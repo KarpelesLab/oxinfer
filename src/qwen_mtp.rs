@@ -152,14 +152,25 @@ impl<'a> QwenMtp<'a> {
     /// `draft_tokens` is how many times a round runs them (their residency priority).
     pub fn stream_units(&self, draft_tokens: usize) -> Vec<crate::stream::UnitSpec> {
         let uses = draft_tokens.max(1) as f64 + 0.5;
-        self.unit_lins()
-            .into_iter()
-            .map(|(name, lins)| crate::stream::UnitSpec {
-                name: name.into(),
-                ranges: lins.iter().flat_map(|l| l.mem_ranges()).collect(),
+        let mut lins = vec![&self.fc];
+        lins.extend(self.attn.lins());
+        lins.extend(self.ffn.dense_lins());
+        // The routed experts of a MoE MTP layer are read on demand.
+        let mut v = vec![crate::stream::UnitSpec {
+            name: "mtp".into(),
+            ranges: lins.iter().flat_map(|l| l.mem_ranges()).collect(),
+            uses,
+            parts: self.ffn.expert_ranges(),
+        }];
+        if let Some(d) = &self.head {
+            v.push(crate::stream::UnitSpec {
+                name: "draft_head".into(),
+                ranges: d.head.mem_ranges(),
                 uses,
-            })
-            .collect()
+                parts: Vec::new(),
+            });
+        }
+        v
     }
 
     /// See `QwenModel::mark_streamed`.
@@ -257,7 +268,13 @@ impl<'a> QwenMtp<'a> {
         model.attn_forward(&self.attn, &mut sess.kv, &hn, t, start, &cos, &sin, &mut y);
         add_inplace(&mut x, &y);
         rmsnorm_f32w_rows(&x, h, &self.ln_post, eps, &mut hn);
-        self.ffn.forward(&hn, t, h, &mut y);
+        let need = |ids: &[usize]| {
+            if let Some(s) = &self.stream {
+                s.need_parts(0, ids)
+            }
+        };
+        self.ffn
+            .forward(&hn, t, h, &mut y, self.stream.as_ref().map(|_| &need as &dyn Fn(&[usize])));
         add_inplace(&mut x, &y);
         rmsnorm_f32w_rows(&x, h, &self.norm, eps, &mut hn);
         hn

@@ -105,29 +105,54 @@ pub(crate) enum Ffn<'a> {
     Moe(Moe<'a>),
 }
 
+/// Called with the routed experts of a MoE pass before they run (weight streaming reads them on
+/// demand).
+pub(crate) type NeedExperts<'f> = Option<&'f dyn Fn(&[usize])>;
+
 impl<'a> Ffn<'a> {
     /// Every weight of the block (all experts of a MoE).
     pub(crate) fn lins(&self) -> Vec<&Lin<'a>> {
+        let mut v = self.dense_lins();
+        v.extend(self.expert_lins().into_iter().flatten());
+        v
+    }
+
+    /// The weights every pass reads: all of a dense MLP, the shared expert of a MoE.
+    pub(crate) fn dense_lins(&self) -> Vec<&Lin<'a>> {
         match self {
             Ffn::Dense(m) => vec![&m.gate, &m.up, &m.down],
-            Ffn::Moe(m) => {
-                let mut v: Vec<&Lin> = vec![&m.shared.gate, &m.shared.up, &m.shared.down];
-                for g in &m.gate_up {
-                    match g {
-                        GateUp::Fused(l) => v.push(l),
-                        GateUp::Split(a, b) => v.extend([a, b]),
-                    }
-                }
-                v.extend(m.down.iter());
-                v
-            }
+            Ffn::Moe(m) => vec![&m.shared.gate, &m.shared.up, &m.shared.down],
         }
     }
 
-    pub(crate) fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32]) {
+    /// The routed experts' weights, per expert (none for a dense MLP).
+    pub(crate) fn expert_lins(&self) -> Vec<Vec<&Lin<'a>>> {
+        match self {
+            Ffn::Dense(_) => Vec::new(),
+            Ffn::Moe(m) => m
+                .gate_up
+                .iter()
+                .zip(&m.down)
+                .map(|(g, d)| match g {
+                    GateUp::Fused(l) => vec![l, d],
+                    GateUp::Split(a, b) => vec![a, b, d],
+                })
+                .collect(),
+        }
+    }
+
+    /// The memory of each routed expert (`Lin::mem_ranges`), for streaming them on demand.
+    pub(crate) fn expert_ranges(&self) -> Vec<Vec<(usize, usize)>> {
+        self.expert_lins()
+            .iter()
+            .map(|e| e.iter().flat_map(|l| l.mem_ranges()).collect())
+            .collect()
+    }
+
+    pub(crate) fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32], need: NeedExperts) {
         match self {
             Ffn::Dense(m) => m.forward(x, t, h, y),
-            Ffn::Moe(m) => m.forward(x, t, h, y),
+            Ffn::Moe(m) => m.forward(x, t, h, y, need),
         }
     }
 
@@ -566,16 +591,33 @@ impl<'a> QwenModel<'a> {
     }
 
     /// The streaming units of this model in execution order (see `crate::stream`): the layers,
-    /// then the LM head.
+    /// then the LM head. The routed experts of MoE layers are on-demand parts of their layer.
     pub fn stream_units(&self) -> Vec<crate::stream::UnitSpec> {
-        self.unit_lins()
-            .into_iter()
-            .map(|(name, lins)| crate::stream::UnitSpec {
-                name,
-                ranges: lins.iter().flat_map(|l| l.mem_ranges()).collect(),
-                uses: 1.0,
+        let mut v: Vec<crate::stream::UnitSpec> = self
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(l, layer)| {
+                let mut lins: Vec<&Lin> = match &layer.mixer {
+                    Mixer::Gdn(g) => vec![&g.qkv, &g.z, &g.b, &g.a, &g.out],
+                    Mixer::Attn(a) => a.lins().to_vec(),
+                };
+                lins.extend(layer.ffn.dense_lins());
+                crate::stream::UnitSpec {
+                    name: format!("layer.{l}"),
+                    ranges: lins.iter().flat_map(|l| l.mem_ranges()).collect(),
+                    uses: 1.0,
+                    parts: layer.ffn.expert_ranges(),
+                }
             })
-            .collect()
+            .collect();
+        v.push(crate::stream::UnitSpec {
+            name: "lm_head".into(),
+            ranges: self.lm_head.mem_ranges(),
+            uses: 1.0,
+            parts: Vec::new(),
+        });
+        v
     }
 
     /// Marks the weights of the units with `streamed[i]` set as streamed: no accelerator state
@@ -694,7 +736,14 @@ impl<'a> QwenModel<'a> {
             }
             add_inplace(&mut x, &y);
             rmsnorm_f32w_rows(&x, h, &layer.ln_post, eps, &mut hn);
-            layer.ffn.forward(&hn, t, h, &mut y);
+            let need = |ids: &[usize]| {
+                if let Some(s) = &self.stream {
+                    s.need_parts(l, ids)
+                }
+            };
+            layer
+                .ffn
+                .forward(&hn, t, h, &mut y, self.stream.as_ref().map(|_| &need as &dyn Fn(&[usize])));
             add_inplace(&mut x, &y);
         }
         rmsnorm_f32w_rows(&x.clone(), h, &self.final_norm, eps, &mut x);
@@ -951,7 +1000,7 @@ impl Moe<'_> {
         be.moe(x, t, h, mi, routes, dev, y)
     }
 
-    fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32]) {
+    fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32], need: NeedExperts) {
         self.shared.forward(x, t, h, y);
         for_chunks(y, h, t > 1, |ti, row| {
             let g = 1.0 / (1.0 + (-dot(&self.shared_gate, &x[ti * h..(ti + 1) * h])).exp());
@@ -965,6 +1014,12 @@ impl Moe<'_> {
             }
         });
         let routes: Vec<_> = logits.chunks(ne).map(|l| self.route(l)).collect();
+        if let Some(need) = need {
+            let mut used: Vec<usize> = routes.iter().flatten().map(|r| r.0).collect();
+            used.sort_unstable();
+            used.dedup();
+            need(&used);
+        }
         let mi = self.inter;
         if t == 1 {
             // Decode: every chosen expert sees the same row, so the gate/up matmuls run as one batch.

@@ -81,6 +81,10 @@ pub struct StreamOptions {
     pub chunk_bytes: usize,
     /// Reader threads (requests in flight).
     pub io_threads: usize,
+    /// Page-cache bytes kept for on-demand unit parts (MoE experts) between uses, least recently
+    /// used out first. None: what the budget leaves after the resident set and the read-ahead
+    /// window (0 without a budget).
+    pub part_cache_bytes: Option<u64>,
 }
 
 impl Default for StreamOptions {
@@ -100,6 +104,7 @@ impl Default for StreamOptions {
             },
             chunk_bytes: 8 << 20,
             io_threads: 2,
+            part_cache_bytes: None,
         }
     }
 }
@@ -120,11 +125,14 @@ impl StreamOptions {
 
 /// One unit of a model: a name, the memory its weights occupy (`(address, length)` spans inside
 /// mapped files), and how many times a decoding round uses it (residency priority).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct UnitSpec {
     pub name: String,
     pub ranges: Vec<(usize, usize)>,
     pub uses: f64,
+    /// Pieces of the unit read only on demand ([`StreamHook::need_parts`]) instead of with the
+    /// unit: the routed experts of a MoE layer, of which a pass uses a few.
+    pub parts: Vec<Vec<(usize, usize)>>,
 }
 
 /// Cumulative counters; subtract two snapshots for one step.
@@ -148,6 +156,9 @@ pub struct StreamStats {
     pub units: u64,
     /// Resident unit uses.
     pub resident_uses: u64,
+    /// On-demand parts (experts) requested, and how many of them were in the part cache.
+    pub parts: u64,
+    pub parts_cached: u64,
 }
 
 impl std::ops::Sub for StreamStats {
@@ -163,6 +174,8 @@ impl std::ops::Sub for StreamStats {
             throttled: self.throttled.saturating_sub(o.throttled),
             units: self.units - o.units,
             resident_uses: self.resident_uses - o.resident_uses,
+            parts: self.parts - o.parts,
+            parts_cached: self.parts_cached - o.parts_cached,
         }
     }
 }
@@ -175,6 +188,9 @@ pub struct StreamPlan {
     pub resident_bytes: u64,
     /// Bytes of the units that are streamed (read once per pass that uses them all).
     pub streamed_bytes: u64,
+    /// Bytes of the on-demand parts (MoE experts) of all units, and the page cache kept for them.
+    pub part_bytes: u64,
+    pub part_cache_bytes: u64,
     /// Resident units that could not be pinned (`ResidentMode::Lock`) or copied.
     pub resident_failures: usize,
     /// Weight bytes outside the mapped files (copies in RAM): 0 when every weight is read in place.
@@ -199,6 +215,74 @@ struct Unit {
     inner: Vec<Span>,
     bytes: u64,
     resident: bool,
+    parts: Vec<Part>,
+}
+
+/// An on-demand piece of a unit (see `UnitSpec::parts`).
+struct Part {
+    spans: Vec<Span>,
+    inner: Vec<Span>,
+    bytes: u64,
+}
+
+/// The parts kept in the page cache between uses (least recently used out first), and the
+/// parts of the units in use.
+#[derive(Default)]
+struct PartCache {
+    cap: u64,
+    used: u64,
+    clock: u64,
+    /// `(unit, part)` -> (last use, bytes), and the same keyed by last use.
+    entries: std::collections::HashMap<(usize, usize), (u64, u64)>,
+    by_use: std::collections::BTreeMap<u64, (usize, usize)>,
+    in_use: Vec<(usize, usize)>,
+}
+
+impl PartCache {
+    /// Marks `k` used now; true if it was cached.
+    fn touch(&mut self, k: (usize, usize)) -> bool {
+        self.clock += 1;
+        match self.entries.get_mut(&k) {
+            Some(e) => {
+                self.by_use.remove(&e.0);
+                e.0 = self.clock;
+                self.by_use.insert(self.clock, k);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Keeps `k` (`bytes`) cached; returns the parts to evict (possibly `k` itself) to stay
+    /// within the capacity, never one in use.
+    fn admit(&mut self, k: (usize, usize), bytes: u64) -> Vec<(usize, usize)> {
+        if self.entries.contains_key(&k) {
+            return Vec::new();
+        }
+        if bytes > self.cap {
+            return vec![k];
+        }
+        self.clock += 1;
+        self.entries.insert(k, (self.clock, bytes));
+        self.by_use.insert(self.clock, k);
+        self.used += bytes;
+        let mut out = Vec::new();
+        let mut skipped = Vec::new();
+        while self.used > self.cap {
+            let Some((stamp, v)) = self.by_use.pop_first() else { break };
+            if self.in_use.contains(&v) {
+                skipped.push((stamp, v));
+                continue;
+            }
+            let (_, b) = self.entries.remove(&v).unwrap();
+            self.used -= b;
+            out.push(v);
+        }
+        for (stamp, v) in skipped {
+            self.by_use.insert(stamp, v);
+        }
+        out
+    }
 }
 
 struct State {
@@ -220,6 +304,8 @@ struct Counters {
     throttle_ns: AtomicU64,
     units: AtomicU64,
     resident_uses: AtomicU64,
+    parts: AtomicU64,
+    parts_cached: AtomicU64,
 }
 
 struct Inner {
@@ -239,6 +325,9 @@ struct Inner {
     st: Mutex<State>,
     cv: Condvar,
     c: Counters,
+    parts: Mutex<PartCache>,
+    /// On-demand loads in progress: the reader's read-ahead waits for them.
+    demand: std::sync::atomic::AtomicUsize,
 }
 
 /// The streaming engine shared by the models it serves (see the module docs).
@@ -276,6 +365,12 @@ impl StreamHook {
         self.s.begin(u);
         UnitGuard(Some((&self.s, u)))
     }
+    /// Inside `enter(i)`: reads parts `ids` of the model's unit `i` (the MoE experts a pass
+    /// routed to) and waits for them. They stay in memory until the unit's guard drops, then in
+    /// the part cache while it has room.
+    pub fn need_parts(&self, i: usize, ids: &[usize]) {
+        self.s.need_parts(self.base + i, ids);
+    }
 }
 
 /// `hook.enter(i)` if there is a hook.
@@ -306,8 +401,9 @@ impl Streamer {
         let locate = |a: usize| maps.iter().position(|&(b, l)| a >= b && a < b + l);
         let mut plan = StreamPlan::default();
         let mut built = Vec::with_capacity(units.len());
-        for u in &units {
-            let mut rs: Vec<(usize, usize)> = u.ranges.iter().copied().filter(|r| r.1 > 0).collect();
+        // Page-aligned spans of `ranges`: outward (read) and inward (evict), and their bytes.
+        let build = |ranges: &[(usize, usize)], plan: &mut StreamPlan| -> (Vec<Span>, Vec<Span>, u64) {
+            let mut rs: Vec<(usize, usize)> = ranges.iter().copied().filter(|r| r.1 > 0).collect();
             rs.sort_unstable();
             // Coalesce: tensors of a unit sit next to each other (small gaps hold norms).
             let mut merged: Vec<(usize, usize)> = Vec::new();
@@ -344,23 +440,50 @@ impl Streamer {
                 }
                 bytes += (e - s) as u64;
             }
+            (spans, inner, bytes)
+        };
+        for u in &units {
+            let (spans, inner, bytes) = build(&u.ranges, &mut plan);
+            let parts: Vec<Part> = u
+                .parts
+                .iter()
+                .map(|r| {
+                    let (spans, inner, bytes) = build(r, &mut plan);
+                    Part { spans, inner, bytes }
+                })
+                .collect();
+            plan.part_bytes += parts.iter().map(|p| p.bytes).sum::<u64>();
             built.push(Unit {
                 spans,
                 inner,
                 bytes,
                 resident: false,
+                parts,
             });
         }
 
         let managed = opts.managed();
+        let mut part_cache = 0;
         if managed {
             let budget = opts
                 .resident_bytes
                 .unwrap_or_else(|| opts.cache_budget.unwrap().saturating_sub(opts.prefetch_bytes));
+            let mut used = 0;
             for i in choose_resident(&units, &built, budget) {
                 built[i].resident = true;
+                used += built[i].bytes;
+            }
+            // The parts get what the units leave of the budget.
+            if opts.resident_bytes.is_none() {
+                part_cache = budget.saturating_sub(used);
             }
         }
+        let part_cache = if plan.part_bytes > 0 {
+            opts.part_cache_bytes.unwrap_or(part_cache)
+        } else {
+            0
+        };
+        plan.part_cache_bytes = part_cache;
         let order: Vec<usize> = (0..built.len()).filter(|&i| !built[i].resident).collect();
         let mut pos = vec![None; built.len()];
         for (p, &u) in order.iter().enumerate() {
@@ -395,6 +518,11 @@ impl Streamer {
             }),
             cv: Condvar::new(),
             c: Counters::default(),
+            parts: Mutex::new(PartCache {
+                cap: part_cache,
+                ..Default::default()
+            }),
+            demand: std::sync::atomic::AtomicUsize::new(0),
         });
         if managed {
             plan.resident_failures = inner.setup();
@@ -436,6 +564,8 @@ impl Streamer {
             throttled: Duration::from_nanos(c.throttle_ns.load(Relaxed)),
             units: c.units.load(Relaxed),
             resident_uses: c.resident_uses.load(Relaxed),
+            parts: c.parts.load(Relaxed),
+            parts_cached: c.parts_cached.load(Relaxed),
         }
     }
 
@@ -478,8 +608,71 @@ impl Streamer {
         st.in_use = Some(p);
     }
 
+    fn need_parts(&self, u: usize, ids: &[usize]) {
+        let inner = &self.inner;
+        let Some(unit) = inner.units.get(u) else { return };
+        let mut spans = Vec::new();
+        {
+            let mut pc = inner.parts.lock().unwrap();
+            for &p in ids {
+                let Some(part) = unit.parts.get(p) else { continue };
+                if pc.in_use.contains(&(u, p)) {
+                    continue;
+                }
+                pc.in_use.push((u, p));
+                inner.c.parts.fetch_add(1, Relaxed);
+                if pc.touch((u, p)) {
+                    inner.c.parts_cached.fetch_add(1, Relaxed);
+                }
+                // Cached parts are probed too (the OS may have dropped some of their pages).
+                spans.extend_from_slice(&part.spans);
+            }
+        }
+        if spans.is_empty() {
+            return;
+        }
+        let t = Instant::now();
+        inner.demand.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let missed = inner.load_spans(&spans, true, true);
+        inner.demand.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if missed > 0 {
+            inner.c.stalls.fetch_add(1, Relaxed);
+            inner.c.stall_ns.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        }
+    }
+
+    /// After unit `u`: its parts go to the part cache, or out of the page cache when that is full.
+    fn release_parts(&self, u: usize) {
+        let inner = &self.inner;
+        let mut out = Vec::new();
+        {
+            let mut pc = inner.parts.lock().unwrap();
+            if !pc.in_use.iter().any(|k| k.0 == u) {
+                return;
+            }
+            let used: Vec<(usize, usize)> = pc.in_use.iter().copied().filter(|k| k.0 == u).collect();
+            pc.in_use.retain(|k| k.0 != u);
+            if !(inner.managed && inner.opts.evict) {
+                return;
+            }
+            for k in used {
+                out.extend(pc.admit(k, inner.units[k.0].parts[k.1].bytes));
+            }
+        }
+        let mut n = 0;
+        for (vu, vp) in out {
+            for s in &inner.units[vu].parts[vp].inner {
+                if sys::evict(&inner.files[s.file], *s) {
+                    n += s.len as u64;
+                }
+            }
+        }
+        inner.c.bytes_evicted.fetch_add(n, Relaxed);
+    }
+
     fn end(&self, u: usize) {
         let inner = &self.inner;
+        self.release_parts(u);
         let Some(p) = inner.pos.get(u).copied().flatten() else {
             return;
         };
@@ -566,6 +759,8 @@ impl Inner {
             &c.throttle_ns,
             &c.units,
             &c.resident_uses,
+            &c.parts,
+            &c.parts_cached,
         ] {
             a.store(0, Relaxed);
         }
@@ -619,9 +814,15 @@ impl Inner {
     /// Brings unit `u` into the page cache (and this process's page tables) with `io_threads`
     /// readers, counting what was already cached and throttling (if `throttle`) what was not.
     fn load(&self, u: &Unit, throttle: bool) {
+        self.load_spans(&u.spans, throttle, false);
+    }
+
+    /// `load` for any spans; returns the bytes that were not cached. Read-ahead (`demand`
+    /// false) yields to on-demand loads between chunks.
+    fn load_spans(&self, spans: &[Span], throttle: bool, demand: bool) -> u64 {
         let chunk = self.opts.chunk_bytes.max(self.page).next_multiple_of(self.page);
         let mut chunks = Vec::new();
-        for s in &u.spans {
+        for s in spans {
             let mut o = 0;
             while o < s.len {
                 chunks.push(Span {
@@ -634,10 +835,15 @@ impl Inner {
             }
         }
         let next = std::sync::atomic::AtomicUsize::new(0);
+        let missed = AtomicU64::new(0);
+        let notouch = std::env::var_os("OXINFER_STREAM_NOTOUCH").is_some();
         let work = || {
             crate::pool::raise_qos();
             let mut scratch = Vec::new();
             while let Some(&c) = chunks.get(next.fetch_add(1, Relaxed)) {
+                while !demand && self.demand.load(Relaxed) > 0 {
+                    std::thread::sleep(Duration::from_micros(100));
+                }
                 // A full `mincore` costs ~15 ms per GB on Darwin: first look at three pages, and
                 // count page by page only when one of them is missing. Unknown counts as a miss.
                 let probe = [c.addr, c.addr + ((c.len / 2) & !(self.page - 1)), c.addr + c.len - self.page];
@@ -652,6 +858,7 @@ impl Inner {
                 let miss = c.len as u64 - have;
                 self.c.bytes_cached.fetch_add(have, Relaxed);
                 self.c.bytes_read.fetch_add(miss, Relaxed);
+                missed.fetch_add(miss, Relaxed);
                 if miss == 0 {
                     // Cached pages map at minor-fault cost wherever they are first used.
                     continue;
@@ -661,7 +868,7 @@ impl Inner {
                     IoMethod::Pread => sys::pread(&self.files[c.file], c, &mut scratch),
                     IoMethod::Touch => {}
                 }
-                if std::env::var_os("OXINFER_STREAM_NOTOUCH").is_none() {
+                if !notouch {
                     touch(c.addr, c.len, self.page);
                 }
                 let rate = f64::from_bits(self.rate.load(Relaxed));
@@ -685,6 +892,7 @@ impl Inner {
                 work();
             });
         }
+        missed.load(Relaxed)
     }
 
     fn io_loop(&self) {
@@ -971,9 +1179,8 @@ mod tests {
 
     fn spec(uses: f64) -> UnitSpec {
         UnitSpec {
-            name: String::new(),
-            ranges: Vec::new(),
             uses,
+            ..Default::default()
         }
     }
     fn unit(bytes: u64) -> Unit {
@@ -982,6 +1189,7 @@ mod tests {
             inner: Vec::new(),
             bytes,
             resident: false,
+            parts: Vec::new(),
         }
     }
 
@@ -1023,6 +1231,7 @@ mod tests {
                         ranges: vec![(b.as_ptr() as usize, b.len())],
                         // Unit 0 is reused, so it is the resident one.
                         uses: if i == 0 { 3.0 } else { 1.0 },
+                        parts: Vec::new(),
                     }
                 })
                 .collect();
@@ -1060,6 +1269,100 @@ mod tests {
             drop(hook);
             drop(s);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn part_cache_keeps_recent_parts_within_capacity() {
+        let mut pc = PartCache {
+            cap: 30,
+            ..Default::default()
+        };
+        assert!(pc.admit((0, 0), 10).is_empty());
+        assert!(pc.admit((0, 1), 10).is_empty());
+        assert!(pc.admit((0, 2), 10).is_empty());
+        // (0, 0) is used again, so (0, 1) is now the oldest.
+        assert!(pc.touch((0, 0)));
+        assert!(!pc.touch((1, 0)));
+        assert_eq!(pc.admit((1, 0), 10), vec![(0, 1)]);
+        // A part in use is never evicted; one larger than the cache evicts itself.
+        pc.in_use.push((0, 2));
+        assert_eq!(pc.admit((1, 1), 10), vec![(0, 0)]);
+        assert_eq!(pc.admit((2, 0), 40), vec![(2, 0)]);
+        assert_eq!(pc.used, 30);
+    }
+
+    /// A unit whose tensors are on-demand parts (MoE experts): the parts read back intact, are
+    /// counted, and stay cached between uses while the part cache has room.
+    #[test]
+    fn streams_parts_on_demand() {
+        const N: usize = 5;
+        const SZ: usize = 256 << 10;
+        let dir = std::env::temp_dir().join(format!("oxinfer-stream-parts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut head = String::from("{");
+        for i in 0..N {
+            head += &format!(
+                "\"t{i}\":{{\"dtype\":\"U8\",\"shape\":[{SZ}],\"data_offsets\":[{},{}]}},",
+                i * SZ,
+                (i + 1) * SZ
+            );
+        }
+        head.pop();
+        head.push('}');
+        while !head.len().is_multiple_of(8) {
+            head.push(' ');
+        }
+        let mut bytes = (head.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(head.as_bytes());
+        bytes.extend((0..N * SZ).map(|i| (i * 13 + i / SZ) as u8));
+        std::fs::write(dir.join("model.safetensors"), &bytes).unwrap();
+        let files = ModelFiles::open(&dir, false).unwrap();
+        let range = |i: usize| {
+            let b = files.bytes(&format!("t{i}")).unwrap();
+            (b.as_ptr() as usize, b.len())
+        };
+        // Unit 0: tensor 0 with tensors 1..5 as parts; the part cache holds one part (and change).
+        let units = vec![UnitSpec {
+            name: "moe".into(),
+            ranges: vec![range(0)],
+            uses: 1.0,
+            parts: (1..N).map(|i| vec![range(i)]).collect(),
+        }];
+        let opts = StreamOptions {
+            resident_bytes: Some(SZ as u64 + (64 << 10)),
+            part_cache_bytes: Some(SZ as u64 + (64 << 10)),
+            prefetch_bytes: SZ as u64,
+            flash_bytes_per_sec: Some(500e6),
+            chunk_bytes: 64 << 10,
+            ..Default::default()
+        };
+        let s = Streamer::new(&[&files], units, opts).unwrap();
+        // Whole pages around each part.
+        let pb = s.plan().part_bytes;
+        assert!((4 * SZ as u64..4 * (SZ as u64 + (32 << 10))).contains(&pb), "{pb}");
+        let hook = StreamHook::new(s.clone(), 0);
+        let sum = |i: usize| files.bytes(&format!("t{i}")).unwrap().iter().map(|&v| v as u64).sum::<u64>();
+        let want: Vec<u64> = (0..N)
+            .map(|t| (0..SZ).map(|i| ((t * SZ + i) * 13 + t) as u8 as u64).sum())
+            .collect();
+        for parts in [vec![0, 2], vec![2], vec![1, 3]] {
+            let _g = hook.enter(0);
+            hook.need_parts(0, &parts);
+            for p in parts {
+                assert_eq!(sum(p + 1), want[p + 1]);
+            }
+        }
+        let st = s.stats();
+        // Five parts requested; part 2 was the most recent one when the second pass asked again.
+        assert_eq!((st.parts, st.parts_cached), (5, 1), "{st:?}");
+        if cfg!(any(target_os = "macos", target_os = "ios")) {
+            assert!(st.bytes_read >= 3 * SZ as u64, "{st:?}");
+            assert!(st.bytes_evicted >= SZ as u64, "{st:?}");
+        }
+        drop(hook);
+        drop(s);
+        drop(files);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

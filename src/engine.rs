@@ -106,8 +106,10 @@ pub struct EngineOptions {
     pub cache_dir: Option<PathBuf>,
     /// Qwen3.5/3.8: stream the weights from the (mapped) file for models larger than memory,
     /// prefetching the next layers while one computes (implies `mmap`; see [`crate::stream`]).
-    /// MTP then drafts up to 8 tokens with a cost-aware length. Keys `stream` (on with the
-    /// defaults), `cache_budget_gb`, `resident_mb`, `prefetch_mb`, `flash_mbps`.
+    /// MTP then drafts up to 8 tokens with a cost-aware length. The routed experts of MoE models
+    /// are read on demand, recently used ones kept in a part of the page-cache budget. Keys
+    /// `stream` (on with the defaults), `cache_budget_gb`, `resident_mb`, `prefetch_mb`,
+    /// `flash_mbps`, `expert_cache_mb`.
     pub stream: Option<crate::stream::StreamOptions>,
     /// Core ML models: where Core ML may run them. Default (None): the Neural Engine, or the
     /// CPU / GPU when `device` asks for it. Key `coreml_units` (`auto`, `ane`, `all`, `gpu`,
@@ -277,6 +279,7 @@ impl EngineOptions {
         "resident_mb",
         "prefetch_mb",
         "flash_mbps",
+        "expert_cache_mb",
         "coreml_units",
         "coreml_prefill",
         "gpu_exact",
@@ -314,13 +317,14 @@ impl EngineOptions {
             "draft_tokens" => self.draft_tokens = parse_opt_usize(key, value)?,
             "cache_dir" => self.cache_dir = opt_str(value).map(PathBuf::from),
             "stream" => self.stream = parse_bool(key, value)?.then(Default::default),
-            "cache_budget_gb" | "resident_mb" | "prefetch_mb" | "flash_mbps" => {
+            "cache_budget_gb" | "resident_mb" | "prefetch_mb" | "flash_mbps" | "expert_cache_mb" => {
                 let st = self.stream.get_or_insert_with(Default::default);
                 let v: f64 = value.parse().with_context(|| format!("{key}: not a number: {value:?}"))?;
                 match key {
                     "cache_budget_gb" => st.cache_budget = Some((v * 1e9) as u64),
                     "resident_mb" => st.resident_bytes = Some((v * (1u64 << 20) as f64) as u64),
                     "prefetch_mb" => st.prefetch_bytes = (v * (1u64 << 20) as f64) as u64,
+                    "expert_cache_mb" => st.part_cache_bytes = Some((v * (1u64 << 20) as f64) as u64),
                     _ => st.flash_bytes_per_sec = Some(v * 1e6),
                 }
             }

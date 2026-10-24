@@ -51,6 +51,7 @@ struct Args {
     stream_io: Option<oxinfer::stream::IoMethod>,
     stream_trace: bool,
     stream_threads: Option<usize>,
+    expert_cache_mb: Option<u64>,
     images: Vec<PathBuf>,
     audios: Vec<PathBuf>,
     dump_mm: Option<PathBuf>,
@@ -127,6 +128,8 @@ fn usage() -> ! {
          \x20 --stream-io M        advise (default on Apple) | pread | touch\n\
          \x20 --stream-trace       with --stream, one line of IO statistics per decoding step\n\
          \x20 --stream-threads N   with --stream, reader threads (default 2)\n\
+         \x20 --expert-cache-mb N  with --stream, page cache kept for recently used MoE experts (which\n\
+         \x20                      are read on demand; default: what the budget leaves)\n\
          \x20 --image FILE         attach an image (repeatable; PNG/JPEG/WebP/GIF/BMP via oxideav)\n\
          \x20 --audio FILE         attach an audio clip (repeatable; WAV/MP3/FLAC/AAC/OGG via oxideav)\n\
          \x20 --max-soft-tokens N  image soft-token budget: 70, 140, 280 (default), 560 or 1120\n\
@@ -206,6 +209,7 @@ fn parse_args() -> Result<Args> {
         stream_io: None,
         stream_trace: false,
         stream_threads: None,
+        expert_cache_mb: None,
         images: Vec::new(),
         audios: Vec::new(),
         dump_mm: None,
@@ -300,6 +304,7 @@ fn parse_args() -> Result<Args> {
             }
             "--stream-trace" => a.stream_trace = true,
             "--stream-threads" => a.stream_threads = Some(val()?.parse()?),
+            "--expert-cache-mb" => a.expert_cache_mb = Some(val()?.parse()?),
             "--image" => a.images.push(PathBuf::from(val()?)),
             "--audio" => a.audios.push(PathBuf::from(val()?)),
             "--dump-mm" => a.dump_mm = Some(PathBuf::from(val()?)),
@@ -990,6 +995,9 @@ fn start_stream(
     if let Some(io) = args.stream_io {
         opts.io = io;
     }
+    if let Some(m) = args.expert_cache_mb {
+        opts.part_cache_bytes = Some(m << 20);
+    }
     if let Some(n) = args.stream_threads {
         opts.io_threads = n;
     }
@@ -1019,6 +1027,13 @@ fn start_stream(
         o.io,
         plan.setup.as_secs_f64()
     );
+    if plan.part_bytes > 0 {
+        eprintln!(
+            "[stream: {:.2} GB of routed experts read on demand, {:.2} GB of page cache keeps the recently used ones]",
+            plan.part_bytes as f64 / 1e9,
+            plan.part_cache_bytes as f64 / 1e9
+        );
+    }
     if plan.unmapped_bytes > 0 {
         eprintln!(
             "[stream: warning: {:.2} GB of weights are copies in RAM, not read from the file]",
@@ -1033,8 +1048,13 @@ fn start_stream(
 
 /// One line of streaming statistics for `steps` decoding steps (`--stream-trace` and summaries).
 fn stream_line(d: &oxinfer::stream::StreamStats, tokens: usize, secs: f64) -> String {
+    let parts = if d.parts > 0 {
+        format!(", experts {} ({} cached)", d.parts, d.parts_cached)
+    } else {
+        String::new()
+    };
     format!(
-        "{tokens} tok in {:.2}s: read {:.2} GB from storage, {:.2} GB cache hits, stalled {:.2}s ({:.0}%), reader busy {:.2}s (throttled {:.2}s)",
+        "{tokens} tok in {:.2}s: read {:.2} GB from storage, {:.2} GB cache hits, stalled {:.2}s ({:.0}%), reader busy {:.2}s (throttled {:.2}s){parts}",
         secs,
         d.bytes_read as f64 / 1e9,
         d.bytes_cached as f64 / 1e9,
