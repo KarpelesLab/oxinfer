@@ -609,12 +609,17 @@ inline void mma_bf_tile(device const bfloat* w, device const half* xh, device co
     op.run(a, b, c);
     scale_store(c, rs, t0, Y.slice(o0, t0));
 }
-#define MMA(NAME, WT, MAKE) \
+// Dense: 128-token tiles, and 32-token tiles (`_s`) for short inputs. (MAKE expands to text with
+// commas, so it is only ever used directly in a body, never forwarded to another macro.)
+#define MMA_SIG(NAME) \
 kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[buffer(1)]], device const half* xh [[buffer(2)]], \
                  device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], \
-                 uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { \
-    threadgroup half Ws[64 * MKB]; \
-    WT w = MAKE; mma_tile<WT, 128>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, tg.y * 128, tid, Ws); }
+                 uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
+#define MMAD(NAME, WT, MAKE) \
+MMA_SIG(NAME) { threadgroup half Ws[64 * MKB]; \
+    WT w = MAKE; mma_tile<WT, 128>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, tg.y * 128, tid, Ws); } \
+MMA_SIG(NAME##_s) { threadgroup half Ws[64 * MKB]; \
+    WT w = MAKE; mma_tile<WT, 32>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, tg.y * 32, tid, Ws); }
 // Grouped: per-expert weight addresses, and one tile per threadgroup row.
 struct EP { device const uchar* q; device const uchar* s; };
 struct GT { uint e; uint r0; uint rows; uint t0; };
@@ -625,27 +630,29 @@ kernel void NAME(device const EP* ep [[buffer(0)]], device const GT* tiles [[buf
     threadgroup half Ws[64 * MKB]; \
     GT g = tiles[tg.y]; device const void* qb = ep[g.e].q; device const void* sb = ep[g.e].s; \
     WT w = MAKE; mma_tile<WT, 32>(w, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out, p.n_out, p.n_in, g.rows, tg.x * 64, g.t0, tid, Ws); }
-MMA(mma_q8, Q8W, MK_Q8) MMA(mma_q4, Q4W, MK_Q4)
+MMAD(mma_q8, Q8W, MK_Q8) MMAD(mma_q4, Q4W, MK_Q4)
 MMAG(mmag_q8, Q8W, MK_Q8) MMAG(mmag_q4, Q4W, MK_Q4)
-kernel void mma_q4a(device const void* qb [[buffer(0)]], device const void* sb [[buffer(1)]], device const half* xh [[buffer(2)]],
-                    device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]],
-                    device const ushort* ob [[buffer(6)]], constant OP& op [[buffer(7)]],
-                    uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup half Ws[64 * MKB];
-    Q4A w = { MK_Q4, ob + op.o_off, op.gpr, op.gk };
-    mma_tile<Q4A, 128>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, tg.y * 128, tid, Ws); }
-#define MMA_BF(NAME, TN) \
+#define MMA_Q4A(NAME, TM) \
+kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[buffer(1)]], device const half* xh [[buffer(2)]], \
+                 device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], \
+                 device const ushort* ob [[buffer(6)]], constant OP& op [[buffer(7)]], \
+                 uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { \
+    threadgroup half Ws[64 * MKB]; \
+    Q4A w = { MK_Q4, ob + op.o_off, op.gpr, op.gk }; \
+    mma_tile<Q4A, TM>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, tg.y * TM, tid, Ws); }
+MMA_Q4A(mma_q4a, 128) MMA_Q4A(mma_q4a_s, 32)
+#define MMA_BF(NAME, TN, TM) \
 kernel void NAME(device const ushort* qb [[buffer(0)]], device const half* xh [[buffer(2)]], device float* y [[buffer(3)]], \
                  constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]]) { \
-    mma_bf_tile<128, TN>((device const bfloat*)(qb + p.w_off), xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * TN, tg.y * 128); }
-MMA_BF(mma_bf64, 64) MMA_BF(mma_bf128, 128)
+    mma_bf_tile<TM, TN>((device const bfloat*)(qb + p.w_off), xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * TN, tg.y * TM); }
+MMA_BF(mma_bf64, 64, 128) MMA_BF(mma_bf128, 128, 128) MMA_BF(mma_bf64_s, 64, 32) MMA_BF(mma_bf128_s, 128, 32)
 kernel void mmag_bf(device const EP* ep [[buffer(0)]], device const GT* tiles [[buffer(1)]], device const half* xh [[buffer(2)]],
                     device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]],
                     uint2 tg [[threadgroup_position_in_grid]]) {
     GT g = tiles[tg.y];
     mma_bf_tile<32, 64>((device const bfloat*)ep[g.e].q, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out,
                         p.n_out, p.n_in, g.rows, tg.x * 64, g.t0); }
-#define GGM(T) MMA(mma_##T, T##W, MK_GG(T##W)) MMAG(mmag_##T, T##W, MK_GG(T##W))
+#define GGM(T) MMAD(mma_##T, T##W, MK_GG(T##W)) MMAG(mmag_##T, T##W, MK_GG(T##W))
 GGM(F16) GGM(Q4_1) GGM(Q5_0) GGM(Q5_1)
 GGM(Q4_0) GGM(IQ4_NL) GGM(Q8_0) GGM(Q4_K) GGM(Q5_K) GGM(Q6_K) GGM(Q3_K) GGM(Q2_K) GGM(IQ4_XS)
 GGM(IQ2_XXS) GGM(IQ2_XS) GGM(IQ2_S) GGM(IQ3_XXS) GGM(IQ3_S) GGM(IQ1_S) GGM(IQ1_M)
@@ -837,11 +844,22 @@ struct MmaParams {
     _p: [u32; 3],
 }
 
-/// Tokens per threadgroup of the dense matrix-unit GEMM, and of the grouped one.
+/// Tokens per threadgroup of the dense matrix-unit GEMM (`MMA_TM_S` for inputs of at most
+/// `MMA_SMALL` rows, which would mostly be padding in a 128-row tile), and of the grouped one.
 const MMA_TM: usize = 128;
+const MMA_TM_S: usize = 32;
+const MMA_SMALL: usize = 64;
 const MMA_GTM: usize = 32;
 /// K step of the matrix-unit GEMMs (`n_in` must be a multiple).
 const MMA_KB: usize = 64;
+
+/// Which matrix-unit GEMM: dense with 128- or 32-token tiles, or grouped (MoE).
+#[derive(Clone, Copy, PartialEq)]
+enum Tile {
+    Dense,
+    Small,
+    Grouped,
+}
 
 /// Matrix-unit pipelines (GPU cores with neural accelerators: M5, A19).
 struct Mma {
@@ -854,6 +872,12 @@ struct Mma {
     q4: Id,
     q4a: Id,
     gguf: Vec<(GgmlType, Id)>,
+    /// The same with 32-token tiles.
+    bf_s: [Id; 2],
+    q8_s: Id,
+    q4_s: Id,
+    q4a_s: Id,
+    gguf_s: Vec<(GgmlType, Id)>,
     /// Grouped (MoE) variants.
     g_bf: Id,
     g_q8: Id,
@@ -1037,8 +1061,11 @@ pub struct MetalBackend {
     group_stats: Id,
     row_stats: Id,
     softmax: Id,
-    /// Matrix-unit kernels, when the device has them (and `OXINFER_METAL_MMA` allows).
+    /// Matrix-unit kernels, when the device has them (and `OXINFER_METAL_MMA` allows), or why
+    /// they failed to compile.
     mma: Option<Mma>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    mma_error: Option<String>,
     /// Keeps MoE expert weights resident (see `new`).
     residency: Option<std::sync::Arc<Residency>>,
     staging: Mutex<Staging>,
@@ -1156,17 +1183,18 @@ impl MetalBackend {
             }
             Ok(lib)
         };
-        let (lib, has_mma) = match want_mma {
+        let t_compile = Instant::now();
+        let (lib, has_mma, mma_error) = match want_mma {
             true => match compile(&format!("{base_src}{MMA_SHADER_SRC}"), true) {
-                Ok(l) => (l, true),
+                Ok(l) => (l, true, None),
                 Err(e) => {
-                    if mma_env.is_some() || std::env::var_os("OXINFER_DEBUG").is_some() {
+                    if apple10 || mma_env.is_some() || std::env::var_os("OXINFER_DEBUG").is_some() {
                         eprintln!("[metal: matrix-unit kernels unavailable: {e}]");
                     }
-                    (compile(&base_src, false)?, false)
+                    (compile(&base_src, false)?, false, Some(e.to_string()))
                 }
             },
-            false => (compile(&base_src, false)?, false),
+            false => (compile(&base_src, false)?, false, None),
         };
         let pipeline = |name: &CStr| -> Result<Id> {
             let ns_name = unsafe { msg_str(nsstring_cls, o.sel(c"stringWithUTF8String:"), name.as_ptr()) };
@@ -1210,6 +1238,14 @@ impl MetalBackend {
                 q4: pipeline(c"mma_q4")?,
                 q4a: pipeline(c"mma_q4a")?,
                 gguf: gg("mma")?,
+                bf_s: [pipeline(c"mma_bf64_s")?, pipeline(c"mma_bf128_s")?],
+                q8_s: pipeline(c"mma_q8_s")?,
+                q4_s: pipeline(c"mma_q4_s")?,
+                q4a_s: pipeline(c"mma_q4a_s")?,
+                gguf_s: GGUF_MMA_TYPES
+                    .iter()
+                    .map(|&k| Ok((k, pipeline(&CString::new(format!("mma_{}_s", k.name()))?)?)))
+                    .collect::<Result<Vec<_>>>()?,
                 g_bf: pipeline(c"mmag_bf")?,
                 g_q8: pipeline(c"mmag_q8")?,
                 g_q4: pipeline(c"mmag_q4")?,
@@ -1281,6 +1317,12 @@ impl MetalBackend {
                 lock: Mutex::new(()),
             }))
         })();
+        if std::env::var_os("OXINFER_METAL_TRACE").is_some() {
+            eprintln!(
+                "[metal: library and pipelines ready in {:.0} ms (matrix units: {has_mma})]",
+                t_compile.elapsed().as_secs_f64() * 1e3
+            );
+        }
         Ok(Self {
             residency,
             stats: Stats::default(),
@@ -1297,6 +1339,7 @@ impl MetalBackend {
             row_stats,
             softmax,
             mma,
+            mma_error,
             staging: Mutex::new(Staging {
                 x: std::ptr::null_mut(),
                 x_cap: 0,
@@ -1517,24 +1560,26 @@ impl MetalBackend {
     }
 
     /// The matrix-unit pipeline for a weight and the outputs per threadgroup it computes.
-    fn mma_pipe(&self, w: &WeightRef, affine: bool, n_out: usize, n_in: usize, grouped: bool) -> Option<(Id, usize)> {
+    fn mma_pipe(&self, w: &WeightRef, affine: bool, n_out: usize, n_in: usize, tile: Tile) -> Option<(Id, usize)> {
         let m = self.mma.as_ref()?;
         if !n_in.is_multiple_of(MMA_KB) || !n_out.is_multiple_of(64) {
             return None;
         }
         let find = |v: &[(GgmlType, Id)], k: GgmlType| v.iter().find(|(t, _)| *t == k).map(|(_, p)| *p);
-        Some(match (w, grouped) {
-            (WeightRef::Bf16(_), false) if n_out.is_multiple_of(128) => (m.bf[1], 128),
-            (WeightRef::Bf16(_), false) => (m.bf[0], 64),
-            (WeightRef::Bf16(_), true) => (m.g_bf, 64),
-            (WeightRef::Q8(_), false) => (m.q8, 64),
-            (WeightRef::Q8(_), true) => (m.g_q8, 64),
-            (WeightRef::Q4(_), false) if affine => (m.q4a, 64),
-            (WeightRef::Q4(_), false) => (m.q4, 64),
-            (WeightRef::Q4(_), true) if !affine => (m.g_q4, 64),
-            (WeightRef::Q4(_), true) => return None,
-            (WeightRef::Gguf(g), false) => (find(&m.gguf, g.kind)?, 64),
-            (WeightRef::Gguf(g), true) => (find(&m.g_gguf, g.kind)?, 64),
+        let small = tile == Tile::Small;
+        let pick = |big: Id, s: Id| if small { s } else { big };
+        Some(match (w, tile) {
+            (WeightRef::Bf16(_), Tile::Grouped) => (m.g_bf, 64),
+            (WeightRef::Bf16(_), _) if n_out.is_multiple_of(128) => (pick(m.bf[1], m.bf_s[1]), 128),
+            (WeightRef::Bf16(_), _) => (pick(m.bf[0], m.bf_s[0]), 64),
+            (WeightRef::Q8(_), Tile::Grouped) => (m.g_q8, 64),
+            (WeightRef::Q8(_), _) => (pick(m.q8, m.q8_s), 64),
+            (WeightRef::Q4(_), Tile::Grouped) if !affine => (m.g_q4, 64),
+            (WeightRef::Q4(_), Tile::Grouped) => return None,
+            (WeightRef::Q4(_), _) if affine => (pick(m.q4a, m.q4a_s), 64),
+            (WeightRef::Q4(_), _) => (pick(m.q4, m.q4_s), 64),
+            (WeightRef::Gguf(g), Tile::Grouped) => (find(&m.g_gguf, g.kind)?, 64),
+            (WeightRef::Gguf(g), _) => (pick(find(&m.gguf, g.kind)?, find(&m.gguf_s, g.kind)?), 64),
         })
     }
 
@@ -1566,7 +1611,12 @@ impl MetalBackend {
     /// `Backend::matmul` on the matrix units; None when some job has no such kernel.
     fn matmul_mma(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [Job]) -> Option<bool> {
         // Rows padded to whole token tiles (zero rows; partial tiles take a slower path).
-        let rows = t.next_multiple_of(MMA_TM);
+        let (tile, tm) = if t <= MMA_SMALL {
+            (Tile::Small, MMA_TM_S)
+        } else {
+            (Tile::Dense, MMA_TM)
+        };
+        let rows = t.next_multiple_of(tm);
         let mut plan = Vec::with_capacity(jobs.len());
         let mut y_total = 0;
         for j in jobs.iter() {
@@ -1574,7 +1624,7 @@ impl MetalBackend {
             if j.y.len() < t * j.n_out {
                 return None;
             }
-            plan.push(self.mma_pipe(&j.w, mw.offsets.is_some(), j.n_out, n_in, false)?);
+            plan.push(self.mma_pipe(&j.w, mw.offsets.is_some(), j.n_out, n_in, tile)?);
             y_total += rows * j.n_out;
         }
         let mut st = self.staging.lock().unwrap();
@@ -1630,7 +1680,7 @@ impl MetalBackend {
                         7,
                     );
                 }
-                e.dispatch((j.n_out / tn, rows / MMA_TM), 128);
+                e.dispatch((j.n_out / tn, rows / tm), 128);
                 y_off += rows * j.n_out;
             }
         };
@@ -2109,8 +2159,8 @@ impl Backend for MetalBackend {
             return None;
         }
         let affine = |w: &WeightRef| matches!(w, WeightRef::Q4(m) if m.offsets.is_some());
-        let (pg, _) = self.mma_pipe(&gate_up[0], affine(&gate_up[0]), 2 * mi, h, true)?;
-        let (pd, _) = self.mma_pipe(&down[0], affine(&down[0]), h, mi, true)?;
+        let (pg, _) = self.mma_pipe(&gate_up[0], affine(&gate_up[0]), 2 * mi, h, Tile::Grouped)?;
+        let (pd, _) = self.mma_pipe(&down[0], affine(&down[0]), h, mi, Tile::Grouped)?;
         let row_bytes = |w: &WeightRef| match w {
             WeightRef::Gguf(g) => g.row_bytes(),
             _ => 0,
@@ -2133,7 +2183,7 @@ impl Backend for MetalBackend {
             .map(|w| (w, 2 * mi, h, pg))
             .chain(down.iter().map(|w| (w, h, mi, pd)))
         {
-            if self.mma_pipe(w, affine(w), n_out, n_in, true)?.0 != pipe {
+            if self.mma_pipe(w, affine(w), n_out, n_in, Tile::Grouped)?.0 != pipe {
                 return None;
             }
             let (d, s) = regions(w);
@@ -2484,6 +2534,9 @@ mod tests {
     /// A backend with the matrix-unit kernels, or None (other devices skip these tests).
     fn backend() -> Option<MetalBackend> {
         let b = MetalBackend::new().ok()?;
+        if let Some(e) = &b.mma_error {
+            panic!("matrix-unit kernels failed to compile: {e}");
+        }
         b.mma.as_ref()?;
         Some(b)
     }
@@ -2528,7 +2581,7 @@ mod tests {
     #[test]
     fn mma_matmul_matches_cpu() {
         let Some(be) = backend() else { return };
-        let (n_out, n_in, t) = (192, 512, 150); // a partial token tile, bf16 at 64 outputs per group
+        let (n_out, n_in) = (192, 512); // bf16 at 64 outputs per threadgroup
         let mut seed = 1;
         let w = bf16(n_out * n_in, &mut seed);
         let q8 = quantize_bf16(&w, n_out, n_in);
@@ -2542,8 +2595,9 @@ mod tests {
             .collect();
         let mut ws = vec![WeightRef::Bf16(&w), WeightRef::Q8(&q8), WeightRef::Q4(&q4)];
         ws.extend(gg.iter().map(WeightRef::Gguf));
-        let x = input(t, n_in, &mut seed);
-        for w in &ws {
+        // Dense tiles (with a partial one) and 32-token tiles.
+        for (w, t) in ws.iter().flat_map(|w| [(w, 150), (w, 37)]) {
+            let x = input(t, n_in, &mut seed);
             let dev = be.upload(w, n_out, n_in).unwrap();
             let mut y = vec![0f32; t * n_out];
             let wr = match w {
