@@ -103,6 +103,29 @@ pub trait Backend: Send + Sync {
     ) -> bool {
         false
     }
+    /// Device state for the routed experts of an MoE layer: expert `e` has the fused gate/up
+    /// projection `gate_up[e]` (`[2 * inter, h]`, gate rows then up rows) and the down projection
+    /// `down[e]` (`[h, inter]`). None if the backend does not run MoE layers.
+    fn upload_moe(&self, _gate_up: &[WeightRef], _down: &[WeightRef], _h: usize, _inter: usize) -> Option<DeviceWeight> {
+        None
+    }
+    /// The routed experts of an MoE layer (`dev` from `upload_moe`) in one submission: token `i`
+    /// of `x` (`[t, h]`) goes through the experts `routes[i]` lists (expert index, weight), and
+    /// `y[i] += sum of weight * down(silu(gate) * up)`. Returns false if nothing was computed
+    /// (the caller then runs the experts itself).
+    #[allow(clippy::too_many_arguments)]
+    fn moe(
+        &self,
+        _x: &[f32],
+        _t: usize,
+        _h: usize,
+        _inter: usize,
+        _routes: &[Vec<(usize, f32)>],
+        _dev: &DeviceWeight,
+        _y: &mut [f32],
+    ) -> bool {
+        false
+    }
     /// Cumulative timing summary for `--profile`.
     fn stats(&self) -> Option<String> {
         None

@@ -78,6 +78,8 @@ pub(crate) struct Moe<'a> {
     shared_gate: Vec<f32>, // [H]
     top_k: usize,
     inter: usize,
+    /// Accelerator state for the routed experts (`Backend::upload_moe`), made on first use.
+    dev: std::sync::OnceLock<Option<crate::gpu::DeviceWeight>>,
 }
 
 /// An expert's input projections: fused (`experts.gate_up_proj`, `[2 * inter, H]`, gate rows then
@@ -450,6 +452,7 @@ impl<'a> Loader<'a, '_> {
             shared_gate: self.getf(&format!("{mp}shared_expert_gate.weight"), &[1, h])?,
             top_k: cfg.num_experts_per_tok,
             inter: mi,
+            dev: std::sync::OnceLock::new(),
         }))
     }
 }
@@ -916,6 +919,38 @@ impl Moe<'_> {
         idx.into_iter().zip(e).map(|(i, v)| (i, v / s)).collect()
     }
 
+    /// The routed experts on the active accelerator (`Backend::moe`), if it takes them: fused
+    /// gate/up weights that are not streamed, and a prefill-sized pass.
+    fn forward_device(&self, x: &[f32], t: usize, h: usize, routes: &[Vec<(usize, f32)>], y: &mut [f32]) -> bool {
+        let mi = self.inter;
+        let Some(be) = crate::gpu::active() else {
+            return false;
+        };
+        if !be.wants(2 * mi, h, t * self.top_k) {
+            return false;
+        }
+        // Streamed experts keep no device state (see `Lin::set_transient_device`).
+        if self.down.iter().any(|l| l.is_transient()) {
+            return false;
+        }
+        let dev = self.dev.get_or_init(|| {
+            let mut gu = Vec::with_capacity(self.gate_up.len());
+            for g in &self.gate_up {
+                match g {
+                    GateUp::Fused(l) if !l.is_transient() => gu.push(l.as_ref()),
+                    _ => return None,
+                }
+            }
+            let down: Vec<_> = self.down.iter().map(|l| l.as_ref()).collect();
+            be.upload_moe(&gu, &down, h, mi)
+        });
+        let Some(dev) = dev else {
+            return false;
+        };
+        let _timer = prof::start(Cat::Matmul);
+        be.moe(x, t, h, mi, routes, dev, y)
+    }
+
     fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32]) {
         self.shared.forward(x, t, h, y);
         for_chunks(y, h, t > 1, |ti, row| {
@@ -999,6 +1034,11 @@ impl Moe<'_> {
                     axpy(yr, w, &o[i * h..(i + 1) * h]);
                 }
             }
+            return;
+        }
+        // Prefill on an accelerator: all routed experts in one submission (gather, grouped
+        // gate/up GEMM, SiLU, grouped down GEMM, weighted combination).
+        if self.forward_device(x, t, h, &routes, y) {
             return;
         }
         // Prefill: gather each expert's tokens into one segment (padded to whole GEMM tiles) and

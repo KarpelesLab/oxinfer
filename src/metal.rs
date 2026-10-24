@@ -13,7 +13,15 @@
 //! Per 32-wide K block the weights are dequantized to f32 in threadgroup memory; x fragments are
 //! read straight from device memory with transposed 8x8 loads; `simdgroup_float8x8` FMAs do the
 //! math. Accumulators must be named variables: arrays of `simdgroup_float8x8` are spilled to
-//! memory by the shader compiler and run 12x slower.
+//! memory by the shader compiler and run 12x slower. Results are bit-identical to the CPU path.
+//!
+//! On GPUs whose cores have matrix units (M5, A19: the Apple10 family), the GEMMs and the MoE
+//! expert layers run on them instead (`MMA_SHADER_SRC`, Metal 4 `matmul2d`), with half-precision
+//! operands and f32 accumulation: ~3-5x faster, at a relative error of ~3e-4 per product.
+//! Environment: `OXINFER_METAL_MMA=0` keeps the f32 kernels (bit-identical to the CPU), `=1` tries
+//! the matrix-unit kernels on any GPU; `OXINFER_METAL_MOE=0` keeps MoE experts on the CPU;
+//! `OXINFER_METAL_TRACE=1` prints the copy and GPU time of every submission;
+//! `OXINFER_METAL_MIN_T=N` takes matmuls from N tokens on (experiments).
 
 use crate::ggml::GgmlType;
 use crate::gpu::{Backend, DeviceWeight, Job, WeightRef};
@@ -528,9 +536,210 @@ GG(Q4_0) GG(IQ4_NL) GG(Q8_0) GG(Q4_K) GG(Q5_K) GG(Q6_K) GG(Q3_K) GG(Q2_K) GG(IQ4
 GG(IQ2_XXS) GG(IQ2_XS) GG(IQ2_S) GG(IQ3_XXS) GG(IQ3_S) GG(IQ1_S) GG(IQ1_M)
 "#;
 
+/// GEMMs on the matrix units of M5 / A19 GPU cores (Metal 4 tensor operations, `matmul2d` from
+/// MetalPerformancePrimitives), appended to the library when the device has them. Operands are
+/// half precision with f32 accumulation: each input row is scaled by a power of two so its
+/// largest value lands in [2^13, 2^14) before the conversion (no overflow, no subnormals), and the
+/// outputs are scaled back. Quantized weights are dequantized per 64-wide K step into threadgroup
+/// memory as half (64 rows x 64 k); bf16 weights are read straight from device memory as bfloat.
+/// A threadgroup (4 SIMD-groups) computes 64 outputs x 128 tokens (64 tokens in the grouped
+/// kernels, whose segments are short), and the tensor bounds clip partial token tiles.
+/// `mmag_*` run many weight matrices in one dispatch (MoE experts): each threadgroup row looks up
+/// its tile (expert, segment start and length, offset) and the expert's weight addresses.
+const MMA_SHADER_SRC: &str = r#"
+#include <metal_tensor>
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+using namespace mpp::tensor_ops;
+// The first four fields as in P (the MK_* macros read them), then the row count.
+struct MP { uint n_out; uint n_in; uint w_off; uint s_off; uint rows; uint _p0; uint _p1; uint _p2; };
+#define MKB 64
+typedef tensor<device half, dextents<int32_t, 2>, tensor_inline> XT;
+typedef tensor<device float, dextents<int32_t, 2>, tensor_inline> YT;
+
+template <typename CT, typename DT>
+inline void scale_store(thread CT& c, device const float* rs, uint t0, DT d) {
+#pragma unroll
+    for (uint16_t i = 0; i < c.get_capacity(); ++i)
+        if (c.is_valid_element(i)) { auto idx = c.get_multidimensional_index(i); c[i] *= rs[t0 + idx[1]]; }
+    c.store(d);
+}
+template <typename CT>
+inline void zero(thread CT& c) {
+#pragma unroll
+    for (uint16_t i = 0; i < c.get_capacity(); ++i) if (c.is_valid_element(i)) c[i] = 0;
+}
+template <typename W, int TM>
+inline void mma_tile(W w, device const half* xh, device const float* rs, device float* y, uint n_out, uint n_in, uint rows,
+                     uint o0, uint t0, uint tid, threadgroup half* Ws) {
+    XT X((device half*)xh, dextents<int32_t, 2>(n_in, rows));
+    YT Y(y, dextents<int32_t, 2>(n_out, rows));
+    constexpr auto desc = matmul2d_descriptor(TM, 64, MKB, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroups<4>> op;
+    typedef tensor<threadgroup half, extents<int32_t, MKB, 64>, tensor_inline> WT;
+    WT Wt(Ws, extents<int32_t, MKB, 64>());
+    auto a0 = X.template slice<MKB, TM>(0, t0);
+    auto c = op.template get_destination_cooperative_tensor<decltype(a0), WT, float>();
+    zero(c);
+    uint row = tid / 2, blk = tid % 2;   // each thread dequantizes one 32-block of one row
+    threadgroup half4* wd = (threadgroup half4*)(Ws + row * MKB + blk * 32);
+    for (uint k0 = 0; k0 < n_in; k0 += MKB) {
+        float4 wv[8];
+        load(w, o0 + row, k0 / 32 + blk, wv);
+        for (uint i = 0; i < 8; i++) wd[i] = half4(wv[i]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto a = X.template slice<MKB, TM>(k0, t0);
+        op.run(a, Wt, c);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    scale_store(c, rs, t0, Y.slice(o0, t0));
+}
+template <int TM, int TN>
+inline void mma_bf_tile(device const bfloat* w, device const half* xh, device const float* rs, device float* y, uint n_out, uint n_in, uint rows,
+                        uint o0, uint t0) {
+    XT X((device half*)xh, dextents<int32_t, 2>(n_in, rows));
+    YT Y(y, dextents<int32_t, 2>(n_out, rows));
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Wt((device bfloat*)w, dextents<int32_t, 2>(n_in, n_out));
+    constexpr auto desc = matmul2d_descriptor(TM, TN, static_cast<int>(dynamic_extent), false, true, false);
+    matmul2d<desc, execution_simdgroups<4>> op;
+    auto a = X.slice(0, t0);
+    auto b = Wt.slice(0, o0);
+    auto c = op.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
+    zero(c);
+    op.run(a, b, c);
+    scale_store(c, rs, t0, Y.slice(o0, t0));
+}
+#define MMA(NAME, WT, MAKE) \
+kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[buffer(1)]], device const half* xh [[buffer(2)]], \
+                 device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], \
+                 uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { \
+    threadgroup half Ws[64 * MKB]; \
+    WT w = MAKE; mma_tile<WT, 128>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, tg.y * 128, tid, Ws); }
+// Grouped: per-expert weight addresses, and one tile per threadgroup row.
+struct EP { device const uchar* q; device const uchar* s; };
+struct GT { uint e; uint r0; uint rows; uint t0; };
+#define MMAG(NAME, WT, MAKE) \
+kernel void NAME(device const EP* ep [[buffer(0)]], device const GT* tiles [[buffer(1)]], device const half* xh [[buffer(2)]], \
+                 device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], \
+                 uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { \
+    threadgroup half Ws[64 * MKB]; \
+    GT g = tiles[tg.y]; device const void* qb = ep[g.e].q; device const void* sb = ep[g.e].s; \
+    WT w = MAKE; mma_tile<WT, 64>(w, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out, p.n_out, p.n_in, g.rows, tg.x * 64, g.t0, tid, Ws); }
+MMA(mma_q8, Q8W, MK_Q8) MMA(mma_q4, Q4W, MK_Q4)
+MMAG(mmag_q8, Q8W, MK_Q8) MMAG(mmag_q4, Q4W, MK_Q4)
+kernel void mma_q4a(device const void* qb [[buffer(0)]], device const void* sb [[buffer(1)]], device const half* xh [[buffer(2)]],
+                    device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]],
+                    device const ushort* ob [[buffer(6)]], constant OP& op [[buffer(7)]],
+                    uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup half Ws[64 * MKB];
+    Q4A w = { MK_Q4, ob + op.o_off, op.gpr, op.gk };
+    mma_tile<Q4A, 128>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, tg.y * 128, tid, Ws); }
+#define MMA_BF(NAME, TN) \
+kernel void NAME(device const ushort* qb [[buffer(0)]], device const half* xh [[buffer(2)]], device float* y [[buffer(3)]], \
+                 constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]]) { \
+    mma_bf_tile<128, TN>((device const bfloat*)(qb + p.w_off), xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * TN, tg.y * 128); }
+MMA_BF(mma_bf64, 64) MMA_BF(mma_bf128, 128)
+kernel void mmag_bf(device const EP* ep [[buffer(0)]], device const GT* tiles [[buffer(1)]], device const half* xh [[buffer(2)]],
+                    device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]],
+                    uint2 tg [[threadgroup_position_in_grid]]) {
+    GT g = tiles[tg.y];
+    mma_bf_tile<64, 64>((device const bfloat*)ep[g.e].q, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out,
+                        p.n_out, p.n_in, g.rows, tg.x * 64, g.t0); }
+#define GGM(T) MMA(mma_##T, T##W, MK_GG(T##W)) MMAG(mmag_##T, T##W, MK_GG(T##W))
+GGM(F16) GGM(Q4_1) GGM(Q5_0) GGM(Q5_1)
+GGM(Q4_0) GGM(IQ4_NL) GGM(Q8_0) GGM(Q4_K) GGM(Q5_K) GGM(Q6_K) GGM(Q3_K) GGM(Q2_K) GGM(IQ4_XS)
+GGM(IQ2_XXS) GGM(IQ2_XS) GGM(IQ2_S) GGM(IQ3_XXS) GGM(IQ3_S) GGM(IQ1_S) GGM(IQ1_M)
+
+// Input rows (optionally gathered: row r is source row src[r]) to half with a power-of-two scale
+// per row (see above); rs gets the inverse scale. One threadgroup of 256 per row; n % 4 == 0.
+struct XH { uint n; uint gather; };
+inline float row_scale(float m, thread float& inv) {
+    int e = 0;
+    if (m > 0.f && isfinite(m)) { frexp(m, e); e = clamp(14 - e, -100, 100); }
+    inv = ldexp(1.0f, -e);
+    return ldexp(1.0f, e);
+}
+inline float tg_max(float m, uint sg, uint lane, threadgroup float* red) {
+    m = simd_max(m);
+    if (lane == 0) red[sg] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return max(max(max(red[0], red[1]), max(red[2], red[3])), max(max(red[4], red[5]), max(red[6], red[7])));
+}
+kernel void x_half(device const float* x [[buffer(0)]], device half* xh [[buffer(1)]], device float* rs [[buffer(2)]],
+                   constant XH& p [[buffer(3)]], device const uint* src [[buffer(4)]],
+                   uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                   uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[8];
+    device const float4* row = (device const float4*)(x + (ulong)(p.gather != 0 ? src[r] : r) * p.n);
+    uint n4 = p.n / 4;
+    float m = 0.f;
+    for (uint i = tid; i < n4; i += 256) { float4 v = abs(row[i]); m = max(m, max(max(v.x, v.y), max(v.z, v.w))); }
+    m = tg_max(m, sg, lane, red);
+    float inv, s = row_scale(m, inv);
+    device half4* out = (device half4*)(xh + (ulong)r * p.n);
+    for (uint i = tid; i < n4; i += 256) out[i] = half4(row[i] * s);
+    if (tid == 0) rs[r] = inv;
+}
+// SiLU(gate) * up of fused [gate | up] rows (n each) into scaled half rows, as x_half.
+inline float4 silu_mul4(float4 g, float4 u) { return g / (1.0f + exp(-g)) * u; }
+kernel void silu_half(device const float* gu [[buffer(0)]], device half* ah [[buffer(1)]], device float* rs [[buffer(2)]],
+                      constant XH& p [[buffer(3)]],
+                      uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[8];
+    device const float4* g = (device const float4*)(gu + (ulong)r * 2 * p.n);
+    device const float4* u = g + p.n / 4;
+    uint n4 = p.n / 4;
+    float m = 0.f;
+    for (uint i = tid; i < n4; i += 256) { float4 v = abs(silu_mul4(g[i], u[i])); m = max(m, max(max(v.x, v.y), max(v.z, v.w))); }
+    m = tg_max(m, sg, lane, red);
+    float inv, s = row_scale(m, inv);
+    device half4* out = (device half4*)(ah + (ulong)r * p.n);
+    for (uint i = tid; i < n4; i += 256) out[i] = half4(silu_mul4(g[i], u[i]) * s);
+    if (tid == 0) rs[r] = inv;
+}
+// out[t] = sum over the token's k slots of weight * o[row].
+struct CB { uint n; uint k; };
+kernel void moe_combine(device const float* o [[buffer(0)]], device const float2* slots [[buffer(1)]], device float* out [[buffer(2)]],
+                        constant CB& p [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
+    uint c = gid.x * 4, t = gid.y;
+    if (c >= p.n) return;
+    float4 acc = 0.f;
+    for (uint j = 0; j < p.k; j++) {
+        float2 s = slots[t * p.k + j];
+        acc += s.y * *(device const float4*)(o + (ulong)as_type<uint>(s.x) * p.n + c);
+    }
+    *(device float4*)(out + (ulong)t * p.n + c) = acc;
+}
+"#;
+
 /// GGUF types with a Metal GEMM (`gemm_<TYPE>` in `GGUF_SHADER_SRC`).
 const GGUF_GPU_TYPES: [GgmlType; 21] = [
     GgmlType::F32,
+    GgmlType::F16,
+    GgmlType::Q4_1,
+    GgmlType::Q5_0,
+    GgmlType::Q5_1,
+    GgmlType::Q4_0,
+    GgmlType::IQ4_NL,
+    GgmlType::Q8_0,
+    GgmlType::Q4_K,
+    GgmlType::Q5_K,
+    GgmlType::Q6_K,
+    GgmlType::Q3_K,
+    GgmlType::Q2_K,
+    GgmlType::IQ4_XS,
+    GgmlType::IQ2_XXS,
+    GgmlType::IQ2_XS,
+    GgmlType::IQ2_S,
+    GgmlType::IQ3_XXS,
+    GgmlType::IQ3_S,
+    GgmlType::IQ1_S,
+    GgmlType::IQ1_M,
+];
+
+/// GGUF types with a matrix-unit GEMM (`mma_<TYPE>` / `mmag_<TYPE>` in `MMA_SHADER_SRC`): all but
+/// F32, whose values would lose precision as half.
+const GGUF_MMA_TYPES: [GgmlType; 20] = [
     GgmlType::F16,
     GgmlType::Q4_1,
     GgmlType::Q5_0,
@@ -615,6 +824,42 @@ struct Params {
     s_off: u32,
 }
 
+/// Parameters of the matrix-unit GEMMs (`MP` in the shader).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MmaParams {
+    n_out: u32,
+    n_in: u32,
+    w_off: u32,
+    s_off: u32,
+    rows: u32,
+    _p: [u32; 3],
+}
+
+/// Tokens per threadgroup of the dense matrix-unit GEMM, and of the grouped one.
+const MMA_TM: usize = 128;
+const MMA_GTM: usize = 64;
+/// K step of the matrix-unit GEMMs (`n_in` must be a multiple).
+const MMA_KB: usize = 64;
+
+/// Matrix-unit pipelines (GPU cores with neural accelerators: M5, A19).
+struct Mma {
+    x_half: Id,
+    silu_half: Id,
+    combine: Id,
+    /// bf16 weights read from device memory, 64 and 128 outputs per threadgroup.
+    bf: [Id; 2],
+    q8: Id,
+    q4: Id,
+    q4a: Id,
+    gguf: Vec<(GgmlType, Id)>,
+    /// Grouped (MoE) variants.
+    g_bf: Id,
+    g_q8: Id,
+    g_q4: Id,
+    g_gguf: Vec<(GgmlType, Id)>,
+}
+
 #[repr(C)]
 struct MtlSize {
     w: usize,
@@ -648,6 +893,70 @@ impl Drop for MetalWeight {
     }
 }
 
+/// An `MTLResidencySet` attached to the command queue, and its selectors.
+struct Residency {
+    set: Id,
+    add: Sel,
+    remove: Sel,
+    commit: Sel,
+    request: Sel,
+    /// `objc_msgSend` with one object argument, and with none.
+    send_id: unsafe extern "C" fn(Id, Sel, Id),
+    send: MsgVoid,
+    /// Serializes changes to the set.
+    lock: Mutex<()>,
+}
+unsafe impl Send for Residency {}
+unsafe impl Sync for Residency {}
+
+impl Residency {
+    /// Adds (or removes) buffers, then commits the change.
+    fn update(&self, ids: &[Id], add: bool) {
+        let _g = self.lock.lock().unwrap();
+        // SAFETY: `set` is a live residency set and `ids` are live buffers.
+        unsafe {
+            for &id in ids {
+                (self.send_id)(self.set, if add { self.add } else { self.remove }, id);
+            }
+            (self.send)(self.set, self.commit);
+            if add {
+                (self.send)(self.set, self.request);
+            }
+        }
+    }
+}
+
+/// Device state of an MoE layer's routed experts (`Backend::upload_moe`).
+struct MoeDev {
+    /// Grouped GEMM pipelines for the gate/up and the down projections.
+    pipes: (Id, Id),
+    /// GGUF row bytes of each (the `s_off` parameter), 0 for other formats.
+    row_bytes: (u32, u32),
+    /// The wrapped weight memory (adjacent experts share a buffer).
+    bufs: Vec<Buf>,
+    /// Per-expert (data, scales) GPU addresses of each projection.
+    ep: (Id, Id),
+    /// The residency set holding `bufs`, if any (else they are made resident per submission).
+    residency: Option<std::sync::Arc<Residency>>,
+    release: (MsgVoid, Sel),
+}
+
+impl Drop for MoeDev {
+    fn drop(&mut self) {
+        if let Some(r) = &self.residency {
+            r.update(&self.bufs.iter().map(|b| b.id).collect::<Vec<_>>(), false);
+        }
+        let (f, sel) = self.release;
+        let ids = self.bufs.iter().map(|b| b.id).chain([self.ep.0, self.ep.1]);
+        for id in ids.filter(|id| !id.is_null()) {
+            // SAFETY: each buffer was created for this state and is released once.
+            unsafe { f(id, sel) };
+        }
+    }
+}
+unsafe impl Send for MoeDev {}
+unsafe impl Sync for MoeDev {}
+
 #[repr(C)]
 struct OffsetParams {
     o_off: u32,
@@ -672,6 +981,17 @@ struct Staging {
     av: Grow,
     asc: Grow,
     ao: Grow,
+    /// Matrix-unit GEMMs: half input rows and their inverse scales.
+    xh: Grow,
+    rs: Grow,
+    /// MoE: gathered row sources, tiles, combine slots, intermediates.
+    m_src: Grow,
+    m_tiles: Grow,
+    m_slots: Grow,
+    m_gu: Grow,
+    m_ah: Grow,
+    m_rs2: Grow,
+    m_o: Grow,
 }
 
 /// A device buffer that only ever grows.
@@ -715,6 +1035,10 @@ pub struct MetalBackend {
     group_stats: Id,
     row_stats: Id,
     softmax: Id,
+    /// Matrix-unit kernels, when the device has them (and `OXINFER_METAL_MMA` allows).
+    mma: Option<Mma>,
+    /// Keeps MoE expert weights resident (see `new`).
+    residency: Option<std::sync::Arc<Residency>>,
     staging: Mutex<Staging>,
     sels: Sels,
 }
@@ -737,6 +1061,8 @@ struct Sels {
     new_buffer_len: Sel,
     status: Sel,
     release: Sel,
+    gpu_address: Sel,
+    use_resources: Sel,
     pool_push: unsafe extern "C" fn() -> *mut c_void,
     pool_pop: unsafe extern "C" fn(*mut c_void),
 }
@@ -791,23 +1117,55 @@ impl MetalBackend {
             // SAFETY: `localizedDescription` returns an NSString owned by the NSError.
             unsafe { o.nsstring_to_string(msg0(err, o.sel(c"localizedDescription"))) }
         };
-        // Compile the shader library from source.
-        let src = CString::new(format!("{SHADER_SRC}{}{GGUF_SHADER_SRC}", gguf_shader_tables()))?;
-        let ns_src = unsafe { msg_str(nsstring_cls, o.sel(c"stringWithUTF8String:"), src.as_ptr()) };
-        let new_lib: MsgNewLib = o.msg_send();
-        let mut err: Id = std::ptr::null_mut();
-        let lib = unsafe {
-            new_lib(
-                device,
-                o.sel(c"newLibraryWithSource:options:error:"),
-                ns_src,
-                std::ptr::null_mut(),
-                &mut err,
-            )
+        // Compile the shader library from source: with the matrix-unit kernels (Metal 4) when the
+        // GPU cores have neural accelerators (Apple10 family: M5, A19), else without.
+        // OXINFER_METAL_MMA=0 turns them off, =1 tries them on any device.
+        let supports_family: unsafe extern "C" fn(Id, Sel, i64) -> u8 = o.msg_send();
+        let apple10 = unsafe { supports_family(device, o.sel(c"supportsFamily:"), 1010) } != 0;
+        let mma_env = std::env::var("OXINFER_METAL_MMA").ok();
+        let want_mma = match mma_env.as_deref() {
+            Some("0") => false,
+            Some("1") => true,
+            _ => apple10,
         };
-        if lib.is_null() {
-            bail!("Metal shader compilation failed: {}", error_text(err));
-        }
+        let base_src = format!("{SHADER_SRC}{}{GGUF_SHADER_SRC}", gguf_shader_tables());
+        let compile = |src: &str, metal4: bool| -> Result<Id> {
+            let src = CString::new(src)?;
+            let ns_src = unsafe { msg_str(nsstring_cls, o.sel(c"stringWithUTF8String:"), src.as_ptr()) };
+            let mut opts: Id = std::ptr::null_mut();
+            if metal4 {
+                let cls = unsafe { get_class(c"MTLCompileOptions".as_ptr()) };
+                if cls.is_null() {
+                    bail!("no MTLCompileOptions");
+                }
+                opts = unsafe { msg0(msg0(cls, o.sel(c"alloc")), o.sel(c"init")) };
+                let set_ver: unsafe extern "C" fn(Id, Sel, u64) = o.msg_send();
+                unsafe { set_ver(opts, o.sel(c"setLanguageVersion:"), 0x4_0000) }; // MTLLanguageVersion4_0
+            }
+            let new_lib: MsgNewLib = o.msg_send();
+            let mut err: Id = std::ptr::null_mut();
+            let lib = unsafe { new_lib(device, o.sel(c"newLibraryWithSource:options:error:"), ns_src, opts, &mut err) };
+            if !opts.is_null() {
+                let void: MsgVoid = o.msg_send();
+                unsafe { void(opts, o.sel(c"release")) };
+            }
+            if lib.is_null() {
+                bail!("Metal shader compilation failed: {}", error_text(err));
+            }
+            Ok(lib)
+        };
+        let (lib, has_mma) = match want_mma {
+            true => match compile(&format!("{base_src}{MMA_SHADER_SRC}"), true) {
+                Ok(l) => (l, true),
+                Err(e) => {
+                    if mma_env.is_some() || std::env::var_os("OXINFER_DEBUG").is_some() {
+                        eprintln!("[metal: matrix-unit kernels unavailable: {e}]");
+                    }
+                    (compile(&base_src, false)?, false)
+                }
+            },
+            false => (compile(&base_src, false)?, false),
+        };
         let pipeline = |name: &CStr| -> Result<Id> {
             let ns_name = unsafe { msg_str(nsstring_cls, o.sel(c"stringWithUTF8String:"), name.as_ptr()) };
             let msg_fn: Msg1 = o.msg_send();
@@ -834,6 +1192,30 @@ impl MetalBackend {
         let group_stats = pipeline(c"group_stats")?;
         let row_stats = pipeline(c"row_stats")?;
         let softmax = pipeline(c"softmax_rows")?;
+        let mma = if has_mma {
+            let gg = |prefix: &str| {
+                GGUF_MMA_TYPES
+                    .iter()
+                    .map(|&k| Ok((k, pipeline(&CString::new(format!("{prefix}_{}", k.name()))?)?)))
+                    .collect::<Result<Vec<_>>>()
+            };
+            Some(Mma {
+                x_half: pipeline(c"x_half")?,
+                silu_half: pipeline(c"silu_half")?,
+                combine: pipeline(c"moe_combine")?,
+                bf: [pipeline(c"mma_bf64")?, pipeline(c"mma_bf128")?],
+                q8: pipeline(c"mma_q8")?,
+                q4: pipeline(c"mma_q4")?,
+                q4a: pipeline(c"mma_q4a")?,
+                gguf: gg("mma")?,
+                g_bf: pipeline(c"mmag_bf")?,
+                g_q8: pipeline(c"mmag_q8")?,
+                g_q4: pipeline(c"mmag_q4")?,
+                g_gguf: gg("mmag")?,
+            })
+        } else {
+            None
+        };
         let pool_push = unsafe { o.objc.get::<unsafe extern "C" fn() -> *mut c_void>(c"objc_autoreleasePoolPush") }
             .map_err(|e| anyhow!("{e}"))?
             .into_inner_unsafe();
@@ -856,10 +1238,49 @@ impl MetalBackend {
             new_buffer_len: o.sel(c"newBufferWithLength:options:"),
             status: o.sel(c"status"),
             release: o.sel(c"release"),
+            gpu_address: o.sel(c"gpuAddress"),
+            use_resources: o.sel(c"useResources:count:usage:"),
             pool_push,
             pool_pop,
         };
+        // A residency set (macOS 15 / iOS 18) attached to the queue keeps the MoE expert weights
+        // resident: reached through addresses, they would otherwise have to be made resident
+        // (`useResources`) on every submission, which costs more than the GEMMs for mapped files.
+        let residency = (|| {
+            mma.as_ref()?;
+            let responds: unsafe extern "C" fn(Id, Sel, Sel) -> u8 = o.msg_send();
+            let new_sel = o.sel(c"newResidencySetWithDescriptor:error:");
+            if unsafe { responds(device, o.sel(c"respondsToSelector:"), new_sel) } == 0 {
+                return None;
+            }
+            let cls = unsafe { get_class(c"MTLResidencySetDescriptor".as_ptr()) };
+            if cls.is_null() {
+                return None;
+            }
+            let desc = unsafe { msg0(msg0(cls, o.sel(c"alloc")), o.sel(c"init")) };
+            let new_set: unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id = o.msg_send();
+            let mut err: Id = std::ptr::null_mut();
+            let set = unsafe { new_set(device, new_sel, desc, &mut err) };
+            let void: MsgVoid = o.msg_send();
+            unsafe { void(desc, o.sel(c"release")) };
+            if set.is_null() {
+                return None;
+            }
+            let add: unsafe extern "C" fn(Id, Sel, Id) = o.msg_send();
+            unsafe { add(queue, o.sel(c"addResidencySet:"), set) };
+            Some(std::sync::Arc::new(Residency {
+                set,
+                add: o.sel(c"addAllocation:"),
+                remove: o.sel(c"removeAllocation:"),
+                commit: o.sel(c"commit"),
+                request: o.sel(c"requestResidency"),
+                send_id: add,
+                send: void,
+                lock: Mutex::new(()),
+            }))
+        })();
         Ok(Self {
+            residency,
             stats: Stats::default(),
             o,
             _foundation: foundation,
@@ -873,6 +1294,7 @@ impl MetalBackend {
             group_stats,
             row_stats,
             softmax,
+            mma,
             staging: Mutex::new(Staging {
                 x: std::ptr::null_mut(),
                 x_cap: 0,
@@ -885,6 +1307,15 @@ impl MetalBackend {
                 av: Grow::new(),
                 asc: Grow::new(),
                 ao: Grow::new(),
+                xh: Grow::new(),
+                rs: Grow::new(),
+                m_src: Grow::new(),
+                m_tiles: Grow::new(),
+                m_slots: Grow::new(),
+                m_gu: Grow::new(),
+                m_ah: Grow::new(),
+                m_rs2: Grow::new(),
+                m_o: Grow::new(),
             }),
             sels,
         })
@@ -966,6 +1397,248 @@ impl MetalBackend {
     }
 }
 
+/// Copies `n` floats, on the worker pool when large (staging copies of prefill activations run
+/// at memory bandwidth rather than one core's).
+///
+/// # Safety
+/// `src` and `dst` must be valid for `n` floats and not overlap.
+unsafe fn par_copy(dst: *mut f32, src: *const f32, n: usize) {
+    const CHUNK: usize = 1 << 16;
+    if n < 8 * CHUNK {
+        unsafe { std::ptr::copy_nonoverlapping(src, dst, n) };
+        return;
+    }
+    let d = unsafe { std::slice::from_raw_parts_mut(dst, n) };
+    let s = src as usize;
+    crate::kernels::for_chunks(d, CHUNK, true, |i, c| {
+        // SAFETY: chunk `i` of the source is as long as `c`.
+        unsafe { std::ptr::copy_nonoverlapping((s as *const f32).add(i * CHUNK), c.as_mut_ptr(), c.len()) };
+    });
+}
+
+/// A compute command encoder being filled (thin wrappers over the `objc_msgSend` calls).
+struct Enc<'a> {
+    b: &'a MetalBackend,
+    enc: Id,
+}
+
+impl Enc<'_> {
+    fn pipe(&self, p: Id) {
+        let f: MsgSetPipe = self.b.o.msg_send();
+        unsafe { f(self.enc, self.b.sels.set_pipeline, p) };
+    }
+    fn buf(&self, b: Id, offset: usize, index: usize) {
+        let f: MsgSetBuffer = self.b.o.msg_send();
+        unsafe { f(self.enc, self.b.sels.set_buffer, b, offset, index) };
+    }
+    fn bytes<T>(&self, v: &T, index: usize) {
+        let f: MsgSetBytes = self.b.o.msg_send();
+        unsafe {
+            f(
+                self.enc,
+                self.b.sels.set_bytes,
+                v as *const T as *const c_void,
+                std::mem::size_of::<T>(),
+                index,
+            )
+        };
+    }
+    fn dispatch(&self, groups: (usize, usize), threads: usize) {
+        let f: MsgDispatch = self.b.o.msg_send();
+        let g = MtlSize {
+            w: groups.0,
+            h: groups.1,
+            d: 1,
+        };
+        let t = MtlSize { w: threads, h: 1, d: 1 };
+        unsafe { f(self.enc, self.b.sels.dispatch, &g, &t) };
+    }
+    /// Makes buffers that are only reached through addresses stored in other buffers resident.
+    fn use_resources(&self, ids: &[Id]) {
+        if ids.is_empty() {
+            return;
+        }
+        let f: unsafe extern "C" fn(Id, Sel, *const Id, usize, usize) = self.b.o.msg_send();
+        unsafe { f(self.enc, self.b.sels.use_resources, ids.as_ptr(), ids.len(), 1) }; // MTLResourceUsageRead
+    }
+}
+
+impl MetalBackend {
+    /// Encodes one compute pass with `encode`, submits it and waits; then, if it completed, calls
+    /// `read_back`. Both get `state` (what they both borrow). `t_in` is when copying the inputs
+    /// started (for the statistics).
+    fn submit<S>(&self, t_in: Instant, state: &mut S, encode: impl FnOnce(&Enc, &S), read_back: impl FnOnce(&mut S)) -> bool {
+        let msg0: Msg0 = self.o.msg_send();
+        let void: MsgVoid = self.o.msg_send();
+        let status: MsgU = self.o.msg_send();
+        unsafe {
+            let t1 = Instant::now();
+            let pool = (self.sels.pool_push)();
+            let cb = msg0(self.queue, self.sels.command_buffer);
+            let enc = msg0(cb, self.sels.compute_encoder);
+            encode(&Enc { b: self, enc }, state);
+            void(enc, self.sels.end_encoding);
+            void(cb, self.sels.commit);
+            void(cb, self.sels.wait);
+            let ok = status(cb, self.sels.status) == 4; // MTLCommandBufferStatusCompleted
+            let t2 = Instant::now();
+            if std::env::var_os("OXINFER_METAL_TRACE").is_some() {
+                let time: unsafe extern "C" fn(Id, Sel) -> f64 = self.o.msg_send();
+                let g = time(cb, self.o.sel(c"GPUEndTime")) - time(cb, self.o.sel(c"GPUStartTime"));
+                eprintln!(
+                    "[metal: copy-in {:.3} ms, gpu {:.3} ms, wall {:.3} ms]",
+                    (t1 - t_in).as_secs_f64() * 1e3,
+                    g * 1e3,
+                    (t2 - t1).as_secs_f64() * 1e3
+                );
+            }
+            if ok {
+                read_back(state);
+            }
+            (self.sels.pool_pop)(pool);
+            self.stats.calls.fetch_add(1, Ordering::Relaxed);
+            self.stats.copy_in_ns.fetch_add((t1 - t_in).as_nanos() as u64, Ordering::Relaxed);
+            self.stats.gpu_ns.fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
+            self.stats.copy_out_ns.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            ok
+        }
+    }
+
+    fn contents(&self, b: Id) -> *mut u8 {
+        let f: MsgPtr = self.o.msg_send();
+        unsafe { f(b, self.sels.contents) as *mut u8 }
+    }
+
+    fn gpu_address(&self, b: &Buf) -> u64 {
+        let f: MsgU = self.o.msg_send();
+        unsafe { f(b.id, self.sels.gpu_address) + b.offset_bytes as u64 }
+    }
+
+    /// The matrix-unit pipeline for a weight and the outputs per threadgroup it computes.
+    fn mma_pipe(&self, w: &WeightRef, affine: bool, n_out: usize, n_in: usize, grouped: bool) -> Option<(Id, usize)> {
+        let m = self.mma.as_ref()?;
+        if !n_in.is_multiple_of(MMA_KB) || !n_out.is_multiple_of(64) {
+            return None;
+        }
+        let find = |v: &[(GgmlType, Id)], k: GgmlType| v.iter().find(|(t, _)| *t == k).map(|(_, p)| *p);
+        Some(match (w, grouped) {
+            (WeightRef::Bf16(_), false) if n_out.is_multiple_of(128) => (m.bf[1], 128),
+            (WeightRef::Bf16(_), false) => (m.bf[0], 64),
+            (WeightRef::Bf16(_), true) => (m.g_bf, 64),
+            (WeightRef::Q8(_), false) => (m.q8, 64),
+            (WeightRef::Q8(_), true) => (m.g_q8, 64),
+            (WeightRef::Q4(_), false) if affine => (m.q4a, 64),
+            (WeightRef::Q4(_), false) => (m.q4, 64),
+            (WeightRef::Q4(_), true) if !affine => (m.g_q4, 64),
+            (WeightRef::Q4(_), true) => return None,
+            (WeightRef::Gguf(g), false) => (find(&m.gguf, g.kind)?, 64),
+            (WeightRef::Gguf(g), true) => (find(&m.g_gguf, g.kind)?, 64),
+        })
+    }
+
+    /// Encodes the conversion of `rows` rows of `n` floats (row r taken from row `src[r]` if
+    /// `src` is given) to scaled half rows plus their inverse scales.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_x_half(&self, e: &Enc, x: Id, xh: Id, rs: Id, n: usize, rows: usize, src: Option<Id>) {
+        #[repr(C)]
+        struct Xh {
+            n: u32,
+            gather: u32,
+        }
+        let m = self.mma.as_ref().unwrap();
+        e.pipe(m.x_half);
+        e.buf(x, 0, 0);
+        e.buf(xh, 0, 1);
+        e.buf(rs, 0, 2);
+        e.bytes(
+            &Xh {
+                n: n as u32,
+                gather: src.is_some() as u32,
+            },
+            3,
+        );
+        e.buf(src.unwrap_or(x), 0, 4);
+        e.dispatch((rows, 1), 256);
+    }
+
+    /// `Backend::matmul` on the matrix units; None when some job has no such kernel.
+    fn matmul_mma(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [Job]) -> Option<bool> {
+        let mut plan = Vec::with_capacity(jobs.len());
+        let mut y_total = 0;
+        for j in jobs.iter() {
+            let mw = j.dev.downcast_ref::<MetalWeight>()?;
+            if j.y.len() < t * j.n_out {
+                return None;
+            }
+            plan.push(self.mma_pipe(&j.w, mw.offsets.is_some(), j.n_out, n_in, false)?);
+            y_total += t * j.n_out;
+        }
+        let mut st = self.staging.lock().unwrap();
+        let st = &mut *st;
+        if !self.ensure_staging(st, t * n_in * 4, y_total * 4)
+            || !self.grow(&mut st.xh, t * n_in * 2)
+            || !self.grow(&mut st.rs, (t + MMA_TM) * 4)
+        {
+            return Some(false);
+        }
+        let t0 = Instant::now();
+        unsafe { par_copy(self.contents(st.x) as *mut f32, x.as_ptr(), t * n_in) };
+        let encode = |e: &Enc, jobs: &&mut [Job]| {
+            self.encode_x_half(e, st.x, st.xh.id, st.rs.id, n_in, t, None);
+            let mut y_off = 0usize;
+            for (j, &(pipe, tn)) in jobs.iter().zip(&plan) {
+                let mw = j.dev.downcast_ref::<MetalWeight>().unwrap();
+                let (_, elem_bytes, scale_bytes) = format_index(&j.w);
+                let s_off = match &j.w {
+                    WeightRef::Gguf(m) => m.row_bytes(),
+                    _ => mw.scales.as_ref().map(|s| s.offset_bytes / scale_bytes).unwrap_or(0),
+                };
+                e.pipe(pipe);
+                e.buf(mw.data.id, 0, 0);
+                e.buf(mw.scales.as_ref().map(|s| s.id).unwrap_or(mw.data.id), 0, 1);
+                e.buf(st.xh.id, 0, 2);
+                e.buf(st.y, y_off * 4, 3);
+                e.bytes(
+                    &MmaParams {
+                        n_out: j.n_out as u32,
+                        n_in: n_in as u32,
+                        w_off: (mw.data.offset_bytes / elem_bytes) as u32,
+                        s_off: s_off as u32,
+                        rows: t as u32,
+                        _p: [0; 3],
+                    },
+                    4,
+                );
+                e.buf(st.rs.id, 0, 5);
+                if let Some((ob, gpr, gk)) = &mw.offsets {
+                    e.buf(ob.id, 0, 6);
+                    e.bytes(
+                        &OffsetParams {
+                            o_off: (ob.offset_bytes / 2) as u32,
+                            gpr: *gpr,
+                            gk: *gk,
+                            _p: 0,
+                        },
+                        7,
+                    );
+                }
+                e.dispatch((j.n_out / tn, t.div_ceil(MMA_TM)), 128);
+                y_off += t * j.n_out;
+            }
+        };
+        let yp = self.contents(st.y) as *const f32;
+        let read_back = |jobs: &mut &mut [Job]| {
+            let mut y_off = 0usize;
+            for j in jobs.iter_mut() {
+                unsafe { par_copy(j.y.as_mut_ptr(), yp.add(y_off), t * j.n_out) };
+                y_off += t * j.n_out;
+            }
+        };
+        let mut jobs = jobs;
+        Some(self.submit(t0, &mut jobs, encode, read_back))
+    }
+}
+
 fn format_index(w: &WeightRef) -> (usize, usize, usize) {
     // (pipeline index, bytes per weight element, bytes per scale)
     match w {
@@ -996,7 +1669,14 @@ impl Backend for MetalBackend {
     }
 
     fn wants(&self, n_out: usize, n_in: usize, t: usize) -> bool {
-        t >= MIN_T && n_out.is_multiple_of(TILE) && n_in.is_multiple_of(32) && 2.0 * (t * n_out * n_in) as f64 >= MIN_FLOPS
+        // OXINFER_METAL_MIN_T=N: take matmuls from N tokens on, whatever their size (experiments).
+        static MIN_T_ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        let min_t = *MIN_T_ENV.get_or_init(|| std::env::var("OXINFER_METAL_MIN_T").ok().and_then(|v| v.parse().ok()));
+        let big = match min_t {
+            Some(m) => t >= m,
+            None => t >= MIN_T && 2.0 * (t * n_out * n_in) as f64 >= MIN_FLOPS,
+        };
+        big && n_out.is_multiple_of(TILE) && n_in.is_multiple_of(32)
     }
 
     fn upload(&self, w: &WeightRef, _n_out: usize, _n_in: usize) -> Option<DeviceWeight> {
@@ -1415,9 +2095,253 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn upload_moe(&self, gate_up: &[WeightRef], down: &[WeightRef], h: usize, mi: usize) -> Option<DeviceWeight> {
+        self.mma.as_ref()?;
+        if gate_up.is_empty() || gate_up.len() != down.len() {
+            return None;
+        }
+        let affine = |w: &WeightRef| matches!(w, WeightRef::Q4(m) if m.offsets.is_some());
+        let (pg, _) = self.mma_pipe(&gate_up[0], affine(&gate_up[0]), 2 * mi, h, true)?;
+        let (pd, _) = self.mma_pipe(&down[0], affine(&down[0]), h, mi, true)?;
+        let row_bytes = |w: &WeightRef| match w {
+            WeightRef::Gguf(g) => g.row_bytes(),
+            _ => 0,
+        };
+        // Every expert's (data, scales) memory regions; one format for all.
+        let regions = |w: &WeightRef| -> ((usize, usize), Option<(usize, usize)>) {
+            fn span<T>(v: &[T]) -> (usize, usize) {
+                (v.as_ptr() as usize, std::mem::size_of_val(v))
+            }
+            match w {
+                WeightRef::Bf16(v) => (span(v), None),
+                WeightRef::Q8(m) => (span(&m.q[..]), Some(span(&m.scales[..]))),
+                WeightRef::Q4(m) => (span(&m.q[..]), Some(span(&m.scales[..]))),
+                WeightRef::Gguf(m) => (span(&m.data[..]), None),
+            }
+        };
+        let mut all: Vec<(usize, usize)> = Vec::new();
+        for (w, n_out, n_in, pipe) in gate_up
+            .iter()
+            .map(|w| (w, 2 * mi, h, pg))
+            .chain(down.iter().map(|w| (w, h, mi, pd)))
+        {
+            if self.mma_pipe(w, affine(w), n_out, n_in, true)?.0 != pipe {
+                return None;
+            }
+            let (d, s) = regions(w);
+            all.push(d);
+            all.extend(s);
+        }
+        // Experts usually are slices of one tensor per projection: wrap adjacent regions as one
+        // buffer, so a submission makes a few buffers resident rather than one per expert.
+        all.sort_unstable();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for (p, n) in all {
+            match spans.last_mut() {
+                Some((s, e)) if p <= *e => *e = (*e).max(p + n),
+                _ => spans.push((p, p + n)),
+            }
+        }
+        let release: (MsgVoid, Sel) = (self.o.msg_send(), self.sels.release);
+        let mut dev = MoeDev {
+            pipes: (pg, pd),
+            row_bytes: (row_bytes(&gate_up[0]) as u32, row_bytes(&down[0]) as u32),
+            bufs: Vec::with_capacity(spans.len()),
+            ep: (std::ptr::null_mut(), std::ptr::null_mut()),
+            residency: None,
+            release,
+        };
+        let mut addr: Vec<u64> = Vec::with_capacity(spans.len());
+        for &(s, e) in &spans {
+            let b = self.wrap(s as *const u8, e - s)?;
+            addr.push(self.gpu_address(&b));
+            dev.bufs.push(b);
+        }
+        let at = |p: usize| {
+            let i = spans.partition_point(|&(s, _)| s <= p) - 1;
+            addr[i] + (p - spans[i].0) as u64
+        };
+        let table = |ws: &[WeightRef]| -> Vec<[u64; 2]> {
+            ws.iter()
+                .map(|w| {
+                    let (d, s) = regions(w);
+                    [at(d.0), s.map_or(at(d.0), |s| at(s.0))]
+                })
+                .collect()
+        };
+        let copy: MsgNewBufBytes = self.o.msg_send();
+        for (slot, tab) in [(&mut dev.ep.0, table(gate_up)), (&mut dev.ep.1, table(down))] {
+            *slot = unsafe {
+                copy(
+                    self.device,
+                    self.sels.new_buffer_bytes,
+                    tab.as_ptr() as *const c_void,
+                    tab.len() * 16,
+                    0,
+                )
+            };
+            if slot.is_null() {
+                return None;
+            }
+        }
+        if let Some(r) = &self.residency {
+            r.update(&dev.bufs.iter().map(|b| b.id).collect::<Vec<_>>(), true);
+            dev.residency = Some(r.clone());
+        }
+        Some(Box::new(dev))
+    }
+
+    fn moe(&self, x: &[f32], t: usize, h: usize, mi: usize, routes: &[Vec<(usize, f32)>], dev: &DeviceWeight, y: &mut [f32]) -> bool {
+        if std::env::var("OXINFER_METAL_MOE").as_deref() == Ok("0") {
+            return false;
+        }
+        let (Some(m), Some(md)) = (self.mma.as_ref(), dev.downcast_ref::<MoeDev>()) else {
+            return false;
+        };
+        let k = routes.first().map_or(0, |r| r.len());
+        if t == 0 || k == 0 || routes.len() != t || routes.iter().any(|r| r.len() != k) || x.len() < t * h || y.len() < t * h {
+            return false;
+        }
+        // Rows per expert, in expert order: the gathered input is one segment per expert, cut
+        // into tiles of MMA_GTM rows.
+        let mut count: Vec<usize> = Vec::new();
+        for &(e, _) in routes.iter().flatten() {
+            if e >= count.len() {
+                count.resize(e + 1, 0);
+            }
+            count[e] += 1;
+        }
+        let mut start = vec![0usize; count.len()];
+        let mut tiles: Vec<[u32; 4]> = Vec::new();
+        let mut rows = 0usize;
+        for (e, &c) in count.iter().enumerate() {
+            start[e] = rows;
+            for t0 in (0..c).step_by(MMA_GTM) {
+                tiles.push([e as u32, rows as u32, c as u32, t0 as u32]);
+            }
+            rows += c;
+        }
+        // Gathered row sources, and each token's (row, weight) slots for the combination.
+        let mut src = vec![0u32; rows];
+        let mut slots = vec![[0u32; 2]; t * k];
+        for (ti, r) in routes.iter().enumerate() {
+            for (j, &(e, w)) in r.iter().enumerate() {
+                let i = start[e];
+                start[e] += 1;
+                src[i] = ti as u32;
+                slots[ti * k + j] = [i as u32, w.to_bits()];
+            }
+        }
+        let mut st = self.staging.lock().unwrap();
+        let st = &mut *st;
+        let pad = rows + MMA_GTM;
+        let ok = self.ensure_staging(st, t * h * 4, t * h * 4)
+            && self.grow(&mut st.xh, rows * h * 2)
+            && self.grow(&mut st.rs, pad * 4)
+            && self.grow(&mut st.m_gu, rows * 2 * mi * 4)
+            && self.grow(&mut st.m_ah, rows * mi * 2)
+            && self.grow(&mut st.m_rs2, pad * 4)
+            && self.grow(&mut st.m_o, rows * h * 4)
+            && self.grow(&mut st.m_src, rows * 4)
+            && self.grow(&mut st.m_tiles, tiles.len() * 16)
+            && self.grow(&mut st.m_slots, slots.len() * 8);
+        if !ok {
+            return false;
+        }
+        let t0 = Instant::now();
+        // SAFETY: every buffer was just sized for what is copied into it.
+        unsafe {
+            let cp = |dst: Id, src: *const u8, n: usize| std::ptr::copy_nonoverlapping(src, self.contents(dst), n);
+            par_copy(self.contents(st.x) as *mut f32, x.as_ptr(), t * h);
+            cp(st.m_src.id, src.as_ptr() as *const u8, rows * 4);
+            cp(st.m_tiles.id, tiles.as_ptr() as *const u8, tiles.len() * 16);
+            cp(st.m_slots.id, slots.as_ptr() as *const u8, slots.len() * 8);
+        }
+        let params = |n_out: usize, n_in: usize, s_off: u32| MmaParams {
+            n_out: n_out as u32,
+            n_in: n_in as u32,
+            w_off: 0,
+            s_off,
+            rows: rows as u32,
+            _p: [0; 3],
+        };
+        let resident: Vec<Id> = match md.residency {
+            Some(_) => Vec::new(),
+            None => md.bufs.iter().map(|b| b.id).collect(),
+        };
+        let encode = |e: &Enc, _: &()| {
+            e.use_resources(&resident);
+            self.encode_x_half(e, st.x, st.xh.id, st.rs.id, h, rows, Some(st.m_src.id));
+            let grouped = |pipe: Id, ep: Id, xh: Id, out: Id, rs: Id, p: &MmaParams| {
+                e.pipe(pipe);
+                e.buf(ep, 0, 0);
+                e.buf(st.m_tiles.id, 0, 1);
+                e.buf(xh, 0, 2);
+                e.buf(out, 0, 3);
+                e.bytes(p, 4);
+                e.buf(rs, 0, 5);
+                e.dispatch((p.n_out as usize / 64, tiles.len()), 128);
+            };
+            grouped(
+                md.pipes.0,
+                md.ep.0,
+                st.xh.id,
+                st.m_gu.id,
+                st.rs.id,
+                &params(2 * mi, h, md.row_bytes.0),
+            );
+            #[repr(C)]
+            struct Xh {
+                n: u32,
+                gather: u32,
+            }
+            e.pipe(m.silu_half);
+            e.buf(st.m_gu.id, 0, 0);
+            e.buf(st.m_ah.id, 0, 1);
+            e.buf(st.m_rs2.id, 0, 2);
+            e.bytes(&Xh { n: mi as u32, gather: 0 }, 3);
+            e.dispatch((rows, 1), 256);
+            grouped(
+                md.pipes.1,
+                md.ep.1,
+                st.m_ah.id,
+                st.m_o.id,
+                st.m_rs2.id,
+                &params(h, mi, md.row_bytes.1),
+            );
+            #[repr(C)]
+            struct Cb {
+                n: u32,
+                k: u32,
+            }
+            e.pipe(m.combine);
+            e.buf(st.m_o.id, 0, 0);
+            e.buf(st.m_slots.id, 0, 1);
+            e.buf(st.y, 0, 2);
+            e.bytes(&Cb { n: h as u32, k: k as u32 }, 3);
+            e.dispatch(((h / 4).div_ceil(64), t), 64);
+        };
+        let out = self.contents(st.y) as *const f32;
+        let read_back = |_: &mut ()| {
+            // SAFETY: the output buffer holds t * h floats.
+            let out = unsafe { std::slice::from_raw_parts(out, t * h) };
+            crate::kernels::for_chunks(&mut y[..t * h], h, t > 1, |ti, row| {
+                for (a, b) in row.iter_mut().zip(&out[ti * h..(ti + 1) * h]) {
+                    *a += b;
+                }
+            });
+        };
+        self.submit(t0, &mut (), encode, read_back)
+    }
+
     fn matmul(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [Job]) -> bool {
         if jobs.is_empty() || !n_in.is_multiple_of(32) || x.len() < t * n_in {
             return false;
+        }
+        if self.mma.is_some()
+            && let Some(ok) = self.matmul_mma(x, t, n_in, jobs)
+        {
+            return ok;
         }
         let t_pad = t.div_ceil(TILE) * TILE;
         let mut y_total = 0;
@@ -1532,6 +2456,160 @@ impl Backend for MetalBackend {
             self.stats.gpu_ns.fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
             self.stats.copy_out_ns.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
             ok
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernels;
+    use crate::quant::{quantize_bf16, quantize_q4};
+
+    /// A backend with the matrix-unit kernels, or None (other devices skip these tests).
+    fn backend() -> Option<MetalBackend> {
+        let b = MetalBackend::new().ok()?;
+        b.mma.as_ref()?;
+        Some(b)
+    }
+
+    fn rnd(seed: &mut u64) -> f32 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+    }
+
+    fn bf16(n: usize, seed: &mut u64) -> Vec<u16> {
+        (0..n).map(|_| (rnd(seed).to_bits() >> 16) as u16).collect()
+    }
+
+    /// Rows of very different magnitudes (the per-row half scaling must cover them, beyond
+    /// half's range included).
+    fn input(t: usize, n: usize, seed: &mut u64) -> Vec<f32> {
+        (0..t * n).map(|i| rnd(seed) * [1e-3, 1.0, 300.0, 2e5][(i / n) % 4]).collect()
+    }
+
+    /// Worst error of any row relative to that row's largest reference value.
+    fn row_err(y: &[f32], r: &[f32], n: usize) -> f32 {
+        y.chunks(n)
+            .zip(r.chunks(n))
+            .map(|(a, b)| {
+                let m = b.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-30);
+                a.iter().zip(b).fold(0f32, |e, (p, q)| e.max((p - q).abs())) / m
+            })
+            .fold(0f32, f32::max)
+    }
+
+    fn cpu(w: &WeightRef, n_out: usize, n_in: usize, x: &[f32], t: usize) -> Vec<f32> {
+        let mut y = vec![0f32; t * n_out];
+        match w {
+            WeightRef::Bf16(w) => kernels::matmul(w, n_out, n_in, x, t, &mut y),
+            WeightRef::Q8(m) => kernels::matmul_quant_multi(&mut [(*m, &mut y[..])], x, t),
+            WeightRef::Q4(m) => kernels::matmul_quant_multi(&mut [(*m, &mut y[..])], x, t),
+            WeightRef::Gguf(m) => kernels::matmul_quant_multi(&mut [(*m, &mut y[..])], x, t),
+        }
+        y
+    }
+
+    #[test]
+    fn mma_matmul_matches_cpu() {
+        let Some(be) = backend() else { return };
+        let (n_out, n_in, t) = (192, 512, 150); // a partial token tile, bf16 at 64 outputs per group
+        let mut seed = 1;
+        let w = bf16(n_out * n_in, &mut seed);
+        let q8 = quantize_bf16(&w, n_out, n_in);
+        let q4 = quantize_q4(&w, n_out, n_in);
+        let gg: Vec<_> = [GgmlType::Q4_K, GgmlType::Q6_K, GgmlType::IQ4_XS]
+            .into_iter()
+            .map(|k| {
+                let raw = crate::ggml::random_blocks(k, n_out * n_in / k.block_size(), &mut seed);
+                crate::ggml::GgufMatrix::from_bytes(k, &raw, n_out, n_in).unwrap()
+            })
+            .collect();
+        let mut ws = vec![WeightRef::Bf16(&w), WeightRef::Q8(&q8), WeightRef::Q4(&q4)];
+        ws.extend(gg.iter().map(WeightRef::Gguf));
+        let x = input(t, n_in, &mut seed);
+        for w in &ws {
+            let dev = be.upload(w, n_out, n_in).unwrap();
+            let mut y = vec![0f32; t * n_out];
+            let wr = match w {
+                WeightRef::Bf16(v) => WeightRef::Bf16(v),
+                WeightRef::Q8(m) => WeightRef::Q8(m),
+                WeightRef::Q4(m) => WeightRef::Q4(m),
+                WeightRef::Gguf(m) => WeightRef::Gguf(m),
+            };
+            let mut jobs = [Job {
+                w: wr,
+                dev: &dev,
+                n_out,
+                y: &mut y,
+            }];
+            assert!(be.matmul_mma(&x, t, n_in, &mut jobs) == Some(true));
+            let e = row_err(&y, &cpu(w, n_out, n_in, &x, t), n_out);
+            assert!(e < 3e-3, "relative error {e}");
+        }
+    }
+
+    /// `w` as f32 rows, and an exact (f64) matrix-vector product with them.
+    fn dense(w: &WeightRef, n_out: usize, n_in: usize) -> Vec<f32> {
+        let mut f = vec![0f32; n_out * n_in];
+        match w {
+            WeightRef::Bf16(v) => f.iter_mut().zip(v.iter()).for_each(|(o, &b)| *o = f32::from_bits((b as u32) << 16)),
+            WeightRef::Q4(m) => crate::quant::dequantize_rows_q4(m, 0, n_out, &mut f),
+            _ => unimplemented!(),
+        }
+        f
+    }
+    fn matvec(w: &[f32], x: &[f32]) -> Vec<f32> {
+        w.chunks(x.len())
+            .map(|r| r.iter().zip(x).map(|(a, b)| *a as f64 * *b as f64).sum::<f64>() as f32)
+            .collect()
+    }
+
+    #[test]
+    fn mma_moe_matches_cpu() {
+        let Some(be) = backend() else { return };
+        let (ne, h, mi, t) = (8, 128, 64, 75);
+        let mut seed = 7;
+        // bf16 experts as slices of one tensor per projection (one buffer each), Q4 separately.
+        let gu = bf16(ne * 2 * mi * h, &mut seed);
+        let dn = bf16(ne * h * mi, &mut seed);
+        let gu4: Vec<_> = gu.chunks(2 * mi * h).map(|w| quantize_q4(w, 2 * mi, h)).collect();
+        let dn4: Vec<_> = dn.chunks(h * mi).map(|w| quantize_q4(w, h, mi)).collect();
+        let x = input(t, h, &mut seed);
+        // Routes: expert 5 unused, the others with uneven loads.
+        let routes: Vec<Vec<(usize, f32)>> = (0..t)
+            .map(|i| vec![([0, 1, 2, 3, 4, 6, 7][i % 7], 0.7), ([1, 7][i % 2], 0.3)])
+            .collect();
+        for q4 in [false, true] {
+            let (wg, wd): (Vec<WeightRef>, Vec<WeightRef>) = (0..ne)
+                .map(|e| match q4 {
+                    false => (
+                        WeightRef::Bf16(&gu[e * 2 * mi * h..(e + 1) * 2 * mi * h]),
+                        WeightRef::Bf16(&dn[e * h * mi..(e + 1) * h * mi]),
+                    ),
+                    true => (WeightRef::Q4(&gu4[e]), WeightRef::Q4(&dn4[e])),
+                })
+                .unzip();
+            let dev = be.upload_moe(&wg, &wd, h, mi).unwrap();
+            let mut y = vec![0f32; t * h];
+            assert!(be.moe(&x, t, h, mi, &routes, &dev, &mut y));
+            let fg: Vec<Vec<f32>> = wg.iter().map(|w| dense(w, 2 * mi, h)).collect();
+            let fd: Vec<Vec<f32>> = wd.iter().map(|w| dense(w, h, mi)).collect();
+            let mut r = vec![0f32; t * h];
+            for (i, rt) in routes.iter().enumerate() {
+                let xi = &x[i * h..(i + 1) * h];
+                for &(e, wt) in rt {
+                    let g = matvec(&fg[e], xi);
+                    let a: Vec<f32> = (0..mi).map(|j| g[j] / (1.0 + (-g[j]).exp()) * g[mi + j]).collect();
+                    let o = matvec(&fd[e], &a);
+                    for (yv, ov) in r[i * h..(i + 1) * h].iter_mut().zip(&o) {
+                        *yv += wt * ov;
+                    }
+                }
+            }
+
+            let e = row_err(&y, &r, h);
+            assert!(e < 3e-3, "q4 {q4}: relative error {e}");
         }
     }
 }

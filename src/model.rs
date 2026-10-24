@@ -469,7 +469,7 @@ impl<'a> Lin<'a> {
     pub fn set_transient_device(&self, on: bool) {
         self.transient.store(on, std::sync::atomic::Ordering::Relaxed);
     }
-    fn is_transient(&self) -> bool {
+    pub(crate) fn is_transient(&self) -> bool {
         self.transient.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
