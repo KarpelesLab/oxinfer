@@ -180,6 +180,9 @@ impl<'a> QwenMtp<'a> {
                 l.set_transient_device(s);
             }
         }
+        for l in self.ffn.expert_lins().into_iter().flatten() {
+            l.set_transient_device(true);
+        }
     }
 
     /// Brackets the layer and the draft head with `hook`'s units (None stops streaming).

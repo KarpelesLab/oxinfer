@@ -159,6 +159,8 @@ pub struct StreamStats {
     /// On-demand parts (experts) requested, and how many of them were in the part cache.
     pub parts: u64,
     pub parts_cached: u64,
+    /// Time spent dropping used units from the page cache.
+    pub evict_time: Duration,
 }
 
 impl std::ops::Sub for StreamStats {
@@ -176,6 +178,7 @@ impl std::ops::Sub for StreamStats {
             resident_uses: self.resident_uses - o.resident_uses,
             parts: self.parts - o.parts,
             parts_cached: self.parts_cached - o.parts_cached,
+            evict_time: self.evict_time.saturating_sub(o.evict_time),
         }
     }
 }
@@ -290,7 +293,19 @@ struct State {
     cur: usize,
     loaded: Vec<bool>,
     in_use: Option<usize>,
+    /// Being read by the reader, and being evicted by the evictor.
+    loading: Option<usize>,
+    evicting: Option<usize>,
     stop: bool,
+}
+
+/// Page-cache drops left to the evictor thread (`msync(MS_INVALIDATE)` costs ~50 ms per GB on
+/// Darwin, which would otherwise sit between two units of a pass).
+enum Evict {
+    /// A streamed unit, by position in `order`.
+    Unit(usize),
+    /// An on-demand part `(unit, part)` the part cache let go.
+    Part(usize, usize),
 }
 
 #[derive(Default)]
@@ -306,6 +321,7 @@ struct Counters {
     resident_uses: AtomicU64,
     parts: AtomicU64,
     parts_cached: AtomicU64,
+    evict_ns: AtomicU64,
 }
 
 struct Inner {
@@ -328,12 +344,16 @@ struct Inner {
     parts: Mutex<PartCache>,
     /// On-demand loads in progress: the reader's read-ahead waits for them.
     demand: std::sync::atomic::AtomicUsize,
+    /// Evictions waiting for the evictor thread, and whether it is to stop (once they are done).
+    evq: Mutex<(Vec<Evict>, bool)>,
+    evcv: Condvar,
 }
 
 /// The streaming engine shared by the models it serves (see the module docs).
 pub struct Streamer {
     inner: Arc<Inner>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    evictor: Mutex<Option<std::thread::JoinHandle<()>>>,
     plan: StreamPlan,
 }
 
@@ -520,6 +540,8 @@ impl Streamer {
                 cur: 0,
                 loaded: vec![false; n],
                 in_use: None,
+                loading: None,
+                evicting: None,
                 stop: false,
             }),
             cv: Condvar::new(),
@@ -529,6 +551,8 @@ impl Streamer {
                 ..Default::default()
             }),
             demand: std::sync::atomic::AtomicUsize::new(0),
+            evq: Mutex::new((Vec::new(), false)),
+            evcv: Condvar::new(),
         });
         if managed {
             plan.resident_failures = inner.setup();
@@ -543,9 +567,17 @@ impl Streamer {
                 .spawn(move || inner.io_loop())
                 .context("start the weight streaming thread")?
         };
+        let ev = {
+            let inner = inner.clone();
+            std::thread::Builder::new()
+                .name("oxinfer-evict".into())
+                .spawn(move || inner.evict_loop())
+                .context("start the page-cache eviction thread")?
+        };
         Ok(Arc::new(Self {
             inner,
             thread: Mutex::new(Some(th)),
+            evictor: Mutex::new(Some(ev)),
             plan,
         }))
     }
@@ -572,6 +604,7 @@ impl Streamer {
             resident_uses: c.resident_uses.load(Relaxed),
             parts: c.parts.load(Relaxed),
             parts_cached: c.parts_cached.load(Relaxed),
+            evict_time: Duration::from_nanos(c.evict_ns.load(Relaxed)),
         }
     }
 
@@ -699,15 +732,7 @@ impl Streamer {
                 out.extend(pc.admit(k, inner.units[k.0].parts[k.1].bytes));
             }
         }
-        let mut n = 0;
-        for (vu, vp) in out {
-            for s in &inner.units[vu].parts[vp].inner {
-                if sys::evict(&inner.files[s.file], *s) {
-                    n += s.len as u64;
-                }
-            }
-        }
-        inner.c.bytes_evicted.fetch_add(n, Relaxed);
+        inner.queue_evictions(out.into_iter().map(|(u, p)| Evict::Part(u, p)));
     }
 
     fn end(&self, u: usize) {
@@ -720,7 +745,7 @@ impl Streamer {
         st.in_use = None;
         st.loaded[p] = false;
         if inner.managed && inner.opts.evict {
-            inner.evict(inner.order[p]);
+            inner.queue_evictions([Evict::Unit(p)]);
         }
         st.cur = (p + 1) % inner.order.len();
         inner.cv.notify_all();
@@ -734,6 +759,12 @@ impl Streamer {
         self.inner.st.lock().unwrap().stop = true;
         self.inner.cv.notify_all();
         if let Some(t) = self.thread.lock().unwrap().take() {
+            let _ = t.join();
+        }
+        // The evictor finishes the queue first.
+        self.inner.evq.lock().unwrap().1 = true;
+        self.inner.evcv.notify_all();
+        if let Some(t) = self.evictor.lock().unwrap().take() {
             let _ = t.join();
         }
     }
@@ -801,6 +832,7 @@ impl Inner {
             &c.resident_uses,
             &c.parts,
             &c.parts_cached,
+            &c.evict_ns,
         ] {
             a.store(0, Relaxed);
         }
@@ -841,7 +873,81 @@ impl Inner {
         failures
     }
 
+    fn queue_evictions(&self, items: impl IntoIterator<Item = Evict>) {
+        let mut q = self.evq.lock().unwrap();
+        if q.1 {
+            // Stopped: evict here.
+            drop(q);
+            for e in items {
+                match e {
+                    Evict::Unit(p) => self.evict(self.order[p]),
+                    Evict::Part(u, p) => self.evict_part(u, p),
+                }
+            }
+            return;
+        }
+        q.0.extend(items);
+        self.evcv.notify_all();
+    }
+
+    /// The evictor thread: drops queued units and parts from the page cache, skipping those
+    /// wanted again meanwhile (a unit back in the read-ahead, a part in use or cached again).
+    fn evict_loop(&self) {
+        loop {
+            let items = {
+                let mut q = self.evq.lock().unwrap();
+                loop {
+                    if !q.0.is_empty() {
+                        break std::mem::take(&mut q.0);
+                    }
+                    if q.1 {
+                        return;
+                    }
+                    q = self.evcv.wait(q).unwrap();
+                }
+            };
+            for e in items {
+                match e {
+                    Evict::Unit(p) => {
+                        {
+                            let mut st = self.st.lock().unwrap();
+                            if st.loaded[p] || st.in_use == Some(p) || st.loading == Some(p) {
+                                continue;
+                            }
+                            st.evicting = Some(p);
+                        }
+                        self.evict(self.order[p]);
+                        self.st.lock().unwrap().evicting = None;
+                        self.cv.notify_all();
+                    }
+                    Evict::Part(u, p) => {
+                        {
+                            let pc = self.parts.lock().unwrap();
+                            if pc.in_use.contains(&(u, p)) || pc.entries.contains_key(&(u, p)) {
+                                continue;
+                            }
+                        }
+                        self.evict_part(u, p);
+                    }
+                }
+            }
+        }
+    }
+
+    fn evict_part(&self, u: usize, p: usize) {
+        let t = Instant::now();
+        let mut n = 0;
+        for s in &self.units[u].parts[p].inner {
+            if sys::evict(&self.files[s.file], *s) {
+                n += s.len as u64;
+            }
+        }
+        self.c.bytes_evicted.fetch_add(n, Relaxed);
+        self.c.evict_ns.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+    }
+
     fn evict(&self, u: usize) {
+        let t = Instant::now();
         let mut n = 0;
         for s in &self.units[u].inner {
             if sys::evict(&self.files[s.file], *s) {
@@ -849,6 +955,7 @@ impl Inner {
             }
         }
         self.c.bytes_evicted.fetch_add(n, Relaxed);
+        self.c.evict_ns.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
     }
 
     /// Brings unit `u` into the page cache (and this process's page tables) with `io_threads`
@@ -895,6 +1002,8 @@ impl Inner {
                 } else {
                     sys::resident_bytes(c.addr, c.len, self.page).unwrap_or(0)
                 };
+                // A span ending with a partial page at the end of a file counts that page whole.
+                let have = have.min(c.len as u64);
                 let miss = c.len as u64 - have;
                 self.c.bytes_cached.fetch_add(have, Relaxed);
                 self.c.bytes_read.fetch_add(miss, Relaxed);
@@ -970,7 +1079,11 @@ impl Inner {
                             }
                         }
                     }
-                    if let Some(&p) = want.iter().find(|&&p| !st.loaded[p] && st.in_use != Some(p)) {
+                    if let Some(&p) = want
+                        .iter()
+                        .find(|&&p| !st.loaded[p] && st.in_use != Some(p) && st.evicting != Some(p))
+                    {
+                        st.loading = Some(p);
                         break p;
                     }
                     st = self.cv.wait(st).unwrap();
@@ -981,6 +1094,7 @@ impl Inner {
             self.c.io_ns.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
             let mut st = self.st.lock().unwrap();
             st.loaded[job] = true;
+            st.loading = None;
             self.cv.notify_all();
         }
     }
@@ -1393,6 +1507,7 @@ mod tests {
                 assert_eq!(sum(p + 1), want[p + 1]);
             }
         }
+        s.shutdown(); // waits for the evictions
         let st = s.stats();
         // Five parts requested; part 2 was the most recent one when the second pass asked again.
         assert_eq!((st.parts, st.parts_cached), (5, 1), "{st:?}");

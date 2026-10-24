@@ -628,6 +628,13 @@ impl<'a> QwenModel<'a> {
                 l.set_transient_device(s);
             }
         }
+        // Routed experts are read on demand and evicted whatever their layer: no device state
+        // (which would pin their pages) outlives a call.
+        for layer in &self.layers {
+            for l in layer.ffn.expert_lins().into_iter().flatten() {
+                l.set_transient_device(true);
+            }
+        }
     }
 
     /// Brackets every layer and the LM head with `hook`'s units (None stops streaming).

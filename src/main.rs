@@ -1075,14 +1075,15 @@ fn stream_line(d: &oxinfer::stream::StreamStats, tokens: usize, secs: f64) -> St
         String::new()
     };
     format!(
-        "{tokens} tok in {:.2}s: read {:.2} GB from storage, {:.2} GB cache hits, stalled {:.2}s ({:.0}%), reader busy {:.2}s (throttled {:.2}s){parts}",
+        "{tokens} tok in {:.2}s: read {:.2} GB from storage, {:.2} GB cache hits, stalled {:.2}s ({:.0}%), reader busy {:.2}s (throttled {:.2}s), evicting {:.2}s{parts}",
         secs,
         d.bytes_read as f64 / 1e9,
         d.bytes_cached as f64 / 1e9,
         d.stall.as_secs_f64(),
         100.0 * d.stall.as_secs_f64() / secs.max(1e-9),
         d.io_busy.as_secs_f64(),
-        d.throttled.as_secs_f64()
+        d.throttled.as_secs_f64(),
+        d.evict_time.as_secs_f64()
     )
 }
 
