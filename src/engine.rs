@@ -116,7 +116,7 @@ pub struct EngineOptions {
     /// MTP then drafts up to 8 tokens with a cost-aware length. The routed experts of MoE models
     /// are read on demand, recently used ones kept in a part of the page-cache budget. Keys
     /// `stream` (on with the defaults), `cache_budget_gb`, `resident_mb`, `prefetch_mb`,
-    /// `flash_mbps`, `expert_cache_mb`.
+    /// `flash_mbps`, `expert_cache_mb`, `expert_predict`.
     pub stream: Option<crate::stream::StreamOptions>,
     /// Core ML models: where Core ML may run them. Default (None): the Neural Engine, or the
     /// CPU / GPU when `device` asks for it. Key `coreml_units` (`auto`, `ane`, `all`, `gpu`,
@@ -291,6 +291,7 @@ impl EngineOptions {
         "prefetch_mb",
         "flash_mbps",
         "expert_cache_mb",
+        "expert_predict",
         "coreml_units",
         "coreml_prefill",
         "gpu_exact",
@@ -338,6 +339,7 @@ impl EngineOptions {
             "draft_tokens" => self.draft_tokens = parse_opt_usize(key, value)?,
             "cache_dir" => self.cache_dir = opt_str(value).map(PathBuf::from),
             "stream" => self.stream = parse_bool(key, value)?.then(Default::default),
+            "expert_predict" => self.stream.get_or_insert_with(Default::default).predict_experts = parse_bool(key, value)?,
             "cache_budget_gb" | "resident_mb" | "prefetch_mb" | "flash_mbps" | "expert_cache_mb" => {
                 let st = self.stream.get_or_insert_with(Default::default);
                 let v: f64 = value.parse().with_context(|| format!("{key}: not a number: {value:?}"))?;

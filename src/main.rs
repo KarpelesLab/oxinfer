@@ -54,6 +54,7 @@ struct Args {
     stream_trace: bool,
     stream_threads: Option<usize>,
     expert_cache_mb: Option<u64>,
+    expert_predict: bool,
     images: Vec<PathBuf>,
     audios: Vec<PathBuf>,
     dump_mm: Option<PathBuf>,
@@ -135,6 +136,7 @@ fn usage() -> ! {
          \x20 --stream-threads N   with --stream, reader threads (default 2)\n\
          \x20 --expert-cache-mb N  with --stream, page cache kept for recently used MoE experts (which\n\
          \x20                      are read on demand; default: what the budget leaves)\n\
+         \x20 --expert-predict     with --stream, read the next MoE layer's guessed experts ahead\n\
          \x20 --image FILE         attach an image (repeatable; PNG/JPEG/WebP/GIF/BMP via oxideav)\n\
          \x20 --audio FILE         attach an audio clip (repeatable; WAV/MP3/FLAC/AAC/OGG via oxideav)\n\
          \x20 --max-soft-tokens N  image soft-token budget: 70, 140, 280 (default), 560 or 1120\n\
@@ -217,6 +219,7 @@ fn parse_args() -> Result<Args> {
         stream_trace: false,
         stream_threads: None,
         expert_cache_mb: None,
+        expert_predict: false,
         images: Vec::new(),
         audios: Vec::new(),
         dump_mm: None,
@@ -322,6 +325,7 @@ fn parse_args() -> Result<Args> {
             "--stream-trace" => a.stream_trace = true,
             "--stream-threads" => a.stream_threads = Some(val()?.parse()?),
             "--expert-cache-mb" => a.expert_cache_mb = Some(val()?.parse()?),
+            "--expert-predict" => a.expert_predict = true,
             "--image" => a.images.push(PathBuf::from(val()?)),
             "--audio" => a.audios.push(PathBuf::from(val()?)),
             "--dump-mm" => a.dump_mm = Some(PathBuf::from(val()?)),
@@ -1019,6 +1023,7 @@ fn start_stream(
     if let Some(m) = args.expert_cache_mb {
         opts.part_cache_bytes = Some(m << 20);
     }
+    opts.predict_experts = args.expert_predict;
     if let Some(n) = args.stream_threads {
         opts.io_threads = n;
     }
@@ -1070,7 +1075,12 @@ fn start_stream(
 /// One line of streaming statistics for `steps` decoding steps (`--stream-trace` and summaries).
 fn stream_line(d: &oxinfer::stream::StreamStats, tokens: usize, secs: f64) -> String {
     let parts = if d.parts > 0 {
-        format!(", experts {} ({} cached)", d.parts, d.parts_cached)
+        let pre = if d.parts_prefetched > 0 {
+            format!(", {} guessed ahead, {} of them used", d.parts_prefetched, d.parts_prefetch_used)
+        } else {
+            String::new()
+        };
+        format!(", experts {} ({} cached{pre})", d.parts, d.parts_cached)
     } else {
         String::new()
     };

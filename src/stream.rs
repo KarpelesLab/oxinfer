@@ -85,6 +85,11 @@ pub struct StreamOptions {
     /// used out first. None: what the budget leaves after the resident set and the read-ahead
     /// window (0 without a budget).
     pub part_cache_bytes: Option<u64>,
+    /// MoE: after each layer, guess the next layer's experts (its router applied to the residual
+    /// stream) and read them ahead. Off by default: with a part cache most experts are hits, and
+    /// the guesses that miss cost bandwidth (Zawen at 6 GB / 2 GB/s: stalls 77% -> 44% of the
+    /// time but 27% more bytes read, 7.3 -> 6.9 tok/s).
+    pub predict_experts: bool,
 }
 
 impl Default for StreamOptions {
@@ -105,6 +110,7 @@ impl Default for StreamOptions {
             chunk_bytes: 8 << 20,
             io_threads: 2,
             part_cache_bytes: None,
+            predict_experts: false,
         }
     }
 }
@@ -161,6 +167,9 @@ pub struct StreamStats {
     pub parts_cached: u64,
     /// Time spent dropping used units from the page cache.
     pub evict_time: Duration,
+    /// Parts read ahead on a prediction, and how many of them a pass then used.
+    pub parts_prefetched: u64,
+    pub parts_prefetch_used: u64,
 }
 
 impl std::ops::Sub for StreamStats {
@@ -179,6 +188,8 @@ impl std::ops::Sub for StreamStats {
             parts: self.parts - o.parts,
             parts_cached: self.parts_cached - o.parts_cached,
             evict_time: self.evict_time.saturating_sub(o.evict_time),
+            parts_prefetched: self.parts_prefetched - o.parts_prefetched,
+            parts_prefetch_used: self.parts_prefetch_used - o.parts_prefetch_used,
         }
     }
 }
@@ -239,6 +250,11 @@ struct PartCache {
     entries: std::collections::HashMap<(usize, usize), (u64, u64)>,
     by_use: std::collections::BTreeMap<u64, (usize, usize)>,
     in_use: Vec<(usize, usize)>,
+    /// Predicted parts waiting for the reader, the one it is reading, and those it has read and
+    /// no pass has used yet.
+    pending: std::collections::VecDeque<(usize, usize)>,
+    loading: Option<(usize, usize)>,
+    ready: Vec<(usize, usize)>,
 }
 
 impl PartCache {
@@ -299,6 +315,14 @@ struct State {
     stop: bool,
 }
 
+/// What the reader fetches next.
+enum Job {
+    /// A streamed unit, by position in `order`.
+    Unit(usize),
+    /// A predicted part `(unit, part)`.
+    Part((usize, usize)),
+}
+
 /// Page-cache drops left to the evictor thread (`msync(MS_INVALIDATE)` costs ~50 ms per GB on
 /// Darwin, which would otherwise sit between two units of a pass).
 enum Evict {
@@ -322,6 +346,8 @@ struct Counters {
     parts: AtomicU64,
     parts_cached: AtomicU64,
     evict_ns: AtomicU64,
+    parts_prefetched: AtomicU64,
+    parts_prefetch_used: AtomicU64,
 }
 
 struct Inner {
@@ -390,6 +416,15 @@ impl StreamHook {
     /// the part cache while it has room.
     pub fn need_parts(&self, i: usize, ids: &[usize]) {
         self.s.need_parts(self.base + i, ids);
+    }
+    /// Hints that parts `ids` of the model's unit `i` will be needed soon (experts predicted
+    /// for the next MoE layer): the reader fetches them ahead of its read-ahead of whole units.
+    pub fn prefetch_parts(&self, i: usize, ids: &[usize]) {
+        self.s.prefetch_parts(self.base + i, ids);
+    }
+    /// The streamer's settings.
+    pub fn options(&self) -> &StreamOptions {
+        self.s.options()
     }
     /// Reads `ranges` (`(address, length)` inside the mapped files) now, ahead of the read-ahead:
     /// the embedding rows of the tokens a pass is about to look up, which would otherwise fault
@@ -605,6 +640,8 @@ impl Streamer {
             parts: c.parts.load(Relaxed),
             parts_cached: c.parts_cached.load(Relaxed),
             evict_time: Duration::from_nanos(c.evict_ns.load(Relaxed)),
+            parts_prefetched: c.parts_prefetched.load(Relaxed),
+            parts_prefetch_used: c.parts_prefetch_used.load(Relaxed),
         }
     }
 
@@ -652,7 +689,19 @@ impl Streamer {
         let Some(unit) = inner.units.get(u) else { return };
         let mut spans = Vec::new();
         {
+            // A part the reader is fetching on a prediction is waited for, not read twice.
+            let mut st = inner.st.lock().unwrap();
+            loop {
+                let pc = inner.parts.lock().unwrap();
+                if !pc.loading.is_some_and(|k| k.0 == u && ids.contains(&k.1)) {
+                    break;
+                }
+                drop(pc);
+                st = inner.cv.wait(st).unwrap();
+            }
+            drop(st);
             let mut pc = inner.parts.lock().unwrap();
+            pc.pending.retain(|k| !(k.0 == u && ids.contains(&k.1)));
             for &p in ids {
                 let Some(part) = unit.parts.get(p) else { continue };
                 if pc.in_use.contains(&(u, p)) {
@@ -660,6 +709,10 @@ impl Streamer {
                 }
                 pc.in_use.push((u, p));
                 inner.c.parts.fetch_add(1, Relaxed);
+                if let Some(i) = pc.ready.iter().position(|&k| k == (u, p)) {
+                    pc.ready.swap_remove(i);
+                    inner.c.parts_prefetch_used.fetch_add(1, Relaxed);
+                }
                 if pc.touch((u, p)) {
                     inner.c.parts_cached.fetch_add(1, Relaxed);
                 }
@@ -714,16 +767,44 @@ impl Streamer {
         }
     }
 
+    fn prefetch_parts(&self, u: usize, ids: &[usize]) {
+        let inner = &self.inner;
+        let Some(unit) = inner.units.get(u) else { return };
+        {
+            let mut pc = inner.parts.lock().unwrap();
+            for &p in ids {
+                let k = (u, p);
+                if p >= unit.parts.len()
+                    || pc.in_use.contains(&k)
+                    || pc.entries.contains_key(&k)
+                    || pc.pending.contains(&k)
+                    || pc.loading == Some(k)
+                    || pc.ready.contains(&k)
+                {
+                    continue;
+                }
+                pc.pending.push_back(k);
+            }
+        }
+        let _st = inner.st.lock().unwrap();
+        inner.cv.notify_all();
+    }
+
     /// After unit `u`: its parts go to the part cache, or out of the page cache when that is full.
     fn release_parts(&self, u: usize) {
         let inner = &self.inner;
         let mut out = Vec::new();
         {
             let mut pc = inner.parts.lock().unwrap();
-            if !pc.in_use.iter().any(|k| k.0 == u) {
+            // Predictions for this unit that no pass asked for are dropped (or cached) too.
+            pc.pending.retain(|k| k.0 != u);
+            let unused: Vec<(usize, usize)> = pc.ready.iter().copied().filter(|k| k.0 == u).collect();
+            pc.ready.retain(|k| k.0 != u);
+            if !pc.in_use.iter().any(|k| k.0 == u) && unused.is_empty() {
                 return;
             }
-            let used: Vec<(usize, usize)> = pc.in_use.iter().copied().filter(|k| k.0 == u).collect();
+            let mut used: Vec<(usize, usize)> = pc.in_use.iter().copied().filter(|k| k.0 == u).collect();
+            used.extend(unused);
             pc.in_use.retain(|k| k.0 != u);
             if !(inner.managed && inner.opts.evict) {
                 return;
@@ -833,6 +914,8 @@ impl Inner {
             &c.parts,
             &c.parts_cached,
             &c.evict_ns,
+            &c.parts_prefetched,
+            &c.parts_prefetch_used,
         ] {
             a.store(0, Relaxed);
         }
@@ -1047,10 +1130,8 @@ impl Inner {
     fn io_loop(&self) {
         // As urgent as the compute threads, which wait for it.
         crate::pool::raise_qos();
+        // Runs even with every unit resident: predicted parts still come through here.
         let n = self.order.len();
-        if n == 0 {
-            return;
-        }
         loop {
             let job = {
                 let mut st = self.st.lock().unwrap();
@@ -1079,17 +1160,40 @@ impl Inner {
                             }
                         }
                     }
+                    // Predicted parts first: the pass will wait for them soonest.
+                    {
+                        let mut pc = self.parts.lock().unwrap();
+                        if let Some(k) = pc.pending.pop_front() {
+                            pc.loading = Some(k);
+                            break Job::Part(k);
+                        }
+                    }
                     if let Some(&p) = want
                         .iter()
                         .find(|&&p| !st.loaded[p] && st.in_use != Some(p) && st.evicting != Some(p))
                     {
                         st.loading = Some(p);
-                        break p;
+                        break Job::Unit(p);
                     }
                     st = self.cv.wait(st).unwrap();
                 }
             };
             let t = Instant::now();
+            match job {
+                Job::Part((u, p)) => {
+                    self.load_spans(&self.units[u].parts[p].spans, true, true);
+                    self.c.parts_prefetched.fetch_add(1, Relaxed);
+                    self.c.io_ns.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+                    let _st = self.st.lock().unwrap();
+                    let mut pc = self.parts.lock().unwrap();
+                    pc.loading = None;
+                    pc.ready.push((u, p));
+                    self.cv.notify_all();
+                    continue;
+                }
+                Job::Unit(_) => {}
+            }
+            let Job::Unit(job) = job else { unreachable!() };
             self.load(&self.units[self.order[job]], true);
             self.c.io_ns.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
             let mut st = self.st.lock().unwrap();
@@ -1507,10 +1611,18 @@ mod tests {
                 assert_eq!(sum(p + 1), want[p + 1]);
             }
         }
+        // A guessed part read ahead, then needed (whether or not the reader got to it first).
+        {
+            let _g = hook.enter(0);
+            hook.prefetch_parts(0, &[0]);
+            hook.need_parts(0, &[0]);
+            assert_eq!(sum(1), want[1]);
+        }
         s.shutdown(); // waits for the evictions
         let st = s.stats();
-        // Five parts requested; part 2 was the most recent one when the second pass asked again.
-        assert_eq!((st.parts, st.parts_cached), (5, 1), "{st:?}");
+        // Six parts requested; part 2 was the most recent one when the second pass asked again.
+        assert_eq!((st.parts, st.parts_cached), (6, 1), "{st:?}");
+        assert!(st.parts_prefetch_used <= st.parts_prefetched && st.parts_prefetched <= 1, "{st:?}");
         if cfg!(any(target_os = "macos", target_os = "ios")) {
             assert!(st.bytes_read >= 3 * SZ as u64, "{st:?}");
             assert!(st.bytes_evicted >= SZ as u64, "{st:?}");

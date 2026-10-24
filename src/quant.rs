@@ -203,6 +203,60 @@ pub struct QAct {
     pub n_in: usize,
 }
 
+/// One block of 32: int8 values (`v * 127 / amax`, rounded half away from zero), returning
+/// `amax` and the integer sum.
+#[inline(always)]
+fn quantize_block(blk: &[f32], q: &mut [i8]) -> (f32, i32) {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        let p = blk.as_ptr();
+        let v: [float32x4_t; 8] = std::array::from_fn(|i| vld1q_f32(p.add(4 * i)));
+        let mut m = vdupq_n_f32(0.0);
+        for x in v {
+            m = vmaxnmq_f32(m, vabsq_f32(x));
+        }
+        let amax = vmaxnmvq_f32(m);
+        let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+        let mut s = vdupq_n_s32(0);
+        for h in 0..4 {
+            let (a, b) = (
+                vcvtaq_s32_f32(vmulq_n_f32(v[2 * h], inv)),
+                vcvtaq_s32_f32(vmulq_n_f32(v[2 * h + 1], inv)),
+            );
+            s = vaddq_s32(s, vaddq_s32(a, b));
+            let n = vqmovn_s16(vcombine_s16(vqmovn_s32(a), vqmovn_s32(b)));
+            vst1_s8(q.as_mut_ptr().add(8 * h), n);
+        }
+        (amax, vaddvq_s32(s))
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+        let mut s = 0i32;
+        for (o, &v) in q.iter_mut().zip(blk) {
+            *o = (v * inv).round() as i8;
+            s += *o as i32;
+        }
+        (amax, s)
+    }
+}
+
+/// Quantizes one row of `x` (`n_in = q.len()` values) into its slices of a `QAct`.
+fn quantize_row(row: &[f32], q: &mut [i8], scales: &mut [f32], sums: &mut [i32], fsums: &mut [f32], hsums: &mut [f32]) {
+    for b in 0..row.len() / QBLOCK {
+        let blk = &row[b * QBLOCK..(b + 1) * QBLOCK];
+        let (amax, s) = quantize_block(blk, &mut q[b * QBLOCK..(b + 1) * QBLOCK]);
+        scales[b] = amax / 127.0;
+        sums[b] = s;
+        let (h0, h1): (f32, f32) = (blk[..16].iter().sum(), blk[16..].iter().sum());
+        hsums[2 * b] = h0;
+        hsums[2 * b + 1] = h1;
+        fsums[b] = blk.iter().sum();
+    }
+}
+
 pub fn quantize_act(x: &[f32], t: usize, n_in: usize) -> QAct {
     assert_eq!(x.len(), t * n_in);
     assert!(n_in.is_multiple_of(QBLOCK));
@@ -212,25 +266,36 @@ pub fn quantize_act(x: &[f32], t: usize, n_in: usize) -> QAct {
     let mut sums = vec![0i32; t * bpr];
     let mut fsums = vec![0f32; t * bpr];
     let mut hsums = vec![0f32; t * bpr * 2];
-    for ti in 0..t {
-        let row = &x[ti * n_in..(ti + 1) * n_in];
-        for b in 0..bpr {
-            let blk = &row[b * QBLOCK..(b + 1) * QBLOCK];
-            let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
-            let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
-            scales[ti * bpr + b] = amax / 127.0;
-            let mut s = 0i32;
-            for (i, &v) in blk.iter().enumerate() {
-                let qi = (v * inv).round() as i8;
-                q[ti * n_in + b * QBLOCK + i] = qi;
-                s += qi as i32;
+    if t == 1 {
+        quantize_row(x, &mut q, &mut scales, &mut sums, &mut fsums, &mut hsums);
+    } else {
+        // Rows in parallel (several tokens: speculative verification, prefill).
+        struct P<T>(*mut T);
+        unsafe impl<T> Sync for P<T> {}
+        impl<T> P<T> {
+            /// Row `i` of `n` elements. SAFETY: different jobs take different rows.
+            #[allow(clippy::mut_from_ref)]
+            unsafe fn row(&self, i: usize, n: usize) -> &mut [T] {
+                unsafe { std::slice::from_raw_parts_mut(self.0.add(i * n), n) }
             }
-            sums[ti * bpr + b] = s;
-            let (h0, h1): (f32, f32) = (blk[..16].iter().sum(), blk[16..].iter().sum());
-            hsums[(ti * bpr + b) * 2] = h0;
-            hsums[(ti * bpr + b) * 2 + 1] = h1;
-            fsums[ti * bpr + b] = blk.iter().sum();
         }
+        let (pq, ps, pi, pf, ph) = (
+            P(q.as_mut_ptr()),
+            P(scales.as_mut_ptr()),
+            P(sums.as_mut_ptr()),
+            P(fsums.as_mut_ptr()),
+            P(hsums.as_mut_ptr()),
+        );
+        crate::pool::run(t, &|ti| unsafe {
+            quantize_row(
+                &x[ti * n_in..(ti + 1) * n_in],
+                pq.row(ti, n_in),
+                ps.row(ti, bpr),
+                pi.row(ti, bpr),
+                pf.row(ti, bpr),
+                ph.row(ti, 2 * bpr),
+            )
+        });
     }
     QAct {
         q,
@@ -474,6 +539,39 @@ pub fn dequantize_rows_q4(m: &Q4Matrix, r0: usize, r1: usize, out: &mut [f32]) {
                 let byte = qrow[b * 16 + j];
                 orow[b * QBLOCK + j] = ((byte & 0x0F) as i32 - 8) as f32 * d + m;
                 orow[b * QBLOCK + j + 16] = ((byte >> 4) as i32 - 8) as f32 * d + m;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The vector / parallel activation quantization equals the plain scalar definition.
+    #[test]
+    fn activation_quantization_matches_scalar() {
+        let (t, n) = (5usize, 4 * QBLOCK);
+        let mut seed = 7u64;
+        let mut x: Vec<f32> = (0..t * n)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((seed >> 33) % 20001) as f32 / 1000.0 - 10.0
+            })
+            .collect();
+        x[QBLOCK..2 * QBLOCK].fill(0.0); // an all-zero block
+        x[2 * QBLOCK + 3] = 1e-30;
+        for tt in [1, t] {
+            let xa = quantize_act(&x[..tt * n], tt, n);
+            for (bi, blk) in x[..tt * n].chunks(QBLOCK).enumerate() {
+                let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+                let q: Vec<i8> = blk.iter().map(|&v| (v * inv).round() as i8).collect();
+                assert_eq!(&xa.q[bi * QBLOCK..(bi + 1) * QBLOCK], &q[..], "block {bi}");
+                assert_eq!(xa.scales[bi].to_bits(), (amax / 127.0).to_bits());
+                assert_eq!(xa.sums[bi], q.iter().map(|&v| v as i32).sum::<i32>());
+                assert_eq!(xa.fsums[bi].to_bits(), blk.iter().sum::<f32>().to_bits());
+                assert_eq!(xa.hsums[2 * bi + 1].to_bits(), blk[16..].iter().sum::<f32>().to_bits());
             }
         }
     }

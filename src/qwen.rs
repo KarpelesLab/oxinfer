@@ -757,6 +757,14 @@ impl<'a> QwenModel<'a> {
                 .ffn
                 .forward(&hn, t, h, &mut y, self.stream.as_ref().map(|_| &need as &dyn Fn(&[usize])));
             add_inplace(&mut x, &y);
+            // Streaming a MoE: guess the next layer's experts now, so they are read while its
+            // attention runs.
+            if let (Some(s), Some(next)) = (&self.stream, self.layers.get(l + 1))
+                && let Ffn::Moe(m) = &next.ffn
+                && s.options().predict_experts
+            {
+                s.prefetch_parts(l + 1, &m.predict(&x, t, h, &next.ln_post, eps));
+            }
         }
         rmsnorm_f32w_rows(&x.clone(), h, &self.final_norm, eps, &mut x);
         sess.rec_span = if record { Some((start, t)) } else { None };
@@ -968,6 +976,25 @@ impl<'a> QwenModel<'a> {
 }
 
 impl Moe<'_> {
+    /// The experts this layer would route `x` (`[t, H]`, the residual stream before the layer)
+    /// to, approximating the layer's MoE input by `x` normed with `norm` (its post-attention
+    /// norm): a guess made one layer ahead so that weight streaming can read them early.
+    pub(crate) fn predict(&self, x: &[f32], t: usize, h: usize, norm: &[f32], eps: f32) -> Vec<usize> {
+        let ne = self.down.len();
+        let mut logits = vec![0f32; t * ne];
+        for_chunks(&mut logits, ne, t > 1, |ti, l| {
+            let mut xn = vec![0f32; h];
+            rmsnorm_f32w(&x[ti * h..(ti + 1) * h], norm, eps, &mut xn);
+            for (v, w) in l.iter_mut().zip(self.router.chunks(h)) {
+                *v = dot(w, &xn);
+            }
+        });
+        let mut used: Vec<usize> = logits.chunks(ne).flat_map(|l| self.route(l).into_iter().map(|r| r.0)).collect();
+        used.sort_unstable();
+        used.dedup();
+        used
+    }
+
     /// Indices and renormalized weights of the top-k experts of one token (softmax over all
     /// experts, top k, divided by their sum: the same as a softmax over the k largest logits).
     fn route(&self, logits: &[f32]) -> Vec<(usize, f32)> {
