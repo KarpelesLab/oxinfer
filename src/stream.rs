@@ -371,6 +371,12 @@ impl StreamHook {
     pub fn need_parts(&self, i: usize, ids: &[usize]) {
         self.s.need_parts(self.base + i, ids);
     }
+    /// Reads `ranges` (`(address, length)` inside the mapped files) now, ahead of the read-ahead:
+    /// the embedding rows of the tokens a pass is about to look up, which would otherwise fault
+    /// in one page at a time behind the reader's requests.
+    pub fn need_ranges(&self, ranges: &[(usize, usize)]) {
+        self.s.need_ranges(ranges);
+    }
 }
 
 /// `hook.enter(i)` if there is a hook.
@@ -627,6 +633,40 @@ impl Streamer {
                 // Cached parts are probed too (the OS may have dropped some of their pages).
                 spans.extend_from_slice(&part.spans);
             }
+        }
+        if spans.is_empty() {
+            return;
+        }
+        let t = Instant::now();
+        inner.demand.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let missed = inner.load_spans(&spans, true, true);
+        inner.demand.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if missed > 0 {
+            inner.c.stalls.fetch_add(1, Relaxed);
+            inner.c.stall_ns.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        }
+    }
+
+    fn need_ranges(&self, ranges: &[(usize, usize)]) {
+        let inner = &self.inner;
+        let page = inner.page;
+        let mut spans: Vec<Span> = Vec::new();
+        for &(a, l) in ranges {
+            let Some(fi) = inner.maps.iter().position(|&(b, ml)| a >= b && a < b + ml) else {
+                continue;
+            };
+            let (base, mlen) = inner.maps[fi];
+            let s = a & !(page - 1);
+            let e = (a + l).next_multiple_of(page).min(base + mlen);
+            if spans.iter().any(|x| x.addr <= s && s + (e - s) <= x.addr + x.len) {
+                continue;
+            }
+            spans.push(Span {
+                file: fi,
+                addr: s,
+                len: e - s,
+                off: (s - base) as u64,
+            });
         }
         if spans.is_empty() {
             return;

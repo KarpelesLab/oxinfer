@@ -72,6 +72,13 @@ pub use crate::generate::{Flow, StopReason};
 pub struct EngineOptions {
     /// CPU worker threads (process-wide; default: all cores). Key `threads`.
     pub threads: Option<usize>,
+    /// Scheduling class of the CPU threads (process-wide, applied with `threads`; Apple
+    /// platforms: the QoS class, `Background` keeping them on the efficiency cores). Key `qos`
+    /// (`interactive`, `initiated`, `utility`, `background`). Default interactive.
+    pub qos: pool::Qos,
+    /// Of `threads`, how many run at background QoS, i.e. on the efficiency cores on Apple
+    /// platforms (see [`pool::PoolOptions`]). Key `efficiency_threads`. Default 0.
+    pub efficiency_threads: usize,
     /// Weight precision for checkpoints that are not already quantized (GGUF, pre-quantized and
     /// MLX checkpoints keep their own). Key `quant` (`bf16`, `q8`, `q4`). Default bf16.
     pub quant: Quant,
@@ -220,6 +227,8 @@ impl Default for EngineOptions {
     fn default() -> Self {
         Self {
             threads: None,
+            qos: pool::Qos::UserInteractive,
+            efficiency_threads: 0,
             quant: Quant::Bf16,
             mmap: cfg!(target_os = "ios"),
             preload: false,
@@ -262,6 +271,8 @@ impl EngineOptions {
     /// The keys [`EngineOptions::set`] accepts.
     pub const KEYS: &'static [&'static str] = &[
         "threads",
+        "qos",
+        "efficiency_threads",
         "quant",
         "mmap",
         "preload",
@@ -291,6 +302,16 @@ impl EngineOptions {
         let opt_str = |v: &str| (!v.is_empty()).then(|| v.to_string());
         match key {
             "threads" => self.threads = parse_opt_usize(key, value)?,
+            "qos" => {
+                self.qos = match value {
+                    "interactive" | "user_interactive" => pool::Qos::UserInteractive,
+                    "initiated" | "user_initiated" => pool::Qos::UserInitiated,
+                    "utility" => pool::Qos::Utility,
+                    "background" => pool::Qos::Background,
+                    _ => bail!("qos: unknown class {value:?} (interactive, initiated, utility, background)"),
+                }
+            }
+            "efficiency_threads" => self.efficiency_threads = parse_opt_usize(key, value)?.unwrap_or(0),
             "quant" => {
                 self.quant = match value {
                     "bf16" => Quant::Bf16,
@@ -663,8 +684,12 @@ impl Engine {
         if is_coreml_dir(&dir) {
             return Self::load_coreml(dir, opts, t0);
         }
-        if let Some(t) = opts.threads {
-            pool::configure(t);
+        if opts.threads.is_some() || opts.qos != pool::Qos::UserInteractive || opts.efficiency_threads > 0 {
+            pool::configure_with(pool::PoolOptions {
+                threads: opts.threads.unwrap_or_else(|| pool::options().threads),
+                qos: opts.qos,
+                efficiency_threads: opts.efficiency_threads,
+            });
         }
         if let Some(on) = opts.gpu_exact {
             crate::gpu::set_exact(on);
@@ -1412,6 +1437,7 @@ mod tests {
                 "device" => "cpu",
                 "coreml_units" => "gpu",
                 "coreml_prefill" => "pad",
+                "qos" => "background",
                 "mtp_from" | "draft" | "cache_dir" => "x",
                 _ => "1",
             };

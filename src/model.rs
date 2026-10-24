@@ -99,6 +99,25 @@ impl<'a> Table<'a> {
         Ok(Table::Gguf(unsafe { GgufMatrix::borrowed(kind, bytes, rows, cols)? }))
     }
 
+    /// The memory row `r` (of `cols` values) is read from, for tables that borrow mapped
+    /// memory (weight streaming reads these spans ahead of the lookup).
+    pub fn row_ranges(&self, r: usize, cols: usize) -> Vec<(usize, usize)> {
+        fn span<T>(v: &[T]) -> (usize, usize) {
+            (v.as_ptr() as usize, std::mem::size_of_val(v))
+        }
+        let bpr = cols / crate::quant::QBLOCK;
+        match self {
+            Table::Bf16(w) => vec![span(&w[r * cols..(r + 1) * cols])],
+            Table::Q8(m) => vec![span(&m.q[r * cols..(r + 1) * cols]), span(&m.scales[r * bpr..(r + 1) * bpr])],
+            Table::Q4(m) => vec![
+                span(&m.q[r * cols / 2..(r + 1) * cols / 2]),
+                span(&m.scales[r * bpr..(r + 1) * bpr]),
+            ],
+            Table::Gguf(m) => vec![span(m.row(r))],
+            Table::Host { .. } | Table::Mlx { .. } => Vec::new(),
+        }
+    }
+
     /// Row `r` (of length `out.len()`) as f32.
     pub fn row(&self, r: usize, out: &mut [f32]) {
         let n = out.len();

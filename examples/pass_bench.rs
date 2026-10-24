@@ -1,6 +1,7 @@
 //! Times main-model forward passes of several token counts (the speculative verification path:
 //! a recording forward plus the LM head over every token), best of a few repeats:
-//! `cargo run --release --example pass_bench -- MODEL [THREADS] [TOKENS,..] [REPEATS]`.
+//! `cargo run --release --example pass_bench -- MODEL [THREADS] [TOKENS,..] [REPEATS]`
+//! (THREADS: `N`, `NeM` with M of them at background QoS, or `Nb` all at background QoS).
 //! Also prints the weight types of a GGUF checkpoint.
 
 use oxinfer::config::QwenConfig;
@@ -14,7 +15,20 @@ use std::time::Instant;
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let path = PathBuf::from(args.next().expect("usage: pass_bench MODEL [THREADS] [TOKENS,..] [REPEATS]"));
-    let threads: usize = args.next().map_or(Ok(3), |t| t.parse())?;
+    // THREADS: `N`, `NeM` (M of the N threads at background QoS: efficiency cores on Apple) or
+    // `Nb` (all at background QoS).
+    let spec = args.next().unwrap_or_else(|| "3".into());
+    let mut po = oxinfer::pool::PoolOptions::threads(3);
+    if let Some(n) = spec.strip_suffix('b') {
+        po.threads = n.parse()?;
+        po.qos = oxinfer::pool::Qos::Background;
+    } else if let Some((n, e)) = spec.split_once('e') {
+        po.threads = n.parse()?;
+        po.efficiency_threads = e.parse()?;
+    } else {
+        po.threads = spec.parse()?;
+    }
+    let threads = spec;
     let counts: Vec<usize> = args
         .next()
         .unwrap_or_else(|| "1,2,4,9".into())
@@ -22,7 +36,7 @@ fn main() -> anyhow::Result<()> {
         .map(|s| s.parse())
         .collect::<Result<_, _>>()?;
     let repeats: usize = args.next().map_or(Ok(3), |t| t.parse())?;
-    oxinfer::pool::init(threads);
+    oxinfer::pool::init_with(po);
     oxinfer::kernels::set_decode_max_tokens(15);
     if oxinfer::gguf::is_gguf(&path) {
         let h = oxinfer::gguf::read_header(&path)?;

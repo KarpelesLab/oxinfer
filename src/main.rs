@@ -29,6 +29,8 @@ struct Args {
     top_p: f32,
     seed: u64,
     threads: Option<usize>,
+    qos: pool::Qos,
+    efficiency_threads: usize,
     preload: bool,
     mmap: bool,
     quant: Quant,
@@ -102,6 +104,9 @@ fn usage() -> ! {
          \x20 --top-p F            top-p (default 0.95)\n\
          \x20 --seed N             RNG seed\n\
          \x20 --threads N          worker threads (default: all cores)\n\
+         \x20 --qos C              thread QoS on Apple platforms: interactive (default), initiated,\n\
+         \x20                      utility, background (efficiency cores only)\n\
+         \x20 --efficiency-threads N  of the threads, N at background QoS (efficiency cores)\n\
          \x20 --mmap               map weights from disk instead of copying into RAM\n\
          \x20 --quant bf16|q8|q4   weight precision for streamed matmuls (default bf16)\n\
          \x20 --preload            with --mmap, touch all weight pages before starting\n\
@@ -187,6 +192,8 @@ fn parse_args() -> Result<Args> {
         top_p: 0.95,
         seed: 42,
         threads: None,
+        qos: pool::Qos::UserInteractive,
+        efficiency_threads: 0,
         preload: false,
         mmap: false,
         quant: Quant::Bf16,
@@ -254,6 +261,16 @@ fn parse_args() -> Result<Args> {
             "--top-p" => a.top_p = val()?.parse()?,
             "--seed" => a.seed = val()?.parse()?,
             "--threads" | "-j" => a.threads = Some(val()?.parse()?),
+            "--qos" => {
+                a.qos = match val()?.as_str() {
+                    "interactive" => pool::Qos::UserInteractive,
+                    "initiated" => pool::Qos::UserInitiated,
+                    "utility" => pool::Qos::Utility,
+                    "background" => pool::Qos::Background,
+                    q => bail!("--qos: unknown class {q} (interactive, initiated, utility, background)"),
+                }
+            }
+            "--efficiency-threads" => a.efficiency_threads = val()?.parse()?,
             "--preload" => a.preload = true,
             "--mmap" => a.mmap = true,
             "--quant" => {
@@ -525,7 +542,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let threads = args.threads.unwrap_or_else(default_threads);
-    pool::init(threads);
+    pool::init_with(pool::PoolOptions {
+        threads,
+        qos: args.qos,
+        efficiency_threads: args.efficiency_threads,
+    });
     run(args)
 }
 

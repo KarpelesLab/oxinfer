@@ -248,6 +248,11 @@ impl<'a> QwenMtp<'a> {
         let cfg = &model.cfg;
         let eps = cfg.rms_norm_eps as f32;
         let mut cat = vec![0f32; t * 2 * h];
+        let table = self.embed.as_ref().unwrap_or(&model.embed);
+        if let Some(s) = self.stream.as_ref().or(model.stream.as_ref()) {
+            let rows: Vec<(usize, usize)> = tokens.iter().flat_map(|&tk| table.row_ranges(tk as usize, h)).collect();
+            s.need_ranges(&rows);
+        }
         let mut e = vec![0f32; h];
         for (i, row) in cat.chunks_mut(2 * h).enumerate() {
             self.embed.as_ref().unwrap_or(&model.embed).row(tokens[i] as usize, &mut e);

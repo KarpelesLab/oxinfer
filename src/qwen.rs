@@ -191,7 +191,7 @@ pub struct QwenModel<'a> {
     pub(crate) lm_head: Lin<'a>,
     pub(crate) inv_freq: Vec<f32>,
     /// Weight streaming: unit `l` is layer `l`, unit `num_hidden_layers` the LM head.
-    stream: Option<crate::stream::StreamHook>,
+    pub(crate) stream: Option<crate::stream::StreamHook>,
 }
 
 /// Recurrent state of one Gated DeltaNet layer.
@@ -710,6 +710,11 @@ impl<'a> QwenModel<'a> {
         let par = t > 1;
 
         let timer = prof::start(Cat::Embed);
+        if let Some(s) = &self.stream {
+            // All rows at once, ahead of the read-ahead, rather than a page fault per lookup.
+            let rows: Vec<(usize, usize)> = tokens.iter().flat_map(|&tk| self.embed.row_ranges(tk as usize, h)).collect();
+            s.need_ranges(&rows);
+        }
         let mut x = vec![0f32; t * h];
         for_chunks(&mut x, h, par, |ti, row| {
             let tok = tokens[ti] as usize;
