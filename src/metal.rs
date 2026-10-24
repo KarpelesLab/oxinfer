@@ -542,8 +542,9 @@ GG(IQ2_XXS) GG(IQ2_XS) GG(IQ2_S) GG(IQ3_XXS) GG(IQ3_S) GG(IQ1_S) GG(IQ1_M)
 /// largest value lands in [2^13, 2^14) before the conversion (no overflow, no subnormals), and the
 /// outputs are scaled back. Quantized weights are dequantized per 64-wide K step into threadgroup
 /// memory as half (64 rows x 64 k); bf16 weights are read straight from device memory as bfloat.
-/// A threadgroup (4 SIMD-groups) computes 64 outputs x 128 tokens (64 tokens in the grouped
-/// kernels, whose segments are short), and the tensor bounds clip partial token tiles.
+/// A threadgroup (4 SIMD-groups) computes 64 outputs x 128 tokens (32 tokens in the grouped
+/// kernels, whose segments are short). The tensor bounds would clip partial token tiles, but
+/// those take a ~1.6x slower path, so the inputs are padded to whole tiles instead.
 /// `mmag_*` run many weight matrices in one dispatch (MoE experts): each threadgroup row looks up
 /// its tile (expert, segment start and length, offset) and the expert's weight addresses.
 const MMA_SHADER_SRC: &str = r#"
@@ -623,7 +624,7 @@ kernel void NAME(device const EP* ep [[buffer(0)]], device const GT* tiles [[buf
                  uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { \
     threadgroup half Ws[64 * MKB]; \
     GT g = tiles[tg.y]; device const void* qb = ep[g.e].q; device const void* sb = ep[g.e].s; \
-    WT w = MAKE; mma_tile<WT, 64>(w, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out, p.n_out, p.n_in, g.rows, tg.x * 64, g.t0, tid, Ws); }
+    WT w = MAKE; mma_tile<WT, 32>(w, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out, p.n_out, p.n_in, g.rows, tg.x * 64, g.t0, tid, Ws); }
 MMA(mma_q8, Q8W, MK_Q8) MMA(mma_q4, Q4W, MK_Q4)
 MMAG(mmag_q8, Q8W, MK_Q8) MMAG(mmag_q4, Q4W, MK_Q4)
 kernel void mma_q4a(device const void* qb [[buffer(0)]], device const void* sb [[buffer(1)]], device const half* xh [[buffer(2)]],
@@ -642,7 +643,7 @@ kernel void mmag_bf(device const EP* ep [[buffer(0)]], device const GT* tiles [[
                     device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]],
                     uint2 tg [[threadgroup_position_in_grid]]) {
     GT g = tiles[tg.y];
-    mma_bf_tile<64, 64>((device const bfloat*)ep[g.e].q, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out,
+    mma_bf_tile<32, 64>((device const bfloat*)ep[g.e].q, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out,
                         p.n_out, p.n_in, g.rows, tg.x * 64, g.t0); }
 #define GGM(T) MMA(mma_##T, T##W, MK_GG(T##W)) MMAG(mmag_##T, T##W, MK_GG(T##W))
 GGM(F16) GGM(Q4_1) GGM(Q5_0) GGM(Q5_1)
@@ -838,7 +839,7 @@ struct MmaParams {
 
 /// Tokens per threadgroup of the dense matrix-unit GEMM, and of the grouped one.
 const MMA_TM: usize = 128;
-const MMA_GTM: usize = 64;
+const MMA_GTM: usize = 32;
 /// K step of the matrix-unit GEMMs (`n_in` must be a multiple).
 const MMA_KB: usize = 64;
 
@@ -934,8 +935,9 @@ struct MoeDev {
     row_bytes: (u32, u32),
     /// The wrapped weight memory (adjacent experts share a buffer).
     bufs: Vec<Buf>,
-    /// Per-expert (data, scales) GPU addresses of each projection.
+    /// Per-expert (data, scales) GPU addresses of each projection, for `n_exp` experts.
     ep: (Id, Id),
+    n_exp: usize,
     /// The residency set holding `bufs`, if any (else they are made resident per submission).
     residency: Option<std::sync::Arc<Residency>>,
     release: (MsgVoid, Sel),
@@ -1563,6 +1565,8 @@ impl MetalBackend {
 
     /// `Backend::matmul` on the matrix units; None when some job has no such kernel.
     fn matmul_mma(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [Job]) -> Option<bool> {
+        // Rows padded to whole token tiles (zero rows; partial tiles take a slower path).
+        let rows = t.next_multiple_of(MMA_TM);
         let mut plan = Vec::with_capacity(jobs.len());
         let mut y_total = 0;
         for j in jobs.iter() {
@@ -1571,20 +1575,24 @@ impl MetalBackend {
                 return None;
             }
             plan.push(self.mma_pipe(&j.w, mw.offsets.is_some(), j.n_out, n_in, false)?);
-            y_total += t * j.n_out;
+            y_total += rows * j.n_out;
         }
         let mut st = self.staging.lock().unwrap();
         let st = &mut *st;
-        if !self.ensure_staging(st, t * n_in * 4, y_total * 4)
-            || !self.grow(&mut st.xh, t * n_in * 2)
-            || !self.grow(&mut st.rs, (t + MMA_TM) * 4)
+        if !self.ensure_staging(st, rows * n_in * 4, y_total * 4)
+            || !self.grow(&mut st.xh, rows * n_in * 2)
+            || !self.grow(&mut st.rs, rows * 4)
         {
             return Some(false);
         }
         let t0 = Instant::now();
-        unsafe { par_copy(self.contents(st.x) as *mut f32, x.as_ptr(), t * n_in) };
+        unsafe {
+            let xp = self.contents(st.x) as *mut f32;
+            par_copy(xp, x.as_ptr(), t * n_in);
+            std::ptr::write_bytes(xp.add(t * n_in), 0, (rows - t) * n_in);
+        }
         let encode = |e: &Enc, jobs: &&mut [Job]| {
-            self.encode_x_half(e, st.x, st.xh.id, st.rs.id, n_in, t, None);
+            self.encode_x_half(e, st.x, st.xh.id, st.rs.id, n_in, rows, None);
             let mut y_off = 0usize;
             for (j, &(pipe, tn)) in jobs.iter().zip(&plan) {
                 let mw = j.dev.downcast_ref::<MetalWeight>().unwrap();
@@ -1604,7 +1612,7 @@ impl MetalBackend {
                         n_in: n_in as u32,
                         w_off: (mw.data.offset_bytes / elem_bytes) as u32,
                         s_off: s_off as u32,
-                        rows: t as u32,
+                        rows: rows as u32,
                         _p: [0; 3],
                     },
                     4,
@@ -1622,8 +1630,8 @@ impl MetalBackend {
                         7,
                     );
                 }
-                e.dispatch((j.n_out / tn, t.div_ceil(MMA_TM)), 128);
-                y_off += t * j.n_out;
+                e.dispatch((j.n_out / tn, rows / MMA_TM), 128);
+                y_off += rows * j.n_out;
             }
         };
         let yp = self.contents(st.y) as *const f32;
@@ -1631,7 +1639,7 @@ impl MetalBackend {
             let mut y_off = 0usize;
             for j in jobs.iter_mut() {
                 unsafe { par_copy(j.y.as_mut_ptr(), yp.add(y_off), t * j.n_out) };
-                y_off += t * j.n_out;
+                y_off += rows * j.n_out;
             }
         };
         let mut jobs = jobs;
@@ -2148,6 +2156,7 @@ impl Backend for MetalBackend {
             row_bytes: (row_bytes(&gate_up[0]) as u32, row_bytes(&down[0]) as u32),
             bufs: Vec::with_capacity(spans.len()),
             ep: (std::ptr::null_mut(), std::ptr::null_mut()),
+            n_exp: gate_up.len(),
             residency: None,
             release,
         };
@@ -2202,10 +2211,14 @@ impl Backend for MetalBackend {
         if t == 0 || k == 0 || routes.len() != t || routes.iter().any(|r| r.len() != k) || x.len() < t * h || y.len() < t * h {
             return false;
         }
-        // Rows per expert, in expert order: the gathered input is one segment per expert, cut
-        // into tiles of MMA_GTM rows.
+        // Rows per expert, in expert order: the gathered input is one segment per expert, padded
+        // to whole tiles of MMA_GTM rows (partial tiles take a slower path in the tensor ops;
+        // padding rows come from a zero row after the input and are never read back).
         let mut count: Vec<usize> = Vec::new();
         for &(e, _) in routes.iter().flatten() {
+            if e >= md.n_exp {
+                return false;
+            }
             if e >= count.len() {
                 count.resize(e + 1, 0);
             }
@@ -2216,13 +2229,14 @@ impl Backend for MetalBackend {
         let mut rows = 0usize;
         for (e, &c) in count.iter().enumerate() {
             start[e] = rows;
-            for t0 in (0..c).step_by(MMA_GTM) {
-                tiles.push([e as u32, rows as u32, c as u32, t0 as u32]);
+            let len = c.next_multiple_of(MMA_GTM);
+            for t0 in (0..len).step_by(MMA_GTM) {
+                tiles.push([e as u32, rows as u32, len as u32, t0 as u32]);
             }
-            rows += c;
+            rows += len;
         }
         // Gathered row sources, and each token's (row, weight) slots for the combination.
-        let mut src = vec![0u32; rows];
+        let mut src = vec![t as u32; rows];
         let mut slots = vec![[0u32; 2]; t * k];
         for (ti, r) in routes.iter().enumerate() {
             for (j, &(e, w)) in r.iter().enumerate() {
@@ -2235,7 +2249,7 @@ impl Backend for MetalBackend {
         let mut st = self.staging.lock().unwrap();
         let st = &mut *st;
         let pad = rows + MMA_GTM;
-        let ok = self.ensure_staging(st, t * h * 4, t * h * 4)
+        let ok = self.ensure_staging(st, (t + 1) * h * 4, t * h * 4)
             && self.grow(&mut st.xh, rows * h * 2)
             && self.grow(&mut st.rs, pad * 4)
             && self.grow(&mut st.m_gu, rows * 2 * mi * 4)
@@ -2253,6 +2267,7 @@ impl Backend for MetalBackend {
         unsafe {
             let cp = |dst: Id, src: *const u8, n: usize| std::ptr::copy_nonoverlapping(src, self.contents(dst), n);
             par_copy(self.contents(st.x) as *mut f32, x.as_ptr(), t * h);
+            std::ptr::write_bytes((self.contents(st.x) as *mut f32).add(t * h), 0, h);
             cp(st.m_src.id, src.as_ptr() as *const u8, rows * 4);
             cp(st.m_tiles.id, tiles.as_ptr() as *const u8, tiles.len() * 16);
             cp(st.m_slots.id, slots.as_ptr() as *const u8, slots.len() * 8);
