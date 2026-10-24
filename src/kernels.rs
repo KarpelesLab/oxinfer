@@ -10,7 +10,7 @@
 
 use crate::pool;
 use crate::prof::{self, Cat};
-use crate::quant::{Q4Matrix, QAct, QBLOCK, QMatrix, dequantize_rows, dequantize_rows_q4, quantize_act};
+use crate::quant::{PairAct, Q4Matrix, QAct, QBLOCK, QMatrix, dequantize_rows, dequantize_rows_q4, quantize_act};
 
 #[inline(always)]
 pub fn bf16_to_f32(x: u16) -> f32 {
@@ -897,6 +897,17 @@ pub trait QMat: Sync {
     unsafe fn rows_t1(&self, xa: &QAct, c: usize, y: *mut f32, r0: usize, r1: usize);
     /// Decode: rows `r0..r1` against activation rows `c0..c0+tc` (tc in 2..=4), into `y[(c0+c)*n_out + r]`.
     unsafe fn rows_tc(&self, xa: &QAct, c0: usize, tc: usize, y: *mut f32, r0: usize, r1: usize);
+    /// Whether `rows_multi` handles this matrix for `t` tokens (`Some`), and if so whether it
+    /// wants the pair-interleaved activations for SMMLA (`Some(true)`).
+    fn multi(&self, _t: usize) -> Option<bool> {
+        None
+    }
+    /// Decode over all `t` (2..=16) activation rows at once (each weight block unpacked once),
+    /// rows `r0..r1` into `y[c*n_out + r]`, with SMMLA when `pairs` is given; false if not
+    /// supported (the driver then runs token pairs). Rows must equal `rows_t1` bit for bit.
+    unsafe fn rows_multi(&self, _xa: &QAct, _pairs: Option<&PairAct>, _t: usize, _y: *mut f32, _r0: usize, _r1: usize) -> bool {
+        false
+    }
 }
 
 impl QMat for QMatrix {
@@ -1140,6 +1151,63 @@ pub fn set_decode_max_tokens(n: usize) {
     DECODE_MAX_TOKENS.store(n.clamp(7, 15), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Kernels for quantized decode passes of 2 or more tokens (speculative verification). All three
+/// give bit-identical rows whatever the token count; they differ in speed only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MultiTokenKernels {
+    /// SMMLA (i8mm) when the CPU has it (Apple A15 / M2 and later, Armv8.6 cores), else SDOT.
+    Auto,
+    /// One weight row at a time against all tokens with SDOT (no i8mm).
+    Dot,
+    /// The older token-pair loop (each weight block unpacked once per pair of tokens).
+    Pairs,
+}
+
+static MULTI_KERNELS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Selects the multi-token decode kernels (default `Auto`; also `OXINFER_MULTI=auto|dot|pairs`).
+pub fn set_multi_token_kernels(k: MultiTokenKernels) {
+    let v = match k {
+        MultiTokenKernels::Auto => 1,
+        MultiTokenKernels::Dot => 2,
+        MultiTokenKernels::Pairs => 3,
+    };
+    MULTI_KERNELS.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The multi-token decode kernels in use.
+pub fn multi_token_kernels() -> MultiTokenKernels {
+    let mut v = MULTI_KERNELS.load(std::sync::atomic::Ordering::Relaxed);
+    if v == 0 {
+        set_multi_token_kernels(match std::env::var("OXINFER_MULTI").as_deref() {
+            Ok("dot") => MultiTokenKernels::Dot,
+            Ok("pairs") => MultiTokenKernels::Pairs,
+            _ => MultiTokenKernels::Auto,
+        });
+        v = MULTI_KERNELS.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    match v {
+        2 => MultiTokenKernels::Dot,
+        3 => MultiTokenKernels::Pairs,
+        _ => MultiTokenKernels::Auto,
+    }
+}
+
+/// Whether this CPU has the int8 matrix-multiply instructions (Arm i8mm: SMMLA).
+pub fn cpu_has_i8mm() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        std::arch::is_aarch64_feature_detected!("i8mm")
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
+
+/// Most tokens the multi-token decode kernels take in one pass.
+const MULTI_MAX: usize = 16;
+
 /// Several quantized matmuls sharing the same f32 input `x` ([t, n_in]); each job is `(matrix, y [t, n_out])`.
 pub fn matmul_quant_multi<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &[f32], t: usize) {
     matmul_quant_multi_at(jobs, x, t, decode_max_tokens())
@@ -1187,6 +1255,11 @@ pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &
     let xt = refs.iter().any(|j| dense(j.m)).then(|| pack_xt(x, t, n_in));
     let xa = refs.iter().any(|j| !dense(j.m)).then(|| quantize_act(x, t, n_in));
     let (tchunks, tc) = if gemm { token_split(blocks.len(), t, nthreads) } else { (1, t) };
+    let mode = multi_token_kernels();
+    let multi = !gemm && (2..=MULTI_MAX).contains(&t) && mode != MultiTokenKernels::Pairs;
+    let pairs =
+        (multi && mode == MultiTokenKernels::Auto && cpu_has_i8mm() && refs.iter().any(|j| !dense(j.m) && j.m.multi(t) == Some(true)))
+            .then(|| PairAct::new(xa.as_ref().unwrap()));
     pool::run(blocks.len() * tchunks, &|b| {
         let (j, r0, r1) = blocks[b / tchunks];
         let job = refs[j as usize];
@@ -1203,6 +1276,9 @@ pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &
             return;
         }
         let xa = xa.as_ref().unwrap();
+        if multi && unsafe { job.m.rows_multi(xa, pairs.as_ref(), t, job.y.get(), r0, r1) } {
+            return;
+        }
         let mut c = 0;
         while c < t {
             // Token pairs: the 3- and 4-token tiles keep 24-32 activation vectors live and

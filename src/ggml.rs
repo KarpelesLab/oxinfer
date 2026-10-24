@@ -16,7 +16,7 @@
 //! (https://github.com/ggml-org/llama.cpp, MIT License, Copyright (c) 2023-2024 The ggml authors).
 
 use crate::kernels::{QMat, bf16_to_f32};
-use crate::quant::{PageVec, QAct, QBLOCK, QBuf, f16_to_f32};
+use crate::quant::{PageVec, PairAct, QAct, QBLOCK, QBuf, f16_to_f32};
 use anyhow::{Result, bail};
 
 #[path = "ggml_tables.rs"]
@@ -985,6 +985,28 @@ impl QMat for GgufMatrix {
     unsafe fn rows_t1(&self, xa: &QAct, c: usize, y: *mut f32, r0: usize, r1: usize) {
         unsafe { self.rows_impl::<1>(xa, c, y, 0, r0, r1) }
     }
+    fn multi(&self, t: usize) -> Option<bool> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            neon::multi_kind(self.kind, t)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = t;
+            None
+        }
+    }
+    unsafe fn rows_multi(&self, xa: &QAct, pairs: Option<&PairAct>, t: usize, y: *mut f32, r0: usize, r1: usize) -> bool {
+        #[cfg(target_arch = "aarch64")]
+        {
+            unsafe { neon::rows_multi(self, &Act::new(xa, 0), pairs, t, y, self.n_out, r0, r1) }
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let _ = (xa, pairs, t, y, r0, r1);
+            false
+        }
+    }
     unsafe fn rows_tc(&self, xa: &QAct, c0: usize, tc: usize, y: *mut f32, r0: usize, r1: usize) {
         let (n, y) = (self.n_out, unsafe { y.add(c0 * self.n_out) });
         unsafe {
@@ -1302,6 +1324,41 @@ mod tests {
                 lins.iter().zip(ys.iter_mut()).map(|((l, n), y)| (l, *n, &mut y[..])).collect();
             crate::model::linear_multi(&mut jobs, n_in, &x, t);
             assert_eq!(ys, alone, "t={t}");
+        }
+    }
+
+    /// The multi-token decode kernels (SDOT and, where the CPU has it, SMMLA) give every row
+    /// bit-identical to the one-token kernel, for every token count.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn multi_token_kernels_are_batch_invariant() {
+        let (n_out, n_in) = (21usize, 3 * QK_K);
+        let mm = crate::kernels::cpu_has_i8mm();
+        for kind in GgmlType::ALL.into_iter().filter(|k| neon::multi_kind(*k, 2).is_some()) {
+            let mut seed = 31 + kind.id() as u64;
+            let m = GgufMatrix::from_bytes(kind, &random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed), n_out, n_in).unwrap();
+            for t in 2..=crate::ggml::neon::MULTI_MAX {
+                let x: Vec<f32> = (0..t * n_in).map(|_| (lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0).collect();
+                let xa = crate::quant::quantize_act(&x, t, n_in);
+                let pairs = crate::quant::PairAct::new(&xa);
+                let mut y1 = vec![0f32; t * n_out];
+                for c in 0..t {
+                    unsafe { m.rows_t1(&xa, c, y1.as_mut_ptr().add(c * n_out), 0, n_out) };
+                }
+                let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+                for p in [None, Some(&pairs)] {
+                    if p.is_some() && !(mm && neon::multi_kind(kind, t) == Some(true)) {
+                        continue;
+                    }
+                    let mut y = vec![0f32; t * n_out];
+                    // Two row ranges, the first odd-sized (a row-pair tail inside the matrix).
+                    unsafe {
+                        assert!(neon::rows_multi(&m, &Act::new(&xa, 0), p, t, y.as_mut_ptr(), n_out, 0, 7));
+                        assert!(neon::rows_multi(&m, &Act::new(&xa, 0), p, t, y.as_mut_ptr(), n_out, 7, n_out));
+                    }
+                    assert_eq!(bits(&y), bits(&y1), "{kind} t={t} smmla={}", p.is_some());
+                }
+            }
         }
     }
 
