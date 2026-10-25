@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/KarpelesLab/oxinfer/compare/v0.0.4...v0.0.5) - 2026-10-25
+
+### Other
+
+- streaming context 2/2 by default, faster SNAC, README section
+- Orpheus text to speech: Llama 3 on the native engine, SNAC decoder, oxinfer::tts
+- README section, model table rows, tools/ref_janus.py
+- text to image and image understanding
+- oxideav-core types in the API; `oxideav` feature; media without oxideav-meta
+- Typed decisions over images (JEV-27B-VL, JEV-9B vl/)
+- image, video and audio input (Qwen and Gemma 4), agreement and speed
+- Vision towers: torchvision-exact resize, GPU matmuls, bf16 Qwen tower
+- Qwen3.5/3.6/3.8 image and video input, Gemma 4 video input
+- Whisper speed table (final measurements, 6-thread rows)
+- --threads
+- bf16 cross-attention keys and values below f16 decoder precision
+- Whisper agreement for base, medium, large-v3 and tiny.en
+- share the engine's run lock, en for English-only models, rule and segment tests
+- Whisper speech to text (models, usage, agreement with transformers, speed); tools/ref_whisper.py
+- fused attention kernel for 64-wide heads (Whisper encoder, SD 2.x)
+- Whisper speech to text: transformers-exact features, encoder/decoder, long-form decoding, timestamps
+- project goals (run everything everywhere, then make it fast)
+- JEV-35B (merged, LM-head readout) measurements
+- typed decisions (Jev models), measured agreement and latency
+- Jev typed decisions: runtime LoRA, Engine::decide, C API oxi_decide, CLI --decide
+- Core ML converter: block-shifting Gemma local cache, prefill and infer bit-identical
+- Core ML runtime: shifting local caches (local_cache_length) are fed exactly once, never padded
+- Core ML converter: Fisher-weighted LUTs, mixed precision, shifting Gemma local cache, Qwen3.5 MoE
+- llama.cpp comparison rerun for oxinfer after the matrix-unit and multi-token kernel merges
+- interleaved oxinfer vs llama.cpp benchmark; README comparison tables
+- SD 1.5 with the LCM-LoRA as the default image model, LoRA files in the browser build
+
 ## [0.0.4](https://github.com/KarpelesLab/oxinfer/compare/v0.0.3...v0.0.4) - 2026-10-25
 
 ### Other
