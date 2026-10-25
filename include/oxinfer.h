@@ -203,7 +203,7 @@ char *oxi_transcriber_info_json(OxiTranscriber *t);
  *   "compression_ratio_threshold": 2.4, "logprob_threshold": -1, "no_speech_threshold": 0.6}.
  *
  * The result is a JSON object (free with oxi_string_free), or NULL on error:
- *   {"text", "language" (code; "" for English-only models), "language_probability" (null when
+ *   {"text", "language" (code, "en" for English-only models), "language_probability" (null when
  *    given), "stopped",
  *    "segments": [{"id", "start", "end" (seconds), "text", "tokens", "temperature",
  *                  "avg_logprob", "compression_ratio", "no_speech_prob",

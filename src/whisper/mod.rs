@@ -43,7 +43,9 @@ pub mod model;
 pub mod tokens;
 
 use crate::clock::Instant;
-use crate::engine::{CancelHandle, Flow};
+// RUN serializes transcriptions with each other and with engine generations (the thread pool
+// runs one region at a time).
+use crate::engine::{CancelHandle, Flow, RUN};
 use crate::platform::DevicePref;
 use crate::pool;
 use crate::safetensors::ModelFiles;
@@ -269,7 +271,7 @@ pub struct TranscribeStats {
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Transcript {
     pub text: String,
-    /// Language code (`en`), given or detected; empty for English-only models.
+    /// Language code (`en`), given or detected (`en` for English-only models).
     pub language: String,
     /// The detected language's probability (None when the language was given).
     pub language_probability: Option<f32>,
@@ -305,9 +307,6 @@ pub struct Transcriber {
     info: TranscriberInfo,
     cancel: Arc<AtomicBool>,
 }
-
-/// Serializes transcriptions (the thread pool runs one region at a time).
-static RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// One decoding attempt of a window.
 struct Attempt {
@@ -464,69 +463,8 @@ impl Transcriber {
         p
     }
 
-    /// Applies the logits rules (transformers' processor order: begin-suppress, suppress,
-    /// timestamps) for the tokens generated so far (`done`).
-    fn process(&self, logits: &mut [f32], done: &[u32], r: &Rules) {
-        let sp = &self.sp;
-        let ninf = f32::NEG_INFINITY;
-        if done.is_empty() {
-            for &t in r.begin_suppress {
-                if let Some(v) = logits.get_mut(t as usize) {
-                    *v = ninf;
-                }
-            }
-        }
-        for (v, &s) in logits.iter_mut().zip(r.suppress) {
-            if s {
-                *v = ninf;
-            }
-        }
-        if !r.timestamps {
-            return;
-        }
-        let tb = sp.timestamp_begin as usize;
-        let eot = sp.eot as usize;
-        logits[sp.no_timestamps as usize] = ninf;
-        let n = done.len();
-        let last_ts = n >= 1 && done[n - 1] as usize >= tb;
-        let penult_ts = n < 2 || done[n - 2] as usize >= tb;
-        if last_ts {
-            if penult_ts {
-                logits[tb..].fill(ninf);
-            } else {
-                logits[..eot].fill(ninf);
-            }
-        }
-        let mut ts_last = tb;
-        if let Some(&t) = done.iter().rev().find(|&&t| t as usize >= tb) {
-            ts_last = if last_ts && !penult_ts { t as usize } else { t as usize + 1 };
-        }
-        let hi = ts_last.min(logits.len());
-        logits[tb..hi].fill(ninf);
-        if done.is_empty() {
-            logits[..tb].fill(ninf);
-            if let Some(m) = sp.max_initial_timestamp_index {
-                let last_allowed = tb + m as usize;
-                if last_allowed + 1 < logits.len() {
-                    logits[last_allowed + 1..].fill(ninf);
-                }
-            }
-        }
-        // Timestamps when their total probability beats every single text token.
-        let lp = log_softmax(logits);
-        let mx = lp[tb..].iter().copied().fold(ninf, f32::max);
-        let ts_lp = if mx == ninf {
-            ninf
-        } else {
-            mx + lp[tb..].iter().map(|&v| (v - mx).exp()).sum::<f32>().ln()
-        };
-        let text_max = lp[..tb].iter().copied().fold(ninf, f32::max);
-        if ts_lp > text_max {
-            logits[..tb].fill(ninf);
-        }
-    }
-
-    /// One decoding attempt over a window from `input` (`begin` = its length).
+    /// One decoding attempt over a window: `input` is the decoder prompt (context, then the
+    /// start-of-transcript sequence at `sot_index`); generates until `<|endoftext|>` or `max_new`.
     #[allow(clippy::too_many_arguments)]
     fn generate(
         &self,
@@ -562,7 +500,7 @@ impl Transcriber {
                 a.cancelled = true;
                 break;
             }
-            self.process(&mut logits, &a.tokens, rules);
+            process(&self.sp, &mut logits, &a.tokens, rules);
             let tok = if temperature > 0.0 {
                 sampler.sample(&logits)
             } else {
@@ -791,7 +729,7 @@ impl Transcriber {
                 seq.splice(0..0, prefix.iter().copied());
                 probs.splice(0..0, prefix.iter().map(|_| 1.0));
             }
-            let (raw, offset) = self.split_segments(&seq, time_offset, seek_num);
+            let (raw, offset) = split_segments(sp.timestamp_begin, &seq, time_offset, seek_num);
             let mut segs: Vec<Segment> = Vec::new();
             let mut tok_at = 0usize;
             let mut seg_probs: Vec<Vec<f32>> = Vec::new();
@@ -850,60 +788,15 @@ impl Transcriber {
             }
         }
         out.text = tokens::decode_text(&self.tok, sp, &all_text).trim().to_string();
-        out.language = language.and_then(|l| sp.language_of(l)).unwrap_or("").to_string();
+        out.language = match language {
+            Some(l) => sp.language_of(l).unwrap_or("").to_string(),
+            // English-only models (or stopped before detection).
+            None => if sp.multilingual { "" } else { "en" }.to_string(),
+        };
         stats.total_secs = t_start.elapsed().as_secs_f64();
         stats.rtf = stats.total_secs / stats.audio_secs.max(1e-9);
         out.stats = stats;
         Ok(out)
-    }
-
-    /// transformers' `_retrieve_segment`: cuts a window's tokens (no `<|endoftext|>`) at
-    /// timestamp pairs into (start, end, tokens), and returns how many frames to move on.
-    fn split_segments(&self, seq: &[u32], time_offset: f64, seek_num: usize) -> (Vec<(f64, f64, Vec<u32>)>, usize) {
-        let tb = self.sp.timestamp_begin;
-        let is_ts: Vec<bool> = seq.iter().map(|&t| t >= tb).collect();
-        let n = seq.len();
-        let single_ending = n >= 2 && !is_ts[n - 2] && is_ts[n - 1];
-        let mut slices: Vec<usize> = (0..n.saturating_sub(1))
-            .filter(|&i| is_ts[i] && is_ts[i + 1])
-            .map(|i| i + 1)
-            .collect();
-        let pos = |t: u32| t.saturating_sub(tb) as f64;
-        if !slices.is_empty() {
-            if single_ending {
-                slices.push(n);
-            } else {
-                *slices.last_mut().unwrap() += 1;
-            }
-            let mut segs = Vec::new();
-            let mut last = 0;
-            for (i, &cur) in slices.iter().enumerate() {
-                let is_last = i + 1 == slices.len();
-                let sl = &seq[last..cur];
-                let end_idx = if !is_last || single_ending { sl.len() - 1 } else { sl.len() - 2 };
-                segs.push((
-                    time_offset + pos(sl[0]) * TIMESTAMP_SECS,
-                    time_offset + pos(sl[end_idx]) * TIMESTAMP_SECS,
-                    sl.to_vec(),
-                ));
-                last = cur;
-            }
-            let offset = if single_ending {
-                seek_num
-            } else {
-                // Seek to the last complete segment's end (2 mel frames per timestamp step).
-                seq[last - 2].saturating_sub(tb) as usize * 2
-            };
-            (segs, offset)
-        } else {
-            let mut last_pos = (seek_num as f64 * FRAME_SECS / TIMESTAMP_SECS).floor();
-            if let Some(&t) = seq.iter().rev().find(|&&t| t >= tb)
-                && t != tb
-            {
-                last_pos = pos(t);
-            }
-            (vec![(time_offset, time_offset + last_pos * TIMESTAMP_SECS, seq.to_vec())], seek_num)
-        }
     }
 
     /// Word timestamps for the segments of one window (openai-whisper's `add_word_timestamps`).
@@ -1009,6 +902,115 @@ impl Transcriber {
     }
 }
 
+/// Applies the logits rules (transformers' processor order: begin-suppress, suppress,
+/// timestamps) for the tokens generated so far (`done`).
+fn process(sp: &Special, logits: &mut [f32], done: &[u32], r: &Rules) {
+    let ninf = f32::NEG_INFINITY;
+    if done.is_empty() {
+        for &t in r.begin_suppress {
+            if let Some(v) = logits.get_mut(t as usize) {
+                *v = ninf;
+            }
+        }
+    }
+    for (v, &s) in logits.iter_mut().zip(r.suppress) {
+        if s {
+            *v = ninf;
+        }
+    }
+    if !r.timestamps {
+        return;
+    }
+    let tb = sp.timestamp_begin as usize;
+    let eot = sp.eot as usize;
+    logits[sp.no_timestamps as usize] = ninf;
+    let n = done.len();
+    let last_ts = n >= 1 && done[n - 1] as usize >= tb;
+    let penult_ts = n < 2 || done[n - 2] as usize >= tb;
+    if last_ts {
+        if penult_ts {
+            logits[tb..].fill(ninf);
+        } else {
+            logits[..eot].fill(ninf);
+        }
+    }
+    let mut ts_last = tb;
+    if let Some(&t) = done.iter().rev().find(|&&t| t as usize >= tb) {
+        ts_last = if last_ts && !penult_ts { t as usize } else { t as usize + 1 };
+    }
+    let hi = ts_last.min(logits.len());
+    logits[tb..hi].fill(ninf);
+    if done.is_empty() {
+        logits[..tb].fill(ninf);
+        if let Some(m) = sp.max_initial_timestamp_index {
+            let last_allowed = tb + m as usize;
+            if last_allowed + 1 < logits.len() {
+                logits[last_allowed + 1..].fill(ninf);
+            }
+        }
+    }
+    // Timestamps when their total probability beats every single text token.
+    let lp = log_softmax(logits);
+    let mx = lp[tb..].iter().copied().fold(ninf, f32::max);
+    let ts_lp = if mx == ninf {
+        ninf
+    } else {
+        mx + lp[tb..].iter().map(|&v| (v - mx).exp()).sum::<f32>().ln()
+    };
+    let text_max = lp[..tb].iter().copied().fold(ninf, f32::max);
+    if ts_lp > text_max {
+        logits[..tb].fill(ninf);
+    }
+}
+
+/// transformers' `_retrieve_segment`: cuts a window's tokens (no `<|endoftext|>`) at
+/// timestamp pairs into (start, end, tokens), and returns how many frames to move on.
+fn split_segments(tb: u32, seq: &[u32], time_offset: f64, seek_num: usize) -> (Vec<(f64, f64, Vec<u32>)>, usize) {
+    let is_ts: Vec<bool> = seq.iter().map(|&t| t >= tb).collect();
+    let n = seq.len();
+    let single_ending = n >= 2 && !is_ts[n - 2] && is_ts[n - 1];
+    let mut slices: Vec<usize> = (0..n.saturating_sub(1))
+        .filter(|&i| is_ts[i] && is_ts[i + 1])
+        .map(|i| i + 1)
+        .collect();
+    let pos = |t: u32| t.saturating_sub(tb) as f64;
+    if !slices.is_empty() {
+        if single_ending {
+            slices.push(n);
+        } else {
+            *slices.last_mut().unwrap() += 1;
+        }
+        let mut segs = Vec::new();
+        let mut last = 0;
+        for (i, &cur) in slices.iter().enumerate() {
+            let is_last = i + 1 == slices.len();
+            let sl = &seq[last..cur];
+            let end_idx = if !is_last || single_ending { sl.len() - 1 } else { sl.len() - 2 };
+            segs.push((
+                time_offset + pos(sl[0]) * TIMESTAMP_SECS,
+                time_offset + pos(sl[end_idx]) * TIMESTAMP_SECS,
+                sl.to_vec(),
+            ));
+            last = cur;
+        }
+        let offset = if single_ending {
+            seek_num
+        } else {
+            // Seek to the last complete segment's end (2 mel frames per timestamp step).
+            seq[last - 2].saturating_sub(tb) as usize * 2
+        };
+        (segs, offset)
+    } else {
+        let mut last_pos = (seek_num as f64 * FRAME_SECS / TIMESTAMP_SECS).floor();
+        if let Some(&t) = seq.iter().rev().find(|&&t| t >= tb)
+            && t != tb
+        {
+            last_pos = pos(t);
+        }
+        (vec![(time_offset, time_offset + last_pos * TIMESTAMP_SECS, seq.to_vec())], seek_num)
+    }
+}
+
 /// Seconds rounded to the millisecond (timestamps are multiples of 20 ms).
 fn round_ms(t: f64) -> f64 {
     (t * 1000.0).round() / 1000.0
@@ -1033,6 +1035,99 @@ fn softmax_prob(x: &[f32], i: usize) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A toy vocabulary: text 0..10, eot 10, sot 11, notimestamps 12, timestamps 13..20.
+    fn toy() -> Special {
+        Special {
+            eot: 10,
+            sot: 11,
+            sot_prev: None,
+            no_timestamps: 12,
+            no_speech: 11,
+            transcribe: None,
+            translate: None,
+            timestamp_begin: 13,
+            languages: Vec::new(),
+            multilingual: false,
+            suppress: Vec::new(),
+            begin_suppress: Vec::new(),
+            max_initial_timestamp_index: Some(2),
+            max_length: 448,
+            alignment_heads: Vec::new(),
+            default_language: None,
+            default_task: None,
+        }
+    }
+
+    fn allowed(sp: &Special, done: &[u32], logits: &[f32]) -> Vec<usize> {
+        let r = Rules {
+            suppress: &[false; 20],
+            begin_suppress: &[0],
+            timestamps: true,
+        };
+        let mut l = logits.to_vec();
+        process(sp, &mut l, done, &r);
+        (0..l.len()).filter(|&i| l[i] > f32::NEG_INFINITY).collect()
+    }
+
+    #[test]
+    fn timestamp_rules() {
+        let sp = toy();
+        let flat = [0f32; 20];
+        // First token: a timestamp of at most max_initial_timestamp_index (13..=15).
+        assert_eq!(allowed(&sp, &[], &flat), vec![13, 14, 15]);
+        // After text: text, end of text, or a timestamp after the opening one (increasing).
+        let mut text = flat;
+        text[3] = 5.0;
+        assert_eq!(allowed(&sp, &[14, 3], &text), (0..12).chain(15..20).collect::<Vec<_>>());
+        // After a single timestamp following text: a timestamp (closing pair) or end of text,
+        // not text; and not before the last timestamp.
+        let mut eot = flat;
+        eot[10] = 5.0;
+        assert_eq!(allowed(&sp, &[14, 3, 16], &eot), vec![10, 11, 16, 17, 18, 19]);
+        // ... where all timestamps together outweigh the end of text when it is not likely.
+        assert_eq!(allowed(&sp, &[14, 3, 16], &text), vec![16, 17, 18, 19]);
+        // After a timestamp pair: text only (incl. eot), no timestamps.
+        assert_eq!(allowed(&sp, &[14, 3, 16, 16], &text), (0..12).collect::<Vec<_>>());
+        // Timestamps together more likely than any text token: timestamps only.
+        let mut ts = flat;
+        for v in &mut ts[13..] {
+            *v = 1.0;
+        }
+        assert_eq!(allowed(&sp, &[14, 3], &ts), (15..20).collect::<Vec<_>>());
+        // Begin-suppress applies to the first token only.
+        let r = Rules {
+            suppress: &[false; 20],
+            begin_suppress: &[0],
+            timestamps: false,
+        };
+        let mut l = flat.to_vec();
+        process(&sp, &mut l, &[], &r);
+        assert_eq!(l[0], f32::NEG_INFINITY);
+        let mut l = flat.to_vec();
+        process(&sp, &mut l, &[1], &r);
+        assert_eq!(l[0], 0.0);
+    }
+
+    #[test]
+    fn segments_like_transformers() {
+        // <|0.00|> a b <|0.20|><|0.20|> c d <|0.40|>: a single timestamp ends it, all consumed.
+        let (s, off) = split_segments(100, &[100, 5, 6, 110, 110, 7, 8, 120], 10.0, 3000);
+        assert_eq!(s.len(), 2);
+        assert!((s[0].0 - 10.0).abs() < 1e-9 && (s[0].1 - 10.2).abs() < 1e-9 && s[0].2 == [100, 5, 6, 110]);
+        assert!((s[1].0 - 10.2).abs() < 1e-9 && (s[1].1 - 10.4).abs() < 1e-9 && s[1].2 == [110, 7, 8, 120]);
+        assert_eq!(off, 3000);
+        // An unfinished segment after the last pair is dropped and the window moves to the
+        // pair (2 mel frames per timestamp step).
+        let (s, off) = split_segments(100, &[100, 5, 110, 110, 6, 7], 0.0, 3000);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].2, [100, 5, 110, 110]);
+        assert!((s[0].1 - 0.2).abs() < 1e-9);
+        assert_eq!(off, 20);
+        // No timestamps: one segment over the window.
+        let (s, off) = split_segments(100, &[5, 6, 7], 30.0, 1001);
+        assert_eq!((s[0].0, s[0].1, off), (30.0, 30.0 + 500.0 * 0.02, 1001));
+    }
 
     #[test]
     fn options_parse() {

@@ -644,8 +644,9 @@ impl Lm {
     }
 }
 
-/// Serializes forward passes across engines (the thread pool runs one region at a time).
-static RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Serializes forward passes across engines (the thread pool runs one region at a time), and
+/// with [`crate::whisper::Transcriber`] runs.
+pub(crate) static RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A loaded model with one conversation.
 pub struct Engine {
