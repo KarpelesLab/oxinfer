@@ -66,9 +66,8 @@ optional.
 | stabilityai/sd-turbo | 1.3B | 2.6 GB (fp16) | text-to-image in one step; matches diffusers (see Image generation) |
 | stable-diffusion-v1-5/stable-diffusion-v1-5 (and SD 1.x / 2.x fine-tunes) | 1.1B | 2.0 GB (fp16) | text-to-image; matches diffusers |
 | anemll/* (ANEMLL Core ML: Qwen3, Qwen2.5, Gemma 3, Llama 3.2, ...) | 0.27B-1.7B tested | 0.3-1.5 GB (LUT6) | Apple Neural Engine via Core ML; same tokens as ANEMLL's runtime (see [Core ML](#core-ml--apple-neural-engine)) |
-| openai/whisper-tiny, -small | 39M / 244M | 151 / 967 MB (fp32) | speech to text; transcripts match transformers token for token (see [Speech to text](#speech-to-text-whisper)) |
-| openai/whisper-large-v3-turbo, distil-whisper/distil-large-v3 | 809M / 756M | 1.6 / 1.5 GB (fp16) | speech to text; match transformers token for token |
-| openai/whisper-base, -medium, -large-v3 (and the `.en` models) | 74M-1.55B | 0.3-3.1 GB | speech to text; same code path, smoke-tested |
+| openai/whisper-tiny, -base, -small, -medium (and `.en`) | 39M-769M | 0.15-3.1 GB (fp32) | speech to text; transcripts match transformers token for token (see [Speech to text](#speech-to-text-whisper)) |
+| openai/whisper-large-v3, -large-v3-turbo, distil-whisper/distil-large-v3 | 1.55B / 809M / 756M | 3.1 / 1.6 / 1.5 GB (fp16) | speech to text; match transformers token for token |
 
 ### Qwen3.5 / Qwen3.8
 
@@ -497,6 +496,10 @@ reading of Woolf's *Kew Gardens* (long-form: four or five windows):
 | whisper-large-v3-turbo | 100 s long-form | 2.7e-5 | 2.5e-2 (1.4e-4) | 2.5e-4 | identical, 300 tokens, same 16 segment times |
 | whisper-large-v3-turbo | 25 s French | 3.2e-5 | 1.2e-2 (9.3e-5) | 5.8e-5 | identical, 29 tokens |
 | distil-large-v3 | 100 s long-form | 2.7e-5 | 3.8e-2 (1.4e-4) | 7.2e-5 | identical, 350 tokens, same 21 segment times |
+| whisper-base | 100 s long-form | 3.0e-5 | 2.9e-3 (7.2e-6) | 4.3e-5 | identical, 361 tokens, same 22 segment times |
+| whisper-medium | 29.4 s, timestamps | 1.6e-5 | 4.7e-3 (8.7e-6) | 4.1e-5 | identical, 102 tokens, same 6 segment times |
+| whisper-large-v3 | 25 s French | 3.2e-5 | 1.1e-3 (7.1e-6) | 2.7e-5 | identical, 25 tokens; `fr` detected |
+| whisper-tiny.en | 100 s long-form | 3.0e-5 | 7.7e-5 (3.3e-6) | 7.7e-5 | identical, 354 tokens, same 24 segment times |
 
 The options agree too (whisper-small): an initial prompt (88 tokens), `condition_on_prev_tokens`
 over the 100 s clip (213 tokens, 11 segments), both together, and the fallback settings (no window
