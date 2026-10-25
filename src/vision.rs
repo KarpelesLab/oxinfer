@@ -166,6 +166,24 @@ pub fn preprocess(rgb: &[u8], w: usize, h: usize, cfg: &VisionConfig, max_soft_t
     } else {
         resize_rgb(rgb, w, h, tw, th)
     };
+    Ok(patchify(&img, tw, th, p))
+}
+
+/// A video frame as the video processor prepares it: resized to the patch budget with Pillow's
+/// 8-bit bicubic (torchvision's uint8 resize in the reference), then scaled to [0, 1].
+pub fn preprocess_frame(rgb: &[u8], w: usize, h: usize, cfg: &VisionConfig, max_soft_tokens: usize) -> Result<ImagePatches> {
+    let p = cfg.patch_size;
+    let k = cfg.pooling_kernel_size;
+    let (th, tw) = target_size(h, w, p, max_soft_tokens * k * k, k)?;
+    let img: Vec<f32> = crate::resample::resize_bicubic_rgb8(rgb, w, h, tw, th)
+        .iter()
+        .map(|&v| v as f32 / 255.0)
+        .collect();
+    Ok(patchify(&img, tw, th, p))
+}
+
+/// Cuts an RGB image in [0, 1] (`tw` x `th`, multiples of `p`) into `p` x `p` patches.
+fn patchify(img: &[f32], tw: usize, th: usize, p: usize) -> ImagePatches {
     let (ph, pw) = (th / p, tw / p);
     let n = ph * pw;
     let d = p * p * 3;
@@ -185,7 +203,7 @@ pub fn preprocess(rgb: &[u8], w: usize, h: usize, cfg: &VisionConfig, max_soft_t
             pos.push((px, py));
         }
     }
-    Ok(ImagePatches { patches, pos, n, pw, ph })
+    ImagePatches { patches, pos, n, pw, ph }
 }
 
 struct VLayer<'a> {

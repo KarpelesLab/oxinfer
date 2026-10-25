@@ -2,7 +2,9 @@
 //! short conv and a delta-rule recurrent state) interleaved with gated full attention, SiLU MLPs
 //! and zero-centered RMSNorm; plain Qwen3 (full attention only) runs on the same code, and so does
 //! Qwen3.5 MoE (top-k routed SiLU experts plus a sigmoid-gated shared expert in place of the MLP).
-//! Text only (no vision encoder); the MTP head for speculative decoding is in `qwen_mtp.rs`.
+//! The vision encoder is in `qwen_vision.rs`; its tokens are placed with M-RoPE (interleaved
+//! time / height / width rotary positions, see `QwenSession::add_vision_span`). The MTP head for
+//! speculative decoding is in `qwen_mtp.rs`.
 
 use crate::config::QwenConfig;
 use crate::kernels::*;
@@ -192,6 +194,8 @@ pub struct QwenModel<'a> {
     final_norm: Vec<f32>,
     pub(crate) lm_head: Lin<'a>,
     pub(crate) inv_freq: Vec<f32>,
+    /// M-RoPE: the position axis (0 time, 1 height, 2 width) of each rotary frequency.
+    mrope_axis: Option<Vec<u8>>,
     /// Weight streaming: unit `l` is layer `l`, unit `num_hidden_layers` the LM head.
     pub(crate) stream: Option<crate::stream::StreamHook>,
 }
@@ -312,6 +316,45 @@ impl DeltaRule {
     }
 }
 
+/// A run of vision tokens (one image, or one temporal patch of a video) in the sequence: `gh` x
+/// `gw` tokens in row-major order from position `start`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VisionSpan {
+    pub start: usize,
+    pub gh: usize,
+    pub gw: usize,
+}
+
+/// M-RoPE positions `[time, height, width]` of positions `start..start + t` given the vision
+/// spans of the sequence (sorted by start), as `get_rope_index` assigns them: a span's tokens sit
+/// at `(s, s + row, s + col)` from the position `s` its first token would have had, and the text
+/// after it continues from `s + max(gh, gw)`. Text before any span gets its plain index.
+pub fn mrope_positions(spans: &[VisionSpan], start: usize, t: usize) -> Vec<[usize; 3]> {
+    let mut out = Vec::with_capacity(t);
+    let mut si = 0;
+    // Rope position minus sequence index for text after the spans passed so far.
+    let mut delta: isize = 0;
+    for p in start..start + t {
+        while si < spans.len() && p >= spans[si].start + spans[si].gh * spans[si].gw {
+            let sp = spans[si];
+            delta += sp.gh.max(sp.gw) as isize - (sp.gh * sp.gw) as isize;
+            si += 1;
+        }
+        match spans.get(si) {
+            Some(sp) if p >= sp.start => {
+                let base = (sp.start as isize + delta) as usize;
+                let k = p - sp.start;
+                out.push([base, base + k / sp.gw, base + k % sp.gw]);
+            }
+            _ => {
+                let q = (p as isize + delta) as usize;
+                out.push([q, q, q]);
+            }
+        }
+    }
+    out
+}
+
 #[derive(Clone)]
 pub struct QwenSession {
     kv: Vec<Option<LayerCache>>,
@@ -319,10 +362,27 @@ pub struct QwenSession {
     rec: Vec<GdnRecord>,
     /// `(start, len)` of the positions recorded by the last forward, if it recorded.
     rec_span: Option<(usize, usize)>,
+    /// Vision token runs of the conversation (M-RoPE), sorted by start.
+    pub(crate) spans: Vec<VisionSpan>,
     pub pos: usize,
 }
 
 impl QwenSession {
+    /// Declares `gh` x `gw` vision tokens (row-major, one image or one temporal patch of a video)
+    /// at sequence position `start` (at or after `pos`), before they are fed: they take M-RoPE
+    /// positions, and the text after them continues from `max(gh, gw)` positions later.
+    pub fn add_vision_span(&mut self, start: usize, gh: usize, gw: usize) {
+        debug_assert!(start >= self.pos && gh > 0 && gw > 0);
+        let sp = VisionSpan { start, gh, gw };
+        let i = self.spans.partition_point(|s| s.start < start);
+        self.spans.insert(i, sp);
+    }
+
+    /// The declared vision spans.
+    pub fn vision_spans(&self) -> &[VisionSpan] {
+        &self.spans
+    }
+
     /// Rewinds to `pos` tokens (dropping later KV entries and restoring the recurrent states).
     /// Positions up to the end of the last forward are always fine; earlier ones need that
     /// forward to have been a recording one (`forward_hidden_rec`) that started before `pos`.
@@ -364,6 +424,7 @@ impl QwenSession {
         for c in self.kv.iter_mut().flatten() {
             c.truncate(pos);
         }
+        self.spans.retain(|s| s.start < pos);
         self.pos = pos;
         Ok(())
     }
@@ -561,6 +622,18 @@ impl<'a> QwenModel<'a> {
         let inv_freq: Vec<f32> = (0..rot / 2)
             .map(|i| (1.0 / theta.powf((2 * i) as f64 / rot as f64)) as f32)
             .collect();
+        // Interleaved M-RoPE (transformers' Qwen3.5 rotary): frequency i rotates with the height
+        // for i % 3 == 1 and i < 3 * sections[1], with the width for i % 3 == 2 and
+        // i < 3 * sections[2], with the time otherwise.
+        let mrope_axis = cfg.mrope_section().map(|sec| {
+            (0..inv_freq.len())
+                .map(|i| match i % 3 {
+                    1 if i < 3 * sec[1] => 1,
+                    2 if i < 3 * sec[2] => 2,
+                    _ => 0,
+                })
+                .collect()
+        });
         Ok(Self {
             cfg,
             quant,
@@ -569,6 +642,7 @@ impl<'a> QwenModel<'a> {
             final_norm,
             lm_head,
             inv_freq,
+            mrope_axis,
             stream: None,
         })
     }
@@ -748,8 +822,32 @@ impl<'a> QwenModel<'a> {
             gdn,
             rec,
             rec_span: None,
+            spans: Vec::new(),
             pos: 0,
         }
+    }
+
+    /// RoPE tables for positions `start..start + t`: plain positions, or M-RoPE positions when
+    /// the sequence has vision spans (identical to plain positions for text-only sequences).
+    pub(crate) fn rope_cs(&self, spans: &[VisionSpan], start: usize, t: usize) -> (Vec<f32>, Vec<f32>) {
+        let axis = match &self.mrope_axis {
+            Some(a) if !spans.is_empty() => a,
+            _ => {
+                let positions: Vec<usize> = (start..start + t).collect();
+                return rope_tables(&positions, &self.inv_freq);
+            }
+        };
+        let half = self.inv_freq.len();
+        let mut cos = vec![0f32; t * half];
+        let mut sin = vec![0f32; t * half];
+        for (i, p) in mrope_positions(spans, start, t).iter().enumerate() {
+            for (j, (&f, &ax)) in self.inv_freq.iter().zip(axis).enumerate() {
+                let a = p[ax as usize] as f32 * f;
+                cos[i * half + j] = a.cos();
+                sin[i * half + j] = a.sin();
+            }
+        }
+        (cos, sin)
     }
 
     pub fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
@@ -801,8 +899,7 @@ impl<'a> QwenModel<'a> {
         for &(i, emb) in mm {
             x[i * h..(i + 1) * h].copy_from_slice(emb);
         }
-        let positions: Vec<usize> = (start..start + t).collect();
-        let (cos, sin) = rope_tables(&positions, &self.inv_freq);
+        let (cos, sin) = self.rope_cs(&sess.spans, start, t);
         drop(timer);
 
         let mut hn = vec![0f32; t * h];

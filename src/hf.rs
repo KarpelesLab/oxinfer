@@ -262,7 +262,7 @@ struct RepoInfo {
     siblings: Vec<Sibling>,
 }
 
-const SMALL_FILES: [&str; 8] = [
+const SMALL_FILES: [&str; 9] = [
     "config.json",
     "generation_config.json",
     "tokenizer.json",
@@ -271,6 +271,7 @@ const SMALL_FILES: [&str; 8] = [
     "chat_template.jinja",
     "processor_config.json",
     "preprocessor_config.json",
+    "video_preprocessor_config.json",
 ];
 
 /// Where a repository file comes from.

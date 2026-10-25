@@ -102,6 +102,23 @@ int oxi_engine_set(OxiEngine *engine, const char *key, const char *value);
  * the callback or oxi_engine_cancel) or -1 (error). */
 int oxi_engine_send(OxiEngine *engine, const char *text, oxi_token_fn cb, void *user);
 
+/* oxi_engine_send with attachments placed before the text (builds with the `media` feature).
+ * `media_json` (NULL = none) is a JSON object, every key optional:
+ *   {"images": ["a.png", ...],     PNG / JPEG / WebP / GIF / BMP
+ *    "videos": ["clip.mp4", ...],  MP4 / MOV / MKV / WebM / AVI with H.264, H.265, AV1, VP8, VP9,
+ *                                  MPEG-4 Part 2 or MJPEG, or a directory of frame images
+ *    "audios": ["a.wav", ...],     WAV / MP3 / FLAC / AAC / Ogg (Gemma 4 only)
+ *    "video_fps": 2.0,             frames sampled per second (default: the model's processor;
+ *                                  Qwen 2, Gemma 4 samples 32 frames uniformly)
+ *    "video_max_frames": 32,       most frames sampled (Gemma 4: the frame count)
+ *    "frames_fps": 24.0,           frame rate of a directory of frames (default 24)
+ *    "max_soft_tokens": 280}       image token budget (Gemma 4: 70/140/280/560/1120 soft tokens;
+ *                                  Qwen: tokens of 32x32 pixels; default: the model's)
+ * Gemma 4 takes images, videos and audio; Qwen3.5 / 3.6 / 3.8 checkpoints that include the
+ * vision tower take images and videos. Attachments belong to this message only. Returns as
+ * oxi_engine_send. */
+int oxi_engine_send_media(OxiEngine *engine, const char *text, const char *media_json, oxi_token_fn cb, void *user);
+
 /* Feeds raw text (no chat template; appended to the current context) and streams the
  * continuation. Returns as oxi_engine_send. */
 int oxi_engine_complete(OxiEngine *engine, const char *text, oxi_token_fn cb, void *user);

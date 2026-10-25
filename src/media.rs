@@ -27,6 +27,11 @@ impl Media {
         Self { ctx }
     }
 
+    /// The oxideav registries (containers and codecs).
+    pub fn context(&self) -> &RuntimeContext {
+        &self.ctx
+    }
+
     pub fn load_image(&self, path: &Path) -> Result<RgbImage> {
         let file = oxideav_image::open(&self.ctx, path).map_err(|e| anyhow!("decode image {}: {e}", path.display()))?;
         let img = file.primary();

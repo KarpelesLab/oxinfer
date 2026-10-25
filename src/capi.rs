@@ -13,7 +13,7 @@
 //! over [`crate::whisper`]) follow the same rules, with `oxi_transcriber_cancel`.
 #![allow(clippy::missing_safety_doc)] // the contract is documented once above and in the header
 
-use crate::engine::{CancelHandle, Delta, Engine, EngineOptions, Flow, Reply, SamplingParams, StopReason, SystemPrompt};
+use crate::engine::{Attachments, CancelHandle, Delta, Engine, EngineOptions, Flow, Reply, SamplingParams, StopReason, SystemPrompt};
 use anyhow::{Context, Result, anyhow, bail};
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
@@ -266,6 +266,26 @@ fn run(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxi_engine_send(e: *mut OxiEngine, text: *const c_char, cb: OxiTokenFn, user: *mut c_void) -> c_int {
     run(e, text, cb, user, |g, t, d| g.send(t, d))
+}
+
+/// Sends a user message with attachments (`media_json`, see `oxinfer.h`) and streams the reply;
+/// returns as `oxi_engine_send`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_engine_send_media(
+    e: *mut OxiEngine,
+    text: *const c_char,
+    media_json: *const c_char,
+    cb: OxiTokenFn,
+    user: *mut c_void,
+) -> c_int {
+    let media = match unsafe { opt_str_arg(media_json, "media_json") }.and_then(|j| match j {
+        None => Ok(Attachments::default()),
+        Some(j) => Attachments::from_json(&serde_json::from_str(j).context("media_json is not JSON")?),
+    }) {
+        Ok(m) => m,
+        Err(err) => return guard(-1, || Err(err)),
+    };
+    run(e, text, cb, user, |g, t, d| g.send_with_media(t, &media, d))
 }
 
 /// Feeds raw text (no chat template) and streams the continuation; returns as `oxi_engine_send`.

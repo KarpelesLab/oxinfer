@@ -22,8 +22,9 @@
 //! Supported checkpoints: Gemma 4 and Gemma 3 (text), Qwen3.5 / Qwen3.8 (dense and MoE), Qwen3,
 //! as safetensors folders (bf16, oxinfer pre-quantized, MLX) or single GGUF files. Speculative
 //! decoding: Qwen's MTP layer ([`EngineOptions::mtp`], optionally from a sidecar checkpoint) or
-//! a Gemma 4 assistant model ([`EngineOptions::draft`], greedy). Images and audio for Gemma 4
-//! with the `media` feature ([`Engine::send_with`]).
+//! a Gemma 4 assistant model ([`EngineOptions::draft`], greedy). With the `media` feature,
+//! [`Engine::send_with_media`] attaches images, videos and audio (Gemma 4) or images and videos
+//! (Qwen3.5 / 3.6 / 3.8 checkpoints with their vision tower).
 //!
 //! Core ML models (on Apple Silicon macOS / iOS with the `gpu` feature): an ANEMLL-format
 //! directory (`meta.yaml` + `.mlmodelc` parts, from ANEMLL or `tools/coreml_convert.py`: Qwen3,
@@ -376,6 +377,62 @@ impl EngineOptions {
             _ => bail!("unknown option {key:?} (known: {})", Self::KEYS.join(", ")),
         }
         Ok(())
+    }
+}
+
+/// Attachments for [`Engine::send_with_media`], placed before the message text (images, then
+/// videos, then audio clips).
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
+pub struct Attachments {
+    pub images: Vec<PathBuf>,
+    /// Audio clips (Gemma 4 only).
+    pub audios: Vec<PathBuf>,
+    /// Video files (MP4 / MOV / MKV / WebM / AVI: H.264, H.265, AV1, VP8, VP9, MPEG-4, MJPEG) or
+    /// directories of frames.
+    pub videos: Vec<PathBuf>,
+    /// Video frame sampling (defaults: the model's video processor).
+    pub video: crate::video::VideoOptions,
+    /// Image token budget, 0 for the model's default (see [`mm::MmRequest::max_soft_tokens`]).
+    pub max_soft_tokens: usize,
+}
+
+impl Attachments {
+    pub fn is_empty(&self) -> bool {
+        self.images.is_empty() && self.audios.is_empty() && self.videos.is_empty()
+    }
+
+    /// Parses `{"images": [path...], "audios": [...], "videos": [...], "video_fps": F,
+    /// "video_max_frames": N, "frames_fps": F, "max_soft_tokens": N}` (every key optional; the
+    /// C API's format).
+    pub fn from_json(v: &serde_json::Value) -> Result<Self> {
+        let obj = v.as_object().context("attachments: expected a JSON object")?;
+        let mut a = Attachments::default();
+        for (k, val) in obj {
+            let paths = || -> Result<Vec<PathBuf>> {
+                val.as_array()
+                    .with_context(|| format!("attachments: {k} must be an array of paths"))?
+                    .iter()
+                    .map(|p| {
+                        p.as_str()
+                            .map(PathBuf::from)
+                            .with_context(|| format!("attachments: {k} must hold strings"))
+                    })
+                    .collect()
+            };
+            let num = || val.as_f64().with_context(|| format!("attachments: {k} must be a number"));
+            match k.as_str() {
+                "images" => a.images = paths()?,
+                "audios" => a.audios = paths()?,
+                "videos" => a.videos = paths()?,
+                "video_fps" => a.video.fps = Some(num()?),
+                "video_max_frames" => a.video.max_frames = Some(num()? as usize),
+                "frames_fps" => a.video.frames_fps = Some(num()?),
+                "max_soft_tokens" => a.max_soft_tokens = num()? as usize,
+                _ => bail!("attachments: unknown key {k:?}"),
+            }
+        }
+        Ok(a)
     }
 }
 
@@ -1075,8 +1132,7 @@ impl Engine {
         self.send_with(user, &[], &[], on_delta)
     }
 
-    /// [`Engine::send`] with image and audio attachments (Gemma 4 with the `media` feature),
-    /// placed before the message text.
+    /// [`Engine::send`] with image and audio attachments (see [`Engine::send_with_media`]).
     pub fn send_with(
         &mut self,
         user: &str,
@@ -1084,19 +1140,41 @@ impl Engine {
         audios: &[PathBuf],
         on_delta: &mut dyn FnMut(&Delta) -> Flow,
     ) -> Result<Reply> {
-        let (mm_text, feats) = if images.is_empty() && audios.is_empty() {
+        let media = Attachments {
+            images: images.to_vec(),
+            audios: audios.to_vec(),
+            ..Attachments::default()
+        };
+        self.send_with_media(user, &media, on_delta)
+    }
+
+    /// [`Engine::send`] with attachments placed before the message text (the `media` feature):
+    /// images, videos and audio for Gemma 4; images and videos for Qwen3.5 / 3.6 / 3.8
+    /// checkpoints that include the vision tower. Not for Core ML models.
+    pub fn send_with_media(&mut self, user: &str, media: &Attachments, on_delta: &mut dyn FnMut(&Delta) -> Flow) -> Result<Reply> {
+        let (mm_text, feats) = if media.is_empty() {
             (String::new(), Vec::new())
         } else {
-            if self.info.family != Family::Gemma4 || self.info.coreml.is_some() {
-                bail!("image and audio inputs are supported for Gemma 4 only (not with Core ML)");
+            if self.info.coreml.is_some() {
+                bail!("attachments are not supported for Core ML models");
+            }
+            match self.info.family {
+                Family::Gemma4 => {}
+                Family::Qwen if crate::qwen_vision::is_qwen_vl(&self.info.path) => {}
+                Family::Qwen => bail!("this checkpoint has no vision tower (text only)"),
+                _ => bail!("attachments are supported for Gemma 4 and Qwen3.5-family vision models only"),
             }
             let req = mm::MmRequest {
                 model: &self.info.path,
-                images,
-                audios,
-                max_soft_tokens: 0,
+                images: &media.images,
+                audios: &media.audios,
+                videos: &media.videos,
+                video: media.video.clone(),
+                max_soft_tokens: media.max_soft_tokens,
+                quant: self.info.quant,
                 dump_mm: None,
             };
+            let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
             mm::prepare(&req, self.files, self.info.hidden_size)?
         };
         let text = self.prompt_text(&format!("{mm_text}{user}"));
@@ -1211,16 +1289,18 @@ impl Engine {
                 ids.len()
             );
         }
-        let overrides = if feats.is_empty() {
-            Vec::new()
+        let (overrides, spans) = if feats.is_empty() {
+            (Vec::new(), Vec::new())
         } else {
-            mm::overrides(&ids, feats, self.info.hidden_size)?
+            (mm::overrides(&ids, feats, self.info.hidden_size)?, mm::vision_spans(&ids, feats)?)
         };
-        if !overrides.is_empty() && matches!(self.lm, Lm::Qwen { .. } | Lm::QwenMtp { .. }) {
-            bail!("attachments are not supported for this model");
-        }
         self.unfed = None;
-        Ok(PendingTurn { ids, overrides, think })
+        Ok(PendingTurn {
+            ids,
+            overrides,
+            spans,
+            think,
+        })
     }
 }
 
@@ -1228,6 +1308,8 @@ impl Engine {
 struct PendingTurn {
     ids: Vec<u32>,
     overrides: Vec<(usize, Vec<f32>)>,
+    /// Qwen M-RoPE vision spans `(index in ids, rows, cols)`.
+    spans: Vec<(usize, usize, usize)>,
     think: bool,
 }
 
@@ -1235,7 +1317,12 @@ impl PendingTurn {
     fn finish(self, e: &mut Engine, on_delta: &mut dyn FnMut(&Delta) -> Flow) -> Result<Reply> {
         // Core ML models do not use the thread pool.
         let _run = e.info.coreml.is_none().then(|| RUN.lock().unwrap_or_else(|p| p.into_inner()));
-        let PendingTurn { ids, overrides, think } = self;
+        let PendingTurn {
+            ids,
+            overrides,
+            spans,
+            think,
+        } = self;
         let Engine {
             lm,
             tok,
@@ -1316,7 +1403,11 @@ impl PendingTurn {
                 }
             }
             Lm::Qwen { model, sess } => {
-                let hs = generate::prefill(*model, sess, &ids, chunk, &[]);
+                let base = sess.pos;
+                for &(p, gh, gw) in &spans {
+                    sess.add_vision_span(base + p, gh, gw);
+                }
+                let hs = generate::prefill(*model, sess, &ids, chunk, &overrides);
                 let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
                 st.prefill_secs = t0.elapsed().as_secs_f64();
                 let max = limit(sess.pos);
@@ -1327,7 +1418,11 @@ impl PendingTurn {
                 }
             }
             Lm::QwenMtp { dec } => {
-                let logits = dec.prefill(&ids, chunk);
+                let base = dec.sess.pos;
+                for &(p, gh, gw) in &spans {
+                    dec.sess.add_vision_span(base + p, gh, gw);
+                }
+                let logits = dec.prefill_mm(&ids, chunk, &overrides);
                 st.prefill_secs = t0.elapsed().as_secs_f64();
                 let max = limit(dec.sess.pos);
                 if max == 0 {

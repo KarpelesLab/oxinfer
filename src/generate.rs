@@ -29,6 +29,9 @@ pub trait TextLm {
     fn forward_hidden_mm(&self, sess: &mut Self::Sess, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32>;
     /// LM-head logits `[t, vocab]` for the last `t` hidden states given.
     fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32>;
+    /// Declares `gh` x `gw` vision tokens at sequence position `start` before they are fed
+    /// (Qwen's M-RoPE positions); models without multimodal positions ignore it.
+    fn add_vision_span(&self, _sess: &mut Self::Sess, _start: usize, _gh: usize, _gw: usize) {}
     /// Runs `tokens` and returns the logits after the last one.
     fn forward(&self, sess: &mut Self::Sess, tokens: &[u32]) -> Vec<f32> {
         let h = self.hidden_size();
@@ -72,6 +75,9 @@ impl TextLm for QwenModel<'_> {
     }
     fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
         QwenModel::logits(self, hidden, t)
+    }
+    fn add_vision_span(&self, sess: &mut QwenSession, start: usize, gh: usize, gw: usize) {
+        sess.add_vision_span(start, gh, gw)
     }
 }
 

@@ -44,7 +44,7 @@ required-features = ["hf", "media"]
 
 [features]
 default = ["media", "hf", "gpu"]
-# Image / audio file decoding through oxideav.
+# Image / audio / video file decoding through oxideav.
 media = ["dep:oxideav-core", "dep:oxideav-pipeline", "dep:oxideav-meta", "dep:oxideav-image"]
 # Fetching models from HuggingFace through rsurl.
 hf = ["dep:rsurl"]
@@ -60,7 +60,7 @@ capi = []
 [dependencies]
 oxideav-core = { version = "0.1", optional = true }
 oxideav-pipeline = { version = "0.1", optional = true }
-oxideav-meta = { version = "0.0.3", default-features = false, features = ["png", "mjpeg", "webp", "gif", "bmp", "basic", "mp3", "flac", "aac", "mp4", "mov", "ogg", "vorbis", "opus", "mkv", "riff"], optional = true }
+oxideav-meta = { version = "0.0.3", default-features = false, features = ["png", "mjpeg", "webp", "gif", "bmp", "basic", "mp3", "flac", "aac", "mp4", "mov", "ogg", "vorbis", "opus", "mkv", "riff", "avi", "h264", "h265", "vp8", "vp9", "av1", "mpeg4video"], optional = true }
 oxideav-image = { version = "0.0.5", optional = true }
 anyhow = "1.0.104"
 half = "2.7.1"

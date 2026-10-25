@@ -85,6 +85,8 @@ pub struct QwenMtp<'a> {
 /// The MTP layer's own KV cache: one entry per main-model position whose successor is known.
 pub struct MtpSession {
     kv: LayerCache,
+    /// The main session's vision spans (M-RoPE positions), copied after each main prefill.
+    pub(crate) spans: Vec<crate::qwen::VisionSpan>,
 }
 
 impl MtpSession {
@@ -96,6 +98,7 @@ impl MtpSession {
     }
     pub fn truncate(&mut self, len: usize) {
         self.kv.truncate(len);
+        self.spans.retain(|s| s.start < len);
     }
 }
 
@@ -229,6 +232,7 @@ impl<'a> QwenMtp<'a> {
     pub fn new_session(&self, cfg: &QwenConfig) -> MtpSession {
         MtpSession {
             kv: LayerCache::new(cfg.num_key_value_heads, cfg.head_dim),
+            spans: Vec::new(),
         }
     }
 
@@ -268,8 +272,7 @@ impl<'a> QwenMtp<'a> {
         linear(&self.fc, h, 2 * h, &cat, t, &mut x);
 
         let start = sess.kv.len;
-        let positions: Vec<usize> = (start..start + t).collect();
-        let (cos, sin) = rope_tables(&positions, &model.inv_freq);
+        let (cos, sin) = model.rope_cs(&sess.spans, start, t);
         let mut hn = vec![0f32; t * h];
         let mut y = vec![0f32; t * h];
         rmsnorm_f32w_rows(&x, h, &self.ln_in, eps, &mut hn);
@@ -561,17 +564,33 @@ impl<'m> MtpDecoder<'m> {
     /// returns the logits after the last one. A committed token that was never processed (the
     /// stop token ending the previous reply) is dropped, as plain decoding drops it.
     pub fn prefill(&mut self, tokens: &[u32], chunk: usize) -> Vec<f32> {
+        self.prefill_mm(tokens, chunk, &[])
+    }
+
+    /// `prefill` with multimodal soft tokens replacing the embeddings at some positions of
+    /// `tokens` (`(index in tokens, embedding)`); declare their vision spans on `self.sess`
+    /// first (`QwenSession::add_vision_span`). The MTP layer sees the placeholder tokens.
+    pub fn prefill_mm(&mut self, tokens: &[u32], chunk: usize, overrides: &[(usize, Vec<f32>)]) -> Vec<f32> {
         assert!(!tokens.is_empty());
         let h = self.model.cfg.hidden_size;
         if self.next.take().is_some() {
             self.pend_t.pop();
         }
+        self.msess.spans = self.sess.spans.clone();
         let mut last = Vec::new();
+        let mut start = 0;
         for c in tokens.chunks(chunk.max(1)) {
             if self.pend_h.len() > self.pend_t.len() * h {
                 self.pend_t.push(c[0]);
             }
-            let hs = self.model.forward_hidden_mm(&mut self.sess, c, &[]);
+            let end = start + c.len();
+            let local: Vec<(usize, &[f32])> = overrides
+                .iter()
+                .filter(|(p, _)| *p >= start && *p < end)
+                .map(|(p, e)| (p - start, e.as_slice()))
+                .collect();
+            start = end;
+            let hs = self.model.forward_hidden_mm(&mut self.sess, c, &local);
             self.pend_h.extend_from_slice(&hs);
             self.pend_t.extend_from_slice(&c[1..]);
             self.flush();

@@ -59,6 +59,8 @@ struct Args {
     expert_predict: bool,
     images: Vec<PathBuf>,
     audios: Vec<PathBuf>,
+    videos: Vec<PathBuf>,
+    video: oxinfer::video::VideoOptions,
     dump_mm: Option<PathBuf>,
     max_soft_tokens: usize,
     cache_dir: Option<PathBuf>,
@@ -160,7 +162,13 @@ fn usage() -> ! {
          \x20 --expert-predict     with --stream, read the next MoE layer's guessed experts ahead\n\
          \x20 --image FILE         attach an image (repeatable; PNG/JPEG/WebP/GIF/BMP via oxideav)\n\
          \x20 --audio FILE         attach an audio clip (repeatable; WAV/MP3/FLAC/AAC/OGG via oxideav)\n\
-         \x20 --max-soft-tokens N  image soft-token budget: 70, 140, 280 (default), 560 or 1120\n\
+         \x20 --video FILE|DIR     attach a video (repeatable; MP4/MOV/MKV/WebM/AVI with H.264, H.265,\n\
+         \x20                      AV1, VP8, VP9, MPEG-4 or MJPEG via oxideav), or a directory of frames\n\
+         \x20 --video-fps F        frames sampled per second (Qwen default 2; Gemma 4: uniform frames)\n\
+         \x20 --video-frames N     most frames sampled (Qwen default 768; Gemma 4: the count, default 32)\n\
+         \x20 --frames-fps F       frame rate of a directory of frames (default 24)\n\
+         \x20 --max-soft-tokens N  image token budget: Gemma 4: 70, 140, 280 (default), 560 or 1120;\n\
+         \x20                      Qwen: merged tokens of 32x32 pixels (default 16384)\n\
          \x20 --dump-mm PREFIX     write multimodal soft tokens / patches as f32 files (for reference checks)\n\
          \x20 --cache-dir DIR      where fetched models are cached\n\
          \x20 --download-only      fetch the model (and drafter) and exit\n\
@@ -268,6 +276,8 @@ fn parse_args() -> Result<Args> {
         expert_predict: false,
         images: Vec::new(),
         audios: Vec::new(),
+        videos: Vec::new(),
+        video: Default::default(),
         dump_mm: None,
         max_soft_tokens: 0,
         cache_dir: None,
@@ -391,6 +401,10 @@ fn parse_args() -> Result<Args> {
             "--expert-predict" => a.expert_predict = true,
             "--image" => a.images.push(PathBuf::from(val()?)),
             "--audio" => a.audios.push(PathBuf::from(val()?)),
+            "--video" => a.videos.push(PathBuf::from(val()?)),
+            "--video-fps" => a.video.fps = Some(val()?.parse()?),
+            "--video-frames" => a.video.max_frames = Some(val()?.parse()?),
+            "--frames-fps" => a.video.frames_fps = Some(val()?.parse()?),
             "--dump-mm" => a.dump_mm = Some(PathBuf::from(val()?)),
             "--max-soft-tokens" => a.max_soft_tokens = val()?.parse()?,
             "--cache-dir" => a.cache_dir = Some(PathBuf::from(val()?)),
@@ -468,7 +482,10 @@ fn mm_request(args: &Args) -> oxinfer::mm::MmRequest<'_> {
         model: &args.model,
         images: &args.images,
         audios: &args.audios,
+        videos: &args.videos,
+        video: args.video.clone(),
         max_soft_tokens: args.max_soft_tokens,
+        quant: args.quant,
         dump_mm: args.dump_mm.as_deref(),
     }
 }
@@ -914,7 +931,11 @@ fn run_image(args: &Args) -> Result<()> {
 }
 
 /// Plain generation (single prompt or chat) for any model family, without attachments or drafter.
-fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt: &dyn ChatFormat) -> Result<()> {
+/// Attachments prepared for the first user turn: placeholder text and soft tokens.
+type Mm = (String, Vec<oxinfer::mm::MmFeature>);
+
+fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt: &dyn ChatFormat, mm: Mm) -> Result<()> {
+    let (mm_text, mut mm_feats) = mm;
     let encode = |text: &str| -> Result<Vec<u32>> {
         let enc = tok.encode(text, false).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
         Ok(enc.get_ids().to_vec())
@@ -937,7 +958,12 @@ fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt
             }
             let text = if first {
                 first = false;
-                fmt.first_turn(system_prompt(args).as_deref(), args.think, &tool_specs(args), line)
+                fmt.first_turn(
+                    system_prompt(args).as_deref(),
+                    args.think,
+                    &tool_specs(args),
+                    &format!("{mm_text}{line}"),
+                )
             } else {
                 fmt.end_of_model_turn() + &fmt.user_turn(line, args.think)
             };
@@ -945,8 +971,10 @@ fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt
             if args.show_tokens {
                 eprintln!("[prompt ids: {ids:?}]");
             }
+            // The attachments belong to the first turn.
+            let overrides = oxinfer::mm::bind(model, &mut sess, &ids, &std::mem::take(&mut mm_feats))?;
             let t = Instant::now();
-            let hs = generate::prefill(model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &[]);
+            let hs = generate::prefill(model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
             let logits = model.logits(&hs[hs.len() - h..], 1);
             let prefill_secs = t.elapsed().as_secs_f64();
             prof::reset();
@@ -970,6 +998,7 @@ fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt
             s
         }
     };
+    let prompt = format!("{mm_text}{prompt}");
     let text = if args.raw {
         prompt
     } else {
@@ -986,8 +1015,9 @@ fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt
     if ids.is_empty() {
         bail!("empty prompt");
     }
+    let overrides = oxinfer::mm::bind(model, &mut sess, &ids, &mm_feats)?;
     let t = Instant::now();
-    let hs = generate::prefill(model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &[]);
+    let hs = generate::prefill(model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
     let logits = model.logits(&hs[hs.len() - h..], 1);
     let prefill_secs = t.elapsed().as_secs_f64();
     if args.profile {
@@ -1099,8 +1129,8 @@ fn run_embed(args: &Args) -> Result<()> {
 
 fn run_qwen(args: Args) -> Result<()> {
     let t0 = Instant::now();
-    if args.draft.is_some() || !args.images.is_empty() || !args.audios.is_empty() {
-        bail!("--draft and attachments are not supported for Qwen models yet (see --mtp)");
+    if args.draft.is_some() {
+        bail!("--draft is not supported for Qwen models (see --mtp)");
     }
     let cfg = config::QwenConfig::load(&args.model)?;
     let eos = config::load_eos_ids(&args.model);
@@ -1147,8 +1177,18 @@ fn run_qwen(args: Args) -> Result<()> {
         None
     };
     if let Some(out) = &args.save_quantized {
+        // Keep the vision tower (loading it marks its tensors for writing).
+        if let Some(qc) = oxinfer::qwen_vision::QwenMmConfig::load(&args.model)? {
+            oxinfer::qwen_vision::QwenVisionTower::load(qc.vision, &files, model.quant)?;
+            eprintln!("[vision tower kept]");
+        }
         return save_quantized(&args.model, out, &files, model.quant);
     }
+    let mm = if mm_request(&args).is_empty() {
+        Default::default()
+    } else {
+        oxinfer::mm::prepare(&mm_request(&args), &files, model.cfg.hidden_size)?
+    };
     let streamer = if args.stream {
         let mut fs = vec![&files];
         fs.extend(side.as_ref());
@@ -1159,8 +1199,8 @@ fn run_qwen(args: Args) -> Result<()> {
     *STREAM.lock().unwrap() = streamer.clone();
     TRACE.store(args.stream_trace, std::sync::atomic::Ordering::Relaxed);
     let r = match &mtp {
-        Some(m) if args.mtp => run_qwen_mtp(&args, &model, m, &tok, &eos, fmt, streamer.as_deref()),
-        _ => run_text(&args, &model, &tok, &eos, fmt),
+        Some(m) if args.mtp => run_qwen_mtp(&args, &model, m, &tok, &eos, fmt, streamer.as_deref(), mm),
+        _ => run_text(&args, &model, &tok, &eos, fmt, mm),
     };
     if let Some(s) = &streamer
         && let Some(c) = s.cached_bytes()
@@ -1287,6 +1327,7 @@ fn stream_line(d: &oxinfer::stream::StreamStats, tokens: usize, secs: f64) -> St
 }
 
 /// Generation (single prompt or chat) with MTP speculative decoding.
+#[allow(clippy::too_many_arguments)]
 fn run_qwen_mtp(
     args: &Args,
     model: &qwen::QwenModel,
@@ -1295,8 +1336,10 @@ fn run_qwen_mtp(
     eos: &[u32],
     fmt: &dyn ChatFormat,
     stream: Option<&oxinfer::stream::Streamer>,
+    mm: Mm,
 ) -> Result<()> {
     use oxinfer::qwen_mtp::{MtpDecoder, MtpOptions};
+    let (mm_text, mut mm_feats) = mm;
     if args.tools || args.dump_logits.is_some() || args.print_prompt {
         bail!("--mtp does not combine with --tools, --dump-logits or --print-prompt");
     }
@@ -1342,8 +1385,10 @@ fn run_qwen_mtp(
         if args.show_tokens {
             eprintln!("[prompt ids ({}): {ids:?}]", ids.len());
         }
+        // The attachments belong to the first turn.
+        let overrides = oxinfer::mm::bind(model, &mut dec.sess, &ids, &std::mem::take(&mut mm_feats))?;
         let t = Instant::now();
-        let logits = dec.prefill(&ids, chunk);
+        let logits = dec.prefill_mm(&ids, chunk, &overrides);
         let prefill_secs = t.elapsed().as_secs_f64();
         prof::reset();
         let before = dec.stats.clone();
@@ -1413,6 +1458,7 @@ fn run_qwen_mtp(
                 s
             }
         };
+        let prompt = format!("{mm_text}{prompt}");
         let text = if args.raw {
             prompt
         } else {
@@ -1434,7 +1480,7 @@ fn run_qwen_mtp(
         }
         let text = if first {
             first = false;
-            fmt.first_turn(system_prompt(args).as_deref(), args.think, &[], line)
+            fmt.first_turn(system_prompt(args).as_deref(), args.think, &[], &format!("{mm_text}{line}"))
         } else {
             fmt.end_of_model_turn() + &fmt.user_turn(line, args.think)
         };
@@ -1451,14 +1497,14 @@ fn run_gemma(args: Args) -> Result<()> {
     let model = Model::load(cfg, &files, args.quant)?;
     let tok = Tokenizer::from_file(args.model.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
     if model.cfg.gemma3 {
-        if args.draft.is_some() || !args.images.is_empty() || !args.audios.is_empty() {
+        if args.draft.is_some() || !mm_request(&args).is_empty() {
             bail!("speculative decoding and attachments are not supported for Gemma 3 yet");
         }
         if let Some(out) = &args.save_quantized {
             return save_quantized(&args.model, out, &files, model.quant);
         }
         let eos = chat::with_turn_end(&chat::Gemma3Chat, &tok, eos);
-        return run_text(&args, &model, &tok, &eos, &chat::Gemma3Chat);
+        return run_text(&args, &model, &tok, &eos, &chat::Gemma3Chat, Default::default());
     }
     let eos = chat::with_turn_end(&chat::GemmaChat, &tok, eos);
     eprintln!(
@@ -1519,7 +1565,7 @@ fn run_gemma(args: Args) -> Result<()> {
 
     if args.chat {
         let mut first = true;
-        let (mm_text, mm_feats) = if !args.images.is_empty() || !args.audios.is_empty() {
+        let (mm_text, mm_feats) = if !mm_request(&args).is_empty() {
             oxinfer::mm::prepare(&mm_request(&args), &files, model.cfg.hidden_size)?
         } else {
             (String::new(), Vec::new())
@@ -1547,7 +1593,7 @@ fn run_gemma(args: Args) -> Result<()> {
                 text.push_str(&chat::user_turn(line));
             }
             let ids = encode(&text)?;
-            if !mm_feats.is_empty() && !text.is_empty() && text.contains("<|image|>") || text.contains("<|audio|>") {
+            if !mm_feats.is_empty() && ["<|image|>", "<|audio|>", "<|video|>"].iter().any(|p| text.contains(p)) {
                 overrides = oxinfer::mm::overrides(&ids, &mm_feats, model.cfg.hidden_size)?;
             }
             if args.show_tokens {
@@ -1615,7 +1661,7 @@ fn run_gemma(args: Args) -> Result<()> {
             s
         }
     };
-    let (mm_text, mm_feats) = if !args.images.is_empty() || !args.audios.is_empty() {
+    let (mm_text, mm_feats) = if !mm_request(&args).is_empty() {
         oxinfer::mm::prepare(&mm_request(&args), &files, model.cfg.hidden_size)?
     } else {
         (String::new(), Vec::new())

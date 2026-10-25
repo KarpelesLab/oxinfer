@@ -385,6 +385,10 @@ pub struct QwenRope {
     pub rope_theta: f64,
     #[serde(default)]
     pub partial_rotary_factor: Option<f64>,
+    /// M-RoPE (vision-language checkpoints): rotary frequencies per (time, height, width) axis,
+    /// interleaved.
+    #[serde(default)]
+    pub mrope_section: Option<Vec<usize>>,
 }
 
 /// Qwen3.5 / Qwen3.8 dense hybrid text config (Gated DeltaNet + gated full attention), or a
@@ -493,6 +497,13 @@ impl QwenConfig {
             .map(|r| r.rope_theta)
             .or(self.rope_theta)
             .unwrap_or(10_000_000.0)
+    }
+    /// The M-RoPE sections (time, height, width frequency counts), if the config has them.
+    pub fn mrope_section(&self) -> Option<&[usize]> {
+        self.rope_parameters
+            .as_ref()
+            .and_then(|r| r.mrope_section.as_deref())
+            .filter(|s| s.len() == 3)
     }
     /// Number of rotated dimensions per head (partial RoPE).
     pub fn rotary_dim(&self) -> usize {

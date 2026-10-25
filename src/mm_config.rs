@@ -145,6 +145,7 @@ pub struct MmConfig {
     pub audio_token_id: u32,
     pub boa_token_id: u32,
     pub eoa_token_id: u32,
+    pub video_token_id: u32,
     pub vision_soft_tokens_per_image: usize,
 }
 
@@ -170,6 +171,7 @@ impl MmConfig {
             audio_token_id: id("audio_token_id", 258881),
             boa_token_id: id("boa_token_id", 256000),
             eoa_token_id: id("eoa_token_id", 258883),
+            video_token_id: id("video_token_id", 258884),
             vision_soft_tokens_per_image: raw
                 .get("vision_soft_tokens_per_image")
                 .and_then(|v| v.as_u64())
