@@ -33,6 +33,7 @@ identical tokens.
 | google/gemma-4-26B-A4B-it | 26B MoE | 52 GB | not yet (MoE block unimplemented) |
 | Qwen/Qwen3.8-27B (and Qwen3.5/3.6 dense) | 27.8B | 55.6 GB | text only; matches the bf16 reference; see below |
 | Qwen/Qwen3.6-35B-A3B and fine-tunes (PixilabAI/Zawen-v0.1-35B-A3B) | 35B MoE, 3B active | 69 GB | text only; Zawen matches the reference (see below) |
+| autotrust/JEV-9B, JEV-27B (Jev decision models) | 9B / 27.8B + LoRA | 18 / 54 GB + 0.16 / 0.44 GB | typed decisions, on the bundled or any matching base; match transformers + peft (see [Typed decisions](#typed-decisions-jev-models)) |
 | Qwen/Qwen3.5-0.8B | 0.8B | 1.7 GB | text only; the small one used for the wasm measurements |
 | mlx-community/gemma-4-e2b-it-4bit, gemma-4-e4b-it-4bit | 5.1B / 8.0B | 3.6 / 5.2 GB (MLX 4-bit) | text, images and audio; see [MLX checkpoints](#mlx-checkpoints) |
 | mlx-community/Qwen3-4B-4bit (Qwen3 dense) | 4.0B | 2.3 GB (MLX 4-bit) | text; matches the reference on the same weights (same top 10) |
@@ -169,6 +170,113 @@ In the browser the model gets `get_datetime` and `run_javascript`, which runs th
 a Web Worker with the network and storage APIs removed and a 5 s limit (hardening, not a security
 boundary). Its system prompt describes where it runs: browser, operating system, language, time
 zone, local time, screen, CPU cores and GPU. Both can be changed under Settings.
+
+## Typed decisions (Jev models)
+
+The Jev models (`autotrust/JEV-9B`, `autotrust/JEV-27B`, ...) answer a typed question about a
+piece of text with calibrated probabilities, in one prefill pass and with no generation
+("System 1"): `noul` (yes / no, probabilities for `["false", "true"]`), `score` (a 0-5 scale) or
+`choice` (2-16 options labelled A-P, up to 256 with the extra single-token labels Q-Z, AA, AB,
+...). The prompt is the `bare-v1` template:
+
+```text
+[kind] choice
+[state] SKU AX-330 stock at 8% of safety level; supplier late twice this quarter.
+[question] Supplier response for this scenario.
+[options]
+A) issue_warning
+B) renegotiate
+C) dual_source
+D) maintain
+[decision]:
+```
+
+The last token's final-norm hidden state goes through a small head (`head.safetensors`, 24 slots),
+the active slots are divided by a per-kind temperature (`calibration.json`) and soft-maxed. The
+backbone of JEV-9B / JEV-27B is the unmodified Qwen3.5-9B / Qwen3.8-27B; the decision skill is a
+LoRA adapter (`adapter/`, r=16, about 160 / 435 MB) that oxinfer applies **unmerged, at run time,
+on top of whatever base weights are loaded** (bf16, `--quant q8|q4`, pre-quantized, MLX or GGUF)
+and only during a decision. One loaded model therefore serves chat (the base model, bit for bit:
+the adapter's layers are skipped when it is off) and decisions. The bundles that ship merged
+weights and read the decision from the LM head (`adapter_vllm/decision_head.json`, e.g.
+`autotrust/JEV-35B`) work too.
+
+```sh
+# a Jev bundle (backbone, adapter and head; the repo id downloads all of it)
+oxinfer --model autotrust/JEV-9B --decide noul \
+  --state "Customer says the parcel arrived damaged and wants their money back." \
+  --question "Is the customer asking for a refund?"
+#   false  0.0092
+# * true   0.9908  ########################################
+
+# any matching base you already have, plus only the decision files of the bundle (~420 MB for
+# JEV-27B: adapter, head and configs, not the 54 GB backbone)
+oxinfer --model ~/.cache/oxinfer/hub/Qwen3.8-27B-oxinfer-q4 --decision-from autotrust/JEV-27B \
+  --decide choice --state "SKU AX-330 stock at 8% of safety level; supplier late twice this quarter." \
+  --question "Supplier response for this scenario." \
+  --option issue_warning --option renegotiate --option dual_source --option maintain
+
+# requests in the /v1/decide JSON format (an object, an array or one per line): one response per line
+oxinfer --model autotrust/JEV-9B --decide-json requests.json
+```
+
+`--decision-from` (engine option `decision_from`) takes a directory or a repo id; the base must
+match the bundle (hidden size, layer count, vocabulary, verbalizer tokens, and the shape of every
+adapted layer), otherwise loading fails with a message saying which. As a library:
+
+```rust
+use oxinfer::decide::DecisionRequest;
+use oxinfer::engine::{Engine, EngineOptions};
+let mut opts = EngineOptions::default();
+opts.set("quant", "q4")?;
+opts.set("decision_from", "autotrust/JEV-9B")?;
+let mut engine = Engine::load("Qwen/Qwen3.5-9B", &opts)?;
+let d = engine.decide(&DecisionRequest::choice(
+    "I was charged twice for my subscription this month.",
+    "Which team should handle this ticket?",
+    ["billing", "technical support", "sales", "account security"],
+))?;
+println!("{} ({:.3})", d.best, d.probabilities[d.best_index]);
+```
+
+A decision runs in a scratch context: the conversation of the engine is left as it was, so
+`send` and `decide` can be interleaved (`examples/decide.rs` checks that the chat reply is the same
+before and after a decision, and the same as without any adapter). `Engine::decide_json` and the C
+API's `oxi_decide` take and return the JSON of the reference server's `POST /v1/decide` (`kind`,
+`state`, `question`, `options` in; `options`, `probabilities`, `choice_index`, `choice`,
+`adaptation` (`native` or `wide-labels`), `usage`, ... out); `oxi_decide_info_json` describes the
+loaded assets.
+
+Agreement with the reference (`transformers` + `peft`, unmerged adapter, the card's slot-head
+readout; 10 questions: 3 noul, 2 score, 4- and 12-option choices and a 20-option wide-label choice
+read through `adapter_vllm`'s LM-head LoRA), JEV-9B:
+
+| oxinfer | vs reference f32 | | vs reference bf16 |
+|---|---|---|---|
+| | max \|Δp\| | max KL | max \|Δp\| |
+| bf16 weights, CPU | 4.8e-4 | 5.3e-7 | 3.9e-3 |
+| bf16 weights, Metal | 5.0e-4 | 5.8e-7 | |
+| BF16 GGUF base (unsloth) + JEV-9B adapter, Metal | 4.6e-4 | 5.2e-7 | |
+| `--quant q8` | 6.5e-3 | 1.2e-4 | |
+
+(The bf16 reference itself differs from the f32 one by 4.0e-3.) Qwen3.5-9B with
+`--decision-from autotrust/JEV-9B` gives the same probabilities as the JEV-9B folder, and JEV-27B on
+the bf16 Qwen3.8-27B reproduces the model card (refund `true` 0.978, AX-330 `dual_source` 0.62);
+on the Q4 conversion the largest difference to bf16 is 0.044 (KL 6.6e-3, from the 4-bit weights).
+
+Latency (M5 Max, 18 threads; a decision is a prefill, so it scales with the prompt):
+
+| model | device | 105-token prompt | 1461-token prompt | plain prefill of the same 1461 tokens |
+|---|---|---|---|---|
+| JEV-9B (bf16) | CPU | 1.31 s | 18.3 s | 17.8 s |
+| JEV-9B (bf16) | Metal | 0.32 s | 2.63 s | 2.44 s |
+| JEV-27B on Qwen3.8-27B Q4 (`decision_from`) | CPU | 5.2 s | 70 s | |
+| JEV-27B on Qwen3.8-27B Q4 (`decision_from`) | Metal | 0.72 s | 6.2 s | 5.9 s |
+
+The adapter costs 3-7 % of the prefill (low-rank products in f32 NEON on the CPU, after the base
+matmul, also when the base matmul runs on the GPU). Not supported: Gemma 4 26B-A4B bundles
+(GEV-26B-Decide, JEV-Gemma4-26B-A4B: oxinfer has no Gemma 4 MoE), LoRA on routed MoE experts,
+image parts in the state, and Core ML models.
 
 ## Image generation
 
