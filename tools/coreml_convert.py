@@ -25,26 +25,35 @@ Supported architectures (docs/coreml-format.md has the exact runtime contract):
 
 The graph is written for the ANE the way ANEMLL does it: fp16 everywhere, linear layers as 1x1
 convolutions, RMSNorm through layer_norm on [x, -x], 4-D tensors, KV cache updated in place with a
-dynamic slice at `current_pos`, LM head split 16 ways. Weights are palettized (k-means LUT,
-per_grouped_channel with 8 output channels per LUT, as in ANEMLL's released models: 6 bits for the
-decoder layers and the LM head, embeddings unquantized); `infer` and `prefill` see byte-identical
-weights, so the merged package stores them once. Decoder chunks are cut at about equal weight
-size, each below --max-chunk-mb.
+dynamic slice at `current_pos`, LM head split 16 ways. Weights are palettized (LUT per group of 8
+output channels, as in ANEMLL's released models: 6 bits for the decoder layers and the LM head,
+embeddings unquantized). By default the LUTs are data-aware (--lut-method fisher, see
+tools/coreml_quant.py): the float32 transformers model answers a few built-in prompts, the
+Fisher information of every weight weights its k-means, and --lut-mix gives the most sensitive
+weights a wider LUT. `infer` and `prefill` see byte-identical weights, so the merged package
+stores them once. Decoder chunks are cut at about equal weight size, each below --max-chunk-mb.
+Gemma 4's sliding-window layers keep a cache of window + batch positions once the context is
+longer than that (docs/coreml-format.md), so 4K-8K contexts cost little memory.
 
 Requires macOS with the Xcode command line tools (`xcrun coremlcompiler`), coremltools >= 8
 (tested: 9.0 with torch 2.14 and numpy 2.2; coremltools 9.0 fails with numpy >= 2.3),
-safetensors, scikit-learn (k-means) and pyyaml for coreml_check.py.
+safetensors, transformers (calibration; --lut-method kmeans does without), scikit-learn
+(Core ML's k-means) and pyyaml for coreml_check.py. Calibration loads the float32 model plus one
+gradient per linear weight: about 3x the fp16 checkpoint size in RAM.
 
 quantization (--ffn-quant / --lmhead-quant / --embed-quant):
   none          fp16
-  lutN[,G]      k-means palettization, N bits (1-8), G output channels per LUT (default 8)
+  lutN[,G]      palettization, N bits (1, 2, 3, 4, 6 or 8: Core ML has no 5-bit LUT), G output
+                channels per LUT (default 8; smaller groups are slower on the ANE: G=1 halves
+                decode speed)
   int8[,tensor] linear int8 per channel (or per tensor)  -- wrong results on the ANE, GPU only
   int4[,B]      linear int4 per block of B (default 32)   -- does not compile for the ANE
 
 examples:
   coreml_convert.py --model ~/.cache/oxinfer/hub/Qwen--Qwen3-0.6B --output out/qwen3-0.6b
   coreml_convert.py --model ~/.cache/oxinfer/hub/Qwen--Qwen3.5-0.8B --output out/q35 \\
-      --context-length 1024 --ffn-quant lut4    # smaller, lower quality
+      --ffn-quant lut4 --lut-mix 4.5 --calib-cache out/q35-calib.pt   # ~30% smaller decoder
+  coreml_convert.py --model models/gemma-4-E2B-it --output out/g4 --context-length 8192
 """
 from __future__ import annotations
 
@@ -111,6 +120,9 @@ class Spec:
     lin_dk: int = 0
     lin_dv: int = 0
     conv_k: int = 0
+    n_experts: int = 0  # MoE (Qwen3.5 MoE): routed experts, top-k, expert width
+    top_k: int = 0
+    moe_inter: int = 0
     # Gemma 4
     global_head_dim: int = 0
     sliding_window: int = 0
@@ -143,7 +155,7 @@ def load_spec(cfg: dict) -> Spec:
     common = dict(
         model_type=mt,
         hidden=tc["hidden_size"],
-        inter=tc["intermediate_size"],
+        inter=tc.get("intermediate_size") or tc.get("moe_intermediate_size", 0),
         n_layers=tc["num_hidden_layers"],
         n_heads=n_heads,
         n_kv=tc.get("num_key_value_heads", n_heads),
@@ -158,10 +170,17 @@ def load_spec(cfg: dict) -> Spec:
         if tc.get("rope_scaling"):
             raise SystemExit("rope_scaling is not supported")
         return Spec(arch="qwen3", theta=theta, rot_dim=head_dim, layer_types=["full"] * common["n_layers"], **common)
-    if mt in ("qwen3_5", "qwen3_5_text", "qwen3_next"):
-        if tc.get("num_experts"):
-            raise SystemExit("Qwen3.5 MoE checkpoints are not supported yet (dense only)")
+    if mt in ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text"):
         n = common["n_layers"]
+        if tc.get("num_experts"):
+            if tc.get("mlp_only_layers") or tc.get("decoder_sparse_step", 1) != 1:
+                raise SystemExit("Qwen3.5 MoE with dense layers (mlp_only_layers) is not supported")
+            common.update(
+                inter=tc.get("moe_intermediate_size", 0),
+                n_experts=tc["num_experts"],
+                top_k=tc["num_experts_per_tok"],
+                moe_inter=tc["moe_intermediate_size"],
+            )
         lt = tc.get("layer_types")
         if lt is None:
             k = tc.get("full_attention_interval", 4)
@@ -242,9 +261,12 @@ class Checkpoint:
 # ---------------------------------------------------------------------------------------------
 
 
-def conv1x1(w: torch.Tensor) -> nn.Conv2d:
-    """A linear layer `y = W x` as a 1x1 convolution over [1, in, 1, T]."""
+def conv1x1(w: torch.Tensor, src: str | None = None, rows=None, gain: float = 1.0) -> nn.Conv2d:
+    """A linear layer `y = W x` as a 1x1 convolution over [1, in, 1, T]. `src` names the
+    checkpoint linear it comes from, `rows` the source rows it holds (default all) and `gain`
+    the factor applied to them, for the calibration statistics of --lut-method."""
     m = nn.Conv2d(w.shape[1], w.shape[0], 1, bias=False, dtype=DTYPE)
+    m.src, m.src_rows, m.src_gain = src, rows, gain
     m.weight.data = w.to(DTYPE).view(w.shape[0], w.shape[1], 1, 1).contiguous()
     m.weight.requires_grad_(False)
     return m
@@ -295,12 +317,17 @@ class Attention(nn.Module):
         if sp.attn_gate:
             # q_proj rows are [query_h, gate_h] per head: split into two projections.
             wq = wq.view(nh, 2, hd, sp.hidden)
-            self.g_proj = conv1x1(wq[:, 1].reshape(nh * hd, sp.hidden))
-            wq = wq[:, 0].reshape(nh * hd, sp.hidden)
-        self.q_proj = conv1x1(wq)
-        self.k_proj = conv1x1(ck.get(p + "k_proj.weight"))
-        self.v_proj = conv1x1(ck.get(p + "v_proj.weight"))
-        self.o_proj = conv1x1(ck.get(p + "o_proj.weight"))
+            r = torch.arange(nh * 2 * hd).view(nh, 2, hd)
+            # holds W / 2 (sigmoid(y) = 0.5 + 0.5 tanh(y / 2)): Core ML would fold the 1/2 into the
+            # weights itself, which changes them after palettization (--lut-method)
+            self.g_proj = conv1x1(wq[:, 1].reshape(nh * hd, sp.hidden) * 0.5, p + "q_proj", r[:, 1].reshape(-1), 0.5)
+            wq, rq = wq[:, 0].reshape(nh * hd, sp.hidden), r[:, 0].reshape(-1)
+        else:
+            rq = None
+        self.q_proj = conv1x1(wq, p + "q_proj", rq)
+        self.k_proj = conv1x1(ck.get(p + "k_proj.weight"), p + "k_proj")
+        self.v_proj = conv1x1(ck.get(p + "v_proj.weight"), p + "v_proj")
+        self.o_proj = conv1x1(ck.get(p + "o_proj.weight"), p + "o_proj")
         off = 1.0 if sp.zero_centered else 0.0
         self.q_norm = RMSNorm(ck.get(p + "q_norm.weight") + off, sp.eps)
         self.k_norm = RMSNorm(ck.get(p + "k_norm.weight") + off, sp.eps)
@@ -346,7 +373,7 @@ class Attention(nn.Module):
         o = torch.matmul(att, vc)  # [1, nh, T, hd]
         o = o.permute(0, 1, 3, 2).reshape(1, nh * hd, 1, t)  # [1, nh*hd, 1, T]
         if sp.attn_gate:
-            o = o * sigmoid(self.g_proj(hs))
+            o = o * (0.5 + 0.5 * torch.tanh(self.g_proj(hs)))
         return self.o_proj(o).squeeze(2).permute(0, 2, 1)  # [1, T, H]
 
 
@@ -372,11 +399,11 @@ class GatedDeltaNet(nn.Module):
         super().__init__()
         p = f"layers.{layer}.linear_attn."
         self.sp, self.slot, self.chunk = sp, slot, chunk
-        self.in_qkv = conv1x1(ck.get(p + "in_proj_qkv.weight"))
-        self.in_z = conv1x1(ck.get(p + "in_proj_z.weight"))
-        self.in_b = conv1x1(ck.get(p + "in_proj_b.weight"))
-        self.in_a = conv1x1(ck.get(p + "in_proj_a.weight"))
-        self.out_proj = conv1x1(ck.get(p + "out_proj.weight"))
+        self.in_qkv = conv1x1(ck.get(p + "in_proj_qkv.weight"), p + "in_proj_qkv")
+        self.in_z = conv1x1(ck.get(p + "in_proj_z.weight"), p + "in_proj_z")
+        self.in_b = conv1x1(ck.get(p + "in_proj_b.weight"), p + "in_proj_b")
+        self.in_a = conv1x1(ck.get(p + "in_proj_a.weight"), p + "in_proj_a")
+        self.out_proj = conv1x1(ck.get(p + "out_proj.weight"), p + "out_proj")
         cw = ck.get(p + "conv1d.weight")  # [conv_dim, 1, K]
         self.conv = nn.Conv2d(sp.conv_dim, sp.conv_dim, (1, sp.conv_k), groups=sp.conv_dim, bias=False, dtype=DTYPE)
         self.conv.weight.data = cw.to(DTYPE).view(sp.conv_dim, 1, 1, sp.conv_k)
@@ -421,8 +448,9 @@ class GatedDeltaNet(nn.Module):
         v = c[:, 2 * kd :].view(nv, dv, t).permute(0, 2, 1)  # [nv, T, dv]
         # l2norm(x) = rms(x) / sqrt(d): q, k unit vectors, ks = sqrt(d_k) k (see class doc).
         rd = 1.0 / math.sqrt(dk)
-        q = rms(q, 1e-6) * rd
-        ks = rms(k, 1e-6)
+        # transformers: x / sqrt(sum x^2 + 1e-6), i.e. eps 1e-6 / d on the mean
+        q = rms(q, 1e-6 / dk) * rd
+        ks = rms(k, 1e-6 / dk)
         if nv != nk:
             rep = nv // nk
             q = q.unsqueeze(1).repeat(1, rep, 1, 1).view(nv, t, dk)
@@ -486,16 +514,67 @@ class GatedDeltaNet(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, ck: Checkpoint, layer: int):
+    def __init__(self, ck: Checkpoint, layer: int, sub: str = "mlp."):
         super().__init__()
-        p = f"layers.{layer}.mlp."
-        self.gate_proj = conv1x1(ck.get(p + "gate_proj.weight"))
-        self.up_proj = conv1x1(ck.get(p + "up_proj.weight"))
-        self.down_proj = conv1x1(ck.get(p + "down_proj.weight"))
+        p = f"layers.{layer}.{sub}"
+        self.gate_proj = conv1x1(ck.get(p + "gate_proj.weight"), p + "gate_proj")
+        self.up_proj = conv1x1(ck.get(p + "up_proj.weight"), p + "up_proj")
+        self.down_proj = conv1x1(ck.get(p + "down_proj.weight"), p + "down_proj")
+
+    def project(self, hs):
+        return self.down_proj(silu(self.gate_proj(hs)) * self.up_proj(hs))
 
     def forward(self, x):
-        hs = x.permute(0, 2, 1).unsqueeze(2)
-        y = self.down_proj(silu(self.gate_proj(hs)) * self.up_proj(hs))
+        return self.project(x.permute(0, 2, 1).unsqueeze(2)).squeeze(2).permute(0, 2, 1)
+
+
+class MoE(nn.Module):
+    """Qwen3.5 sparse MoE block, evaluated densely: every expert runs (the gate, up and down
+    projections of all experts are three wide 1x1 convolutions) and the outputs are weighted by
+    the router's top-k softmax weights (0 for the unselected experts), plus the shared expert
+    scaled by sigmoid(shared_expert_gate). The top-k threshold is found by k-1 rounds of
+    "max, then mask it out" (reductions and compares only, which the ANE runs; no topk op).
+    Compute grows with the total expert count, so this suits small MoE models (and proves the
+    graph); see docs/coreml-format.md for large ones."""
+
+    def __init__(self, sp: Spec, ck: Checkpoint, layer: int):
+        super().__init__()
+        p = f"layers.{layer}.mlp."
+        e, inter = sp.n_experts, sp.moe_inter
+        self.e, self.k, self.inter = e, sp.top_k, inter
+        if ck.has(p + "experts.gate_up_proj"):  # fused [E, 2I, H] / [E, H, I] layout
+            gu = ck.get(p + "experts.gate_up_proj")
+            gate, up = gu[:, :inter], gu[:, inter:]
+            down = ck.get(p + "experts.down_proj")
+        else:
+            gate = torch.stack([ck.get(p + f"experts.{j}.gate_proj.weight") for j in range(e)])
+            up = torch.stack([ck.get(p + f"experts.{j}.up_proj.weight") for j in range(e)])
+            down = torch.stack([ck.get(p + f"experts.{j}.down_proj.weight") for j in range(e)])
+        self.router = conv1x1(ck.get(p + "gate.weight"), p + "gate")
+        self.router.keep_fp16 = True  # a palettized router would flip expert choices
+        self.gate_proj = conv1x1(gate.reshape(e * inter, -1))
+        self.up_proj = conv1x1(up.reshape(e * inter, -1))
+        self.down_proj = conv1x1(down.permute(1, 0, 2).reshape(down.shape[1], e * inter))  # [H, E*I]
+        self.shared = MLP(ck, layer, "mlp.shared_expert.")
+        self.shared_gate = conv1x1(ck.get(p + "shared_expert_gate.weight"), p + "shared_expert_gate")
+
+    def forward(self, x):
+        t = x.shape[1]
+        hs = x.permute(0, 2, 1).unsqueeze(2)  # [1, H, 1, T]
+        logits = self.router(hs)  # [1, E, 1, T]
+        # top-k on the logits (fp16 probabilities of the tail flush to zero and tie), then the
+        # softmax over the selected experts = transformers' renormalized top-k probabilities
+        top = torch.amax(logits, dim=1, keepdim=True)
+        rest = logits
+        for _ in range(self.k - 1):
+            mx = torch.amax(rest, dim=1, keepdim=True)
+            rest = rest - (rest >= mx).to(DTYPE) * 30000.0
+        kth = torch.amax(rest, dim=1, keepdim=True)
+        wsel = torch.exp(logits - top) * (logits >= kth).to(DTYPE)
+        wsel = wsel / torch.sum(wsel, dim=1, keepdim=True)
+        h = silu(self.gate_proj(hs)) * self.up_proj(hs)  # [1, E*I, 1, T]
+        h = (h.view(1, self.e, self.inter, t) * wsel.view(1, self.e, 1, t)).view(1, self.e * self.inter, 1, t)
+        y = self.down_proj(h) + self.shared.project(hs) * sigmoid(self.shared_gate(hs))
         return y.squeeze(2).permute(0, 2, 1)
 
 
@@ -510,7 +589,7 @@ class Layer(nn.Module):
             self.self_attn = Attention(sp, ck, i, sp.full_layers.index(i))
         else:
             self.linear_attn = GatedDeltaNet(sp, ck, i, sp.linear_layers.index(i), gdn_chunk)
-        self.mlp = MLP(ck, i)
+        self.mlp = MoE(sp, ck, i) if sp.n_experts else MLP(ck, i)
 
 
 class Decoder(nn.Module):
@@ -560,14 +639,25 @@ class Decoder(nn.Module):
         return x
 
 
-def state_shapes(sp: Spec, ctx: int) -> dict:
+def local_cache_len(sp: Spec, ctx: int, batch: int) -> int:
+    """Positions kept by the sliding-window layers' cache: the whole context, or when the
+    context is longer than window + batch a shifting window of window + batch positions (the
+    first query of a prefill batch still sees `window` keys after the batch is appended)."""
+    n = sp.sliding_window + batch
+    return n if sp.arch == "gemma4" and SHIFT_LOCAL_CACHE and ctx > n else ctx
+
+
+SHIFT_LOCAL_CACHE = True  # --full-local-cache turns it off
+
+
+def state_shapes(sp: Spec, ctx: int, batch: int = 0) -> dict:
     """Core ML states of the model (buffer name -> shape), all fp16."""
     out = {}
     if sp.arch == "gemma4":
         loc, glob = gemma_slots(sp)
         # [slot, K heads then V heads, position, head_dim]: one slice update per layer (two
         # separate K and V updates with a single KV head fail to compile for the ANE)
-        out["kv_cache_local"] = (len(loc), 2 * sp.n_kv, ctx, sp.head_dim)
+        out["kv_cache_local"] = (len(loc), 2 * sp.n_kv, local_cache_len(sp, ctx, batch), sp.head_dim)
         out["kv_cache_global"] = (len(glob), 2 * sp.n_kv, ctx, sp.global_head_dim)
         return out
     nf = len(sp.full_layers)
@@ -623,7 +713,10 @@ class LMHead(nn.Module):
         self.softcap = softcap
         if softcap:  # cap * tanh(logits / cap): fold 1/cap into the weights
             w = w / softcap
-        self.heads = nn.ModuleList([conv1x1(p) for p in torch.split(w, self.sizes)])
+        starts = [sum(self.sizes[:i]) for i in range(n)]
+        self.heads = nn.ModuleList(
+            [conv1x1(p, "lm_head", torch.arange(s0, s0 + len(p)), 1.0 / softcap if softcap else 1.0) for p, s0 in zip(torch.split(w, self.sizes), starts)]
+        )
 
     def forward(self, hidden_states):
         hs = hidden_states.permute(0, 2, 1).unsqueeze(2)
@@ -672,12 +765,12 @@ class GemmaAttention(nn.Module):
         src = gemma_kv_source(sp, i)
         self.shared = src != i
         self.slot = slots.index(src)
-        self.q_proj = conv1x1(ck.get(p + "q_proj.weight"))
-        self.o_proj = conv1x1(ck.get(p + "o_proj.weight"))
+        self.q_proj = conv1x1(ck.get(p + "q_proj.weight"), p + "q_proj")
+        self.o_proj = conv1x1(ck.get(p + "o_proj.weight"), p + "o_proj")
         self.q_norm = RMSNorm(ck.get(p + "q_norm.weight"), sp.eps)
         if not self.shared:
-            self.k_proj = conv1x1(ck.get(p + "k_proj.weight"))
-            self.v_proj = conv1x1(ck.get(p + "v_proj.weight"))
+            self.k_proj = conv1x1(ck.get(p + "k_proj.weight"), p + "k_proj")
+            self.v_proj = conv1x1(ck.get(p + "v_proj.weight"), p + "v_proj")
             self.k_norm = RMSNorm(ck.get(p + "k_norm.weight"), sp.eps)
 
     def heads(self, y, n, t):
@@ -685,7 +778,7 @@ class GemmaAttention(nn.Module):
             return y.view(1, n, 1, self.hd)
         return y.view(1, n, self.hd, t).permute(0, 1, 3, 2)
 
-    def forward(self, x, cos, sin, mask, current_pos, cache):
+    def forward(self, x, cos, sin, mask, current_pos, cache, shift=False):
         t = x.shape[1]
         hs = x.permute(0, 2, 1).unsqueeze(2)
         q = self.q_norm(self.heads(self.q_proj(hs), self.nh, t))
@@ -695,7 +788,12 @@ class GemmaAttention(nn.Module):
             k = self.k_norm(self.heads(self.k_proj(hs), nkv, t))
             k = k * cos + rotate_half(k) * sin
             v = rms(self.heads(self.v_proj(hs), nkv, t), self.eps)
-            cache[s : s + 1, :, current_pos : current_pos + t, :] = torch.cat([k, v], dim=1)
+            kv = torch.cat([k, v], dim=1)
+            if shift:
+                # shifting window cache: drop the t oldest positions, append the new ones
+                cache[s : s + 1] = torch.cat([cache[s : s + 1, :, t:, :], kv], dim=2)
+            else:
+                cache[s : s + 1, :, current_pos : current_pos + t, :] = kv
         kc = cache[s, :nkv]  # [nkv, ctx, hd]
         vc = cache[s, nkv:]
         rep = self.nh // self.nkv
@@ -723,18 +821,18 @@ class GemmaLayer(nn.Module):
         self.pre_feedforward_layernorm = norm("pre_feedforward_layernorm")
         self.post_feedforward_layernorm = norm("post_feedforward_layernorm")
         self.self_attn = GemmaAttention(sp, ck, i)
-        self.gate_proj = conv1x1(ck.get(p + "mlp.gate_proj.weight"))
-        self.up_proj = conv1x1(ck.get(p + "mlp.up_proj.weight"))
-        self.down_proj = conv1x1(ck.get(p + "mlp.down_proj.weight"))
+        self.gate_proj = conv1x1(ck.get(p + "mlp.gate_proj.weight"), p + "mlp.gate_proj")
+        self.up_proj = conv1x1(ck.get(p + "mlp.up_proj.weight"), p + "mlp.up_proj")
+        self.down_proj = conv1x1(ck.get(p + "mlp.down_proj.weight"), p + "mlp.down_proj")
         self.ple = sp.ple_dim
         if self.ple:
-            self.per_layer_input_gate = conv1x1(ck.get(p + "per_layer_input_gate.weight"))
-            self.per_layer_projection = conv1x1(ck.get(p + "per_layer_projection.weight"))
+            self.per_layer_input_gate = conv1x1(ck.get(p + "per_layer_input_gate.weight"), p + "per_layer_input_gate")
+            self.per_layer_projection = conv1x1(ck.get(p + "per_layer_projection.weight"), p + "per_layer_projection")
             self.post_per_layer_input_norm = norm("post_per_layer_input_norm")
         self.scalar = float(ck.get(p + "layer_scalar").item()) if ck.has(p + "layer_scalar") else 1.0
 
-    def forward(self, x, cos, sin, mask, current_pos, cache, pli):
-        h = self.self_attn(self.input_layernorm(x), cos, sin, mask, current_pos, cache)
+    def forward(self, x, cos, sin, mask, current_pos, cache, pli, shift=False):
+        h = self.self_attn(self.input_layernorm(x), cos, sin, mask, current_pos, cache, shift)
         x = x + self.post_attention_layernorm(h)
         hs = self.pre_feedforward_layernorm(x).permute(0, 2, 1).unsqueeze(2)
         h = self.down_proj(gelu_tanh(self.gate_proj(hs)) * self.up_proj(hs)).squeeze(2).permute(0, 2, 1)
@@ -760,9 +858,9 @@ class GemmaDecoder(nn.Module):
     combined per-layer embeddings, an output of the embeddings model). States: the KV caches of
     the sliding (local) and full (global) attention layers, which have different head dims."""
 
-    def __init__(self, sp: Spec, ck: Checkpoint, start: int, end: int, ctx: int):
+    def __init__(self, sp: Spec, ck: Checkpoint, start: int, end: int, ctx: int, batch: int):
         super().__init__()
-        self.sp, self.start, self.end, self.ctx = sp, start, end, ctx
+        self.sp, self.start, self.end, self.ctx, self.batch = sp, start, end, ctx, batch
         self.layers = nn.ModuleList([GemmaLayer(sp, ck, i) for i in range(start, end)])
         self.last = end == sp.n_layers
         if self.last:
@@ -777,10 +875,12 @@ class GemmaDecoder(nn.Module):
         c, s_ = rope_table(torch.cat([inv, torch.zeros(ghd // 2 - n_rot)]), ctx)
         self.register_buffer("cos_g", c)
         self.register_buffer("sin_g", s_)
-        self.sliding = ctx > sp.sliding_window
+        self.local_len = local_cache_len(sp, ctx, batch)
+        self.shift = self.local_len < ctx
+        self.sliding = ctx > sp.sliding_window and not self.shift
         if self.sliding:
             self.register_buffer("cols", torch.arange(ctx, dtype=torch.int32))
-        for name, shape in state_shapes(sp, ctx).items():
+        for name, shape in state_shapes(sp, ctx, batch).items():
             self.register_buffer(name, torch.zeros(shape, dtype=DTYPE))
 
     def forward(self, x, position_ids, causal_mask, current_pos, prefill: bool, per_layer_inputs):
@@ -790,6 +890,20 @@ class GemmaDecoder(nn.Module):
             "full": (self.cos_g[position_ids].view(1, 1, t, -1), self.sin_g[position_ids].view(1, 1, t, -1)),
         }
         masks = {"full": causal_mask, "sliding": causal_mask}
+        if self.shift:
+            # Slot j of the local cache (after this call's write) holds position
+            # p + t - L + j. Query p + i sees slots L - t + i - W < j <= L - t + i (window band,
+            # a constant per function) with a position >= 0: L - t - j <= p, read from row p of
+            # the causal mask (column c is 0 iff c <= p), reversed.
+            n = self.local_len
+            i = torch.arange(t).view(-1, 1)
+            j = torch.arange(n).view(1, -1)
+            band = ((j > n - t + i - sp.sliding_window) & (j <= n - t + i)).to(DTYPE)
+            band = ((1.0 - band) * -30000.0).view(1, 1, t, n)
+            born = torch.flip(causal_mask[:, :, 0:1, 0 : n - t + 1], dims=[3])
+            if t > 1:
+                born = torch.cat([born, torch.zeros((1, 1, 1, t - 1), dtype=DTYPE)], dim=3)
+            masks["sliding"] = band + born
         if self.sliding:
             # keys at positions <= p - window are outside the sliding window of query p
             out = self.cols.view(1, -1) <= (position_ids.view(-1, 1) - sp.sliding_window)
@@ -800,7 +914,7 @@ class GemmaDecoder(nn.Module):
         for layer in self.layers:
             cos, sin = rope[layer.kind]
             pli = per_layer_inputs[:, :, layer.idx * d : (layer.idx + 1) * d] if d else None
-            x = layer(x, cos, sin, masks[layer.kind], current_pos, caches[layer.kind], pli)
+            x = layer(x, cos, sin, masks[layer.kind], current_pos, caches[layer.kind], pli, self.shift and layer.kind == "sliding")
             used.add(layer.kind)
         for kind, cache in caches.items():  # Core ML rejects declared states the graph never reads
             if kind not in used:
@@ -891,6 +1005,160 @@ class Quant:
         return self.kind
 
 
+class Palettizer:
+    """Data-aware palettization (--lut-method fisher / gptq / wkmeans, tools/coreml_quant.py):
+    the torch modules' 1x1 conv weights are replaced by their palettized values before tracing,
+    and the (LUT, indices, scale) of each is remembered by weight content so that `compress`
+    writes exactly these as constexpr_lut_to_dense ops into the converted program.
+
+    With --lut-mix B the decoder weights get mixed precision: all are palettized at the
+    --ffn-quant bits first, then the ones with the largest estimated loss increase per weight
+    (0.5 sum F (w - q)^2, Fisher F) move to the next width up (4 -> 6) until the average
+    reaches B bits."""
+
+    def __init__(self, args, stats: tuple | None):
+        # per-channel scales on top of the LUT (coreml_quant scale_mode "rms") did not improve
+        # quality in tests, so they are not exposed
+        self.method, self.scale, self.rounds = args.lut_method, "none", args.lut_rounds
+        self.hs, self.fisher = stats or ({}, {})
+        self.table = {}
+        self.keep = set()  # weights left fp16 on purpose
+        self.bits = {}  # src -> bits (mixed precision)
+        self.cache = {}  # (src, bits) -> (lut, idx uint8, scale) of the whole source weight
+        self.mix = None
+
+    def active(self, q: "Quant") -> bool:
+        return q.kind == "lut" and self.method != "kmeans"
+
+    @staticmethod
+    def wider(bits: int) -> int:
+        return min(b for b in (2, 3, 4, 6, 8) if b >= min(bits + 2, 8))
+
+    def plan(self, ck: Checkpoint, q: "Quant", budget: float):
+        """Choose the bits of every decoder weight for an average of `budget` bits."""
+        import coreml_quant as cq
+
+        if not self.fisher:
+            raise SystemExit("--lut-mix needs --lut-method fisher")
+        t0 = time.time()
+        cand, total = [], 0
+        for src, imp in self.fisher.items():
+            if not src.startswith("layers.") or not ck.has(src + ".weight"):
+                continue
+            w = ck.get(src + ".weight").to(DTYPE).float()
+            o = w.shape[0]
+            group = q.group if q.group > 0 else o
+            if o % group or w.numel() <= 2048:
+                continue
+            lut, idx, sc, wh = cq.palettize(w, None, q.bits, group, "fisher", self.scale, imp=imp)
+            self.cache[src, q.bits] = (lut, idx.to(torch.uint8), sc)
+            loss = float(0.5 * (imp * (w - wh) ** 2).sum())
+            cand.append((loss / w.numel(), src, w.numel()))
+            total += w.numel()
+        hi = self.wider(q.bits)
+        extra = (budget - q.bits) / (hi - q.bits) * total
+        used = 0
+        for _, src, n in sorted(cand, reverse=True):
+            if used + n <= extra:
+                self.bits[src] = hi
+                used += n
+        self.mix = q.bits + (hi - q.bits) * used / max(total, 1)
+        print(f"  mixed precision: {len(self.bits)} of {len(cand)} decoder weights at {hi} bits, "
+              f"average {self.mix:.2f} bits ({time.time() - t0:.0f}s)")
+
+    def prepare(self, module: nn.Module, q: "Quant"):
+        """Palettize the 1x1 convolutions of `module` in place (fp16 weights take the values
+        of their LUT), recording their LUT form."""
+        import coreml_quant as cq
+
+        if not self.active(q):
+            return
+        t0, n, err = time.time(), 0, []
+        for _name, m in module.named_modules():
+            if not isinstance(m, nn.Conv2d):
+                continue
+            if m.kernel_size != (1, 1) or m.groups != 1:
+                self.keep.add(cq.weight_key(m.weight.data.numpy()))  # e.g. the GDN depthwise conv: fp16
+                continue
+            o = m.weight.shape[0]
+            group = q.group if q.group > 0 else o
+            if o % group or m.weight.numel() <= 2048 or getattr(m, "keep_fp16", False):
+                self.keep.add(cq.weight_key(m.weight.data.numpy()))
+                continue  # left fp16 (e.g. the MoE router, the 1-row shared-expert gate)
+            w = m.weight.data.float().view(o, -1)
+            src = getattr(m, "src", None)
+            bits = self.bits.get(src, q.bits)
+            whole = m.src_rows is None and m.src_gain == 1.0
+            if whole and (src, bits) in self.cache:
+                lut, idx, sc = self.cache.pop((src, bits))
+                idx = idx.long()
+                lr = lut.repeat_interleave(group, 0)
+                wh = torch.gather(lr * sc.view(-1, 1) if sc is not None else lr, 1, idx)
+            else:
+                h = self.hs.get(src)
+                imp = self.fisher.get(src)
+                if imp is not None and m.src_rows is not None:
+                    imp = imp[m.src_rows]
+                if imp is not None:
+                    imp = imp / (m.src_gain**2)  # importance of the scaled weight
+                method = self.method
+                if (method == "fisher" and imp is None) or (method in ("gptq", "wkmeans") and h is None):
+                    method = "kmeans"  # no statistics for this weight (e.g. fused MoE experts)
+                lut, idx, sc, wh = cq.palettize(w, h, bits, group, method, self.scale, self.rounds, imp=imp)
+                if h is not None:
+                    err.append(cq.output_error(w, wh, h))
+            m.weight.data = wh.to(DTYPE).view_as(m.weight).contiguous()
+            self.table[cq.weight_key(m.weight.data.numpy())] = cq.lut_entry(lut, idx, sc, group, bits, tuple(m.weight.shape))
+            n += 1
+        e = f", mean relative output error {np.mean(err):.2e}" if err else ""
+        print(f"  palettized {n} weights ({self.method}, {q}, scale {self.scale}) in {time.time() - t0:.0f}s{e}")
+
+    def apply(self, mlmodel):
+        import coreml_quant as cq
+
+        m, replaced, unmatched = cq.apply_luts(mlmodel, self.table, self.keep)
+        if unmatched:
+            print(f"  warning: {unmatched} large fp16 conv weights were not palettized (changed by the converter?)", file=sys.stderr)
+        return m
+
+
+PALETTIZER: Palettizer | None = None
+
+
+def calibrate(args) -> dict:
+    """Input statistics of every linear layer of the transformers model (float32) over the
+    calibration sequences, keyed by the checkpoint-relative name used by conv1x1(src=...)."""
+    import coreml_quant as cq
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    t0 = time.time()
+    print(f"calibration ({args.lut_method}): loading {args.model} in float32 ...")
+    tok = AutoTokenizer.from_pretrained(args.model)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=torch.float32).eval()
+    model.to(cq.model_device())
+    seqs = cq.calibration_sequences(
+        model, tok, n_new=args.calib_tokens, text_file=args.calib_file, cache=args.calib_cache, samples=args.calib_samples
+    )
+
+    def select(n):
+        return (".layers." in n and "vision" not in n and "audio" not in n) or n.endswith("lm_head")
+
+    def short(name):
+        return name[name.index("layers.") :] if "layers." in name else "lm_head"
+
+    hs, fis = {}, {}
+    if args.lut_method in ("gptq", "wkmeans"):
+        keys, h = cq.collect_hessians(model, seqs, select)
+        hs = {short(n): h[k] for n, k in keys.items()}
+    if args.lut_method == "fisher":
+        fis = {short(n): f for n, f in cq.collect_fisher(model, seqs, select).items()}
+    del model
+    print(f"calibration done in {time.time() - t0:.0f}s")
+    return hs, fis
+
+
 def compress(mlmodel, q: Quant, workers: int, op_type: str = "conv"):
     """Compress the weights consumed by `op_type` ops only (projections, or the embedding
     gather): RoPE tables and the constant masks of the delta rule stay fp16. Linear int8
@@ -899,6 +1167,8 @@ def compress(mlmodel, q: Quant, workers: int, op_type: str = "conv"):
 
     if q.kind == "none":
         return mlmodel
+    if op_type == "conv" and PALETTIZER is not None and PALETTIZER.active(q):
+        return PALETTIZER.apply(mlmodel)
     if q.kind == "lut":
         # coremltools 9.0 closes its shared k-means pool after a call without clearing it.
         from coremltools.optimize.coreml import _quantization_passes as qp
@@ -945,16 +1215,16 @@ def convert(module, example, inputs, outputs, states):
 
 def reset_states(dec: Decoder):
     with torch.no_grad():
-        for name in state_shapes(dec.sp, dec.ctx):
+        for name in state_shapes(dec.sp, dec.ctx, getattr(dec, "batch", 0)):
             getattr(dec, name).zero_()
 
 
-def ct_states(sp: Spec, ctx: int):
+def ct_states(sp: Spec, ctx: int, batch: int):
     import coremltools as ct
 
     return [
         ct.StateType(wrapped_type=ct.TensorType(shape=shape, dtype=np.float16), name=f"model.model.{name}")
-        for name, shape in state_shapes(sp, ctx).items()
+        for name, shape in state_shapes(sp, ctx, batch).items()
     ]
 
 
@@ -1039,6 +1309,8 @@ def write_meta(path, args, sp: Spec, names: dict, chunks: int, lm_sizes, gen_cfg
             lines.append(f"    lut_{key}: {q.meta}")
         if q.kind == "lut":
             lines.append(f"    lut_{key}_per_channel: {q.group}")
+            if key == "ffn" and PALETTIZER is not None and PALETTIZER.mix:
+                lines.append(f"    lut_ffn_mixed: {PALETTIZER.mix:.2f}     # average bits (some weights at {Palettizer.wider(q.bits)})")
         elif q.kind != "none":
             lines.append(f"    quant_{key}: {q}")
     lines += [
@@ -1070,8 +1342,13 @@ def write_meta(path, args, sp: Spec, names: dict, chunks: int, lm_sizes, gen_cfg
             "    prefill_full_batches_only: true",
             f"    gdn_chunk_size: {a.gdn_chunk}",
         ]
+        if sp.n_experts:
+            lines.append(f"    moe: {{experts: {sp.n_experts}, experts_per_token: {sp.top_k}, evaluation: dense}}   # informational")
     if sp.arch == "gemma4":
         lines += [f"    local_attention_window: {sp.sliding_window}", f"    final_logit_softcap: {sp.softcap}"]
+        n_local = local_cache_len(sp, a.context_length, a.batch_size)
+        if n_local < a.context_length:
+            lines.append(f"    local_cache_length: {n_local}       # shifting window cache (docs/coreml-format.md)")
         if sp.ple_dim:
             lines.append(f"    per_layer_inputs: {sp.n_layers * sp.ple_dim}")
         if sp.first_shared < sp.n_layers:
@@ -1079,7 +1356,7 @@ def write_meta(path, args, sp: Spec, names: dict, chunks: int, lm_sizes, gen_cfg
             lines.append(f"    kv_shared_layers: {{{src}}}")
     if sp.arch != "qwen3":
         lines += [f"    layer_types: [{', '.join(sp.layer_types)}]", "    states:"]
-        for name, shape in state_shapes(sp, a.context_length).items():
+        for name, shape in state_shapes(sp, a.context_length, a.batch_size).items():
             if name == "kv_cache_0":
                 layers = sp.full_layers
             elif name.startswith("kv_cache_"):
@@ -1095,7 +1372,7 @@ def write_meta(path, args, sp: Spec, names: dict, chunks: int, lm_sizes, gen_cfg
         "# Conversion parameters",
         f"# source: {a.model}",
         f"# command: {' '.join(sys.argv)}",
-        f"# ffn: {a.ffn_quant}  lm_head: {a.lmhead_quant}  embeddings: {a.embed_quant}",
+        f"# ffn: {a.ffn_quant}  lm_head: {a.lmhead_quant}  embeddings: {a.embed_quant}  LUT method: {a.lut_method}",
         "",
     ]
     with open(path, "w") as f:
@@ -1133,7 +1410,9 @@ def main():
         "--ffn-quant",
         type=Quant.parse,
         default=Quant.parse("lut6"),
-        help="decoder layers: none|lutN[,G]|int8|int4[,B] (default lut6 = lut6,8, what ANEMLL recommends and ships; lut4 is ~1.5x smaller but loses ~20 points of top-1 agreement on <1B models)",
+        help="decoder layers: none|lutN[,G]|int8|int4[,B] (default lut6 = lut6,8, what ANEMLL recommends and ships; lut4 is "
+        "1.5x smaller and loses 12-14 points of top-1 agreement (vs lut6) on 0.6-2B models with the Fisher LUTs, 7-9 with "
+        "--lut-mix 4.5)",
     )
     ap.add_argument("--lmhead-quant", type=Quant.parse, default=Quant.parse("lut6"), help="LM head (default lut6). int8/int4 are GPU-only, see below")
     ap.add_argument(
@@ -1143,7 +1422,35 @@ def main():
         help="embeddings (default none: Core ML memory-maps an fp16 table and pages in the rows it reads, while a "
         "palettized gather table is decompressed at load time; Gemma 4 E2B with lut4: 87 s and +16.7 GB RSS)",
     )
+    ap.add_argument(
+        "--lut-method",
+        choices=("fisher", "kmeans", "wkmeans", "gptq"),
+        default="fisher",
+        help="how LUT weights are computed: fisher (default: k-means weighted by the Fisher information of every "
+        "weight, measured on a calibration set with the float32 transformers model; needs transformers and RAM for "
+        "the float32 model plus one gradient per linear weight), kmeans (Core ML's plain k-means, no calibration), "
+        "gptq / wkmeans (GPTQ rounding over the LUT / k-means weighted by input second moments: experimental, "
+        "they overfit the small calibration set)",
+    )
+    ap.add_argument(
+        "--lut-mix",
+        type=float,
+        help="fisher: mixed precision for the decoder layers, average bits B between the --ffn-quant bits and the "
+        "next width (4 -> 6): the weights whose palettization costs the most (Fisher estimate) get the wider LUT, "
+        "e.g. --ffn-quant lut4 --lut-mix 4.5",
+    )
+    ap.add_argument("--lut-rounds", type=int, default=1, help="gptq: GPTQ + LUT refit rounds before the final assignment (default 1)")
+    ap.add_argument("--calib-file", help="calibration text file (default: the model's own answers to built-in chat prompts)")
+    ap.add_argument("--calib-tokens", type=int, default=192, help="tokens generated per built-in calibration prompt (default 192)")
+    ap.add_argument("--calib-samples", type=int, default=1, help="answers per built-in prompt: greedy, then sampled ones (default 1)")
+    ap.add_argument("--calib-cache", help="file caching the calibration token sequences (reused when it exists)")
     ap.add_argument("--no-quant", action="store_true", help="fp16 everywhere (same as all three = none)")
+    ap.add_argument(
+        "--full-local-cache",
+        action="store_true",
+        help="gemma4: keep context-length caches for the sliding-window layers too (default: a shifting cache of "
+        "window + batch positions once the context is longer than that)",
+    )
     ap.add_argument("--split-lm-head", type=int, default=16, help="LM head output splits (default 16)")
     ap.add_argument(
         "--gdn-chunk",
@@ -1155,8 +1462,11 @@ def main():
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 2), help="k-means worker processes")
     ap.add_argument("--keep-packages", action="store_true", help="also keep the .mlpackage files")
     ap.add_argument("--parts", default="embeddings,ffn,lm_head", help="comma list of parts to (re)build")
+    ap.add_argument("--only-chunks", help="comma list of decoder chunk numbers (1-based) to build, e.g. to resume or split a long conversion")
     args = ap.parse_args()
     os.environ.setdefault("PYTHONWARNINGS", "ignore")  # k-means worker processes
+    global SHIFT_LOCAL_CACHE
+    SHIFT_LOCAL_CACHE = not args.full_local_cache
     if args.no_quant:
         args.ffn_quant = args.lmhead_quant = args.embed_quant = Quant()
     for q in (args.ffn_quant, args.lmhead_quant, args.embed_quant):
@@ -1172,6 +1482,18 @@ def main():
     args.name = args.name or os.path.basename(src.rstrip("/")).replace("--", "-")
     args.prefix = args.prefix or {"qwen3": "qwen", "qwen3_5": "qwen35", "gemma4": "gemma4"}[sp.arch]
     ck = Checkpoint(src)
+    global PALETTIZER
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # coreml_quant.py
+    parts_ = set(args.parts.split(","))
+    needs = [q for q, part in ((args.ffn_quant, "ffn"), (args.lmhead_quant, "lm_head")) if part in parts_]
+    stats = None
+    if args.lut_method != "kmeans" and any(q.kind == "lut" for q in needs):
+        stats = calibrate(args)
+    PALETTIZER = Palettizer(args, stats)
+    if args.lut_mix and "ffn" in parts_:
+        if args.ffn_quant.kind != "lut":
+            raise SystemExit("--lut-mix needs a LUT --ffn-quant")
+        PALETTIZER.plan(ck, args.ffn_quant, args.lut_mix)
     args.gdn_chunk = args.gdn_chunk or args.batch_size
     if args.gdn_chunk & (args.gdn_chunk - 1) or args.batch_size % args.gdn_chunk:
         raise SystemExit("--gdn-chunk must be a power of two dividing --batch-size")
@@ -1243,6 +1565,7 @@ def main():
     names["lm_head"] = base + ".mlmodelc"
     if "lm_head" in parts:
         print("lm_head ...")
+        PALETTIZER.prepare(head, args.lmhead_quant)
         m = convert(
             head,
             (torch.zeros((1, 1, sp.hidden), dtype=DTYPE),),
@@ -1261,10 +1584,11 @@ def main():
         base = f"{args.prefix}_FFN_PF{args.ffn_quant.suffix}_chunk_{ci + 1:02d}of{chunks:02d}"
         if ci == 0:
             names["ffn"] = base + ".mlmodelc"
-        if "ffn" not in parts:
+        if "ffn" not in parts or (args.only_chunks and str(ci + 1) not in args.only_chunks.split(",")):
             continue
         print(f"chunk {ci + 1}/{chunks}: layers {s}..{e - 1}")
-        dec = GemmaDecoder(sp, ck, s, e, ctx) if sp.arch == "gemma4" else Decoder(sp, ck, s, e, ctx, args.gdn_chunk)
+        dec = GemmaDecoder(sp, ck, s, e, ctx, bs) if sp.arch == "gemma4" else Decoder(sp, ck, s, e, ctx, args.gdn_chunk)
+        PALETTIZER.prepare(dec, args.ffn_quant)
         fn_pkgs = {}
         for fn, t in (("infer", 1), ("prefill", bs)):
             ex = (
@@ -1288,7 +1612,7 @@ def main():
                 ex,
                 inputs,
                 [ct.TensorType(name="output_hidden_states", dtype=np.float16)],
-                ct_states(sp, ctx),
+                ct_states(sp, ctx, bs),
             )
             reset_states(dec)
             if args.ffn_quant.kind != "none":

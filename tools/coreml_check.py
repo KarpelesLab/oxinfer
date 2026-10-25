@@ -277,6 +277,7 @@ def main():
     ap.add_argument("package", help="directory with meta.yaml")
     ap.add_argument("--hf", help="Hugging Face checkpoint for the float32 reference")
     ap.add_argument("--prompt", default=DEFAULT_PROMPT, help="user message (default: a ~170-token request, long enough for two prefill batches)")
+    ap.add_argument("--prompt-file", help="read the user message from this file (long-context checks)")
     ap.add_argument("--no-template", action="store_true", help="tokenize the prompt as is (no chat template)")
     ap.add_argument("--tokens", type=int, default=200, help="generated tokens to compare (default 200)")
     ap.add_argument("--ref-cache", help="npz file caching the reference sequence and logits")
@@ -288,6 +289,8 @@ def main():
     ap.add_argument("--bench-prefill", type=int, default=256, help="prompt tokens for the prefill benchmark")
     ap.add_argument("--bench-decode", type=int, default=64, help="tokens for the decode benchmark")
     args = ap.parse_args()
+    if args.prompt_file:
+        args.prompt = open(args.prompt_file).read()
     d = os.path.abspath(os.path.expanduser(args.package))
     p = load_meta(d)
     files = [p["embeddings"], p["lm_head"]] + [os.path.basename(c) for c in chunk_paths(d, p)]

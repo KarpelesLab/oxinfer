@@ -1178,43 +1178,75 @@ arrays and runs the chain; decode runs 2-10% faster than `chat.py` on the same m
 Neural Engine of iPhones and Macs, in the layout of [ANEMLL](https://github.com/Anemll/Anemll)
 (meta.yaml, an embeddings model, decoder chunks with `infer` and `prefill` functions sharing
 weights and a Core ML state, a 16-way split LM head, the tokenizer files). Qwen3 packages run
-unchanged under ANEMLL's own `chat.py`; Qwen3.5 / 3.6 / 3.8 dense models (Gated DeltaNet
-recurrent state kept as Core ML states, chunked delta rule in the prefill function) and Gemma 4
-E2B / E4B (per-layer embeddings, KV sharing, local and global caches) extend the format as
-described in [docs/coreml-format.md](docs/coreml-format.md); oxinfer's Core ML runtime above
-runs all of them. Weights are 6-bit LUT-palettized by default (ANEMLL's recommended setting);
-`tools/coreml_check.py` runs a package with coremltools, compares it with transformers in float32
-over a few hundred teacher-forced tokens, benchmarks it and lists which ops land on the ANE.
+unchanged under ANEMLL's own `chat.py`; Qwen3.5 / 3.6 / 3.8 models (Gated DeltaNet recurrent
+state kept as Core ML states, chunked delta rule in the prefill function; MoE variants evaluated
+densely, for small models) and Gemma 4 E2B / E4B (per-layer embeddings, KV sharing, local and
+global caches) extend the format as described in [docs/coreml-format.md](docs/coreml-format.md);
+oxinfer's Core ML runtime above runs them. `tools/coreml_check.py` runs a package with coremltools,
+compares it with transformers in float32 over a few hundred teacher-forced tokens, benchmarks it
+and lists which ops land on the ANE.
 
 ```sh
 python3 -m venv venv && venv/bin/pip install coremltools==9.0 torch transformers safetensors \
     scikit-learn pyyaml "numpy<2.3"
 venv/bin/python tools/coreml_convert.py --model ~/.cache/oxinfer/hub/Qwen--Qwen3.5-0.8B --output out/qwen35
+venv/bin/python tools/coreml_convert.py --model ~/.cache/oxinfer/hub/Qwen--Qwen3.5-0.8B --output out/qwen35-small \
+    --ffn-quant lut4 --lut-mix 4.5        # 25% smaller decoder
 venv/bin/python tools/coreml_check.py out/qwen35 --hf ~/.cache/oxinfer/hub/Qwen--Qwen3.5-0.8B --bench --plan
 ```
 
+**Weights.** Only LUT palettization runs correctly on the ANE (Core ML has LUTs of 1, 2, 3, 4, 6
+and 8 bits, no 5), 8 output channels per LUT. Core ML's own palettizer fits each LUT with plain
+k-means, which costs 15-20 points of top-1 agreement at 4 bits on sub-1B models. The converter
+instead computes the LUTs from a calibration set by default (`--lut-method fisher`,
+`tools/coreml_quant.py`): the float32 transformers model answers 32 built-in chat prompts
+(under a minute on MPS), the squared gradients of the next-token loss give the Fisher information of
+every weight, and each LUT is a k-means weighted by it (SqueezeLLM's sensitivity), so the levels
+go where the loss is sensitive. `--lut-mix B` adds mixed precision: the weights whose 4-bit
+palettization costs the most (estimated 0.5 Σ F Δw²) get 6-bit LUTs until the decoder averages B
+bits. Things that did not pay off: GPTQ-style error feedback over the LUT grid (the per-layer
+error drops 4x on the calibration data but rises on other text: it overfits a few thousand
+tokens), per-channel scales on top of the LUT, 3x more calibration data. One LUT per output
+channel is more accurate (Qwen3-0.6B LUT4: 85% top-1) but halves the ANE's decode speed.
+
 Measured on an M5 Max with coremltools (context 512, batch 64; quality = the Core ML logits
 against transformers float32 over 300 teacher-forced tokens of a 135-token chat prompt; speed =
-best of 5, 256-token prefill and 64-token decode including the Python calls; package sizes are
-embeddings + decoder chunks + LM head):
+best of 5, 256-token prefill and 64-token decode including the Python calls, on a shared
+machine; package sizes are embeddings + decoder chunks + LM head):
 
-| Model | Weights | Size (MB) | Logit cosine | Top-1 agreement | Prefill ANE / CPU | Decode ANE / CPU |
-|---|---|---|---|---|---|---|
-| Qwen3-0.6B | fp16 | 311 + 884 + 311 | 0.99999 | 98.7% | 2680 tok/s | 79 tok/s |
-| Qwen3-0.6B | LUT6 (default) | 311 + 338 + 119 | 0.9972 | 93.0% | 5131 / 1949 tok/s | 114 / 56 tok/s |
-| Qwen3-0.6B, ANEMLL's release | LUT6 | 311 + 339 + 119 | 0.9971 | 92.3% | 4409 / 1824 tok/s | 114 / 59 tok/s |
-| Qwen3-0.6B | LUT4 | 311 + 224 + 119 | 0.954 | 72.0% | 4836 tok/s | 103 tok/s |
-| Qwen3.5-0.8B | fp16 | 509 + 1000 + 509 | 0.9998 | 97.0% | 4002 tok/s | 62 tok/s |
-| Qwen3.5-0.8B | LUT6 (default) | 509 + 385 + 195 | 0.9974 | 93.0% | 5176 / 1608 tok/s | 118 / 37 tok/s |
-| Qwen3.5-0.8B | LUT4 | 509 + 254 + 195 | 0.959 | 78.3% | 5035 tok/s | 113 tok/s |
-| Gemma 4 E2B | fp16 | 5530 + 3740 + 805 | 1.00000 | 99.3% | | |
-| Gemma 4 E2B | LUT6 (default) | 5530 + 1419 + 306 | 0.99986 | 97.0% | 1905 / 623 tok/s | 45 / 14 tok/s |
-| Gemma 4 E4B | LUT6 (default) | 7034 + 2992 + 508 | 0.99945 | 96.7% | 1060 / 333 tok/s | 25 / 6 tok/s |
+| Model | Weights (decoder, LUT fit) | Size (MB) | Logit cosine | Top-1 agreement | KL | Prefill ANE / CPU | Decode ANE / CPU |
+|---|---|---|---|---|---|---|---|
+| Qwen3-0.6B | fp16 | 311 + 884 + 311 | 0.99999 | 98.7% | | 2680 tok/s | 79 tok/s |
+| Qwen3-0.6B | LUT6, k-means | 311 + 338 + 119 | 0.9972 | 93.0% | | 5131 / 1949 tok/s | 114 / 56 tok/s |
+| Qwen3-0.6B | LUT6, Fisher (default) | 311 + 338 + 119 | 0.9984 | 93.7% | 0.016 | 5170 tok/s | 116 tok/s |
+| Qwen3-0.6B, ANEMLL's release | LUT6 | 311 + 339 + 119 | 0.9971 | 92.3% | | 4409 / 1824 tok/s | 114 / 59 tok/s |
+| Qwen3-0.6B | LUT4, k-means | 311 + 224 + 119 | 0.954 | 72.0% | | 4836 tok/s | 103 tok/s |
+| Qwen3-0.6B | LUT4, Fisher | 311 + 224 + 119 | 0.9665 | 79.7% | 0.224 | 5219 tok/s | 116 tok/s |
+| Qwen3-0.6B | LUT4, Fisher, mix 4.5 bits | 311 + 253 + 119 | 0.9813 | 84.7% | 0.153 | 5218 tok/s | 116 tok/s |
+| Qwen3-0.6B | LUT4, Fisher, mix 5 bits | 311 + 281 + 119 | 0.9876 | 86.3% | 0.085 | 5229 tok/s | 116 tok/s |
+| Qwen3-0.6B | LUT4, Fisher, 1 channel per LUT | 311 + 234 + 119 | 0.9850 | 85.3% | 0.141 | 2565 tok/s | 47 tok/s |
+| Qwen3.5-0.8B | fp16 | 509 + 1000 + 509 | 0.9998 | 97.0% | | 4002 tok/s | 62 tok/s |
+| Qwen3.5-0.8B | LUT6, k-means | 509 + 385 + 195 | 0.9974 | 93.0% | | 5176 / 1608 tok/s | 118 / 37 tok/s |
+| Qwen3.5-0.8B | LUT6, Fisher (default) | 509 + 384 + 195 | 0.9974 | 94.7% | 0.011 | 5319 tok/s | 136 tok/s |
+| Qwen3.5-0.8B | LUT4, k-means | 509 + 254 + 195 | 0.959 | 78.3% | | 5035 tok/s | 113 tok/s |
+| Qwen3.5-0.8B | LUT4, Fisher | 509 + 255 + 195 | 0.9654 | 83.0% | 0.154 | 5450 tok/s | 136 tok/s |
+| Qwen3.5-0.8B | LUT4, Fisher, mix 4.5 bits | 509 + 286 + 195 | 0.9823 | 85.3% | 0.083 | 5406 tok/s | 136 tok/s |
+| Qwen3.5-0.8B | LUT4, Fisher, mix 5 bits | 509 + 319 + 195 | 0.9894 | 89.0% | 0.053 | 5356 tok/s | 137 tok/s |
+| Gemma 4 E2B | fp16 | 5530 + 3740 + 805 | 1.00000 | 99.3% | | | |
+| Gemma 4 E2B | LUT6, k-means | 5530 + 1419 + 306 | 0.99986 | 97.0% | | 1905 / 623 tok/s | 45 / 14 tok/s |
+| Gemma 4 E2B | LUT6, Fisher (default) | 5530 + 1419 + 306 | 0.99987 | 97.7% | 0.010 | 1976 tok/s | 46 tok/s |
+| Gemma 4 E2B | LUT4, k-means | 5530 + 942 + 306 | 0.99771 | 83.7% | 0.282 | 2010 tok/s | 47 tok/s |
+| Gemma 4 E2B | LUT4, Fisher | 5530 + 942 + 306 | 0.99799 | 84.7% | 0.226 | 2023 tok/s | 47 tok/s |
+| Gemma 4 E2B | LUT4, Fisher, mix 4.5 bits | 5530 + 1061 + 306 | 0.99888 | 91.0% | 0.068 | 2010 tok/s | 47 tok/s |
+| Gemma 4 E4B | LUT6, k-means | 7034 + 2992 + 508 | 0.99945 | 96.7% | | 1060 / 333 tok/s | 25 / 6 tok/s |
 
-Everything but the embedding lookups and the RoPE-table gathers runs on the ANE (MLComputePlan),
-including the Gated DeltaNet recurrence and its chunked prefill. The Gemma embeddings model is
-large because the per-layer embedding table stays fp16: Core ML memory-maps it and pages in only
-the rows it reads, while a palettized table would be decompressed at load time (16.7 GB for E2B).
+The LM head stays LUT6 in every row (LUT4 there costs another 3-6 points). The Fisher packages of
+Qwen3.5 decode faster than the k-means ones because the small depthwise convolution of the Gated
+DeltaNet stays fp16 instead of being palettized. Everything
+but the embedding lookups and the RoPE-table gathers runs on the ANE (MLComputePlan), including
+the Gated DeltaNet recurrence and its chunked prefill. The Gemma embeddings model is large
+because the per-layer embedding table stays fp16: Core ML memory-maps it and pages in only the
+rows it reads, while a palettized table would be decompressed at load time (16.7 GB for E2B).
 "CPU" is Core ML's CPU_ONLY path, whose outputs are NaN for these stateful fp16 graphs (ANEMLL's
 packages too), so it only shows what the ANE saves. On a Max-class Mac, oxinfer's own CPU path
 decodes faster (Qwen3.5-0.8B Q8: 184 tok/s); what the Neural Engine brings is prefill throughput
@@ -1245,6 +1277,29 @@ Qwen3.5 prefill is slower on prompts that do not fill whole batches: the remaind
 tokens here, and all of a short chat turn) goes through `infer` at decode speed, since padding
 would enter the recurrent state. The first load compiles the model for the Neural Engine
 (cached by Core ML until another process loads the package with other settings).
+
+**Long contexts.** Gemma 4's sliding-window layers keep a shifting cache of window + batch = 576
+positions once the context is longer than that (`--full-local-cache` restores context-length
+caches); only the global layers' cache grows with the context. Gemma 4 E2B LUT6, 1939-token
+prompt (a README excerpt) + 100-200 teacher-forced tokens:
+
+| Context | Local cache | Logit cosine / top-1 | Prefill | Decode (at the end of the prompt) |
+|---|---|---|---|---|
+| 2048, full-length local cache | 25 MB | 0.99980 / 98.0% | 954 tok/s (1920 tokens) | 21.2 tok/s |
+| 2048, shifting local cache | 7 MB | 0.99980 / 98.0% | 1241 tok/s | 27.3 tok/s |
+| 8192, shifting local cache | 7 MB (vs 100 MB) | 0.99969 / 97.0% | 1042 tok/s (7936 tokens) | 22.2 tok/s |
+
+**Memory on the Neural Engine.** Loading a chunk adds wired memory outside the process
+footprint. Each function of the multifunction chunk gets its own copy of the weights even though
+the package stores them once, and 3-bit LUTs take as much ANE memory as 4-bit ones. For four
+layers of Qwen3.8-27B (1.52 B parameters): 0.38 / 0.57 / 0.76 GB on disk at LUT2 / 3 / 4, and
+0.47 / 0.81 / 0.84 GB of ANE memory with only `infer` loaded (1.2 / 1.7-1.9 / 1.3-1.9 GB with
+`prefill` too); `infer` takes 14.5 ms per four layers whatever the width. A whole Qwen3.8-27B
+(24.3 B decoder parameters) would need about 13 GB of ANE memory at LUT3 or LUT4 with `infer`
+alone (twice that with `prefill`), 7.5 GB at LUT2, plus ~0.7 GB for a LUT4 LM head: beyond what an
+app can use on a 12 GB iPhone except at 2 bits, which costs far too much quality. On this Mac it
+would decode at ~4 tok/s. Dense models up to ~8 B parameters (about 0.55 GB of ANE memory per
+billion parameters at LUT4, `infer` only) are the practical range for 12 GB phones.
 
 ## How it works
 

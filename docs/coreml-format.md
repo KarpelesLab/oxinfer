@@ -61,6 +61,7 @@ model_info:
     recurrent_state: true        # states that cannot be rewound: feed every token exactly once
     prefill_full_batches_only: true
     gdn_chunk_size: 64           # informational (chunk of the in-graph delta rule)
+    moe: {experts: 16, experts_per_token: 4, evaluation: dense}   # MoE models only, informational
     # --- extensions (qwen3_5 and gemma4) ---
     layer_types: [linear, linear, linear, full, ...]
     states:
@@ -82,6 +83,7 @@ For `gemma4` the extension keys are (E2B shown):
 
 ```yaml
     local_attention_window: 512      # informational: applied inside the graph
+    local_cache_length: 576          # only when the local cache is a shifting window (see States)
     final_logit_softcap: 30.0        # informational: applied inside the LM head
     per_layer_inputs: 8960           # width of the per_layer_inputs tensor (layers x 256)
     kv_shared_layers: {15: 13, 16: 14, ...}   # informational: layer -> layer whose K/V it reads
@@ -99,7 +101,13 @@ For `gemma4` the extension keys are (E2B shown):
 
 Keys other runtimes do not know must be ignored. When `quant_ffn` (or `quant_lmhead`,
 `quant_embeddings`) is present, the part uses linear weight quantization (`int8` or `int4,B`)
-instead of a LUT and `lut_*` is `none`; it changes nothing at run time.
+instead of a LUT and `lut_*` is `none`; it changes nothing at run time. Likewise
+`lut_ffn_mixed: 4.50` (mixed precision: `lut_ffn` is the narrowest LUT, some weights use the
+next width, 4 -> 6 bits, for that average) and the LUT method in the trailing comments are
+informational: every weight is a plain `constexpr_lut_to_dense` whatever its width or method.
+
+No format version was bumped for these extensions: packages written before them (full-length
+local caches, no `local_cache_length`) keep loading and behave as before.
 
 ## Embeddings model
 
@@ -180,8 +188,22 @@ every chunk. A fresh state (all zeros) is an empty context.
   `[slot, 0:n_kv]`, values in `[slot, n_kv:2 n_kv]` (one slice update per layer: two separate
   K and V updates with a single KV head fail to compile for the ANE). K is stored after its
   RMSNorm and RoPE, V after its weightless RMSNorm. The KV-shared layers (the last
-  `num_kv_shared_layers`) write nothing and attend to the slot of `kv_shared_layers[i]`. The
-  caches span the whole context: no ring buffer, the window is a mask.
+  `num_kv_shared_layers`) write nothing and attend to the slot of `kv_shared_layers[i]`.
+  The global cache spans the whole context. The local cache too when `context_length <=
+  local_attention_window + batch_size` (the window is then a mask, see above); for longer
+  contexts it is a **shifting window** of `local_cache_length = local_attention_window +
+  batch_size` positions (meta.yaml key `local_cache_length`, absent for full-length local
+  caches): every call that processes `T` tokens drops the `T` oldest positions and appends the
+  new ones, so after a call ending at position `q` slot `j` holds position
+  `q - local_cache_length + 1 + j` (negative = empty). The extra `batch_size` positions keep
+  the window of the first token of a prefill batch complete. The runtime contract does not
+  change (the masks, including "slot not filled yet", are derived inside the graph from
+  `position_ids` and row `p` of `causal_mask`), but the cache cannot be rewound: positions
+  must be fed exactly once and in order, as for `recurrent_state` (re-running the last prompt
+  token, the ANEMLL habit, shifts the window again; these packages set
+  `prefill_last_token_output`, so it is not needed). Restarting at position 0 is fine without a
+  new state (older slots then count as empty); to go back to any other position restore a
+  snapshot of the state. E2B at context 8192: 7 MB of local cache instead of 100 MB.
 
 The names are the Core ML state names (`stateSchema` in the compiled model's `metadata.json`,
 the same as ANEMLL's for the KV cache). Inference only passes the opaque state; the names matter
@@ -233,7 +255,7 @@ cached K/V heads, softmax attention over the whole cache with the causal mask, S
 Differences: SiLU and sigmoid are written as `x * (0.5 + 0.5 tanh(x / 2))` because the ANE's
 native sigmoid is a coarse approximation; the prefill output described above.
 
-### qwen3_5 (Qwen3.5 / 3.6 / 3.8 dense)
+### qwen3_5 (Qwen3.5 / 3.6 / 3.8, dense and MoE)
 
 * Zero-centered RMSNorm (`1 + w`, folded into the weights at conversion).
 * Full attention layers (every `full_attention_interval`-th): `q_proj` produces query and a
@@ -254,7 +276,21 @@ native sigmoid is a coarse approximation; the prefill output described above.
     power series `(I - N)(I + N^2)...` overflows for correlated keys), then the usual
     `u = T (beta v)`, `w = T (beta k e^G)`, intra-chunk attention and state update. Every op is
     a matmul or elementwise op, all on the Neural Engine.
-* MoE variants (`num_experts`) are not supported yet.
+* MoE variants (`qwen3_5_moe`, `num_experts`): the sparse block is evaluated **densely**. The
+  gate, up and down projections of all experts are three wide 1x1 convolutions; the router's
+  softmax weights are kept for the top `num_experts_per_tok` experts (threshold found by k-1
+  rounds of max-and-mask: reductions and compares, no `topk` op) and renormalized, every
+  expert's SiLU-gated hidden state is scaled by its weight (0 for the others), and the shared
+  expert is added times `sigmoid(shared_expert_gate)`. Same I/O and states as dense. Compute
+  and weight memory grow with the total expert count, so this suits small MoE models only; a
+  35B-A3B model would compute all 35B parameters per token. The router stays fp16 (a palettized
+  router flips expert choices). Validated on random models (8 layers, hidden 1024, 32 experts,
+  top-4): the float32 graph matches transformers (logit cosine 1.000000), every op runs on the
+  ANE (prefill 8200 tok/s, decode 110 tok/s on an M5 Max); the fp16 package scores logit cosine
+  0.9987 on the GPU and 0.94 on the ANE against float32. The ANE's per-layer error is the same
+  as for the dense twin of that model (0.99947 end to end), but random peaky routers turn small
+  differences into different experts: with 1% noise per layer the MoE model's final hidden
+  state moves 30x more than the dense one's in float32 already.
 
 ### gemma4 (Gemma 4 E2B / E4B, text)
 
@@ -290,6 +326,18 @@ ANE output with torch:
   palettized gather table is decompressed when the model loads (LUT4: 87 s, +16.7 GB RSS).
 * The CPU_ONLY path of Core ML returns NaN for these stateful fp16 graphs (ANEMLL's own Qwen3
   release too); CPU_AND_GPU and CPU_AND_NE are correct.
+* Neural Engine memory (wired memory added by loading a chunk, median of load/unload cycles):
+  each function of a multifunction model gets its **own copy** of the weights on the ANE even
+  though the package stores them once (Qwen3.8-27B, 4 layers: 0.8 GB for `infer` alone,
+  1.3-1.7 GB with `prefill`), and a 3-bit LUT costs as much as a 4-bit one (0.81 vs 0.84 GB
+  for the same 4 layers, 2-bit: 0.47 GB). The process footprint does not show it.
+* Precomputed LUTs (`--lut-method fisher`) are written into the converted program by weight
+  content, so the graph must not let Core ML rewrite a weight: its passes fold a constant
+  scale that follows a convolution into the weights (the `y / 2` of `sigmoid(y) = 0.5 + 0.5
+  tanh(y / 2)` after Qwen3.5's gate projection), hence that projection holds `W / 2`.
+* LUT group size is a speed trade-off: one LUT per output channel (`lutN,1`) is the most
+  accurate but halves decode speed on the ANE (Qwen3-0.6B LUT4: 41 vs 92 tok/s), 2 channels
+  per LUT costs ~25%, 8 (the default) is as fast as ANEMLL's packages.
 
 ## Validation
 
