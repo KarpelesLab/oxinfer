@@ -22,6 +22,25 @@ Output is validated against the `transformers` float32 reference: on Gemma 4 E2B
 last-token logits agree to a max absolute difference of about 1e-4 and greedy decoding produces
 identical tokens.
 
+## Goals
+
+1. **Run everything, everywhere.** Any model on any machine: a phone, a browser tab, a laptop with
+   no GPU, a server. It may be slow, but it works. A missing accelerator, too little memory or an
+   unusual platform should never be the reason a model cannot run. The CPU path is the reference
+   and is always there; a 1 TB model on a machine with 1 GB of RAM and no GPU should still produce
+   tokens, by reading the weights from storage as it goes (see
+   [Streaming weights from flash](#streaming-weights-from-flash-models-larger-than-ram)), very slowly.
+2. **Then make it fast.** Anything that improves speed on a given machine is in scope: a GPU
+   when there is one (Metal, CUDA, WebGPU, detected at run time), the Neural Engine through Core
+   ML, quantization, SIMD kernels per CPU (NEON, SDOT / i8mm, AVX2, wasm simd128), speculative
+   decoding (MTP, drafters), prefetching and caching for weights that do not fit in memory. When
+   something is missing, oxinfer falls back to a slower path rather than failing.
+
+Correctness comes first in both: every model and every fast path is checked against the reference
+implementation (the [verification](#verifying-against-the-reference) section and the per-model
+notes give the measured agreement), and a speed-up that changes the output must say so and stay
+optional.
+
 ## Supported models
 
 | Model | Params (total) | bf16 size | Status |
