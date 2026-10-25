@@ -39,6 +39,10 @@ name = "qwen_mtp"
 required-features = ["hf"]
 
 [[example]]
+name = "janus_check"
+required-features = ["hf", "media"]
+
+[[example]]
 name = "transcribe"
 required-features = ["hf", "media"]
 

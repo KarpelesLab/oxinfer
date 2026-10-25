@@ -37,6 +37,7 @@ pub mod gguf;
 pub mod gpu;
 #[cfg(feature = "hf")]
 pub mod hf;
+pub mod janus;
 pub mod kernels;
 pub mod lora;
 #[cfg(feature = "media")]

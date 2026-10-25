@@ -36,6 +36,9 @@ impl Resnet {
             c2: Conv::load(t, &format!("{p}.conv2"))?,
             short: if t.has(&format!("{p}.conv_shortcut.weight")) {
                 Some(Linear::load(t, &format!("{p}.conv_shortcut"))?)
+            } else if t.has(&format!("{p}.nin_shortcut.weight")) {
+                // Taming-transformers naming (the Janus / LlamaGen VQ decoder).
+                Some(Linear::load(t, &format!("{p}.nin_shortcut"))?)
             } else {
                 None
             },

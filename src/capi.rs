@@ -553,3 +553,197 @@ pub unsafe extern "C" fn oxi_transcribe_file(
         }
     })
 }
+
+// ---- Janus-Pro (text to image, image understanding) ----------------------------------------
+
+/// Receives one generated image: `index` in the batch, tightly packed RGB8 (`len` =
+/// `width * height * 3` bytes, valid during the call only).
+pub type OxiImageFn =
+    Option<unsafe extern "C" fn(user: *mut c_void, index: c_int, width: c_int, height: c_int, rgb: *const u8, len: usize)>;
+/// Receives image-generation progress (`step` of `steps` image tokens); return non-zero to cancel.
+pub type OxiStepFn = Option<unsafe extern "C" fn(user: *mut c_void, step: c_int, steps: c_int) -> c_int>;
+
+/// A Janus-Pro model handle.
+pub struct OxiJanus {
+    cancel: crate::janus::CancelHandle,
+    model: Mutex<crate::janus::Janus>,
+}
+
+unsafe fn janus<'a>(j: *const OxiJanus) -> Result<&'a OxiJanus> {
+    unsafe { j.as_ref() }.context("janus is NULL")
+}
+
+fn lock_janus(j: &OxiJanus) -> std::sync::MutexGuard<'_, crate::janus::Janus> {
+    j.model.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Loads a Janus-Pro model (directory or repo id; `key=value` options: quant, mmap, device,
+/// cache_dir, generation, understanding).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_janus_load(
+    model: *const c_char,
+    options: *const c_char,
+    progress: OxiProgressFn,
+    user: *mut c_void,
+) -> *mut OxiJanus {
+    guard(std::ptr::null_mut(), || {
+        let model = unsafe { str_arg(model, "model") }?;
+        let mut o = crate::janus::JanusOptions::default();
+        for item in unsafe { opt_str_arg(options, "options") }?.unwrap_or("").split(['\n', ';']) {
+            let item = item.trim();
+            if item.is_empty() || item.starts_with('#') {
+                continue;
+            }
+            let (k, v) = item.split_once('=').with_context(|| format!("option {item:?} is not key=value"))?;
+            o.set(k.trim(), v.trim())?;
+        }
+        let j = with_progress(progress, user, || crate::janus::Janus::load(model, &o))?;
+        Ok(Box::into_raw(Box::new(OxiJanus {
+            cancel: j.cancel_handle(),
+            model: Mutex::new(j),
+        })))
+    })
+}
+
+/// Frees a Janus model (NULL is ignored). No other call on it may be running.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_janus_free(j: *mut OxiJanus) {
+    if !j.is_null() {
+        guard((), || {
+            drop(unsafe { Box::from_raw(j) });
+            Ok(())
+        })
+    }
+}
+
+/// Stops the running generation or answer (any thread).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_janus_cancel(j: *const OxiJanus) {
+    if let Some(j) = unsafe { j.as_ref() } {
+        j.cancel.cancel();
+    }
+}
+
+/// Text to image: generates `parallel_size` 384x384 images for `prompt` (`options_json`: see
+/// `oxinfer.h`), each passed to `on_image`. Returns the number of images, or -1 (error or
+/// cancelled).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_janus_generate(
+    j: *mut OxiJanus,
+    prompt: *const c_char,
+    options_json: *const c_char,
+    on_image: OxiImageFn,
+    on_step: OxiStepFn,
+    user: *mut c_void,
+) -> c_int {
+    guard(-1, || {
+        let j = unsafe { janus(j) }?;
+        let prompt = unsafe { str_arg(prompt, "prompt") }?;
+        let opts: crate::janus::ImageOptions = match unsafe { opt_str_arg(options_json, "options_json") }?.map(str::trim) {
+            Some(s) if !s.is_empty() => serde_json::from_str(s).context("options_json")?,
+            _ => Default::default(),
+        };
+        let g = lock_janus(j);
+        let mut progress = |p: crate::janus::Progress| -> Flow {
+            match on_step {
+                Some(cb) if unsafe { cb(user, p.step as c_int, p.steps as c_int) } != 0 => Flow::Stop,
+                _ => Flow::Continue,
+            }
+        };
+        let (imgs, _) = g.generate_images(prompt, &opts, &mut progress)?;
+        if let Some(cb) = on_image {
+            for (i, img) in imgs.iter().enumerate() {
+                unsafe {
+                    cb(
+                        user,
+                        i as c_int,
+                        img.width as c_int,
+                        img.height as c_int,
+                        img.rgb.as_ptr(),
+                        img.rgb.len(),
+                    )
+                };
+            }
+        }
+        Ok(imgs.len() as c_int)
+    })
+}
+
+fn janus_answer(
+    j: *mut OxiJanus,
+    question: *const c_char,
+    options_json: *const c_char,
+    cb: OxiTokenFn,
+    user: *mut c_void,
+    images: impl FnOnce() -> Result<Vec<crate::video::RgbImage>>,
+) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let j = unsafe { janus(j) }?;
+        let question = unsafe { str_arg(question, "question") }?;
+        let opts: crate::janus::ChatOptions = match unsafe { opt_str_arg(options_json, "options_json") }?.map(str::trim) {
+            Some(s) if !s.is_empty() => serde_json::from_str(s).context("options_json")?,
+            _ => Default::default(),
+        };
+        let images = images()?;
+        let g = lock_janus(j);
+        let mut on_text = |t: &str| -> Flow {
+            match cb {
+                Some(cb) if !t.is_empty() && unsafe { cb(user, t.as_ptr() as *const c_char, t.len(), 0) } != 0 => Flow::Stop,
+                _ => Flow::Continue,
+            }
+        };
+        Ok(out_string(g.understand(question, &images, &opts, &mut on_text)?))
+    })
+}
+
+/// Answers `question` about the images in `images_json` (a JSON array of file paths, decoded
+/// with the `media` feature; NULL for none), streaming the text to `cb`. Returns the answer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_janus_understand(
+    j: *mut OxiJanus,
+    question: *const c_char,
+    images_json: *const c_char,
+    options_json: *const c_char,
+    cb: OxiTokenFn,
+    user: *mut c_void,
+) -> *mut c_char {
+    janus_answer(j, question, options_json, cb, user, || {
+        let paths: Vec<String> = match unsafe { opt_str_arg(images_json, "images_json") }?.map(str::trim) {
+            Some(s) if !s.is_empty() => serde_json::from_str(s).context("images_json: expected an array of paths")?,
+            _ => Vec::new(),
+        };
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        #[cfg(feature = "media")]
+        {
+            let m = crate::media::Media::new();
+            paths.iter().map(|p| m.load_image(std::path::Path::new(p))).collect()
+        }
+        #[cfg(not(feature = "media"))]
+        bail!("decoding image files needs the `media` feature; use oxi_janus_understand_rgb")
+    })
+}
+
+/// [`oxi_janus_understand`] with one image given as tightly packed RGB8 pixels.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn oxi_janus_understand_rgb(
+    j: *mut OxiJanus,
+    question: *const c_char,
+    rgb: *const u8,
+    width: c_int,
+    height: c_int,
+    options_json: *const c_char,
+    cb: OxiTokenFn,
+    user: *mut c_void,
+) -> *mut c_char {
+    janus_answer(j, question, options_json, cb, user, || {
+        let (w, h) = (usize::try_from(width)?, usize::try_from(height)?);
+        if rgb.is_null() || w == 0 || h == 0 {
+            bail!("rgb is NULL or the size is empty");
+        }
+        let data = unsafe { std::slice::from_raw_parts(rgb, w * h * 3) }.to_vec();
+        Ok(vec![crate::video::RgbImage { width: w, height: h, data }])
+    })
+}

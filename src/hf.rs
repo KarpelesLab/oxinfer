@@ -500,6 +500,19 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
         files.extend(shards);
     } else if list.contains_key("pytorch_model.bin") {
         files.push("pytorch_model.bin".into());
+    } else if let Some((size, src)) = list.get("pytorch_model.bin.index.json") {
+        // Sharded PyTorch checkpoints (e.g. deepseek-ai/Janus-Pro-7B).
+        fetch_file(repo, dir, "pytorch_model.bin.index.json", *size, src, 0, 0)?;
+        let idx: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("pytorch_model.bin.index.json"))?)?;
+        let mut shards: Vec<String> = idx["weight_map"]
+            .as_object()
+            .context("weight_map")?
+            .values()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        shards.sort();
+        shards.dedup();
+        files.extend(shards);
     } else if !gguf_models(&list).is_empty() {
         bail!(
             "{repo} holds GGUF files; pick one as {repo}:QUANT (e.g. {repo}:Q4_K_M): {}",

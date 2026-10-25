@@ -503,6 +503,13 @@ impl ModelFiles {
         let idx = dir.join("model.safetensors.index.json");
         let mut files: Vec<PathBuf> = Vec::new();
         let torch = dir.join("pytorch_model.bin");
+        let torch_idx = dir.join("pytorch_model.bin.index.json");
+        // Sharded PyTorch checkpoints (`pytorch_model-0000N-of-0000M.bin`) share the index format.
+        let idx = if !crate::fsx::exists(&idx) && !crate::fsx::exists(&single) && crate::fsx::exists(&torch_idx) {
+            torch_idx
+        } else {
+            idx
+        };
         if crate::fsx::exists(&single) {
             files.push(single);
         } else if !crate::fsx::exists(&idx) && crate::fsx::exists(&torch) {

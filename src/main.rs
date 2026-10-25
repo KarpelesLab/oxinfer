@@ -12,6 +12,7 @@ use tokenizers::Tokenizer;
 
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
 mod anemll_cli;
+mod janus_cli;
 #[cfg(feature = "media")]
 mod whisper_cli;
 
@@ -104,6 +105,10 @@ struct Args {
     precision: Option<String>,
     fallback: bool,
     condition_on_prev: bool,
+    // Janus-Pro text-to-image.
+    generate_image: Option<String>,
+    num_images: usize,
+    temp_given: bool,
 }
 
 fn usage() -> ! {
@@ -186,6 +191,15 @@ fn usage() -> ! {
          \x20 --seed N             noise seed (default 42)\n\
          \x20 --lora FILE[:SCALE]  merge a LoRA (kohya or diffusers safetensors; repeatable; scale 1);\n\
          \x20                      FILE may be org/repo/file.safetensors on Hugging Face\n\
+         \n\
+         Janus-Pro (deepseek-ai/Janus-Pro-1B / -7B): text to image, and questions about images:\n\
+         \x20 --generate-image T   generate a 384x384 image of T (or --prompt T with -o FILE)\n\
+         \x20 -o, --output FILE     PNG to write (default image.png; FILE-N.png for several images)\n\
+         \x20 --cfg F              classifier-free guidance weight (default 5; alias --guidance)\n\
+         \x20 --temp F             image-token temperature (default 1; 0 = greedy)\n\
+         \x20 --num-images N       images generated together in one batch (default 1)\n\
+         \x20 --seed N             sampling seed (default 42)\n\
+         \x20 --image FILE         with --prompt: answer a question about the image (repeatable)\n\
          \x20 --devices            list detected CPU features and GPUs, then exit\n\
          \x20 --device D           auto (default) | cpu | cuda | metal | vulkan\n\
          \x20 --dump-logits FILE   write last-prompt-token logits (f32 LE) and exit\n\
@@ -321,6 +335,9 @@ fn parse_args() -> Result<Args> {
         precision: None,
         fallback: false,
         condition_on_prev: false,
+        generate_image: None,
+        num_images: 1,
+        temp_given: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -336,7 +353,10 @@ fn parse_args() -> Result<Args> {
             "--raw" => a.raw = true,
             "--chat" => a.chat = true,
             "--max-tokens" | "-n" => a.max_tokens = val()?.parse()?,
-            "--temp" | "-t" => a.temperature = val()?.parse()?,
+            "--temp" | "-t" => {
+                a.temperature = val()?.parse()?;
+                a.temp_given = true;
+            }
             "--top-k" => a.top_k = val()?.parse()?,
             "--top-p" => a.top_p = val()?.parse()?,
             "--seed" => a.seed = val()?.parse()?,
@@ -421,6 +441,8 @@ fn parse_args() -> Result<Args> {
             "--output" | "-o" => a.output = Some(PathBuf::from(val()?)),
             "--steps" => a.steps = Some(val()?.parse()?),
             "--guidance" | "--cfg" => a.guidance = Some(val()?.parse()?),
+            "--generate-image" => a.generate_image = Some(val()?),
+            "--num-images" => a.num_images = val()?.parse()?,
             "--negative" => a.negative = val()?,
             "--sampler" => a.sampler = Some(val()?),
             "--lora" => a.loras.push(oxinfer::sd::lora::LoraSpec::parse(&val()?)?),
@@ -809,6 +831,9 @@ fn run(mut args: Args) -> Result<()> {
         return whisper_cli::run(&args);
         #[cfg(not(feature = "media"))]
         bail!("speech to text from the command line needs the `media` feature (audio decoding)");
+    }
+    if model_type == "multi_modality" {
+        return janus_cli::run(&args);
     }
     match model_type.as_str() {
         "gemma4" | "gemma4_text" | "gemma3" | "gemma3_text" => run_gemma(args),
