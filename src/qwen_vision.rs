@@ -91,11 +91,12 @@ pub struct ProcessorConfig {
 }
 
 impl ProcessorConfig {
-    /// `Qwen2VLImageProcessor` defaults as Qwen3.5 configures them.
+    /// The image processor settings every published Qwen3.5 / 3.6 checkpoint ships (used when a
+    /// checkpoint lacks the file: the class defaults would be Qwen2-VL's 14-pixel patches).
     fn image_default() -> Self {
         Self {
-            min_pixels: 56 * 56,
-            max_pixels: 28 * 28 * 1280,
+            min_pixels: 65536,
+            max_pixels: 16777216,
             mean: [0.5; 3],
             std: [0.5; 3],
             patch_size: 16,
@@ -106,11 +107,12 @@ impl ProcessorConfig {
             max_frames: 768,
         }
     }
-    /// `Qwen3VLVideoProcessor` class defaults.
+    /// The video processor settings of the published checkpoints (`Qwen3VLVideoProcessor`'s
+    /// sampling defaults).
     fn video_default() -> Self {
         Self {
-            min_pixels: 128 * 32 * 32,
-            max_pixels: 32 * 32 * 768,
+            min_pixels: 4096,
+            max_pixels: 25165824,
             ..Self::image_default()
         }
     }
@@ -153,7 +155,7 @@ impl ProcessorConfig {
 
     /// Loads the image (`video` false) or video processor settings of a checkpoint, falling
     /// back the way transformers does: `processor_config.json` entry, then the dedicated file,
-    /// then (video) `preprocessor_config.json`, then the class defaults.
+    /// then (video) `preprocessor_config.json`, then the published defaults.
     pub fn load(dir: &Path, video: bool) -> Self {
         let read = |name: &str| -> Option<serde_json::Value> {
             let b = crate::fsx::read(&dir.join(name)).ok()?;

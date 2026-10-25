@@ -10,9 +10,9 @@ Hugging Face and runs in the tab, with WebGPU when the browser has it; MLX 4-bit
 and Qwen3 models load from the mirror too. Early days: the crate is at 0.0.x and the API and file
 formats may still change.
 
-Local LLM inference in pure Rust: Gemma 4 (text, images, audio), Gemma 3 and Qwen 3 / 3.5 / 3.8
-today, more model families as they come; also embeddings, Stable Diffusion and Whisper speech to
-text. No BLAS, no ML framework: weights are read straight out
+Local LLM inference in pure Rust: Gemma 4 (text, images, video, audio), Qwen 3.5 / 3.6 / 3.8
+(text, images, video), Gemma 3 and Qwen 3 today, more model families as they come; also
+embeddings, Stable Diffusion and Whisper speech to text. No BLAS, no ML framework: weights are read straight out
 of the safetensors files (HuggingFace checkpoints or MLX 4-bit ones) and every operation
 (matmuls, attention, norms, RoPE, sampling) is implemented here, with hand-written SIMD kernels
 (NEON, AVX2, wasm simd128) and its own thread pool. The CPU path runs everywhere; GPUs (Metal,
@@ -46,15 +46,15 @@ optional.
 
 | Model | Params (total) | bf16 size | Status |
 |---|---|---|---|
-| google/gemma-4-E2B-it | 5.1B | 10.2 GB | tested, matches reference (max logit diff 1e-4) |
-| google/gemma-4-E4B-it | 8.0B | 16.0 GB | tested, matches reference (max logit diff 8e-5) |
+| google/gemma-4-E2B-it | 5.1B | 10.2 GB | text, images, video, audio; matches reference (max logit diff 1e-4) |
+| google/gemma-4-E4B-it | 8.0B | 16.0 GB | text, images, video, audio; matches reference (max logit diff 8e-5) |
 | google/gemma-4-12B-it | 12B | 24 GB | supported (k=v global attention), untested |
 | google/gemma-4-31B-it | 31B | 62 GB | supported, sharded loading, untested |
 | google/gemma-4-26B-A4B-it | 26B MoE | 52 GB | not yet (MoE block unimplemented) |
-| Qwen/Qwen3.8-27B (and Qwen3.5/3.6 dense) | 27.8B | 55.6 GB | text only; matches the bf16 reference; see below |
-| Qwen/Qwen3.6-35B-A3B and fine-tunes (PixilabAI/Zawen-v0.1-35B-A3B) | 35B MoE, 3B active | 69 GB | text only; Zawen matches the reference (see below) |
+| Qwen/Qwen3.8-27B (and Qwen3.5/3.6 dense) | 27.8B | 55.6 GB | text, images, video; matches the bf16 reference; see below |
+| Qwen/Qwen3.6-35B-A3B and fine-tunes (PixilabAI/Zawen-v0.1-35B-A3B) | 35B MoE, 3B active | 69 GB | text (the vision code applies to MoE checkpoints too but is untested there: Zawen ships no vision tower); Zawen matches the reference (see below) |
 | autotrust/JEV-9B, JEV-27B (Jev decision models) | 9B / 27.8B + LoRA | 18 / 54 GB + 0.16 / 0.44 GB | typed decisions, on the bundled or any matching base; match transformers + peft (see [Typed decisions](#typed-decisions-jev-models)) |
-| Qwen/Qwen3.5-0.8B | 0.8B | 1.7 GB | text only; the small one used for the wasm measurements |
+| Qwen/Qwen3.5-0.8B | 0.8B | 1.7 GB | text, images, video; matches transformers float32 (see [Image, video and audio input](#image-video-and-audio-input)); the small one used for the wasm measurements |
 | mlx-community/gemma-4-e2b-it-4bit, gemma-4-e4b-it-4bit | 5.1B / 8.0B | 3.6 / 5.2 GB (MLX 4-bit) | text, images and audio; see [MLX checkpoints](#mlx-checkpoints) |
 | mlx-community/Qwen3-4B-4bit (Qwen3 dense) | 4.0B | 2.3 GB (MLX 4-bit) | text; matches the reference on the same weights (same top 10) |
 | mlx-community/gemma-3-4b-it-4bit (Gemma 3) | 4.3B | 3.4 GB (MLX 4-bit) | text only; matches the reference, also past the 1024-token window |
@@ -76,8 +76,9 @@ The Qwen3.5-family dense models are a different architecture (`qwen.rs`): 48 Gat
 value head) interleaved with 16 gated full-attention layers (24 query / 4 KV heads of 256, partial
 RoPE on 64 dims, a sigmoid output gate), SiLU MLPs and zero-centred RMSNorm. The recurrent layers
 keep a fixed-size state instead of a KV cache, so memory does not grow with context for 48 of the
-64 layers. The vision encoder is not loaded yet; the MTP head drives speculative decoding with
-`--mtp` (see Speculative decoding).
+64 layers. The vision tower takes images and videos (see
+[Image, video and audio input](#image-video-and-audio-input)); the MTP head drives speculative
+decoding with `--mtp` (see Speculative decoding).
 
 The MoE variants (`qwen3_5_moe`, Qwen3.5/3.6-35B-A3B) replace each MLP with 256 routed SiLU
 experts of width 512 (softmax router, top 8, weights renormalised) plus a shared expert scaled by
@@ -98,7 +99,7 @@ token). MLX-quantized experts are not read yet.
 Thinking is on by default in the Qwen template; `--think` enables it here (the trace is dimmed),
 otherwise the generation prompt closes the think block.
 
-Text, images and audio are supported (E2B/E4B have both towers). Video is not.
+Text, images, video and audio are supported (E2B/E4B have both towers).
 
 ## Embeddings
 
@@ -375,29 +376,93 @@ model bit for bit. In the library, `sd::Pipeline::load_with_loras(dir, &[LoraSpe
 report)` does the same (`examples/sd_lora.rs`); in the browser build, `web_sd_load` takes the
 LoRA files (`sdLoad(dir, [{ path, scale }])` in `oxinfer.js`).
 
-## Image and audio input
+## Image, video and audio input
 
 ```sh
 ./target/release/oxinfer --model models/gemma-4-E4B-it --quant q4 \
     --image photo.jpg --audio clip.wav --prompt "Describe the image and transcribe the audio."
+./target/release/oxinfer --model Qwen/Qwen3.5-0.8B --video clip.mp4 --prompt "What happens in this video?"
+./target/release/oxinfer --model models/Qwen3.8-27B --quant q8 --image a.png --image b.png -p "Compare them."
 ```
 
-`--image` and `--audio` can be repeated; attachments are placed before the text of the user turn
-(or of the first turn in `--chat`). Files are decoded with the pure-Rust
-[oxideav](https://crates.io/crates/oxideav-core) crates (PNG, JPEG, WebP, GIF, BMP; WAV, MP3, FLAC,
-AAC/M4A, Ogg Vorbis/Opus, MKV audio), resampled to 16 kHz mono for audio.
+`--image`, `--video` and `--audio` can be repeated; attachments are placed before the text of the
+user turn (or of the first turn in `--chat`): images, then videos, then audio. Gemma 4 takes all
+three; Qwen3.5 / 3.6 / 3.8 checkpoints that include the vision tower (`model.visual.*`, as the
+official ones do) take images and videos. Files are decoded with the pure-Rust
+[oxideav](https://crates.io/crates/oxideav-core) crates: PNG, JPEG, WebP, GIF, BMP; WAV, MP3,
+FLAC, AAC/M4A, Ogg Vorbis/Opus, MKV audio (resampled to 16 kHz mono); and video (below).
 
-- **Vision**: aspect-preserving bicubic resize to at most 280 soft tokens (`--max-soft-tokens`
-  accepts 70/140/280/560/1120), 16x16 patches, a 16-layer ViT (hidden 768) with axial 2D RoPE and
-  clipped linears, 3x3 patch pooling, then the vision embedder. A 640x480 image becomes 57x42
-  patches and 266 soft tokens in about 2.5 s.
-- **Audio**: 128-bin log-mel features (20 ms frames, 10 ms hop), two stride-2 conv layers, a
-  12-layer conformer with chunked local attention and relative position bias, then the audio
+- **Gemma 4 vision**: aspect-preserving bicubic resize to at most 280 soft tokens
+  (`--max-soft-tokens` accepts 70/140/280/560/1120), 16x16 patches, a 16-layer ViT (hidden 768)
+  with axial 2D RoPE and clipped linears, 3x3 patch pooling, then the vision embedder. A 640x480
+  image becomes 57x42 patches and 266 soft tokens.
+- **Gemma 4 video** (as `Gemma4VideoProcessor`): 32 frames spread uniformly over the clip, each
+  through the image tower at 70 soft tokens (frames are batched through the tower), written as
+  `mm:ss <|image>` + soft tokens + `<image|>` per frame.
+- **Gemma 4 audio**: 128-bin log-mel features (20 ms frames, 10 ms hop), two stride-2 conv layers,
+  a 12-layer conformer with chunked local attention and relative position bias, then the audio
   embedder: 40 ms of audio per soft token (750 max, i.e. 30 s).
+- **Qwen vision** (`qwen_vision.rs`, as `Qwen2VLImageProcessorFast` and `Qwen3_5VisionModel`):
+  each side resized to a multiple of 32 pixels within the checkpoint's pixel budget (65536 to
+  16.7M pixels; `--max-soft-tokens N` caps it at N tokens of 32x32 pixels), 16x16 patches with
+  two temporal frames each, emitted in 2x2 merge blocks; a Conv3d patch embedding, learned
+  position embeddings bilinearly resampled to the patch grid, axial 2D RoPE, 12 (0.8B) or 27
+  (9B, 27B) pre-LayerNorm blocks with bidirectional attention, and a merger folding each 2x2
+  block into one token. A 1024x1024 image is 4096 patches and 1024 tokens. The text model places
+  the tokens with interleaved M-RoPE (time / height / width positions per rotary frequency; the
+  text after an image continues from its largest side). The tower stays bf16 with `--quant`
+  (int8 blocks moved the 27-layer tower's outputs by 4%), and `--save-quantized` keeps it.
+- **Qwen video** (as `Qwen3VLVideoProcessor`): 2 frames per second (`--video-fps`), at least 4
+  and at most 768 (`--video-frames`), resized together within a 25M-pixel budget for the clip;
+  every two frames form one temporal patch, prefixed with its time (`<1.2 seconds>`) in the
+  prompt.
 
-Soft tokens replace the `<|image|>` / `<|audio|>` placeholder embeddings inside the text model
-(the per-layer-embedding lookup uses the pad token there, as in the reference). All attention
-stays causal, matching the E2B/E4B configuration.
+Soft tokens replace the placeholder embeddings inside the text model (for Gemma, the
+per-layer-embedding lookup uses the pad token there, as in the reference). All attention stays
+causal, matching the configurations. The resize reproduces torchvision's uint8 antialiased
+bicubic exactly (what the reference processors run by default; `resample.rs` also has Pillow's,
+the PIL backend's), so the pixels fed to the towers are bit-identical to transformers'.
+
+**Video files.** oxideav demuxes MP4, MOV, Matroska / WebM and AVI and decodes H.264 (Baseline
+to High, CABAC, B-frames), H.265, AV1, VP8, VP9, MPEG-4 Part 2 and Motion JPEG, all in pure Rust;
+every one of these was checked on ffmpeg-made clips (first frames within one level of
+ffmpeg's, three for MJPEG). A directory of image files (sorted by name) is read as a video at
+`--frames-fps` (default 24, the rate the processors assume). The decoder runs on one thread: a
+10-s 1080p clip decodes in 8.4 s (H.264 High), 6.0 s (VP9) or 9.9 s (AV1), against 0.1 s for
+ffmpeg, and frames up to the last sampled one are all decoded. Not available: other codecs
+(ProRes, Theora, ...), the audio track of a video, and hardware decoding. The same attachments
+go through the library (`Engine::send_with_media` with `Attachments`) and the C API
+(`oxi_engine_send_media` with a JSON list).
+
+Agreement with transformers 5.20 (float32, CPU; `tools/ref_vl.py` runs the reference processor
+and model on the same files and compares with oxinfer's `--dump-mm` / `--dump-logits`):
+
+| Model, input | Tower output vs reference | Last-token logits | 40 greedy tokens |
+|---|---|---|---|
+| Qwen3.5-0.8B, 500x333 image (160 tokens) | max 2.5e-4, rel 2.4e-5 | max diff 1.9e-4 | identical |
+| Qwen3.5-0.8B, 6-s 480x320 video (12 frames, 900 tokens) | max 8.9e-4, rel 2.3e-5 | max diff 2.8e-4 | identical |
+| Qwen3.5-0.8B, 500x332 video (8 frames resized to 512x320) | max 6.1e-4, rel 2.8e-5 | max diff 2.2e-4 | identical |
+| Qwen3.5-0.8B, 2 images + a video (1390 tokens, 9 M-RoPE spans) | | max diff 2.2e-4 | |
+| Qwen3.5-9B tower (the 27-layer tower of 3.8-27B), CPU | max 6.0e-4, rel 1.3e-5 | | |
+| same, Metal with the matrix units (half-precision inputs) | max 0.17, rel 2.4e-3 | | |
+| Gemma 4 E2B, 500x333 image (260 soft tokens) | max 4.2e-5, rel 3.6e-6 | max diff 1.4e-4 | |
+| Gemma 4 E2B, 6-s video (32 frames, 1920 soft tokens) | max 6.7e-5, rel 3.2e-6 | max diff 1.2e-4 | identical |
+
+The pixels match bit for bit in every case, and the expanded prompts are identical. On
+Qwen3.8-27B (`--quant q8`), the same video gives: "The video begins with a serene winter scene
+featuring a red fox perched on a snow-covered tree branch. [...] As the video progresses, there is
+a sudden transition to a completely different scene. The new scene is a watercolor painting of a
+lighthouse situated on a rocky outcrop by the sea."
+
+Tower time (M5 Max, 18 threads; load average 4-15 from other work on the machine; the Metal
+column has the linear layers and attention on the GPU):
+
+| Tower, input | CPU | Metal |
+|---|---|---|
+| Qwen3.5-0.8B, 1024x1024 image (4096 patches) | 1.9 s | 0.46 s |
+| Qwen3.5-9B / Qwen3.8-27B (27 layers, hidden 1152), 1024x1024 image | 6.5 s | 1.6 s |
+| Gemma 4 E2B, 1024x1024 image at 1120 soft tokens (9801 patches) | 12.4 s | 2.3 s |
+| Gemma 4 E2B, 32 video frames of 480x320 (1920 soft tokens) | 8.0 s | 2.5 s |
 
 ## Speech to text (Whisper)
 
@@ -677,7 +742,8 @@ faults on the first pass.
 `oxinfer::engine` is the CLI's text generation as an API: load a directory, GGUF file or repo
 id with `EngineOptions` (every flag above that applies to text, also settable as `key=value`
 pairs), then hold a conversation with streamed output, cancellation from another thread
-(`CancelHandle`), tool calls, attachments and per-turn statistics:
+(`CancelHandle`), tool calls, attachments (`Engine::send_with_media` with images, videos and
+audio clips in an `Attachments`) and per-turn statistics:
 
 ```rust
 use oxinfer::engine::{Engine, EngineOptions, Flow};
@@ -895,8 +961,8 @@ result instead, so later runs (and browsers) load the int8 / int4 blocks as they
 The output is ordinary safetensors: each quantized matrix `X` becomes `X.q8` (I8) + `X.q8s` (F32
 scales) or `X.q4` (U8, two nibbles per byte) + `X.q4s` (F16 scales), in exactly the in-memory
 layout of the kernels, so the loader borrows them without copying (`QBuf`). Only the tensors the
-text model reads are written (no vision/audio towers, no Qwen MTP head); `__metadata__` records the
-precision. Shards are at most 1 GiB (one allocation must stay under 2 GiB in wasm32), and large
+model reads are written: Qwen keeps its MTP head and its vision tower (in bf16), Gemma's vision
+and audio towers are left out; `__metadata__` records the precision. Shards are at most 1 GiB (one allocation must stay under 2 GiB in wasm32), and large
 tensors start on 16 KiB boundaries so Metal wraps them in place. The embedding tables are stored
 quantized too and dequantized one row per token; tables that are only ever looked up (Gemma's
 per-layer embeddings, Qwen 27B's untied input embedding) go to separate `model-tables-*` shards,
@@ -1354,7 +1420,7 @@ weights), and stays off the GPU for the same reasons as on Metal. Weights in mod
 fit in 4 GiB, and no single file can exceed 2 GiB. `web/scripts/test_gemm.mjs` checks the WGSL kernels
 against a JavaScript reference.
 
-Feature flags: `media` (oxideav image/audio decoding), `hf` (HuggingFace fetching), `gpu`
+Feature flags: `media` (oxideav image/audio/video decoding), `hf` (HuggingFace fetching), `gpu`
 (dlsym-loaded backends), all on by default, and `web` (the browser module, off by default and only
 meaningful for `wasm32-unknown-unknown`); `--no-default-features` gives the plain CPU build.
 Cross-compiling needs no C toolchain: the tokenizer uses its pure-Rust regex backend.
@@ -1617,9 +1683,12 @@ billion parameters at LUT4, `infer` only) are the practical range for 12 GB phon
 - `drafter.rs`: the Gemma 4 assistant model (drafter) and its centroid-masked LM head.
 - `qwen_mtp.rs`: the Qwen3.5 MTP layer and the speculative decoder (drafting, verification with
   recorded recurrent states, speculative sampling).
-- `vision.rs`, `audio.rs`: the two encoders plus preprocessing (resize/patching, mel features) and
-  the embedders; `media.rs`: file decoding through oxideav; `mm_config.rs`: tower configs and
-  placeholder token ids.
+- `vision.rs`, `audio.rs`: Gemma 4's two encoders plus preprocessing (resize/patching, mel
+  features) and the embedders; `qwen_vision.rs`: the Qwen3.5-family image / video processors and
+  vision tower; `resample.rs`: torchvision- and Pillow-exact bicubic resizing; `video.rs`: frame
+  sampling and video decoding; `media.rs`: file decoding through oxideav; `mm.rs`: attachments to
+  soft tokens and prompt placeholders; `mm_config.rs`: Gemma's tower configs and placeholder
+  token ids.
 - `pool.rs`: a spin-waiting thread pool with an atomic work counter. Dispatch costs about a microsecond,
   which matters because a decode step issues ~200 small parallel regions.
 - `model.rs`: the Gemma 4 decoder: scaled embeddings, per-layer embeddings (PLE), QK-norm, sliding /
@@ -1638,3 +1707,17 @@ printf '<bos><|turn>user\nWhat is the capital of France?<turn|>\n<|turn>model\n'
 ./target/release/oxinfer --model models/gemma-4-E2B-it --prompt "What is the capital of France?" --dump-logits ours.bin
 ./venv/bin/python tools/ref_logits.py models/gemma-4-E2B-it prompt.txt ours.bin --generate 12
 ```
+
+For images and videos (Qwen3.5-family, and Gemma 4 videos; the reference needs `torchvision`),
+dump oxinfer's side without a system prompt and let `tools/ref_vl.py` run the processor and model:
+
+```sh
+M=~/.cache/oxinfer/hub/Qwen--Qwen3.5-0.8B
+./target/release/oxinfer --model $M --image fox.png -p "Describe this image." --no-system --print-prompt > prompt.txt
+./target/release/oxinfer --model $M --image fox.png -p "Describe this image." --device cpu --dump-mm ours --dump-logits ours.bin
+./venv/bin/python tools/ref_vl.py $M --image fox.png --prompt "Describe this image." \
+    --ours ours --ours-logits ours.bin --ours-prompt prompt.txt --generate 40
+```
+
+Videos are compared as directories of frames (`ffmpeg -i clip.mp4 frames/%05d.png`, then
+`--video frames --frames-fps 24` on both sides), so both read the same pixels.

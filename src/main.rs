@@ -172,8 +172,9 @@ fn usage() -> ! {
          \x20 --dump-mm PREFIX     write multimodal soft tokens / patches as f32 files (for reference checks)\n\
          \x20 --cache-dir DIR      where fetched models are cached\n\
          \x20 --download-only      fetch the model (and drafter) and exit\n\
-         \x20 --save-quantized DIR write a text-only checkpoint with the weights already quantized to\n\
-         \x20                      --quant (loads zero-copy with no quantization pass; for browsers, mmap)\n\
+         \x20 --save-quantized DIR write a checkpoint with the weights already quantized to --quant (loads\n\
+         \x20                      zero-copy with no quantization pass; for browsers, mmap); Qwen keeps\n\
+         \x20                      its vision tower (bf16), Gemma's towers are left out\n\
          \n\
          image generation (a diffusers folder: Stable Diffusion 1.x / 2.x, SD-Turbo):\n\
          \x20 -o, --output FILE     PNG to write (default image.png)\n\
