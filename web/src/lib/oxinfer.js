@@ -791,11 +791,15 @@ export class Oxinfer {
 
   // ---- image generation ----
 
-  /// Loads a diffusers Stable Diffusion folder registered under `dir`.
-  sdLoad(dir) {
+  /// Loads a diffusers Stable Diffusion folder registered under `dir`, merging the LoRA files
+  /// `loras` ([{ path, scale }], paths in the module's filesystem) into its weights.
+  sdLoad(dir, loras = []) {
     const [dp, dn] = this.strArg(dir);
-    const rc = this.ex.web_sd_load(dp, dn, this.gpu ? 1 : 0);
+    const spec = loras.map((l) => `${l.path}:${l.scale ?? 1}`).join('\n');
+    const [lp, ln] = spec ? this.strArg(spec) : [0, 0];
+    const rc = this.ex.web_sd_load(dp, dn, this.gpu ? 1 : 0, lp, ln);
     this.ex.web_free(dp, dn);
+    if (ln) this.ex.web_free(lp, ln);
     if (rc < 0) throw new Error(this.lastError());
   }
 

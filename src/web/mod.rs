@@ -524,16 +524,27 @@ thread_local! {
 
 /// Loads the diffusers pipeline in directory `dir` of the virtual filesystem (its `.safetensors`
 /// files are best registered with `web_put_host_file`: weights are converted on load, so the
-/// files never need to be in module memory). `gpu` non-zero uses the host's WebGPU.
+/// files never need to be in module memory). `gpu` non-zero uses the host's WebGPU. `loras`:
+/// LoRA files to merge, one `PATH[:SCALE]` per line (empty for none).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn web_sd_load(dir: *const u8, dir_len: usize, gpu: u32) -> i32 {
+pub unsafe extern "C" fn web_sd_load(dir: *const u8, dir_len: usize, gpu: u32, loras: *const u8, loras_len: usize) -> i32 {
     install_panic_hook();
     let dir = unsafe { str_arg(dir, dir_len) }.to_string();
+    let loras = if loras_len == 0 { "" } else { unsafe { str_arg(loras, loras_len) } };
+    let loras: Result<Vec<_>> = loras
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| crate::sd::lora::LoraSpec::parse(l.trim()))
+        .collect();
+    let loras = match loras {
+        Ok(l) => l,
+        Err(e) => return set_error(&e),
+    };
     if gpu != 0 {
         webgpu::install();
     }
     let t0 = crate::clock::Instant::now();
-    match crate::sd::Pipeline::load(Path::new(&dir)) {
+    match crate::sd::Pipeline::load_with_loras(Path::new(&dir), &loras, &mut |line| log(&format!("[lora: {line}]"))) {
         Ok(pipe) => {
             log(&format!(
                 "[loaded diffusion pipeline in {:.1}s{}; device {}]",

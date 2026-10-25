@@ -390,6 +390,38 @@ export async function loadDiffusersFromUrl(g, base, progress) {
   }
 }
 
+/// "org/name/file.safetensors" (on Hugging Face) or a URL, with an optional ":SCALE" suffix ->
+/// { url, scale, name }.
+export function loraSource(spec) {
+  let s = spec.trim();
+  let scale = 1;
+  const m = s.match(/^(.*\.safetensors):(-?\d*\.?\d+)$/);
+  if (m) {
+    s = m[1];
+    scale = Number(m[2]);
+  }
+  if (!/\.safetensors$/.test(s)) throw new Error(`${spec}: a LoRA is a .safetensors file (org/name/file.safetensors or a URL)`);
+  const hf = s.match(/^([\w.-]+\/[\w.-]+)\/(.+)$/);
+  const url = /^(https?:|\.?\/)/.test(s) || !hf ? s : `https://huggingface.co/${hf[1]}/resolve/main/${hf[2]}`;
+  return { url, scale, name: s.split('/').pop() };
+}
+
+/// Downloads (or reuses) LoRA files into the module's filesystem as host files; resolves to the
+/// [{ path, scale }] list `sdLoad` takes.
+export async function loadLoras(g, specs, progress) {
+  const out = [];
+  for (const [index, spec] of specs.entries()) {
+    const { url, scale, name } = loraSource(spec);
+    const file = `lora/${index}-${name}`;
+    const { response } = await cachedResponse(url, (got, size) => progress({ file: name, index, count: specs.length, got, size, phase: 'download' }));
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    g.putHostFile(`${ROOT}/${file}`, bytes);
+    progress({ file: name, index, count: specs.length, got: bytes.byteLength, size: bytes.byteLength, phase: 'read' });
+    out.push({ path: `${ROOT}/${file}`, scale });
+  }
+  return out;
+}
+
 /// Reads a diffusers folder picked with <input webkitdirectory>, keeping its subfolders.
 export async function loadDiffusersFromFolder(g, fileList, progress) {
   const files = [...fileList];

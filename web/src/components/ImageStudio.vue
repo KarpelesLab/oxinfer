@@ -1,18 +1,33 @@
 <script setup>
-// Text-to-image with Stable Diffusion (SD-Turbo by default) in the same module as the chat.
+// Text-to-image with Stable Diffusion (SD 1.5 with the LCM-LoRA by default) in the same module as
+// the chat.
 import { computed, nextTick, onMounted, reactive, ref } from 'vue';
 import { Oxinfer, WebGpuHost, hasJspi } from '../lib/oxinfer.js';
-import { cachedBytes, loadDiffusersFromFolder, loadDiffusersFromUrl, sourceBase } from '../lib/loader.js';
+import { cachedBytes, loadDiffusersFromFolder, loadDiffusersFromUrl, loadLoras, sourceBase } from '../lib/loader.js';
 
 const props = defineProps({ device: { type: Object, required: true }, auto: { type: Boolean, default: false }, log: { type: Function, required: true } });
 const emit = defineEmits(['storage']);
 
 const WASM_URL = `${import.meta.env.BASE_URL}oxinfer.wasm`;
-const PRESET = { repo: 'stabilityai/sd-turbo', name: 'SD-Turbo' };
+// Presets carry their own sampling defaults: the LCM-LoRA makes SD 1.5 a 4-step model without
+// guidance (with Euler ancestral: plain Euler leaves speckle noise, since LCM is trained to be
+// re-noised between steps), SD-Turbo is a 1-step one.
+const PRESETS = {
+  sd15: {
+    repo: 'stable-diffusion-v1-5/stable-diffusion-v1-5',
+    name: 'SD 1.5',
+    loras: ['latent-consistency/lcm-lora-sdv1-5/pytorch_lora_weights.safetensors'],
+    steps: 4,
+    guidance: 1,
+    ancestral: true,
+  },
+  turbo: { repo: 'stabilityai/sd-turbo', name: 'SD-Turbo', loras: [], steps: 1, guidance: 0, ancestral: true },
+};
 const params = new URLSearchParams(location.search);
 
-const source = ref(params.get('model') ? 'custom' : 'preset');
+const source = ref(params.get('model') ? 'custom' : PRESETS[params.get('preset')] ? params.get('preset') : 'sd15');
 const custom = ref(params.get('model') || '');
+const customLora = ref(params.get('lora') || '');
 const folderFiles = ref(null);
 const useGpu = ref(params.get('gpu') !== '0');
 const phase = ref('idle'); // idle | loading | preparing | ready | generating
@@ -21,8 +36,9 @@ const progress = reactive({ file: '', index: 0, count: 0, got: 0, size: 0, phase
 const modelName = ref('');
 const prompt = ref(params.get('prompt') || 'a red fox in a snowy forest, golden hour, detailed fur');
 const negative = ref('');
-const steps = ref(1);
-const guidance = ref(0);
+const steps = ref(4);
+const guidance = ref(1);
+const ancestral = ref(true);
 const size = ref(512);
 const seed = ref(Number(params.get('seed') ?? 42));
 const randomSeed = ref(params.get('seed') === null);
@@ -33,7 +49,7 @@ let engine = null;
 let gpuHost = null;
 
 const busy = computed(() => ['loading', 'preparing', 'generating'].includes(phase.value));
-const canLoad = computed(() => !busy.value && (source.value === 'preset' || (source.value === 'custom' && custom.value.trim()) || (source.value === 'folder' && folderFiles.value?.length)));
+const canLoad = computed(() => !busy.value && (PRESETS[source.value] || (source.value === 'custom' && custom.value.trim()) || (source.value === 'folder' && folderFiles.value?.length)));
 const progressLine = computed(() => {
   const p = progress;
   if (!p.count) return 'Finding the model files…';
@@ -62,23 +78,27 @@ async function load() {
     gpuHost = useGpu.value && hasJspi ? await WebGpuHost.create(props.log) : null;
     engine = await Oxinfer.create(WASM_URL, { gpu: gpuHost, log: props.log });
     const onProgress = (p) => Object.assign(progress, p);
+    const preset = PRESETS[source.value];
     if (source.value === 'folder') {
       modelName.value = folderFiles.value[0]?.webkitRelativePath?.split('/')[0] || 'Local model';
       await loadDiffusersFromFolder(engine, folderFiles.value, onProgress);
     } else {
-      const spec = source.value === 'preset' ? PRESET.repo : custom.value;
-      modelName.value = source.value === 'preset' ? PRESET.name : spec.split('/').filter(Boolean).pop();
+      const spec = preset ? preset.repo : custom.value;
+      modelName.value = preset ? preset.name : spec.split('/').filter(Boolean).pop();
       await loadDiffusersFromUrl(engine, sourceBase(spec), onProgress);
     }
+    const loraSpecs = preset ? preset.loras : customLora.value.split(/[\n,]/).map((l) => l.trim()).filter(Boolean);
+    const loras = await loadLoras(engine, loraSpecs, onProgress);
     phase.value = 'preparing';
     await nextTick();
     await pause();
-    engine.sdLoad('/model');
+    engine.sdLoad('/model', loras);
     if (params.get('check') === '1') engine.gpuCheckEnable();
-    const d = engine.sdDefaults();
+    const d = preset || engine.sdDefaults();
     steps.value = Number(params.get('steps') || d.steps);
     guidance.value = Number(params.get('guidance') ?? d.guidance);
-    size.value = d.size;
+    ancestral.value = params.has('sampler') ? params.get('sampler') !== 'euler' : (preset?.ancestral ?? true);
+    size.value = engine.sdDefaults().size;
     phase.value = 'ready';
   } catch (e) {
     error.value = friendly(e);
@@ -107,7 +127,7 @@ async function generate() {
   const t0 = performance.now();
   try {
     const img = await engine.sdGenerate(
-      { prompt: prompt.value, negative: negative.value, steps: steps.value, guidance: guidance.value, seed: seed.value, width: size.value, height: size.value },
+      { prompt: prompt.value, negative: negative.value, steps: steps.value, guidance: guidance.value, seed: seed.value, width: size.value, height: size.value, ancestral: ancestral.value },
       (i, n) => Object.assign(step, { i, n }),
     );
     const secs = (performance.now() - t0) / 1e3;
@@ -159,6 +179,7 @@ onMounted(async () => {
     await load();
     if (engine) {
       for (let i = 0; i < Number(params.get('repeat') || 1); i++) await generate();
+      if (params.get('dump') === '1' && result.value) props.log(`[png ${canvas.value.toDataURL('image/png')}]`);
       props.log(`[image-done ${result.value ? `${result.value.width}x${result.value.height} ${result.value.secs.toFixed(2)}s` : 'none'}]`);
       if (params.get('check') === '1') props.log(`[gpu check: ${engine.gpuCheckSummary()}]`);
     }
@@ -175,10 +196,17 @@ onMounted(async () => {
         <fieldset class="choices" :disabled="busy">
           <legend class="sr-only">Where the model comes from</legend>
           <label class="choice">
-            <input v-model="source" type="radio" value="preset" />
+            <input v-model="source" type="radio" value="sd15" />
+            <span>
+              <strong>SD 1.5</strong>
+              <small>2.1 GB from Hugging Face, with the LCM-LoRA so a 512×512 image takes 4 steps. The lighter model.</small>
+            </span>
+          </label>
+          <label class="choice">
+            <input v-model="source" type="radio" value="turbo" />
             <span>
               <strong>SD-Turbo</strong>
-              <small>2.6 GB from Hugging Face. Makes a 512×512 image in one step; practical with WebGPU.</small>
+              <small>2.6 GB from Hugging Face. Makes a 512×512 image in one step.</small>
             </span>
           </label>
           <label class="choice">
@@ -188,7 +216,10 @@ onMounted(async () => {
               <small>A diffusers repo id or folder URL (SD 1.x or 2.x).</small>
             </span>
           </label>
-          <input v-if="source === 'custom'" v-model="custom" class="field" type="text" placeholder="org/name, https://… or ./folder" aria-label="Diffusers repo id or folder URL" spellcheck="false" />
+          <template v-if="source === 'custom'">
+            <input v-model="custom" class="field" type="text" placeholder="org/name, https://… or ./folder" aria-label="Diffusers repo id or folder URL" spellcheck="false" />
+            <input v-model="customLora" class="field" type="text" placeholder="LoRA (optional): org/name/file.safetensors:0.8" aria-label="LoRA files, comma separated, each with an optional :scale" spellcheck="false" />
+          </template>
           <label class="choice">
             <input v-model="source" type="radio" value="folder" />
             <span>
@@ -214,6 +245,12 @@ onMounted(async () => {
         <h2 id="img-set-h">Settings</h2>
         <label class="inline">Steps <input v-model.number="steps" class="num" type="number" min="1" max="100" /></label>
         <label class="inline">Guidance <input v-model.number="guidance" class="num" type="number" min="0" max="20" step="0.5" /></label>
+        <label class="inline">Sampler
+          <select v-model="ancestral">
+            <option :value="false">Euler</option>
+            <option :value="true">Euler ancestral</option>
+          </select>
+        </label>
         <label class="inline">Size
           <select v-model.number="size">
             <option :value="256">256 × 256</option>

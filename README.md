@@ -226,7 +226,7 @@ holds one safetensors file), fetched into the cache like models; or download it 
 curl -L -o lcm-lora.safetensors \
     https://huggingface.co/latent-consistency/lcm-lora-sdv1-5/resolve/main/pytorch_lora_weights.safetensors
 ./target/release/oxinfer --model models/sd-v1-5 --lora lcm-lora.safetensors \
-    --steps 4 --guidance 1 --sampler euler -p "a red fox in the snow" -o fox.png
+    --steps 4 --guidance 1 -p "a red fox in the snow" -o fox.png  # Euler ancestral (default)
 ./target/release/oxinfer --model models/sd-v1-5 --lora KoRo8888/ufotable_artstyle_locon_v1:0.8 \
     -p "a girl standing in a forest, anime screencap" -o forest.png
 ```
@@ -237,7 +237,8 @@ steps, 79.6 dB; the ufotable LoCon (kohya, 278 UNet + 72 text-encoder modules) a
 at guidance 7.5, 78.4 dB, and the same file re-saved by diffusers in the PEFT layout gives the
 identical image; both together (LCM 1.0 + ufotable 0.6), 82.3 dB. Scale 0 reproduces the base
 model bit for bit. In the library, `sd::Pipeline::load_with_loras(dir, &[LoraSpec { path, scale }],
-report)` does the same (`examples/sd_lora.rs`); the browser build loads no LoRA yet.
+report)` does the same (`examples/sd_lora.rs`); in the browser build, `web_sd_load` takes the
+LoRA files (`sdLoad(dir, [{ path, scale }])` in `oxinfer.js`).
 
 ## Image and audio input
 
@@ -889,8 +890,13 @@ always read into memory.
 
 ### Browser (WebGPU)
 
-The site has a Chat mode and an Image mode; Image mode loads SD-Turbo (2.6 GB of fp16 weights)
-from Hugging Face by default. Diffusion weights stay in JavaScript memory and the module converts
+The site has a Chat mode and an Image mode. Image mode loads SD 1.5 with the LCM-LoRA by default
+(2.1 GB of fp16 weights plus 135 MB from Hugging Face; 4 Euler ancestral steps without guidance,
+about 8 s per 512x512 image in Chrome on the M5 Max with the machine busy, 63 dB from the native
+Metal image); SD-Turbo (2.6 GB, one step) is the other preset, and a custom model can take LoRA
+files too (`?lora=org/name/file.safetensors:0.8`, comma separated). With the LCM-LoRA, plain Euler
+leaves speckle noise in the image: LCM is trained to be re-noised between steps, as the ancestral
+sampler does. Diffusion weights stay in JavaScript memory and the module converts
 them tensor by tensor, so only the bf16 copy counts against the 4 GiB of wasm memory.
 
 The `web` feature (`src/web/`) turns the library into a plain C-ABI wasm module, no bindgen;
