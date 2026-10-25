@@ -62,8 +62,10 @@ a sigmoid gate. Experts load from the fused `experts.gate_up_proj` / `down_proj`
 per-expert `experts.N.*_proj` weights (as transformers saves them), and quantize like any other
 matrix (`--save-quantized` included). Decode batches the 8 chosen experts' input projections into
 one matmul. Prefill gathers each expert's tokens and runs every expert as one grouped matmul on
-the CPU. With `--quant q4` (about 19 GB) on an M5 Max, that is about 220 tok/s of prefill and 65
-tok/s of decode. On randomly initialised weights at the real width (2048 hidden, 256 experts, 2
+the CPU, or on M5 / A19 as one GPU submission per layer on the matrix units. With `--quant q4`
+(about 19 GB) on an M5 Max, that is about 220 tok/s of prefill with the experts on the CPU,
+2.1-2.3x that with the matrix units (see [Performance](#performance)), and 65 tok/s of decode.
+On randomly initialised weights at the real width (2048 hidden, 256 experts, 2
 layers, the real vocabulary), oxinfer matches transformers in float32 to a max logit difference of
 7e-5, with the same 20 greedy tokens. On Zawen-v0.1-35B-A3B's real weights, cut to its first 4
 layers, the float32 match is 3e-5. The full 40 layers against transformers in bf16 give a mean
@@ -444,6 +446,29 @@ With the Metal backend (default on Apple Silicon) prefill runs on the GPU:
 
 (616-token prompt; decode speed is unchanged, see below for why.)
 
+On GPUs whose cores have matrix units ("neural accelerators": M5, A19) the prefill GEMMs and the
+MoE expert layers run on them (Metal 4 tensor operations, see
+[Platforms](#platforms-and-accelerators)). Measured on an M5 Max with a ~3k-token prompt (default
+1024-token chunks; best of two interleaved runs on a shared machine), against the f32 GEMM of the
+same build (`OXINFER_METAL_MMA=0`):
+
+| Model | Precision | Metal, f32 GEMM | Metal, matrix units |
+|---|---|---|---|
+| E2B-it | bf16 | 631 tok/s | 724 tok/s |
+| E4B-it | Q4 (`--save-quantized`) | 420 tok/s | 520 tok/s |
+| Qwen3.8-27B | Q4 (`--save-quantized`) | 109 tok/s | 165 tok/s |
+| Qwen3.8-27B (HauhauCS GGUF) | Q4_K_P | 93 tok/s | 158 tok/s |
+| Zawen-v0.1-35B-A3B (MoE) | `--quant q4 --mmap` | 165 tok/s | 353 tok/s |
+| Zawen-v0.1-35B-A3B (MoE) | `--quant q8 --mmap` | 161 tok/s | 255 tok/s |
+| Zawen-v0.1-35B-A3B (MoE) | Q4 (`--save-quantized`) | 168 tok/s | 379 tok/s |
+
+The GEMMs themselves run 3-4x faster (table under Platforms); what is left of prefill time is
+mostly the CPU part of the layers (Gated DeltaNet recurrence, attention, routing). Against the CPU
+path the next-token distributions differ by a KL divergence of 1e-7 to 2e-5 nats on the dense
+models and 1e-4 to 1e-3 on Zawen (whose top-8 routing amplifies small differences), with the same
+top 10 tokens in every case; a 128-token greedy generation of the 27B GGUF with every pass on the
+matrix units matched the CPU's token for token.
+
 The matmul kernels reach the machine's bandwidth ceiling with 12 threads
 (`cargo run --release --bin membench` prints the raw numbers for your machine), so decode
 speed is set by bytes per token: Q8 cuts them by 1.8x and Q4 by 3.5x. Prefill is compute-bound
@@ -676,7 +701,7 @@ GPU (metal #0): Apple M5 Max, memory 115.4 GB (unified with CPU)
 
 | Platform | Compute | Status |
 |---|---|---|
-| Apple Silicon (macOS, iOS) | NEON kernels + Metal GEMM for prefill | measured, bit-identical logits to the CPU path; iOS: runs in the Simulator (CPU and Metal; `ios/`) |
+| Apple Silicon (macOS, iOS) | NEON kernels + Metal GEMM for prefill; on M5 / A19 the GPU matrix units (prefill GEMMs and MoE experts) | measured; the f32 GEMM gives bit-identical logits to the CPU path, the matrix units (default where present) ~3e-4 relative per product (`OXINFER_METAL_MMA=0` for bit-identical); iOS: runs in the Simulator (CPU and Metal; `ios/`) |
 | Apple Neural Engine (macOS 15 / iOS 18) | Core ML, for ANEMLL-converted models | measured on macOS; builds for iOS; see [Core ML](#core-ml--apple-neural-engine) |
 | x86-64 (Linux, Windows, macOS) | AVX2 + FMA kernels (bf16, Q8 via `maddubs`, Q4), scalar fallback below AVX2 | compiles for all three; the kernel tests pass on the scalar fallback under Rosetta (which exposes no AVX), so the AVX2 kernels themselves are not yet executed anywhere |
 | Linux / Windows + NVIDIA | CUDA driver API + NVRTC-compiled GEMM (`cuda.rs`) | compile-checked only, not yet run on NVIDIA hardware |
@@ -690,10 +715,40 @@ tokens and enough FLOPs to amortize the ~0.15 ms it costs to submit and wait for
 buffer). Weights are not copied on Apple Silicon: quantized matrices and the safetensors blob
 live in page-aligned memory and are wrapped as shared `MTLBuffer`s. The Metal GEMM (64x64 tile per
 threadgroup, `simdgroup_float8x8`, weights dequantized to f32 in threadgroup memory) runs at
-~10 TFLOP/s for bf16 and ~7.5 for Q4, against ~1.3 TFLOP/s for the NEON GEMM. Decode stays on
-the CPU on purpose: it is bandwidth-bound, the CPU already streams weights at ~280 GB/s, and the
-GPU's ~450 GB/s only pays off if the entire forward pass moves over (attention, norms, the KV
-cache), which is the next step if decode speed on the GPU is wanted.
+~10 TFLOP/s for bf16 and ~7.5 for Q4, against ~1.3 TFLOP/s for the NEON GEMM.
+
+On M5 / A19 (Apple10-family GPUs, whose cores have matrix units) the GEMMs run on those instead,
+through Metal 4 tensor operations (`matmul2d` from MetalPerformancePrimitives, compiled at run
+time with the rest of the shaders; nothing is needed at build time). Input rows are converted to
+half with a power-of-two scale per row (no overflow, no subnormals), quantized weights are
+dequantized per 64-wide K step into threadgroup memory as half, bf16 weights are read as bfloat
+straight from device memory, and accumulation is f32: every format with a GEMM (bf16, Q8, Q4,
+the GGUF types) has a matrix-unit version. Kernel throughput at 2048 tokens is ~60 TFLOP/s for
+bf16 and ~50 for Q4 (against ~11 for the f32 GEMM); per call, copies and submission included
+(`membench gpu`, 17408 x 5120):
+
+| Tokens | bf16 f32 GEMM / matrix units | Q4 | Q4_K | Q8_0 |
+|---|---|---|---|---|
+| 256 | 9.7 / 10.5 TFLOP/s | 11.0 / 19.8 | 10.7 / 18.1 | 10.9 / 18.0 |
+| 512 | 11.7 / 24.4 | 11.6 / 28.9 | 11.5 / 28.2 | 11.5 / 28.3 |
+| 1024 | 12.0 / 41.4 | 11.6 / 42.1 | 11.7 / 38.7 | 11.7 / 37.1 |
+| 2048 | 12.2 / 43.8 | 11.8 / 42.6 | 11.5 / 39.6 | 12.1 / 40.6 |
+
+The products are accurate to ~3e-4 relative (half operands) instead of bit-identical to the CPU;
+`OXINFER_METAL_MMA=0` keeps the f32 GEMM. MoE layers (Qwen3.5/3.6-35B-A3B) run their routed
+experts in one submission per layer: the tokens are gathered into one segment per expert, a
+grouped GEMM walks per-expert tiles for the gate/up projection, then SiLU, the grouped down
+projection and the weighted combination, all on the GPU (the expert weights are kept resident
+with an `MTLResidencySet`; making them resident per submission cost more than the GEMMs).
+
+Decode stays on the CPU on purpose: it is bandwidth-bound, the CPU already streams weights at
+~280 GB/s, and the GPU's ~450 GB/s only pays off if the entire forward pass moves over
+(attention, norms, the KV cache). Measured on the 27B GGUF with every pass on the GPU
+(`OXINFER_METAL_MIN_T=1`, matrix units): a pass costs ~257 submissions with CPU work in between
+(~50 ms of submit-and-wait alone) plus 110-150 ms of dequantization-bound GEMMs for 2-16 tokens,
+so plain decode drops from 10.7 to 5.5 tok/s, and `--mtp` verification passes (~4 tokens) take
+the same ~208 ms as on the CPU (14.1 vs 14.2 tok/s). The GPU only wins clearly for 8-16-token
+passes, where the CPU leaves its batch-invariant decode kernels (~0.6-1.4 s vs ~0.2-0.3 s).
 
 ### WebAssembly
 
