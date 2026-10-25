@@ -475,6 +475,10 @@ pub struct Meta {
     pub recurrent_state: bool,
     /// `prefill` only takes full batches of real tokens (no padding).
     pub prefill_full_batches_only: bool,
+    /// Gemma 4 long contexts: the sliding-window layers keep a shifting cache of this many
+    /// positions, which every call advances by its batch, so (as for `recurrent_state`) every
+    /// token is fed exactly once, in order, and never padded.
+    pub local_cache_length: Option<usize>,
     pub split_rotate: bool,
     /// Resolved model paths (empty for the parts a layout does not have).
     pub embeddings: PathBuf,
@@ -558,6 +562,12 @@ fn all_chunks(first: &Path) -> Result<Vec<PathBuf>> {
 }
 
 impl Meta {
+    /// States that only move forward: a recurrent state or a shifting local cache. Every token
+    /// is then fed exactly once, in order, with no padded batches.
+    pub fn no_rewind(&self) -> bool {
+        self.recurrent_state || self.local_cache_length.is_some()
+    }
+
     pub fn load(dir: &Path) -> Result<Meta> {
         let path = dir.join("meta.yaml");
         let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
@@ -679,6 +689,7 @@ impl Meta {
             prefill_last_token_output: p("prefill_last_token_output").and_then(yaml::Value::as_bool).unwrap_or(false),
             recurrent_state: p("recurrent_state").and_then(yaml::Value::as_bool).unwrap_or(false),
             prefill_full_batches_only: p("prefill_full_batches_only").and_then(yaml::Value::as_bool).unwrap_or(false),
+            local_cache_length: p("local_cache_length").and_then(yaml::Value::as_usize),
             split_rotate,
             embeddings,
             lm_head,
@@ -787,7 +798,7 @@ pub enum PrefillMode {
     /// else `Single` (as ANEMLL's `chat.py`: the batch prefill of older conversions can be
     /// wrong, e.g. `anemll-google-gemma-3-270m-it-ctx512-monolithic_0.3.5` produces garbage).
     /// `Padded` for packages of oxinfer's converter (`prefill_last_token_output`) without
-    /// recurrent state.
+    /// recurrent state or shifting local cache.
     Auto,
     /// Full batches through the `prefill` functions, the rest token by token.
     Batched,
@@ -795,7 +806,8 @@ pub enum PrefillMode {
     /// instead of up to `batch_size - 1`, much faster for short prompts, but the KV entries of
     /// those tokens differ from ANEMLL's runtimes in fp16 rounding (the Swift CLI does the same
     /// for `update_mask` models). Same as `Batched` for recurrent models (`recurrent_state`,
-    /// `prefill_full_batches_only`), whose state would absorb the padding.
+    /// `prefill_full_batches_only`), whose state would absorb the padding, and for shifting local
+    /// caches (`local_cache_length`), whose window it would advance.
     Padded,
     /// Every token through `infer`. Slow (decode speed).
     Single,
@@ -922,7 +934,7 @@ pub struct AnemllModel {
     /// Whether the rotate functions are used from `sliding_window` on.
     rotation: bool,
     /// Every prompt token is fed exactly once (no re-run of the last one): packages with
-    /// `prefill_last_token_output` or `recurrent_state`.
+    /// `prefill_last_token_output`, `recurrent_state` or `local_cache_length`.
     exact: bool,
     /// The plan whose head outputs hold the latest prediction.
     head_plan: PlanKind,
@@ -1005,7 +1017,7 @@ impl AnemllModel {
         }
         // Rotation needs both rotate functions in every chunk.
         let rotation = want_rotation && chunks.iter().all(|c| c.infer_rotate.is_some() && c.prefill_rotate.is_some());
-        let exact = meta.prefill_last_token_output || meta.recurrent_state;
+        let exact = meta.prefill_last_token_output || meta.no_rewind();
         if meta.recurrent_state && rotation {
             bail!(
                 "{}: recurrent states cannot be combined with sliding-window rotation",
@@ -1014,7 +1026,7 @@ impl AnemllModel {
         }
         let mut options = options;
         if options.prefill == PrefillMode::Auto {
-            let no_pad = meta.recurrent_state || meta.prefill_full_batches_only;
+            let no_pad = meta.no_rewind() || meta.prefill_full_batches_only;
             options.prefill = if meta.prefill_last_token_output && meta.prefill_dynamic_slice && !no_pad {
                 // oxinfer's converter: padding the last partial batch gives the same logits as
                 // feeding those tokens through `infer` (verified bit-identical on Qwen3 and
@@ -1351,7 +1363,7 @@ impl AnemllModel {
             }
             // A padded batch for all but the last token, unless padding would enter a state that
             // cannot be rewound.
-            let no_pad = self.meta.recurrent_state || self.meta.prefill_full_batches_only;
+            let no_pad = self.meta.no_rewind() || self.meta.prefill_full_batches_only;
             if self.options.prefill == PrefillMode::Padded && !no_pad && p + 1 < end && p + b <= self.meta.context_length {
                 let mut ids = tok(p)[..end - 1 - p].to_vec();
                 let valid = ids.len();

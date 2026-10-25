@@ -115,7 +115,7 @@ pub(super) fn load(dir: &Path, opts: &EngineOptions) -> Result<Loaded> {
     let model = AnemllModel::load(dir, Options { units: cu, prefill })?;
     let resolved = match model.options.prefill {
         PrefillMode::Batched => CoreMlPrefill::Batch,
-        PrefillMode::Padded if !(meta.recurrent_state || meta.prefill_full_batches_only) => CoreMlPrefill::Pad,
+        PrefillMode::Padded if !(meta.no_rewind() || meta.prefill_full_batches_only) => CoreMlPrefill::Pad,
         PrefillMode::Padded => CoreMlPrefill::Batch,
         PrefillMode::Single => CoreMlPrefill::Single,
         PrefillMode::Auto => CoreMlPrefill::Auto,
