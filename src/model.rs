@@ -380,6 +380,8 @@ pub struct Lin<'a> {
     dev: std::sync::OnceLock<Option<crate::gpu::DeviceWeight>>,
     /// Device state is created per call and dropped right after (see `set_transient_device`).
     transient: std::sync::atomic::AtomicBool,
+    /// A runtime LoRA update added to the output while its adapter is switched on.
+    lora: Option<Box<crate::lora::LoraDelta>>,
 }
 
 pub enum Weight<'a> {
@@ -398,6 +400,7 @@ impl<'a> Lin<'a> {
             w: Weight::Bf16(unsafe { crate::quant::QBuf::borrowed(w) }, std::marker::PhantomData),
             dev: std::sync::OnceLock::new(),
             transient: std::sync::atomic::AtomicBool::new(false),
+            lora: None,
         }
     }
     /// bf16 weights converted or reordered at load time (e.g. from fp16 checkpoints).
@@ -406,6 +409,7 @@ impl<'a> Lin<'a> {
             w: Weight::Bf16(w.into(), std::marker::PhantomData),
             dev: std::sync::OnceLock::new(),
             transient: std::sync::atomic::AtomicBool::new(false),
+            lora: None,
         }
     }
     pub fn q8(m: QMatrix) -> Self {
@@ -413,6 +417,7 @@ impl<'a> Lin<'a> {
             w: Weight::Q8(m),
             dev: std::sync::OnceLock::new(),
             transient: std::sync::atomic::AtomicBool::new(false),
+            lora: None,
         }
     }
     pub fn q4(m: Q4Matrix) -> Self {
@@ -420,6 +425,7 @@ impl<'a> Lin<'a> {
             w: Weight::Q4(m),
             dev: std::sync::OnceLock::new(),
             transient: std::sync::atomic::AtomicBool::new(false),
+            lora: None,
         }
     }
     /// A GGUF weight (`GgufMatrix::borrowed` keeps it zero-copy over a mapped file).
@@ -428,6 +434,7 @@ impl<'a> Lin<'a> {
             w: Weight::Gguf(m),
             dev: std::sync::OnceLock::new(),
             transient: std::sync::atomic::AtomicBool::new(false),
+            lora: None,
         }
     }
     /// A GGUF tensor's raw bytes (`n_out` rows of `n_in` elements of `kind`), borrowed for 'a.
@@ -491,13 +498,35 @@ impl<'a> Lin<'a> {
     pub(crate) fn is_transient(&self) -> bool {
         self.transient.load(std::sync::atomic::Ordering::Relaxed)
     }
+    /// Attaches (or with None removes) a runtime LoRA update (see `crate::lora`).
+    pub fn set_lora(&mut self, d: Option<Box<crate::lora::LoraDelta>>) {
+        self.lora = d;
+    }
+    pub fn has_lora(&self) -> bool {
+        self.lora.is_some()
+    }
+    /// The LoRA update when its adapter is switched on.
+    #[inline]
+    fn active_lora(&self) -> Option<&crate::lora::LoraDelta> {
+        self.lora.as_deref().filter(|d| d.is_active())
+    }
 }
 
-/// Fused matmuls over one shared input (any mix of storage formats).
+/// Fused matmuls over one shared input (any mix of storage formats), plus the update of any
+/// active runtime LoRA (on the CPU, after the base matmul).
 pub(crate) fn linear_multi(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, x: &[f32], t: usize) {
     if jobs.is_empty() {
         return;
     }
+    linear_multi_base(jobs, n_in, x, t);
+    for (l, _, y) in jobs.iter_mut() {
+        if let Some(d) = l.active_lora() {
+            d.apply(x, t, y);
+        }
+    }
+}
+
+fn linear_multi_base(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, x: &[f32], t: usize) {
     // Accelerator first (one submission for the whole batch); whatever it declines runs on the CPU.
     let mut rest: Vec<(&Lin, usize, &mut [f32])> = Vec::with_capacity(jobs.len());
     let be = crate::gpu::active();
@@ -926,6 +955,35 @@ impl<'a> Model<'a> {
             inv_freq_sliding,
             inv_freq_full,
         })
+    }
+
+    /// Attaches the modules of a runtime LoRA adapter (see `crate::lora`) to the attention and
+    /// MLP projections and the LM head, by Hugging Face module name. Returns the number patched.
+    pub fn attach_lora(&mut self, ad: &mut crate::lora::LoraAdapter) -> Result<usize> {
+        let (h, nh) = (self.cfg.hidden_size, self.cfg.num_attention_heads);
+        let mut set = |lin: &mut Lin<'a>, name: String, n_out: usize, n_in: usize| -> Result<()> {
+            if let Some(d) = ad.take(&name, n_out, n_in, None, None)? {
+                lin.set_lora(Some(d));
+            }
+            Ok(())
+        };
+        for (l, layer) in self.layers.iter_mut().enumerate() {
+            let p = format!("layers.{l}.");
+            let (hd, kv, inter) = (layer.hd, layer.n_kv * layer.hd, layer.inter);
+            set(&mut layer.q, format!("{p}self_attn.q_proj"), nh * hd, h)?;
+            if let Some(k) = &mut layer.k {
+                set(k, format!("{p}self_attn.k_proj"), kv, h)?;
+            }
+            if let Some(v) = &mut layer.v {
+                set(v, format!("{p}self_attn.v_proj"), kv, h)?;
+            }
+            set(&mut layer.o, format!("{p}self_attn.o_proj"), h, nh * hd)?;
+            set(&mut layer.gate, format!("{p}mlp.gate_proj"), inter, h)?;
+            set(&mut layer.up, format!("{p}mlp.up_proj"), inter, h)?;
+            set(&mut layer.down, format!("{p}mlp.down_proj"), h, inter)?;
+        }
+        set(&mut self.head, "lm_head".into(), self.cfg.vocab_size, h)?;
+        ad.finish()
     }
 
     /// Bytes of linear weights streamed per decoded token.

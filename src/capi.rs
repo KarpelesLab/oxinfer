@@ -321,6 +321,7 @@ pub unsafe extern "C" fn oxi_engine_info_json(e: *mut OxiEngine) -> *mut c_char 
                 "chunks": c.chunks,
                 "recurrent": c.recurrent,
             })),
+            "decision": g.decision_assets().map(|d| d.info_json()),
         });
         Ok(out_string(v.to_string()))
     })
@@ -353,4 +354,27 @@ pub unsafe extern "C" fn oxi_engine_stats_json(e: *mut OxiEngine) -> *mut c_char
 #[unsafe(no_mangle)]
 pub extern "C" fn oxi_devices() -> *mut c_char {
     guard(std::ptr::null_mut(), || Ok(out_string(crate::platform::detect().report())))
+}
+
+/// A typed decision (Jev models, see `oxinfer.h`): a `/v1/decide` JSON request in, the JSON
+/// response out.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_decide(e: *mut OxiEngine, request_json: *const c_char) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let e = unsafe { engine(e) }?;
+        let req = unsafe { str_arg(request_json, "request_json") }?;
+        let req: serde_json::Value = serde_json::from_str(req).context("request_json is not JSON")?;
+        let out = lock(e).decide_json(&req)?;
+        Ok(out_string(out.to_string()))
+    })
+}
+
+/// The decision assets as JSON (`/v1/decide/info`), or NULL with an error when none are loaded.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_decide_info_json(e: *mut OxiEngine) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let g = lock(unsafe { engine(e) }?);
+        let d = g.decision_assets().context("no decision assets loaded")?;
+        Ok(out_string(d.info_json().to_string()))
+    })
 }

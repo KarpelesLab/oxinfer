@@ -18,6 +18,7 @@ pub mod config;
 pub mod coreml;
 #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
 pub mod cuda;
+pub mod decide;
 pub mod drafter;
 pub mod embed;
 pub mod engine;
@@ -29,6 +30,7 @@ pub mod gpu;
 #[cfg(feature = "hf")]
 pub mod hf;
 pub mod kernels;
+pub mod lora;
 #[cfg(feature = "media")]
 pub mod media;
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]

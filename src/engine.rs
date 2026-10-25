@@ -47,6 +47,7 @@
 
 use crate::chat::{self, ChatFormat};
 use crate::clock::Instant;
+use crate::decide::{BaseCheck, Decision, DecisionAssets, DecisionRequest, DecisionStats};
 use crate::drafter::Drafter;
 use crate::generate::{self, Decoded, Flow as GFlow, TextStream};
 use crate::model::{Model, Quant, Session};
@@ -132,6 +133,12 @@ pub struct EngineOptions {
     /// MoE experts on the GPU during prefill. Process-wide, applied on load; None leaves the
     /// current setting ([`crate::gpu::set_moe_offload`]). Key `gpu_moe`.
     pub gpu_moe: Option<bool>,
+    /// Typed decisions ([`Engine::decide`]) with the decision assets of this Jev bundle (path or
+    /// repo id) on top of the loaded base model: only the small files are fetched (adapter, head,
+    /// configs; see [`crate::decide::ASSET_FILES`]), not the backbone, and the base must match
+    /// (hidden size, layers, vocabulary, verbalizer tokens). Without it, assets found in the model
+    /// directory itself are used. Key `decision_from`.
+    pub decision_from: Option<String>,
 }
 
 /// Where Core ML runs a model ([`EngineOptions::coreml_units`]; Core ML's `MLComputeUnits`).
@@ -246,6 +253,7 @@ impl Default for EngineOptions {
             coreml_prefill: CoreMlPrefill::Auto,
             gpu_exact: None,
             gpu_moe: None,
+            decision_from: None,
         }
     }
 }
@@ -296,6 +304,7 @@ impl EngineOptions {
         "coreml_prefill",
         "gpu_exact",
         "gpu_moe",
+        "decision_from",
     ];
 
     /// Sets an option by name (see the field docs for the keys). Unknown keys are errors.
@@ -363,6 +372,7 @@ impl EngineOptions {
             }
             "gpu_exact" => self.gpu_exact = Some(parse_bool(key, value)?),
             "gpu_moe" => self.gpu_moe = Some(parse_bool(key, value)?),
+            "decision_from" => self.decision_from = opt_str(value),
             _ => bail!("unknown option {key:?} (known: {})", Self::KEYS.join(", ")),
         }
         Ok(())
@@ -654,6 +664,8 @@ pub struct Engine {
     stats: Stats,
     /// The weight streamer (`EngineOptions::stream`), stopped on drop before the files go.
     streamer: Option<Arc<crate::stream::Streamer>>,
+    /// Decision assets ([`Engine::decide`]).
+    decision: Option<Box<DecisionAssets>>,
     /// Must stay last: the model, sessions and references above point into it.
     _arena: Arena,
 }
@@ -684,8 +696,15 @@ impl Engine {
             .map(|s| resolve_model(s, opts.cache_dir.as_deref()))
             .transpose()?;
         if is_coreml_dir(&dir) {
+            if opts.decision_from.is_some() {
+                bail!("decisions (decision_from) are not supported for Core ML models");
+            }
             return Self::load_coreml(dir, opts, t0);
         }
+        let decision_dir = match &opts.decision_from {
+            Some(s) => Some(resolve_decision(s, opts.cache_dir.as_deref())?),
+            None => crate::decide::has_assets(&dir).then(|| dir.clone()),
+        };
         if opts.threads.is_some() || opts.qos != pool::Qos::UserInteractive || opts.efficiency_threads > 0 {
             pool::configure_with(pool::PoolOptions {
                 threads: opts.threads.unwrap_or_else(|| pool::options().threads),
@@ -727,13 +746,22 @@ impl Engine {
 
         let mut arena = Arena(Vec::new());
         let mut streamer = None;
+        let decision;
         // Streaming reads the weights in place: always mapped.
         let files = arena.keep(ModelFiles::open(&dir, !(opts.mmap || opts.stream.is_some()))?);
         let tok = load_tokenizer(&dir)?;
         let eos = config::load_eos_ids(&dir);
         let (lm, fmt, quant, layers, hidden, vocab, streamed): (Lm, &'static (dyn ChatFormat + Sync), _, _, _, _, _) = match family {
             Family::Gemma4 | Family::Gemma3 => {
-                let model = arena.keep(Model::load(config::TextConfig::load(&dir)?, files, opts.quant)?);
+                let mut model = Model::load(config::TextConfig::load(&dir)?, files, opts.quant)?;
+                let c = &model.cfg;
+                let base = BaseCheck {
+                    hidden_size: c.hidden_size,
+                    layers: c.num_hidden_layers,
+                    vocab_size: c.vocab_size,
+                };
+                decision = load_decision(decision_dir.as_deref(), &tok, &base, true, |ad| model.attach_lora(ad))?;
+                let model = arena.keep(model);
                 let drafter = match &draft_dir {
                     Some(d) => {
                         let df = arena.keep(ModelFiles::open(d, true)?);
@@ -768,6 +796,13 @@ impl Engine {
             Family::Llama => bail!("Llama checkpoints run as Core ML models only"),
             Family::Qwen => {
                 let mut model = QwenModel::load(config::QwenConfig::load(&dir)?, files, opts.quant)?;
+                let c = &model.cfg;
+                let base = BaseCheck {
+                    hidden_size: c.hidden_size,
+                    layers: c.num_hidden_layers,
+                    vocab_size: c.vocab_size,
+                };
+                decision = load_decision(decision_dir.as_deref(), &tok, &base, false, |ad| model.attach_lora(ad))?;
                 let fmt: &'static (dyn ChatFormat + Sync) = chat::QwenChat::for_model(&dir);
                 let side = match (&side_dir, mtp) {
                     (Some(d), true) => Some(arena.keep(ModelFiles::open(d, false)?)),
@@ -879,6 +914,7 @@ impl Engine {
             cancel: Arc::new(AtomicBool::new(false)),
             stats: Stats::default(),
             streamer,
+            decision,
             _arena: arena,
         })
     }
@@ -928,6 +964,7 @@ impl Engine {
             cancel: Arc::new(AtomicBool::new(false)),
             stats: Stats::default(),
             streamer: None,
+            decision: None,
             _arena: arena,
         })
     }
@@ -1080,6 +1117,73 @@ impl Engine {
             prompt.to_string()
         };
         self.turn(&text, &[], false)?.finish(self, on_delta)
+    }
+
+    /// The decision assets, when loaded (a Jev bundle, or [`EngineOptions::decision_from`]).
+    pub fn decision_assets(&self) -> Option<&DecisionAssets> {
+        self.decision.as_deref()
+    }
+
+    /// Answers a typed question with one probability per option (see [`crate::decide`]): one
+    /// prefill pass over the decision prompt in a scratch context, with the bundle's LoRA adapter
+    /// switched on for that pass only. The conversation is left as it was (its cache is not
+    /// touched), so decisions can be interleaved with chat turns.
+    pub fn decide(&mut self, req: &DecisionRequest) -> Result<Decision> {
+        let t0 = Instant::now();
+        let d = self
+            .decision
+            .as_deref()
+            .context("no decision assets loaded: load a Jev model directory, or set EngineOptions::decision_from")?;
+        let plan = d.plan(req)?;
+        let ids = self
+            .tok
+            .encode(plan.prompt.as_str(), false)
+            .map_err(|e| anyhow!("encode: {e}"))?
+            .get_ids()
+            .to_vec();
+        if let Some(max) = self.max_context
+            && ids.len() > max
+        {
+            bail!("decision prompt of {} tokens exceeds max_context {max}", ids.len());
+        }
+        let need_logits = d.needs_logits(&plan);
+        let chunk = self.prefill_chunk;
+        let t1 = Instant::now();
+        let (hidden, logits) = {
+            let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+            let _on = d.switch.as_ref().map(crate::lora::Active::new);
+            fn run<M: generate::TextLm + ?Sized>(m: &M, ids: &[u32], chunk: usize, need_logits: bool) -> (Vec<f32>, Option<Vec<f32>>) {
+                let mut sess = m.new_session();
+                let hs = generate::prefill(m, &mut sess, ids, chunk, &[]);
+                let h = m.hidden_size();
+                let last = hs[hs.len() - h..].to_vec();
+                let logits = need_logits.then(|| m.logits(&last, 1));
+                (last, logits)
+            }
+            match &self.lm {
+                Lm::Gemma { model, .. } => run(*model, &ids, chunk, need_logits),
+                Lm::Qwen { model, .. } => run(*model, &ids, chunk, need_logits),
+                Lm::QwenMtp { dec } => run(dec.model(), &ids, chunk, need_logits),
+                #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+                Lm::CoreMl(_) => bail!("decisions are not supported for Core ML models"),
+            }
+        };
+        let prefill_secs = t1.elapsed().as_secs_f64();
+        let probs = d.read(&plan, &hidden, logits.as_deref())?;
+        let stats = DecisionStats {
+            prompt_tokens: ids.len(),
+            prefill_secs,
+            total_secs: t0.elapsed().as_secs_f64(),
+        };
+        Ok(d.decision(plan, probs, stats))
+    }
+
+    /// [`Engine::decide`] with a `/v1/decide` JSON request; returns the JSON response.
+    pub fn decide_json(&mut self, req: &serde_json::Value) -> Result<serde_json::Value> {
+        let r = DecisionRequest::from_json(req)?;
+        let dec = self.decide(&r)?;
+        let d = self.decision.as_deref().unwrap();
+        Ok(dec.to_json(&d.model_name, &d.protocol()))
     }
 
     /// Encodes `text` (after the unfed token of the last reply, if any) and checks the context
@@ -1324,6 +1428,56 @@ pub fn resolve_model(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
     }
 }
 
+/// Resolves a decision bundle: a local directory, or (with the `hf` feature) a repo id of which
+/// only the decision assets are fetched ([`crate::decide::ASSET_FILES`], plus the LM-head adapter
+/// when there is no slot head).
+pub fn resolve_decision(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
+    let p = Path::new(spec);
+    if p.is_dir() {
+        return Ok(p.to_path_buf());
+    }
+    #[cfg(feature = "hf")]
+    {
+        let dir = crate::hf::resolve_files(spec, crate::decide::ASSET_FILES, cache_dir)?;
+        if !dir.join("head.safetensors").is_file() {
+            crate::hf::resolve_files(spec, crate::decide::LM_ADAPTER_FILES, cache_dir)?;
+        }
+        if !crate::decide::has_assets(&dir) {
+            bail!("{spec}: no decision assets (judge_config.json or adapter_vllm/decision_head.json)");
+        }
+        Ok(dir)
+    }
+    #[cfg(not(feature = "hf"))]
+    {
+        let _ = cache_dir;
+        bail!("{spec}: not a directory (built without the `hf` feature, so repo ids cannot be fetched)")
+    }
+}
+
+/// Loads the decision assets in `dir` (if any) for a base of `base` dimensions and attaches their
+/// adapter with `attach`.
+fn load_decision(
+    dir: Option<&Path>,
+    tok: &Tokenizer,
+    base: &BaseCheck,
+    gemma: bool,
+    attach: impl FnOnce(&mut crate::lora::LoraAdapter) -> Result<usize>,
+) -> Result<Option<Box<DecisionAssets>>> {
+    let Some(dir) = dir else { return Ok(None) };
+    let (mut assets, adapter) = DecisionAssets::load(dir, tok, base, gemma)?;
+    if let Some(mut ad) = adapter {
+        let n = attach(&mut ad).with_context(|| format!("attach LoRA {}", ad.dir.display()))?;
+        assets.adapter = Some(crate::decide::AdapterInfo {
+            dir: ad.dir.clone(),
+            rank: ad.rank,
+            scale: ad.scale,
+            modules: n,
+            bytes: ad.bytes(),
+        });
+    }
+    Ok(Some(Box::new(assets)))
+}
+
 /// Resolves a file spec: a local path, or (with the `hf` feature) `org/repo/path/in/repo`.
 pub fn resolve_file(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
     #[cfg(feature = "hf")]
@@ -1440,7 +1594,7 @@ mod tests {
                 "coreml_units" => "gpu",
                 "coreml_prefill" => "pad",
                 "qos" => "background",
-                "mtp_from" | "draft" | "cache_dir" => "x",
+                "mtp_from" | "draft" | "cache_dir" | "decision_from" => "x",
                 _ => "1",
             };
             o.set(k, v).unwrap();

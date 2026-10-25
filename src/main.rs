@@ -81,6 +81,13 @@ struct Args {
     // ANEMLL Core ML models.
     coreml_units: Option<String>,
     coreml_prefill: Option<String>,
+    // Typed decisions (Jev models).
+    decide: Option<String>,
+    state: Option<String>,
+    question: Option<String>,
+    options: Vec<String>,
+    decide_json: Option<PathBuf>,
+    decision_from: Option<String>,
 }
 
 fn usage() -> ! {
@@ -172,7 +179,18 @@ fn usage() -> ! {
          \x20 --dim N              truncate to N dimensions (Matryoshka) and renormalize\n\
          \x20 --similarity         print the cosine similarity matrix instead\n\
          \x20 --sparse, --colbert  BGE-M3 lexical weights / multi-vector embeddings instead\n\
-         \x20 --show-tokens        print token ids"
+         \x20 --show-tokens        print token ids\n\
+         \n\
+         typed decisions (Jev models: a bundle directory or repo id such as autotrust/JEV-9B, or any\n\
+         base model with --decision-from):\n\
+         \x20 --decide KIND        noul (yes/no), score (0-5) or choice; prints the distribution\n\
+         \x20 --state TEXT         what the question is about (a JSON object is used as such)\n\
+         \x20 --question TEXT      the question\n\
+         \x20 --option TEXT        a choice option (repeatable, 2-256)\n\
+         \x20 --decide-json FILE   /v1/decide requests (an object, an array or one object per line;\n\
+         \x20                      - for stdin); prints one JSON response per line\n\
+         \x20 --decision-from S    the decision assets (adapter, head, configs) of bundle S, a directory\n\
+         \x20                      or repo id, on top of --model (fetches the small files only)"
     );
     std::process::exit(2)
 }
@@ -244,6 +262,12 @@ fn parse_args() -> Result<Args> {
         dim: None,
         coreml_units: None,
         coreml_prefill: None,
+        decide: None,
+        state: None,
+        question: None,
+        options: Vec::new(),
+        decide_json: None,
+        decision_from: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -363,6 +387,12 @@ fn parse_args() -> Result<Args> {
             "--dim" => a.dim = Some(val()?.parse()?),
             "--coreml-units" => a.coreml_units = Some(val()?),
             "--coreml-prefill" => a.coreml_prefill = Some(val()?),
+            "--decide" => a.decide = Some(val()?),
+            "--state" => a.state = Some(val()?),
+            "--question" => a.question = Some(val()?),
+            "--option" => a.options.push(val()?),
+            "--decide-json" => a.decide_json = Some(PathBuf::from(val()?)),
+            "--decision-from" => a.decision_from = Some(val()?),
             "--show-tokens" => a.show_tokens = true,
             "-h" | "--help" => usage(),
             _ => {
@@ -551,7 +581,109 @@ fn main() -> Result<()> {
         qos: args.qos,
         efficiency_threads: args.efficiency_threads,
     });
+    if args.decide.is_some() || args.decide_json.is_some() {
+        return run_decide(&args);
+    }
+    if args.decision_from.is_some() {
+        bail!("--decision-from goes with --decide or --decide-json");
+    }
     run(args)
+}
+
+/// Typed decisions through the engine: one distribution per request.
+fn run_decide(args: &Args) -> Result<()> {
+    use oxinfer::decide::{DecisionKind, DecisionRequest};
+    use oxinfer::engine::{Engine, EngineOptions};
+    let mut opts = EngineOptions::default();
+    opts.quant = args.quant;
+    opts.mmap = args.mmap;
+    opts.preload = args.preload;
+    opts.device = args.device;
+    opts.prefill_chunk = args.prefill_chunk;
+    opts.cache_dir = args.cache_dir.clone();
+    opts.decision_from = args.decision_from.clone();
+    if args.stream {
+        opts.stream = Some(Default::default());
+    }
+    let mut e = Engine::load(&args.model.to_string_lossy(), &opts)?;
+    let info = e.info().clone();
+    let d = e
+        .decision_assets()
+        .context("this model has no decision assets: use a Jev bundle or --decision-from")?;
+    eprintln!(
+        "[{} {} ({}, {}) on {}, loaded in {:.1}s | decision: {} ({:?}{})]",
+        info.model_type,
+        info.path.display(),
+        info.format,
+        info.quant.as_str(),
+        info.device,
+        info.load_secs,
+        d.model_name,
+        d.readout,
+        match &d.adapter {
+            Some(a) => format!(", LoRA r={} on {} modules, {:.0} MB", a.rank, a.modules, a.bytes as f64 / 1e6),
+            None => String::new(),
+        }
+    );
+    let (model_name, protocol) = (d.model_name.clone(), d.protocol());
+    if let Some(path) = &args.decide_json {
+        let text = if path.as_os_str() == "-" {
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s)?;
+            s
+        } else {
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?
+        };
+        let reqs: Vec<serde_json::Value> = match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(serde_json::Value::Array(a)) => a,
+            Ok(v) => vec![v],
+            Err(_) => text
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(serde_json::from_str)
+                .collect::<Result<_, _>>()
+                .context("parse the requests (a JSON object, an array, or one object per line)")?,
+        };
+        for r in &reqs {
+            let dec = e.decide(&DecisionRequest::from_json(r)?)?;
+            println!("{}", dec.to_json(&model_name, &protocol));
+            eprintln!(
+                "[{} tokens, prefill {:.3}s ({:.0} tok/s)]",
+                dec.stats.prompt_tokens,
+                dec.stats.prefill_secs,
+                dec.stats.prefill_tok_s()
+            );
+        }
+        return Ok(());
+    }
+    let kind = args.decide.as_deref().unwrap_or_default();
+    let kind = DecisionKind::parse(kind).with_context(|| format!("--decide {kind}: expected noul, score or choice"))?;
+    let state = args.state.clone().unwrap_or_default();
+    let state = match serde_json::from_str::<serde_json::Value>(&state) {
+        Ok(v @ serde_json::Value::Object(_)) => v,
+        _ => serde_json::Value::String(state),
+    };
+    let question = args.question.clone().context("--decide needs --question")?;
+    let dec = e.decide(&DecisionRequest::new(kind, state, question, args.options.clone()))?;
+    let w = dec.options.iter().map(|o| o.chars().count()).max().unwrap_or(0).min(60);
+    for (i, (o, p)) in dec.options.iter().zip(&dec.probabilities).enumerate() {
+        let bar = "#".repeat((p * 40.0).round() as usize);
+        let mark = if i == dec.best_index { '*' } else { ' ' };
+        println!("{mark} {o:<w$}  {p:.4}  {bar}");
+    }
+    if let Some(s) = dec.expected_score() {
+        println!("  expected score {s:.3}");
+    }
+    eprintln!(
+        "[{} {} | {} prompt tokens, prefill {:.3}s ({:.0} tok/s), total {:.3}s]",
+        dec.kind.as_str(),
+        dec.adaptation.as_str(),
+        dec.stats.prompt_tokens,
+        dec.stats.prefill_secs,
+        dec.stats.prefill_tok_s(),
+        dec.stats.total_secs
+    );
+    Ok(())
 }
 
 fn run(mut args: Args) -> Result<()> {

@@ -84,6 +84,8 @@ pub(crate) struct Moe<'a> {
 
 /// An expert's input projections: fused (`experts.gate_up_proj`, `[2 * inter, H]`, gate rows then
 /// up rows) or separate (`experts.{e}.gate_proj` / `up_proj`, as transformers saves them).
+// One per expert, built once: boxing the fused case would gain nothing.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum GateUp<'a> {
     Fused(Lin<'a>),
     Split(Lin<'a>, Lin<'a>),
@@ -569,6 +571,75 @@ impl<'a> QwenModel<'a> {
             inv_freq,
             stream: None,
         })
+    }
+
+    /// Attaches the modules of a runtime LoRA adapter (see `crate::lora`) to the layers they
+    /// target, by Hugging Face module name (whatever the checkpoint format; GGUF's tiled Gated
+    /// DeltaNet value heads are reordered to match). Errors when a module matches no layer or
+    /// has another shape. Returns the number of layers patched.
+    pub fn attach_lora(&mut self, ad: &mut crate::lora::LoraAdapter) -> Result<usize> {
+        use crate::lora::tiled_v_rows;
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let (nk, nv, hdk, hdv) = (
+            cfg.linear_num_key_heads,
+            cfg.linear_num_value_heads,
+            cfg.linear_key_head_dim,
+            cfg.linear_value_head_dim,
+        );
+        let (key_dim, value_dim) = (nk * hdk, nv * hdv);
+        let (nh, nkv, hd) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
+        let qw = if cfg.attn_output_gate { 2 * nh * hd } else { nh * hd };
+        let tiled = cfg.v_heads_tiled;
+        let qkv_rows = tiled.then(|| tiled_v_rows(2 * key_dim, nk, nv, hdv));
+        let v_rows = tiled.then(|| tiled_v_rows(0, nk, nv, hdv));
+        let head_rows = tiled.then(|| tiled_v_rows(0, nk, nv, 1));
+        let mut set =
+            |lin: &mut Lin<'a>, name: String, n_out: usize, n_in: usize, rows: Option<&[usize]>, cols: Option<&[usize]>| -> Result<()> {
+                if let Some(d) = ad.take(&name, n_out, n_in, rows, cols)? {
+                    lin.set_lora(Some(d));
+                }
+                Ok(())
+            };
+        for (l, layer) in self.layers.iter_mut().enumerate() {
+            let lp = format!("layers.{l}.");
+            match &mut layer.mixer {
+                Mixer::Gdn(g) => {
+                    let p = format!("{lp}linear_attn.");
+                    set(
+                        &mut g.qkv,
+                        format!("{p}in_proj_qkv"),
+                        2 * key_dim + value_dim,
+                        h,
+                        qkv_rows.as_deref(),
+                        None,
+                    )?;
+                    set(&mut g.z, format!("{p}in_proj_z"), value_dim, h, v_rows.as_deref(), None)?;
+                    set(&mut g.b, format!("{p}in_proj_b"), nv, h, head_rows.as_deref(), None)?;
+                    set(&mut g.a, format!("{p}in_proj_a"), nv, h, head_rows.as_deref(), None)?;
+                    set(&mut g.out, format!("{p}out_proj"), h, value_dim, None, v_rows.as_deref())?;
+                }
+                Mixer::Attn(a) => {
+                    let p = format!("{lp}self_attn.");
+                    set(&mut a.q, format!("{p}q_proj"), qw, h, None, None)?;
+                    set(&mut a.k, format!("{p}k_proj"), nkv * hd, h, None, None)?;
+                    set(&mut a.v, format!("{p}v_proj"), nkv * hd, h, None, None)?;
+                    set(&mut a.o, format!("{p}o_proj"), h, nh * hd, None, None)?;
+                }
+            }
+            // Routed experts are not patched (no adapter of the family has them): their modules
+            // stay in the adapter and `finish` reports them.
+            let (m, p) = match &mut layer.ffn {
+                Ffn::Dense(m) => (m, format!("{lp}mlp.")),
+                Ffn::Moe(moe) => (&mut moe.shared, format!("{lp}mlp.shared_expert.")),
+            };
+            let inter = m.inter;
+            set(&mut m.gate, format!("{p}gate_proj"), inter, h, None, None)?;
+            set(&mut m.up, format!("{p}up_proj"), inter, h, None, None)?;
+            set(&mut m.down, format!("{p}down_proj"), h, inter, None, None)?;
+        }
+        set(&mut self.lm_head, "lm_head".into(), cfg.vocab_size, h, None, None)?;
+        ad.finish()
     }
 
     /// The weights of each streaming unit, in execution order: the layers, then the LM head.

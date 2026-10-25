@@ -106,6 +106,29 @@ pub fn resolve(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Some files of a repo: a local directory is used as is; otherwise the files of `names` that
+/// repo `spec` (`org/name`) has are fetched into its cache directory, which is returned. For
+/// add-ons such as decision assets, without the weights.
+pub fn resolve_files(spec: &str, names: &[&str], cache_dir: Option<&Path>) -> Result<PathBuf> {
+    let p = Path::new(spec);
+    if p.is_dir() {
+        return Ok(p.to_path_buf());
+    }
+    let parts: Vec<&str> = spec.split('/').collect();
+    if parts.len() != 2 || parts.iter().any(|s| s.is_empty() || s.starts_with('.')) || spec.starts_with('/') {
+        bail!("{spec}: not an existing directory and not a HuggingFace repo id of the form org/name");
+    }
+    let root = cache_dir.map(Path::to_path_buf).unwrap_or_else(cache_root);
+    let dir = root.join(spec.replace('/', "--"));
+    let list = listing(spec)?;
+    let present: Vec<&&str> = names.iter().filter(|n| list.contains_key(**n)).collect();
+    for (i, n) in present.iter().enumerate() {
+        let (size, src) = &list[**n];
+        fetch_file(spec, &dir, n, *size, src, i + 1, present.len())?;
+    }
+    Ok(dir)
+}
+
 /// A single file: a local path is used as is; otherwise `spec` is `org/name/path/in/repo` (or
 /// `org/name` when the repo holds exactly one safetensors file), fetched into the repo's cache
 /// directory. For LoRA files and other single-file downloads.
@@ -445,6 +468,14 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
         .filter(|f| list.contains_key(**f))
         .map(|f| f.to_string())
         .collect();
+    // Jev decision bundles: the head, adapter and configs (`crate::decide`); the LM-head
+    // readout's adapter only when there is no slot head.
+    let mut decision: Vec<&str> = crate::decide::ASSET_FILES.to_vec();
+    if !list.contains_key("head.safetensors") {
+        decision.extend(crate::decide::LM_ADAPTER_FILES);
+    }
+    decision.retain(|f| list.contains_key(*f) && !files.iter().any(|g| g == f));
+    files.extend(decision.into_iter().map(str::to_string));
     // sentence-transformers layout (embedding models): the module list, the prompts, and each
     // module's folder (pooling, dense projections); BGE-M3's sparse and multi-vector heads.
     if let Some((size, src)) = list.get("modules.json") {

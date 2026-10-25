@@ -77,6 +77,10 @@ char *oxi_download(const char *spec, const char *cache_dir, oxi_progress_fn prog
  *   coreml_units=auto|ane|all|gpu|cpu   Core ML models (ANEMLL format, Apple only): compute
  *                        units (default auto: the Neural Engine, or cpu/gpu following device)
  *   coreml_prefill=auto|batch|pad|single  Core ML models: how prompts are fed (default auto)
+ *   decision_from=PATH|REPO  typed decisions (oxi_decide) with the decision assets of this Jev
+ *                        bundle (LoRA adapter, head, configs; only those small files are
+ *                        downloaded) on top of the loaded base model, which must match it. A Jev
+ *                        bundle loaded as the model brings its own.
  * Returns NULL on error. */
 OxiEngine *oxi_engine_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
 
@@ -109,13 +113,33 @@ int oxi_engine_reset(OxiEngine *engine);
 void oxi_engine_cancel(const OxiEngine *engine);
 
 /* Model information as a JSON object (path, model_type, family, layers, quant, format, device,
- * threads, speculative, load_secs, coreml (null, or units, prefill, context_length, ...), ...). */
+ * threads, speculative, load_secs, coreml (null, or units, prefill, context_length, ...),
+ * decision (null, or as oxi_decide_info_json), ...). */
 char *oxi_engine_info_json(OxiEngine *engine);
 
 /* Statistics of the last turn as a JSON object: prompt_tokens, prefill_secs, prefill_tok_s,
  * generated_tokens, decode_secs, decode_tok_s, forwards, drafted, accepted, acceptance,
  * context_tokens. */
 char *oxi_engine_stats_json(OxiEngine *engine);
+
+/* A typed decision ("System 1" of the Jev models): one prefill pass, a calibrated probability per
+ * option, no generation. The conversation is not disturbed. `request_json` is a /v1/decide body:
+ *   {"kind": "noul" | "score" | "choice",
+ *    "state": "text" or a JSON value (serialized as Python's json.dumps),
+ *    "question": "...",
+ *    "options": ["...", ...]}            (choice only: 2-256 options; 16 trained, more read
+ *                                         through extra single-token labels)
+ * Returns the response as a JSON object (free with oxi_string_free), or NULL on error:
+ *   {"kind", "effective_kind", "options", "probabilities", "choice_index", "choice",
+ *    "adaptation": "native" | "wide-labels", "protocol", "model",
+ *    "usage": {"prompt_tokens", "completion_tokens", "total_tokens"}, "num_model_requests",
+ *    "elapsed_seconds"}
+ * noul options are ["false", "true"], score options "0".."5". */
+char *oxi_decide(OxiEngine *engine, const char *request_json);
+
+/* The loaded decision assets as JSON (protocol, model, readout, adapter, max_options,
+ * native_choice_options, temperatures, source), or NULL when the model has none. */
+char *oxi_decide_info_json(OxiEngine *engine);
 
 #ifdef __cplusplus
 }
