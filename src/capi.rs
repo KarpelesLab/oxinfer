@@ -9,7 +9,8 @@
 //!
 //! Threads: an engine may be used from any thread, one call at a time, except `oxi_engine_cancel`,
 //! which may be called from any thread at any time (it stops a running `oxi_engine_send` /
-//! `oxi_engine_complete` after the current token).
+//! `oxi_engine_complete` after the current token). Whisper transcribers (`oxi_transcriber_*`,
+//! over [`crate::whisper`]) follow the same rules, with `oxi_transcriber_cancel`.
 #![allow(clippy::missing_safety_doc)] // the contract is documented once above and in the header
 
 use crate::engine::{CancelHandle, Delta, Engine, EngineOptions, Flow, Reply, SamplingParams, StopReason, SystemPrompt};
@@ -376,5 +377,169 @@ pub unsafe extern "C" fn oxi_decide_info_json(e: *mut OxiEngine) -> *mut c_char 
         let g = lock(unsafe { engine(e) }?);
         let d = g.decision_assets().context("no decision assets loaded")?;
         Ok(out_string(d.info_json().to_string()))
+    })
+}
+
+// ---- speech to text (Whisper) ---------------------------------------------------------------
+
+/// Receives one finished segment as JSON (`len` bytes, not NUL-terminated); return non-zero to
+/// stop the transcription.
+pub type OxiSegmentFn = Option<unsafe extern "C" fn(user: *mut c_void, segment_json: *const c_char, len: usize) -> c_int>;
+
+/// A Whisper model handle.
+pub struct OxiTranscriber {
+    cancel: CancelHandle,
+    asr: Mutex<crate::whisper::Transcriber>,
+}
+
+unsafe fn transcriber<'a>(t: *const OxiTranscriber) -> Result<&'a OxiTranscriber> {
+    unsafe { t.as_ref() }.context("transcriber is NULL")
+}
+
+/// Loads a Whisper model (directory or repo id; `key=value` options as for engines).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_transcriber_load(
+    model: *const c_char,
+    options: *const c_char,
+    progress: OxiProgressFn,
+    user: *mut c_void,
+) -> *mut OxiTranscriber {
+    guard(std::ptr::null_mut(), || {
+        let model = unsafe { str_arg(model, "model") }?;
+        let mut o = crate::whisper::TranscriberOptions::default();
+        for item in unsafe { opt_str_arg(options, "options") }?.unwrap_or("").split(['\n', ';']) {
+            let item = item.trim();
+            if item.is_empty() || item.starts_with('#') {
+                continue;
+            }
+            let (k, v) = item.split_once('=').with_context(|| format!("option {item:?} is not key=value"))?;
+            o.set(k.trim(), v.trim())?;
+        }
+        let t = with_progress(progress, user, || crate::whisper::Transcriber::load(model, &o))?;
+        Ok(Box::into_raw(Box::new(OxiTranscriber {
+            cancel: t.cancel_handle(),
+            asr: Mutex::new(t),
+        })))
+    })
+}
+
+/// Frees a transcriber (NULL is ignored). No other call on it may be running.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_transcriber_free(t: *mut OxiTranscriber) {
+    if !t.is_null() {
+        guard((), || {
+            drop(unsafe { Box::from_raw(t) });
+            Ok(())
+        })
+    }
+}
+
+/// Stops the running transcription (any thread); it returns the segments done so far.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_transcriber_cancel(t: *const OxiTranscriber) {
+    if let Some(t) = unsafe { t.as_ref() } {
+        t.cancel.cancel();
+    }
+}
+
+/// Model information as JSON.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_transcriber_info_json(t: *mut OxiTranscriber) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let t = unsafe { transcriber(t) }?;
+        let g = t.asr.lock().unwrap_or_else(|p| p.into_inner());
+        Ok(out_string(serde_json::to_string(g.info())?))
+    })
+}
+
+fn transcribe_common(
+    t: *mut OxiTranscriber,
+    options_json: *const c_char,
+    cb: OxiSegmentFn,
+    user: *mut c_void,
+    pcm: impl FnOnce() -> Result<Vec<f32>>,
+) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let t = unsafe { transcriber(t) }?;
+        let opts: crate::whisper::TranscribeOptions = match unsafe { opt_str_arg(options_json, "options_json") }?.map(str::trim) {
+            Some(s) if !s.is_empty() => serde_json::from_str(s).context("options_json")?,
+            _ => Default::default(),
+        };
+        let samples = pcm()?;
+        let g = t.asr.lock().unwrap_or_else(|p| p.into_inner());
+        let mut on_segment = |s: &crate::whisper::Segment| -> Flow {
+            match cb {
+                Some(cb) => {
+                    let j = serde_json::to_string(s).unwrap_or_default();
+                    let r = unsafe { cb(user, j.as_ptr() as *const c_char, j.len()) };
+                    if r != 0 { Flow::Stop } else { Flow::Continue }
+                }
+                None => Flow::Continue,
+            }
+        };
+        let out = g.transcribe_with(&samples, &opts, &mut on_segment)?;
+        Ok(out_string(serde_json::to_string(&out)?))
+    })
+}
+
+/// Transcribes `n` mono samples in [-1, 1] at `sample_rate` Hz (resampled to 16 kHz with the
+/// `media` feature; otherwise it must be 16000). Returns the transcript as JSON.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_transcribe_pcm(
+    t: *mut OxiTranscriber,
+    samples: *const f32,
+    n: usize,
+    sample_rate: c_int,
+    options_json: *const c_char,
+    cb: OxiSegmentFn,
+    user: *mut c_void,
+) -> *mut c_char {
+    transcribe_common(t, options_json, cb, user, || {
+        if samples.is_null() && n > 0 {
+            bail!("samples is NULL");
+        }
+        let x = if n == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(samples, n) }
+        };
+        let rate = usize::try_from(sample_rate)
+            .ok()
+            .filter(|&r| r > 0)
+            .context("sample_rate must be positive")?;
+        if rate == crate::whisper::mel::SAMPLE_RATE {
+            return Ok(x.to_vec());
+        }
+        #[cfg(feature = "media")]
+        {
+            Ok(crate::media::resample(x, rate, crate::whisper::mel::SAMPLE_RATE))
+        }
+        #[cfg(not(feature = "media"))]
+        {
+            bail!("sample_rate must be 16000 (resampling needs the `media` feature)")
+        }
+    })
+}
+
+/// Transcribes an audio file (decoded with the `media` feature). Returns the transcript as JSON.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_transcribe_file(
+    t: *mut OxiTranscriber,
+    path: *const c_char,
+    options_json: *const c_char,
+    cb: OxiSegmentFn,
+    user: *mut c_void,
+) -> *mut c_char {
+    transcribe_common(t, options_json, cb, user, || {
+        let path = unsafe { str_arg(path, "path") }?;
+        #[cfg(feature = "media")]
+        {
+            crate::whisper::Transcriber::load_audio(std::path::Path::new(path))
+        }
+        #[cfg(not(feature = "media"))]
+        {
+            let _ = path;
+            bail!("decoding audio files needs the `media` feature; use oxi_transcribe_pcm")
+        }
     })
 }

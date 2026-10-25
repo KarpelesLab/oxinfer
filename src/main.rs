@@ -12,6 +12,8 @@ use tokenizers::Tokenizer;
 
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
 mod anemll_cli;
+#[cfg(feature = "media")]
+mod whisper_cli;
 
 struct Args {
     model: PathBuf,
@@ -88,6 +90,18 @@ struct Args {
     options: Vec<String>,
     decide_json: Option<PathBuf>,
     decision_from: Option<String>,
+    // Speech to text (Whisper models).
+    transcribe: Option<PathBuf>,
+    language: Option<String>,
+    translate: bool,
+    timestamps: bool,
+    word_timestamps: bool,
+    initial_prompt: Option<String>,
+    prefix: Option<String>,
+    format: Option<String>,
+    precision: Option<String>,
+    fallback: bool,
+    condition_on_prev: bool,
 }
 
 fn usage() -> ! {
@@ -190,7 +204,21 @@ fn usage() -> ! {
          \x20 --decide-json FILE   /v1/decide requests (an object, an array or one object per line;\n\
          \x20                      - for stdin); prints one JSON response per line\n\
          \x20 --decision-from S    the decision assets (adapter, head, configs) of bundle S, a directory\n\
-         \x20                      or repo id, on top of --model (fetches the small files only)"
+         \x20                      or repo id, on top of --model (fetches the small files only)\n\
+         \n\
+         speech to text (Whisper models: openai/whisper-*, distil-whisper/*; detected from config.json):\n\
+         \x20 --transcribe FILE    audio to transcribe (WAV/MP3/FLAC/AAC/OGG via oxideav; any length)\n\
+         \x20 --language XX        spoken language (code or name; default: detected from the first 30 s)\n\
+         \x20 --translate          translate to English instead of transcribing\n\
+         \x20 --timestamps         print timed segments (always on past 30 s of audio)\n\
+         \x20 --word-timestamps    also word-level times (cross-attention alignment)\n\
+         \x20 --format F           text (default), json, srt or vtt; --json for json\n\
+         \x20 --initial-prompt T   context text for the decoder (names, spelling, style)\n\
+         \x20 --prefix T           text the transcript starts with\n\
+         \x20 --fallback           temperature fallback on repetitive or unlikely windows (openai defaults)\n\
+         \x20 --condition-on-prev  feed each window the previous text\n\
+         \x20 --precision P        weights: f32 (matches transformers token for token), f16, bf16 (default);\n\
+         \x20                      --quant q8|q4 quantizes the decoder (--temp T samples at T)"
     );
     std::process::exit(2)
 }
@@ -268,6 +296,17 @@ fn parse_args() -> Result<Args> {
         options: Vec::new(),
         decide_json: None,
         decision_from: None,
+        transcribe: None,
+        language: None,
+        translate: false,
+        timestamps: false,
+        word_timestamps: false,
+        initial_prompt: None,
+        prefix: None,
+        format: None,
+        precision: None,
+        fallback: false,
+        condition_on_prev: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -394,6 +433,18 @@ fn parse_args() -> Result<Args> {
             "--decide-json" => a.decide_json = Some(PathBuf::from(val()?)),
             "--decision-from" => a.decision_from = Some(val()?),
             "--show-tokens" => a.show_tokens = true,
+            "--transcribe" => a.transcribe = Some(PathBuf::from(val()?)),
+            "--language" => a.language = Some(val()?),
+            "--translate" => a.translate = true,
+            "--timestamps" => a.timestamps = true,
+            "--word-timestamps" => a.word_timestamps = true,
+            "--initial-prompt" => a.initial_prompt = Some(val()?),
+            "--prefix" => a.prefix = Some(val()?),
+            "--format" => a.format = Some(val()?),
+            "--json" => a.format = Some("json".into()),
+            "--precision" => a.precision = Some(val()?),
+            "--fallback" => a.fallback = true,
+            "--condition-on-prev" => a.condition_on_prev = true,
             "-h" | "--help" => usage(),
             _ => {
                 eprintln!("unknown argument {k}");
@@ -718,6 +769,12 @@ fn run(mut args: Args) -> Result<()> {
         return run_embed(&args);
     }
     let model_type = config::model_type(&args.model)?;
+    if model_type == "whisper" || args.transcribe.is_some() {
+        #[cfg(feature = "media")]
+        return whisper_cli::run(&args);
+        #[cfg(not(feature = "media"))]
+        bail!("speech to text from the command line needs the `media` feature (audio decoding)");
+    }
     match model_type.as_str() {
         "gemma4" | "gemma4_text" | "gemma3" | "gemma3_text" => run_gemma(args),
         "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" => run_qwen(args),

@@ -141,6 +141,85 @@ char *oxi_decide(OxiEngine *engine, const char *request_json);
  * native_choice_options, temperatures, source), or NULL when the model has none. */
 char *oxi_decide_info_json(OxiEngine *engine);
 
+/* ---- Speech to text (Whisper) ------------------------------------------------------------------
+ *
+ * openai/whisper-{tiny,base,small,medium,large-v3,large-v3-turbo} (and .en), distil-whisper/*:
+ * Hugging Face safetensors checkpoints with model_type "whisper". Audio of any length (30 s
+ * windows, moved along by the predicted timestamps past 30 s). The encoder runs on the GPU
+ * when one is active; decoding runs on the CPU. A transcriber follows the engine's threading
+ * rules: one call at a time, oxi_transcriber_cancel() from any thread. */
+
+typedef struct OxiTranscriber OxiTranscriber;
+
+/* One finished segment as a JSON object (`len` bytes at `segment_json`, not NUL-terminated), the
+ * same as the entries of the result's "segments". Called after each 30 s window is decoded.
+ * Return non-zero to stop the transcription (the result then has "stopped": true). */
+typedef int (*oxi_segment_fn)(void *user, const char *segment_json, size_t len);
+
+/* Loads a Whisper model: a directory or a repo id (downloaded first, see oxi_download).
+ * `options`: NULL or "key=value" pairs separated by newlines or ';':
+ *   threads=N                  CPU threads (process-wide)
+ *   device=auto|cpu|metal      where the encoder runs (process-wide, first model wins)
+ *   precision=f32|f16|bf16|q8|q4  weights of both encoder and decoder (default bf16; f32 gives
+ *                              transformers' float32 transcripts token for token; f32 and f16 run
+ *                              on the CPU only)
+ *   encoder=..., decoder=...   the same for one part; quant=q8|q4 is decoder=
+ *   mmap=0|1                   map the checkpoint while converting it (default 1)
+ *   cache_dir=PATH             where repo ids are downloaded
+ *   gpu_exact=0|1              GPU matmuls bit-identical to the CPU (process-wide)
+ * Returns NULL on error. */
+OxiTranscriber *oxi_transcriber_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
+
+/* Frees a transcriber (NULL is ignored); no other call on it may be running. */
+void oxi_transcriber_free(OxiTranscriber *t);
+
+/* Stops the running transcription at the next token (any thread). The call returns the
+ * segments finished so far, with "stopped": true. */
+void oxi_transcriber_cancel(const OxiTranscriber *t);
+
+/* Model information as JSON: path, d_model, encoder_layers, decoder_layers, n_mels, vocab_size,
+ * multilingual, encoder, decoder (precisions), device, threads, load_secs. */
+char *oxi_transcriber_info_json(OxiTranscriber *t);
+
+/* Transcription options (`options_json`, NULL or "" for the defaults), a JSON object with any of:
+ *   "language": "fr" | "french" | "<|fr|>" | null   spoken language (null: detected from the
+ *                                                   first 30 s, or the model's default)
+ *   "task": "transcribe" | "translate"             translate = speech to English text
+ *   "timestamps": false          segment-level timestamps (always on past 30 s of audio)
+ *   "word_timestamps": false     word-level times (implies timestamps)
+ *   "temperatures": [0.0]        decoding temperatures tried in order (0 = greedy); the next is
+ *                                used when a window fails the thresholds below
+ *   "compression_ratio_threshold": null   e.g. 2.4: retry repetitive windows
+ *   "logprob_threshold": null             e.g. -1.0: retry unlikely windows
+ *   "no_speech_threshold": null           e.g. 0.6: skip silent windows (needs logprob_threshold)
+ *   "condition_on_prev_tokens": false     feed each window the previous text
+ *   "initial_prompt": null       context text (names, spelling, style)
+ *   "prefix": null               text the transcript starts with
+ *   "suppress_tokens": null      token ids never generated (null: the model's list)
+ *   "suppress_blank": true       no blank / end of text as the first token
+ *   "max_new_tokens": null       per window
+ *   "seed": 0                    sampling seed (temperatures above 0)
+ * openai-whisper's robust defaults: {"temperatures": [0, 0.2, 0.4, 0.6, 0.8, 1],
+ *   "compression_ratio_threshold": 2.4, "logprob_threshold": -1, "no_speech_threshold": 0.6}.
+ *
+ * The result is a JSON object (free with oxi_string_free), or NULL on error:
+ *   {"text", "language" (code; "" for English-only models), "language_probability" (null when
+ *    given), "stopped",
+ *    "segments": [{"id", "start", "end" (seconds), "text", "tokens", "temperature",
+ *                  "avg_logprob", "compression_ratio", "no_speech_prob",
+ *                  "words": [{"word", "start", "end", "probability"}] (word timestamps only)}],
+ *    "stats": {"audio_secs", "mel_secs", "encode_secs", "decode_secs", "total_secs", "windows",
+ *              "tokens", "rtf"}} */
+
+/* Transcribes `n` mono float samples in [-1, 1] at `sample_rate` Hz (resampled to 16 kHz;
+ * builds without the `media` feature need 16000). `cb` may be NULL. */
+char *oxi_transcribe_pcm(OxiTranscriber *t, const float *samples, size_t n, int sample_rate, const char *options_json,
+                         oxi_segment_fn cb, void *user);
+
+/* Transcribes an audio file (WAV, MP3, FLAC, AAC/M4A, Ogg Vorbis/Opus, ...; needs the `media`
+ * feature, which `cargo build-capi` enables). `cb` may be NULL. */
+char *oxi_transcribe_file(OxiTranscriber *t, const char *path, const char *options_json, oxi_segment_fn cb, void *user);
+
 #ifdef __cplusplus
 }
 #endif

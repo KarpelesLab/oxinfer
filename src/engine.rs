@@ -553,6 +553,11 @@ pub struct ModelInfo {
 pub struct CancelHandle(Arc<AtomicBool>);
 
 impl CancelHandle {
+    /// A handle on another component's stop flag (e.g. [`crate::whisper::Transcriber`]).
+    pub(crate) fn from_flag(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+
     /// Requests the current reply to stop after the token being generated (or, during the
     /// prefill, at its first token). Each turn clears the request when it starts, so one made
     /// while no turn runs has no effect.

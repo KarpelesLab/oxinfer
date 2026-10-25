@@ -38,6 +38,10 @@ required-features = ["hf"]
 name = "qwen_mtp"
 required-features = ["hf"]
 
+[[example]]
+name = "transcribe"
+required-features = ["hf", "media"]
+
 [features]
 default = ["media", "hf", "gpu"]
 # Image / audio file decoding through oxideav.
