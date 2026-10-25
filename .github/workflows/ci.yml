@@ -47,6 +47,13 @@ jobs:
       - name: Clippy (all features, warnings denied)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # The feature sets dependents use: none, oxideav-core types only, and the defaults.
+      - name: Clippy (feature subsets)
+        run: |
+          cargo clippy --lib --no-default-features -- -D warnings
+          cargo clippy --lib --no-default-features --features oxideav -- -D warnings
+          cargo clippy --all-targets -- -D warnings
+
       - name: Test (all features)
         run: cargo test --release --all-features
 
@@ -78,6 +85,8 @@ jobs:
           key: ${{ matrix.target }}
       - name: Clippy (CPU-only build)
         run: cargo clippy --release --lib --no-default-features --target ${{ matrix.target }} -- -D warnings
+      - name: Clippy (oxideav-core types only)
+        run: cargo clippy --release --lib --no-default-features --features oxideav --target ${{ matrix.target }} -- -D warnings
       - name: Check (default features)
         if: ${{ !startsWith(matrix.target, 'wasm32') }}
         run: cargo check --release --target ${{ matrix.target }}

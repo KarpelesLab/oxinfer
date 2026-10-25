@@ -678,38 +678,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxideav-meta"
-version = "0.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb3f2afa432a7179ee33778765297704403b30139e6a21d04b29cbdaa10d8b82"
-dependencies = [
- "oxideav-aac",
- "oxideav-av1",
- "oxideav-avi",
- "oxideav-basic",
- "oxideav-bmp",
- "oxideav-core",
- "oxideav-flac",
- "oxideav-gif",
- "oxideav-h264",
- "oxideav-h265",
- "oxideav-mjpeg",
- "oxideav-mkv",
- "oxideav-mov",
- "oxideav-mp3",
- "oxideav-mp4",
- "oxideav-mpeg4video",
- "oxideav-ogg",
- "oxideav-opus",
- "oxideav-png",
- "oxideav-riff",
- "oxideav-vorbis",
- "oxideav-vp8",
- "oxideav-vp9",
- "oxideav-webp",
-]
-
-[[package]]
 name = "oxideav-mjpeg"
 version = "0.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -819,15 +787,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "oxideav-riff"
-version = "0.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68c543deb71a22afe000b5bc58e3ddd26cd54b9b0d7cd0107deeb8055df7991a"
-dependencies = [
- "oxideav-core",
-]
-
-[[package]]
 name = "oxideav-source"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -883,10 +842,31 @@ dependencies = [
  "getrandom",
  "half",
  "memmap2",
+ "oxideav-aac",
+ "oxideav-av1",
+ "oxideav-avi",
+ "oxideav-basic",
+ "oxideav-bmp",
  "oxideav-core",
+ "oxideav-flac",
+ "oxideav-gif",
+ "oxideav-h264",
+ "oxideav-h265",
  "oxideav-image",
- "oxideav-meta",
+ "oxideav-mjpeg",
+ "oxideav-mkv",
+ "oxideav-mov",
+ "oxideav-mp3",
+ "oxideav-mp4",
+ "oxideav-mpeg4video",
+ "oxideav-ogg",
+ "oxideav-opus",
  "oxideav-pipeline",
+ "oxideav-png",
+ "oxideav-vorbis",
+ "oxideav-vp8",
+ "oxideav-vp9",
+ "oxideav-webp",
  "regex",
  "rsurl",
  "serde",

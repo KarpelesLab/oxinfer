@@ -405,6 +405,32 @@ impl Transcriber {
         self.transcribe_with(pcm, opts, &mut |_| Flow::Continue)
     }
 
+    /// Transcribes decoded audio frames (the `oxideav` feature): `params` gives `sample_rate`,
+    /// `channels` and `sample_format`; the channels are averaged and the samples resampled to
+    /// 16 kHz (see [`crate::av::audio_frames_to_mono`]).
+    #[cfg(feature = "oxideav")]
+    pub fn transcribe_frames(
+        &self,
+        frames: &[oxideav_core::AudioFrame],
+        params: &oxideav_core::CodecParameters,
+        opts: &TranscribeOptions,
+    ) -> Result<Transcript> {
+        self.transcribe_frames_with(frames, params, opts, &mut |_| Flow::Continue)
+    }
+
+    /// [`Transcriber::transcribe_frames`] with the segment callback of [`Transcriber::transcribe_with`].
+    #[cfg(feature = "oxideav")]
+    pub fn transcribe_frames_with(
+        &self,
+        frames: &[oxideav_core::AudioFrame],
+        params: &oxideav_core::CodecParameters,
+        opts: &TranscribeOptions,
+        on_segment: &mut dyn FnMut(&Segment) -> Flow,
+    ) -> Result<Transcript> {
+        let pcm = crate::av::audio_frames_to_mono(frames, params, mel::SAMPLE_RATE)?;
+        self.transcribe_with(&pcm, opts, on_segment)
+    }
+
     /// Decodes an audio file (any container / codec oxideav reads), resampled to 16 kHz mono.
     #[cfg(feature = "media")]
     pub fn load_audio(path: &Path) -> Result<Vec<f32>> {

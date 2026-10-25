@@ -502,8 +502,8 @@ fn transcribe_common(
     })
 }
 
-/// Transcribes `n` mono samples in [-1, 1] at `sample_rate` Hz (resampled to 16 kHz with the
-/// `media` feature; otherwise it must be 16000). Returns the transcript as JSON.
+/// Transcribes `n` mono samples in [-1, 1] at `sample_rate` Hz (resampled to 16 kHz). Returns
+/// the transcript as JSON.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxi_transcribe_pcm(
     t: *mut OxiTranscriber,
@@ -527,17 +527,7 @@ pub unsafe extern "C" fn oxi_transcribe_pcm(
             .ok()
             .filter(|&r| r > 0)
             .context("sample_rate must be positive")?;
-        if rate == crate::whisper::mel::SAMPLE_RATE {
-            return Ok(x.to_vec());
-        }
-        #[cfg(feature = "media")]
-        {
-            Ok(crate::media::resample(x, rate, crate::whisper::mel::SAMPLE_RATE))
-        }
-        #[cfg(not(feature = "media"))]
-        {
-            bail!("sample_rate must be 16000 (resampling needs the `media` feature)")
-        }
+        Ok(crate::audio::resample(x, rate, crate::whisper::mel::SAMPLE_RATE))
     })
 }
 

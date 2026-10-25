@@ -14,6 +14,41 @@ const FRAME: usize = 320;
 const HOP: usize = 160;
 const FFT: usize = 512;
 
+/// Windowed-sinc resampler (Hann window, 32 taps per side), good enough for speech features.
+pub fn resample(x: &[f32], from: usize, to: usize) -> Vec<f32> {
+    if from == to || x.is_empty() {
+        return x.to_vec();
+    }
+    let ratio = from as f64 / to as f64;
+    let n_out = ((x.len() as f64) / ratio).floor() as usize;
+    let cutoff = (to as f64 / from as f64).min(1.0) * 0.95; // fraction of the input Nyquist
+    let taps = 32i64;
+    let pi = std::f64::consts::PI;
+    (0..n_out)
+        .map(|i| {
+            let center = i as f64 * ratio;
+            let c0 = center.floor() as i64;
+            let (mut acc, mut wsum) = (0f64, 0f64);
+            for j in (c0 - taps)..=(c0 + taps) {
+                if j < 0 || j >= x.len() as i64 {
+                    continue;
+                }
+                let d = j as f64 - center;
+                let sinc = if d.abs() < 1e-12 {
+                    1.0
+                } else {
+                    (pi * d * cutoff).sin() / (pi * d * cutoff)
+                };
+                let w = 0.5 + 0.5 * (pi * d / (taps as f64 + 1.0)).cos();
+                let k = cutoff * sinc * w;
+                acc += k * x[j as usize] as f64;
+                wsum += k;
+            }
+            if wsum.abs() > 1e-9 { (acc / wsum) as f32 } else { 0.0 }
+        })
+        .collect()
+}
+
 /// Number of mel frames the extractor produces for `n` samples.
 pub fn num_mel_frames(n: usize) -> usize {
     let pad_left = FRAME / 2;

@@ -241,8 +241,8 @@ char *oxi_transcriber_info_json(OxiTranscriber *t);
  *    "stats": {"audio_secs", "mel_secs", "encode_secs", "decode_secs", "total_secs", "windows",
  *              "tokens", "rtf"}} */
 
-/* Transcribes `n` mono float samples in [-1, 1] at `sample_rate` Hz (resampled to 16 kHz;
- * builds without the `media` feature need 16000). `cb` may be NULL. */
+/* Transcribes `n` mono float samples in [-1, 1] at `sample_rate` Hz (resampled to 16 kHz).
+ * `cb` may be NULL. */
 char *oxi_transcribe_pcm(OxiTranscriber *t, const float *samples, size_t n, int sample_rate, const char *options_json,
                          oxi_segment_fn cb, void *user);
 

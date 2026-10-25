@@ -341,13 +341,18 @@ pub fn preprocess_video(frames: &[&[u8]], w: usize, h: usize, pc: &ProcessorConf
 /// Timestamps (seconds) of the temporal patches of a clip sampled at `indices` from a `fps`
 /// video: the mean of each patch's first and last frame (`Qwen3VLProcessor._calculate_timestamps`).
 pub fn temporal_patch_times(indices: &[usize], fps: f64, temporal_patch_size: usize) -> Vec<f64> {
-    let mut idx = indices.to_vec();
-    while !idx.is_empty() && !idx.len().is_multiple_of(temporal_patch_size) {
-        idx.push(*idx.last().unwrap());
+    let times: Vec<f64> = indices.iter().map(|&i| i as f64 / fps).collect();
+    temporal_patch_times_of(&times, temporal_patch_size)
+}
+
+/// [`temporal_patch_times`] from the sampled frames' timestamps in seconds: the mean of the first
+/// and last frame of each temporal patch (the last frame repeated to fill the final patch).
+pub fn temporal_patch_times_of(times: &[f64], temporal_patch_size: usize) -> Vec<f64> {
+    let mut t = times.to_vec();
+    while !t.is_empty() && !t.len().is_multiple_of(temporal_patch_size) {
+        t.push(*t.last().unwrap());
     }
-    idx.chunks(temporal_patch_size)
-        .map(|c| (c[0] as f64 / fps + c[c.len() - 1] as f64 / fps) / 2.0)
-        .collect()
+    t.chunks(temporal_patch_size).map(|c| (c[0] + c[c.len() - 1]) / 2.0).collect()
 }
 
 /// A biased linear layer of the tower.

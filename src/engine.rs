@@ -383,7 +383,8 @@ impl EngineOptions {
 }
 
 /// Attachments for [`Engine::send_with_media`], placed before the message text (images, then
-/// videos, then audio clips).
+/// videos, then audio clips). Files need the `media` feature; decoded oxideav frames (the
+/// `oxideav` feature) go after the files of the same kind.
 #[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct Attachments {
@@ -393,6 +394,15 @@ pub struct Attachments {
     /// Video files (MP4 / MOV / MKV / WebM / AVI: H.264, H.265, AV1, VP8, VP9, MPEG-4, MJPEG) or
     /// directories of frames.
     pub videos: Vec<PathBuf>,
+    /// Decoded pictures, after `images`.
+    #[cfg(feature = "oxideav")]
+    pub image_frames: Vec<crate::av::Picture>,
+    /// Decoded audio, after `audios` (Gemma 4 only).
+    #[cfg(feature = "oxideav")]
+    pub audio_frames: Vec<crate::av::AudioClip>,
+    /// Decoded videos, after `videos`; their frame timestamps give the prompt's.
+    #[cfg(feature = "oxideav")]
+    pub video_frames: Vec<crate::av::VideoClip>,
     /// Video frame sampling (defaults: the model's video processor).
     pub video: crate::video::VideoOptions,
     /// Image token budget, 0 for the model's default (see [`mm::MmRequest::max_soft_tokens`]).
@@ -401,7 +411,50 @@ pub struct Attachments {
 
 impl Attachments {
     pub fn is_empty(&self) -> bool {
+        #[cfg(feature = "oxideav")]
+        if !self.frames().is_empty() {
+            return false;
+        }
         self.images.is_empty() && self.audios.is_empty() && self.videos.is_empty()
+    }
+
+    /// The decoded attachments (the `oxideav` feature).
+    #[cfg(feature = "oxideav")]
+    pub fn frames(&self) -> mm::MmFrames<'_> {
+        mm::MmFrames {
+            images: &self.image_frames,
+            audios: &self.audio_frames,
+            videos: &self.video_frames,
+        }
+    }
+
+    /// With a decoded picture: a frame and the parameters describing it (`width`, `height`,
+    /// `pixel_format`).
+    #[cfg(feature = "oxideav")]
+    pub fn with_image_frame(mut self, frame: oxideav_core::VideoFrame, params: oxideav_core::CodecParameters) -> Self {
+        self.image_frames.push(crate::av::Picture::new(frame, params));
+        self
+    }
+
+    /// With decoded audio: frames and the parameters describing them (`sample_rate`,
+    /// `channels`, `sample_format`).
+    #[cfg(feature = "oxideav")]
+    pub fn with_audio_frames(mut self, frames: Vec<oxideav_core::AudioFrame>, params: oxideav_core::CodecParameters) -> Self {
+        self.audio_frames.push(crate::av::AudioClip::new(frames, params));
+        self
+    }
+
+    /// With a decoded video: frames in presentation order, their parameters and the time base of
+    /// their `pts` (see [`crate::av::VideoClip`]).
+    #[cfg(feature = "oxideav")]
+    pub fn with_video_frames(
+        mut self,
+        frames: Vec<oxideav_core::VideoFrame>,
+        params: oxideav_core::CodecParameters,
+        time_base: Option<oxideav_core::TimeBase>,
+    ) -> Self {
+        self.video_frames.push(crate::av::VideoClip::new(frames, params, time_base));
+        self
     }
 
     /// Parses `{"images": [path...], "audios": [...], "videos": [...], "video_fps": F,
@@ -1150,9 +1203,10 @@ impl Engine {
         self.send_with_media(user, &media, on_delta)
     }
 
-    /// [`Engine::send`] with attachments placed before the message text (the `media` feature):
-    /// images, videos and audio for Gemma 4; images and videos for Qwen3.5 / 3.6 / 3.8
-    /// checkpoints that include the vision tower. Not for Core ML models.
+    /// [`Engine::send`] with attachments placed before the message text (files need the `media`
+    /// feature, decoded frames the `oxideav` feature): images, videos and audio for Gemma 4;
+    /// images and videos for Qwen3.5 / 3.6 / 3.8 checkpoints that include the vision tower. Not
+    /// for Core ML models.
     pub fn send_with_media(&mut self, user: &str, media: &Attachments, on_delta: &mut dyn FnMut(&Delta) -> Flow) -> Result<Reply> {
         let (mm_text, feats) = if media.is_empty() {
             (String::new(), Vec::new())
@@ -1176,7 +1230,11 @@ impl Engine {
                 dump_mm: None,
             };
             let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
-            mm::prepare(&req, self.files, self.info.hidden_size)?
+            #[cfg(feature = "oxideav")]
+            let prepared = mm::prepare_frames(&req, media.frames(), self.files, self.info.hidden_size)?;
+            #[cfg(not(feature = "oxideav"))]
+            let prepared = mm::prepare(&req, self.files, self.info.hidden_size)?;
+            prepared
         };
         let text = self.prompt_text(&format!("{mm_text}{user}"));
         let think = self.config.think;
@@ -1234,14 +1292,14 @@ impl Engine {
                 ),
                 _ => bail!("image decisions are supported on Qwen3.5-family vision checkpoints only"),
             }
-            let bytes = plan.images.iter().map(|s| s.bytes()).collect::<Result<Vec<_>>>()?;
+            let images = crate::decide::ImageSource::to_rgb_all(&plan.images)?;
             let enc = {
                 let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
-                mm::encode_images(
+                mm::encode_rgb_images(
                     &self.info.path,
                     self.files,
                     self.info.hidden_size,
-                    &bytes,
+                    &images,
                     req.attachments.max_soft_tokens,
                 )?
             };

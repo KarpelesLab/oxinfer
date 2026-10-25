@@ -39,10 +39,25 @@ pub struct Params {
     pub sampler: Sampler,
 }
 
+/// A generated image: tightly packed RGB8.
 pub struct Image {
     pub width: usize,
     pub height: usize,
     pub rgb: Vec<u8>,
+}
+
+#[cfg(feature = "oxideav")]
+impl Image {
+    /// The image as an oxideav `Rgb24` frame (`pts` 0) and its `rawvideo` parameters (`width`,
+    /// `height`, `pixel_format`; see [`crate::av::rgb_frame`]), e.g. for an oxideav encoder or filter graph.
+    pub fn to_video_frame(&self) -> (oxideav_core::VideoFrame, oxideav_core::CodecParameters) {
+        crate::av::rgb_frame(self.width, self.height, self.rgb.clone())
+    }
+
+    /// [`Image::to_video_frame`] without copying the pixels.
+    pub fn into_video_frame(self) -> (oxideav_core::VideoFrame, oxideav_core::CodecParameters) {
+        crate::av::rgb_frame(self.width, self.height, self.rgb)
+    }
 }
 
 /// Timings of one generation, in seconds.

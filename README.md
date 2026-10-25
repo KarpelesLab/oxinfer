@@ -509,7 +509,8 @@ ffmpeg's, three for MJPEG). A directory of image files (sorted by name) is read 
 ffmpeg, and frames up to the last sampled one are all decoded. Not available: other codecs
 (ProRes, Theora, ...), the audio track of a video, and hardware decoding. The same attachments
 go through the library (`Engine::send_with_media` with `Attachments`) and the C API
-(`oxi_engine_send_media` with a JSON list).
+(`oxi_engine_send_media` with a JSON list); frames already decoded by oxideav go through the
+library too (see [Using oxinfer from oxideav](#using-oxinfer-from-oxideav-and-other-crates)).
 
 Agreement with transformers 5.20 (float32, CPU; `tools/ref_vl.py` runs the reference processor
 and model on the same files and compares with oxinfer's `--dump-mm` / `--dump-logits`):
@@ -843,6 +844,81 @@ download progress and cancellation. Core ML packages (below) load through the sa
 decoding, streaming detokenization) and the model, session and sampler types. A C API over the
 engine (`capi` feature, `include/oxinfer.h`) and a SwiftUI test app for iOS are in `ios/`
 (see `ios/README.md`).
+
+### Using oxinfer from oxideav (and other crates)
+
+Images, audio and video in the API are [oxideav](https://crates.io/crates/oxideav-core) types:
+decoded `VideoFrame`s and `AudioFrame`s with the `CodecParameters` that describe them, as an
+oxideav pipeline hands them from stage to stage. Two features split what a dependent pulls in:
+
+| Feature | Brings | Gives |
+|---|---|---|
+| `oxideav` | `oxideav-core` only | `oxinfer::av` and the in-memory inputs and outputs below; `oxinfer::oxideav_core` re-exports the crate |
+| `media` (default, implies `oxideav`) | oxideav-pipeline, oxideav-image and the codec and container crates (PNG, JPEG, WebP, GIF, BMP, MP3, FLAC, AAC, Vorbis, Opus, WAV, MP4, MOV, Matroska / WebM, Ogg, AVI, H.264, H.265, VP8, VP9, AV1, MPEG-4 Part 2) | the path-based inputs (`--image`, `--video`, `--audio`, `transcribe_file`, `Media`) |
+
+`hf` (HuggingFace fetching) and `gpu` (run-time GPU backends) are independent of both. A crate
+that already has decoded frames, such as an oxideav filter, needs only the types:
+
+```toml
+[dependencies]
+oxinfer = { version = "0.0.4", default-features = false, features = ["oxideav", "hf", "gpu"] }
+oxideav-core = "0.1.41" # the same 0.1 release oxinfer uses, so the types are the same
+```
+
+Chat and multimodal prompts take frames next to file paths (each kind after the files of the
+same kind):
+
+```rust
+use oxinfer::engine::{Attachments, Engine, EngineOptions, Flow};
+let mut engine = Engine::load("Qwen/Qwen3.5-0.8B", &EngineOptions::default())?;
+// A picture: one VideoFrame and its parameters (width, height, pixel_format).
+let media = Attachments::default().with_image_frame(frame, params);
+// A clip: frames in presentation order, their parameters and the stream time base; frames are
+// sampled as the model's video processor does, and the prompt's timestamps come from the pts.
+let media = media.with_video_frames(frames, video_params, Some(time_base));
+// Audio (Gemma 4): frames and their parameters (sample_rate, channels, sample_format).
+let media = media.with_audio_frames(audio_frames, audio_params);
+let reply = engine.send_with_media("What happens here?", &media, &mut |_| Flow::Continue)?;
+```
+
+The other consumers and producers of media:
+
+```rust
+// Speech to text from decoded audio (any sample format, rate and channel count).
+let t = transcriber.transcribe_frames(&audio_frames, &audio_params, &TranscribeOptions::default())?;
+// Typed decisions over a picture (placed before the state text).
+let req = DecisionRequest::noul("Backyard camera.", "Is there an animal?").with_image_frames([Picture::new(frame, params)]);
+// Stable Diffusion output as an Rgb24 frame for an encoder or a filter graph.
+let (img, _) = pipeline.generate(&params, &mut |_, _| {})?;
+let (frame, frame_params) = img.into_video_frame();
+```
+
+Underneath, `av::video_frame_to_rgb` and `av::audio_frames_to_mono` do the conversions, and
+`mm::prepare_frames` (with `mm::MmFrames`) turns frames into soft tokens for the lower-level
+`generate` API. Pixel formats: packed RGB / BGR in every byte order (with or without alpha or
+padding, 8 and 16 bits, 5-6-5 and 5-5-5), gray (8 to 16 bits, with alpha), 1-bit mono, `Pal8`,
+planar YUV 4:2:0, 4:2:2, 4:4:4, 4:4:0 and 4:1:1 at 8 to 16 bits (with alpha, `YuvJ*`), NV12 /
+NV21, YUYV / UYVY and planar GBR(A); others (CMYK, float) are an error naming the format. YCbCr
+follows the colour signal of the frame or the stream (BT.601 limited range when unspecified;
+BT.709, BT.2020, FCC, SMPTE 240M, identity, full range), in oxideav-pixfmt's fixed-point
+arithmetic: the RGB is byte-identical to `oxideav_image::Image::to_rgb8` for every format both
+convert, so frames and files give the same soft tokens, replies and transcripts
+(`tests/oxideav_e2e.rs`). A missing `width`, `height` or `pixel_format` is inferred from the
+plane layout, as for decoded files; audio of every `SampleFormat`, interleaved or planar, is
+averaged to mono and resampled to the model's rate.
+
+**Dependency cycles.** `media` depends on the codec and container crates directly, not on
+`oxideav-meta`, so a transform crate that depends on oxinfer can itself be registered by
+`oxideav-meta` without a cycle, whatever features it enables. (Cargo refuses any cycle among the
+activated dependencies and accepts one through an optional dependency that is not enabled. With
+a `media` that depended on `oxideav-meta`, oxinfer -> oxideav-meta -> transform -> oxinfer would
+fail in any build that registers the transform in oxideav-meta and enables `media` anywhere, even
+in another crate, since features are unified across the whole graph.) The rule for the transform crate and anything oxideav-meta pulls in:
+
+- depend on `oxinfer` with `default-features = false` and the features you use (`oxideav`, and
+  `hf` / `gpu` as wanted); take `media` only if you need oxinfer to open files itself;
+- never make oxinfer depend on a crate that depends on the transform (oxideav-meta, an
+  "everything" facade): its `media` feature lists the codec crates one by one for that reason.
 
 ## Performance
 
@@ -1497,9 +1573,11 @@ weights), and stays off the GPU for the same reasons as on Metal. Weights in mod
 fit in 4 GiB, and no single file can exceed 2 GiB. `web/scripts/test_gemm.mjs` checks the WGSL kernels
 against a JavaScript reference.
 
-Feature flags: `media` (oxideav image/audio/video decoding), `hf` (HuggingFace fetching), `gpu`
-(dlsym-loaded backends), all on by default, and `web` (the browser module, off by default and only
-meaningful for `wasm32-unknown-unknown`); `--no-default-features` gives the plain CPU build.
+Feature flags: `media` (oxideav image/audio/video file decoding), `hf` (HuggingFace fetching),
+`gpu` (dlsym-loaded backends), all on by default; `oxideav` (oxideav-core types in the API, implied
+by `media`; see [Using oxinfer from oxideav](#using-oxinfer-from-oxideav-and-other-crates)), `capi`,
+and `web` (the browser module, off by default and only meaningful for `wasm32-unknown-unknown`);
+`--no-default-features` gives the plain CPU build.
 Cross-compiling needs no C toolchain: the tokenizer uses its pure-Rust regex backend.
 
 ### Core ML / Apple Neural Engine
@@ -1763,8 +1841,8 @@ billion parameters at LUT4, `infer` only) are the practical range for 12 GB phon
 - `vision.rs`, `audio.rs`: Gemma 4's two encoders plus preprocessing (resize/patching, mel
   features) and the embedders; `qwen_vision.rs`: the Qwen3.5-family image / video processors and
   vision tower; `resample.rs`: torchvision- and Pillow-exact bicubic resizing; `video.rs`: frame
-  sampling and video decoding; `media.rs`: file decoding through oxideav; `mm.rs`: attachments to
-  soft tokens and prompt placeholders; `mm_config.rs`: Gemma's tower configs and placeholder
+  sampling and video decoding; `media.rs`: file decoding through oxideav; `av.rs`: decoded oxideav
+  frames to RGB / mono PCM and back; `mm.rs`: attachments to soft tokens and prompt placeholders; `mm_config.rs`: Gemma's tower configs and placeholder
   token ids.
 - `pool.rs`: a spin-waiting thread pool with an atomic work counter. Dispatch costs about a microsecond,
   which matters because a decode step issues ~200 small parallel regions.

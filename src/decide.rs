@@ -42,6 +42,7 @@
 
 use crate::engine::Attachments;
 use crate::lora::LoraAdapter;
+use crate::video::RgbImage;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -112,6 +113,9 @@ pub enum ImageSource {
     Bytes(Vec<u8>),
     /// An `http://` / `https://` URL, fetched when the decision runs (`hf` feature).
     Url(String),
+    /// A decoded picture (the `oxideav` feature).
+    #[cfg(feature = "oxideav")]
+    Frame(Box<crate::av::Picture>),
 }
 
 impl ImageSource {
@@ -133,7 +137,7 @@ impl ImageSource {
         Ok(Self::Path(PathBuf::from(s.strip_prefix("file://").unwrap_or(s))))
     }
 
-    /// The encoded image.
+    /// The encoded image (a decoded picture is encoded as PNG).
     pub fn bytes(&self) -> Result<Vec<u8>> {
         match self {
             Self::Path(p) => crate::fsx::read(p).with_context(|| format!("read image {}", p.display())),
@@ -142,15 +146,53 @@ impl ImageSource {
             Self::Url(u) => crate::hf::http_get(u),
             #[cfg(not(feature = "hf"))]
             Self::Url(u) => bail!("{u}: built without the `hf` feature, so image URLs cannot be fetched"),
+            #[cfg(feature = "oxideav")]
+            Self::Frame(f) => {
+                let img = f.to_rgb()?;
+                Ok(crate::png::encode_rgb(img.width, img.height, &img.data))
+            }
         }
     }
 
-    /// The state part for this image (`{"image": ...}`; bytes as a base64 data URL).
+    /// The images as RGB8, in order: decoded pictures converted, the others read and decoded
+    /// (the `media` feature).
+    pub fn to_rgb_all(images: &[ImageSource]) -> Result<Vec<RgbImage>> {
+        let encoded = images
+            .iter()
+            .filter(|s| !s.is_frame())
+            .map(|s| s.bytes())
+            .collect::<Result<Vec<_>>>()?;
+        let mut decoded = crate::mm::decode_images(&encoded)?.into_iter();
+        images
+            .iter()
+            .map(|s| match s {
+                #[cfg(feature = "oxideav")]
+                Self::Frame(f) => f.to_rgb(),
+                _ => Ok(decoded.next().expect("one decoded image per encoded one")),
+            })
+            .collect()
+    }
+
+    fn is_frame(&self) -> bool {
+        #[cfg(feature = "oxideav")]
+        if let Self::Frame(_) = self {
+            return true;
+        }
+        false
+    }
+
+    /// The state part for this image (`{"image": ...}`; bytes as a base64 data URL, a decoded
+    /// picture as a PNG data URL).
     pub fn to_part(&self) -> Value {
         let s = match self {
             Self::Path(p) => p.display().to_string(),
             Self::Bytes(b) => format!("data:application/octet-stream;base64,{}", crate::b64::encode(b)),
             Self::Url(u) => u.clone(),
+            #[cfg(feature = "oxideav")]
+            Self::Frame(_) => match self.bytes() {
+                Ok(png) => format!("data:image/png;base64,{}", crate::b64::encode(&png)),
+                Err(e) => format!("(unconvertible picture: {e})"),
+            },
         };
         json!({ "image": s })
     }
@@ -176,9 +218,10 @@ pub struct DecisionRequest {
     pub question: String,
     /// `choice`: 2-256 options (one line each). `noul` / `score`: empty, or their verbalizers.
     pub options: Vec<String>,
-    /// Image files placed at the start of the state, before its text, and the image token
-    /// budget (`max_soft_tokens`, for the state's own images too; 0: the processor's default).
-    /// Videos and audio are refused: the protocol takes images only.
+    /// Image files (and decoded pictures, `image_frames`) placed at the start of the state,
+    /// before its text, and the image token budget (`max_soft_tokens`, for the state's own images
+    /// too; 0: the processor's default). Videos and audio are refused: the protocol takes images
+    /// only.
     pub attachments: Attachments,
 }
 
@@ -195,6 +238,13 @@ impl DecisionRequest {
     /// With image files placed before the state text (see [`DecisionRequest::attachments`]).
     pub fn with_images<P: Into<PathBuf>>(mut self, images: impl IntoIterator<Item = P>) -> Self {
         self.attachments.images.extend(images.into_iter().map(Into::into));
+        self
+    }
+    /// With decoded pictures placed before the state text, after the image files (the `oxideav`
+    /// feature).
+    #[cfg(feature = "oxideav")]
+    pub fn with_image_frames(mut self, images: impl IntoIterator<Item = crate::av::Picture>) -> Self {
+        self.attachments.image_frames.extend(images);
         self
     }
     pub fn noul(state: impl Into<Value>, question: impl Into<String>) -> Self {
@@ -253,8 +303,8 @@ impl DecisionRequest {
         Ok(s)
     }
 
-    /// The state as text and images in prompt order: the attachments' images first, then the
-    /// state (adjacent text merged).
+    /// The state as text and images in prompt order: the attachments' images first (files, then
+    /// decoded pictures), then the state (adjacent text merged).
     pub fn state_parts(&self) -> Result<Vec<StatePart>> {
         use crate::tools::qwen::py_json;
         let mut out: Vec<StatePart> = self
@@ -263,6 +313,13 @@ impl DecisionRequest {
             .iter()
             .map(|p| StatePart::Image(ImageSource::Path(p.clone())))
             .collect();
+        #[cfg(feature = "oxideav")]
+        out.extend(
+            self.attachments
+                .image_frames
+                .iter()
+                .map(|f| StatePart::Image(ImageSource::Frame(Box::new(f.clone())))),
+        );
         let text = |out: &mut Vec<StatePart>, t: &str| match out.last_mut() {
             Some(StatePart::Text(s)) => s.push_str(t),
             _ => out.push(StatePart::Text(t.to_string())),
@@ -797,7 +854,11 @@ impl DecisionAssets {
             }
         };
         let a = &req.attachments;
-        if !a.videos.is_empty() || !a.audios.is_empty() {
+        #[cfg(feature = "oxideav")]
+        let frames = !a.video_frames.is_empty() || !a.audio_frames.is_empty();
+        #[cfg(not(feature = "oxideav"))]
+        let frames = false;
+        if !a.videos.is_empty() || !a.audios.is_empty() || frames {
             bail!("decisions take images only (the /v1/decide protocol has no video or audio parts)");
         }
         // Text around the images: pieces[i] comes before image i, the last one after them all.
@@ -1024,6 +1085,30 @@ mod tests {
         assert_eq!((r.attachments.images.len(), r.attachments.max_soft_tokens), (1, 64));
         assert_eq!(bundle_name(Path::new("/c/hub/autotrust--JEV-9B/vl")), "autotrust/JEV-9B");
         assert_eq!(bundle_name(Path::new("/c/hub/autotrust--JEV-27B-VL")), "autotrust/JEV-27B-VL");
+    }
+
+    #[cfg(feature = "oxideav")]
+    #[test]
+    fn state_image_frames() {
+        // Decoded pictures follow the image files, before the state; they convert without a
+        // decoder, and serialize as PNG data URLs.
+        let pic = crate::av::Picture::from_rgb(2, 1, vec![1, 2, 3, 4, 5, 6]).unwrap();
+        let r = DecisionRequest::noul("state", "q")
+            .with_images(["/tmp/a.png"])
+            .with_image_frames([pic.clone()]);
+        let frame = ImageSource::Frame(Box::new(pic));
+        assert_eq!(
+            r.state_parts().unwrap(),
+            [
+                StatePart::Image(ImageSource::Path("/tmp/a.png".into())),
+                StatePart::Image(frame.clone()),
+                StatePart::Text("state".into()),
+            ]
+        );
+        let rgb = ImageSource::to_rgb_all(std::slice::from_ref(&frame)).unwrap();
+        assert_eq!((rgb[0].width, rgb[0].height, &rgb[0].data), (2, 1, &vec![1, 2, 3, 4, 5, 6]));
+        let part = frame.to_part();
+        assert!(part["image"].as_str().unwrap().starts_with("data:image/png;base64,"));
     }
 
     #[test]

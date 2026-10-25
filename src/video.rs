@@ -1,5 +1,6 @@
 //! Video input: frame sampling as the Hugging Face video processors do it, and (with the
 //! `media` feature) decoding through oxideav, from a video file or from a directory of frames.
+//! Decoded frames in memory are [`crate::av::VideoClip`] (the `oxideav` feature).
 //!
 //! oxideav (pure Rust) demuxes MP4 / MOV / Matroska / WebM / AVI and decodes H.264, H.265, AV1,
 //! VP8, VP9, MPEG-4 Part 2 and Motion JPEG; a directory of image files (sorted by name) is read
@@ -65,6 +66,15 @@ pub fn sample_uniform(total: usize, video_fps: f64, fps: Option<f64>, num_frames
     (0..n).map(|i| i * total / n).collect()
 }
 
+/// A decoded image: tightly packed RGB8.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RgbImage {
+    pub width: usize,
+    pub height: usize,
+    /// Interleaved RGB, row-major.
+    pub data: Vec<u8>,
+}
+
 /// Sampled frames of a clip.
 pub struct Clip {
     /// RGB8 frames, `width` x `height` each, in sampling order.
@@ -77,12 +87,18 @@ pub struct Clip {
     pub fps: f64,
     /// Frames in the clip.
     pub total: usize,
+    /// Presentation time of each sampled frame in seconds from the first frame, when the frames
+    /// carry timestamps (in-memory clips, [`crate::av::VideoClip`]); `None`: index / fps.
+    pub pts: Option<Vec<f64>>,
 }
 
 impl Clip {
     /// Timestamp of each sampled frame in seconds.
     pub fn times(&self) -> Vec<f64> {
-        self.indices.iter().map(|&i| i as f64 / self.fps).collect()
+        match &self.pts {
+            Some(t) => t.clone(),
+            None => self.indices.iter().map(|&i| i as f64 / self.fps).collect(),
+        }
     }
 }
 
@@ -97,7 +113,7 @@ mod decode {
     use super::*;
     use crate::media::Media;
     use anyhow::{Context, Result, anyhow, bail};
-    use oxideav_core::{CodecParameters, Frame, MediaType, PixelFormat, VideoFrame};
+    use oxideav_core::{CodecParameters, Frame, MediaType, VideoFrame};
     use std::path::Path;
 
     /// Image files of a frame directory, sorted by name.
@@ -150,6 +166,7 @@ mod decode {
                 indices,
                 fps,
                 total: files.len(),
+                pts: None,
             });
         }
         let ctx = media.context();
@@ -279,47 +296,15 @@ mod decode {
             indices,
             fps,
             total,
+            pts: None,
         })
     }
 
-    /// Converts a decoded frame to RGB8. Decoders do not always report their output pixel
-    /// format in the stream parameters; it is then inferred from the plane layout.
+    /// Converts a decoded frame to RGB8 through oxideav-image. Decoders do not always report
+    /// their output pixel format in the stream parameters; it is then inferred from the plane
+    /// layout ([`crate::av::complete_params`]).
     fn to_rgb(v: VideoFrame, params: &CodecParameters) -> Result<(Vec<u8>, usize, usize)> {
-        let mut p = params.clone();
-        let planes = v.image_planes();
-        if planes.is_empty() {
-            bail!("decoded frame has no planes");
-        }
-        let rows = |i: usize| planes[i].data.len() / planes[i].stride.max(1);
-        let w = p.width.map_or(planes[0].stride, |w| w as usize);
-        let h = p.height.map_or(rows(0), |h| h as usize);
-        p.width = Some(w as u32);
-        p.height = Some(h as u32);
-        if p.pixel_format.is_none() {
-            let full = p.codec_id.as_str() == "mjpeg";
-            let wide = planes[0].stride >= 2 * w && planes.len() == 3;
-            p.pixel_format = Some(match planes.len() {
-                3 => {
-                    let sub_v = rows(1) < h;
-                    let sub_h = planes[1].stride * if wide { 1 } else { 2 } <= planes[0].stride + 1;
-                    match (sub_v, sub_h, wide, full) {
-                        (true, _, false, false) => PixelFormat::Yuv420P,
-                        (true, _, false, true) => PixelFormat::YuvJ420P,
-                        (true, _, true, _) => PixelFormat::Yuv420P10Le,
-                        (false, true, false, false) => PixelFormat::Yuv422P,
-                        (false, true, false, true) => PixelFormat::YuvJ422P,
-                        (false, true, true, _) => PixelFormat::Yuv422P10Le,
-                        (false, false, false, false) => PixelFormat::Yuv444P,
-                        (false, false, false, true) => PixelFormat::YuvJ444P,
-                        (false, false, true, _) => PixelFormat::Yuv444P10Le,
-                    }
-                }
-                2 => PixelFormat::Nv12,
-                1 if planes[0].stride >= 4 * w => PixelFormat::Rgba,
-                1 if planes[0].stride >= 3 * w => PixelFormat::Rgb24,
-                _ => PixelFormat::Gray8,
-            });
-        }
+        let p = crate::av::complete_params(&v, params)?;
         let img = oxideav_image::Image::from_video_frame(v, &p).map_err(|e| anyhow!("decoded frame: {e}"))?;
         let rgb = img.to_rgb8().map_err(|e| anyhow!("convert frame to RGB: {e}"))?;
         Ok((rgb, img.width() as usize, img.height() as usize))

@@ -44,8 +44,40 @@ required-features = ["hf", "media"]
 
 [features]
 default = ["media", "hf", "gpu"]
-# Image / audio / video file decoding through oxideav.
-media = ["dep:oxideav-core", "dep:oxideav-pipeline", "dep:oxideav-meta", "dep:oxideav-image"]
+# oxideav-core's types in the public API (the `av` module): in-memory images, audio and video as
+# VideoFrame / AudioFrame + CodecParameters for the multimodal models, Whisper and Stable
+# Diffusion. Only the type crate: no codecs, containers or file code.
+oxideav = ["dep:oxideav-core"]
+# Image / audio / video file decoding through oxideav (the path-based inputs). Depends on the codec
+# and container crates themselves, not on oxideav-meta, so a crate that oxideav-meta registers can
+# depend on oxinfer, with or without this feature, without a dependency cycle (see the README).
+media = [
+    "oxideav",
+    "dep:oxideav-pipeline",
+    "dep:oxideav-image",
+    "dep:oxideav-png",
+    "dep:oxideav-mjpeg",
+    "dep:oxideav-webp",
+    "dep:oxideav-gif",
+    "dep:oxideav-bmp",
+    "dep:oxideav-basic",
+    "dep:oxideav-mp3",
+    "dep:oxideav-flac",
+    "dep:oxideav-aac",
+    "dep:oxideav-mp4",
+    "dep:oxideav-mov",
+    "dep:oxideav-ogg",
+    "dep:oxideav-vorbis",
+    "dep:oxideav-opus",
+    "dep:oxideav-mkv",
+    "dep:oxideav-avi",
+    "dep:oxideav-h264",
+    "dep:oxideav-h265",
+    "dep:oxideav-vp8",
+    "dep:oxideav-vp9",
+    "dep:oxideav-av1",
+    "dep:oxideav-mpeg4video",
+]
 # Fetching models from HuggingFace through rsurl.
 hf = ["dep:rsurl"]
 # Runtime-loaded GPU backends (CUDA, Metal, Vulkan detection); all optional at run time.
@@ -58,10 +90,34 @@ web = ["dep:getrandom"]
 capi = []
 
 [dependencies]
-oxideav-core = { version = "0.1", optional = true }
-oxideav-pipeline = { version = "0.1", optional = true }
-oxideav-meta = { version = "0.0.3", default-features = false, features = ["png", "mjpeg", "webp", "gif", "bmp", "basic", "mp3", "flac", "aac", "mp4", "mov", "ogg", "vorbis", "opus", "mkv", "riff", "avi", "h264", "h265", "vp8", "vp9", "av1", "mpeg4video"], optional = true }
+oxideav-core = { version = "0.1.41", optional = true }
+oxideav-pipeline = { version = "0.1.13", optional = true }
 oxideav-image = { version = "0.0.5", optional = true }
+# The codecs and containers of `media` (registered by `media::Media::new`). The 0.0.x crates take
+# any later 0.0 release, as oxideav-meta's own requirements do, so they unify with the host's
+# oxideav tree.
+oxideav-png = { version = "0.1.12", optional = true }
+oxideav-mjpeg = { version = "0.1.13", optional = true }
+oxideav-webp = { version = "0.3.1", optional = true }
+oxideav-gif = { version = ">=0.0.14, <0.1", optional = true }
+oxideav-bmp = { version = "0.1.8", optional = true }
+oxideav-basic = { version = ">=0.0.11, <0.1", optional = true }
+oxideav-mp3 = { version = "0.1.3", optional = true }
+oxideav-flac = { version = ">=0.0.11, <0.1", optional = true }
+oxideav-aac = { version = "0.1.7", optional = true }
+oxideav-mp4 = { version = ">=0.0.10, <0.1", optional = true }
+oxideav-mov = { version = ">=0.0.6, <0.1", optional = true }
+oxideav-ogg = { version = "0.1.9", optional = true }
+oxideav-vorbis = { version = ">=0.0.12, <0.1", optional = true }
+oxideav-opus = { version = ">=0.0.14, <0.1", optional = true }
+oxideav-mkv = { version = ">=0.0.11, <0.1", optional = true }
+oxideav-avi = { version = ">=0.0.10, <0.1", optional = true }
+oxideav-h264 = { version = "0.1.9", optional = true }
+oxideav-h265 = { version = ">=0.0.15, <0.1", optional = true }
+oxideav-vp8 = { version = "0.2.7", optional = true }
+oxideav-vp9 = { version = ">=0.0.14, <0.1", optional = true }
+oxideav-av1 = { version = "0.1.21", optional = true }
+oxideav-mpeg4video = { version = "0.1.8", optional = true }
 anyhow = "1.0.104"
 half = "2.7.1"
 # CLIP tokenizer pre-tokenization (Unicode letter / number classes).
@@ -79,6 +135,12 @@ tokenizers = { version = "0.23.2", default-features = false, features = ["unstab
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 tokenizers = { version = "0.23.2", default-features = false, features = ["unstable_wasm"] }
+
+# tests/oxideav_e2e.rs decodes and encodes media the way an oxideav pipeline does.
+[dev-dependencies]
+oxideav-core = "0.1.41"
+oxideav-pipeline = "0.1.13"
+oxideav-image = "0.0.5"
 
 [profile.release]
 opt-level = 3
