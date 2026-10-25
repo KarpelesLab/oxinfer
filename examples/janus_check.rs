@@ -1,4 +1,4 @@
-//! Dumps for checking Janus-Pro against the reference (tools/ref_janus.py writes the same files):
+//! Dumps for checking Janus-Pro against the reference (`tools/ref_janus.py` writes the same files):
 //!
 //! ```text
 //! janus_check MODEL text QUESTION OUTDIR          prompt ids + last-token text logits
