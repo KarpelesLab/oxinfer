@@ -83,7 +83,7 @@ For `gemma4` the extension keys are (E2B shown):
 
 ```yaml
     local_attention_window: 512      # informational: applied inside the graph
-    local_cache_length: 576          # only when the local cache is a shifting window (see States)
+    local_cache_length: 640          # only when the local cache is a block-shifting window (see States)
     final_logit_softcap: 30.0        # informational: applied inside the LM head
     per_layer_inputs: 8960           # width of the per_layer_inputs tensor (layers x 256)
     kv_shared_layers: {15: 13, 16: 14, ...}   # informational: layer -> layer whose K/V it reads
@@ -190,20 +190,28 @@ every chunk. A fresh state (all zeros) is an empty context.
   RMSNorm and RoPE, V after its weightless RMSNorm. The KV-shared layers (the last
   `num_kv_shared_layers`) write nothing and attend to the slot of `kv_shared_layers[i]`.
   The global cache spans the whole context. The local cache too when `context_length <=
-  local_attention_window + batch_size` (the window is then a mask, see above); for longer
-  contexts it is a **shifting window** of `local_cache_length = local_attention_window +
-  batch_size` positions (meta.yaml key `local_cache_length`, absent for full-length local
-  caches): every call that processes `T` tokens drops the `T` oldest positions and appends the
-  new ones, so after a call ending at position `q` slot `j` holds position
-  `q - local_cache_length + 1 + j` (negative = empty). The extra `batch_size` positions keep
-  the window of the first token of a prefill batch complete. The runtime contract does not
-  change (the masks, including "slot not filled yet", are derived inside the graph from
-  `position_ids` and row `p` of `causal_mask`), but the cache cannot be rewound: positions
-  must be fed exactly once and in order, as for `recurrent_state` (re-running the last prompt
-  token, the ANEMLL habit, shifts the window again; these packages set
-  `prefill_last_token_output`, so it is not needed). Restarting at position 0 is fine without a
-  new state (older slots then count as empty); to go back to any other position restore a
-  snapshot of the state. E2B at context 8192: 7 MB of local cache instead of 100 MB.
+  local_attention_window + 2 batch_size` (the window is then a mask, see above); for longer
+  contexts it is a **block-shifting window** of `local_cache_length = local_attention_window
+  + 2 batch_size` positions (meta.yaml key `local_cache_length`, absent for full-length local
+  caches). Positions are grouped in blocks of `batch_size`; after a call whose last position is
+  `e`, slot `j` holds position `base + j` with `base = (e // batch_size + 1) * batch_size -
+  local_cache_length` (negative = empty, beyond `e` = not written yet). A call that enters a
+  new block shifts the cache by one block (a prefill batch always enters exactly one, an
+  `infer` call when its position is a multiple of `batch_size`), then writes its keys at their
+  slots. A position's slot thus depends only on its block, so `prefill` and `infer` read the
+  keys in the same order and give bit-identical results, as with full-length caches. One
+  block of slack holds the not yet written part of the current block, the other keeps the
+  window of a prefill batch that starts inside a block complete. The runtime contract does
+  not change (the masks are derived inside the graph from `position_ids` and `current_pos`),
+  but the cache cannot be rewound: positions must be fed exactly once and in order, as for
+  `recurrent_state` (re-running the last prompt token, the ANEMLL habit, is not needed: these
+  packages set `prefill_last_token_output`). Restarting at position 0 is fine without a new
+  state (older slots then count as empty); to go back to any other position restore a snapshot
+  of the state. E2B at context 8192: 8 MB of local cache instead of 100 MB.
+  Packages written by the first version of this layout (`local_cache_length` = window +
+  batch, 576 for E2B) dropped `T` positions per call; they work with the same contract, but
+  their `prefill` and `infer` sum the attention in different orders (logit differences up to
+  ~0.16, like those between two context lengths).
 
 The names are the Core ML state names (`stateSchema` in the compiled model's `metadata.json`,
 the same as ANEMLL's for the KV cache). Inference only passes the opaque state; the names matter

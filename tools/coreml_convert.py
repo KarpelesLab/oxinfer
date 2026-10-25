@@ -32,7 +32,7 @@ tools/coreml_quant.py): the float32 transformers model answers a few built-in pr
 Fisher information of every weight weights its k-means, and --lut-mix gives the most sensitive
 weights a wider LUT. `infer` and `prefill` see byte-identical weights, so the merged package
 stores them once. Decoder chunks are cut at about equal weight size, each below --max-chunk-mb.
-Gemma 4's sliding-window layers keep a cache of window + batch positions once the context is
+Gemma 4's sliding-window layers keep a cache of window + 2 batch positions once the context is
 longer than that (docs/coreml-format.md), so 4K-8K contexts cost little memory.
 
 Requires macOS with the Xcode command line tools (`xcrun coremlcompiler`), coremltools >= 8
@@ -641,9 +641,10 @@ class Decoder(nn.Module):
 
 def local_cache_len(sp: Spec, ctx: int, batch: int) -> int:
     """Positions kept by the sliding-window layers' cache: the whole context, or when the
-    context is longer than window + batch a shifting window of window + batch positions (the
-    first query of a prefill batch still sees `window` keys after the batch is appended)."""
-    n = sp.sliding_window + batch
+    context is longer than window + 2 batch a block-shifting window of that many positions
+    (GemmaDecoder: one block of slack for the not yet written part of the current block, one so
+    that a prefill batch starting inside a block still sees `window` keys)."""
+    n = sp.sliding_window + 2 * batch
     return n if sp.arch == "gemma4" and SHIFT_LOCAL_CACHE and ctx > n else ctx
 
 
@@ -778,7 +779,7 @@ class GemmaAttention(nn.Module):
             return y.view(1, n, 1, self.hd)
         return y.view(1, n, self.hd, t).permute(0, 1, 3, 2)
 
-    def forward(self, x, cos, sin, mask, current_pos, cache, shift=False):
+    def forward(self, x, cos, sin, mask, current_pos, cache, shift=None):
         t = x.shape[1]
         hs = x.permute(0, 2, 1).unsqueeze(2)
         q = self.q_norm(self.heads(self.q_proj(hs), self.nh, t))
@@ -789,9 +790,16 @@ class GemmaAttention(nn.Module):
             k = k * cos + rotate_half(k) * sin
             v = rms(self.heads(self.v_proj(hs), nkv, t), self.eps)
             kv = torch.cat([k, v], dim=1)
-            if shift:
-                # shifting window cache: drop the t oldest positions, append the new ones
-                cache[s : s + 1] = torch.cat([cache[s : s + 1, :, t:, :], kv], dim=2)
+            if shift is not None:
+                # block-shifting cache (see GemmaDecoder): drop the oldest `batch` positions when
+                # this call starts a new block, then write the new keys at their slot
+                place, keep, flag, b = shift
+                c = cache[s : s + 1]
+                rolled = torch.cat([c[:, :, b:, :], c[:, :, :b, :]], dim=2)
+                c = rolled if flag is None else rolled * flag + c * (1.0 - flag)
+                # insert by a 0/1 placement matmul (exact): a dynamic slice_update of a tensor
+                # runs on the CPU, and a second state write per layer does not compile
+                cache[s : s + 1] = c * keep + torch.matmul(place, kv)
             else:
                 cache[s : s + 1, :, current_pos : current_pos + t, :] = kv
         kc = cache[s, :nkv]  # [nkv, ctx, hd]
@@ -831,7 +839,7 @@ class GemmaLayer(nn.Module):
             self.post_per_layer_input_norm = norm("post_per_layer_input_norm")
         self.scalar = float(ck.get(p + "layer_scalar").item()) if ck.has(p + "layer_scalar") else 1.0
 
-    def forward(self, x, cos, sin, mask, current_pos, cache, pli, shift=False):
+    def forward(self, x, cos, sin, mask, current_pos, cache, pli, shift=None):
         h = self.self_attn(self.input_layernorm(x), cos, sin, mask, current_pos, cache, shift)
         x = x + self.post_attention_layernorm(h)
         hs = self.pre_feedforward_layernorm(x).permute(0, 2, 1).unsqueeze(2)
@@ -878,8 +886,9 @@ class GemmaDecoder(nn.Module):
         self.local_len = local_cache_len(sp, ctx, batch)
         self.shift = self.local_len < ctx
         self.sliding = ctx > sp.sliding_window and not self.shift
-        if self.sliding:
-            self.register_buffer("cols", torch.arange(ctx, dtype=torch.int32))
+        if self.shift:
+            self.register_buffer("slots", torch.arange(self.local_len).to(DTYPE))
+            self.register_buffer("mod_b", (torch.arange(ctx) % batch).to(DTYPE))
         for name, shape in state_shapes(sp, ctx, batch).items():
             self.register_buffer(name, torch.zeros(shape, dtype=DTYPE))
 
@@ -890,31 +899,51 @@ class GemmaDecoder(nn.Module):
             "full": (self.cos_g[position_ids].view(1, 1, t, -1), self.sin_g[position_ids].view(1, 1, t, -1)),
         }
         masks = {"full": causal_mask, "sliding": causal_mask}
+        shift = None
         if self.shift:
-            # Slot j of the local cache (after this call's write) holds position
-            # p + t - L + j. Query p + i sees slots L - t + i - W < j <= L - t + i (window band,
-            # a constant per function) with a position >= 0: L - t - j <= p, read from row p of
-            # the causal mask (column c is 0 iff c <= p), reversed.
-            n = self.local_len
-            i = torch.arange(t).view(-1, 1)
-            j = torch.arange(n).view(1, -1)
-            band = ((j > n - t + i - sp.sliding_window) & (j <= n - t + i)).to(DTYPE)
-            band = ((1.0 - band) * -30000.0).view(1, 1, t, n)
-            born = torch.flip(causal_mask[:, :, 0:1, 0 : n - t + 1], dims=[3])
-            if t > 1:
-                born = torch.cat([born, torch.zeros((1, 1, 1, t - 1), dtype=DTYPE)], dim=3)
-            masks["sliding"] = band + born
+            # Block-shifting local cache of L = window + 2 batch slots. Positions are grouped in
+            # blocks of `batch`; after a call whose last position is e, slot j holds position
+            # base + j with base = (e // batch + 1) * batch - L (the slots past e are not
+            # written yet). A call entering a new block shifts the cache by one block; a
+            # prefill batch always enters exactly one. The slot of a position thus only depends
+            # on its block, so `prefill` and `infer` see the keys in the same order and compute
+            # the same sums (bit-identical, as with full-length caches). Masks from positions:
+            # query r sees slot j iff r - window < base + j <= r and base + j >= 0.
+            # Core ML computes this integer arithmetic in fp16 (exact only up to 2048), so it
+            # is written with small numbers: r = p mod batch from a table (gathered like the RoPE
+            # tables), offsets relative to p, and "position >= 0" read from row p of the causal
+            # mask (column c is 0 iff c <= p).
+            n, bs, w = self.local_len, self.batch, sp.sliding_window
+            r = self.mod_b[current_pos].view(1, 1)
+            bp = (bs - n) - r  # base - p
+            if t == bs:
+                bp = bp + (r > 0).to(DTYPE) * bs  # a batch starting inside a block ends in the next one
+            j = self.slots.view(1, -1)
+            i = torch.arange(t, dtype=DTYPE).view(-1, 1)
+            rel = bp + j - i  # position of slot j minus position of query i
+            ok = ((rel <= 0) & (rel > -w)).to(DTYPE)
+            col = torch.clamp(-(bp + j), min=0.0).to(torch.int32).view(-1)  # slot j filled iff col <= p
+            born = torch.index_select(causal_mask[0, 0, 0], 0, col).view(1, 1, 1, n)
+            masks["sliding"] = ((1.0 - ok) * -30000.0).view(1, 1, t, n) + born
+            flag = None if t == bs else (r == 0).to(DTYPE).view(1, 1, 1, 1)  # infer: new block?
+            place = (self.slots.view(-1, 1) == (i.view(1, -1) - bp)).to(DTYPE)  # [L, T]: slot of query i
+            keep = (1.0 - place.sum(dim=1)).view(1, 1, n, 1)
+            shift = (place, keep, flag, bs)
         if self.sliding:
-            # keys at positions <= p - window are outside the sliding window of query p
-            out = self.cols.view(1, -1) <= (position_ids.view(-1, 1) - sp.sliding_window)
-            masks["sliding"] = causal_mask + out.to(DTYPE).view(1, 1, t, -1) * -30000.0
+            # keys at positions c <= r - window are outside the sliding window of query r, i.e.
+            # where column c + window of the causal mask row is 0 (comparing positions directly
+            # would run in fp16, inexact beyond 2048)
+            w = sp.sliding_window
+            out = (causal_mask[:, :, :, w:] == 0).to(DTYPE)
+            out = torch.cat([out, torch.zeros((1, 1, t, w), dtype=DTYPE)], dim=3)
+            masks["sliding"] = causal_mask + out * -30000.0
         caches = {"sliding": self.kv_cache_local, "full": self.kv_cache_global}
         used = set()
         d = sp.ple_dim
         for layer in self.layers:
             cos, sin = rope[layer.kind]
             pli = per_layer_inputs[:, :, layer.idx * d : (layer.idx + 1) * d] if d else None
-            x = layer(x, cos, sin, masks[layer.kind], current_pos, caches[layer.kind], pli, self.shift and layer.kind == "sliding")
+            x = layer(x, cos, sin, masks[layer.kind], current_pos, caches[layer.kind], pli, shift if layer.kind == "sliding" else None)
             used.add(layer.kind)
         for kind, cache in caches.items():  # Core ML rejects declared states the graph never reads
             if kind not in used:
@@ -1448,8 +1477,8 @@ def main():
     ap.add_argument(
         "--full-local-cache",
         action="store_true",
-        help="gemma4: keep context-length caches for the sliding-window layers too (default: a shifting cache of "
-        "window + batch positions once the context is longer than that)",
+        help="gemma4: keep context-length caches for the sliding-window layers too (default: a block-shifting cache of "
+        "window + 2 batch positions once the context is longer than that)",
     )
     ap.add_argument("--split-lm-head", type=int, default=16, help="LM head output splits (default 16)")
     ap.add_argument(

@@ -1278,16 +1278,19 @@ tokens here, and all of a short chat turn) goes through `infer` at decode speed,
 would enter the recurrent state. The first load compiles the model for the Neural Engine
 (cached by Core ML until another process loads the package with other settings).
 
-**Long contexts.** Gemma 4's sliding-window layers keep a shifting cache of window + batch = 576
-positions once the context is longer than that (`--full-local-cache` restores context-length
-caches); only the global layers' cache grows with the context. Gemma 4 E2B LUT6, 1939-token
-prompt (a README excerpt) + 100-200 teacher-forced tokens:
+**Long contexts.** Gemma 4's sliding-window layers keep a block-shifting cache of window + 2 x batch
+= 640 positions once the context is longer than that (`--full-local-cache` restores
+context-length caches); only the global layers' cache grows with the context. Keys keep their
+slot within a block of `batch` positions, so `prefill` and `infer` give bit-identical logits
+(oxinfer `--coreml-prefill auto` and `single`: identical last-prompt logits and replies), and
+packages that differ only in context length too. Gemma 4 E2B LUT6, 1939-token prompt (a README
+excerpt) + 100-200 teacher-forced tokens:
 
 | Context | Local cache | Logit cosine / top-1 | Prefill | Decode (at the end of the prompt) |
 |---|---|---|---|---|
-| 2048, full-length local cache | 25 MB | 0.99980 / 98.0% | 954 tok/s (1920 tokens) | 21.2 tok/s |
-| 2048, shifting local cache | 7 MB | 0.99980 / 98.0% | 1241 tok/s | 27.3 tok/s |
-| 8192, shifting local cache | 7 MB (vs 100 MB) | 0.99969 / 97.0% | 1042 tok/s (7936 tokens) | 22.2 tok/s |
+| 2048, full-length local cache | 25 MB | 0.99980 / 98.0% | 1215 tok/s (1920 tokens) | 26.6 tok/s |
+| 2048, block-shifting local cache | 8 MB | 0.99980 / 98.0% | 1530 tok/s | 33.4 tok/s |
+| 8192, block-shifting local cache | 8 MB (vs 100 MB) | 0.99969 / 97.0% | 1080 tok/s (7936 tokens) | 22.6 tok/s |
 
 **Memory on the Neural Engine.** Loading a chunk adds wired memory outside the process
 footprint. Each function of the multifunction chunk gets its own copy of the weights even though
