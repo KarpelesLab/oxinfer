@@ -311,11 +311,10 @@ pub fn quantize_act(x: &[f32], t: usize, n_in: usize) -> QAct {
 /// Quantized activations interleaved per token pair for 2x2 int8 matrix-multiply instructions
 /// (SMMLA): pair `p` holds tokens `2p` and `2p + 1` (an odd count repeats the last token).
 /// `q`: per 8 values, 8 of the first token then 8 of the second (`2 * n_in` bytes per pair);
-/// `s`, `f` (per block of 32) and `h` (per half block) as `[first, second, first, second]`.
+/// `s` (per block of 32) and `h` (per half block) as `[first, second, first, second]`.
 pub struct PairAct {
     pub q: Vec<i8>,
     pub s: Vec<f32>,
-    pub f: Vec<f32>,
     pub h: Vec<f32>,
 }
 
@@ -326,7 +325,6 @@ impl PairAct {
         let np = t.div_ceil(2);
         let mut q = vec![0i8; np * 2 * n];
         let mut s = vec![0f32; np * bpr * 4];
-        let mut f = vec![0f32; np * bpr * 4];
         let mut h = vec![0f32; np * bpr * 8];
         for p in 0..np {
             let (t0, t1) = (2 * p, (2 * p + 1).min(t - 1));
@@ -342,10 +340,9 @@ impl PairAct {
                 }
             }
             quad(&mut s[p * bpr * 4..(p + 1) * bpr * 4], &xa.scales, bpr, t0, t1);
-            quad(&mut f[p * bpr * 4..(p + 1) * bpr * 4], &xa.fsums, bpr, t0, t1);
             quad(&mut h[p * bpr * 8..(p + 1) * bpr * 8], &xa.hsums, 2 * bpr, t0, t1);
         }
-        Self { q, s, f, h }
+        Self { q, s, h }
     }
 }
 

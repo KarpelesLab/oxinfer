@@ -2,6 +2,14 @@
 //! registers once, then runs SDOT against TC int8 activation rows. Integer sums are formed per
 //! 32-element activation block (sub-blocks of 16 are scaled in int32 first) and scaled in f32.
 //! Formats with mins subtract `min * sum(x)` using the exact activation sums.
+//!
+//! Multi-token passes (speculative verification, 2-16 tokens) have their own kernels that unpack
+//! each super-block once for all tokens: SDOT one row at a time, or SMMLA (i8mm) on 2x2 tiles of
+//! rows and tokens for the formats with integer scales per 16. Both repeat the one-token kernels'
+//! f32 operations in the same order, so results are bit-identical whatever the token count. On
+//! Apple's 2025 cores SMMLA issues at half SDOT's rate for twice the multiply-adds and does not
+//! overlap other vector work, so it only pays where SDOT needs many extra instructions to apply
+//! per-16 scales.
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use super::{Act, GgmlType, GgufMatrix, QK_K, q3k_scales, tables::KVALUES_IQ4NL};
@@ -1207,7 +1215,7 @@ unsafe fn pair_f32<const N: usize, const O: usize>(a: &[float32x4_t], b: &[float
 
 /// Half `H` (blocks `4 H .. 4 H + 4`) of super-block `sb` of two rows (`a`, `b`) against every
 /// token pair: the halves are unpacked, interleaved per 8 values (`[a x8, b x8]`) and kept in
-/// registers while the token pairs stream past.
+/// registers while the token pairs stream past. Formats with integer scales per 16 only.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn mm_half<F: Multi, const H: usize>(
@@ -1238,16 +1246,9 @@ unsafe fn mm_half<F: Multi, const H: usize>(
         let xb = (pi * bpr + sb * 8 + 4 * H) * 4;
         unroll4!(bl, 0, {
             let bk = 4 * H + bl;
-            let iv = if F::SC16 {
-                let p0 = smmla(smmla(zero, w[4 * bl], xv(4 * bl)), w[4 * bl + 1], xv(4 * bl + 1));
-                let p1 = smmla(smmla(zero, w[4 * bl + 2], xv(4 * bl + 2)), w[4 * bl + 3], xv(4 * bl + 3));
-                vmlaq_s32(vmulq_s32(p0, sc[2 * bk]), p1, sc[2 * bk + 1])
-            } else {
-                let mut s = smmla(zero, w[4 * bl], xv(4 * bl));
-                s = smmla(s, w[4 * bl + 1], xv(4 * bl + 1));
-                s = smmla(s, w[4 * bl + 2], xv(4 * bl + 2));
-                smmla(s, w[4 * bl + 3], xv(4 * bl + 3))
-            };
+            let p0 = smmla(smmla(zero, w[4 * bl], xv(4 * bl)), w[4 * bl + 1], xv(4 * bl + 1));
+            let p1 = smmla(smmla(zero, w[4 * bl + 2], xv(4 * bl + 2)), w[4 * bl + 3], xv(4 * bl + 3));
+            let iv = vmlaq_s32(vmulq_s32(p0, sc[2 * bk]), p1, sc[2 * bk + 1]);
             let xs = vld1q_f32(p.s.as_ptr().add(xb + 4 * bl));
             acc[bl] = vfmaq_f32(acc[bl], vcvtq_f32_s32(iv), vmulq_f32(ds[bk], xs));
         });
@@ -1259,31 +1260,18 @@ unsafe fn mm_pair<F: Multi>(m: &GgufMatrix, p: &PairAct, t: usize, y: *mut f32, 
     let (rb, n_in) = (m.row_bytes(), m.n_in);
     let bpr = n_in / 32;
     let np = t.div_ceil(2);
+    debug_assert!(F::SC16, "SMMLA tiles take formats with integer scales per 16");
     let mut acc = [[vdupq_n_f32(0.0); 4]; MULTI_MAX / 2];
     let (ra, rbp) = (m.data.as_ptr().add(r * rb), m.data.as_ptr().add((r + 1) * rb));
     for sb in 0..n_in / QK_K {
         let (a, b) = (ra.add(sb * F::TSZ), rbp.add(sb * F::TSZ));
         let (ma, mb) = (F::meta(a), F::meta(b));
-        let sc = if F::SC16 {
-            pair16_s32(&ma.sc, &mb.sc)
-        } else {
-            [vdupq_n_s32(0); 16]
-        };
+        let sc = pair16_s32(&ma.sc, &mb.sc);
         let ds = pair_f32::<2, 8>(&ma.ds, &mb.ds);
         mm_half::<F, 0>(a, b, &sc, &ds, p, np, sb, n_in, &mut acc);
         mm_half::<F, 1>(a, b, &sc, &ds, p, np, sb, n_in, &mut acc);
         // The min terms come after both halves, as in the one-token kernels.
         match F::CORR {
-            Corr::Min32 => {
-                let mn = pair_f32::<2, 8>(&ma.mn, &mb.mn);
-                for (pi, a) in acc[..np].iter_mut().enumerate() {
-                    let xf = p.f.as_ptr().add((pi * bpr + sb * 8) * 4);
-                    for j in 0..4 {
-                        let v = vfmsq_f32(a[j], mn[j], vld1q_f32(xf.add(4 * j)));
-                        a[j] = vfmsq_f32(v, mn[j + 4], vld1q_f32(xf.add(4 * j + 16)));
-                    }
-                }
-            }
             Corr::Q2K => {
                 let mn = pair_f32::<4, 16>(&ma.mn, &mb.mn);
                 for (pi, a) in acc[..np].iter_mut().enumerate() {
@@ -1297,7 +1285,7 @@ unsafe fn mm_pair<F: Multi>(m: &GgufMatrix, p: &PairAct, t: usize, y: *mut f32, 
                     }
                 }
             }
-            Corr::None => {}
+            Corr::None | Corr::Min32 => {}
         }
     }
     for (pi, a) in acc[..np].iter().enumerate() {

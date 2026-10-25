@@ -1256,7 +1256,9 @@ pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &
     let xa = refs.iter().any(|j| !dense(j.m)).then(|| quantize_act(x, t, n_in));
     let (tchunks, tc) = if gemm { token_split(blocks.len(), t, nthreads) } else { (1, t) };
     let mode = multi_token_kernels();
-    let multi = !gemm && (2..=MULTI_MAX).contains(&t) && mode != MultiTokenKernels::Pairs;
+    // Two tokens: the pair kernels already unpack each block once, and keep both accumulators in
+    // registers.
+    let multi = !gemm && (3..=MULTI_MAX).contains(&t) && mode != MultiTokenKernels::Pairs;
     let pairs =
         (multi && mode == MultiTokenKernels::Auto && cpu_has_i8mm() && refs.iter().any(|j| !dense(j.m) && j.m.multi(t) == Some(true)))
             .then(|| PairAct::new(xa.as_ref().unwrap()));
