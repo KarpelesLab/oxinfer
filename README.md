@@ -478,6 +478,113 @@ when operands are in L1; a 12-token tile was tried and lost to register pressure
 prefill dequantizes to f32 and uses the same kernel, so prompt processing speed is independent
 of precision.
 
+### Comparison with llama.cpp
+
+Same GGUF file in both engines, same prompt tokens (llama.cpp gets the text oxinfer's chat
+template produces), greedy, 256 generated tokens (fewer when the model ends its turn) after a
+short code prompt and a short prose prompt, plus prompt processing of 512 and 2048 tokens.
+llama.cpp is commit 4df29be4 with HauhauCS's FastMTP patch, driven through `llama-server`
+(one warm-up request per server start); oxinfer runs as a fresh CLI process per measurement.
+M5 Max, 18 cores, 128 GB, with other jobs running: runs alternate between the engines, each
+configuration ran 3 times, cells are the median with [min-max], and the load average is
+recorded per run (medians 9-15 here; tok/s of the CPU-only rows varied by 2x during a heavier
+spell, so treat small differences as noise). "Metal" is llama.cpp's default (every layer on the
+GPU) and oxinfer's default (prefill GEMMs on the GPU, everything else on the CPU); "CPU" is
+`--device none -ngl 0` / `--device cpu` with each engine's default thread count (llama.cpp 6,
+oxinfer 18).
+
+Qwen3.8-27B (HauhauCS Aggressive, `Q4_K_P`, 17.9 GB; speculative rows use the embedded MTP
+head, or the 32k-vocabulary FastMTP sidecar with `--mtp-from`):
+
+| Engine | pp512 tok/s | pp2048 tok/s | Decode, code | Decode, prose | Drafts accepted (code / prose) |
+|---|---|---|---|---|---|
+| llama.cpp Metal | 650 [620-703] | 577 [538-720] | 24.2 [23.3-26.2] | 24.9 [24.1-25.2] | |
+| llama.cpp Metal, MTP depth 2 | | | 29.5 [22.5-30.4] | 22.0 [19.9-22.7] | 84% / 61% |
+| llama.cpp Metal, MTP depth 3 | | | 34.2 [26.0-35.3] | 24.0 [19.2-28.5] | 76% / 49% |
+| llama.cpp Metal, FastMTP depth 3 | | | 37.7 [32.1-39.0] | 25.3 [22.5-26.9] | 78% / 42% |
+| llama.cpp CPU | 20.8 [18.9-21.2] | 19.0 [18.9-20.4] | 6.7 [6.2-6.9] | 6.8 [6.3-6.9] | |
+| oxinfer (Metal prefill) | 144 [144-147] | 125 [124-129] | 11.0 [10.8-11.5] | 11.3 [11.1-11.7] | |
+| oxinfer `--mtp` | | | 14.8 [12.7-16.0] | 11.8 [9.8-12.1] | 78% / 49% |
+| oxinfer `--mtp-from` FastMTP | | | 14.2 [14.1-17.8] | 11.5 [9.9-13.1] | 78% / 46% |
+| oxinfer CPU | 24.2 [21.4-27.8] | 23.3 [20.8-27.2] | 10.6 [10.3-11.9] | 11.5 [10.8-11.8] | |
+
+(`llama-bench` on the same file in a quiet moment: pp512 744, pp2048 642, tg256 25.5 tok/s.)
+
+Zawen-v0.1-35B-A3B (Qwen3.5-MoE, 256 experts, converted with llama.cpp's `convert_hf_to_gguf.py`
++ `llama-quantize`; the checkpoint has no MTP weights, but the converter still writes
+`nextn_predict_layers = 1` from `config.json`, which llama.cpp then refuses to load, so
+`gguf_set_metadata.py` set it to 0 and `block_count` to 40; oxinfer loads either file):
+
+| Engine | Q4_K_M pp512 | pp2048 | Decode code / prose | Q8_0 pp512 | pp2048 | Decode code / prose |
+|---|---|---|---|---|---|---|
+| llama.cpp Metal | 3001 [2998-3007] | 3065 [2381-3091] | 110 / 111 | 2700 [2603-2798] | 2476 [1732-2730] | 80.7 / 81.0 |
+| llama.cpp CPU | 124 [122-125] | 117 [116-119] | 47.5 / 46.5 | 156 [150-164] | 153 [141-157] | 43.2 / 43.8 |
+| oxinfer (Metal prefill) | 215 [212-230] | 231 [175-244] | 53.9 / 54.1 | 195 [170-198] | 219 [190-219] | 43.0 / 43.3 |
+| oxinfer CPU | 157 [154-161] | 146 [143-151] | 54.8 / 55.2 | 122 [112-146] | 111 [106-136] | 46.4 / 43.2 |
+
+Qwen3.5-0.8B (`Q8_0` converted with `convert_hf_to_gguf.py`, keeps the MTP layer):
+
+| Engine | pp512 | pp2048 | Decode code / prose | MTP decode code / prose (accepted) |
+|---|---|---|---|---|
+| llama.cpp Metal | 14930 [14924-15158] | 16034 [15939-16088] | 280 / 281 | depth 2: 332 / 276 (67% / 47%); depth 3: 335 / 250 (59% / 35%) |
+| llama.cpp CPU | 809 [797-811] | 748 [739-768] | 161 / 165 | |
+| oxinfer (Metal prefill) | 1280 [1219-1313] | 1412 [1412-1432] | 174 / 174 | `--mtp`: 185 / 150 (63% / 43%) |
+| oxinfer CPU | 826 [813-826] | 747 [739-779] | 173 / 172 | |
+
+With 12 threads for both engines on the CPU (a separate interleaved run, load ~15), llama.cpp
+pulls ahead on prompts: 27B pp512 27.4 vs 18.4 tok/s, decode 9.4 / 8.4 vs 8.0 / 9.7; Zawen Q4_K_M
+pp512 197 vs 129, decode 60.5 / 60.1 vs 58.9 / 56.9.
+
+Where the differences come from:
+
+- **Decode with a GPU**: llama.cpp runs the whole forward pass on the GPU (~450 GB/s), oxinfer
+  decodes on the CPU (`--profile` on the 27B: matmuls stream 16.9 GB/token at ~200 GB/s, 85 of
+  95 ms per token; the 1 GB Q6_K LM head another 4.5 ms). That is the 2.2x on the 27B and 2x on
+  the MoE. On the CPU alone oxinfer decodes as fast or faster (27B 11 vs 6.7 tok/s with default
+  threads, 0.8B 173 vs 161).
+- **Prefill with a GPU** (4.5x on the 27B, 14x on the MoE, 11x on 0.8B): only the dense GEMMs
+  run on the GPU, as f32 simdgroup tiles over dequantized weights (~8.4 TFLOP/s on the 27B: 13.2
+  s of GPU time for 2048 tokens). llama.cpp sustains ~35 TFLOP/s there (650 tok/s), above the
+  f32 simdgroup peak of ~20, with half-precision kernels (its Metal backend reports the M5 tensor
+  API). Attention and the Gated DeltaNet scan stay on the CPU (2.6 ms/token, 25% of oxinfer's
+  27B prefill), and each layer's activations make a round trip through host memory. On the MoE
+  the routed experts' grouped matmul (`linear_grouped`) runs on the CPU: only 1.35 s of a 9.2 s
+  2048-token prefill is GPU time.
+- **CPU prefill**: llama.cpp repacks K-quants at load (`CPU_REPACK`, interleaved rows for the
+  i8mm `SMMLA` instructions) and multiplies in int8; oxinfer dequantizes to f32 and runs an
+  FMA GEMM. It is ahead on K-quants only while llama.cpp uses its default 6 threads, and behind
+  on Q8_0 even then.
+- **MoE decode** is not bandwidth-bound in oxinfer (Zawen Q4_K_M: 521 matmul calls per token at
+  ~21 us, 170 GB/s over only 1.9 GB): dispatch and per-expert overhead dominate.
+- **Speculative decoding**: acceptance is the same in both engines (78% code, 46-49% prose on
+  the 27B), so the gap is the verification pass: llama.cpp's multi-token pass on the GPU costs
+  little more than one token, while oxinfer's 4-token CPU pass takes 160-180 ms against ~90 ms
+  for one token (the K-quant kernels are compute-bound at 4 tokens). MTP thus gains 1.35x on code
+  here vs 1.4x (embedded) / 1.55x (FastMTP) in llama.cpp; on prose neither engine gains (0.96-1.04x).
+  On 0.8B every draft step reads the 248k-row LM head, so prose loses in both engines.
+- **Load**: oxinfer's spin-waiting pool on all 18 cores loses the most when other processes
+  compete for cores (27B decode fell to 3-6 tok/s at load averages of 30-90, while llama.cpp's
+  GPU decode stayed at ~20); `--threads 12` was faster than 18 in that state.
+
+Output agreement (first 64 greedy tokens, same in all three repetitions): oxinfer matches
+llama.cpp Metal token for token on the code prompt for every model and on the prose prompt for
+the 27B; on prose the texts part at token 48 (0.8B), 25 (Zawen Q4_K_M) and 21 (Zawen Q8_0) after
+an identical prefix. llama.cpp's own CPU and Metal backends part as early or earlier on the same
+prompts (27B: tokens 53 / 20, 0.8B prose: 9, Zawen: 25 / 18-30), and oxinfer's CPU and Metal
+paths always agree with each other, so these are rounding-order differences at near-ties rather
+than a model error. Speculative decoding (embedded MTP or FastMTP) gives exactly the plain greedy
+tokens in both engines.
+
+To rerun (`tools/bench/bench.py --help` lists the configurations; `--max-load N` waits for a
+quieter machine before each run):
+
+```sh
+cargo build --release
+tools/bench/bench.py --model M.gguf --sidecar FastMTP.gguf --llama-bin ~/llama.cpp/build/bin \
+    --reps 3 --tag mymodel --out results.jsonl
+tools/bench/summarize.py results.jsonl          # medians, acceptance, greedy agreement
+```
+
 ### Quantization quality
 
 Q8 and Q4 are both measured against the bf16 output distribution (itself within 1e-4 of the

@@ -1,0 +1,205 @@
+### Speculative decoding
+
+`--draft models/gemma-4-E4B-it-assistant` enables Google's multi-token-prediction drafter: a
+4-layer, 256-wide decoder that cross-attends to the main model's shared KV caches and predicts
+from the concatenation of the last token's embedding and the previous hidden state. Each round
+drafts 2–6 tokens (adaptive) and verifies them in one multi-token forward pass; greedy
+verification makes the output identical to plain greedy decoding. Acceptance is about 40% on prose
+and 55–65% on code, giving 2–4 tokens per forward. The drafter's own drafts were checked against
+the transformers implementation token for token. It pays off most where the verification pass
+is bandwidth-bound (bf16, Q8); at Q4 the multi-token int8 kernels are instruction-bound, so it
+only helps on predictable text.
+
+`--mtp` does the same for Qwen3.5 / Qwen3.8 with the checkpoint's own multi-token-prediction
+layer (`mtp.*`, `qwen_mtp.rs`): one gated-attention decoder layer that takes the main model's
+final-normed hidden state at position i and the embedding of token i+1 (each RMS-normed,
+concatenated embedding first, projected by `mtp.fc`), runs at position i with its own KV cache,
+and predicts token i+2 through the shared LM head; further drafts feed it its own output (the
+vLLM `qwen3_5_mtp` scheme). The default is 3 drafts per round, adapting between 1 and 3. Both
+greedy and sampled decoding are supported: greedy output is identical to plain greedy (the
+decode kernels give bit-identical rows for up to 7 tokens per pass, so the verification logits
+equal one-token logits; checked on long outputs with and without `--think`, bf16 / Q8 / Q4,
+dense and MoE), and sampling uses the standard speculative-sampling acceptance rule, so every
+token is drawn from exactly the distribution `--temp` / `--top-k` / `--top-p` define (the
+random stream differs from plain sampling, so the same seed gives a different text). Rejected
+drafts are undone exactly: the verification forward keeps the Gated DeltaNet states from
+before the pass plus each token's delta-rule inputs, and a rewind replays the rule up to the
+last accepted token (the same arithmetic, so bit-identical; one state copy instead of one per
+token, which is 151 MB per drafted token on Qwen3.8-27B); KV caches are truncated. On Qwen3.8-27B (M5 Max, under load from other
+jobs):
+
+| Precision | Plain | `--mtp` (code) | `--mtp` (prose) | Acceptance (code / prose) |
+|---|---|---|---|---|
+| `--quant q8` | 7.5 tok/s | 15.2 tok/s (3.75 tok/forward) | 10.5 tok/s (2.55 tok/forward) | 94% / 59% |
+| `--quant q4` | 14.6 tok/s | 24.0 tok/s | 14.7-16.1 tok/s | 94% / 57% |
+
+Q4 gains less because a 4-token Q4 pass costs about twice a one-token pass (SDOT-bound). On
+Qwen3.5-0.8B every draft step reads the 248k-row LM head (a third of the model), so `--mtp`
+gains ~20-25% on code and loses a little on prose; a trimmed draft head (`DraftHead`: a
+`[V_draft, H]` matrix plus a draft-to-target id map, FastMTP style) can replace it through the
+library. The MoE models (Qwen3.6-35B-A3B) work the same way, with an MoE MTP layer. A converted
+checkpoint (`--save-quantized`) keeps the MTP weights; older converted copies can take them from
+the original checkpoint with `--mtp-from DIR`.
+
+From the library: `QwenModel::load_mtp(&files)` (or `QwenMtp::load(cfg, sidecar_files, quant)`),
+then `MtpDecoder::new(&model, &mtp, MtpOptions { .. })`: `prefill` the prompt, `push` the first
+token, call `step` until a stop token (`examples/qwen_mtp.rs`).
+
+FastMTP sidecars (a GGUF holding only an MTP layer, a trimmed output head and a `d2t` map, such as
+HauhauCS's `...-FastMTP-32K.gguf`) load with `--mtp-from FILE` (or `org/repo:FastMTP-32K`): the
+sidecar's layer, token embedding and 32k-row head replace the target's, as in HauhauCS's
+llama.cpp patch (`QwenMtp::attach_sidecar` in the library). With HauhauCS's Qwen3.8-27B Q4_K_P
+GGUF, greedy output with the embedded MTP layer or the FastMTP sidecar is token-for-token the
+plain greedy output.
+
+## How it works
+
+- `safetensors.rs`: parses the header, exposes bf16 tensors as `&[u16]` (single file or sharded).
+- `config.rs`: reads `config.json` and derives per-layer facts (sliding vs global, head dims, KV sharing source, k=v).
+- `platform.rs`: CPU feature and GPU detection (sysctl / procfs for memory, Metal via `objc_msgSend`,
+  CUDA driver API, Vulkan loader), all through `dlsym`; `gpu.rs`: the `Backend` trait the linear layers
+  dispatch through and the registry; `metal.rs`, `cuda.rs`: the backends with their shader sources.
+- `fsx.rs`, `clock.rs`: file access and monotonic time behind one interface, so the loaders run on a
+  real filesystem or on the browser's in-memory table; `src/web/` (feature `web`): the browser module's
+  C-ABI exports and the WebGPU backend calling back into the host; `web/` at the root: the
+  JavaScript host and page.
+- `sd/`: Stable Diffusion: `clip.rs` (BPE tokenizer, text encoder), `unet.rs`, `vae.rs`, `sched.rs`
+  (Euler samplers), `ops.rs` (channels-last convolution, group/layer norm, multi-head attention on
+  the f32 GEMM tiles); `png.rs`: a dependency-free PNG writer.
+- `kernels.rs`: NEON kernels (`kernels_x86.rs`, `kernels_wasm.rs`: the AVX2 and simd128 equivalents, selected by `build.rs` through the `has_simd` cfg). Decode tiles stream 1–2 weight rows with 8 accumulators (the prefetcher
+  prefers few long streams); prefill packs activations into 8-token panels and runs an 8-row x 8-token
+  outer-product kernel that broadcasts bf16 weights by lane. Also RMSNorm, GELU (tanh approximation via
+  a fast exp), RoPE tables, softmax.
+- `quant.rs`: Q8 (32 weights per f32 scale) and Q4_0 (two nibbles per byte, f16 scale) block
+  quantization of weights at load time, plus per-matmul activation quantization; decode kernels use
+  int8 SDOT over four blocks at a time, with multi-token variants for speculative verification.
+- `drafter.rs`: the Gemma 4 assistant model (drafter) and its centroid-masked LM head.
+- `qwen_mtp.rs`: the Qwen3.5 MTP layer and the speculative decoder (drafting, verification with
+  recorded recurrent states, speculative sampling).
+- `vision.rs`, `audio.rs`: the two encoders plus preprocessing (resize/patching, mel features) and
+  the embedders; `media.rs`: file decoding through oxideav; `mm_config.rs`: tower configs and
+  placeholder token ids.
+- `pool.rs`: a spin-waiting thread pool with an atomic work counter. Dispatch costs about a microsecond,
+  which matters because a decode step issues ~200 small parallel regions.
+- `model.rs`: the Gemma 4 decoder: scaled embeddings, per-layer embeddings (PLE), QK-norm, sliding /
+  global attention with proportional RoPE on 512-dim global heads, KV-cache sharing for the top layers,
+  gated-GELU MLP, post-norms, per-layer scalars, tied softcapped LM head.
+- `chat.rs`, `sampler.rs`, `main.rs`: chat template, greedy / top-k / top-p sampling, streaming CLI.
+- `coreml.rs`, `anemll.rs`: Core ML through the Objective-C runtime (models, functions, states,
+  multi-arrays, IOSurface buffers) and the ANEMLL model runner (`meta.yaml`, prefill / infer
+  protocol, sliding-window rotation, split or argmax LM head); `anemll_cli.rs`: its CLI driver.
+
+### Streaming weights from flash (models larger than RAM)
+
+`--stream` (Qwen3.5 / Qwen3.8; implies `--mmap`) runs a model whose weights do not fit in memory
+by reading them in place from the mapped file while a reader thread fetches the next layers. It
+is aimed at phones: HauhauCS's Qwen3.8-27B GGUFs (Q2_K_P 10.7 GB, Q4_K_P 17.9 GB) on a 12 GB
+iPhone. Every forward pass reads the units (decoder layers, LM head, MTP layer, draft head)
+cyclically, so an LRU page cache smaller than the model never hits: each page is gone before its
+next use. With `--cache-budget-gb F` oxinfer manages the cache itself instead: a fixed resident
+set of `F` minus the read-ahead window stays cached (draft units first, since a round runs them
+up to 8 times, then evenly spaced layers so the reader can work ahead while they compute) and
+every other unit is dropped from the cache right after use. The page cache then holds the
+resident set plus the window and nothing else, so each pass reads exactly the streamed bytes.
+
+Darwin details that decided the design (measured on an M5 Max): a clean file page only leaves
+the cache through `msync(MS_INVALIDATE)` (`madvise(MADV_DONTNEED / MADV_FREE)` leave it cached);
+`fcntl(F_RDADVISE)` and `pread` read at 13-14 GB/s while demand faults from compute threads
+manage 2-3 GB/s and `MADV_WILLNEED` ~5 GB/s, so the reader issues `F_RDADVISE` per 8 MB and then
+touches the pages (mapping a 16 KB page costs ~1 us, so above ~7 GB/s the touching, not the SSD,
+limits the reader); a full `mincore` costs ~15 ms per GB, so cached chunks are recognized from
+three probe pages. Metal wraps the mapped weights without copying for GPU prefill, but a live
+no-copy buffer keeps its pages from being evicted, so streamed units get per-call buffers that are
+released after each matmul (`Lin::set_transient_device`).
+
+| Option | Meaning |
+|---|---|
+| `--stream` | stream weights from the mapped file, reading ahead in execution order |
+| `--cache-budget-gb F` | page cache the model may use (resident set = F - prefetch window; streamed units evicted after use) |
+| `--resident-mb N` | resident set size instead of the budget's |
+| `--prefetch-mb N` | read-ahead window (default 768) |
+| `--resident-mode M` | `cache` (clean file pages, default), `lock` (`mlock`), `copy` (anonymous memory over the same addresses) |
+| `--flash-mbps N` / `OXINFER_FLASH_MBPS` | emulate storage that reads N MB/s (the reader sleeps per uncached byte) |
+| `--stream-io M`, `--stream-threads N` | `advise` (default on Apple), `pread` or `touch`; reader threads (default 2) |
+| `--stream-trace` | one line per token / speculative round: bytes read vs cache hits, stall time |
+
+With `--mtp`, streaming defaults to up to 8 drafts with a cost-aware draft length
+(`--mtp-cost`): each round picks the length with the most expected tokens per second from the
+measured round time at each length and the measured acceptance at each draft position. When a
+pass streams 5-12 GB, verifying 9 tokens costs about what verifying 1 does, so long drafts pay
+off; in RAM the same policy settles on 2-3. Long drafts stay exact: `--mtp` verifies up to
+`draft + 1` tokens on the batch-invariant decode kernels (`MtpOptions::exact`,
+`kernels::set_decode_max_tokens`; greedy output checked token for token against plain greedy
+over 160 tokens with 8 drafts, embedded layer and FastMTP sidecar), which at 9 tokens are also
+faster than the prefill GEMM they replace (Q4_K_P: 0.50 s vs 1.12 s per verification on 18
+threads, Q2_K_P on 3 threads: 2.76 s vs 3.27 s). The rewind after a partial acceptance replays
+the delta rule instead of keeping per-token states, so an 8-draft round needs one extra copy of
+the recurrent state (151 MB on Qwen3.8-27B) rather than eight.
+
+Measured on the M5 Max with the phone's limits emulated (`--cache-budget-gb`, `--flash-mbps`;
+greedy, a 40-token answer to a short prompt, CPU decoding; "3 threads" approximates the
+iPhone's 2 performance + 4 efficiency cores). Pass times were within a few percent between
+repeated runs even with other jobs on the machine, since the emulated storage dominates:
+
+| Model | Budget | Flash | Resident / streamed per pass | Plain | `--mtp` (cost-aware, up to 8) |
+|---|---|---|---|---|---|
+| Q2_K_P | 4 GB | 1 GB/s | 3.1 / 7.1 GB | - | 0.35 tok/s (2.60 tok/pass) |
+| Q2_K_P | 6 GB | 2 GB/s | 5.2 / 4.9 GB | 0.39 tok/s | 0.90 tok/s; 3 threads 0.91; FastMTP sidecar 0.73 |
+| Q2_K_P | 8 GB | 3 GB/s | 7.1 / 2.9 GB | 0.91 tok/s; 3 threads 0.89 | 2.07 tok/s; 3 threads 1.57 (compute-bound: picks 1-4 drafts) |
+| Q4_K_P | 4 GB | 1 GB/s | 3.0 / 13.9 GB | 0.069 tok/s | - |
+| Q4_K_P | 6 GB | 2 GB/s | 5.0 / 12.0 GB | 0.15 tok/s | 0.39 tok/s; 3 threads 0.39; sidecar 0.31; fixed 1-3 drafts 0.37 |
+| Q4_K_P | 8 GB | 3 GB/s | 7.0 / 10.2 GB | - | 0.66 tok/s |
+
+A pass takes 1.04-1.14x the time the emulated storage needs for its bytes (88-97% of the
+bandwidth used), and the page cache held by the model stays at or under the budget (sampled
+with `mincore` at exit). Tokens per pass depend on the text, not on the IO: with 8 drafts every
+round, 2.4-2.5 on prose, 2.8-3.3 on an explanation and 4.3-4.5 on code (embedded MTP layer a
+little ahead of the FastMTP sidecar everywhere), so long drafts multiply the IO-bound speed by
+2.3-4x. Sampling (`--temp 0.7`) streams the same way (1.03 tok/s at 6 GB / 2 GB/s on Q2_K_P).
+Without a budget (`--stream` alone, the model cached) streaming costs nothing: 10.5 vs 10.9 tok/s
+for `--mmap` on Q4_K_P.
+
+With no throttle the Mac's SSD streams a 10 GB pass in ~1.3 s (7-8 GB/s, bounded by mapping the
+pages). Prefill streams the weights once per chunk: on the GPU (`--device metal`, mapped weights
+wrapped without copying) a 1138-token prompt on Q4_K_P at 6 GB / 2 GB/s took 13.9 s, near the
+12 s the two passes' IO needs, against 53.7 s on the CPU.
+
+Projected for an iPhone 17 Pro Max, assuming sustained sequential reads of 1-3 GB/s (iPhone NVMe
+reads are usually quoted around 1.5-2.5 GB/s), a page-cache budget of 4-8 GB (the 12 GB device
+minus the OS, the app's own memory and other apps), the measured 90% bandwidth efficiency and
+2.6 tokens per pass (the table's prompt), with CPU decoding:
+
+| Budget | Q2_K_P plain / `--mtp`, 1 GB/s | 2 GB/s | 3 GB/s | Q4_K_P plain / `--mtp`, 1 GB/s | 2 GB/s | 3 GB/s |
+|---|---|---|---|---|---|---|
+| 4 GB | 0.13 / 0.33 | 0.26 / 0.66 | 0.40 / 0.99 | 0.07 / 0.17 | 0.13 / 0.33 | 0.20 / 0.50 |
+| 6 GB | 0.19 / 0.46 | 0.37 / 0.91 | 0.56 / 1.37 | 0.08 / 0.19 | 0.15 / 0.39 | 0.23 / 0.58 |
+| 8 GB | 0.32 / 0.75 | 0.64 / 1.50* | 0.96 / 2.25* | 0.09 / 0.23 | 0.19 / 0.47 | 0.28 / 0.70 |
+
+(tokens/s; * where the phone's CPU rather than the flash becomes the limit: on 3 Mac cores a
+9-token Q2_K_P verification computes in 2.8 s, and at 8 GB / 3 GB/s the cost-aware rounds took
+1.48 s against 1.03 s of IO, giving 1.57 instead of 2.07 tok/s.)
+Q2_K_P is the practical choice: about 1 token/s with 6 GB at 2 GB/s, 1.5 with 8 GB at 3 GB/s.
+
+From the library (everything above is reachable without the CLI):
+
+```rust
+use oxinfer::qwen_mtp::{MtpDecoder, MtpOptions};
+use oxinfer::stream::{StreamOptions, attach_qwen};
+
+let files = ModelFiles::open(&path, false)?; // false: memory-mapped
+let mut model = QwenModel::load(QwenConfig::load(&path)?, &files, Quant::Q4)?;
+let mut mtp = model.load_mtp(&files)?;
+let opts = StreamOptions { cache_budget: Some(6_000_000_000), ..Default::default() };
+let streamer = attach_qwen(&mut model, Some(&mut mtp), &[&files], 8, opts)?;
+let mut dec = MtpDecoder::new(&model, &mtp, MtpOptions { draft_tokens: 8, cost_aware: true, exact: true, stop, ..Default::default() });
+// ... prefill / push, then per step:
+let before = streamer.stats();
+let tokens = dec.step(&mut sampler, max_new);
+let io = streamer.stats() - before; // bytes_read, bytes_cached, stall, io_busy, ...
+```
+
+`Streamer::plan()` reports the resident set and the bytes streamed per pass (and any weight that
+is a RAM copy instead of a view of the file), `cached_bytes()` the model's current page-cache
+footprint, `set_flash_bytes_per_sec` changes the emulated bandwidth while running, and
+`MtpStats::costs` holds what the draft policy measured.
+
