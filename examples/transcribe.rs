@@ -4,7 +4,7 @@
 //! oxideav decodes, or raw 16 kHz f32 samples with `--raw`).
 //!
 //! Options: `--language xx`, `--translate`, `--timestamps`, `--words`, `--fallback`,
-//! `--prompt TEXT`, `--json`, `--precision f32|f16|bf16`, `--quant q8|q4` (decoder),
+//! `--prompt TEXT`, `--condition` (on previous text), `--json`, `--precision f32|f16|bf16`, `--quant q8|q4` (decoder),
 //! `--device cpu|metal|...`, `--profile`, `--dump DIR` (writes the first window's log-mel features, encoder
 //! output and first-step logits as f32 files, plus the PCM, for reference comparisons).
 
@@ -19,7 +19,7 @@ fn write_f32(path: &Path, v: &[f32]) -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: transcribe MODEL AUDIO [--language xx] [--translate] [--timestamps] [--words] [--fallback] [--prompt TEXT] [--json] [--raw] [--precision P] [--quant Q] [--device D] [--dump DIR]";
+    let usage = "usage: transcribe MODEL AUDIO [--language xx] [--translate] [--timestamps] [--words] [--fallback] [--prompt TEXT] [--condition] [--json] [--raw] [--precision P] [--quant Q] [--device D] [--dump DIR]";
     let model = args.next().expect(usage);
     let audio = PathBuf::from(args.next().expect(usage));
     let mut lo = TranscriberOptions::default();
@@ -34,6 +34,7 @@ fn main() -> anyhow::Result<()> {
             "--words" => o.word_timestamps = true,
             "--fallback" => o = o.with_fallback(),
             "--prompt" => o.initial_prompt = Some(val()),
+            "--condition" => o.condition_on_prev_tokens = true,
             "--json" => json = true,
             "--raw" => raw = true,
             "--precision" => lo.set("precision", &val())?,
@@ -113,6 +114,10 @@ fn main() -> anyhow::Result<()> {
     let s = &t.stats;
     if profile {
         oxinfer::prof::report(s.total_secs, s.tokens);
+        eprint!("[encoder attention]\n{}", oxinfer::sd::ops::timing::report());
+    }
+    if oxinfer::sd::ops::gpu_check::on() {
+        eprintln!("[gpu check: {}]", oxinfer::sd::ops::gpu_check::summary());
     }
     eprintln!(
         "[language {}{} | {:.1}s audio, {} windows, {} tokens | mel {:.2}s, encode {:.2}s, decode {:.2}s, total {:.2}s, RTF {:.3}]",

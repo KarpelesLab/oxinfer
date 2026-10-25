@@ -15,6 +15,10 @@
 //! math. Accumulators must be named variables: arrays of `simdgroup_float8x8` are spilled to
 //! memory by the shader compiler and run 12x slower. Results are bit-identical to the CPU path.
 //!
+//! Attention: unmasked heads of 64 (Whisper's encoder, SD 2.x / SD-Turbo) run as one fused
+//! kernel (`flash_attn64`, f32 simdgroup MMA with an online softmax; ~2x faster than the
+//! GEMM + softmax + GEMM path, which the other shapes keep, and no per-head operand repacking).
+//!
 //! On GPUs whose cores have matrix units (M5, A19: the Apple10 family), the GEMMs and the MoE
 //! expert layers run on them instead (`MMA_SHADER_SRC`, Metal 4 `matmul2d`), with half-precision
 //! operands and f32 accumulation: ~3-5x faster, at a relative error of ~3e-4 per product.
@@ -273,6 +277,102 @@ kernel void softmax_rows(device float* s [[buffer(0)]], constant SM& p [[buffer(
     for (uint i = lane; i < lim; i += 32) { float e = exp(row[i] * p.scale - m); row[i] = e; sum += e; }
     float inv = 1.0f / simd_sum(sum);
     for (uint i = lane; i < p.ld; i += 32) row[i] = i < lim ? row[i] * inv : 0.f;
+}
+
+// ---- Fused attention, head size 64, no mask ------------------------------------------------------
+// q, k, v and o in the [rows][heads * 64] layout of the model (q and o rows padded to 32). One
+// threadgroup per (32 queries, head), one SIMD-group per 8 queries; keys and values stream in
+// blocks of 32 through threadgroup memory. Scores (f32 simdgroup MMA), the running max / sum of
+// the online softmax and the output accumulators stay on chip: no score matrix in memory.
+struct FA { uint tq; uint tk; uint d; float scale; };
+#define FLD 68
+#define SLD 36
+#define FQK(C, QA) \
+    simdgroup_load(kt, Ks + 0 * FLD + C * 8, FLD, ulong2(0, 0), true); simdgroup_multiply_accumulate(s0, QA, kt, s0); \
+    simdgroup_load(kt, Ks + 8 * FLD + C * 8, FLD, ulong2(0, 0), true); simdgroup_multiply_accumulate(s1, QA, kt, s1); \
+    simdgroup_load(kt, Ks + 16 * FLD + C * 8, FLD, ulong2(0, 0), true); simdgroup_multiply_accumulate(s2, QA, kt, s2); \
+    simdgroup_load(kt, Ks + 24 * FLD + C * 8, FLD, ulong2(0, 0), true); simdgroup_multiply_accumulate(s3, QA, kt, s3);
+#define FPV(J) \
+    simdgroup_load(pa, S + J * 8, SLD); \
+    simdgroup_load(vt, Vs + J * 8 * FLD + 0, FLD); simdgroup_multiply_accumulate(o0, pa, vt, o0); \
+    simdgroup_load(vt, Vs + J * 8 * FLD + 8, FLD); simdgroup_multiply_accumulate(o1, pa, vt, o1); \
+    simdgroup_load(vt, Vs + J * 8 * FLD + 16, FLD); simdgroup_multiply_accumulate(o2, pa, vt, o2); \
+    simdgroup_load(vt, Vs + J * 8 * FLD + 24, FLD); simdgroup_multiply_accumulate(o3, pa, vt, o3); \
+    simdgroup_load(vt, Vs + J * 8 * FLD + 32, FLD); simdgroup_multiply_accumulate(o4, pa, vt, o4); \
+    simdgroup_load(vt, Vs + J * 8 * FLD + 40, FLD); simdgroup_multiply_accumulate(o5, pa, vt, o5); \
+    simdgroup_load(vt, Vs + J * 8 * FLD + 48, FLD); simdgroup_multiply_accumulate(o6, pa, vt, o6); \
+    simdgroup_load(vt, Vs + J * 8 * FLD + 56, FLD); simdgroup_multiply_accumulate(o7, pa, vt, o7);
+#define FSCALE \
+    simdgroup_load(dg, D, 8); \
+    simdgroup_multiply(o0, dg, o0); simdgroup_multiply(o1, dg, o1); simdgroup_multiply(o2, dg, o2); simdgroup_multiply(o3, dg, o3); \
+    simdgroup_multiply(o4, dg, o4); simdgroup_multiply(o5, dg, o5); simdgroup_multiply(o6, dg, o6); simdgroup_multiply(o7, dg, o7);
+kernel void flash_attn64(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]],
+                         device const float* v [[buffer(2)]], device float* o [[buffer(3)]], constant FA& p [[buffer(4)]],
+                         uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float Ks[32 * FLD];
+    threadgroup float Vs[32 * FLD];
+    threadgroup float Ss[4 * 8 * SLD];
+    threadgroup float Dg[4 * 64];
+    uint q0 = tg.x * 32 + sg * 8;
+    ulong hoff = (ulong)tg.y * 64;
+    threadgroup float* S = Ss + sg * 8 * SLD;
+    threadgroup float* D = Dg + sg * 64;
+    for (uint i = lane; i < 64; i += 32) D[i] = 0.0f;
+    device const float* qs = q + (ulong)q0 * p.d + hoff;
+    simdgroup_float8x8 qa0, qa1, qa2, qa3, qa4, qa5, qa6, qa7;
+    simdgroup_load(qa0, qs + 0, p.d); simdgroup_load(qa1, qs + 8, p.d); simdgroup_load(qa2, qs + 16, p.d); simdgroup_load(qa3, qs + 24, p.d);
+    simdgroup_load(qa4, qs + 32, p.d); simdgroup_load(qa5, qs + 40, p.d); simdgroup_load(qa6, qs + 48, p.d); simdgroup_load(qa7, qs + 56, p.d);
+    simdgroup_float8x8 o0(0.f), o1(0.f), o2(0.f), o3(0.f), o4(0.f), o5(0.f), o6(0.f), o7(0.f);
+    simdgroup_float8x8 kt, vt, pa, dg;
+    uint r = lane / 4, part = lane % 4;
+    float m = -INFINITY, l = 0.0f;
+    for (uint kb = 0; kb < p.tk; kb += 32) {
+        for (uint i = tid; i < 32 * 16; i += 128) {
+            uint row = i / 16, c4 = i % 16, key = kb + row;
+            float4 kv = 0.0f, vv = 0.0f;
+            if (key < p.tk) {
+                kv = ((device const float4*)(k + (ulong)key * p.d + hoff))[c4];
+                vv = ((device const float4*)(v + (ulong)key * p.d + hoff))[c4];
+            }
+            *(threadgroup float4*)(Ks + row * FLD + c4 * 4) = kv;
+            *(threadgroup float4*)(Vs + row * FLD + c4 * 4) = vv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 s0(0.f), s1(0.f), s2(0.f), s3(0.f);
+        FQK(0, qa0) FQK(1, qa1) FQK(2, qa2) FQK(3, qa3) FQK(4, qa4) FQK(5, qa5) FQK(6, qa6) FQK(7, qa7)
+        simdgroup_store(s0, S + 0, SLD); simdgroup_store(s1, S + 8, SLD); simdgroup_store(s2, S + 16, SLD); simdgroup_store(s3, S + 24, SLD);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        // Online softmax: 4 lanes per query row, 8 keys each.
+        float x[8];
+        float bm = -INFINITY;
+        for (uint j = 0; j < 8; j++) {
+            uint col = part * 8 + j;
+            x[j] = kb + col < p.tk ? S[r * SLD + col] * p.scale : -INFINITY;
+            bm = max(bm, x[j]);
+        }
+        bm = max(bm, simd_shuffle_xor(bm, 1));
+        bm = max(bm, simd_shuffle_xor(bm, 2));
+        float mn = max(m, bm);
+        float alpha = exp(m - mn);
+        float ps = 0.0f;
+        for (uint j = 0; j < 8; j++) { float e = exp(x[j] - mn); S[r * SLD + part * 8 + j] = e; ps += e; }
+        ps += simd_shuffle_xor(ps, 1);
+        ps += simd_shuffle_xor(ps, 2);
+        l = l * alpha + ps;
+        m = mn;
+        if (part == 0) D[r * 9] = alpha;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        FSCALE
+        FPV(0) FPV(1) FPV(2) FPV(3)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (part == 0) D[r * 9] = 1.0f / l;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    FSCALE
+    device float* os = o + (ulong)q0 * p.d + hoff;
+    simdgroup_store(o0, os + 0, p.d); simdgroup_store(o1, os + 8, p.d); simdgroup_store(o2, os + 16, p.d); simdgroup_store(o3, os + 24, p.d);
+    simdgroup_store(o4, os + 32, p.d); simdgroup_store(o5, os + 40, p.d); simdgroup_store(o6, os + 48, p.d); simdgroup_store(o7, os + 56, p.d);
 }
 "#;
 
@@ -1061,6 +1161,8 @@ pub struct MetalBackend {
     group_stats: Id,
     row_stats: Id,
     softmax: Id,
+    /// Fused attention for head size 64 without a mask (`flash_attn64`).
+    flash64: Id,
     /// Matrix-unit kernels, when the device has them (and `OXINFER_METAL_MMA` allows), or why
     /// they failed to compile.
     mma: Option<Mma>,
@@ -1223,6 +1325,7 @@ impl MetalBackend {
         let group_stats = pipeline(c"group_stats")?;
         let row_stats = pipeline(c"row_stats")?;
         let softmax = pipeline(c"softmax_rows")?;
+        let flash64 = pipeline(c"flash_attn64")?;
         let mma = if has_mma {
             let gg = |prefix: &str| {
                 GGUF_MMA_TYPES
@@ -1339,6 +1442,7 @@ impl MetalBackend {
             group_stats,
             row_stats,
             softmax,
+            flash64,
             mma,
             mma_error,
             staging: Mutex::new(Staging {
@@ -1510,6 +1614,63 @@ impl Enc<'_> {
 }
 
 impl MetalBackend {
+    /// Unmasked attention with 64-dimensional heads in one fused kernel (`flash_attn64`): the
+    /// operands keep the model's `[rows][heads * 64]` layout, so staging is three plain copies.
+    #[allow(clippy::too_many_arguments)]
+    fn flash_attention(&self, q: &[f32], k: &[f32], v: &[f32], tq: usize, tk: usize, heads: usize, out: &mut [f32]) -> bool {
+        let d = heads * 64;
+        let tqp = tq.next_multiple_of(32);
+        let mut st = self.staging.lock().unwrap();
+        let st = &mut *st;
+        let ok = self.grow(&mut st.aq, tqp * d * 4)
+            && self.grow(&mut st.ak, tk * d * 4)
+            && self.grow(&mut st.av, tk * d * 4)
+            && self.grow(&mut st.ao, tqp * d * 4);
+        if !ok {
+            return false;
+        }
+        let t0 = Instant::now();
+        let (aq, ak, av, ao) = (st.aq.id, st.ak.id, st.av.id, st.ao.id);
+        // SAFETY: the staging buffers hold at least the sizes grown above.
+        unsafe {
+            let qp = self.contents(aq) as *mut f32;
+            par_copy(qp, q.as_ptr(), tq * d);
+            std::ptr::write_bytes(qp.add(tq * d), 0, (tqp - tq) * d);
+            par_copy(self.contents(ak) as *mut f32, k.as_ptr(), tk * d);
+            par_copy(self.contents(av) as *mut f32, v.as_ptr(), tk * d);
+        }
+        #[repr(C)]
+        struct Fa {
+            tq: u32,
+            tk: u32,
+            d: u32,
+            scale: f32,
+        }
+        let p = Fa {
+            tq: tq as u32,
+            tk: tk as u32,
+            d: d as u32,
+            scale: 0.125,
+        };
+        let pipe = self.flash64;
+        let mut out = out;
+        self.submit(
+            t0,
+            &mut out,
+            |e, _| {
+                e.pipe(pipe);
+                e.buf(aq, 0, 0);
+                e.buf(ak, 0, 1);
+                e.buf(av, 0, 2);
+                e.buf(ao, 0, 3);
+                e.bytes(&p, 4);
+                e.dispatch((tqp / 32, heads), 128);
+            },
+            // SAFETY: `ao` holds tqp >= tq rows of d floats.
+            |out| unsafe { par_copy(out.as_mut_ptr(), self.contents(ao) as *const f32, tq * d) },
+        )
+    }
+
     /// The matrix-unit kernels, unless absent or bypassed by [`crate::gpu::set_exact`].
     fn mma(&self) -> Option<&Mma> {
         if crate::gpu::exact() { None } else { self.mma.as_ref() }
@@ -1997,6 +2158,9 @@ impl Backend for MetalBackend {
         let d = heads * dh;
         if q.len() < tq * d || k.len() < tk * d || v.len() < tk * d || out.len() < tq * d || tq == 0 || tk == 0 {
             return false;
+        }
+        if dh == 64 && !causal {
+            return self.flash_attention(q, k, v, tq, tk, heads, out);
         }
         // GEMM tiling: out rows (keys, value dims) in multiples of 64, K in multiples of 32.
         let (dhp, dho, tkp, tqp) = (
