@@ -59,20 +59,24 @@ pub fn run(args: &Args) -> Result<()> {
     if let Some(f) = &args.decode_tokens {
         let ids = read_ids(f)?;
         let frames = audio_frames(&ids);
-        let t = Instant::now();
-        let audio = if oxinfer::snac::is_snac(&args.model) {
+        let (audio, secs) = if oxinfer::snac::is_snac(&args.model) {
             let mut so = SnacOptions::default();
             so.f32_weights = lo.snac_f32;
             let snac = Snac::load(&args.model, &so)?;
             let c = frames_to_codes(&frames);
-            Audio {
-                samples: snac.decode(&[&c[0], &c[1], &c[2]], noise)?,
+            let t = Instant::now();
+            let samples = snac.decode(&[&c[0], &c[1], &c[2]], noise)?;
+            let audio = Audio {
+                samples,
                 sample_rate: snac.sample_rate(),
-            }
+            };
+            (audio, t.elapsed().as_secs_f64())
         } else {
-            Speaker::load(&args.model.to_string_lossy(), &lo)?.decode_frames(&frames, noise)?
+            let speaker = Speaker::load(&args.model.to_string_lossy(), &lo)?;
+            let t = Instant::now();
+            (speaker.decode_frames(&frames, noise)?, t.elapsed().as_secs_f64())
         };
-        eprintln!("[decoded {} frames in {:.3}s]", frames.len(), t.elapsed().as_secs_f64());
+        eprintln!("[decoded {} frames in {secs:.3}s]", frames.len());
         return write_outputs(args, &audio);
     }
 

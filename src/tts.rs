@@ -16,7 +16,10 @@
 //! Streaming ([`Speaker::speak_stream`]) decodes overlapping windows of frames as tokens arrive,
 //! as the official decoder does (it decodes the last 4 frames and keeps the second one: one frame
 //! of left context and two of lookahead); here the first and last frames are emitted too, and
-//! the context sizes are options ([`SpeakOptions::context_left`] / `context_right`).
+//! the context sizes are options ([`SpeakOptions::context_left`] / `context_right`). The
+//! decoder's receptive field is under 3 frames each way: with 3 / 3 the stream is the full decode
+//! (to 3e-7); the default 2 / 2 is within 1.7e-3 of it (59 dB SNR), the official 1 / 2 within
+//! 2.4e-2 (27 dB).
 //!
 //! ```no_run
 //! use oxinfer::tts::{Speaker, SpeakerOptions, SpeakOptions};
@@ -160,9 +163,11 @@ pub struct SpeakOptions {
     /// The SNAC noise blocks' noise (as the reference decoder adds it); off for a deterministic
     /// waveform independent of the seed.
     pub noise: bool,
-    /// Streaming: frames of left context decoded with each window (the official decoder: 1).
+    /// Streaming: frames of left context decoded with each window (default 2; the official
+    /// decoder: 1; 3 makes the stream identical to a full decode).
     pub context_left: usize,
-    /// Streaming: frames of lookahead before a frame is emitted (the official decoder: 2).
+    /// Streaming: frames of lookahead before a frame is emitted (default and official decoder: 2;
+    /// 3 for an exact stream).
     pub context_right: usize,
     /// Streaming: frames emitted per window (1 = lowest latency; more = fewer, larger windows).
     pub chunk_frames: usize,
@@ -180,7 +185,7 @@ impl Default for SpeakOptions {
             seed: 42,
             constrained: true,
             noise: true,
-            context_left: 1,
+            context_left: 2,
             context_right: 2,
             chunk_frames: 1,
         }
@@ -818,5 +823,27 @@ mod tests {
         assert_eq!(o.seed, 5);
         assert_eq!(o.top_p, 0.8);
         assert!(SpeakOptions::from_json(r#"{"bogus": 1}"#).is_ok());
+    }
+
+    #[cfg(feature = "oxideav")]
+    #[test]
+    fn oxideav_frames() {
+        let a = Audio {
+            samples: vec![0.5, -0.25, 0.0],
+            sample_rate: 24000,
+        };
+        let (f, p) = a.to_frame();
+        assert_eq!((f.samples, f.pts, f.data[0].len()), (3, Some(0), 12));
+        assert_eq!((p.sample_rate, p.channels), (Some(24000), Some(1)));
+        assert_eq!(a.to_clip().to_mono(24000).unwrap(), a.samples);
+        let c = AudioChunk {
+            samples: &a.samples[1..],
+            start: 1,
+            sample_rate: 24000,
+            frames: 1,
+            last: true,
+        };
+        let (f, _) = c.to_frame();
+        assert_eq!((f.samples, f.pts), (2, Some(1)));
     }
 }

@@ -351,7 +351,8 @@ char *oxi_speaker_info_json(OxiSpeaker *s);
  *   "constrained": true          sample only tokens valid at each position (and skip most of the
  *                                output layer); false samples the whole vocabulary
  *   "noise": true                SNAC's noise blocks (false: deterministic waveform)
- *   "context_left": 1, "context_right": 2, "chunk_frames": 1   streaming windows, in frames
+ *   "context_left": 2, "context_right": 2, "chunk_frames": 1   streaming windows, in frames
+ *                                (3 / 3: the stream equals a full decode; 1 / 2: the official one)
  * Emotion tags such as <laugh>, <sigh>, <chuckle>, <cough>, <sniffle>, <groan>, <yawn>, <gasp>
  * go in the text. */
 

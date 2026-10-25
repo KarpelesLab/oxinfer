@@ -33,6 +33,18 @@ fn d_true() -> bool {
     true
 }
 
+/// `f(row index, row)` over the `c`-wide rows of `y`, in parallel blocks of rows (one pool item
+/// per row costs more than the work on short rows).
+fn for_rows(y: &mut [f32], c: usize, f: impl Fn(usize, &mut [f32]) + Sync) {
+    let rows = (16384 / c.max(1)).max(1);
+    let par = y.len() > rows * c;
+    for_chunks(y, rows * c, par, |b, block| {
+        for (j, row) in block.chunks_mut(c).enumerate() {
+            f(b * rows + j, row);
+        }
+    });
+}
+
 /// `config.json` of a SNAC checkpoint.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SnacConfig {
@@ -133,7 +145,7 @@ impl Mat {
         let mut y = vec![0f32; t * self.n_out];
         linear(&self.w, self.n_out, self.n_in, x, t, &mut y);
         if let Some(b) = &self.b {
-            for_chunks(&mut y, self.n_out, t > 1, |_, r| {
+            for_rows(&mut y, self.n_out, |_, r| {
                 for (v, &bb) in r.iter_mut().zip(b) {
                     *v += bb;
                 }
@@ -157,7 +169,7 @@ impl Depthwise {
         let (c, k, d) = (self.c, self.k, self.dilation);
         let half = (k - 1) / 2 * d;
         let mut y = vec![0f32; t * c];
-        for_chunks(&mut y, c, t > 1, |ti, out| {
+        for_rows(&mut y, c, |ti, out| {
             out.copy_from_slice(&self.b);
             for j in 0..k {
                 let src = ti as isize + (j * d) as isize - half as isize;
@@ -268,7 +280,7 @@ impl Block {
         let t_out = (t - 1) * s + k + self.out_pad - 2 * p;
         let mut y = vec![0f32; t_out * co];
         // Gather: output step o takes tap (o + p - i * s) of every input step i it overlaps.
-        for_chunks(&mut y, co, true, |o, out| {
+        for_rows(&mut y, co, |o, out| {
             out.copy_from_slice(&self.up_bias);
             let q = o + p;
             let i_hi = (q / s).min(t - 1);
@@ -287,7 +299,7 @@ impl Block {
         if let (Some(nm), Noise::Seeded(seed)) = (&self.noise, noise) {
             let lin = nm.forward(&y, t_out);
             let base = t0 * s;
-            for_chunks(&mut y, co, true, |o, out| {
+            for_rows(&mut y, co, |o, out| {
                 let n = gaussian(seed, layer as u64, (base + o) as u64);
                 for (v, &l) in out.iter_mut().zip(&lin[o * co..(o + 1) * co]) {
                     *v += n * l;
@@ -561,7 +573,7 @@ impl Snac {
         }
         let latent = cfg.latent_dim();
         let mut z = vec![0f32; t * latent];
-        for_chunks(&mut z, latent, t > 1, |ti, row| {
+        for_rows(&mut z, latent, |ti, row| {
             for ((c, &s), table) in codes.iter().zip(&cfg.vq_strides).zip(&self.tables) {
                 let e = c[ti / s] as usize;
                 for (v, &a) in row.iter_mut().zip(&table[e * latent..(e + 1) * latent]) {

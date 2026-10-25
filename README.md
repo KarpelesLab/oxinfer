@@ -12,7 +12,7 @@ formats may still change.
 
 Local LLM inference in pure Rust: Gemma 4 (text, images, video, audio), Qwen 3.5 / 3.6 / 3.8
 (text, images, video), Gemma 3 and Qwen 3 today, more model families as they come; also
-embeddings, Stable Diffusion and Whisper speech to text. No BLAS, no ML framework: weights are read straight out
+embeddings, Stable Diffusion, Whisper speech to text and Orpheus text to speech. No BLAS, no ML framework: weights are read straight out
 of the safetensors files (HuggingFace checkpoints or MLX 4-bit ones) and every operation
 (matmuls, attention, norms, RoPE, sampling) is implemented here, with hand-written SIMD kernels
 (NEON, AVX2, wasm simd128) and its own thread pool. The CPU path runs everywhere; GPUs (Metal,
@@ -71,6 +71,7 @@ optional.
 | anemll/* (ANEMLL Core ML: Qwen3, Qwen2.5, Gemma 3, Llama 3.2, ...) | 0.27B-1.7B tested | 0.3-1.5 GB (LUT6) | Apple Neural Engine via Core ML; same tokens as ANEMLL's runtime (see [Core ML](#core-ml--apple-neural-engine)) |
 | openai/whisper-tiny, -base, -small, -medium (and `.en`) | 39M-769M | 0.15-3.1 GB (fp32) | speech to text; transcripts match transformers token for token (see [Speech to text](#speech-to-text-whisper)) |
 | openai/whisper-large-v3, -large-v3-turbo, distil-whisper/distil-large-v3 | 1.55B / 809M / 756M | 3.1 / 1.6 / 1.5 GB (fp16) | speech to text; match transformers token for token |
+| canopylabs/orpheus-3b-0.1-ft (ungated copy: unsloth/orpheus-3b-0.1-ft) + hubertsiuzdak/snac_24khz | 3.3B + 20M | 6.6 GB + 80 MB (fp32) | text to speech; greedy tokens and waveform match transformers + snac (see [Text to speech](#text-to-speech-orpheus)); also any Llama 3.x as a text model |
 
 ### Qwen3.5 / Qwen3.8
 
@@ -780,6 +781,114 @@ once, voice activity detection or speaker diarization, openai-whisper's word-tim
 (the punctuation merge is there, not the long-word truncation) and `hallucination_silence_threshold`;
 the compression ratio of the fallback is computed with a built-in DEFLATE size estimate (greedy
 LZ77, fixed Huffman codes) instead of zlib, as no deflate implementation is in the dependency tree.
+
+## Text to speech (Orpheus)
+
+[Orpheus TTS](https://github.com/canopyai/Orpheus-TTS) is a Llama 3.2 3B fine-tune that writes
+audio as extra vocabulary tokens: 7 tokens per frame, codes of the three codebooks of the
+[SNAC](https://github.com/hubertsiuzdak/snac) codec, which decodes them to 24 kHz audio (a frame is
+2048 samples, 85 ms). `canopylabs/orpheus-3b-0.1-ft` is gated (accept the licence and set
+`HF_TOKEN`); `unsloth/orpheus-3b-0.1-ft` is an ungated bf16 copy of it. The SNAC decoder
+(`hubertsiuzdak/snac_24khz`, 80 MB, `pytorch_model.bin`) is fetched on first use.
+
+```sh
+./target/release/oxinfer --model unsloth/orpheus-3b-0.1-ft --speak "Hey there, I'm Leo. <chuckle> Nice to meet you." --voice leo -o hi.wav
+./target/release/oxinfer --model unsloth/orpheus-3b-0.1-ft --speak - --quant q4 --speak-stream < text.txt   # faster than real time
+./target/release/oxinfer --model hubertsiuzdak/snac_24khz --decode-tokens tokens.json -o out.wav          # SNAC alone
+```
+
+Voices of the English model: tara (default), leah, jess, leo, dan, mia, zac, zoe; emotion tags
+(`<laugh>`, `<chuckle>`, `<sigh>`, `<cough>`, `<sniffle>`, `<groan>`, `<yawn>`, `<gasp>`) go in the
+text. Sampling follows the official package: temperature 0.6, top-p 0.8, repetition penalty 1.1
+(over the prompt and the reply, as transformers and vLLM apply it), at most 1200 tokens (about
+14 s; `--max-tokens` for more). The prompt is the one `orpheus_tts` builds (start of human,
+`<|begin_of_text|>voice: text`, end of text / human, start of AI, start of speech) and generation
+stops at end of speech. By default sampling is constrained to the tokens valid at each frame
+position (plus the stop tokens), which also computes only those 4096 rows of the 157k-row output
+layer; `--unconstrained` samples the whole vocabulary like the reference.
+
+In Rust (`examples/speak.rs`):
+
+```rust
+use oxinfer::tts::{Speaker, SpeakerOptions, SpeakOptions};
+let mut lo = SpeakerOptions::default();
+lo.quant = oxinfer::model::Quant::Q4;
+let speaker = Speaker::load("unsloth/orpheus-3b-0.1-ft", &lo)?;
+let mut opts = SpeakOptions::default(); // voice, temperature, top_p, top_k, repetition_penalty, max_tokens, seed, ...
+opts.voice = Some("leah".into());
+let audio = speaker.speak("Hello there!", &opts)?; // Audio { samples: Vec<f32>, sample_rate: 24000 }
+audio.write_wav("hello.wav")?;
+// Streaming: chunks of audio while tokens are generated; Flow::Stop (or speaker.cancel_handle()) stops.
+let speech = speaker.speak_stream("A longer sentence...", &opts, &mut |chunk| {
+    play(chunk.samples); // chunk.start: index of its first sample
+    oxinfer::engine::Flow::Continue
+})?;
+println!("RTF {:.2}", speech.stats.rtf());
+```
+
+With the `oxideav` feature, `Audio::to_frame()` / `AudioChunk::to_frame()` give an F32 mono
+`oxideav_core::AudioFrame` with its `CodecParameters` (pts in samples), and `Audio::to_clip()` an
+`av::AudioClip`. `SpeakOptions` deserializes from JSON; the C API takes it that way:
+`oxi_speaker_load`, `oxi_speak` (PCM, optional chunk callback), `oxi_speak_wav`,
+`oxi_speaker_cancel`, `oxi_speaker_stats_json` (`include/oxinfer.h`).
+
+Streaming decodes overlapping windows of frames as they arrive, as the official decoder does (it
+decodes the last 4 frames and keeps the second: 1 frame of left context, 2 of lookahead, and it
+drops the first and last frames). Here every frame is emitted and the context is an option: the
+decoder's receptive field is under 3 frames each way, so `context_left` / `context_right` 3 / 3
+streams exactly the full decode (max abs diff 3e-7), the default 2 / 2 differs from it by at most
+1.7e-3 (59 dB SNR), and the official 1 / 2 by 2.4e-2 (27 dB). The SNAC noise blocks draw their noise per (seed, layer, absolute position), so
+overlapping windows see the same noise as a whole-clip decode.
+
+Llama 3 itself runs on the same code as Qwen3 (full attention without query / key norms, llama3
+RoPE frequency scaling), so any Llama 3.x safetensors checkpoint also works as a text model
+(`--model` with the Llama 3 chat template; GGUF Llama files are not supported).
+
+**Agreement** with the reference: transformers 5.20 float32 `LlamaForCausalLM` + the `snac` 1.2.1
+package, with the token handling of `orpheus_tts` (decoder.py) and the SNAC noise disabled on both
+sides (it is random in the reference):
+
+| Check | Result |
+|---|---|
+| Backbone last-token logits (Orpheus 3B, 14-token text prompt) | max abs diff 3e-5, same top 10 |
+| Greedy speech tokens, tara, "The weather today is sunny with a light breeze from the west." (rep. penalty 1.1), CPU | identical, 379 of 379 tokens (54 frames + stop), constrained and unconstrained |
+| Same, leo, "Could you send me the report by Friday? ...", Metal prefill | identical, 316 of 316 tokens |
+| Waveform of those tokens after SNAC | max abs diff 3.3e-7 / 9.5e-7 (123 dB SNR) |
+| SNAC alone, 400 random frames (34 s), f32 weights | max abs diff 6.6e-6 (117 dB); bf16 weights (`snac_f32=0`) 1.4e-2 (47 dB) |
+| Streaming windows 1 / 2 vs the official decoder's windows | max abs diff 3e-7 |
+
+q8 and q4 weights change the greedy path within a few tokens (greedy decoding of audio codes is
+not a stable regime anyway); their speech is as intelligible as bf16 by the measure below.
+
+**Intelligibility**: four sentences in four voices each, sampled with the default settings,
+transcribed by oxinfer's whisper-small and scored with jiwer (lower case, punctuation removed):
+bf16 (tara, leah, leo, zac) WER 4.7%, q4 streamed (tara, jess, dan, mia) WER 4.7% (10 errors in
+212 words each). 8 of the 10 come from "river bank" transcribed as "riverbank" (a substitution
+and a deletion, in all four voices); the other two are "rainforests" -> "rainforest" and
+"frog" -> "fraud" (bf16), "rainforest" twice (q4): about 1% of words actually misheard.
+
+**Speed** on the M5 Max (18 threads, other jobs running, so the best case is a little higher),
+an 8.5-10 s utterance, streamed (sliding windows, 2 / 2 context). Real-time output needs
+7 x 24000 / 2048 = 82 tokens/s; the real-time factor (RTF) is total time / audio duration:
+
+| Weights | Device | Decode | SNAC | RTF | First audio | Real time? |
+|---|---|---|---|---|---|---|
+| bf16 | CPU | 43 tok/s | 0.7 s | 2.0 | 0.62 s | no |
+| q8 | CPU | 68 tok/s | 0.9 s | 1.33 | 0.50 s | no |
+| q4 | CPU | 108-128 tok/s | 0.75 s | 0.76-0.90 | 0.38 s | yes |
+| bf16 | Metal | 44 tok/s | 0.9 s | 2.0 | 0.59 s | no |
+| q8 | Metal | 68 tok/s | 1.0 s | 1.32 | 0.41 s | no |
+| q4 | Metal | 112-128 tok/s | 0.8 s | 0.69-0.85 | 0.28 s | yes |
+
+Decoding is one token at a time on the CPU and memory-bound (2.8B weights per token once the
+output layer is cut to the audio rows), so the GPU only speeds up the prompt; q4 is the setting
+that keeps up with playback here. SNAC costs about 3 ms per frame decoded once (f32 weights;
+streaming decodes each frame in 5 windows, ~14 ms per 85 ms frame).
+
+Not supported: voice cloning / the pretrained (non-fine-tuned) model's zero-shot prompting with
+reference audio, batched utterances, the 44 / 32 kHz SNAC models (local attention), Llama GGUF
+files, and speculative decoding for Orpheus. The multilingual research checkpoints use the same
+prompt format and should load, but were not tested.
 
 ## Getting weights
 
