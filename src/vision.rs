@@ -4,18 +4,21 @@
 
 use crate::kernels::*;
 use crate::mm_config::VisionConfig;
+use crate::model::{Lin, linear};
 use crate::pool;
 use crate::safetensors::ModelFiles;
 use anyhow::{Context, Result, bail};
 
 pub const SUPPORTED_SOFT_TOKENS: [usize; 5] = [70, 140, 280, 560, 1120];
 
-/// A linear layer with optional input/output clamping (`use_clipped_linears`).
+/// A linear layer with optional input/output clamping (`use_clipped_linears`). The matmul runs
+/// on the active GPU backend when it takes the size (prefill-sized inputs), else on the CPU.
 pub struct ClipLin<'a> {
     pub w: &'a [u16],
     pub n_out: usize,
     pub n_in: usize,
     pub bounds: Option<(f32, f32, f32, f32)>, // in_min, in_max, out_min, out_max
+    lin: Lin<'a>,
 }
 
 impl ClipLin<'_> {
@@ -24,12 +27,12 @@ impl ClipLin<'_> {
         match self.bounds {
             Some((imin, imax, omin, omax)) => {
                 let xc: Vec<f32> = x.iter().map(|v| v.clamp(imin, imax)).collect();
-                matmul(self.w, self.n_out, self.n_in, &xc, t, y);
+                linear(&self.lin, self.n_out, self.n_in, &xc, t, y);
                 for v in y.iter_mut() {
                     *v = v.clamp(omin, omax);
                 }
             }
-            None => matmul(self.w, self.n_out, self.n_in, x, t, y),
+            None => linear(&self.lin, self.n_out, self.n_in, x, t, y),
         }
     }
 }
@@ -51,7 +54,13 @@ pub fn load_clip_lin<'a>(files: &'a ModelFiles, prefix: &str, n_out: usize, n_in
     } else {
         None
     };
-    Ok(ClipLin { w, n_out, n_in, bounds })
+    Ok(ClipLin {
+        w,
+        n_out,
+        n_in,
+        bounds,
+        lin: Lin::bf16(w),
+    })
 }
 
 /// Target (height, width) that preserves aspect ratio within the patch budget and is divisible
@@ -80,74 +89,6 @@ pub fn target_size(height: usize, width: usize, patch: usize, max_patches: usize
     Ok((th, tw))
 }
 
-/// Keys cubic kernel with a = -0.5 (PIL / torchvision "bicubic").
-fn cubic(x: f32) -> f32 {
-    const A: f32 = -0.5;
-    let x = x.abs();
-    if x < 1.0 {
-        ((A + 2.0) * x - (A + 3.0)) * x * x + 1.0
-    } else if x < 2.0 {
-        (((x - 5.0) * x + 8.0) * x - 4.0) * A
-    } else {
-        0.0
-    }
-}
-
-/// Per-axis antialiased resampling weights (PIL-style: support scales with the downscale factor).
-fn resample_weights(n_in: usize, n_out: usize) -> Vec<(usize, Vec<f32>)> {
-    let scale = n_in as f32 / n_out as f32;
-    let filter_scale = scale.max(1.0);
-    let support = 2.0 * filter_scale;
-    (0..n_out)
-        .map(|i| {
-            let center = (i as f32 + 0.5) * scale;
-            let lo = ((center - support + 0.5).floor().max(0.0)) as usize;
-            let hi = ((center + support + 0.5).floor() as usize).min(n_in);
-            let mut w: Vec<f32> = (lo..hi).map(|j| cubic((j as f32 + 0.5 - center) / filter_scale)).collect();
-            let s: f32 = w.iter().sum();
-            if s != 0.0 {
-                for v in w.iter_mut() {
-                    *v /= s;
-                }
-            }
-            (lo, w)
-        })
-        .collect()
-}
-
-/// Bicubic, antialiased resize of an interleaved RGB8 image to f32 RGB in [0, 1].
-pub fn resize_rgb(rgb: &[u8], w: usize, h: usize, tw: usize, th: usize) -> Vec<f32> {
-    let wx = resample_weights(w, tw);
-    let wy = resample_weights(h, th);
-    // Horizontal pass: [h, tw, 3]
-    let mut tmp = vec![0f32; h * tw * 3];
-    for y in 0..h {
-        let row = &rgb[y * w * 3..(y + 1) * w * 3];
-        for (ox, (lo, ws)) in wx.iter().enumerate() {
-            let mut acc = [0f32; 3];
-            for (k, &wgt) in ws.iter().enumerate() {
-                let px = &row[(lo + k) * 3..(lo + k) * 3 + 3];
-                acc[0] += wgt * px[0] as f32;
-                acc[1] += wgt * px[1] as f32;
-                acc[2] += wgt * px[2] as f32;
-            }
-            tmp[(y * tw + ox) * 3..(y * tw + ox) * 3 + 3].copy_from_slice(&acc);
-        }
-    }
-    // Vertical pass: [th, tw, 3]
-    let mut out = vec![0f32; th * tw * 3];
-    for (oy, (lo, ws)) in wy.iter().enumerate() {
-        for x in 0..tw * 3 {
-            let mut acc = 0f32;
-            for (k, &wgt) in ws.iter().enumerate() {
-                acc += wgt * tmp[(lo + k) * tw * 3 + x];
-            }
-            out[oy * tw * 3 + x] = (acc / 255.0).clamp(0.0, 1.0);
-        }
-    }
-    out
-}
-
 /// Preprocessed image: flattened 16x16x3 patches in [0, 1] and their (x, y) grid positions.
 pub struct ImagePatches {
     pub patches: Vec<f32>, // [n, patch*patch*3], (row, col, channel) order
@@ -157,25 +98,14 @@ pub struct ImagePatches {
     pub ph: usize,
 }
 
+/// The image and video-frame processor: an aspect-preserving resize to the patch budget with
+/// torchvision's uint8 antialiased bicubic (the reference processors' default backend, exactly),
+/// then scaling to [0, 1] and 16x16 patches.
 pub fn preprocess(rgb: &[u8], w: usize, h: usize, cfg: &VisionConfig, max_soft_tokens: usize) -> Result<ImagePatches> {
     let p = cfg.patch_size;
     let k = cfg.pooling_kernel_size;
     let (th, tw) = target_size(h, w, p, max_soft_tokens * k * k, k)?;
-    let img = if (th, tw) == (h, w) {
-        rgb.iter().map(|&v| v as f32 / 255.0).collect()
-    } else {
-        resize_rgb(rgb, w, h, tw, th)
-    };
-    Ok(patchify(&img, tw, th, p))
-}
-
-/// A video frame as the video processor prepares it: resized to the patch budget with Pillow's
-/// 8-bit bicubic (torchvision's uint8 resize in the reference), then scaled to [0, 1].
-pub fn preprocess_frame(rgb: &[u8], w: usize, h: usize, cfg: &VisionConfig, max_soft_tokens: usize) -> Result<ImagePatches> {
-    let p = cfg.patch_size;
-    let k = cfg.pooling_kernel_size;
-    let (th, tw) = target_size(h, w, p, max_soft_tokens * k * k, k)?;
-    let img: Vec<f32> = crate::resample::resize_bicubic_rgb8(rgb, w, h, tw, th)
+    let img: Vec<f32> = crate::resample::resize_bicubic_rgb8_torchvision(rgb, w, h, tw, th)
         .iter()
         .map(|&v| v as f32 / 255.0)
         .collect();
@@ -296,20 +226,27 @@ impl<'a> VisionTower<'a> {
 
     /// Encodes one image into soft tokens projected to the text embedding space: `[n_soft, text_hidden]`.
     pub fn encode(&self, img: &ImagePatches) -> Vec<f32> {
+        self.encode_many(&[img]).pop().unwrap()
+    }
+
+    /// Encodes several images (video frames) in one pass: the linear layers run over all their
+    /// patches at once, attention stays within each image. One `[n_soft, text_hidden]` per image.
+    pub fn encode_many(&self, imgs: &[&ImagePatches]) -> Vec<Vec<f32>> {
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let hd = cfg.head_dim;
         let nh = cfg.num_attention_heads;
-        let n = img.n;
+        let n: usize = imgs.iter().map(|i| i.n).sum();
         let eps = cfg.rms_norm_eps as f32;
         let d = cfg.patch_size * cfg.patch_size * 3;
+        let pos: Vec<(usize, usize)> = imgs.iter().flat_map(|i| i.pos.iter().copied()).collect();
 
         // Patch embedding: 2*(p-0.5) -> linear -> + x/y position embeddings.
-        let pix: Vec<f32> = img.patches.iter().map(|v| 2.0 * (v - 0.5)).collect();
+        let pix: Vec<f32> = imgs.iter().flat_map(|i| i.patches.iter().map(|v| 2.0 * (v - 0.5))).collect();
         let mut x = vec![0f32; n * h];
         matmul(self.input_proj, h, d, &pix, n, &mut x);
         let psz = cfg.position_embedding_size;
-        for (i, &(px, py)) in img.pos.iter().enumerate() {
+        for (i, &(px, py)) in pos.iter().enumerate() {
             let ex = &self.pos_table[px * h..(px + 1) * h];
             let ey = &self.pos_table[(psz + py) * h..(psz + py + 1) * h];
             let row = &mut x[i * h..(i + 1) * h];
@@ -320,8 +257,8 @@ impl<'a> VisionTower<'a> {
 
         // RoPE tables per patch: quarter = head_dim/4 angles for x and for y.
         let quarter = self.inv_freq.len();
-        let xs: Vec<usize> = img.pos.iter().map(|p| p.0).collect();
-        let ys: Vec<usize> = img.pos.iter().map(|p| p.1).collect();
+        let xs: Vec<usize> = pos.iter().map(|p| p.0).collect();
+        let ys: Vec<usize> = pos.iter().map(|p| p.1).collect();
         let (cos_x, sin_x) = rope_tables(&xs, &self.inv_freq);
         let (cos_y, sin_y) = rope_tables(&ys, &self.inv_freq);
         let rope_2d = |v: &mut [f32], i: usize| {
@@ -353,7 +290,12 @@ impl<'a> VisionTower<'a> {
                 rope_2d(kh, i / nh);
             });
             for_chunks(&mut v, hd, true, |_, vh| rmsnorm_inplace(vh, None, eps));
-            attention_bidirectional(&q, &k, &v, n, nh, hd, &mut att);
+            let mut s0 = 0;
+            for img in imgs {
+                let r = s0 * nh * hd..(s0 + img.n) * nh * hd;
+                attention_bidirectional(&q[r.clone()], &k[r.clone()], &v[r.clone()], img.n, nh, hd, &mut att[r]);
+                s0 += img.n;
+            }
             layer.o.apply(&att, n, &mut o);
             rmsnorm_rows_inplace(&mut o, h, Some(layer.ln_post_attn), eps);
             add_inplace(&mut x, &o);
@@ -367,33 +309,55 @@ impl<'a> VisionTower<'a> {
             add_inplace(&mut x, &o);
         }
 
-        // 3x3 average pooling by grid position, scaled by sqrt(hidden).
+        // 3x3 average pooling by grid position, scaled by sqrt(hidden), per image.
         let kk = cfg.pooling_kernel_size;
-        let (gw, gh) = (img.pw / kk, img.ph / kk);
-        let n_soft = gw * gh;
-        let mut pooled = vec![0f32; n_soft * h];
-        for (i, &(px, py)) in img.pos.iter().enumerate() {
-            let cell = (px / kk) + gw * (py / kk);
-            let dst = &mut pooled[cell * h..(cell + 1) * h];
-            for (dj, &xj) in dst.iter_mut().zip(&x[i * h..(i + 1) * h]) {
-                *dj += xj;
-            }
-        }
         let scale = (h as f32).sqrt() / (kk * kk) as f32;
+        let mut pooled = Vec::new();
+        let mut counts = Vec::with_capacity(imgs.len());
+        let mut s0 = 0;
+        for img in imgs {
+            let (gw, gh) = (img.pw / kk, img.ph / kk);
+            let base = pooled.len();
+            pooled.resize(base + gw * gh * h, 0f32);
+            for (i, &(px, py)) in img.pos.iter().enumerate() {
+                let cell = (px / kk) + gw * (py / kk);
+                let dst = &mut pooled[base + cell * h..base + (cell + 1) * h];
+                for (dj, &xj) in dst.iter_mut().zip(&x[(s0 + i) * h..(s0 + i + 1) * h]) {
+                    *dj += xj;
+                }
+            }
+            counts.push(gw * gh);
+            s0 += img.n;
+        }
         for v in pooled.iter_mut() {
             *v *= scale;
         }
 
         // Embedder: RMSNorm without scale, then projection to the text hidden size.
+        let n_soft: usize = counts.iter().sum();
         rmsnorm_rows_inplace(&mut pooled, h, None, eps);
         let mut out = vec![0f32; n_soft * self.text_hidden];
         matmul(self.embed_proj, self.text_hidden, h, &pooled, n_soft, &mut out);
-        out
+        let mut res = Vec::with_capacity(imgs.len());
+        let mut s0 = 0;
+        for c in counts {
+            res.push(out[s0 * self.text_hidden..(s0 + c) * self.text_hidden].to_vec());
+            s0 += c;
+        }
+        res
     }
 }
 
-/// Full (non-causal) attention over `n` tokens; q/k/v are `[n, nh, hd]`, scaling 1.0.
+/// Full (non-causal) attention over `n` tokens; q/k/v are `[n, nh, hd]`, scaling 1.0. Longer
+/// inputs (image towers) go through the GEMM-based attention (GPU when one is active) with q
+/// pre-scaled by sqrt(hd) to cancel its 1/sqrt(hd).
 pub fn attention_bidirectional(q: &[f32], k: &[f32], v: &[f32], n: usize, nh: usize, hd: usize, out: &mut [f32]) {
+    if n >= 256 {
+        let s = (hd as f32).sqrt();
+        let qs: Vec<f32> = q.iter().map(|x| x * s).collect();
+        out.copy_from_slice(&crate::sd::ops::attention(&qs, k, v, n, n, nh, hd, false));
+        return;
+    }
     let op = SendPtrF(out.as_mut_ptr());
     pool::run(n * nh, &|idx| {
         let (ti, hh) = (idx / nh, idx % nh);

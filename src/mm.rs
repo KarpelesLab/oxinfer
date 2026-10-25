@@ -6,7 +6,6 @@
 
 #[cfg(feature = "media")]
 use crate::clock::Instant;
-use crate::model::Quant;
 use crate::safetensors::ModelFiles;
 use crate::video::VideoOptions;
 #[cfg(feature = "media")]
@@ -27,9 +26,6 @@ pub struct MmRequest<'a> {
     /// Image token budget (0: the model's default). Gemma 4: soft tokens per image (70, 140,
     /// 280, 560 or 1120); Qwen: merged tokens per image (each covers 32x32 pixels).
     pub max_soft_tokens: usize,
-    /// Precision for a Qwen vision tower that is not pre-quantized (see
-    /// `qwen_vision::QwenVisionTower::load`).
-    pub quant: Quant,
     /// Write the first image's / clip's inputs and soft tokens as f32 files with this prefix.
     pub dump_mm: Option<&'a Path>,
 }
@@ -44,7 +40,6 @@ impl<'a> MmRequest<'a> {
             videos: &[],
             video: VideoOptions::default(),
             max_soft_tokens: 0,
-            quant: Quant::Bf16,
             dump_mm: None,
         }
     }
@@ -133,16 +128,26 @@ pub fn prepare(args: &MmRequest, files: &ModelFiles, text_hidden: usize) -> Resu
             let num_frames = args.video.max_frames.unwrap_or(vp.num_frames);
             let select = |total: usize, fps: f64| video::sample_uniform(total, fps, args.video.fps, num_frames);
             let clip = video::load_clip(&media, path, &select, args.video.frames_fps)?;
+            let frames = clip
+                .frames
+                .iter()
+                .map(|f| vision::preprocess(f, clip.width, clip.height, &tower.cfg, vp.max_soft_tokens))
+                .collect::<Result<Vec<_>>>()?;
+            if let (Some(prefix), 0) = (args.dump_mm, i) {
+                dump(&format!("{}_vpixels.bin", prefix.display()), &frames[0].patches)?;
+            }
+            // Frames go through the tower in batches of up to ~16k patches.
+            let per = frames[0].n.max(1);
+            let mut embs = Vec::with_capacity(frames.len());
+            for batch in frames.chunks((16384 / per).max(1)) {
+                let refs: Vec<&vision::ImagePatches> = batch.iter().collect();
+                embs.extend(tower.encode_many(&refs));
+            }
             let mut emb = Vec::new();
-            let mut parts = Vec::with_capacity(clip.frames.len());
-            for (f, secs) in clip.frames.iter().zip(clip.times()) {
-                let patches = vision::preprocess_frame(f, clip.width, clip.height, &tower.cfg, vp.max_soft_tokens)?;
-                if let (Some(prefix), 0, true) = (args.dump_mm, i, emb.is_empty()) {
-                    dump(&format!("{}_vpixels.bin", prefix.display()), &patches.patches)?;
-                }
-                let e = tower.encode(&patches);
+            let mut parts = Vec::with_capacity(frames.len());
+            for (e, secs) in embs.iter().zip(clip.times()) {
                 let n = e.len() / text_hidden;
-                emb.extend_from_slice(&e);
+                emb.extend_from_slice(e);
                 let s = secs as u64;
                 parts.push(format!("{:02}:{:02} <|image>{}<image|>", s / 60, s % 60, "<|video|>".repeat(n)));
             }
@@ -269,7 +274,7 @@ fn prepare_qwen(
     }
     let media = media::Media::new();
     let t = Instant::now();
-    let tower = qwen_vision::QwenVisionTower::load(qc.vision.clone(), files, args.quant)?;
+    let tower = qwen_vision::QwenVisionTower::load(qc.vision.clone(), files)?;
     let m = qc.vision.spatial_merge_size;
     let unit = qc.image.patch_size * m;
     let max_pixels = args.max_soft_tokens * unit * unit;

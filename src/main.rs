@@ -485,7 +485,6 @@ fn mm_request(args: &Args) -> oxinfer::mm::MmRequest<'_> {
         videos: &args.videos,
         video: args.video.clone(),
         max_soft_tokens: args.max_soft_tokens,
-        quant: args.quant,
         dump_mm: args.dump_mm.as_deref(),
     }
 }
@@ -1179,8 +1178,8 @@ fn run_qwen(args: Args) -> Result<()> {
     if let Some(out) = &args.save_quantized {
         // Keep the vision tower (loading it marks its tensors for writing).
         if let Some(qc) = oxinfer::qwen_vision::QwenMmConfig::load(&args.model)? {
-            oxinfer::qwen_vision::QwenVisionTower::load(qc.vision, &files, model.quant)?;
-            eprintln!("[vision tower kept]");
+            oxinfer::qwen_vision::QwenVisionTower::load(qc.vision, &files)?;
+            eprintln!("[vision tower kept (bf16)]");
         }
         return save_quantized(&args.model, out, &files, model.quant);
     }

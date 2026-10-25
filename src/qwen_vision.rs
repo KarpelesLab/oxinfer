@@ -1,6 +1,6 @@
 //! Qwen3.5 / 3.6 / 3.8 vision (`Qwen3_5ForConditionalGeneration`'s `model.visual`): the image and
 //! video processors (`Qwen2VLImageProcessor` / `Qwen3VLVideoProcessor`: smart resize to multiples
-//! of 32 pixels within a pixel budget, Pillow bicubic, normalization to [-1, 1], 16x16 patches
+//! of 32 pixels within a pixel budget, uint8 bicubic, normalization to [-1, 1], 16x16 patches
 //! with 2 temporal frames each, emitted in 2x2 spatial-merge blocks), and the ViT: a Conv3d patch
 //! embedding, learned position embeddings bilinearly resampled to the patch grid, axial 2D RoPE,
 //! pre-LayerNorm blocks with biased projections and bidirectional attention within each frame,
@@ -10,9 +10,9 @@
 //! DeepStack (feature injection into early decoder layers) is not used by these checkpoints
 //! (`deepstack_visual_indexes` is empty) and is rejected if present.
 
-use crate::bert::{Dense, LayerNorm, gelu_erf};
+use crate::bert::{LayerNorm, gelu_erf};
 use crate::kernels::*;
-use crate::model::{Lin, Quant, linear};
+use crate::model::{Lin, Quant, linear, load_lin};
 use crate::safetensors::ModelFiles;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -312,13 +312,14 @@ fn patchify(frames: &[&[u8]], w: usize, h: usize, pc: &ProcessorConfig) -> Pixel
     Pixels { data, grid: (gt, gh, gw) }
 }
 
-/// The image processor: smart resize within `max_pixels` (0: the checkpoint's budget), Pillow
-/// bicubic, normalization, patches (each frame twice along the temporal patch axis).
+/// The image processor: smart resize within `max_pixels` (0: the checkpoint's budget) with
+/// torchvision's uint8 bicubic (the processor's default backend; `resample` also has Pillow's),
+/// normalization, patches (each frame twice along the temporal patch axis).
 pub fn preprocess_image(rgb: &[u8], w: usize, h: usize, pc: &ProcessorConfig, max_pixels: usize) -> Result<Pixels> {
     let factor = pc.patch_size * pc.merge_size;
     let maxp = if max_pixels > 0 { max_pixels } else { pc.max_pixels };
     let (th, tw) = smart_resize(h, w, factor, pc.min_pixels.min(maxp), maxp)?;
-    let img = crate::resample::resize_bicubic_rgb8(rgb, w, h, tw, th);
+    let img = crate::resample::resize_bicubic_rgb8_torchvision(rgb, w, h, tw, th);
     Ok(patchify(&[img.as_slice()], tw, th, pc))
 }
 
@@ -329,7 +330,7 @@ pub fn preprocess_video(frames: &[&[u8]], w: usize, h: usize, pc: &ProcessorConf
     let (th, tw) = smart_resize_t(frames.len(), pc.temporal_patch_size, h, w, factor, pc.min_pixels, pc.max_pixels)?;
     let resized: Vec<Vec<u8>> = frames
         .iter()
-        .map(|f| crate::resample::resize_bicubic_rgb8(f, w, h, tw, th))
+        .map(|f| crate::resample::resize_bicubic_rgb8_torchvision(f, w, h, tw, th))
         .collect();
     let refs: Vec<&[u8]> = resized.iter().map(|v| v.as_slice()).collect();
     Ok(patchify(&refs, tw, th, pc))
@@ -347,13 +348,55 @@ pub fn temporal_patch_times(indices: &[usize], fps: f64, temporal_patch_size: us
         .collect()
 }
 
+/// A biased linear layer of the tower.
+struct VLin<'a> {
+    w: Lin<'a>,
+    b: Vec<f32>,
+    n_out: usize,
+    n_in: usize,
+}
+
+impl<'a> VLin<'a> {
+    /// Loads `{name}.weight` (`[o, i]`) and `{name}.bias`. When `(po, pi)` is larger, the layer
+    /// is padded with zero rows / columns to it (the 27-layer towers' MLP width, 4304, is not a
+    /// multiple of the GPU tiles): a bf16 copy in memory.
+    fn load(files: &'a ModelFiles, name: &str, (o, i): (usize, usize), (po, pi): (usize, usize)) -> Result<Self> {
+        let wname = format!("{name}.weight");
+        let mut b = files.f32(&format!("{name}.bias"))?;
+        if b.len() != o {
+            bail!("{name}.bias has {} values, expected {o}", b.len());
+        }
+        b.resize(po, 0.0);
+        let w = if (po, pi) == (o, i) {
+            load_lin(files, &wname, o, i, Quant::Bf16)?
+        } else {
+            let info = files.info(&wname).with_context(|| format!("missing tensor {wname}"))?;
+            if info.shape != [o, i] {
+                bail!("tensor {wname} has shape {:?}, expected [{o}, {i}]", info.shape);
+            }
+            let src = files.bf16(&wname)?;
+            let mut v = crate::quant::PageVec::<u16>::zeroed(po * pi);
+            for r in 0..o {
+                v[r * pi..r * pi + i].copy_from_slice(&src[r * i..(r + 1) * i]);
+            }
+            Lin::bf16_owned(v)
+        };
+        Ok(Self { w, b, n_out: po, n_in: pi })
+    }
+
+    fn forward(&self, x: &[f32], t: usize, y: &mut [f32]) {
+        linear(&self.w, self.n_out, self.n_in, x, t, y);
+        for_chunks(y, self.n_out, true, |_, r| add_inplace(r, &self.b));
+    }
+}
+
 struct VBlock<'a> {
     norm1: LayerNorm,
     norm2: LayerNorm,
-    qkv: Dense<'a>,
-    proj: Dense<'a>,
-    fc1: Dense<'a>,
-    fc2: Dense<'a>,
+    qkv: VLin<'a>,
+    proj: VLin<'a>,
+    fc1: VLin<'a>,
+    fc2: VLin<'a>,
 }
 
 pub struct QwenVisionTower<'a> {
@@ -363,26 +406,19 @@ pub struct QwenVisionTower<'a> {
     pos_embed: Vec<f32>, // [num_position_embeddings, H]
     blocks: Vec<VBlock<'a>>,
     merger_norm: LayerNorm,
-    merger_fc1: Dense<'a>,
-    merger_fc2: Dense<'a>,
+    merger_fc1: VLin<'a>,
+    merger_fc2: VLin<'a>,
+    /// MLP width padded to a multiple of 64.
+    inter: usize,
     inv_freq: Vec<f32>, // head_dim/4 frequencies per axis
 }
 
-/// Precision of the tower's linear layers for a model quantized to `q`: int8 when the model is
-/// quantized (Q4 visibly hurts a ViT; int8 is within noise), bf16 otherwise, and bf16 for
-/// layers whose input width is not a multiple of the quantization block.
-fn tower_quant(q: Quant, n_in: usize) -> Quant {
-    match q {
-        Quant::Bf16 => Quant::Bf16,
-        _ if n_in.is_multiple_of(crate::quant::QBLOCK) => Quant::Q8,
-        _ => Quant::Bf16,
-    }
-}
-
 impl<'a> QwenVisionTower<'a> {
-    /// Loads `model.visual.*` (or `visual.*`). Pre-quantized tensors load as stored; otherwise
-    /// see `tower_quant`.
-    pub fn load(cfg: QwenVisionConfig, files: &'a ModelFiles, quant: Quant) -> Result<Self> {
+    /// Loads `model.visual.*` (or `visual.*`) in bf16 whatever the text model's precision:
+    /// int8 blocks moved the 27-layer tower's outputs by 4% (relative), against 1e-5 in bf16,
+    /// and the tower is small next to the language model. Tensors stored pre-quantized load as
+    /// stored.
+    pub fn load(cfg: QwenVisionConfig, files: &'a ModelFiles) -> Result<Self> {
         if !cfg.deepstack_visual_indexes.is_empty() {
             bail!("DeepStack vision features (deepstack_visual_indexes) are not supported");
         }
@@ -398,10 +434,10 @@ impl<'a> QwenVisionTower<'a> {
         } else {
             bail!("the checkpoint has no vision tower (model.visual.*)");
         };
-        let quant = Quant::stored(files).unwrap_or(quant);
         let h = cfg.hidden_size;
         let (c, t, p) = (cfg.in_channels, cfg.temporal_patch_size, cfg.patch_size);
-        let dense = |name: &str, o: usize, i: usize| Dense::load(files, &format!("{pre}{name}"), o, i, tower_quant(quant, i));
+        let dense = |name: &str, o: usize, i: usize| VLin::load(files, &format!("{pre}{name}"), (o, i), (o, i));
+        let (inter, inter_p) = (cfg.intermediate_size, cfg.intermediate_size.next_multiple_of(64));
         let pname = format!("{pre}patch_embed.proj.weight");
         let patch_w = Lin::bf16(files.bf16_conv(&pname, &[h, c, t, p, p])?);
         let patch_b = files.f32(&format!("{pre}patch_embed.proj.bias"))?;
@@ -417,8 +453,8 @@ impl<'a> QwenVisionTower<'a> {
                 norm2: LayerNorm::load(files, &format!("{pre}{b}norm2"), h)?,
                 qkv: dense(&format!("{b}attn.qkv"), 3 * h, h)?,
                 proj: dense(&format!("{b}attn.proj"), h, h)?,
-                fc1: dense(&format!("{b}mlp.linear_fc1"), cfg.intermediate_size, h)?,
-                fc2: dense(&format!("{b}mlp.linear_fc2"), h, cfg.intermediate_size)?,
+                fc1: VLin::load(files, &format!("{pre}{b}mlp.linear_fc1"), (inter, h), (inter_p, h))?,
+                fc2: VLin::load(files, &format!("{pre}{b}mlp.linear_fc2"), (h, inter), (h, inter_p))?,
             });
         }
         let mh = h * cfg.spatial_merge_size * cfg.spatial_merge_size;
@@ -435,6 +471,7 @@ impl<'a> QwenVisionTower<'a> {
             merger_norm: LayerNorm::load(files, &format!("{pre}merger.norm"), h)?,
             merger_fc1: dense("merger.linear_fc1", mh, mh)?,
             merger_fc2: dense("merger.linear_fc2", cfg.out_hidden_size, mh)?,
+            inter: inter_p,
             inv_freq,
             cfg,
         })
@@ -523,7 +560,7 @@ impl<'a> QwenVisionTower<'a> {
         let mut qkv = vec![0f32; n * 3 * h];
         let mut att = vec![0f32; n * h];
         let mut y = vec![0f32; n * h];
-        let mut mid = vec![0f32; n * cfg.intermediate_size];
+        let mut mid = vec![0f32; n * self.inter];
         for b in &self.blocks {
             hn.copy_from_slice(&x);
             b.norm1.apply_rows(&mut hn, eps);
@@ -554,7 +591,7 @@ impl<'a> QwenVisionTower<'a> {
             hn.copy_from_slice(&x);
             b.norm2.apply_rows(&mut hn, eps);
             b.fc1.forward(&hn, n, &mut mid);
-            for_chunks(&mut mid, cfg.intermediate_size, true, |_, r| {
+            for_chunks(&mut mid, self.inter, true, |_, r| {
                 for v in r.iter_mut() {
                     *v = gelu_tanh(*v);
                 }

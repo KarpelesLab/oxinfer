@@ -1171,7 +1171,6 @@ impl Engine {
                 videos: &media.videos,
                 video: media.video.clone(),
                 max_soft_tokens: media.max_soft_tokens,
-                quant: self.info.quant,
                 dump_mm: None,
             };
             let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
