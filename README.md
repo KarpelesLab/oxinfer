@@ -735,7 +735,8 @@ bf16 and ~50 for Q4 (against ~11 for the f32 GEMM); per call, copies and submiss
 | 2048 | 12.2 / 43.8 | 11.8 / 42.6 | 11.5 / 39.6 | 12.1 / 40.6 |
 
 The products are accurate to ~3e-4 relative (half operands) instead of bit-identical to the CPU;
-`OXINFER_METAL_MMA=0` keeps the f32 GEMM. MoE layers (Qwen3.5/3.6-35B-A3B) run their routed
+`OXINFER_METAL_MMA=0`, the engine option `gpu_exact=1` or `oxinfer::gpu::set_exact(true)` keep
+the f32 GEMM (`gpu_moe=0` / `set_moe_offload(false)` keep the experts on the CPU). MoE layers (Qwen3.5/3.6-35B-A3B) run their routed
 experts in one submission per layer: the tokens are gathered into one segment per expert, a
 grouped GEMM walks per-expert tiles for the gate/up projection, then SiLU, the grouped down
 projection and the weighted combination, all on the GPU (the expert weights are kept resident

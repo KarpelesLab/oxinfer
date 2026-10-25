@@ -116,6 +116,13 @@ pub struct EngineOptions {
     /// Core ML models: how prompts are fed. Key `coreml_prefill` (`auto`, `batch`, `pad`,
     /// `single`).
     pub coreml_prefill: CoreMlPrefill,
+    /// GPU matmuls bit-identical to the CPU (no half-precision matrix units on M5/A19; slower
+    /// prefill). Process-wide, applied on load; None leaves the current setting
+    /// ([`crate::gpu::set_exact`]). Key `gpu_exact`.
+    pub gpu_exact: Option<bool>,
+    /// MoE experts on the GPU during prefill. Process-wide, applied on load; None leaves the
+    /// current setting ([`crate::gpu::set_moe_offload`]). Key `gpu_moe`.
+    pub gpu_moe: Option<bool>,
 }
 
 /// Where Core ML runs a model ([`EngineOptions::coreml_units`]; Core ML's `MLComputeUnits`).
@@ -226,6 +233,8 @@ impl Default for EngineOptions {
             stream: None,
             coreml_units: None,
             coreml_prefill: CoreMlPrefill::Auto,
+            gpu_exact: None,
+            gpu_moe: None,
         }
     }
 }
@@ -270,6 +279,8 @@ impl EngineOptions {
         "flash_mbps",
         "coreml_units",
         "coreml_prefill",
+        "gpu_exact",
+        "gpu_moe",
     ];
 
     /// Sets an option by name (see the field docs for the keys). Unknown keys are errors.
@@ -323,6 +334,8 @@ impl EngineOptions {
                 self.coreml_prefill = CoreMlPrefill::parse(value)
                     .with_context(|| format!("coreml_prefill: unknown value {value:?} (auto|batch|pad|single)"))?
             }
+            "gpu_exact" => self.gpu_exact = Some(parse_bool(key, value)?),
+            "gpu_moe" => self.gpu_moe = Some(parse_bool(key, value)?),
             _ => bail!("unknown option {key:?} (known: {})", Self::KEYS.join(", ")),
         }
         Ok(())
@@ -648,6 +661,12 @@ impl Engine {
         }
         if let Some(t) = opts.threads {
             pool::configure(t);
+        }
+        if let Some(on) = opts.gpu_exact {
+            crate::gpu::set_exact(on);
+        }
+        if let Some(on) = opts.gpu_moe {
+            crate::gpu::set_moe_offload(on);
         }
         let gpu = if crate::gpu::initialized() {
             crate::gpu::active()

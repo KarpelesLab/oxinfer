@@ -1148,7 +1148,8 @@ impl MetalBackend {
         };
         // Compile the shader library from source: with the matrix-unit kernels (Metal 4) when the
         // GPU cores have neural accelerators (Apple10 family: M5, A19), else without.
-        // OXINFER_METAL_MMA=0 turns them off, =1 tries them on any device.
+        // OXINFER_METAL_MMA=0 leaves them out, =1 tries them on any device; `gpu::set_exact`
+        // bypasses them at run time.
         let supports_family: unsafe extern "C" fn(Id, Sel, i64) -> u8 = o.msg_send();
         let apple10 = unsafe { supports_family(device, o.sel(c"supportsFamily:"), 1010) } != 0;
         let mma_env = std::env::var("OXINFER_METAL_MMA").ok();
@@ -1509,6 +1510,11 @@ impl Enc<'_> {
 }
 
 impl MetalBackend {
+    /// The matrix-unit kernels, unless absent or bypassed by [`crate::gpu::set_exact`].
+    fn mma(&self) -> Option<&Mma> {
+        if crate::gpu::exact() { None } else { self.mma.as_ref() }
+    }
+
     /// Encodes one compute pass with `encode`, submits it and waits; then, if it completed, calls
     /// `read_back`. Both get `state` (what they both borrow). `t_in` is when copying the inputs
     /// started (for the statistics).
@@ -1561,7 +1567,7 @@ impl MetalBackend {
 
     /// The matrix-unit pipeline for a weight and the outputs per threadgroup it computes.
     fn mma_pipe(&self, w: &WeightRef, affine: bool, n_out: usize, n_in: usize, tile: Tile) -> Option<(Id, usize)> {
-        let m = self.mma.as_ref()?;
+        let m = self.mma()?;
         if !n_in.is_multiple_of(MMA_KB) || !n_out.is_multiple_of(64) {
             return None;
         }
@@ -2154,8 +2160,8 @@ impl Backend for MetalBackend {
     }
 
     fn upload_moe(&self, gate_up: &[WeightRef], down: &[WeightRef], h: usize, mi: usize) -> Option<DeviceWeight> {
-        self.mma.as_ref()?;
-        if gate_up.is_empty() || gate_up.len() != down.len() {
+        self.mma()?;
+        if !crate::gpu::moe_offload() || gate_up.is_empty() || gate_up.len() != down.len() {
             return None;
         }
         let affine = |w: &WeightRef| matches!(w, WeightRef::Q4(m) if m.offsets.is_some());
@@ -2251,10 +2257,10 @@ impl Backend for MetalBackend {
     }
 
     fn moe(&self, x: &[f32], t: usize, h: usize, mi: usize, routes: &[Vec<(usize, f32)>], dev: &DeviceWeight, y: &mut [f32]) -> bool {
-        if std::env::var("OXINFER_METAL_MOE").as_deref() == Ok("0") {
+        if !crate::gpu::moe_offload() {
             return false;
         }
-        let (Some(m), Some(md)) = (self.mma.as_ref(), dev.downcast_ref::<MoeDev>()) else {
+        let (Some(m), Some(md)) = (self.mma(), dev.downcast_ref::<MoeDev>()) else {
             return false;
         };
         let k = routes.first().map_or(0, |r| r.len());
@@ -2403,7 +2409,7 @@ impl Backend for MetalBackend {
         if jobs.is_empty() || !n_in.is_multiple_of(32) || x.len() < t * n_in {
             return false;
         }
-        if self.mma.is_some()
+        if self.mma().is_some()
             && let Some(ok) = self.matmul_mma(x, t, n_in, jobs)
         {
             return ok;

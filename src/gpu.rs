@@ -6,6 +6,7 @@ use crate::ggml::GgufMatrix;
 use crate::quant::{Q4Matrix, QMatrix};
 use std::any::Any;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// A weight matrix in one of the supported storage formats (`[n_out, n_in]`).
 pub enum WeightRef<'a> {
@@ -133,6 +134,44 @@ pub trait Backend: Send + Sync {
 }
 
 static ACTIVE: OnceLock<Option<Box<dyn Backend>>> = OnceLock::new();
+
+/// Process-wide switches: 0 = unset (environment default), 1 = on, 2 = off.
+static EXACT: AtomicU8 = AtomicU8::new(0);
+static MOE: AtomicU8 = AtomicU8::new(0);
+
+fn switch(a: &AtomicU8, env: &'static OnceLock<Option<String>>, var: &str, on_env: fn(&str) -> bool, default: bool) -> bool {
+    match a.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => env.get_or_init(|| std::env::var(var).ok()).as_deref().map_or(default, on_env),
+    }
+}
+
+/// Keeps GPU matmuls bit-identical to the CPU: no reduced-precision matrix units (Metal on
+/// M5/A19 converts inputs to half with f32 accumulation, a KL divergence of 1e-7 to 1e-3 from
+/// the CPU). Process-wide, takes effect on the next dispatch. Default: off, or
+/// `OXINFER_METAL_MMA=0`.
+pub fn set_exact(on: bool) {
+    EXACT.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+}
+
+/// See [`set_exact`].
+pub fn exact() -> bool {
+    static ENV: OnceLock<Option<String>> = OnceLock::new();
+    switch(&EXACT, &ENV, "OXINFER_METAL_MMA", |v| v == "0", false)
+}
+
+/// Runs MoE expert matmuls on the GPU when the backend can (prefill). Process-wide; affects
+/// models loaded afterwards. Default: on, or `OXINFER_METAL_MOE=0` for off.
+pub fn set_moe_offload(on: bool) {
+    MOE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+}
+
+/// See [`set_moe_offload`].
+pub fn moe_offload() -> bool {
+    static ENV: OnceLock<Option<String>> = OnceLock::new();
+    switch(&MOE, &ENV, "OXINFER_METAL_MOE", |v| v != "0", true)
+}
 
 /// Installs the backend for this process (call once, before loading models).
 pub fn install(b: Option<Box<dyn Backend>>) {

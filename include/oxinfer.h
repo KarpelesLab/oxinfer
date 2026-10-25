@@ -71,6 +71,9 @@ char *oxi_download(const char *spec, const char *cache_dir, oxi_progress_fn prog
  *   draft=PATH|REPO      Gemma 4 assistant (drafter) model for speculative decoding (greedy)
  *   draft_tokens=N       max draft tokens per round (default 3 with MTP, 6 with a drafter)
  *   cache_dir=PATH       where repo ids are downloaded
+ *   gpu_exact=0|1        GPU matmuls bit-identical to the CPU (default 0: M5/A19 matrix
+ *                        units, half-precision inputs; process-wide)
+ *   gpu_moe=0|1          MoE experts on the GPU in prefill (default 1; process-wide)
  *   coreml_units=auto|ane|all|gpu|cpu   Core ML models (ANEMLL format, Apple only): compute
  *                        units (default auto: the Neural Engine, or cpu/gpu following device)
  *   coreml_prefill=auto|batch|pad|single  Core ML models: how prompts are fed (default auto)
