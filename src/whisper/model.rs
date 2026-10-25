@@ -247,47 +247,109 @@ pub struct WhisperModel {
     dec_ln: LayerNorm,
     /// The output projection, tied to the token embedding (`[vocab, d]`).
     lm_head: Lin<'static>,
+    /// Cross-attention keys and values held as bf16 (decoders below f16 precision).
+    cross_bf16: bool,
 }
 
-/// Cross-attention keys and values of one decoder layer, head-major (`[heads][n][dh]`) so each
-/// head's keys are contiguous.
+/// Cross-attention keys or values, head-major (`[heads][n][dh]`, each head's rows contiguous):
+/// f32, or bf16 to halve what each decoded token reads (1500 positions per layer).
+enum Kv {
+    F32(Vec<f32>),
+    Bf16(Vec<u16>),
+}
+
+impl Kv {
+    /// From position-major `[n][heads * dh]` projections.
+    fn new(x: &[f32], n: usize, nh: usize, dh: usize, bf16: bool) -> Self {
+        let d = nh * dh;
+        if bf16 {
+            let mut t = vec![0u16; n * d];
+            for_chunks_u16(&mut t, n * dh, |h, r| {
+                for p in 0..n {
+                    for (o, &v) in r[p * dh..(p + 1) * dh].iter_mut().zip(&x[p * d + h * dh..p * d + (h + 1) * dh]) {
+                        *o = half::bf16::from_f32(v).to_bits();
+                    }
+                }
+            });
+            Kv::Bf16(t)
+        } else {
+            let mut t = vec![0f32; n * d];
+            for_chunks(&mut t, n * dh, true, |h, r| {
+                for p in 0..n {
+                    r[p * dh..(p + 1) * dh].copy_from_slice(&x[p * d + h * dh..p * d + (h + 1) * dh]);
+                }
+            });
+            Kv::F32(t)
+        }
+    }
+
+    /// `q . row` for row `r` (`dh` wide).
+    #[inline]
+    fn dot(&self, r: usize, dh: usize, q: &[f32]) -> f32 {
+        match self {
+            Kv::F32(v) => crate::kernels::dot(q, &v[r * dh..(r + 1) * dh]),
+            Kv::Bf16(v) => crate::kernels::dot_bf16(&v[r * dh..(r + 1) * dh], q),
+        }
+    }
+
+    /// `o += w * row` for row `r`.
+    #[inline]
+    fn axpy(&self, r: usize, dh: usize, w: f32, o: &mut [f32]) {
+        match self {
+            Kv::F32(v) => crate::kernels::axpy(o, w, &v[r * dh..(r + 1) * dh]),
+            Kv::Bf16(v) => {
+                for (y, &x) in o.iter_mut().zip(&v[r * dh..(r + 1) * dh]) {
+                    *y += w * crate::kernels::bf16_to_f32(x);
+                }
+            }
+        }
+    }
+}
+
+/// `for_chunks` over u16 rows (parallel).
+fn for_chunks_u16(x: &mut [u16], size: usize, f: impl Fn(usize, &mut [u16]) + Sync) {
+    #[derive(Clone, Copy)]
+    struct P(*mut u16);
+    unsafe impl Send for P {}
+    unsafe impl Sync for P {}
+    impl P {
+        fn get(self) -> *mut u16 {
+            self.0
+        }
+    }
+    let n = x.len();
+    let p = P(x.as_mut_ptr());
+    crate::pool::run(n.div_ceil(size), &|i| {
+        let len = size.min(n - i * size);
+        // SAFETY: chunks are disjoint and `x` outlives the call.
+        f(i, unsafe { std::slice::from_raw_parts_mut(p.get().add(i * size), len) });
+    });
+}
+
+/// Cross-attention keys and values of one decoder layer.
 pub struct CrossLayer {
-    k: Vec<f32>,
-    v: Vec<f32>,
+    k: Kv,
+    v: Kv,
     pub n: usize,
     nh: usize,
     dh: usize,
 }
 
 impl CrossLayer {
-    /// From position-major `[n][heads * dh]` projections.
-    fn new(k: &[f32], v: &[f32], n: usize, nh: usize, dh: usize) -> Self {
-        let d = nh * dh;
-        let mut kt = vec![0f32; n * d];
-        let mut vt = vec![0f32; n * d];
-        for_chunks(&mut kt, n * dh, true, |h, r| {
-            for p in 0..n {
-                r[p * dh..(p + 1) * dh].copy_from_slice(&k[p * d + h * dh..p * d + (h + 1) * dh]);
-            }
-        });
-        for_chunks(&mut vt, n * dh, true, |h, r| {
-            for p in 0..n {
-                r[p * dh..(p + 1) * dh].copy_from_slice(&v[p * d + h * dh..p * d + (h + 1) * dh]);
-            }
-        });
-        Self { k: kt, v: vt, n, nh, dh }
+    fn new(k: &[f32], v: &[f32], n: usize, nh: usize, dh: usize, bf16: bool) -> Self {
+        Self {
+            k: Kv::new(k, n, nh, dh, bf16),
+            v: Kv::new(v, n, nh, dh, bf16),
+            n,
+            nh,
+            dh,
+        }
     }
 
+    /// `q . key` of head `h` at position `p`.
     #[inline]
-    fn key(&self, h: usize, p: usize) -> &[f32] {
-        let o = (h * self.n + p) * self.dh;
-        &self.k[o..o + self.dh]
-    }
-
-    #[inline]
-    fn value(&self, h: usize, p: usize) -> &[f32] {
-        let o = (h * self.n + p) * self.dh;
-        &self.v[o..o + self.dh]
+    fn score(&self, h: usize, p: usize, q: &[f32]) -> f32 {
+        self.k.dot(h * self.n + p, self.dh, q)
     }
 
     /// Attention of `t` (pre-scaled) queries `[t][heads * dh]` over all positions into `out`.
@@ -311,7 +373,7 @@ impl CrossLayer {
                 return;
             }
             let qv = &q[ti * d + h * dh..ti * d + (h + 1) * dh];
-            let mut sc: Vec<f32> = (p0..p1).map(|p| crate::kernels::dot(qv, self.key(h, p))).collect();
+            let mut sc: Vec<f32> = (p0..p1).map(|p| self.score(h, p, qv)).collect();
             let m = sc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let mut l = 0f32;
             for s in sc.iter_mut() {
@@ -323,7 +385,7 @@ impl CrossLayer {
             head[1] = l;
             o.fill(0.0);
             for (p, &w) in (p0..p1).zip(&sc) {
-                crate::kernels::axpy(o, w, self.value(h, p));
+                self.v.axpy(h * n + p, dh, w, o);
             }
         });
         for row in 0..rows {
@@ -455,6 +517,7 @@ impl WhisperModel {
             dec_layers,
             dec_ln: LayerNorm::load(files, "model.decoder.layer_norm", d)?,
             lm_head,
+            cross_bf16: !matches!(dec, Precision::F32 | Precision::F16),
             cfg,
         })
     }
@@ -539,7 +602,10 @@ impl WhisperModel {
         let ps: Vec<&Proj> = self.dec_layers.iter().flat_map(|l| [&l.cross.k, &l.cross.v]).collect();
         let ys = project(&ps, d, enc, n);
         CrossKv {
-            layers: ys.chunks(2).map(|kv| CrossLayer::new(&kv[0], &kv[1], n, nh, d / nh)).collect(),
+            layers: ys
+                .chunks(2)
+                .map(|kv| CrossLayer::new(&kv[0], &kv[1], n, nh, d / nh, self.cross_bf16))
+                .collect(),
         }
     }
 
@@ -671,7 +737,7 @@ impl WhisperModel {
                 for_chunks(&mut w, n_src, t > 1, |i, row| {
                     let qv = &q[i * d + hh * dh..i * d + (hh + 1) * dh];
                     for (s, r) in row.iter_mut().enumerate() {
-                        *r = crate::kernels::dot(qv, kv.key(hh, s));
+                        *r = kv.score(hh, s, qv);
                     }
                 });
                 out[hi] = w;
