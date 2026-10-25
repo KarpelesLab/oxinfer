@@ -14,6 +14,7 @@ use tokenizers::Tokenizer;
 mod anemll_cli;
 mod janus_cli;
 #[cfg(feature = "media")]
+mod tts_cli;
 mod whisper_cli;
 
 struct Args {
@@ -109,6 +110,21 @@ struct Args {
     generate_image: Option<String>,
     num_images: usize,
     temp_given: bool,
+    // Text to speech (Orpheus models).
+    speak: Option<String>,
+    voice: Option<String>,
+    snac: Option<String>,
+    speak_stream: bool,
+    speak_json: Option<String>,
+    no_noise: bool,
+    unconstrained: bool,
+    decode_tokens: Option<PathBuf>,
+    dump_pcm: Option<PathBuf>,
+    repetition_penalty: Option<f32>,
+    // Set explicitly (text to speech has its own defaults).
+    temperature_set: Option<f32>,
+    top_p_set: Option<f32>,
+    max_tokens_set: Option<usize>,
 }
 
 fn usage() -> ! {
@@ -244,7 +260,19 @@ fn usage() -> ! {
          \x20 --fallback           temperature fallback on repetitive or unlikely windows (openai defaults)\n\
          \x20 --condition-on-prev  feed each window the previous text\n\
          \x20 --precision P        weights: f32 (matches transformers token for token), f16, bf16 (default);\n\
-         \x20                      --quant q8|q4 quantizes the decoder (--temp T samples at T)"
+         \x20                      --quant q8|q4 quantizes the decoder (--temp T samples at T)\n\
+         \n\
+         text to speech (Orpheus TTS: unsloth/orpheus-3b-0.1-ft or canopylabs/orpheus-3b-0.1-ft):\n\
+         \x20 --speak TEXT         text to speak (- for stdin); -o FILE writes the WAV (default speech.wav)\n\
+         \x20 --voice NAME         tara (default), leah, jess, leo, dan, mia, zac, zoe; \"\" for none\n\
+         \x20 --speak-stream       decode audio while generating (sliding windows), report latency\n\
+         \x20 --snac DIR           SNAC decoder (default hubertsiuzdak/snac_24khz); --precision f32|bf16\n\
+         \x20 --repetition-penalty F  default 1.1 (also applies to text generation, default 1 there)\n\
+         \x20 --temp, --top-p, --max-tokens, --seed  sampling (TTS defaults 0.6, 0.8, 1200)\n\
+         \x20 --speak-json JSON    all speak options as a JSON object (see oxinfer::tts::SpeakOptions)\n\
+         \x20 --no-noise           no SNAC noise; --unconstrained samples from the whole vocabulary\n\
+         \x20 --decode-tokens FILE decode audio token ids (JSON array) to -o FILE (--model may be a SNAC dir)\n\
+         \x20 --dump-pcm FILE      also write the samples as raw f32"
     );
     std::process::exit(2)
 }
@@ -338,6 +366,19 @@ fn parse_args() -> Result<Args> {
         generate_image: None,
         num_images: 1,
         temp_given: false,
+        speak: None,
+        voice: None,
+        snac: None,
+        speak_stream: false,
+        speak_json: None,
+        no_noise: false,
+        unconstrained: false,
+        decode_tokens: None,
+        dump_pcm: None,
+        repetition_penalty: None,
+        temperature_set: None,
+        top_p_set: None,
+        max_tokens_set: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -352,13 +393,20 @@ fn parse_args() -> Result<Args> {
             "--think" => a.think = true,
             "--raw" => a.raw = true,
             "--chat" => a.chat = true,
-            "--max-tokens" | "-n" => a.max_tokens = val()?.parse()?,
+            "--max-tokens" | "-n" => {
+                a.max_tokens = val()?.parse()?;
+                a.max_tokens_set = Some(a.max_tokens);
+            }
             "--temp" | "-t" => {
                 a.temperature = val()?.parse()?;
                 a.temp_given = true;
+                a.temperature_set = Some(a.temperature);
             }
             "--top-k" => a.top_k = val()?.parse()?,
-            "--top-p" => a.top_p = val()?.parse()?,
+            "--top-p" => {
+                a.top_p = val()?.parse()?;
+                a.top_p_set = Some(a.top_p);
+            }
             "--seed" => a.seed = val()?.parse()?,
             "--threads" | "-j" => a.threads = Some(val()?.parse()?),
             "--qos" => {
@@ -485,6 +533,16 @@ fn parse_args() -> Result<Args> {
             "--precision" => a.precision = Some(val()?),
             "--fallback" => a.fallback = true,
             "--condition-on-prev" => a.condition_on_prev = true,
+            "--speak" => a.speak = Some(val()?),
+            "--voice" => a.voice = Some(val()?),
+            "--snac" => a.snac = Some(val()?),
+            "--speak-stream" => a.speak_stream = true,
+            "--speak-json" => a.speak_json = Some(val()?),
+            "--no-noise" => a.no_noise = true,
+            "--unconstrained" => a.unconstrained = true,
+            "--decode-tokens" => a.decode_tokens = Some(PathBuf::from(val()?)),
+            "--dump-pcm" => a.dump_pcm = Some(PathBuf::from(val()?)),
+            "--repetition-penalty" | "--repeat-penalty" => a.repetition_penalty = Some(val()?.parse()?),
             "-h" | "--help" => usage(),
             _ => {
                 eprintln!("unknown argument {k}");
@@ -825,6 +883,9 @@ fn run(mut args: Args) -> Result<()> {
     if args.embed || oxinfer::embed::is_embedding_model(&args.model) {
         return run_embed(&args);
     }
+    if args.speak.is_some() || args.decode_tokens.is_some() {
+        return tts_cli::run(&args);
+    }
     let model_type = config::model_type(&args.model)?;
     if model_type == "whisper" || args.transcribe.is_some() {
         #[cfg(feature = "media")]
@@ -838,6 +899,8 @@ fn run(mut args: Args) -> Result<()> {
     match model_type.as_str() {
         "gemma4" | "gemma4_text" | "gemma3" | "gemma3_text" => run_gemma(args),
         "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" => run_qwen(args),
+        // Llama 3 runs on the Qwen3 code path.
+        "llama" => run_qwen(args),
         other => bail!("unsupported model_type {other}"),
     }
 }
@@ -983,7 +1046,8 @@ fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt
         let enc = tok.encode(text, false).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
         Ok(enc.get_ids().to_vec())
     };
-    let mut sampler = Sampler::new(args.temperature, args.top_k, args.top_p, args.seed);
+    let mut sampler =
+        Sampler::new(args.temperature, args.top_k, args.top_p, args.seed).with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0));
     let mut sess = model.new_session();
     let h = model.hidden_size();
     if args.chat {
@@ -1180,7 +1244,11 @@ fn run_qwen(args: Args) -> Result<()> {
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
     let mut model = qwen::QwenModel::load(cfg, &files, args.quant)?;
     let tok = load_tokenizer(&args.model)?;
-    let fmt = chat::QwenChat::for_model(&args.model);
+    let fmt: &dyn ChatFormat = if model.cfg.qk_norm {
+        chat::QwenChat::for_model(&args.model)
+    } else {
+        &chat::Llama3Chat
+    };
     let eos = chat::with_turn_end(fmt, &tok, eos);
     eprintln!(
         "[loaded Qwen: {} layers, hidden {}, {:.1} GB checkpoint ({}), {} weights streaming {:.2} GB/token, {} threads, {:.2}s]",
@@ -1410,7 +1478,8 @@ fn run_qwen_mtp(
         },
         if args.temperature > 0.0 { "sampled" } else { "greedy" }
     );
-    let mut sampler = Sampler::new(args.temperature, args.top_k, args.top_p, args.seed);
+    let mut sampler =
+        Sampler::new(args.temperature, args.top_k, args.top_p, args.seed).with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0));
     let mut dec = MtpDecoder::new(model, mtp, opts);
     if dec.opts.draft_tokens > oxinfer::qwen_mtp::max_exact_draft() {
         eprintln!(
@@ -1603,7 +1672,8 @@ fn run_gemma(args: Args) -> Result<()> {
         _ => None,
     };
 
-    let mut sampler = Sampler::new(args.temperature, args.top_k, args.top_p, args.seed);
+    let mut sampler =
+        Sampler::new(args.temperature, args.top_k, args.top_p, args.seed).with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0));
     let mut sess = model.new_session();
 
     if args.chat {

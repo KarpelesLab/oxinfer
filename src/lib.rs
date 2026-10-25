@@ -62,9 +62,11 @@ pub mod resample;
 pub mod safetensors;
 pub mod sampler;
 pub mod sd;
+pub mod snac;
 pub mod stream;
 pub mod tools;
 pub mod torch;
+pub mod tts;
 pub mod video;
 pub mod vision;
 #[cfg(all(feature = "web", target_arch = "wasm32", target_os = "unknown"))]

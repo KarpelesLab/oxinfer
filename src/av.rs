@@ -93,6 +93,16 @@ impl AudioClip {
     }
 }
 
+/// One frame of mono `F32` samples at `sample_rate` with presentation time `pts` (in samples,
+/// i.e. a time base of 1 / `sample_rate`) and the parameters describing it: text-to-speech
+/// output ([`crate::tts`]), whole or streamed.
+pub fn mono_audio_frame(samples: &[f32], sample_rate: u32, pts: i64) -> (AudioFrame, CodecParameters) {
+    let mut clip = AudioClip::from_mono(samples, sample_rate);
+    let mut frame = clip.frames.pop().expect("one frame");
+    frame.pts = Some(pts);
+    (frame, clip.params)
+}
+
 impl PartialEq for AudioClip {
     fn eq(&self, o: &Self) -> bool {
         let (a, b) = (&self.params, &o.params);

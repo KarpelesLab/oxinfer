@@ -10,7 +10,8 @@
 //! Threads: an engine may be used from any thread, one call at a time, except `oxi_engine_cancel`,
 //! which may be called from any thread at any time (it stops a running `oxi_engine_send` /
 //! `oxi_engine_complete` after the current token). Whisper transcribers (`oxi_transcriber_*`,
-//! over [`crate::whisper`]) follow the same rules, with `oxi_transcriber_cancel`.
+//! over [`crate::whisper`]) and Orpheus speakers (`oxi_speaker_*`, `oxi_speak*`, over
+//! [`crate::tts`]) follow the same rules, with `oxi_transcriber_cancel` / `oxi_speaker_cancel`.
 #![allow(clippy::missing_safety_doc)] // the contract is documented once above and in the header
 
 use crate::engine::{Attachments, CancelHandle, Delta, Engine, EngineOptions, Flow, Reply, SamplingParams, StopReason, SystemPrompt};
@@ -219,7 +220,8 @@ pub unsafe extern "C" fn oxi_engine_set(e: *mut OxiEngine, key: *const c_char, v
             "top_k" => s.top_k = num("a count")? as usize,
             "top_p" => s.top_p = num("a number")? as f32,
             "seed" => s.seed = v.parse().map_err(|_| anyhow!("seed: expected an integer, got {v:?}"))?,
-            _ => bail!("unknown setting {key:?} (system, think, max_tokens, temperature, top_k, top_p, seed)"),
+            "repetition_penalty" => s.repetition_penalty = num("a number")? as f32,
+            _ => bail!("unknown setting {key:?} (system, think, max_tokens, temperature, top_k, top_p, seed, repetition_penalty)"),
         }
         if s != g.sampling() {
             g.set_sampling(s);
@@ -745,5 +747,196 @@ pub unsafe extern "C" fn oxi_janus_understand_rgb(
         }
         let data = unsafe { std::slice::from_raw_parts(rgb, w * h * 3) }.to_vec();
         Ok(vec![crate::video::RgbImage { width: w, height: h, data }])
+    })
+}
+
+// ---- Text to speech (Orpheus) ---------------------------------------------------------------
+
+/// Receives streamed audio: `n` mono samples in [-1, 1] at `sample_rate`, the first being sample
+/// `start` of the utterance; return non-zero to stop.
+pub type OxiAudioFn =
+    Option<unsafe extern "C" fn(user: *mut c_void, samples: *const f32, n: usize, start: u64, sample_rate: c_int) -> c_int>;
+
+/// An Orpheus speaker handle.
+pub struct OxiSpeaker {
+    cancel: CancelHandle,
+    speaker: Mutex<crate::tts::Speaker>,
+    stats: Mutex<Option<crate::tts::SpeakStats>>,
+}
+
+unsafe fn speaker<'a>(s: *const OxiSpeaker) -> Result<&'a OxiSpeaker> {
+    unsafe { s.as_ref() }.context("speaker is NULL")
+}
+
+/// Loads an Orpheus model and the SNAC decoder (`key=value` options, see the header).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_speaker_load(
+    model: *const c_char,
+    options: *const c_char,
+    progress: OxiProgressFn,
+    user: *mut c_void,
+) -> *mut OxiSpeaker {
+    guard(std::ptr::null_mut(), || {
+        let model = unsafe { str_arg(model, "model") }?;
+        let mut o = crate::tts::SpeakerOptions::default();
+        for item in unsafe { opt_str_arg(options, "options") }?.unwrap_or("").split(['\n', ';']) {
+            let item = item.trim();
+            if item.is_empty() || item.starts_with('#') {
+                continue;
+            }
+            let (k, v) = item.split_once('=').with_context(|| format!("option {item:?} is not key=value"))?;
+            o.set(k.trim(), v.trim())?;
+        }
+        let s = with_progress(progress, user, || crate::tts::Speaker::load(model, &o))?;
+        Ok(Box::into_raw(Box::new(OxiSpeaker {
+            cancel: s.cancel_handle(),
+            speaker: Mutex::new(s),
+            stats: Mutex::new(None),
+        })))
+    })
+}
+
+/// Frees a speaker (NULL is ignored). No other call on it may be running.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_speaker_free(s: *mut OxiSpeaker) {
+    if !s.is_null() {
+        guard((), || {
+            drop(unsafe { Box::from_raw(s) });
+            Ok(())
+        })
+    }
+}
+
+/// Stops the running utterance (any thread); it returns the audio generated so far.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_speaker_cancel(s: *const OxiSpeaker) {
+    if let Some(s) = unsafe { s.as_ref() } {
+        s.cancel.cancel();
+    }
+}
+
+/// Model information as JSON.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_speaker_info_json(s: *mut OxiSpeaker) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let s = unsafe { speaker(s) }?;
+        let g = s.speaker.lock().unwrap_or_else(|p| p.into_inner());
+        let i = g.info();
+        let j = serde_json::json!({
+            "path": i.path,
+            "snac_path": i.snac_path,
+            "layers": i.layers,
+            "hidden_size": i.hidden_size,
+            "quant": i.quant.as_str(),
+            "device": i.device,
+            "threads": i.threads,
+            "sample_rate": i.sample_rate,
+            "load_secs": i.load_secs,
+            "voices": crate::tts::VOICES,
+        });
+        Ok(out_string(j.to_string()))
+    })
+}
+
+/// Statistics of the last utterance as JSON (`null` before the first).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_speaker_stats_json(s: *mut OxiSpeaker) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let s = unsafe { speaker(s) }?;
+        let st = s.stats.lock().unwrap_or_else(|p| p.into_inner());
+        let mut j = serde_json::to_value(&*st)?;
+        if let (Some(st), Some(o)) = (&*st, j.as_object_mut()) {
+            o.insert("tok_s".into(), st.tok_s().into());
+            o.insert("rtf".into(), st.rtf().into());
+        }
+        Ok(out_string(j.to_string()))
+    })
+}
+
+fn speak_common(
+    s: *mut OxiSpeaker,
+    text: *const c_char,
+    options_json: *const c_char,
+    cb: OxiAudioFn,
+    user: *mut c_void,
+) -> Result<crate::tts::Speech> {
+    let s = unsafe { speaker(s) }?;
+    let text = unsafe { str_arg(text, "text") }?;
+    let opts = crate::tts::SpeakOptions::from_json(unsafe { opt_str_arg(options_json, "options_json") }?.unwrap_or(""))?;
+    let g = s.speaker.lock().unwrap_or_else(|p| p.into_inner());
+    let speech = match cb {
+        Some(cb) => g.speak_stream(text, &opts, &mut |c| {
+            let r = unsafe { cb(user, c.samples.as_ptr(), c.samples.len(), c.start as u64, c.sample_rate as c_int) };
+            if r != 0 { Flow::Stop } else { Flow::Continue }
+        })?,
+        None => g.speak_detailed(text, &opts)?,
+    };
+    *s.stats.lock().unwrap_or_else(|p| p.into_inner()) = Some(speech.stats.clone());
+    Ok(speech)
+}
+
+fn speech_code(f: StopReason) -> c_int {
+    match f {
+        StopReason::Stop => 0,
+        StopReason::Length => 1,
+        StopReason::Cancelled => 2,
+    }
+}
+
+/// Speaks `text`; the samples go to `samples_out` (free with `oxi_audio_free`) when it is not
+/// NULL. Returns 0 (end of speech), 1 (max_tokens), 2 (cancelled) or -1.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn oxi_speak(
+    s: *mut OxiSpeaker,
+    text: *const c_char,
+    options_json: *const c_char,
+    cb: OxiAudioFn,
+    user: *mut c_void,
+    samples_out: *mut *mut f32,
+    n_out: *mut usize,
+    sample_rate_out: *mut c_int,
+) -> c_int {
+    guard(-1, || {
+        let speech = speak_common(s, text, options_json, cb, user)?;
+        let a = speech.audio;
+        unsafe {
+            if let Some(p) = sample_rate_out.as_mut() {
+                *p = a.sample_rate as c_int;
+            }
+            if let Some(p) = n_out.as_mut() {
+                *p = a.samples.len();
+            }
+            if let Some(p) = samples_out.as_mut() {
+                *p = Box::into_raw(a.samples.into_boxed_slice()) as *mut f32;
+            }
+        }
+        Ok(speech_code(speech.finish))
+    })
+}
+
+/// Frees samples returned by `oxi_speak` (`n` as returned; NULL is ignored).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_audio_free(samples: *mut f32, n: usize) {
+    if !samples.is_null() {
+        drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(samples, n)) });
+    }
+}
+
+/// Speaks `text` into a 16-bit PCM WAV file. Returns as `oxi_speak`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_speak_wav(
+    s: *mut OxiSpeaker,
+    text: *const c_char,
+    options_json: *const c_char,
+    path: *const c_char,
+    cb: OxiAudioFn,
+    user: *mut c_void,
+) -> c_int {
+    guard(-1, || {
+        let path = unsafe { str_arg(path, "path") }?;
+        let speech = speak_common(s, text, options_json, cb, user)?;
+        speech.audio.write_wav(path)?;
+        Ok(speech_code(speech.finish))
     })
 }

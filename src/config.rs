@@ -389,6 +389,53 @@ pub struct QwenRope {
     /// interleaved.
     #[serde(default)]
     pub mrope_section: Option<Vec<usize>>,
+    /// "llama3" when transformers 5 folds Llama's `rope_scaling` in here.
+    #[serde(default)]
+    pub rope_type: Option<String>,
+    #[serde(flatten)]
+    pub llama3: Option<Llama3Rope>,
+}
+
+/// Llama 3's RoPE frequency scaling (`rope_type` "llama3"): wavelengths beyond
+/// `original_max_position_embeddings / low_freq_factor` are stretched by `factor`, those below
+/// `.. / high_freq_factor` kept, and the band between interpolated.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct Llama3Rope {
+    pub factor: f64,
+    pub low_freq_factor: f64,
+    pub high_freq_factor: f64,
+    pub original_max_position_embeddings: f64,
+}
+
+impl Llama3Rope {
+    /// Applies the scaling to plain RoPE inverse frequencies (transformers'
+    /// `_compute_llama3_parameters`).
+    pub fn scale(&self, inv_freq: &mut [f32]) {
+        let low_wavelen = self.original_max_position_embeddings / self.low_freq_factor;
+        let high_wavelen = self.original_max_position_embeddings / self.high_freq_factor;
+        for f in inv_freq.iter_mut() {
+            let freq = *f as f64;
+            let wavelen = 2.0 * std::f64::consts::PI / freq;
+            *f = if wavelen < high_wavelen {
+                freq
+            } else if wavelen > low_wavelen {
+                freq / self.factor
+            } else {
+                let smooth = (self.original_max_position_embeddings / wavelen - self.low_freq_factor)
+                    / (self.high_freq_factor - self.low_freq_factor);
+                (1.0 - smooth) * freq / self.factor + smooth * freq
+            } as f32;
+        }
+    }
+}
+
+/// `rope_scaling` as transformers 4 configs store it (Llama 3.1 / 3.2).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RopeScaling {
+    #[serde(default, alias = "type")]
+    pub rope_type: Option<String>,
+    #[serde(flatten)]
+    pub llama3: Option<Llama3Rope>,
 }
 
 /// Qwen3.5 / Qwen3.8 dense hybrid text config (Gated DeltaNet + gated full attention), or a
@@ -453,6 +500,13 @@ pub struct QwenConfig {
     /// rather than `h / (n_v / n_k)`.
     #[serde(skip)]
     pub v_heads_tiled: bool,
+    /// Llama 3 (`model_type` "llama") runs on the same code: full attention without query / key
+    /// norms or output gate, plain RMSNorm, RoPE with the llama3 frequency scaling.
+    #[serde(default)]
+    pub rope_scaling: Option<RopeScaling>,
+    /// Attention has per-head RMSNorms on the queries and keys (all but Llama).
+    #[serde(skip, default = "d_true")]
+    pub qk_norm: bool,
 }
 
 impl QwenConfig {
@@ -463,9 +517,21 @@ impl QwenConfig {
         } else {
             serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?
         };
-        let dense = raw.get("model_type").and_then(|v| v.as_str()) == Some("qwen3");
+        let mt = raw.get("model_type").and_then(|v| v.as_str());
+        let llama = mt == Some("llama");
+        let dense = mt == Some("qwen3") || llama;
         let text = raw.get("text_config").cloned().unwrap_or(raw);
+        let has_head_dim = text.get("head_dim").is_some_and(|v| v.is_u64());
         let mut cfg: QwenConfig = serde_json::from_value(text).context("parse qwen text config")?;
+        if llama {
+            cfg.qk_norm = false;
+            if !has_head_dim {
+                cfg.head_dim = cfg.hidden_size / cfg.num_attention_heads.max(1);
+            }
+            if cfg.rope_theta.is_none() && cfg.rope_parameters.is_none() {
+                cfg.rope_theta = Some(10_000.0);
+            }
+        }
         if dense {
             cfg.layer_types = Some(vec!["full_attention".to_string(); cfg.num_hidden_layers]);
             cfg.attn_output_gate = false;
@@ -497,6 +563,15 @@ impl QwenConfig {
             .map(|r| r.rope_theta)
             .or(self.rope_theta)
             .unwrap_or(10_000_000.0)
+    }
+    /// Llama 3 frequency scaling, from `rope_scaling` or `rope_parameters`.
+    pub fn llama3_rope(&self) -> Option<Llama3Rope> {
+        let is_llama3 = |t: &Option<String>| t.as_deref() == Some("llama3");
+        match (&self.rope_scaling, &self.rope_parameters) {
+            (Some(s), _) if is_llama3(&s.rope_type) => s.llama3,
+            (_, Some(p)) if is_llama3(&p.rope_type) => p.llama3,
+            _ => None,
+        }
     }
     /// The M-RoPE sections (time, height, width frequency counts), if the config has them.
     pub fn mrope_section(&self) -> Option<&[usize]> {

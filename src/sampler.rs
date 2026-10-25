@@ -1,10 +1,18 @@
-//! Token sampling: greedy, or temperature + top-k + top-p.
+//! Token sampling: greedy, or temperature + top-k + top-p, optionally with a repetition penalty.
+
+use std::borrow::Cow;
 
 pub struct Sampler {
     pub temperature: f32,
     pub top_k: usize,
     pub top_p: f32,
+    /// Repetition penalty as transformers and vLLM apply it (1 = off): before anything else,
+    /// the logit of every token seen so far (passed to [`Sampler::observe`], or sampled by
+    /// [`Sampler::sample`]) is divided by it when positive and multiplied by it when negative.
+    pub repetition_penalty: f32,
     rng: u64,
+    /// Bit set of the tokens seen, for the repetition penalty.
+    seen: Vec<u64>,
 }
 
 impl Sampler {
@@ -13,8 +21,47 @@ impl Sampler {
             temperature,
             top_k,
             top_p,
+            repetition_penalty: 1.0,
             rng: seed.max(1),
+            seen: Vec::new(),
         }
+    }
+
+    /// Sets the repetition penalty (see [`Sampler::repetition_penalty`]).
+    pub fn with_repetition_penalty(mut self, penalty: f32) -> Self {
+        self.repetition_penalty = penalty;
+        self
+    }
+
+    /// Records tokens for the repetition penalty (e.g. the prompt, as transformers counts it).
+    pub fn observe(&mut self, tokens: &[u32]) {
+        for &t in tokens {
+            let (w, b) = (t as usize / 64, t % 64);
+            if w >= self.seen.len() {
+                self.seen.resize(w + 1, 0);
+            }
+            self.seen[w] |= 1 << b;
+        }
+    }
+
+    /// Forgets the tokens seen so far.
+    pub fn clear_history(&mut self) {
+        self.seen.clear();
+    }
+
+    /// Whether `token` was seen (repetition penalty).
+    pub fn seen(&self, token: u32) -> bool {
+        self.seen.get(token as usize / 64).is_some_and(|w| (w >> (token % 64)) & 1 == 1)
+    }
+
+    /// `logits` with the repetition penalty applied (borrowed when it is off).
+    fn penalized<'a>(&self, logits: &'a [f32]) -> Cow<'a, [f32]> {
+        if self.repetition_penalty == 1.0 || self.seen.iter().all(|&w| w == 0) {
+            return Cow::Borrowed(logits);
+        }
+        let mut l = logits.to_vec();
+        apply_repetition_penalty(&mut l, &self.seen, self.repetition_penalty);
+        Cow::Owned(l)
     }
 
     fn next_f32(&mut self) -> f32 {
@@ -86,6 +133,7 @@ impl Sampler {
     /// `(token, probability)` pairs summing to 1 by decreasing probability; one token with
     /// probability 1 when greedy.
     pub fn distribution(&self, logits: &[f32]) -> Vec<(u32, f32)> {
+        let logits = &*self.penalized(logits);
         if self.greedy() {
             return vec![(argmax(logits), 1.0)];
         }
@@ -106,11 +154,22 @@ impl Sampler {
         dist.last().map_or(0, |d| d.0)
     }
 
+    /// Draws a token from `logits` (all tokens of the vocabulary). With a repetition penalty,
+    /// the token is recorded as seen.
     pub fn sample(&mut self, logits: &[f32]) -> u32 {
-        if self.greedy() {
-            return argmax(logits);
+        let id = self.sample_inner(logits);
+        if self.repetition_penalty != 1.0 {
+            self.observe(&[id]);
         }
-        let (idx, probs, cut, total) = self.candidates(logits);
+        id
+    }
+
+    fn sample_inner(&mut self, logits: &[f32]) -> u32 {
+        let logits = self.penalized(logits);
+        if self.greedy() {
+            return argmax(&logits);
+        }
+        let (idx, probs, cut, total) = self.candidates(&logits);
         let mut r = self.next_f32() * total;
         for i in 0..cut {
             r -= probs[i];
@@ -119,6 +178,22 @@ impl Sampler {
             }
         }
         idx[cut - 1]
+    }
+}
+
+/// Applies a repetition penalty to `logits` (indexed by token id) for the tokens set in the bit
+/// set `seen` (bit `t % 64` of word `t / 64`): positive logits are divided by `penalty`,
+/// negative ones multiplied (transformers' `RepetitionPenaltyLogitsProcessor`).
+pub fn apply_repetition_penalty(logits: &mut [f32], seen: &[u64], penalty: f32) {
+    for (w, &bits) in seen.iter().enumerate() {
+        let mut b = bits;
+        while b != 0 {
+            let t = w * 64 + b.trailing_zeros() as usize;
+            b &= b - 1;
+            if let Some(l) = logits.get_mut(t) {
+                *l = if *l < 0.0 { *l * penalty } else { *l / penalty };
+            }
+        }
     }
 }
 
@@ -132,4 +207,25 @@ pub fn argmax(x: &[f32]) -> u32 {
         }
     }
     best as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repetition_penalty() {
+        let mut s = Sampler::new(0.0, 0, 1.0, 1).with_repetition_penalty(2.0);
+        // Token 1 wins until it has been seen; then 3.0 / 2 < 2.0.
+        let logits = [0.5, 3.0, 2.0, -1.0];
+        assert_eq!(s.sample(&logits), 1);
+        assert!(s.seen(1) && !s.seen(2));
+        assert_eq!(s.sample(&logits), 2);
+        let mut l = logits.to_vec();
+        s.observe(&[3]);
+        apply_repetition_penalty(&mut l, &s.seen, 2.0);
+        assert_eq!(l, vec![0.5, 1.5, 1.0, -2.0]);
+        s.clear_history();
+        assert_eq!(s.sample(&logits), 1);
+    }
 }

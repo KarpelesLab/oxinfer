@@ -1,7 +1,8 @@
 //! Qwen3.5 / Qwen3.8 dense hybrid text model: Gated DeltaNet (linear attention with a causal
 //! short conv and a delta-rule recurrent state) interleaved with gated full attention, SiLU MLPs
-//! and zero-centered RMSNorm; plain Qwen3 (full attention only) runs on the same code, and so does
-//! Qwen3.5 MoE (top-k routed SiLU experts plus a sigmoid-gated shared expert in place of the MLP).
+//! and zero-centered RMSNorm; plain Qwen3 (full attention only) runs on the same code, as do
+//! Llama 3 (full attention without query / key norms, llama3 RoPE scaling) and Qwen3.5 MoE (top-k
+//! routed SiLU experts plus a sigmoid-gated shared expert in place of the MLP).
 //! The vision encoder is in `qwen_vision.rs`; its tokens are placed with M-RoPE (interleaved
 //! time / height / width rotary positions, see `QwenSession::add_vision_span`). The MTP head for
 //! speculative decoding is in `qwen_mtp.rs`.
@@ -33,8 +34,9 @@ pub(crate) struct Attn<'a> {
     k: Lin<'a>,
     v: Lin<'a>,
     o: Lin<'a>,
-    q_norm: Vec<f32>, // 1 + w (or w, see `zero_centered_norm`)
-    k_norm: Vec<f32>,
+    /// 1 + w (or w, see `zero_centered_norm`); None without query / key norms (Llama).
+    q_norm: Option<Vec<f32>>,
+    k_norm: Option<Vec<f32>>,
 }
 
 // One per layer, built once: the size difference is irrelevant.
@@ -489,8 +491,8 @@ impl<'a> Loader<'a, '_> {
             k: self.lin(&format!("{ap}k_proj.weight"), nkv * hd, h)?,
             v: self.lin(&format!("{ap}v_proj.weight"), nkv * hd, h)?,
             o: self.lin(&format!("{ap}o_proj.weight"), h, nh * hd)?,
-            q_norm: self.norm(&format!("{ap}q_norm.weight"), hd)?,
-            k_norm: self.norm(&format!("{ap}k_norm.weight"), hd)?,
+            q_norm: cfg.qk_norm.then(|| self.norm(&format!("{ap}q_norm.weight"), hd)).transpose()?,
+            k_norm: cfg.qk_norm.then(|| self.norm(&format!("{ap}k_norm.weight"), hd)).transpose()?,
         })
     }
 
@@ -619,9 +621,12 @@ impl<'a> QwenModel<'a> {
         }
         let rot = cfg.rotary_dim();
         let theta = cfg.rope_theta();
-        let inv_freq: Vec<f32> = (0..rot / 2)
+        let mut inv_freq: Vec<f32> = (0..rot / 2)
             .map(|i| (1.0 / theta.powf((2 * i) as f64 / rot as f64)) as f32)
             .collect();
+        if let Some(l3) = cfg.llama3_rope() {
+            l3.scale(&mut inv_freq);
+        }
         // Interleaved M-RoPE (transformers' Qwen3.5 rotary): frequency i rotates with the height
         // for i % 3 == 1 and i < 3 * sections[1], with the width for i % 3 == 2 and
         // i < 3 * sections[2], with the time otherwise.
@@ -990,7 +995,10 @@ impl<'a> QwenModel<'a> {
                 } else {
                     &qg[ti * qw + hh * hd..ti * qw + (hh + 1) * hd]
                 };
-                rmsnorm_f32w(src, &at.q_norm, eps, qo);
+                match &at.q_norm {
+                    Some(w) => rmsnorm_f32w(src, w, eps, qo),
+                    None => qo.copy_from_slice(src),
+                }
                 apply_rope(
                     &mut qo[..2 * half],
                     &cos[ti * half..(ti + 1) * half],
@@ -1015,7 +1023,10 @@ impl<'a> QwenModel<'a> {
         let mut kn = vec![0f32; t * nkv * hd];
         for_chunks(&mut kn, hd, par, |i, ko| {
             let ti = i / nkv;
-            rmsnorm_f32w(&k[i * hd..(i + 1) * hd], &at.k_norm, eps, ko);
+            match &at.k_norm {
+                Some(w) => rmsnorm_f32w(&k[i * hd..(i + 1) * hd], w, eps, ko),
+                None => ko.copy_from_slice(&k[i * hd..(i + 1) * hd]),
+            }
             apply_rope(
                 &mut ko[..2 * half],
                 &cos[ti * half..(ti + 1) * half],

@@ -498,16 +498,20 @@ pub struct SamplingParams {
     pub top_k: usize,
     pub top_p: f32,
     pub seed: u64,
+    /// Repetition penalty (1 = off; see [`Sampler::repetition_penalty`]) over the tokens the
+    /// sampler has generated since it was set. Not used by MTP speculative decoding.
+    pub repetition_penalty: f32,
 }
 
 impl Default for SamplingParams {
-    /// The CLI's defaults: greedy, top-k 64, top-p 0.95, seed 42.
+    /// The CLI's defaults: greedy, top-k 64, top-p 0.95, seed 42, no repetition penalty.
     fn default() -> Self {
         Self {
             temperature: 0.0,
             top_k: 64,
             top_p: 0.95,
             seed: 42,
+            repetition_penalty: 1.0,
         }
     }
 }
@@ -617,7 +621,7 @@ pub enum Family {
     Gemma4,
     Gemma3,
     Qwen,
-    /// Llama 3 (Core ML models only).
+    /// Llama 3 (safetensors folders, and Core ML models).
     Llama,
 }
 
@@ -852,8 +856,16 @@ impl Engine {
             "gemma4" | "gemma4_text" => Family::Gemma4,
             "gemma3" | "gemma3_text" => Family::Gemma3,
             "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" => Family::Qwen,
+            "llama" => Family::Llama,
             other => bail!("unsupported model_type {other}"),
         };
+        if family == Family::Llama && crate::gguf::is_gguf(&dir) {
+            // llama.cpp permutes Llama's query / key rows for its interleaved RoPE.
+            bail!(
+                "{}: Llama GGUF files are not supported (use the safetensors checkpoint)",
+                dir.display()
+            );
+        }
         let mtp = opts.mtp || side_dir.is_some();
         if mtp && family != Family::Qwen {
             bail!("MTP speculative decoding is for Qwen3.5/3.8 models");
@@ -911,8 +923,8 @@ impl Engine {
                 };
                 (lm, fmt, info.0, info.1, info.2, info.3, info.4)
             }
-            Family::Llama => bail!("Llama checkpoints run as Core ML models only"),
-            Family::Qwen => {
+            // Llama 3 runs on the Qwen3 code path (see `crate::qwen`).
+            Family::Qwen | Family::Llama => {
                 let mut model = QwenModel::load(config::QwenConfig::load(&dir)?, files, opts.quant)?;
                 let c = &model.cfg;
                 let base = BaseCheck {
@@ -921,7 +933,11 @@ impl Engine {
                     vocab_size: c.vocab_size,
                 };
                 decision = load_decision(decision_dir.as_deref(), &tok, &base, false, |ad| model.attach_lora(ad))?;
-                let fmt: &'static (dyn ChatFormat + Sync) = chat::QwenChat::for_model(&dir);
+                let fmt: &'static (dyn ChatFormat + Sync) = if family == Family::Llama {
+                    &chat::Llama3Chat
+                } else {
+                    chat::QwenChat::for_model(&dir)
+                };
                 let side = match (&side_dir, mtp) {
                     (Some(d), true) => Some(arena.keep(ModelFiles::open(d, false)?)),
                     _ => None,
@@ -1587,7 +1603,7 @@ impl PendingTurn {
 }
 
 fn sampler_for(s: &SamplingParams) -> Sampler {
-    Sampler::new(s.temperature, s.top_k, s.top_p, s.seed)
+    Sampler::new(s.temperature, s.top_k, s.top_p, s.seed).with_repetition_penalty(s.repetition_penalty)
 }
 
 /// Whether `dir` is a Core ML (ANEMLL-format) model directory: `meta.yaml` next to `.mlmodelc`

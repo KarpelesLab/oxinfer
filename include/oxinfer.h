@@ -95,6 +95,7 @@ void oxi_engine_free(OxiEngine *engine);
  *   max_tokens   max tokens per reply (default 1024)
  *   temperature  0 = greedy (default)
  *   top_k, top_p, seed
+ *   repetition_penalty  1 = off (default); > 1 penalizes tokens already generated
  * system and think shape the start of a conversation: set them before the first message or
  * call oxi_engine_reset(). Returns 0 or -1. */
 int oxi_engine_set(OxiEngine *engine, const char *key, const char *value);
@@ -301,6 +302,77 @@ char *oxi_janus_understand(OxiJanus *j, const char *question, const char *images
 /* oxi_janus_understand() with one image given as tightly packed RGB8 pixels. */
 char *oxi_janus_understand_rgb(OxiJanus *j, const char *question, const uint8_t *rgb, int width, int height,
                                const char *options_json, oxi_token_fn cb, void *user);
+
+/* ---- Text to speech (Orpheus TTS) --------------------------------------------------------------
+ *
+ * canopylabs/orpheus-3b-0.1-ft (gated; unsloth/orpheus-3b-0.1-ft is an ungated copy) and other
+ * Orpheus checkpoints (Llama 3 with SNAC audio tokens), decoded to 24 kHz mono audio by the SNAC
+ * codec (hubertsiuzdak/snac_24khz). A speaker follows the engine's threading rules: one call at a
+ * time, oxi_speaker_cancel() from any thread. */
+
+typedef struct OxiSpeaker OxiSpeaker;
+
+/* Streamed audio: `n` mono float samples in [-1, 1] at `sample_rate` Hz, the first being sample
+ * `start` of the utterance (chunks follow each other without gaps). Return non-zero to stop. */
+typedef int (*oxi_audio_fn)(void *user, const float *samples, size_t n, uint64_t start, int sample_rate);
+
+/* Loads an Orpheus model (directory or repo id) and the SNAC decoder.
+ * `options`: NULL or "key=value" pairs separated by newlines or ';':
+ *   threads=N                  CPU threads (process-wide)
+ *   device=auto|cpu|metal      where the prompt's matmuls run (process-wide, first model wins)
+ *   quant=bf16|q8|q4           language-model weights (default bf16; q4 is fastest)
+ *   mmap=0|1                   map the weights instead of reading them into memory
+ *   snac=DIR|org/name          the SNAC decoder (default hubertsiuzdak/snac_24khz)
+ *   snac_f32=0|1               SNAC weights in f32 (default 1, exact) or bf16
+ *   cache_dir=PATH             where repo ids are downloaded
+ * Returns NULL on error. */
+OxiSpeaker *oxi_speaker_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
+
+/* Frees a speaker (NULL is ignored); no other call on it may be running. */
+void oxi_speaker_free(OxiSpeaker *s);
+
+/* Stops the running utterance after the current token (any thread); the call returns the audio
+ * generated so far, with code 2. */
+void oxi_speaker_cancel(const OxiSpeaker *s);
+
+/* Model information as JSON: path, snac_path, layers, hidden_size, quant, device, threads,
+ * sample_rate, load_secs, voices. */
+char *oxi_speaker_info_json(OxiSpeaker *s);
+
+/* Speak options (`options_json`, NULL or "" for the defaults), a JSON object with any of:
+ *   "voice": "tara"              tara, leah, jess, leo, dan, mia, zac, zoe (English model); null
+ *                                or "" for no voice prefix; any name is passed through
+ *   "temperature": 0.6           0 = greedy
+ *   "top_p": 0.8, "top_k": 0     (0 = no top-k cut)
+ *   "repetition_penalty": 1.1    over the prompt and the generated tokens; >= 1.1 is needed for
+ *                                stable speech, higher speaks faster
+ *   "max_tokens": 1200           7 tokens per 85 ms frame: 1200 is about 14 s of audio
+ *   "seed": 42
+ *   "constrained": true          sample only tokens valid at each position (and skip most of the
+ *                                output layer); false samples the whole vocabulary
+ *   "noise": true                SNAC's noise blocks (false: deterministic waveform)
+ *   "context_left": 1, "context_right": 2, "chunk_frames": 1   streaming windows, in frames
+ * Emotion tags such as <laugh>, <sigh>, <chuckle>, <cough>, <sniffle>, <groan>, <yawn>, <gasp>
+ * go in the text. */
+
+/* Speaks `text`. With `cb`, audio is streamed while it is generated (decoded in overlapping
+ * windows); otherwise it is decoded once at the end. The whole utterance goes to
+ * `*samples_out` (free with oxi_audio_free), `*n_out` and `*sample_rate_out` (24000); any of the
+ * three may be NULL. Returns 0 (end of speech), 1 (max_tokens reached), 2 (cancelled) or -1. */
+int oxi_speak(OxiSpeaker *s, const char *text, const char *options_json, oxi_audio_fn cb, void *user, float **samples_out,
+              size_t *n_out, int *sample_rate_out);
+
+/* Frees samples returned by oxi_speak (`n` as returned; NULL is ignored). */
+void oxi_audio_free(float *samples, size_t n);
+
+/* Speaks `text` into a 16-bit PCM mono WAV file at `path`. `cb` may be NULL. Returns as
+ * oxi_speak. */
+int oxi_speak_wav(OxiSpeaker *s, const char *text, const char *options_json, const char *path, oxi_audio_fn cb, void *user);
+
+/* Statistics of the last utterance as JSON (null before the first): prompt_tokens, tokens,
+ * frames, dropped_tokens, audio_secs, prefill_secs, generate_secs, snac_secs, total_secs,
+ * first_chunk_secs (streaming), tok_s, rtf (total time / audio duration). */
+char *oxi_speaker_stats_json(OxiSpeaker *s);
 
 #ifdef __cplusplus
 }

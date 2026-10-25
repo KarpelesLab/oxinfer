@@ -46,6 +46,10 @@ required-features = ["hf", "media"]
 name = "transcribe"
 required-features = ["hf", "media"]
 
+[[example]]
+name = "speak"
+required-features = ["hf"]
+
 [features]
 default = ["media", "hf", "gpu"]
 # oxideav-core's types in the public API (the `av` module): in-memory images, audio and video as
