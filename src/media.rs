@@ -43,6 +43,18 @@ impl Media {
         })
     }
 
+    /// [`Media::load_image`] for an encoded image in memory (PNG, JPEG, WebP, GIF, BMP).
+    pub fn decode_image(&self, bytes: &[u8]) -> Result<RgbImage> {
+        let file = oxideav_image::decode_bytes(&self.ctx, bytes).map_err(|e| anyhow!("decode image: {e}"))?;
+        let img = file.primary();
+        let data = img.to_rgb8().map_err(|e| anyhow!("convert image to RGB: {e}"))?;
+        Ok(RgbImage {
+            width: img.width() as usize,
+            height: img.height() as usize,
+            data,
+        })
+    }
+
     /// Decodes any supported audio container/codec and returns mono samples at `target_rate`.
     pub fn load_audio(&self, path: &Path, target_rate: usize) -> Result<Vec<f32>> {
         let file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;

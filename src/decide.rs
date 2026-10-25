@@ -29,9 +29,18 @@
 //! labels (bias 0), as the reference server does; with the slot head, the trained labels keep the
 //! head's logits (the `lm_head` LoRA of `adapter_vllm/` re-expresses exactly those rows).
 //!
+//! Images (Qwen3.5-family bases with their vision tower): the state is a list mixing text and
+//! images (`["Photo: ", {"image": "data:image/png;base64,..."}, "\nTask: ..."]`), and each image
+//! goes where it appears, as `<|vision_start|><|image_pad|>...<|vision_end|>` (one pad per merged
+//! vision token, M-RoPE positions as in chat). There is no chat template around the prompt: the
+//! reference server renders its parts with a raw template (text as is, an image as its
+//! placeholder) and reads the same verbalizer logits. The readout, adapter and temperatures are
+//! those of the text decisions; the heads never saw an image in training (zero-shot).
+//!
 //! The JSON wire format ([`DecisionRequest::from_json`], [`Decision::to_json`]) is the one of the
 //! reference server's `POST /v1/decide`.
 
+use crate::engine::Attachments;
 use crate::lora::LoraAdapter;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -94,17 +103,83 @@ impl DecisionKind {
     }
 }
 
+/// An image of a decision's state.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ImageSource {
+    /// A local file.
+    Path(PathBuf),
+    /// An encoded image (PNG, JPEG, WebP, GIF, BMP).
+    Bytes(Vec<u8>),
+    /// An `http://` / `https://` URL, fetched when the decision runs (`hf` feature).
+    Url(String),
+}
+
+impl ImageSource {
+    /// An image reference as the reference server takes it: a `data:` URL (base64) or an
+    /// `http(s)://` URL; also (oxinfer only) a `file://` URL or a local path.
+    pub fn parse(s: &str) -> Result<Self> {
+        if let Some(d) = s.strip_prefix("data:") {
+            let (_, b64) = d
+                .split_once(";base64,")
+                .context("image data URL: only base64 data URLs are supported")?;
+            return Ok(Self::Bytes(crate::b64::decode(b64).context("image data URL: bad base64")?));
+        }
+        if s.starts_with("http://") || s.starts_with("https://") {
+            return Ok(Self::Url(s.to_string()));
+        }
+        if s.is_empty() {
+            bail!("empty image reference");
+        }
+        Ok(Self::Path(PathBuf::from(s.strip_prefix("file://").unwrap_or(s))))
+    }
+
+    /// The encoded image.
+    pub fn bytes(&self) -> Result<Vec<u8>> {
+        match self {
+            Self::Path(p) => crate::fsx::read(p).with_context(|| format!("read image {}", p.display())),
+            Self::Bytes(b) => Ok(b.clone()),
+            #[cfg(feature = "hf")]
+            Self::Url(u) => crate::hf::http_get(u),
+            #[cfg(not(feature = "hf"))]
+            Self::Url(u) => bail!("{u}: built without the `hf` feature, so image URLs cannot be fetched"),
+        }
+    }
+
+    /// The state part for this image (`{"image": ...}`; bytes as a base64 data URL).
+    pub fn to_part(&self) -> Value {
+        let s = match self {
+            Self::Path(p) => p.display().to_string(),
+            Self::Bytes(b) => format!("data:application/octet-stream;base64,{}", crate::b64::encode(b)),
+            Self::Url(u) => u.clone(),
+        };
+        json!({ "image": s })
+    }
+}
+
+/// A piece of a decision's state.
+#[derive(Clone, Debug, PartialEq)]
+pub enum StatePart {
+    Text(String),
+    Image(ImageSource),
+}
+
 /// A typed question about `state`.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub struct DecisionRequest {
     pub kind: DecisionKind,
     /// A string is used as is; other JSON values are serialized as Python's `json.dumps` writes
-    /// them (an array mixes text parts and JSON values, joined without separators).
+    /// them. An array mixes text parts, images and JSON values, joined without separators: a
+    /// string or `{"type": "text", "text"}` is text, `{"image": REF}` or `{"type": "image_url",
+    /// "image_url": {"url": REF}}` an image (see [`ImageSource::parse`]), anything else JSON.
     pub state: Value,
     pub question: String,
     /// `choice`: 2-256 options (one line each). `noul` / `score`: empty, or their verbalizers.
     pub options: Vec<String>,
+    /// Image files placed at the start of the state, before its text, and the image token
+    /// budget (`max_soft_tokens`, for the state's own images too; 0: the processor's default).
+    /// Videos and audio are refused: the protocol takes images only.
+    pub attachments: Attachments,
 }
 
 impl DecisionRequest {
@@ -114,7 +189,13 @@ impl DecisionRequest {
             state: state.into(),
             question: question.into(),
             options,
+            attachments: Attachments::default(),
         }
+    }
+    /// With image files placed before the state text (see [`DecisionRequest::attachments`]).
+    pub fn with_images<P: Into<PathBuf>>(mut self, images: impl IntoIterator<Item = P>) -> Self {
+        self.attachments.images.extend(images.into_iter().map(Into::into));
+        self
     }
     pub fn noul(state: impl Into<Value>, question: impl Into<String>) -> Self {
         Self::new(DecisionKind::Noul, state, question, Vec::new())
@@ -126,7 +207,8 @@ impl DecisionRequest {
         Self::new(DecisionKind::Choice, state, question, options.into_iter().map(Into::into).collect())
     }
 
-    /// A `/v1/decide` request body: `{"kind", "state", "question", "options"}`.
+    /// A `/v1/decide` request body: `{"kind", "state", "question", "options"}`, and (oxinfer
+    /// only) `"attachments"` as [`Attachments::from_json`] takes them.
     pub fn from_json(v: &Value) -> Result<Self> {
         let o = v.as_object().context("decision request: expected a JSON object")?;
         let kind = o
@@ -146,42 +228,87 @@ impl DecisionRequest {
                 .collect::<Result<_>>()?,
             Some(_) => bail!("decision request: \"options\" must be a list of strings"),
         };
-        Ok(Self::new(
+        let mut r = Self::new(
             kind,
             o.get("state").cloned().unwrap_or(Value::String(String::new())),
             question,
             options,
-        ))
-    }
-
-    /// The state as it appears in the prompt.
-    pub fn state_text(&self) -> Result<String> {
-        state_text(&self.state)
-    }
-}
-
-fn state_text(v: &Value) -> Result<String> {
-    use crate::tools::qwen::py_json;
-    Ok(match v {
-        Value::String(s) => s.clone(),
-        Value::Array(parts) => {
-            let mut s = String::new();
-            for p in parts {
-                match p {
-                    Value::String(t) => s.push_str(t),
-                    Value::Object(o) if o.get("type").and_then(Value::as_str) == Some("text") => {
-                        s.push_str(o.get("text").and_then(Value::as_str).unwrap_or_default())
-                    }
-                    Value::Object(o) if o.contains_key("image") || o.get("type").and_then(Value::as_str) == Some("image_url") => {
-                        bail!("image parts in the state are not supported")
-                    }
-                    other => s.push_str(&py_json(other)),
-                }
-            }
-            s
+        );
+        if let Some(a) = o.get("attachments").filter(|a| !a.is_null()) {
+            r.attachments = Attachments::from_json(a).context("decision request")?;
         }
-        other => py_json(other),
-    })
+        Ok(r)
+    }
+
+    /// The state as it appears in the prompt; an error when it has images (see
+    /// [`DecisionRequest::state_parts`]).
+    pub fn state_text(&self) -> Result<String> {
+        let mut s = String::new();
+        for p in self.state_parts()? {
+            match p {
+                StatePart::Text(t) => s.push_str(&t),
+                StatePart::Image(_) => bail!("the state has images (see state_parts)"),
+            }
+        }
+        Ok(s)
+    }
+
+    /// The state as text and images in prompt order: the attachments' images first, then the
+    /// state (adjacent text merged).
+    pub fn state_parts(&self) -> Result<Vec<StatePart>> {
+        use crate::tools::qwen::py_json;
+        let mut out: Vec<StatePart> = self
+            .attachments
+            .images
+            .iter()
+            .map(|p| StatePart::Image(ImageSource::Path(p.clone())))
+            .collect();
+        let text = |out: &mut Vec<StatePart>, t: &str| match out.last_mut() {
+            Some(StatePart::Text(s)) => s.push_str(t),
+            _ => out.push(StatePart::Text(t.to_string())),
+        };
+        let parts = match &self.state {
+            Value::Array(parts) => parts,
+            Value::String(s) => {
+                text(&mut out, s);
+                return Ok(out);
+            }
+            other => {
+                text(&mut out, &py_json(other));
+                return Ok(out);
+            }
+        };
+        for p in parts {
+            let Value::Object(o) = p else {
+                match p {
+                    Value::String(t) => text(&mut out, t),
+                    other => text(&mut out, &py_json(other)),
+                }
+                continue;
+            };
+            let image = match (o.get("image"), o.get("type").and_then(Value::as_str)) {
+                (Some(Value::String(s)), _) => Some(s.as_str()),
+                (Some(_), _) => bail!("decision state: \"image\" must be a string (a data URL, URL or path)"),
+                (None, Some("image_url")) => Some(
+                    match o.get("image_url") {
+                        Some(Value::String(s)) => Some(s.as_str()),
+                        Some(u) => u.get("url").and_then(Value::as_str),
+                        None => None,
+                    }
+                    .context("decision state: image_url part without a url")?,
+                ),
+                _ => None,
+            };
+            match image {
+                Some(s) => out.push(StatePart::Image(ImageSource::parse(s)?)),
+                None if o.get("type").and_then(Value::as_str) == Some("text") => {
+                    text(&mut out, o.get("text").and_then(Value::as_str).unwrap_or_default())
+                }
+                None => text(&mut out, &py_json(p)),
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// How the options of a decision were read.
@@ -215,7 +342,13 @@ pub enum Readout {
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct DecisionStats {
+    /// Prompt tokens, image tokens included.
     pub prompt_tokens: usize,
+    /// Images read, and their vision tokens.
+    pub images: usize,
+    pub image_tokens: usize,
+    /// Fetching, decoding and encoding the images (vision tower).
+    pub vision_secs: f64,
     /// The forward pass (prefill and readout).
     pub prefill_secs: f64,
     /// Everything, tokenization included.
@@ -575,7 +708,7 @@ impl DecisionAssets {
             .and_then(|j| j.get("model_name"))
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_else(|| dir.file_name().map(|s| s.to_string_lossy().replace("--", "/")).unwrap_or_default());
+            .unwrap_or_else(|| bundle_name(dir));
         let prefix = match dhead.as_ref().and_then(|d| d.get("prefix_token")).and_then(Value::as_str) {
             Some(p) => p.to_string(),
             None if gemma => "<bos>".into(),
@@ -663,17 +796,33 @@ impl DecisionAssets {
                 (v.clone(), v, Adaptation::Native)
             }
         };
-        let state = req.state_text()?;
-        let prompt = format!(
-            "{}[kind] {}\n[state] {state}\n[question] {}\n[options]\n{}\n[decision]:",
-            self.prefix,
-            k.as_str(),
+        let a = &req.attachments;
+        if !a.videos.is_empty() || !a.audios.is_empty() {
+            bail!("decisions take images only (the /v1/decide protocol has no video or audio parts)");
+        }
+        // Text around the images: pieces[i] comes before image i, the last one after them all.
+        let mut pieces = vec![format!("{}[kind] {}\n[state] ", self.prefix, k.as_str())];
+        let mut images = Vec::new();
+        for p in req.state_parts()? {
+            match p {
+                StatePart::Text(t) => pieces.last_mut().unwrap().push_str(&t),
+                StatePart::Image(src) => {
+                    images.push(src);
+                    pieces.push(String::new());
+                }
+            }
+        }
+        pieces.last_mut().unwrap().push_str(&format!(
+            "\n[question] {}\n[options]\n{}\n[decision]:",
             req.question,
             lines.join("\n")
-        );
+        ));
+        let prompt = pieces.join(IMAGE_PLACEHOLDER);
         Ok(Plan {
             kind: k,
             prompt,
+            pieces,
+            images,
             options,
             adaptation,
         })
@@ -762,13 +911,35 @@ impl DecisionAssets {
     }
 }
 
+/// An image in [`Plan::prompt`] before its expansion to one pad per vision token (the reference
+/// server's raw template, Qwen3.5 family).
+pub const IMAGE_PLACEHOLDER: &str = "<|vision_start|><|image_pad|><|vision_end|>";
+
 /// A validated request: the prompt and the options it reads.
 #[derive(Clone, Debug)]
 pub struct Plan {
     pub kind: DecisionKind,
+    /// The prompt, with [`IMAGE_PLACEHOLDER`] for each image.
     pub prompt: String,
+    /// The prompt's text around the images (`images.len() + 1` pieces).
+    pub pieces: Vec<String>,
+    pub images: Vec<ImageSource>,
     pub options: Vec<String>,
     pub adaptation: Adaptation,
+}
+
+/// A bundle's name from its directory: `org/name` for a cache directory (`org--name`), also for
+/// a subfolder of one (`autotrust--JEV-9B/vl`: `autotrust/JEV-9B`).
+fn bundle_name(dir: &Path) -> String {
+    let name = |p: &Path| p.file_name().map(|s| s.to_string_lossy().to_string());
+    let own = name(dir).unwrap_or_default();
+    if !own.contains("--")
+        && let Some(parent) = dir.parent().and_then(name)
+        && parent.contains("--")
+    {
+        return parent.replace("--", "/");
+    }
+    own.replace("--", "/")
 }
 
 /// Choice labels beyond the trained slots, as the reference server picks them: A-Z then AA-ZZ,
@@ -820,6 +991,39 @@ mod tests {
         let r = DecisionRequest::from_json(&v).unwrap();
         assert!(r.options.is_empty() && r.state_text().unwrap() == "s");
         assert!(DecisionRequest::from_json(&serde_json::json!({"kind": "maybe", "question": "q"})).is_err());
+    }
+
+    #[test]
+    fn state_images() {
+        let v = json!({"kind": "noul", "question": "q", "state": [
+            "Photo: ", {"image": "data:image/png;base64,Zm9vYmFy"}, "\nTask", {"a": 1},
+            {"type": "image_url", "image_url": {"url": "https://example.com/x.jpg"}}, {"type": "text", "text": "!"},
+            {"image": "file:///tmp/x.png"}]});
+        let r = DecisionRequest::from_json(&v).unwrap().with_images(["/tmp/first.png"]);
+        let parts = r.state_parts().unwrap();
+        assert_eq!(
+            parts,
+            [
+                StatePart::Image(ImageSource::Path("/tmp/first.png".into())),
+                StatePart::Text("Photo: ".into()),
+                StatePart::Image(ImageSource::Bytes(b"foobar".to_vec())),
+                StatePart::Text("\nTask{\"a\": 1}".into()),
+                StatePart::Image(ImageSource::Url("https://example.com/x.jpg".into())),
+                StatePart::Text("!".into()),
+                StatePart::Image(ImageSource::Path("/tmp/x.png".into())),
+            ]
+        );
+        assert!(r.state_text().is_err());
+        assert_eq!(
+            ImageSource::parse(ImageSource::Bytes(b"fo".to_vec()).to_part()["image"].as_str().unwrap()).unwrap(),
+            ImageSource::Bytes(b"fo".to_vec())
+        );
+        assert!(ImageSource::parse("data:image/png,raw").is_err());
+        let v = json!({"kind": "noul", "question": "q", "state": "s", "attachments": {"images": ["a.png"], "max_soft_tokens": 64}});
+        let r = DecisionRequest::from_json(&v).unwrap();
+        assert_eq!((r.attachments.images.len(), r.attachments.max_soft_tokens), (1, 64));
+        assert_eq!(bundle_name(Path::new("/c/hub/autotrust--JEV-9B/vl")), "autotrust/JEV-9B");
+        assert_eq!(bundle_name(Path::new("/c/hub/autotrust--JEV-27B-VL")), "autotrust/JEV-27B-VL");
     }
 
     #[test]

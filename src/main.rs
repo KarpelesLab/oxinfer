@@ -210,10 +210,13 @@ fn usage() -> ! {
          \x20 --state TEXT         what the question is about (a JSON object is used as such)\n\
          \x20 --question TEXT      the question\n\
          \x20 --option TEXT        a choice option (repeatable, 2-256)\n\
+         \x20 --image FILE         an image placed before the state text (repeatable; Qwen3.5-family\n\
+         \x20                      bases with their vision tower; --max-soft-tokens caps its tokens)\n\
          \x20 --decide-json FILE   /v1/decide requests (an object, an array or one object per line;\n\
-         \x20                      - for stdin); prints one JSON response per line\n\
+         \x20                      - for stdin; images inline in the state); one JSON response per line\n\
          \x20 --decision-from S    the decision assets (adapter, head, configs) of bundle S, a directory\n\
-         \x20                      or repo id, on top of --model (fetches the small files only)\n\
+         \x20                      or repo id (org/name/subdir for a subfolder, e.g. autotrust/JEV-9B/vl),\n\
+         \x20                      on top of --model (fetches the small files only)\n\
          \n\
          speech to text (Whisper models: openai/whisper-*, distil-whisper/*; detected from config.json):\n\
          \x20 --transcribe FILE    audio to transcribe (WAV/MP3/FLAC/AAC/OGG via oxideav; any length)\n\
@@ -694,7 +697,29 @@ fn run_decide(args: &Args) -> Result<()> {
         }
     );
     let (model_name, protocol) = (d.model_name.clone(), d.protocol());
+    if !args.videos.is_empty() || !args.audios.is_empty() {
+        bail!("decisions take images only (--image): the /v1/decide protocol has no video or audio parts");
+    }
+    let report = |dec: &oxinfer::decide::Decision| {
+        let s = &dec.stats;
+        let images = match s.images {
+            0 => String::new(),
+            n => format!(", {n} image(s) = {} tokens, vision {:.3}s", s.image_tokens, s.vision_secs),
+        };
+        eprintln!(
+            "[{} {} | {} prompt tokens{images}, prefill {:.3}s ({:.0} tok/s), total {:.3}s]",
+            dec.kind.as_str(),
+            dec.adaptation.as_str(),
+            s.prompt_tokens,
+            s.prefill_secs,
+            s.prefill_tok_s(),
+            s.total_secs
+        );
+    };
     if let Some(path) = &args.decide_json {
+        if !args.images.is_empty() {
+            bail!("--image goes with --decide; with --decide-json, put the images in each request's state");
+        }
         let text = if path.as_os_str() == "-" {
             let mut s = String::new();
             std::io::stdin().read_to_string(&mut s)?;
@@ -713,14 +738,13 @@ fn run_decide(args: &Args) -> Result<()> {
                 .context("parse the requests (a JSON object, an array, or one object per line)")?,
         };
         for r in &reqs {
-            let dec = e.decide(&DecisionRequest::from_json(r)?)?;
+            let mut req = DecisionRequest::from_json(r)?;
+            if req.attachments.max_soft_tokens == 0 {
+                req.attachments.max_soft_tokens = args.max_soft_tokens;
+            }
+            let dec = e.decide(&req)?;
             println!("{}", dec.to_json(&model_name, &protocol));
-            eprintln!(
-                "[{} tokens, prefill {:.3}s ({:.0} tok/s)]",
-                dec.stats.prompt_tokens,
-                dec.stats.prefill_secs,
-                dec.stats.prefill_tok_s()
-            );
+            report(&dec);
         }
         return Ok(());
     }
@@ -732,7 +756,9 @@ fn run_decide(args: &Args) -> Result<()> {
         _ => serde_json::Value::String(state),
     };
     let question = args.question.clone().context("--decide needs --question")?;
-    let dec = e.decide(&DecisionRequest::new(kind, state, question, args.options.clone()))?;
+    let mut req = DecisionRequest::new(kind, state, question, args.options.clone()).with_images(args.images.iter().cloned());
+    req.attachments.max_soft_tokens = args.max_soft_tokens;
+    let dec = e.decide(&req)?;
     let w = dec.options.iter().map(|o| o.chars().count()).max().unwrap_or(0).min(60);
     for (i, (o, p)) in dec.options.iter().zip(&dec.probabilities).enumerate() {
         let bar = "#".repeat((p * 40.0).round() as usize);
@@ -742,15 +768,7 @@ fn run_decide(args: &Args) -> Result<()> {
     if let Some(s) = dec.expected_score() {
         println!("  expected score {s:.3}");
     }
-    eprintln!(
-        "[{} {} | {} prompt tokens, prefill {:.3}s ({:.0} tok/s), total {:.3}s]",
-        dec.kind.as_str(),
-        dec.adaptation.as_str(),
-        dec.stats.prompt_tokens,
-        dec.stats.prefill_secs,
-        dec.stats.prefill_tok_s(),
-        dec.stats.total_secs
-    );
+    report(&dec);
     Ok(())
 }
 

@@ -249,6 +249,15 @@ fn request(url: &str, auth: bool) -> Result<Request> {
     Ok(r)
 }
 
+/// The body of a plain GET of `url` (no HuggingFace token), for image URLs in decision requests.
+pub fn http_get(url: &str) -> Result<Vec<u8>> {
+    let resp = request(url, false)?.send().map_err(|e| anyhow!("{url}: {e}"))?;
+    if resp.status != 200 {
+        bail!("{url}: HTTP {}", resp.status);
+    }
+    Ok(resp.body)
+}
+
 #[derive(Deserialize)]
 struct Sibling {
     rfilename: String,
@@ -326,7 +335,7 @@ fn list_mirror(repo: &str) -> Result<Option<Listing>> {
                     .split_once(";base64,")
                     .map(|(_, b)| b)
                     .with_context(|| format!("{}: unsupported data URL", f.filename))?;
-                Source::Inline(base64_decode(b64).with_context(|| format!("{}: bad base64", f.filename))?)
+                Source::Inline(crate::b64::decode(b64).with_context(|| format!("{}: bad base64", f.filename))?)
             }
             None => Source::Url(f.url),
         };
@@ -405,36 +414,6 @@ fn listing(repo: &str) -> Result<Listing> {
             }
         },
     }
-}
-
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    let val = |c: u8| -> Option<u32> {
-        Some(match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            _ => return None,
-        } as u32)
-    };
-    let digits: Vec<u8> = s.bytes().filter(|c| !c.is_ascii_whitespace() && *c != b'=').collect();
-    let mut out = Vec::with_capacity(digits.len() * 3 / 4);
-    for chunk in digits.chunks(4) {
-        let mut acc = 0u32;
-        for &c in chunk {
-            acc = acc << 6 | val(c)?;
-        }
-        acc <<= 6 * (4 - chunk.len() as u32);
-        let n = match chunk.len() {
-            4 => 3,
-            3 => 2,
-            2 => 1,
-            _ => return None,
-        };
-        out.extend_from_slice(&acc.to_be_bytes()[1..1 + n]);
-    }
-    Some(out)
 }
 
 /// An ANEMLL Core ML repository: `meta.yaml` plus compiled `.mlmodelc` directories.

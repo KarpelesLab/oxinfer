@@ -53,7 +53,8 @@ optional.
 | google/gemma-4-26B-A4B-it | 26B MoE | 52 GB | not yet (MoE block unimplemented) |
 | Qwen/Qwen3.8-27B (and Qwen3.5/3.6 dense) | 27.8B | 55.6 GB | text, images, video; matches the bf16 reference; see below |
 | Qwen/Qwen3.6-35B-A3B and fine-tunes (PixilabAI/Zawen-v0.1-35B-A3B) | 35B MoE, 3B active | 69 GB | text (the vision code applies to MoE checkpoints too but is untested there: Zawen ships no vision tower); Zawen matches the reference (see below) |
-| autotrust/JEV-9B, JEV-27B (Jev decision models) | 9B / 27.8B + LoRA | 18 / 54 GB + 0.16 / 0.44 GB | typed decisions, on the bundled or any matching base; match transformers + peft (see [Typed decisions](#typed-decisions-jev-models)) |
+| autotrust/JEV-9B, JEV-27B (Jev decision models) | 9B / 27.8B + LoRA | 18 / 54 GB + 0.16 / 0.44 GB | typed decisions, on the bundled or any matching base; match transformers + peft (see [Typed decisions](#typed-decisions-jev-models)); image decisions with JEV-9B's `vl/` on Qwen/Qwen3.5-9B |
+| autotrust/JEV-27B-VL | 27.8B + vision + LoRA | 55.6 GB + 0.45 GB | typed decisions over text and images; matches the reference server's math on transformers + peft (see [Image decisions](#image-decisions)) |
 | Qwen/Qwen3.5-0.8B | 0.8B | 1.7 GB | text, images, video; matches transformers float32 (see [Image, video and audio input](#image-video-and-audio-input)); the small one used for the wasm measurements |
 | mlx-community/gemma-4-e2b-it-4bit, gemma-4-e4b-it-4bit | 5.1B / 8.0B | 3.6 / 5.2 GB (MLX 4-bit) | text, images and audio; see [MLX checkpoints](#mlx-checkpoints) |
 | mlx-community/Qwen3-4B-4bit (Qwen3 dense) | 4.0B | 2.3 GB (MLX 4-bit) | text; matches the reference on the same weights (same top 10) |
@@ -197,8 +198,8 @@ zone, local time, screen, CPU cores and GPU. Both can be changed under Settings.
 ## Typed decisions (Jev models)
 
 The Jev models (`autotrust/JEV-9B`, `autotrust/JEV-27B`, ...) answer a typed question about a
-piece of text with calibrated probabilities, in one prefill pass and with no generation
-("System 1"): `noul` (yes / no, probabilities for `["false", "true"]`), `score` (a 0-5 scale) or
+piece of text (or images: [Image decisions](#image-decisions)) with calibrated probabilities, in one
+prefill pass and with no generation ("System 1"): `noul` (yes / no, probabilities for `["false", "true"]`), `score` (a 0-5 scale) or
 `choice` (2-16 options labelled A-P, up to 256 with the extra single-token labels Q-Z, AA, AB,
 ...). The prompt is the `bare-v1` template:
 
@@ -304,7 +305,83 @@ Latency (M5 Max, 18 threads; a decision is a prefill, so it scales with the prom
 The adapter costs 3-7 % of the prefill (low-rank products in f32 NEON on the CPU, after the base
 matmul, also when the base matmul runs on the GPU). Not supported: Gemma 4 26B-A4B bundles
 (GEV-26B-Decide, JEV-Gemma4-26B-A4B: oxinfer has no Gemma 4 MoE), LoRA on routed MoE experts,
-image parts in the state, and Core ML models.
+and Core ML models.
+
+### Image decisions
+
+`autotrust/JEV-27B-VL` (Qwen3.8-27B with its vision tower, unchanged, plus JEV-27B's System 1 as
+an unmerged `adapter_vllm/` LoRA with an `lm_head` readout) and JEV-9B's `vl/` bundle (the same
+adapter as `adapter_vllm/` with the layer names of the multimodal class, for the unmodified
+`Qwen/Qwen3.5-9B`) decide over images too. As in the reference server (`serve_decide.py`), the
+state is a list mixing text and images, and each image goes where it appears:
+
+```text
+[kind] noul
+[state] Photo: <|vision_start|><|image_pad|> x 256<|vision_end|>
+[question] Is this scenario one where: the image shows a wild animal?
+[options]
+false
+true
+[decision]:
+```
+
+No chat template, no system prompt: text parts as they are, an image as its vision tokens (M-RoPE
+positions as in chat), then the readout, adapter, bias and temperatures of the text decisions.
+The head never saw an image in training, so these decisions are zero-shot. The reference server
+takes images only (no video); so does oxinfer.
+
+```sh
+# JEV-9B on the multimodal Qwen3.5-9B: only vl/ is fetched from autotrust/JEV-9B (org/name/subdir)
+oxinfer --model Qwen/Qwen3.5-9B --decision-from autotrust/JEV-9B/vl --decide choice \
+  --image scene.png --state "Task: pick up the red cube." \
+  --question "Where is the red object relative to the blue one?" --option left --option right
+
+# JEV-27B-VL brings its own assets; JSON requests place images anywhere in the state
+oxinfer --model autotrust/JEV-27B-VL --decide-json requests.json
+```
+
+`--image` (repeatable) puts images before the state text; `--max-soft-tokens N` caps the tokens of
+an image (default: the processor's limits; each token covers 32x32 pixels). In JSON (`--decide-json`,
+`Engine::decide_json`, `oxi_decide`) an image part is `{"image": REF}` or `{"type": "image_url",
+"image_url": {"url": REF}}`, with REF a base64 `data:` URL, an `http(s)://` URL (fetched with the
+`hf` feature's client), a `file://` URL or a path; `"attachments": {"images": [...],
+"max_soft_tokens": N}` is the JSON form of `DecisionRequest::attachments`. In Rust:
+
+```rust
+let d = engine.decide(
+    &DecisionRequest::noul(
+        serde_json::json!(["Photo: ", {"image": "photo.jpg"}]),
+        "Is this scenario one where: the image shows food or cooking?",
+    ),
+)?;
+// or: DecisionRequest::noul("caption text", "...").with_images(["photo.jpg"])
+// ImageSource::Bytes(png).to_part() makes a state part from encoded bytes
+```
+
+A text-only checkpoint (the `autotrust/JEV-9B` folder itself has no vision tower) refuses images
+with a message naming the multimodal base to load instead.
+
+Agreement with the reference server's math on `transformers` + `peft` (HF processor, unmerged
+`adapter_vllm`, LM-head logprobs over the verbalizer tokens + bias, per-kind temperature; f32
+compute on the bf16 weights), 11 image decisions (2-3 noul, 2 score, 2- and 4-option, two
+12-option and a 20-option wide-label choice; one or two images of 140-396 vision tokens, as data
+URLs, `image_url` parts and paths) and the 5 text decisions of the text check:
+
+| oxinfer (bf16 weights) | images: max \|Δp\| | max KL | text: max \|Δp\| |
+|---|---|---|---|
+| Qwen3.5-9B + JEV-9B `vl/`, CPU | 3.7e-6 | 1.6e-8 | |
+| Qwen3.5-9B + JEV-9B `vl/`, Metal | 1.1e-3 | 5.7e-6 | 1.3e-4 |
+| JEV-27B-VL, CPU | 8.3e-6 | 4.5e-10 | |
+| JEV-27B-VL, Metal | 6.0e-4 | 9.4e-7 | 8.7e-5 |
+
+Prompt token counts match the processor's exactly; the Metal differences come from its half-precision
+matrix units (`gpu_exact` removes them). Text decisions and chat give the same output as before
+images were supported, bit for bit.
+
+Latency of one image decision (512x512 photo = 256 vision tokens, 298 prompt tokens; M5 Max, while
+other jobs loaded the machine, so upper bounds): Qwen3.5-9B + `vl/` 1.0-1.5 s on Metal (vision tower
+0.4-0.6 s, prefill 0.6-0.9 s) and 7.4 s on the CPU; JEV-27B-VL (bf16) 3.3 s on Metal (tower 0.6 s)
+and 22 s on the CPU.
 
 ## Image generation
 

@@ -8,6 +8,7 @@
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
 pub mod anemll;
 pub mod audio;
+mod b64;
 pub mod bert;
 #[cfg(feature = "capi")]
 pub mod capi;

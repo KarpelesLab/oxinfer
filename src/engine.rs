@@ -138,7 +138,9 @@ pub struct EngineOptions {
     /// repo id) on top of the loaded base model: only the small files are fetched (adapter, head,
     /// configs; see [`crate::decide::ASSET_FILES`]), not the backbone, and the base must match
     /// (hidden size, layers, vocabulary, verbalizer tokens). Without it, assets found in the model
-    /// directory itself are used. Key `decision_from`.
+    /// directory itself are used. `org/name/subdir` takes a bundle in a repo's subfolder (e.g.
+    /// `autotrust/JEV-9B/vl`, the image decision assets for `Qwen/Qwen3.5-9B`). Key
+    /// `decision_from`.
     pub decision_from: Option<String>,
 }
 
@@ -382,7 +384,7 @@ impl EngineOptions {
 
 /// Attachments for [`Engine::send_with_media`], placed before the message text (images, then
 /// videos, then audio clips).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
 pub struct Attachments {
     pub images: Vec<PathBuf>,
@@ -1210,7 +1212,9 @@ impl Engine {
     /// Answers a typed question with one probability per option (see [`crate::decide`]): one
     /// prefill pass over the decision prompt in a scratch context, with the bundle's LoRA adapter
     /// switched on for that pass only. The conversation is left as it was (its cache is not
-    /// touched), so decisions can be interleaved with chat turns.
+    /// touched), so decisions can be interleaved with chat turns. Images in the state (see
+    /// [`DecisionRequest`]) need a Qwen3.5-family checkpoint that includes its vision tower and
+    /// the `media` feature; they go through the tower first, without the adapter.
     pub fn decide(&mut self, req: &DecisionRequest) -> Result<Decision> {
         let t0 = Instant::now();
         let d = self
@@ -1218,9 +1222,40 @@ impl Engine {
             .as_deref()
             .context("no decision assets loaded: load a Jev model directory, or set EngineOptions::decision_from")?;
         let plan = d.plan(req)?;
+        let (mut prompt, mut feats, mut vision_secs) = (plan.prompt.clone(), Vec::new(), 0.0);
+        if !plan.images.is_empty() {
+            let t = Instant::now();
+            match self.info.family {
+                Family::Qwen if crate::qwen_vision::is_qwen_vl(&self.info.path) => {}
+                Family::Qwen => bail!(
+                    "{}: no vision tower (a text-only checkpoint), so image decisions are unavailable; load the \
+                     multimodal base (e.g. Qwen/Qwen3.5-9B with decision_from autotrust/JEV-9B/vl, or autotrust/JEV-27B-VL)",
+                    self.info.path.display()
+                ),
+                _ => bail!("image decisions are supported on Qwen3.5-family vision checkpoints only"),
+            }
+            let bytes = plan.images.iter().map(|s| s.bytes()).collect::<Result<Vec<_>>>()?;
+            let enc = {
+                let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+                mm::encode_images(
+                    &self.info.path,
+                    self.files,
+                    self.info.hidden_size,
+                    &bytes,
+                    req.attachments.max_soft_tokens,
+                )?
+            };
+            prompt = plan.pieces[0].clone();
+            for ((text, feat), piece) in enc.into_iter().zip(&plan.pieces[1..]) {
+                prompt.push_str(&text);
+                prompt.push_str(piece);
+                feats.push(feat);
+            }
+            vision_secs = t.elapsed().as_secs_f64();
+        }
         let ids = self
             .tok
-            .encode(plan.prompt.as_str(), false)
+            .encode(prompt.as_str(), false)
             .map_err(|e| anyhow!("encode: {e}"))?
             .get_ids()
             .to_vec();
@@ -1235,18 +1270,20 @@ impl Engine {
         let (hidden, logits) = {
             let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
             let _on = d.switch.as_ref().map(crate::lora::Active::new);
-            fn run<M: generate::TextLm + ?Sized>(m: &M, ids: &[u32], chunk: usize, need_logits: bool) -> (Vec<f32>, Option<Vec<f32>>) {
+            type Out = Result<(Vec<f32>, Option<Vec<f32>>)>;
+            fn run<M: generate::TextLm + ?Sized>(m: &M, ids: &[u32], feats: &[mm::MmFeature], chunk: usize, need_logits: bool) -> Out {
                 let mut sess = m.new_session();
-                let hs = generate::prefill(m, &mut sess, ids, chunk, &[]);
+                let overrides = mm::bind(m, &mut sess, ids, feats)?;
+                let hs = generate::prefill(m, &mut sess, ids, chunk, &overrides);
                 let h = m.hidden_size();
                 let last = hs[hs.len() - h..].to_vec();
                 let logits = need_logits.then(|| m.logits(&last, 1));
-                (last, logits)
+                Ok((last, logits))
             }
             match &self.lm {
-                Lm::Gemma { model, .. } => run(*model, &ids, chunk, need_logits),
-                Lm::Qwen { model, .. } => run(*model, &ids, chunk, need_logits),
-                Lm::QwenMtp { dec } => run(dec.model(), &ids, chunk, need_logits),
+                Lm::Gemma { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
+                Lm::Qwen { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
+                Lm::QwenMtp { dec } => run(dec.model(), &ids, &feats, chunk, need_logits)?,
                 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
                 Lm::CoreMl(_) => bail!("decisions are not supported for Core ML models"),
             }
@@ -1255,6 +1292,9 @@ impl Engine {
         let probs = d.read(&plan, &hidden, logits.as_deref())?;
         let stats = DecisionStats {
             prompt_tokens: ids.len(),
+            images: feats.len(),
+            image_tokens: feats.iter().map(|f| f.n).sum(),
+            vision_secs,
             prefill_secs,
             total_secs: t0.elapsed().as_secs_f64(),
         };
@@ -1530,7 +1570,8 @@ pub fn resolve_model(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
 
 /// Resolves a decision bundle: a local directory, or (with the `hf` feature) a repo id of which
 /// only the decision assets are fetched ([`crate::decide::ASSET_FILES`], plus the LM-head adapter
-/// when there is no slot head).
+/// when there is no slot head). `org/name/sub/dir` takes the bundle in a subfolder of the repo
+/// (`autotrust/JEV-9B/vl`: JEV-9B's assets for the multimodal Qwen3.5-9B).
 pub fn resolve_decision(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
     let p = Path::new(spec);
     if p.is_dir() {
@@ -1538,9 +1579,28 @@ pub fn resolve_decision(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf>
     }
     #[cfg(feature = "hf")]
     {
-        let dir = crate::hf::resolve_files(spec, crate::decide::ASSET_FILES, cache_dir)?;
+        let parts: Vec<&str> = spec.splitn(3, '/').collect();
+        let (repo, sub) = match parts[..] {
+            [org, name, sub] if !spec.starts_with('/') => (format!("{org}/{name}"), Some(sub.trim_end_matches('/'))),
+            _ => (spec.to_string(), None),
+        };
+        if let Some(s) = sub
+            && s.split('/').any(|c| c.is_empty() || c.starts_with('.'))
+        {
+            bail!("{spec}: bad subfolder {s:?}");
+        }
+        let fetch = |names: &[&str]| -> Result<PathBuf> {
+            let names: Vec<String> = names
+                .iter()
+                .map(|n| sub.map_or_else(|| n.to_string(), |s| format!("{s}/{n}")))
+                .collect();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let dir = crate::hf::resolve_files(&repo, &names, cache_dir)?;
+            Ok(sub.map_or_else(|| dir.clone(), |s| dir.join(s)))
+        };
+        let dir = fetch(crate::decide::ASSET_FILES)?;
         if !dir.join("head.safetensors").is_file() {
-            crate::hf::resolve_files(spec, crate::decide::LM_ADAPTER_FILES, cache_dir)?;
+            fetch(crate::decide::LM_ADAPTER_FILES)?;
         }
         if !crate::decide::has_assets(&dir) {
             bail!("{spec}: no decision assets (judge_config.json or adapter_vllm/decision_head.json)");

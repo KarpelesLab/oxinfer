@@ -80,7 +80,9 @@ char *oxi_download(const char *spec, const char *cache_dir, oxi_progress_fn prog
  *   decision_from=PATH|REPO  typed decisions (oxi_decide) with the decision assets of this Jev
  *                        bundle (LoRA adapter, head, configs; only those small files are
  *                        downloaded) on top of the loaded base model, which must match it. A Jev
- *                        bundle loaded as the model brings its own.
+ *                        bundle loaded as the model brings its own. ORG/NAME/SUBDIR takes the
+ *                        bundle in a subfolder of a repo (autotrust/JEV-9B/vl: JEV-9B's image
+ *                        decision assets, on the multimodal Qwen/Qwen3.5-9B).
  * Returns NULL on error. */
 OxiEngine *oxi_engine_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
 
@@ -144,8 +146,19 @@ char *oxi_engine_stats_json(OxiEngine *engine);
  *   {"kind": "noul" | "score" | "choice",
  *    "state": "text" or a JSON value (serialized as Python's json.dumps),
  *    "question": "...",
- *    "options": ["...", ...]}            (choice only: 2-256 options; 16 trained, more read
+ *    "options": ["...", ...],            (choice only: 2-256 options; 16 trained, more read
  *                                         through extra single-token labels)
+ *    "attachments": {"images": ["a.png", ...], "max_soft_tokens": N}}   (optional, oxinfer only:
+ *                                         image files placed before the state text, and the
+ *                                         image token budget; format of oxi_engine_send_media)
+ * Images (Qwen3.5-family bases that include the vision tower, e.g. Qwen/Qwen3.5-9B with
+ * decision_from=autotrust/JEV-9B/vl, or autotrust/JEV-27B-VL): make "state" a list mixing text
+ * and images, each placed where it appears:
+ *   "state": ["Photo: ", {"image": "data:image/png;base64,..."}, "\nTask: ..."]
+ * An image is {"image": REF} or {"type": "image_url", "image_url": {"url": REF}}, REF a base64
+ * data URL, an http(s):// URL (fetched; builds with HTTP support), a file:// URL or a local
+ * path; other non-string parts are serialized as JSON. Video and audio are not part of the
+ * protocol and are refused.
  * Returns the response as a JSON object (free with oxi_string_free), or NULL on error:
  *   {"kind", "effective_kind", "options", "probabilities", "choice_index", "choice",
  *    "adaptation": "native" | "wide-labels", "protocol", "model",

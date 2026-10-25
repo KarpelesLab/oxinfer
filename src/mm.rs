@@ -280,35 +280,13 @@ fn prepare_qwen(
     let max_pixels = args.max_soft_tokens * unit * unit;
     for (i, path) in args.images.iter().enumerate() {
         let img = media.load_image(path)?;
-        let px = qwen_vision::preprocess_image(&img.data, img.width, img.height, &qc.image, max_pixels)?;
-        let t1 = Instant::now();
-        let emb = tower.encode(&px);
-        let (_, gh, gw) = px.grid;
-        let n = emb.len() / text_hidden;
-        eprintln!(
-            "[image {}: {}x{} -> {}x{} patches -> {} tokens, tower {:.2}s, {:.2}s]",
-            path.display(),
-            img.width,
-            img.height,
-            gw,
-            gh,
-            n,
-            t1.elapsed().as_secs_f64(),
-            t.elapsed().as_secs_f64()
-        );
+        let (px, ph, feat) = qwen_image(&tower, &qc, text_hidden, &img, max_pixels, &path.display().to_string(), t)?;
         if let (Some(prefix), 0) = (args.dump_mm, i) {
             dump(&format!("{}_pixels.bin", prefix.display()), &px.data)?;
-            dump(&format!("{}_image.bin", prefix.display()), &emb)?;
+            dump(&format!("{}_image.bin", prefix.display()), &feat.emb)?;
         }
-        text.push_str("<|vision_start|>");
-        text.push_str(&"<|image_pad|>".repeat(n));
-        text.push_str("<|vision_end|>");
-        feats.push(MmFeature {
-            token_id: qc.image_token_id,
-            emb,
-            n,
-            grids: vec![(gh / m, gw / m)],
-        });
+        text.push_str(&ph);
+        feats.push(feat);
     }
     let vp = &qc.video;
     for (i, path) in args.videos.iter().enumerate() {
@@ -353,6 +331,96 @@ fn prepare_qwen(
         });
     }
     Ok((text, feats))
+}
+
+/// One Qwen image through the tower: its pixels, its placeholder text
+/// (`<|vision_start|><|image_pad|>...<|vision_end|>`) and its feature.
+#[cfg(feature = "media")]
+fn qwen_image(
+    tower: &qwen_vision::QwenVisionTower,
+    qc: &qwen_vision::QwenMmConfig,
+    text_hidden: usize,
+    img: &media::RgbImage,
+    max_pixels: usize,
+    what: &str,
+    t: Instant,
+) -> Result<(qwen_vision::Pixels, String, MmFeature)> {
+    let m = qc.vision.spatial_merge_size;
+    let px = qwen_vision::preprocess_image(&img.data, img.width, img.height, &qc.image, max_pixels)?;
+    let t1 = Instant::now();
+    let emb = tower.encode(&px);
+    let (_, gh, gw) = px.grid;
+    let n = emb.len() / text_hidden;
+    eprintln!(
+        "[image {what}: {}x{} -> {}x{} patches -> {} tokens, tower {:.2}s, {:.2}s]",
+        img.width,
+        img.height,
+        gw,
+        gh,
+        n,
+        t1.elapsed().as_secs_f64(),
+        t.elapsed().as_secs_f64()
+    );
+    let text = format!("<|vision_start|>{}<|vision_end|>", "<|image_pad|>".repeat(n));
+    let feat = MmFeature {
+        token_id: qc.image_token_id,
+        emb,
+        n,
+        grids: vec![(gh / m, gw / m)],
+    };
+    Ok((px, text, feat))
+}
+
+/// Encoded images (PNG, JPEG, WebP, GIF, BMP bytes) for a Qwen3.5-family vision checkpoint in
+/// `model`: per image, its placeholder text (`<|vision_start|><|image_pad|>...<|vision_end|>`, to
+/// place anywhere in a prompt) and its feature. `max_soft_tokens` as in [`MmRequest`]. For
+/// prompts that are not chat turns (typed decisions).
+#[cfg(feature = "media")]
+pub fn encode_images(
+    model: &Path,
+    files: &ModelFiles,
+    text_hidden: usize,
+    images: &[Vec<u8>],
+    max_soft_tokens: usize,
+) -> Result<Vec<(String, MmFeature)>> {
+    let qc = qwen_vision::QwenMmConfig::load(model)?
+        .with_context(|| format!("{}: no Qwen vision tower (config.json has no vision_config)", model.display()))?;
+    if qc.vision.out_hidden_size != text_hidden {
+        bail!(
+            "vision tower output {} does not match the text model's {text_hidden}",
+            qc.vision.out_hidden_size
+        );
+    }
+    let media = media::Media::new();
+    let t = Instant::now();
+    let tower = qwen_vision::QwenVisionTower::load(qc.vision.clone(), files).context("load the vision tower")?;
+    let unit = qc.image.patch_size * qc.vision.spatial_merge_size;
+    let mut out = Vec::with_capacity(images.len());
+    for (i, b) in images.iter().enumerate() {
+        let img = media.decode_image(b).with_context(|| format!("image {}", i + 1))?;
+        let (_, text, feat) = qwen_image(
+            &tower,
+            &qc,
+            text_hidden,
+            &img,
+            max_soft_tokens * unit * unit,
+            &(i + 1).to_string(),
+            t,
+        )?;
+        out.push((text, feat));
+    }
+    Ok(out)
+}
+
+#[cfg(not(feature = "media"))]
+pub fn encode_images(
+    _model: &Path,
+    _files: &ModelFiles,
+    _text_hidden: usize,
+    _images: &[Vec<u8>],
+    _max_soft_tokens: usize,
+) -> Result<Vec<(String, MmFeature)>> {
+    bail!("built without the `media` feature: image inputs are unavailable")
 }
 
 /// Maps placeholder token positions in `ids` to soft-token embeddings, in attachment order.
