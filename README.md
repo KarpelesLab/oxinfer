@@ -516,18 +516,25 @@ whisper-small, 1 of 210 on large-v3-turbo; q4 decoders drift (7 words of 210 on 
 50 of 206 on whisper-small): not recommended for Whisper.
 
 **Speed** on the M5 Max, 100 s of speech (long-form), wall time including features, language
-detection and every window (real-time factor = time / audio duration; lower is faster). Other
-jobs shared the machine (load average 9-18 during these runs, mostly from these runs themselves);
-best of three:
+detection and every window (real-time factor = time / audio duration; lower is faster). Best of
+three runs, load average 4-8 from other jobs (one core busy with a compile during the first
+rows); `--threads 6` approximates a phone's core count:
 
 | Model | Device | Encoder | Decoder | Total | RTF | Speed |
 |---|---|---|---|---|---|---|
-| whisper-small | CPU (18 threads) | 2.13 s | 0.72 s (299 tokens) | 2.86 s | 0.029 | 35x real time |
-| whisper-small | Metal | 0.66 s | 0.72 s | 1.40 s | 0.014 | 71x |
-| whisper-small, q8 decoder | Metal | 0.65 s | 0.55 s | 1.22 s | 0.012 | 82x |
-| whisper-large-v3-turbo | CPU (18 threads) | 9.21 s | 0.57 s (304 tokens) | 9.80 s | 0.098 | 10x |
-| whisper-large-v3-turbo | Metal | 1.49 s | 0.55 s | 2.07 s | 0.021 | 48x |
-| whisper-large-v3-turbo, q8 decoder | Metal | 1.54 s | 0.43 s | 1.99 s | 0.020 | 50x |
+| whisper-small | CPU, 18 threads | 2.17 s | 0.66 s (299 tokens) | 2.84 s | 0.028 | 35x real time |
+| whisper-small | CPU, 6 threads | 4.58 s | 0.82 s | 5.43 s | 0.054 | 18x |
+| whisper-small | Metal | 0.66 s | 0.65 s | 1.32 s | 0.013 | 76x |
+| whisper-small, q8 decoder | Metal | 0.54 s | 0.54 s | 1.09 s | 0.011 | 92x |
+| whisper-large-v3-turbo | CPU, 18 threads | 9.66 s | 0.57 s (304 tokens) | 10.24 s | 0.102 | 10x |
+| whisper-large-v3-turbo | CPU, 6 threads | 19.58 s | 0.70 s | 20.32 s | 0.203 | 5x |
+| whisper-large-v3-turbo | Metal | 1.39 s | 0.58 s | 1.99 s | 0.020 | 50x |
+| whisper-large-v3-turbo, q8 decoder | Metal | 1.34 s | 0.39 s | 1.76 s | 0.018 | 57x |
+
+On Metal the encoder's attention is one fused kernel (`flash_attn64`: about 3.6 ms per
+large-v3-turbo layer, against 10 ms for the GEMM + softmax + GEMM path it replaced, which other
+head sizes still use); a large-v3-turbo window then splits into ~160 ms of matmuls, ~115 ms of
+attention and ~100 ms of CPU-side layer norms, GELU and residual adds.
 
 The encoder (30 s per window, 1500 positions) is the heavy part: its matmuls and attention go to
 the GPU when one is active (Metal, CUDA, WebGPU); decoding is one token at a time on the CPU,
