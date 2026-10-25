@@ -11,7 +11,8 @@ and Qwen3 models load from the mirror too. Early days: the crate is at 0.0.x and
 formats may still change.
 
 Local LLM inference in pure Rust: Gemma 4 (text, images, audio), Gemma 3 and Qwen 3 / 3.5 / 3.8
-today, more model families as they come. No BLAS, no ML framework: weights are read straight out
+today, more model families as they come; also embeddings, Stable Diffusion and Whisper speech to
+text. No BLAS, no ML framework: weights are read straight out
 of the safetensors files (HuggingFace checkpoints or MLX 4-bit ones) and every operation
 (matmuls, attention, norms, RoPE, sampling) is implemented here, with hand-written SIMD kernels
 (NEON, AVX2, wasm simd128) and its own thread pool. The CPU path runs everywhere; GPUs (Metal,
@@ -65,6 +66,9 @@ optional.
 | stabilityai/sd-turbo | 1.3B | 2.6 GB (fp16) | text-to-image in one step; matches diffusers (see Image generation) |
 | stable-diffusion-v1-5/stable-diffusion-v1-5 (and SD 1.x / 2.x fine-tunes) | 1.1B | 2.0 GB (fp16) | text-to-image; matches diffusers |
 | anemll/* (ANEMLL Core ML: Qwen3, Qwen2.5, Gemma 3, Llama 3.2, ...) | 0.27B-1.7B tested | 0.3-1.5 GB (LUT6) | Apple Neural Engine via Core ML; same tokens as ANEMLL's runtime (see [Core ML](#core-ml--apple-neural-engine)) |
+| openai/whisper-tiny, -small | 39M / 244M | 151 / 967 MB (fp32) | speech to text; transcripts match transformers token for token (see [Speech to text](#speech-to-text-whisper)) |
+| openai/whisper-large-v3-turbo, distil-whisper/distil-large-v3 | 809M / 756M | 1.6 / 1.5 GB (fp16) | speech to text; match transformers token for token |
+| openai/whisper-base, -medium, -large-v3 (and the `.en` models) | 74M-1.55B | 0.3-3.1 GB | speech to text; same code path, smoke-tested |
 
 ### Qwen3.5 / Qwen3.8
 
@@ -395,6 +399,144 @@ AAC/M4A, Ogg Vorbis/Opus, MKV audio), resampled to 16 kHz mono for audio.
 Soft tokens replace the `<|image|>` / `<|audio|>` placeholder embeddings inside the text model
 (the per-layer-embedding lookup uses the pad token there, as in the reference). All attention
 stays causal, matching the E2B/E4B configuration.
+
+## Speech to text (Whisper)
+
+OpenAI's Whisper checkpoints in the Hugging Face layout (`model_type: whisper`) transcribe or
+translate audio of any length (`src/whisper/`): openai/whisper-{tiny, base, small, medium,
+large-v3, large-v3-turbo}, the English-only `.en` models, and distil-whisper (the same network
+with fewer decoder layers, e.g. distil-whisper/distil-large-v3). Sizes come from `config.json`
+(80 mel bins, 128 for v3), special tokens and decoding defaults from `generation_config.json`.
+
+```sh
+./target/release/oxinfer --model openai/whisper-small --transcribe talk.mp3              # text
+./target/release/oxinfer --model openai/whisper-large-v3-turbo --transcribe talk.mp3 --timestamps
+./target/release/oxinfer --model openai/whisper-small --transcribe interview.m4a --language fr --translate
+./target/release/oxinfer --model openai/whisper-small --transcribe talk.wav --format srt > talk.srt
+./target/release/oxinfer --model openai/whisper-small --transcribe talk.wav --word-timestamps --json
+```
+
+| Flag | Meaning |
+|---|---|
+| `--transcribe FILE` | audio to transcribe: WAV, MP3, FLAC, AAC/M4A, Ogg Vorbis/Opus, MKV audio (oxideav), resampled to 16 kHz mono |
+| `--language XX` | spoken language, as a code or a name (default: detected from the first 30 s) |
+| `--translate` | translate to English text |
+| `--timestamps` | timed segments (always on past 30 s) |
+| `--word-timestamps` | also word-level times |
+| `--format F` | `text` (default), `json`, `srt`, `vtt` (`--json` is `--format json`) |
+| `--initial-prompt TEXT`, `--prefix TEXT` | context for the decoder (names, spelling, style); forced start of the transcript |
+| `--fallback` | openai-whisper's temperature fallback: temperatures 0, 0.2, ..., 1.0 while a window's tokens compress better than 2.4 or average below -1 log-probability; a window with a no-speech probability over 0.6 and a low log-probability is skipped as silence |
+| `--condition-on-prev` | feed each 30 s window the previous text |
+| `--precision f32\|f16\|bf16` | weight storage (default bf16); `--quant q8\|q4` quantizes the decoder |
+
+What runs, following transformers' `WhisperFeatureExtractor` and
+`WhisperForConditionalGeneration.generate`:
+
+- **Features**: 400-sample periodic Hann window, hop 160, reflect padding, power spectrum,
+  Slaney mel filterbank, `log10`, clamp to `max - 8`, `(x + 4) / 4`. Clips up to 30 s are
+  zero-padded to 30 s first; longer audio is featurized whole (the clamp sees all of it). The DFT
+  (a mixed-radix FFT of 400) and the filterbank run in f64.
+- **Encoder**: two convolutions (kernel 3, the second with stride 2) with GELU, sinusoidal
+  positions, pre-LayerNorm transformer layers, all through the shared matmul (SIMD kernels, GPU
+  backends for the big products) and a fused attention kernel on Metal.
+- **Decoder**: learned positions, causal self-attention over a KV cache, cross-attention over the
+  window's encoder output (keys and values computed once per window, kept head-major and attended
+  with the keys split across threads), the output projection tied to the token embedding.
+- **Decoding**: greedy by default (`TranscribeOptions::temperatures` for sampling and fallback);
+  language detection from the first-token distribution over the language tokens (`language` then
+  holds the code and its probability); `suppress_tokens` and `begin_suppress_tokens`; the rules of
+  `WhisperTimeStampLogitsProcessor` (no `<|notimestamps|>`, timestamps in pairs and increasing, a
+  timestamp first, at most 1 s in, and a timestamp whenever all timestamps together outweigh every
+  text token). Audio over 30 s is decoded in sequential 30 s windows, each moved to the last
+  complete segment's end timestamp, as transformers' long-form generation does; `initial_prompt`
+  becomes `<|startofprev|>` context; `condition_on_prev_tokens` feeds the last 223 tokens.
+- **Word timestamps**: openai-whisper's alignment: the cross-attention of the checkpoint's
+  `alignment_heads` over the text tokens, normalized and median-filtered, aligned to the audio
+  frames by dynamic time warping, tokens grouped into words, punctuation merged. Against
+  transformers' pipeline (`return_timestamps="word"`) on a 29 s LibriSpeech clip, the 60 shared
+  words start within 16 ms of it on average.
+
+In Rust, `oxinfer::whisper::Transcriber` does all of it (`examples/transcribe.rs`):
+
+```rust
+use oxinfer::whisper::{Transcriber, TranscriberOptions, TranscribeOptions};
+let asr = Transcriber::load("openai/whisper-small", &TranscriberOptions::default())?;
+let mut opts = TranscribeOptions::default();
+opts.language = Some("fr".into());
+opts.timestamps = true;
+let pcm = Transcriber::load_audio(std::path::Path::new("talk.mp3"))?; // or your own 16 kHz samples
+let t = asr.transcribe_with(&pcm, &opts, &mut |seg| {
+    println!("[{:.2} -> {:.2}] {}", seg.start, seg.end, seg.text); // as each 30 s window finishes
+    oxinfer::engine::Flow::Continue                               // Flow::Stop ends it there
+})?;
+println!("{} ({}, {:.1}x real time)", t.text, t.language, 1.0 / t.stats.rtf);
+```
+
+`asr.cancel_handle()` stops a transcription from another thread (it returns the finished
+segments with `stopped` set); `transcribe_file` decodes a file first; `detect_language` returns
+the language distribution. `TranscribeOptions` deserializes from JSON, which is how the C API
+takes it: `oxi_transcriber_load`, `oxi_transcribe_file` / `oxi_transcribe_pcm` (any sample rate)
+with a per-segment callback, `oxi_transcriber_cancel`, results as JSON (`include/oxinfer.h`).
+
+**Agreement with transformers** (float32 `WhisperForConditionalGeneration` + `WhisperProcessor`,
+torch 2.14, transformers 5.20; `tools/ref_whisper.py` on the samples oxinfer decoded; oxinfer with
+`--precision f32 --device cpu`). Clips: LibriSpeech test samples (5.9 s; 29.4 s with timestamps),
+25 s of French from a LibriVox recording (language detection), and the first 100 s of a LibriVox
+reading of Woolf's *Kew Gardens* (long-form: four or five windows):
+
+| Model | Clip | Log-mel max abs diff | Encoder max abs diff (rel L2) | First-step logits max abs diff | Greedy transcript |
+|---|---|---|---|---|---|
+| whisper-tiny | 5.9 s | 1.2e-5 | 5.4e-4 (6.7e-6) | 1.2e-4 | identical, 21 tokens |
+| whisper-tiny | 29.4 s, timestamps | 1.6e-5 | 6.3e-3 (1.3e-5) | 9.3e-5 | identical, 99 tokens with timestamps, same 5 segment times |
+| whisper-tiny | 25 s French | 3.1e-5 | 1.6e-3 (6.8e-6) | 1.5e-4 | identical, 77 tokens; `fr` detected |
+| whisper-tiny | 100 s long-form | 3.0e-5 | 4.7e-3 (1.2e-5) | 1.2e-4 | identical, 348 tokens, same 21 segment times |
+| whisper-small | 5.9 s | 1.2e-5 | 3.1e-3 (1.1e-5) | 3.3e-5 | identical, 22 tokens |
+| whisper-small | 29.4 s, timestamps | 1.6e-5 | 2.4e-3 (5.8e-6) | 2.6e-5 | identical, 110 tokens, same 7 segment times |
+| whisper-small | 25 s French | 3.1e-5 | 1.8e-3 (5.5e-6) | 3.0e-5 | identical; `fr` detected; translated: identical, 60 tokens |
+| whisper-small | 100 s long-form | 3.0e-5 | 5.2e-3 (1.3e-5) | 2.7e-5 | identical, 285 tokens, same 15 segment times |
+| whisper-large-v3-turbo | 100 s long-form | 2.7e-5 | 2.5e-2 (1.4e-4) | 2.5e-4 | identical, 300 tokens, same 16 segment times |
+| whisper-large-v3-turbo | 25 s French | 3.2e-5 | 1.2e-2 (9.3e-5) | 5.8e-5 | identical, 29 tokens |
+| distil-large-v3 | 100 s long-form | 2.7e-5 | 3.8e-2 (1.4e-4) | 7.2e-5 | identical, 350 tokens, same 21 segment times |
+
+The options agree too (whisper-small): an initial prompt (88 tokens), `condition_on_prev_tokens`
+over the 100 s clip (213 tokens, 11 segments), both together, and the fallback settings (no window
+falls back on that clip). The log-mel difference is torch's own: its f32 STFT is off from an f64
+evaluation of the same pipeline by up to 1.2e-5, where oxinfer's features are within 7e-8 (f32
+rounding), so bit-identical features would mean reproducing torch's FFT rounding. Encoder
+differences grow with depth (32 layers for large-v3-turbo) but stay at a relative 1e-4.
+
+With the default bf16 weights, transcripts stay close but are not always token-identical. On the
+100 s clip, whisper-large-v3-turbo in bf16 on Metal gives the f32 transcript token for token;
+whisper-small differs in one word of 206, because of the bf16 decoder (bf16 encoder with an f32
+decoder, or f16 weights throughout, are token-identical). A q8 decoder: 0 or 1 word of 206 on
+whisper-small, 1 of 210 on large-v3-turbo; q4 decoders drift (7 words of 210 on large-v3-turbo,
+50 of 206 on whisper-small): not recommended for Whisper.
+
+**Speed** on the M5 Max, 100 s of speech (long-form), wall time including features, language
+detection and every window (real-time factor = time / audio duration; lower is faster). Other
+jobs shared the machine (load average 9-18 during these runs, mostly from these runs themselves);
+best of three:
+
+| Model | Device | Encoder | Decoder | Total | RTF | Speed |
+|---|---|---|---|---|---|---|
+| whisper-small | CPU (18 threads) | 2.13 s | 0.72 s (299 tokens) | 2.86 s | 0.029 | 35x real time |
+| whisper-small | Metal | 0.66 s | 0.72 s | 1.40 s | 0.014 | 71x |
+| whisper-small, q8 decoder | Metal | 0.65 s | 0.55 s | 1.22 s | 0.012 | 82x |
+| whisper-large-v3-turbo | CPU (18 threads) | 9.21 s | 0.57 s (304 tokens) | 9.80 s | 0.098 | 10x |
+| whisper-large-v3-turbo | Metal | 1.49 s | 0.55 s | 2.07 s | 0.021 | 48x |
+| whisper-large-v3-turbo, q8 decoder | Metal | 1.54 s | 0.43 s | 1.99 s | 0.020 | 50x |
+
+The encoder (30 s per window, 1500 positions) is the heavy part: its matmuls and attention go to
+the GPU when one is active (Metal, CUDA, WebGPU); decoding is one token at a time on the CPU,
+where the bf16 / q8 / q4 kernels of the language models apply. Without a GPU (iOS and Android
+builds without one, `--device cpu`), everything runs on the SIMD CPU kernels. f32 and f16 weights
+run on the CPU only (the GPU backends take bf16, q8 and q4).
+
+Not supported: beam search (greedy and sampling only), batched transcription of several files at
+once, voice activity detection or speaker diarization, openai-whisper's word-timing heuristics
+(the punctuation merge is there, not the long-word truncation) and `hallucination_silence_threshold`;
+the compression ratio of the fallback is computed with a built-in DEFLATE size estimate (greedy
+LZ77, fixed Huffman codes) instead of zlib, as no deflate implementation is in the dependency tree.
 
 ## Getting weights
 
@@ -1447,6 +1589,10 @@ billion parameters at LUT4, `infer` only) are the practical range for 12 GB phon
   real filesystem or on the browser's in-memory table; `src/web/` (feature `web`): the browser module's
   C-ABI exports and the WebGPU backend calling back into the host; `web/` at the root: the
   JavaScript host and page.
+- `whisper/`: speech to text: `mel.rs` (Whisper's log-mel features, mixed-radix FFT), `model.rs`
+  (encoder, decoder, cross-attention cache), `tokens.rs` (special tokens, languages, generation
+  config), `align.rs` (word timestamps: DTW), `compress.rs` (the fallback's compression ratio),
+  `mod.rs` (`Transcriber`: decoding rules, long-form windows, fallback); `whisper_cli.rs`: the CLI.
 - `sd/`: Stable Diffusion: `clip.rs` (BPE tokenizer, text encoder), `unet.rs`, `vae.rs`, `sched.rs`
   (Euler samplers), `ops.rs` (channels-last convolution, group/layer norm, multi-head attention on
   the f32 GEMM tiles); `png.rs`: a dependency-free PNG writer.

@@ -143,7 +143,7 @@ char *oxi_decide_info_json(OxiEngine *engine);
 
 /* ---- Speech to text (Whisper) ------------------------------------------------------------------
  *
- * openai/whisper-{tiny,base,small,medium,large-v3,large-v3-turbo} (and .en), distil-whisper/*:
+ * openai/whisper-{tiny,base,small,medium,large-v3,large-v3-turbo} (and .en) and the distil-whisper models:
  * Hugging Face safetensors checkpoints with model_type "whisper". Audio of any length (30 s
  * windows, moved along by the predicted timestamps past 30 s). The encoder runs on the GPU
  * when one is active; decoding runs on the CPU. A transcriber follows the engine's threading
