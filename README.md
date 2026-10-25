@@ -591,9 +591,12 @@ the cache through `msync(MS_INVALIDATE)` (`madvise(MADV_DONTNEED / MADV_FREE)` l
 manage 2-3 GB/s and `MADV_WILLNEED` ~5 GB/s, so the reader issues `F_RDADVISE` per 8 MB and then
 touches the pages (mapping a 16 KB page costs ~1 us, so above ~7 GB/s the touching, not the SSD,
 limits the reader); a full `mincore` costs ~15 ms per GB, so cached chunks are recognized from
-three probe pages. Metal wraps the mapped weights without copying for GPU prefill, but a live
-no-copy buffer keeps its pages from being evicted, so streamed units get per-call buffers that are
-released after each matmul (`Lin::set_transient_device`).
+three probe pages; `msync(MS_INVALIDATE)` itself costs ~50 ms per GB, so an evictor thread drops
+used units instead of the compute thread (160 ms per pass on Q2_K_P at an 8 GB budget). Metal
+wraps the mapped weights without copying for GPU prefill, but a live no-copy buffer keeps its
+pages from being evicted, so streamed units get per-call buffers that are released after each
+matmul (`Lin::set_transient_device`). A pass's embedding rows are read through the streamer
+before the lookup (with priority over the read-ahead) rather than faulting in page by page.
 
 | Option | Meaning |
 |---|---|
@@ -605,6 +608,9 @@ released after each matmul (`Lin::set_transient_device`).
 | `--flash-mbps N` / `OXINFER_FLASH_MBPS` | emulate storage that reads N MB/s (the reader sleeps per uncached byte) |
 | `--stream-io M`, `--stream-threads N` | `advise` (default on Apple), `pread` or `touch`; reader threads (default 2) |
 | `--stream-trace` | one line per token / speculative round: bytes read vs cache hits, stall time |
+| `--expert-cache-mb N` | MoE: page cache kept for recently used routed experts (default: what the budget leaves after the resident set) |
+| `--expert-predict` | MoE: guess the next layer's experts and read them ahead (off by default, see below) |
+| `--threads N`, `--qos C`, `--efficiency-threads N` | compute threads; their QoS class on Apple platforms (`interactive` default, `initiated`, `utility`, `background` = efficiency cores only); how many of them run at background QoS |
 
 With `--mtp`, streaming defaults to up to 8 drafts with a cost-aware draft length
 (`--mtp-cost`): each round picks the length with the most expected tokens per second from the
@@ -613,16 +619,76 @@ pass streams 5-12 GB, verifying 9 tokens costs about what verifying 1 does, so l
 off; in RAM the same policy settles on 2-3. Long drafts stay exact: `--mtp` verifies up to
 `draft + 1` tokens on the batch-invariant decode kernels (`MtpOptions::exact`,
 `kernels::set_decode_max_tokens`; greedy output checked token for token against plain greedy
-over 160 tokens with 8 drafts, embedded layer and FastMTP sidecar), which at 9 tokens are also
-faster than the prefill GEMM they replace (Q4_K_P: 0.50 s vs 1.12 s per verification on 18
-threads, Q2_K_P on 3 threads: 2.76 s vs 3.27 s). The rewind after a partial acceptance replays
+over 160 tokens with 8 drafts, embedded layer and FastMTP sidecar). The rewind after a partial acceptance replays
 the delta rule instead of keeping per-token states, so an 8-draft round needs one extra copy of
 the recurrent state (151 MB on Qwen3.8-27B) rather than eight.
 
+Verification passes of 3-16 tokens on GGUF weights run multi-token kernels (`kernels_ggml.rs`)
+that unpack each weight super-block once for all tokens of the pass; before, the decode kernels
+ran in token pairs and unpacked every block once per pair, which on HauhauCS's files (Q2_K_P is
+mostly IQ3_XXS and IQ3_S grid formats, Q4_K_P mostly Q5_K) made unpacking the main cost. There
+are two variants, both repeating the one-token kernels' f32 operations in the same order (the
+integer sums are exact either way), so every row stays bit-identical whatever the token count
+and the speculative greedy output equals plain greedy; no exactness switch is needed:
+
+- SDOT, one weight row at a time against all tokens: Q4_K, Q5_K, IQ4_XS, and every format
+  without i8mm;
+- SMMLA (Armv8.6 i8mm, detected at run time: A15 / M2 and later, so the A19 Pro and the M5) on
+  2x2 tiles of rows and tokens, the activations interleaved per token pair, from 4 tokens on:
+  the formats with integer scales per 16 (Q2_K, Q3_K, Q6_K, IQ2/IQ3/IQ1), where SDOT needs many
+  extra instructions to apply the scales. On the M5's cores SMMLA issues at half SDOT's rate
+  for twice the multiply-adds (5 vs 10.5 G instructions/s per core, ~9-cycle latency) and does
+  not overlap other vector work, so it buys nothing for the per-32 f32-scale formats.
+
+`kernels::set_multi_token_kernels(MultiTokenKernels::{Auto, Dot, Pairs})` (or
+`OXINFER_MULTI=auto|dot|pairs`) picks them (`Pairs` is the previous behaviour, for comparisons);
+`kernels::cpu_has_i8mm()` reports the feature. One core, a 4096 x 5120 matrix, ns per 256
+weights per token (`examples/kernel_bench.rs`):
+
+| Format | 1 token | 4 tokens: pairs / SDOT / auto | 9 tokens: pairs / SDOT / auto | 9 tokens speed-up |
+|---|---|---|---|---|
+| IQ3_XXS | 20.6 | 11.3 / 6.9 / 6.0 | 12.2 / 5.2 / 4.1 | 2.9x |
+| IQ3_S | 23.1 | 12.5 / 7.7 / 7.0 | 13.6 / 5.4 / 4.8 | 2.8x |
+| Q2_K | 10.3 | 7.3 / 5.5 / 5.5 | 7.6 / 4.9 / 4.5 | 1.7x |
+| Q3_K | 10.7 | 7.6 / 5.4 / 5.0 | 8.0 / 4.3 / 4.0 | 2.0x |
+| Q6_K | 10.3 | 6.8 / 5.0 / 4.7 | 7.2 / 4.2 / 3.8 | 1.9x |
+| Q4_K | 6.2 | 4.5 / 3.7 / 3.7 | 4.8 / 3.3 / 3.3 | 1.5x |
+| Q5_K | 9.7 | 6.0 / 4.6 / 4.5 | 6.6 / 3.7 / 3.7 | 1.8x |
+| IQ4_XS | 6.8 | 4.5 / 3.5 / 3.5 | 4.8 / 3.0 / 3.0 | 1.6x |
+
+Whole verification passes (recording forward plus the LM head over every token,
+`examples/pass_bench.rs`, the old and new kernels alternating pass by pass, best of 5):
+
+| Model | Threads | 1 token | 2 tokens | 4 tokens: old / new | 9 tokens: old / new |
+|---|---|---|---|---|---|
+| Q2_K_P | 3 | 0.54 s | 0.65 s | 1.77 / 1.00 s | 3.04 / 1.14 s (2.7x) |
+| Q2_K_P | 6 | 0.50 s | 0.54 s | 0.75 / 0.43 s | 1.74 / 0.67 s (2.6x) |
+| Q4_K_P | 3 | 0.30 s | 0.46 s | 0.99 / 0.76 s | 1.71 / 1.03 s (1.7x) |
+| Q4_K_P | 6 | 0.16 s | 0.21 s | 0.40 / 0.31 s | 0.91 / 0.59 s (1.55x) |
+
+(Best of 5; the machine was shared, so single passes varied by up to 40%. One- and two-token
+passes run the same kernels as before.)
+
+The activation quantization for several tokens now runs vectorized and in parallel, with the
+same values as before.
+
+MoE models (Zawen-v0.1-35B-A3B and other Qwen3.5/3.6 MoE checkpoints) stream only the experts a
+pass routes to: a MoE layer's unit holds its attention / DeltaNet weights, the router and the
+shared expert, and each routed expert is an on-demand part of it (`UnitSpec::parts`) that the
+layer requests once routing is known (`StreamHook::need_parts`), read with priority over the
+read-ahead and then kept in a part cache (least recently used out) sized by what the budget
+leaves (`StreamOptions::part_cache_bytes`). Zawen in oxinfer Q4 (19.5 GB), 6 GB budget at
+2 GB/s, 3 threads, plain greedy: 0.13 -> 7.3 tok/s (14.2 -> 0.12 GB read per token: the dense
+part, 1.1 GB, is resident and 78% of the requested experts come from the 4.1 GB part cache),
+same tokens as without streaming. Guessing the next layer's experts from the residual stream
+(`--expert-predict`) hides part of the remaining stall (77% -> 44% of the time) but the wrong
+guesses read 27% more bytes, which the flash cannot afford: 6.9 tok/s, so it is off by default.
+
 Measured on the M5 Max with the phone's limits emulated (`--cache-budget-gb`, `--flash-mbps`;
 greedy, a 40-token answer to a short prompt, CPU decoding; "3 threads" approximates the
-iPhone's 2 performance + 4 efficiency cores). Pass times were within a few percent between
-repeated runs even with other jobs on the machine, since the emulated storage dominates:
+iPhone's 2 performance + 4 efficiency cores), before the multi-token kernels. Pass times were
+within a few percent between repeated runs even with other jobs on the machine, since the
+emulated storage dominates:
 
 | Model | Budget | Flash | Resident / streamed per pass | Plain | `--mtp` (cost-aware, up to 8) |
 |---|---|---|---|---|---|
@@ -658,10 +724,49 @@ minus the OS, the app's own memory and other apps), the measured 90% bandwidth e
 | 6 GB | 0.19 / 0.46 | 0.37 / 0.91 | 0.56 / 1.37 | 0.08 / 0.19 | 0.15 / 0.39 | 0.23 / 0.58 |
 | 8 GB | 0.32 / 0.75 | 0.64 / 1.50* | 0.96 / 2.25* | 0.09 / 0.23 | 0.19 / 0.47 | 0.28 / 0.70 |
 
-(tokens/s; * where the phone's CPU rather than the flash becomes the limit: on 3 Mac cores a
-9-token Q2_K_P verification computes in 2.8 s, and at 8 GB / 3 GB/s the cost-aware rounds took
-1.48 s against 1.03 s of IO, giving 1.57 instead of 2.07 tok/s.)
-Q2_K_P is the practical choice: about 1 token/s with 6 GB at 2 GB/s, 1.5 with 8 GB at 3 GB/s.
+(tokens/s; * where the phone's CPU rather than the flash was the limit with the token-pair
+kernels: on 3 Mac cores a 9-token Q2_K_P verification computed in 2.8 s, and at 8 GB / 3 GB/s the
+cost-aware rounds took 1.48 s against 1.03 s of IO. The multi-token kernels bring that pass to
+about 1.1-1.5 s, so the CPU is no longer far behind the flash; see below.)
+Q2_K_P is the practical choice: about 1 token/s with 6 GB at 2 GB/s, 1.7-1.9 with 8 GB at 3 GB/s.
+
+With the multi-token kernels (same prompt, 40 tokens, base = the commit before them; best of
+two interleaved rounds on a machine shared with other jobs, which also read the same model files
+and so sometimes lent cache hits to the IO emulation, mostly on Q4_K_P):
+
+| Model | Budget / flash | MTP | base tok/s (s per pass) | new tok/s (s per pass) | GB read per pass |
+|---|---|---|---|---|---|
+| Q2_K_P | 6 GB / 2 GB/s | embedded | 0.82 (2.98) | 0.91 (2.84) | 5.1 |
+| Q2_K_P | 6 GB / 2 GB/s | FastMTP sidecar | 0.74 (3.11) | 0.84 (2.90) | 5.2 |
+| Q2_K_P | 8 GB / 3 GB/s | embedded | 1.39 (1.76) | 1.71 (1.43) | 3.1 |
+| Q2_K_P | 8 GB / 3 GB/s | FastMTP sidecar | 1.19 (1.92) | 1.93 (1.27) | 3.2 |
+| Q2_K_P, 6 threads | 8 GB / 3 GB/s | embedded | 1.75 | 2.00 | 3.1 |
+| Q4_K_P | 6 GB / 2 GB/s | embedded | 0.46 | 0.40 | 10.0-11.9 |
+| Q4_K_P | 6 GB / 2 GB/s | FastMTP sidecar | 0.34 | 0.31 | 9.6-12.1 |
+| Q4_K_P | 8 GB / 3 GB/s | embedded | 0.77 | 0.67 | 7.3-9.3 |
+| Q4_K_P | 8 GB / 3 GB/s | FastMTP sidecar | 0.54 | 0.54 | 8.6-9.0 |
+
+(The Q4_K_P differences follow the bytes read per pass, which varied with the cache hits the
+other jobs' reads of the same file lent: base 7.3 GB per pass against new 8.5 GB in the 8 GB
+embedded runs, for example.)
+
+Where the flash is the bottleneck (6 GB at 2 GB/s, and every Q4_K_P setting) nothing changes:
+a pass already took about the time its bytes need. Where the CPU was (Q2_K_P at 8 GB / 3 GB/s)
+the faster verification shows up directly, and the cost-aware policy drafts longer.
+Greedy output was the same 40 tokens in every run (plain, embedded MTP layer, FastMTP sidecar,
+old and new kernels), and `OXINFER_CHECK_SPEC` (every verification compared with one-token
+forwards) found no difference over a 77-token answer with 8 drafts every round (embedded layer
+and sidecar, Q2_K_P, which runs both kernel variants).
+
+Phones have performance and efficiency cores (A19 Pro: 2 + 4). The pool hands out work block by
+block, so a pool spanning both kinds lets the slower cores take fewer blocks; `--threads 6`
+(the default `interactive` QoS, which iOS schedules on both kinds) is the setting to start from.
+`pool::PoolOptions { threads, qos, efficiency_threads }` (`pool::init_with`, engine keys
+`threads`, `qos`, `efficiency_threads`) sets the QoS class and keeps chosen workers on the
+efficiency cores; `pool::cpu_cores()` reports the core counts. On the Mac (6 + 12 cores, no
+efficiency cores in the phone's sense, loaded by other jobs) background-QoS threads were starved
+by the other work (a 9-token Q2_K_P pass: 0.63 s on 6 interactive threads, 1.2 s with 4 of them
+at background QoS, 6 s with all six), so the phone's balance has to be measured on the phone.
 
 From the library (everything above is reachable without the CLI):
 
@@ -682,9 +787,12 @@ let io = streamer.stats() - before; // bytes_read, bytes_cached, stall, io_busy,
 ```
 
 `Streamer::plan()` reports the resident set and the bytes streamed per pass (and any weight that
-is a RAM copy instead of a view of the file), `cached_bytes()` the model's current page-cache
-footprint, `set_flash_bytes_per_sec` changes the emulated bandwidth while running, and
-`MtpStats::costs` holds what the draft policy measured.
+is a RAM copy instead of a view of the file, and the on-demand expert bytes and their cache),
+`cached_bytes()` the model's current page-cache footprint, `set_flash_bytes_per_sec` changes the
+emulated bandwidth while running, `StreamStats` also counts expert requests and part-cache hits
+and the eviction time, and `MtpStats::costs` holds what the draft policy measured. The engine
+API takes the same settings as keys (`expert_cache_mb`, `expert_predict`, `qos`,
+`efficiency_threads`).
 
 ## Platforms and accelerators
 
@@ -1037,7 +1145,8 @@ would enter the recurrent state. The first load compiles the model for the Neura
   the f32 GEMM tiles); `png.rs`: a dependency-free PNG writer.
 - `kernels.rs`: NEON kernels (`kernels_x86.rs`, `kernels_wasm.rs`: the AVX2 and simd128 equivalents, selected by `build.rs` through the `has_simd` cfg). Decode tiles stream 1–2 weight rows with 8 accumulators (the prefetcher
   prefers few long streams); prefill packs activations into 8-token panels and runs an 8-row x 8-token
-  outer-product kernel that broadcasts bf16 weights by lane. Also RMSNorm, GELU (tanh approximation via
+  outer-product kernel that broadcasts bf16 weights by lane; `kernels_ggml.rs`: the GGUF formats'
+  one-token and multi-token (SDOT / SMMLA) decode kernels and dequantization. Also RMSNorm, GELU (tanh approximation via
   a fast exp), RoPE tables, softmax.
 - `quant.rs`: Q8 (32 weights per f32 scale) and Q4_0 (two nibbles per byte, f16 scale) block
   quantization of weights at load time, plus per-matmul activation quantization; decode kernels use
