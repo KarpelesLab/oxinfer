@@ -263,6 +263,11 @@ read through `adapter_vllm`'s LM-head LoRA), JEV-9B:
 `--decision-from autotrust/JEV-9B` gives the same probabilities as the JEV-9B folder, and JEV-27B on
 the bf16 Qwen3.8-27B reproduces the model card (refund `true` 0.978, AX-330 `dual_source` 0.62);
 on the Q4 conversion the largest difference to bf16 is 0.044 (KL 6.6e-3, from the 4-bit weights).
+`autotrust/JEV-35B` (merged Qwen3.5-35B-A3B MoE, LM-head readout with 256 trained choice slots)
+against `transformers` in bf16 (an f32 reference does not fit in 128 GB): median max |Δp| 4e-4,
+worst 0.042 (KL 6.6e-3) on a near-tie score question; MoE routing flips near ties, so the CPU and
+Metal runs of oxinfer differ from each other by up to 0.014 too. It decides in 0.25-0.45 s on
+Metal for 45-160 tokens.
 
 Latency (M5 Max, 18 threads; a decision is a prefill, so it scales with the prompt):
 
