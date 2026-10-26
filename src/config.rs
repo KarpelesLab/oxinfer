@@ -507,6 +507,10 @@ pub struct QwenConfig {
     /// Attention has per-head RMSNorms on the queries and keys (all but Llama).
     #[serde(skip, default = "d_true")]
     pub qk_norm: bool,
+    /// RoPE rotates adjacent pairs `(2i, 2i + 1)` rather than the halves `(i, i + d/2)`: Llama
+    /// GGUF files, whose query / key rows llama.cpp permuted to that layout (see `crate::gguf`).
+    #[serde(skip)]
+    pub rope_interleaved: bool,
 }
 
 impl QwenConfig {
@@ -548,6 +552,7 @@ impl QwenConfig {
         if gguf {
             cfg.zero_centered_norm = false;
             cfg.v_heads_tiled = cfg.linear_num_key_heads != cfg.linear_num_value_heads;
+            cfg.rope_interleaved = llama;
         }
         if cfg.layer_types.as_ref().unwrap().len() != cfg.num_hidden_layers {
             bail!("layer_types length mismatch");

@@ -166,15 +166,6 @@ pub struct NomicBertModel<'a> {
     layers: Vec<NomicLayer<'a>>,
 }
 
-/// GPT-J style RoPE: rotates pairs of adjacent dimensions.
-fn apply_rope_interleaved(v: &mut [f32], cos: &[f32], sin: &[f32]) {
-    for (i, p) in v.as_chunks_mut::<2>().0.iter_mut().enumerate() {
-        let (x1, x2) = (p[0], p[1]);
-        p[0] = x1 * cos[i] - x2 * sin[i];
-        p[1] = x2 * cos[i] + x1 * sin[i];
-    }
-}
-
 impl<'a> NomicBertModel<'a> {
     pub fn load(cfg: NomicBertConfig, files: &'a ModelFiles, quant: Quant) -> Result<Self> {
         let prefix = ["", "bert.", "model."]

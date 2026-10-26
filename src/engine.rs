@@ -859,10 +859,9 @@ impl Engine {
             "llama" => Family::Llama,
             other => bail!("unsupported model_type {other}"),
         };
-        if family == Family::Llama && crate::gguf::is_gguf(&dir) {
-            // llama.cpp permutes Llama's query / key rows for its interleaved RoPE.
+        if family == Family::Llama && !chat::Llama3Chat::matches_model(&dir) {
             bail!(
-                "{}: Llama GGUF files are not supported (use the safetensors checkpoint)",
+                "{}: the chat template is not Llama 3's (only the Llama 3 chat format is supported for Llama-architecture models)",
                 dir.display()
             );
         }

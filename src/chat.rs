@@ -379,6 +379,20 @@ impl ChatFormat for Qwen2Chat {
 /// carrying the knowledge cutoff and today's date ("25 Oct 2026", as `strftime_now("%d %b %Y")`).
 pub struct Llama3Chat;
 impl Llama3Chat {
+    /// Whether the model's chat template is this format: always for safetensors folders (the
+    /// family is Llama 3), and for GGUF files whose `tokenizer.chat_template` has no template or
+    /// Llama 3's header tokens (other Llama-architecture models, such as SmolLM or Mistral, use
+    /// other formats).
+    pub fn matches_model(dir: &std::path::Path) -> bool {
+        if !crate::gguf::is_gguf(dir) {
+            return true;
+        }
+        let h = crate::gguf::header(dir).ok();
+        h.as_deref()
+            .and_then(|h| h.chat_template())
+            .is_none_or(|t| t.contains("<|start_header_id|>"))
+    }
+
     fn today() -> String {
         const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
         let (t, _, _, _) = crate::tools::local_now();

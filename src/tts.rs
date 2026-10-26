@@ -393,6 +393,26 @@ fn row_lin(w: &'static [u16], rows: &[std::ops::Range<usize>], n_in: usize, quan
     }
 }
 
+/// The audio head of a GGUF file, in the output layer's own block format: whole rows, so each
+/// frame position's codes are a borrowed view of the mapped file and the three stop rows a copy.
+fn gguf_audio_head(files: &'static ModelFiles, name: &str, vocab: usize, n_in: usize) -> Result<Option<AudioHead>> {
+    let Some(g) = files.ggml(name) else {
+        return Ok(None);
+    };
+    let (kind, bytes) = g?;
+    let rb = kind.row_bytes(n_in);
+    if bytes.len() != vocab * rb {
+        return Ok(None);
+    }
+    let rows = |r0: usize, n: usize| &bytes[r0 * rb..(r0 + n) * rb];
+    let pos = (0..FRAME_TOKENS as u32)
+        .map(|p| Lin::from_gguf(kind, rows((AUDIO_BASE + p * CODES) as usize, CODES as usize), CODES as usize, n_in))
+        .collect::<Result<_>>()?;
+    let stop: Vec<u8> = STOP_TOKENS.iter().flat_map(|&t| rows(t as usize, 1).iter().copied()).collect();
+    let stop = Lin::gguf(crate::ggml::GgufMatrix::from_bytes(kind, &stop, STOP_TOKENS.len(), n_in)?);
+    Ok(Some(AudioHead { pos, stop }))
+}
+
 impl Speaker {
     /// Loads an Orpheus checkpoint (directory or repo id, e.g. `unsloth/orpheus-3b-0.1-ft`, an
     /// ungated copy of `canopylabs/orpheus-3b-0.1-ft`) and the SNAC decoder.
@@ -454,6 +474,10 @@ impl Speaker {
                 })
             }
             _ => None,
+        };
+        let head = match head {
+            Some(hd) => Some(hd),
+            None => gguf_audio_head(fr, &head_name, model.cfg.vocab_size, h)?,
         };
         let tok = crate::engine::load_tokenizer(dir)?;
         let snac = Snac::load(

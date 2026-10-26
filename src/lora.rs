@@ -593,9 +593,50 @@ pub fn tiled_v_rows(head_rows: usize, nk: usize, nv: usize, hd: usize) -> Vec<us
     v
 }
 
+/// Row order of a Llama query / key projection in a GGUF file (llama.cpp's `LlamaModel.permute`):
+/// entry `p` is the Hugging Face row stored at row `p`; stored row `2i + j` of a head of `hd` rows
+/// is row `j * hd/2 + i` of that head.
+pub fn rope_pair_rows(n_heads: usize, hd: usize) -> Vec<usize> {
+    (0..n_heads * hd)
+        .map(|p| {
+            let (head, r) = (p / hd, p % hd);
+            head * hd + (r % 2) * (hd / 2) + r / 2
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// llama.cpp's `permute` (`reshape(n_head, 2, hd/2).swapaxes(1, 2)`), and the equivalence the
+    /// Llama GGUF path relies on: adjacent-pair RoPE on the stored rows is rotate-half RoPE on the
+    /// Hugging Face rows, in the stored order.
+    #[test]
+    fn rope_pair_rows_match_llama_cpp_permute() {
+        use crate::kernels::{apply_rope, apply_rope_interleaved};
+        let (nh, hd) = (3, 8);
+        let rows = rope_pair_rows(nh, hd);
+        for h in 0..nh {
+            for i in 0..hd / 2 {
+                for j in 0..2 {
+                    assert_eq!(rows[h * hd + i * 2 + j], h * hd + j * hd / 2 + i);
+                }
+            }
+        }
+        let x: Vec<f32> = (0..nh * hd).map(|i| (i as f32 * 0.37).sin()).collect();
+        let cos: Vec<f32> = (0..hd / 2).map(|i| (1.0 + i as f32).cos()).collect();
+        let sin: Vec<f32> = (0..hd / 2).map(|i| (1.0 + i as f32).sin()).collect();
+        let mut hf = x.clone();
+        let mut stored: Vec<f32> = rows.iter().map(|&r| x[r]).collect();
+        for h in 0..nh {
+            apply_rope(&mut hf[h * hd..(h + 1) * hd], &cos, &sin);
+            apply_rope_interleaved(&mut stored[h * hd..(h + 1) * hd], &cos, &sin);
+        }
+        for (p, &r) in rows.iter().enumerate() {
+            assert_eq!(stored[p], hf[r]);
+        }
+    }
 
     #[test]
     fn canonical_names() {

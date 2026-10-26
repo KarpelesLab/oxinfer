@@ -2,12 +2,22 @@
 //! llama.cpp tensor names back to the Hugging Face names the loaders use, and the config,
 //! tokenizer and chat template that GGUF files carry in their metadata.
 //!
-//! Supported architectures: `qwen35` (Qwen3.5 / 3.6 / 3.8 dense hybrids), `qwen35moe` and `qwen3`.
+//! Supported architectures: `qwen35` (Qwen3.5 / 3.6 / 3.8 dense hybrids), `qwen35moe`, `qwen3`
+//! and `llama` (Llama 3).
 //! llama.cpp's converter changes some tensors on the way; the loaders undo that where needed:
 //! RMSNorm weights already include the `+1` of Qwen3.5's zero-centred norms, `ssm_a` holds
 //! `-exp(A_log)`, and when there are fewer key heads than value heads the Gated DeltaNet value
 //! heads are stored in tiled order (value head `h` reads key head `h % n_k` instead of
 //! `h / (n_v / n_k)`). See `QwenConfig::v_heads_tiled`.
+//!
+//! Llama: the converter permutes the rows of `q_proj` / `k_proj` within each head for ggml's
+//! adjacent-pair RoPE (`LlamaModel.permute`: rows `[n_head, 2, d/2]` become `[n_head, d/2, 2]`,
+//! so stored row `2i + j` of a head is Hugging Face row `j * d/2 + i`). Rotating adjacent pairs of
+//! the stored layout is the same arithmetic as rotate-half RoPE on the original layout, and the
+//! query / key dot products do not depend on the order within a head, so the weights stay mapped
+//! as they are and the attention uses the interleaved RoPE (`QwenConfig::rope_interleaved`). The
+//! llama3 frequency scaling is not in the metadata: the converter stores the resulting divisor of
+//! each frequency as the `rope_freqs.weight` tensor (loaded as `rope_freqs`).
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value as Json, json};
@@ -270,7 +280,8 @@ impl Header {
             "qwen35" => "qwen3_5_text",
             "qwen35moe" => "qwen3_5_moe_text",
             "qwen3" => "qwen3",
-            a => bail!("GGUF architecture {a:?} is not supported (qwen35, qwen35moe and qwen3 are)"),
+            "llama" => "llama",
+            a => bail!("GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen3 and llama are)"),
         })
     }
 
@@ -282,6 +293,12 @@ impl Header {
     /// The Hugging Face `config.json` this file was converted from (the fields the loaders read).
     pub fn config_json(&self) -> Result<Json> {
         let mt = self.model_type()?;
+        let llama = mt == "llama";
+        if let Some(t) = self.get(&format!("{}.rope.scaling.type", self.arch())).and_then(Value::as_str)
+            && !matches!(t, "none" | "llama3")
+        {
+            bail!("GGUF RoPE scaling {t:?} is not supported");
+        }
         let need = |k: &str| {
             self.arch_u64(k)
                 .with_context(|| format!("GGUF metadata has no {}.{k}", self.arch()))
@@ -302,13 +319,18 @@ impl Header {
             "num_attention_heads": need("attention.head_count")?,
             "num_key_value_heads": self.arch_u64("attention.head_count_kv").unwrap_or(need("attention.head_count")?),
             "head_dim": head_dim,
-            "rms_norm_eps": self.arch_f64("attention.layer_norm_rms_epsilon").unwrap_or(1e-6),
+            "rms_norm_eps": self.arch_f64("attention.layer_norm_rms_epsilon").unwrap_or(if llama { 1e-5 } else { 1e-6 }),
             "vocab_size": vocab,
-            "rope_theta": self.arch_f64("rope.freq_base").unwrap_or(10_000_000.0),
+            "rope_theta": self.arch_f64("rope.freq_base").unwrap_or(if llama { 10_000.0 } else { 10_000_000.0 }),
             "tie_word_embeddings": !self.has("output.weight"),
             "mtp_num_hidden_layers": self.arch_u64("nextn_predict_layers").unwrap_or(0),
         });
-        if mt != "qwen3" {
+        if llama {
+            let rot = self.arch_u64("rope.dimension_count").unwrap_or(head_dim);
+            if rot != head_dim {
+                bail!("GGUF Llama with partial RoPE ({rot} of {head_dim} dimensions) is not supported");
+            }
+        } else if mt != "qwen3" {
             let (nk, nv) = (need("ssm.group_count")?, need("ssm.time_step_rank")?);
             let o = c.as_object_mut().unwrap();
             o.insert(
@@ -358,12 +380,18 @@ impl Header {
             bail!("GGUF tokenizer model {model:?} is not supported (only byte-level BPE, \"gpt2\")");
         }
         let pre = self.get("tokenizer.ggml.pre").and_then(Value::as_str).unwrap_or("");
+        // Llama 3 (as its tokenizer.json): no normalizer, and a word found whole in the vocabulary
+        // is one token whatever the merges say (`ignore_merges`).
+        let llama3 = pre == "llama-bpe";
         let regex = match pre {
             "qwen35" => {
                 r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
             }
             "qwen2" => r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
-            p => bail!("GGUF pre-tokenizer {p:?} is not supported (qwen35 and qwen2 are)"),
+            "llama-bpe" => {
+                r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+            }
+            p => bail!("GGUF pre-tokenizer {p:?} is not supported (qwen35, qwen2 and llama-bpe are)"),
         };
         let tokens = self
             .get("tokenizer.ggml.tokens")
@@ -399,7 +427,7 @@ impl Header {
             "truncation": null,
             "padding": null,
             "added_tokens": added,
-            "normalizer": {"type": "NFC"},
+            "normalizer": if llama3 { Json::Null } else { json!({"type": "NFC"}) },
             "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
                 {"type": "Split", "pattern": {"Regex": regex}, "behavior": "Isolated", "invert": false},
                 byte_level,
@@ -408,7 +436,7 @@ impl Header {
             "decoder": byte_level,
             "model": {
                 "type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": "",
-                "end_of_word_suffix": "", "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+                "end_of_word_suffix": "", "fuse_unk": false, "byte_fallback": false, "ignore_merges": llama3,
                 "vocab": vocab, "merges": merges,
             },
         }))
@@ -428,6 +456,8 @@ pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec
         "token_embd.weight" => "model.embed_tokens.weight".to_string(),
         "output_norm.weight" => "model.norm.weight".to_string(),
         "output.weight" => "lm_head.weight".to_string(),
+        // Llama 3: the divisor of each RoPE frequency (the llama3 scaling, see the module docs).
+        "rope_freqs.weight" => "rope_freqs".to_string(),
         // FastMTP sidecars: draft-vocabulary index -> target token id (for a trimmed output head).
         "d2t" => "mtp.d2t".to_string(),
         n => {
@@ -452,7 +482,7 @@ pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec
             }
             let hf = match (arch, base) {
                 (_, "attn_norm") => "input_layernorm.weight",
-                ("qwen3", "ffn_norm") => "post_attention_layernorm.weight",
+                ("qwen3" | "llama", "ffn_norm") => "post_attention_layernorm.weight",
                 (_, "post_attention_norm") => "post_attention_layernorm.weight",
                 (_, "attn_q") => "self_attn.q_proj.weight",
                 (_, "attn_k") => "self_attn.k_proj.weight",
@@ -553,6 +583,83 @@ mod tests {
     fn put_str(b: &mut Vec<u8>, s: &str) {
         b.extend((s.len() as u64).to_le_bytes());
         b.extend(s.as_bytes());
+    }
+
+    /// The tokenizer rebuilt from a GGUF file against the checkpoint's own `tokenizer.json`, on a
+    /// text file: `OXINFER_GGUF_TOK=FILE.gguf:MODEL_DIR:TEXT cargo test --release --lib -- --ignored
+    /// gguf_tokenizer_matches`.
+    #[test]
+    #[ignore]
+    fn gguf_tokenizer_matches_tokenizer_json() {
+        let spec = std::env::var("OXINFER_GGUF_TOK").expect("OXINFER_GGUF_TOK=FILE.gguf:MODEL_DIR:TEXT");
+        let parts: Vec<&str> = spec.split(':').collect();
+        let ours = read_header(Path::new(parts[0])).unwrap().tokenizer().unwrap();
+        let theirs = tokenizers::Tokenizer::from_file(Path::new(parts[1]).join("tokenizer.json")).unwrap();
+        let text = std::fs::read_to_string(parts[2]).unwrap();
+        let (mut lines, mut tokens) = (0, 0);
+        for line in text.split_inclusive('\n').chain([text.as_str()]) {
+            let a = ours.encode(line, false).unwrap();
+            let b = theirs.encode(line, false).unwrap();
+            assert_eq!(a.get_ids(), b.get_ids(), "{line:?}");
+            assert_eq!(ours.decode(a.get_ids(), false).unwrap(), line);
+            lines += 1;
+            tokens += a.get_ids().len();
+        }
+        eprintln!("{lines} texts, {tokens} tokens: identical");
+    }
+
+    #[test]
+    fn llama_config_and_names() {
+        let mut b = b"GGUF".to_vec();
+        b.extend(3u32.to_le_bytes());
+        b.extend(3u64.to_le_bytes()); // tensors
+        b.extend(6u64.to_le_bytes()); // kv
+        put_str(&mut b, "general.architecture");
+        b.extend(8u32.to_le_bytes());
+        put_str(&mut b, "llama");
+        for (k, v) in [
+            ("block_count", 1u32),
+            ("embedding_length", 64),
+            ("attention.head_count", 4),
+            ("attention.head_count_kv", 2),
+        ] {
+            put_str(&mut b, &format!("llama.{k}"));
+            b.extend(4u32.to_le_bytes());
+            b.extend(v.to_le_bytes());
+        }
+        put_str(&mut b, "llama.rope.freq_base");
+        b.extend(6u32.to_le_bytes());
+        b.extend(500000f32.to_le_bytes());
+        for (name, ne, off) in [
+            ("rope_freqs.weight", vec![8u64], 0u64),
+            ("token_embd.weight", vec![64, 10], 32),
+            ("blk.0.ffn_norm.weight", vec![64], 32 + 640 * 4),
+        ] {
+            put_str(&mut b, name);
+            b.extend((ne.len() as u32).to_le_bytes());
+            for d in ne {
+                b.extend(d.to_le_bytes());
+            }
+            b.extend(0u32.to_le_bytes());
+            b.extend(off.to_le_bytes());
+        }
+        let len = b.len().next_multiple_of(32) + 32 + 640 * 4 + 64 * 4;
+        b.resize(len, 0);
+        let h = parse_header(&b[..], len).unwrap();
+        let c = h.config_json().unwrap();
+        assert_eq!(c["model_type"], "llama");
+        assert_eq!((c["head_dim"].as_u64(), c["num_key_value_heads"].as_u64()), (Some(16), Some(2)));
+        assert_eq!((c["rope_theta"].as_f64(), c["rms_norm_eps"].as_f64()), (Some(500000.0), Some(1e-5)));
+        assert_eq!(c["tie_word_embeddings"], true);
+        let names: Vec<String> = hf_tensors(&h).unwrap().into_iter().map(|t| t.name).collect();
+        assert_eq!(
+            names,
+            [
+                "rope_freqs",
+                "model.embed_tokens.weight",
+                "model.layers.0.post_attention_layernorm.weight"
+            ]
+        );
     }
 
     #[test]

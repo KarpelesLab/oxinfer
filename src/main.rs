@@ -1247,6 +1247,9 @@ fn run_qwen(args: Args) -> Result<()> {
     let fmt: &dyn ChatFormat = if model.cfg.qk_norm {
         chat::QwenChat::for_model(&args.model)
     } else {
+        if !args.raw && !chat::Llama3Chat::matches_model(&args.model) {
+            eprintln!("[warning: the model's chat template is not Llama 3's; prompts use the Llama 3 format anyway]");
+        }
         &chat::Llama3Chat
     };
     let eos = chat::with_turn_end(fmt, &tok, eos);

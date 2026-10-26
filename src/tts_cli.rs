@@ -113,10 +113,14 @@ pub fn run(args: &Args) -> Result<()> {
     let speaker = Speaker::load(&args.model.to_string_lossy(), &lo)?;
     let info = speaker.info();
     eprintln!(
-        "[orpheus: {} layers, hidden {}, {:?}; SNAC {} Hz from {}; device {}, {} threads; loaded in {:.2}s]",
+        "[orpheus: {} layers, hidden {}, {}; SNAC {} Hz from {}; device {}, {} threads; loaded in {:.2}s]",
         info.layers,
         info.hidden_size,
-        info.quant,
+        if oxinfer::gguf::is_gguf(&info.path) {
+            "GGUF".to_string()
+        } else {
+            format!("{:?}", info.quant)
+        },
         info.sample_rate,
         info.snac_path.display(),
         info.device,

@@ -175,8 +175,10 @@ def long_prompts(a, pre, suf):
 
 
 def run_llama(srv, prompt, n):
+    # Token ids, so that llama.cpp does not add a BOS of its own to the template's (Llama 3).
+    ids = http("/tokenize", {"content": prompt, "parse_special": True, "add_special": False})["tokens"]
     d = http("/completion", {
-        "prompt": prompt, "n_predict": n, "temperature": 0, "top_k": 1, "cache_prompt": False,
+        "prompt": ids, "n_predict": n, "temperature": 0, "top_k": 1, "cache_prompt": False,
         "return_tokens": True, "samplers": ["top_k"],
     })  # fmt: skip
     t = d["timings"]

@@ -627,6 +627,15 @@ impl<'a> QwenModel<'a> {
         if let Some(l3) = cfg.llama3_rope() {
             l3.scale(&mut inv_freq);
         }
+        // Llama GGUF: the llama3 scaling as one divisor per frequency.
+        if files.has("rope_freqs") {
+            for (f, d) in inv_freq.iter_mut().zip(ld.getf("rope_freqs", &[rot / 2])?) {
+                *f /= d;
+            }
+        }
+        if cfg.rope_interleaved && rot != cfg.head_dim {
+            bail!("interleaved RoPE needs full rotary dimensions");
+        }
         // Interleaved M-RoPE (transformers' Qwen3.5 rotary): frequency i rotates with the height
         // for i % 3 == 1 and i < 3 * sections[1], with the width for i % 3 == 2 and
         // i < 3 * sections[2], with the time otherwise.
@@ -673,6 +682,10 @@ impl<'a> QwenModel<'a> {
         let qkv_rows = tiled.then(|| tiled_v_rows(2 * key_dim, nk, nv, hdv));
         let v_rows = tiled.then(|| tiled_v_rows(0, nk, nv, hdv));
         let head_rows = tiled.then(|| tiled_v_rows(0, nk, nv, 1));
+        // Llama GGUF: query / key rows in llama.cpp's RoPE order.
+        let paired = cfg.rope_interleaved;
+        let q_rows = paired.then(|| crate::lora::rope_pair_rows(nh, hd));
+        let k_rows = paired.then(|| crate::lora::rope_pair_rows(nkv, hd));
         let mut set =
             |lin: &mut Lin<'a>, name: String, n_out: usize, n_in: usize, rows: Option<&[usize]>, cols: Option<&[usize]>| -> Result<()> {
                 if let Some(d) = ad.take(&name, n_out, n_in, rows, cols)? {
@@ -700,8 +713,8 @@ impl<'a> QwenModel<'a> {
                 }
                 Mixer::Attn(a) => {
                     let p = format!("{lp}self_attn.");
-                    set(&mut a.q, format!("{p}q_proj"), qw, h, None, None)?;
-                    set(&mut a.k, format!("{p}k_proj"), nkv * hd, h, None, None)?;
+                    set(&mut a.q, format!("{p}q_proj"), qw, h, q_rows.as_deref(), None)?;
+                    set(&mut a.k, format!("{p}k_proj"), nkv * hd, h, k_rows.as_deref(), None)?;
                     set(&mut a.v, format!("{p}v_proj"), nkv * hd, h, None, None)?;
                     set(&mut a.o, format!("{p}o_proj"), h, nh * hd, None, None)?;
                 }
@@ -963,6 +976,7 @@ impl<'a> QwenModel<'a> {
         let eps = cfg.rms_norm_eps as f32;
         let half = self.inv_freq.len();
         let gated = cfg.attn_output_gate;
+        let rope = if cfg.rope_interleaved { apply_rope_interleaved } else { apply_rope };
         let qw = if gated { 2 * nh * hd } else { nh * hd };
         let mut qg = vec![0f32; t * qw];
         let mut k = vec![0f32; t * nkv * hd];
@@ -999,7 +1013,7 @@ impl<'a> QwenModel<'a> {
                     Some(w) => rmsnorm_f32w(src, w, eps, qo),
                     None => qo.copy_from_slice(src),
                 }
-                apply_rope(
+                rope(
                     &mut qo[..2 * half],
                     &cos[ti * half..(ti + 1) * half],
                     &sin[ti * half..(ti + 1) * half],
@@ -1027,7 +1041,7 @@ impl<'a> QwenModel<'a> {
                 Some(w) => rmsnorm_f32w(&k[i * hd..(i + 1) * hd], w, eps, ko),
                 None => ko.copy_from_slice(&k[i * hd..(i + 1) * hd]),
             }
-            apply_rope(
+            rope(
                 &mut ko[..2 * half],
                 &cos[ti * half..(ti + 1) * half],
                 &sin[ti * half..(ti + 1) * half],
