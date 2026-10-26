@@ -832,9 +832,57 @@ pub unsafe extern "C" fn oxi_speaker_info_json(s: *mut OxiSpeaker) -> *mut c_cha
             "threads": i.threads,
             "sample_rate": i.sample_rate,
             "load_secs": i.load_secs,
-            "voices": crate::tts::VOICES,
+            "voices": i.voices,
+            "languages": i.languages,
+            "pretrained": i.pretrained,
+            "snac_encoder": i.snac_encoder,
         });
         Ok(out_string(j.to_string()))
+    })
+}
+
+/// Encodes a voice-cloning reference: `n` mono samples in [-1, 1] at `sample_rate` saying
+/// `text`. Returns the reference as JSON (`{"text", "frames"}`), to put in the speak options'
+/// `"references"` array (several references: a steadier voice).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_speaker_encode_reference(
+    s: *mut OxiSpeaker,
+    samples: *const f32,
+    n: usize,
+    sample_rate: c_int,
+    text: *const c_char,
+) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let s = unsafe { speaker(s) }?;
+        let text = unsafe { str_arg(text, "text") }?;
+        if samples.is_null() && n > 0 {
+            bail!("samples is NULL");
+        }
+        if sample_rate <= 0 {
+            bail!("sample_rate must be positive");
+        }
+        let pcm: &[f32] = if n == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(samples, n) }
+        };
+        let g = s.speaker.lock().unwrap_or_else(|p| p.into_inner());
+        let r = g.encode_reference(pcm, sample_rate as u32, text)?;
+        Ok(out_string(serde_json::to_string(&r)?))
+    })
+}
+
+/// `oxi_speaker_encode_reference` of an audio file (WAV, or any format oxideav decodes when
+/// built with `media`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_speaker_encode_reference_file(s: *mut OxiSpeaker, path: *const c_char, text: *const c_char) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let s = unsafe { speaker(s) }?;
+        let path = unsafe { str_arg(path, "path") }?;
+        let text = unsafe { str_arg(text, "text") }?;
+        let g = s.speaker.lock().unwrap_or_else(|p| p.into_inner());
+        let r = g.encode_reference_file(std::path::Path::new(path), text)?;
+        Ok(out_string(serde_json::to_string(&r)?))
     })
 }
 

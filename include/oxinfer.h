@@ -306,8 +306,10 @@ char *oxi_janus_understand_rgb(OxiJanus *j, const char *question, const uint8_t 
 /* ---- Text to speech (Orpheus TTS) --------------------------------------------------------------
  *
  * canopylabs/orpheus-3b-0.1-ft (gated; unsloth/orpheus-3b-0.1-ft is an ungated copy) and other
- * Orpheus checkpoints (Llama 3 with SNAC audio tokens), decoded to 24 kHz mono audio by the SNAC
- * codec (hubertsiuzdak/snac_24khz). A speaker follows the engine's threading rules: one call at a
+ * Orpheus checkpoints (Llama 3 with SNAC audio tokens): the pretrained base
+ * (unsloth/orpheus-3b-0.1-pretrained, for voice cloning) and the multilingual research models
+ * (ungated copies: Our-Org-2/3b-{fr,de,ko,hi,zh,es_it}-ft-research_release), decoded to 24 kHz
+ * mono audio by the SNAC codec (hubertsiuzdak/snac_24khz). A speaker follows the engine's threading rules: one call at a
  * time, oxi_speaker_cancel() from any thread. */
 
 typedef struct OxiSpeaker OxiSpeaker;
@@ -336,8 +338,19 @@ void oxi_speaker_free(OxiSpeaker *s);
 void oxi_speaker_cancel(const OxiSpeaker *s);
 
 /* Model information as JSON: path, snac_path, layers, hidden_size, quant, device, threads,
- * sample_rate, load_secs, voices. */
+ * sample_rate, load_secs, voices (the known voices of the checkpoint's languages), languages
+ * (ISO 639-1 codes from the model card, e.g. ["fr"]), pretrained (a base model: no voices,
+ * clone one with references), snac_encoder (references can be encoded). */
 char *oxi_speaker_info_json(OxiSpeaker *s);
+
+/* Voice cloning: encodes a reference clip, `n` mono samples in [-1, 1] at `sample_rate` Hz
+ * (resampled to 24 kHz), that says `text`. Returns the reference as JSON ({"text", "frames"}),
+ * to put in the speak options' "references" array; NULL on error. Free with oxi_string_free. */
+char *oxi_speaker_encode_reference(OxiSpeaker *s, const float *samples, size_t n, int sample_rate, const char *text);
+
+/* oxi_speaker_encode_reference() of an audio file (WAV; any format oxideav decodes when built
+ * with the `media` feature). */
+char *oxi_speaker_encode_reference_file(OxiSpeaker *s, const char *path, const char *text);
 
 /* Speak options (`options_json`, NULL or "" for the defaults), a JSON object with any of:
  *   "voice": "tara"              tara, leah, jess, leo, dan, mia, zac, zoe (English model); null
@@ -353,6 +366,14 @@ char *oxi_speaker_info_json(OxiSpeaker *s);
  *   "noise": true                SNAC's noise blocks (false: deterministic waveform)
  *   "context_left": 2, "context_right": 2, "chunk_frames": 1   streaming windows, in frames
  *                                (3 / 3: the stream equals a full decode; 1 / 2: the official one)
+ *   "loop_guard": 3              after a frame repeats this many times in a row (how greedy decoding
+ *                                fails with q4 weights), sample the rest at temperature >= 0.6,
+ *                                top-p <= 0.8; 0 = off
+ *   "max_secs_per_byte": 0.25    at most 3 s + this many seconds of audio per byte of text; 0 = off
+ *   "references": [...]          voice cloning: reference utterances placed before the text, each
+ *                                {"text": "what it says", "audio": "ref.wav"} or an object from
+ *                                oxi_speaker_encode_reference(); "voice" is then ignored. Best with
+ *                                a pretrained model (unsloth/orpheus-3b-0.1-pretrained)
  * Emotion tags such as <laugh>, <sigh>, <chuckle>, <cough>, <sniffle>, <groan>, <yawn>, <gasp>
  * go in the text. */
 
@@ -371,7 +392,7 @@ void oxi_audio_free(float *samples, size_t n);
 int oxi_speak_wav(OxiSpeaker *s, const char *text, const char *options_json, const char *path, oxi_audio_fn cb, void *user);
 
 /* Statistics of the last utterance as JSON (null before the first): prompt_tokens, tokens,
- * frames, dropped_tokens, audio_secs, prefill_secs, generate_secs, snac_secs, total_secs,
+ * frames, dropped_tokens, loops (loop-guard catches), audio_secs, prefill_secs, generate_secs, snac_secs, total_secs,
  * first_chunk_secs (streaming), tok_s, rtf (total time / audio duration). */
 char *oxi_speaker_stats_json(OxiSpeaker *s);
 

@@ -13,6 +13,26 @@
 //! - sampling: temperature 0.6, top-p 0.8, repetition penalty 1.1 (over the prompt and the
 //!   reply, as transformers and vLLM apply it), at most 1200 tokens (about 14 s of audio).
 //!
+//! Voice cloning ([`SpeakOptions::references`], best with the pretrained base,
+//! `unsloth/orpheus-3b-0.1-pretrained`) follows canopylabs' pretrained-model notebook: each
+//! reference is a finished turn before the text, start of human, `<|begin_of_text|>transcript`,
+//! end of text / human, start of AI, start of speech, the clip's SNAC codes as audio tokens (the
+//! encoder of [`crate::snac`]), end of speech, end of AI; then the usual turn for the text,
+//! without a voice name. More references give a steadier voice.
+//!
+//! The multilingual research checkpoints (`3b-{fr,de,ko,hi,zh,es_it}-ft-research_release`) use
+//! the same prompt with their own voices ([`voices_for`]); [`SpeakerInfo::languages`] comes from
+//! the model card.
+//!
+//! Greedy decoding (temperature 0) is not the default and can fail with quantized weights: on
+//! rare texts the q4 path falls into a fixed point, one frame repeated forever (a held sound)
+//! with the end of speech at ~1e-8, until `max_tokens` (1 of 72 greedy q4 runs in our tests, none
+//! of 40 bf16 / 72 q8 or of 32 sampled q4 runs). The repetition penalty does not break it (it
+//! is a fixed factor on any seen token). Two guards are on by default:
+//! [`SpeakOptions::loop_guard`] switches to sampling once a frame repeats 3 times (normal
+//! speech never repeats a whole frame), which recovered the sentence in 4 of 5 seeds, and
+//! [`SpeakOptions::max_secs_per_byte`] caps the duration by the text length.
+//!
 //! Streaming ([`Speaker::speak_stream`]) decodes overlapping windows of frames as tokens arrive,
 //! as the official decoder does (it decodes the last 4 frames and keeps the second one: one frame
 //! of left context and two of lookahead); here the first and last frames are emitted too, and
@@ -65,12 +85,32 @@ pub const AUDIO_BASE: u32 = 128266;
 pub const CODES: u32 = 4096;
 /// Tokens per frame.
 pub const FRAME_TOKENS: usize = 7;
+/// Loop guard: loops detected before the utterance ends (see [`SpeakOptions::loop_guard`]).
+const MAX_LOOPS: usize = 8;
 /// Tokens that end the reply.
 pub const STOP_TOKENS: [u32; 3] = [END_OF_SPEECH, END_OF_AI, END_OF_TEXT];
 
 /// The voices of `canopylabs/orpheus-3b-0.1-ft` (English). Other checkpoints (the multilingual
-/// research models) have their own; any name is passed through.
+/// research models) have their own ([`voices_for`]); any name is passed through.
 pub const VOICES: [&str; 8] = ["tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"];
+
+/// The voices of the canopylabs finetuned checkpoints by language (ISO 639-1 code): English
+/// (`orpheus-3b-0.1-ft`) and the multilingual research release (`3b-{fr,de,ko,hi,zh,es_it}-ft-
+/// research_release`, the Spanish and Italian voices sharing one model). Pretrained checkpoints
+/// have no voices.
+pub fn voices_for(language: &str) -> &'static [&'static str] {
+    match language {
+        "en" => &VOICES,
+        "fr" => &["pierre", "amelie", "marie"],
+        "de" => &["jana", "thomas", "max"],
+        "ko" => &["유나", "준서"],
+        "hi" => &["ऋतिका"],
+        "zh" => &["长乐", "白芷"],
+        "es" => &["javi", "sergio", "maria"],
+        "it" => &["pietro", "giulia", "carlo"],
+        _ => &[],
+    }
+}
 
 /// The default SNAC decoder.
 pub const DEFAULT_SNAC: &str = "hubertsiuzdak/snac_24khz";
@@ -143,7 +183,8 @@ impl SpeakerOptions {
 #[serde(default)]
 #[non_exhaustive]
 pub struct SpeakOptions {
-    /// Voice name put before the text (`"tara: ..."`); None or empty: no voice prefix.
+    /// Voice name put before the text (`"tara: ..."`); None or empty: no voice prefix. Ignored
+    /// with [`SpeakOptions::references`] and for pretrained checkpoints ([`SpeakerInfo::pretrained`]).
     pub voice: Option<String>,
     /// 0 = greedy.
     pub temperature: f32,
@@ -171,6 +212,61 @@ pub struct SpeakOptions {
     pub context_right: usize,
     /// Streaming: frames emitted per window (1 = lowest latency; more = fewer, larger windows).
     pub chunk_frames: usize,
+    /// Voice cloning: reference utterances put before the text (see [`VoiceRef`]); `voice` is
+    /// then ignored. JSON: `"references": [{"text": "...", "audio": "ref.wav"}]`.
+    pub references: Vec<VoiceRef>,
+    /// Loop guard: when a frame repeats the one before it this many times in a row (normal speech
+    /// never repeats a whole frame), the rest of the utterance is sampled at temperature
+    /// `max(temperature, 0.6)`, top-p `min(top_p, 0.8)` (a fallback, as Whisper's temperature
+    /// fallback); after 8 loops the utterance ends. This is how greedy decoding fails, at q4 (see
+    /// the module docs). Default 3; 0 = off.
+    pub loop_guard: usize,
+    /// Length cap: at most 3 s plus this many seconds of audio per UTF-8 byte of the text (0 =
+    /// only `max_tokens`). Speech runs at 0.03-0.09 s per byte across the supported languages,
+    /// so the default 0.25 only stops runaways (a short text cannot ramble for 14 s).
+    pub max_secs_per_byte: f32,
+}
+
+/// A reference utterance for voice cloning (zero-shot prompting): a transcript and its audio,
+/// placed before the text as a finished turn (see the module docs). Either `frames` (from
+/// [`Speaker::encode_reference`], reusable across calls) or `audio`, a file encoded at each
+/// call.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+#[non_exhaustive]
+pub struct VoiceRef {
+    /// What the clip says.
+    pub text: String,
+    /// The clip as Orpheus frames (7 codes each, token order).
+    pub frames: Vec<[u32; 7]>,
+    /// An audio file (any format oxideav decodes with the `media` feature; WAV otherwise; raw
+    /// little-endian f32 at the SNAC rate for `.f32`), used when `frames` is empty.
+    pub audio: Option<PathBuf>,
+}
+
+impl VoiceRef {
+    /// A reference from encoded frames.
+    pub fn new(text: impl Into<String>, frames: Vec<[u32; 7]>) -> Self {
+        Self {
+            text: text.into(),
+            frames,
+            audio: None,
+        }
+    }
+
+    /// A reference from an audio file, encoded when speaking.
+    pub fn from_file(text: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        Self {
+            text: text.into(),
+            frames: Vec::new(),
+            audio: Some(path.into()),
+        }
+    }
+
+    /// Seconds of audio (24 kHz SNAC: 2048 samples per frame).
+    pub fn duration_secs(&self) -> f64 {
+        self.frames.len() as f64 * 2048.0 / 24000.0
+    }
 }
 
 impl Default for SpeakOptions {
@@ -188,6 +284,9 @@ impl Default for SpeakOptions {
             context_left: 2,
             context_right: 2,
             chunk_frames: 1,
+            references: Vec::new(),
+            loop_guard: 3,
+            max_secs_per_byte: 0.25,
         }
     }
 }
@@ -271,6 +370,104 @@ pub fn wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     b
 }
 
+/// Reads a WAV file's samples (PCM 8/16/24/32-bit or IEEE float 32/64, channels averaged) and
+/// its sample rate.
+pub fn read_wav(bytes: &[u8]) -> Result<Audio> {
+    if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        bail!("not a WAV file");
+    }
+    let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+    let u32_at = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+    let mut fmt: Option<(u16, usize, u32, usize)> = None;
+    let mut i = 12;
+    while i + 8 <= bytes.len() {
+        let id = &bytes[i..i + 4];
+        let len = u32_at(bytes, i + 4) as usize;
+        let body = &bytes[i + 8..(i + 8 + len).min(bytes.len())];
+        if id == b"fmt " && body.len() >= 16 {
+            let mut tag = u16_at(body, 0);
+            if tag == 0xfffe && body.len() >= 26 {
+                tag = u16_at(body, 24); // WAVE_FORMAT_EXTENSIBLE: the subformat GUID's first bytes
+            }
+            fmt = Some((tag, u16_at(body, 2).max(1) as usize, u32_at(body, 4), u16_at(body, 14) as usize));
+        } else if id == b"data" {
+            let (tag, ch, rate, bits) = fmt.context("WAV data before its fmt chunk")?;
+            let bps = bits / 8;
+            if bps == 0 {
+                bail!("WAV: {bits} bits per sample");
+            }
+            let sample = |s: &[u8]| -> Result<f32> {
+                Ok(match (tag, bits) {
+                    (1, 8) => (s[0] as f32 - 128.0) / 128.0,
+                    (1, 16) => i16::from_le_bytes([s[0], s[1]]) as f32 / 32768.0,
+                    (1, 24) => (i32::from_le_bytes([0, s[0], s[1], s[2]]) >> 8) as f32 / 8_388_608.0,
+                    (1, 32) => i32::from_le_bytes([s[0], s[1], s[2], s[3]]) as f32 / 2_147_483_648.0,
+                    (3, 32) => f32::from_le_bytes([s[0], s[1], s[2], s[3]]),
+                    (3, 64) => f64::from_le_bytes(s[..8].try_into().unwrap()) as f32,
+                    _ => bail!("WAV format {tag} with {bits} bits is not supported"),
+                })
+            };
+            let mut samples = Vec::with_capacity(body.len() / (bps * ch));
+            for f in body.chunks_exact(bps * ch) {
+                let mut acc = 0f32;
+                for c in f.chunks_exact(bps) {
+                    acc += sample(c)?;
+                }
+                samples.push(acc / ch as f32);
+            }
+            return Ok(Audio {
+                samples,
+                sample_rate: rate,
+            });
+        }
+        i += 8 + len + (len & 1);
+    }
+    bail!("WAV file without a data chunk")
+}
+
+/// Mono samples of an audio file at `rate` Hz: raw little-endian f32 at `rate` for `.f32`, WAV,
+/// or (with the `media` feature) any format oxideav decodes.
+pub fn load_audio_file(path: &Path, rate: u32) -> Result<Vec<f32>> {
+    if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("f32")) {
+        let b = crate::fsx::read(path)?;
+        return Ok(b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect());
+    }
+    #[cfg(feature = "media")]
+    {
+        crate::media::Media::new().load_audio(path, rate as usize)
+    }
+    #[cfg(not(feature = "media"))]
+    {
+        let a = read_wav(&crate::fsx::read(path)?).with_context(|| format!("{} (built without `media`: WAV only)", path.display()))?;
+        Ok(crate::audio::resample(&a.samples, a.sample_rate as usize, rate as usize))
+    }
+}
+
+/// Orpheus frames of SNAC codes (the inverse of [`frames_to_codes`]): frame `i` is
+/// `c0[i], c1[2i], c2[4i], c2[4i+1], c1[2i+1], c2[4i+2], c2[4i+3]`.
+pub fn codes_to_frames(codes: &[Vec<u32>]) -> Result<Vec<[u32; 7]>> {
+    let [c0, c1, c2] = codes else {
+        bail!("Orpheus frames take 3 codebooks (SNAC 24 kHz), got {}", codes.len())
+    };
+    let n = c0.len();
+    if c1.len() != 2 * n || c2.len() != 4 * n {
+        bail!("codebook lengths {} / {} / {} are not n / 2n / 4n", n, c1.len(), c2.len());
+    }
+    Ok((0..n)
+        .map(|i| {
+            [
+                c0[i],
+                c1[2 * i],
+                c2[4 * i],
+                c2[4 * i + 1],
+                c1[2 * i + 1],
+                c2[4 * i + 2],
+                c2[4 * i + 3],
+            ]
+        })
+        .collect())
+}
+
 /// A piece of streamed audio.
 #[derive(Clone, Copy, Debug)]
 pub struct AudioChunk<'a> {
@@ -303,6 +500,9 @@ pub struct SpeakStats {
     pub frames: usize,
     /// Generated tokens that were not audio codes in place (unconstrained sampling), dropped.
     pub dropped_tokens: usize,
+    /// Runs of identical frames the loop guard caught ([`SpeakOptions::loop_guard`]); after the
+    /// first, the utterance was sampled with the fallback settings.
+    pub loops: usize,
     pub audio_secs: f64,
     pub prefill_secs: f64,
     /// Language-model time after the prefill.
@@ -350,6 +550,50 @@ pub struct SpeakerInfo {
     pub threads: usize,
     pub sample_rate: u32,
     pub load_secs: f64,
+    /// Languages of the checkpoint (ISO 639-1, from the model card's `language:` list; empty
+    /// when it has none).
+    pub languages: Vec<String>,
+    /// A pretrained (base) checkpoint rather than a finetune with named voices: prompt it with
+    /// plain text, or clone a voice with [`SpeakOptions::references`].
+    pub pretrained: bool,
+    /// The known voices for [`SpeakerInfo::languages`] (none for pretrained checkpoints).
+    pub voices: Vec<String>,
+    /// Whether the SNAC checkpoint has the encoder (voice cloning from audio).
+    pub snac_encoder: bool,
+}
+
+/// The model card's front-matter `language:` list and whether it is a pretrained base (its
+/// title or the directory name says "pretrain").
+fn model_card(dir: &Path) -> (Vec<String>, bool) {
+    let name = dir.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let mut pretrained = name.contains("pretrain");
+    let mut langs = Vec::new();
+    if let Ok(b) = crate::fsx::read(&dir.join("README.md")) {
+        let s = String::from_utf8_lossy(&b);
+        let mut lines = s.lines();
+        if lines.next().map(str::trim) == Some("---") {
+            let mut in_lang = false;
+            for l in lines.by_ref() {
+                if l.trim() == "---" {
+                    break;
+                }
+                if let Some(v) = l.strip_prefix("language:") {
+                    in_lang = v.trim().is_empty();
+                    if !in_lang {
+                        langs.push(v.trim().trim_matches(['"', '\'']).to_string());
+                    }
+                } else if in_lang && let Some(v) = l.trim().strip_prefix("- ") {
+                    langs.push(v.trim().trim_matches(['"', '\'']).to_string());
+                } else if !l.starts_with(' ') && !l.starts_with('-') {
+                    in_lang = false;
+                }
+            }
+        }
+        if let Some(h) = s.lines().find(|l| l.starts_with("# ")) {
+            pretrained |= h.to_lowercase().contains("pretrain");
+        }
+    }
+    (langs, pretrained)
 }
 
 /// The output rows of the audio tokens of each frame position, and of the stop tokens: logits
@@ -487,7 +731,19 @@ impl Speaker {
             },
         )
         .with_context(|| format!("load SNAC from {}", snac_dir.display()))?;
+        let (languages, pretrained) = model_card(dir);
+        let voices: Vec<String> = if pretrained {
+            Vec::new()
+        } else if languages.is_empty() {
+            VOICES.iter().map(|s| s.to_string()).collect()
+        } else {
+            languages.iter().flat_map(|l| voices_for(l)).map(|s| s.to_string()).collect()
+        };
         let info = SpeakerInfo {
+            languages,
+            pretrained,
+            voices,
+            snac_encoder: snac.has_encoder(),
             path: dir.to_path_buf(),
             snac_path: snac_dir.to_path_buf(),
             layers: model.cfg.num_hidden_layers,
@@ -526,15 +782,75 @@ impl Speaker {
 
     /// The prompt token ids for `text` in `voice` (see the module docs).
     pub fn prompt_tokens(&self, text: &str, voice: Option<&str>) -> Result<Vec<u32>> {
-        let t = match voice.map(str::trim).filter(|v| !v.is_empty()) {
+        self.prompt_tokens_with(text, voice, &[])
+    }
+
+    /// The prompt token ids for `text` after the reference utterances `refs` (voice cloning; their
+    /// `frames` must be set, see [`Speaker::resolve_references`]); `voice` is ignored when there
+    /// are references.
+    pub fn prompt_tokens_with(&self, text: &str, voice: Option<&str>, refs: &[VoiceRef]) -> Result<Vec<u32>> {
+        let mut ids = Vec::new();
+        let turn = |ids: &mut Vec<u32>, t: &str| -> Result<()> {
+            let enc = self.tok.encode(t, false).map_err(|e| anyhow!("tokenize: {e}"))?;
+            ids.extend_from_slice(&[START_OF_HUMAN, BOS]);
+            ids.extend_from_slice(enc.get_ids());
+            ids.extend_from_slice(&[END_OF_TEXT, END_OF_HUMAN, START_OF_AI, START_OF_SPEECH]);
+            Ok(())
+        };
+        for r in refs {
+            if r.frames.is_empty() {
+                bail!("reference {:?} has no audio frames (encode it first)", r.text);
+            }
+            if let Some(&bad) = r.frames.iter().flatten().find(|&&c| c >= CODES) {
+                bail!("reference {:?}: code {bad} is out of range (0..{CODES})", r.text);
+            }
+            turn(&mut ids, r.text.trim())?;
+            for f in &r.frames {
+                ids.extend(f.iter().enumerate().map(|(p, &c)| AUDIO_BASE + p as u32 * CODES + c));
+            }
+            ids.extend_from_slice(&[END_OF_SPEECH, END_OF_AI]);
+        }
+        let t = match voice.map(str::trim).filter(|v| !v.is_empty() && refs.is_empty()) {
             Some(v) => format!("{v}: {text}"),
             None => text.to_string(),
         };
-        let enc = self.tok.encode(t.as_str(), false).map_err(|e| anyhow!("tokenize: {e}"))?;
-        let mut ids = vec![START_OF_HUMAN, BOS];
-        ids.extend_from_slice(enc.get_ids());
-        ids.extend_from_slice(&[END_OF_TEXT, END_OF_HUMAN, START_OF_AI, START_OF_SPEECH]);
+        turn(&mut ids, &t)?;
         Ok(ids)
+    }
+
+    /// Encodes a reference clip for voice cloning: `samples` (mono, in [-1, 1]) at `sample_rate`
+    /// (resampled to the SNAC rate), what it says in `text`.
+    pub fn encode_reference(&self, samples: &[f32], sample_rate: u32, text: &str) -> Result<VoiceRef> {
+        let rate = self.snac.sample_rate();
+        let pcm = crate::audio::resample(samples, sample_rate as usize, rate as usize);
+        let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+        let codes = self.snac.encode(&pcm)?;
+        Ok(VoiceRef::new(text, codes_to_frames(&codes)?))
+    }
+
+    /// [`Speaker::encode_reference`] of an audio file (see [`load_audio_file`]).
+    pub fn encode_reference_file(&self, path: &Path, text: &str) -> Result<VoiceRef> {
+        let rate = self.snac.sample_rate();
+        let pcm = load_audio_file(path, rate).with_context(|| format!("reference audio {}", path.display()))?;
+        self.encode_reference(&pcm, rate, text)
+    }
+
+    /// [`Speaker::encode_reference`] of decoded audio.
+    #[cfg(feature = "oxideav")]
+    pub fn encode_reference_clip(&self, clip: &crate::av::AudioClip, text: &str) -> Result<VoiceRef> {
+        let rate = self.snac.sample_rate();
+        self.encode_reference(&clip.to_mono(rate as usize)?, rate, text)
+    }
+
+    /// `refs` with every file-only reference ([`VoiceRef::audio`]) encoded.
+    pub fn resolve_references(&self, refs: &[VoiceRef]) -> Result<Vec<VoiceRef>> {
+        refs.iter()
+            .map(|r| match (&r.audio, r.frames.is_empty()) {
+                (Some(p), true) => self.encode_reference_file(p, &r.text),
+                (None, true) => bail!("reference {:?} has neither frames nor an audio file", r.text),
+                _ => Ok(r.clone()),
+            })
+            .collect()
     }
 
     /// Speaks `text`: the whole utterance, decoded once at the end.
@@ -565,8 +881,10 @@ impl Speaker {
     fn run(&self, text: &str, opts: &SpeakOptions, mut on_chunk: Option<&mut dyn FnMut(&AudioChunk) -> Flow>) -> Result<Speech> {
         let t0 = Instant::now();
         self.cancel.store(false, Ordering::SeqCst);
+        let refs = self.resolve_references(&opts.references)?;
         let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
-        let ids = self.prompt_tokens(text, opts.voice.as_deref())?;
+        let voice = opts.voice.as_deref().filter(|_| !self.info.pretrained);
+        let ids = self.prompt_tokens_with(text, voice, &refs)?;
         let mut st = SpeakStats {
             prompt_tokens: ids.len(),
             ..Default::default()
@@ -578,6 +896,20 @@ impl Speaker {
         let head = if opts.constrained { self.head.as_ref() } else { None };
 
         let mut sampler = Sampler::new(opts.temperature, opts.top_k, opts.top_p, opts.seed);
+        // Loop guard: the fallback sampler once a loop of identical frames was seen.
+        let mut fallback_sampler = Sampler::new(
+            opts.temperature.max(0.6),
+            opts.top_k,
+            if opts.top_p > 0.0 { opts.top_p.min(0.8) } else { 0.8 },
+            opts.seed ^ 0x6c6f_6f70,
+        );
+        let (mut fallback, mut same) = (false, 0usize);
+        let max_frames = if opts.max_secs_per_byte > 0.0 {
+            let secs = 3.0 + text.len() as f64 * opts.max_secs_per_byte as f64;
+            (secs * rate as f64 / self.snac.samples_per_frame() as f64).ceil() as usize
+        } else {
+            usize::MAX
+        };
         let penalty = opts.repetition_penalty;
         let mut seen = vec![0u64; vocab.div_ceil(64)];
         let mark = |seen: &mut Vec<u64>, t: u32| {
@@ -643,7 +975,11 @@ impl Speaker {
             if logits.iter().any(|v| v.is_nan()) {
                 bail!("the model produced NaN logits");
             }
-            let k = sampler.sample(&logits) as usize;
+            let k = if fallback {
+                fallback_sampler.sample(&logits)
+            } else {
+                sampler.sample(&logits)
+            } as usize;
             let id = ids_of.as_ref().map_or(k as u32, |m| m[k]);
             logits.clear();
             tokens.push(id);
@@ -657,8 +993,18 @@ impl Speaker {
                 cur[fill] = id - pos_base;
                 fill += 1;
                 if fill == FRAME_TOKENS {
+                    same = if frames.last() == Some(&cur) { same + 1 } else { 0 };
                     frames.push(cur);
                     fill = 0;
+                    let mut ended = frames.len() >= max_frames;
+                    if opts.loop_guard > 0 && same >= opts.loop_guard {
+                        if st.loops >= MAX_LOOPS {
+                            ended = true;
+                        } else {
+                            st.loops += 1;
+                            (fallback, same) = (true, 0);
+                        }
+                    }
                     let flow = match on_chunk.as_deref_mut() {
                         Some(cb) => {
                             let ts = Instant::now();
@@ -670,6 +1016,10 @@ impl Speaker {
                     };
                     if flow == Flow::Stop {
                         finish = StopReason::Cancelled;
+                        break;
+                    }
+                    if ended {
+                        // Length cap or a loop that did not end: like max_tokens.
                         break;
                     }
                 }
@@ -828,6 +1178,68 @@ mod tests {
         assert_eq!(c[0], vec![1]);
         assert_eq!(c[1], vec![2, 5]);
         assert_eq!(c[2], vec![3, 4, 6, 7]);
+    }
+
+    #[test]
+    fn codes_frames_roundtrip() {
+        let frames = vec![[1, 2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13, 14]];
+        let c = frames_to_codes(&frames);
+        assert_eq!(codes_to_frames(&c).unwrap(), frames);
+        assert!(codes_to_frames(&c[..2]).is_err());
+        assert!(codes_to_frames(&[vec![1], vec![2], vec![3, 4, 5, 6]]).is_err());
+    }
+
+    #[test]
+    fn wav_roundtrip() {
+        let s = vec![0.0, 0.5, -0.5, 1.0, -1.0];
+        let a = read_wav(&wav_bytes(&s, 16000)).unwrap();
+        assert_eq!(a.sample_rate, 16000);
+        for (x, y) in a.samples.iter().zip(&s) {
+            assert!((x - y).abs() < 1e-4, "{x} vs {y}");
+        }
+        // Stereo float: channels averaged.
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF\0\0\0\0WAVEfmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        for v in [3u16, 2] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&8000u32.to_le_bytes());
+        b.extend_from_slice(&64000u32.to_le_bytes());
+        b.extend_from_slice(&8u16.to_le_bytes());
+        b.extend_from_slice(&32u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&8u32.to_le_bytes());
+        b.extend_from_slice(&0.25f32.to_le_bytes());
+        b.extend_from_slice(&0.75f32.to_le_bytes());
+        let a = read_wav(&b).unwrap();
+        assert_eq!((a.samples, a.sample_rate), (vec![0.5], 8000));
+        assert!(read_wav(b"nope").is_err());
+    }
+
+    #[test]
+    fn model_card_languages() {
+        let d = std::env::temp_dir().join(format!("oxinfer-tts-card-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("README.md"),
+            "---\nlibrary_name: transformers\nlanguage:\n- es\n- it\npipeline_tag: text-to-speech\n---\n\n# Orpheus 3B Es & It Finetuned\n",
+        )
+        .unwrap();
+        assert_eq!(model_card(&d), (vec!["es".to_string(), "it".to_string()], false));
+        std::fs::write(d.join("README.md"), "---\nlanguage: en\n---\n# Orpheus 3B 0.1 Pretrained\n").unwrap();
+        assert_eq!(model_card(&d), (vec!["en".to_string()], true));
+        std::fs::remove_dir_all(&d).unwrap();
+        assert_eq!(voices_for("de"), ["jana", "thomas", "max"]);
+    }
+
+    #[test]
+    fn references_json() {
+        let o =
+            SpeakOptions::from_json(r#"{"references": [{"text": "hi", "audio": "a.wav"}, {"text": "yo", "frames": [[1,2,3,4,5,6,7]]}]}"#)
+                .unwrap();
+        assert_eq!(o.references[0], VoiceRef::from_file("hi", "a.wav"));
+        assert_eq!(o.references[1], VoiceRef::new("yo", vec![[1, 2, 3, 4, 5, 6, 7]]));
     }
 
     #[test]

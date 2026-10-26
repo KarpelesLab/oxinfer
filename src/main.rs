@@ -120,6 +120,10 @@ struct Args {
     unconstrained: bool,
     decode_tokens: Option<PathBuf>,
     dump_pcm: Option<PathBuf>,
+    ref_audio: Vec<PathBuf>,
+    ref_text: Vec<String>,
+    snac_encode: Option<PathBuf>,
+    decode_codes: Option<PathBuf>,
     repetition_penalty: Option<f32>,
     // Set explicitly (text to speech has its own defaults).
     temperature_set: Option<f32>,
@@ -272,7 +276,12 @@ fn usage() -> ! {
          \x20 --speak-json JSON    all speak options as a JSON object (see oxinfer::tts::SpeakOptions)\n\
          \x20 --no-noise           no SNAC noise; --unconstrained samples from the whole vocabulary\n\
          \x20 --decode-tokens FILE decode audio token ids (JSON array) to -o FILE (--model may be a SNAC dir)\n\
-         \x20 --dump-pcm FILE      also write the samples as raw f32"
+         \x20 --dump-pcm FILE      also write the samples as raw f32\n\
+         \x20 --ref-audio FILE     voice cloning: a reference clip (WAV/MP3/FLAC/..., raw .f32 at 24 kHz),\n\
+         \x20 --ref-text TEXT      with its transcript; repeatable (more pairs: a steadier voice). Best\n\
+         \x20                      with the pretrained model (unsloth/orpheus-3b-0.1-pretrained)\n\
+         \x20 --snac-encode FILE   (--model a SNAC dir) audio to codes, a JSON array per codebook (-o FILE)\n\
+         \x20 --decode-codes FILE  (--model a SNAC dir) such codes back to a WAV (-o FILE)"
     );
     std::process::exit(2)
 }
@@ -375,6 +384,10 @@ fn parse_args() -> Result<Args> {
         unconstrained: false,
         decode_tokens: None,
         dump_pcm: None,
+        ref_audio: Vec::new(),
+        ref_text: Vec::new(),
+        snac_encode: None,
+        decode_codes: None,
         repetition_penalty: None,
         temperature_set: None,
         top_p_set: None,
@@ -542,6 +555,10 @@ fn parse_args() -> Result<Args> {
             "--unconstrained" => a.unconstrained = true,
             "--decode-tokens" => a.decode_tokens = Some(PathBuf::from(val()?)),
             "--dump-pcm" => a.dump_pcm = Some(PathBuf::from(val()?)),
+            "--ref-audio" => a.ref_audio.push(PathBuf::from(val()?)),
+            "--ref-text" => a.ref_text.push(val()?),
+            "--snac-encode" => a.snac_encode = Some(PathBuf::from(val()?)),
+            "--decode-codes" => a.decode_codes = Some(PathBuf::from(val()?)),
             "--repetition-penalty" | "--repeat-penalty" => a.repetition_penalty = Some(val()?.parse()?),
             "-h" | "--help" => usage(),
             _ => {
@@ -883,7 +900,7 @@ fn run(mut args: Args) -> Result<()> {
     if args.embed || oxinfer::embed::is_embedding_model(&args.model) {
         return run_embed(&args);
     }
-    if args.speak.is_some() || args.decode_tokens.is_some() {
+    if args.speak.is_some() || args.decode_tokens.is_some() || args.snac_encode.is_some() || args.decode_codes.is_some() {
         return tts_cli::run(&args);
     }
     let model_type = config::model_type(&args.model)?;

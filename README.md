@@ -74,6 +74,9 @@ optional.
 | canopylabs/orpheus-3b-0.1-ft (ungated copy: unsloth/orpheus-3b-0.1-ft) + hubertsiuzdak/snac_24khz | 3.3B + 20M | 6.6 GB + 80 MB (fp32) | text to speech; greedy tokens and waveform match transformers + snac (see [Text to speech](#text-to-speech-orpheus)); also any Llama 3.x as a text model |
 | Orpheus GGUF (isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF, lex-au/Orpheus-3b-FT-Q8_0.gguf) | 3.3B | 2.4 / 4.0 GB | text to speech; whisper-small WER 0-1% like the safetensors model |
 | Llama 3.x GGUF (bartowski/Llama-3.2-1B-Instruct-GGUF, ...) | 1.2B tested | 0.8 GB (Q4_K_M) - 2.5 GB (F16) | text; F16 file bit-identical to the safetensors model, quantized files match llama.cpp (see [Llama 3 GGUF](#llama-3-gguf)) |
+| canopylabs/orpheus-3b-0.1-pretrained (ungated copy: unsloth/orpheus-3b-0.1-pretrained) | 3.3B | 6.6 GB | voice cloning from a reference clip (SNAC encoder); prompt and greedy tokens match the canopylabs notebook + transformers |
+| canopylabs/3b-{fr,de,ko,hi,zh,es_it}-ft-research_release (ungated copies: Our-Org-2/...) | 3.3B | 13 GB (fp32) | multilingual text to speech (French and German tested; French greedy tokens match transformers) |
+| hubertsiuzdak/snac_24khz, snac_32khz, snac_44khz | 20M / 55M / 55M | 80 / 220 / 220 MB | the SNAC codec alone, encode and decode (32 / 44 kHz with local attention); codes identical to the `snac` package |
 
 ### Qwen3.5 / Qwen3.8
 
@@ -797,6 +800,13 @@ audio as extra vocabulary tokens: 7 tokens per frame, codes of the three codeboo
 ./target/release/oxinfer --model unsloth/orpheus-3b-0.1-ft --speak "Hey there, I'm Leo. <chuckle> Nice to meet you." --voice leo -o hi.wav
 ./target/release/oxinfer --model unsloth/orpheus-3b-0.1-ft --speak - --quant q4 --speak-stream < text.txt   # faster than real time
 ./target/release/oxinfer --model hubertsiuzdak/snac_24khz --decode-tokens tokens.json -o out.wav          # SNAC alone
+# voice cloning: the pretrained model, a reference clip and what it says (repeatable)
+./target/release/oxinfer --model unsloth/orpheus-3b-0.1-pretrained --ref-audio me.wav --ref-text "What I say in the clip." --speak "Something new." -o clone.wav
+# other languages
+./target/release/oxinfer --model Our-Org-2/3b-fr-ft-research_release --speak "Bonjour, comment allez-vous ?" --voice pierre -o fr.wav
+# the codec alone, any SNAC model: audio -> codes (JSON array per codebook) -> audio
+./target/release/oxinfer --model hubertsiuzdak/snac_44khz --snac-encode music.wav -o codes.json
+./target/release/oxinfer --model hubertsiuzdak/snac_44khz --decode-codes codes.json -o back.wav
 ```
 
 Voices of the English model: tara (default), leah, jess, leo, dan, mia, zac, zoe; emotion tags
@@ -827,6 +837,84 @@ let speech = speaker.speak_stream("A longer sentence...", &opts, &mut |chunk| {
 })?;
 println!("RTF {:.2}", speech.stats.rtf());
 ```
+
+### Voice cloning
+
+The pretrained base (`canopylabs/orpheus-3b-0.1-pretrained`, ungated copy
+`unsloth/orpheus-3b-0.1-pretrained`) has no named voices; it continues in the voice of
+reference utterances given in the prompt. The prompt is the one of canopylabs' notebook for
+that model: per reference a finished turn (start of human, `<|begin_of_text|>transcript`, end
+of text / human, start of AI, start of speech, the clip's SNAC codes as audio tokens, end of
+speech, end of AI), then the turn for the new text (no voice name). The clip is resampled to
+24 kHz and encoded by the SNAC encoder (also in Rust, see below). The model card notes that it
+was not trained for cloning, so more reference pairs give a steadier voice; 5-10 s of clean
+speech per reference works. Finetuned checkpoints accept references too, but follow them less.
+
+```rust
+use oxinfer::tts::{Speaker, SpeakerOptions, SpeakOptions, VoiceRef};
+let speaker = Speaker::load("unsloth/orpheus-3b-0.1-pretrained", &SpeakerOptions::default())?;
+let mut opts = SpeakOptions::default();
+// Encoded once, reusable (serializable): from samples at any rate, a file, or an av::AudioClip.
+opts.references.push(speaker.encode_reference(&samples, 16000, "What the clip says.")?);
+opts.references.push(speaker.encode_reference_file("other.wav".as_ref(), "Its transcript.")?);
+// or encoded at each call: VoiceRef::from_file("What it says.", "ref.wav")
+let audio = speaker.speak("Something new.", &opts)?;
+```
+
+In JSON (C API, `--speak-json`): `"references": [{"text": "...", "audio": "ref.wav"}]`, or the
+objects `oxi_speaker_encode_reference()` / `oxi_speaker_encode_reference_file()` return.
+
+**Agreement** (one 6.5 s reference, a second sentence): the SNAC codes of the clip are identical
+to the `snac` package's, and the prompt (586 tokens) identical to the notebook's; greedy
+generation from it matches transformers float32 for 120 of 120 tokens.
+
+**Intelligibility and voice**: two references (a male and a female voice, 6.5 s each, made by
+the finetuned model's leo and tara), the four sentences of the WER test below, sampled with the
+default settings: WER 5.7% for both (3 errors in 53 words each: "riverbank", "rainforest", as for
+the finetuned voices). The median pitch follows the reference: 144-167 Hz for the leo clip
+(151 Hz), 183-197 Hz for the tara clip (180 Hz), against 93-132 Hz for the pretrained model
+without a reference.
+
+### Other languages
+
+The multilingual research release (`canopylabs/3b-{fr,de,ko,hi,zh,es_it}-ft-research_release`,
+gated; ungated copies `Our-Org-2/3b-*-ft-research_release`, fp32 safetensors read as bf16) uses the
+same prompt format with its own voices: French pierre, amelie, marie; German jana, thomas, max;
+Korean 유나, 준서; Hindi ऋतिका; Mandarin 长乐, 白芷; Spanish javi, sergio, maria; Italian pietro,
+giulia, carlo (`oxinfer::tts::voices_for`). `Speaker::info()` reports the languages (from the
+model card), the known voices and whether the checkpoint is a pretrained base. Greedy French
+tokens match transformers float32 (150 of 150).
+
+WER of four sentences per voice (default sampling), transcribed with `--language`:
+
+| Model | Voices | whisper-small | whisper-large-v3-turbo |
+|---|---|---|---|
+| French (`3b-fr-ft`) | pierre, amelie | 8% (24 utterances, 3 seeds) | 0% (8, seed 42) |
+| French | marie | 58% (12, 3 seeds) | 81% (4) |
+| German (`3b-de-ft`) | jana, thomas, max | 16% (12) | 1.7% (12) |
+
+The voice "marie" of the French research model mostly produces wrong words (the same with
+transformers' greedy tokens, so it is the checkpoint); the others are intelligible, and most of
+whisper-small's errors are its own (whisper-large-v3-turbo hears them correctly).
+
+### The SNAC codec
+
+`oxinfer::snac::Snac` loads any SNAC checkpoint: `encode(&samples)` (the reference's `encode`,
+input zero-padded to a multiple of the hop times `lcm(vq_strides[0], attn_window_size)`) and
+`decode(&codes)`. The 32 and 44 kHz models (four codebooks at 8 / 4 / 2 / 1 times the frame
+rate, music and general audio, not used by any Orpheus model) add local windowed attention after
+the encoder and before the decoder: LayerNorm, 64-dim heads attending within windows of 32 steps
+with rotary positions restarting in every window. Against `snac` 1.2.1 (float32, noise off), on a
+4.9 s clip (resampled for 32 / 44 kHz) and 64 frames of random codes:
+
+| Model | Encoder codes | Decode of the clip's codes | Decode of random codes | bf16 weights |
+|---|---|---|---|---|
+| snac_24khz | identical (57 / 114 / 228) | 1.6e-7 (127 dB) | 2.2e-6 (118 dB) | 58 / 46 dB |
+| snac_32khz | identical (52 / 104 / 208 / 416) | 2.2e-7 (126 dB) | 5.6e-6 (118 dB) | 65 / 52 dB |
+| snac_44khz | identical (72 / 144 / 288 / 576) | 3.3e-7 (126 dB) | 2.3e-6 (121 dB) | 64 / 54 dB |
+
+(max abs difference and SNR.) Encoding 5 s takes 0.08-0.15 s. The reference requires lengths that
+are a multiple of the attention window; here a shorter last window attends within itself.
 
 With the `oxideav` feature, `Audio::to_frame()` / `AudioChunk::to_frame()` give an F32 mono
 `oxideav_core::AudioFrame` with its `CodecParameters` (pts in samples), and `Audio::to_clip()` an
@@ -888,6 +976,26 @@ sides (it is random in the reference):
 q8 and q4 weights change the greedy path within a few tokens (greedy decoding of audio codes is
 not a stable regime anyway); their speech is as intelligible as bf16 by the measure below.
 
+**Greedy decoding and quantized weights.** Greedy (`--temp 0`, not the default) usually ends
+normally at every precision: 183 of 184 greedy runs (20 texts, 2-8 voices, bf16 / q8 / q4) did.
+The failure is a fixed point: on "The weather today is sunny with a light breeze from the
+west." in tara's voice the q4 path says "The weather today", then repeats one frame (all 7
+codes) forever, a held sound, with end of speech at probability ~1e-8, until `max_tokens`
+(171 frames). The repetition penalty cannot break it (it divides any seen token's logit by 1.1,
+however often it was seen); it is not a slow drift of the end-of-speech probability, which stays
+far from the top as long as speech goes on and wins in one step when the text is done. Normal
+speech never repeats a whole frame (0 repeats in all other runs, sampled q4 included), so two
+guards are on by default:
+
+- `loop_guard` (3): when a frame repeats the one before it 3 times in a row, the rest of the
+  utterance is sampled at temperature >= 0.6, top-p <= 0.8 (a fallback, like Whisper's); after 8
+  loops it ends. On the failing case, 4 of 5 fallback seeds then speak the whole sentence and
+  stop (single-frame escapes rarely recovered: 2 of 5);
+- `max_secs_per_byte` (0.25): at most 3 s plus 0.25 s per UTF-8 byte of text, about 3x the
+  slowest speech in any of the supported languages, so a short text cannot run for 14 s.
+
+Sampling (the default) never looped in these tests.
+
 **Intelligibility**: four sentences in four voices each, sampled with the default settings,
 transcribed by oxinfer's whisper-small and scored with jiwer (lower case, punctuation removed):
 bf16 (tara, leah, leo, zac) WER 4.7%, q4 streamed (tara, jess, dan, mia) WER 4.7% (10 errors in
@@ -913,10 +1021,25 @@ output layer is cut to the audio rows), so the GPU only speeds up the prompt; q4
 that keeps up with playback here. SNAC costs about 3 ms per frame decoded once (f32 weights;
 streaming decodes each frame in 5 windows, ~14 ms per 85 ms frame).
 
-Not supported: voice cloning / the pretrained (non-fine-tuned) model's zero-shot prompting with
-reference audio, batched utterances, the 44 / 32 kHz SNAC models (local attention), and
-speculative decoding for Orpheus. The multilingual research checkpoints use the same
-prompt format and should load, but were not tested.
+**Speculative decoding** was measured and not added: no draft gives a speed-up. Acceptance per
+generated token over 2976 tokens (8 utterances; "greedy" = the draft matches the greedy token,
+"sampled" = the expected accepted mass `sum min(p, q)` at temperature 0.6, top-p 0.8):
+
+| Draft | Greedy | Sampled | Tokens per verify pass (2 drafted) |
+|---|---|---|---|
+| n-gram prompt lookup (n = 1-4) | 0-0.1% | 0-0.1% | 1.00 |
+| the previous frame's token at the same position | 0% | 1.4% | 1.01 |
+| edwindn/orpheus-1b-0.1-weightDecay-chkpt78201 (Llama 3.2 1B, same tokens) | 20% | 31% | 1.24 / 1.41 |
+| edwindn/orpheus-1b-0.1-finetuned-v3 | 20% | 31% | 1.24 / 1.41 |
+| Gapeleon/Orpheus-1B-pt | 26% | 38% | 1.33 / 1.52 |
+
+Audio codes do not repeat, so lookup drafts find nothing, and the community 1B models (canopylabs
+never released its smaller sizes) cost about 0.35 of the 3B per token: at best 1.5 tokens per
+pass for 1.7-2x the work of one target token, a slowdown. Medusa-style heads do not exist for
+Orpheus.
+
+Not supported: batched utterances. Korean, Hindi, Mandarin and the
+Spanish / Italian model use the same code but were not tested.
 
 ## Getting weights
 

@@ -1,16 +1,26 @@
-//! SNAC (Multi-Scale Neural Audio Codec, `hubertsiuzdak/snac_24khz`) decoder: codes of three
-//! codebooks at different rates (12, 23 and 47 Hz for the 24 kHz model) back to a waveform. This
-//! is what Orpheus TTS writes its audio tokens as (see [`crate::tts`]).
+//! SNAC (Multi-Scale Neural Audio Codec, `hubertsiuzdak/snac_24khz`, `snac_32khz`, `snac_44khz`):
+//! a waveform to codes of three or four codebooks at different rates (12, 23 and 47 Hz for the
+//! 24 kHz model) and back. Orpheus TTS writes its audio tokens as 24 kHz codes (see
+//! [`crate::tts`]) and reads reference clips (voice cloning) through the encoder.
 //!
-//! The network, as the `snac` Python package builds it (weight-normalized convolutions, folded
+//! The decoder, as the `snac` Python package builds it (weight-normalized convolutions, folded
 //! at load time):
 //! - each codebook's entries are projected to the latent (`out_proj`, a 1x1 conv; precomputed
-//!   per entry here) and repeated to the finest rate (`vq_strides`), the three summed;
+//!   per entry here) and repeated to the finest rate (`vq_strides`), the codebooks summed;
 //! - a depthwise k7 conv and a 1x1 conv to `decoder_dim` channels;
+//! - the 32 / 44 kHz models only: local windowed attention ([`LocalAttention`]);
 //! - per decoder rate: Snake, a transposed conv (kernel 2 * stride) halving the channels, a
 //!   noise block (`x + randn(t) * W x`) and three residual units (Snake, depthwise k7 conv with
 //!   dilation 1 / 3 / 9, Snake, 1x1 conv);
 //! - Snake, a k7 conv to one channel, tanh.
+//!
+//! The encoder ([`Snac::encode`]) mirrors it: a k7 conv from one channel to `encoder_dim`, per
+//! encoder rate three residual units and a strided conv (kernel 2 * stride) doubling the
+//! channels, local attention (32 / 44 kHz), a depthwise k7 conv; then residual vector
+//! quantization: per codebook an average pool by its stride, a 1x1 projection to the 8-dim code
+//! space, the nearest L2-normalized codebook entry (cosine), and the residual minus that entry's
+//! `out_proj`. The input is right-padded with zeros to a multiple of the hop times
+//! `lcm(vq_strides[0], attn_window_size)`, as the reference's `preprocess` does.
 //!
 //! Activations are `[time, channels]` row-major, so 1x1 convs and transposed convs are matmuls
 //! through the shared driver (`model::linear`: SIMD kernels, GPU prefill backend for bf16).
@@ -69,8 +79,8 @@ pub struct SnacConfig {
 impl SnacConfig {
     pub fn load(dir: &Path) -> Result<Self> {
         let cfg: SnacConfig = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?).context("parse SNAC config")?;
-        if cfg.attn_window_size.is_some() {
-            bail!("SNAC models with local attention (attn_window_size) are not supported (the 24 kHz model has none)");
+        if cfg.attn_window_size == Some(0) {
+            bail!("SNAC config with attn_window_size 0");
         }
         if !cfg.depthwise {
             bail!("SNAC models without depthwise convolutions are not supported");
@@ -82,6 +92,23 @@ impl SnacConfig {
     }
     pub fn latent_dim(&self) -> usize {
         self.latent_dim.unwrap_or(self.encoder_dim << self.encoder_rates.len())
+    }
+    /// Input samples per latent step (the product of the encoder rates: 512 at 24 kHz).
+    pub fn hop(&self) -> usize {
+        self.encoder_rates.iter().product()
+    }
+    /// What [`Snac::encode`] pads its input to a multiple of: the hop times
+    /// `lcm(vq_strides[0], attn_window_size)`.
+    pub fn pad_multiple(&self) -> usize {
+        let a = self.vq_strides[0];
+        let b = self.attn_window_size.unwrap_or(1);
+        let gcd = |mut x: usize, mut y: usize| {
+            while y != 0 {
+                (x, y) = (y, x % y);
+            }
+            x
+        };
+        self.hop() * (a / gcd(a, b) * b)
     }
 }
 
@@ -328,19 +355,322 @@ fn gaussian(seed: u64, layer: u64, step: u64) -> f32 {
     ((-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()) as f32
 }
 
-/// A loaded SNAC decoder.
+/// Local multi-head self-attention (`snac.attention.LocalMHA`), residual: LayerNorm, attention
+/// within non-overlapping windows of `window` steps (64-dim heads, rotary positions restarting at
+/// 0 in every window, no mask), output projection, plus the input. The reference needs the length
+/// to be a multiple of the window; here a shorter last window attends within itself.
+struct LocalAttention {
+    norm_w: Vec<f32>,
+    norm_b: Vec<f32>,
+    qkv: Mat,
+    out: Mat,
+    /// Rotary inverse frequencies (`rel_pos.inv_freq`, half the head size).
+    inv_freq: Vec<f32>,
+    window: usize,
+    c: usize,
+}
+
+const HEAD_DIM: usize = 64;
+
+impl LocalAttention {
+    fn load(files: &ModelFiles, p: &str, c: usize, window: usize, f32w: bool) -> Result<Self> {
+        let get = |n: &str, len: usize| -> Result<Vec<f32>> {
+            let v = files.f32(&format!("{p}.{n}"))?;
+            if v.len() != len {
+                bail!("{p}.{n}: {} values, expected {len}", v.len());
+            }
+            Ok(v)
+        };
+        if !c.is_multiple_of(HEAD_DIM) {
+            bail!("{p}: {c} channels are not a multiple of the {HEAD_DIM}-dim heads");
+        }
+        let inv_freq = if files.has(&format!("{p}.rel_pos.inv_freq")) {
+            get("rel_pos.inv_freq", HEAD_DIM / 2)?
+        } else {
+            (0..HEAD_DIM / 2)
+                .map(|i| 1.0 / 10000f32.powf((2 * i) as f32 / HEAD_DIM as f32))
+                .collect()
+        };
+        Ok(Self {
+            norm_w: get("norm.weight", c)?,
+            norm_b: get("norm.bias", c)?,
+            qkv: Mat::new(&get("to_qkv.weight", 3 * c * c)?, 3 * c, c, None, f32w)?,
+            out: Mat::new(&get("to_out.weight", c * c)?, c, c, None, f32w)?,
+            inv_freq,
+            window,
+            c,
+        })
+    }
+
+    /// `x` `[t, c]` in place.
+    fn forward(&self, x: &mut [f32], t: usize) {
+        let c = self.c;
+        let mut h = x.to_vec();
+        for_rows(&mut h, c, |_, r| {
+            let mean = r.iter().map(|&v| v as f64).sum::<f64>() / c as f64;
+            let var = r.iter().map(|&v| (v as f64 - mean) * (v as f64 - mean)).sum::<f64>() / c as f64;
+            let inv = 1.0 / (var + 1e-5).sqrt();
+            for ((v, &w), &b) in r.iter_mut().zip(&self.norm_w).zip(&self.norm_b) {
+                *v = ((*v as f64 - mean) * inv) as f32 * w + b;
+            }
+        });
+        let mut qkv = self.qkv.forward(&h, t); // [t, 3c]: q heads, k heads, v heads
+        let w = self.window;
+        let heads = c / HEAD_DIM;
+        let half = HEAD_DIM / 2;
+        // Rotary embedding of q and k by the position within the window (rotate_half layout).
+        for_rows(&mut qkv, 3 * c, |ti, row| {
+            let pos = (ti % w) as f32;
+            for hd in 0..2 * heads {
+                let v = &mut row[hd * HEAD_DIM..(hd + 1) * HEAD_DIM];
+                for i in 0..half {
+                    let (s, co) = (pos * self.inv_freq[i]).sin_cos();
+                    let (a, b) = (v[i], v[i + half]);
+                    v[i] = a * co - b * s;
+                    v[i + half] = b * co + a * s;
+                }
+            }
+        });
+        // Per (window, head): `[w, 64]` outputs.
+        let windows = t.div_ceil(w);
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let mut blocks = vec![0f32; windows * heads * w * HEAD_DIM];
+        for_chunks(&mut blocks, w * HEAD_DIM, true, |job, out| {
+            let (wi, hd) = (job / heads, job % heads);
+            let (t0, t1) = (wi * w, ((wi + 1) * w).min(t));
+            let col = |j: usize, part: usize| &qkv[j * 3 * c + part * c + hd * HEAD_DIM..j * 3 * c + part * c + (hd + 1) * HEAD_DIM];
+            let mut s = vec![0f32; t1 - t0];
+            for (i, o) in (t0..t1).zip(out.chunks_mut(HEAD_DIM)) {
+                let q = col(i, 0);
+                let mut mx = f32::NEG_INFINITY;
+                for (j, sj) in (t0..t1).zip(s.iter_mut()) {
+                    *sj = crate::kernels::dot(q, col(j, 1)) * scale;
+                    mx = mx.max(*sj);
+                }
+                let mut sum = 0f32;
+                for v in s.iter_mut() {
+                    *v = (*v - mx).exp();
+                    sum += *v;
+                }
+                for (j, &pj) in (t0..t1).zip(&s) {
+                    for (a, &b) in o.iter_mut().zip(col(j, 2)) {
+                        *a += pj * b;
+                    }
+                }
+                let inv = 1.0 / sum;
+                for a in o.iter_mut() {
+                    *a *= inv;
+                }
+            }
+        });
+        let mut att = vec![0f32; t * c];
+        for_rows(&mut att, c, |ti, row| {
+            let (wi, i) = (ti / w, ti % w);
+            for hd in 0..heads {
+                let b = ((wi * heads + hd) * w + i) * HEAD_DIM;
+                row[hd * HEAD_DIM..(hd + 1) * HEAD_DIM].copy_from_slice(&blocks[b..b + HEAD_DIM]);
+            }
+        });
+        let y = self.out.forward(&att, t);
+        crate::kernels::add_inplace(x, &y);
+    }
+}
+
+/// A strided conv (`kernel = 2 * stride`, padding `ceil(stride / 2)`) as a matmul over gathered
+/// input windows: weights `[c_out, kernel * c_in]`, columns ordered (tap, in channel).
+struct StridedConv {
+    w: Mat,
+    stride: usize,
+    kernel: usize,
+    pad: usize,
+    c_in: usize,
+}
+
+impl StridedConv {
+    fn load(files: &ModelFiles, p: &str, stride: usize) -> Result<Self> {
+        let (w, shape) = wn(files, p)?;
+        let [co, ci, k] = shape[..] else {
+            bail!("{p}: expected a conv kernel [out, in, k], got {shape:?}")
+        };
+        if k != 2 * stride {
+            bail!("{p}: kernel {k} for stride {stride}");
+        }
+        let mut r = vec![0f32; w.len()];
+        for o in 0..co {
+            for i in 0..ci {
+                for j in 0..k {
+                    r[o * k * ci + j * ci + i] = w[(o * ci + i) * k + j];
+                }
+            }
+        }
+        Ok(Self {
+            w: Mat::new(&r, co, k * ci, Some(bias(files, p, co)?), true)?,
+            stride,
+            kernel: k,
+            pad: stride.div_ceil(2),
+            c_in: ci,
+        })
+    }
+
+    /// `x` `[t, c_in]` -> `[t_out, c_out]`.
+    fn forward(&self, x: &[f32], t: usize) -> (Vec<f32>, usize) {
+        let (s, k, p, ci) = (self.stride, self.kernel, self.pad, self.c_in);
+        let t_out = (t + 2 * p - k) / s + 1;
+        let mut cols = vec![0f32; t_out * k * ci];
+        for_rows(&mut cols, k * ci, |o, row| {
+            for j in 0..k {
+                let src = (o * s + j) as isize - p as isize;
+                if src >= 0 && (src as usize) < t {
+                    row[j * ci..(j + 1) * ci].copy_from_slice(&x[src as usize * ci..(src as usize + 1) * ci]);
+                }
+            }
+        });
+        (self.w.forward(&cols, t_out), t_out)
+    }
+}
+
+/// One encoder rate: three residual units, Snake, the strided conv.
+struct EncBlock {
+    res: Vec<ResUnit>,
+    snake: Snake,
+    down: StridedConv,
+}
+
+/// The encoder half of a SNAC checkpoint and the quantizers' input side (f32 weights).
+struct Encoder {
+    /// First conv, 1 -> `encoder_dim` channels, taps `[k][c]`.
+    conv_in: Vec<f32>,
+    conv_in_b: Vec<f32>,
+    conv_in_k: usize,
+    blocks: Vec<EncBlock>,
+    attn: Option<LocalAttention>,
+    conv_out: Depthwise,
+    /// Per codebook: `in_proj` (latent -> code dim) and the L2-normalized codebook.
+    in_proj: Vec<Mat>,
+    codebooks: Vec<Vec<f32>>,
+}
+
+impl Encoder {
+    fn load(files: &ModelFiles, cfg: &SnacConfig) -> Result<Self> {
+        let (w, shape) = wn(files, "encoder.block.0")?;
+        let [c0, 1, k] = shape[..] else {
+            bail!("encoder input conv: shape {shape:?}")
+        };
+        let mut conv_in = vec![0f32; k * c0];
+        for ch in 0..c0 {
+            for j in 0..k {
+                conv_in[j * c0 + ch] = w[ch * k + j];
+            }
+        }
+        let conv_in_b = bias(files, "encoder.block.0", c0)?;
+        let mut c = c0;
+        let mut blocks = Vec::new();
+        for (bi, &s) in cfg.encoder_rates.iter().enumerate() {
+            let p = format!("encoder.block.{}.block", bi + 1);
+            let mut res = Vec::new();
+            for (j, dil) in [1, 3, 9].into_iter().enumerate() {
+                let rp = format!("{p}.{j}.block");
+                res.push(ResUnit {
+                    snake1: snake(files, &format!("{rp}.0"), c)?,
+                    conv: depthwise(files, &format!("{rp}.1"), dil)?,
+                    snake2: snake(files, &format!("{rp}.2"), c)?,
+                    pw: pointwise(files, &format!("{rp}.3"), true, true)?,
+                });
+            }
+            let snake = snake(files, &format!("{p}.3"), c)?;
+            let down = StridedConv::load(files, &format!("{p}.4"), s)?;
+            if down.c_in != c {
+                bail!("{p}.4: {} input channels, expected {c}", down.c_in);
+            }
+            c = down.w.n_out;
+            blocks.push(EncBlock { res, snake, down });
+        }
+        if c != cfg.latent_dim() {
+            bail!("encoder: {c} output channels, latent_dim {}", cfg.latent_dim());
+        }
+        let mut next = cfg.encoder_rates.len() + 1;
+        let attn = match cfg.attn_window_size {
+            Some(w) => {
+                next += 1;
+                Some(LocalAttention::load(files, &format!("encoder.block.{}", next - 1), c, w, true)?)
+            }
+            None => None,
+        };
+        let conv_out = depthwise(files, &format!("encoder.block.{next}"), 1)?;
+        let mut in_proj = Vec::new();
+        let mut codebooks = Vec::new();
+        for i in 0..cfg.vq_strides.len() {
+            let p = format!("quantizer.quantizers.{i}");
+            in_proj.push(pointwise(files, &format!("{p}.in_proj"), true, true)?);
+            let mut cb = files.f32(&format!("{p}.codebook.weight"))?;
+            for e in cb.chunks_mut(cfg.codebook_dim) {
+                let n = e.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-12);
+                for v in e {
+                    *v /= n;
+                }
+            }
+            codebooks.push(cb);
+        }
+        Ok(Self {
+            conv_in,
+            conv_in_b,
+            conv_in_k: k,
+            blocks,
+            attn,
+            conv_out,
+            in_proj,
+            codebooks,
+        })
+    }
+
+    /// The latent `[t, latent]` of `audio` (its length a multiple of the hop).
+    fn latent(&self, audio: &[f32]) -> (Vec<f32>, usize) {
+        let (c, k) = (self.conv_in_b.len(), self.conv_in_k);
+        let half = (k - 1) / 2;
+        let mut t = audio.len();
+        let mut x = vec![0f32; t * c];
+        for_rows(&mut x, c, |ti, out| {
+            out.copy_from_slice(&self.conv_in_b);
+            for j in 0..k {
+                let src = ti as isize + j as isize - half as isize;
+                if src < 0 || src >= t as isize {
+                    continue;
+                }
+                let a = audio[src as usize];
+                for (o, &w) in out.iter_mut().zip(&self.conv_in[j * c..(j + 1) * c]) {
+                    *o += a * w;
+                }
+            }
+        });
+        for b in &self.blocks {
+            for r in &b.res {
+                r.forward(&mut x, t);
+            }
+            let h = b.snake.apply(&x);
+            (x, t) = b.down.forward(&h, t);
+        }
+        if let Some(a) = &self.attn {
+            a.forward(&mut x, t);
+        }
+        (self.conv_out.forward(&x, t), t)
+    }
+}
+
+/// A loaded SNAC codec (decoder, and the encoder when the checkpoint has it).
 pub struct Snac {
     pub cfg: SnacConfig,
     /// Per codebook: `[codebook_size, latent]`, each entry through `out_proj` (bias included).
     tables: Vec<Vec<f32>>,
     conv_in: Depthwise,
     proj_in: Mat,
+    attn: Option<LocalAttention>,
     blocks: Vec<Block>,
     snake_out: Snake,
     /// Final k7 conv to one channel, taps `[k][c]`.
     conv_out: Vec<f32>,
     conv_out_b: f32,
     conv_out_k: usize,
+    encoder: Option<Encoder>,
 }
 
 /// Weight-norm parametrization: `g * v / ||v||`, the norm over every dim but the first.
@@ -450,10 +780,24 @@ impl Snac {
         }
         let conv_in = depthwise(&files, "decoder.model.0", 1)?;
         let proj_in = pointwise(&files, "decoder.model.1", true, f32w)?;
+        if proj_in.n_out != cfg.decoder_dim || proj_in.n_in != latent {
+            bail!(
+                "decoder.model.1: shape [{}, {}], expected [{}, {latent}]",
+                proj_in.n_out,
+                proj_in.n_in,
+                cfg.decoder_dim
+            );
+        }
+        // With local attention, it is layer 2 and the blocks follow.
+        let first = if cfg.attn_window_size.is_some() { 3 } else { 2 };
+        let attn = match cfg.attn_window_size {
+            Some(w) => Some(LocalAttention::load(&files, "decoder.model.2", cfg.decoder_dim, w, f32w)?),
+            None => None,
+        };
         let mut blocks = Vec::new();
         let mut c = cfg.decoder_dim;
         for (bi, &s) in cfg.decoder_rates.iter().enumerate() {
-            let p = format!("decoder.model.{}.block", bi + 2);
+            let p = format!("decoder.model.{}.block", bi + first);
             let co = c / 2;
             let (w, shape) = wn(&files, &format!("{p}.1"))?;
             let k = 2 * s;
@@ -501,7 +845,7 @@ impl Snac {
             });
             c = co;
         }
-        let n = cfg.decoder_rates.len() + 2;
+        let n = cfg.decoder_rates.len() + first;
         let snake_out = snake(&files, &format!("decoder.model.{n}"), c)?;
         let (w, shape) = wn(&files, &format!("decoder.model.{}", n + 1))?;
         let [1, ci, k] = shape[..] else {
@@ -517,11 +861,18 @@ impl Snac {
             }
         }
         let conv_out_b = bias(&files, &format!("decoder.model.{}", n + 1), 1)?[0];
+        let encoder = if files.has("encoder.block.0.bias") {
+            Some(Encoder::load(&files, &cfg).context("SNAC encoder")?)
+        } else {
+            None
+        };
         Ok(Self {
+            encoder,
             cfg,
             tables,
             conv_in,
             proj_in,
+            attn,
             blocks,
             snake_out,
             conv_out,
@@ -542,6 +893,85 @@ impl Snac {
     /// Output samples per code of the coarsest codebook (2048 at 24 kHz).
     pub fn samples_per_frame(&self) -> usize {
         self.hop() * self.cfg.vq_strides[0]
+    }
+
+    /// Number of codebooks.
+    pub fn codebooks(&self) -> usize {
+        self.cfg.vq_strides.len()
+    }
+
+    /// Whether the checkpoint has the encoder ([`Snac::encode`]).
+    pub fn has_encoder(&self) -> bool {
+        self.encoder.is_some()
+    }
+
+    /// Encodes mono samples at [`Snac::sample_rate`] (in [-1, 1]) to codes, as the reference's
+    /// `SNAC.encode`: the input is right-padded with zeros to a multiple of
+    /// [`SnacConfig::pad_multiple`], then codebook `i` holds `n * vq_strides[0] / vq_strides[i]`
+    /// codes for `n` coarse frames (`n = padded / samples_per_frame()`). Empty input: no codes.
+    pub fn encode(&self, samples: &[f32]) -> Result<Vec<Vec<u32>>> {
+        let enc = self.encoder.as_ref().context("this SNAC checkpoint has no encoder weights")?;
+        let cfg = &self.cfg;
+        if samples.is_empty() {
+            return Ok(vec![Vec::new(); cfg.vq_strides.len()]);
+        }
+        let m = cfg.pad_multiple();
+        let mut audio = samples.to_vec();
+        audio.resize(samples.len().div_ceil(m) * m, 0.0);
+        let (z, t) = enc.latent(&audio);
+        let latent = cfg.latent_dim();
+        let d = cfg.codebook_dim;
+        let mut residual = z;
+        let mut codes = Vec::with_capacity(cfg.vq_strides.len());
+        for (i, &s) in cfg.vq_strides.iter().enumerate() {
+            let n = t / s;
+            // Average pool by the stride.
+            let mut pooled = vec![0f32; n * latent];
+            for_rows(&mut pooled, latent, |j, row| {
+                for k in 0..s {
+                    for (v, &r) in row.iter_mut().zip(&residual[(j * s + k) * latent..(j * s + k + 1) * latent]) {
+                        *v += r;
+                    }
+                }
+                for v in row.iter_mut() {
+                    *v /= s as f32;
+                }
+            });
+            let e = enc.in_proj[i].forward(&pooled, n); // [n, d]
+            let cb = &enc.codebooks[i];
+            // Nearest entry by the reference's distance `|e|^2 - 2 e.c + |c|^2` over normalized
+            // vectors (the first minimum wins); stored as f32 bits to go through `for_rows`.
+            let mut best = vec![0f32; n];
+            for_rows(&mut best, 1, |j, b| {
+                let mut v = e[j * d..(j + 1) * d].to_vec();
+                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+                for x in &mut v {
+                    *x /= norm;
+                }
+                let e2: f32 = v.iter().map(|x| x * x).sum();
+                let (mut bi, mut bd) = (0usize, f32::INFINITY);
+                for (k, c) in cb.chunks_exact(d).enumerate() {
+                    let dot: f32 = v.iter().zip(c).map(|(a, b)| a * b).sum();
+                    let c2: f32 = c.iter().map(|x| x * x).sum();
+                    let dist = e2 - 2.0 * dot + c2;
+                    if dist < bd {
+                        (bi, bd) = (k, dist);
+                    }
+                }
+                b[0] = f32::from_bits(bi as u32);
+            });
+            let idx: Vec<u32> = best.iter().map(|b| b.to_bits()).collect();
+            // The residual minus the chosen entries (through `out_proj`), repeated by the stride.
+            let table = &self.tables[i];
+            for_rows(&mut residual, latent, |ti, row| {
+                let e = idx[ti / s] as usize;
+                for (v, &a) in row.iter_mut().zip(&table[e * latent..(e + 1) * latent]) {
+                    *v -= a;
+                }
+            });
+            codes.push(idx);
+        }
+        Ok(codes)
     }
 
     /// Decodes `n` coarse frames: `codes[i]` holds `n * vq_strides[0] / vq_strides[i]` codes of
@@ -583,6 +1013,9 @@ impl Snac {
         });
         let h = self.conv_in.forward(&z, t);
         let mut x = self.proj_in.forward(&h, t);
+        if let Some(a) = &self.attn {
+            a.forward(&mut x, t);
+        }
         let (mut len, mut t0) = (t, frame0 * s0);
         for (l, b) in self.blocks.iter().enumerate() {
             let (y, ny) = b.forward(&x, len, t0, l, noise);
@@ -631,6 +1064,24 @@ mod tests {
             x += 0.000_731;
         }
         assert!(worst < 1e-6, "worst sin error {worst}");
+    }
+
+    #[test]
+    fn pad_multiples() {
+        let cfg24: SnacConfig = serde_json::from_str(
+            r#"{"sampling_rate": 24000, "encoder_dim": 48, "encoder_rates": [2, 4, 8, 8], "decoder_dim": 1024,
+                "decoder_rates": [8, 8, 4, 2], "attn_window_size": null, "codebook_size": 4096, "codebook_dim": 8,
+                "vq_strides": [4, 2, 1]}"#,
+        )
+        .unwrap();
+        assert_eq!((cfg24.hop(), cfg24.pad_multiple(), cfg24.latent_dim()), (512, 2048, 768));
+        let cfg44: SnacConfig = serde_json::from_str(
+            r#"{"sampling_rate": 44100, "encoder_dim": 64, "encoder_rates": [2, 3, 8, 8], "decoder_dim": 1536,
+                "decoder_rates": [8, 8, 3, 2], "attn_window_size": 32, "codebook_size": 4096, "codebook_dim": 8,
+                "vq_strides": [8, 4, 2, 1]}"#,
+        )
+        .unwrap();
+        assert_eq!((cfg44.hop(), cfg44.pad_multiple()), (384, 384 * 32));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use crate::Args;
 use anyhow::{Context, Result, bail};
 use oxinfer::engine::Flow;
 use oxinfer::snac::{Noise, Snac, SnacOptions};
-use oxinfer::tts::{Audio, SpeakOptions, Speaker, SpeakerOptions, audio_frames, frames_to_codes};
+use oxinfer::tts::{Audio, SpeakOptions, Speaker, SpeakerOptions, audio_frames, frames_to_codes, load_audio_file};
 use std::io::Read;
 use std::time::Instant;
 
@@ -54,6 +54,44 @@ pub fn run(args: &Args) -> Result<()> {
         };
     }
     let noise = if args.no_noise { Noise::Off } else { Noise::Seeded(args.seed) };
+
+    // The SNAC codec on its own: audio to codes, codes to audio.
+    if args.snac_encode.is_some() || args.decode_codes.is_some() {
+        let mut so = SnacOptions::default();
+        so.f32_weights = lo.snac_f32;
+        let dir = oxinfer::engine::resolve_model(&args.model.to_string_lossy(), args.cache_dir.as_deref())?;
+        let snac = Snac::load(&dir, &so)?;
+        if let Some(f) = &args.snac_encode {
+            let pcm = load_audio_file(f, snac.sample_rate())?;
+            let t = Instant::now();
+            let codes = snac.encode(&pcm)?;
+            let lens: Vec<usize> = codes.iter().map(Vec::len).collect();
+            eprintln!(
+                "[encoded {:.2} s at {} Hz to codes {lens:?} in {:.3}s]",
+                pcm.len() as f64 / snac.sample_rate() as f64,
+                snac.sample_rate(),
+                t.elapsed().as_secs_f64()
+            );
+            let json = serde_json::to_string(&codes)?;
+            match &args.output {
+                Some(o) => std::fs::write(o, json).with_context(|| format!("write {}", o.display()))?,
+                None => println!("{json}"),
+            }
+            return Ok(());
+        }
+        let f = args.decode_codes.as_ref().unwrap();
+        let codes: Vec<Vec<u32>> = serde_json::from_slice(&std::fs::read(f).with_context(|| format!("read {}", f.display()))?)
+            .context("codes: a JSON array per codebook")?;
+        let refs: Vec<&[u32]> = codes.iter().map(Vec::as_slice).collect();
+        let t = Instant::now();
+        let samples = snac.decode(&refs, noise)?;
+        eprintln!("[decoded {} coarse frames in {:.3}s]", codes[0].len(), t.elapsed().as_secs_f64());
+        let audio = Audio {
+            samples,
+            sample_rate: snac.sample_rate(),
+        };
+        return write_outputs(args, &audio);
+    }
 
     // Audio tokens (or, with a SNAC model, the same) decoded without the language model.
     if let Some(f) = &args.decode_tokens {
@@ -111,9 +149,34 @@ pub fn run(args: &Args) -> Result<()> {
     }
 
     let speaker = Speaker::load(&args.model.to_string_lossy(), &lo)?;
+    if args.ref_audio.len() != args.ref_text.len() {
+        bail!(
+            "--ref-audio and --ref-text go in pairs ({} vs {})",
+            args.ref_audio.len(),
+            args.ref_text.len()
+        );
+    }
+    for (a, t) in args.ref_audio.iter().zip(&args.ref_text) {
+        let ts = Instant::now();
+        let r = speaker.encode_reference_file(a, t)?;
+        eprintln!(
+            "[reference {}: {} frames ({:.2} s) encoded in {:.2}s]",
+            a.display(),
+            r.frames.len(),
+            r.duration_secs(),
+            ts.elapsed().as_secs_f64()
+        );
+        so.references.push(r);
+    }
     let info = speaker.info();
     eprintln!(
-        "[orpheus: {} layers, hidden {}, {}; SNAC {} Hz from {}; device {}, {} threads; loaded in {:.2}s]",
+        "[orpheus{}{}: {} layers, hidden {}, {}; SNAC {} Hz from {}; device {}, {} threads; loaded in {:.2}s]",
+        if info.pretrained { " (pretrained)" } else { "" },
+        if info.languages.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", info.languages.join(", "))
+        },
         info.layers,
         info.hidden_size,
         if oxinfer::gguf::is_gguf(&info.path) {
@@ -146,17 +209,25 @@ pub fn run(args: &Args) -> Result<()> {
         speaker.speak_detailed(text.trim(), &so)?
     };
     if args.show_tokens {
-        eprintln!("[prompt ids: {:?}]", speaker.prompt_tokens(text.trim(), so.voice.as_deref())?);
+        eprintln!(
+            "[prompt ids: {:?}]",
+            speaker.prompt_tokens_with(text.trim(), so.voice.as_deref(), &so.references)?
+        );
         eprintln!("[output ids ({}): {:?}]", speech.tokens.len(), speech.tokens);
     }
     let st = &speech.stats;
     eprintln!(
-        "[{} prompt tok, prefill {:.2}s | {} tok ({} frames, {} dropped) in {:.2}s = {:.1} tok/s (real time needs {:.1}) | SNAC {:.2}s | {:.2}s audio in {:.2}s: RTF {:.2}{} | {:?}]",
+        "[{} prompt tok, prefill {:.2}s | {} tok ({} frames, {} dropped{}) in {:.2}s = {:.1} tok/s (real time needs {:.1}) | SNAC {:.2}s | {:.2}s audio in {:.2}s: RTF {:.2}{} | {:?}]",
         st.prompt_tokens,
         st.prefill_secs,
         st.tokens,
         st.frames,
         st.dropped_tokens,
+        if st.loops > 0 {
+            format!(", {} loops", st.loops)
+        } else {
+            String::new()
+        },
         st.generate_secs,
         st.tok_s(),
         7.0 * speaker.snac().sample_rate() as f64 / speaker.snac().samples_per_frame() as f64,
