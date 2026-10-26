@@ -72,6 +72,8 @@ optional.
 | openai/whisper-tiny, -base, -small, -medium (and `.en`) | 39M-769M | 0.15-3.1 GB (fp32) | speech to text; transcripts match transformers token for token (see [Speech to text](#speech-to-text-whisper)) |
 | openai/whisper-large-v3, -large-v3-turbo, distil-whisper/distil-large-v3 | 1.55B / 809M / 756M | 3.1 / 1.6 / 1.5 GB (fp16) | speech to text; match transformers token for token |
 | canopylabs/orpheus-3b-0.1-ft (ungated copy: unsloth/orpheus-3b-0.1-ft) + hubertsiuzdak/snac_24khz | 3.3B + 20M | 6.6 GB + 80 MB (fp32) | text to speech; greedy tokens and waveform match transformers + snac (see [Text to speech](#text-to-speech-orpheus)); also any Llama 3.x as a text model |
+| Orpheus GGUF (isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF, lex-au/Orpheus-3b-FT-Q8_0.gguf) | 3.3B | 2.4 / 4.0 GB | text to speech; whisper-small WER 0-1% like the safetensors model |
+| Llama 3.x GGUF (bartowski/Llama-3.2-1B-Instruct-GGUF, ...) | 1.2B tested | 0.8 GB (Q4_K_M) - 2.5 GB (F16) | text; F16 file bit-identical to the safetensors model, quantized files match llama.cpp (see [Llama 3 GGUF](#llama-3-gguf)) |
 
 ### Qwen3.5 / Qwen3.8
 
@@ -841,8 +843,34 @@ streams exactly the full decode (max abs diff 3e-7), the default 2 / 2 differs f
 overlapping windows see the same noise as a whole-clip decode.
 
 Llama 3 itself runs on the same code as Qwen3 (full attention without query / key norms, llama3
-RoPE frequency scaling), so any Llama 3.x safetensors checkpoint also works as a text model
-(`--model` with the Llama 3 chat template; GGUF Llama files are not supported).
+RoPE frequency scaling), so any Llama 3.x checkpoint also works as a text model (`--model` with
+the Llama 3 chat template), safetensors or GGUF (see [Llama 3 GGUF](#llama-3-gguf)).
+
+GGUF conversions of Orpheus load the same way, as a path or `org/repo:QUANT`; the audio tokens
+are in the GGUF vocabulary (156940 tokens, the 28683 added ones as user-defined tokens), and the
+constrained audio head reads its rows of the output layer in place, in the file's own format:
+
+```sh
+./target/release/oxinfer --model isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF:Q4_K_M --speak "Hello there!" -o hi.wav
+./target/release/oxinfer --model lex-au/Orpheus-3b-FT-Q8_0.gguf:Q8_0 --speak "Hello there!" -o hi.wav
+```
+
+On the backbone's first speech-token distribution (tara, a short prompt, CPU) the Q8_0 / Q4_K_M
+files match the bf16 safetensors model with the same top 10 and KL 3.4e-4 / 2.6e-3. Eight
+sentences (102 words, tara, default sampling, one seed each) transcribed by whisper-small: WER
+0% for Q4_K_M, 1.0% for Q8_0 ("rainforests" -> "rainforest"), 0% for the safetensors model at
+q4 and q8. Decode speed for a 7 s utterance (~600 tokens, not streamed, 3 interleaved runs, load
+7-18):
+
+| Weights | CPU | Default (Metal prefill) |
+|---|---|---|
+| GGUF Q4_K_M (2.4 GB; Q4_K with Q6_K for some tensors) | 99-102 tok/s | 96-99 tok/s |
+| safetensors `--quant q4` | 112-116 tok/s | 113-118 tok/s |
+| GGUF Q8_0 | 68-69 tok/s | 69-72 tok/s |
+| safetensors `--quant q8` | 68-69 tok/s | 70-72 tok/s |
+
+Q4_K_M decodes faster than real time (82 tokens/s) but ~13% slower than oxinfer's own q4: it keeps
+the output layer and half the value and down projections at 6 bits (Q6_K).
 
 **Agreement** with the reference: transformers 5.20 float32 `LlamaForCausalLM` + the `snac` 1.2.1
 package, with the token handling of `orpheus_tts` (decoder.py) and the SNAC noise disabled on both
@@ -886,8 +914,8 @@ that keeps up with playback here. SNAC costs about 3 ms per frame decoded once (
 streaming decodes each frame in 5 windows, ~14 ms per 85 ms frame).
 
 Not supported: voice cloning / the pretrained (non-fine-tuned) model's zero-shot prompting with
-reference audio, batched utterances, the 44 / 32 kHz SNAC models (local attention), Llama GGUF
-files, and speculative decoding for Orpheus. The multilingual research checkpoints use the same
+reference audio, batched utterances, the 44 / 32 kHz SNAC models (local attention), and
+speculative decoding for Orpheus. The multilingual research checkpoints use the same
 prompt format and should load, but were not tested.
 
 ## Getting weights
@@ -929,10 +957,12 @@ cross-origin requests).
 `--model` also takes llama.cpp GGUF files, as a path or as `org/repo:QUANT` (the one file of a
 GGUF repository whose name ends in `QUANT.gguf`, e.g.
 `HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF:Q4_K_P`). Architectures: `qwen35`
-(Qwen3.5 / 3.6 / 3.8), `qwen35moe` and `qwen3`. The tokenizer and chat template come from the
+(Qwen3.5 / 3.6 / 3.8), `qwen35moe`, `qwen3` and `llama` (Llama 3.x, and Orpheus TTS, see
+[below](#llama-3-gguf)). The tokenizer and chat template come from the
 GGUF metadata (the rebuilt tokenizer matches Qwen3.8's `tokenizer.json` on 305 test texts), and
 llama.cpp's conversions are undone at load (`gguf.rs`): norms with the 1 folded in, `ssm_a`, the
-tiled Gated DeltaNet value-head order, separate 3D expert tensors. Weights stay in their GGUF
+tiled Gated DeltaNet value-head order, separate 3D expert tensors, Llama's permuted query / key
+rows. Weights stay in their GGUF
 format: F32, F16, BF16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q2_K-Q6_K, IQ1_S/IQ1_M, IQ2_XXS/XS/S,
 IQ3_XXS/S and IQ4_NL/XS (`ggml.rs`, dequantization bit-exact with gguf-py), with NEON decode
 kernels for every type and Metal prefill kernels. The i-quants (IQ1-IQ3) decode several times
@@ -942,6 +972,49 @@ oxinfer's own Q4/Q8. Embedded MTP layers (`blk.N.nextn.*`) work with `--mtp`.
 On HauhauCS's Qwen3.8-27B Q4_K_P the next-token distribution matches llama.cpp on the same file
 (same top 10, log-probabilities within 0.03, mean 0.013). F32/BF16 GGUFs from llama.cpp's
 converter match transformers to 5e-5. `--save-quantized` does not take GGUF input.
+
+#### Llama 3 GGUF
+
+```sh
+./target/release/oxinfer --model bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M -p "Why is the sky blue?"
+```
+
+llama.cpp's converter permutes the rows of `q_proj` / `k_proj` within each head for ggml's
+adjacent-pair RoPE (`LlamaModel.permute` in `convert_hf_to_gguf.py`: stored row `2i + j` of a head
+of `d` rows is Hugging Face row `j * d/2 + i`). Rotating adjacent pairs of the stored rows is the
+same arithmetic as rotate-half RoPE on the original rows, and attention scores do not depend on
+the order within a head, so the weights stay mapped as they are (no copy) and the Llama GGUF path
+uses the interleaved RoPE instead; LoRA adapters on `q_proj` / `k_proj` get their rows reordered
+to match. The llama3 RoPE scaling (factor, low / high frequency factors, original context) is not
+in the GGUF metadata: the converter stores the resulting divisor of each frequency as the
+`rope_freqs.weight` tensor, which divides the inverse frequencies. Base, heads, KV heads, head
+size and eps come from the `llama.*` keys. The tokenizer is Llama 3's byte-level BPE with the
+`llama-bpe` pre-tokenizer regex, no normalizer and `ignore_merges`, plus the special and
+user-defined tokens (Orpheus's 28683 audio tokens): token for token identical to the checkpoints'
+own `tokenizer.json` (Llama 3.2 1B and Orpheus 3B) on 2953 texts (this README, source code,
+ten languages, emoji, whitespace runs, special tokens; 117k tokens). Chat uses the Llama 3
+format when `tokenizer.chat_template` is Llama 3's (header tokens); other Llama-architecture
+GGUFs (SmolLM, Mistral, ...) load as text models with `--raw` but their chat formats are refused.
+
+Agreement on Llama-3.2-1B-Instruct (bartowski's GGUFs; seven raw prompts of 5-24 tokens in
+English, German, French and Python, each starting with `<|begin_of_text|>`; the last-token
+distribution and 64 greedy tokens; CPU):
+
+| Check | Result |
+|---|---|
+| F16 GGUF vs the bf16 safetensors (unsloth/Llama-3.2-1B-Instruct), oxinfer both | logits bit-identical (max abs diff 0), same greedy text |
+| Q8_0 GGUF vs bf16 safetensors | same top 1 in 7/7, top 10 overlap 9-10/10, KL 1e-5..3.5e-3 |
+| Q4_K_M GGUF vs bf16 safetensors | same top 1 in 6/7, top 10 overlap 8-10/10, KL 3e-3..0.17 |
+| F16 GGUF, oxinfer vs llama.cpp (same file, top 20 log-probabilities) | same top 1 7/7, within 0.027; 64/64 greedy tokens identical in 7/7 |
+| Q8_0 GGUF, oxinfer vs llama.cpp | same top 1 7/7, within 0.10-0.20; 64/64 greedy tokens in 6/7, the 7th splits at a near tie after 8 |
+| Q4_K_M GGUF, oxinfer vs llama.cpp | same top 1 7/7, within 0.15-0.34; 64/64 greedy tokens in 2/7, the others split at near ties after 1, 8, 19, 32 and 55 |
+| Q8_0 / Q4_K_M, transformers float32 on the GGUF's dequantized weights (Q/K rows un-permuted) vs oxinfer | within 0.02-0.12 / 0.02-0.16 (vs llama.cpp: 0.11-0.21 / 0.13-0.36) |
+
+On the F16 file that float32 reference matches oxinfer to 1e-4. The quantized files differ from
+llama.cpp by more than the F16 file, but against the exact float32 forward pass on the same
+dequantized weights oxinfer is the closer of the two, so the gap comes from how the engines round
+intermediate values (both quantize activations to int8 for the integer dot products), not from a
+different reading of the weights.
 
 ### MLX checkpoints
 
@@ -1213,6 +1286,37 @@ head, or the 32k-vocabulary FastMTP sidecar with `--mtp-from`):
 | oxinfer CPU | 24.2 [21.4-27.8] | 23.3 [20.8-27.2] | 10.6 [10.3-11.9] | 11.5 [10.8-11.8] | |
 
 (`llama-bench` on the same file in a quiet moment: pp512 744, pp2048 642, tg256 25.5 tok/s.)
+
+Llama-3.2-1B-Instruct (bartowski) and Orpheus 3B (text generation through the chat template, so
+the code / prose replies are short: 29-33 tokens for code on Orpheus Q4_K_M; Orpheus Q8_0 replies
+only 2-31 tokens and is left out), llama.cpp built from source (ggml 0.20.0), load average 6-8,
+3 runs each, CPU rows with each engine's default thread count as above. llama.cpp gets token
+ids (no second BOS):
+
+| Model | Engine | pp512 tok/s | Decode, code | Decode, prose |
+|---|---|---|---|---|
+| 1B Q4_K_M | llama.cpp Metal | 16323 [16266-16451] | 404 [400-423] | 406 [404-408] |
+| | llama.cpp CPU | 582 [529-613] | 162 [72-165] | 161 [71-166] |
+| | oxinfer (Metal prefill) | 2048 [1164-3012] | 223 [139-227] | 225 [225-229] |
+| | oxinfer CPU | 617 [582-665] | 231 [221-235] | 225 [221-235] |
+| 1B Q8_0 | llama.cpp Metal | 16956 [16880-17214] | 305 [301-305] | 304 [303-305] |
+| | llama.cpp CPU | 748 [677-749] | 159 [158-160] | 159 [158-160] |
+| | oxinfer (Metal prefill) | 3012 [1969-3012] | 163 [163-166] | 161 [159-165] |
+| | oxinfer CPU | 610 [533-617] | 164 [150-171] | 166 [152-170] |
+| Orpheus 3B Q4_K_M | llama.cpp Metal | 5320 [4066-6098] | 190 [189-191] | 191 [189-192] |
+| | llama.cpp CPU | 204 [187-209] | 68 [67-69] | 65 [65-66] |
+| | oxinfer (Metal prefill) | 1313 [914-1384] | 94 [91-94] | 88 [87-89] |
+| | oxinfer CPU | 226 [204-229] | 94 [94-100] | 89 [89-92] |
+
+On the CPU oxinfer decodes 1.4x faster than llama.cpp on Q4_K_M at the default thread counts
+(6 vs 18), but with 12 threads each (1B Q4_K_M, code) the gap is 5% (214-215 vs 221-227 tok/s);
+Q8_0 is on par. llama.cpp runs the whole pass on the GPU and decodes 1.8-2.2x faster there
+(oxinfer's GPU path is prefill only).
+Greedy outputs: oxinfer's Metal and CPU runs agree with each other on every workload but
+one (Orpheus prose, from token 3), and every CPU divergence between the engines within 64
+tokens (at tokens 0, 26, 46 and 62) is at the token where llama.cpp's own Metal and CPU runs
+diverge too (near ties); 7 of the 12 workload / backend pairs above are identical over the 64
+tokens compared.
 
 Zawen-v0.1-35B-A3B (Qwen3.5-MoE, 256 experts, converted with llama.cpp's `convert_hf_to_gguf.py`
 + `llama-quantize`; the checkpoint has no MTP weights, but the converter still writes
