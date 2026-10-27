@@ -9,8 +9,7 @@ use std::borrow::Cow;
 impl<'a> Model<'a> {
     fn gpu_graph<'s>(&'s self) -> Option<Graph<'s>> {
         let cfg = &self.cfg;
-        // MoE layers (26B-A4B) and bidirectional attention are not described here.
-        if cfg.bidirectional() || cfg.enable_moe_block {
+        if cfg.bidirectional() {
             return None;
         }
         let h = cfg.hidden_size;
@@ -90,6 +89,21 @@ impl<'a> Model<'a> {
             None => None,
         };
         let gp = g.buf(p.max(1));
+        // 26B-A4B's MoE blocks: the router input, the experts' input and output, router logits,
+        // the chosen experts and their activations.
+        let (mut n_exp, mut top_k, mut e_inter) = (0, 0, 0);
+        for m in self.layers.iter().filter_map(|l| l.moe.as_ref()) {
+            n_exp = n_exp.max(m.experts.n_experts());
+            top_k = top_k.max(m.experts.top_k);
+            e_inter = e_inter.max(m.experts.inter);
+        }
+        let has_moe = n_exp > 0;
+        let xr = g.buf(if has_moe { h } else { 1 });
+        let hn2 = g.buf(if has_moe { h } else { 1 });
+        let eo = g.buf(if has_moe { h } else { 1 });
+        let rlogits = g.buf(n_exp.max(1));
+        let sel = g.buf((2 * top_k).max(1));
+        let eact = g.buf((top_k * e_inter).max(1));
         // KV cache slots: the layers that own a cache, in layer order (as `Session::caches`).
         let mut slot = vec![usize::MAX; nl];
         for (l, layer) in self.layers.iter().enumerate() {
@@ -192,6 +206,70 @@ impl<'a> Model<'a> {
                 });
             }
             g.ops.push(lin(&layer.down, h, inter, act, ob, LinMode::Store)?);
+            if let Some(m) = &layer.moe {
+                // Routed experts beside the dense MLP, on the same residual x:
+                // ob = norm(ob, post_dense) + norm(experts(norm(x, pre)), post).
+                if m.experts.act != crate::moe::Act::GeluTanh {
+                    return None;
+                }
+                let ne = m.experts.n_experts();
+                let one = |x, out, w: Option<&'s [f32]>, add| Op::Norm {
+                    x,
+                    out,
+                    w: w.map(Cow::Borrowed),
+                    pre: 1.0,
+                    n: h,
+                    rows: 1,
+                    x_stride: h,
+                    out_stride: h,
+                    eps,
+                    add,
+                };
+                g.ops.push(one(ob, ob, Some(&m.ln_post_dense), false));
+                g.ops.push(one(x, xr, None, false));
+                g.ops.push(one(x, hn2, Some(&m.ln_pre), false));
+                g.ops.push(Op::Route {
+                    x: xr,
+                    router: &m.router,
+                    gate: None,
+                    n_exp: ne,
+                    h,
+                    k: m.experts.top_k,
+                    logits: rlogits,
+                    sel,
+                    expert_scale: Some(&m.per_expert_scale),
+                });
+                let mut gate = Vec::with_capacity(ne);
+                let mut up = Vec::with_capacity(ne);
+                for gu in &m.experts.gate_up {
+                    match gu {
+                        crate::moe::GateUp::Fused(l) if !l.has_lora() && !l.is_transient() => gate.push(l.as_ref()),
+                        crate::moe::GateUp::Split(a, b) if !a.has_lora() && !b.has_lora() && !a.is_transient() && !b.is_transient() => {
+                            gate.push(a.as_ref());
+                            up.push(b.as_ref());
+                        }
+                        _ => return None,
+                    }
+                }
+                if m.experts.down.iter().any(|l| l.has_lora() || l.is_transient()) {
+                    return None;
+                }
+                g.ops.push(Op::Experts(crate::gpu::decode::Experts {
+                    gate,
+                    up: (!up.is_empty()).then_some(up),
+                    down: m.experts.down.iter().map(|l| l.as_ref()).collect(),
+                    h,
+                    inter: m.experts.inter,
+                    k: m.experts.top_k,
+                    x: hn2,
+                    sel,
+                    act: eact,
+                    y: eo,
+                    gelu: true,
+                    add: false,
+                }));
+                g.ops.push(one(eo, ob, Some(&m.ln_post), true));
+            }
             let ple = layer.ple.as_ref().zip(pli);
             g.ops.push(Op::AddNorm {
                 y: ob,

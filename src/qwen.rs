@@ -911,6 +911,7 @@ impl<'a> QwenModel<'a> {
                 k: m.experts.top_k,
                 logits: rlogits,
                 sel,
+                expert_scale: None,
             });
             mlp(g, &m.shared, LinMode::AddGated(rlogits.at(ne)))?;
             let mut gate = Vec::with_capacity(ne);
@@ -936,6 +937,8 @@ impl<'a> QwenModel<'a> {
                 sel,
                 act: eact,
                 y: x,
+                gelu: false,
+                add: true,
             }));
             Some(())
         };

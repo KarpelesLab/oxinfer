@@ -546,6 +546,7 @@ enum MOp {
         sel: usize,
         n: u32,
         k: u32,
+        scale: Option<usize>,
     },
     Experts {
         pair: Id,
@@ -553,6 +554,8 @@ enum MOp {
         /// Address tables (gate or fused gate/up, up, down).
         tabs: [Id; 3],
         fused: bool,
+        gelu: bool,
+        add: bool,
         /// (row bytes or offset groups, blocks per group) of gate / up and of down.
         g: (u32, u32),
         d: (u32, u32),
@@ -926,7 +929,11 @@ impl MetalBackend {
                     k,
                     logits,
                     sel,
+                    expert_scale,
                 } => {
+                    if expert_scale.is_some_and(|s| s.len() != n_exp) {
+                        return None;
+                    }
                     if router.len() != n_exp * h || gate.is_some_and(|g| g.len() != h) || n_exp > 1024 || k == 0 || k > 64 || k > n_exp {
                         return None;
                     }
@@ -967,6 +974,7 @@ impl MetalBackend {
                         sel: byte(sel),
                         n: n_exp as u32,
                         k: k as u32,
+                        scale: expert_scale.map(&mut cst),
                     });
                     (vec![rng(x, h), rng(logits, rows)], vec![rng(logits, rows), rng(sel, 2 * k)])
                 }
@@ -977,6 +985,8 @@ impl MetalBackend {
                         sum: self.named_pipeline(&format!("mvx_{}_sum", pf.1.name()))?,
                         tabs,
                         fused,
+                        gelu: ex.gelu,
+                        add: ex.add,
                         g,
                         d,
                         x: byte(ex.x),
@@ -1583,11 +1593,19 @@ impl DecodePlan for MetalPlan<'_> {
                         mode,
                         gate,
                     } => encode_mv(e, *pipe, *nr, *ks, w, w2.as_ref(), (arena, *x), (arena, *y), *mode, (arena, *gate)),
-                    MOp::Topk { pipe, logits, sel, n, k } => {
+                    MOp::Topk {
+                        pipe,
+                        logits,
+                        sel,
+                        n,
+                        k,
+                        scale,
+                    } => {
                         e.pipe(*pipe);
                         e.buf(arena, *logits, 0);
                         e.buf(arena, *sel, 1);
-                        e.bytes(&[*n, *k], 2);
+                        e.bytes(&[*n, *k, scale.is_some() as u32, 0], 2);
+                        e.buf(consts, scale.unwrap_or(0), 3);
                         e.dispatch((1, 1), (*n as usize).next_multiple_of(32));
                     }
                     MOp::Experts {
@@ -1595,6 +1613,8 @@ impl DecodePlan for MetalPlan<'_> {
                         sum,
                         tabs,
                         fused,
+                        gelu,
+                        add,
                         g,
                         d,
                         x,
@@ -1621,7 +1641,8 @@ impl DecodePlan for MetalPlan<'_> {
                         e.buf(if *fused { tabs[0] } else { tabs[1] }, 0, 1);
                         e.buf(arena, *x, 2);
                         e.buf(arena, *act, 3);
-                        e.bytes(&p(*inter, *h, MvMode::SiluPair, *g, if *fused { *inter } else { 0 }), 4);
+                        let am = if *gelu { MvMode::GeluPair } else { MvMode::SiluPair };
+                        e.bytes(&p(*inter, *h, am, *g, if *fused { *inter } else { 0 }), 4);
                         e.buf(arena, *sel, 5);
                         e.dispatch((*inter, *k), 32);
                         e.barrier();
@@ -1630,7 +1651,7 @@ impl DecodePlan for MetalPlan<'_> {
                         e.buf(tabs[2], 0, 1);
                         e.buf(arena, *act, 2);
                         e.buf(arena, *y, 3);
-                        e.bytes(&p(*h, *inter, MvMode::Add, *d, 0), 4);
+                        e.bytes(&p(*h, *inter, if *add { MvMode::Add } else { MvMode::Store }, *d, 0), 4);
                         e.buf(arena, *sel, 5);
                         e.dispatch((*h, 1), 32);
                     }

@@ -712,11 +712,11 @@ struct PleGlobal<'a> {
 /// read the residual normed by `ln_pre`, and their sum, normed by `ln_post`, is added to the
 /// dense MLP output normed by `ln_post_dense` (then both go through `post_feedforward_layernorm`).
 pub(crate) struct GemmaMoe<'a> {
-    router: Vec<f32>, // [n_exp, H]
-    per_expert_scale: Vec<f32>,
-    ln_post_dense: Vec<f32>,
-    ln_pre: Vec<f32>,
-    ln_post: Vec<f32>,
+    pub(crate) router: Vec<f32>, // [n_exp, H]
+    pub(crate) per_expert_scale: Vec<f32>,
+    pub(crate) ln_post_dense: Vec<f32>,
+    pub(crate) ln_pre: Vec<f32>,
+    pub(crate) ln_post: Vec<f32>,
     pub(crate) experts: crate::moe::Experts<'a>,
 }
 

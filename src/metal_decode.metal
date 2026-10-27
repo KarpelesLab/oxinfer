@@ -667,14 +667,16 @@ MVX_SIG(NAME##_sum) { threadgroup float red[2]; \
         EPX e = tab[as_type<uint>(sel[s])]; T f = MAKE(e); \
         mv_acc<T, X, CH, 1, 1>(f, f, false, 0, x + (ulong)s * p.n_in, p.n_in, p.n_out, tg.x, sg, lane, acc, acc2, sel[p.ldy + s]); \
     } \
-    mv_finish<1, 1>(acc, acc2, y, 1, tg.x, p.n_out, sg, lane, red, sel); }
+    mv_finish<1, 1>(acc, acc2, y, p.mode, tg.x, p.n_out, sg, lane, red, sel); }
 #define MK_RAWX(T) T{ e.q, p.gpr }
 #define MKX_Q8(e) MQ8{ (device const char*)(e).q, (device const float*)(e).s, p.n_in }
 #define MKX_Q4(e) MQ4{ (e).q, (device const half*)(e).s, p.n_in, (device const ushort*)(e).o, p.gpr, p.gk }
 
 // Top k of n router logits (ties to the lower index), softmax over the chosen: ids (as uint bits)
 // then weights into `sel`. One threadgroup, one logit per thread (n <= 1024).
-kernel void dec_topk(device const float* logits [[buffer(0)]], device float* sel [[buffer(1)]], constant uint2& p [[buffer(2)]],
+// p.z != 0: the weights are then multiplied by scale[id].
+kernel void dec_topk(device const float* logits [[buffer(0)]], device float* sel [[buffer(1)]], constant uint4& p [[buffer(2)]],
+                     device const float* scale [[buffer(3)]],
                      uint tid [[thread_index_in_threadgroup]], uint nt [[threads_per_threadgroup]],
                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float bv[32];
@@ -699,7 +701,7 @@ kernel void dec_topk(device const float* logits [[buffer(0)]], device float* sel
     if (tid == 0) {
         float m = chosen[0], s = 0.f;
         for (uint j = 0; j < k; j++) { float e = exp(chosen[j] - m); chosen[j] = e; s += e; }
-        for (uint j = 0; j < k; j++) sel[k + j] = chosen[j] / s;
+        for (uint j = 0; j < k; j++) sel[k + j] = chosen[j] / s * (p.z != 0 ? scale[as_type<uint>(sel[j])] : 1.f);
     }
 }
 

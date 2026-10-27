@@ -159,6 +159,8 @@ pub enum Op<'a> {
         k: usize,
         logits: View,
         sel: View,
+        /// Per-expert factors the chosen weights are multiplied by after the softmax (Gemma).
+        expert_scale: Option<&'a [f32]>,
     },
     /// The routed experts chosen in `sel` (see [`Op::Route`]): `act[s] = silu(gate_e x) *
     /// (up_e x)` for each slot, then `y += sum of weight_s * down_e act[s]`.
@@ -218,6 +220,10 @@ pub struct Experts<'a> {
     /// `[k, inter]` scratch.
     pub act: View,
     pub y: View,
+    /// GELU-tanh experts (else SiLU).
+    pub gelu: bool,
+    /// `y +=` the weighted sum (else `y =`).
+    pub add: bool,
 }
 
 /// Whether two weights can form one [`LinMode::SiluPair`] / [`LinMode::GeluPair`] matvec (same
