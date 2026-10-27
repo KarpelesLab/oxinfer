@@ -74,6 +74,8 @@ char *oxi_download(const char *spec, const char *cache_dir, oxi_progress_fn prog
  *   gpu_exact=0|1        GPU matmuls bit-identical to the CPU (default 0: M5/A19 matrix
  *                        units, half-precision inputs; process-wide)
  *   gpu_moe=0|1          MoE experts on the GPU in prefill (default 1; process-wide)
+ *   gpu_decode=0|1       generate a whole token per GPU submission where supported (Metal:
+ *                        Llama 3, Qwen3, Qwen3.5/3.8 dense; default 1; process-wide)
  *   coreml_units=auto|ane|all|gpu|cpu   Core ML models (ANEMLL format, Apple only): compute
  *                        units (default auto: the Neural Engine, or cpu/gpu following device)
  *   coreml_prefill=auto|batch|pad|single  Core ML models: how prompts are fed (default auto)
@@ -327,6 +329,7 @@ typedef int (*oxi_audio_fn)(void *user, const float *samples, size_t n, uint64_t
  *   snac=DIR|org/name          the SNAC decoder (default hubertsiuzdak/snac_24khz)
  *   snac_f32=0|1               SNAC weights in f32 (default 1, exact) or bf16
  *   cache_dir=PATH             where repo ids are downloaded
+ *   gpu_decode=0|1             generate a whole token per GPU submission (default 1; process-wide)
  * Returns NULL on error. */
 OxiSpeaker *oxi_speaker_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
 

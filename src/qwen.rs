@@ -166,13 +166,17 @@ pub struct QwenModel<'a> {
     mrope_axis: Option<Vec<u8>>,
     /// Weight streaming: unit `l` is layer `l`, unit `num_hidden_layers` the LM head.
     pub(crate) stream: Option<crate::stream::StreamHook>,
+    /// Single-token decoding on the GPU (`crate::gpu::decode`), compiled on first use; None when
+    /// the backend or the model cannot.
+    gpu_plan: std::sync::OnceLock<Option<Box<dyn crate::gpu::decode::DecodePlan>>>,
 }
 
 /// Recurrent state of one Gated DeltaNet layer.
 #[derive(Clone)]
 pub struct GdnState {
-    s: Vec<f32>,    // [n_v, hd_k, hd_v]
-    conv: Vec<f32>, // [K-1, conv_dim]: the last K-1 raw conv inputs (oldest first)
+    // Page-aligned and never reallocated: GPU decoding updates them in place (`gpu::decode`).
+    s: crate::quant::PageVec<f32>,    // [n_v, hd_k, hd_v]
+    conv: crate::quant::PageVec<f32>, // [K-1, conv_dim]: the last K-1 raw conv inputs (oldest first)
 }
 
 /// What a recording forward (`QwenModel::forward_hidden_rec`) keeps of one Gated DeltaNet layer
@@ -333,6 +337,8 @@ pub struct QwenSession {
     /// Vision token runs of the conversation (M-RoPE), sorted by start.
     pub(crate) spans: Vec<VisionSpan>,
     pub pos: usize,
+    /// Device state of GPU decoding (KV cache copies).
+    gpu: crate::gpu::decode::Slot,
 }
 
 impl QwenSession {
@@ -603,6 +609,7 @@ impl<'a> QwenModel<'a> {
             inv_freq,
             mrope_axis,
             stream: None,
+            gpu_plan: std::sync::OnceLock::new(),
         })
     }
 
@@ -774,8 +781,8 @@ impl<'a> QwenModel<'a> {
             } else {
                 kv.push(None);
                 gdn.push(Some(GdnState {
-                    s: vec![0f32; cfg.linear_num_value_heads * cfg.linear_key_head_dim * cfg.linear_value_head_dim],
-                    conv: vec![0f32; (cfg.linear_conv_kernel_dim - 1) * conv_dim],
+                    s: crate::quant::PageVec::zeroed(cfg.linear_num_value_heads * cfg.linear_key_head_dim * cfg.linear_value_head_dim),
+                    conv: crate::quant::PageVec::zeroed((cfg.linear_conv_kernel_dim - 1) * conv_dim),
                 }));
             }
         }
@@ -787,7 +794,311 @@ impl<'a> QwenModel<'a> {
             rec_span: None,
             spans: Vec::new(),
             pos: 0,
+            gpu: Default::default(),
         }
+    }
+
+    /// One token's forward pass as a device graph (`crate::gpu::decode`): dense layers with full
+    /// attention (Llama 3, Qwen3, and Qwen3.5's attention layers); None when some layer or
+    /// weight is not supported (Gated DeltaNet, MoE, LoRA, streamed weights).
+    fn gpu_graph<'s>(&'s self) -> Option<crate::gpu::decode::Graph<'s>> {
+        use crate::gpu::decode::{Graph, LinMode, Op};
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let eps = cfg.rms_norm_eps as f32;
+        let (nh, nkv, hd) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
+        let gated = cfg.attn_output_gate;
+        let qw = if gated { 2 * nh * hd } else { nh * hd };
+        let dev = |l: &'s Lin, n_out: usize, n_in: usize| -> Option<&crate::gpu::DeviceWeight> {
+            if l.has_lora() || l.is_transient() {
+                return None;
+            }
+            l.device_weight(n_out, n_in)
+        };
+        let mut g = Graph::new();
+        let x = g.buf(h);
+        let hn = g.buf(h);
+        let qkv = g.buf(qw + 2 * nkv * hd);
+        let qo = g.buf(nh * hd);
+        let att = g.buf(nh * hd);
+        let inter = self
+            .layers
+            .iter()
+            .map(|l| match &l.ffn {
+                Ffn::Dense(m) => m.inter,
+                Ffn::Moe(m) => m.shared.inter,
+            })
+            .max()
+            .unwrap_or(0);
+        let act = g.buf(inter.max(1));
+        let act2 = g.buf(inter.max(1));
+        // MoE: router logits (and the shared expert's gate), the chosen experts, their activations.
+        let (mut n_exp, mut top_k, mut e_inter) = (0, 0, 0);
+        for l in &self.layers {
+            if let Ffn::Moe(m) = &l.ffn {
+                n_exp = n_exp.max(m.experts.down.len());
+                top_k = top_k.max(m.experts.top_k);
+                e_inter = e_inter.max(m.experts.inter);
+            }
+        }
+        let rlogits = g.buf(n_exp + 1);
+        let sel = g.buf((2 * top_k).max(1));
+        let eact = g.buf((top_k * e_inter).max(1));
+        let hidden = g.buf(h);
+        let logits = g.buf(cfg.vocab_size);
+        g.input = x;
+        g.hidden = hidden;
+        g.n_hidden = h;
+        g.rope_halves = vec![self.inv_freq.len()];
+        let lin = |l: &'s Lin, n_out: usize, n_in: usize, x, y, mode| -> Option<Op<'s>> {
+            Some(Op::Linear {
+                w: l.as_ref(),
+                dev: dev(l, n_out, n_in)?,
+                w2: None,
+                n_out,
+                n_in,
+                x,
+                y,
+                mode,
+            })
+        };
+        // down(silu(gate(hn)) * up(hn)) added to x: one paired matvec when gate and up share a
+        // format, else two and an elementwise op.
+        let mlp = |g: &mut Graph<'s>, m: &'s Mlp<'s>, down_mode: LinMode| -> Option<()> {
+            let (gw, uw) = (m.gate.as_ref(), m.up.as_ref());
+            if crate::gpu::decode::pairable(&gw, &uw) {
+                g.ops.push(Op::Linear {
+                    w: gw,
+                    dev: dev(&m.gate, m.inter, h)?,
+                    w2: Some((uw, dev(&m.up, m.inter, h)?)),
+                    n_out: m.inter,
+                    n_in: h,
+                    x: hn,
+                    y: act,
+                    mode: LinMode::SiluPair,
+                });
+            } else {
+                g.ops.push(lin(&m.gate, m.inter, h, hn, act2, LinMode::Store)?);
+                g.ops.push(lin(&m.up, m.inter, h, hn, act, LinMode::Store)?);
+                g.ops.push(Op::Glu {
+                    g: act2,
+                    u: act,
+                    out: act,
+                    n: m.inter,
+                    gelu: false,
+                });
+            }
+            g.ops.push(lin(&m.down, h, m.inter, act, x, down_mode)?);
+            Some(())
+        };
+        // The feed-forward block of a layer on hn, added to x: a dense MLP, or the MoE's routed
+        // experts plus its sigmoid-gated shared expert.
+        let ffn = |g: &mut Graph<'s>, f: &'s Ffn<'s>| -> Option<()> {
+            let m = match f {
+                Ffn::Dense(m) => return mlp(g, m, LinMode::Add),
+                Ffn::Moe(m) => m,
+            };
+            if m.experts.act != crate::moe::Act::Silu || m.experts.down.iter().any(|l| l.has_lora() || l.is_transient()) {
+                return None;
+            }
+            let ne = m.experts.down.len();
+            g.ops.push(Op::Route {
+                x: hn,
+                router: &m.router,
+                gate: Some(&m.shared_gate),
+                n_exp: ne,
+                h,
+                k: m.experts.top_k,
+                logits: rlogits,
+                sel,
+            });
+            mlp(g, &m.shared, LinMode::AddGated(rlogits.at(ne)))?;
+            let mut gate = Vec::with_capacity(ne);
+            let mut up = Vec::with_capacity(ne);
+            for gu in &m.experts.gate_up {
+                match gu {
+                    crate::moe::GateUp::Fused(l) if !l.has_lora() && !l.is_transient() => gate.push(l.as_ref()),
+                    crate::moe::GateUp::Split(a, b) if !a.has_lora() && !b.has_lora() && !a.is_transient() && !b.is_transient() => {
+                        gate.push(a.as_ref());
+                        up.push(b.as_ref());
+                    }
+                    _ => return None,
+                }
+            }
+            g.ops.push(Op::Experts(crate::gpu::decode::Experts {
+                gate,
+                up: (!up.is_empty()).then_some(up),
+                down: m.experts.down.iter().map(|l| l.as_ref()).collect(),
+                h,
+                inter: m.experts.inter,
+                k: m.experts.top_k,
+                x: hn,
+                sel,
+                act: eact,
+                y: x,
+            }));
+            Some(())
+        };
+        let (nk, nv, hdk, hdv) = (
+            cfg.linear_num_key_heads,
+            cfg.linear_num_value_heads,
+            cfg.linear_key_head_dim,
+            cfg.linear_value_head_dim,
+        );
+        let (key_dim, value_dim) = (nk * hdk, nv * hdv);
+        let conv_dim = 2 * key_dim + value_dim;
+        let has_gdn = self.layers.iter().any(|l| matches!(l.mixer, Mixer::Gdn(_)));
+        // Gated DeltaNet: raw projections [qkv | z | b | a], then the conv outputs.
+        let gproj = g.buf(if has_gdn { conv_dim + value_dim + 2 * nv } else { 1 });
+        let gconv = g.buf(if has_gdn { conv_dim } else { 1 });
+        let gout = g.buf(if has_gdn { value_dim } else { 1 });
+        for layer in &self.layers {
+            g.ops.push(Op::norm(x, hn, &layer.ln_in, h, eps));
+            let at = match &layer.mixer {
+                Mixer::Attn(at) => at,
+                Mixer::Gdn(gd) => {
+                    let st = g.states.len();
+                    g.states.push(nv * hdk * hdv);
+                    g.states.push((cfg.linear_conv_kernel_dim - 1) * conv_dim);
+                    g.ops.push(lin(&gd.qkv, conv_dim, h, hn, gproj, LinMode::Store)?);
+                    g.ops.push(lin(&gd.z, value_dim, h, hn, gproj.at(conv_dim), LinMode::Store)?);
+                    g.ops.push(lin(&gd.b, nv, h, hn, gproj.at(conv_dim + value_dim), LinMode::Store)?);
+                    g.ops
+                        .push(lin(&gd.a, nv, h, hn, gproj.at(conv_dim + value_dim + nv), LinMode::Store)?);
+                    g.ops.push(Op::GdnConv {
+                        x: gproj,
+                        out: gconv,
+                        state: st + 1,
+                        w: &gd.conv_w,
+                        dim: conv_dim,
+                        kc: cfg.linear_conv_kernel_dim,
+                    });
+                    g.ops.push(Op::GdnRule(crate::gpu::decode::GdnRule {
+                        c: gconv,
+                        z: gproj.at(conv_dim),
+                        b: gproj.at(conv_dim + value_dim),
+                        a: gproj.at(conv_dim + value_dim + nv),
+                        out: gout,
+                        state: st,
+                        nk,
+                        nv,
+                        hdk,
+                        hdv,
+                        tiled: cfg.v_heads_tiled,
+                        decay_coef: &gd.decay_coef,
+                        dt_bias: &gd.dt_bias,
+                        norm_w: &gd.norm_w,
+                        eps,
+                    }));
+                    g.ops.push(lin(&gd.out, h, value_dim, gout, x, LinMode::Add)?);
+                    g.ops.push(Op::norm(x, hn, &layer.ln_post, h, eps));
+                    ffn(&mut g, &layer.ffn)?;
+                    continue;
+                }
+            };
+            let slot = g.kv.len();
+            g.kv.push((nkv, hd));
+            g.ops.push(lin(&at.q, qw, h, hn, qkv, LinMode::Store)?);
+            g.ops.push(lin(&at.k, nkv * hd, h, hn, qkv.at(qw), LinMode::Store)?);
+            g.ops.push(lin(&at.v, nkv * hd, h, hn, qkv.at(qw + nkv * hd), LinMode::Store)?);
+            g.ops.push(Op::QkRope {
+                qkv,
+                q_out: qo,
+                kv: slot,
+                nh,
+                nkv,
+                hd,
+                half_rot: self.inv_freq.len(),
+                q_stride: if gated { 2 * hd } else { hd },
+                k_off: qw,
+                v_off: qw + nkv * hd,
+                interleaved: cfg.rope_interleaved,
+                q_norm: at.q_norm.as_deref(),
+                k_norm: at.k_norm.as_deref(),
+                eps,
+                rope: 0,
+                v_norm: false,
+                v_from_k: false,
+            });
+            g.ops.push(Op::Attend {
+                q: qo,
+                out: att,
+                kv: slot,
+                nh,
+                nkv,
+                hd,
+                scale: (hd as f32).powf(-0.5),
+                window: None,
+                gate: gated.then_some((qkv.at(hd), 2 * hd)),
+            });
+            g.ops.push(lin(&at.o, h, nh * hd, att, x, LinMode::Add)?);
+            g.ops.push(Op::norm(x, hn, &layer.ln_post, h, eps));
+            ffn(&mut g, &layer.ffn)?;
+        }
+        g.ops.push(Op::norm(x, hidden, &self.final_norm, h, eps));
+        g.head_from = g.ops.len();
+        g.ops.push(lin(&self.lm_head, cfg.vocab_size, h, hidden, logits, LinMode::Store)?);
+        g.logits = Some((logits, cfg.vocab_size));
+        Some(g)
+    }
+
+    /// The GPU decode plan, compiled on first use (pipelines, buffers: ~0.1-0.2 s, so multi-token
+    /// passes build it ahead of the first decode step); None when unavailable.
+    pub(crate) fn gpu_plan(&self) -> Option<&dyn crate::gpu::decode::DecodePlan> {
+        if !crate::gpu::decode_enabled() || !self.stream.is_none() {
+            return None;
+        }
+        self.gpu_plan
+            .get_or_init(|| {
+                let be = crate::gpu::active()?;
+                let g = self.gpu_graph()?;
+                be.decode_plan(&g)
+            })
+            .as_deref()
+    }
+
+    /// Runs token `tok` through the GPU decode plan: the final-normed hidden state and, if
+    /// wanted, the logits. None (nothing changed) when GPU decoding is off or unavailable.
+    fn gpu_step(&self, sess: &mut QwenSession, tok: u32, want_logits: bool) -> Option<(Vec<f32>, Option<Vec<f32>>)> {
+        if !crate::gpu::decode_enabled() || self.stream.is_some() {
+            return None;
+        }
+        let plan = self.gpu_plan()?;
+        let _timer = prof::start(Cat::Matmul);
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let mut x = vec![0f32; h];
+        self.embed.row(tok as usize, &mut x);
+        let (mut cs, sin) = self.rope_cs(&sess.spans, sess.pos, 1);
+        cs.extend_from_slice(&sin);
+        let mut hidden = vec![0f32; h];
+        let mut logits = want_logits.then(|| vec![0f32; cfg.vocab_size]);
+        let mut kv: Vec<&mut LayerCache> = sess.kv.iter_mut().flatten().collect();
+        let mut states: Vec<&mut [f32]> = sess
+            .gdn
+            .iter_mut()
+            .flatten()
+            .flat_map(|g| [&mut g.s[..], &mut g.conv[..]])
+            .collect();
+        let ok = plan.step(
+            &mut sess.gpu,
+            crate::gpu::decode::Step {
+                pos: sess.pos,
+                rope_cs: &cs,
+                x: &x,
+                x2: &[],
+                kv: &mut kv,
+                states: &mut states,
+                hidden: &mut hidden,
+                logits: logits.as_deref_mut(),
+            },
+        );
+        if !ok {
+            return None;
+        }
+        sess.rec_span = None;
+        sess.pos += 1;
+        Some((hidden, logits))
     }
 
     /// RoPE tables for positions `start..start + t`: plain positions, or M-RoPE positions when
@@ -823,25 +1134,47 @@ impl<'a> QwenModel<'a> {
 
     pub fn forward(&self, sess: &mut QwenSession, tokens: &[u32]) -> Vec<f32> {
         let t = tokens.len();
+        if t == 1 {
+            // OXINFER_GPU_DECODE_CHECK=1: compare every GPU step with the CPU path.
+            let before = crate::gpu::decode::check().then(|| sess.clone());
+            if let Some((_, Some(l))) = self.gpu_step(sess, tokens[0], true) {
+                if let Some(mut s2) = before {
+                    let hs = self.forward_impl(&mut s2, tokens, &[], false, false);
+                    crate::gpu::decode::report(s2.pos - 1, &self.logits(&hs, 1), &l);
+                }
+                return l;
+            }
+        }
         let hs = self.forward_hidden_mm(sess, tokens, &[]);
         self.logits(&hs[(t - 1) * self.cfg.hidden_size..], 1)
     }
 
     /// Final-normed hidden states `[t, hidden]` for `tokens` appended at `sess.pos`.
     pub fn forward_hidden_mm(&self, sess: &mut QwenSession, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {
-        self.forward_impl(sess, tokens, mm, false)
+        self.forward_impl(sess, tokens, mm, false, true)
     }
 
     /// `forward_hidden_mm` without overrides that also records what `sess.rewind` needs to go
     /// back to any position inside `tokens` (speculative verification): one copy of the Gated
     /// DeltaNet states, and a replay of the kept tokens' delta rule on rewind.
     pub fn forward_hidden_rec(&self, sess: &mut QwenSession, tokens: &[u32]) -> Vec<f32> {
-        self.forward_impl(sess, tokens, &[], true)
+        self.forward_impl(sess, tokens, &[], true, true)
     }
 
-    fn forward_impl(&self, sess: &mut QwenSession, tokens: &[u32], mm: &[(usize, &[f32])], record: bool) -> Vec<f32> {
+    fn forward_impl(&self, sess: &mut QwenSession, tokens: &[u32], mm: &[(usize, &[f32])], record: bool, gpu: bool) -> Vec<f32> {
         let t = tokens.len();
         assert!(t > 0);
+        if t > 1 && gpu {
+            let _ = self.gpu_plan();
+        }
+        if t == 1
+            && gpu
+            && mm.is_empty()
+            && !record
+            && let Some((hs, _)) = self.gpu_step(sess, tokens[0], false)
+        {
+            return hs;
+        }
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps as f32;
@@ -1065,8 +1398,10 @@ impl<'a> QwenModel<'a> {
             dt_bias: gd.dt_bias.clone(),
         };
         if let Some(r) = rec.as_deref_mut() {
-            r.s0.clone_from(&st.s);
-            r.conv0.clone_from(&st.conv);
+            r.s0.clear();
+            r.s0.extend_from_slice(&st.s);
+            r.conv0.clear();
+            r.conv0.extend_from_slice(&st.conv);
             r.qkv.clone_from(&qkv);
             r.c.clone_from(&c);
             r.b.clone_from(&b);
@@ -1088,7 +1423,7 @@ impl<'a> QwenModel<'a> {
                     new_state[slot * conv_dim..(slot + 1) * conv_dim].copy_from_slice(&st.conv[old * conv_dim..(old + 1) * conv_dim]);
                 }
             }
-            st.conv = new_state;
+            st.conv.copy_from_slice(&new_state);
         }
 
         // Gated delta rule, recurrent over time, parallel over value heads.

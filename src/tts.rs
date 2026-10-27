@@ -135,6 +135,9 @@ pub struct SpeakerOptions {
     pub snac_f32: bool,
     /// Where repo ids are downloaded. Key `cache_dir`.
     pub cache_dir: Option<PathBuf>,
+    /// Generate on the GPU, a whole token per submission (process-wide; None leaves the current
+    /// setting, default on: [`crate::gpu::set_decode`]). Key `gpu_decode`.
+    pub gpu_decode: Option<bool>,
 }
 
 impl Default for SpeakerOptions {
@@ -147,6 +150,7 @@ impl Default for SpeakerOptions {
             snac: None,
             snac_f32: true,
             cache_dir: None,
+            gpu_decode: None,
         }
     }
 }
@@ -161,7 +165,7 @@ fn parse_bool(key: &str, v: &str) -> Result<bool> {
 
 impl SpeakerOptions {
     /// Sets an option by key (`threads`, `device`, `quant`, `mmap`, `snac`, `snac_f32`,
-    /// `cache_dir`).
+    /// `cache_dir`, `gpu_decode`).
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         match key {
             "threads" => self.threads = Some(value.parse().with_context(|| format!("threads: {value:?}"))?),
@@ -171,7 +175,8 @@ impl SpeakerOptions {
             "snac" => self.snac = Some(value.to_string()),
             "snac_f32" => self.snac_f32 = parse_bool(key, value)?,
             "cache_dir" => self.cache_dir = Some(PathBuf::from(value)),
-            _ => bail!("unknown option {key} (threads, device, quant, mmap, snac, snac_f32, cache_dir)"),
+            "gpu_decode" => self.gpu_decode = Some(parse_bool(key, value)?),
+            _ => bail!("unknown option {key} (threads, device, quant, mmap, snac, snac_f32, cache_dir, gpu_decode)"),
         }
         Ok(())
     }
@@ -674,6 +679,9 @@ impl Speaker {
             let mut o = pool::options();
             o.threads = n;
             pool::configure_with(o);
+        }
+        if let Some(on) = opts.gpu_decode {
+            crate::gpu::set_decode(Some(on));
         }
         let gpu = if crate::gpu::initialized() {
             crate::gpu::active()

@@ -41,6 +41,13 @@ impl<T: Copy> PageVec<T> {
         Self { ptr, len, bytes }
     }
 }
+impl<T: Copy> Clone for PageVec<T> {
+    fn clone(&self) -> Self {
+        let mut v = Self::zeroed(self.len);
+        v.copy_from_slice(self);
+        v
+    }
+}
 impl<T: Copy> Drop for PageVec<T> {
     fn drop(&mut self) {
         let layout = std::alloc::Layout::from_size_align(self.bytes, PAGE).expect("layout");

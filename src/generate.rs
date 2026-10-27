@@ -65,6 +65,9 @@ impl TextLm for Model<'_> {
     fn mm_runs_whole(&self) -> bool {
         self.cfg.vision_bidirectional()
     }
+    fn forward(&self, sess: &mut Session, tokens: &[u32]) -> Vec<f32> {
+        Model::forward(self, sess, tokens)
+    }
 }
 
 impl TextLm for QwenModel<'_> {
@@ -86,6 +89,9 @@ impl TextLm for QwenModel<'_> {
     }
     fn add_vision_span(&self, sess: &mut QwenSession, start: usize, gh: usize, gw: usize) {
         sess.add_vision_span(start, gh, gw)
+    }
+    fn forward(&self, sess: &mut QwenSession, tokens: &[u32]) -> Vec<f32> {
+        QwenModel::forward(self, sess, tokens)
     }
 }
 

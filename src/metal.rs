@@ -37,6 +37,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+#[path = "metal_decode.rs"]
+pub(crate) mod decode;
+
 const TILE: usize = 64; // out rows and tokens per threadgroup
 const MIN_T: usize = 16; // smaller token counts stay on the CPU
 const MIN_FLOPS: f64 = 3e8; // ~0.15 ms submission cost vs ~1 TFLOP/s on the CPU
@@ -787,25 +790,27 @@ kernel void x_half(device const float* x [[buffer(0)]], device half* xh [[buffer
     for (uint i = tid; i < n4; i += 256) out[i] = half4(row[i] * s);
     if (tid == 0) rs[r] = inv;
 }
-// SiLU(gate) * up (GELU-tanh(gate) * up when p.gather is set) of fused [gate | up] rows (n each)
-// into scaled half rows, as x_half.
+// act(gate) * up (SiLU, or GELU-tanh with `gelu`) of fused [gate | up] rows (n each) into scaled
+// half rows, as x_half; with `split` = G nonzero, gate row r is at r * n and up row r at
+// (G + r) * n (gate and up experts stored apart).
 inline float4 silu_mul4(float4 g, float4 u) { return g / (1.0f + exp(-g)) * u; }
 inline float4 gelu_mul4(float4 g, float4 u) { return g / (1.0f + exp(-1.5957691f * (g + 0.044715f * g * g * g))) * u; }
 inline float4 act_mul4(float4 g, float4 u, uint gelu) { return gelu != 0 ? gelu_mul4(g, u) : silu_mul4(g, u); }
+struct SH { uint n; uint gelu; uint split; uint _p; };
 kernel void silu_half(device const float* gu [[buffer(0)]], device half* ah [[buffer(1)]], device float* rs [[buffer(2)]],
-                      constant XH& p [[buffer(3)]],
+                      constant SH& p [[buffer(3)]],
                       uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                       uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float red[8];
-    device const float4* g = (device const float4*)(gu + (ulong)r * 2 * p.n);
-    device const float4* u = g + p.n / 4;
+    device const float4* g = (device const float4*)(gu + (ulong)r * (p.split != 0 ? 1 : 2) * p.n);
+    device const float4* u = p.split != 0 ? (device const float4*)(gu + (ulong)(p.split + r) * p.n) : g + p.n / 4;
     uint n4 = p.n / 4;
     float m = 0.f;
-    for (uint i = tid; i < n4; i += 256) { float4 v = abs(act_mul4(g[i], u[i], p.gather)); m = max(m, max(max(v.x, v.y), max(v.z, v.w))); }
+    for (uint i = tid; i < n4; i += 256) { float4 v = abs(act_mul4(g[i], u[i], p.gelu)); m = max(m, max(max(v.x, v.y), max(v.z, v.w))); }
     m = tg_max(m, sg, lane, red);
     float inv, s = row_scale(m, inv);
     device half4* out = (device half4*)(ah + (ulong)r * p.n);
-    for (uint i = tid; i < n4; i += 256) out[i] = half4(act_mul4(g[i], u[i], p.gather) * s);
+    for (uint i = tid; i < n4; i += 256) out[i] = half4(act_mul4(g[i], u[i], p.gelu) * s);
     if (tid == 0) rs[r] = inv;
 }
 // out[t] = sum over the token's k slots of weight * o[row].
@@ -1064,6 +1069,9 @@ struct MoeDev {
     bufs: Vec<Buf>,
     /// Per-expert (data, scales) GPU addresses of each projection, for `n_exp` experts.
     ep: (Id, Id),
+    /// Separate up projections (GGUF): their pipeline, row bytes and address table; `pipes.0`
+    /// and `ep.0` are then the gate projections alone.
+    up: Option<(Id, u32, Id)>,
     n_exp: usize,
     /// GELU-tanh experts (Gemma 4) rather than SiLU.
     gelu: bool,
@@ -1078,7 +1086,11 @@ impl Drop for MoeDev {
             r.update(&self.bufs.iter().map(|b| b.id).collect::<Vec<_>>(), false);
         }
         let (f, sel) = self.release;
-        let ids = self.bufs.iter().map(|b| b.id).chain([self.ep.0, self.ep.1]);
+        let ids = self
+            .bufs
+            .iter()
+            .map(|b| b.id)
+            .chain([self.ep.0, self.ep.1, self.up.map_or(std::ptr::null_mut(), |u| u.2)]);
         for id in ids.filter(|id| !id.is_null()) {
             // SAFETY: each buffer was created for this state and is released once.
             unsafe { f(id, sel) };
@@ -1177,6 +1189,9 @@ pub struct MetalBackend {
     residency: Option<std::sync::Arc<Residency>>,
     staging: Mutex<Staging>,
     sels: Sels,
+    /// The compiled shader library, and pipelines made from it on demand (decode kernels).
+    lib: Id,
+    named: Mutex<std::collections::HashMap<String, Id>>,
 }
 unsafe impl Send for MetalBackend {}
 unsafe impl Sync for MetalBackend {}
@@ -1265,7 +1280,7 @@ impl MetalBackend {
             Some("1") => true,
             _ => apple10,
         };
-        let base_src = format!("{SHADER_SRC}{}{GGUF_SHADER_SRC}", gguf_shader_tables());
+        let base_src = format!("{SHADER_SRC}{}{GGUF_SHADER_SRC}{}", gguf_shader_tables(), decode::shader_src());
         let compile = |src: &str, metal4: bool| -> Result<Id> {
             let src = CString::new(src)?;
             let ns_src = unsafe { msg_str(nsstring_cls, o.sel(c"stringWithUTF8String:"), src.as_ptr()) };
@@ -1473,7 +1488,43 @@ impl MetalBackend {
                 m_o: Grow::new(),
             }),
             sels,
+            lib,
+            named: Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// The pipeline of kernel `name` in the library (made once, then cached).
+    pub(crate) fn named_pipeline(&self, name: &str) -> Option<Id> {
+        let mut m = self.named.lock().unwrap();
+        if let Some(&p) = m.get(name) {
+            return Some(p);
+        }
+        let msg_str: unsafe extern "C" fn(Id, Sel, *const std::ffi::c_char) -> Id = self.o.msg_send();
+        let get_class: unsafe extern "C" fn(*const std::ffi::c_char) -> Id =
+            unsafe { self.o.objc.get(c"objc_getClass") }.ok()?.into_inner_unsafe();
+        let cname = CString::new(name).ok()?;
+        let ns_name = unsafe {
+            msg_str(
+                get_class(c"NSString".as_ptr()),
+                self.o.sel(c"stringWithUTF8String:"),
+                cname.as_ptr(),
+            )
+        };
+        let msg_fn: Msg1 = self.o.msg_send();
+        let f = unsafe { msg_fn(self.lib, self.o.sel(c"newFunctionWithName:"), ns_name) };
+        if f.is_null() {
+            return None;
+        }
+        let new_pipe: MsgNewPipe = self.o.msg_send();
+        let mut err: Id = std::ptr::null_mut();
+        let p = unsafe { new_pipe(self.device, self.o.sel(c"newComputePipelineStateWithFunction:error:"), f, &mut err) };
+        let void: MsgVoid = self.o.msg_send();
+        unsafe { void(f, self.sels.release) };
+        if p.is_null() {
+            return None;
+        }
+        m.insert(name.to_string(), p);
+        Some(p)
     }
 
     /// Wraps host memory as a shared buffer without copying (the enclosing pages are mapped; the
@@ -2328,13 +2379,32 @@ impl Backend for MetalBackend {
         }
     }
 
-    fn upload_moe(&self, gate_up: &[WeightRef], down: &[WeightRef], h: usize, mi: usize, gelu: bool) -> Option<DeviceWeight> {
+    fn decode_plan<'s>(&'s self, g: &crate::gpu::decode::Graph) -> Option<Box<dyn crate::gpu::decode::DecodePlan + 's>> {
+        self.build_plan(g)
+            .map(|p| Box::new(p) as Box<dyn crate::gpu::decode::DecodePlan + 's>)
+    }
+
+    fn upload_moe(
+        &self,
+        gate_up: &[WeightRef],
+        up: Option<&[WeightRef]>,
+        down: &[WeightRef],
+        h: usize,
+        mi: usize,
+        gelu: bool,
+    ) -> Option<DeviceWeight> {
         self.mma()?;
-        if !crate::gpu::moe_offload() || gate_up.is_empty() || gate_up.len() != down.len() {
+        if !crate::gpu::moe_offload() || gate_up.is_empty() || gate_up.len() != down.len() || up.is_some_and(|u| u.len() != down.len()) {
             return None;
         }
         let affine = |w: &WeightRef| matches!(w, WeightRef::Q4(m) if m.offsets.is_some());
-        let (pg, _) = self.mma_pipe(&gate_up[0], affine(&gate_up[0]), 2 * mi, h, Tile::Grouped)?;
+        // Rows of the first projection: fused gate and up, or the gate alone.
+        let g_rows = if up.is_some() { mi } else { 2 * mi };
+        let (pg, _) = self.mma_pipe(&gate_up[0], affine(&gate_up[0]), g_rows, h, Tile::Grouped)?;
+        let pu = match up {
+            Some(u) => Some(self.mma_pipe(&u[0], affine(&u[0]), mi, h, Tile::Grouped)?.0),
+            None => None,
+        };
         let (pd, _) = self.mma_pipe(&down[0], affine(&down[0]), h, mi, Tile::Grouped)?;
         let row_bytes = |w: &WeightRef| match w {
             WeightRef::Gguf(g) => g.row_bytes(),
@@ -2355,7 +2425,8 @@ impl Backend for MetalBackend {
         let mut all: Vec<(usize, usize)> = Vec::new();
         for (w, n_out, n_in, pipe) in gate_up
             .iter()
-            .map(|w| (w, 2 * mi, h, pg))
+            .map(|w| (w, g_rows, h, pg))
+            .chain(up.unwrap_or(&[]).iter().map(|w| (w, mi, h, pu.unwrap())))
             .chain(down.iter().map(|w| (w, h, mi, pd)))
         {
             if self.mma_pipe(w, affine(w), n_out, n_in, Tile::Grouped)?.0 != pipe {
@@ -2381,6 +2452,7 @@ impl Backend for MetalBackend {
             row_bytes: (row_bytes(&gate_up[0]) as u32, row_bytes(&down[0]) as u32),
             bufs: Vec::with_capacity(spans.len()),
             ep: (std::ptr::null_mut(), std::ptr::null_mut()),
+            up: None,
             n_exp: gate_up.len(),
             gelu,
             residency: None,
@@ -2418,6 +2490,22 @@ impl Backend for MetalBackend {
             if slot.is_null() {
                 return None;
             }
+        }
+        if let (Some(u), Some(pu)) = (up, pu) {
+            let tab = table(u);
+            let id = unsafe {
+                copy(
+                    self.device,
+                    self.sels.new_buffer_bytes,
+                    tab.as_ptr() as *const c_void,
+                    tab.len() * 16,
+                    0,
+                )
+            };
+            if id.is_null() {
+                return None;
+            }
+            dev.up = Some((pu, row_bytes(&u[0]) as u32, id));
         }
         if let Some(r) = &self.residency {
             r.update(&dev.bufs.iter().map(|b| b.id).collect::<Vec<_>>(), true);
@@ -2513,37 +2601,55 @@ impl Backend for MetalBackend {
         let encode = |e: &Enc, _: &()| {
             e.use_resources(&resident);
             self.encode_x_half(e, st.x, st.xh.id, st.rs.id, h, rows, Some(st.m_src.id));
-            let grouped = |pipe: Id, ep: Id, xh: Id, out: Id, rs: Id, p: &MmaParams| {
+            let grouped = |pipe: Id, ep: Id, xh: Id, out: (Id, usize), rs: Id, p: &MmaParams| {
                 e.pipe(pipe);
                 e.buf(ep, 0, 0);
                 e.buf(st.m_tiles.id, 0, 1);
                 e.buf(xh, 0, 2);
-                e.buf(out, 0, 3);
+                e.buf(out.0, out.1, 3);
                 e.bytes(p, 4);
                 e.buf(rs, 0, 5);
                 e.dispatch((p.n_out as usize / 64, tiles.len()), 128);
             };
-            grouped(
-                md.pipes.0,
-                md.ep.0,
-                st.xh.id,
-                st.m_gu.id,
-                st.rs.id,
-                &params(2 * mi, h, md.row_bytes.0),
-            );
+            match md.up {
+                // Gate rows [rows, mi], then up rows [rows, mi].
+                Some((pu, rb, ep)) => {
+                    grouped(
+                        md.pipes.0,
+                        md.ep.0,
+                        st.xh.id,
+                        (st.m_gu.id, 0),
+                        st.rs.id,
+                        &params(mi, h, md.row_bytes.0),
+                    );
+                    grouped(pu, ep, st.xh.id, (st.m_gu.id, rows * mi * 4), st.rs.id, &params(mi, h, rb));
+                }
+                None => grouped(
+                    md.pipes.0,
+                    md.ep.0,
+                    st.xh.id,
+                    (st.m_gu.id, 0),
+                    st.rs.id,
+                    &params(2 * mi, h, md.row_bytes.0),
+                ),
+            }
             #[repr(C)]
-            struct Xh {
+            struct Sh {
                 n: u32,
-                gather: u32,
+                gelu: u32,
+                split: u32,
+                _p: u32,
             }
             e.pipe(m.silu_half);
             e.buf(st.m_gu.id, 0, 0);
             e.buf(st.m_ah.id, 0, 1);
             e.buf(st.m_rs2.id, 0, 2);
             e.bytes(
-                &Xh {
+                &Sh {
                     n: mi as u32,
-                    gather: md.gelu as u32,
+                    gelu: md.gelu as u32,
+                    split: if md.up.is_some() { rows as u32 } else { 0 },
+                    _p: 0,
                 },
                 3,
             );
@@ -2552,7 +2658,7 @@ impl Backend for MetalBackend {
                 md.pipes.1,
                 md.ep.1,
                 st.m_ah.id,
-                st.m_o.id,
+                (st.m_o.id, 0),
                 st.m_rs2.id,
                 &params(h, mi, md.row_bytes.1),
             );
@@ -2831,7 +2937,14 @@ mod tests {
         let routes: Vec<Vec<(usize, f32)>> = (0..t)
             .map(|i| vec![([0, 1, 2, 3, 4, 6, 7][i % 7], 0.7), ([1, 7][i % 2], 0.3)])
             .collect();
-        for (q4, gelu) in [(false, false), (true, false), (false, true), (true, true)] {
+        // bf16 / Q4 fused, SiLU / GELU; bf16 with gate and up apart (GGUF layout).
+        for (q4, gelu, split) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, false),
+            (false, false, true),
+        ] {
             let (wg, wd): (Vec<WeightRef>, Vec<WeightRef>) = (0..ne)
                 .map(|e| match q4 {
                     false => (
@@ -2841,7 +2954,12 @@ mod tests {
                     true => (WeightRef::Q4(&gu4[e]), WeightRef::Q4(&dn4[e])),
                 })
                 .unzip();
-            let dev = be.upload_moe(&wg, &wd, h, mi, gelu).unwrap();
+            let half = |e: usize, i: usize| WeightRef::Bf16(&gu[e * 2 * mi * h + i * mi * h..e * 2 * mi * h + (i + 1) * mi * h]);
+            let (sg, su): (Vec<WeightRef>, Vec<WeightRef>) = (0..ne).map(|e| (half(e, 0), half(e, 1))).unzip();
+            let dev = match split {
+                false => be.upload_moe(&wg, None, &wd, h, mi, gelu).unwrap(),
+                true => be.upload_moe(&sg, Some(&su), &wd, h, mi, gelu).unwrap(),
+            };
             let mut y = vec![0f32; t * h];
             assert!(be.moe(&x, t, h, mi, &routes, &dev, &mut y));
             let fg: Vec<Vec<f32>> = wg.iter().map(|w| dense(w, 2 * mi, h)).collect();
@@ -2867,7 +2985,7 @@ mod tests {
             }
 
             let e = row_err(&y, &r, h);
-            assert!(e < 3e-3, "q4 {q4} gelu {gelu}: relative error {e}");
+            assert!(e < 3e-3, "q4 {q4} gelu {gelu} split {split}: relative error {e}");
         }
     }
 }

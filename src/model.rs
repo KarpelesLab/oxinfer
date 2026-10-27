@@ -10,6 +10,9 @@ use crate::quant::{Q4Matrix, QKind, QMatrix, quantize_bf16, quantize_q4};
 use crate::safetensors::{ModelFiles, Stored};
 use anyhow::{Context, Result, bail};
 
+#[path = "model_gpu.rs"]
+mod gpu_dec;
+
 /// Weight precision for the streamed (linear) weights.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Quant {
@@ -783,6 +786,8 @@ pub struct Model<'a> {
     /// Weight streaming: unit 0 is the PLE projection when there is one, then the layers, then
     /// the LM head (see [`Model::stream_units`]).
     stream: Option<crate::stream::StreamHook>,
+    /// Single-token decoding on the GPU (see `model_gpu.rs`), compiled on first use.
+    gpu_plan: std::sync::OnceLock<Option<Box<dyn crate::gpu::decode::DecodePlan>>>,
 }
 
 #[derive(Clone)]
@@ -792,6 +797,9 @@ pub struct LayerCache {
     pub n_kv: usize,
     pub hd: usize,
     pub len: usize,
+    /// Positions unchanged since a device copy of the cache last synced (truncations lower it;
+    /// see `crate::gpu::decode`).
+    pub(crate) kept: usize,
 }
 
 impl LayerCache {
@@ -802,6 +810,7 @@ impl LayerCache {
             n_kv,
             hd,
             len: 0,
+            kept: 0,
         }
     }
     pub(crate) fn push(&mut self, k: &[f32], v: &[f32], t: usize) {
@@ -820,7 +829,12 @@ impl LayerCache {
         let o = (pos * self.n_kv + kvh) * self.hd;
         &self.v[o..o + self.hd]
     }
+    /// All cached keys and values (`[len, n_kv, hd]` each).
+    pub fn data(&self) -> (&[f32], &[f32]) {
+        (&self.k, &self.v)
+    }
     pub(crate) fn truncate(&mut self, len: usize) {
+        self.kept = self.kept.min(len);
         if len < self.len {
             self.k.truncate(len * self.n_kv * self.hd);
             self.v.truncate(len * self.n_kv * self.hd);
@@ -833,6 +847,8 @@ impl LayerCache {
 #[derive(Clone)]
 pub struct Session {
     caches: Vec<Option<LayerCache>>,
+    /// Device state of GPU decoding (KV cache copies).
+    gpu: crate::gpu::decode::Slot,
     pub pos: usize,
 }
 
@@ -1037,6 +1053,7 @@ impl<'a> Model<'a> {
             inv_freq_sliding,
             inv_freq_full,
             stream: None,
+            gpu_plan: std::sync::OnceLock::new(),
         })
     }
 
@@ -1158,7 +1175,11 @@ impl<'a> Model<'a> {
             .iter()
             .map(|l| if l.own_kv { Some(LayerCache::new(l.n_kv, l.hd)) } else { None })
             .collect();
-        Session { caches, pos: 0 }
+        Session {
+            caches,
+            pos: 0,
+            gpu: Default::default(),
+        }
     }
 
     /// The main model's input embedding of `tok`, scaled by sqrt(hidden) (as fed to the drafter).
@@ -1195,6 +1216,17 @@ impl<'a> Model<'a> {
     pub fn forward(&self, sess: &mut Session, tokens: &[u32]) -> Vec<f32> {
         let t = tokens.len();
         let h = self.cfg.hidden_size;
+        if t == 1 {
+            // OXINFER_GPU_DECODE_CHECK=1: compare every GPU step with the CPU path.
+            let before = crate::gpu::decode::check().then(|| sess.clone());
+            if let Some((_, Some(l))) = self.gpu_step(sess, tokens[0], true) {
+                if let Some(mut s2) = before {
+                    let hs = self.forward_hidden_cpu(&mut s2, tokens, &[]);
+                    crate::gpu::decode::report(s2.pos - 1, &self.logits(&hs, 1), &l);
+                }
+                return l;
+            }
+        }
         let hs = self.forward_hidden(sess, tokens);
         self.logits(&hs[(t - 1) * h..], 1)
     }
@@ -1208,8 +1240,21 @@ impl<'a> Model<'a> {
     /// the given embedding (a multimodal soft token in text space) instead of the token
     /// embedding; their per-layer-embedding lookup uses the pad token, as in the reference.
     pub fn forward_hidden_mm(&self, sess: &mut Session, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {
+        if tokens.len() == 1
+            && mm.is_empty()
+            && let Some((hs, _)) = self.gpu_step(sess, tokens[0], false)
+        {
+            return hs;
+        }
+        self.forward_hidden_cpu(sess, tokens, mm)
+    }
+
+    fn forward_hidden_cpu(&self, sess: &mut Session, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {
         let t = tokens.len();
         assert!(t > 0);
+        if t > 1 {
+            let _ = self.gpu_plan();
+        }
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let nl = cfg.num_hidden_layers;

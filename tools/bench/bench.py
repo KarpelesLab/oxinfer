@@ -25,7 +25,8 @@ Variants (pick with --variants; spec variants only run the code/prose workloads)
   llama-cpu       llama.cpp, --device none -ngl 0 (CPU threads; Accelerate BLAS for batches)
   llama-mtp2/3    llama.cpp, embedded MTP head, --spec-type draft-mtp, depth 2 / 3
   llama-fast3     llama.cpp, FastMTP sidecar (--sidecar, needs the HauhauCS patch), depth 3
-  ox              oxinfer defaults (Metal prefill when available)
+  ox              oxinfer defaults (Metal prefill and GPU decode when available)
+  ox-prefill      oxinfer --gpu-decode off (GPU prefill only, decode on the CPU)
   ox-cpu          oxinfer --device cpu
   ox-mtp          oxinfer --mtp
   ox-mtpfrom      oxinfer --mtp-from SIDECAR
@@ -92,6 +93,7 @@ def ox_args(variant, a):
     return base + {
         "ox": [],
         "ox-cpu": ["--device", "cpu"],
+        "ox-prefill": ["--gpu-decode", "off"],
         "ox-mtp": ["--mtp"],
         "ox-mtpfrom": ["--mtp-from", a.sidecar or ""],
     }[variant]

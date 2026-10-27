@@ -168,7 +168,7 @@ impl<'a> Experts<'a> {
     }
 
     /// The routed experts on the active accelerator (`Backend::moe`), if it takes them: fused
-    /// gate/up weights that are not streamed, and a prefill-sized pass.
+    /// or split gate/up weights that are not streamed, and a prefill-sized pass.
     fn forward_device(&self, x: &[f32], t: usize, h: usize, routes: &[Vec<(usize, f32)>], y: &mut [f32]) -> bool {
         let mi = self.inter;
         let Some(be) = crate::gpu::active() else {
@@ -183,14 +183,22 @@ impl<'a> Experts<'a> {
         }
         let dev = self.dev.get_or_init(|| {
             let mut gu = Vec::with_capacity(self.gate_up.len());
+            let mut up = Vec::with_capacity(self.gate_up.len());
             for g in &self.gate_up {
                 match g {
                     GateUp::Fused(l) if !l.is_transient() => gu.push(l.as_ref()),
+                    GateUp::Split(a, b) if !a.is_transient() && !b.is_transient() => {
+                        gu.push(a.as_ref());
+                        up.push(b.as_ref());
+                    }
                     _ => return None,
                 }
             }
+            if !up.is_empty() && up.len() != gu.len() {
+                return None;
+            }
             let down: Vec<_> = self.down.iter().map(|l| l.as_ref()).collect();
-            be.upload_moe(&gu, &down, h, mi, self.act == Act::GeluTanh)
+            be.upload_moe(&gu, (!up.is_empty()).then_some(&up[..]), &down, h, mi, self.act == Act::GeluTanh)
         });
         let Some(dev) = dev else {
             return false;

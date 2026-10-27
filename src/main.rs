@@ -222,6 +222,8 @@ fn usage() -> ! {
          \x20 --image FILE         with --prompt: answer a question about the image (repeatable)\n\
          \x20 --devices            list detected CPU features and GPUs, then exit\n\
          \x20 --device D           auto (default) | cpu | cuda | metal | vulkan\n\
+         \x20 --gpu-decode M       on (default) | off: generate a whole token per GPU submission\n\
+         \x20                      (Metal; Llama 3, Orpheus, Qwen3, Qwen3.5 / 3.8 dense)\n\
          \x20 --dump-logits FILE   write last-prompt-token logits (f32 LE) and exit\n\
          \n\
          ANEMLL Core ML models (a meta.yaml folder; macOS 15 / iOS 18, Apple Neural Engine):\n\
@@ -513,6 +515,15 @@ fn parse_args() -> Result<Args> {
                     .split_once(['x', 'X'])
                     .with_context(|| format!("--size expects WIDTHxHEIGHT, got {v}"))?;
                 a.size = Some((w.parse()?, h.parse()?));
+            }
+            "--gpu-decode" => {
+                let v = val()?;
+                oxinfer::gpu::set_decode(match v.as_str() {
+                    "on" | "1" | "true" => Some(true),
+                    "off" | "0" | "false" => Some(false),
+                    "auto" => None,
+                    _ => bail!("--gpu-decode expects on|off|auto, got {v}"),
+                });
             }
             "--device" => {
                 let v = val()?;
@@ -888,6 +899,10 @@ fn run(mut args: Args) -> Result<()> {
     eprintln!("[platform: {}]", plat.summary());
     let gpu = oxinfer::gpu::init(&plat, args.device);
     match gpu {
+        Some(b) if oxinfer::gpu::decode_enabled() => eprintln!(
+            "[device: {} (prefill matmuls and, where supported, whole decode steps on the GPU)]",
+            b.name()
+        ),
         Some(b) => eprintln!("[device: {} (prefill matmuls on the GPU, everything else on the CPU)]", b.name()),
         None => eprintln!("[device: cpu]"),
     }

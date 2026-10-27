@@ -135,6 +135,11 @@ pub struct EngineOptions {
     /// MoE experts on the GPU during prefill. Process-wide, applied on load; None leaves the
     /// current setting ([`crate::gpu::set_moe_offload`]). Key `gpu_moe`.
     pub gpu_moe: Option<bool>,
+    /// Single-token decode steps entirely on the GPU (one submission per token) where the backend
+    /// supports the model (Metal: dense Llama 3 / Qwen3 / Qwen3.5 / 3.8 layers); everything else
+    /// stays as it was. Process-wide, applied on load; None leaves the current setting (default
+    /// on; [`crate::gpu::set_decode`]). Key `gpu_decode`.
+    pub gpu_decode: Option<bool>,
     /// Typed decisions ([`Engine::decide`]) with the decision assets of this Jev bundle (path or
     /// repo id) on top of the loaded base model: only the small files are fetched (adapter, head,
     /// configs; see [`crate::decide::ASSET_FILES`]), not the backbone, and the base must match
@@ -257,6 +262,7 @@ impl Default for EngineOptions {
             coreml_prefill: CoreMlPrefill::Auto,
             gpu_exact: None,
             gpu_moe: None,
+            gpu_decode: None,
             decision_from: None,
         }
     }
@@ -308,6 +314,7 @@ impl EngineOptions {
         "coreml_prefill",
         "gpu_exact",
         "gpu_moe",
+        "gpu_decode",
         "decision_from",
     ];
 
@@ -376,6 +383,7 @@ impl EngineOptions {
             }
             "gpu_exact" => self.gpu_exact = Some(parse_bool(key, value)?),
             "gpu_moe" => self.gpu_moe = Some(parse_bool(key, value)?),
+            "gpu_decode" => self.gpu_decode = Some(parse_bool(key, value)?),
             "decision_from" => self.decision_from = opt_str(value),
             _ => bail!("unknown option {key:?} (known: {})", Self::KEYS.join(", ")),
         }
@@ -840,6 +848,9 @@ impl Engine {
         }
         if let Some(on) = opts.gpu_moe {
             crate::gpu::set_moe_offload(on);
+        }
+        if let Some(on) = opts.gpu_decode {
+            crate::gpu::set_decode(Some(on));
         }
         let gpu = if crate::gpu::initialized() {
             crate::gpu::active()

@@ -8,6 +8,9 @@ use std::any::Any;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+#[path = "gpu_decode.rs"]
+pub mod decode;
+
 /// A weight matrix in one of the supported storage formats (`[n_out, n_in]`).
 pub enum WeightRef<'a> {
     Bf16(&'a [u16]),
@@ -105,10 +108,20 @@ pub trait Backend: Send + Sync {
         false
     }
     /// Device state for the routed experts of an MoE layer: expert `e` has the fused gate/up
-    /// projection `gate_up[e]` (`[2 * inter, h]`, gate rows then up rows) and the down projection
-    /// `down[e]` (`[h, inter]`); the activation is GELU-tanh when `gelu` is set, else SiLU. None if
-    /// the backend does not run MoE layers.
-    fn upload_moe(&self, _gate_up: &[WeightRef], _down: &[WeightRef], _h: usize, _inter: usize, _gelu: bool) -> Option<DeviceWeight> {
+    /// projection `gate_up[e]` (`[2 * inter, h]`, gate rows then up rows), or with `up` the gate
+    /// projection `gate_up[e]` (`[inter, h]`) and the up projection `up[e]` (GGUF files store
+    /// them apart), and the down projection `down[e]` (`[h, inter]`); the activation is GELU-tanh
+    /// when `gelu` is set, else SiLU. None if the backend does not run MoE layers.
+    #[allow(clippy::too_many_arguments)]
+    fn upload_moe(
+        &self,
+        _gate_up: &[WeightRef],
+        _up: Option<&[WeightRef]>,
+        _down: &[WeightRef],
+        _h: usize,
+        _inter: usize,
+        _gelu: bool,
+    ) -> Option<DeviceWeight> {
         None
     }
     /// The routed experts of an MoE layer (`dev` from `upload_moe`) in one submission: token `i`
@@ -128,6 +141,11 @@ pub trait Backend: Send + Sync {
     ) -> bool {
         false
     }
+    /// Compiles a single-token decode graph (see [`decode`]); None when the backend cannot run
+    /// some op or weight of it (the model then decodes on the CPU).
+    fn decode_plan<'s>(&'s self, _g: &decode::Graph) -> Option<Box<dyn decode::DecodePlan + 's>> {
+        None
+    }
     /// Cumulative timing summary for `--profile`.
     fn stats(&self) -> Option<String> {
         None
@@ -139,6 +157,7 @@ static ACTIVE: OnceLock<Option<Box<dyn Backend>>> = OnceLock::new();
 /// Process-wide switches: 0 = unset (environment default), 1 = on, 2 = off.
 static EXACT: AtomicU8 = AtomicU8::new(0);
 static MOE: AtomicU8 = AtomicU8::new(0);
+static DECODE: AtomicU8 = AtomicU8::new(0);
 
 fn switch(a: &AtomicU8, env: &'static OnceLock<Option<String>>, var: &str, on_env: fn(&str) -> bool, default: bool) -> bool {
     match a.load(Ordering::Relaxed) {
@@ -172,6 +191,27 @@ pub fn set_moe_offload(on: bool) {
 pub fn moe_offload() -> bool {
     static ENV: OnceLock<Option<String>> = OnceLock::new();
     switch(&MOE, &ENV, "OXINFER_METAL_MOE", |v| v != "0", true)
+}
+
+/// Runs single-token decode steps entirely on the GPU (one submission per token) for the model
+/// families and weight formats the backend supports; prefill, speculative verification and
+/// anything unsupported stay where they were. Process-wide, read when a decode step starts.
+/// None restores the default (on, or `OXINFER_GPU_DECODE=0|1`).
+pub fn set_decode(on: Option<bool>) {
+    DECODE.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// See [`set_decode`].
+pub fn decode_enabled() -> bool {
+    static ENV: OnceLock<Option<String>> = OnceLock::new();
+    switch(&DECODE, &ENV, "OXINFER_GPU_DECODE", |v| v != "0", true)
 }
 
 /// Installs the backend for this process (call once, before loading models).
