@@ -1353,6 +1353,7 @@ Useful flags:
 | `--save-quantized DIR` | write a pre-quantized, text-only checkpoint at `--quant` precision (see below) and exit |
 | `--devices` | list detected CPU features and GPUs (Metal, CUDA, Vulkan) and exit |
 | `--device D` | `auto` (default: use a GPU backend when one exists), `cpu`, `metal`, `cuda`, `vulkan` |
+| `--gpu-decode on\|off` | generate a whole token per GPU submission (default `on` where supported; see [Decoding on the GPU](#decoding-on-the-gpu)); engine / speaker option `gpu_decode` |
 | `--prefill-chunk N` | tokens per prefill chunk (default 256 on the CPU, 1024 when a GPU backend is active) |
 | `--profile` | per-operation timing and bandwidth breakdown |
 | `--dump-logits FILE` | write the logits for the last prompt token (for reference checks) |
@@ -1499,7 +1500,45 @@ With the Metal backend (default on Apple Silicon) prefill runs on the GPU:
 | Qwen3.8-27B | `--quant q4` | ~18 tok/s | ~96 tok/s (256-token chunks) |
 | Gemma 4 26B-A4B (MoE) | bf16 / `--quant q4` | ~150 / ~136 tok/s | ~544 / ~576 tok/s (1758-token prompt) |
 
-(616-token prompt; decode speed is unchanged, see below for why.)
+(616-token prompt.)
+
+### Decoding on the GPU
+
+With the Metal backend, single-token decode steps also run on the GPU, the whole forward pass in
+one command buffer per token (see [Platforms](#platforms-and-accelerators) for what runs where).
+Measured on an M5 Max, 256 greedy tokens after a short prompt, against the same build with
+`--gpu-decode off` (GPU prefill, CPU decode; interleaved runs, load average ~5-11):
+
+| Model | Weights | CPU decode | GPU decode | llama.cpp Metal |
+|---|---|---|---|---|
+| Llama-3.2-1B-Instruct | GGUF Q4_K_M | 194-205 tok/s | 391 tok/s | 390-407 tok/s |
+| Llama-3.2-1B-Instruct | GGUF Q8_0 | 148-156 tok/s | 284 tok/s | 269-285 tok/s |
+| Orpheus 3B (text) | GGUF Q4_K_M | 87-94 tok/s | 161-168 tok/s | 176-189 tok/s |
+| Orpheus 3B (`--speak`) | GGUF Q4_K_M | 99 tok/s | 191 tok/s (RTF 0.46) | |
+| Qwen3.5-0.8B | GGUF Q8_0 | 179-182 tok/s | 356-361 tok/s | 282-284 tok/s |
+| Qwen3.5-0.8B | `--quant q8` | 196 tok/s | 351 tok/s | |
+| Qwen3.8-27B (HauhauCS) | GGUF Q4_K_P | 11.9-12.0 tok/s | 20.7-20.9 tok/s | 22.9-23.7 tok/s |
+| Zawen-v0.1-35B-A3B (MoE) | GGUF Q4_K_M | 60 tok/s | 137-140 tok/s | 105-116 tok/s |
+| Zawen-v0.1-35B-A3B (MoE) | GGUF Q8_0 | 47-48 tok/s | 111-114 tok/s | 85-89 tok/s |
+| Zawen-v0.1-35B-A3B (MoE) | Q4 (`--save-quantized`) | 70 tok/s | 152 tok/s | |
+| Gemma 4 E2B-it | Q4 (`--save-quantized`) | 134 tok/s | 201 tok/s | |
+| Gemma 4 E4B-it | Q4 (`--save-quantized`) | 61 tok/s | 115 tok/s | |
+| Gemma 4 26B-A4B (MoE) | GGUF Q4_0 | 63 tok/s | 130 tok/s | 115-116 tok/s |
+
+Long contexts cost attention time (the KV cache stays f32): Llama-3.2-1B Q4_K_M decodes at 297
+tok/s after a 2.5k-token prompt (CPU decode 139). The first step of a model compiles its plan
+(~0.1-0.2 s); a multi-token pass (the prompt) builds it ahead.
+
+Agreement with the CPU path (`OXINFER_GPU_DECODE_CHECK=1` runs every GPU step on the CPU too and
+prints the KL divergence of the two next-token distributions): on bf16 weights the two match to a
+KL of ~1e-12 (Llama 3.2 1B, Qwen3 0.6B, Qwen3.5-0.8B, Gemma 3 1B, Gemma 4 E2B / E4B / 26B-A4B, a
+small Qwen3.5 MoE), with long contexts and split attention included. On quantized weights the CPU
+kernels quantize the activations to int8 while the GPU keeps them f32, so the paths differ by a
+mean KL of 1e-4 to 6e-4 (dense) and up to 3e-3 (MoE, whose routing amplifies it); with 7 prompts
+of 128 tokens on Qwen3.8-27B Q4_K_P, 6 greedy texts were identical to the CPU's and one parted at
+token 26. Against llama.cpp Metal the first 64 greedy tokens were identical on every model and
+prompt above but Zawen Q4_K_M prose (both parted at token 25, as they did before). Orpheus GGUF
+speech made on the GPU transcribes back exactly with whisper-small.
 
 On GPUs whose cores have matrix units ("neural accelerators": M5, A19) the prefill GEMMs and the
 MoE expert layers run on them (Metal 4 tensor operations, see
@@ -1543,7 +1582,9 @@ M5 Max, 18 cores, 128 GB, with other jobs running: runs alternate between the en
 configuration ran 3 times, cells are the median with [min-max], and the load average is
 recorded per run (medians 9-15 here; tok/s of the CPU-only rows varied by 2x during a heavier
 spell, so treat small differences as noise). "Metal" is llama.cpp's default (every layer on the
-GPU) and oxinfer's default (prefill GEMMs on the GPU, everything else on the CPU); "CPU" is
+GPU) and, in the tables of this section, oxinfer with prefill GEMMs on the GPU and everything else
+on the CPU, which was its default before GPU decoding (see
+[Decoding on the GPU](#decoding-on-the-gpu) for the current default); "CPU" is
 `--device none -ngl 0` / `--device cpu` with each engine's default thread count (llama.cpp 6,
 oxinfer 18). The oxinfer default and speculative rows were rerun after the Metal matrix-unit
 prefill and the multi-token GGUF decode kernels landed (load ~11-12); the oxinfer CPU rows and
@@ -1589,8 +1630,9 @@ ids (no second BOS):
 
 On the CPU oxinfer decodes 1.4x faster than llama.cpp on Q4_K_M at the default thread counts
 (6 vs 18), but with 12 threads each (1B Q4_K_M, code) the gap is 5% (214-215 vs 221-227 tok/s);
-Q8_0 is on par. llama.cpp runs the whole pass on the GPU and decodes 1.8-2.2x faster there
-(oxinfer's GPU path is prefill only).
+Q8_0 is on par. llama.cpp runs the whole pass on the GPU and decodes 1.8-2.2x faster than
+oxinfer's GPU-prefill-only path; with GPU decoding oxinfer is on par (table in
+[Decoding on the GPU](#decoding-on-the-gpu)).
 Greedy outputs: oxinfer's Metal and CPU runs agree with each other on every workload but
 one (Orpheus prose, from token 3), and every CPU divergence between the engines within 64
 tokens (at tokens 0, 26, 46 and 62) is at the token where llama.cpp's own Metal and CPU runs
@@ -1624,26 +1666,30 @@ pp512 197 vs 129, decode 60.5 / 60.1 vs 58.9 / 56.9.
 
 Where the differences come from:
 
-- **Decode with a GPU**: llama.cpp runs the whole forward pass on the GPU (~450 GB/s), oxinfer
-  decodes on the CPU (`--profile` on the 27B: matmuls stream 16.9 GB/token at ~200 GB/s, 85 of
-  95 ms per token; the 1 GB Q6_K LM head another 4.5 ms). That is the 2.2x on the 27B and 2x on
-  the MoE. On the CPU alone oxinfer decodes as fast or faster (27B 11 vs 6.7 tok/s with default
-  threads, 0.8B 173 vs 161). Moving the whole decode pass to the GPU is the largest remaining gap
-  (forwarding only the matmuls was measured and is slower: ~257 submissions per token).
+- **Decode with a GPU**: llama.cpp runs the whole forward pass on the GPU; the rows above have
+  oxinfer decode on the CPU (`--profile` on the 27B: matmuls stream 16.9 GB/token at ~200 GB/s, 85
+  of 95 ms per token), hence the 2.2x on the 27B and 2x on the MoE. oxinfer now runs the whole
+  decode pass on the GPU too ([Decoding on the GPU](#decoding-on-the-gpu)): on par with llama.cpp on
+  the 1B models, ahead on Qwen3.5-0.8B (1.27x), Zawen (1.2-1.3x) and Gemma 4 26B-A4B (1.13x),
+  behind on Orpheus 3B and the 27B (~0.9x; its Q4_K / Q5_K matvecs read 450-530 GB/s against
+  550-590 for Q6_K / Q8_0, the main remaining kernel gap).
 - **Prefill with a GPU** (2.8x on the 27B, 10x on the MoE, 8x on 0.8B): only the dense GEMMs
   run on the GPU. They now use the M5 matrix units (half inputs, f32 accumulation; 144 -> 234
   tok/s at pp512 on the 27B, before that f32 simdgroup tiles at ~8.4 TFLOP/s against llama.cpp's
   ~35). Attention and the Gated DeltaNet scan stay on the CPU (2.6 ms/token, now the larger part
   of oxinfer's 27B prefill), and each layer's activations make a round trip through host memory.
   On the MoE, the GPU expert path takes fused `gate_up` weights (safetensors checkpoints: Zawen Q4
-  prefill 165 -> 353-379 tok/s), but a GGUF stores gate and up separately, so these GGUF rows
-  still run the routed experts' grouped matmul on the CPU.
+  prefill 165 -> 353-379 tok/s) and, since GPU decoding landed, GGUF's separate gate and up
+  tensors as well (Zawen Q4_K_M, 695-token prompt: 292 -> 548 tok/s; the GGUF rows above predate
+  it).
 - **CPU prefill**: llama.cpp repacks K-quants at load (`CPU_REPACK`, interleaved rows for the
   i8mm `SMMLA` instructions) and multiplies in int8; oxinfer dequantizes to f32 and runs an
   FMA GEMM. It is ahead on K-quants only while llama.cpp uses its default 6 threads, and behind
   on Q8_0 even then.
-- **MoE decode** is not bandwidth-bound in oxinfer (Zawen Q4_K_M: 521 matmul calls per token at
-  ~21 us, 170 GB/s over only 1.9 GB): dispatch and per-expert overhead dominate.
+- **MoE decode** on the CPU is not bandwidth-bound (Zawen Q4_K_M: 521 matmul calls per token at
+  ~21 us, 170 GB/s over only 1.9 GB): dispatch and per-expert overhead dominate. On the GPU the
+  routed experts of a layer are two dispatches (gate/up pairs, weighted down) reading through
+  per-expert address tables.
 - **Speculative decoding**: acceptance is the same in both engines (78-80% code, 46-50% prose
   on the 27B). The multi-token GGUF kernels (each weight block unpacked once per verification
   pass instead of once per token pair) made oxinfer's verification passes cheap enough that MTP
@@ -2006,7 +2052,7 @@ GPU (metal #0): Apple M5 Max, memory 115.4 GB (unified with CPU)
 
 | Platform | Compute | Status |
 |---|---|---|
-| Apple Silicon (macOS, iOS) | NEON kernels + Metal GEMM for prefill; on M5 / A19 the GPU matrix units (prefill GEMMs and MoE experts) | measured; the f32 GEMM gives bit-identical logits to the CPU path, the matrix units (default where present) ~3e-4 relative per product (`OXINFER_METAL_MMA=0` for bit-identical); iOS: runs in the Simulator (CPU and Metal; `ios/`) |
+| Apple Silicon (macOS, iOS) | NEON kernels + Metal GEMM for prefill; on M5 / A19 the GPU matrix units (prefill GEMMs and MoE experts); single-token decode entirely on the GPU (Llama 3, Qwen3 / 3.5 / 3.8 incl. MoE, Gemma 3 / 4 incl. 26B-A4B) | measured; the f32 GEMM gives bit-identical logits to the CPU path, the matrix units (default where present) ~3e-4 relative per product (`OXINFER_METAL_MMA=0` for bit-identical); iOS: runs in the Simulator (CPU and Metal; `ios/`) |
 | Apple Neural Engine (macOS 15 / iOS 18) | Core ML, for ANEMLL-converted models | measured on macOS; builds for iOS; see [Core ML](#core-ml--apple-neural-engine) |
 | x86-64 (Linux, Windows, macOS) | AVX2 + FMA kernels (bf16, Q8 via `maddubs`, Q4), scalar fallback below AVX2 | compiles for all three; the kernel tests pass on the scalar fallback under Rosetta (which exposes no AVX), so the AVX2 kernels themselves are not yet executed anywhere |
 | Linux / Windows + NVIDIA | CUDA driver API + NVRTC-compiled GEMM (`cuda.rs`) | compile-checked only, not yet run on NVIDIA hardware |
@@ -2047,14 +2093,41 @@ grouped GEMM walks per-expert tiles for the gate/up projection, then SiLU, the g
 projection and the weighted combination, all on the GPU (the expert weights are kept resident
 with an `MTLResidencySet`; making them resident per submission cost more than the GEMMs).
 
-Decode stays on the CPU on purpose: it is bandwidth-bound, the CPU already streams weights at
-~280 GB/s, and the GPU's ~450 GB/s only pays off if the entire forward pass moves over
-(attention, norms, the KV cache). Measured on the 27B GGUF with every pass on the GPU
-(`OXINFER_METAL_MIN_T=1`, matrix units): a pass costs ~257 submissions with CPU work in between
-(~50 ms of submit-and-wait alone) plus 110-150 ms of dequantization-bound GEMMs for 2-16 tokens,
-so plain decode drops from 10.7 to 5.5 tok/s, and `--mtp` verification passes (~4 tokens) take
-the same ~208 ms as on the CPU (14.1 vs 14.2 tok/s). The GPU only wins clearly for 8-16-token
-passes, where the CPU leaves its batch-invariant decode kernels (~0.6-1.4 s vs ~0.2-0.3 s).
+Single-token decode runs entirely on the GPU where the model and its weight formats are supported
+(`--gpu-decode on`, the default; `off`, the engine / speaker option `gpu_decode=0` or
+`oxinfer::gpu::set_decode(Some(false))` keep it on the CPU): the model describes one token's
+forward pass as a graph of device ops (`gpu::decode`), the Metal backend compiles it once into
+kernels and buffer bindings, and each token is one command buffer (plus a small first one, so the
+GPU starts while the rest is encoded) with a single wait. The host only looks up the input
+embedding (and Gemma's per-layer-embedding row) and samples from the logits. What runs on the GPU:
+
+| Model family | On the GPU per token |
+|---|---|
+| Llama 3.x (safetensors, GGUF), Orpheus TTS | RMSNorm, Q/K/V matvecs, RoPE (rotate-half or GGUF's interleaved pairs), KV append, attention, output projection + residual, fused SiLU gate/up, down + residual, final norm, LM head (skipped when only the hidden state is wanted, as Orpheus's restricted audio head runs on the CPU) |
+| Qwen3 (dense) | the same plus per-head Q/K RMSNorm |
+| Qwen3.5 / 3.6 / 3.8 (dense) | full attention layers with the output gate and partial RoPE; Gated DeltaNet layers: in/z/b/a projections, causal conv + SiLU over the conv state, the gated delta rule (state rows in registers, read and written once) with the gated RMSNorm; the recurrent states are the host's own page-aligned memory, updated in place |
+| Qwen3.5 MoE (Zawen-35B-A3B, ...) | router and the shared expert's gate as one f32 matvec, top-k + softmax, the chosen experts' gate/up and weighted down matvecs read through per-expert address tables (fused or GGUF split gate/up), the shared expert scaled by its sigmoid gate |
+| Gemma 4 E2B / E4B / 26B-A4B, Gemma 3 | per-layer embeddings, sliding and full attention (two RoPE tables, head size up to 512), KV sharing across layers, value norms, K = V layers, sandwich norms (each fused with the next norm), GELU-tanh MLPs, 26B-A4B's routed GELU experts beside the dense MLP (router scale, per-expert scales), layer scalars, the softcapped head |
+
+Matvec kernels exist for bf16, oxinfer's Q8 and Q4 (also MLX affine Q4) and every GGUF format
+with a GEMM (specialized kernels for F16, Q4_0, Q8_0, Q4_K, Q5_K and Q6_K; the others through
+their GEMM dequantizers): one SIMD-group or more per row, lanes taking consecutive chunks of a
+row so a SIMD-group reads contiguous memory, nibbles masked rather than shifted (the powers of
+two are divided out once per word), K-quant scales decoded without branches; 450-590 GB/s on
+large matrices of an M5 Max (`cargo test --release --lib decode_mv_bench -- --ignored`).
+Attention scores 32 keys per SIMD-group step (one lane per key), reads each key and value row
+once for the query heads sharing it, and splits long contexts over up to 64 threadgroups per head
+group. Activations stay f32 end to end (the CPU kernels quantize them to int8 for the quantized
+formats), and so do the KV caches: the host caches stay authoritative and the device keeps a
+copy per session, appending what CPU passes added (prefill chunks, speculative verification) and
+forgetting what a rewind dropped. Not on the GPU: models with LoRA adapters attached, streamed
+weights (`--stream`), bidirectional configurations, the vision / audio towers,
+multi-token passes (prefill and speculative verification stay on the existing paths), and
+CUDA / WebGPU (no decode graph backend yet).
+
+Before that, forwarding only the matmuls of decode passes to the GPU was measured and lost: on
+the 27B GGUF (`OXINFER_METAL_MIN_T=1`) a pass cost ~257 submissions with CPU work in between
+(~50 ms of submit-and-wait alone), so plain decode dropped from 10.7 to 5.5 tok/s.
 
 ### WebAssembly
 

@@ -4,10 +4,10 @@
 //! safetensors blobs) and are wrapped as shared `MTLBuffer`s without copying (unified memory), so
 //! "uploading" a model costs nothing.
 //!
-//! Only prefill-sized matmuls run here. Decode is memory-bound and the CPU already streams weights
-//! at ~280 GB/s; with ~0.15 ms per Metal submission, offloading single-token matmuls one by one is
-//! a loss (the GPU's 450 GB/s would need every op of the forward pass on the device). Prefill is
-//! compute-bound and the GEMM below reaches ~11 TFLOP/s against ~1.3 on the CPU.
+//! The `Backend` matmuls here take prefill-sized passes: with ~0.15 ms per Metal submission,
+//! offloading single-token matmuls one by one is a loss. Single-token decode instead runs the
+//! whole forward pass in one command buffer (`metal_decode.rs`, through `gpu::decode` graphs).
+//! Prefill is compute-bound and the GEMM below reaches ~11 TFLOP/s against ~1.3 on the CPU.
 //!
 //! GEMM: a threadgroup of 128 threads (2x2 SIMD-groups) computes a 64 (out) x 64 (tokens) tile.
 //! Per 32-wide K block the weights are dequantized to f32 in threadgroup memory; x fragments are
