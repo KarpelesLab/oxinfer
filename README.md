@@ -48,15 +48,18 @@ optional.
 |---|---|---|---|
 | google/gemma-4-E2B-it | 5.1B | 10.2 GB | text, images, video, audio; matches reference (max logit diff 1e-4) |
 | google/gemma-4-E4B-it | 8.0B | 16.0 GB | text, images, video, audio; matches reference (max logit diff 8e-5) |
-| google/gemma-4-12B-it | 12B | 24 GB | supported (k=v global attention), untested |
+| google/gemma-4-12B-it | 12B | 24 GB | supported (the 26B-A4B code without the experts), untested |
 | google/gemma-4-31B-it | 31B | 62 GB | supported, sharded loading, untested |
-| google/gemma-4-26B-A4B-it | 26B MoE | 52 GB | not yet (MoE block unimplemented) |
+| google/gemma-4-26B-A4B-it | 25.8B MoE, 3.8B active | 52 GB | text, images; matches transformers (max logit diff 3e-4, same greedy tokens); GGUF and MLX 4-bit copies too; see [Gemma 4 26B-A4B](#gemma-4-26b-a4b-moe) |
+| autotrust/GEV-26B-Decide, JEV-Gemma4-26B-A4B | 25.8B MoE + LoRA | 52 GB + 0.15 GB | typed decisions over text and images, on the bundled or Google's base; match transformers + peft to 2e-6 (see [Typed decisions](#typed-decisions-jev-models)) |
 | Qwen/Qwen3.8-27B (and Qwen3.5/3.6 dense) | 27.8B | 55.6 GB | text, images, video; matches the bf16 reference; see below |
 | Qwen/Qwen3.6-35B-A3B and fine-tunes (PixilabAI/Zawen-v0.1-35B-A3B) | 35B MoE, 3B active | 69 GB | text (the vision code applies to MoE checkpoints too but is untested there: Zawen ships no vision tower); Zawen matches the reference (see below) |
 | autotrust/JEV-9B, JEV-27B (Jev decision models) | 9B / 27.8B + LoRA | 18 / 54 GB + 0.16 / 0.44 GB | typed decisions, on the bundled or any matching base; match transformers + peft (see [Typed decisions](#typed-decisions-jev-models)); image decisions with JEV-9B's `vl/` on Qwen/Qwen3.5-9B |
 | autotrust/JEV-27B-VL | 27.8B + vision + LoRA | 55.6 GB + 0.45 GB | typed decisions over text and images; matches the reference server's math on transformers + peft (see [Image decisions](#image-decisions)) |
 | Qwen/Qwen3.5-0.8B | 0.8B | 1.7 GB | text, images, video; matches transformers float32 (see [Image, video and audio input](#image-video-and-audio-input)); the small one used for the wasm measurements |
 | mlx-community/gemma-4-e2b-it-4bit, gemma-4-e4b-it-4bit | 5.1B / 8.0B | 3.6 / 5.2 GB (MLX 4-bit) | text, images and audio; see [MLX checkpoints](#mlx-checkpoints) |
+| mlx-community/gemma-4-26b-a4b-it-4bit | 25.8B MoE | 15.4 GB (MLX 4-bit) | text and images (4-bit `switch_glu` experts) |
+| Gemma 4 GGUF (ggml-org/gemma-4-26B-A4B-it-GGUF, unsloth, bartowski, ...) | 25.8B MoE tested | 14.6 GB (Q4_0) - 27 GB (Q8_0) | text; same next token as transformers and llama.cpp (see [Gemma 4 26B-A4B](#gemma-4-26b-a4b-moe)) |
 | mlx-community/Qwen3-4B-4bit (Qwen3 dense) | 4.0B | 2.3 GB (MLX 4-bit) | text; matches the reference on the same weights (same top 10) |
 | mlx-community/gemma-3-4b-it-4bit (Gemma 3) | 4.3B | 3.4 GB (MLX 4-bit) | text only; matches the reference, also past the 1024-token window |
 | google/embeddinggemma-300m | 0.3B | 1.2 GB (fp32) | embeddings; matches sentence-transformers (see [Embeddings](#embeddings)) |
@@ -77,6 +80,111 @@ optional.
 | canopylabs/orpheus-3b-0.1-pretrained (ungated copy: unsloth/orpheus-3b-0.1-pretrained) | 3.3B | 6.6 GB | voice cloning from a reference clip (SNAC encoder); prompt and greedy tokens match the canopylabs notebook + transformers |
 | canopylabs/3b-{fr,de,ko,hi,zh,es_it}-ft-research_release (ungated copies: Our-Org-2/...) | 3.3B | 13 GB (fp32) | multilingual text to speech (French and German tested; French greedy tokens match transformers) |
 | hubertsiuzdak/snac_24khz, snac_32khz, snac_44khz | 20M / 55M / 55M | 80 / 220 / 220 MB | the SNAC codec alone, encode and decode (32 / 44 kHz with local attention); codes identical to the `snac` package |
+
+### Gemma 4 26B-A4B (MoE)
+
+`google/gemma-4-26B-A4B-it` is the dense Gemma 4 layer (30 layers, 25 sliding with a 1024-token
+window and 8 KV heads of 256, 5 global with 2 KV heads of 512 and keys reused as values) with a
+mixture of experts next to the MLP. Every layer runs both, on the same residual stream:
+
+- the dense GELU MLP (2112 wide) as usual, its output RMS-normed (`post_feedforward_layernorm_1`);
+- a router reading the residual RMS-normed without weight, times a learned scale / sqrt(hidden):
+  softmax over 128 experts, the top 8 renormalized, each weight times a learned per-expert scale;
+- the 8 chosen GELU experts (704 wide, fused `gate_up_proj`) on the residual through their own
+  norm (`pre_feedforward_layernorm_2`), their weighted sum RMS-normed (`post_feedforward_layernorm_2`);
+- the two outputs added, normed again (`post_feedforward_layernorm`) and added to the residual.
+
+There are no per-layer embeddings and no KV sharing (unlike E2B / E4B). The vision tower (27
+layers of 1152) standardizes its pooled output (`std_bias`, `std_scale`), and with
+`use_bidirectional_attention: "vision"` (also 12B / 31B) the soft tokens of one image attend to
+each other both ways on the sliding layers (global layers stay causal; a prefill chunk never
+splits an image). Its chat template closes an empty thought channel in the generation prompt
+when thinking is off (`<|turn>model\n<|channel>thought\n<channel|>`), which oxinfer reproduces.
+
+The routed experts share the Qwen MoE machinery (`moe.rs`): decode batches the 8 experts' input
+projections into one matmul, prefill runs all experts as one grouped matmul (on the matrix units
+on M5 / A19), `--quant q8|q4` and `--save-quantized` quantize them (a Q4 copy is 13 GB, text only
+like the E2B / E4B copies), and `--stream` reads them on demand from storage (with
+`--cache-budget-gb 12`: 4.8 GB of dense weights resident, 46 GB of experts read as routed, 5.4
+tok/s with the experts mostly in the page cache). The same model loads from llama.cpp GGUF files (`gemma4` architecture, text
+only: ggml-org, unsloth and bartowski publish them) and from `mlx-community/gemma-4-26b-a4b-it-4bit`
+(4-bit `switch_glu` experts, the router in 8 bits).
+
+```sh
+./target/release/oxinfer --model google/gemma-4-26B-A4B-it --mmap -p "Write a haiku about the ocean."
+./target/release/oxinfer --model google/gemma-4-26B-A4B-it --mmap --image photo.jpg -p "What is in this picture?"
+./target/release/oxinfer --model ggml-org/gemma-4-26B-A4B-it-GGUF:Q4_0 -p "Hello"
+./target/release/oxinfer --model mlx-community/gemma-4-26b-a4b-it-4bit -p "Hello"
+```
+
+Agreement with transformers (float32 compute on the bf16 weights; five chat prompts of 21-1758
+tokens, the longest well past the sliding window, and one image question; last-token logits, then
+the 2-32 greedy tokens oxinfer generated fed back to the reference, which must pick each of them):
+
+| oxinfer | max logit diff | KL | same top 1 | other |
+|---|---|---|---|---|
+| bf16, CPU | 1e-4 - 3e-4 (image: 0.03) | < 4e-9 (image: 6e-7) | 6/6 | same top 10 in the same order; 147/147 greedy tokens |
+| bf16, Metal (half-precision matrix units) | 0.004 - 0.44 | < 1.3e-4 | 6/6 | |
+| `--quant q8` | 0.38 - 1.1 | 7e-11 - 3.8e-3 | 6/6 | |
+| `--quant q4` | 4.8 - 15 | 2e-8 - 0.04 | 6/6 | |
+| GGUF Q8_0 (ggml-org) | 0.37 - 1.1 | 1e-11 - 4e-4 | 5/5 | text only |
+| GGUF Q4_0 (ggml-org) | 11 - 26 | 2e-6 - 0.07 | 5/5 | text only |
+| MLX 4-bit (mlx-community) | 5.5 - 14 | 3e-10 - 0.11 | 6/6 | |
+
+(Every row against the same bf16-weight reference, so the quantized rows measure the quantization;
+the 1758-token prompt is the hardest.) One trap when building that reference: transformers loaded
+in bf16 rounds the embedding scale buffer, sqrt(2816) = 53.07, to 53.0, which on its own moves the
+router logits by 3e-3 and flips expert choices; the float32 reference restores it. With it
+restored, every one of the 750-4170 routing decisions per prompt is the same in both.
+
+On the Q8_0 GGUF, oxinfer and llama.cpp (CPU) pick the same next token on all five prompts; their
+top-20 log-probabilities differ by 0.2-1.9, but against the float32 forward pass on the bf16
+weights oxinfer is the closer of the two on every prompt (0.05-0.66 against 0.25-1.90), so the gap
+is llama.cpp's int8 activations rather than a different reading of the file. The GGUF tokenizer,
+rebuilt from the vocabulary and merges, gives the same ids as `tokenizer.json` (this README, ten
+languages, emoji, special tokens).
+
+Speed on an M5 Max (18 threads, `--mmap`, the page cache warm; prefill of the 1758-token prompt,
+decode of 256 tokens of code; median of 2 runs while other jobs kept the load average near 4.5, so
+lower bounds):
+
+| weights | device | prefill tok/s | decode tok/s |
+|---|---|---|---|
+| bf16 (7.6 GB read per token) | CPU | 152 | 30 |
+| bf16 | Metal (default) | 544 | 30 |
+| `--quant q8` | CPU | 139 | 48 |
+| `--quant q8` | Metal | 571 | 48 |
+| `--quant q4` | CPU | 136 | 68 |
+| `--quant q4` | Metal | 576 | 70 |
+| GGUF Q8_0 (2046-token prompt) | CPU / Metal | 133 / 605 | 44 / 45 |
+| GGUF Q4_0 (2046-token prompt) | CPU / Metal | 130 / 603 | 61 / 60 |
+| MLX 4-bit | CPU / Metal | 133 / 225 | 65 / 64 |
+
+Decode runs on the CPU on either device (one token per pass reads the weights once, and the CPU
+reaches the memory bandwidth). Prefill attention runs as GEMMs (on the GPU for a chunk that starts
+the context), which took the Metal prefill from 325 to 540 tok/s and the CPU one from 117 to 150.
+The MLX experts stay on the CPU in prefill (the GPU's grouped expert kernels take plain Q4, not
+MLX's affine form), hence its lower Metal number. An image costs about 0.8 s in the vision tower
+on Metal (its 4304-wide MLP is zero-padded to whole GPU tiles), 5 s on the CPU.
+
+Against llama.cpp on the same GGUF files (`tools/bench/bench.py`: same prompt tokens, greedy,
+llama.cpp through `llama-server`, oxinfer as a fresh process per run; M5 Max at load 4-5; median of
+2 runs for Q4_0, 1 for Q8_0):
+
+| file | engine, device | prefill 512 | prefill 2046 | decode (256 tokens of code) |
+|---|---|---|---|---|
+| Q4_0 | llama.cpp, Metal | 3230 | 3006 | 122 |
+| Q4_0 | oxinfer, Metal | 564 | 603 | 60 |
+| Q4_0 | llama.cpp, CPU | 144 | 127 | 57 |
+| Q4_0 | oxinfer, CPU | 138 | 130 | 61 |
+| Q8_0 | llama.cpp, Metal | 2912 | 2888 | 94 |
+| Q8_0 | oxinfer, Metal | 512 | 605 | 45 |
+| Q8_0 | llama.cpp, CPU | 148 | 130 | 45 |
+| Q8_0 | oxinfer, CPU | 148 | 133 | 44 |
+
+On the CPU the two are level; with the GPU, llama.cpp runs the whole pass there (5x the prefill,
+2x the decode) while oxinfer keeps attention, routing and decode on the CPU. The greedy outputs
+agree: Q4_0 identical for 64 tokens on both devices, Q8_0 splitting at a near tie after 31-48.
 
 ### Qwen3.5 / Qwen3.8
 
@@ -103,7 +211,7 @@ layers, the real vocabulary), oxinfer matches transformers in float32 to a max l
 7e-5, with the same 20 greedy tokens. On Zawen-v0.1-35B-A3B's real weights, cut to its first 4
 layers, the float32 match is 3e-5. The full 40 layers against transformers in bf16 give a mean
 logit difference of 0.035, with the same top 10 in the same order (Q8: same top 10; Q4: same top
-token). MLX-quantized experts are not read yet.
+token). MLX-quantized Qwen experts are not read yet (Gemma 4's are).
 
 Thinking is on by default in the Qwen template; `--think` enables it here (the trace is dimmed),
 otherwise the generation prompt closes the think block.
@@ -311,9 +419,50 @@ Latency (M5 Max, 18 threads; a decision is a prefill, so it scales with the prom
 | JEV-27B on Qwen3.8-27B Q4 (`decision_from`) | Metal | 0.72 s | 6.2 s | 5.9 s |
 
 The adapter costs 3-7 % of the prefill (low-rank products in f32 NEON on the CPU, after the base
-matmul, also when the base matmul runs on the GPU). Not supported: Gemma 4 26B-A4B bundles
-(GEV-26B-Decide, JEV-Gemma4-26B-A4B: oxinfer has no Gemma 4 MoE), LoRA on routed MoE experts,
-and Core ML models.
+matmul, also when the base matmul runs on the GPU). Not supported: LoRA on routed MoE experts
+(no bundle has it), Core ML models, and the adaptive thinking of the reference server
+(`"thinking": "auto"`: System 2 reasoning folded into the probabilities; the base model itself
+chats as usual in the same engine).
+
+### Gemma 4 26B-A4B bundles
+
+`autotrust/GEV-26B-Decide` and `autotrust/JEV-Gemma4-26B-A4B` (the same weights published twice)
+put System 1 on the unmodified `google/gemma-4-26B-A4B-it`: a LoRA (r=32) on the attention and
+dense-MLP projections of all 30 layers (205 modules; the routed experts are not adapted), the
+24-slot head and the temperatures. What differs from the Qwen bundles: the prompt starts with
+`<bos>`, the head's logits are soft-capped like Gemma's own (`30 * tanh(z / 30)`, from
+`judge_config.json`), and a choice with more than 16 options is a **tournament** by default, as in
+the bundle's `serve_decide.py`: groups of at most 16 options are read natively, then a final pass
+over each group's winner plus the best of the rest (16 in all), and the group shares are combined
+as the reference does. `"strategy": "single"` (JSON) or `DecisionRequest::strategy` reads them in
+one pass through the wide labels instead (GEV only: it needs `adapter_vllm/`'s LM-head readout;
+JEV-Gemma4 has none). Images go where they appear, each as `<|image>` + its soft tokens +
+`<image|>` with the processor's default budget, attending both ways within the image.
+
+```sh
+# only the decision files of the bundle (150 MB), on the Google base already on disk
+oxinfer --model google/gemma-4-26B-A4B-it --mmap --decision-from autotrust/GEV-26B-Decide \
+  --decide choice --state "Set an alarm for 6:30 tomorrow morning please." --question "Which intent?" \
+  --option weather_query --option alarm_set --option alarm_remove --option play_music
+oxinfer --model google/gemma-4-26B-A4B-it --mmap --decision-from autotrust/GEV-26B-Decide --decide-json requests.json
+```
+
+Agreement with transformers + peft (the card's readout, unmerged adapter, float32 compute on the
+bf16 weights): the 10 text decisions of the JEV-9B check (3 noul, 2 score, 4- and 12-option
+choices, a 20-option tournament) and 5 image decisions (fox photo and shapes, 1-2 images of 256-266
+soft tokens, noul / score / 5- and 6-option choices):
+
+| oxinfer | text: max \|Δp\| | max KL | images: max \|Δp\| | max KL |
+|---|---|---|---|---|
+| GEV-26B-Decide, bf16, CPU | 1.8e-6 | 7e-12 | 5.9e-3 (shapes; the others 5e-5) | 1.4e-4 |
+| JEV-Gemma4-26B-A4B, bf16, Metal | 3.0e-3 | 2.6e-5 | | |
+| 20 options with `"strategy": "single"` vs the reference through `adapter_vllm/` | 2.0e-3 | 2.5e-5 | | |
+
+Prompt token counts match the processor's. The image difference comes from the vision tower's
+input resize, as for chat (logits of image prompts differ by 0.03). On Metal (bf16, M5 Max) a text
+decision takes 0.18-0.32 s for 46-139 prompt tokens, the 20-option tournament (3 passes, 364
+tokens) 0.87 s, and an image decision 1.4 s (0.8 s of it in the vision tower; 2.5 s with two
+images); on the CPU 0.4-0.9 s for text and 9-17 s with images.
 
 ### Image decisions
 
@@ -1080,12 +1229,15 @@ cross-origin requests).
 `--model` also takes llama.cpp GGUF files, as a path or as `org/repo:QUANT` (the one file of a
 GGUF repository whose name ends in `QUANT.gguf`, e.g.
 `HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF:Q4_K_P`). Architectures: `qwen35`
-(Qwen3.5 / 3.6 / 3.8), `qwen35moe`, `qwen3` and `llama` (Llama 3.x, and Orpheus TTS, see
-[below](#llama-3-gguf)). The tokenizer and chat template come from the
-GGUF metadata (the rebuilt tokenizer matches Qwen3.8's `tokenizer.json` on 305 test texts), and
+(Qwen3.5 / 3.6 / 3.8), `qwen35moe`, `qwen3`, `llama` (Llama 3.x, and Orpheus TTS, see
+[below](#llama-3-gguf)) and `gemma4` (Gemma 4 text models, dense and 26B-A4B; see
+[Gemma 4 26B-A4B](#gemma-4-26b-a4b-moe)). The tokenizer and chat template come from the
+GGUF metadata (the rebuilt tokenizer matches Qwen3.8's `tokenizer.json` on 305 test texts, and
+Gemma 4's, a SentencePiece-style BPE with byte fallback, on this README and multilingual text), and
 llama.cpp's conversions are undone at load (`gguf.rs`): norms with the 1 folded in, `ssm_a`, the
 tiled Gated DeltaNet value-head order, separate 3D expert tensors, Llama's permuted query / key
-rows. Weights stay in their GGUF
+rows, Gemma 4's proportional RoPE stored as per-frequency divisors (`rope_freqs`). The `mmproj`
+vision files are not read, so image input needs the safetensors or MLX checkpoint. Weights stay in their GGUF
 format: F32, F16, BF16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q2_K-Q6_K, IQ1_S/IQ1_M, IQ2_XXS/XS/S,
 IQ3_XXS/S and IQ4_NL/XS (`ggml.rs`, dequantization bit-exact with gguf-py), with NEON decode
 kernels for every type and Metal prefill kernels. The i-quants (IQ1-IQ3) decode several times
@@ -1331,6 +1483,9 @@ On an M5 Max (18 cores, ~280 GB/s measured CPU read bandwidth):
 | Qwen3.8-27B | bf16 | 51 GB | ~5.3 tok/s (≈270 GB/s) | | ~19 tok/s |
 | Qwen3.8-27B | `--quant q8` | 29 GB | ~8.8 tok/s | `--mtp`: 1.5x / 2.0x | ~19 tok/s |
 | Qwen3.8-27B | `--quant q4` | 14 GB | ~16 tok/s | `--mtp`: 1.1-1.2x / 1.6x | ~20 tok/s |
+| Gemma 4 26B-A4B (MoE) | bf16 | 7.6 GB | ~30 tok/s (≈230 GB/s) | | ~150 tok/s (1.8k prompt) |
+| Gemma 4 26B-A4B (MoE) | `--quant q8` | 4.3 GB | ~48 tok/s | | ~140 tok/s |
+| Gemma 4 26B-A4B (MoE) | `--quant q4` | 2.1 GB | ~69 tok/s | | ~136 tok/s |
 
 For the 27B model `--mmap` is recommended: quantization then reads the checkpoint straight from
 the page cache (about 3 s to quantize 27.8B parameters on 18 threads) instead of copying 55 GB
@@ -1342,6 +1497,7 @@ With the Metal backend (default on Apple Silicon) prefill runs on the GPU:
 |---|---|---|---|
 | E4B-it | `--quant q4` | ~97 tok/s | ~580 tok/s |
 | Qwen3.8-27B | `--quant q4` | ~18 tok/s | ~96 tok/s (256-token chunks) |
+| Gemma 4 26B-A4B (MoE) | bf16 / `--quant q4` | ~150 / ~136 tok/s | ~544 / ~576 tok/s (1758-token prompt) |
 
 (616-token prompt; decode speed is unchanged, see below for why.)
 
@@ -1615,7 +1771,7 @@ plain greedy output.
 
 ### Streaming weights from flash (models larger than RAM)
 
-`--stream` (Qwen3.5 / Qwen3.8; implies `--mmap`) runs a model whose weights do not fit in memory
+`--stream` (Qwen3.5 / Qwen3.8, Gemma 4 / Gemma 3 including 26B-A4B's experts; implies `--mmap`) runs a model whose weights do not fit in memory
 by reading them in place from the mapped file while a reader thread fetches the next layers. It
 is aimed at phones: HauhauCS's Qwen3.8-27B GGUFs (Q2_K_P 10.7 GB, Q4_K_P 17.9 GB) on a 12 GB
 iPhone. Every forward pass reads the units (decoder layers, LM head, MTP layer, draft head)

@@ -725,7 +725,7 @@ impl QMat for F32Mat<'_> {
 }
 
 /// `y[t][n_out] = x[t][n_in] * m[n_out][n_in]^T` in f32 (pads `t` up to 8).
-fn matmul_f32(m: &[f32], n_out: usize, n_in: usize, x: &[f32], t: usize) -> Vec<f32> {
+pub(crate) fn matmul_f32(m: &[f32], n_out: usize, n_in: usize, x: &[f32], t: usize) -> Vec<f32> {
     let tp = t.max(8);
     let mut xp;
     let xs = if tp != t {

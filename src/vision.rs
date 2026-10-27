@@ -14,7 +14,6 @@ pub const SUPPORTED_SOFT_TOKENS: [usize; 5] = [70, 140, 280, 560, 1120];
 /// A linear layer with optional input/output clamping (`use_clipped_linears`). The matmul runs
 /// on the active GPU backend when it takes the size (prefill-sized inputs), else on the CPU.
 pub struct ClipLin<'a> {
-    pub w: &'a [u16],
     pub n_out: usize,
     pub n_in: usize,
     pub bounds: Option<(f32, f32, f32, f32)>, // in_min, in_max, out_min, out_max
@@ -37,6 +36,27 @@ impl ClipLin<'_> {
     }
 }
 
+impl ClipLin<'_> {
+    /// A copy zero-padded to `n_out` x `n_in` (accelerator kernels take whole tiles: the 12B /
+    /// 31B / 26B towers' MLP is 4304 wide). Padded outputs are 0 (or the clamp of 0) and meet
+    /// zero weights in the next layer, so results do not change.
+    fn padded(&self, n_out: usize, n_in: usize) -> Self {
+        let crate::model::Weight::Bf16(src, _) = &self.lin.w else {
+            unreachable!("vision weights are bf16")
+        };
+        let mut w = crate::quant::PageVec::<u16>::zeroed(n_out * n_in);
+        for (dst, row) in w.chunks_mut(n_in).zip(src.chunks(self.n_in)) {
+            dst[..self.n_in].copy_from_slice(row);
+        }
+        Self {
+            n_out,
+            n_in,
+            bounds: self.bounds,
+            lin: Lin::bf16_owned(w),
+        }
+    }
+}
+
 /// Loads `prefix.weight` and, when `clipped`, the four `prefix.{input,output}_{min,max}` scalars.
 pub fn load_clip_lin<'a>(files: &'a ModelFiles, prefix: &str, n_out: usize, n_in: usize, clipped: bool) -> Result<ClipLin<'a>> {
     let wname = format!("{prefix}.linear.weight");
@@ -55,7 +75,6 @@ pub fn load_clip_lin<'a>(files: &'a ModelFiles, prefix: &str, n_out: usize, n_in
         None
     };
     Ok(ClipLin {
-        w,
         n_out,
         n_in,
         bounds,
@@ -162,6 +181,8 @@ pub struct VisionTower<'a> {
     /// `standardize` (12B / 31B / 26B-A4B): pooled features become `(x - bias) * scale`.
     standardize: Option<(Vec<f32>, Vec<f32>)>,
     pub text_hidden: usize,
+    /// MLP width as run (padded, see `ClipLin::padded`).
+    inter_p: usize,
 }
 
 impl<'a> VisionTower<'a> {
@@ -180,6 +201,12 @@ impl<'a> VisionTower<'a> {
             files.bf16(&full)
         };
         let clipped = cfg.use_clipped_linears;
+        // With an accelerator, an MLP width that is not a whole number of tiles is zero-padded
+        // so its matmuls run there (copies of those weights, 0.8 GB for the 26B tower).
+        let inter_p = match crate::gpu::active() {
+            Some(_) => cfg.intermediate_size.next_multiple_of(64),
+            None => cfg.intermediate_size,
+        };
         let mut layers = Vec::new();
         for l in 0..cfg.num_hidden_layers {
             let lp = format!("{pre}encoder.layers.{l}.");
@@ -200,6 +227,12 @@ impl<'a> VisionTower<'a> {
                 up: cl("mlp.up_proj", cfg.intermediate_size, h)?,
                 down: cl("mlp.down_proj", h, cfg.intermediate_size)?,
             });
+            if inter_p != cfg.intermediate_size {
+                let l = layers.last_mut().unwrap();
+                l.gate = l.gate.padded(inter_p, h);
+                l.up = l.up.padded(inter_p, h);
+                l.down = l.down.padded(h, inter_p);
+            }
         }
         // Axial RoPE: spatial_dim = head_dim/2, inv_freq over arange(0, spatial_dim, 2)/spatial_dim.
         let spatial = hd / 2;
@@ -236,6 +269,7 @@ impl<'a> VisionTower<'a> {
             inv_freq,
             embed_proj,
             text_hidden,
+            inter_p,
             cfg,
         })
     }
@@ -289,7 +323,7 @@ impl<'a> VisionTower<'a> {
         let mut v = vec![0f32; n * nh * hd];
         let mut att = vec![0f32; n * nh * hd];
         let mut o = vec![0f32; n * h];
-        let inter = cfg.intermediate_size;
+        let inter = self.inter_p;
         let mut g = vec![0f32; n * inter];
         let mut u = vec![0f32; n * inter];
         for layer in &self.layers {

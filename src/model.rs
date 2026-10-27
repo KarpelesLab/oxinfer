@@ -354,8 +354,10 @@ pub fn load_lin_experts<'a>(files: &'a ModelFiles, full: &str, n_exp: usize, n_o
             })
             .collect());
     }
-    if files.is_mlx() && files.has(&format!("{full}.scales")) {
-        bail!("{full}: MLX-quantized experts are not supported yet");
+    // MLX 4-bit: repacked as affine Q4 per expert whatever `q` asks for (other widths dequantize
+    // to bf16 below).
+    if let Some(v) = files.mlx_q4_experts(full, n_exp, n_out, n_in)? {
+        return Ok(v.into_iter().map(Lin::q4).collect());
     }
     let info = files.info(full).with_context(|| format!("missing tensor {full}"))?;
     if info.shape != [n_exp, n_out, n_in] {
@@ -1374,7 +1376,11 @@ impl<'a> Model<'a> {
         let mut att = vec![0f32; t * nh * hd];
         // Image soft tokens see their whole image on sliding layers (`vision_bidirectional`).
         let ext = if layer.sliding { ext } else { None };
-        attention_ext(&q, cache, nh, t, start, window, !cfg.bidirectional(), ext, &mut att);
+        if !cfg.bidirectional() && t >= PREFILL_ATTN_MIN {
+            attention_prefill(&q, cache, nh, t, start, window, ext, &mut att);
+        } else {
+            attention_ext(&q, cache, nh, t, start, window, !cfg.bidirectional(), ext, &mut att);
+        }
 
         let mut o = vec![0f32; t * h];
         linear(&layer.o, h, nh * hd, &att, t, &mut o);
@@ -1538,6 +1544,101 @@ pub(crate) fn attention_ext(
         for i in 0..ntasks {
             run(i);
         }
+    }
+}
+
+/// Chunks of at least this many tokens take [`attention_prefill`].
+const PREFILL_ATTN_MIN: usize = 32;
+
+/// Causal (optionally sliding-window, `ext`-extended: see [`attention_ext`]) attention for a
+/// prefill chunk as GEMMs: per block of queries and KV head, the scores of the group's query
+/// heads against every key one of them sees, masked per row, soft-maxed, times V. A chunk that
+/// starts the cache with a plain causal mask goes to the accelerator when there is one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_prefill(
+    q: &[f32],
+    cache: &LayerCache,
+    nh: usize,
+    t: usize,
+    start: usize,
+    window: Option<usize>,
+    ext: Option<&[usize]>,
+    out: &mut [f32],
+) {
+    let _timer = prof::start(Cat::Attention);
+    let (hd, n_kv) = (cache.hd, cache.n_kv);
+    let rep = nh / n_kv;
+    let lo_of = |ti: usize| window.map_or(0, |w| (start + ti + 1).saturating_sub(w));
+    let hi_of = |ti: usize| ext.map_or(start + ti + 1, |e| e[ti].max(start + ti + 1));
+    if ext.is_none()
+        && start == 0
+        && window.is_none_or(|w| t <= w)
+        && let Some(be) = crate::gpu::active()
+        && 4.0 * (t * t * nh * hd) as f64 >= 1e8
+    {
+        // The device's attention scales by 1/sqrt(hd) (Gemma's is 1) and has one KV head per
+        // query head.
+        let s = (hd as f32).sqrt();
+        let qs: Vec<f32> = q.iter().map(|x| x * s).collect();
+        let mut k = vec![0f32; t * nh * hd];
+        let mut v = vec![0f32; t * nh * hd];
+        for_chunks(&mut k, nh * hd, true, |j, r| {
+            for (h, o) in r.chunks_mut(hd).enumerate() {
+                o.copy_from_slice(cache.k_at(j, h / rep));
+            }
+        });
+        for_chunks(&mut v, nh * hd, true, |j, r| {
+            for (h, o) in r.chunks_mut(hd).enumerate() {
+                o.copy_from_slice(cache.v_at(j, h / rep));
+            }
+        });
+        if be.attention(&qs, &k, &v, t, t, nh, hd, true, out) {
+            return;
+        }
+    }
+    let dhp = hd.next_multiple_of(32);
+    // Query blocks keep the score matrix to a few tens of MB.
+    let max_keys = (0..t).map(hi_of).max().unwrap_or(0) - lo_of(0);
+    let tb = ((1usize << 23) / (rep * max_keys.max(1))).clamp(8, 256);
+    let mut b0 = 0;
+    while b0 < t {
+        let b1 = (b0 + tb).min(t);
+        let k0 = lo_of(b0);
+        let k1 = (b0..b1).map(hi_of).max().unwrap();
+        let (n, np) = (k1 - k0, (k1 - k0).next_multiple_of(32));
+        let rows = (b1 - b0) * rep;
+        for g in 0..n_kv {
+            let mut qh = vec![0f32; rows * dhp];
+            for_chunks(&mut qh, dhp, rows > 64, |r, row| {
+                let (ti, h) = (b0 + r / rep, g * rep + r % rep);
+                row[..hd].copy_from_slice(&q[(ti * nh + h) * hd..(ti * nh + h + 1) * hd]);
+            });
+            let mut kh = vec![0f32; n * dhp];
+            for_chunks(&mut kh, dhp, n > 64, |j, row| row[..hd].copy_from_slice(cache.k_at(k0 + j, g)));
+            let mut vt = vec![0f32; hd * np];
+            for_chunks(&mut vt, np, true, |c, row| {
+                for (j, x) in row[..n].iter_mut().enumerate() {
+                    *x = cache.v_at(k0 + j, g)[c];
+                }
+            });
+            let sc = crate::sd::ops::matmul_f32(&kh, n, dhp, &qh, rows);
+            let mut p = vec![0f32; rows * np];
+            for_chunks(&mut p, np, true, |r, row| {
+                let ti = b0 + r / rep;
+                let (lo, hi) = (lo_of(ti) - k0, hi_of(ti) - k0);
+                row[lo..hi].copy_from_slice(&sc[r * n + lo..r * n + hi]);
+                softmax_inplace(&mut row[lo..hi]);
+            });
+            let o = crate::sd::ops::matmul_f32(&vt, hd, np, &p, rows);
+            let op = SendPtr(out.as_mut_ptr());
+            crate::pool::run(rows, &|r| {
+                let (ti, h) = (b0 + r / rep, g * rep + r % rep);
+                // SAFETY: each row writes its own [hd] slice of `out`.
+                let dst = unsafe { std::slice::from_raw_parts_mut(op.get().add((ti * nh + h) * hd), hd) };
+                dst.copy_from_slice(&o[r * hd..(r + 1) * hd]);
+            });
+        }
+        b0 = b1;
     }
 }
 

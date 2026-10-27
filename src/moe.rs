@@ -103,10 +103,19 @@ impl<'a> Experts<'a> {
                 load_lin_experts(files, &format!("{ep}down_proj"), n_exp, h, mi, quant)?,
             )
         } else if has(&format!("{ep}gate_proj")) {
-            let g = load_lin_experts(files, &format!("{ep}gate_proj"), n_exp, mi, h, quant)?;
-            let u = load_lin_experts(files, &format!("{ep}up_proj"), n_exp, mi, h, quant)?;
+            let (gn, un) = (format!("{ep}gate_proj"), format!("{ep}up_proj"));
             let d = load_lin_experts(files, &format!("{ep}down_proj"), n_exp, h, mi, quant)?;
-            (g.into_iter().zip(u).map(|(g, u)| GateUp::Split(g, u)).collect(), d)
+            // MLX 4-bit (`switch_glu`): gate and up fused per expert as they are repacked, so the
+            // experts take one input matmul (and the accelerator path) like fused checkpoints.
+            if let Some(gu) = files.mlx_q4_experts_fused(&gn, &un, n_exp, mi, h)? {
+                files.note_use(&gn, true, false);
+                files.note_use(&un, true, false);
+                (gu.into_iter().map(|m| GateUp::Fused(Lin::q4(m))).collect(), d)
+            } else {
+                let g = load_lin_experts(files, &gn, n_exp, mi, h, quant)?;
+                let u = load_lin_experts(files, &un, n_exp, mi, h, quant)?;
+                (g.into_iter().zip(u).map(|(g, u)| GateUp::Split(g, u)).collect(), d)
+            }
         } else {
             let (mut gu, mut d) = (Vec::with_capacity(n_exp), Vec::with_capacity(n_exp));
             for e in 0..n_exp {

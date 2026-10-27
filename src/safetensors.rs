@@ -36,6 +36,12 @@ pub struct MlxQuant {
 /// `vision_tower.*`, ...; the loaders use the transformers names `model.language_model.*`, ...
 fn mlx_canonical(n: &str) -> String {
     if let Some(r) = n.strip_prefix("language_model.model.") {
+        // MoE experts (Gemma 4 26B-A4B): `experts.switch_glu.gate_proj.weight` is the 3D
+        // `experts.gate_proj` of transformers' unfused layout.
+        if let Some((pre, rest)) = r.split_once(".experts.switch_glu.") {
+            let rest = rest.strip_suffix(".weight").unwrap_or(rest);
+            return format!("model.language_model.{pre}.experts.{rest}");
+        }
         return format!("model.language_model.{r}");
     }
     if let Some(r) = n.strip_prefix("language_model.lm_head.") {
@@ -583,21 +589,26 @@ impl ModelFiles {
             .collect();
         for (sn, s_cols) in scales {
             let base = &sn[..sn.len() - ".scales".len()];
-            let wn = format!("{base}.weight");
+            // 3D expert tensors have no `.weight` suffix (see `mlx_canonical`).
+            let wn = match self.index.contains_key(&format!("{base}.weight")) {
+                true => format!("{base}.weight"),
+                false => base.to_string(),
+            };
             let (bits, group) = overrides.get(base).copied().unwrap_or((bits, group));
             let Some(&i) = self.index.get(&wn) else { continue };
             let Some(w) = self.shards[i].tensors.get_mut(&wn) else { continue };
-            if w.dtype != "U32" || w.shape.len() != 2 {
+            if w.dtype != "U32" || !(2..=3).contains(&w.shape.len()) {
                 continue;
             }
-            let n_in = w.shape[1] * 32 / bits;
+            let last = w.shape.len() - 1;
+            let n_in = w.shape[last] * 32 / bits;
             if s_cols * group != n_in {
                 bail!(
                     "{wn}: {} packed columns at {bits} bits do not match {s_cols} groups of {group}",
-                    w.shape[1]
+                    w.shape[last]
                 );
             }
-            w.shape[1] = n_in;
+            w.shape[last] = n_in;
             w.dtype = "BF16".into();
             w.mlx = Some(MlxQuant { bits, group });
         }
@@ -641,6 +652,96 @@ impl ModelFiles {
             n_in,
             m.group,
         )))
+    }
+
+    /// The experts of an MLX 4-bit `[n_exp, n_out, n_in]` tensor (MoE `switch_glu` projections),
+    /// each repacked as Q4 with offsets; None when `name` is not stored that way.
+    pub fn mlx_q4_experts(&self, name: &str, n_exp: usize, n_out: usize, n_in: usize) -> Result<Option<Vec<Q4Matrix>>> {
+        let Some(info) = self.info(name) else { return Ok(None) };
+        let Some(m) = info.mlx else { return Ok(None) };
+        if m.bits != 4 || !m.group.is_multiple_of(crate::quant::QBLOCK) {
+            return Ok(None);
+        }
+        if info.shape != [n_exp, n_out, n_in] {
+            bail!("tensor {name} has shape {:?}, expected [{n_exp}, {n_out}, {n_in}]", info.shape);
+        }
+        self.touch(name);
+        let base = name.strip_suffix(".weight").unwrap_or(name);
+        let (w, s, b) = (
+            self.bytes_cow(name)?,
+            self.bytes_cow(&format!("{base}.scales"))?,
+            self.bytes_cow(&format!("{base}.biases"))?,
+        );
+        let (w, s, b) = (words::<u32>(&w), words::<u16>(&s), words::<u16>(&b));
+        let (wn, gn) = (n_out * n_in / 8, n_out * n_in / m.group);
+        if w.len() != n_exp * wn || s.len() != n_exp * gn || b.len() != n_exp * gn {
+            bail!("tensor {name}: MLX parts do not match {n_exp} experts of [{n_out}, {n_in}]");
+        }
+        Ok(Some(
+            (0..n_exp)
+                .map(|e| {
+                    crate::quant::from_mlx_q4(
+                        &w[e * wn..(e + 1) * wn],
+                        &s[e * gn..(e + 1) * gn],
+                        &b[e * gn..(e + 1) * gn],
+                        n_out,
+                        n_in,
+                        m.group,
+                    )
+                })
+                .collect(),
+        ))
+    }
+
+    /// MLX 4-bit gate and up expert tensors (`[n_exp, n_out, n_in]` each) fused per expert into
+    /// one `[2 * n_out, n_in]` Q4 matrix, gate rows then up rows (the layout of transformers'
+    /// `gate_up_proj`, which the accelerator's expert path takes); None unless both are stored so.
+    pub fn mlx_q4_experts_fused(&self, gate: &str, up: &str, n_exp: usize, n_out: usize, n_in: usize) -> Result<Option<Vec<Q4Matrix>>> {
+        let (Some(mg), Some(mu)) = (self.mlx(gate), self.mlx(up)) else {
+            return Ok(None);
+        };
+        if mg.bits != 4 || mu.bits != 4 || mg.group != mu.group || !mg.group.is_multiple_of(crate::quant::QBLOCK) {
+            return Ok(None);
+        }
+        for n in [gate, up] {
+            let shape = &self.info(n).unwrap().shape;
+            if shape[..] != [n_exp, n_out, n_in] {
+                bail!("tensor {n} has shape {shape:?}, expected [{n_exp}, {n_out}, {n_in}]");
+            }
+            self.touch(n);
+        }
+        let parts = |n: &str| -> Result<_> {
+            let base = n.strip_suffix(".weight").unwrap_or(n);
+            Ok((
+                self.bytes_cow(n)?,
+                self.bytes_cow(&format!("{base}.scales"))?,
+                self.bytes_cow(&format!("{base}.biases"))?,
+            ))
+        };
+        let ((gw, gs, gb), (uw, us, ub)) = (parts(gate)?, parts(up)?);
+        let (gw, gs, gb) = (words::<u32>(&gw), words::<u16>(&gs), words::<u16>(&gb));
+        let (uw, us, ub) = (words::<u32>(&uw), words::<u16>(&us), words::<u16>(&ub));
+        let (wn, gn) = (n_out * n_in / 8, n_out * n_in / mg.group);
+        if gw.len() != n_exp * wn || uw.len() != n_exp * wn || gs.len() != n_exp * gn || us.len() != n_exp * gn {
+            bail!("tensors {gate} / {up}: MLX parts do not match {n_exp} experts of [{n_out}, {n_in}]");
+        }
+        let cat = |a: &[u32], b: &[u32]| [a, b].concat();
+        let cat16 = |a: &[u16], b: &[u16]| [a, b].concat();
+        Ok(Some(
+            (0..n_exp)
+                .map(|e| {
+                    let (w, s) = (e * wn..(e + 1) * wn, e * gn..(e + 1) * gn);
+                    crate::quant::from_mlx_q4(
+                        &cat(&gw[w.clone()], &uw[w]),
+                        &cat16(&gs[s.clone()], &us[s.clone()]),
+                        &cat16(&gb[s.clone()], &ub[s]),
+                        2 * n_out,
+                        n_in,
+                        mg.group,
+                    )
+                })
+                .collect(),
+        ))
     }
 
     /// Reads row-table parts of MLX matrix `name`: (packed values, scales, biases) as byte sources.
@@ -707,7 +808,9 @@ impl ModelFiles {
         self.touch(name);
         let info = self.shards[i].info(name).unwrap();
         if let Some(m) = info.mlx {
-            return self.mlx_bf16(name, m, info.shape[0], info.shape[1]);
+            let cols = *info.shape.last().unwrap_or(&0);
+            let rows = info.shape[..info.shape.len().saturating_sub(1)].iter().product();
+            return self.mlx_bf16(name, m, rows, cols);
         }
         let sh = &self.shards[i];
         let host = matches!(sh.mmap, Storage::Host(_));
