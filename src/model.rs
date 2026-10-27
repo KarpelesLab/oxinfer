@@ -1,5 +1,6 @@
 //! Gemma 4 text decoder: embeddings, per-layer embeddings (PLE), sliding/global
-//! attention with KV sharing, gated-GELU MLP, tied softcapped LM head.
+//! attention with KV sharing, gated-GELU MLP (plus, in 26B-A4B, a router and 128 routed
+//! GELU experts beside it), tied softcapped LM head.
 
 use crate::config::TextConfig;
 use crate::ggml::{GgmlType, GgufMatrix};
@@ -689,15 +690,55 @@ pub(crate) fn linear(l: &Lin, n_out: usize, n_in: usize, x: &[f32], t: usize, y:
 }
 
 struct PleLayer<'a> {
-    gate: Lin<'a>,   // [P, H]
-    proj: Lin<'a>,   // [H, P]
-    norm: &'a [u16], // [H]
+    gate: Lin<'a>,  // [P, H]
+    proj: Lin<'a>,  // [H, P]
+    norm: Vec<f32>, // [H]
 }
 
 struct PleGlobal<'a> {
     embed: Table<'a>, // [V, L*P]
     proj: Lin<'a>,    // [L*P, H]
-    norm: &'a [u16],  // [P]
+    norm: Vec<f32>,   // [P]
+}
+
+/// The MoE block of a Gemma 4 26B-A4B layer, run beside the dense MLP on the same residual:
+/// the router reads the residual RMS-normed without weight, times `scale / sqrt(hidden)` (folded
+/// into `router`), takes the softmax top k renormalized, times `per_expert_scale`; the experts
+/// read the residual normed by `ln_pre`, and their sum, normed by `ln_post`, is added to the
+/// dense MLP output normed by `ln_post_dense` (then both go through `post_feedforward_layernorm`).
+pub(crate) struct GemmaMoe<'a> {
+    router: Vec<f32>, // [n_exp, H]
+    per_expert_scale: Vec<f32>,
+    ln_post_dense: Vec<f32>,
+    ln_pre: Vec<f32>,
+    ln_post: Vec<f32>,
+    pub(crate) experts: crate::moe::Experts<'a>,
+}
+
+impl GemmaMoe<'_> {
+    /// The routes (expert, weight) of each of the `t` rows of the residual `x`.
+    fn route(&self, x: &[f32], t: usize, h: usize, eps: f32) -> Vec<Vec<(usize, f32)>> {
+        let ne = self.experts.n_experts();
+        let k = self.experts.top_k;
+        let mut logits = vec![0f32; t * ne];
+        for_chunks(&mut logits, ne, t > 1, |ti, l| {
+            let mut xn = x[ti * h..(ti + 1) * h].to_vec();
+            rmsnorm_inplace(&mut xn, None, eps);
+            for (v, w) in l.iter_mut().zip(self.router.chunks(h)) {
+                *v = dot(w, &xn);
+            }
+        });
+        logits
+            .chunks(ne)
+            .map(|l| {
+                let mut r = crate::moe::route_top_k(l, k);
+                for (e, w) in r.iter_mut() {
+                    *w *= self.per_expert_scale[*e];
+                }
+                r
+            })
+            .collect()
+    }
 }
 
 pub struct Layer<'a> {
@@ -723,6 +764,7 @@ pub struct Layer<'a> {
     up: Lin<'a>,
     down: Lin<'a>,
     ple: Option<PleLayer<'a>>,
+    moe: Option<GemmaMoe<'a>>,
     layer_scalar: f32,
 }
 
@@ -736,6 +778,9 @@ pub struct Model<'a> {
     final_norm: Vec<f32>,
     inv_freq_sliding: Vec<f32>,
     inv_freq_full: Vec<f32>,
+    /// Weight streaming: unit 0 is the PLE projection when there is one, then the layers, then
+    /// the LM head (see [`Model::stream_units`]).
+    stream: Option<crate::stream::StreamHook>,
 }
 
 #[derive(Clone)]
@@ -822,14 +867,6 @@ impl<'a> Model<'a> {
         let nl = cfg.num_hidden_layers;
         let p = cfg.hidden_size_per_layer_input;
 
-        let get = |name: &str, shape: &[usize]| -> Result<&'a [u16]> {
-            let full = format!("{prefix}{name}");
-            let info = files.info(&full).with_context(|| format!("missing tensor {full}"))?;
-            if info.shape != shape {
-                bail!("tensor {full} has shape {:?}, expected {:?}", info.shape, shape);
-            }
-            files.bf16(&full)
-        };
         // A streamed linear weight: borrowed bf16 or quantized on load.
         let lin_with = |name: &str, n_out: usize, n_in: usize, q: Quant| load_lin(files, &format!("{prefix}{name}"), n_out, n_in, q);
         let lin = |name: &str, n_out: usize, n_in: usize| lin_with(name, n_out, n_in, quant);
@@ -866,7 +903,7 @@ impl<'a> Model<'a> {
                     table_quant(quant),
                 )?,
                 proj: lin_with("per_layer_model_projection.weight", nl * p, h, hi_quant)?,
-                norm: get("per_layer_projection_norm.weight", &[p])?,
+                norm: nw("per_layer_projection_norm.weight", &[p])?,
             })
         } else {
             None
@@ -875,7 +912,6 @@ impl<'a> Model<'a> {
         let mut layers = Vec::with_capacity(nl);
         for l in 0..nl {
             let lp = format!("layers.{l}.");
-            let g = |n: &str, s: &[usize]| get(&format!("{lp}{n}"), s);
             let gl = |n: &str, n_out: usize, n_in: usize| lin(&format!("{lp}{n}"), n_out, n_in);
             let sliding = cfg.is_sliding(l);
             let hd = cfg.layer_head_dim(l);
@@ -900,14 +936,47 @@ impl<'a> Model<'a> {
                 Some(PleLayer {
                     gate: gl("per_layer_input_gate.weight", p, h)?,
                     proj: gl("per_layer_projection.weight", h, p)?,
-                    norm: g("post_per_layer_input_norm.weight", &[h])?,
+                    norm: nw(&format!("{lp}post_per_layer_input_norm.weight"), &[h])?,
                 })
             } else {
                 None
             };
-            let layer_scalar = match g("layer_scalar", &[1]) {
-                Ok(s) => bf16_to_f32(s[0]),
-                Err(_) => 1.0,
+            let ls = format!("{prefix}{lp}layer_scalar");
+            let layer_scalar = if files.has(&ls) {
+                files.f32(&ls)?.first().copied().unwrap_or(1.0)
+            } else {
+                1.0
+            };
+            let moe = match cfg.moe() {
+                Some((n_exp, top_k, mi)) => {
+                    let proj = nw(&format!("{lp}router.proj.weight"), &[n_exp, h])?;
+                    let scale = nw(&format!("{lp}router.scale"), &[h])?;
+                    let c = (h as f32).powf(-0.5);
+                    let mut router = proj;
+                    for row in router.chunks_mut(h) {
+                        for (w, s) in row.iter_mut().zip(&scale) {
+                            *w *= s * c;
+                        }
+                    }
+                    Some(GemmaMoe {
+                        router,
+                        per_expert_scale: nw(&format!("{lp}router.per_expert_scale"), &[n_exp])?,
+                        ln_post_dense: nw(&format!("{lp}post_feedforward_layernorm_1.weight"), &[h])?,
+                        ln_pre: nw(&format!("{lp}pre_feedforward_layernorm_2.weight"), &[h])?,
+                        ln_post: nw(&format!("{lp}post_feedforward_layernorm_2.weight"), &[h])?,
+                        experts: crate::moe::Experts::load(
+                            files,
+                            &format!("{prefix}{lp}experts."),
+                            n_exp,
+                            top_k,
+                            mi,
+                            h,
+                            quant,
+                            crate::moe::Act::GeluTanh,
+                        )?,
+                    })
+                }
+                None => None,
             };
             layers.push(Layer {
                 sliding,
@@ -931,6 +1000,7 @@ impl<'a> Model<'a> {
                 up: gl("mlp.up_proj.weight", inter, h)?,
                 down: gl("mlp.down_proj.weight", h, inter)?,
                 ple: ple_l,
+                moe,
                 layer_scalar,
             });
         }
@@ -942,7 +1012,17 @@ impl<'a> Model<'a> {
             f
         };
         let inv_freq_sliding = scaled(rope_inv_freq(cfg.head_dim, rs.theta, rs.proportion), rs.factor);
-        let inv_freq_full = scaled(rope_inv_freq(cfg.global_head_dim, rf.theta, rf.proportion), rf.factor);
+        let mut inv_freq_full = scaled(rope_inv_freq(cfg.global_head_dim, rf.theta, rf.proportion), rf.factor);
+        if !cfg.gemma3 && files.has("rope_freqs") {
+            // GGUF: llama.cpp rotates the whole global head, dividing each frequency by
+            // `rope_freqs` (proportional RoPE: 1 for the rotated pairs, huge for the others).
+            let ff = files.f32("rope_freqs")?;
+            let base = rope_inv_freq(cfg.global_head_dim, rf.theta, 1.0);
+            if ff.len() != base.len() {
+                bail!("rope_freqs has {} entries, expected {}", ff.len(), base.len());
+            }
+            inv_freq_full = base.iter().zip(&ff).map(|(b, f)| if *f > 1e6 { 0.0 } else { b / f }).collect();
+        }
 
         Ok(Self {
             cfg,
@@ -954,6 +1034,7 @@ impl<'a> Model<'a> {
             final_norm,
             inv_freq_sliding,
             inv_freq_full,
+            stream: None,
         })
     }
 
@@ -998,8 +1079,75 @@ impl<'a> Model<'a> {
             if let Some(p) = &l.ple {
                 n += p.gate.bytes() + p.proj.bytes();
             }
+            if let Some(m) = &l.moe {
+                n += m.experts.bytes_per_token();
+            }
         }
         n
+    }
+
+    /// The weights of each streaming unit (all experts included), in execution order.
+    fn unit_lins(&self) -> Vec<Vec<&Lin<'a>>> {
+        let mut v: Vec<Vec<&Lin>> = Vec::new();
+        if let Some(p) = &self.ple {
+            v.push(vec![&p.proj]);
+        }
+        for l in &self.layers {
+            v.push(l.dense_lins());
+        }
+        v.push(vec![&self.head]);
+        v
+    }
+
+    /// The streaming units of this model in execution order (see `crate::stream`): the PLE
+    /// projection (E2B / E4B), the layers, the LM head. The routed experts of MoE layers are
+    /// on-demand parts of their layer.
+    pub fn stream_units(&self) -> Vec<crate::stream::UnitSpec> {
+        let base = self.ple.is_some() as usize;
+        self.unit_lins()
+            .into_iter()
+            .enumerate()
+            .map(|(i, lins)| {
+                let layer = i.checked_sub(base).and_then(|l| self.layers.get(l));
+                crate::stream::UnitSpec {
+                    name: match layer {
+                        Some(_) => format!("layer.{}", i - base),
+                        None if i == 0 && base == 1 => "ple".into(),
+                        None => "lm_head".into(),
+                    },
+                    ranges: lins.iter().flat_map(|l| l.mem_ranges()).collect(),
+                    uses: 1.0,
+                    parts: layer.and_then(|l| l.moe.as_ref()).map(|m| m.experts.ranges()).unwrap_or_default(),
+                }
+            })
+            .collect()
+    }
+
+    /// Marks the weights of the units with `streamed[i]` set as streamed: no accelerator state
+    /// is kept for them between calls (see `Lin::set_transient_device`). Routed experts are read
+    /// on demand whatever their layer, so they never keep device state.
+    pub fn mark_streamed(&self, streamed: &[bool]) {
+        for (lins, &s) in self.unit_lins().iter().zip(streamed) {
+            for l in lins {
+                l.set_transient_device(s);
+            }
+        }
+        for m in self.layers.iter().filter_map(|l| l.moe.as_ref()) {
+            for l in m.experts.lins().into_iter().flatten() {
+                l.set_transient_device(true);
+            }
+        }
+    }
+
+    /// Brackets the PLE projection, every layer and the LM head with `hook`'s units (None stops
+    /// streaming).
+    pub fn set_stream(&mut self, hook: Option<crate::stream::StreamHook>) {
+        self.stream = hook;
+    }
+
+    /// The unit index of layer `l` (see [`Model::stream_units`]).
+    fn layer_unit(&self, l: usize) -> usize {
+        l + self.ple.is_some() as usize
     }
 
     pub fn new_session(&self) -> Session {
@@ -1026,7 +1174,9 @@ impl<'a> Model<'a> {
         let cfg = &self.cfg;
         let _timer = prof::start(Cat::Head);
         let mut logits = vec![0f32; t * cfg.vocab_size];
+        let unit = crate::stream::enter(&self.stream, self.layer_unit(self.layers.len()));
         linear(&self.head, cfg.vocab_size, cfg.hidden_size, hidden, t, &mut logits);
+        drop(unit);
         if let Some(cap) = cfg.final_logit_softcapping {
             let cap = cap as f32;
             for_chunks(&mut logits, 8192, true, |_, c| {
@@ -1066,6 +1216,15 @@ impl<'a> Model<'a> {
 
         let par = t > 1;
         let timer = prof::start(Cat::Embed);
+        if let Some(s) = &self.stream {
+            // All rows at once, ahead of the read-ahead, rather than a page fault per lookup.
+            let mut rows: Vec<(usize, usize)> = tokens.iter().flat_map(|&tk| self.embed.row_ranges(tk as usize, h)).collect();
+            if let Some(ple) = &self.ple {
+                let w = nl * cfg.hidden_size_per_layer_input;
+                rows.extend(tokens.iter().flat_map(|&tk| ple.embed.row_ranges(tk as usize, w)));
+            }
+            s.need_ranges(&rows);
+        }
         // Token embeddings, scaled by sqrt(hidden).
         let mut x = vec![0f32; t * h];
         let scale = (h as f32).sqrt();
@@ -1086,7 +1245,9 @@ impl<'a> Model<'a> {
         let pli: Option<Vec<f32>> = self.ple.as_ref().map(|ple| {
             let p = cfg.hidden_size_per_layer_input;
             let mut proj = vec![0f32; t * nl * p];
+            let unit = crate::stream::enter(&self.stream, 0);
             linear(&ple.proj, nl * p, h, &x, t, &mut proj);
+            drop(unit);
             let s_proj = (h as f32).powf(-0.5);
             let s_emb = (p as f32).sqrt();
             let s_out = std::f32::consts::FRAC_1_SQRT_2;
@@ -1096,7 +1257,7 @@ impl<'a> Model<'a> {
                 for l in 0..nl {
                     let chunk = &mut row[l * p..(l + 1) * p];
                     scale_inplace(chunk, s_proj);
-                    rmsnorm_inplace(chunk, Some(ple.norm), eps);
+                    rmsnorm_f32w_inplace(chunk, &ple.norm, eps);
                     for (j, c) in chunk.iter_mut().enumerate() {
                         *c = (*c + emb[l * p + j] * s_emb) * s_out;
                     }
@@ -1108,11 +1269,31 @@ impl<'a> Model<'a> {
         let positions: Vec<usize> = (start..start + t).collect();
         let rope_s = rope_tables(&positions, &self.inv_freq_sliding);
         let rope_f = rope_tables(&positions, &self.inv_freq_full);
+        // `vision_bidirectional`: each run of consecutive soft tokens (one image) is a block whose
+        // tokens see the whole block; the others stay causal.
+        let ext: Option<Vec<usize>> = (cfg.vision_bidirectional() && !mm.is_empty()).then(|| {
+            let mut e: Vec<usize> = (0..t).map(|i| start + i + 1).collect();
+            let mut pos: Vec<usize> = mm.iter().map(|m| m.0).collect();
+            pos.sort_unstable();
+            let mut i = 0;
+            while i < pos.len() {
+                let mut j = i;
+                while j + 1 < pos.len() && pos[j + 1] == pos[j] + 1 {
+                    j += 1;
+                }
+                for &p in &pos[i..=j] {
+                    e[p] = start + pos[j] + 1;
+                }
+                i = j + 1;
+            }
+            e
+        });
         drop(timer);
 
         for (l, layer) in self.layers.iter().enumerate() {
+            let _unit = crate::stream::enter(&self.stream, self.layer_unit(l));
             let rope = if layer.sliding { &rope_s } else { &rope_f };
-            self.layer_forward(l, layer, &mut x, t, start, pli.as_deref(), sess, rope);
+            self.layer_forward(l, layer, &mut x, t, start, pli.as_deref(), sess, rope, ext.as_deref());
         }
 
         // Final norm.
@@ -1132,6 +1313,7 @@ impl<'a> Model<'a> {
         pli: Option<&[f32]>,
         sess: &mut Session,
         rope: &(Vec<f32>, Vec<f32>),
+        ext: Option<&[usize]>,
     ) {
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
@@ -1190,7 +1372,9 @@ impl<'a> Model<'a> {
         let cache = sess.caches[layer.kv_src].as_ref().expect("kv source cache");
         let window = if layer.sliding { Some(cfg.sliding_window) } else { None };
         let mut att = vec![0f32; t * nh * hd];
-        attention_masked(&q, cache, nh, t, start, window, !cfg.bidirectional(), &mut att);
+        // Image soft tokens see their whole image on sliding layers (`vision_bidirectional`).
+        let ext = if layer.sliding { ext } else { None };
+        attention_ext(&q, cache, nh, t, start, window, !cfg.bidirectional(), ext, &mut att);
 
         let mut o = vec![0f32; t * h];
         linear(&layer.o, h, nh * hd, &att, t, &mut o);
@@ -1206,6 +1390,23 @@ impl<'a> Model<'a> {
         gelu_mul(&mut g, &u);
         let mut d = o; // reuse buffer [t, h]
         linear(&layer.down, h, inter, &g, t, &mut d);
+        if let Some(m) = &layer.moe {
+            // The routed experts, beside the dense MLP, on the same residual.
+            rmsnorm_f32w_rows_inplace(&mut d, h, &m.ln_post_dense, eps);
+            let routes = m.route(x, t, h, eps);
+            rmsnorm_f32w_rows(x, h, &m.ln_pre, eps, &mut hn);
+            let mut e = vec![0f32; t * h];
+            let unit = self.layer_unit(l);
+            let need = |ids: &[usize]| {
+                if let Some(s) = &self.stream {
+                    s.need_parts(unit, ids)
+                }
+            };
+            m.experts
+                .forward(&hn, t, h, &routes, &mut e, self.stream.as_ref().map(|_| &need as &dyn Fn(&[usize])));
+            rmsnorm_f32w_rows_inplace(&mut e, h, &m.ln_post, eps);
+            add_inplace(&mut d, &e);
+        }
         rmsnorm_f32w_rows_inplace(&mut d, h, &layer.ln_post_ffn, eps);
         add_inplace(x, &d);
 
@@ -1223,7 +1424,7 @@ impl<'a> Model<'a> {
             });
             let mut pr = d;
             linear(&pw.proj, h, p, &gp, t, &mut pr);
-            rmsnorm_rows_inplace(&mut pr, h, Some(pw.norm), eps);
+            rmsnorm_f32w_rows_inplace(&mut pr, h, &pw.norm, eps);
             add_inplace(x, &pr);
         }
 
@@ -1231,6 +1432,18 @@ impl<'a> Model<'a> {
             let s = layer.layer_scalar;
             for_chunks(x, 4096, par, |_, c| scale_inplace(c, s));
         }
+    }
+}
+
+impl<'a> Layer<'a> {
+    /// The weights every pass reads (all but the routed experts).
+    fn dense_lins(&self) -> Vec<&Lin<'a>> {
+        let mut v = vec![&self.q, &self.o, &self.gate, &self.up, &self.down];
+        v.extend(self.k.iter().chain(self.v.iter()));
+        if let Some(p) = &self.ple {
+            v.extend([&p.gate, &p.proj]);
+        }
+        v
     }
 }
 
@@ -1257,6 +1470,23 @@ pub(crate) fn attention_masked(
     causal: bool,
     out: &mut [f32],
 ) {
+    attention_ext(q, cache, nh, t, start, window, causal, None, out)
+}
+
+/// `attention_masked` where query `i` also sees the keys before `ext[i]` (absolute positions; a
+/// later bound than causal lets the soft tokens of one image see each other both ways).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_ext(
+    q: &[f32],
+    cache: &LayerCache,
+    nh: usize,
+    t: usize,
+    start: usize,
+    window: Option<usize>,
+    causal: bool,
+    ext: Option<&[usize]>,
+    out: &mut [f32],
+) {
     let _timer = prof::start(Cat::Attention);
     let hd = cache.hd;
     let n_kv = cache.n_kv;
@@ -1275,7 +1505,7 @@ pub(crate) fn attention_masked(
         let qpos = start + ti;
         let lo = window.map(|w| (qpos + 1).saturating_sub(w)).unwrap_or(0);
         let hi = match (causal, window) {
-            (true, _) => qpos + 1,
+            (true, _) => ext.map_or(qpos + 1, |e| e[ti].max(qpos + 1)),
             (false, Some(w)) => (qpos + w).min(cache.len),
             (false, None) => cache.len,
         };

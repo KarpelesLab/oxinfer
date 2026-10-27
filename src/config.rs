@@ -85,10 +85,11 @@ pub struct TextConfig {
     pub rope_local_base_freq: Option<f64>,
     #[serde(default)]
     pub rope_scaling: Option<serde_json::Value>,
-    /// Encoder use (EmbeddingGemma): every position attends both ways (within the window on
-    /// sliding layers).
+    /// `true` / `"all"` (encoders: EmbeddingGemma): every position attends both ways (within the
+    /// window on sliding layers). `"vision"` (Gemma 4 12B / 31B / 26B-A4B): the soft tokens of one
+    /// image attend to each other both ways on sliding layers; everything else is causal.
     #[serde(default)]
-    pub use_bidirectional_attention: Option<bool>,
+    pub use_bidirectional_attention: Option<serde_json::Value>,
     /// Gemma 3 (set from `model_type`): RMSNorm scales by `1 + weight`, V is not normed, every
     /// layer has the same head dim, and the layer pattern does not force a global last layer.
     #[serde(skip)]
@@ -121,10 +122,46 @@ const GEMMA3_DEFAULTS: [(&str, f64); 13] = [
     ("max_position_embeddings", 131_072.0),
 ];
 
+/// transformers 5.20+ saves Gemma 4's global-layer attention shape as `per_layer_config`
+/// (`{"5": {"head_dim": 512, "num_key_value_heads": 2}, ...}` for the full-attention layers)
+/// instead of `global_head_dim` / `num_global_key_value_heads`: maps it back.
+fn per_layer_overrides(o: &mut serde_json::Map<String, serde_json::Value>) -> Result<()> {
+    let Some(plc) = o.get("per_layer_config").and_then(|v| v.as_object()).cloned() else {
+        return Ok(());
+    };
+    let mut seen: Option<&serde_json::Value> = None;
+    for v in plc.values() {
+        if seen.is_some_and(|s| s != v) {
+            bail!("per_layer_config with different overrides per layer is not supported");
+        }
+        seen = Some(v);
+    }
+    if let Some(v) = seen {
+        if let Some(extra) = v
+            .as_object()
+            .and_then(|m| m.keys().find(|k| !matches!(k.as_str(), "head_dim" | "num_key_value_heads")))
+        {
+            bail!("per_layer_config override {extra:?} is not supported");
+        }
+        for (from, to) in [
+            ("head_dim", "global_head_dim"),
+            ("num_key_value_heads", "num_global_key_value_heads"),
+        ] {
+            if let Some(x) = v.get(from) {
+                o.insert(to.into(), x.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
 impl TextConfig {
     pub fn load(dir: &Path) -> Result<Self> {
-        let path = dir.join("config.json");
-        let raw: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&path)?)?;
+        let raw: serde_json::Value = if crate::gguf::is_gguf(dir) {
+            crate::gguf::header(dir)?.config_json()?
+        } else {
+            serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?
+        };
         let mt = raw.get("model_type").and_then(|v| v.as_str()).unwrap_or_default();
         let gemma3 = mt == "gemma3" || mt == "gemma3_text";
         let mut text = raw.get("text_config").cloned().unwrap_or(raw);
@@ -151,9 +188,12 @@ impl TextConfig {
                 o.insert("layer_types".into(), lt.into());
             }
         }
+        if let Some(o) = text.as_object_mut() {
+            per_layer_overrides(o)?;
+        }
         let mut cfg: TextConfig = serde_json::from_value(text).context("parse text config")?;
         cfg.gemma3 = gemma3;
-        if gemma3 && cfg.bidirectional() {
+        if cfg.bidirectional() && (gemma3 || cfg.use_bidirectional_attention.as_ref().is_some_and(|v| v == "all")) {
             // As transformers' Gemma3TextConfig: the stored window spans both directions, so each
             // side sees `window / 2` (keys less than `window / 2 + 1` positions away).
             cfg.sliding_window = cfg.sliding_window / 2 + 1;
@@ -163,7 +203,28 @@ impl TextConfig {
     }
 
     pub fn bidirectional(&self) -> bool {
-        self.use_bidirectional_attention.unwrap_or(false)
+        match &self.use_bidirectional_attention {
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(serde_json::Value::String(s)) => s == "all",
+            _ => false,
+        }
+    }
+
+    /// Image soft tokens attend to the other soft tokens of their image both ways (sliding layers).
+    pub fn vision_bidirectional(&self) -> bool {
+        matches!(&self.use_bidirectional_attention, Some(serde_json::Value::String(s)) if s == "vision")
+    }
+
+    /// Gemma 4 MoE layers (26B-A4B): a router and routed experts beside the dense MLP.
+    pub fn moe(&self) -> Option<(usize, usize, usize)> {
+        if !self.enable_moe_block {
+            return None;
+        }
+        Some((
+            self.num_experts.unwrap_or(0),
+            self.top_k_experts.unwrap_or(0),
+            self.moe_intermediate_size.unwrap_or(0),
+        ))
     }
 
     /// Attention scale applied to the queries.
@@ -194,8 +255,10 @@ impl TextConfig {
         {
             *last = "full_attention".to_string();
         }
-        if self.enable_moe_block {
-            bail!("MoE models (26B-A4B) are not supported yet");
+        if let Some((n, k, mi)) = self.moe()
+            && (n == 0 || k == 0 || k > n || mi == 0)
+        {
+            bail!("MoE config: {n} experts, top {k}, expert width {mi}");
         }
         Ok(())
     }
@@ -594,5 +657,34 @@ impl QwenConfig {
             .or(self.partial_rotary_factor)
             .unwrap_or(1.0);
         (self.head_dim as f64 * f) as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Gemma 4 26B-A4B as transformers 5.20 saves it: `per_layer_config` for the global layers,
+    /// `"vision"` bidirectional attention, a MoE block.
+    #[test]
+    fn gemma4_moe_config() {
+        let dir = std::env::temp_dir().join(format!("oxinfer-cfg-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = serde_json::json!({"model_type": "gemma4", "text_config": {
+            "hidden_size": 2816, "intermediate_size": 2112, "num_hidden_layers": 6, "num_attention_heads": 16,
+            "num_key_value_heads": 8, "head_dim": 256, "attention_k_eq_v": true,
+            "per_layer_config": {"5": {"head_dim": 512, "num_key_value_heads": 2}},
+            "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"],
+            "use_bidirectional_attention": "vision", "enable_moe_block": true, "num_experts": 128, "top_k_experts": 8,
+            "moe_intermediate_size": 704, "hidden_size_per_layer_input": 0}});
+        std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+        let c = TextConfig::load(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(
+            (c.global_head_dim, c.layer_n_kv(5), c.layer_n_kv(0), c.layer_head_dim(5)),
+            (512, 2, 8, 512)
+        );
+        assert!(c.vision_bidirectional() && !c.bidirectional());
+        assert_eq!(c.moe(), Some((128, 8, 704)));
     }
 }

@@ -114,6 +114,70 @@ impl ChatFormat for GemmaChat {
     }
 }
 
+impl GemmaChat {
+    /// The format of the Gemma 4 checkpoint in `dir` (a folder or a GGUF file): [`GemmaChatLarge`]
+    /// when its template closes an empty thought channel in the generation prompt, else this.
+    pub fn for_model(dir: &std::path::Path) -> &'static (dyn ChatFormat + Sync) {
+        let template = if crate::gguf::is_gguf(dir) {
+            crate::gguf::header(dir).ok().and_then(|h| h.chat_template().map(str::to_string))
+        } else {
+            crate::fsx::read(&dir.join("chat_template.jinja"))
+                .ok()
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .or_else(|| {
+                    let cfg: serde_json::Value =
+                        serde_json::from_slice(&crate::fsx::read(&dir.join("tokenizer_config.json")).ok()?).ok()?;
+                    cfg["chat_template"].as_str().map(str::to_string)
+                })
+        };
+        match template {
+            Some(t) if t.contains(r"'<|channel>thought\n<channel|>'") => &GemmaChatLarge,
+            _ => &GemmaChat,
+        }
+    }
+}
+
+/// Gemma 4 12B / 31B / 26B-A4B: as [`GemmaChat`], but with thinking off the generation prompt
+/// opens and closes an empty thought channel (`<|turn>model\n<|channel>thought\n<channel|>`), as
+/// these models' chat template does.
+pub struct GemmaChatLarge;
+impl ChatFormat for GemmaChatLarge {
+    fn conversation_start(&self, system: Option<&str>, think: bool) -> String {
+        GemmaChat.conversation_start(system, think)
+    }
+    fn user_turn(&self, content: &str, think: bool) -> String {
+        let mut s = user_turn(content);
+        if !think {
+            s.push_str("<|channel>thought\n<channel|>");
+        }
+        s
+    }
+    fn end_of_model_turn(&self) -> String {
+        GemmaChat.end_of_model_turn()
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        GemmaChat.end_of_turn_token()
+    }
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        GemmaChat.think_tokens()
+    }
+    fn starts_in_thinking(&self, think: bool) -> bool {
+        GemmaChat.starts_in_thinking(think)
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, think: bool, tools: &[ToolSpec]) -> String {
+        GemmaChat.conversation_start_tools(system, think, tools)
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        GemmaChat.tool_call_marker()
+    }
+    fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
+        GemmaChat.parse_tool_calls(raw)
+    }
+    fn tool_results(&self, results: &[ToolResult], think: bool) -> String {
+        GemmaChat.tool_results(results, think)
+    }
+}
+
 /// Gemma 3: `<start_of_turn>` turns, no system role (the system prompt opens the first user
 /// turn), no thinking and no tool tokens.
 pub struct Gemma3Chat;

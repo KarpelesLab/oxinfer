@@ -223,6 +223,41 @@ pub struct DecisionRequest {
     /// too; 0: the processor's default). Videos and audio are refused: the protocol takes images
     /// only.
     pub attachments: Attachments,
+    /// How a choice with more options than the trained labels is read (JSON `"strategy"`).
+    pub strategy: Strategy,
+}
+
+/// How a `choice` with more options than the trained labels (16) is read, as the reference
+/// server's `strategy` field.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Strategy {
+    /// The bundle's default: `tournament` for Gemma bundles, `single` for Qwen ones (as the
+    /// reference server's model profiles).
+    #[default]
+    Auto,
+    /// One pass, the options past the trained labels read through the wide labels.
+    Single,
+    /// Groups of up to 16 options read natively, then a final of the group winners (topped up
+    /// with the best others to 16), the group shares combined as the reference server does.
+    Tournament,
+}
+
+impl Strategy {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "auto" => Some(Self::Auto),
+            "single" => Some(Self::Single),
+            "tournament" => Some(Self::Tournament),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Single => "single",
+            Self::Tournament => "tournament",
+        }
+    }
 }
 
 impl DecisionRequest {
@@ -233,6 +268,7 @@ impl DecisionRequest {
             question: question.into(),
             options,
             attachments: Attachments::default(),
+            strategy: Strategy::Auto,
         }
     }
     /// With image files placed before the state text (see [`DecisionRequest::attachments`]).
@@ -286,6 +322,11 @@ impl DecisionRequest {
         );
         if let Some(a) = o.get("attachments").filter(|a| !a.is_null()) {
             r.attachments = Attachments::from_json(a).context("decision request")?;
+        }
+        if let Some(st) = o.get("strategy").filter(|v| !v.is_null()) {
+            let st = st.as_str().context("decision request: \"strategy\" must be a string")?;
+            r.strategy = Strategy::parse(st)
+                .with_context(|| format!("decision request: strategy {st:?} is not supported (auto, single, tournament)"))?;
         }
         Ok(r)
     }
@@ -375,6 +416,8 @@ pub enum Adaptation {
     Native,
     /// A choice with more options than trained slots, read through the extra labels.
     WideLabels,
+    /// A choice with more options than trained slots, read in groups ([`Strategy::Tournament`]).
+    Tournament,
 }
 
 impl Adaptation {
@@ -382,6 +425,7 @@ impl Adaptation {
         match self {
             Self::Native => "native",
             Self::WideLabels => "wide-labels",
+            Self::Tournament => "tournament",
         }
     }
 }
@@ -410,6 +454,8 @@ pub struct DecisionStats {
     pub prefill_secs: f64,
     /// Everything, tokenization included.
     pub total_secs: f64,
+    /// Forward passes (more than one for a tournament).
+    pub passes: usize,
 }
 
 impl DecisionStats {
@@ -454,7 +500,7 @@ impl Decision {
             "protocol": protocol,
             "model": model,
             "usage": {"prompt_tokens": n, "completion_tokens": 0, "total_tokens": n},
-            "num_model_requests": 1,
+            "num_model_requests": self.stats.passes.max(1),
             "elapsed_seconds": self.stats.total_secs,
         })
     }
@@ -541,6 +587,11 @@ pub struct DecisionAssets {
     head: Option<(Vec<f32>, Vec<f32>)>,
     /// LM-head readout bias per slot.
     lm_bias: Vec<f32>,
+    /// Slot-head logits are soft-capped as `cap * tanh(z / cap)` (Gemma bundles: 30, like the
+    /// model's own logits; `judge_config.json` `softcap`).
+    softcap: Option<f64>,
+    /// [`Strategy::Auto`] means a tournament (Gemma bundles, as the reference server's profile).
+    tournament_default: bool,
     /// Temperature per kind.
     temps: [f64; 3],
     /// Text before `[kind]` (Gemma bundles: `<bos>`).
@@ -772,6 +823,11 @@ impl DecisionAssets {
             None => String::new(),
         };
         let labels = choice_labels(tok, &slots)?;
+        let softcap = judge
+            .as_ref()
+            .and_then(|j| j.get("softcap"))
+            .and_then(Value::as_f64)
+            .filter(|c| *c > 0.0);
         let switch = adapter.as_ref().map(LoraAdapter::switch);
         Ok((
             Self {
@@ -788,6 +844,8 @@ impl DecisionAssets {
                 switch,
                 adapter: None,
                 hidden: base.hidden_size,
+                softcap,
+                tournament_default: gemma,
             },
             adapter,
         ))
@@ -808,9 +866,29 @@ impl DecisionAssets {
         hi - lo
     }
 
-    /// Most options a choice takes.
+    /// Most options a choice takes (single passes need a label for each; tournaments read at most
+    /// the trained labels per pass).
     pub fn max_choice_options(&self) -> usize {
+        if self.tournament_default {
+            return MAX_OPTIONS;
+        }
         self.labels.len().max(self.native_choice_options())
+    }
+
+    /// The strategy `s` stands for with these assets ([`Strategy::Auto`]: the bundle's default).
+    pub fn strategy(&self, s: Strategy) -> Strategy {
+        match s {
+            Strategy::Auto if self.tournament_default => Strategy::Tournament,
+            Strategy::Auto => Strategy::Single,
+            s => s,
+        }
+    }
+
+    /// Whether `req` is read as a tournament (a choice with more options than trained labels).
+    pub fn is_tournament(&self, req: &DecisionRequest) -> bool {
+        req.kind == DecisionKind::Choice
+            && req.options.len() > self.native_choice_options()
+            && self.strategy(req.strategy) == Strategy::Tournament
     }
 
     /// Temperatures per kind (noul, score, choice).
@@ -922,7 +1000,8 @@ impl DecisionAssets {
                 match (&self.head, self.readout) {
                     (Some((w, b)), Readout::SlotHead) => {
                         let row = &w[slot * self.hidden..(slot + 1) * self.hidden];
-                        row.iter().zip(hidden).map(|(&a, &x)| a as f64 * x as f64).sum::<f64>() + b[slot] as f64
+                        let z = row.iter().zip(hidden).map(|(&a, &x)| a as f64 * x as f64).sum::<f64>() + b[slot] as f64;
+                        self.softcap.map_or(z, |c| c * (z / c).tanh())
                     }
                     _ => logit(self.slots.ids[slot])? + self.lm_bias[slot] as f64,
                 }
@@ -970,6 +1049,61 @@ impl DecisionAssets {
             "source": self.source.display().to_string(),
         })
     }
+}
+
+/// The tournament groups of `n` options: `ceil(n / k)` contiguous groups (`k` trained labels) of near-equal size.
+pub fn tournament_groups(n: usize, k: usize) -> Vec<Vec<usize>> {
+    let g = n.div_ceil(k);
+    let (base, extra) = (n / g, n % g);
+    let mut out = Vec::with_capacity(g);
+    let mut i = 0;
+    for j in 0..g {
+        let size = base + usize::from(j < extra);
+        out.push((i..i + size).collect());
+        i += size;
+    }
+    out
+}
+
+/// The tournament's final options from the in-group probabilities (`p[o]` of option `o`):
+/// each group's best, topped up with the best of the others to the trained label count, in
+/// option order.
+pub fn tournament_final(groups: &[Vec<usize>], p: &[f64], k: usize) -> Vec<usize> {
+    let best = |g: &Vec<usize>| g.iter().copied().fold(g[0], |b, o| if p[o] > p[b] { o } else { b });
+    let chosen: Vec<usize> = groups.iter().map(best).collect();
+    let mut rest: Vec<usize> = groups.iter().flatten().copied().filter(|o| !chosen.contains(o)).collect();
+    rest.sort_by(|&a, &b| p[b].total_cmp(&p[a]).then(a.cmp(&b)));
+    let mut fin = chosen;
+    fin.extend(rest.into_iter().take(k.saturating_sub(groups.len())));
+    fin.sort_unstable();
+    fin
+}
+
+/// The tournament's probabilities: final-round options get `final * among`, the others their
+/// group's final share times their in-group probability (the reference server's formula).
+pub fn tournament_combine(groups: &[Vec<usize>], in_group: &[f64], fin: &[usize], final_p: &[f64]) -> Vec<f64> {
+    let n = in_group.len();
+    let mut group_of = vec![0; n];
+    for (gi, g) in groups.iter().enumerate() {
+        for &o in g {
+            group_of[o] = gi;
+        }
+    }
+    let (mut share, mut cap) = (vec![0.0; groups.len()], vec![0.0; groups.len()]);
+    for (&f, &q) in fin.iter().zip(final_p) {
+        share[group_of[f]] += q;
+        cap[group_of[f]] += in_group[f];
+    }
+    let among: f64 = share.iter().zip(&cap).map(|(a, b)| a * b).sum();
+    let mut p: Vec<f64> = (0..n)
+        .map(|o| match fin.iter().position(|&f| f == o) {
+            Some(i) => final_p[i] * among,
+            None => share[group_of[o]] * in_group[o],
+        })
+        .collect();
+    let s: f64 = p.iter().sum();
+    p.iter_mut().for_each(|v| *v /= s);
+    p
 }
 
 /// An image in [`Plan::prompt`] before its expansion to one pad per vision token (the reference
@@ -1039,6 +1173,34 @@ fn choice_labels(tok: &Tokenizer, slots: &Slots) -> Result<Vec<(String, u32)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tournament_rounds() {
+        let g = tournament_groups(20, 16);
+        assert_eq!(g, [(0..10).collect::<Vec<_>>(), (10..20).collect()]);
+        assert_eq!(tournament_groups(33, 16).iter().map(Vec::len).collect::<Vec<_>>(), [11, 11, 11]);
+        // In-group probabilities: option 3 leads group 0, option 12 group 1.
+        let mut p = vec![0.01; 20];
+        p[3] = 0.6;
+        p[12] = 0.5;
+        p[5] = 0.2;
+        let fin = tournament_final(&g, &p, 16);
+        assert_eq!(fin.len(), 16);
+        assert!(fin.contains(&3) && fin.contains(&12) && fin.contains(&5));
+        let final_p: Vec<f64> = fin.iter().map(|&o| if o == 12 { 0.7 } else { 0.3 / 15.0 }).collect();
+        let out = tournament_combine(&g, &p, &fin, &final_p);
+        assert!((out.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        assert_eq!(
+            out.iter()
+                .enumerate()
+                .fold((0, 0.0), |b, (i, &v)| if v > b.1 { (i, v) } else { b })
+                .0,
+            12
+        );
+        let v = json!({"kind": "choice", "question": "q", "options": ["a", "b"], "strategy": "tournament"});
+        assert_eq!(DecisionRequest::from_json(&v).unwrap().strategy, Strategy::Tournament);
+        assert!(DecisionRequest::from_json(&json!({"kind": "noul", "question": "q", "strategy": "permute"})).is_err());
+    }
 
     #[test]
     fn request_json() {

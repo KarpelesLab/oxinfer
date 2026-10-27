@@ -106,13 +106,14 @@ pub trait Backend: Send + Sync {
     }
     /// Device state for the routed experts of an MoE layer: expert `e` has the fused gate/up
     /// projection `gate_up[e]` (`[2 * inter, h]`, gate rows then up rows) and the down projection
-    /// `down[e]` (`[h, inter]`). None if the backend does not run MoE layers.
-    fn upload_moe(&self, _gate_up: &[WeightRef], _down: &[WeightRef], _h: usize, _inter: usize) -> Option<DeviceWeight> {
+    /// `down[e]` (`[h, inter]`); the activation is GELU-tanh when `gelu` is set, else SiLU. None if
+    /// the backend does not run MoE layers.
+    fn upload_moe(&self, _gate_up: &[WeightRef], _down: &[WeightRef], _h: usize, _inter: usize, _gelu: bool) -> Option<DeviceWeight> {
         None
     }
     /// The routed experts of an MoE layer (`dev` from `upload_moe`) in one submission: token `i`
     /// of `x` (`[t, h]`) goes through the experts `routes[i]` lists (expert index, weight), and
-    /// `y[i] += sum of weight * down(silu(gate) * up)`. Returns false if nothing was computed
+    /// `y[i] += sum of weight * down(act(gate) * up)`. Returns false if nothing was computed
     /// (the caller then runs the experts itself).
     #[allow(clippy::too_many_arguments)]
     fn moe(

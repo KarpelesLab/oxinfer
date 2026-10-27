@@ -32,6 +32,11 @@ pub trait TextLm {
     /// Declares `gh` x `gw` vision tokens at sequence position `start` before they are fed
     /// (Qwen's M-RoPE positions); models without multimodal positions ignore it.
     fn add_vision_span(&self, _sess: &mut Self::Sess, _start: usize, _gh: usize, _gw: usize) {}
+    /// The soft tokens of one image attend to each other both ways, so a forward pass must hold
+    /// a whole run of them (prefill chunks are stretched to the end of a run).
+    fn mm_runs_whole(&self) -> bool {
+        false
+    }
     /// Runs `tokens` and returns the logits after the last one.
     fn forward(&self, sess: &mut Self::Sess, tokens: &[u32]) -> Vec<f32> {
         let h = self.hidden_size();
@@ -56,6 +61,9 @@ impl TextLm for Model<'_> {
     }
     fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
         Model::logits(self, hidden, t)
+    }
+    fn mm_runs_whole(&self) -> bool {
+        self.cfg.vision_bidirectional()
     }
 }
 
@@ -82,12 +90,28 @@ impl TextLm for QwenModel<'_> {
 }
 
 /// Prefills `ids` in chunks of `chunk` tokens with multimodal overrides (`(position in ids,
-/// embedding)`); returns the hidden states of the last chunk.
+/// embedding)`); returns the hidden states of the last chunk. A chunk ending inside a run of
+/// consecutive overrides is stretched to the run's end when the model needs whole runs
+/// ([`TextLm::mm_runs_whole`]).
 pub fn prefill<M: TextLm + ?Sized>(model: &M, sess: &mut M::Sess, ids: &[u32], chunk: usize, overrides: &[(usize, Vec<f32>)]) -> Vec<f32> {
     let mut hs = Vec::new();
     let mut start = 0;
-    for c in ids.chunks(chunk.max(1)) {
-        let end = start + c.len();
+    let whole = model.mm_runs_whole() && !overrides.is_empty();
+    let mut mm_pos: Vec<usize> = if whole {
+        overrides.iter().map(|o| o.0).collect()
+    } else {
+        Vec::new()
+    };
+    mm_pos.sort_unstable();
+    let is_mm = |p: usize| mm_pos.binary_search(&p).is_ok();
+    while start < ids.len() {
+        let mut end = (start + chunk.max(1)).min(ids.len());
+        if whole {
+            while end < ids.len() && is_mm(end - 1) && is_mm(end) {
+                end += 1;
+            }
+        }
+        let c = &ids[start..end];
         let local: Vec<(usize, &[f32])> = overrides
             .iter()
             .filter(|(p, _)| *p >= start && *p < end)

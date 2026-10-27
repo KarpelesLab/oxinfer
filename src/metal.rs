@@ -787,8 +787,11 @@ kernel void x_half(device const float* x [[buffer(0)]], device half* xh [[buffer
     for (uint i = tid; i < n4; i += 256) out[i] = half4(row[i] * s);
     if (tid == 0) rs[r] = inv;
 }
-// SiLU(gate) * up of fused [gate | up] rows (n each) into scaled half rows, as x_half.
+// SiLU(gate) * up (GELU-tanh(gate) * up when p.gather is set) of fused [gate | up] rows (n each)
+// into scaled half rows, as x_half.
 inline float4 silu_mul4(float4 g, float4 u) { return g / (1.0f + exp(-g)) * u; }
+inline float4 gelu_mul4(float4 g, float4 u) { return g / (1.0f + exp(-1.5957691f * (g + 0.044715f * g * g * g))) * u; }
+inline float4 act_mul4(float4 g, float4 u, uint gelu) { return gelu != 0 ? gelu_mul4(g, u) : silu_mul4(g, u); }
 kernel void silu_half(device const float* gu [[buffer(0)]], device half* ah [[buffer(1)]], device float* rs [[buffer(2)]],
                       constant XH& p [[buffer(3)]],
                       uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
@@ -798,11 +801,11 @@ kernel void silu_half(device const float* gu [[buffer(0)]], device half* ah [[bu
     device const float4* u = g + p.n / 4;
     uint n4 = p.n / 4;
     float m = 0.f;
-    for (uint i = tid; i < n4; i += 256) { float4 v = abs(silu_mul4(g[i], u[i])); m = max(m, max(max(v.x, v.y), max(v.z, v.w))); }
+    for (uint i = tid; i < n4; i += 256) { float4 v = abs(act_mul4(g[i], u[i], p.gather)); m = max(m, max(max(v.x, v.y), max(v.z, v.w))); }
     m = tg_max(m, sg, lane, red);
     float inv, s = row_scale(m, inv);
     device half4* out = (device half4*)(ah + (ulong)r * p.n);
-    for (uint i = tid; i < n4; i += 256) out[i] = half4(silu_mul4(g[i], u[i]) * s);
+    for (uint i = tid; i < n4; i += 256) out[i] = half4(act_mul4(g[i], u[i], p.gather) * s);
     if (tid == 0) rs[r] = inv;
 }
 // out[t] = sum over the token's k slots of weight * o[row].
@@ -1062,6 +1065,8 @@ struct MoeDev {
     /// Per-expert (data, scales) GPU addresses of each projection, for `n_exp` experts.
     ep: (Id, Id),
     n_exp: usize,
+    /// GELU-tanh experts (Gemma 4) rather than SiLU.
+    gelu: bool,
     /// The residency set holding `bufs`, if any (else they are made resident per submission).
     residency: Option<std::sync::Arc<Residency>>,
     release: (MsgVoid, Sel),
@@ -2323,7 +2328,7 @@ impl Backend for MetalBackend {
         }
     }
 
-    fn upload_moe(&self, gate_up: &[WeightRef], down: &[WeightRef], h: usize, mi: usize) -> Option<DeviceWeight> {
+    fn upload_moe(&self, gate_up: &[WeightRef], down: &[WeightRef], h: usize, mi: usize, gelu: bool) -> Option<DeviceWeight> {
         self.mma()?;
         if !crate::gpu::moe_offload() || gate_up.is_empty() || gate_up.len() != down.len() {
             return None;
@@ -2377,6 +2382,7 @@ impl Backend for MetalBackend {
             bufs: Vec::with_capacity(spans.len()),
             ep: (std::ptr::null_mut(), std::ptr::null_mut()),
             n_exp: gate_up.len(),
+            gelu,
             residency: None,
             release,
         };
@@ -2534,7 +2540,13 @@ impl Backend for MetalBackend {
             e.buf(st.m_gu.id, 0, 0);
             e.buf(st.m_ah.id, 0, 1);
             e.buf(st.m_rs2.id, 0, 2);
-            e.bytes(&Xh { n: mi as u32, gather: 0 }, 3);
+            e.bytes(
+                &Xh {
+                    n: mi as u32,
+                    gather: md.gelu as u32,
+                },
+                3,
+            );
             e.dispatch((rows, 1), 256);
             grouped(
                 md.pipes.1,
@@ -2819,7 +2831,7 @@ mod tests {
         let routes: Vec<Vec<(usize, f32)>> = (0..t)
             .map(|i| vec![([0, 1, 2, 3, 4, 6, 7][i % 7], 0.7), ([1, 7][i % 2], 0.3)])
             .collect();
-        for q4 in [false, true] {
+        for (q4, gelu) in [(false, false), (true, false), (false, true), (true, true)] {
             let (wg, wd): (Vec<WeightRef>, Vec<WeightRef>) = (0..ne)
                 .map(|e| match q4 {
                     false => (
@@ -2829,7 +2841,7 @@ mod tests {
                     true => (WeightRef::Q4(&gu4[e]), WeightRef::Q4(&dn4[e])),
                 })
                 .unzip();
-            let dev = be.upload_moe(&wg, &wd, h, mi).unwrap();
+            let dev = be.upload_moe(&wg, &wd, h, mi, gelu).unwrap();
             let mut y = vec![0f32; t * h];
             assert!(be.moe(&x, t, h, mi, &routes, &dev, &mut y));
             let fg: Vec<Vec<f32>> = wg.iter().map(|w| dense(w, 2 * mi, h)).collect();
@@ -2839,7 +2851,14 @@ mod tests {
                 let xi = &x[i * h..(i + 1) * h];
                 for &(e, wt) in rt {
                     let g = matvec(&fg[e], xi);
-                    let a: Vec<f32> = (0..mi).map(|j| g[j] / (1.0 + (-g[j]).exp()) * g[mi + j]).collect();
+                    let act = |v: f32| {
+                        if gelu {
+                            crate::kernels::gelu_tanh(v)
+                        } else {
+                            v / (1.0 + (-v).exp())
+                        }
+                    };
+                    let a: Vec<f32> = (0..mi).map(|j| act(g[j]) * g[mi + j]).collect();
                     let o = matvec(&fd[e], &a);
                     for (yv, ov) in r[i * h..(i + 1) * h].iter_mut().zip(&o) {
                         *yv += wt * ov;
@@ -2848,7 +2867,7 @@ mod tests {
             }
 
             let e = row_err(&y, &r, h);
-            assert!(e < 3e-3, "q4 {q4}: relative error {e}");
+            assert!(e < 3e-3, "q4 {q4} gelu {gelu}: relative error {e}");
         }
     }
 }

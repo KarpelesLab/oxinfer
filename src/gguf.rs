@@ -2,8 +2,9 @@
 //! llama.cpp tensor names back to the Hugging Face names the loaders use, and the config,
 //! tokenizer and chat template that GGUF files carry in their metadata.
 //!
-//! Supported architectures: `qwen35` (Qwen3.5 / 3.6 / 3.8 dense hybrids), `qwen35moe`, `qwen3`
-//! and `llama` (Llama 3).
+//! Supported architectures: `qwen35` (Qwen3.5 / 3.6 / 3.8 dense hybrids), `qwen35moe`, `qwen3`,
+//! `llama` (Llama 3) and `gemma4` (Gemma 4 text models, dense and 26B-A4B MoE; the vision tower
+//! of the `mmproj` files is not read).
 //! llama.cpp's converter changes some tensors on the way; the loaders undo that where needed:
 //! RMSNorm weights already include the `+1` of Qwen3.5's zero-centred norms, `ssm_a` holds
 //! `-exp(A_log)`, and when there are fewer key heads than value heads the Gated DeltaNet value
@@ -270,6 +271,15 @@ impl Header {
     fn arch_f64(&self, k: &str) -> Option<f64> {
         self.get(&format!("{}.{k}", self.arch())).and_then(Value::as_f64)
     }
+    /// A per-layer metadata value (an array, or one value for every layer).
+    fn arch_per_layer(&self, k: &str) -> Option<Vec<Value>> {
+        let n = self.n_layers();
+        match self.get(&format!("{}.{k}", self.arch()))? {
+            Value::Array(a) if a.len() == n => Some(a.clone()),
+            Value::Array(_) => None,
+            v => Some(vec![v.clone(); n]),
+        }
+    }
     fn has(&self, name: &str) -> bool {
         self.tensors.iter().any(|t| t.name == name)
     }
@@ -281,7 +291,8 @@ impl Header {
             "qwen35moe" => "qwen3_5_moe_text",
             "qwen3" => "qwen3",
             "llama" => "llama",
-            a => bail!("GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen3 and llama are)"),
+            "gemma4" => "gemma4_text",
+            a => bail!("GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen3, llama and gemma4 are)"),
         })
     }
 
@@ -293,6 +304,9 @@ impl Header {
     /// The Hugging Face `config.json` this file was converted from (the fields the loaders read).
     pub fn config_json(&self) -> Result<Json> {
         let mt = self.model_type()?;
+        if mt == "gemma4_text" {
+            return self.gemma4_config();
+        }
         let llama = mt == "llama";
         if let Some(t) = self.get(&format!("{}.rope.scaling.type", self.arch())).and_then(Value::as_str)
             && !matches!(t, "none" | "llama3")
@@ -359,6 +373,86 @@ impl Header {
         Ok(c)
     }
 
+    /// The Gemma 4 text config (`Gemma4TextConfig` fields; the attention shape of the global
+    /// layers comes from the per-layer KV head counts and the `key_length` / `key_length_swa` pair).
+    fn gemma4_config(&self) -> Result<Json> {
+        let need = |k: &str| {
+            self.arch_u64(k)
+                .with_context(|| format!("GGUF metadata has no {}.{k}", self.arch()))
+        };
+        let n = self.n_layers();
+        let vocab = self
+            .tensors
+            .iter()
+            .find(|t| t.name == "token_embd.weight")
+            .map(|t| t.ne[1])
+            .context("GGUF has no token_embd.weight")?;
+        let sliding: Vec<bool> = match self.arch_per_layer("attention.sliding_window_pattern") {
+            Some(v) => v.iter().map(|x| matches!(x, Value::Bool(true))).collect(),
+            None => (0..n).map(|i| (i + 1) % 6 != 0).collect(),
+        };
+        let kv: Vec<usize> = self
+            .arch_per_layer("attention.head_count_kv")
+            .context("GGUF metadata has no head_count_kv")?
+            .iter()
+            .map(|v| v.as_u64().unwrap_or(0) as usize)
+            .collect();
+        let ff: Vec<usize> = self
+            .arch_per_layer("feed_forward_length")
+            .context("GGUF metadata has no feed_forward_length")?
+            .iter()
+            .map(|v| v.as_u64().unwrap_or(0) as usize)
+            .collect();
+        let first_full = sliding.iter().position(|s| !s).unwrap_or(n - 1);
+        let first_swa = sliding.iter().position(|s| *s).unwrap_or(0);
+        let inter = *ff.iter().min().unwrap_or(&0);
+        let h = need("embedding_length")?;
+        let per_layer = self.arch_u64("embedding_length_per_layer_input").unwrap_or(0);
+        // Global layers without a value projection read their keys as values.
+        let k_eq_v = (0..n).any(|l| !sliding[l] && !self.has(&format!("blk.{l}.attn_v.weight")));
+        let mut c = json!({
+            "model_type": "gemma4_text",
+            "hidden_size": h,
+            "intermediate_size": inter,
+            "use_double_wide_mlp": ff.iter().any(|&f| f > inter),
+            "num_hidden_layers": n,
+            "num_attention_heads": need("attention.head_count")?,
+            "num_key_value_heads": kv[first_swa],
+            "num_global_key_value_heads": kv[first_full],
+            "attention_k_eq_v": k_eq_v,
+            "head_dim": self.arch_u64("attention.key_length_swa").unwrap_or(256),
+            "global_head_dim": self.arch_u64("attention.key_length").unwrap_or(512),
+            "rms_norm_eps": self.arch_f64("attention.layer_norm_rms_epsilon").unwrap_or(1e-6),
+            "vocab_size": vocab,
+            "vocab_size_per_layer_input": vocab,
+            "hidden_size_per_layer_input": per_layer,
+            "num_kv_shared_layers": self.arch_u64("attention.shared_kv_layers").unwrap_or(0),
+            "sliding_window": self.arch_u64("attention.sliding_window").unwrap_or(512),
+            "final_logit_softcapping": self.arch_f64("final_logit_softcapping"),
+            "layer_types": sliding.iter().map(|&s| if s { "sliding_attention" } else { "full_attention" }).collect::<Vec<_>>(),
+            "rope_parameters": {
+                "full_attention": {
+                    "rope_theta": self.arch_f64("rope.freq_base").unwrap_or(1_000_000.0),
+                    "rope_type": "proportional",
+                    "partial_rotary_factor": 0.25,
+                },
+                "sliding_attention": {
+                    "rope_theta": self.arch_f64("rope.freq_base_swa").unwrap_or(10_000.0),
+                    "rope_type": "default",
+                },
+            },
+            "tie_word_embeddings": !self.has("output.weight"),
+        });
+        if let Some(e) = self.arch_u64("expert_count").filter(|&e| e > 0) {
+            let o = c.as_object_mut().unwrap();
+            o.insert("enable_moe_block".into(), json!(true));
+            o.insert("num_experts".into(), json!(e));
+            o.insert("top_k_experts".into(), json!(need("expert_used_count")?));
+            o.insert("moe_intermediate_size".into(), json!(need("expert_feed_forward_length")?));
+        }
+        Ok(c)
+    }
+
     /// End-of-generation token ids.
     pub fn eos_ids(&self) -> Vec<u32> {
         let mut v: Vec<u32> = ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"]
@@ -376,6 +470,9 @@ impl Header {
     /// A Hugging Face `tokenizer.json` equivalent to the GGUF vocabulary (byte-level BPE).
     pub fn tokenizer_json(&self) -> Result<Json> {
         let model = self.get("tokenizer.ggml.model").and_then(Value::as_str).unwrap_or("");
+        if model == "gemma4" {
+            return self.gemma4_tokenizer_json();
+        }
         if model != "gpt2" {
             bail!("GGUF tokenizer model {model:?} is not supported (only byte-level BPE, \"gpt2\")");
         }
@@ -442,6 +539,62 @@ impl Header {
         }))
     }
 
+    /// Gemma 4's `tokenizer.json`: SentencePiece-style BPE over `▁`-for-space text with byte
+    /// fallback, rebuilt from the GGUF vocabulary and merges (control and user-defined tokens are
+    /// the added tokens).
+    fn gemma4_tokenizer_json(&self) -> Result<Json> {
+        let tokens = self
+            .get("tokenizer.ggml.tokens")
+            .and_then(Value::as_array)
+            .context("GGUF has no tokenizer.ggml.tokens")?;
+        let types = self.get("tokenizer.ggml.token_type").and_then(Value::as_array);
+        let mut vocab = serde_json::Map::new();
+        let mut added = Vec::new();
+        for (id, t) in tokens.iter().enumerate() {
+            let s = t.as_str().context("non-string token")?;
+            if let Some(3 | 4) = types.and_then(|ty| ty.get(id)).and_then(Value::as_u64) {
+                added.push(json!({"id": id, "content": s, "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}));
+            }
+            vocab.insert(s.to_string(), json!(id));
+        }
+        let merges: Vec<Json> = self
+            .get("tokenizer.ggml.merges")
+            .and_then(Value::as_array)
+            .context("GGUF has no tokenizer.ggml.merges")?
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|m| {
+                let (a, b) = m.split_once(' ').unwrap_or((m, ""));
+                json!([a, b])
+            })
+            .collect();
+        let unk = self
+            .get("tokenizer.ggml.unknown_token_id")
+            .and_then(Value::as_u64)
+            .and_then(|i| tokens.get(i as usize))
+            .and_then(Value::as_str)
+            .unwrap_or("<unk>");
+        Ok(json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": added,
+            "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"},
+            "pre_tokenizer": {"type": "Split", "pattern": {"String": " "}, "behavior": "MergedWithPrevious", "invert": false},
+            "post_processor": null,
+            "decoder": {"type": "Sequence", "decoders": [
+                {"type": "Replace", "pattern": {"String": "\u{2581}"}, "content": " "},
+                {"type": "ByteFallback"},
+                {"type": "Fuse"},
+            ]},
+            "model": {
+                "type": "BPE", "dropout": null, "unk_token": unk, "continuing_subword_prefix": null,
+                "end_of_word_suffix": null, "fuse_unk": true, "byte_fallback": true, "ignore_merges": false,
+                "vocab": vocab, "merges": merges,
+            },
+        }))
+    }
+
     pub fn tokenizer(&self) -> Result<tokenizers::Tokenizer> {
         let j = serde_json::to_vec(&self.tokenizer_json()?)?;
         tokenizers::Tokenizer::from_bytes(j).map_err(|e| anyhow::anyhow!("GGUF tokenizer: {e}"))
@@ -458,6 +611,10 @@ pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec
         "output.weight" => "lm_head.weight".to_string(),
         // Llama 3: the divisor of each RoPE frequency (the llama3 scaling, see the module docs).
         "rope_freqs.weight" => "rope_freqs".to_string(),
+        // Gemma 4 E2B / E4B per-layer embeddings.
+        "per_layer_token_embd.weight" => "model.embed_tokens_per_layer.weight".to_string(),
+        "per_layer_model_proj.weight" => "model.per_layer_model_projection.weight".to_string(),
+        "per_layer_proj_norm.weight" => "model.per_layer_projection_norm.weight".to_string(),
         // FastMTP sidecars: draft-vocabulary index -> target token id (for a trimmed output head).
         "d2t" => "mtp.d2t".to_string(),
         n => {
@@ -481,6 +638,44 @@ pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec
                 }
             }
             let hf = match (arch, base) {
+                ("gemma4", _) => {
+                    let n = match (base, suffix) {
+                        ("ffn_norm", _) => "pre_feedforward_layernorm.weight",
+                        ("post_ffw_norm", _) => "post_feedforward_layernorm.weight",
+                        ("post_ffw_norm_1", _) => "post_feedforward_layernorm_1.weight",
+                        ("pre_ffw_norm_2", _) => "pre_feedforward_layernorm_2.weight",
+                        ("post_ffw_norm_2", _) => "post_feedforward_layernorm_2.weight",
+                        ("ffn_gate_inp", "scale") => "router.scale",
+                        ("ffn_gate_inp", _) => "router.proj.weight",
+                        ("ffn_down_exps", "scale") => "router.per_expert_scale",
+                        ("ffn_gate_up_exps", _) => "experts.gate_up_proj",
+                        ("ffn_gate_exps", _) => "experts.gate_proj",
+                        ("ffn_up_exps", _) => "experts.up_proj",
+                        ("ffn_down_exps", _) => "experts.down_proj",
+                        ("layer_output_scale", _) => "layer_scalar",
+                        ("inp_gate", _) => "per_layer_input_gate.weight",
+                        ("proj", _) => "per_layer_projection.weight",
+                        ("post_norm", _) => "post_per_layer_input_norm.weight",
+                        _ => "",
+                    };
+                    if !n.is_empty() {
+                        return Some((format!("model.layers.{l}.{n}"), shape));
+                    }
+                    match base {
+                        "attn_norm" => "input_layernorm.weight",
+                        "post_attention_norm" => "post_attention_layernorm.weight",
+                        "attn_q" => "self_attn.q_proj.weight",
+                        "attn_k" => "self_attn.k_proj.weight",
+                        "attn_v" => "self_attn.v_proj.weight",
+                        "attn_output" => "self_attn.o_proj.weight",
+                        "attn_q_norm" => "self_attn.q_norm.weight",
+                        "attn_k_norm" => "self_attn.k_norm.weight",
+                        "ffn_gate" => "mlp.gate_proj.weight",
+                        "ffn_up" => "mlp.up_proj.weight",
+                        "ffn_down" => "mlp.down_proj.weight",
+                        _ => return None,
+                    }
+                }
                 (_, "attn_norm") => "input_layernorm.weight",
                 ("qwen3" | "llama", "ffn_norm") => "post_attention_layernorm.weight",
                 (_, "post_attention_norm") => "post_attention_layernorm.weight",

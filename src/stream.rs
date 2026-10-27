@@ -1431,6 +1431,17 @@ pub fn attach_qwen(
     Ok(s)
 }
 
+/// Streams a Gemma 4 / Gemma 3 model whose weights borrow `files` (memory-mapped): the PLE
+/// projection (E2B / E4B), the layers (MoE experts read on demand), the LM head.
+/// Detach (`set_stream(None)`) or drop the model before dropping `files`.
+pub fn attach_gemma(model: &mut crate::model::Model<'_>, files: &ModelFiles, opts: StreamOptions) -> Result<Arc<Streamer>> {
+    let s = Streamer::new(&[files], model.stream_units(), opts)?;
+    let streamed: Vec<bool> = s.plan().units.iter().map(|u| !u.2).collect();
+    model.mark_streamed(&streamed);
+    model.set_stream(Some(StreamHook::new(s.clone(), 0)));
+    Ok(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -171,8 +171,8 @@ fn usage() -> ! {
          \x20                      original one when the model is a converted copy without them)\n\
          \x20 --mtp-cost           with --mtp, pick each round's draft length from measured round times and\n\
          \x20                      acceptance (default with --stream; --no-mtp-cost turns it off)\n\
-         \x20 --stream             Qwen: stream weights from the mapped file (models larger than RAM): a\n\
-         \x20                      reader thread fetches the next layers while one computes\n\
+         \x20 --stream             stream weights from the mapped file (models larger than RAM; Qwen and\n\
+         \x20                      Gemma): a reader thread fetches the next layers while one computes\n\
          \x20 --cache-budget-gb F  with --stream, page cache the model may use: a resident set of\n\
          \x20                      F - prefetch stays cached, the other layers are dropped after use\n\
          \x20 --resident-mb N      with --stream, resident set size (instead of the budget's)\n\
@@ -184,7 +184,7 @@ fn usage() -> ! {
          \x20 --stream-threads N   with --stream, reader threads (default 2)\n\
          \x20 --expert-cache-mb N  with --stream, page cache kept for recently used MoE experts (which\n\
          \x20                      are read on demand; default: what the budget leaves)\n\
-         \x20 --expert-predict     with --stream, read the next MoE layer's guessed experts ahead\n\
+         \x20 --expert-predict     with --stream, read the next MoE layer's guessed experts ahead (Qwen)\n\
          \x20 --image FILE         attach an image (repeatable; PNG/JPEG/WebP/GIF/BMP via oxideav)\n\
          \x20 --audio FILE         attach an audio clip (repeatable; WAV/MP3/FLAC/AAC/OGG via oxideav)\n\
          \x20 --video FILE|DIR     attach a video (repeatable; MP4/MOV/MKV/WebM/AVI with H.264, H.265,\n\
@@ -1323,7 +1323,9 @@ fn run_qwen(args: Args) -> Result<()> {
     let streamer = if args.stream {
         let mut fs = vec![&files];
         fs.extend(side.as_ref());
-        Some(start_stream(&args, &mut model, mtp.as_mut().filter(|_| args.mtp), &fs)?)
+        let mtp = mtp.as_mut().filter(|_| args.mtp);
+        let dt = default_draft_tokens(&args);
+        Some(start_stream(&args, |o| oxinfer::stream::attach_qwen(&mut model, mtp, &fs, dt, o))?)
     } else {
         None
     };
@@ -1359,12 +1361,11 @@ fn default_draft_tokens(args: &Args) -> usize {
     args.draft_tokens.unwrap_or(if args.stream { 8 } else { 3 })
 }
 
-/// Starts weight streaming for `--stream` and prints the plan.
+/// Starts weight streaming for `--stream` (`attach` hooks the model up with the options) and
+/// prints the plan.
 fn start_stream(
     args: &Args,
-    model: &mut qwen::QwenModel,
-    mtp: Option<&mut oxinfer::qwen_mtp::QwenMtp>,
-    files: &[&safetensors::ModelFiles],
+    attach: impl FnOnce(oxinfer::stream::StreamOptions) -> Result<std::sync::Arc<oxinfer::stream::Streamer>>,
 ) -> Result<std::sync::Arc<oxinfer::stream::Streamer>> {
     use oxinfer::stream::StreamOptions;
     let mut opts = StreamOptions::default().with_env();
@@ -1387,7 +1388,7 @@ fn start_stream(
     if let Some(n) = args.stream_threads {
         opts.io_threads = n;
     }
-    let s = oxinfer::stream::attach_qwen(model, mtp, files, default_draft_tokens(args), opts)?;
+    let s = attach(opts)?;
     let plan = s.plan();
     let o = s.options();
     let resident: Vec<&str> = plan.units.iter().filter(|u| u.2).map(|u| u.0.as_str()).collect();
@@ -1626,19 +1627,36 @@ fn run_gemma(args: Args) -> Result<()> {
     let cfg = config::TextConfig::load(&args.model)?;
     let eos = config::load_eos_ids(&args.model);
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
-    let model = Model::load(cfg, &files, args.quant)?;
-    let tok = Tokenizer::from_file(args.model.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+    let mut model = Model::load(cfg, &files, args.quant)?;
+    let streamer = if args.stream {
+        Some(start_stream(&args, |o| oxinfer::stream::attach_gemma(&mut model, &files, o))?)
+    } else {
+        None
+    };
+    *STREAM.lock().unwrap() = streamer.clone();
+    TRACE.store(args.stream_trace, std::sync::atomic::Ordering::Relaxed);
+    let r = run_gemma_loaded(&args, &model, &files, eos, t0);
+    // The streamer reads the mapped files: stop it before they are unmapped.
+    *STREAM.lock().unwrap() = None;
+    model.set_stream(None);
+    drop(streamer);
+    r
+}
+
+fn run_gemma_loaded(args: &Args, model: &Model, files: &safetensors::ModelFiles, eos: Vec<u32>, t0: Instant) -> Result<()> {
+    let tok = load_tokenizer(&args.model)?;
     if model.cfg.gemma3 {
-        if args.draft.is_some() || !mm_request(&args).is_empty() {
+        if args.draft.is_some() || !mm_request(args).is_empty() {
             bail!("speculative decoding and attachments are not supported for Gemma 3 yet");
         }
         if let Some(out) = &args.save_quantized {
-            return save_quantized(&args.model, out, &files, model.quant);
+            return save_quantized(&args.model, out, files, model.quant);
         }
         let eos = chat::with_turn_end(&chat::Gemma3Chat, &tok, eos);
-        return run_text(&args, &model, &tok, &eos, &chat::Gemma3Chat, Default::default());
+        return run_text(args, model, &tok, &eos, &chat::Gemma3Chat, Default::default());
     }
-    let eos = chat::with_turn_end(&chat::GemmaChat, &tok, eos);
+    let fmt = chat::GemmaChat::for_model(&args.model);
+    let eos = chat::with_turn_end(fmt, &tok, eos);
     eprintln!(
         "[loaded {} layers, hidden {}, {:.1} GB checkpoint ({}), {:?} weights streaming {:.2} GB/token, {} threads, {:.2}s]",
         model.cfg.num_hidden_layers,
@@ -1651,7 +1669,7 @@ fn run_gemma(args: Args) -> Result<()> {
         t0.elapsed().as_secs_f64()
     );
     if let Some(out) = &args.save_quantized {
-        return save_quantized(&args.model, out, &files, model.quant);
+        return save_quantized(&args.model, out, files, model.quant);
     }
     if args.preload && args.mmap {
         let t = Instant::now();
@@ -1698,8 +1716,8 @@ fn run_gemma(args: Args) -> Result<()> {
 
     if args.chat {
         let mut first = true;
-        let (mm_text, mm_feats) = if !mm_request(&args).is_empty() {
-            oxinfer::mm::prepare(&mm_request(&args), &files, model.cfg.hidden_size)?
+        let (mm_text, mm_feats) = if !mm_request(args).is_empty() {
+            oxinfer::mm::prepare(&mm_request(args), files, model.cfg.hidden_size)?
         } else {
             (String::new(), Vec::new())
         };
@@ -1717,13 +1735,13 @@ fn run_gemma(args: Args) -> Result<()> {
             let mut text = String::new();
             let mut overrides = Vec::new();
             if first {
-                text.push_str(&chat::GemmaChat.conversation_start_tools(system_prompt(&args).as_deref(), args.think, &tool_specs(&args)));
-                text.push_str(&chat::user_turn(&format!("{mm_text}{line}")));
+                text.push_str(&chat::GemmaChat.conversation_start_tools(system_prompt(args).as_deref(), args.think, &tool_specs(args)));
+                text.push_str(&fmt.user_turn(&format!("{mm_text}{line}"), args.think));
                 first = false;
             } else {
                 // The previous stop token was sampled but never fed to the model.
                 text.push_str(&chat::end_of_model_turn());
-                text.push_str(&chat::user_turn(line));
+                text.push_str(&fmt.user_turn(line, args.think));
             }
             let ids = encode(&text)?;
             if !mm_feats.is_empty() && ["<|image|>", "<|audio|>", "<|video|>"].iter().any(|p| text.contains(p)) {
@@ -1734,12 +1752,12 @@ fn run_gemma(args: Args) -> Result<()> {
             }
             let t = Instant::now();
             if let Some(dr) = &drafter {
-                let hs = generate::prefill(&model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
+                let hs = generate::prefill(model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
                 let h = model.cfg.hidden_size;
                 let hidden_last = hs[hs.len() - h..].to_vec();
                 let prefill_secs = t.elapsed().as_secs_f64();
                 let (out, st, secs) = generate_speculative(
-                    &model,
+                    model,
                     dr,
                     &mut sess,
                     &tok,
@@ -1759,21 +1777,11 @@ fn run_gemma(args: Args) -> Result<()> {
                 );
                 continue;
             }
-            let hs = generate::prefill(&model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
+            let hs = generate::prefill(model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
             let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
             let prefill_secs = t.elapsed().as_secs_f64();
             prof::reset();
-            let (out, n, decode_secs) = generate(
-                &model,
-                &mut sess,
-                &tok,
-                logits,
-                &mut sampler,
-                &eos,
-                args.max_tokens,
-                &chat::GemmaChat,
-                args.think,
-            );
+            let (out, n, decode_secs) = generate(model, &mut sess, &tok, logits, &mut sampler, &eos, args.max_tokens, fmt, args.think);
             if args.show_tokens {
                 eprintln!("[output ids: {out:?}]");
             }
@@ -1781,7 +1789,7 @@ fn run_gemma(args: Args) -> Result<()> {
             if args.profile {
                 prof::report(decode_secs, n);
             }
-            continue_with_tools(&args, &model, &mut sess, &tok, &eos, &chat::GemmaChat, &mut sampler, out)?;
+            continue_with_tools(args, model, &mut sess, &tok, &eos, fmt, &mut sampler, out)?;
         }
         return Ok(());
     }
@@ -1794,8 +1802,8 @@ fn run_gemma(args: Args) -> Result<()> {
             s
         }
     };
-    let (mm_text, mm_feats) = if !mm_request(&args).is_empty() {
-        oxinfer::mm::prepare(&mm_request(&args), &files, model.cfg.hidden_size)?
+    let (mm_text, mm_feats) = if !mm_request(args).is_empty() {
+        oxinfer::mm::prepare(&mm_request(args), files, model.cfg.hidden_size)?
     } else {
         (String::new(), Vec::new())
     };
@@ -1803,8 +1811,8 @@ fn run_gemma(args: Args) -> Result<()> {
     let text = if args.raw {
         format!("<bos>{prompt}")
     } else {
-        let mut t = chat::GemmaChat.conversation_start_tools(system_prompt(&args).as_deref(), args.think, &tool_specs(&args));
-        t.push_str(&chat::user_turn(&prompt));
+        let mut t = chat::GemmaChat.conversation_start_tools(system_prompt(args).as_deref(), args.think, &tool_specs(args));
+        t.push_str(&fmt.user_turn(&prompt, args.think));
         t
     };
     if args.print_prompt {
@@ -1822,13 +1830,13 @@ fn run_gemma(args: Args) -> Result<()> {
 
     if let Some(dr) = &drafter {
         let t = Instant::now();
-        let hs = generate::prefill(&model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
+        let hs = generate::prefill(model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
         let h = model.cfg.hidden_size;
         let hidden_last = hs[hs.len() - h..].to_vec();
         let prefill_secs = t.elapsed().as_secs_f64();
         prof::reset();
         let (out, st, secs) = generate_speculative(
-            &model,
+            model,
             dr,
             &mut sess,
             &tok,
@@ -1863,7 +1871,7 @@ fn run_gemma(args: Args) -> Result<()> {
     }
 
     let t = Instant::now();
-    let hs = generate::prefill(&model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
+    let hs = generate::prefill(model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
     let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
     let prefill_secs = t.elapsed().as_secs_f64();
     if args.profile {
@@ -1886,17 +1894,7 @@ fn run_gemma(args: Args) -> Result<()> {
     }
 
     prof::reset();
-    let (out, n, decode_secs) = generate(
-        &model,
-        &mut sess,
-        &tok,
-        logits,
-        &mut sampler,
-        &eos,
-        args.max_tokens,
-        &chat::GemmaChat,
-        args.think,
-    );
+    let (out, n, decode_secs) = generate(model, &mut sess, &tok, logits, &mut sampler, &eos, args.max_tokens, fmt, args.think);
     if args.show_tokens {
         eprintln!("[output ids: {out:?}]");
     }
@@ -1905,6 +1903,6 @@ fn run_gemma(args: Args) -> Result<()> {
         eprintln!("-- decode --");
         prof::report(decode_secs, n);
     }
-    continue_with_tools(&args, &model, &mut sess, &tok, &eos, &chat::GemmaChat, &mut sampler, out)?;
+    continue_with_tools(args, model, &mut sess, &tok, &eos, fmt, &mut sampler, out)?;
     Ok(())
 }

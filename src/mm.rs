@@ -543,8 +543,9 @@ pub fn encode_rgb_images(
     images: &[RgbImage],
     max_soft_tokens: usize,
 ) -> Result<Vec<(String, MmFeature)>> {
-    let qc = qwen_vision::QwenMmConfig::load(model)?
-        .with_context(|| format!("{}: no Qwen vision tower (config.json has no vision_config)", model.display()))?;
+    let Some(qc) = qwen_vision::QwenMmConfig::load(model)? else {
+        return encode_rgb_images_gemma(model, files, text_hidden, images, max_soft_tokens);
+    };
     if qc.vision.out_hidden_size != text_hidden {
         bail!(
             "vision tower output {} does not match the text model's {text_hidden}",
@@ -566,6 +567,53 @@ pub fn encode_rgb_images(
             t,
         )?;
         out.push((text, feat));
+    }
+    Ok(out)
+}
+
+/// Whether `model` is a Gemma 4 checkpoint folder with its vision tower.
+pub fn has_gemma_vision(model: &Path) -> bool {
+    model.is_dir() && mm_config::MmConfig::load(model).is_ok_and(|m| m.vision.is_some())
+}
+
+/// [`encode_rgb_images`] for Gemma 4: each image as `<|image>`, one `<|image|>` per soft token
+/// (budget `max_soft_tokens`, 0 for the processor's default), `<image|>`.
+fn encode_rgb_images_gemma(
+    model: &Path,
+    files: &ModelFiles,
+    text_hidden: usize,
+    images: &[RgbImage],
+    max_soft_tokens: usize,
+) -> Result<Vec<(String, MmFeature)>> {
+    let mmc = mm_config::MmConfig::load(model)?;
+    let vcfg = mmc
+        .vision
+        .clone()
+        .with_context(|| format!("{}: no vision tower (config.json has no vision_config)", model.display()))?;
+    let tower = vision::VisionTower::load(vcfg, files, text_hidden).context("load the vision tower")?;
+    let budget = if max_soft_tokens > 0 {
+        max_soft_tokens
+    } else {
+        mmc.vision_soft_tokens_per_image
+    };
+    if !vision::SUPPORTED_SOFT_TOKENS.contains(&budget) {
+        bail!("max_soft_tokens must be one of {:?}", vision::SUPPORTED_SOFT_TOKENS);
+    }
+    let mut out = Vec::with_capacity(images.len());
+    for img in images {
+        let patches = vision::preprocess(&img.data, img.width, img.height, &tower.cfg, budget)?;
+        let emb = tower.encode(&patches);
+        let n = emb.len() / text_hidden;
+        let text = format!("<|image>{}<image|>", "<|image|>".repeat(n));
+        out.push((
+            text,
+            MmFeature {
+                token_id: mmc.image_token_id,
+                emb,
+                n,
+                grids: Vec::new(),
+            },
+        ));
     }
     Ok(out)
 }

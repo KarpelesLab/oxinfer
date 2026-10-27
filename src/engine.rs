@@ -113,12 +113,13 @@ pub struct EngineOptions {
     pub draft_tokens: Option<usize>,
     /// Where repo ids are downloaded (default [`crate::hf::cache_root`]). Key `cache_dir`.
     pub cache_dir: Option<PathBuf>,
-    /// Qwen3.5/3.8: stream the weights from the (mapped) file for models larger than memory,
-    /// prefetching the next layers while one computes (implies `mmap`; see [`crate::stream`]).
-    /// MTP then drafts up to 8 tokens with a cost-aware length. The routed experts of MoE models
-    /// are read on demand, recently used ones kept in a part of the page-cache budget. Keys
+    /// Qwen3.5/3.8, Gemma 4 / 3: stream the weights from the (mapped) file for models larger than
+    /// memory, prefetching the next layers while one computes (implies `mmap`; see
+    /// [`crate::stream`]). Qwen MTP then drafts up to 8 tokens with a cost-aware length. The
+    /// routed experts of MoE models are read on demand, recently used ones kept in a part of the
+    /// page-cache budget. Keys
     /// `stream` (on with the defaults), `cache_budget_gb`, `resident_mb`, `prefetch_mb`,
-    /// `flash_mbps`, `expert_cache_mb`, `expert_predict`.
+    /// `flash_mbps`, `expert_cache_mb`, `expert_predict` (Qwen MoE only).
     pub stream: Option<crate::stream::StreamOptions>,
     /// Core ML models: where Core ML may run them. Default (None): the Neural Engine, or the
     /// CPU / GPU when `device` asks for it. Key `coreml_units` (`auto`, `ane`, `all`, `gpu`,
@@ -890,6 +891,9 @@ impl Engine {
                     vocab_size: c.vocab_size,
                 };
                 decision = load_decision(decision_dir.as_deref(), &tok, &base, true, |ad| model.attach_lora(ad))?;
+                if let Some(so) = &opts.stream {
+                    streamer = Some(crate::stream::attach_gemma(&mut model, files, so.clone())?);
+                }
                 let model = arena.keep(model);
                 let drafter = match &draft_dir {
                     Some(d) => {
@@ -906,7 +910,11 @@ impl Engine {
                     }
                     None => None,
                 };
-                let fmt: &'static (dyn ChatFormat + Sync) = if model.cfg.gemma3 { &chat::Gemma3Chat } else { &chat::GemmaChat };
+                let fmt: &'static (dyn ChatFormat + Sync) = if model.cfg.gemma3 {
+                    &chat::Gemma3Chat
+                } else {
+                    chat::GemmaChat::for_model(&dir)
+                };
                 let c = &model.cfg;
                 let info = (
                     model.quant,
@@ -1294,6 +1302,9 @@ impl Engine {
             .decision
             .as_deref()
             .context("no decision assets loaded: load a Jev model directory, or set EngineOptions::decision_from")?;
+        if d.is_tournament(req) {
+            return self.decide_tournament(req);
+        }
         let plan = d.plan(req)?;
         let (mut prompt, mut feats, mut vision_secs) = (plan.prompt.clone(), Vec::new(), 0.0);
         if !plan.images.is_empty() {
@@ -1305,7 +1316,12 @@ impl Engine {
                      multimodal base (e.g. Qwen/Qwen3.5-9B with decision_from autotrust/JEV-9B/vl, or autotrust/JEV-27B-VL)",
                     self.info.path.display()
                 ),
-                _ => bail!("image decisions are supported on Qwen3.5-family vision checkpoints only"),
+                Family::Gemma4 if mm::has_gemma_vision(&self.info.path) => {}
+                Family::Gemma4 => bail!(
+                    "{}: no vision tower (a text-only checkpoint, e.g. GGUF), so image decisions are unavailable",
+                    self.info.path.display()
+                ),
+                _ => bail!("image decisions are supported on Qwen3.5-family and Gemma 4 vision checkpoints only"),
             }
             let images = crate::decide::ImageSource::to_rgb_all(&plan.images)?;
             let enc = {
@@ -1370,8 +1386,60 @@ impl Engine {
             vision_secs,
             prefill_secs,
             total_secs: t0.elapsed().as_secs_f64(),
+            passes: 1,
         };
         Ok(d.decision(plan, probs, stats))
+    }
+
+    /// A choice read as a tournament ([`crate::decide::Strategy::Tournament`]): each group of up
+    /// to 16 options in one pass, then a final pass over the group winners topped up with the
+    /// best others, combined as the reference server does.
+    fn decide_tournament(&mut self, req: &DecisionRequest) -> Result<Decision> {
+        use crate::decide::{Adaptation, Strategy};
+        let t0 = Instant::now();
+        let d = self.decision.as_deref().unwrap();
+        let (k, readout) = (d.native_choice_options(), d.readout);
+        let n = req.options.len();
+        let groups = crate::decide::tournament_groups(n, k);
+        let mut stats = DecisionStats::default();
+        let mut pass = |e: &mut Self, opts: &[usize]| -> Result<Vec<f64>> {
+            let mut sub = req.clone();
+            sub.options = opts.iter().map(|&i| req.options[i].clone()).collect();
+            sub.strategy = Strategy::Single;
+            let r = e.decide(&sub)?;
+            stats.prompt_tokens += r.stats.prompt_tokens;
+            stats.images += r.stats.images;
+            stats.image_tokens += r.stats.image_tokens;
+            stats.vision_secs += r.stats.vision_secs;
+            stats.prefill_secs += r.stats.prefill_secs;
+            stats.passes += 1;
+            Ok(r.probabilities)
+        };
+        let mut in_group = vec![0.0; n];
+        for g in &groups {
+            for (&o, p) in g.iter().zip(pass(self, g)?) {
+                in_group[o] = p;
+            }
+        }
+        let fin = crate::decide::tournament_final(&groups, &in_group, k);
+        let final_p = pass(self, &fin)?;
+        let probabilities = crate::decide::tournament_combine(&groups, &in_group, &fin, &final_p);
+        stats.total_secs = t0.elapsed().as_secs_f64();
+        let best_index = probabilities
+            .iter()
+            .enumerate()
+            .fold((0, f64::NEG_INFINITY), |b, (i, &p)| if p > b.1 { (i, p) } else { b })
+            .0;
+        Ok(Decision {
+            kind: req.kind,
+            options: req.options.clone(),
+            best: req.options[best_index].clone(),
+            probabilities,
+            best_index,
+            adaptation: Adaptation::Tournament,
+            readout,
+            stats,
+        })
     }
 
     /// [`Engine::decide`] with a `/v1/decide` JSON request; returns the JSON response.

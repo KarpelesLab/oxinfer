@@ -159,6 +159,8 @@ pub struct VisionTower<'a> {
     layers: Vec<VLayer<'a>>,
     inv_freq: Vec<f32>,    // head_dim/4 frequencies per spatial axis
     embed_proj: &'a [u16], // [text_hidden, H]
+    /// `standardize` (12B / 31B / 26B-A4B): pooled features become `(x - bias) * scale`.
+    standardize: Option<(Vec<f32>, Vec<f32>)>,
     pub text_hidden: usize,
 }
 
@@ -213,7 +215,21 @@ impl<'a> VisionTower<'a> {
             }
             files.bf16(embed_name)?
         };
+        let standardize = if cfg.standardize {
+            let f = |n: &str| -> Result<Vec<f32>> {
+                let full = format!("{pre}{n}");
+                let info = files.info(&full).with_context(|| format!("missing tensor {full}"))?;
+                if info.shape != [h] {
+                    bail!("tensor {full} has shape {:?}, expected [{h}]", info.shape);
+                }
+                files.f32(&full)
+            };
+            Some((f("std_bias")?, f("std_scale")?))
+        } else {
+            None
+        };
         Ok(Self {
+            standardize,
             input_proj: get("patch_embedder.input_proj.weight", &[h, 3 * cfg.patch_size * cfg.patch_size])?,
             pos_table: get("patch_embedder.position_embedding_table", &[2, cfg.position_embedding_size, h])?,
             layers,
@@ -331,6 +347,13 @@ impl<'a> VisionTower<'a> {
         }
         for v in pooled.iter_mut() {
             *v *= scale;
+        }
+        if let Some((bias, sc)) = &self.standardize {
+            for row in pooled.chunks_mut(h) {
+                for ((v, b), s) in row.iter_mut().zip(bias).zip(sc) {
+                    *v = (*v - b) * s;
+                }
+            }
         }
 
         // Embedder: RMSNorm without scale, then projection to the text hidden size.
