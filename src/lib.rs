@@ -37,6 +37,7 @@ pub mod gguf;
 pub mod gpu;
 #[cfg(feature = "hf")]
 pub mod hf;
+pub mod intervene;
 pub mod janus;
 pub mod kernels;
 pub mod lora;
@@ -60,6 +61,7 @@ pub mod qwen;
 pub mod qwen_mtp;
 pub mod qwen_vision;
 pub mod resample;
+pub mod sae;
 pub mod safetensors;
 pub mod sampler;
 pub mod sd;

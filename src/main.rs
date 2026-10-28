@@ -12,6 +12,7 @@ use tokenizers::Tokenizer;
 
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
 mod anemll_cli;
+mod intervene_cli;
 mod janus_cli;
 #[cfg(feature = "media")]
 mod tts_cli;
@@ -129,6 +130,8 @@ struct Args {
     temperature_set: Option<f32>,
     top_p_set: Option<f32>,
     max_tokens_set: Option<usize>,
+    // Runtime interventions.
+    iv: intervene_cli::IvArgs,
 }
 
 fn usage() -> ! {
@@ -285,6 +288,7 @@ fn usage() -> ! {
          \x20 --snac-encode FILE   (--model a SNAC dir) audio to codes, a JSON array per codebook (-o FILE)\n\
          \x20 --decode-codes FILE  (--model a SNAC dir) such codes back to a WAV (-o FILE)"
     );
+    eprintln!("\n{}", intervene_cli::USAGE);
     std::process::exit(2)
 }
 
@@ -394,6 +398,7 @@ fn parse_args() -> Result<Args> {
         temperature_set: None,
         top_p_set: None,
         max_tokens_set: None,
+        iv: Default::default(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -572,6 +577,7 @@ fn parse_args() -> Result<Args> {
             "--decode-codes" => a.decode_codes = Some(PathBuf::from(val()?)),
             "--repetition-penalty" | "--repeat-penalty" => a.repetition_penalty = Some(val()?.parse()?),
             "-h" | "--help" => usage(),
+            _ if a.iv.parse(&k, &mut val)? => {}
             _ => {
                 eprintln!("unknown argument {k}");
                 usage()
@@ -1072,7 +1078,28 @@ fn run_image(args: &Args) -> Result<()> {
 /// Attachments prepared for the first user turn: placeholder text and soft tokens.
 type Mm = (String, Vec<oxinfer::mm::MmFeature>);
 
-fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt: &dyn ChatFormat, mm: Mm) -> Result<()> {
+fn run_text<M: TextLm + oxinfer::intervene::Host>(
+    args: &Args,
+    model: &M,
+    tok: &Tokenizer,
+    eos: &[u32],
+    fmt: &dyn ChatFormat,
+    mm: Mm,
+) -> Result<()> {
+    let chunk = args.prefill_chunk.unwrap_or(256);
+    if intervene_cli::run_capture(
+        &args.iv,
+        model,
+        tok,
+        fmt,
+        args.raw,
+        args.think,
+        args.prompt.as_deref(),
+        args.output.as_deref(),
+        chunk,
+    )? {
+        return Ok(());
+    }
     let (mm_text, mut mm_feats) = mm;
     let encode = |text: &str| -> Result<Vec<u32>> {
         let enc = tok.encode(text, false).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
@@ -1109,6 +1136,11 @@ fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt
             let ids = encode(&text)?;
             if args.show_tokens {
                 eprintln!("[prompt ids: {ids:?}]");
+            }
+            if model.session_len(&sess) == 0
+                && let Some(st) = model.iv_state(&mut sess)
+            {
+                intervene_cli::install(&args.iv, args.cache_dir.as_deref(), model, tok, st, &ids, chunk)?;
             }
             // The attachments belong to the first turn.
             let overrides = oxinfer::mm::bind(model, &mut sess, &ids, &std::mem::take(&mut mm_feats))?;
@@ -1154,6 +1186,10 @@ fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt
     if ids.is_empty() {
         bail!("empty prompt");
     }
+    let sink = match model.iv_state(&mut sess) {
+        Some(st) => intervene_cli::install(&args.iv, args.cache_dir.as_deref(), model, tok, st, &ids, chunk)?,
+        None => None,
+    };
     let overrides = oxinfer::mm::bind(model, &mut sess, &ids, &mm_feats)?;
     let t = Instant::now();
     let hs = generate::prefill(model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
@@ -1175,12 +1211,19 @@ fn run_text<M: TextLm>(args: &Args, model: &M, tok: &Tokenizer, eos: &[u32], fmt
             .join(" ");
         eprintln!("[wrote {} logits to {} | top10 {top}]", logits.len(), path.display());
         eprintln!("[prefill {} tok in {:.2}s]", ids.len(), prefill_secs);
+        if let Some(sink) = &sink {
+            intervene_cli::print_features(sink, tok, &ids);
+        }
         return Ok(());
     }
     prof::reset();
     let (out, n, decode_secs) = generate(model, &mut sess, tok, logits, &mut sampler, eos, args.max_tokens, fmt, args.think);
     if args.show_tokens {
         eprintln!("[output ids: {out:?}]");
+    }
+    if let Some(sink) = &sink {
+        let all: Vec<u32> = ids.iter().chain(&out).copied().collect();
+        intervene_cli::print_features(sink, tok, &all);
     }
     report(ids.len(), prefill_secs, n, decode_secs);
     if args.profile {
@@ -1533,6 +1576,10 @@ fn run_qwen_mtp(
         if args.show_tokens {
             eprintln!("[prompt ids ({}): {ids:?}]", ids.len());
         }
+        if dec.sess.pos == 0 {
+            intervene_cli::install(&args.iv, args.cache_dir.as_deref(), model, tok, &mut dec.sess.iv, &ids, chunk)?;
+        }
+        dec.sess.iv.gen_from = dec.sess.pos + ids.len() - 1;
         // The attachments belong to the first turn.
         let overrides = oxinfer::mm::bind(model, &mut dec.sess, &ids, &std::mem::take(&mut mm_feats))?;
         let t = Instant::now();
@@ -1728,6 +1775,20 @@ fn run_gemma_loaded(args: &Args, model: &Model, files: &safetensors::ModelFiles,
     let mut sampler =
         Sampler::new(args.temperature, args.top_k, args.top_p, args.seed).with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0));
     let mut sess = model.new_session();
+    let chunk = args.prefill_chunk.unwrap_or(256);
+    if intervene_cli::run_capture(
+        &args.iv,
+        model,
+        &tok,
+        fmt,
+        args.raw,
+        args.think,
+        args.prompt.as_deref(),
+        args.output.as_deref(),
+        chunk,
+    )? {
+        return Ok(());
+    }
 
     if args.chat {
         let mut first = true;
@@ -1759,6 +1820,9 @@ fn run_gemma_loaded(args: &Args, model: &Model, files: &safetensors::ModelFiles,
                 text.push_str(&fmt.user_turn(line, args.think));
             }
             let ids = encode(&text)?;
+            if sess.pos == 0 {
+                intervene_cli::install(&args.iv, args.cache_dir.as_deref(), model, &tok, &mut sess.iv, &ids, chunk)?;
+            }
             if !mm_feats.is_empty() && ["<|image|>", "<|audio|>", "<|video|>"].iter().any(|p| text.contains(p)) {
                 overrides = oxinfer::mm::overrides(&ids, &mm_feats, model.cfg.hidden_size)?;
             }
@@ -1842,6 +1906,7 @@ fn run_gemma_loaded(args: &Args, model: &Model, files: &safetensors::ModelFiles,
     if ids.is_empty() {
         bail!("empty prompt");
     }
+    let sink = intervene_cli::install(&args.iv, args.cache_dir.as_deref(), model, &tok, &mut sess.iv, &ids, chunk)?;
 
     if let Some(dr) = &drafter {
         let t = Instant::now();
@@ -1905,6 +1970,9 @@ fn run_gemma_loaded(args: &Args, model: &Model, files: &safetensors::ModelFiles,
         };
         eprintln!("[wrote {} logits to {} | top10 {top}]", logits.len(), path.display());
         eprintln!("[prefill {} tok in {:.2}s]", ids.len(), prefill_secs);
+        if let Some(sink) = &sink {
+            intervene_cli::print_features(sink, &tok, &ids);
+        }
         return Ok(());
     }
 
@@ -1912,6 +1980,10 @@ fn run_gemma_loaded(args: &Args, model: &Model, files: &safetensors::ModelFiles,
     let (out, n, decode_secs) = generate(model, &mut sess, &tok, logits, &mut sampler, &eos, args.max_tokens, fmt, args.think);
     if args.show_tokens {
         eprintln!("[output ids: {out:?}]");
+    }
+    if let Some(sink) = &sink {
+        let all: Vec<u32> = ids.iter().chain(&out).copied().collect();
+        intervene_cli::print_features(sink, &tok, &all);
     }
     report(ids.len(), prefill_secs, n, decode_secs);
     if args.profile {

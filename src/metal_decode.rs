@@ -566,6 +566,8 @@ enum MOp {
         h: usize,
         inter: usize,
         k: usize,
+        /// Neuron edits between the two kernels: (pipeline, hot offset, entries).
+        edit: Option<(Id, usize, u32)>,
     },
     QkRope {
         pipe: Id,
@@ -603,6 +605,19 @@ enum MOp {
         out: usize,
         n: u32,
         gelu: u32,
+    },
+    Steer {
+        pipe: Id,
+        x: usize,
+        hot: usize,
+        cold: usize,
+        p: [u32; 4],
+    },
+    NeuronEdit {
+        pipe: Id,
+        act: usize,
+        hot: usize,
+        n: u32,
     },
     GdnConv {
         pipe: Id,
@@ -661,6 +676,10 @@ pub(crate) struct MetalPlan<'b> {
     rope_halves: Vec<usize>,
     input2: Option<(usize, usize)>,
     states: Vec<usize>,
+    /// Intervention parameters: (hot offset, floats), (cold offset, floats), and the key of the
+    /// cold values in the arena.
+    params: Option<((usize, usize), (usize, usize))>,
+    params_key: AtomicU64,
     /// One step at a time (the arena is shared).
     lock: Mutex<()>,
     /// Identifies this plan's slots.
@@ -980,6 +999,10 @@ impl MetalBackend {
                 }
                 Op::Experts(ref ex) => {
                     let (tabs, fused, g, d, pf) = self.expert_tables(ex, &mut owned, &mut indirect)?;
+                    let edit = match ex.edits {
+                        Some((v, n)) => Some((self.named_pipeline("dec_neuron_edit")?, byte(v), n as u32)),
+                        None => None,
+                    };
                     emit.push(MOp::Experts {
                         pair: self.named_pipeline(&format!("mvx_{}_pair", pf.0.name()))?,
                         sum: self.named_pipeline(&format!("mvx_{}_sum", pf.1.name()))?,
@@ -996,16 +1019,18 @@ impl MetalBackend {
                         h: ex.h,
                         inter: ex.inter,
                         k: ex.k,
+                        edit,
                     });
-                    (
-                        vec![
-                            rng(ex.x, ex.h),
-                            rng(ex.sel, 2 * ex.k),
-                            rng(ex.act, ex.k * ex.inter),
-                            rng(ex.y, ex.h),
-                        ],
-                        vec![rng(ex.act, ex.k * ex.inter), rng(ex.y, ex.h)],
-                    )
+                    let mut r = vec![
+                        rng(ex.x, ex.h),
+                        rng(ex.sel, 2 * ex.k),
+                        rng(ex.act, ex.k * ex.inter),
+                        rng(ex.y, ex.h),
+                    ];
+                    if let Some((v, n)) = ex.edits {
+                        r.push(rng(v, n * crate::intervene::GPU_ENTRY));
+                    }
+                    (r, vec![rng(ex.act, ex.k * ex.inter), rng(ex.y, ex.h)])
                 }
                 Op::AddNorm {
                     y,
@@ -1066,6 +1091,46 @@ impl MetalBackend {
                         gelu: gelu as u32,
                     });
                     (vec![rng(gv, n), rng(u, n)], vec![rng(out, n)])
+                }
+                Op::Steer {
+                    x,
+                    n,
+                    hot,
+                    cold,
+                    n_add,
+                    n_items,
+                } => {
+                    if n_items > crate::intervene::GPU_MAX_ITEMS {
+                        return None;
+                    }
+                    emit.push(MOp::Steer {
+                        pipe: self.named_pipeline("dec_steer")?,
+                        x: byte(x),
+                        hot: byte(hot),
+                        cold: byte(cold),
+                        p: [n as u32, n_add as u32, n_items as u32, 0],
+                    });
+                    (
+                        vec![
+                            rng(x, n),
+                            rng(hot, n_add.next_multiple_of(4) + crate::intervene::GPU_ENTRY * n_items),
+                            rng(cold, (n_add + 2 * n_items) * n),
+                        ],
+                        vec![rng(x, n)],
+                    )
+                }
+                Op::NeuronEdit { act, hot, n } => {
+                    emit.push(MOp::NeuronEdit {
+                        pipe: self.named_pipeline("dec_neuron_edit")?,
+                        act: byte(act),
+                        hot: byte(hot),
+                        n: n as u32,
+                    });
+                    // The edited neurons are anywhere in the activation: the whole buffer.
+                    (
+                        vec![(act.buf, 0, usize::MAX), rng(hot, n * crate::intervene::GPU_ENTRY)],
+                        vec![(act.buf, 0, usize::MAX)],
+                    )
                 }
                 Op::GdnConv { x, out, state, w, dim, kc } => {
                     if kc < 2 || w.len() != dim * kc || g.states.get(state) != Some(&((kc - 1) * dim)) {
@@ -1255,6 +1320,8 @@ impl MetalBackend {
             rope_halves: g.rope_halves.clone(),
             input2: g.input2.map(|(v, n)| (byte(v), n)),
             states: g.states.clone(),
+            params: g.params.map(|((h, hn), (c, cn))| ((byte(h), hn), (byte(c), cn))),
+            params_key: AtomicU64::new(0),
             lock: Mutex::new(()),
             id: PLAN_IDS.fetch_add(1, Ordering::Relaxed),
             f,
@@ -1519,6 +1586,17 @@ impl DecodePlan for MetalPlan<'_> {
         if let Some((off, n)) = self.input2 {
             unsafe { std::ptr::copy_nonoverlapping(s.x2.as_ptr(), base.add(off) as *mut f32, n) };
         }
+        match (self.params, s.params) {
+            (Some(((ho, hn), (co, cn))), Some((hot, cold, key))) if hot.len() == hn && cold.len() == cn => {
+                unsafe { std::ptr::copy_nonoverlapping(hot.as_ptr(), base.add(ho) as *mut f32, hn) };
+                if self.params_key.load(Ordering::Relaxed) != key {
+                    unsafe { std::ptr::copy_nonoverlapping(cold.as_ptr(), base.add(co) as *mut f32, cn) };
+                    self.params_key.store(key, Ordering::Relaxed);
+                }
+            }
+            (None, None) => {}
+            _ => return false,
+        }
         let want_logits = s.logits.is_some() && self.logits.is_some();
         let end = if want_logits { self.ops.len() } else { self.head_from };
         let kvb: Vec<(Id, Id)> = ms.kv.iter().map(|m| (m.k, m.v)).collect();
@@ -1557,6 +1635,7 @@ impl DecodePlan for MetalPlan<'_> {
                         MOp::QkRope { .. } => "qk",
                         MOp::GdnConv { .. } | MOp::GdnRule { .. } => "gdn",
                         MOp::Glu { .. } | MOp::Ew { .. } => "glu",
+                        MOp::Steer { .. } | MOp::NeuronEdit { .. } => "iv",
                         MOp::AddNorm { .. } => "norm",
                         MOp::Attn { .. } => "attn",
                     };
@@ -1624,6 +1703,7 @@ impl DecodePlan for MetalPlan<'_> {
                         h,
                         inter,
                         k,
+                        edit,
                     } => {
                         let p = |n_out: usize, n_in: usize, mode: MvMode, q: (u32, u32), r2: usize| MvParams {
                             n_out: n_out as u32,
@@ -1646,6 +1726,15 @@ impl DecodePlan for MetalPlan<'_> {
                         e.buf(arena, *sel, 5);
                         e.dispatch((*inter, *k), 32);
                         e.barrier();
+                        if let Some((pipe, hot, n)) = edit {
+                            e.pipe(*pipe);
+                            e.buf(arena, *act, 0);
+                            e.buf(arena, *hot, 1);
+                            e.buf(arena, *sel, 2);
+                            e.bytes(&[*n, *inter as u32, *k as u32, 1u32], 3);
+                            e.dispatch(((*n as usize).div_ceil(64), 1), 64);
+                            e.barrier();
+                        }
                         e.pipe(*sum);
                         e.buf(tabs[2], 0, 0);
                         e.buf(tabs[2], 0, 1);
@@ -1705,6 +1794,22 @@ impl DecodePlan for MetalPlan<'_> {
                         e.bytes(p, 3);
                         e.bytes(n, 4);
                         e.dispatch(((*n as usize).div_ceil(256), 1), 256);
+                    }
+                    MOp::Steer { pipe, x, hot, cold, p } => {
+                        e.pipe(*pipe);
+                        e.buf(arena, *x, 0);
+                        e.buf(arena, *hot, 1);
+                        e.buf(arena, *cold, 2);
+                        e.bytes(p, 3);
+                        e.dispatch((1, 1), 1024);
+                    }
+                    MOp::NeuronEdit { pipe, act, hot, n } => {
+                        e.pipe(*pipe);
+                        e.buf(arena, *act, 0);
+                        e.buf(arena, *hot, 1);
+                        e.buf(arena, *hot, 2);
+                        e.bytes(&[*n, 0u32, 0, 0], 3);
+                        e.dispatch(((*n as usize).div_ceil(64), 1), 64);
                     }
                     MOp::Glu { pipe, g, u, out, n, gelu } => {
                         e.pipe(*pipe);

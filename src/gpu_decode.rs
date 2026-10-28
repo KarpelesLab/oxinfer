@@ -165,6 +165,24 @@ pub enum Op<'a> {
     /// The routed experts chosen in `sel` (see [`Op::Route`]): `act[s] = silu(gate_e x) *
     /// (up_e x)` for each slot, then `y += sum of weight_s * down_e act[s]`.
     Experts(Experts<'a>),
+    /// Residual hooks of `crate::intervene` on one row `x` of `n`: with `n_add` coefficients
+    /// `c` then `n_items` entries of [`crate::intervene::GPU_ENTRY`] floats at `hot`, and the add
+    /// vectors, encoder rows and decoder rows at `cold`: `x += sum c_a add_a + sum (a'_j - a_j)
+    /// dec_j` where `a_j = act(enc_j . x + bias_j)` (see [`crate::intervene::GpuPoint`]).
+    Steer {
+        x: View,
+        n: usize,
+        hot: View,
+        cold: View,
+        n_add: usize,
+        n_items: usize,
+    },
+    /// Neuron edits on `act` (`n` entries at `hot`, see [`crate::intervene::GpuNeurons`]).
+    NeuronEdit {
+        act: View,
+        hot: View,
+        n: usize,
+    },
     /// `out = act(g) * u` over `n` values (SiLU, or GELU with the tanh approximation): the
     /// gate / up pair when the two matrices cannot share one matvec (different formats).
     Glu {
@@ -224,6 +242,9 @@ pub struct Experts<'a> {
     pub gelu: bool,
     /// `y +=` the weighted sum (else `y =`).
     pub add: bool,
+    /// Neuron edits of the routed experts' activations (entries with expert ids, see
+    /// [`crate::intervene::GpuNeurons`]): `(hot, n)`.
+    pub edits: Option<(View, usize)>,
 }
 
 /// Whether two weights can form one [`LinMode::SiluPair`] / [`LinMode::GeluPair`] matvec (same
@@ -286,6 +307,9 @@ pub struct Graph<'a> {
     pub input2: Option<(View, usize)>,
     /// Sizes (floats) of the recurrent states the ops use (host memory, see [`Step::states`]).
     pub states: Vec<usize>,
+    /// Intervention parameters (`crate::intervene`): the per-step part (`hot`, floats) and the
+    /// part refreshed only when its key changes (`cold`), see [`Step::params`].
+    pub params: Option<((View, usize), (View, usize))>,
 }
 
 impl Graph<'_> {
@@ -302,6 +326,7 @@ impl Graph<'_> {
             rope_halves: Vec::new(),
             input2: None,
             states: Vec::new(),
+            params: None,
         }
     }
     /// Adds an activation buffer of `n` floats.
@@ -339,6 +364,9 @@ pub struct Step<'s, 'c> {
     pub hidden: &'s mut [f32],
     /// Computes the head and copies the logits here when set.
     pub logits: Option<&'s mut [f32]>,
+    /// [`Graph::params`] values: hot (every step) and cold with its key (copied when the key
+    /// differs from the last step's).
+    pub params: Option<(&'s [f32], &'s [f32], u64)>,
 }
 
 /// A compiled graph.
@@ -355,6 +383,33 @@ pub struct Slot(pub Option<Box<dyn Any + Send + Sync>>);
 impl Clone for Slot {
     fn clone(&self) -> Self {
         Slot(None)
+    }
+}
+
+/// Compiled plans of a model by key (one per intervention layout; 0 is the plain model).
+#[derive(Default)]
+pub struct PlanCache(std::sync::Mutex<Vec<(u64, SharedPlan)>>);
+
+/// A compiled plan shared by the sessions of a model (None: the model cannot use one).
+pub type SharedPlan = Option<std::sync::Arc<dyn DecodePlan>>;
+
+impl PlanCache {
+    /// Plans kept besides the plain model's (the least recently built go first).
+    const KEEP: usize = 4;
+
+    /// The plan for `key`, built by `make` the first time (a failure is remembered too).
+    pub fn get(&self, key: u64, make: impl FnOnce() -> Option<Box<dyn DecodePlan>>) -> Option<std::sync::Arc<dyn DecodePlan>> {
+        let mut v = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, p)) = v.iter().find(|(k, _)| *k == key) {
+            return p.clone();
+        }
+        let p: Option<std::sync::Arc<dyn DecodePlan>> = make().map(std::sync::Arc::from);
+        if key != 0 && v.iter().filter(|(k, _)| *k != 0).count() >= Self::KEEP {
+            let i = v.iter().position(|(k, _)| *k != 0).unwrap();
+            v.remove(i);
+        }
+        v.push((key, p.clone()));
+        p
     }
 }
 

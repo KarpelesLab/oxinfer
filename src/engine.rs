@@ -148,6 +148,9 @@ pub struct EngineOptions {
     /// `autotrust/JEV-9B/vl`, the image decision assets for `Qwen/Qwen3.5-9B`). Key
     /// `decision_from`.
     pub decision_from: Option<String>,
+    /// Runtime interventions from the first request on (see [`Engine::set_interventions`]).
+    /// Key `interventions`: the [`crate::intervene::Spec`] as JSON, or `@FILE` for a JSON file.
+    pub interventions: Option<crate::intervene::Spec>,
 }
 
 /// Where Core ML runs a model ([`EngineOptions::coreml_units`]; Core ML's `MLComputeUnits`).
@@ -264,6 +267,7 @@ impl Default for EngineOptions {
             gpu_moe: None,
             gpu_decode: None,
             decision_from: None,
+            interventions: None,
         }
     }
 }
@@ -316,6 +320,7 @@ impl EngineOptions {
         "gpu_moe",
         "gpu_decode",
         "decision_from",
+        "interventions",
     ];
 
     /// Sets an option by name (see the field docs for the keys). Unknown keys are errors.
@@ -385,6 +390,18 @@ impl EngineOptions {
             "gpu_moe" => self.gpu_moe = Some(parse_bool(key, value)?),
             "gpu_decode" => self.gpu_decode = Some(parse_bool(key, value)?),
             "decision_from" => self.decision_from = opt_str(value),
+            "interventions" => {
+                self.interventions = match value.trim() {
+                    "" => None,
+                    v => {
+                        let text = match v.strip_prefix('@') {
+                            Some(f) => std::fs::read_to_string(f).with_context(|| format!("interventions: {f}"))?,
+                            None => v.to_string(),
+                        };
+                        Some(crate::intervene::Spec::from_json(&text)?)
+                    }
+                }
+            }
             _ => bail!("unknown option {key:?} (known: {})", Self::KEYS.join(", ")),
         }
         Ok(())
@@ -773,6 +790,17 @@ impl Lm {
 /// with [`crate::whisper::Transcriber`] runs.
 pub(crate) static RUN: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The engine's intervention settings ([`Engine::set_interventions`]).
+#[derive(Default)]
+struct IvState {
+    spec: Option<crate::intervene::Spec>,
+    compiled: Option<Arc<crate::intervene::Compiled>>,
+    calibration: Option<crate::intervene::Calibration>,
+    saes: std::sync::Mutex<std::collections::BTreeMap<PathBuf, Arc<crate::intervene::Sae>>>,
+    features: Arc<std::sync::Mutex<Vec<crate::intervene::TokenFeatures>>>,
+    cache_dir: Option<PathBuf>,
+}
+
 /// A loaded model with one conversation.
 pub struct Engine {
     lm: Lm,
@@ -797,6 +825,8 @@ pub struct Engine {
     streamer: Option<Arc<crate::stream::Streamer>>,
     /// Decision assets ([`Engine::decide`]).
     decision: Option<Box<DecisionAssets>>,
+    /// Runtime interventions ([`Engine::set_interventions`]).
+    iv: IvState,
     /// Must stay last: the model, sessions and references above point into it.
     _arena: Arena,
 }
@@ -1067,7 +1097,17 @@ impl Engine {
             stats: Stats::default(),
             streamer,
             decision,
+            iv: IvState {
+                cache_dir: opts.cache_dir.clone(),
+                ..Default::default()
+            },
             _arena: arena,
+        })
+        .and_then(|mut e| {
+            if let Some(spec) = &opts.interventions {
+                e.set_interventions(Some(spec.clone()))?;
+            }
+            Ok(e)
         })
     }
 
@@ -1117,6 +1157,7 @@ impl Engine {
             stats: Stats::default(),
             streamer: None,
             decision: None,
+            iv: IvState::default(),
             _arena: arena,
         })
     }
@@ -1198,6 +1239,179 @@ impl Engine {
         self.lm.reset();
         self.turns = 0;
         self.unfed = None;
+        self.install_iv();
+    }
+
+    // ---- runtime interventions (crate::intervene) ----
+
+    /// Sets the runtime interventions (neuron edits, steering, ablation, SAE features; see
+    /// [`crate::intervene::Spec`]) for the following requests, or removes them with None. The
+    /// weights are untouched and nothing is reloaded: changing a strength between requests only
+    /// recompiles the small hook set (vector files and SAEs are cached). Neuron edits in the
+    /// [`crate::intervene::Unit::ResidMedian`] unit without an explicit `resid_median` are
+    /// measured on the next request's prompt (once; see [`Engine::calibrate`]). The current
+    /// conversation's cache keeps what was computed before.
+    pub fn set_interventions(&mut self, spec: Option<crate::intervene::Spec>) -> Result<()> {
+        if spec.as_ref().is_some_and(|s| !s.is_empty()) && self.info.coreml.is_some() {
+            bail!("interventions are not supported for Core ML models");
+        }
+        self.iv.spec = spec.filter(|s| !s.is_empty());
+        self.iv.compiled = None;
+        if let Some(spec) = self.iv.spec.clone()
+            && (!spec.needs_calibration() || self.iv.calibration.is_some())
+        {
+            self.iv.compiled = Some(Arc::new(self.compile_iv(&spec)?));
+        }
+        self.install_iv();
+        Ok(())
+    }
+
+    /// The interventions in effect.
+    pub fn interventions(&self) -> Option<&crate::intervene::Spec> {
+        self.iv.spec.as_ref()
+    }
+
+    /// Measures the median residual norm of every layer's output on `text` (fed as is, no chat
+    /// template) with the unedited model, for [`crate::intervene::Unit::ResidMedian`] edits, and
+    /// keeps it for the following [`Engine::set_interventions`] calls (until
+    /// [`Engine::clear_calibration`]). Without it, the first request's prompt is measured.
+    pub fn calibrate(&mut self, text: &str) -> Result<crate::intervene::Calibration> {
+        let ids = self.tok.encode(text, false).map_err(|e| anyhow!("encode: {e}"))?.get_ids().to_vec();
+        let c = {
+            let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+            self.calibrate_ids(&ids)?
+        };
+        self.iv.calibration = Some(c.clone());
+        if let Some(spec) = self.iv.spec.clone() {
+            self.iv.compiled = Some(Arc::new(self.compile_iv(&spec)?));
+            self.install_iv();
+        }
+        Ok(c)
+    }
+
+    /// Forgets the measured residual norms (the next request's prompt is measured again).
+    pub fn clear_calibration(&mut self) {
+        self.iv.calibration = None;
+    }
+
+    /// The calibration in effect, if any.
+    pub fn calibration(&self) -> Option<&crate::intervene::Calibration> {
+        self.iv.calibration.as_ref()
+    }
+
+    /// The SAE features recorded by `sae_inspect` entries during the last request (prompt and
+    /// generated positions).
+    pub fn sae_features(&self) -> Vec<crate::intervene::TokenFeatures> {
+        self.iv.features.lock().unwrap().clone()
+    }
+
+    /// Runs each prompt through a fresh context (no interventions; `chat`: wrapped as a first
+    /// user turn with the chat template and no system prompt, generation prompt included) and
+    /// returns per prompt the pooled output of every layer (`layer -> vector`).
+    pub fn capture(
+        &mut self,
+        prompts: &[String],
+        pool: crate::intervene::Pool,
+        chat: bool,
+    ) -> Result<Vec<std::collections::BTreeMap<usize, Vec<f32>>>> {
+        let mut ids = Vec::with_capacity(prompts.len());
+        for p in prompts {
+            let text = if chat {
+                self.fmt.first_turn(None, self.config.think, &[], p)
+            } else {
+                p.clone()
+            };
+            ids.push(self.tok.encode(text, false).map_err(|e| anyhow!("encode: {e}"))?.get_ids().to_vec());
+        }
+        let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+        let chunk = self.prefill_chunk;
+        match &self.lm {
+            Lm::Gemma { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
+            Lm::Qwen { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
+            Lm::QwenMtp { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
+            #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+            Lm::CoreMl(_) => bail!("activation capture is not supported for Core ML models"),
+        }
+    }
+
+    /// A difference-of-means direction per layer: mean of the `positive` prompts' pooled layer
+    /// outputs minus the `negative` ones' (see [`Engine::capture`]); save it with
+    /// [`crate::intervene::save_vectors`] and use it in `steer` or `ablate`.
+    pub fn make_direction(
+        &mut self,
+        positive: &[String],
+        negative: &[String],
+        pool: crate::intervene::Pool,
+        chat: bool,
+    ) -> Result<std::collections::BTreeMap<usize, Vec<f32>>> {
+        let a = self.capture(positive, pool, chat)?;
+        let b = self.capture(negative, pool, chat)?;
+        Ok(crate::intervene::diff_of_means(&a, &b))
+    }
+
+    fn calibrate_ids(&self, ids: &[u32]) -> Result<crate::intervene::Calibration> {
+        let chunk = self.prefill_chunk;
+        match &self.lm {
+            Lm::Gemma { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
+            Lm::Qwen { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
+            Lm::QwenMtp { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
+            #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+            Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
+        }
+    }
+
+    fn compile_iv(&self, spec: &crate::intervene::Spec) -> Result<crate::intervene::Compiled> {
+        let cache = self.iv.cache_dir.clone();
+        let resolve = move |s: &str| resolve_file(s, cache.as_deref());
+        let ctx = crate::intervene::Ctx {
+            resolve: &resolve,
+            calibration: self.iv.calibration.as_ref(),
+            saes: Some(&self.iv.saes),
+        };
+        let host: &dyn crate::intervene::Host = match &self.lm {
+            Lm::Gemma { model, .. } => *model,
+            Lm::Qwen { model, .. } => *model,
+            Lm::QwenMtp { dec } => dec.model(),
+            #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+            Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
+        };
+        crate::intervene::Compiled::new(spec, host, &ctx)
+    }
+
+    /// Puts the compiled interventions (and the feature sink) into the session.
+    fn install_iv(&mut self) {
+        let st = match &mut self.lm {
+            Lm::Gemma { sess, .. } => &mut sess.iv,
+            Lm::Qwen { sess, .. } => &mut sess.iv,
+            Lm::QwenMtp { dec } => &mut dec.sess.iv,
+            #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+            Lm::CoreMl(_) => return,
+        };
+        st.iv = self.iv.compiled.clone();
+        st.features = self
+            .iv
+            .compiled
+            .as_ref()
+            .is_some_and(|c| c.inspects())
+            .then(|| self.iv.features.clone());
+    }
+
+    /// Before a turn: measures the prompt when a calibration is pending (unedited model), clears
+    /// the feature record.
+    fn prepare_iv(&mut self, ids: &[u32]) -> Result<()> {
+        if let Some(spec) = self.iv.spec.clone()
+            && self.iv.compiled.is_none()
+        {
+            let c = {
+                let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+                self.calibrate_ids(ids)?
+            };
+            self.iv.calibration = Some(c);
+            self.iv.compiled = Some(Arc::new(self.compile_iv(&spec)?));
+            self.install_iv();
+        }
+        self.iv.features.lock().unwrap().clear();
+        Ok(())
     }
 
     /// The text [`Engine::send`] would feed for `user` (the chat template applied).
@@ -1485,6 +1699,7 @@ impl Engine {
         } else {
             (mm::overrides(&ids, feats, self.info.hidden_size)?, mm::vision_spans(&ids, feats)?)
         };
+        self.prepare_iv(&ids)?;
         self.unfed = None;
         Ok(PendingTurn {
             ids,
@@ -1613,6 +1828,7 @@ impl PendingTurn {
                 for &(p, gh, gw) in &spans {
                     dec.sess.add_vision_span(base + p, gh, gw);
                 }
+                dec.sess.iv.gen_from = base + ids.len() - 1;
                 let logits = dec.prefill_mm(&ids, chunk, &overrides);
                 st.prefill_secs = t0.elapsed().as_secs_f64();
                 let max = limit(dec.sess.pos);
@@ -1907,6 +2123,7 @@ mod tests {
                 "coreml_prefill" => "pad",
                 "qos" => "background",
                 "mtp_from" | "draft" | "cache_dir" | "decision_from" => "x",
+                "interventions" => r#"{"neurons":[{"layer":1,"neuron":2,"op":"zero"}]}"#,
                 _ => "1",
             };
             o.set(k, v).unwrap();

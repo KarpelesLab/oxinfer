@@ -85,6 +85,8 @@ char *oxi_download(const char *spec, const char *cache_dir, oxi_progress_fn prog
  *                        bundle loaded as the model brings its own. ORG/NAME/SUBDIR takes the
  *                        bundle in a subfolder of a repo (autotrust/JEV-9B/vl: JEV-9B's image
  *                        decision assets, on the multimodal Qwen/Qwen3.5-9B).
+ *   interventions=JSON|@FILE  runtime interventions from the first message on (the JSON of
+ *                        oxi_engine_set_interventions, on one line, or @ and a file holding it)
  * Returns NULL on error. */
 OxiEngine *oxi_engine_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
 
@@ -173,6 +175,50 @@ char *oxi_decide(OxiEngine *engine, const char *request_json);
 /* The loaded decision assets as JSON (protocol, model, readout, adapter, max_options,
  * native_choice_options, temperatures, source), or NULL when the model has none. */
 char *oxi_decide_info_json(OxiEngine *engine);
+
+/* ---- Runtime interventions (Qwen3.5 / 3.8, Qwen3, Llama 3, Gemma 4 / 3) --------------------------
+ *
+ * Applied while the model runs; the weights are not changed and nothing is reloaded, so they can
+ * change between messages (only the small hook set is rebuilt; GPU decoding keeps its plan when
+ * only strengths change). Layers are 0-based as in the checkpoint's module names. `spec_json`:
+ *   {"neurons": [{"layer": 14, "neuron": 8949,          MLP neuron = index into down_proj's input
+ *                 "expert": 3 | "shared",               MoE layers only
+ *                 "op": "scale"|"zero"|"add"|"set"|"clamp", "value": F, "min": F, "max": F,
+ *                 "dose": F,                            = value, op add
+ *                 "unit": "raw" | "resid_median",       resid_median: value * median |h_L| /
+ *                                                       |W_down[:, n]| (measured on the next
+ *                                                       prompt unedited, or "resid_median": F)
+ *                 "positions": "all"|"prompt"|"generated"}],
+ *    "steer":   [{"file": "v.safetensors" | "v.gguf", "layers": [..] | "layer": L,
+ *                 "vector": [...],                      inline instead of a file (with "layer")
+ *                 "alpha": F, "point": "post"|"mid"|"pre", "normalize": false, "positions": ...}],
+ *    "ablate":  [{"file": ..., "direction_layer": L, "vector": [...], "layers": [..], "positions"}],
+ *    "sae":     [{"sae": "Qwen/SAE-Res-Qwen3.5-2B-Base-W32K-L0_50/layer12.sae.pt", "layer": L,
+ *                 "features": [{"id": F, "op": "clamp"|"scale"|"add"|"zero", "value": V}],
+ *                 "positions": ...}],
+ *    "sae_inspect": [{"sae": ..., "layer": L, "top_k": K}]}
+ * Vector files: safetensors with `layers.N` (the output of layer N), llama.cpp / repeng GGUF
+ * control vectors (`direction.N`, same meaning) or torch .pt. Returns 0 or -1. */
+int oxi_engine_set_interventions(OxiEngine *engine, const char *spec_json);
+
+/* The interventions in effect as JSON ("null" when none). Free with oxi_string_free. */
+char *oxi_engine_interventions_json(OxiEngine *engine);
+
+/* Measures the median norm of every layer's output (positions 1..) on `text`, fed as is, with the
+ * unedited model, for "resid_median" edits (kept for later oxi_engine_set_interventions calls).
+ * Returns {"resid_median": [per layer]} or NULL on error. */
+char *oxi_engine_calibrate(OxiEngine *engine, const char *text);
+
+/* The SAE features recorded by "sae_inspect" during the last message: a JSON array of
+ * {"pos", "layer", "top": [[feature, activation], ...]}. */
+char *oxi_engine_sae_features_json(OxiEngine *engine);
+
+/* Captures the layer outputs of two prompt sets and writes their difference of means per layer
+ * (safetensors `layers.N`, usable in "steer" and "ablate"). `request_json`:
+ *   {"positive": ["...", ...] | "file.txt", "negative": [...] | "file.txt",
+ *    "pool": "last" | "mean", "chat": true, "output": "direction.safetensors"}
+ * Returns {"output", "layers", "norms": {"N": |direction|}} or NULL on error. */
+char *oxi_engine_make_direction(OxiEngine *engine, const char *request_json);
 
 /* ---- Speech to text (Whisper) ------------------------------------------------------------------
  *

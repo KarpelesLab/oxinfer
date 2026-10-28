@@ -787,7 +787,7 @@ pub struct Model<'a> {
     /// the LM head (see [`Model::stream_units`]).
     stream: Option<crate::stream::StreamHook>,
     /// Single-token decoding on the GPU (see `model_gpu.rs`), compiled on first use.
-    gpu_plan: std::sync::OnceLock<Option<Box<dyn crate::gpu::decode::DecodePlan>>>,
+    gpu_plans: crate::gpu::decode::PlanCache,
 }
 
 #[derive(Clone)]
@@ -850,6 +850,8 @@ pub struct Session {
     /// Device state of GPU decoding (KV cache copies).
     gpu: crate::gpu::decode::Slot,
     pub pos: usize,
+    /// Runtime interventions ([`crate::intervene`]).
+    pub iv: crate::intervene::State,
 }
 
 impl Session {
@@ -1053,7 +1055,7 @@ impl<'a> Model<'a> {
             inv_freq_sliding,
             inv_freq_full,
             stream: None,
-            gpu_plan: std::sync::OnceLock::new(),
+            gpu_plans: Default::default(),
         })
     }
 
@@ -1179,6 +1181,7 @@ impl<'a> Model<'a> {
             caches,
             pos: 0,
             gpu: Default::default(),
+            iv: Default::default(),
         }
     }
 
@@ -1337,10 +1340,19 @@ impl<'a> Model<'a> {
         });
         drop(timer);
 
+        // The residual entering layer 0 (after the per-layer inputs were taken from the
+        // embeddings, as a pre-hook on layer 0 would see it).
+        let iv = sess.iv.active().then(|| sess.iv.clone());
+        if let Some(iv) = &iv {
+            iv.point(0, &mut x, h, start);
+        }
         for (l, layer) in self.layers.iter().enumerate() {
             let _unit = crate::stream::enter(&self.stream, self.layer_unit(l));
             let rope = if layer.sliding { &rope_s } else { &rope_f };
-            self.layer_forward(l, layer, &mut x, t, start, pli.as_deref(), sess, rope, ext.as_deref());
+            self.layer_forward(l, layer, &mut x, t, start, pli.as_deref(), sess, rope, ext.as_deref(), iv.as_ref());
+            if let Some(iv) = &iv {
+                iv.point(2 * l + 2, &mut x, h, start);
+            }
         }
 
         // Final norm.
@@ -1361,7 +1373,10 @@ impl<'a> Model<'a> {
         sess: &mut Session,
         rope: &(Vec<f32>, Vec<f32>),
         ext: Option<&[usize]>,
+        iv: Option<&crate::intervene::State>,
     ) {
+        use crate::intervene::Target;
+        let hook = iv.and_then(|s| s.hook(l, start));
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let nh = cfg.num_attention_heads;
@@ -1431,6 +1446,9 @@ impl<'a> Model<'a> {
         linear(&layer.o, h, nh * hd, &att, t, &mut o);
         rmsnorm_f32w_rows_inplace(&mut o, h, &layer.ln_post_attn, eps);
         add_inplace(x, &o);
+        if let Some(iv) = iv {
+            iv.point(2 * l + 1, x, h, start);
+        }
 
         // ---- MLP ----
         rmsnorm_f32w_rows(x, h, &layer.ln_pre_ffn, eps, &mut hn);
@@ -1439,6 +1457,9 @@ impl<'a> Model<'a> {
         let mut u = vec![0f32; t * inter];
         linear_multi(&mut [(&layer.gate, inter, &mut g[..]), (&layer.up, inter, &mut u[..])], h, &hn, t);
         gelu_mul(&mut g, &u);
+        if let Some(k) = &hook {
+            k.apply(Target::Mlp, &mut g, inter);
+        }
         let mut d = o; // reuse buffer [t, h]
         linear(&layer.down, h, inter, &g, t, &mut d);
         if let Some(m) = &layer.moe {
@@ -1453,8 +1474,15 @@ impl<'a> Model<'a> {
                     s.need_parts(unit, ids)
                 }
             };
-            m.experts
-                .forward(&hn, t, h, &routes, &mut e, self.stream.as_ref().map(|_| &need as &dyn Fn(&[usize])));
+            m.experts.forward(
+                &hn,
+                t,
+                h,
+                &routes,
+                &mut e,
+                self.stream.as_ref().map(|_| &need as &dyn Fn(&[usize])),
+                hook.as_ref(),
+            );
             rmsnorm_f32w_rows_inplace(&mut e, h, &m.ln_post, eps);
             add_inplace(&mut d, &e);
         }
@@ -1483,6 +1511,41 @@ impl<'a> Model<'a> {
             let s = layer.layer_scalar;
             for_chunks(x, 4096, par, |_, c| scale_inplace(c, s));
         }
+    }
+}
+
+impl crate::intervene::Host for Model<'_> {
+    fn n_layers(&self) -> usize {
+        self.cfg.num_hidden_layers
+    }
+    fn hidden(&self) -> usize {
+        self.cfg.hidden_size
+    }
+    fn mlp_inter(&self, layer: usize, target: crate::intervene::Target) -> Option<usize> {
+        use crate::intervene::Target;
+        let l = self.layers.get(layer)?;
+        match target {
+            Target::Mlp => Some(l.inter),
+            Target::Expert(e) => l.moe.as_ref().filter(|m| e < m.experts.n_experts()).map(|m| m.experts.inter),
+            Target::Shared => None,
+        }
+    }
+    fn down_column(&self, layer: usize, target: crate::intervene::Target, n: usize) -> Vec<f32> {
+        use crate::intervene::Target;
+        let l = &self.layers[layer];
+        let (down, inter) = match target {
+            Target::Expert(e) => {
+                let m = l.moe.as_ref().unwrap();
+                (&m.experts.down[e], m.experts.inter)
+            }
+            _ => (&l.down, l.inter),
+        };
+        let h = self.cfg.hidden_size;
+        let mut one = vec![0f32; inter];
+        one[n] = 1.0;
+        let mut y = vec![0f32; h];
+        linear(down, h, inter, &one, 1, &mut y);
+        y
     }
 }
 

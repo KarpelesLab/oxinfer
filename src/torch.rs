@@ -11,6 +11,9 @@ use std::collections::HashMap;
 pub struct TorchTensor {
     pub dtype: &'static str,
     pub shape: Vec<usize>,
+    /// Element strides (row-major for [`read_tensors`]; any dense permutation, e.g. a stored
+    /// transpose, for [`read_tensors_dense`]).
+    pub stride: Vec<usize>,
     pub start: usize,
     pub end: usize,
 }
@@ -343,6 +346,17 @@ fn unpickle(p: &[u8]) -> Result<V> {
 /// The tensors of a `torch.save` archive (nested dicts flatten to dotted names), with absolute
 /// byte ranges into `bytes`. Tensors must be contiguous.
 pub fn read_tensors(bytes: &[u8]) -> Result<Vec<(String, TorchTensor)>> {
+    read_impl(bytes, false)
+}
+
+/// [`read_tensors`] that also accepts tensors stored densely in another dimension order (a
+/// transposed view saved as is): their `stride` says how to index them, and `start..end` covers
+/// the whole dense block.
+pub fn read_tensors_dense(bytes: &[u8]) -> Result<Vec<(String, TorchTensor)>> {
+    read_impl(bytes, true)
+}
+
+fn read_impl(bytes: &[u8], permuted: bool) -> Result<Vec<(String, TorchTensor)>> {
     let entries = zip_entries(bytes)?;
     let pkl = entries
         .keys()
@@ -359,13 +373,14 @@ pub fn read_tensors(bytes: &[u8]) -> Result<Vec<(String, TorchTensor)>> {
         prefix: &str,
         entries: &HashMap<String, (usize, usize)>,
         out: &mut Vec<(String, TorchTensor)>,
+        permuted: bool,
     ) -> Result<()> {
         match v {
             V::Dict(d) => {
                 for (k, v) in d {
                     if let V::Str(k) = k {
                         let n = if name.is_empty() { k.clone() } else { format!("{name}.{k}") };
-                        walk(v, &n, prefix, entries, out)?;
+                        walk(v, &n, prefix, entries, out, permuted)?;
                     }
                 }
             }
@@ -378,11 +393,24 @@ pub fn read_tensors(bytes: &[u8]) -> Result<Vec<(String, TorchTensor)>> {
             } => {
                 let es = dtype_size(dtype);
                 let mut expect = 1usize;
-                for (d, s) in shape.iter().zip(stride).rev() {
-                    if *d > 1 && *s != expect {
-                        bail!("tensor {name} is not contiguous (stride {stride:?} for shape {shape:?})");
-                    }
+                let row_major = shape.iter().zip(stride).rev().all(|(d, s)| {
+                    let ok = *d <= 1 || *s == expect;
                     expect *= d;
+                    ok
+                });
+                // A dense permutation: sorted by stride, each is the product of the smaller dims.
+                let dense = || {
+                    let mut ds: Vec<(usize, usize)> = stride.iter().copied().zip(shape.iter().copied()).filter(|p| p.1 > 1).collect();
+                    ds.sort_unstable();
+                    let mut e = 1usize;
+                    ds.iter().all(|&(s, d)| {
+                        let ok = s == e;
+                        e *= d;
+                        ok
+                    })
+                };
+                if !row_major && !(permuted && dense()) {
+                    bail!("tensor {name} is not contiguous (stride {stride:?} for shape {shape:?})");
                 }
                 let (start, len) = *entries
                     .get(&format!("{prefix}data/{key}"))
@@ -397,6 +425,7 @@ pub fn read_tensors(bytes: &[u8]) -> Result<Vec<(String, TorchTensor)>> {
                     TorchTensor {
                         dtype,
                         shape: shape.clone(),
+                        stride: stride.clone(),
                         start: a,
                         end: b,
                     },
@@ -406,7 +435,7 @@ pub fn read_tensors(bytes: &[u8]) -> Result<Vec<(String, TorchTensor)>> {
         }
         Ok(())
     }
-    walk(&root, "", prefix, &entries, &mut out)?;
+    walk(&root, "", prefix, &entries, &mut out, permuted)?;
     Ok(out)
 }
 

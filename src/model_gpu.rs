@@ -7,7 +7,7 @@ use crate::gpu::decode::{Ew, Graph, LinMode, Op, Step, pairable};
 use std::borrow::Cow;
 
 impl<'a> Model<'a> {
-    fn gpu_graph<'s>(&'s self) -> Option<Graph<'s>> {
+    fn gpu_graph<'s>(&'s self, lay: Option<&crate::intervene::GpuLayout>) -> Option<Graph<'s>> {
         let cfg = &self.cfg;
         if cfg.bidirectional() {
             return None;
@@ -52,6 +52,27 @@ impl<'a> Model<'a> {
         g.hidden = hidden;
         g.n_hidden = h;
         g.rope_halves = vec![self.inv_freq_sliding.len(), self.inv_freq_full.len()];
+        // Interventions (`crate::intervene`): parameter buffers and the hooked residual points.
+        let (hot, cold) = (
+            g.buf(lay.map_or(1, |l| l.hot_len.max(1))),
+            g.buf(lay.map_or(1, |l| l.cold_len.max(1))),
+        );
+        if let Some(l) = lay {
+            g.params = Some(((hot, l.hot_len), (cold, l.cold_len)));
+        }
+        let hooked = |p: usize| lay.and_then(|l| l.points.get(p).copied().flatten());
+        let steer = |g: &mut Graph<'s>, p: usize| {
+            if let Some(gp) = hooked(p) {
+                g.ops.push(Op::Steer {
+                    x,
+                    n: h,
+                    hot: hot.at(gp.hot),
+                    cold: cold.at(gp.cold),
+                    n_add: gp.n_add,
+                    n_items: gp.n_items,
+                });
+            }
+        };
         // Per-layer embeddings: the projection of the input, normed per layer, plus the token's
         // row of the PLE table (the second host input).
         let p = cfg.hidden_size_per_layer_input;
@@ -125,9 +146,13 @@ impl<'a> Model<'a> {
                 Some(nx) => (hn, &nx.ln_in),
                 None => (hidden, &self.final_norm),
             };
+            if l == 0 {
+                steer(&mut g, 0);
+            }
             if !have_hn {
                 g.ops.push(Op::norm(x, hn, &layer.ln_in, h, eps));
             }
+            let (dense_edit, expert_edit) = lay.map_or((None, None), |y| y.neurons[l]);
             g.ops.push(lin(&layer.q, nh * hd, h, hn, qkv, LinMode::Store)?);
             if layer.own_kv {
                 g.ops
@@ -172,15 +197,21 @@ impl<'a> Model<'a> {
                 gate: None,
             });
             g.ops.push(lin(&layer.o, h, nh * hd, att, ob, LinMode::Store)?);
+            // A hooked point splits the fused residual step: add, hook, then the norm.
+            let mid = hooked(2 * l + 1).is_some();
             g.ops.push(Op::AddNorm {
                 y: ob,
                 x,
                 wy: Cow::Borrowed(&layer.ln_post_attn),
                 scale: 1.0,
-                next: Some((hn, &layer.ln_pre_ffn)),
+                next: (!mid).then_some((hn, &layer.ln_pre_ffn[..])),
                 n: h,
                 eps,
             });
+            if mid {
+                steer(&mut g, 2 * l + 1);
+                g.ops.push(Op::norm(x, hn, &layer.ln_pre_ffn, h, eps));
+            }
             let inter = layer.inter;
             let (gw, uw) = (layer.gate.as_ref(), layer.up.as_ref());
             if pairable(&gw, &uw) {
@@ -203,6 +234,13 @@ impl<'a> Model<'a> {
                     out: act,
                     n: inter,
                     gelu: true,
+                });
+            }
+            if let Some(e) = dense_edit {
+                g.ops.push(Op::NeuronEdit {
+                    act,
+                    hot: hot.at(e.hot),
+                    n: e.n,
                 });
             }
             g.ops.push(lin(&layer.down, h, inter, act, ob, LinMode::Store)?);
@@ -267,16 +305,19 @@ impl<'a> Model<'a> {
                     y: eo,
                     gelu: true,
                     add: false,
+                    edits: expert_edit.map(|e| (hot.at(e.hot), e.n)),
                 }));
                 g.ops.push(one(eo, ob, Some(&m.ln_post), true));
             }
             let ple = layer.ple.as_ref().zip(pli);
+            let post = hooked(2 * l + 2).is_some();
+            let last_next = (!post).then_some(next_norm);
             g.ops.push(Op::AddNorm {
                 y: ob,
                 x,
                 wy: Cow::Borrowed(&layer.ln_post_ffn),
                 scale: if ple.is_some() { 1.0 } else { layer.layer_scalar },
-                next: if ple.is_some() { None } else { Some(next_norm) },
+                next: if ple.is_some() { None } else { last_next },
                 n: h,
                 eps,
             });
@@ -295,10 +336,14 @@ impl<'a> Model<'a> {
                     x,
                     wy: Cow::Borrowed(&pw.norm),
                     scale: layer.layer_scalar,
-                    next: Some(next_norm),
+                    next: last_next,
                     n: h,
                     eps,
                 });
+            }
+            if post {
+                steer(&mut g, 2 * l + 2);
+                g.ops.push(Op::norm(x, next_norm.0, next_norm.1, h, eps));
             }
             have_hn = true;
         }
@@ -319,17 +364,20 @@ impl<'a> Model<'a> {
 
     /// The GPU decode plan, compiled on first use (pipelines, buffers: ~0.1-0.2 s, so multi-token
     /// passes build it ahead of the first decode step); None when unavailable.
-    pub(crate) fn gpu_plan(&self) -> Option<&dyn crate::gpu::decode::DecodePlan> {
+    pub(crate) fn gpu_plan(&self) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
+        self.gpu_plan_for(None)
+    }
+
+    /// The plan for an intervention layout (None: without interventions).
+    fn gpu_plan_for(&self, lay: Option<&crate::intervene::GpuLayout>) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
         if !crate::gpu::decode_enabled() || !self.stream.is_none() {
             return None;
         }
-        self.gpu_plan
-            .get_or_init(|| {
-                let be = crate::gpu::active()?;
-                let g = self.gpu_graph()?;
-                be.decode_plan(&g)
-            })
-            .as_deref()
+        self.gpu_plans.get(lay.map_or(0, |l| l.signature()), || {
+            let be = crate::gpu::active()?;
+            let g = self.gpu_graph(lay)?;
+            be.decode_plan(&g)
+        })
     }
 
     /// Runs token `tok` through the GPU decode plan: the final-normed hidden state and, if
@@ -339,7 +387,13 @@ impl<'a> Model<'a> {
         if !crate::gpu::decode_enabled() || self.stream.is_some() {
             return None;
         }
-        let plan = self.gpu_plan()?;
+        if !sess.iv.gpu_ok() {
+            return None;
+        }
+        let ivc = sess.iv.iv.clone();
+        let data = ivc.as_ref().and_then(|c| c.gpu_data());
+        let plan = self.gpu_plan_for(data.map(|d| &d.layout))?;
+        let hot = sess.iv.gpu_hot(sess.pos);
         let _timer = crate::prof::start(crate::prof::Cat::Matmul);
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
@@ -372,6 +426,7 @@ impl<'a> Model<'a> {
                 states: &mut [],
                 hidden: &mut hidden,
                 logits: logits.as_deref_mut(),
+                params: data.zip(ivc.as_ref()).map(|(d, c)| (&hot[..], &d.cold[..], c.id())),
             },
         );
         if !ok {

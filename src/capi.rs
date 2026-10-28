@@ -402,6 +402,87 @@ pub unsafe extern "C" fn oxi_decide_info_json(e: *mut OxiEngine) -> *mut c_char 
     })
 }
 
+// ---- runtime interventions ------------------------------------------------------------------
+
+/// Sets the runtime interventions (a `crate::intervene::Spec` as JSON; NULL or "" removes them).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_engine_set_interventions(e: *mut OxiEngine, spec_json: *const c_char) -> c_int {
+    guard(-1, || {
+        let e = unsafe { engine(e) }?;
+        let spec = match unsafe { opt_str_arg(spec_json, "spec_json") }?.map(str::trim) {
+            None | Some("") | Some("null") => None,
+            Some(j) => Some(crate::intervene::Spec::from_json(j)?),
+        };
+        lock(e).set_interventions(spec)?;
+        Ok(0)
+    })
+}
+
+/// The interventions in effect as JSON (`null` when none).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_engine_interventions_json(e: *mut OxiEngine) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let g = lock(unsafe { engine(e) }?);
+        Ok(out_string(serde_json::to_string(&g.interventions())?))
+    })
+}
+
+/// Measures the per-layer median residual norm on `text` for `resid_median` neuron edits.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_engine_calibrate(e: *mut OxiEngine, text: *const c_char) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let e = unsafe { engine(e) }?;
+        let text = unsafe { str_arg(text, "text") }?;
+        let c = lock(e).calibrate(text)?;
+        Ok(out_string(serde_json::json!({ "resid_median": c.resid_median }).to_string()))
+    })
+}
+
+/// The SAE features recorded during the last reply (`sae_inspect`) as JSON.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_engine_sae_features_json(e: *mut OxiEngine) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let g = lock(unsafe { engine(e) }?);
+        Ok(out_string(serde_json::to_string(&g.sae_features())?))
+    })
+}
+
+/// Makes a difference-of-means direction file (see `oxinfer.h`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_engine_make_direction(e: *mut OxiEngine, request_json: *const c_char) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let e = unsafe { engine(e) }?;
+        let req: serde_json::Value =
+            serde_json::from_str(unsafe { str_arg(request_json, "request_json") }?).context("request_json is not JSON")?;
+        let prompts = |k: &str| -> Result<Vec<String>> {
+            match req.get(k) {
+                Some(serde_json::Value::String(f)) => crate::intervene::read_prompts(f.as_ref()),
+                Some(serde_json::Value::Array(a)) => Ok(a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()),
+                _ => bail!("{k}: a list of prompts or a prompt file"),
+            }
+        };
+        let (pos, neg) = (prompts("positive")?, prompts("negative")?);
+        let pool: crate::intervene::Pool = match req.get("pool") {
+            Some(p) => serde_json::from_value(p.clone()).context("pool: last or mean")?,
+            None => crate::intervene::Pool::Last,
+        };
+        let chat = req.get("chat").and_then(|v| v.as_bool()).unwrap_or(true);
+        let out = req
+            .get("output")
+            .and_then(|v| v.as_str())
+            .context("output: the safetensors file to write")?;
+        let d = lock(e).make_direction(&pos, &neg, pool, chat)?;
+        crate::intervene::save_vectors(out.as_ref(), &d, &[("kind", "difference of means (positive - negative)".into())])?;
+        let norms: serde_json::Map<String, serde_json::Value> = d
+            .iter()
+            .map(|(l, v)| (l.to_string(), serde_json::json!(v.iter().map(|x| x * x).sum::<f32>().sqrt())))
+            .collect();
+        Ok(out_string(
+            serde_json::json!({ "output": out, "layers": d.len(), "norms": norms }).to_string(),
+        ))
+    })
+}
+
 // ---- speech to text (Whisper) ---------------------------------------------------------------
 
 /// Receives one finished segment as JSON (`len` bytes, not NUL-terminated); return non-zero to

@@ -22,6 +22,12 @@ pub trait TextLm {
     type Sess;
     fn new_session(&self) -> Self::Sess;
     fn hidden_size(&self) -> usize;
+    /// Decoder layers.
+    fn n_layers(&self) -> usize;
+    /// The session's intervention state ([`crate::intervene`]), when the family supports it.
+    fn iv_state<'s>(&self, _sess: &'s mut Self::Sess) -> Option<&'s mut crate::intervene::State> {
+        None
+    }
     /// Tokens in the session's cache (the position of the next token).
     fn session_len(&self, sess: &Self::Sess) -> usize;
     /// Runs `tokens` through the model, with the embeddings of some positions replaced by
@@ -53,6 +59,12 @@ impl TextLm for Model<'_> {
     fn hidden_size(&self) -> usize {
         self.cfg.hidden_size
     }
+    fn n_layers(&self) -> usize {
+        self.cfg.num_hidden_layers
+    }
+    fn iv_state<'s>(&self, sess: &'s mut Session) -> Option<&'s mut crate::intervene::State> {
+        Some(&mut sess.iv)
+    }
     fn session_len(&self, sess: &Session) -> usize {
         sess.pos
     }
@@ -78,6 +90,12 @@ impl TextLm for QwenModel<'_> {
     fn hidden_size(&self) -> usize {
         self.cfg.hidden_size
     }
+    fn n_layers(&self) -> usize {
+        self.cfg.num_hidden_layers
+    }
+    fn iv_state<'s>(&self, sess: &'s mut QwenSession) -> Option<&'s mut crate::intervene::State> {
+        Some(&mut sess.iv)
+    }
     fn session_len(&self, sess: &QwenSession) -> usize {
         sess.pos
     }
@@ -100,6 +118,12 @@ impl TextLm for QwenModel<'_> {
 /// consecutive overrides is stretched to the run's end when the model needs whole runs
 /// ([`TextLm::mm_runs_whole`]).
 pub fn prefill<M: TextLm + ?Sized>(model: &M, sess: &mut M::Sess, ids: &[u32], chunk: usize, overrides: &[(usize, Vec<f32>)]) -> Vec<f32> {
+    // Interventions limited to prompt / generated positions: the last prompt token is the first
+    // "generated" position (its output is sampled).
+    let base = model.session_len(sess);
+    if let Some(st) = model.iv_state(sess) {
+        st.gen_from = base + ids.len().saturating_sub(1);
+    }
     let mut hs = Vec::new();
     let mut start = 0;
     let whole = model.mm_runs_whole() && !overrides.is_empty();

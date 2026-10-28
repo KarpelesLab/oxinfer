@@ -761,3 +761,69 @@ kernel void dec_add_norm(device const float* y [[buffer(0)]], device float* x [[
         if (i < p.n) out[i] = xv[j] * k2 * wn[i];
     }
 }
+
+// ---- Interventions (crate::intervene) -------------------------------------------------------
+// Residual hooks of one row x[n] (one threadgroup): `hot` holds the n_add add coefficients (padded
+// to 4) then 8 floats per item (bias, threshold, act: 0 linear / 1 relu / 2 jumprelu, op: 0 set /
+// 1 scale, value, enabled); `cold` the n_add add vectors, then the items' encoder rows, then their
+// decoder rows. x += sum c_a add_a first, then every item reads that x: a_j = act(enc_j . x +
+// bias_j), x += sum (a'_j - a_j) dec_j.
+kernel void dec_steer(device float* x [[buffer(0)]], device const float* hot [[buffer(1)]], device const float* cold [[buffer(2)]],
+                      constant uint4& p [[buffer(3)]], uint tid [[thread_index_in_threadgroup]], uint nt [[threads_per_threadgroup]],
+                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[32];
+    threadgroup float coef[64];
+    uint n = p.x, n_add = p.y, n_items = p.z;
+    device const float* items = hot + ((n_add + 3) & ~3u);
+    // The added vectors first (the edits then read the result).
+    if (n_add > 0) {
+        for (uint i = tid; i < n; i += nt) {
+            float v = x[i];
+            for (uint a = 0; a < n_add; a++) v += hot[a] * cold[a * n + i];
+            x[i] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+    for (uint j = 0; j < n_items; j++) {
+        device const float* e = cold + (n_add + j) * n;
+        float s = 0.f;
+        for (uint i = tid; i < n; i += nt) s += e[i] * x[i];
+        s = tg_total(s, nt, sg, lane, red);
+        if (tid == 0) {
+            device const float* q = items + j * 8;
+            float pre = s + q[0];
+            float a = q[2] == 0.f ? pre : (q[2] == 1.f ? max(pre, 0.f) : (pre > q[1] ? pre : 0.f));
+            float a2 = q[3] == 0.f ? q[4] : a * q[4];
+            coef[j] = q[5] != 0.f ? a2 - a : 0.f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device const float* dec = cold + (n_add + n_items) * n;
+    if (n_items == 0) return;
+    for (uint i = tid; i < n; i += nt) {
+        float v = x[i];
+        for (uint j = 0; j < n_items; j++) v += coef[j] * dec[j * n + i];
+        x[i] = v;
+    }
+}
+
+// Neuron edits: entry i (8 floats: expert id or -1, neuron, op: 0 scale / 1 add / 2 set / 3 clamp,
+// a, b, enabled) on act; with experts (p.w = 1), act is [k, inter] for the k experts in sel.
+kernel void dec_neuron_edit(device float* act [[buffer(0)]], device const float* hot [[buffer(1)]], device const float* sel [[buffer(2)]],
+                            constant uint4& p [[buffer(3)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p.x) return;
+    device const float* q = hot + i * 8;
+    if (q[5] == 0.f) return;
+    uint idx = uint(q[1]);
+    uint slots = p.w != 0 ? p.z : 1;
+    for (uint s = 0; s < slots; s++) {
+        if (p.w != 0 && float(as_type<uint>(sel[s])) != q[0]) continue;
+        device float* a = act + s * p.y + idx;
+        float v = *a;
+        if (q[2] == 0.f) v = v * q[3];
+        else if (q[2] == 1.f) v = v + q[3];
+        else if (q[2] == 2.f) v = q[3];
+        else v = min(max(v, q[3]), q[4]);
+        *a = v;
+    }
+}

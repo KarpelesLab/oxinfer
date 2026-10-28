@@ -285,7 +285,7 @@ impl<'a> QwenMtp<'a> {
             }
         };
         self.ffn
-            .forward(&hn, t, h, &mut y, self.stream.as_ref().map(|_| &need as &dyn Fn(&[usize])));
+            .forward(&hn, t, h, &mut y, self.stream.as_ref().map(|_| &need as &dyn Fn(&[usize])), None);
         add_inplace(&mut x, &y);
         rmsnorm_f32w_rows(&x, h, &self.norm, eps, &mut hn);
         hn

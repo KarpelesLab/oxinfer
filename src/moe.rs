@@ -210,7 +210,20 @@ impl<'a> Experts<'a> {
     /// Adds the routed experts' output to `y` (`[t, H]`): token `i` of `x` goes through the
     /// experts `routes[i]` lists (expert, weight). `need` is told the experts used before they run
     /// (weight streaming reads them on demand).
-    pub fn forward(&self, x: &[f32], t: usize, h: usize, routes: &[Vec<(usize, f32)>], y: &mut [f32], need: NeedExperts) {
+    /// `hook`: neuron edits (routed experts' activations; they keep the experts on the CPU).
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        x: &[f32],
+        t: usize,
+        h: usize,
+        routes: &[Vec<(usize, f32)>],
+        y: &mut [f32],
+        need: NeedExperts,
+        hook: Option<&crate::intervene::NeuronHook>,
+    ) {
+        use crate::intervene::Target;
+        let hook = hook.filter(|k| k.experts());
         if let Some(need) = need {
             let mut used: Vec<usize> = routes.iter().flatten().map(|r| r.0).collect();
             used.sort_unstable();
@@ -239,6 +252,9 @@ impl<'a> Experts<'a> {
             for (&(e, w), gu) in r.iter().zip(gu.iter_mut()) {
                 let (g, u) = gu.split_at_mut(mi);
                 act.apply(g, u);
+                if let Some(k) = hook {
+                    k.apply(Target::Expert(e), g, mi);
+                }
                 linear(&self.down[e], h, mi, g, 1, &mut o);
                 axpy(y, w, &o);
             }
@@ -275,6 +291,9 @@ impl<'a> Experts<'a> {
                         act.apply(&mut a, &ub);
                     }
                 }
+                if let Some(k) = hook {
+                    k.apply_rows(Target::Expert(e), &mut a, mi, &toks);
+                }
                 let mut o = vec![0f32; n * h];
                 linear(&self.down[e], h, mi, &a, n, &mut o);
                 outs.push((toks, o));
@@ -291,7 +310,7 @@ impl<'a> Experts<'a> {
         }
         // Prefill on an accelerator: all routed experts in one submission (gather, grouped
         // gate/up GEMM, activation, grouped down GEMM, weighted combination).
-        if self.forward_device(x, t, h, routes, y) {
+        if hook.is_none() && self.forward_device(x, t, h, routes, y) {
             return;
         }
         // Prefill: gather each expert's tokens into one segment (padded to whole GEMM tiles) and
@@ -360,6 +379,13 @@ impl<'a> Experts<'a> {
                 linear_grouped(&gs, &segs, mi, h, &xs, &mut a);
                 linear_grouped(&us, &segs, mi, h, &xs, &mut u);
                 act.apply(&mut a, &u);
+            }
+        }
+        if let Some(k) = hook {
+            for (e, &(s0, len)) in segs.iter().enumerate() {
+                if k.edits(Target::Expert(e)) {
+                    k.apply_rows(Target::Expert(e), &mut a[s0 * mi..(s0 + len) * mi], mi, &src[s0..s0 + len]);
+                }
             }
         }
         let ds: Vec<&Lin> = self.down.iter().collect();

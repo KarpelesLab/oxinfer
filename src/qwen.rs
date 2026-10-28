@@ -8,6 +8,7 @@
 //! speculative decoding is in `qwen_mtp.rs`.
 
 use crate::config::QwenConfig;
+use crate::intervene::{NeuronHook, Target};
 use crate::kernels::*;
 use crate::model::{LayerCache, Lin, Quant, Table, attention, linear, linear_multi, load_lin, table_quant};
 use crate::moe::{Act, Experts, route_top_k};
@@ -56,8 +57,8 @@ impl Mlp<'_> {
     fn bytes(&self) -> usize {
         self.gate.bytes() + self.up.bytes() + self.down.bytes()
     }
-    /// `down(silu(gate(x)) * up(x))` for `t` rows of `x`.
-    fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32]) {
+    /// `down(silu(gate(x)) * up(x))` for `t` rows of `x` (`hook`: neuron edits of `target`).
+    fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32], hook: Option<(&NeuronHook, Target)>) {
         let mut g = vec![0f32; t * self.inter];
         let mut u = vec![0f32; t * self.inter];
         linear_multi(
@@ -67,6 +68,9 @@ impl Mlp<'_> {
             t,
         );
         silu_mul(&mut g, &u);
+        if let Some((hk, tg)) = hook {
+            hk.apply(tg, &mut g, self.inter);
+        }
         linear(&self.down, h, self.inter, &g, t, y);
     }
 }
@@ -121,11 +125,35 @@ impl<'a> Ffn<'a> {
             .collect()
     }
 
-    pub(crate) fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32], need: NeedExperts) {
+    pub(crate) fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32], need: NeedExperts, hook: Option<&NeuronHook>) {
         match self {
-            Ffn::Dense(m) => m.forward(x, t, h, y),
-            Ffn::Moe(m) => m.forward(x, t, h, y, need),
+            Ffn::Dense(m) => m.forward(x, t, h, y, hook.map(|k| (k, Target::Mlp))),
+            Ffn::Moe(m) => m.forward(x, t, h, y, need, hook),
         }
+    }
+
+    /// The intermediate size of `target`, if the block has it.
+    pub(crate) fn inter(&self, target: Target) -> Option<usize> {
+        match (self, target) {
+            (Ffn::Dense(m), Target::Mlp) => Some(m.inter),
+            (Ffn::Moe(m), Target::Shared) => Some(m.shared.inter),
+            (Ffn::Moe(m), Target::Expert(e)) if e < m.experts.n_experts() => Some(m.experts.inter),
+            _ => None,
+        }
+    }
+
+    /// Column `n` of `target`'s down projection.
+    pub(crate) fn down_column(&self, target: Target, n: usize, h: usize) -> Vec<f32> {
+        let (down, inter) = match (self, target) {
+            (Ffn::Dense(m), _) => (&m.down, m.inter),
+            (Ffn::Moe(m), Target::Shared | Target::Mlp) => (&m.shared.down, m.shared.inter),
+            (Ffn::Moe(m), Target::Expert(e)) => (&m.experts.down[e], m.experts.inter),
+        };
+        let mut one = vec![0f32; inter];
+        one[n] = 1.0;
+        let mut y = vec![0f32; h];
+        linear(down, h, inter, &one, 1, &mut y);
+        y
     }
 
     /// Weight bytes read per token.
@@ -168,7 +196,8 @@ pub struct QwenModel<'a> {
     pub(crate) stream: Option<crate::stream::StreamHook>,
     /// Single-token decoding on the GPU (`crate::gpu::decode`), compiled on first use; None when
     /// the backend or the model cannot.
-    gpu_plan: std::sync::OnceLock<Option<Box<dyn crate::gpu::decode::DecodePlan>>>,
+    /// Plans by intervention layout (`GpuLayout::signature`, 0 without interventions).
+    gpu_plans: crate::gpu::decode::PlanCache,
 }
 
 /// Recurrent state of one Gated DeltaNet layer.
@@ -339,6 +368,8 @@ pub struct QwenSession {
     pub pos: usize,
     /// Device state of GPU decoding (KV cache copies).
     gpu: crate::gpu::decode::Slot,
+    /// Runtime interventions ([`crate::intervene`]).
+    pub iv: crate::intervene::State,
 }
 
 impl QwenSession {
@@ -609,7 +640,7 @@ impl<'a> QwenModel<'a> {
             inv_freq,
             mrope_axis,
             stream: None,
-            gpu_plan: std::sync::OnceLock::new(),
+            gpu_plans: Default::default(),
         })
     }
 
@@ -795,14 +826,16 @@ impl<'a> QwenModel<'a> {
             spans: Vec::new(),
             pos: 0,
             gpu: Default::default(),
+            iv: Default::default(),
         }
     }
 
     /// One token's forward pass as a device graph (`crate::gpu::decode`): dense layers with full
     /// attention (Llama 3, Qwen3, and Qwen3.5's attention layers); None when some layer or
     /// weight is not supported (Gated DeltaNet, MoE, LoRA, streamed weights).
-    fn gpu_graph<'s>(&'s self) -> Option<crate::gpu::decode::Graph<'s>> {
+    fn gpu_graph<'s>(&'s self, lay: Option<&crate::intervene::GpuLayout>) -> Option<crate::gpu::decode::Graph<'s>> {
         use crate::gpu::decode::{Graph, LinMode, Op};
+        use crate::intervene::GpuNeurons;
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps as f32;
@@ -850,6 +883,28 @@ impl<'a> QwenModel<'a> {
         g.hidden = hidden;
         g.n_hidden = h;
         g.rope_halves = vec![self.inv_freq.len()];
+        // Interventions: parameter buffers, then a hook op per residual point that has one.
+        let (hot, cold) = (
+            g.buf(lay.map_or(1, |l| l.hot_len.max(1))),
+            g.buf(lay.map_or(1, |l| l.cold_len.max(1))),
+        );
+        if let Some(l) = lay {
+            g.params = Some(((hot, l.hot_len), (cold, l.cold_len)));
+        }
+        let steer = |g: &mut Graph<'s>, p: usize| {
+            if let Some(gp) = lay.and_then(|l| l.points.get(p).copied().flatten()) {
+                g.ops.push(Op::Steer {
+                    x,
+                    n: h,
+                    hot: hot.at(gp.hot),
+                    cold: cold.at(gp.cold),
+                    n_add: gp.n_add,
+                    n_items: gp.n_items,
+                });
+            }
+        };
+        let edits = |l: usize| lay.map_or((None, None), |y| y.neurons[l]);
+        steer(&mut g, 0);
         let lin = |l: &'s Lin, n_out: usize, n_in: usize, x, y, mode| -> Option<Op<'s>> {
             Some(Op::Linear {
                 w: l.as_ref(),
@@ -864,7 +919,7 @@ impl<'a> QwenModel<'a> {
         };
         // down(silu(gate(hn)) * up(hn)) added to x: one paired matvec when gate and up share a
         // format, else two and an elementwise op.
-        let mlp = |g: &mut Graph<'s>, m: &'s Mlp<'s>, down_mode: LinMode| -> Option<()> {
+        let mlp = |g: &mut Graph<'s>, m: &'s Mlp<'s>, down_mode: LinMode, edit: Option<GpuNeurons>| -> Option<()> {
             let (gw, uw) = (m.gate.as_ref(), m.up.as_ref());
             if crate::gpu::decode::pairable(&gw, &uw) {
                 g.ops.push(Op::Linear {
@@ -888,14 +943,22 @@ impl<'a> QwenModel<'a> {
                     gelu: false,
                 });
             }
+            if let Some(e) = edit {
+                g.ops.push(Op::NeuronEdit {
+                    act,
+                    hot: hot.at(e.hot),
+                    n: e.n,
+                });
+            }
             g.ops.push(lin(&m.down, h, m.inter, act, x, down_mode)?);
             Some(())
         };
         // The feed-forward block of a layer on hn, added to x: a dense MLP, or the MoE's routed
         // experts plus its sigmoid-gated shared expert.
-        let ffn = |g: &mut Graph<'s>, f: &'s Ffn<'s>| -> Option<()> {
+        let ffn = |g: &mut Graph<'s>, f: &'s Ffn<'s>, l: usize| -> Option<()> {
+            let (de, ee) = edits(l);
             let m = match f {
-                Ffn::Dense(m) => return mlp(g, m, LinMode::Add),
+                Ffn::Dense(m) => return mlp(g, m, LinMode::Add, de),
                 Ffn::Moe(m) => m,
             };
             if m.experts.act != crate::moe::Act::Silu || m.experts.down.iter().any(|l| l.has_lora() || l.is_transient()) {
@@ -913,7 +976,7 @@ impl<'a> QwenModel<'a> {
                 sel,
                 expert_scale: None,
             });
-            mlp(g, &m.shared, LinMode::AddGated(rlogits.at(ne)))?;
+            mlp(g, &m.shared, LinMode::AddGated(rlogits.at(ne)), de)?;
             let mut gate = Vec::with_capacity(ne);
             let mut up = Vec::with_capacity(ne);
             for gu in &m.experts.gate_up {
@@ -939,6 +1002,7 @@ impl<'a> QwenModel<'a> {
                 y: x,
                 gelu: false,
                 add: true,
+                edits: ee.map(|e| (hot.at(e.hot), e.n)),
             }));
             Some(())
         };
@@ -955,7 +1019,7 @@ impl<'a> QwenModel<'a> {
         let gproj = g.buf(if has_gdn { conv_dim + value_dim + 2 * nv } else { 1 });
         let gconv = g.buf(if has_gdn { conv_dim } else { 1 });
         let gout = g.buf(if has_gdn { value_dim } else { 1 });
-        for layer in &self.layers {
+        for (li, layer) in self.layers.iter().enumerate() {
             g.ops.push(Op::norm(x, hn, &layer.ln_in, h, eps));
             let at = match &layer.mixer {
                 Mixer::Attn(at) => at,
@@ -994,8 +1058,10 @@ impl<'a> QwenModel<'a> {
                         eps,
                     }));
                     g.ops.push(lin(&gd.out, h, value_dim, gout, x, LinMode::Add)?);
+                    steer(&mut g, 2 * li + 1);
                     g.ops.push(Op::norm(x, hn, &layer.ln_post, h, eps));
-                    ffn(&mut g, &layer.ffn)?;
+                    ffn(&mut g, &layer.ffn, li)?;
+                    steer(&mut g, 2 * li + 2);
                     continue;
                 }
             };
@@ -1035,8 +1101,10 @@ impl<'a> QwenModel<'a> {
                 gate: gated.then_some((qkv.at(hd), 2 * hd)),
             });
             g.ops.push(lin(&at.o, h, nh * hd, att, x, LinMode::Add)?);
+            steer(&mut g, 2 * li + 1);
             g.ops.push(Op::norm(x, hn, &layer.ln_post, h, eps));
-            ffn(&mut g, &layer.ffn)?;
+            ffn(&mut g, &layer.ffn, li)?;
+            steer(&mut g, 2 * li + 2);
         }
         g.ops.push(Op::norm(x, hidden, &self.final_norm, h, eps));
         g.head_from = g.ops.len();
@@ -1047,17 +1115,20 @@ impl<'a> QwenModel<'a> {
 
     /// The GPU decode plan, compiled on first use (pipelines, buffers: ~0.1-0.2 s, so multi-token
     /// passes build it ahead of the first decode step); None when unavailable.
-    pub(crate) fn gpu_plan(&self) -> Option<&dyn crate::gpu::decode::DecodePlan> {
+    pub(crate) fn gpu_plan(&self) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
+        self.gpu_plan_for(None)
+    }
+
+    /// The plan for an intervention layout (None: without interventions).
+    fn gpu_plan_for(&self, lay: Option<&crate::intervene::GpuLayout>) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
         if !crate::gpu::decode_enabled() || !self.stream.is_none() {
             return None;
         }
-        self.gpu_plan
-            .get_or_init(|| {
-                let be = crate::gpu::active()?;
-                let g = self.gpu_graph()?;
-                be.decode_plan(&g)
-            })
-            .as_deref()
+        self.gpu_plans.get(lay.map_or(0, |l| l.signature()), || {
+            let be = crate::gpu::active()?;
+            let g = self.gpu_graph(lay)?;
+            be.decode_plan(&g)
+        })
     }
 
     /// Runs token `tok` through the GPU decode plan: the final-normed hidden state and, if
@@ -1066,7 +1137,13 @@ impl<'a> QwenModel<'a> {
         if !crate::gpu::decode_enabled() || self.stream.is_some() {
             return None;
         }
-        let plan = self.gpu_plan()?;
+        if !sess.iv.gpu_ok() {
+            return None;
+        }
+        let ivc = sess.iv.iv.clone();
+        let data = ivc.as_ref().and_then(|c| c.gpu_data());
+        let plan = self.gpu_plan_for(data.map(|d| &d.layout))?;
+        let hot = sess.iv.gpu_hot(sess.pos);
         let _timer = prof::start(Cat::Matmul);
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
@@ -1094,6 +1171,7 @@ impl<'a> QwenModel<'a> {
                 states: &mut states,
                 hidden: &mut hidden,
                 logits: logits.as_deref_mut(),
+                params: data.zip(ivc.as_ref()).map(|(d, c)| (&hot[..], &d.cold[..], c.id())),
             },
         );
         if !ok {
@@ -1200,6 +1278,10 @@ impl<'a> QwenModel<'a> {
         }
         let (cos, sin) = self.rope_cs(&sess.spans, start, t);
         drop(timer);
+        let iv = sess.iv.active().then(|| sess.iv.clone());
+        if let Some(iv) = &iv {
+            iv.point(0, &mut x, h, start);
+        }
 
         let mut hn = vec![0f32; t * h];
         let mut y = vec![0f32; t * h];
@@ -1214,16 +1296,28 @@ impl<'a> QwenModel<'a> {
                 Mixer::Attn(at) => self.attn_forward(at, sess.kv[l].as_mut().unwrap(), &hn, t, start, &cos, &sin, &mut y),
             }
             add_inplace(&mut x, &y);
+            if let Some(iv) = &iv {
+                iv.point(2 * l + 1, &mut x, h, start);
+            }
             rmsnorm_f32w_rows(&x, h, &layer.ln_post, eps, &mut hn);
             let need = |ids: &[usize]| {
                 if let Some(s) = &self.stream {
                     s.need_parts(l, ids)
                 }
             };
-            layer
-                .ffn
-                .forward(&hn, t, h, &mut y, self.stream.as_ref().map(|_| &need as &dyn Fn(&[usize])));
+            let hook = iv.as_ref().and_then(|s| s.hook(l, start));
+            layer.ffn.forward(
+                &hn,
+                t,
+                h,
+                &mut y,
+                self.stream.as_ref().map(|_| &need as &dyn Fn(&[usize])),
+                hook.as_ref(),
+            );
             add_inplace(&mut x, &y);
+            if let Some(iv) = &iv {
+                iv.point(2 * l + 2, &mut x, h, start);
+            }
             // Streaming a MoE: guess the next layer's experts now, so they are read while its
             // attention runs.
             if let (Some(s), Some(next)) = (&self.stream, self.layers.get(l + 1))
@@ -1451,6 +1545,21 @@ impl<'a> QwenModel<'a> {
     }
 }
 
+impl crate::intervene::Host for QwenModel<'_> {
+    fn n_layers(&self) -> usize {
+        self.cfg.num_hidden_layers
+    }
+    fn hidden(&self) -> usize {
+        self.cfg.hidden_size
+    }
+    fn mlp_inter(&self, layer: usize, target: Target) -> Option<usize> {
+        self.layers.get(layer)?.ffn.inter(target)
+    }
+    fn down_column(&self, layer: usize, target: Target, n: usize) -> Vec<f32> {
+        self.layers[layer].ffn.down_column(target, n, self.cfg.hidden_size)
+    }
+}
+
 impl Moe<'_> {
     /// The experts this layer would route `x` (`[t, H]`, the residual stream before the layer)
     /// to, approximating the layer's MoE input by `x` normed with `norm` (its post-attention
@@ -1472,8 +1581,8 @@ impl Moe<'_> {
         used
     }
 
-    fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32], need: NeedExperts) {
-        self.shared.forward(x, t, h, y);
+    fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32], need: NeedExperts, hook: Option<&NeuronHook>) {
+        self.shared.forward(x, t, h, y, hook.map(|k| (k, Target::Shared)));
         for_chunks(y, h, t > 1, |ti, row| {
             let g = 1.0 / (1.0 + (-dot(&self.shared_gate, &x[ti * h..(ti + 1) * h])).exp());
             scale_inplace(row, g);
@@ -1486,7 +1595,7 @@ impl Moe<'_> {
             }
         });
         let routes: Vec<_> = logits.chunks(ne).map(|l| route_top_k(l, self.experts.top_k)).collect();
-        self.experts.forward(x, t, h, &routes, y, need);
+        self.experts.forward(x, t, h, &routes, y, need, hook);
     }
 }
 
