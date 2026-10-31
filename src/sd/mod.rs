@@ -83,15 +83,22 @@ pub fn is_diffusers(dir: &Path) -> bool {
     crate::fsx::exists(&dir.join("model_index.json"))
 }
 
-/// The weight file of a component: prefers full precision, then the fp16 variant.
+/// The weight file of a component: prefers safetensors (full precision, then the fp16 variant),
+/// then PyTorch `.bin` files (older exports such as the MagicBrush checkpoints only have those).
 fn weights(dir: &Path, base: &str) -> Result<PathBuf> {
-    for name in [format!("{base}.safetensors"), format!("{base}.fp16.safetensors")] {
+    let bin = if base == "model" { "pytorch_model" } else { base };
+    for name in [
+        format!("{base}.safetensors"),
+        format!("{base}.fp16.safetensors"),
+        format!("{bin}.bin"),
+        format!("{bin}.fp16.bin"),
+    ] {
         let p = dir.join(&name);
         if crate::fsx::exists(&p) {
             return Ok(p);
         }
     }
-    bail!("no {base}.safetensors or {base}.fp16.safetensors in {}", dir.display())
+    bail!("no {base}.safetensors, {base}.fp16.safetensors or {bin}.bin in {}", dir.display())
 }
 
 fn dump_dir() -> Option<PathBuf> {

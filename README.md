@@ -67,8 +67,11 @@ optional.
 | BAAI/bge-m3 | 0.6B | 2.3 GB (fp32, `pytorch_model.bin`) | dense, sparse and ColBERT embeddings; matches the reference |
 | sentence-transformers/all-MiniLM-L6-v2, paraphrase-multilingual-MiniLM-L12-v2 | 23M / 118M | 90 / 470 MB | embeddings (BERT); match sentence-transformers |
 | BAAI/bge-small-en-v1.5, intfloat/multilingual-e5-small, mixedbread-ai/mxbai-embed-large-v1 | 33M-335M | 0.13-1.3 GB | embeddings (BERT / XLM-R); match sentence-transformers |
-| stabilityai/sd-turbo | 1.3B | 2.6 GB (fp16) | text-to-image in one step; matches diffusers (see Image generation) |
-| stable-diffusion-v1-5/stable-diffusion-v1-5 (and SD 1.x / 2.x fine-tunes) | 1.1B | 2.0 GB (fp16) | text-to-image; matches diffusers |
+| stabilityai/sd-turbo | 1.3B | 2.6 GB (fp16) | text-to-image in one step, image-to-image in one or two; matches diffusers (see Image generation) |
+| stable-diffusion-v1-5/stable-diffusion-v1-5 (and SD 1.x / 2.x fine-tunes) | 1.1B | 2.0 GB (fp16) | text-to-image, image-to-image, inpainting by mask blending; matches diffusers |
+| timbrooks/instruct-pix2pix | 1.1B | 2.0 GB (fp16) | instruction edits of an image ("make it snowy"), also in 4 steps with the SD 1.5 LCM-LoRA; matches diffusers (see [Editing images](#editing-images)) |
+| stable-diffusion-v1-5/stable-diffusion-inpainting (and other 9-channel SD inpainting UNets) | 1.1B | 2.0 GB (fp16) | inpainting with a mask; matches diffusers |
+| vinesmsuic/magicbrush-jul7 (MagicBrush: InstructPix2Pix fine-tuned for local edits) | 1.1B | 4.3 GB (fp32 `.bin`) | instruction edits ("add a red car"); matches diffusers |
 | deepseek-ai/Janus-Pro-1B | 2.1B (1.5B LM) | 4.2 GB (`pytorch_model.bin`) | text-to-image (384x384) and image understanding; matches the official `janus` package (all 576 greedy image tokens identical; see [Janus-Pro](#janus-pro-text-to-image-and-image-understanding)) |
 | deepseek-ai/Janus-Pro-7B | 7.4B | 14.8 GB (sharded `.bin`) | same; matches the reference (logits, first 64 greedy image tokens) |
 | anemll/* (ANEMLL Core ML: Qwen3, Qwen2.5, Gemma 3, Llama 3.2, ...) | 0.27B-1.7B tested | 0.3-1.5 GB (LUT6) | Apple Neural Engine via Core ML; same tokens as ANEMLL's runtime (see [Core ML](#core-ml--apple-neural-engine)) |
@@ -872,6 +875,9 @@ Diffusion 1.x / 2.x, which includes SD 1.5, SD 2.1 and the one-step SD-Turbo (`s
     --steps 25 --guidance 7.5 --sampler euler_a --size 512x512 --seed 7 -o lighthouse.png
 ```
 
+With `--init-image FILE` the same models edit an image instead (image-to-image, inpainting with
+`--mask`, instruction edits with InstructPix2Pix): see [Editing images](#editing-images).
+
 Turbo models (recognised by name) default to 1 step without guidance, others to 25 Euler-ancestral
 steps at guidance 7.5. The CLIP tokenizer and text encoder, the UNet (ResNets, spatial transformers
 with GEGLU, skip connections), the VAE decoder and the Euler samplers are implemented here.
@@ -930,6 +936,161 @@ identical image; both together (LCM 1.0 + ufotable 0.6), 82.3 dB. Scale 0 reprod
 model bit for bit. In the library, `sd::Pipeline::load_with_loras(dir, &[LoraSpec { path, scale }],
 report)` does the same (`examples/sd_lora.rs`); in the browser build, `web_sd_load` takes the
 LoRA files (`sdLoad(dir, [{ path, scale }])` in `oxinfer.js`).
+
+## Editing images
+
+Give a Stable Diffusion pipeline an image and it edits it instead of starting from noise. What
+the edit does follows from the model (the UNet's input channels):
+
+| Model | UNet input | `--init-image` (+ prompt) | `--mask` |
+|---|---|---|---|
+| timbrooks/instruct-pix2pix, vinesmsuic/magicbrush-jul7 | 8 (latents + image latents) | **instruction edit**: the prompt says what to change | not used |
+| stable-diffusion-v1-5/stable-diffusion-inpainting (and other SD inpainting models) | 9 (latents + mask + masked-image latents) | needs a mask | repaints the white part |
+| any text-to-image model (SD 1.x / 2.x, SD-Turbo, + LoRAs) | 4 | image-to-image at `--strength` | inpainting by blending |
+
+**Editing with a prompt: InstructPix2Pix.** For "change this picture like so", use
+InstructPix2Pix. With the SD 1.5 LCM-LoRA (InstructPix2Pix is a fine-tuned SD 1.5, so the LoRA
+fits it) an edit takes 4 UNet passes instead of 60, and the edits look as good:
+
+```sh
+./target/release/oxinfer --model timbrooks/instruct-pix2pix --lora latent-consistency/lcm-lora-sdv1-5 \
+    --init-image cabin.png -p "make it winter, covered in snow" --steps 4 --guidance 1 -o snowy.png
+# Without the LoRA: 20 Euler-ancestral steps, three guided UNet passes each
+./target/release/oxinfer --model timbrooks/instruct-pix2pix --init-image cat.png \
+    -p "turn the cat into a tiger" --image-guidance 1.5 --guidance 7.5 -o tiger.png
+```
+
+`--guidance` (default 7.5) is how strongly the result follows the instruction and
+`--image-guidance` (default 1.5) how closely it keeps to the input: each step runs the UNet on
+(instruction, image), (no text, image) and (no text, no image) and combines them as diffusers'
+`StableDiffusionInstructPix2PixPipeline` does, `uncond + g * (text - image) + ig * (image -
+uncond)`. Guidance at or below 1 (as with the LCM-LoRA) turns both off: one pass per step. The
+image conditioning is the mode of the VAE encoder's latent distribution, unscaled, concatenated
+to the latents.
+
+InstructPix2Pix tends to restyle the whole picture ("add a red car" painted the cabin red in our
+test); MagicBrush (`vinesmsuic/magicbrush-jul7`, InstructPix2Pix fine-tuned on human-annotated
+local edits, same architecture, CreativeML OpenRAIL-M, PyTorch `.bin` weights which load directly)
+added the car and left the rest alone. It is a drop-in alternative at the same 20 guided steps; the
+LCM-LoRA does not carry over to it (its scheduler config uses "leading" timesteps, and the 4-step
+result was unusable).
+
+**Image-to-image.** With a text-to-image model the image is encoded, noised to `--strength`
+(default 0.8) and denoised towards the prompt: as diffusers' `StableDiffusionImg2ImgPipeline`,
+the last `int(steps * strength)` steps of the schedule run, starting from `latents + sigma *
+noise` at the first of them. Turbo models default to just enough steps for one to run (strength
+0.5: 2 steps, 1 run):
+
+```sh
+./target/release/oxinfer --model models/sd-turbo --init-image cabin.png --strength 0.5 \
+    -p "a cabin in a meadow at sunset, golden hour" -o sunset.png
+./target/release/oxinfer --model models/sd-v1-5 --init-image cabin.png --strength 0.6 \
+    -p "an oil painting of a cabin in a meadow, van gogh style" -o vangogh.png
+```
+
+**Inpainting.** `--mask FILE` marks what to repaint in white (Pillow's luma, binarized at 0.5;
+any size, scaled like the image). An inpainting UNet sees the mask and the latents of the image
+with the masked part zeroed at every step (diffusers' `StableDiffusionInpaintPipeline`); with a
+text-to-image UNet the unmasked area is reset after each step to the input's latents noised to the
+next level (diffusers' legacy approach: works, but the seams are weaker). `--strength` defaults to
+1 (start from noise in the masked area); below 1 it starts from the noised image as in img2img.
+
+```sh
+./target/release/oxinfer --model stable-diffusion-v1-5/stable-diffusion-inpainting \
+    --init-image cabin.png --mask cabin_mask.png -p "a red barn" -o barn.png
+```
+
+**Sizes.** Without `--size`, an edit runs at the model's area (512x512 for SD 1.5, 768x768 for
+SD 2.x) with the input's aspect ratio, each side a multiple of 64 (a 768x512 photo runs at
+640x448); with `--size WxH`, at that size. The image and the mask are scaled to cover it (Pillow
+bicubic) and centre-cropped; the output has the working size. `--image FILE` is accepted in place
+of `--init-image` (the flag the language models use); repo ids of diffusers pipelines download
+like other models (`model_index.json`, configs, tokenizer and the fp16 safetensors of each
+component; the safety checker and the single-file checkpoints are skipped).
+
+**Library.** `sd::Pipeline::generate_from(&params, &EditInput, progress)` covers all three;
+`img2img`, `inpaint` and `edit` (InstructPix2Pix) are shorthands, `edit_kind` says what an input
+does with a given model, `edit_size` which size it runs at (`params.width` / `height` 0 pick it),
+and `cancel_flag` stops a running generation from another thread. Images are
+`video::RgbImage`; with the `oxideav` feature, `EditInput::from_picture` /
+`with_mask_picture` take oxideav `Picture`s (any pixel format `Picture::to_rgb` converts), and the
+result converts back with `Image::to_video_frame`. `examples/sd_edit.rs`:
+
+```rust
+use oxinfer::sd::{EditInput, Params, Pipeline, sched::Sampler};
+oxinfer::gpu::init(&oxinfer::platform::detect(), oxinfer::platform::DevicePref::Auto);
+let pipe = Pipeline::load(&oxinfer::hf::resolve("timbrooks/instruct-pix2pix", None)?)?;
+let image = oxinfer::media::Media::new().load_image("cabin.png".as_ref())?;      // a video::RgbImage
+let edit = EditInput::new(image).with_image_guidance(1.5);    // or .with_mask(m), .with_strength(s)
+let params = Params {
+    prompt: "make it snowy".into(), negative: String::new(), steps: 20, guidance: 7.5, seed: 1,
+    width: 0, height: 0, sampler: Sampler::EulerAncestral,           // 0 x 0: Pipeline::edit_size
+};
+let (img, timings) = pipe.generate_from(&params, &edit, &mut |i, n| eprint!("\r{i}/{n}"))?;
+```
+
+**C API.** `oxi_sd_load(model, "device=auto;lora=FILE:SCALE", progress, user)`, then
+`oxi_sd_generate(s, prompt, options_json, on_image, on_step, user)` with `options_json` such as
+`{"init_image": "in.png", "mask": "mask.png", "strength": 0.8, "image_guidance": 1.5, "steps": 4,
+"guidance": 1, "seed": 1}` (text to image without `init_image`), or `oxi_sd_edit_rgb(s, prompt,
+rgb, width, height, mask_rgb_or_NULL, options_json, ...)` for pixels already in memory;
+`oxi_sd_cancel` and returning non-zero from `on_step` stop it (see `include/oxinfer.h`).
+
+**Browser.** Image mode has an InstructPix2Pix preset (with the LCM-LoRA, 4 steps) and, for every
+model, an image and a mask upload with the strength or image-guidance setting
+(`web_sd_set_input`, `sdSetInput(image, mask, { strength, imageGuidance })` in `oxinfer.js`).
+
+**Agreement.** `tools/ref_sd.py --mode img2img | inpaint | pix2pix` runs diffusers' own
+pipelines (Euler scheduler) and records their random draws by role, the initial noise and each
+VAE sample, which oxinfer then reads (`OXINFER_SD_DUMP`). Weights rounded to bf16 on both sides,
+Metal with `OXINFER_METAL_MMA=0` (the default matrix-unit path rounds activations to half:
+about 3e-4 relative, 62-67 dB on the same runs), 512x512, generated test images:
+
+| Edit | Encoder mean | First UNet output | Final latents | Image (rel L2, 8-bit PSNR) |
+|---|---|---|---|---|
+| InstructPix2Pix, 6 steps, guidance 7.5, image guidance 1.5 | 9.1e-7 | 7.5e-6 | 6.1e-6 | 4.2e-6, 85.8 dB |
+| InstructPix2Pix + LCM-LoRA, 4 steps, guidance 1 | 2.1e-6 | 8.3e-7 | 3.1e-6 | 5.8e-6, 86.6 dB |
+| SD 1.5 img2img, strength 0.6, 10 steps, guidance 7.5 | 9.1e-7 | 8.0e-6 | 5.7e-6 | 1.5e-5, 79.0 dB |
+| SD-Turbo img2img, strength 0.5, 2 steps | 9.1e-7 | 1.7e-6 | 2.8e-6 | 1.7e-5, 77.9 dB |
+| SD 1.5 inpainting UNet, strength 1, 10 steps, guidance 7.5 | 1.2e-5 (masked image) | 8.1e-6 | 2.3e-5 | 2.2e-5, 80.0 dB |
+| SD 1.5 inpainting UNet, strength 0.75 | 9.1e-7 | 9.9e-6 | 1.3e-5 | 8.8e-6, 81.3 dB |
+| SD 1.5 (text-to-image UNet) mask blending, 10 steps | 9.1e-7 | 7.9e-6 | 9.1e-6 | 5.7e-6, 86.1 dB |
+| MagicBrush (fp32 `.bin`, "leading" timesteps), 6 steps, guidance 7.5 | 8.1e-7 | 7.5e-6 | 1.0e-5 | 1.1e-5, 84.3 dB |
+
+The encoder's stride-2 convolutions pad one zero row and column after the input only
+(`Downsample2D(padding=0)`); `ConvGeom::pad` carries that to the GPU kernels, so the encoder's
+convolutions, attention and group norms take the same Metal / CUDA / WebGPU paths as the decoder
+(`OXINFER_GPU_CHECK=1`: worst 1.5e-6 relative for the fused norms with `OXINFER_METAL_MMA=0`).
+
+**Timings**, 512x512 on the M5 Max (encode = VAE encoder; the rest as for text to image):
+
+| | Encode | UNet pass | Decode | Whole edit |
+|---|---|---|---|---|
+| Metal: InstructPix2Pix + LCM-LoRA, 4 steps | 0.43 s | 0.35 s | 0.65 s | 2.5 s |
+| Metal: InstructPix2Pix, 20 steps x 3 passes | 0.42 s | 0.33 s | 0.64 s | 21 s |
+| Metal: SD-Turbo img2img, strength 0.5 (1 pass) | 0.43 s | 0.26 s | 0.59 s | 1.4 s |
+| Metal: SD 1.5 img2img, strength 0.6 (15 steps x 2) | 0.43 s | 0.33 s | 0.60 s | 11 s |
+| Metal: inpainting UNet, 25 steps x 2 | 0.47 s | 0.36 s | 0.72 s | 19 s |
+| CPU only (18 threads; measured with another 10-core job running, so upper bounds) | 4.2-5.9 s | 3.1-5.5 s | 7.5-9.9 s | LCM edit 38 s, turbo img2img 16 s |
+| Browser (Chrome, WebGPU; machine busy): InstructPix2Pix + LCM-LoRA | 3.3 s | 3.0 s | 4.8 s | 20.5 s |
+
+On an idle machine the CPU-only UNet pass is about 0.9 s and the decode 2.9-3.4 s (see Image
+generation); the encoder costs about half the decoder. The browser numbers were taken with the
+machine loaded too (SD-Turbo text to image took 7.7 s there against 3.2 s quiet), and the
+browser output matched the native one.
+
+On a phone the same code runs (iOS and Android cross builds are checked; not measured on a device
+for editing): iOS takes the Metal backend like macOS, Android the CPU path. At a few seconds per
+CPU UNet pass, the 4-step LCM InstructPix2Pix edit is the realistic choice there; the model needs
+about 2 GB of bf16 weights in memory.
+
+**Limits.** SD 1.x / 2.x families only (no SDXL, SD 3 or Flux editing here); one image per call;
+the output has the working size (multiples of 64), not the input's; no paste-back of the
+unmasked pixels after inpainting (as diffusers by default: the VAE round trip slightly changes
+them); the mask is binary (no feathering); InstructPix2Pix with `--strength` is not a thing
+(diffusers has none: it always starts from noise); image guidance needs text guidance above 1, so
+the 4-step LCM-LoRA path has no image-guidance knob. Bigger instruction editors
+(Qwen-Image-Edit, FLUX.1 Kontext, Step1X-Edit, OmniGen2, BAGEL) need their own architectures.
 
 ## Janus-Pro: text to image and image understanding
 
@@ -2487,7 +2648,10 @@ about 8 s per 512x512 image in Chrome on the M5 Max with the machine busy, 63 dB
 Metal image); SD-Turbo (2.6 GB, one step) is the other preset, and a custom model can take LoRA
 files too (`?lora=org/name/file.safetensors:0.8`, comma separated). With the LCM-LoRA, plain Euler
 leaves speckle noise in the image: LCM is trained to be re-noised between steps, as the ancestral
-sampler does. Diffusion weights stay in JavaScript memory and the module converts
+sampler does. A third preset, InstructPix2Pix (with the same LCM-LoRA, 4 steps), edits an
+uploaded picture by instruction, and every model takes an input image and a mask (image-to-image,
+inpainting; see [Editing images](#editing-images)); headless Chrome produced the same edit as the
+native build. Diffusion weights stay in JavaScript memory and the module converts
 them tensor by tensor, so only the bf16 copy counts against the 4 GiB of wasm memory.
 
 The `web` feature (`src/web/`) turns the library into a plain C-ABI wasm module, no bindgen;

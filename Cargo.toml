@@ -35,6 +35,10 @@ name = "sd_lora"
 required-features = ["hf"]
 
 [[example]]
+name = "sd_edit"
+required-features = ["hf", "media"]
+
+[[example]]
 name = "qwen_mtp"
 required-features = ["hf"]
 

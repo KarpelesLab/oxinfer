@@ -433,9 +433,9 @@ fn anemll_wanted(name: &str) -> bool {
 
 /// Files of a diffusers pipeline repository (`model_index.json` at the root, as for
 /// `timbrooks/instruct-pix2pix`): the index, each component's configs and tokenizer files, and one
-/// safetensors weight file per component (the fp16 variant when there is one: half the download,
-/// and the weights are kept in bf16 anyway). The safety checker, the full single-file checkpoints
-/// at the root and PyTorch `.bin` duplicates are skipped.
+/// weight file per component (safetensors, the fp16 variant when there is one: half the download,
+/// and the weights are kept in bf16 anyway; PyTorch `.bin` only when a component has no
+/// safetensors). The safety checker and the full single-file checkpoints at the root are skipped.
 fn diffusers_files(list: &Listing) -> Vec<String> {
     let mut files = vec!["model_index.json".to_string()];
     let mut dirs: Vec<&str> = list
@@ -453,9 +453,13 @@ fn diffusers_files(list: &Listing) -> Vec<String> {
                 files.push(n.to_string());
             }
         }
-        let st: Vec<&&String> = names.iter().filter(|n| n.ends_with(".safetensors")).collect();
-        if let Some(f) = st.iter().find(|n| n.ends_with(".fp16.safetensors")).or_else(|| st.first()) {
-            files.push(f.to_string());
+        // Safetensors when there are any, else PyTorch `.bin` (older exports); fp16 first.
+        for ext in [".safetensors", ".bin"] {
+            let w: Vec<&&String> = names.iter().filter(|n| n.ends_with(ext)).collect();
+            if let Some(f) = w.iter().find(|n| n.ends_with(&format!(".fp16{ext}"))).or_else(|| w.first()) {
+                files.push(f.to_string());
+                break;
+            }
         }
     }
     files
