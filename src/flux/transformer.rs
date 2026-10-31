@@ -326,9 +326,9 @@ impl FluxTransformer {
     /// `t` is the timestep in [0, 1000] (sigma * 1000), `guidance` the distilled guidance scale.
     pub fn temb(&self, t: f32, guidance: Option<f32>, pooled: &[f32]) -> Vec<f32> {
         let mlp = |l: &[Dense; 2], x: &[f32]| {
-            let mut h = l[0].forward(x, 1);
+            let mut h = l[0].forward_vec(x);
             h.iter_mut().for_each(|v| *v = silu(*v));
-            l[1].forward(&h, 1)
+            l[1].forward_vec(&h)
         };
         let mut e = mlp(&self.time, &timestep_proj(t, 256));
         if let (Some(g), Some(gs)) = (&self.guide, guidance) {
@@ -362,8 +362,8 @@ impl FluxTransformer {
         let mut hi = self.x_emb.forward(img, n_img);
         let mut ht = self.ctx_emb.forward(txt, n_txt);
         for b in &self.doubles {
-            let mi = b.img_mod.forward(&st, 1);
-            let mt = b.txt_mod.forward(&st, 1);
+            let mi = b.img_mod.forward_vec(&st);
+            let mt = b.txt_mod.forward_vec(&st);
             let (mi, mt) = (chunks(&mi, d), chunks(&mt, d));
             // [0] shift, [1] scale, [2] gate (attention), [3..6] the same for the MLP.
             let xi = ln_mod(&hi, n_img, mi[1], mi[0]);
@@ -400,7 +400,7 @@ impl FluxTransformer {
         h.extend_from_slice(&hi);
         drop(hi);
         for b in &self.singles {
-            let m = b.modl.forward(&st, 1);
+            let m = b.modl.forward_vec(&st);
             let m = chunks(&m, d);
             let x = ln_mod(&h, nt, m[1], m[0]);
             let mut ys = forward_many(&b.proj.iter().collect::<Vec<_>>(), &x, nt);
@@ -427,7 +427,7 @@ impl FluxTransformer {
             gated_add(&mut h, &b.out.forward(&cat, nt), m[2]);
         }
         let hi = &h[n_txt * d..];
-        let m = [self.norm_out[0].forward(&st, 1), self.norm_out[1].forward(&st, 1)];
+        let m = [self.norm_out[0].forward_vec(&st), self.norm_out[1].forward_vec(&st)];
         let x = ln_mod(hi, n_img, &m[0], &m[1]);
         self.proj_out.forward(&x, n_img)
     }

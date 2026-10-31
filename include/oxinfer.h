@@ -505,6 +505,8 @@ typedef struct OxiFlux OxiFlux;
  *   quant=bf16|q8|q4      transformer precision when stored as float (default bf16)
  *   text_quant=bf16|q8|q4 T5 encoder precision (default: quant)
  *   transformer=SPEC      a transformer replacing the folder's (GGUF file, org/name:QUANT)
+ *   text_encoder=SPEC     a T5 encoder replacing the folder's (llama.cpp t5encoder GGUF, e.g.
+ *                         city96/t5-v1_1-xxl-encoder-gguf:Q8_0)
  *   base=SPEC             text encoders / VAE / tokenizers for a GGUF model
  *                         (default unsloth/FLUX.1-Kontext-dev)
  *   device=auto|cpu|metal|cuda|vulkan

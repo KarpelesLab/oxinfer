@@ -44,10 +44,14 @@ pub struct T5Encoder {
 }
 
 impl T5Encoder {
-    /// `dir` is the `text_encoder_2/` folder (config + weights), `tok_dir` the tokenizer folder
-    /// (`tokenizer.json`).
+    /// `dir` is the `text_encoder_2/` folder (config + weights) or a llama.cpp `t5encoder` GGUF
+    /// file (e.g. city96/t5-v1_1-xxl-encoder-gguf), `tok_dir` the tokenizer folder (`tokenizer.json`).
     pub fn load(dir: &Path, tok_dir: &Path, quant: Quant) -> Result<Self> {
-        let cfg: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
+        let cfg: serde_json::Value = if crate::gguf::is_gguf(dir) {
+            gguf_config(dir)?
+        } else {
+            serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?
+        };
         let u = |k: &str| cfg[k].as_u64().map(|v| v as usize).with_context(|| format!("T5 config: {k}"));
         let (d_model, heads, d_kv, n_layers) = (u("d_model")?, u("num_heads")?, u("d_kv")?, u("num_layers")?);
         if cfg["feed_forward_proj"].as_str() != Some("gated-gelu") {
@@ -129,6 +133,12 @@ impl T5Encoder {
         let d = self.d_model;
         let b = self.files.bytes(self.embed)?;
         let id = id as usize;
+        if let Some(g) = self.files.ggml(self.embed) {
+            let (kind, b) = g?;
+            let rb = kind.row_bytes(d);
+            crate::ggml::dequantize_row(kind, &b[id * rb..(id + 1) * rb], out);
+            return Ok(());
+        }
         match self.embed_dtype.as_str() {
             "BF16" => {
                 for (o, c) in out.iter_mut().zip(b[id * d * 2..(id + 1) * d * 2].as_chunks::<2>().0) {
@@ -194,6 +204,37 @@ impl T5Encoder {
         let ids = self.tokenize(text, len)?;
         self.forward(&ids)
     }
+}
+
+/// The `config.json` equivalent of a llama.cpp `t5encoder` GGUF file's metadata.
+fn gguf_config(path: &Path) -> Result<serde_json::Value> {
+    let h = crate::gguf::header(path)?;
+    if h.arch() != "t5encoder" {
+        bail!("{}: GGUF architecture {} is not a T5 encoder", path.display(), h.arch());
+    }
+    let u = |k: &str| {
+        h.get(&format!("t5encoder.{k}"))
+            .and_then(|v| v.as_u64())
+            .with_context(|| format!("GGUF t5encoder.{k}"))
+    };
+    let eps = h
+        .get("t5encoder.attention.layer_norm_rms_epsilon")
+        .or_else(|| h.get("t5encoder.attention.layer_norm_epsilon"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1e-6);
+    Ok(serde_json::json!({
+        "d_model": u("embedding_length")?,
+        "num_heads": u("attention.head_count")?,
+        "d_kv": u("attention.key_length")?,
+        "num_layers": u("block_count")?,
+        "feed_forward_proj": "gated-gelu",
+        // Stored as f32: round to the f32 value transformers configs carry (1e-6).
+        "layer_norm_epsilon": (eps as f32) as f64,
+        "relative_attention_num_buckets": u("attention.relative_buckets_count").unwrap_or(32),
+        "relative_attention_max_distance": 128,
+        "pad_token_id": h.get("tokenizer.ggml.padding_token_id").and_then(|v| v.as_u64()).unwrap_or(0),
+        "eos_token_id": h.get("tokenizer.ggml.eos_token_id").and_then(|v| v.as_u64()).unwrap_or(1),
+    }))
 }
 
 /// transformers' `T5Attention._relative_position_bucket(bidirectional=True)` for

@@ -27,6 +27,21 @@ impl Dense<'_> {
         y
     }
 
+    /// One input vector with full-precision activations: quantized weights would run a single row
+    /// through the int8 decode kernels (activations rounded to int8 per block of 32, a 1e-3
+    /// error on the modulation vectors that steer every block); 8 rows take the dequantize + f32
+    /// GEMM path instead, at no extra weight traffic.
+    pub fn forward_vec(&self, x: &[f32]) -> Vec<f32> {
+        if matches!(self.w.w, crate::model::Weight::Bf16(..)) {
+            return self.forward(x, 1);
+        }
+        const R: usize = 8;
+        let xs: Vec<f32> = (0..R).flat_map(|_| x.iter().copied()).collect();
+        let mut y = self.forward(&xs, R);
+        y.truncate(self.n_out);
+        y
+    }
+
     pub fn forward_into(&self, x: &[f32], rows: usize, y: &mut [f32]) {
         debug_assert_eq!(x.len(), rows * self.n_in);
         linear_multi(&mut [(&self.w, self.n_out, &mut y[..])], self.n_in, x, rows);
@@ -165,9 +180,19 @@ impl<'f> Loader<'f> {
                 let w = &files.bf16(name)?[r0 * n_in..r1 * n_in];
                 Ok(if q == Quant::Bf16 { Lin::bf16(w) } else { quantized(w) })
             }
+            "F16" | "F32" if q == Quant::Bf16 => {
+                // Exact and zero-copy: the rows as a float "GGUF" matrix (F16 / F32 kernels).
+                let (kind, es) = if info.dtype == "F16" {
+                    (crate::ggml::GgmlType::F16, 2)
+                } else {
+                    (crate::ggml::GgmlType::F32, 4)
+                };
+                let b = files.bytes(name)?;
+                Lin::from_gguf(kind, &b[r0 * n_in * es..r1 * n_in * es], n, n_in).with_context(|| format!("tensor {name}"))
+            }
             "F16" | "F32" => {
                 // Converted rows only (ModelFiles::bf16 would keep a converted copy of the whole
-                // tensor for the life of the checkpoint).
+                // tensor for the life of the checkpoint), then quantized.
                 let b = files.bytes(name)?;
                 let mut v = PageVec::<u16>::zeroed(n * n_in);
                 let out: &mut [u16] = &mut v;

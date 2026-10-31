@@ -15,6 +15,7 @@ use std::time::Instant;
 pub struct FluxArgs {
     pub init_image: Option<PathBuf>,
     pub transformer: Option<String>,
+    pub text_encoder: Option<String>,
     pub base: Option<String>,
     pub max_area: Option<usize>,
     pub no_auto_resize: bool,
@@ -27,6 +28,7 @@ impl FluxArgs {
         match flag {
             "--init-image" => self.init_image = Some(PathBuf::from(val()?)),
             "--transformer" => self.transformer = Some(val()?),
+            "--text-encoder" => self.text_encoder = Some(val()?),
             "--base" => self.base = Some(val()?),
             "--max-area" => self.max_area = Some(val()?.parse()?),
             "--no-auto-resize" => self.no_auto_resize = true,
@@ -55,6 +57,7 @@ transformer such as QuantStack/FLUX.1-Kontext-dev-GGUF:Q4_0 or city96/FLUX.1-sch
 \x20 --quant Q            transformer precision when stored as float: bf16 (default) | q8 | q4\n\
 \x20 --text-quant Q       T5 encoder precision (default: --quant)\n\
 \x20 --transformer SPEC   use this transformer (GGUF file or org/name:QUANT) with --model's other parts\n\
+\x20 --text-encoder SPEC a T5 encoder GGUF (e.g. city96/t5-v1_1-xxl-encoder-gguf:Q8_0) instead of the base's\n\
 \x20 --base SPEC          with a GGUF --model: where the text encoders / VAE come from\n\
 \x20                      (default unsloth/FLUX.1-Kontext-dev)\n\
 \x20 --seed N             noise seed (default 42)\n";
@@ -65,6 +68,7 @@ pub fn run(args: &Args) -> Result<()> {
         quant: args.quant,
         text_quant: f.text_quant,
         transformer: f.transformer.clone(),
+        text_encoder: f.text_encoder.clone(),
         base: f.base.clone(),
         device: args.device,
         cache_dir: args.cache_dir.clone(),

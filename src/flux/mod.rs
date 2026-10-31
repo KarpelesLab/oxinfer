@@ -71,6 +71,9 @@ pub struct LoadOptions {
     /// A transformer to use instead of the base folder's `transformer/`: a GGUF file (BFL layout),
     /// a diffusers `transformer` folder, or (with the `hf` feature) `org/name:QUANT` / `org/name`.
     pub transformer: Option<String>,
+    /// A T5 encoder to use instead of the base folder's `text_encoder_2/`: a llama.cpp
+    /// `t5encoder` GGUF file (e.g. `city96/t5-v1_1-xxl-encoder-gguf:Q8_0`) or a folder.
+    pub text_encoder: Option<String>,
     /// Where the text encoders, VAE, tokenizers and scheduler come from when the model given is a
     /// GGUF transformer (default [`DEFAULT_BASE`]).
     pub base: Option<String>,
@@ -86,6 +89,7 @@ impl Default for LoadOptions {
             quant: Quant::Bf16,
             text_quant: None,
             transformer: None,
+            text_encoder: None,
             base: None,
             device: crate::platform::DevicePref::Auto,
             cache_dir: None,
@@ -95,14 +99,15 @@ impl Default for LoadOptions {
 }
 
 impl LoadOptions {
-    /// Sets one `key=value` option (C API): quant, text_quant, transformer, base, device,
-    /// cache_dir, vae_encoder.
+    /// Sets one `key=value` option (C API): quant, text_quant, transformer, text_encoder, base,
+    /// device, cache_dir, vae_encoder.
     pub fn set(&mut self, k: &str, v: &str) -> Result<()> {
         let q = |v: &str| Quant::parse(v).with_context(|| format!("{k}={v}: expected bf16, q8 or q4"));
         match k {
             "quant" => self.quant = q(v)?,
             "text_quant" => self.text_quant = Some(q(v)?),
             "transformer" => self.transformer = Some(v.to_string()),
+            "text_encoder" => self.text_encoder = Some(v.to_string()),
             "base" => self.base = Some(v.to_string()),
             "device" => self.device = crate::platform::DevicePref::parse(v).with_context(|| format!("device={v}"))?,
             "cache_dir" => self.cache_dir = Some(PathBuf::from(v)),
@@ -331,8 +336,14 @@ impl Pipeline {
         } else {
             (model.to_string(), opts.transformer.clone())
         };
-        let skip: &[&str] = if tr_spec.is_some() { &["transformer"] } else { &[] };
-        let dir = resolve_dir(&base, skip, cache)?;
+        let mut skip: Vec<&str> = Vec::new();
+        if tr_spec.is_some() {
+            skip.push("transformer");
+        }
+        if opts.text_encoder.is_some() {
+            skip.push("text_encoder_2");
+        }
+        let dir = resolve_dir(&base, &skip, cache)?;
         let index: serde_json::Value = serde_json::from_slice(
             &crate::fsx::read(&dir.join("model_index.json"))
                 .with_context(|| format!("{}: not a diffusers folder (no model_index.json)", dir.display()))?,
@@ -350,11 +361,12 @@ impl Pipeline {
         };
         let transformer =
             transformer::FluxTransformer::load(&tr_path, opts.quant).with_context(|| format!("transformer {}", tr_path.display()))?;
-        let t5 = t5::T5Encoder::load(
-            &dir.join("text_encoder_2"),
-            &dir.join("tokenizer_2"),
-            opts.text_quant.unwrap_or(opts.quant),
-        )?;
+        let t5_path = match &opts.text_encoder {
+            Some(s) => resolve_transformer(s, cache)?,
+            None => dir.join("text_encoder_2"),
+        };
+        let t5 = t5::T5Encoder::load(&t5_path, &dir.join("tokenizer_2"), opts.text_quant.unwrap_or(opts.quant))
+            .with_context(|| format!("T5 encoder {}", t5_path.display()))?;
         let te = dir.join("text_encoder");
         let te_w = ["model.safetensors", "model.fp16.safetensors"]
             .iter()

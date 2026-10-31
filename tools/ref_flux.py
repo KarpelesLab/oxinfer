@@ -71,6 +71,8 @@ def compare(out):
 def sizes(a, img_wh):
     """The output (w, h) and reference (w, h) FluxKontextPipeline uses."""
     w, h = a.size or (1024, 1024)
+    if img_wh is None:  # text to image (FluxPipeline): no max_area rescaling
+        return (w // 16 * 16, h // 16 * 16), None
     ar = w / h
     w, h = round((a.max_area * ar) ** 0.5) // 16 * 16, round((a.max_area / ar) ** 0.5) // 16 * 16
     ref = None
@@ -167,7 +169,23 @@ def main():
         if a.layers:
             d, s = (int(x) for x in a.layers.split(","))
             cfg["num_layers"], cfg["num_single_layers"] = d, s
-        if a.transformer:
+        if a.transformer and a.layers:
+            # A GGUF file, dequantized exactly in f32 with the gguf package (only the blocks kept),
+            # renamed by diffusers' single-file converter.
+            from gguf import GGUFReader
+            from gguf.quants import dequantize
+            from diffusers.loaders.single_file_utils import convert_flux_transformer_checkpoint_to_diffusers
+            d, s = (int(x) for x in a.layers.split(","))
+            keep = lambda n: not (n.startswith("double_blocks.") and int(n.split(".")[1]) >= d) and \
+                not (n.startswith("single_blocks.") and int(n.split(".")[1]) >= s)
+            ck = {t.name: torch.from_numpy(np.ascontiguousarray(
+                      dequantize(t.data, t.tensor_type).reshape([int(x) for x in reversed(t.shape)]))).float()
+                  for t in GGUFReader(a.transformer).tensors if keep(t.name)}
+            with torch.device("meta"):
+                m = FluxTransformer2DModel.from_config(cfg)
+            m.load_state_dict({k: v.to(dt) for k, v in convert_flux_transformer_checkpoint_to_diffusers(ck).items()},
+                              assign=True, strict=True)
+        elif a.transformer:
             # A GGUF file (BFL layout): diffusers converts the names and dequantizes on the fly.
             from diffusers import GGUFQuantizationConfig
             m = FluxTransformer2DModel.from_single_file(

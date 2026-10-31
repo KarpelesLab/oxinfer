@@ -725,6 +725,32 @@ pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec
     Some((name, shape))
 }
 
+/// The transformers `T5EncoderModel` name of a llama.cpp `t5encoder` tensor (others unchanged).
+fn t5_hf_name(n: &str) -> String {
+    match n {
+        "token_embd.weight" => return "shared.weight".into(),
+        "enc.output_norm.weight" => return "encoder.final_layer_norm.weight".into(),
+        _ => {}
+    }
+    let Some((l, rest)) = n.strip_prefix("enc.blk.").and_then(|r| r.split_once('.')) else {
+        return n.to_string();
+    };
+    let hf = match rest {
+        "attn_q.weight" => "layer.0.SelfAttention.q.weight",
+        "attn_k.weight" => "layer.0.SelfAttention.k.weight",
+        "attn_v.weight" => "layer.0.SelfAttention.v.weight",
+        "attn_o.weight" => "layer.0.SelfAttention.o.weight",
+        "attn_rel_b.weight" => "layer.0.SelfAttention.relative_attention_bias.weight",
+        "attn_norm.weight" => "layer.0.layer_norm.weight",
+        "ffn_gate.weight" => "layer.1.DenseReluDense.wi_0.weight",
+        "ffn_up.weight" => "layer.1.DenseReluDense.wi_1.weight",
+        "ffn_down.weight" => "layer.1.DenseReluDense.wo.weight",
+        "ffn_norm.weight" => "layer.1.layer_norm.weight",
+        _ => return n.to_string(),
+    };
+    format!("encoder.block.{l}.{hf}")
+}
+
 /// A tensor of a GGUF file under its Hugging Face name and shape.
 pub struct HfTensor {
     pub name: String,
@@ -736,13 +762,15 @@ pub struct HfTensor {
 
 /// The tensors of a GGUF file the loaders use, under Hugging Face names.
 pub fn hf_tensors(h: &Header) -> Result<Vec<HfTensor>> {
-    // Diffusion transformers (city96-style FLUX quants) keep their original tensor names.
-    if h.arch() == "flux" {
+    // Diffusion transformers (city96-style FLUX quants) keep their original tensor names; T5
+    // encoders (`t5encoder`) get the transformers names.
+    if matches!(h.arch(), "flux" | "t5encoder") {
+        let t5 = h.arch() == "t5encoder";
         return Ok(h
             .tensors
             .iter()
             .map(|t| HfTensor {
-                name: t.name.clone(),
+                name: if t5 { t5_hf_name(&t.name) } else { t.name.clone() },
                 shape: t.ne.iter().rev().copied().collect(),
                 ggml_type: t.ggml_type,
                 start: t.start,
