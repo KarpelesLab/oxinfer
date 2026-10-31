@@ -826,7 +826,9 @@ impl ModelFiles {
             // fp32 / fp16 checkpoints (PyTorch files, sentence-transformers heads): a bf16 copy.
             let mut cache = self.dequantized.lock().unwrap();
             if !cache.contains_key(name) {
-                let b = self.copy(name)?;
+                // Read in place (a temporary copy from a host-kept shard): only the converted
+                // tensor is kept, not a second copy of the float32 bytes.
+                let b = sh.bytes_cow(name)?;
                 let v: PageVec<u16> = match info.dtype.as_str() {
                     "F32" => {
                         let mut v = PageVec::<u16>::zeroed(b.len() / 4);

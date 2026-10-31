@@ -15,6 +15,7 @@ mod anemll_cli;
 mod flux_cli;
 mod intervene_cli;
 mod janus_cli;
+mod omnigen2_cli;
 mod qwen_image_cli;
 #[cfg(feature = "media")]
 mod tts_cli;
@@ -242,6 +243,15 @@ fn usage() -> ! {
          \x20 --steps N            default 40 (a Lightning LoRA: the steps in its name, 4 or 8)\n\
          \x20 --transformer FILE   the transformer from a GGUF file (e.g. unsloth/Qwen-Image-Edit-2511-GGUF)\n\
          \x20 --quant q8|q4        transformer and text encoder precision; --mmap, --stream as above\n\
+         \n\
+         OmniGen2 (OmniGen2/OmniGen2): image editing, in-context generation and text to image (-o,\n\
+         --steps (default 50), --negative, --seed, --quant, --mmap as above):\n\
+         \x20 --init-image FILE    image to edit (repeatable, up to 5: \"the cat from image 1 on the sofa\n\
+         \x20                      of image 2\"); none: text to image\n\
+         \x20 --guidance F         text guidance (default 5); --image-guidance F image guidance (default 2)\n\
+         \x20 --size WxH           output size (default: the input image's, within 1024x1024; a single\n\
+         \x20                      input image is resized to it); 1024x1024 without or with several images\n\
+         \x20 --image FILE         without -o: ask the model's Qwen2.5-VL about the image (--prompt)\n\
          \n\
          Janus-Pro (deepseek-ai/Janus-Pro-1B / -7B): text to image, and questions about images:\n\
          \x20 --generate-image T   generate a 384x384 image of T (or --prompt T with -o FILE)\n\
@@ -956,6 +966,13 @@ fn run(mut args: Args) -> Result<()> {
     // Bigger prefill chunks keep the GPU busier (577 vs 431 tok/s on E4B q4 at 1024 vs 256);
     // on the CPU 256 keeps the activations in cache.
     args.prefill_chunk = Some(args.prefill_chunk.unwrap_or(if gpu.is_some() { 1024 } else { 256 }));
+    if oxinfer::omnigen2::is_omnigen2(&args.model) {
+        if !omnigen2_cli::is_understanding(&args) {
+            return omnigen2_cli::run(&args);
+        }
+        // Questions about images: the model's Qwen2.5-VL as a chat model.
+        args = omnigen2_cli::understanding_args(args);
+    }
     if oxinfer::flux::is_flux_dir(&args.model) || oxinfer::flux::is_flux_gguf(&args.model) {
         return flux_cli::run(&args);
     }

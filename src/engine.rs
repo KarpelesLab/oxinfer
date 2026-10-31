@@ -2033,7 +2033,19 @@ pub fn load_tokenizer(model: &Path) -> Result<Tokenizer> {
     if crate::gguf::is_gguf(model) {
         return crate::gguf::header(model)?.tokenizer();
     }
-    Tokenizer::from_bytes(crate::fsx::read(&model.join("tokenizer.json"))?).map_err(|e| anyhow!("tokenizer: {e}"))
+    let mut path = model.join("tokenizer.json");
+    // A diffusers pipeline's language model (`mllm/`, `text_encoder/`): the tokenizer sits in a
+    // sibling `processor/` or `tokenizer/` folder.
+    if !crate::fsx::exists(&path)
+        && let Some(p) = model.parent()
+        && let Some(d) = ["processor", "tokenizer"]
+            .iter()
+            .map(|d| p.join(d).join("tokenizer.json"))
+            .find(|f| crate::fsx::exists(f))
+    {
+        path = d;
+    }
+    Tokenizer::from_bytes(crate::fsx::read(&path)?).map_err(|e| anyhow!("tokenizer: {e}"))
 }
 
 /// Writes the tensors the loader used, quantized as loaded, plus the config and tokenizer files:

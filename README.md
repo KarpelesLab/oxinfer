@@ -12,7 +12,7 @@ formats may still change.
 
 Local LLM inference in pure Rust: Gemma 4 (text, images, video, audio), Qwen 3.5 / 3.6 / 3.8
 (text, images, video), Gemma 3 and Qwen 3 today, more model families as they come; also
-embeddings, Stable Diffusion, FLUX.1 Kontext and Qwen-Image-Edit image editing, Whisper speech to text and Orpheus text to speech. No BLAS, no ML framework: weights are read straight out
+embeddings, Stable Diffusion, FLUX.1 Kontext, Qwen-Image-Edit and OmniGen2 image editing, Whisper speech to text and Orpheus text to speech. No BLAS, no ML framework: weights are read straight out
 of the safetensors files (HuggingFace checkpoints or MLX 4-bit ones) and every operation
 (matmuls, attention, norms, RoPE, sampling) is implemented here, with hand-written SIMD kernels
 (NEON, AVX2, wasm simd128) and its own thread pool. The CPU path runs everywhere; GPUs (Metal,
@@ -79,6 +79,7 @@ optional.
 | city96/FLUX.1-schnell-gguf, city96/FLUX.1-dev-gguf | 12B | 6.8 GB (Q4_0) | text to image (schnell: 4 steps, Apache 2.0); schnell Q4_0 matches diffusers at 61.6 dB |
 | Qwen/Qwen-Image-Edit-2511 (also -2509, -Edit) | 20B MMDiT + Qwen2.5-VL-7B (8.3B) + VAE | 41 + 16.6 + 0.25 GB | instruction-based image editing with one or more images; matches diffusers' QwenImageEditPlusPipeline (68.5 dB end to end on the CPU; see [Qwen-Image-Edit](#qwen-image-edit-image-editing-from-instructions-and-qwen-image-text-to-image)); Lightning LoRAs (4 / 8 steps), GGUF transformers (unsloth, QuantStack); Apache 2.0 |
 | Qwen/Qwen-Image, Qwen/Qwen-Image-2512 | same | same | text to image with the same transformer code (2512 tested from unsloth's Q4_0 GGUF + Lightning) |
+| OmniGen2/OmniGen2 | 4.0B DiT + Qwen2.5-VL-3B + FLUX VAE | 15.9 + 15.0 + 0.3 GB (float32) | instruction-based image editing, in-context generation with up to 5 images, text to image; matches the official OmniGen2Pipeline (60 dB end to end with the same bf16 weights; see [OmniGen2](#omnigen2-image-editing-in-context-generation-and-text-to-image)); 2.3 GB of transformer weights at `--quant q4`; Apache 2.0 |
 | Qwen/Qwen2.5-VL-3B-Instruct, -7B-Instruct | 3.8B / 8.3B | 7.5 / 16.6 GB | text and images (no video yet); matches transformers float32 (logits max diff 1.1e-4, same greedy answer; see [Qwen2.5-VL](#qwen25-vl)); also the conditioning encoder `oxinfer::qwen_vl` |
 | city96/t5-v1_1-xxl-encoder-gguf | 4.7B | 2.9 GB (Q4_K_M) - 5.1 GB (Q8_0) | FLUX's T5 encoder as GGUF (`--text-encoder`) |
 | anemll/* (ANEMLL Core ML: Qwen3, Qwen2.5, Gemma 3, Llama 3.2, ...) | 0.27B-1.7B tested | 0.3-1.5 GB (LUT6) | Apple Neural Engine via Core ML; same tokens as ANEMLL's runtime (see [Core ML](#core-ml--apple-neural-engine)) |
@@ -1400,6 +1401,114 @@ Not supported: the layered (`Qwen-Image-Layered`) and ControlNet / inpainting pi
 diffusers folder cover the same weights), batches, the browser build (the weights exceed its 4 GB),
 CUDA runs (compile-checked only). The transformer's activations go between CPU and GPU at every
 matmul (about 1 s per pass at 1024x1024), the next lever for speed.
+
+## OmniGen2: image editing, in-context generation and text to image
+
+OmniGen2 edits an image from an instruction, composes several input images ("the cat from the
+first image on the porch of the cabin in the second"), and generates from text, with one 4B
+diffusion transformer conditioned by Qwen2.5-VL-3B. `src/omnigen2/` follows the official
+`OmniGen2Pipeline` (github.com/VectorSpaceLab/OmniGen2; diffusers has no OmniGen2 pipeline); an
+`OmniGen2/OmniGen2` folder is recognised from `model_index.json`.
+
+```sh
+# edit (50 steps, text guidance 5, image guidance 2, the official negative prompt)
+./target/release/oxinfer --model OmniGen2/OmniGen2 --init-image cat.png \
+    -p "Make the cat wear a small red wizard hat." -o hat.png
+# in-context generation (up to 5 images), quantized transformer: 2.3 GB of weights
+./target/release/oxinfer --model OmniGen2/OmniGen2 --quant q4 --init-image cat.png --init-image cabin.png \
+    --size 1024x768 -p "The cat from the first image sits on the porch of the cabin in the second image." -o both.png
+# text to image; the bf16 Qwen2.5-VL-3B-Instruct (7.5 GB) instead of the folder's float32 copy (15 GB)
+./target/release/oxinfer --model OmniGen2/OmniGen2 --text-encoder Qwen/Qwen2.5-VL-3B-Instruct \
+    --guidance 4 -p "A red fox sitting in a snowy forest at sunrise" -o fox.png
+# understanding: without -o, --image asks the model's Qwen2.5-VL (the mllm/ folder as a chat model)
+./target/release/oxinfer --model OmniGen2/OmniGen2 --image hat.png -p "What is the cat wearing?"
+```
+
+| Flag | Meaning |
+|---|---|
+| `--init-image FILE` | input image (repeatable, up to 5; none: text to image) |
+| `--steps N`, `--guidance F`, `--image-guidance F`, `--negative TEXT` | 50, text guidance 5, image guidance 2, the official negative prompt |
+| `--size WxH` | output size; default: the single input image's size (within 1024x1024 and 1024 per side, multiples of 16), else 1024x1024. With one input image the image is resized to it, so both token grids match |
+| `--quant q8\|q4` | transformer precision (the text encoder follows, at Q8 for `q4`; `--text-quant` overrides) |
+| `--text-encoder SPEC` | the Qwen2.5-VL-3B weights from another folder or repo id |
+| `--transformer FILE`, `--mmap` | the transformer from a GGUF file (calcuis/omnigen2-gguf); map the weights |
+
+What runs: the instruction, in the pipeline's chat template (a system turn "You are a helpful
+assistant that generates high-quality images based on user instructions." and the user turn), goes
+through Qwen2.5-VL-3B as text only (the input images are not shown to it), and its final hidden
+states condition the transformer. The input images are resized with Lanczos within 1024x1024
+pixels and 1024 per side (never up; sides floored to 16), encoded by the FLUX VAE
+(`crate::flux::vae`, posterior mean) and cut into 2x2 patches. The transformer
+(`OmniGen2Transformer2DModel`, 2520 wide, 21 query / 7 key-value heads of 120) runs refiner blocks
+per stream (2 unmodulated over the text, 2 over the noisy target, 2 over each input image on its
+own after a learned per-image embedding), then 32 joint blocks over `[text, images..., target]`:
+sandwich RMSNorms, tanh-gated `1 + scale` modulation, QK RMSNorm, SwiGLU, and Omni RoPE (text at
+`(i, i, i)`, each image on its own grid at axis-0 offset text length + the larger sides of the
+images before it). Euler steps over `t` from 0 (noise) to 1 with `t / (m - m t + t)`,
+`m = sqrt(latent pixels) / 40`, and dual guidance `uncond + image_scale * (ref - uncond) +
+text_scale * (cond - ref)` (three passes per step; `ref` has the images and the negative prompt,
+`uncond` neither; two passes without input images). The noise and image refiners do not depend on
+the prompt, so they run once per step for the three passes.
+
+The 2520-wide layers fit neither Q8 / Q4 blocks of 32 nor the GPU's 64-row matmul tiles: they are
+stored zero-padded (inputs to 2528, outputs to a multiple of 64 on a GPU) and their activations
+padded and cropped around each matmul, an exact product. Heads of 120 are padded to 128 (queries
+pre-scaled) for the GPU's flash-attention kernels; key-value heads are expanded. The published
+checkpoint is float32: it is mapped and converted at load (to bf16, or quantized), so its 31 GB never
+sit in memory.
+
+**Agreement** with the official pipeline (torch 2.15, transformers 5.22, diffusers 0.42; float32
+weights; same prompt, input image and initial noise; the VAE posterior mean instead of a sample on
+both sides; relative L2 errors, PSNR on the 8-bit output):
+
+| oxinfer | against | first velocity (3 passes, CFG) | image PSNR |
+|---|---|---|---|
+| prompt embeddings (Qwen2.5-VL-3B, bf16 = the float32 values) | float32 | 8.8e-6 | |
+| bf16, CPU | reference with the same bf16-rounded weights | 2.4e-6 | |
+| bf16, Metal | same | 2.4e-4 | 60.0 dB (edit, 512x512, 50 steps) |
+| bf16, Metal, 2 input images | same | 4.2e-4 | 52.0 dB (in-context, 512x512, 50 steps) |
+| bf16, Metal, text to image | same | 3.1e-4 | |
+| bf16 | float32 weights | 5.4e-2 | 24.0 dB |
+| `--quant q8` (CPU / Metal) | reference with our Q8 weights dequantized | 3.4e-4 / 4.0e-4 | |
+| `--quant q8` | bf16-weight reference | 5.9e-3 | 40.8 dB (text encoder Q8 too) |
+| `--quant q4` (CPU / Metal) | reference with our Q4 weights dequantized | 3.2e-3 / 2.9e-3 | |
+| `--quant q4` | bf16-weight reference | 8.5e-2 | 20.6 dB (text encoder Q4 too; visually the same edit) |
+
+Quantization error comes from the weights, not from the int8 activations of the CPU kernels: with
+the same dequantized weights in the reference, Q8 agrees to 3e-4 and Q4 to 3e-3. bf16 weight
+rounding alone moves the guided velocity by 5% (the official pipeline runs in bf16), and the
+images then differ in fine detail only. Qwen2.5-VL-3B at Q4 moves the conditioning by 43% (Q8: 5%),
+so `--quant q4` keeps the text encoder at Q8. OmniGen2's `mllm/` is exactly
+Qwen/Qwen2.5-VL-3B-Instruct (identical hidden states), stored as float32.
+
+OMNIGEN2_SPEED_TABLE
+
+**Library and C API.**
+
+```rust
+use oxinfer::omnigen2::{Options, Params, Pipeline};
+let mut pipe = Pipeline::load("OmniGen2/OmniGen2", Options { quant: oxinfer::model::Quant::Q4, ..Default::default() })?;
+let img = oxinfer::media::Media::new().load_image("cat.png".as_ref())?;
+let (out, timings) = pipe.edit(&[img], &Params::new("add a red hat"), &mut |i, n| eprintln!("{i}/{n}"))?;
+// pipe.generate(&params, ..) for text to image; edit_pictures(&[oxideav Picture]) with `oxideav`
+```
+
+The C API has `oxi_omnigen2_load` (`key=value` options: quant, text_quant, text_encoder, mmap,
+transformer, keep_text_encoder, device), `oxi_omnigen2_edit` (a JSON request: prompt, images,
+negative, steps, text_guidance, image_guidance, cfg_range, seed, width, height, max_pixels,
+max_side; plus RGB8 pixel images), `oxi_omnigen2_cancel` and `oxi_omnigen2_free` (see
+`include/oxinfer.h`). For understanding, load `mllm/` as an engine.
+
+**Weights and license.** OmniGen2/OmniGen2: Apache 2.0, ungated; 31 GB, all float32 (15.9 GB
+transformer, 15.0 GB Qwen2.5-VL-3B, 0.3 GB VAE). Qwen/Qwen2.5-VL-3B-Instruct (bf16, 7.5 GB) can
+stand in for `mllm/` (`--text-encoder`). calcuis/omnigen2-gguf has GGUF transformers, but its
+"Q4_0" file is 6 GB: the 2520-wide layers cannot be block-quantized, so most stay F16 (they load,
+on the CPU); `--quant q4` (padded blocks) is smaller and runs on the GPU.
+
+Not supported: the TeaCache / TaylorSeer step caches and the DPM-Solver scheduler option, OmniGen2
+LoRAs, sampling the VAE posterior (the mean is used), batches, `--save-quantized` for the padded
+transformer layers (quantization happens at each load, a few seconds), and the reflection / RL
+variants (OmniGen2-RL, EditScore).
 
 ## Janus-Pro: text to image and image understanding
 

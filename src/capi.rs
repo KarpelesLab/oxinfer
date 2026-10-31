@@ -979,6 +979,127 @@ pub unsafe extern "C" fn oxi_qwen_image_edit_rgb(
     })
 }
 
+// ---- OmniGen2 (image editing, in-context generation, text to image) -------------------------
+
+/// An OmniGen2 pipeline handle.
+pub struct OxiOmniGen2 {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pipe: Mutex<crate::omnigen2::Pipeline>,
+}
+
+/// Loads an OmniGen2 diffusers folder or repo id (`key=value` options, see the header).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_omnigen2_load(
+    model: *const c_char,
+    options: *const c_char,
+    progress: OxiProgressFn,
+    user: *mut c_void,
+) -> *mut OxiOmniGen2 {
+    guard(std::ptr::null_mut(), || {
+        let model = unsafe { str_arg(model, "model") }?;
+        let mut o = crate::omnigen2::Options::default();
+        for item in unsafe { opt_str_arg(options, "options") }?.unwrap_or("").split(['\n', ';']) {
+            let item = item.trim();
+            if item.is_empty() || item.starts_with('#') {
+                continue;
+            }
+            let (k, v) = item.split_once('=').with_context(|| format!("option {item:?} is not key=value"))?;
+            o.set(k.trim(), v.trim())?;
+        }
+        let p = with_progress(progress, user, || crate::omnigen2::Pipeline::load(model, o))?;
+        Ok(Box::into_raw(Box::new(OxiOmniGen2 {
+            cancel: p.cancel_handle(),
+            pipe: Mutex::new(p),
+        })))
+    })
+}
+
+/// Frees an OmniGen2 pipeline (NULL is ignored). No other call on it may be running.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_omnigen2_free(q: *mut OxiOmniGen2) {
+    if !q.is_null() {
+        guard((), || {
+            drop(unsafe { Box::from_raw(q) });
+            Ok(())
+        })
+    }
+}
+
+/// Stops the running edit or generation between denoising steps (any thread).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_omnigen2_cancel(q: *const OxiOmniGen2) {
+    if let Some(q) = unsafe { q.as_ref() } {
+        q.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Edits the images of `request_json` (or generates from the prompt alone without images), with
+/// `n` more input images given as tightly packed RGB8 pixels (after those of the request; `rgb`
+/// may be NULL when `n` is 0); the result goes to `on_image`. Returns 1, or -1.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn oxi_omnigen2_edit(
+    q: *mut OxiOmniGen2,
+    request_json: *const c_char,
+    rgb: *const *const u8,
+    widths: *const c_int,
+    heights: *const c_int,
+    n: c_int,
+    on_image: OxiImageFn,
+    on_step: OxiStepFn,
+    user: *mut c_void,
+) -> c_int {
+    guard(-1, || {
+        let q = unsafe { q.as_ref() }.context("pipeline is NULL")?;
+        let req: crate::omnigen2::Request =
+            serde_json::from_str(unsafe { str_arg(request_json, "request_json") }?).context("request_json")?;
+        let mut images: Vec<crate::video::RgbImage> = Vec::new();
+        if !req.images.is_empty() {
+            #[cfg(feature = "media")]
+            {
+                let m = crate::media::Media::new();
+                for p in &req.images {
+                    images.push(m.load_image(std::path::Path::new(p))?);
+                }
+            }
+            #[cfg(not(feature = "media"))]
+            bail!("decoding image files needs the `media` feature; pass the images as RGB8 pixels");
+        }
+        let n = usize::try_from(n)?;
+        if n > 0 && (rgb.is_null() || widths.is_null() || heights.is_null()) {
+            bail!("rgb, widths or heights is NULL");
+        }
+        for i in 0..n {
+            let (p, w, h) = unsafe { (*rgb.add(i), *widths.add(i), *heights.add(i)) };
+            let (w, h) = (usize::try_from(w)?, usize::try_from(h)?);
+            if p.is_null() || w == 0 || h == 0 {
+                bail!("image {i}: NULL pixels or an empty size");
+            }
+            let data = unsafe { std::slice::from_raw_parts(p, w * h * 3) }.to_vec();
+            images.push(crate::video::RgbImage { width: w, height: h, data });
+        }
+        let mut pipe = q.pipe.lock().unwrap_or_else(|p| p.into_inner());
+        let params = req.params();
+        let cancel = q.cancel.clone();
+        let mut progress = |i: usize, n: usize| {
+            if let Some(cb) = on_step
+                && unsafe { cb(user, i as c_int, n as c_int) } != 0
+            {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        let (img, _) = if images.is_empty() {
+            pipe.generate(&params, &mut progress)?
+        } else {
+            pipe.edit(&images, &params, &mut progress)?
+        };
+        if let Some(cb) = on_image {
+            unsafe { cb(user, 0, img.width as c_int, img.height as c_int, img.rgb.as_ptr(), img.rgb.len()) };
+        }
+        Ok(1)
+    })
+}
+
 // ---- Text to speech (Orpheus) ---------------------------------------------------------------
 
 /// Receives streamed audio: `n` mono samples in [-1, 1] at `sample_rate`, the first being sample

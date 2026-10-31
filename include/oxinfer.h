@@ -397,6 +397,51 @@ int oxi_qwen_image_edit(OxiQwenImage *q, const char *request_json, oxi_image_fn 
 int oxi_qwen_image_edit_rgb(OxiQwenImage *q, const char *request_json, const uint8_t *const *rgb, const int *widths,
                             const int *heights, int n, oxi_image_fn on_image, oxi_step_fn on_step, void *user);
 
+/* ---- OmniGen2: instruction-based image editing, in-context generation, text to image -----------
+ *
+ * OmniGen2/OmniGen2 diffusers folders (over oxinfer::omnigen2): Qwen2.5-VL-3B encodes the
+ * instruction, the 4B transformer denoises with the input images' latents as their own token
+ * streams (dual text / image guidance), the FLUX VAE decodes. For questions about images, load
+ * the folder's mllm/ as an engine (oxi_engine_load). Same threading rules as engines: one call at
+ * a time, oxi_omnigen2_cancel() from any thread. */
+
+typedef struct OxiOmniGen2 OxiOmniGen2;
+
+/* Loads an OmniGen2 pipeline (directory or repo id): configs and VAE now, the text encoder and
+ * the transformer on first use. `options`: `key=value` lines or `;`-separated pairs, NULL for
+ * the defaults:
+ *   quant=bf16|q8|q4       transformer precision (q4: about 2.3 GB of weights)
+ *   text_quant=bf16|q8|q4  text encoder precision
+ *   text_encoder=PATH      the Qwen2.5-VL-3B weights from another folder (OmniGen2's mllm/ is
+ *                          Qwen/Qwen2.5-VL-3B-Instruct stored as float32; the bf16 original
+ *                          is half the download)
+ *   mmap=0|1               map the weights instead of reading them into memory
+ *   transformer=PATH       the transformer from a GGUF file or another folder
+ *   keep_text_encoder=0|1  keep the text encoder loaded between calls (default 0)
+ *   device=auto|cpu|metal|cuda|vulkan */
+OxiOmniGen2 *oxi_omnigen2_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
+
+/* Frees a pipeline (NULL is ignored); no other call on it may be running. */
+void oxi_omnigen2_free(OxiOmniGen2 *q);
+
+/* Stops the running edit between denoising steps (any thread); it then fails with "cancelled". */
+void oxi_omnigen2_cancel(const OxiOmniGen2 *q);
+
+/* Edits images following an instruction ("add a hat to the cat"), composes several ("the cat
+ * of the first image on the sofa of the second"), or generates from the prompt alone without
+ * images. `request_json`: {"prompt": "...", every other key optional:
+ *   "images": ["in.png", ...] (files, decoded with the `media` feature; up to 5 in all),
+ *   "negative": "..." (default: the official negative prompt), "steps": 50,
+ *   "text_guidance": 5, "image_guidance": 2, "cfg_range": [0, 1], "seed": 0,
+ *   "width" / "height" (default: one input image's size, else 1024x1024; a single input image
+ *   is resized to an explicit size), "max_pixels": 1048576, "max_side": 1024 (input images)}
+ * `n` more input images come as tightly packed RGB8 pixels (`rgb[i]`, `widths[i]` x
+ * `heights[i]`; NULLs when `n` is 0), after those of "images". The image is passed to
+ * `on_image` (index 0); `on_step` (may be NULL) is called after every denoising step, non-zero
+ * cancels. Returns 1, or -1 (error, or cancelled). */
+int oxi_omnigen2_edit(OxiOmniGen2 *q, const char *request_json, const uint8_t *const *rgb, const int *widths,
+                      const int *heights, int n, oxi_image_fn on_image, oxi_step_fn on_step, void *user);
+
 /* ---- Text to speech (Orpheus TTS) --------------------------------------------------------------
  *
  * canopylabs/orpheus-3b-0.1-ft (gated; unsloth/orpheus-3b-0.1-ft is an ungated copy) and other
