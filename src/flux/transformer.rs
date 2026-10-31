@@ -68,7 +68,9 @@ pub enum Layout {
     Bfl,
 }
 
-struct Double<'a> {
+/// A double-stream block: separate modulation, projections and MLPs for the image and text
+/// tokens, one joint attention over `[text; image]`.
+pub struct DoubleBlock<'a> {
     img_mod: Dense<'a>,
     txt_mod: Dense<'a>,
     img_qkv: Vec<Dense<'a>>,
@@ -78,14 +80,191 @@ struct Double<'a> {
     txt_out: Dense<'a>,
     img_mlp: [Dense<'a>; 2],
     txt_mlp: [Dense<'a>; 2],
+    pub heads: usize,
+    pub head_dim: usize,
 }
 
-struct Single<'a> {
+/// A single-stream block over the joint sequence: one modulation, q / k / v and the MLP input
+/// from the same normalized activations, attention and MLP outputs projected together.
+pub struct SingleBlock<'a> {
     modl: Dense<'a>,
     /// q, k, v, mlp-in: all reading the same normalized input.
     proj: Vec<Dense<'a>>,
     norms: [Vec<f32>; 2],
     out: Dense<'a>,
+    pub heads: usize,
+    pub head_dim: usize,
+}
+
+impl<'a> DoubleBlock<'a> {
+    /// Block `i` (`transformer_blocks.{i}` / `double_blocks.{i}`) of a `heads` x `head_dim`
+    /// model; the matrices are quantized as the loader says.
+    pub fn load(ld: &Loader<'a>, layout: Layout, i: usize, heads: usize, head_dim: usize) -> Result<Self> {
+        let d = heads * head_dim;
+        let bfl = layout == Layout::Bfl;
+        let (dp, bp) = (format!("transformer_blocks.{i}"), format!("double_blocks.{i}"));
+        let p = |dn: &str, bn: &str| if bfl { format!("{bp}.{bn}") } else { format!("{dp}.{dn}") };
+        let qkv = |dn: [&str; 3], bn: &str| -> Result<Vec<Dense<'a>>> {
+            if bfl {
+                ld.split(&p("", bn), &[d, d, d], true)
+            } else {
+                dn.iter().map(|x| ld.dense(&p(x, ""), true)).collect()
+            }
+        };
+        let norm = |dn: &str, bn: &str| {
+            ld.f32(&if bfl {
+                format!("{bp}.{bn}.scale")
+            } else {
+                format!("{dp}.{dn}.weight")
+            })
+        };
+        Ok(Self {
+            img_mod: ld.dense(&p("norm1.linear", "img_mod.lin"), true)?,
+            txt_mod: ld.dense(&p("norm1_context.linear", "txt_mod.lin"), true)?,
+            img_qkv: qkv(["attn.to_q", "attn.to_k", "attn.to_v"], "img_attn.qkv")?,
+            txt_qkv: qkv(["attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj"], "txt_attn.qkv")?,
+            norms: [
+                norm("attn.norm_q", "img_attn.norm.query_norm")?,
+                norm("attn.norm_k", "img_attn.norm.key_norm")?,
+                norm("attn.norm_added_q", "txt_attn.norm.query_norm")?,
+                norm("attn.norm_added_k", "txt_attn.norm.key_norm")?,
+            ],
+            img_out: ld.dense(&p("attn.to_out.0", "img_attn.proj"), true)?,
+            txt_out: ld.dense(&p("attn.to_add_out", "txt_attn.proj"), true)?,
+            img_mlp: [
+                ld.dense(&p("ff.net.0.proj", "img_mlp.0"), true)?,
+                ld.dense(&p("ff.net.2", "img_mlp.2"), true)?,
+            ],
+            txt_mlp: [
+                ld.dense(&p("ff_context.net.0.proj", "txt_mlp.0"), true)?,
+                ld.dense(&p("ff_context.net.2", "txt_mlp.2"), true)?,
+            ],
+            heads,
+            head_dim,
+        })
+    }
+
+    /// Bytes of weights held.
+    pub fn bytes(&self) -> usize {
+        [&self.img_mod, &self.txt_mod, &self.img_out, &self.txt_out]
+            .into_iter()
+            .chain(&self.img_qkv)
+            .chain(&self.txt_qkv)
+            .chain(&self.img_mlp)
+            .chain(&self.txt_mlp)
+            .map(|l| l.bytes())
+            .sum()
+    }
+
+    /// Updates the image (`hi`, `[n_img, d]`) and text (`ht`, `[n_txt, d]`) streams. `st` is
+    /// SiLU of the conditioning vector; `rope` covers `n_txt + n_img` tokens, text first.
+    pub fn forward(&self, hi: &mut [f32], n_img: usize, ht: &mut [f32], n_txt: usize, st: &[f32], rope: &Rope) {
+        let d = self.heads * self.head_dim;
+        let nt = n_txt + n_img;
+        let mi = self.img_mod.forward_vec(st);
+        let mt = self.txt_mod.forward_vec(st);
+        let (mi, mt) = (chunks(&mi, d), chunks(&mt, d));
+        // [0] shift, [1] scale, [2] gate (attention), [3..6] the same for the MLP.
+        let xi = ln_mod(hi, n_img, mi[1], mi[0]);
+        let xt = ln_mod(ht, n_txt, mt[1], mt[0]);
+        let (mut q, mut k, mut v) = (vec![0f32; nt * d], vec![0f32; nt * d], vec![0f32; nt * d]);
+        {
+            let (qt, qi) = q.split_at_mut(n_txt * d);
+            let (kt, ki) = k.split_at_mut(n_txt * d);
+            let (vt, vi) = v.split_at_mut(n_txt * d);
+            forward_many_into(&self.txt_qkv, &xt, n_txt, &mut [qt, kt, vt]);
+            forward_many_into(&self.img_qkv, &xi, n_img, &mut [qi, ki, vi]);
+            rms_heads(qt, &self.norms[2], self.head_dim);
+            rms_heads(kt, &self.norms[3], self.head_dim);
+            rms_heads(qi, &self.norms[0], self.head_dim);
+            rms_heads(ki, &self.norms[1], self.head_dim);
+        }
+        drop((xi, xt));
+        rope.apply(&mut q, self.heads);
+        rope.apply(&mut k, self.heads);
+        let a = crate::sd::ops::attention(&q, &k, &v, nt, nt, self.heads, self.head_dim, false);
+        drop((q, k, v));
+        let (at, ai) = a.split_at(n_txt * d);
+        gated_add(hi, &self.img_out.forward(ai, n_img), mi[2]);
+        gated_add(ht, &self.txt_out.forward(at, n_txt), mt[2]);
+        drop(a);
+        let xi = ln_mod(hi, n_img, mi[4], mi[3]);
+        gated_add(hi, &mlp(&self.img_mlp, &xi, n_img), mi[5]);
+        drop(xi);
+        let xt = ln_mod(ht, n_txt, mt[4], mt[3]);
+        gated_add(ht, &mlp(&self.txt_mlp, &xt, n_txt), mt[5]);
+    }
+}
+
+impl<'a> SingleBlock<'a> {
+    /// Block `i` (`single_transformer_blocks.{i}` / `single_blocks.{i}`).
+    pub fn load(ld: &Loader<'a>, layout: Layout, i: usize, heads: usize, head_dim: usize) -> Result<Self> {
+        let d = heads * head_dim;
+        let bfl = layout == Layout::Bfl;
+        let (dp, bp) = (format!("single_transformer_blocks.{i}"), format!("single_blocks.{i}"));
+        let p = |dn: &str, bn: &str| if bfl { format!("{bp}.{bn}") } else { format!("{dp}.{dn}") };
+        let proj = if bfl {
+            let (r, _) = ld.shape2(&format!("{bp}.linear1.weight"))?;
+            if r <= 3 * d {
+                bail!("{bp}.linear1 has {r} rows, expected more than {}", 3 * d);
+            }
+            ld.split(&format!("{bp}.linear1"), &[d, d, d, r - 3 * d], true)?
+        } else {
+            ["attn.to_q", "attn.to_k", "attn.to_v", "proj_mlp"]
+                .iter()
+                .map(|x| ld.dense(&format!("{dp}.{x}"), true))
+                .collect::<Result<_>>()?
+        };
+        let norm = |dn: &str, bn: &str| {
+            ld.f32(&if bfl {
+                format!("{bp}.{bn}.scale")
+            } else {
+                format!("{dp}.{dn}.weight")
+            })
+        };
+        Ok(Self {
+            modl: ld.dense(&p("norm.linear", "modulation.lin"), true)?,
+            proj,
+            norms: [norm("attn.norm_q", "norm.query_norm")?, norm("attn.norm_k", "norm.key_norm")?],
+            out: ld.dense(&p("proj_out", "linear2"), true)?,
+            heads,
+            head_dim,
+        })
+    }
+
+    pub fn bytes(&self) -> usize {
+        [&self.modl, &self.out].into_iter().chain(&self.proj).map(|l| l.bytes()).sum()
+    }
+
+    /// Updates the joint sequence `h` (`[nt, d]`, text first).
+    pub fn forward(&self, h: &mut [f32], nt: usize, st: &[f32], rope: &Rope) {
+        let d = self.heads * self.head_dim;
+        let m = self.modl.forward_vec(st);
+        let m = chunks(&m, d);
+        let x = ln_mod(h, nt, m[1], m[0]);
+        let mut ys = forward_many(&self.proj.iter().collect::<Vec<_>>(), &x, nt);
+        drop(x);
+        let mut mlp_in = ys.pop().unwrap();
+        let v = ys.pop().unwrap();
+        let mut k = ys.pop().unwrap();
+        let mut q = ys.pop().unwrap();
+        rms_heads(&mut q, &self.norms[0], self.head_dim);
+        rms_heads(&mut k, &self.norms[1], self.head_dim);
+        rope.apply(&mut q, self.heads);
+        rope.apply(&mut k, self.heads);
+        let a = crate::sd::ops::attention(&q, &k, &v, nt, nt, self.heads, self.head_dim, false);
+        drop((q, k, v));
+        let dm = mlp_in.len() / nt;
+        let w = d + dm;
+        let mut cat = vec![0f32; nt * w];
+        gelu_inplace(&mut mlp_in);
+        for_chunks(&mut cat, w, true, |r, row| {
+            row[..d].copy_from_slice(&a[r * d..(r + 1) * d]);
+            row[d..].copy_from_slice(&mlp_in[r * dm..(r + 1) * dm]);
+        });
+        drop((a, mlp_in));
+        gated_add(h, &self.out.forward(&cat, nt), m[2]);
+    }
 }
 
 pub struct FluxTransformer {
@@ -99,8 +278,8 @@ pub struct FluxTransformer {
     /// Final modulation: (scale, shift) halves.
     norm_out: [Dense<'static>; 2],
     proj_out: Dense<'static>,
-    doubles: Vec<Double<'static>>,
-    singles: Vec<Single<'static>>,
+    pub doubles: Vec<DoubleBlock<'static>>,
+    pub singles: Vec<SingleBlock<'static>>,
     /// Bytes of weights held (borrowed from the mapped checkpoint or quantized copies).
     pub weight_bytes: usize,
     // Declared last: dropped after every layer borrowing it.
@@ -166,102 +345,23 @@ impl FluxTransformer {
             if bfl { [b, a] } else { [a, b] }
         };
         let proj_out = top("proj_out", "final_layer.linear")?;
-        let mut doubles = Vec::with_capacity(cfg.num_layers);
-        for i in 0..cfg.num_layers {
-            let (dp, bp) = (format!("transformer_blocks.{i}"), format!("double_blocks.{i}"));
-            let p = |dn: &str, bn: &str| if bfl { format!("{bp}.{bn}") } else { format!("{dp}.{dn}") };
-            let qkv = |dn: [&str; 3], bn: &str| -> Result<Vec<Dense<'static>>> {
-                if bfl {
-                    ld.split(&p("", bn), &[d, d, d], true)
-                } else {
-                    dn.iter().map(|x| ld.dense(&p(x, ""), true)).collect()
-                }
-            };
-            let norm = |dn: &str, bn: &str| {
-                ld.f32(&if bfl {
-                    format!("{bp}.{bn}.scale")
-                } else {
-                    format!("{dp}.{dn}.weight")
-                })
-            };
-            doubles.push(Double {
-                img_mod: ld.dense(&p("norm1.linear", "img_mod.lin"), true)?,
-                txt_mod: ld.dense(&p("norm1_context.linear", "txt_mod.lin"), true)?,
-                img_qkv: qkv(["attn.to_q", "attn.to_k", "attn.to_v"], "img_attn.qkv")?,
-                txt_qkv: qkv(["attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj"], "txt_attn.qkv")?,
-                norms: [
-                    norm("attn.norm_q", "img_attn.norm.query_norm")?,
-                    norm("attn.norm_k", "img_attn.norm.key_norm")?,
-                    norm("attn.norm_added_q", "txt_attn.norm.query_norm")?,
-                    norm("attn.norm_added_k", "txt_attn.norm.key_norm")?,
-                ],
-                img_out: ld.dense(&p("attn.to_out.0", "img_attn.proj"), true)?,
-                txt_out: ld.dense(&p("attn.to_add_out", "txt_attn.proj"), true)?,
-                img_mlp: [
-                    ld.dense(&p("ff.net.0.proj", "img_mlp.0"), true)?,
-                    ld.dense(&p("ff.net.2", "img_mlp.2"), true)?,
-                ],
-                txt_mlp: [
-                    ld.dense(&p("ff_context.net.0.proj", "txt_mlp.0"), true)?,
-                    ld.dense(&p("ff_context.net.2", "txt_mlp.2"), true)?,
-                ],
-            });
-        }
-        let mut singles = Vec::with_capacity(cfg.num_single_layers);
-        for i in 0..cfg.num_single_layers {
-            let (dp, bp) = (format!("single_transformer_blocks.{i}"), format!("single_blocks.{i}"));
-            let p = |dn: &str, bn: &str| if bfl { format!("{bp}.{bn}") } else { format!("{dp}.{dn}") };
-            let proj = if bfl {
-                let (r, _) = ld.shape2(&format!("{bp}.linear1.weight"))?;
-                if r <= 3 * d {
-                    bail!("{bp}.linear1 has {r} rows, expected more than {}", 3 * d);
-                }
-                ld.split(&format!("{bp}.linear1"), &[d, d, d, r - 3 * d], true)?
-            } else {
-                ["attn.to_q", "attn.to_k", "attn.to_v", "proj_mlp"]
-                    .iter()
-                    .map(|x| ld.dense(&format!("{dp}.{x}"), true))
-                    .collect::<Result<_>>()?
-            };
-            let norm = |dn: &str, bn: &str| {
-                ld.f32(&if bfl {
-                    format!("{bp}.{bn}.scale")
-                } else {
-                    format!("{dp}.{dn}.weight")
-                })
-            };
-            singles.push(Single {
-                modl: ld.dense(&p("norm.linear", "modulation.lin"), true)?,
-                proj,
-                norms: [norm("attn.norm_q", "norm.query_norm")?, norm("attn.norm_k", "norm.key_norm")?],
-                out: ld.dense(&p("proj_out", "linear2"), true)?,
-            });
-        }
-        let mut weight_bytes = 0;
-        for l in [&x_emb, &ctx_emb, &proj_out]
+        let (heads, hd) = (cfg.heads, cfg.head_dim);
+        let doubles = (0..cfg.num_layers)
+            .map(|i| DoubleBlock::load(&ld, layout, i, heads, hd))
+            .collect::<Result<Vec<_>>>()?;
+        let singles = (0..cfg.num_single_layers)
+            .map(|i| SingleBlock::load(&ld, layout, i, heads, hd))
+            .collect::<Result<Vec<_>>>()?;
+        let weight_bytes = [&x_emb, &ctx_emb, &proj_out]
             .into_iter()
             .chain(time.iter())
             .chain(text.iter())
             .chain(norm_out.iter())
-        {
-            weight_bytes += l.bytes();
-        }
-        for b in &doubles {
-            for l in [&b.img_mod, &b.txt_mod, &b.img_out, &b.txt_out]
-                .into_iter()
-                .chain(&b.img_qkv)
-                .chain(&b.txt_qkv)
-                .chain(&b.img_mlp)
-                .chain(&b.txt_mlp)
-            {
-                weight_bytes += l.bytes();
-            }
-        }
-        for b in &singles {
-            for l in [&b.modl, &b.out].into_iter().chain(&b.proj) {
-                weight_bytes += l.bytes();
-            }
-        }
+            .chain(guide.iter().flatten())
+            .map(|l| l.bytes())
+            .sum::<usize>()
+            + doubles.iter().map(|b| b.bytes()).sum::<usize>()
+            + singles.iter().map(|b| b.bytes()).sum::<usize>();
         Ok(Self {
             cfg,
             layout,
@@ -362,69 +462,14 @@ impl FluxTransformer {
         let mut hi = self.x_emb.forward(img, n_img);
         let mut ht = self.ctx_emb.forward(txt, n_txt);
         for b in &self.doubles {
-            let mi = b.img_mod.forward_vec(&st);
-            let mt = b.txt_mod.forward_vec(&st);
-            let (mi, mt) = (chunks(&mi, d), chunks(&mt, d));
-            // [0] shift, [1] scale, [2] gate (attention), [3..6] the same for the MLP.
-            let xi = ln_mod(&hi, n_img, mi[1], mi[0]);
-            let xt = ln_mod(&ht, n_txt, mt[1], mt[0]);
-            let (mut q, mut k, mut v) = (vec![0f32; nt * d], vec![0f32; nt * d], vec![0f32; nt * d]);
-            {
-                let (qt, qi) = q.split_at_mut(n_txt * d);
-                let (kt, ki) = k.split_at_mut(n_txt * d);
-                let (vt, vi) = v.split_at_mut(n_txt * d);
-                forward_many_into(&b.txt_qkv, &xt, n_txt, &mut [qt, kt, vt]);
-                forward_many_into(&b.img_qkv, &xi, n_img, &mut [qi, ki, vi]);
-                rms_heads(qt, &b.norms[2], c.head_dim);
-                rms_heads(kt, &b.norms[3], c.head_dim);
-                rms_heads(qi, &b.norms[0], c.head_dim);
-                rms_heads(ki, &b.norms[1], c.head_dim);
-            }
-            drop((xi, xt));
-            rope.apply(&mut q, c.heads);
-            rope.apply(&mut k, c.heads);
-            let a = crate::sd::ops::attention(&q, &k, &v, nt, nt, c.heads, c.head_dim, false);
-            drop((q, k, v));
-            let (at, ai) = a.split_at(n_txt * d);
-            gated_add(&mut hi, &b.img_out.forward(ai, n_img), mi[2]);
-            gated_add(&mut ht, &b.txt_out.forward(at, n_txt), mt[2]);
-            drop(a);
-            let xi = ln_mod(&hi, n_img, mi[4], mi[3]);
-            gated_add(&mut hi, &mlp(&b.img_mlp, &xi, n_img), mi[5]);
-            drop(xi);
-            let xt = ln_mod(&ht, n_txt, mt[4], mt[3]);
-            gated_add(&mut ht, &mlp(&b.txt_mlp, &xt, n_txt), mt[5]);
+            b.forward(&mut hi, n_img, &mut ht, n_txt, &st, rope);
         }
         // Single-stream blocks over the joint sequence [text; image].
         let mut h = ht;
         h.extend_from_slice(&hi);
         drop(hi);
         for b in &self.singles {
-            let m = b.modl.forward_vec(&st);
-            let m = chunks(&m, d);
-            let x = ln_mod(&h, nt, m[1], m[0]);
-            let mut ys = forward_many(&b.proj.iter().collect::<Vec<_>>(), &x, nt);
-            drop(x);
-            let mut mlp_in = ys.pop().unwrap();
-            let v = ys.pop().unwrap();
-            let mut k = ys.pop().unwrap();
-            let mut q = ys.pop().unwrap();
-            rms_heads(&mut q, &b.norms[0], c.head_dim);
-            rms_heads(&mut k, &b.norms[1], c.head_dim);
-            rope.apply(&mut q, c.heads);
-            rope.apply(&mut k, c.heads);
-            let a = crate::sd::ops::attention(&q, &k, &v, nt, nt, c.heads, c.head_dim, false);
-            drop((q, k, v));
-            let dm = mlp_in.len() / nt;
-            let w = d + dm;
-            let mut cat = vec![0f32; nt * w];
-            gelu_inplace(&mut mlp_in);
-            for_chunks(&mut cat, w, true, |r, row| {
-                row[..d].copy_from_slice(&a[r * d..(r + 1) * d]);
-                row[d..].copy_from_slice(&mlp_in[r * dm..(r + 1) * dm]);
-            });
-            drop((a, mlp_in));
-            gated_add(&mut h, &b.out.forward(&cat, nt), m[2]);
+            b.forward(&mut h, nt, &st, rope);
         }
         let hi = &h[n_txt * d..];
         let m = [self.norm_out[0].forward_vec(&st), self.norm_out[1].forward_vec(&st)];
