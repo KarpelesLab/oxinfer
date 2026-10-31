@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/KarpelesLab/oxinfer/compare/v0.0.5...v0.0.6) - 2026-10-28
+
+### Other
+
+- runtime interventions (spec, formats, CLI, library, C API, agreement, results, GPU coverage, limits)
+- Runtime interventions: neuron edits, steering, directional ablation, SAE features
+- decoding on the GPU (what runs where, speed vs CPU and llama.cpp, agreement), --gpu-decode
+- GPU decode: Gemma 4 26B-A4B MoE layers
+- whole single-token decode pass on the GPU
+- Gemma 4 26B-A4B: MLX experts, GEMM prefill attention, GPU vision MLP, README
+- Gemma 4 26B-A4B (MoE): routed experts, vision, GGUF, decision bundles
+- voice cloning, SNAC encoder and 32/44 kHz codecs, multilingual info, loop guard
+- Llama 3 GGUF and Orpheus GGUF, agreement and speed vs llama.cpp
+- Llama GGUF: Llama 3.x and Orpheus TTS GGUF files
+
 ## [0.0.5](https://github.com/KarpelesLab/oxinfer/compare/v0.0.4...v0.0.5) - 2026-10-25
 
 ### Other
