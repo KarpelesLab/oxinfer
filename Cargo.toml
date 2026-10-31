@@ -47,6 +47,10 @@ name = "bagel_edit"
 required-features = ["hf", "media"]
 
 [[example]]
+name = "step1x_edit"
+required-features = ["hf", "media"]
+
+[[example]]
 name = "qwen_mtp"
 required-features = ["hf"]
 

@@ -61,6 +61,10 @@ pub struct Tensors {
     lora: Option<super::lora::Patches>,
     /// Names the loaders ask for -> names stored in the file (checkpoints in another layout).
     alias: Option<std::collections::HashMap<String, String>>,
+    /// Weights stored as F32 load as two bf16 parts (`w = hi + lo`, ~16 significant bits
+    /// instead of 8) for layers whose output is sensitive to weight rounding (see
+    /// [`Tensors::set_split_f32`]).
+    split_f32: bool,
 }
 
 impl Tensors {
@@ -70,6 +74,7 @@ impl Tensors {
             st: SafeTensors::open(path, cfg!(target_arch = "wasm32"))?,
             lora: None,
             alias: None,
+            split_f32: false,
         })
     }
 
@@ -85,6 +90,17 @@ impl Tensors {
     /// The stored name of `name`.
     fn real<'n>(&'n self, name: &'n str) -> &'n str {
         self.alias.as_ref().and_then(|a| a.get(name)).map_or(name, |s| s.as_str())
+    }
+
+    /// Linear and convolution weights stored as F32 are then kept as a bf16 pair (`hi + lo`,
+    /// run as two matmuls) instead of rounded to bf16: e.g. Step1X-Edit's f32 FLUX VAE, whose
+    /// encoder moves its latents by 1.5% when its weights are rounded.
+    pub fn set_split_f32(&mut self, on: bool) {
+        self.split_f32 = on;
+    }
+
+    fn split(&self, name: &str) -> bool {
+        self.split_f32 && self.st.info(self.real(name)).is_some_and(|i| i.dtype == "F32")
     }
 
     /// Merges these LoRA updates into the weights read from now on.
@@ -152,6 +168,31 @@ impl Tensors {
     }
 }
 
+/// `y += x`.
+fn add_into(y: &mut [f32], x: &[f32]) {
+    for_chunks(y, 1 << 16, y.len() > 1 << 16, |c, r| {
+        for (a, &b) in r.iter_mut().zip(&x[c << 16..]) {
+            *a += b;
+        }
+    });
+}
+
+/// A PyTorch `[out][in][ky][kx]` kernel as `[out][ky][kx][in]` rows, the order of the unfolded
+/// pixel rows.
+fn kernel_rows(w: &[f32], cout: usize, cin: usize, k: usize) -> Vec<f32> {
+    let mut r = vec![0f32; w.len()];
+    for o in 0..cout {
+        for i in 0..cin {
+            for ky in 0..k {
+                for kx in 0..k {
+                    r[((o * k + ky) * k + kx) * cin + i] = w[((o * cin + i) * k + ky) * k + kx];
+                }
+            }
+        }
+    }
+    r
+}
+
 /// f32 -> bf16 with round-to-nearest-even.
 #[inline]
 pub fn f32_to_bf16(f: f32) -> u16 {
@@ -176,6 +217,8 @@ pub struct Linear {
     b: Option<Vec<f32>>,
     pub n_out: usize,
     pub n_in: usize,
+    /// The rounding residual of `w` (f32 checkpoints with [`Tensors::set_split_f32`]).
+    lo: Option<Box<Linear>>,
 }
 
 impl Linear {
@@ -188,7 +231,16 @@ impl Linear {
             s => bail!("{wn}: expected a matrix or 1x1 kernel, got {s:?}"),
         };
         let w = t.f32(&wn)?;
-        Self::from_parts(&w, n_out, n_in, Self::bias(t, prefix, n_out)?)
+        let l = Self::from_parts(&w, n_out, n_in, Self::bias(t, prefix, n_out)?)?;
+        Ok(if t.split(&wn) { l.with_residual(&w)? } else { l })
+    }
+
+    /// Adds the bf16 rounding residual of `w` (the weights `self` was built from) as a second
+    /// part.
+    fn with_residual(mut self, w: &[f32]) -> Result<Self> {
+        let r: Vec<f32> = w.iter().map(|&v| v - f32::from_bits((f32_to_bf16(v) as u32) << 16)).collect();
+        self.lo = Some(Box::new(Self::from_parts(&r, self.n_out, self.n_in, None)?));
+        Ok(self)
     }
 
     fn bias(t: &Tensors, prefix: &str, n_out: usize) -> Result<Option<Vec<f32>>> {
@@ -212,6 +264,7 @@ impl Linear {
             b,
             n_out,
             n_in,
+            lo: None,
         })
     }
 
@@ -224,6 +277,9 @@ impl Linear {
     fn forward_untimed(&self, x: &[f32], rows: usize) -> Vec<f32> {
         let mut y = vec![0f32; rows * self.n_out];
         linear(&self.w, self.n_out, self.n_in, x, rows, &mut y);
+        if let Some(lo) = &self.lo {
+            add_into(&mut y, &lo.forward_untimed(x, rows));
+        }
         if let Some(b) = &self.b {
             for_chunks(&mut y, self.n_out, rows > 1, |_, r| {
                 for (v, &bb) in r.iter_mut().zip(b) {
@@ -260,7 +316,11 @@ impl Conv {
             bail!("{wn}: only square odd kernels are supported, got {kh}x{kw}");
         }
         let w = t.f32(&wn)?;
-        Self::from_kernel(&w, cout, cin, kh, Linear::bias(t, prefix, cout)?)
+        let mut c = Self::from_kernel(&w, cout, cin, kh, Linear::bias(t, prefix, cout)?)?;
+        if t.split(&wn) {
+            c.lin = c.lin.with_residual(&kernel_rows(&w, cout, cin, kh))?;
+        }
+        Ok(c)
     }
 
     /// A k x k convolution (padding k/2) from a kernel in PyTorch layout `[cout, cin, k, k]`
@@ -269,18 +329,7 @@ impl Conv {
         if w.len() != cout * cin * k * k || k.is_multiple_of(2) {
             bail!("convolution kernel: {} values for {cout}x{cin}x{k}x{k}", w.len());
         }
-        // PyTorch [out][in][ky][kx] -> [out][ky][kx][in], the order of the unfolded pixel rows.
-        let mut r = vec![0f32; w.len()];
-        for o in 0..cout {
-            for i in 0..cin {
-                for ky in 0..k {
-                    for kx in 0..k {
-                        r[((o * k + ky) * k + kx) * cin + i] = w[((o * cin + i) * k + ky) * k + kx];
-                    }
-                }
-            }
-        }
-        let lin = Linear::from_parts(&r, cout, k * k * cin, bias)?;
+        let lin = Linear::from_parts(&kernel_rows(w, cout, cin, k), cout, k * k * cin, bias)?;
         Ok(Self {
             lin,
             k,
@@ -516,6 +565,9 @@ impl Linear {
         };
         if !be.conv2d(x, &g, spec.as_ref(), &mut job) {
             return None;
+        }
+        if let Some(lo) = &self.lo {
+            add_into(&mut y, &lo.device_conv(x, g, pre)?);
         }
         if let Some(b) = &self.b {
             for_chunks(&mut y, self.n_out, true, |_, r| {

@@ -377,6 +377,10 @@ pub struct QwenSession {
     pub capture: Vec<usize>,
     /// `(layer, [t, hidden])` recorded by the forward passes for `capture`, in pass order.
     pub captured: Vec<(usize, Vec<f32>)>,
+    /// Explicit `[time, height, width]` RoPE positions by sequence index, overriding the ones
+    /// derived from the vision spans (for pipelines that pass their own `position_ids`; prompt
+    /// passes of several tokens).
+    pub positions: Option<Vec<[usize; 3]>>,
 }
 
 impl QwenSession {
@@ -848,6 +852,7 @@ impl<'a> QwenModel<'a> {
             iv: Default::default(),
             capture: Vec::new(),
             captured: Vec::new(),
+            positions: None,
         }
     }
 
@@ -1229,6 +1234,26 @@ impl<'a> QwenModel<'a> {
         (cos, sin)
     }
 
+    /// RoPE tables for explicit `[time, height, width]` positions (the time axis alone without
+    /// M-RoPE).
+    pub(crate) fn rope_cs_at(&self, pos: &[[usize; 3]]) -> (Vec<f32>, Vec<f32>) {
+        let Some(axis) = &self.mrope_axis else {
+            let positions: Vec<usize> = pos.iter().map(|p| p[0]).collect();
+            return rope_tables(&positions, &self.inv_freq);
+        };
+        let half = self.inv_freq.len();
+        let mut cos = vec![0f32; pos.len() * half];
+        let mut sin = vec![0f32; pos.len() * half];
+        for (i, p) in pos.iter().enumerate() {
+            for (j, (&f, &ax)) in self.inv_freq.iter().zip(axis).enumerate() {
+                let a = p[ax as usize] as f32 * f;
+                cos[i * half + j] = a.cos();
+                sin[i * half + j] = a.sin();
+            }
+        }
+        (cos, sin)
+    }
+
     pub fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
         let _unit = crate::stream::enter(&self.stream, self.layers.len());
         let _timer = prof::start(Cat::Head);
@@ -1300,7 +1325,10 @@ impl<'a> QwenModel<'a> {
         for &(i, emb) in mm {
             x[i * h..(i + 1) * h].copy_from_slice(emb);
         }
-        let (cos, sin) = self.rope_cs(&sess.spans, start, t);
+        let (cos, sin) = match &sess.positions {
+            Some(p) if p.len() >= start + t => self.rope_cs_at(&p[start..start + t]),
+            _ => self.rope_cs(&sess.spans, start, t),
+        };
         drop(timer);
         let iv = sess.iv.active().then(|| sess.iv.clone());
         if let Some(iv) = &iv {

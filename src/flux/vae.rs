@@ -189,7 +189,11 @@ impl Vae {
         let cfg: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
         let factor = 1 << cfg["block_out_channels"].as_array().map_or(3, |a| a.len().saturating_sub(1));
         let encoder = if encoder {
-            Some(VaeEncoder::load(&Tensors::open(&wp)?)?)
+            // f32 checkpoints (Step1X-Edit's) keep their precision: the encoder's latents move
+            // by 1.5% with the weights rounded to bf16.
+            let mut t = Tensors::open(&wp)?;
+            t.set_split_f32(true);
+            Some(VaeEncoder::load(&t)?)
         } else {
             None
         };
@@ -218,7 +222,7 @@ impl Vae {
         }
         // The decoder's levels are stored lowest resolution first (`up.0`); diffusers counts
         // from the top. Rename again now that the depth is known.
-        let t = Tensors::open_renamed(path, |n| {
+        let mut t = Tensors::open_renamed(path, |n| {
             let n = bfl_to_diffusers(n)?;
             match n.strip_prefix("decoder.up_blocks.") {
                 Some(rest) => {
@@ -230,6 +234,8 @@ impl Vae {
         })?;
         let (scaling_factor, shift_factor) = (0.3611, 0.1159);
         let decoder = VaeDecoder::from_tensors(&t, scaling_factor, shift_factor)?;
+        // f32 checkpoints keep their encoder's precision (see `load`).
+        t.set_split_f32(true);
         let encoder = if encoder { Some(VaeEncoder::load(&t)?) } else { None };
         Ok(Self {
             scaling_factor,

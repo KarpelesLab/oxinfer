@@ -442,6 +442,48 @@ void oxi_omnigen2_cancel(const OxiOmniGen2 *q);
 int oxi_omnigen2_edit(OxiOmniGen2 *q, const char *request_json, const uint8_t *const *rgb, const int *widths,
                       const int *heights, int n, oxi_image_fn on_image, oxi_step_fn on_step, void *user);
 
+/* ---- Step1X-Edit: instruction-based image editing ---------------------------------------------
+ *
+ * stepfun-ai/Step1X-Edit-v1p2 (and -v1p2-preview, -v1p1-diffusers) diffusers folders (over
+ * oxinfer::step1x): Qwen2.5-VL-7B reads the instruction and the image, a connector feeds a
+ * FLUX-style 12B MMDiT that denoises with the image's latents as extra tokens, the FLUX VAE
+ * decodes. Same threading rules as engines: one call at a time, oxi_step1x_cancel() from any
+ * thread. */
+
+typedef struct OxiStep1x OxiStep1x;
+
+/* Loads a pipeline (directory or repo id): configs and VAE now, the text encoder and the
+ * transformer on first use. `options`: `key=value` lines or `;`-separated pairs, NULL for the
+ * defaults:
+ *   quant=bf16|q8|q4       transformer precision
+ *   text_quant=bf16|q8|q4  text encoder precision
+ *   mmap=0|1               map the weights instead of reading them into memory
+ *   transformer=PATH       the transformer from another folder or file (same tensor names)
+ *   keep_text_encoder=0|1  keep the 16 GB text encoder loaded between calls (default 0)
+ *   stream=0|1             stream the transformer's blocks from storage
+ *   exact_attention=0|1    f32 attention on the GPU (default 1)
+ *   device=auto|cpu|metal|cuda|vulkan */
+OxiStep1x *oxi_step1x_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
+
+/* Frees a pipeline (NULL is ignored); no other call on it may be running. */
+void oxi_step1x_free(OxiStep1x *s);
+
+/* Stops the running edit between denoising steps (any thread); it then fails with "cancelled". */
+void oxi_step1x_cancel(const OxiStep1x *s);
+
+/* Edits an image following an instruction: `rgb` (tightly packed RGB8, `width` x `height`) when
+ * not NULL, else the request's "images"[0]; without either, text to image.
+ * `request_json`: {"prompt": "make it winter", every other key optional:
+ *   "images": ["in.png"] (decoded with the `media` feature), "negative": "" (default; text to
+ *   image: a list of defects), "true_cfg": 6, "steps": 28, "seed": 42, "size_level": 1024 (the
+ *   working resolution: about size_level^2 pixels at the image's aspect ratio), "width" /
+ *   "height" (the returned size; default the input's), "think": false (v1.2: the VL model
+ *   rewrites the instruction first)}
+ * The image is passed to `on_image` (index 0); `on_step` (may be NULL) is called after every
+ * denoising step, non-zero cancels. Returns 1, or -1 (error, or cancelled). */
+int oxi_step1x_edit(OxiStep1x *s, const char *request_json, const uint8_t *rgb, int width, int height,
+                    oxi_image_fn on_image, oxi_step_fn on_step, void *user);
+
 /* ---- Text to speech (Orpheus TTS) --------------------------------------------------------------
  *
  * canopylabs/orpheus-3b-0.1-ft (gated; unsloth/orpheus-3b-0.1-ft is an ungated copy) and other

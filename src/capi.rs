@@ -1100,6 +1100,120 @@ pub unsafe extern "C" fn oxi_omnigen2_edit(
     })
 }
 
+// ---- Step1X-Edit (image editing) -------------------------------------------------------------
+
+/// A Step1X-Edit pipeline handle.
+pub struct OxiStep1x {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pipe: Mutex<crate::step1x::Pipeline>,
+}
+
+/// Loads a Step1X-Edit diffusers folder or repo id (`key=value` options, see the header).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_step1x_load(
+    model: *const c_char,
+    options: *const c_char,
+    progress: OxiProgressFn,
+    user: *mut c_void,
+) -> *mut OxiStep1x {
+    guard(std::ptr::null_mut(), || {
+        let model = unsafe { str_arg(model, "model") }?;
+        let mut o = crate::step1x::Options::default();
+        for item in unsafe { opt_str_arg(options, "options") }?.unwrap_or("").split(['\n', ';']) {
+            let item = item.trim();
+            if item.is_empty() || item.starts_with('#') {
+                continue;
+            }
+            let (k, v) = item.split_once('=').with_context(|| format!("option {item:?} is not key=value"))?;
+            o.set(k.trim(), v.trim())?;
+        }
+        let p = with_progress(progress, user, || crate::step1x::Pipeline::load(model, o))?;
+        Ok(Box::into_raw(Box::new(OxiStep1x {
+            cancel: p.cancel_handle(),
+            pipe: Mutex::new(p),
+        })))
+    })
+}
+
+/// Frees a Step1X-Edit pipeline (NULL is ignored). No other call on it may be running.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_step1x_free(s: *mut OxiStep1x) {
+    if !s.is_null() {
+        guard((), || {
+            drop(unsafe { Box::from_raw(s) });
+            Ok(())
+        })
+    }
+}
+
+/// Stops the running edit between denoising steps (any thread).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_step1x_cancel(s: *const OxiStep1x) {
+    if let Some(s) = unsafe { s.as_ref() } {
+        s.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Edits the image of `request_json` (or of `rgb` when not NULL: tightly packed RGB8 pixels),
+/// or generates from the prompt alone without an image; the result goes to `on_image`. Returns
+/// 1, or -1 (error or cancelled).
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn oxi_step1x_edit(
+    s: *mut OxiStep1x,
+    request_json: *const c_char,
+    rgb: *const u8,
+    width: c_int,
+    height: c_int,
+    on_image: OxiImageFn,
+    on_step: OxiStepFn,
+    user: *mut c_void,
+) -> c_int {
+    guard(-1, || {
+        let s = unsafe { s.as_ref() }.context("pipeline is NULL")?;
+        let req: crate::step1x::Request =
+            serde_json::from_str(unsafe { str_arg(request_json, "request_json") }?).context("request_json")?;
+        let image = if !rgb.is_null() {
+            let (w, h) = (usize::try_from(width)?, usize::try_from(height)?);
+            if w == 0 || h == 0 {
+                bail!("empty image size");
+            }
+            Some(crate::video::RgbImage {
+                width: w,
+                height: h,
+                data: unsafe { std::slice::from_raw_parts(rgb, w * h * 3) }.to_vec(),
+            })
+        } else if let Some(p) = req.images.first() {
+            #[cfg(feature = "media")]
+            {
+                Some(crate::media::Media::new().load_image(std::path::Path::new(p))?)
+            }
+            #[cfg(not(feature = "media"))]
+            bail!("{p}: decoding image files needs the `media` feature; pass RGB pixels instead")
+        } else {
+            None
+        };
+        let params = req.params();
+        let mut pipe = s.pipe.lock().unwrap_or_else(|p| p.into_inner());
+        let cancel = s.cancel.clone();
+        let mut progress = |i: usize, n: usize| {
+            if let Some(cb) = on_step
+                && unsafe { cb(user, i as c_int, n as c_int) } != 0
+            {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        let (img, _) = match &image {
+            Some(im) => pipe.edit(im, &params, &mut progress)?,
+            None => pipe.generate(&params, &mut progress)?,
+        };
+        if let Some(cb) = on_image {
+            unsafe { cb(user, 0, img.width as c_int, img.height as c_int, img.rgb.as_ptr(), img.rgb.len()) };
+        }
+        Ok(1)
+    })
+}
+
 // ---- Text to speech (Orpheus) ---------------------------------------------------------------
 
 /// Receives streamed audio: `n` mono samples in [-1, 1] at `sample_rate`, the first being sample

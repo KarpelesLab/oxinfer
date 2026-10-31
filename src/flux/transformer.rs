@@ -146,14 +146,18 @@ impl<'a> DoubleBlock<'a> {
 
     /// Bytes of weights held.
     pub fn bytes(&self) -> usize {
+        self.lins().iter().map(|l| l.bytes()).sum()
+    }
+
+    /// The block's linear layers (weight streaming: their memory ranges).
+    pub fn lins(&self) -> Vec<&Dense<'a>> {
         [&self.img_mod, &self.txt_mod, &self.img_out, &self.txt_out]
             .into_iter()
             .chain(&self.img_qkv)
             .chain(&self.txt_qkv)
             .chain(&self.img_mlp)
             .chain(&self.txt_mlp)
-            .map(|l| l.bytes())
-            .sum()
+            .collect()
     }
 
     /// Updates the image (`hi`, `[n_img, d]`) and text (`ht`, `[n_txt, d]`) streams. `st` is
@@ -233,7 +237,12 @@ impl<'a> SingleBlock<'a> {
     }
 
     pub fn bytes(&self) -> usize {
-        [&self.modl, &self.out].into_iter().chain(&self.proj).map(|l| l.bytes()).sum()
+        self.lins().iter().map(|l| l.bytes()).sum()
+    }
+
+    /// The block's linear layers.
+    pub fn lins(&self) -> Vec<&Dense<'a>> {
+        [&self.modl, &self.out].into_iter().chain(&self.proj).collect()
     }
 
     /// Updates the joint sequence `h` (`[nt, d]`, text first).

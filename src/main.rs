@@ -18,6 +18,7 @@ mod intervene_cli;
 mod janus_cli;
 mod omnigen2_cli;
 mod qwen_image_cli;
+mod step1x_cli;
 #[cfg(feature = "media")]
 mod tts_cli;
 mod whisper_cli;
@@ -255,6 +256,15 @@ fn usage() -> ! {
          \x20 --size WxH           output size (default: the input image's, within 1024x1024; a single\n\
          \x20                      input image is resized to it); 1024x1024 without or with several images\n\
          \x20 --image FILE         without -o: ask the model's Qwen2.5-VL about the image (--prompt)\n\
+         \n\
+         Step1X-Edit (stepfun-ai/Step1X-Edit-v1p2, -v1p1-diffusers): image editing (-o, --negative,\n\
+         --seed, --quant, --mmap, --stream as above):\n\
+         \x20 --init-image FILE    image to edit (without: text to image)\n\
+         \x20 --guidance F         true CFG scale (default 6, against the negative prompt, default \"\")\n\
+         \x20 --steps N            default 28 (StepFun's examples use 50)\n\
+         \x20 --size WxH           output size (default the input's), also the working area; the input is\n\
+         \x20                      center-cropped to that aspect ratio (default: about 1024x1024)\n\
+         \x20 --think              v1.2: the VL model rewrites the instruction from the image first\n\
          \n\
          Janus-Pro (deepseek-ai/Janus-Pro-1B / -7B): text to image, and questions about images:\n\
          \x20 --generate-image T   generate a 384x384 image of T (or --prompt T with -o FILE)\n\
@@ -987,6 +997,9 @@ fn run(mut args: Args) -> Result<()> {
     }
     if oxinfer::bagel::is_bagel(&args.model) {
         return bagel_cli::run(&args);
+    }
+    if oxinfer::step1x::is_step1x(&args.model) {
+        return step1x_cli::run(&args);
     }
     if oxinfer::sd::is_diffusers(&args.model) {
         return run_image(&args);

@@ -72,6 +72,7 @@ pub mod safetensors;
 pub mod sampler;
 pub mod sd;
 pub mod snac;
+pub mod step1x;
 pub mod stream;
 pub mod tools;
 pub mod torch;

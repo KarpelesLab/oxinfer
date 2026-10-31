@@ -189,7 +189,22 @@ impl QwenVl {
     /// the embeddings of `images` (with M-RoPE positions); `layers` asks for intermediate
     /// residual streams too.
     pub fn hidden_states(&self, text: &str, images: &[VlImage], layers: &[usize]) -> Result<Hidden> {
-        let ids = self.tokenize(text)?;
+        self.hidden_states_tokens(self.tokenize(text)?, images, None, layers)
+    }
+
+    /// [`QwenVl::hidden_states`] of token ids (image placeholders already expanded), optionally
+    /// with explicit `[time, height, width]` RoPE positions per token (transformers'
+    /// `position_ids`) instead of the ones `get_rope_index` derives.
+    pub fn hidden_states_tokens(
+        &self,
+        ids: Vec<u32>,
+        images: &[VlImage],
+        positions: Option<Vec<[usize; 3]>>,
+        layers: &[usize],
+    ) -> Result<Hidden> {
+        if positions.as_ref().is_some_and(|p| p.len() != ids.len()) {
+            bail!("{} positions for {} tokens", positions.map_or(0, |p| p.len()), ids.len());
+        }
         if ids.is_empty() {
             bail!("empty prompt");
         }
@@ -209,6 +224,7 @@ impl QwenVl {
         };
         let mut sess = self.model.new_session();
         sess.capture = layers.to_vec();
+        sess.positions = positions;
         for (p, gh, gw) in crate::mm::vision_spans(&ids, &feats)? {
             sess.add_vision_span(p, gh, gw);
         }
