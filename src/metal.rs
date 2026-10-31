@@ -2465,7 +2465,7 @@ impl Backend for MetalBackend {
         if q.len() < tq * d || k.len() < tk * d || v.len() < tk * d || out.len() < tq * d || tq == 0 || tk == 0 {
             return false;
         }
-        if dh == 128 && !causal && self.mma().is_some() {
+        if dh == 128 && !causal && self.mma().is_some() && !crate::gpu::exact_attention() {
             return self.flash_attention_mma(q, k, v, tq, tk, heads, out);
         }
         if (dh == 64 || dh == 128) && !causal {

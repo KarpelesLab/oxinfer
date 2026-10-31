@@ -55,11 +55,24 @@ pub struct QwenVisionConfig {
     pub deepstack_visual_indexes: Vec<usize>,
     #[serde(default)]
     pub rope_parameters: Option<serde_json::Value>,
+    /// Qwen2.5-VL: window attention over `window_size` pixels in every block but
+    /// `fullatt_block_indexes` (see `crate::qwen25_vision`). Absent in Qwen3.5 towers.
+    #[serde(default)]
+    pub window_size: Option<usize>,
+    #[serde(default)]
+    pub fullatt_block_indexes: Vec<usize>,
+    /// Qwen2.5-VL video: M-RoPE time steps per second.
+    #[serde(default)]
+    pub tokens_per_second: Option<f64>,
 }
 
 impl QwenVisionConfig {
     pub fn head_dim(&self) -> usize {
         self.hidden_size / self.num_heads
+    }
+    /// A Qwen2-VL / Qwen2.5-VL tower (window attention, RMSNorm, SwiGLU; `crate::qwen25_vision`).
+    pub fn is_qwen25(&self) -> bool {
+        self.window_size.is_some()
     }
     fn rope_theta(&self) -> f64 {
         self.rope_parameters
@@ -198,10 +211,21 @@ impl QwenMmConfig {
         };
         let vision: QwenVisionConfig = serde_json::from_value(v.clone()).context("vision_config")?;
         let id = |k: &str, d: u32| raw.get(k).and_then(|v| v.as_u64()).map_or(d, |v| v as u32);
+        let (mut image, mut video) = (ProcessorConfig::load(dir, false), ProcessorConfig::load(dir, true));
+        if vision.is_qwen25() && !crate::fsx::exists(&dir.join("preprocessor_config.json")) {
+            // Qwen2-VL / 2.5-VL processor defaults (the Qwen3.5 ones have 16-pixel patches).
+            for p in [&mut image, &mut video] {
+                p.patch_size = vision.patch_size;
+                p.mean = [0.481_454_66, 0.457_827_5, 0.408_210_73];
+                p.std = [0.268_629_54, 0.261_302_6, 0.275_777_1];
+                p.min_pixels = 3136;
+                p.max_pixels = 12_845_056;
+            }
+        }
         Ok(Some(Self {
             vision,
-            image: ProcessorConfig::load(dir, false),
-            video: ProcessorConfig::load(dir, true),
+            image,
+            video,
             image_token_id: id("image_token_id", 248056),
             video_token_id: id("video_token_id", 248057),
         }))
@@ -356,7 +380,7 @@ pub fn temporal_patch_times_of(times: &[f64], temporal_patch_size: usize) -> Vec
 }
 
 /// A biased linear layer of the tower.
-struct VLin<'a> {
+pub(crate) struct VLin<'a> {
     w: Lin<'a>,
     b: Vec<f32>,
     n_out: usize,
@@ -367,7 +391,7 @@ impl<'a> VLin<'a> {
     /// Loads `{name}.weight` (`[o, i]`) and `{name}.bias`. When `(po, pi)` is larger, the layer
     /// is padded with zero rows / columns to it (the 27-layer towers' MLP width, 4304, is not a
     /// multiple of the GPU tiles): a bf16 copy in memory.
-    fn load(files: &'a ModelFiles, name: &str, (o, i): (usize, usize), (po, pi): (usize, usize)) -> Result<Self> {
+    pub(crate) fn load(files: &'a ModelFiles, name: &str, (o, i): (usize, usize), (po, pi): (usize, usize)) -> Result<Self> {
         let wname = format!("{name}.weight");
         let mut b = files.f32(&format!("{name}.bias"))?;
         if b.len() != o {
@@ -391,7 +415,18 @@ impl<'a> VLin<'a> {
         Ok(Self { w, b, n_out: po, n_in: pi })
     }
 
-    fn forward(&self, x: &[f32], t: usize, y: &mut [f32]) {
+    /// An all-zero layer (tests).
+    #[cfg(test)]
+    pub(crate) fn zero(n_out: usize, n_in: usize) -> Self {
+        Self {
+            w: Lin::bf16_owned(crate::quant::PageVec::zeroed(n_out * n_in)),
+            b: vec![0.0; n_out],
+            n_out,
+            n_in,
+        }
+    }
+
+    pub(crate) fn forward(&self, x: &[f32], t: usize, y: &mut [f32]) {
         linear(&self.w, self.n_out, self.n_in, x, t, y);
         for_chunks(y, self.n_out, true, |_, r| add_inplace(r, &self.b));
     }
@@ -406,7 +441,42 @@ struct VBlock<'a> {
     fc2: VLin<'a>,
 }
 
-pub struct QwenVisionTower<'a> {
+/// The vision tower of a Qwen vision-language checkpoint: Qwen3.5 / 3.6 / 3.8, or Qwen2-VL /
+/// Qwen2.5-VL (`crate::qwen25_vision`).
+pub enum QwenVisionTower<'a> {
+    Qwen35(Qwen35Tower<'a>),
+    Qwen25(crate::qwen25_vision::Qwen25Tower<'a>),
+}
+
+impl<'a> QwenVisionTower<'a> {
+    /// Loads the tower `cfg` describes (bf16; see [`Qwen35Tower::load`]).
+    pub fn load(cfg: QwenVisionConfig, files: &'a ModelFiles) -> Result<Self> {
+        Ok(if cfg.is_qwen25() {
+            Self::Qwen25(crate::qwen25_vision::Qwen25Tower::load(cfg, files)?)
+        } else {
+            Self::Qwen35(Qwen35Tower::load(cfg, files)?)
+        })
+    }
+
+    pub fn cfg(&self) -> &QwenVisionConfig {
+        match self {
+            Self::Qwen35(t) => &t.cfg,
+            Self::Qwen25(t) => &t.cfg,
+        }
+    }
+
+    /// Encodes preprocessed pixels into `[tokens, out_hidden_size]` language-model embeddings
+    /// (tokens = patches / merge^2, in temporal-group then merged-row-major order).
+    pub fn encode(&self, px: &Pixels) -> Vec<f32> {
+        match self {
+            Self::Qwen35(t) => t.encode(px),
+            Self::Qwen25(t) => t.encode(px),
+        }
+    }
+}
+
+/// The Qwen3.5-family tower (see the module docs).
+pub struct Qwen35Tower<'a> {
     pub cfg: QwenVisionConfig,
     patch_w: Lin<'a>, // [H, C*T*p*p]
     patch_b: Vec<f32>,
@@ -420,7 +490,7 @@ pub struct QwenVisionTower<'a> {
     inv_freq: Vec<f32>, // head_dim/4 frequencies per axis
 }
 
-impl<'a> QwenVisionTower<'a> {
+impl<'a> Qwen35Tower<'a> {
     /// Loads `model.visual.*` (or `visual.*`) in bf16 whatever the text model's precision:
     /// int8 blocks moved the 27-layer tower's outputs by 4% (relative), against 1e-5 in bf16,
     /// and the tower is small next to the language model. Tensors stored pre-quantized load as
@@ -626,7 +696,7 @@ impl<'a> QwenVisionTower<'a> {
 
 /// Bidirectional multi-head attention over `n` tokens (`[n, heads*hd]` each, scale hd^-0.5),
 /// in query chunks that keep the score matrix under ~256 MB (GPU when one is active).
-fn attention_chunked(q: &[f32], k: &[f32], v: &[f32], n: usize, nh: usize, hd: usize) -> Vec<f32> {
+pub(crate) fn attention_chunked(q: &[f32], k: &[f32], v: &[f32], n: usize, nh: usize, hd: usize) -> Vec<f32> {
     let d = nh * hd;
     let chunk = ((1usize << 26) / n.max(1)).clamp(64, n.max(64));
     if chunk >= n {

@@ -237,8 +237,16 @@ impl Conv {
         if kh != kw || kh % 2 == 0 {
             bail!("{wn}: only square odd kernels are supported, got {kh}x{kw}");
         }
-        let k = kh;
         let w = t.f32(&wn)?;
+        Self::from_kernel(&w, cout, cin, kh, Linear::bias(t, prefix, cout)?)
+    }
+
+    /// A k x k convolution (padding k/2) from a kernel in PyTorch layout `[cout, cin, k, k]`
+    /// and its bias.
+    pub fn from_kernel(w: &[f32], cout: usize, cin: usize, k: usize, bias: Option<Vec<f32>>) -> Result<Self> {
+        if w.len() != cout * cin * k * k || k.is_multiple_of(2) {
+            bail!("convolution kernel: {} values for {cout}x{cin}x{k}x{k}", w.len());
+        }
         // PyTorch [out][in][ky][kx] -> [out][ky][kx][in], the order of the unfolded pixel rows.
         let mut r = vec![0f32; w.len()];
         for o in 0..cout {
@@ -250,7 +258,7 @@ impl Conv {
                 }
             }
         }
-        let lin = Linear::from_parts(&r, cout, k * k * cin, Linear::bias(t, prefix, cout)?)?;
+        let lin = Linear::from_parts(&r, cout, k * k * cin, bias)?;
         Ok(Self {
             lin,
             k,
@@ -266,6 +274,12 @@ impl Conv {
         let mut c = Self::load(t, prefix)?;
         c.pad = (before, after);
         Ok(c)
+    }
+
+    /// This convolution with zero padding `before` (top / left) and `after` (bottom / right).
+    pub fn with_padding(mut self, before: usize, after: usize) -> Self {
+        self.pad = (before, after);
+        self
     }
 
     /// `x` is `[h*w, cin]`; returns `([oh*ow, cout], oh, ow)` for the given stride.

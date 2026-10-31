@@ -897,7 +897,9 @@ impl Engine {
         let family = match model_type.as_str() {
             "gemma4" | "gemma4_text" => Family::Gemma4,
             "gemma3" | "gemma3_text" => Family::Gemma3,
-            "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" => Family::Qwen,
+            "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" | "qwen2_5_vl" => {
+                Family::Qwen
+            }
             "llama" => Family::Llama,
             other => bail!("unsupported model_type {other}"),
         };
@@ -983,6 +985,8 @@ impl Engine {
                 decision = load_decision(decision_dir.as_deref(), &tok, &base, false, |ad| model.attach_lora(ad))?;
                 let fmt: &'static (dyn ChatFormat + Sync) = if family == Family::Llama {
                     &chat::Llama3Chat
+                } else if model_type == "qwen2_5_vl" {
+                    Box::leak(Box::new(chat::Qwen2Chat::for_model(&dir)))
                 } else {
                     chat::QwenChat::for_model(&dir)
                 };

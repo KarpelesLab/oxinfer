@@ -37,6 +37,8 @@ pub(crate) struct Attn<'a> {
     /// 1 + w (or w, see `zero_centered_norm`); None without query / key norms (Llama).
     q_norm: Option<Vec<f32>>,
     k_norm: Option<Vec<f32>>,
+    /// Query, key and value biases (Qwen2 / Qwen2.5-VL), added after the projections.
+    bias: Option<[Vec<f32>; 3]>,
 }
 
 // One per layer, built once: the size difference is irrelevant.
@@ -370,6 +372,11 @@ pub struct QwenSession {
     gpu: crate::gpu::decode::Slot,
     /// Runtime interventions ([`crate::intervene`]).
     pub iv: crate::intervene::State,
+    /// Layers whose output (the residual stream after the layer, before the final norm, as
+    /// transformers' `hidden_states[l + 1]`) the next forward passes record into `captured`.
+    pub capture: Vec<usize>,
+    /// `(layer, [t, hidden])` recorded by the forward passes for `capture`, in pass order.
+    pub captured: Vec<(usize, Vec<f32>)>,
 }
 
 impl QwenSession {
@@ -496,6 +503,15 @@ impl<'a> Loader<'a, '_> {
             o: self.lin(&format!("{ap}o_proj.weight"), h, nh * hd)?,
             q_norm: cfg.qk_norm.then(|| self.norm(&format!("{ap}q_norm.weight"), hd)).transpose()?,
             k_norm: cfg.qk_norm.then(|| self.norm(&format!("{ap}k_norm.weight"), hd)).transpose()?,
+            bias: if cfg.attention_bias {
+                Some([
+                    self.getf(&format!("{ap}q_proj.bias"), &[nh * hd])?,
+                    self.getf(&format!("{ap}k_proj.bias"), &[nkv * hd])?,
+                    self.getf(&format!("{ap}v_proj.bias"), &[nkv * hd])?,
+                ])
+            } else {
+                None
+            },
         })
     }
 
@@ -621,9 +637,12 @@ impl<'a> QwenModel<'a> {
         // Interleaved M-RoPE (transformers' Qwen3.5 rotary): frequency i rotates with the height
         // for i % 3 == 1 and i < 3 * sections[1], with the width for i % 3 == 2 and
         // i < 3 * sections[2], with the time otherwise.
+        // Contiguous sections (Qwen2-VL / 2.5-VL): the first `sections[0]` frequencies rotate with
+        // the time, the next `sections[1]` with the height, the rest with the width.
         let mrope_axis = cfg.mrope_section().map(|sec| {
             (0..inv_freq.len())
                 .map(|i| match i % 3 {
+                    _ if !cfg.mrope_interleaved => (i >= sec[0]) as u8 + (i >= sec[0] + sec[1]) as u8,
                     1 if i < 3 * sec[1] => 1,
                     2 if i < 3 * sec[2] => 2,
                     _ => 0,
@@ -827,6 +846,8 @@ impl<'a> QwenModel<'a> {
             pos: 0,
             gpu: Default::default(),
             iv: Default::default(),
+            capture: Vec::new(),
+            captured: Vec::new(),
         }
     }
 
@@ -1065,6 +1086,9 @@ impl<'a> QwenModel<'a> {
                     continue;
                 }
             };
+            if at.bias.is_some() {
+                return None;
+            }
             let slot = g.kv.len();
             g.kv.push((nkv, hd));
             g.ops.push(lin(&at.q, qw, h, hn, qkv, LinMode::Store)?);
@@ -1318,6 +1342,9 @@ impl<'a> QwenModel<'a> {
             if let Some(iv) = &iv {
                 iv.point(2 * l + 2, &mut x, h, start);
             }
+            if sess.capture.contains(&l) {
+                sess.captured.push((l, x.clone()));
+            }
             // Streaming a MoE: guess the next layer's experts now, so they are read while its
             // attention runs.
             if let (Some(s), Some(next)) = (&self.stream, self.layers.get(l + 1))
@@ -1366,6 +1393,11 @@ impl<'a> QwenModel<'a> {
             hn,
             t,
         );
+        if let Some([bq, bk, bv]) = &at.bias {
+            for (buf, b) in [(&mut qg, bq), (&mut k, bk), (&mut v, bv)] {
+                for_chunks(buf, b.len(), t > 1, |_, r| add_inplace(r, b));
+            }
+        }
 
         // Split query / gate, norm, partial RoPE, fold in the 1/sqrt(hd) scaling.
         let scale = (hd as f32).powf(-0.5);

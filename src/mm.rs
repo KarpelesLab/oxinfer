@@ -452,6 +452,9 @@ fn prepare_qwen(src: &Sources, files: &ModelFiles, text_hidden: usize, qc: qwen_
         feats.push(feat);
     }
     let vp = &qc.video;
+    if src.n_videos() > 0 && qc.vision.is_qwen25() {
+        bail!("video input is not supported for Qwen2-VL / Qwen2.5-VL checkpoints yet (images are)");
+    }
     for i in 0..src.n_videos() {
         let t1 = Instant::now();
         let fps = args.video.fps.unwrap_or(vp.fps);

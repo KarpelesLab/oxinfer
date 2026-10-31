@@ -15,6 +15,7 @@ mod anemll_cli;
 mod flux_cli;
 mod intervene_cli;
 mod janus_cli;
+mod qwen_image_cli;
 #[cfg(feature = "media")]
 mod tts_cli;
 mod whisper_cli;
@@ -78,11 +79,14 @@ struct Args {
     size: Option<(usize, usize)>,
     sampler: Option<String>,
     loras: Vec<oxinfer::sd::lora::LoraSpec>,
-    /// Image editing: the input image, a mask (white = repaint), strength, image guidance.
-    init_image: Option<PathBuf>,
+    /// Image editing: the input images (repeatable: Qwen-Image-Edit-2509 / 2511 take several;
+    /// the others the first), a mask (white = repaint), strength, image guidance.
+    init_images: Vec<PathBuf>,
     mask: Option<PathBuf>,
     strength: Option<f32>,
     image_guidance: Option<f32>,
+    /// Qwen-Image: the transformer from a GGUF file or another folder.
+    transformer: Option<PathBuf>,
     device: platform::DevicePref,
     devices: bool,
     embed: bool,
@@ -231,6 +235,14 @@ fn usage() -> ! {
          \x20                      stable-diffusion-v1-5/stable-diffusion-inpainting, or any model)\n\
          \x20 --image-guidance F   InstructPix2Pix: how closely to follow the input image (default 1.5)\n\
          \n\
+         Qwen-Image (Qwen/Qwen-Image-Edit-2511, -Edit-2509, -Edit, Qwen/Qwen-Image): image editing and\n\
+         text to image (-o, --steps, --negative, --size, --seed, --lora as above):\n\
+         \x20 --init-image FILE    image to edit (repeatable: Edit-2509 / 2511 combine several)\n\
+         \x20 --guidance F         true CFG scale (default 4 with negative \" \"; 1 with a Lightning LoRA)\n\
+         \x20 --steps N            default 40 (a Lightning LoRA: the steps in its name, 4 or 8)\n\
+         \x20 --transformer FILE   the transformer from a GGUF file (e.g. unsloth/Qwen-Image-Edit-2511-GGUF)\n\
+         \x20 --quant q8|q4        transformer and text encoder precision; --mmap, --stream as above\n\
+         \n\
          Janus-Pro (deepseek-ai/Janus-Pro-1B / -7B): text to image, and questions about images:\n\
          \x20 --generate-image T   generate a 384x384 image of T (or --prompt T with -o FILE)\n\
          \x20 -o, --output FILE     PNG to write (default image.png; FILE-N.png for several images)\n\
@@ -365,10 +377,11 @@ fn parse_args() -> Result<Args> {
         steps: None,
         guidance: None,
         negative: String::new(),
+        init_images: Vec::new(),
+        transformer: None,
         size: None,
         sampler: None,
         loras: Vec::new(),
-        init_image: None,
         mask: None,
         strength: None,
         image_guidance: None,
@@ -536,10 +549,11 @@ fn parse_args() -> Result<Args> {
             "--negative" => a.negative = val()?,
             "--sampler" => a.sampler = Some(val()?),
             "--lora" => a.loras.push(oxinfer::sd::lora::LoraSpec::parse(&val()?)?),
-            "--init-image" => a.init_image = Some(PathBuf::from(val()?)),
+            "--init-image" => a.init_images.push(PathBuf::from(val()?)),
             "--mask" => a.mask = Some(PathBuf::from(val()?)),
             "--strength" => a.strength = Some(val()?.parse()?),
             "--image-guidance" => a.image_guidance = Some(val()?.parse()?),
+            "--transformer" => a.transformer = Some(PathBuf::from(val()?)),
             "--size" => {
                 let v = val()?;
                 let (w, h) = v
@@ -945,6 +959,9 @@ fn run(mut args: Args) -> Result<()> {
     if oxinfer::flux::is_flux_dir(&args.model) || oxinfer::flux::is_flux_gguf(&args.model) {
         return flux_cli::run(&args);
     }
+    if oxinfer::qwen_image::is_qwen_image(&args.model) {
+        return qwen_image_cli::run(&args);
+    }
     if oxinfer::sd::is_diffusers(&args.model) {
         return run_image(&args);
     }
@@ -966,7 +983,7 @@ fn run(mut args: Args) -> Result<()> {
     }
     match model_type.as_str() {
         "gemma4" | "gemma4_text" | "gemma3" | "gemma3_text" => run_gemma(args),
-        "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" => run_qwen(args),
+        "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" | "qwen2_5_vl" => run_qwen(args),
         // Llama 3 runs on the Qwen3 code path.
         "llama" => run_qwen(args),
         other => bail!("unsupported model_type {other}"),
@@ -1067,7 +1084,7 @@ fn run_image(args: &Args) -> Result<()> {
         }
     };
     // The input of an edit: --init-image, or the first --image.
-    let edit = match args.init_image.as_ref().or(args.images.first()) {
+    let edit = match args.init_images.first().or(args.images.first()) {
         Some(path) => {
             let mut e = EditInput::new(load_edit_image(path)?);
             if let Some(m) = &args.mask {
@@ -1403,8 +1420,12 @@ fn run_qwen(args: Args) -> Result<()> {
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
     let mut model = qwen::QwenModel::load(cfg, &files, args.quant)?;
     let tok = load_tokenizer(&args.model)?;
+    let qwen2_fmt;
     let fmt: &dyn ChatFormat = if model.cfg.qk_norm {
         chat::QwenChat::for_model(&args.model)
+    } else if model.cfg.attention_bias {
+        qwen2_fmt = chat::Qwen2Chat::for_model(&args.model);
+        &qwen2_fmt
     } else {
         if !args.raw && !chat::Llama3Chat::matches_model(&args.model) {
             eprintln!("[warning: the model's chat template is not Llama 3's; prompts use the Llama 3 format anyway]");

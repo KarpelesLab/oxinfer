@@ -762,9 +762,9 @@ pub struct HfTensor {
 
 /// The tensors of a GGUF file the loaders use, under Hugging Face names.
 pub fn hf_tensors(h: &Header) -> Result<Vec<HfTensor>> {
-    // Diffusion transformers (city96-style FLUX quants) keep their original tensor names; T5
+    // Diffusion transformers (city96-style FLUX quants, unsloth Qwen-Image) keep their original tensor names; T5
     // encoders (`t5encoder`) get the transformers names.
-    if matches!(h.arch(), "flux" | "t5encoder") {
+    if matches!(h.arch(), "flux" | "qwen_image" | "t5encoder") {
         let t5 = h.arch() == "t5encoder";
         return Ok(h
             .tensors

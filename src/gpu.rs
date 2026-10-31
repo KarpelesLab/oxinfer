@@ -178,6 +178,21 @@ pub fn set_exact(on: bool) {
     EXACT.store(if on { 1 } else { 2 }, Ordering::Relaxed);
 }
 
+/// Keeps attention in f32 on the GPU while the matmuls may still use the half-precision matrix
+/// units: for models whose attention logits are large (Qwen-Image's run into the thousands, where
+/// half-precision queries and keys move the softmax visibly). Process-wide. Default: off.
+/// Returns the previous setting.
+pub fn set_exact_attention(on: bool) -> bool {
+    EXACT_ATTN.swap(on, Ordering::Relaxed)
+}
+
+/// See [`set_exact_attention`] (also on with [`exact`]).
+pub fn exact_attention() -> bool {
+    EXACT_ATTN.load(Ordering::Relaxed) || exact()
+}
+
+static EXACT_ATTN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// See [`set_exact`].
 pub fn exact() -> bool {
     static ENV: OnceLock<Option<String>> = OnceLock::new();

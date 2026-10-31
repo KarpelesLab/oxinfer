@@ -1,0 +1,404 @@
+//! Weight loading for the Qwen-Image transformer: biased linear layers in any precision (bf16,
+//! Q8 / Q4 quantized at load, pre-quantized, GGUF blocks), with LoRA files (Lightning step
+//! distillation, style LoRAs) merged in at load.
+//!
+//! LoRA keys: `<module>.lora_down.weight` / `.lora_up.weight` / `.alpha` (lightx2v, kohya-style
+//! suffixes on diffusers module paths), PEFT / diffusers `<module>.lora_A.weight` /
+//! `.lora_B.weight`, under an optional `transformer.` / `diffusion_model.` / `base_model.model.`
+//! prefix, or kohya's `lora_unet_<module path with _>`. A targeted weight becomes
+//! `W + strength * alpha / rank * up @ down` in f32, then is stored in the precision asked for;
+//! a GGUF weight is dequantized, merged and re-quantized (Q4_0 for 5-bit-or-smaller types, Q8_0
+//! otherwise).
+
+use crate::kernels::for_chunks;
+use crate::model::{Lin, Quant, linear, linear_multi, load_lin};
+use crate::quant::{PageVec, quantize_bf16, quantize_q4};
+use crate::safetensors::{ModelFiles, SafeTensors};
+use anyhow::{Context, Result, bail};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+/// One LoRA file and the strength it is merged with.
+#[derive(Clone, Debug)]
+pub struct LoraSpec {
+    pub path: PathBuf,
+    pub scale: f32,
+}
+
+impl LoraSpec {
+    /// `FILE[:SCALE]`; the scale defaults to 1.
+    pub fn parse(s: &str) -> Result<Self> {
+        let sd = crate::sd::lora::LoraSpec::parse(s)?;
+        Ok(Self {
+            path: sd.path,
+            scale: sd.scale,
+        })
+    }
+}
+
+/// A low-rank update: `down` `[r, in]`, `up` `[out, r]`, already scaled.
+struct Pair {
+    down: Vec<f32>,
+    up: Vec<f32>,
+    r: usize,
+    scale: f32,
+}
+
+/// The LoRA updates of a set of files, by base weight name (`<module>.weight`).
+pub struct LoraSet {
+    by_weight: HashMap<String, Vec<Pair>>,
+    applied: Mutex<usize>,
+    pub files: Vec<(String, usize)>,
+}
+
+fn tensor_f32(st: &SafeTensors, name: &str) -> Result<Vec<f32>> {
+    let info = st.info(name).with_context(|| format!("missing tensor {name}"))?;
+    let b = st.bytes_cow(name)?;
+    Ok(match info.dtype.as_str() {
+        "F32" => b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect(),
+        "BF16" => b
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| crate::kernels::bf16_to_f32(u16::from_le_bytes(*c)))
+            .collect(),
+        "F16" => b.as_chunks::<2>().0.iter().map(|c| half::f16::from_le_bytes(*c).to_f32()).collect(),
+        d => bail!("LoRA tensor {name}: unsupported dtype {d}"),
+    })
+}
+
+impl LoraSet {
+    /// Parses the LoRA files and ties their modules to the weights of `base` (whose tensor names
+    /// may carry `prefix`). Errors when a module matches no weight.
+    pub fn open(specs: &[LoraSpec], base: &ModelFiles, base_names: &[String], prefix: &str) -> Result<Self> {
+        // kohya's underscore paths -> base weight names.
+        let kohya: HashMap<String, String> = base_names
+            .iter()
+            .filter_map(|n| {
+                n.strip_prefix(prefix)
+                    .and_then(|m| m.strip_suffix(".weight"))
+                    .map(|m| (m.replace('.', "_"), n.clone()))
+            })
+            .collect();
+        let mut by_weight: HashMap<String, Vec<Pair>> = HashMap::new();
+        let mut files = Vec::new();
+        for spec in specs {
+            let st = SafeTensors::open(&spec.path, false).with_context(|| format!("LoRA {}", spec.path.display()))?;
+            let mut modules: HashMap<String, [Option<String>; 3]> = HashMap::new();
+            let mut odd = Vec::new();
+            const SUF: [(&str, usize); 8] = [
+                (".lora_down.weight", 0),
+                (".lora_up.weight", 1),
+                (".lora_A.default.weight", 0),
+                (".lora_B.default.weight", 1),
+                (".lora_A.weight", 0),
+                (".lora_B.weight", 1),
+                (".lora.down.weight", 0),
+                (".alpha", 2),
+            ];
+            for k in st.names() {
+                match SUF.iter().find_map(|(s, r)| k.strip_suffix(s).map(|p| (p, *r))) {
+                    Some((p, r)) => modules.entry(p.to_string()).or_default()[r] = Some(k.clone()),
+                    None => odd.push(k.clone()),
+                }
+            }
+            if !odd.is_empty() {
+                odd.sort();
+                bail!(
+                    "LoRA {}: {} keys are not low-rank pairs (e.g. {}); only LoRA (down / up) modules are supported",
+                    spec.path.display(),
+                    odd.len(),
+                    odd[0]
+                );
+            }
+            let mut n = 0;
+            for (m, [down, up, alpha]) in modules {
+                let (Some(down), Some(up)) = (down, up) else {
+                    bail!("LoRA {}: module {m} lacks its down or up matrix", spec.path.display());
+                };
+                let path = ["transformer.", "diffusion_model.", "base_model.model.", "model.diffusion_model."]
+                    .iter()
+                    .find_map(|p| m.strip_prefix(p))
+                    .unwrap_or(&m);
+                let weight = if let Some(u) = path.strip_prefix("lora_unet_") {
+                    kohya.get(u).cloned()
+                } else {
+                    let w = format!("{prefix}{path}.weight");
+                    base.has(&w).then_some(w)
+                };
+                let Some(weight) = weight else {
+                    bail!("LoRA {}: module {m} matches no transformer weight", spec.path.display());
+                };
+                let ds = st.info(&down).unwrap().shape.clone();
+                let us = st.info(&up).unwrap().shape.clone();
+                let (r, n_in, n_out) = match (ds.as_slice(), us.as_slice()) {
+                    ([r, i], [o, r2]) if r == r2 => (*r, *i, *o),
+                    _ => bail!("LoRA {}: module {m} has shapes {ds:?} / {us:?}", spec.path.display()),
+                };
+                let ws = base.info(&weight).unwrap().shape.clone();
+                if ws.iter().product::<usize>() != n_in * n_out {
+                    bail!("LoRA {}: module {m} is {n_out}x{n_in}, the weight is {ws:?}", spec.path.display());
+                }
+                let alpha = match alpha {
+                    Some(a) => tensor_f32(&st, &a)?.first().copied().unwrap_or(r as f32),
+                    None => r as f32,
+                };
+                by_weight.entry(weight).or_default().push(Pair {
+                    down: tensor_f32(&st, &down)?,
+                    up: tensor_f32(&st, &up)?,
+                    r,
+                    scale: spec.scale * alpha / r as f32,
+                });
+                n += 1;
+            }
+            files.push((spec.path.display().to_string(), n));
+        }
+        Ok(Self {
+            by_weight,
+            applied: Mutex::new(0),
+            files,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_weight.is_empty()
+    }
+
+    /// Adds the updates of weight `name` (`[n_out, n_in]`, row-major f32) to `w`; false if none.
+    fn apply(&self, name: &str, n_out: usize, n_in: usize, w: &mut [f32]) -> bool {
+        let Some(pairs) = self.by_weight.get(name) else {
+            return false;
+        };
+        for p in pairs {
+            // up [out, r] @ down [r, in]: rows of up against the columns of down (down^T rows).
+            let mut dt = vec![0f32; n_in * p.r];
+            for i in 0..p.r {
+                for j in 0..n_in {
+                    dt[j * p.r + i] = p.down[i * n_in + j];
+                }
+            }
+            let d = crate::sd::ops::matmul_f32(&dt, n_in, p.r, &p.up, n_out);
+            let s = p.scale;
+            for_chunks(w, n_in, true, |o, row| {
+                for (a, &b) in row.iter_mut().zip(&d[o * n_in..(o + 1) * n_in]) {
+                    *a += s * b;
+                }
+            });
+        }
+        *self.applied.lock().unwrap() += pairs.len();
+        true
+    }
+
+    /// Modules merged so far.
+    pub fn applied(&self) -> usize {
+        *self.applied.lock().unwrap()
+    }
+
+    /// Modules in the files.
+    pub fn modules(&self) -> usize {
+        self.by_weight.values().map(|v| v.len()).sum()
+    }
+
+    /// The updates of weight `name` as one low-rank pair (several files' ranks stacked): `down`
+    /// `[r, n_in]` and `up` `[n_out, r]` with the scales folded in; None if none.
+    fn stacked(&self, name: &str, n_out: usize, n_in: usize) -> Option<(Vec<f32>, Vec<f32>, usize)> {
+        let pairs = self.by_weight.get(name)?;
+        let r: usize = pairs.iter().map(|p| p.r).sum();
+        let mut down = Vec::with_capacity(r * n_in);
+        let mut up = vec![0f32; n_out * r];
+        let mut c0 = 0;
+        for p in pairs {
+            down.extend_from_slice(&p.down);
+            for o in 0..n_out {
+                for i in 0..p.r {
+                    up[o * r + c0 + i] = p.up[o * p.r + i] * p.scale;
+                }
+            }
+            c0 += p.r;
+        }
+        *self.applied.lock().unwrap() += pairs.len();
+        Some((down, up, r))
+    }
+}
+
+/// A LoRA update applied at run time: `y += up (down x)`, both small matmuls through the shared
+/// matmul (so on the GPU when the base one is).
+pub struct RuntimeLora {
+    down: Lin<'static>,
+    up: Lin<'static>,
+    r: usize,
+}
+
+impl RuntimeLora {
+    fn new(down: &[f32], up: &[f32], r: usize) -> Self {
+        let bf = |v: &[f32]| {
+            let mut p = PageVec::<u16>::zeroed(v.len());
+            for (o, &x) in p.iter_mut().zip(v) {
+                *o = crate::sd::ops::f32_to_bf16(x);
+            }
+            Lin::bf16_owned(p)
+        };
+        Self {
+            down: bf(down),
+            up: bf(up),
+            r,
+        }
+    }
+}
+
+/// A linear layer with an optional bias (and a LoRA update applied at run time).
+pub struct Dense<'a> {
+    pub w: Lin<'a>,
+    pub b: Option<Vec<f32>>,
+    pub n_out: usize,
+    pub n_in: usize,
+    pub lora: Option<RuntimeLora>,
+}
+
+impl Dense<'_> {
+    /// `x` is `[rows, n_in]`; returns `[rows, n_out]`.
+    pub fn forward(&self, x: &[f32], rows: usize) -> Vec<f32> {
+        let mut y = vec![0f32; rows * self.n_out];
+        Self::forward_multi(&mut [(self, &mut y[..])], x, rows);
+        y
+    }
+
+    /// [`Dense::forward`] for a few rows (the timestep embedding and modulation layers), padded
+    /// to 16 rows so quantized weights take the prefill path (dequantized weights against f32
+    /// activations) instead of the decode kernels, which round the activations to int8 per block
+    /// of 32: the timestep embeddings have a few channels far larger than the rest, which int8
+    /// blocks would flatten (16% relative error in the velocity at Q8).
+    pub fn forward_small(&self, x: &[f32], rows: usize) -> Vec<f32> {
+        const PAD: usize = 16;
+        if rows >= PAD {
+            return self.forward(x, rows);
+        }
+        let mut xp = vec![0f32; PAD * self.n_in];
+        xp[..rows * self.n_in].copy_from_slice(&x[..rows * self.n_in]);
+        let mut y = self.forward(&xp, PAD);
+        y.truncate(rows * self.n_out);
+        y
+    }
+
+    /// Several layers over the same input (one fused matmul region).
+    pub fn forward_multi(jobs: &mut [(&Self, &mut [f32])], x: &[f32], rows: usize) {
+        let _t = crate::sd::ops::timing::start(crate::sd::ops::timing::LINEAR);
+        let n_in = jobs[0].0.n_in;
+        let mut lj: Vec<(&Lin, usize, &mut [f32])> = jobs.iter_mut().map(|(d, y)| (&d.w, d.n_out, &mut **y)).collect();
+        linear_multi(&mut lj, n_in, x, rows);
+        // LoRA down projections share the input: one fused region, then each up projection.
+        let mut hs: Vec<Vec<f32>> = jobs
+            .iter()
+            .map(|(d, _)| vec![0f32; d.lora.as_ref().map_or(0, |l| rows * l.r)])
+            .collect();
+        let mut dj: Vec<(&Lin, usize, &mut [f32])> = jobs
+            .iter()
+            .zip(hs.iter_mut())
+            .filter_map(|((d, _), h)| d.lora.as_ref().map(|l| (&l.down, l.r, &mut h[..])))
+            .collect();
+        if !dj.is_empty() {
+            linear_multi(&mut dj, n_in, x, rows);
+        }
+        for ((d, y), h) in jobs.iter_mut().zip(&hs) {
+            if let Some(l) = &d.lora {
+                let mut u = vec![0f32; rows * d.n_out];
+                linear(&l.up, d.n_out, l.r, h, rows, &mut u);
+                crate::kernels::add_inplace(y, &u);
+            }
+            if let Some(b) = &d.b {
+                for_chunks(y, d.n_out, rows > 1, |_, r| {
+                    for (v, &bb) in r.iter_mut().zip(b) {
+                        *v += bb;
+                    }
+                });
+            }
+        }
+    }
+}
+
+/// Loads the transformer's layers from `files` in precision `quant` with the LoRA updates of
+/// `lora`: merged into the weights when they are quantized at load anyway (a copy is made
+/// either way), applied at run time otherwise (bf16 weights borrowed from the checkpoint, GGUF
+/// blocks), so no full-size copy is ever made for a LoRA.
+pub struct Loader<'a, 'l> {
+    pub files: &'a ModelFiles,
+    pub quant: Quant,
+    pub lora: Option<&'l LoraSet>,
+    pub prefix: String,
+}
+
+impl<'a> Loader<'a, '_> {
+    pub fn has(&self, name: &str) -> bool {
+        self.files.has(&format!("{}{name}", self.prefix))
+    }
+
+    pub fn f32(&self, name: &str, n: usize) -> Result<Vec<f32>> {
+        let full = format!("{}{name}", self.prefix);
+        let v = self.files.f32(&full)?;
+        if v.len() != n {
+            bail!("tensor {full} has {} values, expected {n}", v.len());
+        }
+        Ok(v)
+    }
+
+    /// `{name}.weight` `[n_out, n_in]` and `{name}.bias` if present.
+    pub fn dense(&self, name: &str, n_out: usize, n_in: usize) -> Result<Dense<'a>> {
+        let wn = format!("{}{name}.weight", self.prefix);
+        if self.quant != Quant::Bf16
+            && let Ok(v) = std::env::var("OXINFER_QI_BF16")
+            && v.split(',').any(|p| !p.is_empty() && name.contains(p))
+        {
+            let ld = Loader {
+                files: self.files,
+                quant: Quant::Bf16,
+                lora: self.lora,
+                prefix: self.prefix.clone(),
+            };
+            return ld.dense(name, n_out, n_in);
+        }
+        let merge = self.quant != Quant::Bf16 && self.files.ggml(&wn).is_none() && Quant::stored(self.files).is_none();
+        let (w, lora) = match self.lora.filter(|l| l.by_weight.contains_key(&wn)) {
+            Some(l) if merge => (self.merged(&wn, n_out, n_in, l)?, None),
+            Some(l) => {
+                let (d, u, r) = l.stacked(&wn, n_out, n_in).unwrap();
+                (
+                    load_lin(self.files, &wn, n_out, n_in, self.quant)?,
+                    Some(RuntimeLora::new(&d, &u, r)),
+                )
+            }
+            None => (load_lin(self.files, &wn, n_out, n_in, self.quant)?, None),
+        };
+        let bias = if self.has(&format!("{name}.bias")) {
+            Some(self.f32(&format!("{name}.bias"), n_out)?)
+        } else {
+            None
+        };
+        Ok(Dense {
+            w,
+            b: bias,
+            n_out,
+            n_in,
+            lora,
+        })
+    }
+
+    /// Weight `wn` (bf16 / f16 / f32 safetensors) with its LoRA updates merged, quantized to `quant`.
+    fn merged(&self, wn: &str, n_out: usize, n_in: usize, l: &LoraSet) -> Result<Lin<'a>> {
+        let mut w = self.files.f32(wn)?;
+        if w.len() != n_out * n_in {
+            bail!("tensor {wn} has {} values, expected {n_out}x{n_in}", w.len());
+        }
+        l.apply(wn, n_out, n_in, &mut w);
+        let mut bf = PageVec::<u16>::zeroed(w.len());
+        for (o, &v) in bf.iter_mut().zip(&w) {
+            *o = crate::sd::ops::f32_to_bf16(v);
+        }
+        self.files.mark_quant(wn, self.quant.kind().unwrap_or(crate::quant::QKind::Q8));
+        Ok(match self.quant {
+            Quant::Bf16 => Lin::bf16_owned(bf),
+            Quant::Q8 => Lin::q8(quantize_bf16(&bf, n_out, n_in)),
+            Quant::Q4 => Lin::q4(quantize_q4(&bf, n_out, n_in)),
+        })
+    }
+}

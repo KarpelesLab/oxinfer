@@ -372,6 +372,33 @@ pub struct Qwen2Chat {
 }
 
 impl Qwen2Chat {
+    /// The format of the checkpoint in `dir`, from its chat template (`chat_template.jinja`,
+    /// `chat_template.json` or `tokenizer_config.json`): Qwen2.5-VL's template writes its default
+    /// system turn inline ("You are a helpful assistant.").
+    pub fn for_model(dir: &std::path::Path) -> Qwen2Chat {
+        let read = |name: &str| crate::fsx::read(&dir.join(name)).ok();
+        let json_template = |name: &str| -> Option<String> {
+            let v: serde_json::Value = serde_json::from_slice(&read(name)?).ok()?;
+            v["chat_template"].as_str().map(str::to_string)
+        };
+        let template = read("chat_template.jinja")
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .or_else(|| json_template("chat_template.json"))
+            .or_else(|| json_template("tokenizer_config.json"))
+            .unwrap_or_default();
+        let fmt = Self::for_template(&template);
+        if fmt.default_system.is_some() {
+            return fmt;
+        }
+        const OPEN: &str = "%}<|im_start|>system\n";
+        let inline = template.find(OPEN).and_then(|i| {
+            let rest = &template[i + OPEN.len()..];
+            let body = &rest[..rest.find("<|im_end|>")?];
+            (!body.contains(['{', '}', '\''])).then(|| body.to_string())
+        });
+        Qwen2Chat { default_system: inline }
+    }
+
     /// The format of a chat template: its default system prompt is the literal in
     /// `'<|im_start|>system\n...<|im_end|>\n'` (Qwen2.5: "You are Qwen, created by Alibaba
     /// Cloud. You are a helpful assistant."; fine-tunes change it).

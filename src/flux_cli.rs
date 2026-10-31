@@ -63,7 +63,7 @@ transformer such as QuantStack/FLUX.1-Kontext-dev-GGUF:Q4_0 or city96/FLUX.1-sch
 pub fn run(args: &Args) -> Result<()> {
     let f = &args.flux;
     // The image to edit: --init-image (shared with Stable Diffusion editing), or the first --image.
-    let init = args.init_image.as_ref().or(args.images.first());
+    let init = args.init_images.first().or(args.images.first());
     let opts = LoadOptions {
         quant: args.quant,
         text_quant: f.text_quant,

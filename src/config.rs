@@ -495,8 +495,15 @@ impl Llama3Rope {
 /// `rope_scaling` as transformers 4 configs store it (Llama 3.1 / 3.2).
 #[derive(Debug, Clone, Deserialize)]
 pub struct RopeScaling {
-    #[serde(default, alias = "type")]
+    #[serde(default)]
     pub rope_type: Option<String>,
+    /// The older spelling of `rope_type` (configs may carry both).
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
+    /// Qwen2-VL / Qwen2.5-VL M-RoPE: frequencies per (time, height, width) axis, in contiguous
+    /// sections (not interleaved).
+    #[serde(default)]
+    pub mrope_section: Option<Vec<usize>>,
     #[serde(flatten)]
     pub llama3: Option<Llama3Rope>,
 }
@@ -574,6 +581,14 @@ pub struct QwenConfig {
     /// GGUF files, whose query / key rows llama.cpp permuted to that layout (see `crate::gguf`).
     #[serde(skip)]
     pub rope_interleaved: bool,
+    /// Query / key / value projections have biases (Qwen2, Qwen2.5-VL).
+    #[serde(skip)]
+    pub attention_bias: bool,
+    /// M-RoPE sections interleaved over the frequencies (Qwen3.5 / 3-VL: `i % 3` picks the axis)
+    /// rather than contiguous (Qwen2-VL / 2.5-VL: the first `sections[0]` frequencies rotate with
+    /// the time, the next `sections[1]` with the height, the rest with the width).
+    #[serde(skip, default = "d_true")]
+    pub mrope_interleaved: bool,
 }
 
 impl QwenConfig {
@@ -586,10 +601,24 @@ impl QwenConfig {
         };
         let mt = raw.get("model_type").and_then(|v| v.as_str());
         let llama = mt == Some("llama");
-        let dense = mt == Some("qwen3") || llama;
+        // Qwen2 / Qwen2.5 and their vision-language models: no query / key norms, biased q / k / v
+        // projections, contiguous M-RoPE sections.
+        let qwen2 = matches!(mt, Some("qwen2" | "qwen2_vl" | "qwen2_5_vl"));
+        let dense = mt == Some("qwen3") || llama || qwen2;
         let text = raw.get("text_config").cloned().unwrap_or(raw);
         let has_head_dim = text.get("head_dim").is_some_and(|v| v.is_u64());
         let mut cfg: QwenConfig = serde_json::from_value(text).context("parse qwen text config")?;
+        if qwen2 {
+            cfg.qk_norm = false;
+            cfg.attention_bias = true;
+            cfg.mrope_interleaved = false;
+            if !has_head_dim {
+                cfg.head_dim = cfg.hidden_size / cfg.num_attention_heads.max(1);
+            }
+            if cfg.rope_theta.is_none() && cfg.rope_parameters.is_none() {
+                cfg.rope_theta = Some(1_000_000.0);
+            }
+        }
         if llama {
             cfg.qk_norm = false;
             if !has_head_dim {
@@ -636,7 +665,7 @@ impl QwenConfig {
     pub fn llama3_rope(&self) -> Option<Llama3Rope> {
         let is_llama3 = |t: &Option<String>| t.as_deref() == Some("llama3");
         match (&self.rope_scaling, &self.rope_parameters) {
-            (Some(s), _) if is_llama3(&s.rope_type) => s.llama3,
+            (Some(s), _) if is_llama3(&s.rope_type) || is_llama3(&s.kind) => s.llama3,
             (_, Some(p)) if is_llama3(&p.rope_type) => p.llama3,
             _ => None,
         }
@@ -646,6 +675,7 @@ impl QwenConfig {
         self.rope_parameters
             .as_ref()
             .and_then(|r| r.mrope_section.as_deref())
+            .or_else(|| self.rope_scaling.as_ref().and_then(|r| r.mrope_section.as_deref()))
             .filter(|s| s.len() == 3)
     }
     /// Number of rotated dimensions per head (partial RoPE).

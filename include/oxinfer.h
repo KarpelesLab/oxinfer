@@ -351,6 +351,52 @@ char *oxi_janus_understand(OxiJanus *j, const char *question, const char *images
 char *oxi_janus_understand_rgb(OxiJanus *j, const char *question, const uint8_t *rgb, int width, int height,
                                const char *options_json, oxi_token_fn cb, void *user);
 
+/* ---- Qwen-Image: instruction-based image editing and text to image --------------------------
+ *
+ * Qwen/Qwen-Image-Edit-2511, -Edit-2509, -Edit and Qwen/Qwen-Image diffusers folders (over
+ * oxinfer::qwen_image): Qwen2.5-VL-7B encodes the instruction with the input images, the 20B
+ * MMDiT denoises with the images' latents as extra tokens, the VAE decodes. Same threading rules
+ * as engines: one call at a time, oxi_qwen_image_cancel() from any thread. */
+
+typedef struct OxiQwenImage OxiQwenImage;
+
+/* Loads a Qwen-Image pipeline (directory or repo id): configs and VAE now, the text encoder and
+ * the transformer on first use. `options`: `key=value` lines or `;`-separated pairs, NULL for
+ * the defaults:
+ *   quant=bf16|q8|q4       transformer precision (a GGUF transformer keeps its own)
+ *   text_quant=bf16|q8|q4  text encoder precision
+ *   mmap=0|1               map the weights instead of reading them into memory
+ *   transformer=PATH       the transformer from a GGUF file (e.g. qwen-image-edit-2511-Q4_0.gguf)
+ *   lora=FILE[:SCALE]      a LoRA merged into the transformer (repeatable); a Lightning LoRA
+ *                          (file name with "lightning" and "4steps" / "8steps") switches the
+ *                          defaults to its settings
+ *   keep_text_encoder=0|1  keep the 16 GB text encoder loaded between calls (default 0)
+ *   stream=0|1             stream the transformer's blocks from storage
+ *   device=auto|cpu|metal|cuda|vulkan */
+OxiQwenImage *oxi_qwen_image_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
+
+/* Frees a pipeline (NULL is ignored); no other call on it may be running. */
+void oxi_qwen_image_free(OxiQwenImage *q);
+
+/* Stops the running edit between denoising steps (any thread); it then fails with "cancelled". */
+void oxi_qwen_image_cancel(const OxiQwenImage *q);
+
+/* Edits images following an instruction, or generates from the prompt alone without images.
+ * `request_json`: {"prompt": "make it winter", every other key optional:
+ *   "images": ["in.png", ...] (files, decoded with the `media` feature; Edit-2509 / 2511 take
+ *   several), "negative": " ", "true_cfg": 4 (guidance when > 1 with a negative prompt),
+ *   "steps": 40, "seed": 42, "width" / "height" (default: the last image's aspect ratio at about
+ *   1024x1024, multiples of 16), "lightning": true|false (default: whether a Lightning LoRA is
+ *   loaded: its steps, no guidance, shift 3)}
+ * The image is passed to `on_image` (index 0); `on_step` (may be NULL) is called after every
+ * denoising step, non-zero cancels. Returns 1, or -1 (error, or cancelled). */
+int oxi_qwen_image_edit(OxiQwenImage *q, const char *request_json, oxi_image_fn on_image, oxi_step_fn on_step, void *user);
+
+/* oxi_qwen_image_edit() with `n` more input images as tightly packed RGB8 pixels (`rgb[i]`,
+ * `widths[i]` x `heights[i]`), after those of the request's "images". */
+int oxi_qwen_image_edit_rgb(OxiQwenImage *q, const char *request_json, const uint8_t *const *rgb, const int *widths,
+                            const int *heights, int n, oxi_image_fn on_image, oxi_step_fn on_step, void *user);
+
 /* ---- Text to speech (Orpheus TTS) --------------------------------------------------------------
  *
  * canopylabs/orpheus-3b-0.1-ft (gated; unsloth/orpheus-3b-0.1-ft is an ungated copy) and other

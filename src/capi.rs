@@ -831,6 +831,154 @@ pub unsafe extern "C" fn oxi_janus_understand_rgb(
     })
 }
 
+// ---- Qwen-Image (image editing, text to image) ------------------------------------------------
+
+/// A Qwen-Image pipeline handle.
+pub struct OxiQwenImage {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pipe: Mutex<crate::qwen_image::Pipeline>,
+}
+
+/// Loads a Qwen-Image diffusers folder or repo id (`key=value` options, see the header).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_qwen_image_load(
+    model: *const c_char,
+    options: *const c_char,
+    progress: OxiProgressFn,
+    user: *mut c_void,
+) -> *mut OxiQwenImage {
+    guard(std::ptr::null_mut(), || {
+        let model = unsafe { str_arg(model, "model") }?;
+        let mut o = crate::qwen_image::Options::default();
+        for item in unsafe { opt_str_arg(options, "options") }?.unwrap_or("").split(['\n', ';']) {
+            let item = item.trim();
+            if item.is_empty() || item.starts_with('#') {
+                continue;
+            }
+            let (k, v) = item.split_once('=').with_context(|| format!("option {item:?} is not key=value"))?;
+            o.set(k.trim(), v.trim())?;
+        }
+        let p = with_progress(progress, user, || crate::qwen_image::Pipeline::load(model, o))?;
+        Ok(Box::into_raw(Box::new(OxiQwenImage {
+            cancel: p.cancel_handle(),
+            pipe: Mutex::new(p),
+        })))
+    })
+}
+
+/// Frees a Qwen-Image pipeline (NULL is ignored). No other call on it may be running.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_qwen_image_free(q: *mut OxiQwenImage) {
+    if !q.is_null() {
+        guard((), || {
+            drop(unsafe { Box::from_raw(q) });
+            Ok(())
+        })
+    }
+}
+
+/// Stops the running edit or generation between denoising steps (any thread).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_qwen_image_cancel(q: *const OxiQwenImage) {
+    if let Some(q) = unsafe { q.as_ref() } {
+        q.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn qwen_image_run(
+    q: *mut OxiQwenImage,
+    request_json: *const c_char,
+    on_image: OxiImageFn,
+    on_step: OxiStepFn,
+    user: *mut c_void,
+    extra: impl FnOnce() -> Result<Vec<crate::video::RgbImage>>,
+) -> c_int {
+    guard(-1, || {
+        let q = unsafe { q.as_ref() }.context("pipeline is NULL")?;
+        let req: crate::qwen_image::Request =
+            serde_json::from_str(unsafe { str_arg(request_json, "request_json") }?).context("request_json")?;
+        let mut images: Vec<crate::video::RgbImage> = Vec::new();
+        if !req.images.is_empty() {
+            #[cfg(feature = "media")]
+            {
+                let m = crate::media::Media::new();
+                for p in &req.images {
+                    images.push(m.load_image(std::path::Path::new(p))?);
+                }
+            }
+            #[cfg(not(feature = "media"))]
+            bail!("decoding image files needs the `media` feature; use oxi_qwen_image_edit_rgb");
+        }
+        images.extend(extra()?);
+        let mut pipe = q.pipe.lock().unwrap_or_else(|p| p.into_inner());
+        let params = pipe.params(&req);
+        let cancel = q.cancel.clone();
+        let mut progress = |i: usize, n: usize| {
+            if let Some(cb) = on_step
+                && unsafe { cb(user, i as c_int, n as c_int) } != 0
+            {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        let (img, _) = if images.is_empty() {
+            pipe.generate(&params, &mut progress)?
+        } else {
+            pipe.edit(&images, &params, &mut progress)?
+        };
+        if let Some(cb) = on_image {
+            unsafe { cb(user, 0, img.width as c_int, img.height as c_int, img.rgb.as_ptr(), img.rgb.len()) };
+        }
+        Ok(1)
+    })
+}
+
+/// Edits the images of `request_json` (or generates from the prompt alone without images); the
+/// result goes to `on_image`. Returns 1, or -1 (error or cancelled).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_qwen_image_edit(
+    q: *mut OxiQwenImage,
+    request_json: *const c_char,
+    on_image: OxiImageFn,
+    on_step: OxiStepFn,
+    user: *mut c_void,
+) -> c_int {
+    qwen_image_run(q, request_json, on_image, on_step, user, || Ok(Vec::new()))
+}
+
+/// [`oxi_qwen_image_edit`] with `n` more input images given as tightly packed RGB8 pixels
+/// (after those of `request_json`).
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn oxi_qwen_image_edit_rgb(
+    q: *mut OxiQwenImage,
+    request_json: *const c_char,
+    rgb: *const *const u8,
+    widths: *const c_int,
+    heights: *const c_int,
+    n: c_int,
+    on_image: OxiImageFn,
+    on_step: OxiStepFn,
+    user: *mut c_void,
+) -> c_int {
+    qwen_image_run(q, request_json, on_image, on_step, user, || {
+        let n = usize::try_from(n)?;
+        if n > 0 && (rgb.is_null() || widths.is_null() || heights.is_null()) {
+            bail!("rgb, widths or heights is NULL");
+        }
+        (0..n)
+            .map(|i| {
+                let (p, w, h) = unsafe { (*rgb.add(i), *widths.add(i), *heights.add(i)) };
+                let (w, h) = (usize::try_from(w)?, usize::try_from(h)?);
+                if p.is_null() || w == 0 || h == 0 {
+                    bail!("image {i}: NULL pixels or an empty size");
+                }
+                let data = unsafe { std::slice::from_raw_parts(p, w * h * 3) }.to_vec();
+                Ok(crate::video::RgbImage { width: w, height: h, data })
+            })
+            .collect()
+    })
+}
+
 // ---- Text to speech (Orpheus) ---------------------------------------------------------------
 
 /// Receives streamed audio: `n` mono samples in [-1, 1] at `sample_rate`, the first being sample

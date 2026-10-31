@@ -12,7 +12,7 @@ formats may still change.
 
 Local LLM inference in pure Rust: Gemma 4 (text, images, video, audio), Qwen 3.5 / 3.6 / 3.8
 (text, images, video), Gemma 3 and Qwen 3 today, more model families as they come; also
-embeddings, Stable Diffusion, FLUX.1 Kontext image editing, Whisper speech to text and Orpheus text to speech. No BLAS, no ML framework: weights are read straight out
+embeddings, Stable Diffusion, FLUX.1 Kontext and Qwen-Image-Edit image editing, Whisper speech to text and Orpheus text to speech. No BLAS, no ML framework: weights are read straight out
 of the safetensors files (HuggingFace checkpoints or MLX 4-bit ones) and every operation
 (matmuls, attention, norms, RoPE, sampling) is implemented here, with hand-written SIMD kernels
 (NEON, AVX2, wasm simd128) and its own thread pool. The CPU path runs everywhere; GPUs (Metal,
@@ -77,6 +77,9 @@ optional.
 | black-forest-labs/FLUX.1-Kontext-dev (ungated copy: unsloth/FLUX.1-Kontext-dev) | 12B + T5-XXL 4.7B + CLIP-L | 23.8 GB + 9.5 GB | instruction-based image editing (and text to image); matches diffusers' FluxKontextPipeline (transformer blocks 3e-6, 55 dB end to end on a Q4_0 GGUF; see [FLUX.1 Kontext](#flux1-kontext-image-editing-from-instructions-and-flux1-text-to-image)); FLUX.1 [dev] Non-Commercial License |
 | QuantStack/FLUX.1-Kontext-dev-GGUF | 12B | 4.0 GB (Q2_K) - 12.7 GB (Q8_0) | the same with a GGUF transformer (any block format, zero-copy); T5 / CLIP / VAE from unsloth/FLUX.1-Kontext-dev |
 | city96/FLUX.1-schnell-gguf, city96/FLUX.1-dev-gguf | 12B | 6.8 GB (Q4_0) | text to image (schnell: 4 steps, Apache 2.0); schnell Q4_0 matches diffusers at 61.6 dB |
+| Qwen/Qwen-Image-Edit-2511 (also -2509, -Edit) | 20B MMDiT + Qwen2.5-VL-7B (8.3B) + VAE | 41 + 16.6 + 0.25 GB | instruction-based image editing with one or more images; matches diffusers' QwenImageEditPlusPipeline (68.5 dB end to end on the CPU; see [Qwen-Image-Edit](#qwen-image-edit-image-editing-from-instructions-and-qwen-image-text-to-image)); Lightning LoRAs (4 / 8 steps), GGUF transformers (unsloth, QuantStack); Apache 2.0 |
+| Qwen/Qwen-Image, Qwen/Qwen-Image-2512 | same | same | text to image with the same transformer code (2512 tested from unsloth's Q4_0 GGUF + Lightning) |
+| Qwen/Qwen2.5-VL-3B-Instruct, -7B-Instruct | 3.8B / 8.3B | 7.5 / 16.6 GB | text and images (no video yet); matches transformers float32 (logits max diff 1.1e-4, same greedy answer; see [Qwen2.5-VL](#qwen25-vl)); also the conditioning encoder `oxinfer::qwen_vl` |
 | city96/t5-v1_1-xxl-encoder-gguf | 4.7B | 2.9 GB (Q4_K_M) - 5.1 GB (Q8_0) | FLUX's T5 encoder as GGUF (`--text-encoder`) |
 | anemll/* (ANEMLL Core ML: Qwen3, Qwen2.5, Gemma 3, Llama 3.2, ...) | 0.27B-1.7B tested | 0.3-1.5 GB (LUT6) | Apple Neural Engine via Core ML; same tokens as ANEMLL's runtime (see [Core ML](#core-ml--apple-neural-engine)) |
 | openai/whisper-tiny, -base, -small, -medium (and `.en`) | 39M-769M | 0.15-3.1 GB (fp32) | speech to text; transcripts match transformers token for token (see [Speech to text](#speech-to-text-whisper)) |
@@ -1096,7 +1099,8 @@ them); the mask is binary (no feathering); InstructPix2Pix with `--strength` is 
 (diffusers has none: it always starts from noise); image guidance needs text guidance above 1, so
 the 4-step LCM-LoRA path has no image-guidance knob. Bigger instruction editors
 (Qwen-Image-Edit, FLUX.1 Kontext, Step1X-Edit, OmniGen2, BAGEL) need their own architectures;
-FLUX.1 Kontext has one, [below](#flux1-kontext-image-editing-from-instructions-and-flux1-text-to-image).
+FLUX.1 Kontext and Qwen-Image-Edit have one, [below](#flux1-kontext-image-editing-from-instructions-and-flux1-text-to-image)
+and [after it](#qwen-image-edit-image-editing-from-instructions-and-qwen-image-text-to-image).
 
 ## FLUX.1 Kontext: image editing from instructions (and FLUX.1 text to image)
 
@@ -1264,6 +1268,138 @@ FLUX, FLUX.1 Fill / Depth / Canny / Redux, FLUX image-to-image and inpainting pi
 BFL single-file safetensors (`flux1-kontext-dev.safetensors`; the GGUF files and the diffusers
 folder cover the same weights), the browser build (the weights exceed its 4 GB), and CUDA runs
 (compile-checked only).
+
+## Qwen-Image-Edit: image editing from instructions (and Qwen-Image text to image)
+
+Qwen-Image-Edit-2511 (and -2509, and the original Qwen-Image-Edit) edits images the way an
+instruction says, combining several input images; Qwen-Image / Qwen-Image-2512 generate from text
+with the same transformer. `src/qwen_image/` follows diffusers' `QwenImageEditPlusPipeline`,
+`QwenImageEditPipeline` and `QwenImagePipeline`; the pipeline kind comes from `model_index.json`.
+
+```sh
+# full quality: 40 steps, true CFG 4 with a " " negative prompt (Qwen's recommended settings)
+./target/release/oxinfer --model Qwen/Qwen-Image-Edit-2511 --mmap --init-image fox.png \
+    -p "Add a red knitted scarf around the fox's neck." -o scarf.png
+# 4 steps with the Lightning LoRA (its steps, scheduler and guidance are picked from the file name)
+./target/release/oxinfer --model Qwen/Qwen-Image-Edit-2511 --mmap --init-image fox.png \
+    --lora lightx2v/Qwen-Image-Edit-2511-Lightning/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors \
+    -p "Make it winter: snow on the ground, the bench and the branches." -o winter.png
+# several images ("Picture 1", "Picture 2" in the instruction), a 12 GB GGUF transformer
+./target/release/oxinfer --model Qwen/Qwen-Image-Edit-2511 --mmap \
+    --transformer unsloth/Qwen-Image-Edit-2511-GGUF/qwen-image-edit-2511-Q4_0.gguf \
+    --init-image fox.png --init-image shop.png \
+    -p "The fox from Picture 1 sits on the sidewalk in front of the bookshop from Picture 2." -o both.png
+# text to image (a Qwen-Image-2512 folder; fetching the repo id downloads its bf16 transformer too)
+./target/release/oxinfer --model Qwen/Qwen-Image-2512 --mmap \
+    --transformer unsloth/Qwen-Image-2512-GGUF/qwen-image-2512-Q4_0.gguf \
+    --lora lightx2v/Qwen-Image-2512-Lightning/Qwen-Image-2512-Lightning-4steps-V1.0-bf16.safetensors \
+    -p "a cozy bookshop on a rainy street at night, a sign that reads OXINFER BOOKS" -o shop.png
+```
+
+| Flag | Meaning |
+|---|---|
+| `--init-image FILE` | image to edit (repeatable: Edit-2509 / 2511 take several; the output size follows the last one) |
+| `--steps N`, `--guidance F`, `--negative TEXT` | 40, true CFG 4, `" "` (with a Lightning LoRA: its 4 / 8 steps, CFG 1) |
+| `--size WxH` | output size (default: the input's aspect ratio at about 1024x1024, multiples of 16) |
+| `--lora FILE[:SCALE]` | LoRA files (lightx2v Lightning, kohya-style or PEFT keys) |
+| `--transformer FILE` | the transformer from a GGUF file (unsloth / QuantStack conversions; BF16 outer layers kept) |
+| `--quant q8\|q4` | transformer and text-encoder precision (the text encoder stays Q8 with `q4`) |
+| `--mmap`, `--stream` | map the weights; stream the transformer's 60 blocks from storage (`--cache-budget-gb`) |
+
+What runs: the instruction goes through the pipeline's chat template with Qwen2.5-VL-7B
+(`crate::qwen_vl`, below): a system turn, `Picture N: <|vision_start|>...<|vision_end|>` per input
+image (resized to ~384x384 with Pillow's Lanczos, then the Qwen2-VL processor), the instruction;
+the last hidden states minus the template's first 64 tokens condition the transformer. The input
+images are also resized to ~1024x1024 and VAE-encoded (the Wan-style causal 3D VAE, run on one
+frame, latents normalized by its per-channel mean / std) into 2x2 patches that follow the noisy
+target's as extra tokens. The 60-block MMDiT (20B) keeps text and image streams with their own
+AdaLN modulation (reference-image tokens modulated at timestep 0, Edit-2511's `zero_cond_t`), joint
+attention with per-head RMSNorm and the 3-axis MSRoPE (frame, row, column centred on each image,
+text after the largest image). Flow matching with Euler steps and the resolution-dependent shift
+(`crate::flux::sched`), true CFG with the norm-preserving rescale of the combined velocity. The
+Lightning LoRA uses its distillation's fixed shift of 3.
+
+Components load when first needed and the 16 GB text encoder is dropped after encoding (the
+library keeps it with `keep_text_encoder`). A LoRA is merged into the weights when they are
+quantized at load anyway (`--quant`), and applied at run time otherwise (bf16 weights borrowed from
+the mapped checkpoint, GGUF blocks), as two small extra matmuls, so no 40 GB copy is made. On Metal
+the text encoder runs with exact (f32) matmuls (its hidden states have outlier channels near 200,
+which the half-precision matrix units round by 1%), and the transformer's attention stays f32
+(its logits run into the thousands); the transformer's matmuls use the matrix units.
+
+**Agreement** with diffusers 0.42 / transformers 5.20 (`tools/ref_qwen_image.py`: same input image,
+prompt and initial noise; bf16 weights on both sides with every reference matmul in f32;
+Edit-2511, a 512x512 fox photo, "make it winter", 512x512 output with 4096 reference tokens):
+
+| oxinfer | prompt embeddings | first velocity | final latents | image PSNR |
+|---|---|---|---|---|
+| bf16, CPU, 2 steps, true CFG 4 | 4.1e-4 | 1.5e-4 | 1.7e-4 | 68.5 dB |
+| bf16, Metal (matrix units), 2 steps, CFG 4 | 1.1e-2 (before the exact text encoder) | 2.8e-3 | 3.1e-3 | 55.4 dB |
+| bf16 + Lightning LoRA, CPU, 4 steps | 4.1e-4 | 1.8e-3 | 7.6e-3 | 45.7 dB |
+| bf16 + Lightning, Metal with `OXINFER_METAL_MMA=0` | 4.4e-4 | 1.7e-3 | 7.9e-3 | 45.7 dB |
+| bf16 + Lightning, Metal (default) | 4.4e-4 | 7.3e-3 | 8.3e-2 | 28.9 dB |
+| `--quant q8` + Lightning, Metal | 1.7e-2 | 0.16 | 0.38 | 16.9 dB |
+| GGUF Q4_0 (unsloth) + Lightning, Metal | 4.4e-4 | 0.14 | 0.24 | 20.4 dB |
+
+(Relative L2 errors.) The VAE encoder matches to 1.2e-6. The four large Lightning steps amplify
+any difference, and the network is sensitive to weight noise: Q8 blocks (0.55% relative error per
+weight matrix) move the first velocity by 16% (the image-input projection alone by 3.6%), so
+quantized runs give a visibly equivalent edit with different fine detail rather than the same
+pixels; the same holds for GGUF files. The text encoder at Q4 moves the conditioning by 24%, so
+`--quant q4` keeps it at Q8. diffusers 0.42 calls the text encoder without `mm_token_type_ids`, and
+transformers 5 then gives the image tokens plain 1D positions; the reference script passes them
+(M-RoPE, as the model was trained, and as oxinfer does).
+
+**Speed and memory** (M5 Max, 1024x1024 output from a 512x512 photo: 4096 target + 4096 reference
++ ~210 text tokens per pass; Lightning: 4 passes, full quality: 80):
+
+| weights | device | per transformer pass | Lightning edit (total) | 40 steps + CFG | peak memory (footprint) |
+|---|---|---|---|---|---|
+| bf16 (`--mmap`, 41 GB mapped) | Metal | 18 s | 84 s | 23 min (17 s / pass) | 10 GB |
+| `--quant q8` | Metal | 16 s | 89 s | | 34 GB |
+| `--quant q4` | Metal | 17 s | 89 s | | 22 GB |
+| GGUF Q4_0 (12 GB, `--mmap`) | Metal | 18 s | 84 s | | 11 GB |
+| GGUF Q4_0, `--stream --cache-budget-gb 4`, 512x512 | Metal | 13 s | 59 s | | 9.5 GB |
+| bf16, 512x512 output (5300 tokens) | CPU, 18 threads | 185 s | 13 min | | |
+
+The text encoder takes 1-2 s, the VAE 3 s to encode and 5 s to decode at 1024x1024; two input
+images double the reference tokens (37 s per pass). Qwen-Image-2512 text to image (GGUF Q4_0 +
+Lightning, 1024x1024): 58 s, 9.4 GB.
+
+**Sample edits** (Edit-2511 bf16 + Lightning 4 steps, from a 512x512 fox photo and a bookshop that
+Qwen-Image-2512 generated): "Make it winter" covers the ground, bench and branches in snow with
+falling flakes; "Add a red knitted scarf around the fox's neck" adds the scarf and keeps the rest of
+the photo; "Replace the text on the large shop sign with 'QWEN EDIT'" rewrites the gilded sign in
+the same lettering and leaves the hanging sign and the window alone; with both images, "The fox
+from Picture 1 sits on the sidewalk in front of the bookshop from Picture 2" places the fox there.
+
+**Library and C API.**
+
+```rust
+use oxinfer::qwen_image::{Options, Params, Pipeline};
+let mut pipe = Pipeline::load("Qwen/Qwen-Image-Edit-2511", Options { mmap: true, ..Default::default() })?;
+let img = oxinfer::media::Media::new().load_image("fox.png".as_ref())?;
+let (out, timings) = pipe.edit(&[img], &Params::new("make it winter"), &mut |i, n| eprintln!("{i}/{n}"))?;
+// out: width, height, rgb; pipe.generate(&params, ..) for text to image; Params::lightning(prompt, 4)
+// with a Lightning LoRA in Options::loras; edit_pictures(&[oxideav Picture]) with `oxideav`
+```
+
+The C API has `oxi_qwen_image_load` (`key=value` options: quant, text_quant, mmap, transformer,
+lora, keep_text_encoder, stream, device), `oxi_qwen_image_edit` (a JSON request: prompt, images,
+negative, true_cfg, steps, seed, width, height, lightning), `oxi_qwen_image_edit_rgb` (pixels),
+`oxi_qwen_image_cancel` and `oxi_qwen_image_free` (see `include/oxinfer.h`).
+
+**Weights and licenses.** Qwen/Qwen-Image-Edit-2511, -2509, -Edit, Qwen/Qwen-Image, -2512:
+Apache 2.0, ungated (57 GB each in bf16: 41 GB transformer, 16 GB text encoder, 0.25 GB VAE; the
+text encoder and VAE files are identical across them). unsloth/Qwen-Image-Edit-2511-GGUF and
+unsloth/Qwen-Image-2512-GGUF (Q2_K 7.7 GB to Q8_0 22 GB, BF16 41 GB), lightx2v/Qwen-Image-Edit-2511-Lightning
+and lightx2v/Qwen-Image-2512-Lightning (0.85 GB LoRAs): Apache 2.0.
+
+Not supported: the layered (`Qwen-Image-Layered`) and ControlNet / inpainting pipelines, the fp8
+"scaled" single-file checkpoints (`*_fp8_e4m3fn_scaled*.safetensors`; the GGUF files and the
+diffusers folder cover the same weights), batches, the browser build (the weights exceed its 4 GB),
+CUDA runs (compile-checked only). The transformer's activations go between CPU and GPU at every
+matmul (about 1 s per pass at 1024x1024), the next lever for speed.
 
 ## Janus-Pro: text to image and image understanding
 
@@ -1441,6 +1577,35 @@ column has the linear layers and attention on the GPU):
 | Qwen3.5-9B / Qwen3.8-27B (27 layers, hidden 1152), 1024x1024 image | 6.5 s | 1.6 s |
 | Gemma 4 E2B, 1024x1024 image at 1120 soft tokens (9801 patches) | 12.4 s | 2.3 s |
 | Gemma 4 E2B, 32 video frames of 480x320 (1920 soft tokens) | 8.0 s | 2.5 s |
+
+### Qwen2.5-VL
+
+Qwen/Qwen2.5-VL-3B-Instruct, -7B-Instruct (and the other Qwen2.5-VL / Qwen2-VL-style checkpoints,
+`model_type` `qwen2_5_vl`) run through the normal engine, with images:
+
+```sh
+./target/release/oxinfer --model Qwen/Qwen2.5-VL-3B-Instruct --image fox.png -p "Describe this image."
+```
+
+The language model is the Qwen2 transformer (biased query / key / value projections, no query /
+key norms, contiguous M-RoPE sections 16 / 24 / 24 over time, height and width) on the Qwen code
+path; the vision tower (`src/qwen25_vision.rs`) has 14-pixel patches, axial 2D RoPE, RMSNorm
+blocks with a SwiGLU MLP, window attention over 8x8-patch windows in all blocks but
+`fullatt_block_indexes` (whole-image attention), and the 2x2 patch merger. The chat format is the
+checkpoint's (default system prompt "You are a helpful assistant."). Against transformers 5.20 in
+float32 on the 3B model with a 512x512 image (324 image tokens): pixels identical, image features
+1.0e-5 relative, last-position logits max diff 1.1e-4 (KL 1.3e-9) on the CPU; on Metal (half-
+precision matrix units) 1.9e-3 and KL 1.5e-7; greedy answers identical. Video input and single-
+token GPU decoding (biased projections) are not supported for these checkpoints yet (decoding runs
+on the CPU: 12 tok/s for the 3B in bf16).
+
+`oxinfer::qwen_vl::QwenVl` is the same model as a conditioning encoder for diffusion pipelines
+(Qwen-Image uses it; Step1X-Edit and OmniGen2 use Qwen2.5-VL-7B / 3B the same way):
+`QwenVl::load(dir, &QwenVlOptions { quant, mmap, tokenizer_dir, processor_dir, vision })`,
+`encode_image(rgb, w, h, max_pixels) -> VlImage` (embeddings, merged grid, `placeholder()` text),
+and `hidden_states(text, &images, &layers) -> Hidden` with the final-normed states (transformers'
+`hidden_states[-1]`) and the residual stream after any requested layers (`hidden_states[l + 1]`),
+M-RoPE positions for the images included. `examples/qwen_vl_hidden.rs` dumps them.
 
 ## Speech to text (Whisper)
 
