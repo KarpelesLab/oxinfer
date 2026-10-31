@@ -203,6 +203,44 @@ impl Vae {
         })
     }
 
+    /// Loads the autoencoder in Black Forest Labs' original layout (`ae.safetensors` of FLUX.1,
+    /// BAGEL, Step1X-Edit: `encoder.down.N.block.M`, `mid.attn_1`, ...), with FLUX.1's latent
+    /// normalization (scale 0.3611, shift 0.1159). Without `encoder` only the decoder is read.
+    pub fn load_bfl(path: &Path, encoder: bool) -> Result<Self> {
+        let t = Tensors::open_renamed(path, bfl_to_diffusers)?;
+        let levels = t
+            .names()
+            .filter_map(|n| n.strip_prefix("decoder.up.")?.split('.').next()?.parse::<usize>().ok())
+            .max()
+            .map_or(0, |m| m + 1);
+        if levels == 0 || !t.has("decoder.conv_in.weight") {
+            bail!("{}: not a BFL autoencoder (no decoder.up.*)", path.display());
+        }
+        // The decoder's levels are stored lowest resolution first (`up.0`); diffusers counts
+        // from the top. Rename again now that the depth is known.
+        let t = Tensors::open_renamed(path, |n| {
+            let n = bfl_to_diffusers(n)?;
+            match n.strip_prefix("decoder.up_blocks.") {
+                Some(rest) => {
+                    let (i, tail) = rest.split_once('.')?;
+                    Some(format!("decoder.up_blocks.{}.{tail}", levels - 1 - i.parse::<usize>().ok()?))
+                }
+                None => Some(n),
+            }
+        })?;
+        let (scaling_factor, shift_factor) = (0.3611, 0.1159);
+        let decoder = VaeDecoder::from_tensors(&t, scaling_factor, shift_factor)?;
+        let encoder = if encoder { Some(VaeEncoder::load(&t)?) } else { None };
+        Ok(Self {
+            scaling_factor,
+            shift_factor,
+            latent_channels: decoder.latent_channels,
+            factor: 1 << (levels - 1),
+            encoder,
+            decoder,
+        })
+    }
+
     /// Normalized latents (`(mean - shift) * scale`, `[h/8 * w/8, c]`) of `x` (`[h*w, 3]` RGB in
     /// [-1, 1]); returns `(latents, lh, lw)`.
     pub fn encode(&self, x: &[f32], h: usize, w: usize) -> Result<(Vec<f32>, usize, usize)> {
@@ -223,6 +261,46 @@ impl Vae {
     pub fn decode(&self, z: &[f32], lh: usize, lw: usize) -> (Vec<f32>, usize, usize) {
         self.decoder.decode(z, lh, lw)
     }
+}
+
+/// A BFL autoencoder tensor name in diffusers' `AutoencoderKL` naming (decoder levels keep the
+/// BFL index; [`Vae::load_bfl`] reverses them).
+fn bfl_to_diffusers(n: &str) -> Option<String> {
+    let (part, rest) = n.split_once('.')?;
+    if part != "encoder" && part != "decoder" {
+        return None;
+    }
+    let block = |s: &str| {
+        s.replace("nin_shortcut", "conv_shortcut")
+            .replacen("block.", "resnets.", 1)
+            .replacen("downsample.", "downsamplers.0.", 1)
+            .replacen("upsample.", "upsamplers.0.", 1)
+    };
+    let mapped = if let Some(r) = rest.strip_prefix("down.") {
+        format!("down_blocks.{}", block(r))
+    } else if let Some(r) = rest.strip_prefix("up.") {
+        format!("up_blocks.{}", block(r))
+    } else if let Some(r) = rest.strip_prefix("mid.block_1.") {
+        format!("mid_block.resnets.0.{r}")
+    } else if let Some(r) = rest.strip_prefix("mid.block_2.") {
+        format!("mid_block.resnets.1.{r}")
+    } else if let Some(r) = rest.strip_prefix("mid.attn_1.") {
+        let (l, tail) = r.split_once('.')?;
+        let l = match l {
+            "norm" => "group_norm",
+            "q" => "to_q",
+            "k" => "to_k",
+            "v" => "to_v",
+            "proj_out" => "to_out.0",
+            _ => return None,
+        };
+        format!("mid_block.attentions.0.{l}.{tail}")
+    } else if let Some(r) = rest.strip_prefix("norm_out.") {
+        format!("conv_norm_out.{r}")
+    } else {
+        rest.to_string()
+    };
+    Some(format!("{part}.{mapped}"))
 }
 
 /// RGB8 to `[h*w, 3]` floats in [-1, 1] (diffusers `VaeImageProcessor`: `x / 255 * 2 - 1`).
@@ -295,6 +373,32 @@ pub fn hwc_to_chw(v: &[f32], c: usize, h: usize, w: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bfl_names() {
+        let m = |n: &str| bfl_to_diffusers(n).unwrap();
+        assert_eq!(
+            m("encoder.down.1.block.0.nin_shortcut.weight"),
+            "encoder.down_blocks.1.resnets.0.conv_shortcut.weight"
+        );
+        assert_eq!(
+            m("encoder.down.2.downsample.conv.bias"),
+            "encoder.down_blocks.2.downsamplers.0.conv.bias"
+        );
+        assert_eq!(
+            m("decoder.up.3.upsample.conv.weight"),
+            "decoder.up_blocks.3.upsamplers.0.conv.weight"
+        );
+        assert_eq!(m("decoder.mid.block_2.norm1.weight"), "decoder.mid_block.resnets.1.norm1.weight");
+        assert_eq!(
+            m("encoder.mid.attn_1.proj_out.weight"),
+            "encoder.mid_block.attentions.0.to_out.0.weight"
+        );
+        assert_eq!(m("decoder.mid.attn_1.norm.bias"), "decoder.mid_block.attentions.0.group_norm.bias");
+        assert_eq!(m("decoder.norm_out.weight"), "decoder.conv_norm_out.weight");
+        assert_eq!(m("encoder.conv_in.weight"), "encoder.conv_in.weight");
+        assert!(bfl_to_diffusers("vae2llm.weight").is_none());
+    }
 
     #[test]
     fn pack_roundtrip() {

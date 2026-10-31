@@ -59,6 +59,8 @@ pub mod timing {
 pub struct Tensors {
     st: SafeTensors,
     lora: Option<super::lora::Patches>,
+    /// Names the loaders ask for -> names stored in the file (checkpoints in another layout).
+    alias: Option<std::collections::HashMap<String, String>>,
 }
 
 impl Tensors {
@@ -67,7 +69,22 @@ impl Tensors {
         Ok(Self {
             st: SafeTensors::open(path, cfg!(target_arch = "wasm32"))?,
             lora: None,
+            alias: None,
         })
+    }
+
+    /// Opens a checkpoint stored under other names: `rename` maps each stored name to the name
+    /// the loaders use (None: keep it).
+    pub fn open_renamed(path: &Path, rename: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let mut t = Self::open(path)?;
+        let alias = t.st.names().filter_map(|n| rename(n).map(|a| (a, n.clone()))).collect();
+        t.alias = Some(alias);
+        Ok(t)
+    }
+
+    /// The stored name of `name`.
+    fn real<'n>(&'n self, name: &'n str) -> &'n str {
+        self.alias.as_ref().and_then(|a| a.get(name)).map_or(name, |s| s.as_str())
     }
 
     /// Merges these LoRA updates into the weights read from now on.
@@ -84,17 +101,22 @@ impl Tensors {
     }
 
     pub fn has(&self, name: &str) -> bool {
-        self.st.info(name).is_some()
+        self.st.info(self.real(name)).is_some()
     }
 
     pub fn shape(&self, name: &str) -> Result<Vec<usize>> {
-        Ok(self.st.info(name).with_context(|| format!("missing tensor {name}"))?.shape.clone())
+        Ok(self
+            .st
+            .info(self.real(name))
+            .with_context(|| format!("missing tensor {name}"))?
+            .shape
+            .clone())
     }
 
     /// A tensor as f32, whatever its stored float type, with any LoRA updates merged in.
     pub fn f32(&self, name: &str) -> Result<Vec<f32>> {
-        let info = self.st.info(name).with_context(|| format!("missing tensor {name}"))?;
-        let b = self.st.bytes_cow(name)?;
+        let info = self.st.info(self.real(name)).with_context(|| format!("missing tensor {name}"))?;
+        let b = self.st.bytes_cow(self.real(name))?;
         let mut v: Vec<f32> = match info.dtype.as_str() {
             "F16" => b.as_chunks::<2>().0.iter().map(|c| half::f16::from_le_bytes(*c).to_f32()).collect(),
             "BF16" => b
@@ -114,13 +136,13 @@ impl Tensors {
 
     /// Raw fp16 bits when the tensor is stored as F16 (lookup tables keep them exact).
     pub fn f16_bits(&self, name: &str) -> Result<Option<Vec<u16>>> {
-        let info = self.st.info(name).with_context(|| format!("missing tensor {name}"))?;
+        let info = self.st.info(self.real(name)).with_context(|| format!("missing tensor {name}"))?;
         if info.dtype != "F16" || self.lora.as_ref().is_some_and(|p| p.targets(name)) {
             return Ok(None);
         }
         Ok(Some(
             self.st
-                .bytes_cow(name)?
+                .bytes_cow(self.real(name))?
                 .as_chunks::<2>()
                 .0
                 .iter()

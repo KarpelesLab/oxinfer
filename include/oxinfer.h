@@ -630,6 +630,64 @@ int oxi_flux_edit_rgb(OxiFlux *f, const char *prompt, const uint8_t *rgb, int wi
 int oxi_flux_edit_file(OxiFlux *f, const char *prompt, const char *path, const char *options_json, oxi_image_fn on_image,
                        oxi_step_fn on_step, void *user);
 
+/* ---- BAGEL ------------------------------------------------------------------------------- *
+ * ByteDance-Seed/BAGEL-7B-MoT (over oxinfer::bagel): one unified model for instruction-based
+ * image editing, text to image and image understanding. Same threading rules as engines: one
+ * call at a time, oxi_bagel_cancel() from any thread. */
+
+typedef struct OxiBagel OxiBagel;
+
+/* Loads a checkpoint (folder or repo id). `options`: `key=value` lines or `;`-separated pairs,
+ * NULL for the defaults:
+ *   quant=bf16|q8|q4   language model / SigLIP precision (default bf16)
+ *   mmap=0|1           map the weights instead of reading them
+ *   device=auto|cpu|metal|cuda|vulkan
+ *   cache_dir=PATH
+ *   generation=0|1     load the generation expert and VAE (default 1; needed for images)
+ *   understanding=0|1  load SigLIP (default 1; needed for image inputs)
+ *   text=0|1           load the LM head (default 1; needed for answers and thinking) */
+OxiBagel *oxi_bagel_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
+
+/* Frees a model (NULL is ignored); no other call on it may be running. */
+void oxi_bagel_free(OxiBagel *b);
+
+/* Stops the running call (any thread); it then fails with "cancelled". */
+void oxi_bagel_cancel(const OxiBagel *b);
+
+/* Image `options_json` (NULL or {} for the defaults, every key optional):
+ *   {"steps": 50, "timestep_shift": 3, "cfg_text_scale": 4, "cfg_img_scale": 2 (editing) / 1,
+ *    "cfg_interval": [0, 1] (editing) / [0.4, 1], "cfg_renorm_min": 0,
+ *    "cfg_renorm_type": "text_channel" (editing) / "global" | "channel",
+ *    "width": 1024, "height": 1024 (text to image), "max_image_size": 1024,
+ *    "min_image_size": 512 (input resize), "seed": 42, "think": false,
+ *    "max_think_tokens": 1000, "temperature": 0}
+ * Each returns 1, or -1 (error, or cancelled). The image goes to `on_image` (index 0). */
+int oxi_bagel_generate(OxiBagel *b, const char *prompt, const char *options_json, oxi_image_fn on_image, oxi_step_fn on_step,
+                       void *user);
+
+/* Edits a tightly packed RGB8 image following the instruction `prompt`. */
+int oxi_bagel_edit_rgb(OxiBagel *b, const char *prompt, const uint8_t *rgb, int width, int height, const char *options_json,
+                       oxi_image_fn on_image, oxi_step_fn on_step, void *user);
+
+/* oxi_bagel_edit_rgb() with an image file (needs the `media` feature). */
+int oxi_bagel_edit_file(OxiBagel *b, const char *prompt, const char *path, const char *options_json, oxi_image_fn on_image,
+                        oxi_step_fn on_step, void *user);
+
+/* The plan written by the last image call with "think": true (free with oxi_string_free), or
+ * NULL. */
+char *oxi_bagel_last_thinking(const OxiBagel *b);
+
+/* Answers `question` about an RGB8 image (NULL `rgb`: text only), streaming to `cb`.
+ * `options_json`: {"max_tokens": 1000, "temperature": 0 (greedy), "top_k": 0, "top_p": 1,
+ * "seed": 42, "think": false, "max_image_size": 1024, "min_image_size": 512}. Returns the
+ * answer (free with oxi_string_free), or NULL on error. */
+char *oxi_bagel_understand_rgb(OxiBagel *b, const char *question, const uint8_t *rgb, int width, int height,
+                               const char *options_json, oxi_token_fn cb, void *user);
+
+/* oxi_bagel_understand_rgb() with an image file (NULL `path`: text only). */
+char *oxi_bagel_understand_file(OxiBagel *b, const char *question, const char *path, const char *options_json, oxi_token_fn cb,
+                                void *user);
+
 #ifdef __cplusplus
 }
 #endif

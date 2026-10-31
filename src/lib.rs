@@ -16,6 +16,7 @@ pub mod audio;
 #[cfg(feature = "oxideav")]
 pub mod av;
 mod b64;
+pub mod bagel;
 pub mod bert;
 #[cfg(feature = "capi")]
 pub mod capi;

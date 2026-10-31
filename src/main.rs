@@ -12,6 +12,7 @@ use tokenizers::Tokenizer;
 
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
 mod anemll_cli;
+mod bagel_cli;
 mod flux_cli;
 mod intervene_cli;
 mod janus_cli;
@@ -145,6 +146,8 @@ struct Args {
     iv: intervene_cli::IvArgs,
     // FLUX.1 / Kontext.
     flux: flux_cli::FluxArgs,
+    // BAGEL.
+    bagel: bagel_cli::BagelArgs,
 }
 
 fn usage() -> ! {
@@ -328,6 +331,7 @@ fn usage() -> ! {
     );
     eprintln!("\n{}", intervene_cli::USAGE);
     eprintln!("\n{}", flux_cli::USAGE);
+    eprintln!("{}", bagel_cli::USAGE);
     std::process::exit(2)
 }
 
@@ -444,6 +448,7 @@ fn parse_args() -> Result<Args> {
         max_tokens_set: None,
         iv: Default::default(),
         flux: Default::default(),
+        bagel: Default::default(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -629,6 +634,7 @@ fn parse_args() -> Result<Args> {
             "-h" | "--help" => usage(),
             _ if a.iv.parse(&k, &mut val)? => {}
             _ if a.flux.parse(&k, &mut val)? => {}
+            _ if a.bagel.parse(&k, &mut val)? => {}
             _ => {
                 eprintln!("unknown argument {k}");
                 usage()
@@ -978,6 +984,9 @@ fn run(mut args: Args) -> Result<()> {
     }
     if oxinfer::qwen_image::is_qwen_image(&args.model) {
         return qwen_image_cli::run(&args);
+    }
+    if oxinfer::bagel::is_bagel(&args.model) {
+        return bagel_cli::run(&args);
     }
     if oxinfer::sd::is_diffusers(&args.model) {
         return run_image(&args);

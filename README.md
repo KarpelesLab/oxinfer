@@ -12,7 +12,7 @@ formats may still change.
 
 Local LLM inference in pure Rust: Gemma 4 (text, images, video, audio), Qwen 3.5 / 3.6 / 3.8
 (text, images, video), Gemma 3 and Qwen 3 today, more model families as they come; also
-embeddings, Stable Diffusion, FLUX.1 Kontext, Qwen-Image-Edit and OmniGen2 image editing, Whisper speech to text and Orpheus text to speech. No BLAS, no ML framework: weights are read straight out
+embeddings, Stable Diffusion, FLUX.1 Kontext, Qwen-Image-Edit, OmniGen2 and BAGEL image editing, Whisper speech to text and Orpheus text to speech. No BLAS, no ML framework: weights are read straight out
 of the safetensors files (HuggingFace checkpoints or MLX 4-bit ones) and every operation
 (matmuls, attention, norms, RoPE, sampling) is implemented here, with hand-written SIMD kernels
 (NEON, AVX2, wasm simd128) and its own thread pool. The CPU path runs everywhere; GPUs (Metal,
@@ -80,6 +80,7 @@ optional.
 | Qwen/Qwen-Image-Edit-2511 (also -2509, -Edit) | 20B MMDiT + Qwen2.5-VL-7B (8.3B) + VAE | 41 + 16.6 + 0.25 GB | instruction-based image editing with one or more images; matches diffusers' QwenImageEditPlusPipeline (68.5 dB end to end on the CPU; see [Qwen-Image-Edit](#qwen-image-edit-image-editing-from-instructions-and-qwen-image-text-to-image)); Lightning LoRAs (4 / 8 steps), GGUF transformers (unsloth, QuantStack); Apache 2.0 |
 | Qwen/Qwen-Image, Qwen/Qwen-Image-2512 | same | same | text to image with the same transformer code (2512 tested from unsloth's Q4_0 GGUF + Lightning) |
 | OmniGen2/OmniGen2 | 4.0B DiT + Qwen2.5-VL-3B + FLUX VAE | 15.9 + 15.0 + 0.3 GB (float32) | instruction-based image editing, in-context generation with up to 5 images, text to image; matches the official OmniGen2Pipeline (60 dB end to end with the same bf16 weights; see [OmniGen2](#omnigen2-image-editing-in-context-generation-and-text-to-image)); 2.3 GB of transformer weights at `--quant q4`; Apache 2.0 |
+| ByteDance-Seed/BAGEL-7B-MoT | 14B (7B x 2 experts) + SigLIP 0.4B + VAE | 29.2 GB + 0.34 GB | one unified model: instruction-based image editing, text to image, image understanding, optional thinking; matches the official inference code (truncated f32 runs 1e-5; 41-44 dB end to end vs bf16; see [BAGEL](#bagel-image-editing-text-to-image-and-image-understanding-in-one-model)); Apache 2.0 |
 | Qwen/Qwen2.5-VL-3B-Instruct, -7B-Instruct | 3.8B / 8.3B | 7.5 / 16.6 GB | text and images (no video yet); matches transformers float32 (logits max diff 1.1e-4, same greedy answer; see [Qwen2.5-VL](#qwen25-vl)); also the conditioning encoder `oxinfer::qwen_vl` |
 | city96/t5-v1_1-xxl-encoder-gguf | 4.7B | 2.9 GB (Q4_K_M) - 5.1 GB (Q8_0) | FLUX's T5 encoder as GGUF (`--text-encoder`) |
 | anemll/* (ANEMLL Core ML: Qwen3, Qwen2.5, Gemma 3, Llama 3.2, ...) | 0.27B-1.7B tested | 0.3-1.5 GB (LUT6) | Apple Neural Engine via Core ML; same tokens as ANEMLL's runtime (see [Core ML](#core-ml--apple-neural-engine)) |
@@ -1100,8 +1101,9 @@ them); the mask is binary (no feathering); InstructPix2Pix with `--strength` is 
 (diffusers has none: it always starts from noise); image guidance needs text guidance above 1, so
 the 4-step LCM-LoRA path has no image-guidance knob. Bigger instruction editors
 (Qwen-Image-Edit, FLUX.1 Kontext, Step1X-Edit, OmniGen2, BAGEL) need their own architectures;
-FLUX.1 Kontext and Qwen-Image-Edit have one, [below](#flux1-kontext-image-editing-from-instructions-and-flux1-text-to-image)
-and [after it](#qwen-image-edit-image-editing-from-instructions-and-qwen-image-text-to-image).
+FLUX.1 Kontext, Qwen-Image-Edit and BAGEL have one, [below](#flux1-kontext-image-editing-from-instructions-and-flux1-text-to-image),
+[after it](#qwen-image-edit-image-editing-from-instructions-and-qwen-image-text-to-image) and
+[further on](#bagel-image-editing-text-to-image-and-image-understanding-in-one-model).
 
 ## FLUX.1 Kontext: image editing from instructions (and FLUX.1 text to image)
 
@@ -1201,7 +1203,7 @@ same scheduler):
 
 | Module | What | API |
 |---|---|---|
-| `flux::vae` | the 16-channel FLUX `AutoencoderKL`: encoder (new; diffusers' asymmetric-padding downsampler) and `sd::vae::VaeDecoder`, normalization, 2x2 packing | `Vae::load(dir, encoder)`, `encode(rgb, h, w) -> (latents, lh, lw)`, `decode(latents, lh, lw)`, `pack` / `unpack`, `rgb8_to_unit` / `unit_to_rgb8`, `chw_to_hwc` |
+| `flux::vae` | the 16-channel FLUX `AutoencoderKL`: encoder (new; diffusers' asymmetric-padding downsampler) and `sd::vae::VaeDecoder`, normalization, 2x2 packing | `Vae::load(dir, encoder)`, `Vae::load_bfl(ae.safetensors, encoder)` (BFL layout), `encode(rgb, h, w) -> (latents, lh, lw)`, `decode(latents, lh, lw)`, `pack` / `unpack`, `rgb8_to_unit` / `unit_to_rgb8`, `chw_to_hwc` |
 | `flux::sched` | `FlowMatchEulerDiscreteScheduler`: shift, dynamic shifting (exponential / linear), shift_terminal, inverted sigmas | `FlowMatchEuler::load(json)`, `calculate_shift`, `plan(base_sigmas, mu)`, `flux_plan(steps, seq)`, `step`, `scale_noise` |
 | `flux::rope` | rotary embeddings over n-axis token ids (FLUX's 16/56/56 split, any split) | `Rope::new(ids, axes, theta)`, `Rope::flux_ids`, `apply(x, heads)` |
 | `flux::transformer` | `DoubleBlock` / `SingleBlock` (load from diffusers or BFL names, forward), `FluxTransformer`, `timestep_proj`, `ln_mod` | `FluxTransformer::load(path, quant)`, `forward(img, n_img, txt, n_txt, pooled, t, guidance, rope)` |
@@ -1539,6 +1541,145 @@ Not supported: the TeaCache / TaylorSeer step caches and the DPM-Solver schedule
 LoRAs, sampling the VAE posterior (the mean is used), batches, `--save-quantized` for the padded
 transformer layers (quantization happens at each load, a few seconds), and the reflection / RL
 variants (OmniGen2-RL, EditScore).
+
+## BAGEL: image editing, text to image and image understanding in one model
+
+ByteDance's BAGEL-7B-MoT is a single unified model: it edits images from instructions, generates
+them from text, answers questions about them, and can write a plan ("thinking") before an image or
+an answer. `src/bagel/` follows the official inference code (`github.com/ByteDance-Seed/Bagel`:
+`InterleaveInferencer`, `modeling/bagel`); there is no diffusers pipeline. The model is picked
+from the folder (`llm_config.json` + `vit_config.json` + `ae.safetensors`).
+
+```sh
+# editing: --init-image is the picture, --prompt the instruction (29.5 GB download, bf16)
+./target/release/oxinfer --model ByteDance-Seed/BAGEL-7B-MoT --mmap --init-image dog.png \
+    -p "Put a red knitted hat on the dog" -o hat.png
+# ~4x cheaper: inputs resized to at most 512 pixels per side (the output follows the input's size)
+./target/release/oxinfer --model ByteDance-Seed/BAGEL-7B-MoT --mmap --max-size 512 --init-image dog.png \
+    -p "Turn this photo into a watercolor painting" -o watercolor.png
+# text to image, with a written plan first (printed)
+./target/release/oxinfer --model ByteDance-Seed/BAGEL-7B-MoT --mmap --think --size 512x512 \
+    -p "a car made of small cars" -o cars.png
+# image understanding: without -o the answer is text
+./target/release/oxinfer --model ByteDance-Seed/BAGEL-7B-MoT --mmap --init-image cat.png -p "What is in this image?"
+```
+
+| Flag | Meaning |
+|---|---|
+| `--init-image FILE` | with `-o`: the image to edit; without: the image to ask about (repeatable: the instruction follows all images) |
+| `--steps N` | timesteps (default 50: 49 model evaluations per guidance branch) |
+| `--cfg-text F`, `--cfg-img F` | text guidance (4) and image guidance (2 editing, 1 = off for text to image) |
+| `--cfg-interval LO,HI` | timesteps with guidance (0,1 editing; 0.4,1 text to image) |
+| `--cfg-renorm T`, `--cfg-renorm-min F` | CFG-renorm: `text_channel` (editing) / `global` / `channel`; lower bound 0 |
+| `--timestep-shift F` | 3 |
+| `--size WxH` | text-to-image size (default 1024x1024; at most 1024 per side) |
+| `--max-size N`, `--min-size N` | input resize bounds (1024 and 512, the reference's `ImageTransform(1024, 512, 16)`) |
+| `--think` | plan before the image, or reason before the answer (greedy, at most 1000 tokens) |
+| `--quant q8\|q4`, `--mmap` | weight precision (quantized at load); map the checkpoint |
+
+What runs: the language model is Qwen2.5-7B (with q/k RMSNorm added) as a Mixture-of-Transformers:
+every layer has an understanding expert (text and SigLIP tokens) and a generation expert (VAE
+latent tokens) with their own norms, projections and MLPs, meeting in one self-attention over the
+packed sequence. Each text is wrapped as `<|im_start|>...<|im_end|>` and goes through causally. Each
+input image is resized (sides multiples of 16, 512..1024), VAE-encoded with the FLUX autoencoder
+(`flux::vae`, BFL file layout; posterior mean), cut into 2x2 latent patches through `vae2llm` plus a
+timestep embedding of 0 and a 2-D sin-cos position embedding (generation expert), then read again
+by SigLIP so400m/14 at its own size up to 980 pixels (NaViT style: one token per patch, learned
+70x70 position table, 26 layers, connector MLP; understanding expert); every token of an image has
+one RoPE position and attends bidirectionally. The output image's noise latents go after the
+context at the next position and are denoised by rectified flow: `steps - 1` Euler steps over
+`t = 1 -> 0` shifted by `3t / (1 + 2t)`, the generation expert predicting the velocity through
+`llm2vae`. Guidance has two terms, evaluated as extra branches over shared KV caches (no copies):
+text (the context before the instruction) and image (the texts without the images, a separate
+small context); BAGEL's CFG-renorm caps the guided velocity's norm (per token on the text term for
+editing). The three branches of a step run as one batch through every matmul. Thinking and answers
+come from the understanding expert's LM head, decoding after `<|im_start|>`; the plan is then
+appended to the context as text before the image is generated.
+
+**Agreement** with the official code (the repository's modules with flash-attn replaced by SDPA, same inputs and initial noise; the VAE switched to its posterior mean
+as oxinfer encodes):
+
+| check | reference | oxinfer | relative error |
+|---|---|---|---|
+| SigLIP features, 512x512 cat (1369 patches) | float32, CPU | CPU | 1.6e-5 (connector output 1.3e-5) |
+| same | float32 | Metal (matrix units) | 9.3e-4 |
+| LM logits after an image question, 2 layers | float32 | CPU | 1.9e-6 (KL 8e-8) |
+| first denoising step, editing, 2 layers: conditional / text-free / image-free / guided velocity | float32 | CPU | 8.7e-6 / 7.9e-6 / 7.1e-7 / 2.5e-5 |
+| LM logits after an image question, full model | bf16 (CPU autocast) | CPU | 6.6e-2, KL 3.2e-4, same top 5, same 40 greedy tokens |
+| first step velocity, full model, editing (cond / guided) | bf16 (MPS) | CPU | 1.3e-2 / 3.0e-2 |
+| same | bf16 | Metal | 1.3e-2 / 3.1e-2 (Metal vs CPU: 8.9e-4 / 3.3e-3) |
+| same, `--quant q8` / `q4` | bf16 | Metal | 1.3e-2 / 3.9e-2 (vs oxinfer bf16: 2.8e-3 / 3.7e-2) |
+| edited image, 50 steps, cat 512x512 "Put sunglasses on the cat" | bf16 | Metal | 41.4 dB PSNR |
+| text to image, 512x512 fox | bf16 | Metal | 44.0 dB PSNR |
+
+The truncated float32 runs check the implementation (the f32 reference needs no 58 GB); the
+full-model numbers are bf16-activation (reference) against f32-activation (oxinfer) rounding, and
+the images still agree to 41-44 dB. Greedy thinking text follows the reference for its first ~30
+tokens and then picks another near-tie wording (different plan, different image). Quantized
+weights: q8 moves the first velocity by 0.28% against oxinfer's bf16 (the 1024-row matmuls run on
+dequantized weights, so activations are never rounded to int8 here), q4 by 3.7%.
+
+**Speed and memory** (M5 Max, machine shared with other jobs; 50 timesteps; an edit runs three
+branches per step):
+
+| task | weights | device | per branch pass | total | peak footprint |
+|---|---|---|---|---|---|
+| edit, 512x512 input (1024 latent + 2404 context tokens) | bf16 (`--mmap`) | Metal | 1.07 s | 2.9 min (147 passes) | 5.5 GB |
+| same | `--quant q8` | Metal | 0.99 s | 2.8 min | 20 GB |
+| same | `--quant q4` | Metal | 1.01 s | 2.8 min | 13 GB |
+| same | bf16 (`--mmap`) | CPU, 18 threads | 18 s | ~45 min | 3.1 GB |
+| same | `--quant q4` | CPU, 18 threads | 20 s | ~50 min | 11.6 GB |
+| edit, 1024x768 input (3072 latent + 6727 context tokens) | bf16 (`--mmap`) | Metal | 3.4-3.6 s | 9.3 min | 10.4 GB |
+| text to image, 512x512 | bf16 (`--mmap`) | Metal | 1.08 s | 1.7 min (90 passes) | 3.9 GB |
+| text to image, 1024x1024 | bf16 (`--mmap`) | Metal | 4.1 s | ~6 min (~90 passes) | 15.4 GB |
+
+The official code in PyTorch 2.15 on the same GPU (MPS, bf16) takes 98 s for the 512x512 edit and
+109 s for the 512x512 text to image. The context (VAE + SigLIP + text) takes 5-6 s at 512x512 and
+17-29 s at 1024x768 on Metal, 46 s at 512x512 on the CPU; the VAE decodes in 0.8 s (512) to 3 s (1024x768).
+A 100-token answer about a 512x512 image takes 11.7 s on Metal (bf16), 6.9 s with `--quant q4`,
+33 s on the CPU (single-token passes run on the CPU; about 10 tokens/s in bf16). Without `--mmap` the
+whole 29 GB checkpoint is read into memory first (quantizing then keeps both: 41 GB at q4), so
+`--mmap` is the way to run on smaller machines. At 1024x1024 the activations of the three
+batched guidance branches (3 x 4098 tokens) dominate the footprint.
+
+**Sample edits** (bf16, Metal): a golden retriever on a porch, "Put a red knitted hat on the dog",
+gets a red beanie and nothing else changes; a green meadow with a cabin, "Make it winter: snow on
+the roof and the ground", snows over roof and field; a bakery front, "Change the text on the sign from 'FRESH BREAD' to
+'OXINFER CAFE'", rewrites the carved sign in the same style but spells it "OXIVFR CAFE" (BAGEL's
+text rendering is its weak spot); "Turn this photo into a watercolor painting" repaints the whole
+porch scene. `--quant q8` reproduces the bf16 edit at 51 dB (41.3 dB against the reference), q4 at
+36 dB.
+
+**Library and C API.**
+
+```rust
+use oxinfer::bagel::{Bagel, ImageOptions, LoadOptions, TextOptions};
+let m = Bagel::load("ByteDance-Seed/BAGEL-7B-MoT", &LoadOptions { mmap: true, ..Default::default() })?;
+let img = oxinfer::media::Media::new().load_image("dog.png".as_ref())?;
+let (out, stats) = m.edit(&img, "put a red hat on the dog", &ImageOptions::default(), &mut |i, n| { eprintln!("{i}/{n}"); true })?;
+let (fox, _) = m.generate("a red fox in the snow", &ImageOptions { width: Some(512), height: Some(512), ..Default::default() }, &mut |_, _| true)?;
+let answer = m.understand(Some(&img), "What breed is this dog?", &TextOptions::default(), &mut |_| oxinfer::generate::Flow::Continue)?;
+// generate_interleaved / understand_interleaved take any sequence of texts and images;
+// edit_picture / understand_picture take oxideav pictures (`oxideav` feature)
+```
+
+`examples/bagel_edit.rs` edits an image and then describes the result with the same model. The C
+API has `oxi_bagel_load` (`key=value` options: quant, mmap, device, cache_dir, generation,
+understanding, text), `oxi_bagel_edit_rgb` / `oxi_bagel_edit_file` / `oxi_bagel_generate` (JSON
+options as `ImageOptions`), `oxi_bagel_understand_rgb` / `_file` (streamed text),
+`oxi_bagel_last_thinking`, `oxi_bagel_cancel` and `oxi_bagel_free` (see `include/oxinfer.h`).
+Loading only what a task needs (`generation=0` for questions, `understanding=0` for text to image)
+leaves the other expert's weights untouched in the mapped file.
+
+**Weights and license.** ByteDance-Seed/BAGEL-7B-MoT: Apache 2.0, ungated; `ema.safetensors`
+29.2 GB (bf16: both experts of the 7B language model, SigLIP, connectors) and `ae.safetensors`
+0.34 GB (the FLUX.1 autoencoder, f32). No GGUF conversion of BAGEL exists; the community NF4 /
+INT8 / FP8 / DFloat11 checkpoints are not supported (quantize at load with `--quant`).
+
+Not supported: sampling the VAE posterior (the reference draws `mean + std * noise` for input
+images; oxinfer uses the mean, a difference far below the guidance's), TaylorSeer step caching,
+batches, interleaved outputs past one image or one answer, the browser build (the weights exceed
+4 GB). Single-token text decoding runs on the CPU (about 10 tokens/s in bf16).
 
 ## Janus-Pro: text to image and image understanding
 

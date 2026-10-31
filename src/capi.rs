@@ -1705,3 +1705,249 @@ pub unsafe extern "C" fn oxi_flux_edit_file(
         bail!("{path}: decoding image files needs the `media` feature; use oxi_flux_edit_rgb")
     })
 }
+
+// ---- BAGEL (instruction-based editing, text to image, image understanding) ------------------
+
+/// A BAGEL model handle.
+pub struct OxiBagel {
+    cancel: crate::bagel::CancelHandle,
+    model: Mutex<crate::bagel::Bagel>,
+    thinking: Mutex<Option<String>>,
+}
+
+unsafe fn bagel<'a>(b: *const OxiBagel) -> Result<&'a OxiBagel> {
+    unsafe { b.as_ref() }.context("bagel is NULL")
+}
+
+/// Loads a BAGEL checkpoint (folder or repo id; `key=value` options: quant, mmap, device,
+/// cache_dir, generation, understanding, text).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_bagel_load(
+    model: *const c_char,
+    options: *const c_char,
+    progress: OxiProgressFn,
+    user: *mut c_void,
+) -> *mut OxiBagel {
+    guard(std::ptr::null_mut(), || {
+        let model = unsafe { str_arg(model, "model") }?;
+        let mut o = crate::bagel::LoadOptions::default();
+        for item in unsafe { opt_str_arg(options, "options") }?.unwrap_or("").split(['\n', ';']) {
+            let item = item.trim();
+            if item.is_empty() || item.starts_with('#') {
+                continue;
+            }
+            let (k, v) = item.split_once('=').with_context(|| format!("option {item:?} is not key=value"))?;
+            o.set(k.trim(), v.trim())?;
+        }
+        let b = with_progress(progress, user, || crate::bagel::Bagel::load(model, &o))?;
+        Ok(Box::into_raw(Box::new(OxiBagel {
+            cancel: b.cancel_handle(),
+            model: Mutex::new(b),
+            thinking: Mutex::new(None),
+        })))
+    })
+}
+
+/// Frees a BAGEL model (NULL is ignored). No other call on it may be running.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_bagel_free(b: *mut OxiBagel) {
+    if !b.is_null() {
+        guard((), || {
+            drop(unsafe { Box::from_raw(b) });
+            Ok(())
+        })
+    }
+}
+
+/// Stops the running generation or answer (any thread).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_bagel_cancel(b: *const OxiBagel) {
+    if let Some(b) = unsafe { b.as_ref() } {
+        b.cancel.cancel();
+    }
+}
+
+/// The plan written by the last image generation with `"think": true` (NULL when none).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_bagel_last_thinking(b: *const OxiBagel) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let b = unsafe { bagel(b) }?;
+        Ok(match b.thinking.lock().unwrap_or_else(|e| e.into_inner()).as_deref() {
+            Some(t) => out_string(t.to_string()),
+            None => std::ptr::null_mut(),
+        })
+    })
+}
+
+fn bagel_image(
+    b: *mut OxiBagel,
+    prompt: *const c_char,
+    options_json: *const c_char,
+    on_image: OxiImageFn,
+    on_step: OxiStepFn,
+    user: *mut c_void,
+    image: impl FnOnce() -> Result<Option<crate::video::RgbImage>>,
+) -> c_int {
+    guard(-1, || {
+        let b = unsafe { bagel(b) }?;
+        let prompt = unsafe { str_arg(prompt, "prompt") }?;
+        let opts: crate::bagel::ImageOptions = match unsafe { opt_str_arg(options_json, "options_json") }?.map(str::trim) {
+            Some(s) if !s.is_empty() => serde_json::from_str(s).context("options_json")?,
+            _ => Default::default(),
+        };
+        let image = image()?;
+        let m = b.model.lock().unwrap_or_else(|e| e.into_inner());
+        let mut progress = |i: usize, n: usize| match on_step {
+            Some(cb) => (unsafe { cb(user, i as c_int, n as c_int) }) == 0,
+            None => true,
+        };
+        let (img, st) = match &image {
+            Some(im) => m.edit(im, prompt, &opts, &mut progress)?,
+            None => m.generate(prompt, &opts, &mut progress)?,
+        };
+        *b.thinking.lock().unwrap_or_else(|e| e.into_inner()) = st.thinking;
+        if let Some(cb) = on_image {
+            unsafe { cb(user, 0, img.width as c_int, img.height as c_int, img.rgb.as_ptr(), img.rgb.len()) };
+        }
+        Ok(1)
+    })
+}
+
+/// Tightly packed RGB8 pixels as an image.
+///
+/// # Safety
+/// `rgb` must point at `width * height * 3` readable bytes (or be NULL).
+unsafe fn rgb_arg(rgb: *const u8, width: c_int, height: c_int) -> Result<crate::video::RgbImage> {
+    let (w, h) = (usize::try_from(width)?, usize::try_from(height)?);
+    if rgb.is_null() || w == 0 || h == 0 {
+        bail!("rgb is NULL or the size is empty");
+    }
+    let data = unsafe { std::slice::from_raw_parts(rgb, w * h * 3) }.to_vec();
+    Ok(crate::video::RgbImage { width: w, height: h, data })
+}
+
+fn image_file(path: &str) -> Result<crate::video::RgbImage> {
+    #[cfg(feature = "media")]
+    {
+        crate::media::Media::new().load_image(std::path::Path::new(path))
+    }
+    #[cfg(not(feature = "media"))]
+    bail!("{path}: decoding image files needs the `media` feature; pass RGB8 pixels instead")
+}
+
+/// Text to image (`options_json`: see `oxinfer.h`); the image goes to `on_image`. Returns 1, or
+/// -1 (error or cancelled).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_bagel_generate(
+    b: *mut OxiBagel,
+    prompt: *const c_char,
+    options_json: *const c_char,
+    on_image: OxiImageFn,
+    on_step: OxiStepFn,
+    user: *mut c_void,
+) -> c_int {
+    bagel_image(b, prompt, options_json, on_image, on_step, user, || Ok(None))
+}
+
+/// Edits a tightly packed RGB8 image following the instruction `prompt`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn oxi_bagel_edit_rgb(
+    b: *mut OxiBagel,
+    prompt: *const c_char,
+    rgb: *const u8,
+    width: c_int,
+    height: c_int,
+    options_json: *const c_char,
+    on_image: OxiImageFn,
+    on_step: OxiStepFn,
+    user: *mut c_void,
+) -> c_int {
+    bagel_image(b, prompt, options_json, on_image, on_step, user, || {
+        unsafe { rgb_arg(rgb, width, height) }.map(Some)
+    })
+}
+
+/// [`oxi_bagel_edit_rgb`] with an image file (needs the `media` feature).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_bagel_edit_file(
+    b: *mut OxiBagel,
+    prompt: *const c_char,
+    path: *const c_char,
+    options_json: *const c_char,
+    on_image: OxiImageFn,
+    on_step: OxiStepFn,
+    user: *mut c_void,
+) -> c_int {
+    bagel_image(b, prompt, options_json, on_image, on_step, user, || {
+        image_file(unsafe { str_arg(path, "path") }?).map(Some)
+    })
+}
+
+fn bagel_answer(
+    b: *mut OxiBagel,
+    question: *const c_char,
+    options_json: *const c_char,
+    cb: OxiTokenFn,
+    user: *mut c_void,
+    image: impl FnOnce() -> Result<Option<crate::video::RgbImage>>,
+) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let b = unsafe { bagel(b) }?;
+        let question = unsafe { str_arg(question, "question") }?;
+        let opts: crate::bagel::TextOptions = match unsafe { opt_str_arg(options_json, "options_json") }?.map(str::trim) {
+            Some(s) if !s.is_empty() => serde_json::from_str(s).context("options_json")?,
+            _ => Default::default(),
+        };
+        let image = image()?;
+        let m = b.model.lock().unwrap_or_else(|e| e.into_inner());
+        let mut on_text = |t: &str| -> Flow {
+            match cb {
+                Some(cb) if !t.is_empty() && unsafe { cb(user, t.as_ptr() as *const c_char, t.len(), 0) } != 0 => Flow::Stop,
+                _ => Flow::Continue,
+            }
+        };
+        Ok(out_string(m.understand(image.as_ref(), question, &opts, &mut on_text)?))
+    })
+}
+
+/// Answers `question` about a tightly packed RGB8 image (NULL `rgb`: no image), streaming the
+/// text to `cb`. Returns the answer (free with `oxi_string_free`), or NULL on error.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn oxi_bagel_understand_rgb(
+    b: *mut OxiBagel,
+    question: *const c_char,
+    rgb: *const u8,
+    width: c_int,
+    height: c_int,
+    options_json: *const c_char,
+    cb: OxiTokenFn,
+    user: *mut c_void,
+) -> *mut c_char {
+    bagel_answer(b, question, options_json, cb, user, || {
+        if rgb.is_null() {
+            Ok(None)
+        } else {
+            unsafe { rgb_arg(rgb, width, height) }.map(Some)
+        }
+    })
+}
+
+/// [`oxi_bagel_understand_rgb`] with an image file (NULL `path`: no image).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_bagel_understand_file(
+    b: *mut OxiBagel,
+    question: *const c_char,
+    path: *const c_char,
+    options_json: *const c_char,
+    cb: OxiTokenFn,
+    user: *mut c_void,
+) -> *mut c_char {
+    bagel_answer(b, question, options_json, cb, user, || {
+        match unsafe { opt_str_arg(path, "path") }? {
+            Some(p) if !p.is_empty() => image_file(p).map(Some),
+            _ => Ok(None),
+        }
+    })
+}

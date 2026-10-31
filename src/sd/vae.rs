@@ -70,7 +70,16 @@ pub struct VaeDecoder {
 impl VaeDecoder {
     pub fn load(dir: &Path, weights: &Path) -> Result<Self> {
         let cfg: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
-        let t = Tensors::open(weights)?;
+        // Older configs (SD 1.x) omit it; diffusers' default is the SD 1/2 VAE's 0.18215.
+        Self::from_tensors(
+            &Tensors::open(weights)?,
+            cfg["scaling_factor"].as_f64().unwrap_or(0.18215) as f32,
+            cfg["shift_factor"].as_f64().unwrap_or(0.0) as f32,
+        )
+    }
+
+    /// The decoder from diffusers-named weights (`decoder.*`, `post_quant_conv.*`).
+    pub fn from_tensors(t: &Tensors, scaling_factor: f32, shift_factor: f32) -> Result<Self> {
         let eps = 1e-6;
         let p = "decoder";
         let mut ups = Vec::new();
@@ -78,33 +87,32 @@ impl VaeDecoder {
             let b = format!("{p}.up_blocks.{}", ups.len());
             let mut resnets = Vec::new();
             while t.has(&format!("{b}.resnets.{}.conv1.weight", resnets.len())) {
-                resnets.push(Resnet::load(&t, &format!("{b}.resnets.{}", resnets.len()), eps)?);
+                resnets.push(Resnet::load(t, &format!("{b}.resnets.{}", resnets.len()), eps)?);
             }
             let up = if t.has(&format!("{b}.upsamplers.0.conv.weight")) {
-                Some(Conv::load(&t, &format!("{b}.upsamplers.0.conv"))?)
+                Some(Conv::load(t, &format!("{b}.upsamplers.0.conv"))?)
             } else {
                 None
             };
             ups.push(Up { resnets, up });
         }
-        let conv_in = Conv::load(&t, &format!("{p}.conv_in"))?;
+        let conv_in = Conv::load(t, &format!("{p}.conv_in"))?;
         Ok(Self {
             post_quant: if t.has("post_quant_conv.weight") {
-                Some(Linear::load(&t, "post_quant_conv")?)
+                Some(Linear::load(t, "post_quant_conv")?)
             } else {
                 None
             },
             latent_channels: conv_in.cin,
             conv_in,
-            mid1: Resnet::load(&t, &format!("{p}.mid_block.resnets.0"), eps)?,
-            attn: MidAttn::load(&t, &format!("{p}.mid_block.attentions.0"))?,
-            mid2: Resnet::load(&t, &format!("{p}.mid_block.resnets.1"), eps)?,
+            mid1: Resnet::load(t, &format!("{p}.mid_block.resnets.0"), eps)?,
+            attn: MidAttn::load(t, &format!("{p}.mid_block.attentions.0"))?,
+            mid2: Resnet::load(t, &format!("{p}.mid_block.resnets.1"), eps)?,
             ups,
-            norm_out: GroupNorm::load(&t, &format!("{p}.conv_norm_out"), 32, eps)?,
-            conv_out: Conv::load(&t, &format!("{p}.conv_out"))?,
-            // Older configs (SD 1.x) omit it; diffusers' default is the SD 1/2 VAE's 0.18215.
-            scaling_factor: cfg["scaling_factor"].as_f64().unwrap_or(0.18215) as f32,
-            shift_factor: cfg["shift_factor"].as_f64().unwrap_or(0.0) as f32,
+            norm_out: GroupNorm::load(t, &format!("{p}.conv_norm_out"), 32, eps)?,
+            conv_out: Conv::load(t, &format!("{p}.conv_out"))?,
+            scaling_factor,
+            shift_factor,
         })
     }
 
@@ -179,7 +187,7 @@ impl LatentDist {
 impl VaeEncoder {
     /// `None` when the weight file has no encoder (decoder-only exports).
     pub fn load(weights: &Path) -> Result<Option<Self>> {
-        let t = Tensors::open(weights)?;
+        let t = &Tensors::open(weights)?;
         let p = "encoder";
         if !t.has(&format!("{p}.conv_in.weight")) {
             return Ok(None);
@@ -190,28 +198,28 @@ impl VaeEncoder {
             let b = format!("{p}.down_blocks.{}", downs.len());
             let mut resnets = Vec::new();
             while t.has(&format!("{b}.resnets.{}.conv1.weight", resnets.len())) {
-                resnets.push(Resnet::load(&t, &format!("{b}.resnets.{}", resnets.len()), eps)?);
+                resnets.push(Resnet::load(t, &format!("{b}.resnets.{}", resnets.len()), eps)?);
             }
             // `Downsample2D(padding=0)`: one zero row and column after the input, then stride 2.
             let down = if t.has(&format!("{b}.downsamplers.0.conv.weight")) {
-                Some(Conv::load_padded(&t, &format!("{b}.downsamplers.0.conv"), 0, 1)?)
+                Some(Conv::load_padded(t, &format!("{b}.downsamplers.0.conv"), 0, 1)?)
             } else {
                 None
             };
             downs.push(Down { resnets, down });
         }
-        let conv_out = Conv::load(&t, &format!("{p}.conv_out"))?;
+        let conv_out = Conv::load(t, &format!("{p}.conv_out"))?;
         Ok(Some(Self {
-            conv_in: Conv::load(&t, &format!("{p}.conv_in"))?,
+            conv_in: Conv::load(t, &format!("{p}.conv_in"))?,
             downs,
-            mid1: Resnet::load(&t, &format!("{p}.mid_block.resnets.0"), eps)?,
-            attn: MidAttn::load(&t, &format!("{p}.mid_block.attentions.0"))?,
-            mid2: Resnet::load(&t, &format!("{p}.mid_block.resnets.1"), eps)?,
-            norm_out: GroupNorm::load(&t, &format!("{p}.conv_norm_out"), 32, eps)?,
+            mid1: Resnet::load(t, &format!("{p}.mid_block.resnets.0"), eps)?,
+            attn: MidAttn::load(t, &format!("{p}.mid_block.attentions.0"))?,
+            mid2: Resnet::load(t, &format!("{p}.mid_block.resnets.1"), eps)?,
+            norm_out: GroupNorm::load(t, &format!("{p}.conv_norm_out"), 32, eps)?,
             latent_channels: conv_out.cout / 2,
             conv_out,
             quant: if t.has("quant_conv.weight") {
-                Some(Linear::load(&t, "quant_conv")?)
+                Some(Linear::load(t, "quant_conv")?)
             } else {
                 None
             },

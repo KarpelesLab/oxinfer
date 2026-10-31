@@ -43,6 +43,10 @@ name = "flux_edit"
 required-features = ["hf", "media"]
 
 [[example]]
+name = "bagel_edit"
+required-features = ["hf", "media"]
+
+[[example]]
 name = "qwen_mtp"
 required-features = ["hf"]
 
