@@ -1,4 +1,4 @@
-//! Antialiased bicubic resizing of 8-bit RGB exactly as the Hugging Face processors run it:
+//! Antialiased bicubic (and Lanczos) resizing of 8-bit RGB exactly as the Hugging Face processors run it:
 //! Pillow's `Image.resize(size, Image.BICUBIC)` (the image processors' PIL backend) and
 //! torchvision's uint8 `resize(..., BICUBIC, antialias=True)` (the video processors, and the
 //! image processors' torchvision backend).
@@ -25,6 +25,38 @@ fn bicubic(x: f64) -> f64 {
     }
 }
 
+/// Pillow's `sinc_filter`.
+fn sinc(x: f64) -> f64 {
+    if x == 0.0 {
+        return 1.0;
+    }
+    let x = x * std::f64::consts::PI;
+    x.sin() / x
+}
+
+/// The resampling kernel: Keys bicubic (support 2) or Lanczos-3 (Pillow's `lanczos_filter`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Filter {
+    Bicubic,
+    Lanczos,
+}
+
+impl Filter {
+    fn support(self) -> f64 {
+        match self {
+            Filter::Bicubic => 2.0,
+            Filter::Lanczos => 3.0,
+        }
+    }
+    fn eval(self, x: f64) -> f64 {
+        match self {
+            Filter::Bicubic => bicubic(x),
+            Filter::Lanczos if (-3.0..3.0).contains(&x) => sinc(x) * sinc(x / 3.0),
+            Filter::Lanczos => 0.0,
+        }
+    }
+}
+
 /// Fixed-point resampling coefficients of one pass: per output pixel, the first input index and
 /// the weights, scaled by `2^bits`.
 struct Coeffs {
@@ -35,10 +67,10 @@ struct Coeffs {
 /// Coefficients for resampling `n_in` samples into `n_out` (Pillow's `precompute_coeffs`), in
 /// Pillow's 22-bit fixed point, or (`int16`) at the largest precision whose biggest weight fits
 /// in an int16 (torchvision).
-fn coeffs(n_in: usize, n_out: usize, int16: bool) -> Coeffs {
+fn coeffs(n_in: usize, n_out: usize, int16: bool, filter: Filter) -> Coeffs {
     let scale = n_in as f64 / n_out as f64;
     let filterscale = scale.max(1.0);
-    let support = 2.0 * filterscale;
+    let support = filter.support() * filterscale;
     let ss = 1.0 / filterscale;
     let taps: Vec<(usize, Vec<f64>)> = (0..n_out)
         .map(|xx| {
@@ -46,7 +78,7 @@ fn coeffs(n_in: usize, n_out: usize, int16: bool) -> Coeffs {
             // C `(int)` truncation; negative values clamp to 0 anyway.
             let xmin = ((center - support + 0.5) as i64).max(0) as usize;
             let xmax = (((center + support + 0.5) as i64) as usize).min(n_in);
-            let w: Vec<f64> = (xmin..xmax).map(|x| bicubic((x as f64 - center + 0.5) * ss)).collect();
+            let w: Vec<f64> = (xmin..xmax).map(|x| filter.eval((x as f64 - center + 0.5) * ss)).collect();
             let ww: f64 = w.iter().sum();
             (xmin, w.iter().map(|&v| if ww != 0.0 { v / ww } else { v }).collect())
         })
@@ -79,24 +111,32 @@ fn coeffs(n_in: usize, n_out: usize, int16: bool) -> Coeffs {
 /// downscaling). Returns RGB8.
 pub fn resize_bicubic_rgb8(rgb: &[u8], w: usize, h: usize, tw: usize, th: usize) -> Vec<u8> {
     let (dh, dw) = (h as i64 - th as i64, w as i64 - tw as i64);
-    resize(rgb, w, h, tw, th, dh > 0 && dh > dw * 2, false)
+    resize(rgb, w, h, tw, th, dh > 0 && dh > dw * 2, false, Filter::Bicubic)
+}
+
+/// Resizes interleaved RGB8 `w`x`h` to `tw`x`th` like Pillow's LANCZOS (diffusers'
+/// `VaeImageProcessor` default). Returns RGB8.
+pub fn resize_lanczos_rgb8(rgb: &[u8], w: usize, h: usize, tw: usize, th: usize) -> Vec<u8> {
+    let (dh, dw) = (h as i64 - th as i64, w as i64 - tw as i64);
+    resize(rgb, w, h, tw, th, dh > 0 && dh > dw * 2, false, Filter::Lanczos)
 }
 
 /// Resizes interleaved RGB8 `w`x`h` to `tw`x`th` like torchvision's uint8 antialiased bicubic.
 pub fn resize_bicubic_rgb8_torchvision(rgb: &[u8], w: usize, h: usize, tw: usize, th: usize) -> Vec<u8> {
-    resize(rgb, w, h, tw, th, false, true)
+    resize(rgb, w, h, tw, th, false, true, Filter::Bicubic)
 }
 
-fn resize(rgb: &[u8], w: usize, h: usize, tw: usize, th: usize, vertical_first: bool, int16: bool) -> Vec<u8> {
+#[allow(clippy::too_many_arguments)]
+fn resize(rgb: &[u8], w: usize, h: usize, tw: usize, th: usize, vertical_first: bool, int16: bool, filter: Filter) -> Vec<u8> {
     assert_eq!(rgb.len(), w * h * 3, "image size mismatch");
     assert!(tw > 0 && th > 0);
     let (mut img, mut cw, mut ch) = (std::borrow::Cow::Borrowed(rgb), w, h);
     for vertical in [vertical_first, !vertical_first] {
         if vertical && ch != th {
-            img = pass(&img, cw, ch, &coeffs(ch, th, int16), true).into();
+            img = pass(&img, cw, ch, &coeffs(ch, th, int16, filter), true).into();
             ch = th;
         } else if !vertical && cw != tw {
-            img = pass(&img, cw, ch, &coeffs(cw, tw, int16), false).into();
+            img = pass(&img, cw, ch, &coeffs(cw, tw, int16, filter), false).into();
             cw = tw;
         }
     }
@@ -197,6 +237,29 @@ mod tests {
         let r = resize_bicubic_rgb8(&pattern(), 13, 9, 17, 5);
         assert_eq!(&r[..24], &PILLOW_13X9_TO_17X5_HEAD);
         assert_eq!(checksum(&r), 4330021);
+    }
+
+    #[test]
+    fn lanczos_matches_pillow() {
+        // Pillow 13: Image.resize(..., Image.LANCZOS) for the same inputs.
+        let a: Vec<u8> = (0..4 * 5)
+            .flat_map(|i| {
+                let v = (i * 13 % 256) as u8;
+                [v, 255 - v, v / 2]
+            })
+            .collect();
+        let want = [39, 216, 19, 61, 194, 30, 83, 172, 41, 164, 91, 82, 186, 69, 93, 208, 47, 104];
+        assert_eq!(resize_lanczos_rgb8(&a, 5, 4, 3, 2), want);
+        let r = resize_lanczos_rgb8(&pattern(), 13, 9, 17, 5);
+        let head = [
+            112, 80, 73, 53, 63, 59, 13, 103, 32, 53, 144, 19, 98, 99, 41, 130, 75, 138, 150, 123, 182, 187, 166, 197,
+        ];
+        assert_eq!(&r[..24], &head);
+        assert_eq!(checksum(&r), 4331298);
+        let q: Vec<u8> = (0..60u32)
+            .flat_map(|y| (0..80u32).flat_map(move |x| [((x * 7 + y * 3) % 256) as u8, ((x * y) % 256) as u8, ((x + 2 * y) % 256) as u8]))
+            .collect();
+        assert_eq!(checksum(&resize_lanczos_rgb8(&q, 80, 60, 37, 28)), 598100134);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use tokenizers::Tokenizer;
 
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
 mod anemll_cli;
+mod flux_cli;
 mod intervene_cli;
 mod janus_cli;
 #[cfg(feature = "media")]
@@ -137,6 +138,8 @@ struct Args {
     max_tokens_set: Option<usize>,
     // Runtime interventions.
     iv: intervene_cli::IvArgs,
+    // FLUX.1 / Kontext.
+    flux: flux_cli::FluxArgs,
 }
 
 fn usage() -> ! {
@@ -302,6 +305,7 @@ fn usage() -> ! {
          \x20 --decode-codes FILE  (--model a SNAC dir) such codes back to a WAV (-o FILE)"
     );
     eprintln!("\n{}", intervene_cli::USAGE);
+    eprintln!("\n{}", flux_cli::USAGE);
     std::process::exit(2)
 }
 
@@ -416,6 +420,7 @@ fn parse_args() -> Result<Args> {
         top_p_set: None,
         max_tokens_set: None,
         iv: Default::default(),
+        flux: Default::default(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -599,6 +604,7 @@ fn parse_args() -> Result<Args> {
             "--repetition-penalty" | "--repeat-penalty" => a.repetition_penalty = Some(val()?.parse()?),
             "-h" | "--help" => usage(),
             _ if a.iv.parse(&k, &mut val)? => {}
+            _ if a.flux.parse(&k, &mut val)? => {}
             _ => {
                 eprintln!("unknown argument {k}");
                 usage()
@@ -936,6 +942,9 @@ fn run(mut args: Args) -> Result<()> {
     // Bigger prefill chunks keep the GPU busier (577 vs 431 tok/s on E4B q4 at 1024 vs 256);
     // on the CPU 256 keeps the activations in cache.
     args.prefill_chunk = Some(args.prefill_chunk.unwrap_or(if gpu.is_some() { 1024 } else { 256 }));
+    if oxinfer::flux::is_flux_dir(&args.model) || oxinfer::flux::is_flux_gguf(&args.model) {
+        return flux_cli::run(&args);
+    }
     if oxinfer::sd::is_diffusers(&args.model) {
         return run_image(&args);
     }

@@ -467,6 +467,9 @@ fn diffusers_files(list: &Listing) -> Vec<String> {
 
 fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
     let list = listing(repo)?;
+    if list.contains_key("model_index.json") {
+        return fetch_diffusers(repo, dir, &list, &[]);
+    }
     if is_anemll_listing(&list) {
         let mut files: Vec<&String> = list.keys().filter(|k| anemll_wanted(k)).collect();
         files.sort();
@@ -563,6 +566,91 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
         );
     } else {
         bail!("{repo}: no safetensors or pytorch_model.bin weights found");
+    }
+    let count = files.len();
+    for (i, f) in files.iter().enumerate() {
+        let (size, src) = list.get(f).with_context(|| format!("{repo}: {f} is not in the listing"))?;
+        fetch_file(repo, dir, f, *size, src, i + 1, count)?;
+    }
+    Ok(())
+}
+
+/// A diffusers pipeline repository (`model_index.json`) without the components in `skip` (e.g.
+/// `["transformer"]` when its weights come from elsewhere): a local directory is used as is.
+pub fn resolve_diffusers(spec: &str, skip: &[&str], cache_dir: Option<&Path>) -> Result<PathBuf> {
+    let p = Path::new(spec);
+    if p.is_dir() {
+        return Ok(p.to_path_buf());
+    }
+    let parts: Vec<&str> = spec.split('/').collect();
+    if parts.len() != 2 || parts.iter().any(|s| s.is_empty() || s.starts_with('.')) || spec.starts_with('/') {
+        bail!("{spec}: not an existing directory and not a HuggingFace repo id of the form org/name");
+    }
+    let root = cache_dir.map(Path::to_path_buf).unwrap_or_else(cache_root);
+    let dir = root.join(spec.replace('/', "--"));
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let list = listing(spec)?;
+    if !list.contains_key("model_index.json") {
+        bail!("{spec}: not a diffusers pipeline (no model_index.json)");
+    }
+    fetch_diffusers(spec, &dir, &list, skip)?;
+    Ok(dir)
+}
+
+/// The files of a diffusers pipeline: `model_index.json` and, for each component it names (but
+/// those in `skip`), the component folder's configs, tokenizer files and weights (sharded or
+/// not; the full-precision file over an `.fp16` variant, safetensors over `.bin`). Top-level
+/// single-file checkpoints (`flux1-dev.safetensors`, `ae.safetensors`, ...) are left out.
+fn fetch_diffusers(repo: &str, dir: &Path, list: &Listing, skip: &[&str]) -> Result<()> {
+    let (size, src) = &list["model_index.json"];
+    fetch_file(repo, dir, "model_index.json", *size, src, 0, 0)?;
+    let index: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("model_index.json"))?)?;
+    let mut files: Vec<String> = Vec::new();
+    for (comp, v) in index.as_object().context("model_index.json is not an object")? {
+        let named = v.as_array().is_some_and(|a| a.first().is_some_and(|x| !x.is_null()));
+        if comp.starts_with('_') || skip.contains(&comp.as_str()) || !named {
+            continue;
+        }
+        let pre = format!("{comp}/");
+        let mut names: Vec<&String> = list
+            .keys()
+            .filter(|k| k.starts_with(&pre) && !k[pre.len()..].contains('/'))
+            .collect();
+        names.sort();
+        let has = |n: &str| list.contains_key(&format!("{pre}{n}"));
+        let any_st = names.iter().any(|n| n.ends_with(".safetensors"));
+        let weights_index = names.iter().find(|n| n.ends_with(".safetensors.index.json")).map(|s| s.to_string());
+        for n in names {
+            let base = &n[pre.len()..];
+            let keep = if base.ends_with(".safetensors") {
+                // Shards come from the index below; prefer full precision over `.fp16`.
+                weights_index.is_none()
+                    && base
+                        .strip_suffix(".fp16.safetensors")
+                        .is_none_or(|full| !has(&format!("{full}.safetensors")))
+            } else if base.ends_with(".bin") {
+                !any_st
+            } else {
+                [".json", ".txt", ".model", ".tiktoken"].iter().any(|e| base.ends_with(e))
+            };
+            if keep {
+                files.push(n.clone());
+            }
+        }
+        if let Some(idx) = weights_index {
+            let (size, src) = &list[&idx];
+            fetch_file(repo, dir, &idx, *size, src, 0, 0)?;
+            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(&idx))?)?;
+            let mut shards: Vec<String> = v["weight_map"]
+                .as_object()
+                .context("weight_map")?
+                .values()
+                .filter_map(|x| x.as_str().map(|s| format!("{pre}{s}")))
+                .collect();
+            shards.sort();
+            shards.dedup();
+            files.extend(shards);
+        }
     }
     let count = files.len();
     for (i, f) in files.iter().enumerate() {

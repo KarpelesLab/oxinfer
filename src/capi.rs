@@ -1284,3 +1284,155 @@ pub unsafe extern "C" fn oxi_sd_edit_rgb(
         Ok(Some(e))
     })
 }
+
+// ---- FLUX.1 / FLUX.1 Kontext (text to image, instruction-based editing) ----------------------
+
+/// A FLUX pipeline handle.
+pub struct OxiFlux {
+    cancel: crate::flux::CancelHandle,
+    pipe: Mutex<crate::flux::Pipeline>,
+}
+
+unsafe fn flux<'a>(f: *const OxiFlux) -> Result<&'a OxiFlux> {
+    unsafe { f.as_ref() }.context("flux is NULL")
+}
+
+/// Loads a FLUX pipeline (diffusers folder / repo id, or a FLUX GGUF transformer with `base=`;
+/// `key=value` options: quant, text_quant, transformer, base, device, cache_dir, vae_encoder).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_flux_load(
+    model: *const c_char,
+    options: *const c_char,
+    progress: OxiProgressFn,
+    user: *mut c_void,
+) -> *mut OxiFlux {
+    guard(std::ptr::null_mut(), || {
+        let model = unsafe { str_arg(model, "model") }?;
+        let mut o = crate::flux::LoadOptions::default();
+        for item in unsafe { opt_str_arg(options, "options") }?.unwrap_or("").split(['\n', ';']) {
+            let item = item.trim();
+            if item.is_empty() || item.starts_with('#') {
+                continue;
+            }
+            let (k, v) = item.split_once('=').with_context(|| format!("option {item:?} is not key=value"))?;
+            o.set(k.trim(), v.trim())?;
+        }
+        let p = with_progress(progress, user, || crate::flux::Pipeline::load(model, &o))?;
+        Ok(Box::into_raw(Box::new(OxiFlux {
+            cancel: p.cancel_handle(),
+            pipe: Mutex::new(p),
+        })))
+    })
+}
+
+/// Frees a FLUX pipeline (NULL is ignored). No other call on it may be running.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_flux_free(f: *mut OxiFlux) {
+    if !f.is_null() {
+        guard((), || {
+            drop(unsafe { Box::from_raw(f) });
+            Ok(())
+        })
+    }
+}
+
+/// Stops the running generation (any thread).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_flux_cancel(f: *const OxiFlux) {
+    if let Some(f) = unsafe { f.as_ref() } {
+        f.cancel.cancel();
+    }
+}
+
+fn flux_run(
+    f: *mut OxiFlux,
+    prompt: *const c_char,
+    options_json: *const c_char,
+    on_image: OxiImageFn,
+    on_step: OxiStepFn,
+    user: *mut c_void,
+    image: impl FnOnce() -> Result<Option<crate::video::RgbImage>>,
+) -> c_int {
+    guard(-1, || {
+        let f = unsafe { flux(f) }?;
+        let prompt = unsafe { str_arg(prompt, "prompt") }?;
+        let opts: crate::flux::Options = match unsafe { opt_str_arg(options_json, "options_json") }?.map(str::trim) {
+            Some(s) if !s.is_empty() => serde_json::from_str(s).context("options_json")?,
+            _ => Default::default(),
+        };
+        let image = image()?;
+        let p = f.pipe.lock().unwrap_or_else(|e| e.into_inner());
+        let mut progress = |i: usize, n: usize| match on_step {
+            Some(cb) => (unsafe { cb(user, i as c_int, n as c_int) }) == 0,
+            None => true,
+        };
+        let (img, _) = match &image {
+            Some(im) => p.edit(im, prompt, &opts, &mut progress)?,
+            None => p.generate(prompt, &opts, &mut progress)?,
+        };
+        if let Some(cb) = on_image {
+            unsafe { cb(user, 0, img.width as c_int, img.height as c_int, img.rgb.as_ptr(), img.rgb.len()) };
+        }
+        Ok(1)
+    })
+}
+
+/// Text to image (`options_json`: see `oxinfer.h`); the image goes to `on_image`. Returns 1, or
+/// -1 (error or cancelled).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_flux_generate(
+    f: *mut OxiFlux,
+    prompt: *const c_char,
+    options_json: *const c_char,
+    on_image: OxiImageFn,
+    on_step: OxiStepFn,
+    user: *mut c_void,
+) -> c_int {
+    flux_run(f, prompt, options_json, on_image, on_step, user, || Ok(None))
+}
+
+/// Edits an image given as tightly packed RGB8 following the instruction `prompt` (Kontext).
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn oxi_flux_edit_rgb(
+    f: *mut OxiFlux,
+    prompt: *const c_char,
+    rgb: *const u8,
+    width: c_int,
+    height: c_int,
+    options_json: *const c_char,
+    on_image: OxiImageFn,
+    on_step: OxiStepFn,
+    user: *mut c_void,
+) -> c_int {
+    flux_run(f, prompt, options_json, on_image, on_step, user, || {
+        let (w, h) = (usize::try_from(width)?, usize::try_from(height)?);
+        if rgb.is_null() || w == 0 || h == 0 {
+            bail!("rgb is NULL or the size is empty");
+        }
+        let data = unsafe { std::slice::from_raw_parts(rgb, w * h * 3) }.to_vec();
+        Ok(Some(crate::video::RgbImage { width: w, height: h, data }))
+    })
+}
+
+/// [`oxi_flux_edit_rgb`] with an image file (PNG / JPEG / WebP / ...; needs the `media` feature).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_flux_edit_file(
+    f: *mut OxiFlux,
+    prompt: *const c_char,
+    path: *const c_char,
+    options_json: *const c_char,
+    on_image: OxiImageFn,
+    on_step: OxiStepFn,
+    user: *mut c_void,
+) -> c_int {
+    flux_run(f, prompt, options_json, on_image, on_step, user, || {
+        let path = unsafe { str_arg(path, "path") }?;
+        #[cfg(feature = "media")]
+        {
+            Ok(Some(crate::media::Media::new().load_image(std::path::Path::new(path))?))
+        }
+        #[cfg(not(feature = "media"))]
+        bail!("{path}: decoding image files needs the `media` feature; use oxi_flux_edit_rgb")
+    })
+}

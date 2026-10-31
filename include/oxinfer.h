@@ -488,6 +488,55 @@ int oxi_sd_generate(OxiSd *s, const char *prompt, const char *options_json, oxi_
 int oxi_sd_edit_rgb(OxiSd *s, const char *prompt, const uint8_t *rgb, int width, int height, const uint8_t *mask_rgb,
                     const char *options_json, oxi_image_fn on_image, oxi_step_fn on_step, void *user);
 
+/* ---- FLUX.1 / FLUX.1 Kontext: text to image and instruction-based image editing -------------
+ *
+ * FLUX.1 Kontext [dev] (diffusers layout, e.g. unsloth/FLUX.1-Kontext-dev, an ungated copy of
+ * black-forest-labs/FLUX.1-Kontext-dev; FLUX.1 [dev] Non-Commercial License) edits an image
+ * following an instruction; FLUX.1 [schnell] / [dev] generate from text. The transformer may be
+ * a GGUF file in the original layout (QuantStack/FLUX.1-Kontext-dev-GGUF, city96/FLUX.1-*-gguf).
+ * Same threading rules as engines: one call at a time, oxi_flux_cancel() from any thread.
+ * Images are passed to `on_image` (oxi_image_fn, index 0); `on_step` gets (step, steps). */
+
+typedef struct OxiFlux OxiFlux;
+
+/* Loads a pipeline: `model` is a diffusers FLUX folder or repo id, or a FLUX GGUF transformer
+ * (file or org/name:QUANT, the other parts from `base`). `options`: `key=value` lines or
+ * `;`-separated pairs, NULL for the defaults:
+ *   quant=bf16|q8|q4      transformer precision when stored as float (default bf16)
+ *   text_quant=bf16|q8|q4 T5 encoder precision (default: quant)
+ *   transformer=SPEC      a transformer replacing the folder's (GGUF file, org/name:QUANT)
+ *   base=SPEC             text encoders / VAE / tokenizers for a GGUF model
+ *                         (default unsloth/FLUX.1-Kontext-dev)
+ *   device=auto|cpu|metal|cuda|vulkan
+ *   cache_dir=PATH        where repo ids are downloaded
+ *   vae_encoder=0|1       load the VAE encoder (default 1; needed for editing) */
+OxiFlux *oxi_flux_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
+
+/* Frees a pipeline (NULL is ignored); no other call on it may be running. */
+void oxi_flux_free(OxiFlux *f);
+
+/* Stops the running generation (any thread); it then fails with "cancelled". */
+void oxi_flux_cancel(const OxiFlux *f);
+
+/* `options_json` (NULL or {} for the defaults, every key optional; diffusers' arguments):
+ *   {"steps": 28 (4 for schnell), "guidance": 3.5 (distilled guidance; 2.5 suits edits),
+ *    "width": 1024, "height": 1024, "max_area": 1048576 (editing: the output is rescaled to
+ *    this many pixels at width/height's aspect ratio), "auto_resize": true (editing: the input
+ *    goes to the closest preferred Kontext resolution), "max_sequence_length": 512 (T5 tokens;
+ *    256 for schnell), "seed": 42, "true_cfg_scale": 1, "negative_prompt": null}
+ * Each returns 1, or -1 (error, or cancelled). */
+int oxi_flux_generate(OxiFlux *f, const char *prompt, const char *options_json, oxi_image_fn on_image, oxi_step_fn on_step,
+                      void *user);
+
+/* Edits a tightly packed RGB8 image following the instruction `prompt` (Kontext). */
+int oxi_flux_edit_rgb(OxiFlux *f, const char *prompt, const uint8_t *rgb, int width, int height, const char *options_json,
+                      oxi_image_fn on_image, oxi_step_fn on_step, void *user);
+
+/* oxi_flux_edit_rgb() with an image file (PNG / JPEG / WebP / GIF / BMP; needs the `media`
+ * feature). */
+int oxi_flux_edit_file(OxiFlux *f, const char *prompt, const char *path, const char *options_json, oxi_image_fn on_image,
+                       oxi_step_fn on_step, void *user);
+
 #ifdef __cplusplus
 }
 #endif

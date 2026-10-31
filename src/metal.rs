@@ -15,8 +15,8 @@
 //! math. Accumulators must be named variables: arrays of `simdgroup_float8x8` are spilled to
 //! memory by the shader compiler and run 12x slower. Results are bit-identical to the CPU path.
 //!
-//! Attention: unmasked heads of 64 (Whisper's encoder, SD 2.x / SD-Turbo) run as one fused
-//! kernel (`flash_attn64`, f32 simdgroup MMA with an online softmax; ~2x faster than the
+//! Attention: unmasked heads of 64 (Whisper's encoder, SD 2.x / SD-Turbo) or 128 (FLUX) run as one
+//! fused kernel (`flash_attn64` / `flash_attn128`, f32 simdgroup MMA with an online softmax; ~2x faster than the
 //! GEMM + softmax + GEMM path, which the other shapes keep, and no per-head operand repacking).
 //!
 //! On GPUs whose cores have matrix units (M5, A19: the Apple10 family), the GEMMs and the MoE
@@ -376,6 +376,98 @@ kernel void flash_attn64(device const float* q [[buffer(0)]], device const float
     device float* os = o + (ulong)q0 * p.d + hoff;
     simdgroup_store(o0, os + 0, p.d); simdgroup_store(o1, os + 8, p.d); simdgroup_store(o2, os + 16, p.d); simdgroup_store(o3, os + 24, p.d);
     simdgroup_store(o4, os + 32, p.d); simdgroup_store(o5, os + 40, p.d); simdgroup_store(o6, os + 48, p.d); simdgroup_store(o7, os + 56, p.d);
+}
+
+// ---- Fused attention, head size 128, no mask (FLUX, Qwen-Image, ...) ---------------------------
+// As flash_attn64 with twice the head width: keys and values stream in blocks of 16 (two 16 x 128
+// f32 tiles fit the 32 KB of threadgroup memory), 4 lanes per query row hold 4 scores each.
+#define FLD2 132
+#define SLD2 20
+#define FQK2(C, QA) \
+    simdgroup_load(kt, Ks + 0 * FLD2 + C * 8, FLD2, ulong2(0, 0), true); simdgroup_multiply_accumulate(s0, QA, kt, s0); \
+    simdgroup_load(kt, Ks + 8 * FLD2 + C * 8, FLD2, ulong2(0, 0), true); simdgroup_multiply_accumulate(s1, QA, kt, s1);
+#define PV2(J, C, O) simdgroup_load(vt, Vs + J * 8 * FLD2 + C * 8, FLD2); simdgroup_multiply_accumulate(O, pa, vt, O);
+#define FPV2(J) \
+    simdgroup_load(pa, S + J * 8, SLD2); \
+    PV2(J, 0, o0) PV2(J, 1, o1) PV2(J, 2, o2) PV2(J, 3, o3) PV2(J, 4, o4) PV2(J, 5, o5) PV2(J, 6, o6) PV2(J, 7, o7) \
+    PV2(J, 8, o8) PV2(J, 9, o9) PV2(J, 10, o10) PV2(J, 11, o11) PV2(J, 12, o12) PV2(J, 13, o13) PV2(J, 14, o14) PV2(J, 15, o15)
+#define FSCALE2 \
+    simdgroup_load(dg, D, 8); \
+    simdgroup_multiply(o0, dg, o0); simdgroup_multiply(o1, dg, o1); simdgroup_multiply(o2, dg, o2); simdgroup_multiply(o3, dg, o3); \
+    simdgroup_multiply(o4, dg, o4); simdgroup_multiply(o5, dg, o5); simdgroup_multiply(o6, dg, o6); simdgroup_multiply(o7, dg, o7); \
+    simdgroup_multiply(o8, dg, o8); simdgroup_multiply(o9, dg, o9); simdgroup_multiply(o10, dg, o10); simdgroup_multiply(o11, dg, o11); \
+    simdgroup_multiply(o12, dg, o12); simdgroup_multiply(o13, dg, o13); simdgroup_multiply(o14, dg, o14); simdgroup_multiply(o15, dg, o15);
+#define FST2(O, C) simdgroup_store(O, os + C * 8, p.d);
+kernel void flash_attn128(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]],
+                          device const float* v [[buffer(2)]], device float* o [[buffer(3)]], constant FA& p [[buffer(4)]],
+                          uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float Ks[16 * FLD2];
+    threadgroup float Vs[16 * FLD2];
+    threadgroup float Ss[4 * 8 * SLD2];
+    threadgroup float Dg[4 * 64];
+    uint q0 = tg.x * 32 + sg * 8;
+    ulong hoff = (ulong)tg.y * 128;
+    threadgroup float* S = Ss + sg * 8 * SLD2;
+    threadgroup float* D = Dg + sg * 64;
+    for (uint i = lane; i < 64; i += 32) D[i] = 0.0f;
+    device const float* qs = q + (ulong)q0 * p.d + hoff;
+    simdgroup_float8x8 qa0, qa1, qa2, qa3, qa4, qa5, qa6, qa7, qa8, qa9, qa10, qa11, qa12, qa13, qa14, qa15;
+    simdgroup_load(qa0, qs + 0, p.d); simdgroup_load(qa1, qs + 8, p.d); simdgroup_load(qa2, qs + 16, p.d); simdgroup_load(qa3, qs + 24, p.d);
+    simdgroup_load(qa4, qs + 32, p.d); simdgroup_load(qa5, qs + 40, p.d); simdgroup_load(qa6, qs + 48, p.d); simdgroup_load(qa7, qs + 56, p.d);
+    simdgroup_load(qa8, qs + 64, p.d); simdgroup_load(qa9, qs + 72, p.d); simdgroup_load(qa10, qs + 80, p.d); simdgroup_load(qa11, qs + 88, p.d);
+    simdgroup_load(qa12, qs + 96, p.d); simdgroup_load(qa13, qs + 104, p.d); simdgroup_load(qa14, qs + 112, p.d); simdgroup_load(qa15, qs + 120, p.d);
+    simdgroup_float8x8 o0(0.f), o1(0.f), o2(0.f), o3(0.f), o4(0.f), o5(0.f), o6(0.f), o7(0.f);
+    simdgroup_float8x8 o8(0.f), o9(0.f), o10(0.f), o11(0.f), o12(0.f), o13(0.f), o14(0.f), o15(0.f);
+    simdgroup_float8x8 kt, vt, pa, dg;
+    uint r = lane / 4, part = lane % 4;
+    float m = -INFINITY, l = 0.0f;
+    for (uint kb = 0; kb < p.tk; kb += 16) {
+        for (uint i = tid; i < 16 * 32; i += 128) {
+            uint row = i / 32, c4 = i % 32, key = kb + row;
+            float4 kv = 0.0f, vv = 0.0f;
+            if (key < p.tk) {
+                kv = ((device const float4*)(k + (ulong)key * p.d + hoff))[c4];
+                vv = ((device const float4*)(v + (ulong)key * p.d + hoff))[c4];
+            }
+            *(threadgroup float4*)(Ks + row * FLD2 + c4 * 4) = kv;
+            *(threadgroup float4*)(Vs + row * FLD2 + c4 * 4) = vv;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 s0(0.f), s1(0.f);
+        FQK2(0, qa0) FQK2(1, qa1) FQK2(2, qa2) FQK2(3, qa3) FQK2(4, qa4) FQK2(5, qa5) FQK2(6, qa6) FQK2(7, qa7)
+        FQK2(8, qa8) FQK2(9, qa9) FQK2(10, qa10) FQK2(11, qa11) FQK2(12, qa12) FQK2(13, qa13) FQK2(14, qa14) FQK2(15, qa15)
+        simdgroup_store(s0, S + 0, SLD2); simdgroup_store(s1, S + 8, SLD2);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        float x[4];
+        float bm = -INFINITY;
+        for (uint j = 0; j < 4; j++) {
+            uint col = part * 4 + j;
+            x[j] = kb + col < p.tk ? S[r * SLD2 + col] * p.scale : -INFINITY;
+            bm = max(bm, x[j]);
+        }
+        bm = max(bm, simd_shuffle_xor(bm, 1));
+        bm = max(bm, simd_shuffle_xor(bm, 2));
+        float mn = max(m, bm);
+        float alpha = exp(m - mn);
+        float ps = 0.0f;
+        for (uint j = 0; j < 4; j++) { float e = exp(x[j] - mn); S[r * SLD2 + part * 4 + j] = e; ps += e; }
+        ps += simd_shuffle_xor(ps, 1);
+        ps += simd_shuffle_xor(ps, 2);
+        l = l * alpha + ps;
+        m = mn;
+        if (part == 0) D[r * 9] = alpha;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        FSCALE2
+        FPV2(0) FPV2(1)
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (part == 0) D[r * 9] = 1.0f / l;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    FSCALE2
+    device float* os = o + (ulong)q0 * p.d + hoff;
+    FST2(o0, 0) FST2(o1, 1) FST2(o2, 2) FST2(o3, 3) FST2(o4, 4) FST2(o5, 5) FST2(o6, 6) FST2(o7, 7)
+    FST2(o8, 8) FST2(o9, 9) FST2(o10, 10) FST2(o11, 11) FST2(o12, 12) FST2(o13, 13) FST2(o14, 14) FST2(o15, 15)
 }
 "#;
 
@@ -1180,6 +1272,8 @@ pub struct MetalBackend {
     softmax: Id,
     /// Fused attention for head size 64 without a mask (`flash_attn64`).
     flash64: Id,
+    /// The same for head size 128 (`flash_attn128`).
+    flash128: Id,
     /// Matrix-unit kernels, when the device has them (and `OXINFER_METAL_MMA` allows), or why
     /// they failed to compile.
     mma: Option<Mma>,
@@ -1346,6 +1440,7 @@ impl MetalBackend {
         let row_stats = pipeline(c"row_stats")?;
         let softmax = pipeline(c"softmax_rows")?;
         let flash64 = pipeline(c"flash_attn64")?;
+        let flash128 = pipeline(c"flash_attn128")?;
         let mma = if has_mma {
             let gg = |prefix: &str| {
                 GGUF_MMA_TYPES
@@ -1463,6 +1558,7 @@ impl MetalBackend {
             row_stats,
             softmax,
             flash64,
+            flash128,
             mma,
             mma_error,
             staging: Mutex::new(Staging {
@@ -1670,11 +1766,12 @@ impl Enc<'_> {
 }
 
 impl MetalBackend {
-    /// Unmasked attention with 64-dimensional heads in one fused kernel (`flash_attn64`): the
-    /// operands keep the model's `[rows][heads * 64]` layout, so staging is three plain copies.
+    /// Unmasked attention with 64- or 128-dimensional heads in one fused kernel (`flash_attn64` /
+    /// `flash_attn128`): the operands keep the model's `[rows][heads * dh]` layout, so staging is
+    /// three plain copies.
     #[allow(clippy::too_many_arguments)]
-    fn flash_attention(&self, q: &[f32], k: &[f32], v: &[f32], tq: usize, tk: usize, heads: usize, out: &mut [f32]) -> bool {
-        let d = heads * 64;
+    fn flash_attention(&self, q: &[f32], k: &[f32], v: &[f32], tq: usize, tk: usize, heads: usize, dh: usize, out: &mut [f32]) -> bool {
+        let d = heads * dh;
         let tqp = tq.next_multiple_of(32);
         let mut st = self.staging.lock().unwrap();
         let st = &mut *st;
@@ -1706,9 +1803,9 @@ impl MetalBackend {
             tq: tq as u32,
             tk: tk as u32,
             d: d as u32,
-            scale: 0.125,
+            scale: 1.0 / (dh as f32).sqrt(),
         };
-        let pipe = self.flash64;
+        let pipe = if dh == 128 { self.flash128 } else { self.flash64 };
         let mut out = out;
         self.submit(
             t0,
@@ -2215,8 +2312,8 @@ impl Backend for MetalBackend {
         if q.len() < tq * d || k.len() < tk * d || v.len() < tk * d || out.len() < tq * d || tq == 0 || tk == 0 {
             return false;
         }
-        if dh == 64 && !causal {
-            return self.flash_attention(q, k, v, tq, tk, heads, out);
+        if (dh == 64 || dh == 128) && !causal {
+            return self.flash_attention(q, k, v, tq, tk, heads, dh, out);
         }
         // GEMM tiling: out rows (keys, value dims) in multiples of 64, K in multiples of 32.
         let (dhp, dho, tkp, tqp) = (

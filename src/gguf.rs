@@ -736,6 +736,20 @@ pub struct HfTensor {
 
 /// The tensors of a GGUF file the loaders use, under Hugging Face names.
 pub fn hf_tensors(h: &Header) -> Result<Vec<HfTensor>> {
+    // Diffusion transformers (city96-style FLUX quants) keep their original tensor names.
+    if h.arch() == "flux" {
+        return Ok(h
+            .tensors
+            .iter()
+            .map(|t| HfTensor {
+                name: t.name.clone(),
+                shape: t.ne.iter().rev().copied().collect(),
+                ggml_type: t.ggml_type,
+                start: t.start,
+                end: t.end,
+            })
+            .collect());
+    }
     h.model_type()?;
     let (arch, n_layers) = (h.arch().to_string(), h.n_layers());
     Ok(h.tensors

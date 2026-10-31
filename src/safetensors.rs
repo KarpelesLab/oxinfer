@@ -505,8 +505,16 @@ impl ModelFiles {
                 copies: Mutex::new(HashMap::new()),
             });
         }
-        let single = dir.join("model.safetensors");
-        let idx = dir.join("model.safetensors.index.json");
+        let mut single = dir.join("model.safetensors");
+        let mut idx = dir.join("model.safetensors.index.json");
+        // diffusers component folders (`transformer/`, `unet/`): diffusion_pytorch_model.*.
+        if !crate::fsx::exists(&single) && !crate::fsx::exists(&idx) {
+            let d = dir.join("diffusion_pytorch_model.safetensors");
+            let di = dir.join("diffusion_pytorch_model.safetensors.index.json");
+            if crate::fsx::exists(&d) || crate::fsx::exists(&di) {
+                (single, idx) = (d, di);
+            }
+        }
         let mut files: Vec<PathBuf> = Vec::new();
         let torch = dir.join("pytorch_model.bin");
         let torch_idx = dir.join("pytorch_model.bin.index.json");

@@ -30,6 +30,7 @@ pub mod decide;
 pub mod drafter;
 pub mod embed;
 pub mod engine;
+pub mod flux;
 pub mod fsx;
 pub mod generate;
 pub mod ggml;
