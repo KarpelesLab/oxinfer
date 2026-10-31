@@ -13,7 +13,6 @@ use std::time::Instant;
 /// FLUX-specific flags.
 #[derive(Default, Debug)]
 pub struct FluxArgs {
-    pub init_image: Option<PathBuf>,
     pub transformer: Option<String>,
     pub text_encoder: Option<String>,
     pub base: Option<String>,
@@ -26,7 +25,6 @@ impl FluxArgs {
     /// Takes `flag` (with its value from `val`) if it is a FLUX flag.
     pub fn parse(&mut self, flag: &str, val: &mut dyn FnMut() -> Result<String>) -> Result<bool> {
         match flag {
-            "--init-image" => self.init_image = Some(PathBuf::from(val()?)),
             "--transformer" => self.transformer = Some(val()?),
             "--text-encoder" => self.text_encoder = Some(val()?),
             "--base" => self.base = Some(val()?),
@@ -64,6 +62,8 @@ transformer such as QuantStack/FLUX.1-Kontext-dev-GGUF:Q4_0 or city96/FLUX.1-sch
 
 pub fn run(args: &Args) -> Result<()> {
     let f = &args.flux;
+    // The image to edit: --init-image (shared with Stable Diffusion editing), or the first --image.
+    let init = args.init_image.as_ref().or(args.images.first());
     let opts = LoadOptions {
         quant: args.quant,
         text_quant: f.text_quant,
@@ -72,7 +72,7 @@ pub fn run(args: &Args) -> Result<()> {
         base: f.base.clone(),
         device: args.device,
         cache_dir: args.cache_dir.clone(),
-        vae_encoder: f.init_image.is_some(),
+        vae_encoder: init.is_some(),
     };
     let t0 = Instant::now();
     let pipe = Pipeline::load(&args.model.to_string_lossy(), &opts)?;
@@ -110,7 +110,7 @@ pub fn run(args: &Args) -> Result<()> {
     if let Some(m) = f.max_area {
         o.max_area = m;
     }
-    let image = match &f.init_image {
+    let image = match init {
         None => None,
         Some(p) => {
             #[cfg(feature = "media")]

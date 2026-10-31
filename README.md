@@ -12,7 +12,7 @@ formats may still change.
 
 Local LLM inference in pure Rust: Gemma 4 (text, images, video, audio), Qwen 3.5 / 3.6 / 3.8
 (text, images, video), Gemma 3 and Qwen 3 today, more model families as they come; also
-embeddings, Stable Diffusion, Whisper speech to text and Orpheus text to speech. No BLAS, no ML framework: weights are read straight out
+embeddings, Stable Diffusion, FLUX.1 Kontext image editing, Whisper speech to text and Orpheus text to speech. No BLAS, no ML framework: weights are read straight out
 of the safetensors files (HuggingFace checkpoints or MLX 4-bit ones) and every operation
 (matmuls, attention, norms, RoPE, sampling) is implemented here, with hand-written SIMD kernels
 (NEON, AVX2, wasm simd128) and its own thread pool. The CPU path runs everywhere; GPUs (Metal,
@@ -74,6 +74,10 @@ optional.
 | vinesmsuic/magicbrush-jul7 (MagicBrush: InstructPix2Pix fine-tuned for local edits) | 1.1B | 4.3 GB (fp32 `.bin`) | instruction edits ("add a red car"); matches diffusers |
 | deepseek-ai/Janus-Pro-1B | 2.1B (1.5B LM) | 4.2 GB (`pytorch_model.bin`) | text-to-image (384x384) and image understanding; matches the official `janus` package (all 576 greedy image tokens identical; see [Janus-Pro](#janus-pro-text-to-image-and-image-understanding)) |
 | deepseek-ai/Janus-Pro-7B | 7.4B | 14.8 GB (sharded `.bin`) | same; matches the reference (logits, first 64 greedy image tokens) |
+| black-forest-labs/FLUX.1-Kontext-dev (ungated copy: unsloth/FLUX.1-Kontext-dev) | 12B + T5-XXL 4.7B + CLIP-L | 23.8 GB + 9.5 GB | instruction-based image editing (and text to image); matches diffusers' FluxKontextPipeline (transformer blocks 3e-6, 55 dB end to end on a Q4_0 GGUF; see [FLUX.1 Kontext](#flux1-kontext-image-editing-from-instructions-and-flux1-text-to-image)); FLUX.1 [dev] Non-Commercial License |
+| QuantStack/FLUX.1-Kontext-dev-GGUF | 12B | 4.0 GB (Q2_K) - 12.7 GB (Q8_0) | the same with a GGUF transformer (any block format, zero-copy); T5 / CLIP / VAE from unsloth/FLUX.1-Kontext-dev |
+| city96/FLUX.1-schnell-gguf, city96/FLUX.1-dev-gguf | 12B | 6.8 GB (Q4_0) | text to image (schnell: 4 steps, Apache 2.0); schnell Q4_0 matches diffusers at 61.6 dB |
+| city96/t5-v1_1-xxl-encoder-gguf | 4.7B | 2.9 GB (Q4_K_M) - 5.1 GB (Q8_0) | FLUX's T5 encoder as GGUF (`--text-encoder`) |
 | anemll/* (ANEMLL Core ML: Qwen3, Qwen2.5, Gemma 3, Llama 3.2, ...) | 0.27B-1.7B tested | 0.3-1.5 GB (LUT6) | Apple Neural Engine via Core ML; same tokens as ANEMLL's runtime (see [Core ML](#core-ml--apple-neural-engine)) |
 | openai/whisper-tiny, -base, -small, -medium (and `.en`) | 39M-769M | 0.15-3.1 GB (fp32) | speech to text; transcripts match transformers token for token (see [Speech to text](#speech-to-text-whisper)) |
 | openai/whisper-large-v3, -large-v3-turbo, distil-whisper/distil-large-v3 | 1.55B / 809M / 756M | 3.1 / 1.6 / 1.5 GB (fp16) | speech to text; match transformers token for token |
@@ -905,7 +909,8 @@ SiLU applied while the input is loaded), and attention runs its two products as 
 softmax kernel between them. What stays on the CPU is element-wise: residual adds, the GEGLU gate,
 upsampling and skip concatenation. `OXINFER_GPU_CHECK=1` recomputes every device op on the CPU and
 prints the worst relative error per kind (about 4e-6 for attention, 1e-6 for the fused norms, on
-Metal and WebGPU). SDXL, SD 3 and Flux use different architectures and are not supported.
+Metal and WebGPU). SDXL and SD 3 use different architectures and are not supported; FLUX.1 has
+its own pipeline (see [FLUX.1 Kontext](#flux1-kontext-image-editing-from-instructions-and-flux1-text-to-image)).
 
 **LoRA.** `--lora FILE[:SCALE]` (repeatable, scale 1 by default) merges a LoRA into the UNet and
 text-encoder weights at load, `W += scale * alpha / rank * up @ down` in f32 before the bf16
@@ -1090,7 +1095,175 @@ unmasked pixels after inpainting (as diffusers by default: the VAE round trip sl
 them); the mask is binary (no feathering); InstructPix2Pix with `--strength` is not a thing
 (diffusers has none: it always starts from noise); image guidance needs text guidance above 1, so
 the 4-step LCM-LoRA path has no image-guidance knob. Bigger instruction editors
-(Qwen-Image-Edit, FLUX.1 Kontext, Step1X-Edit, OmniGen2, BAGEL) need their own architectures.
+(Qwen-Image-Edit, FLUX.1 Kontext, Step1X-Edit, OmniGen2, BAGEL) need their own architectures;
+FLUX.1 Kontext has one, [below](#flux1-kontext-image-editing-from-instructions-and-flux1-text-to-image).
+
+## FLUX.1 Kontext: image editing from instructions (and FLUX.1 text to image)
+
+FLUX.1 Kontext [dev] edits an image the way an instruction says: "make it night", "put a red
+knitted hat on the dog", "change the text on the sign to ...". The same transformer family does
+text to image as FLUX.1 [schnell] and [dev]. `src/flux/` follows diffusers'
+`FluxKontextPipeline` and `FluxPipeline`. A diffusers FLUX folder, or a FLUX GGUF transformer,
+switches oxinfer to it:
+
+```sh
+# editing: --init-image is the picture, --prompt the instruction (34 GB download, bf16)
+./target/release/oxinfer --model unsloth/FLUX.1-Kontext-dev --init-image photo.png \
+    -p "Make it night, with the porch lamps lit" --guidance 2.5 -o night.png
+# the transformer as a GGUF quant (6.8 GB at Q4_0); T5, CLIP, VAE and tokenizers then come from
+# unsloth/FLUX.1-Kontext-dev (--base), without its 24 GB transformer
+./target/release/oxinfer --model QuantStack/FLUX.1-Kontext-dev-GGUF:Q4_0 --text-quant q8 \
+    --init-image sign.png -p 'Change the text on the sign to "OXINFER CAFE"' -o cafe.png
+# quantize the bf16 checkpoint at load instead (q8 / q4), T5 included
+./target/release/oxinfer --model unsloth/FLUX.1-Kontext-dev --quant q4 --init-image in.png -p "..." -o out.png
+# text to image with FLUX.1 [schnell] (4 steps, no guidance)
+./target/release/oxinfer --model city96/FLUX.1-schnell-gguf:Q4_0 \
+    -p "a photograph of a golden retriever on a farmhouse porch" --size 1024x768 -o dog.png
+```
+
+| Flag | Meaning |
+|---|---|
+| `--init-image FILE` | the image to edit (PNG, JPEG, WebP, ...); without it, text to image |
+| `-p TEXT` | the instruction (editing) or the prompt |
+| `--steps N`, `--guidance F`, `--seed N` | 28 steps (4 for schnell); distilled guidance 3.5 as diffusers (BFL suggests 2.5 for edits); seed 42 |
+| `--size WxH` | output aspect ratio; editing rescales it to `--max-area` pixels (default: the input's size, so the edit keeps its aspect ratio; diffusers' own default is 1024x1024) |
+| `--max-area N` | editing: output pixels, default 1048576 (1024^2), rounded to multiples of 16 |
+| `--no-auto-resize` | editing: keep the input at its own size (rounded down to 16) instead of the closest of Kontext's 17 preferred ~1 MP resolutions |
+| `--quant bf16\|q8\|q4` | transformer precision when stored as float; `--text-quant` sets T5's (default: `--quant`) |
+| `--transformer SPEC` | a transformer replacing the folder's: GGUF file or `org/name:QUANT` |
+| `--text-encoder SPEC` | a T5 encoder GGUF (`city96/t5-v1_1-xxl-encoder-gguf:Q8_0`) replacing `text_encoder_2/` |
+| `--base SPEC` | with a GGUF `--model`: where T5, CLIP, the VAE and the tokenizers come from (default `unsloth/FLUX.1-Kontext-dev`) |
+
+**What runs.** The prompt goes through CLIP-L (the pooled embedding, `sd::clip`) and the T5 v1.1
+XXL encoder (512 tokens padded with `<pad>`, attended like any token as diffusers does; 256 for
+schnell). For an edit, the input is resized with Pillow-exact Lanczos (diffusers'
+`VaeImageProcessor`) to the preferred resolution closest to its aspect ratio, encoded by the VAE
+(posterior mean, `(z - 0.1159) * 0.3611`), packed in 2x2 patches and appended to the noise tokens
+with RoPE index 1 on the first axis (the noise is at index 0, text tokens at 0, 0, 0). The output
+size is the requested one rescaled to `max_area` (Python's round-half-even, then multiples of 16).
+Sigmas are `linspace(1, 1/steps)` shifted by `mu`, linear in the number of noise tokens between
+(256, 0.5) and (4096, 1.15) (`FlowMatchEulerDiscreteScheduler`, dynamic shifting); FLUX.1 [schnell]
+uses no shift. Each step runs the transformer on `[text; noise; reference]` with the guidance scale
+as an input (guidance distillation: one pass per step, no unconditional pass; `true_cfg_scale` with
+a negative prompt adds one, as in diffusers), drops the reference tokens from its output, and takes
+an Euler step `x += (sigma_next - sigma) * v`. The latents are unpacked and decoded by the VAE.
+
+**Weights.** A diffusers folder or repo (`model_index.json`) loads every component; repo ids fetch
+only what the pipeline reads (component folders, not the top-level single-file checkpoints), so
+`unsloth/FLUX.1-Kontext-dev` is about 34 GB. The transformer loads from `transformer/` (bf16, borrowed
+from the mapped shards; `--quant q8|q4` quantizes at load) or from a GGUF file in the original
+black-forest-labs layout (city96 / QuantStack quants, any GGUF block format, zero-copy; fused
+`qkv` / `linear1` rows are split into separate layers without copying). The modulation vectors are
+computed with float activations even for quantized weights (a single row would otherwise take the
+int8 decode kernels, a 1e-3 error steering every block).
+
+| Repository | What | Size | License |
+|---|---|---|---|
+| unsloth/FLUX.1-Kontext-dev (ungated copy of the gated black-forest-labs/FLUX.1-Kontext-dev) | the whole pipeline, diffusers layout | 23.8 GB transformer + 9.5 GB T5 + 0.4 GB CLIP / VAE (bf16) | FLUX.1 [dev] Non-Commercial License |
+| QuantStack/FLUX.1-Kontext-dev-GGUF | Kontext transformer as GGUF, Q2_K to Q8_0 | 4.0 GB (Q2_K), 6.8 GB (Q4_0), 12.7 GB (Q8_0) | FLUX.1 [dev] Non-Commercial License |
+| city96/FLUX.1-schnell-gguf | FLUX.1 [schnell] transformer (text to image) | 6.8 GB (Q4_0) - 23.8 GB (F16) | Apache 2.0 |
+| city96/FLUX.1-dev-gguf | FLUX.1 [dev] transformer (text to image) | same | FLUX.1 [dev] Non-Commercial License |
+| city96/t5-v1_1-xxl-encoder-gguf | the T5 encoder as GGUF (`t5encoder`) | 2.9 GB (Q4_K_M), 5.1 GB (Q8_0) | Apache 2.0 |
+
+The FLUX.1 [dev] license (which covers Kontext [dev]) allows non-commercial use of the weights;
+it claims no rights over outputs, which may be used commercially except to train a competing
+model, and asks for content filtering or review of outputs and AI-generation disclosure where the
+law requires it. Read `LICENSE.md` in the repository before use. FLUX.1 [schnell] and the T5
+encoder are Apache 2.0.
+
+In the library (`Pipeline::load` takes the same specs as `--model`; `LoadOptions` has `quant`,
+`text_quant`, `transformer`, `text_encoder`, `base`, `device`, `cache_dir`, `vae_encoder`;
+`Options` are diffusers' call arguments, see `examples/flux_edit.rs`):
+
+```rust
+use oxinfer::flux::{LoadOptions, Options, Pipeline};
+let pipe = Pipeline::load("QuantStack/FLUX.1-Kontext-dev-GGUF:Q4_0", &LoadOptions::default())?;
+let photo = oxinfer::media::Media::new().load_image("photo.png".as_ref())?; // any video::RgbImage
+let opts = Options { guidance: Some(2.5), width: Some(photo.width), height: Some(photo.height), ..Default::default() };
+let (img, timings) = pipe.edit(&photo, "Make it night", &opts, &mut |step, steps| { eprint!("\r{step}/{steps}"); true })?;
+std::fs::write("night.png", oxinfer::png::encode_rgb(img.width, img.height, &img.rgb))?;
+let (img, _) = pipe.generate("a red fox in the snow", &Options::default(), &mut |_, _| true)?; // text to image
+```
+
+`edit_picture` takes an oxideav `Picture` and `Image::to_picture` returns one (feature
+`oxideav`); `cancel_handle()` stops a run from another thread. The C API has `oxi_flux_load`
+(`key=value` options), `oxi_flux_edit_rgb`, `oxi_flux_edit_file`, `oxi_flux_generate` (JSON
+options, the image through the `oxi_image_fn` callback, steps through `oxi_step_fn`, which can
+cancel), `oxi_flux_cancel` and `oxi_flux_free` (`include/oxinfer.h`).
+
+**Reusable parts** (Step1X-Edit, OmniGen2 and BAGEL use the same VAE; Qwen-Image and others the
+same scheduler):
+
+| Module | What | API |
+|---|---|---|
+| `flux::vae` | the 16-channel FLUX `AutoencoderKL`: encoder (new; diffusers' asymmetric-padding downsampler) and `sd::vae::VaeDecoder`, normalization, 2x2 packing | `Vae::load(dir, encoder)`, `encode(rgb, h, w) -> (latents, lh, lw)`, `decode(latents, lh, lw)`, `pack` / `unpack`, `rgb8_to_unit` / `unit_to_rgb8`, `chw_to_hwc` |
+| `flux::sched` | `FlowMatchEulerDiscreteScheduler`: shift, dynamic shifting (exponential / linear), shift_terminal, inverted sigmas | `FlowMatchEuler::load(json)`, `calculate_shift`, `plan(base_sigmas, mu)`, `flux_plan(steps, seq)`, `step`, `scale_noise` |
+| `flux::rope` | rotary embeddings over n-axis token ids (FLUX's 16/56/56 split, any split) | `Rope::new(ids, axes, theta)`, `Rope::flux_ids`, `apply(x, heads)` |
+| `flux::transformer` | `DoubleBlock` / `SingleBlock` (load from diffusers or BFL names, forward), `FluxTransformer`, `timestep_proj`, `ln_mod` | `FluxTransformer::load(path, quant)`, `forward(img, n_img, txt, n_txt, pooled, t, guidance, rope)` |
+| `flux::t5` | T5 v1.1 encoder (relative position buckets, gated GELU), safetensors or GGUF | `T5Encoder::load(dir, tokenizer_dir, quant)`, `encode(text, len)` |
+| `flux::weights` | linear layers from safetensors / GGUF at bf16, q8, q4 or any GGUF type, row splitting | `Loader { files, quant }`, `dense`, `split`, `rows`; `Dense::forward`, `forward_vec` |
+
+**Agreement with diffusers** (`tools/ref_flux.py` runs diffusers 0.42 / transformers 5.22 stage by
+stage on the same inputs and noise, `OXINFER_FLUX_DUMP=dir` writes oxinfer's stages; float32 on
+both sides, oxinfer with `OXINFER_METAL_MMA=0` unless noted):
+
+| Stage | rel L2 | |
+|---|---|---|
+| T5-XXL, 512 tokens (bf16 weights as stored) | 2.0e-5 | |
+| CLIP-L pooled embedding | 1.7e-6 | |
+| VAE encode (512x512 reference image) | 4.8e-5 | weights fp16 -> bf16 |
+| VAE decode | 5.6e-7 | 97.5 dB |
+| transformer, 2 double + 2 single blocks of the bf16 checkpoint, 2560 tokens | 2.9e-6 | `OXINFER_FLUX_LAYERS=2,2` vs the truncated diffusers model |
+| transformer, 1 + 1 blocks of a Q4_0 GGUF, weights dequantized by gguf-py | 2.8e-6 | |
+| whole transformer (19 + 38 blocks), Q4_0 GGUF, one step | 5.6e-6 | vs diffusers' GGUF loader, 2560 tokens |
+| Kontext edit, 512x512, 8 steps, Q4_0 GGUF, CPU | latents 3.1e-3 | 55.1 dB vs diffusers f32 |
+| FLUX.1 [schnell] Q4_0, 512x512, 4 steps | latents 9.4e-4 | 61.6 dB |
+| same, Metal matrix units (half-precision operands, the default) | latents 5.2e-2 | 37.8 dB (half-precision attention too); the same image to the eye |
+| Kontext edit, bf16, 28 steps, Metal default vs diffusers bf16 on MPS | | 43.4 dB |
+
+T5 at `--text-quant q8` is 1.9e-2 from bf16; city96's Q8_0 T5 GGUF is 11% off, almost all of it
+from its quantized token-embedding table (rows reach 231 in magnitude; the same weights in
+transformers give the same 11%), so the T5 GGUF files are for memory, not fidelity.
+
+**Speed and memory** on the M5 Max (18 cores, 128 GB, shared with other jobs: load average 12-27
+during these runs, so take the numbers as upper bounds). Per denoising step, steady state (the
+first step also uploads the weights); an edit at 1024x1024 has 8704 tokens per pass (512 text +
+4096 noise + 4096 reference), 512x512 with `--no-auto-resize --max-area 262144` 2560:
+
+| Transformer | Metal, 1024^2 | Metal, 512^2 | CPU, 1024^2 | CPU, 512^2 | peak footprint (1024^2, Metal) | max RSS |
+|---|---|---|---|---|---|---|
+| bf16 (mapped) | 9.4 s | 1.9 s | | 41 s | 12.7 GB | 15.6 GB |
+| `--quant q8` | 12.4 s | | | | 31.5 GB | 52.7 GB |
+| `--quant q4` | 10.7 s | | | | 22.3 GB | 50.5 GB |
+| Q8_0 GGUF (`--text-quant q8`) | 10.9 s | | | | 18.2 GB | 24.4 GB |
+| Q4_0 GGUF (`--text-quant q4`) | 13.8 s | 1.6 s | 208 s | 43 s | 15.6 GB | 23.1 GB |
+
+A whole 28-step 1024^2 edit takes 4.5-6.5 minutes on Metal (text encoding 1-2 s, VAE encode
+2 s, decode 3-4 s) and about 1.6 hours on the CPU alone; at 512^2 it is about a minute on Metal.
+The peak footprint counts the process's own memory (quantized copies, activations, Metal
+buffers), max RSS adds the mapped weight pages, which the OS can drop and re-read: bf16 and GGUF
+weights are used in place from the mapped files, so a machine with less RAM than the weights
+streams them from storage (slowly) instead of failing; `--quant q8|q4` makes in-memory copies
+and reads the bf16 files once at load (mapped, so the RSS shows them; the footprint is what
+stays). For small machines the GGUF files are the way: a Q4_0 transformer with a Q4_K_M T5
+(`--text-encoder city96/t5-v1_1-xxl-encoder-gguf:Q4_K_M`) is 9.7 GB on disk, all of it mapped.
+On Metal, every matmul runs on the GPU (M5's matrix units: half-precision operands) and
+attention uses a fused kernel on the matrix units (`flash_attn128_mma`: 7.2 -> 3.6 s per 1024^2
+step against the f32 kernel); norms, RoPE and the gates stay on the CPU. `OXINFER_METAL_MMA=0`
+gives the f32 kernels (the exact rows of the agreement table, 2-2.5x slower).
+
+**Sample edits** (FLUX.1 Kontext [dev] Q8_0, guidance 2.5, 28 steps, 1168x880 from 1024x768 inputs
+that FLUX.1 [schnell] generated): "Put a red knitted hat on the dog" keeps the dog, porch and
+lighting and adds a knitted beanie with a pom-pom; "Make it night time, with the porch lamps lit"
+darkens the scene with both wall lamps glowing; 'Change the text on the sign from "FRESH BREAD" to
+"OXINFER CAFE"' rewrites the carved shop sign in the same typeface and wood, leaving the rest of the
+storefront unchanged; "Turn this photo into a watercolor painting" restyles the whole picture.
+
+Not supported: several reference images (the Kontext pipeline takes one), IP-Adapter, LoRAs on
+FLUX, FLUX.1 Fill / Depth / Canny / Redux, FLUX image-to-image and inpainting pipelines,
+BFL single-file safetensors (`flux1-kontext-dev.safetensors`; the GGUF files and the diffusers
+folder cover the same weights), the browser build (the weights exceed its 4 GB), and CUDA runs
+(compile-checked only).
 
 ## Janus-Pro: text to image and image understanding
 
@@ -2965,6 +3138,10 @@ billion parameters at LUT4, `infer` only) are the practical range for 12 GB phon
   (encoder, decoder, cross-attention cache), `tokens.rs` (special tokens, languages, generation
   config), `align.rs` (word timestamps: DTW), `compress.rs` (the fallback's compression ratio),
   `mod.rs` (`Transcriber`: decoding rules, long-form windows, fallback); `whisper_cli.rs`: the CLI.
+- `flux/`: FLUX.1 / Kontext: `transformer.rs` (double / single stream blocks), `vae.rs` (FLUX VAE
+  encode / decode, latent packing), `sched.rs` (flow-matching Euler), `rope.rs` (multi-axis RoPE),
+  `t5.rs` (T5 encoder), `weights.rs` (layers from safetensors / GGUF), `mod.rs` (the pipelines);
+  `flux_cli.rs`: its CLI.
 - `sd/`: Stable Diffusion: `clip.rs` (BPE tokenizer, text encoder), `unet.rs`, `vae.rs`, `sched.rs`
   (Euler samplers), `ops.rs` (channels-last convolution, group/layer norm, multi-head attention on
   the f32 GEMM tiles); `png.rs`: a dependency-free PNG writer.
