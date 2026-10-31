@@ -47,8 +47,8 @@ transformer such as QuantStack/FLUX.1-Kontext-dev-GGUF:Q4_0 or city96/FLUX.1-sch
 \x20 -o, --output FILE     PNG to write (default image.png)\n\
 \x20 --steps N            denoising steps (default 28; 4 for schnell)\n\
 \x20 --guidance F         distilled guidance (default 3.5; BFL suggests 2.5 for edits)\n\
-\x20 --size WxH           output size (editing: rescaled to --max-area at that aspect ratio;\n\
-\x20                      default the input image's size, text to image 1024x1024)\n\
+\x20 --size WxH           output size, rounded to multiples of 16 (default: the input's aspect\n\
+\x20                      ratio at --max-area pixels; text to image 1024x1024)\n\
 \x20 --max-area N         editing: output pixels (default 1048576 = 1024^2)\n\
 \x20 --no-auto-resize     editing: keep the input size (rounded to 16) instead of the closest\n\
 \x20                      preferred Kontext resolution (about 1 MP)\n\
@@ -107,7 +107,9 @@ pub fn run(args: &Args) -> Result<()> {
         auto_resize: !f.no_auto_resize,
         ..Default::default()
     };
-    if let Some(m) = f.max_area {
+    // An explicit --size is the output area too, unless --max-area says otherwise (diffusers
+    // would rescale it to 1024x1024 pixels).
+    if let Some(m) = f.max_area.or(args.size.map(|(w, h)| w * h)) {
         o.max_area = m;
     }
     let image = match init {
@@ -127,7 +129,18 @@ pub fn run(args: &Args) -> Result<()> {
             }
         }
     };
-    // Editing keeps the input's aspect ratio unless --size says otherwise.
+    // Editing keeps the input's aspect ratio unless --size says otherwise. With --size the reference
+    // is resized to the output size too: Kontext gives the reference tokens the same positions as the
+    // output grid, so a ~1 MP reference under a smaller output comes out zoomed and shifted.
+    let image = match (image, args.size) {
+        (Some(img), Some((w, h))) if !f.no_auto_resize => {
+            let (w, h) = (w / 16 * 16, h / 16 * 16);
+            o.auto_resize = false;
+            let data = oxinfer::resample::resize_lanczos_rgb8(&img.data, img.width, img.height, w, h);
+            Some(oxinfer::video::RgbImage { width: w, height: h, data })
+        }
+        (image, _) => image,
+    };
     let (w, h) = args.size.or(image.as_ref().map(|i| (i.width, i.height))).unwrap_or((1024, 1024));
     (o.width, o.height) = (Some(w), Some(h));
     let (steps, mode) = (

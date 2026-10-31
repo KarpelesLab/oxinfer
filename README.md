@@ -1126,7 +1126,7 @@ switches oxinfer to it:
 | `--init-image FILE` | the image to edit (PNG, JPEG, WebP, ...); without it, text to image |
 | `-p TEXT` | the instruction (editing) or the prompt |
 | `--steps N`, `--guidance F`, `--seed N` | 28 steps (4 for schnell); distilled guidance 3.5 as diffusers (BFL suggests 2.5 for edits); seed 42 |
-| `--size WxH` | output aspect ratio; editing rescales it to `--max-area` pixels (default: the input's size, so the edit keeps its aspect ratio; diffusers' own default is 1024x1024) |
+| `--size WxH` | output size, rounded to multiples of 16 (sets `--max-area` to W x H unless given; default: the input's aspect ratio at 1024^2 pixels; diffusers would rescale any size to 1024^2) |
 | `--max-area N` | editing: output pixels, default 1048576 (1024^2), rounded to multiples of 16 |
 | `--no-auto-resize` | editing: keep the input at its own size (rounded down to 16) instead of the closest of Kontext's 17 preferred ~1 MP resolutions |
 | `--quant bf16\|q8\|q4` | transformer precision when stored as float; `--text-quant` sets T5's (default: `--quant`) |
