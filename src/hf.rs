@@ -431,6 +431,36 @@ fn anemll_wanted(name: &str) -> bool {
         || name.contains(".mlpackage/"))
 }
 
+/// Files of a diffusers pipeline repository (`model_index.json` at the root, as for
+/// `timbrooks/instruct-pix2pix`): the index, each component's configs and tokenizer files, and one
+/// safetensors weight file per component (the fp16 variant when there is one: half the download,
+/// and the weights are kept in bf16 anyway). The safety checker, the full single-file checkpoints
+/// at the root and PyTorch `.bin` duplicates are skipped.
+fn diffusers_files(list: &Listing) -> Vec<String> {
+    let mut files = vec!["model_index.json".to_string()];
+    let mut dirs: Vec<&str> = list
+        .keys()
+        .filter_map(|k| k.split_once('/').map(|(d, _)| d))
+        .filter(|d| !matches!(*d, "safety_checker" | "feature_extractor"))
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    for d in dirs {
+        let mut names: Vec<&String> = list.keys().filter(|k| k.split_once('/').is_some_and(|(p, _)| p == d)).collect();
+        names.sort();
+        for n in &names {
+            if n.ends_with(".json") || n.ends_with(".txt") || n.ends_with(".model") {
+                files.push(n.to_string());
+            }
+        }
+        let st: Vec<&&String> = names.iter().filter(|n| n.ends_with(".safetensors")).collect();
+        if let Some(f) = st.iter().find(|n| n.ends_with(".fp16.safetensors")).or_else(|| st.first()) {
+            files.push(f.to_string());
+        }
+    }
+    files
+}
+
 fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
     let list = listing(repo)?;
     if is_anemll_listing(&list) {
@@ -439,6 +469,15 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
         let count = files.len();
         for (i, f) in files.iter().enumerate() {
             let (size, src) = &list[*f];
+            fetch_file(repo, dir, f, *size, src, i + 1, count)?;
+        }
+        return Ok(());
+    }
+    if list.contains_key("model_index.json") {
+        let files = diffusers_files(&list);
+        let count = files.len();
+        for (i, f) in files.iter().enumerate() {
+            let (size, src) = &list[f];
             fetch_file(repo, dir, f, *size, src, i + 1, count)?;
         }
         return Ok(());

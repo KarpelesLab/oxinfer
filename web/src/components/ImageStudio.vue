@@ -1,6 +1,7 @@
 <script setup>
 // Text-to-image with Stable Diffusion (SD 1.5 with the LCM-LoRA by default) in the same module as
-// the chat.
+// the chat, and image editing: InstructPix2Pix instruction edits ("make it snowy"; with the same
+// LCM-LoRA, 4 steps), image-to-image and inpainting with a mask.
 import { computed, nextTick, onMounted, reactive, ref } from 'vue';
 import { Oxinfer, WebGpuHost, hasJspi } from '../lib/oxinfer.js';
 import { cachedBytes, loadDiffusersFromFolder, loadDiffusersFromUrl, loadLoras, sourceBase } from '../lib/loader.js';
@@ -22,6 +23,16 @@ const PRESETS = {
     ancestral: true,
   },
   turbo: { repo: 'stabilityai/sd-turbo', name: 'SD-Turbo', loras: [], steps: 1, guidance: 0, ancestral: true },
+  // InstructPix2Pix is a fine-tuned SD 1.5, so the SD 1.5 LCM-LoRA applies too: 4 steps instead
+  // of 20 guided ones (60 UNet passes), at the cost of the image guidance (no guidance at all).
+  pix2pix: {
+    repo: 'timbrooks/instruct-pix2pix',
+    name: 'InstructPix2Pix',
+    loras: ['latent-consistency/lcm-lora-sdv1-5/pytorch_lora_weights.safetensors'],
+    steps: 4,
+    guidance: 1,
+    ancestral: true,
+  },
 };
 const params = new URLSearchParams(location.search);
 
@@ -44,6 +55,12 @@ const seed = ref(Number(params.get('seed') ?? 42));
 const randomSeed = ref(params.get('seed') === null);
 const step = reactive({ i: 0, n: 0 });
 const result = ref(null); // { width, height, url, secs, seed }
+// Editing: the input image and mask ({ width, height, rgb, url }), what the model does with them.
+const inputImg = ref(null);
+const maskImg = ref(null);
+const editKind = ref('img2img'); // img2img | inpaint | instruct
+const strength = ref(0.8);
+const imageGuidance = ref(1.5);
 const canvas = ref(null);
 let engine = null;
 let gpuHost = null;
@@ -98,7 +115,13 @@ async function load() {
     steps.value = Number(params.get('steps') || d.steps);
     guidance.value = Number(params.get('guidance') ?? d.guidance);
     ancestral.value = params.has('sampler') ? params.get('sampler') !== 'euler' : (preset?.ancestral ?? true);
-    size.value = engine.sdDefaults().size;
+    const info = engine.sdDefaults();
+    size.value = info.size;
+    editKind.value = info.edit;
+    strength.value = info.turbo ? 0.5 : 0.8;
+    if (params.get('image')) inputImg.value = await decodeImage(await (await fetch(params.get('image'))).blob());
+    if (params.get('mask')) maskImg.value = await decodeImage(await (await fetch(params.get('mask'))).blob());
+    if (params.get('strength')) strength.value = Number(params.get('strength'));
     phase.value = 'ready';
   } catch (e) {
     error.value = friendly(e);
@@ -116,18 +139,74 @@ function friendly(e) {
   return m;
 }
 
+// An image file (any format the browser decodes) as RGB8, the longer side at most 1024 pixels
+// (the pipeline scales it to the model's size anyway).
+async function decodeImage(file) {
+  const bmp = await createImageBitmap(file);
+  const k = Math.min(1, 1024 / Math.max(bmp.width, bmp.height));
+  const w = Math.max(1, Math.round(bmp.width * k));
+  const h = Math.max(1, Math.round(bmp.height * k));
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
+  const ctx = c.getContext('2d');
+  ctx.drawImage(bmp, 0, 0, w, h);
+  const rgba = ctx.getImageData(0, 0, w, h).data;
+  const rgb = new Uint8Array(w * h * 3);
+  for (let i = 0, j = 0; j < rgb.length; i += 4, j += 3) {
+    rgb[j] = rgba[i];
+    rgb[j + 1] = rgba[i + 1];
+    rgb[j + 2] = rgba[i + 2];
+  }
+  return { width: w, height: h, rgb, url: c.toDataURL('image/png') };
+}
+
+async function pick(e, target) {
+  const f = e.target.files?.[0];
+  if (!f) return;
+  try {
+    target.value = await decodeImage(f);
+  } catch (err) {
+    error.value = `That file could not be read as an image (${err.message || err}).`;
+  }
+}
+
+function clearInput() {
+  inputImg.value = null;
+  maskImg.value = null;
+}
+
+const editing = computed(() => !!inputImg.value);
+const needsImage = computed(() => editKind.value !== 'img2img');
+const usesStrength = computed(() => editKind.value !== 'instruct');
+// Image-to-image runs the last steps * strength steps of the schedule: at least one.
+const runSteps = computed(() => (editing.value && usesStrength.value && strength.value < 1 ? Math.max(steps.value, Math.ceil(1 / strength.value - 1e-4)) : steps.value));
+
 async function generate() {
   if (!engine || phase.value !== 'ready' || !prompt.value.trim()) return;
+  if (needsImage.value && !inputImg.value) {
+    error.value = editKind.value === 'instruct' ? 'This model edits images: choose an image first.' : 'This inpainting model needs an image and a mask.';
+    return;
+  }
+  if (editKind.value === 'inpaint' && !maskImg.value) {
+    error.value = 'This inpainting model needs a mask (white where to repaint).';
+    return;
+  }
   error.value = '';
   phase.value = 'generating';
   if (randomSeed.value) seed.value = Math.floor(Math.random() * 2 ** 31);
-  Object.assign(step, { i: 0, n: steps.value });
+  Object.assign(step, { i: 0, n: runSteps.value });
   await nextTick();
   await pause();
   const t0 = performance.now();
   try {
+    engine.sdSetInput(inputImg.value, usesStrength.value ? maskImg.value : null, {
+      strength: usesStrength.value ? strength.value : 0,
+      imageGuidance: imageGuidance.value,
+    });
+    const side = editing.value ? 0 : size.value;
     const img = await engine.sdGenerate(
-      { prompt: prompt.value, negative: negative.value, steps: steps.value, guidance: guidance.value, seed: seed.value, width: size.value, height: size.value, ancestral: ancestral.value },
+      { prompt: prompt.value, negative: negative.value, steps: runSteps.value, guidance: guidance.value, seed: seed.value, width: side, height: side, ancestral: ancestral.value },
       (i, n) => Object.assign(step, { i, n }),
     );
     const secs = (performance.now() - t0) / 1e3;
@@ -210,10 +289,17 @@ onMounted(async () => {
             </span>
           </label>
           <label class="choice">
+            <input v-model="source" type="radio" value="pix2pix" />
+            <span>
+              <strong>InstructPix2Pix</strong>
+              <small>2.1 GB from Hugging Face. Edits a picture you give it by instruction (“make it snowy”), in 4 steps with the LCM-LoRA.</small>
+            </span>
+          </label>
+          <label class="choice">
             <input v-model="source" type="radio" value="custom" />
             <span>
               <strong>Another Stable Diffusion model</strong>
-              <small>A diffusers repo id or folder URL (SD 1.x or 2.x).</small>
+              <small>A diffusers repo id or folder URL (SD 1.x or 2.x, inpainting models too).</small>
             </span>
           </label>
           <template v-if="source === 'custom'">
@@ -241,6 +327,36 @@ onMounted(async () => {
         <p v-if="error" class="error" role="alert">{{ error }}</p>
       </section>
 
+      <section v-if="phase === 'ready' || phase === 'generating'" aria-labelledby="img-edit-h">
+        <h2 id="img-edit-h">{{ editKind === 'instruct' ? 'Image to edit' : 'Start from an image' }}</h2>
+        <p class="hint">
+          {{
+            editKind === 'instruct'
+              ? 'Choose a picture, then say what to change.'
+              : editKind === 'inpaint'
+                ? 'Choose a picture and a mask: white parts are repainted from the description.'
+                : 'Optional. The description then redraws the picture; with a mask, only its white parts.'
+          }}
+        </p>
+        <label class="block">Image
+          <input class="field" type="file" accept="image/*" :disabled="busy" @change="(e) => pick(e, inputImg)" />
+        </label>
+        <img v-if="inputImg" class="thumb" :src="inputImg.url" :alt="`Input image, ${inputImg.width}×${inputImg.height}`" />
+        <template v-if="usesStrength">
+          <label class="block">Mask ({{ editKind === 'inpaint' ? 'required' : 'optional' }})
+            <input class="field" type="file" accept="image/*" :disabled="busy" @change="(e) => pick(e, maskImg)" />
+          </label>
+          <img v-if="maskImg" class="thumb" :src="maskImg.url" alt="Mask" />
+          <label class="inline">Strength <input v-model.number="strength" class="num" type="number" min="0.05" max="1" step="0.05" /></label>
+          <p class="hint">How much of the picture is redrawn: low keeps it, 1 starts from noise.</p>
+        </template>
+        <template v-else>
+          <label class="inline">Image guidance <input v-model.number="imageGuidance" class="num" type="number" min="1" max="5" step="0.1" /></label>
+          <p class="hint">How closely the result keeps to the picture. Used with a guidance above 1 (not with the LCM-LoRA).</p>
+        </template>
+        <button v-if="inputImg || maskImg" class="link" type="button" :disabled="busy" @click="clearInput">Clear the image</button>
+      </section>
+
       <section v-if="phase === 'ready' || phase === 'generating'" aria-labelledby="img-set-h">
         <h2 id="img-set-h">Settings</h2>
         <label class="inline">Steps <input v-model.number="steps" class="num" type="number" min="1" max="100" /></label>
@@ -251,7 +367,7 @@ onMounted(async () => {
             <option :value="true">Euler ancestral</option>
           </select>
         </label>
-        <label class="inline">Size
+        <label v-if="!editing" class="inline">Size
           <select v-model.number="size">
             <option :value="256">256 × 256</option>
             <option :value="384">384 × 384</option>
@@ -272,7 +388,13 @@ onMounted(async () => {
       <div class="stage">
         <canvas v-show="result" ref="canvas" class="picture" :aria-label="result ? `Generated image: ${prompt}` : ''"></canvas>
         <p v-if="!result && phase !== 'generating'" class="empty">
-          {{ phase === 'ready' ? 'Describe an image, then press Generate.' : 'Load an image model, then describe a picture.' }}
+          {{
+            phase !== 'ready'
+              ? 'Load an image model, then describe a picture.'
+              : editKind === 'instruct'
+                ? 'Choose an image, then say what to change.'
+                : 'Describe an image, then press Generate.'
+          }}
         </p>
         <p v-if="phase === 'generating'" class="working" role="status">
           {{ step.i < step.n ? `Denoising, step ${step.i + 1} of ${step.n}…` : 'Decoding the image…' }}
@@ -283,9 +405,16 @@ onMounted(async () => {
         </p>
       </div>
       <form class="composer" @submit.prevent="generate">
-        <textarea v-model="prompt" rows="2" :placeholder="phase === 'idle' ? 'Load a model first' : 'Describe the image'" aria-label="Image description" :disabled="!engine" @keydown="onKey"></textarea>
+        <textarea
+          v-model="prompt"
+          rows="2"
+          :placeholder="phase === 'idle' ? 'Load a model first' : editKind === 'instruct' ? 'Say what to change, e.g. make it winter' : 'Describe the image'"
+          :aria-label="editKind === 'instruct' ? 'Edit instruction' : 'Image description'"
+          :disabled="!engine"
+          @keydown="onKey"
+        ></textarea>
         <div class="actions">
-          <button type="submit" class="primary" :disabled="phase !== 'ready' || !prompt.trim()">Generate</button>
+          <button type="submit" class="primary" :disabled="phase !== 'ready' || !prompt.trim()">{{ editing ? 'Edit' : 'Generate' }}</button>
         </div>
       </form>
     </section>
@@ -428,6 +557,14 @@ button:disabled {
 .stage {
   overflow: auto;
   padding: 1.5rem clamp(1rem, 4vw, 3rem);
+}
+.thumb {
+  display: block;
+  max-width: 100%;
+  max-height: 10rem;
+  margin: 0.5rem 0;
+  border-radius: 4px;
+  box-shadow: 0 0 0 1px var(--line);
 }
 .picture {
   display: block;

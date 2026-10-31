@@ -213,12 +213,15 @@ impl Linear {
     }
 }
 
-/// A k x k convolution (padding k/2), held as a `[out, k*k*in]` matmul over unfolded pixels.
+/// A k x k convolution (zero padding k/2 on every side unless loaded with
+/// [`Conv::load_padded`]), held as a `[out, k*k*in]` matmul over unfolded pixels.
 pub struct Conv {
     lin: Linear,
     pub k: usize,
     pub cin: usize,
     pub cout: usize,
+    /// Zero padding before (top / left) and after (bottom / right) the input.
+    pad: (usize, usize),
 }
 
 /// Upper bound on the unfold buffer of one convolution chunk.
@@ -248,33 +251,49 @@ impl Conv {
             }
         }
         let lin = Linear::from_parts(&r, cout, k * k * cin, Linear::bias(t, prefix, cout)?)?;
-        Ok(Self { lin, k, cin, cout })
+        Ok(Self {
+            lin,
+            k,
+            cin,
+            cout,
+            pad: (k / 2, k / 2),
+        })
+    }
+
+    /// A convolution with asymmetric zero padding: `before` rows / columns above and left of the
+    /// input, `after` below and right (diffusers' `Downsample2D` with `padding=0` pads (0, 1)).
+    pub fn load_padded(t: &Tensors, prefix: &str, before: usize, after: usize) -> Result<Self> {
+        let mut c = Self::load(t, prefix)?;
+        c.pad = (before, after);
+        Ok(c)
     }
 
     /// `x` is `[h*w, cin]`; returns `([oh*ow, cout], oh, ow)` for the given stride.
     pub fn forward(&self, x: &[f32], h: usize, w: usize, stride: usize) -> (Vec<f32>, usize, usize) {
         debug_assert_eq!(x.len(), h * w * self.cin);
         let g = self.geom(h, w, stride);
-        if self.k == 1 && stride == 1 {
+        if self.k == 1 && stride == 1 && self.pad == (0, 0) {
             let _t = timing::start(timing::CONV);
             return (self.lin.forward_untimed(x, h * w), h, w);
         }
         if let Some(y) = self.lin.device_conv(x, g, None) {
+            check_gpu("conv", &y, || self.forward_cpu(x, h, w, stride));
             return (y, g.oh, g.ow);
         }
         (self.forward_cpu(x, h, w, stride), g.oh, g.ow)
     }
 
     fn geom(&self, h: usize, w: usize, stride: usize) -> crate::gpu::ConvGeom {
-        let pad = self.k / 2;
-        let oh = (h + 2 * pad - self.k) / stride + 1;
-        let ow = (w + 2 * pad - self.k) / stride + 1;
+        let (before, after) = self.pad;
+        let oh = (h + before + after - self.k) / stride + 1;
+        let ow = (w + before + after - self.k) / stride + 1;
         crate::gpu::ConvGeom {
             h,
             w,
             cin: self.cin,
             k: self.k,
             stride,
+            pad: before,
             oh,
             ow,
         }
@@ -298,10 +317,9 @@ impl Conv {
     /// Unfold on the CPU, then the shared matmul.
     fn forward_cpu(&self, x: &[f32], h: usize, w: usize, stride: usize) -> Vec<f32> {
         let (k, cin, cout) = (self.k, self.cin, self.cout);
-        let pad = k / 2;
-        let oh = (h + 2 * pad - k) / stride + 1;
-        let ow = (w + 2 * pad - k) / stride + 1;
-        if k == 1 && stride == 1 {
+        let g = self.geom(h, w, stride);
+        let (pad, oh, ow) = (g.pad, g.oh, g.ow);
+        if k == 1 && stride == 1 && pad == 0 {
             return self.lin.forward_untimed(x, h * w);
         }
         let row = k * k * cin;
@@ -482,6 +500,7 @@ impl Linear {
             cin: self.n_in,
             k: 1,
             stride: 1,
+            pad: 0,
             oh: rows,
             ow: 1,
         };

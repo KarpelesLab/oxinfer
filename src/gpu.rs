@@ -42,8 +42,10 @@ pub struct Job<'a> {
     pub y: &'a mut [f32],
 }
 
-/// Geometry of a k x k convolution with padding k/2 over channels-last input `[h*w, cin]`,
-/// producing `[oh*ow, n_out]`; the weights are in the unfolded `[n_out][ky][kx][cin]` layout.
+/// Geometry of a k x k convolution over channels-last input `[h*w, cin]`, zero padded by `pad`
+/// pixels before the first row and column (k/2 for a "same" convolution; the zero padding after
+/// the last row and column is whatever `oh`, `ow` and `stride` reach), producing `[oh*ow, n_out]`;
+/// the weights are in the unfolded `[n_out][ky][kx][cin]` layout.
 #[derive(Clone, Copy, Debug)]
 pub struct ConvGeom {
     pub h: usize,
@@ -51,6 +53,7 @@ pub struct ConvGeom {
     pub cin: usize,
     pub k: usize,
     pub stride: usize,
+    pub pad: usize,
     pub oh: usize,
     pub ow: usize,
 }

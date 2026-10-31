@@ -60,7 +60,9 @@ pub struct ConvDesc {
     gamma: u32,
     beta: u32,
     n_stats: u32,
-    _pad: [u32; 2],
+    /// Zero padding before the first row / column (k/2 for a "same" convolution).
+    pad: u32,
+    _pad: u32,
 }
 
 /// One matmul for the host: output `y` is [t, n_out] f32 in module memory.
@@ -212,7 +214,8 @@ impl Backend for WebGpuBackend {
                 Some(NormKind::Layer) => (g.h * g.w) as u32,
                 None => 0,
             },
-            _pad: [0; 2],
+            pad: g.pad as u32,
+            _pad: 0,
         };
         let rc = unsafe { gpu_conv(x.as_ptr(), &d) };
         if rc != 0 {

@@ -430,7 +430,7 @@ export class WebGpuHost {
     }
     this.device.queue.writeBuffer(this.cxBuf, 0, x.buffer, x.byteOffset, x.byteLength);
     if (!this.convParams) this.convParams = this.device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    this.device.queue.writeBuffer(this.convParams, 0, new Uint32Array([d.nOut, d.nIn, tPad, 0, d.h, d.w, d.cin, d.k, d.stride, d.ow, t, (d.k / 2) | 0, d.mode || 0, d.silu || 0, d.cpg || 1, 0]));
+    this.device.queue.writeBuffer(this.convParams, 0, new Uint32Array([d.nOut, d.nIn, tPad, 0, d.h, d.w, d.cin, d.k, d.stride, d.ow, t, d.pad, d.mode || 0, d.silu || 0, d.cpg || 1, 0]));
     const ySize = tPad * d.nOut * 4;
     const y = this.yFor(ySize, 0);
     const st = this.stageFor(t * d.nOut * 4, 0);
@@ -634,7 +634,7 @@ export class Oxinfer {
         try {
           const v = new Uint32Array(g.memory.buffer, dp >>> 0, 20);
           const fv = new Float32Array(g.memory.buffer, dp >>> 0, 20);
-          const d = { handle: v[0], nOut: v[1], nIn: v[2], h: v[3], w: v[4], cin: v[5], k: v[6], stride: v[7], oh: v[8], ow: v[9], y: v[10], mode: v[11], silu: v[12], cpg: v[13], eps: fv[14], nStats: v[17] };
+          const d = { handle: v[0], nOut: v[1], nIn: v[2], h: v[3], w: v[4], cin: v[5], k: v[6], stride: v[7], oh: v[8], ow: v[9], y: v[10], mode: v[11], silu: v[12], cpg: v[13], eps: fv[14], nStats: v[17], pad: v[18] };
           if (d.mode) {
             d.gamma = new Float32Array(g.memory.buffer, v[15] >>> 0, d.cin);
             d.beta = new Float32Array(g.memory.buffer, v[16] >>> 0, d.cin);
@@ -817,14 +817,34 @@ export class Oxinfer {
     return s;
   }
 
-  /// { size, steps, guidance, turbo } for the loaded pipeline.
+  /// { size, steps, guidance, turbo, edit } for the loaded pipeline; `edit` is what an input
+  /// image does: 'img2img' (with a mask: inpainting by blending), 'inpaint' (an inpainting
+  /// model: needs a mask) or 'instruct' (InstructPix2Pix: the prompt is an instruction).
   sdDefaults() {
-    const p = this.ex.web_alloc(16) >>> 0;
+    const p = this.ex.web_alloc(20) >>> 0;
     const rc = this.ex.web_sd_defaults(p);
-    const v = new Float32Array(this.memory.buffer, p, 4).slice();
-    this.ex.web_free(p, 16);
+    const v = new Float32Array(this.memory.buffer, p, 5).slice();
+    this.ex.web_free(p, 20);
     if (rc < 0) throw new Error(this.lastError());
-    return { size: v[0], steps: v[1], guidance: v[2], turbo: v[3] !== 0 };
+    return { size: v[0], steps: v[1], guidance: v[2], turbo: v[3] !== 0, edit: ['img2img', 'inpaint', 'instruct'][v[4]] || 'img2img' };
+  }
+
+  /// Sets the image the next generations edit ({ width, height, rgb: Uint8Array RGB8 }, null to
+  /// clear), an optional mask of the same form (white = repaint), the strength (image-to-image,
+  /// inpainting; 0 for the default) and the image guidance (InstructPix2Pix; 0 for the default).
+  sdSetInput(image, mask = null, { strength = 0, imageGuidance = 0 } = {}) {
+    const put = (img) => {
+      if (!img) return [0, 0];
+      const p = this.ex.web_alloc(img.rgb.length) >>> 0;
+      new Uint8Array(this.memory.buffer, p, img.rgb.length).set(img.rgb);
+      return [p, img.rgb.length];
+    };
+    const [ip, il] = put(image);
+    const [mp, ml] = put(mask);
+    const rc = this.ex.web_sd_set_input(ip, image?.width || 0, image?.height || 0, mp, mask?.width || 0, mask?.height || 0, strength, imageGuidance);
+    if (il) this.ex.web_free(ip, il);
+    if (ml) this.ex.web_free(mp, ml);
+    if (rc < 0) throw new Error(this.lastError());
   }
 
   /// Generates an image; resolves to { width, height, rgb: Uint8Array }.

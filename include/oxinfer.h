@@ -445,6 +445,49 @@ int oxi_speak_wav(OxiSpeaker *s, const char *text, const char *options_json, con
  * first_chunk_secs (streaming), tok_s, rtf (total time / audio duration). */
 char *oxi_speaker_stats_json(OxiSpeaker *s);
 
+/* ---- Stable Diffusion: text to image and image editing ---------------------------------------
+ *
+ * A diffusers folder or repo id: Stable Diffusion 1.x / 2.x, SD-Turbo, the inpainting models
+ * (stable-diffusion-v1-5/stable-diffusion-inpainting) and InstructPix2Pix
+ * (timbrooks/instruct-pix2pix). With an input image the kind of edit follows from the model:
+ * InstructPix2Pix follows the prompt as an instruction ("make it snowy"); an inpainting model
+ * repaints the white part of the mask; any other model does image-to-image (or, with a mask,
+ * inpainting by blending). One call at a time per pipeline; oxi_sd_cancel() from any thread.
+ * Images go to `on_image` (oxi_image_fn, `index` 0); `on_step` (oxi_step_fn, may be NULL)
+ * after every denoising step, non-zero to cancel. */
+
+typedef struct OxiSd OxiSd;
+
+/* Loads a pipeline. `options`: NULL or "key=value" pairs separated by newlines or ';':
+ *   device=auto|cpu|metal|cuda|vulkan
+ *   cache_dir=PATH        where repo ids are downloaded
+ *   lora=FILE[:SCALE]     merge a LoRA (repeatable) */
+OxiSd *oxi_sd_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
+
+/* Frees a pipeline (NULL is ignored); no other call on it may be running. */
+void oxi_sd_free(OxiSd *s);
+
+/* Stops the running generation (any thread); it then fails with "cancelled". */
+void oxi_sd_cancel(const OxiSd *s);
+
+/* Text to image, or an edit of an image file. `options_json` (NULL or {} for the defaults):
+ *   {"negative": "", "steps": 25 (turbo 1; edits: InstructPix2Pix 20, turbo enough for one step),
+ *    "guidance": 7.5 (turbo 0), "seed": 42, "width": W, "height": H (multiples of 64; default
+ *    the model's size, or for an edit the model's area at the image's aspect ratio),
+ *    "sampler": "euler_a" | "euler",
+ *    "init_image": "in.png" (PNG / JPEG / WebP / ...; needs the `media` feature),
+ *    "mask": "mask.png" (white = repaint), "strength": 0.8 (image-to-image; inpainting 1),
+ *    "image_guidance": 1.5 (InstructPix2Pix)}
+ * Returns 1 (one image), or -1 (error or cancelled; see oxi_last_error). */
+int oxi_sd_generate(OxiSd *s, const char *prompt, const char *options_json, oxi_image_fn on_image, oxi_step_fn on_step,
+                    void *user);
+
+/* An edit of tightly packed RGB8 pixels (`width` * `height` * 3 bytes); `mask_rgb` (same size,
+ * may be NULL) marks what to repaint in white. Options and return as oxi_sd_generate (without
+ * "init_image" / "mask"). */
+int oxi_sd_edit_rgb(OxiSd *s, const char *prompt, const uint8_t *rgb, int width, int height, const uint8_t *mask_rgb,
+                    const char *options_json, oxi_image_fn on_image, oxi_step_fn on_step, void *user);
+
 #ifdef __cplusplus
 }
 #endif

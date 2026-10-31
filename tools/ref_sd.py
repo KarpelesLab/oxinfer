@@ -13,6 +13,16 @@ from the same directory, and the reference stages as ref_*.bin.
 With --lora FILE[:SCALE] (repeatable), the LoRA files are loaded with diffusers'
 load_lora_weights (needs peft) and fused into the weights before any bf16 rounding, as oxinfer
 merges them at load.
+
+Image editing (--mode img2img | inpaint | pix2pix, with --image, --mask, --strength,
+--image-guidance) runs diffusers' own pipelines (StableDiffusionImg2ImgPipeline,
+StableDiffusionInpaintPipeline, StableDiffusionInstructPix2PixPipeline) with the Euler scheduler
+and records every random draw by role (latents_in.bin for the initial noise, enc_image.bin and
+enc_masked.bin for the VAE samples), which oxinfer reads instead of its own noise. Give images
+already at the working size (no resampling on either side):
+
+  python tools/ref_sd.py MODEL OUT "make it snowy" --mode pix2pix --image in.png --steps 10 --guidance 7.5
+  OXINFER_SD_DUMP=OUT oxinfer --model MODEL --init-image in.png -p "make it snowy" --steps 10 --sampler euler
 """
 import argparse, os, sys
 import numpy as np
@@ -23,9 +33,11 @@ def save(path, t):
 
 
 def compare(out):
-    pairs = [("text_cond.bin", "ref_text_cond.bin"), ("unet_out0.bin", "ref_unet_out0.bin"),
+    pairs = [("text_cond.bin", "ref_text_cond.bin"), ("enc_mean.bin", "ref_enc_mean.bin"), ("unet_out0.bin", "ref_unet_out0.bin"),
              ("latents_out.bin", "ref_latents_out.bin"), ("image.bin", "ref_image.bin")]
     for ours, ref in pairs:
+        if not os.path.exists(os.path.join(out, ref)):
+            continue
         a = np.fromfile(os.path.join(out, ours), dtype=np.float32)
         b = np.fromfile(os.path.join(out, ref), dtype=np.float32)
         if a.shape != b.shape:
@@ -54,6 +66,11 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--compare", metavar="DIR")
     ap.add_argument("--lora", action="append", default=[], metavar="FILE[:SCALE]", help="LoRA to fuse (repeatable)")
+    ap.add_argument("--mode", default="txt2img", choices=["txt2img", "img2img", "inpaint", "pix2pix"])
+    ap.add_argument("--image", help="input image (img2img / inpaint / pix2pix), at the working size")
+    ap.add_argument("--mask", help="inpainting mask (white = repaint)")
+    ap.add_argument("--strength", type=float, default=None)
+    ap.add_argument("--image-guidance", type=float, default=1.5)
     ap.add_argument("--bf16-weights", action="store_true", help="round matmul/conv weights to bf16 as oxinfer stores them (isolates implementation error)")
     a = ap.parse_args()
     if a.compare:
@@ -102,6 +119,9 @@ def main():
         ids = tok(text, padding="max_length", max_length=tok.model_max_length, truncation=True, return_tensors="pt").input_ids
         return ids, te(ids)[0]
 
+    if a.mode != "txt2img":
+        return run_edit(a, tok, te, unet, vae, sched)
+
     with torch.no_grad():
         ids, cond = encode(a.prompt)
         print("ids", ids[0, :24].tolist())
@@ -133,6 +153,85 @@ def main():
             Image.fromarray((arr * 255).round().astype("uint8")).save(os.path.join(a.out, "ref.png"))
         except ImportError:
             pass
+    print("wrote reference to", a.out)
+
+
+def run_edit(a, tok, te, unet, vae, sched):
+    """Runs diffusers' editing pipeline, recording the random draws and the stages oxinfer dumps."""
+    import torch
+    import diffusers
+    from PIL import Image
+    from diffusers.utils import torch_utils
+    import diffusers.models.autoencoders.vae as vae_mod
+    from diffusers.pipelines.stable_diffusion import (pipeline_stable_diffusion_img2img as m_i2i,
+                                                      pipeline_stable_diffusion_inpaint as m_inp,
+                                                      pipeline_stable_diffusion_instruct_pix2pix as m_p2p)
+
+    draws = []
+    orig = torch_utils.randn_tensor
+
+    def rec(*args, **kw):
+        t = orig(*args, **kw)
+        draws.append(t.clone())
+        return t
+    for m in (vae_mod, m_i2i, m_inp, m_p2p):
+        m.randn_tensor = rec
+
+    first = {}
+    enc = vae.encode
+
+    def enc_hook(x, *args, **kw):
+        out = enc(x, *args, **kw)
+        first.setdefault("enc_mean", out.latent_dist.mean[0].detach().clone())
+        return out
+    vae.encode = enc_hook
+    step = sched.step
+
+    def step_hook(model_output, *args, **kw):
+        first.setdefault("unet_out0", model_output[0].detach().clone())
+        return step(model_output, *args, **kw)
+    sched.step = step_hook
+
+    common = dict(vae=vae, text_encoder=te, tokenizer=tok, unet=unet, scheduler=sched, safety_checker=None,
+                  feature_extractor=None, requires_safety_checker=False)
+    image = Image.open(a.image).convert("RGB")
+    kw = dict(prompt=a.prompt, image=image, num_inference_steps=a.steps, guidance_scale=a.guidance,
+              generator=torch.Generator().manual_seed(a.seed), output_type="latent")
+    if a.negative:
+        kw["negative_prompt"] = a.negative
+    if a.mode == "img2img":
+        pipe = diffusers.StableDiffusionImg2ImgPipeline(**common)
+        kw["strength"] = 0.8 if a.strength is None else a.strength
+        roles = ["enc_image", "latents_in"]
+    elif a.mode == "inpaint":
+        pipe = diffusers.StableDiffusionInpaintPipeline(**common)
+        kw["mask_image"] = Image.open(a.mask).convert("RGB")
+        kw["strength"] = 1.0 if a.strength is None else a.strength
+        kw["height"], kw["width"] = image.height, image.width
+        if unet.config.in_channels == 9 and kw["strength"] == 1.0:
+            roles = ["latents_in", "enc_masked"]
+        else:
+            roles = ["enc_image", "latents_in", "enc_masked"]
+    else:
+        pipe = diffusers.StableDiffusionInstructPix2PixPipeline(**common)
+        kw["image_guidance_scale"] = a.image_guidance
+        roles = ["latents_in"]
+    with torch.no_grad():
+        ids = tok(a.prompt, padding="max_length", max_length=tok.model_max_length, truncation=True, return_tensors="pt").input_ids
+        save(os.path.join(a.out, "ref_text_cond.bin"), te(ids)[0][0].numpy())
+        lat = pipe(**kw).images
+        img = vae.decode(lat / vae.config.scaling_factor).sample
+    if len(draws) != len(roles):
+        raise SystemExit(f"expected {len(roles)} random draws ({roles}), got {len(draws)}")
+    for r, d in zip(roles, draws):
+        save(os.path.join(a.out, f"{r}.bin"), d[0].numpy())
+    save(os.path.join(a.out, "ref_enc_mean.bin"), first["enc_mean"].numpy())
+    save(os.path.join(a.out, "ref_unet_out0.bin"), first["unet_out0"].numpy())
+    save(os.path.join(a.out, "ref_latents_out.bin"), lat[0].numpy())
+    save(os.path.join(a.out, "ref_image.bin"), img[0].numpy())
+    arr = ((img[0].permute(1, 2, 0).numpy() + 1) / 2).clip(0, 1)
+    Image.fromarray((arr * 255).round().astype("uint8")).save(os.path.join(a.out, "ref.png"))
+    print("timesteps", [float(t) for t in sched.timesteps], "draws", roles)
     print("wrote reference to", a.out)
 
 

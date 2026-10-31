@@ -512,6 +512,8 @@ unsafe extern "C" {
 
 struct SdState {
     pipe: crate::sd::Pipeline,
+    /// The image (and mask) the next generation edits (`web_sd_set_input`).
+    edit: Option<crate::sd::EditInput>,
     image: Vec<u8>,
     width: u32,
     height: u32,
@@ -555,6 +557,7 @@ pub unsafe extern "C" fn web_sd_load(dir: *const u8, dir_len: usize, gpu: u32, l
             SD.with(|s| {
                 *s.borrow_mut() = Some(SdState {
                     pipe,
+                    edit: None,
                     image: Vec::new(),
                     width: 0,
                     height: 0,
@@ -567,25 +570,74 @@ pub unsafe extern "C" fn web_sd_load(dir: *const u8, dir_len: usize, gpu: u32, l
     }
 }
 
-/// Defaults for the loaded pipeline into `out[0..4]`: image side, steps, guidance, turbo (0/1).
+/// Defaults for the loaded pipeline into `out[0..5]`: image side, steps, guidance, turbo (0/1),
+/// and what an input image does: 0 image-to-image (a mask: inpainting by blending), 1 inpainting
+/// (an inpainting UNet: needs an image and a mask), 2 instruction edits (InstructPix2Pix).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn web_sd_defaults(out: *mut f32) -> i32 {
     SD.with(|s| match s.borrow().as_ref() {
         Some(st) => {
+            let kind = match st.pipe.edit_kind(true).or_else(|_| st.pipe.edit_kind(false)) {
+                Ok(crate::sd::EditKind::Inpaint) => 1.0,
+                Ok(crate::sd::EditKind::Instruct) => 2.0,
+                _ => 0.0,
+            };
             let v = [
                 st.pipe.default_size() as f32,
                 if st.pipe.turbo { 1.0 } else { 25.0 },
                 if st.pipe.turbo { 0.0 } else { 7.5 },
                 st.pipe.turbo as u8 as f32,
+                kind,
             ];
-            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), out, 4) };
+            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), out, 5) };
             0
         }
         None => set_error(&anyhow!("no image model loaded")),
     })
 }
 
-/// Generates an image; read it with `web_sd_image`. `sampler`: 0 Euler, 1 Euler ancestral.
+/// Sets the image the following generations edit: RGB8 `w` x `h` (`rgb` null clears it), an
+/// optional mask (`mask` null for none: RGB8 `mw` x `mh`, white = repaint), the strength
+/// (image-to-image / inpainting; 0 or less for the default) and the image guidance
+/// (InstructPix2Pix; 0 or less for the default).
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn web_sd_set_input(
+    rgb: *const u8,
+    w: u32,
+    h: u32,
+    mask: *const u8,
+    mw: u32,
+    mh: u32,
+    strength: f32,
+    image_guidance: f32,
+) -> i32 {
+    let img = |p: *const u8, w: u32, h: u32| crate::video::RgbImage {
+        width: w as usize,
+        height: h as usize,
+        data: unsafe { std::slice::from_raw_parts(p, w as usize * h as usize * 3) }.to_vec(),
+    };
+    let edit = (!rgb.is_null() && w > 0 && h > 0).then(|| {
+        let mut e = crate::sd::EditInput::new(img(rgb, w, h));
+        if !mask.is_null() && mw > 0 && mh > 0 {
+            e = e.with_mask(img(mask, mw, mh));
+        }
+        e.strength = (strength > 0.0).then_some(strength);
+        e.image_guidance = (image_guidance > 0.0).then_some(image_guidance);
+        e
+    });
+    SD.with(|s| match s.borrow_mut().as_mut() {
+        Some(st) => {
+            st.edit = edit;
+            0
+        }
+        None => set_error(&anyhow!("no image model loaded")),
+    })
+}
+
+/// Generates an image (an edit of the `web_sd_set_input` image when one is set; `width` /
+/// `height` 0 then pick the size from it); read it with `web_sd_image`. `sampler`: 0 Euler,
+/// 1 Euler ancestral.
 #[unsafe(no_mangle)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn web_sd_generate(
@@ -625,11 +677,16 @@ pub unsafe extern "C" fn web_sd_generate(
                 crate::sd::sched::Sampler::EulerAncestral
             },
         };
-        match st.pipe.generate(&params, &mut |i, n| unsafe { host_progress(i as u32, n as u32) }) {
+        let mut progress = |i: usize, n: usize| unsafe { host_progress(i as u32, n as u32) };
+        let out = match &st.edit {
+            Some(e) => st.pipe.generate_from(&params, e, &mut progress),
+            None => st.pipe.generate(&params, &mut progress),
+        };
+        match out {
             Ok((img, tm)) => {
                 log(&format!(
-                    "[text {:.2}s | denoise {:.2}s ({} UNet passes) | decode {:.2}s]",
-                    tm.text, tm.denoise, tm.unet_calls, tm.decode
+                    "[text {:.2}s | encode {:.2}s | denoise {:.2}s ({} UNet passes) | decode {:.2}s]",
+                    tm.text, tm.encode, tm.denoise, tm.unet_calls, tm.decode
                 ));
                 st.width = img.width as u32;
                 st.height = img.height as u32;

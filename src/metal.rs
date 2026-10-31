@@ -2141,7 +2141,7 @@ impl Backend for MetalBackend {
                 stride: g.stride as u32,
                 ow: g.ow as u32,
                 npix: t as u32,
-                pad: (g.k / 2) as u32,
+                pad: g.pad as u32,
                 mode: match norm.map(|n| n.kind) {
                     None => 0,
                     Some(NormKind::Group(_)) => 1,

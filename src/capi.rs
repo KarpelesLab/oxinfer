@@ -1069,3 +1069,218 @@ pub unsafe extern "C" fn oxi_speak_wav(
         Ok(speech_code(speech.finish))
     })
 }
+
+// ---- Stable Diffusion (text to image, image editing) ---------------------------------------
+
+/// A Stable Diffusion pipeline handle (`crate::sd::Pipeline`).
+pub struct OxiSd {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pipe: Mutex<crate::sd::Pipeline>,
+}
+
+/// Generation options of `oxi_sd_generate` / `oxi_sd_edit_rgb` (JSON, every key optional).
+#[derive(serde::Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+struct SdOptions {
+    negative: String,
+    steps: Option<usize>,
+    guidance: Option<f32>,
+    seed: Option<u64>,
+    width: Option<usize>,
+    height: Option<usize>,
+    sampler: Option<String>,
+    init_image: Option<String>,
+    mask: Option<String>,
+    strength: Option<f32>,
+    image_guidance: Option<f32>,
+}
+
+/// Loads a diffusers Stable Diffusion folder or repo id (`key=value` options: device,
+/// cache_dir, lora=FILE[:SCALE] (repeatable)).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_sd_load(
+    model: *const c_char,
+    options: *const c_char,
+    progress: OxiProgressFn,
+    user: *mut c_void,
+) -> *mut OxiSd {
+    guard(std::ptr::null_mut(), || {
+        let model = unsafe { str_arg(model, "model") }?;
+        let (mut device, mut cache_dir, mut loras) = (crate::platform::DevicePref::Auto, None, Vec::new());
+        for item in unsafe { opt_str_arg(options, "options") }?.unwrap_or("").split(['\n', ';']) {
+            let item = item.trim();
+            if item.is_empty() || item.starts_with('#') {
+                continue;
+            }
+            let (k, v) = item.split_once('=').with_context(|| format!("option {item:?} is not key=value"))?;
+            match k.trim() {
+                "device" => {
+                    device = crate::platform::DevicePref::parse(v.trim()).with_context(|| format!("device: unknown device {v:?}"))?
+                }
+                "cache_dir" => cache_dir = Some(std::path::PathBuf::from(v.trim())),
+                "lora" => loras.push(crate::sd::lora::LoraSpec::parse(v.trim())?),
+                k => bail!("unknown option {k:?} (device, cache_dir, lora)"),
+            }
+        }
+        let pipe = with_progress(progress, user, || {
+            let dir = crate::engine::resolve_model(model, cache_dir.as_deref())?;
+            if !crate::gpu::initialized() {
+                crate::gpu::init(&crate::platform::detect(), device);
+            }
+            crate::sd::Pipeline::load_with_loras(&dir, &loras, &mut |_| {})
+        })?;
+        Ok(Box::into_raw(Box::new(OxiSd {
+            cancel: pipe.cancel_flag(),
+            pipe: Mutex::new(pipe),
+        })))
+    })
+}
+
+/// Frees a pipeline (NULL is ignored). No other call on it may be running.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_sd_free(s: *mut OxiSd) {
+    if !s.is_null() {
+        guard((), || {
+            drop(unsafe { Box::from_raw(s) });
+            Ok(())
+        })
+    }
+}
+
+/// Stops the running generation (any thread); it then fails with "cancelled".
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_sd_cancel(s: *const OxiSd) {
+    if let Some(s) = unsafe { s.as_ref() } {
+        s.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+fn sd_run(
+    s: *mut OxiSd,
+    prompt: *const c_char,
+    options_json: *const c_char,
+    on_image: OxiImageFn,
+    on_step: OxiStepFn,
+    user: *mut c_void,
+    input: impl FnOnce(&SdOptions) -> Result<Option<crate::sd::EditInput>>,
+) -> c_int {
+    guard(-1, || {
+        let s = unsafe { s.as_ref() }.context("pipeline is NULL")?;
+        let prompt = unsafe { str_arg(prompt, "prompt") }?;
+        let o: SdOptions = match unsafe { opt_str_arg(options_json, "options_json") }?.map(str::trim) {
+            Some(j) if !j.is_empty() => serde_json::from_str(j).context("options_json")?,
+            _ => SdOptions::default(),
+        };
+        let edit = input(&o)?.map(|mut e| {
+            e.strength = o.strength;
+            e.image_guidance = o.image_guidance;
+            e
+        });
+        let pipe = s.pipe.lock().unwrap_or_else(|p| p.into_inner());
+        let kind = match &edit {
+            Some(e) => Some(pipe.edit_kind(e.mask.is_some())?),
+            None => None,
+        };
+        let side = pipe.default_size();
+        let strength = o.strength.unwrap_or(match kind {
+            Some(crate::sd::EditKind::Img2Img) => crate::sd::DEFAULT_STRENGTH,
+            _ => 1.0,
+        });
+        let p = crate::sd::Params {
+            prompt: prompt.to_string(),
+            negative: o.negative.clone(),
+            steps: o.steps.unwrap_or(crate::sd::default_steps(pipe.turbo, kind, strength)),
+            guidance: o.guidance.unwrap_or(if pipe.turbo { 0.0 } else { 7.5 }),
+            seed: o.seed.unwrap_or(42),
+            // 0 x 0: an edit picks the size from the image.
+            width: o.width.unwrap_or(if edit.is_some() { 0 } else { side }),
+            height: o.height.unwrap_or(if edit.is_some() { 0 } else { side }),
+            sampler: match o.sampler.as_deref().unwrap_or("euler_a") {
+                "euler" => crate::sd::sched::Sampler::Euler,
+                "euler_a" | "euler_ancestral" => crate::sd::sched::Sampler::EulerAncestral,
+                other => bail!("unknown sampler {other:?} (euler, euler_a)"),
+            },
+        };
+        let mut progress = |i: usize, n: usize| {
+            if let Some(cb) = on_step
+                && unsafe { cb(user, i as c_int, n as c_int) } != 0
+            {
+                s.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        let (img, _) = match &edit {
+            Some(e) => pipe.generate_from(&p, e, &mut progress)?,
+            None => pipe.generate(&p, &mut progress)?,
+        };
+        if let Some(cb) = on_image {
+            unsafe { cb(user, 0, img.width as c_int, img.height as c_int, img.rgb.as_ptr(), img.rgb.len()) };
+        }
+        Ok(1)
+    })
+}
+
+/// Text to image, or an edit of the files named by `init_image` / `mask` in `options_json`
+/// (see `oxinfer.h`). The image goes to `on_image`. Returns 1, or -1 (error or cancelled).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_sd_generate(
+    s: *mut OxiSd,
+    prompt: *const c_char,
+    options_json: *const c_char,
+    on_image: OxiImageFn,
+    on_step: OxiStepFn,
+    user: *mut c_void,
+) -> c_int {
+    sd_run(s, prompt, options_json, on_image, on_step, user, |o| {
+        let Some(path) = &o.init_image else {
+            if o.mask.is_some() {
+                bail!("mask needs init_image");
+            }
+            return Ok(None);
+        };
+        #[cfg(feature = "media")]
+        {
+            let m = crate::media::Media::new();
+            let mut e = crate::sd::EditInput::new(m.load_image(std::path::Path::new(path))?);
+            if let Some(mk) = &o.mask {
+                e = e.with_mask(m.load_image(std::path::Path::new(mk))?);
+            }
+            Ok(Some(e))
+        }
+        #[cfg(not(feature = "media"))]
+        bail!("decoding {path} needs the `media` feature; use oxi_sd_edit_rgb")
+    })
+}
+
+/// An edit of tightly packed RGB8 pixels (`mask_rgb`, same size, may be NULL: white =
+/// repaint). Returns as `oxi_sd_generate`.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn oxi_sd_edit_rgb(
+    s: *mut OxiSd,
+    prompt: *const c_char,
+    rgb: *const u8,
+    width: c_int,
+    height: c_int,
+    mask_rgb: *const u8,
+    options_json: *const c_char,
+    on_image: OxiImageFn,
+    on_step: OxiStepFn,
+    user: *mut c_void,
+) -> c_int {
+    sd_run(s, prompt, options_json, on_image, on_step, user, |_| {
+        let (w, h) = (usize::try_from(width)?, usize::try_from(height)?);
+        if rgb.is_null() || w == 0 || h == 0 {
+            bail!("rgb is NULL or the size is empty");
+        }
+        let img = |p: *const u8| crate::video::RgbImage {
+            width: w,
+            height: h,
+            data: unsafe { std::slice::from_raw_parts(p, w * h * 3) }.to_vec(),
+        };
+        let mut e = crate::sd::EditInput::new(img(rgb));
+        if !mask_rgb.is_null() {
+            e = e.with_mask(img(mask_rgb));
+        }
+        Ok(Some(e))
+    })
+}

@@ -77,6 +77,11 @@ struct Args {
     size: Option<(usize, usize)>,
     sampler: Option<String>,
     loras: Vec<oxinfer::sd::lora::LoraSpec>,
+    /// Image editing: the input image, a mask (white = repaint), strength, image guidance.
+    init_image: Option<PathBuf>,
+    mask: Option<PathBuf>,
+    strength: Option<f32>,
+    image_guidance: Option<f32>,
     device: platform::DevicePref,
     devices: bool,
     embed: bool,
@@ -214,6 +219,14 @@ fn usage() -> ! {
          \x20 --seed N             noise seed (default 42)\n\
          \x20 --lora FILE[:SCALE]  merge a LoRA (kohya or diffusers safetensors; repeatable; scale 1);\n\
          \x20                      FILE may be org/repo/file.safetensors on Hugging Face\n\
+         \x20 --init-image FILE    edit this image (PNG/JPEG/WebP/...; --image works too): with an\n\
+         \x20                      InstructPix2Pix model (timbrooks/instruct-pix2pix) the prompt is an\n\
+         \x20                      instruction (\"make it snowy\"); otherwise image-to-image\n\
+         \x20 --strength F         image-to-image / inpainting: how much is redrawn, 0..1 (default 0.8;\n\
+         \x20                      inpainting 1)\n\
+         \x20 --mask FILE          inpaint: white = repaint, black = keep (an inpainting model such as\n\
+         \x20                      stable-diffusion-v1-5/stable-diffusion-inpainting, or any model)\n\
+         \x20 --image-guidance F   InstructPix2Pix: how closely to follow the input image (default 1.5)\n\
          \n\
          Janus-Pro (deepseek-ai/Janus-Pro-1B / -7B): text to image, and questions about images:\n\
          \x20 --generate-image T   generate a 384x384 image of T (or --prompt T with -o FILE)\n\
@@ -351,6 +364,10 @@ fn parse_args() -> Result<Args> {
         size: None,
         sampler: None,
         loras: Vec::new(),
+        init_image: None,
+        mask: None,
+        strength: None,
+        image_guidance: None,
         device: platform::DevicePref::Auto,
         devices: false,
         embed: false,
@@ -514,6 +531,10 @@ fn parse_args() -> Result<Args> {
             "--negative" => a.negative = val()?,
             "--sampler" => a.sampler = Some(val()?),
             "--lora" => a.loras.push(oxinfer::sd::lora::LoraSpec::parse(&val()?)?),
+            "--init-image" => a.init_image = Some(PathBuf::from(val()?)),
+            "--mask" => a.mask = Some(PathBuf::from(val()?)),
+            "--strength" => a.strength = Some(val()?.parse()?),
+            "--image-guidance" => a.image_guidance = Some(val()?.parse()?),
             "--size" => {
                 let v = val()?;
                 let (w, h) = v
@@ -1010,9 +1031,17 @@ fn continue_with_tools<M: TextLm>(
     Ok(out)
 }
 
-/// Text-to-image with a diffusers Stable Diffusion folder.
+/// Loads an image file (PNG, JPEG, WebP, ...) for an edit.
+fn load_edit_image(path: &std::path::Path) -> Result<oxinfer::video::RgbImage> {
+    #[cfg(feature = "media")]
+    return oxinfer::media::Media::new().load_image(path);
+    #[cfg(not(feature = "media"))]
+    bail!("reading {} needs the `media` feature (image decoding)", path.display())
+}
+
+/// Text-to-image and image editing with a diffusers Stable Diffusion folder.
 fn run_image(args: &Args) -> Result<()> {
-    use oxinfer::sd::{Params, Pipeline, sched::Sampler};
+    use oxinfer::sd::{EditInput, EditKind, Params, Pipeline, sched::Sampler};
     let t0 = Instant::now();
     let pipe = Pipeline::load_with_loras(&args.model, &args.loras, &mut |line| eprintln!("{line}"))?;
     eprintln!(
@@ -1028,34 +1057,80 @@ fn run_image(args: &Args) -> Result<()> {
             s.trim().to_string()
         }
     };
+    // The input of an edit: --init-image, or the first --image.
+    let edit = match args.init_image.as_ref().or(args.images.first()) {
+        Some(path) => {
+            let mut e = EditInput::new(load_edit_image(path)?);
+            if let Some(m) = &args.mask {
+                e = e.with_mask(load_edit_image(m)?);
+            }
+            e.strength = args.strength;
+            e.image_guidance = args.image_guidance;
+            Some(e)
+        }
+        None if args.mask.is_some() => bail!("--mask needs the image to inpaint (--init-image FILE)"),
+        None => None,
+    };
+    let kind = match &edit {
+        Some(e) => Some(pipe.edit_kind(e.mask.is_some())?),
+        None => None,
+    };
     let side = pipe.default_size();
-    let (width, height) = args.size.unwrap_or((side, side));
+    let (width, height) = match (&edit, args.size) {
+        (_, Some(s)) => s,
+        (Some(e), None) => pipe.edit_size(e.image.width, e.image.height),
+        (None, None) => (side, side),
+    };
     let sampler = match args.sampler.as_deref().unwrap_or("euler_a") {
         "euler" => Sampler::Euler,
         "euler_a" | "euler_ancestral" => Sampler::EulerAncestral,
         other => bail!("unknown sampler {other} (use euler or euler_a)"),
     };
+    // Turbo models: steps * strength must reach one step (strength 0.5 -> 2 steps, 1 run).
+    let strength = args.strength.unwrap_or(match kind {
+        Some(EditKind::Img2Img) => oxinfer::sd::DEFAULT_STRENGTH,
+        _ => 1.0,
+    });
     let params = Params {
         prompt,
         negative: args.negative.clone(),
-        steps: args.steps.unwrap_or(if pipe.turbo { 1 } else { 25 }),
+        steps: args.steps.unwrap_or(oxinfer::sd::default_steps(pipe.turbo, kind, strength)),
         guidance: args.guidance.unwrap_or(if pipe.turbo { 0.0 } else { 7.5 }),
         seed: args.seed,
         width,
         height,
         sampler,
     };
+    let what = match kind {
+        None => String::new(),
+        Some(EditKind::Instruct) => format!(
+            ", instruction edit, image guidance {}",
+            args.image_guidance.unwrap_or(oxinfer::sd::DEFAULT_IMAGE_GUIDANCE)
+        ),
+        Some(EditKind::Img2Img) => format!(", image to image, strength {strength}"),
+        Some(EditKind::Inpaint) => format!(", inpainting (inpainting UNet), strength {strength}"),
+        Some(EditKind::InpaintBlend) => format!(", inpainting (mask blending), strength {strength}"),
+    };
     eprintln!(
-        "[{}x{}, {} steps, guidance {}, {:?}, seed {}]",
+        "[{}x{}, {} steps, guidance {}, {:?}, seed {}{what}]",
         width, height, params.steps, params.guidance, sampler, params.seed
     );
-    let (img, tm) = pipe.generate(&params, &mut |i, n| eprint!("\r[step {i}/{n}]"))?;
+    let mut progress = |i, n| eprint!("\r[step {i}/{n}]");
+    let (img, tm) = match &edit {
+        Some(e) => pipe.generate_from(&params, e, &mut progress)?,
+        None => pipe.generate(&params, &mut progress)?,
+    };
     eprintln!();
     let out = args.output.clone().unwrap_or_else(|| PathBuf::from("image.png"));
     std::fs::write(&out, oxinfer::png::encode_rgb(img.width, img.height, &img.rgb)).with_context(|| format!("write {}", out.display()))?;
     eprintln!(
-        "[text {:.2}s | denoise {:.2}s ({} UNet passes, {:.2}s each) | decode {:.2}s | wrote {}]",
+        "[text {:.2}s |{} denoise {:.2}s ({} UNet passes, {:.2}s each) | decode {:.2}s | wrote {}]",
         tm.text,
+        if edit.is_some() {
+            format!(" encode {:.2}s |", tm.encode)
+        } else {
+            String::new()
+        },
         tm.denoise,
         tm.unet_calls,
         tm.denoise / tm.unet_calls.max(1) as f64,
