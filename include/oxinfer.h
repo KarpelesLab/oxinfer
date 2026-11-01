@@ -74,6 +74,9 @@ char *oxi_download(const char *spec, const char *cache_dir, oxi_progress_fn prog
  *   gpu_exact=0|1        GPU matmuls bit-identical to the CPU (default 0: M5/A19 matrix
  *                        units, half-precision inputs; process-wide)
  *   gpu_moe=0|1          MoE experts on the GPU in prefill (default 1; process-wide)
+ *   stream=0|1           stream weights from storage for models larger than RAM (on by default
+ *                        for a Mistral Large 4 checkpoint over 60% of RAM); cache_budget_gb=F,
+ *                        resident_mb, prefetch_mb, expert_cache_mb, expert_predict=0|1 tune it
  *   gpu_decode=0|1       generate a whole token per GPU submission where supported (Metal:
  *                        Llama 3, Qwen3, Qwen3.5/3.8 dense; default 1; process-wide)
  *   coreml_units=auto|ane|all|gpu|cpu   Core ML models (ANEMLL format, Apple only): compute
@@ -122,7 +125,8 @@ int oxi_engine_send(OxiEngine *engine, const char *text, oxi_token_fn cb, void *
  *    "max_soft_tokens": 280}       image token budget (Gemma 4: 70/140/280/560/1120 soft tokens;
  *                                  Qwen: tokens of 32x32 pixels; default: the model's)
  * Gemma 4 takes images, videos and audio; Qwen3.5 / 3.6 / 3.8 checkpoints that include the
- * vision tower take images and videos. Attachments belong to this message only. Returns as
+ * vision tower take images and videos; Mistral Large 4 takes images (from its checkpoint, or for
+ * a GGUF model the mmproj file beside it). Attachments belong to this message only. Returns as
  * oxi_engine_send. */
 int oxi_engine_send_media(OxiEngine *engine, const char *text, const char *media_json, oxi_token_fn cb, void *user);
 

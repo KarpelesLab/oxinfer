@@ -115,13 +115,14 @@ pub struct EngineOptions {
     pub draft_tokens: Option<usize>,
     /// Where repo ids are downloaded (default [`crate::hf::cache_root`]). Key `cache_dir`.
     pub cache_dir: Option<PathBuf>,
-    /// Qwen3.5/3.8, Gemma 4 / 3: stream the weights from the (mapped) file for models larger than
+    /// Qwen3.5/3.8, Gemma 4 / 3, Mistral Large 4: stream the weights from the (mapped) file for models larger than
     /// memory, prefetching the next layers while one computes (implies `mmap`; see
     /// [`crate::stream`]). Qwen MTP then drafts up to 8 tokens with a cost-aware length. The
     /// routed experts of MoE models are read on demand, recently used ones kept in a part of the
     /// page-cache budget. Keys
     /// `stream` (on with the defaults), `cache_budget_gb`, `resident_mb`, `prefetch_mb`,
-    /// `flash_mbps`, `expert_cache_mb`, `expert_predict` (Qwen MoE only).
+    /// `flash_mbps`, `expert_cache_mb`, `expert_predict` (Qwen MoE, Mistral Large 4). A Mistral Large 4
+    /// checkpoint larger than 60% of RAM streams by default ([`crate::mistral4::default_stream`]).
     pub stream: Option<crate::stream::StreamOptions>,
     /// Core ML models: where Core ML may run them. Default (None): the Neural Engine, or the
     /// CPU / GPU when `device` asks for it. Key `coreml_units` (`auto`, `ane`, `all`, `gpu`,
