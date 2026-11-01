@@ -461,7 +461,7 @@ typedef struct OxiStep1x OxiStep1x;
  *   transformer=PATH       the transformer from another folder or file (same tensor names)
  *   keep_text_encoder=0|1  keep the 16 GB text encoder loaded between calls (default 0)
  *   stream=0|1             stream the transformer's blocks from storage
- *   exact_attention=0|1    f32 attention on the GPU (default 1)
+ *   exact_attention=0|1    f32 attention on the GPU (default 0: the half-precision kernels)
  *   device=auto|cpu|metal|cuda|vulkan */
 OxiStep1x *oxi_step1x_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
 

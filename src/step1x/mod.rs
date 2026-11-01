@@ -87,7 +87,8 @@ pub struct Options {
     pub stream: Option<crate::stream::StreamOptions>,
     /// Keep the text encoder loaded between calls (otherwise dropped after each encoding).
     pub keep_text_encoder: bool,
-    /// Attention in f32 on the GPU (else the half-precision matrix-unit kernels).
+    /// Attention in f32 on the GPU (default: the half-precision matrix-unit kernels, 28% faster
+    /// per pass; the first velocity is as close to the f32 reference either way, 3e-4).
     pub exact_attention: bool,
     /// Accelerator choice, when the process has not initialized one yet.
     pub device: crate::platform::DevicePref,
@@ -102,7 +103,7 @@ impl Default for Options {
             transformer: None,
             stream: None,
             keep_text_encoder: false,
-            exact_attention: true,
+            exact_attention: false,
             device: crate::platform::DevicePref::Auto,
         }
     }
@@ -732,20 +733,23 @@ impl Pipeline {
 
     /// v1.1's encoding: prefix, image and instruction; 217 tokens dropped, then padded to 640
     /// with zeros (the padding is masked in the connector, not in the DiT); RoPE ids all 0.
-    fn encode_v11(&self, vl: &QwenVl, prompt: &str, img: &VlImage) -> Result<Encoded> {
+    fn encode_v11(&self, vl: &QwenVl, prompt: &str, img: &VlImage, name: &str) -> Result<Encoded> {
         let text = format!(
-            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{PREFIX_V11}Picture 1: <|vision_start|><|image_pad|><|vision_end|>{prompt}<|im_end|>\n<|im_start|>assistant\n"
+            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{PREFIX_V11}<|vision_start|><|image_pad|><|vision_end|>{prompt}<|im_end|>\n<|im_start|>assistant\n"
         );
         let ids = Self::v11_ids(vl, &text, img)?;
+        if dump_dir().is_some() {
+            dump(&format!("{name}_ids.bin"), &ids.iter().map(|&i| i as f32).collect::<Vec<_>>());
+        }
         let l = ids.len();
         if l <= DROP_V11 {
             bail!("the prompt template is shorter than the {DROP_V11} tokens it drops");
         }
-        let h = vl.hidden_states_tokens(ids, std::slice::from_ref(img), None, &[])?;
-        let d = h.hidden;
+        let last = Self::masked_hidden(vl, &ids, img)?;
+        let d = vl.hidden_size();
         let valid = (l - DROP_V11).min(MAX_TOKENS_V11);
         let mut hidden = vec![0f32; MAX_TOKENS_V11 * d];
-        hidden[..valid * d].copy_from_slice(&h.last[DROP_V11 * d..(DROP_V11 + valid) * d]);
+        hidden[..valid * d].copy_from_slice(&last[DROP_V11 * d..(DROP_V11 + valid) * d]);
         Ok(Encoded {
             hidden,
             embeds: Vec::new(),
@@ -754,6 +758,61 @@ impl Pipeline {
             n: MAX_TOKENS_V11,
             valid,
         })
+    }
+
+    /// v1.1's text encoder call: `attention_mask = input_ids > 0`, so tokens with id 0 ("!")
+    /// are padding: no other token sees them, they keep position 1 and the rest close the gap.
+    /// The other tokens' states are exact (the sequence runs without them); a padding token's
+    /// own state comes from a pass that sees the tokens before it and itself (the reference's
+    /// row also leaves itself out).
+    fn masked_hidden(vl: &QwenVl, ids: &[u32], img: &VlImage) -> Result<Vec<f32>> {
+        if !ids.contains(&0) {
+            return Ok(vl.hidden_states_tokens(ids.to_vec(), std::slice::from_ref(img), None, &[])?.last);
+        }
+        let mm = vl.mm.as_ref().context("the text encoder has no vision config")?;
+        let d = vl.hidden_size();
+        let model = vl.model();
+        let full = rope_positions(ids, mm.image_token_id, img.grid);
+        let cache_pos: Vec<[usize; 3]> = ids.iter().zip(&full).filter(|(i, _)| **i != 0).map(|(_, p)| *p).collect();
+        let feats = vec![crate::mm::MmFeature {
+            token_id: mm.image_token_id,
+            emb: img.emb.clone(),
+            n: img.n,
+            grids: vec![img.grid],
+        }];
+        let mut sess = model.new_session();
+        let mut out = vec![0f32; ids.len() * d];
+        let mut i = 0;
+        while i < ids.len() {
+            if ids[i] == 0 {
+                let at = sess.pos;
+                let mut p = cache_pos.clone();
+                p.insert(at, [1, 1, 1]);
+                sess.positions = Some(p);
+                let h = model.forward_hidden_rec(&mut sess, &[0]);
+                out[i * d..(i + 1) * d].copy_from_slice(&h);
+                sess.rewind(at)?;
+                i += 1;
+                continue;
+            }
+            let j = ids[i..].iter().position(|&t| t == 0).map_or(ids.len(), |k| i + k);
+            let run = &ids[i..j];
+            sess.positions = Some(cache_pos.clone());
+            let used = ids[..i].iter().filter(|&&t| t == mm.image_token_id).count();
+            let ov = if run.contains(&mm.image_token_id) {
+                if used > 0 {
+                    bail!("an image split by a padding token");
+                }
+                crate::mm::overrides(run, &feats, d)?
+            } else {
+                Vec::new()
+            };
+            let refs: Vec<(usize, &[f32])> = ov.iter().map(|(k, v)| (*k, v.as_slice())).collect();
+            let h = model.forward_hidden_mm(&mut sess, run, &refs);
+            out[i * d..j * d].copy_from_slice(&h);
+            i = j;
+        }
+        Ok(out)
     }
 
     /// v1.1's token ids: the template tokenized whole up to `<|vision_end|>`, then the rest
@@ -895,11 +954,18 @@ impl Pipeline {
                     bail!("working size {w}x{h} is too small");
                 }
                 let vl_rgb = crate::resample::resize_lanczos_rgb8(&img.data, img.width, img.height, w, h);
-                let unit: Vec<f32> = img.data.iter().map(|&v| v as f32 / 255.0).collect();
-                let px: Vec<f32> = resize_bilinear_aa(&unit, img.width, img.height, w, h)
-                    .iter()
-                    .map(|&v| v * 2.0 - 1.0)
-                    .collect();
+                // The VAE's input: v1.2 resizes the original with torch's antialiased bilinear,
+                // v1.1 takes the Lanczos-resized image the vision tower gets.
+                let px: Vec<f32> = match self.version {
+                    Version::V1p2 => {
+                        let unit: Vec<f32> = img.data.iter().map(|&v| v as f32 / 255.0).collect();
+                        resize_bilinear_aa(&unit, img.width, img.height, w, h)
+                            .iter()
+                            .map(|&v| v * 2.0 - 1.0)
+                            .collect()
+                    }
+                    Version::V1p1 => vae::rgb8_to_unit(&vl_rgb),
+                };
                 (
                     w,
                     h,
@@ -954,7 +1020,7 @@ impl Pipeline {
             let enc = |s: &str, name: &str| -> Result<Encoded> {
                 match self.version {
                     Version::V1p2 => self.encode_v12(vl, s, &vimg, vl_size, name),
-                    Version::V1p1 => self.encode_v11(vl, s, &vimg),
+                    Version::V1p1 => self.encode_v11(vl, s, &vimg, name),
                 }
             };
             let pos = enc(&prompt, "prompt")?;
@@ -1024,14 +1090,17 @@ impl Pipeline {
         let mut x = vae::pack(&vae::chw_to_hwc(&noise, c, lh, lw), lh, lw, c);
         let rope_for = |e: &Encoded| {
             let mut ids = e.txt_ids.clone();
-            let mut grids = vec![(0.0f32, lh / 2, lw / 2)];
+            // (index, offset, rows, columns): the target, then the reference at index 1 (v1.1
+            // also shifts it by one row and column).
+            let mut grids = vec![(0.0f32, 0.0f32, lh / 2, lw / 2)];
             if !ref_tok.is_empty() {
-                grids.push((1.0, lh / 2, lw / 2));
+                let off = if self.version == Version::V1p1 { 1.0 } else { 0.0 };
+                grids.push((1.0, off, lh / 2, lw / 2));
             }
-            for (idx, gh, gw) in grids {
+            for (idx, off, gh, gw) in grids {
                 for y in 0..gh {
                     for xx in 0..gw {
-                        ids.extend_from_slice(&[idx, y as f32, xx as f32]);
+                        ids.extend_from_slice(&[idx, y as f32 + off, xx as f32 + off]);
                     }
                 }
             }

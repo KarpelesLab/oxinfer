@@ -12,7 +12,7 @@ formats may still change.
 
 Local LLM inference in pure Rust: Gemma 4 (text, images, video, audio), Qwen 3.5 / 3.6 / 3.8
 (text, images, video), Gemma 3 and Qwen 3 today, more model families as they come; also
-embeddings, Stable Diffusion, FLUX.1 Kontext, Qwen-Image-Edit, OmniGen2 and BAGEL image editing, Whisper speech to text and Orpheus text to speech. No BLAS, no ML framework: weights are read straight out
+embeddings, Stable Diffusion, FLUX.1 Kontext, Qwen-Image-Edit, OmniGen2, BAGEL and Step1X-Edit image editing, Whisper speech to text and Orpheus text to speech. No BLAS, no ML framework: weights are read straight out
 of the safetensors files (HuggingFace checkpoints or MLX 4-bit ones) and every operation
 (matmuls, attention, norms, RoPE, sampling) is implemented here, with hand-written SIMD kernels
 (NEON, AVX2, wasm simd128) and its own thread pool. The CPU path runs everywhere; GPUs (Metal,
@@ -80,6 +80,8 @@ optional.
 | Qwen/Qwen-Image-Edit-2511 (also -2509, -Edit) | 20B MMDiT + Qwen2.5-VL-7B (8.3B) + VAE | 41 + 16.6 + 0.25 GB | instruction-based image editing with one or more images; matches diffusers' QwenImageEditPlusPipeline (68.5 dB end to end on the CPU; see [Qwen-Image-Edit](#qwen-image-edit-image-editing-from-instructions-and-qwen-image-text-to-image)); Lightning LoRAs (4 / 8 steps), GGUF transformers (unsloth, QuantStack); Apache 2.0 |
 | Qwen/Qwen-Image, Qwen/Qwen-Image-2512 | same | same | text to image with the same transformer code (2512 tested from unsloth's Q4_0 GGUF + Lightning) |
 | OmniGen2/OmniGen2 | 4.0B DiT + Qwen2.5-VL-3B + FLUX VAE | 15.9 + 15.0 + 0.3 GB (float32) | instruction-based image editing, in-context generation with up to 5 images, text to image; matches the official OmniGen2Pipeline (60 dB end to end with the same bf16 weights; see [OmniGen2](#omnigen2-image-editing-in-context-generation-and-text-to-image)); 2.3 GB of transformer weights at `--quant q4`; Apache 2.0 |
+| stepfun-ai/Step1X-Edit-v1p2 (also -v1p2-preview) | 12.4B MMDiT + Qwen2.5-VL-7B (8.3B) + FLUX VAE | 24.9 + 16.6 + 0.34 GB | instruction-based image editing (and thinking mode); matches StepFun's diffusers Step1XEditPipelineV1P2 (62 dB after a step on the CPU, 53 dB after 8 steps on Metal; see [Step1X-Edit](#step1x-edit-image-editing-from-instructions)); q8 / q4 at load; Apache 2.0 |
+| stepfun-ai/Step1X-Edit-v1p1-diffusers | same (stock Qwen2.5-VL-7B) | same | v1.1 editing; matches Step1XEditPipeline (49.5 dB after a step at 1024x1024) |
 | ByteDance-Seed/BAGEL-7B-MoT | 14B (7B x 2 experts) + SigLIP 0.4B + VAE | 29.2 GB + 0.34 GB | one unified model: instruction-based image editing, text to image, image understanding, optional thinking; matches the official inference code (truncated f32 runs 1e-5; 41-44 dB end to end vs bf16; see [BAGEL](#bagel-image-editing-text-to-image-and-image-understanding-in-one-model)); Apache 2.0 |
 | Qwen/Qwen2.5-VL-3B-Instruct, -7B-Instruct | 3.8B / 8.3B | 7.5 / 16.6 GB | text and images (no video yet); matches transformers float32 (logits max diff 1.1e-4, same greedy answer; see [Qwen2.5-VL](#qwen25-vl)); also the conditioning encoder `oxinfer::qwen_vl` |
 | city96/t5-v1_1-xxl-encoder-gguf | 4.7B | 2.9 GB (Q4_K_M) - 5.1 GB (Q8_0) | FLUX's T5 encoder as GGUF (`--text-encoder`) |
@@ -1101,9 +1103,10 @@ them); the mask is binary (no feathering); InstructPix2Pix with `--strength` is 
 (diffusers has none: it always starts from noise); image guidance needs text guidance above 1, so
 the 4-step LCM-LoRA path has no image-guidance knob. Bigger instruction editors
 (Qwen-Image-Edit, FLUX.1 Kontext, Step1X-Edit, OmniGen2, BAGEL) need their own architectures;
-FLUX.1 Kontext, Qwen-Image-Edit and BAGEL have one, [below](#flux1-kontext-image-editing-from-instructions-and-flux1-text-to-image),
-[after it](#qwen-image-edit-image-editing-from-instructions-and-qwen-image-text-to-image) and
-[further on](#bagel-image-editing-text-to-image-and-image-understanding-in-one-model).
+FLUX.1 Kontext, Qwen-Image-Edit, BAGEL and Step1X-Edit have one, [below](#flux1-kontext-image-editing-from-instructions-and-flux1-text-to-image),
+[after it](#qwen-image-edit-image-editing-from-instructions-and-qwen-image-text-to-image),
+[further on](#bagel-image-editing-text-to-image-and-image-understanding-in-one-model) and
+[after BAGEL](#step1x-edit-image-editing-from-instructions).
 
 ## FLUX.1 Kontext: image editing from instructions (and FLUX.1 text to image)
 
@@ -1680,6 +1683,143 @@ Not supported: sampling the VAE posterior (the reference draws `mean + std * noi
 images; oxinfer uses the mean, a difference far below the guidance's), TaylorSeer step caching,
 batches, interleaved outputs past one image or one answer, the browser build (the weights exceed
 4 GB). Single-token text decoding runs on the CPU (about 10 tokens/s in bf16).
+
+## Step1X-Edit: image editing from instructions
+
+StepFun's Step1X-Edit edits an image the way an instruction says. `src/step1x/` follows the
+`Step1XEditPipelineV1P2` / `Step1XEditPipeline` of StepFun's diffusers fork (branch
+`step1xedit_v1p2` of Peyton-Chen/diffusers); v1.2 (`stepfun-ai/Step1X-Edit-v1p2`, "ReasonEdit-S",
+and `-v1p2-preview`) and v1.1 (`stepfun-ai/Step1X-Edit-v1p1-diffusers`) are told apart by the
+transformer's `enable_text_token_mapping`.
+
+```sh
+# 28 steps, true CFG 6 against an empty instruction (the pipeline's defaults; StepFun's examples use 50)
+./target/release/oxinfer --model stepfun-ai/Step1X-Edit-v1p2 --mmap --init-image dog.png \
+    -p "Put a red knitted hat on the dog" -o hat.png
+# quoted text is rendered character by character
+./target/release/oxinfer --model stepfun-ai/Step1X-Edit-v1p2 --mmap --init-image bakery.png \
+    -p 'Change the text on the sign from "FRESH BREAD" to "OXINFER CAFE"' -o sign.png
+# thinking mode: the VL model rewrites the instruction from the image first
+./target/release/oxinfer --model stepfun-ai/Step1X-Edit-v1p2 --mmap --init-image cabin.png --think \
+    -p "Show what this place would look like after 100 years of abandonment" -o old.png
+# a 512x512 output worked at 512x512 (4x fewer tokens), q4 transformer
+./target/release/oxinfer --model stepfun-ai/Step1X-Edit-v1p2 --quant q4 --init-image cat.png \
+    --size 512x512 -p "Put sunglasses on the cat" -o cat.png
+```
+
+| Flag | Meaning |
+|---|---|
+| `--init-image FILE` | image to edit (without one: text to image, the vision tower seeing a black square) |
+| `--steps N`, `--guidance F`, `--negative TEXT` | 28, true CFG 6, `""` |
+| `--size WxH` | output size and working area; the input is center-cropped to that aspect ratio. Default: the input's size, worked at about 1024x1024 (multiples of 16) at its aspect ratio |
+| `--think` | v1.2 thinking mode (sampled rewrite, temperature 0.7, top-p 0.9, up to 128 tokens) |
+| `--quant q8\|q4` | transformer precision (the text encoder: q8 with either) |
+| `--mmap`, `--stream` | map the weights; stream the transformer's 57 blocks from storage (`--cache-budget-gb`) |
+
+What runs: the input is resized (Lanczos) to the working size and given to Qwen2.5-VL-7B (v1.2
+ships a fine-tuned copy) inside the pipeline's template: a system turn, a fixed editing prefix, the
+instruction, then `Picture 1: <|vision_start|>...<|vision_end|>` with 256 to 400 vision tokens.
+The template is split at special tokens and quotes and each piece tokenized alone, so quoted text
+becomes one token per character; the text encoder gets explicit M-RoPE positions in which, as the
+pipeline's `attention_mask = input_ids > 0`, a token with id 0 (a lone `!`) sits at position 1
+and the rest close the gap. The last hidden states minus the first 90 tokens condition the DiT. A
+connector (HunyuanVideo's token refiner: two self-attention blocks gated by the timestep embedding
+plus a projection of the states' mean) maps them to the 4096-wide text stream and pools the
+768-wide vector FLUX takes from CLIP; v1.2 adds the raw token embeddings of the quoted characters
+through `text_token_mapping`. The DiT is FLUX.1's (19 double + 38 single blocks, the
+`crate::flux::transformer` blocks as they are) over `[text; target; reference]`: the reference is
+the input resized with torch's antialiased bilinear filter and VAE-encoded (the 16-channel FLUX
+VAE), on the target's grid at RoPE index 1 (v1.1: shifted by one row and column). v1.2 gives the
+text tokens negative positions on the first RoPE axis and the vision tokens the latent-patch
+coordinates of the pixels they cover. Flow matching with FLUX's resolution-dependent shift; true
+CFG where the guidance difference is divided by its per-token norm^0.4 when that norm exceeds 1.
+The decoded image is resized back to the input's size (Pillow bicubic). v1.1 pads the text stream
+to 640 tokens (masked in the connector, not in the DiT) with all text positions at 0.
+
+Components load when first needed; the 16 GB text encoder is dropped after encoding. On Metal the
+text encoder and the VAE encoder run with exact (f32) matmuls, and the VAE's f32 weights keep their
+precision as a bf16 `hi + lo` pair (Step1X ships the FLUX VAE in f32: rounding its weights to bf16
+moves the reference latents by 1.5%, the final image by 20 dB). The transformer uses the matrix
+units, attention included (`exact_attention=1` / `OXINFER_EXACT_ATTENTION=1` keeps it f32).
+
+**Agreement** with the StepFun diffusers fork + transformers 4.55 (bf16 weights on both sides,
+every reference matmul in f32, VAE posterior mean, same initial noise; v1.2, a 512x512 cat photo,
+`Add a red hat to the cat and write "MEOW" on a sign!` (quotes and a lone `!`), `--size 512x512`,
+8 steps, CFG 6; relative L2 errors):
+
+| oxinfer | first velocity (cond / uncond) | final latents | image PSNR |
+|---|---|---|---|
+| bf16, CPU (1 step) | 9.7e-5 / 3.5e-5 | 4.1e-4 | 62.0 dB |
+| bf16, Metal, f32 attention | 3.6e-4 / 2.5e-4 | 4.3e-3 | 53.2 dB |
+| bf16, Metal (default) | 3.3e-4 / 2.6e-4 | 1.3e-2 | 47.3 dB |
+| `--quant q8`, Metal | 3.8e-3 / 2.5e-3 | 6.6e-2 | 33.9 dB |
+| `--quant q4`, Metal | 4.6e-2 / 4.3e-2 | 0.25 | 21.7 dB |
+| v1.1 (`-v1p1-diffusers`), Metal, 1024x1024, 1 step | 1.4e-2 / 2.7e-4 | 1.7e-2 | 49.5 dB |
+
+Token ids are identical (both prompts), the conditioning hidden states agree to 2.1e-4, the RoPE
+ids of the text to 2e-8, the reference latents to 3.5e-5. The quantized rows were also compared
+with a reference running oxinfer's Q8 / Q4_0 weights dequantized: the weights alone move the first
+velocity by 2.8e-3 (Q8) and 4.5e-2 (Q4); oxinfer's quantized matmuls add 2.6e-3 / 3.5e-3 on top,
+so the Q4 error is the 4-bit weights, not the activations. CFG 6 then amplifies differences over
+the steps: quantized edits look the same (same hat, same lettering, same composition) with
+different fine detail. v1.1's text encoder also masks the `!` token as a key; oxinfer reproduces
+that for every other token, while the `!` row itself still sees its own key (that one row is 36%
+off, hence the 1.4e-2 on the conditioned velocity; prompts without a lone `!` match like v1.2).
+
+**Speed and memory** (M5 Max, 1024x768 input worked at 1168x880: 4015 target + 4015 reference +
+~410 text tokens per pass, two passes per step):
+
+| weights | device | per transformer pass | 28-step edit | peak memory (footprint) |
+|---|---|---|---|---|
+| bf16 (`--mmap`, 24.9 GB mapped) | Metal | 9.3 s (f32 attention: 12.8 s) | 9 min | 12.6 GB |
+| bf16, read into memory | Metal | 17.5 s | | 40 GB |
+| `--quant q8` | Metal | 14.0 s | | 28 GB |
+| `--quant q4` | Metal | 14.2 s | | 20 GB |
+| bf16, `--stream --cache-budget-gb 8` | Metal | 13.6 s | | 12.7 GB |
+| bf16, 512x512 (2400 tokens) | Metal | 3-4 s | 3.5 min | 3.7 GB |
+| bf16, 512x512 | CPU, 18 threads | 34 s | | |
+| bf16, 1024x1024 (8832 tokens, v1.1) | CPU, 18 threads | 213 s | | |
+
+The text encoder takes 3-6 s, the VAE 2.5 s each way at this size; the thinking mode adds ~9 s.
+
+**Sample edits** (v1.2 bf16, 28 steps, default sizes): "Put a red knitted hat on the dog" (a 1024x768
+porch photo) adds the hat and leaves every other pixel's content in place, with no shift or zoom
+(`--quant q4` gives the same hat); "Change the text on the sign from "FRESH BREAD" to "OXINFER
+CAFE"" rewrites the carved sign in the same lettering; "Put sunglasses on the cat", "Make it
+winter, with snow on the roof and the ground" (a snowstorm over the same cabin) and "Turn this
+photo into a watercolor painting" do what they say. Thinking mode turned "Show what this place
+would look like after 100 years of abandonment" into "Change the wooden shed to a dilapidated
+and overgrown log cabin." and weathered the cabin only lightly.
+
+**Library and C API.**
+
+```rust
+use oxinfer::step1x::{Options, Params, Pipeline};
+let mut pipe = Pipeline::load("stepfun-ai/Step1X-Edit-v1p2", Options { mmap: true, ..Default::default() })?;
+let img = oxinfer::media::Media::new().load_image("dog.png".as_ref())?;
+let (out, timings) = pipe.edit(&img, &Params::new("put a red hat on the dog"), &mut |i, n| eprintln!("{i}/{n}"))?;
+// out: width, height, rgb (the input's size); Params { size_level, width, height, think, true_cfg,
+// steps, seed, negative, .. }; pipe.generate(&params, ..) without an image; edit_picture with `oxideav`
+```
+
+The C API has `oxi_step1x_load` (`key=value` options: quant, text_quant, mmap, transformer,
+keep_text_encoder, stream, exact_attention, device), `oxi_step1x_edit` (a JSON request: prompt,
+images, negative, true_cfg, steps, seed, size_level, width, height, think; or RGB pixels),
+`oxi_step1x_cancel` and `oxi_step1x_free` (see `include/oxinfer.h`). `examples/step1x_edit.rs`
+edits one image.
+
+**Weights and licenses.** stepfun-ai/Step1X-Edit-v1p2, -v1p2-preview and -v1p1-diffusers: Apache
+2.0, ungated; 42 GB each (24.9 GB transformer in bf16, 16.6 GB text encoder, 0.34 GB VAE in f32).
+v1.1's text encoder is stock Qwen2.5-VL-7B-Instruct (the same files as Qwen-Image's, which can be
+linked instead of downloaded twice); v1.2's is fine-tuned. No GGUF conversions are published:
+`--quant q8 / q4` quantizes at load (2-3 s from the mapped bf16 files).
+
+Not supported: the reflection mode of v1.2 (a multi-round loop where the VL model scores the edit
+and retries), the original `stepfun-ai/Step1X-Edit` single-file checkpoints (v1.0 / v1.1 in the
+original repository's layout; the diffusers folders cover the same models) and its fp8 copies,
+LoRAs, the RegionE acceleration, batches, the browser build (the weights exceed its 4 GB), CUDA
+runs (compile-checked only). The reference image is VAE-encoded at the posterior mean (the
+pipeline samples it; the noise is ~3e-4 of the latents).
 
 ## Janus-Pro: text to image and image understanding
 
