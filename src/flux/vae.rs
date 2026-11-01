@@ -9,7 +9,7 @@
 //! [`crate::sd::vae::VaeDecoder`].
 
 use crate::kernels::{add_inplace, for_chunks};
-use crate::sd::ops::{Conv, GroupNorm, Linear, Pre, Tensors, attention};
+use crate::sd::ops::{Conv, GroupNorm, Linear, Pre, Tensors};
 use crate::sd::unet::Resnet;
 use crate::sd::vae::VaeDecoder;
 use anyhow::{Context, Result, bail};
@@ -47,7 +47,9 @@ impl MidAttn {
             let y = pre.apply(x, n);
             (self.q.forward(&y, n), self.k.forward(&y, n), self.v.forward(&y, n))
         };
-        let a = attention(&q, &k, &v, n, n, 1, self.q.n_out, false);
+        // In query chunks: one head over every latent pixel (16384 at 1024x1024) would hold a
+        // 1 GB score matrix (twice, with the probabilities) at once.
+        let a = crate::qwen_vision::attention_chunked(&q, &k, &v, n, 1, self.q.n_out);
         add_inplace(x, &self.o.forward(&a, n));
     }
 }

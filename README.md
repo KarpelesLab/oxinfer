@@ -1481,7 +1481,37 @@ images then differ in fine detail only. Qwen2.5-VL-3B at Q4 moves the conditioni
 so `--quant q4` keeps the text encoder at Q8. OmniGen2's `mllm/` is exactly
 Qwen/Qwen2.5-VL-3B-Instruct (identical hidden states), stored as float32.
 
-OMNIGEN2_SPEED_TABLE
+**Speed and memory** (M5 Max; 50 steps, three transformer passes per step with input images, two
+without; a 512x512 edit is 1024 target + 1024 image + ~40 text tokens per pass, a 1024x1024 edit
+8.2k; rows marked * shared the GPU with another job):
+
+| run | weights | device | per pass | total | peak memory (footprint) |
+|---|---|---|---|---|---|
+| edit, 512x512 | bf16 (8.0 GB) | Metal | 1.6-2.4 s | 4-6 min | 11.5 GB |
+| edit, 512x512 | `--quant q8` | Metal | 3.0 s | 7.5 min | 10.1 GB |
+| edit, 512x512 | `--quant q4` (2.3 GB) | Metal | 2.1 s | 5.2 min | 8.4 GB; 5.8 GB with `--text-encoder Qwen/Qwen2.5-VL-3B-Instruct` |
+| edit, 512x512 | bf16 | CPU, 18 threads (shared) | 32-39 s | | 10.6 GB |
+| edit, 512x512 | calcuis GGUF "Q4_0" (mostly F16) | CPU matmuls | 10.5 s | | |
+| edit, 1024x1024 | bf16 | Metal | 6.9 s | 17 min | 20 GB |
+| edit, 1024x1024 * | `--quant q4` | Metal | 13.5 s | 34 min | 13 GB |
+| text to image, 1024x1024 * | `--quant q4` | Metal | 7.8 s | 13 min | 14 GB |
+| 2 images (512² + 1024²) to 1024x768 * | `--quant q8` | Metal | 12.7 s | 32 min | 15 GB |
+
+The text encoder takes 0.5 s; the VAE 0.4 / 1.7 s to encode and 0.7 / 2.8 s to decode at 512 /
+1024. Memory beyond the weights is mostly the VAE at full resolution (its mid-block attention now
+runs in query chunks, which took 3 GB off a 1024x1024 encode) and, from the float32 `mllm/`, the
+text encoder's bf16 copy; for small devices use `--quant q4`, `--text-encoder
+Qwen/Qwen2.5-VL-3B-Instruct` (mapped bf16, quantized to Q8) and 512x512 images.
+
+**Sample edits** (bf16, 50 steps): a 512x512 cat photo with "Make the cat wear a small red wizard
+hat" gets the hat and keeps the room; a flat 1024x1024 drawing of a house with "Make it night, with
+warm light in the windows and stars in the sky" turns the sky dark blue with stars, the sun dark
+and the window orange; a 512x512 green meadow cabin with "Change the season to winter" is covered
+in snow (the same as the reference, 60 dB); in-context, "The cat from the first image sits on the
+doorstep of the house in the second image" (Q8) puts the photographed cat in the drawn doorway;
+text to image (Q4), "A photo of a red fox sitting in a snowy forest at sunrise" is a sharp,
+detailed fox. The model's Qwen2.5-VL answers "What is the cat wearing?" with "The cat is wearing a
+red witch hat." (600 tokens/s prefill, 26 tokens/s decode, bf16 on Metal).
 
 **Library and C API.**
 

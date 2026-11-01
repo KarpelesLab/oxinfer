@@ -2,7 +2,7 @@
 //! resolution; the encoder (for image-to-image, inpainting and instruction edits) maps RGB to the
 //! latent distribution.
 
-use super::ops::{Conv, GroupNorm, Linear, Pre, Rng, Tensors, attention, upsample2x};
+use super::ops::{Conv, GroupNorm, Linear, Pre, Rng, Tensors, upsample2x};
 use super::unet::Resnet;
 use crate::kernels::add_inplace;
 use anyhow::Result;
@@ -42,7 +42,8 @@ impl MidAttn {
             (self.q.forward(&y, n), self.k.forward(&y, n), self.v.forward(&y, n))
         };
         let c = self.q.n_out;
-        let a = attention(&q, &k, &v, n, n, 1, c, false);
+        // In query chunks (a 1 GB score matrix at 1024x1024 otherwise).
+        let a = crate::qwen_vision::attention_chunked(&q, &k, &v, n, 1, c);
         add_inplace(x, &self.o.forward(&a, n));
     }
 }
