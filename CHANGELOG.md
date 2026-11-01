@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/KarpelesLab/oxinfer/compare/v0.0.6...v0.0.7) - 2026-11-01
+
+### Other
+
+- Mistral Large 4: document streaming and image options in the library and C API
+- Mistral Large 4: README (architecture, speed, agreement), reference tools
+- Mistral Large 4: streaming by default when too big for RAM, GPU experts in prefill, Pixtral vision
+- Mistral Large 4: MLA + DSA indexer + MoE text model, split GGUF, Mistral-native and FP8 checkpoints
+- exact attention on the matrix units with f32 operands; Step1X half-attention cost was noise
+- quantized Lightning runs lose far less (merge LoRA in f32, exact modulation channels)
+- v1.1 template, padding-token masking and reference offsets; README
+- Step1X-Edit (v1.2, v1.1): connector + FLUX MMDiT, Qwen2.5-VL prompt encoding, CLI, C API
+- instruction-based image editing, text to image and image understanding
+- README numbers, calcuis GGUF transformers, mapped text encoder; VAE mid-attention in query chunks
+- instruction editing, in-context generation and text to image
+- Qwen-Image-Edit (2511 / 2509 / Edit) and Qwen-Image text to image; Qwen2.5-VL
+- FLUX CLI: --size is the output size, and the reference image is resized to it
+- README section and model table rows; CLI shares --init-image with SD editing
+- 128-wide-head attention on the matrix units; examples/flux_edit.rs
+- public DoubleBlock / SingleBlock (load + forward) for reuse by other FLUX-style DiTs
+- exact modulation vectors with quantized weights, F16 weights as stored, T5 GGUF encoders
+- FLUX.1 Kontext: instruction-based image editing, FLUX.1 text to image
+- Image editing: README section, sd_edit example, PyTorch .bin diffusers weights (MagicBrush)
+- Stable Diffusion image editing: img2img, inpainting, InstructPix2Pix
+
 ## [0.0.6](https://github.com/KarpelesLab/oxinfer/compare/v0.0.5...v0.0.6) - 2026-10-28
 
 ### Other
