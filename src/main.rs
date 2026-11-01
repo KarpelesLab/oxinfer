@@ -1560,16 +1560,21 @@ fn run_mistral4(mut args: Args) -> Result<()> {
     }
     let cfg = config::Mistral4Config::load(&args.model)?;
     let eos = config::load_eos_ids(&args.model);
-    // A checkpoint larger than most of RAM is mapped whatever --mmap says: the routed experts are
-    // read through the page cache as they are used.
+    // A checkpoint larger than most of RAM cannot be read in: it is streamed with a page-cache
+    // budget of 70% of RAM (the routed experts read as they are used), unless `--mmap` asks for
+    // plain demand paging.
     let size: u64 = oxinfer::safetensors::checkpoint_bytes(&args.model);
-    if !args.mmap && oxinfer::platform::total_memory().is_some_and(|m| size as f64 > 0.6 * m as f64) {
+    if oxinfer::mistral4::too_big(size) && !args.stream && !args.mmap {
+        let budget = oxinfer::mistral4::default_stream().cache_budget.unwrap_or(0) as f64 / 1e9;
+        args.cache_budget_gb = Some(args.cache_budget_gb.unwrap_or(budget));
         eprintln!(
-            "[the {:.0} GB checkpoint does not fit in memory: mapping it (--mmap)]",
-            size as f64 / 1e9
+            "[the {:.0} GB checkpoint does not fit in memory: streaming it (--stream --cache-budget-gb {:.0})]",
+            size as f64 / 1e9,
+            args.cache_budget_gb.unwrap()
         );
-        args.mmap = true;
+        args.stream = true;
     }
+    args.mmap |= args.stream;
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
     let mut model = oxinfer::mistral4::Mistral4Model::load(cfg, &files, args.quant)?;
     let tok = load_tokenizer(&args.model)?;
@@ -1593,9 +1598,11 @@ fn run_mistral4(mut args: Args) -> Result<()> {
     if let Some(out) = &args.save_quantized {
         return save_quantized(&args.model, out, &files, model.quant);
     }
-    if !mm_request(&args).is_empty() {
-        bail!("image input is not supported for Mistral Large 4 yet");
-    }
+    let mm = if mm_request(&args).is_empty() {
+        Default::default()
+    } else {
+        oxinfer::mm::prepare(&mm_request(&args), &files, model.cfg.hidden_size)?
+    };
     let streamer = if args.stream {
         Some(start_stream(&args, |o| oxinfer::stream::attach_mistral4(&mut model, &files, o))?)
     } else {
@@ -1603,7 +1610,7 @@ fn run_mistral4(mut args: Args) -> Result<()> {
     };
     *STREAM.lock().unwrap() = streamer.clone();
     TRACE.store(args.stream_trace, std::sync::atomic::Ordering::Relaxed);
-    let r = run_text(&args, &model, &tok, &eos, fmt, Default::default());
+    let r = run_text(&args, &model, &tok, &eos, fmt, mm);
     if let Some(s) = &streamer
         && let Some(c) = s.cached_bytes()
     {

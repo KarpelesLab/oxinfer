@@ -56,6 +56,7 @@ mod moe;
 pub mod mpnet;
 pub mod nomic_bert;
 pub mod omnigen2;
+pub mod pixtral;
 pub mod platform;
 pub mod png;
 pub mod pool;

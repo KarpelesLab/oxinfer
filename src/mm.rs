@@ -246,6 +246,9 @@ pub fn prepare_frames(args: &MmRequest, frames: MmFrames, files: &ModelFiles, te
 
 fn prepare_sources(src: &Sources, files: &ModelFiles, text_hidden: usize) -> Result<(String, Vec<MmFeature>)> {
     let args = src.req;
+    if let Some(pc) = crate::pixtral::PixtralConfig::load(args.model)? {
+        return prepare_pixtral(src, files, text_hidden, pc);
+    }
     if let Some(qc) = qwen_vision::QwenMmConfig::load(args.model)? {
         return prepare_qwen(src, files, text_hidden, qc);
     }
@@ -387,6 +390,58 @@ fn prepare_sources(src: &Sources, files: &ModelFiles, text_hidden: usize) -> Res
                 grids: Vec::new(),
             });
         }
+    }
+    Ok((text, feats))
+}
+
+/// Mistral Large 4 (Pixtral) images: each as rows of `[IMG]` placeholders closed by
+/// `[IMG_BREAK]` / `[IMG_END]`, the tower's tokens replacing the `[IMG]` ones. A GGUF model reads
+/// the tower from the `mmproj` file beside it.
+fn prepare_pixtral(
+    src: &Sources,
+    files: &ModelFiles,
+    text_hidden: usize,
+    pc: crate::pixtral::PixtralConfig,
+) -> Result<(String, Vec<MmFeature>)> {
+    let args = src.req;
+    if src.n_videos() > 0 || src.n_audios() > 0 {
+        bail!("this model takes images only (no video or audio)");
+    }
+    let side = match crate::gguf::is_gguf(args.model) {
+        true => Some(ModelFiles::open(
+            &crate::pixtral::mmproj_for(args.model).context("no mmproj file beside the GGUF model")?,
+            true,
+        )?),
+        false => None,
+    };
+    let t = Instant::now();
+    let tower = crate::pixtral::PixtralTower::load(pc, side.as_ref().unwrap_or(files), text_hidden)?;
+    let (mut text, mut feats) = (String::new(), Vec::new());
+    for i in 0..src.n_images() {
+        let (what, img) = src.image(i)?;
+        let px = tower.preprocess(&img.data, img.width, img.height);
+        let emb = tower.encode(&px);
+        let n = emb.len() / text_hidden;
+        eprintln!(
+            "[image {what}: {}x{} -> {}x{} patches -> {} soft tokens, {:.2}s]",
+            img.width,
+            img.height,
+            px.pw,
+            px.ph,
+            n,
+            t.elapsed().as_secs_f64()
+        );
+        if let (Some(prefix), 0) = (args.dump_mm, i) {
+            dump(&format!("{}_pixels.bin", prefix.display()), &px.patches)?;
+            dump(&format!("{}_image.bin", prefix.display()), &emb)?;
+        }
+        text.push_str(&tower.placeholder(&px));
+        feats.push(MmFeature {
+            token_id: tower.cfg.image_token_id,
+            emb,
+            n,
+            grids: Vec::new(),
+        });
     }
     Ok((text, feats))
 }

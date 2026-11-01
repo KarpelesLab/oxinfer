@@ -177,28 +177,41 @@ impl<'a> Experts<'a> {
         if !be.wants(2 * mi, h, t * self.top_k) {
             return false;
         }
-        // Streamed experts keep no device state (see `Lin::set_transient_device`).
-        if self.down.iter().any(|l| l.is_transient()) {
-            return false;
-        }
-        let dev = self.dev.get_or_init(|| {
+        let gelu = self.act == Act::GeluTanh;
+        // Every expert's weights: fused or split gate/up (one form for all), and down.
+        let refs = || {
             let mut gu = Vec::with_capacity(self.gate_up.len());
             let mut up = Vec::with_capacity(self.gate_up.len());
             for g in &self.gate_up {
                 match g {
-                    GateUp::Fused(l) if !l.is_transient() => gu.push(l.as_ref()),
-                    GateUp::Split(a, b) if !a.is_transient() && !b.is_transient() => {
+                    GateUp::Fused(l) => gu.push(l.as_ref()),
+                    GateUp::Split(a, b) => {
                         gu.push(a.as_ref());
                         up.push(b.as_ref());
                     }
-                    _ => return None,
                 }
             }
-            if !up.is_empty() && up.len() != gu.len() {
-                return None;
-            }
             let down: Vec<_> = self.down.iter().map(|l| l.as_ref()).collect();
-            be.upload_moe(&gu, (!up.is_empty()).then_some(&up[..]), &down, h, mi, self.act == Act::GeluTanh)
+            (up.is_empty() || up.len() == gu.len()).then_some((gu, up, down))
+        };
+        // Streamed experts keep no device state between calls (see `Lin::set_transient_device`):
+        // a prefill pass wraps them for its own submission, which reads them in place.
+        if self.down.iter().any(|l| l.is_transient())
+            || self.gate_up.iter().any(|g| match g {
+                GateUp::Fused(l) => l.is_transient(),
+                GateUp::Split(a, b) => a.is_transient() || b.is_transient(),
+            })
+        {
+            let Some((gu, up, down)) = refs() else { return false };
+            let Some(dev) = be.upload_moe_transient(&gu, (!up.is_empty()).then_some(&up[..]), &down, h, mi, gelu) else {
+                return false;
+            };
+            let _timer = prof::start(Cat::Matmul);
+            return be.moe(x, t, h, mi, routes, &dev, y);
+        }
+        let dev = self.dev.get_or_init(|| {
+            let (gu, up, down) = refs()?;
+            be.upload_moe(&gu, (!up.is_empty()).then_some(&up[..]), &down, h, mi, gelu)
         });
         let Some(dev) = dev else {
             return false;

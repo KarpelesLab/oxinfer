@@ -621,6 +621,10 @@ impl ModelFiles {
         // Mistral's own layout (`consolidated*.safetensors`): read under transformers' names.
         if crate::mistral4::is_native(&files) {
             files.rename(crate::mistral4::native_name);
+            // (Query / key rows of the vision tower stay in its interleaved RoPE order.)
+            if let Some(s) = files.shards.first_mut() {
+                s.metadata.insert("naming".into(), "mistral".into());
+            }
         }
         Ok(files)
     }

@@ -933,8 +933,7 @@ impl Engine {
         let decision;
         // Streaming reads the weights in place: always mapped. So is a Mistral Large 4 checkpoint
         // larger than most of RAM (its routed experts are read through the page cache).
-        let too_big = family == Family::Mistral4
-            && crate::platform::total_memory().is_some_and(|m| crate::safetensors::checkpoint_bytes(&dir) as f64 > 0.6 * m as f64);
+        let too_big = family == Family::Mistral4 && crate::mistral4::too_big(crate::safetensors::checkpoint_bytes(&dir));
         let mmap = opts.mmap || opts.stream.is_some() || too_big;
         let files = arena.keep(ModelFiles::open(&dir, !mmap)?);
         let tok = load_tokenizer(&dir)?;
@@ -1064,8 +1063,11 @@ impl Engine {
                 }
                 decision = None;
                 let mut model = Mistral4Model::load(config::Mistral4Config::load(&dir)?, files, opts.quant)?;
-                if let Some(so) = &opts.stream {
-                    streamer = Some(crate::stream::attach_mistral4(&mut model, files, so.clone())?);
+                // Too big for memory: streamed with a page-cache budget unless told otherwise
+                // (2.5-3.5x faster than demand paging on the 378 GB UD-Q2_K_XL, see the README).
+                let so = opts.stream.clone().or_else(|| too_big.then(crate::mistral4::default_stream));
+                if let Some(so) = so {
+                    streamer = Some(crate::stream::attach_mistral4(&mut model, files, so)?);
                 }
                 let model = arena.keep(model);
                 let c = &model.cfg;
@@ -1521,6 +1523,8 @@ impl Engine {
                 Family::Gemma4 => {}
                 Family::Qwen if crate::qwen_vision::is_qwen_vl(&self.info.path) => {}
                 Family::Qwen => bail!("this checkpoint has no vision tower (text only)"),
+                Family::Mistral4 if crate::pixtral::PixtralConfig::load(&self.info.path)?.is_some() => {}
+                Family::Mistral4 => bail!("this checkpoint has no vision tower (for a GGUF model: no mmproj file beside it)"),
                 _ => bail!("attachments are supported for Gemma 4 and Qwen3.5-family vision models only"),
             }
             let req = mm::MmRequest {

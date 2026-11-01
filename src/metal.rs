@@ -2218,6 +2218,142 @@ fn format_index(w: &WeightRef) -> (usize, usize, usize) {
     }
 }
 
+impl MetalBackend {
+    /// `Backend::upload_moe`; `resident` puts the wrapped experts in the queue's residency set
+    /// (else each submission makes them resident: transient state of streamed experts).
+    #[allow(clippy::too_many_arguments)]
+    fn moe_state(
+        &self,
+        gate_up: &[WeightRef],
+        up: Option<&[WeightRef]>,
+        down: &[WeightRef],
+        h: usize,
+        mi: usize,
+        gelu: bool,
+        resident: bool,
+    ) -> Option<DeviceWeight> {
+        self.mma()?;
+        if !crate::gpu::moe_offload() || gate_up.is_empty() || gate_up.len() != down.len() || up.is_some_and(|u| u.len() != down.len()) {
+            return None;
+        }
+        let affine = |w: &WeightRef| matches!(w, WeightRef::Q4(m) if m.offsets.is_some());
+        // Rows of the first projection: fused gate and up, or the gate alone.
+        let g_rows = if up.is_some() { mi } else { 2 * mi };
+        let (pg, _) = self.mma_pipe(&gate_up[0], affine(&gate_up[0]), g_rows, h, Tile::Grouped)?;
+        let pu = match up {
+            Some(u) => Some(self.mma_pipe(&u[0], affine(&u[0]), mi, h, Tile::Grouped)?.0),
+            None => None,
+        };
+        let (pd, _) = self.mma_pipe(&down[0], affine(&down[0]), h, mi, Tile::Grouped)?;
+        let row_bytes = |w: &WeightRef| match w {
+            WeightRef::Gguf(g) => g.row_bytes(),
+            _ => 0,
+        };
+        // Every expert's (data, scales) memory regions; one format for all.
+        let regions = |w: &WeightRef| -> ((usize, usize), Option<(usize, usize)>) {
+            fn span<T>(v: &[T]) -> (usize, usize) {
+                (v.as_ptr() as usize, std::mem::size_of_val(v))
+            }
+            match w {
+                WeightRef::Bf16(v) => (span(v), None),
+                WeightRef::Q8(m) => (span(&m.q[..]), Some(span(&m.scales[..]))),
+                WeightRef::Q4(m) => (span(&m.q[..]), Some(span(&m.scales[..]))),
+                WeightRef::Gguf(m) => (span(&m.data[..]), None),
+            }
+        };
+        let mut all: Vec<(usize, usize)> = Vec::new();
+        for (w, n_out, n_in, pipe) in gate_up
+            .iter()
+            .map(|w| (w, g_rows, h, pg))
+            .chain(up.unwrap_or(&[]).iter().map(|w| (w, mi, h, pu.unwrap())))
+            .chain(down.iter().map(|w| (w, h, mi, pd)))
+        {
+            if self.mma_pipe(w, affine(w), n_out, n_in, Tile::Grouped)?.0 != pipe {
+                return None;
+            }
+            let (d, s) = regions(w);
+            all.push(d);
+            all.extend(s);
+        }
+        // Experts usually are slices of one tensor per projection: wrap adjacent regions as one
+        // buffer, so a submission makes a few buffers resident rather than one per expert.
+        all.sort_unstable();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for (p, n) in all {
+            match spans.last_mut() {
+                Some((s, e)) if p <= *e => *e = (*e).max(p + n),
+                _ => spans.push((p, p + n)),
+            }
+        }
+        let release: (MsgVoid, Sel) = (self.o.msg_send(), self.sels.release);
+        let mut dev = MoeDev {
+            pipes: (pg, pd),
+            row_bytes: (row_bytes(&gate_up[0]) as u32, row_bytes(&down[0]) as u32),
+            bufs: Vec::with_capacity(spans.len()),
+            ep: (std::ptr::null_mut(), std::ptr::null_mut()),
+            up: None,
+            n_exp: gate_up.len(),
+            gelu,
+            residency: None,
+            release,
+        };
+        let mut addr: Vec<u64> = Vec::with_capacity(spans.len());
+        for &(s, e) in &spans {
+            let b = self.wrap(s as *const u8, e - s)?;
+            addr.push(self.gpu_address(&b));
+            dev.bufs.push(b);
+        }
+        let at = |p: usize| {
+            let i = spans.partition_point(|&(s, _)| s <= p) - 1;
+            addr[i] + (p - spans[i].0) as u64
+        };
+        let table = |ws: &[WeightRef]| -> Vec<[u64; 2]> {
+            ws.iter()
+                .map(|w| {
+                    let (d, s) = regions(w);
+                    [at(d.0), s.map_or(at(d.0), |s| at(s.0))]
+                })
+                .collect()
+        };
+        let copy: MsgNewBufBytes = self.o.msg_send();
+        for (slot, tab) in [(&mut dev.ep.0, table(gate_up)), (&mut dev.ep.1, table(down))] {
+            *slot = unsafe {
+                copy(
+                    self.device,
+                    self.sels.new_buffer_bytes,
+                    tab.as_ptr() as *const c_void,
+                    tab.len() * 16,
+                    0,
+                )
+            };
+            if slot.is_null() {
+                return None;
+            }
+        }
+        if let (Some(u), Some(pu)) = (up, pu) {
+            let tab = table(u);
+            let id = unsafe {
+                copy(
+                    self.device,
+                    self.sels.new_buffer_bytes,
+                    tab.as_ptr() as *const c_void,
+                    tab.len() * 16,
+                    0,
+                )
+            };
+            if id.is_null() {
+                return None;
+            }
+            dev.up = Some((pu, row_bytes(&u[0]) as u32, id));
+        }
+        if let Some(r) = self.residency.as_ref().filter(|_| resident) {
+            r.update(&dev.bufs.iter().map(|b| b.id).collect::<Vec<_>>(), true);
+            dev.residency = Some(r.clone());
+        }
+        Some(Box::new(dev))
+    }
+}
+
 impl Backend for MetalBackend {
     fn name(&self) -> &str {
         "metal"
@@ -2684,125 +2820,19 @@ impl Backend for MetalBackend {
         mi: usize,
         gelu: bool,
     ) -> Option<DeviceWeight> {
-        self.mma()?;
-        if !crate::gpu::moe_offload() || gate_up.is_empty() || gate_up.len() != down.len() || up.is_some_and(|u| u.len() != down.len()) {
-            return None;
-        }
-        let affine = |w: &WeightRef| matches!(w, WeightRef::Q4(m) if m.offsets.is_some());
-        // Rows of the first projection: fused gate and up, or the gate alone.
-        let g_rows = if up.is_some() { mi } else { 2 * mi };
-        let (pg, _) = self.mma_pipe(&gate_up[0], affine(&gate_up[0]), g_rows, h, Tile::Grouped)?;
-        let pu = match up {
-            Some(u) => Some(self.mma_pipe(&u[0], affine(&u[0]), mi, h, Tile::Grouped)?.0),
-            None => None,
-        };
-        let (pd, _) = self.mma_pipe(&down[0], affine(&down[0]), h, mi, Tile::Grouped)?;
-        let row_bytes = |w: &WeightRef| match w {
-            WeightRef::Gguf(g) => g.row_bytes(),
-            _ => 0,
-        };
-        // Every expert's (data, scales) memory regions; one format for all.
-        let regions = |w: &WeightRef| -> ((usize, usize), Option<(usize, usize)>) {
-            fn span<T>(v: &[T]) -> (usize, usize) {
-                (v.as_ptr() as usize, std::mem::size_of_val(v))
-            }
-            match w {
-                WeightRef::Bf16(v) => (span(v), None),
-                WeightRef::Q8(m) => (span(&m.q[..]), Some(span(&m.scales[..]))),
-                WeightRef::Q4(m) => (span(&m.q[..]), Some(span(&m.scales[..]))),
-                WeightRef::Gguf(m) => (span(&m.data[..]), None),
-            }
-        };
-        let mut all: Vec<(usize, usize)> = Vec::new();
-        for (w, n_out, n_in, pipe) in gate_up
-            .iter()
-            .map(|w| (w, g_rows, h, pg))
-            .chain(up.unwrap_or(&[]).iter().map(|w| (w, mi, h, pu.unwrap())))
-            .chain(down.iter().map(|w| (w, h, mi, pd)))
-        {
-            if self.mma_pipe(w, affine(w), n_out, n_in, Tile::Grouped)?.0 != pipe {
-                return None;
-            }
-            let (d, s) = regions(w);
-            all.push(d);
-            all.extend(s);
-        }
-        // Experts usually are slices of one tensor per projection: wrap adjacent regions as one
-        // buffer, so a submission makes a few buffers resident rather than one per expert.
-        all.sort_unstable();
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-        for (p, n) in all {
-            match spans.last_mut() {
-                Some((s, e)) if p <= *e => *e = (*e).max(p + n),
-                _ => spans.push((p, p + n)),
-            }
-        }
-        let release: (MsgVoid, Sel) = (self.o.msg_send(), self.sels.release);
-        let mut dev = MoeDev {
-            pipes: (pg, pd),
-            row_bytes: (row_bytes(&gate_up[0]) as u32, row_bytes(&down[0]) as u32),
-            bufs: Vec::with_capacity(spans.len()),
-            ep: (std::ptr::null_mut(), std::ptr::null_mut()),
-            up: None,
-            n_exp: gate_up.len(),
-            gelu,
-            residency: None,
-            release,
-        };
-        let mut addr: Vec<u64> = Vec::with_capacity(spans.len());
-        for &(s, e) in &spans {
-            let b = self.wrap(s as *const u8, e - s)?;
-            addr.push(self.gpu_address(&b));
-            dev.bufs.push(b);
-        }
-        let at = |p: usize| {
-            let i = spans.partition_point(|&(s, _)| s <= p) - 1;
-            addr[i] + (p - spans[i].0) as u64
-        };
-        let table = |ws: &[WeightRef]| -> Vec<[u64; 2]> {
-            ws.iter()
-                .map(|w| {
-                    let (d, s) = regions(w);
-                    [at(d.0), s.map_or(at(d.0), |s| at(s.0))]
-                })
-                .collect()
-        };
-        let copy: MsgNewBufBytes = self.o.msg_send();
-        for (slot, tab) in [(&mut dev.ep.0, table(gate_up)), (&mut dev.ep.1, table(down))] {
-            *slot = unsafe {
-                copy(
-                    self.device,
-                    self.sels.new_buffer_bytes,
-                    tab.as_ptr() as *const c_void,
-                    tab.len() * 16,
-                    0,
-                )
-            };
-            if slot.is_null() {
-                return None;
-            }
-        }
-        if let (Some(u), Some(pu)) = (up, pu) {
-            let tab = table(u);
-            let id = unsafe {
-                copy(
-                    self.device,
-                    self.sels.new_buffer_bytes,
-                    tab.as_ptr() as *const c_void,
-                    tab.len() * 16,
-                    0,
-                )
-            };
-            if id.is_null() {
-                return None;
-            }
-            dev.up = Some((pu, row_bytes(&u[0]) as u32, id));
-        }
-        if let Some(r) = &self.residency {
-            r.update(&dev.bufs.iter().map(|b| b.id).collect::<Vec<_>>(), true);
-            dev.residency = Some(r.clone());
-        }
-        Some(Box::new(dev))
+        self.moe_state(gate_up, up, down, h, mi, gelu, true)
+    }
+
+    fn upload_moe_transient(
+        &self,
+        gate_up: &[WeightRef],
+        up: Option<&[WeightRef]>,
+        down: &[WeightRef],
+        h: usize,
+        mi: usize,
+        gelu: bool,
+    ) -> Option<DeviceWeight> {
+        self.moe_state(gate_up, up, down, h, mi, gelu, false)
     }
 
     fn moe(&self, x: &[f32], t: usize, h: usize, mi: usize, routes: &[Vec<(usize, f32)>], dev: &DeviceWeight, y: &mut [f32]) -> bool {

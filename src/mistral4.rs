@@ -122,6 +122,21 @@ pub(crate) fn native_name(n: &str) -> Option<String> {
     Some(format!("model.language_model.layers.{l}.{sub}"))
 }
 
+/// Weight streaming for a checkpoint that does not fit in memory: a page-cache budget of 70% of
+/// RAM (the dense weights stay resident, the rest caches recently routed experts).
+pub fn default_stream() -> crate::stream::StreamOptions {
+    let mut o = crate::stream::StreamOptions::default().with_env();
+    if o.cache_budget.is_none() {
+        o.cache_budget = crate::platform::total_memory().map(|m| (m as f64 * 0.7) as u64);
+    }
+    o
+}
+
+/// Whether a checkpoint of `bytes` is too big to hold in memory (over 60% of RAM).
+pub fn too_big(bytes: u64) -> bool {
+    crate::platform::total_memory().is_some_and(|m| bytes as f64 > 0.6 * m as f64)
+}
+
 /// Whether `files` is a checkpoint in Mistral's own naming (see [`native_name`]).
 pub(crate) fn is_native(files: &ModelFiles) -> bool {
     files.has("tok_embeddings.weight") && files.has("layers.0.attention_norm.weight")
@@ -781,6 +796,25 @@ impl<'a> Mistral4Model<'a> {
                 Ffn::Moe(m) => self.moe_forward(m, &hn, t, &mut o, need),
             }
             add_inplace(&mut x, &o);
+            // Streaming: guess the next layer's experts from its router on this residual, so
+            // they are read while its attention runs (decode-sized passes; prefill needs most).
+            if let (Some(s), Some(next)) = (&self.stream, self.layers.get(l + 1))
+                && let Ffn::Moe(m) = &next.ffn
+                && t <= 4
+                && s.options().predict_experts
+            {
+                let ne = m.experts.n_experts();
+                let mut guess = Vec::new();
+                for ti in 0..t {
+                    let mut xn = vec![0f32; h];
+                    rmsnorm_f32w(&x[ti * h..(ti + 1) * h], &next.ln_post, eps, &mut xn);
+                    let lg: Vec<f32> = m.router.chunks(h).take(ne).map(|w| dot(w, &xn)).collect();
+                    guess.extend(route(&lg, m.experts.top_k, c.n_group, c.topk_group, 1.0).into_iter().map(|r| r.0));
+                }
+                guess.sort_unstable();
+                guess.dedup();
+                s.prefetch_parts(l + 1, &guess);
+            }
         }
         rmsnorm_f32w_rows_inplace(&mut x, h, &self.final_norm, eps);
         sess.pos += t;

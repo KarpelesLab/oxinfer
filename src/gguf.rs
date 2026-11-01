@@ -910,9 +910,9 @@ pub struct HfTensor {
 /// The tensors of a GGUF file the loaders use, under Hugging Face names.
 pub fn hf_tensors(h: &Header) -> Result<Vec<HfTensor>> {
     // Diffusion transformers (city96-style FLUX quants, unsloth Qwen-Image, calcuis "pig" files such
-    // as OmniGen2) keep their original tensor names; T5
+    // as OmniGen2) and llama.cpp vision `clip` files (mmproj) keep their original tensor names; T5
     // encoders (`t5encoder`) get the transformers names.
-    if matches!(h.arch(), "flux" | "qwen_image" | "pig" | "omnigen2" | "t5encoder") {
+    if matches!(h.arch(), "flux" | "qwen_image" | "pig" | "omnigen2" | "t5encoder" | "clip") {
         let t5 = h.arch() == "t5encoder";
         return Ok(h
             .tensors

@@ -127,6 +127,21 @@ pub trait Backend: Send + Sync {
     ) -> Option<DeviceWeight> {
         None
     }
+    /// [`Backend::upload_moe`] for one pass over experts that stream from storage: the state is
+    /// dropped after the call, and nothing keeps the weights resident beyond the submissions
+    /// that use them.
+    #[allow(clippy::too_many_arguments)]
+    fn upload_moe_transient(
+        &self,
+        _gate_up: &[WeightRef],
+        _up: Option<&[WeightRef]>,
+        _down: &[WeightRef],
+        _h: usize,
+        _inter: usize,
+        _gelu: bool,
+    ) -> Option<DeviceWeight> {
+        None
+    }
     /// The routed experts of an MoE layer (`dev` from `upload_moe`) in one submission: token `i`
     /// of `x` (`[t, h]`) goes through the experts `routes[i]` lists (expert index, weight), and
     /// `y[i] += sum of weight * down(act(gate) * up)`. Returns false if nothing was computed
