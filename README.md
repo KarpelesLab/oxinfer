@@ -11,7 +11,8 @@ and Qwen3 models load from the mirror too. Early days: the crate is at 0.0.x and
 formats may still change.
 
 Local LLM inference in pure Rust: Gemma 4 (text, images, video, audio), Qwen 3.5 / 3.6 / 3.8
-(text, images, video), Gemma 3 and Qwen 3 today, more model families as they come; also
+(text, images, video), Mistral Large 4 (text, images; 1T parameters streamed from storage),
+Gemma 3 and Qwen 3 today, more model families as they come; also
 embeddings, Stable Diffusion, FLUX.1 Kontext, Qwen-Image-Edit, OmniGen2, BAGEL and Step1X-Edit image editing, Whisper speech to text and Orpheus text to speech. No BLAS, no ML framework: weights are read straight out
 of the safetensors files (HuggingFace checkpoints or MLX 4-bit ones) and every operation
 (matmuls, attention, norms, RoPE, sampling) is implemented here, with hand-written SIMD kernels
@@ -90,6 +91,7 @@ optional.
 | openai/whisper-large-v3, -large-v3-turbo, distil-whisper/distil-large-v3 | 1.55B / 809M / 756M | 3.1 / 1.6 / 1.5 GB (fp16) | speech to text; match transformers token for token |
 | canopylabs/orpheus-3b-0.1-ft (ungated copy: unsloth/orpheus-3b-0.1-ft) + hubertsiuzdak/snac_24khz | 3.3B + 20M | 6.6 GB + 80 MB (fp32) | text to speech; greedy tokens and waveform match transformers + snac (see [Text to speech](#text-to-speech-orpheus)); also any Llama 3.x as a text model |
 | Orpheus GGUF (isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF, lex-au/Orpheus-3b-FT-Q8_0.gguf) | 3.3B | 2.4 / 4.0 GB | text to speech; whisper-small WER 0-1% like the safetensors model |
+| mistralai/Mistral-Large-4-1T-A52B; unsloth/Mistral-Large-4-1T-A52B-GGUF | 1T MoE, 52B active (+ 2B vision) | 1.06 TB (FP8) / 378 GB (GGUF UD-Q2_K_XL) | text and images; streamed from storage when larger than RAM (1.3-1.5 tok/s on a 128 GB M5 Max); matches transformers (tiny random checkpoints with every feature, KL < 1e-9) and llama.cpp on the real GGUF (same next tokens, same greedy text); see [Mistral Large 4](#mistral-large-4-1t-a52b) |
 | Llama 3.x GGUF (bartowski/Llama-3.2-1B-Instruct-GGUF, ...) | 1.2B tested | 0.8 GB (Q4_K_M) - 2.5 GB (F16) | text; F16 file bit-identical to the safetensors model, quantized files match llama.cpp (see [Llama 3 GGUF](#llama-3-gguf)) |
 | canopylabs/orpheus-3b-0.1-pretrained (ungated copy: unsloth/orpheus-3b-0.1-pretrained) | 3.3B | 6.6 GB | voice cloning from a reference clip (SNAC encoder); prompt and greedy tokens match the canopylabs notebook + transformers |
 | canopylabs/3b-{fr,de,ko,hi,zh,es_it}-ft-research_release (ungated copies: Our-Org-2/...) | 3.3B | 13 GB (fp32) | multilingual text to speech (French and German tested; French greedy tokens match transformers) |
@@ -231,6 +233,108 @@ Thinking is on by default in the Qwen template; `--think` enables it here (the t
 otherwise the generation prompt closes the think block.
 
 Text, images, video and audio are supported (E2B/E4B have both towers).
+
+### Mistral Large 4 (1T-A52B)
+
+`mistralai/Mistral-Large-4-1T-A52B` (`mistral4.rs`) is a DeepSeek-V3.2-style MoE with Mistral's
+own twists, 72 layers of 6144:
+
+- MLA attention without a query LoRA: 64 heads of 128 (64 rotary dims), keys and values
+  expanded from a 512-wide latent; only the latent and the shared rotary key are cached (2.3 KB
+  per token and layer). Decoding scores against the latent (`kv_b_proj` absorbed into the query
+  and the output, as llama.cpp does); prefill expands the keys and values and runs ordinary
+  attention as GEMMs, on the GPU for a chunk that starts the context.
+- Every fourth layer has no RoPE (the whole head is non-rotary), and layers 39, 43, ..., 71
+  have no KV projection of their own: they read layer 35's latent cache through their own
+  `kv_b_proj` (no cache stored for them).
+- Queries scaled per head and position by `s_h ln(pos + 1) + b_h` ("SSMax"); RoPE on
+  interleaved pairs with YaRN frequencies (factor 2048 over 512) times learned factors
+  ("LeRoPE", `exp(alpha)`), without YaRN's magnitude scaling.
+- DSA sparse attention: an indexer (32 heads of 128, LayerNorm'd, rotary on its first 64 dims)
+  scores every earlier token as `sum_h w_h relu(q_h . k)`, and each query attends only to its
+  2048 best keys; "shared" layers reuse the previous indexer's choice. The indexer keeps its own
+  key cache, and the choice is made exactly as the reference (contexts up to 2048 tokens are
+  dense attention).
+- A dense first layer, then 128 softmax-routed SiLU experts of 6144 (top 4, renormalized) plus a
+  shared expert; untied LM head with logits soft-capped at 30.
+
+Checkpoints: the official one (Mistral's `consolidated-*.safetensors` layout, FP8 E4M3 weights
+with 128x128 block scales, read as stored, zero-copy, through a `GgmlType::F8E4M3` with block
+scales), transformers-saved copies, and llama.cpp GGUF files (`mistral-large4`, split into parts
+or not; unsloth's are tested). The Pixtral vision tower (30 layers of 2048, 2D RoPE, 2x2 patch
+merger and GELU projector) comes from the checkpoint, or for a GGUF model from the `mmproj` file
+beside it (in its folder or the one above). The chat format is the model's template:
+`[SYSTEM_PROMPT]`, `[MODEL_SETTINGS]{"reasoning_effort": ...}` (`high` with `--think`, `low`
+otherwise; the model thinks in `[THINK]...[/THINK]` either way, shown dimmed), `[INST]` turns,
+`[AVAILABLE_TOOLS]` / `[TOOL_CALLS]` tool calling, images as rows of `[IMG]` closed by
+`[IMG_BREAK]` / `[IMG_END]`. Speculative decoding (the checkpoint's DSpark head) is not
+implemented.
+
+```sh
+# unsloth's 378 GB UD-Q2_K_XL on a 128 GB Mac: the folder of parts (or any part, or the repo id)
+./target/release/oxinfer --model unsloth/Mistral-Large-4-1T-A52B-GGUF:UD-Q2_K_XL -p "Why is the sky blue?"
+./target/release/oxinfer --model ~/.cache/oxinfer/hub/unsloth--Mistral-Large-4-1T-A52B-GGUF/UD-Q2_K_XL \
+    --image photo.jpg -p "Describe this image in two sentences."
+# the official FP8 checkpoint (1.06 TB)
+./target/release/oxinfer --model mistralai/Mistral-Large-4-1T-A52B -p "Hello"
+```
+
+A checkpoint larger than 60% of RAM is streamed (`--stream`, see
+[Streaming weights from flash](#streaming-weights-from-flash-models-larger-than-ram)) with a page
+cache budget of 70% of RAM unless told otherwise (`--stream`, `--cache-budget-gb`; `--mmap` alone
+asks for plain demand paging): the 20 GB of dense weights stay resident, the routed experts
+(357 GB) are read as they are routed and the rest of the budget caches the recent ones (about 60%
+of the routed experts are then hits). A prefill chunk needs nearly all experts, so it sweeps them
+once: their GEMMs run on the GPU's matrix units through per-call device state
+(`Backend::upload_moe_transient`, nothing kept resident; 2x the prefill of the CPU experts),
+and longer chunks amortize the sweep. Nothing pins the model in memory: the process footprint
+stays under 1 GB while decoding (3-5 GB in prefill), the page cache holds the rest.
+
+Speed on the M5 Max (128 GB, 18 cores, SSD at ~13 GB/s; other jobs used 3-4 cores, so lower
+bounds), unsloth's UD-Q2_K_XL:
+
+| setting | prefill | decode |
+|---|---|---|
+| default (streaming, 96 GB budget, Metal) | 17.4 tok/s (895-token prompt), 7.5 tok/s (1406, two chunks), 1-2 tok/s (15-90 tokens) | 1.3-1.5 tok/s |
+| same, `--device cpu` | 3.0 tok/s (895 tokens) | 1.1-1.2 tok/s |
+| `--mmap` (demand paging, no streaming) | 0.4 tok/s (15 tokens) | 0.3-0.4 tok/s |
+| `--expert-predict` (next layer's experts guessed and read ahead, 73% right) | | 1.4 tok/s: IO stalls fall from 60% to 27% of the time, but the reads slow the compute as much |
+| llama.cpp (same build of its master, CPU, `-ngl 0`, mmap) | 0.2-0.27 tok/s | 0.25 tok/s |
+
+A decode step reads 31 GB of weights: the resident 20 GB at ~120 GB/s and ~4 GB of routed experts
+from storage (60% of the time is waiting on those reads).
+
+Agreement. transformers (main, `modeling_mistral_large4.py`) in float32 on tiny random
+checkpoints (8 layers of 256, 4 heads, 16 experts, a dense first layer, NoPE layers, a KV-sharing
+layer, full and shared indexer layers, `index_topk` 16 so most queries are sparse, a 2-layer
+Pixtral tower), against every position of a prompt and 8-16 greedy decode steps fed back
+(`tools/mistral4_tiny.py` builds them, `tools/ref_mistral4.py` runs the reference,
+`examples/mistral4_check.rs` compares):
+
+| checkpoint | prefill (max logit diff / mean KL) | decode | other |
+|---|---|---|---|
+| Mistral layout, bf16, 60 tokens | 3.8e-4 / 4.5e-10 | 4.9e-4 / 1.3e-9 | the same in chunks of 1, 7, 33, 60 |
+| same, 300 tokens | 1.0e-2 / 4.0e-8 | 3.3e-3 / 5.9e-8 | every indexer choice (1500 rows) identical; 300/300 and 16/16 top-1 |
+| transformers-saved layout | 3.8e-4 / 4.5e-10 | 4.9e-4 / 1.3e-9 | |
+| FP8 blocks (Mistral layout, `qscale_weight`), vs the reference on the dequantized weights, 60 tokens | 7.5e-4 / 7.5e-10 | 3.5e-4 / 1.0e-9 | |
+| GGUF F32 (llama.cpp's converter), 300 tokens | 3.6e-3 / 9.3e-9 | 1.2e-3 / 1.0e-8 | |
+| GGUF with unsloth's types (Q8_0, Q6_K, IQ2_S, IQ3_XXS, IQ3_S), vs the reference on its dequantized weights, 300 tokens | 5.9e-3 / 1.1e-8 | see below | |
+| image features (Pixtral + projector), 384x384 and 1700x900 images | rel. 1.4e-6 / 1.9e-6 | | prompt ids identical; last-token logits 5e-4 |
+| same from the converted `mmproj` GGUF (f16) | rel. 1.2e-6 | | |
+
+On longer contexts a random tiny model is chaotic: near-ties in the indexer (gaps of 2e-6
+relative between the 16th and 17th key) or the router flip with float32 rounding and move later
+logits by up to 8. Quantized GGUF decoding multiplies with int8 activations (as llama.cpp), 0.7%
+relative per layer here, which such a model amplifies; with float activations (passes of 8+
+tokens) every quantized type matches as above.
+
+On the real UD-Q2_K_XL, against llama.cpp (its master, CPU) on the same file: same next token
+on both prompts tried, top-20 overlap 20/20 and 19/20, log-probabilities of the top 5 within
+0.08 (0.37 over the top 20; llama.cpp quantizes activations differently and oxinfer's prefill
+here ran on the GPU's half-precision matrix units), and the same 24 greedy tokens ("the founding
+of Rome in 753 BC to the fall of Constantinople in 1453 AD. It is one of"). The rebuilt GGUF
+tokenizer (tekken, numbers in groups of three) matches `tokenizer.json` on this README. Chat is
+coherent on both devices, across turns, and about images.
 
 ## Embeddings
 
@@ -2489,16 +2593,19 @@ cross-origin requests).
 
 `--model` also takes llama.cpp GGUF files, as a path or as `org/repo:QUANT` (the one file of a
 GGUF repository whose name ends in `QUANT.gguf`, e.g.
-`HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF:Q4_K_P`). Architectures: `qwen35`
+`HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF:Q4_K_P`). Models split into parts
+(`name-00001-of-00009.gguf`, ...) load from any part or from their folder, and `org/repo:QUANT`
+fetches every part. Architectures: `qwen35`
 (Qwen3.5 / 3.6 / 3.8), `qwen35moe`, `qwen3`, `llama` (Llama 3.x, and Orpheus TTS, see
-[below](#llama-3-gguf)) and `gemma4` (Gemma 4 text models, dense and 26B-A4B; see
-[Gemma 4 26B-A4B](#gemma-4-26b-a4b-moe)). The tokenizer and chat template come from the
+[below](#llama-3-gguf)), `gemma4` (Gemma 4 text models, dense and 26B-A4B; see
+[Gemma 4 26B-A4B](#gemma-4-26b-a4b-moe)) and `mistral-large4` (see
+[Mistral Large 4](#mistral-large-4-1t-a52b), whose Pixtral `mmproj` file is read too). The tokenizer and chat template come from the
 GGUF metadata (the rebuilt tokenizer matches Qwen3.8's `tokenizer.json` on 305 test texts, and
 Gemma 4's, a SentencePiece-style BPE with byte fallback, on this README and multilingual text), and
 llama.cpp's conversions are undone at load (`gguf.rs`): norms with the 1 folded in, `ssm_a`, the
 tiled Gated DeltaNet value-head order, separate 3D expert tensors, Llama's permuted query / key
 rows, Gemma 4's proportional RoPE stored as per-frequency divisors (`rope_freqs`). The `mmproj`
-vision files are not read, so image input needs the safetensors or MLX checkpoint. Weights stay in their GGUF
+vision files are not read (except Mistral Large 4's), so image input needs the safetensors or MLX checkpoint. Weights stay in their GGUF
 format: F32, F16, BF16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q2_K-Q6_K, IQ1_S/IQ1_M, IQ2_XXS/XS/S,
 IQ3_XXS/S and IQ4_NL/XS (`ggml.rs`, dequantization bit-exact with gguf-py), with NEON decode
 kernels for every type and Metal prefill kernels. The i-quants (IQ1-IQ3) decode several times
@@ -3079,7 +3186,7 @@ plain greedy output.
 
 ### Streaming weights from flash (models larger than RAM)
 
-`--stream` (Qwen3.5 / Qwen3.8, Gemma 4 / Gemma 3 including 26B-A4B's experts; implies `--mmap`) runs a model whose weights do not fit in memory
+`--stream` (Qwen3.5 / Qwen3.8, Gemma 4 / Gemma 3 including 26B-A4B's experts, Mistral Large 4, on by default when its checkpoint does not fit in RAM; implies `--mmap`) runs a model whose weights do not fit in memory
 by reading them in place from the mapped file while a reader thread fetches the next layers. It
 is aimed at phones: HauhauCS's Qwen3.8-27B GGUFs (Q2_K_P 10.7 GB, Q4_K_P 17.9 GB) on a 12 GB
 iPhone. Every forward pass reads the units (decoder layers, LM head, MTP layer, draft head)
