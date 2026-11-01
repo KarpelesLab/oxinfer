@@ -152,8 +152,35 @@ impl<T> SendPtr<T> {
     }
 }
 
+/// A weight element the quantizers read: bf16 bits or f32.
+pub trait QSrc: Copy + Sync {
+    fn f32(self) -> f32;
+}
+impl QSrc for u16 {
+    #[inline(always)]
+    fn f32(self) -> f32 {
+        bf16_to_f32(self)
+    }
+}
+impl QSrc for f32 {
+    #[inline(always)]
+    fn f32(self) -> f32 {
+        self
+    }
+}
+
 /// Quantizes a bf16 row-major matrix. Symmetric round-to-nearest, scale = absmax / 127 per block.
 pub fn quantize_bf16(w: &[u16], n_out: usize, n_in: usize) -> QMatrix {
+    quantize_q8_from(w, n_out, n_in)
+}
+
+/// [`quantize_bf16`] for f32 weights (e.g. a LoRA merged in f32, which rounding to bf16 first
+/// would mostly erase: a step-distillation update is often below half a bf16 ulp of the weight).
+pub fn quantize_f32(w: &[f32], n_out: usize, n_in: usize) -> QMatrix {
+    quantize_q8_from(w, n_out, n_in)
+}
+
+fn quantize_q8_from<T: QSrc>(w: &[T], n_out: usize, n_in: usize) -> QMatrix {
     assert_eq!(w.len(), n_out * n_in);
     assert!(n_in.is_multiple_of(QBLOCK), "n_in must be a multiple of {QBLOCK}");
     let bpr = n_in / QBLOCK;
@@ -176,13 +203,13 @@ pub fn quantize_bf16(w: &[u16], n_out: usize, n_in: usize) -> QMatrix {
                 let blk = &row[b * QBLOCK..(b + 1) * QBLOCK];
                 let mut amax = 0f32;
                 for &v in blk {
-                    amax = amax.max(bf16_to_f32(v).abs());
+                    amax = amax.max(v.f32().abs());
                 }
                 let scale = amax / 127.0;
                 let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
                 srow[b] = scale;
                 for (i, &v) in blk.iter().enumerate() {
-                    qrow[b * QBLOCK + i] = (bf16_to_f32(v) * inv).round().clamp(-127.0, 127.0) as i8;
+                    qrow[b * QBLOCK + i] = (v.f32() * inv).round().clamp(-127.0, 127.0) as i8;
                 }
             }
         }
@@ -407,6 +434,15 @@ fn f32_to_f16(x: f32) -> u16 {
 }
 
 pub fn quantize_q4(w: &[u16], n_out: usize, n_in: usize) -> Q4Matrix {
+    quantize_q4_from(w, n_out, n_in)
+}
+
+/// [`quantize_q4`] for f32 weights.
+pub fn quantize_q4_f32(w: &[f32], n_out: usize, n_in: usize) -> Q4Matrix {
+    quantize_q4_from(w, n_out, n_in)
+}
+
+fn quantize_q4_from<T: QSrc>(w: &[T], n_out: usize, n_in: usize) -> Q4Matrix {
     assert_eq!(w.len(), n_out * n_in);
     assert!(n_in.is_multiple_of(QBLOCK));
     let bpr = n_in / QBLOCK;
@@ -428,7 +464,7 @@ pub fn quantize_q4(w: &[u16], n_out: usize, n_in: usize) -> Q4Matrix {
             for b in 0..bpr {
                 let mut vmax = 0f32;
                 for (j, &v) in row[b * QBLOCK..(b + 1) * QBLOCK].iter().enumerate() {
-                    let f = bf16_to_f32(v);
+                    let f = v.f32();
                     blk[j] = f;
                     if f.abs() > vmax.abs() {
                         vmax = f;
@@ -551,6 +587,26 @@ pub fn dequantize_rows_q4(m: &Q4Matrix, r0: usize, r1: usize, out: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The f32 quantizers give the bf16 ones' bytes on bf16-representable weights.
+    #[test]
+    fn f32_quantizers_match_bf16() {
+        let (n_out, n_in) = (3usize, 2 * QBLOCK);
+        let mut seed = 11u64;
+        let bf: Vec<u16> = (0..n_out * n_in)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                crate::sd::ops::f32_to_bf16(((seed >> 33) % 2001) as f32 / 1000.0 - 1.0)
+            })
+            .collect();
+        let f: Vec<f32> = bf.iter().map(|&v| bf16_to_f32(v)).collect();
+        let (a, b) = (quantize_bf16(&bf, n_out, n_in), quantize_f32(&f, n_out, n_in));
+        assert_eq!(&a.q[..], &b.q[..]);
+        assert_eq!(&a.scales[..], &b.scales[..]);
+        let (a, b) = (quantize_q4(&bf, n_out, n_in), quantize_q4_f32(&f, n_out, n_in));
+        assert_eq!(&a.q[..], &b.q[..]);
+        assert_eq!(&a.scales[..], &b.scales[..]);
+    }
 
     /// The vector / parallel activation quantization equals the plain scalar definition.
     #[test]

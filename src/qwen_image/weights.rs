@@ -1,18 +1,18 @@
 //! Weight loading for the Qwen-Image transformer: biased linear layers in any precision (bf16,
 //! Q8 / Q4 quantized at load, pre-quantized, GGUF blocks), with LoRA files (Lightning step
-//! distillation, style LoRAs) merged in at load.
+//! distillation, style LoRAs).
 //!
 //! LoRA keys: `<module>.lora_down.weight` / `.lora_up.weight` / `.alpha` (lightx2v, kohya-style
 //! suffixes on diffusers module paths), PEFT / diffusers `<module>.lora_A.weight` /
 //! `.lora_B.weight`, under an optional `transformer.` / `diffusion_model.` / `base_model.model.`
-//! prefix, or kohya's `lora_unet_<module path with _>`. A targeted weight becomes
-//! `W + strength * alpha / rank * up @ down` in f32, then is stored in the precision asked for;
-//! a GGUF weight is dequantized, merged and re-quantized (Q4_0 for 5-bit-or-smaller types, Q8_0
-//! otherwise).
+//! prefix, or kohya's `lora_unet_<module path with _>`. A weight quantized at load becomes
+//! `W + strength * alpha / rank * up @ down` in f32 and is quantized from that (rounding it to
+//! bf16 first would erase most of a Lightning update, which is below half a bf16 ulp of most
+//! weights); bf16 weights and GGUF blocks keep the update as a low-rank pair applied at run time.
 
 use crate::kernels::for_chunks;
 use crate::model::{Lin, Quant, linear, linear_multi, load_lin};
-use crate::quant::{PageVec, quantize_bf16, quantize_q4};
+use crate::quant::{PageVec, quantize_f32, quantize_q4_f32};
 use crate::safetensors::{ModelFiles, SafeTensors};
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -247,6 +247,13 @@ impl RuntimeLora {
     }
 }
 
+/// Input channels of a quantized layer kept exact: `w` holds their weight columns (`[n_out,
+/// idx.len()]`, f32) and the quantized matrix has them zeroed.
+pub struct ExactCols {
+    idx: Vec<usize>,
+    w: Vec<f32>,
+}
+
 /// A linear layer with an optional bias (and a LoRA update applied at run time).
 pub struct Dense<'a> {
     pub w: Lin<'a>,
@@ -254,6 +261,7 @@ pub struct Dense<'a> {
     pub n_out: usize,
     pub n_in: usize,
     pub lora: Option<RuntimeLora>,
+    pub exact: Option<ExactCols>,
 }
 
 impl Dense<'_> {
@@ -268,7 +276,7 @@ impl Dense<'_> {
     /// to 16 rows so quantized weights take the prefill path (dequantized weights against f32
     /// activations) instead of the decode kernels, which round the activations to int8 per block
     /// of 32: the timestep embeddings have a few channels far larger than the rest, which int8
-    /// blocks would flatten (16% relative error in the velocity at Q8).
+    /// blocks would flatten.
     pub fn forward_small(&self, x: &[f32], rows: usize) -> Vec<f32> {
         const PAD: usize = 16;
         if rows >= PAD {
@@ -301,6 +309,15 @@ impl Dense<'_> {
             linear_multi(&mut dj, n_in, x, rows);
         }
         for ((d, y), h) in jobs.iter_mut().zip(&hs) {
+            if let Some(e) = &d.exact {
+                let k = e.idx.len();
+                for_chunks(y, d.n_out, rows > 1, |t, yr| {
+                    let xs: Vec<f32> = e.idx.iter().map(|&c| x[t * n_in + c]).collect();
+                    for (v, wr) in yr.iter_mut().zip(e.w.chunks_exact(k)) {
+                        *v += wr.iter().zip(&xs).map(|(a, b)| a * b).sum::<f32>();
+                    }
+                });
+            }
             if let Some(l) = &d.lora {
                 let mut u = vec![0f32; rows * d.n_out];
                 linear(&l.up, d.n_out, l.r, h, rows, &mut u);
@@ -357,7 +374,7 @@ impl<'a> Loader<'a, '_> {
             };
             return ld.dense(name, n_out, n_in);
         }
-        let merge = self.quant != Quant::Bf16 && self.files.ggml(&wn).is_none() && Quant::stored(self.files).is_none();
+        let merge = self.quant != Quant::Bf16 && self.quantizes(&wn);
         let (w, lora) = match self.lora.filter(|l| l.by_weight.contains_key(&wn)) {
             Some(l) if merge => (self.merged(&wn, n_out, n_in, l)?, None),
             Some(l) => {
@@ -380,6 +397,55 @@ impl<'a> Loader<'a, '_> {
             n_out,
             n_in,
             lora,
+            exact: None,
+        })
+    }
+
+    /// Whether weight `wn` is quantized here from float weights (not GGUF or pre-quantized).
+    fn quantizes(&self, wn: &str) -> bool {
+        self.files.ggml(wn).is_none() && Quant::stored(self.files).is_none()
+    }
+
+    /// [`Loader::dense`] with input channels `cols` kept exact when the weight is quantized here:
+    /// for inputs whose energy sits in a few channels (the modulation layers read
+    /// `silu(timestep embedding)`, where a handful of channels hold 99.9% of it), the block
+    /// rounding of those channels' weights would otherwise dominate the error.
+    pub fn dense_exact_cols(&self, name: &str, n_out: usize, n_in: usize, cols: &[usize]) -> Result<Dense<'a>> {
+        let wn = format!("{}{name}.weight", self.prefix);
+        if self.quant == Quant::Bf16 || cols.is_empty() || !self.quantizes(&wn) {
+            return self.dense(name, n_out, n_in);
+        }
+        let mut w = self.files.f32(&wn)?;
+        if w.len() != n_out * n_in {
+            bail!("tensor {wn} has {} values, expected {n_out}x{n_in}", w.len());
+        }
+        if let Some(l) = self.lora {
+            l.apply(&wn, n_out, n_in, &mut w);
+        }
+        let k = cols.len();
+        let mut cw = vec![0f32; n_out * k];
+        for (row, c) in w.chunks_exact_mut(n_in).zip(cw.chunks_exact_mut(k)) {
+            for (dst, &i) in c.iter_mut().zip(cols) {
+                *dst = std::mem::take(&mut row[i]);
+            }
+        }
+        self.files.mark_quant(&wn, self.quant.kind().unwrap_or(crate::quant::QKind::Q8));
+        let lin = match self.quant {
+            Quant::Q4 => Lin::q4(quantize_q4_f32(&w, n_out, n_in)),
+            _ => Lin::q8(quantize_f32(&w, n_out, n_in)),
+        };
+        let b = if self.has(&format!("{name}.bias")) {
+            Some(self.f32(&format!("{name}.bias"), n_out)?)
+        } else {
+            None
+        };
+        Ok(Dense {
+            w: lin,
+            b,
+            n_out,
+            n_in,
+            lora: None,
+            exact: Some(ExactCols { idx: cols.to_vec(), w: cw }),
         })
     }
 
@@ -390,15 +456,65 @@ impl<'a> Loader<'a, '_> {
             bail!("tensor {wn} has {} values, expected {n_out}x{n_in}", w.len());
         }
         l.apply(wn, n_out, n_in, &mut w);
-        let mut bf = PageVec::<u16>::zeroed(w.len());
-        for (o, &v) in bf.iter_mut().zip(&w) {
-            *o = crate::sd::ops::f32_to_bf16(v);
-        }
         self.files.mark_quant(wn, self.quant.kind().unwrap_or(crate::quant::QKind::Q8));
         Ok(match self.quant {
-            Quant::Bf16 => Lin::bf16_owned(bf),
-            Quant::Q8 => Lin::q8(quantize_bf16(&bf, n_out, n_in)),
-            Quant::Q4 => Lin::q4(quantize_q4(&bf, n_out, n_in)),
+            Quant::Bf16 => {
+                let mut bf = PageVec::<u16>::zeroed(w.len());
+                for (o, &v) in bf.iter_mut().zip(&w) {
+                    *o = crate::sd::ops::f32_to_bf16(v);
+                }
+                Lin::bf16_owned(bf)
+            }
+            Quant::Q8 => Lin::q8(quantize_f32(&w, n_out, n_in)),
+            Quant::Q4 => Lin::q4(quantize_q4_f32(&w, n_out, n_in)),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Q8 layer with exact input channels: the kept columns contribute exactly, the rest as Q8.
+    #[test]
+    fn exact_cols_forward() {
+        let (n_out, n_in, rows) = (8usize, 64usize, 3usize);
+        let w: Vec<f32> = (0..n_out * n_in).map(|i| ((i * 37 % 101) as f32 - 50.0) / 400.0).collect();
+        let mut x: Vec<f32> = (0..rows * n_in).map(|i| ((i * 13 % 29) as f32 - 14.0) / 10.0).collect();
+        let cols = [5usize, 40];
+        for r in 0..rows {
+            x[r * n_in + 5] = 300.0;
+            x[r * n_in + 40] = -150.0;
+        }
+        let mut wz = w.clone();
+        let mut cw = Vec::new();
+        for o in 0..n_out {
+            for &c in &cols {
+                cw.push(std::mem::take(&mut wz[o * n_in + c]));
+            }
+        }
+        let q = quantize_f32(&wz, n_out, n_in);
+        let mut deq = vec![0f32; n_out * n_in];
+        crate::quant::dequantize_rows(&q, 0, n_out, &mut deq);
+        let d = Dense {
+            w: Lin::q8(q),
+            b: Some(vec![0.5; n_out]),
+            n_out,
+            n_in,
+            lora: None,
+            exact: Some(ExactCols { idx: cols.to_vec(), w: cw }),
+        };
+        let y = d.forward_small(&x, rows);
+        for r in 0..rows {
+            for o in 0..n_out {
+                let mut want = 0.5f64;
+                for i in 0..n_in {
+                    let wv = if cols.contains(&i) { w[o * n_in + i] } else { deq[o * n_in + i] };
+                    want += wv as f64 * x[r * n_in + i] as f64;
+                }
+                let got = y[r * n_out + o] as f64;
+                assert!((got - want).abs() < 1e-3 * (1.0 + want.abs()), "row {r} out {o}: {got} vs {want}");
+            }
+        }
     }
 }

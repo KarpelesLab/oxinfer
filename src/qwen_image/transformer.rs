@@ -198,13 +198,24 @@ impl<'a> Transformer<'a> {
         let d = cfg.inner();
         let (hd, ja) = (cfg.attention_head_dim, cfg.joint_attention_dim);
         let p2 = cfg.patch_size * cfg.patch_size;
+        // The layers outside the blocks (0.5% of the weights) stay in their checkpoint precision,
+        // as GGUF conversions keep them.
+        let top = Loader {
+            files: ld.files,
+            quant: crate::model::Quant::Bf16,
+            lora: ld.lora,
+            prefix: ld.prefix.clone(),
+        };
+        let t_lin1 = top.dense("time_text_embed.timestep_embedder.linear_1", d, 256)?;
+        let t_lin2 = top.dense("time_text_embed.timestep_embedder.linear_2", d, d)?;
+        let cols = mod_channels(&t_lin1, &t_lin2);
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for l in 0..cfg.num_layers {
             let b = format!("transformer_blocks.{l}.");
             let dn = |n: &str, o: usize, i: usize| ld.dense(&format!("{b}{n}"), o, i);
             blocks.push(Block {
-                img_mod: dn("img_mod.1", 6 * d, d)?,
-                txt_mod: dn("txt_mod.1", 6 * d, d)?,
+                img_mod: ld.dense_exact_cols(&format!("{b}img_mod.1"), 6 * d, d, &cols)?,
+                txt_mod: ld.dense_exact_cols(&format!("{b}txt_mod.1"), 6 * d, d, &cols)?,
                 to_q: dn("attn.to_q", d, d)?,
                 to_k: dn("attn.to_k", d, d)?,
                 to_v: dn("attn.to_v", d, d)?,
@@ -226,14 +237,14 @@ impl<'a> Transformer<'a> {
         let inv = |dim: usize| -> Vec<f32> { (0..dim / 2).map(|i| 1.0 / 10000f32.powf((2 * i) as f32 / dim as f32)).collect() };
         let ax = cfg.axes_dims_rope;
         Ok(Self {
-            img_in: ld.dense("img_in", d, cfg.in_channels)?,
-            txt_in: ld.dense("txt_in", d, ja)?,
+            img_in: top.dense("img_in", d, cfg.in_channels)?,
+            txt_in: top.dense("txt_in", d, ja)?,
             txt_norm: ld.f32("txt_norm.weight", ja)?,
-            t_lin1: ld.dense("time_text_embed.timestep_embedder.linear_1", d, 256)?,
-            t_lin2: ld.dense("time_text_embed.timestep_embedder.linear_2", d, d)?,
+            t_lin1,
+            t_lin2,
             blocks,
-            norm_out: ld.dense("norm_out.linear", 2 * d, d)?,
-            proj_out: ld.dense("proj_out", p2 * cfg.out(), d)?,
+            norm_out: top.dense("norm_out.linear", 2 * d, d)?,
+            proj_out: top.dense("proj_out", p2 * cfg.out(), d)?,
             inv_freq: [inv(ax[0]), inv(ax[1]), inv(ax[2])],
             stream: None,
             cfg,
@@ -274,18 +285,7 @@ impl<'a> Transformer<'a> {
 
     /// The timestep embedding of `sigma` (the pipeline passes `t / 1000`): `[inner]`.
     fn temb(&self, sigma: f32) -> Vec<f32> {
-        // Timesteps(256, flip_sin_to_cos, shift 0, scale 1000) on sigma, in f32 as diffusers.
-        let half = 128;
-        let mut e = vec![0f32; 256];
-        for i in 0..half {
-            let f = (-(10000f32.ln()) * i as f32 / half as f32).exp();
-            let a = sigma * f * 1000.0;
-            e[i] = a.cos();
-            e[half + i] = a.sin();
-        }
-        let mut h = self.t_lin1.forward_small(&e, 1);
-        h.iter_mut().for_each(|v| *v = crate::sd::ops::silu(*v));
-        self.t_lin2.forward_small(&h, 1)
+        temb(&self.t_lin1, &self.t_lin2, sigma)
     }
 
     /// RoPE angles (cos, sin; `head_dim / 2` per token) of the image tokens of `shapes` (image
@@ -431,6 +431,41 @@ impl<'a> Transformer<'a> {
         let xo = norm_modulate(&x[..n0 * d], d, &[(&e[d..2 * d], &e[..d])], |_| 0);
         self.proj_out.forward(&xo, n0)
     }
+}
+
+/// The timestep embedding of `sigma` through the embedder's two layers: `[inner]`.
+fn temb(t_lin1: &Dense, t_lin2: &Dense, sigma: f32) -> Vec<f32> {
+    // Timesteps(256, flip_sin_to_cos, shift 0, scale 1000) on sigma, in f32 as diffusers.
+    let half = 128;
+    let mut e = vec![0f32; 256];
+    for i in 0..half {
+        let f = (-(10000f32.ln()) * i as f32 / half as f32).exp();
+        let a = sigma * f * 1000.0;
+        e[i] = a.cos();
+        e[half + i] = a.sin();
+    }
+    let mut h = t_lin1.forward_small(&e, 1);
+    h.iter_mut().for_each(|v| *v = crate::sd::ops::silu(*v));
+    t_lin2.forward_small(&h, 1)
+}
+
+/// The channels of `silu(temb)` (the modulation layers' input) that carry its energy: the 8
+/// largest at each noise level of a grid over [0, 1], about 20 channels in all, holding 99.9% of
+/// it (Qwen-Image-Edit-2511: |x| up to ~330 there, below ~3 elsewhere). Quantizing their weight
+/// columns with the rest moves the modulation, which every token shares, and the first block's
+/// alone then moves the Lightning first velocity by 5.6%; the modulation layers keep them exact.
+fn mod_channels(t_lin1: &Dense, t_lin2: &Dense) -> Vec<usize> {
+    let mut cols = std::collections::BTreeSet::new();
+    for k in 0..=20 {
+        let x: Vec<f32> = temb(t_lin1, t_lin2, k as f32 / 20.0)
+            .iter()
+            .map(|&v| crate::sd::ops::silu(v))
+            .collect();
+        let mut o: Vec<usize> = (0..x.len()).collect();
+        o.sort_by(|&a, &b| x[b].abs().total_cmp(&x[a].abs()));
+        cols.extend(o.into_iter().take(8));
+    }
+    cols.into_iter().collect()
 }
 
 /// `fc2(gelu_tanh(fc1(x)))` in row chunks that keep the hidden activations bounded.

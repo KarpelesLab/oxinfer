@@ -233,6 +233,7 @@ impl<'a> Loader<'a> {
                 n_out: k_out,
                 n_in: k_in,
                 lora: None,
+                exact: None,
             },
             n_in,
             n_out,

@@ -1327,8 +1327,13 @@ Lightning LoRA uses its distillation's fixed shift of 3.
 
 Components load when first needed and the 16 GB text encoder is dropped after encoding (the
 library keeps it with `keep_text_encoder`). A LoRA is merged into the weights when they are
-quantized at load anyway (`--quant`), and applied at run time otherwise (bf16 weights borrowed from
-the mapped checkpoint, GGUF blocks), as two small extra matmuls, so no 40 GB copy is made. On Metal
+quantized at load anyway (`--quant`; merged in f32 and quantized from that, since a Lightning
+update is below half a bf16 ulp of most weights and rounding the merged weights to bf16 would erase
+it), and applied at run time otherwise (bf16 weights borrowed from the mapped checkpoint, GGUF
+blocks), as two small extra matmuls, so no 40 GB copy is made. With `--quant`, the layers outside
+the blocks stay bf16 (as GGUF conversions keep them), and the modulation layers keep the ~17 input
+channels of `silu(timestep embedding)` that carry 99.9% of its energy exact (f32 columns beside the
+quantized matrix). On Metal
 the text encoder runs with exact (f32) matmuls (its hidden states have outlier channels near 200,
 which the half-precision matrix units round by 1%), and the transformer's attention stays f32
 (its logits run into the thousands); the transformer's matmuls use the matrix units.
@@ -1344,15 +1349,25 @@ Edit-2511, a 512x512 fox photo, "make it winter", 512x512 output with 4096 refer
 | bf16 + Lightning LoRA, CPU, 4 steps | 4.1e-4 | 1.8e-3 | 7.6e-3 | 45.7 dB |
 | bf16 + Lightning, Metal with `OXINFER_METAL_MMA=0` | 4.4e-4 | 1.7e-3 | 7.9e-3 | 45.7 dB |
 | bf16 + Lightning, Metal (default) | 4.4e-4 | 7.3e-3 | 8.3e-2 | 28.9 dB |
-| `--quant q8` + Lightning, Metal | 1.7e-2 | 0.16 | 0.38 | 16.9 dB |
-| GGUF Q4_0 (unsloth) + Lightning, Metal | 4.4e-4 | 0.14 | 0.24 | 20.4 dB |
+| `--quant q8` + Lightning, Metal | 1.7e-2 | 4.7e-2 (was 0.16) | 0.11 (was 0.35) | 26.8 dB (was 17.8) |
+| `--quant q4` + Lightning, Metal | 1.7e-2 | 0.14 (was 0.20) | 0.39 (was 0.57) | 15.6 dB (was 12.2) |
+| GGUF Q4_0 (unsloth) + Lightning, Metal | 4.4e-4 | 0.14 | 0.22 | 21.3 dB |
+| reference itself with oxinfer's Q8 weights (dequantized, f32 matmuls), Lightning | | 3.4e-2 | 0.12 | 25.7 dB |
 
-(Relative L2 errors.) The VAE encoder matches to 1.2e-6. The four large Lightning steps amplify
-any difference, and the network is sensitive to weight noise: Q8 blocks (0.55% relative error per
-weight matrix) move the first velocity by 16% (the image-input projection alone by 3.6%), so
-quantized runs give a visibly equivalent edit with different fine detail rather than the same
-pixels; the same holds for GGUF files. The text encoder at Q4 moves the conditioning by 24%, so
-`--quant q4` keeps it at Q8. diffusers 0.42 calls the text encoder without `mm_token_type_ids`, and
+(Relative L2 errors.) The VAE encoder matches to 1.2e-6. The "was" figures came from two load-time
+flaws, both fixed: the Lightning LoRA was merged into bf16-rounded weights before quantizing (its
+update is 0.03-0.14% of each weight matrix's norm and the rounding erased 60-90% of it: bf16
+merged weights alone moved the first velocity by 16.6%), and the modulation layers' few dominant
+input channels shared Q8 blocks with the rest (the first block's modulation alone: 5.6%). What
+remains is the model: the reference run with oxinfer's Q8 weights gives 3.4% and 25.7 dB (last
+row), and oxinfer's Q8 run with the reference's prompt embeddings 3.5% and 25.3 dB. With the
+Lightning LoRA, Qwen-Image amplifies weight noise about 6x into the first velocity (without it,
+Q8 moves the first velocity by 0.21% and Q4 by 2.3% against oxinfer's bf16; they were 0.51% and
+5.9%), then the four large steps amplify the difference again; the first-velocity error scales
+linearly with the weight noise, so 1% would take ~10-bit weights. Quantized Lightning runs give a
+visibly equivalent edit with different fine detail rather than the same pixels (as does the
+default Metal bf16 run, whose half-precision matmul inputs give 28.9 dB). The text encoder at Q4
+moves the conditioning by 24%, so `--quant q4` keeps it at Q8. diffusers 0.42 calls the text encoder without `mm_token_type_ids`, and
 transformers 5 then gives the image tokens plain 1D positions; the reference script passes them
 (M-RoPE, as the model was trained, and as oxinfer does).
 
