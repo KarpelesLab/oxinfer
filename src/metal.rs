@@ -21,7 +21,10 @@
 //!
 //! On GPUs whose cores have matrix units (M5, A19: the Apple10 family), the GEMMs and the MoE
 //! expert layers run on them instead (`MMA_SHADER_SRC`, Metal 4 `matmul2d`), with half-precision
-//! operands and f32 accumulation: ~3-5x faster, at a relative error of ~3e-4 per product.
+//! operands and f32 accumulation: ~3-5x faster, at a relative error of ~3e-4 per product. So does
+//! attention with 128-wide heads (`flash_attn128_mma`, ~2x faster than `flash_attn128`), or with
+//! f32 operands under [`crate::gpu::set_exact_attention`] (`flash_attn128_mma_f32`, as accurate as
+//! `flash_attn128` and ~10% faster).
 //! Environment: `OXINFER_METAL_MMA=0` keeps the f32 kernels (bit-identical to the CPU), `=1` tries
 //! the matrix-unit kernels on any GPU; `OXINFER_METAL_MOE=0` keeps MoE experts on the CPU;
 //! `OXINFER_METAL_TRACE=1` prints the copy and GPU time of every submission;
@@ -905,33 +908,30 @@ kernel void silu_half(device const float* gu [[buffer(0)]], device half* ah [[bu
     for (uint i = tid; i < n4; i += 256) out[i] = half4(act_mul4(g[i], u[i], p.gelu) * s);
     if (tid == 0) rs[r] = inv;
 }
-// Fused attention for 128-wide heads, no mask, on the matrix units: half q / k / v (the model's
-// [rows][heads * 128] layout, q rows padded to 64, k / v rows to 64 with zeros), f32 output. One
-// threadgroup (4 SIMD-groups) per 64 queries of one head; keys stream in blocks of 64. Scores
-// S = Q K^T (f32) go through threadgroup memory for the online softmax, probabilities come back as
-// half for O += P V; O stays in a cooperative tensor, rescaled per query row as the max moves.
+// Fused attention for 128-wide heads, no mask, on the matrix units: q / k / v of type T (the
+// model's [rows][heads * 128] layout, q rows padded to 64, k / v rows to 64 with zeros), f32
+// output. One threadgroup (4 SIMD-groups) per 64 queries of one head; keys stream in blocks of 64.
+// Scores S = Q K^T (f32) go through threadgroup memory for the online softmax, probabilities come
+// back as T in P for O += P V; O stays in a cooperative tensor, rescaled per query row as the max
+// moves. T = half is the fast kernel; T = float runs at f32 precision (P then reuses S: each thread
+// overwrites only the scores it has read).
 struct FAM { uint tq; uint tk; uint d; float scale; };
-kernel void flash_attn128_mma(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]],
-                              device const half* v [[buffer(2)]], device float* o [[buffer(3)]], constant FAM& p [[buffer(4)]],
-                              uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                              uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float S[64 * 64];
-    threadgroup half P[64 * 64];
-    threadgroup float A[64];
-    threadgroup float L[64];
+template <typename T>
+inline void flash_attn128_body(device const T* q, device const T* k, device const T* v, device float* o, constant FAM& p,
+                               threadgroup float* S, threadgroup T* P, threadgroup float* A, threadgroup float* L,
+                               uint2 tg, uint tid) {
     uint q0 = tg.x * 64, h0 = tg.y * 128;
     uint tqp = (p.tq + 63) / 64 * 64, tkp = (p.tk + 63) / 64 * 64;
-    tensor<device half, dextents<int32_t, 2>, tensor_inline> Qt((device half*)q, dextents<int32_t, 2>(p.d, tqp));
-    tensor<device half, dextents<int32_t, 2>, tensor_inline> Kt((device half*)k, dextents<int32_t, 2>(p.d, tkp));
-    tensor<device half, dextents<int32_t, 2>, tensor_inline> Vt((device half*)v, dextents<int32_t, 2>(p.d, tkp));
+    tensor<device T, dextents<int32_t, 2>, tensor_inline> Qt((device T*)q, dextents<int32_t, 2>(p.d, tqp));
+    tensor<device T, dextents<int32_t, 2>, tensor_inline> Kt((device T*)k, dextents<int32_t, 2>(p.d, tkp));
+    tensor<device T, dextents<int32_t, 2>, tensor_inline> Vt((device T*)v, dextents<int32_t, 2>(p.d, tkp));
     tensor<threadgroup float, extents<int32_t, 64, 64>, tensor_inline> St(S, extents<int32_t, 64, 64>());
-    tensor<threadgroup half, extents<int32_t, 64, 64>, tensor_inline> Pt(P, extents<int32_t, 64, 64>());
+    tensor<threadgroup T, extents<int32_t, 64, 64>, tensor_inline> Pt(P, extents<int32_t, 64, 64>());
     constexpr auto ds = matmul2d_descriptor(64, 64, 128, false, true, false);
     constexpr auto dov = matmul2d_descriptor(64, 128, 64, false, false, false, matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<ds, execution_simdgroups<4>> ops;
     matmul2d<dov, execution_simdgroups<4>> opo;
     auto qa = Qt.template slice<128, 64>(h0, q0);
-    auto kb0 = Kt.template slice<128, 64>(h0, 0);
     auto vb0 = Vt.template slice<128, 64>(h0, 0);
     auto co = opo.template get_destination_cooperative_tensor<decltype(Pt), decltype(vb0), float>();
     zero(co);
@@ -955,7 +955,7 @@ kernel void flash_attn128_mma(device const half* q [[buffer(0)]], device const h
         float mn = max(m, bm);
         float alpha = exp(m - mn);
         float ps = 0.0f;
-        for (uint j = 0; j < 32; j++) { float e = exp(x[j] - mn); P[r * 64 + part * 32 + j] = half(e); ps += e; }
+        for (uint j = 0; j < 32; j++) { float e = exp(x[j] - mn); P[r * 64 + part * 32 + j] = T(e); ps += e; }
         ps += simd_shuffle_xor(ps, 1);
         l = l * alpha + ps;
         m = mn;
@@ -977,6 +977,23 @@ kernel void flash_attn128_mma(device const half* q [[buffer(0)]], device const h
             uint row = q0 + idx[1];
             if (row < p.tq) o[(ulong)row * p.d + h0 + idx[0]] = co[i] * L[idx[1]];
         }
+}
+kernel void flash_attn128_mma(device const half* q [[buffer(0)]], device const half* k [[buffer(1)]],
+                              device const half* v [[buffer(2)]], device float* o [[buffer(3)]], constant FAM& p [[buffer(4)]],
+                              uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float S[64 * 64];
+    threadgroup half P[64 * 64];
+    threadgroup float A[64];
+    threadgroup float L[64];
+    flash_attn128_body<half>(q, k, v, o, p, S, P, A, L, tg, tid);
+}
+kernel void flash_attn128_mma_f32(device const float* q [[buffer(0)]], device const float* k [[buffer(1)]],
+                                  device const float* v [[buffer(2)]], device float* o [[buffer(3)]], constant FAM& p [[buffer(4)]],
+                                  uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float S[64 * 64];
+    threadgroup float A[64];
+    threadgroup float L[64];
+    flash_attn128_body<float>(q, k, v, o, p, S, S, A, L, tg, tid);
 }
 // out[t] = sum over the token's k slots of weight * o[row].
 struct CB { uint n; uint k; };
@@ -1156,8 +1173,10 @@ struct Mma {
     g_q8: Id,
     g_q4: Id,
     g_gguf: Vec<(GgmlType, Id)>,
-    /// Fused attention for 128-wide heads on the matrix units (half operands).
+    /// Fused attention for 128-wide heads on the matrix units: half operands, and f32 operands
+    /// (as accurate as `flash_attn128`, ~15% faster).
     flash128: Id,
+    flash128_f32: Id,
 }
 
 #[repr(C)]
@@ -1526,6 +1545,7 @@ impl MetalBackend {
             Some(Mma {
                 x_half: pipeline(c"x_half")?,
                 flash128: pipeline(c"flash_attn128_mma")?,
+                flash128_f32: pipeline(c"flash_attn128_mma_f32")?,
                 silu_half: pipeline(c"silu_half")?,
                 combine: pipeline(c"moe_combine")?,
                 bf: [pipeline(c"mma_bf64")?, pipeline(c"mma_bf128")?],
@@ -1921,18 +1941,30 @@ impl MetalBackend {
         )
     }
 
-    /// [`MetalBackend::flash_attention`] for 128-wide heads on the matrix units
-    /// (`flash_attn128_mma`): q, k and v are staged as half (rows padded to 64 with zeros).
+    /// [`MetalBackend::flash_attention`] for 128-wide heads on the matrix units: q, k and v are
+    /// staged as half (`flash_attn128_mma`) when `half`, else as f32 (`flash_attn128_mma_f32`),
+    /// rows padded to 64 with zeros.
     #[allow(clippy::too_many_arguments)]
-    fn flash_attention_mma(&self, q: &[f32], k: &[f32], v: &[f32], tq: usize, tk: usize, heads: usize, out: &mut [f32]) -> bool {
+    fn flash_attention_mma(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        tq: usize,
+        tk: usize,
+        heads: usize,
+        half: bool,
+        out: &mut [f32],
+    ) -> bool {
         let Some(mma) = self.mma() else { return false };
         let d = heads * 128;
         let (tqp, tkp) = (tq.next_multiple_of(64), tk.next_multiple_of(64));
+        let w = if half { 2 } else { 4 };
         let mut st = self.staging.lock().unwrap();
         let st = &mut *st;
-        let ok = self.grow(&mut st.aq, tqp * d * 2)
-            && self.grow(&mut st.ak, tkp * d * 2)
-            && self.grow(&mut st.av, tkp * d * 2)
+        let ok = self.grow(&mut st.aq, tqp * d * w)
+            && self.grow(&mut st.ak, tkp * d * w)
+            && self.grow(&mut st.av, tkp * d * w)
             && self.grow(&mut st.ao, tq * d * 4);
         if !ok {
             return false;
@@ -1941,9 +1973,15 @@ impl MetalBackend {
         let (aq, ak, av, ao) = (st.aq.id, st.ak.id, st.av.id, st.ao.id);
         // SAFETY: the staging buffers hold at least the sizes grown above.
         unsafe {
-            par_half(self.contents(aq) as *mut u16, q.as_ptr(), tq * d, tqp * d);
-            par_half(self.contents(ak) as *mut u16, k.as_ptr(), tk * d, tkp * d);
-            par_half(self.contents(av) as *mut u16, v.as_ptr(), tk * d, tkp * d);
+            for (buf, x, n, total) in [(aq, q, tq * d, tqp * d), (ak, k, tk * d, tkp * d), (av, v, tk * d, tkp * d)] {
+                if half {
+                    par_half(self.contents(buf) as *mut u16, x.as_ptr(), n, total);
+                } else {
+                    let p = self.contents(buf) as *mut f32;
+                    par_copy(p, x.as_ptr(), n);
+                    std::ptr::write_bytes(p.add(n), 0, total - n);
+                }
+            }
         }
         #[repr(C)]
         struct Fa {
@@ -1958,7 +1996,7 @@ impl MetalBackend {
             d: d as u32,
             scale: 1.0 / (128f32).sqrt(),
         };
-        let pipe = mma.flash128;
+        let pipe = if half { mma.flash128 } else { mma.flash128_f32 };
         let mut out = out;
         self.submit(
             t0,
@@ -2465,8 +2503,8 @@ impl Backend for MetalBackend {
         if q.len() < tq * d || k.len() < tk * d || v.len() < tk * d || out.len() < tq * d || tq == 0 || tk == 0 {
             return false;
         }
-        if dh == 128 && !causal && self.mma().is_some() && !crate::gpu::exact_attention() {
-            return self.flash_attention_mma(q, k, v, tq, tk, heads, out);
+        if dh == 128 && !causal && self.mma().is_some() {
+            return self.flash_attention_mma(q, k, v, tq, tk, heads, !crate::gpu::exact_attention(), out);
         }
         if (dh == 64 || dh == 128) && !causal {
             return self.flash_attention(q, k, v, tq, tk, heads, dh, out);

@@ -1335,8 +1335,9 @@ the blocks stay bf16 (as GGUF conversions keep them), and the modulation layers 
 channels of `silu(timestep embedding)` that carry 99.9% of its energy exact (f32 columns beside the
 quantized matrix). On Metal
 the text encoder runs with exact (f32) matmuls (its hidden states have outlier channels near 200,
-which the half-precision matrix units round by 1%), and the transformer's attention stays f32
-(its logits run into the thousands); the transformer's matmuls use the matrix units.
+which the half-precision matrix units round by 1%), and the transformer's attention keeps f32
+operands (its logits run into the thousands; half-precision queries and keys move the first
+velocity ~10%); the transformer's matmuls and its attention both run on the matrix units.
 
 **Agreement** with diffusers 0.42 / transformers 5.20 (`tools/ref_qwen_image.py`: same input image,
 prompt and initial noise; bf16 weights on both sides with every reference matmul in f32;
@@ -1755,7 +1756,8 @@ Components load when first needed; the 16 GB text encoder is dropped after encod
 text encoder and the VAE encoder run with exact (f32) matmuls, and the VAE's f32 weights keep their
 precision as a bf16 `hi + lo` pair (Step1X ships the FLUX VAE in f32: rounding its weights to bf16
 moves the reference latents by 1.5%, the final image by 20 dB). The transformer uses the matrix
-units, attention included (`exact_attention=1` / `OXINFER_EXACT_ATTENTION=1` keeps it f32).
+units, attention included (`exact_attention=1` / `OXINFER_EXACT_ATTENTION=1` gives it f32
+operands, still on the matrix units).
 
 **Agreement** with the StepFun diffusers fork + transformers 4.55 (bf16 weights on both sides,
 every reference matmul in f32, VAE posterior mean, same initial noise; v1.2, a 512x512 cat photo,
@@ -1765,7 +1767,7 @@ every reference matmul in f32, VAE posterior mean, same initial noise; v1.2, a 5
 | oxinfer | first velocity (cond / uncond) | final latents | image PSNR |
 |---|---|---|---|
 | bf16, CPU (1 step) | 9.7e-5 / 3.5e-5 | 4.1e-4 | 62.0 dB |
-| bf16, Metal, f32 attention | 3.6e-4 / 2.5e-4 | 4.3e-3 | 53.2 dB |
+| bf16, Metal, f32 attention | 3.4e-4 / 2.4e-4 | 1.1e-2 | 48.7 dB |
 | bf16, Metal (default) | 3.3e-4 / 2.6e-4 | 1.3e-2 | 47.3 dB |
 | `--quant q8`, Metal | 3.8e-3 / 2.5e-3 | 6.6e-2 | 33.9 dB |
 | `--quant q4`, Metal | 4.6e-2 / 4.3e-2 | 0.25 | 21.7 dB |
@@ -1777,7 +1779,11 @@ with a reference running oxinfer's Q8 / Q4_0 weights dequantized: the weights al
 velocity by 2.8e-3 (Q8) and 4.5e-2 (Q4); oxinfer's quantized matmuls add 2.6e-3 / 3.5e-3 on top,
 so the Q4 error is the 4-bit weights, not the activations. CFG 6 then amplifies differences over
 the steps: quantized edits look the same (same hat, same lettering, same composition) with
-different fine detail. v1.1's text encoder also masks the `!` token as a key; oxinfer reproduces
+different fine detail. Below ~1e-2 the final latents are chaotic: multiplying the queries of the
+f32 attention by 1 +- 1e-7 (random signs, about one f32 rounding step) moves them anywhere between
+6e-3 and 1.4e-2 against the reference (52 to 47 dB), so the bf16 rows' final numbers are draws from
+that band, and their first velocities are what measures precision: half-precision attention
+leaves those unchanged. v1.1's text encoder also masks the `!` token as a key; oxinfer reproduces
 that for every other token, while the `!` row itself still sees its own key (that one row is 36%
 off, hence the 1.4e-2 on the conditioned velocity; prompts without a lone `!` match like v1.2).
 
@@ -1786,7 +1792,7 @@ off, hence the 1.4e-2 on the conditioned velocity; prompts without a lone `!` ma
 
 | weights | device | per transformer pass | 28-step edit | peak memory (footprint) |
 |---|---|---|---|---|
-| bf16 (`--mmap`, 24.9 GB mapped) | Metal | 9.3 s (f32 attention: 12.8 s) | 9 min | 12.6 GB |
+| bf16 (`--mmap`, 24.9 GB mapped) | Metal | 9.3 s (f32 attention: 34% slower) | 9 min | 12.6 GB |
 | bf16, read into memory | Metal | 17.5 s | | 40 GB |
 | `--quant q8` | Metal | 14.0 s | | 28 GB |
 | `--quant q4` | Metal | 14.2 s | | 20 GB |

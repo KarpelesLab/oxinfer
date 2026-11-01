@@ -178,9 +178,10 @@ pub fn set_exact(on: bool) {
     EXACT.store(if on { 1 } else { 2 }, Ordering::Relaxed);
 }
 
-/// Keeps attention in f32 on the GPU while the matmuls may still use the half-precision matrix
-/// units: for models whose attention logits are large (Qwen-Image's run into the thousands, where
-/// half-precision queries and keys move the softmax visibly). Process-wide. Default: off.
+/// Keeps attention in f32 on the GPU (f32 operands on the matrix units where the GPU has them)
+/// while the matmuls may still use half-precision operands: for models whose attention logits
+/// are large (Qwen-Image's run into the thousands, where half-precision queries and keys move the
+/// softmax visibly). Process-wide. Default: off.
 /// Returns the previous setting.
 pub fn set_exact_attention(on: bool) -> bool {
     EXACT_ATTN.swap(on, Ordering::Relaxed)
