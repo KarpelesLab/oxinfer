@@ -531,6 +531,66 @@ impl ChatFormat for Llama3Chat {
     }
 }
 
+/// Mistral Large 4 (its `chat_template.jinja`): `<s>[SYSTEM_PROMPT]...[/SYSTEM_PROMPT]`, the
+/// tools and `[MODEL_SETTINGS]{"reasoning_effort": "..."}[/MODEL_SETTINGS]` before the first
+/// user turn, `[INST]...[/INST]` user turns, replies closed by `</s>`. The template always sets
+/// a reasoning effort (default "high"); thinking off asks for "low". Thinking is written as
+/// `[THINK]...[/THINK]` at the start of the reply.
+pub struct MistralChat;
+
+impl MistralChat {
+    fn settings(think: bool) -> String {
+        format!(
+            "[MODEL_SETTINGS]{{\"reasoning_effort\": \"{}\"}}[/MODEL_SETTINGS]",
+            if think { "high" } else { "low" }
+        )
+    }
+}
+
+impl ChatFormat for MistralChat {
+    fn conversation_start(&self, system: Option<&str>, think: bool) -> String {
+        self.conversation_start_tools(system, think, &[])
+    }
+    fn user_turn(&self, content: &str, _think: bool) -> String {
+        format!("[INST]{content}[/INST]")
+    }
+    fn end_of_model_turn(&self) -> String {
+        "</s>".to_string()
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        "</s>"
+    }
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        ("[THINK]", "[/THINK]")
+    }
+    fn starts_in_thinking(&self, _think: bool) -> bool {
+        false
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, think: bool, tools: &[ToolSpec]) -> String {
+        let mut s = String::from("<s>");
+        if let Some(sys) = system {
+            s.push_str(&format!("[SYSTEM_PROMPT]{sys}[/SYSTEM_PROMPT]"));
+        }
+        if !tools.is_empty() {
+            s.push_str(&crate::tools::mistral::available_tools(tools));
+        }
+        s.push_str(&Self::settings(think));
+        s
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        "[TOOL_CALLS]"
+    }
+    fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
+        crate::tools::mistral::parse_calls(raw)
+    }
+    fn tool_results(&self, results: &[ToolResult], _think: bool) -> String {
+        // The reply ended on `</s>` (sampled, not fed); the results follow it.
+        let mut s = String::from("</s>");
+        s.extend(results.iter().map(crate::tools::mistral::response));
+        s
+    }
+}
+
 /// `eos` plus the chat format's end-of-turn token, looked up in the tokenizer.
 pub fn with_turn_end(fmt: &dyn ChatFormat, tok: &tokenizers::Tokenizer, mut eos: Vec<u32>) -> Vec<u32> {
     if let Some(id) = tok.token_to_id(fmt.end_of_turn_token())

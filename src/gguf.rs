@@ -292,7 +292,8 @@ impl Header {
             "qwen3" => "qwen3",
             "llama" => "llama",
             "gemma4" => "gemma4_text",
-            a => bail!("GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen3, llama and gemma4 are)"),
+            "mistral-large4" => "mistral_large4_text",
+            a => bail!("GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen3, llama, gemma4 and mistral-large4 are)"),
         })
     }
 
@@ -306,6 +307,9 @@ impl Header {
         let mt = self.model_type()?;
         if mt == "gemma4_text" {
             return self.gemma4_config();
+        }
+        if mt == "mistral_large4_text" {
+            return self.mistral4_config();
         }
         let llama = mt == "llama";
         if let Some(t) = self.get(&format!("{}.rope.scaling.type", self.arch())).and_then(Value::as_str)
@@ -453,6 +457,98 @@ impl Header {
         Ok(c)
     }
 
+    /// The Mistral Large 4 text config (`MistralLarge4TextConfig` fields). llama.cpp stores the MLA
+    /// shapes as the absorbed attention sees them: `key_length` = latent + rotary part,
+    /// `key_length_mla` / `value_length_mla` = the per-head query-key / value sizes.
+    fn mistral4_config(&self) -> Result<Json> {
+        let need = |k: &str| {
+            self.arch_u64(k)
+                .with_context(|| format!("GGUF metadata has no {}.{k}", self.arch()))
+        };
+        let n = self.n_layers();
+        // The embedding may sit in a later part of a split model: the vocabulary size key, else
+        // the token list.
+        let vocab = self
+            .tensors
+            .iter()
+            .find(|t| t.name == "token_embd.weight")
+            .map(|t| t.ne[1])
+            .or_else(|| self.arch_u64("vocab_size"))
+            .or_else(|| self.get("tokenizer.ggml.tokens").and_then(Value::as_array).map(|a| a.len()))
+            .context("GGUF has no token_embd.weight")?;
+        let split = self.get("split.count").and_then(Value::as_u64).unwrap_or(1) > 1;
+        let flags = |k: &str| -> Vec<bool> {
+            match self.arch_per_layer(k) {
+                Some(v) => v.iter().map(|x| matches!(x, Value::Bool(true))).collect(),
+                None => vec![true; n],
+            }
+        };
+        let rope = flags("attention.rope_pattern");
+        let full = flags("attention.indexer.types");
+        let src: Vec<usize> = match self.arch_per_layer("attention.kv_source_map") {
+            Some(v) => v.iter().map(|x| x.as_u64().unwrap_or(0) as usize).collect(),
+            None => (0..n).collect(),
+        };
+        // 1 = softmax (llama.cpp's LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX), this model's router.
+        if let Some(g) = self.arch_u64("expert_gating_func")
+            && g != 1
+        {
+            bail!("GGUF mistral-large4 with expert gating function {g} is not supported (softmax only)");
+        }
+        if matches!(self.get(&format!("{}.expert_weights_norm", self.arch())), Some(Value::Bool(false))) {
+            bail!("GGUF mistral-large4 without normalized expert weights is not supported");
+        }
+        let rot = need("rope.dimension_count")?;
+        let qk = need("attention.key_length_mla")?;
+        let theta = self.arch_f64("rope.freq_base").unwrap_or(10_000.0);
+        let rope_parameters = match self.get(&format!("{}.rope.scaling.type", self.arch())).and_then(Value::as_str) {
+            Some("yarn") => json!({
+                "rope_type": "yarn",
+                "rope_theta": theta,
+                "factor": self.arch_f64("rope.scaling.factor").unwrap_or(1.0),
+                "original_max_position_embeddings": self.arch_u64("rope.scaling.original_context_length").unwrap_or(4096),
+                "beta_fast": self.arch_f64("rope.scaling.yarn_beta_fast").unwrap_or(32.0),
+                "beta_slow": self.arch_f64("rope.scaling.yarn_beta_slow").unwrap_or(1.0),
+                // llama.cpp's converter only takes YaRN without magnitude scaling for this model.
+                "attention_factor": 1.0,
+            }),
+            None | Some("none") => json!({"rope_type": "default", "rope_theta": theta}),
+            Some(t) => bail!("GGUF RoPE scaling {t:?} is not supported for mistral-large4"),
+        };
+        Ok(json!({
+            "model_type": "mistral_large4_text",
+            "hidden_size": need("embedding_length")?,
+            "intermediate_size": self.arch_u64("feed_forward_length").unwrap_or(0),
+            "moe_intermediate_size": need("expert_feed_forward_length")?,
+            "num_hidden_layers": n,
+            "num_attention_heads": need("attention.head_count")?,
+            "vocab_size": vocab,
+            "rms_norm_eps": self.arch_f64("attention.layer_norm_rms_epsilon").unwrap_or(1e-5),
+            "kv_lora_rank": need("attention.kv_lora_rank")?,
+            "qk_rope_head_dim": rot,
+            "qk_nope_head_dim": qk - rot,
+            "v_head_dim": need("attention.value_length_mla")?,
+            "n_routed_experts": need("expert_count")?,
+            "num_experts_per_tok": need("expert_used_count")?,
+            "n_shared_experts": self.arch_u64("expert_shared_count").unwrap_or(1),
+            "routed_scaling_factor": self.arch_f64("expert_weights_scale").unwrap_or(1.0),
+            "n_group": self.arch_u64("expert_group_count").unwrap_or(1),
+            "topk_group": self.arch_u64("expert_group_used_count").unwrap_or(1),
+            "first_k_dense_replace": self.arch_u64("leading_dense_block_count").unwrap_or(1),
+            "index_topk": need("attention.indexer.top_k")?,
+            "index_head_dim": need("attention.indexer.key_length")?,
+            "index_n_heads": need("attention.indexer.head_count")?,
+            "indexer_types": full.iter().map(|&f| if f { "full" } else { "shared" }).collect::<Vec<_>>(),
+            "no_rope_layers": rope.iter().map(|&r| r as u8).collect::<Vec<_>>(),
+            "kv_source_layers": src,
+            "final_logit_softcapping": self.arch_f64("final_logit_softcapping"),
+            // (In a split model the head may be in another part; the loader looks for it.)
+            "tie_word_embeddings": !split && !self.has("output.weight"),
+            "rope_parameters": rope_parameters,
+            "indexer_norm_eps": self.arch_f64("attention.layer_norm_epsilon").unwrap_or(1e-6),
+        }))
+    }
+
     /// End-of-generation token ids.
     pub fn eos_ids(&self) -> Vec<u32> {
         let mut v: Vec<u32> = ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"]
@@ -477,10 +573,18 @@ impl Header {
             bail!("GGUF tokenizer model {model:?} is not supported (only byte-level BPE, \"gpt2\")");
         }
         let pre = self.get("tokenizer.ggml.pre").and_then(Value::as_str).unwrap_or("");
-        // Llama 3 (as its tokenizer.json): no normalizer, and a word found whole in the vocabulary
-        // is one token whatever the merges say (`ignore_merges`).
-        let llama3 = pre == "llama-bpe";
+        // Llama 3 and Mistral's tekken (as their tokenizer.json): no normalizer, and a word found
+        // whole in the vocabulary is one token whatever the merges say (`ignore_merges`).
+        let whole_words = matches!(pre, "llama-bpe" | "tekken" | "tekken-num3" | "pixtral");
+        let tekken = matches!(pre, "tekken" | "tekken-num3" | "pixtral");
         let regex = match pre {
+            "tekken" | "pixtral" => {
+                r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+            }
+            // Numbers in right-aligned groups of three digits (Mistral Large 4).
+            "tekken-num3" => {
+                r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}{1,3}(?=(?:\p{N}{3})*(?!\p{N}))|\p{N}{1,2}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+            }
             "qwen35" => {
                 r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
             }
@@ -488,7 +592,7 @@ impl Header {
             "llama-bpe" => {
                 r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
             }
-            p => bail!("GGUF pre-tokenizer {p:?} is not supported (qwen35, qwen2 and llama-bpe are)"),
+            p => bail!("GGUF pre-tokenizer {p:?} is not supported (qwen35, qwen2, llama-bpe, tekken and tekken-num3 are)"),
         };
         let tokens = self
             .get("tokenizer.ggml.tokens")
@@ -511,6 +615,11 @@ impl Header {
                 3 | 4 => {
                     let special = types.and_then(|ty| ty[id].as_u64()) == Some(3);
                     added.push(json!({"id": id, "content": s, "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": special}));
+                    // Tekken numbers its specials first (0..1000): the model vocabulary must hold
+                    // them too, or the tokenizer renumbers the added tokens after it.
+                    if tekken {
+                        vocab.insert(s.to_string(), json!(id));
+                    }
                 }
                 5 => {}
                 _ => {
@@ -524,7 +633,7 @@ impl Header {
             "truncation": null,
             "padding": null,
             "added_tokens": added,
-            "normalizer": if llama3 { Json::Null } else { json!({"type": "NFC"}) },
+            "normalizer": if whole_words { Json::Null } else { json!({"type": "NFC"}) },
             "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
                 {"type": "Split", "pattern": {"Regex": regex}, "behavior": "Isolated", "invert": false},
                 byte_level,
@@ -533,7 +642,7 @@ impl Header {
             "decoder": byte_level,
             "model": {
                 "type": "BPE", "dropout": null, "unk_token": null, "continuing_subword_prefix": "",
-                "end_of_word_suffix": "", "fuse_unk": false, "byte_fallback": false, "ignore_merges": llama3,
+                "end_of_word_suffix": "", "fuse_unk": false, "byte_fallback": false, "ignore_merges": whole_words,
                 "vocab": vocab, "merges": merges,
             },
         }))
@@ -676,6 +785,44 @@ pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec
                         _ => return None,
                     }
                 }
+                // Mistral Large 4: MLA with kv_b split per head into `attn_k_b` (`[n_head, latent,
+                // nope]`, transposed for the absorbed query) and `attn_v_b` (`[n_head, v, latent]`),
+                // per-head query scaling (SSMax), the DSA indexer.
+                ("mistral-large4", _) => {
+                    let n = match (base, suffix) {
+                        ("attn_norm", _) => "input_layernorm.weight",
+                        ("ffn_norm", _) => "post_attention_layernorm.weight",
+                        ("attn_q", _) => "self_attn.q_proj.weight",
+                        ("attn_kv_a_mqa", _) => "self_attn.kv_a_proj_with_mqa.weight",
+                        ("attn_kv_a_norm", _) => "self_attn.kv_a_layernorm.weight",
+                        ("attn_k_b", _) => "self_attn.k_b",
+                        ("attn_v_b", _) => "self_attn.v_b",
+                        ("attn_output", _) => "self_attn.o_proj.weight",
+                        ("attn_ssmax", "bias") => "self_attn.softmax_scaling.bias",
+                        ("attn_ssmax", _) => "self_attn.softmax_scaling.scale",
+                        ("indexer.q_norm", "bias") => "self_attn.indexer.q_input_norm.bias",
+                        ("indexer.q_norm", _) => "self_attn.indexer.q_input_norm.weight",
+                        ("indexer.attn_q_b", _) => "self_attn.indexer.wq_b.weight",
+                        ("indexer.attn_k", _) => "self_attn.indexer.wk.weight",
+                        ("indexer.k_norm", "bias") => "self_attn.indexer.k_norm.bias",
+                        ("indexer.k_norm", _) => "self_attn.indexer.k_norm.weight",
+                        ("indexer.proj", _) => "self_attn.indexer.weights_proj.weight",
+                        ("indexer.ssmax", "bias") => "self_attn.indexer.softmax_scaling.bias",
+                        ("indexer.ssmax", _) => "self_attn.indexer.softmax_scaling.scale",
+                        ("ffn_gate", _) => "mlp.gate_proj.weight",
+                        ("ffn_up", _) => "mlp.up_proj.weight",
+                        ("ffn_down", _) => "mlp.down_proj.weight",
+                        ("ffn_gate_inp", _) => "mlp.gate.weight",
+                        ("ffn_gate_exps", _) => "mlp.experts.gate_proj",
+                        ("ffn_up_exps", _) => "mlp.experts.up_proj",
+                        ("ffn_down_exps", _) => "mlp.experts.down_proj",
+                        ("ffn_gate_shexp", _) => "mlp.shared_experts.gate_proj.weight",
+                        ("ffn_up_shexp", _) => "mlp.shared_experts.up_proj.weight",
+                        ("ffn_down_shexp", _) => "mlp.shared_experts.down_proj.weight",
+                        _ => return None,
+                    };
+                    return Some((format!("model.layers.{l}.{n}"), shape));
+                }
                 (_, "attn_norm") => "input_layernorm.weight",
                 ("qwen3" | "llama", "ffn_norm") => "post_attention_layernorm.weight",
                 (_, "post_attention_norm") => "post_attention_layernorm.weight",
@@ -780,11 +927,16 @@ pub fn hf_tensors(h: &Header) -> Result<Vec<HfTensor>> {
             .collect());
     }
     h.model_type()?;
-    let (arch, n_layers) = (h.arch().to_string(), h.n_layers());
-    Ok(h.tensors
+    Ok(hf_tensors_as(h, h.arch(), h.n_layers()))
+}
+
+/// [`hf_tensors`] for one file of a split model, named with the first file's architecture and
+/// layer count (the other files carry only the `split.*` metadata).
+pub fn hf_tensors_as(h: &Header, arch: &str, n_layers: usize) -> Vec<HfTensor> {
+    h.tensors
         .iter()
         .filter_map(|t| {
-            hf_tensor(&arch, t, n_layers).map(|(name, shape)| HfTensor {
+            hf_tensor(arch, t, n_layers).map(|(name, shape)| HfTensor {
                 name,
                 shape,
                 ggml_type: t.ggml_type,
@@ -792,7 +944,63 @@ pub fn hf_tensors(h: &Header) -> Result<Vec<HfTensor>> {
                 end: t.end,
             })
         })
-        .collect())
+        .collect()
+}
+
+/// The `-NNNNN-of-MMMMM.gguf` part of a split GGUF file name: (prefix, index, count, digits).
+pub fn split_name(name: &str) -> Option<(&str, usize, usize, usize)> {
+    let stem = name.strip_suffix(".gguf")?;
+    let (head, count) = stem.rsplit_once("-of-")?;
+    let (prefix, idx) = head.rsplit_once('-')?;
+    if idx.is_empty() || idx.len() != count.len() || !idx.bytes().chain(count.bytes()).all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((prefix, idx.parse().ok()?, count.parse().ok()?, idx.len()))
+}
+
+/// All files of the GGUF model `path` belongs to, in order: `path` alone, or for a split model
+/// (`split.count` > 1, files `name-00001-of-00009.gguf` ...) every part, given any of them.
+pub fn split_files(path: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let Some((prefix, _, count, digits)) = split_name(name) else {
+        return Ok(vec![path.to_path_buf()]);
+    };
+    if count <= 1 {
+        return Ok(vec![path.to_path_buf()]);
+    }
+    let dir = path.parent().unwrap_or(Path::new("."));
+    (1..=count)
+        .map(|i| {
+            let p = dir.join(format!("{prefix}-{i:0digits$}-of-{count:0digits$}.gguf"));
+            if p.is_file() {
+                Ok(p)
+            } else {
+                bail!("split GGUF part {} is missing", p.display())
+            }
+        })
+        .collect()
+}
+
+/// The first file of the GGUF model in folder `dir` (a single `.gguf`, or part 1 of a split one;
+/// `mmproj*` vision files are not models), when the folder holds no other checkpoint.
+pub fn model_in_dir(dir: &Path) -> Option<std::path::PathBuf> {
+    if !dir.is_dir() || dir.join("config.json").is_file() {
+        return None;
+    }
+    let mut ggufs: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            n.ends_with(".gguf") && !n.starts_with("mmproj") && split_name(n).is_none_or(|s| s.1 == 1)
+        })
+        .collect();
+    ggufs.sort();
+    match ggufs.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    }
 }
 
 /// String metadata worth keeping on the opened file (scalars only; arrays such as the vocabulary

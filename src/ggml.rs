@@ -57,6 +57,9 @@ pub enum GgmlType {
     IQ4_XS = 23,
     IQ1_M = 29,
     BF16 = 30,
+    /// FP8 E4M3 (`float8_e4m3fn`) with block scales ([`GgufMatrix::fp8`]): safetensors FP8 checkpoints,
+    /// not a GGUF type (the id is outside GGUF's range, and [`GgmlType::ALL`] leaves it out).
+    F8E4M3 = 0x1000,
 }
 
 impl GgmlType {
@@ -117,13 +120,14 @@ impl GgmlType {
             IQ4_XS => "IQ4_XS",
             IQ1_M => "IQ1_M",
             BF16 => "BF16",
+            F8E4M3 => "F8_E4M3",
         }
     }
     /// Elements per block.
     pub fn block_size(self) -> usize {
         use GgmlType::*;
         match self {
-            F32 | F16 | BF16 => 1,
+            F32 | F16 | BF16 | F8E4M3 => 1,
             Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | IQ4_NL => 32,
             _ => QK_K,
         }
@@ -134,6 +138,7 @@ impl GgmlType {
         match self {
             F32 => 4,
             F16 | BF16 => 2,
+            F8E4M3 => 1,
             Q4_0 => 18,
             Q4_1 => 20,
             Q5_0 => 22,
@@ -157,7 +162,7 @@ impl GgmlType {
     }
     /// Plain float storage (no blocks): runs through the f32 path rather than int8 dot products.
     pub fn is_float(self) -> bool {
-        matches!(self, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16)
+        matches!(self, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::F8E4M3)
     }
     /// Bytes of a row of `n` elements (`n` must be a multiple of the block size).
     pub fn row_bytes(self, n: usize) -> usize {
@@ -178,9 +183,61 @@ pub struct GgufMatrix {
     pub data: QBuf<u8>,
     pub n_out: usize,
     pub n_in: usize,
+    /// FP8 checkpoints: one scale per block of `rows` x `cols` weights (DeepSeek-style
+    /// `weight_scale_inv`, multiplied in).
+    pub block_scales: Option<BlockScales>,
+}
+
+/// The block scales of an FP8 matrix: `s[(r / rows) * n_in.div_ceil(cols) + c / cols]` scales
+/// weight `(r, c)`.
+pub struct BlockScales {
+    pub s: QBuf<f32>,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+/// The value of an FP8 E4M3 (`float8_e4m3fn`: no infinities, 0x7f / 0xff are NaN) byte.
+pub fn e4m3_to_f32(b: u8) -> f32 {
+    let sign = if b & 0x80 != 0 { -1.0 } else { 1.0 };
+    let (e, m) = ((b >> 3) & 0xF, b & 7);
+    if e == 0xF && m == 7 {
+        return f32::NAN;
+    }
+    let v = if e == 0 {
+        m as f32 / 8.0 * (2f32).powi(-6)
+    } else {
+        (1.0 + m as f32 / 8.0) * (2f32).powi(e as i32 - 7)
+    };
+    sign * v
+}
+
+/// [`e4m3_to_f32`] of every byte value.
+fn e4m3_table() -> &'static [f32; 256] {
+    static T: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    T.get_or_init(|| std::array::from_fn(|i| e4m3_to_f32(i as u8)))
 }
 
 impl GgufMatrix {
+    /// An FP8 E4M3 matrix (`n_out` rows of `n_in` bytes) with its block scales (`[n_out /
+    /// block.0, n_in / block.1]`, rounded up).
+    pub fn fp8(data: QBuf<u8>, scales: QBuf<f32>, n_out: usize, n_in: usize, block: (usize, usize)) -> Result<Self> {
+        let want = n_out.div_ceil(block.0) * n_in.div_ceil(block.1);
+        if scales.len() != want {
+            bail!(
+                "FP8 [{n_out}, {n_in}] with {:?} blocks needs {want} scales, got {}",
+                block,
+                scales.len()
+            );
+        }
+        let mut m = Self::new(GgmlType::F8E4M3, data, n_out, n_in)?;
+        m.block_scales = Some(BlockScales {
+            s: scales,
+            rows: block.0,
+            cols: block.1,
+        });
+        Ok(m)
+    }
+
     /// Wraps `data` (`n_out` rows of `kind.row_bytes(n_in)` bytes). Rows must hold whole blocks,
     /// and quantized formats need `n_in` to be a multiple of 32 (the activation block).
     pub fn new(kind: GgmlType, data: QBuf<u8>, n_out: usize, n_in: usize) -> Result<Self> {
@@ -194,7 +251,13 @@ impl GgufMatrix {
         if data.len() != want {
             bail!("{kind} [{n_out}, {n_in}] needs {want} bytes, got {}", data.len());
         }
-        Ok(Self { kind, data, n_out, n_in })
+        Ok(Self {
+            kind,
+            data,
+            n_out,
+            n_in,
+            block_scales: None,
+        })
     }
 
     /// Borrows the raw tensor bytes without copying (e.g. from a mapped GGUF file).
@@ -226,6 +289,20 @@ impl GgufMatrix {
     /// as `dequantize_row`, through NEON where available.
     pub fn dequantize_rows(&self, r0: usize, r1: usize, out: &mut [f32]) {
         let n = self.n_in;
+        if let Some(bs) = &self.block_scales {
+            let lut = e4m3_table();
+            let ncb = n.div_ceil(bs.cols);
+            for (i, r) in (r0..r1).enumerate() {
+                let srow = &bs.s[(r / bs.rows) * ncb..(r / bs.rows + 1) * ncb];
+                let (o, w) = (&mut out[i * n..(i + 1) * n], self.row(r));
+                for ((oc, wc), &s) in o.chunks_mut(bs.cols).zip(w.chunks(bs.cols)).zip(srow) {
+                    for (ov, &b) in oc.iter_mut().zip(wc) {
+                        *ov = lut[b as usize] * s;
+                    }
+                }
+            }
+            return;
+        }
         for (i, r) in (r0..r1).enumerate() {
             let o = &mut out[i * n..(i + 1) * n];
             #[cfg(target_arch = "aarch64")]
@@ -320,6 +397,14 @@ pub fn dequantize_row(kind: GgmlType, src: &[u8], out: &mut [f32]) {
         BF16 => {
             for (o, c) in out.iter_mut().zip(src.as_chunks::<2>().0) {
                 *o = bf16_to_f32(u16::from_le_bytes(*c));
+            }
+            return;
+        }
+        // Unscaled (the block scales belong to the matrix, see `GgufMatrix::dequantize_rows`).
+        F8E4M3 => {
+            let lut = e4m3_table();
+            for (o, &b) in out.iter_mut().zip(src) {
+                *o = lut[b as usize];
             }
             return;
         }
@@ -588,7 +673,7 @@ pub fn dequantize_row(kind: GgmlType, src: &[u8], out: &mut [f32]) {
                     }
                 }
             }
-            F32 | F16 | BF16 => unreachable!(),
+            F32 | F16 | BF16 | F8E4M3 => unreachable!(),
         }
     }
 }
@@ -851,7 +936,7 @@ pub fn decode_i8(kind: GgmlType, b: &[u8], q: &mut [i8], s: &mut [f32], m: &mut 
             }
             false
         }
-        F32 | F16 | BF16 => unreachable!("decode_i8 on float type {kind}"),
+        F32 | F16 | BF16 | F8E4M3 => unreachable!("decode_i8 on float type {kind}"),
     }
 }
 

@@ -1025,6 +1025,7 @@ fn run(mut args: Args) -> Result<()> {
         "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" | "qwen2_5_vl" => run_qwen(args),
         // Llama 3 runs on the Qwen3 code path.
         "llama" => run_qwen(args),
+        "mistral_large4" | "mistral_large4_text" => run_mistral4(args),
         other => bail!("unsupported model_type {other}"),
     }
 }
@@ -1547,6 +1548,68 @@ fn run_qwen(args: Args) -> Result<()> {
     if let Some(m) = &mut mtp {
         m.set_stream(None);
     }
+    model.set_stream(None);
+    drop(streamer);
+    r
+}
+
+fn run_mistral4(mut args: Args) -> Result<()> {
+    let t0 = Instant::now();
+    if args.draft.is_some() || args.mtp {
+        bail!("speculative decoding (--draft, --mtp) is not supported for Mistral Large 4 yet");
+    }
+    let cfg = config::Mistral4Config::load(&args.model)?;
+    let eos = config::load_eos_ids(&args.model);
+    // A checkpoint larger than most of RAM is mapped whatever --mmap says: the routed experts are
+    // read through the page cache as they are used.
+    let size: u64 = oxinfer::safetensors::checkpoint_bytes(&args.model);
+    if !args.mmap && oxinfer::platform::total_memory().is_some_and(|m| size as f64 > 0.6 * m as f64) {
+        eprintln!(
+            "[the {:.0} GB checkpoint does not fit in memory: mapping it (--mmap)]",
+            size as f64 / 1e9
+        );
+        args.mmap = true;
+    }
+    let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
+    let mut model = oxinfer::mistral4::Mistral4Model::load(cfg, &files, args.quant)?;
+    let tok = load_tokenizer(&args.model)?;
+    let fmt: &dyn ChatFormat = &chat::MistralChat;
+    let eos = chat::with_turn_end(fmt, &tok, eos);
+    eprintln!(
+        "[loaded Mistral Large 4: {} layers, hidden {}, {:.1} GB checkpoint ({}), {} weights streaming {:.2} GB/token, {} threads, {:.2}s]",
+        model.cfg.num_hidden_layers,
+        model.cfg.hidden_size,
+        files.total_bytes() as f64 / 1e9,
+        if args.mmap { "mmap" } else { "in RAM" },
+        if files.metadata("format") == Some("gguf") {
+            "GGUF".to_string()
+        } else {
+            format!("{:?}", model.quant)
+        },
+        model.streamed_bytes() as f64 / 1e9,
+        pool::threads(),
+        t0.elapsed().as_secs_f64()
+    );
+    if let Some(out) = &args.save_quantized {
+        return save_quantized(&args.model, out, &files, model.quant);
+    }
+    if !mm_request(&args).is_empty() {
+        bail!("image input is not supported for Mistral Large 4 yet");
+    }
+    let streamer = if args.stream {
+        Some(start_stream(&args, |o| oxinfer::stream::attach_mistral4(&mut model, &files, o))?)
+    } else {
+        None
+    };
+    *STREAM.lock().unwrap() = streamer.clone();
+    TRACE.store(args.stream_trace, std::sync::atomic::Ordering::Relaxed);
+    let r = run_text(&args, &model, &tok, &eos, fmt, Default::default());
+    if let Some(s) = &streamer
+        && let Some(c) = s.cached_bytes()
+    {
+        eprintln!("[stream: {:.2} GB of the model files in the page cache at exit]", c as f64 / 1e9);
+    }
+    *STREAM.lock().unwrap() = None;
     model.set_stream(None);
     drop(streamer);
     r

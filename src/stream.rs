@@ -1442,6 +1442,17 @@ pub fn attach_gemma(model: &mut crate::model::Model<'_>, files: &ModelFiles, opt
     Ok(s)
 }
 
+/// Streams a Mistral Large 4 model whose weights borrow `files` (memory-mapped): the layers
+/// (routed experts read on demand), the LM head. Detach (`set_stream(None)`) or drop the model
+/// before dropping `files`.
+pub fn attach_mistral4(model: &mut crate::mistral4::Mistral4Model<'_>, files: &ModelFiles, opts: StreamOptions) -> Result<Arc<Streamer>> {
+    let s = Streamer::new(&[files], model.stream_units(), opts)?;
+    let streamed: Vec<bool> = s.plan().units.iter().map(|u| !u.2).collect();
+    model.mark_streamed(&streamed);
+    model.set_stream(Some(StreamHook::new(s.clone(), 0)));
+    Ok(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -169,6 +169,12 @@ impl SendBytes {
 
 impl SafeTensors {
     pub fn open(path: &Path, in_memory: bool) -> Result<Self> {
+        Self::open_part(path, in_memory, None)
+    }
+
+    /// [`SafeTensors::open`] for a later file of a split GGUF model, whose tensors are named with
+    /// the first file's architecture and layer count (`gguf`).
+    fn open_part(path: &Path, in_memory: bool, gguf: Option<(&str, usize)>) -> Result<Self> {
         if let Some(hf) = crate::fsx::host_file(path) {
             let mut n8 = [0u8; 8];
             crate::fsx::read_host(hf, 0, &mut n8)?;
@@ -207,7 +213,7 @@ impl SafeTensors {
             bail!("{}: file too small", path.display());
         }
         if mmap.len() >= 4 && &mmap[..4] == b"GGUF" {
-            return Self::from_gguf(path, mmap);
+            return Self::from_gguf(path, mmap, gguf);
         }
         if crate::torch::is_torch_zip(&mmap) {
             let tensors = crate::torch::read_tensors(&mmap)
@@ -240,16 +246,20 @@ impl SafeTensors {
         Self::from_header(path, mmap, &head, 8 + n, len)
     }
 
-    fn from_gguf(path: &Path, mmap: Storage) -> Result<Self> {
+    fn from_gguf(path: &Path, mmap: Storage, part: Option<(&str, usize)>) -> Result<Self> {
         let h = crate::gguf::parse_header(&mmap[..], mmap.len()).with_context(|| format!("{}", path.display()))?;
         let mut tensors = HashMap::new();
+        let named = match part {
+            Some((arch, n_layers)) => crate::gguf::hf_tensors_as(&h, arch, n_layers),
+            None => crate::gguf::hf_tensors(&h)?,
+        };
         for crate::gguf::HfTensor {
             name,
             shape,
             ggml_type: t,
             start,
             end,
-        } in crate::gguf::hf_tensors(&h)?
+        } in named
         {
             let dtype = match t {
                 0 => "F32",
@@ -471,6 +481,22 @@ impl TablePart<'_> {
     }
 }
 
+/// The size of the checkpoint at `path` from the file system: a GGUF file with the other parts of
+/// a split model, or the weight files of a folder (0 when nothing is found).
+pub fn checkpoint_bytes(path: &Path) -> u64 {
+    let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    if crate::gguf::is_gguf(path) {
+        return crate::gguf::split_files(path).map_or(0, |v| v.iter().map(|p| size(p)).sum());
+    }
+    std::fs::read_dir(path).map_or(0, |rd| {
+        rd.flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "safetensors" || x == "bin"))
+            .map(|p| size(&p))
+            .sum()
+    })
+}
+
 /// A weight matrix stored pre-quantized in the checkpoint, borrowed in place.
 pub enum Stored {
     Q8(QMatrix),
@@ -494,10 +520,24 @@ impl ModelFiles {
     /// `pytorch_model.bin`), or a single GGUF file.
     pub fn open(dir: &Path, in_memory: bool) -> Result<Self> {
         if crate::gguf::is_gguf(dir) {
-            let shard = SafeTensors::open(dir, in_memory)?;
-            let index = shard.names().map(|n| (n.clone(), 0)).collect();
+            // A split model (`-00001-of-00009.gguf`): every part, named as the first describes.
+            let parts = crate::gguf::split_files(dir)?;
+            let mut shards = vec![SafeTensors::open(&parts[0], in_memory)?];
+            if parts.len() > 1 {
+                let h = crate::gguf::header(&parts[0])?;
+                let (arch, n_layers) = (h.arch().to_string(), h.n_layers());
+                for p in &parts[1..] {
+                    shards.push(SafeTensors::open_part(p, in_memory, Some((&arch, n_layers)))?);
+                }
+            }
+            let mut index = HashMap::new();
+            for (i, s) in shards.iter().enumerate() {
+                for n in s.names() {
+                    index.insert(n.clone(), i);
+                }
+            }
             return Ok(Self {
-                shards: vec![shard],
+                shards,
                 index,
                 touched: Mutex::new(BTreeMap::new()),
                 uses: Mutex::new(HashMap::new()),
@@ -513,6 +553,21 @@ impl ModelFiles {
             let di = dir.join("diffusion_pytorch_model.safetensors.index.json");
             if crate::fsx::exists(&d) || crate::fsx::exists(&di) {
                 (single, idx) = (d, di);
+            }
+        }
+        // Mistral's own layout (`consolidated*.safetensors`, native tensor names), which
+        // transformers reads through config.json's `transformers_weights`.
+        if !crate::fsx::exists(&single) && !crate::fsx::exists(&idx) {
+            let named = crate::fsx::read(&dir.join("config.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .and_then(|c| c["transformers_weights"].as_str().map(str::to_string))
+                .filter(|n| !n.contains('/') && !n.starts_with('.'));
+            let ci = dir.join(named.as_deref().unwrap_or("consolidated.safetensors.index.json"));
+            if crate::fsx::exists(&ci) && ci.to_string_lossy().ends_with(".index.json") {
+                idx = ci;
+            } else if crate::fsx::exists(&dir.join("consolidated.safetensors")) {
+                single = dir.join("consolidated.safetensors");
             }
         }
         let mut files: Vec<PathBuf> = Vec::new();
@@ -563,7 +618,23 @@ impl ModelFiles {
                 .unwrap_or_default();
             files.annotate_mlx(&cfg)?;
         }
+        // Mistral's own layout (`consolidated*.safetensors`): read under transformers' names.
+        if crate::mistral4::is_native(&files) {
+            files.rename(crate::mistral4::native_name);
+        }
         Ok(files)
+    }
+
+    /// Renames tensors: `f` gives the new name of a tensor (None keeps its name).
+    fn rename(&mut self, f: impl Fn(&str) -> Option<String>) {
+        self.index.clear();
+        for (i, sh) in self.shards.iter_mut().enumerate() {
+            let old = std::mem::take(&mut sh.tensors);
+            sh.tensors = old.into_iter().map(|(k, v)| (f(&k).unwrap_or(k), v)).collect();
+            for n in sh.tensors.keys() {
+                self.index.insert(n.clone(), i);
+            }
+        }
     }
 
     /// Whether this is an MLX checkpoint (affine-quantized `{name}.weight` + `.scales` + `.biases`).

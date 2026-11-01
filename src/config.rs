@@ -690,6 +690,259 @@ impl QwenConfig {
     }
 }
 
+fn d_ml4_one() -> f64 {
+    1.0
+}
+fn d_ml4_dense() -> usize {
+    1
+}
+
+/// YaRN RoPE parameters of Mistral Large 4 (`rope_parameters`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct YarnParams {
+    #[serde(default = "d_ml4_theta")]
+    pub rope_theta: f64,
+    #[serde(default)]
+    pub rope_type: Option<String>,
+    #[serde(default)]
+    pub factor: Option<f64>,
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<usize>,
+    #[serde(default)]
+    pub beta_fast: Option<f64>,
+    #[serde(default)]
+    pub beta_slow: Option<f64>,
+    /// The cos / sin magnitude (None: YaRN's `0.1 ln(factor) + 1`, or the mscale ratio).
+    #[serde(default)]
+    pub attention_factor: Option<f64>,
+    #[serde(default)]
+    pub mscale: Option<f64>,
+    #[serde(default)]
+    pub mscale_all_dim: Option<f64>,
+    #[serde(default)]
+    pub truncate: Option<bool>,
+}
+
+fn d_ml4_theta() -> f64 {
+    10_000.0
+}
+
+/// Mistral Large 4 text model (`mistral_large4_text`, transformers' `MistralLarge4TextConfig`):
+/// MLA attention without query LoRA, DSA indexer, no-RoPE and KV-sharing layers, DeepSeek-style
+/// MoE. Defaults are transformers'; a GGUF header is mapped onto the same fields
+/// (`gguf::Header::config_json`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Mistral4Config {
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub moe_intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub vocab_size: usize,
+    #[serde(default = "d_eps5")]
+    pub rms_norm_eps: f64,
+    pub kv_lora_rank: usize,
+    pub qk_rope_head_dim: usize,
+    pub qk_nope_head_dim: usize,
+    pub v_head_dim: usize,
+    pub n_routed_experts: usize,
+    pub num_experts_per_tok: usize,
+    #[serde(default = "d_ml4_dense")]
+    pub n_shared_experts: usize,
+    #[serde(default = "d_ml4_one")]
+    pub routed_scaling_factor: f64,
+    #[serde(default = "d_ml4_dense")]
+    pub n_group: usize,
+    #[serde(default = "d_ml4_dense")]
+    pub topk_group: usize,
+    #[serde(default = "d_ml4_dense")]
+    pub first_k_dense_replace: usize,
+    /// "dense" or "sparse" per layer (default: `first_k_dense_replace` dense layers).
+    #[serde(default)]
+    pub mlp_layer_types: Option<Vec<String>>,
+    pub index_topk: usize,
+    pub index_head_dim: usize,
+    pub index_n_heads: usize,
+    /// "full" (runs the indexer) or "shared" (reuses the previous full layer's top-k) per layer.
+    #[serde(default)]
+    pub indexer_types: Option<Vec<String>>,
+    /// 1 = RoPE, 0 = NoPE, per layer (default: every `no_rope_layer_interval`-th layer is NoPE).
+    #[serde(default)]
+    pub no_rope_layers: Option<Vec<u8>>,
+    #[serde(default = "d4")]
+    pub no_rope_layer_interval: usize,
+    /// The layer whose latent KV cache each layer attends to (default: its own).
+    #[serde(default)]
+    pub kv_source_layers: Option<Vec<usize>>,
+    #[serde(default)]
+    pub final_logit_softcapping: Option<f64>,
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
+    #[serde(default)]
+    pub rope_parameters: Option<YarnParams>,
+    /// Epsilon of the indexer's LayerNorms (transformers hardcodes 1e-6; GGUF stores it).
+    #[serde(default = "d_eps")]
+    pub indexer_norm_eps: f64,
+}
+
+fn d_eps5() -> f64 {
+    1e-5
+}
+
+impl Mistral4Config {
+    /// The text config of a Mistral Large 4 checkpoint folder (`config.json`, root or
+    /// `text_config`) or GGUF file, with transformers' derived defaults filled in.
+    pub fn load(dir: &Path) -> Result<Self> {
+        let raw: serde_json::Value = if crate::gguf::is_gguf(dir) {
+            crate::gguf::header(dir)?.config_json()?
+        } else {
+            serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?
+        };
+        let text = raw.get("text_config").cloned().unwrap_or(raw);
+        let mut c: Mistral4Config = serde_json::from_value(text.clone()).context("parse mistral_large4 text config")?;
+        let n = c.num_hidden_layers;
+        if c.no_rope_layers.is_none() {
+            let k = c.no_rope_layer_interval.max(1);
+            c.no_rope_layers = Some((0..n).map(|i| ((i + 1) % k != 0) as u8).collect());
+        }
+        if c.kv_source_layers.is_none() {
+            c.kv_source_layers = Some((0..n).collect());
+        }
+        if c.indexer_types.is_none() {
+            // `index_topk_pattern` ("FSSF...") or the freq / offset schedule, as transformers.
+            c.indexer_types = Some(match text.get("index_topk_pattern").and_then(|v| v.as_str()) {
+                Some(p) => p.chars().map(|ch| if ch == 'S' { "shared" } else { "full" }.to_string()).collect(),
+                None => {
+                    let freq = text.get("index_topk_freq").and_then(|v| v.as_u64()).unwrap_or(1).max(1) as usize;
+                    let off = text.get("index_skip_topk_offset").and_then(|v| v.as_u64()).unwrap_or(2) as usize;
+                    (0..n)
+                        .map(|i| {
+                            if (i + 1).saturating_sub(off) % freq == 0 {
+                                "full"
+                            } else {
+                                "shared"
+                            }
+                            .to_string()
+                        })
+                        .collect()
+                }
+            });
+        }
+        if c.mlp_layer_types.is_none() {
+            let d = c.first_k_dense_replace.min(n);
+            c.mlp_layer_types = Some((0..n).map(|i| if i < d { "dense" } else { "sparse" }.to_string()).collect());
+        }
+        let lens = [
+            c.no_rope_layers.as_ref().unwrap().len(),
+            c.kv_source_layers.as_ref().unwrap().len(),
+            c.indexer_types.as_ref().unwrap().len(),
+            c.mlp_layer_types.as_ref().unwrap().len(),
+        ];
+        if lens.iter().any(|&l| l != n) {
+            bail!("mistral_large4: per-layer lists of {lens:?} entries for {n} layers");
+        }
+        for l in 0..n {
+            let s = c.kv_source(l);
+            if s > l || c.kv_source(s) != s || c.has_rope(s) != c.has_rope(l) {
+                bail!("mistral_large4: layer {l} cannot share the KV cache of layer {s}");
+            }
+        }
+        if c.indexer_types.as_ref().unwrap().first().is_some_and(|t| t != "full") {
+            bail!("mistral_large4: the first layer must run its own indexer");
+        }
+        if !c.n_routed_experts.is_multiple_of(c.n_group.max(1)) || c.topk_group > c.n_group || c.num_experts_per_tok > c.n_routed_experts {
+            bail!("mistral_large4: bad expert grouping");
+        }
+        if !c.qk_rope_head_dim.is_multiple_of(2) || c.qk_rope_head_dim > c.index_head_dim {
+            bail!("mistral_large4: bad rotary dimension {}", c.qk_rope_head_dim);
+        }
+        Ok(c)
+    }
+    pub fn has_rope(&self, l: usize) -> bool {
+        self.no_rope_layers.as_ref().unwrap()[l] != 0
+    }
+    pub fn kv_source(&self, l: usize) -> usize {
+        self.kv_source_layers.as_ref().unwrap()[l]
+    }
+    pub fn full_indexer(&self, l: usize) -> bool {
+        self.indexer_types.as_ref().unwrap()[l] == "full"
+    }
+    pub fn is_moe(&self, l: usize) -> bool {
+        self.mlp_layer_types.as_ref().unwrap()[l] == "sparse"
+    }
+    /// Query / key head size: the non-rotary part plus the rotary part (the same on NoPE layers,
+    /// whose non-rotary part takes the whole head).
+    pub fn qk_head_dim(&self) -> usize {
+        self.qk_nope_head_dim + self.qk_rope_head_dim
+    }
+    /// The attention scale: `qk_head_dim^-0.5`, times `mscale^2` when YaRN has `mscale_all_dim`
+    /// (transformers' `yarn_apply_mscale`).
+    pub fn attn_scale(&self) -> f32 {
+        let mut s = (self.qk_head_dim() as f64).powf(-0.5);
+        if let Some(r) = &self.rope_parameters
+            && r.rope_type.as_deref().is_some_and(|t| t != "default")
+            && let Some(m) = r.mscale_all_dim.filter(|&m| m != 0.0)
+        {
+            let f = r.factor.unwrap_or(1.0);
+            let ms = if f <= 1.0 { 1.0 } else { 0.1 * m * f.ln() + 1.0 };
+            s *= ms * ms;
+        }
+        s as f32
+    }
+    /// The rotary inverse frequencies (`qk_rope_head_dim / 2` of them) and the cos / sin
+    /// magnitude, as transformers' YaRN (`_compute_yarn_parameters`) or default RoPE computes
+    /// them in float32; the learned LeRoPE factors are applied by the model.
+    pub fn rope(&self) -> (Vec<f32>, f32) {
+        let dim = self.qk_rope_head_dim;
+        let r = self.rope_parameters.clone().unwrap_or(YarnParams {
+            rope_theta: 10_000.0,
+            rope_type: Some("yarn".into()),
+            factor: Some(2048.0),
+            original_max_position_embeddings: Some(512),
+            beta_fast: Some(32.0),
+            beta_slow: Some(1.0),
+            attention_factor: Some(1.0),
+            mscale: None,
+            mscale_all_dim: None,
+            truncate: None,
+        });
+        let base = r.rope_theta;
+        let pos: Vec<f32> = (0..dim / 2).map(|i| (base as f32).powf((2 * i) as f32 / dim as f32)).collect();
+        if r.rope_type.as_deref() != Some("yarn") {
+            return (pos.iter().map(|p| 1.0 / p).collect(), 1.0);
+        }
+        let factor = r.factor.unwrap_or(1.0);
+        let orig = r.original_max_position_embeddings.unwrap_or(4096) as f64;
+        let mscale = |s: f64, m: f64| if s <= 1.0 { 1.0 } else { 0.1 * m * s.ln() + 1.0 };
+        let att = r.attention_factor.unwrap_or_else(|| match (r.mscale, r.mscale_all_dim) {
+            (Some(a), Some(b)) if a != 0.0 && b != 0.0 => mscale(factor, a) / mscale(factor, b),
+            _ => mscale(factor, 1.0),
+        });
+        let (bf, bs) = (
+            r.beta_fast.filter(|&b| b != 0.0).unwrap_or(32.0),
+            r.beta_slow.filter(|&b| b != 0.0).unwrap_or(1.0),
+        );
+        let corr = |rot: f64| (dim as f64 * (orig / (rot * 2.0 * std::f64::consts::PI)).ln()) / (2.0 * base.ln());
+        let (mut lo, mut hi) = (corr(bf), corr(bs));
+        if r.truncate.unwrap_or(true) {
+            (lo, hi) = (lo.floor(), hi.ceil());
+        }
+        let (lo, mut hi) = (lo.max(0.0) as f32, hi.min(dim as f64 - 1.0) as f32);
+        if lo == hi {
+            hi += 0.001;
+        }
+        let inv = (0..dim / 2)
+            .map(|i| {
+                let ramp = ((i as f32 - lo) / (hi - lo)).clamp(0.0, 1.0);
+                let extra = 1.0 - ramp;
+                let (e, ip) = (1.0 / pos[i], 1.0 / (factor as f32 * pos[i]));
+                ip * (1.0 - extra) + e * extra
+            })
+            .collect();
+        (inv, att as f32)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

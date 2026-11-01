@@ -262,6 +262,51 @@ pub mod gemma {
     }
 }
 
+// ---- Mistral (Large 4) ---------------------------------------------------------------------------
+
+pub mod mistral {
+    use super::*;
+
+    /// `[AVAILABLE_TOOLS][...][/AVAILABLE_TOOLS]`: the function schemas as the template's `tojson`
+    /// writes them.
+    pub fn available_tools(tools: &[ToolSpec]) -> String {
+        let list: Vec<Value> = tools
+            .iter()
+            .map(
+                |t| json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": t.parameters } }),
+            )
+            .collect();
+        format!("[AVAILABLE_TOOLS]{}[/AVAILABLE_TOOLS]", qwen::py_json(&Value::Array(list)))
+    }
+
+    /// Every `[TOOL_CALLS]NAME[ARGS]{...}` (arguments as JSON; a JSON string holding an object is
+    /// read too).
+    pub fn parse_calls(raw: &str) -> Vec<ToolCall> {
+        let mut calls = Vec::new();
+        for part in raw.split("[TOOL_CALLS]").skip(1) {
+            let Some((name, args)) = part.split_once("[ARGS]") else { continue };
+            let args = args.trim();
+            // The arguments run to the end of the JSON value (the reply may go on after it).
+            let mut de = serde_json::Deserializer::from_str(args).into_iter::<Value>();
+            let arguments = match de.next() {
+                Some(Ok(Value::Object(o))) => o,
+                Some(Ok(Value::String(s))) => serde_json::from_str(&s).unwrap_or_default(),
+                _ => Map::new(),
+            };
+            calls.push(ToolCall {
+                name: name.trim().to_string(),
+                arguments,
+            });
+        }
+        calls
+    }
+
+    /// A tool message: `[TOOL_RESULTS]content[/TOOL_RESULTS]`.
+    pub fn response(r: &ToolResult) -> String {
+        format!("[TOOL_RESULTS]{}[/TOOL_RESULTS]", r.content)
+    }
+}
+
 // ---- Qwen 3.5 / 3.8 -----------------------------------------------------------------------------
 
 pub mod qwen {

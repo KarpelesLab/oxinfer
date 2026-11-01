@@ -306,6 +306,10 @@ pub fn load_lin<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usize
     if info.shape != [n_out, n_in] {
         bail!("tensor {full} has shape {:?}, expected [{n_out}, {n_in}]", info.shape);
     }
+    // FP8 block-quantized (DeepSeek / Mistral checkpoints): used as stored, zero-copy.
+    if info.dtype == "F8_E4M3" {
+        return Ok(Lin::gguf(fp8_matrix(files, full, n_out, n_in)?));
+    }
     let w = files.bf16(full)?;
     if let Some(k) = q.kind() {
         files.mark_quant(full, k);
@@ -315,6 +319,40 @@ pub fn load_lin<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usize
         Quant::Q8 => Lin::q8(quantize_bf16(w, n_out, n_in)),
         Quant::Q4 => Lin::q4(quantize_q4(w, n_out, n_in)),
     })
+}
+
+/// An FP8 E4M3 weight `full` (`[n_out, n_in]`) with its block scales: `full` minus `.weight`
+/// plus `.weight_scale_inv` (f32 or bf16, one per square block, 128 x 128 or whatever block the
+/// scale grid's shape implies), borrowed from the mapped file where it can be.
+pub(crate) fn fp8_matrix(files: &ModelFiles, full: &str, n_out: usize, n_in: usize) -> Result<GgufMatrix> {
+    let sname = match full.strip_suffix(".weight") {
+        Some(b) => format!("{b}.weight_scale_inv"),
+        None => format!("{full}_scale_inv"),
+    };
+    let si = files.info(&sname).with_context(|| format!("FP8 tensor {full} has no {sname}"))?;
+    let [sr, sc] = si.shape[..] else {
+        bail!("{sname}: scale shape {:?}", si.shape);
+    };
+    let block = [128usize, 64, 256, 32, 16, 512]
+        .into_iter()
+        .find(|&b| n_out.div_ceil(b) == sr && n_in.div_ceil(b) == sc)
+        .with_context(|| format!("{sname}: scale grid {:?} fits no square block of [{n_out}, {n_in}]", si.shape))?;
+    let scales: crate::quant::QBuf<f32> = {
+        let b = files.bytes(&sname)?;
+        if si.dtype == "F32" && (b.as_ptr() as usize).is_multiple_of(4) {
+            // SAFETY: aligned f32 data borrowed from `files`, which outlives the matrix.
+            unsafe { crate::quant::QBuf::borrowed(std::slice::from_raw_parts(b.as_ptr() as *const f32, b.len() / 4)) }
+        } else {
+            let v = files.f32(&sname)?;
+            let mut p = crate::quant::PageVec::<f32>::zeroed(v.len());
+            p.copy_from_slice(&v);
+            p.into()
+        }
+    };
+    let data = files.bytes(full)?;
+    files.note_use(&sname, true, false);
+    // SAFETY: the weight borrows `files`, which outlives every model holding it.
+    GgufMatrix::fp8(unsafe { crate::quant::QBuf::borrowed(data) }, scales, n_out, n_in, (block, block))
 }
 
 /// The experts of a fused `[n_exp, n_out, n_in]` tensor (MoE `gate_up_proj` / `down_proj`), one
@@ -471,7 +509,11 @@ impl<'a> Lin<'a> {
                 v.extend(m.offsets.as_ref().map(|o| span(&o.v[..])));
                 v
             }
-            Weight::Gguf(m) => vec![span(&m.data[..])],
+            Weight::Gguf(m) => {
+                let mut v = vec![span(&m.data[..])];
+                v.extend(m.block_scales.as_ref().map(|b| span(&b.s[..])));
+                v
+            }
         }
     }
     pub fn as_ref(&self) -> crate::gpu::WeightRef<'_> {

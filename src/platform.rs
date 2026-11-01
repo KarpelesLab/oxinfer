@@ -142,7 +142,8 @@ pub fn cpu_features() -> Vec<&'static str> {
     f
 }
 
-fn total_memory() -> Option<u64> {
+/// Physical memory in bytes, when the platform reports it.
+pub fn total_memory() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let s = std::fs::read_to_string("/proc/meminfo").ok()?;

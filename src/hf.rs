@@ -185,9 +185,19 @@ pub fn resolve_gguf(repo: &str, quant: &str, cache_dir: Option<&Path>) -> Result
     let list = listing(repo)?;
     let ggufs = gguf_models(&list);
     let want = format!("{}.gguf", quant.to_ascii_lowercase());
+    // A split model is matched by its first part's name without `-00001-of-0000N`; the later
+    // parts are not models of their own.
+    let model_name = |f: &str| -> Option<String> {
+        match crate::gguf::split_name(f) {
+            Some((pre, 1, _, _)) => Some(format!("{pre}.gguf")),
+            Some(_) => None,
+            None => Some(f.to_string()),
+        }
+    };
     let hits: Vec<&&String> = ggufs
         .iter()
         .filter(|f| {
+            let Some(f) = model_name(f) else { return false };
             let f = f.to_ascii_lowercase();
             f.ends_with(&want) && f[..f.len() - want.len()].ends_with(['-', '.', '_', '/'])
         })
@@ -203,14 +213,21 @@ pub fn resolve_gguf(repo: &str, quant: &str, cache_dir: Option<&Path>) -> Result
             many.iter().map(|f| f.as_str()).collect::<Vec<_>>().join(", ")
         ),
     };
-    if name.contains("-of-") {
-        bail!("{name}: split GGUF files are not supported yet");
-    }
-    let (size, src) = &list[&name];
+    let parts: Vec<String> = match crate::gguf::split_name(&name) {
+        Some((pre, _, count, digits)) => (1..=count)
+            .map(|i| format!("{pre}-{i:0digits$}-of-{count:0digits$}.gguf"))
+            .collect(),
+        None => vec![name.clone()],
+    };
     let root = cache_dir.map(Path::to_path_buf).unwrap_or_else(cache_root);
     let dir = root.join(repo.replace('/', "--"));
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    fetch_file(repo, &dir, &name, *size, src, 1, 1)?;
+    for (i, p) in parts.iter().enumerate() {
+        let (size, src) = list
+            .get(p)
+            .with_context(|| format!("{repo}: split GGUF part {p} is not in the listing"))?;
+        fetch_file(repo, &dir, p, *size, src, i + 1, parts.len())?;
+    }
     Ok(dir.join(name))
 }
 
@@ -530,11 +547,17 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
             }
         }
     }
+    // Mistral's own layout (`consolidated*.safetensors`, read by transformers through
+    // config.json's `transformers_weights`) when there is no transformers-named copy.
+    let index = ["model.safetensors.index.json", "consolidated.safetensors.index.json"]
+        .into_iter()
+        .find(|n| list.contains_key(*n) && (n.starts_with("model") || list.contains_key("config.json")));
     if list.contains_key("model.safetensors") {
         files.push("model.safetensors".into());
-    } else if let Some((size, src)) = list.get("model.safetensors.index.json") {
-        fetch_file(repo, dir, "model.safetensors.index.json", *size, src, 0, 0)?;
-        let idx: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("model.safetensors.index.json"))?)?;
+    } else if let Some(index) = index {
+        let (size, src) = &list[index];
+        fetch_file(repo, dir, index, *size, src, 0, 0)?;
+        let idx: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(index))?)?;
         let mut shards: Vec<String> = idx["weight_map"]
             .as_object()
             .context("weight_map")?

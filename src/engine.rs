@@ -20,7 +20,8 @@
 //! ```
 //!
 //! Supported checkpoints: Gemma 4 and Gemma 3 (text), Qwen3.5 / Qwen3.8 (dense and MoE), Qwen3,
-//! as safetensors folders (bf16, oxinfer pre-quantized, MLX) or single GGUF files. Speculative
+//! Mistral Large 4 (text; see [`crate::mistral4`]), as safetensors folders (bf16, FP8 blocks,
+//! oxinfer pre-quantized, MLX) or GGUF files (single or split into parts). Speculative
 //! decoding: Qwen's MTP layer ([`EngineOptions::mtp`], optionally from a sidecar checkpoint) or
 //! a Gemma 4 assistant model ([`EngineOptions::draft`], greedy). With the `media` feature,
 //! [`Engine::send_with_media`] attaches images, videos and audio (Gemma 4) or images and videos
@@ -51,6 +52,7 @@ use crate::clock::Instant;
 use crate::decide::{BaseCheck, Decision, DecisionAssets, DecisionRequest, DecisionStats};
 use crate::drafter::Drafter;
 use crate::generate::{self, Decoded, Flow as GFlow, TextStream};
+use crate::mistral4::{Mistral4Model, Mistral4Session};
 use crate::model::{Model, Quant, Session};
 use crate::platform::DevicePref;
 use crate::qwen::{QwenModel, QwenSession};
@@ -649,6 +651,8 @@ pub enum Family {
     Qwen,
     /// Llama 3 (safetensors folders, and Core ML models).
     Llama,
+    /// Mistral Large 4 (`mistral_large4`).
+    Mistral4,
 }
 
 /// Speculative decoding in use.
@@ -754,6 +758,10 @@ enum Lm {
     QwenMtp {
         dec: Box<MtpDecoder<'static>>,
     },
+    Mistral4 {
+        model: &'static Mistral4Model<'static>,
+        sess: Mistral4Session,
+    },
     #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
     CoreMl(Box<coreml_lm::CoreMlLm>),
 }
@@ -768,6 +776,7 @@ impl Lm {
             Lm::Gemma { sess, .. } => sess.pos,
             Lm::Qwen { sess, .. } => sess.pos,
             Lm::QwenMtp { dec } => dec.sess.pos,
+            Lm::Mistral4 { sess, .. } => sess.pos,
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(c) => c.context_len(),
         }
@@ -780,6 +789,7 @@ impl Lm {
                 let opts = dec.opts.clone();
                 **dec = MtpDecoder::new(dec.model(), dec.mtp(), opts);
             }
+            Lm::Mistral4 { model, sess } => *sess = model.new_session(),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(c) => c.reset(),
         }
@@ -901,6 +911,7 @@ impl Engine {
                 Family::Qwen
             }
             "llama" => Family::Llama,
+            "mistral_large4" | "mistral_large4_text" => Family::Mistral4,
             other => bail!("unsupported model_type {other}"),
         };
         if family == Family::Llama && !chat::Llama3Chat::matches_model(&dir) {
@@ -920,8 +931,12 @@ impl Engine {
         let mut arena = Arena(Vec::new());
         let mut streamer = None;
         let decision;
-        // Streaming reads the weights in place: always mapped.
-        let files = arena.keep(ModelFiles::open(&dir, !(opts.mmap || opts.stream.is_some()))?);
+        // Streaming reads the weights in place: always mapped. So is a Mistral Large 4 checkpoint
+        // larger than most of RAM (its routed experts are read through the page cache).
+        let too_big = family == Family::Mistral4
+            && crate::platform::total_memory().is_some_and(|m| crate::safetensors::checkpoint_bytes(&dir) as f64 > 0.6 * m as f64);
+        let mmap = opts.mmap || opts.stream.is_some() || too_big;
+        let files = arena.keep(ModelFiles::open(&dir, !mmap)?);
         let tok = load_tokenizer(&dir)?;
         let eos = config::load_eos_ids(&dir);
         let (lm, fmt, quant, layers, hidden, vocab, streamed): (Lm, &'static (dyn ChatFormat + Sync), _, _, _, _, _) = match family {
@@ -1043,6 +1058,38 @@ impl Engine {
                 };
                 (lm, fmt, info.0, info.1, info.2, info.3, info.4)
             }
+            Family::Mistral4 => {
+                if decision_dir.is_some() {
+                    bail!("decisions (decision_from) are not supported for Mistral Large 4");
+                }
+                decision = None;
+                let mut model = Mistral4Model::load(config::Mistral4Config::load(&dir)?, files, opts.quant)?;
+                if let Some(so) = &opts.stream {
+                    streamer = Some(crate::stream::attach_mistral4(&mut model, files, so.clone())?);
+                }
+                let model = arena.keep(model);
+                let c = &model.cfg;
+                let info = (
+                    model.quant,
+                    c.num_hidden_layers,
+                    c.hidden_size,
+                    c.vocab_size,
+                    model.streamed_bytes(),
+                );
+                let lm = Lm::Mistral4 {
+                    model,
+                    sess: model.new_session(),
+                };
+                (
+                    lm,
+                    &chat::MistralChat as &'static (dyn ChatFormat + Sync),
+                    info.0,
+                    info.1,
+                    info.2,
+                    info.3,
+                    info.4,
+                )
+            }
         };
         if opts.preload && opts.mmap {
             files.preload();
@@ -1075,7 +1122,7 @@ impl Engine {
             streamed_bytes: streamed,
             device: gpu.map(|b| b.name().to_string()).unwrap_or_else(|| "cpu".into()),
             threads: pool::threads(),
-            mmap: opts.mmap,
+            mmap,
             speculative,
             load_secs: t0.elapsed().as_secs_f64(),
             coreml: None,
@@ -1333,6 +1380,7 @@ impl Engine {
             Lm::Gemma { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::Qwen { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::QwenMtp { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
+            Lm::Mistral4 { .. } => bail!("activation capture is not supported for Mistral Large 4"),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("activation capture is not supported for Core ML models"),
         }
@@ -1359,6 +1407,7 @@ impl Engine {
             Lm::Gemma { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::Qwen { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::QwenMtp { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
+            Lm::Mistral4 { .. } => bail!("interventions are not supported for Mistral Large 4"),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
         }
@@ -1376,6 +1425,7 @@ impl Engine {
             Lm::Gemma { model, .. } => *model,
             Lm::Qwen { model, .. } => *model,
             Lm::QwenMtp { dec } => dec.model(),
+            Lm::Mistral4 { .. } => bail!("interventions are not supported for Mistral Large 4"),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
         };
@@ -1388,6 +1438,7 @@ impl Engine {
             Lm::Gemma { sess, .. } => &mut sess.iv,
             Lm::Qwen { sess, .. } => &mut sess.iv,
             Lm::QwenMtp { dec } => &mut dec.sess.iv,
+            Lm::Mistral4 { .. } => return,
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => return,
         };
@@ -1602,6 +1653,7 @@ impl Engine {
                 Lm::Gemma { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
                 Lm::Qwen { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
                 Lm::QwenMtp { dec } => run(dec.model(), &ids, &feats, chunk, need_logits)?,
+                Lm::Mistral4 { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
                 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
                 Lm::CoreMl(_) => bail!("decisions are not supported for Core ML models"),
             }
@@ -1846,6 +1898,17 @@ impl PendingTurn {
                     d
                 }
             }
+            Lm::Mistral4 { model, sess } => {
+                let hs = generate::prefill(*model, sess, &ids, chunk, &overrides);
+                let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
+                st.prefill_secs = t0.elapsed().as_secs_f64();
+                let max = limit(sess.pos);
+                if max == 0 {
+                    empty(0.0)
+                } else {
+                    generate::decode(*model, sess, logits, sampler, stop, max, &mut cb)
+                }
+            }
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(c) => {
                 let next = c.prefill(&ids)?;
@@ -1924,6 +1987,10 @@ fn is_coreml_dir(dir: &Path) -> bool {
 /// feature) a repo id (`org/name`, `org/name:QUANT`) fetched into `cache_dir` (default
 /// [`crate::hf::cache_root`]).
 pub fn resolve_model(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
+    // A folder holding one GGUF model (a single file or the parts of a split one): its first file.
+    if let Some(f) = crate::gguf::model_in_dir(Path::new(spec)) {
+        return Ok(f);
+    }
     #[cfg(feature = "hf")]
     {
         crate::hf::resolve(spec, cache_dir)
