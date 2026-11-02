@@ -10,17 +10,22 @@ use crate::safetensors::ModelFiles;
 use anyhow::Result;
 
 /// The gated activation of the experts: `act(gate) * up`.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Act {
-    Silu,
-    GeluTanh,
-}
+pub(crate) use crate::gpu::MoeAct as Act;
 
 impl Act {
-    fn apply(self, g: &mut [f32], u: &[f32]) {
+    fn apply(self, g: &mut [f32], u: &mut [f32]) {
         match self {
             Act::Silu => silu_mul(g, u),
             Act::GeluTanh => gelu_mul(g, u),
+            Act::SiluClamp(l) => {
+                for v in g.iter_mut() {
+                    *v = v.min(l);
+                }
+                for v in u.iter_mut() {
+                    *v = v.clamp(-l, l);
+                }
+                silu_mul(g, u)
+            }
         }
     }
     #[inline]
@@ -28,6 +33,10 @@ impl Act {
         match self {
             Act::Silu => g / (1.0 + (-g).exp()) * u,
             Act::GeluTanh => gelu_tanh(g) * u,
+            Act::SiluClamp(l) => {
+                let g = g.min(l);
+                g / (1.0 + (-g).exp()) * u.clamp(-l, l)
+            }
         }
     }
 }
@@ -177,7 +186,7 @@ impl<'a> Experts<'a> {
         if !be.wants(2 * mi, h, t * self.top_k) {
             return false;
         }
-        let gelu = self.act == Act::GeluTanh;
+        let act = self.act;
         // The weights of experts `ids`: fused or split gate/up (one form for all), and down.
         let refs = |ids: &mut dyn Iterator<Item = usize>| {
             let mut gu = Vec::with_capacity(self.gate_up.len());
@@ -211,7 +220,7 @@ impl<'a> Experts<'a> {
             let Some((gu, up, down)) = refs(&mut used.iter().copied()) else {
                 return false;
             };
-            let Some(dev) = be.upload_moe_transient(&gu, (!up.is_empty()).then_some(&up[..]), &down, h, mi, gelu) else {
+            let Some(dev) = be.upload_moe_transient(&gu, (!up.is_empty()).then_some(&up[..]), &down, h, mi, act) else {
                 return false;
             };
             let local: Vec<Vec<(usize, f32)>> = routes
@@ -223,7 +232,7 @@ impl<'a> Experts<'a> {
         }
         let dev = self.dev.get_or_init(|| {
             let (gu, up, down) = refs(&mut (0..self.down.len()))?;
-            be.upload_moe(&gu, (!up.is_empty()).then_some(&up[..]), &down, h, mi, gelu)
+            be.upload_moe(&gu, (!up.is_empty()).then_some(&up[..]), &down, h, mi, act)
         });
         let Some(dev) = dev else {
             return false;
@@ -313,7 +322,7 @@ impl<'a> Experts<'a> {
                     GateUp::Split(g, u) => {
                         let mut ub = vec![0f32; n * mi];
                         linear_multi(&mut [(g, mi, &mut a[..]), (u, mi, &mut ub[..])], h, &xs, n);
-                        act.apply(&mut a, &ub);
+                        act.apply(&mut a, &mut ub);
                     }
                 }
                 if let Some(k) = hook {
@@ -403,7 +412,7 @@ impl<'a> Experts<'a> {
                 let mut u = vec![0f32; rows * mi];
                 linear_grouped(&gs, &segs, mi, h, &xs, &mut a);
                 linear_grouped(&us, &segs, mi, h, &xs, &mut u);
-                act.apply(&mut a, &u);
+                act.apply(&mut a, &mut u);
             }
         }
         if let Some(k) = hook {

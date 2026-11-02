@@ -112,6 +112,7 @@ pub fn type_size(t: u32) -> Option<(usize, usize)> {
         27 => (1, 8),     // I64
         28 => (1, 8),     // F64
         29 => (256, 56),  // IQ1_M
+        39 => (32, 17),   // MXFP4
         30 => (1, 2),     // BF16
         _ => return None,
     })
@@ -293,7 +294,10 @@ impl Header {
             "llama" => "llama",
             "gemma4" => "gemma4_text",
             "mistral-large4" => "mistral_large4_text",
-            a => bail!("GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen3, llama, gemma4 and mistral-large4 are)"),
+            "deepseek4" => "deepseek_v4",
+            a => bail!(
+                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen3, llama, gemma4, mistral-large4 and deepseek4 are)"
+            ),
         })
     }
 
@@ -310,6 +314,9 @@ impl Header {
         }
         if mt == "mistral_large4_text" {
             return self.mistral4_config();
+        }
+        if mt == "deepseek_v4" {
+            return self.deepseek4_config();
         }
         let llama = mt == "llama";
         if let Some(t) = self.get(&format!("{}.rope.scaling.type", self.arch())).and_then(Value::as_str)
@@ -549,6 +556,88 @@ impl Header {
         }))
     }
 
+    /// The DeepSeek V4 config (`config.json` keys of deepseek-ai/DeepSeek-V4-Flash).
+    fn deepseek4_config(&self) -> Result<Json> {
+        let need = |k: &str| {
+            self.arch_u64(k)
+                .with_context(|| format!("GGUF metadata has no {}.{k}", self.arch()))
+        };
+        let vocab = self
+            .tensors
+            .iter()
+            .find(|t| t.name == "token_embd.weight")
+            .map(|t| t.ne[1])
+            .or_else(|| self.arch_u64("vocab_size"))
+            .or_else(|| self.get("tokenizer.ggml.tokens").and_then(Value::as_array).map(|a| a.len()))
+            .context("GGUF has no token_embd.weight")?;
+        let split = self.get("split.count").and_then(Value::as_u64).unwrap_or(1) > 1;
+        // llama.cpp's gating functions: 1 softmax, 2 sigmoid, 4 sqrt(softplus).
+        let scoring = match self.arch_u64("expert_gating_func") {
+            Some(1) => "softmax",
+            Some(2) => "sigmoid",
+            Some(4) | None => "sqrtsoftplus",
+            Some(g) => bail!("GGUF deepseek4 with expert gating function {g} is not supported"),
+        };
+        let first = |k: &str| match self.get(&format!("{}.{k}", self.arch())) {
+            Some(Value::Array(a)) => a.first().and_then(Value::as_f64),
+            Some(v) => v.as_f64(),
+            None => None,
+        };
+        let ratios: Vec<u64> = self
+            .get(&format!("{}.attention.compress_ratios", self.arch()))
+            .and_then(Value::as_array)
+            .context("GGUF deepseek4 has no attention.compress_ratios")?
+            .iter()
+            .map(|v| v.as_u64().unwrap_or(0))
+            .collect();
+        let rope_scaling = match self.get(&format!("{}.rope.scaling.type", self.arch())).and_then(Value::as_str) {
+            Some("yarn") => json!({
+                "type": "yarn",
+                "factor": self.arch_f64("rope.scaling.factor").unwrap_or(1.0),
+                "original_max_position_embeddings": self.arch_u64("rope.scaling.original_context_length").unwrap_or(0),
+                "beta_fast": self.arch_f64("rope.scaling.yarn_beta_fast").unwrap_or(32.0),
+                "beta_slow": self.arch_f64("rope.scaling.yarn_beta_slow").unwrap_or(1.0),
+            }),
+            None | Some("none") => Json::Null,
+            Some(t) => bail!("GGUF RoPE scaling {t:?} is not supported for deepseek4"),
+        };
+        Ok(json!({
+            "model_type": "deepseek_v4",
+            "hidden_size": need("embedding_length")?,
+            "num_hidden_layers": self.n_layers(),
+            "num_attention_heads": need("attention.head_count")?,
+            "head_dim": need("attention.key_length")?,
+            "qk_rope_head_dim": need("rope.dimension_count")?,
+            "q_lora_rank": need("attention.q_lora_rank")?,
+            "o_groups": need("attention.output_group_count")?,
+            "o_lora_rank": need("attention.output_lora_rank")?,
+            "vocab_size": vocab,
+            "rms_norm_eps": self.arch_f64("attention.layer_norm_rms_epsilon").unwrap_or(1e-6),
+            "n_routed_experts": need("expert_count")?,
+            "n_shared_experts": self.arch_u64("expert_shared_count").unwrap_or(1),
+            "num_experts_per_tok": need("expert_used_count")?,
+            "moe_intermediate_size": need("expert_feed_forward_length")?,
+            "routed_scaling_factor": self.arch_f64("expert_weights_scale").unwrap_or(1.0),
+            "scoring_func": scoring,
+            "norm_topk_prob": !matches!(self.get(&format!("{}.expert_weights_norm", self.arch())), Some(Value::Bool(false))),
+            "swiglu_limit": first("swiglu_clamp_exp").unwrap_or(0.0),
+            "num_hash_layers": self.arch_u64("hash_layer_count").unwrap_or(0),
+            "sliding_window": need("attention.sliding_window")?,
+            "compress_ratios": ratios,
+            "compress_rope_theta": self.arch_f64("attention.compress_rope_freq_base").unwrap_or(160_000.0),
+            "rope_theta": self.arch_f64("rope.freq_base").unwrap_or(10_000.0),
+            "rope_scaling": rope_scaling,
+            "index_n_heads": need("attention.indexer.head_count")?,
+            "index_head_dim": need("attention.indexer.key_length")?,
+            "index_topk": need("attention.indexer.top_k")?,
+            "hc_mult": self.arch_u64("hyper_connection.count").unwrap_or(4),
+            "hc_sinkhorn_iters": self.arch_u64("hyper_connection.sinkhorn_iterations").unwrap_or(20),
+            "hc_eps": self.arch_f64("hyper_connection.epsilon").unwrap_or(1e-6),
+            // (In a split model the head may be in another part; the loader looks for it.)
+            "tie_word_embeddings": !split && !self.has("output.weight"),
+        }))
+    }
+
     /// End-of-generation token ids.
     pub fn eos_ids(&self) -> Vec<u32> {
         let mut v: Vec<u32> = ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id"]
@@ -577,7 +666,13 @@ impl Header {
         // whole in the vocabulary is one token whatever the merges say (`ignore_merges`).
         let whole_words = matches!(pre, "llama-bpe" | "tekken" | "tekken-num3" | "pixtral");
         let tekken = matches!(pre, "tekken" | "tekken-num3" | "pixtral");
+        // DeepSeek V3 / V4: digits in groups of up to three and CJK runs split off first, no
+        // normalizer.
+        let deepseek = matches!(pre, "deepseek-v3" | "joyai-llm");
         let regex = match pre {
+            "deepseek-v3" | "joyai-llm" => {
+                r##"[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"##
+            }
             "tekken" | "pixtral" => {
                 r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
             }
@@ -592,7 +687,9 @@ impl Header {
             "llama-bpe" => {
                 r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
             }
-            p => bail!("GGUF pre-tokenizer {p:?} is not supported (qwen35, qwen2, llama-bpe, tekken and tekken-num3 are)"),
+            p => bail!(
+                "GGUF pre-tokenizer {p:?} is not supported (qwen35, qwen2, llama-bpe, tekken, tekken-num3, deepseek-v3 and joyai-llm are)"
+            ),
         };
         let tokens = self
             .get("tokenizer.ggml.tokens")
@@ -628,16 +725,21 @@ impl Header {
             }
         }
         let byte_level = json!({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false});
+        let split = |r: &str| json!({"type": "Split", "pattern": {"Regex": r}, "behavior": "Isolated", "invert": false});
+        let mut pretok = Vec::new();
+        if deepseek {
+            pretok.push(split(r"\p{N}{1,3}"));
+            pretok.push(split("[一-龥぀-ゟ゠-ヿ]+"));
+        }
+        pretok.push(split(regex));
+        pretok.push(byte_level.clone());
         Ok(json!({
             "version": "1.0",
             "truncation": null,
             "padding": null,
             "added_tokens": added,
-            "normalizer": if whole_words { Json::Null } else { json!({"type": "NFC"}) },
-            "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
-                {"type": "Split", "pattern": {"Regex": regex}, "behavior": "Isolated", "invert": false},
-                byte_level,
-            ]},
+            "normalizer": if whole_words || deepseek { Json::Null } else { json!({"type": "NFC"}) },
+            "pre_tokenizer": {"type": "Sequence", "pretokenizers": pretok},
             "post_processor": byte_level,
             "decoder": byte_level,
             "model": {
@@ -713,6 +815,10 @@ impl Header {
 /// The Hugging Face name and shape of GGUF tensor `t` (None for tensors the loaders do not use).
 /// Shapes are given in PyTorch order (the reverse of ggml's `ne`).
 pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec<usize>)> {
+    // DeepSeek V4: read in DeepSeek's own naming (as its safetensors release).
+    if arch == "deepseek4" {
+        return crate::deepseek4::gguf_name(&t.name, &t.ne);
+    }
     let mut shape: Vec<usize> = t.ne.iter().rev().copied().collect();
     let name = match t.name.as_str() {
         "token_embd.weight" => "model.embed_tokens.weight".to_string(),

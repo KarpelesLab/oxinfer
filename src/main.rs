@@ -1070,6 +1070,7 @@ fn run(mut args: Args) -> Result<()> {
         // Llama 3 runs on the Qwen3 code path.
         "llama" => run_qwen(args),
         "mistral_large4" | "mistral_large4_text" => run_mistral4(args),
+        "deepseek_v4" => run_deepseek4(args),
         other => bail!("unsupported model_type {other}"),
     }
 }
@@ -1719,6 +1720,111 @@ fn run_mistral4(mut args: Args) -> Result<()> {
     r
 }
 
+fn run_deepseek4(mut args: Args) -> Result<()> {
+    let t0 = Instant::now();
+    if args.mtp {
+        bail!("DeepSeek V4 speculative decoding uses a DSpark draft (--draft), not the MTP layer");
+    }
+    if iv_requested(&args.iv) {
+        bail!("runtime interventions are not supported for DeepSeek V4");
+    }
+    // DSpark: as for Mistral Large 4, the draft beside a GGUF model by default.
+    let beside = oxinfer::dspark::draft_for(&args.model);
+    let plain_only = args.tools || args.dump_logits.is_some() || args.print_prompt;
+    let draft = match &args.draft {
+        Some(d) if d.as_os_str() == "auto" => Some(beside.clone().context("--draft auto: no dspark*.gguf beside the model")?),
+        Some(d) if !oxinfer::dspark::is_draft(d) => bail!("{}: not a DSpark (dflash) draft GGUF", d.display()),
+        Some(d) => Some(d.clone()),
+        None if oxinfer::dspark::BY_DEFAULT && !args.no_draft && !plain_only => beside.clone(),
+        None => None,
+    };
+    let cfg = config::DeepSeek4Config::load(&args.model)?;
+    let eos = config::load_eos_ids(&args.model);
+    // A checkpoint larger than most of RAM is streamed with a page-cache budget of 70% of RAM,
+    // unless `--no-stream` (or `--mmap`) asks for plain demand paging.
+    let size: u64 = oxinfer::safetensors::checkpoint_bytes(&args.model);
+    if oxinfer::deepseek4::too_big(size) && args.no_stream {
+        args.mmap = true;
+    }
+    if oxinfer::deepseek4::too_big(size) && !args.stream && !args.mmap {
+        let budget = oxinfer::deepseek4::default_stream().cache_budget.unwrap_or(0) as f64 / 1e9;
+        args.cache_budget_gb = Some(args.cache_budget_gb.unwrap_or(budget));
+        eprintln!(
+            "[the {:.0} GB checkpoint does not fit in memory: streaming it (--stream --cache-budget-gb {:.0})]",
+            size as f64 / 1e9,
+            args.cache_budget_gb.unwrap()
+        );
+        args.stream = true;
+    }
+    args.mmap |= args.stream;
+    let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
+    let mut model = oxinfer::deepseek4::DeepSeek4Model::load(cfg, &files, args.quant)?;
+    let tok = load_tokenizer(&args.model)?;
+    let fmt: &dyn ChatFormat = &chat::DeepSeekChat;
+    let eos = chat::with_turn_end(fmt, &tok, eos);
+    eprintln!(
+        "[loaded DeepSeek V4: {} layers, hidden {}, {:.1} GB checkpoint ({}), {} weights streaming {:.2} GB/token, {} threads, {:.2}s]",
+        model.cfg.num_hidden_layers,
+        model.cfg.hidden_size,
+        files.total_bytes() as f64 / 1e9,
+        if args.mmap { "mmap" } else { "in RAM" },
+        if files.metadata("format") == Some("gguf") {
+            "GGUF".to_string()
+        } else {
+            format!("{:?}", model.quant)
+        },
+        model.streamed_bytes() as f64 / 1e9,
+        pool::threads(),
+        t0.elapsed().as_secs_f64()
+    );
+    if let Some(out) = &args.save_quantized {
+        return save_quantized(&args.model, out, &files, model.quant);
+    }
+    if !mm_request(&args).is_empty() {
+        bail!("DeepSeek V4 takes text only");
+    }
+    let draft_files = match &draft {
+        Some(d) => Some((d, safetensors::ModelFiles::open(d, true)?)),
+        None => None,
+    };
+    let draft = match &draft_files {
+        Some((d, f)) => {
+            let t = Instant::now();
+            let dr = oxinfer::dspark::Dspark::load(d, f, model.cfg.hidden_size, model.cfg.vocab_size, args.quant)?;
+            eprintln!(
+                "[DSpark draft {}: {} layers, block {}, {:.2} GB read per draft pass, {:.2}s]",
+                d.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+                dr.cfg.n_layers,
+                dr.cfg.block_size,
+                dr.pass_bytes() as f64 / 1e9,
+                t.elapsed().as_secs_f64()
+            );
+            Some(dr)
+        }
+        None => None,
+    };
+    let streamer = if args.stream {
+        Some(start_stream(&args, |o| oxinfer::stream::attach_deepseek4(&mut model, &files, o))?)
+    } else {
+        None
+    };
+    *STREAM.lock().unwrap() = streamer.clone();
+    TRACE.store(args.stream_trace, std::sync::atomic::Ordering::Relaxed);
+    let r = match &draft {
+        Some(d) => run_dspark(&args, &model, d, &tok, &eos, fmt, streamer.as_deref(), Default::default()),
+        None => run_text(&args, &model, &tok, &eos, fmt, Default::default()),
+    };
+    if let Some(s) = &streamer
+        && let Some(c) = s.cached_bytes()
+    {
+        eprintln!("[stream: {:.2} GB of the model files in the page cache at exit]", c as f64 / 1e9);
+    }
+    *STREAM.lock().unwrap() = None;
+    model.set_stream(None);
+    drop(streamer);
+    r
+}
+
 static TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The active weight streamer, for the per-token trace of plain decoding.
@@ -2028,9 +2134,9 @@ fn iv_requested(iv: &intervene_cli::IvArgs) -> bool {
 
 /// Generation with a DSpark draft (Mistral Large 4), single prompt or chat.
 #[allow(clippy::too_many_arguments)]
-fn run_dspark(
+fn run_dspark<M: oxinfer::dspark::Target<Sess: Clone>>(
     args: &Args,
-    model: &oxinfer::mistral4::Mistral4Model,
+    model: &M,
     draft: &oxinfer::dspark::Dspark,
     tok: &Tokenizer,
     eos: &[u32],
@@ -2067,7 +2173,7 @@ fn run_dspark(
     );
     let chunk = args.prefill_chunk.unwrap_or(256);
     let mut unfed: Option<u32> = None;
-    let mut turn = |dec: &mut DsparkDecoder<oxinfer::mistral4::Mistral4Model>, text: &str| -> Result<()> {
+    let mut turn = |dec: &mut DsparkDecoder<M>, text: &str| -> Result<()> {
         let mut ids = encode(text)?;
         if ids.is_empty() {
             bail!("empty prompt");

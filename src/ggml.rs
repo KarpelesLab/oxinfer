@@ -57,13 +57,16 @@ pub enum GgmlType {
     IQ4_XS = 23,
     IQ1_M = 29,
     BF16 = 30,
+    /// OCP microscaling FP4: E2M1 values with one E8M0 power-of-two scale per 32 (DeepSeek V4's
+    /// experts).
+    MXFP4 = 39,
     /// FP8 E4M3 (`float8_e4m3fn`) with block scales ([`GgufMatrix::fp8`]): safetensors FP8 checkpoints,
     /// not a GGUF type (the id is outside GGUF's range, and [`GgmlType::ALL`] leaves it out).
     F8E4M3 = 0x1000,
 }
 
 impl GgmlType {
-    pub const ALL: [GgmlType; 22] = [
+    pub const ALL: [GgmlType; 23] = [
         GgmlType::F32,
         GgmlType::F16,
         GgmlType::Q4_0,
@@ -86,6 +89,7 @@ impl GgmlType {
         GgmlType::IQ4_XS,
         GgmlType::IQ1_M,
         GgmlType::BF16,
+        GgmlType::MXFP4,
     ];
 
     /// The type with GGUF id `id`, if supported.
@@ -120,6 +124,7 @@ impl GgmlType {
             IQ4_XS => "IQ4_XS",
             IQ1_M => "IQ1_M",
             BF16 => "BF16",
+            MXFP4 => "MXFP4",
             F8E4M3 => "F8_E4M3",
         }
     }
@@ -128,7 +133,7 @@ impl GgmlType {
         use GgmlType::*;
         match self {
             F32 | F16 | BF16 | F8E4M3 => 1,
-            Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | IQ4_NL => 32,
+            Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | IQ4_NL | MXFP4 => 32,
             _ => QK_K,
         }
     }
@@ -158,6 +163,7 @@ impl GgmlType {
             IQ2_S => 82,
             IQ4_XS => 136,
             IQ1_M => 56,
+            MXFP4 => 17,
         }
     }
     /// Plain float storage (no blocks): runs through the f32 path rather than int8 dot products.
@@ -318,6 +324,16 @@ impl GgufMatrix {
 #[inline(always)]
 fn f16at(b: &[u8], i: usize) -> f32 {
     f16_to_f32(u16::from_le_bytes([b[i], b[i + 1]]))
+}
+/// Half the value of an E8M0 scale byte, `2^(e - 128)` (ggml's `GGML_E8M0_TO_FP32_HALF`; the
+/// MXFP4 values are stored doubled).
+#[inline(always)]
+pub(crate) fn e8m0_half(e: u8) -> f32 {
+    if e < 2 {
+        f32::from_bits(0x0020_0000 << e)
+    } else {
+        f32::from_bits((e as u32 - 1) << 23)
+    }
 }
 #[inline(always)]
 fn u16at(b: &[u8], i: usize) -> u16 {
@@ -662,6 +678,13 @@ pub fn dequantize_row(kind: GgmlType, src: &[u8], out: &mut [f32]) {
                     y[j + 16] = d * KVALUES_IQ4NL[(b[2 + j] >> 4) as usize] as f32;
                 }
             }
+            MXFP4 => {
+                let d = e8m0_half(b[0]);
+                for j in 0..16 {
+                    y[j] = d * KVALUES_MXFP4[(b[1 + j] & 0xF) as usize] as f32;
+                    y[j + 16] = d * KVALUES_MXFP4[(b[1 + j] >> 4) as usize] as f32;
+                }
+            }
             IQ4_XS => {
                 let d = f16at(b, 0);
                 for ib in 0..8 {
@@ -923,6 +946,14 @@ pub fn decode_i8(kind: GgmlType, b: &[u8], q: &mut [i8], s: &mut [f32], m: &mut 
             }
             false
         }
+        MXFP4 => {
+            s[..2].fill(e8m0_half(b[0]));
+            for j in 0..16 {
+                q[j] = KVALUES_MXFP4[(b[1 + j] & 0xF) as usize];
+                q[j + 16] = KVALUES_MXFP4[(b[1 + j] >> 4) as usize];
+            }
+            false
+        }
         IQ4_XS => {
             let d = f16at(b, 0);
             for ib in 0..8 {
@@ -1155,6 +1186,8 @@ pub fn random_blocks(kind: GgmlType, nb: usize, seed: &mut u64) -> Vec<u8> {
                     b[i..i + 2].copy_from_slice(&s.to_le_bytes());
                 }
             }
+            // Scales 2^-10 .. 2^-4 (the doubled values reach 12).
+            MXFP4 => b[0] = 118 + (lcg(seed) % 7) as u8,
             _ => put_f16(b, 0, rnd(seed, true)),
         }
     }
@@ -1199,6 +1232,7 @@ mod tests {
         (GgmlType::IQ3_XXS, 0x9a7e32aaa9e093ca),
         (GgmlType::IQ4_NL, 0x9de348f3e6e39671),
         (GgmlType::IQ4_XS, 0xf26fd3824913af96),
+        (GgmlType::MXFP4, 0xf64d0292f050737d),
         (GgmlType::Q2_K, 0x44b0a081c4b9c71c),
         (GgmlType::Q3_K, 0x0c8fa80fd8589b8a),
         (GgmlType::Q4_0, 0xc2ac60f0d9d22bc8),

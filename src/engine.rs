@@ -51,6 +51,7 @@
 use crate::chat::{self, ChatFormat};
 use crate::clock::Instant;
 use crate::decide::{BaseCheck, Decision, DecisionAssets, DecisionRequest, DecisionStats};
+use crate::deepseek4::{DeepSeek4Model, DeepSeek4Session};
 use crate::drafter::Drafter;
 use crate::dspark::{Dspark, DsparkDecoder, DsparkOptions};
 use crate::generate::{self, Decoded, Flow as GFlow, TextStream};
@@ -745,6 +746,8 @@ pub enum Family {
     Llama,
     /// Mistral Large 4 (`mistral_large4`).
     Mistral4,
+    /// DeepSeek V4 (`deepseek_v4`).
+    DeepSeek4,
 }
 
 /// Speculative decoding in use.
@@ -755,7 +758,7 @@ pub enum Speculative {
     Mtp,
     /// Gemma 4 assistant model.
     Drafter,
-    /// DSpark draft model (Mistral Large 4).
+    /// DSpark draft model (Mistral Large 4, DeepSeek V4).
     Dspark,
 }
 
@@ -859,6 +862,13 @@ enum Lm {
     Mistral4Dspark {
         dec: Box<DsparkDecoder<'static, Mistral4Model<'static>>>,
     },
+    DeepSeek4 {
+        model: &'static DeepSeek4Model<'static>,
+        sess: DeepSeek4Session,
+    },
+    DeepSeek4Dspark {
+        dec: Box<DsparkDecoder<'static, DeepSeek4Model<'static>>>,
+    },
     #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
     CoreMl(Box<coreml_lm::CoreMlLm>),
 }
@@ -875,6 +885,8 @@ impl Lm {
             Lm::QwenMtp { dec } => dec.sess.pos,
             Lm::Mistral4 { sess, .. } => sess.pos,
             Lm::Mistral4Dspark { dec } => dec.sess.pos,
+            Lm::DeepSeek4 { sess, .. } => sess.pos,
+            Lm::DeepSeek4Dspark { dec } => dec.sess.pos,
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(c) => c.context_len(),
         }
@@ -889,6 +901,11 @@ impl Lm {
             }
             Lm::Mistral4 { model, sess } => *sess = model.new_session(),
             Lm::Mistral4Dspark { dec } => {
+                let opts = dec.opts.clone();
+                **dec = DsparkDecoder::new(dec.model(), dec.draft(), opts);
+            }
+            Lm::DeepSeek4 { model, sess } => *sess = model.new_session(),
+            Lm::DeepSeek4Dspark { dec } => {
                 let opts = dec.opts.clone();
                 **dec = DsparkDecoder::new(dec.model(), dec.draft(), opts);
             }
@@ -1013,6 +1030,7 @@ impl Engine {
             }
             "llama" => Family::Llama,
             "mistral_large4" | "mistral_large4_text" => Family::Mistral4,
+            "deepseek_v4" => Family::DeepSeek4,
             other => bail!("unsupported model_type {other}"),
         };
         if family == Family::Llama && !chat::Llama3Chat::matches_model(&dir) {
@@ -1025,8 +1043,8 @@ impl Engine {
         if mtp && family != Family::Qwen {
             bail!("MTP speculative decoding is for Qwen3.5/3.8 models");
         }
-        if draft_dir.is_some() && !matches!(family, Family::Gemma4 | Family::Mistral4) {
-            bail!("a drafter model is for Gemma 4 (or a DSpark draft for Mistral Large 4)");
+        if draft_dir.is_some() && !matches!(family, Family::Gemma4 | Family::Mistral4 | Family::DeepSeek4) {
+            bail!("a drafter model is for Gemma 4 (or a DSpark draft for Mistral Large 4 or DeepSeek V4)");
         }
 
         let mut arena = Arena(Vec::new());
@@ -1034,7 +1052,8 @@ impl Engine {
         let decision;
         // Streaming reads the weights in place: always mapped. So is a Mistral Large 4 checkpoint
         // larger than most of RAM (its routed experts are read through the page cache).
-        let too_big = family == Family::Mistral4 && crate::mistral4::too_big(crate::safetensors::checkpoint_bytes(&dir));
+        let too_big =
+            matches!(family, Family::Mistral4 | Family::DeepSeek4) && crate::mistral4::too_big(crate::safetensors::checkpoint_bytes(&dir));
         // Too big for memory: streamed with a page-cache budget unless told otherwise
         // (2.5-3.5x faster than demand paging on the 378 GB UD-Q2_K_XL, see the README).
         let stream = opts.effective_stream(too_big.then(crate::mistral4::default_stream));
@@ -1225,6 +1244,66 @@ impl Engine {
                     info.4,
                 )
             }
+            Family::DeepSeek4 => {
+                if decision_dir.is_some() {
+                    bail!("decisions (decision_from) are not supported for DeepSeek V4");
+                }
+                decision = None;
+                let mut model = DeepSeek4Model::load(config::DeepSeek4Config::load(&dir)?, files, opts.quant)?;
+                if let Some(so) = stream.clone() {
+                    streamer = Some(crate::stream::attach_deepseek4(&mut model, files, so)?);
+                }
+                let model = arena.keep(model);
+                let c = &model.cfg;
+                let info = (
+                    model.quant,
+                    c.num_hidden_layers,
+                    c.hidden_size,
+                    c.vocab_size,
+                    model.streamed_bytes(),
+                );
+                // DSpark as for Mistral Large 4: the given draft, `auto` / the default for the one
+                // beside a GGUF model, `none` for none.
+                let dspark = match (opts.draft.as_deref(), &draft_dir) {
+                    (Some("auto"), _) => Some(crate::dspark::draft_for(&dir).context("draft=auto: no dspark*.gguf beside the model")?),
+                    (_, Some(d)) => Some(d.clone()),
+                    (None, None) if crate::dspark::BY_DEFAULT => crate::dspark::draft_for(&dir),
+                    _ => None,
+                };
+                let lm = match dspark {
+                    Some(d) => {
+                        let df = arena.keep(ModelFiles::open(&d, true)?);
+                        let dr = Dspark::load(&d, df, c.hidden_size, c.vocab_size, opts.quant)
+                            .with_context(|| format!("DSpark draft {}", d.display()))?;
+                        let dr: &'static Dspark<'static> = arena.keep(dr);
+                        let dopts = DsparkOptions {
+                            draft_tokens: opts.draft_tokens.unwrap_or(dr.cfg.max_draft()),
+                            stop: chat::with_turn_end(&chat::DeepSeekChat, &tok, eos.clone()),
+                            cost_aware: false,
+                            p_min: opts
+                                .draft_p_min
+                                .unwrap_or(if streamer.is_some() { crate::dspark::STREAM_P_MIN } else { 0.0 }),
+                            device: opts.draft_device,
+                        };
+                        Lm::DeepSeek4Dspark {
+                            dec: Box::new(DsparkDecoder::new(model, dr, dopts)),
+                        }
+                    }
+                    None => Lm::DeepSeek4 {
+                        model,
+                        sess: model.new_session(),
+                    },
+                };
+                (
+                    lm,
+                    &chat::DeepSeekChat as &'static (dyn ChatFormat + Sync),
+                    info.0,
+                    info.1,
+                    info.2,
+                    info.3,
+                    info.4,
+                )
+            }
         };
         if opts.preload && opts.mmap {
             files.preload();
@@ -1242,7 +1321,7 @@ impl Engine {
         let speculative = match &lm {
             Lm::QwenMtp { .. } => Speculative::Mtp,
             Lm::Gemma { drafter: Some(_), .. } => Speculative::Drafter,
-            Lm::Mistral4Dspark { .. } => Speculative::Dspark,
+            Lm::Mistral4Dspark { .. } | Lm::DeepSeek4Dspark { .. } => Speculative::Dspark,
             _ => Speculative::None,
         };
         let info = ModelInfo {
@@ -1520,6 +1599,7 @@ impl Engine {
             Lm::QwenMtp { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
             Lm::Mistral4 { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::Mistral4Dspark { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
+            Lm::DeepSeek4 { .. } | Lm::DeepSeek4Dspark { .. } => bail!("activation capture is not supported for DeepSeek V4"),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("activation capture is not supported for Core ML models"),
         }
@@ -1548,6 +1628,7 @@ impl Engine {
             Lm::QwenMtp { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
             Lm::Mistral4 { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::Mistral4Dspark { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
+            Lm::DeepSeek4 { .. } | Lm::DeepSeek4Dspark { .. } => bail!("interventions are not supported for DeepSeek V4"),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
         }
@@ -1567,6 +1648,7 @@ impl Engine {
             Lm::QwenMtp { dec } => dec.model(),
             Lm::Mistral4 { model, .. } => *model,
             Lm::Mistral4Dspark { dec } => dec.model(),
+            Lm::DeepSeek4 { .. } | Lm::DeepSeek4Dspark { .. } => bail!("interventions are not supported for DeepSeek V4"),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
         };
@@ -1581,6 +1663,7 @@ impl Engine {
             Lm::QwenMtp { dec } => &mut dec.sess.iv,
             Lm::Mistral4 { sess, .. } => &mut sess.iv,
             Lm::Mistral4Dspark { dec } => &mut dec.sess.iv,
+            Lm::DeepSeek4 { .. } | Lm::DeepSeek4Dspark { .. } => return,
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => return,
         };
@@ -1803,6 +1886,8 @@ impl Engine {
                 Lm::QwenMtp { dec } => run(dec.model(), &ids, &feats, chunk, need_logits)?,
                 Lm::Mistral4 { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
                 Lm::Mistral4Dspark { dec } => run(dec.model(), &ids, &feats, chunk, need_logits)?,
+                Lm::DeepSeek4 { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
+                Lm::DeepSeek4Dspark { dec } => run(dec.model(), &ids, &feats, chunk, need_logits)?,
                 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
                 Lm::CoreMl(_) => bail!("decisions are not supported for Core ML models"),
             }
@@ -2062,6 +2147,31 @@ impl PendingTurn {
                 }
             }
             Lm::Mistral4 { model, sess } => {
+                let hs = generate::prefill(*model, sess, &ids, chunk, &overrides);
+                let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
+                st.prefill_secs = t0.elapsed().as_secs_f64();
+                let max = limit(sess.pos);
+                if max == 0 {
+                    empty(0.0)
+                } else {
+                    generate::decode(*model, sess, logits, sampler, stop, max, &mut cb)
+                }
+            }
+            Lm::DeepSeek4Dspark { dec } => {
+                let logits = dec.prefill_mm(&ids, chunk, &overrides);
+                st.prefill_secs = t0.elapsed().as_secs_f64();
+                let max = limit(dec.sess.pos);
+                if max == 0 {
+                    empty(0.0)
+                } else {
+                    let before = dec.stats.clone();
+                    let d = generate::decode_rounds(&mut **dec, &logits, sampler, stop, max, &mut cb);
+                    st.drafted = dec.stats.drafted - before.drafted;
+                    st.accepted = dec.stats.accepted - before.accepted;
+                    d
+                }
+            }
+            Lm::DeepSeek4 { model, sess } => {
                 let hs = generate::prefill(*model, sess, &ids, chunk, &overrides);
                 let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
                 st.prefill_secs = t0.elapsed().as_secs_f64();

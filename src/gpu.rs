@@ -31,6 +31,15 @@ impl WeightRef<'_> {
     }
 }
 
+/// The gated activation of MoE experts: `act(gate) * up`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum MoeAct {
+    Silu,
+    GeluTanh,
+    /// SiLU with DeepSeek V4's clamp: `silu(min(gate, l)) * clamp(up, -l, l)`.
+    SiluClamp(f32),
+}
+
 /// Device-side state for one weight matrix (buffers / handles), owned by the layer.
 pub type DeviceWeight = Box<dyn Any + Send + Sync>;
 
@@ -130,8 +139,8 @@ pub trait Backend: Send + Sync {
     /// Device state for the routed experts of an MoE layer: expert `e` has the fused gate/up
     /// projection `gate_up[e]` (`[2 * inter, h]`, gate rows then up rows), or with `up` the gate
     /// projection `gate_up[e]` (`[inter, h]`) and the up projection `up[e]` (GGUF files store
-    /// them apart), and the down projection `down[e]` (`[h, inter]`); the activation is GELU-tanh
-    /// when `gelu` is set, else SiLU. None if the backend does not run MoE layers.
+    /// them apart), and the down projection `down[e]` (`[h, inter]`), with activation `act`. None
+    /// if the backend does not run MoE layers.
     #[allow(clippy::too_many_arguments)]
     fn upload_moe(
         &self,
@@ -140,7 +149,7 @@ pub trait Backend: Send + Sync {
         _down: &[WeightRef],
         _h: usize,
         _inter: usize,
-        _gelu: bool,
+        _act: MoeAct,
     ) -> Option<DeviceWeight> {
         None
     }
@@ -155,7 +164,7 @@ pub trait Backend: Send + Sync {
         _down: &[WeightRef],
         _h: usize,
         _inter: usize,
-        _gelu: bool,
+        _act: MoeAct,
     ) -> Option<DeviceWeight> {
         None
     }

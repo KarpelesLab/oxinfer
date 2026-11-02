@@ -626,11 +626,15 @@ impl ModelFiles {
                 s.metadata.insert("naming".into(), "mistral".into());
             }
         }
+        // DeepSeek V4's own layout: the experts' w1 / w2 / w3 under the names the loaders read.
+        if crate::deepseek4::is_native(&files) {
+            files.rename(crate::deepseek4::native_name);
+        }
         Ok(files)
     }
 
     /// Renames tensors: `f` gives the new name of a tensor (None keeps its name).
-    fn rename(&mut self, f: impl Fn(&str) -> Option<String>) {
+    pub(crate) fn rename(&mut self, f: impl Fn(&str) -> Option<String>) {
         self.index.clear();
         for (i, sh) in self.shards.iter_mut().enumerate() {
             let old = std::mem::take(&mut sh.tensors);

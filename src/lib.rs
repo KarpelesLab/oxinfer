@@ -28,6 +28,7 @@ pub mod coreml;
 #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
 pub mod cuda;
 pub mod decide;
+pub mod deepseek4;
 pub mod drafter;
 pub mod dspark;
 pub mod embed;

@@ -909,6 +909,166 @@ impl Mistral4Config {
     }
 }
 
+fn d_ds4_sqrtsoftplus() -> String {
+    "sqrtsoftplus".into()
+}
+fn d_ds4_hc() -> usize {
+    4
+}
+fn d_ds4_sinkhorn() -> usize {
+    20
+}
+fn d_ds4_window() -> usize {
+    128
+}
+fn d_ds4_ctheta() -> f64 {
+    160_000.0
+}
+
+/// The `rope_scaling` of a DeepSeek V4 config (YaRN on the compressed layers).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Ds4RopeScaling {
+    #[serde(default)]
+    pub r#type: Option<String>,
+    #[serde(default)]
+    pub factor: Option<f64>,
+    #[serde(default)]
+    pub original_max_position_embeddings: Option<usize>,
+    #[serde(default)]
+    pub beta_fast: Option<f64>,
+    #[serde(default)]
+    pub beta_slow: Option<f64>,
+}
+
+/// DeepSeek V4 (`deepseek_v4`, DeepSeek-V4-Flash / -Pro) in DeepSeek's own `config.json` keys (a
+/// GGUF header is mapped onto the same fields, `gguf::Header::config_json`); see
+/// [`crate::deepseek4`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct DeepSeek4Config {
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub head_dim: usize,
+    pub qk_rope_head_dim: usize,
+    pub q_lora_rank: usize,
+    pub o_groups: usize,
+    pub o_lora_rank: usize,
+    pub vocab_size: usize,
+    #[serde(default = "d_eps")]
+    pub rms_norm_eps: f64,
+    pub n_routed_experts: usize,
+    #[serde(default = "d_ml4_dense")]
+    pub n_shared_experts: usize,
+    pub num_experts_per_tok: usize,
+    pub moe_intermediate_size: usize,
+    #[serde(default = "d_ml4_one")]
+    pub routed_scaling_factor: f64,
+    /// `sqrtsoftplus`, `sigmoid` or `softmax`.
+    #[serde(default = "d_ds4_sqrtsoftplus")]
+    pub scoring_func: String,
+    #[serde(default = "d_true")]
+    pub norm_topk_prob: bool,
+    /// Clamp of the experts' SwiGLU inputs (0: none).
+    #[serde(default)]
+    pub swiglu_limit: f64,
+    /// The first layers route by token id (`ffn.gate.tid2eid`).
+    #[serde(default)]
+    pub num_hash_layers: usize,
+    #[serde(default = "d_ds4_window")]
+    pub sliding_window: usize,
+    /// Per layer: 0 (sliding window only), 4 (compressed sparse attention with the indexer) or
+    /// another rate (heavily compressed attention); may list the MTP / DSpark layers after them.
+    pub compress_ratios: Vec<usize>,
+    #[serde(default = "d_ds4_ctheta")]
+    pub compress_rope_theta: f64,
+    #[serde(default = "d_ml4_theta")]
+    pub rope_theta: f64,
+    #[serde(default)]
+    pub rope_scaling: Option<Ds4RopeScaling>,
+    pub index_n_heads: usize,
+    pub index_head_dim: usize,
+    pub index_topk: usize,
+    #[serde(default = "d_ds4_hc")]
+    pub hc_mult: usize,
+    #[serde(default = "d_ds4_sinkhorn")]
+    pub hc_sinkhorn_iters: usize,
+    #[serde(default = "d_eps")]
+    pub hc_eps: f64,
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
+}
+
+impl DeepSeek4Config {
+    /// The config of a DeepSeek V4 checkpoint folder (`config.json`) or GGUF file.
+    pub fn load(dir: &Path) -> Result<Self> {
+        let raw: serde_json::Value = if crate::gguf::is_gguf(dir) {
+            crate::gguf::header(dir)?.config_json()?
+        } else {
+            serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?
+        };
+        Self::from_json(raw)
+    }
+
+    pub fn from_json(raw: serde_json::Value) -> Result<Self> {
+        let c: DeepSeek4Config = serde_json::from_value(raw).context("parse deepseek_v4 config")?;
+        let n = c.num_hidden_layers;
+        if c.compress_ratios.len() < n {
+            bail!("deepseek_v4: {} compress_ratios for {n} layers", c.compress_ratios.len());
+        }
+        if !c.num_attention_heads.is_multiple_of(c.o_groups.max(1)) || c.qk_rope_head_dim > c.head_dim.min(c.index_head_dim) {
+            bail!("deepseek_v4: bad head layout");
+        }
+        if !matches!(c.scoring_func.as_str(), "sqrtsoftplus" | "sigmoid" | "softmax") {
+            bail!("deepseek_v4: scoring function {:?} is not supported", c.scoring_func);
+        }
+        if c.hc_mult == 0 || !c.qk_rope_head_dim.is_multiple_of(2) {
+            bail!("deepseek_v4: bad hyper-connection or rotary settings");
+        }
+        Ok(c)
+    }
+
+    /// The compression rate of layer `l` (0: sliding window only).
+    pub fn ratio(&self, l: usize) -> usize {
+        self.compress_ratios[l]
+    }
+
+    /// Rotary inverse frequencies (`qk_rope_head_dim / 2`) of the sliding-window-only layers
+    /// (plain RoPE, `rope_theta`) and of the compressed ones (`compress_rope_theta` with YaRN,
+    /// without its magnitude scaling), as DeepSeek's `precompute_freqs_cis`.
+    pub fn rope_freqs(&self) -> (Vec<f32>, Vec<f32>) {
+        let rd = self.qk_rope_head_dim;
+        let plain = YarnParams {
+            rope_theta: self.rope_theta,
+            rope_type: Some("default".into()),
+            factor: None,
+            original_max_position_embeddings: None,
+            beta_fast: None,
+            beta_slow: None,
+            attention_factor: None,
+            mscale: None,
+            mscale_all_dim: None,
+            truncate: None,
+        };
+        let main = plain.inv_freq(rd).0;
+        let rs = self.rope_scaling.as_ref();
+        let yarn =
+            rs.is_some_and(|r| r.r#type.as_deref().unwrap_or("yarn") == "yarn" && r.original_max_position_embeddings.unwrap_or(0) > 0);
+        let comp = YarnParams {
+            rope_theta: self.compress_rope_theta,
+            rope_type: Some(if yarn { "yarn" } else { "default" }.into()),
+            factor: rs.and_then(|r| r.factor),
+            original_max_position_embeddings: rs.and_then(|r| r.original_max_position_embeddings),
+            beta_fast: rs.and_then(|r| r.beta_fast),
+            beta_slow: rs.and_then(|r| r.beta_slow),
+            attention_factor: Some(1.0),
+            mscale: None,
+            mscale_all_dim: None,
+            truncate: None,
+        };
+        (main, comp.inv_freq(rd).0)
+    }
+}
+
 impl YarnParams {
     /// The rotary inverse frequencies (`dim / 2` of them) and the cos / sin magnitude, as
     /// transformers' YaRN (`_compute_yarn_parameters`) or default RoPE computes them in float32.

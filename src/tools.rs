@@ -307,6 +307,69 @@ pub mod mistral {
     }
 }
 
+// ---- DeepSeek V4 (DSML) -------------------------------------------------------------------------
+
+pub mod deepseek {
+    use super::*;
+
+    const DSML: &str = "｜DSML｜";
+
+    /// The "## Tools" section DeepSeek V4's encoder (`render_tools`) adds to the system prompt.
+    pub fn tools_block(tools: &[ToolSpec]) -> String {
+        let schemas: Vec<String> = tools
+            .iter()
+            .map(|t| qwen::py_json(&json!({ "name": t.name, "description": t.description, "parameters": t.parameters })))
+            .collect();
+        format!(
+            "## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<{DSML}tool_calls>\" block like the following:\n\n<{DSML}tool_calls>\n<{DSML}invoke name=\"$TOOL_NAME\">\n<{DSML}parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</{DSML}parameter>\n...\n</{DSML}invoke>\n<{DSML}invoke name=\"$TOOL_NAME2\">\n...\n</{DSML}invoke>\n</{DSML}tool_calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n",
+            schemas.join("\n")
+        )
+    }
+
+    /// The marker that opens the calls in a reply.
+    pub const MARKER: &str = "<｜DSML｜tool_calls>";
+
+    /// Every `<｜DSML｜invoke name="..">` with its `<｜DSML｜parameter name=".." string="true|false">
+    /// ..</｜DSML｜parameter>` (string values as is, others as JSON).
+    pub fn parse_calls(raw: &str) -> Vec<ToolCall> {
+        let mut calls = Vec::new();
+        let Some((_, body)) = raw.split_once(MARKER) else { return calls };
+        let open_inv = format!("<{DSML}invoke name=\"");
+        let open_par = format!("<{DSML}parameter name=\"");
+        let close_par = format!("</{DSML}parameter>");
+        for inv in body.split(open_inv.as_str()).skip(1) {
+            let Some((name, mut rest)) = inv.split_once("\">") else { continue };
+            let mut arguments = Map::new();
+            while let Some(i) = rest.find(open_par.as_str()) {
+                rest = &rest[i + open_par.len()..];
+                let Some((pname, r)) = rest.split_once('"') else { break };
+                let Some(r) = r.strip_prefix(" string=\"") else { break };
+                let Some((is_str, r)) = r.split_once("\">") else { break };
+                let Some((value, r)) = r.split_once(close_par.as_str()) else {
+                    break;
+                };
+                let v = if is_str == "true" {
+                    Value::String(value.to_string())
+                } else {
+                    serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string()))
+                };
+                arguments.insert(pname.to_string(), v);
+                rest = r;
+            }
+            calls.push(ToolCall {
+                name: name.to_string(),
+                arguments,
+            });
+        }
+        calls
+    }
+
+    /// A tool result block (the results of one round are joined with blank lines in a user turn).
+    pub fn response(r: &ToolResult) -> String {
+        format!("<tool_result>{}</tool_result>", r.content)
+    }
+}
+
 // ---- Qwen 3.5 / 3.8 -----------------------------------------------------------------------------
 
 pub mod qwen {
@@ -770,6 +833,27 @@ mod tests {
                     .unwrap()
                     .clone()
             }]
+        );
+    }
+
+    /// DeepSeek V4's DSML calls, as its encoder writes them (two calls, string and JSON values).
+    #[test]
+    fn deepseek_calls_parse() {
+        let raw = "Let me compute.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"calculate\">\n<｜DSML｜parameter name=\"expression\" string=\"true\">2+2</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"search\">\n<｜DSML｜parameter name=\"q\" string=\"true\">a \"b\"</｜DSML｜parameter>\n<｜DSML｜parameter name=\"n\" string=\"false\">[1, 2]</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls><｜end▁of▁sentence｜>";
+        let c = deepseek::parse_calls(raw);
+        let obj = |v: Value| v.as_object().unwrap().clone();
+        assert_eq!(
+            c,
+            vec![
+                ToolCall {
+                    name: "calculate".into(),
+                    arguments: obj(json!({"expression": "2+2"}))
+                },
+                ToolCall {
+                    name: "search".into(),
+                    arguments: obj(json!({"q": "a \"b\"", "n": [1, 2]}))
+                }
+            ]
         );
     }
 

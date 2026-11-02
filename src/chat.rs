@@ -591,6 +591,69 @@ impl ChatFormat for MistralChat {
     }
 }
 
+/// DeepSeek V4 (its `encoding_dsv4.py`): `<｜begin▁of▁sentence｜>` then the system prompt as is
+/// (tool schemas appended after a blank line), user turns `<｜User｜>...<｜Assistant｜>` followed by
+/// `<think>` (thinking) or `</think>` (chat), replies closed by `<｜end▁of▁sentence｜>`. Tool
+/// calls are DSML blocks; their results come back as `<tool_result>` blocks of a user turn.
+pub struct DeepSeekChat;
+
+impl DeepSeekChat {
+    const EOS: &'static str = "<｜end▁of▁sentence｜>";
+    fn assistant(think: bool) -> &'static str {
+        if think {
+            "<｜Assistant｜><think>"
+        } else {
+            "<｜Assistant｜></think>"
+        }
+    }
+}
+
+impl ChatFormat for DeepSeekChat {
+    fn conversation_start(&self, system: Option<&str>, think: bool) -> String {
+        self.conversation_start_tools(system, think, &[])
+    }
+    fn user_turn(&self, content: &str, think: bool) -> String {
+        format!("<｜User｜>{content}{}", Self::assistant(think))
+    }
+    fn end_of_model_turn(&self) -> String {
+        Self::EOS.to_string()
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        Self::EOS
+    }
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        ("<think>", "</think>")
+    }
+    fn starts_in_thinking(&self, think: bool) -> bool {
+        think
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, _think: bool, tools: &[ToolSpec]) -> String {
+        let mut s = String::from("<｜begin▁of▁sentence｜>");
+        if let Some(sys) = system {
+            s.push_str(sys);
+        }
+        if !tools.is_empty() {
+            if system.is_some() {
+                s.push_str("\n\n");
+            }
+            s.push_str(&crate::tools::deepseek::tools_block(tools));
+        }
+        s
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        crate::tools::deepseek::MARKER
+    }
+    fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
+        crate::tools::deepseek::parse_calls(raw)
+    }
+    fn tool_results(&self, results: &[ToolResult], think: bool) -> String {
+        // The reply ended on its end-of-sentence token (sampled, not fed); the results are a user
+        // turn.
+        let blocks: Vec<String> = results.iter().map(crate::tools::deepseek::response).collect();
+        format!("{}<｜User｜>{}{}", Self::EOS, blocks.join("\n\n"), Self::assistant(think))
+    }
+}
+
 /// `eos` plus the chat format's end-of-turn token, looked up in the tokenizer.
 pub fn with_turn_end(fmt: &dyn ChatFormat, tok: &tokenizers::Tokenizer, mut eos: Vec<u32>) -> Vec<u32> {
     if let Some(id) = tok.token_to_id(fmt.end_of_turn_token())

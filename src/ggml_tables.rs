@@ -1892,6 +1892,9 @@ pub static IQ3S_GRID: [u32; 512] = [
 
 pub static KVALUES_IQ4NL: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
 
+/// The E2M1 values of MXFP4 doubled (ggml's `kvalues_mxfp4`; the block scale is halved).
+pub static KVALUES_MXFP4: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
 pub static IQ1S_GRID: [u64; 2048] = [
     0xffffffffffffffff,
     0xffffffffffffff01,

@@ -522,6 +522,18 @@ inline void load(IQ4_NLW w, uint row, uint b, thread float4* out) {
         out[i + 4] = kv4(v >> uchar(4)) * d;
     }
 }
+struct MXFP4W { GgW g; };
+inline float4 kvm4(uchar4 v) { return float4(kvalues_mxfp4[v.x], kvalues_mxfp4[v.y], kvalues_mxfp4[v.z], kvalues_mxfp4[v.w]); }
+inline void load(MXFP4W w, uint row, uint b, thread float4* out) {
+    device const uchar* B = w.g.q + (ulong)row * w.g.rb + b * 17;
+    uint e = B[0];
+    float d = e < 2 ? as_type<float>(0x00200000u << e) : as_type<float>((e - 1) << 23);
+    for (uint i = 0; i < 4; i++) {
+        uchar4 v = ld4(B + 1 + 4 * i);
+        out[i] = kvm4(v & uchar(15)) * d;
+        out[i + 4] = kvm4(v >> uchar(4)) * d;
+    }
+}
 struct Q8_0W { GgW g; };
 inline void load(Q8_0W w, uint row, uint b, thread float4* out) {
     device const uchar* B = w.g.q + (ulong)row * w.g.rb + b * 34;
@@ -746,7 +758,7 @@ GEMM(gemm_F8_E4M3, F8W, MK_F8)
 #define GG(T) GEMM(gemm_##T, T##W, MK_GG(T##W))
 GEMM(gemm_F32, F32W2, MK_GG(F32W2)) GG(F16) GG(Q4_1) GG(Q5_0) GG(Q5_1)
 GG(Q4_0) GG(IQ4_NL) GG(Q8_0) GG(Q4_K) GG(Q5_K) GG(Q6_K) GG(Q3_K) GG(Q2_K) GG(IQ4_XS)
-GG(IQ2_XXS) GG(IQ2_XS) GG(IQ2_S) GG(IQ3_XXS) GG(IQ3_S) GG(IQ1_S) GG(IQ1_M)
+GG(IQ2_XXS) GG(IQ2_XS) GG(IQ2_S) GG(IQ3_XXS) GG(IQ3_S) GG(IQ1_S) GG(IQ1_M) GG(MXFP4)
 "#;
 
 /// GEMMs on the matrix units of M5 / A19 GPU cores (Metal 4 tensor operations, `matmul2d` from
@@ -869,7 +881,7 @@ kernel void mmag_bf(device const EP* ep [[buffer(0)]], device const GT* tiles [[
 #define GGM(T) MMAD(mma_##T, T##W, MK_GG(T##W)) MMAG(mmag_##T, T##W, MK_GG(T##W))
 GGM(F16) GGM(Q4_1) GGM(Q5_0) GGM(Q5_1)
 GGM(Q4_0) GGM(IQ4_NL) GGM(Q8_0) GGM(Q4_K) GGM(Q5_K) GGM(Q6_K) GGM(Q3_K) GGM(Q2_K) GGM(IQ4_XS)
-GGM(IQ2_XXS) GGM(IQ2_XS) GGM(IQ2_S) GGM(IQ3_XXS) GGM(IQ3_S) GGM(IQ1_S) GGM(IQ1_M)
+GGM(IQ2_XXS) GGM(IQ2_XS) GGM(IQ2_S) GGM(IQ3_XXS) GGM(IQ3_S) GGM(IQ1_S) GGM(IQ1_M) GGM(MXFP4)
 
 // Input rows (optionally gathered: row r is source row src[r]) to half with a power-of-two scale
 // per row (see above); rs gets the inverse scale. One threadgroup of 256 per row; n % 4 == 0.
@@ -901,13 +913,13 @@ kernel void x_half(device const float* x [[buffer(0)]], device half* xh [[buffer
     for (uint i = tid; i < n4; i += 256) out[i] = half4(row[i] * s);
     if (tid == 0) rs[r] = inv;
 }
-// act(gate) * up (SiLU, or GELU-tanh with `gelu`) of fused [gate | up] rows (n each) into scaled
-// half rows, as x_half; with `split` = G nonzero, gate row r is at r * n and up row r at
+// act(gate) * up (SiLU, or GELU-tanh with `gelu`; with `limit` > 0 gate clamped above and up
+// both ways first, DeepSeek V4) of fused [gate | up] rows (n each) into scaled half rows, as x_half; with `split` = G nonzero, gate row r is at r * n and up row r at
 // (G + r) * n (gate and up experts stored apart).
 inline float4 silu_mul4(float4 g, float4 u) { return g / (1.0f + exp(-g)) * u; }
 inline float4 gelu_mul4(float4 g, float4 u) { return g / (1.0f + exp(-1.5957691f * (g + 0.044715f * g * g * g))) * u; }
-inline float4 act_mul4(float4 g, float4 u, uint gelu) { return gelu != 0 ? gelu_mul4(g, u) : silu_mul4(g, u); }
-struct SH { uint n; uint gelu; uint split; uint _p; };
+inline float4 act_mul4(float4 g, float4 u, uint gelu, float limit) { if (limit > 0.f) { g = min(g, limit); u = clamp(u, -limit, limit); } return gelu != 0 ? gelu_mul4(g, u) : silu_mul4(g, u); }
+struct SH { uint n; uint gelu; uint split; float limit; };
 kernel void silu_half(device const float* gu [[buffer(0)]], device half* ah [[buffer(1)]], device float* rs [[buffer(2)]],
                       constant SH& p [[buffer(3)]],
                       uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
@@ -917,11 +929,11 @@ kernel void silu_half(device const float* gu [[buffer(0)]], device half* ah [[bu
     device const float4* u = p.split != 0 ? (device const float4*)(gu + (ulong)(p.split + r) * p.n) : g + p.n / 4;
     uint n4 = p.n / 4;
     float m = 0.f;
-    for (uint i = tid; i < n4; i += 256) { float4 v = abs(act_mul4(g[i], u[i], p.gelu)); m = max(m, max(max(v.x, v.y), max(v.z, v.w))); }
+    for (uint i = tid; i < n4; i += 256) { float4 v = abs(act_mul4(g[i], u[i], p.gelu, p.limit)); m = max(m, max(max(v.x, v.y), max(v.z, v.w))); }
     m = tg_max(m, sg, lane, red);
     float inv, s = row_scale(m, inv);
     device half4* out = (device half4*)(ah + (ulong)r * p.n);
-    for (uint i = tid; i < n4; i += 256) out[i] = half4(act_mul4(g[i], u[i], p.gelu) * s);
+    for (uint i = tid; i < n4; i += 256) out[i] = half4(act_mul4(g[i], u[i], p.gelu, p.limit) * s);
     if (tid == 0) rs[r] = inv;
 }
 // Fused attention for 128-wide heads, no mask, on the matrix units: q / k / v of type T (the
@@ -1053,8 +1065,10 @@ const GGUF_GPU_TYPES: [GgmlType; 21] = [
 ];
 
 /// GGUF types with a matrix-unit GEMM (`mma_<TYPE>` / `mmag_<TYPE>` in `MMA_SHADER_SRC`): all but
-/// F32, whose values would lose precision as half.
-const GGUF_MMA_TYPES: [GgmlType; 21] = [
+/// F32, whose values would lose precision as half, and MXFP4 (which has the GEMMs but no decode
+/// matvec, so it is not in [`GGUF_GPU_TYPES`]).
+const GGUF_MMA_TYPES: [GgmlType; 22] = [
+    GgmlType::MXFP4,
     GgmlType::F8E4M3,
     GgmlType::F16,
     GgmlType::Q4_1,
@@ -1110,6 +1124,12 @@ fn gguf_shader_tables() -> String {
         "float",
         "kvalues_iq4nl",
         &mut KVALUES_IQ4NL.iter().map(|v| format!("{v}.f")),
+    );
+    arr(
+        &mut s,
+        "float",
+        "kvalues_mxfp4",
+        &mut KVALUES_MXFP4.iter().map(|v| format!("{v}.f")),
     );
     for (name, t) in [
         ("iq2xxs_grid", &IQ2XXS_GRID[..]),
@@ -1319,8 +1339,8 @@ struct MoeDev {
     /// and `ep.0` are then the gate projections alone.
     up: Option<(Id, u32, Id)>,
     n_exp: usize,
-    /// GELU-tanh experts (Gemma 4) rather than SiLU.
-    gelu: bool,
+    /// The experts' activation.
+    act: crate::gpu::MoeAct,
     /// The residency set holding `bufs`, if any (else they are made resident per submission).
     residency: Option<std::sync::Arc<Residency>>,
     release: (MsgVoid, Sel),
@@ -1588,7 +1608,7 @@ impl MetalBackend {
         let gemm_f32 = pipeline(c"gemm_f32")?;
         let gguf_pipes = GGUF_GPU_TYPES
             .iter()
-            .chain(&[GgmlType::F8E4M3])
+            .chain(&[GgmlType::F8E4M3, GgmlType::MXFP4])
             .map(|&k| Ok((k, pipeline(&CString::new(format!("gemm_{}", k.name()))?)?)))
             .collect::<Result<Vec<_>>>()?;
         let group_stats = pipeline(c"group_stats")?;
@@ -2291,7 +2311,7 @@ impl MetalBackend {
         down: &[WeightRef],
         h: usize,
         mi: usize,
-        gelu: bool,
+        act: crate::gpu::MoeAct,
         resident: bool,
     ) -> Option<DeviceWeight> {
         self.mma()?;
@@ -2356,7 +2376,7 @@ impl MetalBackend {
             ep: (std::ptr::null_mut(), std::ptr::null_mut()),
             up: None,
             n_exp: gate_up.len(),
-            gelu,
+            act,
             residency: None,
             release,
         };
@@ -2895,9 +2915,9 @@ impl Backend for MetalBackend {
         down: &[WeightRef],
         h: usize,
         mi: usize,
-        gelu: bool,
+        act: crate::gpu::MoeAct,
     ) -> Option<DeviceWeight> {
-        self.moe_state(gate_up, up, down, h, mi, gelu, true)
+        self.moe_state(gate_up, up, down, h, mi, act, true)
     }
 
     fn upload_moe_transient(
@@ -2907,9 +2927,9 @@ impl Backend for MetalBackend {
         down: &[WeightRef],
         h: usize,
         mi: usize,
-        gelu: bool,
+        act: crate::gpu::MoeAct,
     ) -> Option<DeviceWeight> {
-        self.moe_state(gate_up, up, down, h, mi, gelu, false)
+        self.moe_state(gate_up, up, down, h, mi, act, false)
     }
 
     fn moe(&self, x: &[f32], t: usize, h: usize, mi: usize, routes: &[Vec<(usize, f32)>], dev: &DeviceWeight, y: &mut [f32]) -> bool {
@@ -3036,7 +3056,7 @@ impl Backend for MetalBackend {
                 n: u32,
                 gelu: u32,
                 split: u32,
-                _p: u32,
+                limit: f32,
             }
             e.pipe(m.silu_half);
             e.buf(st.m_gu.id, 0, 0);
@@ -3045,9 +3065,12 @@ impl Backend for MetalBackend {
             e.bytes(
                 &Sh {
                     n: mi as u32,
-                    gelu: md.gelu as u32,
+                    gelu: (md.act == crate::gpu::MoeAct::GeluTanh) as u32,
                     split: if md.up.is_some() { rows as u32 } else { 0 },
-                    _p: 0,
+                    limit: match md.act {
+                        crate::gpu::MoeAct::SiluClamp(l) => l,
+                        _ => 0.0,
+                    },
                 },
                 3,
             );
@@ -3286,7 +3309,7 @@ mod tests {
         let w = bf16(n_out * n_in, &mut seed);
         let q8 = quantize_bf16(&w, n_out, n_in);
         let q4 = quantize_q4(&w, n_out, n_in);
-        let gg: Vec<_> = [GgmlType::Q4_K, GgmlType::Q6_K, GgmlType::IQ4_XS]
+        let gg: Vec<_> = [GgmlType::Q4_K, GgmlType::Q6_K, GgmlType::IQ4_XS, GgmlType::MXFP4]
             .into_iter()
             .map(|k| {
                 let raw = crate::ggml::random_blocks(k, n_out * n_in / k.block_size(), &mut seed);
@@ -3356,14 +3379,24 @@ mod tests {
             .collect();
         // bf16 / Q4 / FP8 (format 0 / 1 / 2) fused, SiLU / GELU; bf16 with gate and up apart (GGUF
         // layout).
-        for (fmt, gelu, split) in [
-            (0, false, false),
-            (1, false, false),
-            (0, true, false),
-            (1, true, false),
-            (0, false, true),
-            (2, false, false),
+        use crate::gpu::MoeAct;
+        for (fmt, act, split) in [
+            (0, MoeAct::Silu, false),
+            (1, MoeAct::Silu, false),
+            (0, MoeAct::GeluTanh, false),
+            (1, MoeAct::GeluTanh, false),
+            (0, MoeAct::Silu, true),
+            (0, MoeAct::SiluClamp(0.5), true),
+            (2, MoeAct::Silu, false),
         ] {
+            // The clamp is absolute: inputs of unit scale, so that some activations are clamped
+            // and some not (rows of very large inputs would all clamp, and cancel out).
+            let x1: Vec<f32> = x
+                .iter()
+                .enumerate()
+                .map(|(i, v)| v / [1e-3, 1.0, 300.0, 2e5][(i / h) % 4])
+                .collect();
+            let x = if matches!(act, MoeAct::SiluClamp(_)) { &x1 } else { &x };
             let (wg, wd): (Vec<WeightRef>, Vec<WeightRef>) = (0..ne)
                 .map(|e| match fmt {
                     0 => (
@@ -3377,11 +3410,11 @@ mod tests {
             let half = |e: usize, i: usize| WeightRef::Bf16(&gu[e * 2 * mi * h + i * mi * h..e * 2 * mi * h + (i + 1) * mi * h]);
             let (sg, su): (Vec<WeightRef>, Vec<WeightRef>) = (0..ne).map(|e| (half(e, 0), half(e, 1))).unzip();
             let dev = match split {
-                false => be.upload_moe(&wg, None, &wd, h, mi, gelu).unwrap(),
-                true => be.upload_moe(&sg, Some(&su), &wd, h, mi, gelu).unwrap(),
+                false => be.upload_moe(&wg, None, &wd, h, mi, act).unwrap(),
+                true => be.upload_moe(&sg, Some(&su), &wd, h, mi, act).unwrap(),
             };
             let mut y = vec![0f32; t * h];
-            assert!(be.moe(&x, t, h, mi, &routes, &dev, &mut y));
+            assert!(be.moe(x, t, h, mi, &routes, &dev, &mut y));
             let fg: Vec<Vec<f32>> = wg.iter().map(|w| dense(w, 2 * mi, h)).collect();
             let fd: Vec<Vec<f32>> = wd.iter().map(|w| dense(w, h, mi)).collect();
             let mut r = vec![0f32; t * h];
@@ -3389,14 +3422,16 @@ mod tests {
                 let xi = &x[i * h..(i + 1) * h];
                 for &(e, wt) in rt {
                     let g = matvec(&fg[e], xi);
-                    let act = |v: f32| {
-                        if gelu {
-                            crate::kernels::gelu_tanh(v)
-                        } else {
-                            v / (1.0 + (-v).exp())
-                        }
-                    };
-                    let a: Vec<f32> = (0..mi).map(|j| act(g[j]) * g[mi + j]).collect();
+                    let a: Vec<f32> = (0..mi)
+                        .map(|j| match act {
+                            MoeAct::GeluTanh => crate::kernels::gelu_tanh(g[j]) * g[mi + j],
+                            MoeAct::Silu => g[j] / (1.0 + (-g[j]).exp()) * g[mi + j],
+                            MoeAct::SiluClamp(l) => {
+                                let v = g[j].min(l);
+                                v / (1.0 + (-v).exp()) * g[mi + j].clamp(-l, l)
+                            }
+                        })
+                        .collect();
                     let o = matvec(&fd[e], &a);
                     for (yv, ov) in r[i * h..(i + 1) * h].iter_mut().zip(&o) {
                         *yv += wt * ov;
@@ -3405,7 +3440,7 @@ mod tests {
             }
 
             let e = row_err(&y, &r, h);
-            assert!(e < 3e-3, "format {fmt} gelu {gelu} split {split}: relative error {e}");
+            assert!(e < 3e-3, "format {fmt} act {act:?} split {split}: relative error {e}");
         }
     }
 }
