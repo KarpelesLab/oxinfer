@@ -1,8 +1,10 @@
 // Single-token decode kernels (see metal_decode.rs). Appended to the library after SHADER_SRC and
 // GGUF_SHADER_SRC, whose dequantizers (`load`, `h2f`, ...) the generic matvec reuses.
 //
-// No reassociation: the multi-token kernels (speculative verification) must compute every token
-// exactly as the single-token ones, whatever the loop structure around the same expressions.
+// No reassociation in the kernels decoding plans use: the multi-token kernels (speculative
+// verification) must compute every token exactly as the single-token ones, whatever the loop
+// structure around the same expressions. The few-rows matvecs and the MoE expert kernels, outside
+// the plans' multi-token steps, keep the default (fast) math.
 #pragma clang fp reassociate(off)
 
 // ---- Matrix-vector products ---------------------------------------------------------------------
@@ -322,6 +324,7 @@ MV_SIG(NAME) { threadgroup float red[2 * NR * KS]; \
     MGen<W> f = { W{ { wb + p.w_off, p.gpr } } }; MGen<W> f2 = { W{ { wb2 + p.w2_off, p.gpr } } }; \
     mv_body<MGen<W>, X32, 32, NR, KS>(f, f2, x, y, p, tg, sg, lane, red, gate); }
 
+#pragma clang fp reassociate(on)
 // ---- The same for a few input rows (1 to 4, `p.ldy`; rows of x and y are n_in / n_out apart), a
 // DSpark draft's block of 3 or a speculative round's committed tokens. Each weight chunk is read
 // from memory once for all rows: GGUF formats dequantize it once into registers (the GEMMs'
@@ -436,6 +439,7 @@ MV_SIG(NAME) { threadgroup float red[8 * NR * KS]; \
     W f = W{ { wb + p.w_off, p.gpr } }; W f2 = W{ { wb2 + p.w2_off, p.gpr } }; \
     mvtl_body<W, NR, KS>(f, f2, x, y, p, tg, sg, lane, red); }
 
+#pragma clang fp reassociate(off)
 // ---- Matvecs of several tokens (speculative verification in a decoding plan): the weights are read once for up to
 // TT tokens (x and y rows `sx` / `sy` floats apart, the AddGated gate `sgate` apart). Every
 // (token, row) is computed with exactly the single-token kernel's arithmetic (same chunks per
@@ -1004,6 +1008,7 @@ kernel void dec_glu_t(device const float* g [[buffer(0)]], device const float* u
     out[(ulong)t * ts.z + i] = act * u[(ulong)t * ts.y + i];
 }
 
+#pragma clang fp reassociate(on)
 // ---- MoE experts of one token -------------------------------------------------------------------
 // Expert e's weights are at the addresses tab[e] (data, scales, affine offsets). `sel` holds the k
 // chosen expert ids (as uint bits) then their weights. Pair kernels: threadgroup (row, slot s)
@@ -1066,6 +1071,7 @@ kernel void dec_topk(device const float* logits [[buffer(0)]], device float* sel
     }
 }
 
+#pragma clang fp reassociate(off)
 // ---- Elementwise: p.x = 0 scale (a * p.y), 1 softcap (tanh(a / p.y) * p.y), 2 combine
 // ((a * p.y + b * p.z) * p.w).
 kernel void dec_ew(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], device float* out [[buffer(2)]],

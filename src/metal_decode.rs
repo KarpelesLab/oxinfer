@@ -175,6 +175,8 @@ pub(crate) fn shader_src() -> String {
             }
         }
     }
+    // The sources appended after these (the matrix-unit GEMMs) keep the default (fast) math.
+    s.push_str("#pragma clang fp reassociate(on)\n");
     s
 }
 
