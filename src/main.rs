@@ -1783,8 +1783,10 @@ fn run_deepseek4(mut args: Args) -> Result<()> {
     if !mm_request(&args).is_empty() {
         bail!("DeepSeek V4 takes text only");
     }
+    // The draft (11 GB, mostly experts of which a pass reads a few) is mapped when the target
+    // streams, so that its unused experts take no memory.
     let draft_files = match &draft {
-        Some(d) => Some((d, safetensors::ModelFiles::open(d, true)?)),
+        Some(d) => Some((d, safetensors::ModelFiles::open(d, !args.stream)?)),
         None => None,
     };
     let draft = match &draft_files {

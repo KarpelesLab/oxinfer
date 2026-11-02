@@ -1272,12 +1272,13 @@ impl Engine {
                 };
                 let lm = match dspark {
                     Some(d) => {
-                        let df = arena.keep(ModelFiles::open(&d, true)?);
+                        // Mapped when the target streams: a pass reads few of the draft's experts.
+                        let df = arena.keep(ModelFiles::open(&d, streamer.is_none())?);
                         let dr = Dspark::load(&d, df, c.hidden_size, c.vocab_size, opts.quant)
                             .with_context(|| format!("DSpark draft {}", d.display()))?;
                         let dr: &'static Dspark<'static> = arena.keep(dr);
                         let dopts = DsparkOptions {
-                            draft_tokens: opts.draft_tokens.unwrap_or(dr.cfg.max_draft()),
+                            draft_tokens: opts.draft_tokens.unwrap_or(crate::dspark::DS4_DRAFT_TOKENS),
                             stop: chat::with_turn_end(&chat::DeepSeekChat, &tok, eos.clone()),
                             cost_aware: false,
                             p_min: opts

@@ -12,7 +12,7 @@ formats may still change.
 
 Local LLM inference in pure Rust: Gemma 4 (text, images, video, audio), Qwen 3.5 / 3.6 / 3.8
 (text, images, video), Mistral Large 4 (text, images; 1T parameters streamed from storage),
-Gemma 3 and Qwen 3 today, more model families as they come; also
+DeepSeek V4 Flash (text; 284B parameters), Gemma 3 and Qwen 3 today, more model families as they come; also
 embeddings, Stable Diffusion, FLUX.1 Kontext, Qwen-Image-Edit, OmniGen2, BAGEL and Step1X-Edit image editing, Whisper speech to text and Orpheus text to speech. No BLAS, no ML framework: weights are read straight out
 of the safetensors files (HuggingFace checkpoints or MLX 4-bit ones) and every operation
 (matmuls, attention, norms, RoPE, sampling) is implemented here, with hand-written SIMD kernels
@@ -92,6 +92,7 @@ optional.
 | canopylabs/orpheus-3b-0.1-ft (ungated copy: unsloth/orpheus-3b-0.1-ft) + hubertsiuzdak/snac_24khz | 3.3B + 20M | 6.6 GB + 80 MB (fp32) | text to speech; greedy tokens and waveform match transformers + snac (see [Text to speech](#text-to-speech-orpheus)); also any Llama 3.x as a text model |
 | Orpheus GGUF (isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF, lex-au/Orpheus-3b-FT-Q8_0.gguf) | 3.3B | 2.4 / 4.0 GB | text to speech; whisper-small WER 0-1% like the safetensors model |
 | mistralai/Mistral-Large-4-1T-A52B; unsloth/Mistral-Large-4-1T-A52B-GGUF | 1T MoE, 52B active (+ 2B vision) | 1.06 TB (FP8) / 378 GB (GGUF UD-Q2_K_XL) | text and images; streamed from storage when larger than RAM (1.3-1.5 tok/s on a 128 GB M5 Max; DSpark speculative decoding); matches transformers (tiny random checkpoints with every feature, KL < 1e-9) and llama.cpp on the real GGUF (same next tokens, same greedy text); see [Mistral Large 4](#mistral-large-4-1t-a52b) |
+| deepseek-ai/DeepSeek-V4-Flash as GGUF (unsloth/DeepSeek-V4-Flash-GGUF) | 284B MoE, 13B active | 97 GB (UD-Q2_K_XL) | text, tool calls; streamed from storage when larger than 60% of RAM (5-10 tok/s on a 128 GB M5 Max); matches DeepSeek's own inference code (tiny random checkpoints, max logit diff 8e-5, KL 3e-11) and llama.cpp on the real GGUF (same greedy text); DSpark speculative decoding (DeepSeek-V4-Flash-DSpark); see [DeepSeek V4](#deepseek-v4-flash) |
 | Llama 3.x GGUF (bartowski/Llama-3.2-1B-Instruct-GGUF, ...) | 1.2B tested | 0.8 GB (Q4_K_M) - 2.5 GB (F16) | text; F16 file bit-identical to the safetensors model, quantized files match llama.cpp (see [Llama 3 GGUF](#llama-3-gguf)) |
 | canopylabs/orpheus-3b-0.1-pretrained (ungated copy: unsloth/orpheus-3b-0.1-pretrained) | 3.3B | 6.6 GB | voice cloning from a reference clip (SNAC encoder); prompt and greedy tokens match the canopylabs notebook + transformers |
 | canopylabs/3b-{fr,de,ko,hi,zh,es_it}-ft-research_release (ungated copies: Our-Org-2/...) | 3.3B | 13 GB (fp32) | multilingual text to speech (French and German tested; French greedy tokens match transformers) |

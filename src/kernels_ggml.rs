@@ -12,7 +12,10 @@
 //! per-16 scales.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use super::{Act, GgmlType, GgufMatrix, QK_K, q3k_scales, tables::KVALUES_IQ4NL};
+use super::{
+    Act, GgmlType, GgufMatrix, QK_K, q3k_scales,
+    tables::{KVALUES_IQ4NL, KVALUES_MXFP4},
+};
 use crate::kernels::simd::{f16x4_to_f32, sdot};
 use crate::quant::PairAct;
 use crate::quant::f16_to_f32;
@@ -66,6 +69,7 @@ pub(super) unsafe fn rows<const TC: usize>(m: &GgufMatrix, x: &Act, y: *mut f32,
         GgmlType::Q8_0 => q8_0::<TC>,
         GgmlType::Q4_0 => q32::<TC, Q4_0>,
         GgmlType::IQ4_NL => q32::<TC, IQ4_NL>,
+        GgmlType::MXFP4 => q32::<TC, MXFP4>,
         GgmlType::Q4_1 => q32::<TC, Q4_1>,
         GgmlType::Q5_0 => q32::<TC, Q5_0>,
         GgmlType::Q5_1 => q32::<TC, Q5_1>,
@@ -794,23 +798,37 @@ const IQ4_NL: u8 = 1;
 const Q4_1: u8 = 2;
 const Q5_0: u8 = 3;
 const Q5_1: u8 = 4;
+const MXFP4: u8 = 5;
 
-/// Q4_0, IQ4_NL, Q4_1, Q5_0 and Q5_1 (`K`): blocks of 32 with an f16 scale (and an f16 min for
-/// Q4_1 / Q5_1), nibbles plus, for Q5, a fifth bit per element in a 32-bit word; four blocks per step.
+/// The scale of the block at `b`: f16, or MXFP4's E8M0 byte (halved, its values doubled).
+#[inline(always)]
+unsafe fn scale32<const K: u8>(b: *const u8) -> f32 {
+    if K == MXFP4 { super::e8m0_half(*b) } else { f16p(b) }
+}
+
+/// Q4_0, IQ4_NL, Q4_1, Q5_0, Q5_1 and MXFP4 (`K`): blocks of 32 with an f16 scale (and an f16 min
+/// for Q4_1 / Q5_1; an E8M0 scale byte for MXFP4), nibbles plus, for Q5, a fifth bit per element in
+/// a 32-bit word; four blocks per step. IQ4_NL and MXFP4 map their nibbles through a table.
 unsafe fn q32<const TC: usize, const K: u8>(row: *const u8, n_in: usize, x: &Act) -> [f32; TC] {
     let (tsz, qs) = match K {
         Q4_0 | IQ4_NL => (18, 2),
+        MXFP4 => (17, 1),
         Q4_1 => (20, 4),
         Q5_0 => (22, 6),
         _ => (24, 8),
     };
+    let table = K == IQ4_NL || K == MXFP4;
     let has_min = K == Q4_1 || K == Q5_1;
     // Nibbles are centered by `qoff` (Q4_1 / Q5_1 like Q4_0 / Q5_0; the min absorbs `d * qoff`).
     let qoff = if K == Q5_0 || K == Q5_1 { 16.0 } else { 8.0 };
     let bpr = n_in / 32;
     let zero = vdupq_n_s32(0);
     let m4 = vdupq_n_u8(0x0F);
-    let kv = vld1q_s8(KVALUES_IQ4NL.as_ptr());
+    let kv = vld1q_s8(if K == MXFP4 {
+        KVALUES_MXFP4.as_ptr()
+    } else {
+        KVALUES_IQ4NL.as_ptr()
+    });
     // The 32 weights of the block at `b` as two vectors (elements 0..16, 16..32).
     let unpack = |b: *const u8| -> (int8x16_t, int8x16_t) {
         let v = vld1q_u8(b.add(qs));
@@ -822,10 +840,11 @@ unsafe fn q32<const TC: usize, const K: u8>(row: *const u8, n_in: usize, x: &Act
             hi = vorrq_u8(hi, vandq_u8(h1, b16));
         }
         let (lo, hi) = (vreinterpretq_s8_u8(lo), vreinterpretq_s8_u8(hi));
-        match K {
-            IQ4_NL => (vqtbl1q_s8(kv, vreinterpretq_u8_s8(lo)), vqtbl1q_s8(kv, vreinterpretq_u8_s8(hi))),
+        if table {
+            (vqtbl1q_s8(kv, vreinterpretq_u8_s8(lo)), vqtbl1q_s8(kv, vreinterpretq_u8_s8(hi)))
+        } else {
             // The offset (8 or 16) is subtracted from the integer sums.
-            _ => (lo, hi),
+            (lo, hi)
         }
     };
     let mut acc = [vdupq_n_f32(0.0); TC];
@@ -835,11 +854,23 @@ unsafe fn q32<const TC: usize, const K: u8>(row: *const u8, n_in: usize, x: &Act
         let (mut dh, mut mh) = ([0u16; 4], [0u16; 4]);
         let mut w = [vdupq_n_s8(0); 8];
         for k in 0..4 {
-            dh[k] = rd16(b.add(tsz * k));
-            mh[k] = rd16(b.add(tsz * k + 2));
+            if K != MXFP4 {
+                dh[k] = rd16(b.add(tsz * k));
+                mh[k] = rd16(b.add(tsz * k + 2));
+            }
             (w[2 * k], w[2 * k + 1]) = unpack(b.add(tsz * k));
         }
-        let dv = f16x4_to_f32(dh.as_ptr());
+        let dv = if K == MXFP4 {
+            let d = [
+                scale32::<K>(b),
+                scale32::<K>(b.add(tsz)),
+                scale32::<K>(b.add(2 * tsz)),
+                scale32::<K>(b.add(3 * tsz)),
+            ];
+            vld1q_f32(d.as_ptr())
+        } else {
+            f16x4_to_f32(dh.as_ptr())
+        };
         let mv = if has_min {
             vaddq_f32(f16x4_to_f32(mh.as_ptr()), vmulq_n_f32(dv, qoff))
         } else {
@@ -856,7 +887,7 @@ unsafe fn q32<const TC: usize, const K: u8>(row: *const u8, n_in: usize, x: &Act
                 );
             }
             let mut s = vpaddq_s32(vpaddq_s32(a[0], a[1]), vpaddq_s32(a[2], a[3]));
-            if K != IQ4_NL {
+            if !table {
                 let xi = vld1q_s32(x.i.add(c * bpr + blk));
                 s = vsubq_s32(s, if qoff == 16.0 { vshlq_n_s32::<4>(xi) } else { vshlq_n_s32::<3>(xi) });
             }
@@ -872,11 +903,11 @@ unsafe fn q32<const TC: usize, const K: u8>(row: *const u8, n_in: usize, x: &Act
     while blk < bpr {
         let b = row.add(blk * tsz);
         let (w0, w1) = unpack(b);
-        let d = f16p(b);
+        let d = scale32::<K>(b);
         for c in 0..TC {
             let xq = x.q.add(c * n_in + blk * 32);
             let mut s = vaddvq_s32(sdot(sdot(zero, w0, vld1q_s8(xq)), w1, vld1q_s8(xq.add(16))));
-            if K != IQ4_NL {
+            if !table {
                 s -= qoff as i32 * *x.i.add(c * bpr + blk);
             }
             out[c] += s as f32 * d * *x.s.add(c * bpr + blk);

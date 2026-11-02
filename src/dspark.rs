@@ -368,6 +368,9 @@ pub const DEVICE_BY_DEFAULT: bool = true;
 /// the draft model gives at least 0.95 are accepted 98% of the time, 0.7-0.95 75%, 0.3-0.7 40%.
 pub const STREAM_P_MIN: f32 = 0.85;
 
+/// Default drafts per round with a DeepSeek V4 draft (its block holds 5): see the README.
+pub const DS4_DRAFT_TOKENS: usize = 3;
+
 /// The DSpark draft GGUF beside GGUF model `model` (a `dspark*.gguf` file in its folder or the
 /// folder above, as unsloth lays them out), if there is exactly one.
 pub fn draft_for(model: &Path) -> Option<PathBuf> {
