@@ -133,6 +133,11 @@ pub enum Op<'a> {
         scale: f32,
         window: Option<usize>,
         gate: Option<(View, usize)>,
+        /// Multi-token plans of a DSpark draft's block: `(causal, window)`: every token of the step
+        /// sees the cached positions before the step's first (the last `window`, if not 0) and
+        /// the step's tokens (those up to its own when `causal`), instead of the positions up to
+        /// its own.
+        block: Option<(bool, usize)>,
     },
     /// Causal depthwise conv of kernel `kc` over `dim` channels with SiLU: `out = silu(sum of
     /// w[ch][j] * input j)`, inputs being the `kc - 1` earlier ones in recurrent state `state`
@@ -293,6 +298,8 @@ pub struct Graph<'a> {
     /// The final hidden state read back after the pass.
     pub hidden: View,
     pub n_hidden: usize,
+    /// Floats of the input per token (0: `n_hidden`).
+    pub n_input: usize,
     /// Ops from this index on compute the logits (skipped when the caller wants the hidden
     /// state only).
     pub head_from: usize,
@@ -310,6 +317,9 @@ pub struct Graph<'a> {
     /// Intervention parameters (`crate::intervene`): the per-step part (`hot`, floats) and the
     /// part refreshed only when its key changes (`cold`), see [`Step::params`].
     pub params: Option<((View, usize), (View, usize))>,
+    /// A buffer the ops copy residual streams into (`n` floats per token), read back after the
+    /// pass ([`Step::capture`]; DSpark target features).
+    pub capture: Option<(View, usize)>,
 }
 
 impl Graph<'_> {
@@ -320,6 +330,7 @@ impl Graph<'_> {
             input: View { buf: 0, off: 0 },
             hidden: View { buf: 0, off: 0 },
             n_hidden: 0,
+            n_input: 0,
             head_from: 0,
             logits: None,
             kv: Vec::new(),
@@ -327,6 +338,7 @@ impl Graph<'_> {
             input2: None,
             states: Vec::new(),
             params: None,
+            capture: None,
         }
     }
     /// Adds an activation buffer of `n` floats.
@@ -345,14 +357,18 @@ impl Default for Graph<'_> {
     }
 }
 
-/// One step's inputs and outputs.
+/// One step's inputs and outputs. A multi-token plan ([`DecodePlan::tokens`] > 1) runs `t` tokens
+/// at positions `pos..pos + t` (each attending to the ones before it), with every per-token input
+/// and output below holding `t` rows.
 pub struct Step<'s, 'c> {
-    /// Tokens already in the caches (the position of this token).
+    /// Tokens already in the caches (the position of the first token).
     pub pos: usize,
-    /// cos then sin of this token's rotary angles for each table of `Graph::rope_halves`, one
-    /// table after the other.
+    /// Tokens of this step (1 for single-token plans).
+    pub t: usize,
+    /// For each table of `Graph::rope_halves`, one after the other: per token, cos then sin of
+    /// its rotary angles.
     pub rope_cs: &'s [f32],
-    /// The input embedding.
+    /// The input embeddings.
     pub x: &'s [f32],
     /// The second input (`Graph::input2`), if the graph has one.
     pub x2: &'s [f32],
@@ -367,12 +383,29 @@ pub struct Step<'s, 'c> {
     /// [`Graph::params`] values: hot (every step) and cold with its key (copied when the key
     /// differs from the last step's).
     pub params: Option<(&'s [f32], &'s [f32], u64)>,
+    /// Receives the [`Graph::capture`] rows (`[t, n]`).
+    pub capture: Option<&'s mut [f32]>,
+    /// The step's keys and values are scratch (a DSpark draft block): they are not appended to
+    /// the host caches, and the next step overwrites them.
+    pub scratch: bool,
 }
 
 /// A compiled graph.
 pub trait DecodePlan: Send + Sync {
-    /// Runs one token. Returns false (with the host caches unchanged) when the device failed.
+    /// Runs one step. Returns false (with the host caches unchanged) when the device failed.
     fn step(&self, slot: &mut Slot, s: Step) -> bool;
+    /// Most tokens of a step.
+    fn tokens(&self) -> usize {
+        1
+    }
+    /// Multi-token plans: runs the recurrent-state ops (Gated DeltaNet conv and rule) of the last
+    /// step again over its first `keep` tokens, from `states` the caller put back as they were
+    /// before that step (the inputs those ops read are kept in per-layer buffers), so a rewind
+    /// inside the step leaves exactly the states one-token steps would have. False if the plan
+    /// cannot.
+    fn replay_recurrent(&self, _slot: &mut Slot, _states: &mut [&mut [f32]], _keep: usize) -> bool {
+        false
+    }
 }
 
 /// Per-session device state of a plan (the KV cache copies). Cloning a session starts its copy

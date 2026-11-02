@@ -1,5 +1,9 @@
 // Single-token decode kernels (see metal_decode.rs). Appended to the library after SHADER_SRC and
 // GGUF_SHADER_SRC, whose dequantizers (`load`, `h2f`, ...) the generic matvec reuses.
+//
+// No reassociation: the multi-token kernels (speculative verification) must compute every token
+// exactly as the single-token ones, whatever the loop structure around the same expressions.
+#pragma clang fp reassociate(off)
 
 // ---- Matrix-vector products ---------------------------------------------------------------------
 // y[r] = W[r] . x for one input row. A threadgroup computes NR consecutive rows with KS SIMD-groups
@@ -432,6 +436,182 @@ MV_SIG(NAME) { threadgroup float red[8 * NR * KS]; \
     W f = W{ { wb + p.w_off, p.gpr } }; W f2 = W{ { wb2 + p.w2_off, p.gpr } }; \
     mvtl_body<W, NR, KS>(f, f2, x, y, p, tg, sg, lane, red); }
 
+// ---- Matvecs of several tokens (speculative verification in a decoding plan): the weights are read once for up to
+// TT tokens (x and y rows `sx` / `sy` floats apart, the AddGated gate `sgate` apart). Every
+// (token, row) is computed with exactly the single-token kernel's arithmetic (same chunks per
+// lane, same reduction order), so a verification pass reproduces one-token decoding bit for bit.
+struct MVK { MV m; uint ntok; uint sx; uint sy; uint sgate; };
+// One chunk of one row against every token: a[t][r] += row . x_t over the chunk, with the
+// single-token kernel's arithmetic. The generic version calls `mdot` per token; the 4- and 8-bit
+// formats below convert the chunk's quants to floats once for all the tokens (the conversions do
+// not depend on x, so every product and sum is the one `mdot` computes).
+template <typename X, int TT, int NR, typename F>
+inline void mvk_rows(F f, uint row, int r, uint c, device const float* x, uint sx, uint ntok, thread float (&a)[TT][NR]) {
+    for (int t = 0; t < TT; t++) {
+        if (uint(t) >= ntok) continue;
+        X xr;
+        xload(x + (ulong)t * sx, c, xr);
+        a[t][r] += mdot(f, row, c, xr);
+    }
+}
+// The masked nibbles of a word as floats (see nib_acc): low nibbles in `l`, high in `h`.
+inline void nib_dec(uint w, thread float4& l, thread float4& h) {
+    l = float4(float(w & 0xFu), float(w & 0xF00u), float(w & 0xF0000u), float(w & 0xF000000u));
+    h = float4(float(w & 0xF0u), float(w & 0xF000u), float(w & 0xF00000u), float(w & 0xF0000000u));
+}
+inline float q4_dot(thread const float4* nl, thread const float4* nh, thread const X32& xr) {
+    float4 lo = 0.f, hi = 0.f;
+    for (int i = 0; i < 4; i++) { lo += xr.v[i] * nl[i]; hi += xr.v[4 + i] * nh[i]; }
+    return dot(lo, NIB_LO) + dot(hi, NIB_HI);
+}
+template <typename X, int TT, int NR>
+inline void mvk_rows(MQ4 f, uint row, int r, uint c, device const float* x, uint sx, uint ntok, thread float (&a)[TT][NR]) {
+    uint4 u = *(device const uint4*)(f.q + (ulong)row * (f.n_in / 2) + c * 16);
+    float d = float(f.s[(ulong)row * (f.n_in / 32) + c]);
+    float o = f.gk != 0 ? as_type<float>(uint(f.o[(ulong)row * f.gpr + c / f.gk]) << 16) : 0.f;
+    float4 nl[4], nh[4];
+    nib_dec(u.x, nl[0], nh[0]);
+    nib_dec(u.y, nl[1], nh[1]);
+    nib_dec(u.z, nl[2], nh[2]);
+    nib_dec(u.w, nl[3], nh[3]);
+    for (int t = 0; t < TT; t++) {
+        if (uint(t) >= ntok) continue;
+        X32 xr;
+        xload(x + (ulong)t * sx, c, xr);
+        float s = d * (q4_dot(nl, nh, xr) - 8.f * xsum32(xr));
+        if (f.gk != 0) s += o * xsum32(xr);
+        a[t][r] += s;
+    }
+}
+template <typename X, int TT, int NR>
+inline void mvk_rows(MQ4_0 f, uint row, int r, uint c, device const float* x, uint sx, uint ntok, thread float (&a)[TT][NR]) {
+    device const ushort* b = (device const ushort*)(f.w + (ulong)row * f.rb + c * 18);
+    float d = float(as_type<half>(b[0]));
+    float4 nl[4], nh[4];
+    nib_dec(ld32u(b + 1), nl[0], nh[0]);
+    nib_dec(ld32u(b + 3), nl[1], nh[1]);
+    nib_dec(ld32u(b + 5), nl[2], nh[2]);
+    nib_dec(ld32u(b + 7), nl[3], nh[3]);
+    for (int t = 0; t < TT; t++) {
+        if (uint(t) >= ntok) continue;
+        X32 xr;
+        xload(x + (ulong)t * sx, c, xr);
+        a[t][r] += d * (q4_dot(nl, nh, xr) - 8.f * xsum32(xr));
+    }
+}
+template <typename X, int TT, int NR>
+inline void mvk_rows(MQ8 f, uint row, int r, uint c, device const float* x, uint sx, uint ntok, thread float (&a)[TT][NR]) {
+    uint4 u = *(device const uint4*)(f.q + (ulong)row * f.n_in + c * 16);
+    float d = f.s[(ulong)row * (f.n_in / 32) + c / 2];
+    float4 w0 = float4(as_type<char4>(u.x)), w1 = float4(as_type<char4>(u.y)), w2 = float4(as_type<char4>(u.z)), w3 = float4(as_type<char4>(u.w));
+    for (int t = 0; t < TT; t++) {
+        if (uint(t) >= ntok) continue;
+        X16 xr;
+        xload(x + (ulong)t * sx, c, xr);
+        float4 s = w0 * xr.v[0];
+        s = fma(w1, xr.v[1], s);
+        s = fma(w2, xr.v[2], s);
+        s = fma(w3, xr.v[3], s);
+        a[t][r] += d * hsum(s);
+    }
+}
+template <typename X, int TT, int NR>
+inline void mvk_rows(MQ8_0 f, uint row, int r, uint c, device const float* x, uint sx, uint ntok, thread float (&a)[TT][NR]) {
+    device const ushort* b = (device const ushort*)(f.w + (ulong)row * f.rb + c * 34);
+    float d = float(as_type<half>(b[0]));
+    float4 w[8];
+    for (int i = 0; i < 8; i++) w[i] = c4(b[1 + 2 * i], b[2 + 2 * i]);
+    for (int t = 0; t < TT; t++) {
+        if (uint(t) >= ntok) continue;
+        X32 xr;
+        xload(x + (ulong)t * sx, c, xr);
+        float4 s = w[0] * xr.v[0];
+        for (int i = 1; i < 8; i++) s = fma(w[i], xr.v[i], s);
+        a[t][r] += d * hsum(s);
+    }
+}
+template <int NR, int KS>
+inline void mvk_finish(thread float* acc, thread float* acc2, device float* y, uint mode, uint r0, uint n_out, uint sg, uint lane,
+                       threadgroup float* red, device const float* gate) {
+    for (int r = 0; r < NR; r++) { acc[r] = simd_sum(acc[r]); acc2[r] = simd_sum(acc2[r]); }
+    bool write = true;
+    if (KS > 1) {
+        if (lane == 0)
+            for (int r = 0; r < NR; r++) { red[sg * 2 * NR + r] = acc[r]; red[sg * 2 * NR + NR + r] = acc2[r]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        write = sg == 0;
+        if (write)
+            for (int r = 0; r < NR; r++) {
+                float a = 0.f, b = 0.f;
+                for (int s = 0; s < KS; s++) { a += red[s * 2 * NR + r]; b += red[s * 2 * NR + NR + r]; }
+                acc[r] = a; acc2[r] = b;
+            }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (write && lane < NR && r0 + lane < n_out) {
+        float a = acc[0], b = acc2[0];
+        for (int r = 1; r < NR; r++) if (lane == uint(r)) { a = acc[r]; b = acc2[r]; }
+        uint o = r0 + lane;
+        if (mode == 0) y[o] = a;
+        else if (mode == 1) y[o] += a;
+        else if (mode == 2) y[o] = a / (1.0f + exp(-a)) * b;
+        else if (mode == 3) {
+            float t = 0.7978845608f * (a + 0.044715f * a * a * a);
+            y[o] = 0.5f * a * (1.0f + precise::tanh(t)) * b;
+        } else y[o] += a / (1.0f + exp(-gate[0]));
+    }
+}
+template <typename F, typename X, uint CH, int NR, int KS, int TT>
+inline void mvk_body(F f, F f2, device const float* x, device float* y, constant MVK& q, uint tg, uint sg, uint lane,
+                     threadgroup float* red, device const float* gate) {
+    constant MV& p = q.m;
+    bool pair = p.mode == 2 || p.mode == 3;
+    uint r0 = tg * NR;
+    uint rows[NR];
+    for (int r = 0; r < NR; r++) rows[r] = min(r0 + r, p.n_out - 1);
+    uint nch = p.n_in / CH;
+    float a[TT][NR], b[TT][NR];
+    for (int t = 0; t < TT; t++)
+        for (int r = 0; r < NR; r++) { a[t][r] = 0.f; b[t][r] = 0.f; }
+    for (uint c = sg * 32 + lane; c < nch; c += KS * 32) {
+        for (int r = 0; r < NR; r++) {
+            mvk_rows<X, TT, NR>(f, rows[r], r, c, x, q.sx, q.ntok, a);
+            if (pair) mvk_rows<X, TT, NR>(f2, rows[r], r, c, x, q.sx, q.ntok, b);
+        }
+    }
+    for (int t = 0; t < TT; t++) {
+        if (uint(t) >= q.ntok) break;
+        float acc[NR], acc2[NR];
+        for (int r = 0; r < NR; r++) { acc[r] = 0.f; acc2[r] = 0.f; acc[r] += 1.f * a[t][r]; acc2[r] += 1.f * b[t][r]; }
+        mvk_finish<NR, KS>(acc, acc2, y + (ulong)t * q.sy, p.mode, r0, p.n_out, sg, lane, red, gate + (ulong)t * q.sgate);
+    }
+}
+#define MVK_SIG(NAME) \
+kernel void NAME(device const uchar* wb [[buffer(0)]], device const uchar* sb [[buffer(1)]], device const float* x [[buffer(2)]], \
+                 device float* y [[buffer(3)]], constant MVK& q [[buffer(4)]], device const uchar* wb2 [[buffer(5)]], \
+                 device const uchar* sb2 [[buffer(6)]], device const uchar* ob [[buffer(7)]], device const uchar* ob2 [[buffer(8)]], \
+                 device const float* gate [[buffer(9)]], \
+                 uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], \
+                 uint lane [[thread_index_in_simdgroup]])
+#define MVK_RAW(NAME, T, X, CH, NR, KS, TT) \
+MVK_SIG(NAME) { threadgroup float red[2 * NR * KS]; constant MV& p = q.m; \
+    T f = { wb + p.w_off, p.gpr }; T f2 = { wb2 + p.w2_off, p.gpr }; \
+    mvk_body<T, X, CH, NR, KS, TT>(f, f2, x, y, q, tg, sg, lane, red, gate); }
+#define MVK_Q8(NAME, NR, KS, TT) \
+MVK_SIG(NAME) { threadgroup float red[2 * NR * KS]; constant MV& p = q.m; \
+    MQ8 f = { (device const char*)(wb + p.w_off), (device const float*)(sb + p.s_off), p.n_in }; \
+    MQ8 f2 = { (device const char*)(wb2 + p.w2_off), (device const float*)(sb2 + p.s2_off), p.n_in }; \
+    mvk_body<MQ8, X16, 16, NR, KS, TT>(f, f2, x, y, q, tg, sg, lane, red, gate); }
+#define MVK_Q4(NAME, NR, KS, TT) \
+MVK_SIG(NAME) { threadgroup float red[2 * NR * KS]; constant MV& p = q.m; \
+    MQ4 f = { wb + p.w_off, (device const half*)(sb + p.s_off), p.n_in, (device const ushort*)(ob + p.o_off), p.gpr, p.gk }; \
+    MQ4 f2 = { wb2 + p.w2_off, (device const half*)(sb2 + p.s2_off), p.n_in, (device const ushort*)(ob2 + p.o2_off), p.gpr, p.gk }; \
+    mvk_body<MQ4, X32, 32, NR, KS, TT>(f, f2, x, y, q, tg, sg, lane, red, gate); }
+#define MVK_GEN(NAME, W, NR, KS, TT) \
+MVK_SIG(NAME) { threadgroup float red[2 * NR * KS]; constant MV& p = q.m; \
+    MGen<W> f = { W{ { wb + p.w_off, p.gpr } } }; MGen<W> f2 = { W{ { wb2 + p.w2_off, p.gpr } } }; \
+    mvk_body<MGen<W>, X32, 32, NR, KS, TT>(f, f2, x, y, q, tg, sg, lane, red, gate); }
+
 // ---- RMSNorm over rows of n: out = x * rsqrt(mean(x^2) + eps) * w (w optional; `add`: out += ...).
 // One threadgroup per row.
 struct NP { uint n; float eps; uint has_w; uint add; uint x_stride; uint o_stride; float pre; uint _p; };
@@ -485,6 +665,10 @@ kernel void dec_rms_norm(device const float* x [[buffer(0)]], device float* out 
 // dimension (hd threads). cos / sin of the position come from the host (`cs`: half cos, half sin).
 struct QP { uint nh; uint nkv; uint hd; uint half_rot; uint q_stride; uint k_off; uint v_off; uint pos;
             uint interleaved; uint has_qn; uint has_kn; float eps; uint v_norm; uint v_from_k; uint _p0; uint _p1; };
+template <typename CS>
+inline void qk_rope_body(device const float* qkv, device float* qo, device float* kc, device float* vc, device const float* qn,
+                         device const float* kn, constant QP& p, uint pos, CS cs, uint h, uint i, uint sg, uint lane,
+                         threadgroup float* buf, threadgroup float* red);
 kernel void dec_qk_rope(device const float* qkv [[buffer(0)]], device float* qo [[buffer(1)]], device float* kc [[buffer(2)]],
                         device float* vc [[buffer(3)]], device const float* qn [[buffer(4)]], device const float* kn [[buffer(5)]],
                         constant QP& p [[buffer(6)]], constant float* cs [[buffer(7)]],
@@ -492,6 +676,24 @@ kernel void dec_qk_rope(device const float* qkv [[buffer(0)]], device float* qo 
                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float buf[512];
     threadgroup float red[16];
+    qk_rope_body(qkv, qo, kc, vc, qn, kn, p, p.pos, cs, h, i, sg, lane, buf, red);
+}
+// Several tokens (grid y): token t at position pos + t, inputs and query outputs `ts.x` / `ts.y`
+// floats apart, its cos / sin `ts.z` floats apart in `cs`.
+kernel void dec_qk_rope_t(device const float* qkv [[buffer(0)]], device float* qo [[buffer(1)]], device float* kc [[buffer(2)]],
+                          device float* vc [[buffer(3)]], device const float* qn [[buffer(4)]], device const float* kn [[buffer(5)]],
+                          constant QP& p [[buffer(6)]], device const float* cs [[buffer(7)]], constant uint4& ts [[buffer(8)]],
+                          uint2 tg [[threadgroup_position_in_grid]], uint i [[thread_index_in_threadgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float buf[512];
+    threadgroup float red[16];
+    uint t = tg.y;
+    qk_rope_body(qkv + (ulong)t * ts.x, qo + (ulong)t * ts.y, kc, vc, qn, kn, p, p.pos + t, cs + (ulong)t * ts.z, tg.x, i, sg, lane, buf, red);
+}
+template <typename CS>
+inline void qk_rope_body(device const float* qkv, device float* qo, device float* kc, device float* vc, device const float* qn,
+                         device const float* kn, constant QP& p, uint pos, CS cs, uint h, uint i, uint sg, uint lane,
+                         threadgroup float* buf, threadgroup float* red) {
     uint hd = p.hd;
     uint kind = h < p.nh ? 0 : (h < p.nh + p.nkv ? 1 : 2); // query, key, value head
     uint hh = kind == 0 ? h : (kind == 1 ? h - p.nh : h - p.nh - p.nkv);
@@ -510,7 +712,7 @@ kernel void dec_qk_rope(device const float* qkv [[buffer(0)]], device float* qo 
         else if (kind == 1) v *= kn[i];
     }
     if (kind == 2) {
-        vc[((ulong)p.pos * p.nkv + hh) * hd + i] = v;
+        vc[((ulong)pos * p.nkv + hh) * hd + i] = v;
         return;
     }
     buf[i] = v;
@@ -530,7 +732,7 @@ kernel void dec_qk_rope(device const float* qkv [[buffer(0)]], device float* qo 
         }
     }
     if (kind == 0) qo[hh * hd + i] = v;
-    else kc[((ulong)p.pos * p.nkv + hh) * hd + i] = v;
+    else kc[((ulong)pos * p.nkv + hh) * hd + i] = v;
 }
 
 // ---- Attention of one query per head over the cache (positions lo..len-1). One threadgroup of
@@ -661,9 +863,7 @@ kernel void dec_attn_combine(device const float* part [[buffer(0)]], device floa
 // Causal depthwise conv (kernel kc) with SiLU, one thread per channel; the state [kc-1][dim] holds
 // the earlier inputs (oldest first) and shifts in this one.
 struct GC { uint dim; uint kc; };
-kernel void dec_gdn_conv(device const float* x [[buffer(0)]], device float* out [[buffer(1)]], device float* st [[buffer(2)]],
-                         device const float* w [[buffer(3)]], constant GC& p [[buffer(4)]], uint ch [[thread_position_in_grid]]) {
-    if (ch >= p.dim) return;
+inline void gdn_conv_body(device const float* x, device float* out, device float* st, device const float* w, constant GC& p, uint ch) {
     uint kc = p.kc;
     float xv = x[ch];
     float s = 0.f;
@@ -672,6 +872,18 @@ kernel void dec_gdn_conv(device const float* x [[buffer(0)]], device float* out 
     out[ch] = s / (1.0f + exp(-s));
     for (uint j = 0; j + 2 < kc; j++) st[j * p.dim + ch] = st[(j + 1) * p.dim + ch];
     st[(kc - 2) * p.dim + ch] = xv;
+}
+kernel void dec_gdn_conv(device const float* x [[buffer(0)]], device float* out [[buffer(1)]], device float* st [[buffer(2)]],
+                         device const float* w [[buffer(3)]], constant GC& p [[buffer(4)]], uint ch [[thread_position_in_grid]]) {
+    if (ch >= p.dim) return;
+    gdn_conv_body(x, out, st, w, p, ch);
+}
+// ts: tokens, input and output strides.
+kernel void dec_gdn_conv_t(device const float* x [[buffer(0)]], device float* out [[buffer(1)]], device float* st [[buffer(2)]],
+                           device const float* w [[buffer(3)]], constant GC& p [[buffer(4)]], constant uint4& ts [[buffer(5)]],
+                           uint ch [[thread_position_in_grid]]) {
+    if (ch >= p.dim) return;
+    for (uint t = 0; t < ts.x; t++) gdn_conv_body(x + (ulong)t * ts.y, out + (ulong)t * ts.z, st, w, p, ch);
 }
 
 // The gated delta rule for one token, one threadgroup per value head: thread (part, j) keeps rows
@@ -688,13 +900,10 @@ inline float tg_sum(float v, uint n, uint tid, uint sg, uint lane, threadgroup f
     threadgroup_barrier(mem_flags::mem_threadgroup);
     return t;
 }
-kernel void dec_gdn_rule(device const float* c [[buffer(0)]], device const float* z [[buffer(1)]], device const float* b [[buffer(2)]],
-                         device const float* a [[buffer(3)]], device float* out [[buffer(4)]], device float* state [[buffer(5)]],
-                         device const float* cst [[buffer(6)]], constant GR& p [[buffer(7)]],
-                         uint hv [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+inline void gdn_rule_body(device const float* c, device const float* z, device const float* b, device const float* a, device float* out,
+                          device float* state, device const float* cst, constant GR& p, uint hv, uint tid, uint sg, uint lane,
+                          threadgroup float* qs, threadgroup float* ks, threadgroup float* red, threadgroup float* red2) {
     // cst: decay_coef[nv], dt_bias[nv], norm_w[hdv]
-    threadgroup float qs[256], ks[256], red[1024], red2[32];
     uint hdk = p.hdk, hdv = p.hdv, np = hdk / 32;
     uint hk = p.tiled != 0 ? hv % p.nk : hv / (p.nv / p.nk);
     uint part = tid / hdv, j = tid % hdv;
@@ -741,6 +950,28 @@ kernel void dec_gdn_rule(device const float* c [[buffer(0)]], device const float
         out[hv * hdv + j] = ov * r * cst[2 * p.nv + j] * (zz / (1.0f + exp(-zz)));
     }
 }
+kernel void dec_gdn_rule(device const float* c [[buffer(0)]], device const float* z [[buffer(1)]], device const float* b [[buffer(2)]],
+                         device const float* a [[buffer(3)]], device float* out [[buffer(4)]], device float* state [[buffer(5)]],
+                         device const float* cst [[buffer(6)]], constant GR& p [[buffer(7)]],
+                         uint hv [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float qs[256], ks[256], red[1024], red2[32];
+    gdn_rule_body(c, z, b, a, out, state, cst, p, hv, tid, sg, lane, qs, ks, red, red2);
+}
+// ts: tokens, strides of c, of z / b / a (one projection buffer) and of out; the tokens run in
+// order, each exactly as the single-token kernel.
+kernel void dec_gdn_rule_t(device const float* c [[buffer(0)]], device const float* z [[buffer(1)]], device const float* b [[buffer(2)]],
+                           device const float* a [[buffer(3)]], device float* out [[buffer(4)]], device float* state [[buffer(5)]],
+                           device const float* cst [[buffer(6)]], constant GR& p [[buffer(7)]], constant uint4& ts [[buffer(8)]],
+                           uint hv [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float qs[256], ks[256], red[1024], red2[32];
+    for (uint t = 0; t < ts.x; t++) {
+        ulong pp = (ulong)t * ts.z;
+        gdn_rule_body(c + (ulong)t * ts.y, z + pp, b + pp, a + pp, out + (ulong)t * ts.w, state, cst, p, hv, tid, sg, lane, qs, ks, red, red2);
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+    }
+}
 
 // ---- out = act(g) * u (SiLU, or GELU with the tanh approximation).
 kernel void dec_glu(device const float* g [[buffer(0)]], device const float* u [[buffer(1)]], device float* out [[buffer(2)]],
@@ -755,6 +986,22 @@ kernel void dec_glu(device const float* g [[buffer(0)]], device const float* u [
         act = a / (1.0f + exp(-a));
     }
     out[i] = act * u[i];
+}
+
+// Several tokens (grid y): ts = strides of g, u, out.
+kernel void dec_glu_t(device const float* g [[buffer(0)]], device const float* u [[buffer(1)]], device float* out [[buffer(2)]],
+                      constant uint2& p [[buffer(3)]], constant uint4& ts [[buffer(4)]], uint2 gid [[thread_position_in_grid]]) {
+    uint i = gid.x, t = gid.y;
+    if (i >= p.x) return;
+    float a = g[(ulong)t * ts.x + i];
+    float act;
+    if (p.y != 0) {
+        float tt = 0.7978845608f * (a + 0.044715f * a * a * a);
+        act = 0.5f * a * (1.0f + precise::tanh(tt));
+    } else {
+        act = a / (1.0f + exp(-a));
+    }
+    out[(ulong)t * ts.z + i] = act * u[(ulong)t * ts.y + i];
 }
 
 // ---- MoE experts of one token -------------------------------------------------------------------
@@ -829,6 +1076,18 @@ kernel void dec_ew(device const float* a [[buffer(0)]], device const float* b [[
     else if (p.x == 1.f) out[i] = precise::tanh(v / p.y) * p.y;
     else out[i] = (v * p.y + b[i] * p.z) * p.w;
 }
+// Several tokens (grid y): ts = strides of a, b, out.
+kernel void dec_ew_t(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], device float* out [[buffer(2)]],
+                     constant float4& p [[buffer(3)]], constant uint& n [[buffer(4)]], constant uint4& ts [[buffer(5)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+    uint i = gid.x, t = gid.y;
+    if (i >= n) return;
+    float v = a[(ulong)t * ts.x + i];
+    device float* o = out + (ulong)t * ts.z;
+    if (p.x == 0.f) o[i] = v * p.y;
+    else if (p.x == 1.f) o[i] = precise::tanh(v / p.y) * p.y;
+    else o[i] = (v * p.y + b[(ulong)t * ts.y + i] * p.z) * p.w;
+}
 
 // ---- x = (x + rmsnorm(y) * wy) * scale, then optionally out = rmsnorm(x) * wn; one threadgroup,
 // up to 8 values per thread kept in registers (n <= 8 * threads).
@@ -845,11 +1104,8 @@ inline float tg_total(float s, uint nt, uint sg, uint lane, threadgroup float* r
     }
     return s;
 }
-kernel void dec_add_norm(device const float* y [[buffer(0)]], device float* x [[buffer(1)]], device float* out [[buffer(2)]],
-                         device const float* wy [[buffer(3)]], device const float* wn [[buffer(4)]], constant AN& p [[buffer(5)]],
-                         uint tid [[thread_index_in_threadgroup]], uint nt [[threads_per_threadgroup]],
-                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float red[32];
+inline void add_norm_body(device const float* y, device float* x, device float* out, device const float* wy, device const float* wn,
+                          constant AN& p, uint tid, uint nt, uint sg, uint lane, threadgroup float* red) {
     float yv[8], xv[8];
     float s = 0.f;
     for (uint j = 0; j < 8; j++) {
@@ -874,6 +1130,23 @@ kernel void dec_add_norm(device const float* y [[buffer(0)]], device float* x [[
         uint i = tid + j * nt;
         if (i < p.n) out[i] = xv[j] * k2 * wn[i];
     }
+}
+kernel void dec_add_norm(device const float* y [[buffer(0)]], device float* x [[buffer(1)]], device float* out [[buffer(2)]],
+                         device const float* wy [[buffer(3)]], device const float* wn [[buffer(4)]], constant AN& p [[buffer(5)]],
+                         uint tid [[thread_index_in_threadgroup]], uint nt [[threads_per_threadgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[32];
+    add_norm_body(y, x, out, wy, wn, p, tid, nt, sg, lane, red);
+}
+// Several tokens (threadgroup y): ts = strides of y, x, out.
+kernel void dec_add_norm_t(device const float* y [[buffer(0)]], device float* x [[buffer(1)]], device float* out [[buffer(2)]],
+                           device const float* wy [[buffer(3)]], device const float* wn [[buffer(4)]], constant AN& p [[buffer(5)]],
+                           constant uint4& ts [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]], uint2 nt2 [[threads_per_threadgroup]],
+                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[32];
+    ulong t = tg.y;
+    add_norm_body(y + t * ts.x, x + t * ts.y, out + t * ts.z, wy, wn, p, tid, nt2.x, sg, lane, red);
 }
 
 // ---- Interventions (crate::intervene) -------------------------------------------------------

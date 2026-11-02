@@ -886,6 +886,11 @@ impl ModelFiles {
         self.index.contains_key(name)
     }
 
+    /// Every tensor name, in no particular order.
+    pub fn names(&self) -> impl Iterator<Item = &String> {
+        self.index.keys()
+    }
+
     pub fn info(&self, name: &str) -> Option<&TensorInfo> {
         self.index.get(name).and_then(|&i| self.shards[i].info(name))
     }

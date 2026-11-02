@@ -2908,6 +2908,15 @@ impl Backend for MetalBackend {
         self.matvec_rows_impl(x, t, n_in, jobs)
     }
 
+    fn decode_plan_multi<'s>(
+        &'s self,
+        g: &crate::gpu::decode::Graph,
+        tokens: usize,
+    ) -> Option<Box<dyn crate::gpu::decode::DecodePlan + 's>> {
+        self.build_plan_t(g, tokens)
+            .map(|p| Box::new(p) as Box<dyn crate::gpu::decode::DecodePlan + 's>)
+    }
+
     fn upload_moe(
         &self,
         gate_up: &[WeightRef],

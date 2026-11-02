@@ -946,6 +946,12 @@ pub struct Session {
     pub pos: usize,
     /// Runtime interventions ([`crate::intervene`]).
     pub iv: crate::intervene::State,
+    /// Layers whose output (the residual stream after the layer, before the final norm, as
+    /// transformers' `hidden_states[l + 1]`) the next CPU forward passes record into
+    /// `captured`.
+    pub capture: Vec<usize>,
+    /// `(layer, [t, hidden])` recorded for `capture`, in pass order.
+    pub captured: Vec<(usize, Vec<f32>)>,
 }
 
 impl Session {
@@ -1276,6 +1282,8 @@ impl<'a> Model<'a> {
             pos: 0,
             gpu: Default::default(),
             iv: Default::default(),
+            capture: Vec::new(),
+            captured: Vec::new(),
         }
     }
 
@@ -1289,14 +1297,21 @@ impl<'a> Model<'a> {
         e
     }
 
-    /// Softcapped logits `[t, vocab]` for final-normed hidden states `[t, hidden]`.
-    pub fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
+    /// Logits `[t, vocab]` for final-normed hidden states `[t, hidden]` before the soft cap.
+    pub fn logits_raw(&self, hidden: &[f32], t: usize) -> Vec<f32> {
         let cfg = &self.cfg;
         let _timer = prof::start(Cat::Head);
         let mut logits = vec![0f32; t * cfg.vocab_size];
-        let unit = crate::stream::enter(&self.stream, self.layer_unit(self.layers.len()));
+        let _unit = crate::stream::enter(&self.stream, self.layer_unit(self.layers.len()));
         linear(&self.head, cfg.vocab_size, cfg.hidden_size, hidden, t, &mut logits);
-        drop(unit);
+        logits
+    }
+
+    /// Softcapped logits `[t, vocab]` for final-normed hidden states `[t, hidden]`.
+    pub fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
+        let cfg = &self.cfg;
+        let mut logits = self.logits_raw(hidden, t);
+        let _timer = prof::start(Cat::Head);
         if let Some(cap) = cfg.final_logit_softcapping {
             let cap = cap as f32;
             for_chunks(&mut logits, 8192, true, |_, c| {
@@ -1446,6 +1461,9 @@ impl<'a> Model<'a> {
             self.layer_forward(l, layer, &mut x, t, start, pli.as_deref(), sess, rope, ext.as_deref(), iv.as_ref());
             if let Some(iv) = &iv {
                 iv.point(2 * l + 2, &mut x, h, start);
+            }
+            if sess.capture.contains(&l) {
+                sess.captured.push((l, x.clone()));
             }
         }
 
@@ -1605,6 +1623,80 @@ impl<'a> Model<'a> {
             let s = layer.layer_scalar;
             for_chunks(x, 4096, par, |_, c| scale_inplace(c, s));
         }
+    }
+}
+
+/// The target of a DSpark draft ([`crate::dspark`]): Gemma 4 (and Gemma 3) text models. The
+/// features are read on the CPU path (one-token GPU steps do not record them).
+impl crate::dspark::Target for Model<'_> {
+    fn forward_feats(
+        &self,
+        sess: &mut Session,
+        tokens: &[u32],
+        mm: &[(usize, &[f32])],
+        layers: &[usize],
+        feats: &mut Vec<f32>,
+    ) -> Vec<f32> {
+        let (t, h) = (tokens.len(), self.cfg.hidden_size);
+        // The residual entering layer `l` is layer `l - 1`'s output (the scaled embeddings for 0).
+        sess.capture = layers.iter().filter(|&&l| l > 0).map(|&l| l - 1).collect();
+        sess.captured.clear();
+        let hs = self.forward_hidden_cpu(sess, tokens, mm);
+        sess.capture.clear();
+        let captured = std::mem::take(&mut sess.captured);
+        let nf = layers.len();
+        feats.clear();
+        feats.resize(t * nf * h, 0.0);
+        for (fi, &l) in layers.iter().enumerate() {
+            let rows: Vec<f32> = if l == 0 {
+                let mut x = vec![0f32; t * h];
+                for (ti, row) in x.chunks_mut(h).enumerate() {
+                    row.copy_from_slice(&self.embed_scaled(tokens[ti]));
+                }
+                for &(i, emb) in mm {
+                    x[i * h..(i + 1) * h].copy_from_slice(emb);
+                }
+                x
+            } else {
+                captured
+                    .iter()
+                    .find(|c| c.0 == l - 1)
+                    .map(|c| c.1.clone())
+                    .unwrap_or_else(|| panic!("DSpark: target layer {l} out of range"))
+            };
+            for ti in 0..t {
+                feats[(ti * nf + fi) * h..(ti * nf + fi + 1) * h].copy_from_slice(&rows[ti * h..(ti + 1) * h]);
+            }
+        }
+        hs
+    }
+    fn forward_verify(&self, sess: &mut Session, tokens: &[u32], layers: &[usize], feats: &mut Vec<f32>) -> Vec<f32> {
+        if let Some(l) = self.gpu_verify(sess, tokens, layers, feats) {
+            return l;
+        }
+        let hs = crate::dspark::Target::forward_feats(self, sess, tokens, &[], layers, feats);
+        self.logits(&hs, tokens.len())
+    }
+    fn embed_row(&self, token: u32, out: &mut [f32]) {
+        if let Some(s) = &self.stream {
+            s.need_ranges(&self.embed.row_ranges(token as usize, self.cfg.hidden_size));
+        }
+        self.embed.row(token as usize, out);
+    }
+    fn embed_scale(&self) -> f32 {
+        (self.cfg.hidden_size as f32).sqrt()
+    }
+    fn head_raw(&self, hidden: &[f32], t: usize) -> Vec<f32> {
+        self.logits_raw(hidden, t)
+    }
+    fn lm_head(&self) -> Option<&Lin<'_>> {
+        Some(&self.head)
+    }
+    fn vocab_size(&self) -> usize {
+        self.cfg.vocab_size
+    }
+    fn truncate(&self, sess: &mut Session, len: usize) {
+        sess.truncate(len);
     }
 }
 

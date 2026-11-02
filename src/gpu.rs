@@ -190,6 +190,11 @@ pub trait Backend: Send + Sync {
     fn decode_plan<'s>(&'s self, _g: &decode::Graph) -> Option<Box<dyn decode::DecodePlan + 's>> {
         None
     }
+    /// Compiles a decode graph for steps of up to `tokens` tokens (speculative verification;
+    /// see [`decode::DecodePlan::tokens`]); None when the backend cannot.
+    fn decode_plan_multi<'s>(&'s self, _g: &decode::Graph, _tokens: usize) -> Option<Box<dyn decode::DecodePlan + 's>> {
+        None
+    }
     /// Cumulative timing summary for `--profile`.
     fn stats(&self) -> Option<String> {
         None

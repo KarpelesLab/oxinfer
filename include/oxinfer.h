@@ -68,17 +68,22 @@ char *oxi_download(const char *spec, const char *cache_dir, oxi_progress_fn prog
  *   mtp=0|1              Qwen3.5/3.8 multi-token prediction speculative decoding
  *   mtp_from=PATH|REPO   MTP weights from another checkpoint (implies mtp=1)
  *   mtp_fixed=0|1        always draft draft_tokens (default adaptive)
- *   draft=PATH|REPO      Gemma 4 assistant (drafter) model for speculative decoding (greedy);
- *                        Mistral Large 4: a DSpark draft GGUF (greedy and sampled, same output
- *                        distribution; default: the dspark*.gguf beside a GGUF model, which
- *                        draft=auto requires), draft=none for none
- *   draft_tokens=N       max draft tokens per round (default 3 with MTP and DSpark, 6 with a
- *                        drafter)
+ *   draft=PATH|REPO      a DSpark draft (Qwen, Gemma 4, Mistral Large 4: Hugging Face folder /
+ *                        repo id or dflash GGUF; greedy and sampled, same output distribution)
+ *                        or a Gemma 4 assistant (drafter) model (greedy); draft=auto: the
+ *                        DSpark draft beside the model, draft=none: none (default: the one
+ *                        beside the model where it measured faster, see the README)
+ *   draft_tokens=N       max draft tokens per round (default 3 with MTP, 6 with a drafter,
+ *                        DSpark its whole block)
  *   draft_p_min=P        DSpark: cut a block before the first draft the draft model gives less
  *                        than probability P (default 0.85 when the model streams, else 0)
  *   draft_device=auto|gpu|cpu  DSpark: where the draft's matmuls run (default auto: the GPU
  *                        when there is one)
- *   cache_dir=PATH      where repo ids are downloaded
+ *   draft_conf_min=C     DSpark: cut a block before the first draft whose confidence-head
+ *                        estimate of being accepted is below C (default 0: off)
+ *   draft_fixed=0|1      DSpark: always draft draft_tokens (default 0: the length, no draft
+ *                        included, that measures fastest; fixed when the model streams)
+ *   cache_dir=PATH       where repo ids are downloaded
  *   gpu_exact=0|1        GPU matmuls bit-identical to the CPU (default 0: M5/A19 matrix
  *                        units, half-precision inputs; process-wide)
  *   gpu_moe=0|1          MoE experts on the GPU in prefill (default 1; process-wide)

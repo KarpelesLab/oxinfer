@@ -202,6 +202,9 @@ pub struct QwenModel<'a> {
     gpu_plans: crate::gpu::decode::PlanCache,
 }
 
+/// Most tokens of a multi-token GPU pass (speculative verification).
+pub const MULTI_TOKENS: usize = 16;
+
 /// Recurrent state of one Gated DeltaNet layer.
 #[derive(Clone)]
 pub struct GdnState {
@@ -358,6 +361,17 @@ pub fn mrope_positions(spans: &[VisionSpan], start: usize, t: usize) -> Vec<[usi
     out
 }
 
+/// A multi-token GPU pass of a session (see [`QwenModel::gpu_verify`]): its plan, its span, and
+/// the recurrent states from before it.
+#[derive(Clone)]
+struct GpuRec {
+    plan: std::sync::Arc<dyn crate::gpu::decode::DecodePlan>,
+    start: usize,
+    len: usize,
+    /// Gated DeltaNet delta-rule and conv states before the pass, in the plan's state order.
+    states: Vec<Vec<f32>>,
+}
+
 #[derive(Clone)]
 pub struct QwenSession {
     kv: Vec<Option<LayerCache>>,
@@ -365,6 +379,9 @@ pub struct QwenSession {
     rec: Vec<GdnRecord>,
     /// `(start, len)` of the positions recorded by the last forward, if it recorded.
     rec_span: Option<(usize, usize)>,
+    /// The last forward when it was a multi-token GPU pass (speculative verification): what a
+    /// rewind inside it needs.
+    gpu_rec: Option<GpuRec>,
     /// Vision token runs of the conversation (M-RoPE), sorted by start.
     pub(crate) spans: Vec<VisionSpan>,
     pub pos: usize,
@@ -407,7 +424,25 @@ impl QwenSession {
             return Ok(());
         }
         let has_gdn = self.gdn.iter().any(|g| g.is_some());
-        if has_gdn {
+        if has_gdn && let Some(r) = self.gpu_rec.take() {
+            // A GPU verification pass: the states from before it, then its first tokens again on
+            // the GPU (the same kernels as one-token steps).
+            if pos <= r.start || pos > r.start + r.len {
+                bail!("cannot rewind to {pos}: the GPU pass covered {}..{}", r.start, r.start + r.len);
+            }
+            let mut states: Vec<&mut [f32]> = self
+                .gdn
+                .iter_mut()
+                .flatten()
+                .flat_map(|g| [&mut g.s[..], &mut g.conv[..]])
+                .collect();
+            for (st, s0) in states.iter_mut().zip(&r.states) {
+                st.copy_from_slice(s0);
+            }
+            if !r.plan.replay_recurrent(&mut self.gpu, &mut states, pos - r.start) {
+                bail!("cannot rewind the recurrent state to {pos}: the GPU replay failed");
+            }
+        } else if has_gdn {
             let Some((start, len)) = self.rec_span else {
                 bail!("cannot rewind the recurrent state to {pos}: the last forward did not record");
             };
@@ -846,6 +881,7 @@ impl<'a> QwenModel<'a> {
             gdn,
             rec,
             rec_span: None,
+            gpu_rec: None,
             spans: Vec::new(),
             pos: 0,
             gpu: Default::default(),
@@ -860,6 +896,16 @@ impl<'a> QwenModel<'a> {
     /// attention (Llama 3, Qwen3, and Qwen3.5's attention layers); None when some layer or
     /// weight is not supported (Gated DeltaNet, MoE, LoRA, streamed weights).
     fn gpu_graph<'s>(&'s self, lay: Option<&crate::intervene::GpuLayout>) -> Option<crate::gpu::decode::Graph<'s>> {
+        self.gpu_graph_with(lay, None)
+    }
+
+    /// [`Self::gpu_graph`], and for multi-token plans (`multi`: layers whose outputs to capture)
+    /// per-layer Gated DeltaNet buffers (kept for replays) and the capture copies.
+    fn gpu_graph_with<'s>(
+        &'s self,
+        lay: Option<&crate::intervene::GpuLayout>,
+        multi: Option<&[usize]>,
+    ) -> Option<crate::gpu::decode::Graph<'s>> {
         use crate::gpu::decode::{Graph, LinMode, Op};
         use crate::intervene::GpuNeurons;
         let cfg = &self.cfg;
@@ -1045,7 +1091,31 @@ impl<'a> QwenModel<'a> {
         let gproj = g.buf(if has_gdn { conv_dim + value_dim + 2 * nv } else { 1 });
         let gconv = g.buf(if has_gdn { conv_dim } else { 1 });
         let gout = g.buf(if has_gdn { value_dim } else { 1 });
+        // Multi-token plans: the residual after the captured layers, copied out.
+        let cap = multi.map(|m| g.buf((m.len() * h).max(1)));
+        if let (Some(c), Some(m)) = (cap, multi) {
+            g.capture = Some((c, m.len() * h));
+        }
+        let capture = |g: &mut Graph<'s>, li: usize| {
+            if let (Some(c), Some(m)) = (cap, multi) {
+                for (i, _) in m.iter().enumerate().filter(|e| *e.1 == li) {
+                    g.ops.push(Op::Ew {
+                        kind: crate::gpu::decode::Ew::Scale(1.0),
+                        a: x,
+                        b: None,
+                        out: c.at(i * h),
+                        n: h,
+                    });
+                }
+            }
+        };
         for (li, layer) in self.layers.iter().enumerate() {
+            // Multi-token plans keep each recurrent layer's inputs in its own buffers.
+            let (gproj, gconv) = if multi.is_some() && matches!(layer.mixer, Mixer::Gdn(_)) {
+                (g.buf(conv_dim + value_dim + 2 * nv), g.buf(conv_dim))
+            } else {
+                (gproj, gconv)
+            };
             g.ops.push(Op::norm(x, hn, &layer.ln_in, h, eps));
             let at = match &layer.mixer {
                 Mixer::Attn(at) => at,
@@ -1088,6 +1158,7 @@ impl<'a> QwenModel<'a> {
                     g.ops.push(Op::norm(x, hn, &layer.ln_post, h, eps));
                     ffn(&mut g, &layer.ffn, li)?;
                     steer(&mut g, 2 * li + 2);
+                    capture(&mut g, li);
                     continue;
                 }
             };
@@ -1128,12 +1199,14 @@ impl<'a> QwenModel<'a> {
                 scale: (hd as f32).powf(-0.5),
                 window: None,
                 gate: gated.then_some((qkv.at(hd), 2 * hd)),
+                block: None,
             });
             g.ops.push(lin(&at.o, h, nh * hd, att, x, LinMode::Add)?);
             steer(&mut g, 2 * li + 1);
             g.ops.push(Op::norm(x, hn, &layer.ln_post, h, eps));
             ffn(&mut g, &layer.ffn, li)?;
             steer(&mut g, 2 * li + 2);
+            capture(&mut g, li);
         }
         g.ops.push(Op::norm(x, hidden, &self.final_norm, h, eps));
         g.head_from = g.ops.len();
@@ -1193,6 +1266,7 @@ impl<'a> QwenModel<'a> {
             &mut sess.gpu,
             crate::gpu::decode::Step {
                 pos: sess.pos,
+                t: 1,
                 rope_cs: &cs,
                 x: &x,
                 x2: &[],
@@ -1201,6 +1275,8 @@ impl<'a> QwenModel<'a> {
                 hidden: &mut hidden,
                 logits: logits.as_deref_mut(),
                 params: data.zip(ivc.as_ref()).map(|(d, c)| (&hot[..], &d.cold[..], c.id())),
+                capture: None,
+                scratch: false,
             },
         );
         if !ok {
@@ -1209,6 +1285,127 @@ impl<'a> QwenModel<'a> {
         sess.rec_span = None;
         sess.pos += 1;
         Some((hidden, logits))
+    }
+
+    /// The multi-token GPU plan capturing the outputs of `layers` (sorted), compiled on first use.
+    fn gpu_multi_plan(&self, layers: &[usize], tokens: usize) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
+        if !crate::gpu::decode_enabled() || self.stream.is_some() {
+            return None;
+        }
+        let key = layers.iter().fold((1u64 << 63) | tokens as u64, |k, &l| {
+            k.wrapping_mul(0x100000001b3).wrapping_add(l as u64 + 1)
+        });
+        self.gpu_plans.get(key, || {
+            let be = crate::gpu::active()?;
+            let plan = self
+                .gpu_graph_with(None, Some(layers))
+                .and_then(|g| be.decode_plan_multi(&g, tokens));
+            if plan.is_none() {
+                eprintln!("[no multi-token GPU plan for this model: speculative verification runs on the CPU]");
+            }
+            plan
+        })
+    }
+
+    /// Runs `tokens` (at most [`MULTI_TOKENS`]) through a multi-token GPU plan, as one-token GPU
+    /// steps would one after the other: the logits of every token and, in `feats`, the residual
+    /// stream entering each of `layers` (as [`crate::dspark::Target::forward_feats`]). None
+    /// (nothing changed) when GPU decoding is off or the model cannot.
+    fn gpu_verify(&self, sess: &mut QwenSession, tokens: &[u32], layers: &[usize], feats: &mut Vec<f32>) -> Option<Vec<f32>> {
+        let t = tokens.len();
+        if t == 0 || t > MULTI_TOKENS || sess.iv.active() || sess.positions.is_some() || layers.contains(&0) {
+            return None;
+        }
+        let mut cap: Vec<usize> = layers.iter().map(|&l| l - 1).collect();
+        cap.sort_unstable();
+        cap.dedup();
+        // The smallest plan holding `t` (a DSpark block of 7 drafts verifies 8 tokens).
+        let plan = self.gpu_multi_plan(&cap, if t <= 8 { 8 } else { MULTI_TOKENS })?;
+        let _timer = prof::start(Cat::Matmul);
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let mut x = vec![0f32; t * h];
+        for (j, &tok) in tokens.iter().enumerate() {
+            self.embed.row(tok as usize, &mut x[j * h..(j + 1) * h]);
+        }
+        let half = self.inv_freq.len();
+        let (cos, sin) = self.rope_cs(&sess.spans, sess.pos, t);
+        let mut cs = Vec::with_capacity(2 * t * half);
+        for j in 0..t {
+            cs.extend_from_slice(&cos[j * half..(j + 1) * half]);
+            cs.extend_from_slice(&sin[j * half..(j + 1) * half]);
+        }
+        let mut hidden = vec![0f32; t * h];
+        let mut logits = vec![0f32; t * cfg.vocab_size];
+        let mut captured = vec![0f32; t * cap.len() * h];
+        // The recurrent states before the pass, for a rewind inside it (none for one token),
+        // copied in parallel into the last pass's buffers.
+        let mut snap = sess.gpu_rec.take().map(|r| r.states).unwrap_or_default();
+        if t > 1 {
+            let src: Vec<&[f32]> = sess.gdn.iter().flatten().flat_map(|g| [&g.s[..], &g.conv[..]]).collect();
+            snap.resize_with(src.len(), Vec::new);
+            for (d, s) in snap.iter_mut().zip(&src) {
+                d.resize(s.len(), 0.0);
+            }
+            let jobs: Vec<(usize, usize, usize)> = src
+                .iter()
+                .zip(snap.iter_mut())
+                .map(|(s, d)| (s.as_ptr() as usize, d.as_mut_ptr() as usize, s.len()))
+                .collect();
+            crate::pool::run(jobs.len(), &|i| {
+                let (s, d, n) = jobs[i];
+                // SAFETY: each job copies one state into its own snapshot buffer.
+                unsafe { std::ptr::copy_nonoverlapping(s as *const f32, d as *mut f32, n) };
+            });
+        }
+        let mut kv: Vec<&mut LayerCache> = sess.kv.iter_mut().flatten().collect();
+        let mut states: Vec<&mut [f32]> = sess
+            .gdn
+            .iter_mut()
+            .flatten()
+            .flat_map(|g| [&mut g.s[..], &mut g.conv[..]])
+            .collect();
+        let ok = plan.step(
+            &mut sess.gpu,
+            crate::gpu::decode::Step {
+                pos: sess.pos,
+                t,
+                rope_cs: &cs,
+                x: &x,
+                x2: &[],
+                kv: &mut kv,
+                states: &mut states,
+                hidden: &mut hidden,
+                logits: Some(&mut logits),
+                params: None,
+                capture: Some(&mut captured),
+                scratch: false,
+            },
+        );
+        if !ok {
+            if std::env::var_os("OXINFER_METAL_TRACE").is_some() {
+                eprintln!("[multi-token GPU step failed: {t} tokens at {}]", sess.pos);
+            }
+            return None;
+        }
+        sess.rec_span = None;
+        sess.gpu_rec = (t > 1).then_some(GpuRec {
+            plan,
+            start: sess.pos,
+            len: t,
+            states: snap,
+        });
+        sess.pos += t;
+        let (nf, nc) = (layers.len(), cap.len());
+        feats.clear();
+        feats.resize(t * nf * h, 0.0);
+        for j in 0..t {
+            for (fi, &l) in layers.iter().enumerate() {
+                let ci = cap.binary_search(&(l - 1)).unwrap();
+                feats[(j * nf + fi) * h..(j * nf + fi + 1) * h].copy_from_slice(&captured[(j * nc + ci) * h..(j * nc + ci + 1) * h]);
+            }
+        }
+        Some(logits)
     }
 
     /// RoPE tables for positions `start..start + t`: plain positions, or M-RoPE positions when
@@ -1294,6 +1491,7 @@ impl<'a> QwenModel<'a> {
     fn forward_impl(&self, sess: &mut QwenSession, tokens: &[u32], mm: &[(usize, &[f32])], record: bool, gpu: bool) -> Vec<f32> {
         let t = tokens.len();
         assert!(t > 0);
+        sess.gpu_rec = None;
         if t > 1 && gpu {
             let _ = self.gpu_plan();
         }
@@ -1602,6 +1800,78 @@ impl<'a> QwenModel<'a> {
             }
         });
         linear(&gd.out, h, value_dim, &out, t, y);
+    }
+}
+
+/// The target of a DSpark draft ([`crate::dspark`]): Qwen3 dense, Qwen3.5 / 3.6 / 3.8 dense and
+/// MoE. The verification forward records the Gated DeltaNet inputs, so a rejected draft rewinds
+/// exactly (see [`QwenSession::rewind`]).
+impl crate::dspark::Target for QwenModel<'_> {
+    fn forward_feats(
+        &self,
+        sess: &mut QwenSession,
+        tokens: &[u32],
+        mm: &[(usize, &[f32])],
+        layers: &[usize],
+        feats: &mut Vec<f32>,
+    ) -> Vec<f32> {
+        let (t, h) = (tokens.len(), self.cfg.hidden_size);
+        // The residual entering layer `l` is layer `l - 1`'s output (the embeddings for 0).
+        sess.capture = layers.iter().filter(|&&l| l > 0).map(|&l| l - 1).collect();
+        sess.captured.clear();
+        let hs = self.forward_impl(sess, tokens, mm, true, true);
+        sess.capture.clear();
+        let captured = std::mem::take(&mut sess.captured);
+        let nf = layers.len();
+        feats.clear();
+        feats.resize(t * nf * h, 0.0);
+        for (fi, &l) in layers.iter().enumerate() {
+            let rows: Vec<f32> = if l == 0 {
+                let mut x = vec![0f32; t * h];
+                for (ti, row) in x.chunks_mut(h).enumerate() {
+                    self.embed.row(tokens[ti] as usize, row);
+                }
+                for &(i, emb) in mm {
+                    x[i * h..(i + 1) * h].copy_from_slice(emb);
+                }
+                x
+            } else {
+                captured
+                    .iter()
+                    .find(|c| c.0 == l - 1)
+                    .map(|c| c.1.clone())
+                    .unwrap_or_else(|| panic!("DSpark: target layer {l} out of range"))
+            };
+            for ti in 0..t {
+                feats[(ti * nf + fi) * h..(ti * nf + fi + 1) * h].copy_from_slice(&rows[ti * h..(ti + 1) * h]);
+            }
+        }
+        hs
+    }
+    fn forward_verify(&self, sess: &mut QwenSession, tokens: &[u32], layers: &[usize], feats: &mut Vec<f32>) -> Vec<f32> {
+        if let Some(l) = self.gpu_verify(sess, tokens, layers, feats) {
+            return l;
+        }
+        let hs = crate::dspark::Target::forward_feats(self, sess, tokens, &[], layers, feats);
+        self.logits(&hs, tokens.len())
+    }
+    fn embed_row(&self, token: u32, out: &mut [f32]) {
+        if let Some(s) = &self.stream {
+            s.need_ranges(&self.embed.row_ranges(token as usize, self.cfg.hidden_size));
+        }
+        self.embed.row(token as usize, out);
+    }
+    fn head_raw(&self, hidden: &[f32], t: usize) -> Vec<f32> {
+        self.logits(hidden, t)
+    }
+    fn lm_head(&self) -> Option<&Lin<'_>> {
+        Some(&self.lm_head)
+    }
+    fn vocab_size(&self) -> usize {
+        self.cfg.vocab_size
+    }
+    fn truncate(&self, sess: &mut QwenSession, len: usize) {
+        sess.rewind(len).expect("DSpark rollback within the verification pass");
     }
 }
 

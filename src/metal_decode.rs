@@ -8,6 +8,17 @@ const SRC: &str = include_str!("metal_decode.metal");
 /// (rows per threadgroup, SIMD-groups splitting each row) variants compiled for each format.
 pub(crate) const MV_VARIANTS: [(usize, usize); 4] = [(1, 1), (1, 2), (1, 4), (2, 4)];
 
+/// Token capacities of the multi-token matvec kernels (a plan of up to N tokens uses the
+/// smallest that holds N).
+pub(crate) const MVK_TOKENS: [usize; 2] = [8, 16];
+
+/// Rows per threadgroup of the multi-token matvecs for up to `tt` tokens (accumulators: rows x
+/// tokens per lane). One row measured fastest for 8 tokens on an M5 Max (`decode_mvk_bench`:
+/// more rows save x loads but cost occupancy).
+pub(crate) fn mvk_rows(_tt: usize) -> usize {
+    1
+}
+
 /// A weight format with a decode matvec kernel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum MvFmt {
@@ -53,6 +64,19 @@ impl MvFmt {
                 k => format!("MV_GEN({n}, {}W, {nr}, {ks})", k.name()),
             },
         }
+    }
+    /// The multi-token instantiation (up to `tt` tokens; see `mvk_body` in the shader).
+    fn instantiate_k(self, nr: usize, ks: usize, tt: usize) -> String {
+        let one = self.instantiate(nr, ks);
+        let (mac, rest) = one.split_once('(').unwrap();
+        let rest = rest
+            .strip_suffix(')')
+            .unwrap()
+            .replacen(&format!("mv_{}_{nr}_{ks}", self.name()), &self.mvk_name(nr, ks, tt), 1);
+        format!("{}({rest}, {tt})", mac.replacen("MV_", "MVK_", 1))
+    }
+    fn mvk_name(self, nr: usize, ks: usize, tt: usize) -> String {
+        format!("mvk_{}_{nr}_{ks}_{tt}", self.name())
     }
     /// The kernel's weight type, x chunk type and chunk size, and the `MKX_` constructor of the
     /// weight type from an expert table entry `e`.
@@ -134,6 +158,21 @@ pub(crate) fn shader_src() -> String {
                 MvFmt::Gguf(GgmlType::F32) => writeln!(s, "MVT_LOAD({name}, F32W2, 1, {ks})"),
                 MvFmt::Gguf(k) => writeln!(s, "MVT_LOAD({name}, {}W, 1, {ks})", k.name()),
             };
+        }
+        // Multi-token: the SIMD-group splits of the single-token variants (the same per-row
+        // arithmetic), more rows per threadgroup (each x chunk loaded once for them).
+        for ks in [1, 2, 4] {
+            if f.specialized() || ks == 4 {
+                for tt in MVK_TOKENS {
+                    let _ = writeln!(s, "{}", f.instantiate_k(mvk_rows(tt), ks, tt));
+                    // decode_mvk_bench: the other row counts too.
+                    if std::env::var_os("OXINFER_MVK_ALL").is_some() {
+                        for nr in [1, 2, 4].into_iter().filter(|&n| n != mvk_rows(tt)) {
+                            let _ = writeln!(s, "{}", f.instantiate_k(nr, ks, tt));
+                        }
+                    }
+                }
+            }
         }
     }
     s
@@ -239,6 +278,25 @@ impl MetalBackend {
         let ks = (n_in / chunk / 64).clamp(1, 4).next_power_of_two().min(4);
         Some((self.named_pipeline(&format!("mvt_{}_1_{ks}", fmt.name()))?, 1, ks))
     }
+    /// The multi-token matvec pipeline for up to `tt` tokens (one of [`MVK_TOKENS`]).
+    pub(crate) fn mvk_pipe(&self, fmt: MvFmt, nr: usize, ks: usize, tt: usize) -> Option<Id> {
+        if !fmt.specialized() && ks != 4 {
+            return None;
+        }
+        self.named_pipeline(&fmt.mvk_name(nr, ks, tt))
+    }
+}
+
+/// Parameters of a multi-token matvec (`MVK` in the shader): the token count and the x, y and
+/// gate strides in floats.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct MvkParams {
+    m: MvParams,
+    ntok: u32,
+    sx: u32,
+    sy: u32,
+    sgate: u32,
 }
 
 /// `objc_msgSend` typed for the encoder calls, and their selectors, looked up once (`Objc::msg_send`
@@ -640,6 +698,9 @@ enum MOp {
         p: NormParams,
         rows: usize,
         threads: usize,
+        /// Multi-token plans: the x and out token strides in floats, and whether the kernel takes
+        /// the tokens as rows (one row per token) rather than one dispatch per token.
+        t: Option<(usize, usize, bool)>,
     },
     Mv {
         pipe: Id,
@@ -652,6 +713,9 @@ enum MOp {
         mode: MvMode,
         /// AddGated: the scalar gate's arena offset.
         gate: usize,
+        /// Multi-token plans: the pipeline, the x, y, gate strides in floats and the rows per
+        /// threadgroup.
+        t: Option<(Id, u32, u32, u32, usize)>,
     },
     Topk {
         pipe: Id,
@@ -692,6 +756,9 @@ enum MOp {
         p: QkParams,
         /// Where this op's RoPE table starts in the step's cos / sin floats.
         cs: usize,
+        /// Multi-token plans: the pipeline, the qkv and query-output strides in floats, and the
+        /// arena offset of this table's per-token cos / sin rows.
+        t: Option<(Id, u32, u32, usize)>,
     },
     AddNorm {
         pipe: Id,
@@ -702,6 +769,8 @@ enum MOp {
         wn: usize,
         p: [u32; 4],
         threads: usize,
+        /// Multi-token plans: the pipeline and the y, x, out strides.
+        t: Option<(Id, [u32; 4])>,
     },
     Ew {
         pipe: Id,
@@ -710,6 +779,8 @@ enum MOp {
         out: usize,
         n: u32,
         p: [f32; 4],
+        /// Multi-token plans: the pipeline and the a, b, out strides.
+        t: Option<(Id, [u32; 4])>,
     },
     Glu {
         pipe: Id,
@@ -718,6 +789,8 @@ enum MOp {
         out: usize,
         n: u32,
         gelu: u32,
+        /// Multi-token plans: the pipeline and the g, u, out strides.
+        t: Option<(Id, [u32; 4])>,
     },
     Steer {
         pipe: Id,
@@ -740,6 +813,8 @@ enum MOp {
         w: usize,
         dim: u32,
         kc: u32,
+        /// Multi-token plans: the pipeline and the x, out strides.
+        t: Option<(Id, u32, u32)>,
     },
     GdnRule {
         pipe: Id,
@@ -751,6 +826,8 @@ enum MOp {
         state: usize,
         cst: usize,
         p: GdnRuleParams,
+        /// Multi-token plans: the pipeline and the c, projection (z / b / a), out strides.
+        t: Option<(Id, u32, u32, u32)>,
     },
     Attn {
         /// Query heads per threadgroup.
@@ -765,6 +842,11 @@ enum MOp {
         p: AttnParams,
         threads: usize,
         hd: u32,
+        /// Multi-token plans: the query, output and gate strides in bytes (one dispatch per
+        /// token, each attending to the positions up to its own).
+        t: Option<(usize, usize, usize)>,
+        /// A draft block's span (see `Op::Attend::block`).
+        block: Option<(bool, usize)>,
     },
 }
 
@@ -783,8 +865,21 @@ pub(crate) struct MetalPlan<'b> {
     ops: Vec<MOp>,
     head_from: usize,
     input: usize,
+    /// Floats of the input per token.
+    n_input: usize,
     hidden: (usize, usize),
     logits: Option<(usize, usize)>,
+    /// Tokens per step at most (1: a single-token plan), and the byte strides between the
+    /// tokens' rows of the input, the hidden state, the logits, the second input and the
+    /// capture.
+    tokens: usize,
+    strides: [usize; 5],
+    /// Multi-token plans: the arena offset of the per-token RoPE rows, and the bytes of
+    /// split-attention partials per token.
+    rope_off: usize,
+    part_stride: usize,
+    /// Multi-token plans: the capture rows (offset, floats per token).
+    capture: Option<(usize, usize)>,
     kv: Vec<(usize, usize)>,
     rope_halves: Vec<usize>,
     input2: Option<(usize, usize)>,
@@ -871,15 +966,37 @@ fn overlaps(a: &[Range], b: &[Range]) -> bool {
 
 impl MetalBackend {
     pub(crate) fn build_plan(&self, g: &Graph) -> Option<MetalPlan<'_>> {
+        self.build_plan_t(g, 1)
+    }
+
+    /// Compiles `g` for steps of up to `tokens` tokens (1: the single-token plan). A multi-token
+    /// plan keeps `tokens` rows of every activation buffer, runs the matvecs with the multi-token
+    /// kernels (weights read once for all the tokens) and the other ops over every token, each
+    /// computed exactly as a single-token step would (same kernels, same reduction orders).
+    pub(crate) fn build_plan_t(&self, g: &Graph, tokens: usize) -> Option<MetalPlan<'_>> {
         let f = Fns::new(self);
-        // Activation arena: every buffer 256-byte aligned.
+        let mt = tokens > 1;
+        let tt = match MVK_TOKENS.iter().find(|&&t| t >= tokens) {
+            Some(&t) => t,
+            None if !mt => 1,
+            None => return None,
+        };
+        // Activation arena: every buffer 256-byte aligned; in a multi-token plan, `tokens` rows of
+        // `tsz` floats (256-byte aligned too).
+        let tsz: Vec<usize> = g.bufs.iter().map(|&n| if mt { n.next_multiple_of(64) } else { n }).collect();
         let mut boff = Vec::with_capacity(g.bufs.len());
         let mut total = 0usize;
-        for &n in &g.bufs {
+        for &n in &tsz {
             boff.push(total);
-            total += (n * 4).next_multiple_of(256);
+            total += (n * tokens * 4).next_multiple_of(256);
         }
         let byte = |v: View| boff[v.buf] + v.off * 4;
+        // The token stride of a view's buffer, in floats.
+        let ts = |v: View| tsz[v.buf];
+        // Multi-token plans: the per-token RoPE rows, table after table.
+        let rope_off = total;
+        total += (tokens * 2 * g.rope_halves.iter().sum::<usize>() * 4).next_multiple_of(256);
+        let rope_table = |r: usize| rope_off + tokens * 2 * g.rope_halves[..r].iter().sum::<usize>() * 4;
         // Constants: every vector 64-byte aligned.
         let mut consts: Vec<f32> = Vec::new();
         let mut cst = |v: &[f32]| -> usize {
@@ -894,7 +1011,7 @@ impl MetalBackend {
         let mut indirect: Vec<Id> = Vec::new();
         let mut head_from = usize::MAX;
         let (mut rd, mut wr): (Vec<Range>, Vec<Range>) = (Vec::new(), Vec::new());
-        let rng = |v: View, n: usize| (v.buf, v.off, v.off + n);
+        let rng = |v: View, n: usize| (v.buf, v.off, v.off + n + (tokens - 1) * tsz[v.buf]);
         for (i, op) in g.ops.iter().enumerate() {
             if i == g.head_from {
                 // The head starts after a barrier, so skipping it leaves no dangling dependency.
@@ -918,6 +1035,8 @@ impl MetalBackend {
                     add,
                 } => {
                     let threads = n.next_multiple_of(32).min(1024);
+                    // One row per token when the op has one row, else one dispatch per token.
+                    let native = mt && rows == 1;
                     emit.push(MOp::Norm {
                         pipe: self.named_pipeline("dec_rms_norm")?,
                         x: byte(x),
@@ -928,13 +1047,14 @@ impl MetalBackend {
                             eps,
                             has_w: w.is_some() as u32,
                             add: add as u32,
-                            x_stride: x_stride as u32,
-                            o_stride: out_stride as u32,
+                            x_stride: if native { ts(x) } else { x_stride } as u32,
+                            o_stride: if native { ts(out) } else { out_stride } as u32,
                             pre,
                             _p: 0,
                         },
                         rows,
                         threads,
+                        t: mt.then(|| (ts(x), ts(out), native)),
                     });
                     let span = |v: View, s: usize| rng(v, (rows - 1) * s + n);
                     let mut r = vec![span(x, x_stride)];
@@ -975,6 +1095,17 @@ impl MetalBackend {
                         return None;
                     }
                     let (nr, ks) = mv_variant(mw.fmt, n_in);
+                    let t = if mt {
+                        Some((
+                            self.mvk_pipe(mw.fmt, mvk_rows(tt), ks, tt)?,
+                            ts(x) as u32,
+                            ts(y) as u32,
+                            gate.map_or(0, ts) as u32,
+                            mvk_rows(tt),
+                        ))
+                    } else {
+                        None
+                    };
                     emit.push(MOp::Mv {
                         pipe: self.mv_pipe(mw.fmt, nr, ks)?,
                         nr,
@@ -985,6 +1116,7 @@ impl MetalBackend {
                         y: byte(y),
                         mode,
                         gate: gate.map_or(0, byte),
+                        t,
                     });
                     let mut r = vec![rng(x, n_in)];
                     if matches!(mode, MvMode::Add | MvMode::AddGated) {
@@ -1042,6 +1174,16 @@ impl MetalBackend {
                             _p: [0; 2],
                         },
                         cs: g.rope_halves[..rope].iter().map(|h| 2 * h).sum(),
+                        t: if mt {
+                            Some((
+                                self.named_pipeline("dec_qk_rope_t")?,
+                                ts(qkv) as u32,
+                                ts(q_out) as u32,
+                                rope_table(rope),
+                            ))
+                        } else {
+                            None
+                        },
                     });
                     let end = (nh * q_stride)
                         .max(k_off + nkv * hd)
@@ -1063,6 +1205,9 @@ impl MetalBackend {
                     sel,
                     expert_scale,
                 } => {
+                    if mt {
+                        return None; // per-token routing: not in multi-token plans
+                    }
                     if expert_scale.is_some_and(|s| s.len() != n_exp) {
                         return None;
                     }
@@ -1098,6 +1243,7 @@ impl MetalBackend {
                         y: byte(logits),
                         mode: MvMode::Store,
                         gate: 0,
+                        t: None,
                     });
                     emit.push(MOp::Barrier);
                     emit.push(MOp::Topk {
@@ -1111,6 +1257,9 @@ impl MetalBackend {
                     (vec![rng(x, h), rng(logits, rows)], vec![rng(logits, rows), rng(sel, 2 * k)])
                 }
                 Op::Experts(ref ex) => {
+                    if mt {
+                        return None;
+                    }
                     let (tabs, fused, g, d, pf) = self.expert_tables(ex, &mut owned, &mut indirect)?;
                     let edit = match ex.edits {
                         Some((v, n)) => Some((self.named_pipeline("dec_neuron_edit")?, byte(v), n as u32)),
@@ -1167,6 +1316,15 @@ impl MetalBackend {
                         wn: next.map_or(0, |(_, w)| cst(w)),
                         p: [n as u32, eps.to_bits(), scale.to_bits(), next.is_some() as u32],
                         threads,
+                        t: if mt {
+                            let o = next.map_or(x, |(o, _)| o);
+                            Some((
+                                self.named_pipeline("dec_add_norm_t")?,
+                                [ts(y) as u32, ts(x) as u32, ts(o) as u32, 0],
+                            ))
+                        } else {
+                            None
+                        },
                     });
                     let mut w = vec![rng(x, n)];
                     w.extend(next.map(|(o, _)| rng(o, n)));
@@ -1189,6 +1347,14 @@ impl MetalBackend {
                         out: byte(out),
                         n: n as u32,
                         p,
+                        t: if mt {
+                            Some((
+                                self.named_pipeline("dec_ew_t")?,
+                                [ts(a) as u32, ts(b.unwrap_or(a)) as u32, ts(out) as u32, 0],
+                            ))
+                        } else {
+                            None
+                        },
                     });
                     let mut r = vec![rng(a, n)];
                     r.extend(b.map(|b| rng(b, n)));
@@ -1202,6 +1368,11 @@ impl MetalBackend {
                         out: byte(out),
                         n: n as u32,
                         gelu: gelu as u32,
+                        t: if mt {
+                            Some((self.named_pipeline("dec_glu_t")?, [ts(gv) as u32, ts(u) as u32, ts(out) as u32, 0]))
+                        } else {
+                            None
+                        },
                     });
                     (vec![rng(gv, n), rng(u, n)], vec![rng(out, n)])
                 }
@@ -1213,7 +1384,7 @@ impl MetalBackend {
                     n_add,
                     n_items,
                 } => {
-                    if n_items > crate::intervene::GPU_MAX_ITEMS {
+                    if mt || n_items > crate::intervene::GPU_MAX_ITEMS {
                         return None;
                     }
                     emit.push(MOp::Steer {
@@ -1233,6 +1404,9 @@ impl MetalBackend {
                     )
                 }
                 Op::NeuronEdit { act, hot, n } => {
+                    if mt {
+                        return None;
+                    }
                     emit.push(MOp::NeuronEdit {
                         pipe: self.named_pipeline("dec_neuron_edit")?,
                         act: byte(act),
@@ -1257,6 +1431,11 @@ impl MetalBackend {
                         w: cst(w),
                         dim: dim as u32,
                         kc: kc as u32,
+                        t: if mt {
+                            Some((self.named_pipeline("dec_gdn_conv_t")?, ts(x) as u32, ts(out) as u32))
+                        } else {
+                            None
+                        },
                     });
                     (
                         vec![rng(x, dim), (KV_RES * 2 + state, 0, usize::MAX)],
@@ -1274,6 +1453,9 @@ impl MetalBackend {
                     }
                     if g.states.get(r.state) != Some(&(r.nv * r.hdk * r.hdv)) || r.norm_w.len() != r.hdv {
                         return None;
+                    }
+                    if mt && (r.z.buf != r.b.buf || r.a.buf != r.b.buf) {
+                        return None; // one stride for z, b and a
                     }
                     let mut v = r.decay_coef.to_vec();
                     v.extend_from_slice(r.dt_bias);
@@ -1298,6 +1480,16 @@ impl MetalBackend {
                             hdk: r.hdk as u32,
                             hdv: r.hdv as u32,
                         },
+                        t: if mt {
+                            Some((
+                                self.named_pipeline("dec_gdn_rule_t")?,
+                                ts(r.c) as u32,
+                                ts(r.b) as u32,
+                                ts(r.out) as u32,
+                            ))
+                        } else {
+                            None
+                        },
                     });
                     let vd = r.nv * r.hdv;
                     (
@@ -1321,7 +1513,11 @@ impl MetalBackend {
                     scale,
                     window,
                     gate,
+                    block,
                 } => {
+                    if block.is_some() && !mt {
+                        return None;
+                    }
                     let d = hd / 32;
                     if !hd.is_multiple_of(32) || !matches!(d, 2 | 4 | 8 | 16) || nkv == 0 || !nh.is_multiple_of(nkv) {
                         return None;
@@ -1360,6 +1556,8 @@ impl MetalBackend {
                             _p: [0; 2],
                         },
                         threads: 256,
+                        t: mt.then(|| (ts(q) * 4, ts(out) * 4, gate.map_or(0, |(v, _)| ts(v) * 4))),
+                        block,
                     });
                     let mut r = vec![rng(q, nh * hd), (KV_RES + kv, 0, usize::MAX)];
                     if let Some((v, s)) = gate {
@@ -1382,9 +1580,10 @@ impl MetalBackend {
         if head_from == usize::MAX {
             head_from = ops.len();
         }
-        // Split-attention partials after the activations.
+        // Split-attention partials after the activations (a region per token).
         let part = total;
-        total += part_floats * 4;
+        let part_stride = (part_floats * 4).next_multiple_of(256);
+        total += part_stride * tokens;
         let new_len: MsgNewBufLen = self.o.msg_send();
         let arena = unsafe { new_len(self.device, self.sels.new_buffer_len, total.max(256), 0) };
         if arena.is_null() {
@@ -1427,8 +1626,20 @@ impl MetalBackend {
             ops,
             head_from,
             input: byte(g.input),
+            n_input: if g.n_input > 0 { g.n_input } else { g.n_hidden },
             hidden: (byte(g.hidden), g.n_hidden),
             logits: g.logits.map(|(v, n)| (byte(v), n)),
+            tokens,
+            strides: [
+                ts(g.input) * 4,
+                ts(g.hidden) * 4,
+                g.logits.map_or(0, |(v, _)| ts(v) * 4),
+                g.input2.map_or(0, |(v, _)| ts(v) * 4),
+                g.capture.map_or(0, |(v, _)| ts(v) * 4),
+            ],
+            rope_off,
+            part_stride,
+            capture: g.capture.map(|(v, n)| (byte(v), n)),
             kv: g.kv.clone(),
             rope_halves: g.rope_halves.clone(),
             input2: g.input2.map(|(v, n)| (byte(v), n)),
@@ -1565,8 +1776,8 @@ impl MetalBackend {
 
 impl MetalPlan<'_> {
     /// Brings the device KV copies in line with the host caches (`pos` positions each) and makes
-    /// room for one more position.
-    fn sync_kv(&self, slot: &mut MetalSlot, kv: &mut [&mut crate::model::LayerCache], pos: usize) -> bool {
+    /// room for `t` more positions.
+    fn sync_kv(&self, slot: &mut MetalSlot, kv: &mut [&mut crate::model::LayerCache], pos: usize, t: usize) -> bool {
         let be = self.be;
         let new_len: MsgNewBufLen = be.o.msg_send();
         for (i, (m, c)) in slot.kv.iter_mut().zip(kv.iter_mut()).enumerate() {
@@ -1577,8 +1788,8 @@ impl MetalPlan<'_> {
             // A truncation (rewind) since the last step invalidates the copy from there on, even
             // if the host cache has grown back past it.
             m.synced = m.synced.min(c.len).min(c.kept);
-            if m.cap < pos + 1 {
-                let cap = (pos + 1).next_power_of_two().max(256);
+            if m.cap < pos + t {
+                let cap = (pos + t).next_power_of_two().max(256);
                 let bytes = cap * row * 4;
                 let (k, v) = unsafe {
                     (
@@ -1651,14 +1862,326 @@ impl MetalPlan<'_> {
     }
 }
 
+impl MetalPlan<'_> {
+    /// Encodes one op of a multi-token plan for `t` tokens at positions `pos..`.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_multi(&self, e: &FastEnc, op: &MOp, arena: Id, consts: Id, kvb: &[(Id, Id)], stb: &[(Id, usize)], pos: usize, t: usize) {
+        match op {
+            MOp::Barrier => e.barrier(),
+            MOp::Norm {
+                pipe,
+                x,
+                out,
+                w,
+                p,
+                rows,
+                threads,
+                t: tk,
+            } => {
+                let (sx, so, native) = tk.expect("multi-token norm");
+                e.pipe(*pipe);
+                e.buf(consts, w.unwrap_or(0), 2);
+                e.bytes(p, 3);
+                if native {
+                    e.buf(arena, *x, 0);
+                    e.buf(arena, *out, 1);
+                    e.dispatch((t, 1), *threads);
+                } else {
+                    for j in 0..t {
+                        e.buf(arena, *x + j * sx * 4, 0);
+                        e.buf(arena, *out + j * so * 4, 1);
+                        e.dispatch((*rows, 1), *threads);
+                    }
+                }
+            }
+            MOp::Mv {
+                ks,
+                w,
+                w2,
+                x,
+                y,
+                mode,
+                gate,
+                t: tk,
+                ..
+            } => {
+                let (pipe, sx, sy, sgate, nr) = tk.expect("multi-token matvec");
+                let w2 = w2.as_ref().unwrap_or(w);
+                let p = MvkParams {
+                    m: MvParams {
+                        n_out: w.n_out as u32,
+                        n_in: w.n_in as u32,
+                        mode: *mode as u32,
+                        rows_per_tg: nr as u32,
+                        w_off: w.data_off,
+                        s_off: w.scales_off,
+                        w2_off: w2.data_off,
+                        s2_off: w2.scales_off,
+                        o_off: w.offs_off,
+                        o2_off: w2.offs_off,
+                        gpr: w.gpr,
+                        gk: w.gk,
+                        ldy: 0,
+                        _p: 0,
+                    },
+                    ntok: t as u32,
+                    sx,
+                    sy,
+                    sgate,
+                };
+                e.pipe(pipe);
+                e.buf(w.data, 0, 0);
+                e.buf(w.scales, 0, 1);
+                e.buf(arena, *x, 2);
+                e.buf(arena, *y, 3);
+                e.bytes(&p, 4);
+                e.buf(w2.data, 0, 5);
+                e.buf(w2.scales, 0, 6);
+                e.buf(w.offs, 0, 7);
+                e.buf(w2.offs, 0, 8);
+                e.buf(arena, *gate, 9);
+                e.dispatch((w.n_out.div_ceil(nr), 1), 32 * ks);
+            }
+            MOp::QkRope {
+                qkv,
+                qo,
+                kv,
+                qn,
+                kn,
+                p,
+                t: tk,
+                ..
+            } => {
+                let (pipe, sq, so, cs) = tk.expect("multi-token rope");
+                let mut p = *p;
+                p.pos = pos as u32;
+                e.pipe(pipe);
+                e.buf(arena, *qkv, 0);
+                e.buf(arena, *qo, 1);
+                e.buf(kvb[*kv].0, 0, 2);
+                e.buf(kvb[*kv].1, 0, 3);
+                e.buf(consts, qn.unwrap_or(0), 4);
+                e.buf(consts, kn.unwrap_or(0), 5);
+                e.bytes(&p, 6);
+                e.buf(arena, cs, 7);
+                e.bytes(&[sq, so, 2 * p.half_rot, 0u32], 8);
+                e.dispatch(((p.nh + 2 * p.nkv) as usize, t), p.hd as usize);
+            }
+            MOp::AddNorm {
+                y,
+                x,
+                out,
+                wy,
+                wn,
+                p,
+                threads,
+                t: tk,
+                ..
+            } => {
+                let (pipe, ts) = tk.expect("multi-token add-norm");
+                e.pipe(pipe);
+                e.buf(arena, *y, 0);
+                e.buf(arena, *x, 1);
+                e.buf(arena, *out, 2);
+                e.buf(consts, *wy, 3);
+                e.buf(consts, *wn, 4);
+                e.bytes(p, 5);
+                e.bytes(&ts, 6);
+                e.dispatch((1, t), *threads);
+            }
+            MOp::Ew {
+                a, b, out, n, p, t: tk, ..
+            } => {
+                let (pipe, ts) = tk.expect("multi-token elementwise");
+                e.pipe(pipe);
+                e.buf(arena, *a, 0);
+                e.buf(arena, *b, 1);
+                e.buf(arena, *out, 2);
+                e.bytes(p, 3);
+                e.bytes(n, 4);
+                e.bytes(&ts, 5);
+                e.dispatch(((*n as usize).div_ceil(256), t), 256);
+            }
+            MOp::Glu {
+                g, u, out, n, gelu, t: tk, ..
+            } => {
+                let (pipe, ts) = tk.expect("multi-token glu");
+                e.pipe(pipe);
+                e.buf(arena, *g, 0);
+                e.buf(arena, *u, 1);
+                e.buf(arena, *out, 2);
+                e.bytes(&[*n, *gelu], 3);
+                e.bytes(&ts, 4);
+                e.dispatch(((*n as usize).div_ceil(256), t), 256);
+            }
+            MOp::GdnConv {
+                x,
+                out,
+                state,
+                w,
+                dim,
+                kc,
+                t: tk,
+                ..
+            } => {
+                let (pipe, sx, so) = tk.expect("multi-token conv");
+                e.pipe(pipe);
+                e.buf(arena, *x, 0);
+                e.buf(arena, *out, 1);
+                e.buf(stb[*state].0, stb[*state].1, 2);
+                e.buf(consts, *w, 3);
+                e.bytes(&[*dim, *kc], 4);
+                e.bytes(&[t as u32, sx, so, 0], 5);
+                e.dispatch(((*dim as usize).div_ceil(256), 1), 256);
+            }
+            MOp::GdnRule {
+                c,
+                z,
+                b,
+                a,
+                out,
+                state,
+                cst,
+                p,
+                t: tk,
+                ..
+            } => {
+                let (pipe, sc, sp, so) = tk.expect("multi-token delta rule");
+                e.pipe(pipe);
+                e.buf(arena, *c, 0);
+                e.buf(arena, *z, 1);
+                e.buf(arena, *b, 2);
+                e.buf(arena, *a, 3);
+                e.buf(arena, *out, 4);
+                e.buf(stb[*state].0, stb[*state].1, 5);
+                e.buf(consts, *cst, 6);
+                e.bytes(p, 7);
+                e.bytes(&[t as u32, sc, sp, so], 8);
+                e.dispatch((p.nv as usize, 1), (p.hdk / 32 * p.hdv) as usize);
+            }
+            MOp::Attn {
+                grp,
+                pipe,
+                combine,
+                q,
+                out,
+                kv,
+                gate,
+                window,
+                p,
+                threads,
+                hd,
+                t: tk,
+                block,
+            } => {
+                let (sq, so, sg) = tk.expect("multi-token attention");
+                for j in 0..t {
+                    // Token j attends to the positions up to its own, split as a single-token
+                    // step at that position would be; a draft block's tokens to the context
+                    // before the block and to the block.
+                    let (len, lo) = match block {
+                        None => {
+                            let len = pos + j + 1;
+                            (len, window.map_or(0, |w| len.saturating_sub(w)))
+                        }
+                        Some((causal, w)) => (
+                            if *causal { pos + j + 1 } else { pos + t },
+                            if *w > 0 { pos.saturating_sub(*w) } else { 0 },
+                        ),
+                    };
+                    let mut p = *p;
+                    p.len = len as u32;
+                    p.lo = lo as u32;
+                    let n = (p.len - p.lo) as usize;
+                    let chunk = n.div_ceil(ATTN_MAX_SPLIT).next_multiple_of(256).max(256);
+                    p.nsplit = n.div_ceil(chunk) as u32;
+                    p.chunk = chunk as u32;
+                    let part = self.part + j * self.part_stride;
+                    let gt = gate.map_or(0, |g| g + j * sg);
+                    e.pipe(*pipe);
+                    e.buf(arena, *q + j * sq, 0);
+                    e.buf(kvb[*kv].0, 0, 1);
+                    e.buf(kvb[*kv].1, 0, 2);
+                    e.buf(arena, *out + j * so, 3);
+                    e.buf(arena, gt, 4);
+                    e.bytes(&p, 5);
+                    e.buf(arena, part, 6);
+                    e.dispatch((p.nh as usize / grp, p.nsplit as usize), *threads);
+                    if p.nsplit > 1 {
+                        e.barrier();
+                        e.pipe(*combine);
+                        e.buf(arena, part, 0);
+                        e.buf(arena, *out + j * so, 1);
+                        e.buf(arena, gt, 2);
+                        e.bytes(&p, 3);
+                        e.bytes(hd, 4);
+                        e.dispatch((p.nh as usize, 1), 256);
+                    }
+                }
+            }
+            MOp::Topk { .. } | MOp::Experts { .. } | MOp::Steer { .. } | MOp::NeuronEdit { .. } => {
+                unreachable!("single-token op in a multi-token plan")
+            }
+        }
+    }
+}
+
 impl DecodePlan for MetalPlan<'_> {
+    fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    fn replay_recurrent(&self, slot: &mut Slot, states: &mut [&mut [f32]], keep: usize) -> bool {
+        if self.tokens < 2 || keep == 0 || keep > self.tokens {
+            return false;
+        }
+        let _g = self.lock.lock().unwrap();
+        let Some(ms) = slot
+            .0
+            .as_mut()
+            .and_then(|b| b.downcast_mut::<MetalSlot>())
+            .filter(|m| m.plan == self.id)
+        else {
+            return false;
+        };
+        if states.len() != self.states.len() || !self.wrap_states(ms, states) {
+            return false;
+        }
+        let stb: Vec<(Id, usize)> = ms
+            .states
+            .iter()
+            .map(|(_, _, b)| b.as_ref().map_or((std::ptr::null_mut(), 0), |b| (b.id, b.offset_bytes)))
+            .collect();
+        let ops: Vec<&MOp> = self
+            .ops
+            .iter()
+            .filter(|o| matches!(o, MOp::GdnConv { .. } | MOp::GdnRule { .. }))
+            .collect();
+        let indirect = if self.be.residency.is_some() { &[][..] } else { &self.indirect[..] };
+        let (ok, _) = run_concurrent(self.be, &self.f, &[std::ops::Range { start: 0, end: 1 }], |e, _| {
+            e.use_resources(indirect);
+            for op in &ops {
+                self.encode_multi(e, op, self.arena, self.consts, &[], &stb, 0, keep);
+                e.barrier();
+            }
+        });
+        ok
+    }
+
     fn step(&self, slot: &mut Slot, s: Step) -> bool {
         let t_start = Instant::now();
         let _g = self.lock.lock().unwrap();
-        if s.kv.len() != self.kv.len()
-            || s.rope_cs.len() != 2 * self.rope_halves.iter().sum::<usize>()
-            || self.input2.is_some_and(|(_, n)| s.x2.len() != n)
-            || s.hidden.len() < self.hidden.1
+        let t = s.t;
+        if t == 0
+            || t > self.tokens
+            || s.kv.len() != self.kv.len()
+            || s.rope_cs.len() != 2 * t * self.rope_halves.iter().sum::<usize>()
+            || s.x.len() != t * self.n_input
+            || self.input2.is_some_and(|(_, n)| s.x2.len() != t * n)
+            || s.hidden.len() < t * self.hidden.1
+            || s.capture
+                .as_ref()
+                .is_some_and(|c| self.capture.is_none_or(|(_, n)| c.len() < t * n))
             || s.states.len() != self.states.len()
             || s.states.iter().zip(&self.states).any(|(a, &n)| a.len() != n)
         {
@@ -1684,7 +2207,7 @@ impl DecodePlan for MetalPlan<'_> {
         }
         let ms = slot.0.as_mut().unwrap().downcast_mut::<MetalSlot>().unwrap();
         let pos = s.pos;
-        if !self.sync_kv(ms, s.kv, pos) || !self.wrap_states(ms, s.states) {
+        if !self.sync_kv(ms, s.kv, pos, t) || !self.wrap_states(ms, s.states) {
             return false;
         }
         let stb: Vec<(Id, usize)> = ms
@@ -1695,9 +2218,22 @@ impl DecodePlan for MetalPlan<'_> {
         let t_synced = Instant::now();
         let arena = self.arena;
         let base = self.f.contents(arena);
-        unsafe { std::ptr::copy_nonoverlapping(s.x.as_ptr(), base.add(self.input) as *mut f32, self.hidden.1) };
-        if let Some((off, n)) = self.input2 {
-            unsafe { std::ptr::copy_nonoverlapping(s.x2.as_ptr(), base.add(off) as *mut f32, n) };
+        let (h, ni) = (self.hidden.1, self.n_input);
+        for j in 0..t {
+            unsafe { std::ptr::copy_nonoverlapping(s.x[j * ni..].as_ptr(), base.add(self.input + j * self.strides[0]) as *mut f32, ni) };
+            if let Some((off, n)) = self.input2 {
+                unsafe { std::ptr::copy_nonoverlapping(s.x2[j * n..].as_ptr(), base.add(off + j * self.strides[3]) as *mut f32, n) };
+            }
+        }
+        if self.tokens > 1 {
+            // The per-token RoPE rows, table by table (`tokens` rows reserved per table).
+            let (mut src, mut dst) = (0, self.rope_off);
+            for &half in &self.rope_halves {
+                let n = t * 2 * half;
+                unsafe { std::ptr::copy_nonoverlapping(s.rope_cs[src..].as_ptr(), base.add(dst) as *mut f32, n) };
+                src += n;
+                dst += self.tokens * 2 * half * 4;
+            }
         }
         match (self.params, s.params) {
             (Some(((ho, hn), (co, cn))), Some((hot, cold, key))) if hot.len() == hn && cold.len() == cn => {
@@ -1756,6 +2292,10 @@ impl DecodePlan for MetalPlan<'_> {
                         continue;
                     }
                 }
+                if self.tokens > 1 {
+                    self.encode_multi(e, op, arena, consts, &kvb, &stb, pos, t);
+                    continue;
+                }
                 match op {
                     MOp::Barrier => e.barrier(),
                     MOp::Norm {
@@ -1766,6 +2306,7 @@ impl DecodePlan for MetalPlan<'_> {
                         p,
                         rows,
                         threads,
+                        ..
                     } => {
                         e.pipe(*pipe);
                         e.buf(arena, *x, 0);
@@ -1784,6 +2325,7 @@ impl DecodePlan for MetalPlan<'_> {
                         y,
                         mode,
                         gate,
+                        ..
                     } => encode_mv(e, *pipe, *nr, *ks, w, w2.as_ref(), (arena, *x), (arena, *y), *mode, (arena, *gate)),
                     MOp::Topk {
                         pipe,
@@ -1792,6 +2334,7 @@ impl DecodePlan for MetalPlan<'_> {
                         n,
                         k,
                         scale,
+                        ..
                     } => {
                         e.pipe(*pipe);
                         e.buf(arena, *logits, 0);
@@ -1817,6 +2360,7 @@ impl DecodePlan for MetalPlan<'_> {
                         inter,
                         k,
                         edit,
+                        ..
                     } => {
                         let p = |n_out: usize, n_in: usize, mode: MvMode, q: (u32, u32), r2: usize| MvParams {
                             n_out: n_out as u32,
@@ -1866,6 +2410,7 @@ impl DecodePlan for MetalPlan<'_> {
                         kn,
                         p,
                         cs: c0,
+                        ..
                     } => {
                         let mut p = *p;
                         p.pos = pos as u32;
@@ -1889,6 +2434,7 @@ impl DecodePlan for MetalPlan<'_> {
                         wn,
                         p,
                         threads,
+                        ..
                     } => {
                         e.pipe(*pipe);
                         e.buf(arena, *y, 0);
@@ -1899,7 +2445,7 @@ impl DecodePlan for MetalPlan<'_> {
                         e.bytes(p, 5);
                         e.dispatch((1, 1), *threads);
                     }
-                    MOp::Ew { pipe, a, b, out, n, p } => {
+                    MOp::Ew { pipe, a, b, out, n, p, .. } => {
                         e.pipe(*pipe);
                         e.buf(arena, *a, 0);
                         e.buf(arena, *b, 1);
@@ -1924,7 +2470,9 @@ impl DecodePlan for MetalPlan<'_> {
                         e.bytes(&[*n, 0u32, 0, 0], 3);
                         e.dispatch(((*n as usize).div_ceil(64), 1), 64);
                     }
-                    MOp::Glu { pipe, g, u, out, n, gelu } => {
+                    MOp::Glu {
+                        pipe, g, u, out, n, gelu, ..
+                    } => {
                         e.pipe(*pipe);
                         e.buf(arena, *g, 0);
                         e.buf(arena, *u, 1);
@@ -1940,6 +2488,7 @@ impl DecodePlan for MetalPlan<'_> {
                         w,
                         dim,
                         kc,
+                        ..
                     } => {
                         #[repr(C)]
                         struct Gc {
@@ -1964,6 +2513,7 @@ impl DecodePlan for MetalPlan<'_> {
                         state,
                         cst,
                         p,
+                        ..
                     } => {
                         e.pipe(*pipe);
                         e.buf(arena, *c, 0);
@@ -1988,6 +2538,7 @@ impl DecodePlan for MetalPlan<'_> {
                         p,
                         threads,
                         hd,
+                        ..
                     } => {
                         let mut p = *p;
                         p.len = (pos + 1) as u32;
@@ -2027,22 +2578,42 @@ impl DecodePlan for MetalPlan<'_> {
         let t_ran = Instant::now();
         let _ = gpu;
         unsafe {
-            std::ptr::copy_nonoverlapping(base.add(self.hidden.0) as *const f32, s.hidden.as_mut_ptr(), self.hidden.1);
+            for j in 0..t {
+                std::ptr::copy_nonoverlapping(
+                    base.add(self.hidden.0 + j * self.strides[1]) as *const f32,
+                    s.hidden[j * h..].as_mut_ptr(),
+                    h,
+                );
+            }
             if let (Some(l), Some((off, n))) = (s.logits, self.logits)
                 && want_logits
             {
-                super::par_copy(l.as_mut_ptr(), base.add(off) as *const f32, n.min(l.len()));
+                let n = n.min(l.len() / t);
+                for j in 0..t {
+                    super::par_copy(l[j * n..].as_mut_ptr(), base.add(off + j * self.strides[2]) as *const f32, n);
+                }
+            }
+            if let (Some(c), Some((off, n))) = (s.capture, self.capture) {
+                for j in 0..t {
+                    std::ptr::copy_nonoverlapping(base.add(off + j * self.strides[4]) as *const f32, c[j * n..].as_mut_ptr(), n);
+                }
             }
         }
-        // The new keys and values go back to the host caches.
-        for (i, (m, c)) in ms.kv.iter_mut().zip(s.kv.iter_mut()).enumerate() {
+        // The new keys and values go back to the host caches (scratch ones stay on the device,
+        // to be overwritten).
+        if s.scratch {
+            for m in ms.kv.iter_mut() {
+                m.synced = pos;
+            }
+        }
+        for (i, (m, c)) in ms.kv.iter_mut().zip(s.kv.iter_mut()).enumerate().filter(|_| !s.scratch) {
             let row = self.kv[i].0 * self.kv[i].1;
             unsafe {
-                let k = std::slice::from_raw_parts((self.f.contents(m.k) as *const f32).add(pos * row), row);
-                let v = std::slice::from_raw_parts((self.f.contents(m.v) as *const f32).add(pos * row), row);
-                c.push(k, v, 1);
+                let k = std::slice::from_raw_parts((self.f.contents(m.k) as *const f32).add(pos * row), t * row);
+                let v = std::slice::from_raw_parts((self.f.contents(m.v) as *const f32).add(pos * row), t * row);
+                c.push(k, v, t);
             }
-            m.synced = pos + 1;
+            m.synced = pos + t;
             c.kept = c.len;
         }
         if trace() {
@@ -2291,6 +2862,229 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// The multi-token matvecs give every token's rows bit for bit as the single-token kernel does
+    /// (speculative verification on the GPU reproduces one-token decoding), in every mode.
+    #[test]
+    fn decode_mvk_matches_single_token() {
+        let Ok(be) = MetalBackend::new() else { return };
+        let f = Fns::new(&be);
+        let (n_out, n_in) = (37, 512);
+        let mut seed = 5u64;
+        for ntok in [5, 11] {
+            let fmts = [
+                MvFmt::Bf16,
+                MvFmt::Q8,
+                MvFmt::Q4,
+                MvFmt::Gguf(GgmlType::F16),
+                MvFmt::Gguf(GgmlType::Q4_0),
+                MvFmt::Gguf(GgmlType::Q8_0),
+                MvFmt::Gguf(GgmlType::Q4_K),
+                MvFmt::Gguf(GgmlType::Q6_K),
+                MvFmt::Gguf(GgmlType::IQ4_XS),
+            ];
+            for fmt in fmts {
+                let (d1, s1, _) = matrix(fmt, n_out, n_in, &mut seed);
+                let (d2, s2, _) = matrix(fmt, n_out, n_in, &mut seed);
+                let dl = d1.len().next_multiple_of(4096);
+                let sl = s1.len().next_multiple_of(4096);
+                let mut data = PageVec::<u8>::zeroed(2 * dl);
+                let mut sc = PageVec::<u8>::zeroed(2 * sl);
+                data[..d1.len()].copy_from_slice(&d1);
+                data[dl..dl + d2.len()].copy_from_slice(&d2);
+                sc[..s1.len()].copy_from_slice(&s1);
+                sc[sl..sl + s2.len()].copy_from_slice(&s2);
+                let db = be.wrap(data.as_ptr(), data.len()).unwrap();
+                let sb = be.wrap(sc.as_ptr(), sc.len()).unwrap();
+                let wt = |i: usize| MvWeight {
+                    fmt,
+                    n_out,
+                    n_in,
+                    data: db.id,
+                    data_off: (db.offset_bytes + i * dl) as u64,
+                    scales: sb.id,
+                    scales_off: (sb.offset_bytes + i * sl) as u64,
+                    offs: db.id,
+                    offs_off: 0,
+                    gpr: match fmt {
+                        MvFmt::Gguf(k) => k.row_bytes(n_in) as u32,
+                        MvFmt::Bf16 => (n_in * 2) as u32,
+                        _ => 0,
+                    },
+                    gk: 0,
+                };
+                // Token rows of x 528 floats apart, of y 40 apart (gates: one per token, at y's end).
+                let (sx, sy) = (n_in + 16, n_out + 3);
+                let x: Vec<f32> = (0..ntok * sx).map(|_| lcg(&mut seed)).collect();
+                let y0: Vec<f32> = (0..ntok * sy).map(|_| lcg(&mut seed)).collect();
+                let mut st = be.staging.lock().unwrap();
+                let st = &mut *st;
+                assert!(be.ensure_staging(st, ntok * sx * 4, ntok * sy * 4));
+                let variants: Vec<(usize, usize)> = if fmt.specialized() { MV_VARIANTS.to_vec() } else { vec![(2, 4)] };
+                for (nr, ks) in variants {
+                    for mode in [MvMode::Store, MvMode::Add, MvMode::SiluPair, MvMode::AddGated] {
+                        let up = wt(1);
+                        let pair = (mode == MvMode::SiluPair).then_some(&up);
+                        let reset = || unsafe {
+                            std::ptr::copy_nonoverlapping(x.as_ptr(), f.contents(st.x) as *mut f32, x.len());
+                            std::ptr::copy_nonoverlapping(y0.as_ptr(), f.contents(st.y) as *mut f32, y0.len());
+                        };
+                        reset();
+                        let pipe = be.mv_pipe(fmt, nr, ks).unwrap();
+                        let (ok, _) = run_concurrent(&be, &f, &[std::ops::Range { start: 0, end: 1 }], |e, _| {
+                            for j in 0..ntok {
+                                encode_mv(
+                                    e,
+                                    pipe,
+                                    nr,
+                                    ks,
+                                    &wt(0),
+                                    pair,
+                                    (st.x, j * sx * 4),
+                                    (st.y, j * sy * 4),
+                                    mode,
+                                    (st.y, (j * sy + n_out) * 4),
+                                );
+                            }
+                        });
+                        assert!(ok);
+                        let want: Vec<f32> = unsafe { std::slice::from_raw_parts(f.contents(st.y) as *const f32, y0.len()) }.to_vec();
+                        reset();
+                        // Up to 8 tokens through the 8-token kernels, more through the 16-token ones.
+                        let tt = if ntok <= 8 { 8 } else { 16 };
+                        let tnr = mvk_rows(tt);
+                        let tpipe = be.mvk_pipe(fmt, tnr, ks, tt).unwrap();
+                        let (ok, _) = run_concurrent(&be, &f, &[std::ops::Range { start: 0, end: 1 }], |e, _| {
+                            let w = wt(0);
+                            let w2 = pair.unwrap_or(&w);
+                            let p = MvkParams {
+                                m: MvParams {
+                                    n_out: n_out as u32,
+                                    n_in: n_in as u32,
+                                    mode: mode as u32,
+                                    rows_per_tg: tnr as u32,
+                                    w_off: w.data_off,
+                                    s_off: w.scales_off,
+                                    w2_off: w2.data_off,
+                                    s2_off: w2.scales_off,
+                                    gpr: w.gpr,
+                                    ..Default::default()
+                                },
+                                ntok: ntok as u32,
+                                sx: sx as u32,
+                                sy: sy as u32,
+                                sgate: sy as u32,
+                            };
+                            e.pipe(tpipe);
+                            e.buf(w.data, 0, 0);
+                            e.buf(w.scales, 0, 1);
+                            e.buf(st.x, 0, 2);
+                            e.buf(st.y, 0, 3);
+                            e.bytes(&p, 4);
+                            e.buf(w2.data, 0, 5);
+                            e.buf(w2.scales, 0, 6);
+                            e.buf(w.offs, 0, 7);
+                            e.buf(w2.offs, 0, 8);
+                            e.buf(st.y, n_out * 4, 9);
+                            e.dispatch((n_out.div_ceil(tnr), 1), 32 * ks);
+                        });
+                        assert!(ok);
+                        let got = unsafe { std::slice::from_raw_parts(f.contents(st.y) as *const f32, y0.len()) };
+                        for j in 0..ntok {
+                            for r in 0..n_out {
+                                let (a, b) = (got[j * sy + r], want[j * sy + r]);
+                                assert_eq!(a.to_bits(), b.to_bits(), "{fmt:?} {nr}x{ks} {mode:?} token {j} row {r}: {a} vs {b}");
+                            }
+                        }
+                    }
+                }
+                for b in [db.id, sb.id] {
+                    unsafe { (f.void)(b, f.s_release) };
+                }
+            }
+        }
+    }
+
+    /// Multi-token matvec times by rows per threadgroup, SIMD-group split and token count
+    /// (`OXINFER_MVK_ALL=1 cargo test --release --lib decode_mvk_bench -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn decode_mvk_bench() {
+        let be = MetalBackend::new().unwrap();
+        let f = Fns::new(&be);
+        let mut seed = 9u64;
+        for fmt in [MvFmt::Bf16, MvFmt::Q8, MvFmt::Q4, MvFmt::Gguf(GgmlType::Q4_K)] {
+            for (n_out, n_in) in [(5120, 5120), (17408, 5120), (5120, 17408)] {
+                let (d, sc, _) = matrix(fmt, n_out, n_in, &mut seed);
+                let copies = (512usize << 20).div_ceil(d.len()).clamp(1, 32);
+                let (dl, sl) = (d.len().next_multiple_of(4096), sc.len().next_multiple_of(4096));
+                let mut big = PageVec::<u8>::zeroed(copies * dl);
+                let mut bigs = PageVec::<u8>::zeroed(copies * sl);
+                for c in 0..copies {
+                    big[c * dl..c * dl + d.len()].copy_from_slice(&d);
+                    bigs[c * sl..c * sl + sc.len()].copy_from_slice(&sc);
+                }
+                let wb = be.wrap(big.as_ptr(), big.len()).unwrap();
+                let sbuf = be.wrap(bigs.as_ptr(), bigs.len()).unwrap();
+                let mut st = be.staging.lock().unwrap();
+                let st = &mut *st;
+                assert!(be.ensure_staging(st, 8 * n_in * 4, 8 * n_out * 4));
+                let ks_list: Vec<usize> = if fmt.specialized() { vec![1, 2, 4] } else { vec![4] };
+                let mut line = format!("{:>5} {n_out}x{n_in}:", fmt.name());
+                for ntok in [1, 4, 8] {
+                    for nr in [1, 2, 4] {
+                        for &ks in &ks_list {
+                            let Some(pipe) = be.mvk_pipe(fmt, nr, ks, 8) else { continue };
+                            let p = |c: usize| MvkParams {
+                                m: MvParams {
+                                    n_out: n_out as u32,
+                                    n_in: n_in as u32,
+                                    rows_per_tg: nr as u32,
+                                    w_off: (wb.offset_bytes + c * dl) as u64,
+                                    s_off: (sbuf.offset_bytes + c * sl) as u64,
+                                    w2_off: (wb.offset_bytes + c * dl) as u64,
+                                    s2_off: (sbuf.offset_bytes + c * sl) as u64,
+                                    gpr: match fmt {
+                                        MvFmt::Gguf(k) => k.row_bytes(n_in) as u32,
+                                        MvFmt::Bf16 => (n_in * 2) as u32,
+                                        _ => 0,
+                                    },
+                                    ..Default::default()
+                                },
+                                ntok: ntok as u32,
+                                sx: n_in as u32,
+                                sy: n_out as u32,
+                                sgate: 0,
+                            };
+                            let reps = 32;
+                            let mut best = f64::MAX;
+                            for _ in 0..4 {
+                                best = best.min(timed(&be, |e| {
+                                    for r in 0..reps {
+                                        e.pipe(pipe);
+                                        e.buf(wb.id, 0, 0);
+                                        e.buf(sbuf.id, 0, 1);
+                                        e.buf(st.x, 0, 2);
+                                        e.buf(st.y, 0, 3);
+                                        e.bytes(&p(r % copies), 4);
+                                        e.buf(wb.id, 0, 5);
+                                        e.buf(sbuf.id, 0, 6);
+                                        e.buf(wb.id, 0, 7);
+                                        e.buf(wb.id, 0, 8);
+                                        e.buf(st.y, 0, 9);
+                                        e.dispatch((n_out.div_ceil(nr), 1), 32 * ks);
+                                    }
+                                }));
+                            }
+                            let _ = write!(line, " t{ntok} {nr}x{ks}:{:.0}us", best / reps as f64 * 1e6);
+                        }
+                    }
+                }
+                println!("{line}");
+                let _ = f.contents(st.x);
             }
         }
     }

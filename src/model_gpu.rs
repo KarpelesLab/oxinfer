@@ -8,6 +8,12 @@ use std::borrow::Cow;
 
 impl<'a> Model<'a> {
     fn gpu_graph<'s>(&'s self, lay: Option<&crate::intervene::GpuLayout>) -> Option<Graph<'s>> {
+        self.gpu_graph_with(lay, None)
+    }
+
+    /// [`Self::gpu_graph`], plus for multi-token plans (`multi`: layers whose outputs to capture)
+    /// the copies of those layers' outputs.
+    fn gpu_graph_with<'s>(&'s self, lay: Option<&crate::intervene::GpuLayout>, multi: Option<&[usize]>) -> Option<Graph<'s>> {
         let cfg = &self.cfg;
         if cfg.bidirectional() {
             return None;
@@ -134,6 +140,11 @@ impl<'a> Model<'a> {
             }
         }
         let qscale = cfg.query_scale();
+        // Multi-token plans: the residual after the captured layers, copied out.
+        let cap = multi.map(|m| g.buf((m.len() * h).max(1)));
+        if let (Some(c), Some(m)) = (cap, multi) {
+            g.capture = Some((c, m.len() * h));
+        }
         // The norm after each residual step is fused into it (`Op::AddNorm`), across layers too:
         // the input norm of a layer comes with the last step of the one before.
         let mut have_hn = false;
@@ -195,6 +206,7 @@ impl<'a> Model<'a> {
                 scale: qscale,
                 window: layer.sliding.then_some(cfg.sliding_window),
                 gate: None,
+                block: None,
             });
             g.ops.push(lin(&layer.o, h, nh * hd, att, ob, LinMode::Store)?);
             // A hooked point splits the fused residual step: add, hook, then the norm.
@@ -345,6 +357,17 @@ impl<'a> Model<'a> {
                 steer(&mut g, 2 * l + 2);
                 g.ops.push(Op::norm(x, next_norm.0, next_norm.1, h, eps));
             }
+            if let (Some(c), Some(m)) = (cap, multi) {
+                for (i, _) in m.iter().enumerate().filter(|e| *e.1 == l) {
+                    g.ops.push(Op::Ew {
+                        kind: Ew::Scale(1.0),
+                        a: x,
+                        b: None,
+                        out: c.at(i * h),
+                        n: h,
+                    });
+                }
+            }
             have_hn = true;
         }
         g.head_from = g.ops.len();
@@ -378,6 +401,99 @@ impl<'a> Model<'a> {
             let g = self.gpu_graph(lay)?;
             be.decode_plan(&g)
         })
+    }
+
+    /// The multi-token GPU plan capturing the outputs of `layers` (sorted), compiled on first use.
+    fn gpu_multi_plan(&self, layers: &[usize], tokens: usize) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
+        if !crate::gpu::decode_enabled() || self.stream.is_some() {
+            return None;
+        }
+        let key = layers.iter().fold((1u64 << 63) | tokens as u64, |k, &l| {
+            k.wrapping_mul(0x100000001b3).wrapping_add(l as u64 + 1)
+        });
+        self.gpu_plans.get(key, || {
+            let be = crate::gpu::active()?;
+            let plan = self
+                .gpu_graph_with(None, Some(layers))
+                .and_then(|g| be.decode_plan_multi(&g, tokens));
+            if plan.is_none() {
+                eprintln!("[no multi-token GPU plan for this model: speculative verification runs on the CPU]");
+            }
+            plan
+        })
+    }
+
+    /// Runs `tokens` (at most 16) through a multi-token GPU plan, as one-token GPU steps would one
+    /// after the other: the (softcapped) logits of every token and, in `feats`, the residual
+    /// stream entering each of `layers` (as [`crate::dspark::Target::forward_feats`]). None
+    /// (nothing changed) when GPU decoding is off or the model cannot.
+    pub(super) fn gpu_verify(&self, sess: &mut Session, tokens: &[u32], layers: &[usize], feats: &mut Vec<f32>) -> Option<Vec<f32>> {
+        let t = tokens.len();
+        if t == 0 || t > 16 || sess.iv.active() || layers.contains(&0) || self.cfg.bidirectional() {
+            return None;
+        }
+        let mut cap: Vec<usize> = layers.iter().map(|&l| l - 1).collect();
+        cap.sort_unstable();
+        cap.dedup();
+        let plan = self.gpu_multi_plan(&cap, if t <= 8 { 8 } else { 16 })?;
+        let _timer = crate::prof::start(crate::prof::Cat::Matmul);
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let mut x = Vec::with_capacity(t * h);
+        let mut x2 = Vec::new();
+        for &tok in tokens {
+            x.extend_from_slice(&self.embed_scaled(tok));
+            if let Some(ple) = &self.ple {
+                let mut e = vec![0f32; cfg.num_hidden_layers * cfg.hidden_size_per_layer_input];
+                ple.embed.row(tok as usize, &mut e);
+                x2.extend_from_slice(&e);
+            }
+        }
+        let positions: Vec<usize> = (sess.pos..sess.pos + t).collect();
+        let mut cs = Vec::new();
+        for f in [&self.inv_freq_sliding, &self.inv_freq_full] {
+            let half = f.len();
+            let (c, s) = crate::kernels::rope_tables(&positions, f);
+            for j in 0..t {
+                cs.extend_from_slice(&c[j * half..(j + 1) * half]);
+                cs.extend_from_slice(&s[j * half..(j + 1) * half]);
+            }
+        }
+        let mut hidden = vec![0f32; t * h];
+        let mut logits = vec![0f32; t * cfg.vocab_size];
+        let mut captured = vec![0f32; t * cap.len() * h];
+        let mut kv: Vec<&mut LayerCache> = sess.caches.iter_mut().flatten().collect();
+        let ok = plan.step(
+            &mut sess.gpu,
+            Step {
+                pos: sess.pos,
+                t,
+                rope_cs: &cs,
+                x: &x,
+                x2: &x2,
+                kv: &mut kv,
+                states: &mut [],
+                hidden: &mut hidden,
+                logits: Some(&mut logits),
+                params: None,
+                capture: Some(&mut captured),
+                scratch: false,
+            },
+        );
+        if !ok {
+            return None;
+        }
+        sess.pos += t;
+        let (nf, nc) = (layers.len(), cap.len());
+        feats.clear();
+        feats.resize(t * nf * h, 0.0);
+        for j in 0..t {
+            for (fi, &l) in layers.iter().enumerate() {
+                let ci = cap.binary_search(&(l - 1)).unwrap();
+                feats[(j * nf + fi) * h..(j * nf + fi + 1) * h].copy_from_slice(&captured[(j * nc + ci) * h..(j * nc + ci + 1) * h]);
+            }
+        }
+        Some(logits)
     }
 
     /// Runs token `tok` through the GPU decode plan: the final-normed hidden state and, if
@@ -419,6 +535,7 @@ impl<'a> Model<'a> {
             &mut sess.gpu,
             Step {
                 pos: sess.pos,
+                t: 1,
                 rope_cs: &cs,
                 x: &x,
                 x2: &x2,
@@ -427,6 +544,8 @@ impl<'a> Model<'a> {
                 hidden: &mut hidden,
                 logits: logits.as_deref_mut(),
                 params: data.zip(ivc.as_ref()).map(|(d, c)| (&hot[..], &d.cold[..], c.id())),
+                capture: None,
+                scratch: false,
             },
         );
         if !ok {
