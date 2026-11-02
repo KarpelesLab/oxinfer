@@ -1,7 +1,7 @@
 [package]
 name = "oxinfer"
 # 0.x while the API and the on-disk pre-quantized format may still change.
-version = "0.0.6"
+version = "0.0.7"
 edition = "2024"
 rust-version = "1.95"
 description = "Local LLM inference in pure Rust (Gemma 4, Qwen 3.5/3.8): SIMD CPU kernels everywhere, GPUs detected at run time, and a WebAssembly + WebGPU browser build."
