@@ -268,7 +268,9 @@ beside it (in its folder or the one above). The chat format is the model's templ
 otherwise; the model thinks in `[THINK]...[/THINK]` either way, shown dimmed), `[INST]` turns,
 `[AVAILABLE_TOOLS]` / `[TOOL_CALLS]` tool calling, images as rows of `[IMG]` closed by
 `[IMG_BREAK]` / `[IMG_END]`. Speculative decoding (the checkpoint's DSpark head) is not
-implemented.
+implemented. [Runtime interventions](#runtime-interventions-neuron-edits-steering-abliteration-sae-features)
+work as for the other families: residual hooks around every layer, and neuron edits of layer 0's
+dense MLP, the shared expert or any routed expert.
 
 ```sh
 # unsloth's 378 GB UD-Q2_K_XL on a 128 GB Mac: the folder of parts (or any part, or the repo id)
@@ -668,14 +670,14 @@ the library (`Engine::set_interventions`, `oxinfer::intervene`) and the C API
 (`oxi_engine_set_interventions`). Interventions are set per request: changing a strength
 between two messages rebuilds a small set of hooks, not the model, and GPU decoding keeps its
 compiled plan. The shared code is in `src/intervene.rs` and `src/sae.rs`, wired into Qwen3.5 /
-3.8 (dense and MoE), Qwen3, Llama 3 and Gemma 4 / 3.
+3.8 (dense and MoE), Qwen3, Llama 3, Gemma 4 / 3 and Mistral Large 4.
 
 **Where the hooks are.** Layers are 0-based, as in the checkpoint's module names
 (`model.layers.14`).
 
 | Hook | Meaning |
 |---|---|
-| neuron `L:n` | element `n` of the input of `layers.L.mlp.down_proj`, that is `act(gate) * up`. MoE layers: per routed expert (`"expert": 3`) or the shared expert (`"expert": "shared"`). |
+| neuron `L:n` | element `n` of the input of `layers.L.mlp.down_proj`, that is `act(gate) * up`. MoE layers: per routed expert (`"expert": 3`; the expert's activation before its routing weight scales the output) or the shared expert (`"expert": "shared"`). Mistral Large 4: layer 0's dense MLP (24576 neurons) takes no `expert`; the MoE layers have the shared expert's 6144 (`mlp.shared_experts.down_proj`) and each routed expert's 6144 (`mlp.experts.down_proj[e]`). |
 | `post` of layer L | the layer's output, `hidden_states[L + 1]` in transformers. This is where llama.cpp control vectors and Qwen-Scope SAEs (`resid_post`) act. |
 | `mid` of layer L | the residual after the attention (or Gated DeltaNet) block was added |
 | `pre` of layer L | the layer's input: the output of layer L - 1, or the embeddings for layer 0 |
@@ -856,12 +858,16 @@ PyTorch:
 | Qwen3.5-2B-Base | Qwen-Scope layer 12: clamp, add, zero (TopK, error term kept) | 4e-5 | 3e-8 | |
 | Qwen3-0.6B | neuron edits, steering (post, mid), ablation | 7e-5 | 5e-8 | |
 | Gemma 4 E2B | neuron edits incl. resid_median, steering (post, mid), ablation | 2.2e-4 | ~0 | 1.3e-4 |
+| Mistral Large 4, tiny random checkpoint (`tools/mistral4_tiny.py`: dense layer 0, 16 experts + shared) | 8 neuron edits (dense scale and resid_median dose; shared add and clamp; routed set, zero, resid_median dose on generated positions, scale on prompt positions), steering (post, mid on generated, pre normalized), ablation in all layers | 2e-5 | 1e-7 | 1.7e-4 |
 
 The `resid_median` values matched to 4 digits (for example L13 9.1125, L14 10.1972 on the
 4B prompt).
 
 Greedy generation on Qwen3.5-4B with the dose edits produced the same 40 of 40 tokens as
-transformers' `generate` under the same hooks, with oxinfer decoding on the GPU.
+transformers' `generate` under the same hooks, with oxinfer decoding on the GPU. On the tiny
+Mistral Large 4, every spec (all of the row above, and neurons, steering and ablation alone) gave
+the same 8 of 8 greedy tokens as `generate` under the hooks; the reference edits the routed
+experts by running transformers' fused-expert loop with the edit in place.
 
 Qwen-Scope inspection agreed exactly: the top-5 features at all 25 positions of a sentence had
 the same ids in the same order as the release's encoder, with activations equal to the 2
@@ -963,6 +969,11 @@ CPU's own speed.
 ### Limits
 
 - **Core ML (ANEMLL) models** refuse interventions.
+- **Mistral Large 4** has no whole-pass GPU decode, so its hooks always run on the CPU between
+  the (GPU or CPU) matmuls; a prefill pass with routed-expert edits keeps that layer's experts on
+  the CPU. Typed decisions (`decision_from`) are not offered for it: a decision bundle is a LoRA
+  adapter and head trained on one backbone (Qwen3.5 / 3.8, Gemma 4), none exists for this model,
+  and its layers take no LoRA.
 - **Speculative decoding.**
   - Qwen MTP drafts come from the unedited MTP head, but the edited main model verifies every
     draft, so the output follows the edited model.

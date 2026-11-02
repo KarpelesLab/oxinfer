@@ -33,7 +33,7 @@ pub struct IvArgs {
 }
 
 pub const USAGE: &str = "\
-runtime interventions (Qwen3.5 / 3.8, Qwen3, Llama 3, Gemma 4 / 3; weights untouched):\n\
+runtime interventions (Qwen3.5 / 3.8, Qwen3, Llama 3, Gemma 4 / 3, Mistral Large 4; weights untouched):\n\
 \x20 --interventions F    a JSON spec (file, or inline when it starts with '{'; see the README)\n\
 \x20 --neuron-edit E      edit an MLP neuron (down_proj input), repeatable: LAYER:NEURON[@EXPERT|@shared],\n\
 \x20                      then scale=F | zero | add=F | set=F | clamp=MIN:MAX | dose=F[,unit=resid_median]\n\

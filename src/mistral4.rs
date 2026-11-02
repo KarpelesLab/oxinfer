@@ -28,6 +28,7 @@
 //! (`mistral-large4`, which split `kv_b` per head into `attn_k_b` / `attn_v_b`).
 
 use crate::config::Mistral4Config;
+use crate::intervene::{NeuronHook, Target};
 use crate::kernels::*;
 use crate::model::{Lin, Quant, Table, Weight, linear, linear_grouped, linear_multi, load_lin, table_quant};
 use crate::moe::{Act, Experts, NeedExperts, route_top_k};
@@ -153,8 +154,8 @@ impl Mlp<'_> {
     fn bytes(&self) -> usize {
         self.gate.bytes() + self.up.bytes() + self.down.bytes()
     }
-    /// `y = down(silu(gate(x)) * up(x))` for `t` rows.
-    fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32]) {
+    /// `y = down(silu(gate(x)) * up(x))` for `t` rows (`hook`: neuron edits of `target`).
+    fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32], hook: Option<(&NeuronHook, Target)>) {
         let mut g = vec![0f32; t * self.inter];
         let mut u = vec![0f32; t * self.inter];
         linear_multi(
@@ -164,6 +165,9 @@ impl Mlp<'_> {
             t,
         );
         silu_mul(&mut g, &u);
+        if let Some((hk, tg)) = hook {
+            hk.apply(tg, &mut g, self.inter);
+        }
         linear(&self.down, h, self.inter, &g, t, y);
     }
 }
@@ -181,6 +185,33 @@ struct Moe<'a> {
 enum Ffn<'a> {
     Dense(Mlp<'a>),
     Moe(Moe<'a>),
+}
+
+impl Ffn<'_> {
+    /// The intermediate size of `target` (the neurons a [`crate::intervene`] edit indexes: the
+    /// input of its `down_proj`), None when this layer has no such MLP.
+    fn inter(&self, target: Target) -> Option<usize> {
+        match (self, target) {
+            (Ffn::Dense(m), Target::Mlp) => Some(m.inter),
+            (Ffn::Moe(m), Target::Shared) => Some(m.shared.inter),
+            (Ffn::Moe(m), Target::Expert(e)) if e < m.experts.n_experts() => Some(m.experts.inter),
+            _ => None,
+        }
+    }
+
+    /// Column `n` of `target`'s down projection (`[h]`).
+    fn down_column(&self, target: Target, n: usize, h: usize) -> Vec<f32> {
+        let (down, inter) = match (self, target) {
+            (Ffn::Dense(m), _) => (&m.down, m.inter),
+            (Ffn::Moe(m), Target::Shared | Target::Mlp) => (&m.shared.down, m.shared.inter),
+            (Ffn::Moe(m), Target::Expert(e)) => (&m.experts.down[e], m.experts.inter),
+        };
+        let mut one = vec![0f32; inter];
+        one[n] = 1.0;
+        let mut y = vec![0f32; h];
+        linear(down, h, inter, &one, 1, &mut y);
+        y
+    }
 }
 
 /// The DSA indexer of a "full" layer.
@@ -249,6 +280,8 @@ pub struct Mistral4Session {
     idx: Vec<Option<Vec<f32>>>,
     idx_dim: usize,
     pub pos: usize,
+    /// Runtime interventions ([`crate::intervene`]).
+    pub iv: crate::intervene::State,
 }
 
 impl Mistral4Session {
@@ -638,6 +671,7 @@ impl<'a> Mistral4Model<'a> {
             idx: self.layers.iter().map(|l| l.attn.indexer.as_ref().map(|_| Vec::new())).collect(),
             idx_dim: c.index_head_dim,
             pos: 0,
+            iv: Default::default(),
         }
     }
 
@@ -775,6 +809,10 @@ impl<'a> Mistral4Model<'a> {
         // SSMax: the log-position basis of every query's scale.
         let lp: Vec<f32> = positions.iter().map(|&p| ((p + 1) as f32).ln()).collect();
         drop(timer);
+        let iv = sess.iv.active().then(|| sess.iv.clone());
+        if let Some(iv) = &iv {
+            iv.point(0, &mut x, h, start);
+        }
         let mut sel: Selection = Vec::new();
         let mut hn = vec![0f32; t * h];
         for (l, layer) in self.layers.iter().enumerate() {
@@ -783,6 +821,9 @@ impl<'a> Mistral4Model<'a> {
             let mut o = vec![0f32; t * h];
             self.attn_forward(l, &layer.attn, &hn, t, start, sess, &mut sel, (&cos, &sin), &lp, &mut o);
             add_inplace(&mut x, &o);
+            if let Some(iv) = &iv {
+                iv.point(2 * l + 1, &mut x, h, start);
+            }
             rmsnorm_f32w_rows(&x, h, &layer.ln_post, eps, &mut hn);
             o.fill(0.0);
             let need = |ids: &[usize]| {
@@ -791,11 +832,15 @@ impl<'a> Mistral4Model<'a> {
                 }
             };
             let need: NeedExperts = self.stream.as_ref().map(|_| &need as &dyn Fn(&[usize]));
+            let hook = iv.as_ref().and_then(|s| s.hook(l, start));
             match &layer.ffn {
-                Ffn::Dense(m) => m.forward(&hn, t, h, &mut o),
-                Ffn::Moe(m) => self.moe_forward(m, &hn, t, &mut o, need),
+                Ffn::Dense(m) => m.forward(&hn, t, h, &mut o, hook.as_ref().map(|k| (k, Target::Mlp))),
+                Ffn::Moe(m) => self.moe_forward(m, &hn, t, &mut o, need, hook.as_ref()),
             }
             add_inplace(&mut x, &o);
+            if let Some(iv) = &iv {
+                iv.point(2 * l + 2, &mut x, h, start);
+            }
             // Streaming: guess the next layer's experts from its router on this residual, so
             // they are read while its attention runs (decode-sized passes; prefill needs most).
             if let (Some(s), Some(next)) = (&self.stream, self.layers.get(l + 1))
@@ -821,10 +866,10 @@ impl<'a> Mistral4Model<'a> {
         x
     }
 
-    fn moe_forward(&self, m: &Moe, x: &[f32], t: usize, y: &mut [f32], need: NeedExperts) {
+    fn moe_forward(&self, m: &Moe, x: &[f32], t: usize, y: &mut [f32], need: NeedExperts, hook: Option<&NeuronHook>) {
         let c = &self.cfg;
         let h = c.hidden_size;
-        m.shared.forward(x, t, h, y);
+        m.shared.forward(x, t, h, y, hook.map(|k| (k, Target::Shared)));
         let ne = m.experts.n_experts();
         let mut logits = vec![0f32; t * ne];
         for_chunks(&mut logits, ne, t > 1, |ti, lg| {
@@ -836,7 +881,7 @@ impl<'a> Mistral4Model<'a> {
             .chunks(ne)
             .map(|lg| route(lg, m.experts.top_k, c.n_group, c.topk_group, c.routed_scaling_factor as f32))
             .collect();
-        m.experts.forward(x, t, h, &routes, y, need, None);
+        m.experts.forward(x, t, h, &routes, y, need, hook);
     }
 
     /// One layer's attention over `hn` (`[t, H]`, the normed residual) into `out` (`[t, H]`).
@@ -1216,6 +1261,9 @@ impl crate::generate::TextLm for Mistral4Model<'_> {
     fn n_layers(&self) -> usize {
         self.cfg.num_hidden_layers
     }
+    fn iv_state<'s>(&self, sess: &'s mut Mistral4Session) -> Option<&'s mut crate::intervene::State> {
+        Some(&mut sess.iv)
+    }
     fn session_len(&self, sess: &Mistral4Session) -> usize {
         sess.pos
     }
@@ -1230,7 +1278,10 @@ impl crate::generate::TextLm for Mistral4Model<'_> {
     }
 }
 
-/// No runtime interventions on this family yet (`crate::intervene`): no MLP is exposed.
+/// Runtime interventions (`crate::intervene`): the residual points around every layer, and as
+/// neurons the input of `down_proj` of the dense MLP (layer 0: `Target::Mlp`), of a MoE layer's
+/// shared expert (`Target::Shared`) and of each routed expert (`Target::Expert`, before the
+/// routing weight scales its output), as for Qwen MoE and Gemma 4 26B-A4B.
 impl crate::intervene::Host for Mistral4Model<'_> {
     fn n_layers(&self) -> usize {
         self.cfg.num_hidden_layers
@@ -1238,11 +1289,11 @@ impl crate::intervene::Host for Mistral4Model<'_> {
     fn hidden(&self) -> usize {
         self.cfg.hidden_size
     }
-    fn mlp_inter(&self, _layer: usize, _target: crate::intervene::Target) -> Option<usize> {
-        None
+    fn mlp_inter(&self, layer: usize, target: Target) -> Option<usize> {
+        self.layers.get(layer)?.ffn.inter(target)
     }
-    fn down_column(&self, _layer: usize, _target: crate::intervene::Target, _n: usize) -> Vec<f32> {
-        Vec::new()
+    fn down_column(&self, layer: usize, target: Target, n: usize) -> Vec<f32> {
+        self.layers[layer].ffn.down_column(target, n, self.cfg.hidden_size)
     }
 }
 

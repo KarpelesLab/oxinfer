@@ -1379,7 +1379,7 @@ impl Engine {
             Lm::Gemma { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::Qwen { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::QwenMtp { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
-            Lm::Mistral4 { .. } => bail!("activation capture is not supported for Mistral Large 4"),
+            Lm::Mistral4 { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("activation capture is not supported for Core ML models"),
         }
@@ -1406,7 +1406,7 @@ impl Engine {
             Lm::Gemma { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::Qwen { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::QwenMtp { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
-            Lm::Mistral4 { .. } => bail!("interventions are not supported for Mistral Large 4"),
+            Lm::Mistral4 { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
         }
@@ -1424,7 +1424,7 @@ impl Engine {
             Lm::Gemma { model, .. } => *model,
             Lm::Qwen { model, .. } => *model,
             Lm::QwenMtp { dec } => dec.model(),
-            Lm::Mistral4 { .. } => bail!("interventions are not supported for Mistral Large 4"),
+            Lm::Mistral4 { model, .. } => *model,
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
         };
@@ -1437,7 +1437,7 @@ impl Engine {
             Lm::Gemma { sess, .. } => &mut sess.iv,
             Lm::Qwen { sess, .. } => &mut sess.iv,
             Lm::QwenMtp { dec } => &mut dec.sess.iv,
-            Lm::Mistral4 { .. } => return,
+            Lm::Mistral4 { sess, .. } => &mut sess.iv,
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => return,
         };

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Reference for oxinfer's runtime interventions (src/intervene.rs) with PyTorch forward hooks on
-a transformers model (dense Qwen3.5 / Qwen3 / Llama / Gemma-style `model.layers`).
+a transformers model (Qwen3.5 / Qwen3 / Llama / Gemma-style `model.layers`, Mistral Large 4's
+`model.language_model.layers`).
 
 usage: ref_intervene.py MODEL_DIR PROMPT_TEXT_FILE SPEC.json [OURS_LOGITS.bin] [--bf16]
                         [--generate N] [--ours-ids IDS.json]
@@ -9,7 +10,9 @@ SPEC.json is the same JSON as `oxinfer --interventions` (neurons, steer, ablate,
 applied independently of oxinfer's implementation:
 - neuron edits: a forward pre-hook on `layers[L].mlp.down_proj` (its input is act(gate) * up);
   unit resid_median: dose * median_{t>=1} |hidden_states[L+1][t]| / |W_down[:, n]| measured on the
-  unedited model over the same prompt (numpy median);
+  unedited model over the same prompt (numpy median); MoE layers: `expert: "shared"` hooks the
+  shared expert's `down_proj`, an expert id the input of that routed expert's down projection
+  (fused 3D expert weights: the experts' forward is replaced by the same loop with the edit);
 - steering: `post` adds alpha * v to the output of `layers[L]`, `mid` to the attention block's
   output (the residual after attention), `pre` to the input of `layers[L]`;
 - ablation: Arditi et al.: r_hat projected out of every layer's input (pre-hook) and of every
@@ -72,13 +75,16 @@ def main():
     gen = int(sys.argv[sys.argv.index("--generate") + 1]) if "--generate" in sys.argv else 0
     ours_ids = json.load(open(sys.argv[sys.argv.index("--ours-ids") + 1])) if "--ours-ids" in sys.argv else None
     dtype = torch.bfloat16 if "--bf16" in sys.argv else torch.float32
-    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForImageTextToText
     tok = AutoTokenizer.from_pretrained(model_dir)
     text = open(text_file).read()
     ids = tok(text, add_special_tokens=False, return_tensors="pt").input_ids
     T = ids.shape[1]
     spec = json.load(open(spec_file)) if not spec_file.startswith("{") else json.loads(spec_file)
-    model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=dtype)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_dir, dtype=dtype)
+    except ValueError:
+        model = AutoModelForImageTextToText.from_pretrained(model_dir, dtype=dtype)
     model.eval()
     base = model.model
     if hasattr(base, "language_model"):
@@ -110,38 +116,86 @@ def main():
     hooks = []
     # Neuron edits.
     by_layer = {}
+    routed = {}
+
+    def shared_mod(mlp):
+        return getattr(mlp, "shared_experts", None) or getattr(mlp, "shared_expert")
+
     for n in spec.get("neurons", []):
-        if n.get("expert") is not None:
-            raise SystemExit("MoE neuron edits are not in the reference")
         op = n.get("op") or ("add" if "dose" in n else "scale")
         val = n.get("value", n.get("dose"))
         L = n["layer"]
+        ex = n.get("expert")
+        if ex == "shared":
+            down = shared_mod(layers[L].mlp).down_proj.weight
+        elif ex is not None:
+            down = layers[L].mlp.experts.down_proj[ex]
+        else:
+            down = layers[L].mlp.down_proj.weight
         if n.get("unit") == "resid_median":
-            col = layers[L].mlp.down_proj.weight[:, n["neuron"]].float()
+            col = down[:, n["neuron"]].float()
             m = n.get("resid_median", med[L] if med else None)
             val = val * m / float(col.norm())
             print(f"neuron {L}:{n['neuron']} add {val:.5f} (median {m:.4f}, |col| {float(col.norm()):.5f})")
-        by_layer.setdefault(L, []).append((n["neuron"], op, val, n.get("min"), n.get("max"), n.get("positions")))
-    for L, edits in by_layer.items():
+        e = (n["neuron"], op, val, n.get("min"), n.get("max"), n.get("positions"))
+        if ex is not None and ex != "shared":
+            routed.setdefault(L, {}).setdefault(ex, []).append(e)
+        else:
+            by_layer.setdefault((L, ex), []).append(e)
+
+    def edit_rows(x, edits, m_of):
+        # x: [rows, inter]; m_of(ps) -> bool mask over the rows.
+        for idx, op, val, lo, hi, ps in edits:
+            m = m_of(ps)
+            a = x[:, idx]
+            if op == "scale":
+                b = a * val
+            elif op == "zero":
+                b = a * 0
+            elif op == "add":
+                b = a + val
+            elif op == "set":
+                b = torch.full_like(a, val)
+            elif op == "clamp":
+                b = a.clamp(min=lo if lo is not None else -float("inf"), max=hi if hi is not None else float("inf"))
+            x[:, idx] = torch.where(m, b, a)
+        return x
+
+    for (L, ex), edits in by_layer.items():
         def pre(mod, inp, edits=edits):
             x = inp[0].clone()
             t = x.shape[1]
-            for idx, op, val, lo, hi, ps in edits:
-                m = pos_mask(ps, t, x.device)
-                a = x[0, :, idx]
-                if op == "scale":
-                    b = a * val
-                elif op == "zero":
-                    b = a * 0
-                elif op == "add":
-                    b = a + val
-                elif op == "set":
-                    b = torch.full_like(a, val)
-                elif op == "clamp":
-                    b = a.clamp(min=lo if lo is not None else -float("inf"), max=hi if hi is not None else float("inf"))
-                x[0, :, idx] = torch.where(m, b, a)
+            x[0] = edit_rows(x[0], edits, lambda ps: pos_mask(ps, t, x.device))
             return (x,) + tuple(inp[1:])
-        hooks.append(layers[L].mlp.down_proj.register_forward_pre_hook(pre))
+        mod = shared_mod(layers[L].mlp).down_proj if ex == "shared" else layers[L].mlp.down_proj
+        hooks.append(mod.register_forward_pre_hook(pre))
+    # Routed experts with fused [n_experts, ...] weights: the reference loop, edited.
+    for L, per in routed.items():
+        exm = layers[L].mlp.experts
+
+        def fwd(hidden_states, top_k_index, top_k_weights, exm=exm, per=per):
+            out = torch.zeros_like(hidden_states)
+            t = hidden_states.shape[0]
+            pos = torch.arange(state["start"], state["start"] + t)
+            for e in range(exm.num_experts):
+                tok_idx, k_pos = torch.where(top_k_index == e)
+                if tok_idx.numel() == 0:
+                    continue
+                cur = hidden_states[tok_idx]
+                gate, up = torch.nn.functional.linear(cur, exm.gate_up_proj[e]).chunk(2, dim=-1)
+                act = exm.act_fn(gate) * up
+                if e in per:
+                    p = pos[tok_idx]
+
+                    def m_of(ps, p=p):
+                        if ps in (None, "all"):
+                            return torch.ones_like(p, dtype=torch.bool)
+                        return p >= gen_from if ps == "generated" else p < gen_from
+                    act = edit_rows(act.clone(), per[e], m_of)
+                y = torch.nn.functional.linear(act, exm.down_proj[e]) * top_k_weights[tok_idx, k_pos, None]
+                out.index_add_(0, tok_idx, y.to(out.dtype))
+            return out
+        exm.forward = fwd
 
     # Gemma's sandwich norms: what the attention block adds to the residual is the output of
     # post_attention_layernorm, and the MLP's is followed by more (MoE, per-layer inputs, layer
