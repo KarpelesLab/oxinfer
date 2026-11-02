@@ -235,6 +235,40 @@ otherwise the generation prompt closes the think block.
 
 Text, images, video and audio are supported (E2B/E4B have both towers).
 
+#### DSpark drafts for Qwen and Gemma 4
+
+`--draft` also takes a DSpark draft for Qwen3, Qwen3.5 / 3.8 and Gemma 4 targets: a Hugging Face
+draft folder or repo id (DeepSpec `Qwen3DSparkModel` / `Gemma4DSparkModel`, SpecForge / RadixArk
+`DSparkDraftModel`, vLLM speculators, NVIDIA Model Optimizer, z-lab `DFlashDraftModel` with a
+Markov head) or a llama.cpp `dflash` GGUF. The draft is a few grouped-query attention layers
+(Gemma 4: K = V attention, value norm, sandwich norms, layer scalars, proportional RoPE, GELU)
+that read the target's residual streams at a few layers, plus the Markov head and the optional
+confidence head (`--spec-draft-conf-min C` cuts a block where its estimate falls below C). The
+whole trained block runs each pass; each round's length (0 to the block, 0 being a plain step)
+is chosen from the measured cost of a draft pass and of verifying each length and from the recent
+acceptance per position, unless `--spec-draft-fixed`. Greedy output is the plain greedy output
+token for token; sampling keeps the target's distribution.
+
+On Metal, when GPU decoding is on, the verification is one multi-token decode pass (the weights
+read once for up to 8 or 16 tokens, each token's arithmetic exactly the single-token kernels', so
+the output is the plain GPU greedy output bit for bit), and the draft itself runs as two such
+passes (its context and its block). `draft=auto` (CLI `--draft auto`) finds the draft inside the
+model folder (`dspark*`) or a known draft of the model in the download cache (`dspark::KNOWN`);
+none is used by default yet.
+
+| target | draft | agreement with the float32 reference | tokens per round | speed (M5 Max, Metal, shared machine) |
+|---|---|---|---|---|
+| Qwen/Qwen3-4B (bf16) | deepseek-ai/dspark_qwen3_4b_block7 | rel. logit error 2-2.5e-6 (CPU), 1.2e-4 (Metal); same drafts | code 5.9, prose 2.2 | code 62 -> 110 tok/s, prose 62 -> 72; CPU only: code 32 -> 63 |
+| Qwen3.8-27B (q4) | RadixArk/Qwen3.8-27B-DSpark | 2-4e-6; same drafts | code 1.7-5.8 | slower than plain on Metal (q4 multi-token passes are compute-bound): 36 -> 26 tok/s; CPU only: code 12.4 -> 15.1 |
+| Qwen3.8-27B (q4) | jialinyyzz/Qwen3.8-27B-DSpark-drafter | 1.5-2.3e-6; same drafts | math 1.3 | 36 -> 20 tok/s |
+| google/gemma-4-12B-it (q8) | deepseek-ai/dspark_gemma4_12b_block7 | 1.8-3.4e-6; same drafts | code 3.6, story 1.5 | code 37 -> 50 tok/s, story 39 -> 34; CPU only: 10.6 -> 22.4 |
+
+The reference is `tools/ref_dspark_hf.py` (DeepSpec's modeling code in float32, fed the target
+features oxinfer computes); `examples/dspark_check.rs` writes the features and the draft logits
+and compares greedy output with and without the draft. Not done yet: the Gemma 4 31B drafts
+(RedHatAI speculators, Hikari07jp), Qwen3.5-35B-A3B (MoE targets have no multi-token GPU pass
+yet), a comparison with llama.cpp, and a default draft per model.
+
 ### Mistral Large 4 (1T-A52B)
 
 `mistralai/Mistral-Large-4-1T-A52B` (`mistral4.rs`) is a DeepSeek-V3.2-style MoE with Mistral's
@@ -423,8 +457,8 @@ The target verifies `[last, d1, d2, d3]` in one pass on the batch-invariant deco
 features of the committed positions join the draft's cache, and rollback truncates the latent
 and indexer key caches (the KV-sharing layers keep none). Greedy output is the plain greedy
 output token for token; sampling keeps the target's distribution (standard speculative
-sampling). Other DSpark backbones (Qwen3, Gemma 4, DeepSeek V4 drafts) would add a layer kind
-behind the same `dspark::Target` trait.
+sampling). The same `dspark::Target` trait serves the DeepSeek V4 draft and the Qwen / Gemma 4
+ones (see [DSpark drafts for Qwen and Gemma 4](#dspark-drafts-for-qwen-and-gemma-4)).
 
 A GGUF model uses the `dspark*.gguf` beside it (its folder or the one above) by default:
 
@@ -3024,9 +3058,11 @@ Useful flags:
 | `--threads N` | worker threads (default: all cores) |
 | `--quant q8` | quantize streamed weights to int8 at load (blocks of 32, f32 scales); ~1.8x less memory traffic |
 | `--quant q4` | GGUF-style Q4_0 (blocks of 32, 4-bit, f16 scale) for all streamed weights; ~3.5x less traffic |
-| `--draft DIR` | speculative decoding with Google's `gemma-4-E4B-it-assistant` drafter (greedy only; output identical to plain greedy); Mistral Large 4: a DSpark draft GGUF (greedy and sampled; default: the `dspark*.gguf` beside the model, which `auto` requires), see [DSpark](#dspark-speculative-decoding) |
-| `--no-draft` | Mistral Large 4: no DSpark draft (plain decoding) |
-| `--draft-tokens N`, `--spec-draft-n-max N` | max draft tokens per round (default 6 with `--draft`, 3 with `--mtp`, 8 with `--mtp --stream`; the length adapts; DSpark 3, its block) |
+| `--draft DIR` | speculative decoding with Google's `gemma-4-E4B-it-assistant` drafter (greedy only; output identical to plain greedy), or a DSpark draft (greedy and sampled): Mistral Large 4 / DeepSeek V4 a draft GGUF (default: the `dspark*.gguf` beside the model, which `auto` requires), Qwen / Gemma 4 a Hugging Face draft or dflash GGUF, see [DSpark](#dspark-speculative-decoding) and [Qwen and Gemma 4 drafts](#dspark-drafts-for-qwen-and-gemma-4) |
+| `--no-draft` | no DSpark draft (plain decoding) |
+| `--draft-tokens N`, `--spec-draft-n-max N` | max draft tokens per round (default 6 with `--draft`, 3 with `--mtp`, 8 with `--mtp --stream`; the length adapts; DSpark: Mistral Large 4 / DeepSeek V4 3, Qwen / Gemma 4 the whole block) |
+| `--spec-draft-fixed` | DSpark (Qwen, Gemma 4): always draft `--draft-tokens` instead of choosing each round's length by measured cost |
+| `--spec-draft-conf-min C` | DSpark: cut a block before the first draft whose confidence-head estimate is below C (default 0: off) |
 | `--spec-draft-p-min P` | DSpark: cut a block before the first draft the draft model gives less than probability P (default 0.85 when the model streams, else 0) |
 | `--mtp` | Qwen3.5/3.8: speculative decoding with the checkpoint's multi-token-prediction layer (greedy and sampled) |
 | `--mtp-fixed` | with `--mtp`, always draft `--draft-tokens` instead of adapting between 1 and N |
