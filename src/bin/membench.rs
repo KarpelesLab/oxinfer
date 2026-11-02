@@ -58,9 +58,11 @@ fn bench_gpu(n_out: usize, n_in: usize) {
         .collect();
     let q8 = quant::quantize_bf16(&w, n_out, n_in);
     let q4 = quant::quantize_q4(&w, n_out, n_in);
-    // KINDS=Q4_K,IQ3_S,..: GGUF formats to check as well (random blocks with sane scales).
-    let gg: Vec<oxinfer::ggml::GgufMatrix> = std::env::var("KINDS")
-        .unwrap_or_default()
+    // KINDS=Q4_K,IQ3_S,..: GGUF formats to check as well (random blocks with sane scales), and
+    // F8_E4M3: FP8 with 128 x 128 block scales, as the official Mistral Large 4 / DeepSeek
+    // checkpoints store them.
+    let kinds = std::env::var("KINDS").unwrap_or_default();
+    let mut gg: Vec<oxinfer::ggml::GgufMatrix> = kinds
         .split(',')
         .filter_map(|k| oxinfer::ggml::GgmlType::ALL.into_iter().find(|t| t.name() == k))
         .map(|k| {
@@ -68,6 +70,20 @@ fn bench_gpu(n_out: usize, n_in: usize) {
             oxinfer::ggml::GgufMatrix::from_bytes(k, &raw, n_out, n_in).unwrap()
         })
         .collect();
+    if kinds.split(',').any(|k| k == "F8_E4M3") {
+        let mut q = quant::PageVec::<u8>::zeroed(n_out * n_in);
+        for (i, b) in q.iter_mut().enumerate() {
+            // Any byte but the NaNs (0x7f, 0xff).
+            let v = ((i as u32).wrapping_mul(2654435761) >> 13) as u8;
+            *b = if v & 0x7f == 0x7f { v ^ 1 } else { v };
+        }
+        let ns = n_out.div_ceil(128) * n_in.div_ceil(128);
+        let mut s = quant::PageVec::<f32>::zeroed(ns);
+        for (i, v) in s.iter_mut().enumerate() {
+            *v = 1e-3 * (1.0 + (i % 7) as f32 / 7.0);
+        }
+        gg.push(oxinfer::ggml::GgufMatrix::fp8(q.into(), s.into(), n_out, n_in, (128, 128)).unwrap());
+    }
     let mut refs: Vec<(&str, WeightRef)> = vec![
         ("bf16", WeightRef::Bf16(&w)),
         ("q8", WeightRef::Q8(&q8)),

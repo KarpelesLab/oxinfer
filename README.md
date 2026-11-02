@@ -260,7 +260,8 @@ own twists, 72 layers of 6144:
 
 Checkpoints: the official one (Mistral's `consolidated-*.safetensors` layout, FP8 E4M3 weights
 with 128x128 block scales, read as stored, zero-copy, through a `GgmlType::F8E4M3` with block
-scales), transformers-saved copies, and llama.cpp GGUF files (`mistral-large4`, split into parts
+scales; prefill GEMMs and the grouped MoE experts run on the GPU, see
+[FP8 on the GPU](#fp8-on-the-gpu)), transformers-saved copies, and llama.cpp GGUF files (`mistral-large4`, split into parts
 or not; unsloth's are tested). The Pixtral vision tower (30 layers of 2048, 2D RoPE, 2x2 patch
 merger and GELU projector) comes from the checkpoint, or for a GGUF model from the `mmproj` file
 beside it (in its folder or the one above). `--mmproj FILE` (engine / C option `mmproj=FILE`, a
@@ -324,7 +325,7 @@ Pixtral tower), against every position of a prompt and 8-16 greedy decode steps 
 | Mistral layout, bf16, 60 tokens | 3.8e-4 / 4.5e-10 | 4.9e-4 / 1.3e-9 | the same in chunks of 1, 7, 33, 60 |
 | same, 300 tokens | 1.0e-2 / 4.0e-8 | 3.3e-3 / 5.9e-8 | every indexer choice (1500 rows) identical; 300/300 and 16/16 top-1 |
 | transformers-saved layout | 3.8e-4 / 4.5e-10 | 4.9e-4 / 1.3e-9 | |
-| FP8 blocks (Mistral layout, `qscale_weight`), vs the reference on the dequantized weights, 60 tokens | 7.5e-4 / 7.5e-10 | 3.5e-4 / 1.0e-9 | |
+| FP8 blocks (Mistral layout, `qscale_weight`), vs the reference on the dequantized weights, 60 tokens | 7.5e-4 / 7.5e-10 | 3.5e-4 / 1.0e-9 | the same with the GEMMs and experts on Metal's f32 kernels (bit-identical to the CPU, also at 300 tokens) |
 | GGUF F32 (llama.cpp's converter), 300 tokens | 3.6e-3 / 9.3e-9 | 1.2e-3 / 1.0e-8 | |
 | GGUF with unsloth's types (Q8_0, Q6_K, IQ2_S, IQ3_XXS, IQ3_S), vs the reference on its dequantized weights, 300 tokens | 5.9e-3 / 1.1e-8 | see below | |
 | image features (Pixtral + projector), 384x384 and 1700x900 images | rel. 1.4e-6 / 1.9e-6 | | prompt ids identical; last-token logits 5e-4 |
@@ -343,6 +344,31 @@ here ran on the GPU's half-precision matrix units), and the same 24 greedy token
 of Rome in 753 BC to the fall of Constantinople in 1453 AD. It is one of"). The rebuilt GGUF
 tokenizer (tekken, numbers in groups of three) matches `tokenizer.json` on this README. Chat is
 coherent on both devices, across turns, and about images.
+
+#### FP8 on the GPU
+
+The FP8 weights keep their bytes on the GPU too: Metal kernels read the E4M3 bytes and the
+128x128 block scales in place (no copy, no conversion at load) and dequantize per K step, an
+E4M3 byte becoming a half exactly by moving its sign and its 7 exponent / mantissa bits into a
+half's places (the 2^8 offset of the exponent bias goes into the block scale). The f32 GEMM (any
+Apple GPU, or `gpu_exact=1`) dequantizes to f32 in threadgroup memory and gives the CPU's results
+bit for bit; on M5 / A19 the matrix units (`matmul2d`) take the weights as half in threadgroup
+memory with f32 accumulation, as for the other formats, in a dense and a grouped (MoE experts)
+kernel. Other block shapes than 128x128 stay on the CPU. Checks: the tiny FP8 checkpoint gives
+the CPU's logits exactly on the f32 kernels (60 and 300 tokens), and on the matrix units exactly
+the logits of its dequantized copy (the same values stored as float32; so FP8 adds no error beyond the half operands, which on such a tiny random model already
+move logits a lot, the bf16 checkpoint included); `cargo test` compares the dense and grouped kernels with the CPU (FP8 among the other
+formats). Throughput (`KINDS=Q8_0,F8_E4M3 membench gpu 17408 5120`, copies and submission
+included, measured while another job kept 9 CPU cores busy):
+
+| Tokens | FP8 f32 GEMM | FP8 matrix units | Q8_0 matrix units (same run) | CPU (FP8) |
+|---|---|---|---|---|
+| 256 | 9.3 TFLOP/s | 15.6 | 17.3 | 1.2 |
+| 512 | | 18.7 | 20.9 | 1.1 |
+| 1024 | 10.9 | 20.5 | 21.9 | 1.3 |
+| 2048 | 11.3 | 41.7 | 40.8 | 1.1 |
+
+Decoding stays on the CPU (this family has no whole-pass GPU decode).
 
 ## Embeddings
 
@@ -3460,7 +3486,7 @@ time with the rest of the shaders; nothing is needed at build time). Input rows 
 half with a power-of-two scale per row (no overflow, no subnormals), quantized weights are
 dequantized per 64-wide K step into threadgroup memory as half, bf16 weights are read as bfloat
 straight from device memory, and accumulation is f32: every format with a GEMM (bf16, Q8, Q4,
-the GGUF types) has a matrix-unit version. Kernel throughput at 2048 tokens is ~60 TFLOP/s for
+the GGUF types, FP8 E4M3 with 128x128 block scales) has a matrix-unit version. Kernel throughput at 2048 tokens is ~60 TFLOP/s for
 bf16 and ~50 for Q4 (against ~11 for the f32 GEMM); per call, copies and submission included
 (`membench gpu`, 17408 x 5120):
 

@@ -728,6 +728,19 @@ inline void load(F32W2 w, uint row, uint b, thread float4* out) {
     device const packed_float4* p = (device const packed_float4*)(w.g.q + (ulong)row * w.g.rb + b * 128);
     for (uint i = 0; i < 8; i++) out[i] = float4(p[i]);
 }
+// FP8 E4M3 with one f32 scale per 128 x 128 block (DeepSeek / Mistral `weight_scale_inv`): rows
+// of n_in bytes at w_off, the scale grid (n_in / 128 rounded up per row block) at s_off floats.
+// Shifting the sign and the 7 exponent / mantissa bits into a half's places gives the value
+// times 2^-8 exactly (subnormals included), folded into the scale.
+struct F8W { device const uchar* q; device const float* s; uint n_in; uint ncb; };
+#define MK_F8 F8W{ (device const uchar*)qb + p.w_off, (device const float*)sb + p.s_off, p.n_in, (p.n_in + 127) / 128 }
+inline float4 e4m3x4(uchar4 v) { ushort4 u = ushort4(v); return float4(as_type<half4>(((u & ushort(0x80)) << 8) | ((u & ushort(0x7f)) << 7))); }
+inline void load(F8W w, uint row, uint b, thread float4* out) {
+    float d = w.s[(row / 128) * w.ncb + b / 4] * 256.f;
+    device const uchar* B = w.q + (ulong)row * w.n_in + b * 32;
+    for (uint i = 0; i < 8; i++) out[i] = e4m3x4(ld4(B + 4 * i)) * d;
+}
+GEMM(gemm_F8_E4M3, F8W, MK_F8)
 #define GG(T) GEMM(gemm_##T, T##W, MK_GG(T##W))
 GEMM(gemm_F32, F32W2, MK_GG(F32W2)) GG(F16) GG(Q4_1) GG(Q5_0) GG(Q5_1)
 GG(Q4_0) GG(IQ4_NL) GG(Q8_0) GG(Q4_K) GG(Q5_K) GG(Q6_K) GG(Q3_K) GG(Q2_K) GG(IQ4_XS)
@@ -830,6 +843,7 @@ kernel void NAME(device const EP* ep [[buffer(0)]], device const GT* tiles [[buf
     WT w = MAKE; mma_tile<WT, 32>(w, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out, p.n_out, p.n_in, g.rows, tg.x * 64, g.t0, tid, Ws); }
 MMAD(mma_q8, Q8W, MK_Q8) MMAD(mma_q4, Q4W, MK_Q4)
 MMAG(mmag_q8, Q8W, MK_Q8) MMAG(mmag_q4, Q4W, MK_Q4)
+MMAD(mma_F8_E4M3, F8W, MK_F8) MMAG(mmag_F8_E4M3, F8W, MK_F8)
 #define MMA_Q4A(NAME, TM) \
 kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[buffer(1)]], device const half* xh [[buffer(2)]], \
                  device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], \
@@ -1010,7 +1024,8 @@ kernel void moe_combine(device const float* o [[buffer(0)]], device const float2
 }
 "#;
 
-/// GGUF types with a Metal GEMM (`gemm_<TYPE>` in `GGUF_SHADER_SRC`).
+/// GGUF types with a Metal GEMM (`gemm_<TYPE>` in `GGUF_SHADER_SRC`) and a decode matvec
+/// (`metal_decode.rs`). FP8 E4M3 (128 x 128 block scales, [`fp8_ok`]) has the GEMMs only.
 const GGUF_GPU_TYPES: [GgmlType; 21] = [
     GgmlType::F32,
     GgmlType::F16,
@@ -1037,7 +1052,8 @@ const GGUF_GPU_TYPES: [GgmlType; 21] = [
 
 /// GGUF types with a matrix-unit GEMM (`mma_<TYPE>` / `mmag_<TYPE>` in `MMA_SHADER_SRC`): all but
 /// F32, whose values would lose precision as half.
-const GGUF_MMA_TYPES: [GgmlType; 20] = [
+const GGUF_MMA_TYPES: [GgmlType; 21] = [
+    GgmlType::F8E4M3,
     GgmlType::F16,
     GgmlType::Q4_1,
     GgmlType::Q5_0,
@@ -1059,6 +1075,21 @@ const GGUF_MMA_TYPES: [GgmlType; 20] = [
     GgmlType::IQ1_S,
     GgmlType::IQ1_M,
 ];
+
+/// Whether the device kernels take `m`: anything but FP8, or FP8 with the 128 x 128 block scales
+/// the shaders assume.
+fn fp8_ok(m: &crate::ggml::GgufMatrix) -> bool {
+    m.kind != GgmlType::F8E4M3 || m.block_scales.as_ref().is_some_and(|b| b.rows == 128 && b.cols == 128)
+}
+
+/// `P::s_off` of a GGUF matrix: the row length in bytes, or for FP8 the offset of its block
+/// scales (in floats) inside their buffer.
+fn gguf_s_off(m: &crate::ggml::GgufMatrix, mw: &MetalWeight) -> usize {
+    match &mw.scales {
+        Some(s) if m.block_scales.is_some() => s.offset_bytes / 4,
+        _ => m.row_bytes(),
+    }
+}
 
 /// The i-quant grids as MSL constant arrays.
 fn gguf_shader_tables() -> String {
@@ -1528,6 +1559,7 @@ impl MetalBackend {
         let gemm_f32 = pipeline(c"gemm_f32")?;
         let gguf_pipes = GGUF_GPU_TYPES
             .iter()
+            .chain(&[GgmlType::F8E4M3])
             .map(|&k| Ok((k, pipeline(&CString::new(format!("gemm_{}", k.name()))?)?)))
             .collect::<Result<Vec<_>>>()?;
         let group_stats = pipeline(c"group_stats")?;
@@ -2089,6 +2121,7 @@ impl MetalBackend {
             (WeightRef::Q4(_), Tile::Grouped) => return None,
             (WeightRef::Q4(_), _) if affine => (pick(m.q4a, m.q4a_s), 64),
             (WeightRef::Q4(_), _) => (pick(m.q4, m.q4_s), 64),
+            (WeightRef::Gguf(g), _) if !fp8_ok(g) => return None,
             (WeightRef::Gguf(g), Tile::Grouped) => (find(&m.g_gguf, g.kind)?, 64),
             (WeightRef::Gguf(g), _) => (pick(find(&m.gguf, g.kind)?, find(&m.gguf_s, g.kind)?), 64),
         })
@@ -2159,7 +2192,7 @@ impl MetalBackend {
                 let mw = j.dev.downcast_ref::<MetalWeight>().unwrap();
                 let (_, elem_bytes, scale_bytes) = format_index(&j.w);
                 let s_off = match &j.w {
-                    WeightRef::Gguf(m) => m.row_bytes(),
+                    WeightRef::Gguf(m) => gguf_s_off(m, mw),
                     _ => mw.scales.as_ref().map(|s| s.offset_bytes / scale_bytes).unwrap_or(0),
                 };
                 e.pipe(pipe);
@@ -2245,8 +2278,9 @@ impl MetalBackend {
             None => None,
         };
         let (pd, _) = self.mma_pipe(&down[0], affine(&down[0]), h, mi, Tile::Grouped)?;
+        // GGUF row lengths (FP8: 0, its MK_F8 reads the scales at the expert's own address).
         let row_bytes = |w: &WeightRef| match w {
-            WeightRef::Gguf(g) => g.row_bytes(),
+            WeightRef::Gguf(g) if g.block_scales.is_none() => g.row_bytes(),
             _ => 0,
         };
         // Every expert's (data, scales) memory regions; one format for all.
@@ -2258,7 +2292,7 @@ impl MetalBackend {
                 WeightRef::Bf16(v) => (span(v), None),
                 WeightRef::Q8(m) => (span(&m.q[..]), Some(span(&m.scales[..]))),
                 WeightRef::Q4(m) => (span(&m.q[..]), Some(span(&m.scales[..]))),
-                WeightRef::Gguf(m) => (span(&m.data[..]), None),
+                WeightRef::Gguf(m) => (span(&m.data[..]), m.block_scales.as_ref().map(|b| span(&b.s[..]))),
             }
         };
         let mut all: Vec<(usize, usize)> = Vec::new();
@@ -2389,9 +2423,15 @@ impl Backend for MetalBackend {
         let mw = match w {
             WeightRef::Gguf(m) => {
                 self.gguf_pipe(m.kind)?;
+                if !fp8_ok(m) {
+                    return None;
+                }
                 MetalWeight {
                     data: self.wrap(m.data.as_ptr(), m.data.len())?,
-                    scales: None,
+                    scales: match &m.block_scales {
+                        Some(b) => Some(self.wrap(b.s.as_ptr() as *const u8, b.s.len() * 4)?),
+                        None => None,
+                    },
                     offsets: None,
                     release,
                 }
@@ -3057,7 +3097,7 @@ impl Backend for MetalBackend {
                 let (fi, elem_bytes, scale_bytes) = format_index(&j.w);
                 // GGUF: byte offset of the data, and the row length in bytes in place of s_off.
                 let (s_off, pipe) = match &j.w {
-                    WeightRef::Gguf(m) => (m.row_bytes(), self.gguf_pipe(m.kind).unwrap()),
+                    WeightRef::Gguf(m) => (gguf_s_off(m, mw), self.gguf_pipe(m.kind).unwrap()),
                     _ => (
                         mw.scales.as_ref().map(|s| s.offset_bytes / scale_bytes).unwrap_or(0),
                         if mw.offsets.is_some() { self.pipe_q4a } else { self.pipes[fi] },
@@ -3176,6 +3216,20 @@ mod tests {
             .fold(0f32, f32::max)
     }
 
+    /// A random FP8 E4M3 matrix (no NaN bytes) with 128 x 128 block scales.
+    fn fp8(n_out: usize, n_in: usize, seed: &mut u64) -> crate::ggml::GgufMatrix {
+        let mut q = crate::quant::PageVec::<u8>::zeroed(n_out * n_in);
+        for b in q.iter_mut() {
+            let v = (rnd(seed).to_bits() >> 7) as u8;
+            *b = if v & 0x7f == 0x7f { v ^ 1 } else { v };
+        }
+        let mut s = crate::quant::PageVec::<f32>::zeroed(n_out.div_ceil(128) * n_in.div_ceil(128));
+        for v in s.iter_mut() {
+            *v = 0.01 + 0.02 * rnd(seed).abs();
+        }
+        crate::ggml::GgufMatrix::fp8(q.into(), s.into(), n_out, n_in, (128, 128)).unwrap()
+    }
+
     fn cpu(w: &WeightRef, n_out: usize, n_in: usize, x: &[f32], t: usize) -> Vec<f32> {
         let mut y = vec![0f32; t * n_out];
         match w {
@@ -3202,7 +3256,8 @@ mod tests {
                 crate::ggml::GgufMatrix::from_bytes(k, &raw, n_out, n_in).unwrap()
             })
             .collect();
-        let mut ws = vec![WeightRef::Bf16(&w), WeightRef::Q8(&q8), WeightRef::Q4(&q4)];
+        let f8 = fp8(n_out, n_in, &mut seed);
+        let mut ws = vec![WeightRef::Bf16(&w), WeightRef::Q8(&q8), WeightRef::Q4(&q4), WeightRef::Gguf(&f8)];
         ws.extend(gg.iter().map(WeightRef::Gguf));
         // Dense tiles (with a partial one) and 32-token tiles.
         for (w, t) in ws.iter().flat_map(|w| [(w, 150), (w, 37)]) {
@@ -3233,6 +3288,7 @@ mod tests {
         match w {
             WeightRef::Bf16(v) => f.iter_mut().zip(v.iter()).for_each(|(o, &b)| *o = f32::from_bits((b as u32) << 16)),
             WeightRef::Q4(m) => crate::quant::dequantize_rows_q4(m, 0, n_out, &mut f),
+            WeightRef::Gguf(m) => m.dequantize_rows(0, n_out, &mut f),
             _ => unimplemented!(),
         }
         f
@@ -3253,26 +3309,32 @@ mod tests {
         let dn = bf16(ne * h * mi, &mut seed);
         let gu4: Vec<_> = gu.chunks(2 * mi * h).map(|w| quantize_q4(w, 2 * mi, h)).collect();
         let dn4: Vec<_> = dn.chunks(h * mi).map(|w| quantize_q4(w, h, mi)).collect();
+        // FP8 experts (the official Mistral Large 4 checkpoint's format).
+        let gu8: Vec<_> = (0..ne).map(|_| fp8(2 * mi, h, &mut seed)).collect();
+        let dn8: Vec<_> = (0..ne).map(|_| fp8(h, mi, &mut seed)).collect();
         let x = input(t, h, &mut seed);
         // Routes: expert 5 unused, the others with uneven loads.
         let routes: Vec<Vec<(usize, f32)>> = (0..t)
             .map(|i| vec![([0, 1, 2, 3, 4, 6, 7][i % 7], 0.7), ([1, 7][i % 2], 0.3)])
             .collect();
-        // bf16 / Q4 fused, SiLU / GELU; bf16 with gate and up apart (GGUF layout).
-        for (q4, gelu, split) in [
-            (false, false, false),
-            (true, false, false),
-            (false, true, false),
-            (true, true, false),
-            (false, false, true),
+        // bf16 / Q4 / FP8 (format 0 / 1 / 2) fused, SiLU / GELU; bf16 with gate and up apart (GGUF
+        // layout).
+        for (fmt, gelu, split) in [
+            (0, false, false),
+            (1, false, false),
+            (0, true, false),
+            (1, true, false),
+            (0, false, true),
+            (2, false, false),
         ] {
             let (wg, wd): (Vec<WeightRef>, Vec<WeightRef>) = (0..ne)
-                .map(|e| match q4 {
-                    false => (
+                .map(|e| match fmt {
+                    0 => (
                         WeightRef::Bf16(&gu[e * 2 * mi * h..(e + 1) * 2 * mi * h]),
                         WeightRef::Bf16(&dn[e * h * mi..(e + 1) * h * mi]),
                     ),
-                    true => (WeightRef::Q4(&gu4[e]), WeightRef::Q4(&dn4[e])),
+                    1 => (WeightRef::Q4(&gu4[e]), WeightRef::Q4(&dn4[e])),
+                    _ => (WeightRef::Gguf(&gu8[e]), WeightRef::Gguf(&dn8[e])),
                 })
                 .unzip();
             let half = |e: usize, i: usize| WeightRef::Bf16(&gu[e * 2 * mi * h + i * mi * h..e * 2 * mi * h + (i + 1) * mi * h]);
@@ -3306,7 +3368,7 @@ mod tests {
             }
 
             let e = row_err(&y, &r, h);
-            assert!(e < 3e-3, "q4 {q4} gelu {gelu} split {split}: relative error {e}");
+            assert!(e < 3e-3, "format {fmt} gelu {gelu} split {split}: relative error {e}");
         }
     }
 }
