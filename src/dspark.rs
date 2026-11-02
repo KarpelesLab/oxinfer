@@ -85,6 +85,11 @@ pub struct DsparkConfig {
     pub target_layers: Vec<usize>,
     pub softcap: Option<f32>,
     pub rope: crate::config::YarnParams,
+    /// The token the block's slots after the anchor are embedded as (DeepSeek V4; MLA drafts
+    /// have learned mask embeddings instead).
+    pub noise: Option<u32>,
+    /// The stages' config of a DeepSeek V4 draft (None: an MLA draft).
+    pub ds4: Option<Box<crate::config::DeepSeek4Config>>,
 }
 
 impl DsparkConfig {
@@ -96,17 +101,55 @@ impl DsparkConfig {
         let u = |k: &str| get(k).and_then(Value::as_u64).map(|v| v as usize);
         let need = |k: &str| u(k).with_context(|| format!("DSpark GGUF has no dflash.{k}"));
         let f = |k: &str| get(k).and_then(Value::as_f64);
-        let Some(lat) = u("attention.kv_lora_rank") else {
-            bail!("only the MLA (Mistral Large 4) DSpark backbone is supported");
-        };
-        let dr = need("rope.dimension_count")?;
-        let qk = need("attention.key_length_mla")?;
         let target_layers: Vec<usize> = get("target_layers")
             .and_then(Value::as_array)
             .context("DSpark GGUF has no dflash.target_layers")?
             .iter()
             .map(|v| v.as_u64().map(|x| x as usize).context("bad dflash.target_layers"))
             .collect::<Result<_>>()?;
+        // DeepSeek V4: full DeepSeek V4 stages (hyper-connections, MoE), `crate::deepseek4`.
+        if get("hyper_connection.count").is_some() {
+            let ds = crate::config::DeepSeek4Config::from_json(h.deepseek4_config()?)?;
+            let c = Self {
+                hidden: ds.hidden_size,
+                n_layers: ds.num_hidden_layers,
+                n_heads: ds.num_attention_heads,
+                lat: 0,
+                dn: 0,
+                dr: ds.qk_rope_head_dim,
+                vd: ds.head_dim,
+                inter: ds.moe_intermediate_size,
+                eps: ds.rms_norm_eps as f32,
+                window: ds.sliding_window,
+                block_size: need("block_size")?,
+                sample_from_anchor: !matches!(get("sample_from_anchor"), Some(Value::Bool(false))),
+                target_layers,
+                softcap: None,
+                rope: crate::config::YarnParams {
+                    rope_theta: ds.rope_theta,
+                    rope_type: Some("default".into()),
+                    factor: None,
+                    original_max_position_embeddings: None,
+                    beta_fast: None,
+                    beta_slow: None,
+                    attention_factor: None,
+                    mscale: None,
+                    mscale_all_dim: None,
+                    truncate: None,
+                },
+                noise: h.get("tokenizer.ggml.mask_token_id").and_then(Value::as_u64).map(|v| v as u32),
+                ds4: Some(Box::new(ds)),
+            };
+            if c.block_size < 2 || c.target_layers.is_empty() || c.noise.is_none() {
+                bail!("bad DeepSeek V4 DSpark metadata (block size, target layers, mask token)");
+            }
+            return Ok(c);
+        }
+        let Some(lat) = u("attention.kv_lora_rank") else {
+            bail!("only the MLA (Mistral Large 4) and DeepSeek V4 DSpark backbones are supported");
+        };
+        let dr = need("rope.dimension_count")?;
+        let qk = need("attention.key_length_mla")?;
         let theta = f("rope.freq_base").unwrap_or(10_000.0);
         let rope = match get("rope.scaling.type").and_then(Value::as_str) {
             Some("yarn") => {
@@ -156,6 +199,8 @@ impl DsparkConfig {
             target_layers,
             softcap: f("final_logit_softcapping").filter(|&c| c > 0.0).map(|c| c as f32),
             rope,
+            noise: None,
+            ds4: None,
         };
         if c.block_size < 2 || c.target_layers.is_empty() || !c.dr.is_multiple_of(2) {
             bail!("bad DSpark metadata: {c:?}");
@@ -202,20 +247,27 @@ struct Markov<'a> {
 /// A loaded DSpark draft (weights borrowed from its GGUF).
 pub struct Dspark<'a> {
     pub cfg: DsparkConfig,
+    /// The backbone: dense MLA layers (Mistral Large 4) or DeepSeek V4 stages.
+    mla: Option<Mla<'a>>,
+    ds4: Option<crate::deepseek4::Ds4Draft<'a>>,
+    markov: Option<Markov<'a>>,
+    /// The draft's own embeddings / LM head, when it ships them (else the target's are used).
+    embed: Option<Table<'a>>,
+    head: Option<Lin<'a>>,
+    target_hidden: usize,
+    /// Run the matmuls of the draft's few rows on the accelerator (see [`Dspark::set_device`]).
+    device: std::sync::atomic::AtomicBool,
+}
+
+/// The MLA backbone (llama.cpp `graph_mistral_large4`).
+struct Mla<'a> {
     fc: Lin<'a>, // [H, n_feat * target hidden]
     enc_norm: Vec<f32>,
     out_norm: Vec<f32>,
     mask: Table<'a>, // [block_size - 1, H]
     layers: Vec<Layer<'a>>,
-    markov: Option<Markov<'a>>,
-    /// The draft's own embeddings / LM head, when it ships them (else the target's are used).
-    embed: Option<Table<'a>>,
-    head: Option<Lin<'a>>,
     inv_freq: Vec<f32>,
     rope_mag: f32,
-    target_hidden: usize,
-    /// Run the matmuls of the draft's few rows on the accelerator (see [`Dspark::set_device`]).
-    device: std::sync::atomic::AtomicBool,
 }
 
 /// Positions the draft's context cache keeps beyond the window it attends to: a truncation by up
@@ -393,23 +445,6 @@ impl<'a> Dspark<'a> {
             }
         };
         let n_feat = c.target_layers.len() * target_hidden;
-        let mut layers = Vec::with_capacity(c.n_layers);
-        for l in 0..c.n_layers {
-            let p = format!("blk.{l}.");
-            layers.push(Layer {
-                attn_norm: vecf(&format!("{p}attn_norm.weight"), h)?,
-                q: lin(&format!("{p}attn_q.weight"), nh * (c.dn + c.dr), h)?,
-                kv_a: lin(&format!("{p}attn_kv_a_mqa.weight"), c.lat + c.dr, h)?,
-                kv_norm: vecf(&format!("{p}attn_kv_a_norm.weight"), c.lat)?,
-                k_b: heads(&format!("{p}attn_k_b.weight"), c.lat, c.dn)?,
-                v_b: heads(&format!("{p}attn_v_b.weight"), c.vd, c.lat)?,
-                o: lin(&format!("{p}attn_output.weight"), h, nh * c.vd)?,
-                ffn_norm: vecf(&format!("{p}ffn_norm.weight"), h)?,
-                gate: lin(&format!("{p}ffn_gate.weight"), c.inter, h)?,
-                up: lin(&format!("{p}ffn_up.weight"), c.inter, h)?,
-                down: lin(&format!("{p}ffn_down.weight"), h, c.inter)?,
-            });
-        }
         let markov = if files.has("markov_w1.weight") {
             let rank = files.info("markov_w1.weight").unwrap().shape.last().copied().unwrap_or(0);
             shape("markov_w1.weight", &[vocab, rank])?;
@@ -430,7 +465,6 @@ impl<'a> Dspark<'a> {
         } else {
             None
         };
-        shape("mask_embd.weight", &[c.block_size - 1, h])?;
         let embed = if files.has("token_embd.weight") {
             shape("token_embd.weight", &[vocab, h])?;
             Some(Table::load(files, "token_embd.weight", vocab, h, quant)?)
@@ -445,18 +479,53 @@ impl<'a> Dspark<'a> {
         } else {
             None
         };
+        if let Some(ds) = &c.ds4 {
+            let ds4 = crate::deepseek4::Ds4Draft::load(files, (**ds).clone(), quant, n_feat)?;
+            return Ok(Self {
+                mla: None,
+                ds4: Some(ds4),
+                markov,
+                embed,
+                head,
+                target_hidden,
+                device: std::sync::atomic::AtomicBool::new(false),
+                cfg,
+            });
+        }
+        let mut layers = Vec::with_capacity(c.n_layers);
+        for l in 0..c.n_layers {
+            let p = format!("blk.{l}.");
+            layers.push(Layer {
+                attn_norm: vecf(&format!("{p}attn_norm.weight"), h)?,
+                q: lin(&format!("{p}attn_q.weight"), nh * (c.dn + c.dr), h)?,
+                kv_a: lin(&format!("{p}attn_kv_a_mqa.weight"), c.lat + c.dr, h)?,
+                kv_norm: vecf(&format!("{p}attn_kv_a_norm.weight"), c.lat)?,
+                k_b: heads(&format!("{p}attn_k_b.weight"), c.lat, c.dn)?,
+                v_b: heads(&format!("{p}attn_v_b.weight"), c.vd, c.lat)?,
+                o: lin(&format!("{p}attn_output.weight"), h, nh * c.vd)?,
+                ffn_norm: vecf(&format!("{p}ffn_norm.weight"), h)?,
+                gate: lin(&format!("{p}ffn_gate.weight"), c.inter, h)?,
+                up: lin(&format!("{p}ffn_up.weight"), c.inter, h)?,
+                down: lin(&format!("{p}ffn_down.weight"), h, c.inter)?,
+            });
+        }
+        shape("mask_embd.weight", &[c.block_size - 1, h])?;
         let (inv_freq, rope_mag) = cfg.rope.inv_freq(cfg.dr);
-        Ok(Self {
+        let mla = Mla {
             fc: lin("fc.weight", h, n_feat)?,
             enc_norm: vecf("enc.output_norm.weight", h)?,
             out_norm: vecf("output_norm.weight", h)?,
             mask: Table::load(files, "mask_embd.weight", c.block_size - 1, h, quant)?,
             layers,
+            inv_freq,
+            rope_mag,
+        };
+        Ok(Self {
+            mla: Some(mla),
+            ds4: None,
             markov,
             embed,
             head,
-            inv_freq,
-            rope_mag,
             target_hidden,
             device: std::sync::atomic::AtomicBool::new(false),
             cfg,
@@ -503,13 +572,23 @@ impl<'a> Dspark<'a> {
         g
     }
 
+    fn mla(&self) -> &Mla<'a> {
+        self.mla.as_ref().expect("MLA draft")
+    }
+
     pub fn new_session(&self) -> DsparkSession {
+        // DeepSeek V4: per stage its window keys, `head_dim` per position.
+        let (n, lat, dr) = match &self.ds4 {
+            Some(d) => (d.n_stages(), d.cfg.head_dim, 0),
+            None => (self.mla().layers.len(), self.cfg.lat, self.cfg.dr),
+        };
         DsparkSession {
-            c: vec![Vec::new(); self.layers.len()],
-            r: vec![Vec::new(); self.layers.len()],
-            lat: self.cfg.lat,
-            dr: self.cfg.dr,
-            keep: self.cfg.window,
+            c: vec![Vec::new(); n],
+            r: vec![Vec::new(); n],
+            lat,
+            dr,
+            // The DeepSeek V4 stages index their window keys from position 0: no trimming.
+            keep: if self.ds4.is_some() { 0 } else { self.cfg.window },
             slack: SLACK,
             start: 0,
             len: 0,
@@ -518,8 +597,15 @@ impl<'a> Dspark<'a> {
 
     /// Weight bytes one draft pass reads (without the target's LM head).
     pub fn pass_bytes(&self) -> usize {
-        let mut n = self.fc.bytes();
-        for l in &self.layers {
+        if let Some(d) = &self.ds4 {
+            return d.pass_bytes(self.cfg.block_size)
+                + self
+                    .markov
+                    .as_ref()
+                    .map_or(0, |m| m.w2.bytes() + m.joint.as_ref().map_or(0, |j| j.0.bytes()));
+        }
+        let mut n = self.mla().fc.bytes();
+        for l in &self.mla().layers {
             n += [&l.q, &l.kv_a, &l.o, &l.gate, &l.up, &l.down]
                 .iter()
                 .map(|w| w.bytes())
@@ -534,9 +620,10 @@ impl<'a> Dspark<'a> {
 
     /// Cos / sin tables (scaled by the YaRN magnitude) for `positions`.
     fn rope(&self, positions: &[usize]) -> (Vec<f32>, Vec<f32>) {
-        let (mut cos, mut sin) = rope_tables(positions, &self.inv_freq);
-        if self.rope_mag != 1.0 {
-            cos.iter_mut().chain(sin.iter_mut()).for_each(|v| *v *= self.rope_mag);
+        let m = self.mla();
+        let (mut cos, mut sin) = rope_tables(positions, &m.inv_freq);
+        if m.rope_mag != 1.0 {
+            cos.iter_mut().chain(sin.iter_mut()).for_each(|v| *v *= m.rope_mag);
         }
         (cos, sin)
     }
@@ -570,14 +657,22 @@ impl<'a> Dspark<'a> {
         let h = self.cfg.hidden;
         let n_feat = self.cfg.target_layers.len() * self.target_hidden;
         assert_eq!(feats.len(), t * n_feat);
+        if let Some(d) = &self.ds4 {
+            for (li, kv) in d.context(feats, t, sess.len).into_iter().enumerate() {
+                sess.c[li].extend_from_slice(&kv);
+            }
+            sess.len += t;
+            return;
+        }
+        let m = self.mla();
         let mut x = vec![0f32; t * h];
-        self.lin(&mut [(&self.fc, h, &mut x[..])], n_feat, feats, t);
-        rmsnorm_f32w_rows_inplace(&mut x, h, &self.enc_norm, self.cfg.eps);
+        self.lin(&mut [(&m.fc, h, &mut x[..])], n_feat, feats, t);
+        rmsnorm_f32w_rows_inplace(&mut x, h, &m.enc_norm, self.cfg.eps);
         // Every layer's latent projection of the same rows, in one batch.
         let kd = self.cfg.lat + self.cfg.dr;
-        let mut kvs = vec![vec![0f32; t * kd]; self.layers.len()];
+        let mut kvs = vec![vec![0f32; t * kd]; m.layers.len()];
         {
-            let mut jobs: Vec<(&Lin, usize, &mut [f32])> = self
+            let mut jobs: Vec<(&Lin, usize, &mut [f32])> = m
                 .layers
                 .iter()
                 .zip(kvs.iter_mut())
@@ -585,7 +680,7 @@ impl<'a> Dspark<'a> {
                 .collect();
             self.lin(&mut jobs, h, &x, t);
         }
-        for (li, (l, kv)) in self.layers.iter().zip(&kvs).enumerate() {
+        for (li, (l, kv)) in m.layers.iter().zip(&kvs).enumerate() {
             let (cl, kr) = self.latent(l, kv, t, sess.len);
             sess.push(li, &cl, &kr);
         }
@@ -601,12 +696,24 @@ impl<'a> Dspark<'a> {
         let qk = dn + dr;
         let pos = sess.len;
         let mut x = vec![0f32; nb * h];
-        match &self.embed {
-            Some(e) => e.row(anchor as usize, &mut x[..h]),
-            None => target.embed_row(anchor, &mut x[..h]),
+        let embed = |t: u32, out: &mut [f32]| match &self.embed {
+            Some(e) => e.row(t as usize, out),
+            None => target.embed_row(t, out),
+        };
+        embed(anchor, &mut x[..h]);
+        if let Some(d) = &self.ds4 {
+            // The noise token after the anchor; the window of the last `window` positions.
+            for i in 1..nb {
+                embed(c.noise.unwrap_or(0), &mut x[i * h..(i + 1) * h]);
+            }
+            let hd = d.cfg.head_dim;
+            let lo = pos.saturating_sub(c.window);
+            let ctx: Vec<&[f32]> = sess.c.iter().map(|kv| &kv[lo * hd..pos * hd]).collect();
+            return d.block(&x, nb, pos, &ctx);
         }
+        let m = self.mla();
         for i in 1..nb {
-            self.mask.row(i - 1, &mut x[i * h..(i + 1) * h]);
+            m.mask.row(i - 1, &mut x[i * h..(i + 1) * h]);
         }
         let positions: Vec<usize> = (pos..pos + nb).collect();
         let (cos, sin) = self.rope(&positions);
@@ -618,7 +725,7 @@ impl<'a> Dspark<'a> {
         let n_ctx = pos - lo;
         let scale = (qk as f32).powf(-0.5);
         let mut hn = vec![0f32; nb * h];
-        for (li, l) in self.layers.iter().enumerate() {
+        for (li, l) in m.layers.iter().enumerate() {
             rmsnorm_f32w_rows(&x, h, &l.attn_norm, c.eps, &mut hn);
             let mut q = vec![0f32; nb * nh * qk];
             let mut kv = vec![0f32; nb * (lat + dr)];
@@ -677,7 +784,7 @@ impl<'a> Dspark<'a> {
             self.lin(&mut [(&l.down, h, &mut o[..])], c.inter, &g, nb);
             add_inplace(&mut x, &o);
         }
-        rmsnorm_f32w_rows_inplace(&mut x, h, &self.out_norm, c.eps);
+        rmsnorm_f32w_rows_inplace(&mut x, h, &m.out_norm, c.eps);
         x
     }
 
@@ -735,9 +842,11 @@ impl<'a> Dspark<'a> {
         let c = &self.cfg;
         let k = k.clamp(1, c.max_draft());
         let first = usize::from(!c.sample_from_anchor);
-        let hid = self.block(target, sess, anchor, k + first);
+        // DeepSeek V4's block attends without a mask: always the trained block, whatever `k`.
+        let nb = if self.ds4.is_some() { c.block_size } else { k + first };
+        let hid = self.block(target, sess, anchor, nb);
         let h = c.hidden;
-        let rows = &hid[first * h..];
+        let rows = &hid[first * h..(first + k) * h];
         let mut logits = match &self.head {
             Some(hd) => {
                 let v = target.vocab_size();

@@ -1044,6 +1044,23 @@ impl<'a> DeepSeek4Model<'a> {
 fn grouped_out(c: &DeepSeek4Config, a: &Attn, att: &[f32], t: usize, out: &mut [f32]) {
     let (h, nh, hd, g, r) = (c.hidden_size, c.num_attention_heads, c.head_dim, c.o_groups, c.o_lora_rank);
     let gd = nh * hd / g;
+    if t < GEMM_MIN {
+        // Short passes: each group on the decode kernels (the grouped GEMM pads to whole tiles).
+        let mut y = vec![0f32; t * g * r];
+        let mut xi = vec![0f32; t * gd];
+        let mut yi = vec![0f32; t * r];
+        for (gi, w) in a.wo_a.iter().enumerate() {
+            for ti in 0..t {
+                xi[ti * gd..(ti + 1) * gd].copy_from_slice(&att[ti * nh * hd + gi * gd..ti * nh * hd + (gi + 1) * gd]);
+            }
+            linear(w, r, gd, &xi, t, &mut yi);
+            for ti in 0..t {
+                y[(ti * g + gi) * r..(ti * g + gi + 1) * r].copy_from_slice(&yi[ti * r..(ti + 1) * r]);
+            }
+        }
+        linear(&a.wo_b, h, g * r, &y, t, out);
+        return;
+    }
     let mut xg = vec![0f32; g * t * gd];
     for ti in 0..t {
         for gi in 0..g {
@@ -1356,6 +1373,182 @@ pub(crate) fn moe_forward(c: &DeepSeek4Config, m: &Moe, x: &[f32], tokens: &[u32
     });
     let routes: Vec<_> = logits.chunks(ne).zip(tokens).map(|(lg, &tk)| route(c, m, lg, tk)).collect();
     m.experts.forward(x, t, h, &routes, y, need, None);
+}
+
+/// The DSpark draft of DeepSeek V4 (the `mtp.*` stages of deepseek-ai/DeepSeek-V4-Flash-DSpark;
+/// llama.cpp's `dflash` GGUF with hyper-connections, its tensors named as the target's by
+/// [`gguf_name`]), as the checkpoint's `inference/model.py`:
+///
+/// - Context: the target's residual (mean of its copies) after a few layers (`dspark_target_layer_ids`,
+///   40..42 of 43), concatenated, projected (`main_proj`, GGUF `fc`) and RMS-normed (`main_norm`,
+///   `enc.output_norm`); each stage turns that into a key of its sliding window (`kv_norm(wkv(.))`,
+///   rotated at the position), the last `sliding_window` positions.
+/// - Block: the anchor token (committed, not yet run by the target) at position `n` and
+///   `block_size - 1` noise tokens (`dspark_noise_token_id`) after it, through full DeepSeek V4
+///   blocks (hyper-connections, MoE, window-only attention) whose queries attend to the window and
+///   to the whole block (no causal mask); the draft's own `hc_head` and norm, the target's head.
+///   Slot `i` predicts the token at `n + i + 1`.
+/// - Markov head: each slot's logits get `markov_w2 markov_w1[prev]`, chained on the drafted tokens
+///   (in [`crate::dspark`]).
+pub(crate) struct Ds4Draft<'a> {
+    pub cfg: DeepSeek4Config,
+    stages: Vec<Layer<'a>>,
+    fc: Lin<'a>, // [H, n_feat]
+    main_norm: Vec<f32>,
+    hc_head: Hc,
+    norm: Vec<f32>,
+    inv: Vec<f32>,
+}
+
+impl<'a> Ds4Draft<'a> {
+    /// Loads the stages of a draft GGUF (`files`, named by [`gguf_name`]) whose features are
+    /// `n_feat` wide.
+    pub(crate) fn load(files: &'a ModelFiles, cfg: DeepSeek4Config, quant: Quant, n_feat: usize) -> Result<Self> {
+        if cfg.compress_ratios.iter().take(cfg.num_hidden_layers).any(|&r| r != 0) {
+            bail!("DeepSeek V4 DSpark draft: compressed attention in a stage is not supported");
+        }
+        let ld = Loader { files, cfg: &cfg, quant };
+        let h = cfg.hidden_size;
+        let stages = (0..cfg.num_hidden_layers)
+            .map(|l| {
+                ld.layer(&format!("layers.{l}."), usize::MAX, 0)
+                    .with_context(|| format!("DSpark stage {l}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (inv, _) = cfg.rope_freqs();
+        Ok(Self {
+            fc: ld.lin("fc.weight", h, n_feat)?,
+            main_norm: ld.getf("enc.output_norm.weight", &[h])?,
+            hc_head: ld.hc_head("")?,
+            norm: ld.getf("norm.weight", &[h])?,
+            stages,
+            inv,
+            cfg,
+        })
+    }
+
+    pub(crate) fn n_stages(&self) -> usize {
+        self.stages.len()
+    }
+
+    /// Weight bytes one draft pass reads (routed experts at top-k per slot).
+    pub(crate) fn pass_bytes(&self, slots: usize) -> usize {
+        let mut n = self.fc.bytes();
+        for l in &self.stages {
+            let a = &l.attn;
+            n += [&a.wq_a, &a.wq_b, &a.wkv, &a.wo_b].iter().map(|w| w.bytes()).sum::<usize>();
+            n += a.wo_a.iter().map(|w| w.bytes()).sum::<usize>();
+            n += l.moe.shared.bytes() + slots * l.moe.experts.bytes_per_token();
+        }
+        n
+    }
+
+    /// Each stage's window keys (`[t, head_dim]`) for `t` rows of target features (`[t, n_feat]`)
+    /// at positions `start..`.
+    pub(crate) fn context(&self, feats: &[f32], t: usize, start: usize) -> Vec<Vec<f32>> {
+        let c = &self.cfg;
+        let (h, hd) = (c.hidden_size, c.head_dim);
+        let eps = c.rms_norm_eps as f32;
+        let mut x = vec![0f32; t * h];
+        linear(&self.fc, h, feats.len() / t, feats, t, &mut x);
+        rmsnorm_f32w_rows_inplace(&mut x, h, &self.main_norm, eps);
+        let positions: Vec<usize> = (start..start + t).collect();
+        let (cos, sin) = rope_tables(&positions, &self.inv);
+        self.stages
+            .iter()
+            .map(|l| {
+                let mut kv = vec![0f32; t * hd];
+                linear(&l.attn.wkv, hd, h, &x, t, &mut kv);
+                norm_rope_rows(&mut kv, hd, Some(&l.attn.kv_norm), eps, &cos, &sin);
+                kv
+            })
+            .collect()
+    }
+
+    /// Runs the block whose input embeddings are `emb` (`[nb, H]`: the anchor's, then the noise
+    /// token's) at positions `pos..` over each stage's window keys `ctx` (`[n_ctx, head_dim]`);
+    /// returns the final-normed states `[nb, H]`.
+    pub(crate) fn block(&self, emb: &[f32], nb: usize, pos: usize, ctx: &[&[f32]]) -> Vec<f32> {
+        let c = &self.cfg;
+        let (h, n) = (c.hidden_size, c.hc_mult);
+        let mut x = vec![0f32; nb * n * h];
+        for (i, row) in x.chunks_mut(n * h).enumerate() {
+            for k in 0..n {
+                row[k * h..(k + 1) * h].copy_from_slice(&emb[i * h..(i + 1) * h]);
+            }
+        }
+        let positions: Vec<usize> = (pos..pos + nb).collect();
+        let (cos, sin) = rope_tables(&positions, &self.inv);
+        let tokens = vec![0u32; nb];
+        for (l, layer) in self.stages.iter().enumerate() {
+            let (xa, post, comb) = hc_pre(c, &layer.hc_attn, &layer.attn_norm, &x, nb);
+            let mut o = vec![0f32; nb * h];
+            self.attn(&layer.attn, &xa, nb, ctx[l], (&cos, &sin), &mut o);
+            hc_post(c, &mut x, &o, &post, &comb, nb);
+            let (xf, post, comb) = hc_pre(c, &layer.hc_ffn, &layer.ffn_norm, &x, nb);
+            o.fill(0.0);
+            moe_forward(c, &layer.moe, &xf, &tokens, nb, &mut o, None);
+            hc_post(c, &mut x, &o, &post, &comb, nb);
+        }
+        let mut out = hc_head(c, &self.hc_head, &x, nb);
+        rmsnorm_f32w_rows_inplace(&mut out, h, &self.norm, c.rms_norm_eps as f32);
+        out
+    }
+
+    /// A stage's attention: the block's queries over the window keys `ctx` and the block's own
+    /// keys, no mask, with the sinks.
+    fn attn(&self, a: &Attn, xa: &[f32], nb: usize, ctx: &[f32], rope: (&[f32], &[f32]), out: &mut [f32]) {
+        let c = &self.cfg;
+        let (h, nh, hd, ql) = (c.hidden_size, c.num_attention_heads, c.head_dim, c.q_lora_rank);
+        let eps = c.rms_norm_eps as f32;
+        let (cos, sin) = rope;
+        let half = cos.len() / nb;
+        let mut qa = vec![0f32; nb * ql];
+        let mut kv = vec![0f32; nb * hd];
+        linear_multi(&mut [(&a.wq_a, ql, &mut qa[..]), (&a.wkv, hd, &mut kv[..])], h, xa, nb);
+        rmsnorm_f32w_rows_inplace(&mut qa, ql, &a.q_norm, eps);
+        let mut q = vec![0f32; nb * nh * hd];
+        linear(&a.wq_b, nh * hd, ql, &qa, nb, &mut q);
+        for_chunks(&mut q, hd, false, |i, qh| {
+            let ti = i / nh;
+            let s = 1.0 / (dot(qh, qh) / hd as f32 + eps).sqrt();
+            scale_inplace(qh, s);
+            rope_tail(qh, &cos[ti * half..(ti + 1) * half], &sin[ti * half..(ti + 1) * half], false);
+        });
+        norm_rope_rows(&mut kv, hd, Some(&a.kv_norm), eps, cos, sin);
+        let n_ctx = ctx.len() / hd;
+        let key = |j: usize| -> &[f32] {
+            if j < n_ctx {
+                &ctx[j * hd..(j + 1) * hd]
+            } else {
+                &kv[(j - n_ctx) * hd..(j - n_ctx + 1) * hd]
+            }
+        };
+        let scale = (hd as f32).powf(-0.5);
+        let mut att = vec![0f32; nb * nh * hd];
+        let op = SendPtr(att.as_mut_ptr());
+        crate::pool::run(nb * nh, &|task| {
+            let (i, hh) = (task / nh, task % nh);
+            let qh = &q[(i * nh + hh) * hd..(i * nh + hh + 1) * hd];
+            let mut s: Vec<f32> = (0..n_ctx + nb).map(|j| dot(qh, key(j)) * scale).collect();
+            let m = s.iter().copied().fold(a.sink[hh], f32::max);
+            let mut tot = (a.sink[hh] - m).exp();
+            for v in s.iter_mut() {
+                *v = (*v - m).exp();
+                tot += *v;
+            }
+            // SAFETY: each (row, head) task writes its own row.
+            let o = unsafe { std::slice::from_raw_parts_mut(op.get().add((i * nh + hh) * hd), hd) };
+            for (j, &p) in s.iter().enumerate() {
+                axpy(o, p / tot, key(j));
+            }
+        });
+        for_chunks(&mut att, hd, false, |i, oh| {
+            let ti = i / nh;
+            rope_tail(oh, &cos[ti * half..(ti + 1) * half], &sin[ti * half..(ti + 1) * half], true);
+        });
+        grouped_out(c, a, &att, nb, out);
+    }
 }
 
 #[derive(Clone, Copy)]

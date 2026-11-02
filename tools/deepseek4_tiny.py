@@ -8,9 +8,11 @@
 # grouped output projection, YaRN on the compressed layers, clamped SwiGLU experts.
 # transformers loads it back through its conversion mapping (checked here, tensor by tensor).
 #
-# usage: deepseek4_tiny.py OUT_DIR REAL_REPO_DIR [--hca N] [--bf16]
+# usage: deepseek4_tiny.py OUT_DIR REAL_REPO_DIR [--hca N] [--bf16] [--dspark]
 #   REAL_REPO_DIR holds tokenizer.json / tokenizer_config.json of deepseek-ai/DeepSeek-V4-Flash.
-# Then: ref_deepseek4.py OUT_DIR ref.safetensors 300 16, and
+#   --dspark: also DSpark draft stages (`mtp.0..2`, as deepseek-ai/DeepSeek-V4-Flash-DSpark), for
+#   tools/ref_dspark_ds4.py (the official DSpark inference/model.py) and tools/dspark_ds4_gguf.py.
+# Then: ref_deepseek4.py OUT_DIR MODEL_PY ref.safetensors 300 16, and
 #   cargo run --release --example deepseek4_check -- OUT_DIR ref.safetensors [--chunk N]
 import json, math, os, shutil, sys
 
@@ -22,6 +24,7 @@ from transformers import DeepseekV4Config, DeepseekV4ForCausalLM
 out, real = sys.argv[1], sys.argv[2]
 hca = int(sys.argv[sys.argv.index("--hca") + 1]) if "--hca" in sys.argv else 16
 bf16 = "--bf16" in sys.argv
+dspark = "--dspark" in sys.argv
 os.makedirs(out, exist_ok=True)
 torch.manual_seed(1234)
 
@@ -44,15 +47,29 @@ official = {
     "bos_token_id": 0, "eos_token_id": 1, "max_position_embeddings": 1048576,
     "torch_dtype": "bfloat16" if bf16 else "float32",
 }
+MARKOV = 32
+if dspark:
+    official.update({
+        "compress_ratios": ratios + [0, 0, 0], "num_nextn_predict_layers": 3, "dspark_block_size": 5,
+        "dspark_noise_token_id": 128799, "dspark_target_layer_ids": [2, 3, 5], "dspark_markov_rank": MARKOV,
+    })
 # transformers' own keys (its layer types only know the rates 4 and 128 by default).
 extra = {
     "layer_types": [kind[r] for r in ratios],
     "compress_rates": {"compressed_sparse_attention": 4, "heavily_compressed_attention": hca},
     "mlp_layer_types": ["hash_moe"] + ["moe"] * (n - 1),
 }
-cfgd = json.loads(json.dumps(dict(official, **extra)))  # a copy: the config edits nested dicts
-cfgd.pop("compress_ratios")
-cfg = DeepseekV4Config(**{k: v for k, v in cfgd.items() if k not in ("architectures", "model_type", "torch_dtype")})
+
+
+def make(over):
+    d = json.loads(json.dumps(dict(official, **extra)))  # a copy: the config edits nested dicts
+    d.update(over)
+    d.pop("compress_ratios")
+    return DeepseekV4Config(**{k: v for k, v in d.items()
+                               if k not in ("architectures", "model_type", "torch_dtype") and not k.startswith("dspark")})
+
+
+cfg = make({})
 model = DeepseekV4ForCausalLM(cfg).float().eval()
 
 g = torch.Generator().manual_seed(42)
@@ -62,44 +79,48 @@ def rn(*shape):
     return torch.randn(*shape, generator=g)
 
 
-with torch.no_grad():
-    for name, p in model.named_parameters():
-        if "norm" in name and name.endswith("weight"):
-            p.copy_(1.0 + 0.2 * rn(*p.shape))
-        elif name.endswith("sinks"):
-            p.copy_(rn(*p.shape))
-        elif name.endswith("position_bias"):
-            p.copy_(0.5 * rn(*p.shape))
-        elif name.endswith(".base") or name.endswith("hc_base"):
-            p.copy_(0.5 * rn(*p.shape))
-        elif name.endswith(".scale") or name.endswith("hc_scale"):
-            p.copy_(0.5 + torch.rand(p.shape, generator=g))
-        elif name.endswith(".fn") or name.endswith("hc_fn"):
-            p.copy_(rn(*p.shape) / math.sqrt(p.shape[-1]) * 4.0)
-        elif "embed_tokens" in name:
-            p.copy_(rn(*p.shape))
-        elif p.ndim >= 2:
-            fan_in = p.shape[-1]
-            gain = 1.0
-            if "q_b_proj" in name or "kv_proj" in name or "q_a_proj" in name:
-                gain = 2.0
-            if "mlp.gate.weight" in name:
-                gain = 3.0
-            if "lm_head" in name:
-                gain = 4.0
-            if "gate_proj" in name and "compressor" in name:
-                gain = 3.0
-            p.copy_(gain * rn(*p.shape) / math.sqrt(fan_in))
-        else:
-            p.copy_(0.1 * rn(*p.shape))
-    for name, b in model.named_buffers():
-        if name.endswith("e_score_correction_bias"):
-            b.copy_(0.3 * rn(*b.shape))
-        elif name.endswith("tid2eid"):
-            # Distinct experts per token, as the real table.
-            v = torch.stack([torch.randperm(cfg.n_routed_experts, generator=g)[: cfg.num_experts_per_tok]
-                             for _ in range(b.shape[0])])
-            b.copy_(v)
+def init(model, cfg):
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if "norm" in name and name.endswith("weight"):
+                p.copy_(1.0 + 0.2 * rn(*p.shape))
+            elif name.endswith("sinks"):
+                p.copy_(rn(*p.shape))
+            elif name.endswith("position_bias"):
+                p.copy_(0.5 * rn(*p.shape))
+            elif name.endswith(".base") or name.endswith("hc_base"):
+                p.copy_(0.5 * rn(*p.shape))
+            elif name.endswith(".scale") or name.endswith("hc_scale"):
+                p.copy_(0.5 + torch.rand(p.shape, generator=g))
+            elif name.endswith(".fn") or name.endswith("hc_fn"):
+                p.copy_(rn(*p.shape) / math.sqrt(p.shape[-1]) * 4.0)
+            elif "embed_tokens" in name:
+                p.copy_(rn(*p.shape))
+            elif p.ndim >= 2:
+                fan_in = p.shape[-1]
+                gain = 1.0
+                if "q_b_proj" in name or "kv_proj" in name or "q_a_proj" in name:
+                    gain = 2.0
+                if "mlp.gate.weight" in name:
+                    gain = 3.0
+                if "lm_head" in name:
+                    gain = 4.0
+                if "gate_proj" in name and "compressor" in name:
+                    gain = 3.0
+                p.copy_(gain * rn(*p.shape) / math.sqrt(fan_in))
+            else:
+                p.copy_(0.1 * rn(*p.shape))
+        for name, b in model.named_buffers():
+            if name.endswith("e_score_correction_bias"):
+                b.copy_(0.3 * rn(*b.shape))
+            elif name.endswith("tid2eid"):
+                # Distinct experts per token, as the real table.
+                v = torch.stack([torch.randperm(cfg.n_routed_experts, generator=g)[: cfg.num_experts_per_tok]
+                                 for _ in range(b.shape[0])])
+                b.copy_(v)
+
+
+init(model, cfg)
 
 # The official names of transformers' parameters.
 REN = [
@@ -132,31 +153,69 @@ LAYER = [
     ("mlp.shared_experts.up_proj.weight", "ffn.shared_experts.w3.weight"),
     ("mlp.shared_experts.down_proj.weight", "ffn.shared_experts.w2.weight"),
 ]
-sd = model.state_dict()
 dt = torch.bfloat16 if bf16 else torch.float32
-tensors = {}
-for k, v in sd.items():
-    if k.endswith("inv_freq") or "rotary_emb" in k:
-        continue
-    name = dict(REN).get(k)
-    if name is None:
-        l, rest = k.removeprefix("model.layers.").split(".", 1)
-        if rest == "mlp.experts.gate_up_proj":
-            mi = cfg.moe_intermediate_size
-            for e in range(v.shape[0]):
-                tensors[f"layers.{l}.ffn.experts.{e}.w1.weight"] = v[e, :mi].to(dt)
-                tensors[f"layers.{l}.ffn.experts.{e}.w3.weight"] = v[e, mi:].to(dt)
-            continue
-        if rest == "mlp.experts.down_proj":
-            for e in range(v.shape[0]):
-                tensors[f"layers.{l}.ffn.experts.{e}.w2.weight"] = v[e].to(dt)
-            continue
-        name = f"layers.{l}." + dict(LAYER)[rest]
+
+
+def keep(name, v):
     if name.endswith("tid2eid"):
-        v = v.to(torch.int32)
-    elif v.ndim >= 2 and not any(s in name for s in ("hc_", "ape")):
+        return v.to(torch.int32).contiguous()
+    if v.ndim >= 2 and not any(s in name for s in ("hc_", "ape")):
         v = v.to(dt)  # the reference keeps the hc / ape / norm / sink / bias tensors in float32
-    tensors[name] = v.contiguous()
+    return v.contiguous()
+
+
+def official_names(sd, layer_prefix, tensors):
+    """transformers' state dict `sd` into `tensors` under DeepSeek's names (layers as `layer_prefix`N)."""
+    for k, v in sd.items():
+        if k.endswith("inv_freq") or "rotary_emb" in k:
+            continue
+        name = dict(REN).get(k)
+        if name is None:
+            l, rest = k.removeprefix("model.layers.").split(".", 1)
+            p = f"{layer_prefix}{l}."
+            if rest == "mlp.experts.gate_up_proj":
+                mi = cfg.moe_intermediate_size
+                for e in range(v.shape[0]):
+                    tensors[f"{p}ffn.experts.{e}.w1.weight"] = v[e, :mi].to(dt).contiguous()
+                    tensors[f"{p}ffn.experts.{e}.w3.weight"] = v[e, mi:].to(dt).contiguous()
+                continue
+            if rest == "mlp.experts.down_proj":
+                for e in range(v.shape[0]):
+                    tensors[f"{p}ffn.experts.{e}.w2.weight"] = v[e].to(dt).contiguous()
+                continue
+            name = p + dict(LAYER)[rest]
+        tensors[name] = keep(name, v)
+
+
+sd = model.state_dict()
+tensors = {}
+official_names(sd, "layers.", tensors)
+
+if dspark:
+    # Three window-only stages with their own hc head and norm (the last), the feature projection
+    # (the first), and the Markov / confidence heads (the last).
+    dcfg = make({"num_hidden_layers": 3, "layer_types": ["sliding_attention"] * 3, "mlp_layer_types": ["moe"] * 3})
+    dm = DeepseekV4ForCausalLM(dcfg).float().eval()
+    init(dm, dcfg)
+    dsd = {k: v for k, v in dm.state_dict().items() if k.startswith("model.layers.")}
+    official_names(dsd, "mtp.", tensors)
+    h, v = official["hidden_size"], official["vocab_size"]
+    nt = len(official["dspark_target_layer_ids"])
+    hc = official["hc_mult"]
+    extra_t = {
+        "mtp.0.main_proj.weight": rn(h, nt * h) / math.sqrt(nt * h) * 2.0,
+        "mtp.0.main_norm.weight": 1.0 + 0.2 * rn(h),
+        "mtp.2.norm.weight": 1.0 + 0.2 * rn(h),
+        "mtp.2.hc_head_fn": rn(hc, hc * h) / math.sqrt(hc * h) * 4.0,
+        "mtp.2.hc_head_base": 0.5 * rn(hc),
+        "mtp.2.hc_head_scale": 0.5 + torch.rand(1, generator=g),
+        "mtp.2.markov_head.markov_w1.weight": rn(v, MARKOV),
+        "mtp.2.markov_head.markov_w2.weight": rn(v, MARKOV) / math.sqrt(MARKOV) * 2.0,
+        "mtp.2.confidence_head.proj.weight": rn(1, h + MARKOV) / math.sqrt(h + MARKOV),
+    }
+    for k, t in extra_t.items():
+        tensors[k] = keep(k, t)
+
 save_file(tensors, os.path.join(out, "model.safetensors"), metadata={"format": "pt"})
 with open(os.path.join(out, "config.json"), "w") as f:
     json.dump(dict(official, **extra), f, indent=2)

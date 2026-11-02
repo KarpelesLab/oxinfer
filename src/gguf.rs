@@ -557,7 +557,7 @@ impl Header {
     }
 
     /// The DeepSeek V4 config (`config.json` keys of deepseek-ai/DeepSeek-V4-Flash).
-    fn deepseek4_config(&self) -> Result<Json> {
+    pub(crate) fn deepseek4_config(&self) -> Result<Json> {
         let need = |k: &str| {
             self.arch_u64(k)
                 .with_context(|| format!("GGUF metadata has no {}.{k}", self.arch()))
@@ -1025,15 +1025,26 @@ pub fn hf_tensors(h: &Header) -> Result<Vec<HfTensor>> {
         "flux" | "qwen_image" | "pig" | "omnigen2" | "t5encoder" | "clip" | "dflash"
     ) {
         let t5 = h.arch() == "t5encoder";
+        // DeepSeek V4 DSpark drafts: the stages (and their head) named as the target's layers.
+        let ds4 = h.arch() == "dflash" && h.get("dflash.hyper_connection.count").is_some();
         return Ok(h
             .tensors
             .iter()
-            .map(|t| HfTensor {
-                name: if t5 { t5_hf_name(&t.name) } else { t.name.clone() },
-                shape: t.ne.iter().rev().copied().collect(),
-                ggml_type: t.ggml_type,
-                start: t.start,
-                end: t.end,
+            .map(|t| match crate::deepseek4::gguf_name(&t.name, &t.ne).filter(|_| ds4) {
+                Some((name, shape)) => HfTensor {
+                    name,
+                    shape,
+                    ggml_type: t.ggml_type,
+                    start: t.start,
+                    end: t.end,
+                },
+                None => HfTensor {
+                    name: if t5 { t5_hf_name(&t.name) } else { t.name.clone() },
+                    shape: t.ne.iter().rev().copied().collect(),
+                    ggml_type: t.ggml_type,
+                    start: t.start,
+                    end: t.end,
+                },
             })
             .collect());
     }
