@@ -296,6 +296,22 @@ pub unsafe extern "C" fn oxi_engine_complete(e: *mut OxiEngine, text: *const c_c
     run(e, text, cb, user, |g, t, d| g.complete(t, d))
 }
 
+/// Runs a whole conversation (`messages_json`, a JSON array of messages, see `oxinfer.h`) and
+/// streams the next reply; returns as `oxi_engine_send`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_engine_chat(e: *mut OxiEngine, messages_json: *const c_char, cb: OxiTokenFn, user: *mut c_void) -> c_int {
+    run(e, messages_json, cb, user, |g, t, d| {
+        let v: serde_json::Value = serde_json::from_str(t).context("messages_json is not JSON")?;
+        let msgs = v
+            .as_array()
+            .context("messages_json: expected an array")?
+            .iter()
+            .map(crate::engine::Message::from_json)
+            .collect::<Result<Vec<_>>>()?;
+        g.chat(&msgs, d)
+    })
+}
+
 /// Starts a new conversation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxi_engine_reset(e: *mut OxiEngine) -> c_int {
@@ -2062,4 +2078,160 @@ pub unsafe extern "C" fn oxi_bagel_understand_file(
             _ => Ok(None),
         }
     })
+}
+
+// ---- OpenAI-compatible server ---------------------------------------------------------------
+
+/// Receives bytes of a response body (`len` bytes at `data`); return non-zero to stop a streamed
+/// body (the request then stops).
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+pub type OxiBytesFn = Option<unsafe extern "C" fn(user: *mut c_void, data: *const c_char, len: usize) -> c_int>;
+
+/// An OpenAI-compatible API over a whitelist of models (`crate::server`), with or without its
+/// HTTP listener.
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+pub struct OxiServer {
+    api: std::sync::Arc<crate::server::Api>,
+    running: Mutex<Option<crate::server::http::Running>>,
+}
+
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+unsafe fn server<'a>(s: *const OxiServer) -> Result<&'a OxiServer> {
+    unsafe { s.as_ref() }.context("server is NULL")
+}
+
+/// Creates the API from options (`key=value` lines or `;`-separated pairs, or a JSON object; see
+/// `oxinfer.h`); fetches or loads the models when the options ask for it.
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_server_new(options: *const c_char, progress: OxiProgressFn, user: *mut c_void) -> *mut OxiServer {
+    guard(std::ptr::null_mut(), || {
+        let text = unsafe { str_arg(options, "options") }?;
+        let o = if text.trim_start().starts_with('{') {
+            crate::server::ServerOptions::from_json(&serde_json::from_str(text).context("options: bad JSON")?)?
+        } else {
+            crate::server::ServerOptions::from_pairs(text)?
+        };
+        let api = with_progress(progress, user, || crate::server::Api::new(o))?;
+        Ok(Box::into_raw(Box::new(OxiServer {
+            api,
+            running: Mutex::new(None),
+        })))
+    })
+}
+
+/// Starts the HTTP(S) listener (`listen`, `tls_cert` / `tls_key`, `self_signed`, `workers`
+/// options) in the background; returns its base URL (`http://127.0.0.1:8080`).
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_server_start(s: *mut OxiServer) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let s = unsafe { server(s) }?;
+        let mut r = s.running.lock().unwrap_or_else(|p| p.into_inner());
+        if r.is_some() {
+            bail!("the server is already running");
+        }
+        let running = crate::server::http::start(s.api.clone())?;
+        let url = running.url();
+        *r = Some(running);
+        Ok(out_string(url))
+    })
+}
+
+/// Stops the listener (requests in flight finish first). Returns 0, or -1.
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_server_stop(s: *mut OxiServer) -> c_int {
+    guard(-1, || {
+        let s = unsafe { server(s) }?;
+        let running = s.running.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(r) = running {
+            r.stop()?;
+        }
+        Ok(0)
+    })
+}
+
+/// Handles one request without HTTP (`method` and `path` as in HTTP; `content_type` and
+/// `authorization` may be NULL): the body, complete or streamed, goes to `on_body`, the content
+/// type to `*content_type_out` when it is not NULL (free with `oxi_string_free`). Returns the
+/// HTTP status (200, or an OpenAI error status with an error JSON body), or -1.
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn oxi_server_handle(
+    s: *mut OxiServer,
+    method: *const c_char,
+    path: *const c_char,
+    content_type: *const c_char,
+    authorization: *const c_char,
+    body: *const c_char,
+    len: usize,
+    on_body: OxiBytesFn,
+    user: *mut c_void,
+    content_type_out: *mut *mut c_char,
+) -> c_int {
+    guard(-1, || {
+        let s = unsafe { server(s) }?;
+        let method = unsafe { str_arg(method, "method") }?;
+        let path = unsafe { str_arg(path, "path") }?;
+        let ct = unsafe { opt_str_arg(content_type, "content_type") }?;
+        if body.is_null() && len > 0 {
+            bail!("body is NULL");
+        }
+        let bytes = if len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(body as *const u8, len) }.to_vec()
+        };
+        let mut req = crate::server::ApiRequest::new(method, path, ct, bytes);
+        req.authorization = unsafe { opt_str_arg(authorization, "authorization") }?.map(str::to_string);
+        let mut send = |b: &[u8]| match on_body {
+            Some(cb) => (unsafe { cb(user, b.as_ptr() as *const c_char, b.len()) }) == 0,
+            None => true,
+        };
+        let set_type = |t: String| {
+            if let Some(p) = unsafe { content_type_out.as_mut() } {
+                *p = out_string(t);
+            }
+        };
+        match s.api.handle(&req) {
+            crate::server::Output::Full(r) => {
+                set_type(r.content_type);
+                send(&r.body);
+                Ok(r.status as c_int)
+            }
+            crate::server::Output::Stream { content_type, producer } => {
+                set_type(content_type);
+                producer(&mut send);
+                Ok(200)
+            }
+        }
+    })
+}
+
+/// Unloads every idle model (each loads again on its next request). Returns 0, or -1.
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_server_unload(s: *mut OxiServer) -> c_int {
+    guard(-1, || {
+        unsafe { server(s) }?.api.unload_all();
+        Ok(0)
+    })
+}
+
+/// Stops the listener if it runs and frees the server (NULL is ignored).
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_server_free(s: *mut OxiServer) {
+    if !s.is_null() {
+        guard((), || {
+            let s = unsafe { Box::from_raw(s) };
+            let running = s.running.lock().unwrap_or_else(|p| p.into_inner()).take();
+            if let Some(r) = running {
+                r.stop()?;
+            }
+            Ok(())
+        })
+    }
 }

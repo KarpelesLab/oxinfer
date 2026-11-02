@@ -59,6 +59,14 @@ pub trait ChatFormat {
     /// What to feed after a reply that ended on its tool calls (its stop token was sampled but not
     /// fed): the results, up to where the model continues.
     fn tool_results(&self, results: &[ToolResult], think: bool) -> String;
+    /// A past reply as the model wrote it after the generation prompt, up to (not including) the
+    /// token it stopped on: its text, then its tool calls (when it made any). Rendering a whole
+    /// conversation again ([`crate::engine::Engine::chat`]) gives the same text as the turns that
+    /// produced it.
+    fn assistant_text(&self, content: &str, calls: &[ToolCall]) -> String {
+        let _ = calls;
+        content.to_string()
+    }
 }
 
 pub struct GemmaChat;
@@ -110,6 +118,11 @@ impl ChatFormat for GemmaChat {
         if think {
             s.push_str("<|channel>thought\n");
         }
+        s
+    }
+    fn assistant_text(&self, content: &str, calls: &[ToolCall]) -> String {
+        let mut s = content.to_string();
+        s.extend(calls.iter().map(crate::tools::gemma::call));
         s
     }
 }
@@ -175,6 +188,9 @@ impl ChatFormat for GemmaChatLarge {
     }
     fn tool_results(&self, results: &[ToolResult], think: bool) -> String {
         GemmaChat.tool_results(results, think)
+    }
+    fn assistant_text(&self, content: &str, calls: &[ToolCall]) -> String {
+        GemmaChat.assistant_text(content, calls)
     }
 }
 
@@ -350,6 +366,19 @@ impl ChatFormat for QwenChat {
         }
         s.push_str("<|im_end|>\n<|im_start|>assistant\n");
         s.push_str(self.think_tail(think));
+        s
+    }
+    fn assistant_text(&self, content: &str, calls: &[ToolCall]) -> String {
+        if calls.is_empty() {
+            return content.to_string();
+        }
+        // The template's layout: the text, a blank line, the calls one per line.
+        let mut s = content.trim().to_string();
+        if !s.is_empty() {
+            s.push_str("\n\n");
+        }
+        let calls: Vec<String> = calls.iter().map(|c| crate::tools::qwen::call(c, self.qwen3)).collect();
+        s.push_str(&calls.join("\n"));
         s
     }
 }
@@ -589,6 +618,11 @@ impl ChatFormat for MistralChat {
         s.extend(results.iter().map(crate::tools::mistral::response));
         s
     }
+    fn assistant_text(&self, content: &str, calls: &[ToolCall]) -> String {
+        let mut s = content.to_string();
+        s.extend(calls.iter().map(crate::tools::mistral::call));
+        s
+    }
 }
 
 /// DeepSeek V4 (its `encoding_dsv4.py`): `<｜begin▁of▁sentence｜>` then the system prompt as is
@@ -651,6 +685,12 @@ impl ChatFormat for DeepSeekChat {
         // turn.
         let blocks: Vec<String> = results.iter().map(crate::tools::deepseek::response).collect();
         format!("{}<｜User｜>{}{}", Self::EOS, blocks.join("\n\n"), Self::assistant(think))
+    }
+    fn assistant_text(&self, content: &str, calls: &[ToolCall]) -> String {
+        if calls.is_empty() {
+            return content.to_string();
+        }
+        format!("{}{}", content.trim_end(), crate::tools::deepseek::calls(calls))
     }
 }
 

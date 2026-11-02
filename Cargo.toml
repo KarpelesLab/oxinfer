@@ -75,7 +75,7 @@ name = "steer"
 required-features = ["hf"]
 
 [features]
-default = ["media", "hf", "gpu"]
+default = ["media", "hf", "gpu", "server"]
 # oxideav-core's types in the public API (the `av` module): in-memory images, audio and video as
 # VideoFrame / AudioFrame + CodecParameters for the multimodal models, Whisper and Stable
 # Diffusion. Only the type crate: no codecs, containers or file code.
@@ -120,6 +120,9 @@ web = ["dep:getrandom"]
 # A C API over the `engine` module (include/oxinfer.h), for Swift and other non-Rust hosts.
 # Build the static library with `cargo build-capi --target T` (see .cargo/config.toml).
 capi = []
+# The OpenAI-compatible server (`oxinfer serve`, `oxinfer::server`): request handling for every
+# model kind, and an HTTP(S) listener through httpsd (not on wasm).
+server = ["dep:httpsd"]
 
 [dependencies]
 oxideav-core = { version = "0.1.41", optional = true }
@@ -162,6 +165,7 @@ dlsym = { version = "0.0.2", optional = true }
 getrandom = { version = "0.3", default-features = false, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+httpsd = { version = "0.1.4", default-features = false, features = ["rt-threadpool", "tls"], optional = true }
 memmap2 = "0.9.11"
 tokenizers = { version = "0.23.2", default-features = false, features = ["unstable_wasm"] }
 

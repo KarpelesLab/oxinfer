@@ -18,6 +18,8 @@ mod intervene_cli;
 mod janus_cli;
 mod omnigen2_cli;
 mod qwen_image_cli;
+#[cfg(feature = "server")]
+mod server_cli;
 mod step1x_cli;
 #[cfg(feature = "media")]
 mod tts_cli;
@@ -367,6 +369,8 @@ fn usage() -> ! {
     eprintln!("\n{}", intervene_cli::USAGE);
     eprintln!("\n{}", flux_cli::USAGE);
     eprintln!("{}", bagel_cli::USAGE);
+    #[cfg(feature = "server")]
+    eprintln!("\n{}", server_cli::USAGE);
     std::process::exit(2)
 }
 
@@ -862,6 +866,11 @@ fn report(prefill_tokens: usize, prefill_secs: f64, decode_tokens: usize, decode
 }
 
 fn main() -> Result<()> {
+    #[cfg(feature = "server")]
+    if std::env::args().nth(1).as_deref() == Some("serve") {
+        let rest: Vec<String> = std::env::args().skip(2).collect();
+        return server_cli::run(&rest);
+    }
     let mut args = parse_args()?;
     if args.devices {
         print!("{}", platform::detect().report());

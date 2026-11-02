@@ -765,6 +765,120 @@ a Web Worker with the network and storage APIs removed and a 5 s limit (hardenin
 boundary). Its system prompt describes where it runs: browser, operating system, language, time
 zone, local time, screen, CPU cores and GPU. Both can be changed under Settings.
 
+## OpenAI-compatible server
+
+`oxinfer serve` exposes the OpenAI API over a whitelist of models: only the models given with
+`--model` can be requested, by their id. Each is `[ID=]SOURCE[,KEY=VALUE...]`: a local folder or
+file, a repo id (fetched on first use, or at start with `--download`) or `org/name:QUANT` for a
+GGUF repo, an optional id (default: the source) and the model's options. HTTP and HTTPS are
+served by [httpsd](https://crates.io/crates/httpsd) (its thread-pool runtime, no async runtime).
+
+```sh
+./target/release/oxinfer serve --listen 127.0.0.1:8080 \
+  --model qwen=Qwen/Qwen3.5-0.8B,quant=q8 \
+  --model gemma=mlx-community/gemma-4-e2b-it-4bit,think=1 \
+  --model bge=BAAI/bge-small-en-v1.5 \
+  --model sd=stabilityai/sd-turbo \
+  --model whisper=openai/whisper-small \
+  --model tts=unsloth/orpheus-3b-0.1-ft,quant=q8
+# [serving qwen (chat), gemma (chat), bge (embedding), sd (image), whisper (transcription), tts (speech) on http://127.0.0.1:8080/v1]
+
+curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "model": "qwen", "messages": [{"role": "user", "content": "Why is the sky blue?"}], "stream": true}'
+curl -s localhost:8080/v1/audio/transcriptions -F model=whisper -F file=@speech.mp3
+curl -s localhost:8080/v1/audio/speech -H 'Content-Type: application/json' \
+  -d '{"model": "tts", "input": "Hello there!", "voice": "leah"}' -o hello.wav
+```
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="none")
+r = client.chat.completions.create(model="qwen", messages=[
+    {"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+        {"type": "text", "text": "What is in this picture?"}]}])
+print(r.choices[0].message.content)
+img = client.images.generate(model="sd", prompt="a lighthouse at dusk", size="512x512",
+                             response_format="b64_json", extra_body={"seed": 7})
+```
+
+| Endpoint | Models | Notes |
+|---|---|---|
+| `GET /v1/models`, `/v1/models/{id}` | all | the whitelist, with `kind` and `loaded` |
+| `POST /v1/chat/completions` | chat (Gemma 4 / 3, Qwen 3.5 / 3.8 / 3, Llama 3, Mistral Large 4, DeepSeek V4, Core ML) | system / developer, multi-turn, `image_url` (data: or http(s) URLs) and `video_url` parts (vision checkpoints), `input_audio` (Gemma 4), `tools` / `tool_choice` with `tool_calls` out, `temperature`, `top_p`, `top_k`, `max_tokens` / `max_completion_tokens`, `stop`, `seed`, `n`, `stream` (SSE, `stream_options.include_usage`), thinking with `reasoning_effort` (`none` off, anything else on), `enable_thinking` or `chat_template_kwargs.enable_thinking`, returned as `reasoning_content` |
+| `POST /v1/completions` | chat | raw continuations (no template): `prompt` as text, texts or token ids, `echo`, `stop`, `stream` |
+| `POST /v1/embeddings` | embedding | `encoding_format` float / base64, `dimensions` (Matryoshka); `prompt_name` (extension) |
+| `POST /v1/images/generations` | image (Stable Diffusion, FLUX.1, Qwen-Image, OmniGen2, Step1X-Edit, BAGEL, Janus-Pro) | `size`, `n`, `response_format` (`b64_json`, or `url` as a PNG data URL); extensions `seed`, `steps`, `guidance`, `negative_prompt` |
+| `POST /v1/images/edits` | image | multipart: `image` (or `image[]`, several for Qwen-Image-Edit-2509+ and OmniGen2), `mask` (Stable Diffusion), `prompt`, the same fields, `strength` |
+| `POST /v1/audio/transcriptions`, `/v1/audio/translations` | Whisper | multipart: `file` (any format oxideav decodes), `language`, `prompt`, `temperature`, `response_format` json / text / verbose_json / srt / vtt, `timestamp_granularities[]` word / segment |
+| `POST /v1/audio/speech` | Orpheus | `input`, `voice` (the model's voices; OpenAI's names take the default one), `response_format` wav or pcm (16-bit 24 kHz mono, streamed as it is generated), `stream_format` sse; extensions `seed`, `temperature`, `top_p`, `repetition_penalty` |
+
+Errors have OpenAI's shape (`{"error": {"message", "type", "param", "code"}}`) and status codes:
+400 for a bad request (also a model of the wrong kind for the endpoint), 401 without the API key,
+404 for an unknown model (`model_not_found`) or endpoint, 405, 413 over the body limit, 500 when
+loading or running fails. The paths also work without `/v1`.
+
+The kind of each model (chat, embedding, image, transcription, speech) comes from its files
+(fetching only the small configuration files of a repo id that is not in the cache yet), or the
+`kind` option. Models load on their first request, or all at start with `--preload`. Each model
+runs one request at a time; the others wait for it. When a model to load would not fit in the
+memory budget (`--memory-gb`, default 80% of RAM; each model counts the size of its weight files,
+scaled for `quant`, or its `memory_gb` option) next to the loaded ones, the least recently used
+idle models are unloaded first. A chat request that extends the previous conversation of a model
+(the same messages, the reply as it was returned and new messages, as chat clients send them)
+reuses its cache: only the new tokens are fed (`usage.prompt_tokens_details.cached_tokens`); this
+works for Qwen3.5's recurrent layers too, and a conversation whose earlier messages carry media is
+fed again.
+
+Model options: those of the engine for chat models (`quant`, `device`, `mmap`, `stream`, `mmproj`,
+`draft`, `mtp`, `max_context`, `prefill_chunk`, `gpu_decode`, ...; see [As a library](#as-a-library)),
+of the loader for the other kinds (Whisper `encoder` / `decoder` precision, Orpheus `snac` and
+`quant`, FLUX `transformer` / `base`, Stable Diffusion `lora`, ...), and:
+
+| Key | Meaning |
+|---|---|
+| `kind` | `chat`, `embedding`, `image`, `transcription` or `speech` (default: detected) |
+| `system` | system prompt when a request has none (default none; `default` for the CLI's prompt with the date and time) |
+| `think` | thinking by default (`1`); requests override it |
+| `max_tokens` | reply length when a request sets none (default 4096) |
+| `temperature`, `top_p`, `top_k`, `repetition_penalty` | sampling defaults (default OpenAI's: temperature 1, top-p 1) |
+| `prompt_name` | embeddings: the named prompt used by default (`query`, ...) |
+| `memory_gb` | the memory the model is counted for |
+
+Server options: `--listen ADDR` (port 0 picks one), `--api-key KEY` (or `$OXINFER_API_KEY`;
+requests need `Authorization: Bearer KEY`), `--cors ORIGIN`, `--max-body-mb N` (default 16, also
+httpsd's limit), `--preload`, `--download`, `--memory-gb F`, `--cache-dir DIR`, `--threads N`,
+`--tls-cert FILE --tls-key FILE` or `--self-signed` for HTTPS, `--workers N` (connections served
+at once, default 32), `--quiet`. Media URLs in requests may be `data:` URLs or `http(s)://` URLs,
+which the server fetches (`--no-remote-media` turns that off); local paths and `file://` URLs
+only with `--local-media`, for trusted clients. `--config FILE` reads the same options as JSON:
+
+```json
+{"listen": "0.0.0.0:8080", "api_key": "...", "memory_gb": 64,
+ "models": ["qwen=Qwen/Qwen3.8-27B,quant=q4,mtp=1",
+            {"id": "embed", "model": "Qwen/Qwen3-Embedding-0.6B", "options": {"prompt_name": "query"}}]}
+```
+
+In the library, `oxinfer::server::Api` handles a request without any transport (method, path,
+content type, body in; a complete body or a streamed one out), and `oxinfer::server::http::start`
+serves it; `Engine::chat` runs a whole conversation (a list of `Message`s) with the cache reuse
+above. The C API has `oxi_server_new` (the options as `key=value` pairs or JSON),
+`oxi_server_start` / `oxi_server_stop`, `oxi_server_handle` (one request, streamed bodies through a
+callback) and `oxi_engine_chat`. `tools/openai_check.py` checks every endpoint with the official
+`openai` Python client (chat, multi-turn with cache reuse, streaming, stop sequences, tool calls
+and their results, streamed tool calls, thinking, completions, errors, vision, embeddings, image
+generation and editing, speech as WAV and streamed PCM, transcriptions as JSON, verbose JSON and
+SRT): all pass with Qwen/Qwen3-0.6B (chat), Qwen/Qwen3.5-0.8B (vision), BAAI/bge-small-en-v1.5,
+stabilityai/sd-turbo, openai/whisper-tiny and the Orpheus Q4_K_M GGUF, and the chat and vision
+checks with mlx-community/gemma-4-e2b-it-4bit, which also transcribes `input_audio` parts.
+
+Not supported: `logprobs`, `response_format` JSON modes (ignored; nothing constrains the output),
+forcing a call with `tool_choice: "required"` (the tools are declared, the model decides), audio
+output from chat models, the Responses and Assistants APIs, image `url` responses other than data
+URLs, and speech formats other than WAV and PCM. Requests that take over 20 s are answered as 200
+before they finish (httpsd drops a connection whose handler runs past its 30 s inactivity window),
+so an error after that point arrives in a 200 body.
+
 ## Typed decisions (Jev models)
 
 The Jev models (`autotrust/JEV-9B`, `autotrust/JEV-27B`, ...) answer a typed question about a
@@ -3123,7 +3237,8 @@ oxideav pipeline hands them from stage to stage. Two features split what a depen
 | `oxideav` | `oxideav-core` only | `oxinfer::av` and the in-memory inputs and outputs below; `oxinfer::oxideav_core` re-exports the crate |
 | `media` (default, implies `oxideav`) | oxideav-pipeline, oxideav-image and the codec and container crates (PNG, JPEG, WebP, GIF, BMP, MP3, FLAC, AAC, Vorbis, Opus, WAV, MP4, MOV, Matroska / WebM, Ogg, AVI, H.264, H.265, VP8, VP9, AV1, MPEG-4 Part 2) | the path-based inputs (`--image`, `--video`, `--audio`, `transcribe_file`, `Media`) |
 
-`hf` (HuggingFace fetching) and `gpu` (run-time GPU backends) are independent of both. A crate
+`hf` (HuggingFace fetching), `gpu` (run-time GPU backends) and `server` (default: the
+[OpenAI-compatible server](#openai-compatible-server), with httpsd) are independent of both. A crate
 that already has decoded frames, such as an oxideav filter, needs only the types:
 
 ```toml

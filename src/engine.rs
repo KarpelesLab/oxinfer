@@ -722,6 +722,9 @@ pub struct Stats {
     pub accepted: usize,
     /// Tokens in the conversation after the turn.
     pub context_tokens: usize,
+    /// [`Engine::chat`]: prompt tokens taken from the cache of the previous call instead of fed
+    /// (the whole prompt is `prompt_tokens + cached_tokens`).
+    pub cached_tokens: usize,
 }
 
 impl Stats {
@@ -902,6 +905,10 @@ enum Lm {
 #[path = "engine_coreml.rs"]
 mod coreml_lm;
 
+#[path = "engine_chat.rs"]
+mod conversation;
+pub use conversation::{Message, Role};
+
 impl Lm {
     fn context_len(&self) -> usize {
         match self {
@@ -993,6 +1000,9 @@ pub struct Engine {
     turns: usize,
     /// The last reply's final token when the model has not run it (see [`Decoded::unfed`]).
     unfed: Option<u32>,
+    /// The tokens in the cache when it holds exactly what [`Engine::chat`] fed and generated
+    /// (None after any other turn), for the next call to reuse.
+    chat_ids: Option<Vec<u32>>,
     cancel: Arc<AtomicBool>,
     stats: Stats,
     /// The weight streamer (`EngineOptions::stream`), stopped on drop before the files go.
@@ -1451,6 +1461,7 @@ impl Engine {
             draft_tokens: opts.draft_tokens.unwrap_or(6),
             turns: 0,
             unfed: None,
+            chat_ids: None,
             cancel: Arc::new(AtomicBool::new(false)),
             stats: Stats::default(),
             streamer,
@@ -1512,6 +1523,7 @@ impl Engine {
             draft_tokens: 0,
             turns: 0,
             unfed: None,
+            chat_ids: None,
             cancel: Arc::new(AtomicBool::new(false)),
             stats: Stats::default(),
             streamer: None,
@@ -1599,6 +1611,7 @@ impl Engine {
         self.lm.reset();
         self.turns = 0;
         self.unfed = None;
+        self.chat_ids = None;
         self.install_iv();
     }
 
@@ -1617,6 +1630,8 @@ impl Engine {
         }
         self.iv.spec = spec.filter(|s| !s.is_empty());
         self.iv.compiled = None;
+        // The next Engine::chat call recomputes its prompt under the new hooks.
+        self.chat_ids = None;
         if let Some(spec) = self.iv.spec.clone()
             && (!spec.needs_calibration() || self.iv.calibration.is_some())
         {
@@ -1836,7 +1851,17 @@ impl Engine {
     /// images and videos for Qwen3.5 / 3.6 / 3.8 checkpoints that include the vision tower. Not
     /// for Core ML models.
     pub fn send_with_media(&mut self, user: &str, media: &Attachments, on_delta: &mut dyn FnMut(&Delta) -> Flow) -> Result<Reply> {
-        let (mm_text, feats) = if media.is_empty() {
+        let (mm_text, feats) = self.prepare_media(media)?;
+        let text = self.prompt_text(&format!("{mm_text}{user}"));
+        let think = self.config.think;
+        let reply = self.turn(&text, &feats, think)?.finish(self, on_delta)?;
+        self.turns += 1;
+        Ok(reply)
+    }
+
+    /// The placeholder text and soft tokens of a message's attachments (nothing when empty).
+    fn prepare_media(&self, media: &Attachments) -> Result<(String, Vec<mm::MmFeature>)> {
+        Ok(if media.is_empty() {
             (String::new(), Vec::new())
         } else {
             if self.info.coreml.is_some() {
@@ -1869,12 +1894,7 @@ impl Engine {
             #[cfg(not(feature = "oxideav"))]
             let prepared = mm::prepare(&req, self.files, self.info.hidden_size)?;
             prepared
-        };
-        let text = self.prompt_text(&format!("{mm_text}{user}"));
-        let think = self.config.think;
-        let reply = self.turn(&text, &feats, think)?.finish(self, on_delta)?;
-        self.turns += 1;
-        Ok(reply)
+        })
     }
 
     /// Feeds the results of the calls a reply ended on; the model continues its answer.
@@ -2077,6 +2097,12 @@ impl Engine {
         if let Some(t) = self.unfed {
             ids.insert(0, t);
         }
+        self.chat_ids = None;
+        self.turn_ids(ids, feats, think)
+    }
+
+    /// [`Engine::turn`] for encoded tokens, fed as they are.
+    fn turn_ids(&mut self, ids: Vec<u32>, feats: &[mm::MmFeature], think: bool) -> Result<PendingTurn> {
         let pos = self.context_len();
         if let Some(max) = self.max_context
             && pos + ids.len() > max

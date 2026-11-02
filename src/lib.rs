@@ -75,6 +75,8 @@ pub mod sae;
 pub mod safetensors;
 pub mod sampler;
 pub mod sd;
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+pub mod server;
 pub mod snac;
 pub mod step1x;
 pub mod stream;

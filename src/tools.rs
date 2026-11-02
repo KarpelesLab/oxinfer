@@ -161,6 +161,16 @@ pub mod gemma {
         )
     }
 
+    /// A call as the model writes it, `<|tool_call>call:NAME{...}<tool_call|>` (for a past reply
+    /// rendered again).
+    pub fn call(c: &ToolCall) -> String {
+        format!(
+            "<|tool_call>call:{}{}<tool_call|>",
+            c.name,
+            format_argument(&Value::Object(c.arguments.clone()))
+        )
+    }
+
     /// Parses Gemma's argument syntax: `{key:<|"|>text<|"|>,n:3,flag:true,list:[...],obj:{...}}`.
     struct Parser<'a> {
         s: &'a str,
@@ -301,6 +311,11 @@ pub mod mistral {
         calls
     }
 
+    /// A call as the model writes it: `[TOOL_CALLS]NAME[ARGS]{...}`.
+    pub fn call(c: &ToolCall) -> String {
+        format!("[TOOL_CALLS]{}[ARGS]{}", c.name, Value::Object(c.arguments.clone()))
+    }
+
     /// A tool message: `[TOOL_RESULTS]content[/TOOL_RESULTS]`.
     pub fn response(r: &ToolResult) -> String {
         format!("[TOOL_RESULTS]{}[/TOOL_RESULTS]", r.content)
@@ -364,6 +379,27 @@ pub mod deepseek {
         calls
     }
 
+    /// Calls as the model writes them: one `<｜DSML｜tool_calls>` block (strings as is, other values
+    /// as JSON).
+    pub fn calls(calls: &[ToolCall]) -> String {
+        let mut s = format!("\n\n{MARKER}\n");
+        for c in calls {
+            s.push_str(&format!("<{DSML}invoke name=\"{}\">\n", c.name));
+            for (k, v) in &c.arguments {
+                let (is_str, text) = match v {
+                    Value::String(t) => ("true", t.clone()),
+                    other => ("false", other.to_string()),
+                };
+                s.push_str(&format!(
+                    "<{DSML}parameter name=\"{k}\" string=\"{is_str}\">{text}</{DSML}parameter>\n"
+                ));
+            }
+            s.push_str(&format!("</{DSML}invoke>\n"));
+        }
+        s.push_str(&format!("</{DSML}tool_calls>"));
+        s
+    }
+
     /// A tool result block (the results of one round are joined with blank lines in a user turn).
     pub fn response(r: &ToolResult) -> String {
         format!("<tool_result>{}</tool_result>", r.content)
@@ -417,6 +453,26 @@ pub mod qwen {
             s.push_str(&py_json(&v));
         }
         s.push_str("\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>");
+        s
+    }
+
+    /// A call as Qwen 3.5 / 3.8 write it (`<tool_call>` with `<function=...>` and one
+    /// `<parameter=...>` per argument: strings as is, other values as JSON), or with `json` as
+    /// Qwen3 writes it (`{"name": ..., "arguments": {...}}`).
+    pub fn call(c: &ToolCall, json: bool) -> String {
+        if json {
+            let v = json!({ "name": c.name, "arguments": Value::Object(c.arguments.clone()) });
+            return format!("<tool_call>\n{}\n</tool_call>", py_json(&v));
+        }
+        let mut s = format!("<tool_call>\n<function={}>\n", c.name);
+        for (k, v) in &c.arguments {
+            let text = match v {
+                Value::String(t) => t.clone(),
+                other => other.to_string(),
+            };
+            s.push_str(&format!("<parameter={k}>\n{text}\n</parameter>\n"));
+        }
+        s.push_str("</function>\n</tool_call>");
         s
     }
 

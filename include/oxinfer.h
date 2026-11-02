@@ -152,6 +152,19 @@ int oxi_engine_send_media(OxiEngine *engine, const char *text, const char *media
  * continuation. Returns as oxi_engine_send. */
 int oxi_engine_complete(OxiEngine *engine, const char *text, oxi_token_fn cb, void *user);
 
+/* Runs a whole conversation and streams the next reply (stateless chat APIs): `messages_json`
+ * is a JSON array of
+ *   {"role": "system" | "user" | "assistant" | "tool", "content": "...",
+ *    "media": {...},                          (user messages: attachments, the format of
+ *                                              oxi_engine_send_media)
+ *    "tool_calls": [{"name": "...", "arguments": {...}}],   (assistant: the calls it made)
+ *    "name": "..."}                           (tool: the tool whose result this is)
+ * System messages are the system prompt (else the `system` setting); the conversation replaces
+ * the engine's, and when it extends the previous call's (that conversation, its reply and new
+ * messages) only the new tokens are fed. For tool definitions and the calls of the reply, use
+ * the server's chat completions (oxi_server_handle). Returns as oxi_engine_send. */
+int oxi_engine_chat(OxiEngine *engine, const char *messages_json, oxi_token_fn cb, void *user);
+
 /* Starts a new conversation. Returns 0 or -1. */
 int oxi_engine_reset(OxiEngine *engine);
 
@@ -751,6 +764,70 @@ char *oxi_bagel_understand_rgb(OxiBagel *b, const char *question, const uint8_t 
 /* oxi_bagel_understand_rgb() with an image file (NULL `path`: text only). */
 char *oxi_bagel_understand_file(OxiBagel *b, const char *question, const char *path, const char *options_json, oxi_token_fn cb,
                                 void *user);
+
+/* ---- OpenAI-compatible server (cargo features `capi` + `server`) -----------------------------
+ * The OpenAI API (GET /v1/models; POST /v1/chat/completions, /v1/completions, /v1/embeddings,
+ * /v1/images/generations, /v1/images/edits, /v1/audio/transcriptions, /v1/audio/translations,
+ * /v1/audio/speech) over a whitelist of models, served over HTTP(S) or called directly. Models
+ * load on first use, run one request at a time each, and the least recently used idle ones are
+ * unloaded when a model to load would not fit in the memory budget. Calls may come from any
+ * thread. */
+
+typedef struct OxiServer OxiServer;
+
+/* Response body bytes (`len` at `data`); return non-zero to stop a streamed body. */
+typedef int (*oxi_bytes_fn)(void *user, const char *data, size_t len);
+
+/* Creates the server from `options`: "key=value" lines or ';'-separated pairs, or a JSON object
+ * with the same keys ("models": an array):
+ *   model=[ID=]SOURCE[,KEY=VALUE...]   a model clients may use (repeatable). SOURCE: a directory,
+ *                        a file, org/name (fetched on first use) or org/name:QUANT (GGUF); ID:
+ *                        the name in requests (default SOURCE). KEYs: the engine options above
+ *                        (quant, device, mmap, stream, mmproj, draft, mtp, max_context, ...) or
+ *                        the loader's for other kinds, and kind=chat|embedding|image|
+ *                        transcription|speech, system=TEXT, think=0|1, max_tokens=N,
+ *                        temperature=F, top_p=F, top_k=N, repetition_penalty=F,
+ *                        prompt_name=NAME (embeddings), memory_gb=F
+ *   api_key=KEY          requests need "Authorization: Bearer KEY"
+ *   cors=ORIGIN          CORS headers for browsers (* for any origin)
+ *   max_body_mb=N        largest request body (default 16)
+ *   preload=0|1          load every model now (default: on first use)
+ *   download=0|1         fetch every model now
+ *   memory_gb=F          memory for the loaded models together (default 80% of RAM)
+ *   cache_dir=PATH       where repo ids are fetched to
+ *   threads=N            CPU threads (process-wide)
+ *   remote_media=0|1     fetch http(s) media URLs in requests (default 1; data: URLs always work)
+ *   local_media=0|1      accept local paths and file:// URLs as media (default 0)
+ *   listen=ADDR          HTTP listener (default 127.0.0.1:8080; port 0 picks a free one)
+ *   tls_cert=PATH, tls_key=PATH, self_signed=0|1   HTTPS
+ *   workers=N            connections served at once (default 32)
+ *   log=0|1              one stderr line per request (default 1)
+ *   config=PATH          read a JSON file of these options
+ * `progress` (may be NULL) reports downloads made by preload / download. Returns NULL on error. */
+OxiServer *oxi_server_new(const char *options, oxi_progress_fn progress, void *user);
+
+/* Starts the HTTP(S) listener in the background; returns its base URL ("http://127.0.0.1:8080";
+ * free with oxi_string_free), or NULL. */
+char *oxi_server_start(OxiServer *s);
+
+/* Stops the listener (requests in flight finish first). Returns 0 or -1. */
+int oxi_server_stop(OxiServer *s);
+
+/* Handles one request without HTTP: `method` ("GET", "POST"), `path` ("/v1/chat/completions"),
+ * `content_type` ("application/json" or "multipart/form-data; boundary=..."; may be NULL),
+ * `authorization` ("Bearer KEY"; may be NULL), and the body (`len` bytes). The response body goes
+ * to `on_body`: in one call, or in chunks as it is generated for streamed responses (server-sent
+ * events for "stream": true, raw PCM for speech in pcm format). `*content_type_out` (when not
+ * NULL) receives the content type (free with oxi_string_free). Returns the HTTP status (200, or
+ * 4xx / 5xx with an OpenAI error object as the body), or -1. */
+int oxi_server_handle(OxiServer *s, const char *method, const char *path, const char *content_type, const char *authorization,
+                      const char *body, size_t len, oxi_bytes_fn on_body, void *user, char **content_type_out);
+
+/* Unloads every idle model (each loads again on its next request). Returns 0 or -1. */
+int oxi_server_unload(OxiServer *s);
+
+/* Stops the listener if it runs and frees the server (NULL is ignored). */
+void oxi_server_free(OxiServer *s);
 
 #ifdef __cplusplus
 }
