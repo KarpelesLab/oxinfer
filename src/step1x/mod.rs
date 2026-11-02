@@ -528,9 +528,7 @@ impl Pipeline {
         if !is_step1x(&dir) {
             bail!("{}: not a Step1X-Edit diffusers pipeline", dir.display());
         }
-        if !crate::gpu::initialized() {
-            crate::gpu::init(&crate::platform::detect(), opts.device);
-        }
+        crate::gpu::ensure(opts.device)?;
         let tdir = match &opts.transformer {
             Some(p) if p.is_dir() => p.clone(),
             _ => dir.join("transformer"),

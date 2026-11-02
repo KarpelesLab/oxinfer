@@ -893,11 +893,7 @@ impl Engine {
         if let Some(on) = opts.gpu_decode {
             crate::gpu::set_decode(Some(on));
         }
-        let gpu = if crate::gpu::initialized() {
-            crate::gpu::active()
-        } else {
-            crate::gpu::init(&crate::platform::detect(), opts.device)
-        };
+        let gpu = crate::gpu::ensure(opts.device)?;
         if crate::sd::is_diffusers(&dir) {
             bail!("{}: a diffusion pipeline; use oxinfer::sd::Pipeline", dir.display());
         }

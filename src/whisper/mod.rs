@@ -343,11 +343,7 @@ impl Transcriber {
         if let Some(on) = opts.gpu_exact {
             crate::gpu::set_exact(on);
         }
-        let gpu = if crate::gpu::initialized() {
-            crate::gpu::active()
-        } else {
-            crate::gpu::init(&crate::platform::detect(), opts.device)
-        };
+        let gpu = crate::gpu::ensure(opts.device)?;
         let model_type = crate::config::model_type(dir)?;
         if model_type != "whisper" {
             bail!("{}: model_type {model_type} is not a Whisper model", dir.display());

@@ -312,9 +312,7 @@ impl Pipeline {
         if !is_omnigen2(&dir) {
             bail!("{}: not an OmniGen2 diffusers folder", dir.display());
         }
-        if !crate::gpu::initialized() {
-            crate::gpu::init(&crate::platform::detect(), opts.device);
-        }
+        crate::gpu::ensure(opts.device)?;
         let tdir = dir.join("transformer");
         let tcfg = TransformerConfig::load(&tdir).with_context(|| format!("{}", tdir.display()))?;
         let vae = crate::flux::vae::Vae::load(&dir.join("vae"), true)?;

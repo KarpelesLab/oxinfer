@@ -87,7 +87,7 @@ fn main() -> Result<()> {
     } else {
         oxinfer::platform::DevicePref::Auto
     };
-    oxinfer::gpu::init(&oxinfer::platform::detect(), dev);
+    oxinfer::gpu::init(&oxinfer::platform::detect(), dev)?;
     let dir = oxinfer::engine::resolve_model(&model, None)?;
     let cfg = oxinfer::config::Mistral4Config::load(&dir)?;
     let files = ModelFiles::open(&dir, !mmap)?;

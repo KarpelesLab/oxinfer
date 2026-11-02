@@ -262,11 +262,23 @@ pub fn active() -> Option<&'static dyn Backend> {
     ACTIVE.get().and_then(|b| b.as_deref())
 }
 
-/// Picks and initialises a backend for the detected platform and the user's preference.
-pub fn init(plat: &crate::platform::Platform, pref: crate::platform::DevicePref) -> Option<&'static dyn Backend> {
+/// Picks and initialises a backend for the detected platform and the user's preference. `Auto`
+/// falls back to the CPU when no GPU backend can start; a device asked for by name that is missing
+/// or cannot start is an error (and nothing is installed, so the caller can still choose another).
+pub fn init(plat: &crate::platform::Platform, pref: crate::platform::DevicePref) -> anyhow::Result<Option<&'static dyn Backend>> {
     use crate::platform::DevicePref;
     let chosen: Option<Box<dyn Backend>> = match plat.pick(pref) {
-        None => None,
+        None => {
+            if let DevicePref::Gpu(k) = pref {
+                let why = if plat.notes.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", plat.notes.join("; "))
+                };
+                anyhow::bail!("device {}: not available{why}", k.as_str());
+            }
+            None
+        }
         Some(g) => {
             let r: Result<Box<dyn Backend>, String> = match g.kind {
                 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
@@ -281,8 +293,9 @@ pub fn init(plat: &crate::platform::Platform, pref: crate::platform::DevicePref)
             };
             match r {
                 Ok(b) => Some(b),
+                Err(e) if pref != DevicePref::Auto => anyhow::bail!("device {}: {e}", g.kind.as_str()),
                 Err(e) => {
-                    if pref != DevicePref::Auto || !e.contains("not implemented") {
+                    if !e.contains("not implemented") {
                         eprintln!("[{}: {e}; using CPU]", g.kind.as_str());
                     }
                     None
@@ -291,5 +304,50 @@ pub fn init(plat: &crate::platform::Platform, pref: crate::platform::DevicePref)
         }
     };
     install(chosen);
-    active()
+    Ok(active())
+}
+
+/// The process's backend, initialised on first use: [`init`] the first time, afterwards the
+/// installed one, which must agree with a device asked for by name (the backend is process-wide,
+/// so a second load cannot pick another).
+pub fn ensure(pref: crate::platform::DevicePref) -> anyhow::Result<Option<&'static dyn Backend>> {
+    use crate::platform::DevicePref;
+    if !initialized() {
+        return init(&crate::platform::detect(), pref);
+    }
+    let b = active();
+    let current = b.map_or("cpu", |b| b.name());
+    match pref {
+        DevicePref::Auto => {}
+        DevicePref::Cpu if b.is_none() => {}
+        DevicePref::Gpu(k) if current.starts_with(k.as_str()) => {}
+        DevicePref::Cpu => anyhow::bail!("device cpu: this process already runs on {current}"),
+        DevicePref::Gpu(k) => anyhow::bail!("device {}: this process already runs on {current}", k.as_str()),
+    }
+    Ok(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::{DevicePref, GpuInfo, GpuKind, detect};
+
+    #[test]
+    fn a_device_asked_for_by_name_never_falls_back() {
+        let mut plat = detect();
+        plat.gpus.clear();
+        let e = init(&plat, DevicePref::Gpu(GpuKind::Cuda)).err().expect("missing device must fail");
+        assert!(e.to_string().starts_with("device cuda: not available"), "{e}");
+        // Detected, but with no compute backend.
+        plat.gpus.push(GpuInfo {
+            kind: GpuKind::Vulkan,
+            index: 0,
+            name: "test".into(),
+            memory_bytes: None,
+            driver: String::new(),
+            unified_memory: false,
+        });
+        let e = init(&plat, DevicePref::Gpu(GpuKind::Vulkan)).err().expect("vulkan has no compute");
+        assert!(e.to_string().contains("not implemented"), "{e}");
+    }
 }

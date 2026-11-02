@@ -13,7 +13,7 @@ fn main() -> anyhow::Result<()> {
     let spread: f32 = args.next().map_or(Ok(4.0), |a| a.parse())?;
     let plat = oxinfer::platform::detect();
     oxinfer::pool::init(std::thread::available_parallelism().map_or(4, |n| n.get()));
-    let gpu = oxinfer::gpu::init(&plat, oxinfer::platform::DevicePref::Auto).ok_or_else(|| anyhow::anyhow!("no GPU backend"))?;
+    let gpu = oxinfer::gpu::init(&plat, oxinfer::platform::DevicePref::Auto)?.ok_or_else(|| anyhow::anyhow!("no GPU backend"))?;
     let d = heads * 128;
     let mut seed = 0x9e3779b97f4a7c15u64;
     let mut gauss = move || {

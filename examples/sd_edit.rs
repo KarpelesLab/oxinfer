@@ -20,7 +20,7 @@ fn main() -> anyhow::Result<()> {
         edit = edit.with_mask(media.load_image(m.as_ref())?);
     }
     // Convolutions, attention and norms on the GPU when there is one (Metal, CUDA).
-    oxinfer::gpu::init(&oxinfer::platform::detect(), oxinfer::platform::DevicePref::Auto);
+    oxinfer::gpu::init(&oxinfer::platform::detect(), oxinfer::platform::DevicePref::Auto)?;
     let pipe = Pipeline::load(&oxinfer::hf::resolve(model, None)?)?;
     let kind = pipe.edit_kind(edit.mask.is_some())?;
     if kind == EditKind::Img2Img {

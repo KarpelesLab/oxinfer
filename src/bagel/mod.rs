@@ -415,9 +415,7 @@ impl Bagel {
             Err(_) => LlmConfig::from_json(&cfg["llm_config"])?,
         };
         let vit_json = read_json("vit_config.json").unwrap_or_else(|_| cfg["vit_config"].clone());
-        if !crate::gpu::initialized() {
-            crate::gpu::init(&crate::platform::detect(), opts.device);
-        }
+        crate::gpu::ensure(opts.device)?;
         let files = Box::new(ModelFiles::open(&dir, !opts.mmap)?);
         // SAFETY: the box's heap block does not move, and `Bagel` drops `parts` (every borrow of
         // it) before `_files`.

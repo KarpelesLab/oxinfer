@@ -2720,7 +2720,7 @@ Useful flags:
 | `--mmap` | map weights from disk instead of copying them into RAM |
 | `--save-quantized DIR` | write a pre-quantized, text-only checkpoint at `--quant` precision (see below) and exit |
 | `--devices` | list detected CPU features and GPUs (Metal, CUDA, Vulkan) and exit |
-| `--device D` | `auto` (default: use a GPU backend when one exists), `cpu`, `metal`, `cuda`, `vulkan` |
+| `--device D` | `auto` (default: use a GPU backend when one exists, else the CPU), `cpu`, `metal`, `cuda`, `vulkan`; a device asked for by name that is missing or cannot start is an error, not a fallback |
 | `--gpu-decode on\|off` | generate a whole token per GPU submission (default `on` where supported; see [Decoding on the GPU](#decoding-on-the-gpu)); engine / speaker option `gpu_decode` |
 | `--prefill-chunk N` | tokens per prefill chunk (default 256 on the CPU, 1024 when a GPU backend is active) |
 | `--profile` | per-operation timing and bandwidth breakdown |

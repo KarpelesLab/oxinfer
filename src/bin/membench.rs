@@ -48,7 +48,7 @@ fn bench_gpu(n_out: usize, n_in: usize) {
     use oxinfer::gpu::{self, WeightRef};
     let plat = oxinfer::platform::detect();
     println!("{}", plat.summary());
-    let Some(be) = gpu::init(&plat, oxinfer::platform::DevicePref::Auto) else {
+    let Ok(Some(be)) = gpu::init(&plat, oxinfer::platform::DevicePref::Auto) else {
         println!("no accelerator backend");
         return;
     };

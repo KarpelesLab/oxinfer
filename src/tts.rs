@@ -683,11 +683,7 @@ impl Speaker {
         if let Some(on) = opts.gpu_decode {
             crate::gpu::set_decode(Some(on));
         }
-        let gpu = if crate::gpu::initialized() {
-            crate::gpu::active()
-        } else {
-            crate::gpu::init(&crate::platform::detect(), opts.device)
-        };
+        let gpu = crate::gpu::ensure(opts.device)?;
         let mt = crate::config::model_type(dir)?;
         if mt != "llama" {
             bail!("{}: model_type {mt} is not an Orpheus (Llama) checkpoint", dir.display());

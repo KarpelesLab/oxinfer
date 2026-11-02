@@ -321,9 +321,7 @@ impl Pipeline {
     /// configs and the VAE now, the text encoder and transformer on first use.
     pub fn load(path_or_repo: &str, opts: Options) -> Result<Self> {
         let dir = crate::engine::resolve_model(path_or_repo, None)?;
-        if !crate::gpu::initialized() {
-            crate::gpu::init(&crate::platform::detect(), opts.device);
-        }
+        crate::gpu::ensure(opts.device)?;
         let kind = kind_of(&dir).with_context(|| format!("{}: not a Qwen-Image diffusers pipeline", dir.display()))?;
         let tdir = dir.join("transformer");
         let tcfg = if crate::fsx::exists(&tdir.join("config.json")) {

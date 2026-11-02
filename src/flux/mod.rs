@@ -352,9 +352,7 @@ impl Pipeline {
         if !class.starts_with("Flux") {
             bail!("{}: {class} is not a FLUX pipeline", dir.display());
         }
-        if !crate::gpu::initialized() {
-            crate::gpu::init(&crate::platform::detect(), opts.device);
-        }
+        crate::gpu::ensure(opts.device)?;
         let tr_path = match &tr_spec {
             Some(s) => resolve_transformer(s, cache)?,
             None => dir.join("transformer"),

@@ -1507,9 +1507,7 @@ pub unsafe extern "C" fn oxi_sd_load(
         }
         let pipe = with_progress(progress, user, || {
             let dir = crate::engine::resolve_model(model, cache_dir.as_deref())?;
-            if !crate::gpu::initialized() {
-                crate::gpu::init(&crate::platform::detect(), device);
-            }
+            crate::gpu::ensure(device)?;
             crate::sd::Pipeline::load_with_loras(&dir, &loras, &mut |_| {})
         })?;
         Ok(Box::into_raw(Box::new(OxiSd {

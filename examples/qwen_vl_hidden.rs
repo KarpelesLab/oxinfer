@@ -43,7 +43,7 @@ fn main() -> Result<()> {
     } else {
         oxinfer::platform::DevicePref::Auto
     };
-    oxinfer::gpu::init(&oxinfer::platform::detect(), dev);
+    oxinfer::gpu::init(&oxinfer::platform::detect(), dev)?;
     let t0 = std::time::Instant::now();
     let vl = QwenVl::load(std::path::Path::new(&model), &opts)?;
     eprintln!("[loaded in {:.1}s]", t0.elapsed().as_secs_f64());

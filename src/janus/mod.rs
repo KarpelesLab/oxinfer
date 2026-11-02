@@ -298,9 +298,7 @@ impl Janus {
         if cfg["model_type"] != "multi_modality" {
             bail!("{}: not a Janus checkpoint (model_type {})", dir.display(), cfg["model_type"]);
         }
-        if !crate::gpu::initialized() {
-            crate::gpu::init(&crate::platform::detect(), opts.device);
-        }
+        crate::gpu::ensure(opts.device)?;
         let lcfg = LlamaConfig::from_json(&cfg["language_config"])?;
         let h = lcfg.hidden_size;
         let files = Box::new(ModelFiles::open(&dir, !opts.mmap)?);
