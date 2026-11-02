@@ -294,18 +294,42 @@ or `--mmap` alone, asks for plain demand paging). The engine / C option is tri-s
 on), `stream=on` / `1`, and `stream=off` / `0`, which really means a plain memory map
 (`EngineOptions::stream_mode`, `StreamMode::{Auto, On, Off}`). Streamed, the 20 GB of dense weights stay resident, the routed experts
 (357 GB) are read as they are routed and the rest of the budget caches the recent ones (about 60%
-of the routed experts are then hits). A prefill chunk needs nearly all experts, so it sweeps them
-once: their GEMMs run on the GPU's matrix units through per-call device state
-(`Backend::upload_moe_transient`, nothing kept resident; 2x the prefill of the CPU experts),
-and longer chunks amortize the sweep. Nothing pins the model in memory: the process footprint
-stays under 1 GB while decoding (3-5 GB in prefill), the page cache holds the rest.
+of the routed experts are then hits). In prefill, a layer's routed experts run on the GPU's
+matrix units through per-call device state (`Backend::upload_moe_transient`, nothing kept
+resident) that wraps only the experts the chunk routes to: a wrapped page must be in memory
+while the submission runs, so wrapping all 128 made every short prompt read the whole 357 GB
+(through page faults at 2-3 GB/s, 70-120 s for 10-30 tokens). A chunk of a few hundred tokens
+still routes to nearly all experts, so longer chunks amortize the sweep. Nothing pins the model
+in memory: the process footprint stays under 1 GB while decoding (3-5 GB in prefill), the page
+cache holds the rest.
+
+Prefill by prompt length, from a cold expert cache (each run starts with only the dense weights
+cached; `--no-system`, plain decoding; load average 9-17 from other jobs, another agent's
+llama.cpp holding a DeepSeek model in memory part of the time). Before: the experts wrapped
+whole; the GPU is now faster than the CPU at every length, and the output is unchanged (the last
+position's logits are bit-identical before and after; against the CPU path the usual matrix-unit
+difference, KL 5e-9 at 24 tokens and 5e-8 at 103, same top token):
+
+| prompt tokens | Metal before | Metal now | storage read | `--device cpu` |
+|---|---|---|---|---|
+| 10 | 117 s (0.1 tok/s) | 8.9 s (1.1 tok/s) | 67 GB | 12.4 s (0.8 tok/s) |
+| 24 | 83 s (0.3) | 14.4-14.8 s (1.7) | 120 GB | 22.6 s (1.1) |
+| 103 | 72 s (1.4) | 34-35 s (3.0) | 255 GB | 52.9 s (1.9) |
+| 329 | 68 s (4.9) | 40-45 s (7.4-8.2) | 317 GB | 143 s (2.3) |
+| 951 | 56 s (17.1) | 53 s (18.0) | 343 GB | 3.0 tok/s at 895 (earlier) |
+
+Prefill now waits on storage 73-84% of the time at 7-9 GB/s. More reader threads help it
+(`--stream-threads 8`: 103 tokens in 26 s instead of 34, one measurement under the same load;
+their effect on decoding was lost in the noise of that load, so the default stays 2). Guessing
+the next layer's experts during prefill (as `--expert-predict` does for decoding) gained nothing
+measurable (24 tokens 15.9 s vs 14.8, 103: 31.5 vs 35.4, 329: the same), so it was left out.
 
 Speed on the M5 Max (128 GB, 18 cores, SSD at ~13 GB/s; other jobs used 3-4 cores, so lower
 bounds), unsloth's UD-Q2_K_XL:
 
 | setting | prefill | decode |
 |---|---|---|
-| default with DSpark (`--spec-draft-p-min 0.85`), measured 2026-11-02 | 0.4-0.7 tok/s (27-50 tokens) | 1.34-1.36 tok/s (plain: 1.26), see [DSpark](#dspark-speculative-decoding) |
+| default with DSpark (`--spec-draft-p-min 0.85`), measured 2026-11-02 | 1.5-2.1 tok/s (27-50 tokens, 2026-11-03; was 0.4-0.7, see above) | 1.34-1.36 tok/s (plain: 1.26), see [DSpark](#dspark-speculative-decoding) |
 | same, `--device cpu` | 1.7 tok/s (50 tokens) | 1.48 tok/s (plain: 1.35) |
 | plain decoding (streaming, 96 GB budget, Metal), earlier measurement | 17.4 tok/s (895-token prompt), 7.5 tok/s (1406, two chunks), 1-2 tok/s (15-90 tokens) | 1.3-1.5 tok/s |
 | same, `--device cpu` | 3.0 tok/s (895 tokens) | 1.1-1.2 tok/s |
@@ -382,7 +406,11 @@ a block of 3 tokens per pass:
 - Context: for every position the target has run, its residual stream entering layers 2, 19, 37
   and 55 and after the last layer, concatenated, projected by `fc` and normed; each of the 3
   dense MLA draft layers (6144 wide, 64 heads, latent K = V of 512 + 64 rotary dims, plain YaRN)
-  caches its own latent of that, and the block attends to the last 2048 positions.
+  caches its own latent of that, and the block attends to the last 2048 positions. The cache
+  keeps only those plus 256 to 512 more (`dspark::SLACK`; 6.9 KB per position, 17.7 MB at
+  most) instead of every position: rolling back up to 256 positions stays exact, and a deeper
+  `DsparkSession::truncate` leaves the block what is left until new positions refill the window
+  (drafts change, the output does not).
 - Block: the last committed token (not yet run by the target) and two learned mask embeddings at
   the next positions, attending non-causally to the context and to each other, then the target's
   LM head, soft-capped at 30. Slot `i` predicts the token `i + 1` positions after the anchor.
@@ -409,8 +437,15 @@ M=~/.cache/oxinfer/hub/unsloth--Mistral-Large-4-1T-A52B-GGUF
 
 `--spec-draft-n-max` (`--draft-tokens`) is at most the block, 3. `--spec-draft-p-min P` cuts a
 block before the first draft the draft model gives less than probability P, 0.85 by default when
-the model streams (0 otherwise). Library: `EngineOptions::draft` (`auto`, a path, `none`),
-`draft_tokens`, `draft_p_min`; the C API takes the same keys. Tool calls, `--dump-logits`,
+the model streams (0 otherwise). `--draft-device auto|gpu|cpu` says where the draft's matmuls
+run: by default on the GPU when there is one (Metal: `Backend::matvec_rows`, matrix-vector
+kernels that read each weight block once for the block's 3 rows, the GGUF formats dequantized
+once into registers; the draft weights and the target's LM head then stay in the queue's
+residency set, 3.2 GB, since binding mapped file pages per submission made them resident again
+every time at ~30 ms per GB); the attention, the per-head `k_b` / `v_b` and the Markov head's
+joint projection stay on the CPU. Library: `EngineOptions::draft` (`auto`, a path, `none`),
+`draft_tokens`, `draft_p_min`, `draft_device` (`DsparkOptions::device`, `Dspark::set_device`);
+the C API takes the same keys. Tool calls, `--dump-logits`,
 `--print-prompt` and interventions use plain decoding.
 
 Agreement: `tools/ref_dspark.py` is an independent float32 torch reference written from
@@ -420,7 +455,14 @@ draft with bf16 weights matches to 8e-7 relative on the logits of all 3 slots; t
 draft on the real target's features to 2-6e-3 relative (int8 activations, as llama.cpp), KL
 under 9e-5, the same drafts. Greedy output with DSpark (cutoff 0.85 or none) is identical to
 plain greedy on the real model (128 tokens, a chat answer and a Python function, Metal and CPU;
-compare runs with `--no-system`, the default system prompt holds the time).
+compare runs with `--no-system`, the default system prompt holds the time). With the draft on
+the GPU (float activations): the tiny draft to 8e-7 as on the CPU, the real draft to 2.2e-4,
+6.6e-4 and 2.4e-3 relative on its 3 slots (KL up to 1.1e-5, the same drafts), and the greedy
+output again identical to plain greedy (the same two prompts, 128 tokens, and 96 tokens through
+`dspark_check --gen`). The bounded context cache: with the tiny draft's window of 8 and a
+951-token prompt (so the cache was trimmed), the draft matches the reference (which keeps every
+position) to 4.5e-6, and 700 greedy tokens equal plain decoding; `cargo test` checks the
+bounded cache bit for bit against an unbounded one through injections and rollbacks.
 
 Acceptance (greedy, 127 tokens): without a cutoff 2.9-3.0 tokens per verification pass (64-66%
 of the drafts accepted; 84% of first drafts, 75-79% of later ones); with the 0.85 cutoff
@@ -438,7 +480,12 @@ builds ran meanwhile, load average 4-12; tokens per pass and acceptance in paren
 
 Other settings on the sky prompt (with the default system prompt; plain 1.24): 1 draft 1.26, 2
 drafts 1.07, cutoff 0.5 1.25, 0.75 1.33, 0.95 1.38; `--expert-predict` with 3 drafts 1.06. The
-draft pass itself takes 30-40 ms. The gain is small because decoding waits on storage 60-70% of
+draft pass itself took 30-40 ms on the CPU; on the GPU it takes 17-21 ms against 28-38 ms on the
+CPU, alternating pass by pass in one process (`dspark_check --bench 20`, load average 9-20; per
+layer the GPU spends 0.13 ms on `q` + `kv_a`, 0.12 on `o`, 0.64 on gate / up and 0.61 on down,
+3.4 ms on the LM head, 0.23 per slot on `markov_w2`). The first pass adds ~0.65 s once (the
+residency set). End to end the difference is lost in the storage-bound verification (37 vs 36-60
+ms per round over 128 tokens under a load of 16-27, the same tokens). The gain is small because decoding waits on storage 60-70% of
 the time, and a verification pass reads the routed experts of every token it holds (11-12
 distinct of the 16 routes per layer): in plain decoding the experts consecutive tokens share
 were page-cache hits anyway, so a fully accepted round reads about what plain decoding of its
@@ -3344,7 +3391,7 @@ before the lookup (with priority over the read-ahead) rather than faulting in pa
 | `--resident-mode M` | `cache` (clean file pages, default), `lock` (`mlock`), `copy` (anonymous memory over the same addresses) |
 | `--flash-mbps N` / `OXINFER_FLASH_MBPS` | emulate storage that reads N MB/s (the reader sleeps per uncached byte) |
 | `--stream-io M`, `--stream-threads N` | `advise` (default on Apple), `pread` or `touch`; reader threads (default 2) |
-| `--stream-trace` | one line per token / speculative round: bytes read vs cache hits, stall time |
+| `--stream-trace` | one line per token / speculative round, and one per prefill: bytes read vs cache hits, stall time |
 | `--expert-cache-mb N` | MoE: page cache kept for recently used routed experts (default: what the budget leaves after the resident set) |
 | `--expert-predict` | MoE: guess the next layer's experts and read them ahead (off by default, see below) |
 | `--threads N`, `--qos C`, `--efficiency-threads N` | compute threads; their QoS class on Apple platforms (`interactive` default, `initiated`, `utility`, `background` = efficiency cores only); how many of them run at background QoS |

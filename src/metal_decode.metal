@@ -318,6 +318,120 @@ MV_SIG(NAME) { threadgroup float red[2 * NR * KS]; \
     MGen<W> f = { W{ { wb + p.w_off, p.gpr } } }; MGen<W> f2 = { W{ { wb2 + p.w2_off, p.gpr } } }; \
     mv_body<MGen<W>, X32, 32, NR, KS>(f, f2, x, y, p, tg, sg, lane, red, gate); }
 
+// ---- The same for a few input rows (1 to 4, `p.ldy`; rows of x and y are n_in / n_out apart), a
+// DSpark draft's block of 3 or a speculative round's committed tokens. Each weight chunk is read
+// from memory once for all rows: GGUF formats dequantize it once into registers (the GEMMs'
+// `load`) and dot it with every row, the other formats repeat their fused dot product per row
+// (the weights then come from the cache). Modes 0 (store), 1 (add) and 2 (SiLU pair). Token loops
+// run to 4 with a guard, so the accumulators stay in registers.
+template <int NR, int KS>
+inline void mvt_finish(thread float (&a)[4][NR], thread float (&b)[4][NR], device float* y, constant MV& p, uint r0, uint sg,
+                       uint lane, threadgroup float* red) {
+    const uint nt = p.ldy, n_out = p.n_out;
+    for (int t = 0; t < 4; t++)
+        for (int r = 0; r < NR; r++) { a[t][r] = simd_sum(a[t][r]); b[t][r] = simd_sum(b[t][r]); }
+    if (KS > 1) {
+        if (lane == 0)
+            for (int t = 0; t < 4; t++)
+                for (int r = 0; r < NR; r++) {
+                    red[((sg * 4 + t) * NR + r) * 2] = a[t][r];
+                    red[((sg * 4 + t) * NR + r) * 2 + 1] = b[t][r];
+                }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg != 0) return;
+        for (int t = 0; t < 4; t++)
+            for (int r = 0; r < NR; r++) {
+                float sa = 0.f, sb = 0.f;
+                for (int s = 0; s < KS; s++) { sa += red[((s * 4 + t) * NR + r) * 2]; sb += red[((s * 4 + t) * NR + r) * 2 + 1]; }
+                a[t][r] = sa; b[t][r] = sb;
+            }
+    }
+    // Lane t * NR + r writes row r of token t.
+    uint lt = lane / NR, lr = lane % NR;
+    if (lt < nt && r0 + lr < n_out) {
+        float va = 0.f, vb = 0.f;
+        for (int t = 0; t < 4; t++)
+            for (int r = 0; r < NR; r++)
+                if (lt == uint(t) && lr == uint(r)) { va = a[t][r]; vb = b[t][r]; }
+        device float* o = y + (ulong)lt * n_out + r0 + lr;
+        if (p.mode == 0) *o = va;
+        else if (p.mode == 1) *o += va;
+        else *o = va / (1.0f + exp(-va)) * vb;
+    }
+}
+template <typename F, typename X, uint CH, int NR, int KS>
+inline void mvt_body(F f, F f2, device const float* x, device float* y, constant MV& p, uint tg, uint sg, uint lane,
+                     threadgroup float* red) {
+    const uint nt = p.ldy, r0 = tg * NR;
+    const bool pair = p.mode == 2;
+    uint rows[NR];
+    for (int r = 0; r < NR; r++) rows[r] = min(r0 + r, p.n_out - 1);
+    float a[4][NR], b[4][NR];
+    for (int t = 0; t < 4; t++)
+        for (int r = 0; r < NR; r++) { a[t][r] = 0.f; b[t][r] = 0.f; }
+    uint nch = p.n_in / CH;
+    for (uint c = sg * 32 + lane; c < nch; c += KS * 32) {
+        for (int t = 0; t < 4; t++) {
+            if (uint(t) >= nt) break;
+            X xr;
+            xload(x + (ulong)t * p.n_in, c, xr);
+            for (int r = 0; r < NR; r++) a[t][r] += mdot(f, rows[r], c, xr);
+            if (pair)
+                for (int r = 0; r < NR; r++) b[t][r] += mdot(f2, rows[r], c, xr);
+        }
+    }
+    mvt_finish<NR, KS>(a, b, y, p, r0, sg, lane, red);
+}
+inline float dot8(thread const float4* v, thread const X32& xr) {
+    float4 s = v[0] * xr.v[0];
+    for (uint i = 1; i < 8; i++) s = fma(v[i], xr.v[i], s);
+    return hsum(s);
+}
+template <typename W, int NR, int KS>
+inline void mvtl_body(W w, W w2, device const float* x, device float* y, constant MV& p, uint tg, uint sg, uint lane,
+                      threadgroup float* red) {
+    const uint nt = p.ldy, r0 = tg * NR;
+    const bool pair = p.mode == 2;
+    float a[4][NR], b[4][NR];
+    for (int t = 0; t < 4; t++)
+        for (int r = 0; r < NR; r++) { a[t][r] = 0.f; b[t][r] = 0.f; }
+    uint nch = p.n_in / 32;
+    for (uint c = sg * 32 + lane; c < nch; c += KS * 32) {
+        for (int r = 0; r < NR; r++) {
+            uint row = min(r0 + r, p.n_out - 1);
+            float4 v[8], u[8];
+            load(w, row, c, v);
+            if (pair) load(w2, row, c, u);
+            for (int t = 0; t < 4; t++) {
+                if (uint(t) >= nt) break;
+                X32 xr;
+                xload(x + (ulong)t * p.n_in, c, xr);
+                a[t][r] += dot8(v, xr);
+                if (pair) b[t][r] += dot8(u, xr);
+            }
+        }
+    }
+    mvt_finish<NR, KS>(a, b, y, p, r0, sg, lane, red);
+}
+#define MVT_RAW(NAME, T, X, CH, NR, KS) \
+MV_SIG(NAME) { threadgroup float red[8 * NR * KS]; \
+    T f = { wb + p.w_off, p.gpr }; T f2 = { wb2 + p.w2_off, p.gpr }; \
+    mvt_body<T, X, CH, NR, KS>(f, f2, x, y, p, tg, sg, lane, red); }
+#define MVT_Q8(NAME, NR, KS) \
+MV_SIG(NAME) { threadgroup float red[8 * NR * KS]; \
+    MQ8 f = { (device const char*)(wb + p.w_off), (device const float*)(sb + p.s_off), p.n_in }; \
+    MQ8 f2 = { (device const char*)(wb2 + p.w2_off), (device const float*)(sb2 + p.s2_off), p.n_in }; \
+    mvt_body<MQ8, X16, 16, NR, KS>(f, f2, x, y, p, tg, sg, lane, red); }
+#define MVT_Q4(NAME, NR, KS) \
+MV_SIG(NAME) { threadgroup float red[8 * NR * KS]; \
+    MQ4 f = { wb + p.w_off, (device const half*)(sb + p.s_off), p.n_in, (device const ushort*)(ob + p.o_off), p.gpr, p.gk }; \
+    MQ4 f2 = { wb2 + p.w2_off, (device const half*)(sb2 + p.s2_off), p.n_in, (device const ushort*)(ob2 + p.o2_off), p.gpr, p.gk }; \
+    mvt_body<MQ4, X32, 32, NR, KS>(f, f2, x, y, p, tg, sg, lane, red); }
+#define MVT_LOAD(NAME, W, NR, KS) \
+MV_SIG(NAME) { threadgroup float red[8 * NR * KS]; \
+    W f = W{ { wb + p.w_off, p.gpr } }; W f2 = W{ { wb2 + p.w2_off, p.gpr } }; \
+    mvtl_body<W, NR, KS>(f, f2, x, y, p, tg, sg, lane, red); }
+
 // ---- RMSNorm over rows of n: out = x * rsqrt(mean(x^2) + eps) * w (w optional; `add`: out += ...).
 // One threadgroup per row.
 struct NP { uint n; float eps; uint has_w; uint add; uint x_stride; uint o_stride; float pre; uint _p; };

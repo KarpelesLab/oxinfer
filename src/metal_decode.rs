@@ -124,6 +124,17 @@ pub(crate) fn shader_src() -> String {
                 let _ = writeln!(s, "{}", f.instantiate(nr, ks));
             }
         }
+        // A few rows at once (`mvt_<fmt>_1_<ks>`, see `MetalBackend::mvt_pipe`).
+        for ks in [1, 2, 4] {
+            let name = format!("mvt_{n}_1_{ks}");
+            let _ = match f {
+                MvFmt::Bf16 => writeln!(s, "MVT_RAW({name}, MBf, X16, 16, 1, {ks})"),
+                MvFmt::Q8 => writeln!(s, "MVT_Q8({name}, 1, {ks})"),
+                MvFmt::Q4 => writeln!(s, "MVT_Q4({name}, 1, {ks})"),
+                MvFmt::Gguf(GgmlType::F32) => writeln!(s, "MVT_LOAD({name}, F32W2, 1, {ks})"),
+                MvFmt::Gguf(k) => writeln!(s, "MVT_LOAD({name}, {}W, 1, {ks})", k.name()),
+            };
+        }
     }
     s
 }
@@ -218,6 +229,15 @@ impl MetalBackend {
             return None;
         }
         self.named_pipeline(&format!("mv_{}_{nr}_{ks}", fmt.name()))
+    }
+
+    /// The few-rows matvec pipeline for a format and a row length: one output row per
+    /// threadgroup, with enough SIMD-groups to cover the row's chunks in one or two passes (GGUF
+    /// formats take chunks of 32 values, one dequantized block of their GEMM loader).
+    pub(crate) fn mvt_pipe(&self, fmt: MvFmt, n_in: usize) -> Option<(Id, usize, usize)> {
+        let chunk = if matches!(fmt, MvFmt::Gguf(_)) { 32 } else { fmt.chunk() };
+        let ks = (n_in / chunk / 64).clamp(1, 4).next_power_of_two().min(4);
+        Some((self.named_pipeline(&format!("mvt_{}_1_{ks}", fmt.name()))?, 1, ks))
     }
 }
 
@@ -435,6 +455,99 @@ pub(crate) fn encode_mv(
     e.buf(w2.offs, 0, 8);
     e.buf(gate.0, gate.1, 9);
     e.dispatch((w.n_out.div_ceil(nr), 1), 32 * ks);
+}
+
+impl MetalBackend {
+    /// [`crate::gpu::Backend::matvec_rows`]: every job in one command buffer (a concurrent
+    /// encoder: the jobs write disjoint outputs), on the few-rows matvec kernels.
+    pub(crate) fn matvec_rows_impl(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [crate::gpu::RowsJob]) -> bool {
+        if jobs.is_empty() || !(1..=4).contains(&t) || x.len() < t * n_in {
+            return false;
+        }
+        let mut ws = Vec::with_capacity(jobs.len());
+        let mut y_total = 0;
+        for j in jobs.iter() {
+            let Some(w) = MvWeight::new(&j.w, j.dev, j.n_out, n_in) else {
+                return false;
+            };
+            let up = match &j.up {
+                Some((u, d)) => match MvWeight::new(u, d, j.n_out, n_in) {
+                    Some(u) if u.fmt == w.fmt => Some(u),
+                    _ => return false,
+                },
+                None => None,
+            };
+            let Some(pipe) = self.mvt_pipe(w.fmt, n_in) else {
+                return false;
+            };
+            if j.y.len() < t * j.n_out {
+                return false;
+            }
+            for d in std::iter::once(j.dev).chain(j.up.as_ref().map(|u| u.1)) {
+                if let Some(mw) = d.downcast_ref::<MetalWeight>() {
+                    mw.keep_resident(&self.residency);
+                }
+            }
+            ws.push((w, up, pipe, y_total));
+            y_total += t * j.n_out;
+        }
+        let f = Fns::new(self);
+        let mut st = self.staging.lock().unwrap();
+        let st = &mut *st;
+        if !self.ensure_staging(st, t * n_in * 4, y_total * 4) {
+            return false;
+        }
+        let t0 = Instant::now();
+        // SAFETY: the staging buffers were just sized for these copies.
+        unsafe { std::ptr::copy_nonoverlapping(x.as_ptr(), f.contents(st.x) as *mut f32, t * n_in) };
+        let t1 = Instant::now();
+        let (ok, _) = run_concurrent(self, &f, &[std::ops::Range { start: 0, end: 1 }], |e, _| {
+            for (w, up, (pipe, nr, ks), y_off) in &ws {
+                let w2 = up.as_ref().unwrap_or(w);
+                let p = MvParams {
+                    n_out: w.n_out as u32,
+                    n_in: n_in as u32,
+                    mode: if up.is_some() { MvMode::SiluPair } else { MvMode::Store } as u32,
+                    rows_per_tg: *nr as u32,
+                    w_off: w.data_off,
+                    s_off: w.scales_off,
+                    w2_off: w2.data_off,
+                    s2_off: w2.scales_off,
+                    o_off: w.offs_off,
+                    o2_off: w2.offs_off,
+                    gpr: w.gpr,
+                    gk: w.gk,
+                    ldy: t as u32,
+                    _p: 0,
+                };
+                e.pipe(*pipe);
+                e.buf(w.data, 0, 0);
+                e.buf(w.scales, 0, 1);
+                e.buf(st.x, 0, 2);
+                e.buf(st.y, y_off * 4, 3);
+                e.bytes(&p, 4);
+                e.buf(w2.data, 0, 5);
+                e.buf(w2.scales, 0, 6);
+                e.buf(w.offs, 0, 7);
+                e.buf(w2.offs, 0, 8);
+                e.buf(st.x, 0, 9);
+                e.dispatch((w.n_out.div_ceil(*nr), 1), 32 * ks);
+            }
+        });
+        let t2 = Instant::now();
+        if ok {
+            let yp = f.contents(st.y) as *const f32;
+            for (j, (_, _, _, y_off)) in jobs.iter_mut().zip(&ws) {
+                // SAFETY: the job's rows were written at its offset of the staging output.
+                unsafe { std::ptr::copy_nonoverlapping(yp.add(*y_off), j.y.as_mut_ptr(), t * j.n_out) };
+            }
+        }
+        self.stats.calls.fetch_add(1, Ordering::Relaxed);
+        self.stats.copy_in_ns.fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
+        self.stats.gpu_ns.fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
+        self.stats.copy_out_ns.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        ok
+    }
 }
 
 // ---- Decode plans -------------------------------------------------------------------------------
@@ -2103,6 +2216,81 @@ mod tests {
             }
             for b in [db.id, sb.id] {
                 unsafe { (f.void)(b, f.s_release) };
+            }
+        }
+    }
+
+    /// The few-rows matvec (`Backend::matvec_rows`) against an exact (f64) product for 1 to 4
+    /// rows, plain and SiLU pairs, over short and long rows (every variant `mv_variant` picks)
+    /// and a GGUF format on the generic kernel.
+    #[test]
+    fn matvec_rows_matches_reference() {
+        use crate::gpu::{Backend, RowsJob};
+        let Ok(be) = MetalBackend::new() else { return };
+        let mut seed = 5u64;
+        let fmts = [GgmlType::Q8_0, GgmlType::Q6_K, GgmlType::Q4_K, GgmlType::F16, GgmlType::IQ4_XS];
+        for kind in fmts {
+            for (n_out, n_in) in [(37, 512), (70, 2048), (21, 4096), (9, 8192)] {
+                let mats: Vec<(GgufMatrix, Vec<f32>)> = (0..2)
+                    .map(|_| {
+                        let raw = crate::ggml::random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed);
+                        let m = GgufMatrix::from_bytes(kind, &raw, n_out, n_in).unwrap();
+                        let mut deq = vec![0f32; n_out * n_in];
+                        m.dequantize_rows(0, n_out, &mut deq);
+                        (m, deq)
+                    })
+                    .collect();
+                let devs: Vec<_> = mats
+                    .iter()
+                    .map(|(m, _)| be.upload(&WeightRef::Gguf(m), n_out, n_in).unwrap())
+                    .collect();
+                for t in 1..=4 {
+                    let x: Vec<f32> = (0..t * n_in).map(|_| lcg(&mut seed)).collect();
+                    // The exact product and the sum of the terms' magnitudes (the scale of f32
+                    // rounding: random blocks can have large scales that cancel).
+                    let dot = |w: &[f32], ti: usize, r: usize| {
+                        w[r * n_in..(r + 1) * n_in]
+                            .iter()
+                            .zip(&x[ti * n_in..(ti + 1) * n_in])
+                            .map(|(&a, &b)| (a as f64 * b as f64, (a as f64 * b as f64).abs()))
+                            .fold((0.0, 0.0), |s, v| (s.0 + v.0, s.1 + v.1))
+                    };
+                    let (mut y, mut yp) = (vec![0f32; t * n_out], vec![0f32; t * n_out]);
+                    let mut jobs = [
+                        RowsJob {
+                            w: WeightRef::Gguf(&mats[0].0),
+                            dev: &devs[0],
+                            up: None,
+                            n_out,
+                            y: &mut y,
+                        },
+                        RowsJob {
+                            w: WeightRef::Gguf(&mats[0].0),
+                            dev: &devs[0],
+                            up: Some((WeightRef::Gguf(&mats[1].0), &devs[1])),
+                            n_out,
+                            y: &mut yp,
+                        },
+                    ];
+                    assert!(be.matvec_rows(&x, t, n_in, &mut jobs), "{kind:?}");
+                    for ti in 0..t {
+                        for r in 0..n_out {
+                            let (a, sa) = dot(&mats[0].1, ti, r);
+                            let (u, su) = dot(&mats[1].1, ti, r);
+                            let sig = 1.0 / (1.0 + (-a).exp());
+                            let p = a * sig * u;
+                            // Bounds from the magnitudes (the pair: both factors' errors).
+                            let (ea, ep) = (sa, sa * u.abs() + su * (a * sig).abs());
+                            for (got, want, scale) in [(y[ti * n_out + r], a, ea), (yp[ti * n_out + r], p, ep)] {
+                                let err = (got as f64 - want).abs() / (scale + 1e-3);
+                                assert!(
+                                    err < 2e-6,
+                                    "{kind:?} {n_out}x{n_in} t {t} token {ti} row {r}: {got} vs {want} ({err:e})"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }

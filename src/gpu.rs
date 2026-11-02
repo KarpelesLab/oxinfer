@@ -42,6 +42,16 @@ pub struct Job<'a> {
     pub y: &'a mut [f32],
 }
 
+/// One matrix-vector product of [`Backend::matvec_rows`]: `y[t][n_out] = W x[t]`, or with `up`
+/// (the same shape and format) `y[t] = silu(W x[t]) * (U x[t])`.
+pub struct RowsJob<'a> {
+    pub w: WeightRef<'a>,
+    pub dev: &'a DeviceWeight,
+    pub up: Option<(WeightRef<'a>, &'a DeviceWeight)>,
+    pub n_out: usize,
+    pub y: &'a mut [f32],
+}
+
 /// Geometry of a k x k convolution over channels-last input `[h*w, cin]`, zero padded by `pad`
 /// pixels before the first row and column (k/2 for a "same" convolution; the zero padding after
 /// the last row and column is whatever `oh`, `ow` and `stride` reach), producing `[oh*ow, n_out]`;
@@ -86,6 +96,13 @@ pub trait Backend: Send + Sync {
     /// Runs a batch of matmuls over one shared input in a single submission. Returns false if
     /// nothing was computed (the caller then runs the whole batch on the CPU).
     fn matmul(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [Job]) -> bool;
+    /// Runs a batch of matrix-vector products over `t` (1 to 4) input rows in one submission,
+    /// whatever their size ([`Backend::wants`] does not apply): the few rows of a draft model's
+    /// pass, where the device reads the weights faster than the CPU. Returns false if nothing was
+    /// computed (the caller then runs the batch on the CPU).
+    fn matvec_rows(&self, _x: &[f32], _t: usize, _n_in: usize, _jobs: &mut [RowsJob]) -> bool {
+        false
+    }
     /// Runs a convolution directly on the device (gathering the k x k neighbourhoods itself, so
     /// the unfolded input never exists in host memory), optionally normalizing its input on the
     /// way in. `job.y` is `[oh*ow, n_out]`. Returns false when the backend does not handle this

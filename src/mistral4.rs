@@ -1333,6 +1333,14 @@ impl crate::dspark::Target for Mistral4Model<'_> {
     fn head_raw(&self, hidden: &[f32], t: usize) -> Vec<f32> {
         Mistral4Model::head_raw(self, hidden, t)
     }
+    fn head_raw_device(&self, hidden: &[f32], t: usize) -> Option<Vec<f32>> {
+        let c = &self.cfg;
+        let _timer = prof::start(Cat::Head);
+        let mut logits = vec![0f32; t * c.vocab_size];
+        let _unit = crate::stream::enter(&self.stream, self.layers.len());
+        let jobs = &mut [(&self.lm_head, None, c.vocab_size, &mut logits[..])];
+        crate::model::linear_rows_device(jobs, c.hidden_size, hidden, t).then_some(logits)
+    }
     fn vocab_size(&self) -> usize {
         self.cfg.vocab_size
     }

@@ -76,7 +76,9 @@ char *oxi_download(const char *spec, const char *cache_dir, oxi_progress_fn prog
  *                        drafter)
  *   draft_p_min=P        DSpark: cut a block before the first draft the draft model gives less
  *                        than probability P (default 0.85 when the model streams, else 0)
- *   cache_dir=PATH       where repo ids are downloaded
+ *   draft_device=auto|gpu|cpu  DSpark: where the draft's matmuls run (default auto: the GPU
+ *                        when there is one)
+ *   cache_dir=PATH      where repo ids are downloaded
  *   gpu_exact=0|1        GPU matmuls bit-identical to the CPU (default 0: M5/A19 matrix
  *                        units, half-precision inputs; process-wide)
  *   gpu_moe=0|1          MoE experts on the GPU in prefill (default 1; process-wide)

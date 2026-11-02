@@ -621,6 +621,58 @@ fn linear_multi_base(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, x: &[f
     }
 }
 
+/// Matmuls of `t` (1 to 4) rows over one shared input on the accelerator's matrix-vector
+/// kernels, whatever their size (see [`crate::gpu::Backend::matvec_rows`]): each job is `(W,
+/// up, n_out, y)`, `y = W x`, or with `up` (same shape and format) `y = silu(W x) * (up x)`.
+/// Returns false, with nothing written, when there is no accelerator or it cannot take every job
+/// (the caller then runs them on the CPU). Streamed weights get device state for this call only.
+pub(crate) fn linear_rows_device(jobs: &mut [(&Lin, Option<&Lin>, usize, &mut [f32])], n_in: usize, x: &[f32], t: usize) -> bool {
+    let Some(be) = crate::gpu::active() else {
+        return false;
+    };
+    if jobs
+        .iter()
+        .any(|(l, u, _, _)| l.active_lora().is_some() || u.is_some_and(|u| u.active_lora().is_some()))
+    {
+        return false;
+    }
+    // Device state: kept by the layer, or made for this call (transient weights).
+    let owned: Vec<[Option<crate::gpu::DeviceWeight>; 2]> = jobs
+        .iter()
+        .map(|(l, u, n, _)| {
+            let own = |w: &Lin| if w.is_transient() { be.upload(&w.as_ref(), *n, n_in) } else { None };
+            [own(l), u.and_then(own)]
+        })
+        .collect();
+    fn dev<'d>(w: &'d Lin, own: &'d Option<crate::gpu::DeviceWeight>, n: usize, n_in: usize) -> Option<&'d crate::gpu::DeviceWeight> {
+        match own {
+            Some(d) => Some(d),
+            None if w.is_transient() => None,
+            None => w.device_weight(n, n_in),
+        }
+    }
+    let mut rj: Vec<crate::gpu::RowsJob> = Vec::with_capacity(jobs.len());
+    for ((l, u, n, y), own) in jobs.iter_mut().zip(&owned) {
+        let Some(d) = dev(l, &own[0], *n, n_in) else { return false };
+        let up = match u {
+            Some(u) => match dev(u, &own[1], *n, n_in) {
+                Some(du) => Some((u.as_ref(), du)),
+                None => return false,
+            },
+            None => None,
+        };
+        rj.push(crate::gpu::RowsJob {
+            w: l.as_ref(),
+            dev: d,
+            up,
+            n_out: *n,
+            y,
+        });
+    }
+    let _timer = prof::start(Cat::Matmul);
+    be.matvec_rows(x, t, n_in, &mut rj)
+}
+
 /// The CPU part of [`linear_multi`]: one fused region per storage format (GGUF checkpoints mix
 /// formats freely, so mixed batches are split; GGUF matrices of different types share one).
 fn linear_multi_cpu(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, x: &[f32], t: usize) {

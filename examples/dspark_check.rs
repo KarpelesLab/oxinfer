@@ -1,14 +1,16 @@
 //! Checks a DSpark draft against a reference (`tools/ref_dspark.py`) and measures its acceptance:
 //!
 //! ```text
-//! dspark_check MODEL DRAFT.gguf PROMPT OUT_DIR [--k N] [--cpu] [--raw] [--gen N]
+//! dspark_check MODEL DRAFT.gguf PROMPT OUT_DIR [--k N] [--cpu] [--raw] [--gen N] [--draft-device cpu|gpu] [--bench N]
 //! ```
 //!
 //! Runs the chat-formatted `PROMPT` (as is with `--raw`) through the target, takes its greedy next
 //! token as the anchor, and writes to `OUT_DIR` the target features of the prompt positions
 //! (`feats.f32`), the draft's logits for `k` slots chained greedily (`logits.f32`) and
 //! `meta.json`. With `--gen N` it then decodes N tokens greedily with and without DSpark and
-//! checks that both give the same tokens.
+//! checks that both give the same tokens. `--draft-device` says where the draft's matmuls run
+//! (default: the GPU when there is one). `--bench N` times N draft passes and injections of 3
+//! positions on the CPU and on the GPU, alternating.
 
 use anyhow::{Context, Result, bail};
 use oxinfer::chat::ChatFormat;
@@ -25,19 +27,22 @@ fn write_f32(path: &Path, v: &[f32]) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    let usage = "usage: dspark_check MODEL DRAFT.gguf PROMPT OUT_DIR [--k N] [--cpu] [--raw] [--gen N]";
+    let usage =
+        "usage: dspark_check MODEL DRAFT.gguf PROMPT OUT_DIR [--k N] [--cpu] [--raw] [--gen N] [--draft-device cpu|gpu] [--bench N]";
     let mut args = std::env::args().skip(1);
     let model = args.next().context(usage)?;
     let draft_path = PathBuf::from(args.next().context(usage)?);
     let prompt = args.next().context(usage)?;
     let out = PathBuf::from(args.next().context(usage)?);
-    let (mut k, mut cpu, mut raw, mut gen_n) = (3usize, false, false, 0usize);
+    let (mut k, mut cpu, mut raw, mut gen_n, mut device, mut bench) = (3usize, false, false, 0usize, None, 0usize);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--k" => k = args.next().context("--k N")?.parse()?,
             "--cpu" => cpu = true,
             "--raw" => raw = true,
             "--gen" => gen_n = args.next().context("--gen N")?.parse()?,
+            "--draft-device" => device = Some(args.next().context("--draft-device cpu|gpu")? == "gpu"),
+            "--bench" => bench = args.next().context("--bench N")?.parse()?,
             other => bail!("unknown argument {other}"),
         }
     }
@@ -84,6 +89,7 @@ fn main() -> Result<()> {
             &d,
             DsparkOptions {
                 draft_tokens: k,
+                device,
                 ..Default::default()
             },
         );
@@ -111,6 +117,38 @@ fn main() -> Result<()> {
         let meta = serde_json::json!({"n": ids.len(), "anchor": anchor, "k": drafts.len(), "drafts": drafts});
         std::fs::write(out.join("meta.json"), meta.to_string())?;
 
+        if bench > 0 {
+            // Draft passes and injections of the last 3 positions' features, CPU and GPU in turn.
+            let nf = all.len() / ids.len();
+            let rows = &all[all.len() - 3 * nf..];
+            let mut times = [[Vec::new(), Vec::new()], [Vec::new(), Vec::new()]];
+            for i in 0..2 * bench {
+                let gpu = i % 2 == 1;
+                d.set_device(gpu);
+                let t = std::time::Instant::now();
+                let (l, _) = d.draft_logits(&m, dec.draft_session(), anchor, k);
+                times[gpu as usize][0].push(t.elapsed().as_secs_f64() * 1e3);
+                std::hint::black_box(l);
+                let mut ds = dec.draft_session().clone();
+                let t = std::time::Instant::now();
+                d.inject(&mut ds, rows, 3);
+                times[gpu as usize][1].push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            for (dev, t) in ["cpu", "gpu"].iter().zip(&mut times) {
+                for v in t.iter_mut() {
+                    v.sort_by(f64::total_cmp);
+                }
+                println!(
+                    "bench {dev}: draft pass median {:.1} ms (min {:.1}), inject 3 median {:.1} ms (min {:.1})",
+                    t[0][t[0].len() / 2],
+                    t[0][0],
+                    t[1][t[1].len() / 2],
+                    t[1][0]
+                );
+            }
+            d.set_device(device.unwrap_or(oxinfer::dspark::DEVICE_BY_DEFAULT && oxinfer::gpu::active().is_some()));
+        }
+
         if gen_n > 0 {
             let stop = oxinfer::config::load_eos_ids(&dir);
             let mut plain_s = m.new_session();
@@ -126,6 +164,7 @@ fn main() -> Result<()> {
                 DsparkOptions {
                     draft_tokens: k,
                     stop: stop.clone(),
+                    device,
                     ..Default::default()
                 },
             );
@@ -135,13 +174,14 @@ fn main() -> Result<()> {
             let spec_secs = t2.elapsed().as_secs_f64();
             let st = &dec.stats;
             println!(
-                "plain {} tok {:.2} tok/s | dspark {} tok {:.2} tok/s, {} rounds, {:.2} tok/round, accepted {}/{} per-round {:?} | same tokens: {}",
+                "plain {} tok {:.2} tok/s | dspark {} tok {:.2} tok/s, {} rounds, {:.2} tok/round, draft {:.1} ms/round, accepted {}/{} per-round {:?} | same tokens: {}",
                 plain.tokens.len(),
                 plain.tokens.len() as f64 / plain_secs,
                 spec.tokens.len(),
                 spec.tokens.len() as f64 / spec_secs,
                 st.rounds,
                 st.tokens_per_round(),
+                1e3 * st.draft_secs / st.rounds.max(1) as f64,
                 st.accepted,
                 st.drafted,
                 st.per_round,

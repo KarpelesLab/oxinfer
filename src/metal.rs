@@ -1232,10 +1232,37 @@ struct MetalWeight {
     offsets: Option<(Buf, u32, u32)>,
     /// `objc_msgSend` as `release`, and its selector.
     release: (MsgVoid, Sel),
+    /// The queue's residency set, once the buffers are in it (see `MetalWeight::keep_resident`).
+    resident: std::sync::OnceLock<std::sync::Arc<Residency>>,
+}
+
+impl MetalWeight {
+    fn ids(&self) -> Vec<Id> {
+        [Some(&self.data), self.scales.as_ref(), self.offsets.as_ref().map(|o| &o.0)]
+            .into_iter()
+            .flatten()
+            .map(|b| b.id)
+            .collect()
+    }
+
+    /// Puts the buffers in the queue's residency set (once). Bound per submission instead, a
+    /// buffer wrapping mapped file pages is made resident again every time, which for the few
+    /// rows of a draft model's matmuls costs several times the kernels (~30 ms per GB).
+    fn keep_resident(&self, r: &Option<std::sync::Arc<Residency>>) {
+        if let Some(r) = r
+            && self.resident.get().is_none()
+            && self.resident.set(r.clone()).is_ok()
+        {
+            r.update(&self.ids(), true);
+        }
+    }
 }
 
 impl Drop for MetalWeight {
     fn drop(&mut self) {
+        if let Some(r) = self.resident.get() {
+            r.update(&self.ids(), false);
+        }
         let (f, sel) = self.release;
         let ids = [Some(&self.data), self.scales.as_ref(), self.offsets.as_ref().map(|o| &o.0)];
         for b in ids.into_iter().flatten() {
@@ -2436,6 +2463,7 @@ impl Backend for MetalBackend {
                     },
                     offsets: None,
                     release,
+                    resident: std::sync::OnceLock::new(),
                 }
             }
             WeightRef::Bf16(w) => MetalWeight {
@@ -2443,12 +2471,14 @@ impl Backend for MetalBackend {
                 scales: None,
                 offsets: None,
                 release,
+                resident: std::sync::OnceLock::new(),
             },
             WeightRef::Q8(m) => MetalWeight {
                 data: self.wrap(m.q.as_ptr() as *const u8, m.q.len())?,
                 scales: Some(self.wrap(m.scales.as_ptr() as *const u8, m.scales.len() * 4)?),
                 offsets: None,
                 release,
+                resident: std::sync::OnceLock::new(),
             },
             WeightRef::Q4(m) => MetalWeight {
                 data: self.wrap(m.q.as_ptr(), m.q.len())?,
@@ -2462,6 +2492,7 @@ impl Backend for MetalBackend {
                     None => None,
                 },
                 release,
+                resident: std::sync::OnceLock::new(),
             },
         };
         Some(Box::new(mw))
@@ -2851,6 +2882,10 @@ impl Backend for MetalBackend {
     fn decode_plan<'s>(&'s self, g: &crate::gpu::decode::Graph) -> Option<Box<dyn crate::gpu::decode::DecodePlan + 's>> {
         self.build_plan(g)
             .map(|p| Box::new(p) as Box<dyn crate::gpu::decode::DecodePlan + 's>)
+    }
+
+    fn matvec_rows(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [crate::gpu::RowsJob]) -> bool {
+        self.matvec_rows_impl(x, t, n_in, jobs)
     }
 
     fn upload_moe(

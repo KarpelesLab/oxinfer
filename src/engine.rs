@@ -123,6 +123,11 @@ pub struct EngineOptions {
     /// probability ([`crate::dspark::DsparkOptions::p_min`]; 0 = off). Default:
     /// [`crate::dspark::STREAM_P_MIN`] when the model streams, else 0. Key `draft_p_min`.
     pub draft_p_min: Option<f32>,
+    /// DSpark: run the draft's matmuls on the accelerator (`Some(true)`, key value `gpu`) or the
+    /// CPU (`Some(false)`, `cpu`); unset (`auto`): on the accelerator when one is active, as
+    /// [`crate::dspark::DEVICE_BY_DEFAULT`] says ([`crate::dspark::DsparkOptions::device`]).
+    /// Key `draft_device`.
+    pub draft_device: Option<bool>,
     /// Where repo ids are downloaded (default [`crate::hf::cache_root`]). Key `cache_dir`.
     pub cache_dir: Option<PathBuf>,
     /// Qwen3.5/3.8, Gemma 4 / 3, Mistral Large 4: stream the weights from the (mapped) file for models larger than
@@ -315,6 +320,7 @@ impl Default for EngineOptions {
             draft: None,
             draft_tokens: None,
             draft_p_min: None,
+            draft_device: None,
             cache_dir: None,
             stream: None,
             stream_mode: StreamMode::Auto,
@@ -375,6 +381,7 @@ impl EngineOptions {
         "draft",
         "draft_tokens",
         "draft_p_min",
+        "draft_device",
         "cache_dir",
         "stream",
         "mmproj",
@@ -436,6 +443,14 @@ impl EngineOptions {
                 self.draft_p_min = match value {
                     "" => None,
                     v => Some(v.parse().with_context(|| format!("{key}: not a number: {v:?}"))?),
+                }
+            }
+            "draft_device" => {
+                self.draft_device = match value {
+                    "" | "auto" => None,
+                    "gpu" | "accelerator" => Some(true),
+                    "cpu" => Some(false),
+                    v => bail!("{key}: expected auto, gpu or cpu, got {v:?}"),
                 }
             }
             "cache_dir" => self.cache_dir = opt_str(value).map(PathBuf::from),
@@ -1189,6 +1204,7 @@ impl Engine {
                             p_min: opts
                                 .draft_p_min
                                 .unwrap_or(if streamer.is_some() { crate::dspark::STREAM_P_MIN } else { 0.0 }),
+                            device: opts.draft_device,
                         };
                         Lm::Mistral4Dspark {
                             dec: Box::new(DsparkDecoder::new(model, dr, dopts)),
@@ -2338,6 +2354,11 @@ mod tests {
         assert_eq!(o.coreml_units, None);
         assert!(o.set("coreml_units", "npu").is_err());
         assert!(o.set("coreml_prefill", "fast").is_err());
+        o.set("draft_device", "cpu").unwrap();
+        assert_eq!(o.draft_device, Some(false));
+        o.set("draft_device", "auto").unwrap();
+        assert_eq!(o.draft_device, None);
+        assert!(o.set("draft_device", "npu").is_err());
         for u in [CoreMlUnits::Ane, CoreMlUnits::All, CoreMlUnits::Gpu, CoreMlUnits::Cpu] {
             assert_eq!(CoreMlUnits::parse(u.as_str()), Some(u));
         }
@@ -2352,6 +2373,7 @@ mod tests {
                 "coreml_units" => "gpu",
                 "coreml_prefill" => "pad",
                 "qos" => "background",
+                "draft_device" => "gpu",
                 "mtp_from" | "draft" | "cache_dir" | "decision_from" => "x",
                 "interventions" => r#"{"neurons":[{"layer":1,"neuron":2,"op":"zero"}]}"#,
                 _ => "1",

@@ -178,12 +178,14 @@ impl<'a> Experts<'a> {
             return false;
         }
         let gelu = self.act == Act::GeluTanh;
-        // Every expert's weights: fused or split gate/up (one form for all), and down.
-        let refs = || {
+        // The weights of experts `ids`: fused or split gate/up (one form for all), and down.
+        let refs = |ids: &mut dyn Iterator<Item = usize>| {
             let mut gu = Vec::with_capacity(self.gate_up.len());
             let mut up = Vec::with_capacity(self.gate_up.len());
-            for g in &self.gate_up {
-                match g {
+            let mut down = Vec::with_capacity(self.gate_up.len());
+            for e in ids {
+                down.push(self.down[e].as_ref());
+                match &self.gate_up[e] {
                     GateUp::Fused(l) => gu.push(l.as_ref()),
                     GateUp::Split(a, b) => {
                         gu.push(a.as_ref());
@@ -191,26 +193,36 @@ impl<'a> Experts<'a> {
                     }
                 }
             }
-            let down: Vec<_> = self.down.iter().map(|l| l.as_ref()).collect();
             (up.is_empty() || up.len() == gu.len()).then_some((gu, up, down))
         };
         // Streamed experts keep no device state between calls (see `Lin::set_transient_device`):
-        // a prefill pass wraps them for its own submission, which reads them in place.
+        // a prefill pass wraps the experts it routes to for its own submission, which reads them
+        // in place. Only those: a wrapped page must be in memory while the submission runs, so
+        // wrapping the others would read every expert of the layer from storage.
         if self.down.iter().any(|l| l.is_transient())
             || self.gate_up.iter().any(|g| match g {
                 GateUp::Fused(l) => l.is_transient(),
                 GateUp::Split(a, b) => a.is_transient() || b.is_transient(),
             })
         {
-            let Some((gu, up, down)) = refs() else { return false };
+            let mut used: Vec<usize> = routes.iter().flatten().map(|r| r.0).collect();
+            used.sort_unstable();
+            used.dedup();
+            let Some((gu, up, down)) = refs(&mut used.iter().copied()) else {
+                return false;
+            };
             let Some(dev) = be.upload_moe_transient(&gu, (!up.is_empty()).then_some(&up[..]), &down, h, mi, gelu) else {
                 return false;
             };
+            let local: Vec<Vec<(usize, f32)>> = routes
+                .iter()
+                .map(|r| r.iter().map(|&(e, w)| (used.binary_search(&e).unwrap(), w)).collect())
+                .collect();
             let _timer = prof::start(Cat::Matmul);
-            return be.moe(x, t, h, mi, routes, &dev, y);
+            return be.moe(x, t, h, mi, &local, &dev, y);
         }
         let dev = self.dev.get_or_init(|| {
-            let (gu, up, down) = refs()?;
+            let (gu, up, down) = refs(&mut (0..self.down.len()))?;
             be.upload_moe(&gu, (!up.is_empty()).then_some(&up[..]), &down, h, mi, gelu)
         });
         let Some(dev) = dev else {

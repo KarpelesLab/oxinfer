@@ -27,7 +27,7 @@
 use crate::generate::TextLm;
 use crate::gguf::{Header, Value};
 use crate::kernels::*;
-use crate::model::{Lin, Quant, Table, linear, linear_multi, load_lin};
+use crate::model::{Lin, Quant, Table, linear, linear_multi, linear_rows_device, load_lin};
 use crate::qwen_mtp::{MtpStats, speculative_accept};
 use crate::safetensors::ModelFiles;
 use crate::sampler::Sampler;
@@ -52,6 +52,12 @@ pub trait Target: TextLm {
     fn embed_row(&self, token: u32, out: &mut [f32]);
     /// LM-head logits `[t, vocab]` without the target's own soft-capping.
     fn head_raw(&self, hidden: &[f32], t: usize) -> Vec<f32>;
+    /// [`Target::head_raw`] for a draft's few rows (1 to 4) on the accelerator's matrix-vector
+    /// kernels ([`crate::gpu::Backend::matvec_rows`]); None when it cannot (the caller then uses
+    /// `head_raw`).
+    fn head_raw_device(&self, _hidden: &[f32], _t: usize) -> Option<Vec<f32>> {
+        None
+    }
     fn vocab_size(&self) -> usize;
     /// Drops cached positions at or beyond `len`.
     fn truncate(&self, sess: &mut Self::Sess, len: usize);
@@ -208,30 +214,89 @@ pub struct Dspark<'a> {
     inv_freq: Vec<f32>,
     rope_mag: f32,
     target_hidden: usize,
+    /// Run the matmuls of the draft's few rows on the accelerator (see [`Dspark::set_device`]).
+    device: std::sync::atomic::AtomicBool,
 }
 
+/// Positions the draft's context cache keeps beyond the window it attends to: a truncation by up
+/// to this many positions leaves the cache exact (the dropped positions come back as the target
+/// runs them again). The cache holds between `window + SLACK` and `window + 2 * SLACK`
+/// positions once it is full; the oldest are dropped `SLACK` at a time.
+pub const SLACK: usize = 256;
+
 /// The draft's context cache: per layer and position the normed latent `[lat]` and the rotated
-/// rotary key `[dr]`, for every position the target has processed.
+/// rotary key `[dr]`, for positions `start..len` of what the target has processed. The block
+/// attends to the last `window` positions only, so with a window the older ones are dropped
+/// (see [`SLACK`]); a draft without one keeps them all.
 #[derive(Clone, Default)]
 pub struct DsparkSession {
     c: Vec<Vec<f32>>,
     r: Vec<Vec<f32>>,
     lat: usize,
     dr: usize,
+    /// Positions kept beyond `slack` (the draft's window; 0: all), and the slack.
+    keep: usize,
+    slack: usize,
+    /// The first cached position.
+    start: usize,
     pub len: usize,
 }
 
 impl DsparkSession {
+    /// Drops cached positions at or beyond `len`. Going back more than [`SLACK`] positions may
+    /// leave less than the window before `len` cached (positions dropped earlier do not come
+    /// back): the block then attends to what is left until new positions fill the window, which
+    /// changes the drafts but not the output (the target verifies them).
     pub fn truncate(&mut self, len: usize) {
         if len < self.len {
+            let n = len.saturating_sub(self.start);
             for c in &mut self.c {
-                c.truncate(len * self.lat);
+                c.truncate(n * self.lat);
             }
             for r in &mut self.r {
-                r.truncate(len * self.dr);
+                r.truncate(n * self.dr);
             }
+            self.start = self.start.min(len);
             self.len = len;
         }
+    }
+
+    /// The first position still cached (positions before it were dropped).
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
+    /// Bytes of the cached latents and keys.
+    pub fn bytes(&self) -> usize {
+        self.c.iter().chain(&self.r).map(|v| v.len() * 4).sum()
+    }
+
+    /// Appends one layer's entries for new positions (the caller then advances `len`).
+    fn push(&mut self, layer: usize, c: &[f32], r: &[f32]) {
+        self.c[layer].extend_from_slice(c);
+        self.r[layer].extend_from_slice(r);
+    }
+
+    /// Drops the oldest positions once more than `keep + 2 * slack` are cached, down to
+    /// `keep + slack` (moving the rest down once per `slack` positions).
+    fn trim(&mut self) {
+        if self.keep == 0 || self.len - self.start < self.keep + 2 * self.slack {
+            return;
+        }
+        let drop = self.len - self.start - (self.keep + self.slack);
+        for c in &mut self.c {
+            c.drain(..drop * self.lat);
+        }
+        for r in &mut self.r {
+            r.drain(..drop * self.dr);
+        }
+        self.start += drop;
+    }
+
+    /// Cached latents and rotary keys of `layer` for positions `lo..hi` (within `start..len`).
+    fn range(&self, layer: usize, lo: usize, hi: usize) -> (&[f32], &[f32]) {
+        let (a, b) = (lo - self.start, hi - self.start);
+        (&self.c[layer][a * self.lat..b * self.lat], &self.r[layer][a * self.dr..b * self.dr])
     }
 }
 
@@ -239,6 +304,10 @@ impl DsparkSession {
 /// `--no-draft`, engine `draft=none`): measured 6-10% faster on Mistral Large 4 streamed from
 /// storage on a 128 GB M5 Max with [`STREAM_P_MIN`] (see the README).
 pub const BY_DEFAULT: bool = true;
+
+/// Whether the draft runs on the accelerator when one is active unless told otherwise
+/// ([`DsparkOptions::device`]): measured faster on an M5 Max (see the README).
+pub const DEVICE_BY_DEFAULT: bool = true;
 
 /// The default `p_min` ([`DsparkOptions::p_min`]) when the target streams its weights. There a
 /// verification pass reads the routed experts of every token it holds (experts shared by
@@ -389,8 +458,49 @@ impl<'a> Dspark<'a> {
             inv_freq,
             rope_mag,
             target_hidden,
+            device: std::sync::atomic::AtomicBool::new(false),
             cfg,
         })
+    }
+
+    /// Runs the matmuls of a draft pass and of the injection of a round's committed tokens (the
+    /// weights, the target's LM head) on the active accelerator's matrix-vector kernels
+    /// (`Backend::matvec_rows`) instead of the CPU's; the attention and the small per-head
+    /// matrices stay on the CPU. Without an accelerator that takes them, the CPU runs them.
+    /// The drafts may differ in the last bits (the target's verification keeps the output
+    /// exact). Off by default; [`DsparkDecoder::new`] sets it from [`DsparkOptions::device`].
+    pub fn set_device(&self, on: bool) {
+        self.device.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the draft runs its matmuls on the accelerator (see [`Dspark::set_device`]).
+    pub fn device(&self) -> bool {
+        self.device.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// `linear_multi` of the draft: for a few rows on the accelerator's matrix-vector kernels
+    /// when the draft runs there, else (or when they decline) as usual.
+    fn lin(&self, jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, x: &[f32], t: usize) {
+        if t <= 4 && self.device() {
+            let mut dj: Vec<(&Lin, Option<&Lin>, usize, &mut [f32])> = jobs.iter_mut().map(|(l, n, y)| (*l, None, *n, &mut **y)).collect();
+            if linear_rows_device(&mut dj, n_in, x, t) {
+                return;
+            }
+        }
+        linear_multi(jobs, n_in, x, t);
+    }
+
+    /// The MLP's `silu(gate x) * up x` (`[t, inter]`), as [`Dspark::lin`].
+    fn glu(&self, l: &Layer, x: &[f32], t: usize) -> Vec<f32> {
+        let (h, inter) = (self.cfg.hidden, self.cfg.inter);
+        let mut g = vec![0f32; t * inter];
+        if t <= 4 && self.device() && linear_rows_device(&mut [(&l.gate, Some(&l.up), inter, &mut g[..])], h, x, t) {
+            return g;
+        }
+        let mut u = vec![0f32; t * inter];
+        linear_multi(&mut [(&l.gate, inter, &mut g[..]), (&l.up, inter, &mut u[..])], h, x, t);
+        silu_mul(&mut g, &u);
+        g
     }
 
     pub fn new_session(&self) -> DsparkSession {
@@ -399,6 +509,9 @@ impl<'a> Dspark<'a> {
             r: vec![Vec::new(); self.layers.len()],
             lat: self.cfg.lat,
             dr: self.cfg.dr,
+            keep: self.cfg.window,
+            slack: SLACK,
+            start: 0,
             len: 0,
         }
     }
@@ -428,13 +541,11 @@ impl<'a> Dspark<'a> {
         (cos, sin)
     }
 
-    /// Each layer's latent and rotated rotary key for `t` rows of `x` (`[t, H]`) at positions
-    /// `start..`: `([t, lat], [t, dr])`.
-    fn latent(&self, l: &Layer, x: &[f32], t: usize, start: usize) -> (Vec<f32>, Vec<f32>) {
+    /// A layer's latent and rotated rotary key for `t` rows of its `kv_a` projection (`kv`,
+    /// `[t, lat + dr]`) at positions `start..`: `([t, lat], [t, dr])`.
+    fn latent(&self, l: &Layer, kv: &[f32], t: usize, start: usize) -> (Vec<f32>, Vec<f32>) {
         let c = &self.cfg;
         let (lat, dr) = (c.lat, c.dr);
-        let mut kv = vec![0f32; t * (lat + dr)];
-        linear(&l.kv_a, lat + dr, c.hidden, x, t, &mut kv);
         let positions: Vec<usize> = (start..start + t).collect();
         let (cos, sin) = self.rope(&positions);
         let half = dr / 2;
@@ -460,14 +571,26 @@ impl<'a> Dspark<'a> {
         let n_feat = self.cfg.target_layers.len() * self.target_hidden;
         assert_eq!(feats.len(), t * n_feat);
         let mut x = vec![0f32; t * h];
-        linear(&self.fc, h, n_feat, feats, t, &mut x);
+        self.lin(&mut [(&self.fc, h, &mut x[..])], n_feat, feats, t);
         rmsnorm_f32w_rows_inplace(&mut x, h, &self.enc_norm, self.cfg.eps);
-        for (li, l) in self.layers.iter().enumerate() {
-            let (cl, kr) = self.latent(l, &x, t, sess.len);
-            sess.c[li].extend_from_slice(&cl);
-            sess.r[li].extend_from_slice(&kr);
+        // Every layer's latent projection of the same rows, in one batch.
+        let kd = self.cfg.lat + self.cfg.dr;
+        let mut kvs = vec![vec![0f32; t * kd]; self.layers.len()];
+        {
+            let mut jobs: Vec<(&Lin, usize, &mut [f32])> = self
+                .layers
+                .iter()
+                .zip(kvs.iter_mut())
+                .map(|(l, kv)| (&l.kv_a, kd, &mut kv[..]))
+                .collect();
+            self.lin(&mut jobs, h, &x, t);
+        }
+        for (li, (l, kv)) in self.layers.iter().zip(&kvs).enumerate() {
+            let (cl, kr) = self.latent(l, kv, t, sess.len);
+            sess.push(li, &cl, &kr);
         }
         sess.len += t;
+        sess.trim();
     }
 
     /// Runs the block `[anchor, mask_1, ..]` of `nb` rows at positions `sess.len..` through the
@@ -488,16 +611,19 @@ impl<'a> Dspark<'a> {
         let positions: Vec<usize> = (pos..pos + nb).collect();
         let (cos, sin) = self.rope(&positions);
         let half = dr / 2;
-        // The context the block sees: the last `window` cached positions, whatever the slot.
+        // The context the block sees: the last `window` positions, whatever the slot (fewer
+        // after a deep truncation, see `DsparkSession::truncate`).
         let lo = if c.window > 0 { pos.saturating_sub(c.window) } else { 0 };
+        let lo = lo.max(sess.start);
         let n_ctx = pos - lo;
         let scale = (qk as f32).powf(-0.5);
         let mut hn = vec![0f32; nb * h];
         for (li, l) in self.layers.iter().enumerate() {
             rmsnorm_f32w_rows(&x, h, &l.attn_norm, c.eps, &mut hn);
             let mut q = vec![0f32; nb * nh * qk];
-            linear(&l.q, nh * qk, h, &hn, nb, &mut q);
-            let (bc, br) = self.latent(l, &hn, nb, pos);
+            let mut kv = vec![0f32; nb * (lat + dr)];
+            self.lin(&mut [(&l.q, nh * qk, &mut q[..]), (&l.kv_a, lat + dr, &mut kv[..])], h, &hn, nb);
+            let (bc, br) = self.latent(l, &kv, nb, pos);
             // Non-rotary queries per head [nh][nb][dn] onto the latent; rotary parts rotated.
             let mut qn = vec![0f32; nh * nb * dn];
             for i in 0..nb {
@@ -508,7 +634,7 @@ impl<'a> Dspark<'a> {
                 }
             }
             let ql = crate::mistral4::per_head(&l.k_b, &qn, nb, dn, lat);
-            let (cc, cr) = (&sess.c[li][lo * lat..pos * lat], &sess.r[li][lo * dr..pos * dr]);
+            let (cc, cr) = sess.range(li, lo, pos);
             let mut ol = vec![0f32; nh * nb * lat];
             let op = SendPtr(ol.as_mut_ptr());
             crate::pool::run(nb * nh, &|task| {
@@ -544,13 +670,11 @@ impl<'a> Dspark<'a> {
                 }
             }
             let mut o = vec![0f32; nb * h];
-            linear(&l.o, h, nh * vd, &att, nb, &mut o);
+            self.lin(&mut [(&l.o, h, &mut o[..])], nh * vd, &att, nb);
             add_inplace(&mut x, &o);
             rmsnorm_f32w_rows(&x, h, &l.ffn_norm, c.eps, &mut hn);
-            let (mut g, mut u) = (vec![0f32; nb * c.inter], vec![0f32; nb * c.inter]);
-            linear_multi(&mut [(&l.gate, c.inter, &mut g[..]), (&l.up, c.inter, &mut u[..])], h, &hn, nb);
-            silu_mul(&mut g, &u);
-            linear(&l.down, h, c.inter, &g, nb, &mut o);
+            let g = self.glu(l, &hn, nb);
+            self.lin(&mut [(&l.down, h, &mut o[..])], c.inter, &g, nb);
             add_inplace(&mut x, &o);
         }
         rmsnorm_f32w_rows_inplace(&mut x, h, &self.out_norm, c.eps);
@@ -618,10 +742,13 @@ impl<'a> Dspark<'a> {
             Some(hd) => {
                 let v = target.vocab_size();
                 let mut y = vec![0f32; k * v];
-                linear(hd, v, h, rows, k, &mut y);
+                self.lin(&mut [(hd, v, &mut y[..])], h, rows, k);
                 y
             }
-            None => target.head_raw(rows, k),
+            None => match self.device().then(|| target.head_raw_device(rows, k)).flatten() {
+                Some(y) => y,
+                None => target.head_raw(rows, k),
+            },
         };
         // The cap applies to the backbone's logits, not to the Markov bias.
         if let Some(cap) = c.softcap {
@@ -650,6 +777,7 @@ impl<'a> Dspark<'a> {
                         inp.extend_from_slice(&w1);
                         inp.extend_from_slice(&rows[i * h..(i + 1) * h]);
                         let mut j = vec![0f32; 3 * r];
+                        // Small (11 MB on Mistral Large 4's draft): not worth a submission.
                         linear(jp, 3 * r, 2 * r + h, &inp, 1, &mut j);
                         add_inplace(&mut j, b);
                         for e in 0..r {
@@ -662,7 +790,7 @@ impl<'a> Dspark<'a> {
                     _ => w1,
                 };
                 let mut bias = vec![0f32; v];
-                linear(&m.w2, v, r, &feat, 1, &mut bias);
+                self.lin(&mut [(&m.w2, v, &mut bias[..])], r, &feat, 1);
                 add_inplace(li, &bias);
             }
             let Some(t) = choose(i, li) else { break };
@@ -700,6 +828,10 @@ pub struct DsparkOptions {
     /// probability (llama.cpp's `--spec-draft-p-min`; 0 = off): an unlikely draft costs a
     /// verification row, and its routed experts when they stream from storage.
     pub p_min: f32,
+    /// Where the draft runs its matmuls ([`Dspark::set_device`]): the accelerator
+    /// (`Some(true)`), the CPU (`Some(false)`), or by default [`DEVICE_BY_DEFAULT`] when an
+    /// accelerator is active (None).
+    pub device: Option<bool>,
 }
 
 impl Default for DsparkOptions {
@@ -709,6 +841,7 @@ impl Default for DsparkOptions {
             stop: Vec::new(),
             cost_aware: false,
             p_min: 0.0,
+            device: None,
         }
     }
 }
@@ -742,6 +875,7 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         if opts.draft_tokens + 1 > crate::kernels::decode_max_tokens() {
             crate::kernels::set_decode_max_tokens(opts.draft_tokens + 1);
         }
+        draft.set_device(opts.device.unwrap_or(DEVICE_BY_DEFAULT && crate::gpu::active().is_some()));
         Self {
             model,
             draft,
@@ -1049,8 +1183,22 @@ mod tests {
     }
 
     /// A one-layer MLA draft with zero backbone weights and a vanilla Markov head that maps the
-    /// previous token `p` onto `p + 1` (bias 10): it always drafts `p + 1, p + 2, ..`.
-    fn toy_draft(path: &Path) {
+    /// previous token `p` onto `p + 1` (bias 10): it always drafts `p + 1, p + 2, ..`. With
+    /// `seed`, the backbone weights are random instead and the draft has its own LM head, so its
+    /// logits depend on the attended context.
+    fn toy_draft(path: &Path, seed: Option<u64>) {
+        let mut st = seed.unwrap_or(0);
+        let mut fill = |len: usize| -> Vec<f32> {
+            match seed {
+                None => vec![0.0; len],
+                Some(_) => (0..len)
+                    .map(|_| {
+                        st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        ((st >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.6
+                    })
+                    .collect(),
+            }
+        };
         let (lat, dn, dr, vd, inter) = (32usize, 32usize, 32usize, 32usize, 32usize);
         let mut b = b"GGUF".to_vec();
         b.extend(3u32.to_le_bytes());
@@ -1089,11 +1237,14 @@ mod tests {
         // Tensors: (name, ggml ne, values).
         let ones = |n: usize| vec![1f32; n];
         let mut tensors: Vec<(String, Vec<usize>, Vec<f32>)> = vec![
-            ("fc.weight".into(), vec![2 * H, H], vec![0.0; 2 * H * H]),
+            ("fc.weight".into(), vec![2 * H, H], fill(2 * H * H)),
             ("enc.output_norm.weight".into(), vec![H], ones(H)),
             ("output_norm.weight".into(), vec![H], ones(H)),
-            ("mask_embd.weight".into(), vec![H, 2], vec![0.0; 2 * H]),
+            ("mask_embd.weight".into(), vec![H, 2], fill(2 * H)),
         ];
+        if seed.is_some() {
+            tensors.push(("output.weight".into(), vec![H, V], fill(H * V)));
+        }
         let mut w1 = vec![0f32; V * V];
         let mut w2 = vec![0f32; V * V];
         for p in 0..V {
@@ -1116,7 +1267,7 @@ mod tests {
             ("ffn_down.weight", vec![inter, H]),
         ] {
             let len: usize = ne.iter().product();
-            let v = if n.contains("norm") { ones(len) } else { vec![0.0; len] };
+            let v = if n.contains("norm") { ones(len) } else { fill(len) };
             tensors.push((format!("blk.0.{n}"), ne, v));
         }
         b.extend((tensors.len() as u64).to_le_bytes());
@@ -1147,7 +1298,7 @@ mod tests {
     #[test]
     fn greedy_dspark_matches_plain_decoding() {
         let path = std::env::temp_dir().join(format!("oxinfer-dspark-test-{}.gguf", std::process::id()));
-        toy_draft(&path);
+        toy_draft(&path, None);
         assert!(is_draft(&path));
         let files = ModelFiles::open(&path, true).unwrap();
         let d = Dspark::load(&path, &files, H, V, Quant::Bf16).unwrap();
@@ -1177,5 +1328,61 @@ mod tests {
             assert!(st.per_round[k] > 0, "k = {k}: no fully accepted round: {:?}", st.per_round);
             assert_eq!(dec.draft_session().len, dec.sess.0.len());
         }
+    }
+
+    /// The bounded context cache (window 4, slack 2) gives bit for bit the drafts of a cache that
+    /// keeps every position, through injections of any size and truncations within the slack,
+    /// and stays bounded.
+    #[test]
+    fn bounded_context_cache_matches_full_cache() {
+        let path = std::env::temp_dir().join(format!("oxinfer-dspark-window-{}.gguf", std::process::id()));
+        toy_draft(&path, Some(7));
+        let files = ModelFiles::open(&path, true).unwrap();
+        let d = Dspark::load(&path, &files, H, V, Quant::Bf16).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(d.cfg.window, 4);
+        let toy = Toy;
+        let mut bounded = d.new_session();
+        bounded.slack = 2;
+        let mut full = d.new_session();
+        full.keep = 0;
+        let n_feat = 2 * H;
+        let mut rng = 1u64;
+        let mut next = |m: u64| {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (rng >> 33) % m
+        };
+        let mut most = 0;
+        for step in 0..60 {
+            let t = 1 + next(5) as usize;
+            let feats: Vec<f32> = (0..t * n_feat).map(|_| next(1000) as f32 / 500.0 - 1.0).collect();
+            d.inject(&mut bounded, &feats, t);
+            d.inject(&mut full, &feats, t);
+            if step % 3 == 2 {
+                // A rejected tail: back by up to the slack.
+                let back = (next(3) as usize).min(bounded.len - 1);
+                bounded.truncate(bounded.len - back);
+                full.truncate(full.len - back);
+            }
+            assert_eq!(bounded.len, full.len);
+            // The window before `len` is always cached.
+            assert!(bounded.len - bounded.start() >= bounded.len.min(4));
+            most = most.max(bounded.len - bounded.start());
+            let anchor = next(V as u64) as u32;
+            let (lb, db) = d.draft_logits(&toy, &bounded, anchor, 3);
+            let (lf, df) = d.draft_logits(&toy, &full, anchor, 3);
+            assert_eq!(db, df, "step {step}");
+            assert!(lb.iter().zip(&lf).all(|(a, b)| a.to_bits() == b.to_bits()), "step {step}");
+        }
+        assert!(bounded.start() > 0 && most < 4 + 2 * 2, "start {} most {most}", bounded.start());
+        assert!(bounded.bytes() < full.bytes() / 4);
+        // A deep truncation keeps what is left; the block then sees fewer positions.
+        let cut = bounded.start() - 1;
+        bounded.truncate(cut);
+        assert_eq!((bounded.start(), bounded.len), (cut, cut));
+        d.inject(&mut bounded, &vec![0.5; n_feat], 1);
+        assert_eq!(bounded.len - bounded.start(), 1);
+        let (l, _) = d.draft_logits(&toy, &bounded, 3, 3);
+        assert!(l.iter().all(|v| v.is_finite()));
     }
 }

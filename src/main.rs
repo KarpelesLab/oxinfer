@@ -52,6 +52,7 @@ struct Args {
     no_draft: bool,
     draft_tokens: Option<usize>,
     draft_p_min: Option<f32>,
+    draft_device: Option<bool>,
     mtp: bool,
     mtp_fixed: bool,
     mtp_from: Option<PathBuf>,
@@ -195,6 +196,8 @@ fn usage() -> ! {
          \x20 --spec-draft-n-max N  the same as --draft-tokens\n\
          \x20 --spec-draft-p-min P  DSpark: cut a block before the first draft the draft model gives\n\
          \x20                      less than probability P (default 0.85 when the model streams, else 0)\n\
+         \x20 --draft-device D     DSpark: auto (default: the GPU when there is one) | gpu | cpu, where the\n\
+         \x20                      draft's matmuls run\n\
          \x20 --mtp                Qwen3.5/3.8: speculative decoding with the checkpoint's multi-token\n\
          \x20                      prediction layer (greedy and sampled; same output distribution)\n\
          \x20 --mtp-fixed          with --mtp, always draft --draft-tokens (default: adaptive 1..N)\n\
@@ -211,7 +214,7 @@ fn usage() -> ! {
          \x20 --resident-mode M    cache (default) | lock (mlock) | copy (anonymous memory)\n\
          \x20 --flash-mbps N       with --stream, emulate storage reading N MB/s (or $OXINFER_FLASH_MBPS)\n\
          \x20 --stream-io M        advise (default on Apple) | pread | touch\n\
-         \x20 --stream-trace       with --stream, one line of IO statistics per decoding step\n\
+         \x20 --stream-trace       with --stream, one line of IO statistics per decoding step and per prefill\n\
          \x20 --stream-threads N   with --stream, reader threads (default 2)\n\
          \x20 --expert-cache-mb N  with --stream, page cache kept for recently used MoE experts (which\n\
          \x20                      are read on demand; default: what the budget leaves)\n\
@@ -390,6 +393,7 @@ fn parse_args() -> Result<Args> {
         no_draft: false,
         draft_tokens: None,
         draft_p_min: None,
+        draft_device: None,
         mtp: false,
         mtp_fixed: false,
         mtp_from: None,
@@ -534,6 +538,14 @@ fn parse_args() -> Result<Args> {
             "--draft-tokens" | "--spec-draft-n-max" => a.draft_tokens = Some(val()?.parse()?),
             "--no-draft" => a.no_draft = true,
             "--spec-draft-p-min" | "--draft-p-min" => a.draft_p_min = Some(val()?.parse()?),
+            "--draft-device" => {
+                a.draft_device = match val()?.as_str() {
+                    "auto" => None,
+                    "gpu" => Some(true),
+                    "cpu" => Some(false),
+                    v => bail!("--draft-device: expected auto, gpu or cpu, got {v:?}"),
+                }
+            }
             "--mtp" => a.mtp = true,
             "--mtp-fixed" => a.mtp_fixed = true,
             "--mtp-from" => {
@@ -1365,9 +1377,11 @@ fn run_text<M: TextLm + oxinfer::intervene::Host>(
     };
     let overrides = oxinfer::mm::bind(model, &mut sess, &ids, &mm_feats)?;
     let t = Instant::now();
+    let s0 = prefill_trace_start();
     let hs = generate::prefill(model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
     let logits = model.logits(&hs[hs.len() - h..], 1);
     let prefill_secs = t.elapsed().as_secs_f64();
+    prefill_trace_end(s0, ids.len(), prefill_secs);
     if args.profile {
         eprintln!("-- prefill --");
         prof::report(prefill_secs, ids.len());
@@ -1788,6 +1802,23 @@ fn start_stream(
     Ok(s)
 }
 
+/// The streaming statistics before a prefill, when `--stream-trace` prints them.
+fn prefill_trace_start() -> Option<(std::sync::Arc<oxinfer::stream::Streamer>, oxinfer::stream::StreamStats)> {
+    if !TRACE.load(std::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
+    let s = STREAM.lock().unwrap().clone()?;
+    let st = s.stats();
+    Some((s, st))
+}
+
+/// `--stream-trace`: one line of streaming statistics for a prefill of `tokens` tokens.
+fn prefill_trace_end(start: Option<(std::sync::Arc<oxinfer::stream::Streamer>, oxinfer::stream::StreamStats)>, tokens: usize, secs: f64) {
+    if let Some((s, s0)) = start {
+        eprintln!("[prefill: {}]", stream_line(&(s.stats() - s0), tokens, secs));
+    }
+}
+
 /// One line of streaming statistics for `steps` decoding steps (`--stream-trace` and summaries).
 fn stream_line(d: &oxinfer::stream::StreamStats, tokens: usize, secs: f64) -> String {
     let parts = if d.parts > 0 {
@@ -1880,8 +1911,10 @@ fn run_qwen_mtp(
         // The attachments belong to the first turn.
         let overrides = oxinfer::mm::bind(model, &mut dec.sess, &ids, &std::mem::take(&mut mm_feats))?;
         let t = Instant::now();
+        let ps0 = prefill_trace_start();
         let logits = dec.prefill_mm(&ids, chunk, &overrides);
         let prefill_secs = t.elapsed().as_secs_f64();
+        prefill_trace_end(ps0, ids.len(), prefill_secs);
         prof::reset();
         let before = dec.stats.clone();
         let s0 = stream.map(|s| s.stats());
@@ -2021,6 +2054,7 @@ fn run_dspark(
         p_min: args
             .draft_p_min
             .unwrap_or(if args.stream { oxinfer::dspark::STREAM_P_MIN } else { 0.0 }),
+        device: args.draft_device,
     };
     let mut sampler =
         Sampler::new(args.temperature, args.top_k, args.top_p, args.seed).with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0));
@@ -2048,8 +2082,10 @@ fn run_dspark(
         // The attachments belong to the first turn.
         let overrides = oxinfer::mm::bind(model, &mut dec.sess, &ids, &std::mem::take(&mut mm_feats))?;
         let t = Instant::now();
+        let ps0 = prefill_trace_start();
         let logits = dec.prefill_mm(&ids, chunk, &overrides);
         let prefill_secs = t.elapsed().as_secs_f64();
+        prefill_trace_end(ps0, ids.len(), prefill_secs);
         prof::reset();
         let before = dec.stats.clone();
         let s0 = stream.map(|s| s.stats());
