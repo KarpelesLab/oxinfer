@@ -342,7 +342,7 @@ fn lin_f32(l: &Lin, n_out: usize, n_in: usize) -> Vec<f32> {
 
 /// Per-head matmuls in one grouped call: `x` holds `nh` blocks of `t` rows of `n_in`, block `h`
 /// goes through `ls[h]` (`[n_out, n_in]`); returns `nh` blocks of `t` rows of `n_out`.
-fn per_head(ls: &[Lin], x: &[f32], t: usize, n_in: usize, n_out: usize) -> Vec<f32> {
+pub(crate) fn per_head(ls: &[Lin], x: &[f32], t: usize, n_in: usize, n_out: usize) -> Vec<f32> {
     let nh = ls.len();
     let tp = t.next_multiple_of(TN);
     let mut xp = vec![0f32; nh * tp * n_in];
@@ -756,14 +756,21 @@ impl<'a> Mistral4Model<'a> {
         self.stream = hook;
     }
 
-    /// Soft-capped logits `[t, vocab]` for final-normed hidden states `[t, hidden]`.
-    pub fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
+    /// LM-head logits `[t, vocab]` (not soft-capped) for final-normed hidden states `[t, hidden]`.
+    pub fn head_raw(&self, hidden: &[f32], t: usize) -> Vec<f32> {
         let c = &self.cfg;
         let _timer = prof::start(Cat::Head);
         let mut logits = vec![0f32; t * c.vocab_size];
-        let unit = crate::stream::enter(&self.stream, self.layers.len());
+        let _unit = crate::stream::enter(&self.stream, self.layers.len());
         linear(&self.lm_head, c.vocab_size, c.hidden_size, hidden, t, &mut logits);
-        drop(unit);
+        logits
+    }
+
+    /// Soft-capped logits `[t, vocab]` for final-normed hidden states `[t, hidden]`.
+    pub fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
+        let c = &self.cfg;
+        let mut logits = self.head_raw(hidden, t);
+        let _timer = prof::start(Cat::Head);
         if let Some(cap) = c.final_logit_softcapping.filter(|&c| c > 0.0) {
             let cap = cap as f32;
             for_chunks(&mut logits, 8192, true, |_, ch| {
@@ -785,6 +792,20 @@ impl<'a> Mistral4Model<'a> {
     /// Runs `tokens` from `sess.pos` (positions in `mm` take the given embeddings instead of the
     /// token's), appending to the caches; returns the final-normed hidden states `[t, hidden]`.
     pub fn forward_hidden_mm(&self, sess: &mut Mistral4Session, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {
+        self.forward_capture(sess, tokens, mm, &[], &mut Vec::new())
+    }
+
+    /// [`Self::forward_hidden_mm`] that also writes to `feats` (`[t, layers.len() * hidden]`) the
+    /// residual stream entering each of `layers`, `num_hidden_layers` standing for the last
+    /// layer's output before the final norm (the target features of a DSpark draft).
+    pub fn forward_capture(
+        &self,
+        sess: &mut Mistral4Session,
+        tokens: &[u32],
+        mm: &[(usize, &[f32])],
+        layers: &[usize],
+        feats: &mut Vec<f32>,
+    ) -> Vec<f32> {
         let t = tokens.len();
         assert!(t > 0);
         let c = &self.cfg;
@@ -815,7 +836,18 @@ impl<'a> Mistral4Model<'a> {
         }
         let mut sel: Selection = Vec::new();
         let mut hn = vec![0f32; t * h];
+        let nf = layers.len();
+        feats.clear();
+        feats.resize(t * nf * h, 0.0);
+        let mut capture = |l: usize, x: &[f32]| {
+            for (k, _) in layers.iter().enumerate().filter(|e| *e.1 == l) {
+                for ti in 0..t {
+                    feats[(ti * nf + k) * h..(ti * nf + k + 1) * h].copy_from_slice(&x[ti * h..(ti + 1) * h]);
+                }
+            }
+        };
         for (l, layer) in self.layers.iter().enumerate() {
+            capture(l, &x);
             let _unit = crate::stream::enter(&self.stream, l);
             rmsnorm_f32w_rows(&x, h, &layer.ln_in, eps, &mut hn);
             let mut o = vec![0f32; t * h];
@@ -861,6 +893,7 @@ impl<'a> Mistral4Model<'a> {
                 s.prefetch_parts(l + 1, &guess);
             }
         }
+        capture(self.layers.len(), &x);
         rmsnorm_f32w_rows_inplace(&mut x, h, &self.final_norm, eps);
         sess.pos += t;
         x
@@ -1275,6 +1308,36 @@ impl crate::generate::TextLm for Mistral4Model<'_> {
     }
     fn forward(&self, sess: &mut Mistral4Session, tokens: &[u32]) -> Vec<f32> {
         Mistral4Model::forward(self, sess, tokens)
+    }
+}
+
+/// The target of a DSpark draft ([`crate::dspark`]).
+impl crate::dspark::Target for Mistral4Model<'_> {
+    fn forward_feats(
+        &self,
+        sess: &mut Mistral4Session,
+        tokens: &[u32],
+        mm: &[(usize, &[f32])],
+        layers: &[usize],
+        feats: &mut Vec<f32>,
+    ) -> Vec<f32> {
+        self.forward_capture(sess, tokens, mm, layers, feats)
+    }
+    fn embed_row(&self, token: u32, out: &mut [f32]) {
+        let h = self.cfg.hidden_size;
+        if let Some(s) = &self.stream {
+            s.need_ranges(&self.embed.row_ranges(token as usize, h));
+        }
+        self.embed.row(token as usize, out);
+    }
+    fn head_raw(&self, hidden: &[f32], t: usize) -> Vec<f32> {
+        Mistral4Model::head_raw(self, hidden, t)
+    }
+    fn vocab_size(&self) -> usize {
+        self.cfg.vocab_size
+    }
+    fn truncate(&self, sess: &mut Mistral4Session, len: usize) {
+        sess.truncate(len);
     }
 }
 

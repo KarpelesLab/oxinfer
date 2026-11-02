@@ -893,7 +893,6 @@ impl Mistral4Config {
     /// magnitude, as transformers' YaRN (`_compute_yarn_parameters`) or default RoPE computes
     /// them in float32; the learned LeRoPE factors are applied by the model.
     pub fn rope(&self) -> (Vec<f32>, f32) {
-        let dim = self.qk_rope_head_dim;
         let r = self.rope_parameters.clone().unwrap_or(YarnParams {
             rope_theta: 10_000.0,
             rope_type: Some("yarn".into()),
@@ -906,6 +905,15 @@ impl Mistral4Config {
             mscale_all_dim: None,
             truncate: None,
         });
+        r.inv_freq(self.qk_rope_head_dim)
+    }
+}
+
+impl YarnParams {
+    /// The rotary inverse frequencies (`dim / 2` of them) and the cos / sin magnitude, as
+    /// transformers' YaRN (`_compute_yarn_parameters`) or default RoPE computes them in float32.
+    pub fn inv_freq(&self, dim: usize) -> (Vec<f32>, f32) {
+        let r = self;
         let base = r.rope_theta;
         let pos: Vec<f32> = (0..dim / 2).map(|i| (base as f32).powf((2 * i) as f32 / dim as f32)).collect();
         if r.rope_type.as_deref() != Some("yarn") {

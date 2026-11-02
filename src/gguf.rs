@@ -910,9 +910,13 @@ pub struct HfTensor {
 /// The tensors of a GGUF file the loaders use, under Hugging Face names.
 pub fn hf_tensors(h: &Header) -> Result<Vec<HfTensor>> {
     // Diffusion transformers (city96-style FLUX quants, unsloth Qwen-Image, calcuis "pig" files such
-    // as OmniGen2) and llama.cpp vision `clip` files (mmproj) keep their original tensor names; T5
-    // encoders (`t5encoder`) get the transformers names.
-    if matches!(h.arch(), "flux" | "qwen_image" | "pig" | "omnigen2" | "t5encoder" | "clip") {
+    // as OmniGen2), llama.cpp vision `clip` files (mmproj) and DFlash / DSpark drafts (`dflash`,
+    // see `crate::dspark`) keep their original tensor names; T5 encoders (`t5encoder`) get the
+    // transformers names.
+    if matches!(
+        h.arch(),
+        "flux" | "qwen_image" | "pig" | "omnigen2" | "t5encoder" | "clip" | "dflash"
+    ) {
         let t5 = h.arch() == "t5encoder";
         return Ok(h
             .tensors
@@ -982,7 +986,8 @@ pub fn split_files(path: &Path) -> Result<Vec<std::path::PathBuf>> {
 }
 
 /// The first file of the GGUF model in folder `dir` (a single `.gguf`, or part 1 of a split one;
-/// `mmproj*` vision files are not models), when the folder holds no other checkpoint.
+/// `mmproj*` vision files and `dspark*` drafts are not models), when the folder holds no other
+/// checkpoint.
 pub fn model_in_dir(dir: &Path) -> Option<std::path::PathBuf> {
     if !dir.is_dir() || dir.join("config.json").is_file() {
         return None;
@@ -993,7 +998,7 @@ pub fn model_in_dir(dir: &Path) -> Option<std::path::PathBuf> {
         .map(|e| e.path())
         .filter(|p| {
             let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            n.ends_with(".gguf") && !n.starts_with("mmproj") && split_name(n).is_none_or(|s| s.1 == 1)
+            n.ends_with(".gguf") && !n.starts_with("mmproj") && !n.starts_with("dspark") && split_name(n).is_none_or(|s| s.1 == 1)
         })
         .collect();
     ggufs.sort();

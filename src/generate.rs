@@ -1,7 +1,7 @@
 //! Text generation building blocks shared by the CLI and [`crate::engine`]: the common surface of
 //! the model families ([`TextLm`]), chunked prefill, the decoding loops (plain sampling, Qwen MTP
-//! and Gemma 4 drafter speculative decoding) with a per-token callback that can stop them, and
-//! incremental detokenization for streaming ([`TextStream`]).
+//! and DSpark rounds, Gemma 4 drafter speculative decoding) with a per-token callback that can
+//! stop them, and incremental detokenization for streaming ([`TextStream`]).
 //!
 //! The loops never print; the callback receives the tokens generated so far (the new one last)
 //! for every token except a stop token, and returns [`Flow::Stop`] to end generation early.
@@ -229,10 +229,29 @@ pub fn decode<M: TextLm + ?Sized>(
     }
 }
 
-/// Qwen MTP speculative decoding after `dec.prefill(..)` returned `logits`: samples the first
-/// token, then runs verification rounds until a stop token, `max_tokens` tokens (at least one is
-/// always generated) or `on_token` stops it (the tokens of the current round are still committed
-/// and returned, without further callbacks). `forwards` counts verification rounds.
+/// A speculative decoder run in verification rounds (Qwen MTP, DSpark): `push` commits the
+/// first token of a reply, `step` drafts, verifies and returns the committed tokens.
+pub trait RoundDecoder {
+    fn push(&mut self, token: u32);
+    fn step(&mut self, sampler: &mut Sampler, max_new: usize) -> Vec<u32>;
+    /// Verification rounds run so far.
+    fn rounds(&self) -> usize;
+}
+
+impl RoundDecoder for MtpDecoder<'_> {
+    fn push(&mut self, token: u32) {
+        MtpDecoder::push(self, token)
+    }
+    fn step(&mut self, sampler: &mut Sampler, max_new: usize) -> Vec<u32> {
+        MtpDecoder::step(self, sampler, max_new)
+    }
+    fn rounds(&self) -> usize {
+        self.stats.rounds
+    }
+}
+
+/// Qwen MTP speculative decoding after `dec.prefill(..)` returned `logits` (see
+/// [`decode_rounds`]).
 pub fn decode_mtp(
     dec: &mut MtpDecoder,
     logits: &[f32],
@@ -241,8 +260,23 @@ pub fn decode_mtp(
     max_tokens: usize,
     on_token: &mut dyn FnMut(&[u32]) -> Flow,
 ) -> Decoded {
+    decode_rounds(dec, logits, sampler, stop, max_tokens, on_token)
+}
+
+/// Speculative decoding in rounds after the decoder's prefill returned `logits`: samples the
+/// first token, then runs verification rounds until a stop token, `max_tokens` tokens (at least
+/// one is always generated) or `on_token` stops it (the tokens of the current round are still
+/// committed and returned, without further callbacks). `forwards` counts verification rounds.
+pub fn decode_rounds<D: RoundDecoder + ?Sized>(
+    dec: &mut D,
+    logits: &[f32],
+    sampler: &mut Sampler,
+    stop: &[u32],
+    max_tokens: usize,
+    on_token: &mut dyn FnMut(&[u32]) -> Flow,
+) -> Decoded {
     let t0 = Instant::now();
-    let rounds0 = dec.stats.rounds;
+    let rounds0 = dec.rounds();
     let first = sampler.sample(logits);
     let mut out = vec![first];
     dec.push(first);
@@ -265,7 +299,7 @@ pub fn decode_mtp(
     };
     Decoded {
         tokens: out,
-        forwards: dec.stats.rounds - rounds0,
+        forwards: dec.rounds() - rounds0,
         secs: t0.elapsed().as_secs_f64(),
         reason,
         // The decoder never runs the last committed token until the next round or prefill.

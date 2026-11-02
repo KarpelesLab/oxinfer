@@ -29,6 +29,7 @@ pub mod coreml;
 pub mod cuda;
 pub mod decide;
 pub mod drafter;
+pub mod dspark;
 pub mod embed;
 pub mod engine;
 pub mod flux;

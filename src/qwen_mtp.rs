@@ -384,7 +384,7 @@ pub struct DraftCosts {
 }
 
 impl DraftCosts {
-    fn record(&mut self, k: usize, secs: f64, accepted: usize, step_secs: Option<f64>) {
+    pub(crate) fn record(&mut self, k: usize, secs: f64, accepted: usize, step_secs: Option<f64>) {
         let ema = |old: f64, n: usize, v: f64| if n == 0 { v } else { 0.7 * old + 0.3 * v };
         if self.round_secs.len() <= k {
             self.round_secs.resize(k + 1, (0.0, 0));

@@ -49,7 +49,9 @@ struct Args {
     show_tokens: bool,
     prefill_chunk: Option<usize>,
     draft: Option<PathBuf>,
+    no_draft: bool,
     draft_tokens: Option<usize>,
+    draft_p_min: Option<f32>,
     mtp: bool,
     mtp_fixed: bool,
     mtp_from: Option<PathBuf>,
@@ -184,9 +186,15 @@ fn usage() -> ! {
          \x20 --preload            with --mmap, touch all weight pages before starting\n\
          \x20 --profile            print per-operation timing breakdown\n\
          \x20 --prefill-chunk N    tokens per prefill chunk (default 256 on CPU, 1024 with a GPU backend)\n\
-         \x20 --draft DIR          speculative decoding with a Gemma 4 assistant (drafter) model; greedy only\n\
+         \x20 --draft DIR          speculative decoding with a Gemma 4 assistant (drafter) model; greedy only.\n\
+         \x20                      Mistral Large 4: a DSpark draft GGUF (default: the dspark*.gguf beside a\n\
+         \x20                      GGUF model, `auto` requires it); greedy and sampled, same output distribution\n\
+         \x20 --no-draft           Mistral Large 4: no DSpark draft\n\
          \x20 --draft-tokens N     max draft tokens per round (default 6 with --draft, adaptive from 3;\n\
-         \x20                      3 with --mtp, 8 with --mtp --stream)\n\
+         \x20                      3 with --mtp, 8 with --mtp --stream; DSpark 3, at most its block)\n\
+         \x20 --spec-draft-n-max N  the same as --draft-tokens\n\
+         \x20 --spec-draft-p-min P  DSpark: cut a block before the first draft the draft model gives\n\
+         \x20                      less than probability P (default 0.85 when the model streams, else 0)\n\
          \x20 --mtp                Qwen3.5/3.8: speculative decoding with the checkpoint's multi-token\n\
          \x20                      prediction layer (greedy and sampled; same output distribution)\n\
          \x20 --mtp-fixed          with --mtp, always draft --draft-tokens (default: adaptive 1..N)\n\
@@ -379,7 +387,9 @@ fn parse_args() -> Result<Args> {
         show_tokens: false,
         prefill_chunk: None,
         draft: None,
+        no_draft: false,
         draft_tokens: None,
+        draft_p_min: None,
         mtp: false,
         mtp_fixed: false,
         mtp_from: None,
@@ -521,7 +531,9 @@ fn parse_args() -> Result<Args> {
             "--profile" => a.profile = true,
             "--prefill-chunk" => a.prefill_chunk = Some(val()?.parse()?),
             "--draft" => a.draft = Some(PathBuf::from(val()?)),
-            "--draft-tokens" => a.draft_tokens = Some(val()?.parse()?),
+            "--draft-tokens" | "--spec-draft-n-max" => a.draft_tokens = Some(val()?.parse()?),
+            "--no-draft" => a.no_draft = true,
+            "--spec-draft-p-min" | "--draft-p-min" => a.draft_p_min = Some(val()?.parse()?),
             "--mtp" => a.mtp = true,
             "--mtp-fixed" => a.mtp_fixed = true,
             "--mtp-from" => {
@@ -828,7 +840,9 @@ fn main() -> Result<()> {
     // Resolve repo ids to cached local directories.
     let spec = args.model.to_string_lossy().to_string();
     args.model = resolve_model(&spec, args.cache_dir.as_deref())?;
-    if let Some(d) = &args.draft {
+    if let Some(d) = &args.draft
+        && d.as_os_str() != "auto"
+    {
         let spec = d.to_string_lossy().to_string();
         args.draft = Some(resolve_model(&spec, args.cache_dir.as_deref())?);
     }
@@ -1573,8 +1587,30 @@ fn run_qwen(args: Args) -> Result<()> {
 
 fn run_mistral4(mut args: Args) -> Result<()> {
     let t0 = Instant::now();
-    if args.draft.is_some() || args.mtp {
-        bail!("speculative decoding (--draft, --mtp) is not supported for Mistral Large 4 yet");
+    if args.mtp {
+        bail!("Mistral Large 4 has no MTP layer: speculative decoding uses a DSpark draft (--draft)");
+    }
+    // DSpark: the given draft, `auto` for the one beside a GGUF model; that one is also the
+    // default (`dspark::BY_DEFAULT`) unless --no-draft or a mode plain decoding serves (tool
+    // calls, logits dumps, prompt printing, interventions).
+    let beside = oxinfer::dspark::draft_for(&args.model);
+    let plain_only = args.tools || args.dump_logits.is_some() || args.print_prompt || iv_requested(&args.iv);
+    let draft = match &args.draft {
+        Some(d) if d.as_os_str() == "auto" => Some(beside.clone().context("--draft auto: no dspark*.gguf beside the model")?),
+        Some(d) if !oxinfer::dspark::is_draft(d) => bail!("{}: not a DSpark (dflash) draft GGUF", d.display()),
+        Some(d) => Some(d.clone()),
+        None if oxinfer::dspark::BY_DEFAULT && !args.no_draft && !plain_only => beside.clone(),
+        None => None,
+    };
+    if draft.is_none()
+        && !args.no_draft
+        && !plain_only
+        && let Some(b) = &beside
+    {
+        eprintln!(
+            "[a DSpark draft is beside the model ({}): --draft auto uses it]",
+            b.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+        );
     }
     let cfg = config::Mistral4Config::load(&args.model)?;
     let eos = config::load_eos_ids(&args.model);
@@ -1627,6 +1663,26 @@ fn run_mistral4(mut args: Args) -> Result<()> {
     } else {
         oxinfer::mm::prepare(&mm_request(&args), &files, model.cfg.hidden_size)?
     };
+    let draft_files = match &draft {
+        Some(d) => Some((d, safetensors::ModelFiles::open(d, true)?)),
+        None => None,
+    };
+    let draft = match &draft_files {
+        Some((d, f)) => {
+            let t = Instant::now();
+            let dr = oxinfer::dspark::Dspark::load(d, f, model.cfg.hidden_size, model.cfg.vocab_size, args.quant)?;
+            eprintln!(
+                "[DSpark draft {}: {} layers, block {}, {:.2} GB read per draft pass, {:.2}s]",
+                d.file_name().map(|n| n.to_string_lossy()).unwrap_or_default(),
+                dr.cfg.n_layers,
+                dr.cfg.block_size,
+                dr.pass_bytes() as f64 / 1e9,
+                t.elapsed().as_secs_f64()
+            );
+            Some(dr)
+        }
+        None => None,
+    };
     let streamer = if args.stream {
         Some(start_stream(&args, |o| oxinfer::stream::attach_mistral4(&mut model, &files, o))?)
     } else {
@@ -1634,7 +1690,10 @@ fn run_mistral4(mut args: Args) -> Result<()> {
     };
     *STREAM.lock().unwrap() = streamer.clone();
     TRACE.store(args.stream_trace, std::sync::atomic::Ordering::Relaxed);
-    let r = run_text(&args, &model, &tok, &eos, fmt, mm);
+    let r = match &draft {
+        Some(d) => run_dspark(&args, &model, d, &tok, &eos, fmt, streamer.as_deref(), mm),
+        None => run_text(&args, &model, &tok, &eos, fmt, mm),
+    };
     if let Some(s) = &streamer
         && let Some(c) = s.cached_bytes()
     {
@@ -1879,6 +1938,157 @@ fn run_qwen_mtp(
         }
         if args.profile {
             prof::report(decode_secs, out.len());
+        }
+        Ok(())
+    };
+    if !args.chat {
+        let prompt = match &args.prompt {
+            Some(p) => p.clone(),
+            None => {
+                let mut s = String::new();
+                std::io::stdin().lock().read_to_string(&mut s)?;
+                s
+            }
+        };
+        let prompt = format!("{mm_text}{prompt}");
+        let text = if args.raw {
+            prompt
+        } else {
+            fmt.first_turn(system_prompt(args).as_deref(), args.think, &[], &prompt)
+        };
+        return turn(&mut dec, &text);
+    }
+    let mut first = true;
+    let stdin = std::io::stdin();
+    loop {
+        eprint!("> ");
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            break;
+        }
+        let line = line.trim_end_matches(['\n', '\r']);
+        if line.trim().is_empty() {
+            continue;
+        }
+        let text = if first {
+            first = false;
+            fmt.first_turn(system_prompt(args).as_deref(), args.think, &[], &format!("{mm_text}{line}"))
+        } else {
+            fmt.end_of_model_turn() + &fmt.user_turn(line, args.think)
+        };
+        turn(&mut dec, &text)?;
+    }
+    Ok(())
+}
+
+/// Whether any intervention flag was given.
+fn iv_requested(iv: &intervene_cli::IvArgs) -> bool {
+    iv.json.is_some()
+        || !iv.neurons.is_empty()
+        || !iv.steer.is_empty()
+        || !iv.ablate.is_empty()
+        || iv.sae.is_some()
+        || !iv.sae_features.is_empty()
+        || iv.make_direction.is_some()
+        || iv.capture.is_some()
+}
+
+/// Generation with a DSpark draft (Mistral Large 4), single prompt or chat.
+#[allow(clippy::too_many_arguments)]
+fn run_dspark(
+    args: &Args,
+    model: &oxinfer::mistral4::Mistral4Model,
+    draft: &oxinfer::dspark::Dspark,
+    tok: &Tokenizer,
+    eos: &[u32],
+    fmt: &dyn ChatFormat,
+    stream: Option<&oxinfer::stream::Streamer>,
+    mm: Mm,
+) -> Result<()> {
+    use oxinfer::dspark::{DsparkDecoder, DsparkOptions};
+    let (mm_text, mut mm_feats) = mm;
+    if args.tools || args.dump_logits.is_some() || args.print_prompt || iv_requested(&args.iv) {
+        bail!("DSpark decoding does not combine with --tools, --dump-logits, --print-prompt or interventions");
+    }
+    let encode = |text: &str| -> Result<Vec<u32>> {
+        let enc = tok.encode(text, false).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+        Ok(enc.get_ids().to_vec())
+    };
+    let opts = DsparkOptions {
+        draft_tokens: args.draft_tokens.unwrap_or(3),
+        stop: eos.to_vec(),
+        cost_aware: args.mtp_cost.unwrap_or(false),
+        p_min: args
+            .draft_p_min
+            .unwrap_or(if args.stream { oxinfer::dspark::STREAM_P_MIN } else { 0.0 }),
+    };
+    let mut sampler =
+        Sampler::new(args.temperature, args.top_k, args.top_p, args.seed).with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0));
+    let mut dec = DsparkDecoder::new(model, draft, opts);
+    eprintln!(
+        "[DSpark speculative decoding: {} draft tokens{}, {}]",
+        dec.opts.draft_tokens,
+        if dec.opts.cost_aware { " max (cost-aware)" } else { "" },
+        if args.temperature > 0.0 { "sampled" } else { "greedy" }
+    );
+    let chunk = args.prefill_chunk.unwrap_or(256);
+    let mut unfed: Option<u32> = None;
+    let mut turn = |dec: &mut DsparkDecoder<oxinfer::mistral4::Mistral4Model>, text: &str| -> Result<()> {
+        let mut ids = encode(text)?;
+        if ids.is_empty() {
+            bail!("empty prompt");
+        }
+        // A reply cut short left its last token unprocessed: it goes first.
+        if let Some(t) = unfed.take() {
+            ids.insert(0, t);
+        }
+        if args.show_tokens {
+            eprintln!("[prompt ids ({}): {ids:?}]", ids.len());
+        }
+        // The attachments belong to the first turn.
+        let overrides = oxinfer::mm::bind(model, &mut dec.sess, &ids, &std::mem::take(&mut mm_feats))?;
+        let t = Instant::now();
+        let logits = dec.prefill_mm(&ids, chunk, &overrides);
+        let prefill_secs = t.elapsed().as_secs_f64();
+        prof::reset();
+        let before = dec.stats.clone();
+        let s0 = stream.map(|s| s.stats());
+        let mut printer = Printer::new(fmt, args.think, tok);
+        let d = generate::decode_rounds(dec, &logits, &mut sampler, eos, args.max_tokens, &mut |out| printer.print(tok, out));
+        unfed = d.unfed;
+        let out = d.tokens;
+        printer.finish(tok, &out, eos);
+        if args.show_tokens {
+            eprintln!("[output ids: {out:?}]");
+        }
+        let st = &dec.stats;
+        let (rounds, drafted, accepted) = (
+            st.rounds - before.rounds,
+            st.drafted - before.drafted,
+            st.accepted - before.accepted,
+        );
+        let n = out.len().saturating_sub(1);
+        report(ids.len(), prefill_secs, n, d.secs);
+        eprintln!(
+            "[DSpark: {rounds} target forwards for {n} tokens = {:.2} tok/forward; drafts accepted {accepted}/{drafted} = {:.0}%; \
+             per-round histogram {:?}; drafting {:.2}s, verification {:.2}s ({:.0} ms per forward)]",
+            n as f64 / rounds.max(1) as f64,
+            100.0 * accepted as f64 / drafted.max(1) as f64,
+            st.per_round,
+            st.draft_secs - before.draft_secs,
+            st.verify_secs - before.verify_secs,
+            1e3 * (st.verify_secs - before.verify_secs) / rounds.max(1) as f64
+        );
+        if let (Some(s), Some(s0)) = (stream, s0) {
+            let sd = s.stats() - s0;
+            eprintln!(
+                "[stream: {}; {:.2} GB read per forward]",
+                stream_line(&sd, n, d.secs),
+                sd.bytes_read as f64 / 1e9 / rounds.max(1) as f64
+            );
+        }
+        if args.profile {
+            prof::report(d.secs, out.len());
         }
         Ok(())
     };

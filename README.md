@@ -91,7 +91,7 @@ optional.
 | openai/whisper-large-v3, -large-v3-turbo, distil-whisper/distil-large-v3 | 1.55B / 809M / 756M | 3.1 / 1.6 / 1.5 GB (fp16) | speech to text; match transformers token for token |
 | canopylabs/orpheus-3b-0.1-ft (ungated copy: unsloth/orpheus-3b-0.1-ft) + hubertsiuzdak/snac_24khz | 3.3B + 20M | 6.6 GB + 80 MB (fp32) | text to speech; greedy tokens and waveform match transformers + snac (see [Text to speech](#text-to-speech-orpheus)); also any Llama 3.x as a text model |
 | Orpheus GGUF (isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF, lex-au/Orpheus-3b-FT-Q8_0.gguf) | 3.3B | 2.4 / 4.0 GB | text to speech; whisper-small WER 0-1% like the safetensors model |
-| mistralai/Mistral-Large-4-1T-A52B; unsloth/Mistral-Large-4-1T-A52B-GGUF | 1T MoE, 52B active (+ 2B vision) | 1.06 TB (FP8) / 378 GB (GGUF UD-Q2_K_XL) | text and images; streamed from storage when larger than RAM (1.3-1.5 tok/s on a 128 GB M5 Max); matches transformers (tiny random checkpoints with every feature, KL < 1e-9) and llama.cpp on the real GGUF (same next tokens, same greedy text); see [Mistral Large 4](#mistral-large-4-1t-a52b) |
+| mistralai/Mistral-Large-4-1T-A52B; unsloth/Mistral-Large-4-1T-A52B-GGUF | 1T MoE, 52B active (+ 2B vision) | 1.06 TB (FP8) / 378 GB (GGUF UD-Q2_K_XL) | text and images; streamed from storage when larger than RAM (1.3-1.5 tok/s on a 128 GB M5 Max; DSpark speculative decoding); matches transformers (tiny random checkpoints with every feature, KL < 1e-9) and llama.cpp on the real GGUF (same next tokens, same greedy text); see [Mistral Large 4](#mistral-large-4-1t-a52b) |
 | Llama 3.x GGUF (bartowski/Llama-3.2-1B-Instruct-GGUF, ...) | 1.2B tested | 0.8 GB (Q4_K_M) - 2.5 GB (F16) | text; F16 file bit-identical to the safetensors model, quantized files match llama.cpp (see [Llama 3 GGUF](#llama-3-gguf)) |
 | canopylabs/orpheus-3b-0.1-pretrained (ungated copy: unsloth/orpheus-3b-0.1-pretrained) | 3.3B | 6.6 GB | voice cloning from a reference clip (SNAC encoder); prompt and greedy tokens match the canopylabs notebook + transformers |
 | canopylabs/3b-{fr,de,ko,hi,zh,es_it}-ft-research_release (ungated copies: Our-Org-2/...) | 3.3B | 13 GB (fp32) | multilingual text to speech (French and German tested; French greedy tokens match transformers) |
@@ -271,8 +271,9 @@ turns image input off. The chat format is the model's template:
 `[SYSTEM_PROMPT]`, `[MODEL_SETTINGS]{"reasoning_effort": ...}` (`high` with `--think`, `low`
 otherwise; the model thinks in `[THINK]...[/THINK]` either way, shown dimmed), `[INST]` turns,
 `[AVAILABLE_TOOLS]` / `[TOOL_CALLS]` tool calling, images as rows of `[IMG]` closed by
-`[IMG_BREAK]` / `[IMG_END]`. Speculative decoding (the checkpoint's DSpark head) is not
-implemented. [Runtime interventions](#runtime-interventions-neuron-edits-steering-abliteration-sae-features)
+`[IMG_BREAK]` / `[IMG_END]`. Speculative decoding uses the checkpoint's DSpark draft head (see
+[below](#dspark-speculative-decoding)); with unsloth's GGUF it is on by default.
+[Runtime interventions](#runtime-interventions-neuron-edits-steering-abliteration-sae-features)
 work as for the other families: residual hooks around every layer, and neuron edits of layer 0's
 dense MLP, the shared expert or any routed expert.
 
@@ -304,7 +305,9 @@ bounds), unsloth's UD-Q2_K_XL:
 
 | setting | prefill | decode |
 |---|---|---|
-| default (streaming, 96 GB budget, Metal) | 17.4 tok/s (895-token prompt), 7.5 tok/s (1406, two chunks), 1-2 tok/s (15-90 tokens) | 1.3-1.5 tok/s |
+| default with DSpark (`--spec-draft-p-min 0.85`), measured 2026-11-02 | 0.4-0.7 tok/s (27-50 tokens) | 1.34-1.36 tok/s (plain: 1.26), see [DSpark](#dspark-speculative-decoding) |
+| same, `--device cpu` | 1.7 tok/s (50 tokens) | 1.48 tok/s (plain: 1.35) |
+| plain decoding (streaming, 96 GB budget, Metal), earlier measurement | 17.4 tok/s (895-token prompt), 7.5 tok/s (1406, two chunks), 1-2 tok/s (15-90 tokens) | 1.3-1.5 tok/s |
 | same, `--device cpu` | 3.0 tok/s (895 tokens) | 1.1-1.2 tok/s |
 | `--mmap` (demand paging, no streaming) | 0.4 tok/s (15 tokens) | 0.3-0.4 tok/s |
 | `--expert-predict` (next layer's experts guessed and read ahead, 73% right) | | 1.4 tok/s: IO stalls fall from 60% to 27% of the time, but the reads slow the compute as much |
@@ -369,6 +372,83 @@ included, measured while another job kept 9 CPU cores busy):
 | 2048 | 11.3 | 41.7 | 40.8 | 1.1 |
 
 Decoding stays on the CPU (this family has no whole-pass GPU decode).
+
+#### DSpark speculative decoding
+
+The checkpoint's DSpark draft head (`dspark.rs`; llama.cpp's `--spec-type draft-dspark`; unsloth
+ships it as `dspark-Mistral-Large-4-1T-A52B-Q8_0.gguf`, 2.2 GB, beside the GGUF folder) proposes
+a block of 3 tokens per pass:
+
+- Context: for every position the target has run, its residual stream entering layers 2, 19, 37
+  and 55 and after the last layer, concatenated, projected by `fc` and normed; each of the 3
+  dense MLA draft layers (6144 wide, 64 heads, latent K = V of 512 + 64 rotary dims, plain YaRN)
+  caches its own latent of that, and the block attends to the last 2048 positions.
+- Block: the last committed token (not yet run by the target) and two learned mask embeddings at
+  the next positions, attending non-causally to the context and to each other, then the target's
+  LM head, soft-capped at 30. Slot `i` predicts the token `i + 1` positions after the anchor.
+- A recurrent Markov head adds a low-rank logit bias to each slot keyed on the previous token
+  (`markov_w2 tanh(.)` of a gated state over `[state, markov_w1[prev], hidden]`), chained over the
+  block on the tokens actually drafted.
+
+The target verifies `[last, d1, d2, d3]` in one pass on the batch-invariant decode kernels, the
+features of the committed positions join the draft's cache, and rollback truncates the latent
+and indexer key caches (the KV-sharing layers keep none). Greedy output is the plain greedy
+output token for token; sampling keeps the target's distribution (standard speculative
+sampling). Other DSpark backbones (Qwen3, Gemma 4, DeepSeek V4 drafts) would add a layer kind
+behind the same `dspark::Target` trait.
+
+A GGUF model uses the `dspark*.gguf` beside it (its folder or the one above) by default:
+
+```sh
+M=~/.cache/oxinfer/hub/unsloth--Mistral-Large-4-1T-A52B-GGUF
+./target/release/oxinfer --model $M/UD-Q2_K_XL -p "Why is the sky blue?"            # DSpark on
+./target/release/oxinfer --model $M/UD-Q2_K_XL --no-draft -p "Why is the sky blue?" # plain
+./target/release/oxinfer --model $M/UD-Q2_K_XL --draft $M/dspark-Mistral-Large-4-1T-A52B-Q8_0.gguf \
+    --spec-draft-n-max 3 --spec-draft-p-min 0.85 -p "..."
+```
+
+`--spec-draft-n-max` (`--draft-tokens`) is at most the block, 3. `--spec-draft-p-min P` cuts a
+block before the first draft the draft model gives less than probability P, 0.85 by default when
+the model streams (0 otherwise). Library: `EngineOptions::draft` (`auto`, a path, `none`),
+`draft_tokens`, `draft_p_min`; the C API takes the same keys. Tool calls, `--dump-logits`,
+`--print-prompt` and interventions use plain decoding.
+
+Agreement: `tools/ref_dspark.py` is an independent float32 torch reference written from
+llama.cpp's `graph_mistral_large4` / `build_dspark_markov_head` and ggml's YaRN, run on the same
+target features (`examples/dspark_check.rs` dumps them with the draft's logits). A tiny random
+draft with bf16 weights matches to 8e-7 relative on the logits of all 3 slots; the real Q8_0
+draft on the real target's features to 2-6e-3 relative (int8 activations, as llama.cpp), KL
+under 9e-5, the same drafts. Greedy output with DSpark (cutoff 0.85 or none) is identical to
+plain greedy on the real model (128 tokens, a chat answer and a Python function, Metal and CPU;
+compare runs with `--no-system`, the default system prompt holds the time).
+
+Acceptance (greedy, 127 tokens): without a cutoff 2.9-3.0 tokens per verification pass (64-66%
+of the drafts accepted; 84% of first drafts, 75-79% of later ones); with the 0.85 cutoff
+2.2-2.7 tokens per pass, 92-93% accepted.
+
+Speed, 128 tokens, streaming with the default 96 GB budget, `--no-system` (other agents'
+builds ran meanwhile, load average 4-12; tokens per pass and acceptance in parentheses):
+
+| prompt, device | plain | 3 drafts, no cutoff | 3 drafts, cutoff 0.85 (default) |
+|---|---|---|---|
+| "why is the sky blue", Metal | 1.26 tok/s | 1.17 (2.95, 66%) | 1.36 (2.23, 92%) |
+| Python function, Metal | 1.26 | 1.13 (2.89, 64%) | 1.34 (2.65, 93%) |
+| Python function, `--device cpu` | 1.35 | | 1.48 (2.65, 93%) |
+| sky, `--temp 0.7` | 1.25 | | 1.32 (2.05, 84%) |
+
+Other settings on the sky prompt (with the default system prompt; plain 1.24): 1 draft 1.26, 2
+drafts 1.07, cutoff 0.5 1.25, 0.75 1.33, 0.95 1.38; `--expert-predict` with 3 drafts 1.06. The
+draft pass itself takes 30-40 ms. The gain is small because decoding waits on storage 60-70% of
+the time, and a verification pass reads the routed experts of every token it holds (11-12
+distinct of the 16 routes per layer): in plain decoding the experts consecutive tokens share
+were page-cache hits anyway, so a fully accepted round reads about what plain decoding of its
+tokens reads, and every rejected draft adds the experts of a token (16 GB read per pass without
+a cutoff, 4.3 GB per token in plain decoding). What is amortized is the dense part and the
+per-pass work (0.26 s of compute per token vs 0.33). The cutoff keeps the drafts that are nearly
+always accepted (98% of those the draft gives at least 0.95, 75% at 0.7-0.95, 40% at 0.3-0.7),
+which brings the storage reads per token back to the plain level. With the model in memory the
+verification is bound by compute and memory bandwidth and full blocks should pay off more (not
+measurable on a 128 GB machine).
 
 ## Embeddings
 
@@ -2755,8 +2835,10 @@ Useful flags:
 | `--threads N` | worker threads (default: all cores) |
 | `--quant q8` | quantize streamed weights to int8 at load (blocks of 32, f32 scales); ~1.8x less memory traffic |
 | `--quant q4` | GGUF-style Q4_0 (blocks of 32, 4-bit, f16 scale) for all streamed weights; ~3.5x less traffic |
-| `--draft DIR` | speculative decoding with Google's `gemma-4-E4B-it-assistant` drafter (greedy only; output identical to plain greedy) |
-| `--draft-tokens N` | max draft tokens per round (default 6 with `--draft`, 3 with `--mtp`, 8 with `--mtp --stream`; the length adapts) |
+| `--draft DIR` | speculative decoding with Google's `gemma-4-E4B-it-assistant` drafter (greedy only; output identical to plain greedy); Mistral Large 4: a DSpark draft GGUF (greedy and sampled; default: the `dspark*.gguf` beside the model, which `auto` requires), see [DSpark](#dspark-speculative-decoding) |
+| `--no-draft` | Mistral Large 4: no DSpark draft (plain decoding) |
+| `--draft-tokens N`, `--spec-draft-n-max N` | max draft tokens per round (default 6 with `--draft`, 3 with `--mtp`, 8 with `--mtp --stream`; the length adapts; DSpark 3, its block) |
+| `--spec-draft-p-min P` | DSpark: cut a block before the first draft the draft model gives less than probability P (default 0.85 when the model streams, else 0) |
 | `--mtp` | Qwen3.5/3.8: speculative decoding with the checkpoint's multi-token-prediction layer (greedy and sampled) |
 | `--mtp-fixed` | with `--mtp`, always draft `--draft-tokens` instead of adapting between 1 and N |
 | `--mtp-from DIR` | `--mtp` with the MTP weights taken from another checkpoint (e.g. the original of a converted copy) |
@@ -3931,6 +4013,9 @@ billion parameters at LUT4, `infer` only) are the practical range for 12 GB phon
   quantization of weights at load time, plus per-matmul activation quantization; decode kernels use
   int8 SDOT over four blocks at a time, with multi-token variants for speculative verification.
 - `drafter.rs`: the Gemma 4 assistant model (drafter) and its centroid-masked LM head.
+- `dspark.rs`: DSpark drafts (llama.cpp `dflash` GGUFs: target-feature context cache, block of
+  mask embeddings, Markov head; the Mistral Large 4 MLA backbone) and their speculative decoder,
+  over any target implementing `dspark::Target`.
 - `qwen_mtp.rs`: the Qwen3.5 MTP layer and the speculative decoder (drafting, verification with
   recorded recurrent states, speculative sampling).
 - `vision.rs`, `audio.rs`: Gemma 4's two encoders plus preprocessing (resize/patching, mel
