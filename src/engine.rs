@@ -119,11 +119,23 @@ pub struct EngineOptions {
     /// memory, prefetching the next layers while one computes (implies `mmap`; see
     /// [`crate::stream`]). Qwen MTP then drafts up to 8 tokens with a cost-aware length. The
     /// routed experts of MoE models are read on demand, recently used ones kept in a part of the
-    /// page-cache budget. Keys
-    /// `stream` (on with the defaults), `cache_budget_gb`, `resident_mb`, `prefetch_mb`,
-    /// `flash_mbps`, `expert_cache_mb`, `expert_predict` (Qwen MoE, Mistral Large 4). A Mistral Large 4
-    /// checkpoint larger than 60% of RAM streams by default ([`crate::mistral4::default_stream`]).
+    /// page-cache budget. Whether to stream is [`EngineOptions::stream_mode`]; these are the
+    /// settings (with [`StreamMode::Auto`], setting them turns streaming on). Keys
+    /// `cache_budget_gb`, `resident_mb`, `prefetch_mb`, `flash_mbps`, `expert_cache_mb`,
+    /// `expert_predict` (Qwen MoE, Mistral Large 4).
     pub stream: Option<crate::stream::StreamOptions>,
+    /// Whether the weights stream (see [`EngineOptions::stream`]): `auto` (default) streams when
+    /// streaming options are set, or a Mistral Large 4 checkpoint larger than 60% of RAM (with
+    /// [`crate::mistral4::default_stream`]); `on` always; `off` never (an oversized checkpoint is
+    /// then plainly memory-mapped and demand-paged). Key `stream` (`auto`, `on` / `1`, `off` /
+    /// `0`).
+    pub stream_mode: StreamMode,
+    /// Mistral Large 4 from GGUF: where the Pixtral vision projector (llama.cpp `mmproj` GGUF)
+    /// comes from. Default: an `mmproj*.gguf` beside the model (in its folder or the one above);
+    /// a file (path or `org/repo/file`, which is downloaded) also replaces the tower of a
+    /// safetensors checkpoint; `none` disables image input. Key `mmproj` (`auto`, `none`, or the
+    /// file).
+    pub mmproj: crate::pixtral::Mmproj,
     /// Core ML models: where Core ML may run them. Default (None): the Neural Engine, or the
     /// CPU / GPU when `device` asks for it. Key `coreml_units` (`auto`, `ane`, `all`, `gpu`,
     /// `cpu`).
@@ -154,6 +166,36 @@ pub struct EngineOptions {
     /// Runtime interventions from the first request on (see [`Engine::set_interventions`]).
     /// Key `interventions`: the [`crate::intervene::Spec`] as JSON, or `@FILE` for a JSON file.
     pub interventions: Option<crate::intervene::Spec>,
+}
+
+/// Whether a model's weights stream from storage ([`EngineOptions::stream_mode`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StreamMode {
+    /// With streaming options set, or for a checkpoint the family streams by default (`auto`).
+    #[default]
+    Auto,
+    /// Always (`on`).
+    On,
+    /// Never: plain loading, or memory mapping for an oversized checkpoint (`off`).
+    Off,
+}
+
+impl StreamMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "" | "auto" => Self::Auto,
+            "1" | "true" | "yes" | "on" => Self::On,
+            "0" | "false" | "no" | "off" => Self::Off,
+            _ => return None,
+        })
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
 }
 
 /// Where Core ML runs a model ([`EngineOptions::coreml_units`]; Core ML's `MLComputeUnits`).
@@ -264,6 +306,8 @@ impl Default for EngineOptions {
             draft_tokens: None,
             cache_dir: None,
             stream: None,
+            stream_mode: StreamMode::Auto,
+            mmproj: crate::pixtral::Mmproj::Auto,
             coreml_units: None,
             coreml_prefill: CoreMlPrefill::Auto,
             gpu_exact: None,
@@ -293,6 +337,16 @@ fn parse_opt_usize(key: &str, v: &str) -> Result<Option<usize>> {
 }
 
 impl EngineOptions {
+    /// The weight streaming in effect ([`EngineOptions::stream_mode`]): None for none, else its
+    /// settings. `default` is what the family streams with when left to decide (`auto`).
+    pub fn effective_stream(&self, default: Option<crate::stream::StreamOptions>) -> Option<crate::stream::StreamOptions> {
+        match self.stream_mode {
+            StreamMode::Off => None,
+            StreamMode::On => Some(self.stream.clone().or(default).unwrap_or_default()),
+            StreamMode::Auto => self.stream.clone().or(default),
+        }
+    }
+
     /// The keys [`EngineOptions::set`] accepts.
     pub const KEYS: &'static [&'static str] = &[
         "threads",
@@ -311,6 +365,7 @@ impl EngineOptions {
         "draft_tokens",
         "cache_dir",
         "stream",
+        "mmproj",
         "cache_budget_gb",
         "resident_mb",
         "prefetch_mb",
@@ -366,7 +421,10 @@ impl EngineOptions {
             "draft" => self.draft = opt_str(value),
             "draft_tokens" => self.draft_tokens = parse_opt_usize(key, value)?,
             "cache_dir" => self.cache_dir = opt_str(value).map(PathBuf::from),
-            "stream" => self.stream = parse_bool(key, value)?.then(Default::default),
+            "stream" => {
+                self.stream_mode = StreamMode::parse(value).with_context(|| format!("stream: expected auto, on or off, got {value:?}"))?
+            }
+            "mmproj" => self.mmproj = crate::pixtral::Mmproj::parse(value),
             "expert_predict" => self.stream.get_or_insert_with(Default::default).predict_experts = parse_bool(key, value)?,
             "cache_budget_gb" | "resident_mb" | "prefetch_mb" | "flash_mbps" | "expert_cache_mb" => {
                 let st = self.stream.get_or_insert_with(Default::default);
@@ -823,6 +881,8 @@ pub struct Engine {
     config: ChatConfig,
     info: ModelInfo,
     files: &'static ModelFiles,
+    /// Where a Mistral Large 4 vision tower comes from (a file resolved to a local path).
+    mmproj: crate::pixtral::Mmproj,
     prefill_chunk: usize,
     max_context: Option<usize>,
     draft_tokens: usize,
@@ -931,7 +991,14 @@ impl Engine {
         // Streaming reads the weights in place: always mapped. So is a Mistral Large 4 checkpoint
         // larger than most of RAM (its routed experts are read through the page cache).
         let too_big = family == Family::Mistral4 && crate::mistral4::too_big(crate::safetensors::checkpoint_bytes(&dir));
-        let mmap = opts.mmap || opts.stream.is_some() || too_big;
+        // Too big for memory: streamed with a page-cache budget unless told otherwise
+        // (2.5-3.5x faster than demand paging on the 378 GB UD-Q2_K_XL, see the README).
+        let stream = opts.effective_stream(too_big.then(crate::mistral4::default_stream));
+        let mmproj = match &opts.mmproj {
+            crate::pixtral::Mmproj::File(p) => crate::pixtral::Mmproj::File(resolve_file(&p.to_string_lossy(), opts.cache_dir.as_deref())?),
+            m => m.clone(),
+        };
+        let mmap = opts.mmap || stream.is_some() || too_big;
         let files = arena.keep(ModelFiles::open(&dir, !mmap)?);
         let tok = load_tokenizer(&dir)?;
         let eos = config::load_eos_ids(&dir);
@@ -945,7 +1012,7 @@ impl Engine {
                     vocab_size: c.vocab_size,
                 };
                 decision = load_decision(decision_dir.as_deref(), &tok, &base, true, |ad| model.attach_lora(ad))?;
-                if let Some(so) = &opts.stream {
+                if let Some(so) = &stream {
                     streamer = Some(crate::stream::attach_gemma(&mut model, files, so.clone())?);
                 }
                 let model = arena.keep(model);
@@ -1015,8 +1082,8 @@ impl Engine {
                     None
                 };
                 // The streamer is attached before the model and MTP layer are frozen in the arena.
-                let draft_tokens = opts.draft_tokens.unwrap_or(if opts.stream.is_some() { 8 } else { 3 });
-                if let Some(so) = &opts.stream {
+                let draft_tokens = opts.draft_tokens.unwrap_or(if stream.is_some() { 8 } else { 3 });
+                if let Some(so) = &stream {
                     let mut fs = vec![files];
                     fs.extend(side);
                     streamer = Some(crate::stream::attach_qwen(&mut model, m.as_mut(), &fs, draft_tokens, so.clone())?);
@@ -1040,8 +1107,8 @@ impl Engine {
                             stop,
                             // Streaming passes are IO-bound: long drafts pay off, so pick their
                             // length by cost and keep them exact.
-                            cost_aware: !opts.mtp_fixed && opts.stream.is_some(),
-                            exact: opts.stream.is_some(),
+                            cost_aware: !opts.mtp_fixed && stream.is_some(),
+                            exact: stream.is_some(),
                         };
                         Lm::QwenMtp {
                             dec: Box::new(MtpDecoder::new(model, m, mopts)),
@@ -1060,10 +1127,7 @@ impl Engine {
                 }
                 decision = None;
                 let mut model = Mistral4Model::load(config::Mistral4Config::load(&dir)?, files, opts.quant)?;
-                // Too big for memory: streamed with a page-cache budget unless told otherwise
-                // (2.5-3.5x faster than demand paging on the 378 GB UD-Q2_K_XL, see the README).
-                let so = opts.stream.clone().or_else(|| too_big.then(crate::mistral4::default_stream));
-                if let Some(so) = so {
+                if let Some(so) = stream.clone() {
                     streamer = Some(crate::stream::attach_mistral4(&mut model, files, so)?);
                 }
                 let model = arena.keep(model);
@@ -1147,6 +1211,7 @@ impl Engine {
             stats: Stats::default(),
             streamer,
             decision,
+            mmproj,
             iv: IvState {
                 cache_dir: opts.cache_dir.clone(),
                 ..Default::default()
@@ -1207,6 +1272,7 @@ impl Engine {
             stats: Stats::default(),
             streamer: None,
             decision: None,
+            mmproj: crate::pixtral::Mmproj::None,
             iv: IvState::default(),
             _arena: arena,
         })
@@ -1520,8 +1586,11 @@ impl Engine {
                 Family::Gemma4 => {}
                 Family::Qwen if crate::qwen_vision::is_qwen_vl(&self.info.path) => {}
                 Family::Qwen => bail!("this checkpoint has no vision tower (text only)"),
-                Family::Mistral4 if crate::pixtral::PixtralConfig::load(&self.info.path)?.is_some() => {}
-                Family::Mistral4 => bail!("this checkpoint has no vision tower (for a GGUF model: no mmproj file beside it)"),
+                Family::Mistral4 if self.mmproj == crate::pixtral::Mmproj::None => bail!("image input is disabled (mmproj none)"),
+                Family::Mistral4 if crate::pixtral::PixtralConfig::load_with(&self.info.path, &self.mmproj)?.is_some() => {}
+                Family::Mistral4 => {
+                    bail!("this checkpoint has no vision tower (for a GGUF model: no mmproj file beside it; set the mmproj option)")
+                }
                 _ => bail!("attachments are supported for Gemma 4 and Qwen3.5-family vision models only"),
             }
             let req = mm::MmRequest {
@@ -1532,6 +1601,7 @@ impl Engine {
                 video: media.video.clone(),
                 max_soft_tokens: media.max_soft_tokens,
                 dump_mm: None,
+                mmproj: self.mmproj.clone(),
             };
             let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
             #[cfg(feature = "oxideav")]
@@ -2212,5 +2282,36 @@ mod tests {
             };
             o.set(k, v).unwrap();
         }
+    }
+    #[test]
+    fn stream_and_mmproj_options() {
+        use crate::pixtral::Mmproj;
+        use crate::stream::StreamOptions;
+        let mut o = EngineOptions::default();
+        let auto = || Some(StreamOptions::default());
+        assert_eq!(o.stream_mode, StreamMode::Auto);
+        assert!(o.effective_stream(None).is_none());
+        assert!(o.effective_stream(auto()).is_some());
+        o.set("stream", "off").unwrap();
+        assert!(o.effective_stream(auto()).is_none());
+        o.set("cache_budget_gb", "10").unwrap();
+        assert!(o.effective_stream(auto()).is_none(), "off wins over tuning keys");
+        o.set("stream", "0").unwrap();
+        assert_eq!(o.stream_mode, StreamMode::Off);
+        o.set("stream", "auto").unwrap();
+        assert_eq!(o.effective_stream(None).and_then(|s| s.cache_budget), Some(10_000_000_000));
+        o.set("stream", "1").unwrap();
+        assert_eq!(o.stream_mode, StreamMode::On);
+        assert!(o.set("stream", "sometimes").is_err());
+        for m in [StreamMode::Auto, StreamMode::On, StreamMode::Off] {
+            assert_eq!(StreamMode::parse(m.as_str()), Some(m));
+        }
+        assert_eq!(o.mmproj, Mmproj::Auto);
+        o.set("mmproj", "none").unwrap();
+        assert_eq!(o.mmproj, Mmproj::None);
+        o.set("mmproj", "/x/mmproj-F16.gguf").unwrap();
+        assert_eq!(o.mmproj, Mmproj::File("/x/mmproj-F16.gguf".into()));
+        o.set("mmproj", "auto").unwrap();
+        assert_eq!(o.mmproj, Mmproj::Auto);
     }
 }

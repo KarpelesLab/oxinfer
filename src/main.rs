@@ -55,6 +55,9 @@ struct Args {
     mtp_from: Option<PathBuf>,
     mtp_cost: Option<bool>,
     stream: bool,
+    /// `--no-stream`: never stream (an oversized Mistral Large 4 is then demand-paged).
+    no_stream: bool,
+    mmproj: oxinfer::pixtral::Mmproj,
     cache_budget_gb: Option<f64>,
     resident_mb: Option<u64>,
     prefetch_mb: Option<u64>,
@@ -205,6 +208,8 @@ fn usage() -> ! {
          \x20 --expert-cache-mb N  with --stream, page cache kept for recently used MoE experts (which\n\
          \x20                      are read on demand; default: what the budget leaves)\n\
          \x20 --expert-predict     with --stream, read the next MoE layer's guessed experts ahead (Qwen)\n\
+         \x20 --no-stream          never stream, not even a Mistral Large 4 checkpoint larger than 60% of\n\
+         \x20                      RAM (streamed by default): it is then memory-mapped and demand-paged\n\
          \x20 --image FILE         attach an image (repeatable; PNG/JPEG/WebP/GIF/BMP via oxideav)\n\
          \x20 --audio FILE         attach an audio clip (repeatable; WAV/MP3/FLAC/AAC/OGG via oxideav)\n\
          \x20 --video FILE|DIR     attach a video (repeatable; MP4/MOV/MKV/WebM/AVI with H.264, H.265,\n\
@@ -215,6 +220,8 @@ fn usage() -> ! {
          \x20 --max-soft-tokens N  image token budget: Gemma 4: 70, 140, 280 (default), 560 or 1120;\n\
          \x20                      Qwen: merged tokens of 32x32 pixels (default 16384)\n\
          \x20 --dump-mm PREFIX     write multimodal soft tokens / patches as f32 files (for reference checks)\n\
+         \x20 --mmproj FILE|none   Mistral Large 4: the vision projector (llama.cpp mmproj GGUF, path or\n\
+         \x20                      org/repo/file; default: the mmproj*.gguf beside a GGUF model), or none\n\
          \x20 --cache-dir DIR      where fetched models are cached\n\
          \x20 --download-only      fetch the model (and drafter) and exit\n\
          \x20 --save-quantized DIR write a checkpoint with the weights already quantized to --quant (loads\n\
@@ -378,6 +385,8 @@ fn parse_args() -> Result<Args> {
         mtp_from: None,
         mtp_cost: None,
         stream: false,
+        no_stream: false,
+        mmproj: Default::default(),
         cache_budget_gb: None,
         resident_mb: None,
         prefetch_mb: None,
@@ -523,8 +532,14 @@ fn parse_args() -> Result<Args> {
             "--no-mtp-cost" => a.mtp_cost = Some(false),
             "--stream" => {
                 a.stream = true;
+                a.no_stream = false;
                 a.mmap = true;
             }
+            "--no-stream" => {
+                a.no_stream = true;
+                a.stream = false;
+            }
+            "--mmproj" => a.mmproj = oxinfer::pixtral::Mmproj::parse(&val()?),
             "--cache-budget-gb" => a.cache_budget_gb = Some(val()?.parse()?),
             "--resident-mb" => a.resident_mb = Some(val()?.parse()?),
             "--prefetch-mb" => a.prefetch_mb = Some(val()?.parse()?),
@@ -671,6 +686,7 @@ fn mm_request(args: &Args) -> oxinfer::mm::MmRequest<'_> {
         video: args.video.clone(),
         max_soft_tokens: args.max_soft_tokens,
         dump_mm: args.dump_mm.as_deref(),
+        mmproj: args.mmproj.clone(),
     }
 }
 
@@ -854,9 +870,11 @@ fn run_decide(args: &Args) -> Result<()> {
     opts.prefill_chunk = args.prefill_chunk;
     opts.cache_dir = args.cache_dir.clone();
     opts.decision_from = args.decision_from.clone();
-    if args.stream {
-        opts.stream = Some(Default::default());
-    }
+    opts.stream_mode = match (args.stream, args.no_stream) {
+        (true, _) => oxinfer::engine::StreamMode::On,
+        (_, true) => oxinfer::engine::StreamMode::Off,
+        _ => oxinfer::engine::StreamMode::Auto,
+    };
     let mut e = Engine::load(&args.model.to_string_lossy(), &opts)?;
     let info = e.info().clone();
     let d = e
@@ -1561,9 +1579,15 @@ fn run_mistral4(mut args: Args) -> Result<()> {
     let cfg = config::Mistral4Config::load(&args.model)?;
     let eos = config::load_eos_ids(&args.model);
     // A checkpoint larger than most of RAM cannot be read in: it is streamed with a page-cache
-    // budget of 70% of RAM (the routed experts read as they are used), unless `--mmap` asks for
-    // plain demand paging.
+    // budget of 70% of RAM (the routed experts read as they are used), unless `--no-stream` (or
+    // `--mmap`) asks for plain demand paging.
     let size: u64 = oxinfer::safetensors::checkpoint_bytes(&args.model);
+    if let oxinfer::pixtral::Mmproj::File(p) = &args.mmproj {
+        args.mmproj = oxinfer::pixtral::Mmproj::File(resolve_file(&p.to_string_lossy(), args.cache_dir.as_deref())?);
+    }
+    if oxinfer::mistral4::too_big(size) && args.no_stream {
+        args.mmap = true;
+    }
     if oxinfer::mistral4::too_big(size) && !args.stream && !args.mmap {
         let budget = oxinfer::mistral4::default_stream().cache_budget.unwrap_or(0) as f64 / 1e9;
         args.cache_budget_gb = Some(args.cache_budget_gb.unwrap_or(budget));

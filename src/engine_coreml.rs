@@ -83,7 +83,7 @@ fn dir_bytes(p: &Path) -> u64 {
 }
 
 pub(super) fn load(dir: &Path, opts: &EngineOptions) -> Result<Loaded> {
-    if opts.mtp || opts.mtp_from.is_some() || opts.draft.is_some() || opts.stream.is_some() {
+    if opts.mtp || opts.mtp_from.is_some() || opts.draft.is_some() || opts.effective_stream(None).is_some() {
         bail!("speculative decoding and weight streaming are not available for Core ML models");
     }
     let meta = Meta::load(dir)?;

@@ -48,6 +48,17 @@ impl PixtralConfig {
     /// The vision config of a Mistral Large 4 / Mistral 3 checkpoint folder (`config.json`
     /// `vision_config`, processor settings from `processor_config.json`); None without one.
     pub fn load(dir: &Path) -> Result<Option<Self>> {
+        Self::load_with(dir, &Mmproj::Auto)
+    }
+
+    /// [`PixtralConfig::load`] with the projector chosen by `mmproj`: an explicit file replaces
+    /// the checkpoint's tower (it must be a Pixtral `mmproj`), `None` gives no vision.
+    pub fn load_with(dir: &Path, mmproj: &Mmproj) -> Result<Option<Self>> {
+        match mmproj {
+            Mmproj::None => return Ok(None),
+            Mmproj::File(p) => return Self::from_mmproj(p, dir).map(Some),
+            Mmproj::Auto => {}
+        }
         if crate::gguf::is_gguf(dir) {
             return match mmproj_for(dir) {
                 Some(p) if crate::gguf::header(&p)?.get("clip.projector_type").and_then(|v| v.as_str()) == Some("pixtral") => {
@@ -117,7 +128,10 @@ impl PixtralConfig {
                 _ => d,
             }
         };
-        let tok = crate::gguf::header(model).ok().and_then(|m| m.tokenizer().ok());
+        let tok = match crate::gguf::is_gguf(model) {
+            true => crate::gguf::header(model).ok().and_then(|m| m.tokenizer().ok()),
+            false => load_vocab(model),
+        };
         let id = |s: &str, d: u32| tok.as_ref().and_then(|t| t.token_to_id(s)).unwrap_or(d);
         Ok(Self {
             hidden_size: u("clip.vision.embedding_length")?,
@@ -142,6 +156,41 @@ const CLIP_STD: [f32; 3] = [0.268_629_54, 0.261_302_6, 0.275_777_1];
 
 fn load_vocab(dir: &Path) -> Option<tokenizers::Tokenizer> {
     tokenizers::Tokenizer::from_bytes(crate::fsx::read(&dir.join("tokenizer.json")).ok()?).ok()
+}
+
+/// Where the vision tower of a Mistral Large 4 checkpoint comes from (`EngineOptions::mmproj`,
+/// `--mmproj`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum Mmproj {
+    /// The checkpoint's own tower, or for a GGUF model the `mmproj*.gguf` beside it
+    /// ([`mmproj_for`]).
+    #[default]
+    Auto,
+    /// This llama.cpp `mmproj` GGUF file.
+    File(PathBuf),
+    /// No vision tower: image input is refused.
+    None,
+}
+
+impl Mmproj {
+    /// `auto` (or empty), `none` / `off`, or a file path.
+    pub fn parse(s: &str) -> Self {
+        match s.trim() {
+            "" | "auto" => Mmproj::Auto,
+            "none" | "off" | "0" => Mmproj::None,
+            p => Mmproj::File(PathBuf::from(p)),
+        }
+    }
+
+    /// The `mmproj` file that holds the tower of `model`, if one does (None: no file, the
+    /// checkpoint's own tower or no vision).
+    pub fn file_for(&self, model: &Path) -> Option<PathBuf> {
+        match self {
+            Mmproj::Auto if crate::gguf::is_gguf(model) => mmproj_for(model),
+            Mmproj::File(p) => Some(p.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// The llama.cpp `mmproj*.gguf` vision file beside GGUF model `model` (in its folder or the

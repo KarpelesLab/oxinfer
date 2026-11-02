@@ -27,6 +27,9 @@ pub struct MmRequest<'a> {
     pub max_soft_tokens: usize,
     /// Write the first image's / clip's inputs and soft tokens as f32 files with this prefix.
     pub dump_mm: Option<&'a Path>,
+    /// Mistral Large 4: where the vision tower comes from (default: the checkpoint, or the
+    /// `mmproj` file beside a GGUF model).
+    pub mmproj: crate::pixtral::Mmproj,
 }
 
 impl<'a> MmRequest<'a> {
@@ -40,6 +43,7 @@ impl<'a> MmRequest<'a> {
             video: VideoOptions::default(),
             max_soft_tokens: 0,
             dump_mm: None,
+            mmproj: Default::default(),
         }
     }
 
@@ -246,7 +250,10 @@ pub fn prepare_frames(args: &MmRequest, frames: MmFrames, files: &ModelFiles, te
 
 fn prepare_sources(src: &Sources, files: &ModelFiles, text_hidden: usize) -> Result<(String, Vec<MmFeature>)> {
     let args = src.req;
-    if let Some(pc) = crate::pixtral::PixtralConfig::load(args.model)? {
+    if args.mmproj == crate::pixtral::Mmproj::None && src.n_images() + src.n_videos() + src.n_audios() > 0 {
+        bail!("image input is disabled (mmproj none)");
+    }
+    if let Some(pc) = crate::pixtral::PixtralConfig::load_with(args.model, &args.mmproj)? {
         return prepare_pixtral(src, files, text_hidden, pc);
     }
     if let Some(qc) = qwen_vision::QwenMmConfig::load(args.model)? {
@@ -396,7 +403,7 @@ fn prepare_sources(src: &Sources, files: &ModelFiles, text_hidden: usize) -> Res
 
 /// Mistral Large 4 (Pixtral) images: each as rows of `[IMG]` placeholders closed by
 /// `[IMG_BREAK]` / `[IMG_END]`, the tower's tokens replacing the `[IMG]` ones. A GGUF model reads
-/// the tower from the `mmproj` file beside it.
+/// the tower from the `mmproj` file beside it (or the one `MmRequest::mmproj` names).
 fn prepare_pixtral(
     src: &Sources,
     files: &ModelFiles,
@@ -407,12 +414,10 @@ fn prepare_pixtral(
     if src.n_videos() > 0 || src.n_audios() > 0 {
         bail!("this model takes images only (no video or audio)");
     }
-    let side = match crate::gguf::is_gguf(args.model) {
-        true => Some(ModelFiles::open(
-            &crate::pixtral::mmproj_for(args.model).context("no mmproj file beside the GGUF model")?,
-            true,
-        )?),
-        false => None,
+    let side = match args.mmproj.file_for(args.model) {
+        Some(p) => Some(ModelFiles::open(&p, true)?),
+        None if crate::gguf::is_gguf(args.model) => bail!("no mmproj file beside the GGUF model (give one with --mmproj)"),
+        None => None,
     };
     let t = Instant::now();
     let tower = crate::pixtral::PixtralTower::load(pc, side.as_ref().unwrap_or(files), text_hidden)?;

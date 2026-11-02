@@ -263,7 +263,10 @@ with 128x128 block scales, read as stored, zero-copy, through a `GgmlType::F8E4M
 scales), transformers-saved copies, and llama.cpp GGUF files (`mistral-large4`, split into parts
 or not; unsloth's are tested). The Pixtral vision tower (30 layers of 2048, 2D RoPE, 2x2 patch
 merger and GELU projector) comes from the checkpoint, or for a GGUF model from the `mmproj` file
-beside it (in its folder or the one above). The chat format is the model's template:
+beside it (in its folder or the one above). `--mmproj FILE` (engine / C option `mmproj=FILE`, a
+path or `org/repo/file`; `EngineOptions::mmproj`) names the projector instead, for a GGUF model
+kept elsewhere or to replace a checkpoint's own tower, and `--mmproj none` (`mmproj=none`)
+turns image input off. The chat format is the model's template:
 `[SYSTEM_PROMPT]`, `[MODEL_SETTINGS]{"reasoning_effort": ...}` (`high` with `--think`, `low`
 otherwise; the model thinks in `[THINK]...[/THINK]` either way, shown dimmed), `[INST]` turns,
 `[AVAILABLE_TOOLS]` / `[TOOL_CALLS]` tool calling, images as rows of `[IMG]` closed by
@@ -283,8 +286,11 @@ dense MLP, the shared expert or any routed expert.
 
 A checkpoint larger than 60% of RAM is streamed (`--stream`, see
 [Streaming weights from flash](#streaming-weights-from-flash-models-larger-than-ram)) with a page
-cache budget of 70% of RAM unless told otherwise (`--stream`, `--cache-budget-gb`; `--mmap` alone
-asks for plain demand paging): the 20 GB of dense weights stay resident, the routed experts
+cache budget of 70% of RAM unless told otherwise (`--stream`, `--cache-budget-gb`; `--no-stream`,
+or `--mmap` alone, asks for plain demand paging). The engine / C option is tri-state:
+`stream=auto` (the default, as above; setting a tuning key such as `cache_budget_gb` also turns it
+on), `stream=on` / `1`, and `stream=off` / `0`, which really means a plain memory map
+(`EngineOptions::stream_mode`, `StreamMode::{Auto, On, Off}`). Streamed, the 20 GB of dense weights stay resident, the routed experts
 (357 GB) are read as they are routed and the rest of the budget caches the recent ones (about 60%
 of the routed experts are then hits). A prefill chunk needs nearly all experts, so it sweeps them
 once: their GEMMs run on the GPU's matrix units through per-call device state
@@ -3197,7 +3203,7 @@ plain greedy output.
 
 ### Streaming weights from flash (models larger than RAM)
 
-`--stream` (Qwen3.5 / Qwen3.8, Gemma 4 / Gemma 3 including 26B-A4B's experts, Mistral Large 4, on by default when its checkpoint does not fit in RAM; implies `--mmap`) runs a model whose weights do not fit in memory
+`--stream` (Qwen3.5 / Qwen3.8, Gemma 4 / Gemma 3 including 26B-A4B's experts, Mistral Large 4, on by default when its checkpoint does not fit in RAM, `--no-stream` / `stream=off` turning that off; implies `--mmap`) runs a model whose weights do not fit in memory
 by reading them in place from the mapped file while a reader thread fetches the next layers. It
 is aimed at phones: HauhauCS's Qwen3.8-27B GGUFs (Q2_K_P 10.7 GB, Q4_K_P 17.9 GB) on a 12 GB
 iPhone. Every forward pass reads the units (decoder layers, LM head, MTP layer, draft head)
