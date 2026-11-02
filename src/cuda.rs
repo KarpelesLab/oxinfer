@@ -309,6 +309,8 @@ struct Stats {
 
 pub struct CudaBackend {
     cu: Cu,
+    /// The primary context; current per thread, so every entry point makes it current (`bind`).
+    ctx: *mut c_void,
     _module: *mut c_void,
     /// bf16, q8, q4
     funcs: [*mut c_void; 3],
@@ -326,6 +328,12 @@ unsafe impl Send for CudaBackend {}
 unsafe impl Sync for CudaBackend {}
 
 impl CudaBackend {
+    /// Makes the context current on the calling thread (a host may load on one thread and generate
+    /// on another). Cheap: a thread-local store in the driver.
+    fn bind(&self) -> bool {
+        unsafe { self.cu.cuCtxSetCurrent(self.ctx) == 0 }
+    }
+
     fn check(&self, rc: c_int, what: &str) -> Result<()> {
         check(&self.cu, rc, what)
     }
@@ -432,6 +440,7 @@ impl CudaBackend {
         }
         Ok(Self {
             cu,
+            ctx,
             _module: module,
             funcs,
             func_q4a,
@@ -585,6 +594,9 @@ impl Backend for CudaBackend {
     }
 
     fn upload(&self, w: &WeightRef, _n_out: usize, _n_in: usize) -> Option<DeviceWeight> {
+        if !self.bind() {
+            return None;
+        }
         let cw = match w {
             WeightRef::Gguf(_) => return None,
             WeightRef::Bf16(w) => CudaWeight {
@@ -648,6 +660,9 @@ impl Backend for CudaBackend {
 
     fn conv2d(&self, x: &[f32], g: &crate::gpu::ConvGeom, norm: Option<&crate::gpu::NormSpec>, job: &mut Job) -> bool {
         use crate::gpu::NormKind;
+        if !self.bind() {
+            return false;
+        }
         if matches!(job.w, WeightRef::Gguf(_)) {
             return false;
         }
@@ -817,6 +832,9 @@ impl Backend for CudaBackend {
         out: &mut [f32],
     ) -> bool {
         let d = heads * dh;
+        if !self.bind() {
+            return false;
+        }
         if q.len() < tq * d || k.len() < tk * d || v.len() < tk * d || out.len() < tq * d || tq == 0 || tk == 0 {
             return false;
         }
@@ -924,6 +942,9 @@ impl Backend for CudaBackend {
     }
 
     fn matmul(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [Job]) -> bool {
+        if !self.bind() {
+            return false;
+        }
         if jobs.is_empty() || !n_in.is_multiple_of(32) || x.len() < t * n_in || jobs.iter().any(|j| matches!(j.w, WeightRef::Gguf(_))) {
             return false;
         }
@@ -1026,5 +1047,569 @@ impl Backend for CudaBackend {
         self.stats.gpu_ns.fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
         self.stats.copy_out_ns.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu::{ConvGeom, NormKind, NormSpec};
+    use crate::kernels;
+    use crate::quant::{Q4Matrix, QMatrix, dequantize_rows_q4, f16_to_f32, from_mlx_q4, mlx_dequant_row, quantize_bf16, quantize_q4};
+
+    /// The backend, or None without an NVIDIA GPU. With one, only a missing NVRTC (a driver without
+    /// the toolkit) may skip: a kernel that fails to compile or load must fail the tests, since
+    /// the backend would otherwise never run anywhere.
+    fn backend() -> Option<CudaBackend> {
+        let plat = crate::platform::detect();
+        let g = plat.gpus.iter().find(|g| g.kind == crate::platform::GpuKind::Cuda)?;
+        match CudaBackend::new(g.index) {
+            Ok(b) => Some(b),
+            Err(e) if e.to_string().starts_with("libnvrtc") => None,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    fn rnd(seed: &mut u64) -> f32 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5
+    }
+    fn bf16(n: usize, seed: &mut u64) -> Vec<u16> {
+        (0..n).map(|_| (rnd(seed).to_bits() >> 16) as u16).collect()
+    }
+    fn f32s(n: usize, seed: &mut u64) -> Vec<f32> {
+        (0..n).map(|_| rnd(seed) * 2.0).collect()
+    }
+    /// Token rows of very different magnitudes.
+    fn input(t: usize, n: usize, seed: &mut u64) -> Vec<f32> {
+        (0..t * n).map(|i| rnd(seed) * [1e-3, 1.0, 300.0, 2e5][(i / n) % 4]).collect()
+    }
+    /// Worst error of any row relative to that row's largest reference value.
+    fn row_err(y: &[f32], r: &[f32], n: usize) -> f32 {
+        assert_eq!(y.len(), r.len());
+        y.chunks(n)
+            .zip(r.chunks(n))
+            .map(|(a, b)| {
+                let m = b.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-30);
+                a.iter().zip(b).fold(0f32, |e, (p, q)| e.max((p - q).abs())) / m
+            })
+            .fold(0f32, f32::max)
+    }
+    /// `[t, n_out]` product with `[n_out, n_in]` f32 weights, exactly (f64).
+    fn gemm_ref(w: &[f32], n_out: usize, n_in: usize, x: &[f32], t: usize) -> Vec<f32> {
+        let mut y = vec![0f32; t * n_out];
+        for i in 0..t {
+            for o in 0..n_out {
+                y[i * n_out + o] = (0..n_in).map(|k| w[o * n_in + k] as f64 * x[i * n_in + k] as f64).sum::<f64>() as f32;
+            }
+        }
+        y
+    }
+    fn dense_bf(w: &[u16]) -> Vec<f32> {
+        w.iter().map(|&b| f32::from_bits((b as u32) << 16)).collect()
+    }
+    fn dense_q8(m: &QMatrix) -> Vec<f32> {
+        let mut f = vec![0f32; m.n_out * m.n_in];
+        for (i, o) in f.iter_mut().enumerate() {
+            let (r, k) = (i / m.n_in, i % m.n_in);
+            *o = m.q[i] as f32 * m.scales[r * (m.n_in / 32) + k / 32];
+        }
+        f
+    }
+    fn dense_q4(m: &Q4Matrix) -> Vec<f32> {
+        let mut f = vec![0f32; m.n_out * m.n_in];
+        dequantize_rows_q4(m, 0, m.n_out, &mut f);
+        f
+    }
+    fn wref<'a>(w: &'a WeightRef<'a>) -> WeightRef<'a> {
+        match w {
+            WeightRef::Bf16(v) => WeightRef::Bf16(v),
+            WeightRef::Q8(m) => WeightRef::Q8(m),
+            WeightRef::Q4(m) => WeightRef::Q4(m),
+            WeightRef::Gguf(m) => WeightRef::Gguf(m),
+        }
+    }
+    fn run_matmul(be: &CudaBackend, w: &WeightRef, n_out: usize, n_in: usize, x: &[f32], t: usize) -> Vec<f32> {
+        let dev = be.upload(w, n_out, n_in).expect("upload");
+        let mut y = vec![f32::NAN; t * n_out];
+        let mut jobs = [Job {
+            w: wref(w),
+            dev: &dev,
+            n_out,
+            y: &mut y,
+        }];
+        assert!(be.matmul(x, t, n_in, &mut jobs), "matmul declined");
+        y
+    }
+    /// An MLX-style affine matrix and its values straight from `w = scale * q + bias`.
+    fn affine(n_out: usize, n_in: usize, group: usize, seed: &mut u64) -> (Q4Matrix, Vec<f32>) {
+        let gpr = n_in / group;
+        let words: Vec<u32> = (0..n_out * n_in / 8)
+            .map(|_| {
+                *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (*seed >> 32) as u32
+            })
+            .collect();
+        let to = |v: f32| half::bf16::from_f32(v).to_bits();
+        let scales: Vec<u16> = (0..n_out * gpr).map(|_| to(0.002 + rnd(seed).abs() * 0.02)).collect();
+        let biases: Vec<u16> = (0..n_out * gpr).map(|_| to(rnd(seed))).collect();
+        let m = from_mlx_q4(&words, &scales, &biases, n_out, n_in, group);
+        let mut f = vec![0f32; n_out * n_in];
+        for r in 0..n_out {
+            let wr = &words[r * n_in / 8..(r + 1) * n_in / 8];
+            mlx_dequant_row(
+                wr,
+                &scales[r * gpr..(r + 1) * gpr],
+                &biases[r * gpr..(r + 1) * gpr],
+                4,
+                group,
+                &mut f[r * n_in..(r + 1) * n_in],
+            );
+        }
+        (m, f)
+    }
+
+    #[test]
+    fn matmul_matches_cpu_and_reference() {
+        let Some(be) = backend() else { return };
+        let (n_out, n_in) = (128, 512);
+        let mut seed = 1;
+        let w = bf16(n_out * n_in, &mut seed);
+        let (q8, q4) = (quantize_bf16(&w, n_out, n_in), quantize_q4(&w, n_out, n_in));
+        let formats = [
+            (WeightRef::Bf16(&w), dense_bf(&w)),
+            (WeightRef::Q8(&q8), dense_q8(&q8)),
+            (WeightRef::Q4(&q4), dense_q4(&q4)),
+        ];
+        // Whole tiles, a partial tile, and fewer tokens than one tile.
+        for t in [64, 150, 37, 1] {
+            let x = input(t, n_in, &mut seed);
+            for (w, dense) in &formats {
+                let y = run_matmul(&be, w, n_out, n_in, &x, t);
+                let e = row_err(&y, &gemm_ref(dense, n_out, n_in, &x, t), n_out);
+                assert!(e < 1e-4, "t {t}: error {e} against the reference");
+                // Below a tile the CPU's quantized kernels are the int8 decode ones, approximate by
+                // design (3e-3 here): the exact reference above is what binds there.
+                if t < 32 {
+                    continue;
+                }
+                let mut c = vec![0f32; t * n_out];
+                match w {
+                    WeightRef::Bf16(v) => kernels::matmul(v, n_out, n_in, &x, t, &mut c),
+                    WeightRef::Q8(m) => kernels::matmul_quant_multi(&mut [(*m, &mut c[..])], &x, t),
+                    WeightRef::Q4(m) => kernels::matmul_quant_multi(&mut [(*m, &mut c[..])], &x, t),
+                    WeightRef::Gguf(_) => unreachable!(),
+                }
+                let e = row_err(&y, &c, n_out);
+                assert!(e < 1e-4, "t {t}: error {e} against the CPU kernels");
+            }
+        }
+    }
+
+    /// Several outputs per input in one submission, of different widths and formats, then a bigger
+    /// batch (the staging buffers grow) and a smaller one again.
+    #[test]
+    fn matmul_batches_and_staging_growth() {
+        let Some(be) = backend() else { return };
+        let n_in = 256;
+        let mut seed = 2;
+        let (a, b) = (bf16(64 * n_in, &mut seed), bf16(192 * n_in, &mut seed));
+        let q4 = quantize_q4(&b, 192, n_in);
+        let (wa, wb) = (WeightRef::Bf16(&a), WeightRef::Q4(&q4));
+        let (da, db) = (be.upload(&wa, 64, n_in).unwrap(), be.upload(&wb, 192, n_in).unwrap());
+        let (ra, rb) = (dense_bf(&a), dense_q4(&q4));
+        for t in [40, 700, 40] {
+            let x = input(t, n_in, &mut seed);
+            let (mut ya, mut yb) = (vec![0f32; t * 64], vec![0f32; t * 192]);
+            let mut jobs = [
+                Job {
+                    w: wref(&wa),
+                    dev: &da,
+                    n_out: 64,
+                    y: &mut ya,
+                },
+                Job {
+                    w: wref(&wb),
+                    dev: &db,
+                    n_out: 192,
+                    y: &mut yb,
+                },
+            ];
+            assert!(be.matmul(&x, t, n_in, &mut jobs));
+            assert!(row_err(&ya, &gemm_ref(&ra, 64, n_in, &x, t), 64) < 1e-4);
+            assert!(row_err(&yb, &gemm_ref(&rb, 192, n_in, &x, t), 192) < 1e-4);
+        }
+    }
+
+    #[test]
+    fn affine_q4_matmul_matches_mlx_definition() {
+        let Some(be) = backend() else { return };
+        let (n_out, n_in) = (128, 512);
+        let mut seed = 3;
+        // MLX's group of 64, and groups of one block and of the whole row.
+        for group in [64, 32, 512] {
+            let (m, truth) = affine(n_out, n_in, group, &mut seed);
+            assert!(m.offsets.is_some());
+            for t in [64, 150, 37] {
+                let x = input(t, n_in, &mut seed);
+                let y = run_matmul(&be, &WeightRef::Q4(&m), n_out, n_in, &x, t);
+                // The offset and the f16 scale are rounded from the definition's values.
+                let e = row_err(&y, &gemm_ref(&dense_q4(&m), n_out, n_in, &x, t), n_out);
+                assert!(e < 1e-4, "group {group} t {t}: error {e} against the dequantized matrix");
+                let e = row_err(&y, &gemm_ref(&truth, n_out, n_in, &x, t), n_out);
+                assert!(e < 2e-2, "group {group} t {t}: error {e} against w = scale * q + bias");
+                let mut c = vec![0f32; t * n_out];
+                kernels::matmul_quant_multi(&mut [(&m, &mut c[..])], &x, t);
+                let e = row_err(&y, &c, n_out);
+                assert!(e < 1e-4, "group {group} t {t}: error {e} against the CPU kernels");
+            }
+        }
+    }
+
+    fn qbuf<T: Copy>(v: &[T]) -> crate::quant::QBuf<T> {
+        let mut p = crate::quant::PageVec::<T>::zeroed(v.len());
+        // SAFETY: `p` holds `v.len()` elements.
+        unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), p.as_mut_ptr(), v.len()) };
+        p.into()
+    }
+
+    /// The kernels' hand-written f16 decoding, on every finite f16 scale (subnormals included).
+    #[test]
+    fn q4_scales_decode_every_finite_f16() {
+        let Some(be) = backend() else { return };
+        let (n_out, n_in) = (65536, 32);
+        let f16s: Vec<u16> = (0..=u16::MAX).map(|h| if (h >> 10) & 31 == 31 { 0 } else { h }).collect();
+        // Element 0 is +1 (low nibble 9), the rest 0 (nibble 8).
+        let mut q = vec![0x88u8; n_out * n_in / 2];
+        q.iter_mut().step_by(n_in / 2).for_each(|b| *b = 0x89);
+        let m = Q4Matrix {
+            q: qbuf(&q),
+            scales: qbuf(&f16s),
+            n_out,
+            n_in,
+            offsets: None,
+        };
+        let t = 64;
+        let mut x = vec![0f32; t * n_in];
+        x.chunks_mut(n_in).for_each(|r| r[0] = 1.0);
+        let y = run_matmul(&be, &WeightRef::Q4(&m), n_out, n_in, &x, t);
+        for (i, &h) in f16s.iter().enumerate() {
+            assert_eq!(y[i], f16_to_f32(h), "f16 bits {h:#06x}");
+        }
+    }
+
+    /// The input after an optional normalization, from its definition.
+    fn normalized(x: &[f32], npx: usize, c: usize, n: Option<&NormSpec>) -> Vec<f32> {
+        let Some(n) = n else { return x[..npx * c].to_vec() };
+        let mut o = vec![0f32; npx * c];
+        let stats = |vals: &mut dyn Iterator<Item = f32>| {
+            let v: Vec<f64> = vals.map(|a| a as f64).collect();
+            let mean = v.iter().sum::<f64>() / v.len() as f64;
+            let var = v.iter().map(|a| (a - mean) * (a - mean)).sum::<f64>() / v.len() as f64;
+            (mean, 1.0 / (var + n.eps as f64).sqrt())
+        };
+        let mut apply = |p: usize, ch: usize, (mean, inv): (f64, f64)| {
+            let v = (x[p * c + ch] as f64 - mean) * inv * n.gamma[ch] as f64 + n.beta[ch] as f64;
+            o[p * c + ch] = (if n.silu { v / (1.0 + (-v).exp()) } else { v }) as f32;
+        };
+        match n.kind {
+            NormKind::Group(g) => {
+                let cpg = c / g;
+                for gi in 0..g {
+                    let s = stats(&mut (0..npx).flat_map(|p| (gi * cpg..(gi + 1) * cpg).map(move |ch| x[p * c + ch])));
+                    for p in 0..npx {
+                        for ch in gi * cpg..(gi + 1) * cpg {
+                            apply(p, ch, s);
+                        }
+                    }
+                }
+            }
+            NormKind::Layer => {
+                for p in 0..npx {
+                    let s = stats(&mut (0..c).map(|ch| x[p * c + ch]));
+                    for ch in 0..c {
+                        apply(p, ch, s);
+                    }
+                }
+            }
+        }
+        o
+    }
+    /// The convolution from its definition: weights `[n_out][ky][kx][cin]`, zeros outside the image.
+    fn conv_ref(w: &[f32], n_out: usize, x: &[f32], g: &ConvGeom) -> Vec<f32> {
+        let n_in = g.k * g.k * g.cin;
+        let mut y = vec![0f32; g.oh * g.ow * n_out];
+        for oy in 0..g.oh {
+            for ox in 0..g.ow {
+                for o in 0..n_out {
+                    let mut s = 0f64;
+                    for ky in 0..g.k {
+                        for kx in 0..g.k {
+                            let iy = (oy * g.stride + ky) as isize - g.pad as isize;
+                            let ix = (ox * g.stride + kx) as isize - g.pad as isize;
+                            if iy < 0 || ix < 0 || iy >= g.h as isize || ix >= g.w as isize {
+                                continue;
+                            }
+                            for ci in 0..g.cin {
+                                let wv = w[o * n_in + (ky * g.k + kx) * g.cin + ci];
+                                s += wv as f64 * x[(iy as usize * g.w + ix as usize) * g.cin + ci] as f64;
+                            }
+                        }
+                    }
+                    y[(oy * g.ow + ox) * n_out + o] = s as f32;
+                }
+            }
+        }
+        y
+    }
+
+    #[test]
+    fn conv2d_matches_definition() {
+        let Some(be) = backend() else { return };
+        let mut seed = 4;
+        let geo = |h, w, cin, k, stride, pad, oh, ow| ConvGeom {
+            h,
+            w,
+            cin,
+            k,
+            stride,
+            pad,
+            oh,
+            ow,
+        };
+        let cases = [
+            geo(20, 30, 32, 3, 1, 1, 20, 30), // "same"
+            geo(20, 30, 64, 3, 2, 0, 10, 15), // stride 2, the zero padding after only (VAE encoder)
+            geo(21, 31, 32, 3, 2, 1, 11, 16), // stride 2, padded on both sides, partial tile
+            geo(16, 16, 64, 1, 1, 0, 16, 16), // 1x1
+            geo(100, 1, 64, 1, 1, 0, 100, 1), // a linear layer as a convolution
+            geo(9, 7, 32, 5, 1, 2, 9, 7),     // fewer pixels than one tile, wide kernel
+        ];
+        for g in cases {
+            let (n_out, npx, n_in) = (64, g.h * g.w, g.k * g.k * g.cin);
+            let x = f32s(npx * g.cin, &mut seed);
+            let gamma: Vec<f32> = (0..g.cin).map(|_| 1.0 + rnd(&mut seed)).collect();
+            let beta: Vec<f32> = (0..g.cin).map(|_| rnd(&mut seed)).collect();
+            let gamma1 = vec![1f32; g.cin];
+            let beta0 = vec![0f32; g.cin];
+            let group = |silu| NormSpec {
+                kind: NormKind::Group(8),
+                eps: 1e-6,
+                gamma: &gamma,
+                beta: &beta,
+                silu,
+            };
+            let layer = |silu| NormSpec {
+                kind: NormKind::Layer,
+                eps: 1e-6,
+                gamma: &gamma,
+                beta: &beta,
+                silu,
+            };
+            let plain_scale = NormSpec {
+                kind: NormKind::Group(1),
+                eps: 1e-5,
+                gamma: &gamma1,
+                beta: &beta0,
+                silu: false,
+            };
+            let norms = [
+                None,
+                Some(group(false)),
+                Some(group(true)),
+                Some(layer(false)),
+                Some(layer(true)),
+                Some(plain_scale),
+            ];
+            let w = bf16(n_out * n_in, &mut seed);
+            let (q8, q4) = (quantize_bf16(&w, n_out, n_in), quantize_q4(&w, n_out, n_in));
+            let formats = [
+                (WeightRef::Bf16(&w), dense_bf(&w)),
+                (WeightRef::Q8(&q8), dense_q8(&q8)),
+                (WeightRef::Q4(&q4), dense_q4(&q4)),
+            ];
+            for (wr, dense) in &formats {
+                let dev = be.upload(wr, n_out, n_in).unwrap();
+                for n in &norms {
+                    let mut y = vec![f32::NAN; g.oh * g.ow * n_out];
+                    let mut job = Job {
+                        w: wref(wr),
+                        dev: &dev,
+                        n_out,
+                        y: &mut y,
+                    };
+                    assert!(be.conv2d(&x, &g, n.as_ref(), &mut job), "{g:?} declined");
+                    let r = conv_ref(dense, n_out, &normalized(&x, npx, g.cin, n.as_ref()), &g);
+                    let e = row_err(&y, &r, n_out);
+                    assert!(e < 2e-3, "{g:?} norm {:?}: error {e}", n.map(|n| (n.kind, n.silu)));
+                }
+            }
+        }
+    }
+
+    /// Cases the kernels cannot take are declined, so the caller runs the CPU path.
+    #[test]
+    fn conv2d_declines_what_it_cannot_run() {
+        let Some(be) = backend() else { return };
+        let mut seed = 5;
+        let g = ConvGeom {
+            h: 8,
+            w: 8,
+            cin: 32,
+            k: 1,
+            stride: 1,
+            pad: 0,
+            oh: 8,
+            ow: 8,
+        };
+        let x = f32s(64 * 32, &mut seed);
+        let (m, _) = affine(64, 32, 32, &mut seed);
+        let wr = WeightRef::Q4(&m);
+        let dev = be.upload(&wr, 64, 32).unwrap();
+        let mut y = vec![0f32; 64 * 64];
+        let mut job = Job {
+            w: wref(&wr),
+            dev: &dev,
+            n_out: 64,
+            y: &mut y,
+        };
+        assert!(!be.conv2d(&x, &g, None, &mut job), "no affine convolution kernel");
+        // A group count that does not divide the channels.
+        let w = bf16(64 * 32, &mut seed);
+        let wr = WeightRef::Bf16(&w);
+        let dev = be.upload(&wr, 64, 32).unwrap();
+        let mut job = Job {
+            w: wref(&wr),
+            dev: &dev,
+            n_out: 64,
+            y: &mut y,
+        };
+        let (ga, be0) = (vec![1f32; 32], vec![0f32; 32]);
+        let n = NormSpec {
+            kind: NormKind::Group(5),
+            eps: 1e-5,
+            gamma: &ga,
+            beta: &be0,
+            silu: false,
+        };
+        assert!(!be.conv2d(&x, &g, Some(&n), &mut job));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_ref(q: &[f32], k: &[f32], v: &[f32], tq: usize, tk: usize, heads: usize, dh: usize, causal: bool) -> Vec<f32> {
+        let d = heads * dh;
+        let mut o = vec![0f32; tq * d];
+        let scale = 1.0 / (dh as f64).sqrt();
+        for h in 0..heads {
+            for i in 0..tq {
+                let lim = if causal { (i + 1).min(tk) } else { tk };
+                let s: Vec<f64> = (0..lim)
+                    .map(|j| {
+                        (0..dh)
+                            .map(|c| q[i * d + h * dh + c] as f64 * k[j * d + h * dh + c] as f64)
+                            .sum::<f64>()
+                            * scale
+                    })
+                    .collect();
+                let m = s.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let e: Vec<f64> = s.iter().map(|a| (a - m).exp()).collect();
+                let sum: f64 = e.iter().sum();
+                for c in 0..dh {
+                    o[i * d + h * dh + c] = ((0..lim).map(|j| e[j] * v[j * d + h * dh + c] as f64).sum::<f64>() / sum) as f32;
+                }
+            }
+        }
+        o
+    }
+
+    #[test]
+    fn attention_matches_definition() {
+        let Some(be) = backend() else { return };
+        let mut seed = 6;
+        for (tq, tk, heads, dh) in [
+            (100, 100, 8, 64),
+            (64, 64, 4, 128),
+            (70, 130, 3, 40), // dh not a multiple of 32, cross attention
+            (130, 70, 2, 33), // more queries than keys
+            (1, 5, 1, 32),
+            (5, 1, 2, 16),
+            (1024, 1024, 16, 64), // a prefill chunk
+        ] {
+            let d = heads * dh;
+            let (q, k, v) = (f32s(tq * d, &mut seed), f32s(tk * d, &mut seed), f32s(tk * d, &mut seed));
+            for causal in [false, true] {
+                let mut out = vec![f32::NAN; tq * d];
+                assert!(be.attention(&q, &k, &v, tq, tk, heads, dh, causal, &mut out));
+                let r = attention_ref(&q, &k, &v, tq, tk, heads, dh, causal);
+                let e = row_err(&out, &r, d);
+                assert!(e < 1e-3, "{tq}x{tk} {heads}x{dh} causal {causal}: error {e}");
+            }
+        }
+    }
+
+    /// CUDA contexts are per thread: everything must work from a thread other than the one that
+    /// created the backend (a host loading on one thread and generating on another).
+    #[test]
+    fn works_from_another_thread() {
+        let Some(be) = backend() else { return };
+        let be = std::sync::Arc::new(be);
+        let (n_out, n_in, t) = (64, 64, 64);
+        let mut seed = 7;
+        let w = bf16(n_out * n_in, &mut seed);
+        let x = input(t, n_in, &mut seed);
+        let (b2, w2, x2) = (be.clone(), w.clone(), x.clone());
+        let y = std::thread::spawn(move || run_matmul(&b2, &WeightRef::Bf16(&w2), n_out, n_in, &x2, t))
+            .join()
+            .expect("matmul from another thread");
+        assert!(row_err(&y, &gemm_ref(&dense_bf(&w), n_out, n_in, &x, t), n_out) < 1e-4);
+        // Weights uploaded here, used there.
+        let wr = WeightRef::Bf16(&w);
+        let dev = be.upload(&wr, n_out, n_in).unwrap();
+        let (r, b3, x3) = (gemm_ref(&dense_bf(&w), n_out, n_in, &x, t), be.clone(), x.clone());
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let mut y = vec![0f32; t * n_out];
+                let mut jobs = [Job {
+                    w: WeightRef::Bf16(&w),
+                    dev: &dev,
+                    n_out,
+                    y: &mut y,
+                }];
+                assert!(b3.matmul(&x3, t, n_in, &mut jobs));
+                assert!(row_err(&y, &r, n_out) < 1e-4);
+            });
+        });
+    }
+
+    /// One device shared by racing threads: the staging buffers must not mix their work up.
+    #[test]
+    fn concurrent_calls_do_not_mix() {
+        let Some(be) = backend() else { return };
+        let (n_out, n_in, t) = (64, 128, 128);
+        let mut seed = 8;
+        let w = bf16(n_out * n_in, &mut seed);
+        let dense = dense_bf(&w);
+        let wr = WeightRef::Bf16(&w);
+        let dev = be.upload(&wr, n_out, n_in).unwrap();
+        let inputs: Vec<Vec<f32>> = (0..8).map(|_| input(t, n_in, &mut seed)).collect();
+        std::thread::scope(|s| {
+            for x in &inputs {
+                let (be, w, dense, dev) = (&be, &w, &dense, &dev);
+                s.spawn(move || {
+                    let r = gemm_ref(dense, n_out, n_in, x, t);
+                    for _ in 0..8 {
+                        let mut y = vec![0f32; t * n_out];
+                        let mut jobs = [Job {
+                            w: WeightRef::Bf16(w),
+                            dev,
+                            n_out,
+                            y: &mut y,
+                        }];
+                        assert!(be.matmul(x, t, n_in, &mut jobs));
+                        assert!(row_err(&y, &r, n_out) < 1e-4);
+                    }
+                });
+            }
+        });
     }
 }
