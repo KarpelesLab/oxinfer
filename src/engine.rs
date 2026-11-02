@@ -20,11 +20,12 @@
 //! ```
 //!
 //! Supported checkpoints: Gemma 4 and Gemma 3 (text), Qwen3.5 / Qwen3.8 (dense and MoE), Qwen3,
-//! Mistral Large 4 (text; see [`crate::mistral4`]), as safetensors folders (bf16, FP8 blocks,
-//! oxinfer pre-quantized, MLX) or GGUF files (single or split into parts). Speculative
-//! decoding: Qwen's MTP layer ([`EngineOptions::mtp`], optionally from a sidecar checkpoint), a
-//! Gemma 4 assistant model ([`EngineOptions::draft`], greedy) or a Mistral Large 4 DSpark draft
-//! (same option, found beside a GGUF model by default; [`crate::dspark`]). With the `media` feature,
+//! Mistral Large 4 (text; see [`crate::mistral4`]), DeepSeek V4 (text; [`crate::deepseek4`]), as
+//! safetensors folders (bf16, FP8 blocks, oxinfer pre-quantized, MLX) or GGUF files (single or
+//! split into parts). Speculative decoding: Qwen's MTP layer ([`EngineOptions::mtp`], optionally
+//! from a sidecar checkpoint), a Gemma 4 assistant model ([`EngineOptions::draft`], greedy) or a
+//! Mistral Large 4 / DeepSeek V4 DSpark draft (same option, found beside a GGUF model by default;
+//! [`crate::dspark`]). With the `media` feature,
 //! [`Engine::send_with_media`] attaches images, videos and audio (Gemma 4) or images and videos
 //! (Qwen3.5 / 3.6 / 3.8 checkpoints with their vision tower).
 //!
@@ -112,7 +113,7 @@ pub struct EngineOptions {
     /// Key `mtp_fixed`.
     pub mtp_fixed: bool,
     /// Gemma 4: speculative decoding (greedy) with this assistant model (path or repo id).
-    /// Mistral Large 4: speculative decoding (greedy and sampled; same output distribution) with
+    /// Mistral Large 4, DeepSeek V4: speculative decoding (greedy and sampled; same output distribution) with
     /// this DSpark draft GGUF ([`crate::dspark`]), `auto` for the `dspark*.gguf` beside a GGUF
     /// model ([`crate::dspark::draft_for`]; unset: the same when there is one, as
     /// [`crate::dspark::BY_DEFAULT`] says), `none` for none. Key `draft`.
@@ -141,7 +142,7 @@ pub struct EngineOptions {
     /// `expert_predict` (Qwen MoE, Mistral Large 4).
     pub stream: Option<crate::stream::StreamOptions>,
     /// Whether the weights stream (see [`EngineOptions::stream`]): `auto` (default) streams when
-    /// streaming options are set, or a Mistral Large 4 checkpoint larger than 60% of RAM (with
+    /// streaming options are set, or a Mistral Large 4 / DeepSeek V4 checkpoint larger than 60% of RAM (with
     /// [`crate::mistral4::default_stream`]); `on` always; `off` never (an oversized checkpoint is
     /// then plainly memory-mapped and demand-paged). Key `stream` (`auto`, `on` / `1`, `off` /
     /// `0`).
