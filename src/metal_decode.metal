@@ -445,19 +445,13 @@ MV_SIG(NAME) { threadgroup float red[8 * NR * KS]; \
 // (token, row) is computed with exactly the single-token kernel's arithmetic (same chunks per
 // lane, same reduction order), so a verification pass reproduces one-token decoding bit for bit.
 struct MVK { MV m; uint ntok; uint sx; uint sy; uint sgate; };
-// One chunk of one row against every token: a[t][r] += row . x_t over the chunk, with the
-// single-token kernel's arithmetic. The generic version calls `mdot` per token; the 4- and 8-bit
-// formats below convert the chunk's quants to floats once for all the tokens (the conversions do
-// not depend on x, so every product and sum is the one `mdot` computes).
-template <typename X, int TT, int NR, typename F>
-inline void mvk_rows(F f, uint row, int r, uint c, device const float* x, uint sx, uint ntok, thread float (&a)[TT][NR]) {
-    for (int t = 0; t < TT; t++) {
-        if (uint(t) >= ntok) continue;
-        X xr;
-        xload(x + (ulong)t * sx, c, xr);
-        a[t][r] += mdot(f, row, c, xr);
-    }
-}
+// A chunk of one row decoded once for every token: `wdec` converts the quants to floats (they do
+// not depend on x), `wdot` is then `mdot`'s arithmetic on them, product for product. Formats
+// without a decoded form keep the row and call `mdot`.
+struct WRow { uint row; };
+template <typename F> struct WDec { typedef WRow T; };
+template <typename F> inline void wdec(F f, uint row, uint c, thread WRow& w) { w.row = row; }
+template <typename F, typename X> inline float wdot(F f, thread const WRow& w, uint c, thread const X& xr) { return mdot(f, w.row, c, xr); }
 // The masked nibbles of a word as floats (see nib_acc): low nibbles in `l`, high in `h`.
 inline void nib_dec(uint w, thread float4& l, thread float4& h) {
     l = float4(float(w & 0xFu), float(w & 0xF00u), float(w & 0xF0000u), float(w & 0xF000000u));
@@ -468,71 +462,78 @@ inline float q4_dot(thread const float4* nl, thread const float4* nh, thread con
     for (int i = 0; i < 4; i++) { lo += xr.v[i] * nl[i]; hi += xr.v[4 + i] * nh[i]; }
     return dot(lo, NIB_LO) + dot(hi, NIB_HI);
 }
-template <typename X, int TT, int NR>
-inline void mvk_rows(MQ4 f, uint row, int r, uint c, device const float* x, uint sx, uint ntok, thread float (&a)[TT][NR]) {
+struct WQ4 { float4 nl[4]; float4 nh[4]; float d; float o; };
+template <> struct WDec<MQ4> { typedef WQ4 T; };
+inline void wdec(MQ4 f, uint row, uint c, thread WQ4& w) {
     uint4 u = *(device const uint4*)(f.q + (ulong)row * (f.n_in / 2) + c * 16);
-    float d = float(f.s[(ulong)row * (f.n_in / 32) + c]);
-    float o = f.gk != 0 ? as_type<float>(uint(f.o[(ulong)row * f.gpr + c / f.gk]) << 16) : 0.f;
-    float4 nl[4], nh[4];
-    nib_dec(u.x, nl[0], nh[0]);
-    nib_dec(u.y, nl[1], nh[1]);
-    nib_dec(u.z, nl[2], nh[2]);
-    nib_dec(u.w, nl[3], nh[3]);
-    for (int t = 0; t < TT; t++) {
-        if (uint(t) >= ntok) continue;
-        X32 xr;
-        xload(x + (ulong)t * sx, c, xr);
-        float s = d * (q4_dot(nl, nh, xr) - 8.f * xsum32(xr));
-        if (f.gk != 0) s += o * xsum32(xr);
-        a[t][r] += s;
-    }
+    w.d = float(f.s[(ulong)row * (f.n_in / 32) + c]);
+    w.o = f.gk != 0 ? as_type<float>(uint(f.o[(ulong)row * f.gpr + c / f.gk]) << 16) : 0.f;
+    nib_dec(u.x, w.nl[0], w.nh[0]);
+    nib_dec(u.y, w.nl[1], w.nh[1]);
+    nib_dec(u.z, w.nl[2], w.nh[2]);
+    nib_dec(u.w, w.nl[3], w.nh[3]);
 }
-template <typename X, int TT, int NR>
-inline void mvk_rows(MQ4_0 f, uint row, int r, uint c, device const float* x, uint sx, uint ntok, thread float (&a)[TT][NR]) {
+inline float wdot(MQ4 f, thread const WQ4& w, uint c, thread const X32& xr) {
+    float r = w.d * (q4_dot(w.nl, w.nh, xr) - 8.f * xsum32(xr));
+    if (f.gk != 0) r += w.o * xsum32(xr);
+    return r;
+}
+template <> struct WDec<MQ4_0> { typedef WQ4 T; };
+inline void wdec(MQ4_0 f, uint row, uint c, thread WQ4& w) {
     device const ushort* b = (device const ushort*)(f.w + (ulong)row * f.rb + c * 18);
-    float d = float(as_type<half>(b[0]));
-    float4 nl[4], nh[4];
-    nib_dec(ld32u(b + 1), nl[0], nh[0]);
-    nib_dec(ld32u(b + 3), nl[1], nh[1]);
-    nib_dec(ld32u(b + 5), nl[2], nh[2]);
-    nib_dec(ld32u(b + 7), nl[3], nh[3]);
-    for (int t = 0; t < TT; t++) {
-        if (uint(t) >= ntok) continue;
-        X32 xr;
-        xload(x + (ulong)t * sx, c, xr);
-        a[t][r] += d * (q4_dot(nl, nh, xr) - 8.f * xsum32(xr));
-    }
+    w.d = float(as_type<half>(b[0]));
+    w.o = 0.f;
+    nib_dec(ld32u(b + 1), w.nl[0], w.nh[0]);
+    nib_dec(ld32u(b + 3), w.nl[1], w.nh[1]);
+    nib_dec(ld32u(b + 5), w.nl[2], w.nh[2]);
+    nib_dec(ld32u(b + 7), w.nl[3], w.nh[3]);
 }
-template <typename X, int TT, int NR>
-inline void mvk_rows(MQ8 f, uint row, int r, uint c, device const float* x, uint sx, uint ntok, thread float (&a)[TT][NR]) {
+inline float wdot(MQ4_0 f, thread const WQ4& w, uint c, thread const X32& xr) { return w.d * (q4_dot(w.nl, w.nh, xr) - 8.f * xsum32(xr)); }
+struct WF16 { float4 w[4]; };
+template <> struct WDec<MBf> { typedef WF16 T; };
+inline void wdec(MBf f, uint row, uint c, thread WF16& w) {
+    device const packed_ushort4* p = (device const packed_ushort4*)(f.w + (ulong)row * f.rb + c * 32);
+    for (int i = 0; i < 4; i++) w.w[i] = bf4(p[i]);
+}
+template <> struct WDec<MF16> { typedef WF16 T; };
+inline void wdec(MF16 f, uint row, uint c, thread WF16& w) {
+    device const packed_half4* p = (device const packed_half4*)(f.w + (ulong)row * f.rb + c * 32);
+    for (int i = 0; i < 4; i++) w.w[i] = float4(half4(p[i]));
+}
+template <typename F>
+inline float wdot(F f, thread const WF16& w, uint c, thread const X16& xr) {
+    float4 a = w.w[0] * xr.v[0];
+    a = fma(w.w[1], xr.v[1], a);
+    a = fma(w.w[2], xr.v[2], a);
+    a = fma(w.w[3], xr.v[3], a);
+    return hsum(a);
+}
+struct WQ8 { float4 w[4]; float d; };
+template <> struct WDec<MQ8> { typedef WQ8 T; };
+inline void wdec(MQ8 f, uint row, uint c, thread WQ8& w) {
     uint4 u = *(device const uint4*)(f.q + (ulong)row * f.n_in + c * 16);
-    float d = f.s[(ulong)row * (f.n_in / 32) + c / 2];
-    float4 w0 = float4(as_type<char4>(u.x)), w1 = float4(as_type<char4>(u.y)), w2 = float4(as_type<char4>(u.z)), w3 = float4(as_type<char4>(u.w));
-    for (int t = 0; t < TT; t++) {
-        if (uint(t) >= ntok) continue;
-        X16 xr;
-        xload(x + (ulong)t * sx, c, xr);
-        float4 s = w0 * xr.v[0];
-        s = fma(w1, xr.v[1], s);
-        s = fma(w2, xr.v[2], s);
-        s = fma(w3, xr.v[3], s);
-        a[t][r] += d * hsum(s);
-    }
+    w.d = f.s[(ulong)row * (f.n_in / 32) + c / 2];
+    w.w[0] = float4(as_type<char4>(u.x)); w.w[1] = float4(as_type<char4>(u.y));
+    w.w[2] = float4(as_type<char4>(u.z)); w.w[3] = float4(as_type<char4>(u.w));
 }
-template <typename X, int TT, int NR>
-inline void mvk_rows(MQ8_0 f, uint row, int r, uint c, device const float* x, uint sx, uint ntok, thread float (&a)[TT][NR]) {
+inline float wdot(MQ8 f, thread const WQ8& w, uint c, thread const X16& xr) {
+    float4 a = w.w[0] * xr.v[0];
+    a = fma(w.w[1], xr.v[1], a);
+    a = fma(w.w[2], xr.v[2], a);
+    a = fma(w.w[3], xr.v[3], a);
+    return w.d * hsum(a);
+}
+struct WQ80 { float4 w[8]; float d; };
+template <> struct WDec<MQ8_0> { typedef WQ80 T; };
+inline void wdec(MQ8_0 f, uint row, uint c, thread WQ80& w) {
     device const ushort* b = (device const ushort*)(f.w + (ulong)row * f.rb + c * 34);
-    float d = float(as_type<half>(b[0]));
-    float4 w[8];
-    for (int i = 0; i < 8; i++) w[i] = c4(b[1 + 2 * i], b[2 + 2 * i]);
-    for (int t = 0; t < TT; t++) {
-        if (uint(t) >= ntok) continue;
-        X32 xr;
-        xload(x + (ulong)t * sx, c, xr);
-        float4 s = w[0] * xr.v[0];
-        for (int i = 1; i < 8; i++) s = fma(w[i], xr.v[i], s);
-        a[t][r] += d * hsum(s);
-    }
+    w.d = float(as_type<half>(b[0]));
+    for (int i = 0; i < 8; i++) w.w[i] = c4(b[1 + 2 * i], b[2 + 2 * i]);
+}
+inline float wdot(MQ8_0 f, thread const WQ80& w, uint c, thread const X32& xr) {
+    float4 a = w.w[0] * xr.v[0];
+    for (int i = 1; i < 8; i++) a = fma(w.w[i], xr.v[i], a);
+    return w.d * hsum(a);
 }
 template <int NR, int KS>
 inline void mvk_finish(thread float* acc, thread float* acc2, device float* y, uint mode, uint r0, uint n_out, uint sg, uint lane,
@@ -574,20 +575,43 @@ inline void mvk_body(F f, F f2, device const float* x, device float* y, constant
     uint rows[NR];
     for (int r = 0; r < NR; r++) rows[r] = min(r0 + r, p.n_out - 1);
     uint nch = p.n_in / CH;
-    float a[TT][NR], b[TT][NR];
-    for (int t = 0; t < TT; t++)
-        for (int r = 0; r < NR; r++) { a[t][r] = 0.f; b[t][r] = 0.f; }
-    for (uint c = sg * 32 + lane; c < nch; c += KS * 32) {
-        for (int r = 0; r < NR; r++) {
-            mvk_rows<X, TT, NR>(f, rows[r], r, c, x, q.sx, q.ntok, a);
-            if (pair) mvk_rows<X, TT, NR>(f2, rows[r], r, c, x, q.sx, q.ntok, b);
+    // The tokens in groups of G, a sweep over the rows each (the next sweep finds the rows' weights
+    // in the cache). Per chunk, the NR rows' quants are decoded once (`wdec`), then every token's
+    // x is loaded once and dotted with each row (`wdot`, the single-token kernel's arithmetic);
+    // a pair's second matrix follows the same way.
+    const int G = TT < MVK_GROUP ? TT : MVK_GROUP;
+    for (uint t0 = 0; t0 < q.ntok; t0 += G) {
+        const uint nt = min(q.ntok - t0, uint(G));
+        device const float* xg = x + (ulong)t0 * q.sx;
+        float a[G][NR], b[G][NR];
+        for (int t = 0; t < G; t++)
+            for (int r = 0; r < NR; r++) { a[t][r] = 0.f; b[t][r] = 0.f; }
+        for (uint c = sg * 32 + lane; c < nch; c += KS * 32) {
+            typename WDec<F>::T w[NR];
+            for (int r = 0; r < NR; r++) wdec(f, rows[r], c, w[r]);
+            for (int t = 0; t < G; t++) {
+                if (uint(t) >= nt) continue;
+                X xr;
+                xload(xg + (ulong)t * q.sx, c, xr);
+                for (int r = 0; r < NR; r++) a[t][r] += wdot(f, w[r], c, xr);
+            }
+            if (pair) {
+                for (int r = 0; r < NR; r++) wdec(f2, rows[r], c, w[r]);
+                for (int t = 0; t < G; t++) {
+                    if (uint(t) >= nt) continue;
+                    X xr;
+                    xload(xg + (ulong)t * q.sx, c, xr);
+                    for (int r = 0; r < NR; r++) b[t][r] += wdot(f2, w[r], c, xr);
+                }
+            }
         }
-    }
-    for (int t = 0; t < TT; t++) {
-        if (uint(t) >= q.ntok) break;
-        float acc[NR], acc2[NR];
-        for (int r = 0; r < NR; r++) { acc[r] = 0.f; acc2[r] = 0.f; acc[r] += 1.f * a[t][r]; acc2[r] += 1.f * b[t][r]; }
-        mvk_finish<NR, KS>(acc, acc2, y + (ulong)t * q.sy, p.mode, r0, p.n_out, sg, lane, red, gate + (ulong)t * q.sgate);
+        for (int t = 0; t < G; t++) {
+            if (uint(t) >= nt) break;
+            float acc[NR], acc2[NR];
+            for (int r = 0; r < NR; r++) { acc[r] = 0.f; acc2[r] = 0.f; acc[r] += 1.f * a[t][r]; acc2[r] += 1.f * b[t][r]; }
+            uint tt = t0 + t;
+            mvk_finish<NR, KS>(acc, acc2, y + (ulong)tt * q.sy, p.mode, r0, p.n_out, sg, lane, red, gate + (ulong)tt * q.sgate);
+        }
     }
 }
 #define MVK_SIG(NAME) \

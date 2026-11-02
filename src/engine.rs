@@ -110,18 +110,21 @@ pub struct EngineOptions {
     /// (path or repo id), e.g. the original one for a converted copy. Key `mtp_from`.
     pub mtp_from: Option<String>,
     /// With `mtp`, always draft `draft_tokens` (default: adaptive between 1 and that); with a
-    /// Qwen or Gemma 4 DSpark draft, likewise (default: the length, no draft included, measured
-    /// fastest, except when the model streams). Key `mtp_fixed` (or `draft_fixed`).
+    /// Qwen or Gemma 4 DSpark draft, likewise (default: a draft pass or a plain step, whichever
+    /// has measured faster lately, and the most profitable part of the block verified, see
+    /// [`crate::dspark::Adaptive`]; fixed when the model streams). Key `mtp_fixed` (or
+    /// `draft_fixed`).
     pub mtp_fixed: bool,
     /// Gemma 4: speculative decoding (greedy) with this assistant model (path or repo id).
     /// Mistral Large 4, DeepSeek V4, Qwen3, Qwen3.5 / 3.8, Gemma 4: speculative decoding (greedy
     /// and sampled; same output distribution) with this DSpark draft ([`crate::dspark`]: a
-    /// `dflash` GGUF or a Hugging Face draft folder, path or repo id), `auto` for the one beside
-    /// the model ([`crate::dspark::draft_for`]: a `dspark*.gguf` beside a GGUF model, a
-    /// `dspark*` draft inside a model folder, or a known draft of this model in the download
-    /// cache); unset: the one beside the model where it is a default
-    /// ([`crate::dspark::default_draft`], when [`crate::dspark::BY_DEFAULT`]); `none` for none.
-    /// Key `draft`.
+    /// `dflash` / `dspark` GGUF, a Hugging Face draft folder, or a path or repo id holding one),
+    /// `auto` for the one beside the model or in the download cache
+    /// ([`crate::dspark::draft_for`]: a `dspark*.gguf` beside a GGUF model, a `dspark*` draft
+    /// inside a model folder, or a [`crate::dspark::KNOWN`] draft of this model), else fetched
+    /// ([`crate::dspark::auto_repo`], with the `hf` feature); unset: one found that way that is a
+    /// default ([`crate::dspark::default_draft`], when [`crate::dspark::BY_DEFAULT`]; nothing is
+    /// fetched); `none` for none. Key `draft`.
     pub draft: Option<String>,
     /// Maximum draft tokens per round (default 3 for MTP and DSpark, 6 for a drafter; DSpark
     /// at most its block). Key `draft_tokens`.
@@ -1035,11 +1038,12 @@ impl Engine {
             .as_deref()
             .map(|s| resolve_model(s, opts.cache_dir.as_deref()))
             .transpose()?;
+        // A draft repository holding several GGUF quantizations: its Q8_0 draft.
         let draft_dir = opts
             .draft
             .as_deref()
             .filter(|s| *s != "none" && *s != "auto")
-            .map(|s| resolve_model(s, opts.cache_dir.as_deref()))
+            .map(|s| resolve_model(s, opts.cache_dir.as_deref()).map(|d| crate::dspark::draft_in(&d).unwrap_or(d)))
             .transpose()?;
         if is_coreml_dir(&dir) {
             if opts.decision_from.is_some() {
@@ -1110,7 +1114,7 @@ impl Engine {
         // for none; unset, the one beside the model where it measured faster
         // (`dspark::default_draft`).
         let dspark = match (opts.draft.as_deref(), &draft_dir) {
-            (Some("auto"), _) => Some(crate::dspark::draft_for(&dir).context("draft=auto: no DSpark draft beside the model")?),
+            (Some("auto"), _) => Some(resolve_auto_draft(&dir, opts.cache_dir.as_deref())?),
             (_, Some(d)) if dspark_given => Some(d.clone()),
             (None, None) if !mtp && crate::dspark::BY_DEFAULT => crate::dspark::default_draft(&dir),
             _ => None,
@@ -1118,8 +1122,8 @@ impl Engine {
         let dspark_opts = |stop: Vec<u32>, streaming: bool| DsparkOptions {
             draft_tokens: opts.draft_tokens.unwrap_or(usize::MAX),
             stop,
-            // The length adapts (no draft included) unless fixed or streaming (where the
-            // cutoff p_min decides).
+            // Cost-aware (a draft or a plain step per round, the verified length) unless fixed or
+            // streaming (where the cutoff p_min decides).
             cost_aware: !opts.mtp_fixed && !streaming,
             p_min: opts
                 .draft_p_min
@@ -1190,7 +1194,7 @@ impl Engine {
                 );
                 let lm = match &dspark {
                     Some(d) if drafter.is_none() => {
-                        let dr = load_dspark(&mut arena, d, model.cfg.hidden_size, model.cfg.vocab_size, opts.quant)?;
+                        let dr = load_dspark(&mut arena, d, model.cfg.hidden_size, model.cfg.vocab_size, model.quant)?;
                         let dopts = dspark_opts(chat::with_turn_end(fmt, &tok, eos.clone()), streamer.is_some());
                         Lm::GemmaDspark {
                             dec: Box::new(DsparkDecoder::new(model, dr, dopts)),
@@ -1269,7 +1273,7 @@ impl Engine {
                     }
                     None => match &dspark {
                         Some(d) => {
-                            let dr = load_dspark(&mut arena, d, model.cfg.hidden_size, model.cfg.vocab_size, opts.quant)?;
+                            let dr = load_dspark(&mut arena, d, model.cfg.hidden_size, model.cfg.vocab_size, model.quant)?;
                             let dopts = dspark_opts(chat::with_turn_end(fmt, &tok, eos.clone()), streamer.is_some());
                             Lm::QwenDspark {
                                 dec: Box::new(DsparkDecoder::new(model, dr, dopts)),
@@ -1304,7 +1308,7 @@ impl Engine {
                 // DSpark: the given draft, `auto` for the one beside a GGUF model (also the
                 // default when `dspark::BY_DEFAULT`), `none` for none.
                 let dspark = match (opts.draft.as_deref(), &draft_dir) {
-                    (Some("auto"), _) => Some(crate::dspark::draft_for(&dir).context("draft=auto: no dspark*.gguf beside the model")?),
+                    (Some("auto"), _) => Some(resolve_auto_draft(&dir, opts.cache_dir.as_deref())?),
                     (_, Some(d)) => Some(d.clone()),
                     (None, None) if crate::dspark::BY_DEFAULT => crate::dspark::default_draft(&dir),
                     _ => None,
@@ -1365,7 +1369,7 @@ impl Engine {
                 // DSpark as for Mistral Large 4: the given draft, `auto` / the default for the one
                 // beside a GGUF model, `none` for none.
                 let dspark = match (opts.draft.as_deref(), &draft_dir) {
-                    (Some("auto"), _) => Some(crate::dspark::draft_for(&dir).context("draft=auto: no dspark*.gguf beside the model")?),
+                    (Some("auto"), _) => Some(resolve_auto_draft(&dir, opts.cache_dir.as_deref())?),
                     (_, Some(d)) => Some(d.clone()),
                     (None, None) if crate::dspark::BY_DEFAULT => crate::dspark::default_draft(&dir),
                     _ => None,
@@ -2421,6 +2425,18 @@ fn is_coreml_dir(dir: &Path) -> bool {
 /// Resolves a model spec to a local checkpoint: a directory or GGUF file, or (with the `hf`
 /// feature) a repo id (`org/name`, `org/name:QUANT`) fetched into `cache_dir` (default
 /// [`crate::hf::cache_root`]).
+/// `draft=auto` (CLI `--draft auto`): the DSpark draft beside the model or in the download cache
+/// ([`crate::dspark::draft_for`]), else (with the `hf` feature) the model's known draft fetched
+/// into the cache ([`crate::dspark::auto_repo`]).
+pub fn resolve_auto_draft(model: &Path, cache_dir: Option<&Path>) -> Result<PathBuf> {
+    if let Some(p) = crate::dspark::draft_for(model) {
+        return Ok(p);
+    }
+    let repo = crate::dspark::auto_repo(model).context("draft=auto: no DSpark draft beside the model, and none known for it")?;
+    let dir = resolve_model(repo, cache_dir)?;
+    crate::dspark::draft_in(&dir).with_context(|| format!("{repo}: no DSpark draft in {}", dir.display()))
+}
+
 pub fn resolve_model(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
     // A folder holding one GGUF model (a single file or the parts of a split one): its first file.
     if let Some(f) = crate::gguf::model_in_dir(Path::new(spec)) {

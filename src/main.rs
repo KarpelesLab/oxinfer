@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use oxinfer::chat::{self, ChatFormat};
-use oxinfer::engine::{load_tokenizer, resolve_file, resolve_model, save_quantized};
+use oxinfer::engine::{load_tokenizer, resolve_auto_draft, resolve_file, resolve_model, save_quantized};
 use oxinfer::generate::{self, Flow, SpecStats, TextLm, TextStream};
 use oxinfer::model::{Model, Quant, Session};
 use oxinfer::sampler::Sampler;
@@ -192,9 +192,11 @@ fn usage() -> ! {
          \x20 --prefill-chunk N    tokens per prefill chunk (default 256 on CPU, 1024 with a GPU backend)\n\
          \x20 --draft DIR          speculative decoding with a DSpark draft (Qwen, Gemma 4, Mistral Large 4,\n\
          \x20                      DeepSeek V4: a Hugging Face draft folder / repo id or a dflash GGUF; greedy\n\
-         \x20                      and sampled, same output distribution; `auto`: the one beside the model,\n\
-         \x20                      see the README) or a Gemma 4 assistant (drafter) model (greedy only)\n\
-         \x20 --no-draft           no DSpark draft (one beside the model is used by default where faster)\n\
+         \x20                      and sampled, same output distribution; `auto`: the one beside the model or\n\
+         \x20                      in the download cache, else the model's known draft fetched; see the\n\
+         \x20                      README) or a Gemma 4 assistant (drafter) model (greedy only)\n\
+         \x20 --no-draft           no DSpark draft (one beside the model or in the download cache is used by\n\
+         \x20                      default where it measured faster)\n\
          \x20 --draft-tokens N     max draft tokens per round (default 6 with a drafter, adaptive from 3;\n\
          \x20                      3 with --mtp, 8 with --mtp --stream; DSpark: Mistral Large 4 / DeepSeek V4\n\
          \x20                      3, Qwen / Gemma 4 the whole block)\n\
@@ -203,8 +205,9 @@ fn usage() -> ! {
          \x20                      less than probability P (default 0.85 when the model streams, else 0)\n\
          \x20 --draft-device D     DSpark: auto (default: the GPU when there is one) | gpu | cpu, where the\n\
          \x20                      draft's matmuls run\n\
-         \x20 --spec-draft-fixed   DSpark (Qwen, Gemma 4): always draft --draft-tokens (default: the length,\n\
-         \x20                      no draft included, that measures fastest; fixed when streaming)\n\
+         \x20 --spec-draft-fixed   DSpark (Qwen, Gemma 4): always draft and verify --draft-tokens (default:\n\
+         \x20                      a draft or a plain step, whichever measures faster, and the most\n\
+         \x20                      profitable part of each block verified; fixed when streaming)\n\
          \x20 --spec-draft-conf-min C  DSpark: cut a block before the first draft whose confidence-head\n\
          \x20                      estimate of being accepted is below C (default 0: off)\n\
          \x20 --mtp                Qwen3.5/3.8: speculative decoding with the checkpoint's multi-token\n\
@@ -883,7 +886,9 @@ fn main() -> Result<()> {
         && d.as_os_str() != "auto"
     {
         let spec = d.to_string_lossy().to_string();
-        args.draft = Some(resolve_model(&spec, args.cache_dir.as_deref())?);
+        let d = resolve_model(&spec, args.cache_dir.as_deref())?;
+        // A draft repository holding several GGUF quantizations: its Q8_0 draft.
+        args.draft = Some(oxinfer::dspark::draft_in(&d).unwrap_or(d));
     }
     if let Some(d) = &args.mtp_from {
         let spec = d.to_string_lossy().to_string();
@@ -1620,7 +1625,7 @@ fn run_qwen(args: Args) -> Result<()> {
         None => None,
     };
     let draft = match &draft_files {
-        Some((d, f)) => Some(load_dspark(d, f, model.cfg.hidden_size, model.cfg.vocab_size, args.quant)?),
+        Some((d, f)) => Some(load_dspark(d, f, model.cfg.hidden_size, model.cfg.vocab_size, model.quant)?),
         None => None,
     };
     let r = match (&mtp, &draft) {
@@ -1654,7 +1659,7 @@ fn run_mistral4(mut args: Args) -> Result<()> {
     let beside = oxinfer::dspark::draft_for(&args.model);
     let plain_only = args.tools || args.dump_logits.is_some() || args.print_prompt || iv_requested(&args.iv);
     let draft = match &args.draft {
-        Some(d) if d.as_os_str() == "auto" => Some(beside.clone().context("--draft auto: no dspark*.gguf beside the model")?),
+        Some(d) if d.as_os_str() == "auto" => Some(resolve_auto_draft(&args.model, args.cache_dir.as_deref())?),
         Some(d) if !oxinfer::dspark::is_draft(d) => bail!("{}: not a DSpark (dflash) draft GGUF", d.display()),
         Some(d) => Some(d.clone()),
         None if oxinfer::dspark::BY_DEFAULT && !args.no_draft && !plain_only => beside.clone(),
@@ -1775,7 +1780,7 @@ fn run_deepseek4(mut args: Args) -> Result<()> {
     let beside = oxinfer::dspark::draft_for(&args.model);
     let plain_only = args.tools || args.dump_logits.is_some() || args.print_prompt;
     let draft = match &args.draft {
-        Some(d) if d.as_os_str() == "auto" => Some(beside.clone().context("--draft auto: no dspark*.gguf beside the model")?),
+        Some(d) if d.as_os_str() == "auto" => Some(resolve_auto_draft(&args.model, args.cache_dir.as_deref())?),
         Some(d) if !oxinfer::dspark::is_draft(d) => bail!("{}: not a DSpark (dflash) draft GGUF", d.display()),
         Some(d) => Some(d.clone()),
         None if oxinfer::dspark::BY_DEFAULT && !args.no_draft && !plain_only => beside.clone(),
@@ -1878,7 +1883,7 @@ fn pick_dspark(args: &Args) -> Result<Option<PathBuf>> {
     let beside = oxinfer::dspark::draft_for(&args.model);
     let plain_only = args.tools || args.dump_logits.is_some() || args.print_prompt || iv_requested(&args.iv);
     let draft = match &args.draft {
-        Some(d) if d.as_os_str() == "auto" => Some(beside.clone().context("--draft auto: no DSpark draft beside the model")?),
+        Some(d) if d.as_os_str() == "auto" => Some(resolve_auto_draft(&args.model, args.cache_dir.as_deref())?),
         Some(d) if oxinfer::dspark::is_draft(d) => Some(d.clone()),
         Some(_) => None,
         None if oxinfer::dspark::BY_DEFAULT && !args.no_draft && !plain_only => oxinfer::dspark::default_draft(&args.model),
@@ -2250,9 +2255,9 @@ fn run_dspark<M: oxinfer::dspark::Target<Sess: Clone>>(
         let enc = tok.encode(text, false).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
         Ok(enc.get_ids().to_vec())
     };
-    // Qwen / Gemma 4 drafts: the whole block, the length adapting (no draft included) unless
-    // fixed or streaming (where the cutoff p_min decides, see the README). Mistral Large 4 /
-    // DeepSeek V4: 3 drafts.
+    // Qwen / Gemma 4 drafts: the whole block, cost-aware (a draft or a plain step per round, the
+    // verified length) unless fixed or streaming (where the cutoff p_min decides, see the
+    // README). Mistral Large 4 / DeepSeek V4: 3 drafts.
     let gqa = matches!(draft.cfg.backbone, oxinfer::dspark::Backbone::Gqa(_));
     let opts = DsparkOptions {
         draft_tokens: args.draft_tokens.unwrap_or(if gqa { usize::MAX } else { 3 }),
@@ -2442,7 +2447,7 @@ fn run_gemma_loaded(args: &Args, model: &Model, files: &safetensors::ModelFiles,
 
     if let Some(d) = pick_dspark(args)? {
         let f = safetensors::ModelFiles::open(&d, true)?;
-        let dr = load_dspark(&d, &f, model.cfg.hidden_size, model.cfg.vocab_size, args.quant)?;
+        let dr = load_dspark(&d, &f, model.cfg.hidden_size, model.cfg.vocab_size, model.quant)?;
         return run_dspark(
             args,
             model,

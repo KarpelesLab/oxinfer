@@ -175,14 +175,23 @@ fn default_rope(theta: f64) -> crate::config::YarnParams {
 }
 
 impl DsparkConfig {
-    /// A llama.cpp `dflash` GGUF's metadata.
+    /// A llama.cpp `dflash` GGUF's metadata (or a `dspark` one, from llama.cpp's DSpark branch:
+    /// the same keys under `dspark.`, without the Gemma 4 scales, which are then Gemma's).
     pub fn from_header(h: &Header) -> Result<Self> {
-        if h.arch() != "dflash" {
-            bail!("not a DFlash / DSpark draft (GGUF architecture {:?})", h.arch());
+        let arch = h.arch();
+        if !matches!(arch, "dflash" | "dspark") {
+            bail!("not a DFlash / DSpark draft (GGUF architecture {arch:?})");
         }
-        let get = |k: &str| h.get(&format!("dflash.{k}"));
-        let u = |k: &str| get(k).and_then(Value::as_u64).map(|v| v as usize);
-        let need = |k: &str| u(k).with_context(|| format!("DSpark GGUF has no dflash.{k}"));
+        let get = |k: &str| h.get(&format!("{arch}.{k}"));
+        // Per-layer arrays (`head_count_kv` in the DSpark branch's Gemma files) must be uniform.
+        let u = |k: &str| match get(k) {
+            Some(Value::Array(a)) => {
+                let v: Vec<u64> = a.iter().filter_map(Value::as_u64).collect();
+                (v.len() == a.len() && v.first().is_some_and(|f| v.iter().all(|x| x == f))).then(|| v[0] as usize)
+            }
+            v => v.and_then(Value::as_u64).map(|v| v as usize),
+        };
+        let need = |k: &str| u(k).with_context(|| format!("DSpark GGUF has no (uniform) {arch}.{k}"));
         let f = |k: &str| get(k).and_then(Value::as_f64);
         let b = |k: &str| match get(k) {
             Some(Value::Bool(v)) => Some(*v),
@@ -275,20 +284,22 @@ impl DsparkConfig {
                 // llama.cpp: one causal flag for every layer (default non-causal).
                 let causal = vec![b("attention.causal").unwrap_or(false); n_layers];
                 let shared_kv = !h.tensors.iter().any(|t| t.name == "blk.0.attn_v.weight");
-                let gemma = h.tensors.iter().any(|t| t.name == "blk.0.post_attention_norm.weight");
+                // Gemma 4's sandwich norms (the DSpark branch names Qwen's feed-forward input
+                // norm `post_attention_norm` too, so the post-feed-forward norm tells them apart).
+                let gemma = h.tensors.iter().any(|t| t.name == "blk.0.post_ffw_norm.weight");
                 let bb = Backbone::Gqa(GqaConfig {
                     n_kv: need("attention.head_count_kv")?,
                     head_dim: hd,
                     k_eq_v: shared_kv,
-                    v_norm: shared_kv,
+                    v_norm: shared_kv || gemma,
                     sandwich: gemma,
-                    gelu: matches!(
-                        h.get("dflash.hidden_act").and_then(Value::as_str),
-                        Some("gelu" | "gelu_pytorch_tanh")
-                    ),
+                    gelu: match get("hidden_act").and_then(Value::as_str) {
+                        Some(a) => matches!(a, "gelu" | "gelu_pytorch_tanh"),
+                        None => gemma,
+                    },
                     attn_scale: f("attention.scale")
                         .filter(|&s| s != 0.0)
-                        .map_or((hd as f32).powf(-0.5), |s| s as f32),
+                        .map_or(if gemma { 1.0 } else { (hd as f32).powf(-0.5) }, |s| s as f32),
                     rope_dims: rot,
                     rope_proportion: 1.0,
                 });
@@ -302,6 +313,12 @@ impl DsparkConfig {
                     .and_then(Value::as_u64)
                     .context("DSpark GGUF has no tokenizer.ggml.mask_token_id")? as u32,
             ),
+        };
+        // Without `embedding_scale`, a Gemma 4 draft scales its embeddings as its target does.
+        let gemma = matches!(&backbone, Backbone::Gqa(g) if g.sandwich);
+        let embed_scale = match f("embedding_scale").filter(|&s| s != 0.0) {
+            Some(s) => Some(s as f32),
+            None => (!gemma).then_some(1.0),
         };
         let c = Self {
             hidden,
@@ -318,7 +335,7 @@ impl DsparkConfig {
             softcap: f("final_logit_softcapping").filter(|&c| c > 0.0).map(|c| c as f32),
             rope,
             mask,
-            embed_scale: Some(f("embedding_scale").filter(|&s| s != 0.0).unwrap_or(1.0) as f32),
+            embed_scale,
         };
         c.check()?;
         Ok(c)
@@ -749,27 +766,103 @@ pub const STREAM_P_MIN: f32 = 0.85;
 /// Default drafts per round with a DeepSeek V4 draft (its block holds 5): see the README.
 pub const DS4_DRAFT_TOKENS: usize = 3;
 
-/// Published DSpark drafts and their targets (Hugging Face repo ids), found beside a target in
-/// the download cache (`org--name` folders), and whether that pair is used by default (where it
-/// measured faster than plain decoding).
+/// Published DSpark drafts and their targets (Hugging Face repo ids), and whether that pair is
+/// used by default (where it measured faster than plain decoding on average, see the README).
+/// A draft is found in the download cache (`org--name` folders beside the target's), or fetched
+/// by `draft=auto` (CLI `--draft auto`) when it is not there; GGUF draft repositories (llama.cpp
+/// conversions) are found but not fetched.
 pub const KNOWN: &[(&str, &str, bool)] = &[
     ("Qwen/Qwen3-4B", "deepseek-ai/dspark_qwen3_4b_block7", false),
     ("Qwen/Qwen3-8B", "deepseek-ai/dspark_qwen3_8b_block7", false),
+    ("Qwen/Qwen3-8B", "ankk98/dspark-qwen3-8b-block7-Q4_K_M-GGUF", false),
     ("Qwen/Qwen3-14B", "deepseek-ai/dspark_qwen3_14b_block7", false),
+    ("Qwen/Qwen3-14B", "Anbeeld/Qwen3-14B-DSpark-GGUF", false),
     ("Qwen/Qwen3.8-27B", "RadixArk/Qwen3.8-27B-DSpark", false),
     ("Qwen/Qwen3.8-27B", "jialinyyzz/Qwen3.8-27B-DSpark-drafter", false),
     ("Qwen/Qwen3.5-35B-A3B", "jinzex/Qwen3.5-35B-A3B-DSpark", false),
     ("google/gemma-4-12B-it", "deepseek-ai/dspark_gemma4_12b_block7", false),
+    ("google/gemma-4-12B-it", "ankk98/dspark-gemma4-12b-block7-Q4_0-GGUF", false),
     ("google/gemma-4-31B-it", "RedHatAI/gemma-4-31B-it-speculator.dspark", false),
     ("google/gemma-4-31B-it", "Hikari07jp/DSpark-Gemma-4-31B-draft", false),
 ];
 
-/// The DSpark draft beside model `model`, and whether it is a default one: a `dspark*.gguf`
-/// file in a GGUF model's folder or the folder above (as unsloth lays them out; a default for
-/// the Mistral Large 4 and DeepSeek V4 drafts, see the README), a `dspark*` draft folder
-/// or GGUF inside a model folder, or a [`KNOWN`] draft of this target in the folder holding it
-/// (the download cache).
+/// Whether a `-`-separated part of a GGUF file name is its quantization (`Q8_0`, `IQ4_XS`,
+/// `BF16`, unsloth's `UD-...`).
+fn is_quant_tag(p: &str) -> bool {
+    let u = p.to_ascii_uppercase();
+    let digit_at = |i: usize| u.as_bytes().get(i).is_some_and(u8::is_ascii_digit);
+    matches!(u.as_str(), "UD" | "BF16" | "F16" | "F32") || (u.starts_with("IQ") && digit_at(2)) || (u.starts_with('Q') && digit_at(1))
+}
+
+/// The names (without the organization) the model at `model` may have on Hugging Face: its
+/// folder's (`org--name` in the download cache, a converted copy's `name-oxinfer-q4`, a GGUF
+/// repository's `name-GGUF`) and, for a GGUF file, its file name up to the quantization.
+fn model_names(model: &Path) -> Vec<String> {
+    let gguf = crate::gguf::is_gguf(model);
+    let mut v = Vec::new();
+    let folder = if gguf { model.parent() } else { Some(model) };
+    if let Some(n) = folder.and_then(Path::file_name).and_then(|n| n.to_str()) {
+        let n = n.rsplit("--").next().unwrap_or(n);
+        let n = ["-oxinfer-q4", "-oxinfer-q8", "-GGUF", "-gguf"]
+            .iter()
+            .fold(n, |n, s| n.strip_suffix(s).unwrap_or(n));
+        v.push(n.to_string());
+    }
+    if gguf && let Some(stem) = model.file_stem().and_then(|s| s.to_str()) {
+        let parts: Vec<&str> = stem.split('-').collect();
+        if let Some(i) = parts.iter().position(|p| is_quant_tag(p)).filter(|&i| i > 0) {
+            v.push(parts[..i].join("-"));
+        }
+    }
+    v
+}
+
+/// The [`KNOWN`] drafts of the model at `model` (repo id, used by default), the default ones
+/// first.
+pub fn known_drafts(model: &Path) -> Vec<(&'static str, bool)> {
+    let names = model_names(model);
+    let mut v: Vec<(&'static str, bool)> = KNOWN
+        .iter()
+        .filter(|(t, _, _)| {
+            t.rsplit('/')
+                .next()
+                .is_some_and(|t| names.iter().any(|n| n.eq_ignore_ascii_case(t)))
+        })
+        .map(|&(_, d, def)| (d, def))
+        .collect();
+    v.sort_by_key(|d| !d.1);
+    v
+}
+
+/// The draft a folder holds: the folder itself (a Hugging Face draft), or its DFlash / DSpark
+/// GGUF (the `Q8_0` one when a repository has several quantizations). A draft file is itself.
+pub fn draft_in(path: &Path) -> Option<PathBuf> {
+    if crate::gguf::is_gguf(path) || hf_config(path).is_some() {
+        return is_draft(path).then(|| path.to_path_buf());
+    }
+    let mut v: Vec<PathBuf> = std::fs::read_dir(path)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| crate::gguf::is_gguf(p) && is_draft(p))
+        .collect();
+    v.sort();
+    let q8 = v.iter().position(|p| p.to_string_lossy().to_ascii_uppercase().contains("Q8_0"));
+    match q8 {
+        Some(i) => Some(v.swap_remove(i)),
+        None => v.into_iter().next(),
+    }
+}
+
+/// The DSpark draft beside model `model`, and whether it is used by default:
+///
+/// - a `dspark*.gguf` file in a GGUF model's folder or the folder above (as unsloth lays them
+///   out), or a `dspark*` draft folder or GGUF inside a model folder: by default for the Mistral
+///   Large 4 and DeepSeek V4 drafts, and for a model with a default [`KNOWN`] draft;
+/// - else a [`KNOWN`] draft of this model in the download cache (the folder holding the model's
+///   folder), default or not as the table says.
 fn find_draft(model: &Path) -> Option<(PathBuf, bool)> {
+    let known = known_drafts(model);
     let pick = |d: &Path| -> Option<PathBuf> {
         let mut v: Vec<PathBuf> = std::fs::read_dir(d)
             .ok()?
@@ -783,44 +876,51 @@ fn find_draft(model: &Path) -> Option<(PathBuf, bool)> {
         v.sort();
         if v.len() == 1 { v.pop() } else { None }
     };
-    if crate::gguf::is_gguf(model) {
-        let dir = model.parent()?;
-        for d in [Some(dir), dir.parent()].into_iter().flatten() {
-            if let Some(p) = pick(d) {
-                let def = load_config(&p).is_ok_and(|c| !matches!(c.backbone, Backbone::Gqa(_)));
-                return Some((p, def));
-            }
+    let beside_default = |p: &Path| load_config(p).is_ok_and(|c| !matches!(c.backbone, Backbone::Gqa(_))) || known.iter().any(|d| d.1);
+    let gguf = crate::gguf::is_gguf(model);
+    let folder = if gguf {
+        model.parent()?
+    } else if model.is_dir() {
+        model
+    } else {
+        return None;
+    };
+    let beside = if gguf {
+        vec![Some(folder), folder.parent()]
+    } else {
+        vec![Some(folder)]
+    };
+    for d in beside.into_iter().flatten() {
+        if let Some(p) = pick(d) {
+            let def = beside_default(&p);
+            return Some((p, def));
         }
-        return None;
     }
-    if !model.is_dir() {
-        return None;
-    }
-    if let Some(p) = pick(model) {
-        return Some((p, false));
-    }
-    // `org--name` (the download cache) or a bare `name`, possibly a converted copy.
-    let folder = model.file_name()?.to_str()?;
-    let name = folder.rsplit("--").next()?;
-    let name = ["-oxinfer-q4", "-oxinfer-q8"]
+    let cache = folder.parent()?;
+    known
         .iter()
-        .fold(name, |n, s| n.strip_suffix(s).unwrap_or(n));
-    let parent = model.parent()?;
-    KNOWN
-        .iter()
-        .filter(|(t, _, _)| t.rsplit('/').next().is_some_and(|t| t.eq_ignore_ascii_case(name)))
-        .map(|(_, d, def)| (parent.join(d.replace('/', "--")), *def))
-        .find(|(p, _)| is_draft(p))
+        .find_map(|&(d, def)| draft_in(&cache.join(d.replace('/', "--"))).map(|p| (p, def)))
 }
 
-/// The DSpark draft beside `model` (see [`KNOWN`]), if any: what `draft=auto` uses.
+/// The DSpark draft beside `model` (see [`find_draft`]), if any: what `draft=auto` uses before
+/// fetching one ([`auto_repo`]).
 pub fn draft_for(model: &Path) -> Option<PathBuf> {
     find_draft(model).map(|d| d.0)
 }
 
-/// The draft used when none is asked for: one beside the model that measured faster.
+/// The draft used when none is asked for: one beside the model or in the download cache that
+/// measured faster ([`KNOWN`]; nothing is fetched).
 pub fn default_draft(model: &Path) -> Option<PathBuf> {
     find_draft(model).filter(|d| d.1).map(|d| d.0)
+}
+
+/// The repository `draft=auto` fetches when no draft is beside `model`: its default [`KNOWN`]
+/// draft, else its first known Hugging Face (safetensors) draft.
+pub fn auto_repo(model: &Path) -> Option<&'static str> {
+    known_drafts(model)
+        .into_iter()
+        .map(|d| d.0)
+        .find(|d| !d.to_ascii_uppercase().ends_with("GGUF"))
 }
 
 /// The `config.json` of a Hugging Face DSpark / DFlash draft folder, if `path` is one.
@@ -842,7 +942,7 @@ fn hf_config(path: &Path) -> Option<Json> {
 /// with a Markov head) folder.
 pub fn is_draft(path: &Path) -> bool {
     if crate::gguf::is_gguf(path) {
-        return crate::gguf::header(path).is_ok_and(|h| h.arch() == "dflash");
+        return crate::gguf::header(path).is_ok_and(|h| matches!(h.arch(), "dflash" | "dspark"));
     }
     hf_config(path).is_some()
 }
@@ -883,7 +983,9 @@ impl Names {
 impl<'a> Dspark<'a> {
     /// Loads the draft in `files` (opened from `path`: a `dflash` GGUF or a Hugging Face draft
     /// folder) for a target whose hidden size is `target_hidden` and vocabulary `vocab`.
-    /// Unquantized weights become `quant`.
+    /// Unquantized weights become `quant` (the engine and the CLI pass the target's weight
+    /// format: a Q4 draft of Qwen3.8-27B at Q4 accepted as many drafts as the bf16 one and ran
+    /// its passes in 23-27 ms instead of 31-34).
     pub fn load(path: &Path, files: &'a ModelFiles, target_hidden: usize, vocab: usize, quant: Quant) -> Result<Self> {
         let gguf = crate::gguf::is_gguf(path);
         let cfg = load_config(path)?;
@@ -992,7 +1094,13 @@ impl<'a> Dspark<'a> {
             let ffn_norm = if sandwich {
                 ln("ffn_norm.weight", "pre_feedforward_layernorm.weight")
             } else {
-                ln("ffn_norm.weight", "post_attention_layernorm.weight")
+                // llama.cpp's DSpark branch keeps Qwen's name for it.
+                let n = ln("ffn_norm.weight", "post_attention_layernorm.weight");
+                if gguf && !has(&n) {
+                    ln("post_attention_norm.weight", "")
+                } else {
+                    n
+                }
             };
             layers.push(Layer {
                 attn,
@@ -1002,9 +1110,12 @@ impl<'a> Dspark<'a> {
                 down: lin(&ln("ffn_down.weight", "mlp.down_proj.weight"), h, c.inter)?,
             });
         }
+        // llama.cpp's DSpark branch: `markov.w1`, `confidence.proj` (mainline: `markov_w1`,
+        // `conf_proj`).
+        let alt = |n: String| if gguf && !has(&n) { n.replacen('_', ".", 1) } else { n };
         let (w1n, w2n) = (
-            nm.top("markov_w1.weight", "markov_head.markov_w1.weight"),
-            nm.top("markov_w2.weight", "markov_head.markov_w2.weight"),
+            alt(nm.top("markov_w1.weight", "markov_head.markov_w1.weight")),
+            alt(nm.top("markov_w2.weight", "markov_head.markov_w2.weight")),
         );
         let markov = if has(&w1n) {
             let rank = files.info(&w1n).unwrap().shape.last().copied().unwrap_or(0);
@@ -1027,15 +1138,24 @@ impl<'a> Dspark<'a> {
         } else {
             None
         };
-        let cn = nm.top("conf_proj.weight", "confidence_head.proj.weight");
+        let conf_alt = |n: String| {
+            if gguf && !has(&n) {
+                n.replacen("conf_proj", "confidence.proj", 1)
+            } else {
+                n
+            }
+        };
+        let cn = conf_alt(nm.top("conf_proj.weight", "confidence_head.proj.weight"));
         let conf = if has(&cn) {
             let n_in = files.info(&cn).unwrap().shape.last().copied().unwrap_or(0);
             let rank = markov.as_ref().map_or(0, |m| m.rank);
             if n_in != h && n_in != h + rank {
                 bail!("DSpark confidence head of width {n_in} (hidden {h}, Markov rank {rank})");
             }
-            shape(&cn, &[1, n_in])?;
-            let bn = nm.top("conf_proj.bias", "confidence_head.proj.bias");
+            if files.info(&cn).unwrap().shape.len() > 1 {
+                shape(&cn, &[1, n_in])?;
+            }
+            let bn = conf_alt(nm.top("conf_proj.bias", "confidence_head.proj.bias"));
             Some(Confidence {
                 w: files.f32(&cn)?,
                 b: if has(&bn) { files.f32(&bn)?[0] } else { 0.0 },
@@ -1051,10 +1171,14 @@ impl<'a> Dspark<'a> {
             None
         };
         // A draft as wide as its target shares the target's embeddings and LM head (DeepSpec
-        // drafts ship frozen copies of them); a narrower one needs its own.
-        let own = h != target_hidden || std::env::var_os("OXINFER_DSPARK_OWN_HEAD").is_some();
+        // drafts ship frozen copies of them, which GGUF conversions may quantize further: a Q4_0
+        // copy of Gemma 4's head moved the draft logits by 18%); a narrower one needs its own.
+        // The MLA and DeepSeek V4 GGUF drafts use theirs, as llama.cpp does.
+        let own = h != target_hidden
+            || (gguf && !matches!(c.backbone, Backbone::Gqa(_)))
+            || std::env::var_os("OXINFER_DSPARK_OWN_HEAD").is_some();
         let en = nm.top("token_embd.weight", "embed_tokens.weight");
-        let embed = if has(&en) && (own || gguf) {
+        let embed = if has(&en) && own {
             shape(&en, &[vocab, h])?;
             Some(Table::load(files, &en, vocab, h, quant)?)
         } else {
@@ -1064,7 +1188,7 @@ impl<'a> Dspark<'a> {
             None
         };
         let hn = nm.top("output.weight", "lm_head.weight");
-        let head = if has(&hn) && (own || gguf) {
+        let head = if has(&hn) && own {
             Some(lin(&hn, vocab, h)?)
         } else {
             if h != target_hidden {
@@ -2106,10 +2230,11 @@ pub struct DsparkOptions {
     pub draft_tokens: usize,
     /// Tokens that end generation: nothing after one is committed within a round.
     pub stop: Vec<u32>,
-    /// Choose each round's draft length for the most expected tokens per second, from the
-    /// measured costs of a draft pass and of verifying each number of tokens, and the recent
-    /// acceptance at each position ([`Adaptive`]). Length 0 (no draft: a plain decoding step)
-    /// is a choice, so where the draft is rarely right decoding stays near plain speed.
+    /// Choose each round between a draft pass and a plain step by their recently measured tokens
+    /// per second, and verify the part of each block with the most expected tokens per second,
+    /// from the measured cost of verifying each length and each draft's calibrated chance of
+    /// being accepted ([`Adaptive`]); where the draft is rarely right, decoding stays near plain
+    /// speed.
     pub cost_aware: bool,
     /// Cut each block before the first draft the draft model itself gives less than this
     /// probability (llama.cpp's `--spec-draft-p-min`; 0 = off): an unlikely draft costs a
@@ -2157,48 +2282,122 @@ pub struct DsparkDecoder<'m, M: Target> {
     k_cur: usize,
     pub stats: MtpStats,
     adapt: Adaptive,
+    /// Features of committed positions not yet in the draft's context (`pending.1` positions):
+    /// they join it before the next draft pass, so rounds without a draft cost no context pass
+    /// and consecutive ones share one.
+    pending: (Vec<f32>, usize),
 }
 
-/// The cost-aware draft length policy ([`DsparkOptions::cost_aware`]).
-#[derive(Clone, Debug, Default)]
+/// The cost-aware draft length policy ([`DsparkOptions::cost_aware`]), in two steps per round:
+///
+/// - Whether to draft: a draft pass costs the same whatever the number of drafts used, so a round
+///   either drafts the whole block or none. It drafts when draft rounds have recently given more
+///   tokens per second than plain steps; otherwise it decodes plainly and drafts again now and then
+///   (after 6 plain rounds, twice as many after each probe that lost, up to 96) to follow the
+///   text.
+/// - How many drafts to verify ([`Adaptive::cut`]): with the drafts in hand, the length that
+///   gives the most expected tokens per second of the round, from the measured cost of verifying
+///   each length and each draft's chance of being accepted, estimated from its probability under
+///   the draft model (calibrated online: drafts by probability bin, accepted or not).
+#[derive(Clone, Debug)]
 pub struct Adaptive {
-    /// Recent probability that draft `j` is accepted when the drafts before it were.
-    pub acc: Vec<f64>,
-    /// Recent cost of a draft pass, and of verifying (and adding to the draft's context) `t`
-    /// tokens, with the number of measurements.
+    /// Recent cost of a draft pass, and of verifying (and committing) `t` drafts, with the number
+    /// of measurements.
     pub draft: (f64, usize),
     pub verify: Vec<(f64, usize)>,
-    /// Rounds in a row without a draft (a draft round is forced now and then, to follow the
-    /// acceptance).
+    /// Decayed counts of verified drafts and of those accepted, by the draft model's probability
+    /// (tenths).
+    pub bins: [(f64, f64); 10],
+    /// Recent tokens and seconds per round with a draft pass.
+    pub gain: (f64, f64, usize),
+    /// Rounds in a row without a draft, and the current number of them before a probe.
     pub plain_run: usize,
+    pub probe: usize,
+    /// This round was a probe (drafted against the measured rates).
+    probing: bool,
+}
+
+impl Default for Adaptive {
+    fn default() -> Self {
+        Self {
+            draft: (0.0, 0),
+            verify: Vec::new(),
+            bins: [(0.0, 0.0); 10],
+            gain: (0.0, 0.0, 0),
+            plain_run: 0,
+            probe: Self::PROBE,
+            probing: false,
+        }
+    }
 }
 
 impl Adaptive {
     const DECAY: f64 = 0.8;
-    /// Rounds without a draft before the next probe.
+    /// Plain rounds before the first probe (doubling up to `PROBE_MAX` while probes lose).
     const PROBE: usize = 6;
+    const PROBE_MAX: usize = 96;
+    /// Weight of the draft model's own probability against the calibration counts of its bin.
+    const PRIOR: f64 = 2.0;
+    /// Decay of the calibration counts per verified draft (a window of about 500 drafts).
+    const BIN_DECAY: f64 = 0.998;
 
+    /// A moving average whose second sample replaces the first (which may include compiling a
+    /// GPU plan or warming caches).
     fn ema(e: &mut (f64, usize), v: f64) {
-        *e = (if e.1 == 0 { v } else { Self::DECAY * e.0 + (1.0 - Self::DECAY) * v }, e.1 + 1);
+        *e = (if e.1 < 2 { v } else { Self::DECAY * e.0 + (1.0 - Self::DECAY) * v }, e.1 + 1);
     }
 
-    fn record(&mut self, kd: usize, accepted: usize, draft: f64, verify: f64) {
-        if kd > 0 {
-            Self::ema(&mut self.draft, draft);
-            if self.acc.len() < kd {
-                self.acc.resize(kd, 0.7);
-            }
-            for j in 0..kd.min(accepted + 1) {
-                self.acc[j] = Self::DECAY * self.acc[j] + (1.0 - Self::DECAY) * f64::from(u8::from(j < accepted));
-            }
-            self.plain_run = 0;
-        } else {
+    /// Records a round: `probs` the probabilities of the drafts proposed (empty: no draft pass),
+    /// `verified` of them verified, `accepted` of those accepted, `emitted` tokens committed.
+    fn record(&mut self, probs: &[f32], verified: usize, accepted: usize, emitted: usize, draft: f64, verify: f64) {
+        if self.verify.len() <= verified {
+            self.verify.resize(verified + 1, (0.0, 0));
+        }
+        Self::ema(&mut self.verify[verified], verify);
+        if probs.is_empty() {
             self.plain_run += 1;
+            return;
         }
-        if self.verify.len() <= kd {
-            self.verify.resize(kd + 1, (0.0, 0));
+        Self::ema(&mut self.draft, draft);
+        for (j, &p) in probs.iter().enumerate().take(verified.min(accepted + 1)) {
+            for b in &mut self.bins {
+                b.0 *= Self::BIN_DECAY;
+                b.1 *= Self::BIN_DECAY;
+            }
+            let b = &mut self.bins[Self::bin(p)];
+            b.0 += f64::from(u8::from(j < accepted));
+            b.1 += 1.0;
         }
-        Self::ema(&mut self.verify[kd], verify);
+        let (t, s) = (emitted as f64, draft + verify);
+        self.gain = match self.gain.2 {
+            0 | 1 => (t, s, self.gain.2 + 1),
+            n => (
+                Self::DECAY * self.gain.0 + (1.0 - Self::DECAY) * t,
+                Self::DECAY * self.gain.1 + (1.0 - Self::DECAY) * s,
+                n + 1,
+            ),
+        };
+        if self.probing {
+            // A probe that lost: probe half as often.
+            let plain = self.verify.first().map_or(0.0, |v| v.0);
+            if t * plain < s {
+                self.probe = (self.probe * 2).min(Self::PROBE_MAX);
+            } else {
+                self.probe = Self::PROBE;
+            }
+        }
+        self.plain_run = 0;
+    }
+
+    fn bin(p: f32) -> usize {
+        ((p.max(0.0) * 10.0) as usize).min(9)
+    }
+
+    /// The chance that a draft of probability `p` (under the draft model) is accepted when the
+    /// drafts before it were.
+    pub fn accept_chance(&self, p: f32) -> f64 {
+        let (a, n) = self.bins[Self::bin(p)];
+        (a + Self::PRIOR * f64::from(p)) / (n + Self::PRIOR)
     }
 
     /// Verifying `k` drafts: measured, else interpolated (or extrapolated flat) between the
@@ -2221,32 +2420,39 @@ impl Adaptive {
         }
     }
 
-    fn expected_tokens(&self, k: usize) -> f64 {
-        let (mut e, mut p) = (1.0, 1.0);
-        for j in 0..k {
-            p *= self.acc.get(j).copied().unwrap_or(0.7);
-            e += p;
+    /// The next round's draft length: `k_max` (a draft pass) or 0 (a plain step).
+    pub fn choose(&mut self, k_max: usize) -> usize {
+        self.probing = false;
+        // First two draft rounds, then two plain ones, to measure both (the first of each may
+        // compile a plan).
+        if self.draft.1 < 2 {
+            return k_max;
         }
-        e
+        let Some(plain) = self.verify.first().filter(|e| e.1 >= 2).map(|e| e.0) else {
+            return 0;
+        };
+        if self.gain.0 * plain >= self.gain.1 {
+            return k_max;
+        }
+        if self.plain_run >= self.probe {
+            self.probing = true;
+            return k_max;
+        }
+        0
     }
 
-    /// The next round's draft length in `0..=k_max`.
-    pub fn choose(&self, k_max: usize) -> usize {
-        // First the full block, then one plain round to measure it.
-        if self.draft.1 == 0 {
-            return k_max;
-        }
-        if self.verify.first().is_none_or(|e| e.1 == 0) {
-            return 0;
-        }
-        if self.plain_run >= Self::PROBE {
-            return k_max;
-        }
-        let mut best = (0, 0.0);
-        for k in 0..=k_max {
-            let Some(v) = self.verify_time(k) else { continue };
-            let t = v + if k > 0 { self.draft.0 } else { 0.0 };
-            let rate = self.expected_tokens(k) / t.max(1e-9);
+    /// How many of the proposed drafts (probabilities `probs`) to verify, given the draft pass
+    /// that made them took `draft_secs`: the length with the most expected tokens per second.
+    pub fn cut(&self, probs: &[f32], draft_secs: f64) -> usize {
+        let mut best = (probs.len(), 0.0);
+        let (mut e, mut p) = (1.0, 1.0);
+        for k in 0..=probs.len() {
+            if k > 0 {
+                p *= self.accept_chance(probs[k - 1]);
+                e += p;
+            }
+            let Some(v) = self.verify_time(k) else { return probs.len() };
+            let rate = e / (draft_secs + v).max(1e-9);
             if rate > best.1 {
                 best = (k, rate);
             }
@@ -2281,6 +2487,7 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
             next: None,
             stats: MtpStats::default(),
             adapt: Adaptive::default(),
+            pending: (Vec::new(), 0),
         }
     }
 
@@ -2303,18 +2510,38 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
     }
 
     /// The draft's context cache (for checks).
-    pub fn draft_session(&self) -> &DsparkSession {
+    pub fn draft_session(&mut self) -> &DsparkSession {
+        self.flush();
         &self.dsess
     }
 
     /// The draft's context cache, for drafting outside a round (checks).
     pub fn draft_session_mut(&mut self) -> &mut DsparkSession {
+        self.flush();
         &mut self.dsess
     }
+
+    /// Adds the pending features to the draft's context, at most [`Self::FLUSH`] positions per
+    /// pass.
+    fn flush(&mut self) {
+        let (feats, n) = std::mem::take(&mut self.pending);
+        if let Some(nf) = feats.len().checked_div(n) {
+            for c in feats.chunks(Self::FLUSH * nf) {
+                self.draft.inject(&mut self.dsess, c, c.len() / nf);
+            }
+        }
+        self.pending = (feats, 0);
+        self.pending.0.clear();
+    }
+
+    /// Positions of one context pass when the pending features are added (the GPU context
+    /// plan's capacity).
+    const FLUSH: usize = 16;
 
     /// Runs `tokens` through the target and adds their features to the draft's cache; returns
     /// the target's final-normed hidden states.
     fn run(&mut self, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {
+        self.flush();
         let mut feats = Vec::new();
         let hs = self
             .model
@@ -2370,18 +2597,25 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         let (model, draft) = (self.model, self.draft);
         let v = model.vocab_size();
         let n = model.session_len(&self.sess); // position of `next`
-        debug_assert_eq!(self.dsess.len, n);
+        debug_assert_eq!(self.dsess.len + self.pending.1, n);
         let k = self.k_cur.min(max_new.max(1) - 1);
 
         let t_round = crate::clock::Instant::now();
-        let prop = if k > 0 {
+        let mut prop = if k > 0 {
+            self.flush();
             draft.propose(model, &mut self.dsess, next, k, self.opts.p_min, self.opts.conf_min, sampler)
         } else {
             Proposal::default()
         };
-        let (drafts, qs) = (&prop.tokens, &prop.dists);
         let draft_secs = t_round.elapsed().as_secs_f64();
-        // `p_min` may have cut the block.
+        // `p_min` may have cut the block; the cost-aware policy verifies the most profitable part.
+        let probs = prop.probs.clone();
+        if self.opts.cost_aware && !prop.tokens.is_empty() {
+            let m = self.adapt.cut(&prop.probs, draft_secs);
+            prop.tokens.truncate(m);
+            prop.dists.truncate(m);
+        }
+        let (drafts, qs) = (&prop.tokens, &prop.dists);
         let kd = drafts.len();
 
         let mut seq = Vec::with_capacity(kd + 1);
@@ -2435,7 +2669,8 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         model.truncate(&mut self.sess, n + c);
         let t_trunc = t_round.elapsed().as_secs_f64();
         let nf = feats.len() / seq.len();
-        draft.inject(&mut self.dsess, &feats[..c * nf], c);
+        self.pending.0.extend_from_slice(&feats[..c * nf]);
+        self.pending.1 += c;
         self.next = out.last().copied();
         let tail_secs = t_round.elapsed().as_secs_f64() - draft_secs;
         if std::env::var_os("OXINFER_DEBUG_DRAFT").is_some() {
@@ -2463,7 +2698,7 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         st.draft_secs += draft_secs;
         st.verify_secs += verify_secs;
         if k == self.k_cur {
-            self.adapt.record(kd, accepted, draft_secs, tail_secs);
+            self.adapt.record(&probs, kd, accepted, c, draft_secs, tail_secs);
         }
         if self.opts.cost_aware {
             self.k_cur = self.adapt.choose(self.opts.draft_tokens);
@@ -2738,10 +2973,11 @@ mod tests {
             let lg = dec.prefill(&prompt, 2);
             let spec = crate::generate::decode_rounds(&mut dec, &lg, &mut s, &[], 40, &mut |_| Flow::Continue);
             assert_eq!(spec.tokens, plain.tokens, "k = {k}");
+            let dlen = dec.draft_session().len;
+            assert_eq!(dlen, dec.sess.0.len());
             let st = &dec.stats;
             assert!(st.accepted > 0 && st.accepted < st.drafted, "k = {k}: {st:?}");
             assert!(st.per_round[k] > 0, "k = {k}: no fully accepted round: {:?}", st.per_round);
-            assert_eq!(dec.draft_session().len, dec.sess.0.len());
         }
     }
 
@@ -2969,9 +3205,10 @@ mod tests {
                     let lg = dec.prefill(prompt, 2);
                     let spec = crate::generate::decode_rounds(&mut dec, &lg, &mut s, &[], 40, &mut |_| Flow::Continue);
                     assert_eq!(&spec.tokens, plain, "variant {i}, k = {k}");
+                    let dlen = dec.draft_session().len;
+                    assert_eq!(dlen, dec.sess.0.len());
                     let st = &dec.stats;
                     assert!(st.accepted > 0, "variant {i}, k = {k}: {st:?}");
-                    assert_eq!(dec.draft_session().len, dec.sess.0.len());
                     none |= st.per_round[0] > 0;
                     some |= st.per_round[1..k].iter().any(|&n| n > 0);
                     all |= st.per_round[k] > 0;
@@ -3039,5 +3276,101 @@ mod tests {
             let b = *hist_spec.get(k).unwrap_or(&0) as f64 / n as f64;
             assert!((a - b).abs() < 0.035, "token {k:?}: plain {a} vs DSpark {b} ({c})");
         }
+    }
+
+    /// The cost-aware policy: drafts the measured rates favour, plain steps (with ever rarer
+    /// probes) where drafting loses, and per block the most profitable verification length.
+    #[test]
+    fn adaptive_policy() {
+        let mut a = Adaptive::default();
+        // Two draft rounds, two plain ones to measure, then the rates decide.
+        assert_eq!(a.choose(7), 7);
+        a.record(&[0.99; 7], 7, 7, 8, 0.010, 0.020);
+        assert_eq!(a.choose(7), 7);
+        a.record(&[0.99; 7], 7, 7, 8, 0.010, 0.020);
+        assert_eq!(a.choose(7), 0);
+        a.record(&[], 0, 0, 1, 0.0, 0.010);
+        assert_eq!(a.choose(7), 0);
+        a.record(&[], 0, 0, 1, 0.0, 0.010);
+        // 8 tokens in 30 ms beats 1 in 10 ms.
+        assert_eq!(a.choose(7), 7);
+        // Verification costs 10 ms plus 10 ms per draft: confident drafts are all verified, a
+        // block whose drafts are all unlikely is not verified at all.
+        a.verify = (0..=7).map(|k| (0.010 + 0.010 * k as f64, 2)).collect();
+        assert_eq!(a.cut(&[0.999; 7], 0.010), 7);
+        assert_eq!(a.cut(&[0.05; 7], 0.010), 0);
+        assert_eq!(a.cut(&[0.999, 0.999, 0.05, 0.999, 0.999, 0.999, 0.999], 0.010), 2);
+        // Draft rounds that lose: plain steps, with a probe after 6, then after 12.
+        let mut a = Adaptive::default();
+        for _ in 0..2 {
+            a.choose(7);
+            a.record(&[0.5; 7], 7, 0, 1, 0.010, 0.080);
+        }
+        for _ in 0..2 {
+            a.choose(7);
+            a.record(&[], 0, 0, 1, 0.0, 0.010);
+        }
+        let mut drafts = Vec::new();
+        for r in 0..30 {
+            let k = a.choose(7);
+            if k > 0 {
+                drafts.push(r);
+                a.record(&[0.5; 7], 1, 0, 1, 0.010, 0.015);
+            } else {
+                a.record(&[], 0, 0, 1, 0.0, 0.010);
+            }
+        }
+        assert_eq!(drafts, [4, 17], "probes at {drafts:?}");
+    }
+
+    /// Greedy DSpark decoding with the cost-aware policy (rounds with and without drafts, blocks
+    /// cut by the calibrated estimate) gives the plain greedy tokens.
+    #[test]
+    fn cost_aware_dspark_matches_plain_decoding() {
+        let dir = std::env::temp_dir().join(format!("oxinfer-dspark-hf-adaptive-{}", std::process::id()));
+        toy_hf_draft(&dir, serde_json::json!({}), Some(7));
+        let files = ModelFiles::open(&dir, true).unwrap();
+        let d = Dspark::load(&dir, &files, H, V, Quant::Bf16).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let toy = Toy;
+        let prompt = [5u32, 9, 13, 2, 7];
+        let mut s = Sampler::new(0.0, 0, 1.0, 1);
+        let mut ps = toy.new_session();
+        let hs = crate::generate::prefill(&toy, &mut ps, &prompt, 2, &[]);
+        let lg = toy.logits(&hs[hs.len() - H..], 1);
+        let plain = crate::generate::decode(&toy, &mut ps, lg, &mut s, &[], 120, &mut |_| Flow::Continue).tokens;
+        let mut dec = DsparkDecoder::new(&toy, &d, DsparkOptions::default());
+        let lg = dec.prefill(&prompt, 2);
+        let spec = crate::generate::decode_rounds(&mut dec, &lg, &mut s, &[], 120, &mut |_| Flow::Continue);
+        assert_eq!(spec.tokens, plain);
+        let dlen = dec.draft_session().len;
+        assert_eq!(dlen, dec.sess.0.len());
+    }
+
+    /// Finding a draft: names of cached and GGUF models, the known drafts in the download cache,
+    /// GGUF draft repositories.
+    #[test]
+    fn draft_discovery() {
+        assert!(["Q8_0", "q4_k_m", "IQ4_XS", "BF16", "UD"].iter().all(|t| is_quant_tag(t)));
+        assert!(!["Qwen3", "8B", "it", "Instruct", "Q"].iter().any(|t| is_quant_tag(t)));
+        let root = std::env::temp_dir().join(format!("oxinfer-dspark-find-{}", std::process::id()));
+        let model = root.join("Qwen--Qwen3-4B-oxinfer-q4");
+        std::fs::create_dir_all(&model).unwrap();
+        let gguf_dir = root.join("Qwen--Qwen3-8B-GGUF");
+        std::fs::create_dir_all(&gguf_dir).unwrap();
+        let gguf = gguf_dir.join("Qwen3-8B-Q8_0.gguf");
+        std::fs::write(&gguf, b"GGUF\x03\0\0\0").unwrap();
+        assert_eq!(model_names(&gguf), ["Qwen3-8B", "Qwen3-8B"]);
+        assert_eq!(auto_repo(&gguf), Some("deepseek-ai/dspark_qwen3_8b_block7"));
+        assert_eq!(auto_repo(&model), Some("deepseek-ai/dspark_qwen3_4b_block7"));
+        assert!(draft_for(&model).is_none());
+        // The known draft in the cache: found, and the default the table says.
+        let draft = root.join("deepseek-ai--dspark_qwen3_4b_block7");
+        toy_hf_draft(&draft, serde_json::json!({}), None);
+        assert_eq!(draft_for(&model).as_deref(), Some(draft.as_path()));
+        let def = KNOWN.iter().any(|k| k.1 == "deepseek-ai/dspark_qwen3_4b_block7" && k.2);
+        assert_eq!(default_draft(&model).is_some(), def);
+        assert_eq!(draft_in(&draft).as_deref(), Some(draft.as_path()));
+        std::fs::remove_dir_all(&root).ok();
     }
 }

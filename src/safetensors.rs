@@ -992,6 +992,18 @@ impl ModelFiles {
         if info.mlx.is_some() {
             return Ok(self.bf16(name)?.iter().map(|&v| crate::kernels::bf16_to_f32(v)).collect());
         }
+        // GGUF block formats (a converter may quantize a small matrix too) dequantized.
+        if let Some(g) = self.ggml(name) {
+            let (kind, bytes) = g?;
+            if !matches!(
+                kind,
+                crate::ggml::GgmlType::F32 | crate::ggml::GgmlType::F16 | crate::ggml::GgmlType::BF16
+            ) {
+                let mut out = vec![0f32; info.shape.iter().product()];
+                crate::ggml::dequantize_row(kind, bytes, &mut out);
+                return Ok(out);
+            }
+        }
         let b = self.bytes(name)?;
         Ok(match info.dtype.as_str() {
             "F32" => b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect(),

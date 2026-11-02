@@ -12,11 +12,24 @@ pub(crate) const MV_VARIANTS: [(usize, usize); 4] = [(1, 1), (1, 2), (1, 4), (2,
 /// smallest that holds N).
 pub(crate) const MVK_TOKENS: [usize; 2] = [8, 16];
 
+/// Tokens the multi-token matvecs take per sweep over the rows (more run as further sweeps, the
+/// rows' weights then coming from the cache; `OXINFER_MVK_GROUP` overrides it for measurements).
+/// With 2 rows per threadgroup, 4 measured best on an M5 Max (`decode_mvk_bench`: 8 tokens of a
+/// 17408x5120 Q4 matrix in ~500 us, Q8 ~400 us, against ~100 / ~180 us for one token).
+const MVK_GROUP: usize = 4;
+
 /// Rows per threadgroup of the multi-token matvecs for up to `tt` tokens (accumulators: rows x
-/// tokens per lane). One row measured fastest for 8 tokens on an M5 Max (`decode_mvk_bench`:
-/// more rows save x loads but cost occupancy).
+/// tokens per lane; each token's x chunk is loaded once for the rows). 2 measured best on an M5
+/// Max end to end (`decode_mvk_bench` for single matrices; `OXINFER_MVK_ROWS` overrides it).
 pub(crate) fn mvk_rows(_tt: usize) -> usize {
-    1
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        std::env::var("OXINFER_MVK_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|r| [1, 2, 4].contains(r))
+            .unwrap_or(2)
+    })
 }
 
 /// A weight format with a decode matvec kernel.
@@ -136,7 +149,13 @@ fn all_formats() -> Vec<MvFmt> {
 
 /// The decode kernels' source with the matvec instantiations.
 pub(crate) fn shader_src() -> String {
-    let mut s = String::from(SRC);
+    let group = std::env::var("OXINFER_MVK_GROUP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|g| (1..=16).contains(g))
+        .unwrap_or(MVK_GROUP);
+    let mut s = format!("#define MVK_GROUP {group}\n");
+    s.push_str(SRC);
     for f in all_formats() {
         // MoE experts: `mvx_<fmt>_pair` / `_sum`.
         let (t, x, ch, mk) = f.kernel_types();
@@ -718,6 +737,9 @@ enum MOp {
         /// Multi-token plans: the pipeline, the x, y, gate strides in floats and the rows per
         /// threadgroup.
         t: Option<(Id, u32, u32, u32, usize)>,
+        /// Multi-token plans without `t` (the MoE router): the x and y strides in bytes, the
+        /// single-token kernel then running once per token.
+        each: (usize, usize),
     },
     Topk {
         pipe: Id,
@@ -726,6 +748,8 @@ enum MOp {
         n: u32,
         k: u32,
         scale: Option<usize>,
+        /// Multi-token plans: the logits and selection strides in bytes (one dispatch per token).
+        t: Option<(usize, usize)>,
     },
     Experts {
         pair: Id,
@@ -747,6 +771,9 @@ enum MOp {
         k: usize,
         /// Neuron edits between the two kernels: (pipeline, hot offset, entries).
         edit: Option<(Id, usize, u32)>,
+        /// Multi-token plans: the x, selection, activation and y strides in bytes (each token's
+        /// experts through the single-token kernels: tokens route to different experts).
+        t: Option<[usize; 4]>,
     },
     QkRope {
         pipe: Id,
@@ -892,7 +919,9 @@ pub(crate) struct MetalPlan<'b> {
     params_key: AtomicU64,
     /// One step at a time (the arena is shared).
     lock: Mutex<()>,
-    /// Identifies this plan's slots.
+    /// Identifies the slots this plan can use: plans of the same model (one-token, multi-token,
+    /// with or without captured features) share a slot, so its device copies of the caches stay
+    /// valid when steps alternate between them (one copy, one truncation watermark).
     id: u64,
 }
 unsafe impl Send for MetalPlan<'_> {}
@@ -955,7 +984,23 @@ impl Drop for MetalSlot {
 unsafe impl Send for MetalSlot {}
 unsafe impl Sync for MetalSlot {}
 
-static PLAN_IDS: AtomicU64 = AtomicU64::new(1);
+/// The slot layout of a graph: its KV caches' and recurrent states' shapes, and the weights they
+/// belong to (the address of the graph's first weight), so that only plans of one model share
+/// slots.
+fn layout_id(g: &Graph) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    g.kv.hash(&mut h);
+    g.states.hash(&mut h);
+    g.ops
+        .iter()
+        .find_map(|op| match op {
+            Op::Linear { dev, .. } => Some(*dev as *const DeviceWeight as usize),
+            _ => None,
+        })
+        .hash(&mut h);
+    h.finish() | 1
+}
 
 /// What an op reads and writes, for barrier placement: (resource, start, end) in floats, where a
 /// resource is an activation buffer or (`KV_RES + i`) a KV cache.
@@ -1119,6 +1164,7 @@ impl MetalBackend {
                         mode,
                         gate: gate.map_or(0, byte),
                         t,
+                        each: (0, 0),
                     });
                     let mut r = vec![rng(x, n_in)];
                     if matches!(mode, MvMode::Add | MvMode::AddGated) {
@@ -1207,9 +1253,7 @@ impl MetalBackend {
                     sel,
                     expert_scale,
                 } => {
-                    if mt {
-                        return None; // per-token routing: not in multi-token plans
-                    }
+                    // Multi-token plans route each token with the single-token kernels.
                     if expert_scale.is_some_and(|s| s.len() != n_exp) {
                         return None;
                     }
@@ -1246,6 +1290,7 @@ impl MetalBackend {
                         mode: MvMode::Store,
                         gate: 0,
                         t: None,
+                        each: (ts(x) * 4, ts(logits) * 4),
                     });
                     emit.push(MOp::Barrier);
                     emit.push(MOp::Topk {
@@ -1255,11 +1300,12 @@ impl MetalBackend {
                         n: n_exp as u32,
                         k: k as u32,
                         scale: expert_scale.map(&mut cst),
+                        t: mt.then(|| (ts(logits) * 4, ts(sel) * 4)),
                     });
                     (vec![rng(x, h), rng(logits, rows)], vec![rng(logits, rows), rng(sel, 2 * k)])
                 }
                 Op::Experts(ref ex) => {
-                    if mt {
+                    if mt && ex.edits.is_some() {
                         return None;
                     }
                     let (tabs, fused, g, d, pf) = self.expert_tables(ex, &mut owned, &mut indirect)?;
@@ -1284,6 +1330,7 @@ impl MetalBackend {
                         inter: ex.inter,
                         k: ex.k,
                         edit,
+                        t: mt.then(|| [ts(ex.x) * 4, ts(ex.sel) * 4, ts(ex.act) * 4, ts(ex.y) * 4]),
                     });
                     let mut r = vec![
                         rng(ex.x, ex.h),
@@ -1649,7 +1696,7 @@ impl MetalBackend {
             params: g.params.map(|((h, hn), (c, cn))| ((byte(h), hn), (byte(c), cn))),
             params_key: AtomicU64::new(0),
             lock: Mutex::new(()),
-            id: PLAN_IDS.fetch_add(1, Ordering::Relaxed),
+            id: layout_id(g),
             f,
         })
     }
@@ -1897,6 +1944,8 @@ impl MetalPlan<'_> {
                 }
             }
             MOp::Mv {
+                pipe,
+                nr,
                 ks,
                 w,
                 w2,
@@ -1904,10 +1953,100 @@ impl MetalPlan<'_> {
                 y,
                 mode,
                 gate,
+                t: None,
+                each,
+            } => {
+                for j in 0..t {
+                    let (xo, yo) = (*x + j * each.0, *y + j * each.1);
+                    encode_mv(e, *pipe, *nr, *ks, w, w2.as_ref(), (arena, xo), (arena, yo), *mode, (arena, *gate));
+                }
+            }
+            MOp::Topk {
+                pipe,
+                logits,
+                sel,
+                n,
+                k,
+                scale,
                 t: tk,
+            } => {
+                let (sl, ss) = tk.expect("multi-token top-k");
+                e.pipe(*pipe);
+                e.bytes(&[*n, *k, scale.is_some() as u32, 0], 2);
+                e.buf(consts, scale.unwrap_or(0), 3);
+                for j in 0..t {
+                    e.buf(arena, *logits + j * sl, 0);
+                    e.buf(arena, *sel + j * ss, 1);
+                    e.dispatch((1, 1), (*n as usize).next_multiple_of(32));
+                }
+            }
+            MOp::Experts {
+                pair,
+                sum,
+                tabs,
+                fused,
+                gelu,
+                add,
+                g,
+                d,
+                x,
+                sel,
+                act,
+                y,
+                h,
+                inter,
+                k,
+                edit: None,
+                t: tk,
+            } => {
+                // Every token's gate / up pairs, then every token's down projections.
+                let [sx, ssel, sact, sy] = tk.expect("multi-token experts");
+                let p = |n_out: usize, n_in: usize, mode: MvMode, q: (u32, u32), r2: usize| MvParams {
+                    n_out: n_out as u32,
+                    n_in: n_in as u32,
+                    mode: mode as u32,
+                    rows_per_tg: 1,
+                    gpr: q.0,
+                    gk: q.1,
+                    ldy: *k as u32,
+                    _p: r2 as u32,
+                    ..Default::default()
+                };
+                e.pipe(*pair);
+                e.buf(tabs[0], 0, 0);
+                e.buf(if *fused { tabs[0] } else { tabs[1] }, 0, 1);
+                let am = if *gelu { MvMode::GeluPair } else { MvMode::SiluPair };
+                e.bytes(&p(*inter, *h, am, *g, if *fused { *inter } else { 0 }), 4);
+                for j in 0..t {
+                    e.buf(arena, *x + j * sx, 2);
+                    e.buf(arena, *act + j * sact, 3);
+                    e.buf(arena, *sel + j * ssel, 5);
+                    e.dispatch((*inter, *k), 32);
+                }
+                e.barrier();
+                e.pipe(*sum);
+                e.buf(tabs[2], 0, 0);
+                e.buf(tabs[2], 0, 1);
+                e.bytes(&p(*h, *inter, if *add { MvMode::Add } else { MvMode::Store }, *d, 0), 4);
+                for j in 0..t {
+                    e.buf(arena, *act + j * sact, 2);
+                    e.buf(arena, *y + j * sy, 3);
+                    e.buf(arena, *sel + j * ssel, 5);
+                    e.dispatch((*h, 1), 32);
+                }
+            }
+            MOp::Mv {
+                ks,
+                w,
+                w2,
+                x,
+                y,
+                mode,
+                gate,
+                t: Some(tk),
                 ..
             } => {
-                let (pipe, sx, sy, sgate, nr) = tk.expect("multi-token matvec");
+                let (pipe, sx, sy, sgate, nr) = *tk;
                 let w2 = w2.as_ref().unwrap_or(w);
                 let p = MvkParams {
                     m: MvParams {
@@ -2121,7 +2260,7 @@ impl MetalPlan<'_> {
                     }
                 }
             }
-            MOp::Topk { .. } | MOp::Experts { .. } | MOp::Steer { .. } | MOp::NeuronEdit { .. } => {
+            MOp::Experts { .. } | MOp::Steer { .. } | MOp::NeuronEdit { .. } => {
                 unreachable!("single-token op in a multi-token plan")
             }
         }

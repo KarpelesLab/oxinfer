@@ -1018,11 +1018,11 @@ pub struct HfTensor {
 pub fn hf_tensors(h: &Header) -> Result<Vec<HfTensor>> {
     // Diffusion transformers (city96-style FLUX quants, unsloth Qwen-Image, calcuis "pig" files such
     // as OmniGen2), llama.cpp vision `clip` files (mmproj) and DFlash / DSpark drafts (`dflash`,
-    // see `crate::dspark`) keep their original tensor names; T5 encoders (`t5encoder`) get the
-    // transformers names.
+    // or `dspark` from llama.cpp's DSpark branch; see `crate::dspark`) keep their original tensor
+    // names; T5 encoders (`t5encoder`) get the transformers names.
     if matches!(
         h.arch(),
-        "flux" | "qwen_image" | "pig" | "omnigen2" | "t5encoder" | "clip" | "dflash"
+        "flux" | "qwen_image" | "pig" | "omnigen2" | "t5encoder" | "clip" | "dflash" | "dspark"
     ) {
         let t5 = h.arch() == "t5encoder";
         // DeepSeek V4 DSpark drafts: the stages (and their head) named as the target's layers.

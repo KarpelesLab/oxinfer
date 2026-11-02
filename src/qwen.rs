@@ -1312,6 +1312,19 @@ impl<'a> QwenModel<'a> {
     /// stream entering each of `layers` (as [`crate::dspark::Target::forward_feats`]). None
     /// (nothing changed) when GPU decoding is off or the model cannot.
     fn gpu_verify(&self, sess: &mut QwenSession, tokens: &[u32], layers: &[usize], feats: &mut Vec<f32>) -> Option<Vec<f32>> {
+        self.gpu_pass(sess, tokens, layers, feats).map(|r| r.1)
+    }
+
+    /// The final-normed hidden states (`[t, hidden]`) and the logits of `tokens` from a GPU pass
+    /// (at most [`MULTI_TOKENS`] tokens; a speculative verification, as plain GPU decoding would
+    /// compute them one token after the other), recording what a rewind inside the pass needs
+    /// ([`QwenSession::rewind`]). None (nothing changed) when GPU decoding is off or the model
+    /// cannot.
+    pub fn gpu_verify_hidden(&self, sess: &mut QwenSession, tokens: &[u32]) -> Option<(Vec<f32>, Vec<f32>)> {
+        self.gpu_pass(sess, tokens, &[], &mut Vec::new())
+    }
+
+    fn gpu_pass(&self, sess: &mut QwenSession, tokens: &[u32], layers: &[usize], feats: &mut Vec<f32>) -> Option<(Vec<f32>, Vec<f32>)> {
         let t = tokens.len();
         if t == 0 || t > MULTI_TOKENS || sess.iv.active() || sess.positions.is_some() || layers.contains(&0) {
             return None;
@@ -1319,8 +1332,18 @@ impl<'a> QwenModel<'a> {
         let mut cap: Vec<usize> = layers.iter().map(|&l| l - 1).collect();
         cap.sort_unstable();
         cap.dedup();
-        // The smallest plan holding `t` (a DSpark block of 7 drafts verifies 8 tokens).
-        let plan = self.gpu_multi_plan(&cap, if t <= 8 { 8 } else { MULTI_TOKENS })?;
+        // The smallest plan holding `t` (a DSpark block of 7 drafts verifies 8 tokens; one token,
+        // a round without drafts, runs the single-token kernels as plain decoding does).
+        let plan = self.gpu_multi_plan(
+            &cap,
+            if t == 1 {
+                1
+            } else if t <= 8 {
+                8
+            } else {
+                MULTI_TOKENS
+            },
+        )?;
         let _timer = prof::start(Cat::Matmul);
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
@@ -1405,7 +1428,7 @@ impl<'a> QwenModel<'a> {
                 feats[(j * nf + fi) * h..(j * nf + fi + 1) * h].copy_from_slice(&captured[(j * nc + ci) * h..(j * nc + ci + 1) * h]);
             }
         }
-        Some(logits)
+        Some((hidden, logits))
     }
 
     /// RoPE tables for positions `start..start + t`: plain positions, or M-RoPE positions when
@@ -1457,6 +1480,21 @@ impl<'a> QwenModel<'a> {
         let mut logits = vec![0f32; t * self.cfg.vocab_size];
         linear(&self.lm_head, self.cfg.vocab_size, self.cfg.hidden_size, hidden, t, &mut logits);
         logits
+    }
+
+    /// [`Self::logits`] of a few rows (1 to 4) on the accelerator's matrix-vector kernels when
+    /// one is active and the weights do not stream (a draft's head: the drafts may differ from
+    /// the CPU's in the last bits, the verification keeps the output exact).
+    pub fn logits_device(&self, hidden: &[f32], t: usize) -> Vec<f32> {
+        if self.stream.is_none() && t <= 4 {
+            let _timer = prof::start(Cat::Head);
+            let (v, h) = (self.cfg.vocab_size, self.cfg.hidden_size);
+            let mut logits = vec![0f32; t * v];
+            if crate::model::linear_rows_device(&mut [(&self.lm_head, None, v, &mut logits[..])], h, hidden, t) {
+                return logits;
+            }
+        }
+        self.logits(hidden, t)
     }
 
     pub fn forward(&self, sess: &mut QwenSession, tokens: &[u32]) -> Vec<f32> {

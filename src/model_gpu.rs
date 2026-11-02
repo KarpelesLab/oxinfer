@@ -435,7 +435,18 @@ impl<'a> Model<'a> {
         let mut cap: Vec<usize> = layers.iter().map(|&l| l - 1).collect();
         cap.sort_unstable();
         cap.dedup();
-        let plan = self.gpu_multi_plan(&cap, if t <= 8 { 8 } else { 16 })?;
+        // The smallest plan holding `t`: one token (a round without drafts) runs the single-token
+        // kernels, as plain decoding does.
+        let plan = self.gpu_multi_plan(
+            &cap,
+            if t == 1 {
+                1
+            } else if t <= 8 {
+                8
+            } else {
+                16
+            },
+        )?;
         let _timer = crate::prof::start(crate::prof::Cat::Matmul);
         let cfg = &self.cfg;
         let h = cfg.hidden_size;

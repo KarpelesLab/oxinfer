@@ -296,7 +296,7 @@ impl<'a> QwenMtp<'a> {
     pub fn draft_distribution(&self, model: &QwenModel, out: &[f32], sampler: &Sampler) -> Vec<(u32, f32)> {
         let h = self.hidden;
         match &self.head {
-            None => sampler.distribution(&model.logits(out, 1)),
+            None => sampler.distribution(&model.logits_device(out, 1)),
             Some(d) => {
                 let mut logits = vec![0f32; d.d2t.len()];
                 let unit = crate::stream::enter(&self.stream, 1);
@@ -651,12 +651,20 @@ impl<'m> MtpDecoder<'m> {
         } else {
             None
         };
-        let hs = if k > 0 {
-            model.forward_hidden_rec(&mut self.sess, &seq)
-        } else {
-            model.forward_hidden_mm(&mut self.sess, &seq, &[])
+        // On the GPU when plain decoding runs there (the same arithmetic: greedy output is plain
+        // GPU decoding's), else on the CPU.
+        let (hs, logits) = match model.gpu_verify_hidden(&mut self.sess, &seq) {
+            Some(r) => r,
+            None => {
+                let hs = if k > 0 {
+                    model.forward_hidden_rec(&mut self.sess, &seq)
+                } else {
+                    model.forward_hidden_mm(&mut self.sess, &seq, &[])
+                };
+                let logits = model.logits(&hs, seq.len());
+                (hs, logits)
+            }
         };
-        let logits = model.logits(&hs, seq.len());
         let verify_secs = t_round.elapsed().as_secs_f64() - draft_secs;
         if let Some(mut s1) = check {
             // Debug: the batched verification must match one-token forwards exactly.
