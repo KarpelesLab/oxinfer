@@ -712,9 +712,10 @@ impl Header {
                 3 | 4 => {
                     let special = types.and_then(|ty| ty[id].as_u64()) == Some(3);
                     added.push(json!({"id": id, "content": s, "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": special}));
-                    // Tekken numbers its specials first (0..1000): the model vocabulary must hold
-                    // them too, or the tokenizer renumbers the added tokens after it.
-                    if tekken {
+                    // Tekken numbers its specials first (0..1000), DeepSeek's BOS / EOS / pad are
+                    // 0..3: the model vocabulary must hold them too, or the tokenizer renumbers
+                    // the added tokens after it.
+                    if tekken || deepseek {
                         vocab.insert(s.to_string(), json!(id));
                     }
                 }
