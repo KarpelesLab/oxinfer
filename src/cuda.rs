@@ -7,8 +7,8 @@
 //! activations are copied up and results down per batch. Discrete GPUs pay for those transfers,
 //! so the threshold is higher than Metal's. Decode stays on the CPU.
 //!
-//! Prefill GEMMs (bf16, Q8, Q4) have been run on an RTX 5080; the attention, group norm, convolution
-//! and affine Q4 kernels are compile-checked only.
+//! Every kernel is tested against references from the definitions (`cargo test --lib cuda::` on a
+//! machine with an NVIDIA GPU) and has run on real models on an RTX 5080; see the README.
 
 use crate::gpu::{Backend, DeviceWeight, Job, WeightRef};
 use anyhow::{Result, anyhow, bail};

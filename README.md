@@ -1041,8 +1041,8 @@ steps at guidance 7.5. The CLIP tokenizer and text encoder, the UNet (ResNets, s
 with GEGLU, skip connections), the VAE decoder and the Euler samplers are implemented here.
 Activations are channels-last, so every convolution unfolds into the same matmul the language models
 use: the SIMD kernels apply on every CPU, and GPU backends run convolutions directly as an implicit
-GEMM (`Backend::conv2d`: the kernel gathers each pixel's neighbourhood itself; Metal measured, CUDA
-compile-checked, WebGPU in the browser). Weights are converted from fp16 to bf16 at load.
+GEMM (`Backend::conv2d`: the kernel gathers each pixel's neighbourhood itself; Metal and CUDA
+measured, WebGPU in the browser). Weights are converted from fp16 to bf16 at load.
 
 `tools/ref_sd.py` runs diffusers on the same noise and compares every stage (`OXINFER_SD_DUMP=dir`).
 With the weights rounded to bf16 on both sides the outputs agree to about 1e-6 (79 dB PSNR on
@@ -3467,7 +3467,7 @@ GPU (metal #0): Apple M5 Max, memory 115.4 GB (unified with CPU)
 | Apple Silicon (macOS, iOS) | NEON kernels + Metal GEMM for prefill; on M5 / A19 the GPU matrix units (prefill GEMMs and MoE experts); single-token decode entirely on the GPU (Llama 3, Qwen3 / 3.5 / 3.8 incl. MoE, Gemma 3 / 4 incl. 26B-A4B) | measured; the f32 GEMM gives bit-identical logits to the CPU path, the matrix units (default where present) ~3e-4 relative per product (`OXINFER_METAL_MMA=0` for bit-identical); iOS: runs in the Simulator (CPU and Metal; `ios/`) |
 | Apple Neural Engine (macOS 15 / iOS 18) | Core ML, for ANEMLL-converted models | measured on macOS; builds for iOS; see [Core ML](#core-ml--apple-neural-engine) |
 | x86-64 (Linux, Windows, macOS) | AVX2 + FMA kernels (bf16, Q8 via `maddubs`, Q4), scalar fallback below AVX2 | compiles for all three; the kernel tests pass on the scalar fallback under Rosetta (which exposes no AVX), so the AVX2 kernels themselves are not yet executed anywhere |
-| Linux / Windows + NVIDIA | CUDA driver API + NVRTC-compiled GEMM (`cuda.rs`), loaded as a native binary so a toolkit newer than the driver works | prefill GEMMs measured on Linux on an RTX 5080 (NVRTC 13.4, driver CUDA 13.2): Qwen3.5-0.8B bf16 logits bit-identical to the CPU path, Q8 and Q4 same generated text, 3627-token prefill 609 -> 915 tok/s (bf16); attention, norm, convolution and affine Q4 kernels compile-checked only; decode stays on the CPU; Windows not run |
+| Linux / Windows + NVIDIA | CUDA driver API + NVRTC-compiled kernels (`cuda.rs`): prefill GEMMs (bf16, Q8, Q4, affine Q4), convolutions, group / layer norms, attention; loaded as a native binary, so a toolkit newer than the driver works | measured on Linux on one RTX 5080 (NVRTC 13.4, driver CUDA 13.2), see [CUDA](#cuda); decode stays on the CPU; Windows and other GPUs not run |
 | Android (aarch64) | NEON kernels | cross-compiles (`aarch64-linux-android`) |
 | Vulkan | detection only (device name and memory) | no compute yet |
 | wasm32 (WASI) | simd128 kernels (bf16, Q8, Q4), threads via wasi-threads | measured: Qwen3.5-0.8B Q8 at 123 tok/s decode with 16 threads under wasmtime 30, identical output to native; see below |
@@ -3541,6 +3541,27 @@ Before that, forwarding only the matmuls of decode passes to the GPU was measure
 the 27B GGUF (`OXINFER_METAL_MIN_T=1`) a pass cost ~257 submissions with CPU work in between
 (~50 ms of submit-and-wait alone), so plain decode dropped from 10.7 to 5.5 tok/s.
 
+
+### CUDA
+
+Measured on an RTX 5080 (16 GB, compute capability 12.0) against a 64-core AVX-512 CPU, with a
+3,600-token prompt for the language models; "same" is the CPU path's result compared with `--device
+cuda`.
+
+| Model | Exercises | Agreement with the CPU | CPU | CUDA |
+|---|---|---|---|---|
+| Qwen3.5-0.8B bf16 | GEMM | logits bit-identical, same text | 609 tok/s | 915 tok/s |
+| Qwen3.5-0.8B `--quant q8` / `q4` | GEMM | same text | 646 / 632 tok/s | 923 / 927 tok/s |
+| mlx-community/Qwen3-4B-4bit | affine Q4 | logits bit-identical, same text | 144 tok/s | 220 tok/s |
+| Qwen3.5-9B (15.9 GB of streamed weights, more than fits) | layers past VRAM stay on the CPU | logits bit-identical, same text | 94 tok/s | 261 tok/s |
+| SD-Turbo, 512x512 | convolutions, norms, attention | 83.4 dB; `OXINFER_GPU_CHECK=1` worst rel L2: attention 3.5e-6, conv+norm 1.5e-6 | UNet 2.56 s, VAE 9.16 s | UNet 0.88 s, VAE 1.83 s |
+| whisper-small `--precision bf16` | encoder | same transcript | encoder 1.44 s | encoder 0.50 s |
+
+Short inputs stay on the CPU (see `wants`), but opening the device costs about 0.1 s at start-up.
+FLUX, Qwen-Image, Step1X and OmniGen2 use the same kernels and have not been run on CUDA.
+
+`cargo test --lib cuda::` compares every kernel with a reference computed in f64 from its
+definition; it fails if a kernel does not compile or load, and skips without an NVIDIA GPU or NVRTC.
 ### WebAssembly
 
 `.cargo/config.toml` turns on `simd128` for the wasm targets (every current engine supports it;
