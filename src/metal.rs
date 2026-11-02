@@ -14,6 +14,8 @@
 //! read straight from device memory with transposed 8x8 loads; `simdgroup_float8x8` FMAs do the
 //! math. Accumulators must be named variables: arrays of `simdgroup_float8x8` are spilled to
 //! memory by the shader compiler and run 12x slower. Results are bit-identical to the CPU path.
+//! The weight formats: bf16, oxinfer's Q8 / Q4, the GGUF block types, and FP8 E4M3 with 128x128
+//! block scales (the official Mistral Large 4 checkpoint), each read in place.
 //!
 //! Attention: unmasked heads of 64 (Whisper's encoder, SD 2.x / SD-Turbo) or 128 (FLUX) run as one
 //! fused kernel (`flash_attn64` / `flash_attn128`, f32 simdgroup MMA with an online softmax; ~2x faster than the
