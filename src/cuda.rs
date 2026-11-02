@@ -7,7 +7,8 @@
 //! activations are copied up and results down per batch. Discrete GPUs pay for those transfers,
 //! so the threshold is higher than Metal's. Decode stays on the CPU.
 //!
-//! This backend is compile-checked but has not been run on NVIDIA hardware yet.
+//! Prefill GEMMs (bf16, Q8, Q4) have been run on an RTX 5080; the attention, group norm, convolution
+//! and affine Q4 kernels are compile-checked only.
 
 use crate::gpu::{Backend, DeviceWeight, Job, WeightRef};
 use anyhow::{Result, anyhow, bail};
@@ -57,6 +58,10 @@ dlsym::library! {
             pub fn nvrtcCompileProgram(prog: *mut c_void, n_opts: c_int, opts: *const *const c_char) -> c_int;
             pub fn nvrtcGetPTXSize(prog: *mut c_void, size: *mut usize) -> c_int;
             pub fn nvrtcGetPTX(prog: *mut c_void, ptx: *mut c_char) -> c_int;
+            #[optional]
+            pub fn nvrtcGetCUBINSize(prog: *mut c_void, size: *mut usize) -> c_int;
+            #[optional]
+            pub fn nvrtcGetCUBIN(prog: *mut c_void, cubin: *mut c_char) -> c_int;
             pub fn nvrtcGetProgramLogSize(prog: *mut c_void, size: *mut usize) -> c_int;
             pub fn nvrtcGetProgramLog(prog: *mut c_void, log: *mut c_char) -> c_int;
             pub fn nvrtcDestroyProgram(prog: *mut *mut c_void) -> c_int;
@@ -84,7 +89,12 @@ struct Q8W { const signed char* q; const float* s; };
 struct BfW { const unsigned short* w; };
 
 __device__ __forceinline__ float bf16f(unsigned short u) { return __uint_as_float(((unsigned int)u) << 16); }
-__device__ __forceinline__ float f16f(unsigned short h) { return __half2float(__ushort_as_half(h)); }
+__device__ __forceinline__ float f16f(unsigned short h) {
+    unsigned int e = (h >> 10) & 31, m = h & 1023, sign = ((unsigned int)(h & 0x8000)) << 16;
+    if (e == 31) return __uint_as_float(sign | 0x7f800000u | (m << 13));
+    if (e == 0) return __uint_as_float(sign | __float_as_uint((float)m * 5.9604644775390625e-8f));
+    return __uint_as_float(sign | ((e + 112) << 23) | (m << 13));
+}
 
 // 8 consecutive values (k0 .. k0+8, k0 % 8 == 0) of block b of one row.
 __device__ __forceinline__ void load8(Q4W w, unsigned int n_in, unsigned int row, unsigned int b, unsigned int k0, float* out) {
@@ -254,7 +264,7 @@ extern "C" __global__ void softmax_rows(float* s, unsigned int cols, unsigned in
     unsigned int r = blockIdx.x;
     float* row = s + (size_t)r * ld;
     unsigned int lim = causal ? min(r + 1, cols) : cols;
-    float m = -INFINITY;
+    float m = -__uint_as_float(0x7f800000u);
     for (unsigned int i = threadIdx.x; i < lim; i += 32) m = fmaxf(m, row[i] * scale);
     m = warp_max(m);
     float sum = 0.f;
@@ -356,7 +366,7 @@ impl CudaBackend {
         if rc != 0 {
             bail!("nvrtcCreateProgram failed ({rc})");
         }
-        let arch = CString::new(format!("--gpu-architecture=compute_{major}{minor}"))?;
+        let arch = CString::new(format!("--gpu-architecture=sm_{major}{minor}"))?;
         let opts = [arch.as_ptr(), c"--use_fast_math".as_ptr()];
         let rc = unsafe { nvrtc.nvrtcCompileProgram(prog, opts.len() as c_int, opts.as_ptr()) };
         if rc != 0 {
@@ -368,17 +378,26 @@ impl CudaBackend {
             bail!("NVRTC compilation failed ({rc}):\n{}", String::from_utf8_lossy(&log));
         }
         let mut n = 0usize;
-        unsafe { nvrtc.nvrtcGetPTXSize(prog, &mut n) };
-        let mut ptx = vec![0u8; n.max(1)];
-        unsafe { nvrtc.nvrtcGetPTX(prog, ptx.as_mut_ptr() as *mut c_char) };
+        let cubin_rc = unsafe { nvrtc.nvrtcGetCUBINSize(prog, &mut n) };
+        // Prefer a native binary: PTX carries the toolkit's version, which a driver older than the
+        // toolkit refuses to load, whereas a binary for this exact core needs no driver JIT.
+        let mut image;
+        if cubin_rc == Some(0) && n > 0 {
+            image = vec![0u8; n];
+            unsafe { nvrtc.nvrtcGetCUBIN(prog, image.as_mut_ptr() as *mut c_char) };
+        } else {
+            unsafe { nvrtc.nvrtcGetPTXSize(prog, &mut n) };
+            image = vec![0u8; n.max(1)];
+            unsafe { nvrtc.nvrtcGetPTX(prog, image.as_mut_ptr() as *mut c_char) };
+        }
         unsafe { nvrtc.nvrtcDestroyProgram(&mut prog) };
-        if *ptx.last().unwrap_or(&1) != 0 {
-            ptx.push(0);
+        if *image.last().unwrap_or(&1) != 0 {
+            image.push(0);
         }
         let mut module: *mut c_void = std::ptr::null_mut();
         check(
             &cu,
-            unsafe { cu.cuModuleLoadData(&mut module, ptx.as_ptr() as *const c_void) },
+            unsafe { cu.cuModuleLoadData(&mut module, image.as_ptr() as *const c_void) },
             "cuModuleLoadData",
         )?;
         let mut funcs = [std::ptr::null_mut(); 3];
