@@ -212,7 +212,8 @@ RoPE on 64 dims, a sigmoid output gate), SiLU MLPs and zero-centred RMSNorm. The
 keep a fixed-size state instead of a KV cache, so memory does not grow with context for 48 of the
 64 layers. The vision tower takes images and videos (see
 [Image, video and audio input](#image-video-and-audio-input)); the MTP head drives speculative
-decoding with `--mtp` (see Speculative decoding).
+decoding with `--mtp` (see Speculative decoding; the default for Qwen3.5-4B and Qwen3.5-9B, see
+[DSpark drafts for Qwen and Gemma 4](#dspark-drafts-for-qwen-and-gemma-4) for how it compares).
 
 The MoE variants (`qwen3_5_moe`, Qwen3.5/3.6-35B-A3B) replace each MLP with 256 routed SiLU
 experts of width 512 (softmax router, top 8, weights renormalised) plus a shared expert scaled by
@@ -240,34 +241,161 @@ Text, images, video and audio are supported (E2B/E4B have both towers).
 `--draft` also takes a DSpark draft for Qwen3, Qwen3.5 / 3.8 and Gemma 4 targets: a Hugging Face
 draft folder or repo id (DeepSpec `Qwen3DSparkModel` / `Gemma4DSparkModel`, SpecForge / RadixArk
 `DSparkDraftModel`, vLLM speculators, NVIDIA Model Optimizer, z-lab `DFlashDraftModel` with a
-Markov head) or a llama.cpp `dflash` GGUF. The draft is a few grouped-query attention layers
-(Gemma 4: K = V attention, value norm, sandwich norms, layer scalars, proportional RoPE, GELU)
-that read the target's residual streams at a few layers, plus the Markov head and the optional
-confidence head (`--spec-draft-conf-min C` cuts a block where its estimate falls below C). The
-whole trained block runs each pass; each round's length (0 to the block, 0 being a plain step)
-is chosen from the measured cost of a draft pass and of verifying each length and from the recent
-acceptance per position, unless `--spec-draft-fixed`. Greedy output is the plain greedy output
-token for token; sampling keeps the target's distribution.
+Markov head) or a GGUF: llama.cpp's `dflash` files (as `convert_hf_to_gguf.py` writes them, or
+BeeLlama's, e.g. `Anbeeld/Qwen3-14B-DSpark-GGUF`) and the `dspark` files of llama.cpp's DSpark
+branch (`ankk98/dspark-qwen3-8b-block7-Q4_K_M-GGUF`, `ankk98/dspark-gemma4-12b-block7-Q4_0-GGUF`,
+which llama.cpp master does not load). A repository holding several GGUF quantizations gives its
+`Q8_0` file. The draft is a few grouped-query attention layers (Gemma 4: K = V attention, value
+norm, sandwich norms, layer scalars, proportional RoPE, GELU) that read the target's residual
+streams at a few layers, plus the Markov head and the optional confidence head
+(`--spec-draft-conf-min C` cuts a block where its estimate falls below C). A draft as wide as its
+target uses the target's embeddings and LM head (the drafts ship frozen copies; a GGUF's copy may
+be quantized further), and the draft's weights are quantized like the target's (a Q4 draft for a
+Q4 target: as many drafts accepted as with the bf16 draft on Qwen3.8-27B, and its passes 23-27 ms
+instead of 31-34). Greedy output is the plain greedy output token for token; sampling keeps the
+target's distribution.
 
-On Metal, when GPU decoding is on, the verification is one multi-token decode pass (the weights
-read once for up to 8 or 16 tokens, each token's arithmetic exactly the single-token kernels', so
-the output is the plain GPU greedy output bit for bit), and the draft itself runs as two such
-passes (its context and its block). `draft=auto` (CLI `--draft auto`) finds the draft inside the
-model folder (`dspark*`) or a known draft of the model in the download cache (`dspark::KNOWN`);
-none is used by default yet.
+**How a draft is found.** `--draft PATH` (or a repo id, `org/name:Q8_0` for one file of a GGUF
+repository) uses that draft. Without `--draft`, a draft is used when one is on disk and the pair
+is a default (the table below): a `dspark*` draft folder or GGUF inside the model folder (or a
+`dspark*.gguf` beside a GGUF model), or a known draft of the model (`dspark::KNOWN`) in the
+download cache, i.e. an `org--name` folder next to the model's (the model is recognized by its
+folder name, a converted copy's `name-oxinfer-q4`, a GGUF repository's `name-GGUF`, or a GGUF file
+name up to its quantization). Nothing is downloaded implicitly; when a default draft is known but
+missing, the CLI says so. `--draft auto` takes any draft found that way (default or not) and,
+when there is none, fetches the model's known draft (its Hugging Face original) into the cache:
 
-| target | draft | agreement with the float32 reference | tokens per round | speed (M5 Max, Metal, shared machine) |
+```sh
+./target/release/oxinfer --model Qwen/Qwen3-8B-GGUF:Q8_0 --draft auto -p "..."  # fetches deepseek-ai/dspark_qwen3_8b_block7 once
+./target/release/oxinfer --model Qwen/Qwen3-8B-GGUF:Q8_0 -p "..."               # then uses it by default
+./target/release/oxinfer --model Qwen/Qwen3-8B-GGUF:Q8_0 --no-draft -p "..."    # plain
+```
+
+Library: `EngineOptions::draft` (`auto`, a path or repo id, `none`; unset for the default) and the
+C API key `draft`; `dspark::draft_for`, `default_draft`, `known_drafts`, `auto_repo`, `draft_in`
+and `engine::resolve_auto_draft` do the search.
+
+**Each round** (unless `--spec-draft-fixed`, or when the model streams) is a draft pass or a plain
+step, whichever has given more tokens per second lately (measured, the first two samples of each
+kind discarded as warm-up). While plain steps win, a draft round is still tried after 6 plain
+rounds, then twice as long apart after each such probe that loses (up to 96). A draft pass costs
+the same for any number of drafts used, so it always drafts the whole block; then it verifies the
+part of the block with the most expected tokens per second: the cost of verifying each length is
+measured (interpolated where not yet measured), and the chance that each draft is accepted (when
+the ones before it were) is estimated from its probability under the draft model, calibrated
+online by tenths (decayed counts of verified drafts and accepted ones, with the draft's own
+probability as a prior). The cut depends on the drafts only, so sampling keeps the target's
+distribution. The draft's context (keys and values of the committed positions) is computed
+lazily, in one pass before the next draft: rounds without a draft add no draft work.
+
+**On the GPU** (Metal, GPU decoding on), the verification is one decode pass for all its tokens,
+each token's arithmetic exactly the single-token kernels' (the output is the plain GPU greedy
+output bit for bit). The multi-token matrix-vector kernels take the tokens 4 at a time over 2
+rows per threadgroup: each row chunk's quants are decoded to floats once (Q4, Q4_0, Q8, Q8_0,
+bf16, f16; the products and sums are then the single-token kernel's, in its order), each token's
+inputs loaded once for both rows. For 8 tokens of a 17408 x 5120 matrix that is ~400 us at Q8 and
+~500 us at Q4 (one token: 180 / 100 us; before: 620-1000 us), an 8-token verification of
+Qwen3.8-27B at Q4 ~150 ms instead of 205-280 (a plain step: 30 ms). MoE targets verify in one
+pass too (Qwen3.5-35B-A3B: 9 tokens in 30-45 ms, a plain step 6-8 ms; Gemma 4 26B-A4B's graph
+takes the same path, untried for lack of a draft): the attention, recurrent and shared parts over
+all the tokens, each token's routing and experts with the single-token kernels (tokens route to
+different experts). A round without drafts runs a one-token plan (the plain decoding kernels plus the
+feature copies), and the plans of a model share their device copies of the caches. The draft runs
+as two such passes (its context and its block).
+
+Defaults (Metal, M5 Max): a pair is on by default where it was faster than plain decoding on
+average over 8-12 prompts (code, prose, chat, math, 200 tokens each):
+
+| target | draft | default | plain -> DSpark, mean tok/s (code / prose / chat / math) | load |
 |---|---|---|---|---|
-| Qwen/Qwen3-4B (bf16) | deepseek-ai/dspark_qwen3_4b_block7 | rel. logit error 2-2.5e-6 (CPU), 1.2e-4 (Metal); same drafts | code 5.9, prose 2.2 | code 62 -> 110 tok/s, prose 62 -> 72; CPU only: code 32 -> 63 |
-| Qwen3.8-27B (q4) | RadixArk/Qwen3.8-27B-DSpark | 2-4e-6; same drafts | code 1.7-5.8 | slower than plain on Metal (q4 multi-token passes are compute-bound): 36 -> 26 tok/s; CPU only: code 12.4 -> 15.1 |
-| Qwen3.8-27B (q4) | jialinyyzz/Qwen3.8-27B-DSpark-drafter | 1.5-2.3e-6; same drafts | math 1.3 | 36 -> 20 tok/s |
-| google/gemma-4-12B-it (q8) | deepseek-ai/dspark_gemma4_12b_block7 | 1.8-3.4e-6; same drafts | code 3.6, story 1.5 | code 37 -> 50 tok/s, story 39 -> 34; CPU only: 10.6 -> 22.4 |
+| Qwen/Qwen3-4B (bf16) | deepseek-ai/dspark_qwen3_4b_block7 | yes | 52.2 -> 107.2 (48 -> 115 / 53 -> 71 / 53 -> 99 / 55 -> 145) | 13-15 |
+| Qwen/Qwen3-8B (Q8_0 GGUF) | deepseek-ai/dspark_qwen3_8b_block7 | yes | 60.0 -> 78.7 (61 -> 95 / 59 -> 58 / 60 -> 60 / 60 -> 101) | 6-9 |
+| Qwen/Qwen3-8B (Q8_0 GGUF) | ankk98/dspark-qwen3-8b-block7-Q4_K_M-GGUF | yes | 60.0 -> 77.9 | 6-9 |
+| Qwen/Qwen3-14B (Q8_0 GGUF) | deepseek-ai/dspark_qwen3_14b_block7 | yes | 31.5 -> 44.4 (34 -> 56 / 34 -> 33 / 34 -> 39 / 25 -> 50) | 5-14 |
+| Qwen/Qwen3-14B (Q8_0 GGUF) | Anbeeld/Qwen3-14B-DSpark-GGUF (Q8_0) | yes | 31.5 -> 43.5 | 5-14 |
+| google/gemma-4-12B-it (q8) | deepseek-ai/dspark_gemma4_12b_block7 | yes | 34.6 -> 43.1 (34 -> 48 / 34 -> 36 / 35 -> 37 / 36 -> 52) | 11-16 |
+| google/gemma-4-12B-it | ankk98/dspark-gemma4-12b-block7-Q4_0-GGUF | no | Q4_0 throughout: fewer drafts accepted (4.3 tokens per round on a code prompt vs 5.2) | |
+| Qwen3.8-27B (q4) | RadixArk/Qwen3.8-27B-DSpark | no | 30.6 -> 29.6 (31 -> 31 / 31 -> 29 / 30 -> 29 / 30 -> 30) | 6-12 |
+| Qwen3.8-27B (q4) | jialinyyzz/Qwen3.8-27B-DSpark-drafter | no | 30.6 -> 29.5 | 6-12 |
+| Qwen3.5-35B-A3B (q4) | jinzex/Qwen3.5-35B-A3B-DSpark | no | 126.9 -> 85.6 (125 -> 89 / 128 -> 84 / 136 -> 85 / 119 -> 84) | 13-24 |
+| google/gemma-4-31B-it (q4) | RedHatAI/gemma-4-31B-it-speculator.dspark | no | 23.2 -> 22.4 (21 -> 21 / 24 -> 23 / 24 -> 22 / 25 -> 23) | 12-24 |
+| google/gemma-4-31B-it (q4) | Hikari07jp/DSpark-Gemma-4-31B-draft | no | 23.2 -> 21.6 | 12-24 |
+
+All the outputs above are the plain greedy outputs, token for token (both GGUF and Hugging Face
+drafts). Where the draft is not a default, the policy decodes mostly plainly and the loss is its
+probes: verifying 8 tokens costs ~5 plain steps at Q4 (the multi-token kernels must reproduce the
+single-token arithmetic, see the llama.cpp comparison below) against ~2-3 at Q8 / bf16, so the Q4
+targets only gain on code and math. Qwen3.5-35B-A3B decodes a token in 6-8 ms; a pass over 9
+tokens costs 30-45 ms (each token's 8 routed experts are its own) and a draft pass 15 ms, so even
+its code rounds (5 tokens, 65% of the drafts accepted) lose, and on prose the plain rounds run at
+plain speed while 6 probes (75 ms each) cost the 30%.
+
+Agreement:
+
+| target | draft | agreement with the float32 reference |
+|---|---|---|
+| Qwen/Qwen3-4B (bf16) | deepseek-ai/dspark_qwen3_4b_block7 | rel. logit error 2-2.5e-6 (CPU), 1.2e-4 (Metal); same drafts |
+| Qwen3.8-27B | RadixArk/Qwen3.8-27B-DSpark | 2-4e-6; same drafts |
+| Qwen3.8-27B | jialinyyzz/Qwen3.8-27B-DSpark-drafter | 1.5-2.3e-6; same drafts |
+| google/gemma-4-12B-it | deepseek-ai/dspark_gemma4_12b_block7 | 1.8-3.4e-6; same drafts |
+| google/gemma-4-31B-it | RedHatAI/gemma-4-31B-it-speculator.dspark | 2.6-9.1e-6; same 8 drafts |
+| google/gemma-4-31B-it | Hikari07jp/DSpark-Gemma-4-31B-draft | 1.0-2.3e-6; same 15 drafts |
+| Qwen/Qwen3.5-35B-A3B | jinzex/Qwen3.5-35B-A3B-DSpark | 1.6-2.7e-6; same 8 drafts |
+
+(bf16 targets on the CPU; the reference takes the target's embeddings and head in bf16, so with
+a Q4 target, whose head is Q8, the draft logits differ by 4-13% while the drafts stay the same.)
+
+GGUF drafts against the original draft (same target features, all 7 slots, chained on each
+draft's own tokens): llama.cpp master's conversion of the Gemma 4 12B draft at F16 matches to
+2-3e-7 relative (KL < 1e-12; the converter needed two local fixes: transformers 5.23 drops
+`global_head_dim`, and it refuses the draft's logit soft-cap, which the `dflash` graph supports),
+at Q8_0 to 0.6-1.4e-3 (KL < 1e-5); the Qwen3-8B conversion at Q8_0 to 4-7e-3, Anbeeld's Qwen3-14B
+Q8_0 to 4-6e-3, ankk98's Qwen3-8B Q4_K_M to 5-9e-2 (KL < 6e-3), all with the same drafts; ankk98's
+Gemma 4 12B "pure Q4_0" to 0.12-0.17 (same drafts on the target's head; with its own Q4_0 head the
+first draft differed).
 
 The reference is `tools/ref_dspark_hf.py` (DeepSpec's modeling code in float32, fed the target
 features oxinfer computes); `examples/dspark_check.rs` writes the features and the draft logits
-and compares greedy output with and without the draft. Not done yet: the Gemma 4 31B drafts
-(RedHatAI speculators, Hikari07jp), Qwen3.5-35B-A3B (MoE targets have no multi-token GPU pass
-yet), a comparison with llama.cpp, and a default draft per model.
+and compares greedy output with and without the draft.
+
+**DSpark or MTP.** Qwen3.5 / 3.8 models also have their own multi-token-prediction layer
+(`--mtp`, see [Speculative decoding](#speculative-decoding)). Its verification now runs as the
+same GPU passes (it used the CPU's multi-token kernels, so its greedy output followed CPU decoding
+rather than plain GPU decoding; it is now plain GPU decoding token for token), and its draft head on
+the GPU. Same prompts, 200 tokens, greedy, tok/s (tokens per verification, drafts accepted; the
+Qwen3.8-27B copy converted to Q4 takes its MTP layer from the original with `--mtp-from`):
+
+| model | plain | DSpark (default policy) | MTP (3 drafts, adaptive) | default |
+|---|---|---|---|---|
+| Qwen3.8-27B (q4; load 6-12) | code 30.8, prose 31.1, chat 30.3, math 30.3 | 31.2, 29.1, 28.8, 29.6 (RadixArk) | 35.6 (3.3, 82%), 25.7 (2.3, 53%), 26.3, 34.3 | plain |
+| Qwen3.5-35B-A3B (q4; load 13-24) | 125, 128, 136, 119 | 89, 84, 85, 84 | 109 (3.2), 82 (2.2), 81, 104 | plain |
+| Qwen3.5-4B (bf16; load 10-13) | 55.8, 50.8, 61.2, 61.1 | (no draft) | 76.0 (3.1), 65.2 (2.2), 71.5, 92.3 | MTP |
+| Qwen3.5-9B (q8; load 8-11) | 57.2, 56.5, 56.8, 57.8 | (no draft) | 81.3 (3.3), 58.9 (2.2), 63.2, 88.3 | MTP |
+
+MTP drafts one token per step (each step reads its decoder layer and the LM head), DSpark a
+whole block per pass; on code and math MTP accepts as much as DSpark at a lower cost per round, but
+it has no plain fallback, so it loses on prose and chat, where its acceptance drops to ~50%. MTP is therefore
+the default for Qwen3.5-4B and Qwen3.5-9B (`qwen_mtp::BY_DEFAULT`; `--no-draft`, engine
+`draft=none`, decodes plainly), and neither for Qwen3.8-27B nor Qwen3.5-35B-A3B at Q4.
+
+Against llama.cpp (master of 2026-11-02, `29c720eaf7`, `llama-server`, `--spec-type draft-dspark`,
+every layer on the GPU; the same GGUF target and draft files, the drafts converted by
+`convert_hf_to_gguf.py`; 12 prompts, 200 tokens, greedy, thinking off; tok/s means, drafts
+accepted in parentheses, load 5-13):
+
+| target, draft | plain llama.cpp / oxinfer | llama.cpp, 7 drafts | llama.cpp, 3 drafts | oxinfer (default policy) |
+|---|---|---|---|---|
+| Qwen3-8B Q8_0, dspark_qwen3_8b Q8_0 | 61.6 / 60.9 | 168.3 (code 213, prose 110; 31-75%) | 119.5 (50-90%) | 77.5 (code 97, prose 61; 59-89%) |
+| gemma-4-12B-it Q8_0, dspark_gemma4_12b Q8_0 | 36.0 / 36.5 | 81.9 (code 126, prose 58; 27-64%) | 69.5 (51-84%) | 43.6 (code 54, prose 37; 53-81%) |
+
+Plain decoding runs at the same speed, and the drafts agree (oxinfer accepts more of them since it
+cuts unlikely ones), but llama.cpp verifies 8 tokens for little more than a plain step (its prose
+runs at 110 tok/s with 31% of the drafts accepted, against 62 plain): its batched kernels reorder
+the arithmetic (a token's logits depend on the batch), where oxinfer's verification must
+reproduce the single-token kernels bit for bit to keep greedy output identical to plain decoding
+(an 8-token verification costs ~2 plain steps at Q8, ~5 at Q4).
+Closing that gap needs single-token kernels whose arithmetic does not depend on the token count,
+e.g. both built on the matrix units (not done).
 
 ### Mistral Large 4 (1T-A52B)
 
@@ -3407,6 +3535,9 @@ of precision.
 
 ### Comparison with llama.cpp
 
+(Speculative decoding with DSpark drafts against llama.cpp master: see
+[DSpark drafts for Qwen and Gemma 4](#dspark-drafts-for-qwen-and-gemma-4).)
+
 Same GGUF file in both engines, same prompt tokens (llama.cpp gets the text oxinfer's chat
 template produces), greedy, 256 generated tokens (fewer when the model ends its turn) after a
 short code prompt and a short prose prompt, plus prompt processing of 512 and 2048 tokens.
@@ -3612,7 +3743,12 @@ layer (`mtp.*`, `qwen_mtp.rs`): one gated-attention decoder layer that takes the
 final-normed hidden state at position i and the embedding of token i+1 (each RMS-normed,
 concatenated embedding first, projected by `mtp.fc`), runs at position i with its own KV cache,
 and predicts token i+2 through the shared LM head; further drafts feed it its own output (the
-vLLM `qwen3_5_mtp` scheme). The default is 3 drafts per round, adapting between 1 and 3. Both
+vLLM `qwen3_5_mtp` scheme). The default is 3 drafts per round, adapting between 1 and 3. With GPU
+decoding the verification is one GPU pass (the same multi-token kernels as DSpark's, so greedy output
+is plain GPU decoding's) and the draft head runs on the GPU; MTP is on by default for Qwen3.5-4B and
+Qwen3.5-9B, where it measured faster on every kind of prompt (numbers and the comparison with DSpark
+in [DSpark drafts for Qwen and Gemma 4](#dspark-drafts-for-qwen-and-gemma-4); `--no-draft` turns it
+off). Both
 greedy and sampled decoding are supported: greedy output is identical to plain greedy (the
 decode kernels give bit-identical rows for up to 7 tokens per pass, so the verification logits
 equal one-token logits; checked on long outputs with and without `--think`, bf16 / Q8 / Q4,

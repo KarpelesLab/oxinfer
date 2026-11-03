@@ -320,6 +320,22 @@ impl<'a> QwenModel<'a> {
     }
 }
 
+/// Models (Hugging Face names, without the organization) that decode with their MTP layer by
+/// default, where it measured faster than plain decoding on average over code, prose, chat and
+/// math prompts (Metal, M5 Max): Qwen3.5-4B (bf16) 57 -> 76 tok/s, Qwen3.5-9B (q8) 57 -> 73.
+/// Qwen3.8-27B (q4: 30.6 -> 30.5, code +16% but prose -17%) and Qwen3.5-35B-A3B (q4: 127 -> 94)
+/// decode plainly unless asked (see the README).
+pub const BY_DEFAULT: &[&str] = &["Qwen3.5-4B", "Qwen3.5-9B"];
+
+/// Whether the model at `model` (a folder or GGUF file, named as [`BY_DEFAULT`] lists them; a
+/// converted copy or the download cache's `org--name` folder) decodes with its MTP layer unless
+/// told otherwise (if it has one).
+pub fn by_default(model: &std::path::Path) -> bool {
+    crate::dspark::model_names(model)
+        .iter()
+        .any(|n| BY_DEFAULT.iter().any(|d| d.eq_ignore_ascii_case(n)))
+}
+
 /// The longest draft whose verification (`draft + 1` tokens) still runs the decode matmul
 /// kernels, which give bit-identical rows whatever the token count; longer verifications use the
 /// prefill GEMM, whose rounding differs, so greedy output can then drift from plain decoding at

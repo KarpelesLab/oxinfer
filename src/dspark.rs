@@ -767,20 +767,23 @@ pub const STREAM_P_MIN: f32 = 0.85;
 pub const DS4_DRAFT_TOKENS: usize = 3;
 
 /// Published DSpark drafts and their targets (Hugging Face repo ids), and whether that pair is
-/// used by default (where it measured faster than plain decoding on average, see the README).
+/// used by default: where it measured faster than plain decoding on average over code, prose,
+/// chat and math prompts (Metal, M5 Max; the README has the numbers). The Q4 targets (Qwen3.8-27B,
+/// Gemma 4 31B), Qwen3.5-35B-A3B (3B active: a plain step takes 8 ms) and the pure-Q4_0 Gemma 4
+/// draft were not faster.
 /// A draft is found in the download cache (`org--name` folders beside the target's), or fetched
 /// by `draft=auto` (CLI `--draft auto`) when it is not there; GGUF draft repositories (llama.cpp
 /// conversions) are found but not fetched.
 pub const KNOWN: &[(&str, &str, bool)] = &[
-    ("Qwen/Qwen3-4B", "deepseek-ai/dspark_qwen3_4b_block7", false),
-    ("Qwen/Qwen3-8B", "deepseek-ai/dspark_qwen3_8b_block7", false),
-    ("Qwen/Qwen3-8B", "ankk98/dspark-qwen3-8b-block7-Q4_K_M-GGUF", false),
-    ("Qwen/Qwen3-14B", "deepseek-ai/dspark_qwen3_14b_block7", false),
-    ("Qwen/Qwen3-14B", "Anbeeld/Qwen3-14B-DSpark-GGUF", false),
+    ("Qwen/Qwen3-4B", "deepseek-ai/dspark_qwen3_4b_block7", true),
+    ("Qwen/Qwen3-8B", "deepseek-ai/dspark_qwen3_8b_block7", true),
+    ("Qwen/Qwen3-8B", "ankk98/dspark-qwen3-8b-block7-Q4_K_M-GGUF", true),
+    ("Qwen/Qwen3-14B", "deepseek-ai/dspark_qwen3_14b_block7", true),
+    ("Qwen/Qwen3-14B", "Anbeeld/Qwen3-14B-DSpark-GGUF", true),
     ("Qwen/Qwen3.8-27B", "RadixArk/Qwen3.8-27B-DSpark", false),
     ("Qwen/Qwen3.8-27B", "jialinyyzz/Qwen3.8-27B-DSpark-drafter", false),
     ("Qwen/Qwen3.5-35B-A3B", "jinzex/Qwen3.5-35B-A3B-DSpark", false),
-    ("google/gemma-4-12B-it", "deepseek-ai/dspark_gemma4_12b_block7", false),
+    ("google/gemma-4-12B-it", "deepseek-ai/dspark_gemma4_12b_block7", true),
     ("google/gemma-4-12B-it", "ankk98/dspark-gemma4-12b-block7-Q4_0-GGUF", false),
     ("google/gemma-4-31B-it", "RedHatAI/gemma-4-31B-it-speculator.dspark", false),
     ("google/gemma-4-31B-it", "Hikari07jp/DSpark-Gemma-4-31B-draft", false),
@@ -797,7 +800,7 @@ fn is_quant_tag(p: &str) -> bool {
 /// The names (without the organization) the model at `model` may have on Hugging Face: its
 /// folder's (`org--name` in the download cache, a converted copy's `name-oxinfer-q4`, a GGUF
 /// repository's `name-GGUF`) and, for a GGUF file, its file name up to the quantization.
-fn model_names(model: &Path) -> Vec<String> {
+pub(crate) fn model_names(model: &Path) -> Vec<String> {
     let gguf = crate::gguf::is_gguf(model);
     let mut v = Vec::new();
     let folder = if gguf { model.parent() } else { Some(model) };

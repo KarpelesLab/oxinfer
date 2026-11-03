@@ -195,8 +195,8 @@ fn usage() -> ! {
          \x20                      and sampled, same output distribution; `auto`: the one beside the model or\n\
          \x20                      in the download cache, else the model's known draft fetched; see the\n\
          \x20                      README) or a Gemma 4 assistant (drafter) model (greedy only)\n\
-         \x20 --no-draft           no DSpark draft (one beside the model or in the download cache is used by\n\
-         \x20                      default where it measured faster)\n\
+         \x20 --no-draft           plain decoding: no DSpark draft (one beside the model or in the download\n\
+         \x20                      cache is used by default where it measured faster) nor default MTP\n\
          \x20 --draft-tokens N     max draft tokens per round (default 6 with a drafter, adaptive from 3;\n\
          \x20                      3 with --mtp, 8 with --mtp --stream; DSpark: Mistral Large 4 / DeepSeek V4\n\
          \x20                      3, Qwen / Gemma 4 the whole block)\n\
@@ -211,8 +211,9 @@ fn usage() -> ! {
          \x20 --spec-draft-conf-min C  DSpark: cut a block before the first draft whose confidence-head\n\
          \x20                      estimate of being accepted is below C (default 0: off)\n\
          \x20 --mtp                Qwen3.5/3.8: speculative decoding with the checkpoint's multi-token\n\
-         \x20                      prediction layer (greedy and sampled; same output distribution)\n\
-         \x20 --mtp-fixed          with --mtp, always draft --draft-tokens (default: adaptive 1..N)\n\
+         \x20                      prediction layer (greedy and sampled; same output distribution); the\n\
+         \x20                      default for Qwen3.5-4B / 9B (--no-draft: plain decoding)\n\
+         \x20 --mtp-fixed         with --mtp, always draft --draft-tokens (default: adaptive 1..N)\n\
          \x20 --mtp-from DIR       implies --mtp, with the MTP weights from another checkpoint (e.g. the\n\
          \x20                      original one when the model is a converted copy without them)\n\
          \x20 --mtp-cost           with --mtp, pick each round's draft length from measured round times and\n\
@@ -1529,7 +1530,7 @@ fn run_embed(args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn run_qwen(args: Args) -> Result<()> {
+fn run_qwen(mut args: Args) -> Result<()> {
     let t0 = Instant::now();
     if args.mtp && args.draft.is_some() {
         bail!("choose --mtp or a DSpark --draft, not both");
@@ -1574,6 +1575,20 @@ fn run_qwen(args: Args) -> Result<()> {
         pool::threads(),
         t0.elapsed().as_secs_f64()
     );
+    // The MTP layer where it is the default (`qwen_mtp::BY_DEFAULT`), unless --no-draft, a draft,
+    // or a mode plain decoding serves.
+    if !args.mtp
+        && draft.is_none()
+        && args.draft.is_none()
+        && !args.no_draft
+        && args.save_quantized.is_none()
+        && !(args.tools || args.dump_logits.is_some() || args.print_prompt || iv_requested(&args.iv))
+        && oxinfer::qwen_mtp::by_default(&args.model)
+        && oxinfer::qwen_mtp::mtp_prefix(&files).is_some()
+    {
+        eprintln!("[MTP speculative decoding: this model's default (--no-draft for plain decoding)]");
+        args.mtp = true;
+    }
     // Converted checkpoints keep the MTP layer (loading it marks its tensors for writing).
     let side = match &args.mtp_from {
         Some(d) => Some(safetensors::ModelFiles::open(d, false)?),
@@ -1889,16 +1904,17 @@ fn pick_dspark(args: &Args) -> Result<Option<PathBuf>> {
         None if oxinfer::dspark::BY_DEFAULT && !args.no_draft && !plain_only => oxinfer::dspark::default_draft(&args.model),
         None => None,
     };
-    if draft.is_none()
-        && args.draft.is_none()
-        && !args.no_draft
-        && !plain_only
-        && let Some(b) = &beside
-    {
-        eprintln!(
-            "[a DSpark draft is beside the model ({}): --draft auto uses it]",
-            b.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
-        );
+    if draft.is_none() && args.draft.is_none() && !args.no_draft && !plain_only {
+        if let Some(b) = &beside {
+            eprintln!(
+                "[a DSpark draft is available ({}; not a default for this model): --draft auto uses it]",
+                b.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()
+            );
+        } else if oxinfer::dspark::known_drafts(&args.model).iter().any(|d| d.1)
+            && let Some(repo) = oxinfer::dspark::auto_repo(&args.model)
+        {
+            eprintln!("[a faster DSpark draft is known for this model: --draft auto fetches {repo}]");
+        }
     }
     Ok(draft)
 }

@@ -104,7 +104,8 @@ pub struct EngineOptions {
     /// and replies stop at the limit. Key `max_context`. Default: unlimited.
     pub max_context: Option<usize>,
     /// Qwen3.5/3.8: speculative decoding with the checkpoint's multi-token prediction layer
-    /// (greedy and sampled; same output distribution). Key `mtp`.
+    /// (greedy and sampled; same output distribution). Also on, unless `draft` is set
+    /// (`none`: plain decoding), for the models of [`crate::qwen_mtp::BY_DEFAULT`]. Key `mtp`.
     pub mtp: bool,
     /// Implies `mtp`: take the MTP weights (and a draft head, if any) from this checkpoint
     /// (path or repo id), e.g. the original one for a converted copy. Key `mtp_from`.
@@ -1229,6 +1230,15 @@ impl Engine {
                     (Some(d), true) => Some(arena.keep(ModelFiles::open(d, false)?)),
                     _ => None,
                 };
+                // The MTP layer where it is the default (`qwen_mtp::BY_DEFAULT`), unless `draft`
+                // says otherwise (`none`: plain decoding), a DSpark draft is used or the model
+                // serves decisions.
+                let mtp = mtp
+                    || (opts.draft.is_none()
+                        && dspark.is_none()
+                        && decision.is_none()
+                        && crate::qwen_mtp::by_default(&dir)
+                        && crate::qwen_mtp::mtp_prefix(files).is_some());
                 let mut m = if mtp {
                     let mut m = model.load_mtp(side.unwrap_or(files))?;
                     if let Some(side) = side {
