@@ -2109,7 +2109,7 @@ fn run_qwen_mtp(
         fast_verify: args.fast_verify,
     };
     eprintln!(
-        "[MTP speculative decoding: {} draft tokens{}, {}]",
+        "[MTP speculative decoding: {} draft tokens{}, {}{}]",
         opts.draft_tokens,
         if opts.cost_aware {
             " max (cost-aware)"
@@ -2118,7 +2118,8 @@ fn run_qwen_mtp(
         } else {
             ""
         },
-        if args.temperature > 0.0 { "sampled" } else { "greedy" }
+        if args.temperature > 0.0 { "sampled" } else { "greedy" },
+        if opts.fast_verify { ", fast verification" } else { "" }
     );
     let mut sampler =
         Sampler::new(args.temperature, args.top_k, args.top_p, args.seed).with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0));
@@ -2306,10 +2307,11 @@ fn run_dspark<M: oxinfer::dspark::Target<Sess: Clone>>(
         Sampler::new(args.temperature, args.top_k, args.top_p, args.seed).with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0));
     let mut dec = DsparkDecoder::new(model, draft, opts);
     eprintln!(
-        "[DSpark speculative decoding: {} draft tokens{}, {}]",
+        "[DSpark speculative decoding: {} draft tokens{}, {}{}]",
         dec.opts.draft_tokens,
         if dec.opts.cost_aware { " max (cost-aware)" } else { "" },
-        if args.temperature > 0.0 { "sampled" } else { "greedy" }
+        if args.temperature > 0.0 { "sampled" } else { "greedy" },
+        if dec.opts.fast_verify { ", fast verification" } else { "" }
     );
     let chunk = args.prefill_chunk.unwrap_or(256);
     let mut unfed: Option<u32> = None;
