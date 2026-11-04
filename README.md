@@ -4157,6 +4157,7 @@ cuda`.
 | Qwen3.5-0.8B bf16 | GEMM | logits bit-identical, same text | 609 tok/s | 915 tok/s |
 | Qwen3.5-0.8B `--quant q8` / `q4` | GEMM | same text | 646 / 632 tok/s | 923 / 927 tok/s |
 | mlx-community/Qwen3-4B-4bit | affine Q4 | logits bit-identical, same text | 144 tok/s | 220 tok/s |
+| mlx-community/gemma-4-26b-a4b-it-4bit (MoE) | affine Q4 dense layers, attention; the 128 routed experts stay on the CPU (no CUDA MoE kernel) | logits rel L2 1.3e-3, same top 3; bit-identical with the device attention off (it sums in another order); a 60-token summary identical up to its last word | 112 tok/s | 149 tok/s |
 | Qwen3.5-9B (15.9 GB of streamed weights, more than fits) | layers past VRAM stay on the CPU | logits bit-identical, same text | 94 tok/s | 261 tok/s |
 | SD-Turbo, 512x512 | convolutions, norms, attention | 83.4 dB; `OXINFER_GPU_CHECK=1` worst rel L2: attention 3.5e-6, conv+norm 1.5e-6 | UNet 2.56 s, VAE 9.16 s | UNet 0.88 s, VAE 1.83 s |
 | whisper-small `--precision bf16` | encoder | same transcript | encoder 1.44 s | encoder 0.50 s |
