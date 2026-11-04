@@ -1963,8 +1963,7 @@ storefront unchanged; "Turn this photo into a watercolor painting" restyles the 
 Not supported: several reference images (the Kontext pipeline takes one), IP-Adapter, LoRAs on
 FLUX, FLUX.1 Fill / Depth / Canny / Redux, FLUX image-to-image and inpainting pipelines,
 BFL single-file safetensors (`flux1-kontext-dev.safetensors`; the GGUF files and the diffusers
-folder cover the same weights), the browser build (the weights exceed its 4 GB), and CUDA runs
-(compile-checked only).
+folder cover the same weights) and the browser build (the weights exceed its 4 GB).
 
 ## Qwen-Image-Edit: image editing from instructions (and Qwen-Image text to image)
 
@@ -2110,8 +2109,8 @@ and lightx2v/Qwen-Image-2512-Lightning (0.85 GB LoRAs): Apache 2.0.
 
 Not supported: the layered (`Qwen-Image-Layered`) and ControlNet / inpainting pipelines, the fp8
 "scaled" single-file checkpoints (`*_fp8_e4m3fn_scaled*.safetensors`; the GGUF files and the
-diffusers folder cover the same weights), batches, the browser build (the weights exceed its 4 GB),
-CUDA runs (compile-checked only). The transformer's activations go between CPU and GPU at every
+diffusers folder cover the same weights), batches, the browser build (the weights exceed its 4 GB).
+The transformer's activations go between CPU and GPU at every
 matmul (about 1 s per pass at 1024x1024), the next lever for speed.
 
 ## OmniGen2: image editing, in-context generation and text to image
@@ -2529,8 +2528,7 @@ linked instead of downloaded twice); v1.2's is fine-tuned. No GGUF conversions a
 Not supported: the reflection mode of v1.2 (a multi-round loop where the VL model scores the edit
 and retries), the original `stepfun-ai/Step1X-Edit` single-file checkpoints (v1.0 / v1.1 in the
 original repository's layout; the diffusers folders cover the same models) and its fp8 copies,
-LoRAs, the RegionE acceleration, batches, the browser build (the weights exceed its 4 GB), CUDA
-runs (compile-checked only). The reference image is VAE-encoded at the posterior mean (the
+LoRAs, the RegionE acceleration, batches, the browser build (the weights exceed its 4 GB). The reference image is VAE-encoded at the posterior mean (the
 pipeline samples it; the noise is ~3e-4 of the latents).
 
 ## Janus-Pro: text to image and image understanding
@@ -4114,9 +4112,13 @@ cuda`.
 | Qwen3.5-9B (15.9 GB of streamed weights, more than fits) | layers past VRAM stay on the CPU | logits bit-identical, same text | 94 tok/s | 261 tok/s |
 | SD-Turbo, 512x512 | convolutions, norms, attention | 83.4 dB; `OXINFER_GPU_CHECK=1` worst rel L2: attention 3.5e-6, conv+norm 1.5e-6 | UNet 2.56 s, VAE 9.16 s | UNet 0.88 s, VAE 1.83 s |
 | whisper-small `--precision bf16` | encoder | same transcript | encoder 1.44 s | encoder 0.50 s |
+| FLUX.1-Kontext-dev `--quant q4`, 512x512, 4 steps | GEMM, attention, norms, VAE | 71.3 dB (max pixel diff 1); `OXINFER_GPU_CHECK=1` worst rel L2: attention 4.1e-6, conv+norm 4.1e-7 | 516 s whole run | 47 s whole run |
+| Qwen-Image-2512 `--quant q4 --mmap`, 512x512, 4 steps | GEMM, attention, VAE | 56.0 dB (max pixel diff 33) | 718 s whole run | 69 s whole run |
+| Step1X-Edit-v1p2 `--quant q4 --mmap`, 4 steps | GEMM, attention, VAE | 70.5 dB (max pixel diff 1) | 3,201 s whole run | 938 s whole run |
 
 Short inputs stay on the CPU (see `wants`), but opening the device costs about 0.1 s at start-up.
-FLUX, Qwen-Image, Step1X and OmniGen2 use the same kernels and have not been run on CUDA.
+The image-model timings include loading and quantizing the weights. OmniGen2 uses the same kernels
+and has not been run on CUDA.
 
 `cargo test --lib cuda::` compares every kernel with a reference computed in f64 from its
 definition; it fails if a kernel does not compile or load, and skips without an NVIDIA GPU or NVRTC.
