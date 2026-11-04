@@ -2917,7 +2917,16 @@ impl Backend for MetalBackend {
         g: &crate::gpu::decode::Graph,
         tokens: usize,
     ) -> Option<Box<dyn crate::gpu::decode::DecodePlan + 's>> {
-        self.build_plan_t(g, tokens)
+        self.build_plan_t(g, tokens, false)
+            .map(|p| Box::new(p) as Box<dyn crate::gpu::decode::DecodePlan + 's>)
+    }
+
+    fn decode_plan_multi_fast<'s>(
+        &'s self,
+        g: &crate::gpu::decode::Graph,
+        tokens: usize,
+    ) -> Option<Box<dyn crate::gpu::decode::DecodePlan + 's>> {
+        self.build_plan_t(g, tokens, true)
             .map(|p| Box::new(p) as Box<dyn crate::gpu::decode::DecodePlan + 's>)
     }
 

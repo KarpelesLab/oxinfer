@@ -200,6 +200,13 @@ pub trait Backend: Send + Sync {
     fn decode_plan_multi<'s>(&'s self, _g: &decode::Graph, _tokens: usize) -> Option<Box<dyn decode::DecodePlan + 's>> {
         None
     }
+    /// [`Backend::decode_plan_multi`] for "fast verification": the multi-token steps may use
+    /// batched kernels whose arithmetic differs from the single-token kernels' (a token's results
+    /// then depend on the batch in rounding), for speed. Backends without such kernels give the
+    /// exact plan.
+    fn decode_plan_multi_fast<'s>(&'s self, g: &decode::Graph, tokens: usize) -> Option<Box<dyn decode::DecodePlan + 's>> {
+        self.decode_plan_multi(g, tokens)
+    }
     /// Cumulative timing summary for `--profile`.
     fn stats(&self) -> Option<String> {
         None

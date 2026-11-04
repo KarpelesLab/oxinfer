@@ -62,8 +62,11 @@ pub trait Target: TextLm {
         feats: &mut Vec<f32>,
     ) -> Vec<f32>;
     /// The verification pass: [`Target::forward_feats`] without multimodal inputs, returning the
-    /// logits `[t, vocab]` of every token (a GPU pass where the model has one).
-    fn forward_verify(&self, sess: &mut Self::Sess, tokens: &[u32], layers: &[usize], feats: &mut Vec<f32>) -> Vec<f32> {
+    /// logits `[t, vocab]` of every token (a GPU pass where the model has one). With `fast`, a
+    /// GPU pass may use batched kernels whose rounding differs from one-token steps
+    /// ([`DsparkOptions::fast_verify`]).
+    fn forward_verify(&self, sess: &mut Self::Sess, tokens: &[u32], layers: &[usize], feats: &mut Vec<f32>, fast: bool) -> Vec<f32> {
+        let _ = fast;
         let hs = self.forward_feats(sess, tokens, &[], layers, feats);
         self.logits(&hs, tokens.len())
     }
@@ -629,6 +632,9 @@ pub struct Dspark<'a> {
     device: std::sync::atomic::AtomicBool,
     /// The GPU plans, once [`Dspark::init_gpu`] ran (None inside: the draft runs on the CPU).
     gpu: std::sync::OnceLock<Option<GpuDraft>>,
+    /// The same on the fast (batched, not batch-invariant) kernels, for sessions with
+    /// [`DsparkOptions::fast_verify`].
+    gpu_fast: std::sync::OnceLock<Option<GpuDraft>>,
 }
 
 /// The dense backbones: MLA (llama.cpp `graph_mistral_large4`) or grouped-query attention
@@ -671,6 +677,8 @@ pub struct DsparkSession {
     /// Device state of the GPU context and block plans (KV cache copies).
     gpu_ctx: crate::gpu::decode::Slot,
     gpu_block: crate::gpu::decode::Slot,
+    /// Run the GPU passes on the fast plans ([`DsparkOptions::fast_verify`]).
+    pub fast: bool,
     pub len: usize,
 }
 
@@ -1211,6 +1219,7 @@ impl<'a> Dspark<'a> {
                 target_hidden,
                 device: std::sync::atomic::AtomicBool::new(false),
                 gpu: Default::default(),
+                gpu_fast: Default::default(),
                 cfg,
             });
         }
@@ -1248,6 +1257,7 @@ impl<'a> Dspark<'a> {
             target_hidden,
             device: std::sync::atomic::AtomicBool::new(false),
             gpu: Default::default(),
+            gpu_fast: Default::default(),
             cfg,
         })
     }
@@ -1331,6 +1341,7 @@ impl<'a> Dspark<'a> {
             kv,
             gpu_ctx: Default::default(),
             gpu_block: Default::default(),
+            fast: false,
             len: 0,
         }
     }
@@ -1887,8 +1898,12 @@ impl Dspark<'_> {
     /// Compiles the GPU plans for a target whose LM head is `head` (the draft's own if it has
     /// one), once; later calls do nothing. Without a GPU decode backend, or for the MLA backbone,
     /// the draft runs on the CPU.
-    pub fn init_gpu(&self, head: Option<&Lin>, vocab: usize) {
-        self.gpu.get_or_init(|| {
+    ///
+    /// With `fast`, the plans on the fast batched kernels are compiled too (sessions with
+    /// [`DsparkSession::fast`] use them; the drafts change in rounding only, the output not at
+    /// all since the target verifies them).
+    pub fn init_gpu(&self, head: Option<&Lin>, vocab: usize, fast: bool) {
+        let build = |fast: bool| {
             if !crate::gpu::decode_enabled() || std::env::var_os("OXINFER_DSPARK_CPU").is_some() {
                 return None;
             }
@@ -1896,13 +1911,32 @@ impl Dspark<'_> {
             let be = crate::gpu::active()?;
             let head = self.head.as_ref().or(head)?;
             let rows = self.cfg.block_rows();
-            let block = be.decode_plan_multi(&self.block_graph(g, head, vocab)?, rows)?;
-            let ctx = be.decode_plan_multi(&self.ctx_graph(g)?, 16)?;
+            let plan = |gr: &crate::gpu::decode::Graph, t: usize| {
+                if fast {
+                    be.decode_plan_multi_fast(gr, t)
+                } else {
+                    be.decode_plan_multi(gr, t)
+                }
+            };
+            let block = plan(&self.block_graph(g, head, vocab)?, rows)?;
+            let ctx = plan(&self.ctx_graph(g)?, 16)?;
             Some(GpuDraft {
                 ctx: std::sync::Arc::from(ctx),
                 block: std::sync::Arc::from(block),
             })
-        });
+        };
+        self.gpu.get_or_init(|| build(false));
+        if fast && matches!(self.gpu.get(), Some(Some(_))) {
+            self.gpu_fast.get_or_init(|| build(true));
+        }
+    }
+
+    /// The GPU plans a session runs on (the fast ones when it asks for them and they exist).
+    fn gpu_plans(&self, fast: bool) -> Option<&GpuDraft> {
+        if fast && let Some(Some(g)) = self.gpu_fast.get() {
+            return Some(g);
+        }
+        self.gpu.get().and_then(|g| g.as_ref())
     }
 
     /// The device weight of a matrix (None: the plan cannot use it).
@@ -2142,7 +2176,7 @@ impl Dspark<'_> {
     /// The context pass on the GPU, when the plans exist and `t` fits; false otherwise (nothing
     /// changed).
     fn gpu_inject(&self, sess: &mut DsparkSession, feats: &[f32], t: usize) -> bool {
-        let Some(Some(gp)) = self.gpu.get() else { return false };
+        let Some(gp) = self.gpu_plans(sess.fast) else { return false };
         if t > gp.ctx.tokens() || sess.kv.len() != self.dense().layers.len() {
             return false;
         }
@@ -2177,7 +2211,7 @@ impl Dspark<'_> {
     /// `block_rows` of them; the session is left as it was. None when the plans are missing or
     /// the device failed.
     fn gpu_block<M: Target + ?Sized>(&self, target: &M, sess: &mut DsparkSession, anchor: u32) -> Option<(Vec<f32>, Vec<f32>)> {
-        let Some(Some(gp)) = self.gpu.get() else { return None };
+        let gp = self.gpu_plans(sess.fast)?;
         let _timer = crate::prof::start(crate::prof::Cat::Matmul);
         let nb = self.cfg.block_rows();
         let h = self.cfg.hidden;
@@ -2252,6 +2286,13 @@ pub struct DsparkOptions {
     /// below this (DeepSpec's `confidence_threshold`; 0 = off, and ignored by drafts without
     /// the head).
     pub conf_min: f32,
+    /// "Fast verification": verify (and draft) on the GPU with batched matrix kernels that read
+    /// the weights once for all the tokens but sum in another order than one-token decoding, so
+    /// a token's logits differ from plain decoding's in rounding (greedy output can then drift
+    /// from plain greedy output at near-ties; sampling stays a correct sample of the model up to
+    /// that rounding). Off by default: verification then reproduces one-token decoding bit for
+    /// bit. Only GPU decode plans have fast kernels (Metal); elsewhere this changes nothing.
+    pub fast_verify: bool,
 }
 
 impl Default for DsparkOptions {
@@ -2263,6 +2304,7 @@ impl Default for DsparkOptions {
             p_min: 0.0,
             device: None,
             conf_min: 0.0,
+            fast_verify: false,
         }
     }
 }
@@ -2478,13 +2520,15 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         }
         draft.set_device(opts.device.unwrap_or(DEVICE_BY_DEFAULT && crate::gpu::active().is_some()));
         if opts.device != Some(false) {
-            draft.init_gpu(model.lm_head(), model.vocab_size());
+            draft.init_gpu(model.lm_head(), model.vocab_size(), opts.fast_verify);
         }
+        let mut dsess = draft.new_session();
+        dsess.fast = opts.fast_verify;
         Self {
             model,
             draft,
             sess: model.new_session(),
-            dsess: draft.new_session(),
+            dsess,
             k_cur: opts.draft_tokens,
             opts,
             next: None,
@@ -2626,7 +2670,7 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         seq.extend_from_slice(drafts);
         let check = std::env::var_os("OXINFER_CHECK_SPEC").is_some().then(|| self.sess.clone());
         let mut feats = Vec::new();
-        let logits = model.forward_verify(&mut self.sess, &seq, &draft.cfg.target_layers, &mut feats);
+        let logits = model.forward_verify(&mut self.sess, &seq, &draft.cfg.target_layers, &mut feats, self.opts.fast_verify);
         let verify_secs = t_round.elapsed().as_secs_f64() - draft_secs;
         if let Some(mut s1) = check {
             // Debug: the batched verification must match one-token forwards exactly.

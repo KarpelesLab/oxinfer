@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! dspark_check MODEL DRAFT PROMPT OUT_DIR [--k N] [--cpu] [--raw] [--gen N] [--draft-device cpu|gpu] [--bench N]
-//!     [--quant Q] [--think]
+//!     [--quant Q] [--think] [--fast] [--drift]
 //! ```
 //!
 //! Runs the chat-formatted `PROMPT` (as is with `--raw`; `--think` turns thinking on for Qwen
@@ -15,7 +15,11 @@
 //! environment's `DSPARK_P_MIN`, `DSPARK_CONF_MIN` and `DSPARK_FIXED=1` set the DSpark options).
 //! `--draft-device` says where the draft's matmuls run (default: the GPU when there is one).
 //! `--bench N` times N draft passes and injections of 3 positions on the CPU and on the GPU,
-//! alternating.
+//! alternating. `--fast` runs the DSpark decoding of `--gen` with fast verification
+//! (`DsparkOptions::fast_verify`); `--drift` (with `--gen`) then also feeds the plain greedy
+//! output through 8-token verification passes, exact and fast (each in its own session, so the
+//! fast one keeps its own keys and values as fast decoding would), and reports how the fast
+//! logits differ from the exact ones (largest difference, KL divergence, top-1 changes).
 
 use anyhow::{Context, Result, bail};
 use oxinfer::chat::ChatFormat;
@@ -43,6 +47,25 @@ struct Opts {
     device: Option<bool>,
     bench: usize,
     stop: Vec<u32>,
+    fast: bool,
+    drift: bool,
+}
+
+/// KL divergence of softmax(b) from softmax(a) (a the reference) and the largest |a - b|.
+fn kl_maxdiff(a: &[f32], b: &[f32]) -> (f64, f32) {
+    let lse = |v: &[f32]| {
+        let m = v.iter().fold(f32::NEG_INFINITY, |a, &x| a.max(x)) as f64;
+        m + v.iter().map(|&x| (x as f64 - m).exp()).sum::<f64>().ln()
+    };
+    let (la, lb) = (lse(a), lse(b));
+    let mut kl = 0f64;
+    let mut dmax = 0f32;
+    for (&x, &y) in a.iter().zip(b) {
+        let pa = (x as f64 - la).exp();
+        kl += pa * ((x as f64 - la) - (y as f64 - lb));
+        dmax = dmax.max((x - y).abs());
+    }
+    (kl.max(0.0), dmax)
 }
 
 fn check<M: Target<Sess: Clone>>(m: &M, d: &Dspark, tok: &Tokenizer, ids: &[u32], o: &Opts) -> Result<()> {
@@ -135,6 +158,7 @@ fn check<M: Target<Sess: Clone>>(m: &M, d: &Dspark, tok: &Tokenizer, ids: &[u32]
                 p_min: env_f32("DSPARK_P_MIN"),
                 conf_min: env_f32("DSPARK_CONF_MIN"),
                 cost_aware: gqa && std::env::var_os("DSPARK_FIXED").is_none(),
+                fast_verify: o.fast,
             },
         );
         let lg = dec.prefill(ids, 256);
@@ -163,26 +187,68 @@ fn check<M: Target<Sess: Clone>>(m: &M, d: &Dspark, tok: &Tokenizer, ids: &[u32]
             println!("plain: {:?}", tok.decode(&plain.tokens, false));
         }
         println!("{:?}", tok.decode(&spec.tokens, false));
+        if o.drift {
+            let layers = d.cfg.target_layers.clone();
+            let (mut se, mut sf) = (m.new_session(), m.new_session());
+            generate::prefill(m, &mut se, ids, 256, &[]);
+            generate::prefill(m, &mut sf, ids, 256, &[]);
+            let v = m.vocab_size();
+            let mut feats = Vec::new();
+            let (mut n, mut flips, mut ties) = (0usize, 0usize, 0usize);
+            let (mut kl_sum, mut kl_max, mut d_sum, mut d_max) = (0f64, 0f64, 0f64, 0f32);
+            for chunk in plain.tokens.chunks(8).filter(|c| c.len() > 1) {
+                let le = m.forward_verify(&mut se, chunk, &layers, &mut feats, false);
+                let lf = m.forward_verify(&mut sf, chunk, &layers, &mut feats, true);
+                for j in 0..chunk.len() {
+                    let (a, b) = (&le[j * v..(j + 1) * v], &lf[j * v..(j + 1) * v]);
+                    let (kl, dm) = kl_maxdiff(a, b);
+                    n += 1;
+                    kl_sum += kl;
+                    kl_max = kl_max.max(kl);
+                    d_sum += dm as f64;
+                    d_max = d_max.max(dm);
+                    let (ta, tb) = (argmax(a) as usize, argmax(b) as usize);
+                    flips += (ta != tb) as usize;
+                    // A near-tie: the exact top-2 margin is within the largest difference.
+                    let top = a[ta];
+                    let second = a
+                        .iter()
+                        .enumerate()
+                        .filter(|&(i, _)| i != ta)
+                        .fold(f32::NEG_INFINITY, |m, (_, &x)| m.max(x));
+                    ties += (top - second <= dm) as usize;
+                }
+            }
+            println!(
+                "drift over {n} positions (8-token passes, fast vs exact): max |logit diff| mean {:.2e} max {:.2e}, KL mean {:.2e} max {:.2e}, top-1 changed at {flips}, exact top-2 margin within the difference at {ties}",
+                d_sum / n.max(1) as f64,
+                d_max,
+                kl_sum / n.max(1) as f64,
+                kl_max
+            );
+        }
     }
     Ok(())
 }
 
 fn main() -> Result<()> {
     let usage = "usage: dspark_check MODEL DRAFT PROMPT OUT_DIR [--k N] [--cpu] [--raw] [--gen N] [--draft-device cpu|gpu] [--bench N] \
-                 [--quant Q] [--think]";
+                 [--quant Q] [--think] [--fast] [--drift]";
     let mut args = std::env::args().skip(1);
     let model = args.next().context(usage)?;
     let draft_spec = args.next().context(usage)?;
     let prompt = args.next().context(usage)?;
     let out = PathBuf::from(args.next().context(usage)?);
     let (mut k, mut cpu, mut raw, mut gen_n, mut device, mut bench) = (None, false, false, 0usize, None, 0usize);
-    let (mut quant, mut think) = (Quant::Bf16, false);
+    let (mut quant, mut think, mut fast, mut drift) = (Quant::Bf16, false, false, false);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--k" => k = Some(args.next().context("--k N")?.parse()?),
             "--cpu" => cpu = true,
             "--raw" => raw = true,
             "--think" => think = true,
+            "--fast" => fast = true,
+            "--drift" => drift = true,
             "--gen" => gen_n = args.next().context("--gen N")?.parse()?,
             "--draft-device" => device = Some(args.next().context("--draft-device cpu|gpu")? == "gpu"),
             "--bench" => bench = args.next().context("--bench N")?.parse()?,
@@ -226,6 +292,8 @@ fn main() -> Result<()> {
         device,
         bench,
         stop: oxinfer::chat::with_turn_end(fmt, &tok, eos),
+        fast,
+        drift,
     };
     if mt == "deepseek_v4" {
         let cfg = oxinfer::config::DeepSeek4Config::load(&dir)?;

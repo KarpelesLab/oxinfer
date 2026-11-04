@@ -143,6 +143,12 @@ pub struct EngineOptions {
     /// accepted is below this ([`crate::dspark::DsparkOptions::conf_min`]; 0 = off, the
     /// default). Key `draft_conf_min`.
     pub draft_conf_min: Option<f32>,
+    /// Speculative decoding (DSpark drafts, Qwen MTP): verify on the GPU with batched matrix
+    /// kernels that are faster but not batch-invariant, so the logits differ from plain
+    /// decoding's in rounding and greedy output may drift from plain greedy output at near-ties
+    /// ([`crate::dspark::DsparkOptions::fast_verify`], [`crate::qwen_mtp::MtpOptions::fast_verify`]).
+    /// Default false (verification reproduces plain decoding bit for bit). Key `fast_verify`.
+    pub fast_verify: bool,
     /// Where repo ids are downloaded (default [`crate::hf::cache_root`]). Key `cache_dir`.
     pub cache_dir: Option<PathBuf>,
     /// Qwen3.5/3.8, Gemma 4 / 3, Mistral Large 4: stream the weights from the (mapped) file for models larger than
@@ -337,6 +343,7 @@ impl Default for EngineOptions {
             draft_p_min: None,
             draft_device: None,
             draft_conf_min: None,
+            fast_verify: false,
             cache_dir: None,
             stream: None,
             stream_mode: StreamMode::Auto,
@@ -400,6 +407,7 @@ impl EngineOptions {
         "draft_device",
         "draft_conf_min",
         "draft_fixed",
+        "fast_verify",
         "cache_dir",
         "stream",
         "mmproj",
@@ -455,6 +463,7 @@ impl EngineOptions {
                 self.mtp |= self.mtp_from.is_some();
             }
             "mtp_fixed" | "draft_fixed" => self.mtp_fixed = parse_bool(key, value)?,
+            "fast_verify" => self.fast_verify = parse_bool(key, value)?,
             "draft" => self.draft = opt_str(value),
             "draft_tokens" => self.draft_tokens = parse_opt_usize(key, value)?,
             "draft_p_min" => {
@@ -1131,6 +1140,7 @@ impl Engine {
                 .unwrap_or(if streaming { crate::dspark::STREAM_P_MIN } else { 0.0 }),
             device: opts.draft_device,
             conf_min: opts.draft_conf_min.unwrap_or(0.0),
+            fast_verify: opts.fast_verify,
         };
 
         let mut arena = Arena(Vec::new());
@@ -1276,6 +1286,7 @@ impl Engine {
                             // length by cost and keep them exact.
                             cost_aware: !opts.mtp_fixed && stream.is_some(),
                             exact: stream.is_some(),
+                            fast_verify: opts.fast_verify,
                         };
                         Lm::QwenMtp {
                             dec: Box::new(MtpDecoder::new(model, m, mopts)),
@@ -1338,6 +1349,7 @@ impl Engine {
                                 .unwrap_or(if streamer.is_some() { crate::dspark::STREAM_P_MIN } else { 0.0 }),
                             device: opts.draft_device,
                             conf_min: opts.draft_conf_min.unwrap_or(0.0),
+                            fast_verify: opts.fast_verify,
                         };
                         Lm::Mistral4Dspark {
                             dec: Box::new(DsparkDecoder::new(model, dr, dopts)),
@@ -1400,6 +1412,7 @@ impl Engine {
                                 .unwrap_or(if streamer.is_some() { crate::dspark::STREAM_P_MIN } else { 0.0 }),
                             device: opts.draft_device,
                             conf_min: opts.draft_conf_min.unwrap_or(0.0),
+                            fast_verify: opts.fast_verify,
                         };
                         Lm::DeepSeek4Dspark {
                             dec: Box::new(DsparkDecoder::new(model, dr, dopts)),

@@ -372,6 +372,10 @@ pub struct MtpOptions {
     /// `draft_tokens + 1` tokens through the decode kernels (raises the process-wide
     /// `kernels::set_decode_max_tokens`, which never lowers it).
     pub exact: bool,
+    /// Verify on the GPU with the fast batched kernels (see
+    /// [`crate::dspark::DsparkOptions::fast_verify`]): faster, but the logits differ from plain
+    /// decoding's in rounding. Default false.
+    pub fast_verify: bool,
 }
 
 impl Default for MtpOptions {
@@ -382,6 +386,7 @@ impl Default for MtpOptions {
             stop: Vec::new(),
             cost_aware: false,
             exact: false,
+            fast_verify: false,
         }
     }
 }
@@ -669,7 +674,7 @@ impl<'m> MtpDecoder<'m> {
         };
         // On the GPU when plain decoding runs there (the same arithmetic: greedy output is plain
         // GPU decoding's), else on the CPU.
-        let (hs, logits) = match model.gpu_verify_hidden(&mut self.sess, &seq) {
+        let (hs, logits) = match model.gpu_verify_hidden(&mut self.sess, &seq, self.opts.fast_verify) {
             Some(r) => r,
             None => {
                 let hs = if k > 0 {

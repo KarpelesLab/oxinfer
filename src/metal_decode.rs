@@ -196,7 +196,79 @@ pub(crate) fn shader_src() -> String {
     }
     // The sources appended after these (the matrix-unit GEMMs) keep the default (fast) math.
     s.push_str("#pragma clang fp reassociate(on)\n");
+    // Fast verification matmuls (`fv_<fmt>_<tokens>`).
+    s.push_str(FV_SRC);
+    for f in FV_FORMATS {
+        let (w, mk) = fv_types(f);
+        if let MvFmt::Gguf(_) = f {
+            let _ = writeln!(s, "#define {mk}(W, S, O, WO, SO, OO) {w}{{ {{ (W) + (WO), p.gpr }} }}");
+        }
+        for tt in MVK_TOKENS {
+            let _ = writeln!(s, "FV_INST({}, {w}, {mk}, {tt})", fv_name(f, false, tt));
+            if f == MvFmt::Q4 {
+                let _ = writeln!(s, "FV_INST({}, Q4A, FV_MK_Q4A, {tt})", fv_name(f, true, tt));
+            }
+        }
+    }
     s
+}
+
+/// The weight loader type of a format for the fast matmuls and its constructor macro.
+fn fv_types(f: MvFmt) -> (String, String) {
+    match f {
+        MvFmt::Bf16 => ("BfW".into(), "FV_MK_BF".into()),
+        MvFmt::Q8 => ("Q8W".into(), "FV_MK_Q8".into()),
+        MvFmt::Q4 => ("Q4W".into(), "FV_MK_Q4".into()),
+        MvFmt::Gguf(k) => (
+            if k == GgmlType::F32 {
+                "F32W2".to_string()
+            } else {
+                format!("{}W", k.name())
+            },
+            format!("FV_MK_{}", k.name()),
+        ),
+    }
+}
+
+impl MetalBackend {
+    /// The fast matmul of a weight for up to `tt` tokens (one of [`MVK_TOKENS`]), and its rows
+    /// per threadgroup.
+    fn fv_pipe(&self, w: &MvWeight, tt: usize) -> Option<(Id, usize)> {
+        if !FV_FORMATS.contains(&w.fmt) {
+            return None;
+        }
+        Some((self.named_pipeline(&fv_name(w.fmt, w.gk != 0, tt))?, FV_ROWS))
+    }
+}
+
+const FV_SRC: &str = include_str!("metal_fastv.metal");
+/// Rows per threadgroup of the fast verification matmuls (`FV_R` in the shader).
+const FV_ROWS: usize = 32;
+/// The formats with fast matmuls (a chunk loader `fv_load8` in the shader); other formats keep the
+/// exact multi-token kernels in fast plans.
+const FV_FORMATS: [MvFmt; 9] = [
+    MvFmt::Bf16,
+    MvFmt::Q8,
+    MvFmt::Q4,
+    MvFmt::Gguf(GgmlType::F16),
+    MvFmt::Gguf(GgmlType::Q4_0),
+    MvFmt::Gguf(GgmlType::Q8_0),
+    MvFmt::Gguf(GgmlType::Q4_K),
+    MvFmt::Gguf(GgmlType::Q5_K),
+    MvFmt::Gguf(GgmlType::Q6_K),
+];
+
+/// The fast verification matmul of a format (affine: oxinfer Q4 with MLX offsets) for up to `tt`
+/// tokens (one of [`MVK_TOKENS`]).
+fn fv_name(f: MvFmt, affine: bool, tt: usize) -> String {
+    format!("fv_{}{}_{tt}", f.name(), if affine { "a" } else { "" })
+}
+
+/// Whether fast plans use the fast matmuls (`OXINFER_FAST_KERNELS=0` keeps the exact multi-token
+/// kernels in them, for measurements).
+fn fast_kernels() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OXINFER_FAST_KERNELS").is_none_or(|v| v != "0"))
 }
 
 /// Parameters of a matvec (`MV` in the shader).
@@ -734,9 +806,9 @@ enum MOp {
         mode: MvMode,
         /// AddGated: the scalar gate's arena offset.
         gate: usize,
-        /// Multi-token plans: the pipeline, the x, y, gate strides in floats and the rows per
-        /// threadgroup.
-        t: Option<(Id, u32, u32, u32, usize)>,
+        /// Multi-token plans: the pipeline, the x, y, gate strides in floats, the rows and the
+        /// threads per threadgroup.
+        t: Option<(Id, u32, u32, u32, usize, usize)>,
         /// Multi-token plans without `t` (the MoE router): the x and y strides in bytes, the
         /// single-token kernel then running once per token.
         each: (usize, usize),
@@ -1013,21 +1085,29 @@ fn overlaps(a: &[Range], b: &[Range]) -> bool {
 
 impl MetalBackend {
     pub(crate) fn build_plan(&self, g: &Graph) -> Option<MetalPlan<'_>> {
-        self.build_plan_t(g, 1)
+        self.build_plan_t(g, 1, false)
     }
 
     /// Compiles `g` for steps of up to `tokens` tokens (1: the single-token plan). A multi-token
     /// plan keeps `tokens` rows of every activation buffer, runs the matvecs with the multi-token
     /// kernels (weights read once for all the tokens) and the other ops over every token, each
     /// computed exactly as a single-token step would (same kernels, same reduction orders).
-    pub(crate) fn build_plan_t(&self, g: &Graph, tokens: usize) -> Option<MetalPlan<'_>> {
+    ///
+    /// With `fast` ("fast verification"), the matvecs of a multi-token plan run on batched
+    /// matrix kernels (`fv_*`, simdgroup MMAs over all the tokens) where the format has one: the
+    /// weights are read once at little more than one token's cost, but the sums are taken in
+    /// another order, so the results differ from single-token steps in rounding.
+    pub(crate) fn build_plan_t(&self, g: &Graph, tokens: usize, fast: bool) -> Option<MetalPlan<'_>> {
         let f = Fns::new(self);
         let mt = tokens > 1;
+        let fast = fast && mt && fast_kernels();
         let tt = match MVK_TOKENS.iter().find(|&&t| t >= tokens) {
             Some(&t) => t,
             None if !mt => 1,
             None => return None,
         };
+        // The fast kernels read whole 8-token tiles of x: keep that many rows.
+        let tokens = if fast { tokens.next_multiple_of(8) } else { tokens };
         // Activation arena: every buffer 256-byte aligned; in a multi-token plan, `tokens` rows of
         // `tsz` floats (256-byte aligned too).
         let tsz: Vec<usize> = g.bufs.iter().map(|&n| if mt { n.next_multiple_of(64) } else { n }).collect();
@@ -1142,16 +1222,22 @@ impl MetalBackend {
                         return None;
                     }
                     let (nr, ks) = mv_variant(mw.fmt, n_in);
-                    let t = if mt {
-                        Some((
+                    let fv = if fast && n_in.is_multiple_of(32) {
+                        self.fv_pipe(&mw, tt)
+                    } else {
+                        None
+                    };
+                    let t = match fv {
+                        Some((p, rows)) => Some((p, ts(x) as u32, ts(y) as u32, gate.map_or(0, ts) as u32, rows, 128)),
+                        None if mt => Some((
                             self.mvk_pipe(mw.fmt, mvk_rows(tt), ks, tt)?,
                             ts(x) as u32,
                             ts(y) as u32,
                             gate.map_or(0, ts) as u32,
                             mvk_rows(tt),
-                        ))
-                    } else {
-                        None
+                            32 * ks,
+                        )),
+                        None => None,
                     };
                     emit.push(MOp::Mv {
                         pipe: self.mv_pipe(mw.fmt, nr, ks)?,
@@ -2036,7 +2122,6 @@ impl MetalPlan<'_> {
                 }
             }
             MOp::Mv {
-                ks,
                 w,
                 w2,
                 x,
@@ -2046,7 +2131,7 @@ impl MetalPlan<'_> {
                 t: Some(tk),
                 ..
             } => {
-                let (pipe, sx, sy, sgate, nr) = *tk;
+                let (pipe, sx, sy, sgate, nr, threads) = *tk;
                 let w2 = w2.as_ref().unwrap_or(w);
                 let p = MvkParams {
                     m: MvParams {
@@ -2081,7 +2166,7 @@ impl MetalPlan<'_> {
                 e.buf(w.offs, 0, 7);
                 e.buf(w2.offs, 0, 8);
                 e.buf(arena, *gate, 9);
-                e.dispatch((w.n_out.div_ceil(nr), 1), 32 * ks);
+                e.dispatch((w.n_out.div_ceil(nr), 1), threads);
             }
             MOp::QkRope {
                 qkv,
@@ -3145,6 +3230,309 @@ mod tests {
                 for b in [db.id, sb.id] {
                     unsafe { (f.void)(b, f.s_release) };
                 }
+            }
+        }
+    }
+
+    /// Encodes a fast verification matmul (`fv_*`) of `ntok` tokens (x / y rows `sx` / `sy`
+    /// floats apart, the gates at `gate`, `sy` apart).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_fv(
+        e: &FastEnc,
+        (pipe, rows): (Id, usize),
+        w: &MvWeight,
+        w2: Option<&MvWeight>,
+        mode: MvMode,
+        ntok: usize,
+        x: (Id, usize),
+        y: (Id, usize),
+        gate: (Id, usize),
+        sx: usize,
+        sy: usize,
+    ) {
+        let w2 = w2.unwrap_or(w);
+        let p = MvkParams {
+            m: MvParams {
+                n_out: w.n_out as u32,
+                n_in: w.n_in as u32,
+                mode: mode as u32,
+                rows_per_tg: rows as u32,
+                w_off: w.data_off,
+                s_off: w.scales_off,
+                w2_off: w2.data_off,
+                s2_off: w2.scales_off,
+                o_off: w.offs_off,
+                o2_off: w2.offs_off,
+                gpr: w.gpr,
+                gk: w.gk,
+                ..Default::default()
+            },
+            ntok: ntok as u32,
+            sx: sx as u32,
+            sy: sy as u32,
+            sgate: sy as u32,
+        };
+        e.pipe(pipe);
+        e.buf(w.data, 0, 0);
+        e.buf(w.scales, 0, 1);
+        e.buf(x.0, x.1, 2);
+        e.buf(y.0, y.1, 3);
+        e.bytes(&p, 4);
+        e.buf(w2.data, 0, 5);
+        e.buf(w2.scales, 0, 6);
+        e.buf(w.offs, 0, 7);
+        e.buf(w2.offs, 0, 8);
+        e.buf(gate.0, gate.1, 9);
+        e.dispatch((w.n_out.div_ceil(rows), 1), 128);
+    }
+
+    /// The fast verification matmuls agree with the single-token kernels up to rounding (they
+    /// sum in another order), in every mode, for token counts within and across 8-token tiles.
+    #[test]
+    fn decode_fv_matches_single_token() {
+        const FV_TOL: f32 = 1e-4;
+        let Ok(be) = MetalBackend::new() else { return };
+        let f = Fns::new(&be);
+        let (n_out, n_in) = (37, 512);
+        let mut seed = 11u64;
+        for ntok in [2usize, 8, 13] {
+            let fmts = [
+                MvFmt::Bf16,
+                MvFmt::Q8,
+                MvFmt::Q4,
+                MvFmt::Gguf(GgmlType::F16),
+                MvFmt::Gguf(GgmlType::Q4_0),
+                MvFmt::Gguf(GgmlType::Q8_0),
+                MvFmt::Gguf(GgmlType::Q4_K),
+                MvFmt::Gguf(GgmlType::Q5_K),
+                MvFmt::Gguf(GgmlType::Q6_K),
+                MvFmt::Gguf(GgmlType::IQ4_XS),
+            ];
+            for fmt in fmts {
+                let (d1, s1, _) = matrix(fmt, n_out, n_in, &mut seed);
+                let (d2, s2, _) = matrix(fmt, n_out, n_in, &mut seed);
+                let dl = d1.len().next_multiple_of(4096);
+                let sl = s1.len().next_multiple_of(4096);
+                let mut data = PageVec::<u8>::zeroed(2 * dl);
+                let mut sc = PageVec::<u8>::zeroed(2 * sl);
+                data[..d1.len()].copy_from_slice(&d1);
+                data[dl..dl + d2.len()].copy_from_slice(&d2);
+                sc[..s1.len()].copy_from_slice(&s1);
+                sc[sl..sl + s2.len()].copy_from_slice(&s2);
+                let db = be.wrap(data.as_ptr(), data.len()).unwrap();
+                let sb = be.wrap(sc.as_ptr(), sc.len()).unwrap();
+                let wt = |i: usize| MvWeight {
+                    fmt,
+                    n_out,
+                    n_in,
+                    data: db.id,
+                    data_off: (db.offset_bytes + i * dl) as u64,
+                    scales: sb.id,
+                    scales_off: (sb.offset_bytes + i * sl) as u64,
+                    offs: db.id,
+                    offs_off: 0,
+                    gpr: match fmt {
+                        MvFmt::Gguf(k) => k.row_bytes(n_in) as u32,
+                        MvFmt::Bf16 => (n_in * 2) as u32,
+                        _ => 0,
+                    },
+                    gk: 0,
+                };
+                // x rows for every token of the 8-token tiles the kernel reads.
+                let (sx, sy) = (n_in + 16, n_out + 3);
+                let x: Vec<f32> = (0..ntok.next_multiple_of(8) * sx).map(|_| lcg(&mut seed)).collect();
+                let y0: Vec<f32> = (0..ntok * sy).map(|_| lcg(&mut seed)).collect();
+                let mut st = be.staging.lock().unwrap();
+                let st = &mut *st;
+                assert!(be.ensure_staging(st, x.len() * 4, ntok * sy * 4));
+                let tt = if ntok <= 8 { 8 } else { 16 };
+                let Some(fpipe) = be.fv_pipe(&wt(0), tt) else {
+                    assert!(!FV_FORMATS.contains(&fmt), "{fmt:?}: no fast kernel");
+                    continue;
+                };
+                let (nr, ks) = mv_variant(fmt, n_in);
+                let pipe = be.mv_pipe(fmt, nr, ks).unwrap();
+                for mode in [MvMode::Store, MvMode::Add, MvMode::SiluPair, MvMode::GeluPair, MvMode::AddGated] {
+                    let up = wt(1);
+                    let pair = matches!(mode, MvMode::SiluPair | MvMode::GeluPair).then_some(&up);
+                    let reset = || unsafe {
+                        std::ptr::copy_nonoverlapping(x.as_ptr(), f.contents(st.x) as *mut f32, x.len());
+                        std::ptr::copy_nonoverlapping(y0.as_ptr(), f.contents(st.y) as *mut f32, y0.len());
+                    };
+                    reset();
+                    let (ok, _) = run_concurrent(&be, &f, &[std::ops::Range { start: 0, end: 1 }], |e, _| {
+                        for j in 0..ntok {
+                            encode_mv(
+                                e,
+                                pipe,
+                                nr,
+                                ks,
+                                &wt(0),
+                                pair,
+                                (st.x, j * sx * 4),
+                                (st.y, j * sy * 4),
+                                mode,
+                                (st.y, (j * sy + n_out) * 4),
+                            );
+                        }
+                    });
+                    assert!(ok);
+                    let want: Vec<f32> = unsafe { std::slice::from_raw_parts(f.contents(st.y) as *const f32, y0.len()) }.to_vec();
+                    reset();
+                    let (ok, _) = run_concurrent(&be, &f, &[std::ops::Range { start: 0, end: 1 }], |e, _| {
+                        encode_fv(e, fpipe, &wt(0), pair, mode, ntok, (st.x, 0), (st.y, 0), (st.y, n_out * 4), sx, sy);
+                    });
+                    assert!(ok);
+                    let got = unsafe { std::slice::from_raw_parts(f.contents(st.y) as *const f32, y0.len()) };
+                    for j in 0..ntok {
+                        let scale = want[j * sy..j * sy + n_out].iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-3);
+                        for r in 0..n_out {
+                            let (a, b) = (got[j * sy + r], want[j * sy + r]);
+                            assert!(
+                                (a - b).abs() <= FV_TOL * scale,
+                                "{fmt:?} {mode:?} {ntok} tokens: token {j} row {r}: {a} vs {b}"
+                            );
+                        }
+                        // The gate slots after the rows are left alone.
+                        assert_eq!(got[j * sy + n_out].to_bits(), y0[j * sy + n_out].to_bits());
+                    }
+                }
+                for b in [db.id, sb.id] {
+                    unsafe { (f.void)(b, f.s_release) };
+                }
+            }
+        }
+    }
+
+    /// Fast verification matmul times against the single-token kernel
+    /// (`cargo test --release --lib decode_fv_bench -- --ignored --nocapture`).
+    #[test]
+    #[ignore]
+    fn decode_fv_bench() {
+        let be = MetalBackend::new().unwrap();
+        let mut seed = 9u64;
+        let fmts: Vec<MvFmt> = match std::env::var("OXINFER_MV_FMTS") {
+            Ok(v) => v
+                .split(',')
+                .map(|k| match k {
+                    "bf" => MvFmt::Bf16,
+                    "q8" => MvFmt::Q8,
+                    "q4" => MvFmt::Q4,
+                    k => MvFmt::Gguf(GGUF_GPU_TYPES.iter().copied().find(|t| t.name() == k).unwrap()),
+                })
+                .collect(),
+            Err(_) => vec![
+                MvFmt::Bf16,
+                MvFmt::Q8,
+                MvFmt::Q4,
+                MvFmt::Gguf(GgmlType::Q8_0),
+                MvFmt::Gguf(GgmlType::Q4_K),
+            ],
+        };
+        for fmt in fmts {
+            for (n_out, n_in) in [(4096, 4096), (12288, 4096), (4096, 12288), (17408, 5120), (151936, 4096)] {
+                let (d, sc, _) = matrix(fmt, n_out.min(17408), n_in, &mut seed);
+                // The LM head shape repeats its first rows (the timing only needs the bytes).
+                let rep = n_out.div_ceil(17408);
+                let one = d.len();
+                let d: Vec<u8> = d.iter().copied().cycle().take(one * rep).collect();
+                let sc: Vec<u8> = sc.iter().copied().cycle().take(sc.len() * rep).collect();
+                let copies = (512usize << 20).div_ceil(d.len()).clamp(1, 32);
+                let (dl, sl) = (d.len().next_multiple_of(4096), sc.len().next_multiple_of(4096));
+                let mut big = PageVec::<u8>::zeroed(copies * dl);
+                let mut bigs = PageVec::<u8>::zeroed(copies * sl);
+                for c in 0..copies {
+                    big[c * dl..c * dl + d.len()].copy_from_slice(&d);
+                    bigs[c * sl..c * sl + sc.len()].copy_from_slice(&sc);
+                }
+                let wb = be.wrap(big.as_ptr(), big.len()).unwrap();
+                let sbuf = be.wrap(bigs.as_ptr(), bigs.len()).unwrap();
+                let mut st = be.staging.lock().unwrap();
+                let st = &mut *st;
+                assert!(be.ensure_staging(st, 16 * n_in * 4, 16 * n_out * 4));
+                let wt = |c: usize| MvWeight {
+                    fmt,
+                    n_out,
+                    n_in,
+                    data: wb.id,
+                    data_off: (wb.offset_bytes + c * dl) as u64,
+                    scales: sbuf.id,
+                    scales_off: (sbuf.offset_bytes + c * sl) as u64,
+                    offs: wb.id,
+                    offs_off: 0,
+                    gpr: match fmt {
+                        MvFmt::Gguf(k) => k.row_bytes(n_in) as u32,
+                        MvFmt::Bf16 => (n_in * 2) as u32,
+                        _ => 0,
+                    },
+                    gk: 0,
+                };
+                let reps = 16;
+                let best = |enc: &dyn Fn(&FastEnc, usize)| {
+                    let mut b = f64::MAX;
+                    for _ in 0..4 {
+                        b = b.min(timed(&be, |e| {
+                            for r in 0..reps {
+                                enc(e, r % copies);
+                            }
+                        }));
+                    }
+                    b / reps as f64 * 1e6
+                };
+                let (nr, ks) = mv_variant(fmt, n_in);
+                let pipe = be.mv_pipe(fmt, nr, ks).unwrap();
+                let one = best(&|e, c| encode_mv(e, pipe, nr, ks, &wt(c), None, (st.x, 0), (st.y, 0), MvMode::Store, (st.y, 0)));
+                let pair = best(&|e, c| {
+                    encode_mv(
+                        e,
+                        pipe,
+                        nr,
+                        ks,
+                        &wt(c),
+                        Some(&wt((c + 1) % copies)),
+                        (st.x, 0),
+                        (st.y, 0),
+                        MvMode::SiluPair,
+                        (st.y, 0),
+                    )
+                });
+                let mut line = format!("{:>5} {n_out}x{n_in}: t1 {one:.0}us (pair {pair:.0})", fmt.name());
+                for ntok in [4, 8, 12, 16] {
+                    let tt = if ntok <= 8 { 8 } else { 16 };
+                    let fp = be.fv_pipe(&wt(0), tt).unwrap();
+                    let t = best(&|e, c| {
+                        encode_fv(
+                            e,
+                            fp,
+                            &wt(c),
+                            None,
+                            MvMode::Store,
+                            ntok,
+                            (st.x, 0),
+                            (st.y, 0),
+                            (st.y, 0),
+                            n_in,
+                            n_out,
+                        )
+                    });
+                    let tp = best(&|e, c| {
+                        encode_fv(
+                            e,
+                            fp,
+                            &wt(c),
+                            Some(&wt((c + 1) % copies)),
+                            MvMode::SiluPair,
+                            ntok,
+                            (st.x, 0),
+                            (st.y, 0),
+                            (st.y, 0),
+                            n_in,
+                            n_out,
+                        )
+                    });
+                    let _ = write!(line, " | t{ntok} {t:.0}us (pair {tp:.0})");
+                }
+                println!("{line}");
             }
         }
     }

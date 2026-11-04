@@ -403,19 +403,26 @@ impl<'a> Model<'a> {
         })
     }
 
-    /// The multi-token GPU plan capturing the outputs of `layers` (sorted), compiled on first use.
-    fn gpu_multi_plan(&self, layers: &[usize], tokens: usize) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
+    /// The multi-token GPU plan capturing the outputs of `layers` (sorted), compiled on first use
+    /// (`fast`: on the batched fast-verification kernels, see
+    /// [`crate::gpu::Backend::decode_plan_multi_fast`]).
+    fn gpu_multi_plan(&self, layers: &[usize], tokens: usize, fast: bool) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
         if !crate::gpu::decode_enabled() || self.stream.is_some() {
             return None;
         }
-        let key = layers.iter().fold((1u64 << 63) | tokens as u64, |k, &l| {
+        let fast = fast && tokens > 1;
+        let key = layers.iter().fold((1u64 << 63) | ((fast as u64) << 62) | tokens as u64, |k, &l| {
             k.wrapping_mul(0x100000001b3).wrapping_add(l as u64 + 1)
         });
         self.gpu_plans.get(key, || {
             let be = crate::gpu::active()?;
-            let plan = self
-                .gpu_graph_with(None, Some(layers))
-                .and_then(|g| be.decode_plan_multi(&g, tokens));
+            let plan = self.gpu_graph_with(None, Some(layers)).and_then(|g| {
+                if fast {
+                    be.decode_plan_multi_fast(&g, tokens)
+                } else {
+                    be.decode_plan_multi(&g, tokens)
+                }
+            });
             if plan.is_none() {
                 eprintln!("[no multi-token GPU plan for this model: speculative verification runs on the CPU]");
             }
@@ -427,7 +434,14 @@ impl<'a> Model<'a> {
     /// after the other: the (softcapped) logits of every token and, in `feats`, the residual
     /// stream entering each of `layers` (as [`crate::dspark::Target::forward_feats`]). None
     /// (nothing changed) when GPU decoding is off or the model cannot.
-    pub(super) fn gpu_verify(&self, sess: &mut Session, tokens: &[u32], layers: &[usize], feats: &mut Vec<f32>) -> Option<Vec<f32>> {
+    pub(super) fn gpu_verify(
+        &self,
+        sess: &mut Session,
+        tokens: &[u32],
+        layers: &[usize],
+        feats: &mut Vec<f32>,
+        fast: bool,
+    ) -> Option<Vec<f32>> {
         let t = tokens.len();
         if t == 0 || t > 16 || sess.iv.active() || layers.contains(&0) || self.cfg.bidirectional() {
             return None;
@@ -446,6 +460,7 @@ impl<'a> Model<'a> {
             } else {
                 16
             },
+            fast,
         )?;
         let _timer = crate::prof::start(crate::prof::Cat::Matmul);
         let cfg = &self.cfg;

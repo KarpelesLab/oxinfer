@@ -57,6 +57,7 @@ struct Args {
     draft_p_min: Option<f32>,
     draft_device: Option<bool>,
     draft_conf_min: Option<f32>,
+    fast_verify: bool,
     mtp: bool,
     mtp_fixed: bool,
     mtp_from: Option<PathBuf>,
@@ -211,6 +212,10 @@ fn usage() -> ! {
          \x20                      profitable part of each block verified; fixed when streaming)\n\
          \x20 --spec-draft-conf-min C  DSpark: cut a block before the first draft whose confidence-head\n\
          \x20                      estimate of being accepted is below C (default 0: off)\n\
+         \x20 --fast-verify        DSpark / MTP on the GPU: verify drafts with batched matrix kernels\n\
+         \x20                      (faster; the logits then differ from plain decoding in rounding, so\n\
+         \x20                      greedy output can drift from plain greedy at near-ties; default:\n\
+         \x20                      exact, the plain greedy output token for token)\n\
          \x20 --mtp                Qwen3.5/3.8: speculative decoding with the checkpoint's multi-token\n\
          \x20                      prediction layer (greedy and sampled; same output distribution); the\n\
          \x20                      default for Qwen3.5-4B / 9B (--no-draft: plain decoding)\n\
@@ -411,6 +416,7 @@ fn parse_args() -> Result<Args> {
         draft_p_min: None,
         draft_device: None,
         draft_conf_min: None,
+        fast_verify: false,
         mtp: false,
         mtp_fixed: false,
         mtp_from: None,
@@ -557,6 +563,7 @@ fn parse_args() -> Result<Args> {
             "--spec-draft-p-min" | "--draft-p-min" => a.draft_p_min = Some(val()?.parse()?),
             "--spec-draft-conf-min" | "--draft-conf-min" => a.draft_conf_min = Some(val()?.parse()?),
             "--spec-draft-fixed" => a.mtp_fixed = true,
+            "--fast-verify" => a.fast_verify = true,
             "--draft-device" => {
                 a.draft_device = match val()?.as_str() {
                     "auto" => None,
@@ -2099,6 +2106,7 @@ fn run_qwen_mtp(
         cost_aware: !args.mtp_fixed && args.mtp_cost.unwrap_or(args.stream),
         // Long drafts stay exact (the decode kernels are also faster than the GEMM at 8-15 tokens).
         exact: true,
+        fast_verify: args.fast_verify,
     };
     eprintln!(
         "[MTP speculative decoding: {} draft tokens{}, {}]",
@@ -2292,6 +2300,7 @@ fn run_dspark<M: oxinfer::dspark::Target<Sess: Clone>>(
             .unwrap_or(if args.stream { oxinfer::dspark::STREAM_P_MIN } else { 0.0 }),
         device: args.draft_device,
         conf_min: args.draft_conf_min.unwrap_or(0.0),
+        fast_verify: args.fast_verify,
     };
     let mut sampler =
         Sampler::new(args.temperature, args.top_k, args.top_p, args.seed).with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0));

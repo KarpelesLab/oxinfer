@@ -1670,8 +1670,8 @@ impl crate::dspark::Target for Model<'_> {
         }
         hs
     }
-    fn forward_verify(&self, sess: &mut Session, tokens: &[u32], layers: &[usize], feats: &mut Vec<f32>) -> Vec<f32> {
-        if let Some(l) = self.gpu_verify(sess, tokens, layers, feats) {
+    fn forward_verify(&self, sess: &mut Session, tokens: &[u32], layers: &[usize], feats: &mut Vec<f32>, fast: bool) -> Vec<f32> {
+        if let Some(l) = self.gpu_verify(sess, tokens, layers, feats, fast) {
             return l;
         }
         let hs = crate::dspark::Target::forward_feats(self, sess, tokens, &[], layers, feats);
