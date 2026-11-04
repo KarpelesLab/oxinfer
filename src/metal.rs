@@ -2899,6 +2899,10 @@ impl Backend for MetalBackend {
         }
     }
 
+    fn decodes(&self) -> bool {
+        true
+    }
+
     fn decode_plan<'s>(&'s self, g: &crate::gpu::decode::Graph) -> Option<Box<dyn crate::gpu::decode::DecodePlan + 's>> {
         self.build_plan(g)
             .map(|p| Box::new(p) as Box<dyn crate::gpu::decode::DecodePlan + 's>)

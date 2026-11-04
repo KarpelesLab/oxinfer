@@ -185,6 +185,11 @@ pub trait Backend: Send + Sync {
     ) -> bool {
         false
     }
+    /// Whether [`Backend::decode_plan`] can return a plan at all (the start-up banner says where
+    /// decoding runs).
+    fn decodes(&self) -> bool {
+        false
+    }
     /// Compiles a single-token decode graph (see [`decode`]); None when the backend cannot run
     /// some op or weight of it (the model then decodes on the CPU).
     fn decode_plan<'s>(&'s self, _g: &decode::Graph) -> Option<Box<dyn decode::DecodePlan + 's>> {

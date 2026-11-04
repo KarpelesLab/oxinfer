@@ -1049,7 +1049,7 @@ fn run(mut args: Args) -> Result<()> {
     eprintln!("[platform: {}]", plat.summary());
     let gpu = oxinfer::gpu::init(&plat, args.device)?;
     match gpu {
-        Some(b) if oxinfer::gpu::decode_enabled() => eprintln!(
+        Some(b) if b.decodes() && oxinfer::gpu::decode_enabled() => eprintln!(
             "[device: {} (prefill matmuls and, where supported, whole decode steps on the GPU)]",
             b.name()
         ),
