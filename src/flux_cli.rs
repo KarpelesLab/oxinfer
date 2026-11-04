@@ -112,7 +112,7 @@ pub fn run(args: &Args) -> Result<()> {
     if let Some(m) = f.max_area.or(args.size.map(|(w, h)| w * h)) {
         o.max_area = m;
     }
-    let image = match init {
+    let image: Option<oxinfer::video::RgbImage> = match init {
         None => None,
         Some(p) => {
             #[cfg(feature = "media")]

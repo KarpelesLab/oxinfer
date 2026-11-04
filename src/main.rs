@@ -23,6 +23,7 @@ mod server_cli;
 mod step1x_cli;
 #[cfg(feature = "media")]
 mod tts_cli;
+#[cfg(feature = "media")]
 mod whisper_cli;
 
 struct Args {
@@ -1085,7 +1086,10 @@ fn run(mut args: Args) -> Result<()> {
         return run_embed(&args);
     }
     if args.speak.is_some() || args.decode_tokens.is_some() || args.snac_encode.is_some() || args.decode_codes.is_some() {
+        #[cfg(feature = "media")]
         return tts_cli::run(&args);
+        #[cfg(not(feature = "media"))]
+        bail!("speech synthesis from the command line needs the `media` feature (audio encoding)");
     }
     let model_type = config::model_type(&args.model)?;
     if model_type == "whisper" || args.transcribe.is_some() {
