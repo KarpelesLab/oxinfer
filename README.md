@@ -974,8 +974,8 @@ of the loader for the other kinds (Whisper `encoder` / `decoder` precision, Orph
 | `memory_gb` | the memory the model is counted for |
 
 Server options: `--listen ADDR` (port 0 picks one), `--api-key KEY` (or `$OXINFER_API_KEY`;
-requests need `Authorization: Bearer KEY`), `--cors ORIGIN`, `--max-body-mb N` (default 16, also
-httpsd's limit), `--preload`, `--download`, `--memory-gb F`, `--cache-dir DIR`, `--threads N`,
+requests need `Authorization: Bearer KEY`), `--cors ORIGIN`, `--max-body-mb N` (default 16),
+`--preload`, `--download`, `--memory-gb F`, `--cache-dir DIR`, `--threads N`,
 `--tls-cert FILE --tls-key FILE` or `--self-signed` for HTTPS, `--workers N` (connections served
 at once, default 32), `--quiet`. Media URLs in requests may be `data:` URLs or `http(s)://` URLs,
 which the server fetches (`--no-remote-media` turns that off); local paths and `file://` URLs

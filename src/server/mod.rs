@@ -191,8 +191,7 @@ pub struct ServerOptions {
     /// `Access-Control-Allow-Origin` value (`*` or an origin) for browser clients; None: no CORS
     /// headers (key `cors`).
     pub cors: Option<String>,
-    /// Largest request body in bytes (key `max_body_mb`, default 16; the HTTP listener caps it
-    /// at 16 MB).
+    /// Largest request body in bytes (key `max_body_mb`, default 16).
     pub max_body: usize,
     /// Load every model at start instead of on first use (key `preload`).
     pub preload: bool,
@@ -569,37 +568,6 @@ impl Api {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
         format!("{prefix}{:x}{:04x}", t.as_millis(), n & 0xffff)
-    }
-
-    /// The content type a successful response to `req` has (for a transport that must send the
-    /// headers before the response is ready).
-    pub fn content_type(&self, req: &ApiRequest) -> String {
-        let path = req.path.trim_end_matches('/');
-        let field = |k: &str| {
-            serde_json::from_slice::<Value>(&req.body)
-                .ok()
-                .and_then(|v| v.get(k).and_then(Value::as_str).map(str::to_string))
-        };
-        if path.ends_with("/audio/speech") {
-            if field("stream_format").as_deref() == Some("sse") {
-                return "text/event-stream".into();
-            }
-            return if field("response_format").as_deref() == Some("pcm") {
-                "audio/pcm"
-            } else {
-                "audio/wav"
-            }
-            .into();
-        }
-        if path.ends_with("/audio/transcriptions") || path.ends_with("/audio/translations") {
-            let format = media::multipart(req.content_type.as_deref(), &req.body)
-                .ok()
-                .and_then(|parts| parts.iter().find(|p| p.name == "response_format").map(media::Part::text));
-            if matches!(format.as_deref(), Some("text" | "srt" | "vtt")) {
-                return "text/plain; charset=utf-8".into();
-            }
-        }
-        "application/json".into()
     }
 
     /// Handles one request.

@@ -62,6 +62,7 @@ pub fn start(api: Arc<Api>) -> Result<Running> {
     let mut server = httpsd::Server::bind(addr)
         .map_err(|e| anyhow!("bind {addr}: {e}"))?
         .workers(o.workers.max(2))
+        .max_body_bytes(o.max_body)
         .server_name(Some(format!("oxinfer/{}", env!("CARGO_PKG_VERSION"))));
     let https = match (&o.tls_cert, &o.tls_key, o.self_signed) {
         (Some(c), Some(k), _) => {
@@ -148,37 +149,11 @@ fn handle(api: &Arc<Api>, req: &Request) -> Response {
     let h = req.headers();
     let mut r = ApiRequest::new(&method, req.path(), h.get("content-type"), req.body().to_vec());
     r.authorization = h.get("authorization").map(str::to_string);
-    // httpsd counts the time a handler runs against the connection's 30 s inactivity window and
-    // drops the connection past it, so the request runs on its own thread: a response not ready
-    // after LATE is committed as 200 (with the content type it will have) and its body streamed
-    // when it is.
-    const LATE: std::time::Duration = std::time::Duration::from_secs(20);
-    let late_type = api.content_type(&r);
-    let (tx, rx) = std::sync::mpsc::channel();
-    let worker = api.clone();
-    std::thread::spawn(move || {
-        let _ = tx.send(worker.handle(&r));
-    });
-    let resp = match rx.recv_timeout(LATE) {
-        Ok(Output::Full(full)) => Response::new(status(full.status))
+    let resp = match api.handle(&r) {
+        Output::Full(full) => Response::new(status(full.status))
             .header("Content-Type", full.content_type)
             .body(full.body),
-        Ok(Output::Stream { content_type, producer }) => streamed(content_type, producer),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => streamed(
-            late_type,
-            Box::new(move |sink| match rx.recv() {
-                Ok(Output::Full(full)) => {
-                    sink(&full.body);
-                }
-                Ok(Output::Stream { producer, .. }) => producer(sink),
-                Err(_) => {}
-            }),
-        ),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Response::new(status(500)).header("Content-Type", "application/json").body(
-            super::ApiError::new(500, "the request failed (internal error)")
-                .to_json()
-                .to_string(),
-        ),
+        Output::Stream { content_type, producer } => streamed(content_type, producer),
     };
     with_cors(api, resp)
 }
