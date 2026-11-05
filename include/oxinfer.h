@@ -84,8 +84,9 @@ char *oxi_download(const char *spec, const char *cache_dir, oxi_progress_fn prog
  *   draft_fixed=0|1      DSpark: always draft draft_tokens (default 0: the length, no draft
  *                        included, that measures fastest; fixed when the model streams)
  *   fast_verify=0|1      DSpark / MTP on the GPU: verify drafts with batched matrix kernels
- *                        (faster; logits then differ from plain decoding in rounding, so greedy
- *                        output can drift from plain greedy at near-ties; default 0: exact)
+ *                        (default 1: faster; logits then differ from plain decoding in rounding,
+ *                        so greedy output can drift from plain greedy at near-ties; 0: exact,
+ *                        the plain greedy output token for token)
  *   cache_dir=PATH       where repo ids are downloaded
  *   gpu_exact=0|1        GPU matmuls bit-identical to the CPU (default 0: M5/A19 matrix
  *                        units, half-precision inputs; process-wide)

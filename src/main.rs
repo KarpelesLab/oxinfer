@@ -212,10 +212,10 @@ fn usage() -> ! {
          \x20                      profitable part of each block verified; fixed when streaming)\n\
          \x20 --spec-draft-conf-min C  DSpark: cut a block before the first draft whose confidence-head\n\
          \x20                      estimate of being accepted is below C (default 0: off)\n\
-         \x20 --fast-verify        DSpark / MTP on the GPU: verify drafts with batched matrix kernels\n\
-         \x20                      (faster; the logits then differ from plain decoding in rounding, so\n\
-         \x20                      greedy output can drift from plain greedy at near-ties; default:\n\
-         \x20                      exact, the plain greedy output token for token)\n\
+         \x20 --exact-verify       DSpark / MTP: verify drafts with the one-token kernels, so greedy\n\
+         \x20                      output is the plain greedy output token for token (default: fast\n\
+         \x20                      batched matrix kernels on the GPU, whose logits differ from plain\n\
+         \x20                      decoding in rounding; --fast-verify asks for them explicitly)\n\
          \x20 --mtp                Qwen3.5/3.8: speculative decoding with the checkpoint's multi-token\n\
          \x20                      prediction layer (greedy and sampled; same output distribution); the\n\
          \x20                      default for Qwen3.5-4B / 9B (--no-draft: plain decoding)\n\
@@ -416,7 +416,7 @@ fn parse_args() -> Result<Args> {
         draft_p_min: None,
         draft_device: None,
         draft_conf_min: None,
-        fast_verify: false,
+        fast_verify: true,
         mtp: false,
         mtp_fixed: false,
         mtp_from: None,
@@ -564,6 +564,7 @@ fn parse_args() -> Result<Args> {
             "--spec-draft-conf-min" | "--draft-conf-min" => a.draft_conf_min = Some(val()?.parse()?),
             "--spec-draft-fixed" => a.mtp_fixed = true,
             "--fast-verify" => a.fast_verify = true,
+            "--exact-verify" => a.fast_verify = false,
             "--draft-device" => {
                 a.draft_device = match val()?.as_str() {
                     "auto" => None,
@@ -1912,7 +1913,9 @@ fn pick_dspark(args: &Args) -> Result<Option<PathBuf>> {
         Some(d) if d.as_os_str() == "auto" => Some(resolve_auto_draft(&args.model, args.cache_dir.as_deref())?),
         Some(d) if oxinfer::dspark::is_draft(d) => Some(d.clone()),
         Some(_) => None,
-        None if oxinfer::dspark::BY_DEFAULT && !args.no_draft && !plain_only => oxinfer::dspark::default_draft(&args.model),
+        None if oxinfer::dspark::BY_DEFAULT && !args.no_draft && !plain_only => {
+            oxinfer::dspark::default_draft_for(&args.model, args.fast_verify)
+        }
         None => None,
     };
     if draft.is_none() && args.draft.is_none() && !args.no_draft && !plain_only {
@@ -2119,7 +2122,11 @@ fn run_qwen_mtp(
             ""
         },
         if args.temperature > 0.0 { "sampled" } else { "greedy" },
-        if opts.fast_verify { ", fast verification" } else { "" }
+        if opts.fast_verify {
+            ", fast verification"
+        } else {
+            ", exact verification"
+        }
     );
     let mut sampler =
         Sampler::new(args.temperature, args.top_k, args.top_p, args.seed).with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0));
@@ -2311,7 +2318,11 @@ fn run_dspark<M: oxinfer::dspark::Target<Sess: Clone>>(
         dec.opts.draft_tokens,
         if dec.opts.cost_aware { " max (cost-aware)" } else { "" },
         if args.temperature > 0.0 { "sampled" } else { "greedy" },
-        if dec.opts.fast_verify { ", fast verification" } else { "" }
+        if dec.opts.fast_verify {
+            ", fast verification"
+        } else {
+            ", exact verification"
+        }
     );
     let chunk = args.prefill_chunk.unwrap_or(256);
     let mut unfed: Option<u32> = None;

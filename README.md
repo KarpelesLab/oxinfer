@@ -304,7 +304,9 @@ feature copies), and the plans of a model share their device copies of the cache
 as two such passes (its context and its block).
 
 Defaults (Metal, M5 Max): a pair is on by default where it was faster than plain decoding on
-average over 8-12 prompts (code, prose, chat, math, 200 tokens each):
+average over 8-12 prompts (code, prose, chat, math, 200 tokens each). The numbers below are exact
+verification; "fast" pairs are on only with [fast verification](#fast-verification) (the
+default), where they gain (see its table):
 
 | target | draft | default | plain -> DSpark, mean tok/s (code / prose / chat / math) | load |
 |---|---|---|---|---|
@@ -315,10 +317,10 @@ average over 8-12 prompts (code, prose, chat, math, 200 tokens each):
 | Qwen/Qwen3-14B (Q8_0 GGUF) | Anbeeld/Qwen3-14B-DSpark-GGUF (Q8_0) | yes | 31.5 -> 43.5 | 5-14 |
 | google/gemma-4-12B-it (q8) | deepseek-ai/dspark_gemma4_12b_block7 | yes | 34.6 -> 43.1 (34 -> 48 / 34 -> 36 / 35 -> 37 / 36 -> 52) | 11-16 |
 | google/gemma-4-12B-it | ankk98/dspark-gemma4-12b-block7-Q4_0-GGUF | no | Q4_0 throughout: fewer drafts accepted (4.3 tokens per round on a code prompt vs 5.2) | |
-| Qwen3.8-27B (q4) | RadixArk/Qwen3.8-27B-DSpark | no | 30.6 -> 29.6 (31 -> 31 / 31 -> 29 / 30 -> 29 / 30 -> 30) | 6-12 |
+| Qwen3.8-27B (q4) | RadixArk/Qwen3.8-27B-DSpark | fast | 30.6 -> 29.6 (31 -> 31 / 31 -> 29 / 30 -> 29 / 30 -> 30) | 6-12 |
 | Qwen3.8-27B (q4) | jialinyyzz/Qwen3.8-27B-DSpark-drafter | no | 30.6 -> 29.5 | 6-12 |
 | Qwen3.5-35B-A3B (q4) | jinzex/Qwen3.5-35B-A3B-DSpark | no | 126.9 -> 85.6 (125 -> 89 / 128 -> 84 / 136 -> 85 / 119 -> 84) | 13-24 |
-| google/gemma-4-31B-it (q4) | RedHatAI/gemma-4-31B-it-speculator.dspark | no | 23.2 -> 22.4 (21 -> 21 / 24 -> 23 / 24 -> 22 / 25 -> 23) | 12-24 |
+| google/gemma-4-31B-it (q4) | RedHatAI/gemma-4-31B-it-speculator.dspark | fast | 23.2 -> 22.4 (21 -> 21 / 24 -> 23 / 24 -> 22 / 25 -> 23) | 12-24 |
 | google/gemma-4-31B-it (q4) | Hikari07jp/DSpark-Gemma-4-31B-draft | no | 23.2 -> 21.6 | 12-24 |
 
 All the outputs above are the plain greedy outputs, token for token (both GGUF and Hugging Face
@@ -393,11 +395,15 @@ cuts unlikely ones), but llama.cpp verifies 8 tokens for little more than a plai
 runs at 110 tok/s with 31% of the drafts accepted, against 62 plain): its batched kernels reorder
 the arithmetic (a token's logits depend on the batch), where oxinfer's verification must
 reproduce the single-token kernels bit for bit to keep greedy output identical to plain decoding
-(an 8-token verification costs ~2 plain steps at Q8, ~5 at Q4). `--fast-verify` (below) lifts
-that constraint.
+(an 8-token verification costs ~2 plain steps at Q8, ~5 at Q4). Fast verification (below, the
+default) lifts that constraint.
 
-**Fast verification** (`--fast-verify`; engine / C API / server key `fast_verify=1`;
-`DsparkOptions::fast_verify`, `MtpOptions::fast_verify`; off by default). The multi-token GPU
+#### Fast verification
+
+On by default; `--exact-verify` (engine / C API / server key `fast_verify=0`;
+`DsparkOptions::fast_verify`, `MtpOptions::fast_verify` false) turns it off, so that greedy
+output is the plain greedy output token for token (the Q4 drafts marked "fast" above are then
+not used by default either). The multi-token GPU
 passes (the verification, and the DSpark draft's own passes) then run their matmuls on batched
 kernels (`metal_fastv.metal`): 8x8 f32 simdgroup-matrix products over all the tokens, the
 weights dequantized straight into the lanes' matrix fragments (each 32-value block's K order
@@ -427,17 +433,18 @@ Speed (M5 Max, 8 prompts: code, prose, chat, math, 200 tokens, greedy, `--no-sys
 means; plain / exact / fast interleaved prompt by prompt, 2 repetitions, 1 for the Q4 models;
 llama.cpp from the table above, Q8_0 GGUF target and draft, 7 drafts):
 
-| target, draft | plain | exact (default) | fast | llama.cpp | load |
+| target, draft | plain | exact | fast (default) | llama.cpp | load |
 |---|---|---|---|---|---|
 | Qwen/Qwen3-4B (bf16), dspark_qwen3_4b | 63.9 | 112.9 | 145.5 (code 176, prose 111) | | 1.3-3.2 |
 | Qwen/Qwen3-8B (Q8_0 GGUF), dspark_qwen3_8b | 63.1 | 84.2 | 125.5 (code 131, prose 95) | 168.3 | 1.7-3.8 |
 | google/gemma-4-12B-it (q8), dspark_gemma4_12b | 38.8 | 52.6 | 92.6 (code 107, prose 59) | 81.9 | 2.1-8.3 |
 | Qwen/Qwen3.5-4B (bf16), MTP | 62.9 | 86.7 | 85.9 | | 2.4-6.6 |
-| Qwen3.8-27B (q4), RadixArk DSpark (not default) | 34.5 | 32.9 | 44.5 (code 57, prose 35) | | 1.4-4.3 |
-| google/gemma-4-31B-it (q4), RedHatAI speculator (not default) | 27.4 | 25.9 | 46.2 (code 55, prose 29) | | 2.8-6.3 |
-| Qwen3.5-35B-A3B (q4), jinzex DSpark (not default) | 169.3 | 122.7 | 126.3 | | 3.6-7.2 |
+| Qwen3.8-27B (q4), RadixArk DSpark | 34.5 | 32.9 | 44.5 (code 57, prose 35) | | 1.4-4.3 |
+| google/gemma-4-31B-it (q4), RedHatAI speculator | 27.4 | 25.9 | 46.2 (code 55, prose 29) | | 2.8-6.3 |
+| Qwen3.5-35B-A3B (q4), jinzex DSpark (not a default) | 169.3 | 122.7 | 126.3 | | 3.6-7.2 |
 
-Fast verification makes the Q4 dense drafts pay (Gemma 4 31B +69%, Qwen3.8-27B +29% over plain),
+Fast verification makes the Q4 dense drafts pay (Gemma 4 31B +69%, Qwen3.8-27B +29% over plain;
+both drafts are therefore defaults with it),
 and closes most of the gap to llama.cpp on Gemma 4 12B; on Qwen3-8B the rest is the draft's own
 passes (~9 ms a round against ~19 ms for an 8-token verification, plain step 16 ms: the Markov
 head's 7 chained submissions alone take 2 ms). MTP on Qwen3.5-4B gains nothing (its 4-token bf16
@@ -3351,7 +3358,7 @@ Useful flags:
 | `--spec-draft-fixed` | DSpark (Qwen, Gemma 4): always draft `--draft-tokens` instead of choosing each round's length by measured cost |
 | `--spec-draft-conf-min C` | DSpark: cut a block before the first draft whose confidence-head estimate is below C (default 0: off) |
 | `--spec-draft-p-min P` | DSpark: cut a block before the first draft the draft model gives less than probability P (default 0.85 when the model streams, else 0) |
-| `--fast-verify` | DSpark / MTP on the GPU: verify with batched matrix kernels (faster; logits differ from plain decoding in rounding, greedy output may drift at near-ties; default exact), see [fast verification](#dspark-drafts-for-qwen-and-gemma-4) |
+| `--exact-verify` | DSpark / MTP: verify with the one-token kernels, so greedy output is the plain greedy output token for token (default: fast batched matrix kernels on the GPU, whose logits differ from plain decoding in rounding; `--fast-verify` asks for them explicitly), see [fast verification](#fast-verification) |
 | `--mtp` | Qwen3.5/3.8: speculative decoding with the checkpoint's multi-token-prediction layer (greedy and sampled) |
 | `--mtp-fixed` | with `--mtp`, always draft `--draft-tokens` instead of adapting between 1 and N |
 | `--mtp-from DIR` | `--mtp` with the MTP weights taken from another checkpoint (e.g. the original of a converted copy) |

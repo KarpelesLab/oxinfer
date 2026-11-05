@@ -78,6 +78,8 @@ fn check<M: Target<Sess: Clone>>(m: &M, d: &Dspark, tok: &Tokenizer, ids: &[u32]
         DsparkOptions {
             draft_tokens: k,
             device: o.device,
+            // The check compares against one-token forwards bit for bit.
+            fast_verify: false,
             ..Default::default()
         },
     );

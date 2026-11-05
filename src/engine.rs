@@ -147,7 +147,7 @@ pub struct EngineOptions {
     /// kernels that are faster but not batch-invariant, so the logits differ from plain
     /// decoding's in rounding and greedy output may drift from plain greedy output at near-ties
     /// ([`crate::dspark::DsparkOptions::fast_verify`], [`crate::qwen_mtp::MtpOptions::fast_verify`]).
-    /// Default false (verification reproduces plain decoding bit for bit). Key `fast_verify`.
+    /// Default true; false: verification reproduces plain decoding bit for bit. Key `fast_verify`.
     pub fast_verify: bool,
     /// Where repo ids are downloaded (default [`crate::hf::cache_root`]). Key `cache_dir`.
     pub cache_dir: Option<PathBuf>,
@@ -343,7 +343,7 @@ impl Default for EngineOptions {
             draft_p_min: None,
             draft_device: None,
             draft_conf_min: None,
-            fast_verify: false,
+            fast_verify: true,
             cache_dir: None,
             stream: None,
             stream_mode: StreamMode::Auto,
@@ -1126,7 +1126,7 @@ impl Engine {
         let dspark = match (opts.draft.as_deref(), &draft_dir) {
             (Some("auto"), _) => Some(resolve_auto_draft(&dir, opts.cache_dir.as_deref())?),
             (_, Some(d)) if dspark_given => Some(d.clone()),
-            (None, None) if !mtp && crate::dspark::BY_DEFAULT => crate::dspark::default_draft(&dir),
+            (None, None) if !mtp && crate::dspark::BY_DEFAULT => crate::dspark::default_draft_for(&dir, opts.fast_verify),
             _ => None,
         };
         let dspark_opts = |stop: Vec<u32>, streaming: bool| DsparkOptions {
@@ -1331,7 +1331,7 @@ impl Engine {
                 let dspark = match (opts.draft.as_deref(), &draft_dir) {
                     (Some("auto"), _) => Some(resolve_auto_draft(&dir, opts.cache_dir.as_deref())?),
                     (_, Some(d)) => Some(d.clone()),
-                    (None, None) if crate::dspark::BY_DEFAULT => crate::dspark::default_draft(&dir),
+                    (None, None) if crate::dspark::BY_DEFAULT => crate::dspark::default_draft_for(&dir, opts.fast_verify),
                     _ => None,
                 };
                 let lm = match dspark {
@@ -1393,7 +1393,7 @@ impl Engine {
                 let dspark = match (opts.draft.as_deref(), &draft_dir) {
                     (Some("auto"), _) => Some(resolve_auto_draft(&dir, opts.cache_dir.as_deref())?),
                     (_, Some(d)) => Some(d.clone()),
-                    (None, None) if crate::dspark::BY_DEFAULT => crate::dspark::default_draft(&dir),
+                    (None, None) if crate::dspark::BY_DEFAULT => crate::dspark::default_draft_for(&dir, opts.fast_verify),
                     _ => None,
                 };
                 let lm = match dspark {

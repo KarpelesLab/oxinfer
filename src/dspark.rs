@@ -774,27 +774,54 @@ pub const STREAM_P_MIN: f32 = 0.85;
 /// Default drafts per round with a DeepSeek V4 draft (its block holds 5): see the README.
 pub const DS4_DRAFT_TOKENS: usize = 3;
 
+/// Whether a [`KNOWN`] draft is used when none is asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ByDefault {
+    /// Only when asked for (`draft=auto`, `--draft auto`).
+    No,
+    /// Always.
+    Yes,
+    /// With fast verification ([`DsparkOptions::fast_verify`], the default) only: with exact
+    /// verification it measured slower than plain decoding.
+    Fast,
+}
+
+impl ByDefault {
+    /// Whether the draft is a default with fast verification on (`fast`) or off.
+    pub fn applies(self, fast: bool) -> bool {
+        match self {
+            ByDefault::No => false,
+            ByDefault::Yes => true,
+            ByDefault::Fast => fast,
+        }
+    }
+}
+
 /// Published DSpark drafts and their targets (Hugging Face repo ids), and whether that pair is
 /// used by default: where it measured faster than plain decoding on average over code, prose,
 /// chat and math prompts (Metal, M5 Max; the README has the numbers). The Q4 targets (Qwen3.8-27B,
-/// Gemma 4 31B), Qwen3.5-35B-A3B (3B active: a plain step takes 8 ms) and the pure-Q4_0 Gemma 4
-/// draft were not faster.
+/// Gemma 4 31B) are faster only with fast verification; Qwen3.5-35B-A3B (3B active: a plain step
+/// takes 8 ms) and the pure-Q4_0 Gemma 4 draft were not faster.
 /// A draft is found in the download cache (`org--name` folders beside the target's), or fetched
 /// by `draft=auto` (CLI `--draft auto`) when it is not there; GGUF draft repositories (llama.cpp
 /// conversions) are found but not fetched.
-pub const KNOWN: &[(&str, &str, bool)] = &[
-    ("Qwen/Qwen3-4B", "deepseek-ai/dspark_qwen3_4b_block7", true),
-    ("Qwen/Qwen3-8B", "deepseek-ai/dspark_qwen3_8b_block7", true),
-    ("Qwen/Qwen3-8B", "ankk98/dspark-qwen3-8b-block7-Q4_K_M-GGUF", true),
-    ("Qwen/Qwen3-14B", "deepseek-ai/dspark_qwen3_14b_block7", true),
-    ("Qwen/Qwen3-14B", "Anbeeld/Qwen3-14B-DSpark-GGUF", true),
-    ("Qwen/Qwen3.8-27B", "RadixArk/Qwen3.8-27B-DSpark", false),
-    ("Qwen/Qwen3.8-27B", "jialinyyzz/Qwen3.8-27B-DSpark-drafter", false),
-    ("Qwen/Qwen3.5-35B-A3B", "jinzex/Qwen3.5-35B-A3B-DSpark", false),
-    ("google/gemma-4-12B-it", "deepseek-ai/dspark_gemma4_12b_block7", true),
-    ("google/gemma-4-12B-it", "ankk98/dspark-gemma4-12b-block7-Q4_0-GGUF", false),
-    ("google/gemma-4-31B-it", "RedHatAI/gemma-4-31B-it-speculator.dspark", false),
-    ("google/gemma-4-31B-it", "Hikari07jp/DSpark-Gemma-4-31B-draft", false),
+pub const KNOWN: &[(&str, &str, ByDefault)] = &[
+    ("Qwen/Qwen3-4B", "deepseek-ai/dspark_qwen3_4b_block7", ByDefault::Yes),
+    ("Qwen/Qwen3-8B", "deepseek-ai/dspark_qwen3_8b_block7", ByDefault::Yes),
+    ("Qwen/Qwen3-8B", "ankk98/dspark-qwen3-8b-block7-Q4_K_M-GGUF", ByDefault::Yes),
+    ("Qwen/Qwen3-14B", "deepseek-ai/dspark_qwen3_14b_block7", ByDefault::Yes),
+    ("Qwen/Qwen3-14B", "Anbeeld/Qwen3-14B-DSpark-GGUF", ByDefault::Yes),
+    ("Qwen/Qwen3.8-27B", "RadixArk/Qwen3.8-27B-DSpark", ByDefault::Fast),
+    ("Qwen/Qwen3.8-27B", "jialinyyzz/Qwen3.8-27B-DSpark-drafter", ByDefault::No),
+    ("Qwen/Qwen3.5-35B-A3B", "jinzex/Qwen3.5-35B-A3B-DSpark", ByDefault::No),
+    ("google/gemma-4-12B-it", "deepseek-ai/dspark_gemma4_12b_block7", ByDefault::Yes),
+    ("google/gemma-4-12B-it", "ankk98/dspark-gemma4-12b-block7-Q4_0-GGUF", ByDefault::No),
+    (
+        "google/gemma-4-31B-it",
+        "RedHatAI/gemma-4-31B-it-speculator.dspark",
+        ByDefault::Fast,
+    ),
+    ("google/gemma-4-31B-it", "Hikari07jp/DSpark-Gemma-4-31B-draft", ByDefault::No),
 ];
 
 /// Whether a `-`-separated part of a GGUF file name is its quantization (`Q8_0`, `IQ4_XS`,
@@ -828,11 +855,16 @@ pub(crate) fn model_names(model: &Path) -> Vec<String> {
     v
 }
 
-/// The [`KNOWN`] drafts of the model at `model` (repo id, used by default), the default ones
-/// first.
+/// The [`KNOWN`] drafts of the model at `model` (repo id, used by default with fast
+/// verification, the default), the default ones first.
 pub fn known_drafts(model: &Path) -> Vec<(&'static str, bool)> {
+    known_drafts_by(model).into_iter().map(|(d, b)| (d, b.applies(true))).collect()
+}
+
+/// [`known_drafts`] with when each is a default.
+fn known_drafts_by(model: &Path) -> Vec<(&'static str, ByDefault)> {
     let names = model_names(model);
-    let mut v: Vec<(&'static str, bool)> = KNOWN
+    let mut v: Vec<(&'static str, ByDefault)> = KNOWN
         .iter()
         .filter(|(t, _, _)| {
             t.rsplit('/')
@@ -841,7 +873,7 @@ pub fn known_drafts(model: &Path) -> Vec<(&'static str, bool)> {
         })
         .map(|&(_, d, def)| (d, def))
         .collect();
-    v.sort_by_key(|d| !d.1);
+    v.sort_by_key(|d| d.1 == ByDefault::No);
     v
 }
 
@@ -871,9 +903,9 @@ pub fn draft_in(path: &Path) -> Option<PathBuf> {
 ///   out), or a `dspark*` draft folder or GGUF inside a model folder: by default for the Mistral
 ///   Large 4 and DeepSeek V4 drafts, and for a model with a default [`KNOWN`] draft;
 /// - else a [`KNOWN`] draft of this model in the download cache (the folder holding the model's
-///   folder), default or not as the table says.
-fn find_draft(model: &Path) -> Option<(PathBuf, bool)> {
-    let known = known_drafts(model);
+///   folder), default or not as the table says (`fast`: with fast verification).
+fn find_draft(model: &Path, fast: bool) -> Option<(PathBuf, bool)> {
+    let known: Vec<(&str, bool)> = known_drafts_by(model).into_iter().map(|(d, b)| (d, b.applies(fast))).collect();
     let pick = |d: &Path| -> Option<PathBuf> {
         let mut v: Vec<PathBuf> = std::fs::read_dir(d)
             .ok()?
@@ -916,13 +948,18 @@ fn find_draft(model: &Path) -> Option<(PathBuf, bool)> {
 /// The DSpark draft beside `model` (see [`find_draft`]), if any: what `draft=auto` uses before
 /// fetching one ([`auto_repo`]).
 pub fn draft_for(model: &Path) -> Option<PathBuf> {
-    find_draft(model).map(|d| d.0)
+    find_draft(model, true).map(|d| d.0)
 }
 
-/// The draft used when none is asked for: one beside the model or in the download cache that
-/// measured faster ([`KNOWN`]; nothing is fetched).
+/// The draft used when none is asked for, with fast verification (the default): one beside the
+/// model or in the download cache that measured faster ([`KNOWN`]; nothing is fetched).
 pub fn default_draft(model: &Path) -> Option<PathBuf> {
-    find_draft(model).filter(|d| d.1).map(|d| d.0)
+    default_draft_for(model, true)
+}
+
+/// [`default_draft`] for fast (`fast`) or exact verification ([`DsparkOptions::fast_verify`]).
+pub fn default_draft_for(model: &Path, fast: bool) -> Option<PathBuf> {
+    find_draft(model, fast).filter(|d| d.1).map(|d| d.0)
 }
 
 /// The repository `draft=auto` fetches when no draft is beside `model`: its default [`KNOWN`]
@@ -2290,7 +2327,7 @@ pub struct DsparkOptions {
     /// the weights once for all the tokens but sum in another order than one-token decoding, so
     /// a token's logits differ from plain decoding's in rounding (greedy output can then drift
     /// from plain greedy output at near-ties; sampling stays a correct sample of the model up to
-    /// that rounding). Off by default: verification then reproduces one-token decoding bit for
+    /// that rounding). On by default; off, verification reproduces one-token decoding bit for
     /// bit. Only GPU decode plans have fast kernels (Metal); elsewhere this changes nothing.
     pub fast_verify: bool,
 }
@@ -2304,7 +2341,7 @@ impl Default for DsparkOptions {
             p_min: 0.0,
             device: None,
             conf_min: 0.0,
-            fast_verify: false,
+            fast_verify: true,
         }
     }
 }
@@ -3014,6 +3051,7 @@ mod tests {
                 DsparkOptions {
                     draft_tokens: k,
                     cost_aware: false,
+                    fast_verify: false,
                     ..Default::default()
                 },
             );
@@ -3246,6 +3284,7 @@ mod tests {
                         DsparkOptions {
                             draft_tokens: k,
                             cost_aware: false,
+                            fast_verify: false,
                             ..Default::default()
                         },
                     );
@@ -3271,6 +3310,7 @@ mod tests {
                 &d,
                 DsparkOptions {
                     conf_min: 0.9,
+                    fast_verify: false,
                     ..Default::default()
                 },
             );
@@ -3415,7 +3455,9 @@ mod tests {
         let draft = root.join("deepseek-ai--dspark_qwen3_4b_block7");
         toy_hf_draft(&draft, serde_json::json!({}), None);
         assert_eq!(draft_for(&model).as_deref(), Some(draft.as_path()));
-        let def = KNOWN.iter().any(|k| k.1 == "deepseek-ai/dspark_qwen3_4b_block7" && k.2);
+        let def = KNOWN
+            .iter()
+            .any(|k| k.1 == "deepseek-ai/dspark_qwen3_4b_block7" && k.2 == ByDefault::Yes);
         assert_eq!(default_draft(&model).is_some(), def);
         assert_eq!(draft_in(&draft).as_deref(), Some(draft.as_path()));
         std::fs::remove_dir_all(&root).ok();

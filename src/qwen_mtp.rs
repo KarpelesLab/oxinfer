@@ -374,7 +374,7 @@ pub struct MtpOptions {
     pub exact: bool,
     /// Verify on the GPU with the fast batched kernels (see
     /// [`crate::dspark::DsparkOptions::fast_verify`]): faster, but the logits differ from plain
-    /// decoding's in rounding. Default false.
+    /// decoding's in rounding. Default true.
     pub fast_verify: bool,
 }
 
@@ -386,7 +386,7 @@ impl Default for MtpOptions {
             stop: Vec::new(),
             cost_aware: false,
             exact: false,
-            fast_verify: false,
+            fast_verify: true,
         }
     }
 }
