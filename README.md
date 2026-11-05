@@ -856,6 +856,105 @@ family; prefill only), the vision variant (`DeepSeek-V4-Flash-Vision-Exp`) and D
 architecture and config keys and should load as GGUF, but was not tried (its smallest GGUFs are
 far beyond this machine's free disk).
 
+### Qwen3.8-Flash-Next
+
+`Qwen/Qwen3.8-Flash-Next` (transformers `qwen4_exp`, "a preview of the Qwen4 architecture";
+`qwen4exp.rs` on top of the Qwen3.5 code) is 125B parameters with 6B active, plus a 51B n-gram
+embedding table and a 4B MTP layer: 48 layers of 2560, 3 Gated DeltaNet layers (sigmoid output
+gate instead of SiLU) then one gated attention layer, MoE with 512 experts (10 routed + 1 shared,
+640 wide) everywhere. What is new, following transformers' `modeling_qwen4_exp.py` (and
+llama.cpp's `qwen4exp`):
+
+- Hyper-connections ("gated residual") replace every norm: the residual stream is 4 streams.
+  Before each block they are RMS-normed per stream, a low-rank bottleneck (10240 -> 320, SiLU of
+  a quarter, -> 10240, sigmoid) gives an element-wise read gate and the block input is the mean
+  of the gated streams; the output is added to every stream with its own weight
+  `2 sigmoid(w_s . normed / 4)`. The embedding starts as 4 copies; a final mixer (no write
+  weights) feeds the LM head (there is no output norm).
+- An n-gram hash embedding before layer 1: each token hashes its bigram and trigram (the previous
+  tokens up to an EOS) into 8 heads each, `(t0 m0 ^ t1 m1 [^ t2 m2]) mod p_h + offset_h` with
+  primes around 20 million, gathers 16 rows of 160 from a 320M-row table and concatenates them; a
+  value projection gated per stream by `sigmoid(signed_sqrt(norm(key_s) . norm(stream_s) /
+  sqrt(2560)))`, plus a causal depthwise conv (kernel 4, dilation 3) of its normed copy, is added
+  to the streams. The table (29 GB at IQ4_NL in unsloth's quants, 102 GB in bf16) is never loaded:
+  each token reads its 16 rows (1.4 KB) from the mapped file.
+- QSA sparse attention: each attention layer's indexer (4 query heads of 128 and one key head,
+  partial RoPE) scores blocks of 4 cached tokens by their mean raw key (normed, rotated to the
+  block's first position): `sum_h relu(q_h . k) / sqrt(128)`; a token attends to the best 512
+  blocks plus the incomplete tail. Up to 2051 visible tokens that is every token.
+
+Checkpoints: llama.cpp GGUF (unsloth's quants, split; the n-gram table is the last part) and the
+safetensors layout (tested on tiny random checkpoints: the real bf16 release is 360 GB). The
+merged weights llama.cpp's converter can write (`attn_qkv_gate`, `hc_*_down_inject`) are refused
+with a clear error; unsloth's files have none. The chat format is Qwen3.8's (`--think` or the server's `enable_thinking` /
+`reasoning_effort` turn thinking on, with the template's reasoning-effort system line), tools as
+for Qwen3.5.
+
+```sh
+# 111 GB: 82 GB of weights read through the page cache, the 29 GB n-gram table a few rows a token
+./target/release/oxinfer --model unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL -p "Why is the sky blue?"
+# MTP speculative decoding with unsloth's draft head (1.3x on code, slower on prose: opt-in)
+./target/release/oxinfer --model unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL \
+    --mtp-from ~/.cache/oxinfer/hub/unsloth--Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
+    -p "Write a Python function that checks whether a number is prime."
+# little memory: stream with a page-cache budget (CPU decoding)
+./target/release/oxinfer --model unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL --stream --cache-budget-gb 40 -p "Hi"
+```
+
+A checkpoint whose weights other than the n-gram table exceed 75% of RAM streams by default (as
+Mistral Large 4); on a 128 GB Mac UD-Q4_K_XL does not, and is read in place through the page cache
+with whole-token GPU decoding. The GPU decode plan wraps the 78 GB of routed experts once and its
+single- and multi-token plans share them; prefill then wraps only the experts each pass routes
+to (`Experts::wrap_per_pass`), since wiring them twice exhausts the GPU's memory. Past 2051 tokens
+of context (where QSA starts dropping blocks) decoding runs on the CPU, which has the selection.
+The MTP layer (`mtp_from` in the engine, C API and server options) is the trunk's 4 residual
+streams plus the next token's embedding, per stream `fc([enorm(e) ; hnorm_s(h_s)])`, through one
+QSA + MoE layer with hyper-connections and its own final mixer, the LM head shared.
+
+Agreement. transformers' `Qwen4ExpForCausalLM` (main branch) in float32 on tiny random checkpoints
+with every feature (`tools/qwen4exp_tiny.py`: QSA with a budget of 16 tokens so most queries are
+sparse, EOS resets in the n-gram contexts, MoE top-3 of 8, bf16-representable weights; compared by
+`examples/qwen4exp_check.rs`): max logit diff 6.6e-7, KL 1e-14, over 40-token prompts and 12 to
+30 cached decode steps, on the CPU and with GPU decoding (GPU against CPU: KL 1e-15), including a
+switch from GPU decoding to the CPU's sparse attention mid-generation. One seed differed (3e-3):
+an indexer score tie at exactly 0 (every head's dot product negative), which `torch.topk` breaks
+in no fixed order.
+
+On the real UD-Q4_K_XL against llama.cpp master on the same files (`tools/llama_logits_dump.cpp`,
+greedy, every decode step compared):
+
+| prompt | oxinfer CPU vs llama.cpp CPU | oxinfer Metal vs llama.cpp CPU |
+|---|---|---|
+| chat, 23 tokens + 33 steps | same greedy 32/33, mean KL 1.4e-3 | 32/33, KL 1.3e-3 |
+| code, 24 + 49 | 49/49, KL 3.3e-4 | 49/49, KL 1.9e-4 |
+| math (thinking), 65 + 49 | 49/49, KL 1.4e-3 | 49/49, KL 2.5e-3 |
+| 3189-token prompt (QSA sparse) + 25 | 25/25, KL 3.3e-3 | 25/25, KL 3.0e-3 |
+
+The one disagreement is a near-tie where llama.cpp's own Metal build picks oxinfer's token too
+(llama.cpp CPU against llama.cpp Metal: KL 1.5e-3 at the first step, the same flip). MTP drafts
+from unsloth's `mtp-...-shared-Q8_0.gguf` are accepted at 92-97% on code and math, and the output
+is the plain greedy output.
+
+Speed on the M5 Max (128 GB; load average 3-9 from other jobs), UD-Q4_K_XL, greedy:
+
+| | prefill | decode |
+|---|---|---|
+| oxinfer, Metal (default) | 165 tok/s (3189 tokens), 85 (757) | 54-59 tok/s (45-49 under load) |
+| oxinfer, Metal + MTP (3 drafts) | | 72 tok/s on code (3.9 tokens per pass), 46 on prose |
+| oxinfer, CPU (`--device cpu`) | | 21.5 tok/s |
+| oxinfer, streamed (`--stream --cache-budget-gb 40`) | | 12 tok/s (47% of the time waiting on storage) |
+| llama.cpp master, Metal (`llama-bench`) | 1030 tok/s (pp512) | 50 tok/s (tg128) |
+| llama.cpp master, CPU (12 threads) | 61 tok/s (pp512) | 21.4 tok/s |
+
+Memory: the GPU run's footprint is 1.5 GB besides the page cache (the weights are file pages,
+82 GB of them in use); streamed with a 40 GB budget, 0.7 GB plus 22 GB of page cache.
+
+Not done: the vision tower (an unmodified Qwen3-VL ViT; from safetensors it would load as
+Qwen3.5's, but a GGUF model would need Qwen3-VL `mmproj` loading, which oxinfer does not have
+yet), GPU decoding past 2051 tokens (no GPU block selection), the merged-weight GGUF layout, and
+fast prefill (the MoE router, the Gated DeltaNet recurrence and attention run on the CPU in
+prefill: 6x slower than llama.cpp's).
+
 ## Embeddings
 
 sentence-transformers models are recognised by their `modules.json` and run in embedding mode:
