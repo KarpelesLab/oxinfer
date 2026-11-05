@@ -893,6 +893,16 @@ enum MOp {
         /// Multi-token plans: the pipeline and the g, u, out strides.
         t: Option<(Id, [u32; 4])>,
     },
+    /// See `Op::PleGate` (single-token plans only).
+    PleGate {
+        pipe: Id,
+        k: usize,
+        q: usize,
+        v: usize,
+        out: usize,
+        n: u32,
+        hc: u32,
+    },
     Steer {
         pipe: Id,
         x: usize,
@@ -1471,6 +1481,7 @@ impl MetalBackend {
                         Ew::Scale(s) => [0.0, s, 0.0, 0.0],
                         Ew::Softcap(c) => [1.0, c, 0.0, 0.0],
                         Ew::Combine { sa, sb, s } => [2.0, sa, sb, s],
+                        Ew::SiluScale(s) => [3.0, s, 0.0, 0.0],
                     };
                     if matches!(kind, Ew::Combine { .. }) && b.is_none() {
                         return None;
@@ -1494,6 +1505,51 @@ impl MetalBackend {
                     let mut r = vec![rng(a, n)];
                     r.extend(b.map(|b| rng(b, n)));
                     (r, vec![rng(out, n)])
+                }
+                Op::HcPre { gate, xn, out, n, hc } => {
+                    if mt {
+                        return None;
+                    }
+                    emit.push(MOp::Ew {
+                        pipe: self.named_pipeline("dec_ew")?,
+                        a: byte(gate),
+                        b: byte(xn),
+                        out: byte(out),
+                        n: n as u32,
+                        p: [4.0, hc as f32, 0.0, 1.0 / hc as f32],
+                        t: None,
+                    });
+                    (vec![rng(gate, hc * n), rng(xn, hc * n)], vec![rng(out, n)])
+                }
+                Op::HcPost { x, y, inj, n, hc } => {
+                    if mt {
+                        return None;
+                    }
+                    emit.push(MOp::Ew {
+                        pipe: self.named_pipeline("dec_ew")?,
+                        a: byte(y),
+                        b: byte(inj),
+                        out: byte(x),
+                        n: (hc * n) as u32,
+                        p: [5.0, n as f32, 1.0 / hc as f32, 0.0],
+                        t: None,
+                    });
+                    (vec![rng(y, n), rng(inj, hc), rng(x, hc * n)], vec![rng(x, hc * n)])
+                }
+                Op::PleGate { k, q, v, out, n, hc } => {
+                    if mt {
+                        return None;
+                    }
+                    emit.push(MOp::PleGate {
+                        pipe: self.named_pipeline("dec_ple_gate")?,
+                        k: byte(k),
+                        q: byte(q),
+                        v: byte(v),
+                        out: byte(out),
+                        n: n as u32,
+                        hc: hc as u32,
+                    });
+                    (vec![rng(k, hc * n), rng(q, hc * n), rng(v, n)], vec![rng(out, hc * n)])
                 }
                 Op::Glu { g: gv, u, out, n, gelu } => {
                     emit.push(MOp::Glu {
@@ -1609,7 +1665,7 @@ impl MetalBackend {
                             nk: r.nk as u32,
                             nv: r.nv as u32,
                             key_dim: key_dim as u32,
-                            tiled: r.tiled as u32,
+                            tiled: r.tiled as u32 | (r.sigmoid_gate as u32) << 1,
                             eps: r.eps,
                             qscale: (r.hdk as f32).powf(-0.5),
                             hdk: r.hdk as u32,
@@ -2345,7 +2401,7 @@ impl MetalPlan<'_> {
                     }
                 }
             }
-            MOp::Experts { .. } | MOp::Steer { .. } | MOp::NeuronEdit { .. } => {
+            MOp::Experts { .. } | MOp::Steer { .. } | MOp::NeuronEdit { .. } | MOp::PleGate { .. } => {
                 unreachable!("single-token op in a multi-token plan")
             }
         }
@@ -2509,7 +2565,7 @@ impl DecodePlan for MetalPlan<'_> {
                         MOp::Topk { .. } | MOp::Experts { .. } => "moe",
                         MOp::QkRope { .. } => "qk",
                         MOp::GdnConv { .. } | MOp::GdnRule { .. } => "gdn",
-                        MOp::Glu { .. } | MOp::Ew { .. } => "glu",
+                        MOp::Glu { .. } | MOp::Ew { .. } | MOp::PleGate { .. } => "glu",
                         MOp::Steer { .. } | MOp::NeuronEdit { .. } => "iv",
                         MOp::AddNorm { .. } => "norm",
                         MOp::Attn { .. } => "attn",
@@ -2679,6 +2735,15 @@ impl DecodePlan for MetalPlan<'_> {
                         e.bytes(p, 3);
                         e.bytes(n, 4);
                         e.dispatch(((*n as usize).div_ceil(256), 1), 256);
+                    }
+                    MOp::PleGate { pipe, k, q, v, out, n, hc } => {
+                        e.pipe(*pipe);
+                        e.buf(arena, *k, 0);
+                        e.buf(arena, *q, 1);
+                        e.buf(arena, *v, 2);
+                        e.buf(arena, *out, 3);
+                        e.bytes(&[*n, *hc], 4);
+                        e.dispatch((*hc as usize, 1), 1024);
                     }
                     MOp::Steer { pipe, x, hot, cold, p } => {
                         e.pipe(*pipe);

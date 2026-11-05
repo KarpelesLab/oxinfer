@@ -66,6 +66,7 @@ pub mod prof;
 pub mod quant;
 pub mod qwen;
 pub mod qwen25_vision;
+pub mod qwen4exp;
 pub mod qwen_image;
 pub mod qwen_mtp;
 pub mod qwen_vision;

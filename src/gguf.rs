@@ -290,13 +290,14 @@ impl Header {
         Ok(match self.arch() {
             "qwen35" => "qwen3_5_text",
             "qwen35moe" => "qwen3_5_moe_text",
+            "qwen4exp" => "qwen4_exp_text",
             "qwen3" => "qwen3",
             "llama" => "llama",
             "gemma4" => "gemma4_text",
             "mistral-large4" => "mistral_large4_text",
             "deepseek4" => "deepseek_v4",
             a => bail!(
-                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen3, llama, gemma4, mistral-large4 and deepseek4 are)"
+                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, llama, gemma4, mistral-large4 and deepseek4 are)"
             ),
         })
     }
@@ -371,7 +372,7 @@ impl Header {
             let rot = self.arch_u64("rope.dimension_count").unwrap_or(head_dim / 4);
             o.insert("partial_rotary_factor".into(), json!(rot as f64 / head_dim as f64));
         }
-        if mt == "qwen3_5_moe_text" {
+        if mt == "qwen3_5_moe_text" || mt == "qwen4_exp_text" {
             let o = c.as_object_mut().unwrap();
             o.insert("num_experts".into(), json!(need("expert_count")?));
             o.insert("num_experts_per_tok".into(), json!(need("expert_used_count")?));
@@ -381,7 +382,66 @@ impl Header {
                 json!(self.arch_u64("expert_shared_feed_forward_length").unwrap_or(0)),
             );
         }
+        if mt == "qwen4_exp_text" {
+            self.qwen4exp_config(c.as_object_mut().unwrap())?;
+        }
         Ok(c)
+    }
+
+    /// The Qwen4-Exp keys (hyper-connections, QSA indexer, n-gram embedding; see
+    /// `crate::qwen4exp`) of the `config.json` a qwen4exp file was converted from. The n-gram hash
+    /// constants, buffers of the safetensors checkpoint, come along as config keys.
+    fn qwen4exp_config(&self, o: &mut serde_json::Map<String, Json>) -> Result<()> {
+        let need = |k: &str| {
+            self.arch_u64(k)
+                .with_context(|| format!("GGUF metadata has no {}.{k}", self.arch()))
+        };
+        let arr = |k: &str| -> Option<Vec<u64>> {
+            self.get(&format!("{}.{k}", self.arch()))
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_u64).collect())
+        };
+        o.insert("hc_count".into(), json!(need("hyper_connection.count")?));
+        o.insert("hc_lowrank".into(), json!(need("hyper_connection.low_rank")?));
+        o.insert("output_gate_type".into(), json!("sigmoid"));
+        o.insert("indexer_n_heads".into(), json!(need("attention.indexer.head_count")?));
+        o.insert("indexer_head_dim".into(), json!(need("attention.indexer.key_length")?));
+        o.insert("indexer_budget".into(), json!(need("attention.indexer.top_k")?));
+        let ratio = arr("attention.compress_ratios")
+            .and_then(|r| r.into_iter().find(|&v| v > 0))
+            .unwrap_or(4);
+        o.insert("indexer_compress_ratio".into(), json!(ratio));
+        if let Some(ple) = arr("ple.layers") {
+            o.insert("ple_layer_ids".into(), json!(ple.iter().map(|l| l + 1).collect::<Vec<_>>()));
+            o.insert("ngram_size".into(), json!(need("ple.ngram_size")?));
+            o.insert("heads_per_ngram".into(), json!(need("ple.heads_per_ngram")?));
+            o.insert("ple_conv_kernel_size".into(), json!(need("ple.conv_kernel")?));
+            o.insert("eos_token_id".into(), json!(need("ple.eos_token_id")?));
+            if let Some(img) = self.arch_u64("ple.image_token_id") {
+                o.insert("image_token_id".into(), json!(img));
+            }
+            let h = need("embedding_length")?;
+            o.insert("ple_embed_dim".into(), json!(h));
+            for (k, key) in [
+                ("ple_layer_multipliers", "ple.layer_multipliers"),
+                ("ple_head_offsets", "ple.head_offsets"),
+                ("ple_head_vocab_sizes", "ple.head_vocab_sizes"),
+            ] {
+                o.insert(k.into(), json!(arr(key).with_context(|| format!("GGUF metadata has no {key}"))?));
+            }
+        }
+        if let Some(sec) = arr("rope.dimension_sections") {
+            o.insert(
+                "rope_parameters".into(),
+                json!({
+                    "rope_theta": self.arch_f64("rope.freq_base").unwrap_or(10_000_000.0),
+                    "mrope_section": sec.iter().take(3).collect::<Vec<_>>(),
+                    "mrope_interleaved": true,
+                    "partial_rotary_factor": o.get("partial_rotary_factor").cloned().unwrap_or(json!(0.25)),
+                }),
+            );
+        }
+        Ok(())
     }
 
     /// The Gemma 4 text config (`Gemma4TextConfig` fields; the attention shape of the global
@@ -827,12 +887,18 @@ pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec
         "output.weight" => "lm_head.weight".to_string(),
         // Llama 3: the divisor of each RoPE frequency (the llama3 scaling, see the module docs).
         "rope_freqs.weight" => "rope_freqs".to_string(),
+        "per_layer_token_embd.weight" if arch == "qwen4exp" => "model.ngram_embedding.weight".to_string(),
         // Gemma 4 E2B / E4B per-layer embeddings.
         "per_layer_token_embd.weight" => "model.embed_tokens_per_layer.weight".to_string(),
         "per_layer_model_proj.weight" => "model.per_layer_model_projection.weight".to_string(),
         "per_layer_proj_norm.weight" => "model.per_layer_projection_norm.weight".to_string(),
         // FastMTP sidecars: draft-vocabulary index -> target token id (for a trimmed output head).
         "d2t" => "mtp.d2t".to_string(),
+        // Qwen4-Exp: the final hyper-connection mixer (in place of the output norm) and the
+        // n-gram hash embedding table.
+        "output_hc_norm.weight" if arch == "qwen4exp" => "model.hyper_connection_mixer.hc_norm.weight".to_string(),
+        "output_hc_down.weight" if arch == "qwen4exp" => "model.hyper_connection_mixer.input_mix_weight_down.weight".to_string(),
+        "output_hc_up.weight" if arch == "qwen4exp" => "model.hyper_connection_mixer.input_mix_weight_up.weight".to_string(),
         n => {
             let rest = n.strip_prefix("blk.")?;
             let (l, rest) = rest.split_once('.')?;
@@ -852,6 +918,18 @@ pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec
                 if let Some(top) = top {
                     return Some((top.to_string(), shape));
                 }
+            }
+            if arch == "qwen4exp"
+                && let Some(n) = qwen4exp_name(base, suffix, &mut shape, &t.ne)
+            {
+                return Some((
+                    match n.strip_prefix('/') {
+                        Some(top) => top.to_string(),
+                        None if mtp => format!("mtp.layers.{}.{n}", l - n_layers),
+                        None => format!("model.layers.{l}.{n}"),
+                    },
+                    shape,
+                ));
             }
             let hf = match (arch, base) {
                 ("gemma4", _) => {
@@ -1054,6 +1132,47 @@ pub fn hf_tensors(h: &Header) -> Result<Vec<HfTensor>> {
 
 /// [`hf_tensors`] for one file of a split model, named with the first file's architecture and
 /// layer count (the other files carry only the `split.*` metadata).
+/// The Qwen4-Exp name (relative to the layer, or absolute after a `/`) of a block tensor that is
+/// not in the generic Qwen mapping; adjusts `shape` where the layouts differ.
+fn qwen4exp_name(base: &str, suffix: &str, shape: &mut Vec<usize>, ne: &[usize]) -> Option<&'static str> {
+    if suffix == "bias" {
+        return None;
+    }
+    Some(match base {
+        "hc_attn_norm" => "attn_hyper_connection.hc_norm.weight",
+        "hc_attn_down" => "attn_hyper_connection.input_mix_weight_down.weight",
+        "hc_attn_up" => "attn_hyper_connection.input_mix_weight_up.weight",
+        "hc_attn_inject" => "attn_hyper_connection.block_inject_weight.weight",
+        "hc_ffn_norm" => "mlp_hyper_connection.hc_norm.weight",
+        "hc_ffn_down" => "mlp_hyper_connection.input_mix_weight_down.weight",
+        "hc_ffn_up" => "mlp_hyper_connection.input_mix_weight_up.weight",
+        "hc_ffn_inject" => "mlp_hyper_connection.block_inject_weight.weight",
+        // Merged weights of llama.cpp's converter: `[a | b]` rows (not supported by the loader).
+        "hc_attn_down_inject" => "attn_hyper_connection.down_inject.weight",
+        "hc_ffn_down_inject" => "mlp_hyper_connection.down_inject.weight",
+        "attn_qkv_gate" => "linear_attn.in_proj_qkvz.weight",
+        "ssm_beta_alpha" => "linear_attn.in_proj_ba.weight",
+        "indexer.q_proj" => "self_attn.indexer.q_proj.weight",
+        "indexer.k_proj" => "self_attn.indexer.k_proj.weight",
+        "indexer.q_norm" => "self_attn.indexer.q_layernorm.weight",
+        "indexer.k_norm" => "self_attn.indexer.k_layernorm.weight",
+        "ple_key" => "ple.key_proj.weight",
+        "ple_value" => "ple.value_proj.weight",
+        "ple_norm_key" => "ple.norm_key.weight",
+        "ple_norm_query" => "ple.norm_query.weight",
+        "ple_norm_conv" => "ple.norm_conv.weight",
+        "ple_conv1d" => {
+            // ggml {K, C} -> HF Conv1d [C, 1, K].
+            *shape = vec![ne[1], 1, ne[0]];
+            "ple.conv1d.weight"
+        }
+        "nextn.hc_head_norm" => "/mtp.hyper_connection_mixer.hc_norm.weight",
+        "nextn.hc_head_down" => "/mtp.hyper_connection_mixer.input_mix_weight_down.weight",
+        "nextn.hc_head_up" => "/mtp.hyper_connection_mixer.input_mix_weight_up.weight",
+        _ => return None,
+    })
+}
+
 pub fn hf_tensors_as(h: &Header, arch: &str, n_layers: usize) -> Vec<HfTensor> {
     h.tensors
         .iter()

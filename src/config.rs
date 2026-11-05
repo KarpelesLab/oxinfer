@@ -589,6 +589,49 @@ pub struct QwenConfig {
     /// the time, the next `sections[1]` with the height, the rest with the width).
     #[serde(skip, default = "d_true")]
     pub mrope_interleaved: bool,
+    /// Qwen4-Exp (Qwen3.8-Flash-Next, see `crate::qwen4exp`): residual streams (hyper-connections)
+    /// in place of the layer norms; 0 for the other models.
+    #[serde(default)]
+    pub hc_count: usize,
+    #[serde(default)]
+    pub hc_lowrank: usize,
+    /// The activation of the Gated DeltaNet output gate (`sigmoid` for Qwen4-Exp; default SiLU).
+    #[serde(default)]
+    pub output_gate_type: Option<String>,
+    /// QSA indexer of the full-attention layers (Qwen4-Exp): `indexer_budget` tokens in blocks of
+    /// `indexer_compress_ratio`.
+    #[serde(default)]
+    pub indexer_budget: usize,
+    #[serde(default)]
+    pub indexer_compress_ratio: usize,
+    #[serde(default)]
+    pub indexer_head_dim: usize,
+    #[serde(default)]
+    pub indexer_n_heads: usize,
+    /// N-gram hash embedding layers (one-based, Qwen4-Exp), injected before those layers.
+    #[serde(default)]
+    pub ple_layer_ids: Vec<usize>,
+    #[serde(default)]
+    pub ple_embed_dim: usize,
+    #[serde(default)]
+    pub ple_conv_kernel_size: usize,
+    #[serde(default)]
+    pub ngram_size: usize,
+    #[serde(default)]
+    pub heads_per_ngram: usize,
+    #[serde(default)]
+    pub eos_token_id: Option<serde_json::Value>,
+    /// The n-gram hash constants when the configuration carries them (GGUF metadata; a
+    /// safetensors checkpoint stores them as buffers instead).
+    #[serde(default)]
+    pub ple_layer_multipliers: Option<Vec<u64>>,
+    #[serde(default)]
+    pub ple_head_offsets: Option<Vec<u64>>,
+    #[serde(default)]
+    pub ple_head_vocab_sizes: Option<Vec<u64>>,
+    /// The image placeholder token (hashed for image positions by the n-gram embedding).
+    #[serde(default)]
+    pub image_token_id: Option<u32>,
 }
 
 impl QwenConfig {
@@ -605,9 +648,13 @@ impl QwenConfig {
         // projections, contiguous M-RoPE sections.
         let qwen2 = matches!(mt, Some("qwen2" | "qwen2_vl" | "qwen2_5_vl"));
         let dense = mt == Some("qwen3") || llama || qwen2;
+        let image_token = raw.get("image_token_id").and_then(|v| v.as_u64());
         let text = raw.get("text_config").cloned().unwrap_or(raw);
         let has_head_dim = text.get("head_dim").is_some_and(|v| v.is_u64());
         let mut cfg: QwenConfig = serde_json::from_value(text).context("parse qwen text config")?;
+        if cfg.image_token_id.is_none() {
+            cfg.image_token_id = image_token.map(|v| v as u32);
+        }
         if qwen2 {
             cfg.qk_norm = false;
             cfg.attention_bias = true;
@@ -652,7 +699,26 @@ impl QwenConfig {
         Ok(cfg)
     }
     pub fn is_full(&self, l: usize) -> bool {
-        self.layer_types.as_ref().unwrap()[l] == "full_attention"
+        matches!(
+            self.layer_types.as_ref().unwrap()[l].as_str(),
+            "full_attention" | "indexed_attention"
+        )
+    }
+    /// Qwen4-Exp (hyper-connections, n-gram embedding, QSA; see `crate::qwen4exp`).
+    pub fn is_exp(&self) -> bool {
+        self.hc_count > 0
+    }
+    /// The Gated DeltaNet output gate is a sigmoid (Qwen4-Exp) rather than SiLU.
+    pub fn gdn_sigmoid_gate(&self) -> bool {
+        self.output_gate_type.as_deref() == Some("sigmoid")
+    }
+    /// The primary end-of-sequence id of the text config (the last of a list).
+    pub fn eos_id(&self) -> Option<u32> {
+        match self.eos_token_id.as_ref()? {
+            serde_json::Value::Number(n) => n.as_u64().map(|v| v as u32),
+            serde_json::Value::Array(a) => a.last().and_then(|v| v.as_u64()).map(|v| v as u32),
+            _ => None,
+        }
     }
     pub fn rope_theta(&self) -> f64 {
         self.rope_parameters

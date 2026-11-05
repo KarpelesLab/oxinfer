@@ -1111,7 +1111,8 @@ fn run(mut args: Args) -> Result<()> {
     }
     match model_type.as_str() {
         "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" | "gemma3" | "gemma3_text" => run_gemma(args),
-        "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" | "qwen2_5_vl" => run_qwen(args),
+        "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" | "qwen2_5_vl" | "qwen4_exp"
+        | "qwen4_exp_text" => run_qwen(args),
         // Llama 3 runs on the Qwen3 code path.
         "llama" => run_qwen(args),
         "mistral_large4" | "mistral_large4_text" => run_mistral4(args),
@@ -1555,6 +1556,23 @@ fn run_qwen(mut args: Args) -> Result<()> {
     }
     let draft = if args.mtp { None } else { pick_dspark(&args)? };
     let cfg = config::QwenConfig::load(&args.model)?;
+    if cfg.is_exp() {
+        // Qwen4-Exp: the n-gram table (tens of GB) is read a few rows per token, so the files are
+        // always mapped; a checkpoint larger than most of RAM streams as Mistral Large 4's does.
+        let size: u64 = oxinfer::safetensors::checkpoint_bytes(&args.model);
+        let too_big = oxinfer::mistral4::too_big(size);
+        if too_big && !args.stream && !args.mmap && !args.no_stream {
+            let budget = oxinfer::mistral4::default_stream().cache_budget.unwrap_or(0) as f64 / 1e9;
+            args.cache_budget_gb = Some(args.cache_budget_gb.unwrap_or(budget));
+            eprintln!(
+                "[the {:.0} GB checkpoint does not fit in memory: streaming it (--stream --cache-budget-gb {:.0})]",
+                size as f64 / 1e9,
+                args.cache_budget_gb.unwrap()
+            );
+            args.stream = true;
+        }
+        args.mmap = true;
+    }
     let eos = config::load_eos_ids(&args.model);
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
     let mut model = qwen::QwenModel::load(cfg, &files, args.quant)?;

@@ -197,6 +197,33 @@ pub enum Op<'a> {
         n: usize,
         gelu: bool,
     },
+    /// Hyper-connection read (Qwen4-Exp, see `crate::qwen4exp`): `out[i] = (1 / hc) sum_s
+    /// sigmoid(gate[s n + i]) xn[s n + i]` over the `hc` streams of `n`.
+    HcPre {
+        gate: View,
+        xn: View,
+        out: View,
+        n: usize,
+        hc: usize,
+    },
+    /// Hyper-connection write: `x[s n + i] += y[i] * 2 sigmoid(inj[s] / hc)`.
+    HcPost {
+        x: View,
+        y: View,
+        inj: View,
+        n: usize,
+        hc: usize,
+    },
+    /// The n-gram embedding gate of Qwen4-Exp: per stream `s`, `a = k_s . q_s / sqrt(n)`, then
+    /// `out[s n + i] = sigmoid(sign(a) sqrt(max(|a|, 1e-6))) * v[i]`.
+    PleGate {
+        k: View,
+        q: View,
+        v: View,
+        out: View,
+        n: usize,
+        hc: usize,
+    },
 }
 
 /// Elementwise ops ([`Op::Ew`]).
@@ -208,6 +235,8 @@ pub enum Ew {
     Softcap(f32),
     /// `out = (a * sa + b * sb) * s`
     Combine { sa: f32, sb: f32, s: f32 },
+    /// `out = silu(a * s)`
+    SiluScale(f32),
 }
 
 impl<'a> Op<'a> {
@@ -282,6 +311,8 @@ pub struct GdnRule<'a> {
     pub hdv: usize,
     /// Value head `h` reads key head `h % nk` (GGUF) rather than `h / (nv / nk)`.
     pub tiled: bool,
+    /// The output gate is `sigmoid(z)` (Qwen4-Exp) rather than `silu(z)`.
+    pub sigmoid_gate: bool,
     pub decay_coef: &'a [f32],
     pub dt_bias: &'a [f32],
     pub norm_w: &'a [f32],

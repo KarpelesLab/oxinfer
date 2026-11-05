@@ -17,42 +17,42 @@ use crate::prof::{self, Cat};
 use crate::safetensors::ModelFiles;
 use anyhow::{Context, Result, bail};
 
-struct Gdn<'a> {
-    qkv: Lin<'a>,         // [2*key_dim + value_dim, H]
-    z: Lin<'a>,           // [value_dim, H]
-    b: Lin<'a>,           // [n_v, H]
-    a: Lin<'a>,           // [n_v, H]
-    conv_w: Vec<f32>,     // [conv_dim, K]
-    decay_coef: Vec<f32>, // -exp(A_log) per v head
-    dt_bias: Vec<f32>,
-    norm_w: Vec<f32>, // [hd_v], plain weight (gated norm)
-    out: Lin<'a>,     // [H, value_dim]
+pub(crate) struct Gdn<'a> {
+    pub(crate) qkv: Lin<'a>,         // [2*key_dim + value_dim, H]
+    pub(crate) z: Lin<'a>,           // [value_dim, H]
+    pub(crate) b: Lin<'a>,           // [n_v, H]
+    pub(crate) a: Lin<'a>,           // [n_v, H]
+    pub(crate) conv_w: Vec<f32>,     // [conv_dim, K]
+    pub(crate) decay_coef: Vec<f32>, // -exp(A_log) per v head
+    pub(crate) dt_bias: Vec<f32>,
+    pub(crate) norm_w: Vec<f32>, // [hd_v], plain weight (gated norm)
+    pub(crate) out: Lin<'a>,     // [H, value_dim]
 }
 
 pub(crate) struct Attn<'a> {
-    q: Lin<'a>, // [nh*hd*2, H] (query and gate interleaved per head)
-    k: Lin<'a>,
-    v: Lin<'a>,
-    o: Lin<'a>,
+    pub(crate) q: Lin<'a>, // [nh*hd*2, H] (query and gate interleaved per head)
+    pub(crate) k: Lin<'a>,
+    pub(crate) v: Lin<'a>,
+    pub(crate) o: Lin<'a>,
     /// 1 + w (or w, see `zero_centered_norm`); None without query / key norms (Llama).
-    q_norm: Option<Vec<f32>>,
-    k_norm: Option<Vec<f32>>,
+    pub(crate) q_norm: Option<Vec<f32>>,
+    pub(crate) k_norm: Option<Vec<f32>>,
     /// Query, key and value biases (Qwen2 / Qwen2.5-VL), added after the projections.
-    bias: Option<[Vec<f32>; 3]>,
+    pub(crate) bias: Option<[Vec<f32>; 3]>,
 }
 
 // One per layer, built once: the size difference is irrelevant.
 #[allow(clippy::large_enum_variant)]
-enum Mixer<'a> {
+pub(crate) enum Mixer<'a> {
     Gdn(Gdn<'a>),
     Attn(Attn<'a>),
 }
 
 pub(crate) struct Mlp<'a> {
-    gate: Lin<'a>,
-    up: Lin<'a>,
-    down: Lin<'a>,
-    inter: usize,
+    pub(crate) gate: Lin<'a>,
+    pub(crate) up: Lin<'a>,
+    pub(crate) down: Lin<'a>,
+    pub(crate) inter: usize,
 }
 
 impl Mlp<'_> {
@@ -80,10 +80,10 @@ impl Mlp<'_> {
 /// Sparse MoE block: softmax router, top-k experts with renormalized weights, plus a shared
 /// expert scaled by `sigmoid(shared_gate . x)`.
 pub(crate) struct Moe<'a> {
-    router: Vec<f32>, // [n_exp, H]
-    experts: Experts<'a>,
-    shared: Mlp<'a>,
-    shared_gate: Vec<f32>, // [H]
+    pub(crate) router: Vec<f32>, // [n_exp, H]
+    pub(crate) experts: Experts<'a>,
+    pub(crate) shared: Mlp<'a>,
+    pub(crate) shared_gate: Vec<f32>, // [H]
 }
 
 // One per layer, built once.
@@ -177,18 +177,18 @@ impl<'a> Attn<'a> {
     }
 }
 
-struct QLayer<'a> {
-    mixer: Mixer<'a>,
+pub(crate) struct QLayer<'a> {
+    pub(crate) mixer: Mixer<'a>,
     ln_in: Vec<f32>,   // 1 + w
     ln_post: Vec<f32>, // 1 + w
-    ffn: Ffn<'a>,
+    pub(crate) ffn: Ffn<'a>,
 }
 
 pub struct QwenModel<'a> {
     pub cfg: QwenConfig,
     pub quant: Quant,
     pub(crate) embed: Table<'a>,
-    layers: Vec<QLayer<'a>>,
+    pub(crate) layers: Vec<QLayer<'a>>,
     final_norm: Vec<f32>,
     pub(crate) lm_head: Lin<'a>,
     pub(crate) inv_freq: Vec<f32>,
@@ -200,6 +200,8 @@ pub struct QwenModel<'a> {
     /// the backend or the model cannot.
     /// Plans by intervention layout (`GpuLayout::signature`, 0 without interventions).
     gpu_plans: crate::gpu::decode::PlanCache,
+    /// Qwen4-Exp (hyper-connections, n-gram embedding, QSA; see `crate::qwen4exp`).
+    pub(crate) exp: Option<Box<crate::qwen4exp::Exp<'a>>>,
 }
 
 /// Most tokens of a multi-token GPU pass (speculative verification).
@@ -209,8 +211,8 @@ pub const MULTI_TOKENS: usize = 16;
 #[derive(Clone)]
 pub struct GdnState {
     // Page-aligned and never reallocated: GPU decoding updates them in place (`gpu::decode`).
-    s: crate::quant::PageVec<f32>,    // [n_v, hd_k, hd_v]
-    conv: crate::quant::PageVec<f32>, // [K-1, conv_dim]: the last K-1 raw conv inputs (oldest first)
+    pub(crate) s: crate::quant::PageVec<f32>,    // [n_v, hd_k, hd_v]
+    pub(crate) conv: crate::quant::PageVec<f32>, // [K-1, conv_dim]: the last K-1 raw conv inputs (oldest first)
 }
 
 /// What a recording forward (`QwenModel::forward_hidden_rec`) keeps of one Gated DeltaNet layer
@@ -220,7 +222,7 @@ pub struct GdnState {
 /// forward, so bit-identical). Keeping every intermediate state instead would cost 151 MB per
 /// token on Qwen3.8-27B; this is one state plus ~45 KB per token. Buffers are reused.
 #[derive(Clone, Default)]
-struct GdnRecord {
+pub(crate) struct GdnRecord {
     s0: Vec<f32>,    // state before the span
     c: Vec<f32>,     // [t, conv_dim]: conv outputs (after SiLU)
     b: Vec<f32>,     // [t, n_v]
@@ -374,11 +376,11 @@ struct GpuRec {
 
 #[derive(Clone)]
 pub struct QwenSession {
-    kv: Vec<Option<LayerCache>>,
-    gdn: Vec<Option<GdnState>>,
-    rec: Vec<GdnRecord>,
+    pub(crate) kv: Vec<Option<LayerCache>>,
+    pub(crate) gdn: Vec<Option<GdnState>>,
+    pub(crate) rec: Vec<GdnRecord>,
     /// `(start, len)` of the positions recorded by the last forward, if it recorded.
-    rec_span: Option<(usize, usize)>,
+    pub(crate) rec_span: Option<(usize, usize)>,
     /// The last forward when it was a multi-token GPU pass (speculative verification): what a
     /// rewind inside it needs.
     gpu_rec: Option<GpuRec>,
@@ -386,7 +388,7 @@ pub struct QwenSession {
     pub(crate) spans: Vec<VisionSpan>,
     pub pos: usize,
     /// Device state of GPU decoding (KV cache copies).
-    gpu: crate::gpu::decode::Slot,
+    pub(crate) gpu: crate::gpu::decode::Slot,
     /// Runtime interventions ([`crate::intervene`]).
     pub iv: crate::intervene::State,
     /// Layers whose output (the residual stream after the layer, before the final norm, as
@@ -398,6 +400,8 @@ pub struct QwenSession {
     /// derived from the vision spans (for pipelines that pass their own `position_ids`; prompt
     /// passes of several tokens).
     pub positions: Option<Vec<[usize; 3]>>,
+    /// Qwen4-Exp state (n-gram contexts and conv, indexer keys; see `crate::qwen4exp`).
+    pub(crate) exp: Option<Box<crate::qwen4exp::ExpSession>>,
 }
 
 impl QwenSession {
@@ -422,6 +426,9 @@ impl QwenSession {
     pub fn rewind(&mut self, pos: usize) -> Result<()> {
         if pos >= self.pos {
             return Ok(());
+        }
+        if let Some(e) = &mut self.exp {
+            e.rewind(pos, self.rec_span)?;
         }
         let has_gdn = self.gdn.iter().any(|g| g.is_some());
         if has_gdn && let Some(r) = self.gpu_rec.take() {
@@ -613,7 +620,12 @@ impl<'a> QwenModel<'a> {
         } else {
             ld.lin("lm_head.weight", cfg.vocab_size, h)?
         };
-        let final_norm = ld.norm(&format!("{prefix}norm.weight"), h)?;
+        let exp = cfg.is_exp();
+        let final_norm = if exp {
+            Vec::new()
+        } else {
+            ld.norm(&format!("{prefix}norm.weight"), h)?
+        };
 
         let (nk, nv, hdk, hdv) = (
             cfg.linear_num_key_heads,
@@ -651,8 +663,16 @@ impl<'a> QwenModel<'a> {
             };
             layers.push(QLayer {
                 mixer,
-                ln_in: ld.norm(&format!("{lp}input_layernorm.weight"), h)?,
-                ln_post: ld.norm(&format!("{lp}post_attention_layernorm.weight"), h)?,
+                ln_in: if exp {
+                    Vec::new()
+                } else {
+                    ld.norm(&format!("{lp}input_layernorm.weight"), h)?
+                },
+                ln_post: if exp {
+                    Vec::new()
+                } else {
+                    ld.norm(&format!("{lp}post_attention_layernorm.weight"), h)?
+                },
                 ffn: ld.ffn(&format!("{lp}mlp."))?,
             });
         }
@@ -688,6 +708,11 @@ impl<'a> QwenModel<'a> {
                 })
                 .collect()
         });
+        let exp = if exp {
+            Some(Box::new(crate::qwen4exp::Exp::load(&ld, prefix)?))
+        } else {
+            None
+        };
         Ok(Self {
             cfg,
             quant,
@@ -699,6 +724,7 @@ impl<'a> QwenModel<'a> {
             mrope_axis,
             stream: None,
             gpu_plans: Default::default(),
+            exp,
         })
     }
 
@@ -787,10 +813,17 @@ impl<'a> QwenModel<'a> {
                     Mixer::Attn(a) => a.lins().to_vec(),
                 };
                 lins.extend(layer.ffn.lins());
+                if let Some(e) = &self.exp {
+                    lins.extend(e.layer_lins(l));
+                }
                 (format!("layer.{l}"), lins)
             })
             .collect();
-        v.push(("lm_head".into(), vec![&self.lm_head]));
+        let mut head = vec![&self.lm_head];
+        if let Some(e) = &self.exp {
+            head.extend(e.mixer.lins());
+        }
+        v.push(("lm_head".into(), head));
         v
     }
 
@@ -807,6 +840,9 @@ impl<'a> QwenModel<'a> {
                     Mixer::Attn(a) => a.lins().to_vec(),
                 };
                 lins.extend(layer.ffn.dense_lins());
+                if let Some(e) = &self.exp {
+                    lins.extend(e.layer_lins(l));
+                }
                 crate::stream::UnitSpec {
                     name: format!("layer.{l}"),
                     ranges: lins.iter().flat_map(|l| l.mem_ranges()).collect(),
@@ -815,9 +851,13 @@ impl<'a> QwenModel<'a> {
                 }
             })
             .collect();
+        let mut head = self.lm_head.mem_ranges();
+        if let Some(e) = &self.exp {
+            head.extend(e.mixer.lins().iter().flat_map(|l| l.mem_ranges()));
+        }
         v.push(crate::stream::UnitSpec {
             name: "lm_head".into(),
-            ranges: self.lm_head.mem_ranges(),
+            ranges: head,
             uses: 1.0,
             parts: Vec::new(),
         });
@@ -855,6 +895,13 @@ impl<'a> QwenModel<'a> {
                 Mixer::Attn(a) => a.bytes(),
             };
         }
+        if let Some(e) = &self.exp {
+            n += (0..self.layers.len())
+                .flat_map(|l| e.layer_lins(l))
+                .chain(e.mixer.lins())
+                .map(|l| l.bytes())
+                .sum::<usize>();
+        }
         n
     }
 
@@ -889,6 +936,7 @@ impl<'a> QwenModel<'a> {
             capture: Vec::new(),
             captured: Vec::new(),
             positions: None,
+            exp: self.exp.as_ref().map(|e| Box::new(e.new_session(cfg))),
         }
     }
 
@@ -908,6 +956,13 @@ impl<'a> QwenModel<'a> {
     ) -> Option<crate::gpu::decode::Graph<'s>> {
         use crate::gpu::decode::{Graph, LinMode, Op};
         use crate::intervene::GpuNeurons;
+        if let Some(ex) = &self.exp {
+            return if multi.is_none() && lay.is_none() {
+                self.exp_gpu_graph(ex)
+            } else {
+                None
+            };
+        }
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps as f32;
@@ -1148,6 +1203,7 @@ impl<'a> QwenModel<'a> {
                         hdk,
                         hdv,
                         tiled: cfg.v_heads_tiled,
+                        sigmoid_gate: cfg.gdn_sigmoid_gate(),
                         decay_coef: &gd.decay_coef,
                         dt_bias: &gd.dt_bias,
                         norm_w: &gd.norm_w,
@@ -1228,8 +1284,18 @@ impl<'a> QwenModel<'a> {
         }
         self.gpu_plans.get(lay.map_or(0, |l| l.signature()), || {
             let be = crate::gpu::active()?;
-            let g = self.gpu_graph(lay)?;
-            be.decode_plan(&g)
+            let g = self.gpu_graph(lay);
+            if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
+                eprintln!(
+                    "[gpu decode graph: {}]",
+                    g.as_ref().map_or("none".into(), |g| format!("{} ops", g.ops.len()))
+                );
+            }
+            let p = be.decode_plan(&g?);
+            if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
+                eprintln!("[gpu decode plan: {}]", if p.is_some() { "built" } else { "none" });
+            }
+            p
         })
     }
 
@@ -1241,6 +1307,9 @@ impl<'a> QwenModel<'a> {
         }
         if !sess.iv.gpu_ok() {
             return None;
+        }
+        if let Some(ex) = &self.exp {
+            return self.exp_gpu_step(ex, sess, tok, want_logits);
         }
         let ivc = sess.iv.iv.clone();
         let data = ivc.as_ref().and_then(|c| c.gpu_data());
@@ -1558,6 +1627,9 @@ impl<'a> QwenModel<'a> {
         {
             return hs;
         }
+        if let Some(ex) = &self.exp {
+            return self.exp_forward(ex, sess, tokens, mm, record);
+        }
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps as f32;
@@ -1653,6 +1725,24 @@ impl<'a> QwenModel<'a> {
         sin: &[f32],
         y: &mut [f32],
     ) {
+        self.attn_forward_sel(at, cache, hn, t, start, cos, sin, None, y)
+    }
+
+    /// [`Self::attn_forward`] where token `i` attends only to the cached positions `sel[i]` when
+    /// set (Qwen4-Exp sparse attention, see `crate::qwen4exp`).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attn_forward_sel(
+        &self,
+        at: &Attn,
+        cache: &mut LayerCache,
+        hn: &[f32],
+        t: usize,
+        start: usize,
+        cos: &[f32],
+        sin: &[f32],
+        sel: Option<&[Option<Vec<u32>>]>,
+        y: &mut [f32],
+    ) {
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let (nh, nkv, hd) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
@@ -1737,7 +1827,10 @@ impl<'a> QwenModel<'a> {
         });
         cache.push(&kn, &v, t);
         let mut att = vec![0f32; t * nh * hd];
-        attention(&q, cache, nh, t, start, None, &mut att);
+        match sel {
+            Some(sel) if sel.iter().any(|s| s.is_some()) => crate::qwen4exp::attention_sel(&q, cache, nh, t, start, sel, &mut att),
+            _ => attention(&q, cache, nh, t, start, None, &mut att),
+        }
         if gated {
             for (a, &g) in att.iter_mut().zip(&gate) {
                 *a *= 1.0 / (1.0 + fast_exp(-g));
@@ -1746,7 +1839,7 @@ impl<'a> QwenModel<'a> {
         linear(&at.o, h, nh * hd, &att, t, y);
     }
 
-    fn gdn_forward(&self, gd: &Gdn, st: &mut GdnState, mut rec: Option<&mut GdnRecord>, hn: &[f32], t: usize, y: &mut [f32]) {
+    pub(crate) fn gdn_forward(&self, gd: &Gdn, st: &mut GdnState, mut rec: Option<&mut GdnRecord>, hn: &[f32], t: usize, y: &mut [f32]) {
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps as f32;
@@ -1844,14 +1937,16 @@ impl<'a> QwenModel<'a> {
         }
         drop(_timer);
 
-        // Gated RMSNorm per head: norm(o) * w * silu(z)
+        // Gated RMSNorm per head: norm(o) * w * silu(z) (sigmoid(z) for Qwen4-Exp)
+        let sig = cfg.gdn_sigmoid_gate();
         for_chunks(&mut out, hdv, t * nv > 64, |i, o| {
             let ss: f32 = o.iter().map(|v| v * v).sum::<f32>() / hdv as f32 + eps;
             let r = ss.powf(-0.5);
             let zz = &z[i * hdv..(i + 1) * hdv];
             for j in 0..hdv {
                 let g = zz[j];
-                o[j] = o[j] * r * gd.norm_w[j] * (g / (1.0 + fast_exp(-g)));
+                let gate = if sig { 1.0 / (1.0 + (-g).exp()) } else { g / (1.0 + fast_exp(-g)) };
+                o[j] = o[j] * r * gd.norm_w[j] * gate;
             }
         });
         linear(&gd.out, h, value_dim, &out, t, y);

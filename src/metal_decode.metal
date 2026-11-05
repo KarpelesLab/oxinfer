@@ -933,7 +933,7 @@ inline void gdn_rule_body(device const float* c, device const float* z, device c
                           threadgroup float* qs, threadgroup float* ks, threadgroup float* red, threadgroup float* red2) {
     // cst: decay_coef[nv], dt_bias[nv], norm_w[hdv]
     uint hdk = p.hdk, hdv = p.hdv, np = hdk / 32;
-    uint hk = p.tiled != 0 ? hv % p.nk : hv / (p.nv / p.nk);
+    uint hk = (p.tiled & 1u) != 0 ? hv % p.nk : hv / (p.nv / p.nk);
     uint part = tid / hdv, j = tid % hdv;
     float q = 0.f, k = 0.f;
     if (tid < hdk) {
@@ -975,7 +975,7 @@ inline void gdn_rule_body(device const float* c, device const float* z, device c
     float r = rsqrt(tg_sum(ov * ov, hdv, tid, sg, lane, red2) / float(hdv) + p.eps);
     if (tid < hdv) {
         float zz = z[hv * hdv + j];
-        out[hv * hdv + j] = ov * r * cst[2 * p.nv + j] * (zz / (1.0f + exp(-zz)));
+        out[hv * hdv + j] = ov * r * cst[2 * p.nv + j] * ((p.tiled & 2u) != 0 ? 1.0f / (1.0f + precise::exp(-zz)) : zz / (1.0f + exp(-zz)));
     }
 }
 kernel void dec_gdn_rule(device const float* c [[buffer(0)]], device const float* z [[buffer(1)]], device const float* b [[buffer(2)]],
@@ -1101,11 +1101,32 @@ kernel void dec_topk(device const float* logits [[buffer(0)]], device float* sel
 kernel void dec_ew(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], device float* out [[buffer(2)]],
                    constant float4& p [[buffer(3)]], constant uint& n [[buffer(4)]], uint i [[thread_position_in_grid]]) {
     if (i >= n) return;
+    if (p.x == 4.f) {
+        // Hyper-connection read: out = mean over the p.y streams of sigmoid(gate) * xn.
+        uint hc = (uint)p.y;
+        float s = 0.f;
+        for (uint j = 0; j < hc; j++) {
+            float g = a[j * n + i];
+            s += b[j * n + i] / (1.0f + precise::exp(-g));
+        }
+        out[i] = s * p.w;
+        return;
+    }
+    if (p.x == 5.f) {
+        // Hyper-connection write: x[s n + i] += y[i] * 2 sigmoid(inj[s] / hc), n = hc * p.y.
+        uint m = (uint)p.y;
+        uint s = i / m;
+        float w = 2.0f / (1.0f + precise::exp(-b[s] * p.z));
+        out[i] += a[i - s * m] * w;
+        return;
+    }
     float v = a[i];
     if (p.x == 0.f) out[i] = v * p.y;
     else if (p.x == 1.f) out[i] = precise::tanh(v / p.y) * p.y;
+    else if (p.x == 3.f) { float u = v * p.y; out[i] = u / (1.0f + precise::exp(-u)); }
     else out[i] = (v * p.y + b[i] * p.z) * p.w;
 }
+
 // Several tokens (grid y): ts = strides of a, b, out.
 kernel void dec_ew_t(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], device float* out [[buffer(2)]],
                      constant float4& p [[buffer(3)]], constant uint& n [[buffer(4)]], constant uint4& ts [[buffer(5)]],
@@ -1243,4 +1264,24 @@ kernel void dec_neuron_edit(device float* act [[buffer(0)]], device const float*
         else v = min(max(v, q[3]), q[4]);
         *a = v;
     }
+}
+
+// ---- Qwen4-Exp n-gram gate: one threadgroup per stream s: a = k_s . q_s / sqrt(n), then
+// out[s n + i] = sigmoid(sign(a) sqrt(max(|a|, 1e-6))) * v[i].
+kernel void dec_ple_gate(device const float* k [[buffer(0)]], device const float* q [[buffer(1)]], device const float* v [[buffer(2)]],
+                         device float* out [[buffer(3)]], constant uint2& p [[buffer(4)]], uint s [[threadgroup_position_in_grid]],
+                         uint tid [[thread_position_in_threadgroup]], uint nt [[threads_per_threadgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[32];
+    uint n = p.x;
+    device const float* ks = k + (ulong)s * n;
+    device const float* qs = q + (ulong)s * n;
+    float acc = 0.f;
+    for (uint i = tid; i < n; i += nt) acc += ks[i] * qs[i];
+    float a = tg_total(acc, nt, sg, lane, red) / sqrt((float)n);
+    float m = sqrt(max(fabs(a), 1e-6f));
+    float g = a > 0.f ? m : (a < 0.f ? -m : 0.f);
+    float sig = 1.0f / (1.0f + precise::exp(-g));
+    device float* o = out + (ulong)s * n;
+    for (uint i = tid; i < n; i += nt) o[i] = sig * v[i];
 }

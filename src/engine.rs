@@ -1092,9 +1092,8 @@ impl Engine {
         let family = match model_type.as_str() {
             "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => Family::Gemma4,
             "gemma3" | "gemma3_text" => Family::Gemma3,
-            "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" | "qwen2_5_vl" => {
-                Family::Qwen
-            }
+            "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" | "qwen2_5_vl"
+            | "qwen4_exp" | "qwen4_exp_text" => Family::Qwen,
             "llama" => Family::Llama,
             "mistral_large4" | "mistral_large4_text" => Family::Mistral4,
             "deepseek_v4" => Family::DeepSeek4,
@@ -1148,8 +1147,10 @@ impl Engine {
         let decision;
         // Streaming reads the weights in place: always mapped. So is a Mistral Large 4 checkpoint
         // larger than most of RAM (its routed experts are read through the page cache).
-        let too_big =
-            matches!(family, Family::Mistral4 | Family::DeepSeek4) && crate::mistral4::too_big(crate::safetensors::checkpoint_bytes(&dir));
+        // Qwen4-Exp reads its n-gram table (tens of GB) a few rows per token: always mapped.
+        let exp = model_type.starts_with("qwen4_exp");
+        let too_big = (exp || matches!(family, Family::Mistral4 | Family::DeepSeek4))
+            && crate::mistral4::too_big(crate::safetensors::checkpoint_bytes(&dir));
         // Too big for memory: streamed with a page-cache budget unless told otherwise
         // (2.5-3.5x faster than demand paging on the 378 GB UD-Q2_K_XL, see the README).
         let stream = opts.effective_stream(too_big.then(crate::mistral4::default_stream));
@@ -1157,7 +1158,7 @@ impl Engine {
             crate::pixtral::Mmproj::File(p) => crate::pixtral::Mmproj::File(resolve_file(&p.to_string_lossy(), opts.cache_dir.as_deref())?),
             m => m.clone(),
         };
-        let mmap = opts.mmap || stream.is_some() || too_big;
+        let mmap = opts.mmap || stream.is_some() || too_big || exp;
         let files = arena.keep(ModelFiles::open(&dir, !mmap)?);
         let tok = load_tokenizer(&dir)?;
         let eos = config::load_eos_ids(&dir);

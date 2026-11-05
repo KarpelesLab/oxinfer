@@ -80,11 +80,16 @@ pub struct QwenMtp<'a> {
     hidden: usize,
     /// Weight streaming: unit 0 is the layer, unit 1 the trimmed draft head.
     stream: Option<crate::stream::StreamHook>,
+    /// Qwen4-Exp (hyper-connections, QSA; see `crate::qwen4exp::MtpExp`).
+    exp: Option<crate::qwen4exp::MtpExp<'a>>,
 }
 
 /// The MTP layer's own KV cache: one entry per main-model position whose successor is known.
 pub struct MtpSession {
     kv: LayerCache,
+    /// Qwen4-Exp: the layer's indexer keys.
+    idx: Option<crate::qwen4exp::IdxCache>,
+    ratio: usize,
     /// The main session's vision spans (M-RoPE positions), copied after each main prefill.
     pub(crate) spans: Vec<crate::qwen::VisionSpan>,
 }
@@ -98,6 +103,9 @@ impl MtpSession {
     }
     pub fn truncate(&mut self, len: usize) {
         self.kv.truncate(len);
+        if let Some(c) = &mut self.idx {
+            c.truncate_to(len, self.ratio);
+        }
         self.spans.retain(|s| s.start < len);
     }
 }
@@ -105,7 +113,9 @@ impl MtpSession {
 /// Where the MTP tensors live in a checkpoint (`mtp.` in Qwen3.5 checkpoints), if anywhere.
 pub fn mtp_prefix(files: &ModelFiles) -> Option<&'static str> {
     let has = |n: &str| files.has(n) || files.has(&format!("{n}.q8")) || files.has(&format!("{n}.q4"));
-    ["mtp.", "model.mtp."].into_iter().find(|p| has(&format!("{p}fc.weight")))
+    ["mtp.", "model.mtp."]
+        .into_iter()
+        .find(|p| has(&format!("{p}fc.weight")) || has(&format!("{p}fc_embedding.weight")))
 }
 
 impl<'a> QwenMtp<'a> {
@@ -122,6 +132,29 @@ impl<'a> QwenMtp<'a> {
         let ld = Loader { files, cfg, quant };
         let h = cfg.hidden_size;
         let lp = format!("{p}layers.0.");
+        if cfg.is_exp() {
+            // Qwen4-Exp: hyper-connections in place of the norms, a QSA indexer, its own mixer.
+            let split = !ld.has(&format!("{p}fc.weight"));
+            return Ok(Self {
+                fc: if split {
+                    ld.lin(&format!("{p}fc_embedding.weight"), h, h)?
+                } else {
+                    ld.lin(&format!("{p}fc.weight"), h, 2 * h)?
+                },
+                norm_emb: ld.norm(&format!("{p}pre_fc_norm_embedding.weight"), h)?,
+                norm_hidden: ld.norm(&format!("{p}pre_fc_norm_hidden.weight"), cfg.hc_count * h)?,
+                attn: ld.attn(&format!("{lp}self_attn."))?,
+                ffn: ld.ffn(&format!("{lp}mlp."))?,
+                ln_in: Vec::new(),
+                ln_post: Vec::new(),
+                norm: Vec::new(),
+                head: None,
+                embed: None,
+                hidden: h,
+                stream: None,
+                exp: Some(crate::qwen4exp::MtpExp::load(&ld, p, split)?),
+            });
+        }
         Ok(Self {
             fc: ld.lin(&format!("{p}fc.weight"), h, 2 * h)?,
             norm_emb: ld.norm(&format!("{p}pre_fc_norm_embedding.weight"), h)?,
@@ -135,6 +168,7 @@ impl<'a> QwenMtp<'a> {
             embed: None,
             hidden: h,
             stream: None,
+            exp: None,
         })
     }
 
@@ -143,6 +177,9 @@ impl<'a> QwenMtp<'a> {
         let mut lins = vec![&self.fc];
         lins.extend(self.attn.lins());
         lins.extend(self.ffn.lins());
+        if let Some(e) = &self.exp {
+            lins.extend(e.lins());
+        }
         let mut v = vec![("mtp", lins)];
         if let Some(d) = &self.head {
             v.push(("draft_head", vec![&d.head]));
@@ -158,6 +195,9 @@ impl<'a> QwenMtp<'a> {
         let mut lins = vec![&self.fc];
         lins.extend(self.attn.lins());
         lins.extend(self.ffn.dense_lins());
+        if let Some(e) = &self.exp {
+            lins.extend(e.lins());
+        }
         // The routed experts of a MoE MTP layer are read on demand.
         let mut v = vec![crate::stream::UnitSpec {
             name: "mtp".into(),
@@ -232,6 +272,8 @@ impl<'a> QwenMtp<'a> {
     pub fn new_session(&self, cfg: &QwenConfig) -> MtpSession {
         MtpSession {
             kv: LayerCache::new(cfg.num_key_value_heads, cfg.head_dim),
+            idx: self.exp.as_ref().map(|_| crate::qwen4exp::new_idx_cache(cfg)),
+            ratio: cfg.indexer_compress_ratio,
             spans: Vec::new(),
         }
     }
@@ -240,6 +282,7 @@ impl<'a> QwenMtp<'a> {
     /// a trimmed one is set).
     pub fn step_bytes(&self, model: &QwenModel) -> usize {
         self.fc.bytes()
+            + self.exp.as_ref().map_or(0, |e| e.lins().iter().map(|l| l.bytes()).sum())
             + self.attn.bytes()
             + self.ffn.streamed_bytes()
             + self.head.as_ref().map_or(model.lm_head.bytes(), |d| d.head.bytes())
@@ -249,6 +292,9 @@ impl<'a> QwenMtp<'a> {
     /// main model's final-normed state, or a previous MTP output) with the token after it, at
     /// position `sess.len() + i`. Appends to the MTP cache; returns the normed outputs `[t, H]`.
     pub fn forward(&self, model: &QwenModel, sess: &mut MtpSession, hidden: &[f32], tokens: &[u32]) -> Vec<f32> {
+        if let Some(e) = &self.exp {
+            return self.exp_forward(e, model, sess, hidden, tokens);
+        }
         let t = tokens.len();
         let h = self.hidden;
         assert!(t > 0 && hidden.len() == t * h);
@@ -291,10 +337,92 @@ impl<'a> QwenMtp<'a> {
         hn
     }
 
+    /// The Qwen4-Exp layer (see `crate::qwen4exp::MtpExp`): `hidden` holds residual streams
+    /// (`[t, hc * H]`: the trunk's before its final mixer, or a previous step's output); returns
+    /// the layer's output streams.
+    fn exp_forward(&self, e: &crate::qwen4exp::MtpExp, model: &QwenModel, sess: &mut MtpSession, hidden: &[f32], tokens: &[u32]) -> Vec<f32> {
+        use crate::qwen4exp::{combine, grouped_norm};
+        let cfg = &model.cfg;
+        let t = tokens.len();
+        let (h, hc) = (self.hidden, cfg.hc_count);
+        let w = hc * h;
+        assert!(t > 0 && hidden.len() == t * w);
+        let eps = cfg.rms_norm_eps as f32;
+        let table = self.embed.as_ref().unwrap_or(&model.embed);
+        if let Some(s) = self.stream.as_ref().or(model.stream.as_ref()) {
+            let rows: Vec<(usize, usize)> = tokens.iter().flat_map(|&tk| table.row_ranges(tk as usize, h)).collect();
+            s.need_ranges(&rows);
+        }
+        let _unit = crate::stream::enter(&self.stream, 0);
+        let mut en = vec![0f32; t * h];
+        let mut ev = vec![0f32; h];
+        for (i, row) in en.chunks_mut(h).enumerate() {
+            table.row(tokens[i] as usize, &mut ev);
+            rmsnorm_f32w(&ev, &self.norm_emb, eps, row);
+        }
+        let mut hn = vec![0f32; t * w];
+        grouped_norm(hidden, &self.norm_hidden, h, eps, &mut hn);
+        // Per stream: fc([enorm(e) ; hnorm_s(h_s)]), rows [t * hc, H] = [t, hc * H].
+        let mut x = vec![0f32; t * w];
+        match &e.fc_hidden {
+            None => {
+                let mut cat = vec![0f32; t * hc * 2 * h];
+                for (r, row) in cat.chunks_mut(2 * h).enumerate() {
+                    let (i, s) = (r / hc, r % hc);
+                    row[..h].copy_from_slice(&en[i * h..(i + 1) * h]);
+                    row[h..].copy_from_slice(&hn[i * w + s * h..i * w + (s + 1) * h]);
+                }
+                linear(&self.fc, h, 2 * h, &cat, t * hc, &mut x);
+            }
+            Some(fh) => {
+                let mut ye = vec![0f32; t * h];
+                linear(&self.fc, h, h, &en, t, &mut ye);
+                linear(fh, h, h, &hn, t * hc, &mut x);
+                for (r, row) in x.chunks_mut(h).enumerate() {
+                    add_inplace(row, &ye[(r / hc) * h..(r / hc + 1) * h]);
+                }
+            }
+        }
+        drop(hn);
+
+        let start = sess.kv.len;
+        let (cos, sin) = model.rope_cs(&sess.spans, start, t);
+        let mut m = vec![0f32; t * h];
+        let mut y = vec![0f32; t * h];
+        let mut inj = vec![0f32; t * hc];
+        e.attn_hc.mix(cfg, &x, t, &mut m, &mut inj);
+        let sel = {
+            let spans = &sess.spans;
+            let rope_at = |p: usize, n: usize| model.rope_cs(spans, p, n);
+            let ic = sess.idx.as_mut().expect("MTP indexer cache");
+            model.qsa_select(&e.indexer, ic, &rope_at, &m, t, start, usize::MAX)
+        };
+        model.attn_forward_sel(&self.attn, &mut sess.kv, &m, t, start, &cos, &sin, sel.as_deref(), &mut y);
+        combine(&mut x, &y, &inj, t, h, hc);
+        e.mlp_hc.mix(cfg, &x, t, &mut m, &mut inj);
+        let need = |ids: &[usize]| {
+            if let Some(s) = &self.stream {
+                s.need_parts(0, ids)
+            }
+        };
+        self.ffn
+            .forward(&m, t, h, &mut y, self.stream.as_ref().map(|_| &need as &dyn Fn(&[usize])), None);
+        combine(&mut x, &y, &inj, t, h, hc);
+        x
+    }
+
     /// The draft distribution over target token ids for one MTP output row, with the sampler's
     /// temperature / top-k / top-p (a single token with probability 1 when greedy).
     pub fn draft_distribution(&self, model: &QwenModel, out: &[f32], sampler: &Sampler) -> Vec<(u32, f32)> {
         let h = self.hidden;
+        let mixed;
+        let out = match &self.exp {
+            Some(e) => {
+                mixed = e.mix_out(&model.cfg, out, 1);
+                &mixed[..]
+            }
+            None => out,
+        };
         match &self.head {
             None => sampler.distribution(&model.logits_device(out, 1)),
             Some(d) => {
@@ -574,7 +702,7 @@ impl<'m> MtpDecoder<'m> {
         if n == 0 {
             return None;
         }
-        let h = self.model.cfg.hidden_size;
+        let h = self.model.mtp_width();
         let out = self.mtp.forward(self.model, &mut self.msess, &self.pend_h[..n * h], &self.pend_t);
         self.pend_h.drain(..n * h);
         self.pend_t.clear();
@@ -594,6 +722,7 @@ impl<'m> MtpDecoder<'m> {
     pub fn prefill_mm(&mut self, tokens: &[u32], chunk: usize, overrides: &[(usize, Vec<f32>)]) -> Vec<f32> {
         assert!(!tokens.is_empty());
         let h = self.model.cfg.hidden_size;
+        let w = self.model.mtp_width();
         if self.next.take().is_some() {
             self.pend_t.pop();
         }
@@ -601,7 +730,7 @@ impl<'m> MtpDecoder<'m> {
         let mut last = Vec::new();
         let mut start = 0;
         for c in tokens.chunks(chunk.max(1)) {
-            if self.pend_h.len() > self.pend_t.len() * h {
+            if self.pend_h.len() > self.pend_t.len() * w {
                 self.pend_t.push(c[0]);
             }
             let end = start + c.len();
@@ -612,7 +741,7 @@ impl<'m> MtpDecoder<'m> {
                 .collect();
             start = end;
             let hs = self.model.forward_hidden_mm(&mut self.sess, c, &local);
-            self.pend_h.extend_from_slice(&hs);
+            self.pend_h.extend_from_slice(self.model.mtp_hidden(&self.sess, &hs));
             self.pend_t.extend_from_slice(&c[1..]);
             self.flush();
             last = hs[hs.len() - h..].to_vec();
@@ -623,7 +752,7 @@ impl<'m> MtpDecoder<'m> {
     /// Commits the token chosen from `prefill`'s logits (the first token of a reply).
     pub fn push(&mut self, token: u32) {
         assert!(self.next.is_none(), "push follows prefill; step commits its own tokens");
-        assert_eq!(self.pend_h.len(), (self.pend_t.len() + 1) * self.model.cfg.hidden_size);
+        assert_eq!(self.pend_h.len(), (self.pend_t.len() + 1) * self.model.mtp_width());
         self.pend_t.push(token);
         self.next = Some(token);
     }
@@ -634,7 +763,6 @@ impl<'m> MtpDecoder<'m> {
     pub fn step(&mut self, sampler: &mut Sampler, max_new: usize) -> Vec<u32> {
         let next = self.next.expect("push a first token before step");
         let (model, mtp) = (self.model, self.mtp);
-        let h = model.cfg.hidden_size;
         let v = model.cfg.vocab_size;
         let n = self.sess.pos; // position of `next`
         let k = self.k_cur.min(max_new.max(1) - 1);
@@ -736,7 +864,8 @@ impl<'m> MtpDecoder<'m> {
         // Drop the entries computed from draft hidden states. The pending rows are empty after
         // drafting (or, with no drafts, still hold rows that end with `next`): append the new ones.
         self.msess.truncate(n);
-        self.pend_h.extend_from_slice(&hs[..c * h]);
+        let w = model.mtp_width();
+        self.pend_h.extend_from_slice(&model.mtp_hidden(&self.sess, &hs)[..c * w]);
         self.pend_t.extend_from_slice(&out);
         self.next = out.last().copied();
 
