@@ -1426,6 +1426,9 @@ struct Stats {
     copy_out_ns: AtomicU64,
 }
 
+/// A shared wrap (`MetalBackend::shared_wraps`): buffer, GPU address, plans using it.
+type SharedWrap = (usize, u64, usize);
+
 pub struct MetalBackend {
     stats: Stats,
     o: Objc,
@@ -1460,6 +1463,10 @@ pub struct MetalBackend {
     /// The compiled shader library, and pipelines made from it on demand (decode kernels).
     lib: Id,
     named: Mutex<std::collections::HashMap<String, Id>>,
+    /// Expert weight spans wrapped by decode plans, shared by the plans of one model (a model's
+    /// single- and multi-token plans would otherwise each wire every expert: 78 GB twice for
+    /// Qwen3.8-Flash-Next at Q4): `(start, len) -> (buffer, plans using it)`.
+    pub(crate) shared_wraps: Mutex<std::collections::HashMap<(usize, usize), SharedWrap>>,
 }
 unsafe impl Send for MetalBackend {}
 unsafe impl Sync for MetalBackend {}
@@ -1763,6 +1770,7 @@ impl MetalBackend {
             sels,
             lib,
             named: Mutex::new(std::collections::HashMap::new()),
+            shared_wraps: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -1804,6 +1812,35 @@ impl MetalBackend {
     /// caller guarantees they belong to one allocation); falls back to copying. The iOS
     /// Simulator's Metal driver aborts on wrapped host memory (it hands buffers to the host's GPU
     /// process as shared memory), so it always copies there.
+    /// [`Self::wrap`] shared between decode plans (see `shared_wraps`); give it back with
+    /// [`Self::unwrap_shared`].
+    pub(crate) fn wrap_shared(&self, ptr: *const u8, len: usize) -> Option<(Id, u64)> {
+        let mut m = self.shared_wraps.lock().unwrap();
+        if let Some(e) = m.get_mut(&(ptr as usize, len)) {
+            e.2 += 1;
+            return Some((e.0 as Id, e.1));
+        }
+        let b = self.wrap(ptr, len)?;
+        let addr = self.gpu_address(&b);
+        m.insert((ptr as usize, len), (b.id as usize, addr, 1));
+        Some((b.id, addr))
+    }
+
+    /// Drops a plan's use of a shared wrap; true when it was the last (the caller releases it).
+    pub(crate) fn unwrap_shared(&self, id: Id) -> bool {
+        let mut m = self.shared_wraps.lock().unwrap();
+        let Some(k) = m.iter().find(|e| e.1.0 == id as usize).map(|e| *e.0) else {
+            return true;
+        };
+        let e = m.get_mut(&k).unwrap();
+        e.2 -= 1;
+        if e.2 == 0 {
+            m.remove(&k);
+            return true;
+        }
+        false
+    }
+
     fn wrap(&self, ptr: *const u8, len: usize) -> Option<Buf> {
         let start = (ptr as usize) & !(PAGE - 1);
         let end = (ptr as usize + len).div_ceil(PAGE) * PAGE;

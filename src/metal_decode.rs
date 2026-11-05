@@ -904,7 +904,7 @@ enum MOp {
         /// Multi-token plans: the pipeline and the g, u, out strides.
         t: Option<(Id, [u32; 4])>,
     },
-    /// See `Op::PleGate` (single-token plans only).
+    /// See `Op::PleGate`.
     PleGate {
         pipe: Id,
         k: usize,
@@ -913,6 +913,8 @@ enum MOp {
         out: usize,
         n: u32,
         hc: u32,
+        /// Multi-token plans: the pipeline and the k, q, v, out strides.
+        t: Option<(Id, [u32; 4])>,
     },
     Steer {
         pipe: Id,
@@ -979,8 +981,10 @@ pub(crate) struct MetalPlan<'b> {
     consts: Id,
     /// Arena offset of the split-attention partials.
     part: usize,
-    /// Buffers made for the plan (MoE weight spans, expert tables), released with it.
+    /// Buffers made for the plan (expert tables), released with it.
     owned: Vec<Id>,
+    /// Expert weight spans shared with the model's other plans (`MetalBackend::wrap_shared`).
+    shared: Vec<Id>,
     /// Buffers reached only through addresses, made resident on every step when the queue has
     /// no residency set.
     indirect: Vec<Id>,
@@ -1025,12 +1029,20 @@ impl Drop for MetalPlan<'_> {
         unsafe {
             (self.f.void)(self.arena, self.f.s_release);
             (self.f.void)(self.consts, self.f.s_release);
+            // Shared spans other plans still use stay resident and wrapped.
+            let last: Vec<Id> = self.shared.iter().copied().filter(|&b| self.be.unwrap_shared(b)).collect();
+            let gone: Vec<Id> = self
+                .indirect
+                .iter()
+                .copied()
+                .filter(|b| !self.shared.contains(b) || last.contains(b))
+                .collect();
             if let Some(r) = &self.be.residency
-                && !self.indirect.is_empty()
+                && !gone.is_empty()
             {
-                r.update(&self.indirect, false);
+                r.update(&gone, false);
             }
-            for &b in &self.owned {
+            for &b in self.owned.iter().chain(&last) {
                 (self.f.void)(b, self.f.s_release);
             }
         }
@@ -1156,6 +1168,7 @@ impl MetalBackend {
         let mut ops: Vec<MOp> = Vec::new();
         let mut part_floats = 0usize;
         let mut owned: Vec<Id> = Vec::new();
+        let mut shared: Vec<Id> = Vec::new();
         let mut indirect: Vec<Id> = Vec::new();
         let mut head_from = usize::MAX;
         let (mut rd, mut wr): (Vec<Range>, Vec<Range>) = (Vec::new(), Vec::new());
@@ -1415,7 +1428,7 @@ impl MetalBackend {
                     if mt && ex.edits.is_some() {
                         return None;
                     }
-                    let (tabs, fused, g, d, pf) = self.expert_tables(ex, &mut owned, &mut indirect)?;
+                    let (tabs, fused, g, d, pf) = self.expert_tables(ex, &mut owned, &mut shared, &mut indirect)?;
                     let edit = match ex.edits {
                         Some((v, n)) => Some((self.named_pipeline("dec_neuron_edit")?, byte(v), n as u32)),
                         None => None,
@@ -1518,9 +1531,6 @@ impl MetalBackend {
                     (r, vec![rng(out, n)])
                 }
                 Op::HcPre { gate, xn, out, n, hc } => {
-                    if mt {
-                        return None;
-                    }
                     emit.push(MOp::Ew {
                         pipe: self.named_pipeline("dec_ew")?,
                         a: byte(gate),
@@ -1528,14 +1538,18 @@ impl MetalBackend {
                         out: byte(out),
                         n: n as u32,
                         p: [4.0, hc as f32, 0.0, 1.0 / hc as f32],
-                        t: None,
+                        t: if mt {
+                            Some((
+                                self.named_pipeline("dec_ew_t")?,
+                                [ts(gate) as u32, ts(xn) as u32, ts(out) as u32, 0],
+                            ))
+                        } else {
+                            None
+                        },
                     });
                     (vec![rng(gate, hc * n), rng(xn, hc * n)], vec![rng(out, n)])
                 }
                 Op::HcPost { x, y, inj, n, hc } => {
-                    if mt {
-                        return None;
-                    }
                     emit.push(MOp::Ew {
                         pipe: self.named_pipeline("dec_ew")?,
                         a: byte(y),
@@ -1543,14 +1557,15 @@ impl MetalBackend {
                         out: byte(x),
                         n: (hc * n) as u32,
                         p: [5.0, n as f32, 1.0 / hc as f32, 0.0],
-                        t: None,
+                        t: if mt {
+                            Some((self.named_pipeline("dec_ew_t")?, [ts(y) as u32, ts(inj) as u32, ts(x) as u32, 0]))
+                        } else {
+                            None
+                        },
                     });
                     (vec![rng(y, n), rng(inj, hc), rng(x, hc * n)], vec![rng(x, hc * n)])
                 }
                 Op::PleGate { k, q, v, out, n, hc } => {
-                    if mt {
-                        return None;
-                    }
                     emit.push(MOp::PleGate {
                         pipe: self.named_pipeline("dec_ple_gate")?,
                         k: byte(k),
@@ -1559,6 +1574,14 @@ impl MetalBackend {
                         out: byte(out),
                         n: n as u32,
                         hc: hc as u32,
+                        t: if mt {
+                            Some((
+                                self.named_pipeline("dec_ple_gate_t")?,
+                                [ts(k) as u32, ts(q) as u32, ts(v) as u32, ts(out) as u32],
+                            ))
+                        } else {
+                            None
+                        },
                     });
                     (vec![rng(k, hc * n), rng(q, hc * n), rng(v, n)], vec![rng(out, hc * n)])
                 }
@@ -1824,6 +1847,7 @@ impl MetalBackend {
             consts: cbuf,
             part,
             owned,
+            shared,
             indirect,
             ops,
             head_from,
@@ -1866,6 +1890,7 @@ impl MetalBackend {
         &self,
         ex: &crate::gpu::decode::Experts,
         owned: &mut Vec<Id>,
+        shared: &mut Vec<Id>,
         indirect: &mut Vec<Id>,
     ) -> Option<([Id; 3], bool, (u32, u32), (u32, u32), (MvFmt, MvFmt))> {
         let n = ex.gate.len();
@@ -1933,10 +1958,10 @@ impl MetalBackend {
         }
         let mut addr = Vec::with_capacity(spans.len());
         for &(s, e) in &spans {
-            let b = self.wrap(s as *const u8, e - s)?;
-            addr.push(self.gpu_address(&b));
-            owned.push(b.id);
-            indirect.push(b.id);
+            let (id, a) = self.wrap_shared(s as *const u8, e - s)?;
+            addr.push(a);
+            shared.push(id);
+            indirect.push(id);
         }
         let at = |p: usize| {
             let i = spans.partition_point(|&(s, _)| s <= p) - 1;
@@ -2412,7 +2437,27 @@ impl MetalPlan<'_> {
                     }
                 }
             }
-            MOp::Experts { .. } | MOp::Steer { .. } | MOp::NeuronEdit { .. } | MOp::PleGate { .. } => {
+            MOp::PleGate {
+                k,
+                q,
+                v,
+                out,
+                n,
+                hc,
+                t: tk,
+                ..
+            } => {
+                let (pipe, ts) = tk.expect("multi-token n-gram gate");
+                e.pipe(pipe);
+                e.buf(arena, *k, 0);
+                e.buf(arena, *q, 1);
+                e.buf(arena, *v, 2);
+                e.buf(arena, *out, 3);
+                e.bytes(&[*n, *hc], 4);
+                e.bytes(&ts, 5);
+                e.dispatch((*hc as usize, t), 1024);
+            }
+            MOp::Experts { .. } | MOp::Steer { .. } | MOp::NeuronEdit { .. } => {
                 unreachable!("single-token op in a multi-token plan")
             }
         }
@@ -2747,7 +2792,9 @@ impl DecodePlan for MetalPlan<'_> {
                         e.bytes(n, 4);
                         e.dispatch(((*n as usize).div_ceil(256), 1), 256);
                     }
-                    MOp::PleGate { pipe, k, q, v, out, n, hc } => {
+                    MOp::PleGate {
+                        pipe, k, q, v, out, n, hc, ..
+                    } => {
                         e.pipe(*pipe);
                         e.buf(arena, *k, 0);
                         e.buf(arena, *q, 1);

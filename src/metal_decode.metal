@@ -1097,12 +1097,11 @@ kernel void dec_topk(device const float* logits [[buffer(0)]], device float* sel
 
 #pragma clang fp reassociate(off)
 // ---- Elementwise: p.x = 0 scale (a * p.y), 1 softcap (tanh(a / p.y) * p.y), 2 combine
-// ((a * p.y + b * p.z) * p.w).
-kernel void dec_ew(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], device float* out [[buffer(2)]],
-                   constant float4& p [[buffer(3)]], constant uint& n [[buffer(4)]], uint i [[thread_position_in_grid]]) {
-    if (i >= n) return;
+// ((a * p.y + b * p.z) * p.w), 3 silu(a * p.y), 4 hyper-connection read (out = p.w * sum over
+// p.y streams of sigmoid(a) * b, streams n apart), 5 hyper-connection write (out[s m + i] +=
+// a[i] * 2 sigmoid(b[s] * p.z), m = p.y).
+inline void ew_body(device const float* a, device const float* b, device float* out, constant float4& p, uint n, uint i) {
     if (p.x == 4.f) {
-        // Hyper-connection read: out = mean over the p.y streams of sigmoid(gate) * xn.
         uint hc = (uint)p.y;
         float s = 0.f;
         for (uint j = 0; j < hc; j++) {
@@ -1113,7 +1112,6 @@ kernel void dec_ew(device const float* a [[buffer(0)]], device const float* b [[
         return;
     }
     if (p.x == 5.f) {
-        // Hyper-connection write: x[s n + i] += y[i] * 2 sigmoid(inj[s] / hc), n = hc * p.y.
         uint m = (uint)p.y;
         uint s = i / m;
         float w = 2.0f / (1.0f + precise::exp(-b[s] * p.z));
@@ -1126,6 +1124,11 @@ kernel void dec_ew(device const float* a [[buffer(0)]], device const float* b [[
     else if (p.x == 3.f) { float u = v * p.y; out[i] = u / (1.0f + precise::exp(-u)); }
     else out[i] = (v * p.y + b[i] * p.z) * p.w;
 }
+kernel void dec_ew(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], device float* out [[buffer(2)]],
+                   constant float4& p [[buffer(3)]], constant uint& n [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+    if (i >= n) return;
+    ew_body(a, b, out, p, n, i);
+}
 
 // Several tokens (grid y): ts = strides of a, b, out.
 kernel void dec_ew_t(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], device float* out [[buffer(2)]],
@@ -1133,11 +1136,7 @@ kernel void dec_ew_t(device const float* a [[buffer(0)]], device const float* b 
                      uint2 gid [[thread_position_in_grid]]) {
     uint i = gid.x, t = gid.y;
     if (i >= n) return;
-    float v = a[(ulong)t * ts.x + i];
-    device float* o = out + (ulong)t * ts.z;
-    if (p.x == 0.f) o[i] = v * p.y;
-    else if (p.x == 1.f) o[i] = precise::tanh(v / p.y) * p.y;
-    else o[i] = (v * p.y + b[(ulong)t * ts.y + i] * p.z) * p.w;
+    ew_body(a + (ulong)t * ts.x, b + (ulong)t * ts.y, out + (ulong)t * ts.z, p, n, i);
 }
 
 // ---- x = (x + rmsnorm(y) * wy) * scale, then optionally out = rmsnorm(x) * wn; one threadgroup,
@@ -1284,4 +1283,25 @@ kernel void dec_ple_gate(device const float* k [[buffer(0)]], device const float
     float sig = 1.0f / (1.0f + precise::exp(-g));
     device float* o = out + (ulong)s * n;
     for (uint i = tid; i < n; i += nt) o[i] = sig * v[i];
+}
+// Several tokens (grid y): ts = strides of k, q, v, out.
+kernel void dec_ple_gate_t(device const float* k [[buffer(0)]], device const float* q [[buffer(1)]], device const float* v [[buffer(2)]],
+                           device float* out [[buffer(3)]], constant uint2& p [[buffer(4)]], constant uint4& ts [[buffer(5)]],
+                           uint2 tg [[threadgroup_position_in_grid]], uint2 tid2 [[thread_position_in_threadgroup]],
+                           uint2 nt2 [[threads_per_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[32];
+    uint tid = tid2.x, nt = nt2.x;
+    uint n = p.x, s = tg.x, t = tg.y;
+    device const float* ks = k + (ulong)t * ts.x + (ulong)s * n;
+    device const float* qs = q + (ulong)t * ts.y + (ulong)s * n;
+    device const float* vs = v + (ulong)t * ts.z;
+    float acc = 0.f;
+    for (uint i = tid; i < n; i += nt) acc += ks[i] * qs[i];
+    float a = tg_total(acc, nt, sg, lane, red) / sqrt((float)n);
+    float m = sqrt(max(fabs(a), 1e-6f));
+    float g = a > 0.f ? m : (a < 0.f ? -m : 0.f);
+    float sig = 1.0f / (1.0f + precise::exp(-g));
+    device float* o = out + (ulong)t * ts.w + (ulong)s * n;
+    for (uint i = tid; i < n; i += nt) o[i] = sig * vs[i];
 }

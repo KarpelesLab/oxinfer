@@ -362,6 +362,8 @@ pub struct ExpSession {
     idx: Vec<Option<IdxCache>>,
     ratio: usize,
     w: usize,
+    /// The layer the n-gram block precedes (its conv state comes before that layer's states).
+    ple_layer: Option<usize>,
     /// The residual streams (`[t, hc * h]`) after the last layer of the last forward (what the MTP
     /// head reads).
     pub(crate) last_wide: Vec<f32>,
@@ -369,6 +371,14 @@ pub struct ExpSession {
 
 impl ExpSession {
     /// Rewinds to `pos` tokens; `rec`: the span the last forward recorded.
+    /// Drops the n-gram contexts and indexer keys of positions from `pos` on.
+    pub(crate) fn rewind_keys(&mut self, pos: usize) {
+        self.toks.truncate(pos);
+        for c in self.idx.iter_mut().flatten() {
+            c.truncate(pos, self.ratio);
+        }
+    }
+
     pub(crate) fn rewind(&mut self, pos: usize, rec: Option<(usize, usize)>) -> Result<()> {
         if pos >= self.toks.len() {
             return Ok(());
@@ -462,6 +472,7 @@ impl<'a> Exp<'a> {
                 .collect(),
             ratio: cfg.indexer_compress_ratio.max(1),
             w,
+            ple_layer: self.ple.as_ref().map(|p| p.layer),
             last_wide: Vec::new(),
         }
     }
@@ -927,7 +938,7 @@ impl<'a> QwenModel<'a> {
     /// mixes and writes, the n-gram block (its embedding rows gathered on the host: the second
     /// input), Gated DeltaNet, the attention layers densely (valid up to [`dense_limit`] tokens),
     /// the MoE blocks. The indexer keys of the attention layers are captured for the host cache.
-    pub(crate) fn exp_gpu_graph<'s>(&'s self, ex: &'s Exp<'s>) -> Option<crate::gpu::decode::Graph<'s>> {
+    pub(crate) fn exp_gpu_graph<'s>(&'s self, ex: &'s Exp<'s>, multi: bool) -> Option<crate::gpu::decode::Graph<'s>> {
         use crate::gpu::decode::{Ew, Experts, Graph, LinMode, Op};
         use crate::qwen::{Ffn, Mixer};
         let cfg = &self.cfg;
@@ -1095,6 +1106,12 @@ impl<'a> QwenModel<'a> {
             mix(&mut g, &el.attn_hc, hn)?;
             match &layer.mixer {
                 Mixer::Gdn(gd) => {
+                    // Multi-token plans keep each recurrent layer's inputs in its own buffers (replays).
+                    let (gproj, gconv) = if multi {
+                        (g.buf(conv_dim + value_dim + 2 * nv), g.buf(conv_dim))
+                    } else {
+                        (gproj, gconv)
+                    };
                     let st = g.states.len();
                     g.states.push(nv * hdk * hdv);
                     g.states.push((cfg.linear_conv_kernel_dim - 1) * conv_dim);
@@ -1487,4 +1504,147 @@ pub fn ngram_table_bytes(path: &std::path::Path) -> u64 {
 pub fn too_big(path: &std::path::Path) -> bool {
     let bytes = crate::safetensors::checkpoint_bytes(path).saturating_sub(ngram_table_bytes(path));
     crate::platform::total_memory().is_some_and(|m| bytes as f64 > 0.75 * m as f64)
+}
+
+impl QwenSession {
+    /// The recurrent states in GPU plan order: per layer, the n-gram block's conv state (Qwen4-Exp,
+    /// before its layer) then the Gated DeltaNet rule and conv states.
+    pub(crate) fn recurrent_states(&mut self) -> Vec<&mut [f32]> {
+        let QwenSession { gdn, exp, .. } = self;
+        recurrent_states_of(gdn, exp.as_deref_mut())
+    }
+}
+
+pub(crate) fn recurrent_states_of<'s>(gdn: &'s mut [Option<crate::qwen::GdnState>], exp: Option<&'s mut ExpSession>) -> Vec<&'s mut [f32]> {
+    {
+        let ple = exp.as_ref().and_then(|e| e.ple_layer);
+        let mut ple_conv = exp.filter(|_| ple.is_some()).map(|e| &mut e.ple_conv[..]);
+        let mut v: Vec<&mut [f32]> = Vec::new();
+        for (l, g) in gdn.iter_mut().enumerate() {
+            if ple == Some(l)
+                && let Some(p) = ple_conv.take()
+            {
+                v.push(p);
+            }
+            if let Some(g) = g {
+                v.push(&mut g.s[..]);
+                v.push(&mut g.conv[..]);
+            }
+        }
+        v
+    }
+}
+
+impl<'a> QwenModel<'a> {
+    /// The n-gram embedding rows (`[t, e]`) of the last `t` tokens of `toks`.
+    fn ngram_rows(&self, ex: &Exp<'a>, toks: &[u32], t: usize) -> Vec<f32> {
+        let Some(p) = &ex.ple else { return Vec::new() };
+        let mut out = vec![0f32; t * p.e];
+        let mut rows = Vec::new();
+        for j in 0..t {
+            rows.clear();
+            p.rows(toks, toks.len() - t + j, &mut rows);
+            for (i, &r) in rows.iter().enumerate() {
+                let o = j * p.e + i * p.table.dim;
+                p.table.row(r, &mut out[o..o + p.table.dim]);
+            }
+        }
+        out
+    }
+
+    /// A speculative verification of `tokens` on the multi-token GPU plan (see
+    /// `QwenModel::gpu_verify_hidden`): the mixed hidden states and the logits, the session
+    /// advanced (indexer keys, n-gram contexts and the MTP head's residual streams included) and
+    /// what a rewind inside the pass needs recorded.
+    pub(crate) fn exp_gpu_pass(&self, ex: &Exp<'a>, sess: &mut QwenSession, tokens: &[u32], fast: bool) -> Option<(Vec<f32>, Vec<f32>)> {
+        use crate::qwen::Mixer;
+        let cfg = &self.cfg;
+        let t = tokens.len();
+        if sess.pos + t > dense_limit(cfg) || !sess.spans.is_empty() {
+            return None;
+        }
+        let plan = self.gpu_multi_plan_pub(t, fast)?;
+        let (h, d) = (cfg.hidden_size, cfg.indexer_head_dim);
+        let w = cfg.hc_count * h;
+        let pos = sess.pos;
+        let mut x = vec![0f32; t * h];
+        for (j, &tok) in tokens.iter().enumerate() {
+            self.embed.row(tok as usize, &mut x[j * h..(j + 1) * h]);
+        }
+        let half = self.inv_freq.len();
+        let (cos, sin) = self.rope_cs(&sess.spans, pos, t);
+        let mut cs = Vec::with_capacity(2 * t * half);
+        for j in 0..t {
+            cs.extend_from_slice(&cos[j * half..(j + 1) * half]);
+            cs.extend_from_slice(&sin[j * half..(j + 1) * half]);
+        }
+        let x2 = {
+            let es = sess.exp.as_mut()?;
+            es.toks.truncate(pos);
+            es.toks.extend_from_slice(tokens);
+            self.ngram_rows(ex, &es.toks, t)
+        };
+        let n_attn = self.layers.iter().filter(|l| matches!(l.mixer, Mixer::Attn(_))).count();
+        let nc = n_attn * d + w;
+        let mut captured = vec![0f32; t * nc];
+        let mut hidden = vec![0f32; t * h];
+        let mut logits = vec![0f32; t * cfg.vocab_size];
+        let mut snap = sess.gpu_rec.take().map(|r| r.states).unwrap_or_default();
+        if t > 1 {
+            let src = sess.recurrent_states();
+            snap.resize_with(src.len(), Vec::new);
+            for (dst, s) in snap.iter_mut().zip(&src) {
+                dst.clear();
+                dst.extend_from_slice(s);
+            }
+        }
+        let ok = {
+            let _timer = crate::prof::start(crate::prof::Cat::Matmul);
+            let QwenSession { kv, gpu, gdn, exp, .. } = sess;
+            let mut kv: Vec<&mut LayerCache> = kv.iter_mut().flatten().collect();
+            let mut states = recurrent_states_of(gdn, exp.as_deref_mut());
+            plan.step(
+                gpu,
+                crate::gpu::decode::Step {
+                    pos,
+                    t,
+                    rope_cs: &cs,
+                    x: &x,
+                    x2: &x2,
+                    kv: &mut kv,
+                    states: &mut states,
+                    hidden: &mut hidden,
+                    logits: Some(&mut logits),
+                    params: None,
+                    capture: Some(&mut captured),
+                    scratch: false,
+                },
+            )
+        };
+        let es = sess.exp.as_mut()?;
+        if !ok {
+            es.toks.truncate(pos);
+            return None;
+        }
+        for (ai, c) in es.idx.iter_mut().flatten().enumerate() {
+            c.raw.truncate(pos * d);
+            for j in 0..t {
+                c.raw.extend_from_slice(&captured[j * nc + ai * d..j * nc + (ai + 1) * d]);
+            }
+            c.pooled.truncate(pos / es.ratio * d);
+        }
+        es.last_wide.clear();
+        for j in 0..t {
+            es.last_wide.extend_from_slice(&captured[j * nc + n_attn * d..(j + 1) * nc]);
+        }
+        sess.rec_span = None;
+        sess.gpu_rec = (t > 1).then_some(crate::qwen::GpuRec {
+            plan,
+            start: pos,
+            len: t,
+            states: snap,
+        });
+        sess.pos += t;
+        Some((hidden, logits))
+    }
 }

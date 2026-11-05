@@ -366,12 +366,12 @@ pub fn mrope_positions(spans: &[VisionSpan], start: usize, t: usize) -> Vec<[usi
 /// A multi-token GPU pass of a session (see [`QwenModel::gpu_verify`]): its plan, its span, and
 /// the recurrent states from before it.
 #[derive(Clone)]
-struct GpuRec {
-    plan: std::sync::Arc<dyn crate::gpu::decode::DecodePlan>,
-    start: usize,
-    len: usize,
+pub(crate) struct GpuRec {
+    pub(crate) plan: std::sync::Arc<dyn crate::gpu::decode::DecodePlan>,
+    pub(crate) start: usize,
+    pub(crate) len: usize,
     /// Gated DeltaNet delta-rule and conv states before the pass, in the plan's state order.
-    states: Vec<Vec<f32>>,
+    pub(crate) states: Vec<Vec<f32>>,
 }
 
 #[derive(Clone)]
@@ -383,7 +383,7 @@ pub struct QwenSession {
     pub(crate) rec_span: Option<(usize, usize)>,
     /// The last forward when it was a multi-token GPU pass (speculative verification): what a
     /// rewind inside it needs.
-    gpu_rec: Option<GpuRec>,
+    pub(crate) gpu_rec: Option<GpuRec>,
     /// Vision token runs of the conversation (M-RoPE), sorted by start.
     pub(crate) spans: Vec<VisionSpan>,
     pub pos: usize,
@@ -428,7 +428,12 @@ impl QwenSession {
             return Ok(());
         }
         if let Some(e) = &mut self.exp {
-            e.rewind(pos, self.rec_span)?;
+            // After a GPU pass the n-gram conv state is replayed with the recurrent states below.
+            if self.gpu_rec.is_some() {
+                e.rewind_keys(pos);
+            } else {
+                e.rewind(pos, self.rec_span)?;
+            }
         }
         let has_gdn = self.gdn.iter().any(|g| g.is_some());
         if has_gdn && let Some(r) = self.gpu_rec.take() {
@@ -437,16 +442,12 @@ impl QwenSession {
             if pos <= r.start || pos > r.start + r.len {
                 bail!("cannot rewind to {pos}: the GPU pass covered {}..{}", r.start, r.start + r.len);
             }
-            let mut states: Vec<&mut [f32]> = self
-                .gdn
-                .iter_mut()
-                .flatten()
-                .flat_map(|g| [&mut g.s[..], &mut g.conv[..]])
-                .collect();
+            let QwenSession { gdn, exp, gpu, .. } = self;
+            let mut states = crate::qwen4exp::recurrent_states_of(gdn, exp.as_deref_mut());
             for (st, s0) in states.iter_mut().zip(&r.states) {
                 st.copy_from_slice(s0);
             }
-            if !r.plan.replay_recurrent(&mut self.gpu, &mut states, pos - r.start) {
+            if !r.plan.replay_recurrent(gpu, &mut states, pos - r.start) {
                 bail!("cannot rewind the recurrent state to {pos}: the GPU replay failed");
             }
         } else if has_gdn {
@@ -971,8 +972,9 @@ impl<'a> QwenModel<'a> {
         use crate::gpu::decode::{Graph, LinMode, Op};
         use crate::intervene::GpuNeurons;
         if let Some(ex) = &self.exp {
-            return if multi.is_none() && lay.is_none() {
-                self.exp_gpu_graph(ex)
+            // Multi-token plans of Qwen4-Exp: speculative verification only (no capture layers).
+            return if lay.is_none() && multi.is_none_or(|m| m.is_empty()) {
+                self.exp_gpu_graph(ex, multi.is_some())
             } else {
                 None
             };
@@ -1373,6 +1375,19 @@ impl<'a> QwenModel<'a> {
     /// The multi-token GPU plan capturing the outputs of `layers` (sorted), compiled on first use
     /// (`fast`: on the batched fast-verification kernels, see
     /// [`crate::gpu::Backend::decode_plan_multi_fast`]).
+    /// The multi-token plan without captured layers for a pass of `t` tokens (the smallest of 1,
+    /// 8 and [`MULTI_TOKENS`] that holds them).
+    pub(crate) fn gpu_multi_plan_pub(&self, t: usize, fast: bool) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
+        let n = if t == 1 {
+            1
+        } else if t <= 8 {
+            8
+        } else {
+            MULTI_TOKENS
+        };
+        (t <= MULTI_TOKENS).then(|| self.gpu_multi_plan(&[], n, fast))?
+    }
+
     fn gpu_multi_plan(&self, layers: &[usize], tokens: usize, fast: bool) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
         if !crate::gpu::decode_enabled() || self.stream.is_some() {
             return None;
@@ -1427,6 +1442,13 @@ impl<'a> QwenModel<'a> {
         let t = tokens.len();
         if t == 0 || t > MULTI_TOKENS || sess.iv.active() || sess.positions.is_some() || layers.contains(&0) {
             return None;
+        }
+        if let Some(ex) = &self.exp {
+            return if layers.is_empty() {
+                self.exp_gpu_pass(ex, sess, tokens, fast)
+            } else {
+                None
+            };
         }
         let mut cap: Vec<usize> = layers.iter().map(|&l| l - 1).collect();
         cap.sort_unstable();
