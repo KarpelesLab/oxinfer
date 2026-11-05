@@ -1560,7 +1560,7 @@ fn run_qwen(mut args: Args) -> Result<()> {
         // Qwen4-Exp: the n-gram table (tens of GB) is read a few rows per token, so the files are
         // always mapped; a checkpoint larger than most of RAM streams as Mistral Large 4's does.
         let size: u64 = oxinfer::safetensors::checkpoint_bytes(&args.model);
-        let too_big = oxinfer::mistral4::too_big(size);
+        let too_big = oxinfer::qwen4exp::too_big(&args.model);
         if too_big && !args.stream && !args.mmap && !args.no_stream {
             let budget = oxinfer::mistral4::default_stream().cache_budget.unwrap_or(0) as f64 / 1e9;
             args.cache_budget_gb = Some(args.cache_budget_gb.unwrap_or(budget));

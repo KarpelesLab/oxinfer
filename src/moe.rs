@@ -72,6 +72,10 @@ pub(crate) struct Experts<'a> {
     pub act: Act,
     /// Accelerator state (`Backend::upload_moe`), made on first use.
     dev: std::sync::OnceLock<Option<crate::gpu::DeviceWeight>>,
+    /// Prefill wraps only the experts a pass routes to, for that pass (as for streamed experts),
+    /// rather than keeping all of them wrapped: set for expert sets too large to be wrapped twice
+    /// (prefill and the GPU decode plan each wrap what they use).
+    pub(crate) wrap_per_pass: std::sync::atomic::AtomicBool,
 }
 
 /// Indices and renormalized weights of the top-k experts of one token (softmax over all experts,
@@ -144,6 +148,7 @@ impl<'a> Experts<'a> {
             inter: mi,
             act,
             dev: std::sync::OnceLock::new(),
+            wrap_per_pass: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -208,7 +213,8 @@ impl<'a> Experts<'a> {
         // a prefill pass wraps the experts it routes to for its own submission, which reads them
         // in place. Only those: a wrapped page must be in memory while the submission runs, so
         // wrapping the others would read every expert of the layer from storage.
-        if self.down.iter().any(|l| l.is_transient())
+        if self.wrap_per_pass.load(std::sync::atomic::Ordering::Relaxed)
+            || self.down.iter().any(|l| l.is_transient())
             || self.gate_up.iter().any(|g| match g {
                 GateUp::Fused(l) => l.is_transient(),
                 GateUp::Split(a, b) => a.is_transient() || b.is_transient(),

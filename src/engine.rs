@@ -1149,8 +1149,11 @@ impl Engine {
         // larger than most of RAM (its routed experts are read through the page cache).
         // Qwen4-Exp reads its n-gram table (tens of GB) a few rows per token: always mapped.
         let exp = model_type.starts_with("qwen4_exp");
-        let too_big = (exp || matches!(family, Family::Mistral4 | Family::DeepSeek4))
-            && crate::mistral4::too_big(crate::safetensors::checkpoint_bytes(&dir));
+        let too_big = if exp {
+            crate::qwen4exp::too_big(&dir)
+        } else {
+            matches!(family, Family::Mistral4 | Family::DeepSeek4) && crate::mistral4::too_big(crate::safetensors::checkpoint_bytes(&dir))
+        };
         // Too big for memory: streamed with a page-cache budget unless told otherwise
         // (2.5-3.5x faster than demand paging on the 378 GB UD-Q2_K_XL, see the README).
         let stream = opts.effective_stream(too_big.then(crate::mistral4::default_stream));

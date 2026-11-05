@@ -340,7 +340,14 @@ impl<'a> QwenMtp<'a> {
     /// The Qwen4-Exp layer (see `crate::qwen4exp::MtpExp`): `hidden` holds residual streams
     /// (`[t, hc * H]`: the trunk's before its final mixer, or a previous step's output); returns
     /// the layer's output streams.
-    fn exp_forward(&self, e: &crate::qwen4exp::MtpExp, model: &QwenModel, sess: &mut MtpSession, hidden: &[f32], tokens: &[u32]) -> Vec<f32> {
+    fn exp_forward(
+        &self,
+        e: &crate::qwen4exp::MtpExp,
+        model: &QwenModel,
+        sess: &mut MtpSession,
+        hidden: &[f32],
+        tokens: &[u32],
+    ) -> Vec<f32> {
         use crate::qwen4exp::{combine, grouped_norm};
         let cfg = &model.cfg;
         let t = tokens.len();

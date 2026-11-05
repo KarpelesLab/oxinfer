@@ -331,11 +331,13 @@ impl Header {
         };
         let h = need("embedding_length")?;
         let head_dim = self.arch_u64("attention.key_length").unwrap_or(h / need("attention.head_count")?);
+        // A split file's first part may hold only metadata: the vocabulary's size then.
         let vocab = self
             .tensors
             .iter()
             .find(|t| t.name == "token_embd.weight")
             .map(|t| t.ne[1])
+            .or_else(|| self.get("tokenizer.ggml.tokens").and_then(Value::as_array).map(|a| a.len()))
             .context("GGUF has no token_embd.weight")?;
         let mut c = json!({
             "model_type": mt,
@@ -348,7 +350,7 @@ impl Header {
             "rms_norm_eps": self.arch_f64("attention.layer_norm_rms_epsilon").unwrap_or(if llama { 1e-5 } else { 1e-6 }),
             "vocab_size": vocab,
             "rope_theta": self.arch_f64("rope.freq_base").unwrap_or(if llama { 10_000.0 } else { 10_000_000.0 }),
-            "tie_word_embeddings": !self.has("output.weight"),
+            "tie_word_embeddings": self.has("token_embd.weight") && !self.has("output.weight"),
             "mtp_num_hidden_layers": self.arch_u64("nextn_predict_layers").unwrap_or(0),
         });
         if llama {

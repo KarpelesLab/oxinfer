@@ -545,7 +545,18 @@ pub(crate) fn run_concurrent(
         let mut ok = true;
         for &cb in &cbs {
             (f.void)(cb, f.s_wait);
-            ok &= (f.status)(cb, f.s_status) == 4;
+            let st = (f.status)(cb, f.s_status);
+            if st != 4 && std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
+                let msg0: unsafe extern "C" fn(Id, Sel) -> Id = b.o.msg_send();
+                let err = msg0(cb, b.o.sel(c"error"));
+                let s = if err.is_null() {
+                    String::new()
+                } else {
+                    b.o.nsstring_to_string(msg0(err, b.o.sel(c"localizedDescription")))
+                };
+                eprintln!("[metal decode: command buffer status {st}: {s}]");
+            }
+            ok &= st == 4;
         }
         let mut g = 0.0;
         if trace() && !cbs.is_empty() {

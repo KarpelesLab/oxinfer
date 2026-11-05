@@ -713,6 +713,20 @@ impl<'a> QwenModel<'a> {
         } else {
             None
         };
+        // Routed experts beyond a third of memory: prefill wraps the experts of each pass rather
+        // than all of them, which the GPU decode plan wraps again (wired twice, the device runs
+        // out of memory: Qwen3.8-Flash-Next's 78 GB at Q4).
+        let expert_bytes: usize = layers
+            .iter()
+            .map(|l| l.ffn.expert_lins().iter().flatten().map(|w| w.bytes()).sum::<usize>())
+            .sum();
+        if crate::platform::total_memory().is_some_and(|m| expert_bytes as f64 > m as f64 / 3.0) {
+            for l in &layers {
+                if let Ffn::Moe(m) = &l.ffn {
+                    m.experts.wrap_per_pass.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
         Ok(Self {
             cfg,
             quant,

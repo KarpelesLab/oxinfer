@@ -795,9 +795,7 @@ impl<'a> QwenModel<'a> {
         t: usize,
         start: usize,
     ) -> Option<Vec<Option<Vec<u32>>>> {
-        let QwenSession {
-            exp, spans, positions, ..
-        } = sess;
+        let QwenSession { exp, spans, positions, .. } = sess;
         let ic = exp.as_mut().unwrap().idx[l].as_mut().expect("indexer cache");
         let (spans, positions) = (&*spans, &*positions);
         let rope_at = |p: usize, n: usize| match positions {
@@ -1297,7 +1295,12 @@ impl<'a> QwenModel<'a> {
         if sess.pos + 1 > dense_limit(cfg) || sess.iv.active() || !sess.spans.is_empty() || sess.positions.is_some() {
             return None;
         }
-        let plan = self.gpu_plan()?;
+        let Some(plan) = self.gpu_plan() else {
+            if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
+                eprintln!("[no gpu decode plan]");
+            }
+            return None;
+        };
         let h = cfg.hidden_size;
         let d = cfg.indexer_head_dim;
         let mut x = vec![0f32; h];
@@ -1358,6 +1361,9 @@ impl<'a> QwenModel<'a> {
         };
         let es = sess.exp.as_mut().unwrap();
         if !ok {
+            if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
+                eprintln!("[gpu decode step failed at {pos}]");
+            }
             es.toks.truncate(pos);
             return None;
         }
@@ -1457,4 +1463,28 @@ impl QwenModel<'_> {
             _ => hs,
         }
     }
+}
+
+/// Bytes of the n-gram embedding table in the checkpoint at `path` (a GGUF file or the first part
+/// of a split one; 0 when there is none or it cannot be told): read a few rows per token, it never
+/// needs to fit in memory.
+pub fn ngram_table_bytes(path: &std::path::Path) -> u64 {
+    if !crate::gguf::is_gguf(path) {
+        return 0;
+    }
+    let Ok(parts) = crate::gguf::split_files(path) else { return 0 };
+    parts
+        .iter()
+        .filter_map(|p| crate::gguf::read_header(p).ok())
+        .flat_map(|h| h.tensors.into_iter())
+        .filter(|t| t.name == "per_layer_token_embd.weight")
+        .map(|t| (t.end - t.start) as u64)
+        .sum()
+}
+
+/// Whether a Qwen4-Exp checkpoint is too big to hold in memory: its weights other than the n-gram
+/// table over 75% of RAM (the table is read from storage as used).
+pub fn too_big(path: &std::path::Path) -> bool {
+    let bytes = crate::safetensors::checkpoint_bytes(path).saturating_sub(ngram_table_bytes(path));
+    crate::platform::total_memory().is_some_and(|m| bytes as f64 > 0.75 * m as f64)
 }
