@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/KarpelesLab/oxinfer/compare/v0.0.7...v0.0.8) - 2026-11-05
+
+### Other
+
+- Qwen3.8-Flash-Next (model table, section with agreement and speed numbers)
+- multi-token GPU verification for MTP (shared expert wraps between plans), MTP from unsloth's GGUF heads
+- GPU decode on the real model (per-pass expert wrapping for huge MoE), auto-streaming excludes the n-gram table, split-GGUF metadata fixes, tools
+- Qwen4-Exp (Qwen3.8-Flash-Next): hyper-connections, n-gram embedding, QSA, MTP; CPU + Metal decode
+- Fast verification by default; --exact-verify opts out; Q4 Gemma 4 31B / Qwen3.8-27B drafts default with it
+- Gemma 4 26B-A4B (MoE) measured on CUDA
+- Fast verification: README speed / drift tables, C header key, CLI banner, specialized Q5_K / Q6_K loaders
+- Fast verification (opt-in): batched simdgroup-matrix matmuls for speculative verification
+- FLUX Kontext, Qwen-Image and Step1X-Edit measured on CUDA
+- httpsd 0.2.0; drop the 20 s late-response workaround, --max-body-mb sets httpsd's limit
+- Build the binary without the `media` feature again (wasi)
+- Start-up banner: only claim GPU decoding for a backend that has it
+- Speculative decoding defaults: DSpark for Qwen3 4B / 8B / 14B and Gemma 4 12B, MTP for Qwen3.5-4B / 9B; README
+- DSpark / MTP: faster exact GPU verification, MoE multi-token passes, cost-aware rounds, GGUF drafts, draft discovery
+- OpenAI-compatible server: oxinfer serve, oxinfer::server (httpsd), Engine::chat, C API
+- no-reassociation only where decoding plans need it
+- DSpark drafts for Qwen and Gemma 4 (agreement, acceptance, speed, CLI)
+- Qwen3 / Qwen3.5 / 3.8 and Gemma 4 drafts; multi-token GPU verification
+- DeepSeek V4: README section (architecture, checkpoints, agreement, speed, DSpark) and engine docs
+- DeepSeek V4: NEON MXFP4 kernel, draft mapped when the target streams, 3 drafts per round by default
+- DeepSeek V4: DSpark draft (DeepSeek V4 stages behind dspark::Target), per-group wo_a on the decode kernels
+- DeepSeek V4: GGUF tokenizer specials in the BPE vocabulary; streamed MoE prefill wraps only the routed experts
+- DeepSeek V4: text model (mHC, CSA / HCA compressed attention, lightning indexer, hash and clamped-SwiGLU MoE), GGUF and DeepSeek-layout checkpoints, MXFP4
+- Mistral Large 4: short-prompt prefill on Metal, bounded DSpark context, draft on the GPU
+- Mistral Large 4: DSpark speculative decoding, on by default with the draft beside the GGUF
+- record what was measured on the RTX 5080
+- list the weight formats in the module docs
+- FP8 E4M3 GEMMs (f32 and matrix units, dense and grouped MoE)
+- Mistral Large 4: explicit mmproj option, tri-state weight streaming
+- Mistral Large 4: runtime interventions (residual hooks, dense / shared / routed expert neurons)
+- make the context current per call; direct tests of every kernel
+- A device asked for by name no longer falls back to the CPU
+- fix NVRTC kernel compilation, load native binaries; first run on NVIDIA
+
 ## [0.0.7](https://github.com/KarpelesLab/oxinfer/compare/v0.0.6...v0.0.7) - 2026-11-01
 
 ### Other
