@@ -2,7 +2,9 @@
 //! `dlsym`, so the binary has no CUDA dependency and runs unchanged on machines without a GPU.
 //! The GEMM kernels are compiled from source by NVRTC for the detected compute capability.
 //!
-//! Only prefill-sized matmuls are offloaded (see `wants`): weights are copied to device memory
+//! Only prefill-sized work is offloaded (see `wants`): matmuls, convolutions, attention, and the
+//! routed experts of MoE layers (gathered per expert, one GEMM pair per expert, combined on the
+//! device; a layer's experts go up all at once or not at all). Weights are copied to device memory
 //! the first time a layer is used (skipped when VRAM is short, that layer then stays on the CPU),
 //! activations are copied up and results down per batch. Discrete GPUs pay for those transfers,
 //! so the threshold is higher than Metal's. Decode stays on the CPU.
@@ -272,8 +274,49 @@ extern "C" __global__ void softmax_rows(float* s, unsigned int cols, unsigned in
     float inv = 1.f / warp_sum(sum);
     for (unsigned int i = threadIdx.x; i < ld; i += 32) row[i] = i < lim ? row[i] * inv : 0.f;
 }
+
+// MoE experts. Gather: row r of the per-expert segments is token src[r] (t: a padding row, zero).
+extern "C" __global__ void moe_gather(const float* x, const unsigned int* src, float* xs, unsigned int h, unsigned int t) {
+    unsigned int r = blockIdx.y, s = src[r];
+    for (unsigned int c = blockIdx.x * blockDim.x + threadIdx.x; c < h; c += gridDim.x * blockDim.x)
+        xs[(size_t)r * h + c] = s < t ? x[(size_t)s * h + c] : 0.f;
+}
+// a = act(gate) * up over [rows, mi]: gate and up side by side per row ([rows, 2 mi]), or with
+// `split` gate rows [rows, mi] then up rows [rows, mi]. kind: 0 SiLU, 1 tanh GELU, 2 clamped SiLU.
+extern "C" __global__ void moe_act(const float* gu, float* a, unsigned int rows, unsigned int mi, unsigned int split, unsigned int kind, float limit) {
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (size_t)rows * mi) return;
+    size_t r = i / mi, j = i % mi;
+    float g, u;
+    if (split) { g = gu[i]; u = gu[(size_t)rows * mi + i]; }
+    else { g = gu[r * 2 * mi + j]; u = gu[r * 2 * mi + mi + j]; }
+    float v;
+    if (kind == 1) {
+        float k = 1.5957692f * (g + 0.044715f * g * g * g);
+        v = g / (1.f + expf(-k));
+    } else {
+        if (kind == 2) { g = fminf(g, limit); u = fminf(fmaxf(u, -limit), limit); }
+        v = g / (1.f + expf(-g));
+    }
+    a[i] = v * u;
+}
+// y[t] += weight * o[row] for each of token t's k (row, weight bits) slots, in order, unfused
+// (the CPU's axpy).
+extern "C" __global__ void moe_combine(const float* o, const unsigned int* slots, float* y, unsigned int h, unsigned int k) {
+    unsigned int t = blockIdx.y;
+    for (unsigned int c = blockIdx.x * blockDim.x + threadIdx.x; c < h; c += gridDim.x * blockDim.x) {
+        float acc = y[(size_t)t * h + c];
+        for (unsigned int j = 0; j < k; j++) {
+            unsigned int row = slots[2 * (t * k + j)];
+            float w = __uint_as_float(slots[2 * (t * k + j) + 1]);
+            acc = __fadd_rn(acc, __fmul_rn(w, o[(size_t)row * h + c]));
+        }
+        y[(size_t)t * h + c] = acc;
+    }
+}
 "#;
 
+#[derive(Clone, Copy)]
 struct CudaWeight {
     data: u64,
     scales: u64,
@@ -283,6 +326,7 @@ struct CudaWeight {
     gk: u32,
 }
 
+#[derive(Default)]
 struct Staging {
     x: u64,
     x_cap: usize,
@@ -297,7 +341,29 @@ struct Staging {
     av: (u64, usize),
     asc: (u64, usize),
     ao: (u64, usize),
+    /// MoE: input, gather sources, gathered rows, gate/up outputs, activations, expert outputs,
+    /// combination slots.
+    mx: (u64, usize),
+    msrc: (u64, usize),
+    mxs: (u64, usize),
+    mgu: (u64, usize),
+    ma: (u64, usize),
+    mo: (u64, usize),
+    mslots: (u64, usize),
 }
+
+/// The routed experts of one MoE layer in device memory (`upload_moe`): per expert the gate/up
+/// projection (fused `[2 mi, h]`, or the gate `[mi, h]` with `up` holding the up projections) and
+/// the down projection, each projection's GEMM kernel (one format per projection).
+struct MoeDev {
+    gu: Vec<CudaWeight>,
+    up: Option<Vec<CudaWeight>>,
+    down: Vec<CudaWeight>,
+    funcs: [*mut c_void; 3],
+    act: crate::gpu::MoeAct,
+}
+unsafe impl Send for MoeDev {}
+unsafe impl Sync for MoeDev {}
 
 #[derive(Default)]
 struct Stats {
@@ -320,6 +386,8 @@ pub struct CudaBackend {
     conv_funcs: [*mut c_void; 3],
     /// gemm_f32, group_stats, row_stats, softmax_rows.
     aux_funcs: [*mut c_void; 4],
+    /// moe_gather, moe_act, moe_combine.
+    moe_funcs: [*mut c_void; 3],
     staging: Mutex<Staging>,
     stats: Stats,
     name: String,
@@ -430,6 +498,14 @@ impl CudaBackend {
                 "cuModuleGetFunction",
             )?;
         }
+        let mut moe_funcs = [std::ptr::null_mut(); 3];
+        for (i, fname) in [c"moe_gather", c"moe_act", c"moe_combine"].iter().enumerate() {
+            check(
+                &cu,
+                unsafe { cu.cuModuleGetFunction(&mut moe_funcs[i], module, fname.as_ptr()) },
+                "cuModuleGetFunction",
+            )?;
+        }
         let mut conv_funcs = [std::ptr::null_mut(); 3];
         for (i, fname) in [c"conv_bf", c"conv_q8", c"conv_q4"].iter().enumerate() {
             check(
@@ -446,19 +522,8 @@ impl CudaBackend {
             func_q4a,
             conv_funcs,
             aux_funcs,
-            staging: Mutex::new(Staging {
-                x: 0,
-                x_cap: 0,
-                y: 0,
-                y_cap: 0,
-                stats: (0, 0),
-                gb: (0, 0),
-                aq: (0, 0),
-                ak: (0, 0),
-                av: (0, 0),
-                asc: (0, 0),
-                ao: (0, 0),
-            }),
+            moe_funcs,
+            staging: Mutex::new(Staging::default()),
             stats: Stats::default(),
             name: format!("cuda (sm_{major}{minor})"),
         })
@@ -531,6 +596,109 @@ impl CudaBackend {
         }
     }
 
+    /// Device copy of one weight matrix (None for GGUF, or when VRAM is short).
+    fn upload_weight(&self, w: &WeightRef) -> Option<CudaWeight> {
+        Some(match w {
+            WeightRef::Gguf(_) => return None,
+            WeightRef::Bf16(w) => CudaWeight {
+                data: self.upload_bytes(w.as_ptr() as *const u8, w.len() * 2)?,
+                scales: 0,
+                offsets: 0,
+                gpr: 0,
+                gk: 0,
+            },
+            WeightRef::Q8(m) => {
+                let data = self.upload_bytes(m.q.as_ptr() as *const u8, m.q.len())?;
+                let scales = match self.upload_bytes(m.scales.as_ptr() as *const u8, m.scales.len() * 4) {
+                    Some(s) => s,
+                    None => {
+                        unsafe { self.cu.cuMemFree_v2(data) };
+                        return None;
+                    }
+                };
+                CudaWeight {
+                    data,
+                    scales,
+                    offsets: 0,
+                    gpr: 0,
+                    gk: 0,
+                }
+            }
+            WeightRef::Q4(m) => {
+                let data = self.upload_bytes(m.q.as_ptr(), m.q.len())?;
+                let scales = match self.upload_bytes(m.scales.as_ptr() as *const u8, m.scales.len() * 2) {
+                    Some(s) => s,
+                    None => {
+                        unsafe { self.cu.cuMemFree_v2(data) };
+                        return None;
+                    }
+                };
+                let (mut offsets, mut gpr, mut gk) = (0, 0, 0);
+                if let Some(o) = &m.offsets {
+                    offsets = match self.upload_bytes(o.v.as_ptr() as *const u8, o.v.len() * 2) {
+                        Some(p) => p,
+                        None => {
+                            unsafe {
+                                self.cu.cuMemFree_v2(data);
+                                self.cu.cuMemFree_v2(scales);
+                            }
+                            return None;
+                        }
+                    };
+                    (gpr, gk) = ((m.n_in / o.group) as u32, (o.group / 32) as u32);
+                }
+                CudaWeight {
+                    data,
+                    scales,
+                    offsets,
+                    gpr,
+                    gk,
+                }
+            }
+        })
+    }
+
+    fn free_weight(&self, cw: &CudaWeight) {
+        for p in [cw.data, cw.scales, cw.offsets] {
+            if p != 0 {
+                unsafe { self.cu.cuMemFree_v2(p) };
+            }
+        }
+    }
+
+    /// The GEMM kernel for a weight of this format.
+    fn gemm_func(&self, w: &WeightRef) -> Option<*mut c_void> {
+        Some(match w {
+            WeightRef::Bf16(_) => self.funcs[0],
+            WeightRef::Q8(_) => self.funcs[1],
+            WeightRef::Q4(m) if m.offsets.is_some() => self.func_q4a,
+            WeightRef::Q4(_) => self.funcs[2],
+            WeightRef::Gguf(_) => return None,
+        })
+    }
+
+    /// Queues `y[t_pad][n_out] = x[t_pad][n_in] * W^T` (t_pad a multiple of TILE) with `func`
+    /// (from `gemm_func`): the plain kernels take the first six parameters, the affine one all
+    /// nine.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm(&self, func: *mut c_void, cw: &CudaWeight, x: u64, y: u64, n_out: usize, n_in: usize, t_pad: usize) -> bool {
+        let (mut p_w, mut p_s, mut p_x, mut p_y) = (cw.data, cw.scales, x, y);
+        let (mut n_out_u, mut n_in_u) = (n_out as u32, n_in as u32);
+        let (mut p_o, mut gpr, mut gk) = (cw.offsets, cw.gpr, cw.gk);
+        let mut params: [*mut c_void; 9] = [
+            &mut p_w as *mut u64 as *mut c_void,
+            &mut p_s as *mut u64 as *mut c_void,
+            &mut p_x as *mut u64 as *mut c_void,
+            &mut p_y as *mut u64 as *mut c_void,
+            &mut n_out_u as *mut u32 as *mut c_void,
+            &mut n_in_u as *mut u32 as *mut c_void,
+            &mut p_o as *mut u64 as *mut c_void,
+            &mut gpr as *mut u32 as *mut c_void,
+            &mut gk as *mut u32 as *mut c_void,
+        ];
+        self.launch(func, ((n_out / TILE) as u32, (t_pad / TILE) as u32), 256, &mut params)
+    }
+
     fn ensure_staging(&self, st: &mut Staging, x_bytes: usize, y_bytes: usize) -> bool {
         let grow = |ptr: &mut u64, cap: &mut usize, need: usize| -> bool {
             if *cap >= need {
@@ -597,65 +765,7 @@ impl Backend for CudaBackend {
         if !self.bind() {
             return None;
         }
-        let cw = match w {
-            WeightRef::Gguf(_) => return None,
-            WeightRef::Bf16(w) => CudaWeight {
-                data: self.upload_bytes(w.as_ptr() as *const u8, w.len() * 2)?,
-                scales: 0,
-                offsets: 0,
-                gpr: 0,
-                gk: 0,
-            },
-            WeightRef::Q8(m) => {
-                let data = self.upload_bytes(m.q.as_ptr() as *const u8, m.q.len())?;
-                let scales = match self.upload_bytes(m.scales.as_ptr() as *const u8, m.scales.len() * 4) {
-                    Some(s) => s,
-                    None => {
-                        unsafe { self.cu.cuMemFree_v2(data) };
-                        return None;
-                    }
-                };
-                CudaWeight {
-                    data,
-                    scales,
-                    offsets: 0,
-                    gpr: 0,
-                    gk: 0,
-                }
-            }
-            WeightRef::Q4(m) => {
-                let data = self.upload_bytes(m.q.as_ptr(), m.q.len())?;
-                let scales = match self.upload_bytes(m.scales.as_ptr() as *const u8, m.scales.len() * 2) {
-                    Some(s) => s,
-                    None => {
-                        unsafe { self.cu.cuMemFree_v2(data) };
-                        return None;
-                    }
-                };
-                let (mut offsets, mut gpr, mut gk) = (0, 0, 0);
-                if let Some(o) = &m.offsets {
-                    offsets = match self.upload_bytes(o.v.as_ptr() as *const u8, o.v.len() * 2) {
-                        Some(p) => p,
-                        None => {
-                            unsafe {
-                                self.cu.cuMemFree_v2(data);
-                                self.cu.cuMemFree_v2(scales);
-                            }
-                            return None;
-                        }
-                    };
-                    (gpr, gk) = ((m.n_in / o.group) as u32, (o.group / 32) as u32);
-                }
-                CudaWeight {
-                    data,
-                    scales,
-                    offsets,
-                    gpr,
-                    gk,
-                }
-            }
-        };
-        Some(Box::new(CudaWeightBox(cw)))
+        Some(Box::new(CudaWeightBox(self.upload_weight(w)?)))
     }
 
     fn conv2d(&self, x: &[f32], g: &crate::gpu::ConvGeom, norm: Option<&crate::gpu::NormSpec>, job: &mut Job) -> bool {
@@ -980,49 +1090,8 @@ impl Backend for CudaBackend {
         let mut y_off = 0usize;
         for j in jobs.iter() {
             let cw = &j.dev.downcast_ref::<CudaWeightBox>().unwrap().0;
-            let fi = match j.w {
-                WeightRef::Bf16(_) => 0,
-                WeightRef::Q8(_) => 1,
-                WeightRef::Q4(_) => 2,
-                WeightRef::Gguf(_) => unreachable!("GGUF weights are never uploaded"),
-            };
-            let mut p_w = cw.data;
-            let mut p_s = cw.scales;
-            let mut p_x = st.x;
-            let mut p_y = st.y + (y_off * 4) as u64;
-            let mut n_out = j.n_out as u32;
-            let mut n_in_u = n_in as u32;
-            let (mut p_o, mut gpr, mut gk) = (cw.offsets, cw.gpr, cw.gk);
-            let mut params: [*mut c_void; 9] = [
-                &mut p_w as *mut u64 as *mut c_void,
-                &mut p_s as *mut u64 as *mut c_void,
-                &mut p_x as *mut u64 as *mut c_void,
-                &mut p_y as *mut u64 as *mut c_void,
-                &mut n_out as *mut u32 as *mut c_void,
-                &mut n_in_u as *mut u32 as *mut c_void,
-                &mut p_o as *mut u64 as *mut c_void,
-                &mut gpr as *mut u32 as *mut c_void,
-                &mut gk as *mut u32 as *mut c_void,
-            ];
-            // The plain kernels take the first six parameters; the affine one all nine.
-            let func = if cw.offsets != 0 { self.func_q4a } else { self.funcs[fi] };
-            let rc = unsafe {
-                self.cu.cuLaunchKernel(
-                    func,
-                    (j.n_out / TILE) as u32,
-                    (t_pad / TILE) as u32,
-                    1,
-                    256,
-                    1,
-                    1,
-                    0,
-                    std::ptr::null_mut(),
-                    params.as_mut_ptr(),
-                    std::ptr::null_mut(),
-                )
-            };
-            if rc != 0 {
-                let _ = self.check(rc, "cuLaunchKernel").map_err(|e| eprintln!("[cuda: {e}]"));
+            let Some(func) = self.gemm_func(&j.w) else { return false };
+            if !self.gemm(func, cw, st.x, st.y + (y_off * 4) as u64, j.n_out, n_in, t_pad) {
                 return false;
             }
             y_off += t_pad * j.n_out;
@@ -1041,6 +1110,232 @@ impl Backend for CudaBackend {
                 return false;
             }
             y_off += t_pad * j.n_out;
+        }
+        self.stats.calls.fetch_add(1, Ordering::Relaxed);
+        self.stats.copy_in_ns.fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
+        self.stats.gpu_ns.fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
+        self.stats.copy_out_ns.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        true
+    }
+
+    fn upload_moe(
+        &self,
+        gate_up: &[WeightRef],
+        up: Option<&[WeightRef]>,
+        down: &[WeightRef],
+        h: usize,
+        mi: usize,
+        act: crate::gpu::MoeAct,
+    ) -> Option<DeviceWeight> {
+        let n = gate_up.len();
+        if !crate::gpu::moe_offload() || n == 0 || down.len() != n || up.is_some_and(|u| u.len() != n) || !self.bind() {
+            return None;
+        }
+        // The GEMM tiles: whole tiles of outputs, whole blocks of 32 inputs.
+        let g_rows = if up.is_some() { mi } else { 2 * mi };
+        if !g_rows.is_multiple_of(TILE) || !h.is_multiple_of(TILE) || !h.is_multiple_of(32) || !mi.is_multiple_of(32) {
+            return None;
+        }
+        // One kernel per projection: every expert in the same format.
+        let func = |ws: &[WeightRef]| -> Option<*mut c_void> {
+            let f = self.gemm_func(&ws[0])?;
+            ws.iter().all(|w| self.gemm_func(w) == Some(f)).then_some(f)
+        };
+        let funcs = [func(gate_up)?, up.map_or(Some(std::ptr::null_mut()), func)?, func(down)?];
+        // All experts or none (VRAM): a partial upload is freed again.
+        let mut done: Vec<CudaWeight> = Vec::new();
+        let mut take = |ws: &[WeightRef]| -> Option<Vec<CudaWeight>> {
+            let mut v = Vec::with_capacity(ws.len());
+            for w in ws {
+                match self.upload_weight(w) {
+                    Some(cw) => v.push(cw),
+                    None => {
+                        for cw in v.iter().chain(done.iter()) {
+                            self.free_weight(cw);
+                        }
+                        return None;
+                    }
+                }
+            }
+            done.extend(v.iter().copied());
+            Some(v)
+        };
+        let gu = take(gate_up)?;
+        let upw = match up {
+            Some(u) => Some(take(u)?),
+            None => None,
+        };
+        let dw = take(down)?;
+        Some(Box::new(MoeDev {
+            gu,
+            up: upw,
+            down: dw,
+            funcs,
+            act,
+        }))
+    }
+
+    fn moe(&self, x: &[f32], t: usize, h: usize, mi: usize, routes: &[Vec<(usize, f32)>], dev: &DeviceWeight, y: &mut [f32]) -> bool {
+        let Some(md) = dev.downcast_ref::<MoeDev>() else {
+            return false;
+        };
+        let k = routes.first().map_or(0, |r| r.len());
+        if !crate::gpu::moe_offload()
+            || t == 0
+            || k == 0
+            || routes.len() != t
+            || routes.iter().any(|r| r.len() != k || r.iter().any(|&(e, _)| e >= md.gu.len()))
+            || x.len() < t * h
+            || y.len() < t * h
+            || !self.bind()
+        {
+            return false;
+        }
+        // One segment of rows per expert, in expert order, padded to whole GEMM tiles.
+        let ne = md.gu.len();
+        let mut count = vec![0usize; ne];
+        for &(e, _) in routes.iter().flatten() {
+            count[e] += 1;
+        }
+        let mut segs = Vec::with_capacity(ne);
+        let mut rows = 0usize;
+        for &c in &count {
+            segs.push(rows);
+            rows += c.next_multiple_of(TILE);
+        }
+        // Gathered row sources (t: padding), and each token's (row, weight bits) slots.
+        let mut src = vec![t as u32; rows];
+        let mut fill = segs.clone();
+        let mut slots = vec![0u32; 2 * t * k];
+        for (ti, r) in routes.iter().enumerate() {
+            for (j, &(e, w)) in r.iter().enumerate() {
+                let i = fill[e];
+                fill[e] += 1;
+                src[i] = ti as u32;
+                slots[2 * (ti * k + j)] = i as u32;
+                slots[2 * (ti * k + j) + 1] = w.to_bits();
+            }
+        }
+        let split = md.up.is_some();
+        let mut st = self.staging.lock().unwrap();
+        let st = &mut *st;
+        let ok = self.grow(&mut st.mx, t * h * 4)
+            && self.grow(&mut st.msrc, rows * 4)
+            && self.grow(&mut st.mxs, rows * h * 4)
+            && self.grow(&mut st.mgu, rows * 2 * mi * 4)
+            && self.grow(&mut st.ma, rows * mi * 4)
+            && self.grow(&mut st.mo, rows * h * 4)
+            && self.grow(&mut st.mslots, slots.len() * 4);
+        if !ok {
+            return false;
+        }
+        let t0 = Instant::now();
+        // y goes up too: the combination adds to it in the CPU's order.
+        if !(self.htod(st.mx.0, &x[..t * h]) && self.htod(st.msrc.0, &src) && self.htod(st.mslots.0, &slots)) {
+            return false;
+        }
+        let t1 = Instant::now();
+        let (mut p_x, mut p_src, mut p_xs, mut h_u, mut t_u) = (st.mx.0, st.msrc.0, st.mxs.0, h as u32, t as u32);
+        let cols = (h as u32).div_ceil(256).min(64);
+        if !self.launch(
+            self.moe_funcs[0],
+            (cols, rows as u32),
+            256,
+            &mut [
+                &mut p_x as *mut u64 as *mut c_void,
+                &mut p_src as *mut u64 as *mut c_void,
+                &mut p_xs as *mut u64 as *mut c_void,
+                &mut h_u as *mut u32 as *mut c_void,
+                &mut t_u as *mut u32 as *mut c_void,
+            ],
+        ) {
+            return false;
+        }
+        // Gate/up and down GEMMs per expert over its segment (experts with no rows are skipped).
+        for e in 0..ne {
+            let len = count[e].next_multiple_of(TILE);
+            if len == 0 {
+                continue;
+            }
+            let r0 = segs[e];
+            let xs = st.mxs.0 + (r0 * h * 4) as u64;
+            let ok = match &md.up {
+                Some(up) => {
+                    self.gemm(md.funcs[0], &md.gu[e], xs, st.mgu.0 + (r0 * mi * 4) as u64, mi, h, len)
+                        && self.gemm(md.funcs[1], &up[e], xs, st.mgu.0 + ((rows + r0) * mi * 4) as u64, mi, h, len)
+                }
+                None => self.gemm(md.funcs[0], &md.gu[e], xs, st.mgu.0 + (r0 * 2 * mi * 4) as u64, 2 * mi, h, len),
+            };
+            if !ok {
+                return false;
+            }
+        }
+        let (kind, limit) = match md.act {
+            crate::gpu::MoeAct::Silu => (0u32, 0f32),
+            crate::gpu::MoeAct::GeluTanh => (1, 0.0),
+            crate::gpu::MoeAct::SiluClamp(l) => (2, l),
+        };
+        let (mut p_gu, mut p_a, mut rows_u, mut mi_u, mut split_u, mut kind_u, mut limit_f) =
+            (st.mgu.0, st.ma.0, rows as u32, mi as u32, split as u32, kind, limit);
+        if !self.launch(
+            self.moe_funcs[1],
+            ((rows * mi).div_ceil(256) as u32, 1),
+            256,
+            &mut [
+                &mut p_gu as *mut u64 as *mut c_void,
+                &mut p_a as *mut u64 as *mut c_void,
+                &mut rows_u as *mut u32 as *mut c_void,
+                &mut mi_u as *mut u32 as *mut c_void,
+                &mut split_u as *mut u32 as *mut c_void,
+                &mut kind_u as *mut u32 as *mut c_void,
+                &mut limit_f as *mut f32 as *mut c_void,
+            ],
+        ) {
+            return false;
+        }
+        for e in 0..ne {
+            let len = count[e].next_multiple_of(TILE);
+            if len == 0 {
+                continue;
+            }
+            let r0 = segs[e];
+            if !self.gemm(
+                md.funcs[2],
+                &md.down[e],
+                st.ma.0 + (r0 * mi * 4) as u64,
+                st.mo.0 + (r0 * h * 4) as u64,
+                h,
+                mi,
+                len,
+            ) {
+                return false;
+            }
+        }
+        // The input buffer is free again: it takes y for the combination.
+        if !self.htod(st.mx.0, &y[..t * h]) {
+            return false;
+        }
+        let (mut p_o, mut p_sl, mut p_y, mut k_u) = (st.mo.0, st.mslots.0, st.mx.0, k as u32);
+        if !self.launch(
+            self.moe_funcs[2],
+            (cols, t as u32),
+            256,
+            &mut [
+                &mut p_o as *mut u64 as *mut c_void,
+                &mut p_sl as *mut u64 as *mut c_void,
+                &mut p_y as *mut u64 as *mut c_void,
+                &mut h_u as *mut u32 as *mut c_void,
+                &mut k_u as *mut u32 as *mut c_void,
+            ],
+        ) {
+            return false;
+        }
+        if unsafe { self.cu.cuCtxSynchronize() } != 0 {
+            return false;
+        }
+        let t2 = Instant::now();
+        if unsafe { self.cu.cuMemcpyDtoH_v2(y.as_mut_ptr() as *mut c_void, st.mx.0, t * h * 4) } != 0 {
+            return false;
         }
         self.stats.calls.fetch_add(1, Ordering::Relaxed);
         self.stats.copy_in_ns.fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
@@ -1582,6 +1877,108 @@ mod tests {
     }
 
     /// One device shared by racing threads: the staging buffers must not mix their work up.
+    /// The routed experts against their definition in f64: fused affine Q4 gate/up with SiLU,
+    /// split bf16 gate and up with tanh GELU and with the clamped SiLU; experts that get no
+    /// tokens, segments of whole and partial tiles, and `y` added to rather than overwritten.
+    #[test]
+    fn moe_matches_definition() {
+        use crate::gpu::MoeAct;
+        let Some(be) = backend() else { return };
+        let (n_exp, h, mi, k) = (6, 128, 64, 2);
+        let mut seed = 11;
+        for (case, act) in [MoeAct::Silu, MoeAct::GeluTanh, MoeAct::SiluClamp(0.4)].into_iter().enumerate() {
+            let split = case > 0;
+            // Dense values of each expert's projections next to their storage.
+            let (mut gq, mut gd, mut ub, mut ud, mut dq, mut dd) = (vec![], vec![], vec![], vec![], vec![], vec![]);
+            for _ in 0..n_exp {
+                if split {
+                    let (g, u) = (bf16(mi * h, &mut seed), bf16(mi * h, &mut seed));
+                    gd.push(dense_bf(&g));
+                    ud.push(dense_bf(&u));
+                    gq.push(None);
+                    ub.push(Some((g, u)));
+                } else {
+                    // The repacked matrix (its offsets are rounded from the MLX biases).
+                    let (m, _) = affine(2 * mi, h, 64, &mut seed);
+                    gd.push(dense_q4(&m));
+                    gq.push(Some(m));
+                    ub.push(None);
+                }
+                let (m, _) = affine(h, mi, 32, &mut seed);
+                dd.push(dense_q4(&m));
+                dq.push(m);
+            }
+            let gate_up: Vec<WeightRef> = (0..n_exp)
+                .map(|e| match (&gq[e], &ub[e]) {
+                    (Some(m), _) => WeightRef::Q4(m),
+                    (_, Some((g, _))) => WeightRef::Bf16(g),
+                    _ => unreachable!(),
+                })
+                .collect();
+            let up: Vec<WeightRef> = ub.iter().flatten().map(|(_, u)| WeightRef::Bf16(u)).collect();
+            let down: Vec<WeightRef> = dq.iter().map(WeightRef::Q4).collect();
+            let dev = be
+                .upload_moe(&gate_up, split.then_some(&up[..]), &down, h, mi, act)
+                .expect("upload_moe");
+            // Expert 4 gets no tokens; expert 0 more than one tile.
+            let t = 90;
+            let routes: Vec<Vec<(usize, f32)>> = (0..t)
+                .map(|i| {
+                    let a = if i < 70 { 0 } else { [1, 2, 3, 5][i % 4] };
+                    vec![
+                        (a, 0.25 + rnd(&mut seed).abs()),
+                        ([1, 2, 3, 5][(i / 3) % 4], 0.1 + rnd(&mut seed).abs()),
+                    ]
+                })
+                .map(|mut r: Vec<(usize, f32)>| {
+                    if r[0].0 == r[1].0 {
+                        r[1].0 = if r[0].0 == 1 { 2 } else { 1 };
+                    }
+                    r
+                })
+                .collect();
+            assert_eq!(routes[0].len(), k);
+            let x = f32s(t * h, &mut seed);
+            let y0 = f32s(t * h, &mut seed);
+            let mut y = y0.clone();
+            assert!(be.moe(&x, t, h, mi, &routes, &dev, &mut y), "moe declined");
+            let mut r = vec![0f32; t * h];
+            for ti in 0..t {
+                let xr = &x[ti * h..(ti + 1) * h];
+                let mut acc: Vec<f64> = y0[ti * h..(ti + 1) * h].iter().map(|&v| v as f64).collect();
+                for &(e, w) in &routes[ti] {
+                    let dot = |m: &[f32], row: usize, n: usize, v: &[f64]| -> f64 { (0..n).map(|c| m[row * n + c] as f64 * v[c]).sum() };
+                    let xv: Vec<f64> = xr.iter().map(|&v| v as f64).collect();
+                    let a: Vec<f64> = (0..mi)
+                        .map(|j| {
+                            let (g, u) = if split {
+                                (dot(&gd[e], j, h, &xv), dot(&ud[e], j, h, &xv))
+                            } else {
+                                (dot(&gd[e], j, h, &xv), dot(&gd[e], mi + j, h, &xv))
+                            };
+                            match act {
+                                MoeAct::Silu => g / (1.0 + (-g).exp()) * u,
+                                MoeAct::GeluTanh => 0.5 * g * (1.0 + (0.7978845608 * (g + 0.044715 * g * g * g)).tanh()) * u,
+                                MoeAct::SiluClamp(l) => {
+                                    let (g, l) = (g.min(l as f64), l as f64);
+                                    g / (1.0 + (-g).exp()) * u.clamp(-l, l)
+                                }
+                            }
+                        })
+                        .collect();
+                    for (c, o) in acc.iter_mut().enumerate() {
+                        *o += w as f64 * dot(&dd[e], c, mi, &a);
+                    }
+                }
+                for (c, o) in acc.iter().enumerate() {
+                    r[ti * h + c] = *o as f32;
+                }
+            }
+            let e = row_err(&y, &r, h);
+            assert!(e < 1e-4, "{act:?}: error {e}");
+        }
+    }
+
     #[test]
     fn concurrent_calls_do_not_mix() {
         let Some(be) = backend() else { return };
