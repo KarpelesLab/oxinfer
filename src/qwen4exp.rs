@@ -759,6 +759,7 @@ impl<'a> QwenModel<'a> {
             match &layer.mixer {
                 crate::qwen::Mixer::Gdn(gd) => {
                     let rec = if record { Some(&mut sess.rec[l]) } else { None };
+                    sess.gpu_states_kept = false;
                     self.gdn_forward(gd, sess.gdn[l].as_mut().unwrap(), rec, &hn, t, &mut y);
                 }
                 crate::qwen::Mixer::Attn(at) => {
@@ -1373,6 +1374,7 @@ impl<'a> QwenModel<'a> {
                     params: None,
                     capture: Some(&mut cap),
                     scratch: false,
+                    states_kept: false,
                 },
             )
         };
@@ -1618,6 +1620,7 @@ impl<'a> QwenModel<'a> {
                     params: None,
                     capture: Some(&mut captured),
                     scratch: false,
+                    states_kept: false,
                 },
             )
         };

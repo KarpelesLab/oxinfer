@@ -959,6 +959,9 @@ pub fn default_draft(model: &Path) -> Option<PathBuf> {
 
 /// [`default_draft`] for fast (`fast`) or exact verification ([`DsparkOptions::fast_verify`]).
 pub fn default_draft_for(model: &Path, fast: bool) -> Option<PathBuf> {
+    if crate::gpu::plain_decode_preferred() {
+        return None;
+    }
     find_draft(model, fast).filter(|d| d.1).map(|d| d.0)
 }
 
@@ -2236,6 +2239,7 @@ impl Dspark<'_> {
                 params: None,
                 capture: None,
                 scratch: false,
+                states_kept: false,
             },
         );
         if ok {
@@ -2274,6 +2278,7 @@ impl Dspark<'_> {
                 params: None,
                 capture: None,
                 scratch: true,
+                states_kept: false,
             },
         );
         ok.then_some((hidden, logits))

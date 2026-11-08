@@ -504,6 +504,7 @@ impl<'a> Model<'a> {
                 params: None,
                 capture: Some(&mut captured),
                 scratch: false,
+                states_kept: false,
             },
         );
         if !ok {
@@ -572,6 +573,7 @@ impl<'a> Model<'a> {
                 params: data.zip(ivc.as_ref()).map(|(d, c)| (&hot[..], &d.cold[..], c.id())),
                 capture: None,
                 scratch: false,
+                states_kept: false,
             },
         );
         if !ok {

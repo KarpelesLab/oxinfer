@@ -1707,7 +1707,7 @@ fn run_mistral4(mut args: Args) -> Result<()> {
         Some(d) if d.as_os_str() == "auto" => Some(resolve_auto_draft(&args.model, args.cache_dir.as_deref())?),
         Some(d) if !oxinfer::dspark::is_draft(d) => bail!("{}: not a DSpark (dflash) draft GGUF", d.display()),
         Some(d) => Some(d.clone()),
-        None if oxinfer::dspark::BY_DEFAULT && !args.no_draft && !plain_only => beside.clone(),
+        None if oxinfer::dspark::BY_DEFAULT && !args.no_draft && !plain_only && !oxinfer::gpu::plain_decode_preferred() => beside.clone(),
         None => None,
     };
     if draft.is_none()
@@ -1828,7 +1828,7 @@ fn run_deepseek4(mut args: Args) -> Result<()> {
         Some(d) if d.as_os_str() == "auto" => Some(resolve_auto_draft(&args.model, args.cache_dir.as_deref())?),
         Some(d) if !oxinfer::dspark::is_draft(d) => bail!("{}: not a DSpark (dflash) draft GGUF", d.display()),
         Some(d) => Some(d.clone()),
-        None if oxinfer::dspark::BY_DEFAULT && !args.no_draft && !plain_only => beside.clone(),
+        None if oxinfer::dspark::BY_DEFAULT && !args.no_draft && !plain_only && !oxinfer::gpu::plain_decode_preferred() => beside.clone(),
         None => None,
     };
     let cfg = config::DeepSeek4Config::load(&args.model)?;
@@ -1931,7 +1931,7 @@ fn pick_dspark(args: &Args) -> Result<Option<PathBuf>> {
         Some(d) if d.as_os_str() == "auto" => Some(resolve_auto_draft(&args.model, args.cache_dir.as_deref())?),
         Some(d) if oxinfer::dspark::is_draft(d) => Some(d.clone()),
         Some(_) => None,
-        None if oxinfer::dspark::BY_DEFAULT && !args.no_draft && !plain_only => {
+        None if oxinfer::dspark::BY_DEFAULT && !args.no_draft && !plain_only && !oxinfer::gpu::plain_decode_preferred() => {
             oxinfer::dspark::default_draft_for(&args.model, args.fast_verify)
         }
         None => None,

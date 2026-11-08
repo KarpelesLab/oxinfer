@@ -7,7 +7,8 @@
 //! device; a layer's experts go up all at once or not at all). Weights are copied to device memory
 //! the first time a layer is used (skipped when VRAM is short, that layer then stays on the CPU),
 //! activations are copied up and results down per batch. Discrete GPUs pay for those transfers,
-//! so the threshold is higher than Metal's. Decode stays on the CPU.
+//! so the threshold is higher than Metal's. Whole decode steps (single tokens, and the
+//! multi-token passes of speculative verification) run as compiled plans (`cuda_decode.rs`).
 //!
 //! Every kernel is tested against references from the definitions (`cargo test --lib cuda::` on a
 //! machine with an NVIDIA GPU) and has run on real models on an RTX 5080; see the README.
@@ -18,6 +19,9 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+#[path = "cuda_decode.rs"]
+mod decode;
 
 const TILE: usize = 64;
 const MIN_T: usize = 32;
@@ -38,6 +42,16 @@ dlsym::library! {
             pub fn cuMemFree_v2(ptr: u64) -> c_int;
             pub fn cuMemcpyHtoD_v2(dst: u64, src: *const c_void, bytes: usize) -> c_int;
             pub fn cuMemcpyDtoH_v2(dst: *mut c_void, src: u64, bytes: usize) -> c_int;
+            pub fn cuMemcpyDtoD_v2(dst: u64, src: u64, bytes: usize) -> c_int;
+            pub fn cuMemsetD8_v2(dst: u64, value: u8, bytes: usize) -> c_int;
+            pub fn cuMemAllocHost_v2(p: *mut *mut c_void, bytes: usize) -> c_int;
+            pub fn cuMemFreeHost(p: *mut c_void) -> c_int;
+            pub fn cuStreamCreate(stream: *mut *mut c_void, flags: u32) -> c_int;
+            pub fn cuStreamSynchronize(stream: *mut c_void) -> c_int;
+            pub fn cuStreamWaitEvent(stream: *mut c_void, event: *mut c_void, flags: u32) -> c_int;
+            pub fn cuEventCreate(event: *mut *mut c_void, flags: u32) -> c_int;
+            pub fn cuEventRecord(event: *mut c_void, stream: *mut c_void) -> c_int;
+            pub fn cuMemcpyDtoHAsync_v2(dst: *mut c_void, src: u64, bytes: usize, stream: *mut c_void) -> c_int;
             pub fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> c_int;
             pub fn cuLaunchKernel(
                 f: *mut c_void, gx: u32, gy: u32, gz: u32, bx: u32, by: u32, bz: u32,
@@ -361,9 +375,30 @@ struct MoeDev {
     down: Vec<CudaWeight>,
     funcs: [*mut c_void; 3],
     act: crate::gpu::MoeAct,
+    /// Transient copies (`upload_moe_transient`): freed with this state, with the context to
+    /// make current for that. Resident ones live in the shared cache.
+    owner: Option<(std::sync::Arc<Cu>, *mut c_void)>,
 }
 unsafe impl Send for MoeDev {}
 unsafe impl Sync for MoeDev {}
+
+impl Drop for MoeDev {
+    fn drop(&mut self) {
+        let Some((cu, ctx)) = &self.owner else { return };
+        unsafe {
+            if cu.cuCtxSetCurrent(*ctx) != 0 {
+                return;
+            }
+            for cw in self.gu.iter().chain(self.up.iter().flatten()).chain(&self.down) {
+                for p in [cw.data, cw.scales, cw.offsets] {
+                    if p != 0 {
+                        cu.cuMemFree_v2(p);
+                    }
+                }
+            }
+        }
+    }
+}
 
 #[derive(Default)]
 struct Stats {
@@ -374,10 +409,14 @@ struct Stats {
 }
 
 pub struct CudaBackend {
-    cu: Cu,
+    /// Shared with per-session decode state, which frees its buffers on drop.
+    cu: std::sync::Arc<Cu>,
     /// The primary context; current per thread, so every entry point makes it current (`bind`).
     ctx: *mut c_void,
-    _module: *mut c_void,
+    module: *mut c_void,
+    /// Expert weights by host address and length: uploaded once, shared by the prefill MoE path
+    /// and decode plans (never freed, like the other device weights).
+    wcache: Mutex<std::collections::HashMap<(usize, usize, u64), CudaWeight>>,
     /// bf16, q8, q4
     funcs: [*mut c_void; 3],
     /// GEMM over affine Q4 weights.
@@ -435,7 +474,7 @@ impl CudaBackend {
             unsafe { Nvrtc::open_first(NVRTC_CANDIDATES.iter().copied()) }
                 .map_err(|e| anyhow!("libnvrtc (ships with the CUDA toolkit): {e}"))?
         };
-        let src = CString::new(KERNEL_SRC)?;
+        let src = CString::new(format!("{KERNEL_SRC}{}", include_str!("cuda_decode.cu")))?;
         let name = CString::new("oxinfer.cu")?;
         let mut prog: *mut c_void = std::ptr::null_mut();
         let rc = unsafe { nvrtc.nvrtcCreateProgram(&mut prog, src.as_ptr(), name.as_ptr(), 0, std::ptr::null(), std::ptr::null()) };
@@ -515,9 +554,10 @@ impl CudaBackend {
             )?;
         }
         Ok(Self {
-            cu,
+            cu: std::sync::Arc::new(cu),
             ctx,
-            _module: module,
+            module,
+            wcache: Mutex::new(std::collections::HashMap::new()),
             funcs,
             func_q4a,
             conv_funcs,
@@ -658,6 +698,300 @@ impl CudaBackend {
         })
     }
 
+    /// A kernel of the module by name.
+    fn func(&self, name: &str) -> Option<*mut c_void> {
+        let c = CString::new(name).ok()?;
+        let mut f = std::ptr::null_mut();
+        (unsafe { self.cu.cuModuleGetFunction(&mut f, self.module, c.as_ptr()) } == 0).then_some(f)
+    }
+
+    /// [`Self::upload_weight`] through the cache of shared weights; the flag tells whether this
+    /// call uploaded it.
+    fn upload_cached(&self, w: &WeightRef) -> Option<(CudaWeight, bool)> {
+        let key = weight_key(w)?;
+        if let Some(cw) = self.wcache.lock().unwrap().get(&key) {
+            return Some((*cw, false));
+        }
+        let cw = self.upload_weight(w)?;
+        self.wcache.lock().unwrap().insert(key, cw);
+        Some((cw, true))
+    }
+
+    /// Every weight of `groups` through the cache, or none: what this call uploaded is freed again
+    /// when one does not fit.
+    fn upload_all(&self, groups: &[&[WeightRef]]) -> Option<Vec<Vec<CudaWeight>>> {
+        let mut out: Vec<Vec<CudaWeight>> = Vec::with_capacity(groups.len());
+        let mut new: Vec<(&WeightRef, CudaWeight)> = Vec::new();
+        for ws in groups {
+            let mut v = Vec::with_capacity(ws.len());
+            for w in ws.iter() {
+                match self.upload_cached(w) {
+                    Some((cw, fresh)) => {
+                        if fresh {
+                            new.push((w, cw));
+                        }
+                        v.push(cw);
+                    }
+                    None => {
+                        for (w, cw) in &new {
+                            self.forget_cached(w, cw);
+                        }
+                        return None;
+                    }
+                }
+            }
+            out.push(v);
+        }
+        Some(out)
+    }
+
+    /// `upload_moe` (`resident`: through the shared cache, kept) or `upload_moe_transient` (owned
+    /// copies, freed with the returned state).
+    #[allow(clippy::too_many_arguments)]
+    fn moe_state(
+        &self,
+        gate_up: &[WeightRef],
+        up: Option<&[WeightRef]>,
+        down: &[WeightRef],
+        h: usize,
+        mi: usize,
+        act: crate::gpu::MoeAct,
+        resident: bool,
+    ) -> Option<DeviceWeight> {
+        let n = gate_up.len();
+
+        if !crate::gpu::moe_offload() || n == 0 || down.len() != n || up.is_some_and(|u| u.len() != n) || !self.bind() {
+            return None;
+        }
+        // The GEMM tiles: whole tiles of outputs, whole blocks of 32 inputs.
+        let g_rows = if up.is_some() { mi } else { 2 * mi };
+        if !g_rows.is_multiple_of(TILE) || !h.is_multiple_of(TILE) || !h.is_multiple_of(32) || !mi.is_multiple_of(32) {
+            return None;
+        }
+        // One kernel per projection: every expert in the same format.
+        let func = |ws: &[WeightRef]| -> Option<*mut c_void> {
+            let f = self.gemm_func(&ws[0])?;
+            ws.iter().all(|w| self.gemm_func(w) == Some(f)).then_some(f)
+        };
+        let funcs = [func(gate_up)?, up.map_or(Some(std::ptr::null_mut()), func)?, func(down)?];
+        // All experts or none (VRAM): a partial upload is freed again.
+        let mut groups: Vec<&[WeightRef]> = vec![gate_up, down];
+        groups.extend(up);
+        let mut all = if resident {
+            self.upload_all(&groups)?
+        } else {
+            self.upload_owned(&groups)?
+        }
+        .into_iter();
+        let (gu, dw) = (all.next()?, all.next()?);
+        let upw = all.next();
+        Some(Box::new(MoeDev {
+            gu,
+            up: upw,
+            down: dw,
+            funcs,
+            act,
+            owner: (!resident).then(|| (self.cu.clone(), self.ctx)),
+        }))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn moe_run(&self, x: &[f32], t: usize, h: usize, mi: usize, routes: &[Vec<(usize, f32)>], dev: &DeviceWeight, y: &mut [f32]) -> bool {
+        let Some(md) = dev.downcast_ref::<MoeDev>() else {
+            return false;
+        };
+        let k = routes.first().map_or(0, |r| r.len());
+        if !crate::gpu::moe_offload()
+            || t == 0
+            || k == 0
+            || routes.len() != t
+            || routes.iter().any(|r| r.len() != k || r.iter().any(|&(e, _)| e >= md.gu.len()))
+            || x.len() < t * h
+            || y.len() < t * h
+            || !self.bind()
+        {
+            return false;
+        }
+        // One segment of rows per expert, in expert order, padded to whole GEMM tiles.
+        let ne = md.gu.len();
+        let mut count = vec![0usize; ne];
+        for &(e, _) in routes.iter().flatten() {
+            count[e] += 1;
+        }
+        let mut segs = Vec::with_capacity(ne);
+        let mut rows = 0usize;
+        for &c in &count {
+            segs.push(rows);
+            rows += c.next_multiple_of(TILE);
+        }
+        // Gathered row sources (t: padding), and each token's (row, weight bits) slots.
+        let mut src = vec![t as u32; rows];
+        let mut fill = segs.clone();
+        let mut slots = vec![0u32; 2 * t * k];
+        for (ti, r) in routes.iter().enumerate() {
+            for (j, &(e, w)) in r.iter().enumerate() {
+                let i = fill[e];
+                fill[e] += 1;
+                src[i] = ti as u32;
+                slots[2 * (ti * k + j)] = i as u32;
+                slots[2 * (ti * k + j) + 1] = w.to_bits();
+            }
+        }
+        let split = md.up.is_some();
+        let mut st = self.staging.lock().unwrap();
+        let st = &mut *st;
+        let ok = self.grow(&mut st.mx, t * h * 4)
+            && self.grow(&mut st.msrc, rows * 4)
+            && self.grow(&mut st.mxs, rows * h * 4)
+            && self.grow(&mut st.mgu, rows * 2 * mi * 4)
+            && self.grow(&mut st.ma, rows * mi * 4)
+            && self.grow(&mut st.mo, rows * h * 4)
+            && self.grow(&mut st.mslots, slots.len() * 4);
+        if !ok {
+            return false;
+        }
+        let t0 = Instant::now();
+        // y goes up too: the combination adds to it in the CPU's order.
+        if !(self.htod(st.mx.0, &x[..t * h]) && self.htod(st.msrc.0, &src) && self.htod(st.mslots.0, &slots)) {
+            return false;
+        }
+        let t1 = Instant::now();
+        let (mut p_x, mut p_src, mut p_xs, mut h_u, mut t_u) = (st.mx.0, st.msrc.0, st.mxs.0, h as u32, t as u32);
+        let cols = (h as u32).div_ceil(256).min(64);
+        if !self.launch(
+            self.moe_funcs[0],
+            (cols, rows as u32),
+            256,
+            &mut [
+                &mut p_x as *mut u64 as *mut c_void,
+                &mut p_src as *mut u64 as *mut c_void,
+                &mut p_xs as *mut u64 as *mut c_void,
+                &mut h_u as *mut u32 as *mut c_void,
+                &mut t_u as *mut u32 as *mut c_void,
+            ],
+        ) {
+            return false;
+        }
+        // Gate/up and down GEMMs per expert over its segment (experts with no rows are skipped).
+        for e in 0..ne {
+            let len = count[e].next_multiple_of(TILE);
+            if len == 0 {
+                continue;
+            }
+            let r0 = segs[e];
+            let xs = st.mxs.0 + (r0 * h * 4) as u64;
+            let ok = match &md.up {
+                Some(up) => {
+                    self.gemm(md.funcs[0], &md.gu[e], xs, st.mgu.0 + (r0 * mi * 4) as u64, mi, h, len)
+                        && self.gemm(md.funcs[1], &up[e], xs, st.mgu.0 + ((rows + r0) * mi * 4) as u64, mi, h, len)
+                }
+                None => self.gemm(md.funcs[0], &md.gu[e], xs, st.mgu.0 + (r0 * 2 * mi * 4) as u64, 2 * mi, h, len),
+            };
+            if !ok {
+                return false;
+            }
+        }
+        let (kind, limit) = match md.act {
+            crate::gpu::MoeAct::Silu => (0u32, 0f32),
+            crate::gpu::MoeAct::GeluTanh => (1, 0.0),
+            crate::gpu::MoeAct::SiluClamp(l) => (2, l),
+        };
+        let (mut p_gu, mut p_a, mut rows_u, mut mi_u, mut split_u, mut kind_u, mut limit_f) =
+            (st.mgu.0, st.ma.0, rows as u32, mi as u32, split as u32, kind, limit);
+        if !self.launch(
+            self.moe_funcs[1],
+            ((rows * mi).div_ceil(256) as u32, 1),
+            256,
+            &mut [
+                &mut p_gu as *mut u64 as *mut c_void,
+                &mut p_a as *mut u64 as *mut c_void,
+                &mut rows_u as *mut u32 as *mut c_void,
+                &mut mi_u as *mut u32 as *mut c_void,
+                &mut split_u as *mut u32 as *mut c_void,
+                &mut kind_u as *mut u32 as *mut c_void,
+                &mut limit_f as *mut f32 as *mut c_void,
+            ],
+        ) {
+            return false;
+        }
+        for e in 0..ne {
+            let len = count[e].next_multiple_of(TILE);
+            if len == 0 {
+                continue;
+            }
+            let r0 = segs[e];
+            if !self.gemm(
+                md.funcs[2],
+                &md.down[e],
+                st.ma.0 + (r0 * mi * 4) as u64,
+                st.mo.0 + (r0 * h * 4) as u64,
+                h,
+                mi,
+                len,
+            ) {
+                return false;
+            }
+        }
+        // The input buffer is free again: it takes y for the combination.
+        if !self.htod(st.mx.0, &y[..t * h]) {
+            return false;
+        }
+        let (mut p_o, mut p_sl, mut p_y, mut k_u) = (st.mo.0, st.mslots.0, st.mx.0, k as u32);
+        if !self.launch(
+            self.moe_funcs[2],
+            (cols, t as u32),
+            256,
+            &mut [
+                &mut p_o as *mut u64 as *mut c_void,
+                &mut p_sl as *mut u64 as *mut c_void,
+                &mut p_y as *mut u64 as *mut c_void,
+                &mut h_u as *mut u32 as *mut c_void,
+                &mut k_u as *mut u32 as *mut c_void,
+            ],
+        ) {
+            return false;
+        }
+        if unsafe { self.cu.cuCtxSynchronize() } != 0 {
+            return false;
+        }
+        let t2 = Instant::now();
+        if unsafe { self.cu.cuMemcpyDtoH_v2(y.as_mut_ptr() as *mut c_void, st.mx.0, t * h * 4) } != 0 {
+            return false;
+        }
+        self.stats.calls.fetch_add(1, Ordering::Relaxed);
+        self.stats.copy_in_ns.fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
+        self.stats.gpu_ns.fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
+        self.stats.copy_out_ns.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        true
+    }
+
+    /// Every weight of `groups` as owned copies (not cached), or none.
+    fn upload_owned(&self, groups: &[&[WeightRef]]) -> Option<Vec<Vec<CudaWeight>>> {
+        let mut out: Vec<Vec<CudaWeight>> = Vec::with_capacity(groups.len());
+        for ws in groups {
+            let mut v = Vec::with_capacity(ws.len());
+            for w in ws.iter() {
+                match self.upload_weight(w) {
+                    Some(cw) => v.push(cw),
+                    None => {
+                        for cw in out.iter().flatten().chain(&v) {
+                            self.free_weight(cw);
+                        }
+                        return None;
+                    }
+                }
+            }
+            out.push(v);
+        }
+        Some(out)
+    }
+
+    /// Drops a weight [`Self::upload_cached`] just uploaded.
+    fn forget_cached(&self, w: &WeightRef, cw: &CudaWeight) {
+        let Some(key) = weight_key(w) else { return };
+        self.wcache.lock().unwrap().remove(&key);
+        self.free_weight(cw);
+    }
+
     fn free_weight(&self, cw: &CudaWeight) {
         for p in [cw.data, cw.scales, cw.offsets] {
             if p != 0 {
@@ -719,6 +1053,45 @@ impl CudaBackend {
         };
         grow(&mut st.x, &mut st.x_cap, x_bytes) && grow(&mut st.y, &mut st.y_cap, y_bytes)
     }
+}
+
+/// The upload cache's key of a weight: its address, length and a fingerprint of samples of its
+/// bytes (memory freed and reused at the same address by other weights must not hit).
+fn weight_key(w: &WeightRef) -> Option<(usize, usize, u64)> {
+    fn sample(b: &[u8], h: &mut u64) {
+        let n = b.len();
+        for start in [0, n / 2, n.saturating_sub(256)] {
+            for &x in &b[start.min(n)..(start + 256).min(n)] {
+                *h = (*h ^ x as u64).wrapping_mul(0x100000001b3);
+            }
+        }
+    }
+    fn bytes<T>(v: &[T]) -> &[u8] {
+        // SAFETY: plain numeric data viewed as bytes.
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+    }
+    let mut h = 0xcbf29ce484222325u64;
+    let (p, n) = match w {
+        WeightRef::Bf16(v) => {
+            sample(bytes(v), &mut h);
+            (v.as_ptr() as usize, v.len() * 2)
+        }
+        WeightRef::Q8(m) => {
+            sample(bytes(&m.q[..]), &mut h);
+            sample(bytes(&m.scales[..]), &mut h);
+            (m.q.as_ptr() as usize, m.q.len())
+        }
+        WeightRef::Q4(m) => {
+            sample(&m.q[..], &mut h);
+            sample(bytes(&m.scales[..]), &mut h);
+            if let Some(o) = &m.offsets {
+                sample(bytes(&o.v[..]), &mut h);
+            }
+            (m.q.as_ptr() as usize, m.q.len())
+        }
+        WeightRef::Gguf(_) => return None,
+    };
+    Some((p, n, h))
 }
 
 fn check(cu: &Cu, rc: c_int, what: &str) -> Result<()> {
@@ -1118,6 +1491,30 @@ impl Backend for CudaBackend {
         true
     }
 
+    fn decodes(&self) -> bool {
+        true
+    }
+
+    /// Measured on an RTX 5080: Qwen3.5-9B Q4 decodes at 111 tok/s plainly, 32 with MTP (the MTP
+    /// layer drafts on the CPU); Qwen3-4B 4-bit at 173 plainly, 140 with its DSpark draft.
+    fn prefers_plain_decode(&self) -> bool {
+        true
+    }
+
+    fn decode_plan<'s>(&'s self, g: &crate::gpu::decode::Graph) -> Option<Box<dyn crate::gpu::decode::DecodePlan + 's>> {
+        self.build_plan(g, 1)
+            .map(|p| Box::new(p) as Box<dyn crate::gpu::decode::DecodePlan + 's>)
+    }
+
+    fn decode_plan_multi<'s>(
+        &'s self,
+        g: &crate::gpu::decode::Graph,
+        tokens: usize,
+    ) -> Option<Box<dyn crate::gpu::decode::DecodePlan + 's>> {
+        self.build_plan(g, tokens)
+            .map(|p| Box::new(p) as Box<dyn crate::gpu::decode::DecodePlan + 's>)
+    }
+
     fn upload_moe(
         &self,
         gate_up: &[WeightRef],
@@ -1127,221 +1524,23 @@ impl Backend for CudaBackend {
         mi: usize,
         act: crate::gpu::MoeAct,
     ) -> Option<DeviceWeight> {
-        let n = gate_up.len();
-        if !crate::gpu::moe_offload() || n == 0 || down.len() != n || up.is_some_and(|u| u.len() != n) || !self.bind() {
-            return None;
-        }
-        // The GEMM tiles: whole tiles of outputs, whole blocks of 32 inputs.
-        let g_rows = if up.is_some() { mi } else { 2 * mi };
-        if !g_rows.is_multiple_of(TILE) || !h.is_multiple_of(TILE) || !h.is_multiple_of(32) || !mi.is_multiple_of(32) {
-            return None;
-        }
-        // One kernel per projection: every expert in the same format.
-        let func = |ws: &[WeightRef]| -> Option<*mut c_void> {
-            let f = self.gemm_func(&ws[0])?;
-            ws.iter().all(|w| self.gemm_func(w) == Some(f)).then_some(f)
-        };
-        let funcs = [func(gate_up)?, up.map_or(Some(std::ptr::null_mut()), func)?, func(down)?];
-        // All experts or none (VRAM): a partial upload is freed again.
-        let mut done: Vec<CudaWeight> = Vec::new();
-        let mut take = |ws: &[WeightRef]| -> Option<Vec<CudaWeight>> {
-            let mut v = Vec::with_capacity(ws.len());
-            for w in ws {
-                match self.upload_weight(w) {
-                    Some(cw) => v.push(cw),
-                    None => {
-                        for cw in v.iter().chain(done.iter()) {
-                            self.free_weight(cw);
-                        }
-                        return None;
-                    }
-                }
-            }
-            done.extend(v.iter().copied());
-            Some(v)
-        };
-        let gu = take(gate_up)?;
-        let upw = match up {
-            Some(u) => Some(take(u)?),
-            None => None,
-        };
-        let dw = take(down)?;
-        Some(Box::new(MoeDev {
-            gu,
-            up: upw,
-            down: dw,
-            funcs,
-            act,
-        }))
+        self.moe_state(gate_up, up, down, h, mi, act, true)
+    }
+
+    fn upload_moe_transient(
+        &self,
+        gate_up: &[WeightRef],
+        up: Option<&[WeightRef]>,
+        down: &[WeightRef],
+        h: usize,
+        mi: usize,
+        act: crate::gpu::MoeAct,
+    ) -> Option<DeviceWeight> {
+        self.moe_state(gate_up, up, down, h, mi, act, false)
     }
 
     fn moe(&self, x: &[f32], t: usize, h: usize, mi: usize, routes: &[Vec<(usize, f32)>], dev: &DeviceWeight, y: &mut [f32]) -> bool {
-        let Some(md) = dev.downcast_ref::<MoeDev>() else {
-            return false;
-        };
-        let k = routes.first().map_or(0, |r| r.len());
-        if !crate::gpu::moe_offload()
-            || t == 0
-            || k == 0
-            || routes.len() != t
-            || routes.iter().any(|r| r.len() != k || r.iter().any(|&(e, _)| e >= md.gu.len()))
-            || x.len() < t * h
-            || y.len() < t * h
-            || !self.bind()
-        {
-            return false;
-        }
-        // One segment of rows per expert, in expert order, padded to whole GEMM tiles.
-        let ne = md.gu.len();
-        let mut count = vec![0usize; ne];
-        for &(e, _) in routes.iter().flatten() {
-            count[e] += 1;
-        }
-        let mut segs = Vec::with_capacity(ne);
-        let mut rows = 0usize;
-        for &c in &count {
-            segs.push(rows);
-            rows += c.next_multiple_of(TILE);
-        }
-        // Gathered row sources (t: padding), and each token's (row, weight bits) slots.
-        let mut src = vec![t as u32; rows];
-        let mut fill = segs.clone();
-        let mut slots = vec![0u32; 2 * t * k];
-        for (ti, r) in routes.iter().enumerate() {
-            for (j, &(e, w)) in r.iter().enumerate() {
-                let i = fill[e];
-                fill[e] += 1;
-                src[i] = ti as u32;
-                slots[2 * (ti * k + j)] = i as u32;
-                slots[2 * (ti * k + j) + 1] = w.to_bits();
-            }
-        }
-        let split = md.up.is_some();
-        let mut st = self.staging.lock().unwrap();
-        let st = &mut *st;
-        let ok = self.grow(&mut st.mx, t * h * 4)
-            && self.grow(&mut st.msrc, rows * 4)
-            && self.grow(&mut st.mxs, rows * h * 4)
-            && self.grow(&mut st.mgu, rows * 2 * mi * 4)
-            && self.grow(&mut st.ma, rows * mi * 4)
-            && self.grow(&mut st.mo, rows * h * 4)
-            && self.grow(&mut st.mslots, slots.len() * 4);
-        if !ok {
-            return false;
-        }
-        let t0 = Instant::now();
-        // y goes up too: the combination adds to it in the CPU's order.
-        if !(self.htod(st.mx.0, &x[..t * h]) && self.htod(st.msrc.0, &src) && self.htod(st.mslots.0, &slots)) {
-            return false;
-        }
-        let t1 = Instant::now();
-        let (mut p_x, mut p_src, mut p_xs, mut h_u, mut t_u) = (st.mx.0, st.msrc.0, st.mxs.0, h as u32, t as u32);
-        let cols = (h as u32).div_ceil(256).min(64);
-        if !self.launch(
-            self.moe_funcs[0],
-            (cols, rows as u32),
-            256,
-            &mut [
-                &mut p_x as *mut u64 as *mut c_void,
-                &mut p_src as *mut u64 as *mut c_void,
-                &mut p_xs as *mut u64 as *mut c_void,
-                &mut h_u as *mut u32 as *mut c_void,
-                &mut t_u as *mut u32 as *mut c_void,
-            ],
-        ) {
-            return false;
-        }
-        // Gate/up and down GEMMs per expert over its segment (experts with no rows are skipped).
-        for e in 0..ne {
-            let len = count[e].next_multiple_of(TILE);
-            if len == 0 {
-                continue;
-            }
-            let r0 = segs[e];
-            let xs = st.mxs.0 + (r0 * h * 4) as u64;
-            let ok = match &md.up {
-                Some(up) => {
-                    self.gemm(md.funcs[0], &md.gu[e], xs, st.mgu.0 + (r0 * mi * 4) as u64, mi, h, len)
-                        && self.gemm(md.funcs[1], &up[e], xs, st.mgu.0 + ((rows + r0) * mi * 4) as u64, mi, h, len)
-                }
-                None => self.gemm(md.funcs[0], &md.gu[e], xs, st.mgu.0 + (r0 * 2 * mi * 4) as u64, 2 * mi, h, len),
-            };
-            if !ok {
-                return false;
-            }
-        }
-        let (kind, limit) = match md.act {
-            crate::gpu::MoeAct::Silu => (0u32, 0f32),
-            crate::gpu::MoeAct::GeluTanh => (1, 0.0),
-            crate::gpu::MoeAct::SiluClamp(l) => (2, l),
-        };
-        let (mut p_gu, mut p_a, mut rows_u, mut mi_u, mut split_u, mut kind_u, mut limit_f) =
-            (st.mgu.0, st.ma.0, rows as u32, mi as u32, split as u32, kind, limit);
-        if !self.launch(
-            self.moe_funcs[1],
-            ((rows * mi).div_ceil(256) as u32, 1),
-            256,
-            &mut [
-                &mut p_gu as *mut u64 as *mut c_void,
-                &mut p_a as *mut u64 as *mut c_void,
-                &mut rows_u as *mut u32 as *mut c_void,
-                &mut mi_u as *mut u32 as *mut c_void,
-                &mut split_u as *mut u32 as *mut c_void,
-                &mut kind_u as *mut u32 as *mut c_void,
-                &mut limit_f as *mut f32 as *mut c_void,
-            ],
-        ) {
-            return false;
-        }
-        for e in 0..ne {
-            let len = count[e].next_multiple_of(TILE);
-            if len == 0 {
-                continue;
-            }
-            let r0 = segs[e];
-            if !self.gemm(
-                md.funcs[2],
-                &md.down[e],
-                st.ma.0 + (r0 * mi * 4) as u64,
-                st.mo.0 + (r0 * h * 4) as u64,
-                h,
-                mi,
-                len,
-            ) {
-                return false;
-            }
-        }
-        // The input buffer is free again: it takes y for the combination.
-        if !self.htod(st.mx.0, &y[..t * h]) {
-            return false;
-        }
-        let (mut p_o, mut p_sl, mut p_y, mut k_u) = (st.mo.0, st.mslots.0, st.mx.0, k as u32);
-        if !self.launch(
-            self.moe_funcs[2],
-            (cols, t as u32),
-            256,
-            &mut [
-                &mut p_o as *mut u64 as *mut c_void,
-                &mut p_sl as *mut u64 as *mut c_void,
-                &mut p_y as *mut u64 as *mut c_void,
-                &mut h_u as *mut u32 as *mut c_void,
-                &mut k_u as *mut u32 as *mut c_void,
-            ],
-        ) {
-            return false;
-        }
-        if unsafe { self.cu.cuCtxSynchronize() } != 0 {
-            return false;
-        }
-        let t2 = Instant::now();
-        if unsafe { self.cu.cuMemcpyDtoH_v2(y.as_mut_ptr() as *mut c_void, st.mx.0, t * h * 4) } != 0 {
-            return false;
-        }
-        self.stats.calls.fetch_add(1, Ordering::Relaxed);
-        self.stats.copy_in_ns.fetch_add((t1 - t0).as_nanos() as u64, Ordering::Relaxed);
-        self.stats.gpu_ns.fetch_add((t2 - t1).as_nanos() as u64, Ordering::Relaxed);
-        self.stats.copy_out_ns.fetch_add(t2.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        true
+        self.moe_run(x, t, h, mi, routes, dev, y)
     }
 }
 
@@ -1976,6 +2175,233 @@ mod tests {
             }
             let e = row_err(&y, &r, h);
             assert!(e < 1e-4, "{act:?}: error {e}");
+            // The same experts as transient copies (streamed weights): the same result.
+            let tdev = be
+                .upload_moe_transient(&gate_up, split.then_some(&up[..]), &down, h, mi, act)
+                .expect("upload_moe_transient");
+            let mut y2 = y0.clone();
+            assert!(be.moe(&x, t, h, mi, &routes, &tdev, &mut y2), "moe declined (transient)");
+            assert!(y2 == y, "{act:?}: transient experts differ");
+            drop(tdev);
+        }
+    }
+
+    /// The decode matvecs (`cuda_decode.cu`): every format and output mode against the f64
+    /// definition, and the multi-token kernel bit-identical to the single-token one per token
+    /// (what makes a verification pass equal to one-token steps).
+    #[test]
+    fn decode_matvecs_match_definition_and_each_other() {
+        let Some(be) = backend() else { return };
+        assert!(be.bind());
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct Dw {
+            q: u64,
+            s: u64,
+            o: u64,
+            gpr: u32,
+            gk: u32,
+        }
+        let dw = |cw: &CudaWeight| Dw {
+            q: cw.data,
+            s: cw.scales,
+            o: cw.offsets,
+            gpr: cw.gpr,
+            gk: cw.gk,
+        };
+        // 100 rows: a partial group of 4 rows per warp, and of 16 per block.
+        let (n_out, n_in, t) = (100, 2560, 5);
+        let mut seed = 21;
+        let w = bf16(n_out * n_in, &mut seed);
+        let w2 = bf16(n_out * n_in, &mut seed);
+        let (q8, q8b) = (quantize_bf16(&w, n_out, n_in), quantize_bf16(&w2, n_out, n_in));
+        let (q4, q4b) = (quantize_q4(&w, n_out, n_in), quantize_q4(&w2, n_out, n_in));
+        let (qa, _) = affine(n_out, n_in, 64, &mut seed);
+        let (qa2, _) = affine(n_out, n_in, 64, &mut seed);
+        type Case<'a> = (&'a str, WeightRef<'a>, WeightRef<'a>, Vec<f32>, Vec<f32>);
+        let cases: Vec<Case> = vec![
+            ("bf", WeightRef::Bf16(&w), WeightRef::Bf16(&w2), dense_bf(&w), dense_bf(&w2)),
+            ("q8", WeightRef::Q8(&q8), WeightRef::Q8(&q8b), dense_q8(&q8), dense_q8(&q8b)),
+            ("q4", WeightRef::Q4(&q4), WeightRef::Q4(&q4b), dense_q4(&q4), dense_q4(&q4b)),
+            ("q4a", WeightRef::Q4(&qa), WeightRef::Q4(&qa2), dense_q4(&qa), dense_q4(&qa2)),
+        ];
+        // Token rows 800 floats apart (a multi-token plan's padded stride), one gate per token.
+        let xs = 2624usize;
+        let x: Vec<f32> = (0..t * xs).map(|_| rnd(&mut seed) * 2.0).collect();
+        let gates: Vec<f32> = (0..t).map(|_| rnd(&mut seed) * 4.0).collect();
+        let y0: Vec<f32> = (0..t * n_out).map(|_| rnd(&mut seed)).collect();
+        let dx = be.upload_bytes(x.as_ptr() as *const u8, x.len() * 4).unwrap();
+        let dg = be.upload_bytes(gates.as_ptr() as *const u8, gates.len() * 4).unwrap();
+        let mut dy = 0u64;
+        assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut dy, t * n_out * 4) }, 0);
+        let down = |n: usize| -> Vec<f32> {
+            let mut v = vec![0f32; n];
+            assert_eq!(unsafe { be.cu.cuMemcpyDtoH_v2(v.as_mut_ptr() as *mut c_void, dy, n * 4) }, 0);
+            v
+        };
+        for (name, a, b, da, db) in &cases {
+            let (ca, cb) = (dw(&be.upload_weight(a).unwrap()), dw(&be.upload_weight(b).unwrap()));
+            let (f1, fk) = (be.func(&format!("dmv_{name}")).unwrap(), be.func(&format!("dmvk_{name}")).unwrap());
+            for mode in 0u32..5 {
+                // Single-token kernel, token by token.
+                assert!(be.htod(dy, &y0));
+                for j in 0..t {
+                    let (xj, yj, gj) = (dx + (j * xs * 4) as u64, dy + (j * n_out * 4) as u64, dg + (j * 4) as u64);
+                    let (no, ni) = (n_out as u32, n_in as u32);
+                    let mut args = [
+                        &ca as *const _ as *mut c_void,
+                        &cb as *const _ as *mut c_void,
+                        &xj as *const _ as *mut c_void,
+                        &yj as *const _ as *mut c_void,
+                        &no as *const _ as *mut c_void,
+                        &ni as *const _ as *mut c_void,
+                        &mode as *const _ as *mut c_void,
+                        &gj as *const _ as *mut c_void,
+                    ];
+                    assert!(be.launch(f1, ((n_out as u32).div_ceil(16), 1), 128, &mut args));
+                }
+                let single = down(t * n_out);
+                // Multi-token kernel, all tokens at once.
+                assert!(be.htod(dy, &y0));
+                let (no, ni, xsu, ysu, gs, nt) = (n_out as u32, n_in as u32, xs as u32, n_out as u32, 1u32, t as u32);
+                let mut args = [
+                    &ca as *const _ as *mut c_void,
+                    &cb as *const _ as *mut c_void,
+                    &dx as *const _ as *mut c_void,
+                    &xsu as *const _ as *mut c_void,
+                    &dy as *const _ as *mut c_void,
+                    &ysu as *const _ as *mut c_void,
+                    &no as *const _ as *mut c_void,
+                    &ni as *const _ as *mut c_void,
+                    &mode as *const _ as *mut c_void,
+                    &dg as *const _ as *mut c_void,
+                    &gs as *const _ as *mut c_void,
+                    &nt as *const _ as *mut c_void,
+                ];
+                assert!(be.launch(fk, ((n_out as u32).div_ceil(32), 1), 256, &mut args));
+                let multi = down(t * n_out);
+                assert!(
+                    single.iter().zip(&multi).all(|(p, q)| p.to_bits() == q.to_bits()),
+                    "{name} mode {mode}: the multi-token kernel differs from the single-token one"
+                );
+                // The definition, in f64.
+                let mut r = vec![0f32; t * n_out];
+                for j in 0..t {
+                    let xr = &x[j * xs..j * xs + n_in];
+                    for o in 0..n_out {
+                        let dot = |m: &[f32]| (0..n_in).map(|k| m[o * n_in + k] as f64 * xr[k] as f64).sum::<f64>();
+                        let (av, bv, y) = (dot(da), dot(db), y0[j * n_out + o] as f64);
+                        let g = gates[j] as f64;
+                        r[j * n_out + o] = match mode {
+                            0 => av,
+                            1 => y + av,
+                            2 => av / (1.0 + (-av).exp()) * bv,
+                            3 => 0.5 * av * (1.0 + (0.7978845608 * (av + 0.044715 * av * av * av)).tanh()) * bv,
+                            _ => y + av / (1.0 + (-g).exp()),
+                        } as f32;
+                    }
+                }
+                let e = row_err(&multi, &r, n_out);
+                assert!(e < 1e-5, "{name} mode {mode}: error {e} against the definition");
+            }
+        }
+    }
+
+    /// `cargo test --release --lib decode_matvec_bench -- --ignored --nocapture`: the decode
+    /// matvecs on a 12288 x 4096 Q4 matrix, one token and four.
+    #[test]
+    #[ignore]
+    fn decode_matvec_bench() {
+        let Some(be) = backend() else { return };
+        assert!(be.bind());
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Dw {
+            q: u64,
+            s: u64,
+            o: u64,
+            gpr: u32,
+            gk: u32,
+        }
+        let (n_out, n_in) = (12288usize, 4096usize);
+        let mut seed = 5;
+        for name in ["q4", "bf"] {
+            let w = bf16(n_out * n_in, &mut seed);
+            let q = quantize_q4(&w, n_out, n_in);
+            let cw = if name == "q4" {
+                be.upload_weight(&WeightRef::Q4(&q)).unwrap()
+            } else {
+                be.upload_weight(&WeightRef::Bf16(&w)).unwrap()
+            };
+            let d = Dw {
+                q: cw.data,
+                s: cw.scales,
+                o: cw.offsets,
+                gpr: cw.gpr,
+                gk: cw.gk,
+            };
+            let x = vec![0.5f32; 8 * n_in];
+            let dx = be.upload_bytes(x.as_ptr() as *const u8, x.len() * 4).unwrap();
+            let mut dy = 0u64;
+            unsafe { be.cu.cuMemAlloc_v2(&mut dy, 8 * n_out * 4) };
+            let bytes = if name == "q4" {
+                n_out * n_in / 2 + n_out * n_in / 16
+            } else {
+                n_out * n_in * 2
+            };
+            let f1 = be.func(&format!("dmv_{name}")).unwrap();
+            let fk = be.func(&format!("dmvk_{name}")).unwrap();
+            let (no, ni, mode, g0) = (n_out as u32, n_in as u32, 0u32, 0u64);
+            let time = |f: &dyn Fn()| {
+                f();
+                unsafe { be.cu.cuCtxSynchronize() };
+                let t0 = std::time::Instant::now();
+                for _ in 0..50 {
+                    f();
+                }
+                unsafe { be.cu.cuCtxSynchronize() };
+                t0.elapsed().as_secs_f64() / 50.0
+            };
+            let s1 = time(&|| {
+                let mut a = [
+                    &d as *const _ as *mut c_void,
+                    &d as *const _ as *mut c_void,
+                    &dx as *const _ as *mut c_void,
+                    &dy as *const _ as *mut c_void,
+                    &no as *const _ as *mut c_void,
+                    &ni as *const _ as *mut c_void,
+                    &mode as *const _ as *mut c_void,
+                    &g0 as *const _ as *mut c_void,
+                ];
+                be.launch(f1, (no.div_ceil(16), 1), 128, &mut a);
+            });
+            for nt in [1u32, 4, 8] {
+                let (xs, ys, gs) = (ni, no, 0u32);
+                let sk = time(&|| {
+                    let mut a = [
+                        &d as *const _ as *mut c_void,
+                        &d as *const _ as *mut c_void,
+                        &dx as *const _ as *mut c_void,
+                        &xs as *const _ as *mut c_void,
+                        &dy as *const _ as *mut c_void,
+                        &ys as *const _ as *mut c_void,
+                        &no as *const _ as *mut c_void,
+                        &ni as *const _ as *mut c_void,
+                        &mode as *const _ as *mut c_void,
+                        &g0 as *const _ as *mut c_void,
+                        &gs as *const _ as *mut c_void,
+                        &nt as *const _ as *mut c_void,
+                    ];
+                    be.launch(fk, (no.div_ceil(32), 1), 256, &mut a);
+                });
+                eprintln!(
+                    "{name}: single {:.0} us ({:.0} GB/s); multi t={nt} {:.0} us ({:.0} GB/s)",
+                    s1 * 1e6,
+                    bytes as f64 / s1 / 1e9,
+                    sk * 1e6,
+                    bytes as f64 / sk / 1e9
+                );
+            }
         }
     }
 

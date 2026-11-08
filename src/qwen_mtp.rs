@@ -466,9 +466,10 @@ pub const BY_DEFAULT: &[&str] = &["Qwen3.5-4B", "Qwen3.5-9B"];
 /// converted copy or the download cache's `org--name` folder) decodes with its MTP layer unless
 /// told otherwise (if it has one).
 pub fn by_default(model: &std::path::Path) -> bool {
-    crate::dspark::model_names(model)
-        .iter()
-        .any(|n| BY_DEFAULT.iter().any(|d| d.eq_ignore_ascii_case(n)))
+    !crate::gpu::plain_decode_preferred()
+        && crate::dspark::model_names(model)
+            .iter()
+            .any(|n| BY_DEFAULT.iter().any(|d| d.eq_ignore_ascii_case(n)))
 }
 
 /// The longest draft whose verification (`draft + 1` tokens) still runs the decode matmul

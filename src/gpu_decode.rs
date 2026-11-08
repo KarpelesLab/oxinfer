@@ -419,6 +419,9 @@ pub struct Step<'s, 'c> {
     /// The step's keys and values are scratch (a DSpark draft block): they are not appended to
     /// the host caches, and the next step overwrites them.
     pub scratch: bool,
+    /// The recurrent states are exactly as the last step on this slot left them (nothing on the
+    /// host wrote them since): a backend holding device copies may skip copying them up.
+    pub states_kept: bool,
 }
 
 /// A compiled graph.

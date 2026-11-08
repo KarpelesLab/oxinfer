@@ -190,6 +190,12 @@ pub trait Backend: Send + Sync {
     fn decodes(&self) -> bool {
         false
     }
+    /// Whether this backend's plain decoding outruns speculative decoding (whose drafts run on the
+    /// CPU): the speculative defaults (MTP, DSpark drafts) then give way to plain decoding; asking
+    /// for them explicitly still uses them.
+    fn prefers_plain_decode(&self) -> bool {
+        false
+    }
     /// Compiles a single-token decode graph (see [`decode`]); None when the backend cannot run
     /// some op or weight of it (the model then decodes on the CPU).
     fn decode_plan<'s>(&'s self, _g: &decode::Graph) -> Option<Box<dyn decode::DecodePlan + 's>> {
@@ -289,6 +295,12 @@ pub fn set_decode(on: Option<bool>) {
 pub fn decode_enabled() -> bool {
     static ENV: OnceLock<Option<String>> = OnceLock::new();
     switch(&DECODE, &ENV, "OXINFER_GPU_DECODE", |v| v != "0", true)
+}
+
+/// True when the active backend decodes on the device and prefers plain decoding there (see
+/// [`Backend::prefers_plain_decode`]).
+pub fn plain_decode_preferred() -> bool {
+    decode_enabled() && active().is_some_and(|b| b.decodes() && b.prefers_plain_decode())
 }
 
 /// Installs the backend for this process (call once, before loading models).

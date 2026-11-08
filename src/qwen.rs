@@ -389,6 +389,9 @@ pub struct QwenSession {
     pub pos: usize,
     /// Device state of GPU decoding (KV cache copies).
     pub(crate) gpu: crate::gpu::decode::Slot,
+    /// The recurrent states are as the last GPU step left them (see
+    /// [`crate::gpu::decode::Step::states_kept`]); every CPU write clears it.
+    pub(crate) gpu_states_kept: bool,
     /// Runtime interventions ([`crate::intervene`]).
     pub iv: crate::intervene::State,
     /// Layers whose output (the residual stream after the layer, before the final norm, as
@@ -427,6 +430,7 @@ impl QwenSession {
         if pos >= self.pos {
             return Ok(());
         }
+        self.gpu_states_kept = false;
         if let Some(e) = &mut self.exp {
             // After a GPU pass the n-gram conv state is replayed with the recurrent states below.
             if self.gpu_rec.is_some() {
@@ -947,6 +951,7 @@ impl<'a> QwenModel<'a> {
             spans: Vec::new(),
             pos: 0,
             gpu: Default::default(),
+            gpu_states_kept: false,
             iv: Default::default(),
             capture: Vec::new(),
             captured: Vec::new(),
@@ -1340,6 +1345,7 @@ impl<'a> QwenModel<'a> {
         cs.extend_from_slice(&sin);
         let mut hidden = vec![0f32; h];
         let mut logits = want_logits.then(|| vec![0f32; cfg.vocab_size]);
+        let kept = sess.gpu_states_kept;
         let mut kv: Vec<&mut LayerCache> = sess.kv.iter_mut().flatten().collect();
         let mut states: Vec<&mut [f32]> = sess
             .gdn
@@ -1362,8 +1368,10 @@ impl<'a> QwenModel<'a> {
                 params: data.zip(ivc.as_ref()).map(|(d, c)| (&hot[..], &d.cold[..], c.id())),
                 capture: None,
                 scratch: false,
+                states_kept: kept,
             },
         );
+        sess.gpu_states_kept = ok;
         if !ok {
             return None;
         }
@@ -1503,6 +1511,7 @@ impl<'a> QwenModel<'a> {
                 unsafe { std::ptr::copy_nonoverlapping(s as *const f32, d as *mut f32, n) };
             });
         }
+        let kept = sess.gpu_states_kept;
         let mut kv: Vec<&mut LayerCache> = sess.kv.iter_mut().flatten().collect();
         let mut states: Vec<&mut [f32]> = sess
             .gdn
@@ -1525,8 +1534,10 @@ impl<'a> QwenModel<'a> {
                 params: None,
                 capture: Some(&mut captured),
                 scratch: false,
+                states_kept: kept,
             },
         );
+        sess.gpu_states_kept = ok;
         if !ok {
             if std::env::var_os("OXINFER_METAL_TRACE").is_some() {
                 eprintln!("[multi-token GPU step failed: {t} tokens at {}]", sess.pos);
@@ -1704,6 +1715,7 @@ impl<'a> QwenModel<'a> {
             match &layer.mixer {
                 Mixer::Gdn(gd) => {
                     let rec = if record { Some(&mut sess.rec[l]) } else { None };
+                    sess.gpu_states_kept = false;
                     self.gdn_forward(gd, sess.gdn[l].as_mut().unwrap(), rec, &hn, t, &mut y)
                 }
                 Mixer::Attn(at) => self.attn_forward(at, sess.kv[l].as_mut().unwrap(), &hn, t, start, &cos, &sin, &mut y),
