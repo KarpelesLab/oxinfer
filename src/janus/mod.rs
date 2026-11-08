@@ -24,6 +24,7 @@ use crate::model::Quant;
 use crate::platform::DevicePref;
 use crate::safetensors::ModelFiles;
 use crate::sampler::Sampler;
+use crate::tokenizer::Tokenizer;
 use crate::video::RgbImage;
 use anyhow::{Context, Result, anyhow, bail};
 use llm::{LlamaConfig, Llm};
@@ -31,7 +32,6 @@ use siglip::{Dense, VisionEncoder, gelu_inplace};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokenizers::Tokenizer;
 use vq::VqDecoder;
 
 /// A generated image (tightly packed RGB8; `to_video_frame()` with the `oxideav` feature).

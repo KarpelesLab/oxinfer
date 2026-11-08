@@ -30,6 +30,7 @@ use crate::model::Quant;
 use crate::platform::DevicePref;
 use crate::safetensors::ModelFiles;
 use crate::sampler::Sampler;
+use crate::tokenizer::Tokenizer;
 use crate::video::RgbImage;
 use anyhow::{Context, Result, anyhow, bail};
 use llm::{Block, Ctx, Kv, Llm, LlmConfig, Proj, project};
@@ -37,7 +38,6 @@ use siglip::{Vit, VitConfig};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokenizers::Tokenizer;
 
 /// A generated image (tightly packed RGB8; `to_video_frame()` with the `oxideav` feature).
 pub use crate::sd::Image;

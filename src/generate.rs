@@ -14,7 +14,7 @@ use crate::prof;
 use crate::qwen::{QwenModel, QwenSession};
 use crate::qwen_mtp::MtpDecoder;
 use crate::sampler::{Sampler, argmax};
-use tokenizers::Tokenizer;
+use crate::tokenizer::Tokenizer;
 
 /// Common surface of the model families (Gemma 4 / Gemma 3, Qwen 3.5/3.8 and Qwen3) used by the
 /// generation loops.

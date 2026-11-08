@@ -155,6 +155,8 @@ oxideav-av1 = { version = "0.1.21", optional = true }
 oxideav-mpeg4video = { version = "0.1.8", optional = true }
 anyhow = "1.0.104"
 half = "2.7.1"
+# Unicode tables of the tokenizer: general categories, normalization forms, grapheme clusters.
+intl = { version = "0.6.4", default-features = false, features = ["full", "normalization", "segmentation"] }
 # CLIP tokenizer pre-tokenization (Unicode letter / number classes).
 regex = { version = "1.12", default-features = false, features = ["std", "unicode"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -167,10 +169,6 @@ getrandom = { version = "0.3", default-features = false, optional = true }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 httpsd = { version = "0.2.0", default-features = false, features = ["rt-threadpool", "tls"], optional = true }
 memmap2 = "0.9.11"
-tokenizers = { version = "0.23.2", default-features = false, features = ["unstable_wasm"] }
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-tokenizers = { version = "0.23.2", default-features = false, features = ["unstable_wasm"] }
 
 # tests/oxideav_e2e.rs decodes and encodes media the way an oxideav pipeline does.
 [dev-dependencies]

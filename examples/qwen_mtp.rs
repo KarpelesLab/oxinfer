@@ -24,7 +24,7 @@ fn main() -> anyhow::Result<()> {
     let model = QwenModel::load(QwenConfig::load(&dir)?, &files, Quant::Q8)?;
     // The MTP layer can also come from a sidecar `ModelFiles` with the same tensor names.
     let mtp = model.load_mtp(&files)?;
-    let tok = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let tok = oxinfer::tokenizer::Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("{e}"))?;
     let fmt = chat::QwenChat::for_model(&dir);
     let stop = chat::with_turn_end(fmt, &tok, load_eos_ids(&dir));
 

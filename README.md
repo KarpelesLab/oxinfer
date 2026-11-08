@@ -3510,6 +3510,18 @@ engine (`capi` feature, `include/oxinfer.h`) and a SwiftUI test app for iOS are 
 (see `ios/README.md`). Neuron edits, steering vectors, directional ablation and SAE features are
 `Engine::set_interventions` (see [Runtime interventions](#runtime-interventions-neuron-edits-steering-abliteration-sae-features)).
 
+Tokenization is in the crate too: `oxinfer::tokenizer::Tokenizer` reads HuggingFace
+`tokenizer.json` files (BPE, Unigram, WordPiece and WordLevel models with their normalizers,
+pre-tokenizers, post-processors and decoders, regex splits on a small backtracking engine with
+lookahead) and has the `encode` / `decode` / `token_to_id` API of the `tokenizers` crate, which
+oxinfer no longer depends on. It was compared with `tokenizers` 0.23.2 on 41 `tokenizer.json`
+files (Qwen 2.5 to 3.5, Llama 3, Mistral Small 3.2, Mistral Large 4's tekken, Gemma 3 and 4,
+DeepSeek V4, Janus, Whisper, CLIP, T5, the WordPiece encoders of BGE, MiniLM, MPNet, nomic and
+mxbai, the XLM-R Unigram of BGE-M3 and multilingual-E5, ModernBERT): ids, special-token masks
+and decoding with and without special tokens agree on 30,037 texts each (a multilingual corpus
+and random strings of added tokens, combining marks, emoji, control characters and whitespace
+runs). Loading is faster (Gemma 4's 32 MB file: 280 ms instead of 430 ms).
+
 ### Using oxinfer from oxideav (and other crates)
 
 Images, audio and video in the API are [oxideav](https://crates.io/crates/oxideav-core) types:

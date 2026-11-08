@@ -62,12 +62,12 @@ use crate::qwen::{QwenModel, QwenSession};
 use crate::safetensors::ModelFiles;
 use crate::sampler::{Sampler, apply_repetition_penalty};
 use crate::snac::{Noise, Snac, SnacOptions};
+use crate::tokenizer::Tokenizer;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokenizers::Tokenizer;
 
 /// `<|begin_of_text|>`.
 pub const BOS: u32 = 128000;

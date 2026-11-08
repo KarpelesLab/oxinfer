@@ -50,13 +50,13 @@ use crate::platform::DevicePref;
 use crate::pool;
 use crate::safetensors::ModelFiles;
 use crate::sampler::{Sampler, argmax};
+use crate::tokenizer::Tokenizer;
 use anyhow::{Context, Result, bail};
 pub use model::{Precision, WhisperConfig, WhisperModel};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokenizers::Tokenizer;
 pub use tokens::{LANGUAGES, Special, language_code, language_name};
 
 /// Seconds per mel frame and per timestamp token.

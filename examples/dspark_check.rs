@@ -28,8 +28,8 @@ use oxinfer::generate::{self, Flow};
 use oxinfer::model::Quant;
 use oxinfer::safetensors::ModelFiles;
 use oxinfer::sampler::{Sampler, argmax};
+use oxinfer::tokenizer::Tokenizer;
 use std::path::{Path, PathBuf};
-use tokenizers::Tokenizer;
 
 fn write_f32(path: &Path, v: &[f32]) -> Result<()> {
     std::fs::write(path, v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>())?;

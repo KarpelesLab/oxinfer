@@ -4,11 +4,11 @@ use oxinfer::engine::{load_tokenizer, resolve_auto_draft, resolve_file, resolve_
 use oxinfer::generate::{self, Flow, SpecStats, TextLm, TextStream};
 use oxinfer::model::{Model, Quant, Session};
 use oxinfer::sampler::Sampler;
+use oxinfer::tokenizer::Tokenizer;
 use oxinfer::{config, drafter, platform, pool, prof, qwen, safetensors};
 use std::io::{BufRead, Read, Write};
 use std::path::PathBuf;
 use std::time::Instant;
-use tokenizers::Tokenizer;
 
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
 mod anemll_cli;

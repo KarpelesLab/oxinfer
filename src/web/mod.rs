@@ -21,11 +21,11 @@ use crate::chat::{ChatFormat, GemmaChat, QwenChat};
 use crate::model::{Model, Quant, Session};
 use crate::qwen::{QwenModel, QwenSession};
 use crate::sampler::Sampler;
+use crate::tokenizer::Tokenizer;
 use crate::{config, fsx, quant::PageVec, safetensors};
 use anyhow::{Result, anyhow, bail};
 use std::cell::RefCell;
 use std::path::Path;
-use tokenizers::Tokenizer;
 
 #[link(wasm_import_module = "env")]
 unsafe extern "C" {

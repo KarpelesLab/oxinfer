@@ -1,9 +1,9 @@
 //! Whisper's special tokens and generation settings, from `generation_config.json` (with the
 //! tokenizer's added tokens as the fallback for older checkpoints), and the language table.
 
+use crate::tokenizer::Tokenizer;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
-use tokenizers::Tokenizer;
 
 /// The languages Whisper was trained on: (code, English name), in token order.
 pub const LANGUAGES: [(&str, &str); 100] = [

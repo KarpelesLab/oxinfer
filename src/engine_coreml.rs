@@ -22,7 +22,7 @@ pub(super) struct CoreMlLm {
 pub(super) struct Loaded {
     pub lm: CoreMlLm,
     pub meta: Meta,
-    pub tok: tokenizers::Tokenizer,
+    pub tok: crate::tokenizer::Tokenizer,
     pub fmt: &'static (dyn crate::chat::ChatFormat + Sync),
     pub stop: Vec<u32>,
     pub family: Family,

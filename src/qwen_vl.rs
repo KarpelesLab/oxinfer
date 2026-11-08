@@ -87,7 +87,7 @@ pub struct QwenVl {
     model: QwenModel<'static>,
     tower: Option<QwenVisionTower<'static>>,
     pub mm: Option<QwenMmConfig>,
-    pub tokenizer: tokenizers::Tokenizer,
+    pub tokenizer: crate::tokenizer::Tokenizer,
     pub dir: PathBuf,
     _files: Box<ModelFiles>,
 }
@@ -242,7 +242,7 @@ impl QwenVl {
 
 /// A Qwen2 byte-level BPE tokenizer from `vocab.json` + `merges.txt` and the added tokens of
 /// `tokenizer_config.json` (folders without `tokenizer.json`, e.g. Qwen-Image's `tokenizer/`).
-pub fn qwen2_tokenizer_from_vocab(dir: &Path) -> Result<tokenizers::Tokenizer> {
+pub fn qwen2_tokenizer_from_vocab(dir: &Path) -> Result<crate::tokenizer::Tokenizer> {
     use serde_json::json;
     let vocab: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("vocab.json"))?)?;
     let merges_txt = String::from_utf8(crate::fsx::read(&dir.join("merges.txt"))?)?;
@@ -274,5 +274,5 @@ pub fn qwen2_tokenizer_from_vocab(dir: &Path) -> Result<tokenizers::Tokenizer> {
             "fuse_unk": false, "byte_fallback": false, "ignore_merges": false, "vocab": vocab, "merges": merges,
         },
     });
-    tokenizers::Tokenizer::from_bytes(serde_json::to_vec(&j)?).map_err(|e| anyhow::anyhow!("tokenizer from {}: {e}", dir.display()))
+    crate::tokenizer::Tokenizer::from_bytes(serde_json::to_vec(&j)?).map_err(|e| anyhow::anyhow!("tokenizer from {}: {e}", dir.display()))
 }

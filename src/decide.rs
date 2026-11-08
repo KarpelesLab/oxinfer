@@ -42,13 +42,13 @@
 
 use crate::engine::Attachments;
 use crate::lora::LoraAdapter;
+use crate::tokenizer::Tokenizer;
 use crate::video::RgbImage;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use tokenizers::Tokenizer;
 
 /// Most options a `choice` takes (wide labels).
 pub const MAX_OPTIONS: usize = 256;

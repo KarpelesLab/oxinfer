@@ -702,9 +702,9 @@ impl Meta {
     }
 
     /// The model's tokenizer (`tokenizer.json`).
-    pub fn tokenizer(&self) -> Result<tokenizers::Tokenizer> {
+    pub fn tokenizer(&self) -> Result<crate::tokenizer::Tokenizer> {
         let p = self.tokenizer_dir.join("tokenizer.json");
-        tokenizers::Tokenizer::from_file(&p).map_err(|e| anyhow!("{}: {e}", p.display()))
+        crate::tokenizer::Tokenizer::from_file(&p).map_err(|e| anyhow!("{}: {e}", p.display()))
     }
 
     fn tokenizer_config(&self) -> serde_json::Value {
@@ -741,7 +741,7 @@ impl Meta {
     /// Stop tokens as ANEMLL's `chat.py` collects them: the tokenizer's EOS token, then
     /// `<|endoftext|>`, `<end_of_turn>` and `<|eot_id|>` when the vocabulary has them, plus the
     /// chat format's end-of-turn token.
-    pub fn stop_tokens(&self, tok: &tokenizers::Tokenizer, fmt: &dyn crate::chat::ChatFormat) -> Vec<u32> {
+    pub fn stop_tokens(&self, tok: &crate::tokenizer::Tokenizer, fmt: &dyn crate::chat::ChatFormat) -> Vec<u32> {
         let cfg = self.tokenizer_config();
         let eos = &cfg["eos_token"];
         let mut ids = Vec::new();

@@ -2,7 +2,7 @@
 //! 24 blocks, width 4096, 64 heads of 64, gated-GELU feed-forward of 10240): RMS norms, no
 //! attention scaling, and a learned relative-position bias (32 buckets, max distance 128)
 //! computed once from the first block and shared by all. The tokenizer is the SentencePiece
-//! `tokenizer.json` through the `tokenizers` crate; prompts are padded (`<pad>`, attended like
+//! `tokenizer.json` through `crate::tokenizer`; prompts are padded (`<pad>`, attended like
 //! any token, as diffusers runs it) to a fixed length.
 
 use super::weights::{Dense, Loader, forward_many};
@@ -33,7 +33,7 @@ pub struct T5Encoder {
     rel_bias: Vec<f32>,
     final_ln: Vec<f32>,
     blocks: Vec<Block<'static>>,
-    tokenizer: tokenizers::Tokenizer,
+    tokenizer: crate::tokenizer::Tokenizer,
     pub pad_id: u32,
     pub eos_id: u32,
     embed: &'static str,
@@ -85,7 +85,7 @@ impl T5Encoder {
             .context("T5: no token embedding (shared.weight)")?;
         let embed_dtype = fs.info(embed).unwrap().dtype.clone();
         let tokenizer =
-            tokenizers::Tokenizer::from_file(tok_dir.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("T5 tokenizer: {e}"))?;
+            crate::tokenizer::Tokenizer::from_file(tok_dir.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("T5 tokenizer: {e}"))?;
         let pad_id = cfg["pad_token_id"].as_u64().unwrap_or(0) as u32;
         let eos_id = cfg["eos_token_id"].as_u64().unwrap_or(1) as u32;
         let weight_bytes = blocks

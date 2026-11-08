@@ -12,9 +12,9 @@ use crate::mpnet::{MpnetConfig, MpnetModel};
 use crate::nomic_bert::{NomicBertConfig, NomicBertModel};
 use crate::qwen::QwenModel;
 use crate::safetensors::{ModelFiles, SafeTensors};
+use crate::tokenizer::Tokenizer;
 use anyhow::{Context, Result, anyhow, bail};
 use std::path::Path;
-use tokenizers::Tokenizer;
 
 enum Backbone<'a> {
     Gemma(Box<Model<'a>>),
@@ -254,7 +254,7 @@ impl<'a> Embedder<'a> {
             .unwrap_or(512) as usize;
 
         let mut tok = Tokenizer::from_bytes(crate::fsx::read(&dir.join("tokenizer.json"))?).map_err(|e| anyhow!("tokenizer: {e}"))?;
-        tok.with_truncation(Some(tokenizers::TruncationParams {
+        tok.with_truncation(Some(crate::tokenizer::TruncationParams {
             max_length: max_len,
             ..Default::default()
         }))

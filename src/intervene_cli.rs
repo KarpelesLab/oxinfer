@@ -7,9 +7,9 @@ use oxinfer::generate::TextLm;
 use oxinfer::intervene::{
     self, Ablate, FeatureEdit, FeatureOp, Host, Point, Pool, SaeInspect, SaeSteer, Spec, State, Steer, TokenFeatures,
 };
+use oxinfer::tokenizer::Tokenizer;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tokenizers::Tokenizer;
 
 /// The intervention flags.
 #[derive(Default)]

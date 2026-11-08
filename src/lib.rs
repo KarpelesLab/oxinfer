@@ -81,6 +81,7 @@ pub mod server;
 pub mod snac;
 pub mod step1x;
 pub mod stream;
+pub mod tokenizer;
 pub mod tools;
 pub mod torch;
 pub mod tts;

@@ -8,10 +8,10 @@ use oxinfer::anemll::{AnemllModel, Meta, Next, Options, PrefillMode};
 use oxinfer::chat::ChatFormat;
 use oxinfer::coreml::ComputeUnits;
 use oxinfer::sampler::Sampler;
+use oxinfer::tokenizer::Tokenizer;
 use std::io::{BufRead, Read};
 use std::path::Path;
 use std::time::Instant;
-use tokenizers::Tokenizer;
 
 fn units(args: &Args) -> Result<ComputeUnits> {
     if let Some(u) = &args.coreml_units {

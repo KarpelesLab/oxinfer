@@ -869,9 +869,9 @@ impl Header {
         }))
     }
 
-    pub fn tokenizer(&self) -> Result<tokenizers::Tokenizer> {
+    pub fn tokenizer(&self) -> Result<crate::tokenizer::Tokenizer> {
         let j = serde_json::to_vec(&self.tokenizer_json()?)?;
-        tokenizers::Tokenizer::from_bytes(j).map_err(|e| anyhow::anyhow!("GGUF tokenizer: {e}"))
+        crate::tokenizer::Tokenizer::from_bytes(j).map_err(|e| anyhow::anyhow!("GGUF tokenizer: {e}"))
     }
 }
 
@@ -1284,7 +1284,7 @@ mod tests {
         let spec = std::env::var("OXINFER_GGUF_TOK").expect("OXINFER_GGUF_TOK=FILE.gguf:MODEL_DIR:TEXT");
         let parts: Vec<&str> = spec.split(':').collect();
         let ours = read_header(Path::new(parts[0])).unwrap().tokenizer().unwrap();
-        let theirs = tokenizers::Tokenizer::from_file(Path::new(parts[1]).join("tokenizer.json")).unwrap();
+        let theirs = crate::tokenizer::Tokenizer::from_file(Path::new(parts[1]).join("tokenizer.json")).unwrap();
         let text = std::fs::read_to_string(parts[2]).unwrap();
         let (mut lines, mut tokens) = (0, 0);
         for line in text.split_inclusive('\n').chain([text.as_str()]) {

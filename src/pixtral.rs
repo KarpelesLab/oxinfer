@@ -154,8 +154,8 @@ impl PixtralConfig {
 const CLIP_MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
 const CLIP_STD: [f32; 3] = [0.268_629_54, 0.261_302_6, 0.275_777_1];
 
-fn load_vocab(dir: &Path) -> Option<tokenizers::Tokenizer> {
-    tokenizers::Tokenizer::from_bytes(crate::fsx::read(&dir.join("tokenizer.json")).ok()?).ok()
+fn load_vocab(dir: &Path) -> Option<crate::tokenizer::Tokenizer> {
+    crate::tokenizer::Tokenizer::from_bytes(crate::fsx::read(&dir.join("tokenizer.json")).ok()?).ok()
 }
 
 /// Where the vision tower of a Mistral Large 4 checkpoint comes from (`EngineOptions::mmproj`,

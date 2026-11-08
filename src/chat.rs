@@ -695,7 +695,7 @@ impl ChatFormat for DeepSeekChat {
 }
 
 /// `eos` plus the chat format's end-of-turn token, looked up in the tokenizer.
-pub fn with_turn_end(fmt: &dyn ChatFormat, tok: &tokenizers::Tokenizer, mut eos: Vec<u32>) -> Vec<u32> {
+pub fn with_turn_end(fmt: &dyn ChatFormat, tok: &crate::tokenizer::Tokenizer, mut eos: Vec<u32>) -> Vec<u32> {
     if let Some(id) = tok.token_to_id(fmt.end_of_turn_token())
         && !eos.contains(&id)
     {

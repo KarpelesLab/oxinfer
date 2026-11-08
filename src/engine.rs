@@ -63,13 +63,13 @@ use crate::qwen::{QwenModel, QwenSession};
 use crate::qwen_mtp::{MtpDecoder, MtpOptions, QwenMtp};
 use crate::safetensors::ModelFiles;
 use crate::sampler::Sampler;
+use crate::tokenizer::Tokenizer;
 use crate::tools::{ToolCall, ToolResult, ToolSpec};
 use crate::{config, mm, pool};
 use anyhow::{Context, Result, anyhow, bail};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokenizers::Tokenizer;
 
 pub use crate::generate::{Flow, StopReason};
 
