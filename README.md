@@ -380,7 +380,9 @@ MTP drafts one token per step (each step reads its decoder layer and the LM head
 whole block per pass; on code and math MTP accepts as much as DSpark at a lower cost per round, but
 it has no plain fallback, so it loses on prose and chat, where its acceptance drops to ~50%. MTP is therefore
 the default for Qwen3.5-4B and Qwen3.5-9B (`qwen_mtp::BY_DEFAULT`; `--no-draft`, engine
-`draft=none`, decodes plainly), and neither for Qwen3.8-27B nor Qwen3.5-35B-A3B at Q4.
+`draft=none`, decodes plainly), and neither for Qwen3.8-27B nor Qwen3.5-35B-A3B at Q4. With CUDA
+decoding, neither MTP nor DSpark is a default: the drafts run on the CPU, and plain GPU decoding
+is faster (see [CUDA](#cuda)); `--mtp` / `--draft` still use them.
 
 Against llama.cpp (master of 2026-11-02, `29c720eaf7`, `llama-server`, `--spec-type draft-dspark`,
 every layer on the GPU; the same GGUF target and draft files, the drafts converted by
@@ -4179,7 +4181,7 @@ GPU (metal #0): Apple M5 Max, memory 115.4 GB (unified with CPU)
 | Apple Silicon (macOS, iOS) | NEON kernels + Metal GEMM for prefill; on M5 / A19 the GPU matrix units (prefill GEMMs and MoE experts); single-token decode entirely on the GPU (Llama 3, Qwen3 / 3.5 / 3.8 incl. MoE, Gemma 3 / 4 incl. 26B-A4B) | measured; the f32 GEMM gives bit-identical logits to the CPU path, the matrix units (default where present) ~3e-4 relative per product (`OXINFER_METAL_MMA=0` for bit-identical); iOS: runs in the Simulator (CPU and Metal; `ios/`) |
 | Apple Neural Engine (macOS 15 / iOS 18) | Core ML, for ANEMLL-converted models | measured on macOS; builds for iOS; see [Core ML](#core-ml--apple-neural-engine) |
 | x86-64 (Linux, Windows, macOS) | AVX2 + FMA kernels (bf16, Q8 via `maddubs`, Q4), scalar fallback below AVX2 | compiles for all three; the kernel tests pass on the scalar fallback under Rosetta (which exposes no AVX), so the AVX2 kernels themselves are not yet executed anywhere |
-| Linux / Windows + NVIDIA | CUDA driver API + NVRTC-compiled kernels (`cuda.rs`): prefill GEMMs (bf16, Q8, Q4, affine Q4), MoE experts, convolutions, group / layer norms, attention; loaded as a native binary, so a toolkit newer than the driver works | measured on Linux on one RTX 5080 (NVRTC 13.4, driver CUDA 13.2), see [CUDA](#cuda); decode stays on the CPU; Windows and other GPUs not run |
+| Linux / Windows + NVIDIA | CUDA driver API + NVRTC-compiled kernels (`cuda.rs`): prefill GEMMs (bf16, Q8, Q4, affine Q4), MoE experts (resident or streamed), convolutions, group / layer norms, attention; whole decode steps, single-token and multi-token (speculative verification); loaded as a native binary, so a toolkit newer than the driver works | measured on Linux on one RTX 5080 (NVRTC 13.4, driver CUDA 13.2), see [CUDA](#cuda); Windows and other GPUs not run |
 | Android (aarch64) | NEON kernels | cross-compiles (`aarch64-linux-android`) |
 | Vulkan | detection only (device name and memory) | no compute yet |
 | wasm32 (WASI) | simd128 kernels (bf16, Q8, Q4), threads via wasi-threads | measured: Qwen3.5-0.8B Q8 at 123 tok/s decode with 16 threads under wasmtime 30, identical output to native; see below |
@@ -4247,7 +4249,7 @@ copy per session, appending what CPU passes added (prefill chunks, speculative v
 forgetting what a rewind dropped. Not on the GPU: models with LoRA adapters attached, streamed
 weights (`--stream`), bidirectional configurations, the vision / audio towers,
 multi-token passes (prefill and speculative verification stay on the existing paths), and
-CUDA / WebGPU (no decode graph backend yet).
+WebGPU (no decode graph backend yet). CUDA runs the same graphs, see [CUDA](#cuda).
 
 Before that, forwarding only the matmuls of decode passes to the GPU was measured and lost: on
 the 27B GGUF (`OXINFER_METAL_MIN_T=1`) a pass cost ~257 submissions with CPU work in between
@@ -4277,6 +4279,39 @@ cuda`.
 | Janus-Pro-1B `--generate-image` | GEMM, image decoder | 95.6 dB (max pixel diff 1) | 84 s whole run | 38 s whole run |
 
 Short inputs stay on the CPU (see `wants`), but opening the device costs about 0.1 s at start-up.
+
+**Decoding.** Whole decode steps run on the GPU as compiled plans of the decode graph
+(`cuda_decode.rs`, the kernels ported from Metal's): matvecs (bf16, Q8, Q4, affine Q4), norms,
+RoPE, attention (split over up to 64 chunks for long contexts), Gated DeltaNet, MoE routing and
+experts. 128 greedy tokens after a short chat prompt (fixed system prompt; the default one
+carries the time), same machine:
+
+| Model | CPU decode | CUDA decode | Text |
+|---|---|---|---|
+| Qwen3.5-0.8B bf16 | 35 tok/s | 304 tok/s | identical |
+| Qwen3.5-0.8B `--quant q8` | 53 tok/s | 369 tok/s | identical |
+| Qwen3.5-0.8B `--quant q4` | 74 tok/s | 421 tok/s | parts (int8 activations on the CPU, below) |
+| mlx-community/Qwen3-4B-4bit | 23 tok/s | 172 tok/s | identical |
+| Qwen3.5-9B `--quant q4` | 12 tok/s | 107 tok/s | identical |
+
+`OXINFER_GPU_DECODE_CHECK=1` (every GPU step also on the CPU): KL 1e-11 on bf16, also after a
+3,700-token prompt (split attention); 1.5e-3 to 3.6e-3 on the quantized formats, whose CPU
+kernels quantize the activations to int8 while the GPU keeps them f32.
+
+Speculative verification runs as multi-token plans: their matvecs read each weight once for all
+the tokens, each token's sum taken exactly as the single-token kernel takes it (the test
+`decode_matvecs_match_definition_and_each_other` checks the bits), and the recurrent states are
+replayed on a rewind. Greedy output with MTP (Qwen3.5-9B) or a DSpark draft (Qwen3-4B with
+`deepseek-ai/dspark_qwen3_4b_block7`) is plain decoding's, token for token. They are slower than
+plain GPU decoding here (40 and 154 tok/s against 107 and 172): the drafts run on the CPU, and a
+Q4 verification pass is compute-bound on the CUDA cores. So with CUDA decoding they are not the
+default (`Backend::prefers_plain_decode`); `--mtp` / `--draft` still use them.
+
+Declined (decoding stays on the CPU): interventions, Qwen4-Exp, GGUF weights, and models whose
+weights do not all fit in VRAM: Gemma 4 26B-A4B's experts do not on 16 GB
+(`OXINFER_GPU_PLAN_DEBUG=1` names the op). Recurrent states go up and down every step (copied back
+on a second stream under the remaining layers; the upload is skipped when nothing on the host
+wrote them).
 The image-model timings include loading and quantizing the weights.
 
 `cargo test --lib cuda::` compares every kernel with a reference computed in f64 from its
