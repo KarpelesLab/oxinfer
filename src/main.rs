@@ -261,8 +261,9 @@ fn usage() -> ! {
          \x20 --stream-io M        advise (default on Apple) | pread | touch\n\
          \x20 --stream-trace       with --stream, one line of IO statistics per decoding step and per prefill\n\
          \x20 --stream-threads N   with --stream, reader threads (default 2)\n\
-         \x20 --stream-gpu on|off  with --stream, decode on the GPU (default on with GPU decoding): resident\n\
-         \x20                      layers stay wrapped, the others are wrapped per pass as they arrive\n\
+         \x20 --stream-gpu on|off|auto  with --stream, decode on the GPU: resident layers stay wrapped,\n\
+         \x20                      the others are wrapped per pass as they arrive (auto, the default: dense\n\
+         \x20                      models on the GPU, MoE models measure both and keep the faster)\n\
          \x20 --expert-cache-mb N  with --stream, page cache kept for recently used MoE experts (which\n\
          \x20                      are read on demand; default: what the budget leaves)\n\
          \x20 --expert-predict     with --stream, read the next MoE layer's guessed experts ahead (Qwen)\n\

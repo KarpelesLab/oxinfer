@@ -384,6 +384,9 @@ pub trait UnitGate: Send + Sync {
     fn part_cached(&self, _u: usize, _p: usize) -> bool {
         false
     }
+    /// The device reads the streamed units (a plan was built over them): the streamer may leave
+    /// mapping their pages to it.
+    fn device_reads(&self, _on: bool) {}
     /// Backend state kept as long as the streamed memory (wraps of cached parts).
     fn device_state(&self) -> Option<&std::sync::Mutex<Option<Box<dyn std::any::Any + Send + Sync>>>> {
         None
@@ -414,6 +417,9 @@ impl UnitGate for crate::stream::StreamHook {
     }
     fn part_cached(&self, u: usize, p: usize) -> bool {
         crate::stream::StreamHook::part_cached(self, u, p)
+    }
+    fn device_reads(&self, on: bool) {
+        self.set_device_reads(on)
     }
     fn device_state(&self) -> Option<&std::sync::Mutex<Option<Box<dyn std::any::Any + Send + Sync>>>> {
         Some(crate::stream::StreamHook::device_state(self))
@@ -560,6 +566,64 @@ impl PlanCache {
         }
         v.push((key, p.clone()));
         p
+    }
+}
+
+/// Where a streamed model with on-demand experts decodes when left to decide
+/// ([`crate::gpu::stream_decode_forced`] unset): each MoE layer of a GPU step waits for its
+/// routing to come back before the chosen experts can be read and wrapped, which on an M5 Max
+/// costs about what decoding on the CPU does. The first steps alternate between the two (after
+/// [`DeviceChoice::WARM`] each), then the faster one is kept.
+#[derive(Default)]
+pub struct DeviceChoice(std::sync::Mutex<ChoiceState>);
+
+#[derive(Default)]
+struct ChoiceState {
+    /// Steps and seconds measured: `[cpu, gpu]`.
+    n: [u32; 2],
+    secs: [f64; 2],
+    decided: Option<bool>,
+}
+
+impl DeviceChoice {
+    /// Steps of each kind not counted (plans compiled, caches filled).
+    pub const WARM: u32 = 2;
+    /// Steps of each kind measured.
+    pub const SAMPLES: u32 = 4;
+
+    /// Whether the next step should run on the device.
+    pub fn want_gpu(&self) -> bool {
+        let s = self.0.lock().unwrap();
+        s.decided.unwrap_or(s.n[1] <= s.n[0])
+    }
+    /// Whether steps are still being measured.
+    pub fn measuring(&self) -> bool {
+        self.0.lock().unwrap().decided.is_none()
+    }
+    /// Records a step's wall time; returns the decision once made (`Some(true)`: the device).
+    pub fn record(&self, gpu: bool, secs: f64) -> Option<bool> {
+        let mut s = self.0.lock().unwrap();
+        if s.decided.is_some() {
+            return None;
+        }
+        let i = gpu as usize;
+        s.n[i] += 1;
+        if s.n[i] > Self::WARM {
+            s.secs[i] += secs;
+        }
+        if s.n.iter().all(|&n| n >= Self::WARM + Self::SAMPLES) {
+            let per = [0, 1].map(|i| s.secs[i] / (s.n[i] - Self::WARM) as f64);
+            let g = per[1] <= per[0];
+            s.decided = Some(g);
+            eprintln!(
+                "[streamed decoding: {:.0} ms per token on the GPU, {:.0} on the CPU: {} from here on]",
+                per[1] * 1e3,
+                per[0] * 1e3,
+                if g { "GPU" } else { "CPU" }
+            );
+            return s.decided;
+        }
+        None
     }
 }
 

@@ -306,8 +306,10 @@ pub fn decode_enabled() -> bool {
 /// Decodes on the device also when the weights stream from storage (`crate::stream`): the
 /// resident layers stay wrapped, every other layer is wrapped per pass as it arrives and dropped
 /// after (see `crate::gpu::decode::Graph::units`). Process-wide, read when a model builds its
-/// plans. None restores the default (on, or `OXINFER_STREAM_GPU=0|1`); without device decoding
-/// ([`decode_enabled`]) streamed models decode on the CPU either way.
+/// plans. None restores the default (auto: dense models decode on the GPU, models with on-demand
+/// experts measure both and keep the faster, see [`decode::DeviceChoice`]; or
+/// `OXINFER_STREAM_GPU=0|1`); without device decoding ([`decode_enabled`]) streamed models decode
+/// on the CPU either way.
 pub fn set_stream_decode(on: Option<bool>) {
     STREAM_DECODE.store(
         match on {
@@ -323,6 +325,17 @@ pub fn set_stream_decode(on: Option<bool>) {
 pub fn stream_decode_enabled() -> bool {
     static ENV: OnceLock<Option<String>> = OnceLock::new();
     decode_enabled() && switch(&STREAM_DECODE, &ENV, "OXINFER_STREAM_GPU", |v| v != "0", true)
+}
+
+/// [`set_stream_decode`] when set (or `OXINFER_STREAM_GPU`); None: the default, where models
+/// with on-demand experts measure both and keep the faster
+/// ([`decode::DeviceChoice`]).
+pub fn stream_decode_forced() -> Option<bool> {
+    match STREAM_DECODE.load(Ordering::Relaxed) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => std::env::var("OXINFER_STREAM_GPU").ok().map(|v| v != "0"),
+    }
 }
 
 static STREAM_DECODE: AtomicU8 = AtomicU8::new(0);

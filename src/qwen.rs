@@ -200,6 +200,8 @@ pub struct QwenModel<'a> {
     /// the backend or the model cannot.
     /// Plans by intervention layout (`GpuLayout::signature`, 0 without interventions).
     gpu_plans: crate::gpu::decode::PlanCache,
+    /// Streamed with on-demand experts: GPU or CPU decoding, measured (see `DeviceChoice`).
+    stream_choice: crate::gpu::decode::DeviceChoice,
     /// Qwen4-Exp (hyper-connections, n-gram embedding, QSA; see `crate::qwen4exp`).
     pub(crate) exp: Option<Box<crate::qwen4exp::Exp<'a>>>,
 }
@@ -743,6 +745,7 @@ impl<'a> QwenModel<'a> {
             mrope_axis,
             stream: None,
             gpu_plans: Default::default(),
+            stream_choice: Default::default(),
             exp,
         })
     }
@@ -1348,6 +1351,9 @@ impl<'a> QwenModel<'a> {
         if !sess.iv.gpu_ok() {
             return None;
         }
+        if self.choosing_device() && !self.stream_choice.want_gpu() {
+            return None;
+        }
         if let Some(ex) = &self.exp {
             return self.exp_gpu_step(ex, sess, tok, want_logits);
         }
@@ -1651,6 +1657,8 @@ impl<'a> QwenModel<'a> {
 
     pub fn forward(&self, sess: &mut QwenSession, tokens: &[u32]) -> Vec<f32> {
         let t = tokens.len();
+        let t0 = crate::clock::Instant::now();
+        let measure = t == 1 && self.choosing_device() && self.stream_choice.measuring();
         if t == 1 {
             // OXINFER_GPU_DECODE_CHECK=1: compare every GPU step with the CPU path.
             let before = crate::gpu::decode::check().then(|| sess.clone());
@@ -1659,11 +1667,24 @@ impl<'a> QwenModel<'a> {
                     let hs = self.forward_impl(&mut s2, tokens, &[], false, false);
                     crate::gpu::decode::report(s2.pos - 1, &self.logits(&hs, 1), &l);
                 }
+                if measure {
+                    self.stream_choice.record(true, t0.elapsed().as_secs_f64());
+                }
                 return l;
             }
         }
         let hs = self.forward_hidden_mm(sess, tokens, &[]);
-        self.logits(&hs[(t - 1) * self.cfg.hidden_size..], 1)
+        let l = self.logits(&hs[(t - 1) * self.cfg.hidden_size..], 1);
+        if measure {
+            self.stream_choice.record(false, t0.elapsed().as_secs_f64());
+        }
+        l
+    }
+
+    /// Streamed with on-demand experts and GPU decoding left to decide: plain decode steps are
+    /// measured on both and the faster kept ([`crate::gpu::decode::DeviceChoice`]).
+    fn choosing_device(&self) -> bool {
+        self.stream.is_some() && crate::gpu::stream_decode_forced().is_none() && self.layers.iter().any(|l| matches!(l.ffn, Ffn::Moe(_)))
     }
 
     /// Final-normed hidden states `[t, hidden]` for `tokens` appended at `sess.pos`.

@@ -2077,6 +2077,12 @@ impl MetalBackend {
             gate: if streamed.is_empty() && experts.is_empty() {
                 None
             } else {
+                // The GPU maps the streamed pages itself as it wires them.
+                if !streamed.is_empty()
+                    && let Some(gt) = &g.gate
+                {
+                    gt.device_reads(true);
+                }
                 g.gate.clone()
             },
             streamed,

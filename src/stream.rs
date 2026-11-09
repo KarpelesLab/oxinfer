@@ -448,6 +448,10 @@ struct Inner {
     parts: Mutex<PartCache>,
     /// On-demand loads in progress: the reader's read-ahead waits for them.
     demand: std::sync::atomic::AtomicUsize,
+    /// The streamed units are read by an accelerator (GPU decoding wraps them per pass): the
+    /// read-ahead does not touch their pages, which the device maps itself (on an M5 Max, touching
+    /// cost the reader ~60 ms per GB: 0.69 -> 0.83 tok/s on Qwen3.8-27B Q2_K_P at 3 GB/s).
+    device_reads: std::sync::atomic::AtomicBool,
     /// Evictions waiting for the evictor thread, and whether it is to stop (once they are done).
     evq: Mutex<(Vec<Evict>, bool)>,
     evcv: Condvar,
@@ -521,6 +525,11 @@ impl StreamHook {
     /// that nothing is dropped after use).
     pub fn is_resident(&self, i: usize) -> bool {
         self.s.inner.units.get(self.base + i).is_none_or(|u| u.resident)
+    }
+    /// Tells the streamer whether an accelerator reads the streamed units (see
+    /// `Inner::device_reads`): then the read-ahead leaves mapping their pages to the device.
+    pub fn set_device_reads(&self, on: bool) {
+        self.s.inner.device_reads.store(on, Relaxed);
     }
     /// On-demand parts (MoE experts) of the model's unit `i`.
     pub fn part_count(&self, i: usize) -> usize {
@@ -715,6 +724,7 @@ impl Streamer {
                 ..Default::default()
             }),
             demand: std::sync::atomic::AtomicUsize::new(0),
+            device_reads: std::sync::atomic::AtomicBool::new(false),
             evq: Mutex::new((Vec::new(), false)),
             evcv: Condvar::new(),
         });
@@ -1110,14 +1120,15 @@ impl Inner {
 
     /// The evictor thread: drops queued units and parts from the page cache, skipping those
     /// wanted again meanwhile (a unit back in the read-ahead, a part in use or cached again).
-    /// Pages a GPU read stay wired for a while after their Metal buffer is released (50-150 ms
+    /// Pages a GPU read stay wired for a while after their Metal buffer is released (50-260 ms
     /// on an M5 Max; `msync` then succeeds but leaves them cached), so what is still cached
-    /// after the drop is tried again a little later.
+    /// after the drop is tried again every 100 ms (each `msync` locks the file's pages, which the
+    /// reader then waits for).
     fn evict_loop(&self) {
         // (last attempt, item, attempts)
         let mut retry: Vec<(Instant, Evict, u32)> = Vec::new();
-        const RETRY: Duration = Duration::from_millis(20);
-        const ATTEMPTS: u32 = 100;
+        const RETRY: Duration = Duration::from_millis(100);
+        const ATTEMPTS: u32 = 30;
         loop {
             let items: Vec<(Evict, u32)> = {
                 let mut q = self.evq.lock().unwrap();
@@ -1235,7 +1246,7 @@ impl Inner {
         }
         let next = std::sync::atomic::AtomicUsize::new(0);
         let missed = AtomicU64::new(0);
-        let notouch = std::env::var_os("OXINFER_STREAM_NOTOUCH").is_some();
+        let notouch = std::env::var_os("OXINFER_STREAM_NOTOUCH").is_some() || (!demand && throttle && self.device_reads.load(Relaxed));
         let work = || {
             crate::pool::raise_qos();
             let mut scratch = Vec::new();
