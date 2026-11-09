@@ -10,7 +10,8 @@ OpenAI-compatible API (/v1/models, /v1/chat/completions, /v1/completions, /v1/em
 /v1/audio/speech) over the listed models only. SOURCE is a local directory or file, a repo id\n\
 (org/name, fetched on first use) or org/name:QUANT (a GGUF file of the repo); ID is the name\n\
 clients use (default: SOURCE). Model options: the engine's (quant, device, mmap, stream, mmproj,\n\
-draft, mtp, max_context, ...) or the loader's for other kinds, and kind=chat|embedding|image|\n\
+draft, mtp, lookup, prompt_cache, max_context, ...) or the loader's for other kinds, and\n\
+kind=chat|embedding|image|\n\
 transcription|speech, system=TEXT, think=1, max_tokens=N, temperature=F, top_p=F, top_k=N,\n\
 repetition_penalty=F, prompt_name=NAME, memory_gb=F.\n\
 \n\
@@ -26,6 +27,10 @@ options:\n\
 \x20 --memory-gb N         memory for loaded models together; least recently used ones are\n\
 \x20                       unloaded to make room (default 80% of RAM)\n\
 \x20 --cache-dir DIR       where repo ids are fetched to\n\
+\x20 --prompt-cache DIR    keep chat models' session snapshots (KV caches, recurrent states) in\n\
+\x20                       DIR (auto: ~/.cache/oxinfer/prompt-cache; created private) across\n\
+\x20                       requests and restarts, restored when a prompt starts with a stored one\n\
+\x20 --prompt-cache-gb F   size cap of the prompt cache (default 20; least recently used go)\n\
 \x20 --threads N           CPU threads (default: all cores)\n\
 \x20 --no-remote-media     do not fetch http(s) image / audio / video URLs (data: URLs only)\n\
 \x20 --local-media         also accept local paths and file:// URLs as media (trusted clients only)\n\

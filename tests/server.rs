@@ -140,3 +140,49 @@ fn chat_and_embeddings() {
     assert_eq!(st, 400);
     s.stop().unwrap();
 }
+
+#[test]
+#[ignore = "fetches Qwen/Qwen3-0.6B"]
+fn prompt_cache_across_restarts() {
+    let chat = env("OXINFER_E2E_CHAT", "Qwen/Qwen3-0.6B");
+    let dir = std::env::temp_dir().join(format!("oxinfer-pc-e2e-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let opts = format!("model=chat={chat}; prompt_cache={}", dir.display());
+    let system = "You are a careful assistant for a library. ".repeat(12);
+    let req = json!({"model": "chat", "temperature": 0, "max_tokens": 20, "messages": [
+        {"role": "system", "content": system}, {"role": "user", "content": "Name one famous library."}]})
+    .to_string();
+    let snapshots = || {
+        std::fs::read_dir(&dir)
+            .map(|d| d.flatten().filter(|e| e.path().extension().is_some_and(|x| x == "oxsnap")).count())
+            .unwrap_or(0)
+    };
+    let s = serve(&opts);
+    let (st, first) = request(s.addr(), "POST", "/v1/chat/completions", &req);
+    assert_eq!(st, 200, "{first}");
+    // The conversation is stored after the response, on another thread.
+    for _ in 0..300 {
+        if snapshots() > 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(snapshots() > 0, "no snapshot stored");
+    s.stop().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+    // A new server (the model loads again): the same request restores the stored prompt and
+    // gives the same reply.
+    let s = serve(&opts);
+    let (st, again) = request(s.addr(), "POST", "/v1/chat/completions", &req);
+    assert_eq!(st, 200, "{again}");
+    let (a, b): (Value, Value) = (serde_json::from_str(&first).unwrap(), serde_json::from_str(&again).unwrap());
+    assert_eq!(a["choices"][0]["message"]["content"], b["choices"][0]["message"]["content"]);
+    let cached = b["usage"]["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap();
+    assert!(cached > 100, "{again}");
+    s.stop().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}

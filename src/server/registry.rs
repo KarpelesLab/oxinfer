@@ -115,6 +115,9 @@ pub(crate) struct Registry {
     entries: Vec<Entry>,
     budget: Option<u64>,
     cache_dir: Option<PathBuf>,
+    /// The server-wide prompt cache of chat models (a model's own `prompt_cache` overrides it).
+    pub prompt_cache: Option<PathBuf>,
+    pub prompt_cache_gb: Option<f64>,
     clock: AtomicU64,
     /// Serializes loads (and the memory accounting around them).
     loading: Mutex<()>,
@@ -164,6 +167,8 @@ impl Registry {
             entries,
             budget,
             cache_dir,
+            prompt_cache: None,
+            prompt_cache_gb: None,
             clock: AtomicU64::new(1),
             loading: Mutex::new(()),
             log,
@@ -211,6 +216,18 @@ impl Registry {
         }
         entry.last_used.store(self.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
         Ok(Lease { entry, guard })
+    }
+
+    /// Writes the snapshot a loaded chat model's prompt cache has waiting (see
+    /// [`crate::engine::Engine::flush_prompt_cache`]); nothing if the model is not loaded.
+    pub fn flush_prompt_cache(&self, id: &str) {
+        let Ok(e) = self.find(id) else { return };
+        let mut g = lock(&e.slot);
+        if let Some(Loaded::Chat(engine)) = g.as_mut()
+            && let Err(err) = engine.flush_prompt_cache()
+        {
+            eprintln!("[{id}: prompt cache: {err:#}]");
+        }
     }
 
     /// `(id, kind, loaded)` of every model.
@@ -358,6 +375,8 @@ impl Registry {
             Kind::Chat => {
                 let mut o = EngineOptions {
                     cache_dir: self.cache_dir.clone(),
+                    prompt_cache: self.prompt_cache.clone(),
+                    prompt_cache_gb: self.prompt_cache_gb,
                     ..Default::default()
                 };
                 for (k, v) in &opts {

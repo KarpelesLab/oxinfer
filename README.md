@@ -1113,10 +1113,14 @@ idle models are unloaded first. A chat request that extends the previous convers
 (the same messages, the reply as it was returned and new messages, as chat clients send them)
 reuses its cache: only the new tokens are fed (`usage.prompt_tokens_details.cached_tokens`); this
 works for Qwen3.5's recurrent layers too, and a conversation whose earlier messages carry media is
-fed again.
+fed again. Models without recurrent state also keep the prefix a new conversation shares with the
+previous one. With `--prompt-cache DIR` (or `auto`; per model `prompt_cache=`), conversations are
+also kept on disk across requests, conversations and restarts and restored when a prompt starts
+with one (see [Session snapshots and the prompt cache](#session-snapshots-and-the-prompt-cache)).
 
 Model options: those of the engine for chat models (`quant`, `device`, `mmap`, `stream`, `mmproj`,
-`draft`, `mtp`, `max_context`, `prefill_chunk`, `gpu_decode`, ...; see [As a library](#as-a-library)),
+`draft`, `mtp`, `lookup`, `prompt_cache`, `max_context`, `prefill_chunk`, `gpu_decode`, ...; see
+[As a library](#as-a-library)),
 of the loader for the other kinds (Whisper `encoder` / `decoder` precision, Orpheus `snac` and
 `quant`, FLUX `transformer` / `base`, Stable Diffusion `lora`, ...), and:
 
@@ -1133,6 +1137,7 @@ of the loader for the other kinds (Whisper `encoder` / `decoder` precision, Orph
 Server options: `--listen ADDR` (port 0 picks one), `--api-key KEY` (or `$OXINFER_API_KEY`;
 requests need `Authorization: Bearer KEY`), `--cors ORIGIN`, `--max-body-mb N` (default 16),
 `--preload`, `--download`, `--memory-gb F`, `--cache-dir DIR`, `--threads N`,
+`--prompt-cache DIR|auto` and `--prompt-cache-gb F` (the chat models' prompt cache),
 `--tls-cert FILE --tls-key FILE` or `--self-signed` for HTTPS, `--workers N` (connections served
 at once, default 32), `--quiet`. Media URLs in requests may be `data:` URLs or `http(s)://` URLs,
 which the server fetches (`--no-remote-media` turns that off); local paths and `file://` URLs
@@ -1163,6 +1168,50 @@ output from chat models, the Responses and Assistants APIs, image `url` response
 URLs, and speech formats other than WAV and PCM. Requests that take over 20 s are answered as 200
 before they finish (httpsd drops a connection whose handler runs past its 30 s inactivity window),
 so an error after that point arrives in a 200 body.
+
+## Session snapshots and the prompt cache
+
+A session (the KV caches, the Gated DeltaNet recurrent and convolution states, positions and
+vision spans, the DSpark draft's context cache and pending features, the MTP layer's cache and
+pending rows, and the tokens) can be written to a file and read back bit for bit (`snapshot.rs`):
+
+```sh
+oxinfer --model Qwen/Qwen3-8B-GGUF:Q8_0 -p "$(cat long_prompt.txt)" --save-session s.oxsnap
+oxinfer --model Qwen/Qwen3-8B-GGUF:Q8_0 --load-session s.oxsnap -p "And then?"   # continues it
+oxinfer --model Qwen/Qwen3-8B-GGUF:Q8_0 --prompt-cache auto -p "..."            # keyed cache
+```
+
+A **prompt cache** (`--prompt-cache DIR|auto`, engine / C API / per-model server key
+`prompt_cache`, server-wide `prompt_cache=`) is a directory of such snapshots keyed by model
+fingerprint (checkpoint, precision, format, device, speculative decoding and its options) and
+token prefix, with a size cap (`prompt_cache_gb`, default 20; least recently used first).
+`Engine::chat` restores the snapshot that saves the most of the prompt: for models without
+recurrent state (Gemma, Qwen3, Llama, with their drafts) any common prefix (the restored caches
+are cut back), for Qwen3.5 / 3.6 / 3.8 (recurrent state cannot be cut back) a whole snapshot the
+prompt starts with. It stores each conversation after its reply (left pending so the reply is not
+delayed: the server writes it on another thread once the response is sent; the next request, an
+explicit `Engine::flush_prompt_cache` or the engine's drop also write it) and, for the recurrent
+models, the prefix every conversation with the same system prompt and tools shares (the first
+turn rendered with an empty message, tokenized, compared with the prompt), the first time it is
+computed. For the models without recurrent state, a stored conversation replaces the snapshots of
+its own prefixes. In memory, `Engine::chat` now also keeps the common prefix with the previous
+conversation for these models (it used to start over unless the new conversation extended the
+old one).
+
+The directory is created private (0700; an existing one is set to 0700, which fails unless it is
+yours, so `/tmp` or `/dev/shm` themselves are refused; a directory of your own on a tmpfs gives
+memory-speed restores on Linux), files are written 0600 under a temporary name and renamed into
+place, symbolic links are not followed, every section length is checked against the model before
+anything is allocated, and a checksum is checked before the state is used. A snapshot of another
+model or other options is refused; a corrupted one is removed from the cache and the prompt is
+computed.
+
+Families: Gemma 4 / 3, Qwen3, Qwen3.5 / 3.6 / 3.8 (dense, MoE, Qwen2.5-VL), Llama 3, with DSpark
+or MTP drafts and the Gemma 4 assistant drafter. Not (yet): Mistral Large 4, DeepSeek V4
+(compressed-attention state), Qwen3.8-Flash-Next (Qwen4-Exp: n-gram and indexer state), Core ML
+models.
+
+<!-- SNAPSHOT-RESULTS -->
 
 ## Typed decisions (Jev models)
 
@@ -3509,6 +3558,10 @@ decoding, streaming detokenization) and the model, session and sampler types. A 
 engine (`capi` feature, `include/oxinfer.h`) and a SwiftUI test app for iOS are in `ios/`
 (see `ios/README.md`). Neuron edits, steering vectors, directional ablation and SAE features are
 `Engine::set_interventions` (see [Runtime interventions](#runtime-interventions-neuron-edits-steering-abliteration-sae-features)).
+`Engine::save_session` / `Engine::load_session` write and restore a conversation's caches, and the
+`prompt_cache` option keeps them in a directory for `Engine::chat` (see
+[Session snapshots and the prompt cache](#session-snapshots-and-the-prompt-cache)); prompt-lookup
+drafting is the `lookup` options ([Prompt lookup](#prompt-lookup)).
 
 Tokenization is in the crate too: `oxinfer::tokenizer::Tokenizer` reads HuggingFace
 `tokenizer.json` files (BPE, Unigram, WordPiece and WordLevel models with their normalizers,
@@ -4003,6 +4056,50 @@ logits. Two lossless changes (after the analysis of llama-modchip in
 (`pairs` / `auto` / `seq` / `old` modes; `PASS_COMPARE=1` asserts that all modes give bit-identical
 logits) measure these. Prefill (8 tokens and more) keeps its f32 GEMM: switching it to the int8
 kernels would change its results.
+
+### Prompt lookup
+
+`lookup.rs` drafts without a draft model: when the last tokens of the conversation (prompt and
+reply so far) occurred before, the tokens that followed that occurrence are the draft, verified
+like any other in one multi-token pass. Replies that quote, edit or summarize their prompt
+(code edits, refactors, extraction, rewrites, repeated structure) accept long runs of such drafts;
+on free prose there is rarely a match and the round is a plain one-token step.
+
+- Matching: an index from every bigram of the context to its positions; the occurrences of the
+  last two tokens (the 48 most recent) are extended backwards to their full match length, the
+  longest match wins (the most recent among equals), and the draft is what followed it (up to
+  `--lookup-tokens`, default 10). Other occurrences that agree on the next token count as
+  consensus.
+- Verification-outcome memory (the one idea taken from llama-modchip's drafter, see
+  `docs/llama-modchip`): a 4096-entry direct-mapped table keyed by a hash of the four tokens before
+  a position remembers the draft token the model last rejected there and the token it chose
+  instead; a draft token refuted in the same context, and not accepted there since, ends the draft
+  (`--no-lookup-memory` turns it off).
+- Cost-aware length: each draft token's chance of being accepted (when those before it were) is
+  estimated per match class (match length, consensus, depth), calibrated online from the
+  verification outcomes; with the measured time of verifying each number of drafts (a plain step
+  for none), the round verifies the length with the most expected tokens per second, which is 0
+  (a plain step) when nothing is worth it. Until a verification has been measured it counts as
+  two plain steps (the first multi-token pass also prepares its GPU plan), so only a good match
+  starts one; a match that is not worth it is still tried now and then (after 8 rounds, doubling
+  to 128) so that a poor early estimate does not stick. In DSpark and MTP decoding every
+  round's verification time feeds the same measurements.
+- Exact like the other drafts: greedy output is the plain greedy output (bit for bit with
+  `--exact-verify`; with fast verification the logits may differ in rounding, as for DSpark and
+  MTP), and sampling uses speculative sampling with a one-token draft distribution (accept with
+  the model's probability of the draft, else draw from the rest), which keeps the model's
+  distribution; a repetition penalty sees the accepted tokens as one-token decoding would.
+- With DSpark or MTP, a lookup match replaces the draft model's round when its expected tokens
+  per second (calibrated chances over the measured verification time) beat the recent rate of
+  that decoder's rounds (or of a plain step when its policy chose one).
+
+On by default (`--no-lookup`, engine / C API / server key `lookup=0`), for every family the
+engine decodes plainly (Gemma 4 / 3, Qwen, Llama 3, Mistral Large 4, DeepSeek V4) and inside
+DSpark and MTP decoding; not with the Gemma 4 assistant drafter or Core ML models. From the
+library: `lookup::Lookup` (the drafter) and `lookup::LookupRounds` (a `RoundDecoder` over any
+`dspark::Target`), or the `lookup` field of `DsparkDecoder` / `MtpDecoder`.
+
+<!-- LOOKUP-RESULTS -->
 
 ### Streaming weights from flash (models larger than RAM)
 

@@ -564,7 +564,7 @@ impl DraftCosts {
     /// Estimated round time with `k` drafts: measured, else the nearest measured length plus
     /// (or minus) the draft steps in between. Unmeasured lengths get no verification cost
     /// growth, which makes the policy try them.
-    fn round_time(&self, k: usize) -> Option<f64> {
+    pub(crate) fn round_time(&self, k: usize) -> Option<f64> {
         if let Some(&(t, n)) = self.round_secs.get(k)
             && n > 0
         {
@@ -581,7 +581,7 @@ impl DraftCosts {
 
     /// Expected committed tokens per round with `k` drafts: 1 + sum over i of the probability
     /// that the first i drafts are all accepted (Laplace-smoothed per-position rates).
-    fn expected_tokens(&self, k: usize) -> f64 {
+    pub(crate) fn expected_tokens(&self, k: usize) -> f64 {
         let mut e = 1.0;
         let mut p = 1.0;
         for j in 0..k {
@@ -656,6 +656,10 @@ pub struct MtpDecoder<'m> {
     next: Option<u32>,
     k_cur: usize,
     pub stats: MtpStats,
+    /// Prompt lookup ([`crate::lookup`]): a long context match supplies a round's drafts instead
+    /// of the MTP layer when it promises more tokens per second (as for
+    /// [`crate::dspark::DsparkDecoder::lookup`]).
+    pub lookup: Option<crate::lookup::Lookup>,
 }
 
 impl<'m> MtpDecoder<'m> {
@@ -687,6 +691,7 @@ impl<'m> MtpDecoder<'m> {
             next: None,
             k_cur,
             stats: MtpStats::default(),
+            lookup: None,
         }
     }
 
@@ -734,6 +739,10 @@ impl<'m> MtpDecoder<'m> {
         if self.next.take().is_some() {
             self.pend_t.pop();
         }
+        if let Some(lk) = &mut self.lookup {
+            lk.truncate(self.sess.pos);
+            lk.extend(tokens);
+        }
         self.msess.spans = self.sess.spans.clone();
         let mut last = Vec::new();
         let mut start = 0;
@@ -763,6 +772,9 @@ impl<'m> MtpDecoder<'m> {
         assert_eq!(self.pend_h.len(), (self.pend_t.len() + 1) * self.model.mtp_width());
         self.pend_t.push(token);
         self.next = Some(token);
+        if let Some(lk) = &mut self.lookup {
+            lk.extend(&[token]);
+        }
     }
 
     /// One speculative round: drafts up to the current draft length (and at most
@@ -780,7 +792,19 @@ impl<'m> MtpDecoder<'m> {
         let mut step_secs = None;
         let mut drafts = Vec::with_capacity(k);
         let mut qs: Vec<Vec<(u32, f32)>> = Vec::with_capacity(k);
-        if k > 0 {
+        // A long prompt-lookup match that promises more than this round's MTP drafts (or plain
+        // step) replaces them; the MTP layer's pending rows then wait, as in a round without
+        // drafts.
+        let costs = &self.stats.costs;
+        let looked = self.lookup.as_mut().and_then(|lk| {
+            let other = (costs.expected_tokens(k), costs.round_time(k).unwrap_or(0.0));
+            lk.draft_over(max_new.max(1) - 1, other.0, other.1)
+        });
+        let lookup_class = looked.as_ref().map(|l| l.1.clone()).unwrap_or_default();
+        if let Some((tokens, _)) = looked {
+            qs = tokens.iter().map(|&t| vec![(t, 1.0)]).collect();
+            drafts = tokens;
+        } else if k > 0 {
             let mut g = self.flush().expect("pending MTP row");
             debug_assert_eq!(self.msess.len(), n);
             for j in 0..k {
@@ -798,6 +822,8 @@ impl<'m> MtpDecoder<'m> {
             }
         }
         let draft_secs = t_round.elapsed().as_secs_f64();
+        let mtp_k = if lookup_class.is_empty() { k } else { 0 };
+        let k = drafts.len();
 
         // Verify [next, drafts..] in one forward, recording the recurrent states for rewinding.
         let mut seq = Vec::with_capacity(k + 1);
@@ -876,6 +902,11 @@ impl<'m> MtpDecoder<'m> {
         self.pend_h.extend_from_slice(&model.mtp_hidden(&self.sess, &hs)[..c * w]);
         self.pend_t.extend_from_slice(&out);
         self.next = out.last().copied();
+        if let Some(lk) = &mut self.lookup {
+            // A verification costs the same whoever drafted.
+            lk.policy.record_time(k, t_round.elapsed().as_secs_f64() - draft_secs);
+            lk.commit(&drafts, &lookup_class, &out, accepted);
+        }
 
         self.stats.rounds += 1;
         self.stats.drafted += k;
@@ -887,7 +918,7 @@ impl<'m> MtpDecoder<'m> {
         self.stats.per_round[accepted] += 1;
         self.stats.draft_secs += draft_secs;
         self.stats.verify_secs += verify_secs;
-        if k == self.k_cur && k > 0 {
+        if mtp_k == self.k_cur && mtp_k > 0 {
             // A draft step's own cost (the head's share included) when the first step was
             // not timed: the drafting time spread over the steps.
             let step = step_secs.or(Some(draft_secs / k as f64));
@@ -897,7 +928,7 @@ impl<'m> MtpDecoder<'m> {
             if let Some(b) = self.stats.costs.best(self.opts.draft_tokens.max(1)) {
                 self.k_cur = b;
             }
-        } else if self.opts.adaptive && k == self.k_cur {
+        } else if self.opts.adaptive && mtp_k == self.k_cur && mtp_k > 0 {
             if accepted == k {
                 self.k_cur = (self.k_cur + 1).min(self.opts.draft_tokens.max(1));
             } else if accepted == 0 {
@@ -905,6 +936,49 @@ impl<'m> MtpDecoder<'m> {
             }
         }
         out
+    }
+}
+
+/// Snapshots ([`crate::snapshot`]): the main session, the MTP layer's cache and its pending rows
+/// (without the committed token not yet run: a restored decoder starts with a prefill).
+impl MtpDecoder<'_> {
+    pub fn write_state<W: std::io::Write>(&self, w: &mut crate::snapshot::SnapWriter<W>) -> Result<()> {
+        use crate::snapshot::SessionState;
+        if self.msess.idx.is_some() {
+            bail!("session snapshots are not supported for Qwen4-Exp models");
+        }
+        self.sess.write_state(w)?;
+        w.u64s("mtp.len", &[self.msess.len() as u64])?;
+        crate::snapshot::write_kv(w, "mtp.kv", &self.msess.kv)?;
+        let pt = if self.next.is_some() {
+            &self.pend_t[..self.pend_t.len().saturating_sub(1)]
+        } else {
+            &self.pend_t[..]
+        };
+        w.u32s("mtp.pend_t", pt)?;
+        w.f32s("mtp.pend_h", &self.pend_h)
+    }
+
+    /// Reads a state written by [`MtpDecoder::write_state`] into a fresh decoder.
+    pub fn read_state(&mut self, r: &mut crate::snapshot::SnapReader) -> Result<()> {
+        use crate::snapshot::SessionState;
+        self.sess.read_state(r)?;
+        let n = self.sess.pos;
+        let ml = r.u64s_exact("mtp.len", 1)?[0] as usize;
+        if ml > n {
+            bail!("snapshot: the MTP cache is longer than the session");
+        }
+        crate::snapshot::read_kv(r, "mtp.kv", &mut self.msess.kv, ml)?;
+        let rows = n - ml;
+        let pt = r.u32s("mtp.pend_t", rows)?;
+        if pt.len() + 1 != rows.max(1) || (rows == 0 && !pt.is_empty()) {
+            bail!("snapshot: bad MTP pending rows");
+        }
+        self.pend_h = r.f32s("mtp.pend_h", rows * self.model.mtp_width())?;
+        self.pend_t = pt;
+        self.msess.spans = self.sess.spans.clone();
+        self.next = None;
+        Ok(())
     }
 }
 

@@ -202,6 +202,45 @@ pub struct EngineOptions {
     /// Runtime interventions from the first request on (see [`Engine::set_interventions`]).
     /// Key `interventions`: the [`crate::intervene::Spec`] as JSON, or `@FILE` for a JSON file.
     pub interventions: Option<crate::intervene::Spec>,
+    /// Prompt-lookup speculative decoding ([`crate::lookup`]): drafts copied from the
+    /// conversation where its last tokens occurred before, verified in one multi-token pass
+    /// (exact, like the other drafts; the cost-aware policy makes rounds without a match plain
+    /// steps). On its own with every family whose plain decoding the engine runs (Gemma 4 / 3,
+    /// Qwen, Llama 3, Mistral Large 4, DeepSeek V4), and inside DSpark and MTP decoding, where a
+    /// long match replaces the draft model's round when it promises more. Not with a Gemma 4
+    /// assistant drafter or Core ML models. None: [`crate::lookup::BY_DEFAULT`]. Key `lookup`.
+    pub lookup: Option<bool>,
+    /// Prompt lookup: most draft tokens per round (default
+    /// [`crate::lookup::DEFAULT_MAX_DRAFT`], at most 14). Key `lookup_tokens`.
+    pub lookup_tokens: Option<usize>,
+    /// Prompt lookup: shortest context match that gives a draft (default 2). Key
+    /// `lookup_min_match`.
+    pub lookup_min_match: Option<usize>,
+    /// Prompt lookup: veto drafts the model refuted in the same context (the
+    /// verification-outcome memory; default on). Key `lookup_memory`.
+    pub lookup_memory: bool,
+    /// Prompt lookup: verify every match to its full length instead of the cost-aware length.
+    /// Key `lookup_fixed`.
+    pub lookup_fixed: bool,
+    /// A directory of session snapshots ([`crate::snapshot::PromptCache`]) shared across engines,
+    /// processes and restarts: [`Engine::chat`] restores the snapshot that saves the most of a
+    /// prompt (KV caches can be cut back to a common prefix; recurrent states only restore a
+    /// whole snapshot the prompt starts with) instead of recomputing it, stores the conversation
+    /// after each reply (written later: [`Engine::flush_prompt_cache`], or the next request or
+    /// drop), and, for models with recurrent state, the prompt prefix every conversation with the
+    /// same system prompt and tools shares. Created private (mode 0700); a shared directory like
+    /// `/tmp` is refused. Key `prompt_cache` (a directory, `auto` for
+    /// [`crate::snapshot::default_dir`], empty or `none` for none). Families: Gemma 4 / 3, Qwen
+    /// (Qwen3, Qwen3.5 / 3.6 / 3.8 dense and MoE, Qwen2.5-VL), Llama 3, with or without their
+    /// DSpark / MTP drafts; not Mistral Large 4, DeepSeek V4, Qwen4-Exp, Core ML, nor the Gemma 4
+    /// assistant drafter's state (none: it keeps no cache).
+    pub prompt_cache: Option<PathBuf>,
+    /// Size cap of the prompt cache in GB (default [`crate::snapshot::DEFAULT_CAP_GB`]). Key
+    /// `prompt_cache_gb`.
+    pub prompt_cache_gb: Option<f64>,
+    /// Shortest conversation (in tokens) the prompt cache stores (default 64). Key
+    /// `prompt_cache_min_tokens`.
+    pub prompt_cache_min_tokens: Option<usize>,
 }
 
 /// Whether a model's weights stream from storage ([`EngineOptions::stream_mode`]).
@@ -355,6 +394,14 @@ impl Default for EngineOptions {
             gpu_decode: None,
             decision_from: None,
             interventions: None,
+            lookup: None,
+            lookup_tokens: None,
+            lookup_min_match: None,
+            lookup_memory: true,
+            lookup_fixed: false,
+            prompt_cache: None,
+            prompt_cache_gb: None,
+            prompt_cache_min_tokens: None,
         }
     }
 }
@@ -424,6 +471,14 @@ impl EngineOptions {
         "gpu_decode",
         "decision_from",
         "interventions",
+        "lookup",
+        "lookup_tokens",
+        "lookup_min_match",
+        "lookup_memory",
+        "lookup_fixed",
+        "prompt_cache",
+        "prompt_cache_gb",
+        "prompt_cache_min_tokens",
     ];
 
     /// Sets an option by name (see the field docs for the keys). Unknown keys are errors.
@@ -517,6 +572,30 @@ impl EngineOptions {
             "gpu_moe" => self.gpu_moe = Some(parse_bool(key, value)?),
             "gpu_decode" => self.gpu_decode = Some(parse_bool(key, value)?),
             "decision_from" => self.decision_from = opt_str(value),
+            "lookup" => {
+                self.lookup = match value {
+                    "" | "auto" => None,
+                    v => Some(parse_bool(key, v)?),
+                }
+            }
+            "lookup_tokens" => self.lookup_tokens = parse_opt_usize(key, value)?,
+            "lookup_min_match" => self.lookup_min_match = parse_opt_usize(key, value)?,
+            "lookup_memory" => self.lookup_memory = parse_bool(key, value)?,
+            "lookup_fixed" => self.lookup_fixed = parse_bool(key, value)?,
+            "prompt_cache" => {
+                self.prompt_cache = match value {
+                    "" | "none" | "off" | "0" => None,
+                    "auto" | "on" | "1" => Some(crate::snapshot::default_dir()),
+                    v => Some(PathBuf::from(v)),
+                }
+            }
+            "prompt_cache_gb" => {
+                self.prompt_cache_gb = match value {
+                    "" => None,
+                    v => Some(v.parse().with_context(|| format!("{key}: not a number: {v:?}"))?),
+                }
+            }
+            "prompt_cache_min_tokens" => self.prompt_cache_min_tokens = parse_opt_usize(key, value)?,
             "interventions" => {
                 self.interventions = match value.trim() {
                     "" => None,
@@ -738,6 +817,10 @@ pub struct Stats {
     /// [`Engine::chat`]: prompt tokens taken from the cache of the previous call instead of fed
     /// (the whole prompt is `prompt_tokens + cached_tokens`).
     pub cached_tokens: usize,
+    /// Of `cached_tokens`, those restored from the prompt cache ([`EngineOptions::prompt_cache`])
+    /// rather than kept in memory, and the time the restore took.
+    pub restored_tokens: usize,
+    pub restore_secs: f64,
 }
 
 impl Stats {
@@ -923,6 +1006,83 @@ mod conversation;
 pub use conversation::{Message, Role};
 
 impl Lm {
+    /// Writes the decoding state to a snapshot ([`crate::snapshot`]).
+    fn write_state<W: std::io::Write>(&self, w: &mut crate::snapshot::SnapWriter<W>) -> Result<()> {
+        use crate::snapshot::SessionState;
+        match self {
+            Lm::Gemma { sess, .. } => sess.write_state(w),
+            Lm::Qwen { sess, .. } => sess.write_state(w),
+            Lm::QwenMtp { dec } => dec.write_state(w),
+            Lm::QwenDspark { dec } => dec.write_state(w),
+            Lm::GemmaDspark { dec } => dec.write_state(w),
+            _ => bail!("session snapshots are not supported for this model family"),
+        }
+    }
+    /// Reads a snapshot's decoding state into the fresh state (after [`Lm::reset`]).
+    fn read_state(&mut self, r: &mut crate::snapshot::SnapReader) -> Result<()> {
+        use crate::snapshot::SessionState;
+        match self {
+            Lm::Gemma { sess, .. } => sess.read_state(r),
+            Lm::Qwen { sess, .. } => sess.read_state(r),
+            Lm::QwenMtp { dec } => dec.read_state(r),
+            Lm::QwenDspark { dec } => dec.read_state(r),
+            Lm::GemmaDspark { dec } => dec.read_state(r),
+            _ => bail!("session snapshots are not supported for this model family"),
+        }
+    }
+    /// Whether snapshots are supported.
+    fn snapshots(&self) -> bool {
+        match self {
+            Lm::Gemma { .. } | Lm::GemmaDspark { .. } => true,
+            Lm::Qwen { sess, .. } => sess.exp.is_none(),
+            Lm::QwenMtp { dec } => dec.sess.exp.is_none(),
+            Lm::QwenDspark { dec } => dec.sess.exp.is_none(),
+            _ => false,
+        }
+    }
+    /// Whether the cache can be cut back to any earlier position (no recurrent state).
+    fn truncatable(&self) -> bool {
+        use crate::snapshot::SessionState;
+        match self {
+            Lm::Gemma { .. } | Lm::GemmaDspark { .. } => true,
+            Lm::Qwen { sess, .. } => sess.truncatable(),
+            Lm::QwenDspark { dec } => dec.sess.truncatable(),
+            _ => false,
+        }
+    }
+    /// Cuts the cache back to `len` positions ([`Lm::truncatable`] states only).
+    fn truncate_to(&mut self, len: usize) {
+        match self {
+            Lm::Gemma { sess, .. } => sess.truncate(len),
+            Lm::Qwen { model, sess } => crate::dspark::Target::truncate(*model, sess, len),
+            Lm::QwenDspark { dec } => dec.truncate_to(len),
+            Lm::GemmaDspark { dec } => dec.truncate_to(len),
+            _ => {}
+        }
+    }
+    /// Runs `ids` into the cache without generating.
+    fn prefill_only(&mut self, ids: &[u32], chunk: usize) -> Result<()> {
+        match self {
+            Lm::Gemma { model, sess, .. } => drop(generate::prefill(*model, sess, ids, chunk, &[])),
+            Lm::Qwen { model, sess } => drop(generate::prefill(*model, sess, ids, chunk, &[])),
+            Lm::QwenMtp { dec } => drop(dec.prefill(ids, chunk)),
+            Lm::QwenDspark { dec } => drop(dec.prefill(ids, chunk)),
+            Lm::GemmaDspark { dec } => drop(dec.prefill(ids, chunk)),
+            _ => bail!("not supported for this model family"),
+        }
+        Ok(())
+    }
+    /// The prompt-lookup drafter a speculative decoder holds.
+    fn lookup_mut(&mut self) -> Option<&mut crate::lookup::Lookup> {
+        match self {
+            Lm::QwenMtp { dec } => dec.lookup.as_mut(),
+            Lm::Mistral4Dspark { dec } => dec.lookup.as_mut(),
+            Lm::DeepSeek4Dspark { dec } => dec.lookup.as_mut(),
+            Lm::QwenDspark { dec } => dec.lookup.as_mut(),
+            Lm::GemmaDspark { dec } => dec.lookup.as_mut(),
+            _ => None,
+        }
+    }
     fn context_len(&self) -> usize {
         match self {
             Lm::Gemma { sess, .. } => sess.pos,
@@ -944,30 +1104,68 @@ impl Lm {
             Lm::Qwen { model, sess } => *sess = model.new_session(),
             Lm::QwenMtp { dec } => {
                 let opts = dec.opts.clone();
+                let lk = reset_lookup(dec.lookup.take());
                 **dec = MtpDecoder::new(dec.model(), dec.mtp(), opts);
+                dec.lookup = lk;
             }
             Lm::Mistral4 { model, sess } => *sess = model.new_session(),
             Lm::Mistral4Dspark { dec } => {
                 let opts = dec.opts.clone();
+                let lk = reset_lookup(dec.lookup.take());
                 **dec = DsparkDecoder::new(dec.model(), dec.draft(), opts);
+                dec.lookup = lk;
             }
             Lm::DeepSeek4 { model, sess } => *sess = model.new_session(),
             Lm::DeepSeek4Dspark { dec } => {
                 let opts = dec.opts.clone();
+                let lk = reset_lookup(dec.lookup.take());
                 **dec = DsparkDecoder::new(dec.model(), dec.draft(), opts);
+                dec.lookup = lk;
             }
             Lm::QwenDspark { dec } => {
                 let opts = dec.opts.clone();
+                let lk = reset_lookup(dec.lookup.take());
                 **dec = DsparkDecoder::new(dec.model(), dec.draft(), opts);
+                dec.lookup = lk;
             }
             Lm::GemmaDspark { dec } => {
                 let opts = dec.opts.clone();
+                let lk = reset_lookup(dec.lookup.take());
                 **dec = DsparkDecoder::new(dec.model(), dec.draft(), opts);
+                dec.lookup = lk;
             }
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(c) => c.reset(),
         }
     }
+}
+
+/// A prompt-lookup drafter for a new conversation.
+fn reset_lookup(lk: Option<crate::lookup::Lookup>) -> Option<crate::lookup::Lookup> {
+    lk.map(|mut l| {
+        l.reset();
+        l
+    })
+}
+
+/// The fingerprint of a loaded model for snapshots: the checkpoint, its precision and format,
+/// the device and the speculative decoding (whose caches are part of the state), hashed.
+fn fingerprint(info: &ModelInfo, opts: &EngineOptions) -> String {
+    let s = format!(
+        "oxinfer-snapshot-1|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{}|{:?}",
+        info.path.display(),
+        info.checkpoint_bytes,
+        info.model_type,
+        info.format,
+        info.quant.as_str(),
+        info.device,
+        info.speculative,
+        opts.draft,
+        opts.mtp_from,
+        opts.fast_verify,
+        opts.draft_device,
+    );
+    format!("{:016x}", crate::snapshot::hash64(&[s.as_bytes()]))
 }
 
 /// Opens and loads the DSpark draft at `path` for a target of hidden size `hidden` and
@@ -1024,12 +1222,27 @@ pub struct Engine {
     decision: Option<Box<DecisionAssets>>,
     /// Runtime interventions ([`Engine::set_interventions`]).
     iv: IvState,
+    /// Prompt lookup for plain decoding ([`EngineOptions::lookup`]; the DSpark and MTP decoders
+    /// hold their own). Its context is the conversation's tokens in the cache.
+    lookup: Option<crate::lookup::Lookup>,
+    /// The tokens in the cache (valid when as long as the cache).
+    history: Vec<u32>,
+    /// The prompt cache ([`EngineOptions::prompt_cache`]), its minimum, and whether the
+    /// conversation waits to be stored.
+    pcache: Option<crate::snapshot::PromptCache>,
+    pcache_min: usize,
+    pcache_pending: bool,
+    /// Identifies the model and the settings its state depends on, for snapshots.
+    fingerprint: String,
     /// Must stay last: the model, sessions and references above point into it.
     _arena: Arena,
 }
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        if let Err(e) = self.flush_prompt_cache() {
+            eprintln!("[prompt cache: {e:#}]");
+        }
         // The model holds handles too; stop the reader thread before the arena unmaps the files.
         if let Some(s) = &self.streamer {
             s.shutdown();
@@ -1442,6 +1655,41 @@ impl Engine {
             files.preload();
         }
         let stop = chat::with_turn_end(fmt, &tok, eos);
+        let mut lm = lm;
+        let lookup = opts.lookup.unwrap_or(crate::lookup::BY_DEFAULT).then(|| {
+            crate::lookup::Lookup::new(crate::lookup::LookupOptions {
+                max_draft: opts.lookup_tokens.unwrap_or(crate::lookup::DEFAULT_MAX_DRAFT),
+                min_match: opts.lookup_min_match.unwrap_or(2),
+                memory: opts.lookup_memory,
+                cost_aware: !opts.lookup_fixed,
+                fast_verify: opts.fast_verify,
+                stop: stop.clone(),
+            })
+        });
+        let lookup = match &mut lm {
+            Lm::QwenMtp { dec } => {
+                dec.lookup = lookup;
+                None
+            }
+            Lm::Mistral4Dspark { dec } => {
+                dec.lookup = lookup;
+                None
+            }
+            Lm::DeepSeek4Dspark { dec } => {
+                dec.lookup = lookup;
+                None
+            }
+            Lm::QwenDspark { dec } => {
+                dec.lookup = lookup;
+                None
+            }
+            Lm::GemmaDspark { dec } => {
+                dec.lookup = lookup;
+                None
+            }
+            Lm::Gemma { drafter: Some(_), .. } => None,
+            _ => lookup,
+        };
         let format = if files.metadata("format") == Some("gguf") {
             "gguf"
         } else if files.is_mlx() {
@@ -1451,6 +1699,14 @@ impl Engine {
         } else {
             "safetensors"
         };
+        let pcache = match &opts.prompt_cache {
+            Some(d) => {
+                let cap = opts.prompt_cache_gb.unwrap_or(crate::snapshot::DEFAULT_CAP_GB);
+                Some(crate::snapshot::PromptCache::open(d, (cap * 1e9) as u64).with_context(|| format!("prompt cache {}", d.display()))?)
+            }
+            None => None,
+        };
+        let pcache = pcache.filter(|_| lm.snapshots());
         let speculative = match &lm {
             Lm::QwenMtp { .. } => Speculative::Mtp,
             Lm::Gemma { drafter: Some(_), .. } => Speculative::Drafter,
@@ -1502,7 +1758,17 @@ impl Engine {
                 cache_dir: opts.cache_dir.clone(),
                 ..Default::default()
             },
+            lookup,
+            history: Vec::new(),
+            pcache,
+            pcache_min: opts.prompt_cache_min_tokens.unwrap_or(64),
+            pcache_pending: false,
+            fingerprint: String::new(),
             _arena: arena,
+        })
+        .map(|mut e| {
+            e.fingerprint = fingerprint(&e.info, opts);
+            e
         })
         .and_then(|mut e| {
             if let Some(spec) = &opts.interventions {
@@ -1561,6 +1827,12 @@ impl Engine {
             decision: None,
             mmproj: crate::pixtral::Mmproj::None,
             iv: IvState::default(),
+            lookup: None,
+            history: Vec::new(),
+            pcache: None,
+            pcache_min: 0,
+            pcache_pending: false,
+            fingerprint: String::new(),
             _arena: arena,
         })
     }
@@ -1632,6 +1904,150 @@ impl Engine {
         &self.stats
     }
 
+    // ---- session snapshots (crate::snapshot) ----
+
+    /// The tokens in the cache (the conversation so far), when known (empty otherwise).
+    pub fn session_tokens(&self) -> &[u32] {
+        if self.history.len() == self.context_len() {
+            &self.history
+        } else {
+            &[]
+        }
+    }
+
+    /// Writes the session (KV caches, recurrent states, positions, speculative decoders' caches,
+    /// and the tokens) to `path` (created mode 0600, replaced atomically), for
+    /// [`Engine::load_session`] on this model with the same options, in this process or another.
+    /// Returns the file size. Families: see [`EngineOptions::prompt_cache`].
+    pub fn save_session(&mut self, path: &Path) -> Result<u64> {
+        let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.lm.snapshots() {
+            bail!("session snapshots are not supported for this model");
+        }
+        let path = if path.is_relative() {
+            Path::new(".").join(path)
+        } else {
+            path.to_path_buf()
+        };
+        crate::snapshot::write_atomic(&path, |f| self.write_snapshot(f))
+    }
+
+    /// Restores a session written by [`Engine::save_session`] (or a prompt-cache snapshot of
+    /// this model): the conversation continues from it as if it had been computed here (the
+    /// next [`Engine::send`] continues it, [`Engine::chat`] reuses it when the conversation
+    /// starts with its tokens). The file must come from the same model and options. Returns the
+    /// tokens restored.
+    pub fn load_session(&mut self, path: &Path) -> Result<usize> {
+        let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+        self.read_snapshot(path)
+    }
+
+    /// Stores the conversation waiting for the prompt cache (see
+    /// [`EngineOptions::prompt_cache`]); [`Engine::chat`] leaves it pending so that the reply is
+    /// not delayed. Returns whether a snapshot was written.
+    pub fn flush_prompt_cache(&mut self) -> Result<bool> {
+        if !std::mem::take(&mut self.pcache_pending) || self.pcache.is_none() {
+            return Ok(false);
+        }
+        let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+        self.store_snapshot()
+    }
+
+    /// The prompt cache's directory, snapshot count and bytes, when one is configured.
+    pub fn prompt_cache_info(&self) -> Option<(PathBuf, usize, u64)> {
+        self.pcache.as_ref().map(|c| (c.dir().to_path_buf(), c.entries().len(), c.bytes()))
+    }
+
+    /// Writes the current conversation to the prompt cache unless it is too short, unknown or
+    /// already there.
+    fn store_snapshot(&mut self) -> Result<bool> {
+        let toks = self.session_tokens().to_vec();
+        let truncatable = self.lm.truncatable();
+        let Some(pc) = &self.pcache else { return Ok(false) };
+        if toks.len() < self.pcache_min || pc.covers(&self.fingerprint, &toks, truncatable) {
+            return Ok(false);
+        }
+        let mut pc = self.pcache.take().unwrap();
+        let r = pc.store(&self.fingerprint, &toks, truncatable, |f| self.write_snapshot(f));
+        self.pcache = Some(pc);
+        r.map(|_| true)
+    }
+
+    fn write_snapshot<W: std::io::Write>(&self, f: W) -> Result<()> {
+        let toks = self.session_tokens();
+        if toks.is_empty() && self.context_len() > 0 {
+            bail!("the tokens in the cache are not known (a turn failed?)");
+        }
+        let mut w = crate::snapshot::SnapWriter::new(f)?;
+        w.u32s("tokens", toks)?;
+        self.lm.write_state(&mut w)?;
+        let meta = serde_json::json!({
+            "model": self.fingerprint,
+            "model_type": self.info.model_type,
+            "tokens": toks.len(),
+            "turns": self.turns,
+            // The last reply's final token when the model has not run it: the next turn feeds it
+            // first (see `Engine::unfed`).
+            "unfed": self.unfed,
+        });
+        w.finish(meta)?;
+        Ok(())
+    }
+
+    /// Replaces the session with a snapshot's (on failure the conversation starts over).
+    fn read_snapshot(&mut self, path: &Path) -> Result<usize> {
+        if !self.lm.snapshots() {
+            bail!("session snapshots are not supported for this model");
+        }
+        let mut r = crate::snapshot::SnapReader::open(path)?;
+        if r.meta()["model"].as_str() != Some(self.fingerprint.as_str()) {
+            bail!(
+                "{}: the snapshot is of another model or other options ({})",
+                path.display(),
+                r.meta()["model_type"].as_str().unwrap_or("?")
+            );
+        }
+        let n = r.meta()["tokens"].as_u64().context("snapshot: no token count")? as usize;
+        let turns = r.meta()["turns"].as_u64().unwrap_or(1) as usize;
+        let unfed = r.meta()["unfed"]
+            .as_u64()
+            .map(|t| t as u32)
+            .filter(|&t| (t as usize) < self.info.vocab_size);
+        self.reset();
+        let res = (|| -> Result<Vec<u32>> {
+            let toks = r.u32s("tokens", n)?;
+            if toks.len() != n {
+                bail!("snapshot: token count mismatch");
+            }
+            self.lm.read_state(&mut r)?;
+            if self.lm.context_len() != n {
+                bail!("snapshot: the state holds {} positions, not {n}", self.lm.context_len());
+            }
+            r.finish()?;
+            Ok(toks)
+        })();
+        match res {
+            Ok(toks) => {
+                if let Some(l) = &mut self.lookup {
+                    l.set_tokens(&toks);
+                }
+                if let Some(l) = self.lm.lookup_mut() {
+                    l.set_tokens(&toks);
+                }
+                self.history = toks.clone();
+                self.chat_ids = Some(toks);
+                self.turns = turns;
+                self.unfed = unfed;
+                self.install_iv();
+                Ok(n)
+            }
+            Err(e) => {
+                self.reset();
+                Err(e.context(format!("restore {}", path.display())))
+            }
+        }
+    }
+
     /// Tokens in the conversation so far.
     pub fn context_len(&self) -> usize {
         self.lm.context_len()
@@ -1640,6 +2056,10 @@ impl Engine {
     /// Starts a new conversation (drops the cache).
     pub fn reset(&mut self) {
         self.lm.reset();
+        if let Some(l) = &mut self.lookup {
+            l.reset();
+        }
+        self.history.clear();
         self.turns = 0;
         self.unfed = None;
         self.chat_ids = None;
@@ -2178,6 +2598,19 @@ impl PendingTurn {
             spans,
             think,
         } = self;
+        // The tokens in the cache: known when the history is as long as the cache. The prompt
+        // lookup drafters follow them.
+        let base = e.lm.context_len();
+        e.history.truncate(base);
+        let known = e.history.len() == base;
+        if known {
+            if let Some(l) = &mut e.lookup {
+                l.set_tokens(&e.history);
+            }
+            if let Some(l) = e.lm.lookup_mut() {
+                l.set_tokens(&e.history);
+            }
+        }
         let Engine {
             lm,
             tok,
@@ -2189,6 +2622,7 @@ impl PendingTurn {
             max_context,
             draft_tokens,
             cancel,
+            lookup,
             ..
         } = e;
         let tok: &Tokenizer = tok;
@@ -2233,8 +2667,27 @@ impl PendingTurn {
             reason: StopReason::Length,
             unfed: None,
         };
+        // Plain decoding, or prompt-lookup rounds when on: the drafter's context is the cache
+        // before the turn plus the turn's tokens.
+        macro_rules! plain {
+            ($model:expr, $sess:expr, $base:expr, $logits:expr, $max:expr) => {
+                match lookup.as_mut() {
+                    Some(lk) => {
+                        lk.truncate($base);
+                        lk.extend(&ids);
+                        let mut dec = crate::lookup::LookupRounds::new($model, $sess, lk);
+                        let d = generate::decode_rounds(&mut dec, &$logits, sampler, stop, $max, &mut cb);
+                        st.drafted = dec.stats.drafted;
+                        st.accepted = dec.stats.accepted;
+                        d
+                    }
+                    None => generate::decode($model, $sess, $logits, sampler, stop, $max, &mut cb),
+                }
+            };
+        }
         let d: Decoded = match lm {
             Lm::Gemma { model, sess, drafter } => {
+                let base = sess.pos;
                 let hs = generate::prefill(*model, sess, &ids, chunk, &overrides);
                 let h = model.cfg.hidden_size;
                 let last = hs[hs.len() - h..].to_vec();
@@ -2253,7 +2706,7 @@ impl PendingTurn {
                     }
                     None => {
                         let logits = model.logits(&last, 1);
-                        generate::decode(*model, sess, logits, sampler, stop, max, &mut cb)
+                        plain!(*model, sess, base, logits, max)
                     }
                 }
             }
@@ -2269,7 +2722,7 @@ impl PendingTurn {
                 if max == 0 {
                     empty(0.0)
                 } else {
-                    generate::decode(*model, sess, logits, sampler, stop, max, &mut cb)
+                    plain!(*model, sess, base, logits, max)
                 }
             }
             Lm::QwenMtp { dec } => {
@@ -2306,6 +2759,7 @@ impl PendingTurn {
                 }
             }
             Lm::Mistral4 { model, sess } => {
+                let base = sess.pos;
                 let hs = generate::prefill(*model, sess, &ids, chunk, &overrides);
                 let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
                 st.prefill_secs = t0.elapsed().as_secs_f64();
@@ -2313,7 +2767,7 @@ impl PendingTurn {
                 if max == 0 {
                     empty(0.0)
                 } else {
-                    generate::decode(*model, sess, logits, sampler, stop, max, &mut cb)
+                    plain!(*model, sess, base, logits, max)
                 }
             }
             Lm::QwenDspark { dec } => {
@@ -2365,6 +2819,7 @@ impl PendingTurn {
                 }
             }
             Lm::DeepSeek4 { model, sess } => {
+                let base = sess.pos;
                 let hs = generate::prefill(*model, sess, &ids, chunk, &overrides);
                 let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
                 st.prefill_secs = t0.elapsed().as_secs_f64();
@@ -2372,7 +2827,7 @@ impl PendingTurn {
                 if max == 0 {
                     empty(0.0)
                 } else {
-                    generate::decode(*model, sess, logits, sampler, stop, max, &mut cb)
+                    plain!(*model, sess, base, logits, max)
                 }
             }
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
@@ -2418,6 +2873,11 @@ impl PendingTurn {
         };
         e.unfed = d.unfed;
         e.stats = st.clone();
+        if known {
+            e.history.extend_from_slice(&ids);
+            e.history.extend_from_slice(&d.tokens);
+            e.history.truncate(e.lm.context_len());
+        }
         Ok(Reply {
             text,
             thinking,

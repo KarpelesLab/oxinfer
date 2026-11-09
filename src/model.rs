@@ -1735,6 +1735,30 @@ impl crate::dspark::Target for Model<'_> {
     }
 }
 
+/// Snapshots ([`crate::snapshot`]): the position and every layer's own KV cache. Interventions
+/// and captures are settings, not state, and are left as they are.
+impl crate::snapshot::SessionState for Session {
+    fn write_state<W: std::io::Write>(&self, w: &mut crate::snapshot::SnapWriter<W>) -> Result<()> {
+        w.u64s("gemma.pos", &[self.pos as u64])?;
+        for (l, c) in self.caches.iter().enumerate() {
+            if let Some(c) = c {
+                crate::snapshot::write_kv(w, &format!("gemma.kv.{l}"), c)?;
+            }
+        }
+        Ok(())
+    }
+    fn read_state(&mut self, r: &mut crate::snapshot::SnapReader) -> Result<()> {
+        let pos = r.u64s_exact("gemma.pos", 1)?[0] as usize;
+        for (l, c) in self.caches.iter_mut().enumerate() {
+            if let Some(c) = c {
+                crate::snapshot::read_kv(r, &format!("gemma.kv.{l}"), c, pos)?;
+            }
+        }
+        self.pos = pos;
+        Ok(())
+    }
+}
+
 impl crate::intervene::Host for Model<'_> {
     fn n_layers(&self) -> usize {
         self.cfg.num_hidden_layers

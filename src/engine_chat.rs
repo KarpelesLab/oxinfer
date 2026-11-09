@@ -103,9 +103,12 @@ impl Engine {
     ///
     /// When the conversation's tokens start with those the cache holds from the previous call
     /// (the same conversation with the reply and new messages appended, the reply rendered as the
-    /// model wrote it), only the new tokens are fed ([`Stats::cached_tokens`]); otherwise the
-    /// conversation starts over. Prompts with attachments before the new messages always start
-    /// over (the cached soft tokens might be of other media).
+    /// model wrote it), only the new tokens are fed ([`Stats::cached_tokens`]); models without
+    /// recurrent state (Gemma, Qwen3, Llama) also keep the part the conversations share when
+    /// they differ later. Otherwise the conversation starts over, or, with a prompt cache
+    /// ([`EngineOptions::prompt_cache`]), from the stored snapshot that saves the most. Prompts
+    /// with attachments in the reused part always start over (the cached soft tokens might be of
+    /// other media).
     pub fn chat(&mut self, messages: &[Message], on_delta: &mut dyn FnMut(&Delta) -> Flow) -> Result<Reply> {
         let (text, feats) = self.render(messages)?;
         let ids = self.tok.encode(text, false).map_err(|e| anyhow!("encode: {e}"))?.get_ids().to_vec();
@@ -113,12 +116,85 @@ impl Engine {
             bail!("empty prompt");
         }
         let placeholder = |t: &u32| feats.iter().any(|f| f.token_id == *t);
-        let skip = match self.chat_ids.take() {
-            Some(c) if c.len() < ids.len() && ids.starts_with(&c) && self.context_len() == c.len() && !c.iter().any(placeholder) => c.len(),
+        let truncatable = self.lm.truncatable();
+        let common = |c: &[u32]| c.iter().zip(&ids).take_while(|(a, b)| a == b).count();
+        // What the cache in memory saves.
+        let mut skip = match self.chat_ids.take() {
+            Some(c) if self.context_len() == c.len() => {
+                let n = common(&c);
+                if n == c.len() && n < ids.len() {
+                    n
+                } else if truncatable {
+                    n.min(ids.len() - 1)
+                } else {
+                    0
+                }
+            }
             _ => 0,
         };
+        if ids[..skip].iter().any(placeholder) {
+            skip = 0;
+        }
+        // A stored snapshot that saves more.
+        let stored = self
+            .pcache
+            .as_ref()
+            .and_then(|pc| pc.best(&self.fingerprint, &ids, truncatable))
+            .filter(|(_, n)| *n > skip && !ids[..*n].iter().any(placeholder))
+            .map(|(e, n)| (e.path.clone(), n));
+        let mut restored = 0;
+        if let Some((path, n)) = stored {
+            self.flush_prompt_cache_logged();
+            let t0 = Instant::now();
+            match self.read_snapshot(&path) {
+                Ok(len) => {
+                    if let Some(pc) = &mut self.pcache {
+                        pc.touch(&path);
+                    }
+                    if len > n {
+                        self.lm.truncate_to(n);
+                        self.history.truncate(n);
+                    }
+                    skip = n;
+                    restored = n;
+                    self.stats.restore_secs = t0.elapsed().as_secs_f64();
+                }
+                Err(e) => {
+                    eprintln!("[prompt cache: {e:#}]");
+                    if let Some(pc) = &mut self.pcache {
+                        pc.remove(&path);
+                    }
+                    skip = 0;
+                }
+            }
+        } else if skip > 0 && skip < self.context_len() {
+            self.flush_prompt_cache_logged();
+            self.lm.truncate_to(skip);
+            self.history.truncate(skip);
+        }
         if skip == 0 {
+            self.flush_prompt_cache_logged();
             self.reset();
+        }
+        let restore_secs = if restored > 0 { self.stats.restore_secs } else { 0.0 };
+        // Models with recurrent state cannot cut a snapshot back: store the prefix that every
+        // conversation with this system prompt and tools shares, the first time it is computed.
+        if self.pcache.is_some() && !truncatable {
+            let b = self.shared_prefix_len(messages, &ids);
+            let covered = self
+                .pcache
+                .as_ref()
+                .is_some_and(|pc| pc.covers(&self.fingerprint, &ids[..b], false));
+            if b >= self.pcache_min && b > skip && b < ids.len() && !covered && !ids[..b].iter().any(placeholder) {
+                let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+                self.lm.prefill_only(&ids[skip..b], self.prefill_chunk)?;
+                self.history.extend_from_slice(&ids[skip..b]);
+                if let Err(e) = self.store_snapshot() {
+                    eprintln!("[prompt cache: {e:#}]");
+                }
+                skip = b;
+                self.chat_ids = None;
+            }
         }
         // The cache ends where the conversation's tokens are fed from: the token the last reply
         // stopped on, if any, is among them.
@@ -126,7 +202,12 @@ impl Engine {
         let think = self.config.think;
         let mut reply = self.turn_ids(ids[skip..].to_vec(), &feats, think)?.finish(self, on_delta)?;
         reply.stats.cached_tokens = skip;
-        self.stats.cached_tokens = skip;
+        reply.stats.restored_tokens = restored;
+        reply.stats.restore_secs = restore_secs;
+        self.stats = reply.stats.clone();
+        if self.pcache.is_some() {
+            self.pcache_pending = true;
+        }
         // The cache holds the prompt and the reply up to the tokens the model has not run (the
         // one it stopped on, at least).
         let (mut fed, ctx) = (ids, self.context_len());
@@ -137,6 +218,37 @@ impl Engine {
         });
         self.turns = messages.iter().filter(|m| m.role == Role::User).count().max(1);
         Ok(reply)
+    }
+
+    /// Stores a pending conversation snapshot, reporting a failure on stderr (the request goes
+    /// on without it).
+    fn flush_prompt_cache_logged(&mut self) {
+        if let Err(e) = self.flush_prompt_cache() {
+            eprintln!("[prompt cache: {e:#}]");
+        }
+    }
+
+    /// The length of the prompt prefix that every conversation with the same system prompt and
+    /// tools shares: `ids`' common prefix with the first turn rendered with an empty message.
+    fn shared_prefix_len(&self, messages: &[Message], ids: &[u32]) -> usize {
+        let c = &self.config;
+        let sys: Vec<&str> = messages
+            .iter()
+            .filter(|m| m.role == Role::System)
+            .map(|m| m.content.as_str())
+            .collect();
+        let system = if sys.is_empty() {
+            match &c.system {
+                SystemPrompt::Default => Some(crate::tools::default_system_prompt(!c.tools.is_empty())),
+                SystemPrompt::None => None,
+                SystemPrompt::Text(t) => Some(t.clone()),
+            }
+        } else {
+            Some(sys.join("\n\n"))
+        };
+        let head = self.fmt.first_turn(system.as_deref(), c.think, &c.tools, "");
+        let Ok(enc) = self.tok.encode(head, false) else { return 0 };
+        enc.get_ids().iter().zip(ids).take_while(|(a, b)| a == b).count()
     }
 
     /// The conversation's prompt text and the soft tokens of its attachments, in order.

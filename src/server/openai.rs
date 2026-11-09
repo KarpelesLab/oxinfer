@@ -540,10 +540,14 @@ pub(super) fn chat(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
         let api = api.clone();
         return Ok(Output::Stream {
             content_type: "text/event-stream".into(),
-            producer: Box::new(move |sink| stream_chat(&api, &req, &id, created, sink)),
+            producer: Box::new(move |sink| {
+                stream_chat(&api, &req, &id, created, sink);
+                api.flush_prompt_cache_later(&req.model);
+            }),
         });
     }
     let choices = run_chat(api, &req, &mut |_, _, _| true)?;
+    api.flush_prompt_cache_later(&req.model);
     let list: Vec<Value> = choices
         .iter()
         .enumerate()

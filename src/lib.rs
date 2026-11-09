@@ -44,6 +44,7 @@ pub mod hf;
 pub mod intervene;
 pub mod janus;
 pub mod kernels;
+pub mod lookup;
 pub mod lora;
 #[cfg(feature = "media")]
 pub mod media;
@@ -79,6 +80,7 @@ pub mod sd;
 #[cfg(all(feature = "server", not(target_arch = "wasm32")))]
 pub mod server;
 pub mod snac;
+pub mod snapshot;
 pub mod step1x;
 pub mod stream;
 pub mod tokenizer;

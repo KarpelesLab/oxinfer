@@ -2373,6 +2373,11 @@ pub struct DsparkDecoder<'m, M: Target> {
     /// they join it before the next draft pass, so rounds without a draft cost no context pass
     /// and consecutive ones share one.
     pending: (Vec<f32>, usize),
+    /// Prompt lookup ([`crate::lookup`]): when its context holds the target's tokens, a long
+    /// context match supplies a round's drafts instead of the draft model when it promises more
+    /// tokens per second. The caller keeps its context in step through `prefill` (it appends the
+    /// tokens fed); rounds append what they commit.
+    pub lookup: Option<crate::lookup::Lookup>,
 }
 
 /// The cost-aware draft length policy ([`DsparkOptions::cost_aware`]), in two steps per round:
@@ -2577,6 +2582,7 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
             stats: MtpStats::default(),
             adapt: Adaptive::default(),
             pending: (Vec::new(), 0),
+            lookup: None,
         }
     }
 
@@ -2652,6 +2658,10 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
     pub fn prefill_mm(&mut self, tokens: &[u32], chunk: usize, overrides: &[(usize, Vec<f32>)]) -> Vec<f32> {
         assert!(!tokens.is_empty());
         self.next = None;
+        if let Some(lk) = &mut self.lookup {
+            lk.truncate(self.model.session_len(&self.sess));
+            lk.extend(tokens);
+        }
         let h = self.model.hidden_size();
         let mut last = Vec::new();
         let mut start = 0;
@@ -2673,6 +2683,9 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
     pub fn push(&mut self, token: u32) {
         assert!(self.next.is_none(), "push follows prefill; step commits its own tokens");
         self.next = Some(token);
+        if let Some(lk) = &mut self.lookup {
+            lk.extend(&[token]);
+        }
     }
 
     /// One speculative round: drafts up to the current draft length (and at most
@@ -2690,7 +2703,24 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         let k = self.k_cur.min(max_new.max(1) - 1);
 
         let t_round = crate::clock::Instant::now();
-        let mut prop = if k > 0 {
+        // A long prompt-lookup match that promises more than this round would (a draft pass at
+        // the recent rate of draft rounds, or a plain step) replaces the draft pass.
+        let looked = self.lookup.as_mut().and_then(|lk| {
+            let other = if k > 0 && self.adapt.gain.2 > 0 {
+                (self.adapt.gain.0, self.adapt.gain.1)
+            } else {
+                (1.0, self.adapt.verify.first().map_or(0.0, |v| v.0))
+            };
+            lk.draft_over(max_new.max(1) - 1, other.0, other.1)
+        });
+        let lookup_class = looked.as_ref().map(|l| l.1.clone()).unwrap_or_default();
+        let mut prop = if let Some((tokens, _)) = looked {
+            Proposal {
+                dists: tokens.iter().map(|&t| vec![(t, 1.0)]).collect(),
+                tokens,
+                ..Proposal::default()
+            }
+        } else if k > 0 {
             self.flush();
             draft.propose(model, &mut self.dsess, next, k, self.opts.p_min, self.opts.conf_min, sampler)
         } else {
@@ -2699,7 +2729,7 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         let draft_secs = t_round.elapsed().as_secs_f64();
         // `p_min` may have cut the block; the cost-aware policy verifies the most profitable part.
         let probs = prop.probs.clone();
-        if self.opts.cost_aware && !prop.tokens.is_empty() {
+        if self.opts.cost_aware && !prop.tokens.is_empty() && lookup_class.is_empty() {
             let m = self.adapt.cut(&prop.probs, draft_secs);
             prop.tokens.truncate(m);
             prop.dists.truncate(m);
@@ -2775,6 +2805,11 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
             );
         }
 
+        if let Some(lk) = &mut self.lookup {
+            // A verification costs the same whoever drafted.
+            lk.policy.record_time(kd, tail_secs);
+            lk.commit(drafts, &lookup_class, &out, accepted);
+        }
         let st = &mut self.stats;
         st.rounds += 1;
         st.drafted += kd;
@@ -2786,13 +2821,92 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         st.per_round[accepted] += 1;
         st.draft_secs += draft_secs;
         st.verify_secs += verify_secs;
-        if k == self.k_cur {
+        if k == self.k_cur && lookup_class.is_empty() {
             self.adapt.record(&probs, kd, accepted, c, draft_secs, tail_secs);
         }
         if self.opts.cost_aware {
             self.k_cur = self.adapt.choose(self.opts.draft_tokens);
         }
         out
+    }
+}
+
+/// Snapshots ([`crate::snapshot`]): the target's session, the draft's context cache and the
+/// features waiting to join it. The policy's measurements are not part of the state.
+impl<M: Target> DsparkDecoder<'_, M>
+where
+    M::Sess: crate::snapshot::SessionState,
+{
+    pub fn write_state<W: std::io::Write>(&self, w: &mut crate::snapshot::SnapWriter<W>) -> Result<()> {
+        use crate::snapshot::SessionState;
+        if self.draft.ds4.is_some() {
+            bail!("session snapshots are not supported with a DeepSeek V4 draft");
+        }
+        self.sess.write_state(w)?;
+        let d = &self.dsess;
+        w.u64s("dspark.pos", &[d.start as u64, d.len as u64, self.pending.1 as u64])?;
+        if d.kv.is_empty() {
+            for (l, (a, b)) in d.a.iter().zip(&d.b).enumerate() {
+                w.f32s(&format!("dspark.a.{l}"), a)?;
+                w.f32s(&format!("dspark.b.{l}"), b)?;
+            }
+        } else {
+            for (l, c) in d.kv.iter().enumerate() {
+                crate::snapshot::write_kv(w, &format!("dspark.kv.{l}"), c)?;
+            }
+        }
+        w.f32s("dspark.pending", &self.pending.0)
+    }
+
+    /// Reads a state written by [`DsparkDecoder::write_state`] into a fresh decoder.
+    pub fn read_state(&mut self, r: &mut crate::snapshot::SnapReader) -> Result<()> {
+        use crate::snapshot::SessionState;
+        self.sess.read_state(r)?;
+        let n = self.model.session_len(&self.sess);
+        let p = r.u64s_exact("dspark.pos", 3)?;
+        let (start, len, pend) = (p[0] as usize, p[1] as usize, p[2] as usize);
+        if start > len || len.checked_add(pend) != Some(n) {
+            bail!("snapshot: the draft's context does not match the target's session");
+        }
+        let d = &mut self.dsess;
+        if d.kv.is_empty() {
+            for l in 0..d.a.len() {
+                d.a[l] = r.f32s(&format!("dspark.a.{l}"), (len - start) * d.wa)?;
+                d.b[l] = r.f32s(&format!("dspark.b.{l}"), (len - start) * d.wb)?;
+            }
+        } else {
+            if start != 0 {
+                bail!("snapshot: bad draft context");
+            }
+            for (l, c) in d.kv.iter_mut().enumerate() {
+                crate::snapshot::read_kv(r, &format!("dspark.kv.{l}"), c, len)?;
+            }
+        }
+        d.start = start;
+        d.len = len;
+        let nf = self.draft.cfg.target_layers.len() * self.model.hidden_size();
+        self.pending = (r.f32s("dspark.pending", pend * nf)?, pend);
+        self.next = None;
+        Ok(())
+    }
+
+    /// Cuts the state back to `len` positions (a target without recurrent state).
+    pub fn truncate_to(&mut self, len: usize) {
+        let n = self.model.session_len(&self.sess);
+        if len >= n {
+            return;
+        }
+        self.model.truncate(&mut self.sess, len);
+        let dl = self.dsess.len;
+        if len >= dl {
+            let nf = self.pending.0.len() / self.pending.1.max(1);
+            self.pending.1 = len - dl;
+            self.pending.0.truncate(self.pending.1 * nf);
+        } else {
+            self.pending = (Vec::new(), 0);
+            self.dsess.truncate(len);
+        }
+        self.next = None;
     }
 }
 

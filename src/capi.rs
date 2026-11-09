@@ -384,9 +384,40 @@ pub unsafe extern "C" fn oxi_engine_stats_json(e: *mut OxiEngine) -> *mut c_char
             "accepted": s.accepted,
             "acceptance": s.acceptance(),
             "context_tokens": s.context_tokens,
+            "cached_tokens": s.cached_tokens,
+            "restored_tokens": s.restored_tokens,
+            "restore_secs": s.restore_secs,
         });
         Ok(out_string(v.to_string()))
     })
+}
+
+/// Saves the session (caches and tokens) to a file; returns its size in bytes, or -1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_engine_save_session(e: *mut OxiEngine, path: *const c_char) -> i64 {
+    guard(-1, || {
+        let path = unsafe { str_arg(path, "path") }?;
+        let n = lock(unsafe { engine(e) }?).save_session(std::path::Path::new(path))?;
+        Ok(n as i64)
+    })
+}
+
+/// Restores a session saved by `oxi_engine_save_session` (same model and options); returns the
+/// tokens restored, or -1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_engine_load_session(e: *mut OxiEngine, path: *const c_char) -> i64 {
+    guard(-1, || {
+        let path = unsafe { str_arg(path, "path") }?;
+        let n = lock(unsafe { engine(e) }?).load_session(std::path::Path::new(path))?;
+        Ok(n as i64)
+    })
+}
+
+/// Writes the conversation waiting for the prompt cache (option `prompt_cache`); returns 1 if a
+/// snapshot was written, 0 if none was needed, -1 on error.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_engine_flush_prompt_cache(e: *mut OxiEngine) -> c_int {
+    guard(-1, || Ok(c_int::from(lock(unsafe { engine(e) }?).flush_prompt_cache()?)))
 }
 
 /// Detected CPU features and GPUs (the CLI's `--devices` report).

@@ -2073,6 +2073,74 @@ impl crate::dspark::Target for QwenModel<'_> {
     }
 }
 
+/// Snapshots ([`crate::snapshot`]): the position, the vision spans, the attention layers' KV
+/// caches and the Gated DeltaNet layers' recurrent and convolution states (copied into the
+/// session's own page-aligned buffers, which GPU decoding uses in place). A restored session
+/// cannot rewind to before the restore point. Qwen4-Exp sessions and explicit positions are not
+/// supported.
+impl crate::snapshot::SessionState for QwenSession {
+    fn write_state<W: std::io::Write>(&self, w: &mut crate::snapshot::SnapWriter<W>) -> Result<()> {
+        if self.exp.is_some() || self.positions.is_some() {
+            bail!("session snapshots are not supported for Qwen4-Exp models or explicit positions");
+        }
+        w.u64s("qwen.pos", &[self.pos as u64])?;
+        let spans: Vec<u64> = self.spans.iter().flat_map(|s| [s.start as u64, s.gh as u64, s.gw as u64]).collect();
+        w.u64s("qwen.spans", &spans)?;
+        for (l, c) in self.kv.iter().enumerate() {
+            if let Some(c) = c {
+                crate::snapshot::write_kv(w, &format!("qwen.kv.{l}"), c)?;
+            }
+        }
+        for (l, g) in self.gdn.iter().enumerate() {
+            if let Some(g) = g {
+                w.f32s(&format!("qwen.gdn.{l}.s"), &g.s)?;
+                w.f32s(&format!("qwen.gdn.{l}.conv"), &g.conv)?;
+            }
+        }
+        Ok(())
+    }
+    fn read_state(&mut self, r: &mut crate::snapshot::SnapReader) -> Result<()> {
+        if self.exp.is_some() {
+            bail!("session snapshots are not supported for Qwen4-Exp models");
+        }
+        let pos = r.u64s_exact("qwen.pos", 1)?[0] as usize;
+        let spans = r.u64s("qwen.spans", 3 << 20)?;
+        if spans.len() % 3 != 0 {
+            bail!("snapshot: bad vision spans");
+        }
+        self.spans = spans
+            .chunks(3)
+            .map(|s| VisionSpan {
+                start: s[0] as usize,
+                gh: s[1] as usize,
+                gw: s[2] as usize,
+            })
+            .collect();
+        if self.spans.iter().any(|s| s.start >= pos || s.gh == 0 || s.gw == 0) {
+            bail!("snapshot: bad vision spans");
+        }
+        for (l, c) in self.kv.iter_mut().enumerate() {
+            if let Some(c) = c {
+                crate::snapshot::read_kv(r, &format!("qwen.kv.{l}"), c, pos)?;
+            }
+        }
+        for (l, g) in self.gdn.iter_mut().enumerate() {
+            if let Some(g) = g {
+                r.f32s_into(&format!("qwen.gdn.{l}.s"), &mut g.s)?;
+                r.f32s_into(&format!("qwen.gdn.{l}.conv"), &mut g.conv)?;
+            }
+        }
+        self.rec_span = None;
+        self.gpu_rec = None;
+        self.gpu_states_kept = false;
+        self.pos = pos;
+        Ok(())
+    }
+    fn truncatable(&self) -> bool {
+        self.gdn.iter().all(|g| g.is_none()) && self.exp.is_none()
+    }
+}
+
 impl crate::intervene::Host for QwenModel<'_> {
     fn n_layers(&self) -> usize {
         self.cfg.num_hidden_layers

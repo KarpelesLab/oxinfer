@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use oxinfer::chat::{self, ChatFormat};
 use oxinfer::engine::{load_tokenizer, resolve_auto_draft, resolve_file, resolve_model, save_quantized};
-use oxinfer::generate::{self, Flow, SpecStats, TextLm, TextStream};
+use oxinfer::generate::{self, Flow, SpecStats, TextStream};
 use oxinfer::model::{Model, Quant, Session};
 use oxinfer::sampler::Sampler;
 use oxinfer::tokenizer::Tokenizer;
@@ -58,6 +58,17 @@ struct Args {
     draft_device: Option<bool>,
     draft_conf_min: Option<f32>,
     fast_verify: bool,
+    /// Prompt lookup: on/off (None: the default, `oxinfer::lookup::BY_DEFAULT`).
+    lookup: Option<bool>,
+    lookup_tokens: Option<usize>,
+    lookup_min_match: Option<usize>,
+    lookup_memory: bool,
+    lookup_fixed: bool,
+    /// Session persistence (runs the conversation through `oxinfer::engine::Engine`).
+    prompt_cache: Option<String>,
+    prompt_cache_gb: Option<f64>,
+    save_session: Option<PathBuf>,
+    load_session: Option<PathBuf>,
     mtp: bool,
     mtp_fixed: bool,
     mtp_from: Option<PathBuf>,
@@ -216,6 +227,21 @@ fn usage() -> ! {
          \x20                      output is the plain greedy output token for token (default: fast\n\
          \x20                      batched matrix kernels on the GPU, whose logits differ from plain\n\
          \x20                      decoding in rounding; --fast-verify asks for them explicitly)\n\
+         \x20 --lookup / --no-lookup  prompt-lookup drafting (default on): drafts copied from the\n\
+         \x20                      conversation where its last tokens occurred before (quoting, editing,\n\
+         \x20                      summarizing), verified like other drafts (exact); rounds without a\n\
+         \x20                      match are plain steps. With DSpark / MTP, a long match replaces the\n\
+         \x20                      draft model's round when it promises more\n\
+         \x20 --lookup-tokens N    prompt lookup: most draft tokens per round (default 10, at most 14)\n\
+         \x20 --lookup-min-match N prompt lookup: shortest context match giving a draft (default 2)\n\
+         \x20 --no-lookup-memory   prompt lookup: no veto of drafts the model refuted in the same context\n\
+         \x20 --lookup-fixed       prompt lookup: verify every match in full (default: cost-aware length)\n\
+         \x20 --prompt-cache DIR   keep conversation snapshots (KV caches, recurrent states, tokens) in DIR\n\
+         \x20                      (`auto`: ~/.cache/oxinfer/prompt-cache, created private) and restore\n\
+         \x20                      the longest one the prompt starts with instead of recomputing it\n\
+         \x20 --prompt-cache-gb F  size cap of the prompt cache (default 20; least recently used go first)\n\
+         \x20 --load-session FILE  start from a session saved with --save-session (same model and options)\n\
+         \x20 --save-session FILE  save the session (KV caches, recurrent states, tokens) after the reply\n\
          \x20 --mtp                Qwen3.5/3.8: speculative decoding with the checkpoint's multi-token\n\
          \x20                      prediction layer (greedy and sampled; same output distribution); the\n\
          \x20                      default for Qwen3.5-4B / 9B (--no-draft: plain decoding)\n\
@@ -417,6 +443,15 @@ fn parse_args() -> Result<Args> {
         draft_device: None,
         draft_conf_min: None,
         fast_verify: true,
+        lookup: None,
+        lookup_tokens: None,
+        lookup_min_match: None,
+        lookup_memory: true,
+        lookup_fixed: false,
+        prompt_cache: None,
+        prompt_cache_gb: None,
+        save_session: None,
+        load_session: None,
         mtp: false,
         mtp_fixed: false,
         mtp_from: None,
@@ -565,6 +600,16 @@ fn parse_args() -> Result<Args> {
             "--spec-draft-fixed" => a.mtp_fixed = true,
             "--fast-verify" => a.fast_verify = true,
             "--exact-verify" => a.fast_verify = false,
+            "--lookup" => a.lookup = Some(true),
+            "--no-lookup" => a.lookup = Some(false),
+            "--lookup-tokens" => a.lookup_tokens = Some(val()?.parse()?),
+            "--lookup-min-match" => a.lookup_min_match = Some(val()?.parse()?),
+            "--no-lookup-memory" => a.lookup_memory = false,
+            "--lookup-fixed" => a.lookup_fixed = true,
+            "--prompt-cache" => a.prompt_cache = Some(val()?),
+            "--prompt-cache-gb" => a.prompt_cache_gb = Some(val()?.parse()?),
+            "--save-session" => a.save_session = Some(PathBuf::from(val()?)),
+            "--load-session" => a.load_session = Some(PathBuf::from(val()?)),
             "--draft-device" => {
                 a.draft_device = match val()?.as_str() {
                     "auto" => None,
@@ -828,8 +873,9 @@ fn generate_speculative(
 }
 
 /// Streams the model's reply to stdout. Returns (generated ids including stop token, forwards, seconds).
+/// `fed` are the tokens just prefilled (the prompt-lookup drafter's context grows with them).
 #[allow(clippy::too_many_arguments)]
-fn generate<M: TextLm>(
+fn generate<M: oxinfer::dspark::Target>(
     model: &M,
     sess: &mut M::Sess,
     tok: &Tokenizer,
@@ -839,21 +885,54 @@ fn generate<M: TextLm>(
     max_tokens: usize,
     fmt: &dyn ChatFormat,
     think: bool,
+    fed: &[u32],
 ) -> (Vec<u32>, usize, f64) {
     let mut printer = Printer::new(fmt, think, tok);
     let stream = STREAM.lock().unwrap().clone();
     let trace = TRACE.load(std::sync::atomic::Ordering::Relaxed);
     let s_start = stream.as_ref().map(|s| s.stats());
     let (mut s_last, mut t_last) = (s_start, Instant::now());
-    let d = generate::decode(model, sess, logits, sampler, eos, max_tokens, &mut |out| {
-        // Every token after the first follows one forward pass.
-        if let (true, Some(s), Some(s0)) = (trace && out.len() > 1, &stream, &s_last) {
-            let now = s.stats();
-            eprintln!("[token: {}]", stream_line(&(now - *s0), 1, t_last.elapsed().as_secs_f64()));
-            (s_last, t_last) = (Some(now), Instant::now());
+    let mut lookup = LOOKUP.lock().unwrap();
+    let lookup_on = lookup.is_some();
+    let d = match lookup.as_mut() {
+        Some(lk) => {
+            lk.extend(fed);
+            lk.opts.stop = eos.to_vec();
+            let (d, st) = {
+                let mut dec = oxinfer::lookup::LookupRounds::new(model, sess, lk);
+                let d = generate::decode_rounds(&mut dec, &logits, sampler, eos, max_tokens, &mut |out| printer.print(tok, out));
+                (d, dec.stats.clone())
+            };
+            // As plain decoding does, run the last token unless it is a stop token.
+            if let Some(t) = d.unfed {
+                model.forward(sess, &[t]);
+                lk.extend(&[t]);
+            }
+            if d.forwards > 0 {
+                eprintln!(
+                    "[lookup: {} forwards for {} tokens = {:.2} tok/forward; drafts accepted {}/{} = {:.0}%; {} drafts vetoed so far]",
+                    d.forwards,
+                    d.tokens.len(),
+                    d.tokens.len() as f64 / d.forwards as f64,
+                    st.accepted,
+                    st.drafted,
+                    100.0 * st.accepted as f64 / st.drafted.max(1) as f64,
+                    lk.stats.vetoed
+                );
+            }
+            d
         }
-        printer.print(tok, out)
-    });
+        None => generate::decode(model, sess, logits, sampler, eos, max_tokens, &mut |out| {
+            // Every token after the first follows one forward pass.
+            if let (true, Some(s), Some(s0)) = (trace && out.len() > 1, &stream, &s_last) {
+                let now = s.stats();
+                eprintln!("[token: {}]", stream_line(&(now - *s0), 1, t_last.elapsed().as_secs_f64()));
+                (s_last, t_last) = (Some(now), Instant::now());
+            }
+            printer.print(tok, out)
+        }),
+    };
+    drop(lookup);
     printer.finish(tok, &d.tokens, eos);
     if let (Some(s), Some(s0)) = (&stream, s_start) {
         let st = s.stats() - s0;
@@ -863,7 +942,9 @@ fn generate<M: TextLm>(
             st.bytes_read as f64 / 1e9 / d.forwards.max(1) as f64
         );
     }
-    (d.tokens, d.forwards, d.secs)
+    // Tokens generated (plain decoding: one forward each; with prompt lookup, fewer forwards).
+    let n = d.tokens.len() - usize::from(d.reason == generate::StopReason::Stop);
+    (d.tokens, if lookup_on { n } else { d.forwards }, d.secs)
 }
 
 fn report(prefill_tokens: usize, prefill_secs: f64, decode_tokens: usize, decode_secs: f64) {
@@ -917,6 +998,9 @@ fn main() -> Result<()> {
         qos: args.qos,
         efficiency_threads: args.efficiency_threads,
     });
+    if args.prompt_cache.is_some() || args.save_session.is_some() || args.load_session.is_some() {
+        return run_session(&args);
+    }
     if args.decide.is_some() || args.decide_json.is_some() {
         return run_decide(&args);
     }
@@ -924,6 +1008,158 @@ fn main() -> Result<()> {
         bail!("--decision-from goes with --decide or --decide-json");
     }
     run(args)
+}
+
+/// Text generation through the engine with session persistence (`--prompt-cache`,
+/// `--load-session`, `--save-session`): a one-shot prompt or a `--chat` loop, the conversation
+/// run by `Engine::chat` (which restores from the prompt cache) or, after `--load-session`,
+/// continued with `Engine::send`.
+fn run_session(args: &Args) -> Result<()> {
+    use oxinfer::engine::{ChatConfig, Engine, EngineOptions, Message, SamplingParams, SystemPrompt};
+    let mut opts = EngineOptions::default();
+    opts.quant = args.quant;
+    opts.mmap = args.mmap;
+    opts.preload = args.preload;
+    opts.device = args.device;
+    opts.prefill_chunk = args.prefill_chunk;
+    opts.cache_dir = args.cache_dir.clone();
+    opts.draft = if args.no_draft {
+        Some("none".into())
+    } else {
+        args.draft.as_ref().map(|d| d.to_string_lossy().into_owned())
+    };
+    opts.draft_tokens = args.draft_tokens;
+    opts.draft_p_min = args.draft_p_min;
+    opts.draft_device = args.draft_device;
+    opts.draft_conf_min = args.draft_conf_min;
+    opts.fast_verify = args.fast_verify;
+    opts.mtp = args.mtp;
+    opts.mtp_fixed = args.mtp_fixed;
+    opts.mtp_from = args.mtp_from.as_ref().map(|d| d.to_string_lossy().into_owned());
+    opts.lookup = args.lookup;
+    opts.lookup_tokens = args.lookup_tokens;
+    opts.lookup_min_match = args.lookup_min_match;
+    opts.lookup_memory = args.lookup_memory;
+    opts.lookup_fixed = args.lookup_fixed;
+    if let Some(p) = &args.prompt_cache {
+        opts.set("prompt_cache", p)?;
+    }
+    opts.prompt_cache_gb = args.prompt_cache_gb;
+    let mut e = Engine::load(&args.model.to_string_lossy(), &opts)?;
+    let info = e.info().clone();
+    eprintln!(
+        "[{} {} ({}, {}) on {}, loaded in {:.1}s, speculative {:?}]",
+        info.model_type,
+        info.path.display(),
+        info.format,
+        info.quant.as_str(),
+        info.device,
+        info.load_secs,
+        info.speculative
+    );
+    if let Some((dir, n, bytes)) = e.prompt_cache_info() {
+        eprintln!("[prompt cache {}: {n} snapshots, {:.2} GB]", dir.display(), bytes as f64 / 1e9);
+    }
+    let c: &mut ChatConfig = e.config_mut();
+    c.system = match (&args.system, args.no_system) {
+        (_, true) => SystemPrompt::None,
+        (Some(s), _) => SystemPrompt::Text(s.clone()),
+        _ => SystemPrompt::Default,
+    };
+    c.think = args.think;
+    c.max_tokens = args.max_tokens;
+    e.set_sampling(SamplingParams {
+        temperature: args.temperature,
+        top_k: args.top_k,
+        top_p: args.top_p,
+        seed: args.seed,
+        repetition_penalty: args.repetition_penalty.unwrap_or(1.0),
+    });
+    let loaded = match &args.load_session {
+        Some(p) => {
+            let t = Instant::now();
+            let n = e.load_session(p)?;
+            eprintln!("[restored {n} tokens from {} in {:.3}s]", p.display(), t.elapsed().as_secs_f64());
+            true
+        }
+        None => false,
+    };
+    let mut messages: Vec<Message> = Vec::new();
+    let turn = |e: &mut Engine, text: &str, messages: &mut Vec<Message>| -> Result<()> {
+        let mut out = std::io::stdout();
+        let mut print = |d: &oxinfer::engine::Delta| {
+            let _ = out.write_all(d.text.as_bytes());
+            let _ = out.flush();
+            Flow::Continue
+        };
+        let reply = if loaded {
+            e.send(text, &mut print)?
+        } else {
+            messages.push(Message::user(text));
+            e.chat(messages, &mut print)?
+        };
+        println!();
+        messages.push(Message::assistant(reply.text.clone()));
+        let s = &reply.stats;
+        report(s.prompt_tokens, s.prefill_secs, s.generated_tokens, s.decode_secs);
+        if s.cached_tokens > 0 {
+            eprintln!(
+                "[{} prompt tokens reused ({} restored from the prompt cache in {:.3}s)]",
+                s.cached_tokens, s.restored_tokens, s.restore_secs
+            );
+        }
+        if s.drafted > 0 {
+            eprintln!(
+                "[speculative: {} forwards, {:.2} tok/forward, drafts accepted {}/{} = {:.0}%]",
+                s.forwards,
+                s.tokens_per_forward(),
+                s.accepted,
+                s.drafted,
+                100.0 * s.acceptance()
+            );
+        }
+        let t = Instant::now();
+        if e.flush_prompt_cache()? {
+            eprintln!("[stored the conversation in the prompt cache in {:.3}s]", t.elapsed().as_secs_f64());
+        }
+        Ok(())
+    };
+    if args.chat {
+        let stdin = std::io::stdin();
+        loop {
+            eprint!("> ");
+            let mut line = String::new();
+            if stdin.lock().read_line(&mut line)? == 0 {
+                break;
+            }
+            let line = line.trim_end_matches(['\n', '\r']);
+            if !line.trim().is_empty() {
+                turn(&mut e, line, &mut messages)?;
+            }
+        }
+    } else {
+        let prompt = match &args.prompt {
+            Some(p) => p.clone(),
+            None => {
+                let mut s = String::new();
+                std::io::stdin().lock().read_to_string(&mut s)?;
+                s
+            }
+        };
+        turn(&mut e, &prompt, &mut messages)?;
+    }
+    if let Some(p) = &args.save_session {
+        let t = Instant::now();
+        let n = e.save_session(p)?;
+        eprintln!(
+            "[saved {} tokens to {} ({:.1} MB) in {:.3}s]",
+            e.session_tokens().len(),
+            p.display(),
+            n as f64 / 1e6,
+            t.elapsed().as_secs_f64()
+        );
+    }
+    Ok(())
 }
 
 /// Typed decisions through the engine: one distribution per request.
@@ -1040,6 +1276,7 @@ fn run_decide(args: &Args) -> Result<()> {
 }
 
 fn run(mut args: Args) -> Result<()> {
+    *LOOKUP.lock().unwrap() = make_lookup(&args, &[]);
     // ANEMLL models (meta.yaml + compiled Core ML parts) run on Core ML, not on our kernels.
     #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
     if anemll_cli::detect(&args.model) {
@@ -1140,7 +1377,7 @@ fn tool_specs(args: &Args) -> Vec<oxinfer::tools::ToolSpec> {
 /// After a reply, runs the built-in tools it called, feeds the results back and lets the model
 /// continue, for up to 5 rounds. Returns the tokens generated after the last round.
 #[allow(clippy::too_many_arguments)]
-fn continue_with_tools<M: TextLm>(
+fn continue_with_tools<M: oxinfer::dspark::Target>(
     args: &Args,
     model: &M,
     sess: &mut M::Sess,
@@ -1181,7 +1418,7 @@ fn continue_with_tools<M: TextLm>(
         let h = model.hidden_size();
         let logits = model.logits(&hs[hs.len() - h..], 1);
         let prefill_secs = t0.elapsed().as_secs_f64();
-        let (o, n, secs) = generate(model, sess, tok, logits, sampler, eos, args.max_tokens, fmt, args.think);
+        let (o, n, secs) = generate(model, sess, tok, logits, sampler, eos, args.max_tokens, fmt, args.think, &ids);
         report(ids.len(), prefill_secs, n, secs);
         out = o;
     }
@@ -1310,7 +1547,7 @@ fn run_image(args: &Args) -> Result<()> {
 /// Attachments prepared for the first user turn: placeholder text and soft tokens.
 type Mm = (String, Vec<oxinfer::mm::MmFeature>);
 
-fn run_text<M: TextLm + oxinfer::intervene::Host>(
+fn run_text<M: oxinfer::dspark::Target + oxinfer::intervene::Host>(
     args: &Args,
     model: &M,
     tok: &Tokenizer,
@@ -1381,7 +1618,18 @@ fn run_text<M: TextLm + oxinfer::intervene::Host>(
             let logits = model.logits(&hs[hs.len() - h..], 1);
             let prefill_secs = t.elapsed().as_secs_f64();
             prof::reset();
-            let (out, n, decode_secs) = generate(model, &mut sess, tok, logits, &mut sampler, eos, args.max_tokens, fmt, args.think);
+            let (out, n, decode_secs) = generate(
+                model,
+                &mut sess,
+                tok,
+                logits,
+                &mut sampler,
+                eos,
+                args.max_tokens,
+                fmt,
+                args.think,
+                &ids,
+            );
             if args.show_tokens {
                 eprintln!("[output ids: {out:?}]");
             }
@@ -1451,7 +1699,18 @@ fn run_text<M: TextLm + oxinfer::intervene::Host>(
         return Ok(());
     }
     prof::reset();
-    let (out, n, decode_secs) = generate(model, &mut sess, tok, logits, &mut sampler, eos, args.max_tokens, fmt, args.think);
+    let (out, n, decode_secs) = generate(
+        model,
+        &mut sess,
+        tok,
+        logits,
+        &mut sampler,
+        eos,
+        args.max_tokens,
+        fmt,
+        args.think,
+        &ids,
+    );
     if args.show_tokens {
         eprintln!("[output ids: {out:?}]");
     }
@@ -1976,6 +2235,24 @@ fn load_dspark<'a>(
 
 static TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The prompt-lookup drafter of plain decoding (`--lookup`), whose context is the session's
+/// tokens.
+static LOOKUP: std::sync::Mutex<Option<oxinfer::lookup::Lookup>> = std::sync::Mutex::new(None);
+
+/// The prompt-lookup drafter the options ask for.
+fn make_lookup(args: &Args, stop: &[u32]) -> Option<oxinfer::lookup::Lookup> {
+    args.lookup.unwrap_or(oxinfer::lookup::BY_DEFAULT).then(|| {
+        oxinfer::lookup::Lookup::new(oxinfer::lookup::LookupOptions {
+            max_draft: args.lookup_tokens.unwrap_or(oxinfer::lookup::DEFAULT_MAX_DRAFT),
+            min_match: args.lookup_min_match.unwrap_or(2),
+            memory: args.lookup_memory,
+            cost_aware: !args.lookup_fixed,
+            fast_verify: args.fast_verify,
+            stop: stop.to_vec(),
+        })
+    })
+}
+
 /// The active weight streamer, for the per-token trace of plain decoding.
 static STREAM: std::sync::Mutex<Option<std::sync::Arc<oxinfer::stream::Streamer>>> = std::sync::Mutex::new(None);
 
@@ -2149,6 +2426,7 @@ fn run_qwen_mtp(
     let mut sampler =
         Sampler::new(args.temperature, args.top_k, args.top_p, args.seed).with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0));
     let mut dec = MtpDecoder::new(model, mtp, opts);
+    dec.lookup = make_lookup(args, eos);
     if dec.opts.draft_tokens > oxinfer::qwen_mtp::max_exact_draft() {
         eprintln!(
             "[note: verifying more than {} drafts runs the prefill GEMM kernels, whose rounding differs from decoding: \
@@ -2222,6 +2500,17 @@ fn run_qwen_mtp(
             st.verify_secs - before.verify_secs,
             1e3 * (st.verify_secs - before.verify_secs) / rounds.max(1) as f64
         );
+        if let Some(lk) = &dec.lookup {
+            let l = &lk.stats;
+            eprintln!(
+                "[lookup (since start): {} rounds verified lookup drafts, accepted {}/{} = {:.0}%, {} vetoed]",
+                l.rounds,
+                l.accepted,
+                l.drafted,
+                100.0 * l.accepted as f64 / l.drafted.max(1) as f64,
+                l.vetoed
+            );
+        }
         if let (Some(s), Some(s0)) = (stream, s0) {
             let d = s.stats() - s0;
             eprintln!(
@@ -2331,6 +2620,7 @@ fn run_dspark<M: oxinfer::dspark::Target<Sess: Clone>>(
     let mut sampler =
         Sampler::new(args.temperature, args.top_k, args.top_p, args.seed).with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0));
     let mut dec = DsparkDecoder::new(model, draft, opts);
+    dec.lookup = make_lookup(args, eos);
     eprintln!(
         "[DSpark speculative decoding: {} draft tokens{}, {}{}]",
         dec.opts.draft_tokens,
@@ -2392,6 +2682,17 @@ fn run_dspark<M: oxinfer::dspark::Target<Sess: Clone>>(
             st.verify_secs - before.verify_secs,
             1e3 * (st.verify_secs - before.verify_secs) / rounds.max(1) as f64
         );
+        if let Some(lk) = &dec.lookup {
+            let l = &lk.stats;
+            eprintln!(
+                "[lookup (since start): {} rounds verified lookup drafts, accepted {}/{} = {:.0}%, {} vetoed]",
+                l.rounds,
+                l.accepted,
+                l.drafted,
+                100.0 * l.accepted as f64 / l.drafted.max(1) as f64,
+                l.vetoed
+            );
+        }
         if let (Some(s), Some(s0)) = (stream, s0) {
             let sd = s.stats() - s0;
             eprintln!(
@@ -2635,7 +2936,18 @@ fn run_gemma_loaded(args: &Args, model: &Model, files: &safetensors::ModelFiles,
             let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
             let prefill_secs = t.elapsed().as_secs_f64();
             prof::reset();
-            let (out, n, decode_secs) = generate(model, &mut sess, &tok, logits, &mut sampler, &eos, args.max_tokens, fmt, args.think);
+            let (out, n, decode_secs) = generate(
+                model,
+                &mut sess,
+                &tok,
+                logits,
+                &mut sampler,
+                &eos,
+                args.max_tokens,
+                fmt,
+                args.think,
+                &ids,
+            );
             if args.show_tokens {
                 eprintln!("[output ids: {out:?}]");
             }
@@ -2752,7 +3064,18 @@ fn run_gemma_loaded(args: &Args, model: &Model, files: &safetensors::ModelFiles,
     }
 
     prof::reset();
-    let (out, n, decode_secs) = generate(model, &mut sess, &tok, logits, &mut sampler, &eos, args.max_tokens, fmt, args.think);
+    let (out, n, decode_secs) = generate(
+        model,
+        &mut sess,
+        &tok,
+        logits,
+        &mut sampler,
+        &eos,
+        args.max_tokens,
+        fmt,
+        args.think,
+        &ids,
+    );
     if args.show_tokens {
         eprintln!("[output ids: {out:?}]");
     }

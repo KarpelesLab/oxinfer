@@ -221,6 +221,18 @@ pub struct ServerOptions {
     pub workers: usize,
     /// Log one line per request to stderr (key `log`, default on).
     pub log: bool,
+    /// Session snapshots of the chat models kept in this directory across requests, many
+    /// conversations and restarts ([`crate::engine::EngineOptions::prompt_cache`]): a request
+    /// whose conversation starts with a stored one (or, for models without recurrent state, shares
+    /// a prefix with it) restores it instead of recomputing it; conversations are stored after
+    /// each reply (once the response is sent), and for recurrent models (Qwen3.5) also the prefix
+    /// shared by all conversations with the same system prompt and tools. Key `prompt_cache` (a
+    /// directory, created private; `auto` for `~/.cache/oxinfer/prompt-cache`; a model's own
+    /// `prompt_cache` option overrides it, `none` turns it off for that model).
+    pub prompt_cache: Option<PathBuf>,
+    /// The prompt cache's size cap in GB (key `prompt_cache_gb`, default 20; see
+    /// [`crate::engine::EngineOptions::prompt_cache_gb`]).
+    pub prompt_cache_gb: Option<f64>,
 }
 
 impl Default for ServerOptions {
@@ -243,6 +255,8 @@ impl Default for ServerOptions {
             self_signed: false,
             workers: 32,
             log: true,
+            prompt_cache: None,
+            prompt_cache_gb: None,
         }
     }
 }
@@ -275,6 +289,8 @@ impl ServerOptions {
         "self_signed",
         "workers",
         "log",
+        "prompt_cache",
+        "prompt_cache_gb",
         "config",
     ];
 
@@ -301,6 +317,14 @@ impl ServerOptions {
             "self_signed" => self.self_signed = parse_bool(key, value)?,
             "workers" => self.workers = value.parse().context("workers")?,
             "log" => self.log = parse_bool(key, value)?,
+            "prompt_cache" => {
+                self.prompt_cache = match value {
+                    "" | "none" | "off" | "0" => None,
+                    "auto" | "on" | "1" => Some(crate::snapshot::default_dir()),
+                    v => Some(PathBuf::from(v)),
+                }
+            }
+            "prompt_cache_gb" => self.prompt_cache_gb = opt_str(value).map(|v| num(&v)).transpose()?,
             "config" => {
                 let text = std::fs::read_to_string(value).with_context(|| format!("config: {value}"))?;
                 let v: Value = serde_json::from_str(&text).with_context(|| format!("config: {value}"))?;
@@ -534,8 +558,11 @@ impl Api {
             crate::pool::init_with(crate::pool::PoolOptions::threads(t));
         }
         let budget = opts.memory_budget.or_else(|| crate::platform::total_memory().map(|m| m / 10 * 8));
+        let mut models = registry::Registry::new(&opts.models, budget, opts.cache_dir.clone(), opts.log);
+        models.prompt_cache = opts.prompt_cache.clone();
+        models.prompt_cache_gb = opts.prompt_cache_gb;
         let api = Arc::new(Api {
-            models: registry::Registry::new(&opts.models, budget, opts.cache_dir.clone(), opts.log),
+            models,
             opts,
             ids: AtomicU64::new(0),
         });
@@ -554,6 +581,16 @@ impl Api {
     /// The whitelist's ids with their kind (None until detected) and whether they are loaded.
     pub fn models(&self) -> Vec<(String, Option<Kind>, bool)> {
         self.models.list()
+    }
+
+    /// Writes a chat model's waiting prompt-cache snapshot on another thread, after the response
+    /// (which this does not delay; the next request to the model waits for it).
+    pub(crate) fn flush_prompt_cache_later(self: &Arc<Self>, id: &str) {
+        let api = self.clone();
+        let id = id.to_string();
+        let _ = std::thread::Builder::new()
+            .name("oxinfer-prompt-cache".into())
+            .spawn(move || api.models.flush_prompt_cache(&id));
     }
 
     /// Unloads every idle model.

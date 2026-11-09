@@ -87,6 +87,22 @@ char *oxi_download(const char *spec, const char *cache_dir, oxi_progress_fn prog
  *                        (default 1: faster; logits then differ from plain decoding in rounding,
  *                        so greedy output can drift from plain greedy at near-ties; 0: exact,
  *                        the plain greedy output token for token)
+ *   lookup=auto|0|1      prompt-lookup drafting (default auto = on): drafts copied from the
+ *                        conversation where its last tokens occurred before, verified in one
+ *                        pass (exact like other drafts; rounds without a match are plain steps);
+ *                        with DSpark / MTP a long match replaces the draft model's round
+ *   lookup_tokens=N      prompt lookup: most draft tokens per round (default 10, at most 14)
+ *   lookup_min_match=N   prompt lookup: shortest context match giving a draft (default 2)
+ *   lookup_memory=0|1    prompt lookup: veto drafts the model refuted in the same context
+ *                        (default 1)
+ *   lookup_fixed=0|1     prompt lookup: verify every match in full (default 0: cost-aware)
+ *   prompt_cache=DIR|auto|none  keep session snapshots (KV caches, recurrent states, tokens) in
+ *                        DIR (auto: ~/.cache/oxinfer/prompt-cache), created private (0700);
+ *                        oxi_engine_chat restores the one that saves the most of a prompt and
+ *                        stores conversations (oxi_engine_flush_prompt_cache). Gemma 4 / 3,
+ *                        Qwen, Llama 3 (and their DSpark / MTP drafts)
+ *   prompt_cache_gb=F    prompt cache size cap (default 20; least recently used removed)
+ *   prompt_cache_min_tokens=N  shortest conversation stored (default 64)
  *   cache_dir=PATH       where repo ids are downloaded
  *   gpu_exact=0|1        GPU matmuls bit-identical to the CPU (default 0: M5/A19 matrix
  *                        units, half-precision inputs; process-wide)
@@ -182,8 +198,25 @@ char *oxi_engine_info_json(OxiEngine *engine);
 
 /* Statistics of the last turn as a JSON object: prompt_tokens, prefill_secs, prefill_tok_s,
  * generated_tokens, decode_secs, decode_tok_s, forwards, drafted, accepted, acceptance,
- * context_tokens. */
+ * context_tokens, cached_tokens (oxi_engine_chat: prompt tokens not fed), restored_tokens (of
+ * those, restored from the prompt cache), restore_secs. */
 char *oxi_engine_stats_json(OxiEngine *engine);
+
+/* Saves the session (KV caches, recurrent states, positions, draft caches and the tokens) to
+ * `path` (mode 0600, replaced atomically). Gemma 4 / 3, Qwen, Llama 3. Returns the file size or
+ * -1. */
+int64_t oxi_engine_save_session(OxiEngine *engine, const char *path);
+
+/* Restores a session saved by oxi_engine_save_session from the same model with the same
+ * options: the conversation continues from it as if computed here (oxi_engine_send continues
+ * it; oxi_engine_chat reuses it when the conversation starts with its tokens). Returns the
+ * tokens restored or -1. */
+int64_t oxi_engine_load_session(OxiEngine *engine, const char *path);
+
+/* With prompt_cache set: writes the conversation oxi_engine_chat left waiting (it does not delay
+ * the reply; the next chat or oxi_engine_free also writes it). Returns 1 (written), 0 (nothing
+ * to write) or -1. */
+int oxi_engine_flush_prompt_cache(OxiEngine *engine);
 
 /* A typed decision ("System 1" of the Jev models): one prefill pass, a calibrated probability per
  * option, no generation. The conversation is not disturbed. `request_json` is a /v1/decide body:
