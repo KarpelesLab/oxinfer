@@ -4207,6 +4207,7 @@ before the lookup (with priority over the read-ahead) rather than faulting in pa
 | `--flash-mbps N` / `OXINFER_FLASH_MBPS` | emulate storage that reads N MB/s (the reader sleeps per uncached byte) |
 | `--stream-io M`, `--stream-threads N` | `advise` (default on Apple), `pread` or `touch`; reader threads (default 2) |
 | `--stream-trace` | one line per token / speculative round, and one per prefill: bytes read vs cache hits, stall time |
+| `--stream-gpu M` | `auto` (default: dense models decode on the GPU, MoE models measure both on their first tokens and keep the faster), `on`, `off` (engine / C API `stream_gpu`) |
 | `--expert-cache-mb N` | MoE: page cache kept for recently used routed experts (default: what the budget leaves after the resident set) |
 | `--expert-predict` | MoE: guess the next layer's experts and read them ahead (off by default, see below) |
 | `--threads N`, `--qos C`, `--efficiency-threads N` | compute threads; their QoS class on Apple platforms (`interactive` default, `initiated`, `utility`, `background` = efficiency cores only); how many of them run at background QoS |

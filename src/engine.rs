@@ -579,7 +579,12 @@ impl EngineOptions {
             "gpu_exact" => self.gpu_exact = Some(parse_bool(key, value)?),
             "gpu_moe" => self.gpu_moe = Some(parse_bool(key, value)?),
             "gpu_decode" => self.gpu_decode = Some(parse_bool(key, value)?),
-            "stream_gpu" => self.stream_gpu = Some(parse_bool(key, value)?),
+            "stream_gpu" => {
+                self.stream_gpu = match value.trim() {
+                    "" | "auto" => None,
+                    v => Some(parse_bool(key, v)?),
+                }
+            }
             "decision_from" => self.decision_from = opt_str(value),
             "lookup" => {
                 self.lookup = match value {
