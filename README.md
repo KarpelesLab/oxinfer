@@ -36,7 +36,8 @@ identical tokens.
 2. **Then make it fast.** Anything that improves speed on a given machine is in scope: a GPU
    when there is one (Metal, CUDA, WebGPU, detected at run time), the Neural Engine through Core
    ML, quantization, SIMD kernels per CPU (NEON, SDOT / i8mm, AVX2, wasm simd128), speculative
-   decoding (MTP, drafters), prefetching and caching for weights that do not fit in memory. When
+   decoding (MTP, drafters, prompt lookup), prompt caches restored from disk, prefetching and
+   caching for weights that do not fit in memory. When
    something is missing, oxinfer falls back to a slower path rather than failing.
 
 Correctness comes first in both: every model and every fast path is checked against the reference
@@ -1192,9 +1193,10 @@ prompt starts with. It stores each conversation after its reply (left pending so
 delayed: the server writes it on another thread once the response is sent; the next request, an
 explicit `Engine::flush_prompt_cache` or the engine's drop also write it) and, for the recurrent
 models, the prefix every conversation with the same system prompt and tools shares (the first
-turn rendered with an empty message, tokenized, compared with the prompt), the first time it is
-computed. For the models without recurrent state, a stored conversation replaces the snapshots of
-its own prefixes. In memory, `Engine::chat` now also keeps the common prefix with the previous
+turn rendered with an empty message, tokenized, compared with the prompt) and the prompt but its
+last token (a request sent again, a reply regenerated), the first time each is computed (the
+prompt is then fed in two or three parts). For the models without recurrent state, a stored
+conversation replaces the snapshots of its own prefixes. In memory, `Engine::chat` now also keeps the common prefix with the previous
 conversation for these models (it used to start over unless the new conversation extended the
 old one).
 
@@ -1211,7 +1213,32 @@ or MTP drafts and the Gemma 4 assistant drafter. Not (yet): Mistral Large 4, Dee
 (compressed-attention state), Qwen3.8-Flash-Next (Qwen4-Exp: n-gram and indexer state), Core ML
 models.
 
-<!-- SNAPSHOT-RESULTS -->
+Checks (M5 Max, Metal; the machine was shared with other jobs at load 30-95, which slowed the
+prefills): `examples/session_check.rs` prefills a ~3000-token prompt, writes the session, reads it
+into a fresh session and decodes 32 greedy steps from the original, the restored and a recomputed
+session: the restored logits are the original's bit for bit at every step (GPU decoding, whose
+device copies of the caches are rebuilt from the restored ones), for Qwen3-8B (2780 tokens, 820 MB
+snapshot, written in 0.35 s, read in 0.22 s against a 23 s prefill), Qwen3.5-4B (2909 tokens,
+243 MB, 0.06 / 0.07 s against 11.6 s; recurrent states and the attention layers' KV) and
+gemma-4-12B-it (3057 tokens, 2.1 GB, 0.53 / 0.31 s against 11.2 s). Through the engine,
+`--save-session` then `--load-session` with a second message gives the same reply as one process
+holding the conversation (Qwen3-8B with its DSpark draft, Qwen3.5-4B with MTP, gemma-4-12B-it with
+DSpark, `--exact-verify`), and `tests/server.rs` (`prompt_cache_across_restarts`) restarts a server
+and gets the same reply from a restored prompt. With `--prompt-cache` and the same ~3000-token
+prompt twice:
+
+| model | first request: prefill | second request: restore | snapshot |
+|---|---|---|---|
+| Qwen3.5-4B (bf16, MTP) | 2909 tokens in 9.2 s | 2908 tokens in 0.08 s | 267 MB |
+| Qwen3-8B (Q8_0 GGUF, plain) | 2780 tokens in 87 s (load 40) | 2779 tokens in 0.50 s | 824 MB |
+| gemma-4-12B-it (Q8_0 GGUF, plain) | 3057 tokens in 60 s (load 37) | 3056 tokens in 0.57-1.9 s | 2.1 GB |
+
+and the same reply both times; a different question after the same document restores the common
+prefix on the models without recurrent state (2771 of 2786 tokens for Qwen3-8B). The first decode
+step after a restore copies the caches to the GPU, as the first step after a prefill does.
+Snapshots hold f32 caches: about 0.3 MB per token for Qwen3-8B, 0.09 MB for Qwen3.5-4B (a quarter
+of its layers have a KV cache), 0.7 MB for Gemma 4 12B, whose sliding-window layers keep every
+position.
 
 ## Typed decisions (Jev models)
 
@@ -4068,8 +4095,9 @@ on free prose there is rarely a match and the round is a plain one-token step.
 - Matching: an index from every bigram of the context to its positions; the occurrences of the
   last two tokens (the 48 most recent) are extended backwards to their full match length, the
   longest match wins (the most recent among equals), and the draft is what followed it (up to
-  `--lookup-tokens`, default 10). Other occurrences that agree on the next token count as
-  consensus.
+  `--lookup-tokens`, default 10; when the verification runs on the CPU, at most 6 unless
+  `--exact-verify` raises the process-wide limit of the batch-invariant decode kernels, as DSpark
+  and MTP do). Other occurrences that agree on the next token count as consensus.
 - Verification-outcome memory (the one idea taken from llama-modchip's drafter, see
   `docs/llama-modchip`): a 4096-entry direct-mapped table keyed by a hash of the four tokens before
   a position remembers the draft token the model last rejected there and the token it chose
@@ -4089,9 +4117,10 @@ on free prose there is rarely a match and the round is a plain one-token step.
   MTP), and sampling uses speculative sampling with a one-token draft distribution (accept with
   the model's probability of the draft, else draw from the rest), which keeps the model's
   distribution; a repetition penalty sees the accepted tokens as one-token decoding would.
-- With DSpark or MTP, a lookup match replaces the draft model's round when its expected tokens
-  per second (calibrated chances over the measured verification time) beat the recent rate of
-  that decoder's rounds (or of a plain step when its policy chose one).
+- With DSpark or MTP, a long lookup match (8 tokens or more: on shorter ones the draft models
+  did better) replaces the draft model's round when its expected tokens per second (calibrated
+  chances over the measured verification time) beat the recent rate of that decoder's rounds (or
+  of a plain step when its policy chose one).
 
 On by default (`--no-lookup`, engine / C API / server key `lookup=0`), for every family the
 engine decodes plainly (Gemma 4 / 3, Qwen, Llama 3, Mistral Large 4, DeepSeek V4) and inside
@@ -4099,7 +4128,48 @@ DSpark and MTP decoding; not with the Gemma 4 assistant drafter or Core ML model
 library: `lookup::Lookup` (the drafter) and `lookup::LookupRounds` (a `RoundDecoder` over any
 `dspark::Target`), or the `lookup` field of `DsparkDecoder` / `MtpDecoder`.
 
-<!-- LOOKUP-RESULTS -->
+Measured on the M5 Max (Metal, GPU decoding; 300 tokens, greedy, `--no-system`, default fast
+verification; tok/s means of 2 interleaved runs per prompt; the machine was shared with other
+jobs, load 8-27, so single cells are noisy). Prompts: `code` (rename a function in a 60-line
+Python module and print it back), `summary` (quote the sentences of a text that mention a date),
+`json` (25 generated records), `prose` (a short story), `chat` (three tips). Tokens per forward
+and drafts accepted in parentheses:
+
+| model | plain | prompt lookup | (no memory) | code | summary | json | prose | chat |
+|---|---|---|---|---|---|---|---|---|
+| Qwen3-8B (Q8_0 GGUF) | 57.8 | **98.1** | 98.3 | 59 -> 138 (3.0, 74%) | 59 -> 160 (3.9, 74%) | 56 -> 78 (1.5, 38%) | 56.5 -> 57.0 | 58.9 -> 57.4 |
+| gemma-4-12B-it (Q8_0 GGUF) | 32.8 | **58.7** | 58.5 | 32 -> 75 (3.1, 79%) | 31 -> 97 (4.2, 75%) | 33 -> 51 (1.9, 57%) | 33.4 -> 34.2 | 34.1 -> 36.5 |
+| Qwen3.5-4B (bf16) | 57.3 | **108.9** | 109.9 | 57 -> 155 (3.4, 70%) | 59 -> 194 (4.5, 72%) | 57 -> 80 (1.6, 37%) | 56.6 -> 57.0 | 56.5 -> 59.1 |
+| Qwen3.5-35B-A3B (q4, MoE) | 139.2 | **153.6** | 145.8 | 139 -> 169 (1.8, 92%) | 147 -> 183 (2.2, 92%) | 133 -> 137 | 134 -> 139 | 144 -> 141 |
+
+Copying prompts gain 2-3x on the dense models; prose and chat stay at plain speed (a few drafts
+per reply). On the MoE model a verified token costs its own routed experts (a 9-token pass is
+4-6 plain steps), so the policy verifies only the likeliest few drafts (1.8-2.2 tokens per
+forward at 92% acceptance) and the gain is 15-25% where the reply copies. The verification-outcome
+memory vetoed nothing in any of these runs: with the most recent of the longest matches winning,
+the target's own correction is already in the context the next time the same suffix comes up, so
+a refuted continuation is rarely proposed again (llama-modchip's drafter also predicts from
+n-gram statistics, which repeat). It costs a hash per draft token and stays on.
+
+With the default draft models (a second run, load 20-27; DSpark for Qwen3-8B and Gemma 4 12B,
+MTP for Qwen3.5-4B), lookup takes over only where a long match beats the draft model's recent
+rounds:
+
+| model | draft | draft + lookup (default) | code | summary | json | prose | chat |
+|---|---|---|---|---|---|---|---|
+| Qwen3-8B, DSpark | 116.9 | 115.8 | 129 -> 134 | 160 -> 149 | 127 -> 129 | 51.7 -> 51.6 | 117 -> 115 |
+| gemma-4-12B-it, DSpark | 76.0 | **81.0** | 94 -> 99 | 106 -> 119 | 91 -> 94 | 37.9 -> 41.5 | 51 -> 53 |
+| Qwen3.5-4B, MTP | 78.3 | **102.9** | 86 -> 138 | 102 -> 174 | 84.5 -> 85.8 | 49 -> 50 | 70 -> 67 |
+
+(DSpark already accepts 80-97% of its 7-token blocks on the copying prompts, so lookup adds little
+there; MTP drafts 3 tokens, and the lookup's longer runs lift it most. Without the long-match rule,
+short prose matches displaced better DSpark rounds on Gemma 4 12B: prose 43.5 -> 35.7.)
+
+Exactness: with `--exact-verify`, greedy output with lookup alone and with the default draft plus
+lookup is the plain greedy output token for token on Qwen3-8B, gemma-4-12B-it, Qwen3.5-4B (Gated
+DeltaNet rewinds) and Qwen3.5-35B-A3B (4 prompts x 300 tokens each); with the default fast
+verification, all 130 outputs of these runs (lookup, without memory, DSpark, MTP, combined) are
+the plain greedy outputs too.
 
 ### Streaming weights from flash (models larger than RAM)
 

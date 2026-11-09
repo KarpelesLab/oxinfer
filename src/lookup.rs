@@ -76,6 +76,9 @@ pub const DEFAULT_MAX_DRAFT: usize = 10;
 /// Whether the engine uses prompt lookup unless told otherwise (`lookup` option).
 pub const BY_DEFAULT: bool = true;
 
+/// Shortest context match whose draft replaces a draft model's round ([`Lookup::draft_over`]).
+pub const LONG_MATCH: usize = 8;
+
 /// Most recent occurrences of a bigram examined per lookup.
 const MAX_CANDIDATES: usize = 48;
 /// Match lengths are counted up to this.
@@ -370,6 +373,30 @@ impl Lookup {
         }
     }
 
+    /// Most drafts a round verifies. A verification on the GPU's decode plans takes up to
+    /// [`LookupOptions::max_draft`]; on the CPU, more tokens than the batch-invariant decode
+    /// kernels take ([`crate::kernels::decode_max_tokens`], 7 by default) would go through the
+    /// prefill GEMM, whose rounding differs from one-token decoding, so with fast verification
+    /// (where that is acceptable) the drafts are capped to stay exact on the CPU without changing
+    /// the process-wide limit; exact verification raises the limit instead ([`Lookup::prepare`]).
+    fn round_cap(&self) -> usize {
+        let gpu = crate::gpu::active().is_some() && crate::gpu::decode_enabled();
+        if gpu || !self.opts.fast_verify {
+            self.opts.max_draft
+        } else {
+            self.opts.max_draft.min(crate::kernels::decode_max_tokens().saturating_sub(1))
+        }
+    }
+
+    /// With exact verification, keeps verifications of up to [`LookupOptions::max_draft`] drafts
+    /// on the batch-invariant decode kernels (raises the process-wide
+    /// [`crate::kernels::set_decode_max_tokens`], as the DSpark and MTP decoders do).
+    pub fn prepare(&self) {
+        if !self.opts.fast_verify {
+            exact_up_to(self.opts.max_draft + 1);
+        }
+    }
+
     /// The context tokens.
     pub fn tokens(&self) -> &[u32] {
         &self.toks
@@ -464,7 +491,7 @@ impl Lookup {
     /// `k_max` tokens, with each token's calibrated chance of acceptance; empty without a match.
     pub fn draft(&mut self, k_max: usize) -> LookupDraft {
         self.stats.lookups += 1;
-        let k_max = k_max.min(self.opts.max_draft);
+        let k_max = k_max.min(self.round_cap());
         let mut d = LookupDraft::default();
         if k_max == 0 {
             return d;
@@ -546,11 +573,16 @@ impl Lookup {
     }
 
     /// For a decoder with its own draft source: the lookup draft to verify this round instead
-    /// (its tokens and calibration classes), if it promises more tokens per second than the
-    /// other source's round would (`other_tokens` committed in `other_secs`; 0 seconds: compare
-    /// tokens only).
+    /// (its tokens and calibration classes), if the context match is long (at least
+    /// [`LONG_MATCH`] tokens: shorter ones are where draft models do better) and it promises more
+    /// tokens per second than the other source's round would (`other_tokens` committed in
+    /// `other_secs`; 0 seconds: compare tokens only).
     pub fn draft_over(&mut self, k_max: usize, other_tokens: f64, other_secs: f64) -> Option<(Vec<u32>, Vec<usize>)> {
+        self.prepare();
         let mut d = self.draft(k_max);
+        if d.matched < LONG_MATCH {
+            return None;
+        }
         let k = self.cut(&d);
         if k == 0 {
             return None;
@@ -565,7 +597,6 @@ impl Lookup {
         }
         d.tokens.truncate(k);
         d.class.truncate(k);
-        exact_up_to(k + 1);
         Some((d.tokens, d.class))
     }
 
@@ -634,7 +665,7 @@ pub struct LookupRounds<'a, M: Target> {
 impl<'a, M: Target> LookupRounds<'a, M> {
     pub fn new(model: &'a M, sess: &'a mut M::Sess, lookup: &'a mut Lookup) -> Self {
         let base = (lookup.len(), model.session_len(sess));
-        exact_up_to(lookup.opts.max_draft + 1);
+        lookup.prepare();
         Self {
             model,
             sess,
@@ -859,10 +890,11 @@ mod tests {
         for (cost_aware, memory) in [(false, false), (false, true), (true, true), (true, false)] {
             let toy = Toy;
             let mut sess = toy.new_session();
+            // The toy target is exact either way; fast verification leaves the process-wide
+            // decode-kernel limit alone for the tests running alongside.
             let mut lk = Lookup::new(LookupOptions {
                 cost_aware,
                 memory,
-                fast_verify: false,
                 ..Default::default()
             });
             let hs = crate::generate::prefill(&toy, &mut sess, &prompt, 3, &[]);
@@ -901,7 +933,6 @@ mod tests {
             let mut sess = toy.new_session();
             let mut lk = Lookup::new(LookupOptions {
                 cost_aware: false,
-                fast_verify: false,
                 ..Default::default()
             });
             let hs = crate::generate::prefill(&toy, &mut sess, &prompt, 4, &[]);

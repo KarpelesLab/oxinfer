@@ -178,30 +178,41 @@ impl Engine {
         }
         let restore_secs = if restored > 0 { self.stats.restore_secs } else { 0.0 };
         // Models with recurrent state cannot cut a snapshot back: store the prefix that every
-        // conversation with this system prompt and tools shares, the first time it is computed.
+        // conversation with this system prompt and tools shares, and the whole prompt but its
+        // last token (a request sent again, a reply regenerated), the first time each is
+        // computed.
+        let (cached, mut pre_secs) = (skip, 0.0);
         if self.pcache.is_some() && !truncatable {
-            let b = self.shared_prefix_len(messages, &ids);
-            let covered = self
-                .pcache
-                .as_ref()
-                .is_some_and(|pc| pc.covers(&self.fingerprint, &ids[..b], false));
-            if b >= self.pcache_min && b > skip && b < ids.len() && !covered && !ids[..b].iter().any(placeholder) {
-                let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
-                self.lm.prefill_only(&ids[skip..b], self.prefill_chunk)?;
-                self.history.extend_from_slice(&ids[skip..b]);
-                if let Err(e) = self.store_snapshot() {
-                    eprintln!("[prompt cache: {e:#}]");
+            let shared = self.shared_prefix_len(messages, &ids);
+            for b in [shared, ids.len() - 1] {
+                let covered = self
+                    .pcache
+                    .as_ref()
+                    .is_some_and(|pc| pc.covers(&self.fingerprint, &ids[..b], false));
+                if b >= self.pcache_min && b > skip && b < ids.len() && !covered && !ids[..b].iter().any(placeholder) {
+                    let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+                    let t = Instant::now();
+                    self.lm.prefill_only(&ids[skip..b], self.prefill_chunk)?;
+                    pre_secs += t.elapsed().as_secs_f64();
+                    self.history.extend_from_slice(&ids[skip..b]);
+                    if let Err(e) = self.store_snapshot() {
+                        eprintln!("[prompt cache: {e:#}]");
+                    }
+                    skip = b;
+                    self.chat_ids = None;
                 }
-                skip = b;
-                self.chat_ids = None;
             }
         }
         // The cache ends where the conversation's tokens are fed from: the token the last reply
         // stopped on, if any, is among them.
         self.unfed = None;
         let think = self.config.think;
+        // Prompt parts fed above count as fed.
+        let pre = (skip - cached, pre_secs);
         let mut reply = self.turn_ids(ids[skip..].to_vec(), &feats, think)?.finish(self, on_delta)?;
-        reply.stats.cached_tokens = skip;
+        reply.stats.cached_tokens = cached;
+        reply.stats.prompt_tokens += pre.0;
+        reply.stats.prefill_secs += pre.1;
         reply.stats.restored_tokens = restored;
         reply.stats.restore_secs = restore_secs;
         self.stats = reply.stats.clone();
