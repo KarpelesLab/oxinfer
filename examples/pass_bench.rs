@@ -5,7 +5,7 @@
 //! `cargo run --release --example pass_bench -- MODEL [THREADS] [TOKENS,..] [REPEATS] [MODES]`
 //! (THREADS: `N`, `NeM` with M of them at background QoS, or `Nb` all at background QoS; MODES:
 //! comma-separated `pairs`, `dot`, `auto`, `seq` (auto with the experts of MoE passes run one
-//! matmul at a time), default `pairs,auto`). Also prints the weight types of a GGUF checkpoint;
+//! matmul at a time), `old` (pairs and seq), default `pairs,auto`). Also prints the weight types of a GGUF checkpoint;
 //! `PASS_PROFILE=1` adds a per-operation profile of the last pass, `PASS_COMPARE=1` checks that
 //! every mode's output is bit-identical to the first one's.
 
@@ -42,14 +42,14 @@ fn main() -> anyhow::Result<()> {
         .map(|s| s.parse())
         .collect::<Result<_, _>>()?;
     let repeats: usize = args.next().map_or(Ok(3), |t| t.parse())?;
-    // `seq`: `auto` with the routed experts of MoE passes run one matmul at a time.
+    // `seq`: `auto` with the experts of MoE passes run one matmul at a time; `old`: `pairs` and `seq`.
     let modes: Vec<(String, MultiTokenKernels)> = args
         .next()
         .unwrap_or_else(|| "pairs,auto".into())
         .split(',')
         .map(|m| {
             let k = match m {
-                "pairs" => MultiTokenKernels::Pairs,
+                "pairs" | "old" => MultiTokenKernels::Pairs,
                 "dot" => MultiTokenKernels::Dot,
                 _ => MultiTokenKernels::Auto,
             };
@@ -81,8 +81,8 @@ fn main() -> anyhow::Result<()> {
     let prof = std::env::var_os("PASS_PROFILE").is_some();
     for &t in &counts {
         let toks: Vec<u32> = (0..t as u32).map(|i| 2000 + i * 11).collect();
-        // One-token passes use the same kernels whatever the mode (except `seq`).
-        let ms = if t == 1 && !modes.iter().any(|m| m.0 == "seq") {
+        // One-token passes use the same kernels whatever the mode (except `seq` and `old`).
+        let ms = if t == 1 && !modes.iter().any(|m| m.0 == "seq" || m.0 == "old") {
             &modes[..1]
         } else {
             &modes[..]
@@ -92,7 +92,7 @@ fn main() -> anyhow::Result<()> {
         for i in 0..repeats {
             for (mi, (_, mode)) in ms.iter().enumerate() {
                 set_multi_token_kernels(*mode);
-                oxinfer::kernels::set_moe_batched(ms[mi].0 != "seq");
+                oxinfer::kernels::set_moe_batched(ms[mi].0 != "seq" && ms[mi].0 != "old");
                 if prof && i + 1 == repeats {
                     oxinfer::prof::reset();
                 }
