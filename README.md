@@ -805,8 +805,18 @@ by +-20%), UD-Q2_K_XL, streaming with the default budget:
 
 | | prefill | decode |
 |---|---|---|
-| oxinfer, Metal | 64 tok/s (2550-token prompt), 5.5 tok/s (15 tokens) | 6-10 tok/s plain, 8-10 with DSpark |
+| oxinfer, Metal | 64 tok/s (2550-token prompt), 5.5 tok/s (15 tokens) | 6-10 tok/s plain, 8-10 with DSpark; 8-10 after a 16k-token prompt |
 | llama.cpp master, CPU (`-ngl 0`, mmap), same file | 47 tok/s (2550 tokens, warm) | 1.6-2.2 tok/s |
+
+Decoding skips work whose result is known (lossless, bit-identical logits): a pooled key is
+computed only when a token completes its window (3 tokens in 4 add only their projected rows, as
+DeepSeek's code does), and the lightning indexer's query projection and scoring run only once a
+query sees more than 512 pooled keys (about 2048 tokens; before that every key is selected). The
+indexer's scoring of one query is spread over all threads (it was one task per query, on one
+thread), and attention takes the shared-row kernel described under
+[Performance](#performance): the 64 heads share one 512-wide key-value head, so each key is read
+once per phase instead of once per head. Before / after on the same file: 8.1-9.3 / 9.9-10.0
+tok/s after an 857-token prompt, 6.5-7.9 / 8.3-8.8 after 4191, 5.4-6.5 / 8.2-10.3 after 16076.
 
 #### DSpark speculative decoding for DeepSeek V4
 
@@ -910,6 +920,9 @@ with whole-token GPU decoding. The GPU decode plan wraps the 78 GB of routed exp
 single- and multi-token plans share them; prefill then wraps only the experts each pass routes
 to (`Experts::wrap_per_pass`), since wiring them twice exhausts the GPU's memory. Past 2051 tokens
 of context (where QSA starts dropping blocks) decoding runs on the CPU, which has the selection.
+There a token's block scores are computed over all threads and its attention (24 query heads on 2
+KV heads) takes the shared-row CPU kernel (see [Performance](#performance)): 13.6 -> 17.7 tok/s
+after a 4338-token prompt on the CPU, same tokens.
 The MTP layer (`mtp_from` in the engine, C API and server options) is the trunk's 4 residual
 streams plus the next token's embedding, per stream `fc([enorm(e) ; hnorm_s(h_s)])`, through one
 QSA + MoE layer with hyper-connections and its own final mixer, the LM head shared.
@@ -3711,6 +3724,32 @@ With the Metal backend (default on Apple Silicon) prefill runs on the GPU:
 | Gemma 4 26B-A4B (MoE) | bf16 / `--quant q4` | ~150 / ~136 tok/s | ~544 / ~576 tok/s (1758-token prompt) |
 
 (616-token prompt.)
+
+CPU decode attention (`attn.rs`). When a decode step has fewer (token, KV head) pairs than threads
+(single-token steps of GQA models, one shared key-value head as in DeepSeek V4, Mistral Large 4's
+MLA latent cache, short speculative verification passes), attention runs in three parallel phases
+that each read a shared key / value row once for all the query heads sharing it: scores over
+blocks of keys (one key load serves 8 heads), the softmax per head, then the weighted values over
+column slices of the head width (a 4-head x 16-column register tile on NEON). Every (query, head)
+keeps the arithmetic of the per-head loop it replaces: the same 8-lane dot products summed in the
+same order, the same softmax, and outputs accumulated from zero in key order element by element.
+Results are therefore bit-identical to it. That was checked on the real models: last-token logits
+after prompts fed 1 or 4 tokens at a time (3067 tokens on DeepSeek V4 Flash, 3172 on Qwen3.8-Flash-Next,
+855 on Qwen3-8B) compare equal byte for byte with the previous kernels. The online softmax of
+llama.cpp-style MQA kernels would change the summation order, so it is not used. Interleaved
+runs, greedy tokens identical to the previous build in every run (load average 18-40 from other
+jobs, so +-15%):
+
+| model, device | context | decode before | decode after |
+|---|---|---|---|
+| DeepSeek V4 Flash UD-Q2_K_XL, Metal (CPU attention) | 857 | 8.1-9.3 tok/s | 9.9-10.0 tok/s |
+| | 4191 | 6.5-7.9 | 8.3-8.8 |
+| | 16076 | 5.4-6.5 | 8.2-10.3 |
+| Qwen3.8-Flash-Next UD-Q4_K_XL, CPU | 863 | 17.6-18.3 | 18.6-19.0 |
+| | 4338 (QSA sparse) | 13.6 | 17.7 |
+| Qwen3.8-Flash-Next, Metal (CPU decode past 2051 tokens) | 4338 | 11.0-11.2 | 11.0-15.5 |
+| Qwen3-8B Q8_0, CPU (8 KV heads) | 855 | 20.1-20.3 | 19.3-20.3 |
+| | 4291 | 9.0-10.5 | 9.6-12.6 |
 
 ### Decoding on the GPU
 

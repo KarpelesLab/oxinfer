@@ -960,6 +960,12 @@ impl<'a> DeepSeek4Model<'a> {
             Some(ix) => (c.index_n_heads, ix.comp.width()),
             None => (0, 0),
         };
+        // The indexer only chooses for a query that sees more than `index_topk` compressed keys
+        // (otherwise every one is selected, see `select`): before that its query projection is
+        // not computed (its compressor still runs, for later queries). The head weights stay in
+        // the fused batch below, whose composition decides the accelerator's kernel (with the
+        // same jobs, the other projections keep their bits).
+        let choose = a.indexer.as_ref().is_some_and(|ix| (start + t) / ix.comp.ratio > c.index_topk);
         let (mut iw, mut ikv, mut ig) = (vec![0f32; t * iw_n], vec![0f32; t * ic_w], vec![0f32; t * ic_w]);
         {
             let mut jobs: Vec<(&Lin, usize, &mut [f32])> = vec![(&a.wq_a, ql, &mut qa[..]), (&a.wkv, hd, &mut kv[..])];
@@ -995,6 +1001,8 @@ impl<'a> DeepSeek4Model<'a> {
         let mut sel: Vec<Option<Vec<u32>>> = vec![None; t];
         if let (Some(ix), Some(is)) = (&a.indexer, st.idx.as_mut()) {
             compress(c, &ix.comp, is, &ikv, &ig, t, start, &self.inv_comp);
+        }
+        if let (true, Some(ix), Some(is)) = (choose, &a.indexer, st.idx.as_ref()) {
             let (ni, di) = (c.index_n_heads, c.index_head_dim);
             let mut iq = vec![0f32; t * ni * di];
             linear(&ix.wq, ni * di, ql, &qa, t, &mut iq);
@@ -1141,7 +1149,30 @@ fn select(c: &DeepSeek4Config, iq: &[f32], iw: &[f32], is: &CompState, t: usize,
     };
     let mut out: Vec<Vec<u32>> = vec![Vec::new(); rows.len()];
     let op = SendPtrV(out.as_mut_ptr());
-    if t < GEMM_MIN {
+    if t < GEMM_MIN && rows.len() < crate::pool::threads() {
+        // Few queries (decode, verification): each one's scores in parallel over blocks of
+        // compressed keys (the same per-key arithmetic as `score_row`), then its top-k.
+        for (ri, &i) in rows.iter().enumerate() {
+            let nv = (start + i + 1) / r;
+            let mut s = vec![0f32; nv];
+            let sp = SendPtr(s.as_mut_ptr());
+            let qs: Vec<&[f32]> = (0..ni).map(|hh| &iq[(i * ni + hh) * di..(i * ni + hh + 1) * di]).collect();
+            let kb = nv.div_ceil(4 * crate::pool::threads()).max(16);
+            crate::pool::run(nv.div_ceil(kb), &|b| {
+                let mut d = vec![0f32; ni];
+                for wi in b * kb..((b + 1) * kb).min(nv) {
+                    crate::attn::dots(&qs, &keys[wi * di..(wi + 1) * di], &mut d);
+                    let mut acc = 0f32;
+                    for hh in 0..ni {
+                        acc += iw[i * ni + hh] * d[hh].max(0.0);
+                    }
+                    // SAFETY: each task writes its own block of `s`.
+                    unsafe { *sp.get().add(wi) = acc };
+                }
+            });
+            out[ri] = top_positions(&s, topk);
+        }
+    } else if t < GEMM_MIN {
         crate::pool::run(rows.len(), &|ri| {
             let i = rows[ri];
             let v = score_row(i, &|hh, wi| {
@@ -1203,41 +1234,40 @@ fn attend(
         (lo..p + 1, cks)
     };
     if t < GEMM_MIN {
-        let g = 8.min(nh);
-        let groups = nh.div_ceil(g);
-        let op = SendPtr(out.as_mut_ptr());
-        crate::pool::run(t * groups, &|task| {
-            let (i, h0) = (task / groups, (task % groups) * g);
-            let h1 = (h0 + g).min(nh);
-            let (wr, cks) = keys_of(i);
-            let n = wr.len() + cks.len();
-            let key = |j: usize| -> &[f32] {
-                if j < wr.len() {
-                    raw(wr.start + j)
-                } else {
-                    ckey(cks[j - wr.len()] as usize)
-                }
-            };
-            let mut s = vec![0f32; n];
-            for hh in h0..h1 {
-                let qh = &q[(i * nh + hh) * hd..(i * nh + hh + 1) * hd];
-                for (j, v) in s.iter_mut().enumerate() {
-                    *v = dot(qh, key(j)) * scale;
-                }
+        // Every head shares the one key-value head: the shared-row kernel reads each key once
+        // per phase for all 64 heads (see `crate::attn`). Per head: scaled scores, softmax with
+        // the sink, `o = sum_j (e_j / tot) k_j` in key order, as a per-head loop would.
+        let lists: Vec<(std::ops::Range<usize>, Vec<u32>)> = (0..t).map(keys_of).collect();
+        let key = |i: usize, j: usize| -> &[f32] {
+            let (wr, cks) = &lists[i];
+            if j < wr.len() {
+                raw(wr.start + j)
+            } else {
+                ckey(cks[j - wr.len()] as usize)
+            }
+        };
+        crate::attn::attend_shared(
+            t,
+            nh,
+            hd,
+            &|i| lists[i].0.len() + lists[i].1.len(),
+            &|i, keys, sc| {
+                let qs: Vec<&[f32]> = (0..nh).map(|hh| &q[(i * nh + hh) * hd..(i * nh + hh + 1) * hd]).collect();
+                crate::attn::score_rows(&qs, keys, &|j| key(i, j), Some(scale), sc);
+            },
+            &|_, hh, s| {
                 let m = s.iter().copied().fold(sink[hh], f32::max);
                 let mut tot = (sink[hh] - m).exp();
                 for v in s.iter_mut() {
                     *v = (*v - m).exp();
                     tot += *v;
                 }
-                // SAFETY: each (query, head) writes its own row.
-                let o = unsafe { std::slice::from_raw_parts_mut(op.get().add((i * nh + hh) * hd), hd) };
-                o.fill(0.0);
-                for (j, &p) in s.iter().enumerate() {
-                    axpy(o, p / tot, key(j));
-                }
-            }
-        });
+                s.iter_mut().for_each(|p| *p /= tot);
+            },
+            &key,
+            &|i, hh| (i * nh + hh) * hd,
+            out,
+        );
         return;
     }
     // Blocks of queries: scores and outputs as GEMMs over the union of their keys.

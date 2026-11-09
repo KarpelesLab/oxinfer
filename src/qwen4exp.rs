@@ -630,18 +630,38 @@ pub(crate) fn attention_sel(q: &[f32], cache: &LayerCache, nh: usize, t: usize, 
     let hd = cache.hd;
     let n_kv = cache.n_kv;
     let rep = nh / n_kv;
+    let all: Vec<u32>;
+    let lists: Vec<&[u32]> = {
+        all = (0..(start + t) as u32).collect();
+        (0..t).map(|ti| sel[ti].as_deref().unwrap_or(&all[..=start + ti])).collect()
+    };
+    let _timer = crate::prof::start(crate::prof::Cat::Attention);
+    if t * n_kv < pool::threads() {
+        // Fewer (token, KV head) units than threads: the shared-row kernel (same bits, see
+        // `crate::attn`) parallelizes over keys and value columns.
+        crate::attn::attend_shared(
+            t * n_kv,
+            rep,
+            hd,
+            &|u| lists[u / n_kv].len(),
+            &|u, keys, sc| {
+                let (ti, kvh) = (u / n_kv, u % n_kv);
+                let pos = lists[ti];
+                let qb = (ti * nh + kvh * rep) * hd;
+                let qs: Vec<&[f32]> = (0..rep).map(|r| &q[qb + r * hd..qb + (r + 1) * hd]).collect();
+                crate::attn::score_rows(&qs, keys, &|j| cache.k_at(pos[j] as usize, kvh), None, sc);
+            },
+            &|_, _, row| softmax_inplace(row),
+            &|u, j| cache.v_at(lists[u / n_kv][j] as usize, u % n_kv),
+            &|u, r| ((u / n_kv) * nh + (u % n_kv) * rep + r) * hd,
+            out,
+        );
+        return;
+    }
     let op = SendF(out.as_mut_ptr());
     pool::run(t * n_kv, &|task| {
         let (ti, kvh) = (task / n_kv, task % n_kv);
-        let qpos = start + ti;
-        let all: Vec<u32>;
-        let pos: &[u32] = match &sel[ti] {
-            Some(s) => s,
-            None => {
-                all = (0..=qpos as u32).collect();
-                &all
-            }
-        };
+        let pos = lists[ti];
         let n = pos.len();
         let mut scores = vec![0f32; n];
         for hh in 0..rep {
@@ -890,7 +910,9 @@ impl<'a> QwenModel<'a> {
         let scale = 1.0 / (d as f32).sqrt();
         let mut sel: Vec<Option<Vec<u32>>> = vec![None; t];
         let sp = SendSel(sel.as_mut_ptr());
-        pool::run(t, &|ti| {
+        // Few tokens (decode, verification): each token's block scores in parallel over blocks.
+        let split = t < pool::threads();
+        let token = |ti: usize| {
             let qpos = start + ti;
             let nb = (qpos + 1) / r;
             if nb <= top {
@@ -906,15 +928,32 @@ impl<'a> QwenModel<'a> {
                     &sin[ti * half..(ti + 1) * half],
                 );
             }
-            let scores: Vec<f32> = (0..nb)
-                .map(|b| {
-                    let kb = &pooled[b * d..(b + 1) * d];
-                    (0..nh).map(|hh| dot(&qn[hh * d..(hh + 1) * d], kb).max(0.0)).sum::<f32>() * scale
-                })
-                .collect();
-            // SAFETY: each token's entry is written by one task.
+            let score = |b: usize| {
+                let kb = &pooled[b * d..(b + 1) * d];
+                (0..nh).map(|hh| dot(&qn[hh * d..(hh + 1) * d], kb).max(0.0)).sum::<f32>() * scale
+            };
+            let scores: Vec<f32> = if split {
+                let mut sc = vec![0f32; nb];
+                let kb = nb.div_ceil(4 * pool::threads()).max(64);
+                let p = SendF(sc.as_mut_ptr());
+                pool::run(nb.div_ceil(kb), &|c| {
+                    for b in c * kb..((c + 1) * kb).min(nb) {
+                        // SAFETY: each task writes its own blocks.
+                        unsafe { *p.get().add(b) = score(b) };
+                    }
+                });
+                sc
+            } else {
+                (0..nb).map(score).collect()
+            };
+            // SAFETY: each token's entry is written by one call.
             unsafe { *sp.get().add(ti) = qsa_select(cfg, &scores, qpos) };
-        });
+        };
+        if split {
+            (0..t).for_each(token);
+        } else {
+            pool::run(t, &token);
+        }
         if std::env::var_os("OXINFER_QSA_DEBUG").is_some() {
             for (i, s) in sel.iter().enumerate() {
                 eprintln!(

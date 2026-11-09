@@ -1852,6 +1852,38 @@ pub(crate) fn attention_ext(
     let rep = nh / n_kv;
     let threads = crate::pool::threads();
     let par = t > 1 || cache.len > 32;
+    let lo_of = |ti: usize| window.map(|w| (start + ti + 1).saturating_sub(w)).unwrap_or(0);
+    let hi_of = |ti: usize| {
+        let qpos = start + ti;
+        match (causal, window) {
+            (true, _) => ext.map_or(qpos + 1, |e| e[ti].max(qpos + 1)),
+            (false, Some(w)) => (qpos + w).min(cache.len),
+            (false, None) => cache.len,
+        }
+    };
+    if par && rep > 1 && t * n_kv < threads {
+        // Too few (token, KV head) units to keep the threads busy with one task each: the
+        // shared-row kernel (same bits) parallelizes over keys and value columns instead of
+        // splitting the heads that share a KV row.
+        crate::attn::attend_shared(
+            t * n_kv,
+            rep,
+            hd,
+            &|u| hi_of(u / n_kv) - lo_of(u / n_kv),
+            &|u, keys, sc| {
+                let (ti, kvh) = (u / n_kv, u % n_kv);
+                let lo = lo_of(ti);
+                let qb = (ti * nh + kvh * rep) * hd;
+                let qs: Vec<&[f32]> = (0..rep).map(|r| &q[qb + r * hd..qb + (r + 1) * hd]).collect();
+                crate::attn::score_rows(&qs, keys, &|j| cache.k_at(lo + j, kvh), None, sc);
+            },
+            &|_, _, row| softmax_inplace(row),
+            &|u, j| cache.v_at(lo_of(u / n_kv) + j, u % n_kv),
+            &|u, r| ((u / n_kv) * nh + (u % n_kv) * rep + r) * hd,
+            out,
+        );
+        return;
+    }
     let group = if t * n_kv >= threads { rep } else { 1 };
     let groups_per_kv = rep / group;
     let ntasks = t * n_kv * groups_per_kv;

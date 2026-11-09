@@ -956,6 +956,10 @@ impl<'a> Mistral4Model<'a> {
         let (ni, d) = (c.index_n_heads, c.index_head_dim);
         let mut ik = vec![0f32; if a.indexer.is_some() { t * d } else { 0 }];
         let mut iw = vec![0f32; if a.indexer.is_some() { t * ni } else { 0 }];
+        // The indexer chooses only for queries that see more than `index_topk` keys (see
+        // `select`); before that its queries are not computed. (The head weights stay in the
+        // fused batch below, whose composition decides the accelerator's kernel.)
+        let choose = a.indexer.is_some() && start + t > c.index_topk;
         {
             let mut jobs: Vec<(&Lin, usize, &mut [f32])> = vec![(&a.q, nh * qk, &mut q[..])];
             if let Some((ka, _)) = &a.kv_a {
@@ -971,19 +975,21 @@ impl<'a> Mistral4Model<'a> {
         // The indexer: its keys join its cache, and each query's best keys are chosen.
         if let Some(ix) = &a.indexer {
             let eps = c.indexer_norm_eps as f32;
-            let mut qn = hn.to_vec();
-            layer_norm_rows(&mut qn, h, &ix.q_norm.0, &ix.q_norm.1, eps);
-            let mut iq = vec![0f32; t * ni * d];
-            linear(&ix.wq, ni * d, h, &qn, t, &mut iq);
             let rot = if dr > 0 { c.qk_rope_head_dim } else { 0 };
-            for_chunks(&mut iq, d, par, |i, qh| {
-                let (ti, hh) = (i / ni, i % ni);
-                let f = ix.ssmax.0[hh] * lp[ti] + ix.ssmax.1[hh];
-                scale_inplace(qh, f);
-                if rot > 0 {
-                    apply_rope_interleaved(&mut qh[..rot], &cos[ti * half..(ti + 1) * half], &sin[ti * half..(ti + 1) * half]);
-                }
-            });
+            let mut iq = vec![0f32; if choose { t * ni * d } else { 0 }];
+            if choose {
+                let mut qn = hn.to_vec();
+                layer_norm_rows(&mut qn, h, &ix.q_norm.0, &ix.q_norm.1, eps);
+                linear(&ix.wq, ni * d, h, &qn, t, &mut iq);
+                for_chunks(&mut iq, d, par, |i, qh| {
+                    let (ti, hh) = (i / ni, i % ni);
+                    let f = ix.ssmax.0[hh] * lp[ti] + ix.ssmax.1[hh];
+                    scale_inplace(qh, f);
+                    if rot > 0 {
+                        apply_rope_interleaved(&mut qh[..rot], &cos[ti * half..(ti + 1) * half], &sin[ti * half..(ti + 1) * half]);
+                    }
+                });
+            }
             layer_norm_rows(&mut ik, d, &ix.k_norm.0, &ix.k_norm.1, eps);
             if rot > 0 {
                 for_chunks(&mut ik, d, par, |ti, kh| {
@@ -994,7 +1000,11 @@ impl<'a> Mistral4Model<'a> {
             iw.iter_mut().for_each(|w| *w *= wscale);
             let keys = sess.idx[l].as_mut().expect("indexer cache");
             keys.extend_from_slice(&ik);
-            *sel = self.select(&iq, &iw, keys, t, start);
+            *sel = if choose {
+                self.select(&iq, &iw, keys, t, start)
+            } else {
+                vec![None; t]
+            };
         }
 
         // The latent cache: normed latent and rotated rotary key per token.
@@ -1101,49 +1111,54 @@ impl<'a> Mistral4Model<'a> {
         let ql = per_head(&a.k_b, &qn, t, dn, lat);
         let _timer = prof::start(Cat::Attention);
         let scale = c.attn_scale();
-        // Tasks of a few heads of one token, so each cached latent is read once per group.
-        let g = if t * nh >= 4 * crate::pool::threads() {
-            nh.min(16)
-        } else {
-            4.min(nh)
+        // Every head reads the one latent cache: the shared-row kernel (same bits as a loop per
+        // head, see `crate::attn`) reads each chosen latent once per phase for all heads.
+        let lists: Vec<Option<&[u32]>> = (0..t).map(|ti| sel.get(ti).and_then(|s| s.as_deref())).collect();
+        let pos = |ti: usize, jj: usize| -> usize {
+            match lists[ti] {
+                Some(s) => s[jj] as usize,
+                None => jj,
+            }
         };
-        let groups = nh.div_ceil(g);
         let mut ol = vec![0f32; nh * t * lat];
-        let op = SendPtr(ol.as_mut_ptr());
-        crate::pool::run(t * groups, &|task| {
-            let (ti, h0) = (task / groups, (task % groups) * g);
-            let h1 = (h0 + g).min(nh);
-            let p = start + ti;
-            let keys: Vec<u32> = match sel.get(ti).and_then(|s| s.as_ref()) {
-                Some(s) => s.clone(),
-                None => (0..=p as u32).collect(),
-            };
-            let n = keys.len();
-            let mut sc = vec![0f32; (h1 - h0) * n];
-            for (jj, &j) in keys.iter().enumerate() {
-                let j = j as usize;
-                let cj = &cache.c[j * lat..(j + 1) * lat];
-                let rj = &cache.r[j * dr..(j + 1) * dr];
-                for hh in h0..h1 {
-                    let qlh = &ql[(hh * t + ti) * lat..(hh * t + ti + 1) * lat];
-                    let mut s = dot(qlh, cj);
-                    if dr > 0 {
-                        s += dot(&q[(ti * nh + hh) * qk + dn..(ti * nh + hh + 1) * qk], rj);
+        crate::attn::attend_shared(
+            t,
+            nh,
+            lat,
+            &|ti| lists[ti].map_or(start + ti + 1, |s| s.len()),
+            &|ti, keys, sc| {
+                let len = keys.len();
+                let (mut s1, mut s2) = ([0f32; 8], [0f32; 8]);
+                for h0 in (0..nh).step_by(8) {
+                    let hb = 8.min(nh - h0);
+                    let qls: Vec<&[f32]> = (h0..h0 + hb).map(|hh| &ql[(hh * t + ti) * lat..(hh * t + ti + 1) * lat]).collect();
+                    let qrs: Vec<&[f32]> = (h0..h0 + hb)
+                        .map(|hh| &q[(ti * nh + hh) * qk + dn..(ti * nh + hh + 1) * qk])
+                        .collect();
+                    for (jj, k) in keys.clone().enumerate() {
+                        let j = pos(ti, k);
+                        crate::attn::dots(&qls, &cache.c[j * lat..(j + 1) * lat], &mut s1[..hb]);
+                        if dr > 0 {
+                            crate::attn::dots(&qrs, &cache.r[j * dr..(j + 1) * dr], &mut s2[..hb]);
+                        }
+                        for b in 0..hb {
+                            let mut s = s1[b];
+                            if dr > 0 {
+                                s += s2[b];
+                            }
+                            sc[(h0 + b) * len + jj] = s * scale;
+                        }
                     }
-                    sc[(hh - h0) * n + jj] = s * scale;
                 }
-            }
-            for hh in h0..h1 {
-                softmax_inplace(&mut sc[(hh - h0) * n..(hh - h0 + 1) * n]);
-            }
-            for hh in h0..h1 {
-                // SAFETY: each (token, head) writes its own latent row.
-                let o = unsafe { std::slice::from_raw_parts_mut(op.get().add((hh * t + ti) * lat), lat) };
-                for (jj, &j) in keys.iter().enumerate() {
-                    axpy(o, sc[(hh - h0) * n + jj], &cache.c[j as usize * lat..(j as usize + 1) * lat]);
-                }
-            }
-        });
+            },
+            &|_, _, row| softmax_inplace(row),
+            &|ti, jj| {
+                let j = pos(ti, jj);
+                &cache.c[j * lat..(j + 1) * lat]
+            },
+            &|ti, hh| (hh * t + ti) * lat,
+            &mut ol,
+        );
         drop(_timer);
         let v = per_head(&a.v_b, &ol, t, lat, vd);
         for ti in 0..t {
@@ -1267,17 +1282,6 @@ impl<'a> Mistral4Model<'a> {
 /// The rotary table width (`dim / 2` entries per token).
 fn cos_half(cos: &[f32], t: usize) -> usize {
     cos.len() / t.max(1)
-}
-
-#[derive(Clone, Copy)]
-struct SendPtr(*mut f32);
-unsafe impl Send for SendPtr {}
-unsafe impl Sync for SendPtr {}
-impl SendPtr {
-    #[inline(always)]
-    fn get(self) -> *mut f32 {
-        self.0
-    }
 }
 
 #[derive(Clone, Copy)]

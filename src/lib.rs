@@ -12,6 +12,7 @@ pub use oxideav_core;
 
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
 pub mod anemll;
+mod attn;
 pub mod audio;
 #[cfg(feature = "oxideav")]
 pub mod av;
