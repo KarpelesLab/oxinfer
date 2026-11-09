@@ -190,6 +190,12 @@ pub trait Backend: Send + Sync {
     fn decodes(&self) -> bool {
         false
     }
+    /// Bytes the device can keep resident for this process without losing performance (Metal's
+    /// `recommendedMaxWorkingSetSize`), when known: the GPU-resident weights of a streamed model
+    /// and its read-ahead window must fit in it.
+    fn working_set(&self) -> Option<u64> {
+        None
+    }
     /// Whether this backend's plain decoding outruns speculative decoding (whose drafts run on the
     /// CPU): the speculative defaults (MTP, DSpark drafts) then give way to plain decoding; asking
     /// for them explicitly still uses them.
@@ -296,6 +302,30 @@ pub fn decode_enabled() -> bool {
     static ENV: OnceLock<Option<String>> = OnceLock::new();
     switch(&DECODE, &ENV, "OXINFER_GPU_DECODE", |v| v != "0", true)
 }
+
+/// Decodes on the device also when the weights stream from storage (`crate::stream`): the
+/// resident layers stay wrapped, every other layer is wrapped per pass as it arrives and dropped
+/// after (see `crate::gpu::decode::Graph::units`). Process-wide, read when a model builds its
+/// plans. None restores the default (on, or `OXINFER_STREAM_GPU=0|1`); without device decoding
+/// ([`decode_enabled`]) streamed models decode on the CPU either way.
+pub fn set_stream_decode(on: Option<bool>) {
+    STREAM_DECODE.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// See [`set_stream_decode`].
+pub fn stream_decode_enabled() -> bool {
+    static ENV: OnceLock<Option<String>> = OnceLock::new();
+    decode_enabled() && switch(&STREAM_DECODE, &ENV, "OXINFER_STREAM_GPU", |v| v != "0", true)
+}
+
+static STREAM_DECODE: AtomicU8 = AtomicU8::new(0);
 
 /// True when the active backend decodes on the device and prefers plain decoding there (see
 /// [`Backend::prefers_plain_decode`]).

@@ -53,6 +53,19 @@ decoding, `mtp_from=PATH` for the MTP sidecar, `device=cpu|metal`, `threads=N`,
 `max_context=N`. `mmap` defaults to on for iOS: mapped weights are clean file pages, which do
 not count against the app's memory limit the way copied ones do.
 
+### Models larger than the phone's memory (Qwen3.8-27B on a 12 GB iPhone)
+
+Nothing to set: a Qwen or Gemma checkpoint larger than the device holds streams from flash by
+default (see "Streaming weights from flash" in the main README). The budget comes from the
+device: what `os_proc_available_memory` leaves the app minus 1 GB, at most 60% of the phone's
+memory and 85% of Metal's working set (`recommendedMaxWorkingSetSize`). The resident layers
+stay wrapped for the GPU, the others are read ahead and wrapped per pass as they arrive, and a
+dense model with an MTP layer drafts up to 8 tokens per pass (cost-aware). `oxi_engine_info_json`
+reports what was chosen (`stream`, `device_memory`). Override with options:
+`cache_budget_gb=5` (page cache the weights may use), `stream=off`, `stream_gpu=0` (decode on
+the CPU), `draft=none` (plain decoding), `threads=6`. With the increased-memory-limit
+entitlement the app gets more, and the default budget follows.
+
 ## Simulator
 
 ```sh

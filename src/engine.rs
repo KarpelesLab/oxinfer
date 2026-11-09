@@ -191,6 +191,11 @@ pub struct EngineOptions {
     /// stays as it was. Process-wide, applied on load; None leaves the current setting (default
     /// on; [`crate::gpu::set_decode`]). Key `gpu_decode`.
     pub gpu_decode: Option<bool>,
+    /// Streamed models (see [`EngineOptions::stream`]) decode on the GPU too: the resident layers
+    /// stay wrapped, the others are wrapped per pass as they arrive and released after (Metal;
+    /// Qwen3.5 / 3.8 dense and MoE). Process-wide, applied on load; None leaves the current
+    /// setting (default on; [`crate::gpu::set_stream_decode`]). Key `stream_gpu`.
+    pub stream_gpu: Option<bool>,
     /// Typed decisions ([`Engine::decide`]) with the decision assets of this Jev bundle (path or
     /// repo id) on top of the loaded base model: only the small files are fetched (adapter, head,
     /// configs; see [`crate::decide::ASSET_FILES`]), not the backbone, and the base must match
@@ -392,6 +397,7 @@ impl Default for EngineOptions {
             gpu_exact: None,
             gpu_moe: None,
             gpu_decode: None,
+            stream_gpu: None,
             decision_from: None,
             interventions: None,
             lookup: None,
@@ -469,6 +475,7 @@ impl EngineOptions {
         "gpu_exact",
         "gpu_moe",
         "gpu_decode",
+        "stream_gpu",
         "decision_from",
         "interventions",
         "lookup",
@@ -571,6 +578,7 @@ impl EngineOptions {
             "gpu_exact" => self.gpu_exact = Some(parse_bool(key, value)?),
             "gpu_moe" => self.gpu_moe = Some(parse_bool(key, value)?),
             "gpu_decode" => self.gpu_decode = Some(parse_bool(key, value)?),
+            "stream_gpu" => self.stream_gpu = Some(parse_bool(key, value)?),
             "decision_from" => self.decision_from = opt_str(value),
             "lookup" => {
                 self.lookup = match value {
@@ -1294,6 +1302,9 @@ impl Engine {
         if let Some(on) = opts.gpu_decode {
             crate::gpu::set_decode(Some(on));
         }
+        if let Some(on) = opts.stream_gpu {
+            crate::gpu::set_stream_decode(Some(on));
+        }
         let gpu = crate::gpu::ensure(opts.device)?;
         if crate::sd::is_diffusers(&dir) {
             bail!("{}: a diffusion pipeline; use oxinfer::sd::Pipeline", dir.display());
@@ -1369,7 +1380,16 @@ impl Engine {
         };
         // Too big for memory: streamed with a page-cache budget unless told otherwise
         // (2.5-3.5x faster than demand paging on the 378 GB UD-Q2_K_XL, see the README).
-        let stream = opts.effective_stream(too_big.then(crate::mistral4::default_stream));
+        // Qwen and Gemma checkpoints larger than this device holds (a 27B on a 12 GB phone)
+        // stream with the device's page-cache budget (`stream::DeviceMemory`).
+        let auto = if too_big {
+            Some(crate::mistral4::default_stream())
+        } else if !exp && matches!(family, Family::Qwen | Family::Llama | Family::Gemma4 | Family::Gemma3) {
+            crate::stream::auto_stream(crate::safetensors::checkpoint_bytes(&dir))
+        } else {
+            None
+        };
+        let stream = opts.effective_stream(auto);
         let mmproj = match &opts.mmproj {
             crate::pixtral::Mmproj::File(p) => crate::pixtral::Mmproj::File(resolve_file(&p.to_string_lossy(), opts.cache_dir.as_deref())?),
             m => m.clone(),
@@ -1464,7 +1484,8 @@ impl Engine {
                     || (opts.draft.is_none()
                         && dspark.is_none()
                         && decision.is_none()
-                        && crate::qwen_mtp::by_default(&dir)
+                        // Streamed dense models: a pass costs about the same for 1 or 9 tokens.
+                        && (crate::qwen_mtp::by_default(&dir) || (stream.is_some() && model.cfg.num_experts.unwrap_or(0) == 0))
                         && crate::qwen_mtp::mtp_prefix(files).is_some());
                 let mut m = if mtp {
                     let mut m = model.load_mtp(side.unwrap_or(files))?;

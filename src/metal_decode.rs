@@ -344,6 +344,111 @@ impl MvWeight {
     }
 }
 
+impl MvWeight {
+    /// A streamed weight (`crate::gpu::decode::StreamedWeight`): no buffers yet (the plan wraps
+    /// the unit's memory per step, see [`MvWeight::bind`]); returns the addresses of the data,
+    /// scales and affine offsets (0 when absent).
+    fn streamed(w: &WeightRef, n_out: usize, n_in: usize) -> Option<(Self, [usize; 3])> {
+        let fmt = MvFmt::of(w)?;
+        if !n_in.is_multiple_of(fmt.chunk()) || (matches!(fmt, MvFmt::Gguf(_)) && !n_in.is_multiple_of(32)) {
+            return None;
+        }
+        let at = |p: *const u8| p as usize;
+        let (gpr, gk, addr) = match w {
+            WeightRef::Gguf(g) => {
+                if g.block_scales.is_some() {
+                    return None; // FP8 block scales: not on the decode kernels
+                }
+                (g.row_bytes() as u32, 0, [at(g.data.as_ptr()), 0, 0])
+            }
+            WeightRef::Bf16(v) => ((n_in * 2) as u32, 0, [at(v.as_ptr() as *const u8), 0, 0]),
+            WeightRef::Q8(m) => (0, 0, [at(m.q.as_ptr() as *const u8), at(m.scales.as_ptr() as *const u8), 0]),
+            WeightRef::Q4(m) => {
+                let (gpr, gk, o) = match &m.offsets {
+                    Some(o) => ((n_in / o.group) as u32, (o.group / 32) as u32, at(o.v.as_ptr() as *const u8)),
+                    None => (0, 0, 0),
+                };
+                (gpr, gk, [at(m.q.as_ptr()), at(m.scales.as_ptr() as *const u8), o])
+            }
+        };
+        let null = std::ptr::null_mut();
+        Some((
+            MvWeight {
+                fmt,
+                n_out,
+                n_in,
+                data: null,
+                data_off: 0,
+                scales: null,
+                scales_off: 0,
+                offs: null,
+                offs_off: 0,
+                gpr,
+                gk,
+            },
+            addr,
+        ))
+    }
+
+    /// Points a streamed weight at its memory inside `bufs`: `(span start, span end, buffer,
+    /// buffer offset of the span start)`. False when an address lies in none of them.
+    fn bind(&mut self, addr: &[usize; 3], bufs: &[(usize, usize, Id, usize)]) -> bool {
+        let find = |a: usize| bufs.iter().find(|b| a >= b.0 && a < b.1).map(|b| (b.2, (a - b.0 + b.3) as u64));
+        let Some((d, doff)) = find(addr[0]) else { return false };
+        (self.data, self.data_off) = (d, doff);
+        (self.scales, self.scales_off) = if addr[1] != 0 {
+            match find(addr[1]) {
+                Some(v) => v,
+                None => return false,
+            }
+        } else {
+            (d, 0)
+        };
+        (self.offs, self.offs_off) = if addr[2] != 0 {
+            match find(addr[2]) {
+                Some(v) => v,
+                None => return false,
+            }
+        } else {
+            (d, 0)
+        };
+        true
+    }
+}
+
+/// A matvec of a plan whose weights stream (see `Graph::units`): its op index and the addresses
+/// of its weight (and the pair's second weight).
+struct StreamedMv {
+    mop: usize,
+    w: [usize; 3],
+    w2: Option<[usize; 3]>,
+}
+
+/// Per expert, per projection (gate or fused gate/up, up, down): the addresses of its data,
+/// scales and affine offsets (0: none).
+type ExpertAddrs = [[usize; 3]; 3];
+
+/// The routed experts of a plan that stream (on-demand parts of their unit): the op, the unit,
+/// the address tables the op reads (filled per step), each expert's memory, and where the op
+/// finds the chosen experts (`k` ids per token, `sel_stride` bytes apart).
+struct StreamedExperts {
+    mop: usize,
+    unit: usize,
+    tabs: [Id; 3],
+    addrs: Vec<ExpertAddrs>,
+    sel: usize,
+    sel_stride: usize,
+    k: usize,
+}
+
+/// A streaming unit of a plan: where its ops start, the streamer's unit, and for a unit that is
+/// not resident the memory to wrap per step.
+struct PlanUnit {
+    start: usize,
+    unit: usize,
+    spans: Option<Vec<(usize, usize)>>,
+}
+
 /// Matvec output modes (`MV::mode`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum MvMode {
@@ -792,6 +897,7 @@ struct AttnParams {
 const ATTN_MAX_SPLIT: usize = 64;
 
 /// A compiled op: byte offsets into the plan's activation arena (`a`) or constants (`c`).
+#[derive(Clone)]
 enum MOp {
     Barrier,
     Norm {
@@ -1020,6 +1126,12 @@ pub(crate) struct MetalPlan<'b> {
     /// with or without captured features) share a slot, so its device copies of the caches stay
     /// valid when steps alternate between them (one copy, one truncation watermark).
     id: u64,
+    /// Weight streaming (see `Graph::units`): the streamer, the matvecs of streamed weights (by
+    /// op index) and the units in op order. None / empty when every weight is resident.
+    gate: Option<std::sync::Arc<dyn crate::gpu::decode::UnitGate>>,
+    streamed: Vec<StreamedMv>,
+    experts: Vec<StreamedExperts>,
+    units: Vec<PlanUnit>,
 }
 unsafe impl Send for MetalPlan<'_> {}
 unsafe impl Sync for MetalPlan<'_> {}
@@ -1100,6 +1212,10 @@ fn layout_id(g: &Graph) -> u64 {
     g.ops
         .iter()
         .find_map(|op| match op {
+            // A streamed weight has no device state of its own: its memory identifies it.
+            Op::Linear { w, dev, n_out, n_in, .. } if crate::gpu::decode::is_streamed(dev) => {
+                MvWeight::streamed(w, *n_out, *n_in).map(|(_, a)| a[0])
+            }
             Op::Linear { dev, .. } => Some(*dev as *const DeviceWeight as usize),
             _ => None,
         })
@@ -1173,7 +1289,14 @@ impl MetalBackend {
         let mut head_from = usize::MAX;
         let (mut rd, mut wr): (Vec<Range>, Vec<Range>) = (Vec::new(), Vec::new());
         let rng = |v: View, n: usize| (v.buf, v.off, v.off + n + (tokens - 1) * tsz[v.buf]);
+        // Streaming: the first compiled op of each graph op, and the matvecs of streamed weights.
+        let mut op_mop: Vec<usize> = Vec::with_capacity(g.ops.len());
+        let mut streamed: Vec<StreamedMv> = Vec::new();
+        let mut experts: Vec<StreamedExperts> = Vec::new();
         for (i, op) in g.ops.iter().enumerate() {
+            op_mop.push(ops.len());
+            let mut smv: Option<([usize; 3], Option<[usize; 3]>)> = None;
+            let mut sxp: Option<StreamedExperts> = None;
             if i == g.head_from {
                 // The head starts after a barrier, so skipping it leaves no dangling dependency.
                 ops.push(MOp::Barrier);
@@ -1234,17 +1357,33 @@ impl MetalBackend {
                     y,
                     mode,
                 } => {
-                    let mw = MvWeight::new(w, dev, n_out, n_in)?;
-                    let mw2 = match w2 {
+                    use crate::gpu::decode::is_streamed;
+                    let (mw, sa) = if is_streamed(dev) {
+                        let (m, a) = MvWeight::streamed(w, n_out, n_in)?;
+                        (m, Some(a))
+                    } else {
+                        (MvWeight::new(w, dev, n_out, n_in)?, None)
+                    };
+                    let (mw2, sa2) = match w2 {
                         Some((w2, d2)) => {
-                            let m = MvWeight::new(w2, d2, n_out, n_in)?;
+                            let (m, a) = if is_streamed(d2) {
+                                let (m, a) = MvWeight::streamed(w2, n_out, n_in)?;
+                                (m, Some(a))
+                            } else {
+                                (MvWeight::new(w2, d2, n_out, n_in)?, None)
+                            };
                             if m.fmt != mw.fmt || m.gk != mw.gk || m.gpr != mw.gpr {
                                 return None; // a pair shares one kernel
                             }
-                            Some(m)
+                            (Some(m), a)
                         }
-                        None => None,
+                        None => (None, None),
                     };
+                    match (sa, sa2, mw2.is_some()) {
+                        (None, None, _) => {}
+                        (Some(a), a2, pair) if a2.is_some() == pair => smv = Some((a, a2)),
+                        _ => return None, // a pair streams whole or not at all
+                    }
                     let (mode, gate) = match mode {
                         LinMode::Store => (MvMode::Store, None),
                         LinMode::Add => (MvMode::Add, None),
@@ -1428,7 +1567,36 @@ impl MetalBackend {
                     if mt && ex.edits.is_some() {
                         return None;
                     }
-                    let (tabs, fused, g, d, pf) = self.expert_tables(ex, &mut owned, &mut shared, &mut indirect)?;
+                    // Experts that stream: on-demand parts of the op's unit, one per expert.
+                    let unit = g.units.iter().take_while(|u| u.0 <= i).last().map(|u| u.1);
+                    let streamed_unit = match (&g.gate, unit) {
+                        (Some(gt), Some(u)) if gt.part_count(u) > 0 => {
+                            if gt.part_count(u) != ex.gate.len() {
+                                return None;
+                            }
+                            Some(u)
+                        }
+                        _ => None,
+                    };
+                    let mut addrs = Vec::new();
+                    let (tabs, fused, g, d, pf) = self.expert_tables(
+                        ex,
+                        &mut owned,
+                        &mut shared,
+                        &mut indirect,
+                        streamed_unit.is_some().then_some(&mut addrs),
+                    )?;
+                    if let Some(u) = streamed_unit {
+                        sxp = Some(StreamedExperts {
+                            mop: 0,
+                            unit: u,
+                            tabs,
+                            addrs,
+                            sel: byte(ex.sel),
+                            sel_stride: ts(ex.sel) * 4,
+                            k: ex.k,
+                        });
+                    }
                     let edit = match ex.edits {
                         Some((v, n)) => Some((self.named_pipeline("dec_neuron_edit")?, byte(v), n as u32)),
                         None => None,
@@ -1799,11 +1967,43 @@ impl MetalBackend {
                 wr.clear();
             }
             ops.extend(emit);
+            if let Some((w, w2)) = smv {
+                streamed.push(StreamedMv { mop: ops.len() - 1, w, w2 });
+            }
+            if let Some(mut x) = sxp {
+                x.mop = ops.len() - 1;
+                experts.push(x);
+            }
             rd.extend(r);
             wr.extend(w);
         }
         if head_from == usize::MAX {
             head_from = ops.len();
+        }
+        // Streaming units: every streamed matvec must lie in a unit that is not resident.
+        let mut units: Vec<PlanUnit> = Vec::new();
+        if !streamed.is_empty() || !experts.is_empty() {
+            let gate = g.gate.as_ref()?;
+            for &(op, u) in &g.units {
+                let start = op_mop.get(op).copied().unwrap_or(ops.len());
+                if units.last().is_some_and(|l| l.start > start) {
+                    return None;
+                }
+                units.push(PlanUnit {
+                    start,
+                    unit: u,
+                    spans: (!gate.resident(u)).then(|| gate.spans(u)),
+                });
+            }
+            for sm in &streamed {
+                let k = units.partition_point(|u| u.start <= sm.mop);
+                let spans = k.checked_sub(1).and_then(|k| units[k].spans.as_ref())?;
+                for a in std::iter::once(&sm.w).chain(&sm.w2).flat_map(|a| a.iter()).filter(|&&a| a != 0) {
+                    if !spans.iter().any(|&(s, l)| *a >= s && *a < s + l) {
+                        return None;
+                    }
+                }
+            }
         }
         // Split-attention partials after the activations (a region per token).
         let part = total;
@@ -1874,6 +2074,14 @@ impl MetalBackend {
             params_key: AtomicU64::new(0),
             lock: Mutex::new(()),
             id: layout_id(g),
+            gate: if streamed.is_empty() && experts.is_empty() {
+                None
+            } else {
+                g.gate.clone()
+            },
+            streamed,
+            experts,
+            units,
             f,
         })
     }
@@ -1892,6 +2100,7 @@ impl MetalBackend {
         owned: &mut Vec<Id>,
         shared: &mut Vec<Id>,
         indirect: &mut Vec<Id>,
+        stream: Option<&mut Vec<ExpertAddrs>>,
     ) -> Option<([Id; 3], bool, (u32, u32), (u32, u32), (MvFmt, MvFmt))> {
         let n = ex.gate.len();
         if n == 0 || ex.down.len() != n || ex.up.as_ref().is_some_and(|u| u.len() != n) || ex.k > 64 {
@@ -1946,6 +2155,37 @@ impl MetalBackend {
         }
         if !fused && (infos[1][0].0 != infos[0][0].0 || infos[1][0].1 != infos[0][0].1) {
             return None; // gate and up share the pair kernel
+        }
+        if let Some(addrs) = stream {
+            // Streamed experts: empty tables, filled per step with the chosen experts' wraps.
+            let new_len: MsgNewBufLen = self.o.msg_send();
+            let mut tabs = [std::ptr::null_mut(); 3];
+            for (t, v) in tabs.iter_mut().zip(&infos) {
+                if v.is_empty() {
+                    continue;
+                }
+                *t = unsafe { new_len(self.device, self.sels.new_buffer_len, v.len() * 32, 0) };
+                if t.is_null() {
+                    return None;
+                }
+                owned.push(*t);
+            }
+            if fused {
+                tabs[1] = tabs[0];
+            }
+            addrs.clear();
+            for e in 0..n {
+                let mut a = [[0usize; 3]; 3];
+                for (j, v) in infos.iter().enumerate() {
+                    if let Some(i) = v.get(e) {
+                        for (q, r) in i.2.iter().enumerate() {
+                            a[j][q] = r.map_or(0, |r| r.0);
+                        }
+                    }
+                }
+                addrs.push(a);
+            }
+            return Some((tabs, fused, infos[0][0].1, infos[2][0].1, (infos[0][0].0, infos[2][0].0)));
         }
         let mut all: Vec<(usize, usize)> = infos.iter().flatten().flat_map(|i| i.2.iter().flatten().copied()).collect();
         all.sort_unstable();
@@ -2464,6 +2704,372 @@ impl MetalPlan<'_> {
     }
 }
 
+/// Encodes ops of a step (see `MetalPlan::step`): the range, and replacements for some of its ops
+/// (streamed weights bound to this step's wraps).
+type EncodeOps<'e> = dyn Fn(&FastEnc, std::ops::Range<usize>, &[(usize, MOp)]) + 'e;
+
+/// Wraps of a streamer's cached parts (routed experts) kept between steps, shared by the plans of
+/// the model (`UnitGate::device_state`): unit -> part -> `(span start, span end, buffer, GPU
+/// address of the span start)` per span (in the queue's residency set when there is one). A part's wraps go once the streamer no longer
+/// caches it (a live wrap the device used keeps the pages wired).
+/// A wrapped span of a part: (start, end, buffer, GPU address of the start).
+type PartSpan = (usize, usize, Id, u64);
+
+struct PartWraps {
+    map: std::collections::HashMap<usize, std::collections::HashMap<usize, Vec<PartSpan>>>,
+    release: (MsgVoid, Sel),
+    residency: Option<std::sync::Arc<crate::metal::Residency>>,
+}
+unsafe impl Send for PartWraps {}
+unsafe impl Sync for PartWraps {}
+
+impl Drop for PartWraps {
+    fn drop(&mut self) {
+        let ids: Vec<Id> = self.map.values().flat_map(|l| l.values()).flatten().map(|b| b.2).collect();
+        if let Some(r) = &self.residency
+            && !ids.is_empty()
+        {
+            r.update(&ids, false);
+        }
+        for b in ids {
+            unsafe { (self.release.0)(b, self.release.1) };
+        }
+    }
+}
+
+/// A command buffer of a streamed step in flight: the units to leave once it completed (with
+/// the wraps of their memory to release), and whether it holds a streamed unit.
+struct Flight {
+    cb: Id,
+    ends: Vec<(usize, Vec<Id>)>,
+    streamed: bool,
+}
+
+/// Where a streamed step changes command buffers: a unit starts, streamed experts run.
+enum Ev {
+    Unit(usize),
+    Experts(usize),
+    End,
+}
+
+/// The command buffers of a streamed step (see [`MetalPlan::run_streamed`]).
+struct StreamRun<'p, 'b> {
+    plan: &'p MetalPlan<'b>,
+    gate: &'p dyn crate::gpu::decode::UnitGate,
+    flights: std::collections::VecDeque<Flight>,
+    /// The open command buffer and encoder, and whether it holds a streamed unit.
+    cur: Option<(Id, Id)>,
+    streamed: bool,
+    /// Units entered and not yet handed to a flight: (unit, end of its ops, its wraps).
+    active: Vec<(usize, usize, Vec<Id>)>,
+    /// Ops encoded so far.
+    pos: usize,
+    ok: bool,
+    /// OXINFER_METAL_TRACE: GPU seconds of the command buffers, and how many.
+    gpu: (f64, usize),
+}
+
+impl StreamRun<'_, '_> {
+    /// Streamed units in flight at most: each keeps its pages wired until it is left.
+    const DEPTH: usize = 2;
+
+    fn enc(&mut self) -> Id {
+        if let Some((_, e)) = self.cur {
+            return e;
+        }
+        let f = &self.plan.f;
+        let cb = unsafe { (f.msg0)(self.plan.be.queue, f.s_cb) };
+        let enc = unsafe { (f.enc_type)(cb, f.s_enc_type, 1) }; // MTLDispatchTypeConcurrent
+        self.cur = Some((cb, enc));
+        enc
+    }
+
+    fn finish(&mut self, fl: Flight) {
+        let f = &self.plan.f;
+        unsafe {
+            // Spin first: the routing of streamed experts waits for one layer's work at a time,
+            // and a sleeping wait wakes up late.
+            let t = Instant::now();
+            while (f.status)(fl.cb, f.s_status) < 4 && t.elapsed() < std::time::Duration::from_millis(20) {
+                std::hint::spin_loop();
+            }
+            (f.void)(fl.cb, f.s_wait);
+            self.ok &= (f.status)(fl.cb, f.s_status) == 4;
+            if trace() {
+                let b = self.plan.be;
+                let time: unsafe extern "C" fn(Id, Sel) -> f64 = b.o.msg_send();
+                self.gpu.0 += time(fl.cb, b.o.sel(c"GPUEndTime")) - time(fl.cb, b.o.sel(c"GPUStartTime"));
+                self.gpu.1 += 1;
+            }
+        }
+        for (u, bufs) in fl.ends {
+            for b in bufs {
+                unsafe { (f.void)(b, f.s_release) };
+            }
+            self.gate.end(u);
+        }
+    }
+
+    /// Commits the open command buffer; leaves what the device finished, and waits while too
+    /// many streamed units are in flight.
+    fn cut(&mut self) {
+        let f = &self.plan.f;
+        if let Some((cb, enc)) = self.cur.take() {
+            unsafe {
+                (f.void)(enc, f.s_end);
+                (f.void)(cb, f.s_commit);
+            }
+            let pos = self.pos;
+            let mut ends = Vec::new();
+            for a in std::mem::take(&mut self.active) {
+                if a.1 <= pos {
+                    ends.push((a.0, a.2));
+                } else {
+                    self.active.push(a);
+                }
+            }
+            self.flights.push_back(Flight {
+                cb,
+                ends,
+                streamed: self.streamed,
+            });
+            self.streamed = false;
+        }
+        while let Some(front) = self.flights.front() {
+            let busy = self.flights.iter().filter(|fl| fl.streamed).count();
+            if busy <= Self::DEPTH && unsafe { (f.status)(front.cb, f.s_status) } < 4 {
+                break;
+            }
+            let fl = self.flights.pop_front().unwrap();
+            self.finish(fl);
+        }
+    }
+
+    fn drain(&mut self) {
+        while let Some(fl) = self.flights.pop_front() {
+            self.finish(fl);
+        }
+    }
+}
+
+impl MetalPlan<'_> {
+    /// Runs ops `..end` of a `t`-token step whose weights partly stream (see `Graph::units`).
+    /// Each unit is entered before its ops are encoded and left once the device finished them. A
+    /// unit that is not resident gets command buffers of its own and its memory is wrapped for
+    /// this step only: the wraps are released when the device is done, so the evictor can drop
+    /// the pages, while the device already runs the next units. Streamed experts end the command
+    /// buffer before them: once the routing is read back, the chosen experts are read (or found
+    /// in the part cache), wrapped (wraps kept while the part cache keeps them) and written to
+    /// the op's address tables.
+    fn run_streamed(&self, end: usize, t: usize, encode: &EncodeOps) -> bool {
+        let Some(gate) = self.gate.as_deref() else { return false };
+        let mut events: Vec<(usize, u8, Ev)> = Vec::new();
+        for (k, u) in self.units.iter().enumerate() {
+            if u.start < end {
+                events.push((u.start, 0, Ev::Unit(k)));
+            }
+        }
+        for (j, x) in self.experts.iter().enumerate() {
+            if x.mop < end {
+                events.push((x.mop, 1, Ev::Experts(j)));
+            }
+        }
+        events.sort_by_key(|e| (e.0, e.1));
+        events.push((end, 2, Ev::End));
+        let unit_end = |k: usize| self.units.get(k + 1).map_or(end, |n| n.start.min(end));
+        let base = self.f.contents(self.arena);
+        let pool = unsafe { (self.be.sels.pool_push)() };
+        let mut r = StreamRun {
+            plan: self,
+            gate,
+            flights: Default::default(),
+            cur: None,
+            streamed: false,
+            active: Vec::new(),
+            pos: 0,
+            ok: true,
+            gpu: (0.0, 0),
+        };
+        let mut bound: Vec<(usize, MOp)> = Vec::new();
+        // OXINFER_METAL_TRACE: seconds waiting for routing, reading experts, wrapping them; units.
+        let mut tm = [0f64; 4];
+        let t_run = Instant::now();
+        for (p, _, ev) in events {
+            if !r.ok {
+                break;
+            }
+            if p > r.pos {
+                let enc = r.enc();
+                encode(&FastEnc { enc, f: &self.f }, r.pos..p, &bound);
+                r.pos = p;
+            }
+            match ev {
+                Ev::End => {}
+                Ev::Unit(k) => {
+                    let u = &self.units[k];
+                    if u.spans.is_some() || r.streamed {
+                        r.cut();
+                        bound.clear();
+                    }
+                    let tb = Instant::now();
+                    gate.begin(u.unit);
+                    tm[3] += tb.elapsed().as_secs_f64();
+                    r.active.push((u.unit, unit_end(k), Vec::new()));
+                    let Some(spans) = &u.spans else { continue };
+                    r.streamed = true;
+                    let mut bufs: Vec<(usize, usize, Id, usize)> = Vec::new();
+                    for &(a, l) in spans {
+                        match self.be.wrap_raw(a as *const u8, l) {
+                            Some((id, off)) => bufs.push((a, a + l, id, off)),
+                            None => r.ok = false,
+                        }
+                    }
+                    r.active.last_mut().unwrap().2.extend(bufs.iter().map(|b| b.2));
+                    let ue = unit_end(k);
+                    let lo = self.streamed.partition_point(|m| m.mop < u.start);
+                    for sm in self.streamed[lo..].iter().take_while(|m| m.mop < ue) {
+                        let mut op = self.ops[sm.mop].clone();
+                        if let MOp::Mv { w, w2, .. } = &mut op {
+                            r.ok &= w.bind(&sm.w, &bufs);
+                            if let (Some(w2), Some(a2)) = (w2.as_mut(), sm.w2.as_ref()) {
+                                r.ok &= w2.bind(a2, &bufs);
+                            }
+                        }
+                        bound.push((sm.mop, op));
+                    }
+                }
+                Ev::Experts(j) => {
+                    let x = &self.experts[j];
+                    let t0 = Instant::now();
+                    r.cut();
+                    r.drain();
+                    tm[0] += t0.elapsed().as_secs_f64();
+                    if !r.ok {
+                        break;
+                    }
+                    let mut ids: Vec<usize> = Vec::new();
+                    for row in 0..t {
+                        let sel = unsafe { base.add(x.sel + row * x.sel_stride) } as *const u32;
+                        for q in 0..x.k {
+                            let e = unsafe { *sel.add(q) } as usize;
+                            if e < x.addrs.len() && !ids.contains(&e) {
+                                ids.push(e);
+                            }
+                        }
+                    }
+                    let t1 = Instant::now();
+                    gate.need_parts(x.unit, &ids);
+                    let t2 = Instant::now();
+                    let res = self.bind_experts(gate, x, &ids);
+                    tm[1] += (t2 - t1).as_secs_f64();
+                    tm[2] += t2.elapsed().as_secs_f64();
+                    let enc = r.enc();
+                    match res {
+                        Some(res) => FastEnc { enc, f: &self.f }.use_resources(&res),
+                        None => r.ok = false,
+                    }
+                    // The rest of a streamed unit (its wraps stay with it until it is left).
+                    r.streamed = r.active.iter().any(|a| !a.2.is_empty());
+                }
+            }
+        }
+        r.cut();
+        r.drain();
+        for (u, _, bufs) in std::mem::take(&mut r.active) {
+            for b in bufs {
+                unsafe { (self.f.void)(b, self.f.s_release) };
+            }
+            gate.end(u);
+        }
+        unsafe { (self.be.sels.pool_pop)(pool) };
+        if trace() {
+            eprintln!(
+                "[metal streamed step: {:.1} ms, {} command buffers, gpu {:.1} ms; routing waits {:.1}, expert reads {:.1}, expert wraps {:.1}, unit waits {:.1} ms]",
+                t_run.elapsed().as_secs_f64() * 1e3,
+                r.gpu.1,
+                r.gpu.0 * 1e3,
+                tm[0] * 1e3,
+                tm[1] * 1e3,
+                tm[2] * 1e3,
+                tm[3] * 1e3
+            );
+        }
+        r.ok
+    }
+
+    /// Wraps the experts `ids` of `x` (or finds their wraps kept from earlier steps), writes
+    /// their entries of the op's address tables, and drops the kept wraps of parts the streamer
+    /// no longer caches. Returns the buffers the op reads through the tables.
+    fn bind_experts(&self, gate: &dyn crate::gpu::decode::UnitGate, x: &StreamedExperts, ids: &[usize]) -> Option<Vec<Id>> {
+        let slot = gate.device_state()?;
+        let mut g = slot.lock().unwrap();
+        if g.as_ref().is_none_or(|b| !b.is::<PartWraps>()) {
+            *g = Some(Box::new(PartWraps {
+                map: Default::default(),
+                release: (self.f.void, self.f.s_release),
+                residency: self.be.residency.clone(),
+            }));
+        }
+        let pw = g.as_mut().unwrap().downcast_mut::<PartWraps>().unwrap();
+        let resid = self.be.residency.as_ref();
+        let layer = pw.map.entry(x.unit).or_default();
+        // Parts of this unit the streamer let go of (their pages may be dropped once unwired).
+        let gone: Vec<usize> = layer
+            .keys()
+            .copied()
+            .filter(|&p| !ids.contains(&p) && !gate.part_cached(x.unit, p))
+            .collect();
+        let mut dropped: Vec<Id> = Vec::new();
+        for p in gone {
+            dropped.extend(layer.remove(&p).unwrap().iter().map(|b| b.2));
+        }
+        if let Some(r) = resid
+            && !dropped.is_empty()
+        {
+            r.update(&dropped, false);
+        }
+        for b in dropped {
+            unsafe { (self.f.void)(b, self.f.s_release) };
+        }
+        let mut res = Vec::new();
+        let mut added = Vec::new();
+        for &e in ids {
+            if let std::collections::hash_map::Entry::Vacant(slot) = layer.entry(e) {
+                let mut v = Vec::new();
+                for (a, l) in gate.part_spans(x.unit, e) {
+                    let (id, off) = self.be.wrap_raw(a as *const u8, l)?;
+                    v.push((a, a + l, id, self.be.buffer_gpu_address(id) + off as u64));
+                    added.push(id);
+                }
+                slot.insert(v);
+            }
+            let v = &layer[&e];
+            res.extend(v.iter().map(|b| b.2));
+            let at = |a: usize| -> Option<u64> {
+                let b = v.iter().find(|b| a >= b.0 && a < b.1)?;
+                Some(b.3 + (a - b.0) as u64)
+            };
+            for (j, &tab) in x.tabs.iter().enumerate() {
+                if tab.is_null() || (j == 1 && tab == x.tabs[0]) {
+                    continue;
+                }
+                let r = x.addrs[e][j];
+                let d = at(r[0])?;
+                let entry = [d, if r[1] != 0 { at(r[1])? } else { d }, if r[2] != 0 { at(r[2])? } else { d }, 0];
+                unsafe { std::ptr::copy_nonoverlapping(entry.as_ptr(), (self.f.contents(tab) as *mut u64).add(4 * e), 4) };
+            }
+        }
+        // With a residency set the kept wraps stay resident there (no per-submission residency).
+        if let Some(r) = resid {
+            if !added.is_empty() {
+                r.update(&added, true);
+            }
+            res.clear();
+        }
+        Some(res)
+    }
+}
+
 impl DecodePlan for MetalPlan<'_> {
     fn tokens(&self) -> usize {
         self.tokens
@@ -2607,12 +3213,15 @@ impl DecodePlan for MetalPlan<'_> {
         }
         parts.push(from..end);
         let indirect = if self.be.residency.is_some() { &[][..] } else { &self.indirect[..] };
-        let (ok, gpu) = run_concurrent(self.be, &self.f, &parts, |e, range| {
+        // Encodes the ops of `range`, those listed in `bound` replaced (streamed weights bound to
+        // this step's wraps).
+        let encode = |e: &FastEnc, range: std::ops::Range<usize>, bound: &[(usize, MOp)]| {
             e.use_resources(indirect);
             // OXINFER_DEC_ONLY=barrier,norm,mv,qk,attn (debugging): encode only these ops.
             static ONLY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
             let only = ONLY.get_or_init(|| std::env::var("OXINFER_DEC_ONLY").ok());
-            for op in &self.ops[range] {
+            for i in range {
+                let op = bound.iter().find(|b| b.0 == i).map_or(&self.ops[i], |b| &b.1);
                 if let Some(o) = only {
                     let k = match op {
                         MOp::Barrier => "barrier",
@@ -2920,7 +3529,12 @@ impl DecodePlan for MetalPlan<'_> {
                     }
                 }
             }
-        });
+        };
+        let (ok, gpu) = if self.gate.is_some() {
+            (self.run_streamed(end, t, &encode), 0.0)
+        } else {
+            run_concurrent(self.be, &self.f, &parts, |e, r| encode(e, r, &[]))
+        };
         if !ok {
             return false;
         }

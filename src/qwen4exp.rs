@@ -949,12 +949,19 @@ impl<'a> QwenModel<'a> {
         let (nh, nkv, hd) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
         let qw = 2 * nh * hd;
         let d = cfg.indexer_head_dim;
+        // Streamed weights (layers outside the resident set, routed experts) are wrapped by the
+        // plan per step (see `crate::gpu::decode::Graph::units`).
+        let streams = self.stream.is_some();
         let dev = |l: &'s Lin, n_out: usize, n_in: usize| -> Option<&'s crate::gpu::DeviceWeight> {
-            if l.has_lora() || l.is_transient() {
+            if l.has_lora() {
                 return None;
+            }
+            if l.is_transient() {
+                return streams.then(crate::gpu::decode::streamed_weight);
             }
             l.device_weight(n_out, n_in)
         };
+        let off = |l: &Lin| l.has_lora() || (l.is_transient() && !streams);
         let lin = |l: &'s Lin, n_out: usize, n_in: usize, x, y, mode| -> Option<Op<'s>> {
             Some(Op::Linear {
                 w: l.as_ref(),
@@ -968,6 +975,9 @@ impl<'a> QwenModel<'a> {
             })
         };
         let mut g = Graph::new();
+        if let Some(s) = &self.stream {
+            g.gate = Some(std::sync::Arc::new(s.clone()));
+        }
         let x0 = g.buf(h);
         let xw = g.buf(w);
         let xn = g.buf(w);
@@ -1066,6 +1076,7 @@ impl<'a> QwenModel<'a> {
         }
         let mut ai = 0;
         for (li, layer) in self.layers.iter().enumerate() {
+            g.units.push((g.ops.len(), li));
             let el = &ex.layers[li];
             if let Some(p) = ple
                 && p.layer == li
@@ -1230,15 +1241,15 @@ impl<'a> QwenModel<'a> {
             let mut uw = Vec::with_capacity(ne);
             for gu in &m.experts.gate_up {
                 match gu {
-                    crate::moe::GateUp::Fused(l) if !l.has_lora() && !l.is_transient() => gw.push(l.as_ref()),
-                    crate::moe::GateUp::Split(a, b) if !a.has_lora() && !b.has_lora() && !a.is_transient() && !b.is_transient() => {
+                    crate::moe::GateUp::Fused(l) if !off(l) => gw.push(l.as_ref()),
+                    crate::moe::GateUp::Split(a, b) if !off(a) && !off(b) => {
                         gw.push(a.as_ref());
                         uw.push(b.as_ref());
                     }
                     _ => return None,
                 }
             }
-            if m.experts.down.iter().any(|l| l.has_lora() || l.is_transient()) {
+            if m.experts.down.iter().any(off) {
                 return None;
             }
             g.ops.push(Op::Experts(Experts {
@@ -1291,6 +1302,7 @@ impl<'a> QwenModel<'a> {
             out: cap.at(n_attn * d),
             n: w,
         });
+        g.units.push((g.ops.len(), self.layers.len()));
         mix(&mut g, &ex.mixer, hidden)?;
         g.head_from = g.ops.len();
         g.ops.push(lin(&self.lm_head, cfg.vocab_size, h, hidden, logits, LinMode::Store)?);

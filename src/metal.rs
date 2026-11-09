@@ -1293,7 +1293,7 @@ impl Drop for MetalWeight {
 }
 
 /// An `MTLResidencySet` attached to the command queue, and its selectors.
-struct Residency {
+pub(crate) struct Residency {
     set: Id,
     add: Sel,
     remove: Sel,
@@ -1310,7 +1310,7 @@ unsafe impl Sync for Residency {}
 
 impl Residency {
     /// Adds (or removes) buffers, then commits the change.
-    fn update(&self, ids: &[Id], add: bool) {
+    pub(crate) fn update(&self, ids: &[Id], add: bool) {
         let _g = self.lock.lock().unwrap();
         // SAFETY: `set` is a live residency set and `ids` are live buffers.
         unsafe {
@@ -1841,6 +1841,11 @@ impl MetalBackend {
         false
     }
 
+    /// [`Self::wrap`] for a caller that releases the buffer itself: (buffer, offset of `ptr`).
+    pub(crate) fn wrap_raw(&self, ptr: *const u8, len: usize) -> Option<(Id, usize)> {
+        self.wrap(ptr, len).map(|b| (b.id, b.offset_bytes))
+    }
+
     fn wrap(&self, ptr: *const u8, len: usize) -> Option<Buf> {
         let start = (ptr as usize) & !(PAGE - 1);
         let end = (ptr as usize + len).div_ceil(PAGE) * PAGE;
@@ -2181,6 +2186,12 @@ impl MetalBackend {
     fn contents(&self, b: Id) -> *mut u8 {
         let f: MsgPtr = self.o.msg_send();
         unsafe { f(b, self.sels.contents) as *mut u8 }
+    }
+
+    /// The GPU address of buffer `id`'s first byte.
+    pub(crate) fn buffer_gpu_address(&self, id: Id) -> u64 {
+        let f: MsgU = self.o.msg_send();
+        unsafe { f(id, self.sels.gpu_address) }
     }
 
     fn gpu_address(&self, b: &Buf) -> u64 {
@@ -2938,6 +2949,12 @@ impl Backend for MetalBackend {
 
     fn decodes(&self) -> bool {
         true
+    }
+
+    fn working_set(&self) -> Option<u64> {
+        let f: MsgU = self.o.msg_send();
+        let v = unsafe { f(self.device, self.o.sel(c"recommendedMaxWorkingSetSize")) };
+        (v > 0).then_some(v)
     }
 
     fn decode_plan<'s>(&'s self, g: &crate::gpu::decode::Graph) -> Option<Box<dyn crate::gpu::decode::DecodePlan + 's>> {

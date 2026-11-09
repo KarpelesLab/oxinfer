@@ -990,13 +990,20 @@ impl<'a> QwenModel<'a> {
         let (nh, nkv, hd) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
         let gated = cfg.attn_output_gate;
         let qw = if gated { 2 * nh * hd } else { nh * hd };
+        // Streamed weights (layers outside the resident set) are wrapped by the plan per step.
         let dev = |l: &'s Lin, n_out: usize, n_in: usize| -> Option<&crate::gpu::DeviceWeight> {
-            if l.has_lora() || l.is_transient() {
+            if l.has_lora() {
                 return None;
+            }
+            if l.is_transient() {
+                return self.stream.is_some().then(crate::gpu::decode::streamed_weight);
             }
             l.device_weight(n_out, n_in)
         };
         let mut g = Graph::new();
+        if let Some(s) = &self.stream {
+            g.gate = Some(std::sync::Arc::new(s.clone()));
+        }
         let x = g.buf(h);
         let hn = g.buf(h);
         let qkv = g.buf(qw + 2 * nkv * hd);
@@ -1109,7 +1116,11 @@ impl<'a> QwenModel<'a> {
                 Ffn::Dense(m) => return mlp(g, m, LinMode::Add, de),
                 Ffn::Moe(m) => m,
             };
-            if m.experts.act != crate::moe::Act::Silu || m.experts.down.iter().any(|l| l.has_lora() || l.is_transient()) {
+            // Streamed experts (always on-demand parts of their layer) are wrapped per step by
+            // the plan once routing chose them.
+            let streams = self.stream.is_some();
+            let off = |l: &Lin| l.has_lora() || (l.is_transient() && !streams);
+            if m.experts.act != crate::moe::Act::Silu || m.experts.down.iter().any(off) {
                 return None;
             }
             let ne = m.experts.down.len();
@@ -1129,8 +1140,8 @@ impl<'a> QwenModel<'a> {
             let mut up = Vec::with_capacity(ne);
             for gu in &m.experts.gate_up {
                 match gu {
-                    crate::moe::GateUp::Fused(l) if !l.has_lora() && !l.is_transient() => gate.push(l.as_ref()),
-                    crate::moe::GateUp::Split(a, b) if !a.has_lora() && !b.has_lora() && !a.is_transient() && !b.is_transient() => {
+                    crate::moe::GateUp::Fused(l) if !off(l) => gate.push(l.as_ref()),
+                    crate::moe::GateUp::Split(a, b) if !off(a) && !off(b) => {
                         gate.push(a.as_ref());
                         up.push(b.as_ref());
                     }
@@ -1186,6 +1197,7 @@ impl<'a> QwenModel<'a> {
             }
         };
         for (li, layer) in self.layers.iter().enumerate() {
+            g.units.push((g.ops.len(), li));
             // Multi-token plans keep each recurrent layer's inputs in its own buffers.
             let (gproj, gconv) = if multi.is_some() && matches!(layer.mixer, Mixer::Gdn(_)) {
                 (g.buf(conv_dim + value_dim + 2 * nv), g.buf(conv_dim))
@@ -1287,9 +1299,16 @@ impl<'a> QwenModel<'a> {
         }
         g.ops.push(Op::norm(x, hidden, &self.final_norm, h, eps));
         g.head_from = g.ops.len();
+        g.units.push((g.ops.len(), self.layers.len()));
         g.ops.push(lin(&self.lm_head, cfg.vocab_size, h, hidden, logits, LinMode::Store)?);
         g.logits = Some((logits, cfg.vocab_size));
         Some(g)
+    }
+
+    /// Whether decode steps may run on the device: GPU decoding is on, and streamed weights (if
+    /// any) may be decoded there ([`crate::gpu::stream_decode_enabled`]).
+    fn gpu_decode_on(&self) -> bool {
+        crate::gpu::decode_enabled() && (self.stream.is_none() || crate::gpu::stream_decode_enabled())
     }
 
     /// The GPU decode plan, compiled on first use (pipelines, buffers: ~0.1-0.2 s, so multi-token
@@ -1300,7 +1319,7 @@ impl<'a> QwenModel<'a> {
 
     /// The plan for an intervention layout (None: without interventions).
     fn gpu_plan_for(&self, lay: Option<&crate::intervene::GpuLayout>) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
-        if !crate::gpu::decode_enabled() || !self.stream.is_none() {
+        if !self.gpu_decode_on() {
             return None;
         }
         self.gpu_plans.get(lay.map_or(0, |l| l.signature()), || {
@@ -1323,7 +1342,7 @@ impl<'a> QwenModel<'a> {
     /// Runs token `tok` through the GPU decode plan: the final-normed hidden state and, if
     /// wanted, the logits. None (nothing changed) when GPU decoding is off or unavailable.
     fn gpu_step(&self, sess: &mut QwenSession, tok: u32, want_logits: bool) -> Option<(Vec<f32>, Option<Vec<f32>>)> {
-        if !crate::gpu::decode_enabled() || self.stream.is_some() {
+        if !self.gpu_decode_on() {
             return None;
         }
         if !sess.iv.gpu_ok() {
@@ -1397,7 +1416,7 @@ impl<'a> QwenModel<'a> {
     }
 
     fn gpu_multi_plan(&self, layers: &[usize], tokens: usize, fast: bool) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
-        if !crate::gpu::decode_enabled() || self.stream.is_some() {
+        if !self.gpu_decode_on() {
             return None;
         }
         let fast = fast && tokens > 1;

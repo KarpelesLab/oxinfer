@@ -129,6 +129,83 @@ impl StreamOptions {
     }
 }
 
+/// The memory a device offers a model, for the streaming defaults ([`auto_stream`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DeviceMemory {
+    /// Physical memory.
+    pub total: Option<u64>,
+    /// What this process may still allocate before the OS ends it (iOS:
+    /// `os_proc_available_memory`); None where the OS does not limit apps that way.
+    pub app_available: Option<u64>,
+    /// The GPU's working set for this process (Metal's `recommendedMaxWorkingSetSize`), when an
+    /// accelerator that decodes is active.
+    pub gpu_working_set: Option<u64>,
+}
+
+impl DeviceMemory {
+    /// Memory the app keeps for itself besides the weights' page cache when the OS limits apps
+    /// (KV cache, recurrent states, activations, the app).
+    pub const APP_RESERVE: u64 = 1 << 30;
+
+    /// What this device reports. `OXINFER_DEVICE_MEM_GB`, `OXINFER_APP_MEM_GB` and
+    /// `OXINFER_GPU_WORKING_SET_GB` override the values (to try a phone's defaults on a desktop).
+    pub fn detect() -> Self {
+        let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<f64>().ok()).map(|g| (g * 1e9) as u64);
+        let gpu = crate::gpu::active()
+            .filter(|b| b.decodes() && crate::gpu::stream_decode_enabled())
+            .and_then(|b| b.working_set());
+        DeviceMemory {
+            total: env("OXINFER_DEVICE_MEM_GB").or_else(crate::platform::total_memory),
+            app_available: env("OXINFER_APP_MEM_GB").or_else(crate::platform::process_available_memory),
+            gpu_working_set: env("OXINFER_GPU_WORKING_SET_GB").or(gpu),
+        }
+    }
+
+    /// The page-cache budget for a streamed model: on a device that limits apps (iOS), what the
+    /// app may still use minus [`Self::APP_RESERVE`], at most 60% of the device's memory; elsewhere
+    /// 70% of the memory. With GPU decoding, at most 85% of the GPU working set (the resident
+    /// layers stay wired for the GPU, and so are the streamed ones it is reading). None when
+    /// nothing is known.
+    pub fn budget(&self) -> Option<u64> {
+        let b = match (self.app_available, self.total) {
+            (Some(a), t) => {
+                let a = a.saturating_sub(Self::APP_RESERVE);
+                t.map_or(a, |t| a.min((t as f64 * 0.6) as u64))
+            }
+            (None, Some(t)) => (t as f64 * 0.7) as u64,
+            (None, None) => return None,
+        };
+        let b = match self.gpu_working_set {
+            Some(w) => b.min((w as f64 * 0.85) as u64),
+            None => b,
+        };
+        Some(b.max(1 << 30))
+    }
+
+    /// Whether `bytes` of weights are too many to keep in memory: more than the budget where the
+    /// OS limits apps, else more than 60% of the memory.
+    pub fn too_big(&self, bytes: u64) -> bool {
+        match (self.app_available, self.total) {
+            (Some(_), _) => self.budget().is_some_and(|b| bytes > b),
+            (None, Some(t)) => bytes as f64 > 0.6 * t as f64,
+            (None, None) => false,
+        }
+    }
+}
+
+/// Streaming for a checkpoint of `bytes` that does not fit this device ([`DeviceMemory`]): the
+/// options with the device's page-cache budget (and `OXINFER_FLASH_MBPS`), or None when the
+/// weights fit.
+pub fn auto_stream(bytes: u64) -> Option<StreamOptions> {
+    let d = DeviceMemory::detect();
+    if !d.too_big(bytes) {
+        return None;
+    }
+    let mut o = StreamOptions::default().with_env();
+    o.cache_budget = d.budget();
+    Some(o)
+}
+
 /// One unit of a model: a name, the memory its weights occupy (`(address, length)` spans inside
 /// mapped files), and how many times a decoding round uses it (residency priority).
 #[derive(Clone, Debug, Default)]
@@ -308,7 +385,8 @@ struct State {
     /// Position (in `order`) of the unit in use or expected next.
     cur: usize,
     loaded: Vec<bool>,
-    in_use: Option<usize>,
+    /// Units in use (several when a GPU pass keeps earlier units busy while it enters the next).
+    in_use: Vec<usize>,
     /// Being read by the reader, and being evicted by the evictor.
     loading: Option<usize>,
     evicting: Option<usize>,
@@ -381,6 +459,9 @@ pub struct Streamer {
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     evictor: Mutex<Option<std::thread::JoinHandle<()>>>,
     plan: StreamPlan,
+    /// Accelerator state tied to the streamed memory (a GPU's wraps of the cached experts),
+    /// dropped with the streamer.
+    device: Mutex<Option<Box<dyn std::any::Any + Send + Sync>>>,
 }
 
 /// A model's link to a streamer: unit `base + i` is the model's unit `i`.
@@ -425,6 +506,54 @@ impl StreamHook {
     /// The streamer's settings.
     pub fn options(&self) -> &StreamOptions {
         self.s.options()
+    }
+    /// [`Self::enter`] without a guard, for passes that keep several units busy at once (a GPU
+    /// pass enters the next layer while the device still reads the last): waits for unit `i`,
+    /// which stays in use until [`Self::leave`].
+    pub fn begin(&self, i: usize) {
+        self.s.begin(self.base + i);
+    }
+    /// Ends a [`Self::begin`].
+    pub fn leave(&self, i: usize) {
+        self.s.end(self.base + i);
+    }
+    /// Whether the model's unit `i` is in the resident set (or the streamer keeps no budget, so
+    /// that nothing is dropped after use).
+    pub fn is_resident(&self, i: usize) -> bool {
+        self.s.inner.units.get(self.base + i).is_none_or(|u| u.resident)
+    }
+    /// On-demand parts (MoE experts) of the model's unit `i`.
+    pub fn part_count(&self, i: usize) -> usize {
+        self.s.inner.units.get(self.base + i).map_or(0, |u| u.parts.len())
+    }
+    /// The memory of part `p` of the model's unit `i`, as page-aligned spans.
+    pub fn part_spans(&self, i: usize, p: usize) -> Vec<(usize, usize)> {
+        self.s
+            .inner
+            .units
+            .get(self.base + i)
+            .and_then(|u| u.parts.get(p))
+            .map_or_else(Vec::new, |q| q.spans.iter().map(|s| (s.addr, s.len)).collect())
+    }
+    /// Whether part `p` of the model's unit `i` is in use or in the part cache (else its pages
+    /// may be dropped: an accelerator should let go of its mapping).
+    pub fn part_cached(&self, i: usize, p: usize) -> bool {
+        let k = (self.base + i, p);
+        let pc = self.s.inner.parts.lock().unwrap();
+        pc.in_use.contains(&k) || pc.entries.contains_key(&k)
+    }
+    /// Accelerator state kept with the streamer (see `Streamer::device`).
+    pub fn device_state(&self) -> &Mutex<Option<Box<dyn std::any::Any + Send + Sync>>> {
+        &self.s.device
+    }
+    /// The memory the model's unit `i` reads, as page-aligned `(address, length)` spans (adjacent
+    /// tensors merged).
+    pub fn unit_spans(&self, i: usize) -> Vec<(usize, usize)> {
+        self.s
+            .inner
+            .units
+            .get(self.base + i)
+            .map_or_else(Vec::new, |u| u.spans.iter().map(|s| (s.addr, s.len)).collect())
     }
     /// Reads `ranges` (`(address, length)` inside the mapped files) now, ahead of the read-ahead:
     /// the embedding rows of the tokens a pass is about to look up, which would otherwise fault
@@ -574,7 +703,7 @@ impl Streamer {
             st: Mutex::new(State {
                 cur: 0,
                 loaded: vec![false; n],
-                in_use: None,
+                in_use: Vec::new(),
                 loading: None,
                 evicting: None,
                 stop: false,
@@ -614,6 +743,7 @@ impl Streamer {
             thread: Mutex::new(Some(th)),
             evictor: Mutex::new(Some(ev)),
             plan,
+            device: Mutex::new(None),
         }))
     }
 
@@ -681,7 +811,9 @@ impl Streamer {
             }
             inner.c.stall_ns.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
         }
-        st.in_use = Some(p);
+        if !st.in_use.contains(&p) {
+            st.in_use.push(p);
+        }
     }
 
     fn need_parts(&self, u: usize, ids: &[usize]) {
@@ -823,12 +955,15 @@ impl Streamer {
             return;
         };
         let mut st = inner.st.lock().unwrap();
-        st.in_use = None;
+        st.in_use.retain(|&q| q != p);
         st.loaded[p] = false;
         if inner.managed && inner.opts.evict {
             inner.queue_evictions([Evict::Unit(p)]);
         }
-        st.cur = (p + 1) % inner.order.len();
+        // A later unit already entered keeps the read-ahead where it is.
+        if st.in_use.is_empty() {
+            st.cur = (p + 1) % inner.order.len();
+        }
         inner.cv.notify_all();
     }
 }
@@ -965,7 +1100,7 @@ impl Inner {
                 match e {
                     Evict::Unit(p) => self.evict(self.order[p]),
                     Evict::Part(u, p) => self.evict_part(u, p),
-                }
+                };
             }
             return;
         }
@@ -975,33 +1110,55 @@ impl Inner {
 
     /// The evictor thread: drops queued units and parts from the page cache, skipping those
     /// wanted again meanwhile (a unit back in the read-ahead, a part in use or cached again).
+    /// Pages a GPU read stay wired for a while after their Metal buffer is released (50-150 ms
+    /// on an M5 Max; `msync` then succeeds but leaves them cached), so what is still cached
+    /// after the drop is tried again a little later.
     fn evict_loop(&self) {
+        // (last attempt, item, attempts)
+        let mut retry: Vec<(Instant, Evict, u32)> = Vec::new();
+        const RETRY: Duration = Duration::from_millis(20);
+        const ATTEMPTS: u32 = 100;
         loop {
-            let items = {
+            let items: Vec<(Evict, u32)> = {
                 let mut q = self.evq.lock().unwrap();
                 loop {
-                    if !q.0.is_empty() {
-                        break std::mem::take(&mut q.0);
+                    if !q.0.is_empty() || retry.iter().any(|r| r.0.elapsed() >= RETRY) {
+                        let mut v: Vec<(Evict, u32)> = std::mem::take(&mut q.0).into_iter().map(|e| (e, 0)).collect();
+                        let mut i = 0;
+                        while i < retry.len() {
+                            if retry[i].0.elapsed() >= RETRY {
+                                let (_, e, n) = retry.swap_remove(i);
+                                v.push((e, n));
+                            } else {
+                                i += 1;
+                            }
+                        }
+                        break v;
                     }
                     if q.1 {
                         return;
                     }
-                    q = self.evcv.wait(q).unwrap();
+                    q = if retry.is_empty() {
+                        self.evcv.wait(q).unwrap()
+                    } else {
+                        self.evcv.wait_timeout(q, RETRY / 4).unwrap().0
+                    };
                 }
             };
-            for e in items {
-                match e {
+            for (e, n) in items {
+                let done = match e {
                     Evict::Unit(p) => {
                         {
                             let mut st = self.st.lock().unwrap();
-                            if st.loaded[p] || st.in_use == Some(p) || st.loading == Some(p) {
+                            if st.loaded[p] || st.in_use.contains(&p) || st.loading == Some(p) {
                                 continue;
                             }
                             st.evicting = Some(p);
                         }
-                        self.evict(self.order[p]);
+                        let done = self.evict(self.order[p]);
                         self.st.lock().unwrap().evicting = None;
                         self.cv.notify_all();
+                        done
                     }
                     Evict::Part(u, p) => {
                         {
@@ -1010,35 +1167,47 @@ impl Inner {
                                 continue;
                             }
                         }
-                        self.evict_part(u, p);
+                        self.evict_part(u, p)
                     }
+                };
+                if !done && n < ATTEMPTS {
+                    retry.push((Instant::now(), e, n + 1));
                 }
             }
         }
     }
 
-    fn evict_part(&self, u: usize, p: usize) {
+    /// Drops spans from the page cache; true when none of them is still cached (sampled).
+    fn evict_spans(&self, spans: &[Span]) -> bool {
         let t = Instant::now();
         let mut n = 0;
-        for s in &self.units[u].parts[p].inner {
-            if sys::evict(&self.files[s.file], *s) {
+        let mut left = false;
+        for s in spans {
+            if !sys::evict(&self.files[s.file], *s) {
+                continue;
+            }
+            // A wired page survives `msync`: look at three pages.
+            let probe = [s.addr, s.addr + ((s.len / 2) & !(self.page - 1)), s.addr + s.len - self.page];
+            if probe
+                .iter()
+                .any(|&a| sys::resident_bytes(a, self.page, self.page) == Some(self.page as u64))
+            {
+                left = true;
+            } else {
                 n += s.len as u64;
             }
         }
         self.c.bytes_evicted.fetch_add(n, Relaxed);
         self.c.evict_ns.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        !left
     }
 
-    fn evict(&self, u: usize) {
-        let t = Instant::now();
-        let mut n = 0;
-        for s in &self.units[u].inner {
-            if sys::evict(&self.files[s.file], *s) {
-                n += s.len as u64;
-            }
-        }
-        self.c.bytes_evicted.fetch_add(n, Relaxed);
-        self.c.evict_ns.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+    fn evict_part(&self, u: usize, p: usize) -> bool {
+        self.evict_spans(&self.units[u].parts[p].inner)
+    }
+
+    fn evict(&self, u: usize) -> bool {
+        self.evict_spans(&self.units[u].inner)
     }
 
     /// Brings unit `u` into the page cache (and this process's page tables) with `io_threads`
@@ -1113,6 +1282,18 @@ impl Inner {
                 }
             }
         };
+        // Everything cached (experts from the part cache): no reader threads to start.
+        let page = self.page;
+        let cached = |c: &Span| {
+            [c.addr, c.addr + ((c.len / 2) & !(page - 1)), c.addr + c.len - page]
+                .iter()
+                .all(|&a| sys::resident_bytes(a, page, page) == Some(page as u64))
+        };
+        if demand && chunks.iter().all(cached) {
+            let n: u64 = chunks.iter().map(|c| c.len as u64).sum();
+            self.c.bytes_cached.fetch_add(n, Relaxed);
+            return 0;
+        }
         let n = self.opts.io_threads.clamp(1, chunks.len().max(1));
         if n == 1 {
             work();
@@ -1154,7 +1335,7 @@ impl Inner {
                     if self.managed && self.opts.evict {
                         // Units read ahead but skipped (the pass took another path) leave the cache.
                         for p in 0..n {
-                            if st.loaded[p] && st.in_use != Some(p) && !want.contains(&p) {
+                            if st.loaded[p] && !st.in_use.contains(&p) && !want.contains(&p) {
                                 st.loaded[p] = false;
                                 self.evict(self.order[p]);
                             }
@@ -1170,7 +1351,7 @@ impl Inner {
                     }
                     if let Some(&p) = want
                         .iter()
-                        .find(|&&p| !st.loaded[p] && st.in_use != Some(p) && st.evicting != Some(p))
+                        .find(|&&p| !st.loaded[p] && !st.in_use.contains(&p) && st.evicting != Some(p))
                     {
                         st.loading = Some(p);
                         break Job::Unit(p);
@@ -1565,6 +1746,46 @@ mod tests {
             drop(s);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The streaming defaults of a 12 GB phone (6 GB left to the app, 8 GB GPU working set) and
+    /// of a desktop: Qwen3.8-27B Q2_K_P (10.7 GB) streams on the phone with a 5 GB budget, an 8 B
+    /// Q4 model (5 GB) does not on the desktop.
+    #[test]
+    fn device_memory_defaults() {
+        const G: u64 = 1_000_000_000;
+        let phone = DeviceMemory {
+            total: Some(12 * G),
+            app_available: Some(6 * G),
+            gpu_working_set: Some(8 * G),
+        };
+        let b = phone.budget().unwrap();
+        assert_eq!(b, 6 * G - DeviceMemory::APP_RESERVE);
+        assert!(phone.too_big(10_700_000_000));
+        assert!(!phone.too_big(2 * G));
+        // The increased-memory-limit entitlement: capped at 60% of the device, then the GPU.
+        let ent = DeviceMemory {
+            app_available: Some(10 * G),
+            gpu_working_set: Some(10 * G),
+            ..phone
+        };
+        let near = |a: Option<u64>, b: u64| a.is_some_and(|a| a.abs_diff(b) < 1024);
+        assert!(near(ent.budget(), (12 * G) * 6 / 10));
+        let gpu = DeviceMemory {
+            gpu_working_set: Some(6 * G),
+            ..ent
+        };
+        assert!(near(gpu.budget(), (6 * G) * 85 / 100));
+        let mac = DeviceMemory {
+            total: Some(16 * G),
+            app_available: None,
+            gpu_working_set: None,
+        };
+        assert!(!mac.too_big(5 * G));
+        assert!(mac.too_big(10_700_000_000));
+        assert!(near(mac.budget(), (16 * G) * 7 / 10));
+        assert_eq!(DeviceMemory::default().budget(), None);
+        assert!(!DeviceMemory::default().too_big(u64::MAX));
     }
 
     #[test]

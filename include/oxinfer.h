@@ -108,8 +108,11 @@ char *oxi_download(const char *spec, const char *cache_dir, oxi_progress_fn prog
  *                        units, half-precision inputs; process-wide)
  *   gpu_moe=0|1          MoE experts on the GPU in prefill (default 1; process-wide)
  *   stream=auto|on|off   stream weights from storage for models larger than RAM (1 / 0 work
- *                        too). auto (default): when a tuning key below is set, or for a Mistral
- *                        Large 4 checkpoint over 60% of RAM; off: never (an oversized checkpoint
+ *                        too). auto (default): when a tuning key below is set, for a Qwen /
+ *                        Gemma checkpoint larger than the device holds (on iOS: what
+ *                        os_proc_available_memory leaves, minus 1 GB; elsewhere 60% of RAM;
+ *                        budget picked the same way, at most 85% of the GPU working set), or for
+ *                        a Mistral Large 4 checkpoint over 60% of RAM; off: never (an oversized checkpoint
  *                        is then memory-mapped and demand-paged); cache_budget_gb=F, resident_mb,
  *                        prefetch_mb, expert_cache_mb, expert_predict=0|1 tune it
  *   mmproj=auto|none|FILE  Mistral Large 4 vision projector: a llama.cpp mmproj GGUF (path or
@@ -117,6 +120,10 @@ char *oxi_download(const char *spec, const char *cache_dir, oxi_progress_fn prog
  *                        mmproj*.gguf beside a GGUF model; none: no image input
  *   gpu_decode=0|1       generate a whole token per GPU submission where supported (Metal:
  *                        Llama 3, Qwen3, Qwen3.5/3.8 dense; default 1; process-wide)
+ *   stream_gpu=0|1       streamed models decode on the GPU too (default 1; process-wide):
+ *                        resident layers stay wrapped, the others are wrapped per pass as they
+ *                        arrive; Qwen3.5/3.8 dense and MoE (Metal). A streamed dense Qwen with an
+ *                        MTP layer decodes with it by default (draft=none for plain decoding)
  *   coreml_units=auto|ane|all|gpu|cpu   Core ML models (ANEMLL format, Apple only): compute
  *                        units (default auto: the Neural Engine, or cpu/gpu following device)
  *   coreml_prefill=auto|batch|pad|single  Core ML models: how prompts are fed (default auto)
@@ -193,7 +200,10 @@ void oxi_engine_cancel(const OxiEngine *engine);
 
 /* Model information as a JSON object (path, model_type, family, layers, quant, format, device,
  * threads, speculative, load_secs, coreml (null, or units, prefill, context_length, ...),
- * decision (null, or as oxi_decide_info_json), ...). */
+ * decision (null, or as oxi_decide_info_json), stream (null, or cache_budget, resident_bytes,
+ * streamed_bytes_per_pass, expert_bytes, expert_cache_bytes, flash_bytes_per_sec, gpu_decode),
+ * device_memory (total, app_available, gpu_working_set, stream_budget: what the streaming
+ * defaults were picked from), ...). */
 char *oxi_engine_info_json(OxiEngine *engine);
 
 /* Statistics of the last turn as a JSON object: prompt_tokens, prefill_secs, prefill_tok_s,

@@ -180,6 +180,23 @@ pub fn total_memory() -> Option<u64> {
     None
 }
 
+/// Memory this process may still allocate before the OS ends it, when the platform says: iOS's
+/// `os_proc_available_memory` (the app's jetsam limit minus its footprint; raised by the
+/// `com.apple.developer.kernel.increased-memory-limit` entitlement). Clean file pages (mapped
+/// weights in the page cache) do not count against it.
+pub fn process_available_memory() -> Option<u64> {
+    #[cfg(all(target_os = "ios", feature = "gpu"))]
+    {
+        let lib = dlsym::Library::this().ok()?;
+        type F = unsafe extern "C" fn() -> usize;
+        let f = unsafe { lib.get::<F>(c"os_proc_available_memory") }.ok()?;
+        let v = unsafe { f.call(()) } as u64;
+        return (v > 0).then_some(v);
+    }
+    #[allow(unreachable_code)]
+    None
+}
+
 pub fn detect() -> Platform {
     let cpu = CpuInfo {
         arch: std::env::consts::ARCH,

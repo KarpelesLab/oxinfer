@@ -351,6 +351,87 @@ pub struct Graph<'a> {
     /// A buffer the ops copy residual streams into (`n` floats per token), read back after the
     /// pass ([`Step::capture`]; DSpark target features).
     pub capture: Option<(View, usize)>,
+    /// Weight streaming: `(first op, unit)` where each streaming unit of the model starts (in
+    /// op order; the ops before the first belong to none), and the streamer that brings the
+    /// units in. Linear ops of units that are not resident carry [`streamed_weight`] as their
+    /// device state: the plan wraps their memory per step, after the unit arrived, and drops
+    /// the wrap once the device has read it, so the pages can leave the cache.
+    pub units: Vec<(usize, usize)>,
+    pub gate: Option<std::sync::Arc<dyn UnitGate>>,
+}
+
+/// The weight streamer as a decode plan sees it (see [`Graph::units`]).
+pub trait UnitGate: Send + Sync {
+    /// Waits until unit `u` is in memory; it stays in use until [`Self::end`].
+    fn begin(&self, u: usize);
+    fn end(&self, u: usize);
+    /// Whether unit `u` stays in memory (its weights are wrapped once, as without streaming).
+    fn resident(&self, u: usize) -> bool;
+    /// The memory of unit `u`: page-aligned `(address, length)` spans.
+    fn spans(&self, u: usize) -> Vec<(usize, usize)>;
+    /// On-demand parts of unit `u` (its routed experts, read once routing chose them).
+    fn part_count(&self, _u: usize) -> usize {
+        0
+    }
+    /// The memory of part `p` of unit `u`, as page-aligned spans.
+    fn part_spans(&self, _u: usize, _p: usize) -> Vec<(usize, usize)> {
+        Vec::new()
+    }
+    /// Inside `begin(u)`: reads parts `ids` of unit `u` and waits for them.
+    fn need_parts(&self, _u: usize, _ids: &[usize]) {}
+    /// Whether part `p` of unit `u` is still wanted in memory (in use or cached): a backend
+    /// keeping it mapped between steps lets go of it otherwise, so that its pages can be dropped.
+    fn part_cached(&self, _u: usize, _p: usize) -> bool {
+        false
+    }
+    /// Backend state kept as long as the streamed memory (wraps of cached parts).
+    fn device_state(&self) -> Option<&std::sync::Mutex<Option<Box<dyn std::any::Any + Send + Sync>>>> {
+        None
+    }
+}
+
+impl UnitGate for crate::stream::StreamHook {
+    fn begin(&self, u: usize) {
+        crate::stream::StreamHook::begin(self, u)
+    }
+    fn end(&self, u: usize) {
+        self.leave(u)
+    }
+    fn resident(&self, u: usize) -> bool {
+        self.is_resident(u)
+    }
+    fn spans(&self, u: usize) -> Vec<(usize, usize)> {
+        self.unit_spans(u)
+    }
+    fn part_count(&self, u: usize) -> usize {
+        crate::stream::StreamHook::part_count(self, u)
+    }
+    fn part_spans(&self, u: usize, p: usize) -> Vec<(usize, usize)> {
+        crate::stream::StreamHook::part_spans(self, u, p)
+    }
+    fn need_parts(&self, u: usize, ids: &[usize]) {
+        crate::stream::StreamHook::need_parts(self, u, ids)
+    }
+    fn part_cached(&self, u: usize, p: usize) -> bool {
+        crate::stream::StreamHook::part_cached(self, u, p)
+    }
+    fn device_state(&self) -> Option<&std::sync::Mutex<Option<Box<dyn std::any::Any + Send + Sync>>>> {
+        Some(crate::stream::StreamHook::device_state(self))
+    }
+}
+
+/// The device state of a weight that streams ([`Graph::units`]): a marker, nothing is wrapped.
+pub struct StreamedWeight;
+
+/// [`StreamedWeight`] as a [`DeviceWeight`].
+pub fn streamed_weight() -> &'static DeviceWeight {
+    static W: std::sync::OnceLock<DeviceWeight> = std::sync::OnceLock::new();
+    W.get_or_init(|| Box::new(StreamedWeight))
+}
+
+/// Whether `dev` is [`streamed_weight`].
+pub fn is_streamed(dev: &DeviceWeight) -> bool {
+    dev.is::<StreamedWeight>()
 }
 
 impl Graph<'_> {
@@ -370,6 +451,8 @@ impl Graph<'_> {
             states: Vec::new(),
             params: None,
             capture: None,
+            units: Vec::new(),
+            gate: None,
         }
     }
     /// Adds an activation buffer of `n` floats.

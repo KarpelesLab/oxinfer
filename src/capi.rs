@@ -335,6 +335,19 @@ pub unsafe extern "C" fn oxi_engine_info_json(e: *mut OxiEngine) -> *mut c_char 
     guard(std::ptr::null_mut(), || {
         let g = lock(unsafe { engine(e) }?);
         let i = g.info();
+        let dm = crate::stream::DeviceMemory::detect();
+        let st = g.streamer().map(|s| {
+            let (p, o) = (s.plan(), s.options());
+            serde_json::json!({
+                "cache_budget": o.cache_budget,
+                "resident_bytes": p.resident_bytes,
+                "streamed_bytes_per_pass": p.streamed_bytes,
+                "expert_bytes": p.part_bytes,
+                "expert_cache_bytes": p.part_cache_bytes,
+                "flash_bytes_per_sec": o.flash_bytes_per_sec,
+                "gpu_decode": crate::gpu::stream_decode_enabled(),
+            })
+        });
         let v = serde_json::json!({
             "path": i.path.to_string_lossy(),
             "model_type": i.model_type,
@@ -361,6 +374,13 @@ pub unsafe extern "C" fn oxi_engine_info_json(e: *mut OxiEngine) -> *mut c_char 
                 "recurrent": c.recurrent,
             })),
             "decision": g.decision_assets().map(|d| d.info_json()),
+            "stream": st,
+            "device_memory": serde_json::json!({
+                "total": dm.total,
+                "app_available": dm.app_available,
+                "gpu_working_set": dm.gpu_working_set,
+                "stream_budget": dm.budget(),
+            }),
         });
         Ok(out_string(v.to_string()))
     })

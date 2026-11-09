@@ -261,6 +261,8 @@ fn usage() -> ! {
          \x20 --stream-io M        advise (default on Apple) | pread | touch\n\
          \x20 --stream-trace       with --stream, one line of IO statistics per decoding step and per prefill\n\
          \x20 --stream-threads N   with --stream, reader threads (default 2)\n\
+         \x20 --stream-gpu on|off  with --stream, decode on the GPU (default on with GPU decoding): resident\n\
+         \x20                      layers stay wrapped, the others are wrapped per pass as they arrive\n\
          \x20 --expert-cache-mb N  with --stream, page cache kept for recently used MoE experts (which\n\
          \x20                      are read on demand; default: what the budget leaves)\n\
          \x20 --expert-predict     with --stream, read the next MoE layer's guessed experts ahead (Qwen)\n\
@@ -696,6 +698,15 @@ fn parse_args() -> Result<Args> {
                     .split_once(['x', 'X'])
                     .with_context(|| format!("--size expects WIDTHxHEIGHT, got {v}"))?;
                 a.size = Some((w.parse()?, h.parse()?));
+            }
+            "--stream-gpu" => {
+                let v = val()?;
+                oxinfer::gpu::set_stream_decode(match v.as_str() {
+                    "on" | "1" | "true" => Some(true),
+                    "off" | "0" | "false" => Some(false),
+                    "auto" => None,
+                    _ => bail!("--stream-gpu expects on|off|auto, got {v}"),
+                });
             }
             "--gpu-decode" => {
                 let v = val()?;
@@ -1831,6 +1842,20 @@ fn run_qwen(mut args: Args) -> Result<()> {
             args.stream = true;
         }
         args.mmap = true;
+    } else if !args.stream && !args.mmap && !args.no_stream {
+        // Larger than this device holds (a 27B on a 12 GB phone): streamed with the device's
+        // page-cache budget (see `stream::DeviceMemory`).
+        let size = oxinfer::safetensors::checkpoint_bytes(&args.model);
+        if let Some(o) = oxinfer::stream::auto_stream(size) {
+            let budget = o.cache_budget.unwrap_or(0) as f64 / 1e9;
+            args.cache_budget_gb = Some(args.cache_budget_gb.unwrap_or(budget));
+            eprintln!(
+                "[the {:.1} GB checkpoint does not fit in this device's memory: streaming it (--stream --cache-budget-gb {:.1})]",
+                size as f64 / 1e9,
+                args.cache_budget_gb.unwrap()
+            );
+            args.stream = true;
+        }
     }
     let eos = config::load_eos_ids(&args.model);
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
@@ -1872,10 +1897,17 @@ fn run_qwen(mut args: Args) -> Result<()> {
         && !args.no_draft
         && args.save_quantized.is_none()
         && !(args.tools || args.dump_logits.is_some() || args.print_prompt || iv_requested(&args.iv))
-        && oxinfer::qwen_mtp::by_default(&args.model)
+        && (oxinfer::qwen_mtp::by_default(&args.model) || (args.stream && model.cfg.num_experts.unwrap_or(0) == 0))
         && oxinfer::qwen_mtp::mtp_prefix(&files).is_some()
     {
-        eprintln!("[MTP speculative decoding: this model's default (--no-draft for plain decoding)]");
+        eprintln!(
+            "[MTP speculative decoding: {} (--no-draft for plain decoding)]",
+            if args.stream {
+                "the default when streaming, where a pass costs about the same for 1 or 9 tokens"
+            } else {
+                "this model's default"
+            }
+        );
         args.mtp = true;
     }
     // Converted checkpoints keep the MTP layer (loading it marks its tensors for writing).
