@@ -820,14 +820,19 @@ impl QMat for F32Mat<'_> {
     fn bytes(&self) -> usize {
         self.m.len() * 4
     }
+    // Float-stored: the driver takes the f32 GEMM at any row count, never the int8 decode
+    // kernels (whose row limit, `kernels::decode_max_tokens`, speculative decoding raises).
+    fn dense(&self) -> bool {
+        true
+    }
     fn dequantize_rows(&self, r0: usize, r1: usize, out: &mut [f32]) {
         out[..(r1 - r0) * self.n_in].copy_from_slice(&self.m[r0 * self.n_in..r1 * self.n_in]);
     }
     unsafe fn rows_t1(&self, _: &QAct, _: usize, _: *mut f32, _: usize, _: usize) {
-        unreachable!("f32 matmuls always run with at least 8 rows")
+        unreachable!("f32 matmuls run on the GEMM (dense)")
     }
     unsafe fn rows_tc(&self, _: &QAct, _: usize, _: usize, _: *mut f32, _: usize, _: usize) {
-        unreachable!("f32 matmuls always run with at least 8 rows")
+        unreachable!("f32 matmuls run on the GEMM (dense)")
     }
 }
 
@@ -973,5 +978,28 @@ impl Rng {
 
     pub fn normals(&mut self, n: usize) -> Vec<f32> {
         (0..n).map(|_| self.normal()).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// f32 matmuls stay on the GEMM even when speculative decoding has raised the decode-kernel
+    /// row limit above their (padded) row count.
+    #[test]
+    fn f32_matmul_ignores_decode_row_limit() {
+        let (n_out, n_in, t) = (24, 64, 9);
+        let m: Vec<f32> = (0..n_out * n_in).map(|i| ((i * 7 % 13) as f32 - 6.0) / 8.0).collect();
+        let x: Vec<f32> = (0..t * n_in).map(|i| ((i * 5 % 11) as f32 - 5.0) / 4.0).collect();
+        let mat = F32Mat { m: &m, n_out, n_in };
+        let mut y = vec![0f32; t * n_out];
+        crate::kernels::matmul_quant_multi_at(&mut [(&mat, &mut y[..])], &x, t, 16);
+        for r in 0..t {
+            for o in 0..n_out {
+                let want: f64 = (0..n_in).map(|k| m[o * n_in + k] as f64 * x[r * n_in + k] as f64).sum();
+                assert!((y[r * n_out + o] as f64 - want).abs() < 1e-3, "row {r} out {o}");
+            }
+        }
     }
 }
