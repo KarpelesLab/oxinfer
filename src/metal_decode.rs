@@ -2981,6 +2981,9 @@ impl MetalPlan<'_> {
         }
         r.cut();
         r.drain();
+        if !self.experts.is_empty() {
+            self.sweep_parts(gate);
+        }
         for (u, _, bufs) in std::mem::take(&mut r.active) {
             for b in bufs {
                 unsafe { (self.f.void)(b, self.f.s_release) };
@@ -3001,6 +3004,34 @@ impl MetalPlan<'_> {
             );
         }
         r.ok
+    }
+
+    /// Releases the kept wraps of every part the streamer no longer caches (after a step, so the
+    /// parts its layers let go of can leave the page cache before the next step).
+    fn sweep_parts(&self, gate: &dyn crate::gpu::decode::UnitGate) {
+        let Some(slot) = gate.device_state() else { return };
+        let mut g = slot.lock().unwrap();
+        let Some(pw) = g.as_mut().and_then(|b| b.downcast_mut::<PartWraps>()) else {
+            return;
+        };
+        let mut dropped: Vec<Id> = Vec::new();
+        for (&u, layer) in pw.map.iter_mut() {
+            layer.retain(|&p, v| {
+                let keep = gate.part_cached(u, p);
+                if !keep {
+                    dropped.extend(v.iter().map(|b| b.2));
+                }
+                keep
+            });
+        }
+        if let Some(r) = &self.be.residency
+            && !dropped.is_empty()
+        {
+            r.update(&dropped, false);
+        }
+        for b in dropped {
+            unsafe { (self.f.void)(b, self.f.s_release) };
+        }
     }
 
     /// Wraps the experts `ids` of `x` (or finds their wraps kept from earlier steps), writes

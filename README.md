@@ -900,7 +900,7 @@ for Qwen3.5.
 ./target/release/oxinfer --model unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL \
     --mtp-from ~/.cache/oxinfer/hub/unsloth--Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf \
     -p "Write a Python function that checks whether a number is prime."
-# little memory: stream with a page-cache budget (CPU decoding)
+# little memory: stream with a page-cache budget (GPU or CPU decoding, measured on the first tokens)
 ./target/release/oxinfer --model unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL --stream --cache-budget-gb 40 -p "Hi"
 ```
 
@@ -4173,7 +4173,7 @@ the plain greedy outputs too.
 
 ### Streaming weights from flash (models larger than RAM)
 
-`--stream` (Qwen3.5 / Qwen3.8, Gemma 4 / Gemma 3 including 26B-A4B's experts, Mistral Large 4, on by default when its checkpoint does not fit in RAM, `--no-stream` / `stream=off` turning that off; implies `--mmap`) runs a model whose weights do not fit in memory
+`--stream` (Qwen3.5 / Qwen3.8, Gemma 4 / Gemma 3 including 26B-A4B's experts, Mistral Large 4, on by default when its checkpoint does not fit in the device's memory, `--no-stream` / `stream=off` turning that off; implies `--mmap`) runs a model whose weights do not fit in memory
 by reading them in place from the mapped file while a reader thread fetches the next layers. It
 is aimed at phones: HauhauCS's Qwen3.8-27B GGUFs (Q2_K_P 10.7 GB, Q4_K_P 17.9 GB) on a 12 GB
 iPhone. Every forward pass reads the units (decoder layers, LM head, MTP layer, draft head)
@@ -4318,22 +4318,148 @@ pages). Prefill streams the weights once per chunk: on the GPU (`--device metal`
 wrapped without copying) a 1138-token prompt on Q4_K_P at 6 GB / 2 GB/s took 13.9 s, near the
 12 s the two passes' IO needs, against 53.7 s on the CPU.
 
-Projected for an iPhone 17 Pro Max, assuming sustained sequential reads of 1-3 GB/s (iPhone NVMe
-reads are usually quoted around 1.5-2.5 GB/s), a page-cache budget of 4-8 GB (the 12 GB device
-minus the OS, the app's own memory and other apps), the measured 90% bandwidth efficiency and
-2.6 tokens per pass (the table's prompt), with CPU decoding:
+#### GPU decoding with streamed weights (mixed GPU / CPU)
+
+With Metal, streamed Qwen3.5 / 3.8 models (dense, MoE and Qwen3.8-Flash-Next) decode on the GPU
+too, single tokens and multi-token MTP verification alike (`--stream-gpu auto|on|off`, engine and
+C API key `stream_gpu`, `gpu::set_stream_decode`):
+
+- The resident set is chosen as for the CPU (the units a round uses most first: the MTP layer,
+  the LM head when drafts share it; then whole decoder layers evenly spaced, so the reader works
+  ahead while they compute) and its weights are wrapped once, as no-copy Metal buffers over the
+  mapping, the same wraps for the single- and multi-token plans. They stay wired.
+- Every other layer is a streamed unit of the plan (`gpu::decode::Graph::units`, `UnitGate`): the
+  step enters the unit (waiting for the reader if it is not there yet), wraps the unit's memory
+  (a few buffers per layer, 0.05-0.2 ms each), encodes the layer into a command buffer of its own
+  and commits it, then enters the next unit while the GPU runs this one. Once the GPU finished a
+  unit its wraps are released and the unit is left, so the evictor can drop its pages; at most two
+  streamed units are in flight. Runs of resident layers share one command buffer.
+- Routed experts (MoE) stay on-demand parts of their layer. The command buffer ends at the expert
+  op: the routing is read back, the chosen experts are read (or found in the part cache) and
+  wrapped, and their addresses go into the op's tables. Wraps of the experts the part cache keeps
+  are kept too (in the queue's residency set), and released when the cache lets the expert go.
+- On the CPU: the MTP drafts (the MTP layer is resident), the embedding lookup, sampling; reading
+  is the reader thread's.
+
+Darwin / Metal facts this rests on (M5 Max, measured with small Swift programs): creating a no-copy
+buffer touches nothing; the first command buffer that uses it wires the whole buffer (about 20 ms
+per GB when the pages are cached; uncached pages are read in at 4-6 GB/s on the way), so units are
+wrapped exactly, never as one buffer over the file. Wired pages survive `msync(MS_INVALIDATE)`:
+after the buffer is released they stay wired for another 50-260 ms (a live buffer keeps them about
+a second after its last use), so the evictor checks that a drop worked and tries again every 100 ms
+(`msync` calls on still-wired pages slowed the reader). The reader no longer touches the pages of
+units the GPU reads, since the GPU maps them itself (touching cost the reader ~60 ms per GB: 0.69
+to 0.89 tok/s on Q2_K_P at 8 GB / 3 GB/s). Because of the release lag, the page cache briefly holds
+up to ~0.25 s of reads (750 MB at 3 GB/s) beyond the budget.
+
+Which device runs a step: dense models decode on the GPU. A MoE step waits for its routing once per
+layer (40 round trips per token on Qwen3.5-35B-A3B, ~1 ms each with the GPU work they wait for),
+which on the M5 Max costs about what decoding on the CPU does, so with `stream_gpu` unset these
+models time their first steps on both (after two warm-up steps each, four measured) and keep the
+faster (`gpu::decode::DeviceChoice`; it prints its decision). Starting a layer that is still being
+read on the CPU was not done: a 9-token verification pass spends ~0.1 s computing on the GPU against
+~1 s of reading at 3 GB/s, so there is nothing for the CPU to hide.
+
+Exactness: a streamed plan runs the same kernels on the same weights as the resident one, so its
+tokens are the resident GPU's. Over 200 greedy tokens of two prompts (code and prose) on Q2_K_P,
+streamed GPU decoding at 8 and 4 GB budgets gave exactly the resident GPU's tokens, and so did MTP
+with fast verification (the default) and with `--exact-verify` (streamed and resident). Qwen3.5-35B-A3B
+streamed on the GPU at 6 GB gave the resident GPU's 200 tokens, and Qwen3.8-Flash-Next UD-Q4_K_XL at
+8 GB / 3 GB/s the resident GPU's 12 tokens. CPU decoding, streamed or not, gives the CPU's tokens
+(identical between the two); those can part from the GPU's at a near-tie, as without streaming (the
+prose prompt did after some tokens on both models), and so can the first steps of a MoE model whose
+device is being measured.
+
+Measured on the M5 Max with the phone's limits emulated (`--cache-budget-gb`, `--flash-mbps`; not
+on a phone), greedy, a short prompt, plain = 24 tokens (12 for Q4_K_P at 4 GB), MTP = 40 tokens
+(cost-aware, up to 8 drafts, 3.25-3.55 tokens per pass), prompt lookup off, CPU decoding on 6
+threads unless noted; load average 6-30 from other jobs. Resident / streamed: what the budget keeps
+resident and what each pass reads (with MTP the MTP layer joins the resident set):
+
+| Model | Budget / flash | Resident / streamed | Plain GPU / CPU | MTP GPU / CPU | MTP, 3 threads: GPU / CPU |
+|---|---|---|---|---|---|
+| Q2_K_P | 4 GB / 1 GB/s | 3.1 / 6.9 GB | 0.14 / 0.14 tok/s | 0.44 / 0.43 tok/s | |
+| Q2_K_P | 6 GB / 2 GB/s | 5.2 / 4.9 GB | 0.37 / 0.36 | 1.13 / 1.15 | |
+| Q2_K_P | 8 GB / 3 GB/s | 7.1 / 2.9 GB | 0.95 / 0.93 (3 threads 0.94) | 2.96 / 3.10 | 3.03 / 2.87 |
+| Q4_K_P | 4 GB / 1 GB/s | 3.0 / 13.9 GB | 0.071 / 0.069 | 0.25 / 0.24 | |
+| Q4_K_P | 6 GB / 2 GB/s | 5.0 / 12.0 GB | 0.154 / 0.147 | 0.55 / 0.51 | |
+| Q4_K_P | 8 GB / 3 GB/s | 7.0 / 10.0 GB | 0.27 / 0.24 (3 threads 0.24) | 0.87 / 0.75 | 0.88 / 0.82 |
+
+Every pass read what the plan says (6.9-7.0 / 4.5-5.1 / 2.9-3.1 GB for Q2_K_P, 13.7-13.9 / 11.9 /
+9.9-10.0 GB for Q4_K_P) and took 1.0-1.15x the emulated reading time: on the Mac both devices are
+flash-bound, the GPU slightly ahead on Q4_K_P. What differs is the compute left over: at 8 GB / 3
+GB/s with MTP the GPU computed 0.10 s (Q2_K_P) / 0.18 s (Q4_K_P) per 9-token pass and waited for
+the flash 89-98% of the time, the CPU 0.46 / 0.83 s on 6 / 3 threads for Q2_K_P (waiting 59 / 27%
+of the time) and 1.5 s on 3 threads for Q4_K_P.
+A phone's CPU, slower than three M5 Max cores, crosses the reading time there; its GPU stays under it
+(see the projection below).
+
+MoE: Qwen3.5-35B-A3B in oxinfer Q4 (20.9 GB; 1.1 GB of dense weights resident, 18.1 GB of routed
+experts read on demand, the rest of the budget a part cache of recently used experts), plain
+decoding, 64 tokens; Qwen3.8-Flash-Next UD-Q4_K_XL (4.5 GB resident: attention, Gated DeltaNet,
+shared experts, routers, hyper-connections, LM head; 78 GB of routed experts on demand; its 29 GB
+n-gram table is read a few rows per token from the mapping, outside the budget), 32 tokens. The page
+cache at exit was within the budget in every run:
+
+| Model | Budget / flash | Expert cache | Experts from the cache | GB read per token | GPU | CPU (6 / 3 threads) |
+|---|---|---|---|---|---|---|
+| 35B-A3B | 4 GB / 1 GB/s | 2.1 GB | 63% | 0.21 | 2.8 tok/s | 3.0 / 2.6 tok/s |
+| 35B-A3B | 6 GB / 2 GB/s | 4.1 GB | 76% | 0.13-0.14 | 5.1 | 5.8 / 5.3 |
+| 35B-A3B | 8 GB / 3 GB/s | 6.1 GB | 84% | 0.09 | 10.0 | 12.3 / 12.1 |
+| Flash-Next | 6 GB / 2 GB/s | 0.65 GB | 0% | 1.2-1.5 | 0.8 | 1.0 / 1.0 |
+| Flash-Next | 8 GB / 3 GB/s | 2.65 GB | 47% | 0.77-0.80 | 1.8 | 1.8 / 2.2 |
+
+Here the CPU wins on the Mac: the GPU spends ~40 ms per 35B-A3B token beyond waiting for the flash
+(40 routing round trips, wrapping newly read experts), the CPU ~20 ms on 6 threads and ~27 on 3,
+which is why `stream_gpu` left unset measures both (it chose the CPU in every run). On a phone,
+with a slower CPU, the measurement may go the other way. Kept expert wraps are released as soon as
+the part cache lets the expert go (checked after every step): an earlier version released them
+only when their layer came round again, which kept a token's worth of experts wired beyond the
+budget (and looked faster: Flash-Next at 6 GB read 0.9 instead of 1.2-1.5 GB per token).
+
+With the CLI defaults for a streamed dense model (MTP, prompt lookup on top) a code prompt on Q2_K_P
+at 8 GB / 3 GB/s decoded 63 tokens at 5.7 tok/s, 6.3 tokens per pass (lookup found nothing to copy
+from a fresh prompt; the same without it).
+
+Defaults from the device (`stream::DeviceMemory`, `stream::auto_stream`): a Qwen or Gemma
+checkpoint streams without being asked when it is larger than the device holds, and the budget is
+picked from the device. Where the OS limits apps (iOS: `os_proc_available_memory`, which the
+increased-memory-limit entitlement raises), the budget is what the app may still use minus 1 GB
+(KV cache, recurrent states, activations, the app itself), at most 60% of the device's memory; on
+other systems streaming starts above 60% of the memory and the budget is 70% of it. With GPU
+decoding the budget is also capped at 85% of Metal's `recommendedMaxWorkingSetSize`, since the
+resident layers stay wired for the GPU. A streamed dense Qwen with an MTP layer drafts with it by
+default (up to 8 drafts, cost-aware; `--no-draft` / `draft=none` for plain decoding), MoE models do
+not (their verification reads the experts of every drafted token). So on a 12 GB iPhone with 6 GB
+left to the app and an 8 GB working set, Qwen3.8-27B Q2_K_P loads with a 4.9 GB budget (4.0 GB of
+it resident), GPU decoding and MTP, without options; `OXINFER_DEVICE_MEM_GB`, `OXINFER_APP_MEM_GB`
+and `OXINFER_GPU_WORKING_SET_GB` override what is detected (to try a phone's defaults elsewhere), and
+`oxi_engine_info_json` reports both the device figures and the streaming plan. In the iOS Simulator
+(the test app in `ios/`, those three variables set to 12 / 6 / 8 GB through `SIMCTL_CHILD_`), the
+27B loaded that way and answered correctly ("Hello there, how are you?"; a functional check only:
+the Simulator's GPU copies the wrapped buffers and runs at 1 token/s).
+
+Projected for an iPhone 17 Pro Max (not measured on a device: no iPhone was available), assuming
+sustained sequential reads of 1-3 GB/s (iPhone NVMe reads are usually quoted around 1.5-2.5 GB/s),
+a page-cache budget of 4-8 GB (the 12 GB device minus the OS, the app's own memory and other apps),
+the measured 90% bandwidth efficiency and the bytes per pass and 3.25 tokens per MTP pass of the
+emulated runs above (tokens per pass depend on the text: 2.4-4.5). A pass then takes the larger of
+its reading time and its compute time. Compute on the phone is an estimate: GPU decoding ~0.4 s per
+9-token pass (the A19 Pro's GPU at a fifth to a sixth of the M5 Max's, which needs 0.10-0.18 s, and
+LPDDR5X bandwidth for the resident weights), CPU decoding ~1.5 s (Q2_K_P) / 2.5 s (Q4_K_P) per
+9-token pass (the M5 Max's 3 cores need 0.83 / 1.5 s; 2 performance + 4 efficiency cores assumed
+1.7x slower):
 
 | Budget | Q2_K_P plain / `--mtp`, 1 GB/s | 2 GB/s | 3 GB/s | Q4_K_P plain / `--mtp`, 1 GB/s | 2 GB/s | 3 GB/s |
 |---|---|---|---|---|---|---|
-| 4 GB | 0.13 / 0.33 | 0.26 / 0.66 | 0.40 / 0.99 | 0.07 / 0.17 | 0.13 / 0.33 | 0.20 / 0.50 |
-| 6 GB | 0.19 / 0.46 | 0.37 / 0.91 | 0.56 / 1.37 | 0.08 / 0.19 | 0.15 / 0.39 | 0.23 / 0.58 |
-| 8 GB | 0.32 / 0.75 | 0.64 / 1.50* | 0.96 / 2.25* | 0.09 / 0.23 | 0.19 / 0.47 | 0.28 / 0.70 |
+| 4 GB | 0.13 / 0.41 | 0.26 / 0.82 | 0.39 / 1.24 | 0.065 / 0.21 | 0.13 / 0.41 | 0.19 / 0.62 |
+| 6 GB | 0.19 / 0.57 | 0.37 / 1.15 | 0.56 / 1.72 | 0.075 / 0.24 | 0.15 / 0.48 | 0.22 / 0.72 |
+| 8 GB | 0.31 / 0.94 | 0.62 / 1.89 | 0.93 / 2.83 (CPU: 2.17*) | 0.09 / 0.29 | 0.18 / 0.57 | 0.27 / 0.86 |
 
-(tokens/s; * where the phone's CPU rather than the flash was the limit with the token-pair
-kernels: on 3 Mac cores a 9-token Q2_K_P verification computed in 2.8 s, and at 8 GB / 3 GB/s the
-cost-aware rounds took 1.48 s against 1.03 s of IO. The multi-token kernels bring that pass to
-about 1.1-1.5 s, so the CPU is no longer far behind the flash; see below.)
-Q2_K_P is the practical choice: about 1 token/s with 6 GB at 2 GB/s, 1.7-1.9 with 8 GB at 3 GB/s.
+(tokens/s with GPU decoding; * where CPU decoding would be compute-bound: at 8 GB / 3 GB/s a pass
+reads in 1.15 s, which the GPU's ~0.4 s keeps up with and an estimated 1.5 s of CPU verification
+does not. Everywhere else both are flash-bound and equal.) Q2_K_P is the practical choice: about 1
+token/s with 6 GB at 2 GB/s and 2-3 with 8 GB at 3 GB/s, with MTP (the default when streaming).
 
 With the multi-token kernels (same prompt, 40 tokens, base = the commit before them; best of
 two interleaved rounds on a machine shared with other jobs, which also read the same model files
