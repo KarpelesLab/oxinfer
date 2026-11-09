@@ -3934,7 +3934,9 @@ jobs):
 | `--quant q8` | 7.5 tok/s | 15.2 tok/s (3.75 tok/forward) | 10.5 tok/s (2.55 tok/forward) | 94% / 59% |
 | `--quant q4` | 14.6 tok/s | 24.0 tok/s | 14.7-16.1 tok/s | 94% / 57% |
 
-Q4 gains less because a 4-token Q4 pass costs about twice a one-token pass (SDOT-bound). On
+Q4 gains less because a 4-token Q4 pass costs about twice a one-token pass (SDOT-bound). (The
+multi-token CPU passes have since become cheaper: see
+[Multi-token passes and MoE experts on the CPU](#multi-token-passes-and-moe-experts-on-the-cpu).) On
 Qwen3.5-0.8B every draft step reads the 248k-row LM head (a third of the model), so `--mtp`
 gains ~20-25% on code and loses a little on prose; a trimmed draft head (`DraftHead`: a
 `[V_draft, H]` matrix plus a draft-to-target id map, FastMTP style) can replace it through the
@@ -3952,6 +3954,55 @@ sidecar's layer, token embedding and 32k-row head replace the target's, as in Ha
 llama.cpp patch (`QwenMtp::attach_sidecar` in the library). With HauhauCS's Qwen3.8-27B Q4_K_P
 GGUF, greedy output with the embedded MTP layer or the FastMTP sidecar is token-for-token the
 plain greedy output.
+
+### Multi-token passes and MoE experts on the CPU
+
+Speculative verification (and prompts shorter than 8 tokens) runs on the CPU's decode kernels,
+whose rows are bit-identical whatever the token count, so verification logits equal one-token
+logits. Two lossless changes (after the analysis of llama-modchip in
+[docs/llama-modchip](docs/llama-modchip/README.md)) made those passes cheaper:
+
+- **Column groups for the blocks-of-32 formats.** GGUF Q8_0, Q4_0, IQ4_NL, MXFP4, Q4_1, Q5_0,
+  Q5_1 and oxinfer's Q4 used to take tokens in pairs (each block unpacked once per pair, plus a
+  one-token pass for an odd count). They now run the one-token kernel instantiated for up to 8
+  tokens on column groups (9 = 5 + 4, 16 = 8 + 8; narrower when the row is long enough that a
+  group's int8 activations would not stay in L1), with rows in 64 KB tiles. Each token's
+  arithmetic is the one-token kernel's, so rows stay bit-identical. The K-quants and i-quants
+  already had such kernels; oxinfer's int8 format gained nothing (its blocks need no unpacking)
+  and keeps the pairs. Single thread, 4096 x 4096, ns per 256 weights per token, token pairs ->
+  column groups (two interleaved runs, a loaded machine):
+
+  | Format | 3 tokens | 4 | 5 | 8 | 15 |
+  |---|---|---|---|---|---|
+  | Q8_0 | 8.6 -> 6.6 | 7.2 -> 5.6 | 8.0 -> 5.0 | 7.7 -> 5.6 | 8.2 -> 6.0 |
+  | Q4_0 | 7.6 -> 6.1 | 6.4 -> 5.5 | 7.1 -> 6.3 | 6.4 -> 6.0 | 7.2 -> 7.0 |
+  | MXFP4 | 9.1 -> 6.8 | 7.4 -> 5.9 | 9.1 -> 5.5 | 7.8 -> 6.0 | 8.6 -> 6.0 |
+  | Q5_0 | 13.7 -> 9.1 | 11.5 -> 8.1 | 12.0 -> 7.5 | 12.3 -> 6.7 | 12.8 -> 7.3 |
+  | Q4 (`--quant q4`) | 7.1 -> 6.1 | 6.4 -> 5.8 | 6.3 -> 5.7 | 6.6 -> 6.1 | 6.4 -> 6.7 |
+
+  A whole verification pass of Qwen3-8B Q8_0 (18 threads, recording forward plus LM head,
+  `examples/pass_bench.rs`, best of 7 interleaved): 3 tokens 49 -> 41 ms, 4 tokens 49 -> 41 ms,
+  8 tokens 83 -> 65 ms (one token: 34 ms). With its DSpark draft on the CPU the decoding gained
+  12-23% on prose (40 -> 44-49 tok/s) and was within noise on code, where the cost-aware drafting
+  now drafts longer blocks; greedy output identical. On other CPUs the portable GGUF kernel takes
+  the same column groups (x86-64 under Rosetta, which runs the portable path: Q8_0 / Q4_K at
+  8 tokens 2.2-2.3x faster per token).
+- **MoE experts in one batch per stage.** Decode and verification passes of the MoE models
+  (Qwen3.5 / 3.6 MoE, Gemma 4 26B-A4B, Mistral Large 4, DeepSeek V4) quantize the input once,
+  build the expert -> tokens grouping once for gate, up and down, and run the gate/up matmuls of
+  every chosen expert, and of the shared expert, as one parallel region, then all down matmuls as
+  another (they ran one region per matmul: Qwen3.5-35B-A3B decode went from 521 to 161 regions
+  per token). This applies only when every matmul would run on the CPU decode kernels anyway (no
+  accelerator, LoRA or float weights), so no matmul run elsewhere ever reads the shared quantized
+  input. Qwen3.5-35B-A3B Q4, passes of 1 / 2 / 4 / 7 tokens, per-expert regions -> batched (12
+  threads, best of 9 interleaved): 35 -> 29, 38 -> 32, 52 -> 45, 81 -> 66 ms. End to end (CPU
+  decode, 128 tokens, alternating binaries on a loaded machine) Gemma 4 26B-A4B Q4_0 went from
+  55.3-55.8 to 56.2-59.8 tok/s; Qwen3.5-35B-A3B's runs (60-69 tok/s) were within the noise.
+
+`examples/kernel_bench.rs` (formats, threads, shape, token counts) and `examples/pass_bench.rs`
+(`pairs` / `auto` / `seq` / `old` modes; `PASS_COMPARE=1` asserts that all modes give bit-identical
+logits) measure these. Prefill (8 tokens and more) keeps its f32 GEMM: switching it to the int8
+kernels would change its results.
 
 ### Streaming weights from flash (models larger than RAM)
 
@@ -4020,6 +4071,11 @@ and the speculative greedy output equals plain greedy; no exactness switch is ne
   extra instructions to apply the scales. On the M5's cores SMMLA issues at half SDOT's rate
   for twice the multiply-adds (5 vs 10.5 G instructions/s per core, ~9-cycle latency) and does
   not overlap other vector work, so it buys nothing for the per-32 f32-scale formats.
+
+The blocks-of-32 formats (Q8_0, Q4_0, IQ4_NL, MXFP4, Q4_1, Q5_0, Q5_1) and oxinfer's Q4 run
+their one-token kernels on column groups of up to 8 tokens instead (see
+[Multi-token passes and MoE experts on the CPU](#multi-token-passes-and-moe-experts-on-the-cpu));
+`Pairs` turns that off too.
 
 `kernels::set_multi_token_kernels(MultiTokenKernels::{Auto, Dot, Pairs})` (or
 `OXINFER_MULTI=auto|dot|pairs`) picks them (`Pairs` is the previous behaviour, for comparisons);
