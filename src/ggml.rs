@@ -1109,7 +1109,7 @@ impl QMat for GgufMatrix {
         #[cfg(not(target_arch = "aarch64"))]
         {
             let _ = t;
-            None
+            (!self.kind.is_float()).then_some(false)
         }
     }
     unsafe fn rows_multi(&self, xa: &QAct, pairs: Option<&PairAct>, t: usize, y: *mut f32, r0: usize, r1: usize) -> bool {
@@ -1119,8 +1119,23 @@ impl QMat for GgufMatrix {
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
-            let _ = (xa, pairs, t, y, r0, r1);
-            false
+            // The portable kernel on column groups (each block decoded once per group; every
+            // token's arithmetic is the one-token kernel's).
+            let _ = pairs;
+            if self.kind.is_float() {
+                return false;
+            }
+            let n = self.n_out;
+            crate::kernels::col_tiles(t, self.n_in, r0, r1, self.row_bytes(), |c0, c1, ta, tb| {
+                let yg = unsafe { y.add(c0 * n) };
+                macro_rules! go {
+                    ($TC:literal) => {
+                        unsafe { self.rows_impl::<$TC>(xa, c0, yg, n, ta, tb) }
+                    };
+                }
+                crate::kernels::with_cols!(c1 - c0, go)
+            });
+            true
         }
     }
     unsafe fn rows_tc(&self, xa: &QAct, c0: usize, tc: usize, y: *mut f32, r0: usize, r1: usize) {
@@ -1451,9 +1466,11 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn multi_token_kernels_are_batch_invariant() {
-        let (n_out, n_in) = (21usize, 3 * QK_K);
+        let n_out = 21usize;
         let mm = crate::kernels::cpu_has_i8mm();
         for kind in GgmlType::ALL.into_iter().filter(|k| neon::multi_kind(*k, 2).is_some()) {
+            // Block-of-32 formats get a block count that is not a multiple of 4 (tail loops).
+            let n_in = if kind.block_size() == QK_K { 3 * QK_K } else { 3 * QK_K + 96 };
             let mut seed = 31 + kind.id() as u64;
             let m = GgufMatrix::from_bytes(kind, &random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed), n_out, n_in).unwrap();
             for t in 2..=crate::ggml::neon::MULTI_MAX {
@@ -1477,6 +1494,30 @@ mod tests {
                     }
                     assert_eq!(bits(&y), bits(&y1), "{kind} t={t} smmla={}", p.is_some());
                 }
+            }
+        }
+    }
+
+    /// Multi-token decode passes through the matmul driver (whatever kernels this target picks:
+    /// NEON multi-token or column groups, the portable column groups elsewhere, token pairs) give
+    /// every token bit-identical rows to a one-token pass, for every quantized type.
+    #[test]
+    fn multi_token_passes_are_batch_invariant() {
+        crate::pool::init(3);
+        let n_out = 37usize;
+        for kind in GgmlType::ALL.into_iter().filter(|k| !k.is_float()) {
+            let n_in = if kind.block_size() == QK_K { 3 * QK_K } else { 3 * QK_K + 96 };
+            let mut seed = 13 + kind.id() as u64;
+            let m = GgufMatrix::from_bytes(kind, &random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed), n_out, n_in).unwrap();
+            let run = |x: &[f32], t: usize| {
+                let mut y = vec![0f32; t * n_out];
+                crate::kernels::matmul_quant_multi_at(&mut [(&m, &mut y[..])], x, t, 15);
+                y.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            };
+            for t in [2usize, 3, 5, 8, 9, 13, 15] {
+                let x: Vec<f32> = (0..t * n_in).map(|_| (lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0).collect();
+                let alone: Vec<u32> = (0..t).flat_map(|c| run(&x[c * n_in..(c + 1) * n_in], 1)).collect();
+                assert_eq!(run(&x, t), alone, "{kind} t={t}");
             }
         }
     }

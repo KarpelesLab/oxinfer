@@ -6,7 +6,9 @@
 //! Multi-token passes (speculative verification, 2-16 tokens) have their own kernels that unpack
 //! each super-block once for all tokens: SDOT one row at a time, or SMMLA (i8mm) on 2x2 tiles of
 //! rows and tokens for the formats with integer scales per 16. Both repeat the one-token kernels'
-//! f32 operations in the same order, so results are bit-identical whatever the token count. On
+//! f32 operations in the same order, so results are bit-identical whatever the token count. The
+//! blocks-of-32 formats (Q8_0, Q4_0, ...) instead run their one-token kernels instantiated for up
+//! to 8 tokens on column groups (9 = 5 + 4), each block unpacked once per group. On
 //! Apple's 2025 cores SMMLA issues at half SDOT's rate for twice the multiply-adds and does not
 //! overlap other vector work, so it only pays where SDOT needs many extra instructions to apply
 //! per-16 scales.
@@ -1355,8 +1357,72 @@ const SMMLA_MIN_TOKENS: usize = 4;
 /// Whether `kind` has multi-token kernels (`Some`), and whether they use SMMLA for `t` tokens
 /// with the pair-interleaved activations (`Some(true)`).
 pub(super) fn multi_kind(kind: GgmlType, t: usize) -> Option<bool> {
+    if cols_kind(kind) {
+        return Some(false);
+    }
     let sc16 = !matches!(kind, GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::IQ4_XS);
     has_multi(kind).then_some(sc16 && t >= SMMLA_MIN_TOKENS)
+}
+
+/// The blocks-of-32 formats, whose one-token kernels take a compile-time token count: their
+/// multi-token passes run those kernels on column groups (`cols_multi`).
+fn cols_kind(kind: GgmlType) -> bool {
+    matches!(
+        kind,
+        GgmlType::Q8_0 | GgmlType::Q4_0 | GgmlType::IQ4_NL | GgmlType::MXFP4 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1
+    )
+}
+
+/// `x` from token `c0` on.
+#[inline(always)]
+unsafe fn act_at(x: &Act, c0: usize) -> Act {
+    let n = x.n_in;
+    Act {
+        q: x.q.add(c0 * n),
+        s: x.s.add(c0 * n / 32),
+        f: x.f.add(c0 * n / 32),
+        h: x.h.add(c0 * n / 16),
+        i: x.i.add(c0 * n / 32),
+        n_in: n,
+    }
+}
+
+/// Multi-token pass of a blocks-of-32 format: rows in tiles, each tile against every column
+/// group with the one-token kernel instantiated for that group's width (each weight block is
+/// unpacked once per group). Every token's arithmetic is the one-token kernel's, so the rows are
+/// bit-identical to `rows::<1>`.
+unsafe fn cols_multi(m: &GgufMatrix, x: &Act, t: usize, y: *mut f32, ys: usize, r0: usize, r1: usize) {
+    macro_rules! kern {
+        ($TC:literal) => {
+            match m.kind {
+                GgmlType::Q8_0 => q8_0::<$TC> as RowFn<$TC>,
+                GgmlType::Q4_0 => q32::<$TC, Q4_0>,
+                GgmlType::IQ4_NL => q32::<$TC, IQ4_NL>,
+                GgmlType::MXFP4 => q32::<$TC, MXFP4>,
+                GgmlType::Q4_1 => q32::<$TC, Q4_1>,
+                GgmlType::Q5_0 => q32::<$TC, Q5_0>,
+                _ => q32::<$TC, Q5_1>,
+            }
+        };
+    }
+    let rb = m.row_bytes();
+    let base = m.data.as_ptr();
+    crate::kernels::col_tiles(t, m.n_in, r0, r1, rb, |c0, c1, ta, tb| {
+        let xg = act_at(x, c0);
+        let yg = y.add(c0 * ys);
+        macro_rules! go {
+            ($TC:literal) => {{
+                let f = kern!($TC);
+                for r in ta..tb {
+                    let o = f(base.add(r * rb), m.n_in, &xg);
+                    for (c, v) in o.iter().enumerate() {
+                        *yg.add(c * ys + r) = *v;
+                    }
+                }
+            }};
+        }
+        crate::kernels::with_cols!(c1 - c0, go)
+    });
 }
 
 /// Whether `kind` has multi-token kernels.
@@ -1394,6 +1460,10 @@ pub(super) unsafe fn rows_multi(
     r1: usize,
 ) -> bool {
     debug_assert!((2..=MULTI_MAX).contains(&t));
+    if cols_kind(m.kind) {
+        cols_multi(m, x, t, y, ys, r0, r1);
+        return true;
+    }
     macro_rules! go {
         ($F:ty) => {
             match p {

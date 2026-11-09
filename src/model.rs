@@ -784,6 +784,40 @@ pub(crate) fn linear_grouped(ls: &[&Lin], segs: &[(usize, usize)], n_out: usize,
     }
 }
 
+/// Whether [`linear_multi`] runs an `n_out x n_in` matmul of `t` rows of `l` on the CPU decode
+/// kernels (so [`linear_batch_q`] can take it): not with an active LoRA, an accelerator that
+/// wants the op, float storage, or more than [`decode_max_tokens`] rows (the f32 GEMM).
+pub(crate) fn cpu_decode_kernels(l: &Lin, n_out: usize, n_in: usize, t: usize) -> bool {
+    if l.active_lora().is_some() || t > decode_max_tokens() || crate::gpu::active().is_some_and(|b| b.wants(n_out, n_in, t)) {
+        return false;
+    }
+    match &l.w {
+        Weight::Q8(_) | Weight::Q4(_) => true,
+        Weight::Gguf(m) => !m.kind.is_float(),
+        Weight::Bf16(..) => false,
+    }
+}
+
+/// Matmuls with their own quantized inputs on the CPU, one parallel region per storage format
+/// (see [`matmul_quant_batch`]): job `(l, i, y)` is `y = xs[i] l^T`. Every job must pass
+/// [`cpu_decode_kernels`] (checked by the caller).
+pub(crate) fn linear_batch_q(xs: &[crate::quant::QAct], jobs: &mut [(&Lin, usize, &mut [f32])]) {
+    let mut q8: Vec<(&QMatrix, usize, &mut [f32])> = Vec::new();
+    let mut q4: Vec<(&Q4Matrix, usize, &mut [f32])> = Vec::new();
+    let mut gg: Vec<(&GgufMatrix, usize, &mut [f32])> = Vec::new();
+    for (l, i, y) in jobs.iter_mut() {
+        match &l.w {
+            Weight::Q8(m) => q8.push((m, *i, &mut **y)),
+            Weight::Q4(m) => q4.push((m, *i, &mut **y)),
+            Weight::Gguf(m) => gg.push((m, *i, &mut **y)),
+            Weight::Bf16(..) => panic!("bf16 weights in a batched quantized matmul"),
+        }
+    }
+    matmul_quant_batch(xs, &mut q8);
+    matmul_quant_batch(xs, &mut q4);
+    matmul_quant_batch(xs, &mut gg);
+}
+
 pub(crate) fn linear(l: &Lin, n_out: usize, n_in: usize, x: &[f32], t: usize, y: &mut [f32]) {
     linear_multi(&mut [(l, n_out, y)], n_in, x, t);
 }
@@ -1594,6 +1628,7 @@ impl<'a> Model<'a> {
                 &mut e,
                 self.stream.as_ref().map(|_| &need as &dyn Fn(&[usize])),
                 hook.as_ref(),
+                None,
             );
             rmsnorm_f32w_rows_inplace(&mut e, h, &m.ln_post, eps);
             add_inplace(&mut d, &e);

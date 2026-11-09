@@ -342,6 +342,27 @@ pub fn quantize_act(x: &[f32], t: usize, n_in: usize) -> QAct {
     }
 }
 
+impl QAct {
+    /// Rows `rows` (in that order) as their own `QAct`: the same values as quantizing those rows
+    /// of the input alone, since every row is quantized on its own.
+    pub fn gather(&self, rows: &[usize]) -> QAct {
+        let n = self.n_in;
+        let bpr = n / QBLOCK;
+        fn pick<T: Copy>(v: &[T], per: usize, rows: &[usize]) -> Vec<T> {
+            rows.iter().flat_map(|&r| v[r * per..(r + 1) * per].iter().copied()).collect()
+        }
+        QAct {
+            q: pick(&self.q, n, rows),
+            scales: pick(&self.scales, bpr, rows),
+            sums: pick(&self.sums, bpr, rows),
+            fsums: pick(&self.fsums, bpr, rows),
+            hsums: pick(&self.hsums, 2 * bpr, rows),
+            t: rows.len(),
+            n_in: n,
+        }
+    }
+}
+
 /// Quantized activations interleaved per token pair for 2x2 int8 matrix-multiply instructions
 /// (SMMLA): pair `p` holds tokens `2p` and `2p + 1` (an odd count repeats the last token).
 /// `q`: per 8 values, 8 of the first token then 8 of the second (`2 * n_in` bytes per pair);

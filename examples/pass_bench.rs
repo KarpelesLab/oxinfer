@@ -4,8 +4,10 @@
 //! hits them alike):
 //! `cargo run --release --example pass_bench -- MODEL [THREADS] [TOKENS,..] [REPEATS] [MODES]`
 //! (THREADS: `N`, `NeM` with M of them at background QoS, or `Nb` all at background QoS; MODES:
-//! comma-separated `pairs`, `dot`, `auto`, default `pairs,auto`). Also prints the weight types
-//! of a GGUF checkpoint; `PASS_PROFILE=1` adds a per-operation profile of the last pass.
+//! comma-separated `pairs`, `dot`, `auto`, `seq` (auto with the experts of MoE passes run one
+//! matmul at a time), default `pairs,auto`). Also prints the weight types of a GGUF checkpoint;
+//! `PASS_PROFILE=1` adds a per-operation profile of the last pass, `PASS_COMPARE=1` checks that
+//! every mode's output is bit-identical to the first one's.
 
 use oxinfer::config::QwenConfig;
 use oxinfer::kernels::{MultiTokenKernels, set_multi_token_kernels};
@@ -40,6 +42,7 @@ fn main() -> anyhow::Result<()> {
         .map(|s| s.parse())
         .collect::<Result<_, _>>()?;
     let repeats: usize = args.next().map_or(Ok(3), |t| t.parse())?;
+    // `seq`: `auto` with the routed experts of MoE passes run one matmul at a time.
     let modes: Vec<(String, MultiTokenKernels)> = args
         .next()
         .unwrap_or_else(|| "pairs,auto".into())
@@ -53,6 +56,7 @@ fn main() -> anyhow::Result<()> {
             (m.to_string(), k)
         })
         .collect();
+    let compare = std::env::var_os("PASS_COMPARE").is_some();
     oxinfer::pool::init_with(po);
     oxinfer::kernels::set_decode_max_tokens(15);
     if oxinfer::gguf::is_gguf(&path) {
@@ -77,12 +81,18 @@ fn main() -> anyhow::Result<()> {
     let prof = std::env::var_os("PASS_PROFILE").is_some();
     for &t in &counts {
         let toks: Vec<u32> = (0..t as u32).map(|i| 2000 + i * 11).collect();
-        // One-token passes use the same kernels whatever the mode.
-        let ms = if t == 1 { &modes[..1] } else { &modes[..] };
+        // One-token passes use the same kernels whatever the mode (except `seq`).
+        let ms = if t == 1 && !modes.iter().any(|m| m.0 == "seq") {
+            &modes[..1]
+        } else {
+            &modes[..]
+        };
+        let mut first: Option<Vec<f32>> = None;
         let mut times: Vec<Vec<f64>> = vec![Vec::new(); ms.len()];
         for i in 0..repeats {
             for (mi, (_, mode)) in ms.iter().enumerate() {
                 set_multi_token_kernels(*mode);
+                oxinfer::kernels::set_moe_batched(ms[mi].0 != "seq");
                 if prof && i + 1 == repeats {
                     oxinfer::prof::reset();
                 }
@@ -92,6 +102,17 @@ fn main() -> anyhow::Result<()> {
                 let l = model.logits(&hs, t);
                 std::hint::black_box(&l);
                 times[mi].push(t0.elapsed().as_secs_f64());
+                // PASS_COMPARE: every mode's output must match the first one bit for bit.
+                if compare {
+                    match &first {
+                        None => first = Some(l.clone()),
+                        Some(f) => assert!(
+                            f.iter().zip(&l).all(|(a, b)| a.to_bits() == b.to_bits()),
+                            "mode {} differs at {t} tokens",
+                            ms[mi].0
+                        ),
+                    }
+                }
                 if prof && i + 1 == repeats {
                     eprintln!("[{} profile]", ms[mi].0);
                     oxinfer::prof::report(*times[mi].last().unwrap(), t);

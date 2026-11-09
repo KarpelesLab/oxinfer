@@ -1,7 +1,8 @@
 //! Routed experts of a mixture-of-experts layer, shared by the model families that have them
 //! (Qwen3.5 / 3.6 MoE: SiLU experts; Gemma 4 26B-A4B: GELU-tanh experts). The router stays with
-//! each model (they differ); this runs the chosen experts for given routes: per token on the
-//! decode kernels for short passes, as one grouped matmul for prefill, or on the accelerator.
+//! each model (they differ); this runs the chosen experts (and any shared expert) for given
+//! routes: on the decode kernels for short passes (one batch per stage for all experts), as one
+//! grouped matmul for prefill, or on the accelerator.
 
 use crate::kernels::*;
 use crate::model::{Lin, Quant, linear, linear_grouped, linear_multi, load_lin, load_lin_experts};
@@ -44,6 +45,41 @@ impl Act {
 /// Called with the routed experts of a MoE pass before they run (weight streaming reads them on
 /// demand).
 pub(crate) type NeedExperts<'f> = Option<&'f dyn Fn(&[usize])>;
+
+/// A shared expert beside the routed ones, on the same input: `y = scale * down(act(gate x) *
+/// up x)` per token (overwriting `y`), before the routed experts add theirs.
+pub(crate) struct Shared<'s, 'a> {
+    pub gate: &'s Lin<'a>,
+    pub up: &'s Lin<'a>,
+    pub down: &'s Lin<'a>,
+    pub inter: usize,
+    pub act: Act,
+    /// Neuron edits of target `Shared`.
+    pub hook: Option<&'s crate::intervene::NeuronHook<'s>>,
+    /// Per-token output scale (Qwen's sigmoid gate).
+    pub scale: Option<Vec<f32>>,
+}
+
+impl Shared<'_, '_> {
+    /// The shared expert alone over `t` rows of `x` into `y`.
+    fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32]) {
+        let mi = self.inter;
+        let mut g = vec![0f32; t * mi];
+        let mut u = vec![0f32; t * mi];
+        linear_multi(&mut [(self.gate, mi, &mut g[..]), (self.up, mi, &mut u[..])], h, x, t);
+        self.act.apply(&mut g, &mut u);
+        if let Some(k) = self.hook {
+            k.apply(crate::intervene::Target::Shared, &mut g, mi);
+        }
+        linear(self.down, h, mi, &g, t, y);
+        self.apply_scale(t, h, y);
+    }
+    fn apply_scale(&self, t: usize, h: usize, y: &mut [f32]) {
+        if let Some(s) = &self.scale {
+            for_chunks(y, h, t > 1, |ti, row| scale_inplace(row, s[ti]));
+        }
+    }
+}
 
 /// An expert's input projections: fused (`experts.gate_up_proj`, `[2 * inter, H]`, gate rows then
 /// up rows) or separate (`experts.{e}.gate_proj` / `up_proj`, as transformers saves them).
@@ -247,10 +283,178 @@ impl<'a> Experts<'a> {
         be.moe(x, t, h, mi, routes, dev, y)
     }
 
+    /// Decode and short passes (speculative verification) on the CPU decode kernels with each
+    /// stage of every chosen expert in one parallel region: `x` is quantized once and each
+    /// expert gets the rows of its tokens (the expert -> tokens grouping is built once for gate,
+    /// up and down), then all gate/up matmuls run as one batch, then all down matmuls (their
+    /// inputs quantized together), the shared expert's in the same batches. Every row is
+    /// bit-identical to running the experts one at a time (activations are quantized per row,
+    /// and the decode kernels are batch-invariant). False, with nothing done, when some expert
+    /// would not take the CPU decode kernels (see [`crate::model::cpu_decode_kernels`]): an
+    /// accelerator, a LoRA or float weights then get the per-expert path, so a matmul handled
+    /// elsewhere never consumes these quantized inputs.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_batched(
+        &self,
+        x: &[f32],
+        t: usize,
+        h: usize,
+        routes: &[Vec<(usize, f32)>],
+        y: &mut [f32],
+        hook: Option<&crate::intervene::NeuronHook>,
+        shared: Option<&Shared>,
+    ) -> bool {
+        use crate::intervene::Target;
+        use crate::model::{cpu_decode_kernels, linear_batch_q};
+        let mi = self.inter;
+        let mut used: Vec<usize> = routes.iter().flatten().map(|r| r.0).collect();
+        used.sort_unstable();
+        used.dedup();
+        let toks: Vec<Vec<usize>> = used
+            .iter()
+            .map(|&e| (0..t).filter(|&ti| routes[ti].iter().any(|r| r.0 == e)).collect())
+            .collect();
+        let mut ok = shared.is_none_or(|s| {
+            let si = s.inter;
+            cpu_decode_kernels(s.gate, si, h, t) && cpu_decode_kernels(s.up, si, h, t) && cpu_decode_kernels(s.down, h, si, t)
+        });
+        for (&e, tk) in used.iter().zip(&toks) {
+            let n = tk.len();
+            ok &= match &self.gate_up[e] {
+                GateUp::Fused(l) => cpu_decode_kernels(l, 2 * mi, h, n),
+                GateUp::Split(g, u) => cpu_decode_kernels(g, mi, h, n) && cpu_decode_kernels(u, mi, h, n),
+            } && cpu_decode_kernels(&self.down[e], h, mi, n);
+        }
+        if !ok {
+            return false;
+        }
+        // Inputs: all of x (experts that every token uses), then each other expert's rows.
+        let xa = crate::quant::quantize_act(x, t, h);
+        let mut xs = vec![];
+        let input: Vec<usize> = toks
+            .iter()
+            .map(|tk| {
+                if tk.len() == t {
+                    0
+                } else {
+                    xs.push(xa.gather(tk));
+                    xs.len()
+                }
+            })
+            .collect();
+        xs.insert(0, xa);
+        // Gate/up: per expert [n, 2 mi] (fused: rows of gate then up) or gate [n, mi] then up [n, mi].
+        let mut gu: Vec<Vec<f32>> = toks.iter().map(|tk| vec![0f32; tk.len() * 2 * mi]).collect();
+        // The shared expert's gate then up ([t, inter] each).
+        let mut sgu = vec![0f32; shared.map_or(0, |s| 2 * t * s.inter)];
+        let mut jobs: Vec<(&Lin, usize, &mut [f32])> = Vec::with_capacity(2 * used.len() + 2);
+        if let Some(s) = shared {
+            let (g, u) = sgu.split_at_mut(t * s.inter);
+            jobs.push((s.gate, 0, g));
+            jobs.push((s.up, 0, u));
+        }
+        for ((&e, &i), o) in used.iter().zip(&input).zip(gu.iter_mut()) {
+            match &self.gate_up[e] {
+                GateUp::Fused(l) => jobs.push((l, i, &mut o[..])),
+                GateUp::Split(g, u) => {
+                    let half = o.len() / 2;
+                    let (og, ou) = o.split_at_mut(half);
+                    jobs.push((g, i, og));
+                    jobs.push((u, i, ou));
+                }
+            }
+        }
+        linear_batch_q(&xs, &mut jobs);
+        drop(jobs);
+        // Activations of all experts, one after another ([sum n, mi]).
+        let total: usize = toks.iter().map(|tk| tk.len()).sum();
+        let mut a = vec![0f32; total * mi];
+        let mut row = 0;
+        for ((&e, tk), gu) in used.iter().zip(&toks).zip(gu.iter_mut()) {
+            let n = tk.len();
+            let ae = &mut a[row * mi..(row + n) * mi];
+            match &self.gate_up[e] {
+                GateUp::Fused(_) => {
+                    for (ar, r) in ae.chunks_mut(mi).zip(gu.chunks_mut(2 * mi)) {
+                        let (g, u) = r.split_at_mut(mi);
+                        self.act.apply(g, u);
+                        ar.copy_from_slice(g);
+                    }
+                }
+                GateUp::Split(..) => {
+                    let (g, u) = gu.split_at_mut(n * mi);
+                    self.act.apply(g, u);
+                    ae.copy_from_slice(g);
+                }
+            }
+            if let Some(k) = hook {
+                k.apply_rows(Target::Expert(e), ae, mi, tk);
+            }
+            row += n;
+        }
+        drop(gu);
+        if let Some(s) = shared {
+            let (g, u) = sgu.split_at_mut(t * s.inter);
+            s.act.apply(g, u);
+            if let Some(k) = s.hook {
+                k.apply(Target::Shared, g, s.inter);
+            }
+            sgu.truncate(t * s.inter);
+        }
+        // Down: the activations quantized together (the shared expert's too when it has the
+        // routed experts' width), then split per expert.
+        let same = shared.is_some_and(|s| s.inter == mi);
+        if same {
+            a.extend_from_slice(&sgu);
+        }
+        let aq = crate::quant::quantize_act(&a, a.len() / mi, mi);
+        let mut row = 0;
+        let mut xs: Vec<crate::quant::QAct> = toks
+            .iter()
+            .map(|tk| {
+                let rows: Vec<usize> = (row..row + tk.len()).collect();
+                row += tk.len();
+                aq.gather(&rows)
+            })
+            .collect();
+        if let Some(s) = shared {
+            xs.push(if same {
+                aq.gather(&(total..total + t).collect::<Vec<_>>())
+            } else {
+                crate::quant::quantize_act(&sgu, t, s.inter)
+            });
+        }
+        let mut outs: Vec<Vec<f32>> = toks.iter().map(|tk| vec![0f32; tk.len() * h]).collect();
+        let mut jobs: Vec<(&Lin, usize, &mut [f32])> = used
+            .iter()
+            .zip(outs.iter_mut())
+            .enumerate()
+            .map(|(i, (&e, o))| (&self.down[e], i, &mut o[..]))
+            .collect();
+        if let Some(s) = shared {
+            jobs.push((s.down, used.len(), &mut *y));
+        }
+        linear_batch_q(&xs, &mut jobs);
+        drop(jobs);
+        if let Some(s) = shared {
+            s.apply_scale(t, h, y);
+        }
+        for (ti, r) in routes.iter().enumerate() {
+            let yr = &mut y[ti * h..(ti + 1) * h];
+            for &(e, w) in r {
+                let j = used.binary_search(&e).unwrap();
+                let i = toks[j].iter().position(|&x| x == ti).unwrap();
+                axpy(yr, w, &outs[j][i * h..(i + 1) * h]);
+            }
+        }
+        true
+    }
+
     /// Adds the routed experts' output to `y` (`[t, H]`): token `i` of `x` goes through the
     /// experts `routes[i]` lists (expert, weight). `need` is told the experts used before they run
     /// (weight streaming reads them on demand).
     /// `hook`: neuron edits (routed experts' activations; they keep the experts on the CPU).
+    /// `shared`: a shared expert, which then writes `y` first (the routed experts add to it).
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -261,6 +465,7 @@ impl<'a> Experts<'a> {
         y: &mut [f32],
         need: NeedExperts,
         hook: Option<&crate::intervene::NeuronHook>,
+        shared: Option<&Shared>,
     ) {
         use crate::intervene::Target;
         let hook = hook.filter(|k| k.experts());
@@ -272,6 +477,12 @@ impl<'a> Experts<'a> {
         }
         let mi = self.inter;
         let act = self.act;
+        if t < TN && crate::kernels::moe_batched() && self.forward_batched(x, t, h, routes, y, hook, shared) {
+            return;
+        }
+        if let Some(s) = shared {
+            s.forward(x, t, h, y);
+        }
         if t == 1 {
             // Decode: every chosen expert sees the same row, so the gate/up matmuls run as one batch.
             let r = &routes[0];
@@ -436,5 +647,103 @@ impl<'a> Experts<'a> {
                 axpy(yr, w, &o[i * h..(i + 1) * h]);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ggml::{GgmlType, GgufMatrix, random_blocks};
+
+    fn lcg(seed: &mut u64) -> f32 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+    }
+
+    /// Batched experts (one parallel region per stage, inputs quantized once) give bit-identical
+    /// outputs to running each expert's matmuls on their own, for decode and short passes, fused
+    /// and separate gate/up, in each quantized CPU format.
+    #[test]
+    fn batched_experts_match_one_at_a_time() {
+        crate::pool::init(3);
+        let (ne, k, mi, h) = (6usize, 3usize, 96usize, 256usize);
+        let mut seed = 5u64;
+        for fmt in 0..3 {
+            for fused in [false, true] {
+                let mut lin = |n_out: usize, n_in: usize| -> Lin<'static> {
+                    let w: Vec<f32> = (0..n_out * n_in).map(|_| lcg(&mut seed)).collect();
+                    match fmt {
+                        0 => Lin::q8(crate::quant::quantize_f32(&w, n_out, n_in)),
+                        1 => Lin::q4(crate::quant::quantize_q4_f32(&w, n_out, n_in)),
+                        _ => {
+                            let mut s = seed;
+                            let b = random_blocks(GgmlType::Q8_0, n_out * n_in / 32, &mut s);
+                            Lin::gguf(GgufMatrix::from_bytes(GgmlType::Q8_0, &b, n_out, n_in).unwrap())
+                        }
+                    }
+                };
+                let gate_up = (0..ne)
+                    .map(|_| {
+                        if fused {
+                            GateUp::Fused(lin(2 * mi, h))
+                        } else {
+                            GateUp::Split(lin(mi, h), lin(mi, h))
+                        }
+                    })
+                    .collect();
+                let down = (0..ne).map(|_| lin(h, mi)).collect();
+                // Shared experts as wide as the routed ones (activations quantized with theirs)
+                // and wider.
+                let sh: Vec<(Lin, Lin, Lin, usize)> = [mi, 2 * mi]
+                    .into_iter()
+                    .map(|si| (lin(si, h), lin(si, h), lin(h, si), si))
+                    .collect();
+                let ex = Experts {
+                    gate_up,
+                    down,
+                    top_k: k,
+                    inter: mi,
+                    act: Act::Silu,
+                    dev: std::sync::OnceLock::new(),
+                    wrap_per_pass: std::sync::atomic::AtomicBool::new(false),
+                };
+                for t in 1..TN {
+                    let x: Vec<f32> = (0..t * h).map(|_| lcg(&mut seed)).collect();
+                    let routes: Vec<Vec<(usize, f32)>> = (0..t)
+                        .map(|_| {
+                            let l: Vec<f32> = (0..ne).map(|_| lcg(&mut seed)).collect();
+                            route_top_k(&l, k)
+                        })
+                        .collect();
+                    let scale: Vec<f32> = (0..t).map(|_| lcg(&mut seed)).collect();
+                    for si in [None, Some(0), Some(1)] {
+                        let shared = si.map(|i| {
+                            let (g, u, d, n) = &sh[i];
+                            Shared {
+                                gate: g,
+                                up: u,
+                                down: d,
+                                inter: *n,
+                                act: Act::SiluClamp(0.7),
+                                hook: None,
+                                scale: (i == 0).then(|| scale.clone()),
+                            }
+                        });
+                        let run = |batched: bool| {
+                            let mut y = vec![0.5f32; t * h];
+                            if batched {
+                                assert!(ex.forward_batched(&x, t, h, &routes, &mut y, None, shared.as_ref()));
+                            } else {
+                                crate::kernels::set_moe_batched(false);
+                                ex.forward(&x, t, h, &routes, &mut y, None, None, shared.as_ref());
+                                crate::kernels::set_moe_batched(true);
+                            }
+                            y.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                        };
+                        assert_eq!(run(true), run(false), "format {fmt} fused {fused} t={t} shared {si:?}");
+                    }
+                }
+            }
+        }
     }
 }

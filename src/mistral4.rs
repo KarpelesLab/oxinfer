@@ -902,7 +902,15 @@ impl<'a> Mistral4Model<'a> {
     fn moe_forward(&self, m: &Moe, x: &[f32], t: usize, y: &mut [f32], need: NeedExperts, hook: Option<&NeuronHook>) {
         let c = &self.cfg;
         let h = c.hidden_size;
-        m.shared.forward(x, t, h, y, hook.map(|k| (k, Target::Shared)));
+        let shared = crate::moe::Shared {
+            gate: &m.shared.gate,
+            up: &m.shared.up,
+            down: &m.shared.down,
+            inter: m.shared.inter,
+            act: Act::Silu,
+            hook,
+            scale: None,
+        };
         let ne = m.experts.n_experts();
         let mut logits = vec![0f32; t * ne];
         for_chunks(&mut logits, ne, t > 1, |ti, lg| {
@@ -914,7 +922,7 @@ impl<'a> Mistral4Model<'a> {
             .chunks(ne)
             .map(|lg| route(lg, m.experts.top_k, c.n_group, c.topk_group, c.routed_scaling_factor as f32))
             .collect();
-        m.experts.forward(x, t, h, &routes, y, need, hook);
+        m.experts.forward(x, t, h, &routes, y, need, hook, Some(&shared));
     }
 
     /// One layer's attention over `hn` (`[t, H]`, the normed residual) into `out` (`[t, H]`).

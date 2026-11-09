@@ -152,19 +152,8 @@ pub fn too_big(bytes: u64) -> bool {
     crate::mistral4::too_big(bytes)
 }
 
-/// SwiGLU with DeepSeek's clamp: `silu(min(g, limit)) * clamp(u, -limit, limit)` into `g`.
-fn swiglu_clamped(g: &mut [f32], u: &mut [f32], limit: f32) {
-    if limit > 0.0 {
-        for v in g.iter_mut() {
-            *v = v.min(limit);
-        }
-        for v in u.iter_mut() {
-            *v = v.clamp(-limit, limit);
-        }
-    }
-    silu_mul(g, u);
-}
-
+/// The shared expert (run with the routed ones: `moe::Shared`, with DeepSeek's SwiGLU clamp
+/// `silu(min(g, limit)) * clamp(u, -limit, limit)` when `limit` > 0).
 pub(crate) struct Mlp<'a> {
     gate: Lin<'a>,
     up: Lin<'a>,
@@ -176,18 +165,6 @@ pub(crate) struct Mlp<'a> {
 impl Mlp<'_> {
     fn bytes(&self) -> usize {
         self.gate.bytes() + self.up.bytes() + self.down.bytes()
-    }
-    fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32]) {
-        let mut g = vec![0f32; t * self.inter];
-        let mut u = vec![0f32; t * self.inter];
-        linear_multi(
-            &mut [(&self.gate, self.inter, &mut g[..]), (&self.up, self.inter, &mut u[..])],
-            h,
-            x,
-            t,
-        );
-        swiglu_clamped(&mut g, &mut u, self.limit);
-        linear(&self.down, h, self.inter, &g, t, y);
     }
 }
 
@@ -1363,7 +1340,16 @@ fn route(c: &DeepSeek4Config, m: &Moe, logits: &[f32], token: u32) -> Vec<(usize
 /// The MoE block of the target or of a DSpark stage.
 pub(crate) fn moe_forward(c: &DeepSeek4Config, m: &Moe, x: &[f32], tokens: &[u32], t: usize, y: &mut [f32], need: NeedExperts) {
     let h = c.hidden_size;
-    m.shared.forward(x, t, h, y);
+    let s = &m.shared;
+    let shared = crate::moe::Shared {
+        gate: &s.gate,
+        up: &s.up,
+        down: &s.down,
+        inter: s.inter,
+        act: if s.limit > 0.0 { Act::SiluClamp(s.limit) } else { Act::Silu },
+        hook: None,
+        scale: None,
+    };
     let ne = m.experts.n_experts();
     let mut logits = vec![0f32; t * ne];
     for_chunks(&mut logits, ne, t > 1, |ti, lg| {
@@ -1372,7 +1358,7 @@ pub(crate) fn moe_forward(c: &DeepSeek4Config, m: &Moe, x: &[f32], tokens: &[u32
         }
     });
     let routes: Vec<_> = logits.chunks(ne).zip(tokens).map(|(lg, &tk)| route(c, m, lg, tk)).collect();
-    m.experts.forward(x, t, h, &routes, y, need, None);
+    m.experts.forward(x, t, h, &routes, y, need, None, Some(&shared));
 }
 
 /// The DSpark draft of DeepSeek V4 (the `mtp.*` stages of deepseek-ai/DeepSeek-V4-Flash-DSpark;

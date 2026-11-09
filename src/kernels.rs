@@ -674,6 +674,67 @@ pub mod simd {
         out
     }
 
+    /// Q4_0: one weight row against TC quantized activation rows (token stride `n_in`) with the
+    /// row's four blocks per step unpacked once into registers and each token's activations
+    /// streamed from L1 (`q4_dot_rows_tc` holds all tokens' activations instead and spills past
+    /// two tokens). Every token's operations are `q4_dot_rows`'s, so results are bit-identical
+    /// to it. (The int8 format gains nothing from this: its blocks need no unpacking.)
+    #[inline(always)]
+    pub unsafe fn q4_dot_cols<const TC: usize>(
+        q: *const u8,
+        s: *const u16,
+        n_in: usize,
+        xq: *const i8,
+        xs: *const f32,
+        xsums: *const i32,
+    ) -> [f32; TC] {
+        let bpr = n_in / 32;
+        let zero = vdupq_n_s32(0);
+        let m0f = vdupq_n_u8(0x0F);
+        let mut accf = [vdupq_n_f32(0.0); TC];
+        let mut b = 0;
+        while b + 4 <= bpr {
+            let k = b * 32;
+            let mut w = [vdupq_n_s8(0); 8];
+            for i in 0..4 {
+                let v = vld1q_u8(q.add(b * 16 + 16 * i));
+                w[2 * i] = vreinterpretq_s8_u8(vandq_u8(v, m0f));
+                w[2 * i + 1] = vreinterpretq_s8_u8(vshrq_n_u8::<4>(v));
+            }
+            let swv = f16x4_to_f32(s.add(b));
+            for (c, acc) in accf.iter_mut().enumerate() {
+                let xp = xq.add(c * n_in + k);
+                let a0 = sdot(sdot(zero, w[0], vld1q_s8(xp)), w[1], vld1q_s8(xp.add(16)));
+                let a1 = sdot(sdot(zero, w[2], vld1q_s8(xp.add(32))), w[3], vld1q_s8(xp.add(48)));
+                let a2 = sdot(sdot(zero, w[4], vld1q_s8(xp.add(64))), w[5], vld1q_s8(xp.add(80)));
+                let a3 = sdot(sdot(zero, w[6], vld1q_s8(xp.add(96))), w[7], vld1q_s8(xp.add(112)));
+                let xoff = vshlq_n_s32::<3>(vld1q_s32(xsums.add(c * bpr + b)));
+                let sums = vsubq_s32(vpaddq_s32(vpaddq_s32(a0, a1), vpaddq_s32(a2, a3)), xoff);
+                *acc = vfmaq_f32(*acc, vcvtq_f32_s32(sums), vmulq_f32(swv, vld1q_f32(xs.add(c * bpr + b))));
+            }
+            b += 4;
+        }
+        let mut out = [0f32; TC];
+        for c in 0..TC {
+            out[c] = vaddvq_f32(accf[c]);
+        }
+        while b < bpr {
+            let k = b * 32;
+            let v = vld1q_u8(q.add(b * 16));
+            let lo = vreinterpretq_s8_u8(vandq_u8(v, m0f));
+            let hi = vreinterpretq_s8_u8(vshrq_n_u8::<4>(v));
+            let sw = crate::quant::f16_to_f32(*s.add(b));
+            for (c, o) in out.iter_mut().enumerate() {
+                let xp = xq.add(c * n_in + k);
+                let a = sdot(sdot(zero, lo, vld1q_s8(xp)), hi, vld1q_s8(xp.add(16)));
+                let sum = vaddvq_s32(a) - 8 * *xsums.add(c * bpr + b);
+                *o += sum as f32 * sw * *xs.add(c * bpr + b);
+            }
+            b += 1;
+        }
+        out
+    }
+
     /// Q4_0: R weight rows against TC quantized activation rows, reading each block once.
     #[inline(never)]
     pub unsafe fn q4_dot_rows_tc<const R: usize, const TC: usize>(
@@ -1121,6 +1182,43 @@ impl QMat for Q4Matrix {
     unsafe fn rows_tc(&self, xa: &QAct, c0: usize, tc: usize, y: *mut f32, r0: usize, r1: usize) {
         self.rows_tc_impl(xa, c0, tc, y, r0, r1)
     }
+    #[cfg(target_arch = "aarch64")]
+    fn multi(&self, _t: usize) -> Option<bool> {
+        Some(false)
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn rows_multi(&self, xa: &QAct, _pairs: Option<&PairAct>, t: usize, y: *mut f32, r0: usize, r1: usize) -> bool {
+        let (n_in, n_out) = (self.n_in, self.n_out);
+        let bpr = n_in / QBLOCK;
+        col_tiles(t, n_in, r0, r1, n_in / 2, |c0, c1, ta, tb| {
+            let xq = xa.q.as_ptr().add(c0 * n_in);
+            let xs = xa.scales.as_ptr().add(c0 * bpr);
+            let xsums = xa.sums.as_ptr().add(c0 * bpr);
+            let yg = y.add(c0 * n_out);
+            macro_rules! go {
+                ($TC:literal) => {
+                    for r in ta..tb {
+                        let o = simd::q4_dot_cols::<$TC>(
+                            self.q.as_ptr().add(r * n_in / 2),
+                            self.scales.as_ptr().add(r * bpr),
+                            n_in,
+                            xq,
+                            xs,
+                            xsums,
+                        );
+                        for (c, v) in o.iter().enumerate() {
+                            *yg.add(c * n_out + r) = *v;
+                        }
+                    }
+                };
+            }
+            with_cols!(c1 - c0, go)
+        });
+        for c in 0..t {
+            self.add_offsets(xa, c, y.add(c * n_out), r0, r1);
+        }
+        true
+    }
 }
 
 struct QJobRef<'a, M: QMat> {
@@ -1193,6 +1291,20 @@ pub fn multi_token_kernels() -> MultiTokenKernels {
     }
 }
 
+static MOE_UNBATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// For benchmarks: `false` runs the routed experts of MoE decode and verification passes one
+/// matmul at a time (the older path) instead of one batch per stage. Results are identical.
+#[doc(hidden)]
+pub fn set_moe_batched(on: bool) {
+    MOE_UNBATCHED.store(!on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`set_moe_batched`].
+pub(crate) fn moe_batched() -> bool {
+    !MOE_UNBATCHED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether this CPU has the int8 matrix-multiply instructions (Arm i8mm: SMMLA).
 pub fn cpu_has_i8mm() -> bool {
     #[cfg(target_arch = "aarch64")]
@@ -1207,6 +1319,54 @@ pub fn cpu_has_i8mm() -> bool {
 
 /// Most tokens the multi-token decode kernels take in one pass.
 const MULTI_MAX: usize = 16;
+
+/// The widest column (token) group of the multi-token kernels that instantiate a one-row kernel
+/// per token count (the blocks-of-32 formats: GGUF Q8_0, Q4_0, ..., and Q4).
+pub(crate) const COLS_MAX: usize = 8;
+
+/// Weight bytes per row tile of those kernels: each tile is re-read (from cache) once per column
+/// group while the group's activations stay in L1.
+const COLS_TILE_BYTES: usize = 64 * 1024;
+
+/// Int8 activation bytes a column group may span (`n_in` per token), so that they stay in L1
+/// while a row tile streams past.
+const COLS_ACT_BYTES: usize = 64 * 1024;
+
+/// Runs `f(c0, c1, ta, tb)` over row tiles `ta..tb` of `r0..r1` (rows of `row_bytes`) and, within
+/// each tile, over column groups `c0..c1` of `t` tokens of `n_in` int8 activations: groups of at
+/// most `COLS_MAX` tokens, and of at most `COLS_ACT_BYTES` of activations (but 2 tokens at
+/// least), as few and as even as possible (9 = 5 + 4, 16 = 8 + 8).
+pub(crate) fn col_tiles(t: usize, n_in: usize, r0: usize, r1: usize, row_bytes: usize, mut f: impl FnMut(usize, usize, usize, usize)) {
+    let wmax = (COLS_ACT_BYTES / n_in.max(1)).clamp(2, COLS_MAX);
+    let n = t.div_ceil(wmax);
+    let tile = (COLS_TILE_BYTES / row_bytes.max(1)).max(4);
+    let mut ta = r0;
+    while ta < r1 {
+        let tb = (ta + tile).min(r1);
+        for g in 0..n {
+            f(g * t / n, (g + 1) * t / n, ta, tb);
+        }
+        ta = tb;
+    }
+}
+
+/// `$go!(W)` with the literal `W` equal to the column-group width `$w` (1..=`COLS_MAX`).
+macro_rules! with_cols {
+    ($w:expr, $go:ident) => {
+        match $w {
+            1 => $go!(1),
+            2 => $go!(2),
+            3 => $go!(3),
+            4 => $go!(4),
+            5 => $go!(5),
+            6 => $go!(6),
+            7 => $go!(7),
+            8 => $go!(8),
+            w => unreachable!("column group of {w}"),
+        }
+    };
+}
+pub(crate) use with_cols;
 
 /// Several quantized matmuls sharing the same f32 input `x` ([t, n_in]); each job is `(matrix, y [t, n_out])`.
 pub fn matmul_quant_multi<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &[f32], t: usize) {
@@ -1277,25 +1437,97 @@ pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &
             unsafe { matmul_quant_block_prefill(job.m, xs, xts, c1 - c0, r0, r1, job.y.get().add(c0 * job.m.n_out())) }
             return;
         }
-        let xa = xa.as_ref().unwrap();
-        if multi && unsafe { job.m.rows_multi(xa, pairs.as_ref(), t, job.y.get(), r0, r1) } {
-            return;
-        }
-        let mut c = 0;
-        while c < t {
-            // Token pairs: the 3- and 4-token tiles keep 24-32 activation vectors live and
-            // spill; re-reading a row block from cache per pair is cheaper (27B Q4, 4 tokens:
-            // 1.7x faster). The row block stays in L2 between pairs.
-            let tc = (t - c).min(2);
-            unsafe {
-                if tc == 1 {
-                    job.m.rows_t1(xa, c, job.y.get().add(c * job.m.n_out()), r0, r1)
-                } else {
-                    job.m.rows_tc(xa, c, tc, job.y.get(), r0, r1)
-                }
+        unsafe { decode_rows(job.m, xa.as_ref().unwrap(), pairs.as_ref(), multi, job.y.get(), r0, r1) }
+    });
+}
+
+/// Decode kernels: rows `r0..r1` of `m` against all `xa.t` activation rows into `y[c*n_out + r]`,
+/// with the multi-token kernels when `multi` (and the matrix has them), else token pairs.
+unsafe fn decode_rows<M: QMat>(m: &M, xa: &QAct, pairs: Option<&PairAct>, multi: bool, y: *mut f32, r0: usize, r1: usize) {
+    let t = xa.t;
+    if multi && unsafe { m.rows_multi(xa, pairs, t, y, r0, r1) } {
+        return;
+    }
+    let mut c = 0;
+    while c < t {
+        // Token pairs: the 3- and 4-token tiles keep 24-32 activation vectors live and
+        // spill; re-reading a row block from cache per pair is cheaper (27B Q4, 4 tokens:
+        // 1.7x faster). The row block stays in L2 between pairs.
+        let tc = (t - c).min(2);
+        unsafe {
+            if tc == 1 {
+                m.rows_t1(xa, c, y.add(c * m.n_out()), r0, r1)
+            } else {
+                m.rows_tc(xa, c, tc, y, r0, r1)
             }
-            c += tc;
         }
+        c += tc;
+    }
+}
+
+/// Quantized matmuls with their own (already quantized) inputs, in one parallel region: job
+/// `(m, i, y)` is `y [xs[i].t, n_out] = xs[i] m^T` on the decode kernels, so each row is
+/// bit-identical to [`matmul_quant_multi`] of that job alone on the f32 rows `xs[i]` was
+/// quantized from (activations are quantized per row). For many small matmuls that would each
+/// pay a parallel region (a mixture-of-experts layer's experts). Every input must have at most
+/// [`decode_max_tokens`] rows (beyond that `matmul_quant_multi` takes the f32 GEMM), and no
+/// matrix may be float-stored.
+pub fn matmul_quant_batch<M: QMat>(xs: &[QAct], jobs: &mut [(&M, usize, &mut [f32])]) {
+    if jobs.is_empty() {
+        return;
+    }
+    let decode_max = decode_max_tokens();
+    let mut total_bytes = 0usize;
+    let refs: Vec<(QJobRef<M>, usize)> = jobs
+        .iter_mut()
+        .map(|(m, i, y)| {
+            let xa = &xs[*i];
+            assert_eq!(m.n_in(), xa.n_in, "input shape mismatch");
+            assert_eq!(y.len(), xa.t * m.n_out(), "output shape mismatch");
+            assert!(!m.dense() && xa.t <= decode_max, "batched matmuls run on the decode kernels only");
+            total_bytes += m.bytes();
+            (
+                QJobRef {
+                    m: *m,
+                    y: SendPtr(y.as_mut_ptr()),
+                },
+                *i,
+            )
+        })
+        .collect();
+    let _timer = prof::start(Cat::Matmul);
+    prof::add_bytes(total_bytes);
+    let nthreads = pool::threads();
+    let bytes_per_row = (total_bytes / refs.iter().map(|j| j.0.m.n_out()).sum::<usize>()).max(1);
+    let target = (total_bytes / (nthreads * 8)).max(128 * 1024);
+    let rows_per_block = (target / bytes_per_row).max(16) / 16 * 16;
+    let mut blocks: Vec<(u32, u32, u32)> = Vec::new();
+    for (j, (job, i)) in refs.iter().enumerate() {
+        if xs[*i].t == 0 {
+            continue;
+        }
+        let mut r = 0;
+        while r < job.m.n_out() {
+            let r1 = (r + rows_per_block).min(job.m.n_out());
+            blocks.push((j as u32, r as u32, r1 as u32));
+            r = r1;
+        }
+    }
+    let mode = multi_token_kernels();
+    let multi = |t: usize| (3..=MULTI_MAX).contains(&t) && mode != MultiTokenKernels::Pairs;
+    let i8mm = mode == MultiTokenKernels::Auto && cpu_has_i8mm();
+    let pairs: Vec<Option<PairAct>> = xs
+        .iter()
+        .enumerate()
+        .map(|(i, xa)| {
+            (i8mm && multi(xa.t) && refs.iter().any(|(j, ji)| *ji == i && j.m.multi(xa.t) == Some(true))).then(|| PairAct::new(xa))
+        })
+        .collect();
+    pool::run(blocks.len(), &|b| {
+        let (j, r0, r1) = blocks[b];
+        let (job, i) = refs[j as usize];
+        let xa = &xs[i];
+        unsafe { decode_rows(job.m, xa, pairs[i].as_ref(), multi(xa.t), job.y.get(), r0 as usize, r1 as usize) }
     });
 }
 
@@ -1772,6 +2004,41 @@ mod tests {
             }
             // int8 activations: ~1% of the output range.
             assert!(max <= 1e-2 * scale.max(1.0), "t={t}: max abs diff {max} (scale {scale})");
+        }
+    }
+
+    /// Multi-token decode passes (2..=16 tokens: column-group kernels, token pairs) give every
+    /// token bit-identical rows to a one-token pass, for the int8, Q4 and affine (MLX) Q4 formats.
+    #[test]
+    fn native_multi_token_passes_are_batch_invariant() {
+        crate::pool::init(3);
+        let (n_out, n_in, group) = (45usize, 4096 + 96, 32usize);
+        let mut seed = 11u64;
+        let w: Vec<u16> = (0..n_out * n_in).map(|_| (lcg(&mut seed).to_bits() >> 16) as u16).collect();
+        let gpr = n_in / group;
+        let words: Vec<u32> = (0..n_out * n_in / 8)
+            .map(|_| lcg(&mut seed).to_bits() ^ (lcg(&mut seed).to_bits() << 7))
+            .collect();
+        let bf = |v: f32| half::bf16::from_f32(v).to_bits();
+        let scales: Vec<u16> = (0..n_out * gpr).map(|_| bf(0.002 + 0.01 * lcg(&mut seed).abs())).collect();
+        let biases: Vec<u16> = (0..n_out * gpr).map(|_| bf(0.05 * lcg(&mut seed))).collect();
+        let q8 = quantize_bf16(&w, n_out, n_in);
+        let q4 = quantize_q4(&w, n_out, n_in);
+        let mlx = crate::quant::from_mlx_q4(&words, &scales, &biases, n_out, n_in, group);
+        fn run<M: QMat>(m: &M, x: &[f32], t: usize) -> Vec<u32> {
+            let mut y = vec![0f32; t * m.n_out()];
+            matmul_quant_multi_at(&mut [(m, &mut y[..])], x, t, MULTI_MAX - 1);
+            y.iter().map(|v| v.to_bits()).collect()
+        }
+        fn check<M: QMat>(name: &str, m: &M, x: &[f32], t: usize, n_in: usize) {
+            let alone: Vec<u32> = (0..t).flat_map(|c| run(m, &x[c * n_in..(c + 1) * n_in], 1)).collect();
+            assert_eq!(run(m, x, t), alone, "{name} t={t}");
+        }
+        for t in 2..MULTI_MAX {
+            let x: Vec<f32> = (0..t * n_in).map(|_| lcg(&mut seed) * 3.0).collect();
+            check("q8", &q8, &x, t, n_in);
+            check("q4", &q4, &x, t, n_in);
+            check("mlx q4", &mlx, &x, t, n_in);
         }
     }
 

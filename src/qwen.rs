@@ -2110,11 +2110,21 @@ impl Moe<'_> {
     }
 
     fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32], need: NeedExperts, hook: Option<&NeuronHook>) {
-        self.shared.forward(x, t, h, y, hook.map(|k| (k, Target::Shared)));
-        for_chunks(y, h, t > 1, |ti, row| {
-            let g = 1.0 / (1.0 + (-dot(&self.shared_gate, &x[ti * h..(ti + 1) * h])).exp());
-            scale_inplace(row, g);
-        });
+        // The shared expert, scaled by its sigmoid gate, runs with the routed experts (one batch
+        // per stage on the CPU decode path).
+        let shared = crate::moe::Shared {
+            gate: &self.shared.gate,
+            up: &self.shared.up,
+            down: &self.shared.down,
+            inter: self.shared.inter,
+            act: Act::Silu,
+            hook,
+            scale: Some(
+                (0..t)
+                    .map(|ti| 1.0 / (1.0 + (-dot(&self.shared_gate, &x[ti * h..(ti + 1) * h])).exp()))
+                    .collect(),
+            ),
+        };
         let ne = self.experts.n_experts();
         let mut logits = vec![0f32; t * ne];
         for_chunks(&mut logits, ne, t > 1, |ti, l| {
@@ -2123,7 +2133,7 @@ impl Moe<'_> {
             }
         });
         let routes: Vec<_> = logits.chunks(ne).map(|l| route_top_k(l, self.experts.top_k)).collect();
-        self.experts.forward(x, t, h, &routes, y, need, hook);
+        self.experts.forward(x, t, h, &routes, y, need, hook, Some(&shared));
     }
 }
 
