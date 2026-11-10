@@ -288,6 +288,12 @@ impl Platform {
                 self.cpu.features.join(" ")
             }
         );
+        #[cfg(target_arch = "x86_64")]
+        let _ = writeln!(
+            s,
+            "  kernels: {} (OXINFER_SIMD=scalar selects the fallbacks)",
+            crate::kernels::simd::level_name()
+        );
         if let Some(m) = self.cpu.memory_bytes {
             let _ = writeln!(s, "  memory: {:.1} GB", m as f64 / 1e9);
         }
