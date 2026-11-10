@@ -16,7 +16,7 @@ use crate::model::{Lin, Quant, linear, load_lin};
 use crate::safetensors::ModelFiles;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn d3() -> usize {
     3
@@ -200,9 +200,124 @@ pub struct QwenMmConfig {
     pub video: ProcessorConfig,
     pub image_token_id: u32,
     pub video_token_id: u32,
+    /// The llama.cpp `mmproj` GGUF file the tower comes from (None: the checkpoint's own
+    /// `model.visual.*` tensors).
+    pub mmproj: Option<PathBuf>,
 }
 
+/// `clip.projector_type` of the llama.cpp mmproj files of the Qwen3-VL-style towers (Qwen3.5 /
+/// 3.6 / 3.8, Qwen3.8-Flash-Next).
+pub const MMPROJ_TYPE: &str = "qwen3vl_merger";
+
 impl QwenMmConfig {
+    /// [`QwenMmConfig::load`] with the tower chosen by `mmproj` (`EngineOptions::mmproj`,
+    /// `--mmproj`): the checkpoint's own tower, or for a GGUF model the `mmproj*.gguf` beside it
+    /// when it is a Qwen3-VL-style projector (`auto`); a given mmproj file; or no vision (`none`).
+    pub fn load_with(model: &Path, mmproj: &crate::pixtral::Mmproj) -> Result<Option<Self>> {
+        use crate::pixtral::Mmproj;
+        match mmproj {
+            Mmproj::None => Ok(None),
+            Mmproj::File(p) => Self::from_mmproj(p, model).map(Some),
+            Mmproj::Auto if crate::gguf::is_gguf(model) => match crate::pixtral::mmproj_for(model) {
+                Some(p) if crate::pixtral::projector_type(&p).as_deref() == Some(MMPROJ_TYPE) => Self::from_mmproj(&p, model).map(Some),
+                _ => Ok(None),
+            },
+            Mmproj::Auto if model.is_dir() => Self::load(model),
+            Mmproj::Auto => Ok(None),
+        }
+    }
+
+    /// The settings of llama.cpp's `qwen3vl_merger` mmproj file `path` for the language model
+    /// `model` (a GGUF file or checkpoint folder, whose vocabulary gives the placeholder token
+    /// ids). The processor settings are the published checkpoints' (pixel budget, 16-pixel
+    /// patches, 2x2 merge), with the file's normalization.
+    fn from_mmproj(path: &Path, model: &Path) -> Result<Self> {
+        let h = crate::gguf::header(path)?;
+        let proj = h.get("clip.projector_type").and_then(|v| v.as_str()).unwrap_or("");
+        if proj != MMPROJ_TYPE {
+            bail!(
+                "{}: projector type {proj:?} is not a Qwen3-VL-style tower ({MMPROJ_TYPE}; pixtral files go with Mistral Large 4)",
+                path.display()
+            );
+        }
+        let u = |k: &str| {
+            h.get(k)
+                .and_then(|v| v.as_u64())
+                .map(|x| x as usize)
+                .with_context(|| format!("{}: no {k}", path.display()))
+        };
+        let hidden = u("clip.vision.embedding_length")?;
+        let npos = h
+            .tensors
+            .iter()
+            .find(|t| t.name == "v.position_embd.weight")
+            .map(|t| t.ne.iter().product::<usize>() / hidden.max(1))
+            .with_context(|| format!("{}: no v.position_embd.weight", path.display()))?;
+        let deepstack: Vec<usize> = h
+            .get("clip.vision.is_deepstack_layers")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .enumerate()
+                    .filter(|(_, v)| matches!(v, crate::gguf::Value::Bool(true)))
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let vision: QwenVisionConfig = serde_json::from_value(serde_json::json!({
+            "depth": u("clip.vision.block_count")?,
+            "hidden_size": hidden,
+            "hidden_act": "gelu_pytorch_tanh",
+            "intermediate_size": u("clip.vision.feed_forward_length")?,
+            "num_heads": u("clip.vision.attention.head_count")?,
+            "patch_size": u("clip.vision.patch_size")?,
+            "spatial_merge_size": u("clip.vision.spatial_merge_size").unwrap_or(2),
+            "out_hidden_size": u("clip.vision.projection_dim")?,
+            "num_position_embeddings": npos,
+            "deepstack_visual_indexes": deepstack,
+        }))?;
+        let triple = |k: &str| -> Option<[f32; 3]> {
+            let a = h.get(k)?.as_array()?;
+            (a.len() == 3).then(|| [0, 1, 2].map(|i| a[i].as_f64().unwrap_or(0.0) as f32))
+        };
+        let (mut image, mut video) = if model.is_dir() {
+            (ProcessorConfig::load(model, false), ProcessorConfig::load(model, true))
+        } else {
+            (ProcessorConfig::image_default(), ProcessorConfig::video_default())
+        };
+        for p in [&mut image, &mut video] {
+            p.patch_size = vision.patch_size;
+            p.merge_size = vision.spatial_merge_size;
+            if let Some(m) = triple("clip.vision.image_mean") {
+                p.mean = m;
+            }
+            if let Some(s) = triple("clip.vision.image_std") {
+                p.std = s;
+            }
+        }
+        let tok = if crate::gguf::is_gguf(model) {
+            crate::gguf::header(model).ok().and_then(|m| m.tokenizer().ok())
+        } else {
+            crate::fsx::read(&model.join("tokenizer.json"))
+                .ok()
+                .and_then(|b| crate::tokenizer::Tokenizer::from_bytes(b).ok())
+        };
+        let id = |s: &str, d: u32| tok.as_ref().and_then(|t| t.token_to_id(s)).unwrap_or(d);
+        Ok(Self {
+            vision,
+            image,
+            video,
+            image_token_id: id("<|image_pad|>", 248056),
+            video_token_id: id("<|video_pad|>", 248057),
+            mmproj: Some(path.to_path_buf()),
+        })
+    }
+
+    /// The tensors of the tower when they live in an mmproj file (None: in the checkpoint).
+    pub fn open_mmproj(&self) -> Result<Option<ModelFiles>> {
+        self.mmproj.as_deref().map(|p| ModelFiles::open(p, false)).transpose()
+    }
+
     /// None when `config.json` has no Qwen-style `vision_config`.
     pub fn load(dir: &Path) -> Result<Option<Self>> {
         let raw: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
@@ -228,6 +343,7 @@ impl QwenMmConfig {
             video,
             image_token_id: id("image_token_id", 248056),
             video_token_id: id("video_token_id", 248057),
+            mmproj: None,
         }))
     }
 }
@@ -504,21 +620,52 @@ impl<'a> Qwen35Tower<'a> {
         {
             bail!("vision hidden_act {a} is not supported (gelu_pytorch_tanh)");
         }
-        let pre = if files.has("model.visual.patch_embed.proj.weight") {
+        // llama.cpp mmproj files (`v.*`, `mm.*`) or the checkpoint's `model.visual.*`.
+        let gguf = files.has("v.patch_embd.weight");
+        let pre = if gguf {
+            ""
+        } else if files.has("model.visual.patch_embed.proj.weight") {
             "model.visual."
         } else if files.has("visual.patch_embed.proj.weight") {
             "visual."
         } else {
             bail!("the checkpoint has no vision tower (model.visual.*)");
         };
+        let name = |hf: &str| if gguf { mmproj_name(hf) } else { format!("{pre}{hf}") };
         let h = cfg.hidden_size;
         let (c, t, p) = (cfg.in_channels, cfg.temporal_patch_size, cfg.patch_size);
-        let dense = |name: &str, o: usize, i: usize| VLin::load(files, &format!("{pre}{name}"), (o, i), (o, i));
+        let dense = |n: &str, o: usize, i: usize| VLin::load(files, &name(n), (o, i), (o, i));
         let (inter, inter_p) = (cfg.intermediate_size, cfg.intermediate_size.next_multiple_of(64));
-        let pname = format!("{pre}patch_embed.proj.weight");
-        let patch_w = Lin::bf16(files.bf16_conv(&pname, &[h, c, t, p, p])?);
-        let patch_b = files.f32(&format!("{pre}patch_embed.proj.bias"))?;
-        let pos_embed = files.f32(&format!("{pre}pos_embed.weight"))?;
+        let patch_w = if gguf {
+            // The Conv3d kernel split by llama.cpp into one Conv2d per temporal slice
+            // (`v.patch_embd.weight`, `.weight.1`): interleaved back into [H, C, T, p, p].
+            let slices = (0..t)
+                .map(|k| {
+                    let n = if k == 0 {
+                        "v.patch_embd.weight".to_string()
+                    } else {
+                        format!("v.patch_embd.weight.{k}")
+                    };
+                    let w = files.bf16(&n)?;
+                    if w.len() != h * c * p * p {
+                        bail!("{n}: {} values, expected {}", w.len(), h * c * p * p);
+                    }
+                    Ok(w)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let pp = p * p;
+            let mut v = crate::quant::PageVec::<u16>::zeroed(h * c * t * pp);
+            for oc in 0..h * c {
+                for (k, w) in slices.iter().enumerate() {
+                    v[(oc * t + k) * pp..(oc * t + k + 1) * pp].copy_from_slice(&w[oc * pp..(oc + 1) * pp]);
+                }
+            }
+            Lin::bf16_owned(v)
+        } else {
+            Lin::bf16(files.bf16_conv(&name("patch_embed.proj.weight"), &[h, c, t, p, p])?)
+        };
+        let patch_b = files.f32(&name("patch_embed.proj.bias"))?;
+        let pos_embed = files.f32(&name("pos_embed.weight"))?;
         if pos_embed.len() != cfg.num_position_embeddings * h || patch_b.len() != h {
             bail!("vision tower: unexpected patch / position embedding sizes");
         }
@@ -526,12 +673,12 @@ impl<'a> Qwen35Tower<'a> {
         for l in 0..cfg.depth {
             let b = format!("blocks.{l}.");
             blocks.push(VBlock {
-                norm1: LayerNorm::load(files, &format!("{pre}{b}norm1"), h)?,
-                norm2: LayerNorm::load(files, &format!("{pre}{b}norm2"), h)?,
+                norm1: LayerNorm::load(files, &name(&format!("{b}norm1")), h)?,
+                norm2: LayerNorm::load(files, &name(&format!("{b}norm2")), h)?,
                 qkv: dense(&format!("{b}attn.qkv"), 3 * h, h)?,
                 proj: dense(&format!("{b}attn.proj"), h, h)?,
-                fc1: VLin::load(files, &format!("{pre}{b}mlp.linear_fc1"), (inter, h), (inter_p, h))?,
-                fc2: VLin::load(files, &format!("{pre}{b}mlp.linear_fc2"), (h, inter), (h, inter_p))?,
+                fc1: VLin::load(files, &name(&format!("{b}mlp.linear_fc1")), (inter, h), (inter_p, h))?,
+                fc2: VLin::load(files, &name(&format!("{b}mlp.linear_fc2")), (h, inter), (h, inter_p))?,
             });
         }
         let mh = h * cfg.spatial_merge_size * cfg.spatial_merge_size;
@@ -545,7 +692,7 @@ impl<'a> Qwen35Tower<'a> {
             patch_b,
             pos_embed,
             blocks,
-            merger_norm: LayerNorm::load(files, &format!("{pre}merger.norm"), h)?,
+            merger_norm: LayerNorm::load(files, &name("merger.norm"), h)?,
             merger_fc1: dense("merger.linear_fc1", mh, mh)?,
             merger_fc2: dense("merger.linear_fc2", cfg.out_hidden_size, mh)?,
             inter: inter_p,
@@ -694,6 +841,37 @@ impl<'a> Qwen35Tower<'a> {
     }
 }
 
+/// The llama.cpp mmproj name of tower tensor `hf` (a `model.visual.` name without the prefix, or
+/// the stem of a norm or linear layer).
+fn mmproj_name(hf: &str) -> String {
+    if let Some(rest) = hf.strip_prefix("blocks.") {
+        let (l, tail) = rest.split_once('.').unwrap_or((rest, ""));
+        let (stem, suffix) = match tail.find(".weight").or_else(|| tail.find(".bias")) {
+            Some(i) => tail.split_at(i),
+            None => (tail, ""),
+        };
+        let g = match stem {
+            "norm1" => "ln1",
+            "norm2" => "ln2",
+            "attn.qkv" => "attn_qkv",
+            "attn.proj" => "attn_out",
+            "mlp.linear_fc1" => "ffn_up",
+            "mlp.linear_fc2" => "ffn_down",
+            s => s,
+        };
+        return format!("v.blk.{l}.{g}{suffix}");
+    }
+    match hf {
+        "patch_embed.proj.bias" => "v.patch_embd.bias",
+        "pos_embed.weight" => "v.position_embd.weight",
+        "merger.norm" => "v.post_ln",
+        "merger.linear_fc1" => "mm.0",
+        "merger.linear_fc2" => "mm.2",
+        s => s,
+    }
+    .to_string()
+}
+
 /// Bidirectional multi-head attention over `n` tokens (`[n, heads*hd]` each, scale hd^-0.5),
 /// in query chunks that keep the score matrix under ~256 MB (GPU when one is active).
 pub(crate) fn attention_chunked(q: &[f32], k: &[f32], v: &[f32], n: usize, nh: usize, hd: usize) -> Vec<f32> {
@@ -726,6 +904,17 @@ mod tests {
         assert_eq!(smart_resize(3000, 4000, 32, 65536, 1_048_576).unwrap(), (864, 1152));
         // Video: 16 frames of 240x320 within 25165824 pixels.
         assert_eq!(smart_resize_t(16, 2, 240, 320, 32, 4096, 25165824).unwrap(), (256, 320));
+    }
+
+    #[test]
+    fn mmproj_names() {
+        assert_eq!(mmproj_name("blocks.3.norm1"), "v.blk.3.ln1");
+        assert_eq!(mmproj_name("blocks.26.attn.qkv"), "v.blk.26.attn_qkv");
+        assert_eq!(mmproj_name("blocks.0.mlp.linear_fc2"), "v.blk.0.ffn_down");
+        assert_eq!(mmproj_name("blocks.0.attn.proj.weight"), "v.blk.0.attn_out.weight");
+        assert_eq!(mmproj_name("merger.linear_fc2"), "mm.2");
+        assert_eq!(mmproj_name("merger.norm"), "v.post_ln");
+        assert_eq!(mmproj_name("pos_embed.weight"), "v.position_embd.weight");
     }
 
     #[test]

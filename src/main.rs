@@ -279,8 +279,9 @@ fn usage() -> ! {
          \x20 --max-soft-tokens N  image token budget: Gemma 4: 70, 140, 280 (default), 560 or 1120;\n\
          \x20                      Qwen: merged tokens of 32x32 pixels (default 16384)\n\
          \x20 --dump-mm PREFIX     write multimodal soft tokens / patches as f32 files (for reference checks)\n\
-         \x20 --mmproj FILE|none   Mistral Large 4: the vision projector (llama.cpp mmproj GGUF, path or\n\
-         \x20                      org/repo/file; default: the mmproj*.gguf beside a GGUF model), or none\n\
+         \x20 --mmproj FILE|none   Mistral Large 4, Qwen3.5-family (Qwen3.8-Flash-Next): the vision tower\n\
+         \x20                      (llama.cpp mmproj GGUF, path or org/repo/file; default: the checkpoint's,\n\
+         \x20                      or the mmproj*.gguf beside a GGUF model), or none\n\
          \x20 --cache-dir DIR      where fetched models are cached\n\
          \x20 --download-only      fetch the model (and drafter) and exit\n\
          \x20 --save-quantized DIR write a checkpoint with the weights already quantized to --quant (loads\n\

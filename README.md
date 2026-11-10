@@ -965,9 +965,37 @@ Speed on the M5 Max (128 GB; load average 3-9 from other jobs), UD-Q4_K_XL, gree
 Memory: the GPU run's footprint is 1.5 GB besides the page cache (the weights are file pages,
 82 GB of them in use); streamed with a 40 GB budget, 0.7 GB plus 22 GB of page cache.
 
-Not done: the vision tower (an unmodified Qwen3-VL ViT; from safetensors it would load as
-Qwen3.5's, but a GGUF model would need Qwen3-VL `mmproj` loading, which oxinfer does not have
-yet), GPU decoding past 2051 tokens (no GPU block selection), the merged-weight GGUF layout, and
+Image input. The vision tower is Qwen3.5's (a Qwen3-VL ViT without DeepStack: 27 layers of
+1152, 16x16 patches over 2 frames, learned 48x48 position grid resampled per image, axial 2D
+RoPE, 2x2 merger into 2560-wide tokens placed with interleaved M-RoPE; image positions hash as
+`<|image_pad|>` in the n-gram embedding, as transformers does). From safetensors it is the
+checkpoint's `model.visual.*`; for a GGUF model it comes from llama.cpp's `mmproj` file
+(`clip.projector_type` `qwen3vl_merger`; unsloth publishes `mmproj-F16.gguf` / `-BF16` in the
+repo root), found beside the model (its folder or the one above) or named with `--mmproj FILE`
+(engine / C / server option `mmproj=FILE`; `mmproj=none` turns images off). The conv kernel
+llama.cpp splits per frame (`v.patch_embd.weight`, `.weight.1`) is joined back; F16 weights load
+as bf16, which restores the released bf16 values exactly. Images go through `--image`, the
+engine's attachments, the C API and the server's `image_url` content parts.
+
+```sh
+# the mmproj file in the repo root is picked up automatically
+curl -L -o ~/.cache/oxinfer/hub/unsloth--Qwen3.8-Flash-Next-GGUF/mmproj-F16.gguf \
+    https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-F16.gguf
+./target/release/oxinfer --model unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL --image painting.png -p "Describe this image."
+```
+
+Checked against transformers' `Qwen4ExpForConditionalGeneration` in float32 on a tiny random
+checkpoint with the real tokenizer and processor (`tools/qwen4exp_vl_tiny.py`, compared with
+`tools/ref_vl.py`): a 681x975 PNG (630 image tokens) gives image features at 1.9e-4 relative
+(pixels differ by 1/255 on a few rounding ties of the bicubic resize), last-position logits within
+1.7e-4 (KL 3e-8), and the same 12 greedy tokens on the CPU and Metal; the tower loaded from the
+llama.cpp-converted mmproj of that checkpoint matches the checkpoint's own to 4.5e-7. On the real
+model the 27-layer tower from `mmproj-F16.gguf` matches transformers' tower with the same weights
+to 2.5e-5 relative on the CPU (and with `OXINFER_METAL_MMA=0`), 0.9% with Metal's default
+half-precision matmul operands (0.8 s instead of 1.4 s for 630 tokens); the model names Vermeer's
+"Girl with a Pearl Earring" from the PNG and describes it (prefill 721 tokens in 3.4 s).
+
+Not done: video input from GGUF is wired the same way but untested, GPU decoding past 2051 tokens (no GPU block selection), the merged-weight GGUF layout, and
 fast prefill (the MoE router, the Gated DeltaNet recurrence and attention run on the CPU in
 prefill: 6x slower than llama.cpp's).
 
@@ -3437,7 +3465,9 @@ Gemma 4's, a SentencePiece-style BPE with byte fallback, on this README and mult
 llama.cpp's conversions are undone at load (`gguf.rs`): norms with the 1 folded in, `ssm_a`, the
 tiled Gated DeltaNet value-head order, separate 3D expert tensors, Llama's permuted query / key
 rows, Gemma 4's proportional RoPE stored as per-frequency divisors (`rope_freqs`). The `mmproj`
-vision files are not read (except Mistral Large 4's), so image input needs the safetensors or MLX checkpoint. Weights stay in their GGUF
+vision files are read for Mistral Large 4 (`pixtral`) and Qwen3.5-family towers
+(`qwen3vl_merger`, see [Qwen3.8-Flash-Next](#qwen38-flash-next)); other models' image input needs
+the safetensors or MLX checkpoint. Weights stay in their GGUF
 format: F32, F16, BF16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q2_K-Q6_K, IQ1_S/IQ1_M, IQ2_XXS/XS/S,
 IQ3_XXS/S, IQ4_NL/XS and MXFP4 (`ggml.rs`, dequantization bit-exact with gguf-py), with NEON decode
 kernels for every type and Metal prefill kernels. The i-quants (IQ1-IQ3) decode several times

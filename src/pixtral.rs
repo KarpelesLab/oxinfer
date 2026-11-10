@@ -52,10 +52,12 @@ impl PixtralConfig {
     }
 
     /// [`PixtralConfig::load`] with the projector chosen by `mmproj`: an explicit file replaces
-    /// the checkpoint's tower (it must be a Pixtral `mmproj`), `None` gives no vision.
+    /// the checkpoint's tower (None when it is not a Pixtral `mmproj`, e.g. a Qwen one), `None`
+    /// gives no vision.
     pub fn load_with(dir: &Path, mmproj: &Mmproj) -> Result<Option<Self>> {
         match mmproj {
             Mmproj::None => return Ok(None),
+            Mmproj::File(p) if projector_type(p).as_deref() != Some("pixtral") => return Ok(None),
             Mmproj::File(p) => return Self::from_mmproj(p, dir).map(Some),
             Mmproj::Auto => {}
         }
@@ -158,8 +160,8 @@ fn load_vocab(dir: &Path) -> Option<crate::tokenizer::Tokenizer> {
     crate::tokenizer::Tokenizer::from_bytes(crate::fsx::read(&dir.join("tokenizer.json")).ok()?).ok()
 }
 
-/// Where the vision tower of a Mistral Large 4 checkpoint comes from (`EngineOptions::mmproj`,
-/// `--mmproj`).
+/// Where the vision tower of a Mistral Large 4 or Qwen3.5-family (Qwen3.8-Flash-Next) checkpoint
+/// comes from (`EngineOptions::mmproj`, `--mmproj`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum Mmproj {
     /// The checkpoint's own tower, or for a GGUF model the `mmproj*.gguf` beside it
@@ -191,6 +193,13 @@ impl Mmproj {
             _ => None,
         }
     }
+}
+
+/// `clip.projector_type` of llama.cpp mmproj file `path` (`pixtral`, `qwen3vl_merger`, ...); None
+/// when it cannot be read or has none.
+pub fn projector_type(path: &Path) -> Option<String> {
+    let h = crate::gguf::header(path).ok()?;
+    h.get("clip.projector_type").and_then(|v| v.as_str()).map(str::to_string)
 }
 
 /// The llama.cpp `mmproj*.gguf` vision file beside GGUF model `model` (in its folder or the

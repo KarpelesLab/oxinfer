@@ -27,8 +27,8 @@ pub struct MmRequest<'a> {
     pub max_soft_tokens: usize,
     /// Write the first image's / clip's inputs and soft tokens as f32 files with this prefix.
     pub dump_mm: Option<&'a Path>,
-    /// Mistral Large 4: where the vision tower comes from (default: the checkpoint, or the
-    /// `mmproj` file beside a GGUF model).
+    /// Mistral Large 4 / Qwen3.5-family: where the vision tower comes from (default: the
+    /// checkpoint, or the `mmproj` file beside a GGUF model).
     pub mmproj: crate::pixtral::Mmproj,
 }
 
@@ -256,7 +256,7 @@ fn prepare_sources(src: &Sources, files: &ModelFiles, text_hidden: usize) -> Res
     if let Some(pc) = crate::pixtral::PixtralConfig::load_with(args.model, &args.mmproj)? {
         return prepare_pixtral(src, files, text_hidden, pc);
     }
-    if let Some(qc) = qwen_vision::QwenMmConfig::load(args.model)? {
+    if let Some(qc) = qwen_vision::QwenMmConfig::load_with(args.model, &args.mmproj)? {
         return prepare_qwen(src, files, text_hidden, qc);
     }
     let mmc = mm_config::MmConfig::load(args.model)?;
@@ -497,7 +497,8 @@ fn prepare_qwen(src: &Sources, files: &ModelFiles, text_hidden: usize, qc: qwen_
         );
     }
     let t = Instant::now();
-    let tower = qwen_vision::QwenVisionTower::load(qc.vision.clone(), files)?;
+    let side = qc.open_mmproj()?;
+    let tower = qwen_vision::QwenVisionTower::load(qc.vision.clone(), side.as_ref().unwrap_or(files))?;
     let m = qc.vision.spatial_merge_size;
     let unit = qc.image.patch_size * m;
     let max_pixels = args.max_soft_tokens * unit * unit;
@@ -595,7 +596,8 @@ fn qwen_image(
     Ok((px, text, feat))
 }
 
-/// Images for a Qwen3.5-family vision checkpoint in `model`: per image, its placeholder text
+/// Images for a Qwen3.5-family vision checkpoint in `model` (or a GGUF model with the mmproj file
+/// beside it): per image, its placeholder text
 /// (`<|vision_start|><|image_pad|>...<|vision_end|>`, to place anywhere in a prompt) and its
 /// feature. `max_soft_tokens` as in [`MmRequest`]. For prompts that are not chat turns (typed
 /// decisions).
@@ -606,7 +608,7 @@ pub fn encode_rgb_images(
     images: &[RgbImage],
     max_soft_tokens: usize,
 ) -> Result<Vec<(String, MmFeature)>> {
-    let Some(qc) = qwen_vision::QwenMmConfig::load(model)? else {
+    let Some(qc) = qwen_vision::QwenMmConfig::load_with(model, &crate::pixtral::Mmproj::Auto)? else {
         return encode_rgb_images_gemma(model, files, text_hidden, images, max_soft_tokens);
     };
     if qc.vision.out_hidden_size != text_hidden {
@@ -616,7 +618,8 @@ pub fn encode_rgb_images(
         );
     }
     let t = Instant::now();
-    let tower = qwen_vision::QwenVisionTower::load(qc.vision.clone(), files).context("load the vision tower")?;
+    let side = qc.open_mmproj()?;
+    let tower = qwen_vision::QwenVisionTower::load(qc.vision.clone(), side.as_ref().unwrap_or(files)).context("load the vision tower")?;
     let unit = qc.image.patch_size * qc.vision.spatial_merge_size;
     let mut out = Vec::with_capacity(images.len());
     for (i, img) in images.iter().enumerate() {

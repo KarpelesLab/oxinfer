@@ -115,8 +115,9 @@ char *oxi_download(const char *spec, const char *cache_dir, oxi_progress_fn prog
  *                        a Mistral Large 4 checkpoint over 60% of RAM; off: never (an oversized checkpoint
  *                        is then memory-mapped and demand-paged); cache_budget_gb=F, resident_mb,
  *                        prefetch_mb, expert_cache_mb, expert_predict=0|1 tune it
- *   mmproj=auto|none|FILE  Mistral Large 4 vision projector: a llama.cpp mmproj GGUF (path or
- *                        org/repo/file); auto (default): the checkpoint's tower, or the
+ *   mmproj=auto|none|FILE  vision tower of Mistral Large 4 (pixtral) and Qwen3.5-family models
+ *                        such as Qwen3.8-Flash-Next (qwen3vl_merger): a llama.cpp mmproj GGUF
+ *                        (path or org/repo/file); auto (default): the checkpoint's tower, or the
  *                        mmproj*.gguf beside a GGUF model; none: no image input
  *   gpu_decode=0|1       generate a whole token per GPU submission where supported (Metal:
  *                        Llama 3, Qwen3, Qwen3.5/3.8 dense; default 1; process-wide)

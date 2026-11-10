@@ -166,11 +166,11 @@ pub struct EngineOptions {
     /// then plainly memory-mapped and demand-paged). Key `stream` (`auto`, `on` / `1`, `off` /
     /// `0`).
     pub stream_mode: StreamMode,
-    /// Mistral Large 4 from GGUF: where the Pixtral vision projector (llama.cpp `mmproj` GGUF)
-    /// comes from. Default: an `mmproj*.gguf` beside the model (in its folder or the one above);
-    /// a file (path or `org/repo/file`, which is downloaded) also replaces the tower of a
-    /// safetensors checkpoint; `none` disables image input. Key `mmproj` (`auto`, `none`, or the
-    /// file).
+    /// Mistral Large 4 and Qwen3.5-family models (Qwen3.8-Flash-Next) from GGUF: where the
+    /// vision tower (llama.cpp `mmproj` GGUF: `pixtral`, `qwen3vl_merger`) comes from. Default: an
+    /// `mmproj*.gguf` beside the model (in its folder or the one above); a file (path or
+    /// `org/repo/file`, which is downloaded) also replaces the tower of a safetensors
+    /// checkpoint; `none` disables image input. Key `mmproj` (`auto`, `none`, or the file).
     pub mmproj: crate::pixtral::Mmproj,
     /// Core ML models: where Core ML may run them. Default (None): the Neural Engine, or the
     /// CPU / GPU when `device` asks for it. Key `coreml_units` (`auto`, `ane`, `all`, `gpu`,
@@ -2326,8 +2326,8 @@ impl Engine {
 
     /// [`Engine::send`] with attachments placed before the message text (files need the `media`
     /// feature, decoded frames the `oxideav` feature): images, videos and audio for Gemma 4;
-    /// images and videos for Qwen3.5 / 3.6 / 3.8 checkpoints that include the vision tower. Not
-    /// for Core ML models.
+    /// images and videos for Qwen3.5 / 3.6 / 3.8 checkpoints that include the vision tower (or,
+    /// from GGUF, with its `mmproj` file: see [`EngineOptions::mmproj`]). Not for Core ML models.
     pub fn send_with_media(&mut self, user: &str, media: &Attachments, on_delta: &mut dyn FnMut(&Delta) -> Flow) -> Result<Reply> {
         let (mm_text, feats) = self.prepare_media(media)?;
         let text = self.prompt_text(&format!("{mm_text}{user}"));
@@ -2347,7 +2347,11 @@ impl Engine {
             }
             match self.info.family {
                 Family::Gemma4 => {}
-                Family::Qwen if crate::qwen_vision::is_qwen_vl(&self.info.path) => {}
+                Family::Qwen if self.mmproj == crate::pixtral::Mmproj::None => bail!("image input is disabled (mmproj none)"),
+                Family::Qwen if crate::qwen_vision::QwenMmConfig::load_with(&self.info.path, &self.mmproj)?.is_some() => {}
+                Family::Qwen if crate::gguf::is_gguf(&self.info.path) => {
+                    bail!("this checkpoint has no vision tower (for a GGUF model: no Qwen mmproj file beside it; set the mmproj option)")
+                }
                 Family::Qwen => bail!("this checkpoint has no vision tower (text only)"),
                 Family::Mistral4 if self.mmproj == crate::pixtral::Mmproj::None => bail!("image input is disabled (mmproj none)"),
                 Family::Mistral4 if crate::pixtral::PixtralConfig::load_with(&self.info.path, &self.mmproj)?.is_some() => {}
@@ -2419,7 +2423,7 @@ impl Engine {
         if !plan.images.is_empty() {
             let t = Instant::now();
             match self.info.family {
-                Family::Qwen if crate::qwen_vision::is_qwen_vl(&self.info.path) => {}
+                Family::Qwen if crate::qwen_vision::QwenMmConfig::load_with(&self.info.path, &crate::pixtral::Mmproj::Auto)?.is_some() => {}
                 Family::Qwen => bail!(
                     "{}: no vision tower (a text-only checkpoint), so image decisions are unavailable; load the \
                      multimodal base (e.g. Qwen/Qwen3.5-9B with decision_from autotrust/JEV-9B/vl, or autotrust/JEV-27B-VL)",
