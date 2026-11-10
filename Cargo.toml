@@ -112,7 +112,7 @@ media = [
 ]
 # Fetching models from HuggingFace through rsurl.
 hf = ["dep:rsurl"]
-# Runtime-loaded GPU backends (CUDA, Metal, Vulkan detection); all optional at run time.
+# Runtime-loaded GPU backends (CUDA, Metal, Vulkan); all optional at run time.
 gpu = ["dep:dlsym"]
 # The browser module (wasm32-unknown-unknown only): C-ABI exports for web/oxinfer.js and the
 # WebGPU backend. Build with `cargo build-web` (see .cargo/config.toml).

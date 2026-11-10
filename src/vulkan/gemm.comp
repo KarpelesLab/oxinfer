@@ -1,0 +1,132 @@
+#version 450
+// Tiled f32 GEMM of the Vulkan backend (see ../vulkan.rs), one source for the four weight formats:
+// compile with -DFMT_BF16, -DFMT_Q8, -DFMT_Q4 or -DFMT_Q4A (affine Q4, MLX). The compiled SPIR-V
+// is checked in next to this file (gemm_*.spv); regenerate it with tools/vulkan_shaders.sh.
+//
+// A workgroup of 256 invocations computes 64 (out rows) x 64 (tokens): per 32-wide K block the
+// weights are dequantized into shared memory ([k][row]) next to the x tile ([k][tok]), then each
+// invocation accumulates a 4 x 4 tile. Every output is one accumulator taking one fma per k in
+// order, which is the CPU prefill GEMM's arithmetic. The host pads the token count to 64.
+//
+// Only Vulkan 1.0 core features: the 8- and 16-bit weights are read as 32-bit words
+// (little-endian hosts), so no storageBuffer16BitAccess / shaderInt8 is needed.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant) uniform P {
+    uint n_out;  // row length of y (the whole matrix)
+    uint n_in;
+    uint row0;   // output row of this chunk's first weight row
+    uint s_base; // word offset of the chunk's scales in w (Q8: f32, Q4: f16)
+    uint o_base; // affine Q4: word offset of the chunk's bf16 offsets in w
+    uint gpr;    // affine Q4: offsets per row
+    uint gk;     // affine Q4: blocks of 32 per offset group
+} p;
+
+// One chunk of whole weight rows: the values, then the scales, then the offsets, each starting
+// on a word. Three storage buffers in all (the Vulkan minimum per stage is four).
+layout(set = 0, binding = 0) readonly buffer W { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer X { float x[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+
+// Scalar arrays: writing one component of a shared vec4 through a dynamic index is miscompiled
+// by some implementations.
+shared float Ws[32 * 64];
+shared float Xs[32 * 64];
+
+float bf16f(uint u) { return uintBitsToFloat(u << 16); }
+
+// Element i of an array of 16-bit values, from the word that holds it.
+uint u16_at(uint word, uint i) { return (word >> ((i & 1u) * 16u)) & 0xffffu; }
+
+float f16f(uint h) {
+    uint e = (h >> 10) & 31u, m = h & 1023u, sign = (h & 0x8000u) << 16;
+    if (e == 31u) return uintBitsToFloat(sign | 0x7f800000u | (m << 13));
+    if (e == 0u) return uintBitsToFloat(sign | floatBitsToUint(float(m) * 5.9604644775390625e-8));
+    return uintBitsToFloat(sign | ((e + 112u) << 23) | (m << 13));
+}
+
+// Weights row[k0 + lc * 8 .. + 8] of the chunk (k0 a multiple of 32) into Ws[..][lr].
+void load_w(uint row, uint k0, uint lr, uint lc) {
+    uint base = lc * 8u * 64u + lr;
+#if defined(FMT_BF16)
+    uint e = (row * p.n_in + k0 + lc * 8u) >> 1;
+    for (uint j = 0u; j < 4u; j++) {
+        uint u = w[e + j];
+        Ws[base + (2u * j) * 64u] = bf16f(u & 0xffffu);
+        Ws[base + (2u * j + 1u) * 64u] = bf16f(u >> 16);
+    }
+#elif defined(FMT_Q8)
+    float d = uintBitsToFloat(w[p.s_base + row * (p.n_in >> 5) + (k0 >> 5)]);
+    uint e = (row * p.n_in + k0 + lc * 8u) >> 2;
+    for (uint j = 0u; j < 2u; j++) {
+        uint u = w[e + j];
+        for (uint i = 0u; i < 4u; i++) {
+            Ws[base + (4u * j + i) * 64u] = float(int(u << (24u - 8u * i)) >> 24) * d;
+        }
+    }
+#else
+    uint b = k0 >> 5;
+    uint si = row * (p.n_in >> 5) + b;
+    float d = f16f(u16_at(w[p.s_base + (si >> 1)], si));
+#ifdef FMT_Q4A
+    uint oi = row * p.gpr + b / p.gk;
+    float m = bf16f(u16_at(w[p.o_base + (oi >> 1)], oi));
+#endif
+    // Byte j of a block holds element j in its low nibble and element j + 16 in its high one.
+    uint e = (row * (p.n_in >> 1) + b * 16u + (lc & 1u) * 8u) >> 2;
+    uint sh = lc < 2u ? 0u : 4u;
+    for (uint j = 0u; j < 2u; j++) {
+        uint u = w[e + j] >> sh;
+        for (uint i = 0u; i < 4u; i++) {
+            // precise: the product and the offset's addition stay two operations, as on the CPU.
+            precise float v = float(int((u >> (8u * i)) & 15u) - 8) * d;
+#ifdef FMT_Q4A
+            v = v + m;
+#endif
+            Ws[base + (4u * j + i) * 64u] = v;
+        }
+    }
+#endif
+}
+
+void main() {
+    uint li = gl_LocalInvocationIndex;
+    uint n0 = gl_WorkGroupID.x * 64u;
+    uint t0 = gl_WorkGroupID.y * 64u;
+    uint tn = li % 16u; // the 4 rows this invocation accumulates
+    uint tt = li / 16u; // the 4 tokens
+    uint lr = li / 4u;  // the row (weights) and token (x) this invocation loads
+    uint lc = li % 4u;  // which 8 of the 32 k
+    precise vec4 a0 = vec4(0.0);
+    precise vec4 a1 = vec4(0.0);
+    precise vec4 a2 = vec4(0.0);
+    precise vec4 a3 = vec4(0.0);
+    for (uint k0 = 0u; k0 < p.n_in; k0 += 32u) {
+        load_w(n0 + lr, k0, lr, lc);
+        uint xb = (t0 + lr) * p.n_in + k0 + lc * 8u;
+        for (uint i = 0u; i < 8u; i++) {
+            Xs[(lc * 8u + i) * 64u + lr] = x[xb + i];
+        }
+        barrier();
+        for (uint k = 0u; k < 32u; k++) {
+            uint wi = k * 64u + tn * 4u;
+            uint xi = k * 64u + tt * 4u;
+            vec4 xv = vec4(Xs[xi], Xs[xi + 1u], Xs[xi + 2u], Xs[xi + 3u]);
+            a0 = fma(vec4(Ws[wi]), xv, a0);
+            a1 = fma(vec4(Ws[wi + 1u]), xv, a1);
+            a2 = fma(vec4(Ws[wi + 2u]), xv, a2);
+            a3 = fma(vec4(Ws[wi + 3u]), xv, a3);
+        }
+        barrier();
+    }
+    uint nb = p.row0 + n0 + tn * 4u;
+    uint tb = t0 + tt * 4u;
+    for (uint j = 0u; j < 4u; j++) {
+        uint yo = (tb + j) * p.n_out + nb;
+        y[yo] = a0[j];
+        y[yo + 1u] = a1[j];
+        y[yo + 2u] = a2[j];
+        y[yo + 3u] = a3[j];
+    }
+}

@@ -32,6 +32,13 @@ pub struct GpuInfo {
     pub unified_memory: bool,
 }
 
+impl GpuInfo {
+    /// A Vulkan implementation that runs on the CPU (llvmpipe, SwiftShader).
+    pub fn is_software(&self) -> bool {
+        self.kind == GpuKind::Vulkan && self.driver.ends_with("(cpu)")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CpuInfo {
     pub arch: &'static str,
@@ -49,7 +56,8 @@ pub struct Platform {
     pub notes: Vec<String>,
 }
 
-/// Which accelerator to use; `Auto` picks the first usable GPU backend, else the CPU.
+/// Which accelerator to use; `Auto` picks the first usable GPU backend (Metal or CUDA before
+/// Vulkan), else the CPU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DevicePref {
     Auto,
@@ -306,11 +314,20 @@ impl Platform {
         s
     }
 
+    /// The devices `auto` tries, in order: the first of each backend (Metal or CUDA before
+    /// Vulkan), without Vulkan's software rasterizers (slower than the CPU kernels).
+    pub fn auto_order(&self) -> impl Iterator<Item = &GpuInfo> {
+        self.gpus.iter().enumerate().filter_map(|(i, g)| {
+            let first = !self.gpus[..i].iter().any(|x| x.kind == g.kind);
+            (first && !g.is_software()).then_some(g)
+        })
+    }
+
     /// Resolves a preference to a concrete GPU, if any.
     pub fn pick(&self, pref: DevicePref) -> Option<&GpuInfo> {
         match pref {
             DevicePref::Cpu => None,
-            DevicePref::Auto => self.gpus.first(),
+            DevicePref::Auto => self.auto_order().next(),
             DevicePref::Gpu(k) => self.gpus.iter().find(|g| g.kind == k),
         }
     }
@@ -336,14 +353,9 @@ pub mod gpu {
         }
         #[cfg(not(target_arch = "wasm32"))]
         match vulkan::probe() {
-            Ok(v) if !v.is_empty() => {
-                // Skip Vulkan devices that are the same physical GPU already reported via CUDA/Metal.
-                for g in v {
-                    if !gpus.iter().any(|x| x.name == g.name) {
-                        gpus.push(g);
-                    }
-                }
-            }
+            // After the vendor backends (which `auto` prefers), and listed even when the same
+            // physical GPU is already there through CUDA or Metal: `--device vulkan` picks them.
+            Ok(v) if !v.is_empty() => gpus.extend(v),
             Ok(_) => notes.push("vulkan: no device".into()),
             Err(e) => notes.push(format!("vulkan: {e}")),
         }
@@ -615,6 +627,18 @@ pub mod gpu {
                 });
             }
             unsafe { vk.vkDestroyInstance(inst, std::ptr::null()) };
+            // The order `--device vulkan` and `auto` take them in: `OXINFER_VULKAN_DEVICE=N` (the
+            // index listed by `--devices`) first when set, then discrete devices, integrated,
+            // virtual, others and software rasterizers; the larger memory first within a type.
+            let forced: Option<usize> = std::env::var("OXINFER_VULKAN_DEVICE").ok().and_then(|v| v.parse().ok());
+            let rank = |g: &GpuInfo| {
+                let ty = ["(discrete)", "(integrated)", "(virtual)", "(other)", "(cpu)"]
+                    .iter()
+                    .position(|t| g.driver.ends_with(t))
+                    .unwrap_or(3);
+                (Some(g.index) != forced, ty, std::cmp::Reverse(g.memory_bytes.unwrap_or(0)))
+            };
+            out.sort_by_key(rank);
             Ok(out)
         }
     }

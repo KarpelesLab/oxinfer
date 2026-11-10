@@ -423,13 +423,43 @@ pub fn active() -> Option<&'static dyn Backend> {
 }
 
 /// Picks and initialises a backend for the detected platform and the user's preference. `Auto`
-/// falls back to the CPU when no GPU backend can start; a device asked for by name that is missing
+/// tries each detected backend in order (Metal or CUDA, then Vulkan) and falls back to the CPU
+/// when none can start; a device asked for by name that is missing
 /// or cannot start is an error (and nothing is installed, so the caller can still choose another).
 pub fn init(plat: &crate::platform::Platform, pref: crate::platform::DevicePref) -> anyhow::Result<Option<&'static dyn Backend>> {
     use crate::platform::DevicePref;
-    let chosen: Option<Box<dyn Backend>> = match plat.pick(pref) {
-        None => {
-            if let DevicePref::Gpu(k) = pref {
+    let start = |g: &crate::platform::GpuInfo| -> Result<Box<dyn Backend>, String> {
+        match g.kind {
+            #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+            crate::platform::GpuKind::Metal => crate::metal::MetalBackend::new()
+                .map(|b| Box::new(b) as Box<dyn Backend>)
+                .map_err(|e| e.to_string()),
+            #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
+            crate::platform::GpuKind::Cuda => crate::cuda::CudaBackend::new(g.index)
+                .map(|b| Box::new(b) as Box<dyn Backend>)
+                .map_err(|e| e.to_string()),
+            #[cfg(all(feature = "gpu", target_pointer_width = "64", not(target_arch = "wasm32")))]
+            crate::platform::GpuKind::Vulkan => crate::vulkan::VulkanBackend::new(g.index)
+                .map(|b| Box::new(b) as Box<dyn Backend>)
+                .map_err(|e| e.to_string()),
+            #[allow(unreachable_patterns)]
+            _ => Err(format!("{} compute is not implemented in this build", g.kind.as_str())),
+        }
+    };
+    let chosen: Option<Box<dyn Backend>> = match pref {
+        DevicePref::Cpu => None,
+        // The first backend that starts: Metal or CUDA when present, else Vulkan.
+        DevicePref::Auto => plat.auto_order().find_map(|g| match start(g) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                if !e.contains("not implemented") {
+                    eprintln!("[{}: {e}]", g.kind.as_str());
+                }
+                None
+            }
+        }),
+        DevicePref::Gpu(k) => match plat.pick(pref) {
+            None => {
                 let why = if plat.notes.is_empty() {
                     String::new()
                 } else {
@@ -437,31 +467,11 @@ pub fn init(plat: &crate::platform::Platform, pref: crate::platform::DevicePref)
                 };
                 anyhow::bail!("device {}: not available{why}", k.as_str());
             }
-            None
-        }
-        Some(g) => {
-            let r: Result<Box<dyn Backend>, String> = match g.kind {
-                #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
-                crate::platform::GpuKind::Metal => crate::metal::MetalBackend::new()
-                    .map(|b| Box::new(b) as Box<dyn Backend>)
-                    .map_err(|e| e.to_string()),
-                #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
-                crate::platform::GpuKind::Cuda => crate::cuda::CudaBackend::new(g.index)
-                    .map(|b| Box::new(b) as Box<dyn Backend>)
-                    .map_err(|e| e.to_string()),
-                _ => Err(format!("{} compute is not implemented in this build", g.kind.as_str())),
-            };
-            match r {
+            Some(g) => match start(g) {
                 Ok(b) => Some(b),
-                Err(e) if pref != DevicePref::Auto => anyhow::bail!("device {}: {e}", g.kind.as_str()),
-                Err(e) => {
-                    if !e.contains("not implemented") {
-                        eprintln!("[{}: {e}; using CPU]", g.kind.as_str());
-                    }
-                    None
-                }
-            }
-        }
+                Err(e) => anyhow::bail!("device {}: {e}", g.kind.as_str()),
+            },
+        },
     };
     install(chosen);
     Ok(active())
@@ -505,16 +515,21 @@ mod tests {
         plat.gpus.clear();
         let e = init(&plat, DevicePref::Gpu(GpuKind::Cuda)).err().expect("missing device must fail");
         assert!(e.to_string().starts_with("device cuda: not available"), "{e}");
-        // Detected, but with no compute backend.
+        // Detected, but with no compute backend in this build.
+        let kind = if cfg!(any(target_os = "macos", target_os = "ios")) {
+            GpuKind::Cuda
+        } else {
+            GpuKind::Metal
+        };
         plat.gpus.push(GpuInfo {
-            kind: GpuKind::Vulkan,
+            kind,
             index: 0,
             name: "test".into(),
             memory_bytes: None,
             driver: String::new(),
             unified_memory: false,
         });
-        let e = init(&plat, DevicePref::Gpu(GpuKind::Vulkan)).err().expect("vulkan has no compute");
+        let e = init(&plat, DevicePref::Gpu(kind)).err().expect("no compute for this kind here");
         assert!(e.to_string().contains("not implemented"), "{e}");
     }
 }
