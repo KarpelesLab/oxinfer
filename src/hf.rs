@@ -539,10 +539,32 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
             if path.is_empty() {
                 continue;
             }
-            for f in ["config.json", "model.safetensors", "pytorch_model.bin"] {
-                let name = format!("{path}/{f}");
-                if list.contains_key(&name) && !(f == "pytorch_model.bin" && list.contains_key(&format!("{path}/model.safetensors"))) {
-                    files.push(name);
+            // A dense module named `X_N` may have siblings `X_M`: the same projection to other
+            // output sizes (stella's `2_Dense_256` ... `2_Dense_8192`), a few MB each.
+            let mut paths = vec![path.to_string()];
+            if let Some((stem, n)) = path.rsplit_once('_')
+                && n.parse::<usize>().is_ok()
+            {
+                let mut sib: Vec<String> = list
+                    .keys()
+                    .filter_map(|k| k.strip_suffix("/config.json"))
+                    .filter(|p| *p != path)
+                    .filter(|p| {
+                        p.strip_prefix(stem)
+                            .and_then(|r| r.strip_prefix('_'))
+                            .is_some_and(|m| m.parse::<usize>().is_ok())
+                    })
+                    .map(str::to_string)
+                    .collect();
+                sib.sort();
+                paths.extend(sib);
+            }
+            for path in &paths {
+                for f in ["config.json", "model.safetensors", "pytorch_model.bin"] {
+                    let name = format!("{path}/{f}");
+                    if list.contains_key(&name) && !(f == "pytorch_model.bin" && list.contains_key(&format!("{path}/model.safetensors"))) {
+                        files.push(name);
+                    }
                 }
             }
         }

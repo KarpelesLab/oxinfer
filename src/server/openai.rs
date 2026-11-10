@@ -825,13 +825,15 @@ pub(super) fn embeddings(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
             _ => return Err(bad_input()),
         };
         tokens += m.emb.tok.encode(text.as_str(), true).map(|e| e.len()).unwrap_or(0);
-        let mut e = m
-            .emb
-            .embed(&text, prompt_name.as_deref())
-            .map_err(|e| ApiError::bad(format!("{e:#}")))?;
-        if let Some(d) = dims {
-            e.truncate(d).map_err(|e| ApiError::bad(format!("{e:#}")).param("dimensions"))?;
+        if let Some(d) = dims
+            && (d == 0 || (d > m.emb.dim() && !m.emb.head_dims().contains(&d)))
+        {
+            return Err(ApiError::bad(format!("cannot give {d} dimensions (the model has {})", m.emb.dim())).param("dimensions"));
         }
+        let e = m
+            .emb
+            .embed_dim(&text, prompt_name.as_deref(), dims)
+            .map_err(|e| ApiError::bad(format!("{e:#}")))?;
         let embedding = if base64 {
             let bytes: Vec<u8> = e.dense.iter().flat_map(|x| x.to_le_bytes()).collect();
             Value::String(crate::b64::encode(&bytes))

@@ -67,6 +67,7 @@ optional.
 | mlx-community/gemma-3-4b-it-4bit (Gemma 3) | 4.3B | 3.4 GB (MLX 4-bit) | text only; matches the reference, also past the 1024-token window |
 | google/embeddinggemma-300m | 0.3B | 1.2 GB (fp32) | embeddings; matches sentence-transformers (see [Embeddings](#embeddings)) |
 | Qwen/Qwen3-Embedding-0.6B | 0.6B | 1.2 GB | embeddings; matches sentence-transformers |
+| Alibaba-NLP/gte-Qwen2-1.5B-instruct, NovaSearch/stella_en_1.5B_v5 | 1.5B | 7.1 / 6.2 GB (fp32) | embeddings (bidirectional Qwen2; stella with its per-size heads); match sentence-transformers |
 | BAAI/bge-m3 | 0.6B | 2.3 GB (fp32, `pytorch_model.bin`) | dense, sparse and ColBERT embeddings; matches the reference |
 | sentence-transformers/all-MiniLM-L6-v2, paraphrase-multilingual-MiniLM-L12-v2 | 23M / 118M | 90 / 470 MB | embeddings (BERT); match sentence-transformers |
 | BAAI/bge-small-en-v1.5, intfloat/multilingual-e5-small, mixedbread-ai/mxbai-embed-large-v1 | 33M-335M | 0.13-1.3 GB | embeddings (BERT / XLM-R); match sentence-transformers |
@@ -1040,7 +1041,7 @@ and faster routed experts in prefill (less tile padding, or larger chunks).
 ## Embeddings
 
 sentence-transformers models are recognised by their `modules.json` and run in embedding mode:
-the backbone (Gemma 3 with bidirectional attention, Qwen3, or a BERT / XLM-RoBERTa encoder in
+the backbone (Gemma 3 with bidirectional attention, Qwen3, Qwen2, or a BERT / XLM-RoBERTa encoder in
 `bert.rs`), then the listed modules: pooling (CLS, mean, max, last token), dense projections,
 normalization. Named prompts come from `config_sentence_transformers.json`. Each input line
 gives one JSON array (or `-p TEXT` one):
@@ -1090,7 +1091,40 @@ ModernBERT (alternating global and sliding-window attention) is supported too:
 modernbert-embed-base and gte-modernbert-base give cosines of 0.99993 and 0.99998 against the
 fp32 reference, and 1 - 1e-6 against one with the same bf16-rounded matrices. modernbert-embed
 expects a `search_query: ` / `search_document: ` prefix in the text itself.
-Qwen2-based embedders (gte-Qwen2, stella) are another architecture and are not supported yet.
+
+Qwen2-based embedders run on the Qwen2 decoder of `qwen.rs` (biased q / k / v projections, no
+query / key norms) without the causal mask: the modeling code these repositories ship makes
+`Qwen2Model` bidirectional unless asked otherwise, and sentence-transformers never asks.
+
+- Alibaba-NLP/gte-Qwen2-1.5B-instruct (and gte-Qwen2-7B-instruct, the same code and layout; not
+  run here): last-token pooling, normalized, 1536 dimensions. Queries take the `query` prompt
+  (`Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery: `);
+  for another task write that format into the text and name no prompt. Documents take none. The
+  pooled token is the `<|endoftext|>` that the model's tokenizer class appends
+  (`add_eos_token`; its `tokenizer.json` has no template for it, so it is appended here).
+- NovaSearch/stella_en_1.5B_v5 (dunzhang's, renamed): mean pooling over every token including
+  the appended `<|endoftext|>`, then a linear head, not normalized (as its `modules.json` says).
+  Prompts `s2p_query` (retrieval queries) and `s2s_query` (similarity), none for documents;
+  512 tokens. The repository has one head per output size, `2_Dense_256` ... `2_Dense_8192`,
+  and `modules.json` names the 1024 one: `--dim N` (`dimensions` in the API) uses the head of
+  that size rather than truncating, and any other size is an error. Downloading fetches all of
+  them (140 MB).
+
+```sh
+./target/release/oxinfer --model Alibaba-NLP/gte-Qwen2-1.5B-instruct --prompt-name query -p "how much protein should a female eat"
+./target/release/oxinfer --model NovaSearch/stella_en_1.5B_v5 --prompt-name s2p_query --dim 256 -p "..."
+```
+
+Against sentence-transformers float32 running that modeling code (`tools/ref_embed.py
+--trust-remote-code`), on nine short texts in five languages: gte-Qwen2-1.5B cosine >= 0.99999
+with and without the query prompt (largest element difference 6e-4 on unit vectors), the same on
+a 1560-word text, and 1 - 1e-6 (1.5e-6 per element) against the reference with the same
+bf16-rounded matrices; the reference encoding the nine texts as one left-padded batch gives the
+same numbers. stella_en_1.5B_v5: cosine >= 0.999997 for documents and both prompts, in a
+right-aligned (left-padded) batch as well, 0.999996 on a text cut at 512 tokens, and >= 0.999997
+with each of the other six heads (`--dense 2_Dense_N` on the reference side). Inputs are embedded
+one at a time, so there is no padding to mask. stella_en_400M_v5 is not a Qwen2 model (its base
+is Alibaba's `new` encoder) and is not supported.
 
 Two details that are easy to get wrong: transformers halves EmbeddingGemma's sliding window for
 bidirectional attention (512 in the config means keys less than 257 positions away on either
@@ -1104,6 +1138,7 @@ let files = oxinfer::safetensors::ModelFiles::open(&dir, false)?;
 let emb = oxinfer::embed::Embedder::load(&dir, &files, oxinfer::model::Quant::Bf16)?;
 let mut e = emb.embed("what is a panda?", None)?;          // or Some("query") with named prompts
 e.truncate(256)?;                                         // Matryoshka (--dim)
+let e256 = emb.embed_dim("what is a panda?", None, Some(256))?;  // --dim: stella's head of that size, else truncation
 let lexical = emb.sparse_tokens(&e);                      // BGE-M3 heads: e.sparse / e.colbert
 ```
 

@@ -1430,7 +1430,7 @@ impl<'a> QwenModel<'a> {
     /// Whether decode steps may run on the device: GPU decoding is on, and streamed weights (if
     /// any) may be decoded there ([`crate::gpu::stream_decode_enabled`]).
     fn gpu_decode_on(&self) -> bool {
-        crate::gpu::decode_enabled() && (self.stream.is_none() || crate::gpu::stream_decode_enabled())
+        crate::gpu::decode_enabled() && !self.cfg.bidirectional && (self.stream.is_none() || crate::gpu::stream_decode_enabled())
     }
 
     /// The GPU decode plan, compiled on first use (pipelines, buffers: ~0.1-0.2 s, so multi-token
@@ -2140,6 +2140,7 @@ impl<'a> QwenModel<'a> {
                 crate::qwen4exp::attention_lists(&q, cache, nh, t, &lists, &mut att)
             }
             Some(sel) if sel.iter().any(|s| s.is_some()) => crate::qwen4exp::attention_sel(&q, cache, nh, t, start, sel, &mut att),
+            _ if cfg.bidirectional => crate::model::attention_masked(&q, cache, nh, t, start, None, false, &mut att),
             _ => attention(&q, cache, nh, t, start, None, &mut att),
         }
         if gated {

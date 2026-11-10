@@ -357,7 +357,7 @@ fn usage() -> ! {
          embeddings (sentence-transformers models are detected; --embed forces it):\n\
          \x20 --embed              embed the prompt, or each stdin line: one JSON array per line\n\
          \x20 --prompt-name NAME   the model's prompt to prepend (e.g. query, document)\n\
-         \x20 --dim N              truncate to N dimensions (Matryoshka) and renormalize\n\
+         \x20 --dim N              N dimensions: truncate (Matryoshka) and renormalize, or stella's head of that size\n\
          \x20 --similarity         print the cosine similarity matrix instead\n\
          \x20 --sparse, --colbert  BGE-M3 lexical weights / multi-vector embeddings instead\n\
          \x20 --show-tokens        print token ids\n\
@@ -1785,10 +1785,7 @@ fn run_embed(args: &Args) -> Result<()> {
     let t1 = Instant::now();
     let mut vecs = Vec::with_capacity(texts.len());
     for text in &texts {
-        let mut e = emb.embed(text, args.prompt_name.as_deref())?;
-        if let Some(d) = args.dim {
-            e.truncate(d).context("--dim")?;
-        }
+        let e = emb.embed_dim(text, args.prompt_name.as_deref(), args.dim)?;
         if args.similarity {
             vecs.push(e.dense);
             continue;

@@ -584,6 +584,10 @@ pub struct QwenConfig {
     /// Query / key / value projections have biases (Qwen2, Qwen2.5-VL).
     #[serde(skip)]
     pub attention_bias: bool,
+    /// No causal mask: every token attends to the whole input (Qwen2 embedders such as
+    /// gte-Qwen2 and stella, whose modeling code runs the decoder that way; set by `crate::embed`).
+    #[serde(skip)]
+    pub bidirectional: bool,
     /// M-RoPE sections interleaved over the frequencies (Qwen3.5 / 3-VL: `i % 3` picks the axis)
     /// rather than contiguous (Qwen2-VL / 2.5-VL: the first `sections[0]` frequencies rotate with
     /// the time, the next `sections[1]` with the height, the rest with the width).
