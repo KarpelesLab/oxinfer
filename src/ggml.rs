@@ -10,7 +10,8 @@
 //! Every format is first expressed as int8 values with one f32 scale (and, for formats with a
 //! min or offset, one f32 offset) per 16 elements (`decode_i8`); that representation serves the
 //! portable dot product. The hot formats have NEON kernels in `kernels_ggml.rs` that unpack in
-//! registers instead.
+//! registers instead; `kernels_ggml_x86.rs` has the AVX2 ones (bit-identical to the portable
+//! path).
 //!
 //! The block layouts and the i-quant grid tables (`ggml_tables.rs`) come from ggml
 //! (https://github.com/ggml-org/llama.cpp, MIT License, Copyright (c) 2023-2024 The ggml authors).
@@ -26,6 +27,10 @@ use tables::*;
 #[cfg(target_arch = "aarch64")]
 #[path = "kernels_ggml.rs"]
 mod neon;
+
+#[cfg(target_arch = "x86_64")]
+#[path = "kernels_ggml_x86.rs"]
+mod avx2;
 
 /// Elements per K-quant / i-quant super-block.
 pub const QK_K: usize = 256;
@@ -304,7 +309,7 @@ impl GgufMatrix {
         self.data.len()
     }
     /// Dequantizes rows `r0..r1` into `out` (f32 row-major, `(r1 - r0) * n_in`); the same values
-    /// as `dequantize_row`, through NEON where available.
+    /// as `dequantize_row`, through NEON or AVX2 where available.
     pub fn dequantize_rows(&self, r0: usize, r1: usize, out: &mut [f32]) {
         let n = self.n_in;
         if let Some(bs) = self.block_scales.as_ref().filter(|_| self.kind != GgmlType::F8E4M3) {
@@ -339,6 +344,11 @@ impl GgufMatrix {
             #[cfg(target_arch = "aarch64")]
             // SAFETY: the row holds `n` elements of `kind` and `o` has room for them.
             if unsafe { neon::dequant_row(self.kind, self.row(r).as_ptr(), n, o.as_mut_ptr()) } {
+                continue;
+            }
+            #[cfg(target_arch = "x86_64")]
+            // SAFETY: AVX2 was detected; the row holds `n` elements of `kind` and `o` has room.
+            if crate::kernels::simd::avx2() && unsafe { avx2::dequant_row(self.kind, self.row(r), n, o.as_mut_ptr()) } {
                 continue;
             }
             dequantize_row(self.kind, self.row(r), o);
@@ -1124,6 +1134,13 @@ impl GgufMatrix {
         }
         #[cfg(target_arch = "aarch64")]
         if unsafe { neon::rows::<TC>(self, &x, y, ys, r0, r1) } {
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        if crate::kernels::simd::avx2() {
+            // SAFETY: AVX2 was detected; bounds per the caller's contract. Bit-identical to the
+            // portable kernel below.
+            unsafe { avx2::rows::<TC>(self, &x, y, ys, r0, r1) };
             return;
         }
         for r in r0..r1 {
