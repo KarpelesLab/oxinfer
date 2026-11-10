@@ -22,12 +22,19 @@ impl<'a> Model<'a> {
         let nh = cfg.num_attention_heads;
         let nl = cfg.num_hidden_layers;
         let eps = cfg.rms_norm_eps as f32;
+        // Streamed weights (units outside the resident set, routed experts) are wrapped by the
+        // plan per step (see `crate::gpu::decode::Graph::units`).
+        let streams = self.stream.is_some();
         let dev = |l: &'s Lin, n_out: usize, n_in: usize| -> Option<&'s crate::gpu::DeviceWeight> {
-            if l.has_lora() || l.is_transient() {
+            if l.has_lora() {
                 return None;
+            }
+            if l.is_transient() {
+                return streams.then(crate::gpu::decode::streamed_weight);
             }
             l.device_weight(n_out, n_in)
         };
+        let off = |l: &Lin| l.has_lora() || (l.is_transient() && !streams);
         let lin = |l: &'s Lin, n_out: usize, n_in: usize, x, y, mode| -> Option<Op<'s>> {
             Some(Op::Linear {
                 w: l.as_ref(),
@@ -44,6 +51,9 @@ impl<'a> Model<'a> {
         let max_kv = self.layers.iter().map(|l| l.n_kv).max()?;
         let max_inter = self.layers.iter().map(|l| l.inter).max()?;
         let mut g = Graph::new();
+        if let Some(s) = &self.stream {
+            g.gate = Some(std::sync::Arc::new(s.clone()));
+        }
         let x = g.buf(h);
         let hn = g.buf(h);
         let qkv = g.buf(nh * max_hd + 2 * max_kv * max_hd);
@@ -87,6 +97,7 @@ impl<'a> Model<'a> {
                 let pli = g.buf(nl * p);
                 let emb = g.buf(nl * p);
                 g.input2 = Some((emb, nl * p));
+                g.units.push((g.ops.len(), 0));
                 g.ops.push(lin(&ple.proj, nl * p, h, x, pli, LinMode::Store)?);
                 g.ops.push(Op::Norm {
                     x: pli,
@@ -150,6 +161,7 @@ impl<'a> Model<'a> {
         let mut have_hn = false;
         for (l, layer) in self.layers.iter().enumerate() {
             let Layer { hd, n_kv, .. } = *layer;
+            g.units.push((g.ops.len(), self.layer_unit(l)));
             let kv = *slot.get(layer.kv_src).filter(|&&s| s != usize::MAX)?;
             // What follows this layer's last residual step: the next layer's input norm, or the
             // final norm into `hidden`.
@@ -293,15 +305,15 @@ impl<'a> Model<'a> {
                 let mut up = Vec::with_capacity(ne);
                 for gu in &m.experts.gate_up {
                     match gu {
-                        crate::moe::GateUp::Fused(l) if !l.has_lora() && !l.is_transient() => gate.push(l.as_ref()),
-                        crate::moe::GateUp::Split(a, b) if !a.has_lora() && !b.has_lora() && !a.is_transient() && !b.is_transient() => {
+                        crate::moe::GateUp::Fused(l) if !off(l) => gate.push(l.as_ref()),
+                        crate::moe::GateUp::Split(a, b) if !off(a) && !off(b) => {
                             gate.push(a.as_ref());
                             up.push(b.as_ref());
                         }
                         _ => return None,
                     }
                 }
-                if m.experts.down.iter().any(|l| l.has_lora() || l.is_transient()) {
+                if m.experts.down.iter().any(off) {
                     return None;
                 }
                 g.ops.push(Op::Experts(crate::gpu::decode::Experts {
@@ -371,6 +383,7 @@ impl<'a> Model<'a> {
             have_hn = true;
         }
         g.head_from = g.ops.len();
+        g.units.push((g.ops.len(), self.layer_unit(nl)));
         g.ops.push(lin(&self.head, cfg.vocab_size, h, hidden, logits, LinMode::Store)?);
         if let Some(cap) = cfg.final_logit_softcapping {
             g.ops.push(Op::Ew {
@@ -385,6 +398,21 @@ impl<'a> Model<'a> {
         Some(g)
     }
 
+    /// Whether decode steps may run on the device: GPU decoding is on, and streamed weights (if
+    /// any) may be decoded there ([`crate::gpu::stream_decode_enabled`]).
+    fn gpu_decode_on(&self) -> bool {
+        crate::gpu::decode_enabled() && (self.stream.is_none() || crate::gpu::stream_decode_enabled())
+    }
+
+    /// Streamed with on-demand experts (26B-A4B) and GPU decoding left to decide: plain decode
+    /// steps are measured on both and the faster kept ([`crate::gpu::decode::DeviceChoice`]).
+    pub(super) fn choosing_device(&self) -> bool {
+        self.stream.is_some()
+            && crate::gpu::stream_decode_forced().is_none()
+            && self.gpu_decode_on()
+            && self.layers.iter().any(|l| l.moe.is_some())
+    }
+
     /// The GPU decode plan, compiled on first use (pipelines, buffers: ~0.1-0.2 s, so multi-token
     /// passes build it ahead of the first decode step); None when unavailable.
     pub(crate) fn gpu_plan(&self) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
@@ -393,7 +421,7 @@ impl<'a> Model<'a> {
 
     /// The plan for an intervention layout (None: without interventions).
     fn gpu_plan_for(&self, lay: Option<&crate::intervene::GpuLayout>) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
-        if !crate::gpu::decode_enabled() || !self.stream.is_none() {
+        if !self.gpu_decode_on() {
             return None;
         }
         self.gpu_plans.get(lay.map_or(0, |l| l.signature()), || {
@@ -407,7 +435,7 @@ impl<'a> Model<'a> {
     /// (`fast`: on the batched fast-verification kernels, see
     /// [`crate::gpu::Backend::decode_plan_multi_fast`]).
     fn gpu_multi_plan(&self, layers: &[usize], tokens: usize, fast: bool) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
-        if !crate::gpu::decode_enabled() || self.stream.is_some() {
+        if !self.gpu_decode_on() {
             return None;
         }
         let fast = fast && tokens > 1;
@@ -527,10 +555,13 @@ impl<'a> Model<'a> {
     /// wanted, the (softcapped) logits. None (nothing changed) when GPU decoding is off or
     /// unavailable for this model.
     pub(super) fn gpu_step(&self, sess: &mut Session, tok: u32, want_logits: bool) -> Option<(Vec<f32>, Option<Vec<f32>>)> {
-        if !crate::gpu::decode_enabled() || self.stream.is_some() {
+        if !self.gpu_decode_on() {
             return None;
         }
         if !sess.iv.gpu_ok() {
+            return None;
+        }
+        if self.choosing_device() && !self.stream_choice.want_gpu() {
             return None;
         }
         let ivc = sess.iv.iv.clone();

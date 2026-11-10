@@ -4246,7 +4246,7 @@ before the lookup (with priority over the read-ahead) rather than faulting in pa
 | `--flash-mbps N` / `OXINFER_FLASH_MBPS` | emulate storage that reads N MB/s (the reader sleeps per uncached byte) |
 | `--stream-io M`, `--stream-threads N` | `advise` (default on Apple), `pread` or `touch`; reader threads (default 2) |
 | `--stream-trace` | one line per token / speculative round, and one per prefill: bytes read vs cache hits, stall time |
-| `--stream-gpu M` | `auto` (default: dense models decode on the GPU, MoE models measure both on their first tokens and keep the faster), `on`, `off` (engine / C API `stream_gpu`) |
+| `--stream-gpu M` | `auto` (default: dense models decode on the GPU, MoE models measure both on their first tokens and keep the faster), `on`, `off` (Qwen3.5 / 3.8, Gemma 4 / 3; engine / C API / server key `stream_gpu`) |
 | `--expert-cache-mb N` | MoE: page cache kept for recently used routed experts (default: what the budget leaves after the resident set) |
 | `--expert-predict` | MoE: guess the next layer's experts and read them ahead (off by default, see below) |
 | `--threads N`, `--qos C`, `--efficiency-threads N` | compute threads; their QoS class on Apple platforms (`interactive` default, `initiated`, `utility`, `background` = efficiency cores only); how many of them run at background QoS |
@@ -4359,8 +4359,9 @@ wrapped without copying) a 1138-token prompt on Q4_K_P at 6 GB / 2 GB/s took 13.
 
 #### GPU decoding with streamed weights (mixed GPU / CPU)
 
-With Metal, streamed Qwen3.5 / 3.8 models (dense, MoE and Qwen3.8-Flash-Next) decode on the GPU
-too, single tokens and multi-token MTP verification alike (`--stream-gpu auto|on|off`, engine and
+With Metal, streamed Qwen3.5 / 3.8 models (dense, MoE and Qwen3.8-Flash-Next) and Gemma 4 / Gemma 3
+(dense, E2B / E4B with their per-layer embedding projection as a unit, 26B-A4B with its routed
+experts) decode on the GPU too, single tokens and multi-token MTP / DSpark verification alike (`--stream-gpu auto|on|off`, engine and
 C API key `stream_gpu`, `gpu::set_stream_decode`):
 
 - The resident set is chosen as for the CPU (the units a round uses most first: the MTP layer,
@@ -4455,6 +4456,37 @@ with a slower CPU, the measurement may go the other way. Kept expert wraps are r
 the part cache lets the expert go (checked after every step): an earlier version released them
 only when their layer came round again, which kept a token's worth of experts wired beyond the
 budget (and looked faster: Flash-Next at 6 GB read 0.9 instead of 1.2-1.5 GB per token).
+
+Gemma 4, same emulation, plain greedy decoding of a code prompt (12-48 tokens), prompt lookup off,
+two interleaved rounds (each cell: round 1 / round 2; load average 2-15 from other jobs; CPU on all
+18 threads, in parentheses on 6): gemma-4-31B-it in oxinfer Q4 (17.3 GB), ggml-org's
+gemma-4-12B-it Q8_0 (12.7 GB), ggml-org's 26B-A4B Q4_0 (14.5 GB: 1.7 GB of dense weights, 13 GB of
+routed experts read on demand, 30 layers):
+
+| Model | Budget / flash | Resident / streamed | GPU | CPU | `auto` |
+|---|---|---|---|---|---|
+| 31B Q4 | 6 GB / 2 GB/s | 5.2 / 12.1 GB | 0.162 / 0.159 tok/s | 0.158 / 0.153 (0.154 / 0.153) | GPU |
+| 31B Q4 | 8 GB / 3 GB/s | 7.1 / 10.1 GB | 0.279 / 0.290 | 0.270 / 0.278 (0.275 / 0.280) | GPU |
+| 12B Q8_0 | 4 GB / 2 GB/s | 3.1 / 9.6 GB | 0.206 / 0.206 | 0.197 / 0.197 (0.200 / 0.201) | 0.208 / 0.207 (GPU) |
+| 26B-A4B | 4 GB / 1 GB/s | 1.7 GB + 1.5 GB expert cache | 2.1 / 2.0 | 2.1 / 2.0 (2.1 / 2.1) | 2.1 / 2.1 (CPU) |
+| 26B-A4B | 6 GB / 2 GB/s | 1.7 GB + 3.5 GB expert cache | 5.6 / 5.6 | 6.4 / 6.5 (6.4 / 6.4) | 6.8 / 6.7 (CPU) |
+| 26B-A4B | 8 GB / 3 GB/s | 1.7 GB + 5.5 GB expert cache | 10.0 / 10.0 | 12.9 / 12.9 (12.7 / 12.6) | 12.6 / 12.6 (CPU) |
+
+The dense models are flash-bound on both devices (stalled on the reader 97-100% of the time), the
+GPU a few percent ahead; on a phone the CPU's share of a pass grows (as for Qwen above) while the
+GPU's stays small. The 26B-A4B waits for its routing 30 times per GPU step (~50 ms per token
+beyond the CPU's at 8 GB), so `auto` timed both on the first tokens and kept the CPU in every run
+(GPU 125 / CPU 73 ms per token at 8 GB / 3 GB/s, 219 / 122 at 6 GB / 2 GB/s).
+
+Gemma exactness, checked step by step with `OXINFER_GPU_DECODE_CHECK=1` (every GPU step also run
+on the CPU) and a hash of both outputs per step: E4B (1.5 GB budget, its PLE projection a
+streamed unit), 12B Q8_0 (4 GB), 31B Q4 (6 GB) and 26B-A4B (4 GB with every dense layer resident;
+1.5 GB with 9 of its 31 units streamed), 32-48 steps each: the streamed GPU's output was
+bit-identical to the resident GPU's at every step, the streamed CPU's to the resident CPU's, and
+the greedy tokens matched. GPU and CPU differ as without streaming (KL up to 1e-2; on E4B the 19th
+token differed). The 31B with a DSpark draft (`--draft` RedHatAI speculator) verifying on the GPU
+while streamed, with fast and with `--exact-verify` verification, gave the plain resident GPU's
+tokens.
 
 With the CLI defaults for a streamed dense model (MTP, prompt lookup on top) a code prompt on Q2_K_P
 at 8 GB / 3 GB/s decoded 63 tokens at 5.7 tok/s, 6.3 tokens per pass (lookup found nothing to copy

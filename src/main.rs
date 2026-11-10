@@ -1843,20 +1843,8 @@ fn run_qwen(mut args: Args) -> Result<()> {
             args.stream = true;
         }
         args.mmap = true;
-    } else if !args.stream && !args.mmap && !args.no_stream {
-        // Larger than this device holds (a 27B on a 12 GB phone): streamed with the device's
-        // page-cache budget (see `stream::DeviceMemory`).
-        let size = oxinfer::safetensors::checkpoint_bytes(&args.model);
-        if let Some(o) = oxinfer::stream::auto_stream(size) {
-            let budget = o.cache_budget.unwrap_or(0) as f64 / 1e9;
-            args.cache_budget_gb = Some(args.cache_budget_gb.unwrap_or(budget));
-            eprintln!(
-                "[the {:.1} GB checkpoint does not fit in this device's memory: streaming it (--stream --cache-budget-gb {:.1})]",
-                size as f64 / 1e9,
-                args.cache_budget_gb.unwrap()
-            );
-            args.stream = true;
-        }
+    } else {
+        auto_stream(&mut args);
     }
     let eos = config::load_eos_ids(&args.model);
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
@@ -2779,8 +2767,29 @@ fn run_dspark<M: oxinfer::dspark::Target<Sess: Clone>>(
     Ok(())
 }
 
-fn run_gemma(args: Args) -> Result<()> {
+/// Streams a checkpoint larger than this device holds (a 27B on a 12 GB phone) with the device's
+/// page-cache budget (see `stream::DeviceMemory`), unless told how to load it.
+fn auto_stream(args: &mut Args) {
+    if args.stream || args.mmap || args.no_stream {
+        return;
+    }
+    let size = oxinfer::safetensors::checkpoint_bytes(&args.model);
+    if let Some(o) = oxinfer::stream::auto_stream(size) {
+        let budget = o.cache_budget.unwrap_or(0) as f64 / 1e9;
+        args.cache_budget_gb = Some(args.cache_budget_gb.unwrap_or(budget));
+        eprintln!(
+            "[the {:.1} GB checkpoint does not fit in this device's memory: streaming it (--stream --cache-budget-gb {:.1})]",
+            size as f64 / 1e9,
+            args.cache_budget_gb.unwrap()
+        );
+        args.stream = true;
+        args.mmap = true;
+    }
+}
+
+fn run_gemma(mut args: Args) -> Result<()> {
     let t0 = Instant::now();
+    auto_stream(&mut args);
     let cfg = config::TextConfig::load(&args.model)?;
     let eos = config::load_eos_ids(&args.model);
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;

@@ -123,8 +123,8 @@ char *oxi_download(const char *spec, const char *cache_dir, oxi_progress_fn prog
  *   stream_gpu=0|1|auto  streamed models decode on the GPU too (process-wide; default: dense
  *                        models on the GPU, MoE models measure both on their first tokens and
  *                        keep the faster): resident layers stay wrapped, the others are wrapped
- *                        per pass as they arrive; Qwen3.5/3.8 dense and MoE (Metal). A streamed dense Qwen with an
- *                        MTP layer decodes with it by default (draft=none for plain decoding)
+ *                        per pass as they arrive; Qwen3.5/3.8 dense and MoE, Gemma 4 / 3
+ *                        dense and 26B-A4B (Metal). A streamed dense Qwen with an MTP layer decodes with it by default (draft=none for plain decoding)
  *   coreml_units=auto|ane|all|gpu|cpu   Core ML models (ANEMLL format, Apple only): compute
  *                        units (default auto: the Neural Engine, or cpu/gpu following device)
  *   coreml_prefill=auto|batch|pad|single  Core ML models: how prompts are fed (default auto)

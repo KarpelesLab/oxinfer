@@ -916,6 +916,8 @@ pub struct Model<'a> {
     stream: Option<crate::stream::StreamHook>,
     /// Single-token decoding on the GPU (see `model_gpu.rs`), compiled on first use.
     gpu_plans: crate::gpu::decode::PlanCache,
+    /// Streamed with on-demand experts: GPU or CPU decoding, measured (see `DeviceChoice`).
+    stream_choice: crate::gpu::decode::DeviceChoice,
 }
 
 #[derive(Clone)]
@@ -1190,6 +1192,7 @@ impl<'a> Model<'a> {
             inv_freq_full,
             stream: None,
             gpu_plans: Default::default(),
+            stream_choice: Default::default(),
         })
     }
 
@@ -1362,6 +1365,8 @@ impl<'a> Model<'a> {
     pub fn forward(&self, sess: &mut Session, tokens: &[u32]) -> Vec<f32> {
         let t = tokens.len();
         let h = self.cfg.hidden_size;
+        let t0 = crate::clock::Instant::now();
+        let measure = t == 1 && self.choosing_device() && self.stream_choice.measuring();
         if t == 1 {
             // OXINFER_GPU_DECODE_CHECK=1: compare every GPU step with the CPU path.
             let before = crate::gpu::decode::check().then(|| sess.clone());
@@ -1370,11 +1375,22 @@ impl<'a> Model<'a> {
                     let hs = self.forward_hidden_cpu(&mut s2, tokens, &[]);
                     crate::gpu::decode::report(s2.pos - 1, &self.logits(&hs, 1), &l);
                 }
+                if measure {
+                    self.stream_choice.record(true, t0.elapsed().as_secs_f64());
+                }
                 return l;
             }
         }
-        let hs = self.forward_hidden(sess, tokens);
-        self.logits(&hs[(t - 1) * h..], 1)
+        let hs = if t == 1 {
+            self.forward_hidden_cpu(sess, tokens, &[])
+        } else {
+            self.forward_hidden(sess, tokens)
+        };
+        let l = self.logits(&hs[(t - 1) * h..], 1);
+        if measure {
+            self.stream_choice.record(false, t0.elapsed().as_secs_f64());
+        }
+        l
     }
 
     /// Runs `tokens` through the decoder and returns the final-normed hidden states `[t, hidden]`.
