@@ -3720,7 +3720,7 @@ Useful flags:
 | `--mmap` | map weights from disk instead of copying them into RAM |
 | `--save-quantized DIR` | write a pre-quantized, text-only checkpoint at `--quant` precision (see below) and exit |
 | `--devices` | list detected CPU features and GPUs (Metal, CUDA, Vulkan) and exit |
-| `--device D` | `auto` (default: use a GPU backend when one exists, else the CPU), `cpu`, `metal`, `cuda`, `vulkan`; a device asked for by name that is missing or cannot start is an error, not a fallback |
+| `--device D` | `auto` (default: the first GPU backend that starts, Metal or CUDA before Vulkan, else the CPU), `cpu`, `metal`, `cuda`, `vulkan`; a device asked for by name that is missing or cannot start is an error, not a fallback |
 | `--gpu-decode on\|off` | generate a whole token per GPU submission (default `on` where supported; see [Decoding on the GPU](#decoding-on-the-gpu)); engine / speaker option `gpu_decode` |
 | `--prefill-chunk N` | tokens per prefill chunk (default 256 on the CPU, 1024 when a GPU backend is active) |
 | `--profile` | per-operation timing and bandwidth breakdown |
@@ -4790,7 +4790,7 @@ GPU (metal #0): Apple M5 Max, memory 115.4 GB (unified with CPU)
 | x86-64 (Linux, Windows, macOS) | AVX2 + FMA kernels (bf16, Q8 via `maddubs`, Q4), scalar fallback below AVX2 | compiles for all three; the kernel tests pass on the scalar fallback under Rosetta (which exposes no AVX), so the AVX2 kernels themselves are not yet executed anywhere |
 | Linux / Windows + NVIDIA | CUDA driver API + NVRTC-compiled kernels (`cuda.rs`): prefill GEMMs (bf16, Q8, Q4, affine Q4), MoE experts (resident or streamed), convolutions, group / layer norms, attention; whole decode steps, single-token and multi-token (speculative verification); loaded as a native binary, so a toolkit newer than the driver works | measured on Linux on one RTX 5080 (NVRTC 13.4, driver CUDA 13.2), see [CUDA](#cuda); Windows and other GPUs not run |
 | Android (aarch64) | NEON kernels | cross-compiles (`aarch64-linux-android`) |
-| Vulkan | detection only (device name and memory) | no compute yet |
+| Vulkan (any GPU with a Vulkan 1.0 driver) | compute shaders through the Vulkan loader (`vulkan.rs`, SPIR-V embedded in the binary): prefill GEMMs only (bf16, Q8, Q4, affine Q4); MoE experts, convolutions, norms, attention and decoding stay on the CPU | measured on Linux on one RTX 5080 (NVIDIA driver, Vulkan 1.4): logits bit-identical to the CPU path and the same greedy text for the four weight formats, see [Vulkan](#vulkan); integrated GPUs, other vendors, Windows, Android and MoltenVK not run |
 | wasm32 (WASI) | simd128 kernels (bf16, Q8, Q4), threads via wasi-threads | measured: Qwen3.5-0.8B Q8 at 123 tok/s decode with 16 threads under wasmtime 30, identical output to native; see below |
 | Browser (Chrome 137+) | simd128 kernels + WebGPU GEMM for prefill (WGSL, via JSPI) | measured in headless Chrome 155: Qwen3.5-0.8B Q8 prefill 34 -> 231 tok/s, identical output; Firefox/Safari run the CPU path (no JSPI) |
 
@@ -4923,6 +4923,72 @@ The image-model timings include loading and quantizing the weights.
 
 `cargo test --lib cuda::` compares every kernel with a reference computed in f64 from its
 definition; it fails if a kernel does not compile or load, and skips without an NVIDIA GPU or NVRTC.
+
+### Vulkan
+
+`--device vulkan` runs the prefill-sized matmuls (bf16, Q8, Q4 and affine Q4 weights, `t >= 16`
+tokens, output rows a multiple of 64) as compute shaders on any Vulkan device. Nothing else runs
+there yet: MoE experts, convolutions, norms, attention and decode steps stay on the CPU, so this
+backend helps long prompts on machines whose GPU has neither Metal nor CUDA. `auto` keeps
+preferring Metal and CUDA, and takes Vulkan when it is the only backend that starts (never a
+software rasterizer such as llvmpipe, which `--device vulkan` still accepts). `--devices` lists
+the Vulkan devices next to the others, the same physical GPU included:
+
+```
+GPU (cuda #0): NVIDIA GeForce RTX 5080
+  memory: 16.6 GB
+  driver: CUDA driver 13.2, compute capability 12.0
+GPU (vulkan #0): NVIDIA GeForce RTX 5080
+  memory: 17.1 GB
+  driver: Vulkan 1.4.329 (discrete)
+```
+
+With several Vulkan devices, the first discrete one is used, then integrated ones (the larger
+memory first within a type); `OXINFER_VULKAN_DEVICE=N` picks the device listed as `vulkan #N`.
+
+- **Nothing at build time, no extension at run time.** `libvulkan` (`vulkan-1.dll`, MoltenVK) is
+  opened with `dlsym` when the device is asked for. The shaders are GLSL (`src/vulkan/gemm.comp`,
+  one source for the four formats) and their compiled SPIR-V is checked in next to it and embedded
+  in the binary; `tools/vulkan_shaders.sh` regenerates it with `glslc` after an edit. They need
+  only Vulkan 1.0 core: the 8- and 16-bit weights are read as 32-bit words, so neither 16-bit
+  storage nor `shaderInt8` is required; the device must allow compute workgroups of 256
+  invocations with 16 KiB of shared memory (checked at start-up, an error otherwise).
+- **Memory.** Unified memory is not assumed. On discrete devices the weights are copied once into
+  device-local buffers through a host-visible staging buffer (a layer the first time it is used),
+  and every batch copies its activations up and its results down within its one submission; on
+  integrated devices the buffers are host-visible and the shaders work in them directly
+  (`OXINFER_VULKAN_STAGED=0|1` forces either). A weight matrix larger than the device's
+  `maxStorageBufferRange` or `maxMemoryAllocationSize` is split by rows over several buffers, and
+  a batch whose activations exceed them runs as several token ranges. A matrix that does not fit
+  in device memory stays on the CPU: with `VK_EXT_memory_budget` the heap's budget is checked
+  (512 MB kept free), otherwise the allocation's failure decides. Device weights are freed with
+  their layer.
+- **Arithmetic.** The kernel is the tiled GEMM of the other backends (a 64 x 64 tile of outputs
+  per workgroup, weights dequantized to f32 in shared memory), each output one accumulator taking
+  one `fma` per input in order, as the CPU prefill GEMM does. Vulkan lets a driver compile `fma`
+  as a separate multiply and add, so bit-identity with the CPU is a property of the driver, not
+  of the backend.
+
+Measured on an RTX 5080 (NVIDIA driver, Vulkan 1.4.329) against the AVX-512 CPU path: the logits
+after an 1,823-token prompt are bit-identical (`--dump-logits`, files
+equal byte for byte) and greedy decoding (up to 64 tokens) gives the same text, for
+
+| Model | Weights |
+|---|---|
+| Qwen3.5-0.8B | bf16 |
+| Qwen3.5-0.8B `--quant q8` | Q8 |
+| Qwen3.5-0.8B `--quant q4` | Q4 (also with `OXINFER_VULKAN_STAGED=0`) |
+| mlx-community/Qwen3-4B-4bit | affine Q4 |
+
+No other device or driver was run, and no speed was measured.
+
+`cargo test --lib vulkan::` runs the kernels in both memory modes against the exact (f64)
+product of the dequantized weights, the same product in the kernel's order of operations and the
+CPU kernels, for each format; the f16 scale decoding on every finite value; batches of several
+outputs; weights split over several buffers and batches split over token ranges (the limits
+lowered, results bit-identical to the unsplit path); declined shapes; freed memory; concurrent
+calls. `bit_identity_report` prints how many outputs differ from the fma-ordered reference on the
+machine at hand (none here). The tests skip without a Vulkan device.
 ### WebAssembly
 
 `.cargo/config.toml` turns on `simd128` for the wasm targets (every current engine supports it;
@@ -5267,7 +5333,8 @@ billion parameters at LUT4, `infer` only) are the practical range for 12 GB phon
 - `config.rs`: reads `config.json` and derives per-layer facts (sliding vs global, head dims, KV sharing source, k=v).
 - `platform.rs`: CPU feature and GPU detection (sysctl / procfs for memory, Metal via `objc_msgSend`,
   CUDA driver API, Vulkan loader), all through `dlsym`; `gpu.rs`: the `Backend` trait the linear layers
-  dispatch through and the registry; `metal.rs`, `cuda.rs`: the backends with their shader sources.
+  dispatch through and the registry; `metal.rs`, `cuda.rs`, `vulkan.rs`: the backends with their shader sources
+  (`src/vulkan/`: GLSL and the SPIR-V compiled from it).
 - `fsx.rs`, `clock.rs`: file access and monotonic time behind one interface, so the loaders run on a
   real filesystem or on the browser's in-memory table; `src/web/` (feature `web`): the browser module's
   C-ABI exports and the WebGPU backend calling back into the host; `web/` at the root: the
