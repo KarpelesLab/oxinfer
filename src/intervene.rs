@@ -11,6 +11,8 @@
 //! - residual points: point `2l` is the residual stream entering layer `l` (point 0: the
 //!   embeddings), `2l + 1` the residual after layer `l`'s attention (or Gated DeltaNet) block
 //!   was added, `2l + 2` the output of layer `l` (`hidden_states[l + 1]` in transformers);
+//!   a stream of several copies per token (DeepSeek V4's hyper-connections) is hooked through
+//!   [`State::point_copies`], which says what the residual of such a model is;
 //! - MLP neurons: the input of `down_proj` (`act(gate) * up`) of a dense MLP, of a MoE layer's
 //!   shared expert, or of each routed expert.
 //!
@@ -999,6 +1001,17 @@ impl Compiled {
 
 // ---- per-session state ----------------------------------------------------------------------
 
+/// Which directional and SAE edits of a point an edit pass applies ([`State::point_copies`]
+/// splits them).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Part {
+    All,
+    /// Items whose activation is linear in the residual (ablation, SAE `add`).
+    Linear,
+    /// Items and SAE edits whose activation goes through a nonlinearity.
+    Encoded,
+}
+
 /// What a session applies and records (see the module docs). Cloning shares the compiled hooks
 /// and the capture / inspection sinks.
 #[derive(Clone)]
@@ -1047,58 +1060,146 @@ impl State {
 
     /// Applies the hooks of residual point `p` to `x` (`t` rows of `h`, positions `start..`).
     pub fn point(&self, p: usize, x: &mut [f32], h: usize, start: usize) {
-        let t = x.len() / h;
         if let Some(iv) = &self.iv
             && let Some(Some(ops)) = iv.points.get(p)
         {
             // Added vectors first, then the edits read the result: a direction ablated at the
             // same point also removes its component of what was added (as a hook on the next
             // layer's input would), and a clamped feature ends at its value.
-            if !ops.adds.is_empty() {
-                for_chunks(x, h, t > 1, |i, row| {
-                    for (ps, v) in &ops.adds {
-                        if self.on(*ps, start + i) {
-                            for (r, a) in row.iter_mut().zip(v) {
-                                *r += a;
-                            }
-                        }
-                    }
-                });
-            }
-            // Whole-encoder SAE edits (each encode runs on the thread pool, so rows go one by
-            // one). All edits read the same x (simultaneous, as an SAE would).
-            let mut sae_delta: Vec<Vec<(f32, &[f32])>> = vec![Vec::new(); if ops.saes.is_empty() { 0 } else { t }];
-            for (i, d) in sae_delta.iter_mut().enumerate() {
-                let row = &x[i * h..(i + 1) * h];
-                for op in &ops.saes {
-                    if self.on(op.positions, start + i) {
-                        d.extend(op.sae.edit_coefs(row, &op.features));
+            self.add_vectors(ops, x, h, start, 1);
+            self.edit_items(ops, x, h, start, 1, Part::All);
+        }
+        self.observe(p, x, h, start);
+    }
+
+    /// [`State::point`] for a residual stream made of `n` copies per token (`x`: `t` rows of
+    /// `n * h`, a token's copies side by side: the hyper-connections of DeepSeek V4). The
+    /// residual of a token is the mean of its copies: capture, calibration and SAEs (encoding,
+    /// inspection) read that, and an edit changes it exactly as [`State::point`] would change a
+    /// single stream, by writing to every copy:
+    /// - added vectors go to each copy;
+    /// - linear directional edits (ablation: `x -= (x . r) r`; SAE `add`) are applied to each
+    ///   copy with its own coefficient, so an ablated direction is gone from every copy (and from
+    ///   any weighted sum of them a block reads), not only from their mean;
+    /// - edits through an SAE nonlinearity (ReLU, JumpReLU, TopK features) are computed on the
+    ///   mean, and their change is added to each copy.
+    ///
+    /// As in [`State::point`], every edit reads the stream after the added vectors and before
+    /// any other edit.
+    pub fn point_copies(&self, p: usize, x: &mut [f32], h: usize, n: usize, start: usize) {
+        let mean = |x: &[f32]| -> Vec<f32> {
+            let mut m = vec![0f32; x.len() / n];
+            for_chunks(&mut m, h, x.len() > n * h, |i, row| {
+                for c in x[i * n * h..(i + 1) * n * h].chunks(h) {
+                    for (s, v) in row.iter_mut().zip(c) {
+                        *s += v;
                     }
                 }
-            }
-            if !ops.items.is_empty() || !sae_delta.is_empty() {
-                for_chunks(x, h, t > 1, |i, row| {
-                    let pos = start + i;
-                    let coefs: Vec<f32> = ops
-                        .items
-                        .iter()
-                        .map(|it| if self.on(it.positions, pos) { it.coef(row) } else { 0.0 })
-                        .collect();
-                    for (it, c) in ops.items.iter().zip(coefs) {
-                        if c != 0.0 {
-                            for (v, d) in row.iter_mut().zip(&it.dec) {
-                                *v += c * d;
-                            }
-                        }
-                    }
-                    for &(c, d) in sae_delta.get(i).map(|v| &v[..]).unwrap_or(&[]) {
-                        for (v, d) in row.iter_mut().zip(d) {
-                            *v += c * d;
+                row.iter_mut().for_each(|s| *s /= n as f32);
+            });
+            m
+        };
+        if let Some(iv) = &self.iv
+            && let Some(Some(ops)) = iv.points.get(p)
+        {
+            self.add_vectors(ops, x, h, start, n);
+            let encoded = !ops.saes.is_empty() || ops.items.iter().any(|it| it.act != ItemAct::Linear);
+            let delta = encoded.then(|| {
+                let m = mean(x);
+                let mut e = m.clone();
+                self.edit_items(ops, &mut e, h, start, 1, Part::Encoded);
+                e.iter_mut().zip(&m).for_each(|(a, b)| *a -= b);
+                e
+            });
+            self.edit_items(ops, x, h, start, n, Part::Linear);
+            if let Some(d) = delta {
+                for_chunks(x, n * h, x.len() > n * h, |i, row| {
+                    for c in row.chunks_mut(h) {
+                        for (v, a) in c.iter_mut().zip(&d[i * h..(i + 1) * h]) {
+                            *v += a;
                         }
                     }
                 });
             }
         }
+        let inspected = self.features.is_some() && self.iv.as_ref().is_some_and(|iv| iv.inspect.iter().any(|i| i.point == p));
+        if inspected || self.capture.is_some() {
+            self.observe(p, &mean(x), h, start);
+        }
+    }
+
+    /// Adds the vectors of `ops` to the rows of `x` (`h` wide, `rep` consecutive rows per
+    /// position, positions `start..`).
+    fn add_vectors(&self, ops: &PointOps, x: &mut [f32], h: usize, start: usize, rep: usize) {
+        if ops.adds.is_empty() {
+            return;
+        }
+        let rows = x.len() / h;
+        for_chunks(x, h, rows > 1, |i, row| {
+            for (ps, v) in &ops.adds {
+                if self.on(*ps, start + i / rep) {
+                    for (r, a) in row.iter_mut().zip(v) {
+                        *r += a;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Applies the directional and SAE edits `part` of `ops` to the rows of `x` (`h` wide, `rep`
+    /// consecutive rows per position, positions `start..`). All of them read the same `x`
+    /// (simultaneous, as an SAE would).
+    fn edit_items(&self, ops: &PointOps, x: &mut [f32], h: usize, start: usize, rep: usize, part: Part) {
+        let rows = x.len() / h;
+        let saes: &[SaeOp] = if part == Part::Linear { &[] } else { &ops.saes };
+        let takes = |it: &Item| match part {
+            Part::All => true,
+            Part::Linear => it.act == ItemAct::Linear,
+            Part::Encoded => it.act != ItemAct::Linear,
+        };
+        // Whole-encoder SAE edits (each encode runs on the thread pool, so rows go one by one).
+        let mut sae_delta: Vec<Vec<(f32, &[f32])>> = vec![Vec::new(); if saes.is_empty() { 0 } else { rows }];
+        for (i, d) in sae_delta.iter_mut().enumerate() {
+            let row = &x[i * h..(i + 1) * h];
+            for op in saes {
+                if self.on(op.positions, start + i / rep) {
+                    d.extend(op.sae.edit_coefs(row, &op.features));
+                }
+            }
+        }
+        if ops.items.iter().any(takes) || !sae_delta.is_empty() {
+            for_chunks(x, h, rows > 1, |i, row| {
+                let pos = start + i / rep;
+                let coefs: Vec<f32> = ops
+                    .items
+                    .iter()
+                    .map(|it| {
+                        if takes(it) && self.on(it.positions, pos) {
+                            it.coef(row)
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                for (it, c) in ops.items.iter().zip(coefs) {
+                    if c != 0.0 {
+                        for (v, d) in row.iter_mut().zip(&it.dec) {
+                            *v += c * d;
+                        }
+                    }
+                }
+                for &(c, d) in sae_delta.get(i).map(|v| &v[..]).unwrap_or(&[]) {
+                    for (v, d) in row.iter_mut().zip(d) {
+                        *v += c * d;
+                    }
+                }
+            });
+        }
+    }
+
+    /// What reads residual point `p` without changing it: SAE inspection and capture of `x`
+    /// (`t` rows of `h`, positions `start..`).
+    fn observe(&self, p: usize, x: &[f32], h: usize, start: usize) {
         if let Some(iv) = &self.iv
             && let Some(sink) = &self.features
         {
@@ -1733,6 +1834,120 @@ mod tests {
         // 5 points (embeddings, mid and post of 2 layers) with an encoder and decoder row each,
         // plus the add vector.
         assert_eq!(g.cold.len(), 5 * 2 * 4 + 4);
+    }
+
+    /// A stream of several copies per token (DeepSeek V4): the mean of the copies changes as a
+    /// single stream would, an ablated direction leaves every copy, reads see the mean.
+    #[test]
+    fn copies_follow_the_mean() {
+        use crate::sae::Arch;
+        let (h, n, t) = (4usize, 3usize, 2usize);
+        let host = toy();
+        let spec = Spec {
+            steer: vec![Steer {
+                vector: Some(vec![0.5, 0.0, 1.0, -1.0]),
+                layer: Some(0),
+                alpha: 2.0,
+                positions: Positions::Generated,
+                ..Default::default()
+            }],
+            ablate: vec![Ablate {
+                vector: Some(vec![1.0, 1.0, 0.0, 0.0]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut c = Compiled::new(&spec, &host, &ctx(None)).unwrap();
+        // SAE edits at the same point: a JumpReLU feature (its own encoder row), an `add`
+        // (linear) and a TopK SAE (whole encoder).
+        let p = point_index(0, Point::Post);
+        let ops = c.points[p].as_mut().unwrap();
+        ops.items.push(Item {
+            enc: vec![0.0, 0.0, 1.0, 1.0],
+            dec: vec![0.0, 1.0, 0.0, 2.0],
+            bias: -0.5,
+            act: ItemAct::JumpRelu(0.25),
+            op: ItemOp::Set(3.0),
+            positions: Positions::All,
+        });
+        ops.items.push(Item {
+            enc: vec![0.0; 4],
+            dec: vec![1.0, 0.0, 0.0, 0.5],
+            bias: 0.0,
+            act: ItemAct::Linear,
+            op: ItemOp::Set(0.75),
+            positions: Positions::All,
+        });
+        let enc = vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0];
+        let dec = vec![0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0];
+        ops.saes.push(SaeOp {
+            sae: Arc::new(Sae::toy(Arch::TopK(2), enc, vec![0.1, 0.0, -0.2], dec, vec![0.0; 4], vec![])),
+            features: vec![
+                FeatureEdit {
+                    id: 0,
+                    op: FeatureOp::Clamp,
+                    value: 2.0,
+                },
+                FeatureEdit {
+                    id: 2,
+                    op: FeatureOp::Scale,
+                    value: -1.0,
+                },
+            ],
+            positions: Positions::All,
+        });
+        let cap = Arc::new(Mutex::new(Capture::new(Pool::All, vec![p])));
+        let st = State {
+            iv: Some(Arc::new(c)),
+            gen_from: 6,
+            ..Default::default()
+        };
+        // Positions 5 (prompt) and 6 (generated), 3 different copies each.
+        let x: Vec<f32> = (0..t * n * h).map(|i| ((i * 7 % 11) as f32 - 4.0) * 0.5).collect();
+        let mean = |x: &[f32]| -> Vec<f32> {
+            x.chunks(n * h)
+                .flat_map(|tok| {
+                    (0..h)
+                        .map(|d| (0..n).map(|k| tok[k * h + d]).sum::<f32>() / n as f32)
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let mut single = mean(&x);
+        st.point(p, &mut single, h, 5);
+        let mut y = x.clone();
+        let stc = State {
+            capture: Some(cap.clone()),
+            ..st.clone()
+        };
+        stc.point_copies(p, &mut y, h, n, 5);
+        for (a, b) in mean(&y).iter().zip(&single) {
+            assert!((a - b).abs() < 1e-5, "{:?} vs {single:?}", mean(&y));
+        }
+        assert!(y != x && single != mean(&x));
+        // The ablated direction: gone from every copy but for what the other edits put back (the
+        // same in each copy), so all copies of a token have the same component.
+        let along: Vec<f32> = y.chunks(h).map(|c| c[0] + c[1]).collect();
+        for tok in along.chunks(n) {
+            assert!(tok.iter().all(|a| (a - tok[0]).abs() < 1e-5), "{along:?}");
+        }
+        // Capture reads the mean, after the edits.
+        let got = cap.lock().unwrap().data[&p].0.clone();
+        for (a, b) in got.iter().zip(&single) {
+            assert!((a - b).abs() < 1e-5);
+        }
+        // Identical copies: each one is the single stream's result.
+        let mut same: Vec<f32> = mean(&x).chunks(h).flat_map(|r| r.repeat(n)).collect();
+        st.point_copies(p, &mut same, h, n, 5);
+        for (tok, want) in same.chunks(n * h).zip(single.chunks(h)) {
+            for c in tok.chunks(h) {
+                assert!(c.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-5));
+            }
+        }
+        // One copy is the plain hook.
+        let mut one = mean(&x);
+        st.point_copies(p, &mut one, h, 1, 5);
+        assert!(one.iter().zip(&single).all(|(a, b)| (a - b).abs() < 1e-6));
     }
 
     #[test]
