@@ -267,6 +267,13 @@ pub trait Backend: Send + Sync {
     fn decode_plan_multi_fast<'s>(&'s self, g: &decode::Graph, tokens: usize) -> Option<Box<dyn decode::DecodePlan + 's>> {
         self.decode_plan_multi(g, tokens)
     }
+    /// Compiles a decode graph as a prefill plan: steps of up to `tokens` tokens (at least; the
+    /// plan may round up, see [`decode::DecodePlan::tokens`]) on batched kernels, the
+    /// activations kept on the device for the whole step. Its results differ from one-token
+    /// steps in rounding. None when the backend cannot.
+    fn decode_plan_prefill<'s>(&'s self, _g: &decode::Graph, _tokens: usize) -> Option<Box<dyn decode::DecodePlan + 's>> {
+        None
+    }
     /// Cumulative timing summary for `--profile`.
     fn stats(&self) -> Option<String> {
         None
@@ -471,6 +478,13 @@ pub fn ensure(pref: crate::platform::DevicePref) -> anyhow::Result<Option<&'stat
         DevicePref::Gpu(k) => anyhow::bail!("device {}: this process already runs on {current}", k.as_str()),
     }
     Ok(b)
+}
+
+/// With `OXINFER_PF_PROFILE` set, prints the GPU time per kind of op of the prefill plans
+/// (Metal) so far.
+pub fn pf_report() {
+    #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+    crate::metal::decode::pf_report();
 }
 
 #[cfg(test)]

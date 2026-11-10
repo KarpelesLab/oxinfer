@@ -2,7 +2,7 @@
 //! prefill of a text file (raw tokens, no template), or compares two such files.
 //!
 //! ```text
-//! prefill_kl MODEL TOKENIZER TEXT OUT.bin [--cpu] [--chunk N]
+//! prefill_kl MODEL TOKENIZER TEXT OUT.bin [--cpu] [--chunk N] [--repeat N]
 //! prefill_kl --compare A.bin B.bin
 //! ```
 
@@ -42,7 +42,7 @@ fn main() -> Result<()> {
         println!("KL {kl:.3e}, max diff {mx:.3e}, top-1 {} vs {}", am(&x), am(&y));
         return Ok(());
     }
-    let usage = "usage: prefill_kl MODEL TOKENIZER TEXT OUT.bin [--cpu] [--chunk N]";
+    let usage = "usage: prefill_kl MODEL TOKENIZER TEXT OUT.bin [--cpu] [--chunk N] [--repeat N]";
     let (model, tok, text, out) = (
         a.first().context(usage)?,
         a.get(1).context(usage)?,
@@ -69,15 +69,32 @@ fn main() -> Result<()> {
     let files = ModelFiles::open(dir, false)?;
     let m = QwenModel::load(cfg, &files, oxinfer::model::Quant::Bf16)?;
     let h = m.cfg.hidden_size;
-    let mut sess = m.new_session();
-    let t0 = std::time::Instant::now();
-    let mut hs = Vec::new();
-    for c in ids.chunks(chunk) {
-        hs = m.forward_hidden_mm(&mut sess, c, &[]);
+    let repeat: usize = a
+        .iter()
+        .position(|x| x == "--repeat")
+        .and_then(|i| a.get(i + 1))
+        .map_or(Ok(1), |v| v.parse())?;
+    let (mut hs, mut dt) = (Vec::new(), 0.0);
+    // Later runs (a new session each) leave out first-use costs (GPU plans).
+    for r in 0..repeat.max(1) {
+        let mut sess = m.new_session();
+        let t0 = std::time::Instant::now();
+        for c in ids.chunks(chunk) {
+            hs = m.forward_hidden_mm(&mut sess, c, &[]);
+        }
+        dt = t0.elapsed().as_secs_f64();
+        let again = if r > 0 { " (again)" } else { "" };
+        eprintln!(
+            "[prefill {} tokens in {dt:.2}s = {:.1} tok/s{again}]",
+            ids.len(),
+            ids.len() as f64 / dt
+        );
     }
-    let dt = t0.elapsed().as_secs_f64();
     let l = m.logits(&hs[hs.len() - h..], 1);
-    eprintln!("[prefill {} tokens in {dt:.2}s = {:.1} tok/s]", ids.len(), ids.len() as f64 / dt);
+    if std::env::var_os("OXINFER_PROFILE").is_some() {
+        oxinfer::prof::report(dt, ids.len());
+        oxinfer::gpu::pf_report();
+    }
     std::fs::write(out, l.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>())?;
     Ok(())
 }

@@ -963,7 +963,7 @@ Speed on the M5 Max (128 GB; load average 3-9 from other jobs), UD-Q4_K_XL, gree
 
 | | prefill | decode |
 |---|---|---|
-| oxinfer, Metal (default) | 374 tok/s (4545 tokens), 261 (563) | 54-59 tok/s (45-49 under load), 47.6 after 4.5k tokens |
+| oxinfer, Metal (default) | 741-778 tok/s (4545 tokens), 698-959 (563; second pass) | 54-59 tok/s (45-49 under load), 47.6 after 4.5k tokens |
 | oxinfer, Metal + MTP (3 drafts) | | 72 tok/s on code (3.9 tokens per pass), 46 on prose |
 | oxinfer, CPU (`--device cpu`) | | 21.5 tok/s |
 | oxinfer, streamed (`--stream --cache-budget-gb 40`) | | 12 tok/s (47% of the time waiting on storage) |
@@ -1003,22 +1003,29 @@ to 2.5e-5 relative on the CPU (and with `OXINFER_METAL_MMA=0`), 0.9% with Metal'
 half-precision matmul operands (0.8 s instead of 1.4 s for 630 tokens); the model names Vermeer's
 "Girl with a Pearl Earring" from the PNG and describes it (prefill 721 tokens in 3.4 s).
 
-Prefill on Metal runs the matmuls, the routed experts, the MoE router (an f32 GEMM), the Gated
-DeltaNet recurrence (one threadgroup per value head and 32 state columns, the state in registers
-across the chunk) and the attention (dense, or over each token's QSA positions) on the GPU; the
-hyper-connection and n-gram elementwise work, the norms, the conv and the block selection stay on
-the CPU. `OXINFER_PREFILL_GPU=0` (or a list of `attn`, `gdn`, `router`) keeps them on the CPU.
-Measured on raw text (`examples/prefill_kl.rs`, interleaved runs): 563 tokens 190 -> 261 tok/s, 1323
-tokens 243 -> 324, 4545 tokens 205 -> 374. Against the CPU path the last position's KL is 2.9e-2,
-1.2e-3 and 2.4e-4, where the previous Metal prefill gave 3.8e-2, 1.8e-4 and 1.1e-3: this model
-amplifies any rounding (a flipped expert among 512), and the half-precision matrix units dominate; with
-`OXINFER_METAL_MMA=0` the old path is bit-identical to the CPU and the new one at KL 7.7e-3
-(563 tokens), any one GPU op alone (even the f32 router) giving the same. Greedy output against the
-previous prefill parts at near-ties (3 long prompts, 100 tokens: at the 2nd, ~60th and ~70th token).
+Prefill on Metal runs whole passes on the GPU: the decode graph compiled as a prefill plan
+(`MetalBackend::build_plan_pf`, chunks of up to 1024 tokens, `OXINFER_PREFILL_TOKENS`) keeps the
+activations on the device and runs the matmuls as matrix-unit GEMMs, the MoE routers as f32 GEMMs,
+the routed experts as grouped GEMMs over each expert's tokens (the routing is read back before each
+MoE layer: the only host round trips), the Gated DeltaNet rule (per-token norms and gates in
+parallel, then the recurrence with each column's four parts in one SIMD-group), the attention
+(dense, or over each token's QSA positions, four query heads per threadgroup), the indexer and the
+convolutions over the whole chunk, and the expert weights wrapped once for both plans.
+`OXINFER_PREFILL_GPU=0` keeps everything but the matmuls on the CPU; `attn,gdn,router` gives the
+previous op-by-op offload. On raw text (`examples/prefill_kl.rs`, first pass of a process / a
+second pass, interleaved, under load from other processes): 563 tokens 160-190 -> 311-349 /
+698-959 tok/s, 1323 tokens 178-231 -> 476-547 / 671-852, 4545 tokens 214-251 -> 606-637 / 741-778
+(the first pass includes building the GPU plans, ~1 s); unloaded the op-by-op offload measured
+261 / 324 / 374. Against the CPU path the last position's KL is 1.6e-2, 3.9e-4 and 9.1e-4 (the
+op-by-op offload 2.9e-2, 1.2e-3, 2.4e-4; the older Metal prefill 3.8e-2, 1.8e-4, 1.1e-3): this
+model amplifies any rounding (a flipped expert among 512), and the half-precision matrix units
+dominate. Image prompts (and past 2051 tokens, QSA) run on the plan too. `OXINFER_PF_PROFILE=1`
+runs each op of the plan in a command buffer of its own and prints the GPU time per kind of op
+(with `prefill_kl` and `OXINFER_PROFILE`): at 4545 tokens the routed experts take ~45% (grouped
+32-row tiles, mostly padding at ~20 tokens per expert), the attention ~10%, the GEMMs ~25%.
 
 Not done: video input from GGUF is wired the same way but untested, the merged-weight GGUF layout,
-and a whole-layer GPU prefill (still 3-4x slower than llama.cpp's: the hyper-connection mixes, the
-routed experts' per-pass wrapping and the host round trips between ops dominate).
+and faster routed experts in prefill (less tile padding, or larger chunks).
 
 ## Embeddings
 

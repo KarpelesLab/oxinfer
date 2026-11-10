@@ -1014,7 +1014,9 @@ impl<'a> QwenModel<'a> {
     /// input), Gated DeltaNet, the attention layers with their QSA indexer (its keys in a one-head
     /// KV cache after each layer's attention cache, see [`IdxCache`]; RoPE table 1 holds the
     /// angles of the first position of the block a token ends), the MoE blocks.
-    pub(crate) fn exp_gpu_graph<'s>(&'s self, ex: &'s Exp<'s>, multi: bool) -> Option<crate::gpu::decode::Graph<'s>> {
+    /// `prefill`: for a prefill plan (`Backend::decode_plan_prefill`): no LM head, and the Gated
+    /// DeltaNet layers share their buffers (no replays).
+    pub(crate) fn exp_gpu_graph<'s>(&'s self, ex: &'s Exp<'s>, multi: bool, prefill: bool) -> Option<crate::gpu::decode::Graph<'s>> {
         use crate::gpu::decode::{Ew, Experts, Graph, LinMode, Op};
         use crate::qwen::{Ffn, Mixer};
         let cfg = &self.cfg;
@@ -1072,7 +1074,7 @@ impl<'a> QwenModel<'a> {
         // Captured: the residual streams after the last layer (what the MTP head reads), then with
         // OXINFER_QSA_CHECK each attention layer's raw indexer queries and key and the positions
         // it selected.
-        let check = qsa_check() && !multi;
+        let check = qsa_check() && !multi && !prefill;
         let per = nq + d + sel_n;
         let n_cap = w + if check { n_attn * per } else { 0 };
         let cap = g.buf(n_cap);
@@ -1109,7 +1111,7 @@ impl<'a> QwenModel<'a> {
         let gconv = g.buf(conv_dim);
         let gout = g.buf(value_dim);
         let hidden = g.buf(h);
-        let logits = g.buf(cfg.vocab_size);
+        let logits = g.buf(if prefill { 1 } else { cfg.vocab_size });
         g.input = x0;
         g.hidden = hidden;
         g.n_hidden = h;
@@ -1205,7 +1207,7 @@ impl<'a> QwenModel<'a> {
             match &layer.mixer {
                 Mixer::Gdn(gd) => {
                     // Multi-token plans keep each recurrent layer's inputs in its own buffers (replays).
-                    let (gproj, gconv) = if multi {
+                    let (gproj, gconv) = if multi && !prefill {
                         (g.buf(conv_dim + value_dim + 2 * nv), g.buf(conv_dim))
                     } else {
                         (gproj, gconv)
@@ -1419,6 +1421,9 @@ impl<'a> QwenModel<'a> {
         g.units.push((g.ops.len(), self.layers.len()));
         mix(&mut g, &ex.mixer, hidden)?;
         g.head_from = g.ops.len();
+        if prefill {
+            return Some(g);
+        }
         g.ops.push(lin(&self.lm_head, cfg.vocab_size, h, hidden, logits, LinMode::Store)?);
         g.logits = Some((logits, cfg.vocab_size));
         Some(g)
@@ -1803,6 +1808,98 @@ impl<'a> QwenModel<'a> {
             }
         }
         out
+    }
+
+    /// A prefill pass of `tokens` on the GPU prefill plan (`QwenModel::gpu_prefill_plan`; chunks of
+    /// the plan's size): the mixed hidden states, as [`Self::exp_forward`] gives them (without
+    /// recording for rewinds). None (nothing changed) when unavailable; a failure past the first
+    /// chunk finishes the pass on the host path.
+    pub(crate) fn exp_gpu_prefill(&self, ex: &Exp<'a>, sess: &mut QwenSession, tokens: &[u32], mm: &[(usize, &[f32])]) -> Option<Vec<f32>> {
+        let cfg = &self.cfg;
+        let t = tokens.len();
+        if sess.iv.active() || !sess.capture.is_empty() || self.stream.is_some() || sess.pos + t > QSA_GPU_MAX_POS {
+            return None;
+        }
+        let plan = self.gpu_prefill_plan()?;
+        let n = plan.tokens();
+        let (h, w) = (cfg.hidden_size, cfg.hc_count * cfg.hidden_size);
+        let pos = sess.pos;
+        let mut x = vec![0f32; t * h];
+        for_chunks(&mut x, h, t > 1, |ti, row| self.embed.row(tokens[ti] as usize, row));
+        for &(i, emb) in mm {
+            x[i * h..(i + 1) * h].copy_from_slice(emb);
+        }
+        // The n-gram ids of image positions are the image token (as the reference hashes them).
+        let es = sess.exp.as_mut()?;
+        es.toks.truncate(pos);
+        for (i, &tk) in tokens.iter().enumerate() {
+            let img = mm.iter().any(|m| m.0 == i);
+            es.toks.push(if img { cfg.image_token_id.unwrap_or(tk) } else { tk });
+        }
+        let mut hidden = vec![0f32; t * h];
+        let mut wide = vec![0f32; t * w];
+        let mut c = 0;
+        while c < t {
+            let m = n.min(t - c);
+            let p = pos + c;
+            let cs = self.exp_rope_rows(sess, p, m);
+            let x2 = {
+                let es = sess.exp.as_ref()?;
+                self.ngram_rows(ex, &es.toks[..p + m], m)
+            };
+            self.exp_gpu_pool(ex, sess, p);
+            let ok = {
+                let _timer = crate::prof::start(crate::prof::Cat::Matmul);
+                let QwenSession { kv, gpu, gdn, exp, .. } = sess;
+                let (mut kv, mut states) = exp_step_refs(gdn, kv, exp.as_deref_mut());
+                plan.step(
+                    gpu,
+                    crate::gpu::decode::Step {
+                        pos: p,
+                        t: m,
+                        rope_cs: &cs,
+                        x: &x[c * h..(c + m) * h],
+                        x2: &x2,
+                        kv: &mut kv,
+                        states: &mut states,
+                        hidden: &mut hidden[c * h..(c + m) * h],
+                        logits: None,
+                        params: None,
+                        capture: Some(&mut wide[c * w..(c + m) * w]),
+                        scratch: false,
+                        states_kept: false,
+                    },
+                )
+            };
+            if !ok {
+                if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
+                    eprintln!("[gpu prefill step failed at {p}]");
+                }
+                break;
+            }
+            self.exp_gpu_repool(ex, sess, p, m);
+            sess.pos += m;
+            c += m;
+        }
+        sess.rec_span = None;
+        sess.gpu_states_kept = false;
+        if c == 0 {
+            sess.exp.as_mut()?.toks.truncate(pos);
+            return None;
+        }
+        if c < t {
+            // The rest on the host path.
+            let rest: Vec<(usize, &[f32])> = mm.iter().filter(|m| m.0 >= c).map(|&(i, e)| (i - c, e)).collect();
+            let hs = self.exp_forward(ex, sess, &tokens[c..], &rest, false);
+            hidden.truncate(c * h);
+            hidden.extend_from_slice(&hs);
+            let es = sess.exp.as_mut().unwrap();
+            let tail = std::mem::take(&mut es.last_wide);
+            wide.truncate(c * w);
+            wide.extend_from_slice(&tail);
+        }
+        sess.exp.as_mut().unwrap().last_wide = wide;
+        Some(hidden)
     }
 
     /// A speculative verification of `tokens` on the multi-token GPU plan (see

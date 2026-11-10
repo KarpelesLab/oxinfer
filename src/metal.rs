@@ -791,6 +791,17 @@ inline void scale_store(thread CT& c, device const float* rs, uint t0, DT d) {
         if (c.is_valid_element(i)) { auto idx = c.get_multidimensional_index(i); c[i] *= rs[t0 + idx[1]]; }
     c.store(d);
 }
+// The same into rows ldy floats apart (prefill plans: a view of a wider activation row).
+template <typename CT>
+inline void scale_store_ld(thread CT& c, device const float* rs, uint t0, device float* y, uint ldy, uint o0) {
+#pragma unroll
+    for (uint16_t i = 0; i < c.get_capacity(); ++i)
+        if (c.is_valid_element(i)) {
+            auto idx = c.get_multidimensional_index(i);
+            uint r = t0 + idx[1];
+            y[(ulong)r * ldy + o0 + idx[0]] = c[i] * rs[r];
+        }
+}
 template <typename CT>
 inline void zero(thread CT& c) {
 #pragma unroll
@@ -798,7 +809,7 @@ inline void zero(thread CT& c) {
 }
 template <typename W, int TM>
 inline void mma_tile(W w, device const half* xh, device const float* rs, device float* y, uint n_out, uint n_in, uint rows,
-                     uint o0, uint t0, uint tid, threadgroup half* Ws) {
+                     uint o0, uint t0, uint tid, threadgroup half* Ws, uint ldy = 0) {
     XT X((device half*)xh, dextents<int32_t, 2>(n_in, rows));
     YT Y(y, dextents<int32_t, 2>(n_out, rows));
     constexpr auto desc = matmul2d_descriptor(TM, 64, MKB, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
@@ -819,11 +830,12 @@ inline void mma_tile(W w, device const half* xh, device const float* rs, device 
         op.run(a, Wt, c);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    scale_store(c, rs, t0, Y.slice(o0, t0));
+    if (ldy != 0) scale_store_ld(c, rs, t0, y, ldy, o0);
+    else scale_store(c, rs, t0, Y.slice(o0, t0));
 }
 template <int TM, int TN>
 inline void mma_bf_tile(device const bfloat* w, device const half* xh, device const float* rs, device float* y, uint n_out, uint n_in, uint rows,
-                        uint o0, uint t0) {
+                        uint o0, uint t0, uint ldy = 0) {
     XT X((device half*)xh, dextents<int32_t, 2>(n_in, rows));
     YT Y(y, dextents<int32_t, 2>(n_out, rows));
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Wt((device bfloat*)w, dextents<int32_t, 2>(n_in, n_out));
@@ -834,7 +846,8 @@ inline void mma_bf_tile(device const bfloat* w, device const half* xh, device co
     auto c = op.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
     zero(c);
     op.run(a, b, c);
-    scale_store(c, rs, t0, Y.slice(o0, t0));
+    if (ldy != 0) scale_store_ld(c, rs, t0, y, ldy, o0);
+    else scale_store(c, rs, t0, Y.slice(o0, t0));
 }
 // Dense: 128-token tiles, and 32-token tiles (`_s`) for short inputs. (MAKE expands to text with
 // commas, so it is only ever used directly in a body, never forwarded to another macro.)
@@ -844,9 +857,9 @@ kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[bu
                  uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
 #define MMAD(NAME, WT, MAKE) \
 MMA_SIG(NAME) { threadgroup half Ws[64 * MKB]; \
-    WT w = MAKE; mma_tile<WT, 128>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, tg.y * 128, tid, Ws); } \
+    WT w = MAKE; mma_tile<WT, 128>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, tg.y * 128, tid, Ws, p._p0); } \
 MMA_SIG(NAME##_s) { threadgroup half Ws[64 * MKB]; \
-    WT w = MAKE; mma_tile<WT, 32>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, tg.y * 32, tid, Ws); }
+    WT w = MAKE; mma_tile<WT, 32>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, tg.y * 32, tid, Ws, p._p0); }
 // Grouped: per-expert weight addresses, and one tile per threadgroup row.
 struct EP { device const uchar* q; device const uchar* s; };
 struct GT { uint e; uint r0; uint rows; uint t0; };
@@ -856,7 +869,7 @@ kernel void NAME(device const EP* ep [[buffer(0)]], device const GT* tiles [[buf
                  uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { \
     threadgroup half Ws[64 * MKB]; \
     GT g = tiles[tg.y]; device const void* qb = ep[g.e].q; device const void* sb = ep[g.e].s; \
-    WT w = MAKE; mma_tile<WT, 32>(w, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out, p.n_out, p.n_in, g.rows, tg.x * 64, g.t0, tid, Ws); }
+    WT w = MAKE; mma_tile<WT, GTM>(w, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out, p.n_out, p.n_in, g.rows, tg.x * 64, g.t0, tid, Ws); }
 MMAD(mma_q8, Q8W, MK_Q8) MMAD(mma_q4, Q4W, MK_Q4)
 MMAG(mmag_q8, Q8W, MK_Q8) MMAG(mmag_q4, Q4W, MK_Q4)
 MMAD(mma_F8_E4M3, F8W, MK_F8) MMAG(mmag_F8_E4M3, F8W, MK_F8)
@@ -867,27 +880,28 @@ kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[bu
                  uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { \
     threadgroup half Ws[64 * MKB]; \
     Q4A w = { MK_Q4, ob + op.o_off, op.gpr, op.gk }; \
-    mma_tile<Q4A, TM>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, tg.y * TM, tid, Ws); }
+    mma_tile<Q4A, TM>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, tg.y * TM, tid, Ws, p._p0); }
 MMA_Q4A(mma_q4a, 128) MMA_Q4A(mma_q4a_s, 32)
 #define MMA_BF(NAME, TN, TM) \
 kernel void NAME(device const ushort* qb [[buffer(0)]], device const half* xh [[buffer(2)]], device float* y [[buffer(3)]], \
                  constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]]) { \
-    mma_bf_tile<TM, TN>((device const bfloat*)(qb + p.w_off), xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * TN, tg.y * TM); }
+    mma_bf_tile<TM, TN>((device const bfloat*)(qb + p.w_off), xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * TN, tg.y * TM, p._p0); }
 MMA_BF(mma_bf64, 64, 128) MMA_BF(mma_bf128, 128, 128) MMA_BF(mma_bf64_s, 64, 32) MMA_BF(mma_bf128_s, 128, 32)
 kernel void mmag_bf(device const EP* ep [[buffer(0)]], device const GT* tiles [[buffer(1)]], device const half* xh [[buffer(2)]],
                     device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]],
                     uint2 tg [[threadgroup_position_in_grid]]) {
     GT g = tiles[tg.y];
-    mma_bf_tile<32, 64>((device const bfloat*)ep[g.e].q, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out,
+    mma_bf_tile<GTM, 64>((device const bfloat*)ep[g.e].q, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out,
                         p.n_out, p.n_in, g.rows, tg.x * 64, g.t0); }
 #define GGM(T) MMAD(mma_##T, T##W, MK_GG(T##W)) MMAG(mmag_##T, T##W, MK_GG(T##W))
 GGM(F16) GGM(Q4_1) GGM(Q5_0) GGM(Q5_1)
 GGM(Q4_0) GGM(IQ4_NL) GGM(Q8_0) GGM(Q4_K) GGM(Q5_K) GGM(Q6_K) GGM(Q3_K) GGM(Q2_K) GGM(IQ4_XS)
 GGM(IQ2_XXS) GGM(IQ2_XS) GGM(IQ2_S) GGM(IQ3_XXS) GGM(IQ3_S) GGM(IQ1_S) GGM(IQ1_M) GGM(MXFP4)
 
-// Input rows (optionally gathered: row r is source row src[r]) to half with a power-of-two scale
-// per row (see above); rs gets the inverse scale. One threadgroup of 256 per row; n % 4 == 0.
-struct XH { uint n; uint gather; };
+// Input rows (optionally gathered: row r is source row src[r], zeros for ~0) to half with a
+// power-of-two scale per row (see above); rs gets the inverse scale. Source rows are `stride`
+// floats apart. One threadgroup of 256 per row; n % 4 == 0.
+struct XH { uint n; uint gather; uint stride; uint _p; };
 inline float row_scale(float m, thread float& inv) {
     int e = 0;
     if (m > 0.f && isfinite(m)) { frexp(m, e); e = clamp(14 - e, -100, 100); }
@@ -905,8 +919,15 @@ kernel void x_half(device const float* x [[buffer(0)]], device half* xh [[buffer
                    uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float red[8];
-    device const float4* row = (device const float4*)(x + (ulong)(p.gather != 0 ? src[r] : r) * p.n);
+    uint sr = p.gather != 0 ? src[r] : r;
     uint n4 = p.n / 4;
+    if (sr == 0xffffffffu) {
+        device half4* out = (device half4*)(xh + (ulong)r * p.n);
+        for (uint i = tid; i < n4; i += 256) out[i] = half4(0.f);
+        if (tid == 0) rs[r] = 1.f;
+        return;
+    }
+    device const float4* row = (device const float4*)(x + (ulong)sr * p.stride);
     float m = 0.f;
     for (uint i = tid; i < n4; i += 256) { float4 v = abs(row[i]); m = max(m, max(max(v.x, v.y), max(v.z, v.w))); }
     m = tg_max(m, sg, lane, red);
@@ -1026,7 +1047,7 @@ kernel void flash_attn128_mma_f32(device const float* q [[buffer(0)]], device co
     flash_attn128_body<float>(q, k, v, o, p, S, S, A, L, tg, tid);
 }
 // out[t] = sum over the token's k slots of weight * o[row].
-struct CB { uint n; uint k; };
+struct CB { uint n; uint k; uint ldo; uint _p; };
 kernel void moe_combine(device const float* o [[buffer(0)]], device const float2* slots [[buffer(1)]], device float* out [[buffer(2)]],
                         constant CB& p [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
     uint c = gid.x * 4, t = gid.y;
@@ -1036,7 +1057,7 @@ kernel void moe_combine(device const float* o [[buffer(0)]], device const float2
         float2 s = slots[t * p.k + j];
         acc += s.y * *(device const float4*)(o + (ulong)as_type<uint>(s.x) * p.n + c);
     }
-    *(device float4*)(out + (ulong)t * p.n + c) = acc;
+    *(device float4*)(out + (ulong)t * p.ldo + c) = acc;
 }
 "#;
 
@@ -1585,7 +1606,7 @@ impl MetalBackend {
         };
         let t_compile = Instant::now();
         let (lib, has_mma, mma_error) = match want_mma {
-            true => match compile(&format!("{base_src}{MMA_SHADER_SRC}"), true) {
+            true => match compile(&format!("#define GTM {MMA_GTM}\n{base_src}{MMA_SHADER_SRC}"), true) {
                 Ok(l) => (l, true, None),
                 Err(e) => {
                     if apple10 || mma_env.is_some() || std::env::var_os("OXINFER_DEBUG").is_some() {
@@ -2234,6 +2255,8 @@ impl MetalBackend {
         struct Xh {
             n: u32,
             gather: u32,
+            stride: u32,
+            _p: u32,
         }
         let m = self.mma.as_ref().unwrap();
         e.pipe(m.x_half);
@@ -2244,6 +2267,8 @@ impl MetalBackend {
             &Xh {
                 n: n as u32,
                 gather: src.is_some() as u32,
+                stride: n as u32,
+                _p: 0,
             },
             3,
         );
@@ -2985,6 +3010,15 @@ impl Backend for MetalBackend {
             .map(|p| Box::new(p) as Box<dyn crate::gpu::decode::DecodePlan + 's>)
     }
 
+    fn decode_plan_prefill<'s>(
+        &'s self,
+        g: &crate::gpu::decode::Graph,
+        tokens: usize,
+    ) -> Option<Box<dyn crate::gpu::decode::DecodePlan + 's>> {
+        self.build_plan_pf(g, tokens)
+            .map(|p| Box::new(p) as Box<dyn crate::gpu::decode::DecodePlan + 's>)
+    }
+
     fn decode_plan_multi_fast<'s>(
         &'s self,
         g: &crate::gpu::decode::Graph,
@@ -3173,12 +3207,22 @@ impl Backend for MetalBackend {
             struct Cb {
                 n: u32,
                 k: u32,
+                ldo: u32,
+                _p: u32,
             }
             e.pipe(m.combine);
             e.buf(st.m_o.id, 0, 0);
             e.buf(st.m_slots.id, 0, 1);
             e.buf(st.y, 0, 2);
-            e.bytes(&Cb { n: h as u32, k: k as u32 }, 3);
+            e.bytes(
+                &Cb {
+                    n: h as u32,
+                    k: k as u32,
+                    ldo: h as u32,
+                    _p: 0,
+                },
+                3,
+            );
             e.dispatch(((h / 4).div_ceil(64), t), 64);
         };
         let out = self.contents(st.y) as *const f32;
@@ -3360,6 +3404,79 @@ mod tests {
                 a.iter().zip(b).fold(0f32, |e, (p, q)| e.max((p - q).abs())) / m
             })
             .fold(0f32, f32::max)
+    }
+
+    /// Timing of `Backend::moe` at Qwen3.8-Flash-Next's shapes (512 experts, Q4_K gate / up,
+    /// Q5_1 down, top 10): `cargo test --release --lib moe_bench -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn moe_bench() {
+        let Some(be) = backend() else { return };
+        let (ne, h, mi, k) = (512usize, 2560usize, 640usize, 10usize);
+        let mut seed = 11;
+        // Random blocks with sane f16 scales (bytes 0..4 of each block, Q4_K; 0..4 Q5_1).
+        let make = |kind: GgmlType, n_out: usize, n_in: usize, seed: &mut u64| {
+            let rb = kind.row_bytes(n_in);
+            let mut q = crate::quant::PageVec::<u8>::zeroed(ne * n_out * rb);
+            for b in q.iter_mut() {
+                *b = (rnd(seed).to_bits() >> 9) as u8;
+            }
+            let bs = kind.type_size();
+            for blk in q.chunks_mut(bs) {
+                blk[0..2].copy_from_slice(&0x2000u16.to_le_bytes());
+                blk[2..4].copy_from_slice(&0x2000u16.to_le_bytes());
+            }
+            q
+        };
+        let g = make(GgmlType::Q4_K, mi, h, &mut seed);
+        let u = make(GgmlType::Q4_K, mi, h, &mut seed);
+        let d = make(GgmlType::Q5_1, h, mi, &mut seed);
+        let mats = |q: &crate::quant::PageVec<u8>, kind: GgmlType, n_out: usize, n_in: usize| -> Vec<crate::ggml::GgufMatrix> {
+            let sz = n_out * kind.row_bytes(n_in);
+            (0..ne)
+                .map(|e| crate::ggml::GgufMatrix {
+                    kind,
+                    data: unsafe { crate::quant::QBuf::borrowed(&q[e * sz..(e + 1) * sz]) },
+                    n_out,
+                    n_in,
+                    block_scales: None,
+                })
+                .collect()
+        };
+        let (gm, um, dm) = (
+            mats(&g, GgmlType::Q4_K, mi, h),
+            mats(&u, GgmlType::Q4_K, mi, h),
+            mats(&d, GgmlType::Q5_1, h, mi),
+        );
+        let gw: Vec<WeightRef> = gm.iter().map(WeightRef::Gguf).collect();
+        let uw: Vec<WeightRef> = um.iter().map(WeightRef::Gguf).collect();
+        let dw: Vec<WeightRef> = dm.iter().map(WeightRef::Gguf).collect();
+        let dev = be.upload_moe(&gw, Some(&uw), &dw, h, mi, crate::gpu::MoeAct::Silu).unwrap();
+        for t in [512usize, 1024, 2048, 4096] {
+            let x = input(t, h, &mut seed);
+            let routes: Vec<Vec<(usize, f32)>> = (0..t)
+                .map(|_| {
+                    let mut v: Vec<usize> = Vec::new();
+                    while v.len() < k {
+                        let e = ((rnd(&mut seed) + 0.5) * ne as f32) as usize % ne;
+                        if !v.contains(&e) {
+                            v.push(e);
+                        }
+                    }
+                    v.into_iter().map(|e| (e, 0.1)).collect()
+                })
+                .collect();
+            let mut y = vec![0f32; t * h];
+            assert!(be.moe(&x, t, h, mi, &routes, &dev, &mut y));
+            let n = 5;
+            let t0 = Instant::now();
+            for _ in 0..n {
+                assert!(be.moe(&x, t, h, mi, &routes, &dev, &mut y));
+            }
+            let dt = t0.elapsed().as_secs_f64() / n as f64;
+            let flops = 2.0 * (t * k) as f64 * (3 * h * mi) as f64;
+            eprintln!("moe t={t}: {:.2} ms, {:.1} TFLOP/s useful", dt * 1e3, flops / dt / 1e12);
+        }
     }
 
     /// A random FP8 E4M3 matrix (no NaN bytes) with 128 x 128 block scales.

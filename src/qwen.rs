@@ -986,7 +986,7 @@ impl<'a> QwenModel<'a> {
         if let Some(ex) = &self.exp {
             // Multi-token plans of Qwen4-Exp: speculative verification only (no capture layers).
             return if lay.is_none() && multi.is_none_or(|m| m.is_empty()) {
-                self.exp_gpu_graph(ex, multi.is_some())
+                self.exp_gpu_graph(ex, multi.is_some(), false)
             } else {
                 None
             };
@@ -1425,6 +1425,33 @@ impl<'a> QwenModel<'a> {
         (t <= MULTI_TOKENS).then(|| self.gpu_multi_plan(&[], n, fast))?
     }
 
+    /// Qwen4-Exp: the GPU prefill plan (see `Backend::decode_plan_prefill`), compiled on first
+    /// use; None when unavailable.
+    pub(crate) fn gpu_prefill_plan(&self) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
+        let ex = self.exp.as_ref()?;
+        if !self.gpu_decode_on() {
+            return None;
+        }
+        let tokens = std::env::var("OXINFER_PREFILL_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n >= PREFILL_GPU_MIN)
+            .unwrap_or(1024);
+        self.gpu_plans.get((1 << 61) | tokens as u64, || {
+            let be = crate::gpu::active()?;
+            let t0 = std::time::Instant::now();
+            let plan = self.exp_gpu_graph(ex, true, true).and_then(|g| be.decode_plan_prefill(&g, tokens));
+            if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
+                eprintln!(
+                    "[gpu prefill plan: {} in {:.2}s]",
+                    if plan.is_some() { "built" } else { "none" },
+                    t0.elapsed().as_secs_f64()
+                );
+            }
+            plan
+        })
+    }
+
     fn gpu_multi_plan(&self, layers: &[usize], tokens: usize, fast: bool) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
         if !self.gpu_decode_on() {
             return None;
@@ -1708,7 +1735,11 @@ impl<'a> QwenModel<'a> {
         assert!(t > 0);
         sess.gpu_rec = None;
         if t > 1 && gpu {
+            let t0 = std::time::Instant::now();
             let _ = self.gpu_plan();
+            if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
+                eprintln!("[gpu plan ready in {:.2}s]", t0.elapsed().as_secs_f64());
+            }
         }
         if t == 1
             && gpu
@@ -1719,6 +1750,13 @@ impl<'a> QwenModel<'a> {
             return hs;
         }
         if let Some(ex) = &self.exp {
+            if gpu
+                && !record
+                && prefill_gpu(t, "plan")
+                && let Some(hs) = self.exp_gpu_prefill(ex, sess, tokens, mm)
+            {
+                return hs;
+            }
             return self.exp_forward(ex, sess, tokens, mm, record);
         }
         let cfg = &self.cfg;
@@ -2325,7 +2363,7 @@ impl Moe<'_> {
 
 /// Qwen4-Exp passes of at least this many tokens (prefill) run Gated DeltaNet's rule and the
 /// attention on the GPU when there is one.
-const PREFILL_GPU_MIN: usize = 32;
+pub(crate) const PREFILL_GPU_MIN: usize = 32;
 
 /// Whether a Qwen4-Exp pass of `t` tokens offloads past the matmuls (`OXINFER_PREFILL_GPU=0`: not).
 fn prefill_gpu_exp(cfg: &QwenConfig, t: usize, what: &str) -> bool {
@@ -2333,7 +2371,7 @@ fn prefill_gpu_exp(cfg: &QwenConfig, t: usize, what: &str) -> bool {
 }
 
 /// [`prefill_gpu_exp`] for a part known to be Qwen4-Exp's.
-fn prefill_gpu(t: usize, what: &str) -> bool {
+pub(crate) fn prefill_gpu(t: usize, what: &str) -> bool {
     static ON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     let v = ON.get_or_init(|| std::env::var("OXINFER_PREFILL_GPU").unwrap_or_default());
     t >= PREFILL_GPU_MIN && v != "0" && (v.is_empty() || v == "1" || v.split(',').any(|x| x == what))

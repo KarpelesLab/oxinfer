@@ -622,6 +622,36 @@ impl FastEnc<'_> {
     }
 }
 
+/// `OXINFER_PF_PROFILE` is set: prefill plans run each op in a command buffer of its own and
+/// add up the GPU time per kind of op ([`pf_report`]; slower, for profiling).
+fn pf_prof() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OXINFER_PF_PROFILE").is_some())
+}
+static PF_TIMES: std::sync::Mutex<Vec<(String, f64, usize)>> = std::sync::Mutex::new(Vec::new());
+fn pf_note(kind: String, g: f64) {
+    let mut v = PF_TIMES.lock().unwrap();
+    match v.iter_mut().find(|x| x.0 == kind) {
+        Some(x) => {
+            x.1 += g;
+            x.2 += 1;
+        }
+        None => v.push((kind, g, 1)),
+    }
+}
+/// Prints the GPU time per kind of op of the prefill plan steps so far (`OXINFER_PF_PROFILE`).
+pub(crate) fn pf_report() {
+    let v = PF_TIMES.lock().unwrap();
+    let tot: f64 = v.iter().map(|x| x.1).sum();
+    for x in v.iter() {
+        eprintln!("  {:<24} {:8.1} ms {:6} ops", x.0, x.1 * 1e3, x.2);
+    }
+    eprintln!("  total {:.1} ms", tot * 1e3);
+}
+
+/// Prefill GEMMs with fewer 128-row tiles than this take 32-row ones (measured on an M5 Max).
+const PF_SMALL_TILES: usize = 160;
+
 /// `OXINFER_METAL_TRACE` is set.
 fn trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -667,6 +697,10 @@ pub(crate) fn run_concurrent(
             ok &= st == 4;
         }
         let mut g = 0.0;
+        if pf_prof() && !cbs.is_empty() {
+            let time: unsafe extern "C" fn(Id, Sel) -> f64 = b.o.msg_send();
+            g = time(*cbs.last().unwrap(), b.o.sel(c"GPUEndTime")) - time(cbs[0], b.o.sel(c"GPUStartTime"));
+        }
         if trace() && !cbs.is_empty() {
             let time: unsafe extern "C" fn(Id, Sel) -> f64 = b.o.msg_send();
             g = time(*cbs.last().unwrap(), b.o.sel(c"GPUEndTime")) - time(cbs[0], b.o.sel(c"GPUStartTime"));
@@ -929,6 +963,11 @@ struct QsaScoreParams {
 /// Most key chunks a head's attention is split into (`AttnParams::nsplit`).
 const ATTN_MAX_SPLIT: usize = 64;
 
+/// Prefill plans: tokens per multi-token matvec (shapes without a GEMM).
+const PF_MV_TOKENS: usize = 16;
+/// Prefill plans: barrier resources of the GEMM scratch (half rows, outputs).
+const PF_RES: usize = KV_RES * 4;
+
 /// The sparse attention of a token at `pos` under QSA (`MOp::Attn::sel`): the kernel, the arena
 /// offset of its positions and their count, or None while every block fits the budget (dense).
 fn qsa_list(sel: &Option<(Id, usize, usize, usize, usize)>, pos: usize) -> Option<(Id, usize, usize)> {
@@ -1156,6 +1195,125 @@ enum MOp {
         r: usize,
         t: Option<(usize, usize)>,
     },
+    /// Prefill plans ([`MetalBackend::build_plan_pf`]): rows of `x` (`stride` floats apart, `n`
+    /// each) to the GEMM scratch as scaled half rows (see `x_half`).
+    XHalf {
+        pipe: Id,
+        x: usize,
+        stride: u32,
+        n: u32,
+    },
+    /// Prefill plans: `y = W x` on the matrix units from the scratch half rows, into rows `ldy`
+    /// floats apart (0: `n_out`). Pipelines and outputs per threadgroup for 128- and 32-row tiles.
+    Gemm {
+        pipes: [(Id, usize); 2],
+        data: Id,
+        scales: Id,
+        w_off: u32,
+        s_off: u32,
+        offs: Option<(Id, [u32; 4])>,
+        n_out: usize,
+        n_in: usize,
+        y: usize,
+        ldy: u32,
+    },
+    /// Prefill plans: `y = W x` with f32 weights in the constants (`gemm_f32`, 64 x 64 tiles; the
+    /// MoE routers), x rows `n_in` apart, y rows `n_out` apart.
+    GemmF32 {
+        pipe: Id,
+        w: usize,
+        x: usize,
+        y: usize,
+        n_out: usize,
+        n_in: usize,
+    },
+    /// Prefill plans: `y += x * sigmoid(gate)` per token (`pf_add_rows`; ts as the kernel's).
+    AddRows {
+        pipe: Id,
+        y: usize,
+        x: usize,
+        gate: usize,
+        n: u32,
+        ts: [u32; 4],
+    },
+    /// Prefill plans: the routers' top-k of every token in one dispatch (`pf_topk`).
+    PfTopk {
+        pipe: Id,
+        logits: usize,
+        sel: usize,
+        n: u32,
+        k: u32,
+        scale: Option<usize>,
+        ts: [u32; 4],
+    },
+    /// Prefill plans: routed experts as grouped matrix-unit GEMMs over the tokens of each expert;
+    /// the step reads the routing back first (index into `MetalPlan::pf`'s experts).
+    PfExperts(usize),
+    /// Prefill plans: the Gated DeltaNet rule over the chunk (`pf_gdn_rule`), then its gated norm.
+    PfGdn {
+        rule: Id,
+        norm: Id,
+        c: usize,
+        ba: usize,
+        z: usize,
+        out: usize,
+        state: usize,
+        cst: usize,
+        norm_w: usize,
+        p: GdnRuleParams,
+        /// Strides of c, b / a, out; of z.
+        ts: [u32; 3],
+        zs: u32,
+        eps: f32,
+        sigmoid: bool,
+    },
+    /// Prefill plans: attention of every token of the chunk (`pfa_D_G`), dense or QSA.
+    PfAttn {
+        pipe: Id,
+        grp: usize,
+        q: usize,
+        out: usize,
+        kv: usize,
+        gate: usize,
+        sel: usize,
+        p: AttnParams,
+        /// `PFA` without the start position.
+        a: [u32; 8],
+    },
+}
+
+/// The routed experts of a prefill plan's MoE layer (`MOp::PfExperts`): grouped GEMM pipelines,
+/// the experts' address tables (data, scales), GGUF row bytes, and the activations.
+struct PfExperts {
+    pipes: (Id, Id),
+    up: Option<(Id, u32)>,
+    tabs: [Id; 3],
+    row_bytes: (u32, u32),
+    x: usize,
+    x_stride: u32,
+    sel: usize,
+    sel_stride: usize,
+    y: usize,
+    y_stride: u32,
+    h: usize,
+    inter: usize,
+    k: usize,
+    n_exp: usize,
+}
+
+/// A prefill plan's state beyond a multi-token plan's: arena offsets of the GEMM scratch (half
+/// rows, their scales), the routed experts of each MoE layer and their staging buffer (one
+/// layer at a time: the step waits for the routing before each).
+struct PfState {
+    xh: usize,
+    rs: usize,
+    tmp: usize,
+    experts: Vec<PfExperts>,
+    /// Staging: the buffer and offsets of src, tiles, slots, xh, rs, gu, ah, rs2, o.
+    stage: Id,
+    st: [usize; 9],
+    max_rows: usize,
+    max_tiles: usize,
 }
 
 pub(crate) struct MetalPlan<'b> {
@@ -1212,6 +1370,7 @@ pub(crate) struct MetalPlan<'b> {
     units: Vec<PlanUnit>,
     /// Most positions a step may reach (QSA scores: `Op::QsaSelect::cap` blocks).
     max_len: usize,
+    pf: Option<PfState>,
 }
 unsafe impl Send for MetalPlan<'_> {}
 unsafe impl Sync for MetalPlan<'_> {}
@@ -1233,6 +1392,16 @@ impl Drop for MetalPlan<'_> {
                 && !gone.is_empty()
             {
                 r.update(&gone, false);
+            }
+            if let Some(pf) = &self.pf {
+                (self.f.void)(pf.stage, self.f.s_release);
+                for x in &pf.experts {
+                    (self.f.void)(x.tabs[0], self.f.s_release);
+                    (self.f.void)(x.tabs[2], self.f.s_release);
+                    if x.tabs[1] != x.tabs[0] {
+                        (self.f.void)(x.tabs[1], self.f.s_release);
+                    }
+                }
             }
             for &b in self.owned.iter().chain(&last) {
                 (self.f.void)(b, self.f.s_release);
@@ -1327,16 +1496,42 @@ impl MetalBackend {
     /// weights are read once at little more than one token's cost, but the sums are taken in
     /// another order, so the results differ from single-token steps in rounding.
     pub(crate) fn build_plan_t(&self, g: &Graph, tokens: usize, fast: bool) -> Option<MetalPlan<'_>> {
+        self.build_plan_mode(g, tokens, fast, false)
+    }
+
+    /// A prefill plan: `g` compiled for chunks of up to `tokens` tokens (rounded up to whole
+    /// 128-row GEMM tiles) with the activations kept on the device for the whole pass. The
+    /// matvecs become matrix-unit GEMMs (half inputs, as `Backend::matmul`; tiny or odd shapes keep
+    /// the multi-token matvecs, 16 tokens at a time), the routed experts grouped GEMMs over each
+    /// expert's tokens (the step reads the routing back before each MoE layer), the Gated DeltaNet
+    /// rule and the attention the prefill kernels (`pf_gdn_rule`, `pfa_D_G`); the other ops run
+    /// as in a multi-token plan. Results differ from one-token steps in rounding.
+    pub(crate) fn build_plan_pf(&self, g: &Graph, tokens: usize) -> Option<MetalPlan<'_>> {
+        self.build_plan_mode(g, tokens, false, true)
+    }
+
+    fn build_plan_mode(&self, g: &Graph, tokens: usize, fast: bool, pf: bool) -> Option<MetalPlan<'_>> {
         let f = Fns::new(self);
-        let mt = tokens > 1;
-        let fast = fast && mt && fast_kernels();
+        let mt = tokens > 1 || pf;
+        let fast = fast && mt && !pf && fast_kernels();
+        if pf && (self.mma().is_none() || g.gate.is_some()) {
+            return None;
+        }
         let tt = match MVK_TOKENS.iter().find(|&&t| t >= tokens) {
+            _ if pf => PF_MV_TOKENS,
             Some(&t) => t,
             None if !mt => 1,
             None => return None,
         };
-        // The fast kernels read whole 8-token tiles of x: keep that many rows.
-        let tokens = if fast { tokens.next_multiple_of(8) } else { tokens };
+        // The fast kernels read whole 8-token tiles of x: keep that many rows; prefill GEMMs
+        // whole 128-row tiles.
+        let tokens = if pf {
+            tokens.next_multiple_of(super::MMA_TM)
+        } else if fast {
+            tokens.next_multiple_of(8)
+        } else {
+            tokens
+        };
         // Activation arena: every buffer 256-byte aligned; in a multi-token plan, `tokens` rows of
         // `tsz` floats (256-byte aligned too).
         let tsz: Vec<usize> = g.bufs.iter().map(|&n| if mt { n.next_multiple_of(64) } else { n }).collect();
@@ -1353,6 +1548,28 @@ impl MetalBackend {
         let rope_off = total;
         total += (tokens * 2 * g.rope_halves.iter().sum::<usize>() * 4).next_multiple_of(256);
         let rope_table = |r: usize| rope_off + tokens * 2 * g.rope_halves[..r].iter().sum::<usize>() * 4;
+        // Prefill plans: the GEMM scratch (half rows, their scales, outputs before an add or a
+        // pair's activation).
+        let (mut pf_xh, mut pf_rs, mut pf_tmp, mut pf_tmp_n) = (0, 0, 0, 0);
+        if pf {
+            let (mut ni, mut no) = (0, 0);
+            for op in &g.ops {
+                if let Op::Linear { n_out, n_in, .. } = *op {
+                    ni = ni.max(n_in);
+                    no = no.max(n_out);
+                }
+            }
+            pf_xh = total;
+            total += (tokens * ni * 2).next_multiple_of(256);
+            pf_rs = total;
+            total += (tokens * 4).next_multiple_of(256);
+            pf_tmp = total;
+            pf_tmp_n = no;
+            total += (2 * tokens * no * 4).next_multiple_of(256);
+        }
+        // The view whose half rows the scratch holds, and the routed experts.
+        let mut xh_of: Option<(usize, usize, usize)> = None;
+        let mut pf_experts: Vec<PfExperts> = Vec::new();
         // Constants: every vector 64-byte aligned.
         let mut consts: Vec<f32> = Vec::new();
         let mut cst = |v: &[f32]| -> usize {
@@ -1437,8 +1654,114 @@ impl MetalBackend {
                     x,
                     y,
                     mode,
-                } => {
+                } => 'lin: {
                     use crate::gpu::decode::is_streamed;
+                    // Prefill: matrix-unit GEMMs where the weights have them.
+                    let gemm = |w: &WeightRef, dev: &crate::gpu::DeviceWeight| -> Option<MOp> {
+                        let mw = dev.downcast_ref::<super::MetalWeight>()?;
+                        let affine = mw.offsets.is_some();
+                        let pd = self.mma_pipe(w, affine, n_out, n_in, super::Tile::Dense)?;
+                        let ps = self.mma_pipe(w, affine, n_out, n_in, super::Tile::Small)?;
+                        let (_, elem_bytes, scale_bytes) = super::format_index(w);
+                        let s_off = match w {
+                            WeightRef::Gguf(m) => super::gguf_s_off(m, mw),
+                            _ => mw.scales.as_ref().map(|s| s.offset_bytes / scale_bytes).unwrap_or(0),
+                        };
+                        Some(MOp::Gemm {
+                            pipes: [pd, ps],
+                            data: mw.data.id,
+                            scales: mw.scales.as_ref().map(|s| s.id).unwrap_or(mw.data.id),
+                            w_off: (mw.data.offset_bytes / elem_bytes) as u32,
+                            s_off: s_off as u32,
+                            offs: mw
+                                .offsets
+                                .as_ref()
+                                .map(|(ob, gpr, gk)| (ob.id, [(ob.offset_bytes / 2) as u32, *gpr, *gk, 0])),
+                            n_out,
+                            n_in,
+                            y: 0,
+                            ldy: 0,
+                        })
+                    };
+                    let mmas = if !pf || is_streamed(dev) || w2.as_ref().is_some_and(|(_, d)| is_streamed(d)) {
+                        None
+                    } else {
+                        match (gemm(w, dev), w2.as_ref().map(|(w2, d2)| gemm(w2, d2))) {
+                            (Some(a), None) => Some((a, None)),
+                            (Some(a), Some(Some(b))) => Some((a, Some(b))),
+                            _ => None,
+                        }
+                    };
+                    if let Some((mut g1, g2)) = mmas {
+                        let mut r = vec![rng(x, n_in), (PF_RES, 0, usize::MAX)];
+                        let mut wv = vec![];
+                        if xh_of != Some((x.buf, x.off, n_in)) {
+                            emit.push(MOp::XHalf {
+                                pipe: self.named_pipeline("x_half")?,
+                                x: byte(x),
+                                stride: ts(x) as u32,
+                                n: n_in as u32,
+                            });
+                            emit.push(MOp::Barrier);
+                            wv.push((PF_RES, 0, usize::MAX));
+                            xh_of = Some((x.buf, x.off, n_in));
+                        }
+                        let set_y = |op: &mut MOp, at: usize, ld: u32| {
+                            if let MOp::Gemm { y, ldy, .. } = op {
+                                (*y, *ldy) = (at, ld);
+                            }
+                        };
+                        match (mode, g2) {
+                            (LinMode::Store, None) => {
+                                set_y(&mut g1, byte(y), if ts(y) == n_out { 0 } else { ts(y) as u32 });
+                                emit.push(g1);
+                            }
+                            (LinMode::Add | LinMode::AddGated(_), None) => {
+                                set_y(&mut g1, pf_tmp, 0);
+                                emit.push(g1);
+                                emit.push(MOp::Barrier);
+                                let gv = match mode {
+                                    LinMode::AddGated(v) => Some(v),
+                                    _ => None,
+                                };
+                                emit.push(MOp::AddRows {
+                                    pipe: self.named_pipeline("pf_add_rows")?,
+                                    y: byte(y),
+                                    x: pf_tmp,
+                                    gate: gv.map_or(0, byte),
+                                    n: n_out as u32,
+                                    ts: [n_out as u32, ts(y) as u32, gv.map_or(0, ts) as u32, gv.is_some() as u32],
+                                });
+                                if let Some(v) = gv {
+                                    r.push(rng(v, 1));
+                                }
+                                r.push(rng(y, n_out));
+                                r.push((PF_RES + 1, 0, usize::MAX));
+                                wv.push((PF_RES + 1, 0, usize::MAX));
+                            }
+                            (LinMode::SiluPair | LinMode::GeluPair, Some(mut g2)) => {
+                                set_y(&mut g1, pf_tmp, 0);
+                                set_y(&mut g2, pf_tmp + tokens * n_out * 4, 0);
+                                emit.push(g1);
+                                emit.push(g2);
+                                emit.push(MOp::Barrier);
+                                emit.push(MOp::Glu {
+                                    pipe: self.named_pipeline("dec_glu")?,
+                                    g: pf_tmp,
+                                    u: pf_tmp + tokens * n_out * 4,
+                                    out: byte(y),
+                                    n: n_out as u32,
+                                    gelu: matches!(mode, LinMode::GeluPair) as u32,
+                                    t: Some((self.named_pipeline("dec_glu_t")?, [n_out as u32, n_out as u32, ts(y) as u32, 0])),
+                                });
+                                r.push((PF_RES + 1, 0, usize::MAX));
+                                wv.push((PF_RES + 1, 0, usize::MAX));
+                            }
+                            _ => return None,
+                        }
+                        wv.push(rng(y, n_out));
+                        break 'lin (r, wv);
+                    }
                     let (mw, sa) = if is_streamed(dev) {
                         let (m, a) = MvWeight::streamed(w, n_out, n_in)?;
                         (m, Some(a))
@@ -1592,7 +1915,7 @@ impl MetalBackend {
                     logits,
                     sel,
                     expert_scale,
-                } => {
+                } => 'route: {
                     // Multi-token plans route each token with the single-token kernels.
                     if expert_scale.is_some_and(|s| s.len() != n_exp) {
                         return None;
@@ -1619,6 +1942,64 @@ impl MetalBackend {
                         gk: 0,
                     };
                     let (nr, ks) = mv_variant(fmt, h);
+                    // Prefill: the experts' logits as an f32 GEMM into the scratch, the shared
+                    // expert's gate row as multi-token matvecs.
+                    if pf && n_exp.is_multiple_of(64) && h.is_multiple_of(32) && ts(x) == h {
+                        let woff = mw.data_off as usize;
+                        emit.push(MOp::GemmF32 {
+                            pipe: self.named_pipeline("gemm_f32")?,
+                            w: woff,
+                            x: byte(x),
+                            y: pf_tmp,
+                            n_out: n_exp,
+                            n_in: h,
+                        });
+                        if gate.is_some() {
+                            let mut gw = mw;
+                            gw.n_out = 1;
+                            gw.data_off += (n_exp * h * 4) as u64;
+                            emit.push(MOp::Mv {
+                                pipe: self.mv_pipe(fmt, nr, ks)?,
+                                nr,
+                                ks,
+                                w: gw,
+                                w2: None,
+                                x: byte(x),
+                                y: byte(logits) + n_exp * 4,
+                                mode: MvMode::Store,
+                                gate: 0,
+                                t: Some((
+                                    self.mvk_pipe(fmt, mvk_rows(tt), ks, tt)?,
+                                    ts(x) as u32,
+                                    ts(logits) as u32,
+                                    0,
+                                    mvk_rows(tt),
+                                    32 * ks,
+                                )),
+                                each: (0, 0),
+                            });
+                        }
+                        emit.push(MOp::Barrier);
+                        emit.push(MOp::PfTopk {
+                            pipe: self.named_pipeline("pf_topk")?,
+                            logits: pf_tmp,
+                            sel: byte(sel),
+                            n: n_exp as u32,
+                            k: k as u32,
+                            scale: expert_scale.map(&mut cst),
+                            ts: [n_exp as u32, ts(sel) as u32, 0, 0],
+                        });
+                        break 'route (
+                            vec![rng(x, h), rng(logits, rows), (PF_RES + 1, 0, usize::MAX)],
+                            vec![rng(logits, rows), rng(sel, 2 * k), (PF_RES + 1, 0, usize::MAX)],
+                        );
+                    }
+                    let mvk = if pf {
+                        self.mvk_pipe(fmt, mvk_rows(tt), ks, tt)
+                            .map(|p| (p, ts(x) as u32, ts(logits) as u32, 0, mvk_rows(tt), 32 * ks))
+                    } else {
+                        None
+                    };
                     emit.push(MOp::Mv {
                         pipe: self.mv_pipe(fmt, nr, ks)?,
                         nr,
@@ -1629,20 +2010,113 @@ impl MetalBackend {
                         y: byte(logits),
                         mode: MvMode::Store,
                         gate: 0,
-                        t: None,
+                        t: mvk,
                         each: (ts(x) * 4, ts(logits) * 4),
                     });
                     emit.push(MOp::Barrier);
-                    emit.push(MOp::Topk {
-                        pipe: self.named_pipeline("dec_topk")?,
-                        logits: byte(logits),
-                        sel: byte(sel),
-                        n: n_exp as u32,
-                        k: k as u32,
-                        scale: expert_scale.map(&mut cst),
-                        t: mt.then(|| (ts(logits) * 4, ts(sel) * 4)),
-                    });
+                    if pf {
+                        emit.push(MOp::PfTopk {
+                            pipe: self.named_pipeline("pf_topk")?,
+                            logits: byte(logits),
+                            sel: byte(sel),
+                            n: n_exp as u32,
+                            k: k as u32,
+                            scale: expert_scale.map(&mut cst),
+                            ts: [ts(logits) as u32, ts(sel) as u32, 0, 0],
+                        });
+                    } else {
+                        emit.push(MOp::Topk {
+                            pipe: self.named_pipeline("dec_topk")?,
+                            logits: byte(logits),
+                            sel: byte(sel),
+                            n: n_exp as u32,
+                            k: k as u32,
+                            scale: expert_scale.map(&mut cst),
+                            t: mt.then(|| (ts(logits) * 4, ts(sel) * 4)),
+                        });
+                    }
                     (vec![rng(x, h), rng(logits, rows)], vec![rng(logits, rows), rng(sel, 2 * k)])
+                }
+                Op::Experts(ref ex) if pf => {
+                    if ex.edits.is_some() || ex.add {
+                        return None;
+                    }
+                    let (tabs, fused, _, _, _) = self.expert_tables(ex, &mut owned, &mut shared, &mut indirect, None)?;
+                    let n = ex.gate.len();
+                    // Grouped GEMM tables: (data, scales) per expert, from the decode tables.
+                    let copy: MsgNewBufBytes = self.o.msg_send();
+                    let mut t16 = [std::ptr::null_mut(); 3];
+                    for (j, (&src, dst)) in tabs.iter().zip(t16.iter_mut()).enumerate() {
+                        if j == 1 && fused {
+                            continue;
+                        }
+                        let rows = unsafe { std::slice::from_raw_parts(f.contents(src) as *const [u64; 4], n) };
+                        let tab: Vec<[u64; 2]> = rows.iter().map(|r| [r[0], r[1]]).collect();
+                        *dst = unsafe { copy(self.device, self.sels.new_buffer_bytes, tab.as_ptr() as *const c_void, n * 16, 0) };
+                        if dst.is_null() {
+                            return None;
+                        }
+                    }
+                    if fused {
+                        t16[1] = t16[0];
+                    }
+                    let affine = |w: &WeightRef| matches!(w, WeightRef::Q4(m) if m.offsets.is_some());
+                    let row_bytes = |w: &WeightRef| match w {
+                        WeightRef::Gguf(g) if g.block_scales.is_none() => g.row_bytes() as u32,
+                        _ => 0,
+                    };
+                    let g_rows = if fused { 2 * ex.inter } else { ex.inter };
+                    let pg = self
+                        .mma_pipe(&ex.gate[0], affine(&ex.gate[0]), g_rows, ex.h, super::Tile::Grouped)?
+                        .0;
+                    let pd = self
+                        .mma_pipe(&ex.down[0], affine(&ex.down[0]), ex.h, ex.inter, super::Tile::Grouped)?
+                        .0;
+                    let up = match &ex.up {
+                        Some(u) => Some((
+                            self.mma_pipe(&u[0], affine(&u[0]), ex.inter, ex.h, super::Tile::Grouped)?.0,
+                            row_bytes(&u[0]),
+                        )),
+                        None => None,
+                    };
+                    // One pipeline per projection: every expert's format must match the first's.
+                    let lists = [(&ex.gate[..], g_rows, ex.h, pg), (&ex.down[..], ex.h, ex.inter, pd)];
+                    for (ws, n_out, n_in, p) in lists {
+                        if ws
+                            .iter()
+                            .any(|w| self.mma_pipe(w, affine(w), n_out, n_in, super::Tile::Grouped).map(|x| x.0) != Some(p))
+                        {
+                            return None;
+                        }
+                    }
+                    if let (Some(u), Some((pu, _))) = (&ex.up, up)
+                        && u.iter()
+                            .any(|w| self.mma_pipe(w, affine(w), ex.inter, ex.h, super::Tile::Grouped).map(|x| x.0) != Some(pu))
+                    {
+                        return None;
+                    }
+                    if !ex.h.is_multiple_of(64) || !ex.inter.is_multiple_of(64) {
+                        return None;
+                    }
+                    emit.push(MOp::PfExperts(pf_experts.len()));
+                    pf_experts.push(PfExperts {
+                        pipes: (pg, pd),
+                        up,
+                        tabs: t16,
+                        row_bytes: (row_bytes(&ex.gate[0]), row_bytes(&ex.down[0])),
+                        x: byte(ex.x),
+                        x_stride: ts(ex.x) as u32,
+                        sel: byte(ex.sel),
+                        sel_stride: ts(ex.sel),
+                        y: byte(ex.y),
+                        y_stride: ts(ex.y) as u32,
+                        h: ex.h,
+                        inter: ex.inter,
+                        k: ex.k,
+                        n_exp: n,
+                    });
+                    let _ = ex.gelu;
+                    (vec![rng(ex.x, ex.h), rng(ex.sel, 2 * ex.k)], vec![rng(ex.y, ex.h)])
                 }
                 Op::Experts(ref ex) => {
                     if mt && ex.edits.is_some() {
@@ -1916,6 +2390,63 @@ impl MetalBackend {
                         vec![rng(out, dim), (KV_RES * 2 + state, 0, usize::MAX)],
                     )
                 }
+                Op::GdnRule(ref r) if pf => {
+                    if !r.hdk.is_multiple_of(32)
+                        || r.hdk > 256
+                        || !r.hdv.is_multiple_of(32)
+                        || r.hdv > 1024
+                        || r.nk == 0
+                        || !r.nv.is_multiple_of(r.nk)
+                    {
+                        return None;
+                    }
+                    if g.states.get(r.state) != Some(&(r.nv * r.hdk * r.hdv)) || r.norm_w.len() != r.hdv {
+                        return None;
+                    }
+                    // pf_gdn_rule reads b then a from one row.
+                    if r.a.buf != r.b.buf || r.a.off != r.b.off + r.nv {
+                        return None;
+                    }
+                    let mut v = r.decay_coef.to_vec();
+                    v.extend_from_slice(r.dt_bias);
+                    let key_dim = r.nk * r.hdk;
+                    emit.push(MOp::PfGdn {
+                        rule: self.named_pipeline("pf_gdn_rule")?,
+                        norm: self.named_pipeline("pf_gated_norm")?,
+                        c: byte(r.c),
+                        ba: byte(r.b),
+                        z: byte(r.z),
+                        out: byte(r.out),
+                        state: r.state,
+                        cst: cst(&v),
+                        norm_w: cst(r.norm_w),
+                        p: GdnRuleParams {
+                            nk: r.nk as u32,
+                            nv: r.nv as u32,
+                            key_dim: key_dim as u32,
+                            tiled: r.tiled as u32,
+                            eps: r.eps,
+                            qscale: (r.hdk as f32).powf(-0.5),
+                            hdk: r.hdk as u32,
+                            hdv: r.hdv as u32,
+                        },
+                        ts: [ts(r.c) as u32, ts(r.b) as u32, ts(r.out) as u32],
+                        zs: ts(r.z) as u32,
+                        eps: r.eps,
+                        sigmoid: r.sigmoid_gate,
+                    });
+                    let vd = r.nv * r.hdv;
+                    (
+                        vec![
+                            rng(r.c, 2 * key_dim + vd),
+                            rng(r.z, vd),
+                            rng(r.b, 2 * r.nv),
+                            (KV_RES * 2 + r.state, 0, usize::MAX),
+                            (PF_RES + 1, 0, usize::MAX),
+                        ],
+                        vec![rng(r.out, vd), (KV_RES * 2 + r.state, 0, usize::MAX), (PF_RES + 1, 0, usize::MAX)],
+                    )
+                }
                 Op::GdnRule(ref r) => {
                     let ok_dims = r.hdk.is_multiple_of(32)
                         && r.hdk <= 256
@@ -2087,6 +2618,71 @@ impl MetalBackend {
                     sel,
                     ratio,
                     top,
+                } if pf => {
+                    let d = hd / 32;
+                    if !hd.is_multiple_of(32) || !matches!(d, 2 | 4 | 8 | 16) || nkv == 0 || !nh.is_multiple_of(nkv) || ratio == 0 {
+                        return None;
+                    }
+                    if g.kv.get(kv) != Some(&(nkv, hd)) {
+                        return None;
+                    }
+                    let rep = nh / nkv;
+                    // Query heads per threadgroup: more than decoding's (each key and value row is
+                    // read once for them), G * D <= 32 (measured: 2x faster than 16, more spills).
+                    let grp = [8, 4, 2, 1]
+                        .into_iter()
+                        .find(|&g| rep.is_multiple_of(g) && g * d <= 32)
+                        .unwrap_or(1);
+                    emit.push(MOp::PfAttn {
+                        pipe: self.named_pipeline(&format!("pfa_{d}_{grp}"))?,
+                        grp,
+                        q: byte(q),
+                        out: byte(out),
+                        kv,
+                        gate: gate.map_or(0, |(v, _)| boff[v.buf]),
+                        sel: byte(sel),
+                        p: AttnParams {
+                            nh: nh as u32,
+                            nkv: nkv as u32,
+                            len: 0,
+                            lo: 0,
+                            scale,
+                            has_gate: gate.is_some() as u32,
+                            g_stride: gate.map_or(0, |(_, s)| s as u32),
+                            g_off: gate.map_or(0, |(v, _)| v.off as u32),
+                            nsplit: 1,
+                            chunk: 0,
+                            _p: [0; 2],
+                        },
+                        a: [
+                            0,
+                            ratio as u32,
+                            top as u32,
+                            ts(sel) as u32,
+                            ts(q) as u32,
+                            ts(out) as u32,
+                            gate.map_or(0, |(v, _)| ts(v)) as u32,
+                            0,
+                        ],
+                    });
+                    let mut r = vec![rng(q, nh * hd), (KV_RES + kv, 0, usize::MAX), rng(sel, (top + 1) * ratio)];
+                    if let Some((v, s)) = gate {
+                        r.push(rng(v, nh * s));
+                    }
+                    (r, vec![rng(out, nh * hd)])
+                }
+                Op::AttendSel {
+                    q,
+                    out,
+                    kv,
+                    nh,
+                    nkv,
+                    hd,
+                    scale,
+                    gate,
+                    sel,
+                    ratio,
+                    top,
                 } => {
                     let d = hd / 32;
                     if !hd.is_multiple_of(32) || !matches!(d, 2 | 4 | 8 | 16) || nkv == 0 || !nh.is_multiple_of(nkv) || ratio == 0 {
@@ -2212,6 +2808,11 @@ impl MetalBackend {
                 rd.clear();
                 wr.clear();
             }
+            if let Some((b, o, n)) = xh_of
+                && overlaps(&w, &[(b, o, o + n + (tokens - 1) * tsz[b])])
+            {
+                xh_of = None;
+            }
             ops.extend(emit);
             if let Some((w, w2)) = smv {
                 streamed.push(StreamedMv { mop: ops.len() - 1, w, w2 });
@@ -2251,6 +2852,52 @@ impl MetalBackend {
                 }
             }
         }
+        // Prefill: the routed experts' staging, sized for the most rows a layer can gather (each
+        // used expert's rows padded to whole tiles).
+        let pf_state = if pf {
+            let (mut h, mut mi, mut k, mut ne) = (0, 0, 0, 0);
+            for x in &pf_experts {
+                (h, mi, k, ne) = (h.max(x.h), mi.max(x.inter), k.max(x.k), ne.max(x.n_exp));
+            }
+            let gtm = super::MMA_GTM;
+            let max_rows = tokens * k + ne.min(tokens * k) * (gtm - 1);
+            let max_tiles = max_rows / gtm + 1;
+            let sizes = [
+                max_rows * 4,
+                max_tiles * 16,
+                tokens * k.max(1) * 8,
+                max_rows * h * 2,
+                (max_rows + gtm) * 4,
+                max_rows * 2 * mi * 4,
+                max_rows * mi * 2,
+                (max_rows + gtm) * 4,
+                max_rows * h * 4,
+            ];
+            let mut st = [0usize; 9];
+            let mut sz = 0;
+            for (o, n) in st.iter_mut().zip(sizes) {
+                *o = sz;
+                sz += n.max(16).next_multiple_of(256);
+            }
+            let new_len: MsgNewBufLen = self.o.msg_send();
+            let stage = unsafe { new_len(self.device, self.sels.new_buffer_len, sz, 0) };
+            if stage.is_null() {
+                return None;
+            }
+            Some(PfState {
+                xh: pf_xh,
+                rs: pf_rs,
+                tmp: pf_tmp,
+                experts: pf_experts,
+                stage,
+                st,
+                max_rows,
+                max_tiles,
+            })
+        } else {
+            None
+        };
+        let _ = pf_tmp_n;
         // Split-attention partials after the activations (a region per token).
         let part = total;
         let part_stride = (part_floats * 4).next_multiple_of(256);
@@ -2335,6 +2982,7 @@ impl MetalBackend {
             experts,
             units,
             max_len,
+            pf: pf_state,
             f,
         })
     }
@@ -3025,6 +3673,474 @@ impl MetalPlan<'_> {
             MOp::Experts { .. } | MOp::Steer { .. } | MOp::NeuronEdit { .. } => {
                 unreachable!("single-token op in a multi-token plan")
             }
+            MOp::XHalf { .. }
+            | MOp::Gemm { .. }
+            | MOp::GemmF32 { .. }
+            | MOp::AddRows { .. }
+            | MOp::PfTopk { .. }
+            | MOp::PfExperts(_)
+            | MOp::PfGdn { .. }
+            | MOp::PfAttn { .. } => unreachable!("prefill op in a multi-token plan"),
+        }
+    }
+}
+
+impl MetalPlan<'_> {
+    /// Prefill plans: the routing of `t` tokens for `x`'s layer, read back from the arena, as
+    /// grouped GEMM work in the staging buffer (as `Backend::moe`): each expert's rows gathered
+    /// one segment after another, padded to whole tiles. Returns (rows, tiles).
+    fn pf_route(&self, pf: &PfState, x: &PfExperts, t: usize) -> Option<(usize, usize)> {
+        let base = self.f.contents(self.arena);
+        let k = x.k;
+        let gtm = super::MMA_GTM;
+        let mut ids = vec![0u32; t * k];
+        let mut wts = vec![0f32; t * k];
+        for j in 0..t {
+            // SAFETY: selection rows of the arena: k ids (as bits) then k weights per token.
+            let row = unsafe { std::slice::from_raw_parts((base.add(x.sel) as *const f32).add(j * x.sel_stride), 2 * k) };
+            for i in 0..k {
+                ids[j * k + i] = row[i].to_bits();
+                wts[j * k + i] = row[k + i];
+            }
+        }
+        let mut count = vec![0usize; x.n_exp];
+        for &e in &ids {
+            *count.get_mut(e as usize)? += 1;
+        }
+        let mut start = vec![0usize; x.n_exp];
+        let mut tiles: Vec<[u32; 4]> = Vec::new();
+        let mut rows = 0usize;
+        for (e, &c) in count.iter().enumerate() {
+            start[e] = rows;
+            let len = c.next_multiple_of(gtm);
+            for t0 in (0..len).step_by(gtm) {
+                tiles.push([e as u32, rows as u32, len as u32, t0 as u32]);
+            }
+            rows += len;
+        }
+        if rows > pf.max_rows || tiles.len() > pf.max_tiles {
+            return None;
+        }
+        let sb = self.f.contents(pf.stage);
+        // SAFETY: the staging regions were sized for max_rows rows and max_tiles tiles.
+        unsafe {
+            let src = std::slice::from_raw_parts_mut(sb.add(pf.st[0]) as *mut u32, rows);
+            src.fill(u32::MAX);
+            let slots = std::slice::from_raw_parts_mut(sb.add(pf.st[2]) as *mut [u32; 2], t * k);
+            for j in 0..t {
+                for i in 0..k {
+                    let e = ids[j * k + i] as usize;
+                    let r = start[e];
+                    start[e] += 1;
+                    src[r] = j as u32;
+                    slots[j * k + i] = [r as u32, wts[j * k + i].to_bits()];
+                }
+            }
+            std::ptr::copy_nonoverlapping(tiles.as_ptr(), sb.add(pf.st[1]) as *mut [u32; 4], tiles.len());
+        }
+        Some((rows, tiles.len()))
+    }
+
+    /// Encodes one op of a prefill plan for `t` tokens at `pos` (`run`: the routing of the MoE
+    /// layer, see [`Self::pf_route`]).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_pf(
+        &self,
+        e: &FastEnc,
+        op: &MOp,
+        arena: Id,
+        consts: Id,
+        kvb: &[(Id, Id)],
+        stb: &[(Id, usize)],
+        pos: usize,
+        t: usize,
+        run: &std::cell::Cell<(usize, usize)>,
+    ) {
+        let pf = self.pf.as_ref().unwrap();
+        let m = self.be.mma.as_ref().unwrap();
+        // GEMM row tiles: 32 rows for short chunks, else 128.
+        let (tile, tm) = if t <= super::MMA_SMALL {
+            (1, super::MMA_TM_S)
+        } else {
+            (0, super::MMA_TM)
+        };
+        let rows = t.next_multiple_of(tm);
+        #[repr(C)]
+        struct Xh {
+            n: u32,
+            gather: u32,
+            stride: u32,
+            _p: u32,
+        }
+        match op {
+            MOp::XHalf { pipe, x, stride, n } => {
+                e.pipe(*pipe);
+                e.buf(arena, *x, 0);
+                e.buf(arena, pf.xh, 1);
+                e.buf(arena, pf.rs, 2);
+                e.bytes(
+                    &Xh {
+                        n: *n,
+                        gather: 0,
+                        stride: *stride,
+                        _p: 0,
+                    },
+                    3,
+                );
+                e.buf(arena, 0, 4);
+                e.dispatch((rows, 1), 256);
+            }
+            MOp::Gemm {
+                pipes,
+                data,
+                scales,
+                w_off,
+                s_off,
+                offs,
+                n_out,
+                n_in,
+                y,
+                ldy,
+            } => {
+                // Few 128-row tiles (narrow outputs): 32-row ones keep more of the GPU busy.
+                let small = tile == 0 && (n_out / pipes[0].1) * (rows / tm) < PF_SMALL_TILES;
+                let (tile, tm) = if small { (1, super::MMA_TM_S) } else { (tile, tm) };
+                let (pipe, tn) = pipes[tile];
+                e.pipe(pipe);
+                e.buf(*data, 0, 0);
+                e.buf(*scales, 0, 1);
+                e.buf(arena, pf.xh, 2);
+                e.buf(arena, *y, 3);
+                e.bytes(
+                    &super::MmaParams {
+                        n_out: *n_out as u32,
+                        n_in: *n_in as u32,
+                        w_off: *w_off,
+                        s_off: *s_off,
+                        rows: rows as u32,
+                        _p: [*ldy, 0, 0],
+                    },
+                    4,
+                );
+                e.buf(arena, pf.rs, 5);
+                if let Some((ob, op)) = offs {
+                    e.buf(*ob, 0, 6);
+                    e.bytes(op, 7);
+                }
+                e.dispatch((n_out / tn, rows / tm), 128);
+            }
+            MOp::GemmF32 {
+                pipe,
+                w,
+                x,
+                y,
+                n_out,
+                n_in,
+            } => {
+                e.pipe(*pipe);
+                e.buf(consts, 0, 0);
+                e.buf(consts, 0, 1);
+                e.buf(arena, *x, 2);
+                e.buf(arena, *y, 3);
+                e.bytes(&[*n_out as u32, *n_in as u32, (*w / 4) as u32, 0], 4);
+                e.dispatch((n_out / 64, t.div_ceil(64)), 128);
+            }
+            MOp::AddRows { pipe, y, x, gate, n, ts } => {
+                e.pipe(*pipe);
+                e.buf(arena, *y, 0);
+                e.buf(arena, *x, 1);
+                e.buf(arena, *gate, 2);
+                e.bytes(n, 3);
+                e.bytes(ts, 4);
+                e.dispatch(((*n as usize).div_ceil(256), t), 256);
+            }
+            MOp::PfTopk {
+                pipe,
+                logits,
+                sel,
+                n,
+                k,
+                scale,
+                ts,
+            } => {
+                e.pipe(*pipe);
+                e.buf(arena, *logits, 0);
+                e.buf(arena, *sel, 1);
+                e.bytes(&[*n, *k, scale.is_some() as u32, 0], 2);
+                e.buf(consts, scale.unwrap_or(0), 3);
+                e.bytes(ts, 4);
+                e.dispatch((t, 1), (*n as usize).next_multiple_of(32));
+            }
+            MOp::PfExperts(i) => {
+                let x = &pf.experts[*i];
+                let (er, nt) = run.get();
+                let (h, mi) = (x.h, x.inter);
+                let st = |j: usize| pf.st[j];
+                let sb = pf.stage;
+                e.pipe(m.x_half);
+                e.buf(arena, x.x, 0);
+                e.buf(sb, st(3), 1);
+                e.buf(sb, st(4), 2);
+                e.bytes(
+                    &Xh {
+                        n: h as u32,
+                        gather: 1,
+                        stride: x.x_stride,
+                        _p: 0,
+                    },
+                    3,
+                );
+                e.buf(sb, st(0), 4);
+                e.dispatch((er, 1), 256);
+                e.barrier();
+                let params = |n_out: usize, n_in: usize, s_off: u32| super::MmaParams {
+                    n_out: n_out as u32,
+                    n_in: n_in as u32,
+                    w_off: 0,
+                    s_off,
+                    rows: er as u32,
+                    _p: [0; 3],
+                };
+                let grouped = |pipe: Id, ep: Id, xh: usize, out: usize, rs: usize, p: &super::MmaParams| {
+                    e.pipe(pipe);
+                    e.buf(ep, 0, 0);
+                    e.buf(sb, st(1), 1);
+                    e.buf(sb, xh, 2);
+                    e.buf(sb, out, 3);
+                    e.bytes(p, 4);
+                    e.buf(sb, rs, 5);
+                    e.dispatch((p.n_out as usize / 64, nt), 128);
+                };
+                match x.up {
+                    Some((pu, rb)) => {
+                        grouped(x.pipes.0, x.tabs[0], st(3), st(5), st(4), &params(mi, h, x.row_bytes.0));
+                        grouped(pu, x.tabs[1], st(3), st(5) + er * mi * 4, st(4), &params(mi, h, rb));
+                    }
+                    None => grouped(x.pipes.0, x.tabs[0], st(3), st(5), st(4), &params(2 * mi, h, x.row_bytes.0)),
+                }
+                e.barrier();
+                #[repr(C)]
+                struct Sh {
+                    n: u32,
+                    gelu: u32,
+                    split: u32,
+                    limit: f32,
+                }
+                e.pipe(m.silu_half);
+                e.buf(sb, st(5), 0);
+                e.buf(sb, st(6), 1);
+                e.buf(sb, st(7), 2);
+                e.bytes(
+                    &Sh {
+                        n: mi as u32,
+                        gelu: 0,
+                        split: if x.up.is_some() { er as u32 } else { 0 },
+                        limit: 0.0,
+                    },
+                    3,
+                );
+                e.dispatch((er, 1), 256);
+                e.barrier();
+                grouped(x.pipes.1, x.tabs[2], st(6), st(8), st(7), &params(h, mi, x.row_bytes.1));
+                e.barrier();
+                #[repr(C)]
+                struct Cb {
+                    n: u32,
+                    k: u32,
+                    ldo: u32,
+                    _p: u32,
+                }
+                e.pipe(m.combine);
+                e.buf(sb, st(8), 0);
+                e.buf(sb, st(2), 1);
+                e.buf(arena, x.y, 2);
+                e.bytes(
+                    &Cb {
+                        n: h as u32,
+                        k: x.k as u32,
+                        ldo: x.y_stride,
+                        _p: 0,
+                    },
+                    3,
+                );
+                e.dispatch(((h / 4).div_ceil(64), t), 64);
+            }
+            MOp::PfGdn {
+                rule,
+                norm,
+                c,
+                ba,
+                z,
+                out,
+                state,
+                cst,
+                norm_w,
+                p,
+                ts,
+                zs,
+                eps,
+                sigmoid,
+            } => {
+                let two = (p.hdk == 128 && p.nv <= p.hdk)
+                    .then(|| Some((self.be.named_pipeline("pf_gdn_prep")?, self.be.named_pipeline("pf_gdn_seq")?)))
+                    .flatten();
+                if let Some((prep, seq)) = two {
+                    // Per-token norms and gates in parallel, then the recurrence alone.
+                    let gw = 2 * p.key_dim + 2 * p.nv;
+                    e.pipe(prep);
+                    e.buf(arena, *c, 0);
+                    e.buf(arena, *ba, 1);
+                    e.buf(arena, pf.tmp, 2);
+                    e.buf(consts, *cst, 4);
+                    e.bytes(p, 5);
+                    e.bytes(&[t as u32, ts[0], ts[1], gw], 6);
+                    e.dispatch((p.nk as usize, t), p.hdk as usize);
+                    e.barrier();
+                    e.pipe(seq);
+                    e.buf(arena, *c, 0);
+                    e.buf(arena, pf.tmp, 1);
+                    e.buf(arena, *out, 2);
+                    e.buf(stb[*state].0, stb[*state].1, 3);
+                    e.bytes(p, 5);
+                    e.bytes(&[t as u32, ts[0], ts[2], gw], 6);
+                    e.dispatch((p.nv as usize, p.hdv as usize / 32), 128);
+                } else {
+                    e.pipe(*rule);
+                    e.buf(arena, *c, 0);
+                    e.buf(arena, *ba, 1);
+                    e.buf(arena, *out, 2);
+                    e.buf(stb[*state].0, stb[*state].1, 3);
+                    e.buf(consts, *cst, 4);
+                    e.bytes(p, 5);
+                    e.bytes(&[t as u32, ts[0], ts[1], ts[2]], 6);
+                    e.dispatch((p.nv as usize, p.hdv as usize / 32), p.hdk as usize);
+                }
+                e.barrier();
+                e.pipe(*norm);
+                e.buf(arena, *out, 0);
+                e.buf(arena, *z, 1);
+                e.buf(consts, *norm_w, 2);
+                e.bytes(&[*eps, 0.0f32], 3);
+                e.bytes(&[ts[2], *zs, p.hdv, *sigmoid as u32], 4);
+                e.dispatch((p.nv as usize, t), p.hdv as usize);
+            }
+            MOp::PfAttn {
+                pipe,
+                grp,
+                q,
+                out,
+                kv,
+                gate,
+                sel,
+                p,
+                a,
+            } => {
+                let mut a = *a;
+                a[0] = pos as u32;
+                e.pipe(*pipe);
+                e.buf(arena, *q, 0);
+                e.buf(kvb[*kv].0, 0, 1);
+                e.buf(kvb[*kv].1, 0, 2);
+                e.buf(arena, *out, 3);
+                e.buf(arena, *gate, 4);
+                e.bytes(p, 5);
+                e.buf(arena, *sel, 6);
+                e.bytes(&a, 7);
+                e.dispatch((p.nh as usize / grp, t), 256);
+            }
+            // The tokens in parallel, then the state.
+            MOp::GdnConv {
+                x,
+                out,
+                state,
+                w,
+                dim,
+                kc,
+                t: Some((_, sx, so)),
+                ..
+            } => {
+                let (Some(conv), Some(shift)) = (self.be.named_pipeline("pf_conv"), self.be.named_pipeline("pf_conv_state")) else {
+                    return self.encode_multi(e, op, arena, consts, kvb, stb, pos, t);
+                };
+                e.pipe(conv);
+                e.buf(arena, *x, 0);
+                e.buf(arena, *out, 1);
+                e.buf(stb[*state].0, stb[*state].1, 2);
+                e.buf(consts, *w, 3);
+                e.bytes(&[*dim, *kc], 4);
+                e.bytes(&[t as u32, *sx, *so, 0], 5);
+                e.dispatch(((*dim as usize).div_ceil(256), t), 256);
+                e.barrier();
+                e.pipe(shift);
+                e.dispatch(((*dim as usize).div_ceil(256), 1), 256);
+            }
+            // A threadgroup per token.
+            MOp::QsaKey {
+                k, kv, w, p, t: Some(cs), ..
+            } if self.be.named_pipeline("pf_qsa_key").is_some() => {
+                let mut p = *p;
+                p.pos = pos as u32;
+                p.t = t as u32;
+                e.pipe(self.be.named_pipeline("pf_qsa_key").unwrap());
+                e.buf(arena, *k, 0);
+                e.buf(kvb[*kv].0, 0, 1);
+                e.buf(kvb[*kv].1, 0, 2);
+                e.buf(consts, *w, 3);
+                e.bytes(&p, 4);
+                e.buf(arena, *cs, 5);
+                e.dispatch((t, 1), p.d as usize);
+            }
+            // Multi-token matvecs, PF_MV_TOKENS tokens at a time.
+            MOp::Mv {
+                w,
+                w2,
+                x,
+                y,
+                mode,
+                gate,
+                t: Some(tk),
+                ..
+            } => {
+                let (pipe, sx, sy, sgate, nr, threads) = *tk;
+                let w2 = w2.as_ref().unwrap_or(w);
+                for b in (0..t).step_by(PF_MV_TOKENS) {
+                    let p = MvkParams {
+                        m: MvParams {
+                            n_out: w.n_out as u32,
+                            n_in: w.n_in as u32,
+                            mode: *mode as u32,
+                            rows_per_tg: nr as u32,
+                            w_off: w.data_off,
+                            s_off: w.scales_off,
+                            w2_off: w2.data_off,
+                            s2_off: w2.scales_off,
+                            o_off: w.offs_off,
+                            o2_off: w2.offs_off,
+                            gpr: w.gpr,
+                            gk: w.gk,
+                            ldy: 0,
+                            _p: 0,
+                        },
+                        ntok: (t - b).min(PF_MV_TOKENS) as u32,
+                        sx,
+                        sy,
+                        sgate,
+                    };
+                    e.pipe(pipe);
+                    e.buf(w.data, 0, 0);
+                    e.buf(w.scales, 0, 1);
+                    e.buf(arena, *x + b * sx as usize * 4, 2);
+                    e.buf(arena, *y + b * sy as usize * 4, 3);
+                    e.bytes(&p, 4);
+                    e.buf(w2.data, 0, 5);
+                    e.buf(w2.scales, 0, 6);
+                    e.buf(w.offs, 0, 7);
+                    e.buf(w2.offs, 0, 8);
+                    e.buf(arena, *gate + b * sgate as usize * 4, 9);
+                    e.dispatch((w.n_out.div_ceil(nr), 1), threads);
+                }
+            }
+            _ => self.encode_multi(e, op, arena, consts, kvb, stb, pos, t),
         }
     }
 }
@@ -3570,6 +4686,8 @@ impl DecodePlan for MetalPlan<'_> {
         }
         parts.push(from..end);
         let indirect = if self.be.residency.is_some() { &[][..] } else { &self.indirect[..] };
+        // Prefill plans: the routing of the MoE layer being encoded.
+        let pf_run = std::cell::Cell::new((0usize, 0usize));
         // Encodes the ops of `range`, those listed in `bound` replaced (streamed weights bound to
         // this step's wraps).
         let encode = |e: &FastEnc, range: std::ops::Range<usize>, bound: &[(usize, MOp)]| {
@@ -3592,10 +4710,18 @@ impl DecodePlan for MetalPlan<'_> {
                         MOp::AddNorm { .. } => "norm",
                         MOp::Attn { .. } => "attn",
                         MOp::QsaKey { .. } | MOp::QsaScore { .. } | MOp::QsaTopk { .. } => "qsa",
+                        MOp::XHalf { .. } | MOp::Gemm { .. } | MOp::GemmF32 { .. } | MOp::AddRows { .. } => "mv",
+                        MOp::PfTopk { .. } | MOp::PfExperts(_) => "moe",
+                        MOp::PfGdn { .. } => "gdn",
+                        MOp::PfAttn { .. } => "attn",
                     };
                     if !o.split(',').any(|x| x == k) {
                         continue;
                     }
+                }
+                if self.pf.is_some() {
+                    self.encode_pf(e, op, arena, consts, &kvb, &stb, pos, t, &pf_run);
+                    continue;
                 }
                 if self.tokens > 1 {
                     self.encode_multi(e, op, arena, consts, &kvb, &stb, pos, t);
@@ -3603,6 +4729,14 @@ impl DecodePlan for MetalPlan<'_> {
                 }
                 match op {
                     MOp::Barrier => e.barrier(),
+                    MOp::XHalf { .. }
+                    | MOp::Gemm { .. }
+                    | MOp::GemmF32 { .. }
+                    | MOp::AddRows { .. }
+                    | MOp::PfTopk { .. }
+                    | MOp::PfExperts(_)
+                    | MOp::PfGdn { .. }
+                    | MOp::PfAttn { .. } => unreachable!("prefill op in a one-token plan"),
                     MOp::Norm {
                         pipe,
                         x,
@@ -3947,6 +5081,76 @@ impl DecodePlan for MetalPlan<'_> {
         };
         let (ok, gpu) = if self.gate.is_some() {
             (self.run_streamed(end, t, &encode), 0.0)
+        } else if let Some(pf) = &self.pf {
+            // One command buffer up to each MoE layer, whose routing is read back first.
+            let mut from = 0;
+            let mut ok = true;
+            if pf_prof() {
+                for i in 0..end {
+                    let op = &self.ops[i];
+                    if matches!(op, MOp::Barrier) {
+                        continue;
+                    }
+                    if let MOp::PfExperts(x) = op {
+                        match self.pf_route(pf, &pf.experts[*x], t) {
+                            Some(r) => pf_run.set(r),
+                            None => return false,
+                        }
+                    }
+                    let kind = match op {
+                        MOp::Gemm { n_out, n_in, .. } => format!("gemm {n_out}x{n_in}"),
+                        MOp::GemmF32 { n_out, n_in, .. } => format!("gemm f32 {n_out}x{n_in}"),
+                        MOp::Mv { w, .. } => format!("mv {}x{}", w.n_out, w.n_in),
+                        MOp::XHalf { .. } => "xhalf".into(),
+                        MOp::Norm { .. } => "norm".into(),
+                        MOp::Ew { .. } => "ew".into(),
+                        MOp::Glu { .. } => "glu".into(),
+                        MOp::AddRows { .. } => "addrows".into(),
+                        MOp::PfTopk { .. } => "topk".into(),
+                        MOp::PfExperts(_) => "experts".into(),
+                        MOp::PfGdn { .. } => "gdn rule".into(),
+                        MOp::GdnConv { .. } => "conv".into(),
+                        MOp::PfAttn { .. } => "attn".into(),
+                        MOp::QkRope { .. } => "qkrope".into(),
+                        MOp::QsaKey { .. } => "qsa key".into(),
+                        MOp::QsaScore { .. } => "qsa score".into(),
+                        MOp::QsaTopk { .. } => "qsa topk".into(),
+                        MOp::PleGate { .. } => "ple".into(),
+                        _ => "other".into(),
+                    };
+                    let (o, g) = run_concurrent(self.be, &self.f, std::slice::from_ref(&(i..i + 1)), |e, r| encode(e, r, &[]));
+                    if !o {
+                        return false;
+                    }
+                    pf_note(kind, g);
+                }
+                from = end;
+            }
+            let stops: Vec<(usize, usize)> = (from..end)
+                .filter_map(|i| match self.ops[i] {
+                    MOp::PfExperts(x) => Some((i, x)),
+                    _ => None,
+                })
+                .collect();
+            for (i, x) in stops {
+                {
+                    if i > from {
+                        ok &= run_concurrent(self.be, &self.f, std::slice::from_ref(&(from..i)), |e, r| encode(e, r, &[])).0;
+                    }
+                    match ok.then(|| self.pf_route(pf, &pf.experts[x], t)).flatten() {
+                        Some(r) => pf_run.set(r),
+                        None => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    from = i;
+                }
+            }
+            if ok && from < end {
+                ok &= run_concurrent(self.be, &self.f, std::slice::from_ref(&(from..end)), |e, r| encode(e, r, &[])).0;
+            }
+            (ok, 0.0)
         } else {
             run_concurrent(self.be, &self.f, &parts, |e, r| encode(e, r, &[]))
         };
