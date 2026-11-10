@@ -10,10 +10,17 @@
 //! `scale * q` (and Q4_K / Q5_K with their mins), bit-identical to `dequantize_row`.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use super::{Act, GgmlType, GgufMatrix, QK_K, decode_i8, e8m0_half, f16at, iq4xs_scale, q3k_scales, scale_min_k4, u32at};
+use super::{Act, GgmlType, GgufMatrix, QK_K, decode_i8, e8m0_half, iq4xs_scale, q3k_scales, scale_min_k4, u32at};
 use crate::ggml::tables::{KVALUES_IQ4NL, KVALUES_MXFP4};
+use crate::kernels::simd::f16c_to_f32;
 use crate::quant::QBLOCK;
 use std::arch::x86_64::*;
+
+/// The f16 at byte `i` of a block (`super::f16at` with F16C: the same value, inlined).
+#[inline(always)]
+unsafe fn f16at(b: &[u8], i: usize) -> f32 {
+    f16c_to_f32(u16::from_le_bytes([b[i], b[i + 1]]))
+}
 
 /// One block's int8 values, aligned for whole-register loads.
 #[repr(align(32))]
@@ -304,8 +311,8 @@ unsafe fn dot_row<const TC: usize>(kind: GgmlType, row: &[u8], x: &Act) -> [f32;
 /// Rows `r0..r1` of `m` (a quantized type) against TC activation rows, into `y[c * ys + r]`.
 ///
 /// # Safety
-/// The CPU has AVX2 and FMA; `x` and `y` cover TC activation rows and the outputs written.
-#[target_feature(enable = "avx2,fma")]
+/// The CPU has AVX2, FMA and F16C (`simd::avx2()`); `x` and `y` cover TC activation rows and the outputs written.
+#[target_feature(enable = "avx2,fma,f16c")]
 pub(super) unsafe fn rows<const TC: usize>(m: &GgufMatrix, x: &Act, y: *mut f32, ys: usize, r0: usize, r1: usize) {
     for r in r0..r1 {
         let o = dot_row::<TC>(m.kind, m.row(r), x);
@@ -334,8 +341,8 @@ fn dequant_kind(kind: GgmlType) -> bool {
 /// `kind` has no AVX2 version (nothing is written).
 ///
 /// # Safety
-/// The CPU has AVX2 and FMA; `row` holds `n` elements of `kind` and `out` has room for them.
-#[target_feature(enable = "avx2,fma")]
+/// The CPU has AVX2, FMA and F16C (`simd::avx2()`); `row` holds `n` elements of `kind` and `out` has room for them.
+#[target_feature(enable = "avx2,fma,f16c")]
 pub(super) unsafe fn dequant_row(kind: GgmlType, row: &[u8], n: usize, out: *mut f32) -> bool {
     if !dequant_kind(kind) {
         return false;
@@ -391,7 +398,7 @@ mod tests {
         !cpu_has_avx2()
     }
 
-    #[target_feature(enable = "avx2,fma")]
+    #[target_feature(enable = "avx2,fma,f16c")]
     unsafe fn unpack_avx2(kind: GgmlType, b: &[u8], q: &mut [i8; QK_K], s: &mut [f32; 16], m: &mut [f32; 16]) -> bool {
         unpack(kind, b, q, s, m)
     }

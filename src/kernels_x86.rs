@@ -1,8 +1,9 @@
-//! x86-64 kernels: AVX2 + FMA, chosen at run time (`is_x86_feature_detected!`), with scalar
-//! fallbacks in the same shapes so the call sites in `kernels.rs` are shared with the NEON module.
-//! bf16 weights widen with a 16-bit shift; Q8 uses the `maddubs` sign trick (|w| <= 127 so the
-//! int16 pair sums cannot saturate); Q4 nibbles go in unsigned with the +8 offset folded through
-//! the activation block sums, like the NEON path.
+//! x86-64 kernels: AVX2 + FMA (and F16C for the f16 scales), chosen at run time
+//! (`is_x86_feature_detected!`), with scalar fallbacks in the same shapes so the call sites in
+//! `kernels.rs` are shared with the NEON module. `OXINFER_SIMD=scalar` selects the fallbacks on
+//! any CPU. bf16 weights widen with a 16-bit shift; Q8 uses the `maddubs` sign trick (|w| <= 127
+//! so the int16 pair sums cannot saturate); Q4 nibbles go in unsigned with the +8 offset folded
+//! through the activation block sums, like the NEON path.
 
 use crate::quant::f16_to_f32;
 use std::arch::x86_64::*;
@@ -10,9 +11,21 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 static LEVEL: AtomicU8 = AtomicU8::new(0);
 
-/// True when the CPU has AVX2 and FMA, whatever `OXINFER_SIMD` says.
+/// True when the CPU has AVX2, FMA and F16C (every AVX2 CPU has the last), whatever
+/// `OXINFER_SIMD` says.
 pub fn cpu_has_avx2() -> bool {
-    is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma")
+    is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") && is_x86_feature_detected!("f16c")
+}
+
+/// An f16 as f32 with F16C: exact, as `f16_to_f32`, without its call (the `half` crate picks
+/// its conversion at run time, out of line: per block of 32 weights that costs more than the
+/// dot product).
+///
+/// # Safety
+/// Inlined into `#[target_feature(enable = "f16c")]` functions only.
+#[inline(always)]
+pub unsafe fn f16c_to_f32(h: u16) -> f32 {
+    _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h as i32)))
 }
 
 /// True when the AVX2 + FMA kernels are in use (cached): the CPU has both and
@@ -460,7 +473,7 @@ unsafe fn q4_dot_rows_tc_scalar<const R: usize, const TC: usize>(
     out
 }
 
-#[target_feature(enable = "avx2,fma")]
+#[target_feature(enable = "avx2,fma,f16c")]
 unsafe fn q4_dot_rows_tc_avx2<const R: usize, const TC: usize>(
     q: *const u8,
     s: *const u16,
@@ -486,7 +499,7 @@ unsafe fn q4_dot_rows_tc_avx2<const R: usize, const TC: usize>(
             let lo = _mm_and_si128(bytes, m0f);
             let hi = _mm_and_si128(_mm_srli_epi16::<4>(bytes), m0f);
             let wv = _mm256_set_m128i(hi, lo); // elements 0..15 = low nibbles, 16..31 = high nibbles
-            let d = f16_to_f32(*s.add(r * bpr + b));
+            let d = f16c_to_f32(*s.add(r * bpr + b));
             for c in 0..TC {
                 let p16 = _mm256_maddubs_epi16(wv, xv[c]);
                 let p32 = _mm256_madd_epi16(p16, ones);
@@ -574,6 +587,22 @@ mod tests {
         assert_eq!(avx2(), cpu_has_avx2() && !off);
         assert_eq!(level_name(), if avx2() { "avx2+fma" } else { "scalar" });
         eprintln!("x86-64 kernels in use: {}", level_name());
+    }
+
+    /// F16C conversion of the f16 scales equals the software one for all 65536 values.
+    #[test]
+    fn f16c_matches_software_conversion() {
+        if skip() {
+            return;
+        }
+        #[target_feature(enable = "f16c")]
+        unsafe fn conv(h: u16) -> f32 {
+            f16c_to_f32(h)
+        }
+        for h in 0..=u16::MAX {
+            let (a, b) = (unsafe { conv(h) }, half::f16::from_bits(h).to_f32_const());
+            assert!(a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()), "{h:#06x}: {a} vs {b}");
+        }
     }
 
     fn dot_tiles<W: Wt, const R: usize, const TC: usize, const G: usize, const A: usize>(seed: &mut u64) {
