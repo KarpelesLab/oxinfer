@@ -43,6 +43,10 @@ pub trait TextLm {
     fn mm_runs_whole(&self) -> bool {
         false
     }
+    /// The prefill chunk the model prefers over `chunk` (see `QwenModel::prefill_chunk`).
+    fn prefill_chunk(&self, chunk: usize) -> usize {
+        chunk
+    }
     /// Runs `tokens` and returns the logits after the last one.
     fn forward(&self, sess: &mut Self::Sess, tokens: &[u32]) -> Vec<f32> {
         let h = self.hidden_size();
@@ -108,6 +112,9 @@ impl TextLm for QwenModel<'_> {
     fn add_vision_span(&self, sess: &mut QwenSession, start: usize, gh: usize, gw: usize) {
         sess.add_vision_span(start, gh, gw)
     }
+    fn prefill_chunk(&self, chunk: usize) -> usize {
+        QwenModel::prefill_chunk(self, chunk)
+    }
     fn forward(&self, sess: &mut QwenSession, tokens: &[u32]) -> Vec<f32> {
         QwenModel::forward(self, sess, tokens)
     }
@@ -126,6 +133,7 @@ pub fn prefill<M: TextLm + ?Sized>(model: &M, sess: &mut M::Sess, ids: &[u32], c
     }
     let mut hs = Vec::new();
     let mut start = 0;
+    let chunk = model.prefill_chunk(chunk);
     let whole = model.mm_runs_whole() && !overrides.is_empty();
     let mut mm_pos: Vec<usize> = if whole {
         overrides.iter().map(|o| o.0).collect()

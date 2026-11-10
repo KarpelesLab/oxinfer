@@ -1432,11 +1432,7 @@ impl<'a> QwenModel<'a> {
         if !self.gpu_decode_on() {
             return None;
         }
-        let tokens = std::env::var("OXINFER_PREFILL_TOKENS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|&n: &usize| n >= PREFILL_GPU_MIN)
-            .unwrap_or(1024);
+        let tokens = prefill_plan_tokens();
         self.gpu_plans.get((1 << 61) | tokens as u64, || {
             let be = crate::gpu::active()?;
             let t0 = std::time::Instant::now();
@@ -1450,6 +1446,19 @@ impl<'a> QwenModel<'a> {
             }
             plan
         })
+    }
+
+    /// The prefill chunk to use instead of `chunk`: Qwen4-Exp passes on the GPU prefill plan take
+    /// chunks of the plan's size when given GPU-sized ones (1024 and up; each MoE layer's grouped
+    /// GEMMs get more tokens per expert).
+    pub fn prefill_chunk(&self, chunk: usize) -> usize {
+        let plan = self.exp.is_some()
+            && self.stream.is_none()
+            && chunk >= 1024
+            && self.gpu_decode_on()
+            && crate::gpu::active().is_some()
+            && prefill_gpu(PREFILL_GPU_MIN, "plan");
+        if plan { chunk.max(prefill_plan_tokens()) } else { chunk }
     }
 
     fn gpu_multi_plan(&self, layers: &[usize], tokens: usize, fast: bool) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
@@ -2364,6 +2373,16 @@ impl Moe<'_> {
 /// Qwen4-Exp passes of at least this many tokens (prefill) run Gated DeltaNet's rule and the
 /// attention on the GPU when there is one.
 pub(crate) const PREFILL_GPU_MIN: usize = 32;
+
+/// Tokens per step of the Qwen4-Exp GPU prefill plan (`OXINFER_PREFILL_TOKENS`, default 2048:
+/// 9-20% faster than 1024 at 4.5k tokens for ~1.5 GB more device memory).
+fn prefill_plan_tokens() -> usize {
+    std::env::var("OXINFER_PREFILL_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &usize| n >= PREFILL_GPU_MIN)
+        .unwrap_or(2048)
+}
 
 /// Whether a Qwen4-Exp pass of `t` tokens offloads past the matmuls (`OXINFER_PREFILL_GPU=0`: not).
 fn prefill_gpu_exp(cfg: &QwenConfig, t: usize, what: &str) -> bool {

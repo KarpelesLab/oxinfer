@@ -746,7 +746,7 @@ impl<'m> MtpDecoder<'m> {
         self.msess.spans = self.sess.spans.clone();
         let mut last = Vec::new();
         let mut start = 0;
-        for c in tokens.chunks(chunk.max(1)) {
+        for c in tokens.chunks(self.model.prefill_chunk(chunk).max(1)) {
             if self.pend_h.len() > self.pend_t.len() * w {
                 self.pend_t.push(c[0]);
             }

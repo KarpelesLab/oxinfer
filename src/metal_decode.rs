@@ -2903,6 +2903,13 @@ impl MetalBackend {
         let part_stride = (part_floats * 4).next_multiple_of(256);
         total += part_stride * tokens;
         let new_len: MsgNewBufLen = self.o.msg_send();
+        if pf && std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
+            eprintln!(
+                "[prefill plan: {tokens} tokens, arena {:.2} GB, expert staging {:.2} GB]",
+                total as f64 / 1e9,
+                pf_state.as_ref().map_or(0, |p| p.st[8] + p.max_rows * 4 * 2560) as f64 / 1e9
+            );
+        }
         let arena = unsafe { new_len(self.device, self.sels.new_buffer_len, total.max(256), 0) };
         if arena.is_null() {
             return None;
