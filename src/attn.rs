@@ -96,9 +96,46 @@ fn lanes<const G: usize>(qp: &[*const [f32; 8]; G], kc: &[[f32; 8]]) -> [[f32; 8
     }
 }
 
+/// [`lanes`] with AVX2: one register per head, a multiply then an add (no FMA), so the lane sums
+/// are the scalar ones bit for bit.
+///
+/// # Safety
+/// The CPU has AVX2; every `qp[g]` covers `kc.len()` chunks.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn lanes_avx2<const G: usize>(qp: &[*const [f32; 8]; G], kc: &[[f32; 8]]) -> [[f32; 8]; G] {
+    use std::arch::x86_64::*;
+    // SAFETY: per the contract.
+    unsafe {
+        let mut acc = [_mm256_setzero_ps(); G];
+        for (i, k8) in kc.iter().enumerate() {
+            let k = _mm256_loadu_ps(k8.as_ptr());
+            for g in 0..G {
+                acc[g] = _mm256_add_ps(acc[g], _mm256_mul_ps(_mm256_loadu_ps(qp[g].add(i) as *const f32), k));
+            }
+        }
+        std::array::from_fn(|g| {
+            let mut a = [0f32; 8];
+            _mm256_storeu_ps(a.as_mut_ptr(), acc[g]);
+            a
+        })
+    }
+}
+
 #[cfg(not(target_arch = "aarch64"))]
 #[inline(always)]
 fn lanes<const G: usize>(qp: &[*const [f32; 8]; G], kc: &[[f32; 8]]) -> [[f32; 8]; G] {
+    #[cfg(target_arch = "x86_64")]
+    if crate::kernels::simd::avx2() {
+        // SAFETY: AVX2 was detected; every `qp[g]` covers `kc.len()` chunks (caller).
+        return unsafe { lanes_avx2(qp, kc) };
+    }
+    lanes_portable(qp, kc)
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn lanes_portable<const G: usize>(qp: &[*const [f32; 8]; G], kc: &[[f32; 8]]) -> [[f32; 8]; G] {
     let mut acc = [[0f32; 8]; G];
     for (i, k8) in kc.iter().enumerate() {
         for g in 0..G {
@@ -324,6 +361,11 @@ unsafe fn weighted_rows<const R: usize>(w: &[&[f32]; R], rows: &[Row], c0: usize
         }
         c += 16;
     }
+    #[cfg(target_arch = "x86_64")]
+    if crate::kernels::simd::avx2() {
+        // SAFETY: AVX2 was detected; bounds per the contract.
+        c = unsafe { weighted_rows_avx2(w, rows, c, c1, out, c0) };
+    }
     while c < c1 {
         let cn = (c + 8).min(c1);
         let mut acc = [[0f32; 8]; R];
@@ -343,6 +385,48 @@ unsafe fn weighted_rows<const R: usize>(w: &[&[f32]; R], rows: &[Row], c0: usize
         }
         c = cn;
     }
+}
+
+/// The whole 16-column steps of [`weighted_rows`] from column `c` with AVX2 (a multiply then an
+/// add per key, as the scalar loop: bit-identical); returns the first column not done.
+///
+/// # Safety
+/// The CPU has AVX2; otherwise as [`weighted_rows`], with `out[r]` starting at column `c0`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn weighted_rows_avx2<const R: usize>(
+    w: &[&[f32]; R],
+    rows: &[Row],
+    mut c: usize,
+    c1: usize,
+    out: &[*mut f32; R],
+    c0: usize,
+) -> usize {
+    use std::arch::x86_64::*;
+    // SAFETY: per the contract.
+    unsafe {
+        while c + 16 <= c1 {
+            let z = _mm256_setzero_ps();
+            let mut acc = [[z; 2]; R];
+            for (j, p) in rows.iter().enumerate() {
+                let p = p.0.add(c);
+                let v = [_mm256_loadu_ps(p), _mm256_loadu_ps(p.add(8))];
+                for r in 0..R {
+                    let x = _mm256_set1_ps(*w[r].get_unchecked(j));
+                    for q in 0..2 {
+                        acc[r][q] = _mm256_add_ps(acc[r][q], _mm256_mul_ps(x, v[q]));
+                    }
+                }
+            }
+            for r in 0..R {
+                for q in 0..2 {
+                    _mm256_storeu_ps(out[r].add(c - c0 + 8 * q), acc[r][q]);
+                }
+            }
+            c += 16;
+        }
+    }
+    c
 }
 
 #[cfg(test)]
@@ -367,6 +451,70 @@ mod tests {
                 dots(&qr, &k, &mut out);
                 for (o, qv) in out.iter().zip(&q) {
                     assert_eq!(o.to_bits(), dot(qv, &k).to_bits(), "d {d} g {g}");
+                }
+            }
+        }
+    }
+
+    /// The AVX2 lane sums and value accumulation against the portable loops, bit for bit (the two
+    /// tests around this one check whichever the dispatch picked against `dot` and `axpy`).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_kernels_match_portable_bitwise() {
+        if !crate::kernels::simd::cpu_has_avx2() {
+            eprintln!("skipped: this CPU has no AVX2 + FMA");
+            return;
+        }
+        let mut seed = 21;
+        for chunks in [0usize, 1, 5, 64] {
+            let k: Vec<[f32; 8]> = (0..chunks).map(|_| std::array::from_fn(|_| lcg(&mut seed))).collect();
+            let q: Vec<Vec<[f32; 8]>> = (0..8)
+                .map(|_| (0..chunks).map(|_| std::array::from_fn(|_| lcg(&mut seed))).collect())
+                .collect();
+            macro_rules! go {
+                ($($G:literal),*) => {$(
+                    let qp: [*const [f32; 8]; $G] = std::array::from_fn(|g| q[g].as_ptr());
+                    // SAFETY: AVX2 was detected; every row has `chunks` chunks.
+                    let a = unsafe { lanes_avx2::<$G>(&qp, &k) };
+                    let b = lanes_portable::<$G>(&qp, &k);
+                    assert_eq!(a.map(|r| r.map(f32::to_bits)), b.map(|r| r.map(f32::to_bits)), "G={} chunks={chunks}", $G);
+                )*};
+            }
+            go!(1, 2, 4, 8);
+        }
+        // Value accumulation: 1..=4 heads, column ranges with and without a tail below 16.
+        let (n, vw) = (37usize, 80usize);
+        let vals: Vec<Vec<f32>> = (0..n).map(|_| (0..vw).map(|_| lcg(&mut seed)).collect()).collect();
+        let rows: Vec<Row> = vals.iter().map(|v| Row(v.as_ptr())).collect();
+        let ws: Vec<Vec<f32>> = (0..4).map(|_| (0..n).map(|_| lcg(&mut seed)).collect()).collect();
+        for (c0, c1) in [(0usize, vw), (3, 19), (8, 47), (5, 12), (64, 80)] {
+            for r in 1..=4usize {
+                let mut want = vec![vec![0f32; c1 - c0]; r];
+                for (h, o) in want.iter_mut().enumerate() {
+                    for (j, v) in vals.iter().enumerate() {
+                        axpy(o, ws[h][j], &v[c0..c1]);
+                    }
+                }
+                let mut got = vec![vec![f32::NAN; c1 - c0]; r];
+                let ds: Vec<*mut f32> = got.iter_mut().map(|v| v.as_mut_ptr()).collect();
+                // SAFETY: AVX2 was detected; rows are `vw >= c1` wide, outputs `c1 - c0`.
+                let done = unsafe {
+                    match r {
+                        4 => weighted_rows_avx2::<4>(&[&ws[0], &ws[1], &ws[2], &ws[3]], &rows, c0, c1, &[ds[0], ds[1], ds[2], ds[3]], c0),
+                        3 => weighted_rows_avx2::<3>(&[&ws[0], &ws[1], &ws[2]], &rows, c0, c1, &[ds[0], ds[1], ds[2]], c0),
+                        2 => weighted_rows_avx2::<2>(&[&ws[0], &ws[1]], &rows, c0, c1, &[ds[0], ds[1]], c0),
+                        _ => weighted_rows_avx2::<1>(&[&ws[0]], &rows, c0, c1, &[ds[0]], c0),
+                    }
+                };
+                assert_eq!(done, c0 + (c1 - c0) / 16 * 16);
+                for h in 0..r {
+                    for c in 0..c1 - c0 {
+                        if c < done - c0 {
+                            assert_eq!(got[h][c].to_bits(), want[h][c].to_bits(), "cols {c0}..{c1} heads {r} [{h}][{c}]");
+                        } else {
+                            assert!(got[h][c].is_nan(), "column {c} written past the whole steps");
+                        }
+                    }
                 }
             }
         }
