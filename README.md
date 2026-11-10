@@ -3666,16 +3666,27 @@ engine (`capi` feature, `include/oxinfer.h`) and a SwiftUI test app for iOS are 
 drafting is the `lookup` options ([Prompt lookup](#prompt-lookup)).
 
 Tokenization is in the crate too: `oxinfer::tokenizer::Tokenizer` reads HuggingFace
-`tokenizer.json` files (BPE, Unigram, WordPiece and WordLevel models with their normalizers,
-pre-tokenizers, post-processors and decoders, regex splits on a small backtracking engine with
-lookahead) and has the `encode` / `decode` / `token_to_id` API of the `tokenizers` crate, which
-oxinfer no longer depends on. It was compared with `tokenizers` 0.23.2 on 41 `tokenizer.json`
+`tokenizer.json` files (BPE, Unigram, WordPiece and WordLevel models with every normalizer,
+pre-tokenizer, post-processor and decoder of the format, BPE dropout, script splitting,
+truncation with stride and overflowing parts, padding, added-token flags) and has the API of
+the `tokenizers` crate, which oxinfer no longer depends on: `encode` of single texts, pairs
+(with type ids) and pre-split words, `encode_batch`, `decode`, `decode_batch`, `decode_stream`,
+`token_to_id`, `get_vocab`. Regex splits run on an in-crate backtracking engine with
+`fancy-regex`'s syntax and semantics (lookbehind, atomic groups, backreferences, conditionals,
+`\K`, `\G`). It was compared with `tokenizers` 0.23.2 on 41 `tokenizer.json`
 files (Qwen 2.5 to 3.5, Llama 3, Mistral Small 3.2, Mistral Large 4's tekken, Gemma 3 and 4,
 DeepSeek V4, Janus, Whisper, CLIP, T5, the WordPiece encoders of BGE, MiniLM, MPNet, nomic and
 mxbai, the XLM-R Unigram of BGE-M3 and multilingual-E5, ModernBERT): ids, special-token masks
 and decoding with and without special tokens agree on 30,037 texts each (a multilingual corpus
 and random strings of added tokens, combining marks, emoji, control characters and whitespace
-runs). Loading is faster (Gemma 4's 32 MB file: 280 ms instead of 430 ms).
+runs). Loading is faster (Gemma 4's 32 MB file: 280 ms instead of 430 ms), and so is encoding
+(Qwen 2.5 on that corpus: 225 ms instead of 336 ms). Unusual files were covered by rewriting ten
+of them (BERT, MPNet, ModernBERT, Qwen, Gemma, Mistral, T5, BGE-M3, CLIP, Whisper) about 200
+ways each: every pre-tokenizer, two dozen split regexes with every behavior, normalizer chains,
+model options, post-processors with each truncation strategy and padding, decoders and
+added-token flags. Single texts, pairs, pre-split words, batches, decoding and streaming
+decoding agree on 40 texts per rewrite, except where `tokenizers` itself is undefined: several
+added tokens that normalize to the same string (it then picks one by hash-map order).
 
 ### Using oxinfer from oxideav (and other crates)
 

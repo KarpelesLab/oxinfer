@@ -92,6 +92,8 @@ pub struct ModelJson {
     ignore_merges: Option<bool>,
     #[serde(default)]
     max_input_chars_per_word: Option<usize>,
+    #[serde(default)]
+    dropout: Option<f32>,
 }
 
 #[derive(Clone)]
@@ -120,6 +122,11 @@ impl Model {
                 VocabJson::List(_) => bail!("{ty} model with a list vocabulary"),
             }
         };
+        if let Some(p) = m.dropout
+            && !(0.0..=1.0).contains(&p)
+        {
+            bail!("BPE dropout {p} is not in [0, 1]");
+        }
         Ok(match ty.as_str() {
             "BPE" => Model::Bpe(Bpe::new(
                 map(vocab)?,
@@ -131,6 +138,7 @@ impl Model {
                     fuse_unk: m.fuse_unk.unwrap_or(false),
                     byte_fallback: m.byte_fallback.unwrap_or(false),
                     ignore_merges: m.ignore_merges.unwrap_or(false),
+                    dropout: m.dropout.filter(|&p| p > 0.0),
                 },
             )?),
             "Unigram" => match vocab {
@@ -179,6 +187,15 @@ impl Model {
             Model::Unigram(m) => m.pieces.get(id as usize).map(|(t, _)| t.as_str()),
             Model::WordPiece(m) => m.vocab.token(id),
             Model::WordLevel(m) => m.vocab.token(id),
+        }
+    }
+
+    pub fn get_vocab(&self) -> HashMap<String, u32> {
+        match self {
+            Model::Bpe(m) => m.vocab.ids.clone(),
+            Model::Unigram(m) => m.ids.clone(),
+            Model::WordPiece(m) => m.vocab.ids.clone(),
+            Model::WordLevel(m) => m.vocab.ids.clone(),
         }
     }
 
@@ -231,6 +248,30 @@ pub struct BpeOptions {
     fuse_unk: bool,
     byte_fallback: bool,
     ignore_merges: bool,
+    /// Merge dropout probability (BPE-dropout regularization); None or 0 is deterministic.
+    dropout: Option<f32>,
+}
+
+/// A uniform f32 in [0, 1) from a per-thread xorshift generator.
+fn random_f32() -> f32 {
+    use std::cell::Cell;
+    thread_local! {
+        static STATE: Cell<u64> = Cell::new({
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos() as u64);
+            let local = 0u8;
+            (t ^ (&local as *const u8 as u64).rotate_left(32)) | 1
+        });
+    }
+    STATE.with(|s| {
+        let mut x = s.get();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        (x >> 40) as f32 / (1u64 << 24) as f32
+    })
 }
 
 #[derive(Clone)]
@@ -270,7 +311,9 @@ impl Bpe {
     }
 
     fn tokenize(&self, word: &str, out: &mut Vec<u32>) -> Result<()> {
+        // (With dropout the reference skips the whole-word lookup.)
         if self.o.ignore_merges
+            && self.o.dropout.is_none()
             && let Some(id) = self.vocab.id(word)
         {
             out.push(id);
@@ -340,7 +383,9 @@ impl Bpe {
         Ok(())
     }
 
-    /// Applies merges by rank (lowest first, leftmost on ties) until none applies.
+    /// Applies merges by rank (lowest first, leftmost on ties) until none applies; with
+    /// dropout, each candidate merge is skipped with that probability (skipped candidates come
+    /// back once a merge is done).
     fn merge(&self, syms: &mut Vec<u32>) {
         let n = syms.len();
         if n < 2 {
@@ -355,7 +400,16 @@ impl Bpe {
                 heap.push(std::cmp::Reverse((rank, i, id)));
             }
         }
-        while let Some(std::cmp::Reverse((rank, pos, new_id))) = heap.pop() {
+        let mut skipped = Vec::new();
+        while let Some(top) = heap.pop() {
+            if let Some(p) = self.o.dropout {
+                if random_f32() < p {
+                    skipped.push(top);
+                    continue;
+                }
+                heap.extend(skipped.drain(..));
+            }
+            let std::cmp::Reverse((rank, pos, new_id)) = top;
             if !alive[pos] || next[pos] < 0 {
                 continue;
             }

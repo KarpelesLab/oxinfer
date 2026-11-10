@@ -608,6 +608,7 @@ dependencies = [
  "oxideav-vp9",
  "oxideav-webp",
  "regex",
+ "regex-syntax",
  "rsurl",
  "serde",
  "serde_json",

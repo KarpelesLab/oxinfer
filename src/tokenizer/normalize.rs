@@ -138,6 +138,97 @@ impl Normalizer {
         })
     }
 
+    /// Normalizes `s` and also tells how many leading bytes of the result map to the start of
+    /// the original input, given that the first `zero` bytes of `s` do (`shift0`: `s` starts at
+    /// the input's start; chars inserted before everything then map there too).
+    pub fn normalize_tracked(&self, s: String, shift0: bool, zero: usize) -> (String, usize) {
+        if !shift0 {
+            return (self.normalize(s), 0);
+        }
+        match self {
+            Normalizer::Sequence(v) => {
+                let mut cur = (s, zero);
+                for n in v {
+                    cur = n.normalize_tracked(cur.0, shift0, cur.1);
+                }
+                cur
+            }
+            Normalizer::Prepend(p) => {
+                if s.is_empty() {
+                    return (s, zero);
+                }
+                let z = if zero > 0 { p.len() + zero } else { 0 };
+                (format!("{p}{s}"), z)
+            }
+            Normalizer::Strip { left, right } => {
+                let leading = if *left { s.chars().take_while(|c| c.is_whitespace()).count() } else { 0 };
+                let trailing = if *right { s.chars().rev().take_while(|c| c.is_whitespace()).count() } else { 0 };
+                if leading == 0 && trailing == 0 {
+                    return (s, zero);
+                }
+                let count = s.chars().count();
+                let mut sim = ZeroSim::new(&s, zero, shift0, leading);
+                for (i, c) in s.chars().enumerate() {
+                    if i < leading || i >= count - trailing {
+                        continue;
+                    }
+                    // (The reference compares a char index with a byte length here.)
+                    let change = if i + trailing + 1 == s.len() { -(trailing as isize) } else { 0 };
+                    sim.push(c, change);
+                }
+                let z = sim.out;
+                (self.normalize(s), z)
+            }
+            Normalizer::Replace { pattern, content } => {
+                let mut out = String::with_capacity(s.len());
+                let mut z = 0;
+                let mut run = true;
+                for ((a, b), m) in pattern.find_matches(&s) {
+                    if m {
+                        // The content takes the alignment of the last matched char (or the
+                        // start, for an empty match there).
+                        let at_zero = if b == 0 { true } else { b - 1 < zero };
+                        if run && !content.is_empty() {
+                            if at_zero {
+                                z += content.len();
+                            } else {
+                                run = false;
+                            }
+                        }
+                        out.push_str(content);
+                    } else {
+                        if run {
+                            let k = zero.saturating_sub(a).min(b - a);
+                            z += k;
+                            if k < b - a {
+                                run = false;
+                            }
+                        }
+                        out.push_str(&s[a..b]);
+                    }
+                }
+                (out, z)
+            }
+            Normalizer::Precompiled(p) => {
+                let (out, transforms) = p.normalize_with_changes(&s);
+                let Some(t) = transforms else { return (out, zero) };
+                let mut sim = ZeroSim::new(&s, zero, shift0, 0);
+                for (c, ch) in t {
+                    sim.push(c, ch);
+                    if sim.done {
+                        break;
+                    }
+                }
+                (out, sim.out)
+            }
+            _ => {
+                let out = self.normalize(s.clone());
+                let z = zero_char_local(self, &s, &out, zero);
+                (out, z)
+            }
+        }
+    }
+
     pub fn normalize(&self, s: String) -> String {
         match self {
             Normalizer::Nfc => unicode::nfc(&s),
@@ -223,6 +314,72 @@ impl Normalizer {
     }
 }
 
+/// Follows the reference implementation's alignment rule over the start of a transformed
+/// string, to find how many leading output bytes still map to offset 0 of the original input.
+/// Each output char comes with its `change` (`0` replaces the next input char, `-n` also drops
+/// the `n` after it, `1` is inserted and takes the alignment of the input char before it).
+struct ZeroSim<'a> {
+    input: &'a str,
+    offset: usize,
+    zero: usize,
+    shift0: bool,
+    out: usize,
+    done: bool,
+}
+
+impl<'a> ZeroSim<'a> {
+    fn new(input: &'a str, zero: usize, shift0: bool, initial_removed: usize) -> ZeroSim<'a> {
+        let offset = input.char_indices().nth(initial_removed).map_or(input.len(), |(i, _)| i);
+        ZeroSim {
+            input,
+            offset,
+            zero,
+            shift0,
+            out: 0,
+            done: false,
+        }
+    }
+
+    fn push(&mut self, c: char, change: isize) {
+        if self.done {
+            return;
+        }
+        let idx = self.offset;
+        let at_zero = if change > 0 {
+            if idx < 1 { self.shift0 } else { idx - 1 < self.zero }
+        } else {
+            idx < self.zero
+        };
+        if change <= 0 {
+            let mut it = self.input[self.offset.min(self.input.len())..].chars();
+            if let Some(x) = it.next() {
+                self.offset += x.len_utf8();
+            }
+            for _ in 0..(-change) {
+                match it.next() {
+                    Some(x) => self.offset += x.len_utf8(),
+                    None => break,
+                }
+            }
+        }
+        if at_zero {
+            self.out += c.len_utf8();
+        } else {
+            self.done = true;
+        }
+    }
+}
+
+/// The leading bytes of `out` that come from the first `zero` bytes of `input`, for
+/// normalizers that map each char on its own: as many chars as normalizing that prefix gives.
+fn zero_char_local(n: &Normalizer, input: &str, out: &str, zero: usize) -> usize {
+    if zero == 0 {
+        return 0;
+    }
+    let m = n.normalize(input[..zero.min(input.len())].to_string()).chars().count();
+    out.char_indices().nth(m).map_or(out.len(), |(i, _)| i)
+}
+
 fn is_chinese_char(c: char) -> bool {
     matches!(c as u32,
         0x4E00..=0x9FFF | 0x3400..=0x4DBF | 0x20000..=0x2A6DF | 0x2A700..=0x2B73F | 0x2B740..=0x2B81F
@@ -291,6 +448,51 @@ impl Precompiled {
         let rest = self.normalized.get(i..)?;
         let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
         std::str::from_utf8(&rest[..end]).ok()
+    }
+
+    /// The normalized text and, when anything changed, the per-char changes the reference
+    /// implementation hands to its alignment tracking (a removal at the very start is lost there,
+    /// which shifts the alignments; it matters for `prepend_scheme: first`).
+    fn normalize_with_changes(&self, s: &str) -> (String, Option<Vec<(char, isize)>>) {
+        let mut out = String::with_capacity(s.len());
+        let mut t: Vec<(char, isize)> = Vec::with_capacity(s.len());
+        let mut modified = false;
+        let replace = |t: &mut Vec<(char, isize)>, old: &str, new: &str| {
+            let diff = new.chars().count() as isize - old.chars().count() as isize;
+            t.extend(new.chars().map(|c| (c, 0)));
+            if diff > 0 {
+                t.iter_mut().rev().take(diff as usize).for_each(|(_, c)| *c = 1);
+            } else if diff < 0
+                && let Some((_, c)) = t.last_mut()
+            {
+                *c += diff;
+            }
+        };
+        for g in unicode::graphemes(s) {
+            if g.len() < 6
+                && let Some(n) = self.transform(g)
+            {
+                out.push_str(n);
+                modified = true;
+                replace(&mut t, g, n);
+                continue;
+            }
+            for (i, c) in g.char_indices() {
+                let part = &g[i..i + c.len_utf8()];
+                match self.transform(part) {
+                    Some(n) => {
+                        out.push_str(n);
+                        modified = true;
+                        replace(&mut t, part, n);
+                    }
+                    None => {
+                        out.push(c);
+                        t.push((c, 0));
+                    }
+                }
+            }
+        }
+        (out, modified.then_some(t))
     }
 
     /// Grapheme by grapheme: a short grapheme mapped as a whole, else char by char (as

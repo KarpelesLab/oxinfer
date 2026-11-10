@@ -1,5 +1,6 @@
 //! Decoders (token strings back to text) and post-processors (special tokens around a sequence).
 
+use super::Encoding;
 use super::normalize::Pattern;
 use super::pretok::bytes_char;
 use anyhow::{Result, anyhow, bail};
@@ -224,25 +225,116 @@ impl Decoder {
     }
 }
 
-/// One element of a template: a special token's ids, or the sequence (A or B).
+/// One element of a template: a special token's ids, or a sequence (A or B), with the type id
+/// its tokens get.
 #[derive(Clone, Debug)]
 pub enum Piece {
-    Special(Vec<u32>),
-    Seq(bool),
+    Special(Vec<u32>, u32),
+    Seq(bool, u32),
 }
 
 #[derive(Clone, Debug)]
 pub enum PostProcessor {
     Template {
         single: Vec<Piece>,
+        pair: Vec<Piece>,
     },
-    /// `[cls] A [sep]` (RoBERTa and BERT processing of a single sequence).
-    Wrap {
+    /// `[CLS] A [SEP]` / `[CLS] A [SEP] B [SEP]` (B gets type id 1).
+    Bert {
         cls: u32,
         sep: u32,
     },
-    Noop,
+    /// `<s> A </s>` / `<s> A </s> </s> B </s>` (all type id 0).
+    Roberta {
+        cls: u32,
+        sep: u32,
+    },
+    /// Offsets trimming only: nothing to do on ids.
+    ByteLevel,
     Sequence(Vec<PostProcessor>),
+}
+
+/// Parses a template piece: `{"Sequence": {"id": "A", "type_id": 0}}`,
+/// `{"SpecialToken": {"id": "[CLS]", "type_id": 0}}`, or the string forms `$A`, `$B:1`, `$1`,
+/// `[CLS]:0`.
+fn template_piece(p: &Value, specials: &Value) -> Result<Piece> {
+    let special = |name: &str, type_id: u32| -> Result<Piece> {
+        let ids = specials[name]["ids"]
+            .as_array()
+            .ok_or_else(|| anyhow!("template special token {name:?} is not defined"))?
+            .iter()
+            .map(|x| x.as_u64().map(|x| x as u32).ok_or_else(|| anyhow!("bad id for {name:?}")))
+            .collect::<Result<Vec<u32>>>()?;
+        Ok(Piece::Special(ids, type_id))
+    };
+    if let Some(s) = p.get("SpecialToken") {
+        return special(s["id"].as_str().unwrap_or_default(), s["type_id"].as_u64().unwrap_or(0) as u32);
+    }
+    if let Some(s) = p.get("Sequence") {
+        let b = match s["id"].as_str() {
+            Some("A") | None => false,
+            Some("B") => true,
+            Some(x) => bail!("bad template sequence id {x:?}"),
+        };
+        return Ok(Piece::Seq(b, s["type_id"].as_u64().unwrap_or(0) as u32));
+    }
+    let Some(s) = p.as_str() else { bail!("bad template piece {p}") };
+    let (id, type_id) = match s.split(':').collect::<Vec<_>>()[..] {
+        [id] => (id, None),
+        [id, t] => (id, Some(t.parse::<u32>().map_err(|_| anyhow!("bad template piece {s:?}"))?)),
+        _ => bail!("bad template piece {s:?}"),
+    };
+    if let Some(rest) = id.strip_prefix('$') {
+        let (b, t) = match rest {
+            "" | "A" | "a" => (false, 0),
+            "B" | "b" => (true, 0),
+            n => (false, n.parse::<u32>().map_err(|_| anyhow!("bad template piece {s:?}"))?),
+        };
+        Ok(Piece::Seq(b, type_id.unwrap_or(t)))
+    } else {
+        special(id, type_id.unwrap_or(0))
+    }
+}
+
+fn template(t: &Value, specials: &Value, default: &str) -> Result<Vec<Piece>> {
+    match t {
+        Value::Array(a) => a.iter().map(|p| template_piece(p, specials)).collect(),
+        Value::String(s) => s.split(' ').map(|p| template_piece(&Value::String(p.to_string()), specials)).collect(),
+        Value::Null => default.split(' ').map(|p| template_piece(&Value::String(p.to_string()), specials)).collect(),
+        _ => bail!("bad template {t}"),
+    }
+}
+
+/// `encoding` wrapped as `[pre..] encoding [post]` (special tokens marked, attention reset), the
+/// same for its overflowing parts; `ty` gives the type ids (`None`: keep the encoding's).
+fn wrap(e: &Encoding, pre: &[u32], post: u32, ty: (u32, Option<u32>, u32)) -> Encoding {
+    let one = |e: &Encoding| {
+        let n = e.ids.len();
+        let mut ids = Vec::with_capacity(n + pre.len() + 1);
+        ids.extend_from_slice(pre);
+        ids.extend_from_slice(&e.ids);
+        ids.push(post);
+        let mut type_ids = vec![ty.0; pre.len()];
+        match ty.1 {
+            Some(t) => type_ids.extend(std::iter::repeat_n(t, n)),
+            None => type_ids.extend_from_slice(&e.type_ids),
+        }
+        type_ids.push(ty.2);
+        let mut special = vec![1; pre.len()];
+        special.extend(std::iter::repeat_n(0, n));
+        special.push(1);
+        let attention = vec![1; ids.len()];
+        Encoding {
+            ids,
+            type_ids,
+            special,
+            attention,
+            overflowing: Vec::new(),
+        }
+    };
+    let mut out = one(e);
+    out.overflowing = e.overflowing.iter().map(one).collect();
+    out
 }
 
 impl PostProcessor {
@@ -252,39 +344,20 @@ impl PostProcessor {
         Ok(match ty {
             "TemplateProcessing" => {
                 let specials = &v["special_tokens"];
-                let parse = |t: &Value| -> Result<Vec<Piece>> {
-                    let mut out = Vec::new();
-                    for p in t.as_array().into_iter().flatten() {
-                        if let Some(s) = p.get("SpecialToken") {
-                            let name = s["id"].as_str().unwrap_or_default();
-                            let ids = specials[name]["ids"]
-                                .as_array()
-                                .ok_or_else(|| anyhow!("template special token {name:?} is not defined"))?
-                                .iter()
-                                .map(|x| x.as_u64().map(|x| x as u32).ok_or_else(|| anyhow!("bad id for {name:?}")))
-                                .collect::<Result<Vec<u32>>>()?;
-                            out.push(Piece::Special(ids));
-                        } else if let Some(s) = p.get("Sequence") {
-                            out.push(Piece::Seq(s["id"].as_str() == Some("B")));
-                        } else {
-                            bail!("bad template piece {p}");
-                        }
-                    }
-                    Ok(out)
-                };
                 PostProcessor::Template {
-                    single: parse(&v["single"])?,
+                    single: template(&v["single"], specials, "$0")?,
+                    pair: template(&v["pair"], specials, "$A:0 $B:1")?,
                 }
             }
-            "RobertaProcessing" => PostProcessor::Wrap {
+            "RobertaProcessing" => PostProcessor::Roberta {
                 cls: tok("cls")?,
                 sep: tok("sep")?,
             },
-            "BertProcessing" => PostProcessor::Wrap {
+            "BertProcessing" => PostProcessor::Bert {
                 cls: tok("cls")?,
                 sep: tok("sep")?,
             },
-            "ByteLevel" => PostProcessor::Noop,
+            "ByteLevel" => PostProcessor::ByteLevel,
             "Sequence" => PostProcessor::Sequence(
                 v["processors"]
                     .as_array()
@@ -295,49 +368,96 @@ impl PostProcessor {
         })
     }
 
-    /// How many special tokens a single sequence gets.
-    pub fn added_tokens(&self) -> usize {
+    /// How many special tokens a single sequence (or a pair) gets.
+    pub fn added_tokens(&self, is_pair: bool) -> usize {
         match self {
-            PostProcessor::Template { single } => single.iter().map(|p| if let Piece::Special(ids) = p { ids.len() } else { 0 }).sum(),
-            PostProcessor::Wrap { .. } => 2,
-            PostProcessor::Noop => 0,
-            PostProcessor::Sequence(v) => v.iter().map(PostProcessor::added_tokens).sum(),
+            PostProcessor::Template { single, pair } => (if is_pair { pair } else { single })
+                .iter()
+                .map(|p| if let Piece::Special(ids, _) = p { ids.len() } else { 0 })
+                .sum(),
+            PostProcessor::Bert { .. } => 2 + is_pair as usize,
+            PostProcessor::Roberta { .. } => 2 + 2 * is_pair as usize,
+            PostProcessor::ByteLevel => 0,
+            PostProcessor::Sequence(v) => v.iter().map(|p| p.added_tokens(is_pair)).sum(),
         }
     }
 
-    /// Adds the special tokens around a single sequence: (ids, special-token mask).
-    pub fn process(&self, ids: Vec<u32>, mask: Vec<u32>) -> (Vec<u32>, Vec<u32>) {
+    /// Processes one encoding (or a pair) into the final one: each gets its sequence's type id,
+    /// the processor adds its special tokens, then the parts are concatenated.
+    pub fn process(&self, mut encoding: Encoding, pair: Option<Encoding>, add_special_tokens: bool) -> Result<Encoding> {
+        encoding.type_ids = vec![0; encoding.ids.len()];
+        let mut encodings = vec![encoding];
+        if let Some(mut p) = pair {
+            p.type_ids = vec![1; p.ids.len()];
+            encodings.push(p);
+        }
+        let encodings = self.process_encodings(encodings, add_special_tokens)?;
+        Ok(Encoding::merge(encodings))
+    }
+
+    fn process_encodings(&self, encodings: Vec<Encoding>, add_special_tokens: bool) -> Result<Vec<Encoding>> {
         match self {
-            PostProcessor::Template { single } => {
-                let mut o = Vec::with_capacity(ids.len() + 4);
-                let mut m = Vec::with_capacity(ids.len() + 4);
-                for p in single {
+            PostProcessor::Template { single, pair } => {
+                let t = match encodings.len() {
+                    1 => single,
+                    2 => pair,
+                    n => bail!("cannot post-process {n} sequences"),
+                };
+                let mut out = Vec::with_capacity(t.len());
+                for p in t {
                     match p {
-                        Piece::Special(s) => {
-                            o.extend_from_slice(s);
-                            m.extend(std::iter::repeat_n(1, s.len()));
+                        Piece::Seq(b, type_id) => {
+                            let mut e = encodings
+                                .get(*b as usize)
+                                .ok_or_else(|| anyhow!("the template uses sequence B without a pair"))?
+                                .clone();
+                            e.type_ids = vec![*type_id; e.ids.len()];
+                            out.push(e);
                         }
-                        Piece::Seq(false) => {
-                            o.extend_from_slice(&ids);
-                            m.extend_from_slice(&mask);
-                        }
-                        Piece::Seq(true) => {}
+                        Piece::Special(ids, type_id) if add_special_tokens => out.push(Encoding {
+                            ids: ids.clone(),
+                            type_ids: vec![*type_id; ids.len()],
+                            special: vec![1; ids.len()],
+                            attention: vec![1; ids.len()],
+                            overflowing: Vec::new(),
+                        }),
+                        Piece::Special(..) => {}
                     }
                 }
-                (o, m)
+                Ok(out)
             }
-            PostProcessor::Wrap { cls, sep } => {
-                let mut o = Vec::with_capacity(ids.len() + 2);
-                o.push(*cls);
-                o.extend_from_slice(&ids);
-                o.push(*sep);
-                let mut m = vec![1];
-                m.extend_from_slice(&mask);
-                m.push(1);
-                (o, m)
+            PostProcessor::Bert { cls, sep } | PostProcessor::Roberta { cls, sep } => {
+                let roberta = matches!(self, PostProcessor::Roberta { .. });
+                let mut encodings = encodings;
+                if roberta {
+                    // RoBERTa has a single type: every sequence (but not its overflowing parts,
+                    // which only get fixed when wrapped) becomes type 0, even without specials.
+                    for e in &mut encodings {
+                        e.type_ids = vec![0; e.ids.len()];
+                    }
+                }
+                if !add_special_tokens {
+                    return Ok(encodings);
+                }
+                Ok(encodings
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| match (i, roberta) {
+                        (0, true) => wrap(e, &[*cls], *sep, (0, Some(0), 0)),
+                        (0, false) => wrap(e, &[*cls], *sep, (0, None, 0)),
+                        (_, false) => wrap(e, &[], *sep, (1, None, 1)),
+                        (_, true) => wrap(e, &[*sep], *sep, (0, Some(0), 0)),
+                    })
+                    .collect())
             }
-            PostProcessor::Noop => (ids, mask),
-            PostProcessor::Sequence(v) => v.iter().fold((ids, mask), |(i, m), p| p.process(i, m)),
+            PostProcessor::ByteLevel => Ok(encodings),
+            PostProcessor::Sequence(v) => {
+                let mut e = encodings;
+                for p in v {
+                    e = p.process_encodings(e, add_special_tokens)?;
+                }
+                Ok(e)
+            }
         }
     }
 }

@@ -7,11 +7,43 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::Value;
 use std::sync::OnceLock;
 
-/// A piece of text; `first` is set when it starts the input (Metaspace's `first` scheme).
+/// A piece of text. `shift0`: it starts at the start of the input (what Metaspace's `first`
+/// scheme checks); `zero`: how many of its leading bytes map to that start (pieces cut from it
+/// before that point start there too).
 #[derive(Clone, Debug)]
 pub struct Piece {
     pub s: String,
-    pub first: bool,
+    pub shift0: bool,
+    pub zero: usize,
+}
+
+impl Piece {
+    /// A whole input segment starting at `start` in the input.
+    pub fn segment(s: String, start: usize) -> Piece {
+        let zero = if start == 0 { s.chars().next().map_or(0, char::len_utf8) } else { 0 };
+        Piece { s, shift0: start == 0, zero }
+    }
+
+    /// The sub-piece `a..b`.
+    pub fn slice(&self, a: usize, b: usize) -> Piece {
+        let shift0 = a < self.zero;
+        Piece {
+            s: self.s[a..b].to_string(),
+            shift0,
+            zero: if shift0 { (self.zero - a).min(b - a) } else { 0 },
+        }
+    }
+
+    /// Prepends `p` (the prepended text takes the alignment of the first char).
+    fn prepend(&mut self, p: &str) {
+        if self.s.is_empty() {
+            return;
+        }
+        self.s.insert_str(0, p);
+        if self.zero > 0 {
+            self.zero += p.len();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,7 +100,29 @@ pub enum PreTokenizer {
     Punctuation(Behavior),
     CharDelimiter(char),
     FixedLength(usize),
+    UnicodeScripts,
     Sequence(Vec<PreTokenizer>),
+}
+
+/// The script of `c` for the UnicodeScripts pre-tokenizer: SentencePiece's table, with
+/// Hiragana, Katakana and the prolonged sound mark counted as Han and the space as `Any` (0).
+fn script(c: char) -> u8 {
+    use super::scripts::{HAN, HIRAGANA, KATAKANA, SCRIPTS};
+    if c == '\u{30FC}' {
+        return HAN;
+    }
+    if c == ' ' {
+        return 0;
+    }
+    let u = c as u32;
+    let i = SCRIPTS.partition_point(|&(_, b, _)| b < u);
+    match SCRIPTS.get(i) {
+        Some(&(a, _, s)) if a <= u => match s {
+            HIRAGANA | KATAKANA => HAN,
+            s => s,
+        },
+        _ => 0,
+    }
 }
 
 /// The GPT-2 byte-level split pattern.
@@ -148,10 +202,7 @@ fn split_by(p: &Piece, matches: Vec<((usize, usize), bool)>, behavior: Behavior,
     }
     for ((a, b), remove) in spans {
         if !remove && a < b {
-            out.push(Piece {
-                s: p.s[a..b].to_string(),
-                first: p.first && a == 0,
-            });
+            out.push(p.slice(a, b));
         }
     }
 }
@@ -235,6 +286,7 @@ impl PreTokenizer {
                     .ok_or_else(|| anyhow!("CharDelimiterSplit without a delimiter"))?,
             ),
             "FixedLength" => PreTokenizer::FixedLength(v["length"].as_u64().unwrap_or(5) as usize),
+            "UnicodeScripts" => PreTokenizer::UnicodeScripts,
             "Sequence" => PreTokenizer::Sequence(
                 v["pretokenizers"]
                     .as_array()
@@ -243,6 +295,15 @@ impl PreTokenizer {
             ),
             t => bail!("unsupported pre-tokenizer {t}"),
         })
+    }
+
+    /// Whether a Metaspace with `prepend_scheme: first` is in there.
+    pub fn uses_first(&self) -> bool {
+        match self {
+            PreTokenizer::Metaspace { prepend, .. } => *prepend == Prepend::First,
+            PreTokenizer::Sequence(v) => v.iter().any(PreTokenizer::uses_first),
+            _ => false,
+        }
     }
 
     /// Splits every piece of `pieces`.
@@ -256,6 +317,7 @@ impl PreTokenizer {
         }
         if let PreTokenizer::ByteLevel { .. } = self {
             for p in &mut out {
+                p.zero = byte_level_chars(&p.s[..p.zero]).len();
                 p.s = byte_level_chars(&p.s);
             }
         }
@@ -268,11 +330,11 @@ impl PreTokenizer {
                 add_prefix_space,
                 use_regex,
             } => {
+                let mut q;
                 let p = if *add_prefix_space && !p.s.starts_with(' ') {
-                    &Piece {
-                        s: format!(" {}", p.s),
-                        first: p.first,
-                    }
+                    q = p.clone();
+                    q.prepend(" ");
+                    &q
                 } else {
                     p
                 };
@@ -306,18 +368,22 @@ impl PreTokenizer {
                 prepend,
                 split,
             } => {
-                let mut s: String = p.s.chars().map(|c| if c == ' ' { *replacement } else { c }).collect();
+                let r = *replacement;
+                let map = |t: &str| -> String { t.chars().map(|c| if c == ' ' { r } else { c }).collect() };
+                let mut q = Piece {
+                    s: map(&p.s),
+                    shift0: p.shift0,
+                    zero: map(&p.s[..p.zero]).len(),
+                };
                 let add = match prepend {
                     Prepend::Always => true,
-                    Prepend::First => p.first,
+                    Prepend::First => p.shift0,
                     Prepend::Never => false,
                 };
-                if add && !s.is_empty() && !s.starts_with(*replacement) {
-                    s.insert(0, *replacement);
+                if add && !q.s.starts_with(r) {
+                    q.prepend(r.encode_utf8(&mut [0; 4]));
                 }
-                let q = Piece { s, first: p.first };
                 if *split {
-                    let r = *replacement;
                     split_by(&q, char_matches(&q.s, |c| c == r), Behavior::MergedWithNext, out);
                 } else if !q.s.is_empty() {
                     out.push(q);
@@ -334,14 +400,30 @@ impl PreTokenizer {
             }
             PreTokenizer::FixedLength(n) => {
                 let chars: Vec<(usize, char)> = p.s.char_indices().collect();
-                for (k, chunk) in chars.chunks((*n).max(1)).enumerate() {
+                for chunk in chars.chunks((*n).max(1)) {
                     let a = chunk[0].0;
                     let last = chunk[chunk.len() - 1];
                     let b = last.0 + last.1.len_utf8();
-                    out.push(Piece {
-                        s: p.s[a..b].to_string(),
-                        first: p.first && k == 0,
-                    });
+                    out.push(p.slice(a, b));
+                }
+            }
+            PreTokenizer::UnicodeScripts => {
+                // A cut wherever the script changes (`Any` chars join either side). As in the
+                // reference, text before the first cut (leading `Any` chars) is dropped.
+                let mut cuts = Vec::new();
+                let mut last: Option<u8> = None;
+                for (i, c) in p.s.char_indices() {
+                    let sc = script(c);
+                    if sc != 0 && last != Some(sc) {
+                        cuts.push(i);
+                    }
+                    if sc != 0 {
+                        last = Some(sc);
+                    }
+                }
+                cuts.push(p.s.len());
+                for w in cuts.windows(2) {
+                    out.push(p.slice(w[0], w[1]));
                 }
             }
             PreTokenizer::Sequence(_) => unreachable!(),

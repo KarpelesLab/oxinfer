@@ -159,6 +159,7 @@ half = "2.7.1"
 intl = { version = "0.6.4", default-features = false, features = ["full", "normalization", "segmentation"] }
 # CLIP tokenizer pre-tokenization (Unicode letter / number classes).
 regex = { version = "1.12", default-features = false, features = ["std", "unicode"] }
+regex-syntax = { version = "0.8", default-features = false, features = ["std", "unicode"] }
 serde = { version = "1.0.229", features = ["derive"] }
 # preserve_order: tool schemas keep their key order (chat templates serialize them as given).
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
