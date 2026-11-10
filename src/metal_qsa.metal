@@ -1,5 +1,6 @@
 // ---- QSA (Qwen4-Exp sparse attention, see qwen4exp.rs and gpu_decode.rs `Op::QsaKey` / `QsaSelect`
-// / `AttendSel`). Appended to the decode kernels (metal_decode.metal).
+// / `AttendSel`), and the Qwen4-Exp prefill kernels (`pf_*`, metal_prefill.rs). Appended to the decode
+// kernels (metal_decode.metal).
 //
 // Every float op of the indexer below is written in the CPU path's order without contraction, so
 // given the same inputs the pooled keys, the normed queries and the block scores match it but for
@@ -199,4 +200,86 @@ kernel void dec_qsa_topk(device const float* sc [[buffer(0)]], device uint* sel 
     }
     uint tail = nb * r;
     for (uint q = tail + tid; q <= p.pos; q += nt) sel[p.top * r + q - tail] = q;
+}
+
+// Prefill attention over a host KV cache (gpu.rs `AttnJob`, QSA-aware): grid (head groups, tokens);
+// token i (position start + i) attends to the meta[2 i + 1] positions listed at idx + meta[2 i], or
+// with meta[2 i] == ~0 to positions 0 .. start + i. q (scaled) and out: [t, nh, hd]. One threadgroup
+// takes all of a token's keys (the tokens give the parallelism).
+#define ATTN_PF(D, G) \
+kernel void pf_attn_##D##_##G(device const float* q [[buffer(0)]], device const float* kc [[buffer(1)]], device const float* vc [[buffer(2)]], \
+                         device float* out [[buffer(3)]], constant AP& p0 [[buffer(4)]], device const uint* idx [[buffer(5)]], \
+                         device const uint* meta [[buffer(6)]], constant uint& start [[buffer(7)]], \
+                         uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
+    threadgroup float sm[16]; threadgroup float so[8 * D * 32]; threadgroup float qs[G * D * 32]; \
+    uint i = tg.y; \
+    AP p = p0; \
+    p.lo = 0; p.nsplit = 1; p.has_gate = 0; \
+    ulong qo = (ulong)i * p.nh * D * 32; \
+    uint off = meta[2 * i]; \
+    if (off == 0xffffffffu) { \
+        p.len = start + i + 1; p.chunk = p.len; \
+        attn_body<D, G, false, thread AP&>(q + qo, kc, vc, out + qo, q, (device float*)nullptr, p, tg.x, 0, tid, sg, lane, sm, so, qs); \
+    } else { \
+        p.len = meta[2 * i + 1]; p.chunk = p.len; \
+        attn_body<D, G, true, thread AP&>(q + qo, kc, vc, out + qo, q, (device float*)nullptr, p, tg.x, 0, tid, sg, lane, sm, so, qs, idx + off); \
+    } }
+ATTN_PF(2, 1) ATTN_PF(2, 2) ATTN_PF(2, 4) ATTN_PF(2, 8) ATTN_PF(4, 1) ATTN_PF(4, 2) ATTN_PF(4, 4) ATTN_PF(8, 1) ATTN_PF(8, 2) ATTN_PF(16, 1)
+
+// Prefill Gated DeltaNet rule (gpu.rs `GdnJob`) without the gated norm: threadgroup (value head hv,
+// group g of 32 state columns), thread (part, jj) keeps rows 32 part .. 32 part + 31 of column
+// 32 g + jj in registers over all the tokens (the columns evolve independently), writing each
+// token's raw output column; the math is gdn_rule_body's. hdk / 32 * 32 = hdk threads.
+kernel void pf_gdn_rule(device const float* c [[buffer(0)]], device const float* ba [[buffer(1)]], device float* out [[buffer(2)]],
+                        device float* state [[buffer(3)]], device const float* cst [[buffer(4)]], constant GR& p [[buffer(5)]],
+                        constant uint4& ts [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float qs[256], ks[256], red[256], red2[32];
+    uint hv = tg.x, hdk = p.hdk, hdv = p.hdv, np = hdk / 32;
+    uint hk = (p.tiled & 1u) != 0 ? hv % p.nk : hv / (p.nv / p.nk);
+    uint part = tid / 32, jj = tid % 32, j = tg.y * 32 + jj;
+    device float* S = state + (ulong)hv * hdk * hdv + part * 32 * hdv + j;
+    float s[32];
+    for (uint d = 0; d < 32; d++) s[d] = S[d * hdv];
+    float dc = cst[hv], dtb = cst[p.nv + hv];
+    for (uint t = 0; t < ts.x; t++) {
+        device const float* ct = c + (ulong)t * ts.y;
+        device const float* zt = ba + (ulong)t * ts.z;
+        float q = ct[hk * hdk + tid], k = ct[p.key_dim + hk * hdk + tid];
+        qs[tid] = q;
+        ks[tid] = k;
+        float qinv = 1.0f / sqrt(tg_sum(q * q, hdk, tid, sg, lane, red2) + 1e-6f) * p.qscale;
+        float kinv = 1.0f / sqrt(tg_sum(k * k, hdk, tid, sg, lane, red2) + 1e-6f);
+        float beta = 1.0f / (1.0f + exp(-zt[hv]));
+        float ga = zt[p.nv + hv] + dtb;
+        float sp = ga > 20.f ? ga : log(1.0f + exp(ga));
+        float decay = exp(dc * sp);
+        float kv = 0.f;
+        for (uint d = 0; d < 32; d++) {
+            s[d] *= decay;
+            kv += s[d] * (ks[part * 32 + d] * kinv);
+        }
+        red[part * 32 + jj] = kv;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float kvm = 0.f;
+        for (uint i = 0; i < np; i++) kvm += red[i * 32 + jj];
+        float delta = (ct[2 * p.key_dim + hv * hdv + j] - kvm) * beta;
+        float o = 0.f;
+        for (uint d = 0; d < 32; d++) {
+            s[d] += (ks[part * 32 + d] * kinv) * delta;
+            o += s[d] * (qs[part * 32 + d] * qinv);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        red[part * 32 + jj] = o;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (part == 0) {
+            float ov = 0.f;
+            for (uint i = 0; i < np; i++) ov += red[i * 32 + jj];
+            out[(ulong)t * ts.w + hv * hdv + j] = ov;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint d = 0; d < 32; d++) S[d * hdv] = s[d];
 }

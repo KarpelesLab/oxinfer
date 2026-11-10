@@ -773,10 +773,11 @@ inline void qk_rope_body(device const float* qkv, device float* qo, device float
 struct AP { uint nh; uint nkv; uint len; uint lo; float scale; uint has_gate; uint g_stride; uint g_off; uint nsplit; uint chunk; uint _p0; uint _p1; };
 // One threadgroup per (G query heads sharing a key / value head, chunk of keys): every key and
 // value row is read once for the G heads.
-// SEL (QSA sparse attention, metal_qsa.metal): key j is cache position idx[j] rather than j.
-template <int D, int G, bool SEL = false>
+// SEL (QSA sparse attention, metal_qsa.metal): key j is cache position idx[j] rather than j. PT: how
+// the parameters arrive (per-token copies in the prefill kernels).
+template <int D, int G, bool SEL = false, typename PT = constant AP&>
 inline void attn_body(device const float* q, device const float* kc, device const float* vc, device float* out, device const float* gate,
-                      device float* part, constant AP& p, uint hg, uint split, uint tid, uint sg, uint lane, threadgroup float* sm,
+                      device float* part, PT p, uint hg, uint split, uint tid, uint sg, uint lane, threadgroup float* sm,
                       threadgroup float* so, threadgroup float* qs, device const uint* idx = nullptr) {
     constexpr uint HD = D * 32;
     uint h0 = hg * G;

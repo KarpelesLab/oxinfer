@@ -77,10 +77,12 @@ impl<'a> Hc<'a> {
         let mut lo = vec![0f32; t * lr];
         linear(&self.down, lr, w, &xn, t, &mut lo);
         let inv = 1.0 / hc as f32;
-        for v in lo.iter_mut() {
-            let a = *v * inv;
-            *v = a * sigmoid(a);
-        }
+        for_chunks(&mut lo, lr, t > 1, |_, row| {
+            for v in row.iter_mut() {
+                let a = *v * inv;
+                *v = a * sigmoid(a);
+            }
+        });
         let mut gate = vec![0f32; t * w];
         linear(&self.up, w, lr, &lo, t, &mut gate);
         for_chunks(mixed, h, t > 1, |ti, m| {

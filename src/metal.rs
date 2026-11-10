@@ -44,6 +44,8 @@ use std::time::Instant;
 
 #[path = "metal_decode.rs"]
 pub(crate) mod decode;
+#[path = "metal_prefill.rs"]
+mod prefill;
 
 const TILE: usize = 64; // out rows and tokens per threadgroup
 const MIN_T: usize = 16; // smaller token counts stay on the CPU
@@ -2955,6 +2957,14 @@ impl Backend for MetalBackend {
         let f: MsgU = self.o.msg_send();
         let v = unsafe { f(self.device, self.o.sel(c"recommendedMaxWorkingSetSize")) };
         (v > 0).then_some(v)
+    }
+
+    fn attention_cached(&self, j: &mut crate::gpu::AttnJob) -> bool {
+        self.attention_cached_impl(j)
+    }
+
+    fn gdn_rule(&self, j: &mut crate::gpu::GdnJob) -> bool {
+        self.gdn_rule_impl(j)
     }
 
     fn decode_plan<'s>(&'s self, g: &crate::gpu::decode::Graph) -> Option<Box<dyn crate::gpu::decode::DecodePlan + 's>> {

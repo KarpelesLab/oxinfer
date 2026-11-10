@@ -963,7 +963,7 @@ Speed on the M5 Max (128 GB; load average 3-9 from other jobs), UD-Q4_K_XL, gree
 
 | | prefill | decode |
 |---|---|---|
-| oxinfer, Metal (default) | 165 tok/s (3189 tokens), 85 (757) | 54-59 tok/s (45-49 under load) |
+| oxinfer, Metal (default) | 374 tok/s (4545 tokens), 261 (563) | 54-59 tok/s (45-49 under load), 47.6 after 4.5k tokens |
 | oxinfer, Metal + MTP (3 drafts) | | 72 tok/s on code (3.9 tokens per pass), 46 on prose |
 | oxinfer, CPU (`--device cpu`) | | 21.5 tok/s |
 | oxinfer, streamed (`--stream --cache-budget-gb 40`) | | 12 tok/s (47% of the time waiting on storage) |
@@ -1003,9 +1003,22 @@ to 2.5e-5 relative on the CPU (and with `OXINFER_METAL_MMA=0`), 0.9% with Metal'
 half-precision matmul operands (0.8 s instead of 1.4 s for 630 tokens); the model names Vermeer's
 "Girl with a Pearl Earring" from the PNG and describes it (prefill 721 tokens in 3.4 s).
 
-Not done: video input from GGUF is wired the same way but untested, GPU decoding past 2051 tokens (no GPU block selection), the merged-weight GGUF layout, and
-fast prefill (the MoE router, the Gated DeltaNet recurrence and attention run on the CPU in
-prefill: 6x slower than llama.cpp's).
+Prefill on Metal runs the matmuls, the routed experts, the MoE router (an f32 GEMM), the Gated
+DeltaNet recurrence (one threadgroup per value head and 32 state columns, the state in registers
+across the chunk) and the attention (dense, or over each token's QSA positions) on the GPU; the
+hyper-connection and n-gram elementwise work, the norms, the conv and the block selection stay on
+the CPU. `OXINFER_PREFILL_GPU=0` (or a list of `attn`, `gdn`, `router`) keeps them on the CPU.
+Measured on raw text (`examples/prefill_kl.rs`, interleaved runs): 563 tokens 190 -> 261 tok/s, 1323
+tokens 243 -> 324, 4545 tokens 205 -> 374. Against the CPU path the last position's KL is 2.9e-2,
+1.2e-3 and 2.4e-4, where the previous Metal prefill gave 3.8e-2, 1.8e-4 and 1.1e-3: this model
+amplifies any rounding (a flipped expert among 512), and the half-precision matrix units dominate; with
+`OXINFER_METAL_MMA=0` the old path is bit-identical to the CPU and the new one at KL 7.7e-3
+(563 tokens), any one GPU op alone (even the f32 router) giving the same. Greedy output against the
+previous prefill parts at near-ties (3 long prompts, 100 tokens: at the 2nd, ~60th and ~70th token).
+
+Not done: video input from GGUF is wired the same way but untested, the merged-weight GGUF layout,
+and a whole-layer GPU prefill (still 3-4x slower than llama.cpp's: the hyper-connection mixes, the
+routed experts' per-pass wrapping and the host round trips between ops dominate).
 
 ## Embeddings
 

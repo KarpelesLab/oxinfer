@@ -119,8 +119,13 @@ pub(crate) struct Experts<'a> {
 /// lower index.
 pub(crate) fn route_top_k(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
     let mut idx: Vec<usize> = (0..logits.len()).collect();
-    idx.sort_by(|&a, &b| logits[b].total_cmp(&logits[a]).then(a.cmp(&b)));
-    idx.truncate(k);
+    // A strict total order: the k first after a selection, then sorted, are the full sort's.
+    let ord = |a: &usize, b: &usize| logits[*b].total_cmp(&logits[*a]).then(a.cmp(b));
+    if k < idx.len() {
+        idx.select_nth_unstable_by(k, ord);
+        idx.truncate(k);
+    }
+    idx.sort_by(ord);
     let m = logits[idx[0]];
     let e: Vec<f32> = idx.iter().map(|&i| (logits[i] - m).exp()).collect();
     let s: f32 = e.iter().sum();

@@ -84,6 +84,9 @@ pub(crate) struct Moe<'a> {
     pub(crate) experts: Experts<'a>,
     pub(crate) shared: Mlp<'a>,
     pub(crate) shared_gate: Vec<f32>, // [H]
+    /// Qwen4-Exp: prefill passes take the router logits from the matmul path (on the GPU when
+    /// there is one), through this f32 copy of `router` made on first use.
+    pub(crate) router_mm: Option<std::sync::OnceLock<Lin<'static>>>,
 }
 
 // One per layer, built once.
@@ -594,6 +597,7 @@ impl<'a> Loader<'a, '_> {
             experts,
             shared: self.mlp(&format!("{mp}shared_expert."), cfg.shared_expert_intermediate_size)?,
             shared_gate: self.getf(&format!("{mp}shared_expert_gate.weight"), &[1, h])?,
+            router_mm: cfg.is_exp().then(std::sync::OnceLock::new),
         }))
     }
 }
@@ -1915,7 +1919,25 @@ impl<'a> QwenModel<'a> {
         });
         cache.push(&kn, &v, t);
         let mut att = vec![0f32; t * nh * hd];
+        // Qwen4-Exp prefill: on the GPU (dense, or over each token's QSA selection).
+        let on_gpu = prefill_gpu_exp(cfg, t, "attn")
+            && crate::gpu::active().is_some_and(|be| {
+                let (kc, vc) = cache.data();
+                be.attention_cached(&mut crate::gpu::AttnJob {
+                    q: &q,
+                    k: kc,
+                    v: vc,
+                    start,
+                    t,
+                    nh,
+                    nkv,
+                    hd,
+                    sel,
+                    out: &mut att,
+                })
+            });
         match sel {
+            _ if on_gpu => {}
             Some(sel) if sel.iter().any(|s| s.is_some()) => crate::qwen4exp::attention_sel(&q, cache, nh, t, start, sel, &mut att),
             _ => attention(&q, cache, nh, t, start, None, &mut att),
         }
@@ -2019,26 +2041,58 @@ impl<'a> QwenModel<'a> {
 
         // Gated delta rule, recurrent over time, parallel over value heads.
         let mut out = vec![0f32; t * value_dim];
-        rule.run(&mut st.s, &c, &b, &a, t, Some(&mut out));
+        let sig = cfg.gdn_sigmoid_gate();
+        // Qwen4-Exp prefill: the rule on the GPU (one pass over the chunk).
+        let on_gpu = prefill_gpu_exp(cfg, t, "gdn") && {
+            let mut ba = vec![0f32; t * 2 * nv];
+            for (ti, row) in ba.chunks_mut(2 * nv).enumerate() {
+                row[..nv].copy_from_slice(&b[ti * nv..(ti + 1) * nv]);
+                row[nv..].copy_from_slice(&a[ti * nv..(ti + 1) * nv]);
+            }
+            crate::gpu::active().is_some_and(|be| {
+                be.gdn_rule(&mut crate::gpu::GdnJob {
+                    c: &c,
+                    ba: &ba,
+                    state: &mut st.s,
+                    out: &mut out,
+                    t,
+                    nk,
+                    nv,
+                    hdk,
+                    hdv,
+                    tiled: cfg.v_heads_tiled,
+                    decay_coef: &gd.decay_coef,
+                    dt_bias: &gd.dt_bias,
+                })
+            })
+        };
+        if !on_gpu {
+            rule.run(&mut st.s, &c, &b, &a, t, Some(&mut out));
+        }
         if let Some(r) = rec {
             r.rule = rule;
         }
         drop(_timer);
 
-        // Gated RMSNorm per head: norm(o) * w * silu(z) (sigmoid(z) for Qwen4-Exp)
-        let sig = cfg.gdn_sigmoid_gate();
-        for_chunks(&mut out, hdv, t * nv > 64, |i, o| {
-            let ss: f32 = o.iter().map(|v| v * v).sum::<f32>() / hdv as f32 + eps;
-            let r = ss.powf(-0.5);
-            let zz = &z[i * hdv..(i + 1) * hdv];
-            for j in 0..hdv {
-                let g = zz[j];
-                let gate = if sig { 1.0 / (1.0 + (-g).exp()) } else { g / (1.0 + fast_exp(-g)) };
-                o[j] = o[j] * r * gd.norm_w[j] * gate;
-            }
-        });
+        gated_norm(&mut out, &z, &gd.norm_w, eps, sig, t * nv > 64);
         linear(&gd.out, h, value_dim, &out, t, y);
     }
+}
+
+/// Gated DeltaNet's gated RMSNorm per head (`hdv = w.len()`): `norm(o) * w * silu(z)` (sigmoid(z)
+/// for Qwen4-Exp).
+fn gated_norm(out: &mut [f32], z: &[f32], w: &[f32], eps: f32, sig: bool, par: bool) {
+    let hdv = w.len();
+    for_chunks(out, hdv, par, |i, o| {
+        let ss: f32 = o.iter().map(|v| v * v).sum::<f32>() / hdv as f32 + eps;
+        let r = ss.powf(-0.5);
+        let zz = &z[i * hdv..(i + 1) * hdv];
+        for j in 0..hdv {
+            let g = zz[j];
+            let gate = if sig { 1.0 / (1.0 + (-g).exp()) } else { g / (1.0 + fast_exp(-g)) };
+            o[j] = o[j] * r * w[j] * gate;
+        }
+    });
 }
 
 /// The target of a DSpark draft ([`crate::dspark`]): Qwen3 dense, Qwen3.5 / 3.6 / 3.8 dense and
@@ -2235,14 +2289,54 @@ impl Moe<'_> {
         };
         let ne = self.experts.n_experts();
         let mut logits = vec![0f32; t * ne];
-        for_chunks(&mut logits, ne, t > 1, |ti, l| {
-            for (v, w) in l.iter_mut().zip(self.router.chunks(h)) {
-                *v = dot(w, &x[ti * h..(ti + 1) * h]);
+        match &self.router_mm {
+            Some(r) if prefill_gpu(t, "router") => {
+                let lin = r.get_or_init(|| {
+                    let mut pv = crate::quant::PageVec::<u8>::zeroed(self.router.len() * 4);
+                    for (d, v) in pv.as_chunks_mut::<4>().0.iter_mut().zip(&self.router) {
+                        d.copy_from_slice(&v.to_le_bytes());
+                    }
+                    Lin::gguf(crate::ggml::GgufMatrix {
+                        kind: crate::ggml::GgmlType::F32,
+                        data: crate::quant::QBuf::from(pv),
+                        n_out: ne,
+                        n_in: h,
+                        block_scales: None,
+                    })
+                });
+                linear(lin, ne, h, x, t, &mut logits);
             }
-        });
+            _ => {
+                // Blocks of tokens per router row (each row read once per block; the same dots).
+                const RB: usize = 8;
+                for_chunks(&mut logits, RB * ne, t > 1, |bi, l| {
+                    for (e, w) in self.router.chunks(h).enumerate() {
+                        for (j, xr) in x[bi * RB * h..].chunks(h).take(l.len() / ne).enumerate() {
+                            l[j * ne + e] = dot(w, xr);
+                        }
+                    }
+                });
+            }
+        }
         let routes: Vec<_> = logits.chunks(ne).map(|l| route_top_k(l, self.experts.top_k)).collect();
         self.experts.forward(x, t, h, &routes, y, need, hook, Some(&shared));
     }
+}
+
+/// Qwen4-Exp passes of at least this many tokens (prefill) run Gated DeltaNet's rule and the
+/// attention on the GPU when there is one.
+const PREFILL_GPU_MIN: usize = 32;
+
+/// Whether a Qwen4-Exp pass of `t` tokens offloads past the matmuls (`OXINFER_PREFILL_GPU=0`: not).
+fn prefill_gpu_exp(cfg: &QwenConfig, t: usize, what: &str) -> bool {
+    cfg.is_exp() && prefill_gpu(t, what)
+}
+
+/// [`prefill_gpu_exp`] for a part known to be Qwen4-Exp's.
+fn prefill_gpu(t: usize, what: &str) -> bool {
+    static ON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let v = ON.get_or_init(|| std::env::var("OXINFER_PREFILL_GPU").unwrap_or_default());
+    t >= PREFILL_GPU_MIN && v != "0" && (v.is_empty() || v == "1" || v.split(',').any(|x| x == what))
 }
 
 #[derive(Clone, Copy)]
@@ -2253,5 +2347,128 @@ impl SendPtrF {
     #[inline(always)]
     fn get(self) -> *mut f32 {
         self.0
+    }
+}
+
+#[cfg(all(test, feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+mod prefill_gpu_tests {
+    use super::*;
+    use crate::gpu::Backend;
+
+    fn lcg(s: &mut u64) -> f32 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    }
+
+    fn close(a: &[f32], b: &[f32], tol: f32) {
+        let scale = b.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let d = a.iter().zip(b).fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+        assert!(d <= tol * scale, "max diff {d} (scale {scale})");
+    }
+
+    /// `Backend::gdn_rule` against `DeltaRule::run` (then the gated norm, as the forward does).
+    #[test]
+    fn gdn_rule_matches_cpu() {
+        let Ok(be) = crate::metal::MetalBackend::new() else { return };
+        let (nk, nv, hdk, hdv, t) = (2, 6, 128, 128, 70);
+        let mut sd = 5u64;
+        let (key_dim, vd) = (nk * hdk, nv * hdv);
+        let mut r = |n: usize, s: f32| (0..n).map(|_| s * lcg(&mut sd)).collect::<Vec<f32>>();
+        let c = r(t * (2 * key_dim + vd), 1.0);
+        let z = r(t * vd, 2.0);
+        let b = r(t * nv, 2.0);
+        let a = r(t * nv, 2.0);
+        let s0 = r(nv * hdk * hdv, 0.1);
+        let decay: Vec<f32> = r(nv, 1.0).iter().map(|v| -(v.abs() + 0.1)).collect();
+        let dt = r(nv, 1.0);
+        let w = r(hdv, 1.0).iter().map(|v| 1.0 + 0.5 * v).collect::<Vec<f32>>();
+        for (tiled, sig) in [(false, true), (true, false)] {
+            let rule = DeltaRule {
+                nk,
+                nv,
+                hdk,
+                hdv,
+                tiled,
+                decay_coef: decay.clone(),
+                dt_bias: dt.clone(),
+            };
+            let mut s_cpu = s0.clone();
+            let mut o_cpu = vec![0f32; t * vd];
+            rule.run(&mut s_cpu, &c, &b, &a, t, Some(&mut o_cpu));
+            gated_norm(&mut o_cpu, &z, &w, 1e-6, sig, false);
+            let mut ba = vec![0f32; t * 2 * nv];
+            for (ti, row) in ba.chunks_mut(2 * nv).enumerate() {
+                row[..nv].copy_from_slice(&b[ti * nv..(ti + 1) * nv]);
+                row[nv..].copy_from_slice(&a[ti * nv..(ti + 1) * nv]);
+            }
+            let mut s_gpu = s0.clone();
+            let mut o_gpu = vec![0f32; t * vd];
+            assert!(be.gdn_rule(&mut crate::gpu::GdnJob {
+                c: &c,
+                ba: &ba,
+                state: &mut s_gpu,
+                out: &mut o_gpu,
+                t,
+                nk,
+                nv,
+                hdk,
+                hdv,
+                tiled,
+                decay_coef: &decay,
+                dt_bias: &dt,
+            }));
+            gated_norm(&mut o_gpu, &z, &w, 1e-6, sig, false);
+            close(&o_gpu, &o_cpu, 1e-4);
+            close(&s_gpu, &s_cpu, 1e-4);
+        }
+    }
+
+    /// `Backend::attention_cached` against the CPU attention, dense and over QSA selections.
+    #[test]
+    fn attention_cached_matches_cpu() {
+        let Ok(be) = crate::metal::MetalBackend::new() else { return };
+        let (nh, nkv, hd, start, t) = (8, 2, 256, 300, 40);
+        let mut sd = 9u64;
+        let mut cache = LayerCache::new(nkv, hd);
+        let len = start + t;
+        let k: Vec<f32> = (0..len * nkv * hd).map(|_| lcg(&mut sd)).collect();
+        let v: Vec<f32> = (0..len * nkv * hd).map(|_| lcg(&mut sd)).collect();
+        cache.push(&k, &v, len);
+        let q: Vec<f32> = (0..t * nh * hd).map(|_| 0.1 * lcg(&mut sd)).collect();
+        // Every other token over a selection: a few blocks of 4 and its tail.
+        let sel: Vec<Option<Vec<u32>>> = (0..t)
+            .map(|i| {
+                let p = (start + i) as u32;
+                (i % 2 == 1).then(|| {
+                    (0..p / 4)
+                        .filter(|b| b % 3 == 0)
+                        .flat_map(|b| 4 * b..4 * b + 4)
+                        .chain(p / 4 * 4..=p)
+                        .collect()
+                })
+            })
+            .collect();
+        for sel in [None, Some(&sel[..])] {
+            let mut cpu = vec![0f32; t * nh * hd];
+            match sel {
+                Some(s) => crate::qwen4exp::attention_sel(&q, &cache, nh, t, start, s, &mut cpu),
+                None => attention(&q, &cache, nh, t, start, None, &mut cpu),
+            }
+            let mut gpu = vec![0f32; t * nh * hd];
+            let (kc, vc) = cache.data();
+            assert!(be.attention_cached(&mut crate::gpu::AttnJob {
+                q: &q,
+                k: kc,
+                v: vc,
+                start,
+                t,
+                nh,
+                nkv,
+                hd,
+                sel,
+                out: &mut gpu,
+            }));
+            close(&gpu, &cpu, 1e-5);
+        }
     }
 }

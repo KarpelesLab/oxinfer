@@ -61,6 +61,46 @@ pub struct RowsJob<'a> {
     pub y: &'a mut [f32],
 }
 
+/// Attention of a prefill chunk over a host KV cache ([`Backend::attention_cached`]): query
+/// `i` (position `start + i`, `[nh, hd]`, already scaled) attends to the cached positions
+/// `sel[i]` when set (QSA, Qwen4-Exp), else to positions `0..=start + i`; heads share key / value
+/// heads in groups of `nh / nkv`.
+pub struct AttnJob<'a> {
+    pub q: &'a [f32],
+    /// `[len, nkv, hd]` each.
+    pub k: &'a [f32],
+    pub v: &'a [f32],
+    pub start: usize,
+    pub t: usize,
+    pub nh: usize,
+    pub nkv: usize,
+    pub hd: usize,
+    pub sel: Option<&'a [Option<Vec<u32>>]>,
+    /// `[t, nh, hd]`.
+    pub out: &'a mut [f32],
+}
+
+/// The gated delta rule of Gated DeltaNet over `t` tokens in order ([`Backend::gdn_rule`]; the
+/// CPU path is `crate::qwen`'s `DeltaRule::run`).
+pub struct GdnJob<'a> {
+    /// `[t, 2 nk hdk + nv hdv]`: the conv outputs (q, k, v).
+    pub c: &'a [f32],
+    /// `[t, 2 nv]`: per token `b`, then `a`.
+    pub ba: &'a [f32],
+    /// `[nv, hdk, hdv]`, updated.
+    pub state: &'a mut [f32],
+    /// `[t, nv hdv]`: the rule's outputs (before the gated norm).
+    pub out: &'a mut [f32],
+    pub t: usize,
+    pub nk: usize,
+    pub nv: usize,
+    pub hdk: usize,
+    pub hdv: usize,
+    pub tiled: bool,
+    pub decay_coef: &'a [f32],
+    pub dt_bias: &'a [f32],
+}
+
 /// Geometry of a k x k convolution over channels-last input `[h*w, cin]`, zero padded by `pad`
 /// pixels before the first row and column (k/2 for a "same" convolution; the zero padding after
 /// the last row and column is whatever `oh`, `ow` and `stride` reach), producing `[oh*ow, n_out]`;
@@ -134,6 +174,14 @@ pub trait Backend: Send + Sync {
         _causal: bool,
         _out: &mut [f32],
     ) -> bool {
+        false
+    }
+    /// See [`AttnJob`]. False when the backend does not run it (the caller then does).
+    fn attention_cached(&self, _j: &mut AttnJob) -> bool {
+        false
+    }
+    /// See [`GdnJob`]. False (the state untouched) when the backend does not run it.
+    fn gdn_rule(&self, _j: &mut GdnJob) -> bool {
         false
     }
     /// Device state for the routed experts of an MoE layer: expert `e` has the fused gate/up
