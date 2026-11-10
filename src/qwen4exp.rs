@@ -768,10 +768,7 @@ impl<'a> QwenModel<'a> {
         for &(i, emb) in mm {
             x0[i * h..(i + 1) * h].copy_from_slice(emb);
         }
-        let (cos, sin) = match &sess.positions {
-            Some(p) if p.len() >= start + t => self.rope_cs_at(&p[start..start + t]),
-            _ => self.rope_cs(&sess.spans, start, t),
-        };
+        let (cos, sin) = self.exp_rope_at(&sess.spans, &sess.positions, start, t);
         // The n-gram ids of image positions are the image token (as the reference hashes them).
         {
             let es = sess.exp.as_mut().expect("Qwen4-Exp session");
@@ -859,6 +856,21 @@ impl<'a> QwenModel<'a> {
     /// The QSA indexer of full-attention layer `l` for `t` tokens at `start` (block input `hn`):
     /// caches their raw keys and the pooled keys of the blocks they complete, then picks the
     /// positions each token attends to (None for all: every visible block is in the budget).
+    /// RoPE tables of sequence positions `p..p + n`: the explicit positions when set, else the
+    /// M-RoPE positions of the vision spans (plain positions for text).
+    fn exp_rope_at(
+        &self,
+        spans: &[crate::qwen::VisionSpan],
+        positions: &Option<Vec<[usize; 3]>>,
+        p: usize,
+        n: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        match positions {
+            Some(ps) if ps.len() >= p + n => self.rope_cs_at(&ps[p..p + n]),
+            _ => self.rope_cs(spans, p, n),
+        }
+    }
+
     fn qsa_select_all(
         &self,
         ix: &Indexer,
@@ -871,10 +883,7 @@ impl<'a> QwenModel<'a> {
         let QwenSession { exp, spans, positions, .. } = sess;
         let ic = exp.as_mut().unwrap().idx[l].as_mut().expect("indexer cache");
         let (spans, positions) = (&*spans, &*positions);
-        let rope_at = |p: usize, n: usize| match positions {
-            Some(ps) if ps.len() >= p + n => self.rope_cs_at(&ps[p..p + n]),
-            _ => self.rope_cs(spans, p, n),
-        };
+        let rope_at = |p: usize, n: usize| self.exp_rope_at(spans, positions, p, n);
         self.qsa_select(ix, ic, &rope_at, hn, t, start, l)
     }
 
@@ -1425,7 +1434,7 @@ impl<'a> QwenModel<'a> {
         want_logits: bool,
     ) -> Option<(Vec<f32>, Option<Vec<f32>>)> {
         let cfg = &self.cfg;
-        if sess.iv.active() || !sess.spans.is_empty() || sess.positions.is_some() || sess.pos + 1 > QSA_GPU_MAX_POS {
+        if sess.iv.active() || sess.pos + 1 > QSA_GPU_MAX_POS {
             return None;
         }
         let Some(plan) = self.gpu_plan() else {
@@ -1438,7 +1447,7 @@ impl<'a> QwenModel<'a> {
         let mut x = vec![0f32; h];
         self.embed.row(tok as usize, &mut x);
         let pos = sess.pos;
-        let cs = self.exp_rope_rows(pos, 1);
+        let cs = self.exp_rope_rows(sess, pos, 1);
         let es = sess.exp.as_mut()?;
         es.toks.truncate(pos);
         es.toks.push(tok);
@@ -1506,17 +1515,17 @@ impl<'a> QwenModel<'a> {
 
     /// The RoPE rows of a GPU step of `t` tokens at `pos` (see [`Self::exp_gpu_graph`]): per token
     /// cos then sin of its position, then of the first position of the block it ends.
-    fn exp_rope_rows(&self, pos: usize, t: usize) -> Vec<f32> {
+    fn exp_rope_rows(&self, sess: &QwenSession, pos: usize, t: usize) -> Vec<f32> {
         let half = self.inv_freq.len();
         let r = self.cfg.indexer_compress_ratio.max(1);
         let mut cs = Vec::with_capacity(4 * t * half);
         for j in 0..t {
-            let (c, s) = self.rope_cs(&[], pos + j, 1);
+            let (c, s) = self.exp_rope_at(&sess.spans, &sess.positions, pos + j, 1);
             cs.extend_from_slice(&c);
             cs.extend_from_slice(&s);
         }
         for j in 0..t {
-            let (c, s) = self.rope_cs(&[], (pos + j + 1).saturating_sub(r), 1);
+            let (c, s) = self.exp_rope_at(&sess.spans, &sess.positions, (pos + j + 1).saturating_sub(r), 1);
             cs.extend_from_slice(&c);
             cs.extend_from_slice(&s);
         }
@@ -1541,8 +1550,10 @@ impl<'a> QwenModel<'a> {
     /// not pooled yet (it pools only once QSA drops blocks).
     fn exp_gpu_pool(&self, ex: &Exp<'a>, sess: &mut QwenSession, pos: usize) {
         let r = self.cfg.indexer_compress_ratio.max(1);
-        let Some(es) = sess.exp.as_mut() else { return };
-        let rope_at = |p: usize, n: usize| self.rope_cs(&[], p, n);
+        let QwenSession { exp, spans, positions, .. } = sess;
+        let Some(es) = exp.as_mut() else { return };
+        let (spans, positions) = (&*spans, &*positions);
+        let rope_at = |p: usize, n: usize| self.exp_rope_at(spans, positions, p, n);
         for (el, ic) in ex.layers.iter().zip(es.idx.iter_mut()) {
             if let (Some(ix), Some(ic)) = (&el.indexer, ic)
                 && ic.pooled_n < pos / r
@@ -1575,7 +1586,7 @@ impl<'a> QwenModel<'a> {
         let top = cfg.indexer_budget / r;
         let eps = cfg.rms_norm_eps as f32;
         let per = (nh + 1) * d + (top + 1) * r;
-        let (cos, sin) = self.rope_cs(&[], pos, 1);
+        let (cos, sin) = self.exp_rope_at(&sess.spans, &sess.positions, pos, 1);
         let es = sess.exp.as_mut().unwrap();
         let mut ai = 0;
         for (l, (el, ic)) in ex.layers.iter().zip(es.idx.iter_mut()).enumerate() {
@@ -1801,7 +1812,7 @@ impl<'a> QwenModel<'a> {
     pub(crate) fn exp_gpu_pass(&self, ex: &Exp<'a>, sess: &mut QwenSession, tokens: &[u32], fast: bool) -> Option<(Vec<f32>, Vec<f32>)> {
         let cfg = &self.cfg;
         let t = tokens.len();
-        if sess.pos + t > QSA_GPU_MAX_POS || !sess.spans.is_empty() {
+        if sess.pos + t > QSA_GPU_MAX_POS {
             return None;
         }
         let plan = self.gpu_multi_plan_pub(t, fast)?;
@@ -1812,7 +1823,7 @@ impl<'a> QwenModel<'a> {
         for (j, &tok) in tokens.iter().enumerate() {
             self.embed.row(tok as usize, &mut x[j * h..(j + 1) * h]);
         }
-        let cs = self.exp_rope_rows(pos, t);
+        let cs = self.exp_rope_rows(sess, pos, t);
         let x2 = {
             let es = sess.exp.as_mut()?;
             es.toks.truncate(pos);
