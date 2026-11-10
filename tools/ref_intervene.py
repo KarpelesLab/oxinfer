@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Reference for oxinfer's runtime interventions (src/intervene.rs) with PyTorch forward hooks on
 a transformers model (Qwen3.5 / Qwen3 / Llama / Gemma-style `model.layers`, Mistral Large 4's
-`model.language_model.layers`).
+`model.language_model.layers`, DeepSeek V4's hyper-connection streams).
 
 usage: ref_intervene.py MODEL_DIR PROMPT_TEXT_FILE SPEC.json [OURS_LOGITS.bin] [--bf16]
-                        [--generate N] [--ours-ids IDS.json]
+                        [--generate N] [--ours-ids IDS.json] [--block-hooks]
 
 SPEC.json is the same JSON as `oxinfer --interventions` (neurons, steer, ablate, sae). It is
 applied independently of oxinfer's implementation:
@@ -17,8 +17,18 @@ applied independently of oxinfer's implementation:
   output (the residual after attention), `pre` to the input of `layers[L]`;
 - ablation: Arditi et al.: r_hat projected out of every layer's input (pre-hook) and of every
   attention and MLP block's output;
-- SAE features (Qwen-Scope layerN.sae.pt, topk(relu(x W_enc^T + b_enc)) or SAELens): on the output
-  of layers[L], x += (a' - a) W_dec[f] (error term kept).
+- SAE features (Qwen-Scope layerN.sae.pt, topk(relu(x W_enc^T + b_enc)), or a SAELens directory
+  with a ReLU / JumpReLU SAE): on the output of layers[L], x += (a' - a) W_dec[f] (error term kept).
+DeepSeek V4: the residual stream is `[batch, tokens, hc_mult, hidden]` (the hyper-connection
+copies) and "the residual" is the mean of the copies. `pre` / `post` are the input / output of
+`layers[L]`, `mid` the stream between the two halves of the layer (the input of `ffn_hc`, edited
+in place: the layer mixes that same tensor back in). Steering adds to every copy, ablation
+projects every copy, an SAE encodes the mean and its change is added to every copy; the
+calibration is the median norm of the mean. Neurons: the shared expert's `down_proj` input and
+each routed expert's (the experts' loop with the clamped SwiGLU, edited). `--block-hooks` puts
+the ablation on Arditi's sites instead (the layer's input, the attention's and the MoE's outputs
+before the hyper-connections spread them), which must give the same logits: copies free of r
+stay free of it under the mixing.
 Positions: `generated` = positions >= len(prompt) - 1, `prompt` = the others.
 Prints the logits difference with OURS_LOGITS.bin (last prompt position), and with --generate the
 greedy continuation under the same hooks (compared with --ours-ids, a JSON list, when given).
@@ -44,6 +54,17 @@ def load_vectors(path, n_layers):
 
 def load_sae(path):
     import os
+    if os.path.isdir(path):
+        # SAELens: W_enc [d_in, d_sae], W_dec [d_sae, d_in]; ReLU or JumpReLU (threshold).
+        from safetensors.torch import load_file
+        cfg = json.load(open(os.path.join(path, "cfg.json")))
+        sd = load_file(os.path.join(path, "sae_weights.safetensors"))
+        arch = cfg.get("architecture", "standard")
+        if arch not in ("standard", "jumprelu") or cfg.get("apply_b_dec_to_input"):
+            raise SystemExit("SAELens in the reference: standard or jumprelu, no apply_b_dec_to_input")
+        return dict(W_enc=sd["W_enc"].float().T.contiguous(), b_enc=sd["b_enc"].float(), W_dec=sd["W_dec"].float(),
+                    b_dec=sd["b_dec"].float(), k=None, threshold=sd["threshold"].float() if arch == "jumprelu" else None,
+                    layer=int(cfg["hook_name"].split(".")[1]))
     if path.endswith(".pt"):
         sd = torch.load(path, map_location="cpu", weights_only=True)
         cfg = json.load(open(os.path.join(os.path.dirname(path), "config.json")))
@@ -56,6 +77,9 @@ def load_sae(path):
 
 def sae_encode(s, x):
     pre = x @ s["W_enc"].T + s["b_enc"]
+    if s.get("k") is None:
+        th = s.get("threshold")
+        return torch.relu(pre) if th is None else torch.where(pre > th, pre, torch.zeros_like(pre))
     r = torch.relu(pre)
     v, i = torch.topk(r, s["k"], dim=-1)
     a = torch.zeros_like(r)
@@ -105,11 +129,29 @@ def main():
     def cur_t(x):
         return x.shape[1]
 
+    # DeepSeek V4: the residual is [batch, tokens, hc_mult, hidden] (see the docstring).
+    copies = hasattr(layers[0], "attn_hc")
+    block_hooks = "--block-hooks" in sys.argv
+
+    def mask_for(x, ps):
+        m = pos_mask(ps, x.shape[1], x.device).to(x.dtype)
+        return m.view(1, -1, *([1] * (x.dim() - 2)))
+
     # Calibration (unedited model, numpy median over positions 1..).
     med = None
     if any(n.get("unit") == "resid_median" and "resid_median" not in n for n in spec.get("neurons", [])):
-        with torch.no_grad():
-            hs = model(input_ids=ids, output_hidden_states=True).hidden_states
+        if copies:
+            outs = {}
+            hk = [layers[l].register_forward_hook(lambda m, i, o, l=l: outs.__setitem__(l, o.mean(dim=2)))
+                  for l in range(nl)]
+            with torch.no_grad():
+                model(input_ids=ids)
+            for k in hk:
+                k.remove()
+            hs = [None] + [outs[l] for l in range(nl)]
+        else:
+            with torch.no_grad():
+                hs = model(input_ids=ids, output_hidden_states=True).hidden_states
         med = [float(np.median(hs[l + 1][0, 1:].float().norm(dim=-1).numpy())) for l in range(nl)]
         print("calibration medians:", {n["layer"]: round(med[n["layer"]], 4) for n in spec["neurons"]})
 
@@ -182,8 +224,12 @@ def main():
                 if tok_idx.numel() == 0:
                     continue
                 cur = hidden_states[tok_idx]
-                gate, up = torch.nn.functional.linear(cur, exm.gate_up_proj[e]).chunk(2, dim=-1)
-                act = exm.act_fn(gate) * up
+                gu = torch.nn.functional.linear(cur, exm.gate_up_proj[e])
+                if hasattr(exm, "_apply_gate"):
+                    act = exm._apply_gate(gu)  # DeepSeek V4: the clamped SwiGLU
+                else:
+                    gate, up = gu.chunk(2, dim=-1)
+                    act = exm.act_fn(gate) * up
                 if e in per:
                     p = pos[tok_idx]
 
@@ -223,6 +269,17 @@ def main():
             return args, kwargs
         return mod.register_forward_pre_hook(hook, with_kwargs=True)
 
+    def edit_input(mod, fn):
+        # The tensor itself (its other readers see the edit too).
+        def hook(m, args):
+            args[0].copy_(fn(args[0]))
+        return mod.register_forward_pre_hook(hook)
+
+    def at_mid(layer, fn):
+        if copies:
+            return edit_input(layer.ffn_hc, fn)
+        return add_to_output(attn_mod(layer), fn)
+
     # Steering.
     for s in spec.get("steer", []):
         if "vector" in s:
@@ -242,13 +299,12 @@ def main():
             ps = s.get("positions")
 
             def fn(x, v=v, ps=ps):
-                m = pos_mask(ps, x.shape[1], x.device).to(x.dtype)[None, :, None]
-                return x + m * v.to(x.dtype)
+                return x + mask_for(x, ps) * v.to(x.dtype)
             point = s.get("point", "post")
             if point == "post":
                 hooks.append(add_to_output(layers[L], fn))
             elif point == "mid":
-                hooks.append(add_to_output(attn_mod(layers[L]), fn))
+                hooks.append(at_mid(layers[L], fn))
             else:
                 hooks.append(add_to_input(layers[L], fn))
 
@@ -264,11 +320,14 @@ def main():
         ps = a.get("positions")
 
         def proj(x, r=r, ps=ps):
-            m = pos_mask(ps, x.shape[1], x.device).to(x.dtype)[None, :, None]
             rr = r.to(x.dtype)
-            return x - m * (x @ rr)[..., None] * rr
+            return x - mask_for(x, ps) * (x @ rr)[..., None] * rr
         for L in a.get("layers") or range(nl):
             hooks.append(add_to_input(layers[L], proj))
+            if copies and not block_hooks:
+                hooks.append(at_mid(layers[L], proj))
+                hooks.append(add_to_output(layers[L], proj))
+                continue
             hooks.append(add_to_output(attn_mod(layers[L]), proj))
             hooks.append(add_to_output(layers[L] if gemma else layers[L].mlp, proj))
 
@@ -280,7 +339,9 @@ def main():
         ps = s.get("positions")
 
         def fn(x, sae=sae, feats=feats, ps=ps):
-            xf = x.float()
+            # Several copies: the SAE reads their mean, and its change goes to each of them.
+            x4 = x if x.dim() == 4 else None
+            xf = (x.mean(dim=2) if x4 is not None else x).float()
             a = sae_encode(sae, xf)
             delta = torch.zeros_like(xf)
             for f in feats:
@@ -296,6 +357,8 @@ def main():
                     d = f["value"] - cur
                 delta += d[..., None] * sae["W_dec"][f["id"]]
             m = pos_mask(ps, x.shape[1], x.device).to(xf.dtype)[None, :, None]
+            if x4 is not None:
+                return x4 + (m * delta).unsqueeze(2).to(x.dtype)
             return (xf + m * delta).to(x.dtype)
         hooks.append(add_to_output(layers[L], fn))
 

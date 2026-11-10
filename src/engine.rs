@@ -2191,7 +2191,8 @@ impl Engine {
             Lm::Mistral4Dspark { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
             Lm::QwenDspark { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
             Lm::GemmaDspark { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
-            Lm::DeepSeek4 { .. } | Lm::DeepSeek4Dspark { .. } => bail!("activation capture is not supported for DeepSeek V4"),
+            Lm::DeepSeek4 { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
+            Lm::DeepSeek4Dspark { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("activation capture is not supported for Core ML models"),
         }
@@ -2222,7 +2223,8 @@ impl Engine {
             Lm::Mistral4Dspark { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
             Lm::QwenDspark { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
             Lm::GemmaDspark { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
-            Lm::DeepSeek4 { .. } | Lm::DeepSeek4Dspark { .. } => bail!("interventions are not supported for DeepSeek V4"),
+            Lm::DeepSeek4 { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
+            Lm::DeepSeek4Dspark { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
         }
@@ -2244,7 +2246,8 @@ impl Engine {
             Lm::Mistral4Dspark { dec } => dec.model(),
             Lm::QwenDspark { dec } => dec.model(),
             Lm::GemmaDspark { dec } => dec.model(),
-            Lm::DeepSeek4 { .. } | Lm::DeepSeek4Dspark { .. } => bail!("interventions are not supported for DeepSeek V4"),
+            Lm::DeepSeek4 { model, .. } => *model,
+            Lm::DeepSeek4Dspark { dec } => dec.model(),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
         };
@@ -2261,7 +2264,8 @@ impl Engine {
             Lm::Mistral4Dspark { dec } => &mut dec.sess.iv,
             Lm::QwenDspark { dec } => &mut dec.sess.iv,
             Lm::GemmaDspark { dec } => &mut dec.sess.iv,
-            Lm::DeepSeek4 { .. } | Lm::DeepSeek4Dspark { .. } => return,
+            Lm::DeepSeek4 { sess, .. } => &mut sess.iv,
+            Lm::DeepSeek4Dspark { dec } => &mut dec.sess.iv,
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => return,
         };
@@ -2842,6 +2846,7 @@ impl PendingTurn {
                 }
             }
             Lm::DeepSeek4Dspark { dec } => {
+                dec.sess.iv.gen_from = dec.sess.pos + ids.len() - 1;
                 let logits = dec.prefill_mm(&ids, chunk, &overrides);
                 st.prefill_secs = t0.elapsed().as_secs_f64();
                 let max = limit(dec.sess.pos);

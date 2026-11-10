@@ -34,8 +34,22 @@
 //! ...; float tensors; the experts are renamed `gate_proj` / `down_proj` / `up_proj` on open,
 //! [`native_name`]) and llama.cpp GGUF files (`deepseek4`, named onto the same by [`gguf_name`]).
 //! The model's DSpark draft is in [`crate::dspark`].
+//!
+//! Runtime interventions ([`crate::intervene`]). The residual stream is the `hc_mult` copies, and
+//! "the residual" at a point is their mean (what a DSpark draft reads too): residual point `2l`
+//! is the stream entering layer `l` (`Block.forward`'s input; point 0: the embedding, repeated),
+//! `2l + 1` the stream after the attention's `hc_post`, `2l + 2` the layer's output (after the
+//! MoE's `hc_post`). Hooks go through [`crate::intervene::State::point_copies`]: reads (capture,
+//! calibration, SAE encoding) see the mean, edits write to every copy so that the mean changes
+//! as a single stream would (steering adds to each copy, ablation projects each copy, SAE
+//! feature changes computed on the mean are added to each copy). Neurons are the input of `w2`
+//! (`down_proj`) of the shared expert and of each routed expert, `silu(min(gate, limit)) *
+//! clamp(up, -limit, limit)`, before the routing weight (the reference multiplies it in before
+//! `w2`; `w2` has no bias, so that is the same edit of an activation scaled afterwards). Every
+//! layer is a MoE: there is no dense MLP.
 
 use crate::config::DeepSeek4Config;
+use crate::intervene::{NeuronHook, Target};
 use crate::kernels::*;
 use crate::model::{Lin, Quant, Table, linear, linear_multi, load_lin, table_quant};
 use crate::moe::{Act, Experts, NeedExperts};
@@ -302,6 +316,8 @@ pub struct DeepSeek4Session {
     hd: usize,
     window: usize,
     pub pos: usize,
+    /// Runtime interventions ([`crate::intervene`]).
+    pub iv: crate::intervene::State,
 }
 
 impl DeepSeek4Session {
@@ -756,6 +772,7 @@ impl<'a> DeepSeek4Model<'a> {
             hd: c.head_dim,
             window: c.sliding_window,
             pos: 0,
+            iv: Default::default(),
         }
     }
 
@@ -891,6 +908,14 @@ impl<'a> DeepSeek4Model<'a> {
         let nf = layers.len();
         feats.clear();
         feats.resize(t * nf * h, 0.0);
+        // Interventions: residual points on the copies (see the module docs).
+        let iv = sess.iv.active().then(|| sess.iv.clone());
+        let point = |p: usize, x: &mut [f32]| {
+            if let Some(iv) = &iv {
+                iv.point_copies(p, x, h, n, start);
+            }
+        };
+        point(0, &mut x);
         let mut capture = |l: usize, x: &[f32]| {
             for (k, _) in layers.iter().enumerate().filter(|e| *e.1 == l) {
                 for ti in 0..t {
@@ -907,6 +932,7 @@ impl<'a> DeepSeek4Model<'a> {
             let mut o = vec![0f32; t * h];
             self.attn_forward(l, layer, &xa, t, start, &mut sess.layers[l], (&rope.0, &rope.1), &mut o);
             hc_post(c, &mut x, &o, &post, &comb, t);
+            point(2 * l + 1, &mut x);
             let (xf, post, comb) = hc_pre(c, &layer.hc_ffn, &layer.ffn_norm, &x, t);
             o.fill(0.0);
             let need = |ids: &[usize]| {
@@ -915,8 +941,10 @@ impl<'a> DeepSeek4Model<'a> {
                 }
             };
             let need: NeedExperts = self.stream.as_ref().map(|_| &need as &dyn Fn(&[usize]));
-            self.moe_forward(&layer.moe, &xf, tokens, t, &mut o, need);
+            let hook = iv.as_ref().and_then(|s| s.hook(l, start));
+            self.moe_forward(&layer.moe, &xf, tokens, t, &mut o, need, hook.as_ref());
             hc_post(c, &mut x, &o, &post, &comb, t);
+            point(2 * l + 2, &mut x);
         }
         capture(self.layers.len(), &x);
         let mut out = hc_head(c, &self.hc_head, &x, t);
@@ -927,9 +955,19 @@ impl<'a> DeepSeek4Model<'a> {
     }
 
     /// Routes each token and runs the routed and shared experts of `m` over `x` (`[t, H]`) into
-    /// `y`.
-    pub(crate) fn moe_forward(&self, m: &Moe, x: &[f32], tokens: &[u32], t: usize, y: &mut [f32], need: NeedExperts) {
-        moe_forward(&self.cfg, m, x, tokens, t, y, need)
+    /// `y` (`hook`: neuron edits).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn moe_forward(
+        &self,
+        m: &Moe,
+        x: &[f32],
+        tokens: &[u32],
+        t: usize,
+        y: &mut [f32],
+        need: NeedExperts,
+        hook: Option<&NeuronHook>,
+    ) {
+        moe_forward(&self.cfg, m, x, tokens, t, y, need, hook)
     }
 
     /// One layer's attention over `xa` (`[t, H]`, the normed block input) into `out`.
@@ -1367,8 +1405,19 @@ fn route(c: &DeepSeek4Config, m: &Moe, logits: &[f32], token: u32) -> Vec<(usize
     idx.into_iter().zip(w).map(|(i, v)| (i, v * rs)).collect()
 }
 
-/// The MoE block of the target or of a DSpark stage.
-pub(crate) fn moe_forward(c: &DeepSeek4Config, m: &Moe, x: &[f32], tokens: &[u32], t: usize, y: &mut [f32], need: NeedExperts) {
+/// The MoE block of the target or of a DSpark stage (`hook`: neuron edits of the shared expert
+/// and of the routed ones, on the input of their down projection).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn moe_forward(
+    c: &DeepSeek4Config,
+    m: &Moe,
+    x: &[f32],
+    tokens: &[u32],
+    t: usize,
+    y: &mut [f32],
+    need: NeedExperts,
+    hook: Option<&NeuronHook>,
+) {
     let h = c.hidden_size;
     let s = &m.shared;
     let shared = crate::moe::Shared {
@@ -1377,7 +1426,7 @@ pub(crate) fn moe_forward(c: &DeepSeek4Config, m: &Moe, x: &[f32], tokens: &[u32
         down: &s.down,
         inter: s.inter,
         act: if s.limit > 0.0 { Act::SiluClamp(s.limit) } else { Act::Silu },
-        hook: None,
+        hook: hook.filter(|k| k.edits(Target::Shared)),
         scale: None,
     };
     let ne = m.experts.n_experts();
@@ -1388,7 +1437,7 @@ pub(crate) fn moe_forward(c: &DeepSeek4Config, m: &Moe, x: &[f32], tokens: &[u32
         }
     });
     let routes: Vec<_> = logits.chunks(ne).zip(tokens).map(|(lg, &tk)| route(c, m, lg, tk)).collect();
-    m.experts.forward(x, t, h, &routes, y, need, None, Some(&shared));
+    m.experts.forward(x, t, h, &routes, y, need, hook, Some(&shared));
 }
 
 /// The DSpark draft of DeepSeek V4 (the `mtp.*` stages of deepseek-ai/DeepSeek-V4-Flash-DSpark;
@@ -1503,7 +1552,7 @@ impl<'a> Ds4Draft<'a> {
             hc_post(c, &mut x, &o, &post, &comb, nb);
             let (xf, post, comb) = hc_pre(c, &layer.hc_ffn, &layer.ffn_norm, &x, nb);
             o.fill(0.0);
-            moe_forward(c, &layer.moe, &xf, &tokens, nb, &mut o, None);
+            moe_forward(c, &layer.moe, &xf, &tokens, nb, &mut o, None, None);
             hc_post(c, &mut x, &o, &post, &comb, nb);
         }
         let mut out = hc_head(c, &self.hc_head, &x, nb);
@@ -1600,6 +1649,9 @@ impl crate::generate::TextLm for DeepSeek4Model<'_> {
     fn n_layers(&self) -> usize {
         self.cfg.num_hidden_layers
     }
+    fn iv_state<'s>(&self, sess: &'s mut DeepSeek4Session) -> Option<&'s mut crate::intervene::State> {
+        Some(&mut sess.iv)
+    }
     fn session_len(&self, sess: &DeepSeek4Session) -> usize {
         sess.pos
     }
@@ -1614,8 +1666,10 @@ impl crate::generate::TextLm for DeepSeek4Model<'_> {
     }
 }
 
-/// No runtime interventions for this family (its residual is several streams): no MLP neurons
-/// to edit, and the session has no intervention state ([`crate::generate::TextLm::iv_state`]).
+/// Runtime interventions (`crate::intervene`): the residual points around every layer on the
+/// hyper-connection copies (see the module docs), and as neurons the input of `down_proj` (`w2`)
+/// of each layer's shared expert (`Target::Shared`) and routed experts (`Target::Expert`, before
+/// the routing weight). No layer has a dense MLP.
 impl crate::intervene::Host for DeepSeek4Model<'_> {
     fn n_layers(&self) -> usize {
         self.cfg.num_hidden_layers
@@ -1623,11 +1677,31 @@ impl crate::intervene::Host for DeepSeek4Model<'_> {
     fn hidden(&self) -> usize {
         self.cfg.hidden_size
     }
-    fn mlp_inter(&self, _layer: usize, _target: crate::intervene::Target) -> Option<usize> {
-        None
+    fn mlp_inter(&self, layer: usize, target: Target) -> Option<usize> {
+        let m = &self.layers.get(layer)?.moe;
+        match target {
+            Target::Mlp => None,
+            Target::Shared => Some(m.shared.inter),
+            Target::Expert(e) => (e < m.experts.n_experts()).then_some(m.experts.inter),
+        }
     }
-    fn down_column(&self, _layer: usize, _target: crate::intervene::Target, _n: usize) -> Vec<f32> {
-        Vec::new()
+    fn down_column(&self, layer: usize, target: Target, n: usize) -> Vec<f32> {
+        let m = &self.layers[layer].moe;
+        let (down, inter) = match target {
+            Target::Expert(e) => (&m.experts.down[e], m.experts.inter),
+            Target::Shared | Target::Mlp => (&m.shared.down, m.shared.inter),
+        };
+        let mut one = vec![0f32; inter];
+        one[n] = 1.0;
+        let h = self.cfg.hidden_size;
+        let mut y = vec![0f32; h];
+        // A streamed checkpoint reads the layer (and the routed expert) as a pass would.
+        let _unit = crate::stream::enter(&self.stream, layer);
+        if let (Some(s), Target::Expert(e)) = (&self.stream, target) {
+            s.need_parts(layer, &[e]);
+        }
+        linear(down, h, inter, &one, 1, &mut y);
+        y
     }
 }
 
@@ -1681,6 +1755,287 @@ mod tests {
             Some("layers.2.attn.indexer.wq_b.weight")
         );
         assert_eq!(gguf_name("output_hc_fn.weight", &[16384, 4]).map(|x| x.1), Some(vec![4, 16384]));
+    }
+
+    /// A deterministic uniform generator in [-1, 1).
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+        }
+    }
+
+    /// Writes a tiny random checkpoint in DeepSeek's naming (float32) with a hash layer, a CSA
+    /// layer whose indexer chooses, a heavily compressed layer and a window-only one; returns its
+    /// config.
+    fn tiny_checkpoint(dir: &std::path::Path) -> DeepSeek4Config {
+        let ratios = [0usize, 4, 8, 0];
+        let c = DeepSeek4Config::from_json(serde_json::json!({
+            "hidden_size": 16, "num_hidden_layers": ratios.len(), "num_attention_heads": 2, "head_dim": 8,
+            "qk_rope_head_dim": 4, "q_lora_rank": 8, "o_groups": 2, "o_lora_rank": 4, "vocab_size": 32,
+            "n_routed_experts": 4, "n_shared_experts": 1, "num_experts_per_tok": 2, "moe_intermediate_size": 8,
+            "routed_scaling_factor": 1.5, "swiglu_limit": 1.5, "num_hash_layers": 1, "sliding_window": 4,
+            "compress_ratios": ratios, "index_n_heads": 2, "index_head_dim": 8, "index_topk": 2
+        }))
+        .unwrap();
+        let (h, nh, hd, ql) = (c.hidden_size, c.num_attention_heads, c.head_dim, c.q_lora_rank);
+        let (g, r, hc) = (c.o_groups, c.o_lora_rank, c.hc_mult);
+        let (ne, k, mi, v) = (c.n_routed_experts, c.num_experts_per_tok, c.moe_intermediate_size, c.vocab_size);
+        let (ni, di) = (c.index_n_heads, c.index_head_dim);
+        let mut rng = Rng(0x5eed);
+        let mut tensors: Vec<(String, &'static str, Vec<usize>, Vec<u8>)> = Vec::new();
+        // `scale` times uniform noise, plus `bias`.
+        let mut add = |name: String, shape: &[usize], scale: f32, bias: f32| {
+            let n: usize = shape.iter().product();
+            let bytes = (0..n).flat_map(|_| (bias + scale * rng.next()).to_le_bytes()).collect();
+            tensors.push((name, "F32", shape.to_vec(), bytes));
+        };
+        let mat = |fan_in: usize, gain: f32| gain * (3.0 / fan_in as f32).sqrt();
+        add("embed.weight".into(), &[v, h], 1.7, 0.0);
+        add("head.weight".into(), &[v, h], mat(h, 4.0), 0.0);
+        add("norm.weight".into(), &[h], 0.2, 1.0);
+        add("hc_head_fn".into(), &[hc, hc * h], mat(hc * h, 4.0), 0.0);
+        add("hc_head_base".into(), &[hc], 0.5, 0.0);
+        add("hc_head_scale".into(), &[1], 0.25, 0.75);
+        for (l, &ratio) in ratios.iter().enumerate() {
+            let p = format!("layers.{l}.");
+            let mix = (2 + hc) * hc;
+            for part in ["attn", "ffn"] {
+                add(format!("{p}{part}_norm.weight"), &[h], 0.2, 1.0);
+                add(format!("{p}hc_{part}_fn"), &[mix, hc * h], mat(hc * h, 4.0), 0.0);
+                add(format!("{p}hc_{part}_base"), &[mix], 0.5, 0.0);
+                add(format!("{p}hc_{part}_scale"), &[3], 0.25, 0.75);
+            }
+            add(format!("{p}attn.wq_a.weight"), &[ql, h], mat(h, 2.0), 0.0);
+            add(format!("{p}attn.q_norm.weight"), &[ql], 0.2, 1.0);
+            add(format!("{p}attn.wq_b.weight"), &[nh * hd, ql], mat(ql, 2.0), 0.0);
+            add(format!("{p}attn.wkv.weight"), &[hd, h], mat(h, 2.0), 0.0);
+            add(format!("{p}attn.kv_norm.weight"), &[hd], 0.2, 1.0);
+            add(format!("{p}attn.wo_a.weight"), &[g * r, nh * hd / g], mat(nh * hd / g, 1.0), 0.0);
+            add(format!("{p}attn.wo_b.weight"), &[h, g * r], mat(g * r, 1.0), 0.0);
+            add(format!("{p}attn.attn_sink"), &[nh], 1.0, 0.0);
+            let mut compressor = |p: String, d: usize| {
+                let w = if ratio == 4 { 2 * d } else { d };
+                add(format!("{p}wkv.weight"), &[w, h], mat(h, 1.0), 0.0);
+                add(format!("{p}wgate.weight"), &[w, h], mat(h, 3.0), 0.0);
+                add(format!("{p}ape"), &[ratio, w], 0.5, 0.0);
+                add(format!("{p}norm.weight"), &[d], 0.2, 1.0);
+            };
+            if ratio > 0 {
+                compressor(format!("{p}attn.compressor."), hd);
+            }
+            if ratio == 4 {
+                compressor(format!("{p}attn.indexer.compressor."), di);
+                add(format!("{p}attn.indexer.wq_b.weight"), &[ni * di, ql], mat(ql, 2.0), 0.0);
+                add(format!("{p}attn.indexer.weights_proj.weight"), &[ni, h], mat(h, 1.0), 0.0);
+            }
+            add(format!("{p}ffn.gate.weight"), &[ne, h], mat(h, 3.0), 0.0);
+            if l >= c.num_hash_layers {
+                add(format!("{p}ffn.gate.bias"), &[ne], 0.3, 0.0);
+            }
+            for e in (0..ne).map(|e| format!("experts.{e}")).chain(["shared_experts".to_string()]) {
+                add(format!("{p}ffn.{e}.w1.weight"), &[mi, h], mat(h, 2.0), 0.0);
+                add(format!("{p}ffn.{e}.w3.weight"), &[mi, h], mat(h, 2.0), 0.0);
+                add(format!("{p}ffn.{e}.w2.weight"), &[h, mi], mat(mi, 1.0), 0.0);
+            }
+        }
+        // The hash layer's experts of each token id (distinct).
+        let tab: Vec<u8> = (0..v)
+            .flat_map(|t| (0..k).map(move |j| ((t * 3 + j * (1 + t % (ne - 1))) % ne) as i32))
+            .flat_map(|e| e.to_le_bytes())
+            .collect();
+        tensors.push(("layers.0.ffn.gate.tid2eid".into(), "I32", vec![v, k], tab));
+        let mut head = serde_json::Map::new();
+        let mut data = Vec::new();
+        for (name, dtype, shape, bytes) in tensors {
+            let entry = serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [data.len(), data.len() + bytes.len()]});
+            head.insert(name, entry);
+            data.extend(bytes);
+        }
+        let mut head = serde_json::Value::Object(head).to_string();
+        while !head.len().is_multiple_of(8) {
+            head.push(' ');
+        }
+        let mut file = (head.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(head.as_bytes());
+        file.extend(data);
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("model.safetensors"), file).unwrap();
+        c
+    }
+
+    /// Runtime interventions on a tiny random model, without a reference: every kind of hook
+    /// changes the logits, a neutral spec does not, the result does not depend on how the tokens
+    /// are split into passes (prefill, short passes and one-token decode steps take different
+    /// expert paths), an ablated direction is absent from the residual, and the calibration reads
+    /// the mean of the hyper-connection copies. (Agreement with PyTorch hooks is measured by
+    /// tools/ref_intervene.py, see the README.)
+    #[test]
+    fn interventions_on_a_tiny_model() {
+        use crate::intervene::{self, Ablate, Compiled, Ctx, ExpertRef, NeuronEdit, NeuronOp, Point, Positions, Spec, Steer};
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("oxinfer-ds4-iv-test-{}", std::process::id()));
+        let cfg = tiny_checkpoint(&dir);
+        let files = ModelFiles::open(&dir, true).unwrap();
+        let m = DeepSeek4Model::load(cfg, &files, Quant::Bf16).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let (h, nl, v) = (m.cfg.hidden_size, m.cfg.num_hidden_layers, m.cfg.vocab_size);
+        let ids: Vec<u32> = (0..40).map(|i| (i * 7 + 3) % v as u32).collect();
+        let more = [5u32, 17, 2];
+        let resolve = |s: &str| -> Result<std::path::PathBuf> { Ok(s.into()) };
+        let compile = |spec: &Spec| {
+            let ctx = Ctx {
+                resolve: &resolve,
+                calibration: None,
+                saes: None,
+            };
+            Arc::new(Compiled::new(spec, &m, &ctx).unwrap())
+        };
+        // The logits after the prompt (in passes of `chunk`) and after each of `more`.
+        let run = |iv: Option<Arc<Compiled>>, chunk: usize| -> Vec<f32> {
+            let mut sess = m.new_session();
+            sess.iv.iv = iv;
+            let hs = crate::generate::prefill(&m, &mut sess, &ids, chunk, &[]);
+            let mut out = m.logits(&hs[hs.len() - h..], 1);
+            for &t in &more {
+                out.extend(m.forward(&mut sess, &[t]));
+            }
+            out
+        };
+        let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let vecf = |seed: usize| -> Vec<f32> { (0..h).map(|i| ((i * 5 + seed * 3) % 7) as f32 - 3.0).collect() };
+        let neuron = |layer: usize, neuron: usize, expert: Option<usize>, op: NeuronOp, value: f32, positions: Positions| NeuronEdit {
+            layer,
+            neuron,
+            expert: Some(expert.map_or(ExpertRef::Name("shared".into()), ExpertRef::Id)),
+            op: Some(op),
+            value: Some(value),
+            positions,
+            ..Default::default()
+        };
+        let mut neurons = vec![
+            neuron(0, 1, None, NeuronOp::Add, 1.5, Positions::All),
+            neuron(2, 3, None, NeuronOp::Scale, -2.0, Positions::Generated),
+        ];
+        // A neuron of every routed expert of a hash layer and of a scored one: whatever the routes.
+        for e in 0..m.cfg.n_routed_experts {
+            neurons.push(neuron(0, 2, Some(e), NeuronOp::Add, 0.8, Positions::All));
+            neurons.push(neuron(3, 5, Some(e), NeuronOp::Set, 0.6, Positions::Prompt));
+            neurons.push(neuron(1, 4, Some(e), NeuronOp::Scale, 3.0, Positions::Generated));
+        }
+        let steer = |layer: usize, point: Point, positions: Positions, alpha: f32| Steer {
+            vector: Some(vecf(layer)),
+            layer: Some(layer),
+            alpha,
+            point,
+            positions,
+            ..Default::default()
+        };
+        let steers = vec![
+            steer(0, Point::Pre, Positions::All, 0.3),
+            steer(1, Point::Mid, Positions::Generated, 0.5),
+            steer(2, Point::Post, Positions::Prompt, -0.4),
+        ];
+        let r = vecf(11);
+        let ablate = vec![Ablate {
+            vector: Some(r.clone()),
+            ..Default::default()
+        }];
+        let only_neurons = Spec {
+            neurons: neurons.clone(),
+            ..Default::default()
+        };
+        let only_steer = Spec {
+            steer: steers.clone(),
+            ..Default::default()
+        };
+        let only_ablate = Spec {
+            ablate: ablate.clone(),
+            ..Default::default()
+        };
+        let all = Spec {
+            neurons,
+            steer: steers,
+            ablate,
+            ..Default::default()
+        };
+
+        let base = run(None, 40);
+        let scale = base.iter().fold(0f32, |a, b| a.max(b.abs()));
+        let tol = 1e-3 * scale;
+        // A neutral spec (hooks installed, nothing changed) gives the plain logits.
+        let neutral = Spec {
+            neurons: vec![
+                neuron(1, 0, None, NeuronOp::Scale, 1.0, Positions::All),
+                neuron(1, 0, Some(2), NeuronOp::Scale, 1.0, Positions::All),
+            ],
+            steer: vec![steer(2, Point::Mid, Positions::All, 0.0)],
+            ..Default::default()
+        };
+        let d = diff(&run(Some(compile(&neutral)), 40), &base);
+        assert!(d <= tol, "neutral spec moved the logits by {d}");
+        // Every kind of hook does something, and the same thing however the passes are cut.
+        for (what, spec) in [
+            ("neurons", &only_neurons),
+            ("steer", &only_steer),
+            ("ablate", &only_ablate),
+            ("all", &all),
+        ] {
+            let whole = run(Some(compile(spec)), 40);
+            assert!(whole.iter().all(|x| x.is_finite()));
+            let moved = diff(&whole, &base);
+            assert!(moved > 50.0 * tol, "{what}: the logits moved by {moved} only");
+            for chunk in [7, 1] {
+                let d = diff(&run(Some(compile(spec)), chunk), &whole);
+                assert!(
+                    d <= tol,
+                    "{what}: passes of {chunk} differ from one pass by {d} (logits up to {scale})"
+                );
+            }
+        }
+        // The ablated direction is absent from the residual (the mean of the copies, as a DSpark
+        // draft reads it) entering every layer and leaving the last.
+        let layers: Vec<usize> = (0..=nl).collect();
+        let feats_of = |iv: Option<Arc<Compiled>>| {
+            let mut sess = m.new_session();
+            sess.iv.iv = iv;
+            let mut feats = Vec::new();
+            m.forward_capture(&mut sess, &ids, &layers, &mut feats);
+            feats
+        };
+        let rn = dot(&r, &r).sqrt();
+        let along = |f: &[f32]| f.chunks(h).map(|x| (dot(x, &r) / rn).abs()).fold(0f32, f32::max);
+        let plain = feats_of(None);
+        let ablated = feats_of(Some(compile(&only_ablate)));
+        assert!(
+            along(&plain) > 0.1 && along(&ablated) < 1e-4,
+            "{} {}",
+            along(&plain),
+            along(&ablated)
+        );
+        // Calibration (the `resid_median` unit) and capture read that same residual.
+        let cal = intervene::calibrate(&m, &ids, 16).unwrap();
+        for l in 0..nl {
+            let norms: Vec<f32> = (1..ids.len())
+                .map(|t| {
+                    let x = &plain[(t * (nl + 1) + l + 1) * h..(t * (nl + 1) + l + 2) * h];
+                    dot(x, x).sqrt()
+                })
+                .collect();
+            let want = intervene::median(&norms);
+            assert!(
+                (cal.resid_median[l] - want).abs() <= 1e-3 * want,
+                "layer {l}: {} vs {want}",
+                cal.resid_median[l]
+            );
+        }
+        let cap = intervene::capture_layers(&m, std::slice::from_ref(&ids), intervene::Pool::Last, 16).unwrap();
+        let t = ids.len() - 1;
+        for l in 0..nl {
+            let x = &plain[(t * (nl + 1) + l + 1) * h..(t * (nl + 1) + l + 2) * h];
+            assert!(diff(&cap[0][&l], x) <= 1e-3 * dot(x, x).sqrt(), "layer {l}");
+        }
     }
 
     /// The Sinkhorn mixing matrix is (nearly) doubly stochastic.

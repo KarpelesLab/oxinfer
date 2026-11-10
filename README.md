@@ -763,7 +763,15 @@ FP4 experts yet): use a GGUF. The chat format is DeepSeek's `encoding_dsv4.py` (
 prompts, checked with tools and in both modes): `<｜begin▁of▁sentence｜>` and the system prompt,
 `<｜User｜>...<｜Assistant｜>` then `</think>` (chat) or `<think>` (`--think`, the reasoning shown
 dimmed), DSML tool calls (`<｜DSML｜tool_calls>` blocks, `--tools`) with results returned as
-`<tool_result>` blocks of a user turn. Runtime interventions are not supported for this family.
+`<tool_result>` blocks of a user turn.
+
+[Runtime interventions](#runtime-interventions-neuron-edits-steering-abliteration-sae-features)
+work on this family: neuron edits of the shared and routed experts, steering, ablation, SAE
+features, capture and `--make-direction`. The residual stream is the 4 hyper-connection copies,
+and "the residual at layer N" is defined as their mean (what the DSpark draft reads too): hooks
+read the mean and write to every copy. That section gives the exact hook points and the
+agreement with PyTorch hooks, measured on the tiny random checkpoint (the real model was not
+run with interventions).
 
 ```sh
 # unsloth's 97 GB UD-Q2_K_XL on a 128 GB Mac (streamed: more than 60% of RAM)
@@ -1593,7 +1601,7 @@ the library (`Engine::set_interventions`, `oxinfer::intervene`) and the C API
 (`oxi_engine_set_interventions`). Interventions are set per request: changing a strength
 between two messages rebuilds a small set of hooks, not the model, and GPU decoding keeps its
 compiled plan. The shared code is in `src/intervene.rs` and `src/sae.rs`, wired into Qwen3.5 /
-3.8 (dense and MoE), Qwen3, Llama 3, Gemma 4 / 3 and Mistral Large 4.
+3.8 (dense and MoE), Qwen3, Llama 3, Gemma 4 / 3, Mistral Large 4 and DeepSeek V4.
 
 **Where the hooks are.** Layers are 0-based, as in the checkpoint's module names
 (`model.layers.14`).
@@ -1604,6 +1612,30 @@ compiled plan. The shared code is in `src/intervene.rs` and `src/sae.rs`, wired 
 | `post` of layer L | the layer's output, `hidden_states[L + 1]` in transformers. This is where llama.cpp control vectors and Qwen-Scope SAEs (`resid_post`) act. |
 | `mid` of layer L | the residual after the attention (or Gated DeltaNet) block was added |
 | `pre` of layer L | the layer's input: the output of layer L - 1, or the embeddings for layer 0 |
+
+**DeepSeek V4** has no single residual stream: each token carries `hc_mult` (4) copies of the
+hidden state (`[tokens, 4, hidden]`), which every block reads through a learned weighted sum and
+writes back through learned weights and a mixing matrix. The hooks are defined on that stream
+(`State::point_copies` in `src/intervene.rs`):
+
+- **The points.** `pre` of layer L is the 4-copy tensor entering `layers.L` (`Block.forward`'s
+  input in DeepSeek's `inference/model.py`; the repeated embedding for layer 0). `mid` is the
+  tensor after the attention half (the output of its `hc_post`, the input of the MoE half's
+  `hc_pre`). `post` is the layer's output, which is the next layer's `pre`.
+- **The residual at a point** is the mean of the 4 copies. Capture, `--make-direction`, the
+  `resid_median` calibration, SAE encoding and inspection read that mean, so vectors and SAEs
+  have `hidden` values as for every other family.
+- **Edits write to every copy**, so that the mean changes exactly as a single stream would:
+  steering adds `alpha * v` to each copy; ablation projects `r` out of each copy (it is then
+  absent from every weighted sum a block reads, not only from the mean, and stays absent
+  through the mixing, whose weights are scalars per copy; hooking Arditi's block outputs before
+  they are spread over the copies gives the same logits, which the reference checks); an SAE
+  feature edit is computed on the mean and its change `(a' - a) * W_dec[f]` is added to each
+  copy.
+- **Neurons.** Every layer is a MoE (the first 3 hash-routed), so an edit always names an
+  `expert`: `"shared"` is the input of `ffn.shared_experts.w2` (2048 neurons), an id the input of
+  `ffn.experts.E.w2` (2048 each, 256 experts), both `silu(min(gate, 10)) * clamp(up, -10, 10)`,
+  for a routed expert before its routing weight. There is no dense MLP.
 
 **Where they apply.** `positions` is `all` (the default), `prompt` or `generated`. `generated`
 covers the last prompt token and every generated token, so every position whose output is
@@ -1782,9 +1814,27 @@ PyTorch:
 | Qwen3-0.6B | neuron edits, steering (post, mid), ablation | 7e-5 | 5e-8 | |
 | Gemma 4 E2B | neuron edits incl. resid_median, steering (post, mid), ablation | 2.2e-4 | ~0 | 1.3e-4 |
 | Mistral Large 4, tiny random checkpoint (`tools/mistral4_tiny.py`: dense layer 0, 16 experts + shared) | 8 neuron edits (dense scale and resid_median dose; shared add and clamp; routed set, zero, resid_median dose on generated positions, scale on prompt positions), steering (post, mid on generated, pre normalized), ablation in all layers | 2e-5 | 1e-7 | 1.7e-4 |
+| DeepSeek V4, tiny random checkpoint (`tools/deepseek4_tiny.py`: 6 layers, hash-routed layer 0, window-only, CSA and HCA layers, 8 experts + shared, 4 hyper-connection copies) | 32 neuron edits (shared add, clamp, resid_median dose; routed set, zero, scale on prompt positions, resid_median dose on generated positions, scale; one neuron of all 8 experts of 3 layers), steering (post at 2 layers, mid on generated, pre normalized, post on prompt positions), a TopK SAE (clamp, add, zero, scale) and a JumpReLU SAE (clamp, scale, add on generated positions), ablation in layers 0-1; a 106-token prompt | 2e-5 | 2e-8 | 3e-5 |
 
 The `resid_median` values matched to 4 digits (for example L13 9.1125, L14 10.1972 on the
 4B prompt).
+
+DeepSeek V4 was measured on the tiny checkpoint only (the real model is a 97 GB download and
+was not run with interventions). The reference (`ref_intervene.py`, transformers'
+`DeepseekV4ForCausalLM`) hooks the same tensors: the 4-copy input and output of `layers[L]`,
+the input of `ffn_hc` for `mid`, the shared expert's `down_proj` input, and the experts' loop
+with the clamped SwiGLU for routed experts. Each kind alone agreed to 3e-5 or better (KL below
+2e-7): the neuron edits, the steering entries, ablation of one direction in all layers and of
+two (the second in layers 1-3 on generated positions), the TopK SAE, the JumpReLU SAE. With
+`--block-hooks` the reference ablates on Arditi's sites instead (layer input, attention and
+MoE outputs before they are spread over the copies) and gives the same logits (3e-5). The
+combined spec gave 1e-5 with the prompt prefilled in passes of 7 tokens and of 1, and 2e-5 with
+the weights streamed (`--stream`). Calibration medians matched to the 4 digits printed (L3
+30.7286, L4 33.1161). Every spec gave the same 16 of 16 greedy tokens as `generate` under the
+hooks. Captured layer outputs (mean pool) matched the mean of the copies in PyTorch to 1e-6
+relative, and SAE inspection gave the same top-3 features and activations. Through the engine,
+decoding with a (tiny random) DSpark draft gave the same replies as plain decoding under the
+combined spec and under ablation (2 prompts, 24 tokens each).
 
 Greedy generation on Qwen3.5-4B with the dose edits produced the same 40 of 40 tokens as
 transformers' `generate` under the same hooks, with oxinfer decoding on the GPU. On the tiny
@@ -1897,6 +1947,16 @@ CPU's own speed.
   the CPU. Typed decisions (`decision_from`) are not offered for it: a decision bundle is a LoRA
   adapter and head trained on one backbone (Qwen3.5 / 3.8, Gemma 4), none exists for this model,
   and its layers take no LoRA.
+- **DeepSeek V4** is in the same position: no whole-pass GPU decode exists for this family, so
+  on every device the hooks run on the CPU between the matmuls, in prefill and in decoding, and
+  the CLI's "GPU decode keeps running on the GPU" line does not apply. A pass with routed-expert
+  edits keeps that layer's experts on the CPU. Streamed weights work unchanged (the hooks touch
+  activations only; the `resid_median` unit reads one `down_proj` column, for a routed expert
+  through the streamer). The CLI decodes without the DSpark draft when interventions are
+  given; the engine keeps the draft, whose stages are not hooked: they read the edited model's
+  residual and the edited model verifies every draft, so the output follows the edited model.
+  An SAE must have been trained on the mean of the copies (none is published for this model),
+  and agreement was measured on a tiny random checkpoint only.
 - **Speculative decoding.**
   - Qwen MTP drafts come from the unedited MTP head, but the edited main model verifies every
     draft, so the output follows the edited model.

@@ -2106,12 +2106,10 @@ fn run_deepseek4(mut args: Args) -> Result<()> {
     if args.mtp {
         bail!("DeepSeek V4 speculative decoding uses a DSpark draft (--draft), not the MTP layer");
     }
-    if iv_requested(&args.iv) {
-        bail!("runtime interventions are not supported for DeepSeek V4");
-    }
-    // DSpark: as for Mistral Large 4, the draft beside a GGUF model by default.
+    // DSpark: as for Mistral Large 4, the draft beside a GGUF model by default (not with
+    // interventions, which plain decoding serves).
     let beside = oxinfer::dspark::draft_for(&args.model);
-    let plain_only = args.tools || args.dump_logits.is_some() || args.print_prompt;
+    let plain_only = args.tools || args.dump_logits.is_some() || args.print_prompt || iv_requested(&args.iv);
     let draft = match &args.draft {
         Some(d) if d.as_os_str() == "auto" => Some(resolve_auto_draft(&args.model, args.cache_dir.as_deref())?),
         Some(d) if !oxinfer::dspark::is_draft(d) => bail!("{}: not a DSpark (dflash) draft GGUF", d.display()),
