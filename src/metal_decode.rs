@@ -4,6 +4,8 @@ use super::*;
 use std::fmt::Write as _;
 
 const SRC: &str = include_str!("metal_decode.metal");
+/// The QSA kernels (Qwen4-Exp sparse attention), after `SRC` (they use its attention body).
+const QSA_SRC: &str = include_str!("metal_qsa.metal");
 
 /// (rows per threadgroup, SIMD-groups splitting each row) variants compiled for each format.
 pub(crate) const MV_VARIANTS: [(usize, usize); 4] = [(1, 1), (1, 2), (1, 4), (2, 4)];
@@ -156,6 +158,7 @@ pub(crate) fn shader_src() -> String {
         .unwrap_or(MVK_GROUP);
     let mut s = format!("#define MVK_GROUP {group}\n");
     s.push_str(SRC);
+    s.push_str(QSA_SRC);
     for f in all_formats() {
         // MoE experts: `mvx_<fmt>_pair` / `_sum`.
         let (t, x, ch, mk) = f.kernel_types();
@@ -893,8 +896,46 @@ struct AttnParams {
     _p: [u32; 2],
 }
 
+/// `dec_qsa_key` parameters (metal_qsa.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct QsaKeyParams {
+    d: u32,
+    r: u32,
+    half_rot: u32,
+    pos: u32,
+    t: u32,
+    eps: f32,
+    inv_r: f32,
+    k_stride: u32,
+    cs_stride: u32,
+    _p: [u32; 3],
+}
+
+/// `dec_qsa_score` parameters (metal_qsa.metal).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct QsaScoreParams {
+    nh: u32,
+    d: u32,
+    half_rot: u32,
+    nb: u32,
+    r: u32,
+    eps: f32,
+    scale: f32,
+    _p: u32,
+}
+
 /// Most key chunks a head's attention is split into (`AttnParams::nsplit`).
 const ATTN_MAX_SPLIT: usize = 64;
+
+/// The sparse attention of a token at `pos` under QSA (`MOp::Attn::sel`): the kernel, the arena
+/// offset of its positions and their count, or None while every block fits the budget (dense).
+fn qsa_list(sel: &Option<(Id, usize, usize, usize, usize)>, pos: usize) -> Option<(Id, usize, usize)> {
+    let &(pipe, off, r, top, _) = sel.as_ref()?;
+    let nb = (pos + 1) / r;
+    (nb > top).then(|| (pipe, off, top * r + pos + 1 - nb * r))
+}
 
 /// A compiled op: byte offsets into the plan's activation arena (`a`) or constants (`c`).
 #[derive(Clone)]
@@ -1077,6 +1118,43 @@ enum MOp {
         t: Option<(usize, usize, usize)>,
         /// A draft block's span (see `Op::Attend::block`).
         block: Option<(bool, usize)>,
+        /// QSA (`Op::AttendSel`): the sparse kernel, the arena offset of the positions, the block
+        /// size, the blocks kept and the positions' token stride in bytes.
+        sel: Option<(Id, usize, usize, usize, usize)>,
+    },
+    /// See `Op::QsaKey`: `cs` is where the block-start RoPE table starts in a step's cos / sin
+    /// floats; multi-token plans: the arena offset of that table's per-token rows.
+    QsaKey {
+        pipe: Id,
+        k: usize,
+        kv: usize,
+        w: usize,
+        p: QsaKeyParams,
+        cs: usize,
+        t: Option<usize>,
+    },
+    /// The scores of `Op::QsaSelect` (none while the blocks fit the budget `top`). Multi-token
+    /// plans: the query and score strides in bytes, the arena offset of the RoPE rows.
+    QsaScore {
+        pipe: Id,
+        q: usize,
+        kv: usize,
+        w: usize,
+        p: QsaScoreParams,
+        top: usize,
+        cs: usize,
+        scores: usize,
+        t: Option<(usize, usize, usize)>,
+    },
+    /// The selection of `Op::QsaSelect`. Multi-token plans: the score and position strides in
+    /// bytes.
+    QsaTopk {
+        pipe: Id,
+        scores: usize,
+        sel: usize,
+        top: usize,
+        r: usize,
+        t: Option<(usize, usize)>,
     },
 }
 
@@ -1132,6 +1210,8 @@ pub(crate) struct MetalPlan<'b> {
     streamed: Vec<StreamedMv>,
     experts: Vec<StreamedExperts>,
     units: Vec<PlanUnit>,
+    /// Most positions a step may reach (QSA scores: `Op::QsaSelect::cap` blocks).
+    max_len: usize,
 }
 unsafe impl Send for MetalPlan<'_> {}
 unsafe impl Sync for MetalPlan<'_> {}
@@ -1293,6 +1373,7 @@ impl MetalBackend {
         let mut op_mop: Vec<usize> = Vec::with_capacity(g.ops.len());
         let mut streamed: Vec<StreamedMv> = Vec::new();
         let mut experts: Vec<StreamedExperts> = Vec::new();
+        let mut max_len = usize::MAX;
         for (i, op) in g.ops.iter().enumerate() {
             op_mop.push(ops.len());
             let mut smv: Option<([usize; 3], Option<[usize; 3]>)> = None;
@@ -1896,6 +1977,170 @@ impl MetalBackend {
                         vec![rng(r.out, vd), (KV_RES * 2 + r.state, 0, usize::MAX)],
                     )
                 }
+                Op::QsaKey {
+                    k,
+                    kv,
+                    d,
+                    ratio,
+                    norm,
+                    eps,
+                    half_rot,
+                    rope,
+                } => {
+                    if d > 512
+                        || norm.len() != d
+                        || ratio == 0
+                        || 2 * half_rot > d
+                        || g.rope_halves.get(rope) != Some(&half_rot)
+                        || g.kv.get(kv) != Some(&(1, d))
+                    {
+                        return None;
+                    }
+                    emit.push(MOp::QsaKey {
+                        pipe: self.named_pipeline("dec_qsa_key")?,
+                        k: byte(k),
+                        kv,
+                        w: cst(norm),
+                        p: QsaKeyParams {
+                            d: d as u32,
+                            r: ratio as u32,
+                            half_rot: half_rot as u32,
+                            pos: 0,
+                            t: 1,
+                            eps,
+                            inv_r: 1.0 / ratio as f32,
+                            k_stride: ts(k) as u32,
+                            cs_stride: 2 * half_rot as u32,
+                            _p: [0; 3],
+                        },
+                        cs: g.rope_halves[..rope].iter().map(|h| 2 * h).sum(),
+                        t: mt.then(|| rope_table(rope)),
+                    });
+                    (vec![rng(k, d), (KV_RES + kv, 0, usize::MAX)], vec![(KV_RES + kv, 0, usize::MAX)])
+                }
+                Op::QsaSelect {
+                    q,
+                    kv,
+                    nh,
+                    d,
+                    ratio,
+                    top,
+                    norm,
+                    eps,
+                    scale,
+                    half_rot,
+                    rope,
+                    scores,
+                    cap,
+                    sel,
+                } => {
+                    if nh > 8 || nh * d > 1024 || norm.len() != d || ratio == 0 || top == 0 || !d.is_multiple_of(8) {
+                        return None;
+                    }
+                    if 2 * half_rot > d || g.rope_halves.get(rope) != Some(&half_rot) || g.kv.get(kv) != Some(&(1, d)) {
+                        return None;
+                    }
+                    max_len = max_len.min(cap * ratio);
+                    emit.push(MOp::QsaScore {
+                        pipe: self.named_pipeline("dec_qsa_score")?,
+                        q: byte(q),
+                        kv,
+                        w: cst(norm),
+                        p: QsaScoreParams {
+                            nh: nh as u32,
+                            d: d as u32,
+                            half_rot: half_rot as u32,
+                            nb: 0,
+                            r: ratio as u32,
+                            eps,
+                            scale,
+                            _p: 0,
+                        },
+                        top,
+                        cs: g.rope_halves[..rope].iter().map(|h| 2 * h).sum(),
+                        scores: byte(scores),
+                        t: mt.then(|| (ts(q) * 4, ts(scores) * 4, rope_table(rope))),
+                    });
+                    emit.push(MOp::Barrier);
+                    emit.push(MOp::QsaTopk {
+                        pipe: self.named_pipeline("dec_qsa_topk")?,
+                        scores: byte(scores),
+                        sel: byte(sel),
+                        top,
+                        r: ratio,
+                        t: mt.then(|| (ts(scores) * 4, ts(sel) * 4)),
+                    });
+                    (
+                        vec![rng(q, nh * d), (KV_RES + kv, 0, usize::MAX)],
+                        vec![rng(scores, cap), rng(sel, (top + 1) * ratio)],
+                    )
+                }
+                Op::AttendSel {
+                    q,
+                    out,
+                    kv,
+                    nh,
+                    nkv,
+                    hd,
+                    scale,
+                    gate,
+                    sel,
+                    ratio,
+                    top,
+                } => {
+                    let d = hd / 32;
+                    if !hd.is_multiple_of(32) || !matches!(d, 2 | 4 | 8 | 16) || nkv == 0 || !nh.is_multiple_of(nkv) || ratio == 0 {
+                        return None;
+                    }
+                    if g.kv.get(kv) != Some(&(nkv, hd)) {
+                        return None;
+                    }
+                    part_floats = part_floats.max(nh * ATTN_MAX_SPLIT * (hd + 2));
+                    let rep = nh / nkv;
+                    let grp = [8, 4, 2, 1]
+                        .into_iter()
+                        .find(|&g| rep.is_multiple_of(g) && g * d <= 16)
+                        .unwrap_or(1);
+                    emit.push(MOp::Attn {
+                        grp,
+                        pipe: self.named_pipeline(&format!("dec_attn_{d}_{grp}"))?,
+                        combine: self.named_pipeline("dec_attn_combine")?,
+                        hd: hd as u32,
+                        q: byte(q),
+                        out: byte(out),
+                        kv,
+                        gate: gate.map(|(v, _)| boff[v.buf]),
+                        window: None,
+                        p: AttnParams {
+                            nh: nh as u32,
+                            nkv: nkv as u32,
+                            len: 0,
+                            lo: 0,
+                            scale,
+                            has_gate: gate.is_some() as u32,
+                            g_stride: gate.map_or(0, |(_, s)| s as u32),
+                            g_off: gate.map_or(0, |(v, _)| v.off as u32),
+                            nsplit: 1,
+                            chunk: 0,
+                            _p: [0; 2],
+                        },
+                        threads: 256,
+                        t: mt.then(|| (ts(q) * 4, ts(out) * 4, gate.map_or(0, |(v, _)| ts(v) * 4))),
+                        block: None,
+                        sel: Some((
+                            self.named_pipeline(&format!("dec_attn_sel_{d}_{grp}"))?,
+                            byte(sel),
+                            ratio,
+                            top,
+                            ts(sel) * 4,
+                        )),
+                    });
+                    let mut r = vec![rng(q, nh * hd), (KV_RES + kv, 0, usize::MAX), rng(sel, (top + 1) * ratio)];
+                    if let Some((v, s)) = gate {
+                        r.push(rng(v, nh * s));
+                    }
+                    (r, vec![rng(out, nh * hd)])
+                }
                 Op::Attend {
                     q,
                     out,
@@ -1951,6 +2196,7 @@ impl MetalBackend {
                         threads: 256,
                         t: mt.then(|| (ts(q) * 4, ts(out) * 4, gate.map_or(0, |(v, _)| ts(v) * 4))),
                         block,
+                        sel: None,
                     });
                     let mut r = vec![rng(q, nh * hd), (KV_RES + kv, 0, usize::MAX)];
                     if let Some((v, s)) = gate {
@@ -2088,6 +2334,7 @@ impl MetalBackend {
             streamed,
             experts,
             units,
+            max_len,
             f,
         })
     }
@@ -2637,9 +2884,11 @@ impl MetalPlan<'_> {
                 hd,
                 t: tk,
                 block,
+                sel,
             } => {
                 let (sq, so, sg) = tk.expect("multi-token attention");
                 for j in 0..t {
+                    let list = qsa_list(sel, pos + j);
                     // Token j attends to the positions up to its own, split as a single-token
                     // step at that position would be; a draft block's tokens to the context
                     // before the block and to the block.
@@ -2656,13 +2905,18 @@ impl MetalPlan<'_> {
                     let mut p = *p;
                     p.len = len as u32;
                     p.lo = lo as u32;
+                    let mut pipe = *pipe;
+                    if let (Some(sl), Some(s)) = (list, sel) {
+                        (pipe, p.len, p.lo) = (sl.0, sl.2 as u32, 0);
+                        e.buf(arena, sl.1 + j * s.4, 7);
+                    }
                     let n = (p.len - p.lo) as usize;
                     let chunk = n.div_ceil(ATTN_MAX_SPLIT).next_multiple_of(256).max(256);
                     p.nsplit = n.div_ceil(chunk) as u32;
                     p.chunk = chunk as u32;
                     let part = self.part + j * self.part_stride;
                     let gt = gate.map_or(0, |g| g + j * sg);
-                    e.pipe(*pipe);
+                    e.pipe(pipe);
                     e.buf(arena, *q + j * sq, 0);
                     e.buf(kvb[*kv].0, 0, 1);
                     e.buf(kvb[*kv].1, 0, 2);
@@ -2702,6 +2956,71 @@ impl MetalPlan<'_> {
                 e.bytes(&[*n, *hc], 4);
                 e.bytes(&ts, 5);
                 e.dispatch((*hc as usize, t), 1024);
+            }
+            MOp::QsaKey {
+                pipe, k, kv, w, p, t: tk, ..
+            } => {
+                let mut p = *p;
+                p.pos = pos as u32;
+                p.t = t as u32;
+                e.pipe(*pipe);
+                e.buf(arena, *k, 0);
+                e.buf(kvb[*kv].0, 0, 1);
+                e.buf(kvb[*kv].1, 0, 2);
+                e.buf(consts, *w, 3);
+                e.bytes(&p, 4);
+                e.buf(arena, tk.expect("multi-token indexer keys"), 5);
+                e.dispatch((1, 1), p.d as usize);
+            }
+            MOp::QsaScore {
+                pipe,
+                q,
+                kv,
+                w,
+                p,
+                top,
+                scores,
+                t: tk,
+                ..
+            } => {
+                let (sq, ss, cs) = tk.expect("multi-token indexer scores");
+                for j in 0..t {
+                    let nb = (pos + j + 1) / p.r as usize;
+                    if nb <= *top {
+                        continue;
+                    }
+                    let mut p = *p;
+                    p.nb = nb as u32;
+                    e.pipe(*pipe);
+                    e.buf(arena, *q + j * sq, 0);
+                    e.buf(kvb[*kv].1, 0, 1);
+                    e.buf(consts, *w, 2);
+                    e.buf(arena, *scores + j * ss, 3);
+                    e.bytes(&p, 4);
+                    e.buf(arena, cs + j * 2 * p.half_rot as usize * 4, 5);
+                    e.dispatch((nb.div_ceil(256), 1), 256);
+                }
+            }
+            MOp::QsaTopk {
+                pipe,
+                scores,
+                sel,
+                top,
+                r,
+                t: tk,
+            } => {
+                let (ss, sl) = tk.expect("multi-token indexer selection");
+                for j in 0..t {
+                    let nb = (pos + j + 1) / r;
+                    if nb <= *top {
+                        continue;
+                    }
+                    e.pipe(*pipe);
+                    e.buf(arena, *scores + j * ss, 0);
+                    e.buf(arena, *sel + j * sl, 1);
+                    e.bytes(&[nb as u32, *top as u32, *r as u32, (pos + j) as u32], 2);
+                    e.dispatch((1, 1), 1024);
+                }
             }
             MOp::Experts { .. } | MOp::Steer { .. } | MOp::NeuronEdit { .. } => {
                 unreachable!("single-token op in a multi-token plan")
@@ -3165,6 +3484,7 @@ impl DecodePlan for MetalPlan<'_> {
                 .is_some_and(|c| self.capture.is_none_or(|(_, n)| c.len() < t * n))
             || s.states.len() != self.states.len()
             || s.states.iter().zip(&self.states).any(|(a, &n)| a.len() != n)
+            || s.pos + t > self.max_len
         {
             return false;
         }
@@ -3271,6 +3591,7 @@ impl DecodePlan for MetalPlan<'_> {
                         MOp::Steer { .. } | MOp::NeuronEdit { .. } => "iv",
                         MOp::AddNorm { .. } => "norm",
                         MOp::Attn { .. } => "attn",
+                        MOp::QsaKey { .. } | MOp::QsaScore { .. } | MOp::QsaTopk { .. } => "qsa",
                     };
                     if !o.split(',').any(|x| x == k) {
                         continue;
@@ -3521,6 +3842,57 @@ impl DecodePlan for MetalPlan<'_> {
                         e.bytes(p, 7);
                         e.dispatch((p.nv as usize, 1), (p.hdk / 32 * p.hdv) as usize);
                     }
+                    MOp::QsaKey {
+                        pipe, k, kv, w, p, cs: c0, ..
+                    } => {
+                        let mut p = *p;
+                        p.pos = pos as u32;
+                        e.pipe(*pipe);
+                        e.buf(arena, *k, 0);
+                        e.buf(kvb[*kv].0, 0, 1);
+                        e.buf(kvb[*kv].1, 0, 2);
+                        e.buf(consts, *w, 3);
+                        e.bytes(&p, 4);
+                        e.bytes_slice(&cs[*c0..*c0 + 2 * p.half_rot as usize], 5);
+                        e.dispatch((1, 1), p.d as usize);
+                    }
+                    MOp::QsaScore {
+                        pipe,
+                        q,
+                        kv,
+                        w,
+                        p,
+                        top,
+                        cs: c0,
+                        scores,
+                        ..
+                    } => {
+                        let nb = (pos + 1) / p.r as usize;
+                        if nb > *top {
+                            let mut p = *p;
+                            p.nb = nb as u32;
+                            e.pipe(*pipe);
+                            e.buf(arena, *q, 0);
+                            e.buf(kvb[*kv].1, 0, 1);
+                            e.buf(consts, *w, 2);
+                            e.buf(arena, *scores, 3);
+                            e.bytes(&p, 4);
+                            e.bytes_slice(&cs[*c0..*c0 + 2 * p.half_rot as usize], 5);
+                            e.dispatch((nb.div_ceil(256), 1), 256);
+                        }
+                    }
+                    MOp::QsaTopk {
+                        pipe, scores, sel, top, r, ..
+                    } => {
+                        let nb = (pos + 1) / r;
+                        if nb > *top {
+                            e.pipe(*pipe);
+                            e.buf(arena, *scores, 0);
+                            e.buf(arena, *sel, 1);
+                            e.bytes(&[nb as u32, *top as u32, *r as u32, pos as u32], 2);
+                            e.dispatch((1, 1), 1024);
+                        }
+                    }
                     MOp::Attn {
                         grp,
                         pipe,
@@ -3533,18 +3905,24 @@ impl DecodePlan for MetalPlan<'_> {
                         p,
                         threads,
                         hd,
+                        sel,
                         ..
                     } => {
                         let mut p = *p;
                         p.len = (pos + 1) as u32;
                         p.lo = window.map_or(0, |w| (pos + 1).saturating_sub(w)) as u32;
+                        let mut pipe = *pipe;
+                        if let Some(sl) = qsa_list(sel, pos) {
+                            (pipe, p.len, p.lo) = (sl.0, sl.2 as u32, 0);
+                            e.buf(arena, sl.1, 7);
+                        }
                         // Keys per threadgroup: one pass of its 8 SIMD-groups (256 keys) at least, so
                         // long contexts spread over up to ATTN_MAX_SPLIT threadgroups per head.
                         let n = (p.len - p.lo) as usize;
                         let chunk = n.div_ceil(ATTN_MAX_SPLIT).next_multiple_of(256).max(256);
                         p.nsplit = n.div_ceil(chunk) as u32;
                         p.chunk = chunk as u32;
-                        e.pipe(*pipe);
+                        e.pipe(pipe);
                         e.buf(arena, *q, 0);
                         e.buf(kvb[*kv].0, 0, 1);
                         e.buf(kvb[*kv].1, 0, 2);

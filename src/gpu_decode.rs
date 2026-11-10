@@ -224,6 +224,61 @@ pub enum Op<'a> {
         n: usize,
         hc: usize,
     },
+    /// QSA indexer keys (Qwen4-Exp, see `crate::qwen4exp`): the token's raw key `k` (`d` floats)
+    /// goes to key row `pos` of cache `kv` (`(1, d)`); value row `pos` gets, when the token
+    /// completes a block of `ratio` (`(pos + 1) % ratio == 0`), the block's pooled key: the
+    /// mean of its raw keys, RMS-normed with `norm`, RoPE'd (first `2 * half_rot` dimensions,
+    /// table `rope` of [`Graph::rope_halves`], which holds the angles of the block's first
+    /// position), else zeros. The ops follow the CPU path's order (RMSNorm factors may differ
+    /// in the last bit).
+    QsaKey {
+        k: View,
+        kv: usize,
+        d: usize,
+        ratio: usize,
+        norm: &'a [f32],
+        eps: f32,
+        half_rot: usize,
+        rope: usize,
+    },
+    /// QSA block selection: past `top` complete blocks, the raw queries `q` (`[nh, d]`) are
+    /// RMS-normed (`norm`) and RoPE'd (table `rope`), every complete block scored against the
+    /// pooled keys of cache `kv` (`scale * sum_h relu(q_h . k)`, into `scores`, one float per
+    /// block), and the positions attended written to `sel` (u32 bits): the `top` best blocks
+    /// (ties to the lower block) in ascending order, `ratio` positions each, then the
+    /// incomplete tail up to the token. Nothing runs while every block fits the budget.
+    QsaSelect {
+        q: View,
+        kv: usize,
+        nh: usize,
+        d: usize,
+        ratio: usize,
+        top: usize,
+        norm: &'a [f32],
+        eps: f32,
+        scale: f32,
+        half_rot: usize,
+        rope: usize,
+        scores: View,
+        /// Floats of `scores` (most blocks scored).
+        cap: usize,
+        sel: View,
+    },
+    /// [`Op::Attend`] under QSA: over the positions [`Op::QsaSelect`] wrote to `sel`, or all of
+    /// them while every block fits the budget (`top` blocks of `ratio`).
+    AttendSel {
+        q: View,
+        out: View,
+        kv: usize,
+        nh: usize,
+        nkv: usize,
+        hd: usize,
+        scale: f32,
+        gate: Option<(View, usize)>,
+        sel: View,
+        ratio: usize,
+        top: usize,
+    },
 }
 
 /// Elementwise ops ([`Op::Ew`]).

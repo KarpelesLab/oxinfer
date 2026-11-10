@@ -509,6 +509,9 @@ fn op_name(op: &Op) -> &'static str {
         Op::HcPre { .. } => "hc-pre",
         Op::HcPost { .. } => "hc-post",
         Op::PleGate { .. } => "ple-gate",
+        Op::QsaKey { .. } => "qsa-key",
+        Op::QsaSelect { .. } => "qsa-select",
+        Op::AttendSel { .. } => "qsa-attention",
     }
 }
 
@@ -1020,6 +1023,7 @@ impl CudaBackend {
                         });
                     }
                     Op::Steer { .. } | Op::NeuronEdit { .. } | Op::HcPre { .. } | Op::HcPost { .. } | Op::PleGate { .. } => return None,
+                    Op::QsaKey { .. } | Op::QsaSelect { .. } | Op::AttendSel { .. } => return None,
                 }
             }
             Some(())

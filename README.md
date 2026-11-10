@@ -95,7 +95,7 @@ optional.
 | Orpheus GGUF (isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF, lex-au/Orpheus-3b-FT-Q8_0.gguf) | 3.3B | 2.4 / 4.0 GB | text to speech; whisper-small WER 0-1% like the safetensors model |
 | mistralai/Mistral-Large-4-1T-A52B; unsloth/Mistral-Large-4-1T-A52B-GGUF | 1T MoE, 52B active (+ 2B vision) | 1.06 TB (FP8) / 378 GB (GGUF UD-Q2_K_XL) | text and images; streamed from storage when larger than RAM (1.3-1.5 tok/s on a 128 GB M5 Max; DSpark speculative decoding); matches transformers (tiny random checkpoints with every feature, KL < 1e-9) and llama.cpp on the real GGUF (same next tokens, same greedy text); see [Mistral Large 4](#mistral-large-4-1t-a52b) |
 | deepseek-ai/DeepSeek-V4-Flash as GGUF (unsloth/DeepSeek-V4-Flash-GGUF) | 284B MoE, 13B active | 97 GB (UD-Q2_K_XL) | text, tool calls; streamed from storage when larger than 60% of RAM (5-10 tok/s on a 128 GB M5 Max); matches DeepSeek's own inference code (tiny random checkpoints, max logit diff 8e-5, KL 3e-11) and llama.cpp on the real GGUF (same greedy text); DSpark speculative decoding (DeepSeek-V4-Flash-DSpark); see [DeepSeek V4](#deepseek-v4-flash) |
-| Qwen/Qwen3.8-Flash-Next as GGUF (unsloth/Qwen3.8-Flash-Next-GGUF) | 125B MoE, 6B active, + 51B n-gram embedding + 4B MTP | 111 GB (UD-Q4_K_XL, 29 GB of it the n-gram table) | text, thinking on / off, tool calls, MTP speculative decoding (unsloth's MTP GGUF); hyper-connections, n-gram embedding (read a few rows per token from storage) and QSA sparse attention; matches transformers (tiny random checkpoints, max logit diff 6.6e-7) and llama.cpp on the real GGUF (same greedy tokens, KL 2e-4 to 3e-3); 45-59 tok/s Metal decode, 21 CPU; see [Qwen3.8-Flash-Next](#qwen38-flash-next) |
+| Qwen/Qwen3.8-Flash-Next as GGUF (unsloth/Qwen3.8-Flash-Next-GGUF) | 125B MoE, 6B active, + 51B n-gram embedding + 4B MTP | 111 GB (UD-Q4_K_XL, 29 GB of it the n-gram table) | text, thinking on / off, tool calls, MTP speculative decoding (unsloth's MTP GGUF); hyper-connections, n-gram embedding (read a few rows per token from storage) and QSA sparse attention; matches transformers (tiny random checkpoints, max logit diff 6.6e-7) and llama.cpp on the real GGUF (same greedy tokens, KL 2e-4 to 3e-3); 45-59 tok/s Metal decode (47 at 4.5k context), 21 CPU; see [Qwen3.8-Flash-Next](#qwen38-flash-next) |
 | Llama 3.x GGUF (bartowski/Llama-3.2-1B-Instruct-GGUF, ...) | 1.2B tested | 0.8 GB (Q4_K_M) - 2.5 GB (F16) | text; F16 file bit-identical to the safetensors model, quantized files match llama.cpp (see [Llama 3 GGUF](#llama-3-gguf)) |
 | canopylabs/orpheus-3b-0.1-pretrained (ungated copy: unsloth/orpheus-3b-0.1-pretrained) | 3.3B | 6.6 GB | voice cloning from a reference clip (SNAC encoder); prompt and greedy tokens match the canopylabs notebook + transformers |
 | canopylabs/3b-{fr,de,ko,hi,zh,es_it}-ft-research_release (ungated copies: Our-Org-2/...) | 3.3B | 13 GB (fp32) | multilingual text to speech (French and German tested; French greedy tokens match transformers) |
@@ -919,10 +919,18 @@ Mistral Large 4); on a 128 GB Mac UD-Q4_K_XL does not, and is read in place thro
 with whole-token GPU decoding. The GPU decode plan wraps the 78 GB of routed experts once and its
 single- and multi-token plans share them; prefill then wraps only the experts each pass routes
 to (`Experts::wrap_per_pass`), since wiring them twice exhausts the GPU's memory. Past 2051 tokens
-of context (where QSA starts dropping blocks) decoding runs on the CPU, which has the selection.
-There a token's block scores are computed over all threads and its attention (24 query heads on 2
-KV heads) takes the shared-row CPU kernel (see [Performance](#performance)): 13.6 -> 17.7 tok/s
-after a 4338-token prompt on the CPU, same tokens.
+of context (where QSA starts dropping blocks) the decode plan scores the blocks, picks the top 512
+(a radix select, ties to the lower block as on the CPU) and attends to the picked positions on
+the GPU too: 47.6 tok/s after a 4556-token prompt (CPU decoding: 20.4). The indexer keys live in a
+one-head KV cache per layer that the plan mirrors like the attention's; the device pools a block's
+key when a token ends it, and the host pools it again (its RMSNorm takes `powf(-0.5)`, which the
+GPU's `rsqrt` can miss by an ulp) so the cache always holds the CPU path's keys.
+`OXINFER_QSA_CHECK=1` checks every step's selections against the CPU path's scoring of the same
+queries (no difference over 160 steps x 12 layers at 4.5k context); multi-token verification
+(prompt lookup, MTP) runs the same ops and gives the plain GPU decode's tokens with
+`--exact-verify`. On the CPU a token's block scores are computed over all threads and its
+attention (24 query heads on 2 KV heads) takes the shared-row CPU kernel (see
+[Performance](#performance)): 13.6 -> 17.7 tok/s after a 4338-token prompt, same tokens.
 The MTP layer (`mtp_from` in the engine, C API and server options) is the trunk's 4 residual
 streams plus the next token's embedding, per stream `fc([enorm(e) ; hnorm_s(h_s)])`, through one
 QSA + MoE layer with hyper-connections and its own final mixer, the LM head shared.

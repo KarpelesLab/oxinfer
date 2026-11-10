@@ -963,6 +963,13 @@ impl LayerCache {
     pub fn data(&self) -> (&[f32], &[f32]) {
         (&self.k, &self.v)
     }
+    /// Overwrites the value row of KV head `kvh` at cached position `pos` (a device copy then
+    /// syncs again from there).
+    pub(crate) fn set_v(&mut self, pos: usize, kvh: usize, row: &[f32]) {
+        let o = (pos * self.n_kv + kvh) * self.hd;
+        self.v[o..o + self.hd].copy_from_slice(row);
+        self.kept = self.kept.min(pos);
+    }
     pub(crate) fn truncate(&mut self, len: usize) {
         self.kept = self.kept.min(len);
         if len < self.len {

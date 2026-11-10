@@ -773,10 +773,11 @@ inline void qk_rope_body(device const float* qkv, device float* qo, device float
 struct AP { uint nh; uint nkv; uint len; uint lo; float scale; uint has_gate; uint g_stride; uint g_off; uint nsplit; uint chunk; uint _p0; uint _p1; };
 // One threadgroup per (G query heads sharing a key / value head, chunk of keys): every key and
 // value row is read once for the G heads.
-template <int D, int G>
+// SEL (QSA sparse attention, metal_qsa.metal): key j is cache position idx[j] rather than j.
+template <int D, int G, bool SEL = false>
 inline void attn_body(device const float* q, device const float* kc, device const float* vc, device float* out, device const float* gate,
                       device float* part, constant AP& p, uint hg, uint split, uint tid, uint sg, uint lane, threadgroup float* sm,
-                      threadgroup float* so, threadgroup float* qs) {
+                      threadgroup float* so, threadgroup float* qs, device const uint* idx = nullptr) {
     constexpr uint HD = D * 32;
     uint h0 = hg * G;
     uint kvh = h0 / (p.nh / p.nkv);
@@ -799,7 +800,7 @@ inline void attn_body(device const float* q, device const float* kc, device cons
         float s[G];
         for (int g = 0; g < G; g++) s[g] = -INFINITY;
         if (j < j1) {
-            device const float4* kr = (device const float4*)(kc + (ulong)j * rs + (ulong)kvh * HD);
+            device const float4* kr = (device const float4*)(kc + (ulong)(SEL ? idx[j] : j) * rs + (ulong)kvh * HD);
             float4 acc[G];
             for (int g = 0; g < G; g++) acc[g] = 0.f;
             for (uint d = 0; d < HD / 4; d++) {
@@ -820,7 +821,7 @@ inline void attn_body(device const float* q, device const float* kc, device cons
         uint nb = min(32u, j1 - base);
         device const float* vb = vc + (ulong)base * rs + (ulong)kvh * HD + lane * D;
         for (uint t = 0; t < nb; t++) {
-            device const float* vr = vb + t * rs;
+            device const float* vr = SEL ? vc + (ulong)idx[base + t] * rs + (ulong)kvh * HD + lane * D : vb + t * rs;
             float v[D];
             for (int d = 0; d < D; d++) v[d] = vr[d];
             for (int g = 0; g < G; g++) {

@@ -19,7 +19,8 @@
 //!   4 cached tokens plus the incomplete tail, blocks scored by a small indexer (4 query heads of
 //!   128 against the block's mean raw key, normed and rotated to the block's first position;
 //!   `sum_h relu(q_h . k) / sqrt(128)`). Up to 2051 visible tokens every block is picked, so short
-//!   contexts attend densely.
+//!   contexts attend densely. GPU decoding runs the indexer too (`Op::QsaKey`, `Op::QsaSelect`,
+//!   `Op::AttendSel` of `crate::gpu::decode`), its keys in a one-head KV cache ([`IdxCache`]).
 
 use crate::config::QwenConfig;
 use crate::kernels::*;
@@ -331,20 +332,30 @@ pub(crate) struct Exp<'a> {
 }
 
 /// Indexer keys of one full-attention layer: the raw key of every cached position and the pooled
-/// (normed, rotated) key of every complete block.
-#[derive(Clone, Default)]
+/// (normed, rotated) key of every complete block, as a one-head KV cache (which GPU decoding
+/// mirrors like the attention's): key row `p` is position `p`'s raw key, value row `p` the
+/// pooled key of the block `p` ends (zeros elsewhere, and for blocks not pooled yet).
+#[derive(Clone)]
 pub struct IdxCache {
-    /// `[len, d]`.
-    raw: Vec<f32>,
-    /// `[blocks, d]`.
-    pooled: Vec<f32>,
-    d: usize,
+    kv: LayerCache,
+    /// The complete blocks whose pooled keys are in `kv` (the first ones).
+    pooled_n: usize,
 }
 
 impl IdxCache {
+    fn new(d: usize) -> Self {
+        IdxCache {
+            kv: LayerCache::new(1, d),
+            pooled_n: 0,
+        }
+    }
     fn truncate(&mut self, pos: usize, ratio: usize) {
-        self.raw.truncate(pos * self.d);
-        self.pooled.truncate(pos / ratio * self.d);
+        self.kv.truncate(pos);
+        self.pooled_n = self.pooled_n.min(pos / ratio);
+    }
+    /// The pooled key of block `b`.
+    fn pooled(&self, b: usize, ratio: usize) -> &[f32] {
+        self.kv.v_at(b * ratio + ratio - 1, 0)
     }
 }
 
@@ -463,12 +474,7 @@ impl<'a> Exp<'a> {
             idx: self
                 .layers
                 .iter()
-                .map(|l| {
-                    l.indexer.as_ref().map(|_| IdxCache {
-                        d: cfg.indexer_head_dim,
-                        ..Default::default()
-                    })
-                })
+                .map(|l| l.indexer.as_ref().map(|_| IdxCache::new(cfg.indexer_head_dim)))
                 .collect(),
             ratio: cfg.indexer_compress_ratio.max(1),
             w,
@@ -600,11 +606,44 @@ fn table_rows(t: &Table, dim: usize) -> usize {
     }
 }
 
+/// The normed, rotated indexer queries (`[nh, d]`) of one token from its raw ones `q`, with the
+/// rotary angles of its position.
+fn qsa_query(norm: &[f32], q: &[f32], eps: f32, cos: &[f32], sin: &[f32]) -> Vec<f32> {
+    let d = norm.len();
+    let half = cos.len();
+    let mut qn = vec![0f32; q.len()];
+    for (o, qh) in qn.chunks_exact_mut(d).zip(q.chunks_exact(d)) {
+        rmsnorm_f32w(qh, norm, eps, o);
+        apply_rope(&mut o[..2 * half], cos, sin);
+    }
+    qn
+}
+
+/// The QSA score of a block with pooled key `kb`: `scale * sum_h relu(qn_h . kb)`.
+fn qsa_score(qn: &[f32], kb: &[f32], d: usize, scale: f32) -> f32 {
+    qn.chunks_exact(d).map(|qh| dot(qh, kb).max(0.0)).sum::<f32>() * scale
+}
+
+/// Positions the GPU decode plan's QSA scores cover (`Op::QsaSelect::cap` blocks); longer
+/// contexts decode on the CPU.
+const QSA_GPU_MAX_POS: usize = 1 << 18;
+
+/// `OXINFER_QSA_CHECK`: GPU decoding checks every sparse step's selections (and the pooled keys
+/// it made) against the CPU path's from the same queries and keys, printing mismatches.
+fn qsa_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OXINFER_QSA_CHECK").is_some())
+}
+
 /// The blocks a query at `qpos` (absolute) attends to under QSA, as token positions, or None
 /// when every visible token is selected.
 fn qsa_select(cfg: &QwenConfig, scores: &[f32], qpos: usize) -> Option<Vec<u32>> {
     let r = cfg.indexer_compress_ratio;
-    let top = cfg.indexer_budget / r;
+    qsa_pick(r, cfg.indexer_budget / r, scores, qpos)
+}
+
+/// [`qsa_select`] with blocks of `r` and `top` kept.
+fn qsa_pick(r: usize, top: usize, scores: &[f32], qpos: usize) -> Option<Vec<u32>> {
     let nb = (qpos + 1) / r;
     if nb <= top {
         return None;
@@ -837,6 +876,30 @@ impl<'a> QwenModel<'a> {
         self.qsa_select(ix, ic, &rope_at, hn, t, start, l)
     }
 
+    /// Pools the blocks of `ic` up to `upto` (exclusive) that have no pooled key yet: the mean of
+    /// their raw keys, RMS-normed, rotated to the block's first position.
+    pub(crate) fn qsa_pool(&self, ix: &Indexer, ic: &mut IdxCache, rope_at: &dyn Fn(usize, usize) -> (Vec<f32>, Vec<f32>), upto: usize) {
+        let cfg = &self.cfg;
+        let r = cfg.indexer_compress_ratio;
+        let d = ic.kv.hd;
+        let eps = cfg.rms_norm_eps as f32;
+        let half = self.inv_freq.len();
+        let mut m = vec![0f32; d];
+        let mut kn = vec![0f32; d];
+        for b in ic.pooled_n..upto {
+            let (cos, sin) = rope_at(b * r, 1);
+            m.fill(0.0);
+            for p in b * r..(b + 1) * r {
+                add_inplace(&mut m, ic.kv.k_at(p, 0));
+            }
+            scale_inplace(&mut m, 1.0 / r as f32);
+            rmsnorm_f32w(&m, &ix.k_norm, eps, &mut kn);
+            apply_rope(&mut kn[..2 * half], &cos, &sin);
+            ic.kv.set_v(b * r + r - 1, 0, &kn);
+        }
+        ic.pooled_n = ic.pooled_n.max(upto);
+    }
+
     /// [`Self::qsa_select_all`] over an indexer cache, with `rope_at(p, n)` the rotary tables of
     /// positions `p..p + n`.
     #[allow(clippy::too_many_arguments)]
@@ -871,42 +934,15 @@ impl<'a> QwenModel<'a> {
         }
         let top = cfg.indexer_budget / r;
         let last_nb = (start + t) / r;
-        let have = {
-            ic.raw.truncate(start * d);
-            ic.raw.extend_from_slice(&k);
-            ic.pooled.truncate(start / r * d);
-            ic.pooled.len() / d
-        };
+        ic.truncate(start, r);
+        ic.kv.push(&k, &vec![0f32; t * d], t);
         if last_nb <= top {
             // Every block is selected: the pooled keys wait until some token needs them.
             return None;
         }
-        let mut newp = Vec::with_capacity(last_nb.saturating_sub(have) * d);
-        if last_nb > have {
-            let mut cos = Vec::new();
-            let mut sin = Vec::new();
-            for b in have..last_nb {
-                let (cb, sb) = rope_at(b * r, 1);
-                cos.extend(cb);
-                sin.extend(sb);
-            }
-            let raw = &ic.raw;
-            let mut m = vec![0f32; d];
-            let mut kn = vec![0f32; d];
-            for (i, b) in (have..last_nb).enumerate() {
-                m.fill(0.0);
-                for p in b * r..(b + 1) * r {
-                    add_inplace(&mut m, &raw[p * d..(p + 1) * d]);
-                }
-                scale_inplace(&mut m, 1.0 / r as f32);
-                rmsnorm_f32w(&m, &ix.k_norm, eps, &mut kn);
-                apply_rope(&mut kn[..2 * half], &cos[i * half..(i + 1) * half], &sin[i * half..(i + 1) * half]);
-                newp.extend_from_slice(&kn);
-            }
-        }
+        self.qsa_pool(ix, ic, rope_at, last_nb);
         let (cos, sin) = rope_at(start, t);
-        ic.pooled.extend_from_slice(&newp);
-        let pooled = &ic.pooled;
+        let ic = &*ic;
         let scale = 1.0 / (d as f32).sqrt();
         let mut sel: Vec<Option<Vec<u32>>> = vec![None; t];
         let sp = SendSel(sel.as_mut_ptr());
@@ -918,20 +954,14 @@ impl<'a> QwenModel<'a> {
             if nb <= top {
                 return;
             }
-            let mut qn = vec![0f32; nh * d];
-            for hh in 0..nh {
-                let o = &mut qn[hh * d..(hh + 1) * d];
-                rmsnorm_f32w(&q[(ti * nh + hh) * d..(ti * nh + hh + 1) * d], &ix.q_norm, eps, o);
-                apply_rope(
-                    &mut o[..2 * half],
-                    &cos[ti * half..(ti + 1) * half],
-                    &sin[ti * half..(ti + 1) * half],
-                );
-            }
-            let score = |b: usize| {
-                let kb = &pooled[b * d..(b + 1) * d];
-                (0..nh).map(|hh| dot(&qn[hh * d..(hh + 1) * d], kb).max(0.0)).sum::<f32>() * scale
-            };
+            let qn = qsa_query(
+                &ix.q_norm,
+                &q[ti * nh * d..(ti + 1) * nh * d],
+                eps,
+                &cos[ti * half..(ti + 1) * half],
+                &sin[ti * half..(ti + 1) * half],
+            );
+            let score = |b: usize| qsa_score(&qn, ic.pooled(b, r), d, scale);
             let scores: Vec<f32> = if split {
                 let mut sc = vec![0f32; nb];
                 let kb = nb.div_ceil(4 * pool::threads()).max(64);
@@ -967,17 +997,12 @@ impl<'a> QwenModel<'a> {
     }
 }
 
-/// Most positions the GPU decode plan attends to densely: beyond `indexer_budget +
-/// indexer_compress_ratio - 1` visible tokens QSA drops blocks, which only the CPU path does.
-fn dense_limit(cfg: &QwenConfig) -> usize {
-    cfg.indexer_budget + cfg.indexer_compress_ratio.max(1) - 1
-}
-
 impl<'a> QwenModel<'a> {
     /// One token's Qwen4-Exp forward as a device graph (`crate::gpu::decode`): the hyper-connection
     /// mixes and writes, the n-gram block (its embedding rows gathered on the host: the second
-    /// input), Gated DeltaNet, the attention layers densely (valid up to [`dense_limit`] tokens),
-    /// the MoE blocks. The indexer keys of the attention layers are captured for the host cache.
+    /// input), Gated DeltaNet, the attention layers with their QSA indexer (its keys in a one-head
+    /// KV cache after each layer's attention cache, see [`IdxCache`]; RoPE table 1 holds the
+    /// angles of the first position of the block a token ends), the MoE blocks.
     pub(crate) fn exp_gpu_graph<'s>(&'s self, ex: &'s Exp<'s>, multi: bool) -> Option<crate::gpu::decode::Graph<'s>> {
         use crate::gpu::decode::{Ew, Experts, Graph, LinMode, Op};
         use crate::qwen::{Ffn, Mixer};
@@ -1029,10 +1054,21 @@ impl<'a> QwenModel<'a> {
         let qo = g.buf(nh * hd);
         let att = g.buf(nh * hd);
         let n_attn = self.layers.iter().filter(|l| matches!(l.mixer, Mixer::Attn(_))).count();
-        // Captured: the indexer keys of the attention layers, then the residual streams after the
-        // last layer (what the MTP head reads).
-        let cap = g.buf(n_attn * d + w);
-        let itmp = g.buf((cfg.indexer_n_heads + 1) * d);
+        let nq = cfg.indexer_n_heads * d;
+        let ratio = cfg.indexer_compress_ratio.max(1);
+        let top = cfg.indexer_budget / ratio;
+        let sel_n = (top + 1) * ratio;
+        // Captured: the residual streams after the last layer (what the MTP head reads), then with
+        // OXINFER_QSA_CHECK each attention layer's raw indexer queries and key and the positions
+        // it selected.
+        let check = qsa_check() && !multi;
+        let per = nq + d + sel_n;
+        let n_cap = w + if check { n_attn * per } else { 0 };
+        let cap = g.buf(n_cap);
+        let itmp = g.buf(nq + d);
+        let cap_blocks = QSA_GPU_MAX_POS / ratio;
+        let scores = g.buf(cap_blocks);
+        let selb = g.buf(sel_n);
         let (mut n_exp, mut top_k, mut e_inter, mut s_inter) = (0, 0, 0, 0);
         for l in &self.layers {
             match &l.ffn {
@@ -1066,8 +1102,8 @@ impl<'a> QwenModel<'a> {
         g.input = x0;
         g.hidden = hidden;
         g.n_hidden = h;
-        g.rope_halves = vec![self.inv_freq.len()];
-        g.capture = Some((cap, n_attn * d + w));
+        g.rope_halves = vec![self.inv_freq.len(); 2];
+        g.capture = Some((cap, n_cap));
         // The n-gram block's buffers.
         let ple = ex.ple.as_ref();
         let e = ple.map_or(1, |p| p.e);
@@ -1204,23 +1240,50 @@ impl<'a> QwenModel<'a> {
                         return None;
                     }
                     let ix = el.indexer.as_ref()?;
+                    let (iq, sl) = if check {
+                        (cap.at(w + ai * per), cap.at(w + ai * per + nq + d))
+                    } else {
+                        (itmp, selb)
+                    };
                     match &ix.k {
-                        Some(k) => g.ops.push(lin(k, d, h, hn, cap.at(ai * d), LinMode::Store)?),
-                        None => {
-                            let nq = cfg.indexer_n_heads * d;
-                            g.ops.push(lin(&ix.q, nq + d, h, hn, itmp, LinMode::Store)?);
-                            g.ops.push(Op::Ew {
-                                kind: Ew::Scale(1.0),
-                                a: itmp.at(nq),
-                                b: None,
-                                out: cap.at(ai * d),
-                                n: d,
-                            });
+                        Some(k) => {
+                            g.ops.push(lin(&ix.q, nq, h, hn, iq, LinMode::Store)?);
+                            g.ops.push(lin(k, d, h, hn, iq.at(nq), LinMode::Store)?);
                         }
+                        None => g.ops.push(lin(&ix.q, nq + d, h, hn, iq, LinMode::Store)?),
                     }
                     ai += 1;
                     let slot = g.kv.len();
                     g.kv.push((nkv, hd));
+                    let islot = g.kv.len();
+                    g.kv.push((1, d));
+                    let half = self.inv_freq.len();
+                    g.ops.push(Op::QsaKey {
+                        k: iq.at(nq),
+                        kv: islot,
+                        d,
+                        ratio,
+                        norm: &ix.k_norm,
+                        eps,
+                        half_rot: half,
+                        rope: 1,
+                    });
+                    g.ops.push(Op::QsaSelect {
+                        q: iq,
+                        kv: islot,
+                        nh: cfg.indexer_n_heads,
+                        d,
+                        ratio,
+                        top,
+                        norm: &ix.q_norm,
+                        eps,
+                        scale: 1.0 / (d as f32).sqrt(),
+                        half_rot: half,
+                        rope: 0,
+                        scores,
+                        cap: cap_blocks,
+                        sel: sl,
+                    });
                     g.ops.push(lin(&at.q, qw, h, hn, qkv, LinMode::Store)?);
                     g.ops.push(lin(&at.k, nkv * hd, h, hn, qkv.at(qw), LinMode::Store)?);
                     g.ops.push(lin(&at.v, nkv * hd, h, hn, qkv.at(qw + nkv * hd), LinMode::Store)?);
@@ -1243,7 +1306,7 @@ impl<'a> QwenModel<'a> {
                         v_norm: false,
                         v_from_k: false,
                     });
-                    g.ops.push(Op::Attend {
+                    g.ops.push(Op::AttendSel {
                         q: qo,
                         out: att,
                         kv: slot,
@@ -1251,9 +1314,10 @@ impl<'a> QwenModel<'a> {
                         nkv,
                         hd,
                         scale: (hd as f32).powf(-0.5),
-                        window: None,
                         gate: Some((qkv.at(hd), 2 * hd)),
-                        block: None,
+                        sel: sl,
+                        ratio,
+                        top,
                     });
                     g.ops.push(lin(&at.o, h, nh * hd, att, y, LinMode::Store)?);
                 }
@@ -1338,7 +1402,7 @@ impl<'a> QwenModel<'a> {
             kind: Ew::Scale(1.0),
             a: xw,
             b: None,
-            out: cap.at(n_attn * d),
+            out: cap,
             n: w,
         });
         g.units.push((g.ops.len(), self.layers.len()));
@@ -1350,8 +1414,7 @@ impl<'a> QwenModel<'a> {
     }
 
     /// Runs token `tok` through the Qwen4-Exp GPU decode plan (see [`Self::exp_gpu_graph`]): the
-    /// mixed hidden state and, if wanted, the logits. None (nothing changed) when unavailable,
-    /// or past the dense-attention limit.
+    /// mixed hidden state and, if wanted, the logits. None (nothing changed) when unavailable.
     pub(crate) fn exp_gpu_step(
         &self,
         ex: &Exp<'a>,
@@ -1359,9 +1422,8 @@ impl<'a> QwenModel<'a> {
         tok: u32,
         want_logits: bool,
     ) -> Option<(Vec<f32>, Option<Vec<f32>>)> {
-        use crate::qwen::Mixer;
         let cfg = &self.cfg;
-        if sess.pos + 1 > dense_limit(cfg) || sess.iv.active() || !sess.spans.is_empty() || sess.positions.is_some() {
+        if sess.iv.active() || !sess.spans.is_empty() || sess.positions.is_some() || sess.pos + 1 > QSA_GPU_MAX_POS {
             return None;
         }
         let Some(plan) = self.gpu_plan() else {
@@ -1371,12 +1433,10 @@ impl<'a> QwenModel<'a> {
             return None;
         };
         let h = cfg.hidden_size;
-        let d = cfg.indexer_head_dim;
         let mut x = vec![0f32; h];
         self.embed.row(tok as usize, &mut x);
-        let (mut cs, sin) = self.rope_cs(&sess.spans, sess.pos, 1);
-        cs.extend_from_slice(&sin);
         let pos = sess.pos;
+        let cs = self.exp_rope_rows(pos, 1);
         let es = sess.exp.as_mut()?;
         es.toks.truncate(pos);
         es.toks.push(tok);
@@ -1389,29 +1449,17 @@ impl<'a> QwenModel<'a> {
                 p.table.row(r, &mut x2[i * p.table.dim..(i + 1) * p.table.dim]);
             }
         }
-        let n_attn = self.layers.iter().filter(|l| matches!(l.mixer, Mixer::Attn(_))).count();
+        self.exp_gpu_pool(ex, sess, pos);
         let w = cfg.hc_count * h;
-        let mut cap = vec![0f32; n_attn * d + w];
+        let mut cap = vec![0f32; w + if qsa_check() { self.exp_check_floats() } else { 0 }];
         let mut hidden = vec![0f32; h];
         let mut logits = want_logits.then(|| vec![0f32; cfg.vocab_size]);
         let ok = {
             let _timer = crate::prof::start(crate::prof::Cat::Matmul);
-            let es = sess.exp.as_mut().unwrap();
-            let ple_layer = ex.ple.as_ref().map(|p| p.layer);
-            let mut states: Vec<&mut [f32]> = Vec::new();
-            let mut ple_conv = Some(&mut es.ple_conv[..]);
-            for (l, g) in sess.gdn.iter_mut().enumerate() {
-                if ple_layer == Some(l) {
-                    states.push(ple_conv.take()?);
-                }
-                if let Some(g) = g {
-                    states.push(&mut g.s[..]);
-                    states.push(&mut g.conv[..]);
-                }
-            }
-            let mut kv: Vec<&mut LayerCache> = sess.kv.iter_mut().flatten().collect();
+            let QwenSession { kv, gpu, gdn, exp, .. } = sess;
+            let (mut kv, mut states) = exp_step_refs(gdn, kv, exp.as_deref_mut());
             plan.step(
-                &mut sess.gpu,
+                gpu,
                 crate::gpu::decode::Step {
                     pos,
                     t: 1,
@@ -1437,15 +1485,133 @@ impl<'a> QwenModel<'a> {
             es.toks.truncate(pos);
             return None;
         }
-        for (ai, c) in es.idx.iter_mut().flatten().enumerate() {
-            c.raw.truncate(pos * d);
-            c.raw.extend_from_slice(&cap[ai * d..(ai + 1) * d]);
-            c.pooled.truncate(pos / es.ratio * d);
+        es.last_wide = cap[..w].to_vec();
+        let ratio = es.ratio;
+        // The device's pooled key of a block the token ended (for the check).
+        let gpu_keys: Vec<Vec<f32>> = if cap.len() > w && (pos + 1).is_multiple_of(ratio) {
+            es.idx.iter().flatten().map(|c| c.pooled(pos / ratio, ratio).to_vec()).collect()
+        } else {
+            Vec::new()
+        };
+        self.exp_gpu_repool(ex, sess, pos, 1);
+        if cap.len() > w {
+            self.exp_check(ex, sess, pos, &cap[w..], &gpu_keys);
         }
-        es.last_wide = cap[n_attn * d..].to_vec();
         sess.rec_span = None;
         sess.pos += 1;
         Some((hidden, logits))
+    }
+
+    /// The RoPE rows of a GPU step of `t` tokens at `pos` (see [`Self::exp_gpu_graph`]): per token
+    /// cos then sin of its position, then of the first position of the block it ends.
+    fn exp_rope_rows(&self, pos: usize, t: usize) -> Vec<f32> {
+        let half = self.inv_freq.len();
+        let r = self.cfg.indexer_compress_ratio.max(1);
+        let mut cs = Vec::with_capacity(4 * t * half);
+        for j in 0..t {
+            let (c, s) = self.rope_cs(&[], pos + j, 1);
+            cs.extend_from_slice(&c);
+            cs.extend_from_slice(&s);
+        }
+        for j in 0..t {
+            let (c, s) = self.rope_cs(&[], (pos + j + 1).saturating_sub(r), 1);
+            cs.extend_from_slice(&c);
+            cs.extend_from_slice(&s);
+        }
+        cs
+    }
+
+    /// After a GPU step of `t` tokens at `pos`: the blocks they ended pooled again on the host,
+    /// so that the cache holds the CPU path's pooled keys. The device's own (which that step's
+    /// scores used) can differ in the last bit: its RMSNorm takes `rsqrt` where the CPU path
+    /// takes `powf(-0.5)`, which is not correctly rounded on every platform.
+    fn exp_gpu_repool(&self, ex: &Exp<'a>, sess: &mut QwenSession, pos: usize, t: usize) {
+        let r = self.cfg.indexer_compress_ratio.max(1);
+        if let Some(es) = sess.exp.as_mut() {
+            for c in es.idx.iter_mut().flatten() {
+                c.pooled_n = pos / r;
+            }
+        }
+        self.exp_gpu_pool(ex, sess, pos + t);
+    }
+
+    /// Before a GPU step at `pos`: the pooled keys of the blocks before it that the CPU path has
+    /// not pooled yet (it pools only once QSA drops blocks).
+    fn exp_gpu_pool(&self, ex: &Exp<'a>, sess: &mut QwenSession, pos: usize) {
+        let r = self.cfg.indexer_compress_ratio.max(1);
+        let Some(es) = sess.exp.as_mut() else { return };
+        let rope_at = |p: usize, n: usize| self.rope_cs(&[], p, n);
+        for (el, ic) in ex.layers.iter().zip(es.idx.iter_mut()) {
+            if let (Some(ix), Some(ic)) = (&el.indexer, ic)
+                && ic.pooled_n < pos / r
+            {
+                self.qsa_pool(ix, ic, &rope_at, pos / r);
+            }
+        }
+    }
+
+    /// Floats per step of the OXINFER_QSA_CHECK capture (after the residual streams).
+    fn exp_check_floats(&self) -> usize {
+        let cfg = &self.cfg;
+        let r = cfg.indexer_compress_ratio.max(1);
+        let n_attn = self
+            .layers
+            .iter()
+            .filter(|l| matches!(l.mixer, crate::qwen::Mixer::Attn(_)))
+            .count();
+        n_attn * ((cfg.indexer_n_heads + 1) * cfg.indexer_head_dim + (cfg.indexer_budget / r + 1) * r)
+    }
+
+    /// OXINFER_QSA_CHECK after a GPU step at `pos`: each attention layer's selection from the CPU
+    /// path's scoring of the same raw queries over the same cache, against the GPU's (`got`: per
+    /// layer the raw queries and key, then the positions); the pooled key of a block the token
+    /// ended (`gpu_keys`, per layer) against the CPU pooling of the same raw keys.
+    fn exp_check(&self, ex: &Exp<'a>, sess: &mut QwenSession, pos: usize, got: &[f32], gpu_keys: &[Vec<f32>]) {
+        let cfg = &self.cfg;
+        let (nh, d) = (cfg.indexer_n_heads, cfg.indexer_head_dim);
+        let r = cfg.indexer_compress_ratio.max(1);
+        let top = cfg.indexer_budget / r;
+        let eps = cfg.rms_norm_eps as f32;
+        let per = (nh + 1) * d + (top + 1) * r;
+        let (cos, sin) = self.rope_cs(&[], pos, 1);
+        let es = sess.exp.as_mut().unwrap();
+        let mut ai = 0;
+        for (l, (el, ic)) in ex.layers.iter().zip(es.idx.iter_mut()).enumerate() {
+            let (Some(ix), Some(ic)) = (&el.indexer, ic) else { continue };
+            let row = &got[ai * per..(ai + 1) * per];
+            if let Some(gpu_key) = gpu_keys.get(ai) {
+                let b = pos / r;
+                let cpu_key = ic.pooled(b, r);
+                let ulps = gpu_key
+                    .iter()
+                    .zip(cpu_key)
+                    .map(|(a, c)| (a.to_bits() as i64 - c.to_bits() as i64).abs())
+                    .max()
+                    .unwrap_or(0);
+                if ulps > 0 {
+                    eprintln!("[qsa check] layer {l} pos {pos}: device pooled key of block {b} off by up to {ulps} ulp");
+                }
+            }
+            ai += 1;
+            let nb = (pos + 1) / r;
+            if nb <= top {
+                continue;
+            }
+            let qn = qsa_query(&ix.q_norm, &row[..nh * d], eps, &cos, &sin);
+            let scale = 1.0 / (d as f32).sqrt();
+            let scores: Vec<f32> = (0..nb).map(|b| qsa_score(&qn, ic.pooled(b, r), d, scale)).collect();
+            let cpu = qsa_select(cfg, &scores, pos).unwrap_or_default();
+            let gpu: Vec<u32> = row[(nh + 1) * d..(nh + 1) * d + cpu.len()].iter().map(|v| v.to_bits()).collect();
+            if gpu != cpu {
+                let cb: std::collections::BTreeSet<u32> = cpu.iter().map(|p| p / r as u32).collect();
+                let gb: std::collections::BTreeSet<u32> = gpu.iter().map(|p| p / r as u32).collect();
+                let only: Vec<(u32, f32)> = cb
+                    .symmetric_difference(&gb)
+                    .map(|&b| (b, scores.get(b as usize).copied().unwrap_or(f32::NAN)))
+                    .collect();
+                eprintln!("[qsa check] layer {l} pos {pos}: selection differs, blocks (score) in one only: {only:?}");
+            }
+        }
     }
 }
 
@@ -1501,10 +1667,7 @@ impl<'a> MtpExp<'a> {
 
 /// The MTP layer's indexer cache (Qwen4-Exp).
 pub fn new_idx_cache(cfg: &QwenConfig) -> IdxCache {
-    IdxCache {
-        d: cfg.indexer_head_dim,
-        ..Default::default()
-    }
+    IdxCache::new(cfg.indexer_head_dim)
 }
 
 impl IdxCache {
@@ -1569,23 +1732,47 @@ impl QwenSession {
 }
 
 pub(crate) fn recurrent_states_of<'s>(gdn: &'s mut [Option<crate::qwen::GdnState>], exp: Option<&'s mut ExpSession>) -> Vec<&'s mut [f32]> {
-    {
-        let ple = exp.as_ref().and_then(|e| e.ple_layer);
-        let mut ple_conv = exp.filter(|_| ple.is_some()).map(|e| &mut e.ple_conv[..]);
-        let mut v: Vec<&mut [f32]> = Vec::new();
-        for (l, g) in gdn.iter_mut().enumerate() {
-            if ple == Some(l)
-                && let Some(p) = ple_conv.take()
-            {
-                v.push(p);
-            }
-            if let Some(g) = g {
-                v.push(&mut g.s[..]);
-                v.push(&mut g.conv[..]);
-            }
+    exp_step_refs(gdn, &mut [], exp).1
+}
+
+/// The KV caches of a GPU step in plan order (per attention layer, its cache of `kv` then its
+/// indexer's) and the recurrent states (see [`QwenSession::recurrent_states`]).
+type StepRefs<'s> = (Vec<&'s mut LayerCache>, Vec<&'s mut [f32]>);
+fn exp_step_refs<'s>(
+    gdn: &'s mut [Option<crate::qwen::GdnState>],
+    kv: &'s mut [Option<LayerCache>],
+    exp: Option<&'s mut ExpSession>,
+) -> StepRefs<'s> {
+    let (ple, mut ple_conv, idx) = match exp {
+        Some(e) => {
+            let ExpSession {
+                ple_layer, ple_conv, idx, ..
+            } = e;
+            (*ple_layer, ple_layer.is_some().then_some(&mut ple_conv[..]), Some(idx))
         }
-        v
+        None => (None, None, None),
+    };
+    let mut v: Vec<&mut [f32]> = Vec::new();
+    for (l, g) in gdn.iter_mut().enumerate() {
+        if ple == Some(l)
+            && let Some(p) = ple_conv.take()
+        {
+            v.push(p);
+        }
+        if let Some(g) = g {
+            v.push(&mut g.s[..]);
+            v.push(&mut g.conv[..]);
+        }
     }
+    let mut ix = idx.into_iter().flat_map(|i| i.iter_mut().flatten().map(|c| &mut c.kv));
+    let mut caches = Vec::new();
+    for c in kv.iter_mut().flatten() {
+        caches.push(c);
+        if let Some(i) = ix.next() {
+            caches.push(i);
+        }
+    }
+    (caches, v)
 }
 
 impl<'a> QwenModel<'a> {
@@ -1610,35 +1797,28 @@ impl<'a> QwenModel<'a> {
     /// advanced (indexer keys, n-gram contexts and the MTP head's residual streams included) and
     /// what a rewind inside the pass needs recorded.
     pub(crate) fn exp_gpu_pass(&self, ex: &Exp<'a>, sess: &mut QwenSession, tokens: &[u32], fast: bool) -> Option<(Vec<f32>, Vec<f32>)> {
-        use crate::qwen::Mixer;
         let cfg = &self.cfg;
         let t = tokens.len();
-        if sess.pos + t > dense_limit(cfg) || !sess.spans.is_empty() {
+        if sess.pos + t > QSA_GPU_MAX_POS || !sess.spans.is_empty() {
             return None;
         }
         let plan = self.gpu_multi_plan_pub(t, fast)?;
-        let (h, d) = (cfg.hidden_size, cfg.indexer_head_dim);
+        let h = cfg.hidden_size;
         let w = cfg.hc_count * h;
         let pos = sess.pos;
         let mut x = vec![0f32; t * h];
         for (j, &tok) in tokens.iter().enumerate() {
             self.embed.row(tok as usize, &mut x[j * h..(j + 1) * h]);
         }
-        let half = self.inv_freq.len();
-        let (cos, sin) = self.rope_cs(&sess.spans, pos, t);
-        let mut cs = Vec::with_capacity(2 * t * half);
-        for j in 0..t {
-            cs.extend_from_slice(&cos[j * half..(j + 1) * half]);
-            cs.extend_from_slice(&sin[j * half..(j + 1) * half]);
-        }
+        let cs = self.exp_rope_rows(pos, t);
         let x2 = {
             let es = sess.exp.as_mut()?;
             es.toks.truncate(pos);
             es.toks.extend_from_slice(tokens);
             self.ngram_rows(ex, &es.toks, t)
         };
-        let n_attn = self.layers.iter().filter(|l| matches!(l.mixer, Mixer::Attn(_))).count();
-        let nc = n_attn * d + w;
+        self.exp_gpu_pool(ex, sess, pos);
+        let nc = w;
         let mut captured = vec![0f32; t * nc];
         let mut hidden = vec![0f32; t * h];
         let mut logits = vec![0f32; t * cfg.vocab_size];
@@ -1654,8 +1834,7 @@ impl<'a> QwenModel<'a> {
         let ok = {
             let _timer = crate::prof::start(crate::prof::Cat::Matmul);
             let QwenSession { kv, gpu, gdn, exp, .. } = sess;
-            let mut kv: Vec<&mut LayerCache> = kv.iter_mut().flatten().collect();
-            let mut states = recurrent_states_of(gdn, exp.as_deref_mut());
+            let (mut kv, mut states) = exp_step_refs(gdn, kv, exp.as_deref_mut());
             plan.step(
                 gpu,
                 crate::gpu::decode::Step {
@@ -1680,17 +1859,11 @@ impl<'a> QwenModel<'a> {
             es.toks.truncate(pos);
             return None;
         }
-        for (ai, c) in es.idx.iter_mut().flatten().enumerate() {
-            c.raw.truncate(pos * d);
-            for j in 0..t {
-                c.raw.extend_from_slice(&captured[j * nc + ai * d..j * nc + (ai + 1) * d]);
-            }
-            c.pooled.truncate(pos / es.ratio * d);
-        }
         es.last_wide.clear();
         for j in 0..t {
-            es.last_wide.extend_from_slice(&captured[j * nc + n_attn * d..(j + 1) * nc]);
+            es.last_wide.extend_from_slice(&captured[j * nc..(j + 1) * nc]);
         }
+        self.exp_gpu_repool(ex, sess, pos, t);
         sess.rec_span = None;
         sess.gpu_rec = (t > 1).then_some(crate::qwen::GpuRec {
             plan,
@@ -1700,5 +1873,147 @@ impl<'a> QwenModel<'a> {
         });
         sess.pos += t;
         Some((hidden, logits))
+    }
+}
+
+#[cfg(all(test, feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+mod qsa_gpu_tests {
+    use super::*;
+    use crate::gpu::Backend;
+    use crate::gpu::decode::{Graph, Op, Slot, Step};
+
+    fn lcg(s: &mut u64) -> f32 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((*s >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    }
+
+    /// The Metal QSA ops against the CPU path: the pooled key of a block the token ends, and
+    /// the positions selected (blocks drawn from few distinct pooled keys, so that many scores
+    /// tie exactly and the budget's boundary falls inside a tie: the lower blocks must win).
+    #[test]
+    fn qsa_select_matches_cpu() {
+        let Ok(be) = crate::metal::MetalBackend::new() else { return };
+        let (nh, d, r, top, half) = (4, 128, 4, 512, 32);
+        let eps = 1e-6f32;
+        let mut seed = 7u64;
+        let qw: Vec<f32> = (0..d).map(|_| 1.0 + 0.5 * lcg(&mut seed)).collect();
+        let kw: Vec<f32> = (0..d).map(|_| 1.0 + 0.5 * lcg(&mut seed)).collect();
+        let cap = 4096;
+        let sel_n = (top + 1) * r;
+        let mut g = Graph::new();
+        let inp = g.buf(nh * d + d);
+        let scores = g.buf(cap);
+        let sel = g.buf(sel_n);
+        g.input = inp;
+        g.n_input = nh * d + d;
+        g.hidden = inp;
+        g.n_hidden = 1;
+        g.kv.push((1, d));
+        g.rope_halves = vec![half, half];
+        g.capture = Some((sel, sel_n));
+        g.ops.push(Op::QsaKey {
+            k: inp.at(nh * d),
+            kv: 0,
+            d,
+            ratio: r,
+            norm: &kw,
+            eps,
+            half_rot: half,
+            rope: 1,
+        });
+        g.ops.push(Op::QsaSelect {
+            q: inp,
+            kv: 0,
+            nh,
+            d,
+            ratio: r,
+            top,
+            norm: &qw,
+            eps,
+            scale: 1.0 / (d as f32).sqrt(),
+            half_rot: half,
+            rope: 0,
+            scores,
+            cap,
+            sel,
+        });
+        g.head_from = g.ops.len();
+        let plan = be.decode_plan(&g).expect("QSA plan");
+        // Cached positions: random raw keys; the pooled key of block b is one of 40 vectors.
+        let start = 8003;
+        let distinct: Vec<Vec<f32>> = (0..40).map(|_| (0..d).map(|_| lcg(&mut seed)).collect()).collect();
+        let mut cache = LayerCache::new(1, d);
+        for p in 0..start {
+            let k: Vec<f32> = (0..d).map(|_| lcg(&mut seed)).collect();
+            let v = if (p + 1) % r == 0 {
+                distinct[(p / r * 7919) % distinct.len()].clone()
+            } else {
+                vec![0f32; d]
+            };
+            cache.push(&k, &v, 1);
+        }
+        let angles = |p: usize| -> (Vec<f32>, Vec<f32>) {
+            let a: Vec<f32> = (0..half).map(|i| p as f32 * 0.37f32.powi(i as i32)).collect();
+            (a.iter().map(|x| x.cos()).collect(), a.iter().map(|x| x.sin()).collect())
+        };
+        let mut slot = Slot::default();
+        let mut ties = 0;
+        for pos in start..start + 4 {
+            let x: Vec<f32> = (0..nh * d + d).map(|_| lcg(&mut seed)).collect();
+            let (c0, s0) = angles(pos);
+            let (c1, s1) = angles((pos + 1).saturating_sub(r));
+            let cs: Vec<f32> = [c0.clone(), s0.clone(), c1.clone(), s1.clone()].concat();
+            let mut hidden = [0f32; 1];
+            let mut got = vec![0f32; sel_n];
+            let ok = plan.step(
+                &mut slot,
+                Step {
+                    pos,
+                    t: 1,
+                    rope_cs: &cs,
+                    x: &x,
+                    x2: &[],
+                    kv: &mut [&mut cache],
+                    states: &mut [],
+                    hidden: &mut hidden,
+                    logits: None,
+                    params: None,
+                    capture: Some(&mut got),
+                    scratch: false,
+                    states_kept: false,
+                },
+            );
+            assert!(ok);
+            assert_eq!(cache.len, pos + 1);
+            assert_eq!(cache.k_at(pos, 0), &x[nh * d..]);
+            if (pos + 1) % r == 0 {
+                let mut m = vec![0f32; d];
+                for p in pos + 1 - r..=pos {
+                    add_inplace(&mut m, cache.k_at(p, 0));
+                }
+                scale_inplace(&mut m, 1.0 / r as f32);
+                let mut kn = vec![0f32; d];
+                rmsnorm_f32w(&m, &kw, eps, &mut kn);
+                apply_rope(&mut kn[..2 * half], &c1, &s1);
+                for (a, b) in cache.v_at(pos, 0).iter().zip(&kn) {
+                    assert!((a - b).abs() <= 1e-6 * b.abs().max(1.0), "pooled key {a} vs {b}");
+                }
+            } else {
+                assert!(cache.v_at(pos, 0).iter().all(|&v| v == 0.0));
+            }
+            let qn = qsa_query(&qw, &x[..nh * d], eps, &c0, &s0);
+            let nb = (pos + 1) / r;
+            let sc: Vec<f32> = (0..nb)
+                .map(|b| qsa_score(&qn, cache.v_at(b * r + r - 1, 0), d, 1.0 / (d as f32).sqrt()))
+                .collect();
+            let want = qsa_pick(r, top, &sc, pos).unwrap();
+            let have: Vec<u32> = got[..want.len()].iter().map(|v| v.to_bits()).collect();
+            assert_eq!(have, want, "selection at {pos}");
+            // The boundary inside a tie: a block left out scores as the last one kept.
+            let kept: std::collections::HashSet<u32> = want.iter().map(|p| p / r as u32).filter(|&b| (b as usize) < nb).collect();
+            let low = kept.iter().map(|&b| sc[b as usize]).fold(f32::INFINITY, f32::min);
+            ties += (0..nb).filter(|b| !kept.contains(&(*b as u32)) && sc[*b] == low).count();
+        }
+        assert!(ties > 0, "no tie at the budget boundary");
     }
 }
