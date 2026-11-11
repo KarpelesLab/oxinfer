@@ -20,6 +20,15 @@ use std::path::Path;
 
 const LN_EPS: f32 = 1e-5;
 
+/// Sequences whose next token goes through the decoder's matmuls together. The CPU kernels
+/// compute up to 7 rows one row at a time (8 and more take the tiled prefill kernel, whose sums
+/// round differently) and the GPU backends leave so few rows to the CPU, so a sequence gets the
+/// same bits whatever it is batched with, or alone.
+pub const STEP_ROWS: usize = 7;
+
+/// Windows stacked in one encoder pass at most (bounds the activations held at once).
+const ENC_STACK: usize = 8;
+
 fn d_1500() -> usize {
     1500
 }
@@ -530,14 +539,52 @@ impl WhisperModel {
     /// Encodes one window of log-mel frames (`[window_frames, n_mels]`, time-major) into
     /// `[max_source_positions, d_model]`.
     pub fn encode(&self, mel: &[f32]) -> Vec<f32> {
+        self.encode_stack(&[mel]).pop().unwrap()
+    }
+
+    /// Encodes several windows, each as [`WhisperModel::encode`] does and with the same result
+    /// as encoding it alone. The windows go through the matmuls together (one GPU submission
+    /// per product for all of them) when that changes no value: always on the CPU, whose kernels
+    /// compute each row independently of the others, and on a GPU backend when it takes the same
+    /// products for one window as for the stack. Attention stays per window.
+    pub fn encode_batch(&self, mels: &[&[f32]]) -> Vec<Vec<f32>> {
+        let mut out = Vec::with_capacity(mels.len());
+        for group in mels.chunks(ENC_STACK) {
+            if group.len() > 1 && self.stackable(group.len()) {
+                out.extend(self.encode_stack(group));
+            } else {
+                out.extend(group.iter().map(|m| self.encode(m)));
+            }
+        }
+        out
+    }
+
+    /// Whether `b` windows stacked go through the same matmul paths as one window.
+    fn stackable(&self, b: usize) -> bool {
+        let Some(be) = crate::gpu::active() else {
+            return true;
+        };
+        let cfg = &self.cfg;
+        let (d, f, n) = (cfg.d_model, cfg.encoder_ffn_dim, cfg.max_source_positions);
+        [(d, self.conv1_in, 2 * n), (d, 3 * d, n), (d, d, n), (f, d, n), (d, f, n)]
+            .iter()
+            .all(|&(n_out, n_in, t)| be.wants(n_out, n_in, t) == be.wants(n_out, n_in, b * t))
+    }
+
+    /// The encoder over `mels.len()` windows with their rows stacked in every matmul.
+    fn encode_stack(&self, mels: &[&[f32]]) -> Vec<Vec<f32>> {
         let cfg = &self.cfg;
         let (d, nm) = (cfg.d_model, cfg.num_mel_bins);
         let t = self.window_frames();
-        assert_eq!(mel.len(), t * nm, "encoder input must be {t} frames of {nm} mels");
+        let nb = mels.len();
+        for mel in mels {
+            assert_eq!(mel.len(), t * nm, "encoder input must be {t} frames of {nm} mels");
+        }
         // conv1: kernel 3, padding 1, then GELU.
         let k1 = self.conv1_in;
-        let mut cols = vec![0f32; t * k1];
-        for_chunks(&mut cols, k1, true, |i, r| {
+        let mut cols = vec![0f32; nb * t * k1];
+        for_chunks(&mut cols, k1, true, |row, r| {
+            let (mel, i) = (mels[row / t], row % t);
             for j in 0..3 {
                 let src = i as isize + j as isize - 1;
                 if src >= 0 && (src as usize) < t {
@@ -546,12 +593,13 @@ impl WhisperModel {
                 }
             }
         });
-        let mut h = project(&[&self.conv1], k1, &cols, t).pop().unwrap();
+        let mut h = project(&[&self.conv1], k1, &cols, nb * t).pop().unwrap();
         gelu_inplace(&mut h);
         // conv2: kernel 3, stride 2, padding 1, then GELU and the positions.
         let n = cfg.max_source_positions;
-        let mut cols = vec![0f32; n * 3 * d];
-        for_chunks(&mut cols, 3 * d, true, |i, r| {
+        let mut cols = vec![0f32; nb * n * 3 * d];
+        for_chunks(&mut cols, 3 * d, true, |row, r| {
+            let (h, i) = (&h[row / n * t * d..], row % n);
             for j in 0..3 {
                 let src = (2 * i) as isize + j as isize - 1;
                 if src >= 0 && (src as usize) < t {
@@ -561,10 +609,11 @@ impl WhisperModel {
             }
         });
         drop(h);
-        let mut x = project(&[&self.conv2], 3 * d, &cols, n).pop().unwrap();
+        let mut x = project(&[&self.conv2], 3 * d, &cols, nb * n).pop().unwrap();
         drop(cols);
         let pos = &self.enc_pos;
-        for_chunks(&mut x, d, true, |i, r| {
+        for_chunks(&mut x, d, true, |row, r| {
+            let i = row % n;
             for (v, p) in r.iter_mut().zip(&pos[i * d..(i + 1) * d]) {
                 *v = gelu_erf(*v) + p;
             }
@@ -572,26 +621,31 @@ impl WhisperModel {
 
         let nh = cfg.encoder_attention_heads;
         let dh = d / nh;
-        let mut hn = vec![0f32; n * d];
+        let w = n * d;
+        let mut hn = vec![0f32; nb * w];
         for layer in &self.enc_layers {
             hn.copy_from_slice(&x);
             layer.ln1.apply_rows(&mut hn, LN_EPS);
             let a = &layer.attn;
-            let mut qkv = project(&[&a.q, &a.k, &a.v], d, &hn, n);
+            let mut qkv = project(&[&a.q, &a.k, &a.v], d, &hn, nb * n);
             let (v, k, q) = (qkv.pop().unwrap(), qkv.pop().unwrap(), qkv.pop().unwrap());
-            let att = crate::sd::ops::attention(&q, &k, &v, n, n, nh, dh, false);
-            let o = project(&[&a.o], d, &att, n).pop().unwrap();
+            let mut att = Vec::with_capacity(nb * w);
+            for b in 0..nb {
+                let r = b * w..(b + 1) * w;
+                att.extend(crate::sd::ops::attention(&q[r.clone()], &k[r.clone()], &v[r], n, n, nh, dh, false));
+            }
+            let o = project(&[&a.o], d, &att, nb * n).pop().unwrap();
             crate::kernels::add_inplace(&mut x, &o);
 
             hn.copy_from_slice(&x);
             layer.ln2.apply_rows(&mut hn, LN_EPS);
-            let mut f = project(&[&layer.fc1], d, &hn, n).pop().unwrap();
+            let mut f = project(&[&layer.fc1], d, &hn, nb * n).pop().unwrap();
             gelu_inplace(&mut f);
-            let o = project(&[&layer.fc2], cfg.encoder_ffn_dim, &f, n).pop().unwrap();
+            let o = project(&[&layer.fc2], cfg.encoder_ffn_dim, &f, nb * n).pop().unwrap();
             crate::kernels::add_inplace(&mut x, &o);
         }
         self.enc_ln.apply_rows(&mut x, LN_EPS);
-        x
+        x.chunks(w).map(<[f32]>::to_vec).collect()
     }
 
     /// The cross-attention keys and values of every decoder layer for an encoded window.
@@ -689,6 +743,94 @@ impl WhisperModel {
         y
     }
 
+    /// One decoding step of several sequences at once: sequence `i` takes `tokens[i]` after its
+    /// cached positions, over its own encoder window. Returns the logits `[tokens.len(), vocab]`.
+    /// The sequences share the decoder's matmuls [`STEP_ROWS`] at a time, and each gets the bits
+    /// that `decode` and `logits` give it alone.
+    pub fn decode_step(&self, tokens: &[u32], sts: &mut [&mut DecState], cross: &[&CrossKv]) -> Vec<f32> {
+        assert!(tokens.len() == sts.len() && tokens.len() == cross.len());
+        let d = self.cfg.d_model;
+        let v = self.cfg.vocab_size;
+        let mut out = vec![0f32; tokens.len() * v];
+        let mut r0 = 0;
+        for st in sts.chunks_mut(STEP_ROWS) {
+            let r1 = r0 + st.len();
+            let h = self.decode_rows(&tokens[r0..r1], st, &cross[r0..r1]);
+            linear_multi(&mut [(&self.lm_head, v, &mut out[r0 * v..r1 * v])], d, &h, r1 - r0);
+            r0 = r1;
+        }
+        out
+    }
+
+    /// The decoder over one new token of each of up to [`STEP_ROWS`] sequences: the rows share
+    /// the matmuls, attention runs per sequence over its own caches. Returns the final hidden
+    /// states `[rows, d_model]`.
+    fn decode_rows(&self, tokens: &[u32], sts: &mut [&mut DecState], cross: &[&CrossKv]) -> Vec<f32> {
+        let cfg = &self.cfg;
+        let d = cfg.d_model;
+        let t = tokens.len();
+        debug_assert!(t <= STEP_ROWS);
+        let nh = cfg.decoder_attention_heads;
+        let dh = d / nh;
+        let scale = (dh as f32).powf(-0.5);
+        let mut x = vec![0f32; t * d];
+        for (i, &tok) in tokens.iter().enumerate() {
+            let pos = sts[i].pos;
+            assert!(
+                pos < cfg.max_target_positions,
+                "decoder context of {} exceeded",
+                cfg.max_target_positions
+            );
+            let r = &mut x[i * d..(i + 1) * d];
+            lin_row(&self.lm_head, d, tok as usize, r);
+            if cfg.scale_embedding {
+                crate::kernels::scale_inplace(r, (d as f32).sqrt());
+            }
+            crate::kernels::add_inplace(r, &self.dec_pos[pos * d..(pos + 1) * d]);
+        }
+        let mut hn = vec![0f32; t * d];
+        let mut att = vec![0f32; t * d];
+        for (l, layer) in self.dec_layers.iter().enumerate() {
+            hn.copy_from_slice(&x);
+            layer.ln1.apply_rows(&mut hn, LN_EPS);
+            let a = &layer.self_attn;
+            let mut qkv = project(&[&a.q, &a.k, &a.v], d, &hn, t);
+            let (v, k, mut q) = (qkv.pop().unwrap(), qkv.pop().unwrap(), qkv.pop().unwrap());
+            crate::kernels::scale_inplace(&mut q, scale);
+            for (i, st) in sts.iter_mut().enumerate() {
+                let r = i * d..(i + 1) * d;
+                st.layers[l].push(&k[r.clone()], &v[r.clone()], 1);
+                attention_masked(&q[r.clone()], &st.layers[l], nh, 1, st.pos, None, true, &mut att[r]);
+            }
+            let o = project(&[&a.o], d, &att, t).pop().unwrap();
+            crate::kernels::add_inplace(&mut x, &o);
+
+            hn.copy_from_slice(&x);
+            layer.ln_cross.apply_rows(&mut hn, LN_EPS);
+            let c = &layer.cross;
+            let mut q = project(&[&c.q], d, &hn, t).pop().unwrap();
+            crate::kernels::scale_inplace(&mut q, scale);
+            for (i, cr) in cross.iter().enumerate() {
+                let r = i * d..(i + 1) * d;
+                cr.layers[l].attend(&q[r.clone()], 1, &mut att[r]);
+            }
+            let o = project(&[&c.o], d, &att, t).pop().unwrap();
+            crate::kernels::add_inplace(&mut x, &o);
+
+            hn.copy_from_slice(&x);
+            layer.ln2.apply_rows(&mut hn, LN_EPS);
+            let mut f = project(&[&layer.fc1], d, &hn, t).pop().unwrap();
+            gelu_inplace(&mut f);
+            let o = project(&[&layer.fc2], cfg.decoder_ffn_dim, &f, t).pop().unwrap();
+            crate::kernels::add_inplace(&mut x, &o);
+        }
+        for st in sts.iter_mut() {
+            st.pos += 1;
+        }
+        self.dec_ln.apply_rows(&mut x, LN_EPS);
+        x
+    }
+
     /// Scaled cross-attention scores (`q . k / sqrt(dh)`, before the softmax) of the given
     /// `(layer, head)` pairs for every token of `tokens`, run from an empty cache:
     /// `[heads.len()][tokens.len()][source positions]`. For word-level timestamps.
@@ -757,5 +899,52 @@ impl WhisperModel {
             crate::kernels::add_inplace(&mut x, &o);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rand(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                ((s >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.4
+            })
+            .collect()
+    }
+
+    /// Batching relies on a row of a matmul not depending on the rows computed with it: up to
+    /// `STEP_ROWS` rows for decoding steps, any number of whole windows for the encoder.
+    #[test]
+    fn matmul_rows_do_not_depend_on_the_batch() {
+        let (n_out, n_in) = (200, 96);
+        let w = rand(n_out * n_in, 1);
+        for p in [Precision::F32, Precision::F16, Precision::Bf16, Precision::Q8, Precision::Q4] {
+            let l = make_lin(&w, n_out, n_in, p).unwrap();
+            let run = |x: &[f32], t: usize| {
+                let mut y = vec![0f32; t * n_out];
+                linear_multi(&mut [(&l, n_out, &mut y[..])], n_in, x, t);
+                y
+            };
+            // Decoding steps: each row alone against 2..=STEP_ROWS rows together.
+            let x = rand(STEP_ROWS * n_in, 2);
+            let alone: Vec<f32> = (0..STEP_ROWS).flat_map(|r| run(&x[r * n_in..(r + 1) * n_in], 1)).collect();
+            for t in 2..=STEP_ROWS {
+                assert!(
+                    run(&x[..t * n_in], t) == alone[..t * n_out],
+                    "{p:?}: {t} rows differ from single rows"
+                );
+            }
+            // Encoder: windows of 150 rows (not a multiple of the 8-row tiles), alone and stacked.
+            let win = 150;
+            let x = rand(3 * win * n_in, 3);
+            let alone: Vec<f32> = (0..3).flat_map(|b| run(&x[b * win * n_in..(b + 1) * win * n_in], win)).collect();
+            assert!(run(&x, 3 * win) == alone, "{p:?}: stacked windows differ from single windows");
+        }
     }
 }

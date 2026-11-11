@@ -550,11 +550,18 @@ fn generate_images(m: &mut ImageModel, job: &ImageJob, seed: u64) -> anyhow::Res
 
 /// `POST /v1/audio/transcriptions` and `/v1/audio/translations` (multipart: `file`, `model`,
 /// `language`, `prompt`, `response_format`, `temperature`, `timestamp_granularities[]`).
+/// Beyond the OpenAI API: `beam_size`, `patience`, `length_penalty` and `best_of` (beam search
+/// and best-of-n sampling, as openai-whisper), and several `file` parts, transcribed together
+/// as a batch and answered with a JSON array of the per-file results, in order (`json` and
+/// `verbose_json` only).
 pub(super) fn transcriptions(api: &Arc<Api>, req: &ApiRequest, translate: bool) -> ApiResult<Output> {
     let parts = multipart(req.content_type.as_deref(), &req.body)?;
     let text = |k: &str| field(&parts, k).map(Part::text).filter(|s| !s.is_empty());
     let model = text("model").ok_or_else(|| ApiError::bad("model is required").param("model"))?;
-    let file = field(&parts, "file").ok_or_else(|| ApiError::bad("file is required").param("file"))?;
+    let files: Vec<&Part> = parts.iter().filter(|p| p.name == "file").collect();
+    if files.is_empty() {
+        return Err(ApiError::bad("file is required").param("file"));
+    }
     let format = text("response_format").unwrap_or_else(|| "json".into());
     if !["json", "text", "verbose_json", "srt", "vtt"].contains(&format.as_str()) {
         return Err(
@@ -565,7 +572,33 @@ pub(super) fn transcriptions(api: &Arc<Api>, req: &ApiRequest, translate: bool) 
         .iter()
         .filter(|p| p.name.starts_with("timestamp_granularities"))
         .any(|p| p.text() == "word");
+    if files.len() > 1 && !["json", "verbose_json"].contains(&format.as_str()) {
+        return Err(
+            ApiError::bad("several files are answered as a JSON array: response_format must be json or verbose_json")
+                .param("response_format"),
+        );
+    }
+    let number = |k: &'static str| -> ApiResult<Option<f32>> {
+        text(k)
+            .map(|v| {
+                v.parse::<f32>()
+                    .map_err(|_| ApiError::bad(format!("{k} must be a number")).param(k))
+            })
+            .transpose()
+    };
+    let count = |k: &'static str| -> ApiResult<Option<usize>> {
+        text(k)
+            .map(|v| {
+                v.parse::<usize>()
+                    .map_err(|_| ApiError::bad(format!("{k} must be a positive integer")).param(k))
+            })
+            .transpose()
+    };
     let mut o = crate::whisper::TranscribeOptions {
+        beam_size: count("beam_size")?,
+        patience: number("patience")?,
+        length_penalty: number("length_penalty")?,
+        best_of: count("best_of")?,
         language: text("language"),
         initial_prompt: text("prompt"),
         task: translate.then_some(crate::whisper::Task::Translate),
@@ -582,54 +615,67 @@ pub(super) fn transcriptions(api: &Arc<Api>, req: &ApiRequest, translate: bool) 
         }
     }
     api.models.check(&model, Kind::Transcription)?;
-    let pcm = decode_audio(file)?;
+    let pcms: Vec<Vec<f32>> = files.iter().map(|f| decode_audio(f)).collect::<ApiResult<_>>()?;
+    let refs: Vec<&[f32]> = pcms.iter().map(|p| &p[..]).collect();
     let mut lease = api.models.acquire(&model, Kind::Transcription)?;
     let Loaded::Transcription(t) = lease.model() else { unreachable!() };
-    let tr = t.transcribe(&pcm, &o).map_err(|e| ApiError::new(500, format!("{e:#}")))?;
+    // Bad search options (patience without beam_size, ...) are the request's fault.
+    let mut trs = t.transcribe_batch(&refs, &o).map_err(|e| {
+        let bad = ["beam_size", "patience", "best_of", "length_penalty"];
+        let msg = format!("{e:#}");
+        ApiError::new(if bad.iter().any(|k| msg.starts_with(k)) { 400 } else { 500 }, msg)
+    })?;
     drop(lease);
     let text_body = |s: String, ct: &str| ApiResponse {
         status: 200,
         content_type: ct.into(),
         body: s.into_bytes(),
     };
+    let object = |tr: &crate::whisper::Transcript| -> Value {
+        if format != "verbose_json" {
+            return json!({ "text": tr.text.trim(), "usage": { "type": "duration", "seconds": tr.stats.audio_secs.ceil() } });
+        }
+        let segments: Vec<Value> = tr
+            .segments
+            .iter()
+            .map(|s| {
+                json!({
+                    "id": s.id, "seek": 0, "start": s.start, "end": s.end, "text": s.text, "tokens": s.tokens,
+                    "temperature": s.temperature, "avg_logprob": s.avg_logprob,
+                    "compression_ratio": s.compression_ratio, "no_speech_prob": s.no_speech_prob,
+                })
+            })
+            .collect();
+        let mut v = json!({
+            "task": if translate { "translate" } else { "transcribe" },
+            "language": tr.language,
+            "duration": tr.stats.audio_secs,
+            "text": tr.text.trim(),
+            "segments": segments,
+            "usage": { "type": "duration", "seconds": tr.stats.audio_secs.ceil() },
+        });
+        if words {
+            let w: Vec<Value> = tr
+                .segments
+                .iter()
+                .flat_map(|s| s.words.iter())
+                .map(|w| json!({ "word": w.word.trim(), "start": w.start, "end": w.end }))
+                .collect();
+            v["words"] = Value::Array(w);
+        }
+        v
+    };
+    if trs.len() > 1 {
+        return Ok(Output::Full(ApiResponse::json(
+            200,
+            &Value::Array(trs.iter().map(object).collect()),
+        )));
+    }
+    let tr = trs.pop().unwrap();
     Ok(Output::Full(match format.as_str() {
         "text" => text_body(format!("{}\n", tr.text.trim()), "text/plain; charset=utf-8"),
         "srt" | "vtt" => text_body(subtitles(&tr.segments, format == "vtt"), "text/plain; charset=utf-8"),
-        "verbose_json" => {
-            let segments: Vec<Value> = tr
-                .segments
-                .iter()
-                .map(|s| {
-                    json!({
-                        "id": s.id, "seek": 0, "start": s.start, "end": s.end, "text": s.text, "tokens": s.tokens,
-                        "temperature": s.temperature, "avg_logprob": s.avg_logprob,
-                        "compression_ratio": s.compression_ratio, "no_speech_prob": s.no_speech_prob,
-                    })
-                })
-                .collect();
-            let mut v = json!({
-                "task": if translate { "translate" } else { "transcribe" },
-                "language": tr.language,
-                "duration": tr.stats.audio_secs,
-                "text": tr.text.trim(),
-                "segments": segments,
-                "usage": { "type": "duration", "seconds": tr.stats.audio_secs.ceil() },
-            });
-            if words {
-                let w: Vec<Value> = tr
-                    .segments
-                    .iter()
-                    .flat_map(|s| s.words.iter())
-                    .map(|w| json!({ "word": w.word.trim(), "start": w.start, "end": w.end }))
-                    .collect();
-                v["words"] = Value::Array(w);
-            }
-            ApiResponse::json(200, &v)
-        }
-        _ => ApiResponse::json(
-            200,
-            &json!({ "text": tr.text.trim(), "usage": { "type": "duration", "seconds": tr.stats.audio_secs.ceil() } }),
-        ),
+        _ => ApiResponse::json(200, &object(&tr)),
     }))
 }
 

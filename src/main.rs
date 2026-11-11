@@ -143,6 +143,13 @@ struct Args {
     precision: Option<String>,
     fallback: bool,
     condition_on_prev: bool,
+    /// Further `--transcribe` files, transcribed with the first as a batch.
+    transcribe_more: Vec<PathBuf>,
+    beam: Option<usize>,
+    patience: Option<f32>,
+    length_penalty: Option<f32>,
+    best_of: Option<usize>,
+    batch: Option<usize>,
     // Janus-Pro text-to-image.
     generate_image: Option<String>,
     num_images: usize,
@@ -377,7 +384,9 @@ fn usage() -> ! {
          \x20                      on top of --model (fetches the small files only)\n\
          \n\
          speech to text (Whisper models: openai/whisper-*, distil-whisper/*; detected from config.json):\n\
-         \x20 --transcribe FILE    audio to transcribe (WAV/MP3/FLAC/AAC/OGG via oxideav; any length)\n\
+         \x20 --transcribe FILE    audio to transcribe (WAV/MP3/FLAC/AAC/OGG via oxideav; any length);\n\
+         \x20                      repeat it for several files, decoded together (--batch N at a time,\n\
+         \x20                      default 8) with the results each file gets alone\n\
          \x20 --language XX        spoken language (code or name; default: detected from the first 30 s)\n\
          \x20 --translate          translate to English instead of transcribing\n\
          \x20 --timestamps         print timed segments (always on past 30 s of audio)\n\
@@ -387,6 +396,10 @@ fn usage() -> ! {
          \x20 --prefix T           text the transcript starts with\n\
          \x20 --fallback           temperature fallback on repetitive or unlikely windows (openai defaults)\n\
          \x20 --condition-on-prev  feed each window the previous text\n\
+         \x20 --beam N             beam search with N beams (openai-whisper's beam_size) at temperature 0;\n\
+         \x20                      --patience P ends it after round(N * P) finished hypotheses (default 1),\n\
+         \x20                      --length-penalty A ranks them by logprob / ((5 + length) / 6)^A\n\
+         \x20 --best-of N          at temperatures above 0 (--temp, --fallback) keep the best of N samples\n\
          \x20 --precision P        weights: f32 (matches transformers token for token), f16, bf16 (default);\n\
          \x20                      --quant q8|q4 quantizes the decoder (--temp T samples at T)\n\
          \n\
@@ -522,6 +535,12 @@ fn parse_args() -> Result<Args> {
         precision: None,
         fallback: false,
         condition_on_prev: false,
+        transcribe_more: Vec::new(),
+        beam: None,
+        patience: None,
+        length_penalty: None,
+        best_of: None,
+        batch: None,
         generate_image: None,
         num_images: 1,
         temp_given: false,
@@ -740,7 +759,13 @@ fn parse_args() -> Result<Args> {
             "--decide-json" => a.decide_json = Some(PathBuf::from(val()?)),
             "--decision-from" => a.decision_from = Some(val()?),
             "--show-tokens" => a.show_tokens = true,
+            "--transcribe" if a.transcribe.is_some() => a.transcribe_more.push(PathBuf::from(val()?)),
             "--transcribe" => a.transcribe = Some(PathBuf::from(val()?)),
+            "--beam" => a.beam = Some(val()?.parse()?),
+            "--patience" => a.patience = Some(val()?.parse()?),
+            "--length-penalty" => a.length_penalty = Some(val()?.parse()?),
+            "--best-of" => a.best_of = Some(val()?.parse()?),
+            "--batch" => a.batch = Some(val()?.parse()?),
             "--language" => a.language = Some(val()?),
             "--translate" => a.translate = true,
             "--timestamps" => a.timestamps = true,

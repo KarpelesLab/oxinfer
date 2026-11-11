@@ -362,6 +362,13 @@ char *oxi_transcriber_info_json(OxiTranscriber *t);
  *   "suppress_blank": true       no blank / end of text as the first token
  *   "max_new_tokens": null       per window
  *   "seed": 0                    sampling seed (temperatures above 0)
+ *   "beam_size": null            beam search with this many beams at temperature 0, as
+ *                                openai-whisper does it (null: greedy)
+ *   "patience": null             beam search ends after round(beam_size * patience) finished
+ *                                hypotheses (null: 1.0)
+ *   "length_penalty": null       rank the finished hypotheses by logprob / ((5 + length) / 6)^a,
+ *                                a in 0..1 (null: logprob / length)
+ *   "best_of": null              sequences sampled at each temperature above 0, the best kept
  * openai-whisper's robust defaults: {"temperatures": [0, 0.2, 0.4, 0.6, 0.8, 1],
  *   "compression_ratio_threshold": 2.4, "logprob_threshold": -1, "no_speech_threshold": 0.6}.
  *

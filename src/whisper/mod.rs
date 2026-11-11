@@ -4,7 +4,7 @@
 //! (80 or 128 mel bins), special tokens and decoding defaults from `generation_config.json`.
 //!
 //! Decoding follows transformers' `WhisperForConditionalGeneration.generate` (greedy by default,
-//! so its transcripts can be compared token for token):
+//! so its transcripts can be compared token for token), and openai-whisper for beam search:
 //! - language detection from the first window's first-token distribution over the language
 //!   tokens when no language is given; transcribe or translate;
 //! - `suppress_tokens` / `begin_suppress_tokens`; the timestamp rules of
@@ -14,7 +14,12 @@
 //! - optional temperature fallback (compression ratio, average log-probability and no-speech
 //!   thresholds), conditioning on the previous window's text, an initial prompt and a prefix;
 //! - optional word-level timestamps from the alignment heads' cross-attention (openai-whisper's
-//!   DTW alignment).
+//!   DTW alignment);
+//! - optional beam search ([`TranscribeOptions::beam_size`], `patience`, `length_penalty`) at
+//!   temperature 0 and the best of several samples above it (`best_of`), as openai-whisper's
+//!   `BeamSearchDecoder` and `MaximumLikelihoodRanker` do them;
+//! - several inputs at once ([`Transcriber::transcribe_batch`]): their windows share the encoder
+//!   and every decoder step, with the transcripts each input gets alone.
 //!
 //! ```no_run
 //! use oxinfer::whisper::{Transcriber, TranscriberOptions, TranscribeOptions};
@@ -37,7 +42,10 @@
 //! ([`TranscriberOptions::decoder`]).
 
 pub mod align;
+#[cfg(test)]
+mod batch_tests;
 mod compress;
+mod decode;
 pub mod mel;
 pub mod model;
 pub mod tokens;
@@ -49,7 +57,6 @@ use crate::engine::{CancelHandle, Flow, RUN};
 use crate::platform::DevicePref;
 use crate::pool;
 use crate::safetensors::ModelFiles;
-use crate::sampler::{Sampler, argmax};
 use crate::tokenizer::Tokenizer;
 use anyhow::{Context, Result, bail};
 pub use model::{Precision, WhisperConfig, WhisperModel};
@@ -184,6 +191,19 @@ pub struct TranscribeOptions {
     pub max_new_tokens: Option<usize>,
     /// Seed of the sampler (temperatures above 0).
     pub seed: u64,
+    /// Beam search with this many beams at temperature 0 (openai-whisper's `beam_size`); None
+    /// is greedy decoding. Temperatures above 0 (the fallback) sample instead.
+    pub beam_size: Option<usize>,
+    /// Beam search ends once `round(beam_size * patience)` hypotheses have ended (None: 1.0).
+    pub patience: Option<f32>,
+    /// Ranking of the ended hypotheses (beams, or the `best_of` samples): None divides the
+    /// log-probability by the length, Some(a), 0 to 1, by `((5 + length) / 6)^a`.
+    pub length_penalty: Option<f32>,
+    /// Sequences sampled at each temperature above 0, of which the best ranked is kept (None: 1).
+    pub best_of: Option<usize>,
+    /// Inputs decoded together by [`Transcriber::transcribe_batch`] (the others wait for a free
+    /// place). Each holds its features and one window's cross-attention keys and values.
+    pub batch_size: usize,
 }
 
 impl Default for TranscribeOptions {
@@ -204,6 +224,11 @@ impl Default for TranscribeOptions {
             suppress_blank: true,
             max_new_tokens: None,
             seed: 0,
+            beam_size: None,
+            patience: None,
+            length_penalty: None,
+            best_of: None,
+            batch_size: 8,
         }
     }
 }
@@ -251,7 +276,8 @@ pub struct Segment {
     pub words: Vec<Word>,
 }
 
-/// Timings of one transcription, in seconds.
+/// Timings of one transcription, in seconds. In a batch, `encode_secs` and `decode_secs` are the
+/// time of the passes the input took part in (shared with the inputs decoded with it).
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct TranscribeStats {
     pub audio_secs: f64,
@@ -261,7 +287,7 @@ pub struct TranscribeStats {
     pub decode_secs: f64,
     pub total_secs: f64,
     pub windows: usize,
-    /// Decoder passes that produced a token, fallback retries included.
+    /// Decoder passes that produced a token, fallback retries and every beam or sample included.
     pub tokens: usize,
     /// Wall time over audio duration (lower is faster; 0.1 = ten times real time).
     pub rtf: f64,
@@ -308,14 +334,43 @@ pub struct Transcriber {
     cancel: Arc<AtomicBool>,
 }
 
-/// One decoding attempt of a window.
-struct Attempt {
-    /// Generated tokens, `<|endoftext|>` included when it was produced.
-    tokens: Vec<u32>,
-    /// log-softmax of the processed logits at each chosen token.
-    logprobs: Vec<f32>,
-    no_speech_prob: f32,
-    cancelled: bool,
+/// The options of a transcription resolved against the checkpoint (shared by a batch).
+struct Plan<'a> {
+    o: &'a TranscribeOptions,
+    task: Task,
+    /// The language token when it is given (else detected per input).
+    language: Option<u32>,
+    prompt: Option<Vec<u32>>,
+    prefix: Vec<u32>,
+    suppress: Vec<bool>,
+    /// Beam search: (beams, ended hypotheses that end the search).
+    beam: Option<(usize, usize)>,
+}
+
+/// One input on its way through a transcription.
+struct Stream {
+    /// Position among the inputs.
+    index: usize,
+    feats: mel::Features,
+    timestamps: bool,
+    language: Option<u32>,
+    /// Segment history for conditioning (raw tokens, the prompt first).
+    history: Vec<Vec<u32>>,
+    all_text: Vec<u32>,
+    /// The next window's first frame.
+    seek: usize,
+    condition: bool,
+    out: Transcript,
+    stats: TranscribeStats,
+    started: Instant,
+}
+
+/// The decoder prompt of a window.
+struct Prompt {
+    input: Vec<u32>,
+    sot_index: usize,
+    sot_len: usize,
+    max_new: usize,
 }
 
 /// What the logits rules need.
@@ -485,91 +540,121 @@ impl Transcriber {
         p
     }
 
-    /// One decoding attempt over a window: `input` is the decoder prompt (context, then the
-    /// start-of-transcript sequence at `sot_index`); generates until `<|endoftext|>` or `max_new`.
-    #[allow(clippy::too_many_arguments)]
-    fn generate(
-        &self,
-        cross: &model::CrossKv,
-        input: &[u32],
-        sot_index: usize,
-        temperature: f32,
-        rules: &Rules,
-        max_new: usize,
-        seed: u64,
-        stats: &mut TranscribeStats,
-    ) -> Attempt {
-        let m = &self.model;
-        let d = m.cfg.d_model;
-        let mut st = m.new_state();
-        let h = m.decode(input, &mut st, cross);
-        let t = input.len();
-        // No-speech probability: the raw logits at <|startoftranscript|>.
-        let no_speech_prob = {
-            let l = m.logits(&h[sot_index * d..(sot_index + 1) * d]);
-            softmax_prob(&l, self.sp.no_speech as usize)
-        };
-        let mut logits = m.logits(&h[(t - 1) * d..t * d]);
-        let mut sampler = Sampler::new(temperature, 0, 1.0, seed.max(1));
-        let mut a = Attempt {
-            tokens: Vec::new(),
-            logprobs: Vec::new(),
-            no_speech_prob,
-            cancelled: false,
-        };
-        while a.tokens.len() < max_new {
-            if self.cancel.load(Ordering::SeqCst) {
-                a.cancelled = true;
-                break;
-            }
-            process(&self.sp, &mut logits, &a.tokens, rules);
-            let tok = if temperature > 0.0 {
-                sampler.sample(&logits)
-            } else {
-                argmax(&logits)
-            };
-            a.logprobs.push(log_softmax_at(&logits, tok as usize));
-            a.tokens.push(tok);
-            stats.tokens += 1;
-            if tok == self.sp.eot || st.pos >= m.cfg.max_target_positions {
-                break;
-            }
-            let h = m.decode(&[tok], &mut st, cross);
-            logits = m.logits(&h);
-        }
-        a
-    }
-
     /// Transcribes 16 kHz mono samples, calling `on_segment` as each segment is final (after
     /// its 30 s window is decoded); returning [`Flow::Stop`] ends the transcription there.
     pub fn transcribe_with(&self, pcm: &[f32], o: &TranscribeOptions, on_segment: &mut dyn FnMut(&Segment) -> Flow) -> Result<Transcript> {
+        let mut out = self.transcribe_batch_with(&[pcm], o, &mut |_, s| on_segment(s))?;
+        Ok(out.pop().unwrap())
+    }
+
+    /// Transcribes several inputs (16 kHz mono samples each) together: the current 30 s window
+    /// of every input goes through the encoder and through each decoder step as one batch,
+    /// [`TranscribeOptions::batch_size`] inputs at a time. Each transcript is the one
+    /// [`Transcriber::transcribe`] gives for that input alone, token for token and bit for bit
+    /// in its probabilities (a row of a batch does not depend on the others). The windows of one
+    /// input stay sequential: each starts where the previous one's last segment ended.
+    pub fn transcribe_batch(&self, pcms: &[&[f32]], opts: &TranscribeOptions) -> Result<Vec<Transcript>> {
+        self.transcribe_batch_with(pcms, opts, &mut |_, _| Flow::Continue)
+    }
+
+    /// [`Transcriber::transcribe_batch`], calling `on_segment` with the input's index as each
+    /// segment is final; returning [`Flow::Stop`] ends that input's transcription there (the
+    /// others go on). Segments of different inputs arrive interleaved, in order for each input.
+    pub fn transcribe_batch_with(
+        &self,
+        pcms: &[&[f32]],
+        o: &TranscribeOptions,
+        on_segment: &mut dyn FnMut(usize, &Segment) -> Flow,
+    ) -> Result<Vec<Transcript>> {
         let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
         self.cancel.store(false, Ordering::SeqCst);
-        let t_start = Instant::now();
-        let m = &self.model;
-        let sp = &self.sp;
-        let mut out = Transcript::default();
-        let mut stats = TranscribeStats {
-            audio_secs: pcm.len() as f64 / mel::SAMPLE_RATE as f64,
-            ..Default::default()
-        };
+        let plan = self.plan(o)?;
+        let batch = o.batch_size.max(1);
+        let mut outs: Vec<Option<Transcript>> = pcms.iter().map(|_| None).collect();
+        let mut active: Vec<Stream> = Vec::new();
+        let mut next = 0usize;
+        loop {
+            let cancelled = self.cancel.load(Ordering::SeqCst);
+            while !cancelled && active.len() < batch && next < pcms.len() {
+                active.push(self.open(next, pcms[next], &plan));
+                next += 1;
+            }
+            // Inputs that are done (or stopped) leave their place to the next ones.
+            let mut i = 0;
+            while i < active.len() {
+                let s = &mut active[i];
+                s.out.stopped |= cancelled;
+                if s.out.stopped || s.seek >= s.feats.frames {
+                    let s = active.remove(i);
+                    let index = s.index;
+                    outs[index] = Some(self.close(s));
+                } else {
+                    i += 1;
+                }
+            }
+            if active.is_empty() {
+                if cancelled || next >= pcms.len() {
+                    break;
+                }
+                continue;
+            }
+            self.round(&plan, &mut active, on_segment)?;
+        }
+        // Cancelled before they started.
+        Ok(outs
+            .into_iter()
+            .map(|t| {
+                t.unwrap_or_else(|| Transcript {
+                    language: if self.sp.multilingual { "" } else { "en" }.to_string(),
+                    stopped: true,
+                    ..Default::default()
+                })
+            })
+            .collect())
+    }
 
-        let t0 = Instant::now();
-        let feats = mel::log_mel(pcm, m.cfg.num_mel_bins);
-        stats.mel_secs = t0.elapsed().as_secs_f64();
-        let win = m.window_frames();
-        let max_frames = feats.frames;
-        let shortform = max_frames <= win;
-        let word_ts = o.word_timestamps;
-        if word_ts && sp.alignment_heads.is_empty() {
+    /// Transcribes several audio files together (see [`Transcriber::transcribe_batch`]).
+    #[cfg(feature = "media")]
+    pub fn transcribe_files(&self, paths: &[&Path], opts: &TranscribeOptions) -> Result<Vec<Transcript>> {
+        let pcms: Vec<Vec<f32>> = paths
+            .iter()
+            .map(|p| Self::load_audio(p).with_context(|| format!("{}", p.display())))
+            .collect::<Result<_>>()?;
+        let refs: Vec<&[f32]> = pcms.iter().map(|p| &p[..]).collect();
+        self.transcribe_batch(&refs, opts)
+    }
+
+    /// Checks the options and resolves them against the checkpoint.
+    fn plan<'a>(&self, o: &'a TranscribeOptions) -> Result<Plan<'a>> {
+        let sp = &self.sp;
+        let m = &self.model;
+        if o.word_timestamps && sp.alignment_heads.is_empty() {
             bail!("word timestamps need alignment_heads in generation_config.json");
         }
-        let timestamps = o.timestamps || word_ts || !shortform;
         if o.temperatures.is_empty() {
             bail!("temperatures must not be empty");
         }
         if o.no_speech_threshold.is_some() && o.logprob_threshold.is_none() {
             bail!("no_speech_threshold needs logprob_threshold");
+        }
+        let beam = match o.beam_size {
+            Some(0) => bail!("beam_size must be at least 1"),
+            Some(size) => {
+                // Python's round (half to even), as openai-whisper computes it.
+                let max_candidates = (size as f64 * o.patience.unwrap_or(1.0) as f64).round_ties_even();
+                if max_candidates.is_nan() || max_candidates < 1.0 {
+                    bail!("patience {:?} leaves no hypothesis to wait for with {size} beams", o.patience);
+                }
+                Some((size, max_candidates as usize))
+            }
+            None if o.patience.is_some() => bail!("patience needs beam_size"),
+            None => None,
+        };
+        if o.best_of == Some(0) {
+            bail!("best_of must be at least 1");
+        }
+        if o.length_penalty.is_some_and(|a| !(0.0..=1.0).contains(&a)) {
+            bail!("length_penalty must be between 0 and 1");
         }
 
         // Task and language tokens.
@@ -610,108 +695,213 @@ impl Transcriber {
                 suppress[t as usize] = true;
             }
         }
-        let begin_suppress: &[u32] = if o.suppress_blank { &sp.begin_suppress } else { &[] };
-        let rules = Rules {
-            suppress: &suppress,
-            begin_suppress,
-            timestamps,
-        };
+        Ok(Plan {
+            o,
+            task,
+            language,
+            prompt,
+            prefix,
+            suppress,
+            beam,
+        })
+    }
 
-        // Segment history for conditioning (raw tokens, the prompt first).
+    /// Starts an input: its features and decoding state.
+    fn open(&self, index: usize, pcm: &[f32], plan: &Plan) -> Stream {
+        let o = plan.o;
+        let started = Instant::now();
+        let mut stats = TranscribeStats {
+            audio_secs: pcm.len() as f64 / mel::SAMPLE_RATE as f64,
+            ..Default::default()
+        };
+        let feats = mel::log_mel(pcm, self.model.cfg.num_mel_bins);
+        stats.mel_secs = started.elapsed().as_secs_f64();
+        let shortform = feats.frames <= self.model.window_frames();
         let mut history: Vec<Vec<u32>> = Vec::new();
         if o.condition_on_prev_tokens
-            && let Some(p) = &prompt
+            && let Some(p) = &plan.prompt
         {
             history.push(p.clone());
         }
-        let mut all_text: Vec<u32> = Vec::new();
-        let mut seek = 0usize;
-        let mut condition = o.condition_on_prev_tokens;
-        let cut_off = m.cfg.max_target_positions / 2 - 1;
-        while seek < max_frames {
-            if self.cancel.load(Ordering::SeqCst) {
-                out.stopped = true;
-                break;
-            }
-            let seek_num = (max_frames - seek).min(win);
-            let time_offset = seek as f64 * FRAME_SECS;
-            let te = Instant::now();
-            let mut window = feats.window(seek);
-            // Frames past this window's audio are zeros (the last window).
-            window[seek_num * feats.n_mels..].fill(0.0);
-            window.resize(win * feats.n_mels, 0.0);
-            let cross = m.cross_kv(&m.encode(&window));
-            stats.encode_secs += te.elapsed().as_secs_f64();
-            stats.windows += 1;
-            let td = Instant::now();
-            if sp.multilingual && language.is_none() {
-                let probs = self.language_probs(&cross);
-                let best = &probs[0];
-                language = Some(sp.language_token(&best.0)?);
-                out.language_probability = Some(best.1);
-            }
+        Stream {
+            index,
+            feats,
+            timestamps: o.timestamps || o.word_timestamps || !shortform,
+            language: plan.language,
+            history,
+            all_text: Vec::new(),
+            seek: 0,
+            condition: o.condition_on_prev_tokens,
+            out: Transcript::default(),
+            stats,
+            started,
+        }
+    }
 
-            // Decoder input: context, then <|startoftranscript|> [language task] [notimestamps].
-            let mut input: Vec<u32> = Vec::new();
-            if condition && !history.is_empty() {
-                let flat: Vec<u32> = history
+    /// Ends an input: its transcript.
+    fn close(&self, s: Stream) -> Transcript {
+        let sp = &self.sp;
+        let mut out = s.out;
+        out.text = tokens::decode_text(&self.tok, sp, &s.all_text).trim().to_string();
+        out.language = match s.language {
+            Some(l) => sp.language_of(l).unwrap_or("").to_string(),
+            // English-only models (or stopped before detection).
+            None => if sp.multilingual { "" } else { "en" }.to_string(),
+        };
+        let mut stats = s.stats;
+        stats.total_secs = s.started.elapsed().as_secs_f64();
+        stats.rtf = stats.total_secs / stats.audio_secs.max(1e-9);
+        out.stats = stats;
+        out
+    }
+
+    /// The decoder input of a stream's next window: context, then `<|startoftranscript|>
+    /// [language task] [notimestamps]` and the prefix.
+    fn prompt(&self, plan: &Plan, s: &Stream) -> Result<Prompt> {
+        let sp = &self.sp;
+        let o = plan.o;
+        let cut_off = self.model.cfg.max_target_positions / 2 - 1;
+        let mut input: Vec<u32> = Vec::new();
+        if s.condition && !s.history.is_empty() {
+            let flat: Vec<u32> = s
+                .history
+                .iter()
+                .flat_map(|s| {
+                    let skip = s.len() > 2 && s[s.len() - 2] >= sp.timestamp_begin;
+                    s[..s.len() - skip as usize].iter().copied()
+                })
+                .collect();
+            input.push(sp.sot_prev.context("no <|startofprev|> token")?);
+            input.extend_from_slice(&flat[flat.len().saturating_sub(cut_off)..]);
+        } else if let Some(p) = &plan.prompt {
+            input.push(sp.sot_prev.context("no <|startofprev|> token")?);
+            input.extend_from_slice(p);
+        }
+        let sot_index = input.len();
+        let sot_len = if sp.multilingual { 3 } else { 1 };
+        input.push(sp.sot);
+        if sp.multilingual {
+            input.push(s.language.unwrap());
+            input.push(match plan.task {
+                Task::Transcribe => sp.transcribe.context("no <|transcribe|> token")?,
+                Task::Translate => sp.translate.context("no <|translate|> token")?,
+            });
+        }
+        if !s.timestamps {
+            input.push(sp.no_timestamps);
+        }
+        if s.seek == 0 {
+            input.extend_from_slice(&plan.prefix);
+        }
+        if input.len() >= sp.max_length {
+            bail!(
+                "the prompt ({} tokens) leaves no room in the {}-token decoder",
+                input.len(),
+                sp.max_length
+            );
+        }
+        let mut max_new = sp.max_length - input.len();
+        if let Some(n) = o.max_new_tokens {
+            max_new = max_new.min(n);
+        }
+        Ok(Prompt {
+            input,
+            sot_index,
+            sot_len,
+            max_new,
+        })
+    }
+
+    /// Decodes the next window of every stream (none is done): one encoder pass, then the
+    /// decoding attempts, the streams that need another temperature going on together.
+    fn round(&self, plan: &Plan, streams: &mut [Stream], on_segment: &mut dyn FnMut(usize, &Segment) -> Flow) -> Result<()> {
+        let m = &self.model;
+        let sp = &self.sp;
+        let o = plan.o;
+        let win = m.window_frames();
+        let n = streams.len();
+
+        let te = Instant::now();
+        let windows: Vec<Vec<f32>> = streams
+            .iter()
+            .map(|s| {
+                let seek_num = (s.feats.frames - s.seek).min(win);
+                let mut window = s.feats.window(s.seek);
+                // Frames past this window's audio are zeros (the last window).
+                window[seek_num * s.feats.n_mels..].fill(0.0);
+                window.resize(win * s.feats.n_mels, 0.0);
+                window
+            })
+            .collect();
+        let refs: Vec<&[f32]> = windows.iter().map(|w| &w[..]).collect();
+        let cross: Vec<model::CrossKv> = m.encode_batch(&refs).iter().map(|e| m.cross_kv(e)).collect();
+        drop(windows);
+        let encode_secs = te.elapsed().as_secs_f64();
+
+        let td = Instant::now();
+        let mut prompts: Vec<Prompt> = Vec::with_capacity(n);
+        for (s, c) in streams.iter_mut().zip(&cross) {
+            s.stats.encode_secs += encode_secs;
+            s.stats.windows += 1;
+            if sp.multilingual && s.language.is_none() {
+                let probs = self.language_probs(c);
+                let best = &probs[0];
+                s.language = Some(sp.language_token(&best.0)?);
+                s.out.language_probability = Some(best.1);
+            }
+            prompts.push(self.prompt(plan, s)?);
+        }
+        let begin_suppress: &[u32] = if o.suppress_blank { &sp.begin_suppress } else { &[] };
+        let rules: Vec<Rules> = streams
+            .iter()
+            .map(|s| Rules {
+                suppress: &plan.suppress,
+                begin_suppress,
+                timestamps: s.timestamps,
+            })
+            .collect();
+
+        // Decode, retrying at higher temperatures while the thresholds say so.
+        let mut chosen: Vec<Option<(decode::Attempt, f32)>> = (0..n).map(|_| None).collect();
+        let mut skip = vec![false; n];
+        let mut pending: Vec<usize> = (0..n).collect();
+        for (fi, &temp) in o.temperatures.iter().enumerate() {
+            // Beam search at temperature 0, sampling (the best of `best_of`) above it.
+            let search = match plan.beam {
+                Some((size, max_candidates)) if temp <= 0.0 => decode::Search::Beam { size, max_candidates },
+                _ => decode::Search::Sample {
+                    temperature: temp,
+                    n: if temp > 0.0 { o.best_of.unwrap_or(1) } else { 1 },
+                },
+            };
+            let attempts = {
+                let jobs: Vec<decode::Job> = pending
                     .iter()
-                    .flat_map(|s| {
-                        let skip = s.len() > 2 && s[s.len() - 2] >= sp.timestamp_begin;
-                        s[..s.len() - skip as usize].iter().copied()
+                    .map(|&i| decode::Job {
+                        cross: &cross[i],
+                        input: &prompts[i].input,
+                        sot_index: prompts[i].sot_index,
+                        rules: &rules[i],
+                        search,
+                        length_penalty: o.length_penalty,
+                        // openai-whisper's beam search stops after half the context.
+                        max_new: match search {
+                            decode::Search::Beam { .. } => prompts[i].max_new.min(m.cfg.max_target_positions / 2),
+                            decode::Search::Sample { .. } => prompts[i].max_new,
+                        },
+                        seed: o.seed.wrapping_add(streams[i].seek as u64 * 31 + fi as u64),
                     })
                     .collect();
-                input.push(sp.sot_prev.context("no <|startofprev|> token")?);
-                input.extend_from_slice(&flat[flat.len().saturating_sub(cut_off)..]);
-            } else if let Some(p) = &prompt {
-                input.push(sp.sot_prev.context("no <|startofprev|> token")?);
-                input.extend_from_slice(p);
-            }
-            let sot_index = input.len();
-            let sot_len = if sp.multilingual { 3 } else { 1 };
-            input.push(sp.sot);
-            if sp.multilingual {
-                input.push(language.unwrap());
-                input.push(match task {
-                    Task::Transcribe => sp.transcribe.context("no <|transcribe|> token")?,
-                    Task::Translate => sp.translate.context("no <|translate|> token")?,
-                });
-            }
-            if !timestamps {
-                input.push(sp.no_timestamps);
-            }
-            if seek == 0 {
-                input.extend_from_slice(&prefix);
-            }
-            if input.len() >= sp.max_length {
-                bail!(
-                    "the prompt ({} tokens) leaves no room in the {}-token decoder",
-                    input.len(),
-                    sp.max_length
-                );
-            }
-            let mut max_new = sp.max_length - input.len();
-            if let Some(n) = o.max_new_tokens {
-                max_new = max_new.min(n);
-            }
-
-            // Decode, retrying at higher temperatures while the thresholds say so.
-            let mut chosen: Option<(Attempt, f32)> = None;
-            let mut skip = false;
-            for (fi, &temp) in o.temperatures.iter().enumerate() {
-                let a = self.generate(
-                    &cross,
-                    &input,
-                    sot_index,
-                    temp,
-                    &rules,
-                    max_new,
-                    o.seed.wrapping_add(seek as u64 * 31 + fi as u64),
-                    &mut stats,
-                );
+                decode::run(m, sp, &jobs, &self.cancel)
+            };
+            let last = fi + 1 == o.temperatures.len();
+            let mut again: Vec<usize> = Vec::new();
+            for (&i, a) in pending.iter().zip(attempts) {
+                let s = &mut streams[i];
+                s.stats.tokens += a.steps;
                 if a.cancelled {
-                    out.stopped = true;
-                    break;
+                    s.out.stopped = true;
+                    continue;
                 }
                 let cr = compress::compression_ratio(&a.tokens);
                 let lp = a.logprobs.iter().sum::<f32>() / a.tokens.len().max(1) as f32;
@@ -721,104 +911,118 @@ impl Transcriber {
                     && a.no_speech_prob > nt
                 {
                     fallback = false;
-                    skip = true;
+                    skip[i] = true;
                 }
-                let last = fi + 1 == o.temperatures.len();
-                chosen = Some((a, temp));
-                if !fallback || last {
-                    break;
+                chosen[i] = Some((a, temp));
+                if fallback && !last {
+                    again.push(i);
                 }
             }
-            stats.decode_secs += td.elapsed().as_secs_f64();
-            if out.stopped {
-                break;
-            }
-            let (a, temp) = chosen.unwrap();
-            condition = o.condition_on_prev_tokens && temp < 0.5;
-            if skip {
-                seek += seek_num;
-                continue;
-            }
-            let cr = compress::compression_ratio(&a.tokens);
-            let avg_lp = a.logprobs.iter().sum::<f32>() / a.tokens.len().max(1) as f32;
-            let mut seq = a.tokens.clone();
-            let mut probs: Vec<f32> = a.logprobs.iter().map(|v| v.exp()).collect();
-            if seq.last() == Some(&sp.eot) {
-                seq.pop();
-                probs.pop();
-            }
-            if seek == 0 && !prefix.is_empty() {
-                seq.splice(0..0, prefix.iter().copied());
-                probs.splice(0..0, prefix.iter().map(|_| 1.0));
-            }
-            let (raw, offset) = split_segments(sp.timestamp_begin, &seq, time_offset, seek_num);
-            let mut segs: Vec<Segment> = Vec::new();
-            let mut tok_at = 0usize;
-            let mut seg_probs: Vec<Vec<f32>> = Vec::new();
-            for (start, end, toks) in raw {
-                // Locate the segment's tokens in `seq` for their probabilities.
-                let n = toks.len();
-                let pos = (tok_at..=seq.len().saturating_sub(n))
-                    .find(|&i| seq[i..i + n] == toks[..])
-                    .unwrap_or(tok_at);
-                seg_probs.push(probs[pos..pos + n].to_vec());
-                tok_at = pos + n;
-                all_text.extend(toks.iter().copied().filter(|&t| t < sp.eot));
-                history.push(toks.clone());
-                let mut end = end;
-                if !timestamps {
-                    end = end.min(stats.audio_secs);
-                }
-                segs.push(Segment {
-                    id: 0,
-                    start: round_ms(start),
-                    end: round_ms(end),
-                    text: tokens::decode_text(&self.tok, sp, &toks).trim().to_string(),
-                    tokens: toks,
-                    temperature: temp,
-                    avg_logprob: avg_lp,
-                    compression_ratio: cr,
-                    no_speech_prob: a.no_speech_prob,
-                    words: Vec::new(),
-                });
-            }
-            if word_ts {
-                self.add_words(
-                    &mut segs,
-                    &seg_probs,
-                    &input[sot_index..sot_index + sot_len],
-                    &cross,
-                    seek_num,
-                    time_offset,
-                );
-            }
-            seek += offset.max(1);
-            let mut stop = false;
-            for mut s in segs {
-                if !s.tokens.iter().any(|&t| t < sp.eot) {
-                    continue;
-                }
-                s.id = out.segments.len();
-                if on_segment(&s) == Flow::Stop {
-                    stop = true;
-                }
-                out.segments.push(s);
-            }
-            if stop {
-                out.stopped = true;
+            pending = again;
+            if pending.is_empty() {
                 break;
             }
         }
-        out.text = tokens::decode_text(&self.tok, sp, &all_text).trim().to_string();
-        out.language = match language {
-            Some(l) => sp.language_of(l).unwrap_or("").to_string(),
-            // English-only models (or stopped before detection).
-            None => if sp.multilingual { "" } else { "en" }.to_string(),
-        };
-        stats.total_secs = t_start.elapsed().as_secs_f64();
-        stats.rtf = stats.total_secs / stats.audio_secs.max(1e-9);
-        out.stats = stats;
-        Ok(out)
+        let decode_secs = td.elapsed().as_secs_f64();
+
+        for (i, s) in streams.iter_mut().enumerate() {
+            s.stats.decode_secs += decode_secs;
+            if s.out.stopped {
+                continue;
+            }
+            let (a, temp) = chosen[i].take().unwrap();
+            self.finish_window(plan, s, &prompts[i], &cross[i], &a, temp, skip[i], on_segment);
+        }
+        Ok(())
+    }
+
+    /// Turns a window's chosen attempt into segments and moves the stream on.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_window(
+        &self,
+        plan: &Plan,
+        s: &mut Stream,
+        prompt: &Prompt,
+        cross: &model::CrossKv,
+        a: &decode::Attempt,
+        temp: f32,
+        skip: bool,
+        on_segment: &mut dyn FnMut(usize, &Segment) -> Flow,
+    ) {
+        let sp = &self.sp;
+        let o = plan.o;
+        let seek_num = (s.feats.frames - s.seek).min(self.model.window_frames());
+        let time_offset = s.seek as f64 * FRAME_SECS;
+        s.condition = o.condition_on_prev_tokens && temp < 0.5;
+        if skip {
+            s.seek += seek_num;
+            return;
+        }
+        let cr = compress::compression_ratio(&a.tokens);
+        let avg_lp = a.logprobs.iter().sum::<f32>() / a.tokens.len().max(1) as f32;
+        let mut seq = a.tokens.clone();
+        let mut probs: Vec<f32> = a.logprobs.iter().map(|v| v.exp()).collect();
+        if seq.last() == Some(&sp.eot) {
+            seq.pop();
+            probs.pop();
+        }
+        let prefix = &plan.prefix;
+        if s.seek == 0 && !prefix.is_empty() {
+            seq.splice(0..0, prefix.iter().copied());
+            probs.splice(0..0, prefix.iter().map(|_| 1.0));
+        }
+        let (raw, offset) = split_segments(sp.timestamp_begin, &seq, time_offset, seek_num);
+        let mut segs: Vec<Segment> = Vec::new();
+        let mut tok_at = 0usize;
+        let mut seg_probs: Vec<Vec<f32>> = Vec::new();
+        for (start, end, toks) in raw {
+            // Locate the segment's tokens in `seq` for their probabilities.
+            let n = toks.len();
+            let pos = (tok_at..=seq.len().saturating_sub(n))
+                .find(|&i| seq[i..i + n] == toks[..])
+                .unwrap_or(tok_at);
+            seg_probs.push(probs[pos..pos + n].to_vec());
+            tok_at = pos + n;
+            s.all_text.extend(toks.iter().copied().filter(|&t| t < sp.eot));
+            s.history.push(toks.clone());
+            let mut end = end;
+            if !s.timestamps {
+                end = end.min(s.stats.audio_secs);
+            }
+            segs.push(Segment {
+                id: 0,
+                start: round_ms(start),
+                end: round_ms(end),
+                text: tokens::decode_text(&self.tok, sp, &toks).trim().to_string(),
+                tokens: toks,
+                temperature: temp,
+                avg_logprob: avg_lp,
+                compression_ratio: cr,
+                no_speech_prob: a.no_speech_prob,
+                words: Vec::new(),
+            });
+        }
+        if o.word_timestamps {
+            self.add_words(
+                &mut segs,
+                &seg_probs,
+                &prompt.input[prompt.sot_index..prompt.sot_index + prompt.sot_len],
+                cross,
+                seek_num,
+                time_offset,
+            );
+        }
+        s.seek += offset.max(1);
+        for mut seg in segs {
+            if !seg.tokens.iter().any(|&t| t < sp.eot) {
+                continue;
+            }
+            seg.id = s.out.segments.len();
+            if on_segment(s.index, &seg) == Flow::Stop {
+                s.out.stopped = true;
+            }
+            s.out.segments.push(seg);
+        }
     }
 
     /// Word timestamps for the segments of one window (openai-whisper's `add_word_timestamps`).
@@ -1158,6 +1362,15 @@ mod tests {
         assert_eq!(o.task, Some(Task::Translate));
         assert!(o.timestamps && o.suppress_blank);
         assert_eq!(o.temperatures, vec![0.0]);
+        assert_eq!(
+            (o.beam_size, o.patience, o.length_penalty, o.best_of, o.batch_size),
+            (None, None, None, None, 8)
+        );
+        let o: TranscribeOptions = serde_json::from_str(r#"{"beam_size":5,"patience":2.0,"length_penalty":0.6,"best_of":3}"#).unwrap();
+        assert_eq!(
+            (o.beam_size, o.patience, o.length_penalty, o.best_of),
+            (Some(5), Some(2.0), Some(0.6), Some(3))
+        );
         let mut t = TranscriberOptions::default();
         t.set("quant", "q8").unwrap();
         assert_eq!(t.decoder, Precision::Q8);

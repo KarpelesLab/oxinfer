@@ -4,6 +4,9 @@
 //! oxideav decodes, or raw 16 kHz f32 samples with `--raw`).
 //!
 //! Options: `--language xx`, `--translate`, `--timestamps`, `--words`, `--fallback`,
+//! `--beam N` (beam search; `--patience P`, `--length-penalty A`), `--best-of N` and `--temperature T` (sampling),
+//! `--also AUDIO` (repeatable: more inputs, transcribed with the first as a batch of `--batch N`; `--json` then prints
+//! an array), `--max-new N`,
 //! `--prompt TEXT`, `--condition` (on previous text), `--json`, `--precision f32|f16|bf16`, `--quant q8|q4` (decoder),
 //! `--device cpu|metal|...`, `--threads N`, `--profile`, `--dump DIR` (writes the first window's log-mel features, encoder
 //! output and first-step logits as f32 files, plus the PCM, for reference comparisons).
@@ -19,12 +22,13 @@ fn write_f32(path: &Path, v: &[f32]) -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: transcribe MODEL AUDIO [--language xx] [--translate] [--timestamps] [--words] [--fallback] [--prompt TEXT] [--condition] [--json] [--raw] [--precision P] [--quant Q] [--device D] [--threads N] [--dump DIR]";
+    let usage = "usage: transcribe MODEL AUDIO [--also AUDIO]... [--batch N] [--language xx] [--translate] [--timestamps] [--words] [--fallback] [--beam N] [--patience P] [--length-penalty A] [--best-of N] [--temperature T] [--max-new N] [--prompt TEXT] [--condition] [--json] [--raw] [--precision P] [--quant Q] [--device D] [--threads N] [--dump DIR]";
     let model = args.next().expect(usage);
     let audio = PathBuf::from(args.next().expect(usage));
     let mut lo = TranscriberOptions::default();
     let mut o = TranscribeOptions::default();
     let (mut json, mut raw, mut dump, mut profile) = (false, false, None::<PathBuf>, false);
+    let mut also: Vec<PathBuf> = Vec::new();
     while let Some(a) = args.next() {
         let mut val = || args.next().unwrap_or_else(|| panic!("{a} needs a value"));
         match a.as_str() {
@@ -33,6 +37,14 @@ fn main() -> anyhow::Result<()> {
             "--timestamps" => o.timestamps = true,
             "--words" => o.word_timestamps = true,
             "--fallback" => o = o.with_fallback(),
+            "--beam" => o.beam_size = Some(val().parse()?),
+            "--patience" => o.patience = Some(val().parse()?),
+            "--length-penalty" => o.length_penalty = Some(val().parse()?),
+            "--best-of" => o.best_of = Some(val().parse()?),
+            "--temperature" => o.temperatures = vec![val().parse()?],
+            "--max-new" => o.max_new_tokens = Some(val().parse()?),
+            "--batch" => o.batch_size = val().parse()?,
+            "--also" => also.push(PathBuf::from(val())),
             "--prompt" => o.initial_prompt = Some(val()),
             "--condition" => o.condition_on_prev_tokens = true,
             "--json" => json = true,
@@ -60,16 +72,41 @@ fn main() -> anyhow::Result<()> {
         info.device,
         info.load_secs
     );
-    let pcm: Vec<f32> = if raw {
-        std::fs::read(&audio)?
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect()
-    } else {
-        Transcriber::load_audio(&audio)?
+    let load = |audio: &Path| -> anyhow::Result<Vec<f32>> {
+        Ok(if raw {
+            std::fs::read(audio)?
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect()
+        } else {
+            Transcriber::load_audio(audio)?
+        })
     };
+    let pcm: Vec<f32> = load(&audio)?;
+    if !also.is_empty() {
+        // A batch: the first input and the others together.
+        let mut pcms = vec![pcm];
+        for a in &also {
+            pcms.push(load(a)?);
+        }
+        let refs: Vec<&[f32]> = pcms.iter().map(|p| &p[..]).collect();
+        let ts = asr.transcribe_batch(&refs, &o)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&ts)?);
+        }
+        for (i, t) in ts.iter().enumerate() {
+            if !json {
+                println!("{i}: {}", t.text);
+            }
+            eprintln!(
+                "[{i}: language {} | {:.1}s audio, {} windows, {} tokens]",
+                t.language, t.stats.audio_secs, t.stats.windows, t.stats.tokens
+            );
+        }
+        return Ok(());
+    }
     if let Some(d) = &dump {
         std::fs::create_dir_all(d)?;
         write_f32(&d.join("pcm.f32"), &pcm)?;
