@@ -16,6 +16,7 @@ mod bagel_cli;
 mod flux_cli;
 mod intervene_cli;
 mod janus_cli;
+mod minimax_h3_cli;
 mod omnigen2_cli;
 mod qwen_image_cli;
 #[cfg(feature = "server")]
@@ -1330,6 +1331,9 @@ fn run(mut args: Args) -> Result<()> {
     }
     if oxinfer::qwen_image::is_qwen_image(&args.model) {
         return qwen_image_cli::run(&args);
+    }
+    if oxinfer::minimax_h3::is_h3_image(&args.model) {
+        return minimax_h3_cli::run(&args);
     }
     if oxinfer::bagel::is_bagel(&args.model) {
         return bagel_cli::run(&args);

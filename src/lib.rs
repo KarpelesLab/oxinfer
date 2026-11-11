@@ -52,6 +52,7 @@ pub mod media;
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
 pub mod metal;
 pub mod minimax;
+pub mod minimax_h3;
 pub mod minimax_vision;
 pub mod minimax_vl01;
 pub mod mistral4;

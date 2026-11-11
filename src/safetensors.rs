@@ -559,7 +559,12 @@ impl ModelFiles {
                 copies: Mutex::new(HashMap::new()),
             });
         }
-        let mut single = dir.join("model.safetensors");
+        // A `.safetensors` file given directly (a sidecar such as MiniMax-H3-Image's PDD heads).
+        let mut single = if dir.extension().is_some_and(|e| e == "safetensors") && dir.is_file() {
+            dir.to_path_buf()
+        } else {
+            dir.join("model.safetensors")
+        };
         let mut idx = dir.join("model.safetensors.index.json");
         // diffusers component folders (`transformer/`, `unet/`): diffusion_pytorch_model.*.
         if !crate::fsx::exists(&single) && !crate::fsx::exists(&idx) {
