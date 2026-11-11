@@ -2414,7 +2414,7 @@ law requires it. Read `LICENSE.md` in the repository before use. FLUX.1 [schnell
 encoder are Apache 2.0.
 
 In the library (`Pipeline::load` takes the same specs as `--model`; `LoadOptions` has `quant`,
-`text_quant`, `transformer`, `text_encoder`, `base`, `device`, `cache_dir`, `vae_encoder`;
+`text_quant`, `transformer`, `text_encoder`, `base`, `device`, `cache_dir`, `vae_encoder`, `loras`, `vae`, `redux`;
 `Options` are diffusers' call arguments, see `examples/flux_edit.rs`):
 
 ```rust
@@ -2501,10 +2501,117 @@ darkens the scene with both wall lamps glowing; 'Change the text on the sign fro
 "OXINFER CAFE"' rewrites the carved shop sign in the same typeface and wood, leaving the rest of the
 storefront unchanged; "Turn this photo into a watercolor painting" restyles the whole picture.
 
-Not supported: several reference images (the Kontext pipeline takes one), IP-Adapter, LoRAs on
-FLUX, FLUX.1 Fill / Depth / Canny / Redux, FLUX image-to-image and inpainting pipelines,
-BFL single-file safetensors (`flux1-kontext-dev.safetensors`; the GGUF files and the diffusers
-folder cover the same weights) and the browser build (the weights exceed its 4 GB).
+**More FLUX.1 modes.** `Pipeline::render(prompt, &Inputs, &Options, progress)` runs all of them
+(`Inputs { references, init, mask, control, image_prompts }`; `generate` and `edit` are shortcuts),
+and the CLI picks the mode from the flags and the transformer's input width:
+
+```sh
+# several reference images for Kontext ("the woman from the first image wearing the hat from the second")
+./target/release/oxinfer --model QuantStack/FLUX.1-Kontext-dev-GGUF:Q4_0 --init-image woman.png \
+    --init-image hat.png -p "The woman wears the hat" -o out.png
+# a LoRA (here a few-step one: 8 steps instead of 28) on a GGUF transformer
+./target/release/oxinfer --model city96/FLUX.1-dev-gguf:Q4_0 --steps 8 \
+    --lora alimama-creative/FLUX.1-Turbo-Alpha/diffusion_pytorch_model.safetensors -p "a red fox in the snow" -o fox.png
+# image to image (FluxImg2ImgPipeline) and inpainting by mask blending (FluxInpaintPipeline)
+./target/release/oxinfer --model city96/FLUX.1-dev-gguf:Q4_0 --init-image photo.png --strength 0.6 -p "an oil painting" -o oil.png
+./target/release/oxinfer --model city96/FLUX.1-dev-gguf:Q4_0 --init-image photo.png --mask mask.png --strength 0.85 -p "a red sofa" -o sofa.png
+# FLUX.1 Fill (a 384-channel transformer: FluxFillPipeline; guidance 30 is BFL's setting)
+./target/release/oxinfer --model flux1-fill-dev-Q4_0.gguf --init-image photo.png --mask mask.png --guidance 30 -p "a red sofa" -o sofa.png
+# FLUX.1 Canny / Depth: BFL's control LoRA on FLUX.1 [dev] (or a 128-channel Canny / Depth transformer)
+./target/release/oxinfer --model city96/FLUX.1-dev-gguf:Q4_0 --lora flux1-canny-dev-lora.safetensors \
+    --control-image edges.png --guidance 30 -p "a glass house in a forest" -o house.png
+# FLUX.1 Redux: an image as the prompt (variations; -p adds text)
+./target/release/oxinfer --model city96/FLUX.1-dev-gguf:Q4_0 --redux Runware/FLUX.1-Redux-dev --image-prompt photo.png -p "" -o variation.png
+# BFL single-file checkpoints: the transformer and the autoencoder
+./target/release/oxinfer --model flux1-dev.safetensors --vae ae.safetensors -p "a red fox in the snow" -o fox.png
+```
+
+| Flag | Meaning |
+|---|---|
+| `--init-image FILE` (repeated) | Kontext: several references. Each is VAE-encoded on its own (resized to its own preferred resolution) and appended as its own token sequence |
+| `--ref-layout offset\|index\|diffusers` | where the references' tokens sit (RoPE ids `[index, row, column]`; one reference is `[1, y, x]` in all three). `offset` (default; ComfyUI's default for FLUX Kontext): index 1 for all, each reference beside or below the previous ones, whichever keeps the canvas more square. `index` (ComfyUI's `index` method): reference i at index i + 1, all at the origin. `diffusers`: the ids of diffusers' community `pipeline_flux_kontext_multiple_images.py` (every reference resized to the first one's size, index 1, reference i shifted by i x the grid height along the columns). BFL's own code and diffusers' `FluxKontextPipeline` take one image only |
+| `--strength F` | `--init-image` becomes the start of an image-to-image run instead of a Kontext reference: the image is noised to step `int(steps * (1 - F))` of the schedule and denoised from there (default 0.6 as diffusers; 1 for Fill) |
+| `--mask FILE` | inpaint `--init-image`: white is repainted (resized like the image, luma thresholded at 50%). FLUX.1 Fill reads the masked image's latents and the mask as 320 more input channels per token; any other FLUX.1 blends in latent space as diffusers' `FluxInpaintPipeline` (after each step the kept region is reset to the image at that step's noise level, mask sampled per latent pixel) |
+| `--control-image FILE` | the edge / depth map (as an image; computing Canny edges or depth is up to you) for FLUX.1 Canny / Depth: its latents ride along every noise token (128 input channels) |
+| `--image-prompt FILE`, `--redux SPEC`, `--image-prompt-scale F` | FLUX.1 Redux: the image through SigLIP so400m/14 at 384 px and the Redux projector into 729 tokens appended to the T5 tokens (repeatable); the scale multiplies them |
+| `--lora FILE[:SCALE]` | LoRA files on the transformer (repeatable; a local file or `org/name/file.safetensors`) |
+| `--vae SPEC` | the autoencoder from BFL's `ae.safetensors` (or a diffusers `vae` folder) |
+
+**LoRAs** are applied at load as a low-rank side path on each targeted layer
+(`y = W x + scale * alpha / rank * up (down x)`, f32, after the base matmul wherever that ran): the
+same function as the merged weights `W + scale * alpha / rank * up @ down`, with `W` left as it is
+stored (mapped bf16, any GGUF block format, q8 / q4). Rewriting a quantized matrix would mean
+dequantizing and requantizing it, and the update of a few-step LoRA is smaller than a Q4 block's
+rounding step, so the side path is both exact and free of a 24 GB copy; it costs two small matmuls
+per layer and step. Key namings read: diffusers / PEFT (`transformer.<module>.lora_A.weight`,
+alpha from the `lora_adapter_metadata` header), kohya / ai-toolkit (`lora_unet_double_blocks_0_img_attn_qkv.lora_down.weight`
+with `.alpha`, `lora_transformer_*`), BFL / ComfyUI (`[diffusion_model.]double_blocks.0.img_attn.qkv.lora_A.weight`,
+with `lora_B.bias` and the QK-norm scales of BFL's control LoRAs, whose `img_in` update widens the
+input to 128 channels) and XLabs (`double_blocks.0.processor.qkv_lora1.down.weight`). Modules on
+BFL's fused matrices (`qkv`, `linear1`, the final modulation) are split by rows over the layers
+oxinfer keeps. A key that is not a low-rank pair (DoRA, LoKr, LoHa) or a module that matches no
+layer is an error; text-encoder modules (`lora_te1_*`, `text_encoder.*`) are not applied and the
+load line says how many there were (`[lora FILE x1: 504 modules applied, rank 64]`). Few-step
+LoRAs keep the model's scheduler; give `--steps` yourself.
+
+**Single files.** `--model` (or `--transformer`) takes a BFL-layout safetensors file
+(`flux1-dev.safetensors`, `flux1-kontext-dev.safetensors`, also with ComfyUI's
+`model.diffusion_model.` prefix; bf16 / fp16 / f32, not fp8) the way it takes a GGUF: names are
+remapped to the same layers (fused `qkv` / `linear1` split by rows, zero-copy), the configuration
+comes from the tensor shapes, the other parts from `--base`. `--vae ae.safetensors` loads the
+autoencoder from BFL's layout.
+
+Measured against diffusers 0.42 with `tools/ref_flux_ext.py` (it runs both sides on the same
+noise). On a tiny random-weight pipeline from `tools/flux_tiny.py` (2 + 2 blocks, the real
+tokenizers; float32 on both sides, CPU), end to end:
+
+| Check (`--mode all`) | final latents, rel L2 | image |
+|---|---|---|
+| image to image (strength 0.6 of 6 steps; 0.35 of 10 with a resize) vs `FluxImg2ImgPipeline` | 2.3e-6, 2.8e-6 | 86.9, 84.6 dB |
+| inpainting (strength 0.8; 1.0) vs `FluxInpaintPipeline` | 2.2e-6, 1.9e-6 | 86.9, 84.3 dB |
+| Fill (384 channels; strength 1 and 0.7) vs `FluxFillPipeline` | 2.7e-6, 2.7e-6 | 85.3, 85.6 dB |
+| control (128 channels) vs `FluxControlPipeline` | 1.7e-6 | 88.9 dB |
+| 3 Kontext references, `offset` / `index` / `diffusers` ids vs a diffusers Kontext loop over ComfyUI's / the community pipeline's ids | 1.6e-6, 1.6e-6, 1.5e-6 | 87.0, 87.0, 86.5 dB |
+| LoRA, PEFT keys, vs `load_lora_weights` | 3.3e-6 | 84.3 dB |
+| LoRA, kohya keys (fused `qkv` / `linear1`, per-module alpha); XLabs keys; PEFT x0.7 + kohya x-0.5 | 2.3e-6, 2.2e-6, 2.3e-6 | 89.0, 85.2, 85.6 dB |
+| BFL control LoRA (`lora_B.bias`, norm scales, 128-channel `img_in`) on a 64-channel model vs `FluxControlPipeline` | 3.6e-6 | 83.9 dB |
+| BFL single-file transformer + `ae.safetensors` vs the diffusers folder (and with the kohya LoRA) | 1.9e-6 (2.3e-6) | 88.2 dB (89.0) |
+| Redux (tiny SigLIP + projector) vs `FluxPriorReduxPipeline` | 1.9e-6, tokens 6.4e-7 | 84.6 dB |
+
+diffusers' converters for kohya / XLabs / BFL LoRA keys and for single files assume FLUX.1's
+3072-wide layers and cannot read a tiny model, so for those rows the reference merges
+`W + scale * alpha / rank * up @ down` into the BFL-layout weights in Python and runs the diffusers
+pipeline on the result; where diffusers samples the VAE posterior the reference takes its mode,
+as oxinfer does. On real weights (FLUX.1 [dev] Q4_0 GGUF, one transformer call at 256x256 against
+diffusers' GGUF loader with `load_lora_weights`, on oxinfer's own text embeddings; f32, CPU):
+
+| Check (`--mode step`, `--mode redux-tokens`) | rel L2 |
+|---|---|
+| alimama-creative/FLUX.1-Turbo-Alpha (PEFT keys, 504 modules, rank 64); the LoRA itself moves the prediction by 0.20 | 2.7e-6 |
+| XLabs-AI/flux-RealismLora (XLabs keys, 76 modules, rank 16); moves the prediction by 0.12 | 3.8e-6 |
+| BFL's flux1-canny-dev-lora (control LoRA, 314 low-rank modules of rank 64-128 with biases + 152 norm scales), 256x192 with a control image, vs `FluxControlPipeline`'s loader with `--fix-norm-out` | 1.7e-6 |
+| the same against diffusers 0.42 as it is | 3.9e-2 |
+| Redux tokens (SigLIP so400m + projector of FLUX.1-Redux-dev, bf16 weights) vs transformers | 9.2e-6 |
+
+The last row is diffusers: its converter for BFL control LoRAs swaps the (shift, scale) halves of
+`final_layer.adaLN_modulation.1`'s `lora_A` rows as well as `lora_B`'s, but `lora_A`'s rows are
+rank components, not output channels, so the product changes; `--fix-norm-out` swaps them back in
+the reference (with only that change the two agree, also on 1 + 1 blocks in f32: 1.8e-6). oxinfer
+applies the update as BFL's own code does.
+
+Not run on real weights: FLUX.1 Fill and the 128-channel Canny / Depth transformers (plumbing
+checked on the tiny models only), BFL's 24 GB single files (the same tensors as the GGUF files,
+which load through the same BFL-layout path), whole few-step generations (no picture was
+looked at: the LoRA rows above compare one transformer call), and multi-reference Kontext on the
+real model (the ids are checked, the picture quality of each layout is not). Redux' SigLIP resize
+is Pillow's bicubic (transformers' PIL processor; its torchvision processor antialiases
+differently).
+
+Not supported: IP-Adapter (XLabs, InstantX), ControlNets, DoRA / LoKr / LoHa LoRAs and LoRAs on
+the text encoders, fp8 single-file checkpoints, masks or `--strength` together with Kontext
+references (diffusers' `FluxKontextInpaintPipeline`), the C API and server for the modes above
+other than LoRA / VAE loading and `strength` (use the library's `Pipeline::render`), and the
+browser build (the weights exceed its 4 GB).
 
 ## Stable Diffusion 3 / 3.5: text to image and image to image
 
