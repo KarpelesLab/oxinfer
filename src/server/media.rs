@@ -393,8 +393,8 @@ fn generate_images(m: &mut ImageModel, job: &ImageJob, seed: u64) -> anyhow::Res
     use anyhow::bail;
     let (w, h) = (job.size.map(|s| s.0), job.size.map(|s| s.1));
     let first = job.images.first();
-    if job.mask.is_some() && !matches!(m, ImageModel::Sd(_)) {
-        bail!("masks are supported by Stable Diffusion models only");
+    if job.mask.is_some() && !matches!(m, ImageModel::Sd(_) | ImageModel::QwenImage(_)) {
+        bail!("masks are supported by Stable Diffusion and Qwen-Image models only");
     }
     let mut out = Vec::new();
     if let ImageModel::Janus(j) = m {
@@ -481,7 +481,12 @@ fn generate_images(m: &mut ImageModel, job: &ImageJob, seed: u64) -> anyhow::Res
                     height: h,
                     ..Default::default()
                 };
-                let p = pipe.params(&r);
+                let mut p = pipe.params(&r);
+                p.strength = job.strength;
+                p.mask = job.mask.clone();
+                if pipe.kind == crate::qwen_image::Kind::Layered {
+                    bail!("Qwen-Image-Layered returns RGBA layers; use the command line or the library");
+                }
                 let (img, _) = if job.images.is_empty() {
                     pipe.generate(&p, &mut |_, _| {})?
                 } else {

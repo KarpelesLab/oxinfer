@@ -5,7 +5,8 @@
 //! skipped (the first chunk only primes their caches), so encoder and decoder are 2D networks:
 //! RMS norms over channels (`F.normalize * sqrt(C) * gamma`), SiLU residual blocks, one
 //! single-head attention in the middle block, stride-2 downsampling after a `(0, 1, 0, 1)` zero
-//! pad, nearest 2x upsampling.
+//! pad, nearest 2x upsampling. Qwen-Image-Layered's VAE is the same network with four image
+//! channels (RGBA).
 
 use crate::kernels::for_chunks;
 use crate::sd::ops::{Conv, Tensors, silu};
@@ -327,26 +328,62 @@ impl Vae {
         1 << (self.cfg.dim_mult.len() - 1)
     }
 
+    /// Image channels the encoder takes (3, or 4 for the RGBA VAE of Qwen-Image-Layered).
+    pub fn image_channels(&self) -> usize {
+        self.dec.conv_out.cout
+    }
+
     /// Encodes an image (`[h*w, 3]` channels-last, values in [-1, 1]) into its normalized latent
     /// mean (`(mode - latents_mean) / latents_std`): `([lh*lw, z], lh, lw)`.
     pub fn encode(&self, px: &[f32], h: usize, w: usize) -> Result<(Vec<f32>, usize, usize)> {
+        self.encode_sample(px, h, w, None)
+    }
+
+    /// [`Vae::encode`] with a sample of the posterior instead of its mode when `eps` is given:
+    /// `mean + exp(logvar / 2) * eps(lh, lw)`, the noise `[lh*lw, z]` channels-last (diffusers'
+    /// `latent_dist.sample()`, log-variance clamped to [-30, 20]), then normalized.
+    pub fn encode_sample(
+        &self,
+        px: &[f32],
+        h: usize,
+        w: usize,
+        eps: Option<&mut dyn FnMut(usize, usize) -> Result<Vec<f32>>>,
+    ) -> Result<(Vec<f32>, usize, usize)> {
         let (Some(enc), Some(q)) = (&self.enc, &self.quant) else {
             bail!("the VAE was loaded without its encoder");
         };
+        if px.len() != h * w * enc.conv_in.cin {
+            bail!("VAE input: {} values for {w}x{h} with {} channels", px.len(), enc.conv_in.cin);
+        }
         let (y, lh, lw) = enc.forward(px, h, w);
         let (m, _, _) = q.forward(&y, lh, lw, 1);
         let z = self.cfg.z_dim;
+        let eps = match eps {
+            Some(f) => {
+                let e = f(lh, lw)?;
+                if e.len() != lh * lw * z {
+                    bail!("posterior noise: {} values for a {lw}x{lh} latent", e.len());
+                }
+                Some(e)
+            }
+            None => None,
+        };
         let mut out = vec![0f32; lh * lw * z];
         let (mean, std) = (&self.cfg.latents_mean, &self.cfg.latents_std);
         for_chunks(&mut out, z, true, |p, r| {
             for c in 0..z {
-                r[c] = (m[p * 2 * z + c] - mean[c]) / std[c];
+                let mut v = m[p * 2 * z + c];
+                if let Some(e) = &eps {
+                    v += (0.5 * m[p * 2 * z + z + c].clamp(-30.0, 20.0)).exp() * e[p * z + c];
+                }
+                r[c] = (v - mean[c]) / std[c];
             }
         });
         Ok((out, lh, lw))
     }
 
-    /// Decodes normalized latents (`[lh*lw, z]`) into an image `[h*w, 3]` in [-1, 1].
+    /// Decodes normalized latents (`[lh*lw, z]`) into an image `[h*w, 3]` (`[h*w, 4]` for an
+    /// RGBA VAE) in [-1, 1].
     pub fn decode(&self, lat: &[f32], lh: usize, lw: usize) -> (Vec<f32>, usize, usize) {
         let z = self.cfg.z_dim;
         let (mean, std) = (&self.cfg.latents_mean, &self.cfg.latents_std);

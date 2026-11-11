@@ -7,6 +7,11 @@
 //! on queries and keys and the 3-axis MSRoPE (frame, row, column; rows and columns centred on the
 //! image, text positions on the diagonal after the largest image). With `zero_cond_t` (Edit-2511)
 //! the reference-image tokens are modulated as at timestep 0.
+//!
+//! Variants: ControlNet residuals added to the image stream after each block
+//! ([`Extra::control`], computed by `super::controlnet`), and Qwen-Image-Layered's transformer
+//! (`use_layer3d_rope`: every layer is its own frame and the condition image sits at frame -1;
+//! `use_additional_t_cond`: an embedding added to the timestep embedding).
 
 use super::weights::{Dense, Loader};
 use crate::kernels::*;
@@ -64,13 +69,17 @@ pub struct TransformerConfig {
     pub use_additional_t_cond: bool,
     #[serde(default)]
     pub use_layer3d_rope: bool,
+    /// `QwenImageControlNetModel`: channels of the control tokens beyond `in_channels` (the
+    /// packed mask of the inpainting ControlNet).
+    #[serde(default)]
+    pub extra_condition_channels: usize,
 }
 
 impl TransformerConfig {
     pub fn load(dir: &Path) -> Result<Self> {
         let c: Self = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
-        if c.guidance_embeds || c.use_additional_t_cond || c.use_layer3d_rope {
-            bail!("Qwen-Image transformer variants with guidance embeddings, additional t conditions or layered RoPE are not supported");
+        if c.guidance_embeds {
+            bail!("Qwen-Image transformer variants with guidance embeddings are not supported");
         }
         if c.attention_head_dim != 2 * (c.axes_dims_rope.iter().sum::<usize>() / 2) {
             bail!(
@@ -148,16 +157,31 @@ impl ImageShape {
     }
 }
 
+/// What a forward pass takes beyond the tokens.
+#[derive(Clone, Copy, Default)]
+pub struct Extra<'e> {
+    /// ControlNet residuals (`[tokens, inner]` each), added to the image stream after block `i`
+    /// as `control[i / ceil(blocks / control.len())]`.
+    pub control: Option<&'e [Vec<f32>]>,
+    /// How many leading images of `shapes` are denoised (0 counts as 1; Qwen-Image-Layered
+    /// denoises the composite and every layer).
+    pub targets: usize,
+    /// `additional_t_cond` (Qwen-Image-Layered: 0 for RGBA layers, 1 for RGB).
+    pub t_cond: Option<usize>,
+}
+
 pub struct Transformer<'a> {
     pub cfg: TransformerConfig,
-    img_in: Dense<'a>,
+    pub(super) img_in: Dense<'a>,
     txt_in: Dense<'a>,
     txt_norm: Vec<f32>,
     t_lin1: Dense<'a>,
     t_lin2: Dense<'a>,
+    /// `time_text_embed.addition_t_embedding` (`[2, inner]`, `use_additional_t_cond`).
+    add_t: Option<Vec<f32>>,
     blocks: Vec<Block<'a>>,
-    norm_out: Dense<'a>,
-    proj_out: Dense<'a>,
+    /// The output head, `norm_out.linear` and `proj_out` (a ControlNet has none).
+    head: Option<(Dense<'a>, Dense<'a>)>,
     /// Inverse frequencies per RoPE axis.
     inv_freq: [Vec<f32>; 3],
     /// Weight streaming: unit `i` is block `i`.
@@ -195,6 +219,12 @@ fn gated_add(x: &mut [f32], y: &[f32], n: usize, gates: &[&[f32]], group: impl F
 
 impl<'a> Transformer<'a> {
     pub fn load(cfg: TransformerConfig, ld: &Loader<'a, '_>) -> Result<Self> {
+        Self::load_with(cfg, ld, true)
+    }
+
+    /// [`Transformer::load`]; `head` false leaves out `norm_out` / `proj_out` (a ControlNet's
+    /// copy of the first blocks).
+    pub fn load_with(cfg: TransformerConfig, ld: &Loader<'a, '_>, head: bool) -> Result<Self> {
         let d = cfg.inner();
         let (hd, ja) = (cfg.attention_head_dim, cfg.joint_attention_dim);
         let p2 = cfg.patch_size * cfg.patch_size;
@@ -208,7 +238,12 @@ impl<'a> Transformer<'a> {
         };
         let t_lin1 = top.dense("time_text_embed.timestep_embedder.linear_1", d, 256)?;
         let t_lin2 = top.dense("time_text_embed.timestep_embedder.linear_2", d, d)?;
-        let cols = mod_channels(&t_lin1, &t_lin2);
+        let add_t = if cfg.use_additional_t_cond {
+            Some(ld.f32("time_text_embed.addition_t_embedding.weight", 2 * d)?)
+        } else {
+            None
+        };
+        let cols = mod_channels(&t_lin1, &t_lin2, add_t.as_deref());
         let mut blocks = Vec::with_capacity(cfg.num_layers);
         for l in 0..cfg.num_layers {
             let b = format!("transformer_blocks.{l}.");
@@ -242,9 +277,13 @@ impl<'a> Transformer<'a> {
             txt_norm: ld.f32("txt_norm.weight", ja)?,
             t_lin1,
             t_lin2,
+            add_t,
             blocks,
-            norm_out: top.dense("norm_out.linear", 2 * d, d)?,
-            proj_out: top.dense("proj_out", p2 * cfg.out(), d)?,
+            head: if head {
+                Some((top.dense("norm_out.linear", 2 * d, d)?, top.dense("proj_out", p2 * cfg.out(), d)?))
+            } else {
+                None
+            },
             inv_freq: [inv(ax[0]), inv(ax[1]), inv(ax[2])],
             stream: None,
             cfg,
@@ -284,12 +323,19 @@ impl<'a> Transformer<'a> {
     }
 
     /// The timestep embedding of `sigma` (the pipeline passes `t / 1000`): `[inner]`.
-    fn temb(&self, sigma: f32) -> Vec<f32> {
-        temb(&self.t_lin1, &self.t_lin2, sigma)
+    fn temb(&self, sigma: f32, t_cond: Option<usize>) -> Vec<f32> {
+        let mut e = temb(&self.t_lin1, &self.t_lin2, sigma);
+        if let Some(a) = &self.add_t {
+            let d = e.len();
+            let i = t_cond.unwrap_or(0).min(1);
+            crate::kernels::add_inplace(&mut e, &a[i * d..(i + 1) * d]);
+        }
+        e
     }
 
     /// RoPE angles (cos, sin; `head_dim / 2` per token) of the image tokens of `shapes` (image
-    /// `k` is frame `k`) and of `txt` text tokens.
+    /// `k` is frame `k`; with `use_layer3d_rope` the last image, the condition, is frame -1 and
+    /// the text starts no earlier than the number of layers) and of `txt` text tokens.
     pub fn rope(&self, shapes: &[ImageShape], txt: usize) -> (CosSin, CosSin) {
         let half = self.cfg.attention_head_dim / 2;
         let [f0, f1, f2] = &self.inv_freq;
@@ -308,19 +354,25 @@ impl<'a> Transformer<'a> {
         let (mut ic, mut is) = (vec![0f32; n * half], vec![0f32; n * half]);
         let mut t = 0;
         let mut max_vid = 0i64;
+        let layered = self.cfg.use_layer3d_rope;
         for (k, s) in shapes.iter().enumerate() {
             let (h, w) = (s.rows as i64, s.cols as i64);
+            let cond = layered && k + 1 == shapes.len();
             for f in 0..s.frames {
+                let frame = if cond { -1 } else { (k + f) as i64 };
                 for r in 0..h {
                     for c in 0..w {
                         // scale_rope: positions centred, -(h - h/2) .. h/2 - 1.
-                        let pos = [(k + f) as i64, r - (h - h / 2), c - (w - w / 2)];
+                        let pos = [frame, r - (h - h / 2), c - (w - w / 2)];
                         angles(pos, &mut ic[t * half..(t + 1) * half], &mut is[t * half..(t + 1) * half]);
                         t += 1;
                     }
                 }
             }
             max_vid = max_vid.max(h / 2).max(w / 2);
+        }
+        if layered {
+            max_vid = max_vid.max(shapes.len() as i64 - 1);
         }
         let (mut tc, mut ts) = (vec![0f32; txt * half], vec![0f32; txt * half]);
         for i in 0..txt {
@@ -344,6 +396,46 @@ impl<'a> Transformer<'a> {
     /// stream (`embed_text`, `[t_txt, inner]`), `sigma` the noise level. Returns the velocity
     /// prediction for the target's tokens (`[shapes[0].tokens(), patch^2 * out_channels]`).
     pub fn forward(&self, img: &[f32], shapes: &[ImageShape], txt: &[f32], sigma: f32) -> Vec<f32> {
+        self.forward_with(img, shapes, txt, sigma, &Extra::default())
+    }
+
+    /// [`Transformer::forward`] with ControlNet residuals, several denoised images (the
+    /// prediction then covers the first `extra.targets` images) or the additional timestep
+    /// condition.
+    pub fn forward_with(&self, img: &[f32], shapes: &[ImageShape], txt: &[f32], sigma: f32, extra: &Extra) -> Vec<f32> {
+        let cfg = &self.cfg;
+        let d = cfg.inner();
+        let ni: usize = shapes.iter().map(|s| s.tokens()).sum();
+        let n_out: usize = shapes[..extra.targets.clamp(1, shapes.len())].iter().map(|s| s.tokens()).sum();
+        assert_eq!(img.len(), ni * cfg.in_channels, "image tokens do not match the shapes");
+        let (norm_out, proj_out) = self.head.as_ref().expect("a ControlNet has no output head");
+        let mut x = self.img_in.forward(img, ni);
+        let nb = self.blocks.len();
+        let temb = self.run_blocks(&mut x, shapes, txt, sigma, extra.t_cond, &mut |li, x| {
+            if let Some(c) = extra.control.filter(|c| !c.is_empty()) {
+                let r = &c[li / nb.div_ceil(c.len())];
+                assert_eq!(r.len(), x.len(), "ControlNet residuals do not match the image tokens");
+                crate::kernels::add_inplace(x, r);
+            }
+        });
+        // Output: AdaLayerNormContinuous (scale first, then shift) on the denoised tokens.
+        let silu_t: Vec<f32> = temb.iter().map(|&v| crate::sd::ops::silu(v)).collect();
+        let e = norm_out.forward_small(&silu_t, 1);
+        let xo = norm_modulate(&x[..n_out * d], d, &[(&e[d..2 * d], &e[..d])], |_| 0);
+        proj_out.forward(&xo, n_out)
+    }
+
+    /// The blocks over the image stream `x` (`[tokens, inner]`, after `img_in`) and the text
+    /// stream `txt`; `after(i, x)` runs after block `i`. Returns the timestep embedding.
+    pub(super) fn run_blocks(
+        &self,
+        x: &mut [f32],
+        shapes: &[ImageShape],
+        txt: &[f32],
+        sigma: f32,
+        t_cond: Option<usize>,
+        after: &mut dyn FnMut(usize, &mut [f32]),
+    ) -> Vec<f32> {
         let cfg = &self.cfg;
         let d = cfg.inner();
         let (nh, hd) = (cfg.num_attention_heads, cfg.attention_head_dim);
@@ -351,15 +443,14 @@ impl<'a> Transformer<'a> {
         let ni: usize = shapes.iter().map(|s| s.tokens()).sum();
         let n0 = shapes[0].tokens();
         let nt = txt.len() / d;
-        assert_eq!(img.len(), ni * cfg.in_channels, "image tokens do not match the shapes");
-        let mut x = self.img_in.forward(img, ni);
+        assert_eq!(x.len(), ni * d, "image stream does not match the shapes");
         let mut tx = txt.to_vec();
-        let temb = self.temb(sigma);
+        let temb = self.temb(sigma, t_cond);
         let zero = cfg.zero_cond_t && ni > n0;
         // Modulation rows: the target's timestep, and 0 for the reference images (zero_cond_t).
         let mut temb_rows = temb.clone();
         if zero {
-            temb_rows.extend(self.temb(0.0));
+            temb_rows.extend(self.temb(0.0, t_cond));
         }
         let nrows = temb_rows.len() / d;
         let silu_rows: Vec<f32> = temb_rows.iter().map(|&v| crate::sd::ops::silu(v)).collect();
@@ -378,7 +469,7 @@ impl<'a> Transformer<'a> {
             let imods: Vec<(&[f32], &[f32])> = (0..nrows).map(|r| (&im[ch(r, 0)], &im[ch(r, 1)])).collect();
             let igates: Vec<&[f32]> = (0..nrows).map(|r| &im[ch(r, 2)]).collect();
             let tmods = [(&tm[0..d], &tm[d..2 * d])];
-            let xm = norm_modulate(&x, d, &imods, img_group);
+            let xm = norm_modulate(x, d, &imods, img_group);
             let tmm = norm_modulate(&tx, d, &tmods, |_| 0);
 
             // Projections into the joint [text, image] rows.
@@ -411,25 +502,27 @@ impl<'a> Transformer<'a> {
             let ia = b.to_out.forward(&att[nt * d..], ni);
             let ta = b.to_add_out.forward(&att[..nt * d], nt);
             drop(att);
-            gated_add(&mut x, &ia, d, &igates, img_group);
+            gated_add(x, &ia, d, &igates, img_group);
             gated_add(&mut tx, &ta, d, &[&tm[2 * d..3 * d]], |_| 0);
 
             // MLPs.
             let imods2: Vec<(&[f32], &[f32])> = (0..nrows).map(|r| (&im[ch(r, 3)], &im[ch(r, 4)])).collect();
             let igates2: Vec<&[f32]> = (0..nrows).map(|r| &im[ch(r, 5)]).collect();
-            let xm = norm_modulate(&x, d, &imods2, img_group);
+            let xm = norm_modulate(x, d, &imods2, img_group);
             let y = mlp(&b.img_fc1, &b.img_fc2, &xm, ni);
-            gated_add(&mut x, &y, d, &igates2, img_group);
+            gated_add(x, &y, d, &igates2, img_group);
             let tmods2 = [(&tm[3 * d..4 * d], &tm[4 * d..5 * d])];
             let tmm = norm_modulate(&tx, d, &tmods2, |_| 0);
             let y = mlp(&b.txt_fc1, &b.txt_fc2, &tmm, nt);
             gated_add(&mut tx, &y, d, &[&tm[5 * d..6 * d]], |_| 0);
+            after(li, x);
         }
-        // Output: AdaLayerNormContinuous (scale first, then shift) on the target's tokens.
-        let silu_t: Vec<f32> = temb.iter().map(|&v| crate::sd::ops::silu(v)).collect();
-        let e = self.norm_out.forward_small(&silu_t, 1);
-        let xo = norm_modulate(&x[..n0 * d], d, &[(&e[d..2 * d], &e[..d])], |_| 0);
-        self.proj_out.forward(&xo, n0)
+        temb
+    }
+
+    /// Number of blocks.
+    pub fn num_blocks(&self) -> usize {
+        self.blocks.len()
     }
 }
 
@@ -454,12 +547,13 @@ fn temb(t_lin1: &Dense, t_lin2: &Dense, sigma: f32) -> Vec<f32> {
 /// it (Qwen-Image-Edit-2511: |x| up to ~330 there, below ~3 elsewhere). Quantizing their weight
 /// columns with the rest moves the modulation, which every token shares, and the first block's
 /// alone then moves the Lightning first velocity by 5.6%; the modulation layers keep them exact.
-fn mod_channels(t_lin1: &Dense, t_lin2: &Dense) -> Vec<usize> {
+fn mod_channels(t_lin1: &Dense, t_lin2: &Dense, add_t: Option<&[f32]>) -> Vec<usize> {
     let mut cols = std::collections::BTreeSet::new();
     for k in 0..=20 {
         let x: Vec<f32> = temb(t_lin1, t_lin2, k as f32 / 20.0)
             .iter()
-            .map(|&v| crate::sd::ops::silu(v))
+            .enumerate()
+            .map(|(i, &v)| crate::sd::ops::silu(v + add_t.map_or(0.0, |a| a[i])))
             .collect();
         let mut o: Vec<usize> = (0..x.len()).collect();
         o.sort_by(|&a, &b| x[b].abs().total_cmp(&x[a].abs()));

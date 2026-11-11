@@ -238,6 +238,71 @@ impl QwenVl {
             layers: std::mem::take(&mut sess.captured),
         })
     }
+
+    /// Continues `text` (image placeholders as in [`QwenVl::hidden_states`]) greedily for at most
+    /// `max_new_tokens` tokens, stopping before any of `eos`: the new token ids. Logits of tokens
+    /// already in the sequence are divided (when positive) or multiplied by `repetition_penalty`,
+    /// as transformers' `generate` does (Qwen2.5-VL's generation config: top-k 1, penalty 1.05).
+    pub fn generate(
+        &self,
+        text: &str,
+        images: &[VlImage],
+        max_new_tokens: usize,
+        eos: &[u32],
+        repetition_penalty: f32,
+    ) -> Result<Vec<u32>> {
+        let ids = self.tokenize(text)?;
+        if ids.is_empty() {
+            bail!("empty prompt");
+        }
+        let h = self.hidden_size();
+        let feats: Vec<crate::mm::MmFeature> = match &self.mm {
+            Some(mm) => images
+                .iter()
+                .map(|im| crate::mm::MmFeature {
+                    token_id: mm.image_token_id,
+                    emb: im.emb.clone(),
+                    n: im.n,
+                    grids: vec![im.grid],
+                })
+                .collect(),
+            None if images.is_empty() => Vec::new(),
+            None => bail!("{}: not a vision-language model", self.dir.display()),
+        };
+        let mut sess = self.model.new_session();
+        for (p, gh, gw) in crate::mm::vision_spans(&ids, &feats)? {
+            sess.add_vision_span(p, gh, gw);
+        }
+        let ov = crate::mm::overrides(&ids, &feats, h)?;
+        let refs: Vec<(usize, &[f32])> = ov.iter().map(|(i, v)| (*i, v.as_slice())).collect();
+        let last = self.model.forward_hidden_mm(&mut sess, &ids, &refs);
+        let mut logits = self.model.logits(&last[(ids.len() - 1) * h..], 1);
+        let mut seen = vec![false; logits.len()];
+        ids.iter().for_each(|&i| seen[i as usize] = true);
+        let mut out = Vec::new();
+        while out.len() < max_new_tokens {
+            if repetition_penalty != 1.0 {
+                for (l, _) in logits.iter_mut().zip(&seen).filter(|(_, s)| **s) {
+                    *l = if *l > 0.0 {
+                        *l / repetition_penalty
+                    } else {
+                        *l * repetition_penalty
+                    };
+                }
+            }
+            // The first of equal maxima, as torch's argmax.
+            let next = (0..logits.len()).rev().max_by(|&a, &b| logits[a].total_cmp(&logits[b])).unwrap() as u32;
+            if eos.contains(&next) {
+                break;
+            }
+            out.push(next);
+            seen[next as usize] = true;
+            if out.len() < max_new_tokens {
+                logits = self.model.forward(&mut sess, &[next]);
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// A Qwen2 byte-level BPE tokenizer from `vocab.json` + `merges.txt` and the added tokens of

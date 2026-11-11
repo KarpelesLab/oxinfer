@@ -114,6 +114,8 @@ struct Args {
     image_guidance: Option<f32>,
     /// Qwen-Image: the transformer from a GGUF file or another folder.
     transformer: Option<PathBuf>,
+    /// Qwen-Image: ControlNet and layer-decomposition flags.
+    qwen_image: qwen_image_cli::Flags,
     device: platform::DevicePref,
     devices: bool,
     embed: bool,
@@ -328,6 +330,18 @@ fn usage() -> ! {
          \x20 --guidance F         true CFG scale (default 4 with negative \" \"; 1 with a Lightning LoRA)\n\
          \x20 --steps N            default 40 (a Lightning LoRA: the steps in its name, 4 or 8)\n\
          \x20 --transformer FILE   the transformer from a GGUF file (e.g. unsloth/Qwen-Image-Edit-2511-GGUF)\n\
+         \x20                      or a single safetensors file (FP8 scaled checkpoints)\n\
+         \x20 --strength F         with --init-image: start from the image, 0..1 of the schedule (Qwen-Image:\n\
+         \x20                      image to image, default 0.6; edit models: default 1 with --mask)\n\
+         \x20 --mask FILE          inpaint the white region of the (first) --init-image\n\
+         \x20 --controlnet DIR     a ControlNet (InstantX/Qwen-Image-ControlNet-Union, -Inpainting) with\n\
+         \x20 --control-image FILE its condition image (repeatable; with --mask: the image to inpaint),\n\
+         \x20 --control-scale F    conditioning scale (default 1; repeatable, one per image),\n\
+         \x20 --control-start F, --control-end F   the part of the steps it acts on (default 0 and 1)\n\
+         \x20 --layers N           Qwen-Image-Layered: RGBA layers to decompose --init-image into (default 4;\n\
+         \x20                      -p is a caption of the image, written by the text encoder without -p;\n\
+         \x20                      -o out.png writes out_0.png ...)\n\
+         \x20 --resolution N       Qwen-Image-Layered: 640 (default) or 1024\n\
          \x20 --quant q8|q4        transformer and text encoder precision; --mmap, --stream as above\n\
          \n\
          OmniGen2 (OmniGen2/OmniGen2): image editing, in-context generation and text to image (-o,\n\
@@ -524,6 +538,7 @@ fn parse_args() -> Result<Args> {
         negative: String::new(),
         init_images: Vec::new(),
         transformer: None,
+        qwen_image: Default::default(),
         size: None,
         sampler: None,
         loras: Vec::new(),
@@ -740,6 +755,9 @@ fn parse_args() -> Result<Args> {
             "--strength" => a.strength = Some(val()?.parse()?),
             "--image-guidance" => a.image_guidance = Some(val()?.parse()?),
             "--transformer" => a.transformer = Some(PathBuf::from(val()?)),
+            "--controlnet" | "--control-image" | "--control-scale" | "--control-start" | "--control-end" | "--layers" | "--resolution" => {
+                a.qwen_image.set(&k, &val()?)?
+            }
             "--size" => {
                 let v = val()?;
                 let (w, h) = v

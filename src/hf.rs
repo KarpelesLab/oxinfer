@@ -589,6 +589,9 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
         shards.sort();
         shards.dedup();
         files.extend(shards);
+    } else if list.contains_key("diffusion_pytorch_model.safetensors") {
+        // A single diffusers component (a ControlNet repo).
+        files.push("diffusion_pytorch_model.safetensors".into());
     } else if list.contains_key("pytorch_model.bin") {
         files.push("pytorch_model.bin".into());
     } else if let Some((size, src)) = list.get("pytorch_model.bin.index.json") {

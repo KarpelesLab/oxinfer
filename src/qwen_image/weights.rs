@@ -9,6 +9,13 @@
 //! `W + strength * alpha / rank * up @ down` in f32 and is quantized from that (rounding it to
 //! bf16 first would erase most of a Lightning update, which is below half a bf16 ulp of most
 //! weights); bf16 weights and GGUF blocks keep the update as a low-rank pair applied at run time.
+//!
+//! FP8 "scaled" single-file checkpoints (`*_fp8_e4m3fn_scaled*.safetensors`) keep their weights
+//! as stored: `float8_e4m3fn` bytes times a scale, one per tensor (ComfyUI's layout: a scalar
+//! `<module>.scale_weight` beside every weight and a `scaled_fp8` marker tensor) or one per
+//! output row (lightx2v's: `<module>.weight_scale` of shape `[n_out, 1]`, on the blocks' weights
+//! only), or none (plain `*_fp8_e4m3fn.safetensors`). The tensor names are diffusers' own, under
+//! an optional `model.diffusion_model.` prefix.
 
 use crate::kernels::for_chunks;
 use crate::model::{Lin, Quant, linear, linear_multi, load_lin};
@@ -379,12 +386,9 @@ impl<'a> Loader<'a, '_> {
             Some(l) if merge => (self.merged(&wn, n_out, n_in, l)?, None),
             Some(l) => {
                 let (d, u, r) = l.stacked(&wn, n_out, n_in).unwrap();
-                (
-                    load_lin(self.files, &wn, n_out, n_in, self.quant)?,
-                    Some(RuntimeLora::new(&d, &u, r)),
-                )
+                (self.lin(&wn, n_out, n_in)?, Some(RuntimeLora::new(&d, &u, r)))
             }
-            None => (load_lin(self.files, &wn, n_out, n_in, self.quant)?, None),
+            None => (self.lin(&wn, n_out, n_in)?, None),
         };
         let bias = if self.has(&format!("{name}.bias")) {
             Some(self.f32(&format!("{name}.bias"), n_out)?)
@@ -401,9 +405,21 @@ impl<'a> Loader<'a, '_> {
         })
     }
 
-    /// Whether weight `wn` is quantized here from float weights (not GGUF or pre-quantized).
+    /// Whether weight `wn` is quantized here from float weights (not GGUF, FP8 or pre-quantized).
     fn quantizes(&self, wn: &str) -> bool {
-        self.files.ggml(wn).is_none() && Quant::stored(self.files).is_none()
+        self.files.ggml(wn).is_none() && Quant::stored(self.files).is_none() && !self.is_fp8(wn)
+    }
+
+    fn is_fp8(&self, wn: &str) -> bool {
+        self.files.info(wn).is_some_and(|i| i.dtype == "F8_E4M3")
+    }
+
+    /// Weight `wn` in this loader's precision, or as stored (GGUF, pre-quantized, FP8).
+    fn lin(&self, wn: &str, n_out: usize, n_in: usize) -> Result<Lin<'a>> {
+        if self.is_fp8(wn) && !self.files.has(&wn.replace(".weight", ".weight_scale_inv")) {
+            return fp8_scaled(self.files, wn, n_out, n_in);
+        }
+        load_lin(self.files, wn, n_out, n_in, self.quant)
     }
 
     /// [`Loader::dense`] with input channels `cols` kept exact when the weight is quantized here:
@@ -469,6 +485,40 @@ impl<'a> Loader<'a, '_> {
             Quant::Q4 => Lin::q4(quantize_q4_f32(&w, n_out, n_in)),
         })
     }
+}
+
+/// An FP8 E4M3 weight `wn` (`<module>.weight`, `[n_out, n_in]`) of a "scaled" checkpoint, used as
+/// stored: the bytes borrowed from the file, times `<module>.scale_weight` (ComfyUI) or
+/// `<module>.weight_scale` (lightx2v), a scalar or one value per output row; no scale tensor
+/// means 1.
+fn fp8_scaled<'a>(files: &'a ModelFiles, wn: &str, n_out: usize, n_in: usize) -> Result<Lin<'a>> {
+    let info = files.info(wn).with_context(|| format!("missing tensor {wn}"))?;
+    if info.shape != [n_out, n_in] {
+        bail!("tensor {wn} has shape {:?}, expected [{n_out}, {n_in}]", info.shape);
+    }
+    let base = wn.strip_suffix(".weight").unwrap_or(wn);
+    let sname = [format!("{base}.scale_weight"), format!("{base}.weight_scale")]
+        .into_iter()
+        .find(|n| files.has(n));
+    let (scales, block) = match &sname {
+        Some(n) => {
+            let v = files.f32(n)?;
+            match v.len() {
+                1 => (v, (n_out, n_in)),
+                l if l == n_out => (v, (1, n_in)),
+                l => bail!("{n}: {l} scales for a [{n_out}, {n_in}] weight (expected 1 or {n_out})"),
+            }
+        }
+        None => (vec![1.0], (n_out, n_in)),
+    };
+    let mut sp = PageVec::<f32>::zeroed(scales.len());
+    sp.copy_from_slice(&scales);
+    files.note_use(wn, true, false);
+    let data = files.bytes(wn)?;
+    // SAFETY: the weight borrows `files` for 'a, which outlives every model holding it.
+    let m = crate::ggml::GgufMatrix::fp8(unsafe { crate::quant::QBuf::borrowed(data) }, sp.into(), n_out, n_in, block)
+        .with_context(|| format!("tensor {wn}"))?;
+    Ok(Lin::gguf(m))
 }
 
 #[cfg(test)]

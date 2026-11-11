@@ -1038,8 +1038,30 @@ fn qwen_image_run(
             bail!("decoding image files needs the `media` feature; use oxi_qwen_image_edit_rgb");
         }
         images.extend(extra()?);
+        // The mask and the ControlNet images are files of the request.
+        let mut side: Vec<crate::video::RgbImage> = Vec::new();
+        if req.mask.is_some() || !req.control_images.is_empty() {
+            #[cfg(feature = "media")]
+            {
+                let m = crate::media::Media::new();
+                for p in req.control_images.iter().chain(&req.mask) {
+                    side.push(m.load_image(std::path::Path::new(p))?);
+                }
+            }
+            #[cfg(not(feature = "media"))]
+            bail!("decoding the mask and control image files needs the `media` feature");
+        }
         let mut pipe = q.pipe.lock().unwrap_or_else(|p| p.into_inner());
-        let params = pipe.params(&req);
+        if pipe.kind == crate::qwen_image::Kind::Layered {
+            bail!(
+                "Qwen-Image-Layered returns RGBA layers, which this call cannot pass on: use the library (Pipeline::decompose) or the command line"
+            );
+        }
+        let mut params = pipe.params(&req);
+        if req.mask.is_some() {
+            params.mask = side.pop();
+        }
+        params.control = crate::qwen_image::Pipeline::controls(&req, side)?;
         let cancel = q.cancel.clone();
         let mut progress = |i: usize, n: usize| {
             if let Some(cb) = on_step

@@ -578,6 +578,10 @@ impl ModelFiles {
             dir.join("model.safetensors")
         };
         let mut idx = dir.join("model.safetensors.index.json");
+        // A single-file checkpoint (e.g. a ComfyUI `*_fp8_e4m3fn_scaled.safetensors`).
+        if dir.extension().is_some_and(|e| e == "safetensors") && !crate::fsx::exists(&single) {
+            single = dir.to_path_buf();
+        }
         // diffusers component folders (`transformer/`, `unet/`): diffusion_pytorch_model.*.
         if !crate::fsx::exists(&single) && !crate::fsx::exists(&idx) {
             let d = dir.join("diffusion_pytorch_model.safetensors");

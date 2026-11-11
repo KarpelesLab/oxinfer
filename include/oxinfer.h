@@ -481,6 +481,9 @@ typedef struct OxiQwenImage OxiQwenImage;
  *   text_quant=bf16|q8|q4  text encoder precision
  *   mmap=0|1               map the weights instead of reading them into memory
  *   transformer=PATH       the transformer from a GGUF file (e.g. qwen-image-edit-2511-Q4_0.gguf)
+ *                          or a single safetensors file (FP8 scaled checkpoints)
+ *   controlnet=PATH        a ControlNet folder or repo id (InstantX/Qwen-Image-ControlNet-Union,
+ *                          -Inpainting), used by requests with "control_images"
  *   lora=FILE[:SCALE]      a LoRA merged into the transformer (repeatable); a Lightning LoRA
  *                          (file name with "lightning" and "4steps" / "8steps") switches the
  *                          defaults to its settings
@@ -501,7 +504,14 @@ void oxi_qwen_image_cancel(const OxiQwenImage *q);
  *   several), "negative": " ", "true_cfg": 4 (guidance when > 1 with a negative prompt),
  *   "steps": 40, "seed": 42, "width" / "height" (default: the last image's aspect ratio at about
  *   1024x1024, multiples of 16), "lightning": true|false (default: whether a Lightning LoRA is
- *   loaded: its steps, no guidance, shift 3)}
+ *   loaded: its steps, no guidance, shift 3),
+ *   "strength": 0..1 (start from the first image noised to that part of the schedule: image to
+ *   image with Qwen-Image / -2512, default 0.6), "mask": "mask.png" (inpaint the white region of
+ *   that image; with an inpainting ControlNet, of the control image),
+ *   "control_images": ["canny.png", ...] with "control_scale": [1.0] (one for all, or one each),
+ *   "control_start" / "control_end" (the part of the steps the ControlNet acts on, 0 and 1),
+ *   "cfg_normalize": true}
+ * Qwen-Image-Layered (RGBA layers) is not served by this call: Pipeline::decompose or the CLI.
  * The image is passed to `on_image` (index 0); `on_step` (may be NULL) is called after every
  * denoising step, non-zero cancels. Returns 1, or -1 (error, or cancelled). */
 int oxi_qwen_image_edit(OxiQwenImage *q, const char *request_json, oxi_image_fn on_image, oxi_step_fn on_step, void *user);

@@ -31,10 +31,20 @@ fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
 
 /// Encodes `rgb` (`width * height * 3` bytes, row-major) as a PNG file.
 pub fn encode_rgb(width: usize, height: usize, rgb: &[u8]) -> Vec<u8> {
-    assert_eq!(rgb.len(), width * height * 3, "pixel buffer does not match the size");
+    encode(width, height, rgb, 3)
+}
+
+/// Encodes `rgba` (`width * height * 4` bytes, row-major, straight alpha) as a PNG file.
+pub fn encode_rgba(width: usize, height: usize, rgba: &[u8]) -> Vec<u8> {
+    encode(width, height, rgba, 4)
+}
+
+/// 8-bit truecolour (`ch` 3) or truecolour with alpha (`ch` 4).
+fn encode(width: usize, height: usize, rgb: &[u8], ch: usize) -> Vec<u8> {
+    assert_eq!(rgb.len(), width * height * ch, "pixel buffer does not match the size");
     // Scanlines with filter type 0.
-    let mut raw = Vec::with_capacity(height * (width * 3 + 1));
-    for row in rgb.chunks_exact(width * 3) {
+    let mut raw = Vec::with_capacity(height * (width * ch + 1));
+    for row in rgb.chunks_exact(width * ch) {
         raw.push(0);
         raw.extend_from_slice(row);
     }
@@ -57,7 +67,8 @@ pub fn encode_rgb(width: usize, height: usize, rgb: &[u8]) -> Vec<u8> {
     let mut ihdr = Vec::with_capacity(13);
     ihdr.extend_from_slice(&(width as u32).to_be_bytes());
     ihdr.extend_from_slice(&(height as u32).to_be_bytes());
-    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit, truecolour, deflate, adaptive filter, no interlace
+    // 8-bit, truecolour (with alpha), deflate, adaptive filter, no interlace
+    ihdr.extend_from_slice(&[8, if ch == 4 { 6 } else { 2 }, 0, 0, 0]);
     chunk(&mut out, b"IHDR", &ihdr);
     chunk(&mut out, b"IDAT", &z);
     chunk(&mut out, b"IEND", &[]);
