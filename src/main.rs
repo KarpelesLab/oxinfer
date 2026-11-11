@@ -1362,7 +1362,7 @@ fn run(mut args: Args) -> Result<()> {
     match model_type.as_str() {
         "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" | "gemma3" | "gemma3_text" => run_gemma(args),
         "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" | "qwen2" | "qwen2_5_vl"
-        | "qwen4_exp" | "qwen4_exp_text" => run_qwen(args),
+        | "qwen3_vl" | "qwen4_exp" | "qwen4_exp_text" => run_qwen(args),
         // Llama 3 runs on the Qwen3 code path.
         "llama" => run_qwen(args),
         // MiniMax M2 / M2.1 / M2.5 / M2.7: the Qwen code path with MiniMax's attention norms and router.

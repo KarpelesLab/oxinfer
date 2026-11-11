@@ -765,7 +765,8 @@ impl QwenConfig {
         let minimax_01 = matches!(mt, Some("minimax" | "minimax_text_01" | "minimax_m1" | "minimax_vl_01"));
         let minimax_hf = mt == Some("minimax");
         let minimax_m2 = mt == Some("minimax_m2") || minimax_m3;
-        let dense = mt == Some("qwen3") || llama || qwen2 || minimax_m2;
+        // Qwen3-VL's text model is a dense Qwen3 (with M-RoPE, plain for text).
+        let dense = matches!(mt, Some("qwen3" | "qwen3_vl" | "qwen3_vl_text")) || llama || qwen2 || minimax_m2;
         let image_token = raw.get("image_token_id").and_then(|v| v.as_u64());
         let text = raw.get("text_config").cloned().unwrap_or(raw);
         let has_head_dim = text.get("head_dim").is_some_and(|v| v.is_u64());

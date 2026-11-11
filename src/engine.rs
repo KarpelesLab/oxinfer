@@ -1323,7 +1323,7 @@ impl Engine {
             "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => Family::Gemma4,
             "gemma3" | "gemma3_text" => Family::Gemma3,
             "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" | "qwen2" | "qwen2_5_vl"
-            | "qwen4_exp" | "qwen4_exp_text" => Family::Qwen,
+            | "qwen3_vl" | "qwen4_exp" | "qwen4_exp_text" => Family::Qwen,
             "llama" => Family::Llama,
             "minimax_m2" | "minimax_m3_vl" | "minimax_m3_vl_text" | "minimax" | "minimax_text_01" | "minimax_m1" | "minimax_vl_01" => {
                 Family::Qwen

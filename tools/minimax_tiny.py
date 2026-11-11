@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tiny random MiniMax checkpoints + transformers reference outputs (float32, CPU, eager).
 
-usage: minimax_tiny.py OUT_DIR [--arch m2|m3|01|qwen2] [--release] [--gen N] [--seed S] [--fp8]
+usage: minimax_tiny.py OUT_DIR [--arch m2|m3|01|qwen2|qwen3vl] [--release] [--gen N] [--seed S] [--fp8]
 
 --arch m2: MiniMax-M2 / M2.1 / M2.5 / M2.7 (`minimax_m2`): full attention with query / key norms
   over all heads, partial RoPE, sigmoid-routed experts with a selection bias, no shared expert.
@@ -138,6 +138,22 @@ elif arch == "01":
         bos_token_id=EOS,
     )
     Model = MiniMaxForCausalLM
+elif arch == "qwen3vl":
+    # Qwen3-VL (MiniMax-H3's text encoder): the text model; M-RoPE is plain for text.
+    from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration
+
+    cfg = Qwen3VLConfig(
+        text_config=dict(vocab_size=V, hidden_size=128, intermediate_size=192, num_hidden_layers=3,
+                         num_attention_heads=4, num_key_value_heads=2, head_dim=32, rms_norm_eps=1e-6,
+                         rope_parameters={"rope_type": "default", "rope_theta": 5000000.0,
+                                          "mrope_section": [6, 5, 5], "mrope_interleaved": True},
+                         tie_word_embeddings=False),
+        vision_config=dict(depth=1, hidden_size=64, intermediate_size=64, num_heads=2, out_hidden_size=128,
+                           deepstack_visual_indexes=[]),
+        tie_word_embeddings=False,
+    )
+    cfg.text_config._attn_implementation = "eager"
+    Model = Qwen3VLForConditionalGeneration
 elif arch == "qwen2":
     # MiniMax's SynLogic models are Qwen2.5 fine-tunes: biased q / k / v, no query / key norms.
     from transformers import Qwen2Config, Qwen2ForCausalLM
