@@ -437,12 +437,12 @@ fn generate_images(m: &mut ImageModel, job: &ImageJob, seed: u64) -> anyhow::Res
                     prompt: job.prompt.clone(),
                     negative: job.negative.clone().unwrap_or_default(),
                     steps: job.steps.unwrap_or(crate::sd::default_steps(pipe.turbo, kind, strength)),
-                    guidance: job.guidance.unwrap_or(if pipe.turbo { 0.0 } else { 7.5 }),
+                    guidance: job.guidance.unwrap_or(pipe.default_guidance()),
                     seed,
                     // 0 x 0: an edit takes the image's size.
                     width: w.unwrap_or(if edit.is_some() { 0 } else { side }),
                     height: h.unwrap_or(if edit.is_some() { 0 } else { side }),
-                    sampler: crate::sd::sched::Sampler::EulerAncestral,
+                    sampler: pipe.default_sampler(),
                 };
                 let (img, _) = match &edit {
                     Some(e) => pipe.generate_from(&p, e, &mut |_, _| {})?,

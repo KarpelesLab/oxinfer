@@ -299,13 +299,14 @@ fn usage() -> ! {
          \x20                      zero-copy with no quantization pass; for browsers, mmap); Qwen keeps\n\
          \x20                      its vision tower (bf16), Gemma's towers are left out\n\
          \n\
-         image generation (a diffusers folder: Stable Diffusion 1.x / 2.x, SD-Turbo):\n\
+         image generation (a diffusers folder: Stable Diffusion 1.x / 2.x, SD-Turbo, SDXL):\n\
          \x20 -o, --output FILE     PNG to write (default image.png)\n\
          \x20 --steps N            denoising steps (default 1 for turbo models, else 25)\n\
-         \x20 --guidance F         classifier-free guidance (default 0 for turbo, else 7.5)\n\
+         \x20 --guidance F         classifier-free guidance (default 0 for turbo, 5 for SDXL, else 7.5)\n\
          \x20 --negative TEXT      negative prompt (with guidance > 1)\n\
-         \x20 --size WxH           image size, multiples of 64 (default the model's)\n\
-         \x20 --sampler NAME       euler or euler_a (default euler_a)\n\
+         \x20 --size WxH           image size, multiples of 64 (32 for SDXL; default the model's)\n\
+         \x20 --sampler NAME       euler or euler_a (default euler_a; SDXL: its scheduler's), or\n\
+         \x20                      euler_trailing / euler_a_trailing (few-step LoRAs such as SDXL-Lightning)\n\
          \x20 --seed N             noise seed (default 42)\n\
          \x20 --lora FILE[:SCALE]  merge a LoRA (kohya or diffusers safetensors; repeatable; scale 1);\n\
          \x20                      FILE may be org/repo/file.safetensors on Hugging Face\n\
@@ -1539,10 +1540,9 @@ fn run_image(args: &Args) -> Result<()> {
         (Some(e), None) => pipe.edit_size(e.image.width, e.image.height),
         (None, None) => (side, side),
     };
-    let sampler = match args.sampler.as_deref().unwrap_or("euler_a") {
-        "euler" => Sampler::Euler,
-        "euler_a" | "euler_ancestral" => Sampler::EulerAncestral,
-        other => bail!("unknown sampler {other} (use euler or euler_a)"),
+    let sampler = match args.sampler.as_deref() {
+        None => pipe.default_sampler(),
+        Some(name) => Sampler::parse(name).with_context(|| format!("unknown sampler {name} (use {})", Sampler::NAMES))?,
     };
     // Turbo models: steps * strength must reach one step (strength 0.5 -> 2 steps, 1 run).
     let strength = args.strength.unwrap_or(match kind {
@@ -1553,7 +1553,7 @@ fn run_image(args: &Args) -> Result<()> {
         prompt,
         negative: args.negative.clone(),
         steps: args.steps.unwrap_or(oxinfer::sd::default_steps(pipe.turbo, kind, strength)),
-        guidance: args.guidance.unwrap_or(if pipe.turbo { 0.0 } else { 7.5 }),
+        guidance: args.guidance.unwrap_or(pipe.default_guidance()),
         seed: args.seed,
         width,
         height,

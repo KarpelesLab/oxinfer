@@ -1638,15 +1638,17 @@ fn sd_run(
             prompt: prompt.to_string(),
             negative: o.negative.clone(),
             steps: o.steps.unwrap_or(crate::sd::default_steps(pipe.turbo, kind, strength)),
-            guidance: o.guidance.unwrap_or(if pipe.turbo { 0.0 } else { 7.5 }),
+            guidance: o.guidance.unwrap_or(pipe.default_guidance()),
             seed: o.seed.unwrap_or(42),
             // 0 x 0: an edit picks the size from the image.
             width: o.width.unwrap_or(if edit.is_some() { 0 } else { side }),
             height: o.height.unwrap_or(if edit.is_some() { 0 } else { side }),
-            sampler: match o.sampler.as_deref().unwrap_or("euler_a") {
-                "euler" => crate::sd::sched::Sampler::Euler,
-                "euler_a" | "euler_ancestral" => crate::sd::sched::Sampler::EulerAncestral,
-                other => bail!("unknown sampler {other:?} (euler, euler_a)"),
+            sampler: match o.sampler.as_deref() {
+                None => pipe.default_sampler(),
+                Some(name) => match crate::sd::sched::Sampler::parse(name) {
+                    Some(s) => s,
+                    None => bail!("unknown sampler {name:?} ({})", crate::sd::sched::Sampler::NAMES),
+                },
             },
         };
         let mut progress = |i: usize, n: usize| {

@@ -696,9 +696,10 @@ void oxi_sd_cancel(const OxiSd *s);
 
 /* Text to image, or an edit of an image file. `options_json` (NULL or {} for the defaults):
  *   {"negative": "", "steps": 25 (turbo 1; edits: InstructPix2Pix 20, turbo enough for one step),
- *    "guidance": 7.5 (turbo 0), "seed": 42, "width": W, "height": H (multiples of 64; default
+ *    "guidance": 7.5 (turbo 0, SDXL 5), "seed": 42, "width": W, "height": H (multiples of 64; default
  *    the model's size, or for an edit the model's area at the image's aspect ratio),
- *    "sampler": "euler_a" | "euler",
+ *    "sampler": "euler_a" | "euler" | "euler_trailing" | "euler_a_trailing" (default euler_a; SDXL:
+ *    its scheduler's),
  *    "init_image": "in.png" (PNG / JPEG / WebP / ...; needs the `media` feature),
  *    "mask": "mask.png" (white = repaint), "strength": 0.8 (image-to-image; inpainting 1),
  *    "image_guidance": 1.5 (InstructPix2Pix)}
