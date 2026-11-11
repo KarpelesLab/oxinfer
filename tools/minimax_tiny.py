@@ -152,6 +152,23 @@ else:
 
 cfg._attn_implementation = "eager"
 m = Model(cfg).float().eval()
+def minimax_slopes(model):
+    """MiniMax's lightning slopes: `slope * (1 - l / (L - 1) + 1e-5)`; transformers' `minimax` puts
+    the 1e-5 in the denominator too, which changes the last layer's decay by half (the factor is
+    about 1e-5 there), visible over long contexts."""
+    import math
+    for l, layer in enumerate(model.model.layers):
+        a = layer.self_attn
+        if not hasattr(a, "slope_rate"):
+            continue
+        n, L = a.num_attention_heads, model.config.num_hidden_layers
+        base = 1 / (2 ** (8 / n))
+        rate = torch.tensor([base ** (h + 1) for h in range(n)], dtype=torch.float32)[:, None, None]
+        rate = rate * (1 - l / (L - 1) + 1e-5)
+        a.slope_rate = rate
+        a.query_decay, a.key_decay, a.diagonal_decay = a.decay_factors(rate)
+
+
 if arch == "01":
     # transformers' `minimax` rotates whole heads; MiniMax's own code (modeling_minimax_m1.py,
     # which llama.cpp and vLLM follow) rotates the first `rotary_dim` dimensions with frequencies
@@ -171,6 +188,7 @@ if arch == "01":
         return q, k
 
     mmod.apply_rotary_pos_emb = partial_rope
+    minimax_slopes(m)
 
 
 def fp8_quant(w):

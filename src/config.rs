@@ -690,18 +690,32 @@ pub struct QwenConfig {
     /// `alpha * residual + beta * sublayer`.
     #[serde(default)]
     pub postnorm: bool,
-    #[serde(default, alias = "layernorm_full_attention_alpha")]
+    /// The residual scales as the `-hf` releases name them, and as the original ones do
+    /// (`layernorm_*`); either may be present, or both.
+    #[serde(default)]
     pub full_attn_alpha_factor: Option<f64>,
-    #[serde(default, alias = "layernorm_full_attention_beta")]
+    #[serde(default)]
     pub full_attn_beta_factor: Option<f64>,
-    #[serde(default, alias = "layernorm_linear_attention_alpha")]
+    #[serde(default)]
     pub linear_attn_alpha_factor: Option<f64>,
-    #[serde(default, alias = "layernorm_linear_attention_beta")]
+    #[serde(default)]
     pub linear_attn_beta_factor: Option<f64>,
-    #[serde(default, alias = "layernorm_mlp_alpha")]
+    #[serde(default)]
     pub mlp_alpha_factor: Option<f64>,
-    #[serde(default, alias = "layernorm_mlp_beta")]
+    #[serde(default)]
     pub mlp_beta_factor: Option<f64>,
+    #[serde(default)]
+    pub layernorm_full_attention_alpha: Option<f64>,
+    #[serde(default)]
+    pub layernorm_full_attention_beta: Option<f64>,
+    #[serde(default)]
+    pub layernorm_linear_attention_alpha: Option<f64>,
+    #[serde(default)]
+    pub layernorm_linear_attention_beta: Option<f64>,
+    #[serde(default)]
+    pub layernorm_mlp_alpha: Option<f64>,
+    #[serde(default)]
+    pub layernorm_mlp_beta: Option<f64>,
     /// Set for MiniMax-01 checkpoints: the linear layers are lightning attention.
     #[serde(skip)]
     pub lightning: bool,
@@ -932,11 +946,21 @@ impl QwenConfig {
         }
         let f = |v: Option<f64>| v.unwrap_or(1.0) as f32;
         let attn = if self.is_full(l) {
-            (f(self.full_attn_alpha_factor), f(self.full_attn_beta_factor))
+            (
+                f(self.full_attn_alpha_factor.or(self.layernorm_full_attention_alpha)),
+                f(self.full_attn_beta_factor.or(self.layernorm_full_attention_beta)),
+            )
         } else {
-            (f(self.linear_attn_alpha_factor), f(self.linear_attn_beta_factor))
+            (
+                f(self.linear_attn_alpha_factor.or(self.layernorm_linear_attention_alpha)),
+                f(self.linear_attn_beta_factor.or(self.layernorm_linear_attention_beta)),
+            )
         };
-        Some([attn, (f(self.mlp_alpha_factor), f(self.mlp_beta_factor))])
+        let mlp = (
+            f(self.mlp_alpha_factor.or(self.layernorm_mlp_alpha)),
+            f(self.mlp_beta_factor.or(self.layernorm_mlp_beta)),
+        );
+        Some([attn, mlp])
     }
     /// Layer `l` has a dense MLP rather than a MoE (MiniMax M3's leading layers).
     pub fn is_dense_mlp(&self, l: usize) -> bool {

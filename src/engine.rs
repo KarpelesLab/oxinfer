@@ -2354,6 +2354,7 @@ impl Engine {
                 Family::Gemma4 => {}
                 Family::Qwen if self.mmproj == crate::pixtral::Mmproj::None => bail!("image input is disabled (mmproj none)"),
                 Family::Qwen if crate::qwen_vision::QwenMmConfig::load_with(&self.info.path, &self.mmproj)?.is_some() => {}
+                Family::Qwen if crate::minimax_vl01::Vl01Config::load(&self.info.path)?.is_some() => {}
                 Family::Qwen if crate::gguf::is_gguf(&self.info.path) => {
                     bail!("this checkpoint has no vision tower (for a GGUF model: no Qwen mmproj file beside it; set the mmproj option)")
                 }

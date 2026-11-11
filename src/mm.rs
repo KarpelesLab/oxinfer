@@ -259,6 +259,9 @@ fn prepare_sources(src: &Sources, files: &ModelFiles, text_hidden: usize) -> Res
     if let Some(qc) = qwen_vision::QwenMmConfig::load_with(args.model, &args.mmproj)? {
         return prepare_qwen(src, files, text_hidden, qc);
     }
+    if let Some(vc) = crate::minimax_vl01::Vl01Config::load(args.model)? {
+        return prepare_vl01(src, files, text_hidden, vc);
+    }
     let mmc = mm_config::MmConfig::load(args.model)?;
     let mut text = String::new();
     let mut feats = Vec::new();
@@ -474,6 +477,59 @@ impl GemmaVideoConfig {
             max_soft_tokens: int("max_soft_tokens", 70),
         }
     }
+}
+
+/// MiniMax-VL-01 attachments: `<image>` per packed feature (see `crate::minimax_vl01`).
+fn prepare_vl01(
+    src: &Sources,
+    files: &ModelFiles,
+    text_hidden: usize,
+    vc: crate::minimax_vl01::Vl01Config,
+) -> Result<(String, Vec<MmFeature>)> {
+    if src.n_audios() > 0 || src.n_videos() > 0 {
+        bail!("MiniMax-VL-01 takes images only");
+    }
+    let (mut text, mut feats) = (String::new(), Vec::new());
+    if src.n_images() == 0 {
+        return Ok((text, feats));
+    }
+    if vc.text_hidden != text_hidden {
+        bail!(
+            "vision projector output {} does not match the text model's {text_hidden}",
+            vc.text_hidden
+        );
+    }
+    let t = Instant::now();
+    let tower = crate::minimax_vl01::Vl01Tower::load(vc.clone(), files)?;
+    for i in 0..src.n_images() {
+        let (what, img) = src.image(i)?;
+        let (views, tiles) = crate::minimax_vl01::preprocess(&vc, &img.data, img.width, img.height);
+        let emb = tower.encode(&views, tiles, img.width, img.height);
+        let n = emb.len() / text_hidden;
+        debug_assert_eq!(n, vc.tokens(img.width, img.height));
+        eprintln!(
+            "[image {what}: {}x{} -> {} views ({}x{} tiles) -> {n} tokens, {:.2}s]",
+            img.width,
+            img.height,
+            views.len(),
+            tiles.0,
+            tiles.1,
+            t.elapsed().as_secs_f64()
+        );
+        if let (Some(prefix), 0) = (src.req.dump_mm, i) {
+            let px: Vec<f32> = views.concat();
+            dump(&format!("{}_pixels.bin", prefix.display()), &px)?;
+            dump(&format!("{}_image.bin", prefix.display()), &emb)?;
+        }
+        text.push_str(&"<image>".repeat(n));
+        feats.push(MmFeature {
+            token_id: vc.image_token_id,
+            emb,
+            n,
+            grids: Vec::new(),
+        });
+    }
+    Ok((text, feats))
 }
 
 /// Qwen3.5-family attachments: `<|vision_start|><|image_pad|>...<|vision_end|>` per image, and per

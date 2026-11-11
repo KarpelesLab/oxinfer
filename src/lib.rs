@@ -53,6 +53,7 @@ pub mod media;
 pub mod metal;
 pub mod minimax;
 pub mod minimax_vision;
+pub mod minimax_vl01;
 pub mod mistral4;
 pub mod mm;
 pub mod mm_config;
