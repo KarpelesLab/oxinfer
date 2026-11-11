@@ -77,6 +77,9 @@ pub fn run(args: &Args) -> Result<()> {
     }
     p.seed = args.seed;
     p.think = args.think;
+    let e = &args.bagel.edit;
+    e.only("Step1X-Edit", false, false, false)?;
+    p.sample_posterior = e.sample_posterior;
     // --size WxH: the output size, and the working resolution's area (the input's aspect ratio
     // is kept while denoising: the reference latents share the target's grid).
     if let Some((w, h)) = args.size {
@@ -123,6 +126,9 @@ pub fn run(args: &Args) -> Result<()> {
         None => pipe.generate(&p, &mut progress)?,
     };
     eprintln!();
+    if let Some(s) = tm.posterior_std {
+        eprintln!("[reference image: posterior std / latents (L2) {s:.3e}]");
+    }
     if let Some(r) = &tm.rewritten {
         eprintln!("[rewritten instruction: {r}]");
     }

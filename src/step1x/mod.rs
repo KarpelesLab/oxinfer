@@ -160,6 +160,10 @@ pub struct Params {
     /// Above this timestep (0..1000) the guidance difference is divided by its norm^power.
     pub timesteps_truncate: f32,
     pub norm_power: f32,
+    /// Sample the VAE posterior of the input image (`mean + std * noise`, as the pipeline's
+    /// `sample_mode="sample"`) instead of taking its mean. The noise comes from
+    /// [`crate::vae_posterior::noise`], seeded by `seed`.
+    pub sample_posterior: bool,
 }
 
 impl Params {
@@ -176,6 +180,7 @@ impl Params {
             think: false,
             timesteps_truncate: 0.93,
             norm_power: 0.4,
+            sample_posterior: false,
         }
     }
 }
@@ -193,6 +198,8 @@ pub struct Request {
     pub width: Option<usize>,
     pub height: Option<usize>,
     pub think: Option<bool>,
+    /// Sample the VAE posterior of the input image instead of taking its mean.
+    pub sample_posterior: Option<bool>,
     /// The input image file (decoded with the `media` feature); none: text to image.
     pub images: Vec<String>,
 }
@@ -216,6 +223,7 @@ impl Request {
         p.width = self.width;
         p.height = self.height;
         p.think = self.think.unwrap_or(false);
+        p.sample_posterior = self.sample_posterior.unwrap_or(false);
         p
     }
 }
@@ -237,6 +245,9 @@ pub struct Timings {
     pub size: (usize, usize),
     /// The instruction the thinking mode produced.
     pub rewritten: Option<String>,
+    /// With `sample_posterior`: the posterior's standard deviations relative to its means (L2
+    /// over the reference latents).
+    pub posterior_std: Option<f64>,
 }
 
 struct LoadedTransformer {
@@ -1051,6 +1062,7 @@ impl Pipeline {
         let t1 = Instant::now();
         let c = self.vae.latent_channels;
         let (lh, lw) = (2 * (h / 16), 2 * (w / 16));
+        let mut posterior_std = None;
         let ref_tok = match &vae_px {
             Some(px) => {
                 dump("vae_in.bin", px);
@@ -1061,7 +1073,22 @@ impl Pipeline {
                         // (half-precision activations move them by 8e-4, bf16 weights by 1.5%).
                         let was = crate::gpu::exact();
                         crate::gpu::set_exact(true);
-                        let r = self.vae.encode(px, h, w);
+                        let r = if p.sample_posterior {
+                            // The reference's posterior noise instead of ours for checks.
+                            let n = c * lh * lw;
+                            match read_override("ref_noise_in.bin", Some(n)) {
+                                Ok(eps) => {
+                                    let eps = eps.unwrap_or_else(|| crate::vae_posterior::noise(p.seed, 0, n));
+                                    crate::vae_posterior::encode_sampled(&self.vae, px, h, w, &eps, true).map(|s| {
+                                        posterior_std = Some(s.relative_std);
+                                        (s.latents, s.lh, s.lw)
+                                    })
+                                }
+                                Err(e) => Err(e),
+                            }
+                        } else {
+                            self.vae.encode(px, h, w)
+                        };
                         crate::gpu::set_exact(was);
                         r?.0
                     }
@@ -1074,6 +1101,7 @@ impl Pipeline {
             None => Vec::new(),
         };
         tm.vae_encode = t1.elapsed().as_secs_f64();
+        tm.posterior_std = posterior_std;
 
         tm.load_transformer = self.load_transformer()?;
         let t2 = Instant::now();

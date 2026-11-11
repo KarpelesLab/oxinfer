@@ -76,6 +76,21 @@ pub fn run(args: &Args) -> Result<()> {
         p.negative = args.negative.clone();
     }
     p.seed = args.seed;
+    let e = &args.bagel.edit;
+    e.only("OmniGen2", true, true, true)?;
+    if let Some(s) = &e.scheduler {
+        p.scheduler = oxinfer::omnigen2::Scheduler::parse(s).with_context(|| format!("--scheduler expects euler|dpmsolver++, got {s}"))?;
+    }
+    // As the official script: TaylorSeer wins when both caches are asked for.
+    if e.taylorseer {
+        if e.teacache.is_some() {
+            eprintln!("[--teacache and --taylorseer are mutually exclusive: using TaylorSeer]");
+        }
+        p = p.with_taylorseer();
+    } else if let Some(t) = e.teacache {
+        p = p.with_teacache(t);
+    }
+    p.sample_posterior = e.sample_posterior;
     if let Some((w, h)) = args.size {
         p.width = Some(w);
         p.height = Some(h);
@@ -84,13 +99,24 @@ pub fn run(args: &Args) -> Result<()> {
     paths.extend(args.images.iter().cloned());
     let images = load_images(&paths)?;
     eprintln!(
-        "[{} steps, text guidance {}, image guidance {}, seed {}, {} input image{}]",
+        "[{} steps ({}{}), text guidance {}, image guidance {}, seed {}, {} input image{}{}]",
         p.steps,
+        p.scheduler.as_str(),
+        match p.cache {
+            oxinfer::step_cache::StepCache::None => String::new(),
+            oxinfer::step_cache::StepCache::TeaCache { rel_l1_thresh } => format!(", TeaCache {rel_l1_thresh}"),
+            oxinfer::step_cache::StepCache::TaylorSeer(_) => ", TaylorSeer".to_string(),
+        },
         p.text_guidance,
         if images.is_empty() { 1.0 } else { p.image_guidance },
         p.seed,
         images.len(),
-        if images.len() == 1 { "" } else { "s" }
+        if images.len() == 1 { "" } else { "s" },
+        if p.sample_posterior && !images.is_empty() {
+            ", sampled VAE posterior"
+        } else {
+            ""
+        }
     );
     let mut progress = |i: usize, n: usize| eprint!("\r[step {i}/{n}]");
     let (img, tm) = if images.is_empty() {
@@ -99,13 +125,16 @@ pub fn run(args: &Args) -> Result<()> {
         pipe.edit(&images, &p, &mut progress)?
     };
     eprintln!();
+    for (i, s) in tm.posterior_std.iter().enumerate() {
+        eprintln!("[input image {}: posterior std / latents (L2) {s:.3e}]", i + 1);
+    }
     if let Some(t) = pipe.transformer() {
         eprintln!("[transformer weights {:.2} GB]", t.bytes() as f64 / 1e9);
     }
     let out = args.output.clone().unwrap_or_else(|| PathBuf::from("image.png"));
     std::fs::write(&out, oxinfer::png::encode_rgb(img.width, img.height, &img.rgb)).with_context(|| format!("write {}", out.display()))?;
     eprintln!(
-        "[load text {:.1}s, encode {:.1}s | vae encode {:.1}s | load transformer {:.1}s | denoise {:.1}s ({} passes, {:.2}s each) | decode {:.1}s | {}x{} -> {}]",
+        "[load text {:.1}s, encode {:.1}s | vae encode {:.1}s | load transformer {:.1}s | denoise {:.1}s ({} passes, {:.2}s each{}) | decode {:.1}s | {}x{} -> {}]",
         tm.load_text,
         tm.text,
         tm.vae_encode,
@@ -113,6 +142,11 @@ pub fn run(args: &Args) -> Result<()> {
         tm.denoise,
         tm.transformer_calls,
         tm.denoise / tm.transformer_calls.max(1) as f64,
+        if tm.cached_passes > 0 {
+            format!("; {} more from the step cache", tm.cached_passes)
+        } else {
+            String::new()
+        },
         tm.decode,
         img.width,
         img.height,

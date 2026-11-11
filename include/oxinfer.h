@@ -542,7 +542,10 @@ void oxi_omnigen2_cancel(const OxiOmniGen2 *q);
  *   "negative": "..." (default: the official negative prompt), "steps": 50,
  *   "text_guidance": 5, "image_guidance": 2, "cfg_range": [0, 1], "seed": 0,
  *   "width" / "height" (default: one input image's size, else 1024x1024; a single input image
- *   is resized to an explicit size), "max_pixels": 1048576, "max_side": 1024 (input images)}
+ *   is resized to an explicit size), "max_pixels": 1048576, "max_side": 1024 (input images),
+ *   and, changing the result (all off by default): "scheduler": "euler" | "dpmsolver++",
+ *   "teacache": 0.05 (TeaCache with this threshold), "taylorseer": true,
+ *   "sample_posterior": true (sample the VAE posterior of input images instead of its mean)}
  * `n` more input images come as tightly packed RGB8 pixels (`rgb[i]`, `widths[i]` x
  * `heights[i]`; NULLs when `n` is 0), after those of "images". The image is passed to
  * `on_image` (index 0); `on_step` (may be NULL) is called after every denoising step, non-zero
@@ -586,7 +589,8 @@ void oxi_step1x_cancel(const OxiStep1x *s);
  *   image: a list of defects), "true_cfg": 6, "steps": 28, "seed": 42, "size_level": 1024 (the
  *   working resolution: about size_level^2 pixels at the image's aspect ratio), "width" /
  *   "height" (the returned size; default the input's), "think": false (v1.2: the VL model
- *   rewrites the instruction first)}
+ *   rewrites the instruction first), "sample_posterior": false (sample the VAE posterior of
+ *   the input image instead of its mean)}
  * The image is passed to `on_image` (index 0); `on_step` (may be NULL) is called after every
  * denoising step, non-zero cancels. Returns 1, or -1 (error, or cancelled). */
 int oxi_step1x_edit(OxiStep1x *s, const char *request_json, const uint8_t *rgb, int width, int height,
@@ -811,7 +815,9 @@ void oxi_bagel_cancel(const OxiBagel *b);
  *    "cfg_renorm_type": "text_channel" (editing) / "global" | "channel",
  *    "width": 1024, "height": 1024 (text to image), "max_image_size": 1024,
  *    "min_image_size": 512 (input resize), "seed": 42, "think": false,
- *    "max_think_tokens": 1000, "temperature": 0}
+ *    "max_think_tokens": 1000, "temperature": 0, "taylorseer": false (TaylorSeer step
+ *    cache: a different image), "sample_posterior": false (sample the VAE posterior of input
+ *    images instead of its mean)}
  * Each returns 1, or -1 (error, or cancelled). The image goes to `on_image` (index 0). */
 int oxi_bagel_generate(OxiBagel *b, const char *prompt, const char *options_json, oxi_image_fn on_image, oxi_step_fn on_step,
                        void *user);

@@ -338,6 +338,10 @@ fn usage() -> ! {
          \x20 --size WxH           output size (default: the input image's, within 1024x1024; a single\n\
          \x20                      input image is resized to it); 1024x1024 without or with several images\n\
          \x20 --image FILE         without -o: ask the model's Qwen2.5-VL about the image (--prompt)\n\
+         \x20 --scheduler S        euler (default) | dpmsolver++\n\
+         \x20 --teacache F         TeaCache step cache with relative-L1 threshold F (e.g. 0.05); or\n\
+         \x20 --taylorseer         TaylorSeer step cache (both skip transformer passes: a different image)\n\
+         \x20 --sample-posterior   sample the VAE posterior of input images (default: its mean)\n\
          \n\
          Step1X-Edit (stepfun-ai/Step1X-Edit-v1p2, -v1p1-diffusers): image editing (-o, --negative,\n\
          --seed, --quant, --mmap, --stream as above):\n\
@@ -347,6 +351,7 @@ fn usage() -> ! {
          \x20 --size WxH           output size (default the input's), also the working area; the input is\n\
          \x20                      center-cropped to that aspect ratio (default: about 1024x1024)\n\
          \x20 --think              v1.2: the VL model rewrites the instruction from the image first\n\
+         \x20 --sample-posterior   sample the VAE posterior of the input image (default: its mean)\n\
          \n\
          Janus-Pro (deepseek-ai/Janus-Pro-1B / -7B) and JanusFlow (deepseek-ai/JanusFlow-1.3B): text\n\
          to image, and questions about images:\n\

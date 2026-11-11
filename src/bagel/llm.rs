@@ -311,7 +311,47 @@ impl<'a> Llm<'a> {
     /// Runs several blocks of the same shape (one per context, e.g. the guidance branches of a
     /// denoising step) as one batch: every matmul takes all their rows, attention stays per
     /// block. Returns each block's final-normed `und` and `gen` hidden states.
-    pub fn forward_multi(&self, mut ctxs: Vec<Ctx>, blocks: Vec<Block>) -> Result<Vec<(Vec<f32>, Vec<f32>)>> {
+    pub fn forward_multi(&self, ctxs: Vec<Ctx>, blocks: Vec<Block>) -> Result<Vec<(Vec<f32>, Vec<f32>)>> {
+        let c = &self.cfg;
+        let h = c.hidden_size;
+        let nb = blocks.len();
+        let (xu, xg, nu, ng) = self.forward_layers(ctxs, blocks)?;
+        let mut hu = vec![0f32; xu.len()];
+        let mut hg = vec![0f32; xg.len()];
+        rmsnorm_rows(&xu, h, Some(self.norm), c.rms_norm_eps, &mut hu);
+        if ng > 0 {
+            rmsnorm_rows(&xg, h, self.norm_gen, c.rms_norm_eps, &mut hg);
+        }
+        Ok((0..nb)
+            .map(|bi| {
+                (
+                    hu[bi * nu * h..(bi + 1) * nu * h].to_vec(),
+                    hg[bi * ng * h..(bi + 1) * ng * h].to_vec(),
+                )
+            })
+            .collect())
+    }
+
+    /// [`Llm::forward_multi`] for the generation expert's rows, before the final norm: the last
+    /// layer's hidden states of each block's latent tokens (`[n_gen, hidden]` per block), the
+    /// feature a [`crate::step_cache::TaylorSeer`] keeps. [`Llm::final_norm_gen`] completes them.
+    pub fn forward_multi_gen_raw(&self, ctxs: Vec<Ctx>, blocks: Vec<Block>) -> Result<Vec<Vec<f32>>> {
+        let h = self.cfg.hidden_size;
+        let nb = blocks.len();
+        let (_, xg, _, ng) = self.forward_layers(ctxs, blocks)?;
+        Ok((0..nb).map(|bi| xg[bi * ng * h..(bi + 1) * ng * h].to_vec()).collect())
+    }
+
+    /// The generation expert's final norm over `[rows, hidden]` last-layer states.
+    pub fn final_norm_gen(&self, xg: &[f32]) -> Vec<f32> {
+        let mut hg = vec![0f32; xg.len()];
+        rmsnorm_rows(xg, self.cfg.hidden_size, self.norm_gen, self.cfg.rms_norm_eps, &mut hg);
+        hg
+    }
+
+    /// The layers of [`Llm::forward_multi`]: every block's understanding rows and generation
+    /// rows after the last layer (before the final norms), and the rows per block of each.
+    fn forward_layers(&self, mut ctxs: Vec<Ctx>, blocks: Vec<Block>) -> Result<(Vec<f32>, Vec<f32>, usize, usize)> {
         let c = &self.cfg;
         let (h, inter) = (c.hidden_size, c.intermediate_size);
         let (nh, nkv, hd) = (c.num_attention_heads, c.num_key_value_heads, c.head_dim);
@@ -479,18 +519,7 @@ impl<'a> Llm<'a> {
         if let Some(Ctx::Append(kv)) = ctxs.first_mut() {
             kv.len += t;
         }
-        rmsnorm_rows(&xu, h, Some(self.norm), c.rms_norm_eps, &mut hu);
-        if ng > 0 {
-            rmsnorm_rows(&xg, h, self.norm_gen, c.rms_norm_eps, &mut hg);
-        }
-        Ok((0..nb)
-            .map(|bi| {
-                (
-                    hu[bi * nu * h..(bi + 1) * nu * h].to_vec(),
-                    hg[bi * ng * h..(bi + 1) * ng * h].to_vec(),
-                )
-            })
-            .collect())
+        Ok((xu, xg, nu, ng))
     }
 }
 

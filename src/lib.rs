@@ -88,11 +88,13 @@ pub mod server;
 pub mod snac;
 pub mod snapshot;
 pub mod step1x;
+pub mod step_cache;
 pub mod stream;
 pub mod tokenizer;
 pub mod tools;
 pub mod torch;
 pub mod tts;
+pub mod vae_posterior;
 pub mod video;
 pub mod vision;
 #[cfg(all(feature = "gpu", target_pointer_width = "64", not(target_arch = "wasm32")))]

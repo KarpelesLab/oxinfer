@@ -390,9 +390,8 @@ impl<'a> Transformer<'a> {
         Ok(x)
     }
 
-    /// The joint blocks over `[text, refs..., target]` and the output layer: the velocity of the
-    /// target's patches, `[target.tokens(), patch^2 * out_channels]`.
-    pub fn joint(&self, text: &[f32], refs: &[(&[f32], Grid)], target: &[f32], tg: Grid, sc: &StepCond) -> Result<Vec<f32>> {
+    /// The joint sequence `[text, refs..., target]` (`[n, hidden]`) and its RoPE angles.
+    fn joint_input(&self, text: &[f32], refs: &[(&[f32], Grid)], target: &[f32], tg: Grid) -> Result<(Vec<f32>, CosSin, usize)> {
         let d = self.cfg.hidden_size;
         let l = text.len() / d;
         let nr: usize = refs.iter().map(|r| r.1.tokens()).sum();
@@ -410,11 +409,74 @@ impl<'a> Transformer<'a> {
         Self::grid_pos(tg, s, &mut pos);
         x.extend_from_slice(target);
         let cs = self.rope(&pos)?;
+        Ok((x, cs, n))
+    }
+
+    /// The joint blocks over `[text, refs..., target]` and the output layer: the velocity of the
+    /// target's patches, `[target.tokens(), patch^2 * out_channels]`.
+    pub fn joint(&self, text: &[f32], refs: &[(&[f32], Grid)], target: &[f32], tg: Grid, sc: &StepCond) -> Result<Vec<f32>> {
+        let h = self.joint_hidden(text, refs, target, tg, sc)?;
+        Ok(self.output(&h, tg.tokens(), sc))
+    }
+
+    /// The joint blocks alone: the target rows of the last block's hidden states,
+    /// `[target.tokens(), hidden]` (the feature a [`crate::step_cache::TaylorSeer`] keeps);
+    /// [`Transformer::output`] turns them into the velocity.
+    pub fn joint_hidden(&self, text: &[f32], refs: &[(&[f32], Grid)], target: &[f32], tg: Grid, sc: &StepCond) -> Result<Vec<f32>> {
+        let d = self.cfg.hidden_size;
+        let n0 = tg.tokens();
+        let (mut x, cs, n) = self.joint_input(text, refs, target, tg)?;
         for (b, m) in self.layers.iter().zip(&sc.layers) {
             self.block(b, &mut x, n, &cs, Some(m));
         }
-        // norm_out: LayerNorm (no affine, eps 1e-6) * (1 + scale), then the projection.
-        let xo = &x[(n - n0) * d..];
+        x.drain(..(n - n0) * d);
+        Ok(x)
+    }
+
+    /// [`Transformer::joint`] under a [`TeaCache`](crate::step_cache::TeaCache) (the official
+    /// transformer's `enable_teacache`): the first block's modulated input over the whole
+    /// sequence decides whether the blocks run; when they do not, the residual of the last pass
+    /// that ran them is added to the input instead. Returns the velocity and whether the blocks
+    /// ran.
+    #[allow(clippy::too_many_arguments)]
+    pub fn joint_teacache(
+        &self,
+        text: &[f32],
+        refs: &[(&[f32], Grid)],
+        target: &[f32],
+        tg: Grid,
+        sc: &StepCond,
+        cache: &mut crate::step_cache::TeaCache,
+        first_or_last: bool,
+    ) -> Result<(Vec<f32>, bool)> {
+        let d = self.cfg.hidden_size;
+        let n0 = tg.tokens();
+        let (mut x, cs, n) = self.joint_input(text, refs, target, tg)?;
+        // `layers[0].norm1(hidden_states, temb)`: RMSNorm times (1 + scale_msa).
+        let mut modulated = vec![0f32; n * d];
+        if let (Some(b), Some(m)) = (self.layers.first(), sc.layers.first()) {
+            rmsnorm_f32w_rows(&x, d, &b.norm1, self.cfg.norm_eps, &mut modulated);
+            scale_rows(&mut modulated, d, &m[..d]);
+        }
+        let ran = cache.should_calc(modulated, first_or_last);
+        let h = match (ran, cache.residual()) {
+            (false, Some(res)) if res.len() == n0 * d => target.iter().zip(res).map(|(&a, &b)| a + b).collect(),
+            _ => {
+                for (b, m) in self.layers.iter().zip(&sc.layers) {
+                    self.block(b, &mut x, n, &cs, Some(m));
+                }
+                x.drain(..(n - n0) * d);
+                cache.set_residual(x.iter().zip(target).map(|(&a, &b)| a - b).collect());
+                x
+            }
+        };
+        Ok((self.output(&h, n0, sc), ran))
+    }
+
+    /// `norm_out` over the target's final hidden states (`[n0, hidden]`): LayerNorm (no affine,
+    /// eps 1e-6) * (1 + scale), then the projection to `[n0, patch^2 * out_channels]`.
+    pub fn output(&self, xo: &[f32], n0: usize, sc: &StepCond) -> Vec<f32> {
+        let d = self.cfg.hidden_size;
         let mut y = vec![0f32; n0 * d];
         let sc_out = &sc.out_scale;
         for_chunks(&mut y, d, n0 > 16, |i, r| {
@@ -426,7 +488,7 @@ impl<'a> Transformer<'a> {
                 r[j] = ((src[j] as f64 - mean) * inv) as f32 * (1.0 + sc_out[j]);
             }
         });
-        Ok(self.norm_out_lin2.forward(&y, n0))
+        self.norm_out_lin2.forward(&y, n0)
     }
 
     /// One block over `x` (`[n, hidden]`), in place; `m` is its modulation when it has one.

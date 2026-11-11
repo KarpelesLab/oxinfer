@@ -21,6 +21,49 @@ pub struct BagelArgs {
     pub shift: Option<f32>,
     pub max_size: Option<usize>,
     pub min_size: Option<usize>,
+    /// Flags shared with the other instruction-editing pipelines (parsed here so that they need
+    /// no hook of their own in the argument loop).
+    pub edit: EditArgs,
+}
+
+/// Opt-in options of the instruction-editing pipelines (OmniGen2, BAGEL, Step1X-Edit) that
+/// change the result: step caches, the scheduler, posterior sampling.
+#[derive(Default, Debug)]
+pub struct EditArgs {
+    /// `--teacache F`: TeaCache with this relative-L1 threshold (OmniGen2).
+    pub teacache: Option<f32>,
+    /// `--taylorseer`: TaylorSeer step caching (OmniGen2, BAGEL).
+    pub taylorseer: bool,
+    /// `--scheduler euler|dpmsolver++` (OmniGen2).
+    pub scheduler: Option<String>,
+    /// `--sample-posterior`: sample the VAE posterior of input images instead of its mean.
+    pub sample_posterior: bool,
+}
+
+impl EditArgs {
+    fn parse(&mut self, flag: &str, val: &mut dyn FnMut() -> Result<String>) -> Result<bool> {
+        match flag {
+            "--teacache" => self.teacache = Some(val()?.parse()?),
+            "--taylorseer" => self.taylorseer = true,
+            "--scheduler" => self.scheduler = Some(val()?),
+            "--sample-posterior" => self.sample_posterior = true,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Fails when a flag the running pipeline does not have was given.
+    pub fn only(&self, model: &str, teacache: bool, taylorseer: bool, scheduler: bool) -> Result<()> {
+        let bad = |on: bool, ok: bool, flag: &str| -> Result<()> {
+            if on && !ok {
+                anyhow::bail!("{flag} is not an option of {model}");
+            }
+            Ok(())
+        };
+        bad(self.teacache.is_some(), teacache, "--teacache")?;
+        bad(self.taylorseer, taylorseer, "--taylorseer")?;
+        bad(self.scheduler.is_some(), scheduler, "--scheduler")
+    }
 }
 
 impl BagelArgs {
@@ -45,7 +88,7 @@ impl BagelArgs {
             "--timestep-shift" => self.shift = Some(val()?.parse()?),
             "--max-size" => self.max_size = Some(val()?.parse()?),
             "--min-size" => self.min_size = Some(val()?.parse()?),
-            _ => return Ok(false),
+            _ => return self.edit.parse(flag, val),
         }
         Ok(true)
     }
@@ -67,11 +110,15 @@ BAGEL (ByteDance-Seed/BAGEL-7B-MoT): editing, text to image and image understand
 \x20 --max-size N         input images: longer side at most N (default 1024; 512 is ~4x cheaper)\n\
 \x20 --min-size N         input images: shorter side at least N where possible (default 512)\n\
 \x20 --think              write a plan (images) or reasoning (answers) first\n\
+\x20 --taylorseer         TaylorSeer step cache: after 5 steps the model runs every 3rd step (a\n\
+\x20                      different image; off by default)\n\
+\x20 --sample-posterior   sample the VAE posterior of input images (default: its mean)\n\
 \x20 --quant Q            bf16 (default) | q8 | q4      --mmap   map the weights\n\
 \x20 --seed N             noise seed (default 42)\n";
 
 pub fn run(args: &Args) -> Result<()> {
     let b = &args.bagel;
+    b.edit.only("BAGEL", false, true, false)?;
     // The images to edit or ask about: every --init-image, else every --image.
     let inits: Vec<&PathBuf> = if args.init_images.is_empty() {
         args.images.iter().collect()
@@ -164,17 +211,25 @@ pub fn run(args: &Args) -> Result<()> {
         think: args.think,
         max_image_size: max_size,
         min_image_size: min_size,
+        taylorseer: b.edit.taylorseer,
+        sample_posterior: b.edit.sample_posterior,
         ..Default::default()
     };
     if let Some((w, h)) = args.size {
         (o.width, o.height) = (Some(w), Some(h));
     }
     eprintln!(
-        "[{}: {} steps, seed {}{}]",
+        "[{}: {} steps, seed {}{}{}{}]",
         if image.is_some() { "edit" } else { "text to image" },
         o.steps,
         o.seed,
-        if o.think { ", thinking" } else { "" }
+        if o.think { ", thinking" } else { "" },
+        if o.taylorseer { ", TaylorSeer" } else { "" },
+        if o.sample_posterior && image.is_some() {
+            ", sampled VAE posterior"
+        } else {
+            ""
+        }
     );
     let tp = Instant::now();
     let mut progress = |i: usize, n: usize| {
@@ -183,13 +238,16 @@ pub fn run(args: &Args) -> Result<()> {
     };
     let (img, st) = m.generate_interleaved(&inputs, &o, &mut progress)?;
     eprintln!();
+    for (i, s) in st.posterior_std.iter().enumerate() {
+        eprintln!("[input image {}: posterior std / latents (L2) {s:.3e}]", i + 1);
+    }
     if let Some(t) = &st.thinking {
         println!("{t}");
     }
     let out = args.output.clone().unwrap_or_else(|| PathBuf::from("image.png"));
     std::fs::write(&out, oxinfer::png::encode_rgb(img.width, img.height, &img.rgb)).with_context(|| format!("write {}", out.display()))?;
     eprintln!(
-        "[{}x{} | context {} tokens {:.2}s | think {:.2}s | denoise {:.2}s ({} passes of {} latent tokens, {:.2}s each) | decode {:.2}s | wrote {}]",
+        "[{}x{} | context {} tokens {:.2}s | think {:.2}s | denoise {:.2}s ({} passes of {} latent tokens, {:.2}s each{}) | decode {:.2}s | wrote {}]",
         img.width,
         img.height,
         st.context_tokens,
@@ -199,6 +257,11 @@ pub fn run(args: &Args) -> Result<()> {
         st.passes,
         st.latent_tokens,
         st.denoise / st.passes.max(1) as f64,
+        if st.cached_passes > 0 {
+            format!("; {} more from the step cache", st.cached_passes)
+        } else {
+            String::new()
+        },
         st.decode,
         out.display()
     );

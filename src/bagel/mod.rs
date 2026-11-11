@@ -17,6 +17,10 @@
 //! * Text (answers, and the optional "thinking" plan written before an image) comes from the
 //!   understanding expert's LM head, decoded after `<|im_start|>`.
 //!
+//! Options that change the result, off by default: TaylorSeer step caching
+//! ([`crate::step_cache`], the reference's `enable_taylorseer`) and sampling the VAE posterior of
+//! input images ([`crate::vae_posterior`]; the default is its mean).
+//!
 //! Every text segment is wrapped in `<|im_start|>` / `<|im_end|>` and every image in
 //! `<|vision_start|>` / `<|vision_end|>`; there is no chat template beyond that.
 
@@ -30,6 +34,7 @@ use crate::model::Quant;
 use crate::platform::DevicePref;
 use crate::safetensors::ModelFiles;
 use crate::sampler::Sampler;
+use crate::step_cache::{Calc, TaylorSeer, TaylorSeerConfig};
 use crate::tokenizer::Tokenizer;
 use crate::video::RgbImage;
 use anyhow::{Context, Result, anyhow, bail};
@@ -170,6 +175,13 @@ pub struct ImageOptions {
     /// Thinking: most tokens (default 1000), sampling temperature (0, the default: greedy).
     pub max_think_tokens: usize,
     pub temperature: f32,
+    /// TaylorSeer step caching (the reference's `enable_taylorseer`): after the first 5 steps
+    /// the language model runs every 3rd step and the steps between take a Taylor expansion
+    /// (order 6) of its last layer's states. Faster, and a different image: off by default.
+    pub taylorseer: bool,
+    /// Sample the VAE posterior of input images (`mean + std * noise`, as the reference) instead
+    /// of taking its mean. The noise comes from [`crate::vae_posterior::noise`], seeded by `seed`.
+    pub sample_posterior: bool,
 }
 
 impl Default for ImageOptions {
@@ -190,6 +202,8 @@ impl Default for ImageOptions {
             think: false,
             max_think_tokens: 1000,
             temperature: 0.0,
+            taylorseer: false,
+            sample_posterior: false,
         }
     }
 }
@@ -237,6 +251,11 @@ pub struct ImageStats {
     pub decode: f64,
     /// Language-model passes over the latent tokens (all guidance branches).
     pub passes: usize,
+    /// Passes TaylorSeer answered without running the language model.
+    pub cached_passes: usize,
+    /// With `sample_posterior`: per input image, the posterior's standard deviations relative
+    /// to its means (L2 over the latent).
+    pub posterior_std: Vec<f64>,
     /// Latent tokens per pass and the context lengths of the conditional branch.
     pub latent_tokens: usize,
     pub context_tokens: usize,
@@ -618,7 +637,8 @@ impl Bagel {
 
     /// `update_context_image` with `vae=True`: the image's clean latents through the generation
     /// expert (bidirectional, one position).
-    fn add_vae_image(&self, c: &mut Seq, img: &RgbImage) -> Result<()> {
+    fn add_vae_image(&self, c: &mut Seq, img: &RgbImage, posterior: Option<(u64, usize)>) -> Result<Option<f64>> {
+        let mut rel_std = None;
         let (w, h) = (img.width, img.height);
         let f = 8 * self.latent_patch;
         if !w.is_multiple_of(f) || !h.is_multiple_of(f) {
@@ -627,7 +647,21 @@ impl Bagel {
         let ids = self.latent_ids(w, h)?;
         let z = match read_override("vae_latents_in.bin", (h / 8) * (w / 8) * self.latent_channels)? {
             Some(z) => z,
-            None => self.vae()?.encode(&normalize(&img.data), h, w)?.0,
+            None => match posterior {
+                // `posterior`: the seed and this image's index; the reference's noise instead
+                // (dump folder) for checks. The BFL autoencoder does not clamp the log-variance.
+                Some((seed, index)) => {
+                    let n = (h / 8) * (w / 8) * self.latent_channels;
+                    let eps = match read_override(&format!("vae_noise{index}_in.bin"), n)? {
+                        Some(v) => v,
+                        None => crate::vae_posterior::noise(seed, index, n),
+                    };
+                    let s = crate::vae_posterior::encode_sampled(self.vae()?, &normalize(&img.data), h, w, &eps, false)?;
+                    rel_std = Some(s.relative_std);
+                    s.latents
+                }
+                None => self.vae()?.encode(&normalize(&img.data), h, w)?.0,
+            },
         };
         let tok = self.patchify(&z, h / 8, w / 8);
         dump("vae_tokens.bin", &tok);
@@ -643,7 +677,7 @@ impl Bagel {
             },
         )?;
         c.rope += 1;
-        Ok(())
+        Ok(rel_std)
     }
 
     /// The SigLIP embeddings of an image (after the `vit_transform` resize), `[patches, hidden]`.
@@ -909,6 +943,7 @@ impl Bagel {
         }
         let mut shape = (o.width.unwrap_or(1024), o.height.unwrap_or(1024));
         let mut img_texts: Vec<&str> = Vec::new();
+        let mut n_images = 0;
         for i in inputs {
             match i {
                 Input::Text(t) => {
@@ -918,7 +953,9 @@ impl Bagel {
                 }
                 Input::Image(img) => {
                     let img = Self::input_image(img, o.max_image_size, o.min_image_size)?;
-                    self.add_vae_image(&mut gen_c, &img)?;
+                    let rel = self.add_vae_image(&mut gen_c, &img, o.sample_posterior.then_some((o.seed, n_images)))?;
+                    st.posterior_std.extend(rel);
+                    n_images += 1;
                     self.add_vit_image(&mut gen_c, &img)?;
                     shape = (img.width, img.height);
                     text_mark = (gen_c.kv.len, gen_c.rope);
@@ -1033,7 +1070,7 @@ impl Bagel {
         let markers = llm.embed(&[self.special.vision_start, self.special.vision_end]);
         // The velocities of the given branches (indexes into `views`), one batched pass; branches
         // whose view equals an earlier one reuse its result.
-        let mut velocities = |which: &[usize], e: &[f32]| -> Result<Vec<Vec<f32>>> {
+        let velocities = |which: &[usize], e: &[f32], st: &mut ImageStats| -> Result<Vec<Vec<f32>>> {
             let mut uniq: Vec<usize> = Vec::new();
             let map: Vec<usize> = which
                 .iter()
@@ -1061,6 +1098,11 @@ impl Bagel {
             let v = project(&[&gp.llm2vae], llm.cfg.hidden_size, &hg, n * uniq.len()).swap_remove(0);
             Ok(map.iter().map(|&m| v[m * n * pd..(m + 1) * n * pd].to_vec()).collect())
         };
+        // TaylorSeer: one state per guidance branch, as the reference.
+        let mut seers: Option<[TaylorSeer; 3]> = o
+            .taylorseer
+            .then(|| std::array::from_fn(|_| TaylorSeer::new(TaylorSeerConfig::BAGEL)));
+        let mut decisions = String::new();
         for i in 0..steps - 1 {
             if self.cancel.load(Ordering::Relaxed) {
                 bail!("cancelled");
@@ -1068,13 +1110,71 @@ impl Bagel {
             let t = ts[i];
             let on = t > g.interval[0] && t <= g.interval[1];
             let (ts_, is_) = if on { (g.text_scale, g.img_scale) } else { (1.0, 1.0) };
-            let e = self.latent_embed(&x, &ids, t)?;
             let which: &[usize] = match (ts_ > 1.0, is_ > 1.0) {
                 (false, _) => &[0],
                 (true, false) => &[0, 1],
                 (true, true) => &[0, 1, 2],
             };
-            let mut vs = velocities(which, &e)?;
+            let mut vs = match &mut seers {
+                None => {
+                    let e = self.latent_embed(&x, &ids, t)?;
+                    velocities(which, &e, st)?
+                }
+                Some(seers) => {
+                    // The branches that run the language model this step, in one batch (equal
+                    // views once); the others take their Taylor expansion. Each branch's
+                    // feature is its latent tokens' last-layer states, before the final norm.
+                    let calc: Vec<Calc> = which.iter().map(|&w| seers[w].begin()).collect();
+                    let full: Vec<usize> = which
+                        .iter()
+                        .zip(&calc)
+                        .filter(|(_, c)| **c == Calc::Full)
+                        .map(|(&w, _)| w)
+                        .collect();
+                    if !full.is_empty() {
+                        let e = self.latent_embed(&x, &ids, t)?;
+                        let mut uniq: Vec<usize> = Vec::new();
+                        let map: Vec<usize> = full
+                            .iter()
+                            .map(|&w| match uniq.iter().position(|&u| views[u].same(&views[w])) {
+                                Some(p) => p,
+                                None => {
+                                    uniq.push(w);
+                                    uniq.len() - 1
+                                }
+                            })
+                            .collect();
+                        let ctxs = uniq.iter().map(|&u| Ctx::Prefix(views[u].kv, views[u].len)).collect();
+                        let blocks = uniq
+                            .iter()
+                            .map(|&u| Block {
+                                und: markers.clone(),
+                                gen_: e.clone(),
+                                pos: views[u].rope,
+                                text: false,
+                            })
+                            .collect();
+                        let raw = llm.forward_multi_gen_raw(ctxs, blocks)?;
+                        st.passes += uniq.len();
+                        for (&w, &m) in full.iter().zip(&map) {
+                            seers[w].update(raw[m].clone());
+                        }
+                    }
+                    st.cached_passes += which.len() - full.len();
+                    let mut hg = Vec::with_capacity(which.len() * n * llm.cfg.hidden_size);
+                    for (&w, c) in which.iter().zip(&calc) {
+                        match c {
+                            Calc::Full => hg.extend_from_slice(seers[w].feature()),
+                            Calc::Taylor => hg.extend(seers[w].predict()),
+                        }
+                        decisions.push_str(&format!("{i} {w} {}\n", (*c == Calc::Full) as u8));
+                        seers[w].end();
+                    }
+                    let hg = llm.final_norm_gen(&hg);
+                    let v = project(&[&gp.llm2vae], llm.cfg.hidden_size, &hg, n * which.len()).swap_remove(0);
+                    (0..which.len()).map(|m| v[m * n * pd..(m + 1) * n * pd].to_vec()).collect()
+                }
+            };
             let v = if ts_ > 1.0 {
                 let v_i = (vs.len() == 3).then(|| vs.pop().unwrap());
                 let v_t = vs.pop().unwrap();
@@ -1102,6 +1202,9 @@ impl Bagel {
             }
         }
         dump("latents_out.bin", &x);
+        if let (Some(d), true) = (dump_dir(), o.taylorseer) {
+            let _ = std::fs::write(d.join("cache.txt"), &decisions);
+        }
         Ok(x)
     }
 }

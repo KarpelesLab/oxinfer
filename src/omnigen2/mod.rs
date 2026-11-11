@@ -15,11 +15,17 @@
 //!   ref)`, where `ref` sees the images with the negative prompt and `uncond` neither, inside
 //!   `cfg_range` (fractions of the steps); text-only guidance when `image_scale <= 1`.
 //!
+//! Options that change the result, off by default: the official `--scheduler dpmsolver++`
+//! ([`sched`]), the TeaCache and TaylorSeer step caches ([`crate::step_cache`], one state per
+//! guidance branch as in the official pipeline), and sampling the VAE posterior of the input
+//! images ([`crate::vae_posterior`]; the default is its mean).
+//!
 //! With one input image the output takes its (resized) size; otherwise the requested size (1024 x
 //! 1024 by default) scaled into `max_pixels`, the decoded image then resized back to the request.
 //! The understanding side of OmniGen2 is Qwen2.5-VL chat: load the `mllm/` folder with
 //! [`crate::engine::Engine`] (the tokenizer and image processor come from `processor/`).
 
+pub mod sched;
 pub mod transformer;
 pub mod weights;
 
@@ -28,12 +34,14 @@ use crate::model::Quant;
 use crate::qwen_vl::{QwenVl, QwenVlOptions};
 use crate::safetensors::ModelFiles;
 pub use crate::sd::Image;
+use crate::step_cache::{Calc, OMNIGEN2_TEACACHE_POLY, StepCache, TaylorSeer, TaylorSeerConfig, TeaCache};
 use crate::video::RgbImage;
 use anyhow::{Context, Result, bail};
+pub use sched::Scheduler;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use transformer::{Grid, Transformer, TransformerConfig};
+use transformer::{Grid, StepCond, Transformer, TransformerConfig};
 
 /// The official default negative prompt (`inference.py`, `app.py`).
 pub const DEFAULT_NEGATIVE: &str = "(((deformed))), blurry, over saturation, bad anatomy, disfigured, poorly drawn face, mutation, mutated, (extra_limb), (ugly), (poorly drawn hands), fused fingers, messy drawing, broken legs censor, censored, censor_bar";
@@ -131,6 +139,15 @@ pub struct Params {
     pub max_pixels: usize,
     /// Longest side of each input image.
     pub max_side: usize,
+    /// The sampler (default Euler; `DpmSolver` is the official `--scheduler dpmsolver++`).
+    pub scheduler: Scheduler,
+    /// A step cache (default none: every step runs the transformer). TeaCache and TaylorSeer
+    /// skip the joint blocks on some steps and so change the image.
+    pub cache: StepCache,
+    /// Sample the VAE posterior of the input images (`mean + std * noise`, as the official
+    /// pipeline) instead of taking its mean. The noise comes from
+    /// [`crate::vae_posterior::noise`], seeded by `seed`.
+    pub sample_posterior: bool,
 }
 
 impl Params {
@@ -147,7 +164,24 @@ impl Params {
             height: None,
             max_pixels: 1024 * 1024,
             max_side: 1024,
+            scheduler: Scheduler::Euler,
+            cache: StepCache::None,
+            sample_posterior: false,
         }
+    }
+
+    /// The official TeaCache (`--enable_teacache`) with this relative-L1 threshold (the
+    /// official default: 0.05).
+    pub fn with_teacache(mut self, rel_l1_thresh: f32) -> Self {
+        self.cache = StepCache::TeaCache { rel_l1_thresh };
+        self
+    }
+
+    /// The official TaylorSeer (`--enable_taylorseer`: order 4, the blocks every 3rd step after
+    /// the first 5).
+    pub fn with_taylorseer(mut self) -> Self {
+        self.cache = StepCache::TaylorSeer(TaylorSeerConfig::OMNIGEN2);
+        self
     }
 }
 
@@ -166,6 +200,14 @@ pub struct Request {
     pub height: Option<usize>,
     pub max_pixels: Option<usize>,
     pub max_side: Option<usize>,
+    /// `"euler"` (default) or `"dpmsolver++"`.
+    pub scheduler: Option<Scheduler>,
+    /// TeaCache with this relative-L1 threshold (e.g. 0.05).
+    pub teacache: Option<f32>,
+    /// TaylorSeer (it takes precedence over `teacache`, as in the official script).
+    pub taylorseer: Option<bool>,
+    /// Sample the VAE posterior of the input images instead of taking its mean.
+    pub sample_posterior: Option<bool>,
     /// Input image files (decoded with the `media` feature).
     pub images: Vec<String>,
 }
@@ -185,6 +227,14 @@ impl Request {
         p.height = self.height;
         p.max_pixels = self.max_pixels.unwrap_or(p.max_pixels);
         p.max_side = self.max_side.unwrap_or(p.max_side);
+        p.scheduler = self.scheduler.unwrap_or(p.scheduler);
+        if let Some(t) = self.teacache {
+            p = p.with_teacache(t);
+        }
+        if self.taylorseer == Some(true) {
+            p = p.with_taylorseer();
+        }
+        p.sample_posterior = self.sample_posterior.unwrap_or(false);
         p
     }
 }
@@ -200,6 +250,11 @@ pub struct Timings {
     pub decode: f64,
     /// Joint-block passes (one per guidance branch per step).
     pub transformer_calls: usize,
+    /// Passes a step cache answered without running the joint blocks.
+    pub cached_passes: usize,
+    /// With `sample_posterior`: per input image, the posterior's standard deviations relative
+    /// to its means (L2 over the latent).
+    pub posterior_std: Vec<f64>,
 }
 
 struct LoadedTransformer {
@@ -302,6 +357,88 @@ fn dumped(name: &str) -> Result<Option<Vec<f32>>> {
 struct RefLatent {
     tokens: Vec<f32>,
     grid: Grid,
+}
+
+/// The step-cache state of one guidance branch.
+enum BranchCache {
+    None,
+    Tea(TeaCache),
+    Taylor(TaylorSeer),
+}
+
+impl BranchCache {
+    fn new(c: &StepCache) -> Self {
+        match *c {
+            StepCache::None => Self::None,
+            StepCache::TeaCache { rel_l1_thresh } => Self::Tea(TeaCache::new(rel_l1_thresh, &OMNIGEN2_TEACACHE_POLY)),
+            StepCache::TaylorSeer(cfg) => Self::Taylor(TaylorSeer::new(cfg)),
+        }
+    }
+}
+
+/// The image streams of one step, embedded when a pass first needs them (a step whose passes
+/// are all TaylorSeer predictions needs none).
+struct StepStreams<'a> {
+    tr: &'a Transformer<'static>,
+    x: &'a [f32],
+    tg: Grid,
+    refs: &'a [RefLatent],
+    sc: &'a StepCond,
+    noise: Option<Vec<f32>>,
+    ref_embs: Option<Vec<Vec<f32>>>,
+}
+
+impl StepStreams<'_> {
+    fn ensure(&mut self, with_refs: bool) -> Result<()> {
+        if self.noise.is_none() {
+            self.noise = Some(self.tr.embed_noise(self.x, self.tg, self.sc)?);
+        }
+        if with_refs && self.ref_embs.is_none() {
+            let e = self
+                .refs
+                .iter()
+                .enumerate()
+                .map(|(j, r)| self.tr.embed_ref(&r.tokens, r.grid, j, self.sc))
+                .collect::<Result<_>>()?;
+            self.ref_embs = Some(e);
+        }
+        Ok(())
+    }
+
+    /// One guidance branch's velocity: `text` with or without the input images, through
+    /// `cache`. Returns whether the joint blocks ran.
+    fn pass(&mut self, cache: &mut BranchCache, text: &[f32], with_refs: bool, first_or_last: bool) -> Result<(Vec<f32>, bool)> {
+        let (tr, tg, sc) = (self.tr, self.tg, self.sc);
+        if let BranchCache::Taylor(ts) = cache {
+            let calc = ts.begin();
+            let v = match calc {
+                Calc::Full => {
+                    self.ensure(with_refs)?;
+                    let h = tr.joint_hidden(text, &self.ref_list(with_refs), self.noise.as_ref().unwrap(), tg, sc)?;
+                    let v = tr.output(&h, tg.tokens(), sc);
+                    ts.update(h);
+                    v
+                }
+                Calc::Taylor => tr.output(&ts.predict(), tg.tokens(), sc),
+            };
+            ts.end();
+            return Ok((v, calc == Calc::Full));
+        }
+        self.ensure(with_refs)?;
+        let refs = self.ref_list(with_refs);
+        let noise = self.noise.as_ref().unwrap();
+        match cache {
+            BranchCache::Tea(tc) => tr.joint_teacache(text, &refs, noise, tg, sc, tc, first_or_last),
+            _ => Ok((tr.joint(text, &refs, noise, tg, sc)?, true)),
+        }
+    }
+
+    fn ref_list(&self, with_refs: bool) -> Vec<(&[f32], Grid)> {
+        match (&self.ref_embs, with_refs) {
+            (Some(e), true) => e.iter().zip(self.refs).map(|(e, r)| (&e[..], r.grid)).collect(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 impl Pipeline {
@@ -554,7 +691,20 @@ impl Pipeline {
         let c = self.tcfg.in_channels;
         let mut refs = Vec::new();
         for (i, (rgb, w, h)) in vae_rgb.iter().enumerate() {
-            let (lat, lh, lw) = self.vae.encode(&crate::flux::vae::rgb8_to_unit(rgb), *h, *w)?;
+            let unit = crate::flux::vae::rgb8_to_unit(rgb);
+            let (lat, lh, lw) = if p.sample_posterior {
+                // Validation: the reference's posterior noise instead of ours (dump folder).
+                let n = c * (h / 8) * (w / 8);
+                let eps = match dumped(&format!("ref_noise{i}_in.bin"))? {
+                    Some(v) => v,
+                    None => crate::vae_posterior::noise(p.seed, i, n),
+                };
+                let s = crate::vae_posterior::encode_sampled(&self.vae, &unit, *h, *w, &eps, true)?;
+                tm.posterior_std.push(s.relative_std);
+                (s.latents, s.lh, s.lw)
+            } else {
+                self.vae.encode(&unit, *h, *w)?
+            };
             let tokens = match dumped(&format!("ref_latents{i}_in.bin"))? {
                 Some(v) => transformer::patchify(&crate::flux::vae::chw_to_hwc(&v, c, lh, lw), lh, lw, c),
                 None => transformer::patchify(&lat, lh, lw, c),
@@ -594,32 +744,50 @@ impl Pipeline {
         let ts = timesteps(p.steps, lh * lw);
         let image_cfg = !refs.is_empty() && p.image_guidance > 1.0;
         let steps = p.steps;
+        let mut dpm = (p.scheduler == Scheduler::DpmSolver).then(|| sched::DpmSolver::new(&ts[..steps]));
+        // One cache state per guidance branch, as the official pipeline: conditional, reference
+        // (images + negative prompt), unconditional.
+        let mut caches = [BranchCache::new(&p.cache), BranchCache::new(&p.cache), BranchCache::new(&p.cache)];
+        // Per pass "step branch ran", in the official pipeline's order of passes (dump folder).
+        let mut decisions = String::new();
         for i in 0..steps {
             self.check_cancel()?;
             let (t, t_next) = (ts[i], ts[i + 1]);
             let sc = tr.step_cond(t);
-            let noise_emb = tr.embed_noise(&x, tg, &sc)?;
-            let ref_embs: Vec<Vec<f32>> = refs
-                .iter()
-                .enumerate()
-                .map(|(j, r)| tr.embed_ref(&r.tokens, r.grid, j, &sc))
-                .collect::<Result<_>>()?;
-            let ref_list: Vec<(&[f32], Grid)> = ref_embs.iter().zip(&refs).map(|(e, r)| (&e[..], r.grid)).collect();
+            let mut streams = StepStreams {
+                tr,
+                x: &x,
+                tg,
+                refs: &refs,
+                sc: &sc,
+                noise: None,
+                ref_embs: None,
+            };
+            let edge = i == 0 || i + 1 == steps;
             let frac = i as f32 / steps as f32;
             let in_range = p.cfg_range.0 <= frac && frac <= p.cfg_range.1;
             let tgs = if in_range { p.text_guidance } else { 1.0 };
             let igs = if in_range && image_cfg { p.image_guidance } else { 1.0 };
-            let mut v = tr.joint(&txt_pos, &ref_list, &noise_emb, tg, &sc)?;
+            let mut count = |ran: bool| {
+                if ran {
+                    tm.transformer_calls += 1;
+                } else {
+                    tm.cached_passes += 1;
+                }
+                ran as u8
+            };
+            let [c_cond, c_ref, c_uncond] = &mut caches;
+            let (mut v, ran) = streams.pass(c_cond, &txt_pos, true, edge)?;
+            let mut ran_all = vec![count(ran)];
             if i == 0 {
                 dump("v0_cond.bin", &v);
             }
-            tm.transformer_calls += 1;
             if let (true, Some(tn)) = (tgs > 1.0, &txt_neg) {
-                let un = tr.joint(tn, &[], &noise_emb, tg, &sc)?;
-                tm.transformer_calls += 1;
+                let (un, ran) = streams.pass(c_uncond, tn, false, edge)?;
+                let ran_uncond = count(ran);
                 if igs > 1.0 {
-                    let rf = tr.joint(tn, &ref_list, &noise_emb, tg, &sc)?;
-                    tm.transformer_calls += 1;
+                    let (rf, ran) = streams.pass(c_ref, tn, true, edge)?;
+                    ran_all.push(count(ran));
                     for ((a, &u), &r) in v.iter_mut().zip(&un).zip(&rf) {
                         *a = u + igs * (r - u) + tgs * (*a - r);
                     }
@@ -628,15 +796,28 @@ impl Pipeline {
                         *a = u + tgs * (*a - u);
                     }
                 }
+                ran_all.push(ran_uncond);
+            }
+            for (b, r) in ran_all.iter().enumerate() {
+                decisions.push_str(&format!("{i} {b} {r}\n"));
             }
             if i == 0 {
                 dump("v0.bin", &v);
             }
-            let dt = t_next - t;
-            for (a, &b) in x.iter_mut().zip(&v) {
-                *a += dt * b;
+            drop(streams);
+            match &mut dpm {
+                Some(d) => d.step(i, &v, &mut x),
+                None => {
+                    let dt = t_next - t;
+                    for (a, &b) in x.iter_mut().zip(&v) {
+                        *a += dt * b;
+                    }
+                }
             }
             progress(i + 1, steps);
+        }
+        if let Some(d) = dump_dir() {
+            let _ = std::fs::write(d.join("cache.txt"), &decisions);
         }
         tm.denoise = t2.elapsed().as_secs_f64();
 
