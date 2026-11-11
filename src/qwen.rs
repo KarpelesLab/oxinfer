@@ -109,6 +109,9 @@ pub(crate) enum Ffn<'a> {
 
 pub(crate) use crate::moe::NeedExperts;
 
+#[path = "qwen_batch.rs"]
+pub(crate) mod batch;
+
 impl<'a> Ffn<'a> {
     /// Every weight of the block (all experts of a MoE).
     pub(crate) fn lins(&self) -> Vec<&Lin<'a>> {
@@ -2019,6 +2022,28 @@ impl<'a> QwenModel<'a> {
         sel: Option<&[Option<Vec<u32>>]>,
         y: &mut [f32],
     ) {
+        self.attn_forward_caches(at, &mut [cache], hn, t, start, cos, sin, sel, y)
+    }
+
+    /// [`Self::attn_forward_sel`] over `caches`: one cache takes the `t` tokens as one sequence
+    /// from `start`; `t` caches (2 or more) take token `i` as the next token of the independent
+    /// sequence `caches[i]` (`cos` / `sin` row `i` at that sequence's position; `start` and `sel`
+    /// are unused), each attending to its own cache as a one-token pass does.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attn_forward_caches(
+        &self,
+        at: &Attn,
+        caches: &mut [&mut LayerCache],
+        hn: &[f32],
+        t: usize,
+        start: usize,
+        cos: &[f32],
+        sin: &[f32],
+        sel: Option<&[Option<Vec<u32>>]>,
+        y: &mut [f32],
+    ) {
+        let each = caches.len() > 1;
+        debug_assert!(if each { caches.len() == t } else { caches.len() == 1 });
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let (nh, nkv, hd) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
@@ -2113,15 +2138,28 @@ impl<'a> QwenModel<'a> {
                 &sin[ti * half..(ti + 1) * half],
             );
         });
-        cache.push(&kn, &v, t);
-        // MiniMax M3: the keys each (token, KV head) attends, past the dense range.
-        let ix_sel = at
-            .indexer
-            .as_ref()
-            .and_then(|ix| ix.select(cache, hn, t, h, start, cos, sin, half, eps));
+        if each {
+            let w = nkv * hd;
+            for (i, c) in caches.iter_mut().enumerate() {
+                c.push(&kn[i * w..(i + 1) * w], &v[i * w..(i + 1) * w], 1);
+            }
+        } else {
+            caches[0].push(&kn, &v, t);
+        }
+        // MiniMax M3: the keys each (token, KV head) attends, past the dense range (one sequence
+        // only: batched decode steps of independent sequences are declined for such models).
+        let ix_sel = if each {
+            None
+        } else {
+            at.indexer
+                .as_ref()
+                .and_then(|ix| ix.select(caches[0], hn, t, h, start, cos, sin, half, eps))
+        };
+        let cache: &LayerCache = &*caches[0];
         let mut att = vec![0f32; t * nh * hd];
         // Qwen4-Exp prefill: on the GPU (dense, or over each token's QSA selection).
-        let on_gpu = prefill_gpu_exp(cfg, t, "attn")
+        let on_gpu = !each
+            && prefill_gpu_exp(cfg, t, "attn")
             && crate::gpu::active().is_some_and(|be| {
                 let (kc, vc) = cache.data();
                 be.attention_cached(&mut crate::gpu::AttnJob {
@@ -2139,6 +2177,12 @@ impl<'a> QwenModel<'a> {
             });
         match sel {
             _ if on_gpu => {}
+            _ if each => {
+                let w = nh * hd;
+                for (i, c) in caches.iter().enumerate() {
+                    attention(&q[i * w..(i + 1) * w], c, nh, 1, c.len - 1, None, &mut att[i * w..(i + 1) * w]);
+                }
+            }
             _ if let Some(lists) = &ix_sel => {
                 let lists: Vec<&[u32]> = lists.iter().map(|l| &l[..]).collect();
                 crate::qwen4exp::attention_lists(&q, cache, nh, t, &lists, &mut att)
