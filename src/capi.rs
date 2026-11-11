@@ -713,10 +713,12 @@ pub type OxiImageFn =
 /// Receives image-generation progress (`step` of `steps` image tokens); return non-zero to cancel.
 pub type OxiStepFn = Option<unsafe extern "C" fn(user: *mut c_void, step: c_int, steps: c_int) -> c_int>;
 
-/// A Janus-Pro model handle.
+/// A Janus-Pro or JanusFlow model handle.
 pub struct OxiJanus {
     cancel: crate::janus::CancelHandle,
     model: Mutex<crate::janus::Janus>,
+    /// The conversation of `oxi_janus_chat`.
+    chat: Mutex<crate::janus::Conversation>,
 }
 
 unsafe fn janus<'a>(j: *const OxiJanus) -> Result<&'a OxiJanus> {
@@ -727,8 +729,8 @@ fn lock_janus(j: &OxiJanus) -> std::sync::MutexGuard<'_, crate::janus::Janus> {
     j.model.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Loads a Janus-Pro model (directory or repo id; `key=value` options: quant, mmap, device,
-/// cache_dir, generation, understanding).
+/// Loads a Janus-Pro or JanusFlow model (directory or repo id; `key=value` options: quant, mmap,
+/// device, cache_dir, generation, understanding, vae).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxi_janus_load(
     model: *const c_char,
@@ -751,6 +753,7 @@ pub unsafe extern "C" fn oxi_janus_load(
         Ok(Box::into_raw(Box::new(OxiJanus {
             cancel: j.cancel_handle(),
             model: Mutex::new(j),
+            chat: Mutex::new(Default::default()),
         })))
     })
 }
@@ -774,7 +777,7 @@ pub unsafe extern "C" fn oxi_janus_cancel(j: *const OxiJanus) {
     }
 }
 
-/// Text to image: generates `parallel_size` 384x384 images for `prompt` (`options_json`: see
+/// Text to image (Janus-Pro and JanusFlow): generates `parallel_size` 384x384 images for `prompt` (`options_json`: see
 /// `oxinfer.h`), each passed to `on_image`. Returns the number of images, or -1 (error or
 /// cancelled).
 #[unsafe(no_mangle)]
@@ -827,6 +830,19 @@ fn janus_answer(
     user: *mut c_void,
     images: impl FnOnce() -> Result<Vec<crate::video::RgbImage>>,
 ) -> *mut c_char {
+    janus_turn(j, question, options_json, cb, user, false, images)
+}
+
+/// One question: of the handle's conversation (`chat`), or on its own.
+fn janus_turn(
+    j: *mut OxiJanus,
+    question: *const c_char,
+    options_json: *const c_char,
+    cb: OxiTokenFn,
+    user: *mut c_void,
+    chat: bool,
+    images: impl FnOnce() -> Result<Vec<crate::video::RgbImage>>,
+) -> *mut c_char {
     guard(std::ptr::null_mut(), || {
         let j = unsafe { janus(j) }?;
         let question = unsafe { str_arg(question, "question") }?;
@@ -842,7 +858,58 @@ fn janus_answer(
                 _ => Flow::Continue,
             }
         };
-        Ok(out_string(g.understand(question, &images, &opts, &mut on_text)?))
+        if !chat {
+            return Ok(out_string(g.understand(question, &images, &opts, &mut on_text)?));
+        }
+        let mut conv = j.chat.lock().unwrap_or_else(|p| p.into_inner());
+        let r = g.ask(&mut conv, question, &images, &opts, &mut on_text);
+        if r.is_err() {
+            // A failed turn leaves the state out of step: start over.
+            *conv = Default::default();
+        }
+        Ok(out_string(r?))
+    })
+}
+
+fn janus_image_paths(images_json: *const c_char) -> Result<Vec<crate::video::RgbImage>> {
+    let paths: Vec<String> = match unsafe { opt_str_arg(images_json, "images_json") }?.map(str::trim) {
+        Some(s) if !s.is_empty() => serde_json::from_str(s).context("images_json: expected an array of paths")?,
+        _ => Vec::new(),
+    };
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    #[cfg(feature = "media")]
+    {
+        let m = crate::media::Media::new();
+        paths.iter().map(|p| m.load_image(std::path::Path::new(p))).collect()
+    }
+    #[cfg(not(feature = "media"))]
+    bail!("decoding image files needs the `media` feature; use oxi_janus_understand_rgb")
+}
+
+/// The next turn of the handle's conversation: as [`oxi_janus_understand`], but the model knows
+/// the earlier questions, their images and its answers. `images_json` holds the images this
+/// question adds (NULL for none). An error ends the conversation.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_janus_chat(
+    j: *mut OxiJanus,
+    question: *const c_char,
+    images_json: *const c_char,
+    options_json: *const c_char,
+    cb: OxiTokenFn,
+    user: *mut c_void,
+) -> *mut c_char {
+    janus_turn(j, question, options_json, cb, user, true, || janus_image_paths(images_json))
+}
+
+/// Forgets the conversation of [`oxi_janus_chat`]: the next call starts a new one.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_janus_chat_reset(j: *mut OxiJanus) {
+    guard((), || {
+        let j = unsafe { janus(j) }?;
+        *j.chat.lock().unwrap_or_else(|p| p.into_inner()) = Default::default();
+        Ok(())
     })
 }
 
@@ -857,22 +924,7 @@ pub unsafe extern "C" fn oxi_janus_understand(
     cb: OxiTokenFn,
     user: *mut c_void,
 ) -> *mut c_char {
-    janus_answer(j, question, options_json, cb, user, || {
-        let paths: Vec<String> = match unsafe { opt_str_arg(images_json, "images_json") }?.map(str::trim) {
-            Some(s) if !s.is_empty() => serde_json::from_str(s).context("images_json: expected an array of paths")?,
-            _ => Vec::new(),
-        };
-        if paths.is_empty() {
-            return Ok(Vec::new());
-        }
-        #[cfg(feature = "media")]
-        {
-            let m = crate::media::Media::new();
-            paths.iter().map(|p| m.load_image(std::path::Path::new(p))).collect()
-        }
-        #[cfg(not(feature = "media"))]
-        bail!("decoding image files needs the `media` feature; use oxi_janus_understand_rgb")
-    })
+    janus_answer(j, question, options_json, cb, user, || janus_image_paths(images_json))
 }
 
 /// [`oxi_janus_understand`] with one image given as tightly packed RGB8 pixels.

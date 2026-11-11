@@ -399,15 +399,19 @@ fn generate_images(m: &mut ImageModel, job: &ImageJob, seed: u64) -> anyhow::Res
     let mut out = Vec::new();
     if let ImageModel::Janus(j) = m {
         if first.is_some() {
-            bail!("Janus-Pro generates images from text only (no edits)");
+            bail!("Janus models generate images from text only (no edits)");
         }
         let mut o = crate::janus::ImageOptions {
             seed,
             parallel_size: job.n,
             ..Default::default()
         };
-        if let Some(g) = job.guidance {
-            o.cfg_weight = g;
+        o.cfg_weight = job.guidance;
+        if let Some(n) = job.steps {
+            o.steps = n;
+        }
+        if let (Some(w), Some(h)) = (w, h) {
+            (o.width, o.height) = (w, h);
         }
         let (imgs, _) = j.generate_images(&job.prompt, &o, &mut |_| Flow::Continue)?;
         return Ok(imgs.into_iter().map(|i| (i.width, i.height, i.rgb)).collect());

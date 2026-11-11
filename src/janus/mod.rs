@@ -1,19 +1,24 @@
-//! DeepSeek Janus-Pro (`deepseek-ai/Janus-Pro-1B`, `-7B`): one autoregressive model that both
-//! writes images and reads them.
+//! DeepSeek's Janus family (`deepseek-ai/Janus-Pro-1B`, `-7B`, `deepseek-ai/JanusFlow-1.3B`): one
+//! language model that both writes images and reads them. The variant is read from the config
+//! ([`Variant`]).
 //!
-//! * **Text to image** ([`Janus::generate_image`]): the prompt in the SFT format plus
+//! * **Text to image, Janus-Pro** ([`Janus::generate_image`]): the prompt in the SFT format plus
 //!   `<begin_of_image>`, then 576 image tokens (a 24x24 grid) sampled from `gen_head` with
 //!   classifier-free guidance. The conditional and unconditional sequences (the latter with the
 //!   prompt replaced by padding) run as one batch, so each step reads the weights once; every
 //!   sampled token is fed back through `gen_embed` + `gen_aligner`. The VQ decoder ([`vq`])
 //!   turns the grid into a 384x384 RGB image.
+//! * **Text to image, JanusFlow**: rectified flow in the SDXL VAE's latent space with the
+//!   language model predicting the velocity ([`flow`]), then the VAE decoder.
 //! * **Image understanding** ([`Janus::understand`]): a SigLIP-L/16 encoder and aligner
 //!   ([`siglip`]) turn each image into 576 embeddings placed at `<image_placeholder>`, and the
-//!   language model answers with its text head.
+//!   language model answers with its text head. [`Janus::ask`] continues a [`Conversation`]
+//!   over several turns.
 //!
 //! The language model is a LLaMA decoder ([`llm`]); weights load from `pytorch_model.bin`
 //! (sharded or not) or safetensors.
 
+pub mod flow;
 pub mod llm;
 pub mod siglip;
 pub mod vq;
@@ -28,7 +33,7 @@ use crate::tokenizer::Tokenizer;
 use crate::video::RgbImage;
 use anyhow::{Context, Result, anyhow, bail};
 use llm::{LlamaConfig, Llm};
-use siglip::{Dense, VisionEncoder, gelu_inplace};
+use siglip::{Aligner, Dense, Mlp, VisionEncoder, gelu_inplace};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,13 +49,36 @@ pub const SYSTEM_PROMPT: &str = "You are a helpful language and vision assistant
 /// the images are placed before the question).
 pub const IMAGE_TAG: &str = "<image_placeholder>";
 
+/// The text of the end-of-sentence token, which closes an assistant turn in the SFT template.
+const EOS_TEXT: &str = "<｜end▁of▁sentence｜>";
+
+/// The model families.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Variant {
+    /// Janus-Pro: images as 576 VQ tokens sampled one by one.
+    Pro,
+    /// JanusFlow: images by rectified flow in the SDXL VAE's latent space.
+    Flow,
+}
+
+impl Variant {
+    pub fn name(self) -> &'static str {
+        match self {
+            Variant::Pro => "Janus-Pro",
+            Variant::Flow => "JanusFlow",
+        }
+    }
+}
+
 /// True when `dir` holds a Janus checkpoint (`model_type` `multi_modality` with a VQ
-/// generation tower).
+/// generation tower, or JanusFlow's generation encoder).
 pub fn is_janus(dir: &Path) -> bool {
     crate::fsx::read(&dir.join("config.json"))
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .is_some_and(|v| v["model_type"] == "multi_modality" && v.get("gen_vision_config").is_some())
+        .is_some_and(|v| {
+            v["model_type"] == "multi_modality" && (v.get("gen_vision_config").is_some() || v.get("vision_gen_enc_config").is_some())
+        })
 }
 
 /// Loading options.
@@ -64,10 +92,15 @@ pub struct JanusOptions {
     pub device: DevicePref,
     /// Where repo ids are downloaded (default [`crate::hf::cache_root`]).
     pub cache_dir: Option<PathBuf>,
-    /// Load the image generation parts (`gen_head`, `gen_embed`, `gen_aligner`, VQ decoder).
+    /// Load the image generation parts (Janus-Pro: `gen_head`, `gen_embed`, `gen_aligner`, VQ
+    /// decoder; JanusFlow: the generation encoder and decoder, and the VAE).
     pub generation: bool,
     /// Load the understanding encoder (SigLIP + aligner).
     pub understanding: bool,
+    /// JanusFlow: the VAE that decodes the latents, a diffusers `AutoencoderKL` folder (or a
+    /// pipeline folder with a `vae/` in it) or repo id. None: the checkpoint's own `vae/` folder
+    /// if it has one, else [`flow::DEFAULT_VAE`] (the SDXL VAE, as in the reference).
+    pub vae: Option<String>,
 }
 
 impl Default for JanusOptions {
@@ -79,13 +112,15 @@ impl Default for JanusOptions {
             cache_dir: None,
             generation: true,
             understanding: true,
+            vae: None,
         }
     }
 }
 
 impl JanusOptions {
     /// Sets an option by name (the C API's `key=value` options): `quant` (bf16, q8, q4), `mmap`,
-    /// `device` (auto, cpu, metal, cuda, vulkan), `cache_dir`, `generation`, `understanding`.
+    /// `device` (auto, cpu, metal, cuda, vulkan), `cache_dir`, `generation`, `understanding`,
+    /// `vae`.
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         let flag = || match value.to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => Ok(true),
@@ -102,45 +137,58 @@ impl JanusOptions {
             "cache_dir" => self.cache_dir = (!value.is_empty()).then(|| PathBuf::from(value)),
             "generation" => self.generation = flag()?,
             "understanding" => self.understanding = flag()?,
-            _ => bail!("unknown option {key:?} (quant, mmap, device, cache_dir, generation, understanding)"),
+            "vae" => self.vae = (!value.is_empty()).then(|| value.to_string()),
+            _ => bail!("unknown option {key:?} (quant, mmap, device, cache_dir, generation, understanding, vae)"),
         }
         Ok(())
     }
 }
 
-/// Text-to-image options. The defaults are the reference's (`generation_inference.py`) except
-/// `parallel_size` (16 there). Deserializes from JSON with every key optional.
+/// Text-to-image options. The defaults are the reference's (`generation_inference.py`,
+/// `demo/app_janusflow.py`) except `parallel_size` (16 and 5 there). Deserializes from JSON with
+/// every key optional.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ImageOptions {
-    /// Classifier-free guidance weight (default 5): `uncond + w * (cond - uncond)`.
-    pub cfg_weight: f32,
-    /// Sampling temperature (default 1); 0 picks the most likely token (greedy).
+    /// Classifier-free guidance weight, `uncond + w * (cond - uncond)`. None (the default): the
+    /// model's, 5 for Janus-Pro and 2 for JanusFlow.
+    pub cfg_weight: Option<f32>,
+    /// Janus-Pro: sampling temperature (default 1); 0 picks the most likely token (greedy).
     pub temperature: f32,
-    /// Keep only the `top_k` most likely tokens (0, the default: all).
+    /// Janus-Pro: keep only the `top_k` most likely tokens (0, the default: all).
     pub top_k: usize,
-    /// Nucleus sampling threshold (1, the default: off).
+    /// Janus-Pro: nucleus sampling threshold (1, the default: off).
     pub top_p: f32,
-    /// Random seed.
+    /// Random seed (Janus-Pro: of the token sampling; JanusFlow: of the starting noise).
     pub seed: u64,
     /// Images generated together from the prompt (one batch; default 1).
     pub parallel_size: usize,
+    /// JanusFlow: Euler steps of the flow (default 30).
+    pub steps: usize,
+    /// Output size in pixels; 0 and 0 (the default) for the model's own 384x384. Both models
+    /// generate 384x384 only (see [`Janus::native_size`]); another size is that image
+    /// resampled with a Lanczos filter, as the reference's demos do for display.
+    pub width: usize,
+    pub height: usize,
 }
 
 impl Default for ImageOptions {
     fn default() -> Self {
         Self {
-            cfg_weight: 5.0,
+            cfg_weight: None,
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
             seed: 42,
             parallel_size: 1,
+            steps: flow::DEFAULT_STEPS,
+            width: 0,
+            height: 0,
         }
     }
 }
 
-/// Options for [`Janus::understand`]. Greedy by default, like the reference's `inference.py`.
+/// Options for [`Janus::understand`] and [`Janus::ask`]. Greedy by default, like the reference's `inference.py`.
 /// Deserializes from JSON with every key optional.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -151,7 +199,8 @@ pub struct ChatOptions {
     pub top_k: usize,
     pub top_p: f32,
     pub seed: u64,
-    /// The system prompt; None for [`SYSTEM_PROMPT`], an empty string for none.
+    /// The system prompt; None for [`SYSTEM_PROMPT`], an empty string for none. It opens the
+    /// conversation: later turns of a [`Conversation`] ignore it.
     pub system_prompt: Option<String>,
 }
 
@@ -171,9 +220,10 @@ impl Default for ChatOptions {
 /// Where image generation is, for the progress callback.
 #[derive(Clone, Copy, Debug)]
 pub struct Progress {
-    /// Image tokens sampled so far (of every image of the batch).
+    /// Janus-Pro: image tokens sampled so far (of every image of the batch); JanusFlow: Euler
+    /// steps done.
     pub step: usize,
-    /// Image tokens per image (576).
+    /// Janus-Pro: image tokens per image (576); JanusFlow: Euler steps.
     pub steps: usize,
 }
 
@@ -183,9 +233,9 @@ pub struct ImageStats {
     pub prompt_tokens: usize,
     /// The prompt through the language model (both CFG sequences).
     pub prefill: f64,
-    /// The image-token loop.
+    /// The image-token loop (JanusFlow: the flow's steps).
     pub tokens: f64,
-    /// VQ decoding of every image.
+    /// VQ (JanusFlow: VAE) decoding of every image.
     pub decode: f64,
     pub steps: usize,
 }
@@ -249,19 +299,57 @@ struct Special {
     eos: u32,
 }
 
+/// The SFT template's role names and what ends a text-to-image prompt.
+struct Format {
+    user: &'static str,
+    assistant: &'static str,
+    gen_tag: String,
+}
+
+/// A conversation with [`Janus::ask`]: the language model's state after the turns so far.
+#[derive(Default)]
+pub struct Conversation {
+    st: Option<llm::BatchState>,
+    ids: Vec<u32>,
+    /// The last answer: where its tokens start in `ids`, and its text. The next question reads
+    /// it again as text, as the reference's template does.
+    answer: Option<(usize, String)>,
+}
+
+impl Conversation {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The token ids the model has read and written so far (images as their placeholders).
+    pub fn ids(&self) -> &[u32] {
+        &self.ids
+    }
+
+    /// True before the first question.
+    pub fn is_empty(&self) -> bool {
+        self.st.is_none()
+    }
+}
+
 /// The models, borrowing the checkpoint owned by [`Janus`].
 struct Parts<'a> {
     llm: Llm<'a>,
     gen_parts: Option<GenParts<'a>>,
+    flow: Option<flow::FlowParts<'a>>,
     vision: Option<VisionEncoder<'a>>,
+    /// JanusFlow: the embedding at `<image_beg>` in front of an image's embeddings.
+    beg_of_und: Option<Vec<f32>>,
 }
 
-/// A loaded Janus-Pro model.
+/// A loaded Janus-Pro or JanusFlow model.
 pub struct Janus {
     // Declared before `files`, which it borrows: dropped first.
     parts: Parts<'static>,
     tok: Tokenizer,
     special: Special,
+    format: Format,
+    pub variant: Variant,
     cancel: Arc<AtomicBool>,
     pub path: PathBuf,
     pub load_secs: f64,
@@ -289,8 +377,9 @@ fn weight_file(dir: &Path, name: &str) -> Result<PathBuf> {
 }
 
 impl Janus {
-    /// Loads a Janus-Pro checkpoint: a local directory or a Hugging Face repo id
-    /// (`deepseek-ai/Janus-Pro-1B`), fetched into the cache on first use.
+    /// Loads a Janus-Pro or JanusFlow checkpoint: a local directory or a Hugging Face repo id
+    /// (`deepseek-ai/Janus-Pro-1B`, `deepseek-ai/JanusFlow-1.3B`), fetched into the cache on
+    /// first use. JanusFlow also loads its VAE ([`JanusOptions::vae`]) for generation.
     pub fn load(path_or_repo: &str, opts: &JanusOptions) -> Result<Janus> {
         let t0 = Instant::now();
         let dir = crate::engine::resolve_model(path_or_repo, opts.cache_dir.as_deref())?;
@@ -306,16 +395,54 @@ impl Janus {
         // it) before `_files`.
         let fs: &'static ModelFiles = unsafe { &*(files.as_ref() as *const ModelFiles) };
         let tok = crate::engine::load_tokenizer(&dir)?;
+        let variant = if cfg.get("vision_gen_enc_config").is_some() {
+            Variant::Flow
+        } else {
+            Variant::Pro
+        };
+        let is_flow = variant == Variant::Flow;
+        // The processor's tags and template (`VLChatProcessor`), with its defaults.
+        let pc: serde_json::Value = crate::fsx::read(&dir.join("processor_config.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let tag = |k: &str, d: &str| pc[k].as_str().unwrap_or(d).to_string();
+        let image_start = tag("image_start_tag", if is_flow { "<image_beg>" } else { "<begin_of_image>" });
+        let image_end = tag("image_end_tag", if is_flow { "<image_end>" } else { "<end_of_image>" });
+        let (user, assistant) = match pc["sft_format"]
+            .as_str()
+            .unwrap_or(if is_flow { "deepseek_old" } else { "deepseek" })
+        {
+            "deepseek" => ("<|User|>", "<|Assistant|>"),
+            "deepseek_old" => ("User", "Assistant"),
+            f => bail!("processor_config: unknown sft_format {f:?}"),
+        };
+        let format = Format {
+            user,
+            assistant,
+            gen_tag: if is_flow {
+                tag("image_gen_tag", "<｜begin▁of▁generation｜>")
+            } else {
+                image_start.clone()
+            },
+        };
         let id = |t: &str| tok.token_to_id(t).with_context(|| format!("tokenizer: no {t}"));
         let special = Special {
-            image_start: id("<begin_of_image>")?,
-            image_end: id("<end_of_image>")?,
-            image: id(IMAGE_TAG)?,
+            image_start: id(&image_start)?,
+            image_end: id(&image_end)?,
+            image: id(&tag("image_tag", IMAGE_TAG))?,
             pad: id("<｜▁pad▁｜>")?,
-            eos: id("<｜end▁of▁sentence｜>")?,
+            eos: id(EOS_TEXT)?,
         };
+        id(&format.gen_tag)?;
         let llm = Llm::load(lcfg, fs, "language_model.", opts.quant)?;
-        let gen_parts = if opts.generation {
+        let flow = if opts.generation && is_flow {
+            let vae = flow::load_vae(&dir, opts)?;
+            Some(flow::FlowParts::load(fs, &cfg, h, llm.cfg.rms_norm_eps, vae)?)
+        } else {
+            None
+        };
+        let gen_parts = if opts.generation && !is_flow {
             let g = &cfg["gen_vision_config"]["params"];
             let codes = g["image_token_size"].as_u64().unwrap_or(16384) as usize;
             let code_dim = g["n_embed"].as_u64().unwrap_or(8) as usize;
@@ -357,7 +484,7 @@ impl Janus {
             None
         };
         let vision = if opts.understanding {
-            let vp = &cfg["vision_config"]["params"];
+            let vp = &cfg[if is_flow { "vision_und_enc_config" } else { "vision_config" }]["params"];
             let name = vp["model_name"].as_str().unwrap_or_default();
             if name != "siglip_large_patch16_384" {
                 bail!("vision_config: only siglip_large_patch16_384 is supported, got {name}");
@@ -384,18 +511,55 @@ impl Janus {
                     .and_then(|v| v.as_u64())
                     .map_or((mean[i] * 255.0) as u8, |v| v as u8)
             });
-            let n_embed = cfg["aligner_config"]["params"]["n_embed"].as_u64().unwrap_or(h as u64) as usize;
-            if n_embed != h {
-                bail!("aligner_config: n_embed {n_embed} is not the hidden size {h}");
+            let (prefix, aligner) = if is_flow {
+                (
+                    "vision_und_enc_model.vision_tower",
+                    Aligner::Linear(Box::new(Dense::load(fs, "vision_und_enc_aligner", h, VisionEncoder::WIDTH)?)),
+                )
+            } else {
+                let n_embed = cfg["aligner_config"]["params"]["n_embed"].as_u64().unwrap_or(h as u64) as usize;
+                if n_embed != h {
+                    bail!("aligner_config: n_embed {n_embed} is not the hidden size {h}");
+                }
+                (
+                    "vision_model.vision_tower",
+                    Aligner::Mlp(Box::new(Mlp::load(fs, "aligner", VisionEncoder::WIDTH, h)?)),
+                )
+            };
+            Some(VisionEncoder::load(
+                fs,
+                prefix,
+                aligner,
+                size,
+                layers,
+                mean,
+                tri("image_std", 0.5),
+                background,
+            )?)
+        } else {
+            None
+        };
+        let beg_of_und = if opts.understanding && is_flow {
+            let e = fs.f32("beg_of_und_embed")?;
+            if e.len() != h {
+                bail!("beg_of_und_embed: {} values, expected {h}", e.len());
             }
-            Some(VisionEncoder::load(fs, size, layers, h, mean, tri("image_std", 0.5), background)?)
+            Some(e)
         } else {
             None
         };
         Ok(Janus {
-            parts: Parts { llm, gen_parts, vision },
+            parts: Parts {
+                llm,
+                gen_parts,
+                flow,
+                vision,
+                beg_of_und,
+            },
             tok,
             special,
+            format,
+            variant,
             cancel: Arc::new(AtomicBool::new(false)),
             path: dir,
             load_secs: t0.elapsed().as_secs_f64(),
@@ -417,31 +581,60 @@ impl Janus {
     }
 
     fn encode(&self, text: &str) -> Result<Vec<u32>> {
-        Ok(self.tok.encode(text, true).map_err(|e| anyhow!("encode: {e}"))?.get_ids().to_vec())
+        self.encode_with(text, true)
+    }
+
+    /// Token ids of `text`, with BOS in front or not.
+    fn encode_with(&self, text: &str, bos: bool) -> Result<Vec<u32>> {
+        Ok(self.tok.encode(text, bos).map_err(|e| anyhow!("encode: {e}"))?.get_ids().to_vec())
     }
 
     fn generator(&self) -> Result<&GenParts<'static>> {
-        self.parts
-            .gen_parts
-            .as_ref()
-            .context("image generation was not loaded (JanusOptions::generation)")
+        self.parts.gen_parts.as_ref().context(if self.variant == Variant::Flow {
+            "JanusFlow has no image tokens (it generates by rectified flow)"
+        } else {
+            "image generation was not loaded (JanusOptions::generation)"
+        })
     }
 
-    /// The text-to-image prompt: the "deepseek" SFT template with no system prompt, one user
-    /// turn and an empty assistant turn, then `<begin_of_image>`.
+    /// Janus-Pro's text-to-image prompt: the "deepseek" SFT template with no system prompt, one
+    /// user turn and an empty assistant turn, then `<begin_of_image>`.
     pub fn generation_prompt(prompt: &str) -> String {
         sft(&[("<|User|>", prompt), ("<|Assistant|>", "")], "") + "<begin_of_image>"
     }
 
-    /// The understanding prompt for a question about `images` images: placeholders are added
-    /// before the question when it has none.
+    /// Janus-Pro's understanding prompt for a question about `images` images: placeholders are
+    /// added before the question when it has none.
     pub fn understanding_prompt(question: &str, images: usize, system: &str) -> String {
-        let q = if images > 0 && !question.contains(IMAGE_TAG) {
-            format!("{}{question}", format!("{IMAGE_TAG}\n").repeat(images))
-        } else {
-            question.to_string()
-        };
-        sft(&[("<|User|>", &q), ("<|Assistant|>", "")], system)
+        sft(&[("<|User|>", &with_placeholders(question, images)), ("<|Assistant|>", "")], system)
+    }
+
+    /// This model's text-to-image prompt (JanusFlow: the "deepseek_old" roles `User` and
+    /// `Assistant`, ending with `<｜begin▁of▁generation｜>`).
+    pub fn generation_text(&self, prompt: &str) -> String {
+        let f = &self.format;
+        sft(&[(f.user, prompt), (f.assistant, "")], "") + &f.gen_tag
+    }
+
+    /// This model's prompt for one question of a conversation: the first turn (with the system
+    /// prompt) or a later one, which follows the previous answer and the end-of-sentence token.
+    pub fn turn_text(&self, question: &str, images: usize, system: &str, first: bool) -> String {
+        let f = &self.format;
+        sft(
+            &[(f.user, &with_placeholders(question, images)), (f.assistant, "")],
+            if first { system } else { "" },
+        )
+    }
+
+    /// The side in pixels of the images the model generates: 384. It is fixed by training for
+    /// both models: Janus-Pro writes a 24x24 grid of image tokens and JanusFlow a 48x48 latent
+    /// (24x24 tokens), in raster order with one-dimensional positions, so another grid is not a
+    /// larger or wider image to them.
+    pub fn native_size(&self) -> usize {
+        match &self.parts.flow {
+            Some(f) => f.image_size(),
+            None => self.parts.gen_parts.as_ref().map_or(384, |g| g.grid * g.vq.scale()),
+        }
     }
 
     /// Generates one image (the first of the batch when `parallel_size` > 1; see
@@ -451,22 +644,53 @@ impl Janus {
         Ok(imgs.swap_remove(0))
     }
 
-    /// Generates `parallel_size` images for `prompt`, calling `progress` after every image-token
-    /// step (return [`Flow::Stop`] to cancel; the call then fails with "cancelled").
+    /// Generates `parallel_size` images for `prompt`, calling `progress` after every step (an
+    /// image token of Janus-Pro, an Euler step of JanusFlow; return [`Flow::Stop`] to cancel:
+    /// the call then fails with "cancelled").
     pub fn generate_images(
         &self,
         prompt: &str,
         opts: &ImageOptions,
         progress: &mut dyn FnMut(Progress) -> Flow,
     ) -> Result<(Vec<Image>, ImageStats)> {
-        let (grids, mut stats) = self.generate_tokens(prompt, opts, progress)?;
-        let t0 = Instant::now();
-        let imgs = grids.iter().map(|g| self.decode_tokens(g)).collect::<Result<Vec<_>>>()?;
+        if (opts.width == 0) != (opts.height == 0) {
+            bail!("image size: give both width and height, or neither for the model's own size");
+        }
+        let (mut imgs, mut stats, t0);
+        if self.variant == Variant::Flow {
+            let (latents, st) = self.flow_latents(prompt, opts, None, None, progress)?;
+            stats = st;
+            t0 = Instant::now();
+            imgs = latents.iter().map(|z| self.decode_latents(z)).collect::<Result<Vec<_>>>()?;
+        } else {
+            let (grids, st) = self.generate_tokens(prompt, opts, progress)?;
+            stats = st;
+            t0 = Instant::now();
+            imgs = grids.iter().map(|g| self.decode_tokens(g)).collect::<Result<Vec<_>>>()?;
+        }
+        if opts.width != 0 {
+            for img in &mut imgs {
+                if (img.width, img.height) != (opts.width, opts.height) {
+                    img.rgb = crate::resample::resize_lanczos_rgb8(&img.rgb, img.width, img.height, opts.width, opts.height);
+                    (img.width, img.height) = (opts.width, opts.height);
+                }
+            }
+        }
         stats.decode = t0.elapsed().as_secs_f64();
         Ok((imgs, stats))
     }
 
-    /// The image-token grids (`parallel_size` of them, 576 tokens each, row-major) for `prompt`.
+    /// JanusFlow: decodes a latent of [`Janus::flow_latents`] to a 384x384 image.
+    pub fn decode_latents(&self, latents: &[f32]) -> Result<Image> {
+        let (rgb, width, height) = self.decode_latents_f32(latents)?;
+        Ok(Image {
+            width,
+            height,
+            rgb: vq::to_rgb8(&rgb),
+        })
+    }
+
+    /// Janus-Pro: the image-token grids (`parallel_size` of them, 576 tokens each, row-major) for `prompt`.
     pub fn generate_tokens(
         &self,
         prompt: &str,
@@ -481,7 +705,7 @@ impl Janus {
     /// and `tokens[..i]`). For checks against the reference.
     pub fn image_logits(&self, prompt: &str, cfg_weight: f32, tokens: &[u32]) -> Result<Vec<Vec<f32>>> {
         let opts = ImageOptions {
-            cfg_weight,
+            cfg_weight: Some(cfg_weight),
             temperature: 0.0,
             ..Default::default()
         };
@@ -502,7 +726,8 @@ impl Janus {
         let g = self.generator()?;
         let llm = &self.parts.llm;
         let h = llm.cfg.hidden_size;
-        let ids = self.encode(&Self::generation_prompt(prompt))?;
+        let ids = self.encode(&self.generation_text(prompt))?;
+        let cfg_weight = opts.cfg_weight.unwrap_or(5.0);
         let l = ids.len();
         if l < 2 {
             bail!("prompt too short");
@@ -555,7 +780,7 @@ impl Janus {
                     &logits[2 * i * codes..(2 * i + 1) * codes],
                     &logits[(2 * i + 1) * codes..(2 * i + 2) * codes],
                 );
-                let guided: Vec<f32> = c.iter().zip(u).map(|(&c, &u)| u + opts.cfg_weight * (c - u)).collect();
+                let guided: Vec<f32> = c.iter().zip(u).map(|(&c, &u)| u + cfg_weight * (c - u)).collect();
                 let tok = match forced {
                     Some(f) => f[step],
                     None => sample(&mut sampler, &guided),
@@ -617,48 +842,66 @@ impl Janus {
         Ok((emb, feats))
     }
 
-    /// The prompt token ids for an understanding question, with each image expanded to
-    /// `<begin_of_image>`, 576 image tokens and `<end_of_image>`; and where the images go.
-    fn understanding_ids(&self, question: &str, images: usize, system: &str) -> Result<(Vec<u32>, Vec<usize>)> {
-        let ids = self.encode(&Self::understanding_prompt(question, images, system))?;
-        let per = self.vision()?.tokens();
-        let mut out = Vec::with_capacity(ids.len() + images * (per + 2));
-        let mut starts = Vec::new();
-        for &t in &ids {
-            if t == self.special.image {
-                out.push(self.special.image_start);
-                starts.push(out.len());
-                out.extend(std::iter::repeat_n(self.special.image, per));
-                out.push(self.special.image_end);
-            } else {
-                out.push(t);
-            }
-        }
-        if starts.len() != images {
-            bail!("the question has {} image placeholders for {images} images", starts.len());
-        }
-        Ok((out, starts))
-    }
-
     /// Text logits after the prompt of an understanding question (`[vocab]`), for checks.
     pub fn understanding_logits(&self, question: &str, images: &[RgbImage], system: Option<&str>) -> Result<Vec<f32>> {
-        let hid = self.prefill_understanding(question, images, system.unwrap_or(SYSTEM_PROMPT))?.1;
-        let h = self.parts.llm.cfg.hidden_size;
-        Ok(self.parts.llm.logits(&hid[hid.len() - h..], 1))
+        self.ask_logits(&mut Conversation::new(), question, images, system)
     }
 
-    fn prefill_understanding(&self, question: &str, images: &[RgbImage], system: &str) -> Result<(llm::BatchState, Vec<f32>, usize)> {
+    /// The text logits (`[vocab]`) after the prompt of the conversation's next question, which
+    /// is added to the conversation without an answer. For checks.
+    pub fn ask_logits(&self, conv: &mut Conversation, question: &str, images: &[RgbImage], system: Option<&str>) -> Result<Vec<f32>> {
+        let hid = self.prefill_turn(conv, question, images, system.unwrap_or(SYSTEM_PROMPT))?;
+        Ok(self.parts.llm.logits(&hid, 1))
+    }
+
+    /// Feeds the next question of `conv` (the first with the system prompt) and its images to
+    /// the language model; returns the last position's hidden state. Each image is expanded to
+    /// the start tag, 576 image positions and the end tag.
+    fn prefill_turn(&self, conv: &mut Conversation, question: &str, images: &[RgbImage], system: &str) -> Result<Vec<f32>> {
         let llm = &self.parts.llm;
         let h = llm.cfg.hidden_size;
-        let (ids, starts) = self.understanding_ids(question, images.len(), system)?;
+        let first = conv.is_empty();
+        let mut text = self.turn_text(question, images.len(), system, first);
+        // The reference formats the whole conversation again at every turn, so the model reads
+        // its previous answer as text (` ANSWER` after `Assistant:`, then the end-of-sentence
+        // token), which is not always the tokens it wrote: those are replaced.
+        if let Some((start, answer)) = conv.answer.take() {
+            if let Some(st) = conv.st.as_mut() {
+                st.rewind(&[start], start);
+            }
+            conv.ids.truncate(start);
+            if !answer.trim().is_empty() {
+                text = format!(" {}{EOS_TEXT}{text}", answer.trim());
+            }
+        }
+        let per = if images.is_empty() { 0 } else { self.vision()?.tokens() };
+        let mut ids = Vec::new();
+        let mut starts = Vec::new();
+        for t in self.encode_with(&text, first)? {
+            if t == self.special.image {
+                ids.push(self.special.image_start);
+                starts.push(ids.len());
+                ids.extend(std::iter::repeat_n(self.special.image, per));
+                ids.push(self.special.image_end);
+            } else {
+                ids.push(t);
+            }
+        }
+        if starts.len() != images.len() {
+            bail!("the question has {} image placeholders for {} images", starts.len(), images.len());
+        }
         let mut x = llm.embed(&ids);
         for (img, &s) in images.iter().zip(&starts) {
             let (emb, _) = self.encode_image(img)?;
             x[s * h..s * h + emb.len()].copy_from_slice(&emb);
+            if let Some(beg) = &self.parts.beg_of_und {
+                x[(s - 1) * h..s * h].copy_from_slice(beg);
+            }
         }
-        let mut st = llm.new_state(1);
-        let hid = llm.forward(&mut st, x, ids.len());
-        Ok((st, hid, ids.len()))
+        let st = conv.st.get_or_insert_with(|| llm.new_state(1));
+        let hid = llm.forward(st, x, ids.len());
+        conv.ids.extend_from_slice(&ids);
+        Ok(hid[hid.len() - h..].to_vec())
     }
 
     /// Answers `question` about `images` (each placed at an `<image_placeholder>` of the
@@ -670,12 +913,29 @@ impl Janus {
         opts: &ChatOptions,
         on_text: &mut dyn FnMut(&str) -> Flow,
     ) -> Result<String> {
+        self.ask(&mut Conversation::new(), question, images, opts, on_text)
+    }
+
+    /// The next turn of a conversation: answers `question`, which may come with more `images`
+    /// (each at an `<image_placeholder>`, or before the question), knowing the earlier turns and
+    /// their images. The turns follow the reference's SFT template (the previous answer closed
+    /// by the end-of-sentence token), and the model's state is kept, so a turn costs its own
+    /// tokens and the previous answer's, read again as text. A failed or cancelled call leaves
+    /// the conversation unusable.
+    pub fn ask(
+        &self,
+        conv: &mut Conversation,
+        question: &str,
+        images: &[RgbImage],
+        opts: &ChatOptions,
+        on_text: &mut dyn FnMut(&str) -> Flow,
+    ) -> Result<String> {
         self.cancel.store(false, Ordering::Relaxed);
         let llm = &self.parts.llm;
-        let h = llm.cfg.hidden_size;
         let system = opts.system_prompt.as_deref().unwrap_or(SYSTEM_PROMPT);
-        let (mut st, hid, _) = self.prefill_understanding(question, images, system)?;
-        let mut logits = llm.logits(&hid[hid.len() - h..], 1);
+        let hid = self.prefill_turn(conv, question, images, system)?;
+        let start = conv.ids.len();
+        let mut logits = llm.logits(&hid, 1);
         let mut sampler = Sampler::new(opts.temperature, opts.top_k, opts.top_p, opts.seed);
         let mut out: Vec<u32> = Vec::new();
         let mut text = String::new();
@@ -684,27 +944,41 @@ impl Janus {
             if t == self.special.eos {
                 break;
             }
+            // The token joins the conversation before its text is shown, so stopping there
+            // leaves the state in step with the answer.
             out.push(t);
+            conv.ids.push(t);
+            let st = conv.st.as_mut().context("conversation state")?;
+            logits = llm.logits(&llm.forward(st, llm.embed(&[t]), 1), 1);
             let full = self.tok.decode(&out, true).map_err(|e| anyhow!("decode: {e}"))?;
             // Emit only complete characters (a partial UTF-8 sequence decodes to U+FFFD).
             if full.len() > text.len() && !full.ends_with('\u{FFFD}') && full.starts_with(&text) {
                 let delta = full[text.len()..].to_string();
                 text = full;
                 if on_text(&delta) == Flow::Stop {
+                    conv.answer = Some((start, text.clone()));
                     return Ok(text);
                 }
             }
             if self.cancel.load(Ordering::Relaxed) {
                 bail!("cancelled");
             }
-            let x = llm.embed(&[t]);
-            logits = llm.logits(&llm.forward(&mut st, x, 1), 1);
         }
         let full = self.tok.decode(&out, true).map_err(|e| anyhow!("decode: {e}"))?;
         if full.len() > text.len() && full.starts_with(&text) {
             on_text(&full[text.len()..]);
         }
+        conv.answer = Some((start, full.clone()));
         Ok(full)
+    }
+}
+
+/// `question` with one placeholder per image in front when it has none.
+fn with_placeholders(question: &str, images: usize) -> String {
+    if images > 0 && !question.contains(IMAGE_TAG) {
+        format!("{}{question}", format!("{IMAGE_TAG}\n").repeat(images))
+    } else {
+        question.to_string()
     }
 }
 
@@ -741,7 +1015,7 @@ fn sft(turns: &[(&str, &str)], system: &str) -> String {
             s.push_str(role);
             s.push(':');
         } else {
-            let sep = if i % 2 == 0 { "\n\n" } else { "<｜end▁of▁sentence｜>" };
+            let sep = if i % 2 == 0 { "\n\n" } else { EOS_TEXT };
             s.push_str(&format!("{role}: {msg}{sep}"));
         }
     }

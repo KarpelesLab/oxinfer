@@ -1,4 +1,5 @@
-//! Dumps for checking Janus-Pro against the reference (`tools/ref_janus.py` writes the same files):
+//! Dumps for checking Janus-Pro and JanusFlow against the reference (`tools/ref_janus.py` writes
+//! the same files):
 //!
 //! ```text
 //! janus_check MODEL text QUESTION OUTDIR          prompt ids + last-token text logits
@@ -6,13 +7,23 @@
 //! janus_check MODEL forced PROMPT TOKENS OUT.bin  guided logits per step, teacher-forced
 //! janus_check MODEL vq TOKENS OUT.bin             VQ decoder output (HWC f32 in [-1, 1])
 //! janus_check MODEL vision IMAGE QUESTION OUTDIR  features, embeddings, logits, greedy answer
+//! janus_check MODEL chat IMAGE Q1 Q2 OUTDIR       two turns: the greedy answer to Q1 about the
+//!                                                 image (answer1.txt), then the conversation's
+//!                                                 ids and the logits after Q2
+//! janus_check MODEL flow PROMPT NOISE.bin STEPS CFG OUTDIR
+//!                                                 JanusFlow from the given noise ([48*48, 4]
+//!                                                 f32): the velocities of every step
+//!                                                 (velocity.bin: per step, conditional then
+//!                                                 unconditional), latents.bin, pixels.bin (the
+//!                                                 VAE's output, HWC) and image.png
 //! ```
 //!
-//! `OXINFER_QUANT=q8|q4` quantizes the language model.
+//! `OXINFER_QUANT=q8|q4` quantizes the language model; `OXINFER_DEVICE=cpu|cuda|...` picks the
+//! device.
 
 use anyhow::{Context, Result, bail};
 use oxinfer::generate::Flow;
-use oxinfer::janus::{ChatOptions, ImageOptions, Janus, JanusOptions};
+use oxinfer::janus::{ChatOptions, Conversation, ImageOptions, Janus, JanusOptions};
 use std::path::Path;
 
 fn save(path: impl AsRef<Path>, v: &[f32]) -> Result<()> {
@@ -30,11 +41,14 @@ fn tokens(path: &str) -> Result<Vec<u32>> {
 fn main() -> Result<()> {
     let a: Vec<String> = std::env::args().skip(1).collect();
     if a.len() < 3 {
-        bail!("usage: janus_check MODEL text|gen|forced|vq|vision ARGS... (see the source)");
+        bail!("usage: janus_check MODEL text|gen|forced|vq|vision|chat|flow ARGS... (see the source)");
     }
     let mut opts = JanusOptions::default();
     if let Ok(q) = std::env::var("OXINFER_QUANT") {
         opts.quant = oxinfer::model::Quant::parse(&q).context("OXINFER_QUANT")?;
+    }
+    if let Ok(d) = std::env::var("OXINFER_DEVICE") {
+        opts.set("device", &d)?;
     }
     let jm = Janus::load(&a[0], &opts)?;
     eprintln!("[loaded in {:.1}s]", jm.load_secs);
@@ -92,6 +106,55 @@ fn main() -> Result<()> {
             let ans = jm.understand(&a[3], &[img], &o, &mut |_| Flow::Continue)?;
             std::fs::write(format!("{}/answer.txt", a[4]), &ans)?;
             println!("{ans}");
+        }
+        "chat" => {
+            std::fs::create_dir_all(&a[5])?;
+            let img = oxinfer::media::Media::new().load_image(Path::new(&a[2]))?;
+            let o = ChatOptions {
+                max_tokens: 48,
+                ..Default::default()
+            };
+            let mut conv = Conversation::new();
+            let ans = jm.ask(&mut conv, &a[3], &[img], &o, &mut |_| Flow::Continue)?;
+            std::fs::write(format!("{}/answer1.txt", a[5]), &ans)?;
+            let lg = jm.ask_logits(&mut conv, &a[4], &[], None)?;
+            save(format!("{}/logits.bin", a[5]), &lg)?;
+            let s: Vec<String> = conv.ids().iter().map(|t| t.to_string()).collect();
+            std::fs::write(format!("{}/ids.txt", a[5]), s.join(" "))?;
+            println!("{ans}");
+        }
+        "flow" => {
+            let out = &a[6];
+            std::fs::create_dir_all(out)?;
+            let noise: Vec<f32> = std::fs::read(&a[3])?
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
+                .collect();
+            let o = ImageOptions {
+                steps: a[4].parse()?,
+                cfg_weight: Some(a[5].parse()?),
+                ..Default::default()
+            };
+            let mut trace = Vec::new();
+            let (z, st) = jm.flow_latents(&a[2], &o, Some(&noise), Some(&mut trace), &mut |p| {
+                eprint!("\r[step {}/{}]", p.step, p.steps);
+                Flow::Continue
+            })?;
+            eprintln!(
+                "\n[{} prompt tokens: prefill {:.2}s, steps {:.2}s]",
+                st.prompt_tokens, st.prefill, st.tokens
+            );
+            save(format!("{out}/velocity.bin"), &trace.concat())?;
+            save(format!("{out}/latents.bin"), &z[0])?;
+            let (px, _, _) = jm.decode_latents_f32(&z[0])?;
+            save(format!("{out}/pixels.bin"), &px)?;
+            let img = jm.decode_latents(&z[0])?;
+            std::fs::write(
+                format!("{out}/image.png"),
+                oxinfer::png::encode_rgb(img.width, img.height, &img.rgb),
+            )?;
         }
         m => bail!("unknown mode {m}"),
     }

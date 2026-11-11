@@ -390,12 +390,14 @@ char *oxi_transcribe_pcm(OxiTranscriber *t, const float *samples, size_t n, int 
  * feature, which `cargo build-capi` enables). `cb` may be NULL. */
 char *oxi_transcribe_file(OxiTranscriber *t, const char *path, const char *options_json, oxi_segment_fn cb, void *user);
 
-/* ---- Janus-Pro: text to image and image understanding ------------------------------------
+/* ---- Janus-Pro and JanusFlow: text to image and image understanding -------------------------
  *
- * deepseek-ai/Janus-Pro-1B and -7B (over oxinfer::janus). One autoregressive model writes
- * 384x384 images as 576 image tokens (classifier-free guidance, the conditional and
- * unconditional sequences batched) and answers questions about images. Same threading rules as
- * engines: one call at a time, oxi_janus_cancel() from any thread. */
+ * deepseek-ai/Janus-Pro-1B and -7B, deepseek-ai/JanusFlow-1.3B (over oxinfer::janus; the variant
+ * is read from the checkpoint). One language model writes 384x384 images (Janus-Pro: 576 image
+ * tokens; JanusFlow: rectified flow in the SDXL VAE's latent space; both with classifier-free
+ * guidance, the conditional and unconditional sequences batched) and answers questions about
+ * images. Same threading rules as engines: one call at a time, oxi_janus_cancel() from any
+ * thread. */
 
 typedef struct OxiJanus OxiJanus;
 
@@ -403,17 +405,20 @@ typedef struct OxiJanus OxiJanus;
  * bytes), valid during the call only. */
 typedef void (*oxi_image_fn)(void *user, int index, int width, int height, const uint8_t *rgb, size_t len);
 
-/* Image-generation progress: `step` of `steps` image tokens sampled. Return non-zero to cancel. */
+/* Image-generation progress: `step` of `steps` image tokens sampled (JanusFlow: flow steps
+ * done). Return non-zero to cancel. */
 typedef int (*oxi_step_fn)(void *user, int step, int steps);
 
-/* Loads a Janus-Pro model (directory or repo id). `options`: `key=value` lines or `;`-separated
+/* Loads a Janus-Pro or JanusFlow model (directory or repo id). `options`: `key=value` lines or `;`-separated
  * pairs, NULL for the defaults:
  *   quant=bf16|q8|q4      language model and image head precision (default bf16)
  *   mmap=0|1              map the weights instead of reading them into memory
  *   device=auto|cpu|metal|cuda|vulkan
  *   cache_dir=PATH        where repo ids are downloaded
  *   generation=0|1        load the text-to-image parts (default 1)
- *   understanding=0|1     load the image encoder (default 1) */
+ *   understanding=0|1     load the image encoder (default 1)
+ *   vae=PATH|REPO         JanusFlow: the VAE decoding the latents (default the checkpoint's
+ *                         vae/ folder if any, else stabilityai/sdxl-vae) */
 OxiJanus *oxi_janus_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
 
 /* Frees a Janus model (NULL is ignored); no other call on it may be running. */
@@ -423,10 +428,14 @@ void oxi_janus_free(OxiJanus *j);
 void oxi_janus_cancel(const OxiJanus *j);
 
 /* Text to image. `options_json` (NULL or {} for the defaults, every key optional):
- *   {"cfg_weight": 5, "temperature": 1 (0 = greedy), "top_k": 0 (off), "top_p": 1 (off),
- *    "seed": 42, "parallel_size": 1 (images generated together in one batch)}
+ *   {"cfg_weight": null (the model's: 5, JanusFlow 2), "seed": 42,
+ *    "parallel_size": 1 (images generated together in one batch),
+ *    "temperature": 1 (0 = greedy), "top_k": 0 (off), "top_p": 1 (off)     Janus-Pro's sampling
+ *    "steps": 30                                                           JanusFlow's Euler steps
+ *    "width": 0, "height": 0 (the models' own and only size, 384x384; other values resample
+ *                             that image with a Lanczos filter)}
  * Each image is passed to `on_image`; `on_step` (may be NULL) is called after every image-token
- * step. Returns the number of images, or -1 (error, or cancelled). */
+ * (JanusFlow: flow) step. Returns the number of images, or -1 (error, or cancelled). */
 int oxi_janus_generate(OxiJanus *j, const char *prompt, const char *options_json, oxi_image_fn on_image, oxi_step_fn on_step,
                        void *user);
 
@@ -441,6 +450,14 @@ char *oxi_janus_understand(OxiJanus *j, const char *question, const char *images
 /* oxi_janus_understand() with one image given as tightly packed RGB8 pixels. */
 char *oxi_janus_understand_rgb(OxiJanus *j, const char *question, const uint8_t *rgb, int width, int height,
                                const char *options_json, oxi_token_fn cb, void *user);
+
+/* The next turn of the handle's conversation: as oxi_janus_understand(), but the model knows the
+ * earlier questions, their images and its answers (`images_json`: the images this question adds,
+ * NULL for none; "system_prompt" counts on the first turn only). An error ends the conversation;
+ * oxi_janus_chat_reset() starts a new one. */
+char *oxi_janus_chat(OxiJanus *j, const char *question, const char *images_json, const char *options_json, oxi_token_fn cb,
+                     void *user);
+void oxi_janus_chat_reset(OxiJanus *j);
 
 /* ---- Qwen-Image: instruction-based image editing and text to image --------------------------
  *

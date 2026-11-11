@@ -86,6 +86,30 @@ impl BatchState {
     pub fn batch(&self) -> usize {
         self.seqs.len()
     }
+
+    /// The sequences of `parts` side by side as one batch whose next token is at position
+    /// `pos`. The sequences may hold different numbers of cached positions (JanusFlow's
+    /// unconditional sequence attends to BOS only, yet sits at the same positions as the
+    /// conditional one).
+    pub fn join(parts: &[&BatchState], pos: usize) -> BatchState {
+        BatchState {
+            seqs: parts.iter().flat_map(|p| p.seqs.iter().cloned()).collect(),
+            pos,
+        }
+    }
+
+    /// Cached positions of each sequence.
+    pub fn lens(&self) -> Vec<usize> {
+        self.seqs.iter().map(|s| s.first().map_or(0, |c| c.len)).collect()
+    }
+
+    /// Drops the cached positions past `lens[b]` of each sequence and moves back to `pos`.
+    pub fn rewind(&mut self, lens: &[usize], pos: usize) {
+        for (seq, &n) in self.seqs.iter_mut().zip(lens) {
+            seq.iter_mut().for_each(|c| c.truncate(n));
+        }
+        self.pos = pos;
+    }
 }
 
 impl<'a> Llm<'a> {
@@ -213,7 +237,7 @@ impl<'a> Llm<'a> {
                 seq[li].push(&k[bi * t * kv..(bi + 1) * t * kv], &v[bi * t * kv..(bi + 1) * t * kv], t);
             }
             let caches: Vec<&LayerCache> = st.seqs.iter().map(|s| &s[li]).collect();
-            attention_batch(&q, &caches, nh, t, start, &mut att);
+            attention_batch(&q, &caches, nh, t, &mut att);
             linear(&l.o, h, nh * hd, &att, rows, &mut y);
             crate::kernels::add_inplace(&mut x, &y);
             rmsnorm_rows(&x, h, Some(l.ln_post), c.rms_norm_eps, &mut hn);
@@ -229,9 +253,9 @@ impl<'a> Llm<'a> {
 }
 
 /// Causal attention for a batch: `q` is `[batch * t, nh, hd]` (rotated and scaled), `caches[b]`
-/// sequence b's keys and values (already holding the `t` new positions). One task per
-/// (sequence, position, head), all in one parallel region.
-fn attention_batch(q: &[f32], caches: &[&LayerCache], nh: usize, t: usize, start: usize, out: &mut [f32]) {
+/// sequence b's keys and values (already holding the `t` new positions, after whatever that
+/// sequence kept before). One task per (sequence, position, head), all in one parallel region.
+fn attention_batch(q: &[f32], caches: &[&LayerCache], nh: usize, t: usize, out: &mut [f32]) {
     let _timer = crate::prof::start(crate::prof::Cat::Attention);
     let (hd, nkv) = (caches[0].hd, caches[0].n_kv);
     let rep = nh / nkv;
@@ -241,7 +265,7 @@ fn attention_batch(q: &[f32], caches: &[&LayerCache], nh: usize, t: usize, start
         let (bi, rem) = (task / (t * nh), task % (t * nh));
         let (ti, hh) = (rem / nh, rem % nh);
         let cache = caches[bi];
-        let n = start + ti + 1;
+        let n = cache.len - t + ti + 1;
         let qv = &q[task * hd..(task + 1) * hd];
         let mut scores: Vec<f32> = (0..n).map(|j| dot(qv, cache.k_at(j, hh / rep))).collect();
         softmax_inplace(&mut scores);
@@ -252,7 +276,7 @@ fn attention_batch(q: &[f32], caches: &[&LayerCache], nh: usize, t: usize, start
             axpy(o, p, cache.v_at(j, hh / rep));
         }
     };
-    if ntasks > 1 && (start + t) * ntasks > 256 {
+    if ntasks > 1 && caches[0].len * ntasks > 256 {
         crate::pool::run(ntasks, &run);
     } else {
         (0..ntasks).for_each(run);

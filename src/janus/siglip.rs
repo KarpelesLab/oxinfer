@@ -1,6 +1,7 @@
 //! Janus's understanding encoder: a SigLIP ViT-L/16 at 384x384 (timm `VisionTransformer`, 24
-//! pre-norm blocks, no class token, final LayerNorm, pooling head unused) and the `MlpProjector`
-//! aligner (Linear, GELU, Linear) into the language model's embedding space: 576 tokens per image.
+//! pre-norm blocks, no class token, final LayerNorm, pooling head unused) and the aligner into
+//! the language model's embedding space (Janus-Pro's `MlpProjector`: Linear, GELU, Linear;
+//! JanusFlow's single Linear): 576 tokens per image.
 
 use crate::model::{Lin, linear, linear_multi};
 use crate::safetensors::ModelFiles;
@@ -103,6 +104,23 @@ impl<'a> Mlp<'a> {
     }
 }
 
+/// The projection of the encoder's features into the language model.
+pub(crate) enum Aligner<'a> {
+    /// Janus-Pro (`aligner`).
+    Mlp(Box<Mlp<'a>>),
+    /// JanusFlow (`vision_und_enc_aligner`).
+    Linear(Box<Dense<'a>>),
+}
+
+impl Aligner<'_> {
+    fn forward(&self, x: &[f32], rows: usize) -> Vec<f32> {
+        match self {
+            Aligner::Mlp(m) => m.forward(x, rows),
+            Aligner::Linear(d) => d.forward(x, rows),
+        }
+    }
+}
+
 struct LayerNorm {
     w: Vec<f32>,
     b: Vec<f32>,
@@ -154,7 +172,7 @@ pub struct VisionEncoder<'a> {
     pos_embed: Vec<f32>,
     blocks: Vec<Block<'a>>,
     norm: LayerNorm,
-    aligner: Mlp<'a>,
+    aligner: Aligner<'a>,
     /// Pixel normalization (`preprocessor_config.json`).
     pub mean: [f32; 3],
     pub std: [f32; 3],
@@ -163,20 +181,23 @@ pub struct VisionEncoder<'a> {
 }
 
 impl<'a> VisionEncoder<'a> {
-    /// `siglip_large_patch16_384` under `vision_model.vision_tower` plus the aligner, which
-    /// projects to `n_embed`; `layers` is the depth kept (`select_layer`).
+    /// The width of the encoder's features (the aligner's input).
+    pub const WIDTH: usize = 1024;
+
+    /// `siglip_large_patch16_384` under `p` (`vision_model.vision_tower`) plus the aligner into
+    /// the language model; `layers` is the depth kept (`select_layer`).
     #[allow(clippy::too_many_arguments)]
-    pub fn load(
+    pub(crate) fn load(
         files: &'a ModelFiles,
+        p: &str,
+        aligner: Aligner<'a>,
         image_size: usize,
         layers: usize,
-        n_embed: usize,
         mean: [f32; 3],
         std: [f32; 3],
         background: [u8; 3],
     ) -> Result<Self> {
-        let (width, heads, patch) = (1024, 16, 16);
-        let p = "vision_model.vision_tower";
+        let (width, heads, patch) = (Self::WIDTH, 16, 16);
         let grid = image_size / patch;
         let pos_embed = files.f32(&format!("{p}.pos_embed"))?;
         if pos_embed.len() != grid * grid * width {
@@ -209,7 +230,7 @@ impl<'a> VisionEncoder<'a> {
             pos_embed,
             blocks,
             norm: LayerNorm::load(files, &format!("{p}.norm"), width)?,
-            aligner: Mlp::load(files, "aligner", width, n_embed)?,
+            aligner,
             mean,
             std,
             background,

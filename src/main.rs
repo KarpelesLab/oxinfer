@@ -348,14 +348,19 @@ fn usage() -> ! {
          \x20                      center-cropped to that aspect ratio (default: about 1024x1024)\n\
          \x20 --think              v1.2: the VL model rewrites the instruction from the image first\n\
          \n\
-         Janus-Pro (deepseek-ai/Janus-Pro-1B / -7B): text to image, and questions about images:\n\
+         Janus-Pro (deepseek-ai/Janus-Pro-1B / -7B) and JanusFlow (deepseek-ai/JanusFlow-1.3B): text\n\
+         to image, and questions about images:\n\
          \x20 --generate-image T   generate a 384x384 image of T (or --prompt T with -o FILE)\n\
          \x20 -o, --output FILE     PNG to write (default image.png; FILE-N.png for several images)\n\
-         \x20 --cfg F              classifier-free guidance weight (default 5; alias --guidance)\n\
-         \x20 --temp F             image-token temperature (default 1; 0 = greedy)\n\
+         \x20 --cfg F              classifier-free guidance weight (default 5, JanusFlow 2; alias\n\
+         \x20                      --guidance)\n\
+         \x20 --temp F             Janus-Pro: image-token temperature (default 1; 0 = greedy)\n\
+         \x20 --steps N            JanusFlow: Euler steps of the rectified flow (default 30)\n\
+         \x20 --size WxH           resample the 384x384 image (the models' only size) to WxH\n\
          \x20 --num-images N       images generated together in one batch (default 1)\n\
          \x20 --seed N             sampling seed (default 42)\n\
          \x20 --image FILE         with --prompt: answer a question about the image (repeatable)\n\
+         \x20 --chat               a conversation: more questions from standard input, one per line\n\
          \x20 --devices            list detected CPU features and GPUs, then exit\n\
          \x20 --device D           auto (default) | cpu | cuda | metal | vulkan\n\
          \x20 --gpu-decode M       on (default) | off: generate a whole token per GPU submission\n\
