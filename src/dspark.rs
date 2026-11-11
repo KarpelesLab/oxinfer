@@ -1811,12 +1811,13 @@ impl<'a> Dspark<'a> {
             if conf.is_some_and(|c| c < conf_min) {
                 return None;
             }
-            let q = sampler.distribution(logits);
+            let q = sampler.draft_distribution(logits);
             let d = if sampler.greedy() { q[0].0 } else { sampler.sample_from(&q) };
             let pd = softmax_at(logits, d);
             if pd < p_min {
                 return None;
             }
+            sampler.draft_commit(d);
             p.dists.push(q);
             p.probs.push(pd);
             p.conf.push(conf.unwrap_or(f32::NAN));
@@ -2772,6 +2773,7 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
             let p = sampler.distribution(&logits[j * v..(j + 1) * v]);
             match speculative_accept(sampler, &p, q, d) {
                 None => {
+                    sampler.commit(d);
                     out.push(d);
                     accepted += 1;
                     if self.opts.stop.contains(&d) {
@@ -2779,6 +2781,7 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
                     }
                 }
                 Some(t) => {
+                    sampler.commit(t);
                     out.push(t);
                     break;
                 }
@@ -3561,6 +3564,75 @@ mod tests {
         assert_eq!(spec.tokens, plain);
         let dlen = dec.draft_session().len;
         assert_eq!(dlen, dec.sess.0.len());
+    }
+
+    /// A filter whose mask depends on the token before: forbids the tokens congruent to it
+    /// modulo 3.
+    #[derive(Clone)]
+    struct NotLikeLast(u32);
+    impl crate::sampler::TokenFilter for NotLikeLast {
+        fn mask(&mut self, logits: &mut [f32]) {
+            for (i, l) in logits.iter_mut().enumerate() {
+                if i as u32 % 3 == self.0 % 3 {
+                    *l = f32::NEG_INFINITY;
+                }
+            }
+        }
+        fn accept(&mut self, token: u32) {
+            self.0 = token;
+        }
+        fn fork(&self) -> Box<dyn crate::sampler::TokenFilter> {
+            Box::new(self.clone())
+        }
+        fn complete(&self) -> bool {
+            true
+        }
+    }
+
+    /// With a filter and a log-probability record on the sampler (constrained decoding), DSpark
+    /// rounds give the tokens and the record of plain decoding under the same filter: drafts are
+    /// drawn under the filter's forked state and verification masks every position.
+    #[test]
+    fn guided_dspark_matches_guided_plain_decoding() {
+        let dir = std::env::temp_dir().join(format!("oxinfer-dspark-hf-guided-{}", std::process::id()));
+        toy_hf_draft(&dir, serde_json::json!({}), Some(7));
+        let files = ModelFiles::open(&dir, true).unwrap();
+        let d = Dspark::load(&dir, &files, H, V, Quant::Bf16).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let toy = Toy;
+        let prompt = [5u32, 9, 13, 2, 7];
+        let guided = || {
+            let mut s = Sampler::new(0.0, 0, 1.0, 1);
+            let log = s.set_guide(Some(Box::new(NotLikeLast(7))), Some(2));
+            (s, log)
+        };
+        let run_plain = |s: &mut Sampler| {
+            let mut ps = toy.new_session();
+            let hs = crate::generate::prefill(&toy, &mut ps, &prompt, 2, &[]);
+            let lg = toy.logits(&hs[hs.len() - H..], 1);
+            crate::generate::decode(&toy, &mut ps, lg, s, &[], 120, &mut |_| Flow::Continue).tokens
+        };
+        let (mut s, want_log) = guided();
+        let plain = run_plain(&mut s);
+        assert_eq!(s.take_guide().unwrap().tokens, plain);
+        assert!(plain.windows(2).all(|w| w[0] % 3 != w[1] % 3) && plain[0] % 3 != 1);
+        assert_ne!(plain, run_plain(&mut Sampler::new(0.0, 0, 1.0, 1)), "the filter changes the reply");
+        for cost_aware in [false, true] {
+            let (mut s, log) = guided();
+            let opts = DsparkOptions {
+                cost_aware,
+                ..Default::default()
+            };
+            let mut dec = DsparkDecoder::new(&toy, &d, opts);
+            let lg = dec.prefill(&prompt, 2);
+            let spec = crate::generate::decode_rounds(&mut dec, &lg, &mut s, &[], 120, &mut |_| Flow::Continue);
+            assert_eq!(spec.tokens, plain, "cost_aware {cost_aware}");
+            assert_eq!(s.take_guide().unwrap().tokens, plain, "every committed token reached the guide");
+            assert_eq!(*log.lock().unwrap(), *want_log.lock().unwrap());
+            if !cost_aware {
+                assert!(dec.stats.drafted > 0, "{:?}", dec.stats);
+            }
+        }
     }
 
     /// Finding a draft: names of cached and GGUF models, the known drafts in the download cache,

@@ -193,6 +193,9 @@ impl CoreMlLm {
         for _ in 0..max_tokens {
             let id = match &next {
                 Next::Logits(l) => sampler.sample(&l[..l.len().min(self.vocab)]),
+                Next::Argmax { .. } if sampler.guided() => {
+                    bail!("this Core ML model returns only its most likely token: constrained decoding and logprobs need its logits")
+                }
                 Next::Argmax { token, .. } => *token,
             };
             out.push(id);

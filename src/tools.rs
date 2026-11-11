@@ -786,6 +786,16 @@ pub mod qwen {
     /// (Qwen3) `<tool_call>{"name": NAME, "arguments": {...}}</tool_call>`.
     /// Parameter values are JSON when they parse as JSON, strings otherwise (as the template writes).
     pub fn parse_calls(raw: &str) -> Vec<ToolCall> {
+        parse_calls_for(raw, &[])
+    }
+
+    /// [`parse_calls`] with the declared tools: a parameter whose schema says `"type": "string"`
+    /// stays the string the model wrote, also when it reads as JSON (`42`, `true`, `null`).
+    pub fn parse_calls_for(raw: &str, tools: &[ToolSpec]) -> Vec<ToolCall> {
+        let declared_string = |tool: &str, key: &str| {
+            let t = tools.iter().find(|t| t.name == tool);
+            t.and_then(|t| t.parameters.get("properties")?.get(key)?.get("type")?.as_str()) == Some("string")
+        };
         let mut calls = Vec::new();
         let mut rest = raw;
         while let Some(start) = rest.find("<tool_call>") {
@@ -818,7 +828,7 @@ pub mod qwen {
                     let raw_v = v[..ve].trim_matches('\n');
                     let value = serde_json::from_str::<Value>(raw_v.trim())
                         .ok()
-                        .filter(|j| !j.is_string())
+                        .filter(|j| !j.is_string() && !declared_string(&name, &key))
                         .unwrap_or_else(|| Value::String(raw_v.to_string()));
                     arguments.insert(key, value);
                     params = &v[ve.min(v.len())..];
@@ -1199,6 +1209,21 @@ mod tests {
     }
 
     /// DeepSeek V4's DSML calls, as its encoder writes them (two calls, string and JSON values).
+    #[test]
+    fn qwen_string_parameters_stay_strings() {
+        let raw =
+            "<tool_call>\n<function=f>\n<parameter=zip>\n75001\n</parameter>\n<parameter=n>\n3\n</parameter>\n</function>\n</tool_call>";
+        let tool = ToolSpec {
+            name: "f".into(),
+            description: String::new(),
+            parameters: json!({"type": "object", "properties": {"zip": {"type": "string"}, "n": {"type": "integer"}}}),
+        };
+        let typed = qwen::parse_calls_for(raw, &[tool]);
+        assert_eq!(typed[0].arguments["zip"], json!("75001"));
+        assert_eq!(typed[0].arguments["n"], json!(3));
+        assert_eq!(qwen::parse_calls(raw)[0].arguments["zip"], json!(75001));
+    }
+
     #[test]
     fn deepseek_calls_parse() {
         let raw = "Let me compute.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"calculate\">\n<｜DSML｜parameter name=\"expression\" string=\"true\">2+2</｜DSML｜parameter>\n</｜DSML｜invoke>\n<｜DSML｜invoke name=\"search\">\n<｜DSML｜parameter name=\"q\" string=\"true\">a \"b\"</｜DSML｜parameter>\n<｜DSML｜parameter name=\"n\" string=\"false\">[1, 2]</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls><｜end▁of▁sentence｜>";

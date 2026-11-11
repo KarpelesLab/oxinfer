@@ -216,12 +216,21 @@ pub unsafe extern "C" fn oxi_engine_set(e: *mut OxiEngine, key: *const c_char, v
             }
             "think" => g.config_mut().think = num("0 or 1")? != 0.0,
             "max_tokens" => g.config_mut().max_tokens = num("a count")? as usize,
+            "response_format" => {
+                g.config_mut().response_format = match value {
+                    None | Some("") | Some("text") => crate::engine::ResponseFormat::Text,
+                    Some("json_object") => crate::engine::ResponseFormat::JsonObject,
+                    Some(j) => crate::engine::ResponseFormat::from_json(&serde_json::from_str(j).context("response_format is not JSON")?)?,
+                }
+            }
             "temperature" => s.temperature = num("a number")? as f32,
             "top_k" => s.top_k = num("a count")? as usize,
             "top_p" => s.top_p = num("a number")? as f32,
             "seed" => s.seed = v.parse().map_err(|_| anyhow!("seed: expected an integer, got {v:?}"))?,
             "repetition_penalty" => s.repetition_penalty = num("a number")? as f32,
-            _ => bail!("unknown setting {key:?} (system, think, max_tokens, temperature, top_k, top_p, seed, repetition_penalty)"),
+            _ => bail!(
+                "unknown setting {key:?} (system, think, max_tokens, response_format, temperature, top_k, top_p, seed, repetition_penalty)"
+            ),
         }
         if s != g.sampling() {
             g.set_sampling(s);

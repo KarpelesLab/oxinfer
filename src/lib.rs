@@ -24,6 +24,7 @@ pub mod capi;
 pub mod chat;
 pub mod clock;
 pub mod config;
+pub mod constrain;
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
 pub mod coreml;
 #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]

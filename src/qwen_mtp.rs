@@ -431,14 +431,15 @@ impl<'a> QwenMtp<'a> {
             None => out,
         };
         match &self.head {
-            None => sampler.distribution(&model.logits_device(out, 1)),
+            None => sampler.draft_distribution(&model.logits_device(out, 1)),
             Some(d) => {
                 let mut logits = vec![0f32; d.d2t.len()];
                 let unit = crate::stream::enter(&self.stream, 1);
                 linear(&d.head, d.d2t.len(), h, out, 1, &mut logits);
                 drop(unit);
+                // The head's own vocabulary: no filter applies here (verification filters).
                 sampler
-                    .distribution(&logits)
+                    .unguided_distribution(&logits)
                     .into_iter()
                     .map(|(i, p)| (d.d2t[i as usize], p))
                     .collect()
@@ -810,6 +811,7 @@ impl<'m> MtpDecoder<'m> {
             for j in 0..k {
                 let q = mtp.draft_distribution(model, &g, sampler);
                 let d = if sampler.greedy() { q[0].0 } else { sampler.sample_from(&q) };
+                sampler.draft_commit(d);
                 drafts.push(d);
                 qs.push(q);
                 if j + 1 < k {
@@ -873,6 +875,7 @@ impl<'m> MtpDecoder<'m> {
             let p = sampler.distribution(&logits[j * v..(j + 1) * v]);
             match speculative_accept(sampler, &p, q, d) {
                 None => {
+                    sampler.commit(d);
                     out.push(d);
                     accepted += 1;
                     if self.opts.stop.contains(&d) {
@@ -880,6 +883,7 @@ impl<'m> MtpDecoder<'m> {
                     }
                 }
                 Some(t) => {
+                    sampler.commit(t);
                     out.push(t);
                     break;
                 }

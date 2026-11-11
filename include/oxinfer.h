@@ -147,6 +147,12 @@ void oxi_engine_free(OxiEngine *engine);
  *   system       system prompt; NULL value = default prompt (date and time), "" = none
  *   think        0|1 thinking mode
  *   max_tokens   max tokens per reply (default 1024)
+ *   response_format  constrained decoding of the answer (thinking stays free): "json_object"
+ *                (any JSON object), or OpenAI's response_format object as JSON,
+ *                {"type":"json_schema","json_schema":{"schema":{...}}} (objects with properties /
+ *                required / additionalProperties:false, arrays with items / minItems / maxItems,
+ *                string, number, integer, boolean, null, enum, const, anyOf, $defs / $ref; any
+ *                other keyword is an error); NULL, "" or "text" = unconstrained (default)
  *   temperature  0 = greedy (default)
  *   top_k, top_p, seed
  *   repetition_penalty  1 = off (default); > 1 penalizes tokens already generated

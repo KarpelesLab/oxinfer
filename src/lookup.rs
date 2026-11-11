@@ -627,6 +627,7 @@ pub fn accept(sampler: &mut Sampler, logits: &[f32], v: usize, drafts: &[u32], s
     for (j, &d) in drafts.iter().enumerate() {
         let p = sampler.distribution(&logits[j * v..(j + 1) * v]);
         let t = speculative_accept(sampler, &p, &[(d, 1.0)], d).unwrap_or(d);
+        sampler.commit(t);
         if penalty {
             sampler.observe(&[t]);
         }
@@ -913,6 +914,71 @@ mod tests {
                 assert!(st.accepted < st.drafted, "some drafts rejected: {st:?}");
             }
         }
+    }
+
+    /// A filter whose mask depends on the token before: forbids the tokens whose sum with it is
+    /// a multiple of 5 (the toy's usual successor of 2 and 7 among them).
+    #[derive(Clone)]
+    struct NotLikeLast(u32);
+    impl crate::sampler::TokenFilter for NotLikeLast {
+        fn mask(&mut self, logits: &mut [f32]) {
+            for (i, l) in logits.iter_mut().enumerate() {
+                if (i as u32 + self.0).is_multiple_of(5) {
+                    *l = f32::NEG_INFINITY;
+                }
+            }
+        }
+        fn accept(&mut self, token: u32) {
+            self.0 = token;
+        }
+        fn fork(&self) -> Box<dyn crate::sampler::TokenFilter> {
+            Box::new(self.clone())
+        }
+        fn complete(&self) -> bool {
+            true
+        }
+    }
+
+    /// With a filter and a log-probability record on the sampler (constrained decoding),
+    /// prompt-lookup rounds give the tokens and the record of plain decoding under the same
+    /// filter: verification masks every position, and drafts outside the filter are rejected.
+    #[test]
+    fn guided_lookup_matches_guided_plain_decoding() {
+        let prompt: Vec<u32> = (0..12).chain(0..12).chain([3, 4, 5]).collect();
+        let guided = || {
+            let mut s = Sampler::new(0.0, 0, 1.0, 1);
+            let log = s.set_guide(Some(Box::new(NotLikeLast(5))), Some(2));
+            (s, log)
+        };
+        let (mut s, want_log) = guided();
+        let want = plain(&prompt, &mut s, 150);
+        assert_eq!(s.take_guide().unwrap().tokens, want);
+        assert!(want.windows(2).all(|w| !(w[0] + w[1]).is_multiple_of(5)) && !want[0].is_multiple_of(5));
+        // The filter changes the reply: the test would pass trivially otherwise.
+        assert_ne!(want, plain(&prompt, &mut Sampler::new(0.0, 0, 1.0, 1), 150));
+
+        let toy = Toy;
+        let mut sess = toy.new_session();
+        let mut lk = Lookup::new(LookupOptions {
+            cost_aware: false,
+            ..Default::default()
+        });
+        let hs = crate::generate::prefill(&toy, &mut sess, &prompt, 3, &[]);
+        lk.extend(&prompt);
+        let lg = toy.logits(&hs[hs.len() - H..], 1);
+        let (mut s, log) = guided();
+        let (d, st) = {
+            let mut dec = LookupRounds::new(&toy, &mut sess, &mut lk);
+            let d = crate::generate::decode_rounds(&mut dec, &lg, &mut s, &[], 150, &mut |_| Flow::Continue);
+            (d, dec.stats.clone())
+        };
+        assert_eq!(d.tokens, want);
+        assert_eq!(s.take_guide().unwrap().tokens, want, "every committed token reached the guide");
+        assert_eq!(*log.lock().unwrap(), *want_log.lock().unwrap());
+        assert!(
+            st.drafted > 0 && st.accepted > 0 && st.accepted < st.drafted,
+            "drafts accepted and rejected: {st:?}"
+        );
     }
 
     /// Sampled prompt-lookup decoding keeps the target's distribution: the first token after a

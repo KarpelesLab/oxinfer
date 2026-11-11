@@ -56,6 +56,17 @@ pub trait ChatFormat {
     fn tool_call_marker(&self) -> &'static str;
     /// Tool calls in a reply decoded with its special tokens.
     fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall>;
+    /// [`ChatFormat::parse_tool_calls`] knowing the declared tools: formats that write string
+    /// arguments bare keep a parameter declared as a string a string (`"42"`, `"true"`).
+    fn parse_tool_calls_for(&self, raw: &str, tools: &[ToolSpec]) -> Vec<ToolCall> {
+        let _ = tools;
+        self.parse_tool_calls(raw)
+    }
+    /// How the model writes a tool call, for a forced one ([`crate::constrain`]); None when
+    /// the format has no tool calling.
+    fn tool_syntax(&self) -> Option<crate::constrain::ToolSyntax> {
+        None
+    }
     /// What to feed after a reply that ended on its tool calls (its stop token was sampled but not
     /// fed): the results, up to where the model continues.
     fn tool_results(&self, results: &[ToolResult], think: bool) -> String;
@@ -111,6 +122,9 @@ impl ChatFormat for GemmaChat {
     }
     fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
         crate::tools::gemma::parse_calls(raw)
+    }
+    fn tool_syntax(&self) -> Option<crate::constrain::ToolSyntax> {
+        Some(crate::constrain::ToolSyntax::Gemma)
     }
     fn tool_results(&self, results: &[ToolResult], think: bool) -> String {
         // The model stopped on `<|tool_response>`; the responses continue the same model turn.
@@ -185,6 +199,9 @@ impl ChatFormat for GemmaChatLarge {
     }
     fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
         GemmaChat.parse_tool_calls(raw)
+    }
+    fn tool_syntax(&self) -> Option<crate::constrain::ToolSyntax> {
+        GemmaChat.tool_syntax()
     }
     fn tool_results(&self, results: &[ToolResult], think: bool) -> String {
         GemmaChat.tool_results(results, think)
@@ -355,6 +372,16 @@ impl ChatFormat for QwenChat {
     }
     fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
         crate::tools::qwen::parse_calls(raw)
+    }
+    fn parse_tool_calls_for(&self, raw: &str, tools: &[ToolSpec]) -> Vec<ToolCall> {
+        crate::tools::qwen::parse_calls_for(raw, tools)
+    }
+    fn tool_syntax(&self) -> Option<crate::constrain::ToolSyntax> {
+        Some(if self.qwen3 {
+            crate::constrain::ToolSyntax::QwenJson
+        } else {
+            crate::constrain::ToolSyntax::QwenXml
+        })
     }
     fn tool_results(&self, results: &[ToolResult], think: bool) -> String {
         // The assistant turn ended (<|im_end|> was sampled, not fed); results come as a user turn.
@@ -612,6 +639,9 @@ impl ChatFormat for MistralChat {
     fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
         crate::tools::mistral::parse_calls(raw)
     }
+    fn tool_syntax(&self) -> Option<crate::constrain::ToolSyntax> {
+        Some(crate::constrain::ToolSyntax::Mistral)
+    }
     fn tool_results(&self, results: &[ToolResult], _think: bool) -> String {
         // The reply ended on `</s>` (sampled, not fed); the results follow it.
         let mut s = String::from("</s>");
@@ -679,6 +709,9 @@ impl ChatFormat for DeepSeekChat {
     }
     fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
         crate::tools::deepseek::parse_calls(raw)
+    }
+    fn tool_syntax(&self) -> Option<crate::constrain::ToolSyntax> {
+        Some(crate::constrain::ToolSyntax::Dsml)
     }
     fn tool_results(&self, results: &[ToolResult], think: bool) -> String {
         // The reply ended on its end-of-sentence token (sampled, not fed); the results are a user

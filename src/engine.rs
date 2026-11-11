@@ -71,7 +71,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+pub use crate::constrain::{ResponseFormat, ToolChoice};
 pub use crate::generate::{Flow, StopReason};
+pub use crate::sampler::TokenLogprob;
 
 /// How to load and run a model. Construct with `EngineOptions::default()` and set fields (or
 /// [`EngineOptions::set`] key-value pairs); new options are added as new fields and keys.
@@ -787,6 +789,16 @@ pub struct ChatConfig {
     /// with [`Engine::send_tool_results`]. [`crate::tools::builtin_specs`] and
     /// [`crate::tools::run_builtin`] are the CLI's built-in tools.
     pub tools: Vec<ToolSpec>,
+    /// What the answer must be: text, a JSON object or a JSON value of a schema, enforced while
+    /// decoding ([`crate::constrain`]). Thinking is not constrained. With tools declared the
+    /// model may still call one instead (the call then follows the tool's schema).
+    pub response_format: ResponseFormat,
+    /// Whether the reply must be a tool call (of any of `tools`, or of one), written in the
+    /// model's call syntax with arguments of the tool's parameter schema.
+    pub tool_choice: ToolChoice,
+    /// Records the log probability of every generated token and of this many most likely
+    /// alternatives ([`Reply::logprobs`], [`Delta::logprob`]).
+    pub logprobs: Option<usize>,
 }
 
 impl Default for ChatConfig {
@@ -796,6 +808,9 @@ impl Default for ChatConfig {
             think: false,
             max_tokens: 1024,
             tools: Vec::new(),
+            response_format: ResponseFormat::Text,
+            tool_choice: ToolChoice::Auto,
+            logprobs: None,
         }
     }
 }
@@ -810,6 +825,8 @@ pub struct Delta<'a> {
     pub text: &'a str,
     /// Whether the text belongs to a thinking block.
     pub thinking: bool,
+    /// The token's log probability ([`ChatConfig::logprobs`]).
+    pub logprob: Option<&'a TokenLogprob>,
 }
 
 /// Timings and counters of the last turn.
@@ -863,8 +880,11 @@ pub struct Reply {
     /// Generated token ids, including the stop token if one ended the reply.
     pub tokens: Vec<u32>,
     pub finish: StopReason,
-    /// Tool calls the reply ended on (only with [`ChatConfig::tools`]).
+    /// Tool calls the reply ended on (only with [`ChatConfig::tools`]). A forced call
+    /// ([`ChatConfig::tool_choice`]) cut short by the token limit is not reported.
     pub tool_calls: Vec<ToolCall>,
+    /// With [`ChatConfig::logprobs`]: one entry per token of `tokens`.
+    pub logprobs: Vec<TokenLogprob>,
     pub stats: Stats,
 }
 
@@ -1241,6 +1261,8 @@ pub struct Engine {
     lookup: Option<crate::lookup::Lookup>,
     /// The tokens in the cache (valid when as long as the cache).
     history: Vec<u32>,
+    /// The vocabulary and compiled grammars of constrained replies ([`ChatConfig::response_format`]).
+    constrain: crate::constrain::Cache,
     /// The prompt cache ([`EngineOptions::prompt_cache`]), its minimum, and whether the
     /// conversation waits to be stored.
     pcache: Option<crate::snapshot::PromptCache>,
@@ -1792,6 +1814,7 @@ impl Engine {
             },
             lookup,
             history: Vec::new(),
+            constrain: Default::default(),
             pcache,
             pcache_min: opts.prompt_cache_min_tokens.unwrap_or(64),
             pcache_pending: false,
@@ -1861,6 +1884,7 @@ impl Engine {
             iv: IvState::default(),
             lookup: None,
             history: Vec::new(),
+            constrain: Default::default(),
             pcache: None,
             pcache_min: 0,
             pcache_pending: false,
@@ -1908,6 +1932,12 @@ impl Engine {
     }
 
     /// Replaces the sampler (and reseeds it).
+    /// The bytes every token adds to decoded text (computed on first use): what
+    /// [`TokenLogprob`] entries are shown with, and what constrained decoding reads.
+    pub fn token_vocab(&mut self) -> Arc<crate::constrain::Vocab> {
+        self.constrain.vocab(&self.tok)
+    }
+
     pub fn set_sampling(&mut self, s: SamplingParams) {
         self.sampling = s;
         self.sampler = sampler_for(&s);
@@ -2664,29 +2694,51 @@ impl PendingTurn {
             draft_tokens,
             cancel,
             lookup,
+            constrain,
             ..
         } = e;
         let tok: &Tokenizer = tok;
         let chunk = *prefill_chunk;
         cancel.store(false, Ordering::SeqCst);
 
+        // What the reply must be and the log probabilities to record ride on the sampler, so
+        // every decoding loop that samples through it follows them.
+        let constraint = constrain.constraint(tok, *fmt, &config.response_format, &config.tool_choice, &config.tools, think, stop)?;
+        let log = sampler.set_guide(
+            constraint.map(|c| Box::new(c) as Box<dyn crate::sampler::TokenFilter>),
+            config.logprobs,
+        );
+        let guided = sampler.guided();
+        let call_id = Some(fmt.tool_call_marker())
+            .filter(|m| !m.is_empty())
+            .and_then(|m| tok.token_to_id(m));
+
         let mut stream = TextStream::new(*fmt, think, tok);
         let (mut text, mut thinking) = (String::new(), String::new());
         let cancel_flag = cancel.clone();
+        let mut called = false;
         let mut cb = |out: &[u32]| -> GFlow {
             let id = *out.last().unwrap();
-            stream.on_token(id);
+            let delimiter = stream.on_token(id);
             let d = stream.delta(tok, out, false);
             let th = stream.thinking();
+            called |= Some(id) == call_id;
             if th {
                 thinking.push_str(&d);
             } else {
                 text.push_str(&d);
             }
+            let logprob = config.logprobs.and_then(|_| {
+                let log = log.lock().unwrap_or_else(|p| p.into_inner());
+                let mut e = log.get(out.len() - 1).filter(|e| e.token == id)?.clone();
+                e.content = !(delimiter || th || called);
+                Some(e)
+            });
             let f = on_delta(&Delta {
                 token: Some(id),
                 text: &d,
                 thinking: th,
+                logprob: logprob.as_ref(),
             });
             if cancel_flag.load(Ordering::SeqCst) { GFlow::Stop } else { f }
         };
@@ -2736,7 +2788,8 @@ impl PendingTurn {
                 let max = limit(sess.pos);
                 match *drafter {
                     _ if max == 0 => empty(0.0),
-                    Some(dr) => {
+                    // The drafter's loop is greedy and does not sample: guided replies decode plainly.
+                    Some(dr) if !guided => {
                         let base = sess.pos;
                         let (d, ss) = generate::decode_speculative(model, dr, sess, last, *draft_tokens, stop, max, &mut cb);
                         // Keep the reply in the cache up to (not including) its last token.
@@ -2745,7 +2798,7 @@ impl PendingTurn {
                         st.accepted = ss.accepted;
                         d
                     }
-                    None => {
+                    _ => {
                         let logits = model.logits(&last, 1);
                         plain!(*model, sess, base, logits, max)
                     }
@@ -2901,17 +2954,34 @@ impl PendingTurn {
                 token: None,
                 text: &rest,
                 thinking: th,
+                logprob: None,
             });
         }
+        // The guide saw every token of the reply, or a loop sampled around it.
+        let report = sampler.take_guide();
+        if report.as_ref().is_some_and(|r| r.tokens != d.tokens) {
+            bail!("internal error: the reply's tokens did not all go through the sampler's guide (constraint, logprobs)");
+        }
+        let mut logprobs = std::mem::take(&mut *log.lock().unwrap_or_else(|p| p.into_inner()));
+        if !logprobs.is_empty() {
+            let (mut ts, mut called) = (TextStream::new(*fmt, think, tok), false);
+            for (e, &t) in logprobs.iter_mut().zip(&d.tokens) {
+                let delimiter = ts.on_token(t);
+                called |= Some(t) == call_id;
+                e.content = !(delimiter || ts.thinking() || called || stop.contains(&t));
+            }
+        }
+        // A forced call that the token limit cut short is not a call.
+        let cut_call = config.tool_choice != ToolChoice::Auto && report.and_then(|r| r.complete) == Some(false);
         st.generated_tokens = shown.len();
         st.decode_secs = d.secs;
         st.forwards = d.forwards;
         st.context_tokens = lm.context_len() + usize::from(d.unfed.is_some());
-        let tool_calls = if config.tools.is_empty() {
+        let tool_calls = if config.tools.is_empty() || cut_call {
             Vec::new()
         } else {
             let raw = tok.decode(&d.tokens, false).map_err(|e| anyhow!("decode: {e}"))?;
-            fmt.parse_tool_calls(&raw)
+            fmt.parse_tool_calls_for(&raw, &config.tools)
         };
         e.unfed = d.unfed;
         e.stats = st.clone();
@@ -2926,6 +2996,7 @@ impl PendingTurn {
             tokens: d.tokens,
             finish: d.reason,
             tool_calls,
+            logprobs,
             stats: st,
         })
     }
