@@ -1,7 +1,9 @@
 //! The Stable Diffusion 1.x / 2.x denoiser (diffusers `UNet2DConditionModel`): ResNet blocks with
 //! timestep conditioning, spatial transformers with self- and cross-attention to the text
 //! embedding, and skip connections from the down path to the up path. Channel counts are taken
-//! from the weight shapes, so the same code loads SD 1.5, SD 2.1 and SD-Turbo.
+//! from the weight shapes, so the same code loads SD 1.5, SD 2.1, SD-Turbo and SDXL (several
+//! transformer layers per block, none at the top level, and the added size / pooled-text
+//! conditioning of `xl.rs`).
 
 use super::ops::{
     Conv, GroupNorm, LayerNorm, Linear, Pre, Tensors, attention, concat_channels, gelu_erf, silu_inplace, timestep_embedding, upsample2x,
@@ -208,6 +210,8 @@ pub struct Unet {
     pub in_channels: usize,
     pub sample_size: usize,
     pub cross_dim: usize,
+    /// SDXL's added conditioning (`addition_embed_type: "text_time"`).
+    pub add: Option<super::xl::AddEmbed>,
 }
 
 fn count(t: &Tensors, f: impl Fn(usize) -> String) -> usize {
@@ -235,11 +239,14 @@ impl Unet {
             _ => vec![8; n_blocks],
         };
         let eps = cfg["norm_eps"].as_f64().unwrap_or(1e-5) as f32;
-        for (k, want) in [("class_embed_type", None), ("addition_embed_type", None)] {
-            if cfg[k].as_str() != want {
-                bail!("UNet {k} = {} is not supported (SDXL-style conditioning)", cfg[k]);
-            }
+        if !cfg["class_embed_type"].is_null() {
+            bail!("UNet class_embed_type = {} is not supported", cfg["class_embed_type"]);
         }
+        let add = match cfg["addition_embed_type"].as_str() {
+            None => None,
+            Some("text_time") => Some(super::xl::AddEmbed::load(&t, &cfg)?),
+            Some(other) => bail!("UNet addition_embed_type = {other} is not supported"),
+        };
         let mut downs = Vec::with_capacity(n_blocks);
         for i in 0..n_blocks {
             let p = format!("down_blocks.{i}");
@@ -298,16 +305,42 @@ impl Unet {
             freq_shift: cfg["freq_shift"].as_f64().unwrap_or(0.0) as f32,
             sample_size: cfg["sample_size"].as_u64().unwrap_or(64) as usize,
             cross_dim: cfg["cross_attention_dim"].as_u64().unwrap_or(768) as usize,
+            add,
         })
+    }
+
+    /// How much the down path shrinks each side (2 per downsampler): the latent's sides must
+    /// be multiples of it.
+    pub fn down_factor(&self) -> usize {
+        1 << self.downs.iter().filter(|b| b.down.is_some()).count()
     }
 
     /// Predicted noise (or v) for `latent` (`[h*w, in_channels]`) at timestep `timestep`, given the
     /// text embedding `ctx` (`[m, cross_dim]`).
     pub fn forward(&self, latent: &[f32], h: usize, w: usize, timestep: f32, ctx: &[f32], m: usize) -> Vec<f32> {
+        self.forward_added(latent, h, w, timestep, ctx, m, None)
+    }
+
+    /// [`Unet::forward`] with SDXL's added embedding ([`super::xl::AddEmbed::forward`]: pooled
+    /// text and size conditioning), which joins the time embedding.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_added(
+        &self,
+        latent: &[f32],
+        h: usize,
+        w: usize,
+        timestep: f32,
+        ctx: &[f32],
+        m: usize,
+        added: Option<&[f32]>,
+    ) -> Vec<f32> {
         let te = timestep_embedding(timestep, self.time_dim, self.flip_sin_to_cos, self.freq_shift);
         let mut temb = self.t1.forward(&te, 1);
         silu_inplace(&mut temb);
         let mut temb = self.t2.forward(&temb, 1);
+        if let Some(a) = added {
+            add_inplace(&mut temb, a);
+        }
         // Every ResNet applies SiLU to the embedding before its projection.
         silu_inplace(&mut temb);
         let temb = Some(&temb[..]);

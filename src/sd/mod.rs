@@ -1,7 +1,9 @@
-//! Text-to-image with Stable Diffusion 1.x / 2.x and SD-Turbo from a diffusers folder
-//! (`model_index.json`, `text_encoder/`, `tokenizer/`, `unet/`, `vae/`, `scheduler/`), and image
-//! editing: image-to-image, inpainting (dedicated 9-channel inpainting UNets, or mask blending
-//! with a text-to-image one) and InstructPix2Pix instruction edits ([`Pipeline::generate_from`]).
+//! Text-to-image with Stable Diffusion 1.x / 2.x, SD-Turbo and Stable Diffusion XL (base and
+//! SDXL-Turbo; what XL adds is in `xl.rs`) from a diffusers folder (`model_index.json`,
+//! `text_encoder/`, `tokenizer/`, `unet/`, `vae/`, `scheduler/`; `text_encoder_2/` and
+//! `tokenizer_2/` for XL), and image editing: image-to-image, inpainting (dedicated 9-channel
+//! inpainting UNets, or mask blending with a text-to-image one) and InstructPix2Pix instruction
+//! edits ([`Pipeline::generate_from`]).
 //!
 //! The UNet's convolutions run through the same matmul as the language models, so they use the
 //! SIMD kernels on every CPU and the GPU backends (Metal, CUDA, WebGPU) when one is active.
@@ -12,6 +14,7 @@ pub mod ops;
 pub mod sched;
 pub mod unet;
 pub mod vae;
+pub mod xl;
 
 use crate::clock::Instant;
 use crate::video::RgbImage;
@@ -32,6 +35,11 @@ pub struct Pipeline {
     pub schedule: Schedule,
     /// Distilled single-step models (SD-Turbo) default to 1 step and no guidance.
     pub turbo: bool,
+    /// Stable Diffusion XL: the second text encoder (None for SD 1.x / 2.x).
+    pub xl: Option<xl::TextXl>,
+    /// SDXL's size conditioning; None (the default) uses the output size and no crop, as
+    /// diffusers does ([`xl::SizeCond::for_image`]).
+    pub size_cond: Option<xl::SizeCond>,
 }
 
 pub struct Params {
@@ -137,8 +145,12 @@ impl Pipeline {
         }
         let index: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("model_index.json"))?)?;
         let class = index["_class_name"].as_str().unwrap_or("");
-        if class.contains("XL") || class.contains("StableDiffusion3") || class.contains("Flux") {
-            bail!("{class} is not supported yet (Stable Diffusion 1.x / 2.x and SD-Turbo are)");
+        if class.contains("StableDiffusion3") || class.contains("Flux") {
+            bail!("{class} is not supported here (Stable Diffusion 1.x / 2.x, SD-Turbo and SDXL are)");
+        }
+        let is_xl = class.contains("XL");
+        if is_xl && (!index["text_encoder"].is_array() || !index["text_encoder_2"].is_array()) {
+            bail!("{class} without both text encoders (the SDXL refiner) is not supported: use the SDXL base model");
         }
         let te = dir.join("text_encoder");
         let un = dir.join("unet");
@@ -151,21 +163,42 @@ impl Pipeline {
             un_t.set_lora(set.resolve(lora::Part::Unet, &un_t)?);
         }
         let text = clip::ClipText::load(&te, te_t)?;
+        let xl = if is_xl {
+            let mut t2 = ops::Tensors::open(&weights(&dir.join("text_encoder_2"), "model")?)?;
+            if !set.is_empty() {
+                t2.set_lora(set.resolve(lora::Part::Text2, &t2)?);
+            }
+            Some(xl::TextXl::load(dir, &index, t2)?)
+        } else {
+            None
+        };
         let unet = unet::Unet::load(&un, un_t)?;
         if !set.is_empty() {
             for line in set.report()? {
                 report(&line);
             }
         }
-        if unet.cross_dim != text.hidden {
+        let text_dim = xl.as_ref().map_or(text.hidden, |x| x.cross_dim(&text));
+        if unet.cross_dim != text_dim {
             bail!(
-                "text encoder width {} does not match the UNet's cross-attention width {}",
-                text.hidden,
+                "text encoder width {text_dim} does not match the UNet's cross-attention width {}",
                 unet.cross_dim
             );
         }
+        match (&unet.add, &xl) {
+            (Some(a), Some(x)) if a.pooled_dim(6) != Some(x.pooled_dim()) => bail!(
+                "this UNet's added conditioning does not take a {}-wide pooled embedding and 6 size ids (the SDXL refiner is not supported)",
+                x.pooled_dim()
+            ),
+            (Some(_), None) => bail!("this UNet takes SDXL's added conditioning, but the pipeline has no second text encoder"),
+            (None, Some(_)) => bail!("an SDXL pipeline whose UNet has no added conditioning (addition_embed_type) is not supported"),
+            _ => {}
+        }
         let vae_weights = weights(&va, "diffusion_pytorch_model")?;
         let vae = vae::VaeDecoder::load(&va, &vae_weights)?;
+        if is_xl && unet.in_channels == 2 * vae.latent_channels {
+            bail!("SDXL InstructPix2Pix models are not supported");
+        }
         // Distilled single-step models are named as such (folder, or the name recorded at export).
         let name = format!("{} {}", dir.to_string_lossy(), index["_name_or_path"].as_str().unwrap_or("")).to_lowercase();
         Ok(Self {
@@ -178,6 +211,54 @@ impl Pipeline {
             cancel: Default::default(),
             schedule: Schedule::load(&dir.join("scheduler").join("scheduler_config.json"))?,
             turbo: name.contains("turbo"),
+            xl,
+            size_cond: None,
+        })
+    }
+
+    /// The sampler used when none is asked for: Euler ancestral, or for SDXL the one its
+    /// scheduler config names (Euler for the base model, Euler ancestral for SDXL-Turbo).
+    pub fn default_sampler(&self) -> Sampler {
+        if self.is_xl() && !self.schedule.ancestral {
+            Sampler::Euler
+        } else {
+            Sampler::EulerAncestral
+        }
+    }
+
+    /// The guidance scale used when none is asked for (diffusers' defaults): 0 for turbo models,
+    /// 5 for SDXL, 7.5 otherwise.
+    pub fn default_guidance(&self) -> f32 {
+        match (self.turbo, self.is_xl()) {
+            (true, _) => 0.0,
+            (false, true) => 5.0,
+            (false, false) => 7.5,
+        }
+    }
+
+    /// True for a Stable Diffusion XL pipeline.
+    pub fn is_xl(&self) -> bool {
+        self.xl.is_some()
+    }
+
+    /// The conditioning of a prompt: the text context and, for SDXL, the added embedding
+    /// (pooled text + size ids) for a `width` x `height` image.
+    fn condition(&self, text: &str, negative: bool, width: usize, height: usize) -> Result<Cond> {
+        let Some(x) = &self.xl else {
+            return Ok(Cond {
+                ctx: self.encode_prompt(text),
+                added: None,
+            });
+        };
+        let c = x.encode(&self.tokenizer, &self.text, text, negative);
+        if !negative {
+            dump_raw("text_pooled.bin", c.pooled.as_deref().unwrap_or(&[]));
+        }
+        let ids = self.size_cond.unwrap_or(xl::SizeCond::for_image(width, height)).ids();
+        let add = self.unet.add.as_ref().context("SDXL UNet without added conditioning")?;
+        Ok(Cond {
+            added: Some(add.forward(c.pooled.as_deref().unwrap_or(&[]), &ids)?),
+            ctx: c.ctx,
         })
     }
 
@@ -328,10 +409,11 @@ impl Pipeline {
         if !width.is_multiple_of(8) || !height.is_multiple_of(8) || width < 64 || height < 64 {
             bail!("image size must be a multiple of 8 and at least 64 (got {width}x{height})");
         }
-        // Three 2x downsamplings in the UNet: the latent side must divide by 8.
+        // The 2x downsamplings in the UNet (three; two for SDXL): the latent side must divide by them.
         let (lh, lw) = (height / 8, width / 8);
-        if !lh.is_multiple_of(8) || !lw.is_multiple_of(8) {
-            bail!("image size must be a multiple of 64 for this UNet (got {width}x{height})");
+        let df = self.unet.down_factor();
+        if !lh.is_multiple_of(df) || !lw.is_multiple_of(df) {
+            bail!("image size must be a multiple of {} for this UNet (got {width}x{height})", 8 * df);
         }
         let n = lh * lw;
         let lc = self.vae.latent_channels;
@@ -360,17 +442,21 @@ impl Pipeline {
         self.cancel.store(false, Relaxed);
         let mut tm = Timings::default();
         let t0 = Instant::now();
-        let m = self.tokenizer.max_len;
-        let cond = self.encode_prompt(&p.prompt);
+        let cond = self.condition(&p.prompt, false, width, height)?;
+        let m = cond.ctx.len() / self.unet.cross_dim;
         let guided = match kind {
             Some(EditKind::Instruct) => p.guidance > 1.0 && image_guidance >= 1.0,
             _ => p.guidance > 1.0,
         };
-        let uncond = if guided { Some(self.encode_prompt(&p.negative)) } else { None };
-        dump_raw("text_cond.bin", &cond);
+        let uncond = if guided {
+            Some(self.condition(&p.negative, true, width, height)?)
+        } else {
+            None
+        };
+        dump_raw("text_cond.bin", &cond.ctx);
         tm.text = t0.elapsed().as_secs_f64();
 
-        let (timesteps, sigmas, init) = self.schedule.plan(steps);
+        let (timesteps, sigmas, init) = self.schedule.plan_for(steps, p.sampler);
         let mut rng = Rng::new(p.seed);
 
         // The image and mask at the working size, and their latents.
@@ -449,20 +535,21 @@ impl Pipeline {
                 Some((ex, ce)) => concat_channels(&xs, lc, ex, *ce, n),
                 None => xs.clone(),
             };
-            let mut out = self.unet.forward(&xin, lh, lw, t as f32, &cond, m);
+            let unet = |x: &[f32], c: &Cond| self.unet.forward_added(x, lh, lw, t as f32, &c.ctx, m, c.added.as_deref());
+            let mut out = unet(&xin, &cond);
             tm.unet_calls += 1;
             if let Some(u) = &uncond {
                 if kind == Some(EditKind::Instruct) {
                     // Three passes: text + image, image only, neither (image latents zeroed).
-                    let img = self.unet.forward(&xin, lh, lw, t as f32, u, m);
+                    let img = unet(&xin, u);
                     let xin0 = concat_channels(&xs, lc, &zeros, lc, n);
-                    let un = self.unet.forward(&xin0, lh, lw, t as f32, u, m);
+                    let un = unet(&xin0, u);
                     tm.unet_calls += 2;
                     for ((o, &im), &un) in out.iter_mut().zip(&img).zip(&un) {
                         *o = un + p.guidance * (*o - im) + image_guidance * (im - un);
                     }
                 } else {
-                    let un = self.unet.forward(&xin, lh, lw, t as f32, u, m);
+                    let un = unet(&xin, u);
                     tm.unet_calls += 1;
                     for (o, &n) in out.iter_mut().zip(&un) {
                         *o = n + p.guidance * (*o - n);
@@ -500,6 +587,14 @@ impl Pipeline {
         tm.decode = t2.elapsed().as_secs_f64();
         Ok((Image { width: w, height: h, rgb }, tm))
     }
+}
+
+/// The conditioning of one prompt for the UNet.
+struct Cond {
+    /// `[tokens, cross_dim]`.
+    ctx: Vec<f32>,
+    /// SDXL's added embedding (pooled text + size ids).
+    added: Option<Vec<f32>>,
 }
 
 /// img2img's default strength (diffusers' `StableDiffusionImg2ImgPipeline`).

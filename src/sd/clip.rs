@@ -1,7 +1,8 @@
 //! CLIP text side of Stable Diffusion: the byte-level BPE tokenizer (`tokenizer/vocab.json` +
 //! `merges.txt`, as `transformers.CLIPTokenizer`) and the text transformer (`text_encoder/`,
 //! `CLIPTextModel`: pre-LN blocks, causal self-attention, final layer norm). SD 1.x uses OpenAI
-//! CLIP ViT-L/14 (768 wide, quick_gelu); SD 2.x and SD-Turbo use OpenCLIP ViT-H (1024, gelu).
+//! CLIP ViT-L/14 (768 wide, quick_gelu); SD 2.x and SD-Turbo use OpenCLIP ViT-H (1024, gelu); SDXL
+//! uses both ViT-L and OpenCLIP bigG (1280, gelu, with its text projection: see `xl.rs`).
 
 use super::ops::{LayerNorm, Linear, Tensors, attention, gelu_erf, quick_gelu};
 use crate::kernels::{add_inplace, for_chunks};
@@ -161,6 +162,8 @@ pub struct ClipText {
     act: Act,
     heads: usize,
     pub hidden: usize,
+    /// `text_projection` of a `CLIPTextModelWithProjection` (SDXL's second encoder).
+    proj: Option<Linear>,
 }
 
 impl ClipText {
@@ -206,11 +209,56 @@ impl ClipText {
             act,
             heads,
             hidden,
+            proj: if t.has("text_projection.weight") {
+                Some(Linear::load(&t, "text_projection")?)
+            } else {
+                None
+            },
         })
     }
 
     /// Last hidden state (after the final layer norm) for `ids`: `[ids.len(), hidden]`.
     pub fn forward(&self, ids: &[u32]) -> Vec<f32> {
+        let t = ids.len();
+        let mut x = self.embed(ids);
+        for l in &self.layers {
+            self.layer(l, &mut x, t);
+        }
+        self.final_ln.forward(&x, t)
+    }
+
+    /// What SDXL conditions on: the penultimate hidden state (`hidden_states[-2]`, before the
+    /// last layer and the final layer norm; `[ids.len(), hidden]`) and the pooled embedding (the
+    /// final hidden state at the end-of-text token, through `text_projection` when the model
+    /// has one, as `CLIPTextModelWithProjection.text_embeds`).
+    pub fn forward_penultimate(&self, ids: &[u32]) -> (Vec<f32>, Vec<f32>) {
+        let (t, h) = (ids.len(), self.hidden);
+        let mut x = self.embed(ids);
+        let n = self.layers.len();
+        for l in &self.layers[..n.saturating_sub(1)] {
+            self.layer(l, &mut x, t);
+        }
+        let penultimate = x.clone();
+        if let Some(l) = self.layers.last() {
+            self.layer(l, &mut x, t);
+        }
+        // The end-of-text token has the highest id: its first position (transformers' argmax).
+        let eos = (0..t).rev().max_by_key(|&i| ids[i]).unwrap_or(0);
+        let pooled = self.final_ln.forward(&x[eos * h..(eos + 1) * h], 1);
+        let pooled = match &self.proj {
+            Some(p) => p.forward(&pooled, 1),
+            None => pooled,
+        };
+        (penultimate, pooled)
+    }
+
+    /// Width of the pooled embedding of [`ClipText::forward_penultimate`].
+    pub fn pooled_dim(&self) -> usize {
+        self.proj.as_ref().map_or(self.hidden, |p| p.n_out)
+    }
+
+    /// Token plus position embeddings: `[ids.len(), hidden]`.
+    fn embed(&self, ids: &[u32]) -> Vec<f32> {
         let (t, h) = (ids.len(), self.hidden);
         let mut x = vec![0f32; t * h];
         for_chunks(&mut x, h, false, |i, r| {
@@ -227,19 +275,22 @@ impl ClipText {
                 *o += p;
             }
         });
-        for l in &self.layers {
-            let y = l.ln1.forward(&x, t);
-            let (q, k, v) = (l.q.forward(&y, t), l.k.forward(&y, t), l.v.forward(&y, t));
-            let a = attention(&q, &k, &v, t, t, self.heads, h / self.heads, true);
-            add_inplace(&mut x, &l.o.forward(&a, t));
-            let y = l.ln2.forward(&x, t);
-            let mut m = l.fc1.forward(&y, t);
-            match self.act {
-                Act::Gelu => m.iter_mut().for_each(|v| *v = gelu_erf(*v)),
-                Act::QuickGelu => m.iter_mut().for_each(|v| *v = quick_gelu(*v)),
-            }
-            add_inplace(&mut x, &l.fc2.forward(&m, t));
+        x
+    }
+
+    /// One pre-LN block, in place.
+    fn layer(&self, l: &Layer, x: &mut [f32], t: usize) {
+        let h = self.hidden;
+        let y = l.ln1.forward(x, t);
+        let (q, k, v) = (l.q.forward(&y, t), l.k.forward(&y, t), l.v.forward(&y, t));
+        let a = attention(&q, &k, &v, t, t, self.heads, h / self.heads, true);
+        add_inplace(x, &l.o.forward(&a, t));
+        let y = l.ln2.forward(x, t);
+        let mut m = l.fc1.forward(&y, t);
+        match self.act {
+            Act::Gelu => m.iter_mut().for_each(|v| *v = gelu_erf(*v)),
+            Act::QuickGelu => m.iter_mut().for_each(|v| *v = quick_gelu(*v)),
         }
-        self.final_ln.forward(&x, t)
+        add_inplace(x, &l.fc2.forward(&m, t));
     }
 }

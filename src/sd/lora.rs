@@ -4,11 +4,13 @@
 //!
 //! Two key layouts are read:
 //! - kohya / A1111: `lora_unet_<module path with _>.lora_down.weight`, `.lora_up.weight` and
-//!   `.alpha`, and `lora_te_text_model_encoder_...` for the text encoder. The underscore path is
-//!   matched against the underscore form of every weight of the base model.
+//!   `.alpha`, and `lora_te_text_model_encoder_...` for the text encoder (`lora_te1_` and
+//!   `lora_te2_` for SDXL's two). The underscore path is matched against the underscore form of
+//!   every weight of the base model, and for the UNet also against its names in the original
+//!   (SGM) layout, which kohya's SDXL files use (`lora_unet_input_blocks_4_1_...`).
 //! - diffusers / PEFT: `unet.<module>.lora_A.weight` / `.lora_B.weight` (also `.lora.down` /
 //!   `.lora.up`, and the older `processor.to_q_lora.down` attention processors), with
-//!   `text_encoder.` for the text side.
+//!   `text_encoder.` (and SDXL's `text_encoder_2.`) for the text side.
 //!
 //! On a convolution (LoCon) the down projection is itself a convolution (`[rank, in, kh, kw]`)
 //! and the up projection a 1x1 one (`[out, rank, 1, 1]`), so both flatten to the same product
@@ -56,6 +58,19 @@ impl LoraSpec {
 pub enum Part {
     Unet,
     Text,
+    /// SDXL's second text encoder.
+    Text2,
+}
+
+impl Part {
+    /// The component's name in a diffusers file (key prefix, metadata section).
+    fn section(self) -> &'static str {
+        match self {
+            Part::Unet => "unet",
+            Part::Text => "text_encoder",
+            Part::Text2 => "text_encoder_2",
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -118,7 +133,12 @@ pub struct Loras {
 /// The base model's module path for a key prefix: the part it patches, the path, and whether it
 /// is kohya's underscore form.
 fn target(prefix: &str) -> (Part, String, bool) {
-    for (p, part) in [("lora_unet_", Part::Unet), ("lora_te_", Part::Text), ("lora_te1_", Part::Text)] {
+    for (p, part) in [
+        ("lora_unet_", Part::Unet),
+        ("lora_te_", Part::Text),
+        ("lora_te1_", Part::Text),
+        ("lora_te2_", Part::Text2),
+    ] {
         if let Some(rest) = prefix.strip_prefix(p) {
             return (part, rest.to_string(), true);
         }
@@ -127,6 +147,8 @@ fn target(prefix: &str) -> (Part, String, bool) {
         (Part::Unet, r)
     } else if let Some(r) = prefix.strip_prefix("text_encoder.") {
         (Part::Text, r)
+    } else if let Some(r) = prefix.strip_prefix("text_encoder_2.") {
+        (Part::Text2, r)
     } else {
         (Part::Unet, prefix)
     };
@@ -193,7 +215,7 @@ impl Loras {
                 if let Some(meta) = &meta
                     && m.alpha.is_none()
                 {
-                    m.meta_alpha = peft_alpha(meta, if part == Part::Unet { "unet" } else { "text_encoder" }, &path);
+                    m.meta_alpha = peft_alpha(meta, part.section(), &path);
                 }
                 targets.push((part, path, kohya));
                 modules.push(m);
@@ -223,9 +245,18 @@ impl Loras {
     pub fn resolve(self: &Arc<Self>, part: Part, base: &Tensors) -> Result<Option<Patches>> {
         let me = &**self;
         let kohya: HashMap<String, String> = if me.targets.iter().any(|(p, _, k)| *p == part && *k) {
-            base.names()
-                .filter_map(|n| n.strip_suffix(".weight"))
-                .map(|m| (m.replace('.', "_"), format!("{m}.weight")))
+            // The UNet also under its original (SGM) names: kohya's SDXL files use those.
+            let sgm = if part == Part::Unet {
+                super::xl::sgm_names(base)
+            } else {
+                Vec::new()
+            };
+            sgm.into_iter()
+                .chain(
+                    base.names()
+                        .filter_map(|n| n.strip_suffix(".weight"))
+                        .map(|m| (m.replace('.', "_"), format!("{m}.weight"))),
+                )
                 .collect()
         } else {
             HashMap::new()
@@ -242,7 +273,7 @@ impl Loras {
                 // Text-encoder keys saved from newer transformers lack the `text_model.` level.
                 [format!("{path}.weight"), format!("text_model.{path}.weight")]
                     .into_iter()
-                    .find(|w| base.has(w) && (part == Part::Text || !w.starts_with("text_model.")))
+                    .find(|w| base.has(w) && (part != Part::Unet || !w.starts_with("text_model.")))
             };
             let Some(w) = w else {
                 m.state.store(1, Ordering::Relaxed);
@@ -290,6 +321,10 @@ impl Loras {
             let (merged, unread): (Vec<usize>, Vec<usize>) =
                 matched.into_iter().partition(|&i| self.modules[i].applied.load(Ordering::Relaxed));
             let count = |part| merged.iter().filter(|&&i| self.targets[i].0 == part).count();
+            let text2 = match count(Part::Text2) {
+                0 => String::new(),
+                n => format!(", text encoder 2 {n}"),
+            };
             let mut skipped: Vec<&str> = unmatched.iter().chain(&unread).map(|&i| self.modules[i].key.as_str()).collect();
             skipped.extend(self.unsupported[fi].iter().map(String::as_str));
             if merged.is_empty() {
@@ -303,7 +338,7 @@ impl Loras {
                 );
             }
             let mut s = format!(
-                "[lora {} x{}: {} modules merged (unet {}, text encoder {})",
+                "[lora {} x{}: {} modules merged (unet {}, text encoder {}{text2})",
                 f.name,
                 f.scale,
                 merged.len(),
@@ -386,6 +421,14 @@ mod tests {
         assert_eq!(
             target("lora_te_text_model_encoder_layers_0_mlp_fc1"),
             (Part::Text, "text_model_encoder_layers_0_mlp_fc1".into(), true)
+        );
+        assert_eq!(
+            target("lora_te2_text_model_encoder_layers_31_self_attn_q_proj"),
+            (Part::Text2, "text_model_encoder_layers_31_self_attn_q_proj".into(), true)
+        );
+        assert_eq!(
+            target("text_encoder_2.text_model.encoder.layers.3.mlp.fc2"),
+            (Part::Text2, "text_model.encoder.layers.3.mlp.fc2".into(), false)
         );
         assert_eq!(
             target("unet.down_blocks.0.attentions.0.transformer_blocks.0.attn1.processor.to_out"),
