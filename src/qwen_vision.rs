@@ -64,6 +64,14 @@ pub struct QwenVisionConfig {
     /// Qwen2.5-VL video: M-RoPE time steps per second.
     #[serde(default)]
     pub tokens_per_second: Option<f64>,
+    /// MiniMax M3's CLIP-style tower with 3D RoPE (`crate::minimax_vision`).
+    #[serde(default)]
+    pub minimax_m3: bool,
+    /// MiniMax M3: the projector's width, and the tower's LayerNorm epsilon.
+    #[serde(default)]
+    pub projector_hidden_size: Option<usize>,
+    #[serde(default)]
+    pub layer_norm_eps: Option<f64>,
 }
 
 impl QwenVisionConfig {
@@ -74,7 +82,7 @@ impl QwenVisionConfig {
     pub fn is_qwen25(&self) -> bool {
         self.window_size.is_some()
     }
-    fn rope_theta(&self) -> f64 {
+    pub(crate) fn rope_theta(&self) -> f64 {
         self.rope_parameters
             .as_ref()
             .and_then(|r| r.get("rope_theta"))
@@ -200,6 +208,9 @@ pub struct QwenMmConfig {
     pub video: ProcessorConfig,
     pub image_token_id: u32,
     pub video_token_id: u32,
+    /// What surrounds and fills an image's placeholder in the prompt: start, one per token, end
+    /// (`<|vision_start|>`, `<|image_pad|>`, `<|vision_end|>` for Qwen).
+    pub markers: [&'static str; 3],
     /// The llama.cpp `mmproj` GGUF file the tower comes from (None: the checkpoint's own
     /// `model.visual.*` tensors).
     pub mmproj: Option<PathBuf>,
@@ -208,6 +219,8 @@ pub struct QwenMmConfig {
 /// `clip.projector_type` of the llama.cpp mmproj files of the Qwen3-VL-style towers (Qwen3.5 /
 /// 3.6 / 3.8, Qwen3.8-Flash-Next).
 pub const MMPROJ_TYPE: &str = "qwen3vl_merger";
+/// `clip.projector_type` of MiniMax M3's mmproj files (`crate::minimax_vision`).
+pub const MMPROJ_MINIMAX_M3: &str = "minimax_m3";
 
 impl QwenMmConfig {
     /// [`QwenMmConfig::load`] with the tower chosen by `mmproj` (`EngineOptions::mmproj`,
@@ -219,7 +232,9 @@ impl QwenMmConfig {
             Mmproj::None => Ok(None),
             Mmproj::File(p) => Self::from_mmproj(p, model).map(Some),
             Mmproj::Auto if crate::gguf::is_gguf(model) => match crate::pixtral::mmproj_for(model) {
-                Some(p) if crate::pixtral::projector_type(&p).as_deref() == Some(MMPROJ_TYPE) => Self::from_mmproj(&p, model).map(Some),
+                Some(p) if matches!(crate::pixtral::projector_type(&p).as_deref(), Some(MMPROJ_TYPE | MMPROJ_MINIMAX_M3)) => {
+                    Self::from_mmproj(&p, model).map(Some)
+                }
                 _ => Ok(None),
             },
             Mmproj::Auto if model.is_dir() => Self::load(model),
@@ -234,6 +249,9 @@ impl QwenMmConfig {
     fn from_mmproj(path: &Path, model: &Path) -> Result<Self> {
         let h = crate::gguf::header(path)?;
         let proj = h.get("clip.projector_type").and_then(|v| v.as_str()).unwrap_or("");
+        if proj == MMPROJ_MINIMAX_M3 {
+            return Self::minimax_m3_mmproj(&h, path, model);
+        }
         if proj != MMPROJ_TYPE {
             bail!(
                 "{}: projector type {proj:?} is not a Qwen3-VL-style tower ({MMPROJ_TYPE}; pixtral files go with Mistral Large 4)",
@@ -309,6 +327,7 @@ impl QwenMmConfig {
             video,
             image_token_id: id("<|image_pad|>", 248056),
             video_token_id: id("<|video_pad|>", 248057),
+            markers: QWEN_MARKERS,
             mmproj: Some(path.to_path_buf()),
         })
     }
@@ -321,6 +340,9 @@ impl QwenMmConfig {
     /// None when `config.json` has no Qwen-style `vision_config`.
     pub fn load(dir: &Path) -> Result<Option<Self>> {
         let raw: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
+        if raw.get("model_type").and_then(|v| v.as_str()) == Some("minimax_m3_vl") {
+            return Self::minimax_m3(&raw);
+        }
         let Some(v) = raw.get("vision_config").filter(|v| v.get("spatial_merge_size").is_some()) else {
             return Ok(None);
         };
@@ -343,10 +365,120 @@ impl QwenMmConfig {
             video,
             image_token_id: id("image_token_id", 248056),
             video_token_id: id("video_token_id", 248057),
+            markers: QWEN_MARKERS,
+            mmproj: None,
+        }))
+    }
+
+    /// MiniMax M3's tower from llama.cpp's `minimax_m3` mmproj file.
+    fn minimax_m3_mmproj(h: &crate::gguf::Header, path: &Path, model: &Path) -> Result<Self> {
+        let u = |k: &str| {
+            h.get(k)
+                .and_then(|v| v.as_u64())
+                .with_context(|| format!("{}: no {k}", path.display()))
+        };
+        let out = u("clip.vision.projection_dim")?;
+        let ph = h
+            .tensors
+            .iter()
+            .find(|t| t.name == "mm.1.weight")
+            .map(|t| t.ne[1] as u64)
+            .unwrap_or(out);
+        let raw = serde_json::json!({
+            "model_type": "minimax_m3_vl",
+            "text_config": {"hidden_size": out},
+            "projector_hidden_size": ph,
+            "vision_config": {
+                "num_hidden_layers": u("clip.vision.block_count")?,
+                "hidden_size": u("clip.vision.embedding_length")?,
+                "intermediate_size": u("clip.vision.feed_forward_length")?,
+                "num_attention_heads": u("clip.vision.attention.head_count")?,
+                "patch_size": u("clip.vision.patch_size")?,
+                "spatial_merge_size": u("clip.vision.spatial_merge_size").unwrap_or(2),
+                "layer_norm_eps": h.get("clip.vision.attention.layer_norm_epsilon").and_then(|v| v.as_f64()),
+            },
+        });
+        let mut c = Self::minimax_m3(&raw)?.context("minimax_m3 mmproj")?;
+        let tok = crate::gguf::header(model).ok().and_then(|m| m.tokenizer().ok());
+        if let Some(t) = &tok {
+            c.image_token_id = t.token_to_id("]<]image[>[").unwrap_or(c.image_token_id);
+            c.video_token_id = t.token_to_id("]<]video[>[").unwrap_or(c.video_token_id);
+        }
+        c.mmproj = Some(path.to_path_buf());
+        Ok(c)
+    }
+
+    /// MiniMax M3's (`crate::minimax_vision`): a CLIP-style `vision_config`, the processor its
+    /// release uses (Qwen2-VL's resize between 3136 and 451584 pixels, 14-pixel patches, CLIP
+    /// mean / std), images as `]<]start of image[>[` + `]<]image[>[` per token + `]<]end of image[>[`.
+    fn minimax_m3(raw: &serde_json::Value) -> Result<Option<Self>> {
+        let Some(v) = raw.get("vision_config") else { return Ok(None) };
+        let text_hidden = raw
+            .get("text_config")
+            .and_then(|t| t.get("hidden_size"))
+            .and_then(|x| x.as_u64())
+            .context("minimax_m3_vl config has no text hidden_size")?;
+        let u = |k: &str| {
+            v.get(k)
+                .and_then(|x| x.as_u64())
+                .with_context(|| format!("vision_config has no {k}"))
+        };
+        let comp = v
+            .get("img_token_compression_config")
+            .or_else(|| raw.get("img_token_compression_config"));
+        let merge = comp
+            .and_then(|c| c.get("spatial_merge_size"))
+            .or_else(|| v.get("spatial_merge_size"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(2);
+        let temporal = comp
+            .and_then(|c| c.get("temporal_patch_size"))
+            .or_else(|| v.get("temporal_patch_size"))
+            .and_then(|x| x.as_u64())
+            .unwrap_or(2);
+        let theta = v
+            .get("rope_theta")
+            .or_else(|| v.get("rope_parameters").and_then(|r| r.get("rope_theta")))
+            .and_then(|x| x.as_f64())
+            .unwrap_or(10000.0);
+        let vision: QwenVisionConfig = serde_json::from_value(serde_json::json!({
+            "depth": u("num_hidden_layers")?,
+            "hidden_size": u("hidden_size")?,
+            "hidden_act": "gelu",
+            "intermediate_size": u("intermediate_size")?,
+            "num_heads": u("num_attention_heads")?,
+            "patch_size": u("patch_size")?,
+            "spatial_merge_size": merge,
+            "temporal_patch_size": temporal,
+            "out_hidden_size": text_hidden,
+            "rope_parameters": {"rope_theta": theta},
+            "minimax_m3": true,
+            "projector_hidden_size": raw.get("projector_hidden_size").and_then(|x| x.as_u64()),
+            "layer_norm_eps": v.get("layer_norm_eps").and_then(|x| x.as_f64()),
+        }))?;
+        let mut image = ProcessorConfig::image_default();
+        image.patch_size = vision.patch_size;
+        image.temporal_patch_size = vision.temporal_patch_size;
+        image.merge_size = vision.spatial_merge_size;
+        image.mean = [0.481_454_66, 0.457_827_5, 0.408_210_73];
+        image.std = [0.268_629_54, 0.261_302_6, 0.275_777_1];
+        image.min_pixels = 4 * 28 * 28;
+        image.max_pixels = 451_584;
+        let id = |k: &str, d: u32| raw.get(k).and_then(|v| v.as_u64()).map_or(d, |v| v as u32);
+        Ok(Some(Self {
+            vision,
+            video: image.clone(),
+            image,
+            image_token_id: id("image_token_index", 200025),
+            video_token_id: id("video_token_index", 200026),
+            markers: ["]<]start of image[>[", "]<]image[>[", "]<]end of image[>["],
             mmproj: None,
         }))
     }
 }
+
+/// Qwen's image placeholder: start, one per token, end.
+pub const QWEN_MARKERS: [&str; 3] = ["<|vision_start|>", "<|image_pad|>", "<|vision_end|>"];
 
 /// Whether a checkpoint is a Qwen3.5-family vision-language model (`config.json` has a Qwen
 /// `vision_config`).
@@ -542,6 +674,33 @@ impl<'a> VLin<'a> {
         }
     }
 
+    pub(crate) fn n_out(&self) -> usize {
+        self.n_out
+    }
+
+    /// [`Self::load`] with the rows reordered: row `perm[j]` of the layer is row `j` of the
+    /// stored weight (and bias), a bf16 copy (llama.cpp mmproj files permute some rows).
+    pub(crate) fn load_permuted(files: &'a ModelFiles, name: &str, (o, i): (usize, usize), perm: &[usize]) -> Result<Self> {
+        let wname = format!("{name}.weight");
+        let src = files.bf16(&wname)?;
+        let b0 = files.f32(&format!("{name}.bias"))?;
+        if src.len() != o * i || b0.len() != o || perm.len() != o {
+            bail!("{wname}: unexpected size for a [{o}, {i}] layer");
+        }
+        let mut w = crate::quant::PageVec::<u16>::zeroed(o * i);
+        let mut b = vec![0f32; o];
+        for (j, &r) in perm.iter().enumerate() {
+            w[r * i..(r + 1) * i].copy_from_slice(&src[j * i..(j + 1) * i]);
+            b[r] = b0[j];
+        }
+        Ok(Self {
+            w: Lin::bf16_owned(w),
+            b,
+            n_out: o,
+            n_in: i,
+        })
+    }
+
     pub(crate) fn forward(&self, x: &[f32], t: usize, y: &mut [f32]) {
         linear(&self.w, self.n_out, self.n_in, x, t, y);
         for_chunks(y, self.n_out, true, |_, r| add_inplace(r, &self.b));
@@ -562,12 +721,15 @@ struct VBlock<'a> {
 pub enum QwenVisionTower<'a> {
     Qwen35(Qwen35Tower<'a>),
     Qwen25(crate::qwen25_vision::Qwen25Tower<'a>),
+    MiniMaxM3(crate::minimax_vision::MiniMaxM3Tower<'a>),
 }
 
 impl<'a> QwenVisionTower<'a> {
     /// Loads the tower `cfg` describes (bf16; see [`Qwen35Tower::load`]).
     pub fn load(cfg: QwenVisionConfig, files: &'a ModelFiles) -> Result<Self> {
-        Ok(if cfg.is_qwen25() {
+        Ok(if cfg.minimax_m3 {
+            Self::MiniMaxM3(crate::minimax_vision::MiniMaxM3Tower::load(cfg, files)?)
+        } else if cfg.is_qwen25() {
             Self::Qwen25(crate::qwen25_vision::Qwen25Tower::load(cfg, files)?)
         } else {
             Self::Qwen35(Qwen35Tower::load(cfg, files)?)
@@ -578,6 +740,7 @@ impl<'a> QwenVisionTower<'a> {
         match self {
             Self::Qwen35(t) => &t.cfg,
             Self::Qwen25(t) => &t.cfg,
+            Self::MiniMaxM3(t) => &t.cfg,
         }
     }
 
@@ -587,6 +750,7 @@ impl<'a> QwenVisionTower<'a> {
         match self {
             Self::Qwen35(t) => t.encode(px),
             Self::Qwen25(t) => t.encode(px),
+            Self::MiniMaxM3(t) => t.encode(px),
         }
     }
 }

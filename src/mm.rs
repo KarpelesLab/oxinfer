@@ -501,7 +501,11 @@ fn prepare_qwen(src: &Sources, files: &ModelFiles, text_hidden: usize, qc: qwen_
     let tower = qwen_vision::QwenVisionTower::load(qc.vision.clone(), side.as_ref().unwrap_or(files))?;
     let m = qc.vision.spatial_merge_size;
     let unit = qc.image.patch_size * m;
-    let max_pixels = args.max_soft_tokens * unit * unit;
+    let mut max_pixels = args.max_soft_tokens * unit * unit;
+    if qc.vision.minimax_m3 {
+        // MiniMax M3 was trained on images of at most its processor's budget.
+        max_pixels = max_pixels.min(qc.image.max_pixels);
+    }
     for i in 0..src.n_images() {
         let (what, img) = src.image(i)?;
         let (px, ph, feat) = qwen_image(&tower, &qc, text_hidden, &img, max_pixels, &what, t)?;
@@ -513,6 +517,9 @@ fn prepare_qwen(src: &Sources, files: &ModelFiles, text_hidden: usize, qc: qwen_
         feats.push(feat);
     }
     let vp = &qc.video;
+    if src.n_videos() > 0 && qc.vision.minimax_m3 {
+        bail!("video input is not supported for MiniMax M3 yet (images are)");
+    }
     if src.n_videos() > 0 && qc.vision.is_qwen25() {
         bail!("video input is not supported for Qwen2-VL / Qwen2.5-VL checkpoints yet (images are)");
     }
@@ -586,7 +593,8 @@ fn qwen_image(
         t1.elapsed().as_secs_f64(),
         t.elapsed().as_secs_f64()
     );
-    let text = format!("<|vision_start|>{}<|vision_end|>", "<|image_pad|>".repeat(n));
+    let [start, pad, end] = qc.markers;
+    let text = format!("{start}{}{end}", pad.repeat(n));
     let feat = MmFeature {
         token_id: qc.image_token_id,
         emb,
