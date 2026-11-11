@@ -111,6 +111,41 @@ impl GateUp<'_> {
             GateUp::Split(g, u) => g.bytes() + u.bytes(),
         }
     }
+
+    fn lora_active(&self) -> bool {
+        match self {
+            GateUp::Fused(l) => l.active_lora().is_some(),
+            GateUp::Split(g, u) => g.active_lora().is_some() || u.active_lora().is_some(),
+        }
+    }
+
+    /// Adds the updates of the active LoRAs to `o`, this expert's gate/up outputs for rows `tk`
+    /// of `x` (`[t, h]`): `[n, 2 * inter]` when fused, gate `[n, inter]` then up `[n, inter]`
+    /// when split.
+    fn apply_lora(&self, x: &[f32], h: usize, tk: &[usize], t: usize, o: &mut [f32]) {
+        if !self.lora_active() {
+            return;
+        }
+        let n = tk.len();
+        let rows: Vec<f32>;
+        let xe = if n == t {
+            x
+        } else {
+            rows = tk.iter().flat_map(|&ti| &x[ti * h..(ti + 1) * h]).copied().collect();
+            &rows[..]
+        };
+        match self {
+            GateUp::Fused(l) => l.active_lora().unwrap().apply(xe, n, o),
+            GateUp::Split(g, u) => {
+                let (og, ou) = o.split_at_mut(o.len() / 2);
+                for (l, o) in [(g, og), (u, ou)] {
+                    if let Some(d) = l.active_lora() {
+                        d.apply(xe, n, o);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The routed experts of one layer.
@@ -161,6 +196,18 @@ pub(crate) fn route_sigmoid(logits: &[f32], bias: &[f32], k: usize, scale: f32) 
     idx.sort_by(ord);
     let sum: f32 = idx.iter().map(|&i| s[i]).sum();
     idx.into_iter().map(|i| (i, s[i] / sum * scale)).collect()
+}
+
+/// The updates of the active LoRAs of a grouped matmul ([`linear_grouped`], which runs the base
+/// weights only): `ls[j]`'s over the first `count[j]` rows of its segment (the rest is padding).
+fn grouped_lora(ls: &[&Lin], segs: &[(usize, usize)], count: &[usize], n_out: usize, n_in: usize, x: &[f32], y: &mut [f32]) {
+    for ((l, &(s0, _)), &n) in ls.iter().zip(segs).zip(count) {
+        if n > 0
+            && let Some(d) = l.active_lora()
+        {
+            d.apply(&x[s0 * n_in..(s0 + n) * n_in], n, &mut y[s0 * n_out..(s0 + n) * n_out]);
+        }
+    }
 }
 
 /// `y += a * x`.
@@ -240,6 +287,11 @@ impl<'a> Experts<'a> {
         self.down.len()
     }
 
+    /// Whether some expert has a LoRA that is switched on.
+    fn lora_active(&self) -> bool {
+        self.down.iter().any(|l| l.active_lora().is_some()) || self.gate_up.iter().any(GateUp::lora_active)
+    }
+
     /// Weight bytes one token reads (top_k experts).
     pub fn bytes_per_token(&self) -> usize {
         self.top_k * (self.gate_up[0].bytes() + self.down[0].bytes())
@@ -272,7 +324,9 @@ impl<'a> Experts<'a> {
         let Some(be) = crate::gpu::active() else {
             return false;
         };
-        if !be.wants(2 * mi, h, t * self.top_k) || !self.act.on_device() {
+        // The accelerator runs gate/up, the activation and down in one submission, which leaves
+        // no place for a side path: experts with an active LoRA run on the CPU.
+        if !be.wants(2 * mi, h, t * self.top_k) || !self.act.on_device() || self.lora_active() {
             return false;
         }
         let act = self.act;
@@ -337,10 +391,12 @@ impl<'a> Experts<'a> {
     /// up and down), then all gate/up matmuls run as one batch, then all down matmuls (their
     /// inputs quantized together), the shared expert's in the same batches. Every row is
     /// bit-identical to running the experts one at a time (activations are quantized per row,
-    /// and the decode kernels are batch-invariant). False, with nothing done, when some expert
+    /// and the decode kernels are batch-invariant). The update of an active LoRA is added per
+    /// expert after each batch, from the float rows that expert read (as the per-expert path
+    /// does, so the two still agree bit for bit). False, with nothing done, when some expert
     /// would not take the CPU decode kernels (see [`crate::model::cpu_decode_kernels`]): an
-    /// accelerator, a LoRA or float weights then get the per-expert path, so a matmul handled
-    /// elsewhere never consumes these quantized inputs.
+    /// accelerator or float weights then get the per-expert path, so a matmul handled elsewhere
+    /// never consumes these quantized inputs.
     #[allow(clippy::too_many_arguments)]
     fn forward_batched(
         &self,
@@ -414,6 +470,18 @@ impl<'a> Experts<'a> {
         }
         linear_batch_q(&xs, &mut jobs);
         drop(jobs);
+        // LoRA updates of the input projections, from the float rows each expert read.
+        if let Some(s) = shared {
+            let (g, u) = sgu.split_at_mut(t * s.inter);
+            for (l, o) in [(s.gate, g), (s.up, u)] {
+                if let Some(d) = l.active_lora() {
+                    d.apply(x, t, o);
+                }
+            }
+        }
+        for ((&e, tk), o) in used.iter().zip(&toks).zip(gu.iter_mut()) {
+            self.gate_up[e].apply_lora(x, h, tk, t, o);
+        }
         // Activations of all experts, one after another ([sum n, mi]).
         let total: usize = toks.iter().map(|tk| tk.len()).sum();
         let mut a = vec![0f32; total * mi];
@@ -484,7 +552,19 @@ impl<'a> Experts<'a> {
         }
         linear_batch_q(&xs, &mut jobs);
         drop(jobs);
+        // LoRA updates of the output projections, from the float activations.
+        let mut row = 0;
+        for ((&e, tk), o) in used.iter().zip(&toks).zip(outs.iter_mut()) {
+            let n = tk.len();
+            if let Some(d) = self.down[e].active_lora() {
+                d.apply(&a[row * mi..(row + n) * mi], n, o);
+            }
+            row += n;
+        }
         if let Some(s) = shared {
+            if let Some(d) = s.down.active_lora() {
+                d.apply(&sgu, t, y);
+            }
             s.apply_scale(t, h, y);
         }
         for (ti, r) in routes.iter().enumerate() {
@@ -661,6 +741,7 @@ impl<'a> Experts<'a> {
                     .collect();
                 let mut gu = vec![0f32; rows * 2 * mi];
                 linear_grouped(&ls, &segs, 2 * mi, h, &xs, &mut gu);
+                grouped_lora(&ls, &segs, &count, 2 * mi, h, &xs, &mut gu);
                 for_chunks(&mut a, mi, true, |i, ar| {
                     let r = &gu[i * 2 * mi..(i + 1) * 2 * mi];
                     for ((o, &g), &u) in ar.iter_mut().zip(&r[..mi]).zip(&r[mi..]) {
@@ -677,6 +758,8 @@ impl<'a> Experts<'a> {
                 let mut u = vec![0f32; rows * mi];
                 linear_grouped(&gs, &segs, mi, h, &xs, &mut a);
                 linear_grouped(&us, &segs, mi, h, &xs, &mut u);
+                grouped_lora(&gs, &segs, &count, mi, h, &xs, &mut a);
+                grouped_lora(&us, &segs, &count, mi, h, &xs, &mut u);
                 act.apply(&mut a, &mut u);
             }
         }
@@ -690,6 +773,7 @@ impl<'a> Experts<'a> {
         let ds: Vec<&Lin> = self.down.iter().collect();
         let mut o = vec![0f32; rows * h];
         linear_grouped(&ds, &segs, h, mi, &a, &mut o);
+        grouped_lora(&ds, &segs, &count, h, mi, &a, &mut o);
         for_chunks(y, h, true, |ti, yr| {
             for &(i, w) in &slot[ti] {
                 axpy(yr, w, &o[i * h..(i + 1) * h]);
@@ -708,11 +792,229 @@ mod tests {
         ((*seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
     }
 
+    /// Serializes the tests that switch the batched kernels off (a process-wide setting).
+    static BATCHED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A LoRA on the routed experts, in both PEFT layouts (stacked 3-D parameters, one module
+    /// per expert) on both storages of the base weights (fused and separate gate / up), against
+    /// experts whose weights have the update merged in (`W_e + scale * B_e A_e`, with PEFT's
+    /// placement of expert `e` in the stacked tensors), computed in f64: decode, short passes
+    /// and grouped prefill on bf16 weights; on Q8 weights the batched kernels against the
+    /// one-at-a-time path, bit for bit. Switched off, the experts are the base ones.
+    #[test]
+    fn expert_lora_matches_merged_weights() {
+        use crate::lora::LoraAdapter;
+        let _guard = BATCHED.lock().unwrap_or_else(|p| p.into_inner());
+        crate::pool::init(3);
+        let (ne, k, mi, h, r) = (5usize, 2usize, 32usize, 64usize, 3usize);
+        let scale = 1.5f32;
+        let mut seed = 11u64;
+        let mut rnd = |n: usize, amp: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| bf16_to_f32(half::bf16::from_f32(lcg(&mut seed) * amp).to_bits()))
+                .collect()
+        };
+        // Base weights per expert (exact in bf16) and the adapter as peft stores it for stacked
+        // parameters: lora_A [ne * r, in], lora_B [out, r * ne].
+        let wgu: Vec<Vec<f32>> = (0..ne).map(|_| rnd(2 * mi * h, 0.2)).collect();
+        let wd: Vec<Vec<f32>> = (0..ne).map(|_| rnd(h * mi, 0.2)).collect();
+        let (a_gu, b_gu) = (rnd(ne * r * h, 0.3), rnd(2 * mi * r * ne, 0.3));
+        let (a_d, b_d) = (rnd(ne * r * mi, 0.3), rnd(h * r * ne, 0.3));
+        // Expert e's factors: A rows e * r .., B columns k * ne + e.
+        let factors = |a: &[f32], b: &[f32], n_in: usize, e: usize| -> (Vec<f32>, Vec<f32>) {
+            let n_out = b.len() / (r * ne);
+            let ae = a[e * r * n_in..(e + 1) * r * n_in].to_vec();
+            let be = (0..n_out * r).map(|i| b[(i / r) * r * ne + (i % r) * ne + e]).collect();
+            (ae, be)
+        };
+        let merged = |w: &[f32], (a, b): &(Vec<f32>, Vec<f32>), n_in: usize, s: f64| -> Vec<f64> {
+            (0..w.len())
+                .map(|i| {
+                    let (o, c) = (i / n_in, i % n_in);
+                    let d: f64 = (0..r).map(|k| b[o * r + k] as f64 * a[k * n_in + c] as f64).sum();
+                    w[i] as f64 + s * d
+                })
+                .collect()
+        };
+        // The experts' output for routes, added to 0.5, with the update scaled by `s`.
+        let reference = |x: &[f32], routes: &[Vec<(usize, f32)>], s: f64| -> Vec<f64> {
+            let mgu: Vec<Vec<f64>> = (0..ne).map(|e| merged(&wgu[e], &factors(&a_gu, &b_gu, h, e), h, s)).collect();
+            let md: Vec<Vec<f64>> = (0..ne).map(|e| merged(&wd[e], &factors(&a_d, &b_d, mi, e), mi, s)).collect();
+            let mut y = vec![0.5f64; routes.len() * h];
+            for (ti, rt) in routes.iter().enumerate() {
+                let xr = &x[ti * h..(ti + 1) * h];
+                for &(e, w) in rt {
+                    let mv = |m: &[f64], row: usize| -> f64 { (0..h).map(|c| m[row * h + c] * xr[c] as f64).sum() };
+                    let act: Vec<f64> = (0..mi)
+                        .map(|j| {
+                            let (g, u) = (mv(&mgu[e], j), mv(&mgu[e], mi + j));
+                            g / (1.0 + (-g).exp()) * u
+                        })
+                        .collect();
+                    for o in 0..h {
+                        let d: f64 = (0..mi).map(|j| md[e][o * mi + j] * act[j]).sum();
+                        y[ti * h + o] += w as f64 * d;
+                    }
+                }
+            }
+            y
+        };
+        let lin = |w: &[f32], n_out: usize, n_in: usize, q8: bool| -> Lin<'static> {
+            if q8 {
+                return Lin::q8(crate::quant::quantize_f32(w, n_out, n_in));
+            }
+            let mut pv = crate::quant::PageVec::<u16>::zeroed(w.len());
+            for (d, v) in pv.iter_mut().zip(w) {
+                *d = half::bf16::from_f32(*v).to_bits();
+            }
+            Lin::bf16_owned(pv)
+        };
+        let name = "layers.0.mlp.experts";
+        for q8 in [false, true] {
+            for fused in [true, false] {
+                for stacked in [true, false] {
+                    let gate_up = (0..ne)
+                        .map(|e| {
+                            if fused {
+                                GateUp::Fused(lin(&wgu[e], 2 * mi, h, q8))
+                            } else {
+                                GateUp::Split(lin(&wgu[e][..mi * h], mi, h, q8), lin(&wgu[e][mi * h..], mi, h, q8))
+                            }
+                        })
+                        .collect();
+                    let mut ex = Experts {
+                        gate_up,
+                        down: (0..ne).map(|e| lin(&wd[e], h, mi, q8)).collect(),
+                        top_k: k,
+                        inter: mi,
+                        act: Act::Silu,
+                        dev: std::sync::OnceLock::new(),
+                        wrap_per_pass: std::sync::atomic::AtomicBool::new(false),
+                    };
+                    let modules = if stacked {
+                        vec![
+                            (name.to_string(), a_d.clone(), b_d.clone(), mi),
+                            (format!("{name}.base_layer"), a_gu.clone(), b_gu.clone(), h),
+                        ]
+                    } else {
+                        let mut v = Vec::new();
+                        for e in 0..ne {
+                            let (a, b) = factors(&a_gu, &b_gu, h, e);
+                            v.push((format!("{name}.{e}.gate_proj"), a.clone(), b[..mi * r].to_vec(), h));
+                            v.push((format!("{name}.{e}.up_proj"), a, b[mi * r..].to_vec(), h));
+                            let (a, b) = factors(&a_d, &b_d, mi, e);
+                            v.push((format!("{name}.{e}.down_proj"), a, b, mi));
+                        }
+                        v
+                    };
+                    let mut ad = LoraAdapter::for_test(r, scale, modules);
+                    ad.attach_experts(&mut ex, name, h).unwrap();
+                    assert_eq!(ad.finish().unwrap(), if fused { 2 * ne } else { 3 * ne });
+                    let switch = ad.switch();
+                    let what = format!("q8 {q8} fused {fused} stacked {stacked}");
+                    for t in [1, 3, TN - 1, TN + 5] {
+                        let x: Vec<f32> = (0..t * h).map(|_| lcg(&mut seed)).collect();
+                        let routes: Vec<Vec<(usize, f32)>> = (0..t)
+                            .map(|_| {
+                                let l: Vec<f32> = (0..ne).map(|_| lcg(&mut seed)).collect();
+                                route_top_k(&l, k)
+                            })
+                            .collect();
+                        let run = |on: bool, batched: bool| -> Vec<f32> {
+                            switch.store(on, std::sync::atomic::Ordering::SeqCst);
+                            crate::kernels::set_moe_batched(batched);
+                            let mut y = vec![0.5f32; t * h];
+                            ex.forward(&x, t, h, &routes, &mut y, None, None, None);
+                            crate::kernels::set_moe_batched(true);
+                            y
+                        };
+                        let (on, off) = (run(true, true), run(false, true));
+                        assert!(on.iter().zip(&off).any(|(a, b)| (a - b).abs() > 1e-2), "{what} t={t}: no effect");
+                        if q8 {
+                            let one = run(true, false);
+                            assert!(on.iter().zip(&one).all(|(a, b)| a.to_bits() == b.to_bits()), "{what} t={t}");
+                            if t < TN {
+                                switch.store(true, std::sync::atomic::Ordering::SeqCst);
+                                let mut y = vec![0.5f32; t * h];
+                                assert!(ex.forward_batched(&x, t, h, &routes, &mut y, None, None), "{what} t={t}");
+                                assert!(on.iter().zip(&y).all(|(a, b)| a.to_bits() == b.to_bits()), "{what} t={t}");
+                            }
+                            continue;
+                        }
+                        for (got, s) in [(&on, scale as f64), (&off, 0.0)] {
+                            let want = reference(&x, &routes, s);
+                            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                                assert!(
+                                    (*g as f64 - w).abs() < 2e-4 * (1.0 + w.abs()),
+                                    "{what} t={t} scale {s} [{i}]: {g} vs {w}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Expert modules that cannot be applied are errors, never dropped.
+    #[test]
+    fn expert_lora_rejects_what_it_cannot_apply() {
+        use crate::lora::LoraAdapter;
+        let (ne, mi, h, r) = (4usize, 32usize, 64usize, 2usize);
+        let experts = || Experts {
+            gate_up: (0..ne)
+                .map(|_| GateUp::Fused(Lin::q8(crate::quant::quantize_f32(&vec![0.1; 2 * mi * h], 2 * mi, h))))
+                .collect(),
+            down: (0..ne)
+                .map(|_| Lin::q8(crate::quant::quantize_f32(&vec![0.1; h * mi], h, mi)))
+                .collect(),
+            top_k: 2,
+            inter: mi,
+            act: Act::Silu,
+            dev: std::sync::OnceLock::new(),
+            wrap_per_pass: std::sync::atomic::AtomicBool::new(false),
+        };
+        let name = "layers.0.mlp.experts";
+        let attach = |rank: usize, modules: Vec<(String, Vec<f32>, Vec<f32>, usize)>| -> anyhow::Result<usize> {
+            let mut ad = LoraAdapter::for_test(rank, 1.0, modules);
+            ad.attach_experts(&mut experts(), name, h)?;
+            ad.finish()
+        };
+        let stacked = |n_out: usize, n_in: usize, comps: usize| (name.to_string(), vec![0.5; comps * n_in], vec![0.5; n_out * comps], n_in);
+        assert_eq!(attach(r, vec![stacked(h, mi, ne * r)]).unwrap(), ne);
+        // Stacked over another number of experts.
+        let e = attach(r, vec![stacked(h, mi, 2 * ne * r)]).unwrap_err().to_string();
+        assert!(e.contains("another base model"), "{e}");
+        // A stacked parameter of another shape; separate stacked gate / up parameters.
+        let e = attach(r, vec![stacked(h, 3 * mi, ne * r)]).unwrap_err().to_string();
+        assert!(e.contains("another base model"), "{e}");
+        let e = attach(r, vec![stacked(mi, h, ne * r)]).unwrap_err().to_string();
+        assert!(e.contains("cannot be told apart"), "{e}");
+        // An expert the model does not have; a weight an expert does not have.
+        let module = |m: &str, n_out: usize, n_in: usize| (format!("{name}.{m}"), vec![0.5; r * n_in], vec![0.5; n_out * r], n_in);
+        assert_eq!(
+            attach(r, vec![module("3.gate_proj", mi, h), module("3.down_proj", h, mi)]).unwrap(),
+            2
+        );
+        let e = attach(r, vec![module("4.gate_proj", mi, h)]).unwrap_err().to_string();
+        assert!(e.contains("match no layer"), "{e}");
+        let e = attach(r, vec![module("0.gate_up_proj", 2 * mi, h)]).unwrap_err().to_string();
+        assert!(e.contains("match no layer"), "{e}");
+        let e = attach(r, vec![module("0.down_proj", h, 2 * mi)]).unwrap_err().to_string();
+        assert!(e.contains("another base model"), "{e}");
+        // Both layouts on one weight.
+        let e = attach(r, vec![stacked(h, mi, ne * r), module("1.down_proj", h, mi)])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("also targets"), "{e}");
+    }
+
     /// Batched experts (one parallel region per stage, inputs quantized once) give bit-identical
     /// outputs to running each expert's matmuls on their own, for decode and short passes, fused
     /// and separate gate/up, in each quantized CPU format.
     #[test]
     fn batched_experts_match_one_at_a_time() {
+        let _guard = BATCHED.lock().unwrap_or_else(|p| p.into_inner());
         crate::pool::init(3);
         let (ne, k, mi, h) = (6usize, 3usize, 96usize, 256usize);
         let mut seed = 5u64;

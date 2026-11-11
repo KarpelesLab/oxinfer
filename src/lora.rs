@@ -11,6 +11,25 @@
 //! Keys are PEFT's: `base_model.model.<module path>.lora_A.weight` (`[r, in]`) and `.lora_B.weight`
 //! (`[out, r]`). Module paths are matched from `layers.N.` on (the `model.` / `model.language_model.`
 //! prefix differs between the text-only and the multimodal classes) or as `lm_head`.
+//!
+//! Routed MoE experts (Qwen MoE: `layers.N.mlp.experts`, Gemma 4 26B-A4B: `layers.N.experts`) are
+//! adapted per expert, in either layout PEFT produces for them ([`LoraAdapter::attach_experts`]):
+//! - stacked parameters (`LoraConfig(target_parameters=["experts.gate_up_proj",
+//!   "experts.down_proj"])` on the current transformers classes, whose experts are 3-D
+//!   `[experts, out, in]` parameters): one wrapper per parameter, nested, saved as
+//!   `...experts.lora_A.weight`, `...experts.base_layer.lora_A.weight`, ... with `lora_A`
+//!   `[experts * r, in]` (expert `e`: rows `e * r ..`) and `lora_B` `[out, r * experts]` (expert
+//!   `e`, component `k`: column `k * experts + e`). The keys do not name the parameter, so it is
+//!   told from the shape (`gate_up_proj`: `[2 * inter, H]`, `down_proj`: `[H, inter]`);
+//! - one module per expert (`...experts.E.gate_proj`, `.up_proj`, `.down_proj`, the layout of
+//!   classes that keep each expert as an MLP of `nn.Linear`s), each an ordinary pair.
+//!
+//! Either layout goes on either storage of the base weights: a `gate_up_proj` update is split
+//! by rows for checkpoints with separate gate and up matrices (GGUF), and `gate_proj` /
+//! `up_proj` updates are stacked (rank `r_gate + r_up`) for fused ones. Not accepted (an error
+//! at load, like any module that finds no layer): separate stacked `gate_proj` / `up_proj`
+//! parameters (their two wrappers have the same shape, and the keys do not say which is which),
+//! and both layouts on the same expert weight.
 
 use crate::kernels::dot;
 use crate::pool;
@@ -292,6 +311,98 @@ struct Pair {
     n_out: usize,
 }
 
+impl Pair {
+    /// The pair without the components that cannot contribute (adapters zero-padded to a common
+    /// rank; the halves of a split or stacked pair).
+    fn pruned(self) -> Self {
+        let (r0, n_in, n_out) = (self.r, self.n_in, self.n_out);
+        let (a, b) = (&self.a, &self.b);
+        let keep: Vec<usize> = (0..r0)
+            .filter(|&k| a[k * n_in..(k + 1) * n_in].iter().any(|&v| v != 0.0) && (0..n_out).any(|o| b[o * r0 + k] != 0.0))
+            .collect();
+        if keep.len() == r0 {
+            return self;
+        }
+        let r = keep.len();
+        let mut ak = Vec::with_capacity(r * n_in);
+        for &k in &keep {
+            ak.extend_from_slice(&a[k * n_in..(k + 1) * n_in]);
+        }
+        let mut bk = Vec::with_capacity(n_out * r);
+        for o in 0..n_out {
+            bk.extend(keep.iter().map(|&k| b[o * r0 + k]));
+        }
+        Self {
+            a: ak,
+            b: bk,
+            r,
+            n_in,
+            n_out,
+        }
+    }
+
+    /// Expert `e` of a PEFT stacked-parameter pair over `n_exp` experts (see the module docs).
+    fn expert(&self, e: usize, n_exp: usize) -> Self {
+        let (r, n_in, n_out) = (self.r / n_exp, self.n_in, self.n_out);
+        let a = self.a[e * r * n_in..(e + 1) * r * n_in].to_vec();
+        let mut b = Vec::with_capacity(n_out * r);
+        for o in 0..n_out {
+            b.extend((0..r).map(|k| self.b[o * self.r + k * n_exp + e]));
+        }
+        Self { a, b, r, n_in, n_out }.pruned()
+    }
+
+    /// The pairs of output rows `..n` and `n..` (the same `A`).
+    fn split_out(self, n: usize) -> (Self, Self) {
+        let (r, n_in) = (self.r, self.n_in);
+        let (b0, b1) = self.b.split_at(n * r);
+        let half = |b: &[f32], n_out: usize| {
+            Self {
+                a: self.a.clone(),
+                b: b.to_vec(),
+                r,
+                n_in,
+                n_out,
+            }
+            .pruned()
+        };
+        (half(b0, n), half(b1, self.n_out - n))
+    }
+
+    /// The pair of two layers stacked by output rows (`first`'s `n_first` rows, then `second`'s
+    /// `n_second`; a missing one updates nothing): rank `r_first + r_second`.
+    fn stack_out(first: Option<Self>, second: Option<Self>, n_first: usize, n_second: usize, n_in: usize) -> Self {
+        let (r0, r1) = (first.as_ref().map_or(0, |p| p.r), second.as_ref().map_or(0, |p| p.r));
+        let r = r0 + r1;
+        let mut a = Vec::with_capacity(r * n_in);
+        let mut b = vec![0f32; (n_first + n_second) * r];
+        for (p, row0, k0) in [(&first, 0, 0), (&second, n_first, r0)] {
+            let Some(p) = p else { continue };
+            a.extend_from_slice(&p.a);
+            for o in 0..p.n_out {
+                b[(row0 + o) * r + k0..(row0 + o) * r + k0 + p.r].copy_from_slice(&p.b[o * p.r..(o + 1) * p.r]);
+            }
+        }
+        Self {
+            a,
+            b,
+            r,
+            n_in,
+            n_out: n_first + n_second,
+        }
+    }
+}
+
+/// Whether the canonical module `key` is a PEFT wrapper of a stacked expert parameter
+/// (`...experts`, `...experts.base_layer`, ...).
+fn is_stacked(key: &str) -> bool {
+    let mut k = key;
+    while let Some(rest) = k.strip_suffix(".base_layer") {
+        k = rest;
+    }
+    k.ends_with(".experts")
+}
+
 /// A PEFT LoRA adapter, loaded and waiting to be attached to a model ([`LoraAdapter::take`] by
 /// module, then [`LoraAdapter::finish`]).
 pub struct LoraAdapter {
@@ -429,34 +540,19 @@ impl LoraAdapter {
             if ash.len() != 2 || bsh.len() != 2 || ash[0] != bsh[1] {
                 bail!("{module}: lora_A {ash:?} and lora_B {bsh:?} do not form a low-rank pair");
             }
-            let (r0, n_in, n_out) = (ash[0], ash[1], bsh[0]);
-            // Drop components that cannot contribute (adapters zero-padded to a common rank).
-            let keep: Vec<usize> = (0..r0)
-                .filter(|&k| a[k * n_in..(k + 1) * n_in].iter().any(|&v| v != 0.0) && (0..n_out).any(|o| b[o * r0 + k] != 0.0))
-                .collect();
-            let r = keep.len();
-            let mut ak = Vec::with_capacity(r * n_in);
-            for &k in &keep {
-                ak.extend_from_slice(&a[k * n_in..(k + 1) * n_in]);
-            }
-            let mut bk = Vec::with_capacity(n_out * r);
-            for o in 0..n_out {
-                bk.extend(keep.iter().map(|&k| b[o * r0 + k]));
-            }
-            bytes += (ak.len() + bk.len()) * 4;
-            if modules
-                .insert(
-                    key.clone(),
-                    Pair {
-                        a: ak,
-                        b: bk,
-                        r,
-                        n_in,
-                        n_out,
-                    },
-                )
-                .is_some()
-            {
+            let pair = Pair {
+                a,
+                b,
+                r: ash[0],
+                n_in: ash[1],
+                n_out: bsh[0],
+            };
+            // Drop components that cannot contribute (adapters zero-padded to a common rank);
+            // those of a stacked expert parameter keep their places until the experts are
+            // taken apart.
+            let pair = if is_stacked(&key) { pair } else { pair.pruned() };
+            bytes += (pair.a.len() + pair.b.len()) * 4;
+            if modules.insert(key.clone(), pair).is_some() {
                 bail!("{}: module {key} appears twice", path.display());
             }
         }
@@ -506,6 +602,14 @@ impl LoraAdapter {
         rows: Option<&[usize]>,
         cols: Option<&[usize]>,
     ) -> Result<Option<Box<LoraDelta>>> {
+        let Some(p) = self.take_pair(name, n_out, n_in)? else {
+            return Ok(None);
+        };
+        Ok(Some(self.delta(p, rows, cols)))
+    }
+
+    /// The pair of module `name`, checked against a layer of `n_out x n_in`.
+    fn take_pair(&mut self, name: &str, n_out: usize, n_in: usize) -> Result<Option<Pair>> {
         let Some(p) = self.modules.remove(name) else {
             return Ok(None);
         };
@@ -516,7 +620,12 @@ impl LoraAdapter {
                 p.n_in
             );
         }
-        let r = p.r;
+        Ok(Some(p))
+    }
+
+    /// The update of `p`, counted as attached (`rows` / `cols` as in [`LoraAdapter::take`]).
+    fn delta(&mut self, p: Pair, rows: Option<&[usize]>, cols: Option<&[usize]>) -> Box<LoraDelta> {
+        let (r, n_in, n_out) = (p.r, p.n_in, p.n_out);
         let mut a = p.a;
         if let Some(cols) = cols {
             let src = a.clone();
@@ -534,7 +643,7 @@ impl LoraAdapter {
             }
         }
         self.attached += 1;
-        Ok(Some(Box::new(LoraDelta {
+        Box::new(LoraDelta {
             a,
             bt,
             r,
@@ -542,7 +651,106 @@ impl LoraAdapter {
             n_out,
             scale: self.scale,
             active: self.active.clone(),
-        })))
+        })
+    }
+
+    /// Attaches the adapter's modules for the routed experts `ex` of a MoE layer, whose module
+    /// path is `name` (`layers.N.mlp.experts`, `layers.N.experts`), in either PEFT layout (see
+    /// the module docs): each expert's weights get their own update, applied to the tokens
+    /// routed to that expert. Errors on a module that fits no expert weight.
+    pub(crate) fn attach_experts(&mut self, ex: &mut crate::moe::Experts, name: &str, h: usize) -> Result<()> {
+        use crate::moe::GateUp;
+        let (ne, mi) = (ex.n_experts(), ex.inter);
+        // Per expert: gate, up (or `fused`: both as one), down.
+        let mut pairs: Vec<[Option<Pair>; 3]> = (0..ne).map(|_| [None, None, None]).collect();
+        let mut fused: Vec<Option<Pair>> = (0..ne).map(|_| None).collect();
+        // Stacked parameters: `name`, `name.base_layer`, ... (one wrapper per parameter).
+        let mut key = name.to_string();
+        let mut seen = [false; 2];
+        while let Some(p) = self.modules.remove(&key) {
+            let which = match (p.n_out, p.n_in) {
+                (o, i) if o == 2 * mi && i == h => 0,
+                (o, i) if o == h && i == mi => 1,
+                (o, i) if o == mi && i == h => bail!(
+                    "LoRA module {key} is for a stacked [{ne}, {o}, {i}] parameter: separate stacked gate_proj / up_proj \
+                     parameters are not supported (their adapters cannot be told apart)"
+                ),
+                (o, i) => bail!(
+                    "LoRA module {key} is for a stacked [{ne}, {o}, {i}] parameter, but the model's experts are \
+                     [{ne}, {}, {h}] (gate_up_proj) and [{ne}, {h}, {mi}] (down_proj): the adapter is for another base model",
+                    2 * mi
+                ),
+            };
+            if p.r != ne * self.rank {
+                bail!(
+                    "LoRA module {key} has {} components, expected {} (rank {} for each of the model's {ne} experts): \
+                     the adapter is for another base model",
+                    p.r,
+                    ne * self.rank,
+                    self.rank
+                );
+            }
+            if std::mem::replace(&mut seen[which], true) {
+                bail!("LoRA module {key}: two adapters for the same stacked expert parameter");
+            }
+            for e in 0..ne {
+                let pe = p.expert(e, ne);
+                if which == 0 {
+                    fused[e] = Some(pe);
+                } else {
+                    pairs[e][2] = Some(pe);
+                }
+            }
+            key.push_str(".base_layer");
+        }
+        // One module per expert.
+        for (e, pe) in pairs.iter_mut().enumerate() {
+            for (i, (m, n_out, n_in)) in [("gate_proj", mi, h), ("up_proj", mi, h), ("down_proj", h, mi)]
+                .into_iter()
+                .enumerate()
+            {
+                let key = format!("{name}.{e}.{m}");
+                if let Some(p) = self.take_pair(&key, n_out, n_in)? {
+                    if (i < 2 && fused[e].is_some()) || pe[i].is_some() {
+                        bail!("LoRA module {key}: the adapter also targets the stacked parameter of this weight");
+                    }
+                    pe[i] = Some(p);
+                }
+            }
+        }
+        for (e, (([gate, up, down], fused), gu)) in pairs.into_iter().zip(fused).zip(ex.gate_up.iter_mut()).enumerate() {
+            match gu {
+                GateUp::Fused(l) => {
+                    let p = match fused {
+                        Some(p) => Some(p),
+                        None if gate.is_some() || up.is_some() => Some(Pair::stack_out(gate, up, mi, mi, h)),
+                        None => None,
+                    };
+                    if let Some(p) = p {
+                        l.set_lora(Some(self.delta(p, None, None)));
+                    }
+                }
+                GateUp::Split(g, u) => {
+                    let (gate, up) = match fused {
+                        Some(p) => {
+                            let (a, b) = p.split_out(mi);
+                            (Some(a), Some(b))
+                        }
+                        None => (gate, up),
+                    };
+                    if let Some(p) = gate {
+                        g.set_lora(Some(self.delta(p, None, None)));
+                    }
+                    if let Some(p) = up {
+                        u.set_lora(Some(self.delta(p, None, None)));
+                    }
+                }
+            }
+            if let Some(p) = down {
+                ex.down[e].set_lora(Some(self.delta(p, None, None)));
+            }
+        }
+        Ok(())
     }
 
     /// Checks that every module found a layer; returns the number attached.
@@ -560,6 +768,33 @@ impl LoraAdapter {
     /// Parameter bytes (f32) of the loaded modules.
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+}
+
+#[cfg(test)]
+impl LoraAdapter {
+    /// An adapter of rank `rank` holding `modules` (`(name, lora_A [r, n_in], lora_B [n_out, r],
+    /// n_in)`, as an adapter file would), switched on.
+    pub(crate) fn for_test(rank: usize, scale: f32, modules: Vec<(String, Vec<f32>, Vec<f32>, usize)>) -> Self {
+        let modules = modules
+            .into_iter()
+            .map(|(name, a, b, n_in)| {
+                let r = a.len() / n_in;
+                let n_out = b.len() / r;
+                (name, Pair { a, b, r, n_in, n_out })
+            })
+            .collect();
+        Self {
+            dir: PathBuf::new(),
+            rank,
+            alpha: scale * rank as f32,
+            scale,
+            target_modules: Vec::new(),
+            modules,
+            active: Arc::new(AtomicBool::new(true)),
+            attached: 0,
+            bytes: 0,
+        }
     }
 }
 

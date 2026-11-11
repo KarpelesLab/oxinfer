@@ -1470,10 +1470,55 @@ Latency (M5 Max, 18 threads; a decision is a prefill, so it scales with the prom
 | JEV-27B on Qwen3.8-27B Q4 (`decision_from`) | Metal | 0.72 s | 6.2 s | 5.9 s |
 
 The adapter costs 3-7 % of the prefill (low-rank products in f32 NEON on the CPU, after the base
-matmul, also when the base matmul runs on the GPU). Not supported: LoRA on routed MoE experts
-(no bundle has it), Core ML models, and the adaptive thinking of the reference server
-(`"thinking": "auto"`: System 2 reasoning folded into the probabilities; the base model itself
-chats as usual in the same engine).
+matmul, also when the base matmul runs on the GPU). Not supported: Core ML models, and the
+adaptive thinking of the reference server (`"thinking": "auto"`: System 2 reasoning folded into the
+probabilities; the base model itself chats as usual in the same engine).
+
+**LoRA on routed MoE experts.** An adapter may also target the routed experts of a MoE base
+(Qwen3.5 / 3.6 MoE: `layers.N.mlp.experts`; Gemma 4 26B-A4B: `layers.N.experts`): each expert
+gets its own low-rank update, applied to the tokens routed to it, on every CPU path of the
+experts (decode, the batched kernels of short passes, grouped prefill) and with streamed experts.
+Two adapter layouts are accepted, on either storage of the base experts (fused `gate_up_proj`, or
+separate gate / up matrices as in GGUF):
+
+- stacked parameters, what peft writes for the current transformers classes, whose experts are 3-D
+  `[experts, out, in]` parameters: `LoraConfig(target_parameters=["experts.gate_up_proj",
+  "experts.down_proj"])` saves nested wrappers `...experts.lora_A/B` and
+  `...experts.base_layer.lora_A/B`, with `lora_A` `[experts * r, in]` and `lora_B`
+  `[out, r * experts]`; the keys do not name the parameter, so it is told from the shape;
+- one module per expert (`...experts.E.gate_proj`, `.up_proj`, `.down_proj`), ordinary pairs.
+
+A prefill pass whose experts would run on the GPU runs them on the CPU while the adapter is on
+(the device computes an expert in one submission, with no place for the side path; the dense
+matmuls stay on the GPU, with theirs), and a model with an adapter attached decodes without the
+GPU decode plan, as with any runtime LoRA. Not accepted, as an error at load (an expert module
+that cannot be applied is never skipped): separate stacked `gate_proj` / `up_proj` parameters
+(their wrappers have the same shape and cannot be told apart), a rank or expert count other than
+the model's, both layouts on one weight, and DoRA / per-module ranks as for dense layers.
+
+No published bundle adapts routed experts, so this was verified on synthetic adapters only:
+`tools/moe_lora_tiny.py` makes a tiny random-weight Qwen3.5-MoE or Gemma 4 MoE checkpoint
+(4 layers, 8 experts, top 3; hidden 128) and a random rank-4 peft adapter on the experts'
+`gate_up_proj` / `down_proj` and on attention and MLP projections, and
+`examples/moe_lora_check.rs` compares every position's logits of a 40-token prompt with peft's
+unmerged forward (float32). bf16 weights, CPU, the adapter moving the logits by up to 9.6 (Qwen) /
+4.4 (Gemma):
+
+| | Qwen3.5-MoE: max \|Δlogit\| | max KL | Gemma 4 MoE: max \|Δlogit\| | max KL |
+|---|---|---|---|---|
+| one prefill pass | 7.1e-5 | 4.1e-10 | 6.0e-5 | 1.6e-10 |
+| passes of 5 tokens, and token by token | 9.8e-5 | 3.6e-10 | 3.3e-5 | 5.5e-11 |
+| adapter off, vs the base model | 1.6e-4 | 1.3e-9 | 4.3e-5 | 8.3e-11 |
+
+The per-expert layout of the same adapter and the same checkpoint saved with one module per
+expert give the same numbers in all four combinations. With larger random models (hidden and
+expert width 1024, 4 experts, 160 tokens) on CUDA, where the base experts' prefill does run on the
+GPU when the adapter is off: 5.1e-5 (Qwen) and 2.0e-4 (Gemma) with the adapter on, as on the CPU
+(5.1e-5 / 2.0e-4). On Q8 / Q4 weights the batched expert kernels with the adapter match the
+one-expert-at-a-time path bit for bit (logits of random weights quantized this coarsely are too
+far from float32 to compare with the reference), and after a pass with the adapter the base
+model's logits are bit for bit what they were. Not run: an adapter of this kind on real weights,
+Metal, and streamed experts end to end (they take the same CPU paths).
 
 ### Gemma 4 26B-A4B bundles
 

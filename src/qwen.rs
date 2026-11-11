@@ -870,6 +870,12 @@ impl<'a> QwenModel<'a> {
         let paired = cfg.rope_interleaved;
         let q_rows = paired.then(|| crate::lora::rope_pair_rows(nh, hd));
         let k_rows = paired.then(|| crate::lora::rope_pair_rows(nkv, hd));
+        // Routed experts: one update per expert, in either PEFT layout.
+        for (l, layer) in self.layers.iter_mut().enumerate() {
+            if let Ffn::Moe(moe) = &mut layer.ffn {
+                ad.attach_experts(&mut moe.experts, &format!("layers.{l}.mlp.experts"), h)?;
+            }
+        }
         let mut set =
             |lin: &mut Lin<'a>, name: String, n_out: usize, n_in: usize, rows: Option<&[usize]>, cols: Option<&[usize]>| -> Result<()> {
                 if let Some(d) = ad.take(&name, n_out, n_in, rows, cols)? {
@@ -904,8 +910,6 @@ impl<'a> QwenModel<'a> {
                     set(&mut a.o, format!("{p}o_proj"), h, nh * hd, None, None)?;
                 }
             }
-            // Routed experts are not patched (no adapter of the family has them): their modules
-            // stay in the adapter and `finish` reports them.
             let (m, p) = match &mut layer.ffn {
                 Ffn::Dense(m) => (m, format!("{lp}mlp.")),
                 Ffn::Moe(moe) => match &mut moe.shared {

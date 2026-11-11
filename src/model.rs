@@ -639,7 +639,7 @@ impl<'a> Lin<'a> {
     }
     /// The LoRA update when its adapter is switched on.
     #[inline]
-    fn active_lora(&self) -> Option<&crate::lora::LoraDelta> {
+    pub(crate) fn active_lora(&self) -> Option<&crate::lora::LoraDelta> {
         self.lora.as_deref().filter(|d| d.is_active())
     }
 }
@@ -869,10 +869,12 @@ pub(crate) fn linear_grouped(ls: &[&Lin], segs: &[(usize, usize)], n_out: usize,
 }
 
 /// Whether [`linear_multi`] runs an `n_out x n_in` matmul of `t` rows of `l` on the CPU decode
-/// kernels (so [`linear_batch_q`] can take it): not with an active LoRA, an accelerator that
-/// wants the op, float storage, or more than [`decode_max_tokens`] rows (the f32 GEMM).
+/// kernels (so [`linear_batch_q`] can take it): not with an accelerator that wants the op, float
+/// storage, or more than [`decode_max_tokens`] rows (the f32 GEMM). This is about the base
+/// matmul: the caller adds the update of an active LoRA itself ([`Lin::active_lora`]), from the
+/// float inputs, after [`linear_batch_q`].
 pub(crate) fn cpu_decode_kernels(l: &Lin, n_out: usize, n_in: usize, t: usize) -> bool {
-    if l.active_lora().is_some() || t > decode_max_tokens() || crate::gpu::active().is_some_and(|b| b.wants(n_out, n_in, t)) {
+    if t > decode_max_tokens() || crate::gpu::active().is_some_and(|b| b.wants(n_out, n_in, t)) {
         return false;
     }
     match &l.w {
@@ -1305,9 +1307,15 @@ impl<'a> Model<'a> {
     }
 
     /// Attaches the modules of a runtime LoRA adapter (see `crate::lora`) to the attention and
-    /// MLP projections and the LM head, by Hugging Face module name. Returns the number patched.
+    /// MLP projections, the routed experts (26B-A4B) and the LM head, by Hugging Face module
+    /// name. Returns the number patched.
     pub fn attach_lora(&mut self, ad: &mut crate::lora::LoraAdapter) -> Result<usize> {
         let (h, nh) = (self.cfg.hidden_size, self.cfg.num_attention_heads);
+        for (l, layer) in self.layers.iter_mut().enumerate() {
+            if let Some(m) = &mut layer.moe {
+                ad.attach_experts(&mut m.experts, &format!("layers.{l}.experts"), h)?;
+            }
+        }
         let mut set = |lin: &mut Lin<'a>, name: String, n_out: usize, n_in: usize| -> Result<()> {
             if let Some(d) = ad.take(&name, n_out, n_in, None, None)? {
                 lin.set_lora(Some(d));
