@@ -58,6 +58,46 @@ if arch == "m2":
         max_position_embeddings=4096,
     )
     Model = MiniMaxM2ForCausalLM
+elif arch == "m3":
+    from transformers.models.minimax_m3_vl.configuration_minimax_m3_vl import MiniMaxM3VLTextConfig
+    from transformers.models.minimax_m3_vl.modeling_minimax_m3_vl import MiniMaxM3VLForCausalLM
+
+    # A dense leading layer (no indexer, as the release), then sparse MoE layers whose indexer
+    # keeps 3 blocks of 4 positions: a 40-token prompt is well past the dense range.
+    n = 4
+    cfg = MiniMaxM3VLTextConfig(
+        vocab_size=V,
+        hidden_size=128,
+        intermediate_size=64,
+        dense_intermediate_size=192,
+        shared_intermediate_size=64,
+        num_hidden_layers=n,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=64,
+        num_local_experts=8,
+        num_experts_per_tok=int(os.environ.get("TOPK", "3")),
+        # transformers rotates `partial_rotary_factor` of each head (the release gives both).
+        rotary_dim=32,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.5},
+        routed_scaling_factor=2.0,
+        swiglu_alpha=1.702,
+        # Low enough that random activations hit the clamp.
+        swiglu_limit=float(os.environ.get("LIMIT", "1.0")),
+        mlp_layer_types=["dense"] + ["sparse"] * (n - 1),
+        layer_types=["full_attention"] + ["minimax_m3_sparse"] * (n - 1),
+        index_n_heads=2,
+        index_head_dim=64,
+        index_block_size=int(os.environ.get("BLOCK", "4")),
+        index_topk_blocks=3,
+        index_local_blocks=int(os.environ.get("LOCAL", "1")),
+        rms_norm_eps=1e-6,
+        tie_word_embeddings=False,
+        initializer_range=0.08,
+        eos_token_id=EOS,
+        bos_token_id=EOS,
+    )
+    Model = MiniMaxM3VLForCausalLM
 else:
     sys.exit(f"unknown --arch {arch}")
 
@@ -95,7 +135,8 @@ def quantized(name):
 with torch.no_grad():
     for n, p in m.named_parameters():
         if "norm" in n:
-            p.copy_(1.0 + torch.randn_like(p) * 0.2)
+            # M3's norms scale by 1 + w (Gemma style).
+            p.copy_((0.0 if arch == "m3" else 1.0) + torch.randn_like(p) * 0.2)
     for n, b in m.named_buffers():
         if n.endswith("e_score_correction_bias"):
             # Large enough to change the choice from the plain top-k of the scores.

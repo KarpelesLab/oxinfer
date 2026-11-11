@@ -730,6 +730,123 @@ impl MiniMaxChat {
     }
 }
 
+/// MiniMax M3 / M3.1: a system turn with the model's identity, its thinking instructions and id,
+/// then a `developer` turn with the system prompt (default "You are a helpful assistant.") and the
+/// tools; thinking in `<mm:think>`; tool calls as `]<]minimax[>[`-tagged XML (see
+/// `crate::tools::minimax3`). M3's template has thinking modes: on (`<mm:think>` opens the reply)
+/// or off (`</mm:think>` does); M3.1's is always adaptive (the model decides; off prefills
+/// `</mm:think>`, as its instructions describe).
+pub struct MiniMax3Chat {
+    /// The system turn's first paragraph ("Your model version is MiniMax-M3.1, ...").
+    pub identity: String,
+    /// The template takes `thinking_mode` (M3).
+    pub modes: bool,
+}
+
+impl MiniMax3Chat {
+    const ADAPTIVE: &'static str = "Current thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n";
+
+    /// Whether a chat template is M3's (rather than M2's).
+    pub fn is_template(t: &str) -> bool {
+        t.contains("<mm:think>")
+    }
+
+    pub fn for_template(t: &str) -> MiniMax3Chat {
+        let identity = t
+            .split("'Your model version is ")
+            .nth(1)
+            .and_then(|r| r.split_once('\''))
+            .map(|(id, _)| format!("Your model version is {id}"))
+            .unwrap_or_else(|| "Your model version is MiniMax-M3, developed by MiniMax.".to_string());
+        MiniMax3Chat {
+            identity,
+            modes: t.contains("thinking_mode"),
+        }
+    }
+
+    fn mode(&self, think: bool) -> &'static str {
+        match (self.modes, think) {
+            (false, _) => Self::ADAPTIVE,
+            (true, true) => {
+                "Current thinking mode: enabled. You MUST think step by step before every response, including after receiving function/tool results.\n"
+            }
+            (true, false) => "Current thinking mode: disabled. Do not output any thinking process.\n",
+        }
+    }
+
+    fn ai(&self, think: bool) -> &'static str {
+        match (self.modes, think) {
+            (true, true) => "]~b]ai\n<mm:think>",
+            (false, true) => "]~b]ai\n",
+            (_, false) => "]~b]ai\n</mm:think>",
+        }
+    }
+}
+
+impl ChatFormat for MiniMax3Chat {
+    fn conversation_start(&self, system: Option<&str>, think: bool) -> String {
+        self.conversation_start_tools(system, think, &[])
+    }
+    fn user_turn(&self, content: &str, think: bool) -> String {
+        format!("]~b]user\n{content}[e~[\n{}", self.ai(think))
+    }
+    fn end_of_model_turn(&self) -> String {
+        "[e~[\n".to_string()
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        "[e~["
+    }
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        ("<mm:think>", "</mm:think>")
+    }
+    fn starts_in_thinking(&self, think: bool) -> bool {
+        think && self.modes
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, think: bool, tools: &[ToolSpec]) -> String {
+        let mut s = format!(
+            "]~!b[]~b]system\n{}\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\n{}</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\n",
+            self.identity,
+            self.mode(think)
+        );
+        s.push_str(system.filter(|s| !s.is_empty()).unwrap_or("You are a helpful assistant."));
+        if !tools.is_empty() {
+            s.push_str(&crate::tools::minimax3::tools_block(tools));
+        }
+        s.push_str("[e~[\n");
+        s
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        crate::tools::minimax3::NS
+    }
+    fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
+        crate::tools::minimax3::parse_calls(raw)
+    }
+    fn tool_results(&self, results: &[ToolResult], think: bool) -> String {
+        let mut s = String::from("[e~[\n]~b]tool");
+        for r in results {
+            s.push_str(&format!("\n<response>{}</response>", r.content));
+        }
+        s.push_str("[e~[\n");
+        s.push_str(self.ai(think));
+        s
+    }
+    fn assistant_text(&self, content: &str, calls: &[ToolCall]) -> String {
+        if calls.is_empty() {
+            return content.to_string();
+        }
+        format!("{content}{}", crate::tools::minimax3::calls(calls))
+    }
+}
+
+/// The chat format of a MiniMax model: M3's or M2's, by its template.
+pub fn minimax_for_model(dir: &std::path::Path) -> &'static (dyn ChatFormat + Sync) {
+    let t = model_template(dir);
+    match t.as_deref() {
+        Some(t) if MiniMax3Chat::is_template(t) => Box::leak(Box::new(MiniMax3Chat::for_template(t))),
+        t => Box::leak(Box::new(MiniMaxChat::for_template(t))),
+    }
+}
+
 /// The chat template source of the model in `dir` (`chat_template.jinja`, the one in
 /// `tokenizer_config.json`, or a GGUF file's).
 pub fn model_template(dir: &std::path::Path) -> Option<String> {
@@ -865,5 +982,61 @@ mod tests {
             "[e~[\n]~b]tool\n<response>12:00</response>[e~[\n]~b]ai\n<think>\n"
         );
         assert_eq!(f.assistant_text("need tool\n</think>\n\n", &calls), &reply[..]);
+    }
+
+    /// MiniMax-M3.1-Flash's template, as transformers renders it (adaptive thinking).
+    #[test]
+    fn minimax3_matches_template() {
+        let id = "Your model version is MiniMax-M3.1, developed by MiniMax. Knowledge cutoff: January 2026. Founded in early 2022, MiniMax is a global AI foundation model company committed to advancing the frontiers of AI towards AGI.";
+        let f = MiniMax3Chat::for_template(&format!("{{{{- '{id}' }}}} <mm:think>"));
+        assert!(!f.modes);
+        let sys = format!(
+            "]~!b[]~b]system\n{id}\n\n<thinking_instructions>\nYou have a thinking capability that allows you to reason step by step before responding. When thinking is enabled, wrap your reasoning in <mm:think></mm:think> tags before your response. When thinking is disabled, begin your response directly after the </mm:think> prefix. When thinking is adaptive, decide on your own whether to think for the current turn.\nCurrent thinking mode: adaptive. You are encouraged to think for complex decision-making, multi-step reasoning, or when analyzing function/tool results.\n</thinking_instructions>\n\n<model_id>8bb8149fe</model_id>[e~[\n]~b]developer\nYou are a helpful assistant."
+        );
+        assert_eq!(
+            f.first_turn(None, true, &[], "Hi"),
+            format!("{sys}[e~[\n]~b]user\nHi[e~[\n]~b]ai\n")
+        );
+        let tool = ToolSpec {
+            name: "get_time".into(),
+            description: "Current time".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {"tz": {"type": "string"}}, "required": ["tz"]}),
+        };
+        let ns = "]<]minimax[>[";
+        let tools = format!(
+            "\n\n# Tools\nYou may call one or more tools to assist with the user query.\nHere are the tools available in JSONSchema format:\n\n<tools>\n<tool>{{\"name\": \"get_time\", \"description\": \"Current time\", \"parameters\": {{\"type\": \"object\", \"properties\": {{\"tz\": {{\"type\": \"string\"}}}}, \"required\": [\"tz\"]}}}}</tool>\n</tools>\n\nTo call tools, wrap all invocations in a single {ns}<tool_call>{ns}</tool_call> block. Parameter values containing nested objects or arrays are recursively expanded into XML elements. Example:\n\n{ns}<tool_call>\n{ns}<invoke name=\"tool-name-1\">{ns}<param-1>value-1{ns}</param-1>{ns}<param-2>{ns}<item>{ns}<key-a>val-a{ns}</key-a>{ns}<key-b>val-b{ns}</key-b>{ns}</item>{ns}</param-2>{ns}</invoke>\n{ns}<invoke name=\"tool-name-2\">{ns}<param-1>value-1{ns}</param-1>{ns}</invoke>\n{ns}</tool_call>"
+        );
+        assert_eq!(
+            f.first_turn(None, true, std::slice::from_ref(&tool), "Time?"),
+            format!("{sys}{tools}[e~[\n]~b]user\nTime?[e~[\n]~b]ai\n")
+        );
+        let reply = format!(
+            "<mm:think>r</mm:think>{ns}<tool_call>\n{ns}<invoke name=\"get_time\">{ns}<tz>UTC{ns}</tz>{ns}</invoke>\n{ns}</tool_call>"
+        );
+        let calls = f.parse_tool_calls(&reply);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["tz"], "UTC");
+        assert_eq!(f.assistant_text("<mm:think>r</mm:think>", &calls), reply);
+        let results = [ToolResult {
+            name: "get_time".into(),
+            content: "12:00".into(),
+        }];
+        assert_eq!(
+            f.tool_results(&results, true),
+            "[e~[\n]~b]tool\n<response>12:00</response>[e~[\n]~b]ai\n"
+        );
+        // Nested arguments round-trip.
+        let mut args = serde_json::Map::new();
+        args.insert("q".into(), "a < b".into());
+        args.insert("n".into(), 3.into());
+        args.insert("flag".into(), true.into());
+        args.insert("list".into(), serde_json::json!([1, "x", {"k": "v"}]));
+        args.insert("obj".into(), serde_json::json!({"a": {"b": 2.5}}));
+        let call = ToolCall {
+            name: "f".into(),
+            arguments: args,
+        };
+        let t = f.assistant_text("", std::slice::from_ref(&call));
+        assert_eq!(f.parse_tool_calls(&t), vec![call]);
     }
 }

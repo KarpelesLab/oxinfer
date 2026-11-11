@@ -641,7 +641,8 @@ impl<'a> Loader<'a, '_> {
         // MiniMax names its shared expert `shared_experts` and does not gate it.
         let shared = if si == 0 {
             None
-        } else if self.has(&format!("{mp}shared_experts.gate_proj.weight")) {
+        } else if self.has(&format!("{mp}shared_experts.gate_proj.weight")) || self.has(&format!("{mp}shared_experts.gate_up_proj.weight"))
+        {
             Some(self.mlp(&format!("{mp}shared_experts."), si)?)
         } else {
             Some(self.mlp(&format!("{mp}shared_expert."), si)?)

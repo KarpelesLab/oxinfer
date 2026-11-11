@@ -482,6 +482,136 @@ pub mod minimax {
     }
 }
 
+/// MiniMax M3 / M3.1: every tag of a call is preceded by the `]<]minimax[>[` token; arguments are
+/// elements named after them, objects and arrays expanded into nested elements (`<item>` per
+/// array entry), scalars as text (booleans as JSON).
+pub mod minimax3 {
+    use super::*;
+
+    pub const NS: &str = "]<]minimax[>[";
+
+    /// The tools section of the developer turn.
+    pub fn tools_block(tools: &[ToolSpec]) -> String {
+        let mut s = String::from(
+            "\n\n# Tools\nYou may call one or more tools to assist with the user query.\nHere are the tools available in JSONSchema format:\n\n<tools>\n",
+        );
+        for t in tools {
+            let f = json!({ "name": t.name, "description": t.description, "parameters": t.parameters });
+            s.push_str(&format!("<tool>{}</tool>\n", qwen::py_json(&f)));
+        }
+        s.push_str("</tools>\n\n");
+        s.push_str(&format!(
+            "To call tools, wrap all invocations in a single {NS}<tool_call>{NS}</tool_call> block. Parameter values containing nested objects or arrays are recursively expanded into XML elements. Example:\n\n{NS}<tool_call>\n{NS}<invoke name=\"tool-name-1\">{NS}<param-1>value-1{NS}</param-1>{NS}<param-2>{NS}<item>{NS}<key-a>val-a{NS}</key-a>{NS}<key-b>val-b{NS}</key-b>{NS}</item>{NS}</param-2>{NS}</invoke>\n{NS}<invoke name=\"tool-name-2\">{NS}<param-1>value-1{NS}</param-1>{NS}</invoke>\n{NS}</tool_call>"
+        ));
+        s
+    }
+
+    /// A value as the template's `to_xml` writes it.
+    fn to_xml(v: &Value, out: &mut String) {
+        match v {
+            Value::Object(o) => {
+                for (k, v) in o.iter().filter(|(_, v)| !v.is_null()) {
+                    out.push_str(&format!("{NS}<{k}>"));
+                    to_xml(v, out);
+                    out.push_str(&format!("{NS}</{k}>"));
+                }
+            }
+            Value::Array(a) => {
+                for v in a {
+                    out.push_str(&format!("{NS}<item>"));
+                    to_xml(v, out);
+                    out.push_str(&format!("{NS}</item>"));
+                }
+            }
+            Value::Null => {}
+            Value::String(s) => out.push_str(s),
+            other => out.push_str(&other.to_string()),
+        }
+    }
+
+    /// Calls as the template renders them after a reply's text.
+    pub fn calls(calls: &[ToolCall]) -> String {
+        let mut s = format!("{NS}<tool_call>\n");
+        for c in calls {
+            s.push_str(&format!("{NS}<invoke name=\"{}\">", c.name));
+            for (k, v) in c.arguments.iter().filter(|(_, v)| !v.is_null()) {
+                s.push_str(&format!("{NS}<{k}>"));
+                to_xml(v, &mut s);
+                s.push_str(&format!("{NS}</{k}>"));
+            }
+            s.push_str(&format!("{NS}</invoke>\n"));
+        }
+        s.push_str(&format!("{NS}</tool_call>"));
+        s
+    }
+
+    /// The children of an element body (after the `NS` markers were removed): `(name, body)`
+    /// pairs, or None when the body is text.
+    fn children(mut body: &str) -> Option<Vec<(&str, &str)>> {
+        let mut out = Vec::new();
+        loop {
+            let b = body.trim_start_matches(['\n', ' ']);
+            if b.is_empty() {
+                return (!out.is_empty()).then_some(out);
+            }
+            let rest = b.strip_prefix('<')?;
+            let (name, rest) = rest.split_once('>')?;
+            if name.is_empty() || name.starts_with('/') || name.contains(' ') {
+                return None;
+            }
+            // The matching close tag, skipping nested elements of the same name.
+            let (open, close) = (format!("<{name}>"), format!("</{name}>"));
+            let (mut depth, mut i) = (1usize, 0usize);
+            loop {
+                let c = rest[i..].find(&close)? + i;
+                depth += rest[i..c].matches(&open).count();
+                depth -= 1;
+                if depth == 0 {
+                    out.push((name, &rest[..c]));
+                    body = &rest[c + close.len()..];
+                    break;
+                }
+                i = c + close.len();
+            }
+        }
+    }
+
+    fn value(body: &str) -> Value {
+        match children(body) {
+            Some(ch) if ch.iter().all(|(n, _)| *n == "item") => Value::Array(ch.into_iter().map(|(_, b)| value(b)).collect()),
+            Some(ch) => Value::Object(ch.into_iter().map(|(n, b)| (n.to_string(), value(b))).collect()),
+            None => serde_json::from_str::<Value>(body.trim())
+                .ok()
+                .filter(|j| !j.is_string() && !j.is_object() && !j.is_array())
+                .unwrap_or_else(|| Value::String(body.to_string())),
+        }
+    }
+
+    /// Every `<invoke name="..">` in `<tool_call>` blocks.
+    pub fn parse_calls(raw: &str) -> Vec<ToolCall> {
+        let text = raw.replace(NS, "");
+        let mut calls = Vec::new();
+        for block in text.split("<tool_call>").skip(1) {
+            let block = block.split("</tool_call>").next().unwrap_or(block);
+            for inv in block.split("<invoke name=\"").skip(1) {
+                let Some((name, rest)) = inv.split_once("\">") else { continue };
+                let body = rest.split("</invoke>").next().unwrap_or(rest);
+                let arguments = match value(body) {
+                    Value::Object(o) => o,
+                    _ => Map::new(),
+                };
+                if !name.is_empty() {
+                    calls.push(ToolCall {
+                        name: name.to_string(),
+                        arguments,
+                    });
+                }
+            }
+        }
+        calls
+    }
+}
+
 // ---- Qwen 3.5 / 3.8 -----------------------------------------------------------------------------
 
 pub mod qwen {

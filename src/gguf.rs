@@ -297,8 +297,9 @@ impl Header {
             "mistral-large4" => "mistral_large4_text",
             "deepseek4" => "deepseek_v4",
             "minimax-m2" => "minimax_m2",
+            "minimax-m3" => "minimax_m3_vl_text",
             a => bail!(
-                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, llama, gemma4, mistral-large4, deepseek4 and minimax-m2 are)"
+                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, llama, gemma4, mistral-large4, deepseek4, minimax-m2 and minimax-m3 are)"
             ),
         })
     }
@@ -321,7 +322,7 @@ impl Header {
             return self.deepseek4_config();
         }
         let llama = mt == "llama";
-        let minimax = mt == "minimax_m2";
+        let minimax = matches!(mt, "minimax_m2" | "minimax_m3_vl_text");
         if let Some(t) = self.get(&format!("{}.rope.scaling.type", self.arch())).and_then(Value::as_str)
             && !matches!(t, "none" | "llama3")
         {
@@ -373,6 +374,34 @@ impl Header {
             o.insert("scoring_func".into(), json!("sigmoid"));
             if let Some(s) = self.arch_f64("expert_weights_scale").filter(|&s| s > 0.0) {
                 o.insert("routed_scaling_factor".into(), json!(s));
+            }
+            if mt == "minimax_m3_vl_text" {
+                // M3: leading dense layers, a shared expert, swigluoai (llama.cpp's constants),
+                // the MSA indexer on the MoE layers; norms with the 1 folded in.
+                let n = self.n_layers();
+                let dense = self.arch_u64("leading_dense_block_count").unwrap_or(0);
+                let ff = need("expert_feed_forward_length")?;
+                o.insert("dense_intermediate_size".into(), json!(need("feed_forward_length")?));
+                o.insert(
+                    "shared_intermediate_size".into(),
+                    json!(ff * self.arch_u64("expert_shared_count").unwrap_or(0)),
+                );
+                o.insert(
+                    "moe_layer_freq".into(),
+                    json!((0..n).map(|l| (l >= dense) as u8).collect::<Vec<_>>()),
+                );
+                o.insert("hidden_act".into(), json!("swigluoai"));
+                for (k, g) in [
+                    ("index_n_heads", "attention.indexer.head_count"),
+                    ("index_head_dim", "attention.indexer.key_length"),
+                    ("index_topk_blocks", "attention.indexer.top_k"),
+                    ("index_block_size", "attention.indexer.block_size"),
+                    ("index_local_blocks", "attention.indexer.local_blocks"),
+                ] {
+                    if let Some(v) = self.arch_u64(g) {
+                        o.insert(k.into(), json!(v));
+                    }
+                }
             }
         } else if mt != "qwen3" {
             let (nk, nv) = (need("ssm.group_count")?, need("ssm.time_step_rank")?);
@@ -1031,7 +1060,12 @@ pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec
                     return Some((format!("model.layers.{l}.{n}"), shape));
                 }
                 (_, "attn_norm") => "input_layernorm.weight",
-                ("qwen3" | "llama" | "minimax-m2", "ffn_norm") => "post_attention_layernorm.weight",
+                ("qwen3" | "llama" | "minimax-m2" | "minimax-m3", "ffn_norm") => "post_attention_layernorm.weight",
+                // MiniMax M3's lightning indexer.
+                (_, "indexer.q_proj") => "self_attn.indexer.q_proj.weight",
+                (_, "indexer.k_proj") => "self_attn.indexer.k_proj.weight",
+                (_, "indexer.q_norm") => "self_attn.indexer.q_norm.weight",
+                (_, "indexer.k_norm") => "self_attn.indexer.k_norm.weight",
                 // MiniMax: the router's selection bias.
                 (_, "exp_probs_b") => "mlp.e_score_correction_bias",
                 (_, "post_attention_norm") => "post_attention_layernorm.weight",
