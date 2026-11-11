@@ -755,7 +755,13 @@ fn parse_args() -> Result<Args> {
             "--strength" => a.strength = Some(val()?.parse()?),
             "--image-guidance" => a.image_guidance = Some(val()?.parse()?),
             "--transformer" => a.transformer = Some(PathBuf::from(val()?)),
-            "--controlnet" | "--control-image" | "--control-scale" | "--control-start" | "--control-end" | "--layers" | "--resolution" => {
+            // FLUX (Canny / Depth) and Qwen-Image (ControlNet) both take control images.
+            "--control-image" => {
+                let v = val()?;
+                a.flux.control_image = Some(PathBuf::from(&v));
+                a.qwen_image.set(&k, &v)?
+            }
+            "--controlnet" | "--control-scale" | "--control-start" | "--control-end" | "--layers" | "--resolution" => {
                 a.qwen_image.set(&k, &val()?)?
             }
             "--size" => {
