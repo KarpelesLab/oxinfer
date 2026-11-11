@@ -487,7 +487,7 @@ impl FluxTransformer {
     }
 }
 
-fn forward_many_into(ls: &[Dense], x: &[f32], rows: usize, outs: &mut [&mut [f32]]) {
+pub(crate) fn forward_many_into(ls: &[Dense], x: &[f32], rows: usize, outs: &mut [&mut [f32]]) {
     let n_in = ls[0].n_in;
     {
         let mut jobs: Vec<(&crate::model::Lin, usize, &mut [f32])> =
@@ -505,7 +505,7 @@ fn forward_many_into(ls: &[Dense], x: &[f32], rows: usize, outs: &mut [&mut [f32
     }
 }
 
-fn mlp(l: &[Dense; 2], x: &[f32], rows: usize) -> Vec<f32> {
+pub(crate) fn mlp(l: &[Dense; 2], x: &[f32], rows: usize) -> Vec<f32> {
     let mut h = l[0].forward(x, rows);
     gelu_inplace(&mut h);
     l[1].forward(&h, rows)
@@ -516,11 +516,11 @@ fn gelu_inplace(x: &mut [f32]) {
 }
 
 #[inline]
-fn silu(x: f32) -> f32 {
+pub(crate) fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-fn add(a: &mut [f32], b: &[f32]) {
+pub(crate) fn add(a: &mut [f32], b: &[f32]) {
     for (x, &y) in a.iter_mut().zip(b) {
         *x += y;
     }
@@ -531,7 +531,7 @@ fn chunks(v: &[f32], d: usize) -> Vec<&[f32]> {
 }
 
 /// `x += gate * y` per row (`gate` has one value per channel).
-fn gated_add(x: &mut [f32], y: &[f32], gate: &[f32]) {
+pub(crate) fn gated_add(x: &mut [f32], y: &[f32], gate: &[f32]) {
     let d = gate.len();
     for_chunks(x, d, x.len() > d * 16, |r, row| {
         let yr = &y[r * d..(r + 1) * d];
@@ -560,7 +560,7 @@ pub fn ln_mod(x: &[f32], rows: usize, scale: &[f32], shift: &[f32]) -> Vec<f32> 
 }
 
 /// RMS norm (eps 1e-6, weight `w`) of every `dh`-wide head of `x`.
-fn rms_heads(x: &mut [f32], w: &[f32], dh: usize) {
+pub(crate) fn rms_heads(x: &mut [f32], w: &[f32], dh: usize) {
     for_chunks(x, dh * 32, x.len() > dh * 64, |_, c| {
         for h in c.chunks_mut(dh) {
             let ms = h.iter().map(|&v| v * v).sum::<f32>() / dh as f32;

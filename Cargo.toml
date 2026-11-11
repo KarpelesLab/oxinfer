@@ -47,6 +47,10 @@ name = "flux_edit"
 required-features = ["hf", "media"]
 
 [[example]]
+name = "sd3_generate"
+required-features = ["hf"]
+
+[[example]]
 name = "bagel_edit"
 required-features = ["hf", "media"]
 

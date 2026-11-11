@@ -19,6 +19,7 @@ mod janus_cli;
 mod minimax_h3_cli;
 mod omnigen2_cli;
 mod qwen_image_cli;
+mod sd3_cli;
 #[cfg(feature = "server")]
 mod server_cli;
 mod step1x_cli;
@@ -180,6 +181,8 @@ struct Args {
     iv: intervene_cli::IvArgs,
     // FLUX.1 / Kontext.
     flux: flux_cli::FluxArgs,
+    // Stable Diffusion 3 / 3.5.
+    sd3: sd3_cli::Sd3Args,
     // BAGEL.
     bagel: bagel_cli::BagelArgs,
 }
@@ -430,6 +433,7 @@ fn usage() -> ! {
     );
     eprintln!("\n{}", intervene_cli::USAGE);
     eprintln!("\n{}", flux_cli::USAGE);
+    eprintln!("{}", sd3_cli::USAGE);
     eprintln!("{}", bagel_cli::USAGE);
     #[cfg(feature = "server")]
     eprintln!("\n{}", server_cli::USAGE);
@@ -574,6 +578,7 @@ fn parse_args() -> Result<Args> {
         max_tokens_set: None,
         iv: Default::default(),
         flux: Default::default(),
+        sd3: Default::default(),
         bagel: Default::default(),
     };
     let mut it = std::env::args().skip(1);
@@ -808,6 +813,7 @@ fn parse_args() -> Result<Args> {
             "-h" | "--help" => usage(),
             _ if a.iv.parse(&k, &mut val)? => {}
             _ if a.flux.parse(&k, &mut val)? => {}
+            _ if a.sd3.parse(&k, &mut val)? => {}
             _ if a.bagel.parse(&k, &mut val)? => {}
             _ => {
                 eprintln!("unknown argument {k}");
@@ -1367,6 +1373,9 @@ fn run(mut args: Args) -> Result<()> {
     }
     if oxinfer::flux::is_flux_dir(&args.model) || oxinfer::flux::is_flux_gguf(&args.model) {
         return flux_cli::run(&args);
+    }
+    if oxinfer::sd3::is_sd3_dir(&args.model) || oxinfer::sd3::is_sd3_gguf(&args.model) {
+        return sd3_cli::run(&args);
     }
     if oxinfer::qwen_image::is_qwen_image(&args.model) {
         return qwen_image_cli::run(&args);
