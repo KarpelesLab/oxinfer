@@ -78,6 +78,7 @@ optional.
 | vinesmsuic/magicbrush-jul7 (MagicBrush: InstructPix2Pix fine-tuned for local edits) | 1.1B | 4.3 GB (fp32 `.bin`) | instruction edits ("add a red car"); matches diffusers |
 | deepseek-ai/Janus-Pro-1B | 2.1B (1.5B LM) | 4.2 GB (`pytorch_model.bin`) | text-to-image (384x384) and image understanding; matches the official `janus` package (all 576 greedy image tokens identical; see [Janus-Pro](#janus-pro-text-to-image-and-image-understanding)) |
 | deepseek-ai/Janus-Pro-7B | 7.4B | 14.8 GB (sharded `.bin`) | same; matches the reference (logits, first 64 greedy image tokens) |
+| deepseek-ai/JanusFlow-1.3B | 2.0B (1.3B LM) | 4.1 GB + the SDXL VAE (335 MB) | text-to-image by rectified flow (384x384) and image understanding; matches the official code (velocities, latents, image within 1 of 255; see [Janus-Pro](#janus-pro-text-to-image-and-image-understanding)) |
 | black-forest-labs/FLUX.1-Kontext-dev (ungated copy: unsloth/FLUX.1-Kontext-dev) | 12B + T5-XXL 4.7B + CLIP-L | 23.8 GB + 9.5 GB | instruction-based image editing (and text to image); matches diffusers' FluxKontextPipeline (transformer blocks 3e-6, 55 dB end to end on a Q4_0 GGUF; see [FLUX.1 Kontext](#flux1-kontext-image-editing-from-instructions-and-flux1-text-to-image)); FLUX.1 [dev] Non-Commercial License |
 | QuantStack/FLUX.1-Kontext-dev-GGUF | 12B | 4.0 GB (Q2_K) - 12.7 GB (Q8_0) | the same with a GGUF transformer (any block format, zero-copy); T5 / CLIP / VAE from unsloth/FLUX.1-Kontext-dev |
 | city96/FLUX.1-schnell-gguf, city96/FLUX.1-dev-gguf | 12B | 6.8 GB (Q4_0) | text to image (schnell: 4 steps, Apache 2.0); schnell Q4_0 matches diffusers at 61.6 dB |
@@ -3199,7 +3200,8 @@ pipeline samples it; the noise is ~3e-4 of the latents).
 
 ## Janus-Pro: text to image and image understanding
 
-DeepSeek's Janus-Pro is one autoregressive model that both draws and reads images (`src/janus/`).
+DeepSeek's Janus-Pro is one autoregressive model that both draws and reads images (`src/janus/`);
+JanusFlow, its rectified-flow sibling, is described further down.
 A Janus checkpoint (`model_type` `multi_modality`) is recognised from its config:
 
 ```sh
@@ -3282,8 +3284,78 @@ Decoding steps are memory-bound (about 190 GB/s of weights), so the batch of two
 costs the same as one, and several images share the weight reads: four images take 2.2-2.6x the
 time of one. Metal runs the prompt and the VQ decoder (1.0 s CPU, 0.3 s Metal per image); the
 per-step matmuls of a few rows stay on the CPU, where they are faster than one GPU submission
-each. Not supported: JanusFlow (rectified-flow generation), image sizes other than 384x384,
-multi-turn chat with images (one question per call), and the browser build.
+each.
+
+**JanusFlow** (`deepseek-ai/JanusFlow-1.3B`, recognised from its config; `src/janus/flow.rs`)
+uses the same entry points:
+
+```sh
+./target/release/oxinfer --model deepseek-ai/JanusFlow-1.3B --generate-image "a red fox in the snow" -o fox.png
+./target/release/oxinfer --model deepseek-ai/JanusFlow-1.3B -p "a watercolor lighthouse" -o l.png \
+    --steps 30 --cfg 2 --seed 7 --num-images 2 --size 768x768
+./target/release/oxinfer --model deepseek-ai/JanusFlow-1.3B --image chart.png -p "Which slice is the largest?" --chat
+```
+
+It generates by rectified flow in the latent space of the SDXL VAE, with the language model as
+the velocity network. Each of the `--steps` Euler steps (default 30, t from 0 to 1) embeds the
+48x48x4 latent with the `ShallowUViTEncoder` (sinusoidal time embedding through two linears, a
+2x2 patch convolution, two ConvNeXt blocks with global response normalization modulated by the
+time embedding) into 576 tokens, runs the LLaMA decoder over the prompt, the time embedding (in
+place of the prompt's final `<｜begin▁of▁generation｜>`) and the tokens, and turns its hidden
+states at the tokens back into a velocity with the `ShallowUViTDecoder` (RMSNorm and linear to
+768 channels, concatenation with the encoder's tokens, the long skip connection, two more ConvNeXt
+blocks, 1x1 convolution and pixel shuffle). Guidance is `cfg * v_cond - (cfg - 1) * v_uncond`
+(default 2, the reference demo's), the unconditional sequence attending to BOS only as in the
+reference's attention mask; both sequences of every image run as one batch, and the prompt's keys
+and values are computed once and kept across the steps (`--cfg 1` runs the conditional sequence
+alone). The latents are decoded by the Stable Diffusion VAE decoder (`src/sd/vae.rs`) with the
+weights of `stabilityai/sdxl-vae`, fetched on first use (`JanusOptions::vae`, the C option `vae=`:
+another folder or repo; a `vae/` folder inside the checkpoint is used when present), kept in full
+f32 precision: rounded to bf16 they move the image by 0.6%. For understanding, JanusFlow has the
+same SigLIP-L/16 tower with a single linear aligner and a learned embedding at `<image_beg>`,
+and the older `User:` / `Assistant:` template; all of it is read from the checkpoint's configs.
+
+Agreement with the official `janus.janusflow` code and diffusers' `AutoencoderKL` in float32 on
+CPU (`tools/ref_janus.py` vs `examples/janus_check.rs`, oxinfer on the CPU with bf16 weights as
+stored; generation from the same starting noise, 30 steps, CFG 2):
+
+| JanusFlow-1.3B | max abs diff | rel L2 | |
+|---|---|---|---|
+| velocity of the first step (conditional and unconditional) | 9.1e-6 | 1.3e-6 | |
+| velocities of all 30 steps | 3.0e-3 | 2.3e-5 | last step 2.2e-3, rel 6.9e-5 |
+| final latents | 4.6e-4 | 1.1e-5 | |
+| VAE output (384x384x3, in [-1, 1]) | 1.4e-3 | 4.0e-5 | PNG: 78.3 dB, max pixel diff 1, 428 of 442368 bytes differ |
+| text logits after a 51-token prompt | 4.9e-5 | 2.6e-6 | same argmax |
+| SigLIP features, 1280x960 image | 8.3e-3 | 2.4e-5 | |
+| aligned image embeddings | 3.8e-3 | 2.2e-5 | |
+| logits after the 630-token image prompt | 7.8e-5 | 3.9e-6 | greedy answer identical |
+| the same for a 150x260 image (upscaled, padded left and right) | 5.3e-5 | 2.8e-6 | 64 greedy answer tokens identical |
+
+**Image sizes.** Generation is 384x384 for every model of the family, a limit of the models
+rather than of oxinfer: Janus-Pro was trained to write a 24x24 grid of image tokens and JanusFlow
+a 48x48 latent (24x24 tokens), in raster order with one-dimensional positions, and the
+reference generates nothing else. `--size WxH` (`ImageOptions::width` / `height`, the API's
+`size`) therefore resamples the 384x384 image with a Lanczos filter, as the reference's demos do
+for display; it adds no detail. For understanding, images of any size and aspect ratio go
+through the reference processor's steps: longer side resized to 384 (antialiased bicubic, up or
+down), centered on a square of the processor's background colour.
+
+**Conversations.** `--chat` continues after the first answer with one question per line of
+standard input, the images belonging to the first question; in the library `Janus::ask` takes a
+`Conversation` and each turn may add images, and the C API has `oxi_janus_chat` /
+`oxi_janus_chat_reset`. The turns follow the reference's template (`... Assistant: ANSWER<eos>User:
+QUESTION\n\nAssistant:`). The language model's state is kept between turns; the previous answer is
+read again as text, because the reference formats the whole conversation anew at every turn and
+its tokens are not always the ones the model wrote (the first word loses or gains its leading
+space). Checked on a second question after an image question and its greedy answer, against the
+reference run on the whole two-turn conversation: 664 identical token ids for both models,
+logits max diff 9.7e-5 (rel 4.7e-6) for JanusFlow-1.3B and 1.4e-4 (rel 3.0e-6) for Janus-Pro-1B.
+Janus-Pro-1B checked again after these changes: guided logits over 48 teacher-forced steps
+3.1e-4 (rel 6.4e-6), logits after a 150x260 image 1.2e-4 (rel 1.3e-6), same greedy answer.
+
+Not supported: image generation at a native size other than 384x384 (a limit of the models, see
+above) and the browser build. JanusFlow was checked on the CPU only; its ConvNeXt blocks always
+run there.
 
 ## Image, video and audio input
 
