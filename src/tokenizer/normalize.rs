@@ -161,8 +161,16 @@ impl Normalizer {
                 (format!("{p}{s}"), z)
             }
             Normalizer::Strip { left, right } => {
-                let leading = if *left { s.chars().take_while(|c| c.is_whitespace()).count() } else { 0 };
-                let trailing = if *right { s.chars().rev().take_while(|c| c.is_whitespace()).count() } else { 0 };
+                let leading = if *left {
+                    s.chars().take_while(|c| c.is_whitespace()).count()
+                } else {
+                    0
+                };
+                let trailing = if *right {
+                    s.chars().rev().take_while(|c| c.is_whitespace()).count()
+                } else {
+                    0
+                };
                 if leading == 0 && trailing == 0 {
                     return (s, zero);
                 }

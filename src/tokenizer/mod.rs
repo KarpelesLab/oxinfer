@@ -342,7 +342,9 @@ impl Encoding {
 
 /// Pads every encoding to the fixed length or the longest one, rounded up to the multiple.
 fn pad_encodings(encodings: &mut [Encoding], p: &PaddingParams) {
-    let Some(longest) = encodings.iter().map(Encoding::len).max() else { return };
+    let Some(longest) = encodings.iter().map(Encoding::len).max() else {
+        return;
+    };
     let mut target = p.length.unwrap_or(longest);
     if let Some(m) = p.pad_to_multiple_of
         && m > 0

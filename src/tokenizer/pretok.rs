@@ -20,8 +20,16 @@ pub struct Piece {
 impl Piece {
     /// A whole input segment starting at `start` in the input.
     pub fn segment(s: String, start: usize) -> Piece {
-        let zero = if start == 0 { s.chars().next().map_or(0, char::len_utf8) } else { 0 };
-        Piece { s, shift0: start == 0, zero }
+        let zero = if start == 0 {
+            s.chars().next().map_or(0, char::len_utf8)
+        } else {
+            0
+        };
+        Piece {
+            s,
+            shift0: start == 0,
+            zero,
+        }
     }
 
     /// The sub-piece `a..b`.

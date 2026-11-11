@@ -145,21 +145,39 @@ enum Assertion {
 #[derive(Debug)]
 enum Expr {
     Empty,
-    Any { nl: bool },
+    Any {
+        nl: bool,
+    },
     Assert(Assertion),
     Lit(char),
     Set(Box<Set>),
     Concat(Vec<Expr>),
     Alt(Vec<Expr>),
     Group(usize, Box<Expr>),
-    Repeat { child: Box<Expr>, lo: usize, hi: usize, greedy: bool },
-    Look { child: Box<Expr>, behind: bool, neg: bool },
-    Backref { group: usize, casei: bool },
+    Repeat {
+        child: Box<Expr>,
+        lo: usize,
+        hi: usize,
+        greedy: bool,
+    },
+    Look {
+        child: Box<Expr>,
+        behind: bool,
+        neg: bool,
+    },
+    Backref {
+        group: usize,
+        casei: bool,
+    },
     Atomic(Box<Expr>),
     KeepOut,
     Continue,
     BackrefExists(usize),
-    Cond { cond: Box<Expr>, yes: Box<Expr>, no: Box<Expr> },
+    Cond {
+        cond: Box<Expr>,
+        yes: Box<Expr>,
+        no: Box<Expr>,
+    },
 }
 
 impl Expr {
@@ -434,12 +452,7 @@ impl Parser<'_> {
         let ix = self.ws(ix)?;
         let Some(b) = self.byte(ix) else { return Ok((ix, Expr::Empty)) };
         match b {
-            b'.' => Ok((
-                ix + 1,
-                Expr::Any {
-                    nl: self.flag(F_DOTNL),
-                },
-            )),
+            b'.' => Ok((ix + 1, Expr::Any { nl: self.flag(F_DOTNL) })),
             b'^' => Ok((
                 ix + 1,
                 Expr::Assert(if self.flag(F_MULTI) {
@@ -699,7 +712,9 @@ impl Parser<'_> {
             ix += 1;
         }
         loop {
-            let Some(&c) = b.get(ix) else { return Err(self.err(ix, "unclosed character class")) };
+            let Some(&c) = b.get(ix) else {
+                return Err(self.err(ix, "unclosed character class"));
+            };
             ix = match c {
                 b'\\' => {
                     let (end, e) = self.parse_escape(ix, true)?;
@@ -928,26 +943,57 @@ enum Insn {
     Match,
     One(One),
     /// Greedy repetition of one character.
-    Star { one: One, lo: usize, hi: usize },
+    Star {
+        one: One,
+        lo: usize,
+        hi: usize,
+    },
     Assert(Assertion),
     Split(usize, usize),
     Jmp(usize),
     Save(usize),
     Save0(usize),
     Restore(usize),
-    RepeatGr { lo: usize, hi: usize, next: usize, repeat: usize },
-    RepeatNg { lo: usize, hi: usize, next: usize, repeat: usize },
-    RepeatEpsGr { lo: usize, next: usize, repeat: usize, check: usize },
-    RepeatEpsNg { lo: usize, next: usize, repeat: usize, check: usize },
+    RepeatGr {
+        lo: usize,
+        hi: usize,
+        next: usize,
+        repeat: usize,
+    },
+    RepeatNg {
+        lo: usize,
+        hi: usize,
+        next: usize,
+        repeat: usize,
+    },
+    RepeatEpsGr {
+        lo: usize,
+        next: usize,
+        repeat: usize,
+        check: usize,
+    },
+    RepeatEpsNg {
+        lo: usize,
+        next: usize,
+        repeat: usize,
+        check: usize,
+    },
     GoBack(usize),
     FailNegativeLook,
-    Backref { slot: usize, casei: bool },
+    Backref {
+        slot: usize,
+        casei: bool,
+    },
     BackrefExists(usize),
     BeginAtomic,
     EndAtomic,
     /// Variable-length lookbehind: sub-program `prog` must match a span ending here (searched
     /// at most `max` chars back).
-    Behind { prog: usize, neg: bool, max: Option<usize> },
+    Behind {
+        prog: usize,
+        neg: bool,
+        max: Option<usize>,
+    },
     Continue,
 }
 
@@ -1162,7 +1208,11 @@ impl Compiler {
             self.insns.push(Insn::Split(pc + 1, pc + 1));
             self.visit(child)?;
             let next = self.pc();
-            self.insns[pc] = if greedy { Insn::Split(pc + 1, next) } else { Insn::Split(next, pc + 1) };
+            self.insns[pc] = if greedy {
+                Insn::Split(pc + 1, next)
+            } else {
+                Insn::Split(next, pc + 1)
+            };
             return Ok(());
         }
         let min = self.size(child).min;
@@ -1188,7 +1238,11 @@ impl Compiler {
             self.visit(child)?;
             self.insns.push(Insn::Jmp(pc));
             let next = self.pc();
-            self.insns[pc] = if greedy { Insn::Split(pc + 1, next) } else { Insn::Split(next, pc + 1) };
+            self.insns[pc] = if greedy {
+                Insn::Split(pc + 1, next)
+            } else {
+                Insn::Split(next, pc + 1)
+            };
         } else if lo == 1 && hi == usize::MAX {
             let pc = self.pc();
             self.visit(child)?;
@@ -1677,7 +1731,10 @@ impl Regex {
                         let mut p = ix;
                         let mut steps = 0;
                         loop {
-                            if self.run(&self.subs[sub], &mut sub_state, s, p, from, skipped_empty, Some(ix), budget)?.is_some() {
+                            if self
+                                .run(&self.subs[sub], &mut sub_state, s, p, from, skipped_empty, Some(ix), budget)?
+                                .is_some()
+                            {
                                 found = true;
                                 break;
                             }

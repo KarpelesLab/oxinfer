@@ -299,8 +299,14 @@ fn template_piece(p: &Value, specials: &Value) -> Result<Piece> {
 fn template(t: &Value, specials: &Value, default: &str) -> Result<Vec<Piece>> {
     match t {
         Value::Array(a) => a.iter().map(|p| template_piece(p, specials)).collect(),
-        Value::String(s) => s.split(' ').map(|p| template_piece(&Value::String(p.to_string()), specials)).collect(),
-        Value::Null => default.split(' ').map(|p| template_piece(&Value::String(p.to_string()), specials)).collect(),
+        Value::String(s) => s
+            .split(' ')
+            .map(|p| template_piece(&Value::String(p.to_string()), specials))
+            .collect(),
+        Value::Null => default
+            .split(' ')
+            .map(|p| template_piece(&Value::String(p.to_string()), specials))
+            .collect(),
         _ => bail!("bad template {t}"),
     }
 }
