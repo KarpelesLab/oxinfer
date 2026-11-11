@@ -292,6 +292,7 @@ impl Header {
             "qwen35moe" => "qwen3_5_moe_text",
             "qwen4exp" => "qwen4_exp_text",
             "qwen3" => "qwen3",
+            "qwen2" => "qwen2",
             "llama" => "llama",
             "gemma4" => "gemma4_text",
             "mistral-large4" => "mistral_large4_text",
@@ -299,7 +300,7 @@ impl Header {
             "minimax-m2" => "minimax_m2",
             "minimax-m3" => "minimax_m3_vl_text",
             a => bail!(
-                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, llama, gemma4, mistral-large4, deepseek4, minimax-m2 and minimax-m3 are)"
+                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, llama, gemma4, mistral-large4, deepseek4, minimax-m2, minimax-m3 and qwen2 are)"
             ),
         })
     }
@@ -403,7 +404,7 @@ impl Header {
                     }
                 }
             }
-        } else if mt != "qwen3" {
+        } else if !matches!(mt, "qwen3" | "qwen2") {
             let (nk, nv) = (need("ssm.group_count")?, need("ssm.time_step_rank")?);
             let o = c.as_object_mut().unwrap();
             o.insert(
@@ -1060,7 +1061,11 @@ pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec
                     return Some((format!("model.layers.{l}.{n}"), shape));
                 }
                 (_, "attn_norm") => "input_layernorm.weight",
-                ("qwen3" | "llama" | "minimax-m2" | "minimax-m3", "ffn_norm") => "post_attention_layernorm.weight",
+                ("qwen3" | "qwen2" | "llama" | "minimax-m2" | "minimax-m3", "ffn_norm") => "post_attention_layernorm.weight",
+                // Qwen2's query / key / value biases.
+                (_, "attn_q") if suffix == "bias" => "self_attn.q_proj.bias",
+                (_, "attn_k") if suffix == "bias" => "self_attn.k_proj.bias",
+                (_, "attn_v") if suffix == "bias" => "self_attn.v_proj.bias",
                 // MiniMax M3's lightning indexer.
                 (_, "indexer.q_proj") => "self_attn.indexer.q_proj.weight",
                 (_, "indexer.k_proj") => "self_attn.indexer.k_proj.weight",

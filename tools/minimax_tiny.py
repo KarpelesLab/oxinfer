@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tiny random MiniMax checkpoints + transformers reference outputs (float32, CPU, eager).
 
-usage: minimax_tiny.py OUT_DIR [--arch m2|m3] [--release] [--gen N] [--seed S] [--fp8]
+usage: minimax_tiny.py OUT_DIR [--arch m2|m3|01|qwen2] [--release] [--gen N] [--seed S] [--fp8]
 
 --arch m2: MiniMax-M2 / M2.1 / M2.5 / M2.7 (`minimax_m2`): full attention with query / key norms
   over all heads, partial RoPE, sigmoid-routed experts with a selection bias, no shared expert.
@@ -137,6 +137,16 @@ elif arch == "01":
         bos_token_id=EOS,
     )
     Model = MiniMaxForCausalLM
+elif arch == "qwen2":
+    # MiniMax's SynLogic models are Qwen2.5 fine-tunes: biased q / k / v, no query / key norms.
+    from transformers import Qwen2Config, Qwen2ForCausalLM
+
+    cfg = Qwen2Config(
+        vocab_size=V, hidden_size=128, intermediate_size=192, num_hidden_layers=3,
+        num_attention_heads=4, num_key_value_heads=2, rope_theta=1000000.0, rms_norm_eps=1e-6,
+        tie_word_embeddings=False, initializer_range=0.08, eos_token_id=EOS, bos_token_id=EOS,
+    )
+    Model = Qwen2ForCausalLM
 else:
     sys.exit(f"unknown --arch {arch}")
 
@@ -192,6 +202,8 @@ def quantized(name):
 
 with torch.no_grad():
     for n, p in m.named_parameters():
+        if n.endswith(".bias"):
+            p.copy_(torch.randn_like(p) * 0.3)
         if "norm" in n:
             # M3's norms scale by 1 + w (Gemma style).
             p.copy_((0.0 if arch == "m3" else 1.0) + torch.randn_like(p) * 0.2)
