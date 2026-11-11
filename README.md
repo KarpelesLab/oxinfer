@@ -3158,11 +3158,14 @@ with fewer decoder layers, e.g. distil-whisper/distil-large-v3). Sizes come from
 ./target/release/oxinfer --model openai/whisper-small --transcribe interview.m4a --language fr --translate
 ./target/release/oxinfer --model openai/whisper-small --transcribe talk.wav --format srt > talk.srt
 ./target/release/oxinfer --model openai/whisper-small --transcribe talk.wav --word-timestamps --json
+./target/release/oxinfer --model openai/whisper-small --transcribe talk.wav --beam 5       # beam search
+./target/release/oxinfer --model openai/whisper-small --transcribe a.mp3 --transcribe b.mp3 --transcribe c.wav  # a batch
 ```
 
 | Flag | Meaning |
 |---|---|
-| `--transcribe FILE` | audio to transcribe: WAV, MP3, FLAC, AAC/M4A, Ogg Vorbis/Opus, MKV audio (oxideav), resampled to 16 kHz mono |
+| `--transcribe FILE` | audio to transcribe: WAV, MP3, FLAC, AAC/M4A, Ogg Vorbis/Opus, MKV audio (oxideav), resampled to 16 kHz mono. Repeat it for several files: they are decoded together as a batch, with the result each file gets alone |
+| `--batch N` | files decoded together at most (default 8); the others take the places of those that finish |
 | `--language XX` | spoken language, as a code or a name (default: detected from the first 30 s) |
 | `--translate` | translate to English text |
 | `--timestamps` | timed segments (always on past 30 s) |
@@ -3171,6 +3174,10 @@ with fewer decoder layers, e.g. distil-whisper/distil-large-v3). Sizes come from
 | `--initial-prompt TEXT`, `--prefix TEXT` | context for the decoder (names, spelling, style); forced start of the transcript |
 | `--fallback` | openai-whisper's temperature fallback: temperatures 0, 0.2, ..., 1.0 while a window's tokens compress better than 2.4 or average below -1 log-probability; a window with a no-speech probability over 0.6 and a low log-probability is skipped as silence |
 | `--condition-on-prev` | feed each 30 s window the previous text |
+| `--beam N` | beam search with N beams (openai-whisper's `beam_size`) at temperature 0; with `--fallback`, the higher temperatures sample |
+| `--patience P` | beam search ends once `round(N * P)` hypotheses have ended (default 1) |
+| `--length-penalty A` | rank the ended hypotheses by log-probability over `((5 + length) / 6)^A`, A from 0 to 1 (default: over the length) |
+| `--best-of N` | at temperatures above 0 (`--temp T`, `--fallback`), sample N sequences and keep the best ranked |
 | `--precision f32\|f16\|bf16` | weight storage (default bf16); `--quant q8\|q4` quantizes the decoder |
 
 What runs, following transformers' `WhisperFeatureExtractor` and
@@ -3194,6 +3201,26 @@ What runs, following transformers' `WhisperFeatureExtractor` and
   text token). Audio over 30 s is decoded in sequential 30 s windows, each moved to the last
   complete segment's end timestamp, as transformers' long-form generation does; `initial_prompt`
   becomes `<|startofprev|>` context; `condition_on_prev_tokens` feeds the last 223 tokens.
+- **Beam search** (`beam_size`, `patience`, `length_penalty`; `src/whisper/decode.rs`), as
+  openai-whisper's `BeamSearchDecoder` and `MaximumLikelihoodRanker`: every beam proposes its
+  `beam_size + 1` most likely tokens after the logit rules above (applied per beam); the
+  candidates are walked by decreasing cumulative log-probability until `beam_size` of them that
+  go on are kept, those ending in `<|endoftext|>` met on the way are set aside, and the search
+  ends once `round(beam_size * patience)` hypotheses have ended or after 224 tokens. The best is
+  the one with the highest log-probability over its length (or over `((5 + length) / 6)^a` with
+  a length penalty). Each beam has its own self-attention cache: a beam continued once hands its
+  cache on, a beam continued several times is copied. Beam search runs at temperature 0; the
+  fallback temperatures above it sample, `best_of` sequences each, ranked the same way.
+- **Batches**: several inputs are transcribed together (`transcribe_batch`): the current 30 s
+  window of each goes through the encoder in one pass (the windows stacked in every matmul, one
+  GPU submission per product for all of them; attention per window) and every hypothesis of
+  every input is one row of each decoder step (rows share the matmuls seven at a time; attention
+  per row over its own caches). Inputs that need another temperature retry together, an input
+  that ends leaves its place to the next. The windows of one input stay sequential, since each
+  starts at the previous one's last timestamp. A row's values do not depend on the rows computed
+  with it (the CPU kernels compute up to seven rows one at a time, and the encoder is stacked on
+  a GPU only when the backend takes the same products for one window as for the stack), so each
+  transcript is the one the input gets alone: same tokens, times and probabilities, bit for bit.
 - **Word timestamps**: openai-whisper's alignment: the cross-attention of the checkpoint's
   `alignment_heads` over the text tokens, normalized and median-filtered, aligned to the audio
   frames by dynamic time warping, tokens grouped into words, punctuation merged. Against
@@ -3216,11 +3243,30 @@ let t = asr.transcribe_with(&pcm, &opts, &mut |seg| {
 println!("{} ({}, {:.1}x real time)", t.text, t.language, 1.0 / t.stats.rtf);
 ```
 
+Beam search and batches are options and one more call:
+
+```rust
+opts.beam_size = Some(5);          // openai-whisper's beam_size; patience, length_penalty, best_of
+opts.batch_size = 8;               // inputs decoded together
+let clips: Vec<Vec<f32>> = load_clips();
+let refs: Vec<&[f32]> = clips.iter().map(|c| &c[..]).collect();
+let transcripts = asr.transcribe_batch(&refs, &opts)?;   // one Transcript per input, in order
+// transcribe_batch_with(&refs, &opts, &mut |input, seg| ...) reports each segment with its input;
+// transcribe_files(&paths, &opts) decodes the files first.
+```
+
 `asr.cancel_handle()` stops a transcription from another thread (it returns the finished
 segments with `stopped` set); `transcribe_file` decodes a file first; `detect_language` returns
 the language distribution. `TranscribeOptions` deserializes from JSON, which is how the C API
 takes it: `oxi_transcriber_load`, `oxi_transcribe_file` / `oxi_transcribe_pcm` (any sample rate)
-with a per-segment callback, `oxi_transcriber_cancel`, results as JSON (`include/oxinfer.h`).
+with a per-segment callback, `oxi_transcriber_cancel`, results as JSON (`include/oxinfer.h`);
+`beam_size`, `patience`, `length_penalty` and `best_of` are keys of that JSON (the C API
+transcribes one input per call). The server's `/v1/audio/transcriptions` takes the same four as
+form fields, and several `file` parts in one request: they are transcribed as a batch and
+answered with a JSON array of the per-file results, in order (`response_format` `json` or
+`verbose_json`). With several `--transcribe` files the CLI prints each file's text under a
+`== file ==` line (or a JSON array with a `file` key each), and writes subtitles next to each
+input (`talk.mp3` gives `talk.srt`).
 
 **Agreement with transformers** (float32 `WhisperForConditionalGeneration` + `WhisperProcessor`,
 torch 2.14, transformers 5.20; `tools/ref_whisper.py` on the samples oxinfer decoded; oxinfer with
@@ -3253,6 +3299,48 @@ evaluation of the same pipeline by up to 1.2e-5, where oxinfer's features are wi
 rounding), so bit-identical features would mean reproducing torch's FFT rounding. Encoder
 differences grow with depth (32 layers for large-v3-turbo) but stay at a relative 1e-4.
 
+**Beam search against openai-whisper** (openai-whisper 20250625, torch 2.15 on the CPU, float32,
+the `tiny` and `base` checkpoints; `tools/ref_whisper_beam.py`; oxinfer with `--precision f32
+--device cpu` on the Hugging Face copies of the same weights, language given as English). Twelve
+LibriSpeech clips of 5.9 to 29.4 s (hf-internal-testing/librispeech_asr_dummy), each decoded by
+`whisper.decode` with the same options; the tokens compared include the timestamp tokens where
+timestamps are on:
+
+| Model | `beam_size` | `patience` | `length_penalty` | Timestamps | Clips with identical tokens | Max abs diff of the average log-probability |
+|---|---|---|---|---|---|---|
+| whisper-tiny | 5 | | | no | 12 of 12 (492 tokens) | 2.4e-4 |
+| whisper-tiny | 5 | | | yes | 12 of 12 (527 tokens) | 2.3e-4 |
+| whisper-tiny | 2 | | | no | 12 of 12 (497 tokens) | 2.4e-4 |
+| whisper-tiny | 8 | 2 | | yes | 12 of 12 (524 tokens) | 2.4e-4 |
+| whisper-tiny | 5 | | 1.0 | yes | 12 of 12 (527 tokens) | 2.3e-4 |
+| whisper-tiny | 4 | 1.5 | 0.6 | no | 12 of 12 (493 tokens) | 2.4e-4 |
+| whisper-base | 5 | | | no | 12 of 12 (493 tokens) | 2.2e-4 |
+| whisper-base | 5 | | | yes | 12 of 12 (547 tokens) | 2.5e-4 |
+| whisper-base | 3 | 2 | 0.8 | yes | 12 of 12 (548 tokens) | 2.5e-4 |
+
+The no-speech probabilities are within 5e-7 of the reference. One 29.4 s clip ends its first
+window on a timestamp pair at 21.72 s (whisper-tiny, with timestamps): `whisper.decode` stops there, oxinfer
+decodes the rest in a second window, and the first window is what the table compares. Long-form,
+against whisper's `transcribe()` with `beam_size=5`, `temperature=0` and
+`condition_on_previous_text=False`, on two clips of 90.6 and 75.6 s made of those samples end to
+end: the text tokens and the segment times are identical for both clips with both models (tiny:
+503 text tokens, 16 and 12 segments; base: 496 text tokens, 15 and 12 segments). Only token-level
+bookkeeping differs there: oxinfer keeps both timestamps of the pair that closes a window in the
+segment's `tokens`, as transformers does, and openai-whisper keeps one. Not compared: sampled
+output (`best_of`, the fallback temperatures), which depends on the random number generator.
+
+**Batches against single inputs**. The same 14 inputs (the twelve clips and the two long ones,
+19 to 21 windows in all) as one batch and each alone, comparing every segment's tokens, times,
+average log-probability, compression ratio and no-speech probability, the words and the detected
+language as printed in the JSON output: identical for all 14 with whisper-tiny greedy (bf16, CPU),
+whisper-tiny with `--beam 5 --timestamps --batch 5` (bf16, CPU), whisper-base with `--beam 5
+--best-of 3 --fallback` and word timestamps (f32, CPU), and whisper-small with `--beam 3` on CUDA
+(bf16, RTX 5080: the encoder windows stacked on the GPU). The unit tests check the same on a tiny
+random-weight model without downloaded weights (`src/whisper/batch_tests.rs`: batched encoder and
+decoder steps bit for bit in f32, bf16, q8 and q4, whole transcripts with beam search, sampling,
+fallback and word timestamps, and the beam search against a slow transcription of
+openai-whisper's Python). Not run: batches on Metal and WebGPU (no such device here).
+
 With the default bf16 weights, transcripts stay close but are not always token-identical. On the
 100 s clip, whisper-large-v3-turbo in bf16 on Metal gives the f32 transcript token for token;
 whisper-small differs in one word of 206, because of the bf16 decoder (bf16 encoder with an f32
@@ -3282,13 +3370,16 @@ head sizes still use); a large-v3-turbo window then splits into ~160 ms of matmu
 attention and ~100 ms of CPU-side layer norms, GELU and residual adds.
 
 The encoder (30 s per window, 1500 positions) is the heavy part: its matmuls and attention go to
-the GPU when one is active (Metal, CUDA, WebGPU); decoding is one token at a time on the CPU,
+the GPU when one is active (Metal, CUDA, WebGPU); decoding is one token at a time on the CPU
+(one row per beam and per input of a batch),
 where the bf16 / q8 / q4 kernels of the language models apply. Without a GPU (iOS and Android
 builds without one, `--device cpu`), everything runs on the SIMD CPU kernels. f32 and f16 weights
 run on the CPU only (the GPU backends take bf16, q8 and q4).
 
-Not supported: beam search (greedy and sampling only), batched transcription of several files at
-once, voice activity detection or speaker diarization, openai-whisper's word-timing heuristics
+Not supported: batching the windows of one long file (they are sequential: each starts at the
+previous one's last timestamp), transformers' own beam search (`num_beams`, a different
+algorithm from openai-whisper's, which is the one implemented),
+voice activity detection or speaker diarization, openai-whisper's word-timing heuristics
 (the punctuation merge is there, not the long-word truncation) and `hallucination_silence_threshold`;
 the compression ratio of the fallback is computed with a built-in DEFLATE size estimate (greedy
 LZ77, fixed Huffman codes) instead of zlib, as no deflate implementation is in the dependency tree.
