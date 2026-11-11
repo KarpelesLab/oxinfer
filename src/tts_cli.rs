@@ -1,11 +1,15 @@
 //! `oxinfer --model <Orpheus model> --speak TEXT -o out.wav`: text to speech through
 //! `oxinfer::tts`; `--decode-tokens FILE` decodes audio tokens without the language model.
+//! Several `--speak`, `--speak-file FILE` (an utterance per line) or `--speak-split` (the
+//! sentences of a long text) are generated as one batch.
 
 use crate::Args;
 use anyhow::{Context, Result, bail};
 use oxinfer::engine::Flow;
 use oxinfer::snac::{Noise, Snac, SnacOptions};
-use oxinfer::tts::{Audio, SpeakOptions, Speaker, SpeakerOptions, audio_frames, frames_to_codes, load_audio_file};
+use oxinfer::tts::{
+    Audio, SpeakOptions, Speaker, SpeakerOptions, Utterance, audio_frames, frames_to_codes, load_audio_file, split_sentences,
+};
 use std::io::Read;
 use std::time::Instant;
 
@@ -23,14 +27,28 @@ fn read_ids(path: &std::path::Path) -> Result<Vec<u32>> {
 
 fn write_outputs(args: &Args, audio: &Audio) -> Result<()> {
     let out = args.output.clone().unwrap_or_else(|| "speech.wav".into());
-    audio.write_wav(&out)?;
+    write_audio(&out, args.dump_pcm.as_deref(), audio)
+}
+
+/// `path` with `-N` before its extension (`out.wav` -> `out-3.wav`).
+fn numbered(path: &std::path::Path, n: usize) -> std::path::PathBuf {
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+    let name = match path.extension() {
+        Some(e) => format!("{stem}-{n}.{}", e.to_string_lossy()),
+        None => format!("{stem}-{n}"),
+    };
+    path.with_file_name(name)
+}
+
+fn write_audio(out: &std::path::Path, dump_pcm: Option<&std::path::Path>, audio: &Audio) -> Result<()> {
+    audio.write_wav(out)?;
     eprintln!(
         "[wrote {} ({:.2} s of audio at {} Hz)]",
         out.display(),
         audio.duration_secs(),
         audio.sample_rate
     );
-    if let Some(p) = &args.dump_pcm {
+    if let Some(p) = dump_pcm {
         let bytes: Vec<u8> = audio.samples.iter().flat_map(|v| v.to_le_bytes()).collect();
         std::fs::write(p, bytes)?;
         eprintln!("[wrote {} f32 samples to {}]", audio.samples.len(), p.display());
@@ -118,11 +136,34 @@ pub fn run(args: &Args) -> Result<()> {
         return write_outputs(args, &audio);
     }
 
-    let mut text = args.speak.clone().context("--speak TEXT")?;
-    if text == "-" {
-        text.clear();
-        std::io::stdin().read_to_string(&mut text)?;
+    let stdin = || -> Result<String> {
+        let mut t = String::new();
+        std::io::stdin().read_to_string(&mut t)?;
+        Ok(t)
+    };
+    let mut texts: Vec<String> = Vec::new();
+    match args.speak.as_deref() {
+        Some("-") => texts.push(stdin()?),
+        Some(t) => texts.push(t.to_string()),
+        None => {}
     }
+    texts.extend(args.speak_more.iter().cloned());
+    if let Some(f) = &args.speak_file {
+        let all = if f.as_os_str() == "-" {
+            stdin()?
+        } else {
+            std::fs::read_to_string(f).with_context(|| format!("read {}", f.display()))?
+        };
+        texts.extend(all.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string));
+    }
+    if texts.is_empty() {
+        bail!("--speak TEXT or --speak-file FILE: nothing to say");
+    }
+    let batch = texts.len() > 1 || args.speak_file.is_some() || args.speak_split;
+    if batch && args.speak_stream {
+        bail!("--speak-stream takes one utterance (a batch is decoded when all of it is generated)");
+    }
+    let text = texts[0].clone();
     let mut so = match &args.speak_json {
         Some(j) => SpeakOptions::from_json(j)?,
         None => SpeakOptions::default(),
@@ -190,6 +231,9 @@ pub fn run(args: &Args) -> Result<()> {
         info.threads,
         info.load_secs
     );
+    if batch {
+        return run_batch(args, &speaker, &texts, &so);
+    }
     let speech = if args.speak_stream {
         let t0 = Instant::now();
         let mut chunks = 0;
@@ -241,4 +285,83 @@ pub fn run(args: &Args) -> Result<()> {
         speech.finish
     );
     write_outputs(args, &speech.audio)
+}
+
+/// Several utterances as one batch: a WAV each (`out-1.wav`, ...), or with `--speak-split` the
+/// sentences of the texts joined in one.
+fn run_batch(args: &Args, speaker: &Speaker, texts: &[String], so: &SpeakOptions) -> Result<()> {
+    let texts: Vec<String> = if args.speak_split {
+        texts.iter().flat_map(|t| split_sentences(t, 240)).collect()
+    } else {
+        texts.iter().map(|t| t.trim().to_string()).collect()
+    };
+    // `--voice a,b,c`: utterance i takes voice i (cycling).
+    let voices: Vec<&str> = args
+        .voice
+        .as_deref()
+        .map(|v| v.split(',').map(str::trim).collect())
+        .unwrap_or_default();
+    let opts: Vec<SpeakOptions> = (0..texts.len())
+        .map(|i| {
+            let mut o = so.clone();
+            if !voices.is_empty() {
+                let v = voices[i % voices.len()];
+                o.voice = (!v.is_empty()).then(|| v.to_string());
+            }
+            o
+        })
+        .collect();
+    let items: Vec<Utterance> = texts.iter().zip(&opts).map(|(t, o)| Utterance::new(t, o)).collect();
+    let (speeches, bs) = speaker.speak_batch_detailed(&items)?;
+    let out = args.output.clone().unwrap_or_else(|| "speech.wav".into());
+    for (i, (s, u)) in speeches.iter().zip(&items).enumerate() {
+        let st = &s.stats;
+        eprintln!(
+            "[{}: {} prompt tok | {} tok ({} frames, {} dropped{}) | {:.2}s audio | {:?} | {}{:?}]",
+            i + 1,
+            st.prompt_tokens,
+            st.tokens,
+            st.frames,
+            st.dropped_tokens,
+            if st.loops > 0 {
+                format!(", {} loops", st.loops)
+            } else {
+                String::new()
+            },
+            st.audio_secs,
+            s.finish,
+            u.opts.voice.as_deref().map(|v| format!("{v}: ")).unwrap_or_default(),
+            u.text
+        );
+        if args.show_tokens {
+            eprintln!("[output ids {} ({}): {:?}]", i + 1, s.tokens.len(), s.tokens);
+        }
+        if !args.speak_split {
+            let pcm = args.dump_pcm.as_ref().map(|p| numbered(p, i + 1));
+            write_audio(&numbered(&out, i + 1), pcm.as_deref(), &s.audio)?;
+        }
+    }
+    eprintln!(
+        "[batch of {}: prefill {:.2}s | {} tok in {} steps (up to {} per pass), {:.2}s = {:.1} tok/s (real time needs {:.1} per utterance) | SNAC {:.2}s | {:.2}s audio in {:.2}s: RTF {:.2}]",
+        bs.utterances,
+        bs.prefill_secs,
+        bs.tokens,
+        bs.steps,
+        bs.width,
+        bs.generate_secs,
+        bs.tok_s(),
+        7.0 * speaker.snac().sample_rate() as f64 / speaker.snac().samples_per_frame() as f64,
+        bs.snac_secs,
+        bs.audio_secs,
+        bs.total_secs,
+        bs.rtf()
+    );
+    if args.speak_split {
+        let audio = Audio {
+            samples: speeches.iter().flat_map(|s| s.audio.samples.iter().copied()).collect(),
+            sample_rate: speaker.snac().sample_rate(),
+        };
+        write_outputs(args, &audio)?;
+    }
+    Ok(())
 }

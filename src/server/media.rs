@@ -734,14 +734,102 @@ const OPENAI_VOICES: [&str; 13] = [
     "alloy", "ash", "ballad", "cedar", "coral", "echo", "fable", "marin", "nova", "onyx", "sage", "shimmer", "verse",
 ];
 
+/// The model's voice for a request's `voice` (OpenAI's names take the default one).
+fn speech_voice(info: &crate::tts::SpeakerInfo, voice: Option<&str>) -> ApiResult<Option<String>> {
+    Ok(match voice {
+        Some(v) if info.voices.iter().any(|x| x == v) => Some(v.to_string()),
+        Some(v) if !OPENAI_VOICES.contains(&v) && !info.voices.is_empty() => {
+            return Err(ApiError::bad(format!("voice {v:?}: this model's voices are {}", info.voices.join(", "))).param("voice"));
+        }
+        Some(v) if info.voices.is_empty() && !OPENAI_VOICES.contains(&v) => Some(v.to_string()),
+        _ if info.voices.iter().any(|x| x == "tara") => Some("tara".into()),
+        _ => info.voices.first().cloned(),
+    })
+}
+
+/// `POST /v1/audio/speech` with an array as `input` (an extension): the utterances are generated
+/// as one batch ([`crate::tts::Speaker::speak_batch`]) and returned as JSON, `data[i].audio` the
+/// base64 WAV (or 16-bit PCM) of `input[i]`. `voice` is one name or an array, one per input.
+fn speech_batch(
+    api: &Arc<Api>,
+    body: &Value,
+    model: &str,
+    inputs: &[Value],
+    format: &str,
+    o: crate::tts::SpeakOptions,
+) -> ApiResult<Output> {
+    let texts: Vec<&str> = inputs
+        .iter()
+        .map(|v| v.as_str().filter(|t| !t.trim().is_empty()))
+        .collect::<Option<_>>()
+        .ok_or_else(|| ApiError::bad("input: an array of non-empty strings").param("input"))?;
+    if texts.is_empty() || texts.len() > 64 {
+        return Err(ApiError::bad("input: 1 to 64 utterances").param("input"));
+    }
+    if body.get("stream_format").and_then(Value::as_str).is_some_and(|f| f != "audio") {
+        return Err(ApiError::bad("stream_format: a batch is not streamed").param("stream_format"));
+    }
+    let voices: Vec<Option<&str>> = match body.get("voice") {
+        Some(Value::Array(a)) if a.len() == texts.len() => a.iter().map(Value::as_str).collect(),
+        Some(Value::Array(_)) => return Err(ApiError::bad("voice: one voice, or one per input").param("voice")),
+        v => vec![v.and_then(Value::as_str); texts.len()],
+    };
+    api.models.check(model, Kind::Speech)?;
+    let mut lease = api.models.acquire(model, Kind::Speech)?;
+    let Loaded::Speech(sp) = lease.model() else { unreachable!() };
+    let opts: Vec<crate::tts::SpeakOptions> = voices
+        .iter()
+        .map(|v| {
+            let mut o = o.clone();
+            o.voice = speech_voice(sp.info(), *v)?;
+            Ok(o)
+        })
+        .collect::<ApiResult<_>>()?;
+    let items: Vec<crate::tts::Utterance> = texts.iter().zip(&opts).map(|(t, o)| crate::tts::Utterance::new(t, o)).collect();
+    let speeches = sp.speak_batch(&items).map_err(|e| ApiError::new(500, format!("{e:#}")))?;
+    let (mut tin, mut tout) = (0, 0);
+    let data: Vec<Value> = speeches
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            tin += s.stats.prompt_tokens;
+            tout += s.stats.tokens;
+            let bytes = if format == "pcm" {
+                s.audio.to_i16().iter().flat_map(|v| v.to_le_bytes()).collect()
+            } else {
+                s.audio.to_wav()
+            };
+            json!({
+                "index": i, "audio": crate::b64::encode(&bytes), "format": format, "sample_rate": s.audio.sample_rate,
+                "duration": s.audio.duration_secs(),
+                "usage": { "input_tokens": s.stats.prompt_tokens, "output_tokens": s.stats.tokens },
+            })
+        })
+        .collect();
+    let out = json!({
+        "object": "list", "model": model, "data": data,
+        "usage": { "input_tokens": tin, "output_tokens": tout, "total_tokens": tin + tout },
+    });
+    Ok(Output::Full(ApiResponse {
+        status: 200,
+        content_type: "application/json".into(),
+        body: out.to_string().into_bytes(),
+    }))
+}
+
 /// `POST /v1/audio/speech`: `wav` (default) or `pcm` (16-bit little-endian mono, streamed as it
-/// is generated); `stream_format: "sse"` streams base64 PCM in `speech.audio.delta` events.
+/// is generated); `stream_format: "sse"` streams base64 PCM in `speech.audio.delta` events. An
+/// array as `input` is a batch, answered as JSON (see [`speech_batch`]).
 pub(super) fn speech(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
     let s = |k: &str| body.get(k).and_then(Value::as_str).map(str::to_string);
     let model = s("model").ok_or_else(|| ApiError::bad("model is required").param("model"))?;
-    let input = s("input")
-        .filter(|t| !t.trim().is_empty())
-        .ok_or_else(|| ApiError::bad("input is required").param("input"))?;
+    let batch = body.get("input").and_then(Value::as_array);
+    let input = match batch {
+        Some(_) => String::new(),
+        None => s("input")
+            .filter(|t| !t.trim().is_empty())
+            .ok_or_else(|| ApiError::bad("input is required").param("input"))?,
+    };
     let format = s("response_format").unwrap_or_else(|| "wav".into());
     if format != "wav" && format != "pcm" {
         return Err(ApiError::bad(format!("response_format {format:?}: this server writes wav or pcm")).param("response_format"));
@@ -771,22 +859,16 @@ pub(super) fn speech(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
         o.max_tokens = v as usize;
     }
     o.seed = num("seed").map(|v| v as u64).unwrap_or_else(random_seed);
+    if let Some(inputs) = batch {
+        return speech_batch(api, body, &model, inputs, &format, o);
+    }
     let voice = s("voice");
     api.models.check(&model, Kind::Speech)?;
     let api2 = api.clone();
     let mut run = move |sink: Option<Sink>| -> ApiResult<Option<crate::tts::Speech>> {
         let mut lease = api2.models.acquire(&model, Kind::Speech)?;
         let Loaded::Speech(sp) = lease.model() else { unreachable!() };
-        let info = sp.info();
-        o.voice = match voice.as_deref() {
-            Some(v) if info.voices.iter().any(|x| x == v) => Some(v.to_string()),
-            Some(v) if !OPENAI_VOICES.contains(&v) && !info.voices.is_empty() => {
-                return Err(ApiError::bad(format!("voice {v:?}: this model's voices are {}", info.voices.join(", "))).param("voice"));
-            }
-            Some(v) if info.voices.is_empty() && !OPENAI_VOICES.contains(&v) => Some(v.to_string()),
-            _ if info.voices.iter().any(|x| x == "tara") => Some("tara".into()),
-            _ => info.voices.first().cloned(),
-        };
+        o.voice = speech_voice(sp.info(), voice.as_deref())?;
         match sink {
             None => Ok(Some(
                 sp.speak_detailed(&input, &o).map_err(|e| ApiError::new(500, format!("{e:#}")))?,

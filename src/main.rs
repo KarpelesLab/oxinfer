@@ -160,6 +160,9 @@ struct Args {
     snac: Option<String>,
     speak_stream: bool,
     speak_json: Option<String>,
+    speak_more: Vec<String>,
+    speak_file: Option<PathBuf>,
+    speak_split: bool,
     no_noise: bool,
     unconstrained: bool,
     decode_tokens: Option<PathBuf>,
@@ -407,6 +410,10 @@ fn usage() -> ! {
          \x20 --speak TEXT         text to speak (- for stdin); -o FILE writes the WAV (default speech.wav)\n\
          \x20 --voice NAME         tara (default), leah, jess, leo, dan, mia, zac, zoe; \"\" for none\n\
          \x20 --speak-stream       decode audio while generating (sliding windows), report latency\n\
+         \x20 --speak-file FILE    a batch: one utterance per line (- for stdin), generated together; so are\n\
+         \x20                      several --speak. -o out.wav writes out-1.wav, out-2.wav, ...;\n\
+         \x20                      --voice a,b,c gives utterance i the i-th voice (cycling)\n\
+         \x20 --speak-split        split the text into sentences, generate them as a batch, join them in -o\n\
          \x20 --snac DIR           SNAC decoder (default hubertsiuzdak/snac_24khz); --precision f32|bf16\n\
          \x20 --repetition-penalty F  default 1.1 (also applies to text generation, default 1 there)\n\
          \x20 --temp, --top-p, --max-tokens, --seed  sampling (TTS defaults 0.6, 0.8, 1200)\n\
@@ -549,6 +556,9 @@ fn parse_args() -> Result<Args> {
         snac: None,
         speak_stream: false,
         speak_json: None,
+        speak_more: Vec::new(),
+        speak_file: None,
+        speak_split: false,
         no_noise: false,
         unconstrained: false,
         decode_tokens: None,
@@ -777,7 +787,10 @@ fn parse_args() -> Result<Args> {
             "--precision" => a.precision = Some(val()?),
             "--fallback" => a.fallback = true,
             "--condition-on-prev" => a.condition_on_prev = true,
+            "--speak" if a.speak.is_some() => a.speak_more.push(val()?),
             "--speak" => a.speak = Some(val()?),
+            "--speak-file" => a.speak_file = Some(PathBuf::from(val()?)),
+            "--speak-split" => a.speak_split = true,
             "--voice" => a.voice = Some(val()?),
             "--snac" => a.snac = Some(val()?),
             "--speak-stream" => a.speak_stream = true,
@@ -1372,7 +1385,12 @@ fn run(mut args: Args) -> Result<()> {
     if args.embed || oxinfer::embed::is_embedding_model(&args.model) {
         return run_embed(&args);
     }
-    if args.speak.is_some() || args.decode_tokens.is_some() || args.snac_encode.is_some() || args.decode_codes.is_some() {
+    if args.speak.is_some()
+        || args.speak_file.is_some()
+        || args.decode_tokens.is_some()
+        || args.snac_encode.is_some()
+        || args.decode_codes.is_some()
+    {
         #[cfg(feature = "media")]
         return tts_cli::run(&args);
         #[cfg(not(feature = "media"))]

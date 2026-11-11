@@ -41,6 +41,10 @@
 //! (to 3e-7); the default 2 / 2 is within 1.7e-3 of it (59 dB SNR), the official 1 / 2 within
 //! 2.4e-2 (27 dB).
 //!
+//! Several utterances are generated together by [`Speaker::speak_batch`]: one column each of
+//! every pass through the language model, and one SNAC pass for all, with every utterance the
+//! same as spoken alone ([`Utterance`], [`Speaker::speak_long`] for the sentences of a long text).
+//!
 //! ```no_run
 //! use oxinfer::tts::{Speaker, SpeakerOptions, SpeakOptions};
 //! # fn main() -> anyhow::Result<()> {
@@ -55,12 +59,11 @@
 
 use crate::clock::Instant;
 use crate::engine::{CancelHandle, Flow, RUN, StopReason};
-use crate::model::{Lin, Quant, linear};
+use crate::model::{Lin, Quant};
 use crate::platform::DevicePref;
 use crate::pool;
 use crate::qwen::{QwenModel, QwenSession};
 use crate::safetensors::ModelFiles;
-use crate::sampler::{Sampler, apply_repetition_penalty};
 use crate::snac::{Noise, Snac, SnacOptions};
 use crate::tokenizer::Tokenizer;
 use anyhow::{Context, Result, anyhow, bail};
@@ -68,6 +71,10 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+#[path = "tts_batch.rs"]
+mod batch;
+pub use batch::{BatchStats, Utterance, split_sentences};
 
 /// `<|begin_of_text|>`.
 pub const BOS: u32 = 128000;
@@ -889,53 +896,16 @@ impl Speaker {
         let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
         let voice = opts.voice.as_deref().filter(|_| !self.info.pretrained);
         let ids = self.prompt_tokens_with(text, voice, &refs)?;
-        let mut st = SpeakStats {
-            prompt_tokens: ids.len(),
-            ..Default::default()
-        };
         let noise = if opts.noise { Noise::Seeded(opts.seed) } else { Noise::Off };
         let rate = self.snac.sample_rate();
-        let vocab = self.model.cfg.vocab_size;
         let h = self.model.cfg.hidden_size;
-        let head = if opts.constrained { self.head.as_ref() } else { None };
-
-        let mut sampler = Sampler::new(opts.temperature, opts.top_k, opts.top_p, opts.seed);
-        // Loop guard: the fallback sampler once a loop of identical frames was seen.
-        let mut fallback_sampler = Sampler::new(
-            opts.temperature.max(0.6),
-            opts.top_k,
-            if opts.top_p > 0.0 { opts.top_p.min(0.8) } else { 0.8 },
-            opts.seed ^ 0x6c6f_6f70,
-        );
-        let (mut fallback, mut same) = (false, 0usize);
-        let max_frames = if opts.max_secs_per_byte > 0.0 {
-            let secs = 3.0 + text.len() as f64 * opts.max_secs_per_byte as f64;
-            (secs * rate as f64 / self.snac.samples_per_frame() as f64).ceil() as usize
-        } else {
-            usize::MAX
-        };
-        let penalty = opts.repetition_penalty;
-        let mut seen = vec![0u64; vocab.div_ceil(64)];
-        let mark = |seen: &mut Vec<u64>, t: u32| {
-            if let Some(w) = seen.get_mut(t as usize / 64) {
-                *w |= 1 << (t % 64);
-            }
-        };
-        let is_seen = |seen: &[u64], t: u32| seen.get(t as usize / 64).is_some_and(|w| (w >> (t % 64)) & 1 == 1);
-        for &t in &ids {
-            mark(&mut seen, t);
-        }
+        let mut voice = batch::Voice::new(self, text, opts, &ids);
 
         let mut sess: QwenSession = self.model.new_session();
         let hs = crate::generate::prefill(&self.model, &mut sess, &ids, 256, &[]);
         let mut hidden = hs[hs.len() - h..].to_vec();
-        st.prefill_secs = t0.elapsed().as_secs_f64();
+        voice.st.prefill_secs = t0.elapsed().as_secs_f64();
 
-        let mut tokens = Vec::new();
-        let mut frames: Vec<[u32; 7]> = Vec::new();
-        let mut cur = [0u32; 7];
-        let mut fill = 0usize;
-        let mut finish = StopReason::Length;
         let mut out = Streamer {
             snac: &self.snac,
             noise,
@@ -949,94 +919,38 @@ impl Speaker {
             first_chunk: None,
         };
         let tg = Instant::now();
-        for _ in 0..opts.max_tokens {
-            // Logits and the token ids they stand for.
-            let (mut logits, ids_of): (Vec<f32>, Option<Vec<u32>>) = match head {
-                Some(hd) => {
-                    let mut l = vec![0f32; CODES as usize + STOP_TOKENS.len()];
-                    let (a, b) = l.split_at_mut(CODES as usize);
-                    linear(&hd.pos[fill], CODES as usize, h, &hidden, 1, a);
-                    linear(&hd.stop, STOP_TOKENS.len(), h, &hidden, 1, b);
-                    let base = AUDIO_BASE + fill as u32 * CODES;
-                    let ids: Vec<u32> = (base..base + CODES).chain(STOP_TOKENS).collect();
-                    if penalty != 1.0 {
-                        for (v, &t) in l.iter_mut().zip(&ids) {
-                            if is_seen(&seen, t) {
-                                *v = if *v < 0.0 { *v * penalty } else { *v / penalty };
-                            }
-                        }
-                    }
-                    (l, Some(ids))
+        let mut pump_secs = 0f64;
+        while voice.tokens.len() < opts.max_tokens {
+            let id = voice.sample(self, &hidden, None)?;
+            let go = voice.accept(id, &mut |frames| match on_chunk.as_deref_mut() {
+                Some(cb) => {
+                    let ts = Instant::now();
+                    let f = out.pump(frames, false, cb);
+                    pump_secs += ts.elapsed().as_secs_f64();
+                    f
                 }
-                None => {
-                    let mut l = self.model.logits(&hidden, 1);
-                    if penalty != 1.0 {
-                        apply_repetition_penalty(&mut l, &seen, penalty);
-                    }
-                    (l, None)
-                }
-            };
-            if logits.iter().any(|v| v.is_nan()) {
-                bail!("the model produced NaN logits");
-            }
-            let k = if fallback {
-                fallback_sampler.sample(&logits)
-            } else {
-                sampler.sample(&logits)
-            } as usize;
-            let id = ids_of.as_ref().map_or(k as u32, |m| m[k]);
-            logits.clear();
-            tokens.push(id);
-            mark(&mut seen, id);
-            if STOP_TOKENS.contains(&id) {
-                finish = StopReason::Stop;
+                None => Ok(Flow::Continue),
+            })?;
+            if !go {
                 break;
             }
-            let pos_base = AUDIO_BASE + fill as u32 * CODES;
-            if (pos_base..pos_base + CODES).contains(&id) {
-                cur[fill] = id - pos_base;
-                fill += 1;
-                if fill == FRAME_TOKENS {
-                    same = if frames.last() == Some(&cur) { same + 1 } else { 0 };
-                    frames.push(cur);
-                    fill = 0;
-                    let mut ended = frames.len() >= max_frames;
-                    if opts.loop_guard > 0 && same >= opts.loop_guard {
-                        if st.loops >= MAX_LOOPS {
-                            ended = true;
-                        } else {
-                            st.loops += 1;
-                            (fallback, same) = (true, 0);
-                        }
-                    }
-                    let flow = match on_chunk.as_deref_mut() {
-                        Some(cb) => {
-                            let ts = Instant::now();
-                            let f = out.pump(&frames, false, cb)?;
-                            st.generate_secs -= ts.elapsed().as_secs_f64();
-                            f
-                        }
-                        None => Flow::Continue,
-                    };
-                    if flow == Flow::Stop {
-                        finish = StopReason::Cancelled;
-                        break;
-                    }
-                    if ended {
-                        // Length cap or a loop that did not end: like max_tokens.
-                        break;
-                    }
-                }
-            } else {
-                st.dropped_tokens += 1;
-            }
             if self.cancel.load(Ordering::SeqCst) {
-                finish = StopReason::Cancelled;
+                voice.finish = StopReason::Cancelled;
+                break;
+            }
+            if voice.tokens.len() >= opts.max_tokens {
                 break;
             }
             hidden = self.model.forward_hidden_mm(&mut sess, &[id], &[]);
         }
-        st.generate_secs += tg.elapsed().as_secs_f64();
+        let batch::Voice {
+            tokens,
+            frames,
+            finish,
+            mut st,
+            ..
+        } = voice;
+        st.generate_secs = tg.elapsed().as_secs_f64() - pump_secs;
         let samples = match on_chunk {
             Some(cb) => {
                 if finish != StopReason::Cancelled {

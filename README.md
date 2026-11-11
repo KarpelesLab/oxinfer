@@ -1219,7 +1219,7 @@ img = client.images.generate(model="sd", prompt="a lighthouse at dusk", size="51
 | `POST /v1/images/generations` | image (Stable Diffusion, FLUX.1, Qwen-Image, OmniGen2, Step1X-Edit, BAGEL, Janus-Pro) | `size`, `n`, `response_format` (`b64_json`, or `url` as a PNG data URL); extensions `seed`, `steps`, `guidance`, `negative_prompt` |
 | `POST /v1/images/edits` | image | multipart: `image` (or `image[]`, several for Qwen-Image-Edit-2509+ and OmniGen2), `mask` (Stable Diffusion), `prompt`, the same fields, `strength` |
 | `POST /v1/audio/transcriptions`, `/v1/audio/translations` | Whisper | multipart: `file` (any format oxideav decodes), `language`, `prompt`, `temperature`, `response_format` json / text / verbose_json / srt / vtt, `timestamp_granularities[]` word / segment |
-| `POST /v1/audio/speech` | Orpheus | `input`, `voice` (the model's voices; OpenAI's names take the default one), `response_format` wav or pcm (16-bit 24 kHz mono, streamed as it is generated), `stream_format` sse; extensions `seed`, `temperature`, `top_p`, `repetition_penalty` |
+| `POST /v1/audio/speech` | Orpheus | `input`, `voice` (the model's voices; OpenAI's names take the default one), `response_format` wav or pcm (16-bit 24 kHz mono, streamed as it is generated), `stream_format` sse; extensions `seed`, `temperature`, `top_p`, `repetition_penalty`; an array as `input` (1 to 64 texts, `voice` one name or an array) is generated as one batch and answered as JSON, `data[i].audio` the base64 WAV (or PCM) of `input[i]` |
 
 Errors have OpenAI's shape (`{"error": {"message", "type", "param", "code"}}`) and status codes:
 400 for a bad request (also a model of the wrong kind for the endpoint), 401 without the API key,
@@ -3442,6 +3442,10 @@ audio as extra vocabulary tokens: 7 tokens per frame, codes of the three codeboo
 ./target/release/oxinfer --model unsloth/orpheus-3b-0.1-ft --speak "Hey there, I'm Leo. <chuckle> Nice to meet you." --voice leo -o hi.wav
 ./target/release/oxinfer --model unsloth/orpheus-3b-0.1-ft --speak - --quant q4 --speak-stream < text.txt   # faster than real time
 ./target/release/oxinfer --model hubertsiuzdak/snac_24khz --decode-tokens tokens.json -o out.wav          # SNAC alone
+# a batch: one utterance per line (or several --speak), generated together -> out-1.wav, out-2.wav, ...
+./target/release/oxinfer --model unsloth/orpheus-3b-0.1-ft --quant q4 --speak-file lines.txt --voice tara,leo,mia -o out.wav
+# a long text: its sentences as one batch, joined in one file
+./target/release/oxinfer --model unsloth/orpheus-3b-0.1-ft --quant q4 --speak - --speak-split -o story.wav < story.txt
 # voice cloning: the pretrained model, a reference clip and what it says (repeatable)
 ./target/release/oxinfer --model unsloth/orpheus-3b-0.1-pretrained --ref-audio me.wav --ref-text "What I say in the clip." --speak "Something new." -o clone.wav
 # other languages
@@ -3479,6 +3483,64 @@ let speech = speaker.speak_stream("A longer sentence...", &opts, &mut |chunk| {
 })?;
 println!("RTF {:.2}", speech.stats.rtf());
 ```
+
+### Batched utterances
+
+`Speaker::speak_batch` generates several utterances together, each with its own text and
+`SpeakOptions` (voice, sampling settings, seed, limits, references):
+
+```rust
+use oxinfer::tts::Utterance;
+let (leo, mia) = (SpeakOptions { voice: Some("leo".into()), ..Default::default() },
+                  SpeakOptions { voice: Some("mia".into()), seed: 7, ..Default::default() });
+let speeches = speaker.speak_batch(&[Utterance::new("Hello there!", &leo), Utterance::new("And a longer one.", &mia)])?;
+// speeches[i]: the Speech (audio, tokens, frames, finish, stats) of utterance i
+let (audio, parts, stats) = speaker.speak_long(&long_text, &opts, 0)?; // the sentences as a batch, joined
+```
+
+- **Language model.** The prompts are prefilled one after another; then every decode step feeds
+  the next token of each running utterance as one column of a single pass
+  (`QwenModel::forward_hidden_batch`, `src/qwen_batch.rs`): the layer matmuls run on the
+  multi-token decode kernels of
+  [Multi-token passes](#multi-token-passes-and-moe-experts-on-the-cpu), which read the weights
+  once for all columns, while each utterance keeps its own session (KV caches, position), and its
+  attention is the one-token attention over its own cache. Up to 15 utterances share a pass with
+  quantized weights (q8, q4, GGUF), 7 with bf16; a wider batch takes several passes per step.
+- **Per utterance**: its sampler state and seed, repetition-penalty set, loop guard, length caps
+  and stop. An utterance that ends leaves the batch and the others go on (ragged lengths).
+  Unconstrained utterances share one pass through the whole output layer.
+- **SNAC.** `Snac::decode_batch` decodes all the utterances in one pass per layer, the clips laid
+  end to end with each one padded, and given its noise, on its own (groups of about 22 s of
+  audio per pass).
+- **Sentences.** `--speak-split` / `Speaker::speak_long` / `tts::split_sentences` cut a text at
+  sentence ends (`.`, `!`, `?`, `…`, `。`, `！`, `？` and line breaks), join short neighbours up to
+  240 bytes, and speak the pieces as one batch. Each piece is its own utterance (so a long text
+  is no longer cut at `max_tokens`), and its prosody starts afresh.
+- **CLI**: several `--speak`, or `--speak-file FILE` (one utterance per line, `-` for stdin);
+  `-o out.wav` writes `out-1.wav`, `out-2.wav`, ...; `--voice a,b,c` gives utterance i the i-th
+  voice, cycling. **Server**: an array as `input` of `/v1/audio/speech` (see
+  [the server](#openai-compatible-server)). `examples/speak.rs` takes `--also TEXT`. The C API has
+  no batch call yet, and a batch is not streamed (its audio is decoded when all of it is
+  generated).
+
+Every utterance of a batch is the utterance generated alone with the same options: the decode
+kernels give each column the bits of a one-token pass, so on the CPU the tokens and the samples
+are identical, greedy or sampled. Measured on the
+Orpheus 3B Q4_K_M GGUF (CPU, 12 threads): a batch of 9 utterances in 8 voices (5 greedy without
+SNAC noise, 4 sampled at 0.6 / 0.8 with it; 2 of the 9 unconstrained; 99 to 400 tokens each, 7
+ending on a stop token at different steps and 2 at the 400-token limit; 2242 tokens in 399 steps)
+against each utterance alone: 9 of 9 token sequences identical, and all 653312 samples
+bit-identical (`real_batch_matches_alone`, an ignored test taking `OXINFER_TTS_MODEL`). The
+tests that need no weights check the same on a random 2-layer Orpheus-shaped model and a small
+random SNAC at bf16, q8 and q4 (9 utterances with mixed voices, seeds, samplers and limits:
+`batch_matches_alone`), the batched language-model steps against one-token steps with sequences
+leaving the batch (`batch_steps_match_one_token_steps`), and the batched SNAC decode against
+single decodes with f32 and bf16 weights (`batch_decode_matches_alone`). The bf16 safetensors
+checkpoint was not run in a batch on real weights (it was not on this machine).
+
+A batch decodes on the CPU kernels (the GPU decode plans take one sequence), so with GPU
+decoding on (`gpu_decode`, the default where a backend has it) a lone utterance and the same
+utterance in a batch come from different kernels and can part where two tokens are close.
 
 ### Voice cloning
 
@@ -3680,7 +3742,8 @@ never released its smaller sizes) cost about 0.35 of the 3B per token: at best 1
 pass for 1.7-2x the work of one target token, a slowdown. Medusa-style heads do not exist for
 Orpheus.
 
-Not supported: batched utterances. Korean, Hindi, Mandarin and the
+Not supported: batched utterances on the GPU decode plans (a batch decodes on the CPU kernels),
+streaming a batch, and a batch call in the C API. Korean, Hindi, Mandarin and the
 Spanish / Italian model use the same code but were not tested.
 
 ## Getting weights
