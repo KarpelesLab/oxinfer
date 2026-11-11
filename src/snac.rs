@@ -191,16 +191,31 @@ struct Depthwise {
     dilation: usize,
 }
 
+/// The clip of row `ti` in a batch whose clips start at rows `off[..n]` (`off[n]`: the row count).
+#[inline]
+fn seg_of(off: &[usize], ti: usize) -> usize {
+    if off.len() == 2 { 0 } else { off.partition_point(|&o| o <= ti) - 1 }
+}
+
 impl Depthwise {
     fn forward(&self, x: &[f32], t: usize) -> Vec<f32> {
+        self.forward_segs(x, &[0, t])
+    }
+
+    /// [`Depthwise::forward`] over clips laid end to end (rows `off[i]..off[i + 1]`), each
+    /// padded on its own.
+    fn forward_segs(&self, x: &[f32], off: &[usize]) -> Vec<f32> {
         let (c, k, d) = (self.c, self.k, self.dilation);
         let half = (k - 1) / 2 * d;
+        let t = *off.last().unwrap();
         let mut y = vec![0f32; t * c];
         for_rows(&mut y, c, |ti, out| {
+            let s = seg_of(off, ti);
+            let (lo, hi) = (off[s] as isize, off[s + 1] as isize);
             out.copy_from_slice(&self.b);
             for j in 0..k {
                 let src = ti as isize + (j * d) as isize - half as isize;
-                if src < 0 || src >= t as isize {
+                if src < lo || src >= hi {
                     continue;
                 }
                 let xs = &x[src as usize * c..(src as usize + 1) * c];
@@ -275,10 +290,15 @@ struct ResUnit {
 
 impl ResUnit {
     fn forward(&self, x: &mut [f32], t: usize) {
+        self.forward_segs(x, &[0, t])
+    }
+
+    /// Over clips laid end to end (see [`Depthwise::forward_segs`]).
+    fn forward_segs(&self, x: &mut [f32], off: &[usize]) {
         let h = self.snake1.apply(x);
-        let h = self.conv.forward(&h, t);
+        let h = self.conv.forward_segs(&h, off);
         let h = self.snake2.apply(&h);
-        let h = self.pw.forward(&h, t);
+        let h = self.pw.forward(&h, *off.last().unwrap());
         crate::kernels::add_inplace(x, &h);
     }
 }
@@ -298,45 +318,59 @@ struct Block {
 }
 
 impl Block {
-    /// `x` `[t, c_in]` -> `[t_out, c_out]`; `t0` is the absolute index of `x`'s first step at
-    /// this block's input rate (for the noise).
-    fn forward(&self, x: &[f32], t: usize, t0: usize, layer: usize, noise: Noise) -> (Vec<f32>, usize) {
+    /// Clips laid end to end, `x` rows `off[i]..off[i + 1]` (`[t, c_in]`) for clip `i`, to
+    /// `[t_out, c_out]` and the clips' output offsets; `t0[i]` is the absolute index of clip
+    /// `i`'s first step at this block's input rate and `noise[i]` its noise.
+    fn forward(&self, x: &[f32], off: &[usize], t0: &[usize], layer: usize, noise: &[Noise]) -> (Vec<f32>, Vec<usize>) {
+        let t = *off.last().unwrap();
         let h = self.snake.apply(x);
         let taps = self.up.forward(&h, t); // [t, kernel * c_out]
         let (s, k, p, co) = (self.stride, self.kernel, self.pad, self.c_out);
-        let t_out = (t - 1) * s + k + self.out_pad - 2 * p;
+        let mut out_off = Vec::with_capacity(off.len());
+        out_off.push(0);
+        for w in off.windows(2) {
+            let n = w[1] - w[0];
+            let n_out = if n == 0 { 0 } else { (n - 1) * s + k + self.out_pad - 2 * p };
+            out_off.push(out_off.last().unwrap() + n_out);
+        }
+        let t_out = *out_off.last().unwrap();
         let mut y = vec![0f32; t_out * co];
         // Gather: output step o takes tap (o + p - i * s) of every input step i it overlaps.
-        for_rows(&mut y, co, |o, out| {
+        for_rows(&mut y, co, |row, out| {
+            let sg = seg_of(&out_off, row);
+            let (o, base, n) = (row - out_off[sg], off[sg], off[sg + 1] - off[sg]);
             out.copy_from_slice(&self.up_bias);
             let q = o + p;
-            let i_hi = (q / s).min(t - 1);
+            let i_hi = (q / s).min(n - 1);
             let i_lo = (q + 1).saturating_sub(k).div_ceil(s);
             for i in i_lo..=i_hi {
                 let tap = q - i * s;
                 if tap >= k {
                     continue;
                 }
-                let src = &taps[i * k * co + tap * co..i * k * co + (tap + 1) * co];
-                for (v, &a) in out.iter_mut().zip(src) {
+                let r = (base + i) * k * co + tap * co;
+                for (v, &a) in out.iter_mut().zip(&taps[r..r + co]) {
                     *v += a;
                 }
             }
         });
-        if let (Some(nm), Noise::Seeded(seed)) = (&self.noise, noise) {
+        if let Some(nm) = &self.noise
+            && noise.iter().any(|n| *n != Noise::Off)
+        {
             let lin = nm.forward(&y, t_out);
-            let base = t0 * s;
-            for_rows(&mut y, co, |o, out| {
-                let n = gaussian(seed, layer as u64, (base + o) as u64);
-                for (v, &l) in out.iter_mut().zip(&lin[o * co..(o + 1) * co]) {
+            for_rows(&mut y, co, |row, out| {
+                let sg = seg_of(&out_off, row);
+                let Noise::Seeded(seed) = noise[sg] else { return };
+                let n = gaussian(seed, layer as u64, (t0[sg] * s + row - out_off[sg]) as u64);
+                for (v, &l) in out.iter_mut().zip(&lin[row * co..(row + 1) * co]) {
                     *v += n * l;
                 }
             });
         }
         for r in &self.res {
-            r.forward(&mut y, t_out);
+            r.forward_segs(&mut y, &out_off);
         }
-        (y, t_out)
+        (y, out_off)
     }
 }
 
@@ -983,46 +1017,95 @@ impl Snac {
     /// [`Snac::decode`] for a window whose first coarse frame is frame `frame0` of the clip
     /// (the noise depends on absolute positions, see [`Noise`]).
     pub fn decode_at(&self, codes: &[&[u32]], frame0: usize, noise: Noise) -> Result<Vec<f32>> {
+        Ok(self.decode_batch(&[DecodeJob { codes, frame0, noise }])?.pop().unwrap())
+    }
+
+    /// Decodes several clips (or windows of clips) together: every layer runs once over all of
+    /// them laid end to end, each clip padded and given its noise on its own, so each result
+    /// equals its own [`Snac::decode_at`] (bit for bit on the CPU). Clips are taken in groups of
+    /// about [`BATCH_SAMPLES`] output samples, in order (a clip of under 8 latent steps, one
+    /// frame of the 24 kHz model, on its own).
+    pub fn decode_batch(&self, jobs: &[DecodeJob<'_>]) -> Result<Vec<Vec<f32>>> {
         let cfg = &self.cfg;
-        if codes.len() != cfg.vq_strides.len() {
-            bail!("SNAC: {} codebooks given, the model has {}", codes.len(), cfg.vq_strides.len());
-        }
         let s0 = cfg.vq_strides[0];
-        let n = codes[0].len();
-        if n == 0 {
-            return Ok(Vec::new());
+        for j in jobs {
+            let codes = j.codes;
+            if codes.len() != cfg.vq_strides.len() {
+                bail!("SNAC: {} codebooks given, the model has {}", codes.len(), cfg.vq_strides.len());
+            }
+            let t = codes[0].len() * s0;
+            for (i, (c, &s)) in codes.iter().zip(&cfg.vq_strides).enumerate() {
+                if c.len() * s != t {
+                    bail!("SNAC: codebook {i} has {} codes, expected {}", c.len(), t / s);
+                }
+                if let Some(&bad) = c.iter().find(|&&v| v as usize >= cfg.codebook_size) {
+                    bail!("SNAC: code {bad} of codebook {i} is out of range (0..{})", cfg.codebook_size);
+                }
+            }
         }
-        let t = n * s0;
-        for (i, (c, &s)) in codes.iter().zip(&cfg.vq_strides).enumerate() {
-            if c.len() * s != t {
-                bail!("SNAC: codebook {i} has {} codes, expected {}", c.len(), t / s);
+        let spf = self.samples_per_frame();
+        // A clip of fewer latent steps than a GEMM tile is a pass of its own: alone its first
+        // matmuls take the few-row kernels, whose bits (bf16 weights) are not the GEMM's.
+        let small = |j: &DecodeJob| j.codes[0].len() * s0 < crate::kernels::TN;
+        let mut out = Vec::with_capacity(jobs.len());
+        let mut i = 0;
+        while i < jobs.len() {
+            let mut samples = jobs[i].codes[0].len() * spf;
+            let mut j = i + 1;
+            while j < jobs.len() && !small(&jobs[i]) && !small(&jobs[j]) && samples + jobs[j].codes[0].len() * spf <= BATCH_SAMPLES {
+                samples += jobs[j].codes[0].len() * spf;
+                j += 1;
             }
-            if let Some(&bad) = c.iter().find(|&&v| v as usize >= cfg.codebook_size) {
-                bail!("SNAC: code {bad} of codebook {i} is out of range (0..{})", cfg.codebook_size);
-            }
+            out.extend(self.decode_group(&jobs[i..j]));
+            i = j;
+        }
+        Ok(out)
+    }
+
+    /// The validated clips `jobs` in one pass.
+    fn decode_group(&self, jobs: &[DecodeJob<'_>]) -> Vec<Vec<f32>> {
+        let cfg = &self.cfg;
+        let s0 = cfg.vq_strides[0];
+        let mut off = Vec::with_capacity(jobs.len() + 1);
+        off.push(0usize);
+        for j in jobs {
+            off.push(off.last().unwrap() + j.codes[0].len() * s0);
+        }
+        let t = *off.last().unwrap();
+        if t == 0 {
+            return vec![Vec::new(); jobs.len()];
         }
         let latent = cfg.latent_dim();
         let mut z = vec![0f32; t * latent];
-        for_rows(&mut z, latent, |ti, row| {
-            for ((c, &s), table) in codes.iter().zip(&cfg.vq_strides).zip(&self.tables) {
+        for_rows(&mut z, latent, |row, out| {
+            let sg = seg_of(&off, row);
+            let ti = row - off[sg];
+            for ((c, &s), table) in jobs[sg].codes.iter().zip(&cfg.vq_strides).zip(&self.tables) {
                 let e = c[ti / s] as usize;
-                for (v, &a) in row.iter_mut().zip(&table[e * latent..(e + 1) * latent]) {
+                for (v, &a) in out.iter_mut().zip(&table[e * latent..(e + 1) * latent]) {
                     *v += a;
                 }
             }
         });
-        let h = self.conv_in.forward(&z, t);
+        let h = self.conv_in.forward_segs(&z, &off);
         let mut x = self.proj_in.forward(&h, t);
         if let Some(a) = &self.attn {
-            a.forward(&mut x, t);
+            let c = self.proj_in.n_out;
+            for w in off.windows(2).filter(|w| w[1] > w[0]) {
+                a.forward(&mut x[w[0] * c..w[1] * c], w[1] - w[0]);
+            }
         }
-        let (mut len, mut t0) = (t, frame0 * s0);
+        let noise: Vec<Noise> = jobs.iter().map(|j| j.noise).collect();
+        let mut t0: Vec<usize> = jobs.iter().map(|j| j.frame0 * s0).collect();
         for (l, b) in self.blocks.iter().enumerate() {
-            let (y, ny) = b.forward(&x, len, t0, l, noise);
-            t0 *= b.stride;
+            let (y, ny) = b.forward(&x, &off, &t0, l, &noise);
+            for v in t0.iter_mut() {
+                *v *= b.stride;
+            }
             x = y;
-            len = ny;
+            off = ny;
         }
+        let len = *off.last().unwrap();
         let h = self.snake_out.apply(&x);
         let (c, k) = (self.snake_out.alpha.len(), self.conv_out_k);
         let half = (k - 1) / 2;
@@ -1031,10 +1114,12 @@ impl Snac {
         for_chunks(&mut out, rows, true, |ci, block| {
             for (j, o) in block.iter_mut().enumerate() {
                 let ti = ci * rows + j;
+                let sg = seg_of(&off, ti);
+                let (lo, hi) = (off[sg] as isize, off[sg + 1] as isize);
                 let mut acc = self.conv_out_b;
                 for tap in 0..k {
                     let src = ti as isize + tap as isize - half as isize;
-                    if src < 0 || src >= len as isize {
+                    if src < lo || src >= hi {
                         continue;
                     }
                     let xs = &h[src as usize * c..(src as usize + 1) * c];
@@ -1047,13 +1132,148 @@ impl Snac {
                 *o = acc.tanh();
             }
         });
-        Ok(out)
+        off.windows(2).map(|w| out[w[0]..w[1]].to_vec()).collect()
     }
 }
 
+/// One clip of [`Snac::decode_batch`]: the codes of each codebook as [`Snac::decode`] takes
+/// them, the clip's first coarse frame when it is a window of a longer clip (else 0), its noise.
+#[derive(Clone, Copy, Debug)]
+pub struct DecodeJob<'a> {
+    pub codes: &'a [&'a [u32]],
+    pub frame0: usize,
+    pub noise: Noise,
+}
+
+/// Output samples [`Snac::decode_batch`] decodes in one pass (about 22 s at 24 kHz: the widest
+/// layer then holds 130 MB per activation); a longer clip is a pass of its own.
+pub const BATCH_SAMPLES: usize = 1 << 19;
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use crate::qwen::batch::tests::write_safetensors;
+
+    /// A random SNAC decoder with the 24 kHz model's layout (three codebooks of 4096 codes,
+    /// rates 8 8 4 2, noise blocks) and 64 decoder channels, in a new temporary directory.
+    pub(crate) fn tiny_snac(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("oxinfer-tiny-snac-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (latent, dd, cd, cs) = (32usize, 64usize, 8usize, 4096usize);
+        let rates = [8usize, 8, 4, 2];
+        let cfg = serde_json::json!({
+            "sampling_rate": 24000, "encoder_dim": 4, "encoder_rates": [2, 4, 8, 8], "latent_dim": latent,
+            "decoder_dim": dd, "decoder_rates": rates, "attn_window_size": null, "codebook_size": cs,
+            "codebook_dim": cd, "vq_strides": [4, 2, 1], "noise": true, "depthwise": true,
+        });
+        std::fs::write(dir.join("config.json"), serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let mut seed = 77u64;
+        let mut rnd = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    (((seed >> 40) as f32 / (1u64 << 24) as f32) - 0.5) * scale
+                })
+                .collect()
+        };
+        let mut t: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
+        let mut add = |n: String, shape: &[usize], scale: f32| {
+            let v = rnd(shape.iter().product(), scale);
+            t.push((n, shape.to_vec(), v));
+        };
+        for i in 0..3 {
+            let q = format!("quantizer.quantizers.{i}");
+            add(format!("{q}.codebook.weight"), &[cs, cd], 2.0);
+            add(format!("{q}.out_proj.weight"), &[latent, cd, 1], 1.0);
+            add(format!("{q}.out_proj.bias"), &[latent], 0.2);
+        }
+        add("decoder.model.0.weight".into(), &[latent, 1, 7], 1.0);
+        add("decoder.model.0.bias".into(), &[latent], 0.2);
+        add("decoder.model.1.weight".into(), &[dd, latent, 1], 0.6);
+        add("decoder.model.1.bias".into(), &[dd], 0.2);
+        let mut c = dd;
+        for (bi, &s) in rates.iter().enumerate() {
+            let (b, co) = (format!("decoder.model.{}.block", bi + 2), c / 2);
+            add(format!("{b}.0.alpha"), &[1, c, 1], 2.0);
+            add(format!("{b}.1.weight"), &[c, co, 2 * s], 0.6);
+            add(format!("{b}.1.bias"), &[co], 0.2);
+            add(format!("{b}.2.linear.weight"), &[co, co, 1], 0.6);
+            for j in 0..3 {
+                let r = format!("{b}.{}.block", 3 + j);
+                add(format!("{r}.0.alpha"), &[1, co, 1], 2.0);
+                add(format!("{r}.1.weight"), &[co, 1, 7], 1.0);
+                add(format!("{r}.1.bias"), &[co], 0.2);
+                add(format!("{r}.2.alpha"), &[1, co, 1], 2.0);
+                add(format!("{r}.3.weight"), &[co, co, 1], 0.6);
+                add(format!("{r}.3.bias"), &[co], 0.2);
+            }
+            c = co;
+        }
+        add("decoder.model.6.alpha".into(), &[1, c, 1], 2.0);
+        add("decoder.model.7.weight".into(), &[1, c, 7], 1.0);
+        add("decoder.model.7.bias".into(), &[1], 0.2);
+        write_safetensors(&dir.join("model.safetensors"), &t);
+        dir
+    }
+
+    /// Clips decoded together (different lengths, window offsets and noise, an empty one, more
+    /// than one pass holds) equal their own decodes bit for bit, with f32 and bf16 weights.
+    #[test]
+    fn batch_decode_matches_alone() {
+        crate::pool::init(3);
+        let dir = tiny_snac("batch");
+        for f32_weights in [true, false] {
+            let snac = Snac::load(&dir, &SnacOptions { f32_weights }).unwrap();
+            assert_eq!(snac.samples_per_frame(), 2048);
+            let lens = [3usize, 1, 0, 9, 2, 140, 130, 5];
+            let mut seed = 5u32;
+            let mut code = || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 16) % 4096
+            };
+            let clips: Vec<[Vec<u32>; 3]> = lens
+                .iter()
+                .map(|&n| {
+                    [
+                        (0..n).map(|_| code()).collect(),
+                        (0..2 * n).map(|_| code()).collect(),
+                        (0..4 * n).map(|_| code()).collect(),
+                    ]
+                })
+                .collect();
+            let refs: Vec<[&[u32]; 3]> = clips.iter().map(|c| [&c[0][..], &c[1][..], &c[2][..]]).collect();
+            let jobs: Vec<DecodeJob> = refs
+                .iter()
+                .enumerate()
+                .map(|(i, c)| DecodeJob {
+                    codes: c,
+                    frame0: [0, 7, 0, 2][i % 4],
+                    noise: if i % 3 == 1 { Noise::Off } else { Noise::Seeded(i as u64 / 2) },
+                })
+                .collect();
+            // 140 + 130 frames do not fit one pass.
+            assert!((140 + 130) * snac.samples_per_frame() > BATCH_SAMPLES);
+            let batch = snac.decode_batch(&jobs).unwrap();
+            for (i, (j, b)) in jobs.iter().zip(&batch).enumerate() {
+                let alone = snac.decode_at(j.codes, j.frame0, j.noise).unwrap();
+                assert_eq!(alone.len(), lens[i] * 2048);
+                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(b), bits(&alone), "clip {i} (f32 weights: {f32_weights})");
+            }
+            assert!(batch[0].iter().any(|v| v.abs() > 1e-4));
+            assert!(snac.decode_batch(&[]).unwrap().is_empty());
+            let bad = [&[4096u32][..], &[0, 0][..], &[0, 0, 0, 0][..]];
+            assert!(
+                snac.decode_batch(&[DecodeJob {
+                    codes: &bad,
+                    frame0: 0,
+                    noise: Noise::Off
+                }])
+                .is_err()
+            );
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn sin_matches_libm() {
