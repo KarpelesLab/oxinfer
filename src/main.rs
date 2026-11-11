@@ -1041,7 +1041,12 @@ fn main() -> Result<()> {
     }
     // Resolve repo ids to cached local directories.
     let spec = args.model.to_string_lossy().to_string();
-    args.model = resolve_model(&spec, args.cache_dir.as_deref())?;
+    // (A single safetensors file: a BFL FLUX checkpoint, local or `org/name/file.safetensors`.)
+    args.model = if spec.ends_with(".safetensors") {
+        resolve_file(&spec, args.cache_dir.as_deref())?
+    } else {
+        resolve_model(&spec, args.cache_dir.as_deref())?
+    };
     if let Some(d) = &args.draft
         && d.as_os_str() != "auto"
     {
@@ -1381,7 +1386,10 @@ fn run(mut args: Args) -> Result<()> {
         // Questions about images: the model's Qwen2.5-VL as a chat model.
         args = omnigen2_cli::understanding_args(args);
     }
-    if oxinfer::flux::is_flux_dir(&args.model) || oxinfer::flux::is_flux_gguf(&args.model) {
+    if oxinfer::flux::is_flux_dir(&args.model)
+        || oxinfer::flux::is_flux_gguf(&args.model)
+        || oxinfer::flux::is_flux_safetensors(&args.model)
+    {
         return flux_cli::run(&args);
     }
     if oxinfer::sd3::is_sd3_dir(&args.model) || oxinfer::sd3::is_sd3_gguf(&args.model) {

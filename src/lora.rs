@@ -54,6 +54,29 @@ pub struct LoraDelta {
 }
 
 impl LoraDelta {
+    /// An update that is always on: `y += B (A x)` with `a` `[r, n_in]` and `b` `[n_out, r]`
+    /// (strengths folded in). For LoRA files applied at load to models whose weights stay in
+    /// their stored format (the FLUX transformer: mapped bf16, GGUF blocks, Q8 / Q4).
+    pub fn fixed(a: Vec<f32>, b: &[f32], r: usize, n_in: usize, n_out: usize) -> Self {
+        assert_eq!(a.len(), r * n_in, "LoRA down shape");
+        assert_eq!(b.len(), n_out * r, "LoRA up shape");
+        let mut bt = vec![0f32; r * n_out];
+        for o in 0..n_out {
+            for k in 0..r {
+                bt[k * n_out + o] = b[o * r + k];
+            }
+        }
+        Self {
+            a,
+            bt,
+            r,
+            n_in,
+            n_out,
+            scale: 1.0,
+            active: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
     #[inline]
     pub(crate) fn is_active(&self) -> bool {
         self.active.load(Ordering::Relaxed)

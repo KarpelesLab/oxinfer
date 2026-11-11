@@ -160,6 +160,41 @@ impl<'a> DoubleBlock<'a> {
             .collect()
     }
 
+    /// Every linear layer under its diffusers module name (below `transformer_blocks.{i}.`).
+    pub fn named_mut(&mut self) -> Vec<(&'static str, &mut Dense<'a>)> {
+        let [iq, ik, iv] = &mut self.img_qkv[..] else { unreachable!() };
+        let [tq, tk, tv] = &mut self.txt_qkv[..] else { unreachable!() };
+        let [im0, im1] = &mut self.img_mlp;
+        let [tm0, tm1] = &mut self.txt_mlp;
+        vec![
+            ("norm1.linear", &mut self.img_mod),
+            ("norm1_context.linear", &mut self.txt_mod),
+            ("attn.to_q", iq),
+            ("attn.to_k", ik),
+            ("attn.to_v", iv),
+            ("attn.add_q_proj", tq),
+            ("attn.add_k_proj", tk),
+            ("attn.add_v_proj", tv),
+            ("attn.to_out.0", &mut self.img_out),
+            ("attn.to_add_out", &mut self.txt_out),
+            ("ff.net.0.proj", im0),
+            ("ff.net.2", im1),
+            ("ff_context.net.0.proj", tm0),
+            ("ff_context.net.2", tm1),
+        ]
+    }
+
+    /// The QK norm weights under their diffusers names.
+    pub fn norms_mut(&mut self) -> Vec<(&'static str, &mut Vec<f32>)> {
+        let [a, b, c, d] = &mut self.norms;
+        vec![
+            ("attn.norm_q", a),
+            ("attn.norm_k", b),
+            ("attn.norm_added_q", c),
+            ("attn.norm_added_k", d),
+        ]
+    }
+
     /// Updates the image (`hi`, `[n_img, d]`) and text (`ht`, `[n_txt, d]`) streams. `st` is
     /// SiLU of the conditioning vector; `rope` covers `n_txt + n_img` tokens, text first.
     pub fn forward(&self, hi: &mut [f32], n_img: usize, ht: &mut [f32], n_txt: usize, st: &[f32], rope: &Rope) {
@@ -245,6 +280,25 @@ impl<'a> SingleBlock<'a> {
         [&self.modl, &self.out].into_iter().chain(&self.proj).collect()
     }
 
+    /// Every linear layer under its diffusers module name (below `single_transformer_blocks.{i}.`).
+    pub fn named_mut(&mut self) -> Vec<(&'static str, &mut Dense<'a>)> {
+        let [q, k, v, m] = &mut self.proj[..] else { unreachable!() };
+        vec![
+            ("norm.linear", &mut self.modl),
+            ("attn.to_q", q),
+            ("attn.to_k", k),
+            ("attn.to_v", v),
+            ("proj_mlp", m),
+            ("proj_out", &mut self.out),
+        ]
+    }
+
+    /// The QK norm weights under their diffusers names.
+    pub fn norms_mut(&mut self) -> Vec<(&'static str, &mut Vec<f32>)> {
+        let [a, b] = &mut self.norms;
+        vec![("attn.norm_q", a), ("attn.norm_k", b)]
+    }
+
     /// Updates the joint sequence `h` (`[nt, d]`, text first).
     pub fn forward(&self, h: &mut [f32], nt: usize, st: &[f32], rope: &Rope) {
         let d = self.heads * self.head_dim;
@@ -280,6 +334,10 @@ pub struct FluxTransformer {
     pub cfg: Config,
     pub layout: Layout,
     x_emb: Dense<'static>,
+    /// A LoRA over more input channels than the checkpoint's `x_embedder` reads (BFL's Canny /
+    /// Depth control LoRAs: 128 against 64): the stored layer reads the first channels, this
+    /// update all of them (the same as diffusers' zero-padded, expanded `x_embedder`).
+    x_ext: Option<Box<crate::lora::LoraDelta>>,
     ctx_emb: Dense<'static>,
     time: [Dense<'static>; 2],
     guide: Option<[Dense<'static>; 2]>,
@@ -295,28 +353,56 @@ pub struct FluxTransformer {
     _files: Box<ModelFiles>,
 }
 
+/// The prefix of the transformer's tensors in ComfyUI checkpoints.
+const COMFY_PREFIX: &str = "model.diffusion_model.";
+
 /// Optional `OXINFER_FLUX_LAYERS=D,S`: run only the first D double and S single blocks (for
 /// reference checks against a truncated diffusers model).
-fn layer_limit() -> Option<(usize, usize)> {
+pub(crate) fn layer_limit() -> Option<(usize, usize)> {
     let v = std::env::var("OXINFER_FLUX_LAYERS").ok()?;
     let (a, b) = v.split_once(',')?;
     Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
 }
 
 impl FluxTransformer {
-    /// Loads `dir` (a diffusers `transformer/` folder) or a single GGUF file in BFL layout.
-    /// Float weights are quantized to `quant` (bf16 keeps them as stored, borrowed from the
-    /// mapping); GGUF weights run in their own format whatever `quant` says.
+    /// Loads `dir` (a diffusers `transformer/` folder), a single GGUF file in BFL layout, or a
+    /// single safetensors file (BFL layout: `flux1-dev.safetensors`, with or without ComfyUI's
+    /// `model.diffusion_model.` prefix; or diffusers names). Float weights are quantized to
+    /// `quant` (bf16 keeps them as stored, borrowed from the mapping); GGUF weights run in their
+    /// own format whatever `quant` says.
     pub fn load(path: &Path, quant: Quant) -> Result<Self> {
         let gguf = crate::gguf::is_gguf(path);
+        let in_memory = cfg!(target_arch = "wasm32");
         // Mapped (zero-copy where the stored format runs as is; the page cache streams it).
-        let files = Box::new(ModelFiles::open(path, cfg!(target_arch = "wasm32"))?);
+        let files = if !gguf && path.is_file() {
+            let mut f = ModelFiles::open_file(path, in_memory)?;
+            if f.names().any(|n| n.starts_with(COMFY_PREFIX)) {
+                // A checkpoint that bundles other models: only the transformer's tensors.
+                f.rename(|n| Some(n.strip_prefix(COMFY_PREFIX).map_or_else(|| format!("other.{n}"), str::to_string)));
+            }
+            f
+        } else {
+            ModelFiles::open(path, in_memory)?
+        };
+        for n in ["img_in.weight", "x_embedder.weight"] {
+            if let Some(i) = files.info(n)
+                && !matches!(i.dtype.as_str(), "BF16" | "F16" | "F32")
+                && files.ggml(n).is_none()
+            {
+                bail!(
+                    "{}: weights stored as {} are not supported (fp8 checkpoints: use the bf16 / fp16 file or a GGUF quant)",
+                    path.display(),
+                    i.dtype
+                );
+            }
+        }
+        let files = Box::new(files);
         // SAFETY: the box's heap block does not move, and every layer borrowing it is dropped
         // before `_files` (field order).
         let fs: &'static ModelFiles = unsafe { &*(files.as_ref() as *const ModelFiles) };
         let layout = if fs.has("img_in.weight") { Layout::Bfl } else { Layout::Diffusers };
         let ld = Loader { files: fs, quant };
-        let mut cfg = if !gguf && crate::fsx::exists(&path.join("config.json")) {
+        let mut cfg = if !gguf && !path.is_file() && crate::fsx::exists(&path.join("config.json")) {
             Config::from_json(&serde_json::from_slice(&crate::fsx::read(&path.join("config.json"))?)?)?
         } else {
             Self::infer_config(&ld, layout)?
@@ -375,6 +461,7 @@ impl FluxTransformer {
             cfg,
             layout,
             x_emb,
+            x_ext: None,
             ctx_emb,
             time,
             guide,
@@ -408,7 +495,17 @@ impl FluxTransformer {
         let (d, in_channels) = ld.shape2(&format!("{xe}.weight")).context("not a FLUX transformer")?;
         let (_, joint_dim) = ld.shape2(&format!("{ce}.weight"))?;
         let (_, pooled_dim) = ld.shape2(&format!("{ve}.weight"))?;
-        let head_dim = 128;
+        // The QK norm scales are one head wide (128 in every released FLUX.1).
+        let qn = match layout {
+            Layout::Bfl => "double_blocks.0.img_attn.norm.query_norm.scale",
+            Layout::Diffusers => "transformer_blocks.0.attn.norm_q.weight",
+        };
+        let head_dim = ld
+            .files
+            .info(qn)
+            .and_then(|i| i.shape.first().copied())
+            .filter(|&h| h > 0)
+            .unwrap_or(128);
         if !d.is_multiple_of(head_dim) || num_layers + num_single_layers == 0 {
             bail!("unexpected FLUX transformer shape (hidden {d}, {num_layers} + {num_single_layers} blocks)");
         }
@@ -416,9 +513,15 @@ impl FluxTransformer {
             Layout::Bfl => ld.has("guidance_in.in_layer.weight"),
             Layout::Diffusers => ld.has("time_text_embed.guidance_embedder.linear_1.weight"),
         };
+        let pn = if layout == Layout::Bfl {
+            "final_layer.linear.weight"
+        } else {
+            "proj_out.weight"
+        };
         Ok(Config {
             in_channels,
-            out_channels: in_channels,
+            // FLUX.1 Fill / Canny / Depth read more channels than they predict.
+            out_channels: ld.shape2(pn).map_or(in_channels, |s| s.0),
             num_layers,
             num_single_layers,
             heads: d / head_dim,
@@ -426,9 +529,67 @@ impl FluxTransformer {
             joint_dim,
             pooled_dim,
             guidance_embeds,
-            axes: vec![16, 56, 56],
+            // 16 / 56 / 56 of 128: an eighth for the index axis, the rest halved.
+            axes: vec![head_dim / 8, (head_dim - head_dim / 8) / 2, (head_dim - head_dim / 8) / 2],
             theta: 10000.0,
         })
+    }
+
+    /// Every linear layer under its diffusers module name (`transformer_blocks.0.attn.to_q`,
+    /// `x_embedder`, ...); the final modulation layer, stored as two halves, is
+    /// `norm_out.linear.scale` and `norm_out.linear.shift`.
+    pub fn named_layers_mut(&mut self) -> Vec<(String, &mut Dense<'static>)> {
+        let mut v: Vec<(String, &mut Dense<'static>)> = Vec::new();
+        v.push(("x_embedder".into(), &mut self.x_emb));
+        v.push(("context_embedder".into(), &mut self.ctx_emb));
+        v.push(("proj_out".into(), &mut self.proj_out));
+        let [a, b] = &mut self.norm_out;
+        v.push(("norm_out.linear.scale".into(), a));
+        v.push(("norm_out.linear.shift".into(), b));
+        let emb = [
+            ("timestep_embedder", Some(&mut self.time)),
+            ("guidance_embedder", self.guide.as_mut()),
+            ("text_embedder", Some(&mut self.text)),
+        ];
+        for (n, l) in emb {
+            if let Some([a, b]) = l {
+                v.push((format!("time_text_embed.{n}.linear_1"), a));
+                v.push((format!("time_text_embed.{n}.linear_2"), b));
+            }
+        }
+        for (i, b) in self.doubles.iter_mut().enumerate() {
+            v.extend(b.named_mut().into_iter().map(|(n, l)| (format!("transformer_blocks.{i}.{n}"), l)));
+        }
+        for (i, b) in self.singles.iter_mut().enumerate() {
+            v.extend(
+                b.named_mut()
+                    .into_iter()
+                    .map(|(n, l)| (format!("single_transformer_blocks.{i}.{n}"), l)),
+            );
+        }
+        v
+    }
+
+    /// The QK norm weights under their diffusers names (`transformer_blocks.0.attn.norm_q`).
+    pub fn named_norms_mut(&mut self) -> Vec<(String, &mut Vec<f32>)> {
+        let mut v: Vec<(String, &mut Vec<f32>)> = Vec::new();
+        for (i, b) in self.doubles.iter_mut().enumerate() {
+            v.extend(b.norms_mut().into_iter().map(|(n, l)| (format!("transformer_blocks.{i}.{n}"), l)));
+        }
+        for (i, b) in self.singles.iter_mut().enumerate() {
+            v.extend(
+                b.norms_mut()
+                    .into_iter()
+                    .map(|(n, l)| (format!("single_transformer_blocks.{i}.{n}"), l)),
+            );
+        }
+        v
+    }
+
+    /// Widens the input to `in_channels` with a low-rank update over all of them (see `x_ext`).
+    pub(crate) fn set_input_extension(&mut self, in_channels: usize, ext: Box<crate::lora::LoraDelta>) {
+        self.cfg.in_channels = in_channels;
+        self.x_ext = Some(ext);
     }
 
     /// The conditioning vector: timestep (+ guidance) embeddings plus the pooled-text projection.
@@ -468,7 +629,16 @@ impl FluxTransformer {
         assert_eq!(rope.rows, nt, "rope table rows");
         let temb = self.temb(t, guidance, pooled);
         let st: Vec<f32> = temb.iter().map(|&v| silu(v)).collect();
-        let mut hi = self.x_emb.forward(img, n_img);
+        let mut hi = match &self.x_ext {
+            None => self.x_emb.forward(img, n_img),
+            Some(ext) => {
+                let (ci, cb) = (c.in_channels, self.x_emb.n_in);
+                let base: Vec<f32> = img.chunks_exact(ci).flat_map(|r| r[..cb].iter().copied()).collect();
+                let mut y = self.x_emb.forward(&base, n_img);
+                ext.apply(img, n_img, &mut y);
+                y
+            }
+        };
         let mut ht = self.ctx_emb.forward(txt, n_txt);
         for b in &self.doubles {
             b.forward(&mut hi, n_img, &mut ht, n_txt, &st, rope);

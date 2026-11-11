@@ -757,7 +757,11 @@ typedef struct OxiFlux OxiFlux;
  *                         (default unsloth/FLUX.1-Kontext-dev)
  *   device=auto|cpu|metal|cuda|vulkan
  *   cache_dir=PATH        where repo ids are downloaded
- *   vae_encoder=0|1       load the VAE encoder (default 1; needed for editing) */
+ *   vae_encoder=0|1       load the VAE encoder (default 1; needed for editing)
+ *   lora=FILE[:SCALE]     a LoRA applied to the transformer (diffusers / kohya / BFL / XLabs
+ *                         keys); give it again for more
+ *   vae=SPEC              the autoencoder: BFL's ae.safetensors or a diffusers vae folder
+ * `model` may also be a BFL single-file checkpoint (flux1-dev.safetensors). */
 OxiFlux *oxi_flux_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
 
 /* Frees a pipeline (NULL is ignored); no other call on it may be running. */
@@ -771,12 +775,15 @@ void oxi_flux_cancel(const OxiFlux *f);
  *    "width": 1024, "height": 1024, "max_area": 1048576 (editing: the output is rescaled to
  *    this many pixels at width/height's aspect ratio), "auto_resize": true (editing: the input
  *    goes to the closest preferred Kontext resolution), "max_sequence_length": 512 (T5 tokens;
- *    256 for schnell), "seed": 42, "true_cfg_scale": 1, "negative_prompt": null}
+ *    256 for schnell), "seed": 42, "true_cfg_scale": 1, "negative_prompt": null,
+ *    "strength": null (editing: 0..1 makes it an image-to-image run from the noised input
+ *    instead of a Kontext edit, for FLUX.1 [dev] / [schnell])}
  * Each returns 1, or -1 (error, or cancelled). */
 int oxi_flux_generate(OxiFlux *f, const char *prompt, const char *options_json, oxi_image_fn on_image, oxi_step_fn on_step,
                       void *user);
 
-/* Edits a tightly packed RGB8 image following the instruction `prompt` (Kontext). */
+/* Edits a tightly packed RGB8 image following the instruction `prompt` (Kontext), or with
+ * "strength" redraws it under the prompt (image to image). */
 int oxi_flux_edit_rgb(OxiFlux *f, const char *prompt, const uint8_t *rgb, int width, int height, const char *options_json,
                       oxi_image_fn on_image, oxi_step_fn on_step, void *user);
 

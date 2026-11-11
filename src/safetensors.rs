@@ -516,6 +516,18 @@ impl ModelFiles {
         }
     }
 
+    /// Opens one safetensors file as a checkpoint (single-file checkpoints such as Black Forest
+    /// Labs' `flux1-dev.safetensors`).
+    pub fn open_file(path: &Path, in_memory: bool) -> Result<Self> {
+        let shard = SafeTensors::open(path, in_memory)?;
+        let index = shard.names().map(|n| (n.clone(), 0)).collect();
+        Ok(Self {
+            shards: vec![shard],
+            index,
+            ..Self::empty()
+        })
+    }
+
     /// Opens the checkpoint in directory `dir` (safetensors, sharded or not, or
     /// `pytorch_model.bin`), or a single GGUF file.
     pub fn open(dir: &Path, in_memory: bool) -> Result<Self> {
