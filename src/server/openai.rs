@@ -3,7 +3,10 @@
 use super::media::{TempFiles, random_seed, to_file};
 use super::registry::{Kind, Loaded};
 use super::{Api, ApiError, ApiResponse, ApiResult, Output, Sink, now};
-use crate::engine::{Attachments, Engine, Flow, Message, Reply, Role, SamplingParams, StopReason, SystemPrompt};
+use crate::constrain::Vocab;
+use crate::engine::{
+    Attachments, Engine, Flow, Message, Reply, ResponseFormat, Role, SamplingParams, StopReason, SystemPrompt, TokenLogprob, ToolChoice,
+};
 use crate::tools::{ToolCall, ToolSpec};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
@@ -42,6 +45,8 @@ struct Gen {
     n: usize,
     stream: bool,
     include_usage: bool,
+    /// Log probabilities with this many alternatives per token.
+    logprobs: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -49,6 +54,8 @@ struct ChatRequest {
     model: String,
     messages: Vec<InMessage>,
     tools: Vec<ToolSpec>,
+    tool_choice: ToolChoice,
+    response_format: ResponseFormat,
     think: Option<bool>,
     params: Gen,
 }
@@ -100,9 +107,24 @@ impl Gen {
         if stream && n > 1 {
             return Err(ApiError::bad("n > 1 cannot be streamed").param("n"));
         }
-        if boolean(v, "logprobs")?.unwrap_or(false) || v.get("top_logprobs").is_some_and(|t| !t.is_null()) {
-            return Err(ApiError::bad("logprobs are not supported").param("logprobs"));
-        }
+        // Chat: `logprobs: true` and `top_logprobs: N`; completions: `logprobs: N`.
+        let logprobs = match v.get("logprobs") {
+            None | Some(Value::Null | Value::Bool(false)) => None,
+            Some(Value::Bool(true)) => Some(0),
+            Some(Value::Number(n)) => match n.as_u64() {
+                Some(n) if n <= 20 => Some(n as usize),
+                _ => return Err(ApiError::bad("logprobs must be between 0 and 20").param("logprobs")),
+            },
+            Some(_) => return Err(ApiError::bad("logprobs must be a boolean (chat) or a count (completions)").param("logprobs")),
+        };
+        let logprobs = match num(v, "top_logprobs")? {
+            None => logprobs,
+            Some(t) if !(0.0..=20.0).contains(&t) => {
+                return Err(ApiError::bad("top_logprobs must be between 0 and 20").param("top_logprobs"));
+            }
+            Some(_) if logprobs.is_none() => return Err(ApiError::bad("top_logprobs requires logprobs to be true").param("top_logprobs")),
+            Some(t) => Some(t as usize),
+        };
         let max_tokens = num(v, "max_completion_tokens")?.or(num(v, "max_tokens")?);
         if max_tokens.is_some_and(|m| m < 1.0) {
             return Err(ApiError::bad("max_tokens must be at least 1").param("max_tokens"));
@@ -130,6 +152,7 @@ impl Gen {
             n,
             stream,
             include_usage: v.pointer("/stream_options/include_usage").and_then(Value::as_bool).unwrap_or(false),
+            logprobs,
         })
     }
 
@@ -200,8 +223,9 @@ fn content(v: &Value, role: Role) -> ApiResult<(String, Vec<MediaPart>)> {
     }
 }
 
-/// Tool definitions (`[{"type": "function", "function": {...}}]`), as `tool_choice` allows.
-fn tools(v: &Value) -> ApiResult<Vec<ToolSpec>> {
+/// Tool definitions (`[{"type": "function", "function": {...}}]`), as `tool_choice` allows, and
+/// whether a call is forced (the parameter schemas of the tools it may be are then checked).
+fn tools(v: &Value) -> ApiResult<(Vec<ToolSpec>, ToolChoice)> {
     let bad = |m: String| ApiError::bad(m).param("tools");
     let mut out = Vec::new();
     if let Some(list) = v.get("tools").filter(|t| !t.is_null()) {
@@ -225,11 +249,16 @@ fn tools(v: &Value) -> ApiResult<Vec<ToolSpec>> {
             });
         }
     }
+    let mut choice = ToolChoice::Auto;
     match v.get("tool_choice") {
         None | Some(Value::Null) => {}
         Some(Value::String(s)) => match s.as_str() {
             "none" => out.clear(),
-            "auto" | "required" => {}
+            "auto" => {}
+            "required" if out.is_empty() => {
+                return Err(ApiError::bad("tool_choice is required, but no tools are given").param("tool_choice"));
+            }
+            "required" => choice = ToolChoice::Required,
             other => {
                 return Err(
                     ApiError::bad(format!("tool_choice {other:?}: expected none, auto, required or a function")).param("tool_choice"),
@@ -244,9 +273,15 @@ fn tools(v: &Value) -> ApiResult<Vec<ToolSpec>> {
             if out.is_empty() {
                 return Err(ApiError::bad(format!("tool_choice names {name:?}, which is not in tools")).param("tool_choice"));
             }
+            choice = ToolChoice::Function(name.to_string());
         }
     }
-    Ok(out)
+    if choice != ToolChoice::Auto {
+        for t in &out {
+            crate::constrain::check_tool(t).map_err(|e| ApiError::bad(format!("{e:#}")).param("tools"))?;
+        }
+    }
+    Ok((out, choice))
 }
 
 impl ChatRequest {
@@ -316,10 +351,17 @@ impl ChatRequest {
             .or(boolean(v, "enable_thinking")?)
             .or(v.pointer("/chat_template_kwargs/enable_thinking").and_then(Value::as_bool))
             .or(effort.map(|e| !matches!(e, "none" | "minimal")));
+        let (tools, tool_choice) = tools(v)?;
+        let response_format = match v.get("response_format") {
+            None | Some(Value::Null) => ResponseFormat::Text,
+            Some(f) => ResponseFormat::from_json(f).map_err(|e| ApiError::bad(format!("{e:#}")).param("response_format"))?,
+        };
         Ok(Self {
             model: model.to_string(),
             messages,
-            tools: tools(v)?,
+            tools,
+            tool_choice,
+            response_format,
             think,
             params: Gen::parse(v, 8)?,
         })
@@ -410,8 +452,75 @@ impl<'a> StopFilter<'a> {
 
 // ---- chat completions -------------------------------------------------------------------------
 
+/// A token's log probability as the API shows it: the token's text and bytes, and the most
+/// likely tokens at its position.
+#[derive(Clone, Debug)]
+struct LogEntry {
+    token: String,
+    bytes: Vec<u8>,
+    logprob: f32,
+    top: Vec<(String, Vec<u8>, f32)>,
+}
+
+impl LogEntry {
+    fn new(vocab: &Vocab, l: &TokenLogprob) -> Self {
+        let text = |id: u32| (String::from_utf8_lossy(vocab.bytes(id)).into_owned(), vocab.bytes(id).to_vec());
+        // JSON has no infinity: a token the model gave no probability (one a constraint
+        // forced, at most) shows OpenAI's floor.
+        let finite = |p: f32| if p.is_finite() { p.max(-9999.0) } else { -9999.0 };
+        let (token, bytes) = text(l.token);
+        Self {
+            token,
+            bytes,
+            logprob: finite(l.logprob),
+            top: l
+                .top
+                .iter()
+                .map(|&(id, p)| {
+                    let (t, b) = text(id);
+                    (t, b, finite(p))
+                })
+                .collect(),
+        }
+    }
+
+    /// Chat completions: `{"content": [{token, logprob, bytes, top_logprobs}]}`.
+    fn chat(entries: &[LogEntry]) -> Value {
+        let list: Vec<Value> = entries
+            .iter()
+            .map(|e| {
+                let top: Vec<Value> = e
+                    .top
+                    .iter()
+                    .map(|(t, b, p)| json!({ "token": t, "logprob": p, "bytes": b }))
+                    .collect();
+                json!({ "token": e.token, "logprob": e.logprob, "bytes": e.bytes, "top_logprobs": top })
+            })
+            .collect();
+        json!({ "content": list, "refusal": null })
+    }
+
+    /// Completions: parallel `tokens`, `token_logprobs`, `top_logprobs` and `text_offset`
+    /// (characters, from `offset`).
+    fn legacy(entries: &[LogEntry], mut offset: usize) -> Value {
+        let mut offsets = Vec::new();
+        for e in entries {
+            offsets.push(offset);
+            offset += e.token.chars().count();
+        }
+        json!({
+            "tokens": entries.iter().map(|e| e.token.as_str()).collect::<Vec<_>>(),
+            "token_logprobs": entries.iter().map(|e| e.logprob).collect::<Vec<_>>(),
+            "top_logprobs": entries.iter().map(|e| e.top.iter().map(|(t, _, p)| (t.clone(), json!(p))).collect::<Map<String, Value>>()).collect::<Vec<_>>(),
+            "text_offset": offsets,
+        })
+    }
+}
+
 /// One generated choice.
 struct Choice {
+    /// With `logprobs`: the entries of the answer's tokens.
+    logprobs: Option<Vec<LogEntry>>,
     text: String,
     thinking: String,
     tool_calls: Vec<ToolCall>,
@@ -419,6 +528,8 @@ struct Choice {
     prompt_tokens: usize,
     cached_tokens: usize,
     completion_tokens: usize,
+    /// Characters of `text` that were generated (completions: the rest is the echoed prompt).
+    generated_chars: usize,
 }
 
 fn finish_reason(r: &Reply, stopped: bool) -> &'static str {
@@ -430,8 +541,45 @@ fn finish_reason(r: &Reply, stopped: bool) -> &'static str {
     }
 }
 
-/// A streamed piece: (choice, text, thinking).
-type Emit<'a> = &'a mut dyn FnMut(usize, &str, bool) -> bool;
+/// A streamed piece: (choice, text, thinking, the log probabilities of the tokens it adds).
+type Emit<'a> = &'a mut dyn FnMut(usize, &str, bool, &[LogEntry]) -> bool;
+
+/// Collects the log probabilities of a reply's answer tokens: all of them, and those not yet
+/// sent with a streamed piece.
+struct LogCollector {
+    vocab: Option<Arc<Vocab>>,
+    all: Vec<LogEntry>,
+    pending: Vec<LogEntry>,
+}
+
+impl LogCollector {
+    fn new(engine: &mut Engine, on: bool) -> Self {
+        Self {
+            vocab: on.then(|| engine.token_vocab()),
+            all: Vec::new(),
+            pending: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, l: Option<&TokenLogprob>) {
+        if let (Some(v), Some(l)) = (&self.vocab, l.filter(|l| l.content)) {
+            self.pending.push(LogEntry::new(v, l));
+        }
+    }
+
+    /// The entries to send with the next piece.
+    fn take(&mut self) -> Vec<LogEntry> {
+        self.all.extend(self.pending.iter().cloned());
+        std::mem::take(&mut self.pending)
+    }
+
+    /// The entries of the reply; with `cut` (a stop sequence), without the tokens whose text
+    /// was never released.
+    fn finish(mut self, cut: bool) -> (Option<Vec<LogEntry>>, Vec<LogEntry>) {
+        let rest = if cut { Vec::new() } else { self.take() };
+        (self.vocab.is_some().then_some(self.all), rest)
+    }
+}
 
 /// Runs the request's `n` choices on its model, streaming the text to `emit`.
 fn run_chat(api: &Api, req: &ChatRequest, emit: Emit) -> ApiResult<Vec<Choice>> {
@@ -441,6 +589,10 @@ fn run_chat(api: &Api, req: &ChatRequest, emit: Emit) -> ApiResult<Vec<Choice>> 
     let spec = lease.spec().clone();
     let Loaded::Chat(engine) = lease.model() else { unreachable!() };
     configure(engine, &spec, req.think, &req.tools, req.params.max_tokens);
+    let c = engine.config_mut();
+    c.response_format = req.response_format.clone();
+    c.tool_choice = req.tool_choice.clone();
+    c.logprobs = req.params.logprobs;
     let seed = req.params.seed.unwrap_or_else(random_seed);
     let mut out = Vec::new();
     for i in 0..req.params.n {
@@ -448,29 +600,33 @@ fn run_chat(api: &Api, req: &ChatRequest, emit: Emit) -> ApiResult<Vec<Choice>> 
         let mut filter = StopFilter::new(&req.params.stop);
         let (mut text, mut thinking) = (String::new(), String::new());
         let mut gone = false;
+        let mut logs = LogCollector::new(engine, req.params.logprobs.is_some());
         let reply = engine
             .chat(&messages, &mut |d| {
+                logs.push(d.logprob);
                 let ok = if d.thinking {
                     thinking.push_str(d.text);
-                    d.text.is_empty() || emit(i, d.text, true)
+                    d.text.is_empty() || emit(i, d.text, true, &[])
                 } else {
                     let t = filter.push(d.text);
                     text.push_str(&t);
-                    t.is_empty() || emit(i, &t, false)
+                    t.is_empty() || emit(i, &t, false, &logs.take())
                 };
                 gone |= !ok;
                 if gone || filter.hit { Flow::Stop } else { Flow::Continue }
             })
             .map_err(|e| ApiError::bad(format!("{e:#}")))?;
         let rest = filter.finish();
-        if !rest.is_empty() {
+        let (logprobs, last) = logs.finish(filter.hit);
+        if !rest.is_empty() || !last.is_empty() {
             text.push_str(&rest);
-            emit(i, &rest, false);
+            emit(i, &rest, false, &last);
         }
         if gone {
             break;
         }
         out.push(Choice {
+            logprobs,
             finish: finish_reason(&reply, filter.hit),
             text,
             thinking,
@@ -478,6 +634,7 @@ fn run_chat(api: &Api, req: &ChatRequest, emit: Emit) -> ApiResult<Vec<Choice>> 
             prompt_tokens: reply.stats.prompt_tokens + reply.stats.cached_tokens,
             cached_tokens: reply.stats.cached_tokens,
             completion_tokens: reply.stats.generated_tokens,
+            generated_chars: 0,
         });
     }
     Ok(out)
@@ -546,7 +703,7 @@ pub(super) fn chat(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
             }),
         });
     }
-    let choices = run_chat(api, &req, &mut |_, _, _| true)?;
+    let choices = run_chat(api, &req, &mut |_, _, _, _| true)?;
     api.flush_prompt_cache_later(&req.model);
     let list: Vec<Value> = choices
         .iter()
@@ -562,7 +719,7 @@ pub(super) fn chat(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
             if !c.tool_calls.is_empty() {
                 msg["tool_calls"] = tool_calls_json(api, &c.tool_calls, false);
             }
-            json!({ "index": i, "message": msg, "logprobs": null, "finish_reason": c.finish })
+            json!({ "index": i, "message": msg, "logprobs": c.logprobs.as_deref().map(LogEntry::chat), "finish_reason": c.finish })
         })
         .collect();
     Ok(Output::Full(ApiResponse::json(
@@ -584,22 +741,29 @@ fn sse(sink: Sink, v: &Value) -> bool {
 }
 
 fn stream_chat(api: &Api, req: &ChatRequest, id: &str, created: u64, sink: Sink) {
-    let chunk = |delta: Value, finish: Value| {
+    let chunk_with = |delta: Value, finish: Value, logprobs: Value| {
         json!({
             "id": id, "object": "chat.completion.chunk", "created": created, "model": req.model,
-            "choices": [{ "index": 0, "delta": delta, "logprobs": null, "finish_reason": finish }],
+            "choices": [{ "index": 0, "delta": delta, "logprobs": logprobs, "finish_reason": finish }],
         })
     };
+    let chunk = |delta: Value, finish: Value| chunk_with(delta, finish, Value::Null);
     if !sse(sink, &chunk(json!({ "role": "assistant", "content": "" }), Value::Null)) {
         return;
     }
-    let r = run_chat(api, req, &mut |_, text, thinking| {
+    let r = run_chat(api, req, &mut |_, text, thinking, logprobs| {
         let delta = if thinking {
             json!({ "reasoning_content": text })
         } else {
             json!({ "content": text })
         };
-        sse(sink, &chunk(delta, Value::Null))
+        // The entries of the tokens whose text this piece (or an earlier, empty one) holds.
+        let logprobs = if req.params.logprobs.is_some() && !thinking {
+            LogEntry::chat(logprobs)
+        } else {
+            Value::Null
+        };
+        sse(sink, &chunk_with(delta, Value::Null, logprobs))
     });
     match r {
         Ok(choices) => {
@@ -669,16 +833,26 @@ pub(super) fn completions(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
         return Ok(Output::Stream {
             content_type: "text/event-stream".into(),
             producer: Box::new(move |sink| {
-                let chunk = |text: &str, finish: Value| {
+                let chunk = |text: &str, finish: Value, logprobs: Value| {
                     json!({
                         "id": id, "object": "text_completion", "created": created, "model": job.model,
-                        "choices": [{ "index": 0, "text": text, "logprobs": null, "finish_reason": finish }],
+                        "choices": [{ "index": 0, "text": text, "logprobs": logprobs, "finish_reason": finish }],
                     })
                 };
-                match job.run(&api, &mut |_, t| sse(sink, &chunk(t, Value::Null))) {
+                let mut offset = 0;
+                let mut piece = |_: usize, t: &str, l: &[LogEntry]| {
+                    let logprobs = if job.params.logprobs.is_some() {
+                        LogEntry::legacy(l, offset)
+                    } else {
+                        Value::Null
+                    };
+                    offset += t.chars().count();
+                    sse(sink, &chunk(t, Value::Null, logprobs))
+                };
+                match job.run(&api, &mut piece) {
                     Ok(choices) => {
                         if let Some(c) = choices.first() {
-                            sse(sink, &chunk("", c.finish.into()));
+                            sse(sink, &chunk("", c.finish.into(), Value::Null));
                         }
                         if job.params.include_usage {
                             let u = json!({
@@ -696,11 +870,20 @@ pub(super) fn completions(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
             }),
         });
     }
-    let choices = job.run(api, &mut |_, _| true)?;
+    let choices = job.run(api, &mut |_, _, _| true)?;
     let list: Vec<Value> = choices
         .iter()
         .enumerate()
-        .map(|(i, c)| json!({ "index": i, "text": c.text, "logprobs": null, "finish_reason": c.finish }))
+        .map(|(i, c)| {
+            // Offsets count from the start of `text`, after an echoed prompt.
+            let echoed = if job.echo {
+                c.text.chars().count().saturating_sub(c.generated_chars)
+            } else {
+                0
+            };
+            let logprobs = c.logprobs.as_deref().map(|l| LogEntry::legacy(l, echoed));
+            json!({ "index": i, "text": c.text, "logprobs": logprobs, "finish_reason": c.finish })
+        })
         .collect();
     let completion: usize = choices.iter().map(|c| c.completion_tokens).sum();
     let prompt: usize = choices.iter().step_by(job.params.n).map(|c| c.prompt_tokens).sum();
@@ -721,12 +904,17 @@ struct Completion {
 }
 
 impl Completion {
-    /// Every prompt `n` times; `emit(choice, text)` streams.
-    fn run(&self, api: &Api, emit: &mut dyn FnMut(usize, &str) -> bool) -> ApiResult<Vec<Choice>> {
+    /// Every prompt `n` times; `emit(choice, text, log probabilities)` streams.
+    fn run(&self, api: &Api, emit: &mut dyn FnMut(usize, &str, &[LogEntry]) -> bool) -> ApiResult<Vec<Choice>> {
         let mut lease = api.models.acquire(&self.model, Kind::Chat)?;
         let spec = lease.spec().clone();
         let Loaded::Chat(engine) = lease.model() else { unreachable!() };
-        engine.config_mut().max_tokens = self.params.max_tokens.unwrap_or(16);
+        let c = engine.config_mut();
+        c.max_tokens = self.params.max_tokens.unwrap_or(16);
+        // A raw continuation: nothing of the last chat request constrains it.
+        c.response_format = ResponseFormat::Text;
+        c.tool_choice = ToolChoice::Auto;
+        c.logprobs = self.params.logprobs;
         let seed = self.params.seed.unwrap_or_else(random_seed);
         let mut out = Vec::new();
         for p in &self.prompts {
@@ -748,27 +936,33 @@ impl Completion {
                 engine.set_sampling(self.params.sampling(&spec, seed.wrapping_add(k as u64)));
                 let mut filter = StopFilter::new(&self.params.stop);
                 let mut text = if self.echo { prompt.clone() } else { String::new() };
-                if self.echo && !emit(k, &prompt) {
+                if self.echo && !emit(k, &prompt, &[]) {
                     break;
                 }
                 let mut gone = false;
+                let echoed = text.chars().count();
+                let mut logs = LogCollector::new(engine, self.params.logprobs.is_some());
                 let reply = engine
                     .complete(&prompt, &mut |d| {
+                        logs.push(d.logprob);
                         let t = filter.push(d.text);
                         text.push_str(&t);
-                        gone |= !t.is_empty() && !emit(k, &t);
+                        gone |= !t.is_empty() && !emit(k, &t, &logs.take());
                         if gone || filter.hit { Flow::Stop } else { Flow::Continue }
                     })
                     .map_err(|e| ApiError::bad(format!("{e:#}")))?;
                 let rest = filter.finish();
-                if !rest.is_empty() {
+                let (logprobs, last) = logs.finish(filter.hit);
+                if !rest.is_empty() || !last.is_empty() {
                     text.push_str(&rest);
-                    emit(k, &rest);
+                    emit(k, &rest, &last);
                 }
                 if gone {
                     return Ok(out);
                 }
                 out.push(Choice {
+                    logprobs,
+                    generated_chars: text.chars().count() - echoed,
                     finish: finish_reason(&reply, filter.hit),
                     text,
                     thinking: String::new(),
@@ -896,6 +1090,8 @@ mod tests {
         assert_eq!(r.messages[2].tool_calls[0].1.arguments["x"], 1);
         assert_eq!(r.messages[3].name.as_deref(), Some("look"));
         assert_eq!(r.tools.len(), 1);
+        assert_eq!(r.tool_choice, ToolChoice::Function("look".into()));
+        assert_eq!(r.response_format, ResponseFormat::Text);
         assert_eq!(r.think, Some(true));
         let g = &r.params;
         assert_eq!(
@@ -924,6 +1120,95 @@ mod tests {
         );
         let none = json!({"model": "m", "messages": [{"role": "user", "content": "x"}], "tools": v["tools"], "tool_choice": "none"});
         assert!(ChatRequest::parse(&none).unwrap().tools.is_empty());
+    }
+
+    #[test]
+    fn constraints_and_logprobs_parsing() {
+        let with = |extra: Value| {
+            let mut v = json!({"model": "m", "messages": [{"role": "user", "content": "x"}]});
+            for (k, x) in extra.as_object().unwrap() {
+                v[k] = x.clone();
+            }
+            ChatRequest::parse(&v)
+        };
+        let tools = json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {"a": {"type": "integer"}}}}},
+                           {"type": "function", "function": {"name": "g"}}]);
+        let r = with(json!({"tools": tools, "tool_choice": "required", "logprobs": true, "top_logprobs": 5})).unwrap();
+        assert_eq!(
+            (r.tool_choice, r.tools.len(), r.params.logprobs),
+            (ToolChoice::Required, 2, Some(5))
+        );
+        assert_eq!(with(json!({"logprobs": true})).unwrap().params.logprobs, Some(0));
+        assert_eq!(with(json!({"logprobs": false})).unwrap().params.logprobs, None);
+        assert_eq!(with(json!({"top_logprobs": 3})).unwrap_err().param, Some("top_logprobs"));
+        assert_eq!(
+            with(json!({"logprobs": true, "top_logprobs": 21})).unwrap_err().param,
+            Some("top_logprobs")
+        );
+        assert_eq!(with(json!({"tool_choice": "required"})).unwrap_err().param, Some("tool_choice"));
+        // A forced call needs a parameter schema the grammar can follow.
+        let odd = json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {"a": {"type": "integer", "minimum": 1}}}}}]);
+        let e = with(json!({"tools": odd, "tool_choice": "required"})).unwrap_err();
+        assert!(
+            e.param == Some("tools") && e.status == 400 && e.message.contains("\"minimum\" is not supported"),
+            "{}",
+            e.message
+        );
+        assert!(with(json!({"tools": odd})).is_ok());
+
+        let schema = json!({"type": "object", "properties": {"n": {"type": "integer"}}, "required": ["n"], "additionalProperties": false});
+        let r = with(json!({"response_format": {"type": "json_schema", "json_schema": {"name": "n", "strict": true, "schema": schema}}}))
+            .unwrap();
+        assert_eq!(r.response_format, ResponseFormat::JsonSchema(schema));
+        assert_eq!(
+            with(json!({"response_format": {"type": "json_object"}})).unwrap().response_format,
+            ResponseFormat::JsonObject
+        );
+        assert_eq!(
+            with(json!({"response_format": {"type": "text"}})).unwrap().response_format,
+            ResponseFormat::Text
+        );
+        let e = with(json!({"response_format": {"type": "json_schema", "json_schema": {"name": "n", "schema": {"type": "string", "pattern": "^a"}}}})).unwrap_err();
+        assert!(
+            e.status == 400 && e.param == Some("response_format") && e.message.contains("\"pattern\" is not supported"),
+            "{}",
+            e.message
+        );
+        assert!(with(json!({"response_format": {"type": "json_schema"}})).is_err());
+        assert!(with(json!({"response_format": {"type": "yaml"}})).is_err());
+        // Completions take the number of alternatives.
+        assert_eq!(Gen::parse(&json!({"logprobs": 3}), 1).unwrap().logprobs, Some(3));
+        assert!(Gen::parse(&json!({"logprobs": 99}), 1).is_err());
+    }
+
+    #[test]
+    fn logprob_shapes() {
+        let tokens = vec![(b"Hel".to_vec(), true), (b"lo".to_vec(), true), (vec![0xe6, 0x97], true)];
+        let vocab = Vocab::from_tokens(tokens, Vec::new());
+        let entry = |token, logprob: f32, top: &[(u32, f32)]| {
+            let l = TokenLogprob {
+                token,
+                logprob,
+                top: top.to_vec(),
+                content: true,
+            };
+            LogEntry::new(&vocab, &l)
+        };
+        let list = [entry(0, -0.5, &[(0, -0.5), (1, -2.0)]), entry(2, f32::NEG_INFINITY, &[])];
+        let chat = LogEntry::chat(&list);
+        assert_eq!(
+            chat["content"][0],
+            json!({"token": "Hel", "logprob": -0.5, "bytes": [72, 101, 108],
+            "top_logprobs": [{"token": "Hel", "logprob": -0.5, "bytes": [72, 101, 108]}, {"token": "lo", "logprob": -2.0, "bytes": [108, 111]}]})
+        );
+        // Part of a character: its bytes, and the floor for a probability of zero.
+        assert_eq!(chat["content"][1]["bytes"], json!([0xe6, 0x97]));
+        assert_eq!(chat["content"][1]["logprob"], json!(-9999.0));
+        let legacy = LogEntry::legacy(&list[..1], 4);
+        assert_eq!(
+            legacy,
+            json!({"tokens": ["Hel"], "token_logprobs": [-0.5], "top_logprobs": [{"Hel": -0.5, "lo": -2.0}], "text_offset": [4]})
+        );
     }
 
     #[test]

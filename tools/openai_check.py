@@ -113,7 +113,75 @@ if a.chat:
     assert "156" in (msg.content or "") and reasoning, msg
     ok("reasoning", f"{len(reasoning)} chars of reasoning, answer {msg.content.strip()[-40:]!r}")
 
-    r = c.completions.create(model=m, prompt="The capital of France is", max_tokens=5, temperature=0)
+    # Structured outputs: the reply is constrained to the schema while decoding.
+    schema = {"type": "object",
+              "properties": {"name": {"type": "string"}, "population": {"type": "integer"},
+                             "continent": {"enum": ["Africa", "America", "Asia", "Europe", "Oceania"]},
+                             "landmarks": {"type": "array", "items": {"$ref": "#/$defs/landmark"}}},
+              "required": ["name", "population", "continent", "landmarks"], "additionalProperties": False,
+              "$defs": {"landmark": {"type": "object", "properties": {"name": {"type": "string"}, "year": {"type": ["integer", "null"]}},
+                                     "required": ["name", "year"], "additionalProperties": False}}}
+    fmt = {"type": "json_schema", "json_schema": {"name": "city", "strict": True, "schema": schema}}
+    def city(text):
+        d = json.loads(text)
+        assert list(d) == schema["required"] and isinstance(d["name"], str) and type(d["population"]) is int, d
+        assert d["continent"] in schema["properties"]["continent"]["enum"], d
+        for l in d["landmarks"]:
+            assert list(l) == ["name", "year"] and isinstance(l["name"], str) and (l["year"] is None or type(l["year"]) is int), d
+        return d
+    n = 0
+    for i, q in enumerate(["Tell me about Paris.", "Describe Tokyo.", "What is 2 + 2?", "Sing a song.", "Cairo?"]):
+        for t in (0, 1):
+            r = c.chat.completions.create(model=m, temperature=t, seed=i, max_tokens=400, response_format=fmt,
+                                          messages=[{"role": "user", "content": q}])
+            if r.choices[0].finish_reason != "length":
+                city(r.choices[0].message.content)
+                n += 1
+    assert n >= 8, n
+    ok("response_format json_schema", f"{n} of 10 replies complete, all valid")
+    r = c.chat.completions.create(model=m, temperature=0, max_tokens=200, response_format={"type": "json_object"},
+                                  messages=[{"role": "user", "content": "Say hello."}])
+    assert isinstance(json.loads(r.choices[0].message.content), dict)
+    ok("response_format json_object", r.choices[0].message.content)
+    text = "".join(ch.choices[0].delta.content or "" for ch in c.chat.completions.create(
+        model=m, temperature=0, max_tokens=400, response_format=fmt, stream=True,
+        messages=[{"role": "user", "content": "Tell me about Rome."}]) if ch.choices)
+    ok("response_format stream", city(text)["name"])
+    try:
+        bad = {"type": "json_schema", "json_schema": {"name": "x", "schema": {"type": "string", "pattern": "^a"}}}
+        c.chat.completions.create(model=m, response_format=bad, messages=[{"role": "user", "content": "hi"}])
+        raise AssertionError("expected an error")
+    except openai.BadRequestError as e:
+        ok("unsupported schema -> 400", e.body["message"] if isinstance(e.body, dict) else e.body)
+
+    # Forced tool calls.
+    for choice in ("required", {"type": "function", "function": {"name": "get_weather"}}):
+        r = c.chat.completions.create(model=m, temperature=0, max_tokens=200, tools=WEATHER, tool_choice=choice,
+                                      messages=[{"role": "user", "content": "Hello, how are you?"}])
+        call = r.choices[0].message.tool_calls[0]
+        args = json.loads(call.function.arguments)
+        assert call.function.name == "get_weather" and list(args) == ["city"] and isinstance(args["city"], str), call
+        ok(f"tool_choice {choice if isinstance(choice, str) else 'function'}", call.function.arguments)
+
+    # Log probabilities.
+    r = c.chat.completions.create(model=m, temperature=0, max_tokens=20, logprobs=True, top_logprobs=3,
+                                  messages=[{"role": "user", "content": "Name three colors."}])
+    lp = r.choices[0].logprobs.content
+    assert len(lp) == r.usage.completion_tokens and all(len(e.top_logprobs) == 3 and e.logprob <= 0 for e in lp), lp
+    assert bytes(b for e in lp for b in e.bytes).decode().strip() == r.choices[0].message.content.strip()
+    ok("logprobs", f"{len(lp)} tokens, first {lp[0].token!r} {lp[0].logprob:.3f}")
+    got = [e for ch in c.chat.completions.create(model=m, temperature=0, max_tokens=20, logprobs=True, top_logprobs=3, stream=True,
+                                                 messages=[{"role": "user", "content": "Name three colors."}])
+           for choice in ch.choices if choice.logprobs for e in choice.logprobs.content or []]
+    # The same tokens. The values are equal only when the repeat reuses nothing of the first
+    # request's cache (see the README): with a cached prefix the last prompt token runs alone.
+    assert [(e.token, e.bytes) for e in got] == [(e.token, e.bytes) for e in lp], got
+    worst = max(abs(x.logprob - y.logprob) for x, y in zip(got, lp))
+    assert worst < 1.0, worst
+    ok("logprobs stream", f"{len(got)} tokens, max difference to the first request {worst:.2e}")
+
+    r = c.completions.create(model=m, prompt="The capital of France is", max_tokens=5, temperature=0, logprobs=2)
+    assert len(r.choices[0].logprobs.tokens) == 5 and "".join(r.choices[0].logprobs.tokens) == r.choices[0].text
     ok("completions", repr(r.choices[0].text))
 
     try:
