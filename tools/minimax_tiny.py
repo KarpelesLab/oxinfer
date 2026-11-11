@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Tiny random MiniMax checkpoints + transformers reference outputs (float32, CPU, eager).
 
-usage: minimax_tiny.py OUT_DIR [--arch m2] [--gen N] [--seed S] [--fp8]
+usage: minimax_tiny.py OUT_DIR [--arch m2|m3] [--release] [--gen N] [--seed S] [--fp8]
 
 --arch m2: MiniMax-M2 / M2.1 / M2.5 / M2.7 (`minimax_m2`): full attention with query / key norms
   over all heads, partial RoPE, sigmoid-routed experts with a selection bias, no shared expert.
---fp8: the attention and expert projections stored as the releases store them (float8_e4m3fn with
-  one `weight_scale_inv` per 32 x 32 block); the reference runs on the dequantized values.
+--arch m3: MiniMax-M3 / M3.1 (text): a dense leading layer, then MoE layers with a shared expert,
+  clamped swigluoai and the MSA lightning indexer (blocks of 4, top 3: sparse past 12 positions).
+--release (m3): the tensors and config.json as MiniMax's release lays them out.
+--fp8: M2: the projections as float8_e4m3fn with one `weight_scale_inv` per 32 x 32 block; M3
+  --release: MXFP8 projections (E8M0 per 32) and NVFP4 experts (compressed-tensors), as
+  MiniMax-M3.1-Flash. The reference runs on the dequantized values.
 
 Writes OUT_DIR/model, OUT_DIR/prompt.txt, OUT_DIR/ref.bin ([1+N, vocab] f32: the prompt's last
 position, then after each greedy token via the KV cache), OUT_DIR/gen.txt and OUT_DIR/prefill.bin
@@ -147,8 +151,134 @@ with torch.no_grad():
         p.copy_(p.to(torch.bfloat16).float())
 os.makedirs(out, exist_ok=True)
 mdir = os.path.join(out, "model")
-m.save_pretrained(mdir)
-if fp8:
+release = "--release" in args
+if release and arch != "m3":
+    sys.exit("--release is for --arch m3")
+if not release:
+    m.save_pretrained(mdir)
+E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
+
+
+def mxfp8(w):
+    """MXFP8 as MiniMax M3.1 stores it: float8_e4m3fn values, an E8M0 exponent byte per 32 along
+    each row. Returns (values, exponents, dequantized)."""
+    r, c = w.shape
+    b = w.reshape(r, c // 32, 32)
+    e = torch.ceil(torch.log2(b.abs().amax(-1).clamp(min=1e-30) / 448.0)).clamp(-127, 127)
+    q = (b / torch.exp2(e)[..., None]).to(torch.float8_e4m3fn)
+    deq = (q.float() * torch.exp2(e)[..., None]).reshape(r, c)
+    return q.reshape(r, c), (e + 127).to(torch.uint8), deq
+
+
+def nvfp4(w):
+    """NVFP4 as compressed-tensors stores it: E2M1 codes (two per byte, low nibble first), an
+    E4M3 scale per 16, the tensor's global scale (a divisor). Returns (packed, scales, global,
+    dequantized)."""
+    r, c = w.shape
+    g = 448.0 * 6.0 / w.abs().max().clamp(min=1e-30)
+    b = w.reshape(r, c // 16, 16)
+    s = ((b.abs().amax(-1) / 6.0) * g).to(torch.float8_e4m3fn)
+    sf = s.float().clamp(min=1e-30)
+    x = b * g / sf[..., None]
+    idx = (x.abs()[..., None] - E2M1).abs().argmin(-1)
+    codes = idx + 8 * (x < 0).to(idx.dtype)
+    deq = (E2M1[idx] * torch.where(x < 0, -1.0, 1.0) * sf[..., None] / g).reshape(r, c)
+    codes = codes.reshape(r, c)
+    packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).to(torch.uint8)
+    return packed, s, torch.tensor(float(g)), deq
+
+
+if release:
+    # The tensors of MiniMax's release (`language_model.` prefix, `block_sparse_moe`, per-expert
+    # w1 / w3 / w2, `index_*`), from the in-memory model; with --fp8 the attention, dense,
+    # shared and indexer projections as MXFP8 and the experts as NVFP4, the reference then
+    # running on what they hold.
+    os.makedirs(mdir, exist_ok=True)
+    P = dict(m.named_parameters())
+    B = dict(m.named_buffers())
+    out_t = {}
+
+    def put(name, view, kind):
+        """Stores `view` (a slice of a reference parameter) under `name`, quantized as `kind`."""
+        w = view.detach().float()
+        if fp8 and kind == "mx" and w.shape[1] % 32 == 0:
+            q, e, deq = mxfp8(w)
+            out_t[name] = q
+            out_t[name + "_scale_inv"] = e
+            view.data.copy_(deq)
+        elif fp8 and kind == "nv":
+            pk, sc, gs, deq = nvfp4(w)
+            base = name[: -len(".weight")]
+            out_t[base + ".weight_packed"] = pk
+            out_t[base + ".weight_scale"] = sc
+            out_t[base + ".weight_global_scale"] = gs
+            out_t[base + ".input_global_scale"] = torch.tensor(1.0)
+            view.data.copy_(deq)
+        else:
+            out_t[name] = w.to(torch.bfloat16)
+
+    L = "language_model.model."
+    put("language_model.lm_head.weight", P["lm_head.weight"], "plain")
+    put(L + "embed_tokens.weight", P["model.embed_tokens.weight"], "plain")
+    put(L + "norm.weight", P["model.norm.weight"], "plain")
+    mi, si, di = cfg.intermediate_size, cfg.shared_intermediate_size, cfg.dense_intermediate_size
+    for l in range(cfg.num_hidden_layers):
+        hp, rp = f"model.layers.{l}.", f"{L}layers.{l}."
+        for n in ["input_layernorm", "post_attention_layernorm"]:
+            put(f"{rp}{n}.weight", P[f"{hp}{n}.weight"], "plain")
+        for n in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+            put(f"{rp}self_attn.{n}.weight", P[f"{hp}self_attn.{n}.weight"], "mx")
+        for n in ["q_norm", "k_norm"]:
+            put(f"{rp}self_attn.{n}.weight", P[f"{hp}self_attn.{n}.weight"], "plain")
+        if f"{hp}self_attn.indexer.q_proj.weight" in P:
+            for n in ["q_proj", "k_proj"]:
+                put(f"{rp}self_attn.index_{n}.weight", P[f"{hp}self_attn.indexer.{n}.weight"], "mx")
+            for n in ["q_norm", "k_norm"]:
+                put(f"{rp}self_attn.index_{n}.weight", P[f"{hp}self_attn.indexer.{n}.weight"], "plain")
+        if cfg.mlp_layer_types[l] == "dense":
+            gu = P[f"{hp}mlp.gate_up_proj.weight"]
+            put(f"{rp}mlp.gate_proj.weight", gu[:di], "mx")
+            put(f"{rp}mlp.up_proj.weight", gu[di:], "mx")
+            put(f"{rp}mlp.down_proj.weight", P[f"{hp}mlp.down_proj.weight"], "mx")
+        else:
+            mp = f"{rp}block_sparse_moe."
+            put(mp + "gate.weight", P[f"{hp}mlp.gate.weight"], "plain")
+            out_t[mp + "e_score_correction_bias"] = B[f"{hp}mlp.gate.e_score_correction_bias"].float()
+            gu, dn = P[f"{hp}mlp.experts.gate_up_proj"], P[f"{hp}mlp.experts.down_proj"]
+            for e in range(cfg.num_local_experts):
+                put(f"{mp}experts.{e}.w1.weight", gu[e, :mi], "nv")
+                put(f"{mp}experts.{e}.w3.weight", gu[e, mi:], "nv")
+                put(f"{mp}experts.{e}.w2.weight", dn[e], "nv")
+            sgu = P[f"{hp}mlp.shared_experts.gate_up_proj.weight"]
+            put(f"{mp}shared_experts.gate_proj.weight", sgu[:si], "mx")
+            put(f"{mp}shared_experts.up_proj.weight", sgu[si:], "mx")
+            put(f"{mp}shared_experts.down_proj.weight", P[f"{hp}mlp.shared_experts.down_proj.weight"], "mx")
+    save_file({k: v.contiguous() for k, v in out_t.items()}, os.path.join(mdir, "model.safetensors"), metadata={"format": "pt"})
+    tc = {
+        "hidden_size": cfg.hidden_size, "intermediate_size": mi, "num_hidden_layers": cfg.num_hidden_layers,
+        "num_attention_heads": cfg.num_attention_heads, "num_key_value_heads": cfg.num_key_value_heads,
+        "head_dim": cfg.head_dim, "vocab_size": V, "rms_norm_eps": cfg.rms_norm_eps, "use_gemma_norm": True,
+        "attention_output_gate": False, "rope_theta": cfg.rope_parameters["rope_theta"],
+        "rotary_dim": cfg.rotary_dim, "partial_rotary_factor": cfg.rope_parameters["partial_rotary_factor"],
+        "hidden_act": "swigluoai", "use_qk_norm": True, "tie_word_embeddings": False,
+        "dense_intermediate_size": di, "shared_intermediate_size": si,
+        "num_local_experts": cfg.num_local_experts, "num_experts_per_tok": cfg.num_experts_per_tok,
+        "n_shared_experts": 1, "scoring_func": "sigmoid", "use_routing_bias": True,
+        "moe_layer_freq": [int(t == "sparse") for t in cfg.mlp_layer_types], "qk_norm_type": "per_head",
+        "swiglu_alpha": cfg.swiglu_alpha, "swiglu_limit": cfg.swiglu_limit,
+        "routed_scaling_factor": cfg.routed_scaling_factor,
+        "sparse_attention_config": {
+            "use_sparse_attention": True, "sparse_index_dim": cfg.index_head_dim,
+            "sparse_num_index_heads": cfg.index_n_heads, "sparse_topk_blocks": cfg.index_topk_blocks,
+            "sparse_block_size": cfg.index_block_size, "sparse_score_type": "max", "sparse_init_block": 0,
+            "sparse_local_block": cfg.index_local_blocks,
+            "sparse_attention_freq": [1] * cfg.num_hidden_layers,
+        },
+        "eos_token_id": EOS, "bos_token_id": EOS,
+    }
+    hub = {"architectures": ["MiniMaxM3SparseForConditionalGeneration"], "model_type": "minimax_m3_vl", "text_config": tc}
+    json.dump(hub, open(os.path.join(mdir, "config.json"), "w"), indent=2)
+if fp8 and not release:
     # Rewrite the projections as FP8 + block scales, and run the reference on what they hold.
     f = os.path.join(mdir, "model.safetensors")
     sd = load_file(f)

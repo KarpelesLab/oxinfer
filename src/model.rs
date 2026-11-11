@@ -302,6 +302,12 @@ pub fn load_lin<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usize
     if let Some(m) = files.mlx_q4(full, n_out, n_in)? {
         return Ok(Lin::q4(m));
     }
+    // NVFP4 (compressed-tensors): repacked into ggml's NVFP4 blocks.
+    if let Some(base) = full.strip_suffix(".weight")
+        && files.has(&format!("{base}.weight_packed"))
+    {
+        return Ok(Lin::gguf(nvfp4_matrix(files, full, n_out, n_in)?));
+    }
     let info = files.info(full).with_context(|| format!("missing tensor {full}"))?;
     if info.shape != [n_out, n_in] {
         bail!("tensor {full} has shape {:?}, expected [{n_out}, {n_in}]", info.shape);
@@ -333,13 +339,23 @@ pub(crate) fn fp8_matrix(files: &ModelFiles, full: &str, n_out: usize, n_in: usi
     let [sr, sc] = si.shape[..] else {
         bail!("{sname}: scale shape {:?}", si.shape);
     };
+    // Square blocks (DeepSeek-style 128 x 128), or MXFP8's runs of 32 along each row.
     let block = [128usize, 64, 256, 32, 16, 512]
         .into_iter()
         .find(|&b| n_out.div_ceil(b) == sr && n_in.div_ceil(b) == sc)
-        .with_context(|| format!("{sname}: scale grid {:?} fits no square block of [{n_out}, {n_in}]", si.shape))?;
+        .map(|b| (b, b))
+        .or_else(|| (sr == n_out && sc > 0 && n_in.div_ceil(n_in.div_ceil(sc)) == sc).then(|| (1, n_in.div_ceil(sc))))
+        .with_context(|| format!("{sname}: scale grid {:?} fits no block of [{n_out}, {n_in}]", si.shape))?;
     let scales: crate::quant::QBuf<f32> = {
         let b = files.bytes(&sname)?;
-        if si.dtype == "F32" && (b.as_ptr() as usize).is_multiple_of(4) {
+        if si.dtype == "U8" || si.dtype == "F8_E8M0" {
+            // MXFP8: E8M0 power-of-two exponents.
+            let mut p = crate::quant::PageVec::<f32>::zeroed(b.len());
+            for (d, &e) in p.iter_mut().zip(b) {
+                *d = if e == 255 { f32::NAN } else { (2f32).powi(e as i32 - 127) };
+            }
+            p.into()
+        } else if si.dtype == "F32" && (b.as_ptr() as usize).is_multiple_of(4) {
             // SAFETY: aligned f32 data borrowed from `files`, which outlives the matrix.
             unsafe { crate::quant::QBuf::borrowed(std::slice::from_raw_parts(b.as_ptr() as *const f32, b.len() / 4)) }
         } else {
@@ -352,7 +368,60 @@ pub(crate) fn fp8_matrix(files: &ModelFiles, full: &str, n_out: usize, n_in: usi
     let data = files.bytes(full)?;
     files.note_use(&sname, true, false);
     // SAFETY: the weight borrows `files`, which outlives every model holding it.
-    GgufMatrix::fp8(unsafe { crate::quant::QBuf::borrowed(data) }, scales, n_out, n_in, (block, block))
+    GgufMatrix::fp8(unsafe { crate::quant::QBuf::borrowed(data) }, scales, n_out, n_in, block)
+}
+
+/// An NVFP4 weight as compressed-tensors stores it (`full` minus `.weight` plus `.weight_packed`:
+/// `[n_out, n_in / 2]` E2M1 pairs, low nibble first; `.weight_scale`: an E4M3 scale per 16;
+/// `.weight_global_scale`: the divisor of the whole tensor), repacked into ggml's NVFP4 blocks.
+pub(crate) fn nvfp4_matrix(files: &ModelFiles, full: &str, n_out: usize, n_in: usize) -> Result<GgufMatrix> {
+    let base = full.strip_suffix(".weight").unwrap_or(full);
+    let (pn, sn, gn) = (
+        format!("{base}.weight_packed"),
+        format!("{base}.weight_scale"),
+        format!("{base}.weight_global_scale"),
+    );
+    if !n_in.is_multiple_of(64) {
+        bail!("{pn}: NVFP4 rows of {n_in} are not whole blocks of 64");
+    }
+    let (pi, si) = (
+        files.info(&pn).context("NVFP4 packed weight")?,
+        files.info(&sn).context(sn.clone())?,
+    );
+    if pi.shape != [n_out, n_in / 2] || si.shape != [n_out, n_in / 16] || si.dtype != "F8_E4M3" {
+        bail!("{pn}: NVFP4 shapes {:?} / {:?} for [{n_out}, {n_in}]", pi.shape, si.shape);
+    }
+    let global = files.f32(&gn)?.first().copied().context("NVFP4 global scale")?;
+    let (packed, sc) = (files.bytes(&pn)?, files.bytes(&sn)?);
+    let nb = n_in / 64;
+    let mut out = crate::quant::PageVec::<u8>::zeroed(n_out * nb * 36);
+    for (r, orow) in out.chunks_mut(nb * 36).enumerate() {
+        let prow = &packed[r * n_in / 2..(r + 1) * n_in / 2];
+        let srow = &sc[r * n_in / 16..(r + 1) * n_in / 16];
+        for (b, ob) in orow.chunks_mut(36).enumerate() {
+            for s in 0..4 {
+                ob[s] = srow[4 * b + s] & 0x7F;
+                // Elements 16 * (4b + s) + e: byte e / 2, low nibble for even e.
+                let p = &prow[(64 * b + 16 * s) / 2..(64 * b + 16 * s) / 2 + 8];
+                let nib = |e: usize| (p[e / 2] >> (4 * (e % 2))) & 0xF;
+                for j in 0..8 {
+                    ob[4 + 8 * s + j] = nib(j) | (nib(j + 8) << 4);
+                }
+            }
+        }
+    }
+    files.note_use(&pn, true, false);
+    files.note_use(&sn, true, false);
+    files.note_use(&gn, true, false);
+    let mut m = GgufMatrix::new(crate::ggml::GgmlType::NVFP4, out.into(), n_out, n_in)?;
+    let mut g = crate::quant::PageVec::<f32>::zeroed(1);
+    g[0] = 1.0 / global;
+    m.block_scales = Some(crate::ggml::BlockScales {
+        s: g.into(),
+        rows: n_out,
+        cols: n_in,
+    });
+    Ok(m)
 }
 
 /// The experts of a fused `[n_exp, n_out, n_in]` tensor (MoE `gate_up_proj` / `down_proj`), one

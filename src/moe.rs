@@ -176,8 +176,13 @@ impl<'a> Experts<'a> {
     /// expert (`{e}.gate_proj.weight`, ...).
     #[allow(clippy::too_many_arguments)]
     pub fn load(files: &'a ModelFiles, ep: &str, n_exp: usize, top_k: usize, mi: usize, h: usize, quant: Quant, act: Act) -> Result<Self> {
-        let has =
-            |n: &str| files.has(n) || files.has(&format!("{n}.q8")) || files.has(&format!("{n}.q4")) || files.has(&format!("{n}.scales"));
+        let has = |n: &str| {
+            files.has(n)
+                || files.has(&format!("{n}.q8"))
+                || files.has(&format!("{n}.q4"))
+                || files.has(&format!("{n}.scales"))
+                || files.has(&format!("{n}_packed"))
+        };
         let fused = format!("{ep}gate_up_proj");
         let (gate_up, down) = if has(&fused) {
             (

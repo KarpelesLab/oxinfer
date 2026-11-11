@@ -63,6 +63,11 @@ pub enum GgmlType {
     /// FP8 E4M3 (`float8_e4m3fn`) with block scales ([`GgufMatrix::fp8`]): safetensors FP8 checkpoints,
     /// not a GGUF type (the id is outside GGUF's range, and [`GgmlType::ALL`] leaves it out).
     F8E4M3 = 0x1000,
+    /// NVFP4 in ggml's layout (type 40): blocks of 64 E2M1 values with an unsigned E4M3 scale per
+    /// 16, here from compressed-tensors checkpoints (MiniMax M3.1's experts) with the tensor's
+    /// global scale as a whole-matrix [`BlockScales`]. Runs through the f32 path; GGUF files of
+    /// this type (whose global scales are sidecar tensors) are not read.
+    NVFP4 = 40,
 }
 
 impl GgmlType {
@@ -126,6 +131,7 @@ impl GgmlType {
             BF16 => "BF16",
             MXFP4 => "MXFP4",
             F8E4M3 => "F8_E4M3",
+            NVFP4 => "NVFP4",
         }
     }
     /// Elements per block.
@@ -134,6 +140,7 @@ impl GgmlType {
         match self {
             F32 | F16 | BF16 | F8E4M3 => 1,
             Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | IQ4_NL | MXFP4 => 32,
+            NVFP4 => 64,
             _ => QK_K,
         }
     }
@@ -164,11 +171,16 @@ impl GgmlType {
             IQ4_XS => 136,
             IQ1_M => 56,
             MXFP4 => 17,
+            NVFP4 => 36,
         }
     }
-    /// Plain float storage (no blocks): runs through the f32 path rather than int8 dot products.
+    /// Runs through the f32 path (dequantized rows) rather than int8 dot products: plain float
+    /// storage, and NVFP4 (whose 16-value scales the int8 kernels' 32-value blocks cannot take).
     pub fn is_float(self) -> bool {
-        matches!(self, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::F8E4M3)
+        matches!(
+            self,
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::F8E4M3 | GgmlType::NVFP4
+        )
     }
     /// Bytes of a row of `n` elements (`n` must be a multiple of the block size).
     pub fn row_bytes(self, n: usize) -> usize {
@@ -295,6 +307,19 @@ impl GgufMatrix {
     /// as `dequantize_row`, through NEON where available.
     pub fn dequantize_rows(&self, r0: usize, r1: usize, out: &mut [f32]) {
         let n = self.n_in;
+        if let Some(bs) = self.block_scales.as_ref().filter(|_| self.kind != GgmlType::F8E4M3) {
+            // Scales on top of what the kind decodes (NVFP4's global scale).
+            let ncb = n.div_ceil(bs.cols);
+            for (i, r) in (r0..r1).enumerate() {
+                let o = &mut out[i * n..(i + 1) * n];
+                dequantize_row(self.kind, self.row(r), o);
+                let srow = &bs.s[(r / bs.rows) * ncb..(r / bs.rows + 1) * ncb];
+                for (oc, &s) in o.chunks_mut(bs.cols).zip(srow) {
+                    oc.iter_mut().for_each(|v| *v *= s);
+                }
+            }
+            return;
+        }
         if let Some(bs) = &self.block_scales {
             let lut = e4m3_table();
             let ncb = n.div_ceil(bs.cols);
@@ -334,6 +359,22 @@ pub(crate) fn e8m0_half(e: u8) -> f32 {
     } else {
         f32::from_bits((e as u32 - 1) << 23)
     }
+}
+
+/// Half the value of an unsigned E4M3 scale byte (ggml's `ggml_ue4m3_to_fp32`: NVFP4's values are
+/// stored doubled; 0 and 0x7f decode to 0).
+#[inline(always)]
+pub(crate) fn ue4m3_half(x: u8) -> f32 {
+    if x == 0 || x == 0x7F {
+        return 0.0;
+    }
+    let (e, m) = ((x >> 3) & 0xF, (x & 7) as f32);
+    let raw = if e == 0 {
+        m * (2f32).powi(-9)
+    } else {
+        (1.0 + m / 8.0) * (2f32).powi(e as i32 - 7)
+    };
+    raw * 0.5
 }
 #[inline(always)]
 fn u16at(b: &[u8], i: usize) -> u16 {
@@ -685,6 +726,18 @@ pub fn dequantize_row(kind: GgmlType, src: &[u8], out: &mut [f32]) {
                     y[j + 16] = d * KVALUES_MXFP4[(b[1 + j] >> 4) as usize] as f32;
                 }
             }
+            NVFP4 => {
+                // Four sub-blocks of 16: an unsigned E4M3 scale (halved, the values doubled), then
+                // 8 bytes holding elements j (low nibble) and j + 8 (high).
+                for s in 0..4 {
+                    let d = ue4m3_half(b[s]);
+                    let q = &b[4 + 8 * s..4 + 8 * s + 8];
+                    for j in 0..8 {
+                        y[16 * s + j] = d * KVALUES_MXFP4[(q[j] & 0xF) as usize] as f32;
+                        y[16 * s + j + 8] = d * KVALUES_MXFP4[(q[j] >> 4) as usize] as f32;
+                    }
+                }
+            }
             IQ4_XS => {
                 let d = f16at(b, 0);
                 for ib in 0..8 {
@@ -967,7 +1020,7 @@ pub fn decode_i8(kind: GgmlType, b: &[u8], q: &mut [i8], s: &mut [f32], m: &mut 
             }
             false
         }
-        F32 | F16 | BF16 | F8E4M3 => unreachable!("decode_i8 on float type {kind}"),
+        F32 | F16 | BF16 | F8E4M3 | NVFP4 => unreachable!("decode_i8 on f32-path type {kind}"),
     }
 }
 

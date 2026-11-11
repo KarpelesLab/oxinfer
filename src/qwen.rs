@@ -530,7 +530,7 @@ pub(crate) struct Loader<'a, 'c> {
 impl<'a> Loader<'a, '_> {
     pub fn has(&self, n: &str) -> bool {
         let f = self.files;
-        f.has(n) || f.has(&format!("{n}.q8")) || f.has(&format!("{n}.q4"))
+        f.has(n) || f.has(&format!("{n}.q8")) || f.has(&format!("{n}.q4")) || f.has(&format!("{n}_packed"))
     }
 
     /// Small parameter vectors are stored as BF16 in some checkpoints and F32 in others.
