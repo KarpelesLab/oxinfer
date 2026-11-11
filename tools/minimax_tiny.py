@@ -10,7 +10,8 @@ usage: minimax_tiny.py OUT_DIR [--arch m2|m3|01|qwen2] [--release] [--gen N] [--
 --release (m3): the tensors and config.json as MiniMax's release lays them out.
 --fp8: M2: the projections as float8_e4m3fn with one `weight_scale_inv` per 32 x 32 block; M3
   --release: MXFP8 projections (E8M0 per 32) and NVFP4 experts (compressed-tensors), as
-  MiniMax-M3.1-Flash. The reference runs on the dequantized values.
+  MiniMax-M3.1-Flash (NVFP4=modelopt: ModelOpt's packaging, as MiniMax-H3-Image-PE). The
+  reference runs on the dequantized values.
 
 Writes OUT_DIR/model, OUT_DIR/prompt.txt, OUT_DIR/ref.bin ([1+N, vocab] f32: the prompt's last
 position, then after each greedy token via the KV cache), OUT_DIR/gen.txt and OUT_DIR/prefill.bin
@@ -293,10 +294,17 @@ if release:
         elif fp8 and kind == "nv":
             pk, sc, gs, deq = nvfp4(w)
             base = name[: -len(".weight")]
-            out_t[base + ".weight_packed"] = pk
-            out_t[base + ".weight_scale"] = sc
-            out_t[base + ".weight_global_scale"] = gs
-            out_t[base + ".input_global_scale"] = torch.tensor(1.0)
+            if os.environ.get("NVFP4") == "modelopt":
+                # ModelOpt's packaging: the pairs as `.weight`, the tensor scale as a factor.
+                out_t[base + ".weight"] = pk
+                out_t[base + ".weight_scale"] = sc
+                out_t[base + ".weight_scale_2"] = (1.0 / gs).reshape(())
+                out_t[base + ".input_scale"] = torch.tensor(1.0)
+            else:
+                out_t[base + ".weight_packed"] = pk
+                out_t[base + ".weight_scale"] = sc
+                out_t[base + ".weight_global_scale"] = gs
+                out_t[base + ".input_global_scale"] = torch.tensor(1.0)
             view.data.copy_(deq)
         else:
             out_t[name] = w.to(torch.bfloat16)

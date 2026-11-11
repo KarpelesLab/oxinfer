@@ -302,10 +302,8 @@ pub fn load_lin<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usize
     if let Some(m) = files.mlx_q4(full, n_out, n_in)? {
         return Ok(Lin::q4(m));
     }
-    // NVFP4 (compressed-tensors): repacked into ggml's NVFP4 blocks.
-    if let Some(base) = full.strip_suffix(".weight")
-        && files.has(&format!("{base}.weight_packed"))
-    {
+    // NVFP4 (compressed-tensors or ModelOpt): repacked into ggml's NVFP4 blocks.
+    if is_nvfp4(files, full) {
         return Ok(Lin::gguf(nvfp4_matrix(files, full, n_out, n_in)?));
     }
     let info = files.info(full).with_context(|| format!("missing tensor {full}"))?;
@@ -371,16 +369,30 @@ pub(crate) fn fp8_matrix(files: &ModelFiles, full: &str, n_out: usize, n_in: usi
     GgufMatrix::fp8(unsafe { crate::quant::QBuf::borrowed(data) }, scales, n_out, n_in, block)
 }
 
-/// An NVFP4 weight as compressed-tensors stores it (`full` minus `.weight` plus `.weight_packed`:
-/// `[n_out, n_in / 2]` E2M1 pairs, low nibble first; `.weight_scale`: an E4M3 scale per 16;
-/// `.weight_global_scale`: the divisor of the whole tensor), repacked into ggml's NVFP4 blocks.
+/// Whether `full` is an NVFP4 weight: compressed-tensors' (`.weight_packed`) or ModelOpt's (a
+/// U8 `.weight` beside `.weight_scale_2`).
+pub(crate) fn is_nvfp4(files: &ModelFiles, full: &str) -> bool {
+    let Some(base) = full.strip_suffix(".weight") else { return false };
+    files.has(&format!("{base}.weight_packed"))
+        || (files.has(&format!("{base}.weight_scale_2")) && files.info(full).is_some_and(|i| i.dtype == "U8"))
+}
+
+/// An NVFP4 weight (`[n_out, n_in / 2]` E2M1 pairs, low nibble first; `.weight_scale`: an E4M3
+/// scale per 16) with its tensor-wide scale, repacked into ggml's NVFP4 blocks: compressed-tensors
+/// stores the pairs as `.weight_packed` and a divisor as `.weight_global_scale`, ModelOpt the
+/// pairs as `.weight` and a factor as `.weight_scale_2`.
 pub(crate) fn nvfp4_matrix(files: &ModelFiles, full: &str, n_out: usize, n_in: usize) -> Result<GgufMatrix> {
     let base = full.strip_suffix(".weight").unwrap_or(full);
-    let (pn, sn, gn) = (
-        format!("{base}.weight_packed"),
-        format!("{base}.weight_scale"),
-        format!("{base}.weight_global_scale"),
-    );
+    let ct = files.has(&format!("{base}.weight_packed"));
+    let (pn, sn, gn) = if ct {
+        (
+            format!("{base}.weight_packed"),
+            format!("{base}.weight_scale"),
+            format!("{base}.weight_global_scale"),
+        )
+    } else {
+        (full.to_string(), format!("{base}.weight_scale"), format!("{base}.weight_scale_2"))
+    };
     if !n_in.is_multiple_of(64) {
         bail!("{pn}: NVFP4 rows of {n_in} are not whole blocks of 64");
     }
@@ -391,7 +403,8 @@ pub(crate) fn nvfp4_matrix(files: &ModelFiles, full: &str, n_out: usize, n_in: u
     if pi.shape != [n_out, n_in / 2] || si.shape != [n_out, n_in / 16] || si.dtype != "F8_E4M3" {
         bail!("{pn}: NVFP4 shapes {:?} / {:?} for [{n_out}, {n_in}]", pi.shape, si.shape);
     }
-    let global = files.f32(&gn)?.first().copied().context("NVFP4 global scale")?;
+    let g = files.f32(&gn)?.first().copied().context("NVFP4 global scale")?;
+    let factor = if ct { 1.0 / g } else { g };
     let (packed, sc) = (files.bytes(&pn)?, files.bytes(&sn)?);
     let nb = n_in / 64;
     let mut out = crate::quant::PageVec::<u8>::zeroed(n_out * nb * 36);
@@ -415,7 +428,7 @@ pub(crate) fn nvfp4_matrix(files: &ModelFiles, full: &str, n_out: usize, n_in: u
     files.note_use(&gn, true, false);
     let mut m = GgufMatrix::new(crate::ggml::GgmlType::NVFP4, out.into(), n_out, n_in)?;
     let mut g = crate::quant::PageVec::<f32>::zeroed(1);
-    g[0] = 1.0 / global;
+    g[0] = factor;
     m.block_scales = Some(crate::ggml::BlockScales {
         s: g.into(),
         rows: n_out,
