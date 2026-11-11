@@ -519,6 +519,20 @@ impl ModelFiles {
     /// Opens the checkpoint in directory `dir` (safetensors, sharded or not, or
     /// `pytorch_model.bin`), or a single GGUF file.
     pub fn open(dir: &Path, in_memory: bool) -> Result<Self> {
+        // Copied into memory only if that leaves the system its reserve (20% of RAM, at most
+        // 2 GB): otherwise mapped, its pages then reclaimable page cache.
+        let in_memory = in_memory && {
+            let bytes = checkpoint_bytes(dir);
+            let fits = crate::platform::fits_in_memory(bytes);
+            if !fits {
+                eprintln!(
+                    "[{:.1} GB of weights would leave less than {:.1} GB of memory available: mapping them instead of loading them]",
+                    bytes as f64 / 1e9,
+                    crate::platform::memory_reserve() as f64 / 1e9
+                );
+            }
+            fits
+        };
         if crate::gguf::is_gguf(dir) {
             // A split model (`-00001-of-00009.gguf`): every part, named as the first describes.
             let parts = crate::gguf::split_files(dir)?;

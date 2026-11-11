@@ -120,6 +120,8 @@ pub struct GqaConfig {
     pub sandwich: bool,
     /// GELU (tanh) feed-forward instead of SiLU.
     pub gelu: bool,
+    /// MiniMax M3's clamped "swigluoai" feed-forward (alpha 1.702, limit 7) instead of SiLU.
+    pub oai: bool,
     pub attn_scale: f32,
     /// Leading dims of each head rotated (rotate-half pairs `(i, i + rope_dims / 2)`).
     pub rope_dims: usize,
@@ -296,10 +298,11 @@ impl DsparkConfig {
                     k_eq_v: shared_kv,
                     v_norm: shared_kv || gemma,
                     sandwich: gemma,
-                    gelu: match get("hidden_act").and_then(Value::as_str) {
+                    gelu: match get("hidden_act").or_else(|| get("hidden_activation")).and_then(Value::as_str) {
                         Some(a) => matches!(a, "gelu" | "gelu_pytorch_tanh"),
                         None => gemma,
                     },
+                    oai: get("hidden_activation").or_else(|| get("hidden_act")).and_then(Value::as_str) == Some("swigluoai"),
                     attn_scale: f("attention.scale")
                         .filter(|&s| s != 0.0)
                         .map_or(if gemma { 1.0 } else { (hd as f32).powf(-0.5) }, |s| s as f32),
@@ -512,6 +515,7 @@ impl DsparkConfig {
                         get("hidden_act").or_else(|| get("hidden_activation")).and_then(Json::as_str),
                         Some("gelu" | "gelu_pytorch_tanh")
                     ),
+                oai: get("hidden_act").or_else(|| get("hidden_activation")).and_then(Json::as_str) == Some("swigluoai"),
                 attn_scale: if gemma { 1.0 } else { (head_dim as f32).powf(-0.5) },
                 rope_dims,
                 rope_proportion: proportion,
@@ -1333,13 +1337,16 @@ impl<'a> Dspark<'a> {
     fn glu(&self, l: &Layer, x: &[f32], t: usize) -> Vec<f32> {
         let (h, inter) = (self.cfg.hidden, self.cfg.inter);
         let gelu = matches!(&self.cfg.backbone, Backbone::Gqa(g) if g.gelu);
+        let oai = matches!(&self.cfg.backbone, Backbone::Gqa(g) if g.oai);
         let mut g = vec![0f32; t * inter];
-        if !gelu && t <= 4 && self.device() && linear_rows_device(&mut [(&l.gate, Some(&l.up), inter, &mut g[..])], h, x, t) {
+        if !gelu && !oai && t <= 4 && self.device() && linear_rows_device(&mut [(&l.gate, Some(&l.up), inter, &mut g[..])], h, x, t) {
             return g;
         }
         let mut u = vec![0f32; t * inter];
         self.lin(&mut [(&l.gate, inter, &mut g[..]), (&l.up, inter, &mut u[..])], h, x, t);
-        if gelu {
+        if oai {
+            crate::moe::Act::SwigluOai { alpha: 1.702, limit: 7.0 }.apply(&mut g, &mut u);
+        } else if gelu {
             gelu_mul(&mut g, &u);
         } else {
             silu_mul(&mut g, &u);
@@ -2066,6 +2073,9 @@ impl Dspark<'_> {
     /// The block pass: the block's embeddings to the logits of every row (soft-capped, before
     /// the Markov bias).
     fn block_graph<'s>(&'s self, g: &GqaConfig, head: &'s Lin, vocab: usize) -> Option<crate::gpu::decode::Graph<'s>> {
+        if g.oai {
+            return None;
+        }
         use crate::gpu::decode::{Ew, Graph, LinMode, Op, pairable};
         use std::borrow::Cow;
         let c = &self.cfg;

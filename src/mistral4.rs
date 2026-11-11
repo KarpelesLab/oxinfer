@@ -128,14 +128,18 @@ pub(crate) fn native_name(n: &str) -> Option<String> {
 pub fn default_stream() -> crate::stream::StreamOptions {
     let mut o = crate::stream::StreamOptions::default().with_env();
     if o.cache_budget.is_none() {
-        o.cache_budget = crate::platform::total_memory().map(|m| (m as f64 * 0.7) as u64);
+        o.cache_budget = crate::platform::total_memory().map(|m| {
+            let b = (m as f64 * 0.7) as u64;
+            crate::platform::memory_headroom().map_or(b, |h| b.min(h)).max(1 << 30)
+        });
     }
     o
 }
 
-/// Whether a checkpoint of `bytes` is too big to hold in memory (over 60% of RAM).
+/// Whether a checkpoint of `bytes` is too big to hold in memory (over 60% of RAM, or more than
+/// the system can give now while keeping its reserve).
 pub fn too_big(bytes: u64) -> bool {
-    crate::platform::total_memory().is_some_and(|m| bytes as f64 > 0.6 * m as f64)
+    crate::platform::total_memory().is_some_and(|m| bytes as f64 > 0.6 * m as f64) || !crate::platform::fits_in_memory(bytes)
 }
 
 /// Whether `files` is a checkpoint in Mistral's own naming (see [`native_name`]).

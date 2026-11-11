@@ -557,7 +557,10 @@ impl Api {
         if let Some(t) = opts.threads {
             crate::pool::init_with(crate::pool::PoolOptions::threads(t));
         }
-        let budget = opts.memory_budget.or_else(|| crate::platform::total_memory().map(|m| m / 10 * 8));
+        // 80% of the memory, and never more than it can give now while keeping its reserve.
+        let budget = opts
+            .memory_budget
+            .or_else(|| crate::platform::total_memory().map(|m| (m / 10 * 8).min(crate::platform::memory_headroom().unwrap_or(u64::MAX))));
         let mut models = registry::Registry::new(&opts.models, budget, opts.cache_dir.clone(), opts.log);
         models.prompt_cache = opts.prompt_cache.clone();
         models.prompt_cache_gb = opts.prompt_cache_gb;

@@ -142,6 +142,38 @@ pub fn cpu_features() -> Vec<&'static str> {
     f
 }
 
+/// Memory oxinfer always leaves to the rest of the system: 20% of the physical memory, at most
+/// 2 GB. Loading decisions keep [`available_memory`] above it (see [`memory_headroom`]).
+pub fn memory_reserve() -> u64 {
+    total_memory().map_or(2 << 30, |t| (t / 5).min(2 << 30))
+}
+
+/// Memory the system could give a process now without swapping: Linux's `MemAvailable` (free
+/// memory plus reclaimable page cache); elsewhere what the OS lets this app still use (iOS), else
+/// the physical memory.
+pub fn available_memory() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let line = s.lines().find(|l| l.starts_with("MemAvailable:"))?;
+        let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+        return Some(kb * 1024);
+    }
+    #[allow(unreachable_code)]
+    process_available_memory().or_else(total_memory)
+}
+
+/// What a load may still take for itself: [`available_memory`] minus [`memory_reserve`]. None
+/// when the platform reports neither.
+pub fn memory_headroom() -> Option<u64> {
+    available_memory().map(|a| a.saturating_sub(memory_reserve()))
+}
+
+/// Whether `bytes` more of process memory leaves the system its reserve.
+pub fn fits_in_memory(bytes: u64) -> bool {
+    memory_headroom().is_none_or(|h| bytes <= h)
+}
+
 /// Physical memory in bytes, when the platform reports it.
 pub fn total_memory() -> Option<u64> {
     #[cfg(target_os = "linux")]

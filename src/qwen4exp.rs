@@ -1748,7 +1748,7 @@ pub fn ngram_table_bytes(path: &std::path::Path) -> u64 {
 /// table over 75% of RAM (the table is read from storage as used).
 pub fn too_big(path: &std::path::Path) -> bool {
     let bytes = crate::safetensors::checkpoint_bytes(path).saturating_sub(ngram_table_bytes(path));
-    crate::platform::total_memory().is_some_and(|m| bytes as f64 > 0.75 * m as f64)
+    crate::platform::total_memory().is_some_and(|m| bytes as f64 > 0.75 * m as f64) || !crate::platform::fits_in_memory(bytes)
 }
 
 impl QwenSession {

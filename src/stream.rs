@@ -140,6 +140,9 @@ pub struct DeviceMemory {
     /// The GPU's working set for this process (Metal's `recommendedMaxWorkingSetSize`), when an
     /// accelerator that decodes is active.
     pub gpu_working_set: Option<u64>,
+    /// What the system can give now minus the reserve it always keeps
+    /// ([`crate::platform::memory_headroom`]).
+    pub headroom: Option<u64>,
 }
 
 impl DeviceMemory {
@@ -158,14 +161,17 @@ impl DeviceMemory {
             total: env("OXINFER_DEVICE_MEM_GB").or_else(crate::platform::total_memory),
             app_available: env("OXINFER_APP_MEM_GB").or_else(crate::platform::process_available_memory),
             gpu_working_set: env("OXINFER_GPU_WORKING_SET_GB").or(gpu),
+            headroom: env("OXINFER_DEVICE_MEM_GB")
+                .map(|t| t.saturating_sub((t / 5).min(2 << 30)))
+                .or_else(crate::platform::memory_headroom),
         }
     }
 
     /// The page-cache budget for a streamed model: on a device that limits apps (iOS), what the
     /// app may still use minus [`Self::APP_RESERVE`], at most 60% of the device's memory; elsewhere
     /// 70% of the memory. With GPU decoding, at most 85% of the GPU working set (the resident
-    /// layers stay wired for the GPU, and so are the streamed ones it is reading). None when
-    /// nothing is known.
+    /// layers stay wired for the GPU, and so are the streamed ones it is reading). Never more
+    /// than the memory available now minus the system's reserve. None when nothing is known.
     pub fn budget(&self) -> Option<u64> {
         let b = match (self.app_available, self.total) {
             (Some(a), t) => {
@@ -179,12 +185,17 @@ impl DeviceMemory {
             Some(w) => b.min((w as f64 * 0.85) as u64),
             None => b,
         };
+        let b = self.headroom.map_or(b, |h| b.min(h));
         Some(b.max(1 << 30))
     }
 
-    /// Whether `bytes` of weights are too many to keep in memory: more than the budget where the
-    /// OS limits apps, else more than 60% of the memory.
+    /// Whether `bytes` of weights are too many to keep in memory: more than the memory available
+    /// now minus the system's reserve, more than the budget where the OS limits apps, else more
+    /// than 60% of the memory.
     pub fn too_big(&self, bytes: u64) -> bool {
+        if self.headroom.is_some_and(|h| bytes > h) {
+            return true;
+        }
         match (self.app_available, self.total) {
             (Some(_), _) => self.budget().is_some_and(|b| bytes > b),
             (None, Some(t)) => bytes as f64 > 0.6 * t as f64,
@@ -1769,6 +1780,7 @@ mod tests {
             total: Some(12 * G),
             app_available: Some(6 * G),
             gpu_working_set: Some(8 * G),
+            headroom: None,
         };
         let b = phone.budget().unwrap();
         assert_eq!(b, 6 * G - DeviceMemory::APP_RESERVE);
@@ -1791,10 +1803,18 @@ mod tests {
             total: Some(16 * G),
             app_available: None,
             gpu_working_set: None,
+            headroom: None,
         };
         assert!(!mac.too_big(5 * G));
         assert!(mac.too_big(10_700_000_000));
         assert!(near(mac.budget(), (16 * G) * 7 / 10));
+        // Busy: only 4 GB can be taken now (the reserve already set aside), whatever the total.
+        let busy = DeviceMemory {
+            headroom: Some(4 * G),
+            ..mac
+        };
+        assert!(busy.too_big(5 * G));
+        assert_eq!(busy.budget(), Some(4 * G));
         assert_eq!(DeviceMemory::default().budget(), None);
         assert!(!DeviceMemory::default().too_big(u64::MAX));
     }
