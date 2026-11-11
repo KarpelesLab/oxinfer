@@ -163,3 +163,156 @@ impl SendLists {
         self.0
     }
 }
+
+/// MiniMax-01's lightning attention (linear attention with a fixed decay per head), the mixer
+/// of the layers between its softmax attention ones. With `q, k, v = silu(qkv_proj(x))` split per
+/// head, each head keeps a `[hd, hd]` state: `S = exp(-slope) * S + k^T v`, `o = q S` (the
+/// blockwise form of the reference computes the same sums); the heads' outputs are RMS-normed
+/// together, gated by `sigmoid(output_gate(x))` and projected by `out_proj`.
+pub(crate) struct Lightning<'a> {
+    pub(crate) qkv: Lin<'a>,  // [3 * nh * hd, H], per head [q | k | v]
+    pub(crate) gate: Lin<'a>, // [nh * hd, H]
+    pub(crate) out: Lin<'a>,  // [H, nh * hd]
+    pub(crate) norm: Vec<f32>,
+    /// `exp(-slope)` per head.
+    pub(crate) decay: Vec<f32>,
+}
+
+/// What a recording forward keeps of a lightning layer to rewind into its span: the state
+/// before it and every token's keys and values.
+#[derive(Clone, Default)]
+pub(crate) struct LightningRec {
+    pub(crate) s0: Vec<f32>,
+    pub(crate) kv: Vec<f32>, // [t, nh, 2 * hd]: k then v
+    pub(crate) decay: Vec<f32>,
+    pub(crate) hd: usize,
+}
+
+impl LightningRec {
+    /// Replays the first `n` tokens of the span from the state before it into `s`.
+    pub(crate) fn replay(&self, s: &mut [f32], n: usize) {
+        s.copy_from_slice(&self.s0);
+        let (nh, hd) = (self.decay.len(), self.hd);
+        for ti in 0..n {
+            for h in 0..nh {
+                let row = &self.kv[(ti * nh + h) * 2 * hd..(ti * nh + h + 1) * 2 * hd];
+                step(&mut s[h * hd * hd..(h + 1) * hd * hd], &row[..hd], &row[hd..], self.decay[h]);
+            }
+        }
+    }
+}
+
+/// `S = d * S + k^T v` for one head.
+#[inline]
+fn step(s: &mut [f32], k: &[f32], v: &[f32], d: f32) {
+    let hd = k.len();
+    for (r, &kr) in k.iter().enumerate() {
+        let row = &mut s[r * hd..(r + 1) * hd];
+        for (sv, &vv) in row.iter_mut().zip(v) {
+            *sv = d * *sv + kr * vv;
+        }
+    }
+}
+
+/// The slopes of MiniMax-01's lightning heads (ALiBi's, as its code builds them): for a power
+/// of two `n`, `2^(-8/n)` to the powers 1..=n; otherwise those of the nearest lower power of two
+/// then every other one of the next.
+pub(crate) fn slopes(n: usize) -> Vec<f64> {
+    fn pow2(n: usize) -> Vec<f64> {
+        let start = 2f64.powf(-(2f64.powf(-((n as f64).log2() - 3.0))));
+        (0..n).map(|i| start * start.powi(i as i32)).collect()
+    }
+    if (n as f64).log2().fract() == 0.0 {
+        return pow2(n);
+    }
+    let c = 1usize << (n as f64).log2().floor() as u32;
+    let mut v = pow2(c);
+    v.extend(slopes(2 * c).into_iter().step_by(2).take(n - c));
+    v
+}
+
+impl<'a> Lightning<'a> {
+    /// The layer under `ap` (`...self_attn.`) of layer `l` of `n_layers`.
+    pub(crate) fn load(ld: &Loader<'a, '_>, ap: &str, l: usize, n_layers: usize) -> Result<Self> {
+        let c = ld.cfg;
+        let (h, nh, hd) = (c.hidden_size, c.num_attention_heads, c.head_dim);
+        // Shallower layers decay faster: slope * (1 - l / (L - 1) + 1e-5).
+        let f = 1.0 - l as f64 / (n_layers.max(2) - 1) as f64 + 1e-5;
+        Ok(Self {
+            qkv: ld.lin(&format!("{ap}qkv_proj.weight"), 3 * nh * hd, h)?,
+            gate: ld.lin(&format!("{ap}output_gate.weight"), nh * hd, h)?,
+            out: ld.lin(&format!("{ap}out_proj.weight"), h, nh * hd)?,
+            norm: ld.getf(&format!("{ap}norm.weight"), &[nh * hd])?,
+            decay: slopes(nh).iter().map(|s| (-s * f).exp() as f32).collect(),
+        })
+    }
+
+    pub(crate) fn lins(&self) -> Vec<&Lin<'a>> {
+        vec![&self.qkv, &self.gate, &self.out]
+    }
+
+    /// `t` tokens of `hn` through the layer into `y`, updating the state `s` (`[nh, hd, hd]`);
+    /// `rec`: keeps what a rewind into these tokens needs.
+    pub(crate) fn forward(&self, s: &mut [f32], rec: Option<&mut LightningRec>, hn: &[f32], t: usize, h: usize, y: &mut [f32]) {
+        let (nh, hd) = (self.decay.len(), self.norm.len() / self.decay.len());
+        let w = nh * hd;
+        let mut qkv = vec![0f32; t * 3 * w];
+        let mut g = vec![0f32; t * w];
+        linear_multi(&mut [(&self.qkv, 3 * w, &mut qkv[..]), (&self.gate, w, &mut g[..])], h, hn, t);
+        for v in qkv.iter_mut() {
+            *v = *v / (1.0 + (-*v).exp());
+        }
+        if let Some(r) = rec {
+            r.s0.clear();
+            r.s0.extend_from_slice(s);
+            r.kv.clear();
+            for ti in 0..t {
+                for hh in 0..nh {
+                    let b = (ti * nh + hh) * 3 * hd;
+                    r.kv.extend_from_slice(&qkv[b + hd..b + 3 * hd]);
+                }
+            }
+            r.decay.clone_from(&self.decay);
+            r.hd = hd;
+        }
+        let mut o = vec![0f32; t * w];
+        {
+            let _timer = crate::prof::start(crate::prof::Cat::Attention);
+            let (sp, op) = (SendF(s.as_mut_ptr()), SendF(o.as_mut_ptr()));
+            pool::run(nh, &|hh| {
+                // SAFETY: head `hh` owns its state block and its columns of `o`.
+                let st = unsafe { std::slice::from_raw_parts_mut(sp.get().add(hh * hd * hd), hd * hd) };
+                for ti in 0..t {
+                    let b = (ti * nh + hh) * 3 * hd;
+                    let (q, k, v) = (&qkv[b..b + hd], &qkv[b + hd..b + 2 * hd], &qkv[b + 2 * hd..b + 3 * hd]);
+                    step(st, k, v, self.decay[hh]);
+                    let out = unsafe { std::slice::from_raw_parts_mut(op.get().add(ti * w + hh * hd), hd) };
+                    out.fill(0.0);
+                    for (r, &qr) in q.iter().enumerate() {
+                        for (ov, &sv) in out.iter_mut().zip(&st[r * hd..(r + 1) * hd]) {
+                            *ov += qr * sv;
+                        }
+                    }
+                }
+            });
+        }
+        // The heads' outputs normed together (the reference's default eps), then gated.
+        for_chunks(&mut o, w, t > 1, |ti, r| {
+            rmsnorm_f32w_inplace(r, &self.norm, 1e-6);
+            for (v, &gv) in r.iter_mut().zip(&g[ti * w..(ti + 1) * w]) {
+                *v *= 1.0 / (1.0 + (-gv).exp());
+            }
+        });
+        crate::model::linear(&self.out, h, w, &o, t, y);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SendF(*mut f32);
+unsafe impl Send for SendF {}
+unsafe impl Sync for SendF {}
+impl SendF {
+    fn get(self) -> *mut f32 {
+        self.0
+    }
+}

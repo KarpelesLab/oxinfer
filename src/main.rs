@@ -1366,7 +1366,9 @@ fn run(mut args: Args) -> Result<()> {
         // Llama 3 runs on the Qwen3 code path.
         "llama" => run_qwen(args),
         // MiniMax M2 / M2.1 / M2.5 / M2.7: the Qwen code path with MiniMax's attention norms and router.
-        "minimax_m2" | "minimax_m3_vl" | "minimax_m3_vl_text" => run_qwen(args),
+        "minimax_m2" | "minimax_m3_vl" | "minimax_m3_vl_text" | "minimax" | "minimax_text_01" | "minimax_m1" | "minimax_vl_01" => {
+            run_qwen(args)
+        }
         "mistral_large4" | "mistral_large4_text" => run_mistral4(args),
         "deepseek_v4" => run_deepseek4(args),
         other => bail!("unsupported model_type {other}"),

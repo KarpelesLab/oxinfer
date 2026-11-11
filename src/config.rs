@@ -681,6 +681,30 @@ pub struct QwenConfig {
     /// MiniMax M3's RMSNorm scales by `1 + weight` (Gemma style).
     #[serde(default)]
     pub use_gemma_norm: bool,
+    /// MiniMax-Text-01 / M1 (`minimax`, `minimax_text_01`, `minimax_m1`): lightning attention
+    /// (see `crate::minimax`) on the layers `attn_type_list` marks 0, softmax attention on those
+    /// marked 1 (`layer_types` in the `-hf` releases).
+    #[serde(default)]
+    pub attn_type_list: Option<Vec<u8>>,
+    /// MiniMax-01: the residual is the normed input (`postnorm`), and each sublayer's output is
+    /// `alpha * residual + beta * sublayer`.
+    #[serde(default)]
+    pub postnorm: bool,
+    #[serde(default, alias = "layernorm_full_attention_alpha")]
+    pub full_attn_alpha_factor: Option<f64>,
+    #[serde(default, alias = "layernorm_full_attention_beta")]
+    pub full_attn_beta_factor: Option<f64>,
+    #[serde(default, alias = "layernorm_linear_attention_alpha")]
+    pub linear_attn_alpha_factor: Option<f64>,
+    #[serde(default, alias = "layernorm_linear_attention_beta")]
+    pub linear_attn_beta_factor: Option<f64>,
+    #[serde(default, alias = "layernorm_mlp_alpha")]
+    pub mlp_alpha_factor: Option<f64>,
+    #[serde(default, alias = "layernorm_mlp_beta")]
+    pub mlp_beta_factor: Option<f64>,
+    /// Set for MiniMax-01 checkpoints: the linear layers are lightning attention.
+    #[serde(skip)]
+    pub lightning: bool,
 }
 
 /// `sparse_attention_config` of MiniMax M3's release.
@@ -724,6 +748,8 @@ impl QwenConfig {
         // projections, contiguous M-RoPE sections.
         let qwen2 = matches!(mt, Some("qwen2" | "qwen2_vl" | "qwen2_5_vl"));
         let minimax_m3 = matches!(mt, Some("minimax_m3_vl" | "minimax_m3_vl_text"));
+        let minimax_01 = matches!(mt, Some("minimax" | "minimax_text_01" | "minimax_m1" | "minimax_vl_01"));
+        let minimax_hf = mt == Some("minimax");
         let minimax_m2 = mt == Some("minimax_m2") || minimax_m3;
         let dense = mt == Some("qwen3") || llama || qwen2 || minimax_m2;
         let image_token = raw.get("image_token_id").and_then(|v| v.as_u64());
@@ -782,6 +808,32 @@ impl QwenConfig {
             if cfg.hidden_act.is_none() || cfg.swiglu_alpha.is_some() {
                 // transformers rewrites "swigluoai" to "silu" on save, keeping alpha / limit.
                 cfg.hidden_act = Some("swigluoai".to_string());
+            }
+        }
+        if minimax_01 {
+            // Lightning attention plus softmax attention every few layers (no query / key norms,
+            // partial RoPE of `rotary_dim`), Mixtral-style softmax-routed experts.
+            cfg.lightning = true;
+            // transformers' `minimax` always takes the residual after the norm.
+            if minimax_hf {
+                cfg.postnorm = true;
+            }
+            cfg.qk_norm = false;
+            cfg.attn_output_gate = false;
+            cfg.zero_centered_norm = false;
+            cfg.moe_intermediate_size = cfg.intermediate_size;
+            if cfg.num_experts.is_none() {
+                bail!("MiniMax-01 config has no num_local_experts");
+            }
+            if let Some(a) = &cfg.attn_type_list {
+                cfg.layer_types = Some(
+                    a.iter()
+                        .map(|&v| if v == 1 { "full_attention" } else { "linear_attention" }.to_string())
+                        .collect(),
+                );
+            }
+            if cfg.layer_types.is_none() {
+                bail!("MiniMax-01 config has neither attn_type_list nor layer_types");
             }
         }
         if dense {
@@ -871,6 +923,20 @@ impl QwenConfig {
     /// Query / key norms over all heads at once (MiniMax M2's `qk_norm_type` "per_layer").
     pub fn qk_norm_full(&self) -> bool {
         self.qk_norm_type.as_deref() == Some("per_layer")
+    }
+    /// MiniMax-01's residual scales of layer `l`: `(alpha, beta)` of its attention, then of its MLP
+    /// (`x = alpha * norm(x) + beta * f(norm(x))`); None for pre-norm models.
+    pub fn postnorm_scales(&self, l: usize) -> Option<[(f32, f32); 2]> {
+        if !self.postnorm {
+            return None;
+        }
+        let f = |v: Option<f64>| v.unwrap_or(1.0) as f32;
+        let attn = if self.is_full(l) {
+            (f(self.full_attn_alpha_factor), f(self.full_attn_beta_factor))
+        } else {
+            (f(self.linear_attn_alpha_factor), f(self.linear_attn_beta_factor))
+        };
+        Some([attn, (f(self.mlp_alpha_factor), f(self.mlp_beta_factor))])
     }
     /// Layer `l` has a dense MLP rather than a MoE (MiniMax M3's leading layers).
     pub fn is_dense_mlp(&self, l: usize) -> bool {

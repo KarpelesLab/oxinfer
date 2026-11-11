@@ -838,11 +838,123 @@ impl ChatFormat for MiniMax3Chat {
     }
 }
 
-/// The chat format of a MiniMax model: M3's or M2's, by its template.
+/// MiniMax-Text-01, VL-01 and M1: `<beginning_of_sentence>ROLE name=...\n...<end_of_sentence>\n`
+/// turns. M1 opens the document with `<begin_of_document>`, declares tools in a system turn and
+/// thinks in plain-text `<think>` blocks; Text-01 declares each tool in its own system turn after
+/// the conversation (here after the first user turn) and answers tool calls with
+/// `function_response` system turns.
+pub struct MiniMax01Chat {
+    pub m1: bool,
+}
+
+impl MiniMax01Chat {
+    const AI: &'static str = "<beginning_of_sentence>ai name=assistant\n";
+    const EOS: &'static str = "<end_of_sentence>";
+
+    /// Whether a chat template is this family's.
+    pub fn is_template(t: &str) -> bool {
+        t.contains("<beginning_of_sentence>")
+    }
+
+    pub fn for_template(t: &str) -> MiniMax01Chat {
+        MiniMax01Chat {
+            m1: t.contains("<begin_of_document>"),
+        }
+    }
+}
+
+impl ChatFormat for MiniMax01Chat {
+    fn conversation_start(&self, system: Option<&str>, think: bool) -> String {
+        self.conversation_start_tools(system, think, &[])
+    }
+    fn first_turn(&self, system: Option<&str>, think: bool, tools: &[ToolSpec], content: &str) -> String {
+        if self.m1 {
+            let mut s = self.conversation_start_tools(system, think, tools);
+            s.push_str(&self.user_turn(content, think));
+            return s;
+        }
+        // Text-01's template lists the tools after the messages.
+        let mut s = self.conversation_start_tools(system, think, &[]);
+        s.push_str(&format!("<beginning_of_sentence>user name=user\n{content}{}\n", Self::EOS));
+        s.push_str(&crate::tools::minimax01::text01_tools_turns(tools));
+        s.push_str(Self::AI);
+        s
+    }
+    fn user_turn(&self, content: &str, _think: bool) -> String {
+        format!("<beginning_of_sentence>user name=user\n{content}{}\n{}", Self::EOS, Self::AI)
+    }
+    fn end_of_model_turn(&self) -> String {
+        format!("{}\n", Self::EOS)
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        Self::EOS
+    }
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        if self.m1 { ("<think>", "</think>") } else { ("", "") }
+    }
+    fn starts_in_thinking(&self, _think: bool) -> bool {
+        false
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, _think: bool, tools: &[ToolSpec]) -> String {
+        let mut s = String::from(if self.m1 { "<begin_of_document>" } else { "" });
+        if let Some(sys) = system.filter(|s| !s.is_empty()) {
+            s.push_str(&format!("<beginning_of_sentence>system ai_setting=assistant\n{sys}{}\n", Self::EOS));
+        }
+        if self.m1 && !tools.is_empty() {
+            s.push_str(&crate::tools::minimax01::m1_tools_turn(tools));
+        }
+        s
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        if self.m1 { "<tool_calls>" } else { "<function_call>" }
+    }
+    fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
+        if self.m1 {
+            crate::tools::minimax01::parse_m1(raw)
+        } else {
+            crate::tools::minimax01::parse_text01(raw)
+        }
+    }
+    fn tool_results(&self, results: &[ToolResult], _think: bool) -> String {
+        let mut s = format!("{}\n", Self::EOS);
+        if self.m1 {
+            s.push_str("<beginning_of_sentence>tool name=tools\n");
+            for r in results {
+                s.push_str(&format!("tool name: {}\ntool result: {}\n\n", r.name, r.content));
+            }
+            s.push_str(&format!("{}\n", Self::EOS));
+        } else {
+            for r in results {
+                s.push_str(&format!(
+                    "<beginning_of_sentence>system function_response=functions\n{{\"name\": \"{}\", \"response\": {}}}{}\n",
+                    r.name,
+                    r.content,
+                    Self::EOS
+                ));
+            }
+        }
+        s.push_str(Self::AI);
+        s
+    }
+    fn assistant_text(&self, content: &str, calls: &[ToolCall]) -> String {
+        if calls.is_empty() {
+            return content.to_string();
+        }
+        let c = if self.m1 {
+            crate::tools::minimax01::m1_calls(calls)
+        } else {
+            crate::tools::minimax01::text01_calls(calls)
+        };
+        format!("{}\n{c}", content.trim_end())
+    }
+}
+
+/// The chat format of a MiniMax model: M3's, MiniMax-01's / M1's or M2's, by its template.
 pub fn minimax_for_model(dir: &std::path::Path) -> &'static (dyn ChatFormat + Sync) {
     let t = model_template(dir);
     match t.as_deref() {
         Some(t) if MiniMax3Chat::is_template(t) => Box::leak(Box::new(MiniMax3Chat::for_template(t))),
+        Some(t) if MiniMax01Chat::is_template(t) => Box::leak(Box::new(MiniMax01Chat::for_template(t))),
         t => Box::leak(Box::new(MiniMaxChat::for_template(t))),
     }
 }
@@ -1038,5 +1150,42 @@ mod tests {
         };
         let t = f.assistant_text("", std::slice::from_ref(&call));
         assert_eq!(f.parse_tool_calls(&t), vec![call]);
+    }
+
+    /// MiniMax-M1's and Text-01's templates (rendered with Jinja).
+    #[test]
+    fn minimax01_matches_templates() {
+        let tool = ToolSpec {
+            name: "get_time".into(),
+            description: "Current time".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {"tz": {"type": "string"}}}),
+        };
+        let decl = r#"{"type": "function", "function": {"name": "get_time", "description": "Current time", "parameters": {"type": "object", "properties": {"tz": {"type": "string"}}}}}"#;
+        let m1 = MiniMax01Chat::for_template("{{ '<begin_of_document>' }}<beginning_of_sentence>");
+        assert!(m1.m1);
+        assert_eq!(
+            m1.first_turn(Some("Be brief."), false, std::slice::from_ref(&tool), "Hi"),
+            format!(
+                "<begin_of_document><beginning_of_sentence>system ai_setting=assistant\nBe brief.<end_of_sentence>\n<beginning_of_sentence>system tool_setting=tools\nYou are provided with these tools:\n<tools>\n{decl}\n</tools>\n\nIf you need to call tools, please respond with <tool_calls></tool_calls> XML tags, and provide tool-name and json-object of arguments, following the format below:\n<tool_calls>\n{{name: <tool-name-1>, arguments: <args-json-object-1>}}\n...\n</tool_calls><end_of_sentence>\n<beginning_of_sentence>user name=user\nHi<end_of_sentence>\n<beginning_of_sentence>ai name=assistant\n"
+            )
+        );
+        let t01 = MiniMax01Chat::for_template("<beginning_of_sentence>");
+        assert!(!t01.m1);
+        assert_eq!(
+            t01.first_turn(Some("Be brief."), false, std::slice::from_ref(&tool), "Hi"),
+            format!(
+                "<beginning_of_sentence>system ai_setting=assistant\nBe brief.<end_of_sentence>\n<beginning_of_sentence>user name=user\nHi<end_of_sentence>\n<beginning_of_sentence>system function_setting=functions\n{decl}<end_of_sentence>\n<beginning_of_sentence>ai name=assistant\n"
+            )
+        );
+        // Calls as each writes them.
+        let m1_out = "<think>\nok\n</think>\n<tool_calls>\n{\"name\": \"get_time\", \"arguments\": {\"tz\": \"UTC\"}}\n</tool_calls>";
+        assert_eq!(m1.parse_tool_calls(m1_out)[0].arguments["tz"], "UTC");
+        let t01_out = "<function_call>```typescript\nfunctions.get_time({\"tz\": \"UTC\"})\n```";
+        let c = t01.parse_tool_calls(t01_out);
+        assert_eq!((c[0].name.as_str(), &c[0].arguments["tz"]), ("get_time", &serde_json::json!("UTC")));
+        for f in [&m1, &t01] {
+            let t = f.assistant_text("Let me check.", &c);
+            assert_eq!(f.parse_tool_calls(&t), c, "{t}");
+        }
     }
 }

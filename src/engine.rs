@@ -1325,7 +1325,9 @@ impl Engine {
             "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" | "qwen2_5_vl"
             | "qwen4_exp" | "qwen4_exp_text" => Family::Qwen,
             "llama" => Family::Llama,
-            "minimax_m2" | "minimax_m3_vl" | "minimax_m3_vl_text" => Family::Qwen,
+            "minimax_m2" | "minimax_m3_vl" | "minimax_m3_vl_text" | "minimax" | "minimax_text_01" | "minimax_m1" | "minimax_vl_01" => {
+                Family::Qwen
+            }
             "mistral_large4" | "mistral_large4_text" => Family::Mistral4,
             "deepseek_v4" => Family::DeepSeek4,
             other => bail!("unsupported model_type {other}"),

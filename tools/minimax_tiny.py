@@ -102,11 +102,65 @@ elif arch == "m3":
         bos_token_id=EOS,
     )
     Model = MiniMaxM3VLForCausalLM
+elif arch == "01":
+    from transformers import MiniMaxConfig, MiniMaxForCausalLM
+
+    # Lightning attention with a softmax attention layer every 3rd, post-norm residuals scaled as
+    # the releases (alpha 3.56); the reference's prefill runs in blocks of 4 (its chunked form).
+    n = 6
+    cfg = MiniMaxConfig(
+        vocab_size=V,
+        hidden_size=128,
+        intermediate_size=64,
+        num_hidden_layers=n,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        num_local_experts=8,
+        num_experts_per_tok=2,
+        layer_types=[
+            {"f": "full_attention", "l": "linear_attention"}[c]
+            for c in os.environ.get("LAYERS", "llfllf")[:n]
+        ],
+        block_size=int(os.environ.get("BLOCK", "4")),
+        # MiniMax's code rotates `rotary_dim` of each head; transformers needs the factor for it.
+        rotary_dim=16,
+        rope_parameters={"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 0.5},
+        full_attn_alpha_factor=3.5565588200778455,
+        linear_attn_alpha_factor=3.5565588200778455,
+        mlp_alpha_factor=3.5565588200778455,
+        postnorm=True,
+        rms_norm_eps=1e-5,
+        tie_word_embeddings=False,
+        initializer_range=0.08,
+        eos_token_id=EOS,
+        bos_token_id=EOS,
+    )
+    Model = MiniMaxForCausalLM
 else:
     sys.exit(f"unknown --arch {arch}")
 
 cfg._attn_implementation = "eager"
 m = Model(cfg).float().eval()
+if arch == "01":
+    # transformers' `minimax` rotates whole heads; MiniMax's own code (modeling_minimax_m1.py,
+    # which llama.cpp and vLLM follow) rotates the first `rotary_dim` dimensions with frequencies
+    # over `rotary_dim`. The reference here does as MiniMax's code.
+    from transformers.models.minimax import modeling_minimax as mmod
+
+    rd = cfg.rotary_dim
+    m.model.rotary_emb.inv_freq = 1.0 / (10000.0 ** (torch.arange(0, rd, 2).float() / rd))
+    m.model.rotary_emb.original_inv_freq = m.model.rotary_emb.inv_freq
+
+    def partial_rope(q, k, cos, sin, unsqueeze_dim=1, **_):
+        cos, sin = cos.unsqueeze(unsqueeze_dim), sin.unsqueeze(unsqueeze_dim)
+        r = cos.shape[-1]
+        rot = lambda x: torch.cat((-x[..., r // 2 : r], x[..., : r // 2]), dim=-1)
+        q = torch.cat([q[..., :r] * cos + rot(q) * sin, q[..., r:]], dim=-1)
+        k = torch.cat([k[..., :r] * cos + rot(k) * sin, k[..., r:]], dim=-1)
+        return q, k
+
+    mmod.apply_rotary_pos_emb = partial_rope
 
 
 def fp8_quant(w):
@@ -331,7 +385,10 @@ with torch.no_grad():
     for i in range(gen):
         t = int(rows[-1].argmax())
         toks.append(t)
-        o = m(torch.tensor([[t]]), past_key_values=cache, use_cache=True)
+        # Explicit positions: transformers' MiniMax-01 cache reports length 0 when layer 0 is a
+        # lightning layer (as in every release), which would restart decode positions at 0.
+        p = torch.tensor([[len(prompt) + i]])
+        o = m(torch.tensor([[t]]), past_key_values=cache, use_cache=True, position_ids=p, cache_position=p[0])
         cache = o.past_key_values
         rows.append(o.logits[0, -1].float())
     torch.stack(rows).numpy().tofile(os.path.join(out, "ref.bin"))

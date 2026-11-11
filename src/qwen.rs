@@ -48,6 +48,8 @@ pub(crate) struct Attn<'a> {
 pub(crate) enum Mixer<'a> {
     Gdn(Gdn<'a>),
     Attn(Attn<'a>),
+    /// MiniMax-01's lightning attention (see `crate::minimax`).
+    Lightning(crate::minimax::Lightning<'a>),
 }
 
 pub(crate) struct Mlp<'a> {
@@ -252,6 +254,8 @@ pub(crate) struct GdnRecord {
     conv0: Vec<f32>, // conv state before the span
     conv_dim: usize,
     rule: DeltaRule,
+    /// A lightning layer's record (MiniMax-01) in place of the above.
+    lightning: Option<crate::minimax::LightningRec>,
 }
 
 /// The shapes and per-head constants of one layer's gated delta rule.
@@ -485,6 +489,10 @@ impl QwenSession {
             let i = pos - start - 1; // the last kept token, within the span
             for (st, rec) in self.gdn.iter_mut().zip(&self.rec) {
                 let Some(st) = st else { continue };
+                if let Some(lr) = &rec.lightning {
+                    lr.replay(&mut st.s, i + 1);
+                    continue;
+                }
                 st.s.copy_from_slice(&rec.s0);
                 let nv = rec.rule.nv;
                 rec.rule
@@ -721,6 +729,13 @@ impl<'a> QwenModel<'a> {
             let lp = format!("{prefix}layers.{l}.");
             let mixer = if cfg.is_full(l) {
                 Mixer::Attn(ld.attn(&format!("{lp}self_attn."))?)
+            } else if cfg.lightning {
+                Mixer::Lightning(crate::minimax::Lightning::load(
+                    &ld,
+                    &format!("{lp}self_attn."),
+                    l,
+                    cfg.num_hidden_layers,
+                )?)
             } else {
                 let gp = format!("{lp}linear_attn.");
                 let conv_w = ld.getf(&format!("{gp}conv1d.weight"), &[conv_dim, 1, kc])?;
@@ -865,6 +880,7 @@ impl<'a> QwenModel<'a> {
         for (l, layer) in self.layers.iter_mut().enumerate() {
             let lp = format!("layers.{l}.");
             match &mut layer.mixer {
+                Mixer::Lightning(_) => {}
                 Mixer::Gdn(g) => {
                     let p = format!("{lp}linear_attn.");
                     set(
@@ -916,6 +932,7 @@ impl<'a> QwenModel<'a> {
                 let mut lins: Vec<&Lin> = match &layer.mixer {
                     Mixer::Gdn(g) => vec![&g.qkv, &g.z, &g.b, &g.a, &g.out],
                     Mixer::Attn(a) => a.lins().to_vec(),
+                    Mixer::Lightning(lt) => lt.lins(),
                 };
                 lins.extend(layer.ffn.lins());
                 if let Some(e) = &self.exp {
@@ -943,6 +960,7 @@ impl<'a> QwenModel<'a> {
                 let mut lins: Vec<&Lin> = match &layer.mixer {
                     Mixer::Gdn(g) => vec![&g.qkv, &g.z, &g.b, &g.a, &g.out],
                     Mixer::Attn(a) => a.lins().to_vec(),
+                    Mixer::Lightning(lt) => lt.lins(),
                 };
                 lins.extend(layer.ffn.dense_lins());
                 if let Some(e) = &self.exp {
@@ -998,6 +1016,7 @@ impl<'a> QwenModel<'a> {
             n += match &l.mixer {
                 Mixer::Gdn(g) => g.qkv.bytes() + g.z.bytes() + g.b.bytes() + g.a.bytes() + g.out.bytes(),
                 Mixer::Attn(a) => a.bytes(),
+                Mixer::Lightning(lt) => lt.lins().iter().map(|w| w.bytes()).sum(),
             };
         }
         if let Some(e) = &self.exp {
@@ -1019,6 +1038,13 @@ impl<'a> QwenModel<'a> {
             if cfg.is_full(l) {
                 kv.push(Some(LayerCache::new(cfg.num_key_value_heads, cfg.head_dim)));
                 gdn.push(None);
+            } else if cfg.lightning {
+                // A `[hd, hd]` state per head, no conv.
+                kv.push(None);
+                gdn.push(Some(GdnState {
+                    s: crate::quant::PageVec::zeroed(cfg.num_attention_heads * cfg.head_dim * cfg.head_dim),
+                    conv: crate::quant::PageVec::zeroed(0),
+                }));
             } else {
                 kv.push(None);
                 gdn.push(Some(GdnState {
@@ -1301,6 +1327,7 @@ impl<'a> QwenModel<'a> {
             let at = match &layer.mixer {
                 // MiniMax: norms over all heads, block-sparse attention (CPU for now).
                 Mixer::Attn(at) if at.indexer.is_some() || cfg.qk_norm_full() => return None,
+                Mixer::Lightning(_) => return None,
                 Mixer::Attn(at) => at,
                 Mixer::Gdn(gd) => {
                     let st = g.states.len();
@@ -1898,8 +1925,22 @@ impl<'a> QwenModel<'a> {
                     self.gdn_forward(gd, sess.gdn[l].as_mut().unwrap(), rec, &hn, t, &mut y)
                 }
                 Mixer::Attn(at) => self.attn_forward(at, sess.kv[l].as_mut().unwrap(), &hn, t, start, &cos, &sin, &mut y),
+                Mixer::Lightning(lt) => {
+                    let rec = if record {
+                        Some(sess.rec[l].lightning.get_or_insert_with(Default::default))
+                    } else {
+                        None
+                    };
+                    sess.gpu_states_kept = false;
+                    lt.forward(&mut sess.gdn[l].as_mut().unwrap().s, rec, &hn, t, h, &mut y)
+                }
             }
-            add_inplace(&mut x, &y);
+            // MiniMax-01: the normed input is the residual, both scaled.
+            let post = cfg.postnorm_scales(l);
+            match post {
+                Some([(a, b), _]) => residual_scaled(&mut x, &hn, a, &y, b),
+                None => add_inplace(&mut x, &y),
+            }
             if let Some(iv) = &iv {
                 iv.point(2 * l + 1, &mut x, h, start);
             }
@@ -1918,7 +1959,10 @@ impl<'a> QwenModel<'a> {
                 self.stream.as_ref().map(|_| &need as &dyn Fn(&[usize])),
                 hook.as_ref(),
             );
-            add_inplace(&mut x, &y);
+            match post {
+                Some([_, (a, b)]) => residual_scaled(&mut x, &hn, a, &y, b),
+                None => add_inplace(&mut x, &y),
+            }
             if let Some(iv) = &iv {
                 iv.point(2 * l + 2, &mut x, h, start);
             }
@@ -2232,6 +2276,13 @@ impl<'a> QwenModel<'a> {
 
         gated_norm(&mut out, &z, &gd.norm_w, eps, sig, t * nv > 64);
         linear(&gd.out, h, value_dim, &out, t, y);
+    }
+}
+
+/// `x = a * hn + b * y` (MiniMax-01's post-norm residual).
+fn residual_scaled(x: &mut [f32], hn: &[f32], a: f32, y: &[f32], b: f32) {
+    for ((x, &n), &y) in x.iter_mut().zip(hn).zip(y) {
+        *x = a * n + b * y;
     }
 }
 

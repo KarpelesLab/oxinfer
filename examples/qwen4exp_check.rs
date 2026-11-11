@@ -61,7 +61,7 @@ fn main() -> Result<()> {
         .map(|c| f32::from_le_bytes(*c))
         .collect();
     let gen_ids = ids(&args.next().context(usage)?)?;
-    let (mut chunk, mut cpu, mut mtp, mut mtp_from) = (usize::MAX, false, None, None);
+    let (mut chunk, mut cpu, mut mtp, mut mtp_from, mut rewind) = (usize::MAX, false, None, None, None);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--chunk" => chunk = args.next().context("--chunk N")?.parse()?,
@@ -69,6 +69,13 @@ fn main() -> Result<()> {
             // Greedy MTP speculative decoding of the reference's tokens (draft length K).
             "--mtp" => mtp = Some(args.next().context("--mtp K")?.parse::<usize>()?),
             "--mtp-from" => mtp_from = Some(args.next().context("--mtp-from FILE")?),
+            // Feed the first K reference tokens as one recording pass, rewind to after R of them,
+            // then step on (checks rewinds into a pass: KV caches and recurrent states).
+            "--rewind" => {
+                let k: usize = args.next().context("--rewind K R")?.parse()?;
+                let r: usize = args.next().context("--rewind K R")?.parse()?;
+                rewind = Some((k, r));
+            }
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
@@ -146,14 +153,23 @@ fn main() -> Result<()> {
     };
     step(0, &l);
     let t2 = std::time::Instant::now();
-    for i in 1..n {
+    let mut from = 1;
+    if let Some((k, r)) = rewind {
+        anyhow::ensure!(r < k && k < n, "--rewind K R needs R < K < {n}");
+        m.forward_hidden_rec(&mut sess, &gen_ids[..k]);
+        sess.rewind(prompt.len() + r)?;
+        println!("[fed {k} tokens in one recording pass, rewound to keep {r}]");
+        from = r + 1;
+    }
+    for i in from..n {
         let l = m.forward(&mut sess, &gen_ids[i - 1..i]);
         step(i, &l);
     }
     let dt = t2.elapsed().as_secs_f64();
+    let c = n - from + 1;
     println!(
-        "{n} steps: max logit diff {worst:.3e}, mean KL {:.3e}, same top-1 {same}/{n}; decode {:.2} tok/s",
-        kls / n as f64,
+        "{c} steps: max logit diff {worst:.3e}, mean KL {:.3e}, same top-1 {same}/{c}; decode {:.2} tok/s",
+        kls / c as f64,
         (n - 1) as f64 / dt.max(1e-9)
     );
     Ok(())

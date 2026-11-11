@@ -612,6 +612,106 @@ pub mod minimax3 {
     }
 }
 
+/// MiniMax-M1: tools as JSON lines in a `tool_setting` system turn, calls as JSON lines in
+/// `<tool_calls>`; MiniMax-Text-01: one `function_setting` turn per tool, calls as
+/// `<function_call>` followed by a TypeScript block `functions.NAME({json})`.
+pub mod minimax01 {
+    use super::*;
+
+    /// The `tool_setting` turn of MiniMax-M1's template (whose `''name''` renders unquoted).
+    pub fn m1_tools_turn(tools: &[ToolSpec]) -> String {
+        let mut s = String::from("<beginning_of_sentence>system tool_setting=tools\nYou are provided with these tools:\n<tools>\n");
+        for t in tools {
+            let v = json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": t.parameters } });
+            s.push_str(&qwen::py_json(&v));
+            s.push('\n');
+        }
+        s.push_str("</tools>\n\nIf you need to call tools, please respond with <tool_calls></tool_calls> XML tags, and provide tool-name and json-object of arguments, following the format below:\n<tool_calls>\n{name: <tool-name-1>, arguments: <args-json-object-1>}\n...\n</tool_calls><end_of_sentence>\n");
+        s
+    }
+
+    /// The `function_setting` turns of MiniMax-Text-01's template.
+    pub fn text01_tools_turns(tools: &[ToolSpec]) -> String {
+        tools
+            .iter()
+            .map(|t| {
+                let v =
+                    json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": t.parameters } });
+                format!(
+                    "<beginning_of_sentence>system function_setting=functions\n{}<end_of_sentence>\n",
+                    qwen::py_json(&v)
+                )
+            })
+            .collect()
+    }
+
+    fn call_of(v: &Value) -> Option<ToolCall> {
+        let o = v.as_object()?;
+        let name = o.get("name")?.as_str()?.to_string();
+        let arguments = match o.get("arguments") {
+            Some(Value::Object(a)) => a.clone(),
+            Some(Value::String(a)) => serde_json::from_str(a).unwrap_or_default(),
+            _ => Map::new(),
+        };
+        Some(ToolCall { name, arguments })
+    }
+
+    /// M1: one JSON object per line inside `<tool_calls>`.
+    pub fn parse_m1(raw: &str) -> Vec<ToolCall> {
+        raw.split("<tool_calls>")
+            .skip(1)
+            .flat_map(|b| {
+                b.split("</tool_calls>")
+                    .next()
+                    .unwrap_or(b)
+                    .lines()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter_map(|l| serde_json::from_str::<Value>(l.trim()).ok().as_ref().and_then(call_of))
+            .collect()
+    }
+
+    pub fn m1_calls(calls: &[ToolCall]) -> String {
+        let lines: Vec<String> = calls
+            .iter()
+            .map(|c| qwen::py_json(&json!({ "name": c.name, "arguments": Value::Object(c.arguments.clone()) })))
+            .collect();
+        format!("<tool_calls>\n{}\n</tool_calls>", lines.join("\n"))
+    }
+
+    /// Text-01: `functions.NAME({json})` lines in TypeScript blocks after `<function_call>`.
+    pub fn parse_text01(raw: &str) -> Vec<ToolCall> {
+        let mut calls = Vec::new();
+        for part in raw.split("<function_call>").skip(1) {
+            for line in part.lines() {
+                let Some(rest) = line.trim().strip_prefix("functions.") else {
+                    continue;
+                };
+                let Some((name, args)) = rest.split_once('(') else { continue };
+                let args = args.trim_end().strip_suffix(')').unwrap_or(args);
+                let arguments = serde_json::from_str::<Value>(args)
+                    .ok()
+                    .and_then(|v| v.as_object().cloned())
+                    .unwrap_or_default();
+                calls.push(ToolCall {
+                    name: name.to_string(),
+                    arguments,
+                });
+            }
+        }
+        calls
+    }
+
+    pub fn text01_calls(calls: &[ToolCall]) -> String {
+        let lines: Vec<String> = calls
+            .iter()
+            .map(|c| format!("functions.{}({})", c.name, qwen::py_json(&Value::Object(c.arguments.clone()))))
+            .collect();
+        format!("<function_call>```typescript\n{}\n```", lines.join("\n"))
+    }
+}
+
 // ---- Qwen 3.5 / 3.8 -----------------------------------------------------------------------------
 
 pub mod qwen {
