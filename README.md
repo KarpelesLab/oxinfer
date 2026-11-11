@@ -2021,7 +2021,8 @@ CPU's own speed.
 ## Image generation
 
 A diffusers folder (one with `model_index.json`) switches oxinfer to text-to-image with Stable
-Diffusion 1.x / 2.x, which includes SD 1.5, SD 2.1 and the one-step SD-Turbo (`src/sd/`):
+Diffusion 1.x / 2.x, which includes SD 1.5, SD 2.1 and the one-step SD-Turbo, and with Stable
+Diffusion XL (see [below](#stable-diffusion-xl)) (`src/sd/`):
 
 ```sh
 ./target/release/oxinfer --model models/sd-turbo -p "a red fox in a snowy forest" -o fox.png
@@ -2059,7 +2060,7 @@ SiLU applied while the input is loaded), and attention runs its two products as 
 softmax kernel between them. What stays on the CPU is element-wise: residual adds, the GEGLU gate,
 upsampling and skip concatenation. `OXINFER_GPU_CHECK=1` recomputes every device op on the CPU and
 prints the worst relative error per kind (about 4e-6 for attention, 1e-6 for the fused norms, on
-Metal and WebGPU). SDXL and SD 3 use different architectures and are not supported; FLUX.1 has
+Metal and WebGPU). SD 3 uses a different architecture and is not supported; FLUX.1 has
 its own pipeline (see [FLUX.1 Kontext](#flux1-kontext-image-editing-from-instructions-and-flux1-text-to-image)).
 
 **LoRA.** `--lora FILE[:SCALE]` (repeatable, scale 1 by default) merges a LoRA into the UNet and
@@ -2092,6 +2093,89 @@ model bit for bit. In the library, `sd::Pipeline::load_with_loras(dir, &[LoraSpe
 report)` does the same (`examples/sd_lora.rs`); in the browser build, `web_sd_load` takes the
 LoRA files (`sdLoad(dir, [{ path, scale }])` in `oxinfer.js`).
 
+### Stable Diffusion XL
+
+An SDXL diffusers folder (`StableDiffusionXLPipeline` in `model_index.json`, with `text_encoder_2/`
+and `tokenizer_2/`) loads through the same pipeline, CLI, library, C API and server entry points;
+the model type is read from the folder. SDXL base 1.0 and SDXL-Turbo were run:
+
+```sh
+./target/release/oxinfer --model stabilityai/stable-diffusion-xl-base-1.0 \
+    -p "a watercolor painting of a lighthouse on a cliff" --negative "blurry" -o lighthouse.png
+./target/release/oxinfer --model stabilityai/sdxl-turbo -p "a red fox in a snowy forest" -o fox.png
+# image-to-image and inpainting (mask blending), as for SD 1.x
+./target/release/oxinfer --model stabilityai/stable-diffusion-xl-base-1.0 --init-image in.png \
+    --strength 0.6 -p "an oil painting of a lighthouse at sunset" -o painting.png
+# SDXL-Lightning: a few-step LoRA on the base model, over "trailing" timesteps
+./target/release/oxinfer --model stabilityai/stable-diffusion-xl-base-1.0 \
+    --lora ByteDance/SDXL-Lightning/sdxl_lightning_4step_lora.safetensors \
+    --sampler euler_trailing --steps 4 --guidance 0 -p "a red fox in a snowy forest" -o fox.png
+```
+
+What SDXL adds is in `src/sd/xl.rs`; the rest is the SD 1.x code, which takes its structure from
+the weights and configs:
+
+- **Two text encoders**, CLIP ViT-L and OpenCLIP bigG with its text projection. The penultimate
+  hidden states of both, concatenated per token (768 + 1280), are the cross-attention context;
+  the projected end-of-text state of the second is the pooled embedding. An empty negative prompt
+  conditions on zeros when the pipeline says so (`force_zeros_for_empty_prompt`: the base model,
+  not Turbo).
+- **Added conditioning.** The pooled embedding and six size ids (original size, crop offset,
+  target size; each a 256-wide sinusoidal embedding) go through the UNet's `add_embedding` into
+  the time embedding. As in diffusers the ids default to the output size and no crop;
+  `Pipeline::size_cond` sets them in the library (`examples/sd_xl.rs`).
+- **UNet.** Transformer depth per block (1, 2, 10), no attention at the top level, two
+  downsamplings (so sizes are multiples of 32), linear projections: all read from the weights.
+- **VAE.** The scaling factor (0.13025) comes from the VAE config. Everything here is computed
+  in f32, so the original SDXL VAE's fp16 weights decode without the overflow that the "fp16-fix"
+  VAE works around in half-precision runtimes (that VAE has the same architecture; not run).
+- **Samplers and defaults.** Without `--sampler` an SDXL model uses the scheduler its config names
+  (Euler for the base model, Euler ancestral for Turbo), with guidance 5 and 25 steps at
+  1024x1024 for the base model and 1 step without guidance at 512x512 for Turbo.
+  `--sampler euler_trailing` / `euler_a_trailing` run over "trailing" timesteps whatever the
+  config says, which few-step LoRAs such as SDXL-Lightning need on the base model.
+- **LoRA.** `--lora` reads kohya SDXL files, whose UNet keys follow the original (SGM) layout
+  (`lora_unet_input_blocks_4_1_transformer_blocks_0_attn1_to_q`, `lora_unet_output_blocks_...`,
+  `lora_unet_middle_block_...`) with `lora_te1_` / `lora_te2_` for the two text encoders, the
+  diffusers-named kohya form (`lora_unet_down_blocks_...`) and the diffusers / PEFT layout
+  (`unet.`, `text_encoder.`, `text_encoder_2.`).
+
+`tools/ref_sdxl.py` runs diffusers' `StableDiffusionXLPipeline`, `...Img2ImgPipeline` and
+`...InpaintPipeline` (Euler scheduler) on the same random draws, as `tools/ref_sd.py` does for
+SD 1.x. On the CPU (x86-64, AVX-512), 512x512 to keep the float32 reference small, weights rounded
+to bf16 on both sides (relative L2 error; image also as 8-bit PSNR):
+
+| Run | Text context | Pooled | First UNet output | Final latents | Image |
+|---|---|---|---|---|---|
+| SDXL-Turbo, 1 step | 1.9e-6 | 2.0e-6 | 4.5e-7 | 9.4e-6 | 2.8e-5, 79.8 dB |
+| SDXL-Turbo, 4 steps | 1.9e-6 | 2.0e-6 | 4.5e-7 | 1.0e-5 | 4.2e-5, 78.8 dB |
+| SDXL base, 2 steps, guidance 5 | 1.9e-6 | 1.7e-6 | 1.1e-5 | 1.6e-5 | 3.4e-5, 76.2 dB |
+| SDXL base, 6 steps, guidance 5 | 1.9e-6 | 1.7e-6 | 2.8e-6 | 1.5e-4 | 2.6e-4, 68.7 dB |
+| SDXL base, 6 steps, guidance 7, negative prompt | 1.9e-6 | 1.7e-6 | 3.5e-6 | 1.3e-4 | 3.2e-4, 67.8 dB |
+| SDXL base img2img, strength 0.6, 10 steps, guidance 5 (encoder mean 2.6e-5) | 1.9e-6 | 1.8e-6 | 2.3e-5 | 2.3e-4 | 3.2e-4, 68.5 dB |
+| SDXL-Turbo img2img, strength 0.5, 2 steps (encoder mean 2.6e-5) | 1.9e-6 | 1.8e-6 | 2.8e-5 | 4.4e-5 | 7.2e-5, 75.8 dB |
+| SDXL base inpainting (mask blending), strength 1, 8 steps, guidance 5 | 1.9e-6 | 2.1e-6 | 2.2e-6 | 4.8e-5 | 1.0e-4, 74.7 dB |
+| SDXL base inpainting (mask blending), strength 0.7, 10 steps, guidance 5 | 1.9e-6 | 2.1e-6 | 1.5e-5 | 6.9e-5 | 6.9e-5, 75.8 dB |
+| + kohya LoRA at 0.9 (SGM names: 722 UNet, 72 + 192 text-encoder modules), 6 steps, guidance 5 | 9.7e-7 | 1.8e-6 | 2.4e-6 | 1.1e-4 | 3.8e-4, 68.5 dB |
+| + kohya LoRA with convolutions (SGM names, 788 UNet modules), 6 steps, guidance 5 | 2.0e-6 | 2.4e-6 | 1.7e-6 | 8.1e-4 | 2.6e-3, 62.0 dB |
+| + SDXL-Lightning 4-step LoRA (788 UNet modules), `euler_trailing`, 4 steps | 1.9e-6 | 2.0e-6 | 2.4e-7 | 5.7e-5 | 8.5e-5, 75.9 dB |
+
+Each stage agrees to float rounding; over several guided steps the differences grow along the
+trajectory (compare the 2-step and 6-step rows of the same prompt and noise). Against the
+float32 reference without the bf16 rounding, the weight storage is what shows: 42.7 dB for the
+SDXL-Turbo image, and 30.1 dB after 6 guided steps of the base model (text context 1.2e-3, first
+UNet output 2.6e-3, the same picture to the eye). On CUDA (RTX 5080) the 6-step base run gives
+69.5 dB and the img2img run 69.4 dB against the same references, and `OXINFER_GPU_CHECK=1` reports
+at worst 2.5e-6 for attention, 6.9e-7 for the fused convolution norms and 3.5e-7 for the fused
+linear norms; a 1024x1024 image at the defaults (25 steps, guidance 5) was generated there too.
+
+Not supported: the SDXL refiner (its own conditioning: one text encoder and an aesthetic score),
+SDXL InstructPix2Pix, and single-file checkpoints (`sd_xl_base_1.0.safetensors`: as for SD 1.x,
+only the diffusers folder layout is read). A dedicated 9-channel SDXL inpainting UNet takes the
+same code path as the SD 1.x one but was not run. Repo ids download the full-precision
+safetensors when a repo has both (about 14 GB for SDXL base); a folder holding only the `.fp16`
+files (7 GB) loads the same, and the weights are kept in bf16 either way.
+
 ## Editing images
 
 Give a Stable Diffusion pipeline an image and it edits it instead of starting from noise. What
@@ -2101,7 +2185,7 @@ the edit does follows from the model (the UNet's input channels):
 |---|---|---|---|
 | timbrooks/instruct-pix2pix, vinesmsuic/magicbrush-jul7 | 8 (latents + image latents) | **instruction edit**: the prompt says what to change | not used |
 | stable-diffusion-v1-5/stable-diffusion-inpainting (and other SD inpainting models) | 9 (latents + mask + masked-image latents) | needs a mask | repaints the white part |
-| any text-to-image model (SD 1.x / 2.x, SD-Turbo, + LoRAs) | 4 | image-to-image at `--strength` | inpainting by blending |
+| any text-to-image model (SD 1.x / 2.x, SD-Turbo, SDXL, SDXL-Turbo, + LoRAs) | 4 | image-to-image at `--strength` | inpainting by blending |
 
 **Editing with a prompt: InstructPix2Pix.** For "change this picture like so", use
 InstructPix2Pix. With the SD 1.5 LCM-LoRA (InstructPix2Pix is a fine-tuned SD 1.5, so the LoRA
@@ -2239,7 +2323,8 @@ for editing): iOS takes the Metal backend like macOS, Android the CPU path. At a
 CPU UNet pass, the 4-step LCM InstructPix2Pix edit is the realistic choice there; the model needs
 about 2 GB of bf16 weights in memory.
 
-**Limits.** SD 1.x / 2.x families only (no SDXL, SD 3 or Flux editing here); one image per call;
+**Limits.** SD 1.x / 2.x and SDXL families only (no SD 3 or Flux editing here; no SDXL
+InstructPix2Pix); one image per call;
 the output has the working size (multiples of 64), not the input's; no paste-back of the
 unmasked pixels after inpainting (as diffusers by default: the VAE round trip slightly changes
 them); the mask is binary (no feathering); InstructPix2Pix with `--strength` is not a thing
@@ -5550,7 +5635,7 @@ billion parameters at LUT4, `infer` only) are the practical range for 12 GB phon
   `t5.rs` (T5 encoder), `weights.rs` (layers from safetensors / GGUF), `mod.rs` (the pipelines);
   `flux_cli.rs`: its CLI.
 - `sd/`: Stable Diffusion: `clip.rs` (BPE tokenizer, text encoder), `unet.rs`, `vae.rs`, `sched.rs`
-  (Euler samplers), `ops.rs` (channels-last convolution, group/layer norm, multi-head attention on
+  (Euler samplers), `xl.rs` (SDXL: second text encoder, size conditioning, kohya LoRA names), `ops.rs` (channels-last convolution, group/layer norm, multi-head attention on
   the f32 GEMM tiles); `png.rs`: a dependency-free PNG writer.
 - `kernels.rs`: NEON kernels (`kernels_x86.rs`, `kernels_wasm.rs`: the AVX2 and simd128 equivalents, selected by `build.rs` through the `has_simd` cfg). Decode tiles stream 1–2 weight rows with 8 accumulators (the prefetcher
   prefers few long streams); prefill packs activations into 8-token panels and runs an 8-row x 8-token
