@@ -51,6 +51,7 @@ pub mod lora;
 pub mod media;
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
 pub mod metal;
+pub mod minimax;
 pub mod mistral4;
 pub mod mm;
 pub mod mm_config;

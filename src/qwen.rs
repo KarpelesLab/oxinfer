@@ -39,6 +39,8 @@ pub(crate) struct Attn<'a> {
     pub(crate) k_norm: Option<Vec<f32>>,
     /// Query, key and value biases (Qwen2 / Qwen2.5-VL), added after the projections.
     pub(crate) bias: Option<[Vec<f32>; 3]>,
+    /// MiniMax M3's lightning indexer (block-sparse attention, see `crate::minimax`).
+    pub(crate) indexer: Option<crate::minimax::Indexer<'a>>,
 }
 
 // One per layer, built once: the size difference is irrelevant.
@@ -53,13 +55,15 @@ pub(crate) struct Mlp<'a> {
     pub(crate) up: Lin<'a>,
     pub(crate) down: Lin<'a>,
     pub(crate) inter: usize,
+    /// SiLU, or MiniMax M3's clamped "swigluoai".
+    pub(crate) act: Act,
 }
 
 impl Mlp<'_> {
     fn bytes(&self) -> usize {
         self.gate.bytes() + self.up.bytes() + self.down.bytes()
     }
-    /// `down(silu(gate(x)) * up(x))` for `t` rows of `x` (`hook`: neuron edits of `target`).
+    /// `down(act(gate(x)) * up(x))` for `t` rows of `x` (`hook`: neuron edits of `target`).
     fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32], hook: Option<(&NeuronHook, Target)>) {
         let mut g = vec![0f32; t * self.inter];
         let mut u = vec![0f32; t * self.inter];
@@ -69,7 +73,7 @@ impl Mlp<'_> {
             x,
             t,
         );
-        silu_mul(&mut g, &u);
+        self.act.apply(&mut g, &mut u);
         if let Some((hk, tg)) = hook {
             hk.apply(tg, &mut g, self.inter);
         }
@@ -78,12 +82,17 @@ impl Mlp<'_> {
 }
 
 /// Sparse MoE block: softmax router, top-k experts with renormalized weights, plus a shared
-/// expert scaled by `sigmoid(shared_gate . x)`.
+/// expert scaled by `sigmoid(shared_gate . x)`. MiniMax: a sigmoid router with a selection
+/// bias (`route_bias`), and no shared expert (M2).
 pub(crate) struct Moe<'a> {
     pub(crate) router: Vec<f32>, // [n_exp, H]
     pub(crate) experts: Experts<'a>,
-    pub(crate) shared: Mlp<'a>,
-    pub(crate) shared_gate: Vec<f32>, // [H]
+    pub(crate) shared: Option<Mlp<'a>>,
+    /// The shared expert's sigmoid gate (`[H]`); without one the shared expert is added as is.
+    pub(crate) shared_gate: Option<Vec<f32>>,
+    /// Sigmoid routing (MiniMax): the per-expert selection bias (`e_score_correction_bias`) and
+    /// the factor on the weights. None: softmax routing.
+    pub(crate) route_bias: Option<(Vec<f32>, f32)>,
     /// Qwen4-Exp: prefill passes take the router logits from the matmul path (on the GPU when
     /// there is one), through this f32 copy of `router` made on first use.
     pub(crate) router_mm: Option<std::sync::OnceLock<Lin<'static>>>,
@@ -110,7 +119,7 @@ impl<'a> Ffn<'a> {
     pub(crate) fn dense_lins(&self) -> Vec<&Lin<'a>> {
         match self {
             Ffn::Dense(m) => vec![&m.gate, &m.up, &m.down],
-            Ffn::Moe(m) => vec![&m.shared.gate, &m.shared.up, &m.shared.down],
+            Ffn::Moe(m) => m.shared.iter().flat_map(|s| [&s.gate, &s.up, &s.down]).collect(),
         }
     }
 
@@ -141,17 +150,20 @@ impl<'a> Ffn<'a> {
     pub(crate) fn inter(&self, target: Target) -> Option<usize> {
         match (self, target) {
             (Ffn::Dense(m), Target::Mlp) => Some(m.inter),
-            (Ffn::Moe(m), Target::Shared) => Some(m.shared.inter),
+            (Ffn::Moe(m), Target::Shared) => m.shared.as_ref().map(|s| s.inter),
             (Ffn::Moe(m), Target::Expert(e)) if e < m.experts.n_experts() => Some(m.experts.inter),
             _ => None,
         }
     }
 
-    /// Column `n` of `target`'s down projection.
+    /// Column `n` of `target`'s down projection (a target `inter` gave a size for).
     pub(crate) fn down_column(&self, target: Target, n: usize, h: usize) -> Vec<f32> {
         let (down, inter) = match (self, target) {
             (Ffn::Dense(m), _) => (&m.down, m.inter),
-            (Ffn::Moe(m), Target::Shared | Target::Mlp) => (&m.shared.down, m.shared.inter),
+            (Ffn::Moe(m), Target::Shared | Target::Mlp) => {
+                let s = m.shared.as_ref().expect("a MoE without a shared expert");
+                (&s.down, s.inter)
+            }
             (Ffn::Moe(m), Target::Expert(e)) => (&m.experts.down[e], m.experts.inter),
         };
         let mut one = vec![0f32; inter];
@@ -166,17 +178,21 @@ impl<'a> Ffn<'a> {
         match self {
             Ffn::Dense(m) => m.bytes(),
             // The shared expert and top_k of the routed ones.
-            Ffn::Moe(m) => m.shared.bytes() + m.experts.bytes_per_token(),
+            Ffn::Moe(m) => m.shared.as_ref().map_or(0, |s| s.bytes()) + m.experts.bytes_per_token(),
         }
     }
 }
 
 impl<'a> Attn<'a> {
     pub(crate) fn bytes(&self) -> usize {
-        self.q.bytes() + self.k.bytes() + self.v.bytes() + self.o.bytes()
+        self.lins().iter().map(|l| l.bytes()).sum()
     }
-    pub(crate) fn lins(&self) -> [&Lin<'a>; 4] {
-        [&self.q, &self.k, &self.v, &self.o]
+    pub(crate) fn lins(&self) -> Vec<&Lin<'a>> {
+        let mut v = vec![&self.q, &self.k, &self.v, &self.o];
+        if let Some(ix) = &self.indexer {
+            v.extend(ix.lins());
+        }
+        v
     }
 }
 
@@ -536,13 +552,26 @@ impl<'a> Loader<'a, '_> {
         Ok(norm_weight(self.getf(full, &[n])?, self.cfg.zero_centered_norm))
     }
 
-    fn mlp(&self, p: &str, inter: usize) -> Result<Mlp<'a>> {
+    /// The gated MLP under `p`: `gate_proj` / `up_proj` / `down_proj`, or a fused `gate_up_proj`
+    /// (gate rows then up rows, as transformers keeps MiniMax M3's).
+    pub(crate) fn mlp(&self, p: &str, inter: usize) -> Result<Mlp<'a>> {
         let h = self.cfg.hidden_size;
+        let fused = format!("{p}gate_up_proj.weight");
+        let (gate, up) = if self.has(&fused) {
+            let mut v = crate::model::load_lin_experts(self.files, &fused, 2, inter, h, self.quant)?.into_iter();
+            (v.next().unwrap(), v.next().unwrap())
+        } else {
+            (
+                self.lin(&format!("{p}gate_proj.weight"), inter, h)?,
+                self.lin(&format!("{p}up_proj.weight"), inter, h)?,
+            )
+        };
         Ok(Mlp {
-            gate: self.lin(&format!("{p}gate_proj.weight"), inter, h)?,
-            up: self.lin(&format!("{p}up_proj.weight"), inter, h)?,
+            gate,
+            up,
             down: self.lin(&format!("{p}down_proj.weight"), h, inter)?,
             inter,
+            act: self.cfg.mlp_act(),
         })
     }
 
@@ -552,13 +581,15 @@ impl<'a> Loader<'a, '_> {
         let h = cfg.hidden_size;
         let (nh, nkv, hd) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
         let qw = 2 * nh * hd; // q and gate
+        // MiniMax M2: one norm over all heads.
+        let (qn, kn) = if cfg.qk_norm_full() { (nh * hd, nkv * hd) } else { (hd, hd) };
         Ok(Attn {
             q: self.lin(&format!("{ap}q_proj.weight"), if cfg.attn_output_gate { qw } else { nh * hd }, h)?,
             k: self.lin(&format!("{ap}k_proj.weight"), nkv * hd, h)?,
             v: self.lin(&format!("{ap}v_proj.weight"), nkv * hd, h)?,
             o: self.lin(&format!("{ap}o_proj.weight"), h, nh * hd)?,
-            q_norm: cfg.qk_norm.then(|| self.norm(&format!("{ap}q_norm.weight"), hd)).transpose()?,
-            k_norm: cfg.qk_norm.then(|| self.norm(&format!("{ap}k_norm.weight"), hd)).transpose()?,
+            q_norm: cfg.qk_norm.then(|| self.norm(&format!("{ap}q_norm.weight"), qn)).transpose()?,
+            k_norm: cfg.qk_norm.then(|| self.norm(&format!("{ap}k_norm.weight"), kn)).transpose()?,
             bias: if cfg.attention_bias {
                 Some([
                     self.getf(&format!("{ap}q_proj.bias"), &[nh * hd])?,
@@ -568,6 +599,7 @@ impl<'a> Loader<'a, '_> {
             } else {
                 None
             },
+            indexer: crate::minimax::Indexer::load(self, ap)?,
         })
     }
 
@@ -590,13 +622,41 @@ impl<'a> Loader<'a, '_> {
             mi,
             h,
             quant,
-            Act::Silu,
+            cfg.mlp_act(),
         )?;
+        let si = cfg.shared_expert_intermediate_size;
+        let route_bias = if cfg.router_sigmoid() {
+            let scale = cfg.routed_scaling_factor.unwrap_or(1.0) as f32;
+            // The release keeps it beside the router, transformers inside it.
+            let name = format!("{mp}e_score_correction_bias");
+            let name = if self.files.has(&name) {
+                name
+            } else {
+                format!("{mp}gate.e_score_correction_bias")
+            };
+            Some((self.getf(&name, &[n_exp])?, scale))
+        } else {
+            None
+        };
+        // MiniMax names its shared expert `shared_experts` and does not gate it.
+        let shared = if si == 0 {
+            None
+        } else if self.has(&format!("{mp}shared_experts.gate_proj.weight")) {
+            Some(self.mlp(&format!("{mp}shared_experts."), si)?)
+        } else {
+            Some(self.mlp(&format!("{mp}shared_expert."), si)?)
+        };
+        let gate_name = format!("{mp}shared_expert_gate.weight");
         Ok(Ffn::Moe(Moe {
             router: self.getf(&format!("{mp}gate.weight"), &[n_exp, h])?,
             experts,
-            shared: self.mlp(&format!("{mp}shared_expert."), cfg.shared_expert_intermediate_size)?,
-            shared_gate: self.getf(&format!("{mp}shared_expert_gate.weight"), &[1, h])?,
+            shared,
+            shared_gate: if self.files.has(&gate_name) {
+                Some(self.getf(&gate_name, &[1, h])?)
+            } else {
+                None
+            },
+            route_bias,
             router_mm: cfg.is_exp().then(std::sync::OnceLock::new),
         }))
     }
@@ -608,6 +668,9 @@ impl<'a> QwenModel<'a> {
         let ld = Loader { files, cfg: &cfg, quant };
         let prefix = if ld.has("model.language_model.embed_tokens.weight") {
             "model.language_model."
+        } else if ld.has("language_model.model.embed_tokens.weight") {
+            // MiniMax M3's release (a LLaVA-style layout).
+            "language_model.model."
         } else if ld.has("model.embed_tokens.weight") {
             "model."
         } else if ld.has("embed_tokens.weight") {
@@ -617,7 +680,12 @@ impl<'a> QwenModel<'a> {
         };
         let h = cfg.hidden_size;
 
-        let tied = cfg.tie_word_embeddings || !ld.has("lm_head.weight");
+        let head = if ld.has("language_model.lm_head.weight") {
+            "language_model.lm_head.weight"
+        } else {
+            "lm_head.weight"
+        };
+        let tied = cfg.tie_word_embeddings || !ld.has(head);
         // Lookups use the head's precision when tied (one copy in a pre-quantized file), else bf16.
         let embed = Table::load(
             files,
@@ -629,7 +697,7 @@ impl<'a> QwenModel<'a> {
         let lm_head = if tied {
             ld.lin(&format!("{prefix}embed_tokens.weight"), cfg.vocab_size, h)?
         } else {
-            ld.lin("lm_head.weight", cfg.vocab_size, h)?
+            ld.lin(head, cfg.vocab_size, h)?
         };
         let exp = cfg.is_exp();
         let final_norm = if exp {
@@ -684,7 +752,14 @@ impl<'a> QwenModel<'a> {
                 } else {
                     ld.norm(&format!("{lp}post_attention_layernorm.weight"), h)?
                 },
-                ffn: ld.ffn(&format!("{lp}mlp."))?,
+                // MiniMax keeps its MoE under `block_sparse_moe.`; M3's leading layers are dense.
+                ffn: if cfg.num_experts.is_some() && cfg.is_dense_mlp(l) {
+                    Ffn::Dense(ld.mlp(&format!("{lp}mlp."), cfg.dense_intermediate_size)?)
+                } else if ld.has(&format!("{lp}block_sparse_moe.gate.weight")) {
+                    ld.ffn(&format!("{lp}block_sparse_moe."))?
+                } else {
+                    ld.ffn(&format!("{lp}mlp."))?
+                },
             });
         }
         let rot = cfg.rotary_dim();
@@ -816,7 +891,10 @@ impl<'a> QwenModel<'a> {
             // stay in the adapter and `finish` reports them.
             let (m, p) = match &mut layer.ffn {
                 Ffn::Dense(m) => (m, format!("{lp}mlp.")),
-                Ffn::Moe(moe) => (&mut moe.shared, format!("{lp}mlp.shared_expert.")),
+                Ffn::Moe(moe) => match &mut moe.shared {
+                    Some(s) => (s, format!("{lp}mlp.shared_expert.")),
+                    None => continue,
+                },
             };
             let inter = m.inter;
             set(&mut m.gate, format!("{p}gate_proj"), inter, h, None, None)?;
@@ -1021,7 +1099,7 @@ impl<'a> QwenModel<'a> {
             .iter()
             .map(|l| match &l.ffn {
                 Ffn::Dense(m) => m.inter,
-                Ffn::Moe(m) => m.shared.inter,
+                Ffn::Moe(m) => m.shared.as_ref().map_or(0, |s| s.inter),
             })
             .max()
             .unwrap_or(0);
@@ -1082,6 +1160,9 @@ impl<'a> QwenModel<'a> {
         // down(silu(gate(hn)) * up(hn)) added to x: one paired matvec when gate and up share a
         // format, else two and an elementwise op.
         let mlp = |g: &mut Graph<'s>, m: &'s Mlp<'s>, down_mode: LinMode, edit: Option<GpuNeurons>| -> Option<()> {
+            if m.act != Act::Silu {
+                return None;
+            }
             let (gw, uw) = (m.gate.as_ref(), m.up.as_ref());
             if crate::gpu::decode::pairable(&gw, &uw) {
                 g.ops.push(Op::Linear {
@@ -1130,11 +1211,15 @@ impl<'a> QwenModel<'a> {
             if m.experts.act != crate::moe::Act::Silu || m.experts.down.iter().any(off) {
                 return None;
             }
+            // The plan routes by softmax and adds a gated shared expert (MiniMax: CPU for now).
+            let (Some(shared), Some(shared_gate), None) = (&m.shared, &m.shared_gate, &m.route_bias) else {
+                return None;
+            };
             let ne = m.experts.down.len();
             g.ops.push(Op::Route {
                 x: hn,
                 router: &m.router,
-                gate: Some(&m.shared_gate),
+                gate: Some(shared_gate),
                 n_exp: ne,
                 h,
                 k: m.experts.top_k,
@@ -1142,7 +1227,7 @@ impl<'a> QwenModel<'a> {
                 sel,
                 expert_scale: None,
             });
-            mlp(g, &m.shared, LinMode::AddGated(rlogits.at(ne)), de)?;
+            mlp(g, shared, LinMode::AddGated(rlogits.at(ne)), de)?;
             let mut gate = Vec::with_capacity(ne);
             let mut up = Vec::with_capacity(ne);
             for gu in &m.experts.gate_up {
@@ -1213,6 +1298,8 @@ impl<'a> QwenModel<'a> {
             };
             g.ops.push(Op::norm(x, hn, &layer.ln_in, h, eps));
             let at = match &layer.mixer {
+                // MiniMax: norms over all heads, block-sparse attention (CPU for now).
+                Mixer::Attn(at) if at.indexer.is_some() || cfg.qk_norm_full() => return None,
                 Mixer::Attn(at) => at,
                 Mixer::Gdn(gd) => {
                     let st = g.states.len();
@@ -1914,6 +2001,18 @@ impl<'a> QwenModel<'a> {
         let mut q = vec![0f32; t * nh * hd];
         let mut gate = vec![0f32; t * nh * hd];
         let par = t > 1;
+        // MiniMax M2: one norm over all heads (ungated queries), here; none per head below.
+        let (q_norm, k_norm) = if cfg.qk_norm_full() {
+            if let Some(w) = &at.q_norm {
+                for_chunks(&mut qg, nh * hd, par, |_, r| rmsnorm_f32w_inplace(r, w, eps));
+            }
+            if let Some(w) = &at.k_norm {
+                for_chunks(&mut k, nkv * hd, par, |_, r| rmsnorm_f32w_inplace(r, w, eps));
+            }
+            (None, None)
+        } else {
+            (at.q_norm.as_deref(), at.k_norm.as_deref())
+        };
         {
             let qp = SendPtrF(q.as_mut_ptr());
             let gp = SendPtrF(gate.as_mut_ptr());
@@ -1926,7 +2025,7 @@ impl<'a> QwenModel<'a> {
                 } else {
                     &qg[ti * qw + hh * hd..ti * qw + (hh + 1) * hd]
                 };
-                match &at.q_norm {
+                match q_norm {
                     Some(w) => rmsnorm_f32w(src, w, eps, qo),
                     None => qo.copy_from_slice(src),
                 }
@@ -1954,7 +2053,7 @@ impl<'a> QwenModel<'a> {
         let mut kn = vec![0f32; t * nkv * hd];
         for_chunks(&mut kn, hd, par, |i, ko| {
             let ti = i / nkv;
-            match &at.k_norm {
+            match k_norm {
                 Some(w) => rmsnorm_f32w(&k[i * hd..(i + 1) * hd], w, eps, ko),
                 None => ko.copy_from_slice(&k[i * hd..(i + 1) * hd]),
             }
@@ -1965,6 +2064,11 @@ impl<'a> QwenModel<'a> {
             );
         });
         cache.push(&kn, &v, t);
+        // MiniMax M3: the keys each (token, KV head) attends, past the dense range.
+        let ix_sel = at
+            .indexer
+            .as_ref()
+            .and_then(|ix| ix.select(cache, hn, t, h, start, cos, sin, half, eps));
         let mut att = vec![0f32; t * nh * hd];
         // Qwen4-Exp prefill: on the GPU (dense, or over each token's QSA selection).
         let on_gpu = prefill_gpu_exp(cfg, t, "attn")
@@ -1985,6 +2089,10 @@ impl<'a> QwenModel<'a> {
             });
         match sel {
             _ if on_gpu => {}
+            _ if let Some(lists) = &ix_sel => {
+                let lists: Vec<&[u32]> = lists.iter().map(|l| &l[..]).collect();
+                crate::qwen4exp::attention_lists(&q, cache, nh, t, &lists, &mut att)
+            }
             Some(sel) if sel.iter().any(|s| s.is_some()) => crate::qwen4exp::attention_sel(&q, cache, nh, t, start, sel, &mut att),
             _ => attention(&q, cache, nh, t, start, None, &mut att),
         }
@@ -2311,29 +2419,36 @@ impl Moe<'_> {
                 *v = dot(w, &xn);
             }
         });
-        let k = self.experts.top_k;
-        let mut used: Vec<usize> = logits.chunks(ne).flat_map(|l| route_top_k(l, k).into_iter().map(|r| r.0)).collect();
+        let mut used: Vec<usize> = logits.chunks(ne).flat_map(|l| self.route(l).into_iter().map(|r| r.0)).collect();
         used.sort_unstable();
         used.dedup();
         used
     }
 
+    /// The chosen experts and their weights for one token's router logits.
+    pub(crate) fn route(&self, logits: &[f32]) -> Vec<(usize, f32)> {
+        let k = self.experts.top_k;
+        match &self.route_bias {
+            Some((bias, scale)) => crate::moe::route_sigmoid(logits, bias, k, *scale),
+            None => route_top_k(logits, k),
+        }
+    }
+
     fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32], need: NeedExperts, hook: Option<&NeuronHook>) {
-        // The shared expert, scaled by its sigmoid gate, runs with the routed experts (one batch
-        // per stage on the CPU decode path).
-        let shared = crate::moe::Shared {
-            gate: &self.shared.gate,
-            up: &self.shared.up,
-            down: &self.shared.down,
-            inter: self.shared.inter,
-            act: Act::Silu,
+        // The shared expert, scaled by its sigmoid gate (if it has one), runs with the routed
+        // experts (one batch per stage on the CPU decode path).
+        let shared = self.shared.as_ref().map(|s| crate::moe::Shared {
+            gate: &s.gate,
+            up: &s.up,
+            down: &s.down,
+            inter: s.inter,
+            act: s.act,
             hook,
-            scale: Some(
-                (0..t)
-                    .map(|ti| 1.0 / (1.0 + (-dot(&self.shared_gate, &x[ti * h..(ti + 1) * h])).exp()))
-                    .collect(),
-            ),
-        };
+            scale: self
+                .shared_gate
+                .as_ref()
+                .map(|g| (0..t).map(|ti| 1.0 / (1.0 + (-dot(g, &x[ti * h..(ti + 1) * h])).exp())).collect()),
+        });
         let ne = self.experts.n_experts();
         let mut logits = vec![0f32; t * ne];
         match &self.router_mm {
@@ -2365,8 +2480,12 @@ impl Moe<'_> {
                 });
             }
         }
-        let routes: Vec<_> = logits.chunks(ne).map(|l| route_top_k(l, self.experts.top_k)).collect();
-        self.experts.forward(x, t, h, &routes, y, need, hook, Some(&shared));
+        let routes: Vec<_> = logits.chunks(ne).map(|l| self.route(l)).collect();
+        // The routed experts add to `y`, which a shared expert would have written first.
+        if shared.is_none() {
+            y[..t * h].fill(0.0);
+        }
+        self.experts.forward(x, t, h, &routes, y, need, hook, shared.as_ref());
     }
 }
 

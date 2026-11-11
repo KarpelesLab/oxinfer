@@ -1365,6 +1365,8 @@ fn run(mut args: Args) -> Result<()> {
         | "qwen4_exp_text" => run_qwen(args),
         // Llama 3 runs on the Qwen3 code path.
         "llama" => run_qwen(args),
+        // MiniMax M2 / M2.1 / M2.5 / M2.7: the Qwen code path with MiniMax's attention norms and router.
+        "minimax_m2" => run_qwen(args),
         "mistral_large4" | "mistral_large4_text" => run_mistral4(args),
         "deepseek_v4" => run_deepseek4(args),
         other => bail!("unsupported model_type {other}"),
@@ -1852,7 +1854,9 @@ fn run_qwen(mut args: Args) -> Result<()> {
     let mut model = qwen::QwenModel::load(cfg, &files, args.quant)?;
     let tok = load_tokenizer(&args.model)?;
     let qwen2_fmt;
-    let fmt: &dyn ChatFormat = if model.cfg.qk_norm {
+    let fmt: &dyn ChatFormat = if config::model_type(&args.model)?.starts_with("minimax") {
+        chat::MiniMaxChat::for_model(&args.model)
+    } else if model.cfg.qk_norm {
         chat::QwenChat::for_model(&args.model)
     } else if model.cfg.attention_bias {
         qwen2_fmt = chat::Qwen2Chat::for_model(&args.model);

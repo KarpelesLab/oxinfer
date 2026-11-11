@@ -548,7 +548,7 @@ pub struct QwenConfig {
     #[serde(default = "d_true")]
     pub attn_output_gate: bool,
     /// Sparse MoE MLPs (Qwen3.5 MoE: routed experts plus a gated shared expert) when set.
-    #[serde(default)]
+    #[serde(default, alias = "num_local_experts")]
     pub num_experts: Option<usize>,
     #[serde(default)]
     pub num_experts_per_tok: usize,
@@ -632,6 +632,82 @@ pub struct QwenConfig {
     /// The image placeholder token (hashed for image positions by the n-gram embedding).
     #[serde(default)]
     pub image_token_id: Option<u32>,
+    /// MiniMax M2 (`model_type` "minimax_m2") runs on the same code: full attention whose query
+    /// and key norms span all heads (`qk_norm_type` "per_layer"), partial RoPE given as
+    /// `rotary_dim`, sigmoid-scored routing (see [`Self::router_sigmoid`]) without a shared expert.
+    #[serde(default, rename = "rotary_dim")]
+    pub rotary_dims: Option<usize>,
+    /// MoE router scoring: "softmax" (Qwen) or "sigmoid" (MiniMax).
+    #[serde(default)]
+    pub scoring_func: Option<String>,
+    /// Factor on the renormalized routing weights of sigmoid routers (1 when absent).
+    #[serde(default)]
+    pub routed_scaling_factor: Option<f64>,
+    /// "per_layer": one RMSNorm over all heads' queries (keys); "per_head" (or absent): per head.
+    #[serde(default)]
+    pub qk_norm_type: Option<String>,
+    /// MiniMax's shared expert width (0: none).
+    #[serde(default)]
+    pub shared_intermediate_size: usize,
+    /// MiniMax M3 (`minimax_m3_vl`): the width of the leading dense layers' MLPs.
+    #[serde(default)]
+    pub dense_intermediate_size: usize,
+    /// MiniMax M3: per-layer MLP kind, "dense" or "sparse" (MoE); from `moe_layer_freq` (0 / 1).
+    #[serde(default)]
+    pub mlp_layer_types: Option<Vec<String>>,
+    #[serde(default)]
+    pub moe_layer_freq: Option<Vec<u8>>,
+    /// "swigluoai" (MiniMax M3: see [`crate::moe::Act::SwigluOai`]); SiLU otherwise.
+    #[serde(default)]
+    pub hidden_act: Option<String>,
+    #[serde(default)]
+    pub swiglu_alpha: Option<f64>,
+    #[serde(default)]
+    pub swiglu_limit: Option<f64>,
+    /// MiniMax M3's lightning indexer (block-sparse attention, see `crate::minimax`): as the
+    /// release spells it (`sparse_attention_config`) or as transformers saves it (`index_*`).
+    #[serde(default)]
+    pub sparse_attention_config: Option<MiniMaxSparse>,
+    #[serde(default)]
+    pub index_n_heads: Option<usize>,
+    #[serde(default)]
+    pub index_head_dim: Option<usize>,
+    #[serde(default)]
+    pub index_block_size: Option<usize>,
+    #[serde(default)]
+    pub index_topk_blocks: Option<usize>,
+    #[serde(default)]
+    pub index_local_blocks: Option<usize>,
+    /// MiniMax M3's RMSNorm scales by `1 + weight` (Gemma style).
+    #[serde(default)]
+    pub use_gemma_norm: bool,
+}
+
+/// `sparse_attention_config` of MiniMax M3's release.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MiniMaxSparse {
+    #[serde(default)]
+    pub sparse_num_index_heads: Option<usize>,
+    #[serde(default)]
+    pub sparse_index_dim: Option<usize>,
+    #[serde(default)]
+    pub sparse_block_size: Option<usize>,
+    #[serde(default)]
+    pub sparse_topk_blocks: Option<usize>,
+    #[serde(default)]
+    pub sparse_local_block: Option<usize>,
+}
+
+/// MiniMax M3's lightning indexer: `heads` index heads (one per KV head) of `dim`, keys pooled
+/// into blocks of `block` positions by their maximum score, the `topk` best blocks plus the `local`
+/// ones ending at the query attended.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IndexerConfig {
+    pub heads: usize,
+    pub dim: usize,
+    pub block: usize,
+    pub topk: usize,
+    pub local: usize,
 }
 
 impl QwenConfig {
@@ -647,7 +723,9 @@ impl QwenConfig {
         // Qwen2 / Qwen2.5 and their vision-language models: no query / key norms, biased q / k / v
         // projections, contiguous M-RoPE sections.
         let qwen2 = matches!(mt, Some("qwen2" | "qwen2_vl" | "qwen2_5_vl"));
-        let dense = mt == Some("qwen3") || llama || qwen2;
+        let minimax_m3 = matches!(mt, Some("minimax_m3_vl" | "minimax_m3_vl_text"));
+        let minimax_m2 = mt == Some("minimax_m2") || minimax_m3;
+        let dense = mt == Some("qwen3") || llama || qwen2 || minimax_m2;
         let image_token = raw.get("image_token_id").and_then(|v| v.as_u64());
         let text = raw.get("text_config").cloned().unwrap_or(raw);
         let has_head_dim = text.get("head_dim").is_some_and(|v| v.is_u64());
@@ -675,10 +753,43 @@ impl QwenConfig {
                 cfg.rope_theta = Some(10_000.0);
             }
         }
+        if minimax_m2 {
+            // `intermediate_size` is the experts' width; every layer is a MoE.
+            if cfg.moe_intermediate_size == 0 {
+                cfg.moe_intermediate_size = cfg.intermediate_size;
+            }
+            cfg.shared_expert_intermediate_size = cfg.shared_intermediate_size;
+            if cfg.scoring_func.is_none() {
+                cfg.scoring_func = Some("sigmoid".to_string());
+            }
+            // transformers' MiniMaxM2Attention norms all heads together whatever the key says;
+            // M3 norms each head.
+            cfg.qk_norm_type = Some(if minimax_m3 { "per_head" } else { "per_layer" }.to_string());
+            if cfg.num_experts.is_none() {
+                bail!("MiniMax config has no num_local_experts");
+            }
+        }
+        if minimax_m3 {
+            if cfg.mlp_layer_types.is_none() {
+                cfg.mlp_layer_types = cfg
+                    .moe_layer_freq
+                    .as_ref()
+                    .map(|f| f.iter().map(|&v| if v != 0 { "sparse" } else { "dense" }.to_string()).collect());
+            }
+            if cfg.mlp_layer_types.as_ref().is_some_and(|m| m.len() != cfg.num_hidden_layers) {
+                bail!("mlp_layer_types length mismatch");
+            }
+            if cfg.hidden_act.is_none() || cfg.swiglu_alpha.is_some() {
+                // transformers rewrites "swigluoai" to "silu" on save, keeping alpha / limit.
+                cfg.hidden_act = Some("swigluoai".to_string());
+            }
+        }
         if dense {
+            // MiniMax M3: the sparse layers are full attention whose indexer (present in the
+            // checkpoint for those layers only) picks the key blocks.
             cfg.layer_types = Some(vec!["full_attention".to_string(); cfg.num_hidden_layers]);
             cfg.attn_output_gate = false;
-            cfg.zero_centered_norm = false;
+            cfg.zero_centered_norm = minimax_m3;
         }
         if cfg.layer_types.is_none() {
             let k = cfg.full_attention_interval.max(1);
@@ -750,9 +861,47 @@ impl QwenConfig {
             .rope_parameters
             .as_ref()
             .and_then(|r| r.partial_rotary_factor)
-            .or(self.partial_rotary_factor)
-            .unwrap_or(1.0);
-        (self.head_dim as f64 * f) as usize
+            .or(self.partial_rotary_factor);
+        match (f, self.rotary_dims) {
+            (Some(f), _) => (self.head_dim as f64 * f) as usize,
+            (None, Some(d)) => d,
+            (None, None) => self.head_dim,
+        }
+    }
+    /// Query / key norms over all heads at once (MiniMax M2's `qk_norm_type` "per_layer").
+    pub fn qk_norm_full(&self) -> bool {
+        self.qk_norm_type.as_deref() == Some("per_layer")
+    }
+    /// Layer `l` has a dense MLP rather than a MoE (MiniMax M3's leading layers).
+    pub fn is_dense_mlp(&self, l: usize) -> bool {
+        self.num_experts.is_none() || self.mlp_layer_types.as_ref().is_some_and(|m| m[l] == "dense")
+    }
+    /// The MLP activation: SiLU, or MiniMax M3's clamped "swigluoai".
+    pub fn mlp_act(&self) -> crate::moe::Act {
+        match self.hidden_act.as_deref() {
+            Some("swigluoai") => crate::moe::Act::SwigluOai {
+                alpha: self.swiglu_alpha.unwrap_or(1.702) as f32,
+                limit: self.swiglu_limit.unwrap_or(7.0) as f32,
+            },
+            _ => crate::moe::Act::Silu,
+        }
+    }
+    /// MiniMax M3's lightning indexer settings (layers with indexer weights use them).
+    pub fn indexer(&self) -> Option<IndexerConfig> {
+        let s = self.sparse_attention_config.as_ref();
+        let pick = |flat: Option<usize>, nested: Option<usize>| flat.or(nested);
+        Some(IndexerConfig {
+            heads: pick(self.index_n_heads, s.and_then(|s| s.sparse_num_index_heads))?,
+            dim: pick(self.index_head_dim, s.and_then(|s| s.sparse_index_dim))?,
+            block: pick(self.index_block_size, s.and_then(|s| s.sparse_block_size))?,
+            topk: pick(self.index_topk_blocks, s.and_then(|s| s.sparse_topk_blocks))?,
+            local: pick(self.index_local_blocks, s.and_then(|s| s.sparse_local_block)).unwrap_or(1),
+        })
+    }
+    /// Sigmoid-scored MoE routing (MiniMax): experts chosen by `sigmoid(logit) + bias`, weighted
+    /// by their sigmoid scores renormalized over the chosen ones (times `routed_scaling_factor`).
+    pub fn router_sigmoid(&self) -> bool {
+        self.scoring_func.as_deref() == Some("sigmoid")
     }
 }
 

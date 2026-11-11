@@ -1325,6 +1325,7 @@ impl Engine {
             "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" | "qwen2_5_vl"
             | "qwen4_exp" | "qwen4_exp_text" => Family::Qwen,
             "llama" => Family::Llama,
+            "minimax_m2" => Family::Qwen,
             "mistral_large4" | "mistral_large4_text" => Family::Mistral4,
             "deepseek_v4" => Family::DeepSeek4,
             other => bail!("unsupported model_type {other}"),
@@ -1474,6 +1475,8 @@ impl Engine {
                 decision = load_decision(decision_dir.as_deref(), &tok, &base, false, |ad| model.attach_lora(ad))?;
                 let fmt: &'static (dyn ChatFormat + Sync) = if family == Family::Llama {
                     &chat::Llama3Chat
+                } else if model_type.starts_with("minimax") {
+                    chat::MiniMaxChat::for_model(&dir)
                 } else if model_type == "qwen2_5_vl" {
                     Box::leak(Box::new(chat::Qwen2Chat::for_model(&dir)))
                 } else {

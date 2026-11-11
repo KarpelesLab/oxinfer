@@ -38,6 +38,13 @@ pub enum MoeAct {
     GeluTanh,
     /// SiLU with DeepSeek V4's clamp: `silu(min(gate, l)) * clamp(up, -l, l)`.
     SiluClamp(f32),
+    /// MiniMax M3's "swigluoai" (GPT-OSS's, gate and up not interleaved): with
+    /// `g = min(gate, limit)`, `(clamp(up, -limit, limit) + 1) * g * sigmoid(alpha * g)`.
+    /// CPU only for now: the accelerator paths decline it.
+    SwigluOai {
+        alpha: f32,
+        limit: f32,
+    },
 }
 
 /// Device-side state for one weight matrix (buffers / handles), owned by the layer.

@@ -296,8 +296,9 @@ impl Header {
             "gemma4" => "gemma4_text",
             "mistral-large4" => "mistral_large4_text",
             "deepseek4" => "deepseek_v4",
+            "minimax-m2" => "minimax_m2",
             a => bail!(
-                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, llama, gemma4, mistral-large4 and deepseek4 are)"
+                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, llama, gemma4, mistral-large4, deepseek4 and minimax-m2 are)"
             ),
         })
     }
@@ -320,6 +321,7 @@ impl Header {
             return self.deepseek4_config();
         }
         let llama = mt == "llama";
+        let minimax = mt == "minimax_m2";
         if let Some(t) = self.get(&format!("{}.rope.scaling.type", self.arch())).and_then(Value::as_str)
             && !matches!(t, "none" | "llama3")
         {
@@ -357,6 +359,20 @@ impl Header {
             let rot = self.arch_u64("rope.dimension_count").unwrap_or(head_dim);
             if rot != head_dim {
                 bail!("GGUF Llama with partial RoPE ({rot} of {head_dim} dimensions) is not supported");
+            }
+        } else if minimax {
+            // MiniMax M2: every layer a sigmoid-routed MoE without a shared expert, partial RoPE.
+            let o = c.as_object_mut().unwrap();
+            o.insert("num_local_experts".into(), json!(need("expert_count")?));
+            o.insert("num_experts_per_tok".into(), json!(need("expert_used_count")?));
+            o.insert("intermediate_size".into(), json!(need("expert_feed_forward_length")?));
+            o.insert(
+                "rotary_dim".into(),
+                json!(self.arch_u64("rope.dimension_count").unwrap_or(head_dim)),
+            );
+            o.insert("scoring_func".into(), json!("sigmoid"));
+            if let Some(s) = self.arch_f64("expert_weights_scale").filter(|&s| s > 0.0) {
+                o.insert("routed_scaling_factor".into(), json!(s));
             }
         } else if mt != "qwen3" {
             let (nk, nv) = (need("ssm.group_count")?, need("ssm.time_step_rank")?);
@@ -745,12 +761,16 @@ impl Header {
             "qwen35" => {
                 r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
             }
+            // MiniMax M2 / M3 (as its tokenizer.json): the GPT-4o split with digits in threes.
+            "minimax-m2" => {
+                r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+            }
             "qwen2" => r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
             "llama-bpe" => {
                 r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
             }
             p => bail!(
-                "GGUF pre-tokenizer {p:?} is not supported (qwen35, qwen2, llama-bpe, tekken, tekken-num3, deepseek-v3 and joyai-llm are)"
+                "GGUF pre-tokenizer {p:?} is not supported (qwen35, qwen2, llama-bpe, tekken, tekken-num3, deepseek-v3, joyai-llm and minimax-m2 are)"
             ),
         };
         let tokens = self
@@ -1011,7 +1031,9 @@ pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec
                     return Some((format!("model.layers.{l}.{n}"), shape));
                 }
                 (_, "attn_norm") => "input_layernorm.weight",
-                ("qwen3" | "llama", "ffn_norm") => "post_attention_layernorm.weight",
+                ("qwen3" | "llama" | "minimax-m2", "ffn_norm") => "post_attention_layernorm.weight",
+                // MiniMax: the router's selection bias.
+                (_, "exp_probs_b") => "mlp.e_score_correction_bias",
                 (_, "post_attention_norm") => "post_attention_layernorm.weight",
                 (_, "attn_q") => "self_attn.q_proj.weight",
                 (_, "attn_k") => "self_attn.k_proj.weight",

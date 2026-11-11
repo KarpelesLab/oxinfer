@@ -894,6 +894,7 @@ impl CudaBackend {
             crate::gpu::MoeAct::Silu => (0u32, 0f32),
             crate::gpu::MoeAct::GeluTanh => (1, 0.0),
             crate::gpu::MoeAct::SiluClamp(l) => (2, l),
+            crate::gpu::MoeAct::SwigluOai { .. } => return false,
         };
         let (mut p_gu, mut p_a, mut rows_u, mut mi_u, mut split_u, mut kind_u, mut limit_f) =
             (st.mgu.0, st.ma.0, rows as u32, mi as u32, split as u32, kind, limit);
@@ -2162,6 +2163,7 @@ mod tests {
                                     let (g, l) = (g.min(l as f64), l as f64);
                                     g / (1.0 + (-g).exp()) * u.clamp(-l, l)
                                 }
+                                MoeAct::SwigluOai { .. } => unreachable!("not a device activation"),
                             }
                         })
                         .collect();

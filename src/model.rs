@@ -401,7 +401,9 @@ pub fn load_lin_experts<'a>(files: &'a ModelFiles, full: &str, n_exp: usize, n_o
         return Ok(v.into_iter().map(Lin::q4).collect());
     }
     let info = files.info(full).with_context(|| format!("missing tensor {full}"))?;
-    if info.shape != [n_exp, n_out, n_in] {
+    // `[n_exp * n_out, n_in]` is the same memory: a fused projection (gate rows, then up rows)
+    // taken as its `n_exp` parts.
+    if info.shape != [n_exp, n_out, n_in] && info.shape != [n_exp * n_out, n_in] {
         bail!("tensor {full} has shape {:?}, expected [{n_exp}, {n_out}, {n_in}]", info.shape);
     }
     let w = files.bf16(full)?;
@@ -927,6 +929,10 @@ pub struct LayerCache {
     pub n_kv: usize,
     pub hd: usize,
     pub len: usize,
+    /// An extra row of `aux_dim` per cached position (MiniMax M3's indexer keys), dropped with
+    /// the positions; empty for other models.
+    aux: Vec<f32>,
+    pub aux_dim: usize,
     /// Positions unchanged since a device copy of the cache last synced (truncations lower it;
     /// see `crate::gpu::decode`).
     pub(crate) kept: usize,
@@ -940,8 +946,20 @@ impl LayerCache {
             n_kv,
             hd,
             len: 0,
+            aux: Vec::new(),
+            aux_dim: 0,
             kept: 0,
         }
+    }
+    /// Appends rows of `aux_dim` (fixing it on first use).
+    pub(crate) fn aux_push(&mut self, rows: &[f32], dim: usize) {
+        debug_assert!(self.aux_dim == 0 || self.aux_dim == dim);
+        self.aux_dim = dim;
+        self.aux.extend_from_slice(rows);
+    }
+    /// The auxiliary rows of every cached position (`[len, aux_dim]`).
+    pub(crate) fn aux(&self) -> &[f32] {
+        &self.aux
     }
     pub(crate) fn push(&mut self, k: &[f32], v: &[f32], t: usize) {
         debug_assert_eq!(k.len(), t * self.n_kv * self.hd);
@@ -977,6 +995,7 @@ impl LayerCache {
             self.v.truncate(len * self.n_kv * self.hd);
             self.len = len;
         }
+        self.aux.truncate(len * self.aux_dim);
     }
 }
 

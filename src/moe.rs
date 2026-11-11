@@ -14,7 +14,8 @@ use anyhow::Result;
 pub(crate) use crate::gpu::MoeAct as Act;
 
 impl Act {
-    fn apply(self, g: &mut [f32], u: &mut [f32]) {
+    /// `g = act(g) * u` over a row (or rows) of gate and up activations.
+    pub(crate) fn apply(self, g: &mut [f32], u: &mut [f32]) {
         match self {
             Act::Silu => silu_mul(g, u),
             Act::GeluTanh => gelu_mul(g, u),
@@ -27,6 +28,11 @@ impl Act {
                 }
                 silu_mul(g, u)
             }
+            Act::SwigluOai { .. } => {
+                for (g, &u) in g.iter_mut().zip(u.iter()) {
+                    *g = self.scalar(*g, u);
+                }
+            }
         }
     }
     #[inline]
@@ -38,7 +44,15 @@ impl Act {
                 let g = g.min(l);
                 g / (1.0 + (-g).exp()) * u.clamp(-l, l)
             }
+            Act::SwigluOai { alpha, limit } => {
+                let g = g.min(limit);
+                (u.clamp(-limit, limit) + 1.0) * g / (1.0 + (-alpha * g).exp())
+            }
         }
+    }
+    /// Whether the accelerator expert kernels implement this activation.
+    pub(crate) fn on_device(self) -> bool {
+        !matches!(self, Act::SwigluOai { .. })
     }
 }
 
@@ -132,6 +146,23 @@ pub(crate) fn route_top_k(logits: &[f32], k: usize) -> Vec<(usize, f32)> {
     idx.into_iter().zip(e).map(|(i, v)| (i, v / s)).collect()
 }
 
+/// Sigmoid-scored routing (MiniMax, DeepSeek V3 without expert groups): the k experts with the
+/// largest `sigmoid(logit) + bias` (ties to the lower index), weighted by their sigmoid scores
+/// renormalized over the k, times `scale`. Sorted by selection score.
+pub(crate) fn route_sigmoid(logits: &[f32], bias: &[f32], k: usize, scale: f32) -> Vec<(usize, f32)> {
+    let s: Vec<f32> = logits.iter().map(|&l| 1.0 / (1.0 + (-l).exp())).collect();
+    let choice: Vec<f32> = s.iter().zip(bias).map(|(s, b)| s + b).collect();
+    let mut idx: Vec<usize> = (0..logits.len()).collect();
+    let ord = |a: &usize, b: &usize| choice[*b].total_cmp(&choice[*a]).then(a.cmp(b));
+    if k < idx.len() {
+        idx.select_nth_unstable_by(k, ord);
+        idx.truncate(k);
+    }
+    idx.sort_by(ord);
+    let sum: f32 = idx.iter().map(|&i| s[i]).sum();
+    idx.into_iter().map(|i| (i, s[i] / sum * scale)).collect()
+}
+
 /// `y += a * x`.
 fn axpy(y: &mut [f32], a: f32, x: &[f32]) {
     for (y, x) in y.iter_mut().zip(x) {
@@ -171,14 +202,21 @@ impl<'a> Experts<'a> {
                 (g.into_iter().zip(u).map(|(g, u)| GateUp::Split(g, u)).collect(), d)
             }
         } else {
+            // Per-expert modules: `gate_proj` / `up_proj` / `down_proj`, or (MiniMax, Mixtral)
+            // `w1` / `w3` / `w2`.
+            let names = if has(&format!("{ep}0.w1.weight")) {
+                ["w1", "w3", "w2"]
+            } else {
+                ["gate_proj", "up_proj", "down_proj"]
+            };
             let (mut gu, mut d) = (Vec::with_capacity(n_exp), Vec::with_capacity(n_exp));
             for e in 0..n_exp {
                 let p = format!("{ep}{e}.");
                 gu.push(GateUp::Split(
-                    load_lin(files, &format!("{p}gate_proj.weight"), mi, h, quant)?,
-                    load_lin(files, &format!("{p}up_proj.weight"), mi, h, quant)?,
+                    load_lin(files, &format!("{p}{}.weight", names[0]), mi, h, quant)?,
+                    load_lin(files, &format!("{p}{}.weight", names[1]), mi, h, quant)?,
                 ));
-                d.push(load_lin(files, &format!("{p}down_proj.weight"), h, mi, quant)?);
+                d.push(load_lin(files, &format!("{p}{}.weight", names[2]), h, mi, quant)?);
             }
             (gu, d)
         };
@@ -229,7 +267,7 @@ impl<'a> Experts<'a> {
         let Some(be) = crate::gpu::active() else {
             return false;
         };
-        if !be.wants(2 * mi, h, t * self.top_k) {
+        if !be.wants(2 * mi, h, t * self.top_k) || !self.act.on_device() {
             return false;
         }
         let act = self.act;

@@ -3633,6 +3633,7 @@ mod tests {
                                 let v = g[j].min(l);
                                 v / (1.0 + (-v).exp()) * g[mi + j].clamp(-l, l)
                             }
+                            MoeAct::SwigluOai { .. } => unreachable!("not a device activation"),
                         })
                         .collect();
                     let o = matvec(&fd[e], &a);

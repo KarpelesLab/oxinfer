@@ -668,14 +668,21 @@ fn qsa_pick(r: usize, top: usize, scores: &[f32], qpos: usize) -> Option<Vec<u32
 /// Attention of the queries `q` (`[t, nh, hd]`, scaled) over the cached positions `sel[ti]` of
 /// each token (or all up to its own when None).
 pub(crate) fn attention_sel(q: &[f32], cache: &LayerCache, nh: usize, t: usize, start: usize, sel: &[Option<Vec<u32>>], out: &mut [f32]) {
+    let all: Vec<u32> = (0..(start + t) as u32).collect();
+    let lists: Vec<&[u32]> = (0..t)
+        .flat_map(|ti| std::iter::repeat_n(sel[ti].as_deref().unwrap_or(&all[..=start + ti]), cache.n_kv))
+        .collect();
+    attention_lists(q, cache, nh, t, &lists, out)
+}
+
+/// Attention of the queries `q` (`[t, nh, hd]`, scaled) where the heads of KV head `kvh` at
+/// token `ti` see the cached positions `lists[ti * n_kv + kvh]` (MiniMax M3 selects key blocks
+/// per KV head, Qwen4-Exp per token).
+pub(crate) fn attention_lists(q: &[f32], cache: &LayerCache, nh: usize, t: usize, lists: &[&[u32]], out: &mut [f32]) {
     let hd = cache.hd;
     let n_kv = cache.n_kv;
     let rep = nh / n_kv;
-    let all: Vec<u32>;
-    let lists: Vec<&[u32]> = {
-        all = (0..(start + t) as u32).collect();
-        (0..t).map(|ti| sel[ti].as_deref().unwrap_or(&all[..=start + ti])).collect()
-    };
+    debug_assert_eq!(lists.len(), t * n_kv);
     let _timer = crate::prof::start(crate::prof::Cat::Attention);
     if t * n_kv < pool::threads() {
         // Fewer (token, KV head) units than threads: the shared-row kernel (same bits, see
@@ -684,16 +691,16 @@ pub(crate) fn attention_sel(q: &[f32], cache: &LayerCache, nh: usize, t: usize, 
             t * n_kv,
             rep,
             hd,
-            &|u| lists[u / n_kv].len(),
+            &|u| lists[u].len(),
             &|u, keys, sc| {
                 let (ti, kvh) = (u / n_kv, u % n_kv);
-                let pos = lists[ti];
+                let pos = lists[u];
                 let qb = (ti * nh + kvh * rep) * hd;
                 let qs: Vec<&[f32]> = (0..rep).map(|r| &q[qb + r * hd..qb + (r + 1) * hd]).collect();
                 crate::attn::score_rows(&qs, keys, &|j| cache.k_at(pos[j] as usize, kvh), None, sc);
             },
             &|_, _, row| softmax_inplace(row),
-            &|u, j| cache.v_at(lists[u / n_kv][j] as usize, u % n_kv),
+            &|u, j| cache.v_at(lists[u][j] as usize, u % n_kv),
             &|u, r| ((u / n_kv) * nh + (u % n_kv) * rep + r) * hd,
             out,
         );
@@ -702,7 +709,7 @@ pub(crate) fn attention_sel(q: &[f32], cache: &LayerCache, nh: usize, t: usize, 
     let op = SendF(out.as_mut_ptr());
     pool::run(t * n_kv, &|task| {
         let (ti, kvh) = (task / n_kv, task % n_kv);
-        let pos = lists[ti];
+        let pos = lists[task];
         let n = pos.len();
         let mut scores = vec![0f32; n];
         for hh in 0..rep {
@@ -1089,7 +1096,7 @@ impl<'a> QwenModel<'a> {
                     n_exp = n_exp.max(m.experts.down.len());
                     top_k = top_k.max(m.experts.top_k);
                     e_inter = e_inter.max(m.experts.inter);
-                    s_inter = s_inter.max(m.shared.inter);
+                    s_inter = s_inter.max(m.shared.as_ref()?.inter);
                 }
                 Ffn::Dense(_) => return None,
             }
@@ -1341,11 +1348,14 @@ impl<'a> QwenModel<'a> {
             if m.experts.act != crate::moe::Act::Silu {
                 return None;
             }
+            let (Some(sh), Some(shared_gate)) = (&m.shared, &m.shared_gate) else {
+                return None;
+            };
             let ne = m.experts.down.len();
             g.ops.push(Op::Route {
                 x: hn,
                 router: &m.router,
-                gate: Some(&m.shared_gate),
+                gate: Some(shared_gate),
                 n_exp: ne,
                 h,
                 k: m.experts.top_k,
@@ -1384,7 +1394,6 @@ impl<'a> QwenModel<'a> {
                 edits: None,
             }));
             // The shared expert, sigmoid-gated, added to the routed experts' sum.
-            let sh = &m.shared;
             let (sg, su) = (sh.gate.as_ref(), sh.up.as_ref());
             if crate::gpu::decode::pairable(&sg, &su) {
                 g.ops.push(Op::Linear {

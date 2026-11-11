@@ -427,7 +427,12 @@ pub trait SessionState {
 pub(crate) fn write_kv<W: Write>(w: &mut SnapWriter<W>, name: &str, c: &crate::model::LayerCache) -> Result<()> {
     let (k, v) = c.data();
     w.f32s(&format!("{name}.k"), &k[..c.len * c.n_kv * c.hd])?;
-    w.f32s(&format!("{name}.v"), &v[..c.len * c.n_kv * c.hd])
+    w.f32s(&format!("{name}.v"), &v[..c.len * c.n_kv * c.hd])?;
+    if c.aux_dim > 0 {
+        w.u64s(&format!("{name}.aux_dim"), &[c.aux_dim as u64])?;
+        w.f32s(&format!("{name}.aux"), c.aux())?;
+    }
+    Ok(())
 }
 
 /// Reads a KV cache written by [`write_kv`] into the fresh cache `c`, of `len` positions.
@@ -437,6 +442,12 @@ pub(crate) fn read_kv(r: &mut SnapReader, name: &str, c: &mut crate::model::Laye
     let v = r.f32s(&format!("{name}.v"), n)?;
     c.truncate(0);
     c.push(&k, &v, len);
+    if r.next_is(&format!("{name}.aux_dim")) {
+        let d = r.u64s_exact(&format!("{name}.aux_dim"), 1)?[0] as usize;
+        let n = len.checked_mul(d).context("snapshot: aux size")?;
+        let a = r.f32s(&format!("{name}.aux"), n)?;
+        c.aux_push(&a, d);
+    }
     Ok(())
 }
 

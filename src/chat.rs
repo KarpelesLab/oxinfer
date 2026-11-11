@@ -694,6 +694,119 @@ impl ChatFormat for DeepSeekChat {
     }
 }
 
+/// MiniMax M2 / M2.1 / M2.5 / M2.7 (and M3's text turns): `]~!b[` then `]~b]ROLE\n...[e~[\n` turns;
+/// replies always open a thinking block (`<think>\n` ends the generation prompt); tool results
+/// are a `tool` turn of `<response>` blocks. Without a system prompt the template puts the
+/// model's identity there, which differs between releases (read from the model's template).
+pub struct MiniMaxChat {
+    pub identity: String,
+}
+
+impl MiniMaxChat {
+    const BOS: &'static str = "]~!b[";
+    const EOT: &'static str = "[e~[";
+
+    /// The format of the model in `dir` (its template's `model_identity`).
+    pub fn for_model(dir: &std::path::Path) -> &'static MiniMaxChat {
+        Box::leak(Box::new(Self::for_template(model_template(dir).as_deref())))
+    }
+
+    pub fn for_template(template: Option<&str>) -> MiniMaxChat {
+        let identity = template
+            .and_then(|t| t.split("set model_identity = \"").nth(1))
+            .and_then(|r| r.split_once('"'))
+            .map(|(id, _)| id.to_string())
+            .unwrap_or_else(|| "You are a helpful assistant.".to_string());
+        MiniMaxChat { identity }
+    }
+
+    fn ai(think: bool) -> &'static str {
+        // The template always opens a thinking block; without thinking it is closed empty.
+        if think {
+            "]~b]ai\n<think>\n"
+        } else {
+            "]~b]ai\n<think>\n\n</think>\n\n"
+        }
+    }
+}
+
+/// The chat template source of the model in `dir` (`chat_template.jinja`, the one in
+/// `tokenizer_config.json`, or a GGUF file's).
+pub fn model_template(dir: &std::path::Path) -> Option<String> {
+    if crate::gguf::is_gguf(dir) {
+        return crate::gguf::header(dir)
+            .ok()
+            .as_deref()
+            .and_then(|h| h.chat_template())
+            .map(str::to_string);
+    }
+    let jinja = crate::fsx::read(&dir.join("chat_template.jinja"))
+        .ok()
+        .map(|b| String::from_utf8_lossy(&b).into_owned());
+    jinja.or_else(|| {
+        let cfg: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("tokenizer_config.json")).ok()?).ok()?;
+        cfg["chat_template"].as_str().map(str::to_string)
+    })
+}
+
+impl ChatFormat for MiniMaxChat {
+    fn conversation_start(&self, system: Option<&str>, think: bool) -> String {
+        self.conversation_start_tools(system, think, &[])
+    }
+    fn user_turn(&self, content: &str, think: bool) -> String {
+        format!("]~b]user\n{content}{}\n{}", Self::EOT, Self::ai(think))
+    }
+    fn end_of_model_turn(&self) -> String {
+        format!("{}\n", Self::EOT)
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        Self::EOT
+    }
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        ("<think>", "</think>")
+    }
+    fn starts_in_thinking(&self, think: bool) -> bool {
+        think
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, _think: bool, tools: &[ToolSpec]) -> String {
+        let mut s = format!("{}]~b]system\n", Self::BOS);
+        match system.filter(|s| !s.is_empty()) {
+            Some(sys) => s.push_str(sys),
+            None => s.push_str(&self.identity),
+        }
+        if !tools.is_empty() {
+            s.push_str(&crate::tools::minimax::tools_block(tools));
+        }
+        s.push_str(Self::EOT);
+        s.push('\n');
+        s
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        crate::tools::minimax::MARKER
+    }
+    fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
+        crate::tools::minimax::parse_calls(raw)
+    }
+    fn tool_results(&self, results: &[ToolResult], think: bool) -> String {
+        // The reply ended on `[e~[` (sampled, not fed); the results are one tool turn.
+        let mut s = format!("{}\n]~b]tool", Self::EOT);
+        for r in results {
+            s.push_str(&format!("\n<response>{}</response>", r.content));
+        }
+        s.push_str(Self::EOT);
+        s.push('\n');
+        s.push_str(Self::ai(think));
+        s
+    }
+    fn assistant_text(&self, content: &str, calls: &[ToolCall]) -> String {
+        if calls.is_empty() {
+            return content.to_string();
+        }
+        // As the template: the text as is, then a newline and the calls block.
+        format!("{content}{}", crate::tools::minimax::calls(calls))
+    }
+}
+
 /// `eos` plus the chat format's end-of-turn token, looked up in the tokenizer.
 pub fn with_turn_end(fmt: &dyn ChatFormat, tok: &crate::tokenizer::Tokenizer, mut eos: Vec<u32>) -> Vec<u32> {
     if let Some(id) = tok.token_to_id(fmt.end_of_turn_token())
@@ -702,4 +815,55 @@ pub fn with_turn_end(fmt: &dyn ChatFormat, tok: &crate::tokenizer::Tokenizer, mu
         eos.push(id);
     }
     eos
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const M27: &str = "You are a helpful assistant. Your name is MiniMax-M2.7 and is built by MiniMax.";
+
+    fn m27() -> MiniMaxChat {
+        MiniMaxChat::for_template(Some(&format!("{{%- set model_identity = \"{M27}\" -%}}")))
+    }
+
+    /// The renderings of MiniMax-M2.7's own chat template (transformers' apply_chat_template).
+    #[test]
+    fn minimax_matches_template() {
+        let f = m27();
+        assert_eq!(f.identity, M27);
+        assert_eq!(
+            f.first_turn(None, true, &[], "Hi"),
+            format!("]~!b[]~b]system\n{M27}[e~[\n]~b]user\nHi[e~[\n]~b]ai\n<think>\n")
+        );
+        assert_eq!(
+            f.first_turn(Some("Be brief."), true, &[], "Hi"),
+            "]~!b[]~b]system\nBe brief.[e~[\n]~b]user\nHi[e~[\n]~b]ai\n<think>\n"
+        );
+        let tool = ToolSpec {
+            name: "get_time".into(),
+            description: "Current time".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {"tz": {"type": "string"}}, "required": ["tz"]}),
+        };
+        let start = format!(
+            "]~!b[]~b]system\n{M27}\n\n# Tools\nYou may call one or more tools to assist with the user query.\nHere are the tools available in JSONSchema format:\n\n<tools>\n<tool>{{\"name\": \"get_time\", \"description\": \"Current time\", \"parameters\": {{\"type\": \"object\", \"properties\": {{\"tz\": {{\"type\": \"string\"}}}}, \"required\": [\"tz\"]}}}}</tool>\n</tools>\n\nWhen making tool calls, use XML format to invoke tools and pass parameters:\n\n<minimax:tool_call>\n<invoke name=\"tool-name-1\">\n<parameter name=\"param-key-1\">param-value-1</parameter>\n<parameter name=\"param-key-2\">param-value-2</parameter>\n...\n</invoke>\n</minimax:tool_call>[e~[\n]~b]user\nTime?[e~[\n]~b]ai\n<think>\n"
+        );
+        assert_eq!(f.first_turn(None, true, std::slice::from_ref(&tool), "Time?"), start);
+        // A call as the template renders it, its parse, and the results turn.
+        let reply = "need tool\n</think>\n\n\n<minimax:tool_call>\n<invoke name=\"get_time\">\n<parameter name=\"tz\">UTC</parameter>\n<parameter name=\"n\">3</parameter>\n</invoke>\n</minimax:tool_call>";
+        let calls = f.parse_tool_calls(reply);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_time");
+        assert_eq!(calls[0].arguments["tz"], "UTC");
+        assert_eq!(calls[0].arguments["n"], 3);
+        let results = [ToolResult {
+            name: "get_time".into(),
+            content: "12:00".into(),
+        }];
+        assert_eq!(
+            f.tool_results(&results, true),
+            "[e~[\n]~b]tool\n<response>12:00</response>[e~[\n]~b]ai\n<think>\n"
+        );
+        assert_eq!(f.assistant_text("need tool\n</think>\n\n", &calls), &reply[..]);
+    }
 }

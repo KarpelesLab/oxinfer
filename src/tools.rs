@@ -406,6 +406,82 @@ pub mod deepseek {
     }
 }
 
+// ---- MiniMax M2 / M3 ----------------------------------------------------------------------------
+
+pub mod minimax {
+    use super::*;
+
+    /// The marker that opens the calls in a reply.
+    pub const MARKER: &str = "<minimax:tool_call>";
+    const END: &str = "</minimax:tool_call>";
+
+    /// The "# Tools" section the MiniMax template appends to the system turn: one
+    /// `<tool>{function JSON}</tool>` per tool, then the call syntax.
+    pub fn tools_block(tools: &[ToolSpec]) -> String {
+        let mut s = String::from(
+            "\n\n# Tools\nYou may call one or more tools to assist with the user query.\nHere are the tools available in JSONSchema format:\n\n<tools>\n",
+        );
+        for t in tools {
+            let f = json!({ "name": t.name, "description": t.description, "parameters": t.parameters });
+            s.push_str(&format!("<tool>{}</tool>\n", qwen::py_json(&f)));
+        }
+        s.push_str("</tools>\n\nWhen making tool calls, use XML format to invoke tools and pass parameters:\n\n");
+        s.push_str(MARKER);
+        s.push_str("\n<invoke name=\"tool-name-1\">\n<parameter name=\"param-key-1\">param-value-1</parameter>\n<parameter name=\"param-key-2\">param-value-2</parameter>\n...\n</invoke>\n");
+        s.push_str(END);
+        s
+    }
+
+    /// Every `<invoke name="..">` with its `<parameter name="..">..</parameter>` inside
+    /// `<minimax:tool_call>` blocks. Values are JSON when they parse as JSON (other than a bare
+    /// string), strings otherwise (the template writes strings as is, other values as JSON).
+    pub fn parse_calls(raw: &str) -> Vec<ToolCall> {
+        let mut calls = Vec::new();
+        for block in raw.split(MARKER).skip(1) {
+            let block = block.split(END).next().unwrap_or(block);
+            for inv in block.split("<invoke name=\"").skip(1) {
+                let Some((name, mut rest)) = inv.split_once("\">") else { continue };
+                rest = rest.split("</invoke>").next().unwrap_or(rest);
+                let mut arguments = Map::new();
+                while let Some(i) = rest.find("<parameter name=\"") {
+                    rest = &rest[i + "<parameter name=\"".len()..];
+                    let Some((key, r)) = rest.split_once("\">") else { break };
+                    let (value, r) = r.split_once("</parameter>").unwrap_or((r, ""));
+                    let v = value.trim_matches('\n');
+                    let parsed = serde_json::from_str::<Value>(v.trim()).ok().filter(|j| !j.is_string());
+                    arguments.insert(key.to_string(), parsed.unwrap_or_else(|| Value::String(v.to_string())));
+                    rest = r;
+                }
+                if !name.is_empty() {
+                    calls.push(ToolCall {
+                        name: name.to_string(),
+                        arguments,
+                    });
+                }
+            }
+        }
+        calls
+    }
+
+    /// Calls as the template renders them after a reply's text.
+    pub fn calls(calls: &[ToolCall]) -> String {
+        let mut s = format!("\n{MARKER}\n");
+        for c in calls {
+            s.push_str(&format!("<invoke name=\"{}\">\n", c.name));
+            for (k, v) in &c.arguments {
+                let text = match v {
+                    Value::String(t) => t.clone(),
+                    other => qwen::py_json(other),
+                };
+                s.push_str(&format!("<parameter name=\"{k}\">{text}</parameter>\n"));
+            }
+            s.push_str("</invoke>\n");
+        }
+        s.push_str(END);
+        s
+    }
+}
+
 // ---- Qwen 3.5 / 3.8 -----------------------------------------------------------------------------
 
 pub mod qwen {

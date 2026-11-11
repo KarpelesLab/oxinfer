@@ -367,7 +367,8 @@ mod tests {
             name: "weather".into(),
             arguments: args,
         };
-        let formats: [&dyn ChatFormat; 4] = [&chat::GemmaChat, &chat::QWEN, &chat::QWEN3, &chat::MistralChat];
+        let minimax = chat::MiniMaxChat::for_template(None);
+        let formats: [&dyn ChatFormat; 5] = [&chat::GemmaChat, &chat::QWEN, &chat::QWEN3, &chat::MistralChat, &minimax];
         for f in formats {
             let t = f.assistant_text("Let me check.", std::slice::from_ref(&call));
             assert_eq!(f.parse_tool_calls(&t), vec![call.clone()], "{t}");
