@@ -2810,6 +2810,9 @@ diffusion transformer conditioned by Qwen2.5-VL-3B. `src/omnigen2/` follows the 
 | `--quant q8\|q4` | transformer precision (the text encoder follows, at Q8 for `q4`; `--text-quant` overrides) |
 | `--text-encoder SPEC` | the Qwen2.5-VL-3B weights from another folder or repo id |
 | `--transformer FILE`, `--mmap` | the transformer from a GGUF file (calcuis/omnigen2-gguf); map the weights |
+| `--scheduler euler\|dpmsolver++` | the sampler: Euler (default) or the official DPM-Solver++ option |
+| `--teacache F`, `--taylorseer` | a step cache (off by default; both skip transformer passes and change the image): TeaCache with relative-L1 threshold `F` (the official default is 0.05), or TaylorSeer |
+| `--sample-posterior` | sample the VAE posterior of the input images instead of taking its mean (off by default) |
 
 What runs: the instruction, in the pipeline's chat template (a system turn "You are a helpful
 assistant that generates high-quality images based on user instructions." and the user turn), goes
@@ -2899,12 +2902,14 @@ let mut pipe = Pipeline::load("OmniGen2/OmniGen2", Options { quant: oxinfer::mod
 let img = oxinfer::media::Media::new().load_image("cat.png".as_ref())?;
 let (out, timings) = pipe.edit(&[img], &Params::new("add a red hat"), &mut |i, n| eprintln!("{i}/{n}"))?;
 // pipe.generate(&params, ..) for text to image; edit_pictures(&[oxideav Picture]) with `oxideav`
+// Params::new(..).with_teacache(0.05) / .with_taylorseer(); params.scheduler = Scheduler::DpmSolver;
+// params.sample_posterior = true
 ```
 
 The C API has `oxi_omnigen2_load` (`key=value` options: quant, text_quant, text_encoder, mmap,
 transformer, keep_text_encoder, device), `oxi_omnigen2_edit` (a JSON request: prompt, images,
 negative, steps, text_guidance, image_guidance, cfg_range, seed, width, height, max_pixels,
-max_side; plus RGB8 pixel images), `oxi_omnigen2_cancel` and `oxi_omnigen2_free` (see
+max_side, scheduler, teacache, taylorseer, sample_posterior; plus RGB8 pixel images), `oxi_omnigen2_cancel` and `oxi_omnigen2_free` (see
 `include/oxinfer.h`). For understanding, load `mllm/` as an engine.
 
 **Weights and license.** OmniGen2/OmniGen2: Apache 2.0, ungated; 31 GB, all float32 (15.9 GB
@@ -2913,10 +2918,87 @@ stand in for `mllm/` (`--text-encoder`). calcuis/omnigen2-gguf has GGUF transfor
 "Q4_0" file is 6 GB: the 2520-wide layers cannot be block-quantized, so most stay F16 (they load,
 on the CPU); `--quant q4` (padded blocks) is smaller and runs on the GPU.
 
-Not supported: the TeaCache / TaylorSeer step caches and the DPM-Solver scheduler option, OmniGen2
-LoRAs, sampling the VAE posterior (the mean is used), batches, `--save-quantized` for the padded
-transformer layers (quantization happens at each load, a few seconds), and the reflection / RL
-variants (OmniGen2-RL, EditScore).
+**Scheduler, step caches, posterior sampling.** All opt-in: each changes the image. Without them
+the output is bit-identical to before they existed (same PNG and final latents with one input
+image, two, and none, against a build of the previous commit, on the tiny model below).
+
+- `--scheduler dpmsolver++` is the official script's option: the repository's
+  `DPMSolverMultistepScheduler(algorithm_type="dpmsolver++", solver_type="midpoint",
+  solver_order=2, prediction_type="flow_prediction")` on the same timesteps, working on
+  `sigma = 1 - t` with the data prediction `x + sigma * v`. Its first and last steps are first
+  order (and the second in effect, its difference term being divided by an infinite log-SNR
+  ratio). `src/omnigen2/sched.rs` is checked step by step against that scheduler without a
+  model: `tools/ref_omnigen2_sched.py` prints its sigmas and the sample after each of 6 steps,
+  which the unit test holds (sigmas within 1e-7, samples within 2e-6).
+- `--teacache F` is the official transformer's `enable_teacache`: per guidance branch
+  (conditional, reference, unconditional: each its own state), the relative L1 change of the
+  first joint block's modulated input since the previous step goes through the fitted polynomial
+  (`-5.4826 x^4 + 11.4877 x^3 - 4.4741 x^2 + 2.4773 x - 0.0332`) and accumulates; while the sum
+  is under `F` the 32 joint blocks are skipped and the last computed residual (blocks' output
+  minus input) is added to the input instead. The first and last steps always run. The refiners
+  run on every step (the decision needs their output).
+- `--taylorseer` is the official pipeline's `enable_taylorseer` (order 4, interval 3, first
+  enhance 5): per branch, the blocks run on its first 5 passes and then every 3rd; the passes
+  between take the Taylor expansion of the hidden states, from finite differences between the
+  last runs. The official code keeps the features of all 32 layers over the whole sequence; a
+  skipped pass replaces every layer's output by its own prediction, so only the last layer's
+  target rows reach the output, and those are what oxinfer keeps (the same arithmetic on the
+  same values, megabytes per branch instead of gigabytes). A step whose passes are all
+  predictions skips the refiners too. With both flags TaylorSeer wins, as in the official
+  script.
+- `--sample-posterior` draws each input image's latents as `mean + std * noise` like the official
+  `latent_dist.sample()`, instead of the mean. The noise comes from oxinfer's generator
+  (xoshiro256** seeded from `--seed`, one stream per input image, apart from the initial
+  latents'), in `[c, h, w]` order: the reference's distribution, not its draw. oxinfer does not
+  reproduce torch's generator (the initial latents are compared by passing the reference's noise
+  in, and so is this), and the official pipeline draws this noise from torch's global generator
+  rather than the run's seeded one, so there is no draw to match bit for bit: the mean stays the
+  default. The posterior is narrow: for a 256x256 cat photo its standard deviations are 1.4e-4
+  of the latents (L2), and sampling moved the 30-step edit below by 66.6 dB PSNR.
+
+Checked against the official `OmniGen2Pipeline` itself (float32, CPU) on a tiny random-weight
+model (`tools/omnigen2_tiny.py`: a 4-block 96-wide transformer and a small 16-channel VAE; the
+reference's prompt embeddings, initial noise and posterior noise passed to oxinfer; 64x64 output;
+relative L2 error of the final latents, and whether every pass made the same run / skip
+decision):
+
+| options | input images | steps | passes that ran the blocks (of all) | same decisions | final latents |
+|---|---|---|---|---|---|
+| none | 1 | 12 | 36 (36) | | 9.8e-7 |
+| `--teacache 0.5` | 1 | 30 | 85 (90) | yes | 7.3e-7 |
+| `--teacache 1.0` | 1 | 30 | 73 (90) | yes | 7.0e-7 |
+| `--teacache 2.0` | 1 | 30 | 43 (90) | yes | 9.6e-7 |
+| `--teacache 1.0` | 0 (text to image) | 30 | 28 (60) | yes | 7.5e-7 |
+| `--taylorseer` | 1 | 30 | 39 (90) | yes | 9.9e-7 |
+| `--taylorseer` | 2 | 30 | 39 (90) | yes | 9.3e-7 |
+| `--taylorseer` | 0 (text to image) | 30 | 26 (60) | yes | 9.4e-7 |
+| `--scheduler dpmsolver++` | 1 | 20 | 60 (60) | | 9.4e-7 |
+| `--taylorseer --scheduler dpmsolver++` | 1 | 50 | 60 (150) | yes | 9.5e-7 |
+| `--sample-posterior` | 1 | 12 | 36 (36) | | 9.6e-7 (sampled reference latents: 7.8e-7) |
+| `--teacache 2.0 --scheduler dpmsolver++ --sample-posterior` | 2 | 30 | 39 (90) | yes | 8.3e-7 |
+
+The tiny model needs thresholds far above 0.05 to skip anything (its random blocks move the
+modulated input a lot between steps). On the real model (`--quant q4`, CUDA, a 256x256 cat photo,
+"Make the cat wear a small red wizard hat.", seed 3; PSNR of the output against the same run
+without the option, which is the size of the change the option makes, not an error):
+
+| run | steps | passes that ran the blocks (of all) | image against the plain run |
+|---|---|---|---|
+| `--teacache 0.05` | 50 | 105 (150) | 46.4 dB |
+| `--teacache 0.1` | 50 | 71 (150) | 40.5 dB |
+| `--teacache 0.05` | 30 | 90 (90): nothing skipped | identical |
+| `--teacache 0.2` | 30 | 44 (90) | 37.3 dB |
+| `--taylorseer` | 30 | 39 (90) | 32.3 dB |
+| `--scheduler dpmsolver++` | 30 | 90 (90) | 38.8 dB |
+| `--sample-posterior` | 30 | 90 (90) | 66.6 dB |
+
+All of them give the same edit to the eye (the same hat on the same cat). The step caches were
+compared with the official pipeline on the tiny model only; the real model was not run in the
+Python reference for them.
+
+Not supported: OmniGen2 LoRAs, batches, `--save-quantized` for the padded transformer layers
+(quantization happens at each load, a few seconds), and the reflection / RL variants
+(OmniGen2-RL, EditScore).
 
 ## BAGEL: image editing, text to image and image understanding in one model
 
@@ -2951,6 +3033,8 @@ from the folder (`llm_config.json` + `vit_config.json` + `ae.safetensors`).
 | `--size WxH` | text-to-image size (default 1024x1024; at most 1024 per side) |
 | `--max-size N`, `--min-size N` | input resize bounds (1024 and 512, the reference's `ImageTransform(1024, 512, 16)`) |
 | `--think` | plan before the image, or reason before the answer (greedy, at most 1000 tokens) |
+| `--taylorseer` | TaylorSeer step cache (off by default: fewer language-model passes, a different image) |
+| `--sample-posterior` | sample the VAE posterior of input images instead of taking its mean (off by default) |
 | `--quant q8\|q4`, `--mmap` | weight precision (quantized at load); map the checkpoint |
 
 What runs: the language model is Qwen2.5-7B (with q/k RMSNorm added) as a Mixture-of-Transformers:
@@ -3052,10 +3136,44 @@ leaves the other expert's weights untouched in the mapped file.
 0.34 GB (the FLUX.1 autoencoder, f32). No GGUF conversion of BAGEL exists; the community NF4 /
 INT8 / FP8 / DFloat11 checkpoints are not supported (quantize at load with `--quant`).
 
-Not supported: sampling the VAE posterior (the reference draws `mean + std * noise` for input
-images; oxinfer uses the mean, a difference far below the guidance's), TaylorSeer step caching,
-batches, interleaved outputs past one image or one answer, the browser build (the weights exceed
-4 GB). Single-token text decoding runs on the CPU (about 10 tokens/s in bf16).
+**TaylorSeer and posterior sampling.** Both opt-in: they change the image. Without them the
+output is bit-identical to before they existed (same PNG for an edit and a text-to-image run
+against a build of the previous commit; real weights, the language model cut to 2 layers).
+
+`--taylorseer` (`"taylorseer": true`) is the reference's `enable_taylorseer` (order 6, interval
+3, first enhance 5): each guidance branch has its own state; it runs the language model on its
+first 5 passes and then every 3rd, and the passes between take the Taylor expansion of the
+hidden states, from finite differences between the last runs. The reference keeps the features
+of every layer; on a skipped pass each layer returns its own prediction, so only the last
+layer's latent-token states (before the final norm) reach `llm2vae`, and those are what oxinfer
+keeps. Branches that run on the same step still share one batch. Against the official code
+(`tools/ref_bagel_taylorseer.py`: the repository's model with the real weights, cut to 2 layers
+and run in float32 on the CPU, its initial noise passed to oxinfer run with the same cut;
+text to image, 256x256):
+
+| run | steps | passes that ran the model (of all) | same decisions | final latents (relative L2) |
+|---|---|---|---|---|
+| no cache | 12 | 20 (20) | | 7.8e-6 |
+| `--taylorseer` | 30 | 24 (53) | yes | 5.0e-5 |
+| `--taylorseer --cfg-img 1.5` (three branches) | 50 | 53 (131) | yes | 9.6e-5 |
+
+The larger error with the cache is float32 rounding through the order-6 differences, on the
+same schedule. The full 28-layer model was not run with the cache here, and the editing path
+was not compared with the reference (it differs from text to image only in the contexts the
+branches attend to).
+
+`--sample-posterior` (`"sample_posterior": true`) draws each input image's VAE latents as
+`mean + exp(0.5 logvar) * noise`, as the reference's `DiagonalGaussian`, instead of the mean.
+The noise comes from oxinfer's generator (xoshiro256** seeded from `--seed`, one stream per
+input image, apart from the initial latents'): the reference's distribution, not its draw, which
+comes from torch's global generator and cannot be matched, so the mean stays the default. The
+sampling code (`src/vae_posterior.rs`) is the one checked against diffusers on OmniGen2's tiny
+model above, here without diffusers' log-variance clamp, which the BFL autoencoder does not
+have; BAGEL's own sampler was not compared with the reference. For a 256x256 cat photo the
+posterior's standard deviations are 1.4e-4 of the latents (L2).
+
+Not supported: batches, interleaved outputs past one image or one answer, the browser build (the
+weights exceed 4 GB). Single-token text decoding runs on the CPU (about 10 tokens/s in bf16).
 
 ## Step1X-Edit: image editing from instructions
 
@@ -3086,6 +3204,7 @@ transformer's `enable_text_token_mapping`.
 | `--steps N`, `--guidance F`, `--negative TEXT` | 28, true CFG 6, `""` |
 | `--size WxH` | output size and working area; the input is center-cropped to that aspect ratio. Default: the input's size, worked at about 1024x1024 (multiples of 16) at its aspect ratio |
 | `--think` | v1.2 thinking mode (sampled rewrite, temperature 0.7, top-p 0.9, up to 128 tokens) |
+| `--sample-posterior` | sample the VAE posterior of the input image instead of taking its mean (off by default) |
 | `--quant q8\|q4` | transformer precision (the text encoder: q8 with either) |
 | `--mmap`, `--stream` | map the weights; stream the transformer's 57 blocks from storage (`--cache-budget-gb`) |
 
@@ -3182,7 +3301,8 @@ let (out, timings) = pipe.edit(&img, &Params::new("put a red hat on the dog"), &
 
 The C API has `oxi_step1x_load` (`key=value` options: quant, text_quant, mmap, transformer,
 keep_text_encoder, stream, exact_attention, device), `oxi_step1x_edit` (a JSON request: prompt,
-images, negative, true_cfg, steps, seed, size_level, width, height, think; or RGB pixels),
+images, negative, true_cfg, steps, seed, size_level, width, height, think, sample_posterior; or
+RGB pixels),
 `oxi_step1x_cancel` and `oxi_step1x_free` (see `include/oxinfer.h`). `examples/step1x_edit.rs`
 edits one image.
 
@@ -3195,8 +3315,21 @@ linked instead of downloaded twice); v1.2's is fine-tuned. No GGUF conversions a
 Not supported: the reflection mode of v1.2 (a multi-round loop where the VL model scores the edit
 and retries), the original `stepfun-ai/Step1X-Edit` single-file checkpoints (v1.0 / v1.1 in the
 original repository's layout; the diffusers folders cover the same models) and its fp8 copies,
-LoRAs, the RegionE acceleration, batches, the browser build (the weights exceed its 4 GB). The reference image is VAE-encoded at the posterior mean (the
-pipeline samples it; the noise is ~3e-4 of the latents).
+LoRAs, the RegionE acceleration, batches, the browser build (the weights exceed its 4 GB).
+
+The reference image is VAE-encoded at the posterior mean by default (the pipeline samples it).
+`--sample-posterior` (`"sample_posterior": true`, `Params::sample_posterior`) draws it as
+`mean + std * noise` like the pipeline's `retrieve_latents(..., sample_mode="sample")`, with the
+log-variance clamped to [-30, 20] as diffusers does. The noise comes from oxinfer's generator
+(xoshiro256** seeded from `--seed`, a stream apart from the initial latents'): the pipeline's
+distribution, not its draw, since oxinfer does not reproduce torch's generator (checks pass the
+reference's noise in, as for the initial latents). So the mean stays the default, and the
+agreement table above is measured with it. The sampling code is the one checked against
+diffusers' `latent_dist.sample()` on OmniGen2's tiny model (sampled latents within 7.8e-7 with
+the same noise), where the same kind of VAE measured a posterior 1.4e-4 of the latents wide.
+Step1X-Edit itself was not run with the flag, nor re-run after this change (its 42 GB of weights
+are more than this check could load on the shared machine); its default path calls the same
+`Vae::encode` as before.
 
 ## Janus-Pro: text to image and image understanding
 
