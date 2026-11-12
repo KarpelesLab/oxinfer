@@ -139,7 +139,7 @@ impl<'a> DLin<'a> {
         let mut y = vec![0f32; t * self.n_out];
         linear(&self.w, self.n_out, self.n_in, x, t, &mut y);
         if let Some(b) = &self.b {
-            for_chunks(&mut y, self.n_out, t > 1, |_, r| add_inplace(r, b));
+            for_chunks(&mut y, self.n_out, t > 1, |_, r| r.iter_mut().zip(b).for_each(|(v, &bv)| *v += bv));
         }
         y
     }

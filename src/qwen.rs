@@ -1869,6 +1869,7 @@ impl<'a> QwenModel<'a> {
             && gpu
             && mm.is_empty()
             && !record
+            && sess.capture.is_empty()
             && let Some((hs, _)) = self.gpu_step(sess, tokens[0], false)
         {
             return hs;

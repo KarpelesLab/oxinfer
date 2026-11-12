@@ -132,6 +132,19 @@ pub(crate) fn raise_qos() {
     });
 }
 
+thread_local! {
+    /// Set while this thread runs a pool job: a nested `Pool::run` would wait on itself.
+    static IN_JOB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` with this thread marked as inside a job.
+#[inline]
+fn in_job(f: impl FnOnce()) {
+    let prev = IN_JOB.with(|c| c.replace(true));
+    f();
+    IN_JOB.with(|c| c.set(prev));
+}
+
 /// Claims and runs blocks of the current region, if any. Returns false if no region was published.
 #[inline]
 fn participate(shared: &Shared) -> bool {
@@ -144,13 +157,13 @@ fn participate(shared: &Shared) -> bool {
     // SAFETY: the publisher keeps the region alive until `active` drops to zero after
     // it has cleared the pointer, and we incremented `active` before loading it.
     let region = unsafe { &*rp };
-    loop {
+    in_job(|| loop {
         let i = region.next.fetch_add(1, Relaxed);
         if i >= region.n {
             break;
         }
         (region.f)(i);
-    }
+    });
     shared.active.fetch_sub(1, SeqCst);
     true
 }
@@ -243,12 +256,16 @@ impl Pool {
     }
 
     /// Runs `f(i)` for every `i in 0..n` across the pool, returning when all are done.
-    /// Must not be called from inside a job.
+    /// From inside a job it runs serially on the calling thread.
     pub fn run(&self, n: usize, f: &(dyn Fn(usize) + Sync)) {
         if n == 0 {
             return;
         }
-        if n == 1 || self.workers == 0 {
+        let nested = IN_JOB.with(|c| c.get());
+        if nested && std::env::var_os("OXINFER_POOL_DEBUG").is_some() {
+            eprintln!("[pool: nested run]\n{}", std::backtrace::Backtrace::force_capture());
+        }
+        if n == 1 || self.workers == 0 || nested {
             for i in 0..n {
                 f(i);
             }
@@ -269,13 +286,13 @@ impl Pool {
                 h.unpark();
             }
         }
-        loop {
+        in_job(|| loop {
             let i = region.next.fetch_add(1, Relaxed);
             if i >= n {
                 break;
             }
             f(i);
-        }
+        });
         s.region.store(std::ptr::null_mut(), SeqCst);
         while s.active.load(SeqCst) != 0 {
             std::hint::spin_loop();
