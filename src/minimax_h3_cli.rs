@@ -9,6 +9,18 @@ use oxinfer::minimax_h3::{Params, Pipeline};
 use std::path::PathBuf;
 use std::time::Instant;
 
+/// Whether a checkpoint folder holds its weights (not only its configuration).
+fn has_weights(dir: &std::path::Path) -> bool {
+    if dir.join("model.safetensors").exists() {
+        return true;
+    }
+    let Ok(b) = std::fs::read(dir.join("model.safetensors.index.json")) else { return false };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b) else { return false };
+    v["weight_map"]
+        .as_object()
+        .is_some_and(|m| m.values().filter_map(|f| f.as_str()).all(|f| dir.join(f).exists()))
+}
+
 /// MiniMax-H3's text encoder folder.
 fn text_encoder(model: &std::path::Path) -> Result<PathBuf> {
     if let Ok(p) = std::env::var("OXINFER_H3_TEXT_ENCODER") {
@@ -24,7 +36,7 @@ fn text_encoder(model: &std::path::Path) -> Result<PathBuf> {
     for r in &roots {
         for sub in ["text_encoder", "FL2VA/text_encoder"] {
             let p = r.join(sub);
-            if p.join("config.json").exists() {
+            if p.join("config.json").exists() && has_weights(&p) {
                 return Ok(p);
             }
         }
