@@ -520,6 +520,25 @@ pub const CATALOG: &[Model] = &[
     .speed(19.6, 48)
     .moe()
     .note(PARAMS),
+    // LongCat-2.5 and LongCat-2.0: never run (3.5 TB each); the agreement with the published code
+    // is measured on tiny checkpoints, the loader on the releases' headers, and
+    // LongCat-Flash-Lite-Sparse (the same architecture) was run on its real weights. Bytes per
+    // token: the loader's report.
+    Model::new("meituan-longcat/LongCat-2.5", Kind::Chat, 1600.0, 3562.0, AGENT)
+        .fixed(Format::Bf16, "bf16")
+        .speed(112.2, 38)
+        .moe()
+        .note("supported, untested; text only (no vision tower, no MTP)"),
+    Model::new("meituan-longcat/LongCat-2.0", Kind::Chat, 1600.0, 3552.0, AGENT)
+        .fixed(Format::Bf16, "bf16")
+        .speed(112.2, 38)
+        .moe()
+        .note("supported, untested; the text model of LongCat-2.5"),
+    Model::new("meituan-longcat/LongCat-Flash-Lite-Sparse", Kind::Chat, 69.0, 138.3, &[Text, Tools])
+        .fixed(Format::Bf16, "bf16")
+        .speed(9.1, 14)
+        .moe()
+        .note("63 GB of it n-gram tables read a few rows a token; no thinking mode"),
     // Kimi K3.1 Pro: text only here (no vision tower), never run on the real weights (the
     // agreement with Moonshot's code is measured on tiny checkpoints; the loader was tried on
     // these files' headers). Bytes per token: the dense weights of 93 layers and 16 experts each.

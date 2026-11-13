@@ -90,6 +90,7 @@ too. The device is chosen at run time (`--device auto`: a GPU when one starts, e
 | [GLM-5.3 and GLM-5.3-Flash](docs/glm.md) | hyper-connections, KDA linear attention, MLA with the DSA indexer; text only |
 | [ERNIE 5.5 Flash Base](docs/ernie.md) | 280B MoE base model (HCA and MLA-DSA attention); on tiny checkpoints only |
 | [Kimi K3.1 Pro, Kimi K3](docs/kimi.md) | 2.8T MoE with linear and sparse attention, on tiny checkpoints only |
+| [LongCat-2.5, LongCat-2.0, LongCat-Flash-Lite-Sparse](docs/longcat.md) | 1.6T MoE with sparse attention and a hashed n-gram embedding; the 69B sibling on its real weights, LongCat-2.5 on tiny checkpoints only |
 | [Nemotron 3.5 Lightning and Transcribe](docs/nemotron.md) | Mamba-2 / attention / MoE hybrid; a 34B speech LM for speech to text |
 | [Inkling-2 Small](docs/inkling.md) | 594B MoE with images (relative-bias attention, short convolutions, attention residual); the decoder on tiny checkpoints only |
 | [Raon-1 nano](docs/raon.md) | delta-rule linear attention and gated MLA on four residual streams, per-layer embeddings |
