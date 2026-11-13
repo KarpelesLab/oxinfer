@@ -1,8 +1,11 @@
-//! Compares a DeepSeek V4 or V4.1 checkpoint run by oxinfer with reference outputs (as written by
-//! `tools/ref_deepseek4.py` / `tools/ref_deepseek41.py`: `ids` (I64), `logits` `[n, vocab]` at
+//! Compares a DeepSeek V4, V4.1 or ERNIE 5.5 checkpoint run by oxinfer with reference outputs (as
+//! written by `tools/ref_deepseek4.py` / `tools/ref_deepseek41.py` / `tools/ref_ernie55.py`: `ids`
+//! (I64), `logits` `[n, vocab]` at
 //! every prompt position, and optionally `gen` (I64, greedy tokens) with `decode_logits`
 //! `[len(gen), vocab]`, the logits after feeding each of them one at a time; for V4.1 also
-//! `image_at` / `image_embeds`, an image span of the prompt as the reference embeds it):
+//! `image_at` / `image_embeds`, an image span of the prompt as the reference embeds it; for ERNIE
+//! 5.5 also `mtp_logits` `[n - 1, vocab]`, the MTP layer over the prompt, and `draft` /
+//! `draft_logits`, a chain of its drafts after the prompt):
 //!
 //! ```text
 //! deepseek4_check MODEL REF.safetensors [--chunk N] [--cpu] [--mmap]
@@ -11,7 +14,8 @@
 //!
 //! Prints, for the prefill (in chunks of N tokens, default the whole prompt) and for the
 //! token-by-token decode, the largest logit difference, the mean KL divergence and the agreement
-//! of the top token.
+//! of the top token. With an MTP layer (ERNIE 5.5), `--mtp N` then decodes N tokens greedily with
+//! its drafts (`--drafts K` per round, default 3) and compares them with plain greedy decoding.
 
 use anyhow::{Context, Result};
 use oxinfer::deepseek4::DeepSeek4Model;
@@ -60,6 +64,9 @@ fn report(what: &str, ours: &[f32], refs: &[f32], vocab: usize) {
         if m > max {
             (max, worst) = (m, i);
         }
+        if m > 0.05 && std::env::var_os("OXINFER_CHECK_VERBOSE").is_some() {
+            eprintln!("{what} {i}: max logit diff {m:.3e}");
+        }
         kl += k;
         same += s as usize;
     }
@@ -75,11 +82,14 @@ fn main() -> Result<()> {
     let model = args.next().context(usage)?;
     let refp = args.next().context(usage)?;
     let (mut chunk, mut cpu, mut mmap) = (None, false, false);
+    let (mut mtp_n, mut drafts) = (0usize, 3usize);
     let mut texts = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--chunk" => chunk = Some(args.next().context("--chunk N")?.parse::<usize>()?),
             "--cpu" => cpu = true,
+            "--mtp" => mtp_n = args.next().context("--mtp N")?.parse()?,
+            "--drafts" => drafts = args.next().context("--drafts K")?.parse()?,
             "--mmap" => mmap = true,
             other if refp == "--load" => texts.push(other.to_string()),
             other => anyhow::bail!("unknown argument {other}"),
@@ -138,8 +148,18 @@ fn main() -> Result<()> {
     };
     let mut sess = m.new_session();
     let mut ours = Vec::with_capacity(refs.len());
+    // ERNIE 5.5: the residual before the head at every position, for the MTP layer.
+    let mtp = m.has_mtp() && st.info("mtp_logits").is_some();
+    let mut resid = Vec::new();
     let t0 = std::time::Instant::now();
     for (ci, c) in ids.chunks(chunk).enumerate() {
+        if mtp {
+            let mut r = Vec::new();
+            let hs = m.forward_residual(&mut sess, c, &mut r);
+            resid.extend(r);
+            ours.extend(m.logits(&hs, c.len()));
+            continue;
+        }
         let start = ci * chunk;
         let mm: Vec<(usize, &[f32])> = img
             .chunks(h)
@@ -158,6 +178,33 @@ fn main() -> Result<()> {
     );
     report("prefill", &ours, &refs, vocab);
 
+    if mtp {
+        // The MTP layer over the prompt (in the same chunks), then a round of drafts after it.
+        let n = ids.len();
+        let w = resid.len() / n;
+        let mut ms = m.mtp_session().unwrap();
+        let (mut got, mut last) = (Vec::new(), Vec::new());
+        for c in (0..n - 1).collect::<Vec<_>>().chunks(chunk) {
+            let (a, b) = (c[0], c[c.len() - 1] + 1);
+            let hs = m.mtp_forward(&mut ms, &resid[a * w..b * w], &ids[a + 1..b + 1], &mut last);
+            got.extend(m.logits(&hs, b - a));
+        }
+        report("mtp (prompt)", &got, &f32s(&st, "mtp_logits")?, vocab);
+        let dref = f32s(&st, "draft_logits")?;
+        let am = |v: &[f32]| v.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).unwrap().0 as u32;
+        let mut tok = am(&ours[(n - 1) * vocab..]);
+        let mut r = resid[(n - 1) * w..].to_vec();
+        let mut got = Vec::new();
+        for _ in 0..dref.len() / vocab {
+            let hs = m.mtp_forward(&mut ms, &r, &[tok], &mut last);
+            let lg = m.logits(&hs, 1);
+            tok = am(&lg);
+            got.extend(lg);
+            r = std::mem::take(&mut last);
+        }
+        report("mtp (drafts)", &got, &dref, vocab);
+    }
+
     if st.info("gen").is_some() {
         let gen_ids = i64s(&st, "gen")?;
         let dref = f32s(&st, "decode_logits")?;
@@ -166,6 +213,31 @@ fn main() -> Result<()> {
             got.extend(m.forward(&mut sess, &[tk]));
         }
         report("decode", &got, &dref, vocab);
+    }
+    if mtp_n > 0 {
+        // Greedy decoding after the prompt, plain and with MTP drafts.
+        let am = |v: &[f32]| v.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).unwrap().0 as u32;
+        let mut sess = m.new_session();
+        let t0 = std::time::Instant::now();
+        let mut plain = vec![am(&m.forward(&mut sess, &ids))];
+        while plain.len() < mtp_n {
+            let lg = m.forward(&mut sess, &plain[plain.len() - 1..]);
+            plain.push(am(&lg));
+        }
+        let tp = t0.elapsed().as_secs_f64();
+        let mut dec = oxinfer::deepseek4::ErnieMtpDecoder::new(&m, drafts)?;
+        let t0 = std::time::Instant::now();
+        let mut spec = vec![dec.prefill(&ids)];
+        while spec.len() < mtp_n {
+            spec.extend(dec.step());
+        }
+        spec.truncate(mtp_n);
+        let same = plain.iter().zip(&spec).take_while(|(a, b)| a == b).count();
+        let (rounds, drafted, kept) = dec.stats;
+        println!(
+            "mtp decode: {mtp_n} tokens, {same} match plain greedy decoding; {rounds} rounds, {kept}/{drafted} drafts kept; plain {tp:.2}s, with drafts {:.2}s",
+            t0.elapsed().as_secs_f64()
+        );
     }
     Ok(())
 }
