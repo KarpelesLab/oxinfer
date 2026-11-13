@@ -1360,7 +1360,7 @@ impl Engine {
                 Family::Qwen
             }
             "mistral_large4" | "mistral_large4_text" => Family::Mistral4,
-            "deepseek_v4" | "deepseek_v41" => Family::DeepSeek4,
+            "deepseek_v4" | "deepseek_v41" | "ernie5_5_moe" => Family::DeepSeek4,
             m if crate::glm5::is_model_type(m) => Family::Glm5,
             other => bail!("unsupported model_type {other}"),
         };
@@ -1670,7 +1670,13 @@ impl Engine {
                     c.vocab_size,
                     model.streamed_bytes(),
                 );
-                let fmt: &'static (dyn ChatFormat + Sync) = if c.v41 { &chat::DeepSeek41Chat } else { &chat::DeepSeekChat };
+                let fmt: &'static (dyn ChatFormat + Sync) = if c.v41 {
+                    &chat::DeepSeek41Chat
+                } else if c.ernie.is_some() {
+                    &chat::ErnieBaseChat
+                } else {
+                    &chat::DeepSeekChat
+                };
                 // DSpark as for Mistral Large 4: the given draft, `auto` / the default for the one
                 // beside a GGUF model, `none` for none. (V4.1's draft stages are not read yet: a
                 // draft beside the model is left alone.)
@@ -1678,9 +1684,14 @@ impl Engine {
                     (Some("auto"), _) | (_, Some(_)) if c.v41 => {
                         bail!("DSpark drafts are not supported for DeepSeek V4.1 yet")
                     }
+                    (Some("auto"), _) | (_, Some(_)) if c.ernie.is_some() => {
+                        bail!("DSpark drafts are not supported for ERNIE 5.5")
+                    }
                     (Some("auto"), _) => Some(resolve_auto_draft(&dir, opts.cache_dir.as_deref())?),
                     (_, Some(d)) => Some(d.clone()),
-                    (None, None) if crate::dspark::BY_DEFAULT && !c.v41 => crate::dspark::default_draft_for(&dir, opts.fast_verify),
+                    (None, None) if crate::dspark::BY_DEFAULT && !c.v41 && c.ernie.is_none() => {
+                        crate::dspark::default_draft_for(&dir, opts.fast_verify)
+                    }
                     _ => None,
                 };
                 let lm = match dspark {

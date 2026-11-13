@@ -590,6 +590,11 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
         shards.sort();
         shards.dedup();
         files.extend(shards);
+    } else if list.keys().any(|n| crate::safetensors::is_shard_name(n)) {
+        // Shards without an index (baidu/ERNIE-5.5-Flash-Base).
+        let mut shards: Vec<String> = list.keys().filter(|n| crate::safetensors::is_shard_name(n)).cloned().collect();
+        shards.sort();
+        files.extend(shards);
     } else if list.contains_key("diffusion_pytorch_model.safetensors") {
         // A single diffusers component (a ControlNet repo).
         files.push("diffusion_pytorch_model.safetensors".into());

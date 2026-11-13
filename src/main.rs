@@ -1569,7 +1569,7 @@ fn run(mut args: Args) -> Result<()> {
             run_qwen(args)
         }
         "mistral_large4" | "mistral_large4_text" => run_mistral4(args),
-        "deepseek_v4" | "deepseek_v41" => run_deepseek4(args),
+        "deepseek_v4" | "deepseek_v41" | "ernie5_5_moe" => run_deepseek4(args),
         m if oxinfer::glm5::is_model_type(m) => run_glm5(args),
         other => bail!("unsupported model_type {other}"),
     }
@@ -2299,7 +2299,9 @@ fn run_mistral4(mut args: Args) -> Result<()> {
 fn run_deepseek4(mut args: Args) -> Result<()> {
     let t0 = Instant::now();
     if args.mtp {
-        bail!("DeepSeek V4 speculative decoding uses a DSpark draft (--draft), not the MTP layer");
+        bail!(
+            "DeepSeek V4 speculative decoding uses a DSpark draft (--draft), not the MTP layer (ERNIE 5.5's MTP drafts are in the library only: deepseek4::ErnieMtpDecoder)"
+        );
     }
     // DSpark: as for Mistral Large 4, the draft beside a GGUF model by default (not with
     // interventions, which plain decoding serves).
@@ -2317,9 +2319,15 @@ fn run_deepseek4(mut args: Args) -> Result<()> {
     let draft = match draft {
         Some(_) if cfg.v41 && args.draft.is_some() => bail!("DSpark drafts are not supported for DeepSeek V4.1 yet"),
         Some(_) if cfg.v41 => None,
+        Some(_) if cfg.ernie.is_some() && args.draft.is_some() => bail!("DSpark drafts are not supported for ERNIE 5.5"),
+        Some(_) if cfg.ernie.is_some() => None,
         d => d,
     };
-    let name = if cfg.v41 { "DeepSeek V4.1" } else { "DeepSeek V4" };
+    let name = match (cfg.v41, cfg.ernie.is_some()) {
+        (true, _) => "DeepSeek V4.1",
+        (_, true) => "ERNIE 5.5",
+        _ => "DeepSeek V4",
+    };
     let eos = config::load_eos_ids(&args.model);
     // A checkpoint larger than most of RAM is streamed with a page-cache budget of 70% of RAM,
     // unless `--no-stream` (or `--mmap`) asks for plain demand paging.
@@ -2343,6 +2351,8 @@ fn run_deepseek4(mut args: Args) -> Result<()> {
     let tok = load_tokenizer(&args.model)?;
     let fmt: &dyn ChatFormat = if model.cfg.v41 {
         &chat::DeepSeek41Chat
+    } else if model.cfg.ernie.is_some() {
+        &chat::ErnieBaseChat
     } else {
         &chat::DeepSeekChat
     };

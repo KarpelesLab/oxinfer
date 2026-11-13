@@ -537,6 +537,27 @@ pub fn checkpoint_bytes(path: &Path) -> u64 {
     })
 }
 
+/// Whether `name` is a shard of a transformers checkpoint (`model-00001-of-00128.safetensors`).
+pub(crate) fn is_shard_name(name: &str) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    name.strip_prefix("model-")
+        .and_then(|r| r.strip_suffix(".safetensors"))
+        .and_then(|r| r.split_once("-of-"))
+        .is_some_and(|(a, b)| digits(a) && digits(b))
+}
+
+/// The shards of a checkpoint folder that has no index, in order.
+fn unindexed_shards(dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir).map_or(Vec::new(), |rd| {
+        rd.flatten()
+            .map(|e| e.path())
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(is_shard_name))
+            .collect()
+    });
+    v.sort();
+    v
+}
+
 /// A weight matrix stored pre-quantized in the checkpoint, borrowed in place.
 pub enum Stored {
     Q8(QMatrix),
@@ -674,7 +695,11 @@ impl ModelFiles {
             names.dedup();
             files.extend(names.into_iter().map(|n| dir.join(n)));
         } else {
-            bail!("no model.safetensors, index or pytorch_model.bin found in {}", dir.display());
+            // Shards without an index (baidu/ERNIE-5.5-Flash-Base ships none).
+            files = unindexed_shards(dir);
+            if files.is_empty() {
+                bail!("no model.safetensors, index or pytorch_model.bin found in {}", dir.display());
+            }
         }
         let mut shards = Vec::with_capacity(files.len());
         for p in &files {

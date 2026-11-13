@@ -727,6 +727,50 @@ impl ChatFormat for DeepSeekChat {
     }
 }
 
+/// ERNIE 5.5 Flash Base (baidu/ERNIE-5.5-Flash-Base): a base model, the end of pre-training, with
+/// no chat template. A prompt is the text to continue after `<|ERNIE_MASK|>` (what its tokenizer
+/// puts in front of a text, and also its end-of-text token): each user turn is written as it is,
+/// and a reply is what the model writes until it ends the text. There is no system role (a
+/// system prompt, the default one included, is left out), no thinking and no tool calling.
+pub struct ErnieBaseChat;
+
+impl ErnieBaseChat {
+    const EOS: &'static str = "<|ERNIE_MASK|>";
+}
+
+impl ChatFormat for ErnieBaseChat {
+    fn conversation_start(&self, _system: Option<&str>, _think: bool) -> String {
+        Self::EOS.to_string()
+    }
+    fn user_turn(&self, content: &str, _think: bool) -> String {
+        content.to_string()
+    }
+    fn end_of_model_turn(&self) -> String {
+        String::new()
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        Self::EOS
+    }
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        ("", "")
+    }
+    fn starts_in_thinking(&self, _think: bool) -> bool {
+        false
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, think: bool, _tools: &[ToolSpec]) -> String {
+        self.conversation_start(system, think)
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        ""
+    }
+    fn parse_tool_calls(&self, _raw: &str) -> Vec<ToolCall> {
+        Vec::new()
+    }
+    fn tool_results(&self, _results: &[ToolResult], _think: bool) -> String {
+        String::new()
+    }
+}
+
 /// DeepSeek V4.1 (its `encoding/encoding.py`): V4's format with a `<｜System｜>` token in front of
 /// the system part (the system prompt, the tool schemas after a blank line, and in thinking mode
 /// a first line giving the reasoning effort as a number, 75 of 100 by default), and DSML tags

@@ -124,6 +124,17 @@ fn main() -> Result<()> {
             files.names().count(),
             files.total_bytes() as f64 / 1e9
         );
+        if c.ernie.is_some() {
+            println!("ERNIE 5.5: MTP layer {}", if m.has_mtp() { "loaded" } else { "absent" });
+        }
+        if dir.join("tokenizer.json").exists() {
+            let tok =
+                oxinfer::tokenizer::Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+            for text in &texts {
+                let enc = tok.encode(text.as_str(), true).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+                println!("{:?}", enc.get_ids());
+            }
+        }
         if oxinfer::gguf::is_gguf(&dir) {
             let tok = oxinfer::gguf::header(&dir)?.tokenizer()?;
             for text in texts {
