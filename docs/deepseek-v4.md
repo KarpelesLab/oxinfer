@@ -208,7 +208,12 @@ and both are read:
 - AtomicChat's: the reference's hash buffers as tensors (`engram_token_map`, `engram_primes`,
   `engram_offsets`, `engram_multipliers`), `engram_q` / `engram_k` apart, the config's own key
   names, and the table file named by `deepseek41.engram.file` (the same ISTA-DASLab file, not in
-  AtomicChat's repository): it is read from beside the model or one folder up.
+  AtomicChat's repository): it is read from beside the model or one folder up (also with one
+  table per layer, `blk.N.engram_embd`, as that file first had).
+
+How the two correspond is taken from ISTA-DASLab's `convert_ds41_upstream.py`, which rewrites
+one into the other: `engram_gate = engram_q * engram_k`, and llama.cpp's head offsets count rows
+from the start of the table of all layers (the reference's from the start of each layer's).
 
 The chat format is DeepSeek's `encoding/encoding.py` (`chat::DeepSeek41Chat`): V4's with a
 `<｜System｜>` token in front of the system part, in thinking mode a first line `Reasoning Effort:
@@ -256,9 +261,9 @@ header values); the tokenizer rebuilt from the GGUF metadata gives the ids of th
 ./target/release/oxinfer --model DIR/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf --think -p "..."
 ```
 
-Not done for V4.1: a run on the real weights (so no speed, no comparison with llama.cpp, and the
-assumption that `blk.N.engram_gate` is the product `q_weight * k_weight` is untested: the tiny
-GGUFs are written with that reading); image input (the ViT with 2D RoPE, the 3x3 aligner and the
+Not done for V4.1: a run on the real weights (so no speed and no comparison with llama.cpp, whose
+`deepseek41` code was not read: the GGUF layouts are known from the released headers and from
+ISTA-DASLab's script only); image input (the ViT with 2D RoPE, the 3x3 aligner and the
 image processor; `mmproj` files are not read; the language model's side is in place and
 verified as above); DSpark (the `mtp.*` stages differ from V4's: 128 experts, a Markov head on the
 target's embedding and head, a confidence head; a `dspark*.gguf` beside the model is ignored and

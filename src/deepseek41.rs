@@ -769,6 +769,8 @@ pub(crate) fn gguf_name(name: &str, ne: &[usize]) -> Option<(String, Vec<usize>)
             "engram_gate" => Some("engram.qk_weight"),
             "engram_q" => Some("engram.q_weight"),
             "engram_k" => Some("engram.k_weight"),
+            // A layer's own table (the first engram files of ISTA-DASLab's conversions).
+            "engram_embd" => Some("engram.embed.weight"),
             _ => None,
         };
         if let Some(n) = n {
@@ -907,6 +909,10 @@ mod tests {
             Some(("layers.5.attn.wo_a.weight".into(), vec![8192, 4096]))
         );
         assert_eq!(n("engram_primes.weight", &[24, 2]).map(|x| x.1), Some(vec![2, 24]));
+        assert_eq!(
+            n("blk.14.engram_embd.weight", &[256, 1000]),
+            Some(("layers.14.engram.embed.weight".into(), vec![1000, 256]))
+        );
     }
 
     /// The bucket counts are the primes the reference draws (the first ones match the header of
