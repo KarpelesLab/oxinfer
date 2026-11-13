@@ -651,6 +651,8 @@ pub(crate) fn pf_report() {
 
 /// Prefill GEMMs with fewer 128-row tiles than this take 32-row ones (measured on an M5 Max).
 const PF_SMALL_TILES: usize = 160;
+/// Multi-token plans: bytes of QSA block score rows (see `MOp::QsaScore`).
+const QSA_SCORE_BYTES: usize = 32 << 20;
 
 /// `OXINFER_METAL_TRACE` is set.
 fn trace() -> bool {
@@ -1173,7 +1175,10 @@ enum MOp {
         t: Option<usize>,
     },
     /// The scores of `Op::QsaSelect` (none while the blocks fit the budget `top`). Multi-token
-    /// plans: the query and score strides in bytes, the arena offset of the RoPE rows.
+    /// plans: the query stride in bytes, the bytes of the score region, the arena offset of the
+    /// RoPE rows, and the selection too (`QsaTopk`'s pipeline, the arena offset and stride in
+    /// bytes of the positions): the tokens' score rows, each as long as the step needs, cycle
+    /// through the region, groups of tokens scored then selected between barriers.
     QsaScore {
         pipe: Id,
         q: usize,
@@ -1184,16 +1189,16 @@ enum MOp {
         cs: usize,
         scores: usize,
         t: Option<(usize, usize, usize)>,
+        sel: Option<(Id, usize, usize)>,
     },
-    /// The selection of `Op::QsaSelect`. Multi-token plans: the score and position strides in
-    /// bytes.
+    /// The selection of `Op::QsaSelect` (single-token plans; multi-token ones select in
+    /// `QsaScore`).
     QsaTopk {
         pipe: Id,
         scores: usize,
         sel: usize,
         top: usize,
         r: usize,
-        t: Option<(usize, usize)>,
     },
     /// Prefill plans ([`MetalBackend::build_plan_pf`]): rows of `x` (`stride` floats apart, `n`
     /// each) to the GEMM scratch as scaled half rows (see `x_half`).
@@ -1535,7 +1540,20 @@ impl MetalBackend {
         };
         // Activation arena: every buffer 256-byte aligned; in a multi-token plan, `tokens` rows of
         // `tsz` floats (256-byte aligned too).
-        let tsz: Vec<usize> = g.bufs.iter().map(|&n| if mt { n.next_multiple_of(64) } else { n }).collect();
+        let mut tsz: Vec<usize> = g.bufs.iter().map(|&n| if mt { n.next_multiple_of(64) } else { n }).collect();
+        // Multi-token plans: QSA score rows (`Op::QsaSelect::cap` floats each, 256 KB) take a
+        // region of QSA_SCORE_BYTES used as a ring of rows as long as the step's longest one
+        // (see `MOp::QsaScore`), rather than a full row per token (512 MB at 2048 tokens).
+        if mt {
+            for op in &g.ops {
+                if let Op::QsaSelect { scores, cap, .. } = *op {
+                    let per = (QSA_SCORE_BYTES / 4 / tokens)
+                        .max(cap.next_multiple_of(64).div_ceil(tokens))
+                        .next_multiple_of(64);
+                    tsz[scores.buf] = tsz[scores.buf].min(per);
+                }
+            }
+        }
         let mut boff = Vec::with_capacity(g.bufs.len());
         let mut total = 0usize;
         for &n in &tsz {
@@ -2585,17 +2603,23 @@ impl MetalBackend {
                         top,
                         cs: g.rope_halves[..rope].iter().map(|h| 2 * h).sum(),
                         scores: byte(scores),
-                        t: mt.then(|| (ts(q) * 4, ts(scores) * 4, rope_table(rope))),
+                        t: mt.then(|| (ts(q) * 4, ts(scores) * 4 * tokens, rope_table(rope))),
+                        sel: if mt {
+                            Some((self.named_pipeline("dec_qsa_topk")?, byte(sel), ts(sel) * 4))
+                        } else {
+                            None
+                        },
                     });
-                    emit.push(MOp::Barrier);
-                    emit.push(MOp::QsaTopk {
-                        pipe: self.named_pipeline("dec_qsa_topk")?,
-                        scores: byte(scores),
-                        sel: byte(sel),
-                        top,
-                        r: ratio,
-                        t: mt.then(|| (ts(scores) * 4, ts(sel) * 4)),
-                    });
+                    if !mt {
+                        emit.push(MOp::Barrier);
+                        emit.push(MOp::QsaTopk {
+                            pipe: self.named_pipeline("dec_qsa_topk")?,
+                            scores: byte(scores),
+                            sel: byte(sel),
+                            top,
+                            r: ratio,
+                        });
+                    }
                     (
                         vec![rng(q, nh * d), (KV_RES + kv, 0, usize::MAX)],
                         vec![rng(scores, cap), rng(sel, (top + 1) * ratio)],
@@ -3630,47 +3654,48 @@ impl MetalPlan<'_> {
                 top,
                 scores,
                 t: tk,
+                sel,
                 ..
             } => {
-                let (sq, ss, cs) = tk.expect("multi-token indexer scores");
-                for j in 0..t {
-                    let nb = (pos + j + 1) / p.r as usize;
-                    if nb <= *top {
-                        continue;
+                let (sq, region, cs) = tk.expect("multi-token indexer scores");
+                let (topk, sel, sl) = sel.expect("multi-token indexer selection");
+                let r = p.r as usize;
+                // Tokens past the budget, their rows as long as the last one's, as many rows at a
+                // time as the region holds.
+                let j0 = ((*top + 1) * r).saturating_sub(pos + 1).min(t);
+                let ss = ((pos + t) / r).next_multiple_of(64) * 4;
+                let group = (region / ss).max(1);
+                let mut g0 = j0;
+                while g0 < t {
+                    let g1 = (g0 + group).min(t);
+                    if g0 > j0 {
+                        e.barrier();
                     }
-                    let mut p = *p;
-                    p.nb = nb as u32;
-                    e.pipe(*pipe);
-                    e.buf(arena, *q + j * sq, 0);
-                    e.buf(kvb[*kv].1, 0, 1);
-                    e.buf(consts, *w, 2);
-                    e.buf(arena, *scores + j * ss, 3);
-                    e.bytes(&p, 4);
-                    e.buf(arena, cs + j * 2 * p.half_rot as usize * 4, 5);
-                    e.dispatch((nb.div_ceil(256), 1), 256);
+                    for j in g0..g1 {
+                        let mut p = *p;
+                        p.nb = ((pos + j + 1) / r) as u32;
+                        e.pipe(*pipe);
+                        e.buf(arena, *q + j * sq, 0);
+                        e.buf(kvb[*kv].1, 0, 1);
+                        e.buf(consts, *w, 2);
+                        e.buf(arena, *scores + (j - g0) * ss, 3);
+                        e.bytes(&p, 4);
+                        e.buf(arena, cs + j * 2 * p.half_rot as usize * 4, 5);
+                        e.dispatch(((p.nb as usize).div_ceil(256), 1), 256);
+                    }
+                    e.barrier();
+                    for j in g0..g1 {
+                        let nb = (pos + j + 1) / r;
+                        e.pipe(topk);
+                        e.buf(arena, *scores + (j - g0) * ss, 0);
+                        e.buf(arena, sel + j * sl, 1);
+                        e.bytes(&[nb as u32, *top as u32, r as u32, (pos + j) as u32], 2);
+                        e.dispatch((1, 1), 1024);
+                    }
+                    g0 = g1;
                 }
             }
-            MOp::QsaTopk {
-                pipe,
-                scores,
-                sel,
-                top,
-                r,
-                t: tk,
-            } => {
-                let (ss, sl) = tk.expect("multi-token indexer selection");
-                for j in 0..t {
-                    let nb = (pos + j + 1) / r;
-                    if nb <= *top {
-                        continue;
-                    }
-                    e.pipe(*pipe);
-                    e.buf(arena, *scores + j * ss, 0);
-                    e.buf(arena, *sel + j * sl, 1);
-                    e.bytes(&[nb as u32, *top as u32, *r as u32, (pos + j) as u32], 2);
-                    e.dispatch((1, 1), 1024);
-                }
-            }
+            MOp::QsaTopk { .. } => unreachable!("multi-token plans select in QsaScore"),
             MOp::Experts { .. } | MOp::Steer { .. } | MOp::NeuronEdit { .. } => {
                 unreachable!("single-token op in a multi-token plan")
             }
