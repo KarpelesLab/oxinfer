@@ -45,10 +45,10 @@ Decoding runs on the CPU kernels (the GPU decode plans do not cover the conv and
 the prefill matmuls still use a GPU when there is one). Speculative decoding (prompt lookup) is
 on as for other models; MTP and DSpark do not apply.
 
-`transformers` 5.23 has an `lfm3` class of its own whose attention gate is named `g_proj`: loaded
-without `trust_remote_code`, it leaves the checkpoint's `gate_proj` weights unused and the gate
-randomly initialized, and it does not apply the partial rotation. The reference here is the
-modeling code the repository ships (`modeling_lfm3.py`, `tools/ref_logits.py --trust-remote-code`).
+`transformers` 5.23 has an `lfm3` class of its own that differs from the one the repository
+ships: its attention gate is an optional `g_proj` (the checkpoint's is `gate_proj`) and its RoPE
+has no zero-tail partial rotation. It was not run here; the reference is the repository's
+modeling code (`modeling_lfm3.py`, `tools/ref_logits.py --trust-remote-code`).
 
 ## Chat format and tools
 

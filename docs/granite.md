@@ -36,12 +36,12 @@ query / key norms) with four scales in its config, and runs on the Llama code pa
 
 In GGUF files they are `granite.attention.scale`, `granite.embedding_scale`,
 `granite.residual_scale` and `granite.logit_scale`. With the last three at 1 (Granite 4.1 / 4.2)
-the model decodes on the GPU like Llama 3; other values (Granite 3's `granite` checkpoints: 12,
-0.22 and 8 or 16) are applied on the CPU path, but Granite 3's chat template
-(`<|start_of_role|>` turns) is not written: such a model is refused by the engine and the server,
-and runs from the command line with `--raw` prompts. The hybrid Mamba models (`granitemoehybrid`: Granite
-4.0 `h-*`, and the 4.0 350m / 1b / micro checkpoints, which use that class too) and the MoE ones
-(`granitemoe`) are not supported.
+the model decodes on the GPU like Llama 3; other values (as older `granite` checkpoints have them)
+are applied on the CPU path, checked on a random checkpoint only. A chat template that is not
+ChatML (Granite 3's `<|start_of_role|>` turns) is not written: such a model is refused by the
+engine and the server, and runs from the command line with `--raw` prompts. Other Granite
+classes are not supported: `granitemoehybrid` (ibm-granite/granite-4.0-350m is one, although its
+layers are all attention) and `granitemoe`.
 
 GGUF files follow llama.cpp's Llama conversion (query / key rows permuted for adjacent-pair RoPE,
 see [Llama 3 GGUF](weights.md#llama-3-gguf)). Their tokenizer is the `granite-docling`

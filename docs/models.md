@@ -22,7 +22,7 @@
 | taobao-mnn/MNN-Pocket-0.3B (a small Qwen3, bf16 safetensors; its chat template has no thinking block) | 0.36B | 0.72 GB | text; matches transformers float32 (max logit diff 5e-5 on three prompts of 16 to 1299 tokens, same greedy tokens on the CPU and with CUDA decoding); the prompt follows its template (no `<think>` block after the assistant header) |
 | mlx-community/gemma-3-4b-it-4bit (Gemma 3) | 4.3B | 3.4 GB (MLX 4-bit) | text only; matches the reference, also past the 1024-token window |
 | google/embeddinggemma-300m | 0.3B | 1.2 GB (fp32) | embeddings; matches sentence-transformers (see [Embeddings](embeddings.md#embeddings)) |
-| google/embeddinggemma-2 | 0.74B (0.24B text encoder + Gemma 4's vision and audio towers) | 1.5 GB (bf16) | text, image and audio embeddings in one space (no video yet); text, image, audio and image + text match sentence-transformers (cosine 1.000000, max difference 1.3e-6; see [EmbeddingGemma 2](embeddings.md#embeddinggemma-2)) |
+| google/embeddinggemma-2 | 0.74B (text encoder + Gemma 4's vision and audio towers) | 1.5 GB (bf16) | text, image and audio embeddings in one space (no video yet); text, image, audio and image + text match sentence-transformers (cosine 1.000000, max difference 1.3e-6; see [EmbeddingGemma 2](embeddings.md#embeddinggemma-2)) |
 | Qwen/Qwen3-Embedding-0.6B | 0.6B | 1.2 GB | embeddings; matches sentence-transformers |
 | Alibaba-NLP/gte-Qwen2-1.5B-instruct, NovaSearch/stella_en_1.5B_v5 | 1.5B | 7.1 / 6.2 GB (fp32) | embeddings (bidirectional Qwen2; stella with its per-size heads); match sentence-transformers |
 | BAAI/bge-m3 | 0.6B | 2.3 GB (fp32, `pytorch_model.bin`) | dense, sparse and ColBERT embeddings; matches the reference |

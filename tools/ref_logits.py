@@ -6,7 +6,7 @@ usage: ref_logits.py MODEL_DIR PROMPT_TEXT_FILE OURS_LOGITS.bin [--generate N] [
 PROMPT_TEXT_FILE holds the exact templated text (including <bos>) that oxinfer tokenized.
 Prints token ids, compares our logits with the reference and optionally greedy-generates.
 --trust-remote-code runs the model repo's own modeling code (LiquidAI/LFM3-1.7B: the class of
-that name in transformers names the attention gate differently and leaves it uninitialized).
+that name in transformers 5.23 names the attention gate differently and has another RoPE).
 """
 import sys, struct, time
 import numpy as np
