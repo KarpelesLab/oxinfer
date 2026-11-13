@@ -92,6 +92,7 @@ too. The device is chosen at run time (`--device auto`: a GPU when one starts, e
 | [Kimi K3.1 Pro, Kimi K3](docs/kimi.md) | 2.8T MoE with linear and sparse attention, on tiny checkpoints only |
 | [Nemotron 3.5 Lightning and Transcribe](docs/nemotron.md) | Mamba-2 / attention / MoE hybrid; a 34B speech LM for speech to text |
 | [Inkling-2 Small](docs/inkling.md) | 594B MoE with images (relative-bias attention, short convolutions, attention residual); the decoder on tiny checkpoints only |
+| [Raon-1 nano](docs/raon.md) | delta-rule linear attention and gated MLA on four residual streams, per-layer embeddings |
 | [Qwen3.8-Flash-Next](docs/qwen-flash-next.md) | 125B MoE with an n-gram embedding table |
 | [Unlimited-OCR-2](docs/ocr.md) | document OCR: page images to text with layout, block-sparse attention |
 | [Image, video and audio input](docs/multimodal-input.md) | the vision and audio towers of Gemma 4 and Qwen, Qwen2.5-VL |

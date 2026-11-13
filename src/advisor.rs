@@ -304,6 +304,9 @@ pub const CATALOG: &[Model] = &[
     Model::new("prism-ml/Ternary-Bonsai-2-2B-gguf:PTQ1_0", Kind::Chat, 1.9, 0.43, AGENT)
         .fixed(Format::GgufLow, "GGUF PTQ1_0 (ternary)")
         .note("Hadamard-folded ternary weights (also :PQ2_0, :Q2_0); decodes on the CPU"),
+    Model::new("KRAFTON/Raon-1-nano", Kind::Chat, 3.1, 7.1, AGENT)
+        .speed(3.06, 24)
+        .note("half of its parameters are a per-layer embedding table read one row a token"),
     Model::new("Qwen/Qwen2.5-VL-3B-Instruct", Kind::Chat, 3.8, 7.5, &[Text, ImageInput]),
     Model::new("mlx-community/Qwen3-4B-4bit", Kind::Chat, 4.0, 2.4, AGENT)
         .fixed(Format::Q4, "MLX 4-bit")
