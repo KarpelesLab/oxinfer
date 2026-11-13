@@ -7,6 +7,87 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.9](https://github.com/KarpelesLab/oxinfer/compare/v0.0.8...v0.0.9) - 2026-11-13
+
+### Other
+
+- oxinfer --check-update / --update from the GitHub releases (compcol, fstool)
+- capabilities (CAN column, --can filter), every model of the README table
+- clippy (large enum variants boxed, redundant slicing) and rustfmt in the MiniMax code
+- --models, what runs on this machine with an estimated decoding speed
+- --control-image reaches both FLUX and Qwen-Image; README: transcription endpoint fields
+- rustfmt
+- Qwen-Image image to image, inpainting, ControlNet, Layered and FP8 files (flags, agreement)
+- image to image, inpainting, ControlNet, Layered, FP8 scaled checkpoints
+- response_format (json_object, json_schema), tool_choice required / function, logprobs
+- Constrained decoding: JSON / JSON Schema grammars, forced tool calls and logprobs in the sampler
+- reference checks for the new modes (tiny pipeline, real-weight steps) and README
+- LoRAs, several Kontext references, image to image, inpainting, Fill, Canny / Depth, Redux, BFL single files
+- OmniGen2 / BAGEL / Step1X-Edit step caches, DPM-Solver++ and posterior sampling as measured
+- OmniGen2, BAGEL, Step1X-Edit: step caches, DPM-Solver++, VAE posterior sampling (all opt-in)
+- JanusFlow, Janus image sizes and conversations, measured agreement
+- JanusFlow (rectified flow, SDXL VAE), conversations, output size
+- Stable Diffusion 3 / 3.5: tools/ref_sd3.py reference, README section and measured agreement
+- Stable Diffusion 3 / 3.5: MMDiT transformer, CLIP-L / CLIP-G / T5 conditioning, text to image and image to image
+- Stable Diffusion XL: diffusers reference script and measured agreement
+- Stable Diffusion XL: CLI, C API and server defaults, library example
+- Stable Diffusion XL: two text encoders, added conditioning, kohya LoRA names
+- batched utterances
+- batched decoding of several clips
+- decode steps of independent sequences in one pass
+- adapters on routed MoE experts, per selected expert
+- document beam search and batches, reference check against openai-whisper
+- beam search and batched transcription
+- x86-64 AVX2 kernels executed and verified on real hardware
+- x86-64 kernels: f16 scales through F16C inside the Q4 and GGUF kernels
+- AVX2 score lanes and value accumulation on x86-64
+- AVX2 decode kernels and dequantization, bit-identical to the portable path
+- x86-64 kernels: direct AVX2 tests against the scalar fallbacks, OXINFER_SIMD=scalar
+- README (platform row, section with the measured agreement, --device)
+- prefill GEMMs on a Vulkan compute device (bf16, Q8, Q4, affine Q4)
+- DeepSeek V4: runtime interventions (residual hooks on the hyper-connection copies, shared / routed expert neurons)
+- residual hooks on a stream of several copies per token
+- Qwen2-based embedders (gte-Qwen2, stella) with bidirectional attention and per-size heads
+- fix the pool deadlock in the VAE decode; README row
+- skip text encoder folders without weights
+- text to image (DiT, PDD sampler, ViT VAE decoder)
+- Qwen3-VL text models (`qwen3_vl`) on the Qwen path
+- NVFP4 in ModelOpt's packaging (MiniMax-H3-Image-PE)
+- MiniMax-VL-01 image input; MiniMax-01 reference fixes
+- MiniMax M3 / M3.1 image input
+- Qwen2 / Qwen2.5 text models (MiniMax SynLogic), GGUF `qwen2` too
+- Always leave the system 20% of its memory (at most 2 GB)
+- MiniMax M3 / M3.1 and Text-01 / M1 rows
+- MiniMax-Text-01 / VL-01 (text) / M1: lightning attention, post-norm residuals
+- MXFP8 and NVFP4 checkpoints (MiniMax-M3.1-Flash, M3-MXFP8)
+- MiniMax M3 / M3.1 text: MSA sparse attention, swigluoai MoE, chat format
+- MiniMax M2 / M2.1 / M2.5 / M2.7 on the Qwen path; M3 text groundwork
+- the whole tokenizer.json format and encode API
+- 2048-token prefill plan steps
+- whole prefill passes on Metal as a prefill plan
+- GPU decoding with images in the context
+- Gated DeltaNet rule, attention and MoE router of prefill on Metal
+- QSA sparse attention in the GPU decode plan past 2051 tokens of context
+- Qwen3.8-Flash-Next image input: Qwen3-VL mmproj GGUF loading (qwen3vl_merger) for Qwen3.5-family towers
+- GPU decoding with streamed weights for Gemma 4 / Gemma 3 (dense, E2B/E4B, 26B-A4B)
+- CPU decode attention reading shared key/value rows once; DeepSeek V4 / Mistral Large 4 indexer skips
+- Streamed MoE on the GPU: release kept expert wraps after every step; README measurements
+- stream_gpu=auto in the engine options; README option row
+- Streaming GPU decode: no page touching for device-read units, slower eviction retries, measured GPU/CPU choice for streamed MoE
+- GPU decoding with streamed weights (dense and MoE Qwen), device memory defaults
+- :ops: f32 matmuls are float-stored, so they never reach the decode kernels
+- Prompt lookup and prompt cache: measured defaults, README results
+- Prompt-lookup drafting with a verification-outcome memory; session snapshots and a prompt cache
+- CPU multi-token column-group kernels and batched MoE experts (measurements)
+- `old` mode (token pairs and per-expert MoE matmuls)
+- multi-column decode kernels for blocks-of-32 formats, batched MoE experts
+- Tokenizer in the crate: drop the tokenizers dependency
+- cleanroom specs of llama-modchip's performance changes (quant kernels, CPU runtime, model/server, speculative)
+- CUDA decoding (speeds, agreement, speculative verification, defaults)
+- whole decode steps on the GPU (single- and multi-token plans), streamed MoE experts
+- CUDA measurements for OmniGen2, BAGEL, Janus-Pro and device MoE experts
+- routed MoE experts on the device (gather, per-expert GEMMs, activation, combination)
+
 ## [0.0.8](https://github.com/KarpelesLab/oxinfer/compare/v0.0.7...v0.0.8) - 2026-11-05
 
 ### Other
