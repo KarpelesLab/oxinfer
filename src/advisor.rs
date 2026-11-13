@@ -469,6 +469,24 @@ pub const CATALOG: &[Model] = &[
     .speed(19.6, 48)
     .moe()
     .note(PARAMS),
+    // Kimi K3.1 Pro: text only here (no vision tower), never run on the real weights (the
+    // agreement with Moonshot's code is measured on tiny checkpoints; the loader was tried on
+    // these files' headers). Bytes per token: the dense weights of 93 layers and 16 experts each.
+    Model::new("midagedev/Kimi-K3.1-Pro-GGUF:IQ1_S", Kind::Chat, 2800.0, 580.0, AGENT)
+        .fixed(Format::GgufLow, "GGUF IQ1_S")
+        .speed(41.7, 93)
+        .moe()
+        .note("supported, untested; text only"),
+    Model::new("KarLexAI/Kimi-K3.1-Pro-GGUF:KLX-IQ1_S", Kind::Chat, 2800.0, 593.0, AGENT)
+        .fixed(Format::GgufLow, "GGUF KLX-IQ1_S")
+        .speed(55.5, 93)
+        .moe()
+        .note("supported, untested; text only"),
+    Model::new("DevQuasar/moonshotai.Kimi-K3.1-Pro-GGUF:MXFP4_MOE", Kind::Chat, 2800.0, 1509.0, AGENT)
+        .fixed(Format::GgufQ4, "GGUF MXFP4_MOE")
+        .speed(84.6, 93)
+        .moe()
+        .note("supported, untested; the release's own 4-bit experts; text only"),
     Model::new("sentence-transformers/all-MiniLM-L6-v2", Kind::Embedding, 0.023, 0.09, EMBED),
     Model::new("BAAI/bge-small-en-v1.5", Kind::Embedding, 0.033, 0.13, EMBED),
     Model::new(
