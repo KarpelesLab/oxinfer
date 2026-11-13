@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.10](https://github.com/KarpelesLab/oxinfer/compare/v0.0.9...v0.0.10) - 2026-11-13
+
+### Other
+
+- httpsd 0.2.1; the static fullrust binary with the server again
+
 ## [0.0.9](https://github.com/KarpelesLab/oxinfer/compare/v0.0.8...v0.0.9) - 2026-11-13
 
 ### Other
