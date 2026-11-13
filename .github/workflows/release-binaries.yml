@@ -1,0 +1,265 @@
+name: Release binaries
+
+# Attaches the `oxinfer` command-line binary to a GitHub Release, for:
+#   - Linux x86-64 as a static, libc-free executable built with the fullrust toolchain
+#     (https://github.com/KarpelesLab/fullrust): it needs nothing but a Linux kernel;
+#   - Linux x86-64 / aarch64 (glibc), Windows x86-64 / aarch64, and macOS (universal).
+#
+# release-plz creates the release and then dispatches this workflow with the tag (see
+# release-plz.yml): workflow_dispatch is the only trigger, so a failed upload can be retried
+# against an existing release without re-tagging. Dispatched without a tag, it builds the ref it
+# runs on and keeps the archives as workflow artifacts instead (a dry run of the builds).
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build and upload to (e.g. v0.0.9); empty: build this ref, keep the archives as artifacts"
+        required: false
+        type: string
+
+permissions:
+  # gh release upload attaches assets.
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ inputs.tag }}
+  # What the archives are named after: the tag, or `dev-<sha>` for a dry run.
+  VERSION: ${{ inputs.tag != '' && inputs.tag || format('dev-{0}', github.sha) }}
+  # The release profile keeps debug info (for profiling); the published binaries are stripped.
+  PROFILE: --config profile.release.debug=false --config profile.release.strip=true
+
+jobs:
+  build:
+    name: build ${{ matrix.asset_suffix }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            asset_suffix: linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            asset_suffix: linux-aarch64
+            apt_packages: gcc-aarch64-linux-gnu
+            linker: aarch64-linux-gnu-gcc
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            asset_suffix: windows-x86_64
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            asset_suffix: windows-aarch64
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag != '' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+
+      - name: Verify the checkout is the release tag
+        if: inputs.tag != ''
+        shell: bash
+        run: |
+          got="$(git describe --tags --exact-match --match "$TAG")"
+          if [[ "$got" != "$TAG" ]]; then
+            echo "::error::checked out '$got', expected release tag '$TAG'"
+            exit 1
+          fi
+          echo "Building $TAG at $(git rev-parse HEAD)"
+
+      - name: Install cross compiler (Linux aarch64)
+        if: matrix.apt_packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_packages }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        shell: bash
+        env:
+          # Empty (and so dropped) for the native targets.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+        run: cargo build --release --locked --bin oxinfer --target ${{ matrix.target }} $PROFILE
+
+      - name: Stage archive contents
+        shell: bash
+        run: |
+          mkdir staging
+          td="target/${{ matrix.target }}/release"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp "$td/oxinfer.exe" staging/
+          else
+            cp "$td/oxinfer" staging/
+          fi
+          cp README.md LICENSE staging/
+          ls -l staging
+
+      - name: Pack archive
+        id: pack
+        shell: bash
+        run: |
+          name="oxinfer-${VERSION}-${{ matrix.asset_suffix }}"
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            asset="${name}.zip"
+            (cd staging && 7z a "../${asset}" *)
+          else
+            asset="${name}.tar.gz"
+            tar -C staging -czf "${asset}" .
+          fi
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release
+        if: inputs.tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${TAG}" "${{ steps.pack.outputs.asset }}" --clobber
+
+      - name: Keep as artifact (dry run)
+        if: inputs.tag == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.asset }}
+          path: ${{ steps.pack.outputs.asset }}
+          retention-days: 7
+
+  build-fullrust:
+    name: build linux-x86_64-static (fullrust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag != '' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+
+      - name: Verify the checkout is the release tag
+        if: inputs.tag != ''
+        run: |
+          got="$(git describe --tags --exact-match --match "$TAG")"
+          if [[ "$got" != "$TAG" ]]; then
+            echo "::error::checked out '$got', expected release tag '$TAG'"
+            exit 1
+          fi
+
+      # A static x86_64-unknown-linux-fullrust executable: no libc, no interpreter, nothing to
+      # install. That target is not in the `unix` family and cannot load shared libraries, so
+      # the `gpu` feature (CUDA / Vulkan through dlopen) is left out: this binary runs on the
+      # CPU. The image tracks the stable toolchain the other jobs use.
+      - name: Build static libc-free binary (fullrust)
+        uses: KarpelesLab/fullrust@master
+        with:
+          image: ghcr.io/karpeleslab/fullrust:1.100
+          args: >-
+            --release --bin oxinfer --no-default-features --features media,hf,server
+            --config profile.release.debug=false --config profile.release.strip=true
+
+      - name: Stage archive contents
+        run: |
+          mkdir staging
+          bin=target/x86_64-unknown-linux-fullrust/release/oxinfer
+          file "$bin"
+          # Nothing dynamic: no interpreter, no needed libraries.
+          if readelf -l "$bin" | grep -q INTERP || readelf -d "$bin" | grep -q NEEDED; then
+            echo "::error::the fullrust binary is not static"
+            exit 1
+          fi
+          "$bin" --devices
+          cp "$bin" staging/
+          cp README.md LICENSE staging/
+
+      - name: Pack archive
+        id: pack
+        run: |
+          asset="oxinfer-${VERSION}-linux-x86_64-static.tar.gz"
+          tar -C staging -czf "${asset}" .
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release
+        if: inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${TAG}" "${{ steps.pack.outputs.asset }}" --clobber
+
+      - name: Keep as artifact (dry run)
+        if: inputs.tag == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.asset }}
+          path: ${{ steps.pack.outputs.asset }}
+          retention-days: 7
+
+  build-macos-universal:
+    name: build macos universal
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag != '' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+
+      - name: Verify the checkout is the release tag
+        if: inputs.tag != ''
+        run: |
+          got="$(git describe --tags --exact-match --match "$TAG")"
+          if [[ "$got" != "$TAG" ]]; then
+            echo "::error::checked out '$got', expected release tag '$TAG'"
+            exit 1
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-universal
+
+      - name: Build both Apple slices
+        run: |
+          for t in x86_64-apple-darwin aarch64-apple-darwin; do
+            cargo build --release --locked --bin oxinfer --target "$t" $PROFILE
+          done
+
+      - name: Lipo into a universal binary
+        run: |
+          mkdir staging
+          lipo -create -output staging/oxinfer \
+            target/x86_64-apple-darwin/release/oxinfer \
+            target/aarch64-apple-darwin/release/oxinfer
+          cp README.md LICENSE staging/
+          file staging/oxinfer
+          staging/oxinfer --devices
+
+      - name: Pack archive
+        id: pack
+        run: |
+          asset="oxinfer-${VERSION}-macos-universal.tar.gz"
+          tar -C staging -czf "${asset}" .
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload to release
+        if: inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${TAG}" "${{ steps.pack.outputs.asset }}" --clobber
+
+      - name: Keep as artifact (dry run)
+        if: inputs.tag == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pack.outputs.asset }}
+          path: ${{ steps.pack.outputs.asset }}
+          retention-days: 7
