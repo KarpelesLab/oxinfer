@@ -103,6 +103,7 @@ pub mod tokenizer;
 pub mod tools;
 pub mod torch;
 pub mod tts;
+pub mod unlimited_ocr;
 #[cfg(feature = "update")]
 pub mod update;
 pub mod vae_posterior;
