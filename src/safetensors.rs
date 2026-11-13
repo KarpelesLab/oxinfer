@@ -113,6 +113,16 @@ pub struct SafeTensors {
     mmap: Storage,
     tensors: HashMap<String, TensorInfo>,
     metadata: HashMap<String, String>,
+    /// Hadamard-folded tensors of a GGUF file (`prism.hadamard.*`), under their loader names.
+    folds: Option<Folds>,
+}
+
+/// The folded tensors of a file (see [`crate::hadamard`]) and which of them a loader has taken.
+struct Folds {
+    weights: HashMap<String, std::sync::Arc<crate::hadamard::Fold>>,
+    tables: HashMap<String, std::sync::Arc<crate::hadamard::Fold>>,
+    /// (name, as a table) of every fold handed to a loader.
+    claimed: Mutex<Vec<(String, bool)>>,
 }
 
 /// Reads a whole file into memory using parallel positional reads (sequential where the
@@ -235,6 +245,7 @@ impl SafeTensors {
                 mmap,
                 tensors,
                 metadata: HashMap::new(),
+                folds: None,
             });
         }
         let n = u64::from_le_bytes(mmap[..8].try_into().unwrap()) as usize;
@@ -278,10 +289,34 @@ impl SafeTensors {
             };
             tensors.insert(name, info);
         }
+        // Hadamard-folded weights, renamed like the tensors (the first file of a split model
+        // carries the metadata and, as llama.cpp's splitter orders them, the folded tensors' names).
+        let folds = match crate::hadamard::parse(&h).with_context(|| format!("{}", path.display()))? {
+            Some(spec) => {
+                let (arch, n_layers) = (h.arch(), h.n_layers());
+                let rename = |m: HashMap<String, std::sync::Arc<crate::hadamard::Fold>>| -> Result<HashMap<_, _>> {
+                    m.into_iter()
+                        .map(|(n, f)| {
+                            let t = h.tensors.iter().find(|t| t.name == n).unwrap();
+                            let (hf, _) = crate::gguf::hf_tensor(arch, t, n_layers)
+                                .with_context(|| format!("prism.hadamard weight {n} is not a tensor the loader reads"))?;
+                            Ok((hf, f))
+                        })
+                        .collect()
+                };
+                Some(Folds {
+                    weights: rename(spec.weights)?,
+                    tables: rename(spec.tables)?,
+                    claimed: Mutex::new(Vec::new()),
+                })
+            }
+            None => None,
+        };
         Ok(Self {
             mmap,
             tensors,
             metadata: crate::gguf::scalar_metadata(&h).into_iter().collect(),
+            folds,
         })
     }
 
@@ -329,7 +364,12 @@ impl SafeTensors {
         if metadata.get("format").map(String::as_str) == Some("mlx") {
             tensors = tensors.into_iter().map(|(k, v)| (mlx_canonical(&k), v)).collect();
         }
-        Ok(Self { mmap, tensors, metadata })
+        Ok(Self {
+            mmap,
+            tensors,
+            metadata,
+            folds: None,
+        })
     }
 
     pub fn info(&self, name: &str) -> Option<&TensorInfo> {
@@ -1150,6 +1190,38 @@ impl ModelFiles {
 
     pub fn metadata(&self, key: &str) -> Option<&str> {
         self.shards.iter().find_map(|s| s.metadata.get(key).map(|v| v.as_str()))
+    }
+
+    /// The input transform of matmul weight `name` when the checkpoint stores it Hadamard-folded
+    /// (see [`crate::hadamard`]), or with `table` the transform that reads rows of lookup table
+    /// `name` back. Taking it is recorded: see [`ModelFiles::unclaimed_folds`].
+    pub fn fold(&self, name: &str, table: bool) -> Option<std::sync::Arc<crate::hadamard::Fold>> {
+        let fs = self.shards.iter().find_map(|s| s.folds.as_ref())?;
+        let f = if table { &fs.tables } else { &fs.weights }.get(name)?.clone();
+        let mut c = fs.claimed.lock().unwrap();
+        if !c.iter().any(|(n, t)| n == name && *t == table) {
+            c.push((name.to_string(), table));
+        }
+        Some(f)
+    }
+
+    /// The folded tensors no loader asked the transform of: a model that reads them anyway
+    /// computes noise, so loaders of architectures that can be folded check this is empty.
+    pub fn unclaimed_folds(&self) -> Vec<String> {
+        let Some(fs) = self.shards.iter().find_map(|s| s.folds.as_ref()) else {
+            return Vec::new();
+        };
+        let c = fs.claimed.lock().unwrap();
+        let missing = |m: &HashMap<String, std::sync::Arc<crate::hadamard::Fold>>, table: bool| -> Vec<String> {
+            m.keys()
+                .filter(|n| !c.iter().any(|(x, t)| x == *n && *t == table))
+                .cloned()
+                .collect()
+        };
+        let mut v = missing(&fs.weights, false);
+        v.extend(missing(&fs.tables, true));
+        v.sort();
+        v
     }
 
     /// The pre-quantized form of matrix `name` (`[n_out, n_in]`, or a table of `n_out` rows), if

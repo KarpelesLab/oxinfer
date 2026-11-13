@@ -88,6 +88,8 @@ pub enum Table<'a> {
         parts: [crate::safetensors::TablePart<'a>; 3],
         q: crate::safetensors::MlxQuant,
     },
+    /// A table of Hadamard-latent rows (see [`crate::hadamard`]): each row read is transformed back.
+    Folded(Box<Table<'a>>, std::sync::Arc<crate::hadamard::Fold>),
 }
 
 impl<'a> Table<'a> {
@@ -119,6 +121,7 @@ impl<'a> Table<'a> {
             ],
             Table::Gguf(m) => vec![span(m.row(r))],
             Table::Host { .. } | Table::Mlx { .. } => Vec::new(),
+            Table::Folded(t, _) => t.row_ranges(r, cols),
         }
     }
 
@@ -133,6 +136,10 @@ impl<'a> Table<'a> {
             }
             Table::Q8(m) => crate::quant::dequantize_rows(m, r, r + 1, out),
             Table::Q4(m) => crate::quant::dequantize_rows_q4(m, r, r + 1, out),
+            Table::Folded(t, f) => {
+                t.row(r, out);
+                f.unfold(out);
+            }
             Table::Gguf(m) => m.dequantize_rows(r, r + 1, out),
             Table::Mlx { parts, q } => {
                 let (wb, gb) = (n * q.bits / 8, n / q.group * 2);
@@ -210,6 +217,7 @@ impl<'a> Table<'a> {
             Table::Q8(m) => m.bytes(),
             Table::Q4(m) => m.bytes(),
             Table::Gguf(m) => m.bytes(),
+            Table::Folded(t, _) => t.bytes(),
             Table::Host { .. } => 0,
             Table::Mlx { parts, .. } => parts
                 .iter()
@@ -224,6 +232,14 @@ impl<'a> Table<'a> {
     /// Loads table `full` (`[rows, cols]`): the pre-quantized form when the checkpoint has one,
     /// otherwise bf16, recording `store_as` for `--save-quantized`.
     pub fn load(files: &'a ModelFiles, full: &str, rows: usize, cols: usize, store_as: Quant) -> Result<Self> {
+        let t = Self::load_stored(files, full, rows, cols, store_as)?;
+        Ok(match files.fold(full, true) {
+            Some(f) => Table::Folded(Box::new(t), f),
+            None => t,
+        })
+    }
+
+    fn load_stored(files: &'a ModelFiles, full: &str, rows: usize, cols: usize, store_as: Quant) -> Result<Self> {
         files.note_use(full, false, true);
         if let Some(g) = files.ggml(full) {
             let (kind, bytes) = g?;
@@ -285,6 +301,12 @@ impl<'a> Table<'a> {
 /// A streamed linear weight `[n_out, n_in]` named `full`: pre-quantized from the checkpoint when
 /// present (zero-copy), otherwise bf16 quantized to `q` at load (and recorded for `--save-quantized`).
 pub fn load_lin<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usize, q: Quant) -> Result<Lin<'a>> {
+    let mut l = load_lin_stored(files, full, n_out, n_in, q)?;
+    l.fold = files.fold(full, false);
+    Ok(l)
+}
+
+fn load_lin_stored<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usize, q: Quant) -> Result<Lin<'a>> {
     files.note_use(full, true, false);
     // GGUF: used in its own format whatever `q` asks for.
     if let Some(g) = files.ggml(full) {
@@ -510,6 +532,9 @@ pub struct Lin<'a> {
     transient: std::sync::atomic::AtomicBool,
     /// A runtime LoRA update added to the output while its adapter is switched on.
     lora: Option<Box<crate::lora::LoraDelta>>,
+    /// The weight is stored Hadamard-folded: its input goes through this transform first (on the
+    /// CPU, in [`linear_multi`]; such a weight gets no device state).
+    pub(crate) fold: Option<std::sync::Arc<crate::hadamard::Fold>>,
 }
 
 pub enum Weight<'a> {
@@ -529,6 +554,7 @@ impl<'a> Lin<'a> {
             dev: std::sync::OnceLock::new(),
             transient: std::sync::atomic::AtomicBool::new(false),
             lora: None,
+            fold: None,
         }
     }
     /// bf16 weights converted or reordered at load time (e.g. from fp16 checkpoints).
@@ -538,6 +564,7 @@ impl<'a> Lin<'a> {
             dev: std::sync::OnceLock::new(),
             transient: std::sync::atomic::AtomicBool::new(false),
             lora: None,
+            fold: None,
         }
     }
     pub fn q8(m: QMatrix) -> Self {
@@ -546,6 +573,7 @@ impl<'a> Lin<'a> {
             dev: std::sync::OnceLock::new(),
             transient: std::sync::atomic::AtomicBool::new(false),
             lora: None,
+            fold: None,
         }
     }
     pub fn q4(m: Q4Matrix) -> Self {
@@ -554,6 +582,7 @@ impl<'a> Lin<'a> {
             dev: std::sync::OnceLock::new(),
             transient: std::sync::atomic::AtomicBool::new(false),
             lora: None,
+            fold: None,
         }
     }
     /// A GGUF weight (`GgufMatrix::borrowed` keeps it zero-copy over a mapped file).
@@ -563,6 +592,7 @@ impl<'a> Lin<'a> {
             dev: std::sync::OnceLock::new(),
             transient: std::sync::atomic::AtomicBool::new(false),
             lora: None,
+            fold: None,
         }
     }
     /// A GGUF tensor's raw bytes (`n_out` rows of `n_in` elements of `kind`), borrowed for 'a.
@@ -611,13 +641,16 @@ impl<'a> Lin<'a> {
     /// Device-side state for this layer on the active accelerator, whatever the op size (callers
     /// that bypass `Backend::wants`, such as convolutions, decide for themselves).
     pub(crate) fn device_weight(&self, n_out: usize, n_in: usize) -> Option<&crate::gpu::DeviceWeight> {
+        if self.fold.is_some() {
+            return None;
+        }
         let be = crate::gpu::active()?;
         self.dev.get_or_init(|| be.upload(&self.as_ref(), n_out, n_in)).as_ref()
     }
     /// Device-side state for this layer if the active accelerator wants the op at this size.
     fn device_state(&self, n_out: usize, n_in: usize, t: usize) -> Option<&crate::gpu::DeviceWeight> {
         let be = crate::gpu::active()?;
-        if !be.wants(n_out, n_in, t) {
+        if self.fold.is_some() || !be.wants(n_out, n_in, t) {
             return None;
         }
         self.dev.get_or_init(|| be.upload(&self.as_ref(), n_out, n_in)).as_ref()
@@ -629,6 +662,23 @@ impl<'a> Lin<'a> {
     }
     pub(crate) fn is_transient(&self) -> bool {
         self.transient.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    /// Rows `rows` of the matrix (`n_in` wide) as f32 into `out` (`[rows.len(), n_in]`); false,
+    /// with `out` untouched, for a Hadamard-folded weight (whose rows are in another basis).
+    pub fn rows(&self, rows: &[u32], n_in: usize, out: &mut [f32]) -> bool {
+        if self.fold.is_some() {
+            return false;
+        }
+        for (&r, o) in rows.iter().zip(out.chunks_exact_mut(n_in)) {
+            let r = r as usize;
+            match &self.w {
+                Weight::Bf16(w, _) => bf16_to_f32_slice(&w[r * n_in..(r + 1) * n_in], o),
+                Weight::Q8(m) => crate::quant::dequantize_rows(m, r, r + 1, o),
+                Weight::Q4(m) => crate::quant::dequantize_rows_q4(m, r, r + 1, o),
+                Weight::Gguf(m) => m.dequantize_rows(r, r + 1, o),
+            }
+        }
+        true
     }
     /// Attaches (or with None removes) a runtime LoRA update (see `crate::lora`).
     pub fn set_lora(&mut self, d: Option<Box<crate::lora::LoraDelta>>) {
@@ -650,10 +700,42 @@ pub(crate) fn linear_multi(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, 
     if jobs.is_empty() {
         return;
     }
-    linear_multi_base(jobs, n_in, x, t);
+    if jobs.iter().any(|(l, _, _)| l.fold.is_some()) {
+        linear_multi_folded(jobs, n_in, x, t);
+    } else {
+        linear_multi_base(jobs, n_in, x, t);
+    }
     for (l, _, y) in jobs.iter_mut() {
         if let Some(d) = l.active_lora() {
             d.apply(x, t, y);
+        }
+    }
+}
+
+/// [`linear_multi_base`] with Hadamard-folded weights among the jobs (see [`crate::hadamard`]):
+/// the jobs of each transform run on the CPU over the input transformed once; the others as usual.
+fn linear_multi_folded(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, x: &[f32], t: usize) {
+    let key = |l: &Lin| l.fold.as_ref().map(std::sync::Arc::as_ptr);
+    let mut keys: Vec<Option<*const crate::hadamard::Fold>> = Vec::new();
+    for (l, _, _) in jobs.iter() {
+        if !keys.contains(&key(l)) {
+            keys.push(key(l));
+        }
+    }
+    let mut xf = Vec::new();
+    for k in keys {
+        let mut sub: Vec<(&Lin, usize, &mut [f32])> = jobs
+            .iter_mut()
+            .filter(|(l, _, _)| key(l) == k)
+            .map(|(l, n, y)| (*l, *n, &mut **y))
+            .collect();
+        match sub[0].0.fold.clone() {
+            Some(f) => {
+                xf.resize(t * n_in, 0f32);
+                f.apply(&x[..t * n_in], n_in, &mut xf);
+                linear_multi_cpu(&mut sub, n_in, &xf, t);
+            }
+            None => linear_multi_base(&mut sub, n_in, x, t),
         }
     }
 }
@@ -666,7 +748,7 @@ fn linear_multi_base(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, x: &[f
     let owned: Vec<Option<crate::gpu::DeviceWeight>> = jobs
         .iter()
         .map(|(l, n, _)| match be {
-            Some(b) if l.is_transient() && b.wants(*n, n_in, t) => b.upload(&l.as_ref(), *n, n_in),
+            Some(b) if l.is_transient() && l.fold.is_none() && b.wants(*n, n_in, t) => b.upload(&l.as_ref(), *n, n_in),
             _ => None,
         })
         .collect();
@@ -724,7 +806,13 @@ pub(crate) fn linear_rows_device(jobs: &mut [(&Lin, Option<&Lin>, usize, &mut [f
     let owned: Vec<[Option<crate::gpu::DeviceWeight>; 2]> = jobs
         .iter()
         .map(|(l, u, n, _)| {
-            let own = |w: &Lin| if w.is_transient() { be.upload(&w.as_ref(), *n, n_in) } else { None };
+            let own = |w: &Lin| {
+                if w.is_transient() && w.fold.is_none() {
+                    be.upload(&w.as_ref(), *n, n_in)
+                } else {
+                    None
+                }
+            };
             [own(l), u.and_then(own)]
         })
         .collect();
@@ -824,6 +912,7 @@ fn linear_multi_cpu(jobs: &mut [(&Lin, usize, &mut [f32])], n_in: usize, x: &[f3
 /// Grouped matmuls on the CPU (see [`matmul_grouped`]): `ls[j]` over rows `segs[j]` of `x`.
 /// All weights must have the same shape and precision.
 pub(crate) fn linear_grouped(ls: &[&Lin], segs: &[(usize, usize)], n_out: usize, n_in: usize, x: &[f32], y: &mut [f32]) {
+    assert!(ls.iter().all(|l| l.fold.is_none()), "Hadamard-folded weights in a grouped matmul");
     match &ls[0].w {
         Weight::Bf16(..) => {
             let ws: Vec<&[u16]> = ls
@@ -874,7 +963,7 @@ pub(crate) fn linear_grouped(ls: &[&Lin], segs: &[(usize, usize)], n_out: usize,
 /// matmul: the caller adds the update of an active LoRA itself ([`Lin::active_lora`]), from the
 /// float inputs, after [`linear_batch_q`].
 pub(crate) fn cpu_decode_kernels(l: &Lin, n_out: usize, n_in: usize, t: usize) -> bool {
-    if t > decode_max_tokens() || crate::gpu::active().is_some_and(|b| b.wants(n_out, n_in, t)) {
+    if l.fold.is_some() || t > decode_max_tokens() || crate::gpu::active().is_some_and(|b| b.wants(n_out, n_in, t)) {
         return false;
     }
     match &l.w {

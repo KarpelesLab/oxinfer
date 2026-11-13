@@ -43,6 +43,7 @@ pub mod ggml;
 pub mod gguf;
 pub mod glm5;
 pub mod gpu;
+pub mod hadamard;
 #[cfg(feature = "hf")]
 pub mod hf;
 pub mod intervene;

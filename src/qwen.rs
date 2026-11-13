@@ -841,6 +841,15 @@ impl<'a> QwenModel<'a> {
                 }
             }
         }
+        // Hadamard-folded checkpoints: every folded tensor must have been loaded through a path
+        // that applies its transform (otherwise the model computes noise).
+        let unclaimed = files.unclaimed_folds();
+        if !unclaimed.is_empty() {
+            bail!(
+                "Hadamard-folded tensors this loader would read without their transform: {}",
+                unclaimed.join(", ")
+            );
+        }
         Ok(Self {
             cfg,
             quant,
@@ -1121,7 +1130,7 @@ impl<'a> QwenModel<'a> {
         let qw = if gated { 2 * nh * hd } else { nh * hd };
         // Streamed weights (layers outside the resident set) are wrapped by the plan per step.
         let dev = |l: &'s Lin, n_out: usize, n_in: usize| -> Option<&crate::gpu::DeviceWeight> {
-            if l.has_lora() {
+            if l.has_lora() || l.fold.is_some() {
                 return None;
             }
             if l.is_transient() {
@@ -2430,7 +2439,8 @@ impl crate::dspark::Target for QwenModel<'_> {
         self.logits(hidden, t)
     }
     fn lm_head(&self) -> Option<&Lin<'_>> {
-        Some(&self.lm_head)
+        // A folded head only runs through `linear` (which transforms its input).
+        self.lm_head.fold.is_none().then_some(&self.lm_head)
     }
     fn vocab_size(&self) -> usize {
         self.cfg.vocab_size
