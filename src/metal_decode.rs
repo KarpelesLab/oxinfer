@@ -1285,8 +1285,9 @@ enum MOp {
 /// The routed experts of a prefill plan's MoE layer (`MOp::PfExperts`): grouped GEMM pipelines,
 /// the experts' address tables (data, scales), GGUF row bytes, and the activations.
 struct PfExperts {
-    pipes: (Id, Id),
-    up: Option<(Id, u32)>,
+    /// Grouped GEMM pipelines (tiles of 32, 128 and 16 rows, see `super::group_tiles`).
+    pipes: ([Id; 3], [Id; 3]),
+    up: Option<([Id; 3], u32)>,
     tabs: [Id; 3],
     row_bytes: (u32, u32),
     x: usize,
@@ -2066,17 +2067,11 @@ impl MetalBackend {
                         _ => 0,
                     };
                     let g_rows = if fused { 2 * ex.inter } else { ex.inter };
-                    let pg = self
-                        .mma_pipe(&ex.gate[0], affine(&ex.gate[0]), g_rows, ex.h, super::Tile::Grouped)?
-                        .0;
-                    let pd = self
-                        .mma_pipe(&ex.down[0], affine(&ex.down[0]), ex.h, ex.inter, super::Tile::Grouped)?
-                        .0;
+                    let pg3 = self.grouped_pipes(&ex.gate[0], affine(&ex.gate[0]), g_rows, ex.h)?;
+                    let pd3 = self.grouped_pipes(&ex.down[0], affine(&ex.down[0]), ex.h, ex.inter)?;
+                    let (pg, pd) = (pg3[0], pd3[0]);
                     let up = match &ex.up {
-                        Some(u) => Some((
-                            self.mma_pipe(&u[0], affine(&u[0]), ex.inter, ex.h, super::Tile::Grouped)?.0,
-                            row_bytes(&u[0]),
-                        )),
+                        Some(u) => Some((self.grouped_pipes(&u[0], affine(&u[0]), ex.inter, ex.h)?, row_bytes(&u[0]))),
                         None => None,
                     };
                     // One pipeline per projection: every expert's format must match the first's.
@@ -2091,7 +2086,7 @@ impl MetalBackend {
                     }
                     if let (Some(u), Some((pu, _))) = (&ex.up, up)
                         && u.iter()
-                            .any(|w| self.mma_pipe(w, affine(w), ex.inter, ex.h, super::Tile::Grouped).map(|x| x.0) != Some(pu))
+                            .any(|w| self.mma_pipe(w, affine(w), ex.inter, ex.h, super::Tile::Grouped).map(|x| x.0) != Some(pu[0]))
                     {
                         return None;
                     }
@@ -2100,7 +2095,7 @@ impl MetalBackend {
                     }
                     emit.push(MOp::PfExperts(pf_experts.len()));
                     pf_experts.push(PfExperts {
-                        pipes: (pg, pd),
+                        pipes: (pg3, pd3),
                         up,
                         tabs: t16,
                         row_bytes: (row_bytes(&ex.gate[0]), row_bytes(&ex.down[0])),
@@ -2859,18 +2854,17 @@ impl MetalBackend {
             for x in &pf_experts {
                 (h, mi, k, ne) = (h.max(x.h), mi.max(x.inter), k.max(x.k), ne.max(x.n_exp));
             }
-            let gtm = super::MMA_GTM;
-            let max_rows = tokens * k + ne.min(tokens * k) * (gtm - 1);
-            let max_tiles = max_rows / gtm + 1;
+            let max_rows = tokens * k + ne.min(tokens * k) * 15;
+            let max_tiles = max_rows / 16 + 1;
             let sizes = [
                 max_rows * 4,
                 max_tiles * 16,
                 tokens * k.max(1) * 8,
                 max_rows * h * 2,
-                (max_rows + gtm) * 4,
+                (max_rows + 128) * 4,
                 max_rows * 2 * mi * 4,
                 max_rows * mi * 2,
-                (max_rows + gtm) * 4,
+                (max_rows + 128) * 4,
                 max_rows * h * 4,
             ];
             let mut st = [0usize; 9];
@@ -3695,11 +3689,11 @@ impl MetalPlan<'_> {
 impl MetalPlan<'_> {
     /// Prefill plans: the routing of `t` tokens for `x`'s layer, read back from the arena, as
     /// grouped GEMM work in the staging buffer (as `Backend::moe`): each expert's rows gathered
-    /// one segment after another, padded to whole tiles. Returns (rows, tiles).
-    fn pf_route(&self, pf: &PfState, x: &PfExperts, t: usize) -> Option<(usize, usize)> {
+    /// one segment after another, padded to whole tiles (`super::group_tiles`). Returns the rows
+    /// and the tiles of each size.
+    fn pf_route(&self, pf: &PfState, x: &PfExperts, t: usize) -> Option<(usize, [usize; 3])> {
         let base = self.f.contents(self.arena);
         let k = x.k;
-        let gtm = super::MMA_GTM;
         let mut ids = vec![0u32; t * k];
         let mut wts = vec![0f32; t * k];
         for j in 0..t {
@@ -3714,17 +3708,20 @@ impl MetalPlan<'_> {
         for &e in &ids {
             *count.get_mut(e as usize)? += 1;
         }
-        let mut start = vec![0usize; x.n_exp];
-        let mut tiles: Vec<[u32; 4]> = Vec::new();
-        let mut rows = 0usize;
-        for (e, &c) in count.iter().enumerate() {
-            start[e] = rows;
-            let len = c.next_multiple_of(gtm);
-            for t0 in (0..len).step_by(gtm) {
-                tiles.push([e as u32, rows as u32, len as u32, t0 as u32]);
-            }
-            rows += len;
+        if let Some(p) = std::env::var_os("OXINFER_PF_ROUTES") {
+            // Rows per expert of each layer (u32 tokens, then n_exp counts) for moe_bench.
+            use std::io::Write;
+            let rec: Vec<u8> = std::iter::once(t)
+                .chain(count.iter().copied())
+                .flat_map(|v| (v as u32).to_le_bytes())
+                .collect();
+            let _ = std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(p)
+                .and_then(|mut f| f.write_all(&rec));
         }
+        let (tiles, ntiles, mut start, rows) = super::group_tiles(&count);
         if rows > pf.max_rows || tiles.len() > pf.max_tiles {
             return None;
         }
@@ -3745,7 +3742,7 @@ impl MetalPlan<'_> {
             }
             std::ptr::copy_nonoverlapping(tiles.as_ptr(), sb.add(pf.st[1]) as *mut [u32; 4], tiles.len());
         }
-        Some((rows, tiles.len()))
+        Some((rows, ntiles))
     }
 
     /// Encodes one op of a prefill plan for `t` tokens at `pos` (`run`: the routing of the MoE
@@ -3761,7 +3758,7 @@ impl MetalPlan<'_> {
         stb: &[(Id, usize)],
         pos: usize,
         t: usize,
-        run: &std::cell::Cell<(usize, usize)>,
+        run: &std::cell::Cell<(usize, [usize; 3])>,
     ) {
         let pf = self.pf.as_ref().unwrap();
         let m = self.be.mma.as_ref().unwrap();
@@ -3908,15 +3905,22 @@ impl MetalPlan<'_> {
                     rows: er as u32,
                     _p: [0; 3],
                 };
-                let grouped = |pipe: Id, ep: Id, xh: usize, out: usize, rs: usize, p: &super::MmaParams| {
-                    e.pipe(pipe);
-                    e.buf(ep, 0, 0);
-                    e.buf(sb, st(1), 1);
-                    e.buf(sb, xh, 2);
-                    e.buf(sb, out, 3);
-                    e.bytes(p, 4);
-                    e.buf(sb, rs, 5);
-                    e.dispatch((p.n_out as usize / 64, nt), 128);
+                // One grid per tile size (disjoint rows: no barrier between them).
+                let grouped = |pipes: [Id; 3], ep: Id, xh: usize, out: usize, rs: usize, p: &super::MmaParams| {
+                    let mut first = 0;
+                    for (pipe, n) in [pipes[1], pipes[0], pipes[2]].into_iter().zip(nt) {
+                        if n > 0 {
+                            e.pipe(pipe);
+                            e.buf(ep, 0, 0);
+                            e.buf(sb, st(1) + first * 16, 1);
+                            e.buf(sb, xh, 2);
+                            e.buf(sb, out, 3);
+                            e.bytes(p, 4);
+                            e.buf(sb, rs, 5);
+                            e.dispatch((p.n_out as usize / 64, n), 128);
+                        }
+                        first += n;
+                    }
                 };
                 match x.up {
                     Some((pu, rb)) => {
@@ -4694,7 +4698,7 @@ impl DecodePlan for MetalPlan<'_> {
         parts.push(from..end);
         let indirect = if self.be.residency.is_some() { &[][..] } else { &self.indirect[..] };
         // Prefill plans: the routing of the MoE layer being encoded.
-        let pf_run = std::cell::Cell::new((0usize, 0usize));
+        let pf_run = std::cell::Cell::new((0usize, [0usize; 3]));
         // Encodes the ops of `range`, those listed in `bound` replaced (streamed weights bound to
         // this step's wraps).
         let encode = |e: &FastEnc, range: std::ops::Range<usize>, bound: &[(usize, MOp)]| {

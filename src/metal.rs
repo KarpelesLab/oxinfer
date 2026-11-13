@@ -546,15 +546,31 @@ inline void scale_min_k4(uint j, device const uchar* s, thread float& sc, thread
     if (j < 4) { sc = float(s[j] & 63); mn = float(s[j + 4] & 63); }
     else { sc = float((s[j + 4] & 15) | ((s[j - 4] >> 6) << 4)); mn = float((s[j + 4] >> 4) | ((s[j] >> 6) << 4)); }
 }
+// Q4_K and Q5_1 blocks are read as words (GGUF tensors are 8-byte aligned, and so are these
+// blocks within them; same values as reading bytes): the byte reads were a large part of the
+// matrix-unit GEMMs' time.
+inline uint byte_of(uint w, uint i) { return (w >> (8 * i)) & 255u; }
 struct Q4_KW { GgW g; };
 inline void load(Q4_KW w, uint row, uint b, thread float4* out) {
-    device const uchar* B = sblk(w.g, row, b, 144);
+    device const uint* B = (device const uint*)sblk(w.g, row, b, 144);
     uint j = b % 8;
-    float sc, mn; scale_min_k4(j, B + 4, sc, mn);
-    float d1 = h2f(B) * sc, m1 = h2f(B + 2) * mn;
-    device const uchar* q = B + 16 + 32 * (j / 2);
-    uchar sh = uchar(4 * (j % 2));
-    for (uint i = 0; i < 8; i++) out[i] = f4((ld4(q + 4 * i) >> sh) & uchar(15)) * d1 - m1;
+    half2 dm = as_type<half2>(B[0]);
+    uint s0 = B[1], s1 = B[2], s2 = B[3]; // scale_min_k4's 12 bytes
+    float sc, mn;
+    if (j < 4) { sc = float(byte_of(s0, j) & 63); mn = float(byte_of(s1, j) & 63); }
+    else {
+        uint a = byte_of(s2, j - 4);
+        sc = float((a & 15) | ((byte_of(s0, j - 4) >> 6) << 4));
+        mn = float((a >> 4) | ((byte_of(s1, j - 4) >> 6) << 4));
+    }
+    float d1 = float(dm.x) * sc, m1 = float(dm.y) * mn;
+    device const uint2* q = (device const uint2*)(B + 4 + 8 * (j / 2));
+    uint sh = 4 * (j % 2);
+    for (uint i = 0; i < 4; i++) {
+        uint2 u = q[i];
+        out[2 * i] = f4(as_type<uchar4>((u.x >> sh) & 0x0F0F0F0Fu)) * d1 - m1;
+        out[2 * i + 1] = f4(as_type<uchar4>((u.y >> sh) & 0x0F0F0F0Fu)) * d1 - m1;
+    }
 }
 struct Q5_KW { GgW g; };
 inline void load(Q5_KW w, uint row, uint b, thread float4* out) {
@@ -732,8 +748,22 @@ struct Q4_1W { GgW g; };
 inline void load(Q4_1W w, uint row, uint b, thread float4* out) { load_q45(w.g.q + (ulong)row * w.g.rb + b * 20, true, false, out); }
 struct Q5_0W { GgW g; };
 inline void load(Q5_0W w, uint row, uint b, thread float4* out) { load_q45(w.g.q + (ulong)row * w.g.rb + b * 22, false, true, out); }
+// Bits 0..3 of x moved to bit 4 of bytes 0..3.
+inline uint spread4(uint x) { return ((x & 1u) | ((x & 2u) << 7) | ((x & 4u) << 14) | ((x & 8u) << 21)) << 4; }
 struct Q5_1W { GgW g; };
-inline void load(Q5_1W w, uint row, uint b, thread float4* out) { load_q45(w.g.q + (ulong)row * w.g.rb + b * 24, true, true, out); }
+inline void load(Q5_1W w, uint row, uint b, thread float4* out) {
+    device const uint* B = (device const uint*)(w.g.q + (ulong)row * w.g.rb + b * 24);
+    half2 dm = as_type<half2>(B[0]);
+    float d = float(dm.x), m = float(dm.y);
+    uint qh = B[1];
+    for (uint i = 0; i < 4; i++) {
+        uint v = B[2 + i], e = 4 * i;
+        float4 lo = f4(as_type<uchar4>((v & 0x0F0F0F0Fu) | spread4((qh >> e) & 15u)));
+        float4 hi = f4(as_type<uchar4>(((v >> 4) & 0x0F0F0F0Fu) | spread4((qh >> (e + 16)) & 15u)));
+        out[i] = (lo - 0.f) * d + m;
+        out[i + 4] = (hi - 0.f) * d + m;
+    }
+}
 struct F16W { GgW g; };
 inline void load(F16W w, uint row, uint b, thread float4* out) {
     device const packed_half4* p = (device const packed_half4*)(w.g.q + (ulong)row * w.g.rb + b * 64);
@@ -860,16 +890,23 @@ MMA_SIG(NAME) { threadgroup half Ws[64 * MKB]; \
     WT w = MAKE; mma_tile<WT, 128>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, tg.y * 128, tid, Ws, p._p0); } \
 MMA_SIG(NAME##_s) { threadgroup half Ws[64 * MKB]; \
     WT w = MAKE; mma_tile<WT, 32>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, tg.y * 32, tid, Ws, p._p0); }
-// Grouped: per-expert weight addresses, and one tile per threadgroup row.
+// Grouped: per-expert weight addresses, and one tile per threadgroup row. Each format comes with
+// tiles of GTM rows (NAME), 128 rows (NAME_l: the bulk of an expert's rows when it has many, the
+// weights dequantized once for 4x the rows) and 16 rows (NAME_s: an odd remainder, half the
+// padding); a layer's tiles are dispatched one grid per size (see `group_tiles`).
 struct EP { device const uchar* q; device const uchar* s; };
 struct GT { uint e; uint r0; uint rows; uint t0; };
-#define MMAG(NAME, WT, MAKE) \
+#define MMAG_SIG(NAME) \
 kernel void NAME(device const EP* ep [[buffer(0)]], device const GT* tiles [[buffer(1)]], device const half* xh [[buffer(2)]], \
                  device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], \
-                 uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { \
-    threadgroup half Ws[64 * MKB]; \
-    GT g = tiles[tg.y]; device const void* qb = ep[g.e].q; device const void* sb = ep[g.e].s; \
-    WT w = MAKE; mma_tile<WT, GTM>(w, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out, p.n_out, p.n_in, g.rows, tg.x * 64, g.t0, tid, Ws); }
+                 uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
+#define MMAG_PRE threadgroup half Ws[64 * MKB]; \
+    GT g = tiles[tg.y]; device const void* qb = ep[g.e].q; device const void* sb = ep[g.e].s;
+#define MMAG_ARGS w, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out, p.n_out, p.n_in, g.rows, tg.x * 64, g.t0, tid, Ws
+#define MMAG(NAME, WT, MAKE) \
+MMAG_SIG(NAME) { MMAG_PRE WT w = MAKE; mma_tile<WT, GTM>(MMAG_ARGS); } \
+MMAG_SIG(NAME##_l) { MMAG_PRE WT w = MAKE; mma_tile<WT, 128>(MMAG_ARGS); } \
+MMAG_SIG(NAME##_s) { MMAG_PRE WT w = MAKE; mma_tile<WT, 16>(MMAG_ARGS); }
 MMAD(mma_q8, Q8W, MK_Q8) MMAD(mma_q4, Q4W, MK_Q4)
 MMAG(mmag_q8, Q8W, MK_Q8) MMAG(mmag_q4, Q4W, MK_Q4)
 MMAD(mma_F8_E4M3, F8W, MK_F8) MMAG(mmag_F8_E4M3, F8W, MK_F8)
@@ -887,12 +924,14 @@ kernel void NAME(device const ushort* qb [[buffer(0)]], device const half* xh [[
                  constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]]) { \
     mma_bf_tile<TM, TN>((device const bfloat*)(qb + p.w_off), xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * TN, tg.y * TM, p._p0); }
 MMA_BF(mma_bf64, 64, 128) MMA_BF(mma_bf128, 128, 128) MMA_BF(mma_bf64_s, 64, 32) MMA_BF(mma_bf128_s, 128, 32)
-kernel void mmag_bf(device const EP* ep [[buffer(0)]], device const GT* tiles [[buffer(1)]], device const half* xh [[buffer(2)]],
-                    device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]],
-                    uint2 tg [[threadgroup_position_in_grid]]) {
-    GT g = tiles[tg.y];
-    mma_bf_tile<GTM, 64>((device const bfloat*)ep[g.e].q, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out,
+#define MMAG_BF(NAME, TM) \
+kernel void NAME(device const EP* ep [[buffer(0)]], device const GT* tiles [[buffer(1)]], device const half* xh [[buffer(2)]], \
+                 device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], \
+                 uint2 tg [[threadgroup_position_in_grid]]) { \
+    GT g = tiles[tg.y]; \
+    mma_bf_tile<TM, 64>((device const bfloat*)ep[g.e].q, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out, \
                         p.n_out, p.n_in, g.rows, tg.x * 64, g.t0); }
+MMAG_BF(mmag_bf, GTM) MMAG_BF(mmag_bf_l, 128) MMAG_BF(mmag_bf_s, 16)
 #define GGM(T) MMAD(mma_##T, T##W, MK_GG(T##W)) MMAG(mmag_##T, T##W, MK_GG(T##W))
 GGM(F16) GGM(Q4_1) GGM(Q5_0) GGM(Q5_1)
 GGM(Q4_0) GGM(IQ4_NL) GGM(Q8_0) GGM(Q4_K) GGM(Q5_K) GGM(Q6_K) GGM(Q3_K) GGM(Q2_K) GGM(IQ4_XS)
@@ -1114,6 +1153,38 @@ const GGUF_MMA_TYPES: [GgmlType; 22] = [
     GgmlType::IQ1_S,
     GgmlType::IQ1_M,
 ];
+
+/// The grouped GEMM tiles of a MoE layer with `count[e]` rows for expert e: the gathered input
+/// holds one segment per expert, padded to a multiple of 16 rows, cut into tiles of 128 rows while
+/// that many remain, then of `MMA_GTM` (32), then one of 16 for an odd remainder. Returns the
+/// tiles ([expert, segment start, segment length, tile start]) listed by size (128, 32, 16: one
+/// grid each), how many of each, every segment's start and the rows in all. A layer of t tokens
+/// with k experts each has at most `t k + 15 n_exp` rows and a tile per 16 rows.
+pub(crate) fn group_tiles(count: &[usize]) -> (Vec<[u32; 4]>, [usize; 3], Vec<usize>, usize) {
+    let mut cls: [Vec<[u32; 4]>; 3] = Default::default();
+    let mut start = Vec::with_capacity(count.len());
+    let mut rows = 0usize;
+    for (e, &c) in count.iter().enumerate() {
+        start.push(rows);
+        let len = c.next_multiple_of(16);
+        let tile = |t0: usize| [e as u32, rows as u32, len as u32, t0 as u32];
+        let mut t0 = 0;
+        while t0 + 128 <= len {
+            cls[0].push(tile(t0));
+            t0 += 128;
+        }
+        while t0 + MMA_GTM <= len {
+            cls[1].push(tile(t0));
+            t0 += MMA_GTM;
+        }
+        if t0 < len {
+            cls[2].push(tile(t0));
+        }
+        rows += len;
+    }
+    let n = [cls[0].len(), cls[1].len(), cls[2].len()];
+    (cls.concat(), n, start, rows)
+}
 
 /// Whether the device kernels take `m`: anything but FP8, or FP8 with the 128 x 128 block scales
 /// the shaders assume.
@@ -1350,8 +1421,9 @@ impl Residency {
 
 /// Device state of an MoE layer's routed experts (`Backend::upload_moe`).
 struct MoeDev {
-    /// Grouped GEMM pipelines for the gate/up and the down projections.
-    pipes: (Id, Id),
+    /// Grouped GEMM pipelines (tiles of 32, 128 and 16 rows) for the gate/up and the down
+    /// projections.
+    pipes: ([Id; 3], [Id; 3]),
     /// GGUF row bytes of each (the `s_off` parameter), 0 for other formats.
     row_bytes: (u32, u32),
     /// The wrapped weight memory (adjacent experts share a buffer).
@@ -1360,7 +1432,7 @@ struct MoeDev {
     ep: (Id, Id),
     /// Separate up projections (GGUF): their pipeline, row bytes and address table; `pipes.0`
     /// and `ep.0` are then the gate projections alone.
-    up: Option<(Id, u32, Id)>,
+    up: Option<([Id; 3], u32, Id)>,
     n_exp: usize,
     /// The experts' activation.
     act: crate::gpu::MoeAct,
@@ -2247,6 +2319,23 @@ impl MetalBackend {
         })
     }
 
+    /// The grouped (MoE) pipelines of a weight for tiles of `MMA_GTM`, 128 and 16 rows (see
+    /// [`group_tiles`]); the latter two are built on first use.
+    fn grouped_pipes(&self, w: &WeightRef, affine: bool, n_out: usize, n_in: usize) -> Option<[Id; 3]> {
+        let p = self.mma_pipe(w, affine, n_out, n_in, Tile::Grouped)?.0;
+        let base = match w {
+            WeightRef::Bf16(_) => "mmag_bf".to_string(),
+            WeightRef::Q8(_) => "mmag_q8".to_string(),
+            WeightRef::Q4(_) => "mmag_q4".to_string(),
+            WeightRef::Gguf(g) => format!("mmag_{}", g.kind.name()),
+        };
+        Some([
+            p,
+            self.named_pipeline(&format!("{base}_l"))?,
+            self.named_pipeline(&format!("{base}_s"))?,
+        ])
+    }
+
     /// Encodes the conversion of `rows` rows of `n` floats (row r taken from row `src[r]` if
     /// `src` is given) to scaled half rows plus their inverse scales.
     #[allow(clippy::too_many_arguments)]
@@ -2396,12 +2485,13 @@ impl MetalBackend {
         let affine = |w: &WeightRef| matches!(w, WeightRef::Q4(m) if m.offsets.is_some());
         // Rows of the first projection: fused gate and up, or the gate alone.
         let g_rows = if up.is_some() { mi } else { 2 * mi };
-        let (pg, _) = self.mma_pipe(&gate_up[0], affine(&gate_up[0]), g_rows, h, Tile::Grouped)?;
-        let pu = match up {
-            Some(u) => Some(self.mma_pipe(&u[0], affine(&u[0]), mi, h, Tile::Grouped)?.0),
+        let pg3 = self.grouped_pipes(&gate_up[0], affine(&gate_up[0]), g_rows, h)?;
+        let pu3 = match up {
+            Some(u) => Some(self.grouped_pipes(&u[0], affine(&u[0]), mi, h)?),
             None => None,
         };
-        let (pd, _) = self.mma_pipe(&down[0], affine(&down[0]), h, mi, Tile::Grouped)?;
+        let pd3 = self.grouped_pipes(&down[0], affine(&down[0]), h, mi)?;
+        let (pg, pu, pd) = (pg3[0], pu3.map(|p| p[0]), pd3[0]);
         // GGUF row lengths (FP8: 0, its MK_F8 reads the scales at the expert's own address).
         let row_bytes = |w: &WeightRef| match w {
             WeightRef::Gguf(g) if g.block_scales.is_none() => g.row_bytes(),
@@ -2445,7 +2535,7 @@ impl MetalBackend {
         }
         let release: (MsgVoid, Sel) = (self.o.msg_send(), self.sels.release);
         let mut dev = MoeDev {
-            pipes: (pg, pd),
+            pipes: (pg3, pd3),
             row_bytes: (row_bytes(&gate_up[0]) as u32, row_bytes(&down[0]) as u32),
             bufs: Vec::with_capacity(spans.len()),
             ep: (std::ptr::null_mut(), std::ptr::null_mut()),
@@ -2488,7 +2578,7 @@ impl MetalBackend {
                 return None;
             }
         }
-        if let (Some(u), Some(pu)) = (up, pu) {
+        if let (Some(u), Some(pu)) = (up, pu3) {
             let tab = table(u);
             let id = unsafe {
                 copy(
@@ -3064,8 +3154,8 @@ impl Backend for MetalBackend {
             return false;
         }
         // Rows per expert, in expert order: the gathered input is one segment per expert, padded
-        // to whole tiles of MMA_GTM rows (partial tiles take a slower path in the tensor ops;
-        // padding rows come from a zero row after the input and are never read back).
+        // to whole tiles (partial tiles take a slower path in the tensor ops; padding rows come
+        // from a zero row after the input and are never read back).
         let mut count: Vec<usize> = Vec::new();
         for &(e, _) in routes.iter().flatten() {
             if e >= md.n_exp {
@@ -3076,17 +3166,7 @@ impl Backend for MetalBackend {
             }
             count[e] += 1;
         }
-        let mut start = vec![0usize; count.len()];
-        let mut tiles: Vec<[u32; 4]> = Vec::new();
-        let mut rows = 0usize;
-        for (e, &c) in count.iter().enumerate() {
-            start[e] = rows;
-            let len = c.next_multiple_of(MMA_GTM);
-            for t0 in (0..len).step_by(MMA_GTM) {
-                tiles.push([e as u32, rows as u32, len as u32, t0 as u32]);
-            }
-            rows += len;
-        }
+        let (tiles, ntiles, mut start, rows) = group_tiles(&count);
         // Gathered row sources, and each token's (row, weight) slots for the combination.
         let mut src = vec![t as u32; rows];
         let mut slots = vec![[0u32; 2]; t * k];
@@ -3100,7 +3180,7 @@ impl Backend for MetalBackend {
         }
         let mut st = self.staging.lock().unwrap();
         let st = &mut *st;
-        let pad = rows + MMA_GTM;
+        let pad = rows + 128;
         let ok = self.ensure_staging(st, (t + 1) * h * 4, t * h * 4)
             && self.grow(&mut st.xh, rows * h * 2)
             && self.grow(&mut st.rs, pad * 4)
@@ -3139,15 +3219,22 @@ impl Backend for MetalBackend {
         let encode = |e: &Enc, _: &()| {
             e.use_resources(&resident);
             self.encode_x_half(e, st.x, st.xh.id, st.rs.id, h, rows, Some(st.m_src.id));
-            let grouped = |pipe: Id, ep: Id, xh: Id, out: (Id, usize), rs: Id, p: &MmaParams| {
-                e.pipe(pipe);
-                e.buf(ep, 0, 0);
-                e.buf(st.m_tiles.id, 0, 1);
-                e.buf(xh, 0, 2);
-                e.buf(out.0, out.1, 3);
-                e.bytes(p, 4);
-                e.buf(rs, 0, 5);
-                e.dispatch((p.n_out as usize / 64, tiles.len()), 128);
+            // One grid per tile size (disjoint rows: no barrier between them).
+            let grouped = |pipes: [Id; 3], ep: Id, xh: Id, out: (Id, usize), rs: Id, p: &MmaParams| {
+                let mut first = 0;
+                for (pipe, n) in [pipes[1], pipes[0], pipes[2]].into_iter().zip(ntiles) {
+                    if n > 0 {
+                        e.pipe(pipe);
+                        e.buf(ep, 0, 0);
+                        e.buf(st.m_tiles.id, first * 16, 1);
+                        e.buf(xh, 0, 2);
+                        e.buf(out.0, out.1, 3);
+                        e.bytes(p, 4);
+                        e.buf(rs, 0, 5);
+                        e.dispatch((p.n_out as usize / 64, n), 128);
+                    }
+                    first += n;
+                }
             };
             match md.up {
                 // Gate rows [rows, mi], then up rows [rows, mi].
@@ -3408,6 +3495,9 @@ mod tests {
 
     /// Timing of `Backend::moe` at Qwen3.8-Flash-Next's shapes (512 experts, Q4_K gate / up,
     /// Q5_1 down, top 10): `cargo test --release --lib moe_bench -- --ignored --nocapture`.
+    /// Routes are uniform at random, or with `OXINFER_MOE_ROUTES=FILE` the median layer of each
+    /// size recorded by a prefill-plan run with `OXINFER_PF_ROUTES=FILE` (real routing is far from
+    /// uniform: at 2048 tokens the busiest expert takes about half of them).
     #[test]
     #[ignore]
     fn moe_bench() {
@@ -3452,9 +3542,24 @@ mod tests {
         let uw: Vec<WeightRef> = um.iter().map(WeightRef::Gguf).collect();
         let dw: Vec<WeightRef> = dm.iter().map(WeightRef::Gguf).collect();
         let dev = be.upload_moe(&gw, Some(&uw), &dw, h, mi, crate::gpu::MoeAct::Silu).unwrap();
-        for t in [512usize, 1024, 2048, 4096] {
+        // Recorded layers: (tokens, rows per expert).
+        let recorded: Option<Vec<(usize, Vec<usize>)>> = std::env::var_os("OXINFER_MOE_ROUTES").map(|p| {
+            let b = std::fs::read(p).unwrap();
+            let w: Vec<usize> = b.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c) as usize).collect();
+            w.chunks_exact(ne + 1).map(|r| (r[0], r[1..].to_vec())).collect()
+        });
+        let sizes: Vec<usize> = match &recorded {
+            Some(r) => {
+                let mut v: Vec<usize> = r.iter().map(|l| l.0).collect();
+                v.sort_unstable();
+                v.dedup();
+                v
+            }
+            None => vec![512, 1024, 2048, 4096],
+        };
+        for t in sizes {
             let x = input(t, h, &mut seed);
-            let routes: Vec<Vec<(usize, f32)>> = (0..t)
+            let mut routes: Vec<Vec<(usize, f32)>> = (0..t)
                 .map(|_| {
                     let mut v: Vec<usize> = Vec::new();
                     while v.len() < k {
@@ -3466,16 +3571,31 @@ mod tests {
                     v.into_iter().map(|e| (e, 0.1)).collect()
                 })
                 .collect();
+            if let Some(r) = &recorded {
+                // The median layer of this size; a token's experts are consecutive slots of a
+                // cursor running over the experts' rows (distinct, k per token).
+                let layers: Vec<&Vec<usize>> = r.iter().filter(|l| l.0 == t).map(|l| &l.1).collect();
+                let mut by_max = layers.clone();
+                by_max.sort_by_key(|c| c.iter().max().copied());
+                routes = vec![Vec::new(); t];
+                let mut cur = 0;
+                for (e, &c) in by_max[by_max.len() / 2].iter().enumerate() {
+                    for _ in 0..c {
+                        routes[cur % t].push((e, 0.1));
+                        cur += 1;
+                    }
+                }
+            }
             let mut y = vec![0f32; t * h];
             assert!(be.moe(&x, t, h, mi, &routes, &dev, &mut y));
-            let n = 5;
-            let t0 = Instant::now();
+            let n = 10;
+            let g0 = be.stats.gpu_ns.load(Ordering::Relaxed);
             for _ in 0..n {
                 assert!(be.moe(&x, t, h, mi, &routes, &dev, &mut y));
             }
-            let dt = t0.elapsed().as_secs_f64() / n as f64;
+            let dt = (be.stats.gpu_ns.load(Ordering::Relaxed) - g0) as f64 / 1e9 / n as f64;
             let flops = 2.0 * (t * k) as f64 * (3 * h * mi) as f64;
-            eprintln!("moe t={t}: {:.2} ms, {:.1} TFLOP/s useful", dt * 1e3, flops / dt / 1e12);
+            eprintln!("moe t={t}: {:.2} ms GPU, {:.1} TFLOP/s useful", dt * 1e3, flops / dt / 1e12);
         }
     }
 
