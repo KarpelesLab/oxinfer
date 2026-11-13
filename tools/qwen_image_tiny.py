@@ -29,13 +29,26 @@ usage:
       DUMP/ref_*.npy and compares with oxinfer's dumps when they are there. So: run it, then
         OXINFER_QI_DUMP=DUMP oxinfer --model MODEL ... (the same settings)
       then run it again (or with --compare-only).
+  qwen_image_tiny.py make21 SRC OUT [--seed S]
+      Qwen-Image-2.1: SRC holds the real repo's small files (processor/, scheduler/,
+      text_encoder/config.json, model_index.json). Writes OUT/base and OUT/turbo
+      (QwenImage21Pipeline), OUT/gguf (the transformer as GGUF files, and what they decode to)
+      and OUT/lora (a LoRA and the transformer with it merged). Needs a diffusers with the 2.1
+      pipeline (0.44.0.dev0, from source) and the `gguf` package.
+  qwen_image_tiny.py ref21 MODEL DUMP --prompt P [--size WxH] [--steps N] [--negative N --cfg F]
+      [--transformer DIR | --transformer-gguf FILE] [--lora FILE --lora-scale F] [--bf16]
+      [--low-mem] [--no-kv-cache] [--seed S]
+      The reference text-to-image run of a Qwen-Image-2.1 folder, used like `ref` (without
+      --steps: the pipeline's own schedule, the saved sigmas of a Turbo checkpoint). On real
+      weights: --transformer-gguf runs the weights a GGUF file decodes to (what oxinfer computes
+      with from that file), --low-mem keeps one of text encoder and transformer in memory.
 """
 import argparse, functools, json, math, os, shutil, sys
 import numpy as np
 import torch
 
 ap = argparse.ArgumentParser()
-ap.add_argument("cmd", choices=["make", "ref"])
+ap.add_argument("cmd", choices=["make", "ref", "make21", "ref21"])
 ap.add_argument("a")
 ap.add_argument("b")
 ap.add_argument("--seed", type=int, default=0)
@@ -44,7 +57,7 @@ ap.add_argument("--prompt", default="a red fox on a bench")
 ap.add_argument("--negative")
 ap.add_argument("--cfg", type=float, default=1.0)
 ap.add_argument("--size")
-ap.add_argument("--steps", type=int, default=4)
+ap.add_argument("--steps", type=int)
 ap.add_argument("--image")
 ap.add_argument("--mask")
 ap.add_argument("--strength", type=float)
@@ -59,7 +72,15 @@ ap.add_argument("--no-cfg-normalize", action="store_true")
 ap.add_argument("--transformer")
 ap.add_argument("--compare-only", action="store_true")
 ap.add_argument("--own-embeds", action="store_true", help="do not hand oxinfer the reference's prompt embeddings")
+ap.add_argument("--lora", help="ref21: a LoRA file")
+ap.add_argument("--lora-scale", type=float, default=1.0)
+ap.add_argument("--bf16", action="store_true", help="ref21: run in bfloat16 (real checkpoints)")
+ap.add_argument("--no-kv-cache", action="store_true", help="ref21: use_kv_cache=False")
+ap.add_argument("--transformer-gguf", help="ref21: the transformer from a GGUF file, dequantized")
+ap.add_argument("--low-mem", action="store_true", help="ref21: drop the text encoder before loading the transformer")
 a = ap.parse_args()
+a.steps_given = a.steps is not None
+a.steps = a.steps if a.steps_given else 4
 torch.set_grad_enabled(False)
 
 
@@ -377,7 +398,261 @@ def ref(M, D):
         print(f"image: PSNR {10 * np.log10(255 ** 2 / max(mse, 1e-12)):.2f} dB, max pixel difference {int(np.abs(o8 - u8).max())}")
 
 
+def make21(src, out, seed):
+    """Tiny Qwen-Image-2.1 pipelines: OUT/base (the scheduler of Qwen-Image-2.1: dynamic shift,
+    terminal stretch) and OUT/turbo (Qwen-Image-2.1-Turbo: saved `sample_sigmas`, no shift), with
+    the same weights; the transformer again as GGUF files (OUT/gguf/tiny-21-comfy.gguf: ComfyUI's
+    `model.diffusion_model.` names without metadata, Q8_0 blocks; OUT/gguf/tiny-21.gguf: plain
+    names, `general.architecture = qwen_image21`, Q4_0 / Q8_0 blocks) and the weights those
+    decode to as diffusers folders (OUT/gguf/comfy, OUT/gguf/plain); a rank-4 LoRA
+    (OUT/lora/tiny_lora.safetensors, diffusers keys with alphas) and the transformer with it
+    merged at strength 0.7 (OUT/lora/merged)."""
+    import gguf
+    from diffusers import (AutoencoderKLQwenImage21, FlowMatchEulerDiscreteScheduler, QwenImage21Pipeline,
+                           QwenImage21Transformer2DModel)
+    from safetensors.torch import save_file
+    from transformers import Qwen3VLConfig, Qwen3VLForConditionalGeneration, Qwen3VLProcessor
+
+    torch.manual_seed(seed)
+    g = torch.Generator().manual_seed(seed + 1)
+    H, Z = 64, 8  # text hidden size = context_in_dim; latent channels
+
+    def bf16(*models):
+        for m in models:
+            for p in m.parameters():
+                p.copy_(p.to(torch.bfloat16).float())
+        return models[0]
+
+    def randomize(m, std=0.5):
+        """Every weight random (diffusers leaves norm scales at their init), norms near their init."""
+        for n, p in m.named_parameters():
+            if p.ndim > 1:
+                p.copy_(torch.randn(p.shape, generator=g) * (std / math.sqrt(p[0].numel())))
+            else:
+                p.add_(torch.randn(p.shape, generator=g) * 0.1)
+
+    rc = json.load(open(os.path.join(src, "text_encoder", "config.json")))
+    text = dict(rc["text_config"])
+    text.update(hidden_size=H, intermediate_size=128, num_attention_heads=4, num_key_value_heads=2, head_dim=16,
+                num_hidden_layers=3, rope_scaling={"mrope_interleaved": True, "mrope_section": [2, 3, 3], "rope_type": "default"})
+    vision = dict(rc["vision_config"])
+    vision.update(depth=4, hidden_size=32, intermediate_size=64, num_heads=2, out_hidden_size=H,
+                  deepstack_visual_indexes=[1, 2, 3])
+    top = {k: v for k, v in rc.items() if k.endswith("_token_id")}
+    te = Qwen3VLForConditionalGeneration(Qwen3VLConfig(text_config=text, vision_config=vision, **top)).float().eval()
+    randomize(te)
+    bf16(te)
+    proc = Qwen3VLProcessor.from_pretrained(os.path.join(src, "processor"))
+
+    tkw = dict(patch_size=1, in_channels=Z, out_channels=Z, num_layers=3, attention_head_dim=32, num_attention_heads=2,
+               context_in_dim=H, mlp_ratio=3, axes_dims_rope=(8, 12, 12))
+    tr = QwenImage21Transformer2DModel(**tkw).float().eval()
+    randomize(tr)
+    bf16(tr)
+    mean = [round(float(v), 4) for v in torch.randn(Z, generator=g) * 0.3]
+    std = [round(float(v), 4) for v in 1.0 + torch.rand(Z, generator=g)]
+    vae = AutoencoderKLQwenImage21(base_dim=8, decoder_base_dim=12, z_dim=Z, dim_mult=[1, 2, 4, 8, 8], num_res_blocks=1,
+                                   latents_mean=mean, latents_std=std).float().eval()
+    randomize(vae, std=1.0)
+    bf16(vae)
+    sc = json.load(open(os.path.join(src, "scheduler", "scheduler_config.json")))
+    base = dict(sc, use_dynamic_shifting=True, shift_terminal=0.02)
+    turbo = dict(sc, use_dynamic_shifting=False, shift_terminal=None)
+    sig = json.load(open(os.path.join(src, "model_index.json"))).get("sample_sigmas") or \
+        [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]
+    for name, cfg, ss in (("base", base, None), ("turbo", turbo, sig)):
+        QwenImage21Pipeline(scheduler=FlowMatchEulerDiscreteScheduler.from_config(cfg), vae=vae, text_encoder=te,
+                            processor=proc, transformer=tr, sample_sigmas=ss).save_pretrained(os.path.join(out, name))
+
+    # GGUF files of the transformer, and what they decode to.
+    gdir = os.path.join(out, "gguf")
+    os.makedirs(gdir, exist_ok=True)
+    sd = {k: v.float() for k, v in tr.state_dict().items()}
+    Q = gguf.GGMLQuantizationType
+    for fname, folder, prefix, arch, pick in (
+        ("tiny-21-comfy.gguf", "comfy", "model.diffusion_model.", None, lambda k: Q.Q8_0),
+        ("tiny-21.gguf", "plain", "", "qwen_image21", lambda k: Q.Q4_0 if "img_mlp" in k else Q.Q8_0),
+    ):
+        w = gguf.GGUFWriter(os.path.join(gdir, fname), arch or "x")
+        if arch is None:
+            w.kv_data = [{}]  # ComfyUI conversions of this model carry no metadata at all
+        dec = {}
+        for k, v in sd.items():
+            x = v.numpy()
+            if v.ndim == 2 and k.startswith("transformer_blocks.") and v.shape[1] % 32 == 0:
+                t = pick(k)
+                q = gguf.quants.quantize(x, t)
+                dec[k] = torch.from_numpy(gguf.quants.dequantize(q, t).copy()).float()
+                w.add_tensor(prefix + k, q, raw_dtype=t)
+            elif v.ndim == 1:
+                dec[k] = v
+                w.add_tensor(prefix + k, x.astype(np.float32))
+            else:
+                dec[k] = v
+                w.add_tensor(prefix + k, gguf.quants.quantize(x, Q.BF16), raw_dtype=Q.BF16)
+        w.write_header_to_file()
+        w.write_kv_data_to_file()
+        w.write_tensors_to_file()
+        w.close()
+        m = QwenImage21Transformer2DModel(**tkw).float().eval()
+        m.load_state_dict(dec)
+        m.save_pretrained(os.path.join(gdir, folder))
+
+    # A LoRA on the blocks' linear layers (diffusers keys, alpha 2 for rank 4), and its merge.
+    ldir = os.path.join(out, "lora")
+    os.makedirs(ldir, exist_ok=True)
+    lora, merged, r, alpha, strength = {}, dict(sd), 4, 2.0, 0.7
+    for k, v in sd.items():
+        if v.ndim == 2 and k.startswith("transformer_blocks."):
+            mod = k[: -len(".weight")]
+            A = (torch.randn(r, v.shape[1], generator=g) * 0.3).to(torch.bfloat16)
+            B = (torch.randn(v.shape[0], r, generator=g) * 0.3).to(torch.bfloat16)
+            lora[f"transformer.{mod}.lora_A.weight"] = A
+            lora[f"transformer.{mod}.lora_B.weight"] = B
+            lora[f"transformer.{mod}.alpha"] = torch.tensor(alpha)
+            merged[k] = v + strength * alpha / r * (B.float() @ A.float())
+    save_file(lora, os.path.join(ldir, "tiny_lora.safetensors"))
+    m = QwenImage21Transformer2DModel(**tkw).float().eval()
+    m.load_state_dict(merged)
+    m.save_pretrained(os.path.join(ldir, "merged"))
+    print("wrote", out)
+
+
+def ref21(M, D):
+    """The reference run of a Qwen-Image-2.1 folder (text to image; `--transformer DIR` swaps the
+    transformer, `--bf16` runs a real checkpoint in bfloat16 instead of float32)."""
+    from diffusers import QwenImage21Pipeline, QwenImage21Transformer2DModel
+    from PIL import Image
+
+    os.makedirs(D, exist_ok=True)
+    names = ["prompt_embeds", "x0", "v0", "latents_out", "image"]
+    if a.compare_only:
+        for n in names:
+            f = os.path.join(D, f"ref_{n}.npy")
+            if os.path.exists(f):
+                report(D, n, f"{n}.bin", np.load(f))
+        psnr21(D)
+        return
+    dt = torch.bfloat16 if a.bf16 else torch.float32
+    kw, pre = {}, None
+    if a.low_mem:
+        # Real checkpoints: the text encoder alone first, dropped before the transformer loads.
+        import gc
+        enc = QwenImage21Pipeline.from_pretrained(M, torch_dtype=dt, transformer=None, vae=None)
+        pre = [enc.encode_prompt(a.prompt)[0]]
+        if a.negative is not None and a.cfg > 1:
+            pre.append(enc.encode_prompt(a.negative)[0])
+        del enc
+        gc.collect()
+        kw["text_encoder"] = None
+    if a.transformer:
+        kw["transformer"] = QwenImage21Transformer2DModel.from_pretrained(a.transformer, torch_dtype=dt)
+    if a.transformer_gguf:
+        # The weights a GGUF file decodes to (the dequantization of gguf-py), as the transformer.
+        import gguf
+        tr = QwenImage21Transformer2DModel.from_config(QwenImage21Transformer2DModel.load_config(M, subfolder="transformer"))
+        sd = {}
+        for t in gguf.GGUFReader(a.transformer_gguf).tensors:
+            name = t.name.removeprefix("model.diffusion_model.")
+            x = gguf.quants.dequantize(t.data, t.tensor_type).reshape([int(d) for d in reversed(t.shape)])
+            sd[name] = torch.from_numpy(np.ascontiguousarray(x)).to(dt)
+        tr.load_state_dict(sd)
+        kw["transformer"] = tr.to(dt).eval()
+        del sd
+    pipe = QwenImage21Pipeline.from_pretrained(M, torch_dtype=dt, **kw)
+    pipe.set_progress_bar_config(disable=True)
+    if a.lora:
+        # diffusers 0.44.0.dev0 prefixes `transformer.` twice when a file in diffusers keys also
+        # carries `.alpha` tensors: fold alpha / rank into the up matrices and drop them.
+        from safetensors.torch import load_file
+        sd = load_file(a.lora)
+        al = {k[: -len(".alpha")]: float(v) for k, v in sd.items() if k.endswith(".alpha")}
+        fold = {}
+        for k, v in sd.items():
+            m = k[: -len(".lora_B.weight")]
+            if k.endswith(".lora_B.weight") and m in al:
+                v = v.float() * (al[m] / sd[m + ".lora_A.weight"].shape[0])
+            if not k.endswith(".alpha"):
+                fold[k] = v
+        pipe.load_lora_weights(fold, adapter_name="l")
+        pipe.set_adapters(["l"], adapter_weights=[a.lora_scale])
+    w, h = map(int, (a.size or "1024x1024").lower().split("x"))
+    w, h = w // 32 * 32, h // 32 * 32
+    lh, lw = h // 16, w // 16
+    z = pipe.transformer.config.in_channels
+    noise = torch.randn((1, 1, z, lh, lw), generator=torch.Generator().manual_seed(a.seed), dtype=torch.float32)
+    wbin(D, "noise.bin", noise)
+    cap = {}
+
+    def hook(m, args, kws, out):
+        cap.setdefault("v0", out[0][0][-lh * lw:])
+        cap.setdefault("x0", kws["hidden_states"][0][-lh * lw:])
+
+    pipe.transformer.register_forward_hook(hook, with_kwargs=True)
+    emb = []
+    enc = pipe.encode_prompt
+
+    def encode_prompt(*args, **kws):
+        r = enc(*args, **kws)
+        emb.append(r[0][0])
+        return r
+
+    pipe.encode_prompt = encode_prompt
+    call = dict(prompt=a.prompt, width=w, height=h, true_cfg_scale=a.cfg, output_type="latent",
+                latents=pipe._pack_latents(noise.to(dt), 1, z, lh, lw), use_kv_cache=not a.no_kv_cache)
+    if pre is not None:
+        call.update(prompt=None, prompt_embeds=pre[0])
+        emb.extend(e[0] for e in pre)
+        if len(pre) > 1:
+            call.update(negative_prompt_embeds=pre[1])
+    if a.steps_given:
+        call["num_inference_steps"] = a.steps
+        if pipe.config.sample_sigmas is not None and len(pipe.config.sample_sigmas) != a.steps:
+            call["sigmas"] = np.linspace(1.0, 1 / a.steps, a.steps)
+    if a.negative is not None and pre is None:
+        call["negative_prompt"] = a.negative
+    lat = pipe(**call).images
+    out = {"prompt_embeds": emb[0], "latents_out": lat[0], "x0": cap["x0"]}
+    if a.cfg <= 1 or a.negative is None:
+        out["v0"] = cap["v0"]
+    if not a.own_embeds:
+        wbin(D, "prompt_embeds_in.bin", emb[0])
+        if len(emb) > 1:
+            wbin(D, "negative_embeds_in.bin", emb[1])
+    vae = pipe.vae
+    mean = torch.tensor(vae.config.latents_mean).view(1, z, 1, 1, 1)
+    std = torch.tensor(vae.config.latents_std).view(1, z, 1, 1, 1)
+    zl = pipe._unpack_latents(lat.float(), h, w, 16) * std + mean
+    px = vae.decode(zl.to(vae.dtype), return_dict=False)[0][:, :, 0][0].permute(1, 2, 0).float()
+    out["image"] = px
+    u8 = np.round(np.clip(px.numpy() * 0.5 + 0.5, 0, 1) * 255).astype(np.uint8)
+    Image.fromarray(u8, "RGBA").save(os.path.join(D, "ref_image.png"))
+    print(f"2.1 t2i: {w}x{h}, {len(pipe.scheduler.timesteps)} steps, sigmas {[round(float(s), 6) for s in pipe.scheduler.sigmas]}")
+    for n in names:
+        if n in out:
+            v = out[n].float().numpy()
+            np.save(os.path.join(D, f"ref_{n}.npy"), v)
+            report(D, n, f"{n}.bin", v)
+    psnr21(D)
+
+
+def psnr21(D):
+    o, r = os.path.join(D, "image.bin"), os.path.join(D, "ref_image.npy")
+    if os.path.exists(o) and os.path.exists(r):
+        to8 = lambda x: np.round(np.clip(x * 0.5 + 0.5, 0, 1) * 255)
+        r8 = to8(np.load(r).astype(np.float64))
+        o8 = to8(np.fromfile(o, dtype="<f4").astype(np.float64).reshape(r8.shape))
+        for name, sl in (("RGBA", slice(0, 4)), ("RGB", slice(0, 3))):
+            mse = np.mean((o8[..., sl] - r8[..., sl]) ** 2)
+            print(f"image {name}: PSNR {10 * np.log10(255 ** 2 / max(mse, 1e-12)):.2f} dB, "
+                  f"max pixel difference {int(np.abs(o8[..., sl] - r8[..., sl]).max())}")
+
+
 if a.cmd == "make":
     make(a.a, a.b, a.seed)
+elif a.cmd == "make21":
+    make21(a.a, a.b, a.seed)
+elif a.cmd == "ref21":
+    ref21(a.a, a.b)
 else:
     ref(a.a, a.b)
