@@ -7,7 +7,9 @@
 //! named), backreferences (`\1`, `\k<name>`, relative `\k<-1>`), conditionals (`(?(1)a|b)`), `\K`,
 //! `\G`, the `\A \z \Z \b \B \< \> \b{start}..` assertions, inline flags `i m s x U` (scoped
 //! `(?i:..)` or to the end of the pattern `(?i)`) and comments. Matching is leftmost-first
-//! backtracking on an explicit stack (no recursion), with fancy-regex's backtrack limit.
+//! backtracking on an explicit stack (no recursion), with fancy-regex's backtrack limit. One
+//! place follows Oniguruma (which the Python tokenizers library uses) where fancy-regex differs:
+//! `+` after an interval repeats it (`\d{3}+` is `(?:\d{3})+`, not a possessive `\d{3}`).
 //!
 //! Character classes, `\d \s \w`, `\p{..}` properties (general categories, scripts, script
 //! extensions, binary properties, ...) and case-insensitive literals are compiled by
@@ -386,7 +388,20 @@ impl Parser<'_> {
         };
         if self.byte(ix) == Some(b'+') {
             ix += 1;
-            node = Expr::Atomic(Box::new(node));
+            // `a++`, `a*+`, `a?+` are possessive. After an interval, `+` repeats it (`\d{3}+` is
+            // `(?:\d{3})+`): Oniguruma's Ruby syntax, which the tokenizers library of Python
+            // runs its patterns with (fancy-regex reads a possessive interval there), and what
+            // tokenizer files are written against (ERNIE 5.5 groups digits with `\p{Nd}{3}+\z`).
+            node = if b == b'{' {
+                Expr::Repeat {
+                    child: Box::new(node),
+                    lo: 1,
+                    hi: usize::MAX,
+                    greedy: true,
+                }
+            } else {
+                Expr::Atomic(Box::new(node))
+            };
         }
         Ok((ix, node))
     }
@@ -1883,6 +1898,11 @@ mod tests {
         assert_eq!(all(r"(?<=a\d*)x", "a123x bx"), ["x"]);
         assert_eq!(all(r"(?>a+)b", "aaab"), ["aaab"]);
         assert_eq!(all(r"a++a", "aaaa"), Vec::<String>::new());
+        // `+` after an interval repeats it (Oniguruma's Ruby syntax): digits in groups of three
+        // from the right, as ERNIE 5.5's tokenizer splits them.
+        assert_eq!(all(r"\A\d{1,2}(?=\d{3}+\z)", "1234567"), ["1"]);
+        assert_eq!(all(r"\A\d{1,2}(?=\d{3}+\z)", "123456"), Vec::<String>::new());
+        assert_eq!(all(r"a{2}+", "aaaaa"), ["aaaa"]);
         assert_eq!(all(r"(\w)\1", "abccdd"), ["cc", "dd"]);
         assert_eq!(all(r"(?<q>['x])\w+\k<q>", "'ab' xcdx"), ["'ab'", "xcdx"]);
         assert_eq!(all(r"(a)?(?(1)b|c)", "ab c"), ["ab", "c"]);
