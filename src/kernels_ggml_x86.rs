@@ -54,6 +54,55 @@ unsafe fn lookup(table: &[i8; 16], idx: __m256i) -> __m256i {
     _mm256_shuffle_epi8(_mm256_set_m128i(t, t), idx)
 }
 
+/// The 32 two-bit fields of the 8 bytes at `p` in order (field `j % 4` of byte `j / 4`), minus 1:
+/// the codes of Q2_0 / PQ2_0.
+#[inline(always)]
+unsafe fn fields2(p: *const u8) -> __m256i {
+    let x = _mm_loadl_epi64(p as *const __m128i);
+    let m = _mm_set1_epi8(3);
+    // Field k of every byte (the 16-bit shifts leak the neighbour's bits above the mask only).
+    let t0 = _mm_and_si128(x, m);
+    let t1 = _mm_and_si128(_mm_srli_epi16::<2>(x), m);
+    let t2 = _mm_and_si128(_mm_srli_epi16::<4>(x), m);
+    let t3 = _mm_and_si128(_mm_srli_epi16::<6>(x), m);
+    let (lo, hi) = (_mm_unpacklo_epi8(t0, t1), _mm_unpacklo_epi8(t2, t3));
+    let v = _mm256_set_m128i(_mm_unpackhi_epi16(lo, hi), _mm_unpacklo_epi16(lo, hi));
+    _mm256_sub_epi8(v, _mm256_set1_epi8(1))
+}
+
+/// One run of `c` (a multiple of 8) base-3 bytes at `src` into `5 * c` trits at `dst`, digit
+/// `n` of byte `m` at `n * c + m`: `((b * 3^n mod 256) * 3 >> 8) - 1`, as ggml computes it.
+#[inline(always)]
+unsafe fn trit_run(src: *const u8, c: usize, dst: *mut i8) {
+    const POW3: [i16; 5] = [1, 3, 9, 27, 81];
+    for m0 in (0..c).step_by(8) {
+        let x = _mm_cvtepu8_epi16(_mm_loadl_epi64(src.add(m0) as *const __m128i));
+        for (n, &pw) in POW3.iter().enumerate() {
+            let q = _mm_and_si128(_mm_mullo_epi16(x, _mm_set1_epi16(pw)), _mm_set1_epi16(0xFF));
+            let t = _mm_srli_epi16::<8>(_mm_mullo_epi16(q, _mm_set1_epi16(3)));
+            let t = _mm_sub_epi8(_mm_packus_epi16(t, t), _mm_set1_epi8(1));
+            _mm_storel_epi64(dst.add(n * c + m0) as *mut __m128i, t);
+        }
+    }
+}
+
+/// The trits of a TQ1_0 / PTQ1_0 block: its base-3 bytes in `runs`, then four trits per byte
+/// of `qh` (digit-major like the runs), see `super::low_bit_i8`.
+#[inline(always)]
+unsafe fn trits(qs: *const u8, runs: [usize; 2], qh: &[u8], q: *mut i8) {
+    let (mut at, mut o) = (0, 0);
+    for c in runs {
+        trit_run(qs.add(at), c, q.add(o));
+        at += c;
+        o += 5 * c;
+    }
+    for n in 0..4 {
+        for (h, &v) in qh.iter().enumerate() {
+            *q.add(o + n * qh.len() + h) = super::TRITS[v as usize][n];
+        }
+    }
+}
+
 #[inline(always)]
 unsafe fn st(q: *mut i8, at: usize, v: __m256i) {
     _mm256_storeu_si256(q.add(at) as *mut __m256i, v)
@@ -220,6 +269,52 @@ unsafe fn unpack(kind: GgmlType, b: &[u8], q: &mut [i8; QK_K], s: &mut [f32; 16]
             }
             false
         }
+        Q1_0 => {
+            debug_assert!(b.len() >= 18);
+            for i in 0..4 {
+                // 16 where the bit is set: +1, else -1.
+                let v = _mm256_srli_epi16::<3>(high_bits(u32at(b, 2 + 4 * i)));
+                st(q, 32 * i, _mm256_sub_epi8(v, _mm256_set1_epi8(1)));
+            }
+            s[..8].fill(f16at(b, 0));
+            false
+        }
+        Q2_0 | PQ2_0 => {
+            let n = kind.block_size() / 32;
+            debug_assert!(b.len() >= 2 + 8 * n);
+            for i in 0..n {
+                st(q, 32 * i, fields2(p.add(2 + 8 * i)));
+            }
+            s[..2 * n].fill(f16at(b, 0));
+            false
+        }
+        TQ2_0 => {
+            debug_assert!(b.len() >= 66);
+            for run in 0..2 {
+                let v = _mm256_loadu_si256(p.add(32 * run) as *const __m256i);
+                for l in 0..4 {
+                    st(
+                        q,
+                        128 * run + 32 * l,
+                        _mm256_sub_epi8(shr_and(v, 2 * l as i32, 3), _mm256_set1_epi8(1)),
+                    );
+                }
+            }
+            s.fill(f16at(b, 64));
+            false
+        }
+        TQ1_0 => {
+            debug_assert!(b.len() >= 54);
+            trits(p, [32, 16], &b[48..52], q);
+            s.fill(f16at(b, 52));
+            false
+        }
+        PTQ1_0 => {
+            debug_assert!(b.len() >= 28);
+            trits(p, [16, 8], &b[24..26], q);
+            s[..8].fill(f16at(b, 26));
+            false
+        }
         _ => {
             let bs = kind.block_size();
             decode_i8(
@@ -334,7 +429,10 @@ unsafe fn st16(o: *mut f32, q: *const i8, s: __m256) {
 /// Whether [`dequant_row`] handles `kind`.
 fn dequant_kind(kind: GgmlType) -> bool {
     use GgmlType::*;
-    matches!(kind, Q4_0 | Q5_0 | Q8_0 | IQ4_NL | MXFP4 | Q3_K | Q4_K | Q5_K | Q6_K | IQ4_XS)
+    matches!(
+        kind,
+        Q4_0 | Q5_0 | Q8_0 | IQ4_NL | MXFP4 | Q3_K | Q4_K | Q5_K | Q6_K | IQ4_XS | Q1_0 | Q2_0 | PQ2_0 | TQ1_0 | TQ2_0 | PTQ1_0
+    )
 }
 
 /// Dequantizes one row of `n` elements into `out`, bit-identical to `dequantize_row`; false if
