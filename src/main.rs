@@ -118,6 +118,10 @@ struct Args {
     qwen_image: qwen_image_cli::Flags,
     device: platform::DevicePref,
     devices: bool,
+    /// `--models`: what runs on this machine (`--all`: every variant; `--kind K`).
+    models: bool,
+    models_all: bool,
+    models_kind: Option<oxinfer::advisor::Kind>,
     embed: bool,
     prompt_name: Option<String>,
     similarity: bool,
@@ -381,6 +385,11 @@ fn usage() -> ! {
          \x20 --image FILE         with --prompt: answer a question about the image (repeatable)\n\
          \x20 --chat               a conversation: more questions from standard input, one per line\n\
          \x20 --devices            list detected CPU features and GPUs, then exit\n\
+         \x20 --models             list the tested models with what this machine can run: download size against\n\
+         \x20                      the free disk space, memory against RAM and GPU memory, where each decodes\n\
+         \x20                      and an estimated tokens/s (CPU kernels are timed for about a second);\n\
+         \x20                      --all lists every precision, --kind chat|embedding|image|speech|tts and\n\
+         \x20                      --model TEXT filter, --device cpu ignores the GPU, --json prints JSON\n\
          \x20 --device D           auto (default) | cpu | cuda | metal | vulkan\n\
          \x20 --gpu-decode M       on (default) | off: generate a whole token per GPU submission\n\
          \x20                      (Metal; Llama 3, Orpheus, Qwen3, Qwen3.5 / 3.8 dense)\n\
@@ -547,6 +556,9 @@ fn parse_args() -> Result<Args> {
         image_guidance: None,
         device: platform::DevicePref::Auto,
         devices: false,
+        models: false,
+        models_all: false,
+        models_kind: None,
         embed: false,
         prompt_name: None,
         similarity: false,
@@ -742,6 +754,13 @@ fn parse_args() -> Result<Args> {
                 a.mmap = true;
             }
             "--devices" => a.devices = true,
+            "--models" => a.models = true,
+            "--all" => a.models_all = true,
+            "--kind" => {
+                let v = val()?;
+                a.models_kind =
+                    Some(oxinfer::advisor::Kind::parse(&v).with_context(|| format!("unknown kind {v} (chat|embedding|image|speech|tts)"))?);
+            }
             "--output" | "-o" => a.output = Some(PathBuf::from(val()?)),
             "--steps" => a.steps = Some(val()?.parse()?),
             "--guidance" | "--cfg" => a.guidance = Some(val()?.parse()?),
@@ -855,7 +874,7 @@ fn parse_args() -> Result<Args> {
             }
         }
     }
-    if a.model.as_os_str().is_empty() && !a.devices {
+    if a.model.as_os_str().is_empty() && !a.devices && !a.models {
         usage();
     }
     Ok(a)
@@ -1052,6 +1071,23 @@ fn report(prefill_tokens: usize, prefill_secs: f64, decode_tokens: usize, decode
     );
 }
 
+/// `--models`: the catalog of tested models against this machine.
+fn run_models(args: &Args) -> Result<()> {
+    pool::init(args.threads.unwrap_or_else(default_threads));
+    let hw = oxinfer::advisor::Hardware::detect(args.device, args.cache_dir.as_deref());
+    let filter = args.model.to_string_lossy().to_lowercase();
+    let rows: Vec<_> = oxinfer::advisor::survey(&hw)
+        .into_iter()
+        .filter(|r| args.models_kind.is_none_or(|k| r.model.kind == k) && r.model.repo.to_lowercase().contains(&filter))
+        .collect();
+    if args.format.as_deref() == Some("json") {
+        println!("{}", serde_json::to_string_pretty(&oxinfer::advisor::to_json(&hw, &rows))?);
+    } else {
+        print!("{}", oxinfer::advisor::render(&hw, &rows, args.models_all));
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     #[cfg(feature = "server")]
     if std::env::args().nth(1).as_deref() == Some("serve") {
@@ -1062,6 +1098,9 @@ fn main() -> Result<()> {
     if args.devices {
         print!("{}", platform::detect().report());
         return Ok(());
+    }
+    if args.models {
+        return run_models(&args);
     }
     // Resolve repo ids to cached local directories.
     let spec = args.model.to_string_lossy().to_string();

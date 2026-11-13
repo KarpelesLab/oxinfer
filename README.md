@@ -4646,6 +4646,7 @@ Useful flags:
 | `--mmap` | map weights from disk instead of copying them into RAM |
 | `--save-quantized DIR` | write a pre-quantized, text-only checkpoint at `--quant` precision (see below) and exit |
 | `--devices` | list detected CPU features and GPUs (Metal, CUDA, Vulkan) and exit |
+| `--models` | list the tested models with what this machine can run and an estimated decoding speed (see [What runs on this machine](#what-runs-on-this-machine)) and exit |
 | `--device D` | `auto` (default: the first GPU backend that starts, Metal or CUDA before Vulkan, else the CPU), `cpu`, `metal`, `cuda`, `vulkan`; a device asked for by name that is missing or cannot start is an error, not a fallback |
 | `--gpu-decode on\|off` | generate a whole token per GPU submission (default `on` where supported; see [Decoding on the GPU](#decoding-on-the-gpu)); engine / speaker option `gpu_decode` |
 | `--prefill-chunk N` | tokens per prefill chunk (default 256 on the CPU, 1024 when a GPU backend is active) |
@@ -4656,6 +4657,93 @@ Useful flags:
 By default the whole safetensors file is read into RAM at startup (a few seconds), which
 gives steady decode speed from the first token. `--mmap` starts faster but pays page
 faults on the first pass.
+
+### What runs on this machine
+
+```sh
+./target/release/oxinfer --models                 # the tested models, one line each
+./target/release/oxinfer --models --all --kind chat   # every precision of the chat models
+./target/release/oxinfer --models --model gemma --json  # filtered by name, as JSON
+./target/release/oxinfer --models --device cpu     # as if there were no GPU
+```
+
+`--models` checks the models of the table above against the machine and exits: the download
+against the free space of the cache directory (`on disk` when the repo is already there, `N GB
+short` when it does not fit), the memory each precision needs against the RAM and the GPU's
+memory, where it would decode, and an estimated decoding speed. On a Threadripper 9970X with an
+RTX 5080 (16 GB), 134 GB of RAM:
+
+```
+CHAT                                                    DISK     MEMORY  RUNS ON                       DECODE
+Qwen/Qwen3.5-0.8B                          bf16         on disk  1.7 GB  GPU                           ~312 tok/s
+bartowski/Llama-3.2-1B-Instruct-GGUF:Q8_0  GGUF Q8_0    on disk  1.3 GB  CPU                           ~39 tok/s
+google/gemma-4-E4B-it                      --quant q8   16 GB    12 GB   GPU                           ~104 tok/s
+Qwen/Qwen3.5-9B                            --quant q8   on disk  12 GB   GPU                           ~71 tok/s
+mlx-community/gemma-4-26b-a4b-it-4bit      MLX 4-bit    on disk  15 GB   CPU                           ~16 tok/s
+Qwen/Qwen3.8-27B                           --quant q4   56 GB    19 GB   CPU                           ~4.6 tok/s
+unsloth/DeepSeek-V4-Flash-GGUF:UD-Q2_K_XL  GGUF ...     97 GB    97 GB   storage (over 60% of memory)  storage-bound
+```
+
+One line per model shows the precision to pick: the most precise one that decodes in memory at
+10 tokens/s or more, else the fastest in memory, else the smallest; `--all` lists `bf16`,
+`--quant q8` and `--quant q4` of every safetensors checkpoint. The rules are the engine's: weights
+over 60% of the RAM are streamed from storage (they run, at a speed set by the storage, which is
+not estimated), and whole decode steps run on the GPU when the backend has decode plans for the
+weight format and the weights fit in 92% of its memory with 1 GB to spare. Embedding, image,
+Whisper and TTS models get the disk and memory verdicts only.
+
+The speed is the cost model the measurements follow (`src/advisor.rs`, `oxinfer::advisor`): a
+decoded token reads every dense weight once, so
+
+```
+seconds per token = bytes per token / rate(weight format) + layers x cost per layer
+```
+
+- **CPU.** The rates are measured when the command runs: the single-token kernel of each format
+  on a random matrix of 268M weights (larger than the caches), about 0.1 s each, 2 to 3 s and up
+  to 0.9 GB in all; they are printed (`CPU kernels, GB/s: ...`). Two constants were fitted on the
+  9970X against 200 greedy tokens of ten checkpoints: 0.35 ms per layer (1.1 ms for a
+  mixture-of-experts layer), and the ratio between a kernel's rate inside a model and on the
+  synthetic matrix (1.2 for bf16, 1.1 for q8, 0.8 for q4, 0.78 for GGUF). Measured against
+  predicted there, tokens/s on the CPU:
+
+  | checkpoint | measured | predicted |
+  |---|---|---|
+  | Qwen3.5-0.8B bf16 / q8 / q4 | 33.0 / 49.1 / 73.2 | 39.5 / 55 / 71.5 |
+  | Qwen3.5-9B bf16 / q8 / q4 | 5.9 / 9.7 / 14.6 | 5.3 / 8.9 / 14.2 |
+  | Qwen3-4B MLX 4-bit | 19.5 | 22.5 |
+  | Llama 3.2 1B GGUF Q4_K_M / Q8_0 | 60.7 / 39.4 | 60.3 / 39.5 |
+  | Gemma 4 26B-A4B MLX 4-bit | 15.9 | 15.9 (the MoE constant is fitted on it) |
+  | Orpheus 3B GGUF Q4_K_M as a text model (not part of the fit) | 25.8 | 26.1 |
+
+  The machine was shared while these were measured (load average 10 to 60), and the kernel
+  rates move with the load by 10 to 30%, so does the estimate. No other CPU was measured: on an
+  Apple or a two-channel desktop CPU the kernel rates are measured the same way, but the two
+  fitted constants are this machine's.
+- **GPU.** A GPU cannot be timed without loading a model, so the rates are those of one device
+  per backend. CUDA, on the RTX 5080: 850 / 740 / 540 GB/s for bf16 / q8 / q4 and 0.06 ms per
+  layer, which gives 312 / 387 / 450 tokens/s for Qwen3.5-0.8B (measured 304 / 368 / 421), 71 /
+  98 for Qwen3.5-9B q8 / q4 (measured 71.6 / 101.4) and 152 for Qwen3-4B 4-bit (measured 171).
+  GGUF files and the 26B-A4B mixture of experts decoded at the CPU's speed with `--device cuda`
+  (53.7 and 17.1 tokens/s against 57.0 and 16.1), so they are estimated on the CPU. Metal: 400
+  GB/s and 0.03 ms per layer, from the M5 Max figures of
+  [Decoding on the GPU](#decoding-on-the-gpu) (not measured again). On another device of the
+  backend the same rates are used and the estimate is marked `?` (`"basis":
+  "gpu-reference-other-device"` in the JSON): it is the reference device's speed, not this
+  one's. Vulkan has no decode plans, so its models are estimated on the CPU.
+- **What is not modelled:** speculative decoding (MTP, DSpark, prompt lookup), long contexts
+  (attention grows with the context), prefill speed, thermal limits, and a GPU shared with other
+  programs. Qwen3.5-9B in bf16 (15.9 GB per token) with `--device cuda` on the 16 GB card ran at
+  3.7 tokens/s, slower than the CPU's 5.9: the table sends it to the CPU, the engine's `auto`
+  does not yet.
+
+The bytes per token, layers and sizes of the catalog come from the loader's own report for the
+checkpoints loaded here (Qwen3.5-0.8B and 9B, Qwen3-4B 4-bit, Gemma 4 26B-A4B 4-bit, Llama 3.2
+1B), from the tables of this README for Gemma 4 and Qwen3.8-27B, and from the parameter counts
+for Qwen3.6-35B-A3B, Qwen3.8-Flash-Next, DeepSeek V4 Flash and Mistral Large 4 (noted in the
+JSON). In the library: `advisor::Hardware::detect`, `advisor::survey`, `advisor::render`,
+`advisor::to_json`; free disk space is read with `statvfs` (Linux, macOS, iOS, Android; unknown
+elsewhere).
 
 ### As a library
 
@@ -6257,6 +6345,8 @@ billion parameters at LUT4, `infer` only) are the practical range for 12 GB phon
 
 - `safetensors.rs`: parses the header, exposes bf16 tensors as `&[u16]` (single file or sharded).
 - `config.rs`: reads `config.json` and derives per-layer facts (sliding vs global, head dims, KV sharing source, k=v).
+- `advisor.rs`: `--models`, the tested models against the machine's disk, memory and GPU, with an
+  estimated decoding speed (kernel rates timed on the spot)
 - `platform.rs`: CPU feature and GPU detection (sysctl / procfs for memory, Metal via `objc_msgSend`,
   CUDA driver API, Vulkan loader), all through `dlsym`; `gpu.rs`: the `Backend` trait the linear layers
   dispatch through and the registry; `metal.rs`, `cuda.rs`, `vulkan.rs`: the backends with their shader sources

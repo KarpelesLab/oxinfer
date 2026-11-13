@@ -220,6 +220,38 @@ pub fn total_memory() -> Option<u64> {
     None
 }
 
+/// Bytes an unprivileged process may still write on the file system holding `path` (its nearest
+/// existing ancestor), when the platform says: `statvfs` on Linux and Apple systems.
+pub fn free_disk(path: &std::path::Path) -> Option<u64> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        unsafe extern "C" {
+            fn statvfs(path: *const std::ffi::c_char, buf: *mut u64) -> std::ffi::c_int;
+        }
+        let dir = path.ancestors().find(|p| p.exists())?;
+        let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        // Larger than `struct statvfs` on every supported target, and 8-byte aligned.
+        let mut buf = [0u64; 32];
+        if unsafe { statvfs(c.as_ptr(), buf.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // f_bsize, f_frsize, f_blocks, f_bfree, f_bavail: all 64-bit on 64-bit Linux; on Apple
+        // systems the two sizes are 64-bit and the block counts 32-bit.
+        #[cfg(all(any(target_os = "linux", target_os = "android"), target_pointer_width = "64"))]
+        return buf[1].checked_mul(buf[4]);
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        return buf[1].checked_mul(buf[3] & 0xffff_ffff);
+        #[allow(unreachable_code)]
+        None
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios")))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// Memory this process may still allocate before the OS ends it, when the platform says: iOS's
 /// `os_proc_available_memory` (the app's jetsam limit minus its footprint; raised by the
 /// `com.apple.developer.kernel.increased-memory-limit` entitlement). Clean file pages (mapped
