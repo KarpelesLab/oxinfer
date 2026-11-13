@@ -602,6 +602,8 @@ pub const CATALOG: &[Model] = &[
         .note("44.1 kHz, up to 16 speakers per text; cloning from a clip and its transcript; on the CPU"),
     Model::new("Edge0/Audio8-TTS-Realistic-Air", Kind::Tts, 0.6, 2.6, &[TextToSpeech, VoiceCloning])
         .note("44.1 kHz, 23 languages; cloning from a clip and its transcript; on the CPU"),
+    Model::new("higurashi-ai/Haru-4B", Kind::Tts, 5.3, 10.5, &[AudioInput, TextToSpeech, VoiceCloning])
+        .note("speech to speech, full duplex at 24 kHz: --audio USER.wav -o REPLY.wav; a research base model; on the CPU"),
     Model::new(
         "stable-diffusion-v1-5/stable-diffusion-v1-5",
         Kind::Image,

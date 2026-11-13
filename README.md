@@ -14,7 +14,7 @@ Local LLM inference in pure Rust: Gemma 4 (text, images, video, audio), Qwen 3.5
 (text, images, video), Mistral Large 4 (text, images; 1T parameters streamed from storage),
 DeepSeek V4 Flash (text; 284B parameters), Qwen3.8-Flash-Next (text; 125B + a 51B n-gram table read
 from storage), Gemma 3 and Qwen 3 today, more model families as they come; also
-embeddings, Stable Diffusion, FLUX.1 Kontext, Qwen-Image-Edit, OmniGen2, BAGEL and Step1X-Edit image editing, Whisper speech to text, Orpheus, ZONOS3-Mini and Audio8 TTS text to speech. No BLAS, no ML framework: weights are read straight out
+embeddings, Stable Diffusion, FLUX.1 Kontext, Qwen-Image-Edit, OmniGen2, BAGEL and Step1X-Edit image editing, Whisper speech to text, Orpheus and ZONOS3-Mini text to speech. No BLAS, no ML framework: weights are read straight out
 of the safetensors files (HuggingFace checkpoints or MLX 4-bit ones) and every operation
 (matmuls, attention, norms, RoPE, sampling) is implemented here, with hand-written SIMD kernels
 (NEON, AVX2, wasm simd128) and its own thread pool. The CPU path runs everywhere; GPUs (Metal,
@@ -113,6 +113,7 @@ too. The device is chosen at run time (`--device auto`: a GPU when one starts, e
 | [Orpheus](docs/orpheus.md) | text to speech, batches, voice cloning, the SNAC codec |
 | [ZONOS3-Mini](docs/zonos.md) | text to speech at 44.1 kHz in 43 languages, default voices, cloning from a clip |
 | [Audio8 TTS](docs/audio8-tts.md) | text to speech at 44.1 kHz in 23 languages, cloning from a clip and its transcript, its codec |
+| [Haru-4B](docs/haru.md) | full-duplex speech to speech at 24 kHz: a recording of the user in, what the model says meanwhile out |
 | [Fish Audio Drama 3](docs/fish-drama.md) | text to speech at 44.1 kHz with a 35B MoE, several speakers per text, cloning from a clip and its transcript |
 
 **Under the hood**
