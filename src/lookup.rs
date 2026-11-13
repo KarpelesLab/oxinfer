@@ -909,8 +909,10 @@ mod tests {
             };
             assert_eq!(d.tokens, want, "cost_aware {cost_aware} memory {memory}");
             assert_eq!(lk.tokens(), &sess.0[..], "context in step");
-            assert!(st.accepted > 50 && st.rounds < 120, "{st:?}");
+            // With `cost_aware` the draft lengths follow measured times, which on the toy are a
+            // few microseconds of noise: only the tokens are checked then.
             if !cost_aware {
+                assert!(st.accepted > 50 && st.rounds < 120, "{st:?}");
                 assert!(st.accepted < st.drafted, "some drafts rejected: {st:?}");
             }
         }
