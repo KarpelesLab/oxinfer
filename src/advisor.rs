@@ -544,6 +544,9 @@ pub const CATALOG: &[Model] = &[
     )
     .note("ControlNet: InstantX/Qwen-Image-ControlNet-Union"),
     Model::new("Qwen/Qwen-Image-Edit-2511", Kind::Image, 28.3, 57.9, &[ImageEdit, Inpainting]).note("one or more input images"),
+    Model::new("Qwen/Qwen-Image-2.1-Turbo", Kind::Image, 16.2, 32.4, &[TextToImage, ImageEdit])
+        .note("8 steps; GGUF transformers: abenzerps/Qwen-Image-2.1-Turbo-Quantized"),
+    Model::new("Qwen/Qwen-Image-2.1", Kind::Image, 16.2, 33.1, &[TextToImage, ImageEdit]).note("40 steps; RGBA output"),
     Model::new("MiniMaxAI/MiniMax-H3-Image", Kind::Image, 63.0, 127.2, &[TextToImage])
         .note("with MiniMax-H3's Qwen3-VL text encoder; 2048x2048 and up"),
 ];

@@ -4,6 +4,8 @@ Qwen-Image-Edit-2511 (and -2509, and the original Qwen-Image-Edit) edits images 
 instruction says, combining several input images; Qwen-Image / Qwen-Image-2512 generate from text
 with the same transformer. `src/qwen_image/` follows diffusers' `QwenImageEditPlusPipeline`,
 `QwenImageEditPipeline` and `QwenImagePipeline`; the pipeline kind comes from `model_index.json`.
+Qwen-Image-2.1 and Qwen-Image-2.1-Turbo, a different and smaller model for both text to image and
+editing, have [their own section](#qwen-image-21-and-qwen-image-21-turbo).
 
 ```sh
 # full quality: 40 steps, true CFG 4 with a " " negative prompt (Qwen's recommended settings)
@@ -245,3 +247,145 @@ single-file checkpoints, ControlNets with the edit models, several different Con
 command line and the library return them), the browser build (the weights exceed its 4 GB).
 The transformer's activations go between CPU and GPU at every
 matmul (about 1 s per pass at 1024x1024), the next lever for speed.
+
+## Qwen-Image-2.1 and Qwen-Image-2.1-Turbo
+
+Qwen-Image-2.1 is a different model behind the same command line and library type
+(`model_index.json` says `QwenImage21Pipeline`): a 7B single-stream transformer instead of the
+20B MMDiT, Qwen3-VL-8B instead of Qwen2.5-VL-7B as the text encoder, a 16x RGBA VAE with 64
+latent channels, and text to image and editing in one checkpoint. Qwen-Image-2.1-Turbo is its
+8-step distillation. `src/qwen_image/v21.rs` follows diffusers' `QwenImage21Pipeline`.
+
+```sh
+# Qwen-Image-2.1-Turbo: 8 steps, no guidance, a 4 GB GGUF transformer
+# (the repo id fetches the whole repo, its 14 GB bf16 transformer included)
+./target/release/oxinfer --model Qwen/Qwen-Image-2.1-Turbo --mmap \
+    --transformer abenzerps/Qwen-Image-2.1-Turbo-Quantized/qwen-image-2.1-turbo-Q4_K_M.gguf \
+    -p 'a cozy bookshop on a rainy street at night, a neon sign that reads "OXINFER BOOKS"' -o shop.png
+# an edit: one or more input images (the output takes the last one's aspect ratio)
+./target/release/oxinfer --model Qwen/Qwen-Image-2.1-Turbo --mmap --init-image shop.png \
+    -p "Make it winter: thick snow on the pavement, snowflakes falling." -o winter.png
+# Qwen-Image-2.1: 40 steps, no guidance unless asked (--guidance 4 --negative " ")
+./target/release/oxinfer --model Qwen/Qwen-Image-2.1 --mmap --size 1024x1024 -p "..." -o out.png
+# a LoRA (diffusers keys) on the Turbo checkpoint
+./target/release/oxinfer --model Qwen/Qwen-Image-2.1-Turbo --mmap \
+    --lora MicksHF/Qwen-Image-2.1-Anime-Fusal/fusal-qwen-image-2.1-turbo-e6-preview-r128.safetensors:0.7 \
+    -p "fusal style. a girl reading in a sunlit library" -o anime.png
+```
+
+What changed against Qwen-Image-2512, as the configs and diffusers' code have it:
+
+| | Qwen-Image-2512 | Qwen-Image-2.1 / 2.1-Turbo |
+|---|---|---|
+| transformer | `QwenImageTransformer2DModel`: 60 dual-stream blocks of width 3072 (24 heads x 128), 20B, biases, GELU MLPs (x4), AdaLN per block with shift / scale / gate | `QwenImage21Transformer2DModel`: 32 single-stream blocks of width 4096 (32 x 128), 7B, no bias anywhere, SwiGLU MLPs (`mlp_ratio` 3), one `modulation` layer shared by all blocks giving scale and `tanh` gate only |
+| config keys | `joint_attention_dim` 3584, `patch_size` 2, `in_channels` 64 (16 x 2 x 2), `out_channels` 16, `num_layers` 60, `num_attention_heads` 24, `guidance_embeds` | `context_in_dim` 4096, `patch_size` 1, `in_channels` / `out_channels` 64, `num_layers` 32, `num_attention_heads` 32, `mlp_ratio` 3, `eps`, `causal_condition`; `attention_head_dim` 128 and `axes_dims_rope` [16, 56, 56] as before |
+| sequence | text and image streams, joint bidirectional attention; text positions after the image | one sequence `[text (with the condition images where their placeholders are), target]`, block-causal attention (a token sees what precedes it, an image is bidirectional inside), text and condition images modulated as at timestep 0 |
+| text encoder | Qwen2.5-VL-7B (3584), last hidden states, 34 / 64 template tokens dropped | Qwen3-VL-8B (4096, 36 layers, DeepStack vision features), the last layer's output before the final norm, the system turn dropped; system prompt "Comprehend and analyze the provided prompt." |
+| VAE | `AutoencoderKLQwenImage`: 16 channels, 8x, RGB, 0.25 GB | `AutoencoderKLQwenImage21`: 64 channels, 16x, RGBA, residual groups with shortcuts, decoder width 144 (encoder 96), 0.68 GB in bf16 |
+| scheduler | flow-matching Euler, dynamic exponential shift (0.5 to 0.9 over 256 to 8192 tokens), `shift_terminal` 0.02 | the same for Qwen-Image-2.1; Turbo: no shift (`use_dynamic_shifting` false, `shift` 1, no terminal), the sigmas saved in `model_index.json` |
+| defaults | 40 steps, true CFG 4 with a `" "` negative prompt, norm rescale | 40 steps, no guidance (true CFG 1; with a negative prompt, plain CFG without the rescale); Turbo: the 8 saved sigmas `1, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568` |
+
+What runs: the prompt goes through the pipeline's template (`<|im_start|>system\nComprehend and
+analyze the provided prompt.<|im_end|>`, the user turn, the assistant header) and Qwen3-VL-8B;
+the transformer reads the residual stream after the last layer, before the final norm, without
+the system turn. The transformer runs the prompt once, keeping every block's keys and values
+(nothing before the target depends on the target or on the timestep: text and condition images
+are modulated as at timestep 0 and attend backwards only), and each denoising step then computes
+the target's tokens alone against them (diffusers' `use_kv_cache`, here without the first full
+pass). An edit's input images are resized to about 1024x1024 and go two ways: through the text
+encoder's vision tower as `<imageN><|vision_start|>...<|vision_end|>` before the instruction
+(with Qwen3-VL's DeepStack: the tower's features after its layers 8, 16 and 24, each through its
+own merger, are added to the image tokens after the language model's first three layers), and
+through the VAE as opaque RGBA into latent tokens, four of which stand in the transformer's
+sequence where the text encoder had one placeholder. The VAE decodes to RGBA: the command line
+writes an RGBA PNG when the picture has transparent pixels (alpha under one half somewhere; ask
+for them as the model card does, "This is an RGBA image with transparency. ... The image has
+alpha channel and the background is transparent.") and RGB otherwise; the library returns the
+RGB channels as they are and keeps the alpha in `Pipeline::alpha`.
+
+| Flag | Meaning with Qwen-Image-2.1 |
+|---|---|
+| `--steps N` | default: the checkpoint's saved sigmas (Turbo: 8) or 40; another count with Turbo uses the uniform grid, which Qwen did not train it for |
+| `--guidance F`, `--negative TEXT` | true CFG (default 1: one pass per step) |
+| `--size WxH` | multiples of 32; default 1024x1024, or the last input image's aspect ratio at about that area (the model cards use 2048x2048, 1696x2528, ...: four times the tokens) |
+| `--init-image FILE` | an edit; repeatable |
+| `--transformer FILE` | a GGUF file (ComfyUI-style names without metadata, or `general.architecture = qwen_image21`), an FP8 "scaled" single file in ComfyUI's layout, or bf16 safetensors |
+| `--lora FILE[:SCALE]` | LoRAs in diffusers keys (`transformer.<module>.lora_A / lora_B`, with or without `.alpha`); merged at load with `--quant`, applied at run time otherwise |
+| `--quant q8\|q4` | quantizes the transformer's blocks and the text encoder at load |
+
+Not supported with 2.1: `--strength`, `--mask`, ControlNets, `--stream`; text encoders as GGUF
+files (AtomicChat/Qwen-Image-2.1-Turbo-Uncensored-GGUF is the text encoder, llama.cpp's
+`qwen3vl` architecture with an `mmproj` file, not a transformer); ComfyUI's fused `gate_up`
+single files (the 265-tensor layout), int8 / NVFP4 / MLX / bitsandbytes checkpoints. The
+prompt's keys and values stay in memory for the run (float32, 32 blocks): 1 MB per text token,
+4.3 GB per 1024x1024 input image.
+
+**Agreement** with diffusers 0.44.0.dev0 (from source; the released 0.43 ships the same pipeline)
+and transformers 5.23, `tools/qwen_image_tiny.py ref21`: the same prompt and initial noise, the
+reference in float32. On real weights, Qwen-Image-2.1-Turbo with abenzerps' Q4_K_M GGUF
+transformer (4.05 GB) and the reference running the weights that file decodes to (gguf-py's
+dequantization, so both sides compute with the same numbers), 8 steps, a 768x768 image of a
+bookshop with a neon sign, oxinfer's own text encoding (Qwen3-VL-8B in bf16):
+
+| run | prompt embeddings | first velocity | final latents | image (RGBA) |
+|---|---|---|---|---|
+| text to image, CPU | 7.2e-6 | 2.5e-6 | 6.6e-4 | 64.6 dB, largest pixel difference 13 |
+| text to image, CUDA (RTX 5080) | 7.2e-6 | 1.7e-6 | 1.4e-4 | 72.0 dB, largest pixel difference 3 |
+| edit of that picture ("Make it winter: ..."), 768x768 from the input at 1024x1024, CUDA | 7.2e-4 (text and image tokens) | 3.5e-5 | 1.1e-4 | 75.5 dB, largest pixel difference 1 |
+
+(Relative L2 errors; the RGB channels alone: 63.3, 70.8 and 74.3 dB. In the edit the VAE
+encoder's latents of the input match to 3.4e-6, and the prompt embeddings cover the vision tower
+with DeepStack on the real Qwen3-VL-8B. An opaque picture's alpha is not exactly 255: 2.7% of its
+pixels are below, down to 230, the same in the reference.) The saved Turbo sigmas go through the
+scheduler unchanged, as diffusers prints them.
+
+On tiny random-weight pipelines (`make21`: 3 blocks of width 64, a 5-layer Qwen3-VL with a
+4-layer vision tower and three DeepStack levels, the residual VAE with 8 latent channels,
+bf16-exact weights), CPU, oxinfer's own text encoding:
+
+| run (tiny model) | settings | prompt embeddings | first velocity | final latents | image |
+|---|---|---|---|---|---|
+| Turbo, text to image | 96x64, the 8 saved sigmas | 4.7e-7 | 2.3e-7 | 8.3e-8 | max pixel difference 1 |
+| Turbo, `--steps 3` (uniform sigmas on both sides) | 64x64 | | 2.1e-7 | 7.2e-8 | identical |
+| 2.1 scheduler (dynamic shift, terminal 0.02) | 64x64, 40 steps | | 2.1e-7 | 7.9e-8 | max difference 1 |
+| 2.1, true CFG 3 with a negative prompt | 160x224, 5 steps | | | 1.7e-7 | max difference 1 |
+| GGUF, `model.diffusion_model.` names, no metadata, Q8_0 blocks | 96x64, 8 steps | | 2.5e-7 | 8.6e-8 | identical |
+| GGUF, `qwen_image21`, Q4_0 / Q8_0 blocks, true CFG 2 | 96x64, 8 steps | | | 1.2e-7 | max difference 1 |
+| FP8 scaled single file (ComfyUI layout) | 96x64, 8 steps | | 1.9e-7 | 1.1e-7 | max difference 1 |
+| LoRA at 0.7 (diffusers keys with alphas), bf16 and GGUF base | 96x64, 8 steps | | 9.0e-5 | 2.9e-5 | max difference 1 |
+| LoRA at 0.7 merged at `--quant q8` | 96x64, 8 steps | 1.7e-2 | 6.3e-4 | 1.9e-4 | max difference 1 |
+| edit, one image | 128x96, 8 steps | 8.1e-7 | 2.4e-7 | 1.1e-7 | max difference 1 |
+| edit, two images, true CFG 2.5, default size (800x1312) | 4 steps | 9.2e-7 | | 2.0e-7 | max difference 1 |
+| edit, three images, GGUF transformer | 160x96, 8 steps | 9.7e-7 | 2.4e-7 | 9.5e-8 | max difference 1 |
+
+The GGUF, FP8 and LoRA rows compare with diffusers running the weights those files decode to (a
+runtime LoRA is kept as a bf16 pair, hence 9e-5; the `q8` row measures the quantization). In the
+edit rows the VAE encoder's latents of the input images match to 9e-7, and the prompt embeddings
+cover the vision tower, DeepStack and the image tokens' positions. diffusers 0.44.0.dev0 does
+not load a LoRA file that has both diffusers keys and `.alpha` tensors (it prefixes
+`transformer.` twice); the reference script folds the alphas into the up matrices first.
+
+Also run on real weights, without a reference: MicksHF's Fusal Turbo LoRA (rank 128, 224
+modules, strength 0.7) on the Turbo Q4_K_M GGUF draws "fusal style. a girl with silver hair
+reading a book in a sunlit library" as a clean anime illustration; chatrlabs' Q4_K_M GGUF (a
+fine-tune of Qwen-Image-2.1 with `general.architecture = qwen_image21`, Q4_K and Q6_K blocks)
+with Qwen-Image-2.1's scheduler, 16 steps and true CFG 5 gives a clean 512x512 photograph of its
+prompt (a fox on a park bench); the Turbo edit above with oxinfer's own noise keeps the street
+and the shop sign's lettering and covers the pavement and ledges in snow, with flakes falling.
+Not run on real weights: the bf16 transformers (14 GB; the code path is the tiny models'),
+`--quant`, the FP8 single file, Qwen-Image-2.1's own checkpoint and 40-step schedule (only the
+fine-tune above, at 16 steps), several input images, transparent pictures, 2048x2048.
+
+**Speed** (64-core x86 with an RTX 5080, a shared machine, Q4_K_M GGUF with `--mmap`): 35 s per
+pass at 768x768 and 57 s at 1024x1024 on CUDA, 41 s at 768x768 on the CPU alone (the GGUF
+blocks' matmuls run on the CPU either way); the text encoder takes 2-4 s, the VAE 30 s to decode
+768x768 and 44 s at 1024x1024 (its decoder is 1152 channels wide at the first three levels). An
+edit of one 1024x1024 input adds 13 s of VAE encoding and 15 s of text encoding with the vision
+tower, and its steps attend to 4096 more tokens (36 to 43 s per pass at 768x768).
+
+**Weights and licenses.** Qwen/Qwen-Image-2.1 and Qwen/Qwen-Image-2.1-Turbo: the Qwen Research
+License Agreement (not Apache 2.0 like the earlier Qwen-Image models), ungated; 33 GB each (17.5 GB text encoder, 14.2 GB transformer, 1.35 /
+0.68 GB VAE). abenzerps/Qwen-Image-2.1-Turbo-Quantized (GGUF Q4_0 4.05 GB to Q8_0 7.6 GB, an FP8
+file; also the text encoder and VAE as single files, which oxinfer does not read) and
+chatrlabs/Qwen-Image-2.1-Uncensored-Omni-Quantized (GGUF Q4_0 to BF16): the same license.
+MicksHF/Qwen-Image-2.1-Anime-Fusal: LoRAs for the Turbo and the base checkpoint.

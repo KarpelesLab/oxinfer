@@ -114,4 +114,9 @@ on the CPU: 12 tok/s for the 3B in bf16).
 `encode_image(rgb, w, h, max_pixels) -> VlImage` (embeddings, merged grid, `placeholder()` text),
 and `hidden_states(text, &images, &layers) -> Hidden` with the final-normed states (transformers'
 `hidden_states[-1]`) and the residual stream after any requested layers (`hidden_states[l + 1]`),
-M-RoPE positions for the images included. `examples/qwen_vl_hidden.rs` dumps them.
+M-RoPE positions for the images included. `examples/qwen_vl_hidden.rs` dumps them. It also loads
+Qwen3-VL (Qwen-Image-2.1's text encoder is Qwen3-VL-8B), whose vision tower has DeepStack: the
+tower's features after three of its layers, each through its own merger, are added to the image
+tokens after the language model's first three layers (`VlImage::deep`; tiny-checkpoint prompt
+embeddings with an image match transformers 5.23 to 8e-7). The chat engine does not run
+DeepStack and refuses such a tower.

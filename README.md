@@ -97,7 +97,7 @@ too. The device is chosen at run time (`--device auto`: a GPU when one starts, e
 | [Stable Diffusion 1.x / 2.x / XL](docs/stable-diffusion.md) | text to image, image to image, inpainting, InstructPix2Pix |
 | [Stable Diffusion 3 / 3.5](docs/sd3.md) | text to image, image to image |
 | [FLUX.1](docs/flux.md) | Kontext editing, schnell / dev, Fill, Canny / Depth, Redux |
-| [Qwen-Image and Qwen-Image-Edit](docs/qwen-image.md) | editing, text to image, ControlNet, layers |
+| [Qwen-Image, Qwen-Image-Edit and Qwen-Image-2.1](docs/qwen-image.md) | editing, text to image, ControlNet, layers; Qwen-Image-2.1 / 2.1-Turbo |
 | [OmniGen2](docs/omnigen2.md), [BAGEL](docs/bagel.md), [Step1X-Edit](docs/step1x-edit.md), [Janus-Pro](docs/janus.md) | instruction editing, unified generation and understanding |
 | [Whisper](docs/whisper.md) | speech to text |
 | [Orpheus](docs/orpheus.md) | text to speech, batches, voice cloning, the SNAC codec |
