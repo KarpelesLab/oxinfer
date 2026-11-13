@@ -66,6 +66,7 @@ use crate::platform::DevicePref;
 use crate::qwen::{QwenModel, QwenSession};
 use crate::qwen_mtp::{MtpDecoder, MtpOptions, QwenMtp};
 use crate::raon::{RaonModel, RaonSession};
+use crate::ripple::{RippleModel, RippleSession};
 use crate::safetensors::ModelFiles;
 use crate::sampler::Sampler;
 use crate::tokenizer::Tokenizer;
@@ -915,6 +916,8 @@ pub enum Family {
     Inkling2,
     /// Baidu Unlimited-OCR-2 (`unlimited-ocr`): document images to text.
     UnlimitedOcr,
+    /// Ripple (`ricursive`).
+    Ripple,
     /// Raon-1 (`raon1_nano`).
     Raon,
 }
@@ -1042,6 +1045,10 @@ enum Lm {
     UnlimitedOcr {
         model: &'static crate::unlimited_ocr::OcrModel<'static>,
         sess: crate::unlimited_ocr::OcrSession,
+    },
+    Ripple {
+        model: &'static RippleModel<'static>,
+        sess: RippleSession,
     },
     Raon {
         model: &'static RaonModel<'static>,
@@ -1179,6 +1186,7 @@ impl Lm {
             Lm::Nemotron { sess, .. } => sess.pos,
             Lm::Inkling2 { sess, .. } => sess.pos,
             Lm::UnlimitedOcr { sess, .. } => sess.pos,
+            Lm::Ripple { sess, .. } => sess.pos,
             Lm::Raon { sess, .. } => sess.pos,
             Lm::DeepSeek4Dspark { dec } => dec.sess.pos,
             Lm::QwenDspark { dec } => dec.sess.pos,
@@ -1210,6 +1218,7 @@ impl Lm {
             Lm::Nemotron { model, sess } => *sess = model.new_session(),
             Lm::Inkling2 { model, sess } => *sess = model.new_session(),
             Lm::UnlimitedOcr { sess, .. } => sess.clear(),
+            Lm::Ripple { model, sess } => *sess = model.new_session(),
             Lm::Raon { model, sess } => *sess = model.new_session(),
             Lm::DeepSeek4Dspark { dec } => {
                 let opts = dec.opts.clone();
@@ -1418,6 +1427,7 @@ impl Engine {
             m if crate::nemotron::is_model_type(m) => Family::Nemotron,
             m if crate::inkling::is_model_type(m) => Family::Inkling2,
             m if crate::unlimited_ocr::is_model_type(m) => Family::UnlimitedOcr,
+            "ricursive" => Family::Ripple,
             "raon1_nano" => Family::Raon,
             other => bail!("unsupported model_type {other}"),
         };
@@ -1476,7 +1486,7 @@ impl Engine {
         } else {
             matches!(
                 family,
-                Family::Mistral4 | Family::DeepSeek4 | Family::Glm5 | Family::Kimi | Family::Inkling2
+                Family::Mistral4 | Family::DeepSeek4 | Family::Glm5 | Family::Kimi | Family::Inkling2 | Family::Ripple
             ) && crate::mistral4::too_big(crate::safetensors::checkpoint_bytes(&dir))
         };
         // Too big for memory: streamed with a page-cache budget unless told otherwise
@@ -1795,6 +1805,32 @@ impl Engine {
                 let c = &model.cfg;
                 let fmt: &'static (dyn ChatFormat + Sync) = &chat::KimiChat;
                 let lm = Lm::Kimi {
+                    model,
+                    sess: model.new_session(),
+                };
+                (
+                    lm,
+                    fmt,
+                    model.quant,
+                    c.num_hidden_layers,
+                    c.hidden_size,
+                    c.vocab_size,
+                    model.streamed_bytes(),
+                )
+            }
+            Family::Ripple => {
+                if decision_dir.is_some() {
+                    bail!("decisions (decision_from) are not supported for Ripple");
+                }
+                decision = None;
+                let mut model = RippleModel::load(crate::ripple::RippleConfig::load(&dir)?, files, opts.quant)?;
+                if let Some(so) = stream.clone() {
+                    streamer = Some(crate::stream::attach_ripple(&mut model, files, so)?);
+                }
+                let model = arena.keep(model);
+                let c = &model.cfg;
+                let fmt: &'static (dyn ChatFormat + Sync) = &chat::RippleChat;
+                let lm = Lm::Ripple {
                     model,
                     sess: model.new_session(),
                 };
@@ -2465,6 +2501,7 @@ impl Engine {
             Lm::Nemotron { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::Inkling2 { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::UnlimitedOcr { .. } => bail!("activation capture is not supported for Unlimited-OCR"),
+            Lm::Ripple { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::Raon { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::DeepSeek4Dspark { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
@@ -2503,6 +2540,7 @@ impl Engine {
             Lm::Nemotron { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::Inkling2 { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::UnlimitedOcr { .. } => bail!("interventions are not supported for Unlimited-OCR"),
+            Lm::Ripple { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::Raon { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::DeepSeek4Dspark { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
@@ -2532,6 +2570,7 @@ impl Engine {
             Lm::Nemotron { model, .. } => *model,
             Lm::Inkling2 { model, .. } => *model,
             Lm::UnlimitedOcr { .. } => bail!("interventions are not supported for Unlimited-OCR"),
+            Lm::Ripple { model, .. } => *model,
             Lm::Raon { model, .. } => *model,
             Lm::DeepSeek4Dspark { dec } => dec.model(),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
@@ -2556,6 +2595,7 @@ impl Engine {
             Lm::Nemotron { sess, .. } => &mut sess.iv,
             Lm::Inkling2 { sess, .. } => &mut sess.iv,
             Lm::UnlimitedOcr { .. } => return,
+            Lm::Ripple { sess, .. } => &mut sess.iv,
             Lm::Raon { sess, .. } => &mut sess.iv,
             Lm::DeepSeek4Dspark { dec } => &mut dec.sess.iv,
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
@@ -2800,6 +2840,7 @@ impl Engine {
                 Lm::Nemotron { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
                 Lm::Inkling2 { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
                 Lm::UnlimitedOcr { .. } => bail!("decisions are not supported for Unlimited-OCR"),
+                Lm::Ripple { .. } => bail!("decisions are not supported for Ripple"),
                 Lm::Raon { .. } => bail!("decisions are not supported for Raon-1"),
                 Lm::DeepSeek4Dspark { dec } => run(dec.model(), &ids, &feats, chunk, need_logits)?,
                 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
@@ -3198,6 +3239,18 @@ impl PendingTurn {
                 }
             }
             Lm::Kimi { model, sess } => {
+                let base = sess.pos;
+                let hs = generate::prefill(*model, sess, &ids, chunk, &overrides);
+                let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
+                st.prefill_secs = t0.elapsed().as_secs_f64();
+                let max = limit(sess.pos);
+                if max == 0 {
+                    empty(0.0)
+                } else {
+                    plain!(*model, sess, base, logits, max)
+                }
+            }
+            Lm::Ripple { model, sess } => {
                 let base = sess.pos;
                 let hs = generate::prefill(*model, sess, &ids, chunk, &overrides);
                 let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);

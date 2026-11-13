@@ -1810,7 +1810,7 @@ pub const PRETOKENIZER: &str = concat!(
 
 /// GPT-2's byte to character map (`bytes_to_unicode`): printable Latin-1 bytes as themselves,
 /// the others from U+0100 up.
-fn byte_chars() -> [char; 256] {
+pub(crate) fn byte_chars() -> [char; 256] {
     let mut out = ['\0'; 256];
     let mut n = 0u32;
     for (b, slot) in out.iter_mut().enumerate() {

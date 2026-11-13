@@ -1682,6 +1682,16 @@ pub fn attach_kimi(model: &mut crate::kimi::KimiModel<'_>, files: &ModelFiles, o
     Ok(s)
 }
 
+/// Streams a Ripple model whose weights borrow `files` (memory-mapped): the layers, the LM head.
+/// Detach (`set_stream(None)`) or drop the model before dropping `files`.
+pub fn attach_ripple(model: &mut crate::ripple::RippleModel<'_>, files: &ModelFiles, opts: StreamOptions) -> Result<Arc<Streamer>> {
+    let s = Streamer::new(&[files], model.stream_units(), opts)?;
+    let streamed: Vec<bool> = s.plan().units.iter().map(|u| !u.2).collect();
+    model.mark_streamed(&streamed);
+    model.set_stream(Some(StreamHook::new(s.clone(), 0)));
+    Ok(s)
+}
+
 /// Streams a Raon-1 model whose weights borrow `files` (memory-mapped): the per-layer embedding
 /// projection, the layers, the LM head. Detach (`set_stream(None)`) or drop the model before
 /// dropping `files`.

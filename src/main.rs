@@ -1608,6 +1608,7 @@ fn run(mut args: Args) -> Result<()> {
         m if oxinfer::nemotron::is_model_type(m) => run_nemotron(args),
         m if oxinfer::inkling::is_model_type(m) => run_inkling(args),
         m if oxinfer::unlimited_ocr::is_model_type(m) => unlimited_ocr_cli::run(&args),
+        "ricursive" => run_ripple(args),
         "raon1_nano" => run_raon(args),
         other => bail!("unsupported model_type {other}"),
     }
@@ -2513,6 +2514,72 @@ fn run_kimi(mut args: Args) -> Result<()> {
     }
     let streamer = if args.stream {
         Some(start_stream(&args, |o| oxinfer::stream::attach_kimi(&mut model, &files, o))?)
+    } else {
+        None
+    };
+    *STREAM.lock().unwrap() = streamer.clone();
+    TRACE.store(args.stream_trace, std::sync::atomic::Ordering::Relaxed);
+    let r = run_text(&args, &model, &tok, &eos, fmt, Default::default());
+    if let Some(s) = &streamer
+        && let Some(c) = s.cached_bytes()
+    {
+        eprintln!("[stream: {:.2} GB of the model files in the page cache at exit]", c as f64 / 1e9);
+    }
+    *STREAM.lock().unwrap() = None;
+    model.set_stream(None);
+    drop(streamer);
+    r
+}
+
+/// Ripple (text; see `oxinfer::ripple`).
+fn run_ripple(mut args: Args) -> Result<()> {
+    let t0 = Instant::now();
+    if args.mtp || args.draft.is_some() {
+        bail!("Ripple has no speculative decoding with a draft here (its DFlash2 draft is not read)");
+    }
+    if !mm_request(&args).is_empty() {
+        bail!("Ripple takes text only");
+    }
+    let cfg = oxinfer::ripple::RippleConfig::load(&args.model)?;
+    let eos = config::load_eos_ids(&args.model);
+    // A checkpoint larger than most of RAM is streamed with a page-cache budget of 70% of RAM,
+    // unless `--no-stream` (or `--mmap`) asks for plain demand paging.
+    let size: u64 = oxinfer::safetensors::checkpoint_bytes(&args.model);
+    if oxinfer::ripple::too_big(size) && args.no_stream {
+        args.mmap = true;
+    }
+    if oxinfer::ripple::too_big(size) && !args.stream && !args.mmap {
+        let budget = oxinfer::ripple::default_stream().cache_budget.unwrap_or(0) as f64 / 1e9;
+        args.cache_budget_gb = Some(args.cache_budget_gb.unwrap_or(budget));
+        eprintln!(
+            "[the {:.0} GB checkpoint does not fit in memory: streaming it (--stream --cache-budget-gb {:.0})]",
+            size as f64 / 1e9,
+            args.cache_budget_gb.unwrap()
+        );
+        args.stream = true;
+    }
+    args.mmap |= args.stream;
+    let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
+    let mut model = oxinfer::ripple::RippleModel::load(cfg, &files, args.quant)?;
+    let tok = load_tokenizer(&args.model)?;
+    let fmt: &dyn ChatFormat = &chat::RippleChat;
+    let eos = chat::with_turn_end(fmt, &tok, eos);
+    eprintln!(
+        "[loaded Ripple: {} layers, hidden {}, {:.1} GB checkpoint ({}), {:?} weights streaming {:.2} GB/token, {} threads, {:.2}s]",
+        model.cfg.num_hidden_layers,
+        model.cfg.hidden_size,
+        files.total_bytes() as f64 / 1e9,
+        if args.mmap { "mmap" } else { "in RAM" },
+        model.quant,
+        model.streamed_bytes() as f64 / 1e9,
+        pool::threads(),
+        t0.elapsed().as_secs_f64()
+    );
+    if let Some(out) = &args.save_quantized {
+        return save_quantized(&args.model, out, &files, model.quant);
+    }
+    let streamer = if args.stream {
+        Some(start_stream(&args, |o| oxinfer::stream::attach_ripple(&mut model, &files, o))?)
     } else {
         None
     };

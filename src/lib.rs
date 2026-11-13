@@ -88,6 +88,7 @@ pub mod qwen_vision;
 pub mod qwen_vl;
 pub mod raon;
 pub mod resample;
+pub mod ripple;
 pub mod sae;
 pub mod safetensors;
 pub mod sampler;

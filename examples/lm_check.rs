@@ -1,16 +1,17 @@
-//! Compares a Raon-1 checkpoint run by oxinfer with reference outputs (as written by
-//! `tools/ref_raon.py`: `ids` (I64), `logits` `[n, vocab]` at every prompt position, and optionally
+//! Compares a Raon-1 or Ripple checkpoint run by oxinfer with reference outputs (as written by
+//! `tools/ref_raon.py` and `tools/ref_ripple.py`: `ids` (I64), `logits` `[n, vocab]` at every prompt position, and optionally
 //! `gen` (I64, greedy tokens) with `decode_logits` `[len(gen), vocab]`, the logits after feeding
 //! each of them one at a time):
 //!
 //! ```text
-//! lm_check MODEL REF.safetensors [--chunk N] [--cpu] [--mmap] [--quant bf16|q8|q4]
+//! lm_check MODEL REF.safetensors [--chunk N] [--cpu] [--mmap] [--quant bf16|q8|q4] [--layers K]
 //! lm_check MODEL --encode FILE
 //! ```
 //!
 //! Prints, for the prefill (in chunks of N tokens, default the whole prompt) and for the
 //! token-by-token decode, the largest logit difference, the mean KL divergence and the agreement
-//! of the top token. `--encode` in place of the reference prints the ids the checkpoint's
+//! of the top token. `--layers K` cuts a Ripple model to its first K layers (as
+//! `ref_ripple.py --layers K`: a part of a checkpoint too big for the reference). `--encode` in place of the reference prints the ids the checkpoint's
 //! tokenizer gives the text of FILE.
 
 use anyhow::{Context, Result};
@@ -125,12 +126,13 @@ fn main() -> Result<()> {
     let model = args.next().context(usage)?;
     let refp = args.next().context(usage)?;
     let (mut chunk, mut cpu, mut mmap, mut quant) = (None, false, false, oxinfer::model::Quant::Bf16);
-    let mut text = None;
+    let (mut text, mut layers) = (None, None);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--chunk" => chunk = Some(args.next().context("--chunk N")?.parse::<usize>()?),
             "--cpu" => cpu = true,
             "--mmap" => mmap = true,
+            "--layers" => layers = Some(args.next().context("--layers K")?.parse::<usize>()?),
             "--quant" => quant = oxinfer::model::Quant::parse(&args.next().context("--quant Q")?).context("--quant: bf16, q8 or q4")?,
             other if refp == "--encode" && text.is_none() => text = Some(other.to_string()),
             other => anyhow::bail!("unknown argument {other}"),
@@ -155,6 +157,17 @@ fn main() -> Result<()> {
     match oxinfer::config::model_type(&dir)?.as_str() {
         "raon1_nano" => {
             let m = oxinfer::raon::RaonModel::load(oxinfer::raon::RaonConfig::load(&dir)?, &files, quant)?;
+            check(&m, m.cfg.vocab_size, &st, chunk)
+        }
+        "ricursive" => {
+            let mut cfg = oxinfer::ripple::RippleConfig::load(&dir)?;
+            if let Some(k) = layers {
+                cfg.num_hidden_layers = k;
+                if let Some(lt) = &mut cfg.layer_types {
+                    lt.truncate(k);
+                }
+            }
+            let m = oxinfer::ripple::RippleModel::load(cfg, &files, quant)?;
             check(&m, m.cfg.vocab_size, &st, chunk)
         }
         other => anyhow::bail!("lm_check: model_type {other} is not handled here"),
