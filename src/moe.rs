@@ -28,7 +28,7 @@ impl Act {
                 }
                 silu_mul(g, u)
             }
-            Act::SwigluOai { .. } => {
+            Act::SwigluOai { .. } | Act::Situ { .. } => {
                 for (g, &u) in g.iter_mut().zip(u.iter()) {
                     *g = self.scalar(*g, u);
                 }
@@ -48,11 +48,19 @@ impl Act {
                 let g = g.min(limit);
                 (u.clamp(-limit, limit) + 1.0) * g / (1.0 + (-alpha * g).exp())
             }
+            Act::Situ { beta, linear_beta } => {
+                let u = if linear_beta > 0.0 {
+                    linear_beta * (u / linear_beta).tanh()
+                } else {
+                    u
+                };
+                beta * (g / beta).tanh() / (1.0 + (-g).exp()) * u
+            }
         }
     }
     /// Whether the accelerator expert kernels implement this activation.
     pub(crate) fn on_device(self) -> bool {
-        !matches!(self, Act::SwigluOai { .. })
+        !matches!(self, Act::SwigluOai { .. } | Act::Situ { .. })
     }
 }
 
@@ -294,7 +302,8 @@ impl<'a> Experts<'a> {
 
     /// Weight bytes one token reads (top_k experts).
     pub fn bytes_per_token(&self) -> usize {
-        self.top_k * (self.gate_up[0].bytes() + self.down[0].bytes())
+        // (No experts: the dense first layer of ERNIE 5.5.)
+        self.top_k * self.gate_up.first().map_or(0, |g| g.bytes() + self.down[0].bytes())
     }
 
     /// The weights of each expert.

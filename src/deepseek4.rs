@@ -48,8 +48,12 @@
 //! `w2`; `w2` has no bias, so that is the same edit of an activation scaled afterwards). Every
 //! layer is a MoE: there is no dense MLP.
 
+#[path = "ernie5.rs"]
+mod ernie;
 #[path = "deepseek41.rs"]
 mod v41;
+pub use ernie::{ErnieMtpDecoder, ErnieMtpSession};
+pub(crate) use ernie::{is_native as is_ernie, native_name as ernie_name};
 pub(crate) use v41::{gguf_config as gguf_config_v41, gguf_name as gguf_name_v41};
 
 use crate::config::DeepSeek4Config;
@@ -348,7 +352,8 @@ impl DeepSeek4Session {
     fn trim(&mut self) {
         let keep_from = self.pos.saturating_sub(self.window + SLACK);
         for st in &mut self.layers {
-            if keep_from >= st.raw_start + 2 * SLACK {
+            // (An MLA layer of ERNIE 5.5 keeps no raw keys: every position stays in `comp`.)
+            if keep_from >= st.raw_start + 2 * SLACK && !st.raw.is_empty() {
                 st.raw.drain(..(keep_from - st.raw_start) * self.hd);
                 st.raw_start = keep_from;
             }
@@ -374,6 +379,8 @@ pub struct DeepSeek4Model<'a> {
     /// hash.
     x41: Vec<v41::Layer41<'a>>,
     hash: Option<v41::Hash>,
+    /// ERNIE 5.5 (`cfg.ernie`): what its layers add, the MultiMax head, the MTP layer.
+    ern: Option<ernie::Ernie<'a>>,
     /// Weight streaming: unit `l` is layer `l`, unit `num_hidden_layers` the LM head.
     stream: Option<crate::stream::StreamHook>,
 }
@@ -575,7 +582,13 @@ fn sigmoid(x: f32) -> f32 {
 pub(crate) fn hc_mix(c: &DeepSeek4Config, w: &Hc, x: &[f32], pre: &mut [f32], post: &mut [f32], comb: &mut [f32]) {
     let n = c.hc_mult;
     let (eps, heps) = (c.rms_norm_eps as f32, c.hc_eps as f32);
-    let r = 1.0 / (dot(x, x) / x.len() as f32 + eps).sqrt();
+    let ms = dot(x, x) / x.len() as f32;
+    // (ERNIE 5.5 keeps the epsilon outside the root.)
+    let r = if c.ernie.is_some() {
+        1.0 / (ms.sqrt() + eps)
+    } else {
+        1.0 / (ms + eps).sqrt()
+    };
     let m = |i: usize| dot(&w.f[i * x.len()..(i + 1) * x.len()], x) * r;
     for i in 0..n {
         pre[i] = sigmoid(m(i) * w.scale[0] + w.base[i]) + heps;
@@ -729,7 +742,7 @@ impl<'a> DeepSeek4Model<'a> {
         if !files.has("embed.weight") {
             bail!("cannot find embed.weight in checkpoint (DeepSeek V4 is read in DeepSeek's naming or from GGUF)");
         }
-        if files.info("layers.0.attn.wq_a.weight").is_some_and(|i| i.dtype == "F8_E4M3") {
+        if cfg.ernie.is_none() && files.info("layers.0.attn.wq_a.weight").is_some_and(|i| i.dtype == "F8_E4M3") {
             bail!("DeepSeek V4: the FP8 / FP4 release is not supported yet (use a GGUF conversion)");
         }
         let ld = Loader { files, cfg: &cfg, quant };
@@ -745,13 +758,19 @@ impl<'a> DeepSeek4Model<'a> {
                 base: Vec::new(),
                 scale: Vec::new(),
             }
+        } else if cfg.ernie.is_some() {
+            ernie::hc(&ld, "hc_head", cfg.hc_mult)?
         } else {
             ld.hc_head("")?
         };
         let hash = if cfg.v41 { v41::Hash::load(&ld)? } else { None };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let mut x41 = Vec::new();
-        for l in 0..cfg.num_hidden_layers {
+        let ern = match &cfg.ernie {
+            Some(_) => Some(ernie::load(&ld, &mut layers)?),
+            None => None,
+        };
+        for l in (0..cfg.num_hidden_layers).filter(|_| ern.is_none()) {
             layers.push(
                 ld.layer(&format!("layers.{l}."), l, cfg.ratio(l))
                     .with_context(|| format!("layer {l}"))?,
@@ -773,6 +792,7 @@ impl<'a> DeepSeek4Model<'a> {
             inv_comp,
             x41,
             hash,
+            ern,
             stream: None,
         };
         // Routed experts that cannot all stay in memory are read through the page cache as they
@@ -801,6 +821,7 @@ impl<'a> DeepSeek4Model<'a> {
                 .iter()
                 .enumerate()
                 .map(|(i, l)| match self.x41.get(i) {
+                    _ if self.ern.as_ref().is_some_and(|e| e.is_mla(i)) => ernie::mla_state(c),
                     // V4.1: a key source holds the compressed keys (with the rows of the groups
                     // still pooling when the rate is above 1) and the indexers' keys.
                     Some(x) => LayerState {
@@ -841,6 +862,9 @@ impl<'a> DeepSeek4Model<'a> {
         v.extend([&s.gate, &s.up, &s.down]);
         if let Some(x) = self.x41.get(i) {
             v.extend(x.lins());
+        }
+        if let Some(e) = &self.ern {
+            v.extend(e.lins(i));
         }
         v
     }
@@ -906,6 +930,9 @@ impl<'a> DeepSeek4Model<'a> {
         let mut logits = vec![0f32; t * c.vocab_size];
         let _unit = crate::stream::enter(&self.stream, self.layers.len());
         linear(&self.head, c.vocab_size, c.hidden_size, hidden, t, &mut logits);
+        if let Some(e) = &self.ern {
+            e.multimax(&mut logits);
+        }
         logits
     }
 
@@ -952,6 +979,9 @@ impl<'a> DeepSeek4Model<'a> {
             return v41::forward(self, sess, tokens, mm, layers, feats);
         }
         assert!(mm.is_empty(), "DeepSeek V4 takes text only");
+        if self.ern.is_some() {
+            return ernie::forward(self, sess, tokens, layers, feats, None);
+        }
         let t = tokens.len();
         assert!(t > 0);
         let c = &self.cfg;
@@ -1050,7 +1080,6 @@ impl<'a> DeepSeek4Model<'a> {
         rope: (&[f32], &[f32]),
         out: &mut [f32],
     ) {
-        let _ = l;
         let c = &self.cfg;
         let a = &layer.attn;
         let (h, nh, hd, ql) = (c.hidden_size, c.num_attention_heads, c.head_dim, c.q_lora_rank);
@@ -1126,12 +1155,20 @@ impl<'a> DeepSeek4Model<'a> {
             let ti = i / nh;
             rope_tail(oh, &cos[ti * half..(ti + 1) * half], &sin[ti * half..(ti + 1) * half], true);
         });
-        grouped_out(c, a, &att, t, out);
+        // ERNIE 5.5: the heads mixed, and a gate from the query latent on the grouped output.
+        let gate = self.ern.as_ref().map(|e| e.mix_and_gate(l, &qa, &mut att, t));
+        grouped_out(c, a, &att, t, gate.as_deref(), out);
     }
 }
 
 /// The grouped output projection: each group of heads through its `wo_a` block, then `wo_b`.
-fn grouped_out(c: &DeepSeek4Config, a: &Attn, att: &[f32], t: usize, out: &mut [f32]) {
+/// `gate` (`[t, groups * o_lora]`, ERNIE 5.5): its sigmoid scales what `wo_b` reads.
+fn grouped_out(c: &DeepSeek4Config, a: &Attn, att: &[f32], t: usize, gate: Option<&[f32]>, out: &mut [f32]) {
+    let gated = |y: &mut [f32]| {
+        if let Some(g) = gate {
+            y.iter_mut().zip(g).for_each(|(v, &g)| *v *= sigmoid(g));
+        }
+    };
     let (h, nh, hd, g, r) = (c.hidden_size, c.num_attention_heads, c.head_dim, c.o_groups, c.o_lora_rank);
     let gd = nh * hd / g;
     if t < GEMM_MIN {
@@ -1148,6 +1185,7 @@ fn grouped_out(c: &DeepSeek4Config, a: &Attn, att: &[f32], t: usize, out: &mut [
                 y[(ti * g + gi) * r..(ti * g + gi + 1) * r].copy_from_slice(&yi[ti * r..(ti + 1) * r]);
             }
         }
+        gated(&mut y);
         linear(&a.wo_b, h, g * r, &y, t, out);
         return;
     }
@@ -1164,6 +1202,7 @@ fn grouped_out(c: &DeepSeek4Config, a: &Attn, att: &[f32], t: usize, out: &mut [
             y[(ti * g + gi) * r..(ti * g + gi + 1) * r].copy_from_slice(&yg[(gi * t + ti) * r..(gi * t + ti + 1) * r]);
         }
     }
+    gated(&mut y);
     linear(&a.wo_b, h, g * r, &y, t, out);
 }
 
@@ -1247,16 +1286,34 @@ fn select_with<R: Send>(
     start: usize,
     finish: &(dyn Fn(usize, &mut [f32]) -> R + Sync),
 ) -> Vec<Option<R>> {
+    select_lag(c, iq, iw, is, t, start, 0, finish)
+}
+
+/// [`select_with`] over the keys at least `lag` positions before each query (ERNIE 5.5's indexer
+/// leaves the sliding window out: `lag` = the window).
+#[allow(clippy::too_many_arguments)]
+fn select_lag<R: Send>(
+    c: &DeepSeek4Config,
+    iq: &[f32],
+    iw: &[f32],
+    is: &CompState,
+    t: usize,
+    start: usize,
+    lag: usize,
+    finish: &(dyn Fn(usize, &mut [f32]) -> R + Sync),
+) -> Vec<Option<R>> {
     let (ni, di, topk, r) = (c.index_n_heads, c.index_head_dim, c.index_topk, is.ratio);
     let mut sel: Vec<Option<R>> = (0..t).map(|_| None).collect();
-    let rows: Vec<usize> = (0..t).filter(|&i| (start + i + 1) / r > topk).collect();
+    // The keys query `i` may choose from.
+    let seen = |i: usize| (start + i + 1).saturating_sub(lag) / r;
+    let rows: Vec<usize> = (0..t).filter(|&i| seen(i) > topk).collect();
     if rows.is_empty() {
         return sel;
     }
     let _timer = prof::start(Cat::Attention);
     let keys = &is.keys;
     let score_row = |i: usize, sc: &dyn Fn(usize, usize) -> f32| -> R {
-        let nv = (start + i + 1) / r;
+        let nv = seen(i);
         let mut s = vec![0f32; nv];
         for (wi, o) in s.iter_mut().enumerate() {
             let mut acc = 0f32;
@@ -1273,7 +1330,7 @@ fn select_with<R: Send>(
         // Few queries (decode, verification): each one's scores in parallel over blocks of
         // compressed keys (the same per-key arithmetic as `score_row`), then its top-k.
         for (ri, &i) in rows.iter().enumerate() {
-            let nv = (start + i + 1) / r;
+            let nv = seen(i);
             let mut s = vec![0f32; nv];
             let sp = SendPtr(s.as_mut_ptr());
             let qs: Vec<&[f32]> = (0..ni).map(|hh| &iq[(i * ni + hh) * di..(i * ni + hh + 1) * di]).collect();
@@ -1302,7 +1359,7 @@ fn select_with<R: Send>(
             unsafe { *op.get().add(ri) = Some(v) };
         });
     } else {
-        let n = (start + t) / r;
+        let n = seen(t - 1);
         let rb = ((1usize << 22) / (ni * n.max(1))).clamp(1, 64);
         for (bi, blk) in rows.chunks(rb).enumerate() {
             let mut qb = vec![0f32; blk.len() * ni * di];
@@ -1338,8 +1395,27 @@ fn attend(
     start: usize,
     out: &mut [f32],
 ) {
+    let dims = (c.num_attention_heads, c.head_dim, c.sliding_window);
+    attend_dims(dims, sink, q, st, comp, sel, ratio, t, start, out)
+}
+
+/// [`attend`] with `dims` heads of `dims.1` and a window of `dims.2` (the MLA layers of ERNIE 5.5
+/// have their own).
+#[allow(clippy::too_many_arguments)]
+fn attend_dims(
+    dims: (usize, usize, usize),
+    sink: &[f32],
+    q: &[f32],
+    st: &LayerState,
+    comp: Option<&CompState>,
+    sel: &[Option<Vec<u32>>],
+    ratio: usize,
+    t: usize,
+    start: usize,
+    out: &mut [f32],
+) {
     let _timer = prof::start(Cat::Attention);
-    let (nh, hd, win) = (c.num_attention_heads, c.head_dim, c.sliding_window);
+    let (nh, hd, win) = dims;
     let scale = (hd as f32).powf(-0.5);
     let raw = |p: usize| &st.raw[(p - st.raw_start) * hd..(p - st.raw_start + 1) * hd];
     let ckey = |w: usize| &comp.unwrap().keys[w * hd..(w + 1) * hd];
@@ -1712,7 +1788,7 @@ impl<'a> Ds4Draft<'a> {
             let ti = i / nh;
             rope_tail(oh, &cos[ti * half..(ti + 1) * half], &sin[ti * half..(ti + 1) * half], true);
         });
-        grouped_out(c, a, &att, nb, out);
+        grouped_out(c, a, &att, nb, None, out);
     }
 }
 

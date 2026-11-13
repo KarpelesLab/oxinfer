@@ -709,6 +709,10 @@ impl ModelFiles {
                 s.metadata.insert("naming".into(), "mistral".into());
             }
         }
+        // ERNIE 5.5's own layout, under the names of DeepSeek V4's.
+        if crate::deepseek4::is_ernie(&files) {
+            files.rename(crate::deepseek4::ernie_name);
+        }
         // DeepSeek V4's own layout: the experts' w1 / w2 / w3 under the names the loaders read.
         if crate::deepseek4::is_native(&files) {
             files.rename(crate::deepseek4::native_name);

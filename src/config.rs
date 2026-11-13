@@ -1364,6 +1364,103 @@ pub struct DeepSeek4Config {
     /// V4.1: the vision tower (`vision_config`), None for a text-only conversion.
     #[serde(default)]
     pub vision_config: Option<Ds41VisionConfig>,
+    /// ERNIE 5.5 (`ernie5_5_moe`, set from `model_type`): see [`Ernie5Config`].
+    #[serde(default)]
+    pub ernie: Option<Ernie5Config>,
+}
+
+/// What ERNIE 5.5 (`ernie5_5_moe`, baidu/ERNIE-5.5-Flash-Base) adds to the DeepSeek V4 fields of
+/// [`DeepSeek4Config`] (which then describe its HCA layers), from the keys of its `config.json`;
+/// see `crate::deepseek4` (`ernie5.rs`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Ernie5Config {
+    /// Per layer, the MTP layers after the model's: an MLA layer with the DSA indexer (a
+    /// `compress_ratios` entry of 0 or less; such a layer has ratio 0 in
+    /// [`DeepSeek4Config::compress_ratios`]).
+    pub mla_layers: Vec<bool>,
+    pub mla_heads: usize,
+    pub mla_q_lora_rank: usize,
+    pub mla_kv_lora_rank: usize,
+    pub mla_qk_nope_head_dim: usize,
+    pub mla_qk_rope_head_dim: usize,
+    pub mla_v_head_dim: usize,
+    /// The first layers have a dense MLP of this width in place of the MoE.
+    pub first_k_dense_replace: usize,
+    pub intermediate_size: usize,
+    /// The routed experts run in a space of this width.
+    pub moe_latent_size: usize,
+    pub situ_beta: f64,
+    pub situ_linear_beta: f64,
+    /// `num_nextn_predict_layers`: the MTP layers after the model's.
+    #[serde(default)]
+    pub mtp_layers: usize,
+    /// The MultiMax ranges then temperatures (8 values) a GGUF header carries (otherwise the
+    /// checkpoint's `model.lm_head.multimax_*` tensors).
+    #[serde(default)]
+    pub multimax: Option<Vec<f32>>,
+}
+
+impl Ernie5Config {
+    /// The `config.json` of an `ernie5_5_moe` checkpoint in the keys of [`DeepSeek4Config`].
+    fn rewrite(mut raw: serde_json::Value) -> Result<serde_json::Value> {
+        let g = |k: &str| raw.get(k).cloned().with_context(|| format!("ernie5_5_moe: config has no {k}"));
+        let on = |k: &str| raw.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+        if !on("moe_split_feature_routing") || !on("routed_scaling_factor_learnable") {
+            bail!("ernie5_5_moe: only split-feature routing with learned expert scales is supported");
+        }
+        if raw.get("hidden_act").and_then(|v| v.as_str()) != Some("situ") {
+            bail!("ernie5_5_moe: only the situ activation is supported");
+        }
+        let ratios: Vec<i64> = serde_json::from_value(g("compress_ratios")?).context("ernie5_5_moe: compress_ratios")?;
+        let ernie = serde_json::json!({
+            "mla_layers": ratios.iter().map(|&r| r <= 0).collect::<Vec<_>>(),
+            "mla_heads": g("hybrid_mla_num_attention_heads")?,
+            "mla_q_lora_rank": g("hybrid_mla_q_lora_rank")?,
+            "mla_kv_lora_rank": g("hybrid_mla_kv_lora_rank")?,
+            "mla_qk_nope_head_dim": g("hybrid_mla_qk_nope_head_dim")?,
+            "mla_qk_rope_head_dim": g("hybrid_mla_qk_rope_head_dim")?,
+            "mla_v_head_dim": g("hybrid_mla_v_head_dim")?,
+            "first_k_dense_replace": raw.get("first_k_dense_replace").cloned().unwrap_or(0.into()),
+            "intermediate_size": g("intermediate_size")?,
+            "moe_latent_size": g("moe_latent_size")?,
+            "situ_beta": g("activation_situ_beta")?,
+            "situ_linear_beta": raw.get("activation_situ_linear_beta").cloned().unwrap_or(0.into()),
+            "mtp_layers": raw.get("num_nextn_predict_layers").cloned().unwrap_or(0.into()),
+            "multimax": raw.get("multimax_values").cloned(),
+        });
+        let o = raw.as_object_mut().context("ernie5_5_moe: config is not an object")?;
+        o.insert(
+            "compress_ratios".into(),
+            ratios.iter().map(|&r| r.max(0)).collect::<Vec<_>>().into(),
+        );
+        o.insert("ernie".into(), ernie);
+        Ok(raw)
+    }
+
+    fn check(&self, c: &DeepSeek4Config) -> Result<()> {
+        let n = c.num_hidden_layers + self.mtp_layers;
+        if self.mla_layers.len() < n {
+            bail!("ernie5_5_moe: {} compress_ratios for {n} layers", self.mla_layers.len());
+        }
+        if self.mla_layers[..c.num_hidden_layers]
+            .iter()
+            .zip(&c.compress_ratios)
+            .any(|(m, &r)| !m && r == 4)
+        {
+            bail!("ernie5_5_moe: compression rate 4 (overlapping windows with an indexer) is not part of this architecture");
+        }
+        if self.mla_layers[c.num_hidden_layers..n].iter().any(|m| !m) {
+            bail!("ernie5_5_moe: an MTP layer with compressed attention is not supported");
+        }
+        let rd = self.mla_qk_rope_head_dim;
+        if rd != c.qk_rope_head_dim || rd > c.index_head_dim || self.mla_heads == 0 || self.situ_beta <= 0.0 {
+            bail!("ernie5_5_moe: bad MLA layout");
+        }
+        if c.num_hash_layers != 0 || c.scoring_func != "sigmoid" || c.v41 {
+            bail!("ernie5_5_moe: only sigmoid routing without hash-routed layers is supported");
+        }
+        Ok(())
+    }
 }
 
 /// The `vision_config` of DeepSeek V4.1: a ViT with 2D RoPE and SwiGLU MLPs, whose patches the
@@ -1409,8 +1506,14 @@ impl DeepSeek4Config {
             }
             raw = text;
         }
+        if raw.get("model_type").and_then(|v| v.as_str()) == Some("ernie5_5_moe") && raw.get("ernie").is_none() {
+            raw = Ernie5Config::rewrite(raw)?;
+        }
         let c: DeepSeek4Config = serde_json::from_value(raw).context("parse deepseek_v4 config")?;
         let n = c.num_hidden_layers;
+        if let Some(e) = &c.ernie {
+            e.check(&c)?;
+        }
         if c.v41 {
             c.check_v41()?;
         }

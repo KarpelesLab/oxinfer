@@ -45,6 +45,12 @@ pub enum MoeAct {
         alpha: f32,
         limit: f32,
     },
+    /// ERNIE 5.5's SiTU: `beta tanh(gate / beta) sigmoid(gate) * linear_beta tanh(up /
+    /// linear_beta)` (the up side unclipped when `linear_beta` is 0). CPU only for now.
+    Situ {
+        beta: f32,
+        linear_beta: f32,
+    },
 }
 
 /// Device-side state for one weight matrix (buffers / handles), owned by the layer.

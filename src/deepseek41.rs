@@ -738,7 +738,7 @@ fn attn(
         let ti = i / nh;
         rope_tail(oh, &cos[ti * half..(ti + 1) * half], &sin[ti * half..(ti + 1) * half], true);
     });
-    grouped_out(c, a, &att, t, out);
+    grouped_out(c, a, &att, t, None, out);
 }
 
 /// The DeepSeek-naming name and PyTorch-order shape of a `deepseek41` GGUF tensor (`ne`: ggml's
