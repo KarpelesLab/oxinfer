@@ -271,6 +271,49 @@ fn e4m3_table() -> &'static [f32; 256] {
     T.get_or_init(|| std::array::from_fn(|i| e4m3_to_f32(i as u8)))
 }
 
+/// `out[i] = e4m3_to_f32(src[i]) * s` computed from the bits (the values of the table), in a
+/// form that vectorizes: the rows of an FP8 matrix are converted on every pass over them.
+#[inline(always)]
+fn e4m3_scaled_body(src: &[u8], s: f32, out: &mut [f32]) {
+    for (o, &b) in out.iter_mut().zip(src) {
+        let b = b as u32;
+        let (e, m) = ((b >> 3) & 0xF, b & 7);
+        // (1 + m / 8) * 2^(e - 7), or m / 8 * 2^-6 for the subnormals (e = 0).
+        let normal = ((e + 120) << 23) | (m << 20);
+        let subnormal = (m as i32 as f32 * (1.0 / 512.0)).to_bits();
+        let magnitude = if e == 0 { subnormal } else { normal };
+        let magnitude = if b & 0x7F == 0x7F { 0x7FC0_0000 } else { magnitude };
+        *o = f32::from_bits(magnitude | ((b & 0x80) << 24)) * s;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn e4m3_scaled_avx2(src: &[u8], s: f32, out: &mut [f32]) {
+    e4m3_scaled_body(src, s, out)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vl")]
+unsafe fn e4m3_scaled_avx512(src: &[u8], s: f32, out: &mut [f32]) {
+    e4m3_scaled_body(src, s, out)
+}
+
+/// [`e4m3_scaled_body`] compiled for the widest vectors this CPU has.
+fn e4m3_scaled_fn() -> fn(&[u8], f32, &mut [f32]) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: each is called only when its features were detected.
+        if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") {
+            return |src, s, out| unsafe { e4m3_scaled_avx512(src, s, out) };
+        }
+        if is_x86_feature_detected!("avx2") {
+            return |src, s, out| unsafe { e4m3_scaled_avx2(src, s, out) };
+        }
+    }
+    e4m3_scaled_body
+}
+
 impl GgufMatrix {
     /// An FP8 E4M3 matrix (`n_out` rows of `n_in` bytes) with its block scales (`[n_out /
     /// block.0, n_in / block.1]`, rounded up).
@@ -357,15 +400,13 @@ impl GgufMatrix {
             return;
         }
         if let Some(bs) = &self.block_scales {
-            let lut = e4m3_table();
+            let scaled = e4m3_scaled_fn();
             let ncb = n.div_ceil(bs.cols);
             for (i, r) in (r0..r1).enumerate() {
                 let srow = &bs.s[(r / bs.rows) * ncb..(r / bs.rows + 1) * ncb];
                 let (o, w) = (&mut out[i * n..(i + 1) * n], self.row(r));
                 for ((oc, wc), &s) in o.chunks_mut(bs.cols).zip(w.chunks(bs.cols)).zip(srow) {
-                    for (ov, &b) in oc.iter_mut().zip(wc) {
-                        *ov = lut[b as usize] * s;
-                    }
+                    scaled(wc, s, oc);
                 }
             }
             return;
@@ -1409,6 +1450,28 @@ pub fn random_blocks(kind: GgmlType, nb: usize, seed: &mut u64) -> Vec<u8> {
 mod tests {
     use super::*;
     use crate::kernels::matmul_quant_multi;
+
+    /// The vectorized FP8 conversion gives the table's values bit for bit, for every byte and
+    /// at every length (vector tails).
+    #[test]
+    fn e4m3_scaled_matches_the_table() {
+        let bytes: Vec<u8> = (0..=255u8).chain((0..=255u8).rev()).collect();
+        for s in [1.0f32, 0.003_741, -2.5] {
+            for len in [0usize, 1, 7, 16, 33, 128, 300, 512] {
+                for f in [e4m3_scaled_fn(), e4m3_scaled_body as fn(&[u8], f32, &mut [f32])] {
+                    let mut out = vec![0f32; len];
+                    f(&bytes[..len], s, &mut out);
+                    for (&b, &v) in bytes[..len].iter().zip(&out) {
+                        let want = e4m3_to_f32(b) * s;
+                        assert!(
+                            want.to_bits() == v.to_bits() || (want.is_nan() && v.is_nan()),
+                            "byte {b:#04x} x {s}: {v} vs {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     fn fnv(v: &[f32]) -> u64 {
         let mut h = 0xcbf29ce484222325u64;
