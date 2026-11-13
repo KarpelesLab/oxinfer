@@ -257,9 +257,6 @@ impl KimiConfig {
             Act::Silu
         }
     }
-    fn qk(&self) -> usize {
-        self.qk_nope_head_dim + self.qk_rope_head_dim
-    }
 }
 
 /// Weight streaming for a checkpoint that does not fit in memory (as Mistral Large 4).
@@ -272,17 +269,17 @@ pub fn too_big(bytes: u64) -> bool {
     crate::mistral4::too_big(bytes)
 }
 
-struct Mlp<'a> {
-    gate: Lin<'a>,
-    up: Lin<'a>,
-    down: Lin<'a>,
-    inter: usize,
-    act: Act,
+pub(crate) struct Mlp<'a> {
+    pub(crate) gate: Lin<'a>,
+    pub(crate) up: Lin<'a>,
+    pub(crate) down: Lin<'a>,
+    pub(crate) inter: usize,
+    pub(crate) act: Act,
 }
 
 impl Mlp<'_> {
     /// `y = down(act(gate(x), up(x)))` for `t` rows (`hook`: neuron edits of `target`).
-    fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32], hook: Option<(&NeuronHook, Target)>) {
+    pub(crate) fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32], hook: Option<(&NeuronHook, Target)>) {
         let mut g = vec![0f32; t * self.inter];
         let mut u = vec![0f32; t * self.inter];
         linear_multi(
@@ -322,44 +319,77 @@ enum Ffn<'a> {
     Moe(Moe<'a>),
 }
 
-struct Kda<'a> {
-    q: Lin<'a>, // [nh * hd, H]
-    k: Lin<'a>,
-    v: Lin<'a>,
+pub(crate) struct Kda<'a> {
+    pub(crate) q: Lin<'a>, // [nh * hd, H]
+    pub(crate) k: Lin<'a>,
+    pub(crate) v: Lin<'a>,
     /// The q / k / v convolutions, `[nh * hd, kernel]` each.
-    conv: [Vec<f32>; 3],
-    f_a: Lin<'a>, // [hd, H]
-    f_b: Lin<'a>, // [nh * hd, hd]
+    pub(crate) conv: [Vec<f32>; 3],
+    pub(crate) f_a: Lin<'a>, // [rank, H]
+    pub(crate) f_b: Lin<'a>, // [nh * hd, rank]
     /// `exp(A_log)` per head.
-    exp_a: Vec<f32>,
-    dt_bias: Vec<f32>, // [nh * hd]
-    b: Lin<'a>,        // [nh, H]
-    g: Lin<'a>,        // [nh * hd, H]
-    o_norm: Vec<f32>,  // [hd]
-    o: Lin<'a>,        // [H, nh * hd]
+    pub(crate) exp_a: Vec<f32>,
+    pub(crate) dt_bias: Vec<f32>, // [nh * hd]
+    pub(crate) b: Lin<'a>,        // [nh, H]
+    /// Raon-1's write gate (`[nh, H]`): the value is written with `sigmoid(b + w)` while the
+    /// state is erased with `sigmoid(b)`. None: both with `sigmoid(b)` (Kimi).
+    pub(crate) w: Option<Lin<'a>>,
+    pub(crate) g: Lin<'a>,       // [nh * hd, H]
+    pub(crate) o_norm: Vec<f32>, // [hd]
+    pub(crate) o: Lin<'a>,       // [H, nh * hd]
+}
+
+/// The shapes and constants of a KDA layer ([`kda_forward`]).
+pub(crate) struct KdaDims {
+    pub(crate) h: usize,
+    pub(crate) nh: usize,
+    pub(crate) hd: usize,
+    /// The width between `f_a` and `f_b` (Kimi: `hd`).
+    pub(crate) rank: usize,
+    pub(crate) kc: usize,
+    /// The decay's lower bound (`gate_lower_bound`).
+    pub(crate) lower: f32,
+    /// The epsilon of the gated norm of the output.
+    pub(crate) eps: f32,
+    /// The L2 norm of queries and keys: `x / max(|x|, 1e-6)` (PyTorch's `F.normalize`, Raon-1)
+    /// instead of `x rsqrt(|x|^2 + 1e-6)` (fla-core's kernels, Kimi).
+    pub(crate) clamp_norm: bool,
+}
+
+/// The shapes and constants of a gated NoPE MLA layer ([`mla_forward`]).
+pub(crate) struct MlaDims {
+    pub(crate) h: usize,
+    pub(crate) nh: usize,
+    pub(crate) lat: usize,
+    pub(crate) vd: usize,
+    pub(crate) dn: usize,
+    pub(crate) dr: usize,
+    pub(crate) ql: usize,
+    /// The epsilon of the latent norms.
+    pub(crate) eps: f32,
 }
 
 /// Kimi K3.1's lightning indexer.
-struct Indexer<'a> {
+pub(crate) struct Indexer<'a> {
     wq: Lin<'a>,                  // [n_heads * D, q_lora]
     wk: Lin<'a>,                  // [D, H]
     k_norm: (Vec<f32>, Vec<f32>), // LayerNorm [D]
     proj: Lin<'a>,                // [n_heads, H]
 }
 
-struct Mla<'a> {
-    q_a: Lin<'a>, // [q_lora, H]
-    q_norm: Vec<f32>,
-    q_b: Lin<'a>,  // [nh * (dn + dr), q_lora]
-    kv_a: Lin<'a>, // [lat + dr, H]
-    kv_norm: Vec<f32>,
+pub(crate) struct Mla<'a> {
+    pub(crate) q_a: Lin<'a>, // [q_lora, H]
+    pub(crate) q_norm: Vec<f32>,
+    pub(crate) q_b: Lin<'a>,  // [nh * (dn + dr), q_lora]
+    pub(crate) kv_a: Lin<'a>, // [lat + dr, H]
+    pub(crate) kv_norm: Vec<f32>,
     /// Per head: `k_b[h]` `[lat, dn]` maps a query's first `dn` lanes onto the latent, `v_b[h]`
     /// `[v, lat]` the attended latent onto the value.
-    k_b: Vec<Lin<'a>>,
-    v_b: Vec<Lin<'a>>,
-    gate: Option<Lin<'a>>, // [nh * v, H]
-    o: Lin<'a>,            // [H, nh * v]
-    indexer: Option<Indexer<'a>>,
+    pub(crate) k_b: Vec<Lin<'a>>,
+    pub(crate) v_b: Vec<Lin<'a>>,
+    pub(crate) gate: Option<Lin<'a>>, // [nh * v, H]
+    pub(crate) o: Lin<'a>,            // [H, nh * v]
+    pub(crate) indexer: Option<Indexer<'a>>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -381,19 +411,19 @@ struct Layer<'a> {
 /// A KDA layer's state: the delta rule's `[nh, hd, hd]` (key rows, value columns) and the last
 /// `kernel - 1` inputs of the three convolutions (`[3][kernel - 1][nh * hd]`, oldest first).
 #[derive(Clone)]
-struct KdaState {
-    s: Vec<f32>,
-    conv: Vec<f32>,
+pub(crate) struct KdaState {
+    pub(crate) s: Vec<f32>,
+    pub(crate) conv: Vec<f32>,
 }
 
 /// An MLA layer's cache: per position the normed latent `[lat]`, the shared key lanes `[dr]` and
 /// (K3.1) the index key `[D]`.
 #[derive(Clone, Default)]
-struct MlaCache {
-    c: Vec<f32>,
-    r: Vec<f32>,
-    idx: Vec<f32>,
-    len: usize,
+pub(crate) struct MlaCache {
+    pub(crate) c: Vec<f32>,
+    pub(crate) r: Vec<f32>,
+    pub(crate) idx: Vec<f32>,
+    pub(crate) len: usize,
 }
 
 #[derive(Clone)]
@@ -408,14 +438,16 @@ enum LayerState {
 /// (the same arithmetic as the pass, without reading a weight matrix). At Kimi K3's size that is
 /// one state (6 MB) plus 0.2 MB per token, per layer.
 #[derive(Clone, Default)]
-struct KdaRecord {
-    s0: Vec<f32>,
-    conv0: Vec<f32>,
+pub(crate) struct KdaRecord {
+    pub(crate) s0: Vec<f32>,
+    pub(crate) conv0: Vec<f32>,
     /// The q / k / v projections before their convolutions, `[t, nh * hd]` each.
-    raw: [Vec<f32>; 3],
-    /// `f_b(f_a(x))` `[t, nh * hd]` and `b_proj(x)` `[t, nh]`.
-    f: Vec<f32>,
-    beta: Vec<f32>,
+    pub(crate) raw: [Vec<f32>; 3],
+    /// `f_b(f_a(x))` `[t, nh * hd]`, `b_proj(x)` `[t, nh]` and the write gate's projection
+    /// (`[t, nh]`, empty without one).
+    pub(crate) f: Vec<f32>,
+    pub(crate) beta: Vec<f32>,
+    pub(crate) write: Vec<f32>,
 }
 
 /// The records of the last recording pass, which started at `pos`.
@@ -437,7 +469,7 @@ pub struct KimiSession {
 
 /// The keys each query of a pass attends to: None = every earlier key, or the sorted positions
 /// the indexer chose.
-type Selection = Vec<Option<Vec<u32>>>;
+pub(crate) type Selection = Vec<Option<Vec<u32>>>;
 
 pub struct KimiModel<'a> {
     pub cfg: KimiConfig,
@@ -468,6 +500,21 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
+/// A matrix: GGUF blocks as stored, float32 tensors exactly, others through `load_lin`.
+pub(crate) fn load_lin_exact<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usize, quant: Quant) -> Result<Lin<'a>> {
+    if files.ggml(full).is_none()
+        && let Some(info) = files.info(full)
+        && info.dtype == "F32"
+    {
+        if info.shape != [n_out, n_in] {
+            bail!("tensor {full} has shape {:?}, expected [{n_out}, {n_in}]", info.shape);
+        }
+        files.note_use(full, true, false);
+        return Lin::from_gguf(crate::ggml::GgmlType::F32, files.bytes(full)?, n_out, n_in);
+    }
+    load_lin(files, full, n_out, n_in, quant)
+}
+
 /// Loads tensors by their names in Moonshot's checkpoints, with shape checks.
 struct Loader<'a, 'c> {
     files: &'a ModelFiles,
@@ -485,19 +532,8 @@ impl<'a> Loader<'a, '_> {
         }
         self.files.f32(full)
     }
-    /// A matrix: GGUF blocks as stored, float32 tensors exactly, others through `load_lin`.
     fn lin(&self, full: &str, n_out: usize, n_in: usize) -> Result<Lin<'a>> {
-        if self.files.ggml(full).is_none()
-            && let Some(info) = self.files.info(full)
-            && info.dtype == "F32"
-        {
-            if info.shape != [n_out, n_in] {
-                bail!("tensor {full} has shape {:?}, expected [{n_out}, {n_in}]", info.shape);
-            }
-            self.files.note_use(full, true, false);
-            return Lin::from_gguf(crate::ggml::GgmlType::F32, self.files.bytes(full)?, n_out, n_in);
-        }
-        load_lin(self.files, full, n_out, n_in, self.quant)
+        load_lin_exact(self.files, full, n_out, n_in, self.quant)
     }
     fn mlp(&self, p: &str, inter: usize) -> Result<Mlp<'a>> {
         let h = self.cfg.hidden_size;
@@ -552,6 +588,7 @@ impl<'a> Loader<'a, '_> {
             exp_a,
             dt_bias: self.getf(&format!("{ap}dt_bias"), d)?,
             b: self.lin(&format!("{ap}b_proj.weight"), nh, h)?,
+            w: None,
             g: self.lin(&format!("{ap}g_proj.weight"), d, h)?,
             o_norm: self.getf(&format!("{ap}o_norm.weight"), hd)?,
             o: self.lin(&format!("{ap}o_proj.weight"), h, d)?,
@@ -733,6 +770,35 @@ impl<'a> KimiModel<'a> {
             }
         }
         Ok(m)
+    }
+
+    fn kda_dims(&self) -> KdaDims {
+        let c = &self.cfg;
+        let la = &c.linear_attn_config;
+        KdaDims {
+            h: c.hidden_size,
+            nh: la.num_heads,
+            hd: la.head_dim,
+            rank: la.head_dim,
+            kc: la.short_conv_kernel_size,
+            lower: la.gate_lower_bound.unwrap() as f32,
+            eps: c.rms_norm_eps as f32,
+            clamp_norm: false,
+        }
+    }
+
+    fn mla_dims(&self) -> MlaDims {
+        let c = &self.cfg;
+        MlaDims {
+            h: c.hidden_size,
+            nh: c.num_attention_heads,
+            lat: c.kv_lora_rank,
+            vd: c.v_head_dim,
+            dn: c.qk_nope_head_dim,
+            dr: c.qk_rope_head_dim,
+            ql: c.q_lora_rank.unwrap(),
+            eps: c.rms_norm_eps as f32,
+        }
     }
 
     pub fn new_session(&self) -> KimiSession {
@@ -966,12 +1032,14 @@ impl<'a> KimiModel<'a> {
             match (&layer.attn, &mut sess.layers[l]) {
                 (Attn::Kda(k), LayerState::Kda(st)) => {
                     let mut kr = rec.as_ref().map(|_| KdaRecord::default());
-                    self.kda_forward(k, st, kr.as_mut(), &hn, t, &mut o);
+                    kda_forward(&self.kda_dims(), k, st, kr.as_mut(), &hn, t, &mut o);
                     if let (Some(r), Some(kr)) = (&mut rec, kr) {
                         r.kda.push((l, kr));
                     }
                 }
-                (Attn::Mla(a), LayerState::Mla(cache)) => self.mla_forward(a, cache, &hn, t, start, &mut o),
+                (Attn::Mla(a), LayerState::Mla(cache)) => {
+                    mla_forward(&self.mla_dims(), c.dsa_config.as_ref(), a, cache, &hn, t, start, &mut o)
+                }
                 _ => unreachable!("layer state of another kind"),
             }
             if banked {
@@ -1054,289 +1122,319 @@ impl<'a> KimiModel<'a> {
             add_inplace(y, &ys);
         }
     }
+}
 
-    /// A KDA layer over `hn` (`[t, H]`, the normed input) into `y`, advancing `st`. `rec`: keep
-    /// what a rollback inside this pass needs.
-    fn kda_forward(&self, kd: &Kda, st: &mut KdaState, rec: Option<&mut KdaRecord>, hn: &[f32], t: usize, y: &mut [f32]) {
-        let c = &self.cfg;
-        let la = &c.linear_attn_config;
-        let (h, nh, hd) = (c.hidden_size, la.num_heads, la.head_dim);
-        let d = nh * hd;
-        let mut raw = [vec![0f32; t * d], vec![0f32; t * d], vec![0f32; t * d]];
-        let mut fa = vec![0f32; t * hd];
-        let mut beta = vec![0f32; t * nh];
-        let mut gate = vec![0f32; t * d];
-        {
-            let [rq, rk, rv] = &mut raw;
-            linear_multi(
-                &mut [
-                    (&kd.q, d, &mut rq[..]),
-                    (&kd.k, d, &mut rk[..]),
-                    (&kd.v, d, &mut rv[..]),
-                    (&kd.f_a, hd, &mut fa[..]),
-                    (&kd.b, nh, &mut beta[..]),
-                    (&kd.g, d, &mut gate[..]),
-                ],
-                h,
-                hn,
-                t,
-            );
+/// A KDA layer over `hn` (`[t, H]`, the normed input) into `y`, advancing `st`. `rec`: keep
+/// what a rollback inside this pass needs.
+pub(crate) fn kda_forward(dm: &KdaDims, kd: &Kda, st: &mut KdaState, rec: Option<&mut KdaRecord>, hn: &[f32], t: usize, y: &mut [f32]) {
+    let (h, nh, hd, rank) = (dm.h, dm.nh, dm.hd, dm.rank);
+    let d = nh * hd;
+    let mut raw = [vec![0f32; t * d], vec![0f32; t * d], vec![0f32; t * d]];
+    let mut fa = vec![0f32; t * rank];
+    let mut beta = vec![0f32; t * nh];
+    let mut write = vec![0f32; if kd.w.is_some() { t * nh } else { 0 }];
+    let mut gate = vec![0f32; t * d];
+    {
+        let [rq, rk, rv] = &mut raw;
+        let mut jobs: Vec<(&Lin, usize, &mut [f32])> = vec![
+            (&kd.q, d, &mut rq[..]),
+            (&kd.k, d, &mut rk[..]),
+            (&kd.v, d, &mut rv[..]),
+            (&kd.f_a, rank, &mut fa[..]),
+            (&kd.b, nh, &mut beta[..]),
+            (&kd.g, d, &mut gate[..]),
+        ];
+        if let Some(w) = &kd.w {
+            jobs.push((w, nh, &mut write[..]));
         }
-        let mut f = vec![0f32; t * d];
-        linear(&kd.f_b, d, hd, &fa, t, &mut f);
-        if let Some(r) = rec {
-            r.s0.clone_from(&st.s);
-            r.conv0.clone_from(&st.conv);
-            r.raw.clone_from(&raw);
-            r.f.clone_from(&f);
-            r.beta.clone_from(&beta);
-        }
-        let mut out = vec![0f32; t * d];
-        self.kda_scan(kd, st, &raw, &f, &beta, t, Some(&mut out));
-        crate::qwen::gated_norm(&mut out, &gate, &kd.o_norm, c.rms_norm_eps as f32, true, t * nh > 64);
-        linear(&kd.o, h, d, &out, t, y);
+        linear_multi(&mut jobs, h, hn, t);
     }
+    let mut f = vec![0f32; t * d];
+    linear(&kd.f_b, d, rank, &fa, t, &mut f);
+    if let Some(r) = rec {
+        r.s0.clone_from(&st.s);
+        r.conv0.clone_from(&st.conv);
+        r.raw.clone_from(&raw);
+        r.f.clone_from(&f);
+        r.beta.clone_from(&beta);
+        r.write.clone_from(&write);
+    }
+    let mut out = vec![0f32; t * d];
+    kda_scan(dm, kd, st, &raw, &f, &beta, &write, t, Some(&mut out));
+    crate::qwen::gated_norm(&mut out, &gate, &kd.o_norm, dm.eps, true, t * nh > 64);
+    linear(&kd.o, h, d, &out, t, y);
+}
 
-    /// The recurrent part of a KDA layer over `t` tokens, advancing `st`: the convolutions of the
-    /// q / k / v projections `raw`, then the gated delta rule with the decay inputs `f` and the
-    /// `beta` inputs, written to `out` (`[t, nh * hd]`) when given.
-    #[allow(clippy::too_many_arguments)]
-    fn kda_scan(&self, kd: &Kda, st: &mut KdaState, raw: &[Vec<f32>; 3], f: &[f32], beta: &[f32], t: usize, out: Option<&mut [f32]>) {
-        let la = &self.cfg.linear_attn_config;
-        let (nh, hd, kc) = (la.num_heads, la.head_dim, la.short_conv_kernel_size);
-        let d = nh * hd;
-        let lower = la.gate_lower_bound.unwrap() as f32;
-        let _timer = prof::start(Cat::Attention);
-        // Causal depthwise convolutions over time (left context from the state), then SiLU; the
-        // state keeps the last `kernel - 1` inputs.
-        let keep = kc - 1;
-        let mut conv = [vec![0f32; t * d], vec![0f32; t * d], vec![0f32; t * d]];
-        for (i, (out, x)) in conv.iter_mut().zip(raw).enumerate() {
-            let w = &kd.conv[i];
-            let past = &st.conv[i * keep * d..(i + 1) * keep * d];
-            let src = |ti: isize, ch: usize| -> f32 {
-                if ti >= 0 {
-                    x[ti as usize * d + ch]
-                } else {
-                    past[(keep as isize + ti) as usize * d + ch]
-                }
-            };
-            for_chunks(out, d, t > 1, |ti, row| {
-                for (ch, o) in row.iter_mut().enumerate() {
-                    let mut s = 0f32;
-                    for j in 0..kc {
-                        s += w[ch * kc + j] * src(ti as isize - keep as isize + j as isize, ch);
-                    }
-                    *o = s * sigmoid(s);
-                }
-            });
-            let mut next = vec![0f32; keep * d];
-            for slot in 0..keep {
-                let ti = t as isize - keep as isize + slot as isize;
-                let dst = &mut next[slot * d..(slot + 1) * d];
-                if ti >= 0 {
-                    dst.copy_from_slice(&x[ti as usize * d..(ti as usize + 1) * d]);
-                } else {
-                    let old = (keep as isize + ti) as usize;
-                    dst.copy_from_slice(&past[old * d..(old + 1) * d]);
-                }
+/// The recurrent part of a KDA layer over `t` tokens, advancing `st`: the convolutions of the
+/// q / k / v projections `raw`, then the gated delta rule with the decay inputs `f` and the
+/// `beta` inputs (and those of the write gate, `write`, empty without one), written to `out`
+/// (`[t, nh * hd]`) when given.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn kda_scan(
+    dm: &KdaDims,
+    kd: &Kda,
+    st: &mut KdaState,
+    raw: &[Vec<f32>; 3],
+    f: &[f32],
+    beta: &[f32],
+    write: &[f32],
+    t: usize,
+    out: Option<&mut [f32]>,
+) {
+    let (nh, hd, kc) = (dm.nh, dm.hd, dm.kc);
+    let d = nh * hd;
+    let (lower, clamp) = (dm.lower, dm.clamp_norm);
+    let _timer = prof::start(Cat::Attention);
+    // Causal depthwise convolutions over time (left context from the state), then SiLU; the
+    // state keeps the last `kernel - 1` inputs.
+    let keep = kc - 1;
+    let mut conv = [vec![0f32; t * d], vec![0f32; t * d], vec![0f32; t * d]];
+    for (i, (out, x)) in conv.iter_mut().zip(raw).enumerate() {
+        let w = &kd.conv[i];
+        let past = &st.conv[i * keep * d..(i + 1) * keep * d];
+        let src = |ti: isize, ch: usize| -> f32 {
+            if ti >= 0 {
+                x[ti as usize * d + ch]
+            } else {
+                past[(keep as isize + ti) as usize * d + ch]
             }
-            st.conv[i * keep * d..(i + 1) * keep * d].copy_from_slice(&next);
-        }
-        // The gated delta rule, recurrent over time, parallel over heads.
-        let [cq, ck, cv] = &conv;
-        let (op, sp) = (out.map(|o| SendPtr(o.as_mut_ptr())), SendPtr(st.s.as_mut_ptr()));
-        let qscale = (hd as f32).powf(-0.5);
-        crate::pool::run(nh, &|hh| {
-            // SAFETY: each head owns its state slab and its output columns.
-            let s = unsafe { std::slice::from_raw_parts_mut(sp.get().add(hh * hd * hd), hd * hd) };
-            let (mut qn, mut kn) = (vec![0f32; hd], vec![0f32; hd]);
-            let (mut mem, mut delta, mut decay) = (vec![0f32; hd], vec![0f32; hd], vec![0f32; hd]);
-            for ti in 0..t {
-                let at = ti * d + hh * hd;
-                let (qv, kv, vv) = (&cq[at..at + hd], &ck[at..at + hd], &cv[at..at + hd]);
-                let qi = (dot(qv, qv) + 1e-6).sqrt().recip() * qscale;
-                let ki = (dot(kv, kv) + 1e-6).sqrt().recip();
-                for j in 0..hd {
-                    qn[j] = qv[j] * qi;
-                    kn[j] = kv[j] * ki;
-                    decay[j] = (lower * sigmoid(kd.exp_a[hh] * (f[at + j] + kd.dt_bias[hh * hd + j]))).exp();
+        };
+        for_chunks(out, d, t > 1, |ti, row| {
+            for (ch, o) in row.iter_mut().enumerate() {
+                let mut s = 0f32;
+                for j in 0..kc {
+                    s += w[ch * kc + j] * src(ti as isize - keep as isize + j as isize, ch);
                 }
-                let b = sigmoid(beta[ti * nh + hh]);
-                // S *= exp(g) (per key row); mem = k^T S.
-                mem.fill(0.0);
-                for dk in 0..hd {
-                    let row = &mut s[dk * hd..(dk + 1) * hd];
-                    let (dc, kd_) = (decay[dk], kn[dk]);
-                    for (m, r) in mem.iter_mut().zip(row.iter_mut()) {
-                        *r *= dc;
-                        *m += *r * kd_;
-                    }
-                }
-                for j in 0..hd {
-                    delta[j] = (vv[j] - mem[j]) * b;
-                }
-                // S += k (x) delta; o = q^T S.
-                match op {
-                    Some(op) => {
-                        // SAFETY: this (token, head) output slice is written by this head only.
-                        let o = unsafe { std::slice::from_raw_parts_mut(op.get().add(at), hd) };
-                        o.fill(0.0);
-                        for dk in 0..hd {
-                            let row = &mut s[dk * hd..(dk + 1) * hd];
-                            let (kd_, qd) = (kn[dk], qn[dk]);
-                            for j in 0..hd {
-                                row[j] += kd_ * delta[j];
-                                o[j] += row[j] * qd;
-                            }
-                        }
-                    }
-                    None => {
-                        for dk in 0..hd {
-                            let row = &mut s[dk * hd..(dk + 1) * hd];
-                            let kd_ = kn[dk];
-                            for j in 0..hd {
-                                row[j] += kd_ * delta[j];
-                            }
-                        }
-                    }
-                }
+                *o = s * sigmoid(s);
             }
         });
+        let mut next = vec![0f32; keep * d];
+        for slot in 0..keep {
+            let ti = t as isize - keep as isize + slot as isize;
+            let dst = &mut next[slot * d..(slot + 1) * d];
+            if ti >= 0 {
+                dst.copy_from_slice(&x[ti as usize * d..(ti as usize + 1) * d]);
+            } else {
+                let old = (keep as isize + ti) as usize;
+                dst.copy_from_slice(&past[old * d..(old + 1) * d]);
+            }
+        }
+        st.conv[i * keep * d..(i + 1) * keep * d].copy_from_slice(&next);
     }
-
-    /// An MLA layer over `hn` (`[t, H]`, the normed input) into `out`, appending to `cache`.
-    fn mla_forward(&self, a: &Mla, cache: &mut MlaCache, hn: &[f32], t: usize, start: usize, out: &mut [f32]) {
-        let c = &self.cfg;
-        let (h, nh, lat, vd) = (c.hidden_size, c.num_attention_heads, c.kv_lora_rank, c.v_head_dim);
-        let (dr, ql, qk) = (c.qk_rope_head_dim, c.q_lora_rank.unwrap(), c.qk());
-        let eps = c.rms_norm_eps as f32;
-        let (ni, d, topk) = match (&a.indexer, &c.dsa_config) {
-            (Some(_), Some(dc)) => (dc.index_num_heads, dc.index_head_dim, dc.index_topk),
-            _ => (0, 0, usize::MAX),
-        };
-        let mut qa = vec![0f32; t * ql];
-        let mut kv = vec![0f32; t * (lat + dr)];
-        let mut gate = vec![0f32; if a.gate.is_some() { t * nh * vd } else { 0 }];
-        let mut ik = vec![0f32; t * d];
-        let mut iw = vec![0f32; t * ni];
-        {
-            let mut jobs: Vec<(&Lin, usize, &mut [f32])> = vec![(&a.q_a, ql, &mut qa[..]), (&a.kv_a, lat + dr, &mut kv[..])];
-            if let Some(g) = &a.gate {
-                jobs.push((g, nh * vd, &mut gate[..]));
-            }
-            if let Some(ix) = &a.indexer {
-                jobs.push((&ix.wk, d, &mut ik[..]));
-                jobs.push((&ix.proj, ni, &mut iw[..]));
-            }
-            linear_multi(&mut jobs, h, hn, t);
-        }
-        rmsnorm_f32w_rows_inplace(&mut qa, ql, &a.q_norm, eps);
-        let mut q = vec![0f32; t * nh * qk];
-        linear(&a.q_b, nh * qk, ql, &qa, t, &mut q);
-        // The cache: normed latent and the shared key lanes per token.
-        for row in kv.chunks_mut(lat + dr) {
-            let (cl, kr) = row.split_at_mut(lat);
-            rmsnorm_f32w_inplace(cl, &a.kv_norm, eps);
-            cache.c.extend_from_slice(cl);
-            cache.r.extend_from_slice(kr);
-        }
-        cache.len += t;
-        debug_assert_eq!(cache.len, start + t);
-        // The indexer: its keys join the cache; a query that sees more than `index_topk` keys
-        // attends to its best ones only.
-        let sel: Selection = match (&a.indexer, &c.dsa_config) {
-            (Some(ix), Some(dc)) => {
-                layer_norm_rows(&mut ik, d, &ix.k_norm.0, &ix.k_norm.1, dc.index_norm_eps as f32);
-                cache.idx.extend_from_slice(&ik);
-                if start + t > topk {
-                    let mut iq = vec![0f32; t * ni * d];
-                    linear(&ix.wq, ni * d, ql, &qa, t, &mut iq);
-                    let ws = ((d * ni) as f32).powf(-0.5);
-                    iw.iter_mut().for_each(|w| *w *= ws);
-                    select(&iq, &iw, &cache.idx, ni, d, topk, t, start)
+    // The gated delta rule, recurrent over time, parallel over heads.
+    let [cq, ck, cv] = &conv;
+    let (op, sp) = (out.map(|o| SendPtr(o.as_mut_ptr())), SendPtr(st.s.as_mut_ptr()));
+    let qscale = (hd as f32).powf(-0.5);
+    crate::pool::run(nh, &|hh| {
+        // SAFETY: each head owns its state slab and its output columns.
+        let s = unsafe { std::slice::from_raw_parts_mut(sp.get().add(hh * hd * hd), hd * hd) };
+        let (mut qn, mut kn) = (vec![0f32; hd], vec![0f32; hd]);
+        let (mut mem, mut delta, mut decay) = (vec![0f32; hd], vec![0f32; hd], vec![0f32; hd]);
+        for ti in 0..t {
+            let at = ti * d + hh * hd;
+            let (qv, kv, vv) = (&cq[at..at + hd], &ck[at..at + hd], &cv[at..at + hd]);
+            let inv = |v: &[f32]| {
+                if clamp {
+                    dot(v, v).sqrt().max(1e-6).recip()
                 } else {
-                    vec![None; t]
+                    (dot(v, v) + 1e-6).sqrt().recip()
+                }
+            };
+            let (qi, ki) = (inv(qv) * qscale, inv(kv));
+            for j in 0..hd {
+                qn[j] = qv[j] * qi;
+                kn[j] = kv[j] * ki;
+                decay[j] = (lower * sigmoid(kd.exp_a[hh] * (f[at + j] + kd.dt_bias[hh * hd + j]))).exp();
+            }
+            let b = sigmoid(beta[ti * nh + hh]);
+            // The value's share: written with `sigmoid(b + w)` where the state is erased with
+            // `sigmoid(b)`.
+            let wr = if write.is_empty() {
+                1.0
+            } else {
+                sigmoid(beta[ti * nh + hh] + write[ti * nh + hh]) / b
+            };
+            // S *= exp(g) (per key row); mem = k^T S.
+            mem.fill(0.0);
+            for dk in 0..hd {
+                let row = &mut s[dk * hd..(dk + 1) * hd];
+                let (dc, kd_) = (decay[dk], kn[dk]);
+                for (m, r) in mem.iter_mut().zip(row.iter_mut()) {
+                    *r *= dc;
+                    *m += *r * kd_;
                 }
             }
-            _ => vec![None; t],
-        };
-        let mut att = vec![0f32; t * nh * vd];
-        self.attend(a, &q, cache, t, start, &sel, &mut att);
-        if a.gate.is_some() {
-            for (v, g) in att.iter_mut().zip(&gate) {
-                *v *= sigmoid(*g);
+            for j in 0..hd {
+                delta[j] = (vv[j] * wr - mem[j]) * b;
             }
-        }
-        linear(&a.o, h, nh * vd, &att, t, out);
-    }
-
-    /// Attention scored against the latent cache (`kv_b` absorbed): each head's first `dn` query
-    /// lanes are mapped onto the latent (`k_b`) and scored, with its last `dr` lanes against the
-    /// shared key lanes, at every chosen position; the attended latent is mapped onto the value
-    /// (`v_b`). `out` `[t, nh * v]`.
-    #[allow(clippy::too_many_arguments)]
-    fn attend(&self, a: &Mla, q: &[f32], cache: &MlaCache, t: usize, start: usize, sel: &Selection, out: &mut [f32]) {
-        let c = &self.cfg;
-        let (nh, lat, vd) = (c.num_attention_heads, c.kv_lora_rank, c.v_head_dim);
-        let (dn, dr, qk) = (c.qk_nope_head_dim, c.qk_rope_head_dim, c.qk());
-        let mut qn = vec![0f32; nh * t * dn];
-        for ti in 0..t {
-            for hh in 0..nh {
-                qn[(hh * t + ti) * dn..(hh * t + ti + 1) * dn].copy_from_slice(&q[(ti * nh + hh) * qk..(ti * nh + hh) * qk + dn]);
-            }
-        }
-        let ql = per_head(&a.k_b, &qn, t, dn, lat);
-        let _timer = prof::start(Cat::Attention);
-        let scale = (qk as f32).powf(-0.5);
-        let lists: Vec<Option<&[u32]>> = (0..t).map(|ti| sel[ti].as_deref()).collect();
-        let pos = |ti: usize, jj: usize| -> usize {
-            match lists[ti] {
-                Some(s) => s[jj] as usize,
-                None => jj,
-            }
-        };
-        let mut ol = vec![0f32; nh * t * lat];
-        crate::attn::attend_shared(
-            t,
-            nh,
-            lat,
-            &|ti| lists[ti].map_or(start + ti + 1, |s| s.len()),
-            &|ti, keys, sc| {
-                let len = keys.len();
-                let (mut s1, mut s2) = ([0f32; 8], [0f32; 8]);
-                for h0 in (0..nh).step_by(8) {
-                    let hb = 8.min(nh - h0);
-                    let qls: Vec<&[f32]> = (h0..h0 + hb).map(|hh| &ql[(hh * t + ti) * lat..(hh * t + ti + 1) * lat]).collect();
-                    let qrs: Vec<&[f32]> = (h0..h0 + hb)
-                        .map(|hh| &q[(ti * nh + hh) * qk + dn..(ti * nh + hh + 1) * qk])
-                        .collect();
-                    for (jj, k) in keys.clone().enumerate() {
-                        let j = pos(ti, k);
-                        crate::attn::dots(&qls, &cache.c[j * lat..(j + 1) * lat], &mut s1[..hb]);
-                        if dr > 0 {
-                            crate::attn::dots(&qrs, &cache.r[j * dr..(j + 1) * dr], &mut s2[..hb]);
-                        }
-                        for b in 0..hb {
-                            sc[(h0 + b) * len + jj] = (s1[b] + if dr > 0 { s2[b] } else { 0.0 }) * scale;
+            // S += k (x) delta; o = q^T S.
+            match op {
+                Some(op) => {
+                    // SAFETY: this (token, head) output slice is written by this head only.
+                    let o = unsafe { std::slice::from_raw_parts_mut(op.get().add(at), hd) };
+                    o.fill(0.0);
+                    for dk in 0..hd {
+                        let row = &mut s[dk * hd..(dk + 1) * hd];
+                        let (kd_, qd) = (kn[dk], qn[dk]);
+                        for j in 0..hd {
+                            row[j] += kd_ * delta[j];
+                            o[j] += row[j] * qd;
                         }
                     }
                 }
-            },
-            &|_, _, row| softmax_inplace(row),
-            &|ti, jj| {
-                let j = pos(ti, jj);
-                &cache.c[j * lat..(j + 1) * lat]
-            },
-            &|ti, hh| (hh * t + ti) * lat,
-            &mut ol,
-        );
-        drop(_timer);
-        let v = per_head(&a.v_b, &ol, t, lat, vd);
-        for ti in 0..t {
-            for hh in 0..nh {
-                out[(ti * nh + hh) * vd..(ti * nh + hh + 1) * vd].copy_from_slice(&v[(hh * t + ti) * vd..(hh * t + ti + 1) * vd]);
+                None => {
+                    for dk in 0..hd {
+                        let row = &mut s[dk * hd..(dk + 1) * hd];
+                        let kd_ = kn[dk];
+                        for j in 0..hd {
+                            row[j] += kd_ * delta[j];
+                        }
+                    }
+                }
             }
+        }
+    });
+}
+
+/// An MLA layer over `hn` (`[t, H]`, the normed input) into `out`, appending to `cache`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mla_forward(
+    dm: &MlaDims,
+    dsa: Option<&DsaConfig>,
+    a: &Mla,
+    cache: &mut MlaCache,
+    hn: &[f32],
+    t: usize,
+    start: usize,
+    out: &mut [f32],
+) {
+    let (h, nh, lat, vd) = (dm.h, dm.nh, dm.lat, dm.vd);
+    let (dr, ql, qk) = (dm.dr, dm.ql, dm.dn + dm.dr);
+    let eps = dm.eps;
+    let (ni, d, topk) = match (&a.indexer, dsa) {
+        (Some(_), Some(dc)) => (dc.index_num_heads, dc.index_head_dim, dc.index_topk),
+        _ => (0, 0, usize::MAX),
+    };
+    let mut qa = vec![0f32; t * ql];
+    let mut kv = vec![0f32; t * (lat + dr)];
+    let mut gate = vec![0f32; if a.gate.is_some() { t * nh * vd } else { 0 }];
+    let mut ik = vec![0f32; t * d];
+    let mut iw = vec![0f32; t * ni];
+    {
+        let mut jobs: Vec<(&Lin, usize, &mut [f32])> = vec![(&a.q_a, ql, &mut qa[..]), (&a.kv_a, lat + dr, &mut kv[..])];
+        if let Some(g) = &a.gate {
+            jobs.push((g, nh * vd, &mut gate[..]));
+        }
+        if let Some(ix) = &a.indexer {
+            jobs.push((&ix.wk, d, &mut ik[..]));
+            jobs.push((&ix.proj, ni, &mut iw[..]));
+        }
+        linear_multi(&mut jobs, h, hn, t);
+    }
+    rmsnorm_f32w_rows_inplace(&mut qa, ql, &a.q_norm, eps);
+    let mut q = vec![0f32; t * nh * qk];
+    linear(&a.q_b, nh * qk, ql, &qa, t, &mut q);
+    // The cache: normed latent and the shared key lanes per token.
+    for row in kv.chunks_mut(lat + dr) {
+        let (cl, kr) = row.split_at_mut(lat);
+        rmsnorm_f32w_inplace(cl, &a.kv_norm, eps);
+        cache.c.extend_from_slice(cl);
+        cache.r.extend_from_slice(kr);
+    }
+    cache.len += t;
+    debug_assert_eq!(cache.len, start + t);
+    // The indexer: its keys join the cache; a query that sees more than `index_topk` keys
+    // attends to its best ones only.
+    let sel: Selection = match (&a.indexer, dsa) {
+        (Some(ix), Some(dc)) => {
+            layer_norm_rows(&mut ik, d, &ix.k_norm.0, &ix.k_norm.1, dc.index_norm_eps as f32);
+            cache.idx.extend_from_slice(&ik);
+            if start + t > topk {
+                let mut iq = vec![0f32; t * ni * d];
+                linear(&ix.wq, ni * d, ql, &qa, t, &mut iq);
+                let ws = ((d * ni) as f32).powf(-0.5);
+                iw.iter_mut().for_each(|w| *w *= ws);
+                select(&iq, &iw, &cache.idx, ni, d, topk, t, start)
+            } else {
+                vec![None; t]
+            }
+        }
+        _ => vec![None; t],
+    };
+    let mut att = vec![0f32; t * nh * vd];
+    attend(dm, a, &q, cache, t, start, &sel, &mut att);
+    if a.gate.is_some() {
+        for (v, g) in att.iter_mut().zip(&gate) {
+            *v *= sigmoid(*g);
+        }
+    }
+    linear(&a.o, h, nh * vd, &att, t, out);
+}
+
+/// Attention scored against the latent cache (`kv_b` absorbed): each head's first `dn` query
+/// lanes are mapped onto the latent (`k_b`) and scored, with its last `dr` lanes against the
+/// shared key lanes, at every chosen position; the attended latent is mapped onto the value
+/// (`v_b`). `out` `[t, nh * v]`.
+#[allow(clippy::too_many_arguments)]
+fn attend(dm: &MlaDims, a: &Mla, q: &[f32], cache: &MlaCache, t: usize, start: usize, sel: &Selection, out: &mut [f32]) {
+    let (nh, lat, vd) = (dm.nh, dm.lat, dm.vd);
+    let (dn, dr, qk) = (dm.dn, dm.dr, dm.dn + dm.dr);
+    let mut qn = vec![0f32; nh * t * dn];
+    for ti in 0..t {
+        for hh in 0..nh {
+            qn[(hh * t + ti) * dn..(hh * t + ti + 1) * dn].copy_from_slice(&q[(ti * nh + hh) * qk..(ti * nh + hh) * qk + dn]);
+        }
+    }
+    let ql = per_head(&a.k_b, &qn, t, dn, lat);
+    let _timer = prof::start(Cat::Attention);
+    let scale = (qk as f32).powf(-0.5);
+    let lists: Vec<Option<&[u32]>> = (0..t).map(|ti| sel[ti].as_deref()).collect();
+    let pos = |ti: usize, jj: usize| -> usize {
+        match lists[ti] {
+            Some(s) => s[jj] as usize,
+            None => jj,
+        }
+    };
+    let mut ol = vec![0f32; nh * t * lat];
+    crate::attn::attend_shared(
+        t,
+        nh,
+        lat,
+        &|ti| lists[ti].map_or(start + ti + 1, |s| s.len()),
+        &|ti, keys, sc| {
+            let len = keys.len();
+            let (mut s1, mut s2) = ([0f32; 8], [0f32; 8]);
+            for h0 in (0..nh).step_by(8) {
+                let hb = 8.min(nh - h0);
+                let qls: Vec<&[f32]> = (h0..h0 + hb).map(|hh| &ql[(hh * t + ti) * lat..(hh * t + ti + 1) * lat]).collect();
+                let qrs: Vec<&[f32]> = (h0..h0 + hb)
+                    .map(|hh| &q[(ti * nh + hh) * qk + dn..(ti * nh + hh + 1) * qk])
+                    .collect();
+                for (jj, k) in keys.clone().enumerate() {
+                    let j = pos(ti, k);
+                    crate::attn::dots(&qls, &cache.c[j * lat..(j + 1) * lat], &mut s1[..hb]);
+                    if dr > 0 {
+                        crate::attn::dots(&qrs, &cache.r[j * dr..(j + 1) * dr], &mut s2[..hb]);
+                    }
+                    for b in 0..hb {
+                        sc[(h0 + b) * len + jj] = (s1[b] + if dr > 0 { s2[b] } else { 0.0 }) * scale;
+                    }
+                }
+            }
+        },
+        &|_, _, row| softmax_inplace(row),
+        &|ti, jj| {
+            let j = pos(ti, jj);
+            &cache.c[j * lat..(j + 1) * lat]
+        },
+        &|ti, hh| (hh * t + ti) * lat,
+        &mut ol,
+    );
+    drop(_timer);
+    let v = per_head(&a.v_b, &ol, t, lat, vd);
+    for ti in 0..t {
+        for hh in 0..nh {
+            out[(ti * nh + hh) * vd..(ti * nh + hh + 1) * vd].copy_from_slice(&v[(hh * t + ti) * vd..(hh * t + ti + 1) * vd]);
         }
     }
 }
@@ -1419,7 +1517,7 @@ impl KimiModel<'_> {
             kr.f.truncate(n * d);
             kr.beta.truncate(n * nh);
             if n > 0 {
-                self.kda_scan(kd, st, &kr.raw, &kr.f, &kr.beta, n, None);
+                kda_scan(&self.kda_dims(), kd, st, &kr.raw, &kr.f, &kr.beta, &kr.write, n, None);
             }
         }
         let di = c.dsa_config.as_ref().map_or(0, |dc| dc.index_head_dim);
