@@ -157,14 +157,14 @@ jobs:
       # A static x86_64-unknown-linux-fullrust executable: no libc, no interpreter, nothing to
       # install. That target is not in the `unix` family and cannot load shared libraries, so
       # the `gpu` feature (CUDA / Vulkan through dlopen) is left out: this binary runs on the
-      # CPU. `server` is left out too: httpsd 0.2.0 has no positioned read for this target.
+      # CPU.
       # The image tracks the stable toolchain the other jobs use.
       - name: Build static libc-free binary (fullrust)
         uses: KarpelesLab/fullrust@master
         with:
           image: ghcr.io/karpeleslab/fullrust:1.100
           args: >-
-            --release --bin oxinfer --no-default-features --features media,hf,update
+            --release --bin oxinfer --no-default-features --features media,hf,server,update
             --config profile.release.debug=false --config profile.release.strip=true
 
       - name: Stage archive contents

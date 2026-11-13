@@ -4665,7 +4665,7 @@ dispatched by release-plz on the new tag):
 
 | archive | built with | notes |
 |---|---|---|
-| `oxinfer-<tag>-linux-x86_64-static.tar.gz` | the [fullrust](https://github.com/KarpelesLab/fullrust) toolchain | a static executable with no libc and no interpreter: it needs only a Linux kernel. CPU only (it cannot load the CUDA / Vulkan libraries) and without `oxinfer serve` (httpsd does not build for that target yet) |
+| `oxinfer-<tag>-linux-x86_64-static.tar.gz` | the [fullrust](https://github.com/KarpelesLab/fullrust) toolchain | a static executable with no libc and no interpreter: it needs only a Linux kernel. CPU only (it cannot load the CUDA / Vulkan libraries) |
 | `oxinfer-<tag>-linux-x86_64.tar.gz`, `-linux-aarch64.tar.gz` | stable Rust, glibc | all default features |
 | `oxinfer-<tag>-windows-x86_64.zip`, `-windows-aarch64.zip` | stable Rust, MSVC | |
 | `oxinfer-<tag>-macos-universal.tar.gz` | stable Rust, both Apple architectures in one binary | |

@@ -250,9 +250,9 @@ checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "httpsd"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2f7002f2eee36d6831f8145317a3b50b13829d3eb170ca633940b5542bf7b61e"
+checksum = "b82cfb0dc3a3f9b2d42d384de875c3bb9d9df0779f6b91cd02ac8a5783900247"
 dependencies = [
  "purecrypto",
 ]
