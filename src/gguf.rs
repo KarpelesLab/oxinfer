@@ -323,8 +323,9 @@ impl Header {
             "glm-dsa" => "glm_moe_dsa",
             "kimi-k3" => "kimi_k3",
             "kimi-k31" => "kimi_k31",
+            "nemotron_h" | "nemotron_h_moe" => "nemotron_h",
             a => bail!(
-                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, llama, gemma4, mistral-large4, deepseek4, deepseek41, minimax-m2, minimax-m3, glm5-next, glm-dsa and qwen2 are)"
+                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, llama, gemma4, mistral-large4, deepseek4, deepseek41, minimax-m2, minimax-m3, glm5-next, glm-dsa, nemotron_h, nemotron_h_moe and qwen2 are)"
             ),
         })
     }
@@ -354,6 +355,9 @@ impl Header {
         }
         if matches!(mt, "kimi_k3" | "kimi_k31") {
             return crate::kimi::gguf_config(self);
+        }
+        if mt == "nemotron_h" {
+            return crate::nemotron::gguf_config(self);
         }
         let llama = mt == "llama";
         let minimax = matches!(mt, "minimax_m2" | "minimax_m3_vl_text");
@@ -999,6 +1003,10 @@ pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec
     }
     if matches!(arch, "kimi-k3" | "kimi-k31") {
         return crate::kimi::gguf_name(&t.name, &t.ne);
+    }
+    // Nemotron-H: transformers' naming.
+    if matches!(arch, "nemotron_h" | "nemotron_h_moe") {
+        return crate::nemotron::gguf_name(&t.name, &t.ne, n_layers);
     }
     let mut shape: Vec<usize> = t.ne.iter().rev().copied().collect();
     let name = match t.name.as_str() {
