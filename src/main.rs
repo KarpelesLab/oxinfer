@@ -2061,6 +2061,19 @@ fn run_embed(args: &Args) -> Result<()> {
     if (args.sparse && !emb.has_sparse()) || (args.colbert && !emb.has_colbert()) {
         bail!("this model has no {} head", if args.sparse { "sparse" } else { "colbert" });
     }
+    let fmt = |v: &[f32]| format!("[{}]", v.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(","));
+    // Attachments (EmbeddingGemma 2): one embedding of them and the prompt text, if any.
+    let mm = mm_request(args);
+    if !mm.is_empty() {
+        let t1 = Instant::now();
+        let mut e = emb.embed_media(&mm, &files, args.prompt.as_deref().unwrap_or(""), args.prompt_name.as_deref())?;
+        if let Some(d) = args.dim {
+            e.truncate(d)?;
+        }
+        println!("{}", fmt(&e.dense));
+        eprintln!("[1 input with attachments in {:.2}s]", t1.elapsed().as_secs_f64());
+        return Ok(());
+    }
     let texts: Vec<String> = match &args.prompt {
         Some(p) => vec![p.clone()],
         None => std::io::stdin()
@@ -2071,7 +2084,6 @@ fn run_embed(args: &Args) -> Result<()> {
             .filter(|l| !l.trim().is_empty())
             .collect(),
     };
-    let fmt = |v: &[f32]| format!("[{}]", v.iter().map(|x| format!("{x}")).collect::<Vec<_>>().join(","));
     let t1 = Instant::now();
     let mut vecs = Vec::with_capacity(texts.len());
     for text in &texts {

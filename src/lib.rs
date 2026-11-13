@@ -36,6 +36,7 @@ pub mod deepseek4;
 pub mod drafter;
 pub mod dspark;
 pub mod embed;
+pub mod embed_gemma2;
 pub mod engine;
 pub mod fish;
 pub mod flux;

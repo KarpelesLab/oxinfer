@@ -218,7 +218,13 @@ pub struct AudioTower<'a> {
 
 impl<'a> AudioTower<'a> {
     pub fn load(cfg: AudioConfig, files: &'a ModelFiles, text_hidden: usize) -> Result<Self> {
-        let pre = "model.audio_tower.";
+        // Gemma 4 keeps its towers under `model.`, EmbeddingGemma 2 at the root.
+        let root = if files.has("model.embed_audio.embedding_projection.weight") {
+            "model."
+        } else {
+            ""
+        };
+        let pre = format!("{root}audio_tower.");
         let h = cfg.hidden_size;
         let get = |name: &str, shape: &[usize]| -> Result<&'a [u16]> {
             let full = format!("{pre}{name}");
@@ -266,7 +272,8 @@ impl<'a> AudioTower<'a> {
                 lc_end: cl("lconv1d.linear_end", h, h)?,
             });
         }
-        let embed_name = "model.embed_audio.embedding_projection.weight";
+        let embed_name = format!("{root}embed_audio.embedding_projection.weight");
+        let embed_name = embed_name.as_str();
         let embed_proj = {
             let info = files.info(embed_name).context("missing embed_audio projection")?;
             if info.shape != [text_hidden, cfg.output_proj_dims] {

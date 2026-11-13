@@ -8,6 +8,7 @@
 
 use crate::bert::{BertConfig, BertModel};
 use crate::config::{QwenConfig, TextConfig};
+use crate::embed_gemma2::{EmbGemma2Config, EmbGemma2Model};
 use crate::model::{Model, Quant};
 use crate::modernbert::{ModernBertConfig, ModernBertModel};
 use crate::mpnet::{MpnetConfig, MpnetModel};
@@ -20,6 +21,8 @@ use std::path::Path;
 
 enum Backbone<'a> {
     Gemma(Box<Model<'a>>),
+    /// EmbeddingGemma 2 (`crate::embed_gemma2`): its rows are already projected to the output size.
+    Gemma2(Box<EmbGemma2Model<'a>>),
     Qwen(Box<QwenModel<'a>>),
     Bert(Box<BertModel<'a>>),
     Mpnet(Box<MpnetModel<'a>>),
@@ -224,6 +227,8 @@ impl<'a> Embedder<'a> {
             let mut cfg = QwenConfig::load(dir)?;
             cfg.bidirectional = model_type == "qwen2" && qwen2_bidirectional(dir);
             Backbone::Qwen(Box::new(QwenModel::load(cfg, files, quant)?))
+        } else if model_type == "embedding_gemma2" {
+            Backbone::Gemma2(Box::new(EmbGemma2Model::load(EmbGemma2Config::load(dir)?, files, quant)?))
         } else if model_type.starts_with("gemma") {
             Backbone::Gemma(Box::new(Model::load(TextConfig::load(dir)?, files, quant)?))
         } else if crate::bert::is_bert(&model_type) {
@@ -239,6 +244,7 @@ impl<'a> Embedder<'a> {
         };
         let hidden = match &backbone {
             Backbone::Gemma(m) => m.cfg.hidden_size,
+            Backbone::Gemma2(m) => m.cfg.hidden_size,
             Backbone::Qwen(m) => m.cfg.hidden_size,
             Backbone::Bert(m) => m.cfg.hidden_size,
             Backbone::Mpnet(m) => m.cfg.hidden_size,
@@ -260,7 +266,15 @@ impl<'a> Embedder<'a> {
                 "Transformer" => {}
                 "Pooling" => {
                     let c = read_json(&mdir.join("config.json")).context("pooling config")?;
-                    let on = |k: &str| c[k].as_bool().unwrap_or(false);
+                    // sentence-transformers 6 writes one `pooling_mode` name, older ones a flag each.
+                    let mode = c["pooling_mode"].as_str();
+                    let on = |k: &str| {
+                        c[k].as_bool().unwrap_or(false)
+                            || mode.is_some_and(|m| {
+                                k.strip_prefix("pooling_mode_")
+                                    .is_some_and(|f| f == m || f.strip_suffix("_token").or(f.strip_suffix("_tokens")) == Some(m))
+                            })
+                    };
                     pooling = if on("pooling_mode_cls_token") {
                         Pooling::Cls
                     } else if on("pooling_mode_lasttoken") {
@@ -310,6 +324,7 @@ impl<'a> Embedder<'a> {
         let max_len = read_json(&dir.join("sentence_bert_config.json"))
             .and_then(|c| c["max_seq_length"].as_u64())
             .or_else(|| cfg["max_position_embeddings"].as_u64())
+            .or_else(|| cfg["text_config"]["max_position_embeddings"].as_u64())
             .unwrap_or(512) as usize;
 
         let mut tok = Tokenizer::from_bytes(crate::fsx::read(&dir.join("tokenizer.json"))?).map_err(|e| anyhow!("tokenizer: {e}"))?;
@@ -391,6 +406,7 @@ impl<'a> Embedder<'a> {
         match (self.dense.last(), &self.backbone) {
             (Some(d), _) => d.n_out,
             (None, Backbone::Gemma(m)) => m.cfg.hidden_size,
+            (None, Backbone::Gemma2(m)) => m.cfg.hidden_size,
             (None, Backbone::Qwen(m)) => m.cfg.hidden_size,
             (None, Backbone::Bert(m)) => m.cfg.hidden_size,
             (None, Backbone::Mpnet(m)) => m.cfg.hidden_size,
@@ -428,6 +444,7 @@ impl<'a> Embedder<'a> {
                 let mut s = m.new_session();
                 m.forward_hidden(&mut s, ids)
             }
+            Backbone::Gemma2(m) => m.forward(ids),
             Backbone::Qwen(m) => {
                 let mut s = m.new_session();
                 m.forward_hidden_mm(&mut s, ids, &[])
@@ -437,6 +454,57 @@ impl<'a> Embedder<'a> {
             Backbone::Nomic(m) => m.forward(ids),
             Backbone::ModernBert(m) => m.forward(ids),
         }
+    }
+
+    /// Whether the model embeds images and audio too (EmbeddingGemma 2).
+    pub fn multimodal(&self) -> bool {
+        matches!(self.backbone, Backbone::Gemma2(_))
+    }
+
+    /// One embedding of the attachments of `req` (images and audio clips; EmbeddingGemma 2,
+    /// whose checkpoint `files` holds Gemma 4's vision and audio towers) followed by `text`
+    /// (which may be empty), with prompt `prompt_name`: the attachments' soft tokens stand where
+    /// the processor writes them (`<|image>`, one `<|image|>` per soft token, `<image|>`; audio
+    /// alike), and the pooling covers them as it covers text tokens.
+    pub fn embed_media(&self, req: &crate::mm::MmRequest, files: &ModelFiles, text: &str, prompt_name: Option<&str>) -> Result<Embedding> {
+        let Backbone::Gemma2(m) = &self.backbone else {
+            bail!("this embedding model takes text only");
+        };
+        if self.pooling != Pooling::Mean || !self.dense.is_empty() {
+            bail!("attachments are embedded with mean pooling and no dense module");
+        }
+        // Its video processor lays frames out its own way (`<|video|>` soft tokens, no timestamps).
+        if !req.videos.is_empty() {
+            bail!("video embeddings are not supported (images and audio are)");
+        }
+        let prompt = match prompt_name.or(self.default_prompt.as_deref()) {
+            Some(n) => self.prompt(n).with_context(|| format!("the model has no prompt named {n}"))?,
+            None => "",
+        };
+        let width = m.cfg.width;
+        let (mm_text, feats) = crate::mm::prepare(req, files, width)?;
+        let full = format!("{prompt}{mm_text}{text}");
+        let enc = self.tok.encode(full.as_str(), true).map_err(|e| anyhow!("encode: {e}"))?;
+        let ids = enc.get_ids();
+        let mut x = m.embed(ids);
+        for (pos, emb) in crate::mm::overrides(ids, &feats, width)? {
+            x[pos * width..(pos + 1) * width].copy_from_slice(&emb);
+        }
+        let hs = m.forward_embeds(x);
+        let h = m.cfg.hidden_size;
+        let mut v = vec![0f32; h];
+        for r in hs.chunks(h) {
+            crate::kernels::add_inplace(&mut v, r);
+        }
+        v.iter_mut().for_each(|x| *x /= ids.len() as f32);
+        if self.normalize {
+            l2_normalize(&mut v);
+        }
+        Ok(Embedding {
+            dense: v,
+            sparse: None,
+            colbert: None,
+        })
     }
 
     /// Embeds `text` with prompt `prompt_name` (None: the model's default prompt, if any).

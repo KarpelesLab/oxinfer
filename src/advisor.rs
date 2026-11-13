@@ -580,6 +580,7 @@ pub const CATALOG: &[Model] = &[
     ),
     Model::new("intfloat/multilingual-e5-small", Kind::Embedding, 0.118, 0.47, EMBED).note("size from the parameter count"),
     Model::new("google/embeddinggemma-300m", Kind::Embedding, 0.3, 1.2, EMBED),
+    Model::new("google/embeddinggemma-2", Kind::Embedding, 0.74, 1.5, EMBED).note("text, images and audio in one space (--image, --audio)"),
     Model::new("mixedbread-ai/mxbai-embed-large-v1", Kind::Embedding, 0.335, 1.3, EMBED),
     Model::new("Qwen/Qwen3-Embedding-0.6B", Kind::Embedding, 0.6, 1.2, EMBED),
     Model::new("BAAI/bge-m3", Kind::Embedding, 0.6, 2.3, EMBED).note("dense, sparse and ColBERT"),

@@ -13,6 +13,7 @@ printf 'Which planet is the Red Planet?\nMars looks red.\nVenus is the hottest p
 #  1.0000  0.8014  0.5470
 #  ...
 ./target/release/oxinfer --model google/embeddinggemma-300m --dim 256 -p "..."   # Matryoshka
+./target/release/oxinfer --model google/embeddinggemma-2 --image photo.jpg           # an image (EmbeddingGemma 2)
 ./target/release/oxinfer --model BAAI/bge-m3 --sparse -p "..."     # lexical weights {token: weight}
 ./target/release/oxinfer --model BAAI/bge-m3 --colbert -p "..."    # one vector per token
 ```
@@ -101,3 +102,55 @@ e.truncate(256)?;                                         // Matryoshka (--dim)
 let e256 = emb.embed_dim("what is a panda?", None, Some(256))?;  // --dim: stella's head of that size, else truncation
 let lexical = emb.sparse_tokens(&e);                      // BGE-M3 heads: e.sparse / e.colbert
 ```
+
+## EmbeddingGemma 2
+
+[google/embeddinggemma-2](https://huggingface.co/google/embeddinggemma-2) (`model_type:
+embedding_gemma2`, 1.5 GB) embeds text, images, audio and video into one 768-dimensional space
+(Matryoshka: `--dim 512`, `256`, `128`).
+
+```sh
+./target/release/oxinfer --model google/embeddinggemma-2 --prompt-name query -p "a red square next to a blue circle"
+./target/release/oxinfer --model google/embeddinggemma-2 --image photo.jpg
+./target/release/oxinfer --model google/embeddinggemma-2 --audio clip.wav
+./target/release/oxinfer --model google/embeddinggemma-2 --image photo.jpg -p "taken in Lisbon" --prompt-name document
+```
+
+With attachments (`--image`, `--audio`, each repeatable) the command gives one
+embedding of the attachments followed by the `-p` text, if any (`Embedder::embed_media` in the
+library). The server's `/v1/embeddings` takes text.
+
+The text encoder (`embed_gemma2.rs`) is a small bidirectional Gemma-4-style stack: 24 layers of
+width 512, query / key norms (and an unscaled norm on the values), unscaled attention scores,
+sandwich norms, a `layer_scalar` per layer. Five layers in six are `sliding_attention` (keys at
+most 512 positions away, on either side: 4 heads of 256 over 2 key / value heads, RoPE base 1e4),
+every sixth is `full_attention` with its own shape (`per_layer_config`: 4 heads of 512 over one
+key / value head, RoPE base 1e6). After the MLP each layer adds a third block, gated by a
+per-layer input: `ple = norm(per_layer_model_projection(x0) / sqrt(512))` is computed once from
+the input embeddings `x0` (a projection only, with no per-layer token table as in Gemma 4), and
+layer `i` adds `norm(per_layer_projection(gelu(per_layer_input_gate(x)) * ple[i]))`. The final
+norm is followed by `embedding_projection` (512 to 768) on every token; the sentence-transformers
+modules are then mean pooling over all tokens and normalization.
+
+Images and audio go through Gemma 4's own towers (`vision_tower` / `embed_vision`, 16
+layers; `audio_tower` / `embed_audio`, 12 layers; see
+[Image, video and audio input](multimodal-input.md)), read here from the root of the checkpoint
+instead of under `model.`. Their soft tokens take the place of the placeholders the processor
+writes (`<|image>`, one `<|image|>` per soft token, `<image|>`; at most 280 soft tokens per image;
+`<|audio>` ... `<audio|>`, one token per 40 ms), between `<bos>` and `<eos>`, and are pooled like
+text tokens.
+
+Checked against sentence-transformers 6.3 on transformers 5.23, float32, CPU
+(`tools/ref_embed.py` for text):
+
+| Input | Cosine to the reference | Max difference |
+|---|---|---|
+| 7 short texts in six languages and code, and a 2581-token one; no prompt, `query`, `document` | 1.000000 for each | 3.9e-7 |
+| a 640x480 image (266 soft tokens) | 1.000000 | 8.4e-7 |
+| the same on CUDA | 1.000000 | 7.2e-7 |
+| a 3.2 s audio clip (80 soft tokens) | 1.000000 | 1.2e-6 |
+| the image followed by a text, without and with the `query` prompt | 1.000000 | 1.3e-6 |
+
+Video is not supported yet: the model's video processor lays the frames out its own way (up to 32
+frames at 1 fps and 140 soft tokens each, as `<|video|>` soft tokens without timestamps), and
+`--video` is refused rather than fed in Gemma 4's layout.

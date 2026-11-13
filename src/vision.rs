@@ -187,7 +187,13 @@ pub struct VisionTower<'a> {
 
 impl<'a> VisionTower<'a> {
     pub fn load(cfg: VisionConfig, files: &'a ModelFiles, text_hidden: usize) -> Result<Self> {
-        let pre = "model.vision_tower.";
+        // Gemma 4 keeps its towers under `model.`, EmbeddingGemma 2 at the root.
+        let root = if files.has("model.vision_tower.patch_embedder.input_proj.weight") {
+            "model."
+        } else {
+            ""
+        };
+        let pre = format!("{root}vision_tower.");
         let h = cfg.hidden_size;
         let hd = cfg.head_dim;
         let nh = cfg.num_attention_heads;
@@ -240,7 +246,8 @@ impl<'a> VisionTower<'a> {
         let inv_freq: Vec<f32> = (0..spatial / 2)
             .map(|i| (1.0 / theta.powf((2 * i) as f64 / spatial as f64)) as f32)
             .collect();
-        let embed_name = "model.embed_vision.embedding_projection.weight";
+        let embed_name = format!("{root}embed_vision.embedding_projection.weight");
+        let embed_name = embed_name.as_str();
         let embed_proj = {
             let info = files.info(embed_name).context("missing embed_vision projection")?;
             if info.shape != [text_hidden, h] {
