@@ -111,7 +111,7 @@ too. The device is chosen at run time (`--device auto`: a GPU when one starts, e
 | [Nemotron 3.5 Transcribe](docs/nemotron.md#speech-to-text-nemotron-35-transcribe) | speech to text and speech translation with a speech LM |
 | [Orpheus](docs/orpheus.md) | text to speech, batches, voice cloning, the SNAC codec |
 | [ZONOS3-Mini](docs/zonos.md) | text to speech at 44.1 kHz in 43 languages, default voices, cloning from a clip |
-| [Fish Audio Drama 3](docs/fish-drama.md) | not supported yet: what the checkpoint holds and what each stage would need |
+| [Fish Audio Drama 3](docs/fish-drama.md) | text to speech at 44.1 kHz with a 35B MoE, several speakers per text, cloning from a clip and its transcript |
 
 **Under the hood**
 

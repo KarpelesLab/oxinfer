@@ -577,6 +577,10 @@ pub const CATALOG: &[Model] = &[
     Model::new("Zyphra/ZONOS3-Mini", Kind::Tts, 0.8, 1.2, &[TextToSpeech, VoiceCloning])
         .fixed(Format::GgufQ4, "GGUF Q4_0 / Q8_0")
         .note("44.1 kHz, 43 languages, 27 voices; cloning from a clip's speaker embedding; on the CPU"),
+    Model::new("fishaudio/drama-3", Kind::Tts, 35.9, 41.5, &[TextToSpeech, VoiceCloning])
+        .fixed(Format::Q8, "FP8")
+        .moe()
+        .note("44.1 kHz, up to 16 speakers per text; cloning from a clip and its transcript; on the CPU"),
     Model::new(
         "stable-diffusion-v1-5/stable-diffusion-v1-5",
         Kind::Image,
