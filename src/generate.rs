@@ -492,6 +492,27 @@ pub struct TextStream {
     header: Option<(u32, Vec<u32>)>,
     /// Special tokens are part of the text ([`ChatFormat::keeps_special_tokens`]).
     keep_special: bool,
+    marks: Option<Marks>,
+}
+
+/// The state of a format whose blocks are marked in plain text ([`crate::chat::TextMarks`]).
+struct Marks {
+    m: crate::chat::TextMarks,
+    /// Bytes of the decoded reply read so far.
+    raw: usize,
+    called: bool,
+    /// A thinking block opened or closed since the last [`TextStream::on_token`].
+    flipped: bool,
+    /// The line break after a mark is still to drop.
+    skip_nl: bool,
+}
+
+/// The length of the longest suffix of `text` that starts `mark` without completing it.
+fn partial_suffix(text: &str, mark: &str) -> usize {
+    (1..mark.len().min(text.len() + 1))
+        .rev()
+        .find(|&i| text.is_char_boundary(text.len() - i) && mark.starts_with(&text[text.len() - i..]))
+        .unwrap_or(0)
 }
 
 /// The token ids of a format whose blocks are tags of several tokens
@@ -534,13 +555,20 @@ impl TextStream {
                 .message_header()
                 .and_then(|(open, ends)| Some((tok.token_to_id(open)?, ends.iter().filter_map(|t| tok.token_to_id(t)).collect()))),
             keep_special: fmt.keeps_special_tokens(),
+            marks: fmt.text_marks().map(|m| Marks {
+                m,
+                raw: 0,
+                called: false,
+                flipped: false,
+                skip_nl: false,
+            }),
         }
     }
 
     /// Whether the reply has opened its tool calls (formats with tags; the others open them
     /// with one token, [`ChatFormat::tool_call_marker`]).
     pub fn called(&self) -> bool {
-        self.tags.as_ref().is_some_and(|t| t.called)
+        self.tags.as_ref().is_some_and(|t| t.called) || self.marks.as_ref().is_some_and(|m| m.called)
     }
 
     /// The token ids that open and close a thinking block (`u32::MAX` if none).
@@ -556,6 +584,11 @@ impl TextStream {
     /// Tracks thinking blocks; call for each new token before [`TextStream::delta`]. Returns
     /// true if the token opened or closed a thinking block.
     pub fn on_token(&mut self, id: u32) -> bool {
+        // Marks in plain text are found in the decoded text ([`TextStream::delta`]): the change
+        // is reported with the next token.
+        if let Some(m) = &mut self.marks {
+            return std::mem::take(&mut m.flipped);
+        }
         if let Some(t) = &mut self.tags {
             if id == t.open || id == t.close {
                 t.tag = Some((id == t.open, Vec::new()));
@@ -585,6 +618,9 @@ impl TextStream {
     /// The new stable text of `out` since the last call (empty if none; `final_` flushes an
     /// incomplete character too). `out` must not include a stop token.
     pub fn delta(&mut self, tok: &Tokenizer, out: &[u32], final_: bool) -> String {
+        if self.marks.is_some() {
+            return self.delta_marks(tok, out, final_);
+        }
         // Thinking delimiters are rendered as dimming, never as text (some tokenizers keep them).
         let visible = match self.call.and_then(|c| out.iter().position(|&t| t == c)) {
             Some(i) => &out[..i],
@@ -642,5 +678,73 @@ impl TextStream {
             }
         }
         String::new()
+    }
+
+    /// [`TextStream::delta`] for marks in plain text: the marks are not shown, nor the line break
+    /// that leads to the closing one or to the tool calls, nor the one after a thinking mark;
+    /// nothing is shown from the tool calls on. The text stops at a thinking mark, which is
+    /// applied by the next call (so that [`TextStream::thinking`] says what the returned text
+    /// is), and the start of a possible mark is held back until `final_`.
+    fn delta_marks(&mut self, tok: &Tokenizer, out: &[u32], final_: bool) -> String {
+        let Ok(text) = tok.decode(out, true) else {
+            return String::new();
+        };
+        let stable = if !final_ && text.ends_with('\u{FFFD}') {
+            text.len().saturating_sub(3)
+        } else {
+            text.len()
+        };
+        let m = self.marks.as_mut().unwrap();
+        let mut shown = String::new();
+        while !m.called && m.raw < stable && text.is_char_boundary(stable) {
+            let rest = &text[m.raw..stable];
+            if m.skip_nl {
+                m.skip_nl = false;
+                m.raw += usize::from(rest.starts_with('\n'));
+                continue;
+            }
+            let toggle = if self.thinking { m.m.think_close } else { m.m.think_open };
+            let at = |mark: &str| rest.find(mark).filter(|_| !mark.is_empty());
+            // (Calls are not looked for inside a thinking block.)
+            let call = if self.thinking { None } else { at(m.m.call) };
+            let next = match (at(toggle), call) {
+                (Some(t), Some(c)) if c < t => Some((c, true)),
+                (Some(t), _) => Some((t, false)),
+                (None, Some(c)) => Some((c, true)),
+                (None, None) => None,
+            };
+            let Some((i, is_call)) = next else {
+                let hold = if final_ {
+                    0
+                } else {
+                    let lead = |mark: &str| partial_suffix(rest, &format!("\n{mark}")).max(partial_suffix(rest, mark));
+                    lead(toggle).max(if self.thinking { 0 } else { lead(m.m.call) })
+                };
+                shown.push_str(&rest[..rest.len() - hold]);
+                m.raw += rest.len() - hold;
+                break;
+            };
+            let before = &rest[..i];
+            let lead = self.thinking || is_call;
+            shown.push_str(if lead {
+                before.strip_suffix('\n').unwrap_or(before)
+            } else {
+                before
+            });
+            m.raw += i;
+            if is_call {
+                m.called = true;
+            } else if shown.is_empty() || final_ {
+                m.raw += toggle.len();
+                self.thinking = !self.thinking;
+                (m.flipped, m.skip_nl) = (true, true);
+                if !final_ {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        shown
     }
 }

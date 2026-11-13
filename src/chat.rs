@@ -41,6 +41,14 @@ pub struct TagTokens {
     pub calls: &'static str,
 }
 
+/// Markup written as plain text, of several ordinary tokens (Ripple): what opens and closes the
+/// reasoning and what opens a tool call.
+pub struct TextMarks {
+    pub think_open: &'static str,
+    pub think_close: &'static str,
+    pub call: &'static str,
+}
+
 /// Chat formatting for a model family.
 pub trait ChatFormat {
     fn conversation_start(&self, system: Option<&str>, think: bool) -> String;
@@ -108,6 +116,12 @@ pub trait ChatFormat {
     /// For formats whose replies are messages with a header: the token that opens a message and
     /// the tokens that end its header (what stands between is a name, not text of the reply).
     fn message_header(&self) -> Option<(&'static str, &'static [&'static str])> {
+        None
+    }
+
+    /// The marks of a format whose blocks are delimited in plain text (then
+    /// [`ChatFormat::think_tokens`] is empty and [`ChatFormat::tool_call_marker`] is no token).
+    fn text_marks(&self) -> Option<TextMarks> {
         None
     }
 }
@@ -1669,6 +1683,85 @@ impl ChatFormat for RaonChat {
     }
 }
 
+/// Ripple (Ricursive): ChatML turns written as they are (nothing trimmed) and a generation prompt
+/// that opens no thinking block: the model writes `<think>`, its reasoning and `</think>` itself,
+/// as plain text ([`ChatFormat::text_marks`]), and the template has no switch for it. Tools are
+/// declared as JSON in the system turn and called as `<tool_call>` around one JSON object.
+pub struct RippleChat;
+
+impl ChatFormat for RippleChat {
+    fn conversation_start(&self, system: Option<&str>, _think: bool) -> String {
+        system.map_or(String::new(), |s| format!("<|im_start|>system\n{s}<|im_end|>\n"))
+    }
+    fn user_turn(&self, content: &str, _think: bool) -> String {
+        format!("<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n")
+    }
+    fn end_of_model_turn(&self) -> String {
+        "<|im_end|>\n".to_string()
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        "<|im_end|>"
+    }
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        ("", "")
+    }
+    fn starts_in_thinking(&self, _think: bool) -> bool {
+        false
+    }
+    fn text_marks(&self) -> Option<TextMarks> {
+        Some(TextMarks {
+            think_open: "<think>",
+            think_close: "</think>",
+            call: "<tool_call>",
+        })
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, think: bool, tools: &[ToolSpec]) -> String {
+        if tools.is_empty() {
+            return self.conversation_start(system, think);
+        }
+        let mut s = String::from("<|im_start|>system\n");
+        if let Some(sys) = system {
+            s.push_str(sys);
+            s.push_str("\n\n");
+        }
+        s.push_str("# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools> XML tags:\n<tools>");
+        for t in tools {
+            let v = serde_json::json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": t.parameters } });
+            s.push('\n');
+            s.push_str(&crate::tools::qwen::py_json(&v));
+        }
+        s.push_str("\n</tools>\n\nFor each function call, return exactly one valid JSON object with function name and arguments inside XML tool-call tags. The arguments field must be a JSON object, not a string, and strings must use valid JSON escaping:\n<tool_call>\n{\"name\": \"execute_bash\", \"arguments\": {\"command\": \"pwd\"}}\n</tool_call><|im_end|>\n");
+        s
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        "<tool_call>"
+    }
+    fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
+        crate::tools::qwen::parse_calls(raw)
+    }
+    fn tool_results(&self, results: &[ToolResult], _think: bool) -> String {
+        let mut s = String::from("<|im_end|>\n<|im_start|>user");
+        for r in results {
+            s.push_str("\n<tool_response>\n");
+            s.push_str(&r.content);
+            s.push_str("\n</tool_response>");
+        }
+        s.push_str("<|im_end|>\n<|im_start|>assistant\n");
+        s
+    }
+    /// The template's layout: the text, then each call on a line of its own.
+    fn assistant_text(&self, content: &str, calls: &[ToolCall]) -> String {
+        let mut s = content.to_string();
+        for (i, c) in calls.iter().enumerate() {
+            if i > 0 || !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(&crate::tools::qwen::call(c, true));
+        }
+        s
+    }
+}
+
 /// `eos` plus the chat format's end-of-turn token, looked up in the tokenizer.
 pub fn with_turn_end(fmt: &dyn ChatFormat, tok: &crate::tokenizer::Tokenizer, mut eos: Vec<u32>) -> Vec<u32> {
     if let Some(id) = tok.token_to_id(fmt.end_of_turn_token())
@@ -2126,6 +2219,97 @@ mod tests {
             "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hi<|assistant|><think>greet</think>Hello!<|user|>Bye<|assistant|><think>"
         );
         assert_eq!(f.user_turn("Hi", false), "<|user|>Hi<|assistant|><think></think>");
+    }
+
+    /// Ripple's format against its template (`chat_template.jinja` of
+    /// ricursiveAI/Ripple-65B-Preview, rendered by transformers): untrimmed turns, a system
+    /// prompt, tools with and without one, a past reply, rounds of tool calling with nested
+    /// arguments.
+    #[test]
+    fn ripple_matches_template() {
+        let f = RippleChat;
+        for think in [false, true] {
+            assert_eq!(
+                f.first_turn(None, think, &[], "  Hi \n"),
+                "<|im_start|>user\n  Hi \n<|im_end|>\n<|im_start|>assistant\n"
+            );
+        }
+        assert_eq!(
+            f.first_turn(Some("Be brief.\n"), false, &[], "Hi"),
+            "<|im_start|>system\nBe brief.\n<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+        );
+        let tool = ToolSpec {
+            name: "get_weather".into(),
+            description: "Weather in a city (°C)".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}, "days": {"type": "integer", "description": "forecast days"}},
+                "required": ["city"],
+            }),
+        };
+        let tools = std::slice::from_ref(&tool);
+        assert_eq!(
+            f.first_turn(Some("Be brief."), false, tools, "Weather?"),
+            "<|im_start|>system\nBe brief.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather in a city (°C)\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"description\": \"forecast days\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return exactly one valid JSON object with function name and arguments inside XML tool-call tags. The arguments field must be a JSON object, not a string, and strings must use valid JSON escaping:\n<tool_call>\n{\"name\": \"execute_bash\", \"arguments\": {\"command\": \"pwd\"}}\n</tool_call><|im_end|>\n<|im_start|>user\nWeather?<|im_end|>\n<|im_start|>assistant\n"
+        );
+        let start = f.first_turn(None, false, tools, "Weather?");
+        assert_eq!(
+            start,
+            "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather in a city (°C)\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"description\": \"forecast days\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return exactly one valid JSON object with function name and arguments inside XML tool-call tags. The arguments field must be a JSON object, not a string, and strings must use valid JSON escaping:\n<tool_call>\n{\"name\": \"execute_bash\", \"arguments\": {\"command\": \"pwd\"}}\n</tool_call><|im_end|>\n<|im_start|>user\nWeather?<|im_end|>\n<|im_start|>assistant\n"
+        );
+        let mut s = f.first_turn(None, false, &[], "Hi");
+        s.push_str(&f.assistant_text_after("Hello!", &[], false));
+        s.push_str(&f.end_of_model_turn());
+        s.push_str(&f.user_turn("And now?", false));
+        assert_eq!(
+            s,
+            "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello!<|im_end|>\n<|im_start|>user\nAnd now?<|im_end|>\n<|im_start|>assistant\n"
+        );
+        // Rounds of tool calling.
+        let call = |args: serde_json::Value| ToolCall {
+            name: "get_weather".into(),
+            arguments: args.as_object().unwrap().clone(),
+        };
+        let result = |content: &str| ToolResult {
+            name: "get_weather".into(),
+            content: content.into(),
+        };
+        let mut s = start.clone();
+        s.push_str(&f.assistant_text_after("Let me check.", &[call(serde_json::json!({"city": "Paris", "days": 3}))], false));
+        s.push_str(&f.tool_results(&[result("22°C")], false));
+        assert_eq!(
+            s,
+            "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather in a city (°C)\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"description\": \"forecast days\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return exactly one valid JSON object with function name and arguments inside XML tool-call tags. The arguments field must be a JSON object, not a string, and strings must use valid JSON escaping:\n<tool_call>\n{\"name\": \"execute_bash\", \"arguments\": {\"command\": \"pwd\"}}\n</tool_call><|im_end|>\n<|im_start|>user\nWeather?<|im_end|>\n<|im_start|>assistant\nLet me check.\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": 3}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n22°C\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+        );
+        let mut s = start.clone();
+        let calls = [
+            call(serde_json::json!({"city": "Paris", "days": 3})),
+            call(serde_json::json!({"city": "Seoul"})),
+        ];
+        s.push_str(&f.assistant_text_after("", &calls, false));
+        s.push_str(&f.tool_results(&[result("22°C"), result("9°C\n")], false));
+        s.push_str(&f.assistant_text_after("Sunny.", &[], false));
+        s.push_str(&f.end_of_model_turn());
+        s.push_str(&f.user_turn("Thanks", false));
+        assert_eq!(
+            s,
+            "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather in a city (°C)\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"description\": \"forecast days\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return exactly one valid JSON object with function name and arguments inside XML tool-call tags. The arguments field must be a JSON object, not a string, and strings must use valid JSON escaping:\n<tool_call>\n{\"name\": \"execute_bash\", \"arguments\": {\"command\": \"pwd\"}}\n</tool_call><|im_end|>\n<|im_start|>user\nWeather?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": 3}}\n</tool_call>\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Seoul\"}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n22°C\n</tool_response>\n<tool_response>\n9°C\n\n</tool_response><|im_end|>\n<|im_start|>assistant\nSunny.<|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n"
+        );
+        let mut s = start.clone();
+        let nested = call(serde_json::json!({"city": "Paris \"FR\"", "opts": {"a": [1, 2.5], "b": null}, "raw": true}));
+        s.push_str(&f.assistant_text_after("", std::slice::from_ref(&nested), false));
+        s.push_str(&f.tool_results(&[result("ok")], false));
+        assert_eq!(
+            s,
+            "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather in a city (°C)\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"description\": \"forecast days\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nFor each function call, return exactly one valid JSON object with function name and arguments inside XML tool-call tags. The arguments field must be a JSON object, not a string, and strings must use valid JSON escaping:\n<tool_call>\n{\"name\": \"execute_bash\", \"arguments\": {\"command\": \"pwd\"}}\n</tool_call><|im_end|>\n<|im_start|>user\nWeather?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris \\\"FR\\\"\", \"opts\": {\"a\": [1, 2.5], \"b\": null}, \"raw\": true}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+        );
+        // The calls read back from the text the model would have written, reasoning before them.
+        let reply = format!("<think>\nI should call it.\n</think>\n\n{}", f.assistant_text("", &calls));
+        assert_eq!(f.parse_tool_calls_for(&reply, tools), calls.to_vec());
+        assert_eq!(
+            f.parse_tool_calls_for(&f.assistant_text("", std::slice::from_ref(&nested)), tools),
+            vec![nested]
+        );
     }
 
     /// Raon-1's format against its template (`chat_template.jinja` of KRAFTON/Raon-1-nano, rendered
