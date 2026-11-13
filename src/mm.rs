@@ -265,6 +265,9 @@ fn prepare_sources(src: &Sources, files: &ModelFiles, text_hidden: usize) -> Res
     if let Some(vc) = crate::minimax_vl01::Vl01Config::load(args.model)? {
         return prepare_vl01(src, files, text_hidden, vc);
     }
+    if crate::config::model_type(args.model).is_ok_and(|m| crate::unlimited_ocr::is_model_type(&m)) {
+        return prepare_unlimited_ocr(src, files, text_hidden);
+    }
     let mmc = mm_config::MmConfig::load(args.model)?;
     let mut text = String::new();
     let mut feats = Vec::new();
@@ -584,6 +587,59 @@ fn prepare_vl01(
         text.push_str(&"<image>".repeat(n));
         feats.push(MmFeature {
             token_id: vc.image_token_id,
+            emb,
+            n,
+            grids: Vec::new(),
+        });
+    }
+    Ok((text, feats))
+}
+
+/// Unlimited-OCR-2 pages: `<PAGE>` and an `<image>` per packed feature for every image (see
+/// `crate::unlimited_ocr`). One page alone is also cut into tiles, several are global views only
+/// (`infer()`'s automatic mode); an image token budget below a page's tokens with tiles
+/// (`max_soft_tokens`) keeps the global view only.
+fn prepare_unlimited_ocr(src: &Sources, files: &ModelFiles, text_hidden: usize) -> Result<(String, Vec<MmFeature>)> {
+    use crate::unlimited_ocr as uo;
+    if src.n_audios() > 0 || src.n_videos() > 0 {
+        bail!("Unlimited-OCR takes images only");
+    }
+    let (mut text, mut feats) = (String::new(), Vec::new());
+    if src.n_images() == 0 {
+        return Ok((text, feats));
+    }
+    let cfg = uo::OcrConfig::load(src.req.model)?;
+    let tower = uo::OcrTower::load(files, text_hidden)?;
+    let budget = src.req.max_soft_tokens;
+    for i in 0..src.n_images() {
+        let t = Instant::now();
+        let (what, img) = src.image(i)?;
+        let mut page = uo::preprocess(&img.data, img.width, img.height, src.n_images() == 1)?;
+        if budget > 0 && page.tokens() > budget {
+            page = uo::preprocess(&img.data, img.width, img.height, false)?;
+        }
+        let mut global = Vec::new();
+        let emb = tower.encode(&page, Some(&mut global));
+        let n = page.tokens();
+        eprintln!(
+            "[image {what}: {}x{} -> a 1024x1024 view and {}x{} tiles of 640 -> {n} tokens, {:.2}s]",
+            img.width,
+            img.height,
+            if page.tiles.is_empty() { 0 } else { page.grid.0 },
+            if page.tiles.is_empty() { 0 } else { page.grid.1 },
+            t.elapsed().as_secs_f64()
+        );
+        if let (Some(prefix), 0) = (src.req.dump_mm, i) {
+            let mut px = page.global.clone();
+            page.tiles.iter().for_each(|t| px.extend_from_slice(t));
+            dump(&format!("{}_pixels.bin", prefix.display()), &px)?;
+            dump(&format!("{}_features.bin", prefix.display()), &global)?;
+            dump(&format!("{}_image.bin", prefix.display()), &emb)?;
+        }
+        text.push_str(uo::PAGE);
+        text.push_str(&uo::IMAGE.repeat(n));
+        feats.push(MmFeature {
+            token_id: cfg.image_token_id,
             emb,
             n,
             grids: Vec::new(),

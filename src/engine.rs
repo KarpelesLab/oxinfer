@@ -912,6 +912,8 @@ pub enum Family {
     Nemotron,
     /// Inkling-2 (`inkling2`).
     Inkling2,
+    /// Baidu Unlimited-OCR-2 (`unlimited-ocr`): document images to text.
+    UnlimitedOcr,
 }
 
 /// Speculative decoding in use.
@@ -1034,6 +1036,10 @@ enum Lm {
         model: &'static KimiModel<'static>,
         sess: KimiSession,
     },
+    UnlimitedOcr {
+        model: &'static crate::unlimited_ocr::OcrModel<'static>,
+        sess: crate::unlimited_ocr::OcrSession,
+    },
     DeepSeek4Dspark {
         dec: Box<DsparkDecoder<'static, DeepSeek4Model<'static>>>,
     },
@@ -1145,6 +1151,14 @@ impl Lm {
             _ => None,
         }
     }
+    /// The rules of a reply to the prompt `ids` beyond the request's own (Unlimited-OCR's page
+    /// count guard).
+    fn reply_guard(&self, ids: &[u32]) -> Option<Box<dyn crate::sampler::TokenFilter>> {
+        match self {
+            Lm::UnlimitedOcr { model, .. } => Some(Box::new(crate::unlimited_ocr::OcrGuard::new(&model.cfg, ids))),
+            _ => None,
+        }
+    }
     fn context_len(&self) -> usize {
         match self {
             Lm::Gemma { sess, .. } => sess.pos,
@@ -1157,6 +1171,7 @@ impl Lm {
             Lm::Kimi { sess, .. } => sess.pos,
             Lm::Nemotron { sess, .. } => sess.pos,
             Lm::Inkling2 { sess, .. } => sess.pos,
+            Lm::UnlimitedOcr { sess, .. } => sess.pos,
             Lm::DeepSeek4Dspark { dec } => dec.sess.pos,
             Lm::QwenDspark { dec } => dec.sess.pos,
             Lm::GemmaDspark { dec } => dec.sess.pos,
@@ -1186,6 +1201,7 @@ impl Lm {
             Lm::Kimi { model, sess } => *sess = model.new_session(),
             Lm::Nemotron { model, sess } => *sess = model.new_session(),
             Lm::Inkling2 { model, sess } => *sess = model.new_session(),
+            Lm::UnlimitedOcr { sess, .. } => sess.clear(),
             Lm::DeepSeek4Dspark { dec } => {
                 let opts = dec.opts.clone();
                 let lk = reset_lookup(dec.lookup.take());
@@ -1392,6 +1408,7 @@ impl Engine {
             "kimi_k3" | "kimi_k31" => Family::Kimi,
             m if crate::nemotron::is_model_type(m) => Family::Nemotron,
             m if crate::inkling::is_model_type(m) => Family::Inkling2,
+            m if crate::unlimited_ocr::is_model_type(m) => Family::UnlimitedOcr,
             other => bail!("unsupported model_type {other}"),
         };
         if family == Family::Llama && !chat::Llama3Chat::matches_model(&dir) {
@@ -1780,6 +1797,24 @@ impl Engine {
                     c.vocab_size,
                     model.streamed_bytes(),
                 )
+            }
+            Family::UnlimitedOcr => {
+                if decision_dir.is_some() {
+                    bail!("decisions (decision_from) are not supported for Unlimited-OCR");
+                }
+                decision = None;
+                let model = arena.keep(crate::unlimited_ocr::OcrModel::load(
+                    crate::unlimited_ocr::OcrConfig::load(&dir)?,
+                    files,
+                    opts.quant,
+                )?);
+                let c = &model.cfg;
+                let fmt: &'static (dyn ChatFormat + Sync) = &crate::unlimited_ocr::OcrChat;
+                let lm = Lm::UnlimitedOcr {
+                    model,
+                    sess: model.new_session(),
+                };
+                (lm, fmt, model.quant, c.num_hidden_layers, c.hidden_size, c.vocab_size, 0)
             }
             Family::Glm5 => {
                 if decision_dir.is_some() {
@@ -2393,6 +2428,7 @@ impl Engine {
             Lm::Kimi { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::Nemotron { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::Inkling2 { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
+            Lm::UnlimitedOcr { .. } => bail!("activation capture is not supported for Unlimited-OCR"),
             Lm::DeepSeek4Dspark { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("activation capture is not supported for Core ML models"),
@@ -2429,6 +2465,7 @@ impl Engine {
             Lm::Kimi { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::Nemotron { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::Inkling2 { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
+            Lm::UnlimitedOcr { .. } => bail!("interventions are not supported for Unlimited-OCR"),
             Lm::DeepSeek4Dspark { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
@@ -2456,6 +2493,7 @@ impl Engine {
             Lm::Kimi { model, .. } => *model,
             Lm::Nemotron { model, .. } => *model,
             Lm::Inkling2 { model, .. } => *model,
+            Lm::UnlimitedOcr { .. } => bail!("interventions are not supported for Unlimited-OCR"),
             Lm::DeepSeek4Dspark { dec } => dec.model(),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
@@ -2478,6 +2516,7 @@ impl Engine {
             Lm::Kimi { sess, .. } => &mut sess.iv,
             Lm::Nemotron { sess, .. } => &mut sess.iv,
             Lm::Inkling2 { sess, .. } => &mut sess.iv,
+            Lm::UnlimitedOcr { .. } => return,
             Lm::DeepSeek4Dspark { dec } => &mut dec.sess.iv,
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => return,
@@ -2576,6 +2615,7 @@ impl Engine {
                     bail!("this checkpoint has no vision tower (for a GGUF model: no Qwen mmproj file beside it; set the mmproj option)")
                 }
                 Family::Qwen => bail!("this checkpoint has no vision tower (text only)"),
+                Family::UnlimitedOcr => {}
                 Family::Mistral4 if self.mmproj == crate::pixtral::Mmproj::None => bail!("image input is disabled (mmproj none)"),
                 Family::Mistral4 if crate::pixtral::PixtralConfig::load_with(&self.info.path, &self.mmproj)?.is_some() => {}
                 Family::Mistral4 => {
@@ -2719,6 +2759,7 @@ impl Engine {
                 Lm::Kimi { .. } => bail!("decisions are not supported for Kimi K3"),
                 Lm::Nemotron { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
                 Lm::Inkling2 { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
+                Lm::UnlimitedOcr { .. } => bail!("decisions are not supported for Unlimited-OCR"),
                 Lm::DeepSeek4Dspark { dec } => run(dec.model(), &ids, &feats, chunk, need_logits)?,
                 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
                 Lm::CoreMl(_) => bail!("decisions are not supported for Core ML models"),
@@ -2893,7 +2934,9 @@ impl PendingTurn {
         // every decoding loop that samples through it follows them.
         let constraint = constrain.constraint(tok, *fmt, &config.response_format, &config.tool_choice, &config.tools, think, stop)?;
         let log = sampler.set_guide(
-            constraint.map(|c| Box::new(c) as Box<dyn crate::sampler::TokenFilter>),
+            constraint
+                .map(|c| Box::new(c) as Box<dyn crate::sampler::TokenFilter>)
+                .or_else(|| lm.reply_guard(&ids)),
             config.logprobs,
         );
         let guided = sampler.guided();
@@ -3123,6 +3166,18 @@ impl PendingTurn {
                     empty(0.0)
                 } else {
                     plain!(*model, sess, base, logits, max)
+                }
+            }
+            // The prompt in one pass (the pages' positions depend on all of it); no lookup rounds.
+            Lm::UnlimitedOcr { model, sess } => {
+                let hs = generate::prefill(*model, sess, &ids, chunk, &overrides);
+                let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
+                st.prefill_secs = t0.elapsed().as_secs_f64();
+                let max = limit(sess.pos);
+                if max == 0 {
+                    empty(0.0)
+                } else {
+                    generate::decode(*model, sess, logits, sampler, stop, max, &mut cb)
                 }
             }
             // No prompt-lookup rounds: the recurrent layers cannot roll a rejected draft back.

@@ -25,6 +25,7 @@ mod server_cli;
 mod step1x_cli;
 #[cfg(feature = "media")]
 mod tts_cli;
+mod unlimited_ocr_cli;
 #[cfg(feature = "media")]
 mod whisper_cli;
 #[cfg(feature = "media")]
@@ -198,6 +199,8 @@ struct Args {
     sd3: sd3_cli::Sd3Args,
     // BAGEL.
     bagel: bagel_cli::BagelArgs,
+    // Unlimited-OCR.
+    ocr: unlimited_ocr_cli::OcrArgs,
 }
 
 fn usage() -> ! {
@@ -420,6 +423,16 @@ fn usage() -> ! {
          \x20 --sparse, --colbert  BGE-M3 lexical weights / multi-vector embeddings instead\n\
          \x20 --show-tokens        print token ids\n\
          \n\
+         document OCR (baidu/Unlimited-OCR-2; detected from config.json):\n\
+         \x20 --image FILE         a page (repeatable, in order; a page alone is also read as tiles)\n\
+         \x20 -p TEXT              the instruction (default: Multi page parsing.)\n\
+         \x20 --max-tokens N       max new tokens (default 8000 per page)\n\
+         \x20 --no-repeat-ngram N  no n-gram of N generated tokens twice within the window (default off)\n\
+         \x20 --ngram-window N     the last tokens that rule searches (default 100)\n\
+         \x20 --max-page-tokens N  tokens of one page before the next is forced (default 20000)\n\
+         \x20 --no-page-guard      do not hold the reply to as many pages as the prompt has\n\
+         \x20 --max-soft-tokens N  below a page's tokens with tiles: its global view only (273)\n\
+         \n\
          typed decisions (Jev models: a bundle directory or repo id such as autotrust/JEV-9B, or any\n\
          base model with --decision-from):\n\
          \x20 --decide KIND        noul (yes/no), score (0-5) or choice; prints the distribution\n\
@@ -641,6 +654,7 @@ fn parse_args() -> Result<Args> {
         flux: Default::default(),
         sd3: Default::default(),
         bagel: Default::default(),
+        ocr: Default::default(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -903,6 +917,7 @@ fn parse_args() -> Result<Args> {
             _ if a.flux.parse(&k, &mut val)? => {}
             _ if a.sd3.parse(&k, &mut val)? => {}
             _ if a.bagel.parse(&k, &mut val)? => {}
+            _ if a.ocr.parse(&k, &mut val)? => {}
             _ => {
                 eprintln!("unknown argument {k}");
                 usage()
@@ -1592,6 +1607,7 @@ fn run(mut args: Args) -> Result<()> {
         "kimi_k3" | "kimi_k31" => run_kimi(args),
         m if oxinfer::nemotron::is_model_type(m) => run_nemotron(args),
         m if oxinfer::inkling::is_model_type(m) => run_inkling(args),
+        m if oxinfer::unlimited_ocr::is_model_type(m) => unlimited_ocr_cli::run(&args),
         other => bail!("unsupported model_type {other}"),
     }
 }
