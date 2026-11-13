@@ -55,7 +55,7 @@ ffmpeg, and frames up to the last sampled one are all decoded. Not available: ot
 (ProRes, Theora, ...), the audio track of a video, and hardware decoding. The same attachments
 go through the library (`Engine::send_with_media` with `Attachments`) and the C API
 (`oxi_engine_send_media` with a JSON list); frames already decoded by oxideav go through the
-library too (see [Using oxinfer from oxideav](cli.md#using-oxinfer-from-oxideav-and-other-crates)).
+library too (see [Using oxinfer from oxideav](library.md#using-oxinfer-from-oxideav-and-other-crates)).
 
 Agreement with transformers 5.20 (float32, CPU; `tools/ref_vl.py` runs the reference processor
 and model on the same files and compares with oxinfer's `--dump-mm` / `--dump-logits`):

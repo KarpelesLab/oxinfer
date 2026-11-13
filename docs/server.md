@@ -68,7 +68,7 @@ with one (see [Session snapshots and the prompt cache](sessions.md#session-snaps
 
 Model options: those of the engine for chat models (`quant`, `device`, `mmap`, `stream`, `mmproj`,
 `draft`, `mtp`, `lookup`, `prompt_cache`, `max_context`, `prefill_chunk`, `gpu_decode`, ...; see
-[As a library](cli.md#as-a-library)),
+[As a library](library.md#as-a-library)),
 of the loader for the other kinds (Whisper `encoder` / `decoder` precision, Orpheus `snac` and
 `quant`, FLUX `transformer` / `base`, Stable Diffusion `lora`, ...), and:
 

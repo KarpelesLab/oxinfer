@@ -51,7 +51,7 @@ dense MLP, the shared expert or any routed expert.
 ```
 
 A checkpoint larger than 60% of RAM is streamed (`--stream`, see
-[Streaming weights from flash](performance.md#streaming-weights-from-flash-models-larger-than-ram)) with a page
+[Streaming weights from flash](streaming.md#streaming-weights-from-flash-models-larger-than-ram)) with a page
 cache budget of 70% of RAM unless told otherwise (`--stream`, `--cache-budget-gb`; `--no-stream`,
 or `--mmap` alone, asks for plain demand paging). The engine / C option is tri-state:
 `stream=auto` (the default, as above; setting a tuning key such as `cache_budget_gb` also turns it

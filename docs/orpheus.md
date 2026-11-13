@@ -71,7 +71,7 @@ let (audio, parts, stats) = speaker.speak_long(&long_text, &opts, 0)?; // the se
   the next token of each running utterance as one column of a single pass
   (`QwenModel::forward_hidden_batch`, `src/qwen_batch.rs`): the layer matmuls run on the
   multi-token decode kernels of
-  [Multi-token passes](performance.md#multi-token-passes-and-moe-experts-on-the-cpu), which read the weights
+  [Multi-token passes](speculative-decoding.md#multi-token-passes-and-moe-experts-on-the-cpu), which read the weights
   once for all columns, while each utterance keeps its own session (KV caches, position), and its
   attention is the one-token attention over its own cache. Up to 15 utterances share a pass with
   quantized weights (q8, q4, GGUF), 7 with bf16; a wider batch takes several passes per step.

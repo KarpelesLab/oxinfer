@@ -156,7 +156,7 @@ features oxinfer computes); `examples/dspark_check.rs` writes the features and t
 and compares greedy output with and without the draft.
 
 **DSpark or MTP.** Qwen3.5 / 3.8 models also have their own multi-token-prediction layer
-(`--mtp`, see [Speculative decoding](performance.md#speculative-decoding)). Its verification now runs as the
+(`--mtp`, see [Speculative decoding](speculative-decoding.md#speculative-decoding)). Its verification now runs as the
 same GPU passes (it used the CPU's multi-token kernels, so its greedy output followed CPU decoding
 rather than plain GPU decoding; it is now plain GPU decoding token for token), and its draft head on
 the GPU. Same prompts, 200 tokens, greedy, tok/s (tokens per verification, drafts accepted; the

@@ -32,7 +32,7 @@ identical tokens.
    unusual platform should never be the reason a model cannot run. The CPU path is the reference
    and is always there; a 1 TB model on a machine with 1 GB of RAM and no GPU should still produce
    tokens, by reading the weights from storage as it goes (see
-   [Streaming weights from flash](docs/performance.md#streaming-weights-from-flash-models-larger-than-ram)), very slowly.
+   [Streaming weights from flash](docs/streaming.md#streaming-weights-from-flash-models-larger-than-ram)), very slowly.
 2. **Then make it fast.** Anything that improves speed on a given machine is in scope: a GPU
    when there is one (Metal, CUDA, WebGPU, detected at run time), the Neural Engine through Core
    ML, quantization, SIMD kernels per CPU (NEON, SDOT / i8mm, AVX2, wasm simd128), speculative
@@ -59,8 +59,8 @@ cargo build --release          # or take a binary from the GitHub releases
 
 A Hugging Face repo id is downloaded to the cache on first use; a local folder or GGUF file works
 too. The device is chosen at run time (`--device auto`: a GPU when one starts, else the CPU).
-[docs/cli.md](docs/cli.md) has the flags, the release binaries and `--update`, `--models`, and
-the library and C API.
+[docs/cli.md](docs/cli.md) has the flags, the release binaries, `--update` and `--models`;
+[docs/library.md](docs/library.md) the Rust and C API.
 
 ## Documentation
 
@@ -68,7 +68,8 @@ the library and C API.
 
 | | |
 |---|---|
-| [Command line, building, library use](docs/cli.md) | flags, release binaries and self-update, `--models`, the Rust and C API |
+| [Command line](docs/cli.md) | building, flags, release binaries and self-update, `--models` |
+| [Library use](docs/library.md) | the Rust and C API, features, use from other crates |
 | [Supported models](docs/models.md) | every tested checkpoint with its size and measured agreement with the reference |
 | [Getting weights](docs/weights.md) | Hugging Face downloads, the mirror, GGUF files, MLX checkpoints |
 | [OpenAI-compatible server](docs/server.md) | chat, embeddings, images, audio; structured outputs, forced tool calls, log probabilities |
@@ -105,8 +106,12 @@ the library and C API.
 
 | | |
 |---|---|
-| [Performance](docs/performance.md) | measurements, GPU decoding, comparison with llama.cpp, quantization, speculative decoding, streaming weights from flash |
-| [Platforms and accelerators](docs/platforms.md) | CUDA, Vulkan, WebAssembly, the browser (WebGPU), Core ML / Apple Neural Engine |
+| [Performance](docs/performance.md) | measurements, GPU decoding, comparison with llama.cpp, quantization |
+| [Speculative decoding](docs/speculative-decoding.md) | drafters, MTP, multi-token passes, prompt lookup |
+| [Streaming weights from flash](docs/streaming.md) | models larger than RAM, mixed GPU / CPU decoding |
+| [Platforms and accelerators](docs/platforms.md) | what runs where; CUDA, Vulkan |
+| [WebAssembly and the browser](docs/wasm.md) | WASI, WebGPU |
+| [Core ML / Apple Neural Engine](docs/coreml.md) | running and converting Core ML models |
 | [How it works](docs/internals.md) | the layout of the code |
 | [Verifying against the reference](docs/verification.md) | how outputs are compared with `transformers` and others |
 | [Core ML model format](docs/coreml-format.md), [llama.cpp notes](docs/llama-modchip/README.md) | reference notes |
