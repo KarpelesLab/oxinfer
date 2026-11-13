@@ -262,7 +262,7 @@ impl Snake {
 /// `sin(x)` to within ~1 ulp of libm over the range Snake sees, branch-free so it vectorizes:
 /// reduction by pi (three-part Cody-Waite) and an odd degree-11 polynomial on [-pi/2, pi/2].
 #[inline(always)]
-fn sin_f32(x: f32) -> f32 {
+pub(crate) fn sin_f32(x: f32) -> f32 {
     const INV_PI: f32 = std::f32::consts::FRAC_1_PI;
     const P1: f32 = 3.140625;
     const P2: f32 = 9.670_257_6e-4;
@@ -708,7 +708,7 @@ pub struct Snac {
 }
 
 /// Weight-norm parametrization: `g * v / ||v||`, the norm over every dim but the first.
-fn wn(files: &ModelFiles, p: &str) -> Result<(Vec<f32>, Vec<usize>)> {
+pub(crate) fn wn(files: &ModelFiles, p: &str) -> Result<(Vec<f32>, Vec<usize>)> {
     let (gn, vn) = if files.has(&format!("{p}.parametrizations.weight.original0")) {
         (
             format!("{p}.parametrizations.weight.original0"),

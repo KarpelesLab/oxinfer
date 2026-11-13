@@ -36,6 +36,7 @@ pub mod drafter;
 pub mod dspark;
 pub mod embed;
 pub mod engine;
+pub mod fish;
 pub mod flux;
 pub mod fsx;
 pub mod generate;
