@@ -79,10 +79,16 @@ log-probability difference over the top 10 of those steps):
 
 | File | What it is | Result |
 |---|---|---|
-| `ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF:IQ2_XS-mtp` (8.8 GB) | GSQ-RCO: every tensor quantized at each standard ggml type with GSQ (a learned rounding), then one type chosen per tensor under a size budget (RCO). The file is ordinary GGUF with twelve types side by side (F32, BF16, Q2_K, Q4_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS); nothing new to decode | 32/32 tokens as llama.cpp, within 0.31; `--mtp` from the embedded layer: 3.58 tokens per forward, 88% of drafts accepted |
+| `ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF:IQ2_XS-mtp` (8.8 GB) | GSQ-RCO: every tensor quantized at each standard ggml type with GSQ (grid assignments and scales learned per tensor), then one type chosen per tensor under a size budget (RCO). The file is ordinary GGUF with thirteen types side by side (F32, BF16, Q2_K, Q4_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS); nothing new to decode | 32/32 tokens as llama.cpp, within 0.31; `--mtp` from the embedded layer: 3.58 tokens per forward, 88% of drafts accepted |
 | `DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF:MTP-IQ3_M` (5.7 GB) | Qwen3.5-9B fine-tune with the MTP layer (`blk.32.nextn.*`), IQ3_S / Q4_K | 26 tokens as llama.cpp (within 0.65), then a near tie (0.334 against 0.316); `--mtp`: 2.33 tokens per forward. The repository's `MTP-IQ2_M` file is damaged on the Hub (its first 10.97 MB, the whole header, are zeros) |
+| `HauhauCS/Qwen3.5-4B-Uncensored-HauhauCS-Aggressive` `Q4_K_M`, `ccore/Qwen3.5-4B-3D-Coder` `Q4_K_M` (2.7 GB each) | Qwen3.5-4B fine-tunes in the usual layout (the second with the newer `nextn_predict_layers = 0` and `attention.recurrent_layers` keys) | 16 tokens as llama.cpp (within 0.28) then a near tie (0.202 against 0.199); 32/32 (within 0.25) |
 | `prism-ml/Ternary-Bonsai-2-2B-gguf` `Q2_0` / `PQ2_0` / `PTQ1_0` (0.4-0.5 GB) | ternary weights, Hadamard-folded, tied output head (below) | `Q2_0`: 48/48 tokens as llama.cpp, within 0.22; the other two packings give the same 48 tokens |
 | `prism-ml/Ternary-Bonsai-2-27B-gguf` `Q2_0` (7.6 GB) / `PTQ1_0` (5.9 GB) | the same for Qwen3.8-27B, with its own output head and the Gated DeltaNet permutation | `Q2_0`: 20 tokens as llama.cpp (within 0.07), then a near tie (0.328 against 0.323); `PTQ1_0`: the 32 tokens of `Q2_0`, within 0.06 |
+
+`maritaca-ai/S5-nano` (`qwen3_5` safetensors of Qwen3.5-4B's shape, 9.3 GB) ran as stored and
+with `--quant q4`; `mradermacher/gemma-4-31B-it-ARA-heretic-GGUF:Q2_K` was only loaded from its
+header and tensor table (a file of the real size with zero weights: the 60 layers load and a
+forward pass runs).
 
 **Ternary-Bonsai 2** (PrismML) stores every matrix of the language model as ternary values with
 one f16 scale per group, in one of three packings: `Q2_0` (mainline llama.cpp's type 42: 2-bit
