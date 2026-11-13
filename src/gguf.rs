@@ -297,10 +297,11 @@ impl Header {
             "gemma4" => "gemma4_text",
             "mistral-large4" => "mistral_large4_text",
             "deepseek4" => "deepseek_v4",
+            "deepseek41" => "deepseek_v41",
             "minimax-m2" => "minimax_m2",
             "minimax-m3" => "minimax_m3_vl_text",
             a => bail!(
-                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, llama, gemma4, mistral-large4, deepseek4, minimax-m2, minimax-m3 and qwen2 are)"
+                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, llama, gemma4, mistral-large4, deepseek4, deepseek41, minimax-m2, minimax-m3 and qwen2 are)"
             ),
         })
     }
@@ -321,6 +322,9 @@ impl Header {
         }
         if mt == "deepseek_v4" {
             return self.deepseek4_config();
+        }
+        if mt == "deepseek_v41" {
+            return crate::deepseek4::gguf_config_v41(self, self.deepseek4_config()?);
         }
         let llama = mt == "llama";
         let minimax = matches!(mt, "minimax_m2" | "minimax_m3_vl_text");
@@ -932,6 +936,9 @@ pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec
     if arch == "deepseek4" {
         return crate::deepseek4::gguf_name(&t.name, &t.ne);
     }
+    if arch == "deepseek41" {
+        return crate::deepseek4::gguf_name_v41(&t.name, &t.ne);
+    }
     let mut shape: Vec<usize> = t.ne.iter().rev().copied().collect();
     let name = match t.name.as_str() {
         "token_embd.weight" => "model.embed_tokens.weight".to_string(),
@@ -1278,11 +1285,30 @@ pub fn split_files(path: &Path) -> Result<Vec<std::path::PathBuf>> {
             let p = dir.join(format!("{prefix}-{i:0digits$}-of-{count:0digits$}.gguf"));
             if p.is_file() {
                 Ok(p)
+            } else if let Some(other) = unnamed_part(dir, i - 1, count) {
+                Ok(other)
             } else {
                 bail!("split GGUF part {} is missing", p.display())
             }
         })
         .collect()
+}
+
+/// Part `no` (from 0) of a split model of `count` parts that is not named as one: a GGUF file in
+/// `dir` or its parent whose header says so (the engram tables that the DeepSeek V4.1 conversions
+/// share between their quantizations, `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`).
+fn unnamed_part(dir: &Path, no: usize, count: usize) -> Option<std::path::PathBuf> {
+    let split = |h: &Header, k: &str| h.get(k).and_then(Value::as_u64).map(|v| v as usize);
+    [Some(dir), dir.parent()]
+        .into_iter()
+        .flatten()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flat_map(|rd| rd.flatten().map(|e| e.path()))
+        .filter(|p| {
+            let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            n.ends_with(".gguf") && split_name(n).is_none() && !n.starts_with("mmproj") && !n.starts_with("dspark")
+        })
+        .find(|p| header(p).is_ok_and(|h| split(&h, "split.no") == Some(no) && split(&h, "split.count") == Some(count)))
 }
 
 /// The first file of the GGUF model in folder `dir` (a single `.gguf`, or part 1 of a split one;

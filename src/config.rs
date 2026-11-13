@@ -1238,7 +1238,7 @@ fn d_ds4_ctheta() -> f64 {
 /// The `rope_scaling` of a DeepSeek V4 config (YaRN on the compressed layers).
 #[derive(Debug, Clone, Deserialize)]
 pub struct Ds4RopeScaling {
-    #[serde(default)]
+    #[serde(default, alias = "rope_type")]
     pub r#type: Option<String>,
     #[serde(default)]
     pub factor: Option<f64>,
@@ -1250,9 +1250,14 @@ pub struct Ds4RopeScaling {
     pub beta_slow: Option<f64>,
 }
 
+fn d_ds41_pad() -> u32 {
+    2
+}
+
 /// DeepSeek V4 (`deepseek_v4`, DeepSeek-V4-Flash / -Pro) in DeepSeek's own `config.json` keys (a
 /// GGUF header is mapped onto the same fields, `gguf::Header::config_json`); see
-/// [`crate::deepseek4`].
+/// [`crate::deepseek4`]. DeepSeek V4.1 (`deepseek_v41`) is read from the `text_config` of its
+/// `config.json` into the same struct, with `v41` set and the fields after it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeepSeek4Config {
     pub hidden_size: usize,
@@ -1306,6 +1311,78 @@ pub struct DeepSeek4Config {
     pub hc_eps: f64,
     #[serde(default)]
     pub tie_word_embeddings: bool,
+    /// DeepSeek V4.1 (set from `model_type`): compressed keys and indexer choices shared between
+    /// layers, engram lookups, no hash routing, no `hc_head`.
+    #[serde(default)]
+    pub v41: bool,
+    /// V4.1: the layers that compress their own keys (the layers after one read its keys).
+    #[serde(default)]
+    pub kv_source_layer_ids: Vec<usize>,
+    /// V4.1: the layers that run an indexer (the layers after one reuse its choice).
+    #[serde(default)]
+    pub index_source_layer_ids: Vec<usize>,
+    /// V4.1: the index layer whose scores choose the candidate blocks of the index layers after
+    /// it (None or negative: no candidate filtering).
+    #[serde(default)]
+    pub candidate_source_layer_id: Option<i64>,
+    #[serde(default)]
+    pub candidate_topk_blocks: usize,
+    #[serde(default)]
+    pub candidate_block_size: usize,
+    /// V4.1 engram: the layers whose input gets an n-gram lookup, the rows of each one's table,
+    /// the longest n-gram, the heads per n-gram size and their width.
+    #[serde(default)]
+    pub engram_layer_ids: Vec<usize>,
+    #[serde(default)]
+    pub engram_num_embeddings: Vec<usize>,
+    #[serde(default)]
+    pub engram_max_ngram_size: usize,
+    /// Where the search for each head's prime bucket count starts.
+    #[serde(default)]
+    pub engram_vocab_size: usize,
+    #[serde(default)]
+    pub engram_n_heads: usize,
+    #[serde(default)]
+    pub engram_head_dim: usize,
+    #[serde(default = "d_ds41_pad")]
+    pub engram_pad_token_id: u32,
+    /// Hash inputs a GGUF header carries (otherwise read from the checkpoint's `engram.*` tensors,
+    /// the bucket counts and offsets also derived from `engram_vocab_size`): per engram layer the
+    /// `max_ngram_size` multipliers, the `(max_ngram_size - 1) * n_heads` prime bucket counts and
+    /// their offsets in the layer's table; the compressed id of every token.
+    #[serde(default)]
+    pub engram_multipliers: Option<Vec<Vec<i64>>>,
+    #[serde(default)]
+    pub engram_primes: Option<Vec<Vec<i64>>>,
+    #[serde(default)]
+    pub engram_offsets: Option<Vec<Vec<i64>>>,
+    #[serde(default)]
+    pub engram_token_map: Option<Vec<i32>>,
+    /// V4.1: the id every position of an image span carries.
+    #[serde(default)]
+    pub image_token_id: Option<u32>,
+    /// V4.1: the vision tower (`vision_config`), None for a text-only conversion.
+    #[serde(default)]
+    pub vision_config: Option<Ds41VisionConfig>,
+}
+
+/// The `vision_config` of DeepSeek V4.1: a ViT with 2D RoPE and SwiGLU MLPs, whose patches the
+/// aligner merges `downsample_ratio` x `downsample_ratio`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Ds41VisionConfig {
+    pub num_hidden_layers: usize,
+    pub hidden_size: usize,
+    pub num_attention_heads: usize,
+    pub intermediate_size: usize,
+    pub patch_size: usize,
+    #[serde(default = "d_ml4_theta")]
+    pub rope_theta: f64,
+    pub downsample_ratio: usize,
+    pub max_image_tokens: usize,
+    #[serde(default)]
+    pub min_pixels: usize,
+    #[serde(default)]
+    pub max_wh_ratio: Option<usize>,
 }
 
 impl DeepSeek4Config {
@@ -1319,9 +1396,24 @@ impl DeepSeek4Config {
         Self::from_json(raw)
     }
 
-    pub fn from_json(raw: serde_json::Value) -> Result<Self> {
+    pub fn from_json(mut raw: serde_json::Value) -> Result<Self> {
+        // DeepSeek V4.1: the text model's keys are in `text_config`.
+        if raw.get("model_type").and_then(|v| v.as_str()) == Some("deepseek_v41") {
+            let mut text = raw.get("text_config").cloned().unwrap_or_else(|| raw.clone());
+            let t = text.as_object_mut().context("deepseek_v41: text_config is not an object")?;
+            t.insert("v41".into(), true.into());
+            for k in ["image_token_id", "vision_config"] {
+                if let Some(v) = raw.get(k).filter(|v| !v.is_null()) {
+                    t.insert(k.into(), v.clone());
+                }
+            }
+            raw = text;
+        }
         let c: DeepSeek4Config = serde_json::from_value(raw).context("parse deepseek_v4 config")?;
         let n = c.num_hidden_layers;
+        if c.v41 {
+            c.check_v41()?;
+        }
         if c.compress_ratios.len() < n {
             bail!("deepseek_v4: {} compress_ratios for {n} layers", c.compress_ratios.len());
         }
@@ -1335,6 +1427,70 @@ impl DeepSeek4Config {
             bail!("deepseek_v4: bad hyper-connection or rotary settings");
         }
         Ok(c)
+    }
+
+    fn check_v41(&self) -> Result<()> {
+        let n = self.num_hidden_layers;
+        if self.num_hash_layers != 0 {
+            bail!("deepseek_v41: hash-routed layers are not part of this architecture");
+        }
+        for l in 0..n.min(self.compress_ratios.len()) {
+            let r = self.compress_ratios[l];
+            if r == 0 {
+                continue;
+            }
+            let (Some(kv), Some(ix)) = (self.kv_source(l), self.index_source(l)) else {
+                bail!("deepseek_v41: layer {l} has compressed attention but no key or index source layer before it");
+            };
+            if self.compress_ratios[kv] != r || self.compress_ratios[ix] != r || ix < kv {
+                bail!("deepseek_v41: layer {l} (rate {r}) does not share the rate of its source layers {kv} / {ix}");
+            }
+        }
+        if let Some(cs) = self.candidate_source() {
+            if !self.index_source_layer_ids.contains(&cs) || self.candidate_block_size == 0 || self.candidate_topk_blocks == 0 {
+                bail!("deepseek_v41: bad candidate block settings");
+            }
+            // Every later index layer masks with the candidates: same keys.
+            for &l in self.index_source_layer_ids.iter().filter(|&&l| l > cs) {
+                if self.kv_source(l) != self.kv_source(cs) {
+                    bail!("deepseek_v41: index layer {l} does not share the keys of the candidate source layer {cs}");
+                }
+            }
+        }
+        let ne = self.engram_layer_ids.len();
+        if ne > 0 {
+            if self.engram_max_ngram_size < 2 || self.engram_n_heads == 0 || self.engram_head_dim == 0 {
+                bail!("deepseek_v41: bad engram settings");
+            }
+            if self.engram_layer_ids.iter().any(|&l| l >= n) {
+                bail!("deepseek_v41: engram layer out of range");
+            }
+            let cols = (self.engram_max_ngram_size - 1) * self.engram_n_heads;
+            let ok = |v: &Option<Vec<Vec<i64>>>, w: usize| v.as_ref().is_none_or(|v| v.len() == ne && v.iter().all(|r| r.len() == w));
+            if !ok(&self.engram_multipliers, self.engram_max_ngram_size)
+                || !ok(&self.engram_primes, cols)
+                || !ok(&self.engram_offsets, cols)
+            {
+                bail!("deepseek_v41: engram hash tables do not match the engram settings");
+            }
+        }
+        Ok(())
+    }
+
+    /// V4.1: the layer whose compressed keys layer `l` attends to (the last key source at or
+    /// before it).
+    pub fn kv_source(&self, l: usize) -> Option<usize> {
+        self.kv_source_layer_ids.iter().copied().filter(|&s| s <= l).max()
+    }
+
+    /// V4.1: the layer whose indexer chooses the compressed keys of layer `l`.
+    pub fn index_source(&self, l: usize) -> Option<usize> {
+        self.index_source_layer_ids.iter().copied().filter(|&s| s <= l).max()
+    }
+
+    /// V4.1: the candidate source layer, when candidate filtering is on.
+    pub fn candidate_source(&self) -> Option<usize> {
+        self.candidate_source_layer_id.filter(|&l| l >= 0).map(|l| l as usize)
     }
 
     /// The compression rate of layer `l` (0: sliding window only).

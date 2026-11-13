@@ -48,6 +48,10 @@
 //! `w2`; `w2` has no bias, so that is the same edit of an activation scaled afterwards). Every
 //! layer is a MoE: there is no dense MLP.
 
+#[path = "deepseek41.rs"]
+mod v41;
+pub(crate) use v41::{gguf_config as gguf_config_v41, gguf_name as gguf_name_v41};
+
 use crate::config::DeepSeek4Config;
 use crate::intervene::{NeuronHook, Target};
 use crate::kernels::*;
@@ -241,6 +245,8 @@ pub(crate) enum Pick {
 pub(crate) struct Moe<'a> {
     router: Vec<f32>, // [n_exp, H]
     pick: Pick,
+    /// V4.1: the selection bias of the tokens of an image span (`gate.bias_vl`).
+    bias_vl: Option<Vec<f32>>,
     pub(crate) experts: Experts<'a>,
     shared: Mlp<'a>,
 }
@@ -316,6 +322,8 @@ pub struct DeepSeek4Session {
     hd: usize,
     window: usize,
     pub pos: usize,
+    /// V4.1: the engram id (compressed token id, -1 inside an image span) of every position.
+    eng: Vec<i32>,
     /// Runtime interventions ([`crate::intervene`]).
     pub iv: crate::intervene::State,
 }
@@ -333,6 +341,7 @@ impl DeepSeek4Session {
                 c.truncate(pos);
             }
         }
+        self.eng.truncate(pos);
         self.pos = pos;
     }
 
@@ -361,6 +370,10 @@ pub struct DeepSeek4Model<'a> {
     /// Rotary inverse frequencies of the window-only layers and of the compressed ones.
     inv_main: Vec<f32>,
     inv_comp: Vec<f32>,
+    /// DeepSeek V4.1 (`cfg.v41`): each layer's compressor, indexer and engram, and the engram
+    /// hash.
+    x41: Vec<v41::Layer41<'a>>,
+    hash: Option<v41::Hash>,
     /// Weight streaming: unit `l` is layer `l`, unit `num_hidden_layers` the LM head.
     stream: Option<crate::stream::StreamHook>,
 }
@@ -455,7 +468,8 @@ impl<'a> Loader<'a, '_> {
         let hcn = c.hc_mult;
         let mix = (2 + hcn) * hcn;
         let ap = format!("{prefix}attn.");
-        let (comp, indexer) = if ratio > 0 {
+        // (V4.1 layers have their own compressors and indexers: `v41::Layer41`.)
+        let (comp, indexer) = if ratio > 0 && !c.v41 {
             let comp = self.compressor(&format!("{ap}compressor."), ratio, hd)?;
             let indexer = if ratio == 4 {
                 let (ni, di) = (c.index_n_heads, c.index_head_dim);
@@ -513,9 +527,15 @@ impl<'a> Loader<'a, '_> {
             let bn = format!("{fp}gate.bias");
             Pick::Score(if self.files.has(&bn) { Some(self.getf(&bn, &[ne])?) } else { None })
         };
+        let vn = format!("{fp}gate.bias_vl");
         let moe = Moe {
             router: self.getf(&format!("{fp}gate.weight"), &[ne, h])?,
             pick,
+            bias_vl: if c.v41 && self.files.has(&vn) {
+                Some(self.getf(&vn, &[ne])?)
+            } else {
+                None
+            },
             experts: Experts::load(
                 self.files,
                 &format!("{fp}experts."),
@@ -718,13 +738,27 @@ impl<'a> DeepSeek4Model<'a> {
         let embed = Table::load(files, "embed.weight", v, h, if tied { quant } else { table_quant(quant) })?;
         let head = ld.lin(if tied { "embed.weight" } else { "head.weight" }, v, h)?;
         let norm = ld.getf("norm.weight", &[h])?;
-        let hc_head = ld.hc_head("")?;
+        // (V4.1 collapses the copies with the last layer's weights: no `hc_head`.)
+        let hc_head = if cfg.v41 {
+            Hc {
+                f: Vec::new(),
+                base: Vec::new(),
+                scale: Vec::new(),
+            }
+        } else {
+            ld.hc_head("")?
+        };
+        let hash = if cfg.v41 { v41::Hash::load(&ld)? } else { None };
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        let mut x41 = Vec::new();
         for l in 0..cfg.num_hidden_layers {
             layers.push(
                 ld.layer(&format!("layers.{l}."), l, cfg.ratio(l))
                     .with_context(|| format!("layer {l}"))?,
             );
+            if cfg.v41 {
+                x41.push(v41::load_layer(&ld, l, hash.as_ref()).with_context(|| format!("layer {l}"))?);
+            }
         }
         let (inv_main, inv_comp) = cfg.rope_freqs();
         let m = Self {
@@ -737,6 +771,8 @@ impl<'a> DeepSeek4Model<'a> {
             layers,
             inv_main,
             inv_comp,
+            x41,
+            hash,
             stream: None,
         };
         // Routed experts that cannot all stay in memory are read through the page cache as they
@@ -763,15 +799,26 @@ impl<'a> DeepSeek4Model<'a> {
             layers: self
                 .layers
                 .iter()
-                .map(|l| LayerState {
-                    comp: l.attn.comp.as_ref().map(|cp| cs(cp.d, cp.width(), cp.ratio)),
-                    idx: l.attn.indexer.as_ref().map(|ix| cs(ix.comp.d, ix.comp.width(), ix.comp.ratio)),
-                    ..Default::default()
+                .enumerate()
+                .map(|(i, l)| match self.x41.get(i) {
+                    // V4.1: a key source holds the compressed keys (with the rows of the groups
+                    // still pooling when the rate is above 1) and the indexers' keys.
+                    Some(x) => LayerState {
+                        comp: x.comp().map(|cp| cs(c.head_dim, cp.width(c.head_dim), l.ratio)),
+                        idx: x.comp().map(|_| cs(c.index_head_dim, 0, l.ratio)),
+                        ..Default::default()
+                    },
+                    None => LayerState {
+                        comp: l.attn.comp.as_ref().map(|cp| cs(cp.d, cp.width(), cp.ratio)),
+                        idx: l.attn.indexer.as_ref().map(|ix| cs(ix.comp.d, ix.comp.width(), ix.comp.ratio)),
+                        ..Default::default()
+                    },
                 })
                 .collect(),
             hd: c.head_dim,
             window: c.sliding_window,
             pos: 0,
+            eng: Vec::new(),
             iv: Default::default(),
         }
     }
@@ -788,19 +835,22 @@ impl<'a> DeepSeek4Model<'a> {
         v
     }
 
-    fn dense_lins<'s>(&'s self, l: &'s Layer<'a>) -> Vec<&'s Lin<'a>> {
+    fn dense_lins<'s>(&'s self, i: usize, l: &'s Layer<'a>) -> Vec<&'s Lin<'a>> {
         let mut v = self.attn_lins(&l.attn);
         let s = &l.moe.shared;
         v.extend([&s.gate, &s.up, &s.down]);
+        if let Some(x) = self.x41.get(i) {
+            v.extend(x.lins());
+        }
         v
     }
 
     /// Weight bytes read per decoded token (the routed experts at top-k).
     pub fn streamed_bytes(&self) -> usize {
         let mut n = self.head.bytes();
-        for l in &self.layers {
-            n += self.attn_lins(&l.attn).iter().map(|w| w.bytes()).sum::<usize>();
-            n += l.moe.shared.bytes() + l.moe.experts.bytes_per_token();
+        for (i, l) in self.layers.iter().enumerate() {
+            n += self.dense_lins(i, l).iter().map(|w| w.bytes()).sum::<usize>();
+            n += l.moe.experts.bytes_per_token();
         }
         n
     }
@@ -814,7 +864,7 @@ impl<'a> DeepSeek4Model<'a> {
             .enumerate()
             .map(|(l, layer)| crate::stream::UnitSpec {
                 name: format!("layer.{l}"),
-                ranges: self.dense_lins(layer).iter().flat_map(|w| w.mem_ranges()).collect(),
+                ranges: self.dense_lins(l, layer).iter().flat_map(|w| w.mem_ranges()).collect(),
                 uses: 1.0,
                 parts: layer.moe.experts.ranges(),
             })
@@ -833,7 +883,7 @@ impl<'a> DeepSeek4Model<'a> {
     pub fn mark_streamed(&self, streamed: &[bool]) {
         for (l, layer) in self.layers.iter().enumerate() {
             let s = streamed.get(l).copied().unwrap_or(false);
-            for w in self.dense_lins(layer) {
+            for w in self.dense_lins(l, layer) {
                 w.set_transient_device(s);
             }
             for e in layer.moe.experts.lins().into_iter().flatten() {
@@ -885,6 +935,23 @@ impl<'a> DeepSeek4Model<'a> {
     /// mean of the residual copies entering each of `layers`, `num_hidden_layers` standing for
     /// the last layer's output (the target features of a DSpark draft).
     pub fn forward_capture(&self, sess: &mut DeepSeek4Session, tokens: &[u32], layers: &[usize], feats: &mut Vec<f32>) -> Vec<f32> {
+        self.forward_capture_mm(sess, tokens, &[], layers, feats)
+    }
+
+    /// [`Self::forward_capture`] with the input embeddings of some tokens replaced (`mm`: index
+    /// in `tokens`, row): the image positions of DeepSeek V4.1.
+    pub fn forward_capture_mm(
+        &self,
+        sess: &mut DeepSeek4Session,
+        tokens: &[u32],
+        mm: &[(usize, &[f32])],
+        layers: &[usize],
+        feats: &mut Vec<f32>,
+    ) -> Vec<f32> {
+        if self.cfg.v41 {
+            return v41::forward(self, sess, tokens, mm, layers, feats);
+        }
+        assert!(mm.is_empty(), "DeepSeek V4 takes text only");
         let t = tokens.len();
         assert!(t > 0);
         let c = &self.cfg;
@@ -967,7 +1034,7 @@ impl<'a> DeepSeek4Model<'a> {
         need: NeedExperts,
         hook: Option<&NeuronHook>,
     ) {
-        moe_forward(&self.cfg, m, x, tokens, t, y, need, hook)
+        moe_forward(&self.cfg, m, x, tokens, &[], t, y, need, hook)
     }
 
     /// One layer's attention over `xa` (`[t, H]`, the normed block input) into `out`.
@@ -1053,7 +1120,7 @@ impl<'a> DeepSeek4Model<'a> {
             sel = select(c, &iq, &iw, is, t, start);
         }
         let mut att = vec![0f32; t * nh * hd];
-        attend(c, &a.sink, &q, st, &sel, layer.ratio, t, start, &mut att);
+        attend(c, &a.sink, &q, st, st.comp.as_ref(), &sel, layer.ratio, t, start, &mut att);
         // Undo the rotation of the values' tails at each query's position.
         for_chunks(&mut att, hd, t * nh > 64, |i, oh| {
             let ti = i / nh;
@@ -1165,15 +1232,30 @@ fn pool(c: &DeepSeek4Config, cp: &Compressor, cs: &CompState, w0: usize, inv: &[
 /// highest `sum_h w_h relu(q_h . k)` among the visible ones (None when there are no more than
 /// that). `iq` `[t, heads, dim]` (rotated), `iw` `[t, heads]` (scaled).
 fn select(c: &DeepSeek4Config, iq: &[f32], iw: &[f32], is: &CompState, t: usize, start: usize) -> Vec<Option<Vec<u32>>> {
+    let topk = c.index_topk;
+    select_with(c, iq, iw, is, t, start, &|_, s| top_positions(s, topk))
+}
+
+/// [`select`] with the choice left to `finish`: for each query that sees more than `index_topk`
+/// compressed keys, `finish(query, scores of its visible keys)` (None for the other queries).
+fn select_with<R: Send>(
+    c: &DeepSeek4Config,
+    iq: &[f32],
+    iw: &[f32],
+    is: &CompState,
+    t: usize,
+    start: usize,
+    finish: &(dyn Fn(usize, &mut [f32]) -> R + Sync),
+) -> Vec<Option<R>> {
     let (ni, di, topk, r) = (c.index_n_heads, c.index_head_dim, c.index_topk, is.ratio);
-    let mut sel: Vec<Option<Vec<u32>>> = vec![None; t];
+    let mut sel: Vec<Option<R>> = (0..t).map(|_| None).collect();
     let rows: Vec<usize> = (0..t).filter(|&i| (start + i + 1) / r > topk).collect();
     if rows.is_empty() {
         return sel;
     }
     let _timer = prof::start(Cat::Attention);
     let keys = &is.keys;
-    let score_row = |i: usize, sc: &dyn Fn(usize, usize) -> f32| -> Vec<u32> {
+    let score_row = |i: usize, sc: &dyn Fn(usize, usize) -> f32| -> R {
         let nv = (start + i + 1) / r;
         let mut s = vec![0f32; nv];
         for (wi, o) in s.iter_mut().enumerate() {
@@ -1183,9 +1265,9 @@ fn select(c: &DeepSeek4Config, iq: &[f32], iw: &[f32], is: &CompState, t: usize,
             }
             *o = acc;
         }
-        top_positions(&s, topk)
+        finish(i, &mut s)
     };
-    let mut out: Vec<Vec<u32>> = vec![Vec::new(); rows.len()];
+    let mut out: Vec<Option<R>> = (0..rows.len()).map(|_| None).collect();
     let op = SendPtrV(out.as_mut_ptr());
     if t < GEMM_MIN && rows.len() < crate::pool::threads() {
         // Few queries (decode, verification): each one's scores in parallel over blocks of
@@ -1208,7 +1290,7 @@ fn select(c: &DeepSeek4Config, iq: &[f32], iw: &[f32], is: &CompState, t: usize,
                     unsafe { *sp.get().add(wi) = acc };
                 }
             });
-            out[ri] = top_positions(&s, topk);
+            out[ri] = Some(finish(i, &mut s));
         }
     } else if t < GEMM_MIN {
         crate::pool::run(rows.len(), &|ri| {
@@ -1217,7 +1299,7 @@ fn select(c: &DeepSeek4Config, iq: &[f32], iw: &[f32], is: &CompState, t: usize,
                 dot(&iq[(i * ni + hh) * di..(i * ni + hh + 1) * di], &keys[wi * di..(wi + 1) * di])
             });
             // SAFETY: each task writes its own slot.
-            unsafe { *op.get().add(ri) = v };
+            unsafe { *op.get().add(ri) = Some(v) };
         });
     } else {
         let n = (start + t) / r;
@@ -1231,12 +1313,12 @@ fn select(c: &DeepSeek4Config, iq: &[f32], iw: &[f32], is: &CompState, t: usize,
             crate::pool::run(blk.len(), &|k| {
                 let v = score_row(blk[k], &|hh, wi| sc[(k * ni + hh) * n + wi]);
                 // SAFETY: each task writes its own slot.
-                unsafe { *op.get().add(bi * rb + k) = v };
+                unsafe { *op.get().add(bi * rb + k) = Some(v) };
             });
         }
     }
     for (&i, v) in rows.iter().zip(out) {
-        sel[i] = Some(v);
+        sel[i] = v;
     }
     sel
 }
@@ -1249,6 +1331,7 @@ fn attend(
     sink: &[f32],
     q: &[f32],
     st: &LayerState,
+    comp: Option<&CompState>,
     sel: &[Option<Vec<u32>>],
     ratio: usize,
     t: usize,
@@ -1258,7 +1341,6 @@ fn attend(
     let _timer = prof::start(Cat::Attention);
     let (nh, hd, win) = (c.num_attention_heads, c.head_dim, c.sliding_window);
     let scale = (hd as f32).powf(-0.5);
-    let comp = st.comp.as_ref();
     let raw = |p: usize| &st.raw[(p - st.raw_start) * hd..(p - st.raw_start + 1) * hd];
     let ckey = |w: usize| &comp.unwrap().keys[w * hd..(w + 1) * hd];
     // The keys of query `i`: window positions, then compressed entries.
@@ -1367,7 +1449,7 @@ fn attend(
 }
 
 /// The routing of one token (`logits` over the experts) as the reference's `Gate`.
-fn route(c: &DeepSeek4Config, m: &Moe, logits: &[f32], token: u32) -> Vec<(usize, f32)> {
+fn route(c: &DeepSeek4Config, m: &Moe, logits: &[f32], token: u32, image: bool) -> Vec<(usize, f32)> {
     let k = c.num_experts_per_tok;
     let scores: Vec<f32> = match c.scoring_func.as_str() {
         "softmax" => {
@@ -1386,6 +1468,11 @@ fn route(c: &DeepSeek4Config, m: &Moe, logits: &[f32], token: u32) -> Vec<(usize
             .map(|&e| e as usize)
             .collect(),
         Pick::Score(bias) => {
+            let bias = if image {
+                m.bias_vl.as_ref().or(bias.as_ref())
+            } else {
+                bias.as_ref()
+            };
             let sel: Vec<f32> = match bias {
                 Some(b) => scores.iter().zip(b).map(|(s, b)| s + b).collect(),
                 None => scores.clone(),
@@ -1397,7 +1484,13 @@ fn route(c: &DeepSeek4Config, m: &Moe, logits: &[f32], token: u32) -> Vec<(usize
         }
     };
     let mut w: Vec<f32> = idx.iter().map(|&i| scores[i]).collect();
-    if c.scoring_func != "softmax" {
+    if c.v41 {
+        // V4.1: `norm_topk_prob`, whatever the scoring function.
+        if c.norm_topk_prob && k > 1 {
+            let s: f32 = w.iter().sum::<f32>() + 1e-20;
+            w.iter_mut().for_each(|v| *v /= s);
+        }
+    } else if c.scoring_func != "softmax" {
         let s: f32 = w.iter().sum();
         w.iter_mut().for_each(|v| *v /= s);
     }
@@ -1406,13 +1499,15 @@ fn route(c: &DeepSeek4Config, m: &Moe, logits: &[f32], token: u32) -> Vec<(usize
 }
 
 /// The MoE block of the target or of a DSpark stage (`hook`: neuron edits of the shared expert
-/// and of the routed ones, on the input of their down projection).
+/// and of the routed ones, on the input of their down projection). `image`: the tokens inside an
+/// image span (V4.1's own selection bias; empty: none).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn moe_forward(
     c: &DeepSeek4Config,
     m: &Moe,
     x: &[f32],
     tokens: &[u32],
+    image: &[bool],
     t: usize,
     y: &mut [f32],
     need: NeedExperts,
@@ -1436,7 +1531,12 @@ pub(crate) fn moe_forward(
             *v = dot(w, &x[ti * h..(ti + 1) * h]);
         }
     });
-    let routes: Vec<_> = logits.chunks(ne).zip(tokens).map(|(lg, &tk)| route(c, m, lg, tk)).collect();
+    let routes: Vec<_> = logits
+        .chunks(ne)
+        .zip(tokens)
+        .enumerate()
+        .map(|(i, (lg, &tk))| route(c, m, lg, tk, image.get(i).copied().unwrap_or(false)))
+        .collect();
     m.experts.forward(x, t, h, &routes, y, need, hook, Some(&shared));
 }
 
@@ -1552,7 +1652,7 @@ impl<'a> Ds4Draft<'a> {
             hc_post(c, &mut x, &o, &post, &comb, nb);
             let (xf, post, comb) = hc_pre(c, &layer.hc_ffn, &layer.ffn_norm, &x, nb);
             o.fill(0.0);
-            moe_forward(c, &layer.moe, &xf, &tokens, nb, &mut o, None, None);
+            moe_forward(c, &layer.moe, &xf, &tokens, &[], nb, &mut o, None, None);
             hc_post(c, &mut x, &o, &post, &comb, nb);
         }
         let mut out = hc_head(c, &self.hc_head, &x, nb);
@@ -1627,13 +1727,18 @@ impl SendPtr {
     }
 }
 
-#[derive(Clone, Copy)]
-struct SendPtrV(*mut Vec<u32>);
-unsafe impl Send for SendPtrV {}
-unsafe impl Sync for SendPtrV {}
-impl SendPtrV {
+struct SendPtrV<T>(*mut T);
+impl<T> Clone for SendPtrV<T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for SendPtrV<T> {}
+unsafe impl<T: Send> Send for SendPtrV<T> {}
+unsafe impl<T: Send> Sync for SendPtrV<T> {}
+impl<T> SendPtrV<T> {
     #[inline(always)]
-    fn get(self) -> *mut Vec<u32> {
+    fn get(self) -> *mut T {
         self.0
     }
 }
@@ -1655,8 +1760,8 @@ impl crate::generate::TextLm for DeepSeek4Model<'_> {
     fn session_len(&self, sess: &DeepSeek4Session) -> usize {
         sess.pos
     }
-    fn forward_hidden_mm(&self, sess: &mut DeepSeek4Session, tokens: &[u32], _mm: &[(usize, &[f32])]) -> Vec<f32> {
-        DeepSeek4Model::forward_hidden(self, sess, tokens)
+    fn forward_hidden_mm(&self, sess: &mut DeepSeek4Session, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {
+        self.forward_capture_mm(sess, tokens, mm, &[], &mut Vec::new())
     }
     fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
         DeepSeek4Model::logits(self, hidden, t)

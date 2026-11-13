@@ -549,12 +549,20 @@ impl ModelFiles {
             // A split model (`-00001-of-00009.gguf`): every part, named as the first describes.
             let parts = crate::gguf::split_files(dir)?;
             let mut shards = vec![SafeTensors::open(&parts[0], in_memory)?];
-            if parts.len() > 1 {
-                let h = crate::gguf::header(&parts[0])?;
-                let (arch, n_layers) = (h.arch().to_string(), h.n_layers());
-                for p in &parts[1..] {
-                    shards.push(SafeTensors::open_part(p, in_memory, Some((&arch, n_layers)))?);
-                }
+            let h = crate::gguf::header(&parts[0])?;
+            let (arch, n_layers) = (h.arch().to_string(), h.n_layers());
+            for p in &parts[1..] {
+                shards.push(SafeTensors::open_part(p, in_memory, Some((&arch, n_layers)))?);
+            }
+            // DeepSeek V4.1 conversions that name the file of their engram tables instead of
+            // counting it among their parts: beside the model, or one folder up.
+            if let Some(f) = h.get(&format!("{arch}.engram.file")).and_then(crate::gguf::Value::as_str)
+                && !f.contains(['/', '\\'])
+                && let Some(d) = parts[0].parent()
+                && let Some(p) = [d.join(f), d.join("..").join(f)].into_iter().find(|p| p.is_file())
+                && !parts.contains(&p)
+            {
+                shards.push(SafeTensors::open_part(&p, in_memory, Some((&arch, n_layers)))?);
             }
             let mut index = HashMap::new();
             for (i, s) in shards.iter().enumerate() {
