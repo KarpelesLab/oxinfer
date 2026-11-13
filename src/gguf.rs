@@ -321,6 +321,8 @@ impl Header {
             "minimax-m3" => "minimax_m3_vl_text",
             "glm5-next" => "glm5_next_text",
             "glm-dsa" => "glm_moe_dsa",
+            "kimi-k3" => "kimi_k3",
+            "kimi-k31" => "kimi_k31",
             a => bail!(
                 "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, llama, gemma4, mistral-large4, deepseek4, deepseek41, minimax-m2, minimax-m3, glm5-next, glm-dsa and qwen2 are)"
             ),
@@ -349,6 +351,9 @@ impl Header {
         }
         if crate::glm5::is_model_type(mt) {
             return crate::glm5::gguf_config(self);
+        }
+        if matches!(mt, "kimi_k3" | "kimi_k31") {
+            return crate::kimi::gguf_config(self);
         }
         let llama = mt == "llama";
         let minimax = matches!(mt, "minimax_m2" | "minimax_m3_vl_text");
@@ -798,6 +803,9 @@ impl Header {
             bail!("GGUF tokenizer model {model:?} is not supported (only byte-level BPE, \"gpt2\")");
         }
         let pre = self.get("tokenizer.ggml.pre").and_then(Value::as_str).unwrap_or("");
+        if pre == "kimi-k2" {
+            return self.kimi_tokenizer_json();
+        }
         // Llama 3 and Mistral's tekken (as their tokenizer.json): no normalizer, and a word found
         // whole in the vocabulary is one token whatever the merges say (`ignore_merges`).
         let whole_words = matches!(pre, "llama-bpe" | "glm4" | "tekken" | "tekken-num3" | "pixtral");
@@ -892,6 +900,27 @@ impl Header {
         }))
     }
 
+    /// Kimi K2 / K3 (`kimi-k2`): the tiktoken vocabulary as byte-level BPE whose merges follow
+    /// tiktoken's ranks (the file's own merge list is an approximation of them and is not used).
+    fn kimi_tokenizer_json(&self) -> Result<Json> {
+        let tokens = self
+            .get("tokenizer.ggml.tokens")
+            .and_then(Value::as_array)
+            .context("GGUF has no tokenizer.ggml.tokens")?;
+        let types = self.get("tokenizer.ggml.token_type").and_then(Value::as_array);
+        let (mut normal, mut added) = (Vec::new(), Vec::new());
+        for (id, t) in tokens.iter().enumerate() {
+            let s = t.as_str().context("non-string token")?;
+            // 1 normal, 3 control, 4 user-defined, 5 unused.
+            match types.and_then(|ty| ty.get(id)).and_then(Value::as_u64).unwrap_or(1) {
+                3 | 4 => added.push((s.to_string(), id as u32, true)),
+                5 => {}
+                _ => normal.push((s.to_string(), id as u32)),
+            }
+        }
+        Ok(crate::kimi::bpe_json(&normal, &added))
+    }
+
     /// Gemma 4's `tokenizer.json`: SentencePiece-style BPE over `▁`-for-space text with byte
     /// fallback, rebuilt from the GGUF vocabulary and merges (control and user-defined tokens are
     /// the added tokens).
@@ -967,6 +996,9 @@ pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec
     // GLM-5.3 / GLM-5.3-Flash: the release's naming.
     if matches!(arch, "glm5-next" | "glm-dsa") {
         return crate::glm5::gguf_name(&t.name, &t.ne, n_layers);
+    }
+    if matches!(arch, "kimi-k3" | "kimi-k31") {
+        return crate::kimi::gguf_name(&t.name, &t.ne);
     }
     let mut shape: Vec<usize> = t.ne.iter().rev().copied().collect();
     let name = match t.name.as_str() {

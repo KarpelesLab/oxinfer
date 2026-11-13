@@ -57,6 +57,7 @@ use crate::drafter::Drafter;
 use crate::dspark::{Dspark, DsparkDecoder, DsparkOptions};
 use crate::generate::{self, Decoded, Flow as GFlow, TextStream};
 use crate::glm5::{Glm5Model, Glm5Session};
+use crate::kimi::{KimiModel, KimiSession};
 use crate::mistral4::{Mistral4Model, Mistral4Session};
 use crate::model::{Model, Quant, Session};
 use crate::platform::DevicePref;
@@ -903,6 +904,8 @@ pub enum Family {
     DeepSeek4,
     /// GLM-5.3 and GLM-5.3-Flash (`glm_moe_dsa`, `glm5_next`).
     Glm5,
+    /// Kimi K3 / K3.1 (`kimi_k3`, `kimi_k31`).
+    Kimi,
 }
 
 /// Speculative decoding in use.
@@ -1021,6 +1024,10 @@ enum Lm {
         model: &'static DeepSeek4Model<'static>,
         sess: DeepSeek4Session,
     },
+    Kimi {
+        model: &'static KimiModel<'static>,
+        sess: KimiSession,
+    },
     DeepSeek4Dspark {
         dec: Box<DsparkDecoder<'static, DeepSeek4Model<'static>>>,
     },
@@ -1133,6 +1140,7 @@ impl Lm {
             Lm::Mistral4Dspark { dec } => dec.sess.pos,
             Lm::DeepSeek4 { sess, .. } => sess.pos,
             Lm::Glm5 { sess, .. } => sess.pos,
+            Lm::Kimi { sess, .. } => sess.pos,
             Lm::DeepSeek4Dspark { dec } => dec.sess.pos,
             Lm::QwenDspark { dec } => dec.sess.pos,
             Lm::GemmaDspark { dec } => dec.sess.pos,
@@ -1159,6 +1167,7 @@ impl Lm {
             }
             Lm::DeepSeek4 { model, sess } => *sess = model.new_session(),
             Lm::Glm5 { model, sess } => *sess = model.new_session(),
+            Lm::Kimi { model, sess } => *sess = model.new_session(),
             Lm::DeepSeek4Dspark { dec } => {
                 let opts = dec.opts.clone();
                 let lk = reset_lookup(dec.lookup.take());
@@ -1362,6 +1371,7 @@ impl Engine {
             "mistral_large4" | "mistral_large4_text" => Family::Mistral4,
             "deepseek_v4" | "deepseek_v41" | "ernie5_5_moe" => Family::DeepSeek4,
             m if crate::glm5::is_model_type(m) => Family::Glm5,
+            "kimi_k3" | "kimi_k31" => Family::Kimi,
             other => bail!("unsupported model_type {other}"),
         };
         if family == Family::Llama && !chat::Llama3Chat::matches_model(&dir) {
@@ -1417,7 +1427,7 @@ impl Engine {
         let too_big = if exp {
             crate::qwen4exp::too_big(&dir)
         } else {
-            matches!(family, Family::Mistral4 | Family::DeepSeek4 | Family::Glm5)
+            matches!(family, Family::Mistral4 | Family::DeepSeek4 | Family::Glm5 | Family::Kimi)
                 && crate::mistral4::too_big(crate::safetensors::checkpoint_bytes(&dir))
         };
         // Too big for memory: streamed with a page-cache budget unless told otherwise
@@ -1722,6 +1732,32 @@ impl Engine {
                     },
                 };
                 (lm, fmt, info.0, info.1, info.2, info.3, info.4)
+            }
+            Family::Kimi => {
+                if decision_dir.is_some() {
+                    bail!("decisions (decision_from) are not supported for Kimi K3");
+                }
+                decision = None;
+                let mut model = KimiModel::load(crate::kimi::KimiConfig::load(&dir)?, files, opts.quant)?;
+                if let Some(so) = stream.clone() {
+                    streamer = Some(crate::stream::attach_kimi(&mut model, files, so)?);
+                }
+                let model = arena.keep(model);
+                let c = &model.cfg;
+                let fmt: &'static (dyn ChatFormat + Sync) = &chat::KimiChat;
+                let lm = Lm::Kimi {
+                    model,
+                    sess: model.new_session(),
+                };
+                (
+                    lm,
+                    fmt,
+                    model.quant,
+                    c.num_hidden_layers,
+                    c.hidden_size,
+                    c.vocab_size,
+                    model.streamed_bytes(),
+                )
             }
             Family::Glm5 => {
                 if decision_dir.is_some() {
@@ -2275,6 +2311,7 @@ impl Engine {
             Lm::GemmaDspark { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
             Lm::DeepSeek4 { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::Glm5 { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
+            Lm::Kimi { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::DeepSeek4Dspark { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("activation capture is not supported for Core ML models"),
@@ -2308,6 +2345,7 @@ impl Engine {
             Lm::GemmaDspark { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
             Lm::DeepSeek4 { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::Glm5 { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
+            Lm::Kimi { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::DeepSeek4Dspark { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
@@ -2332,6 +2370,7 @@ impl Engine {
             Lm::GemmaDspark { dec } => dec.model(),
             Lm::DeepSeek4 { model, .. } => *model,
             Lm::Glm5 { model, .. } => *model,
+            Lm::Kimi { model, .. } => *model,
             Lm::DeepSeek4Dspark { dec } => dec.model(),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
@@ -2351,6 +2390,7 @@ impl Engine {
             Lm::GemmaDspark { dec } => &mut dec.sess.iv,
             Lm::DeepSeek4 { sess, .. } => &mut sess.iv,
             Lm::Glm5 { sess, .. } => &mut sess.iv,
+            Lm::Kimi { sess, .. } => &mut sess.iv,
             Lm::DeepSeek4Dspark { dec } => &mut dec.sess.iv,
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => return,
@@ -2588,6 +2628,7 @@ impl Engine {
                 Lm::GemmaDspark { dec } => run(dec.model(), &ids, &feats, chunk, need_logits)?,
                 Lm::DeepSeek4 { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
                 Lm::Glm5 { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
+                Lm::Kimi { .. } => bail!("decisions are not supported for Kimi K3"),
                 Lm::DeepSeek4Dspark { dec } => run(dec.model(), &ids, &feats, chunk, need_logits)?,
                 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
                 Lm::CoreMl(_) => bail!("decisions are not supported for Core ML models"),
@@ -2779,7 +2820,7 @@ impl PendingTurn {
             let delimiter = stream.on_token(id);
             let d = stream.delta(tok, out, false);
             let th = stream.thinking();
-            called |= Some(id) == call_id;
+            called |= Some(id) == call_id || stream.called();
             if th {
                 thinking.push_str(&d);
             } else {
@@ -2982,6 +3023,18 @@ impl PendingTurn {
                     plain!(*model, sess, base, logits, max)
                 }
             }
+            Lm::Kimi { model, sess } => {
+                let base = sess.pos;
+                let hs = generate::prefill(*model, sess, &ids, chunk, &overrides);
+                let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
+                st.prefill_secs = t0.elapsed().as_secs_f64();
+                let max = limit(sess.pos);
+                if max == 0 {
+                    empty(0.0)
+                } else {
+                    plain!(*model, sess, base, logits, max)
+                }
+            }
             // No prompt-lookup rounds: the recurrent layers cannot roll a rejected draft back.
             Lm::Glm5 { model, sess } => {
                 let hs = generate::prefill(*model, sess, &ids, chunk, &overrides);
@@ -3036,7 +3089,7 @@ impl PendingTurn {
             let (mut ts, mut called) = (TextStream::new(*fmt, think, tok), false);
             for (e, &t) in logprobs.iter_mut().zip(&d.tokens) {
                 let delimiter = ts.on_token(t);
-                called |= Some(t) == call_id;
+                called |= Some(t) == call_id || ts.called();
                 e.content = !(delimiter || ts.thinking() || called || stop.contains(&t));
             }
         }
@@ -3222,6 +3275,10 @@ pub fn load_tokenizer(model: &Path) -> Result<Tokenizer> {
         return crate::gguf::header(model)?.tokenizer();
     }
     let mut path = model.join("tokenizer.json");
+    // Kimi K3: a tiktoken vocabulary and no tokenizer.json.
+    if !crate::fsx::exists(&path) && crate::fsx::exists(&model.join("tiktoken.model")) {
+        return crate::kimi::tiktoken_tokenizer(model);
+    }
     // A diffusers pipeline's language model (`mllm/`, `text_encoder/`): the tokenizer sits in a
     // sibling `processor/` or `tokenizer/` folder.
     if !crate::fsx::exists(&path)

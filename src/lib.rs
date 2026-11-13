@@ -49,6 +49,7 @@ pub mod hf;
 pub mod intervene;
 pub mod janus;
 pub mod kernels;
+pub mod kimi;
 pub mod lookup;
 pub mod lora;
 #[cfg(feature = "media")]
