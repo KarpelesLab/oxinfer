@@ -899,6 +899,100 @@ pub mod qwen {
     }
 }
 
+// ---- GLM-5.3 ------------------------------------------------------------------------------------
+
+/// GLM-5.3 / GLM-5.3-Flash: JSON declarations inside `<tools>` in a system turn of their own;
+/// calls as `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>` (each
+/// tag a token of the vocabulary), strings bare and other values as JSON.
+pub mod glm {
+    use super::*;
+
+    /// The marker that opens a call in a reply.
+    pub const MARKER: &str = "<tool_call>";
+    const END: &str = "</tool_call>";
+
+    /// The tools turn the template writes after the reasoning-effort line.
+    pub fn tools_block(tools: &[ToolSpec]) -> String {
+        let mut s = String::from(
+            "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n",
+        );
+        for t in tools {
+            s.push_str(&format!(
+                "{{\"name\": {}, \"description\": {}, \"parameters\": {}}}\n",
+                qwen::py_json(&Value::String(t.name.clone())),
+                qwen::py_json(&Value::String(t.description.clone())),
+                qwen::py_json(&t.parameters)
+            ));
+        }
+        s.push_str("</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>");
+        s
+    }
+
+    /// Every `<tool_call>` of a reply. Values are JSON when they parse as JSON (other than a bare
+    /// string), strings otherwise; a parameter declared `"type": "string"` in `tools` stays the
+    /// string the model wrote.
+    pub fn parse_calls_for(raw: &str, tools: &[ToolSpec]) -> Vec<ToolCall> {
+        let declared_string = |tool: &str, key: &str| {
+            let t = tools.iter().find(|t| t.name == tool);
+            t.and_then(|t| t.parameters.get("properties")?.get(key)?.get("type")?.as_str()) == Some("string")
+        };
+        let mut calls = Vec::new();
+        for block in raw.split(MARKER).skip(1) {
+            let block = block.split(END).next().unwrap_or(block);
+            let (name, mut rest) = match block.find("<arg_key>") {
+                Some(i) => (block[..i].trim(), &block[i..]),
+                None => (block.trim(), ""),
+            };
+            let mut arguments = Map::new();
+            while let Some(r) = rest.strip_prefix("<arg_key>") {
+                let Some((key, r)) = r.split_once("</arg_key>") else { break };
+                let Some(r) = r.trim_start().strip_prefix("<arg_value>") else {
+                    break;
+                };
+                let (value, r) = r.split_once("</arg_value>").unwrap_or((r, ""));
+                let parsed = serde_json::from_str::<Value>(value.trim())
+                    .ok()
+                    .filter(|j| !j.is_string() && !declared_string(name, key.trim()));
+                arguments.insert(key.trim().to_string(), parsed.unwrap_or_else(|| Value::String(value.to_string())));
+                rest = r.trim_start();
+            }
+            if !name.is_empty() {
+                calls.push(ToolCall {
+                    name: name.to_string(),
+                    arguments,
+                });
+            }
+        }
+        calls
+    }
+
+    pub fn parse_calls(raw: &str) -> Vec<ToolCall> {
+        parse_calls_for(raw, &[])
+    }
+
+    /// Calls as the template renders them after a reply's text.
+    pub fn calls(calls: &[ToolCall]) -> String {
+        let mut s = String::new();
+        for c in calls {
+            s.push_str(MARKER);
+            s.push_str(&c.name);
+            for (k, v) in &c.arguments {
+                let text = match v {
+                    Value::String(t) => t.clone(),
+                    other => qwen::py_json(other),
+                };
+                s.push_str(&format!("<arg_key>{k}</arg_key><arg_value>{text}</arg_value>"));
+            }
+            s.push_str(END);
+        }
+        s
+    }
+
+    pub fn response(r: &ToolResult) -> String {
+        format!("<tool_response>{}</tool_response>", r.content)
+    }
+}
+
 // ---- built-in tools (command line) --------------------------------------------------------------
 
 /// Local wall-clock time: (`YYYY-MM-DD HH:MM:SS`, weekday, UTC offset in seconds, zone name).

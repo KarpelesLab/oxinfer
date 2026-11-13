@@ -1136,6 +1136,88 @@ impl ChatFormat for MiniMaxChat {
     }
 }
 
+/// GLM-5.3 and GLM-5.3-Flash (zai-org; Nex-N2.6 has the same template): `[gMASK]<sop>`, a system
+/// turn with the reasoning effort (the template's default, Max), the tools in a system turn of
+/// their own, then `<|system|>` / `<|user|>` / `<|assistant|>` / `<|observation|>` turns with
+/// nothing between them. A reply ends on the next role token (`<|user|>`, or `<|observation|>`
+/// after tool calls). The template always opens the reply with `<think>`; without thinking the
+/// block is closed at once, as the template renders past replies that have no reasoning.
+pub struct GlmChat;
+
+impl GlmChat {
+    fn assistant(think: bool) -> &'static str {
+        if think {
+            "<|assistant|><think>"
+        } else {
+            "<|assistant|><think></think>"
+        }
+    }
+
+    /// `eos` plus the role tokens a reply can end on.
+    pub fn stop_ids(tok: &crate::tokenizer::Tokenizer, mut eos: Vec<u32>) -> Vec<u32> {
+        for t in ["<|user|>", "<|observation|>", "<|endoftext|>"] {
+            if let Some(id) = tok.token_to_id(t)
+                && !eos.contains(&id)
+            {
+                eos.push(id);
+            }
+        }
+        eos
+    }
+}
+
+impl ChatFormat for GlmChat {
+    fn conversation_start(&self, system: Option<&str>, think: bool) -> String {
+        self.conversation_start_tools(system, think, &[])
+    }
+    fn user_turn(&self, content: &str, think: bool) -> String {
+        format!("<|user|>{content}{}", Self::assistant(think))
+    }
+    fn end_of_model_turn(&self) -> String {
+        String::new()
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        "<|user|>"
+    }
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        ("<think>", "</think>")
+    }
+    fn starts_in_thinking(&self, think: bool) -> bool {
+        think
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, _think: bool, tools: &[ToolSpec]) -> String {
+        let mut s = String::from("[gMASK]<sop><|system|>Reasoning Effort: Max");
+        if !tools.is_empty() {
+            s.push_str(&crate::tools::glm::tools_block(tools));
+        }
+        if let Some(sys) = system.filter(|s| !s.is_empty()) {
+            s.push_str("<|system|>");
+            s.push_str(sys);
+        }
+        s
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        crate::tools::glm::MARKER
+    }
+    fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
+        crate::tools::glm::parse_calls(raw)
+    }
+    fn parse_tool_calls_for(&self, raw: &str, tools: &[ToolSpec]) -> Vec<ToolCall> {
+        crate::tools::glm::parse_calls_for(raw, tools)
+    }
+    fn tool_results(&self, results: &[ToolResult], think: bool) -> String {
+        let mut s = String::from("<|observation|>");
+        for r in results {
+            s.push_str(&crate::tools::glm::response(r));
+        }
+        s.push_str(Self::assistant(think));
+        s
+    }
+    fn assistant_text(&self, content: &str, calls: &[ToolCall]) -> String {
+        format!("{content}{}", crate::tools::glm::calls(calls))
+    }
+}
+
 /// `eos` plus the chat format's end-of-turn token, looked up in the tokenizer.
 pub fn with_turn_end(fmt: &dyn ChatFormat, tok: &crate::tokenizer::Tokenizer, mut eos: Vec<u32>) -> Vec<u32> {
     if let Some(id) = tok.token_to_id(fmt.end_of_turn_token())
@@ -1345,5 +1427,89 @@ mod tests {
                 "<｜begin▁of▁sentence｜><｜System｜>Be brief.\n\n{tools}<｜User｜>Paris?<｜Assistant｜></think>Let me check.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>sunny</tool_result><｜Assistant｜></think>Sunny.<｜end▁of▁sentence｜><｜User｜>Thanks<｜Assistant｜></think>"
             )
         );
+    /// The renderings of GLM-5.3-Flash's chat template (transformers' jinja environment; the
+    /// templates of GLM-5.3 and Nex-N2.6 give the same text on these conversations).
+    #[test]
+    fn glm_matches_template() {
+        let f = GlmChat;
+        assert_eq!(
+            f.first_turn(None, true, &[], "Hi"),
+            "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hi<|assistant|><think>"
+        );
+        assert_eq!(
+            f.first_turn(Some("Be brief."), true, &[], "Hi"),
+            "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>Be brief.<|user|>Hi<|assistant|><think>"
+        );
+        let tools = [
+            ToolSpec {
+                name: "get_time".into(),
+                description: "Current time in a timezone.".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {"tz": {"type": "string", "description": "IANA name"}, "n": {"type": "integer"}}, "required": ["tz"]}),
+            },
+            ToolSpec {
+                name: "calc".into(),
+                description: "Evaluate.".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {"expr": {"type": "string"}}}),
+            },
+        ];
+        let block = concat!(
+            "<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n",
+            "You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n",
+            r#"{"name": "get_time", "description": "Current time in a timezone.", "parameters": {"type": "object", "properties": {"tz": {"type": "string", "description": "IANA name"}, "n": {"type": "integer"}}, "required": ["tz"]}}"#,
+            "\n",
+            r#"{"name": "calc", "description": "Evaluate.", "parameters": {"type": "object", "properties": {"expr": {"type": "string"}}}}"#,
+            "\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n",
+            "<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>"
+        );
+        assert_eq!(
+            f.first_turn(Some("Be brief."), true, &tools, "Time in Tokyo?"),
+            format!("[gMASK]<sop><|system|>Reasoning Effort: Max{block}<|system|>Be brief.<|user|>Time in Tokyo?<|assistant|><think>")
+        );
+        // A reply with two calls as the template renders it, its parse, and the results turn.
+        let reply = "need tool</think>Let me check.<tool_call>get_time<arg_key>tz</arg_key><arg_value>Asia/Tokyo</arg_value><arg_key>n</arg_key><arg_value>3</arg_value></tool_call><tool_call>calc<arg_key>expr</arg_key><arg_value>1+1</arg_value></tool_call>";
+        let calls = f.parse_tool_calls_for(reply, &tools);
+        assert_eq!(calls.len(), 2);
+        assert_eq!((calls[0].name.as_str(), calls[1].name.as_str()), ("get_time", "calc"));
+        assert_eq!(calls[0].arguments["tz"], "Asia/Tokyo");
+        assert_eq!(calls[0].arguments["n"], 3);
+        assert_eq!(calls[1].arguments["expr"], "1+1");
+        assert_eq!(f.assistant_text("need tool</think>Let me check.", &calls), reply);
+        let results = [
+            ToolResult {
+                name: "get_time".into(),
+                content: "12:00".into(),
+            },
+            ToolResult {
+                name: "calc".into(),
+                content: "2".into(),
+            },
+        ];
+        assert_eq!(
+            f.tool_results(&results, true),
+            "<|observation|><tool_response>12:00</tool_response><tool_response>2</tool_response><|assistant|><think>"
+        );
+        // A string parameter keeps what the model wrote, also when it reads as JSON.
+        let c = f.parse_tool_calls_for(
+            "<tool_call>calc<arg_key>expr</arg_key><arg_value>42</arg_value></tool_call>",
+            &tools,
+        );
+        assert_eq!(c[0].arguments["expr"], "42");
+        assert_eq!(
+            f.parse_tool_calls("<tool_call>calc<arg_key>expr</arg_key><arg_value>42</arg_value></tool_call>")[0].arguments["expr"],
+            42
+        );
+        // A second turn (the reply ended on `<|user|>`, which the next turn writes), and a reply
+        // without thinking.
+        let two = format!(
+            "{}greet</think>Hello!{}{}",
+            f.first_turn(None, true, &[], "Hi"),
+            f.end_of_model_turn(),
+            f.user_turn("Bye", true)
+        );
+        assert_eq!(
+            two,
+            "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hi<|assistant|><think>greet</think>Hello!<|user|>Bye<|assistant|><think>"
+        );
+        assert_eq!(f.user_turn("Hi", false), "<|user|>Hi<|assistant|><think></think>");
     }
 }

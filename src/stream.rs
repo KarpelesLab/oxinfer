@@ -1671,6 +1671,17 @@ pub fn attach_deepseek4(
     Ok(s)
 }
 
+/// Streams a GLM-5.3 / GLM-5.3-Flash model whose weights borrow `files` (memory-mapped): the
+/// layers (routed experts read on demand), the LM head. Detach (`set_stream(None)`) or drop the
+/// model before dropping `files`.
+pub fn attach_glm5(model: &mut crate::glm5::Glm5Model<'_>, files: &ModelFiles, opts: StreamOptions) -> Result<Arc<Streamer>> {
+    let s = Streamer::new(&[files], model.stream_units(), opts)?;
+    let streamed: Vec<bool> = s.plan().units.iter().map(|u| !u.2).collect();
+    model.mark_streamed(&streamed);
+    model.set_stream(Some(StreamHook::new(s.clone(), 0)));
+    Ok(s)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

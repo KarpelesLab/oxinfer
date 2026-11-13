@@ -56,6 +56,7 @@ use crate::deepseek4::{DeepSeek4Model, DeepSeek4Session};
 use crate::drafter::Drafter;
 use crate::dspark::{Dspark, DsparkDecoder, DsparkOptions};
 use crate::generate::{self, Decoded, Flow as GFlow, TextStream};
+use crate::glm5::{Glm5Model, Glm5Session};
 use crate::mistral4::{Mistral4Model, Mistral4Session};
 use crate::model::{Model, Quant, Session};
 use crate::platform::DevicePref;
@@ -900,6 +901,8 @@ pub enum Family {
     Mistral4,
     /// DeepSeek V4 (`deepseek_v4`).
     DeepSeek4,
+    /// GLM-5.3 and GLM-5.3-Flash (`glm_moe_dsa`, `glm5_next`).
+    Glm5,
 }
 
 /// Speculative decoding in use.
@@ -1021,6 +1024,10 @@ enum Lm {
     DeepSeek4Dspark {
         dec: Box<DsparkDecoder<'static, DeepSeek4Model<'static>>>,
     },
+    Glm5 {
+        model: &'static Glm5Model<'static>,
+        sess: Glm5Session,
+    },
     QwenDspark {
         dec: Box<DsparkDecoder<'static, QwenModel<'static>>>,
     },
@@ -1125,6 +1132,7 @@ impl Lm {
             Lm::Mistral4 { sess, .. } => sess.pos,
             Lm::Mistral4Dspark { dec } => dec.sess.pos,
             Lm::DeepSeek4 { sess, .. } => sess.pos,
+            Lm::Glm5 { sess, .. } => sess.pos,
             Lm::DeepSeek4Dspark { dec } => dec.sess.pos,
             Lm::QwenDspark { dec } => dec.sess.pos,
             Lm::GemmaDspark { dec } => dec.sess.pos,
@@ -1150,6 +1158,7 @@ impl Lm {
                 dec.lookup = lk;
             }
             Lm::DeepSeek4 { model, sess } => *sess = model.new_session(),
+            Lm::Glm5 { model, sess } => *sess = model.new_session(),
             Lm::DeepSeek4Dspark { dec } => {
                 let opts = dec.opts.clone();
                 let lk = reset_lookup(dec.lookup.take());
@@ -1352,6 +1361,7 @@ impl Engine {
             }
             "mistral_large4" | "mistral_large4_text" => Family::Mistral4,
             "deepseek_v4" | "deepseek_v41" => Family::DeepSeek4,
+            m if crate::glm5::is_model_type(m) => Family::Glm5,
             other => bail!("unsupported model_type {other}"),
         };
         if family == Family::Llama && !chat::Llama3Chat::matches_model(&dir) {
@@ -1407,7 +1417,8 @@ impl Engine {
         let too_big = if exp {
             crate::qwen4exp::too_big(&dir)
         } else {
-            matches!(family, Family::Mistral4 | Family::DeepSeek4) && crate::mistral4::too_big(crate::safetensors::checkpoint_bytes(&dir))
+            matches!(family, Family::Mistral4 | Family::DeepSeek4 | Family::Glm5)
+                && crate::mistral4::too_big(crate::safetensors::checkpoint_bytes(&dir))
         };
         // Too big for memory: streamed with a page-cache budget unless told otherwise
         // (2.5-3.5x faster than demand paging on the 378 GB UD-Q2_K_XL, see the README).
@@ -1701,11 +1712,44 @@ impl Engine {
                 };
                 (lm, fmt, info.0, info.1, info.2, info.3, info.4)
             }
+            Family::Glm5 => {
+                if decision_dir.is_some() {
+                    bail!("decisions (decision_from) are not supported for GLM-5.3");
+                }
+                if opts.draft.as_deref().is_some_and(|d| d != "none") || mtp {
+                    bail!("speculative decoding is not supported for GLM-5.3");
+                }
+                decision = None;
+                let mut model = Glm5Model::load(crate::glm5::Glm5Config::load(&dir)?, files, opts.quant)?;
+                if let Some(so) = stream.clone() {
+                    streamer = Some(crate::stream::attach_glm5(&mut model, files, so)?);
+                }
+                let model = arena.keep(model);
+                let c = &model.cfg;
+                (
+                    Lm::Glm5 {
+                        model,
+                        sess: model.new_session(),
+                    },
+                    &chat::GlmChat as &'static (dyn ChatFormat + Sync),
+                    model.quant,
+                    c.num_hidden_layers,
+                    c.hidden_size,
+                    c.vocab_size,
+                    model.streamed_bytes(),
+                )
+            }
         };
         if opts.preload && opts.mmap {
             files.preload();
         }
         let stop = chat::with_turn_end(fmt, &tok, eos);
+        // A GLM-5.3 reply also ends on `<|observation|>` (after tool calls).
+        let stop = if family == Family::Glm5 {
+            chat::GlmChat::stop_ids(&tok, stop)
+        } else {
+            stop
+        };
         let mut lm = lm;
         let lookup = opts.lookup.unwrap_or(crate::lookup::BY_DEFAULT).then(|| {
             crate::lookup::Lookup::new(crate::lookup::LookupOptions {
@@ -2219,6 +2263,7 @@ impl Engine {
             Lm::QwenDspark { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
             Lm::GemmaDspark { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
             Lm::DeepSeek4 { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
+            Lm::Glm5 { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::DeepSeek4Dspark { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("activation capture is not supported for Core ML models"),
@@ -2251,6 +2296,7 @@ impl Engine {
             Lm::QwenDspark { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
             Lm::GemmaDspark { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
             Lm::DeepSeek4 { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
+            Lm::Glm5 { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::DeepSeek4Dspark { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
@@ -2274,6 +2320,7 @@ impl Engine {
             Lm::QwenDspark { dec } => dec.model(),
             Lm::GemmaDspark { dec } => dec.model(),
             Lm::DeepSeek4 { model, .. } => *model,
+            Lm::Glm5 { model, .. } => *model,
             Lm::DeepSeek4Dspark { dec } => dec.model(),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
@@ -2292,6 +2339,7 @@ impl Engine {
             Lm::QwenDspark { dec } => &mut dec.sess.iv,
             Lm::GemmaDspark { dec } => &mut dec.sess.iv,
             Lm::DeepSeek4 { sess, .. } => &mut sess.iv,
+            Lm::Glm5 { sess, .. } => &mut sess.iv,
             Lm::DeepSeek4Dspark { dec } => &mut dec.sess.iv,
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => return,
@@ -2528,6 +2576,7 @@ impl Engine {
                 Lm::QwenDspark { dec } => run(dec.model(), &ids, &feats, chunk, need_logits)?,
                 Lm::GemmaDspark { dec } => run(dec.model(), &ids, &feats, chunk, need_logits)?,
                 Lm::DeepSeek4 { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
+                Lm::Glm5 { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
                 Lm::DeepSeek4Dspark { dec } => run(dec.model(), &ids, &feats, chunk, need_logits)?,
                 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
                 Lm::CoreMl(_) => bail!("decisions are not supported for Core ML models"),
@@ -2920,6 +2969,18 @@ impl PendingTurn {
                     empty(0.0)
                 } else {
                     plain!(*model, sess, base, logits, max)
+                }
+            }
+            // No prompt-lookup rounds: the recurrent layers cannot roll a rejected draft back.
+            Lm::Glm5 { model, sess } => {
+                let hs = generate::prefill(*model, sess, &ids, chunk, &overrides);
+                let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
+                st.prefill_secs = t0.elapsed().as_secs_f64();
+                let max = limit(sess.pos);
+                if max == 0 {
+                    empty(0.0)
+                } else {
+                    generate::decode(*model, sess, logits, sampler, stop, max, &mut cb)
                 }
             }
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
