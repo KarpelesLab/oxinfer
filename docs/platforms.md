@@ -73,18 +73,36 @@ embedding (and Gemma's per-layer-embedding row) and samples from the logits. Wha
 Matvec kernels exist for bf16, oxinfer's Q8 and Q4 (also MLX affine Q4) and every GGUF format
 with a GEMM (specialized kernels for F16, Q4_0, Q8_0, Q4_K, Q5_K and Q6_K; the others through
 their GEMM dequantizers): one SIMD-group or more per row, lanes taking consecutive chunks of a
-row so a SIMD-group reads contiguous memory, nibbles masked rather than shifted (the powers of
-two are divided out once per word), K-quant scales decoded without branches; 450-590 GB/s on
-large matrices of an M5 Max (`cargo test --release --lib decode_mv_bench -- --ignored`).
+row so a SIMD-group reads contiguous memory, the nibbles (and Q5_K's high bits) of a word
+unpacked four at a time as bytes, K-quant scales decoded without branches; 450-590 GB/s on
+large matrices of an M5 Max (Q5_K ~360-390: twice the float work per value of Q4_K, as the high
+bits are summed apart to keep single- and multi-token results identical; `cargo test --release
+--lib decode_mv_bench -- --ignored`).
 Attention scores 32 keys per SIMD-group step (one lane per key), reads each key and value row
 once for the query heads sharing it, and splits long contexts over up to 64 threadgroups per head
 group. Activations stay f32 end to end (the CPU kernels quantize them to int8 for the quantized
 formats), and so do the KV caches: the host caches stay authoritative and the device keeps a
 copy per session, appending what CPU passes added (prefill chunks, speculative verification) and
 forgetting what a rewind dropped. Not on the GPU: models with LoRA adapters attached, streamed
-weights (`--stream`), bidirectional configurations, the vision / audio towers,
-multi-token passes (prefill and speculative verification stay on the existing paths), and
-WebGPU (no decode graph backend yet). CUDA runs the same graphs, see [CUDA](#cuda).
+weights (`--stream`), bidirectional configurations, the vision / audio towers, and WebGPU (no
+decode graph backend yet). Multi-token passes run on multi-token plans (speculative
+verification, bit-identical to one-token steps) and prefill plans (below).
+
+Prefill passes of 32 tokens and more run whole on the GPU too, for every model with a decode
+graph (Llama 3, Qwen3, Qwen3.5 / 3.6 / 3.8 dense and MoE, Gemma 3 / 4 incl. 26B-A4B,
+Qwen3.8-Flash-Next): the graph without its LM head compiled as a prefill plan
+(`MetalBackend::build_plan_pf`, chunks of up to 2048 tokens), the activations on the device for
+the whole chunk, the matmuls as matrix-unit GEMMs, the routed experts as grouped GEMMs, and plain
+causal or sliding-window attention as flash attention on 8x8 SIMD-group matrices
+(`metal_pfflash.metal`: S = Q K^T and O += P V with an online softmax per row, 32 queries per
+threadgroup sharing the key reads; heads of 256 and 512 split their dimensions over SIMD-groups).
+Only the new keys and values come back to the host caches. Interventions, captured layers,
+streamed weights, M-RoPE position lists and Gemma image prompts keep the op-by-op path
+(`OXINFER_PREFILL_GPU=0` forces it, `OXINFER_PF_FLASH=0` the per-token attention kernels). The
+last-token distribution is as close to the CPU path's as before or closer (Qwen3-8B Q8_0, 2.5k
+tokens: KL 2.2e-5 -> 6.4e-6; Gemma 4 12B Q8_0: 1.0e-4 -> 5.5e-5; Llama-3.2-1B Q4_K_M 2.5e-5 ->
+2.3e-5), and greedy output is unchanged on the models checked (Llama 1B, Orpheus, Qwen3-8B / 14B,
+Qwen3.5-9B, Qwen3.8-27B, Gemma 4 12B / 26B-A4B; 2 prompts x 64 tokens each). CUDA runs the same graphs, see [CUDA](#cuda).
 
 Before that, forwarding only the matmuls of decode passes to the GPU was measured and lost: on
 the 27B GGUF (`OXINFER_METAL_MIN_T=1`) a pass cost ~257 submissions with CPU work in between

@@ -132,6 +132,61 @@ of precision.
 (Speculative decoding with DSpark drafts against llama.cpp master: see
 [DSpark drafts for Qwen and Gemma 4](qwen.md#dspark-drafts-for-qwen-and-gemma-4).)
 
+#### llama-bench matrix (November 2026)
+
+`llama-bench` (llama.cpp master `fe14cad`, 2026-11-13, Metal build; `-p 512,2048 -n 128 -r 3`,
+CPU rows `-ngl 0 -dev none` with its default 6 threads) against `examples/parity_bench.rs` on the
+same GGUF files (the engine API, warm like llama-bench: a warm-up pass of each size, then the
+median of 3 runs, 1 for the CPU rows of the larger models; raw text cut to exactly N tokens, 513 /
+2049 for Gemma with its BOS; plain decoding: `lookup=0 draft=none mtp=0`; CPU rows `device=cpu`
+with its default 18 threads). M5 Max shared with other jobs (load averages 4-9 for the Metal rows,
+7-21 for the CPU rows, which therefore vary by +-20%); the two engines interleaved model by model.
+tok/s, llama.cpp / oxinfer:
+
+| model | Metal pp512 | pp2048 | tg128 | CPU pp512 | pp2048 | tg128 |
+|---|---|---|---|---|---|---|
+| Llama-3.2-1B Q4_K_M (bartowski) | 17808 / 11564 | 15010 / 12341 | 401 / 403 | 468 / 337 | 436 / 339 | 141 / 190 |
+| Llama-3.2-1B Q8_0 | 18293 / 12424 | 13543 / 11980 | 300 / 309 | 681 / 390 | 592 / 301 | 148 / 149 |
+| Orpheus 3B Q4_K_M | 5571 / 4390 | 4305 / 3831 | 186 / 182 (22 tok) | 178 / 126 | 156 / 90 | 60 / 68 (24 tok) |
+| Qwen3-8B Q8_0 | 2259 / 2268 | 2176 / 1966 | 62.2 / 61.6 | 70 / 45 | 95 / 66 | 28.4 / 24.7 |
+| Qwen3-14B Q8_0 | 1310 / 1318 | 1252 / 1144 | 35.5 / 35.9 | 50 / 37 | 48 / 34 | 13.2 / 14.9 |
+| Qwen3.5-9B BF16 (unsloth) | 2197 / 2516 | 1981 / 2015 | 32.1 / 35.1 | 86 / 62 | 80 / 66 | 1.4 / 15.0 |
+| Gemma 4 12B Q8_0 (ggml-org) | 1808 / 1049 | 1415 / 1142 | 37.6 / 38.3 | 67 / 36 | 61 / 43 | 18.5 / 20.6 |
+| Gemma 4 26B-A4B Q4_0 (ggml-org) | 3922 / 2437 | 3056 / 2340 | 114 / 126 | 138 / 137 | 127 / 107 | 57.5 / 63.8 |
+| Qwen3.8-27B Q4_K_P (HauhauCS) | 683 / 575 | 571 / 563 | 23.5 / 23 (best; 12-23) | 21.0 / 23.2 | 20.9 / 21.5 | 7.1 / 9.9 |
+
+Before this round (master `779396c`), Metal prefill ran only the matmuls on the GPU, with
+attention and norms on the CPU and a host round trip per layer: pp512 / pp2048 were 1628 / 1017
+(Llama 1B Q4_K_M), 392 / 202 (Orpheus), 282 / 174 (Qwen3-8B), 205 / 129 (Qwen3-14B), 646 / 337
+(Qwen3.5-9B), 501 / 345 (Gemma 4 12B), 601 / 432 (26B-A4B), 154 / 116 (27B), measured under a
+heavier load (18-38). Now every model with a GPU decode graph prefills on whole-pass prefill
+plans with flash attention ([Decoding on the GPU](#decoding-on-the-gpu)): 2-12x faster, at or
+above llama.cpp on Qwen3-8B / 14B / 3.5-9B pp512 and the 27B pp2048, 0.6-0.9x on the rest
+(below). Decoding is level on Metal (the 27B's runs varied with the page cache, other jobs held
+100+ GB models) and on the CPU ahead except Qwen3-8B; llama.cpp's CPU decode of the BF16
+Qwen3.5-9B (Gated DeltaNet) runs at 1.4 tok/s.
+
+Speculative decoding with a DSpark draft llama.cpp master loads (Anbeeld's Qwen3-14B-DSpark
+Q8_0 beside Qwen3-14B Q8_0; `--spec-type draft-dspark --spec-draft-n-max 7`, all layers on the
+GPU; oxinfer `--draft` with its default policy and fast verification; 200 tokens, greedy, one
+run each, loaded machine): code 94 / 99 tok/s, math 146 / 131, chat 74 / 58, prose 58 / 31-64
+(oxinfer's prose run varied 31-64 between two runs; plain decoding 33-35 in both engines). With
+`--spec-type draft-dflash` llama.cpp accepts none of this file's drafts.
+
+Where oxinfer is still behind:
+
+- **Metal prefill at 512 tokens** (0.6-0.8x on Llama 1B, Orpheus, Gemma 4): the matrix-unit
+  GEMM runs at ~29 TFLOP/s on 512-token passes against ~42-55 at 2048 (see the `membench gpu`
+  table under [Platforms](platforms.md)); Gemma 4 12B spends ~85% of its pp512 pass
+  in GEMMs. Copying the new keys and values back to the host caches costs 3-6% more.
+- **Gemma 4 26B-A4B prefill**: the routed experts' grouped GEMMs (32-row tiles, mostly padding at
+  ~40 tokens per expert) and one routing read-back per layer.
+- **CPU prefill** (0.5-0.9x, level on 26B-A4B pp512, ahead on the 27B): llama.cpp repacks the weights for the int8 `SMMLA` / `SDOT`
+  instructions and multiplies int8 activations; oxinfer dequantizes to f32 and runs an FMA GEMM
+  at ~1.3 TFLOP/s. (Accelerate's `cblas_sgemm` measured 1.0-1.5 TFLOP/s here, no better.)
+
+#### Earlier comparisons (llama-server, op-by-op Metal prefill)
+
 Same GGUF file in both engines, same prompt tokens (llama.cpp gets the text oxinfer's chat
 template produces), greedy, 256 generated tokens (fewer when the model ends its turn) after a
 short code prompt and a short prose prompt, plus prompt processing of 512 and 2048 tokens.
