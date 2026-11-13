@@ -1424,7 +1424,7 @@ impl Engine {
             "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => Family::Gemma4,
             "gemma3" | "gemma3_text" => Family::Gemma3,
             "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" | "qwen2" | "qwen2_5_vl"
-            | "qwen3_vl" | "qwen4_exp" | "qwen4_exp_text" => Family::Qwen,
+            | "qwen3_vl" | "qwen4_exp" | "qwen4_exp_text" | "lfm3" => Family::Qwen,
             "llama" => Family::Llama,
             // Granite runs on the Llama (Qwen3) code path with its own scales and chat format.
             "granite" => Family::Qwen,
@@ -1604,6 +1604,8 @@ impl Engine {
                     chat::minimax_for_model(&dir)
                 } else if model_type == "qwen2_5_vl" || model_type == "qwen2" {
                     Box::leak(Box::new(chat::Qwen2Chat::for_model(&dir)))
+                } else if model_type == "lfm3" {
+                    &chat::Lfm3Chat
                 } else {
                     chat::QwenChat::for_model(&dir)
                 };

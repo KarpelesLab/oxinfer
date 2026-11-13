@@ -20,7 +20,7 @@ impl QwenModel<'_> {
             Mixer::Attn(a) => matches!(a.q.as_ref(), crate::gpu::WeightRef::Bf16(_)),
             Mixer::Gdn(g) => matches!(g.qkv.as_ref(), crate::gpu::WeightRef::Bf16(_)),
             // Never batched (see `forward_hidden_batch`).
-            Mixer::Lightning(_) => false,
+            Mixer::Lightning(_) | Mixer::Conv(_) => false,
         });
         if bf16 { 7 } else { decode_max_tokens() }
     }
@@ -46,8 +46,9 @@ impl QwenModel<'_> {
             || self.cfg.attn_type_list.is_some()
             || self.cfg.granite_scales().is_some()
             || self.layers.iter().any(|l| match &l.mixer {
-                Mixer::Lightning(_) => true,
-                Mixer::Attn(at) => at.indexer.is_some(),
+                Mixer::Lightning(_) | Mixer::Conv(_) => true,
+                // LFM3's gated heads (its sliding layers rotate with their own frequencies).
+                Mixer::Attn(at) => at.indexer.is_some() || at.head_gate.is_some(),
                 Mixer::Gdn(_) => false,
             });
         if b == 1 || self.exp.is_some() || !plain || minimax {
@@ -108,7 +109,7 @@ impl QwenModel<'_> {
                     let mut caches: Vec<&mut LayerCache> = sess.iter_mut().map(|s| s.kv[l].as_mut().unwrap()).collect();
                     self.attn_forward_caches(at, &mut caches, &hn, b, 0, &cos, &sin, None, &mut y);
                 }
-                Mixer::Lightning(_) => unreachable!("lightning attention is not batched"),
+                Mixer::Lightning(_) | Mixer::Conv(_) => unreachable!("lightning attention and convs are not batched"),
             }
             add_inplace(&mut x, &y);
             rmsnorm_f32w_rows(&x, h, &layer.ln_post, eps, &mut hn);

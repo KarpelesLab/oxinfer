@@ -822,7 +822,7 @@ impl<'a> QwenModel<'a> {
             }
             el.attn_hc.mix(cfg, &x, t, &mut hn, &mut inj);
             match &layer.mixer {
-                crate::qwen::Mixer::Lightning(_) => unreachable!("Qwen4-Exp has no lightning layers"),
+                crate::qwen::Mixer::Lightning(_) | crate::qwen::Mixer::Conv(_) => unreachable!("Qwen4-Exp has no such layers"),
                 crate::qwen::Mixer::Gdn(gd) => {
                     let rec = if record { Some(&mut sess.rec[l]) } else { None };
                     sess.gpu_states_kept = false;
@@ -1213,7 +1213,7 @@ impl<'a> QwenModel<'a> {
             }
             mix(&mut g, &el.attn_hc, hn)?;
             match &layer.mixer {
-                Mixer::Lightning(_) => return None,
+                Mixer::Lightning(_) | Mixer::Conv(_) => return None,
                 Mixer::Gdn(gd) => {
                     // Multi-token plans keep each recurrent layer's inputs in its own buffers (replays).
                     let (gproj, gconv) = if multi && !prefill {

@@ -722,6 +722,10 @@ pub struct QwenConfig {
     pub layernorm_mlp_alpha: Option<f64>,
     #[serde(default)]
     pub layernorm_mlp_beta: Option<f64>,
+    /// Liquid LFM3 (`model_type` "lfm3", see `crate::lfm3`): conv and attention layers, the
+    /// attention ones with a sigmoid gate per head and RoPE parameters per layer type.
+    #[serde(skip)]
+    pub lfm3: Option<crate::lfm3::Lfm3Config>,
     /// Set for MiniMax-01 checkpoints: the linear layers are lightning attention.
     #[serde(skip)]
     pub lightning: bool,
@@ -787,9 +791,20 @@ impl QwenConfig {
         // Qwen3-VL's text model is a dense Qwen3 (with M-RoPE, plain for text).
         let dense = matches!(mt, Some("qwen3" | "qwen3_vl" | "qwen3_vl_text")) || llama || qwen2 || minimax_m2;
         let image_token = raw.get("image_token_id").and_then(|v| v.as_u64());
-        let text = raw.get("text_config").cloned().unwrap_or(raw);
+        let lfm3 = mt == Some("lfm3");
+        let mut text = raw.get("text_config").cloned().unwrap_or(raw);
         let has_head_dim = text.get("head_dim").is_some_and(|v| v.is_u64());
+        // LFM3's `rope_parameters` are per layer type: read by `crate::lfm3::configure`.
+        let lfm3 = lfm3.then(|| text.clone());
+        if lfm3.is_some()
+            && let Some(o) = text.as_object_mut()
+        {
+            o.remove("rope_parameters");
+        }
         let mut cfg: QwenConfig = serde_json::from_value(text).context("parse qwen text config")?;
+        if let Some(raw) = &lfm3 {
+            crate::lfm3::configure(&mut cfg, raw)?;
+        }
         if cfg.image_token_id.is_none() {
             cfg.image_token_id = image_token.map(|v| v as u32);
         }
@@ -902,8 +917,17 @@ impl QwenConfig {
     pub fn is_full(&self, l: usize) -> bool {
         matches!(
             self.layer_types.as_ref().unwrap()[l].as_str(),
-            "full_attention" | "indexed_attention"
+            "full_attention" | "indexed_attention" | "sliding_attention"
         )
+    }
+    /// Layer `l` is an LFM3 gated short convolution.
+    pub fn is_conv(&self, l: usize) -> bool {
+        self.lfm3.is_some() && !self.is_full(l)
+    }
+    /// The causal window of layer `l`'s attention (LFM3's `sliding_attention` layers).
+    pub fn attn_window(&self, l: usize) -> Option<usize> {
+        let lf = self.lfm3.as_ref()?;
+        (self.layer_types.as_ref().unwrap()[l] == "sliding_attention").then_some(lf.window)
     }
     /// Qwen4-Exp (hyper-connections, n-gram embedding, QSA; see `crate::qwen4exp`).
     pub fn is_exp(&self) -> bool {

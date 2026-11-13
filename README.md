@@ -95,6 +95,7 @@ too. The device is chosen at run time (`--device auto`: a GPU when one starts, e
 | [Inkling-2 Small](docs/inkling.md) | 594B MoE with images (relative-bias attention, short convolutions, attention residual); the decoder on tiny checkpoints only |
 | [Raon-1 nano](docs/raon.md) | delta-rule linear attention and gated MLA on four residual streams, per-layer embeddings |
 | [Ripple-65B Preview](docs/ripple.md) | dense 65B with sliding and full attention layers, gated attention, value residuals; run as NVFP4 |
+| [Liquid LFM3](docs/lfm3.md) | conv and attention hybrid for small devices |
 | [Qwen3.8-Flash-Next](docs/qwen-flash-next.md) | 125B MoE with an n-gram embedding table |
 | [Unlimited-OCR-2](docs/ocr.md) | document OCR: page images to text with layout, block-sparse attention |
 | [IBM Granite 4 and TwIL-8B](docs/granite.md) | Granite 4.1 / 4.2 and their fine-tunes, safetensors and GGUF |

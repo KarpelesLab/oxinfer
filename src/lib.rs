@@ -55,6 +55,7 @@ pub mod intervene;
 pub mod janus;
 pub mod kernels;
 pub mod kimi;
+pub mod lfm3;
 pub mod longcat;
 pub mod longcat_chat;
 pub mod lookup;

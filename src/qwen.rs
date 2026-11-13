@@ -41,6 +41,10 @@ pub(crate) struct Attn<'a> {
     pub(crate) bias: Option<[Vec<f32>; 3]>,
     /// MiniMax M3's lightning indexer (block-sparse attention, see `crate::minimax`).
     pub(crate) indexer: Option<crate::minimax::Indexer<'a>>,
+    /// LFM3: `[nh, H]`, each head's output is scaled by the sigmoid of its row.
+    pub(crate) head_gate: Option<Lin<'a>>,
+    /// LFM3's sliding attention: the keys seen, the query's own included.
+    pub(crate) window: Option<usize>,
 }
 
 // One per layer, built once: the size difference is irrelevant.
@@ -50,6 +54,8 @@ pub(crate) enum Mixer<'a> {
     Attn(Attn<'a>),
     /// MiniMax-01's lightning attention (see `crate::minimax`).
     Lightning(crate::minimax::Lightning<'a>),
+    /// LFM3's gated short convolution (see `crate::lfm3`).
+    Conv(crate::lfm3::ShortConv<'a>),
 }
 
 pub(crate) struct Mlp<'a> {
@@ -197,6 +203,7 @@ impl<'a> Attn<'a> {
         if let Some(ix) = &self.indexer {
             v.extend(ix.lins());
         }
+        v.extend(&self.head_gate);
         v
     }
 }
@@ -205,6 +212,8 @@ pub(crate) struct QLayer<'a> {
     pub(crate) mixer: Mixer<'a>,
     ln_in: Vec<f32>,   // 1 + w
     ln_post: Vec<f32>, // 1 + w
+    /// LFM3's sandwich norms: on the mixer's output and on the MLP's, before the residual.
+    post: Option<[Vec<f32>; 2]>,
     pub(crate) ffn: Ffn<'a>,
 }
 
@@ -505,10 +514,13 @@ impl QwenSession {
                     lr.replay(&mut st.s, i + 1);
                     continue;
                 }
-                st.s.copy_from_slice(&rec.s0);
                 let nv = rec.rule.nv;
-                rec.rule
-                    .run(&mut st.s, &rec.c, &rec.b[..(i + 1) * nv], &rec.a[..(i + 1) * nv], i + 1, None);
+                // (An LFM3 conv layer has no delta rule: its record is the conv inputs alone.)
+                if nv > 0 {
+                    st.s.copy_from_slice(&rec.s0);
+                    rec.rule
+                        .run(&mut st.s, &rec.c, &rec.b[..(i + 1) * nv], &rec.a[..(i + 1) * nv], i + 1, None);
+                }
                 // The conv state is the last K-1 raw inputs up to and including token i.
                 let cd = rec.conv_dim;
                 let keep = st.conv.len() / cd;
@@ -620,6 +632,8 @@ impl<'a> Loader<'a, '_> {
                 None
             },
             indexer: crate::minimax::Indexer::load(self, ap)?,
+            head_gate: None,
+            window: None,
         })
     }
 
@@ -723,6 +737,8 @@ impl<'a> QwenModel<'a> {
         let exp = cfg.is_exp();
         let final_norm = if exp {
             Vec::new()
+        } else if cfg.lfm3.is_some() {
+            ld.norm(&format!("{prefix}embedding_norm.weight"), h)?
         } else {
             ld.norm(&format!("{prefix}norm.weight"), h)?
         };
@@ -739,6 +755,30 @@ impl<'a> QwenModel<'a> {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
             let lp = format!("{prefix}layers.{l}.");
+            if let Some(lf) = &cfg.lfm3 {
+                let mixer = if cfg.is_conv(l) {
+                    Mixer::Conv(crate::lfm3::ShortConv::load(&ld, &format!("{lp}conv."), lf)?)
+                } else {
+                    let ap = format!("{lp}self_attn.");
+                    let mut at = ld.attn(&ap)?;
+                    at.head_gate = Some(ld.lin(&format!("{ap}gate_proj.weight"), cfg.num_attention_heads, h)?);
+                    at.window = cfg.attn_window(l);
+                    Mixer::Attn(at)
+                };
+                let norm = |n: &str| ld.norm(&format!("{lp}{n}.weight"), h);
+                layers.push(QLayer {
+                    mixer,
+                    ln_in: norm("operator_norm")?,
+                    ln_post: norm("ffn_norm")?,
+                    post: if lf.sandwich {
+                        Some([norm("post_operator_norm")?, norm("post_ffn_norm")?])
+                    } else {
+                        None
+                    },
+                    ffn: Ffn::Dense(crate::lfm3::mlp(&ld, &format!("{lp}feed_forward."))?),
+                });
+                continue;
+            }
             let mixer = if cfg.is_full(l) {
                 Mixer::Attn(ld.attn(&format!("{lp}self_attn."))?)
             } else if cfg.lightning {
@@ -780,6 +820,7 @@ impl<'a> QwenModel<'a> {
                 } else {
                     ld.norm(&format!("{lp}post_attention_layernorm.weight"), h)?
                 },
+                post: None,
                 // MiniMax keeps its MoE under `block_sparse_moe.`; M3's leading layers are dense.
                 ffn: if cfg.num_experts.is_some() && cfg.is_dense_mlp(l) {
                     Ffn::Dense(ld.mlp(&format!("{lp}mlp."), cfg.dense_intermediate_size)?)
@@ -797,6 +838,10 @@ impl<'a> QwenModel<'a> {
             .collect();
         if let Some(l3) = cfg.llama3_rope() {
             l3.scale(&mut inv_freq);
+        }
+        // LFM3: the full-attention layers' frequencies (the sliding ones' are built per pass).
+        if let Some(lf) = &cfg.lfm3 {
+            inv_freq = lf.full.inv_freq(cfg.head_dim);
         }
         // Llama GGUF: the llama3 scaling as one divisor per frequency.
         if files.has("rope_freqs") {
@@ -907,7 +952,7 @@ impl<'a> QwenModel<'a> {
         for (l, layer) in self.layers.iter_mut().enumerate() {
             let lp = format!("layers.{l}.");
             match &mut layer.mixer {
-                Mixer::Lightning(_) => {}
+                Mixer::Lightning(_) | Mixer::Conv(_) => {}
                 Mixer::Gdn(g) => {
                     let p = format!("{lp}linear_attn.");
                     set(
@@ -958,6 +1003,7 @@ impl<'a> QwenModel<'a> {
                     Mixer::Gdn(g) => vec![&g.qkv, &g.z, &g.b, &g.a, &g.out],
                     Mixer::Attn(a) => a.lins().to_vec(),
                     Mixer::Lightning(lt) => lt.lins(),
+                    Mixer::Conv(c) => c.lins(),
                 };
                 lins.extend(layer.ffn.lins());
                 if let Some(e) = &self.exp {
@@ -986,6 +1032,7 @@ impl<'a> QwenModel<'a> {
                     Mixer::Gdn(g) => vec![&g.qkv, &g.z, &g.b, &g.a, &g.out],
                     Mixer::Attn(a) => a.lins().to_vec(),
                     Mixer::Lightning(lt) => lt.lins(),
+                    Mixer::Conv(c) => c.lins(),
                 };
                 lins.extend(layer.ffn.dense_lins());
                 if let Some(e) = &self.exp {
@@ -1042,6 +1089,7 @@ impl<'a> QwenModel<'a> {
                 Mixer::Gdn(g) => g.qkv.bytes() + g.z.bytes() + g.b.bytes() + g.a.bytes() + g.out.bytes(),
                 Mixer::Attn(a) => a.bytes(),
                 Mixer::Lightning(lt) => lt.lins().iter().map(|w| w.bytes()).sum(),
+                Mixer::Conv(c) => c.lins().iter().map(|w| w.bytes()).sum(),
             };
         }
         if let Some(e) = &self.exp {
@@ -1063,6 +1111,13 @@ impl<'a> QwenModel<'a> {
             if cfg.is_full(l) {
                 kv.push(Some(LayerCache::new(cfg.num_key_value_heads, cfg.head_dim)));
                 gdn.push(None);
+            } else if let Some(lf) = &cfg.lfm3 {
+                // The last `kernel - 1` conv inputs, no delta-rule state.
+                kv.push(None);
+                gdn.push(Some(GdnState {
+                    s: crate::quant::PageVec::zeroed(0),
+                    conv: crate::quant::PageVec::zeroed((lf.kernel - 1) * cfg.hidden_size),
+                }));
             } else if cfg.lightning {
                 // A `[hd, hd]` state per head, no conv.
                 kv.push(None);
@@ -1354,8 +1409,9 @@ impl<'a> QwenModel<'a> {
             g.ops.push(Op::norm(x, hn, &layer.ln_in, h, eps));
             let at = match &layer.mixer {
                 // MiniMax: norms over all heads, block-sparse attention (CPU for now).
-                Mixer::Attn(at) if at.indexer.is_some() || cfg.qk_norm_full() => return None,
-                Mixer::Lightning(_) => return None,
+                // LFM3 (convs, sandwich norms, gated heads, two RoPEs) runs on the CPU path.
+                Mixer::Attn(at) if at.indexer.is_some() || cfg.qk_norm_full() || at.head_gate.is_some() => return None,
+                Mixer::Lightning(_) | Mixer::Conv(_) => return None,
                 Mixer::Attn(at) => at,
                 Mixer::Gdn(gd) => {
                     let st = g.states.len();
@@ -1958,6 +2014,11 @@ impl<'a> QwenModel<'a> {
         if let Some(iv) = &iv {
             iv.point(0, &mut x, h, start);
         }
+        // LFM3: the sliding-attention layers rotate with their own frequencies.
+        let sliding_cs = cfg
+            .lfm3
+            .as_ref()
+            .map(|lf| crate::lfm3::rope_cs(&lf.sliding.inv_freq(cfg.head_dim), start, t));
 
         let mut hn = vec![0f32; t * h];
         let mut y = vec![0f32; t * h];
@@ -1965,6 +2026,23 @@ impl<'a> QwenModel<'a> {
             let _unit = crate::stream::enter(&self.stream, l);
             rmsnorm_f32w_rows(&x, h, &layer.ln_in, eps, &mut hn);
             match &layer.mixer {
+                Mixer::Conv(cv) => {
+                    sess.gpu_states_kept = false;
+                    let st = sess.gdn[l].as_mut().unwrap();
+                    // Recording: the state before the pass and its conv inputs, for a rewind.
+                    let rec = record.then(|| {
+                        let r = &mut sess.rec[l];
+                        r.conv0.clear();
+                        r.conv0.extend_from_slice(&st.conv);
+                        r.conv_dim = h;
+                        &mut r.qkv
+                    });
+                    cv.forward(&mut st.conv, &hn, t, h, &mut y, rec)
+                }
+                Mixer::Attn(at) if at.window.is_some() && sliding_cs.is_some() => {
+                    let (c, s) = sliding_cs.as_ref().unwrap();
+                    self.attn_forward(at, sess.kv[l].as_mut().unwrap(), &hn, t, start, c, s, &mut y)
+                }
                 Mixer::Gdn(gd) => {
                     let rec = if record { Some(&mut sess.rec[l]) } else { None };
                     sess.gpu_states_kept = false;
@@ -1980,6 +2058,9 @@ impl<'a> QwenModel<'a> {
                     sess.gpu_states_kept = false;
                     lt.forward(&mut sess.gdn[l].as_mut().unwrap().s, rec, &hn, t, h, &mut y)
                 }
+            }
+            if let Some([p, _]) = &layer.post {
+                rmsnorm_f32w_rows_inplace(&mut y, h, p, eps);
             }
             // MiniMax-01: the normed input is the residual, both scaled.
             let post = cfg.postnorm_scales(l);
@@ -2006,6 +2087,9 @@ impl<'a> QwenModel<'a> {
                 self.stream.as_ref().map(|_| &need as &dyn Fn(&[usize])),
                 hook.as_ref(),
             );
+            if let Some([_, p]) = &layer.post {
+                rmsnorm_f32w_rows_inplace(&mut y, h, p, eps);
+            }
             match post {
                 Some([_, (a, b)]) => residual_scaled(&mut x, &hn, a, &y, b),
                 None if let Some((_, r, _)) = granite => x.iter_mut().zip(&y).for_each(|(x, y)| *x += r * y),
@@ -2226,7 +2310,7 @@ impl<'a> QwenModel<'a> {
             _ if each => {
                 let w = nh * hd;
                 for (i, c) in caches.iter().enumerate() {
-                    attention(&q[i * w..(i + 1) * w], c, nh, 1, c.len - 1, None, &mut att[i * w..(i + 1) * w]);
+                    attention(&q[i * w..(i + 1) * w], c, nh, 1, c.len - 1, at.window, &mut att[i * w..(i + 1) * w]);
                 }
             }
             _ if let Some(lists) = &ix_sel => {
@@ -2235,11 +2319,19 @@ impl<'a> QwenModel<'a> {
             }
             Some(sel) if sel.iter().any(|s| s.is_some()) => crate::qwen4exp::attention_sel(&q, cache, nh, t, start, sel, &mut att),
             _ if cfg.bidirectional => crate::model::attention_masked(&q, cache, nh, t, start, None, false, &mut att),
-            _ => attention(&q, cache, nh, t, start, None, &mut att),
+            _ => attention(&q, cache, nh, t, start, at.window, &mut att),
         }
         if gated {
             for (a, &g) in att.iter_mut().zip(&gate) {
                 *a *= 1.0 / (1.0 + fast_exp(-g));
+            }
+        }
+        if let Some(hg) = &at.head_gate {
+            let mut g = vec![0f32; t * nh];
+            linear(hg, nh, h, hn, t, &mut g);
+            for (a, &g) in att.chunks_mut(hd).zip(&g) {
+                let s = 1.0 / (1.0 + (-g).exp());
+                a.iter_mut().for_each(|v| *v *= s);
             }
         }
         linear(&at.o, h, nh * hd, &att, t, y);

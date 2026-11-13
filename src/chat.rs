@@ -568,6 +568,92 @@ impl ChatFormat for Qwen2Chat {
     }
 }
 
+/// Liquid LFM3 (its `chat_template.jinja`): `<|startoftext|>`, ChatML turns, the tools as bare
+/// JSON functions in `<tools>` after the system prompt (no system turn without either),
+/// `<tool_call><function=...>` calls (Qwen 3.5's), each result in a `tool` turn. The reply opens
+/// with `<think>` when thinking, and with an empty `<think></think>` otherwise.
+pub struct Lfm3Chat;
+impl Lfm3Chat {
+    fn think_tail(think: bool) -> &'static str {
+        if think { "<think>" } else { "<think></think>" }
+    }
+    fn start(system: &str) -> String {
+        if system.is_empty() {
+            "<|startoftext|>".to_string()
+        } else {
+            format!("<|startoftext|><|im_start|>system\n{system}<|im_end|>\n")
+        }
+    }
+}
+impl ChatFormat for Lfm3Chat {
+    fn conversation_start(&self, system: Option<&str>, _think: bool) -> String {
+        Self::start(system.unwrap_or(""))
+    }
+    fn user_turn(&self, content: &str, think: bool) -> String {
+        format!(
+            "<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n{}",
+            Self::think_tail(think)
+        )
+    }
+    fn end_of_model_turn(&self) -> String {
+        "<|im_end|>\n".to_string()
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        "<|im_end|>"
+    }
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        ("<think>", "</think>")
+    }
+    fn starts_in_thinking(&self, think: bool) -> bool {
+        think
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, think: bool, tools: &[ToolSpec]) -> String {
+        if tools.is_empty() {
+            return self.conversation_start(system, think);
+        }
+        let mut s = system.unwrap_or("").to_string();
+        if !s.is_empty() {
+            s.push_str("\n\n");
+        }
+        s.push_str("<tools>");
+        for t in tools {
+            let f = serde_json::json!({ "name": t.name, "description": t.description, "parameters": t.parameters });
+            s.push('\n');
+            s.push_str(&crate::tools::qwen::py_json(&f));
+        }
+        s.push_str("\n</tools>");
+        Self::start(&s)
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        "<tool_call>"
+    }
+    fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
+        crate::tools::qwen::parse_calls(raw)
+    }
+    fn parse_tool_calls_for(&self, raw: &str, tools: &[ToolSpec]) -> Vec<ToolCall> {
+        crate::tools::qwen::parse_calls_for(raw, tools)
+    }
+    fn tool_syntax(&self) -> Option<crate::constrain::ToolSyntax> {
+        Some(crate::constrain::ToolSyntax::QwenXml)
+    }
+    fn tool_results(&self, results: &[ToolResult], think: bool) -> String {
+        let mut s = String::from("<|im_end|>\n");
+        for r in results {
+            s.push_str("<|im_start|>tool\n<tool_response>\n");
+            s.push_str(&r.content);
+            s.push_str("\n</tool_response><|im_end|>\n");
+        }
+        s.push_str("<|im_start|>assistant\n");
+        s.push_str(Self::think_tail(think));
+        s
+    }
+    fn assistant_text(&self, content: &str, calls: &[ToolCall]) -> String {
+        // The template's layout: the text, then the calls a blank line apart.
+        let calls: Vec<String> = calls.iter().map(|c| crate::tools::qwen::call(c, false)).collect();
+        format!("{content}{}", calls.join("\n\n"))
+    }
+}
+
 /// Llama 3.x instruct: header-delimited turns; the template always opens with a system turn
 /// carrying the knowledge cutoff and today's date ("25 Oct 2026", as `strftime_now("%d %b %Y")`).
 pub struct Llama3Chat;
@@ -1871,6 +1957,54 @@ mod tests {
 
     fn m27() -> MiniMaxChat {
         MiniMaxChat::for_template(Some(&format!("{{%- set model_identity = \"{M27}\" -%}}")))
+    }
+
+    /// The renderings of LFM3-1.7B's own chat template (transformers' apply_chat_template).
+    #[test]
+    fn lfm3_matches_template() {
+        let f = Lfm3Chat;
+        assert_eq!(
+            f.first_turn(None, false, &[], "Hi"),
+            "<|startoftext|><|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think></think>"
+        );
+        assert_eq!(
+            f.first_turn(Some("Be brief."), true, &[], "Hi"),
+            "<|startoftext|><|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>"
+        );
+        let tool = ToolSpec {
+            name: "weather".into(),
+            description: "Get the weather.".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]}),
+        };
+        let decl = r#"{"name": "weather", "description": "Get the weather.", "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]}}"#;
+        let tools = std::slice::from_ref(&tool);
+        let user = "<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think>";
+        assert_eq!(
+            f.first_turn(Some("Be brief."), false, tools, "Weather in Paris?"),
+            format!("<|startoftext|><|im_start|>system\nBe brief.\n\n<tools>\n{decl}\n</tools><|im_end|>\n{user}")
+        );
+        assert_eq!(
+            f.first_turn(None, false, tools, "Weather in Paris?"),
+            format!("<|startoftext|><|im_start|>system\n<tools>\n{decl}\n</tools><|im_end|>\n{user}")
+        );
+        // A past reply with a call, and the results turn.
+        let call = "<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+        let calls = f.parse_tool_calls_for(call, tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            (calls[0].name.as_str(), &calls[0].arguments["days"]),
+            ("weather", &serde_json::json!(3))
+        );
+        assert_eq!(f.assistant_text("Let me check.", &calls), format!("Let me check.{call}"));
+        assert_eq!(f.assistant_text("plain", &[]), "plain");
+        let results = [ToolResult {
+            name: "weather".into(),
+            content: "{\"temp\": 21}".into(),
+        }];
+        assert_eq!(
+            f.tool_results(&results, false),
+            "<|im_end|>\n<|im_start|>tool\n<tool_response>\n{\"temp\": 21}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>"
+        );
     }
 
     /// The renderings of MiniMax-M2.7's own chat template (transformers' apply_chat_template).
