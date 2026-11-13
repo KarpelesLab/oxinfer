@@ -329,14 +329,32 @@ pub mod deepseek {
 
     const DSML: &str = "｜DSML｜";
 
+    /// The names of the DSML tags: the block of calls, a call, a parameter.
+    pub(super) struct Tags {
+        pub block: &'static str,
+        pub invoke: &'static str,
+        pub parameter: &'static str,
+    }
+
+    const V4: Tags = Tags {
+        block: "tool_calls",
+        invoke: "invoke",
+        parameter: "parameter",
+    };
+
     /// The "## Tools" section DeepSeek V4's encoder (`render_tools`) adds to the system prompt.
     pub fn tools_block(tools: &[ToolSpec]) -> String {
+        tools_block_with(&V4, tools)
+    }
+
+    pub(super) fn tools_block_with(tags: &Tags, tools: &[ToolSpec]) -> String {
+        let (b, i, p) = (tags.block, tags.invoke, tags.parameter);
         let schemas: Vec<String> = tools
             .iter()
             .map(|t| qwen::py_json(&json!({ "name": t.name, "description": t.description, "parameters": t.parameters })))
             .collect();
         format!(
-            "## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<{DSML}tool_calls>\" block like the following:\n\n<{DSML}tool_calls>\n<{DSML}invoke name=\"$TOOL_NAME\">\n<{DSML}parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</{DSML}parameter>\n...\n</{DSML}invoke>\n<{DSML}invoke name=\"$TOOL_NAME2\">\n...\n</{DSML}invoke>\n</{DSML}tool_calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n",
+            "## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<{DSML}{b}>\" block like the following:\n\n<{DSML}{b}>\n<{DSML}{i} name=\"$TOOL_NAME\">\n<{DSML}{p} name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</{DSML}{p}>\n...\n</{DSML}{i}>\n<{DSML}{i} name=\"$TOOL_NAME2\">\n...\n</{DSML}{i}>\n</{DSML}{b}>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n",
             schemas.join("\n")
         )
     }
@@ -347,11 +365,18 @@ pub mod deepseek {
     /// Every `<｜DSML｜invoke name="..">` with its `<｜DSML｜parameter name=".." string="true|false">
     /// ..</｜DSML｜parameter>` (string values as is, others as JSON).
     pub fn parse_calls(raw: &str) -> Vec<ToolCall> {
+        parse_calls_with(&V4, raw)
+    }
+
+    pub(super) fn parse_calls_with(tags: &Tags, raw: &str) -> Vec<ToolCall> {
         let mut calls = Vec::new();
-        let Some((_, body)) = raw.split_once(MARKER) else { return calls };
-        let open_inv = format!("<{DSML}invoke name=\"");
-        let open_par = format!("<{DSML}parameter name=\"");
-        let close_par = format!("</{DSML}parameter>");
+        let marker = format!("<{DSML}{}>", tags.block);
+        let Some((_, body)) = raw.split_once(marker.as_str()) else {
+            return calls;
+        };
+        let open_inv = format!("<{DSML}{} name=\"", tags.invoke);
+        let open_par = format!("<{DSML}{} name=\"", tags.parameter);
+        let close_par = format!("</{DSML}{}>", tags.parameter);
         for inv in body.split(open_inv.as_str()).skip(1) {
             let Some((name, mut rest)) = inv.split_once("\">") else { continue };
             let mut arguments = Map::new();
@@ -382,27 +407,58 @@ pub mod deepseek {
     /// Calls as the model writes them: one `<｜DSML｜tool_calls>` block (strings as is, other values
     /// as JSON).
     pub fn calls(calls: &[ToolCall]) -> String {
-        let mut s = format!("\n\n{MARKER}\n");
+        calls_with(&V4, calls)
+    }
+
+    pub(super) fn calls_with(tags: &Tags, calls: &[ToolCall]) -> String {
+        let (b, i, p) = (tags.block, tags.invoke, tags.parameter);
+        let mut s = format!("\n\n<{DSML}{b}>\n");
         for c in calls {
-            s.push_str(&format!("<{DSML}invoke name=\"{}\">\n", c.name));
+            s.push_str(&format!("<{DSML}{i} name=\"{}\">\n", c.name));
             for (k, v) in &c.arguments {
                 let (is_str, text) = match v {
                     Value::String(t) => ("true", t.clone()),
                     other => ("false", other.to_string()),
                 };
-                s.push_str(&format!(
-                    "<{DSML}parameter name=\"{k}\" string=\"{is_str}\">{text}</{DSML}parameter>\n"
-                ));
+                s.push_str(&format!("<{DSML}{p} name=\"{k}\" string=\"{is_str}\">{text}</{DSML}{p}>\n"));
             }
-            s.push_str(&format!("</{DSML}invoke>\n"));
+            s.push_str(&format!("</{DSML}{i}>\n"));
         }
-        s.push_str(&format!("</{DSML}tool_calls>"));
+        s.push_str(&format!("</{DSML}{b}>"));
         s
     }
 
     /// A tool result block (the results of one round are joined with blank lines in a user turn).
     pub fn response(r: &ToolResult) -> String {
         format!("<tool_result>{}</tool_result>", r.content)
+    }
+}
+
+/// DeepSeek V4.1 (its `encoding.py`): V4's DSML with tag names that start with a space
+/// (`<｜DSML｜ calls>`, `<｜DSML｜ invoke name="..">`, `<｜DSML｜ parameter ..>`).
+pub mod deepseek41 {
+    use super::deepseek::{Tags, calls_with, parse_calls_with, tools_block_with};
+    use super::*;
+
+    const V41: Tags = Tags {
+        block: " calls",
+        invoke: " invoke",
+        parameter: " parameter",
+    };
+
+    pub fn tools_block(tools: &[ToolSpec]) -> String {
+        tools_block_with(&V41, tools)
+    }
+
+    /// The marker that opens the calls in a reply.
+    pub const MARKER: &str = "<｜DSML｜ calls>";
+
+    pub fn parse_calls(raw: &str) -> Vec<ToolCall> {
+        parse_calls_with(&V41, raw)
+    }
+
+    pub fn calls(calls: &[ToolCall]) -> String {
+        calls_with(&V41, calls)
     }
 }
 

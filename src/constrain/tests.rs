@@ -388,12 +388,13 @@ fn forced_calls_are_what_each_format_writes_and_parses() {
         name: "now".into(),
         arguments: Map::new(),
     };
-    let formats: [(&dyn ChatFormat, ToolSyntax); 5] = [
+    let formats: [(&dyn ChatFormat, ToolSyntax); 6] = [
         (&chat::QWEN3, ToolSyntax::QwenJson),
         (&chat::QWEN, ToolSyntax::QwenXml),
         (&chat::GemmaChat, ToolSyntax::Gemma),
         (&chat::MistralChat, ToolSyntax::Mistral),
         (&chat::DeepSeekChat, ToolSyntax::Dsml),
+        (&chat::DeepSeek41Chat, ToolSyntax::Dsml41),
     ];
     for (fmt, syntax) in formats {
         assert_eq!(fmt.tool_syntax(), Some(syntax));
@@ -476,6 +477,7 @@ fn forced_calls_need_tools_a_syntax_and_a_supported_schema() {
         ToolSyntax::Gemma,
         ToolSyntax::Mistral,
         ToolSyntax::Dsml,
+        ToolSyntax::Dsml41,
     ] {
         let e = err(ToolChoice::Required, &odd, Some(syntax));
         assert!(e.contains("tool \"odd\"") && e.contains("\"minimum\" is not supported"), "{e}");
@@ -497,6 +499,7 @@ fn forced_calls_need_tools_a_syntax_and_a_supported_schema() {
             ToolSyntax::Gemma => &chat::GemmaChat,
             ToolSyntax::Mistral => &chat::MistralChat,
             ToolSyntax::Dsml => &chat::DeepSeekChat,
+            ToolSyntax::Dsml41 => &chat::DeepSeek41Chat,
         };
         let text = fmt.assistant_text("", std::slice::from_ref(&call));
         assert_eq!(call_accepts(&c, &text), Some(true), "{syntax:?}: {text}");

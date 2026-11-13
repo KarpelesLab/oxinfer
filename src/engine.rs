@@ -1351,7 +1351,7 @@ impl Engine {
                 Family::Qwen
             }
             "mistral_large4" | "mistral_large4_text" => Family::Mistral4,
-            "deepseek_v4" => Family::DeepSeek4,
+            "deepseek_v4" | "deepseek_v41" => Family::DeepSeek4,
             other => bail!("unsupported model_type {other}"),
         };
         if family == Family::Llama && !chat::Llama3Chat::matches_model(&dir) {
@@ -1659,12 +1659,17 @@ impl Engine {
                     c.vocab_size,
                     model.streamed_bytes(),
                 );
+                let fmt: &'static (dyn ChatFormat + Sync) = if c.v41 { &chat::DeepSeek41Chat } else { &chat::DeepSeekChat };
                 // DSpark as for Mistral Large 4: the given draft, `auto` / the default for the one
-                // beside a GGUF model, `none` for none.
+                // beside a GGUF model, `none` for none. (V4.1's draft stages are not read yet: a
+                // draft beside the model is left alone.)
                 let dspark = match (opts.draft.as_deref(), &draft_dir) {
+                    (Some("auto"), _) | (_, Some(_)) if c.v41 => {
+                        bail!("DSpark drafts are not supported for DeepSeek V4.1 yet")
+                    }
                     (Some("auto"), _) => Some(resolve_auto_draft(&dir, opts.cache_dir.as_deref())?),
                     (_, Some(d)) => Some(d.clone()),
-                    (None, None) if crate::dspark::BY_DEFAULT => crate::dspark::default_draft_for(&dir, opts.fast_verify),
+                    (None, None) if crate::dspark::BY_DEFAULT && !c.v41 => crate::dspark::default_draft_for(&dir, opts.fast_verify),
                     _ => None,
                 };
                 let lm = match dspark {
@@ -1676,7 +1681,7 @@ impl Engine {
                         let dr: &'static Dspark<'static> = arena.keep(dr);
                         let dopts = DsparkOptions {
                             draft_tokens: opts.draft_tokens.unwrap_or(crate::dspark::DS4_DRAFT_TOKENS),
-                            stop: chat::with_turn_end(&chat::DeepSeekChat, &tok, eos.clone()),
+                            stop: chat::with_turn_end(fmt, &tok, eos.clone()),
                             cost_aware: false,
                             p_min: opts
                                 .draft_p_min
@@ -1694,15 +1699,7 @@ impl Engine {
                         sess: model.new_session(),
                     },
                 };
-                (
-                    lm,
-                    &chat::DeepSeekChat as &'static (dyn ChatFormat + Sync),
-                    info.0,
-                    info.1,
-                    info.2,
-                    info.3,
-                    info.4,
-                )
+                (lm, fmt, info.0, info.1, info.2, info.3, info.4)
             }
         };
         if opts.preload && opts.mmap {

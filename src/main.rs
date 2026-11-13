@@ -1569,7 +1569,7 @@ fn run(mut args: Args) -> Result<()> {
             run_qwen(args)
         }
         "mistral_large4" | "mistral_large4_text" => run_mistral4(args),
-        "deepseek_v4" => run_deepseek4(args),
+        "deepseek_v4" | "deepseek_v41" => run_deepseek4(args),
         other => bail!("unsupported model_type {other}"),
     }
 }
@@ -2312,6 +2312,13 @@ fn run_deepseek4(mut args: Args) -> Result<()> {
         None => None,
     };
     let cfg = config::DeepSeek4Config::load(&args.model)?;
+    // V4.1's draft stages (bias for image tokens, 128 experts, a confidence head) are not read yet.
+    let draft = match draft {
+        Some(_) if cfg.v41 && args.draft.is_some() => bail!("DSpark drafts are not supported for DeepSeek V4.1 yet"),
+        Some(_) if cfg.v41 => None,
+        d => d,
+    };
+    let name = if cfg.v41 { "DeepSeek V4.1" } else { "DeepSeek V4" };
     let eos = config::load_eos_ids(&args.model);
     // A checkpoint larger than most of RAM is streamed with a page-cache budget of 70% of RAM,
     // unless `--no-stream` (or `--mmap`) asks for plain demand paging.
@@ -2333,10 +2340,14 @@ fn run_deepseek4(mut args: Args) -> Result<()> {
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
     let mut model = oxinfer::deepseek4::DeepSeek4Model::load(cfg, &files, args.quant)?;
     let tok = load_tokenizer(&args.model)?;
-    let fmt: &dyn ChatFormat = &chat::DeepSeekChat;
+    let fmt: &dyn ChatFormat = if model.cfg.v41 {
+        &chat::DeepSeek41Chat
+    } else {
+        &chat::DeepSeekChat
+    };
     let eos = chat::with_turn_end(fmt, &tok, eos);
     eprintln!(
-        "[loaded DeepSeek V4: {} layers, hidden {}, {:.1} GB checkpoint ({}), {} weights streaming {:.2} GB/token, {} threads, {:.2}s]",
+        "[loaded {name}: {} layers, hidden {}, {:.1} GB checkpoint ({}), {} weights streaming {:.2} GB/token, {} threads, {:.2}s]",
         model.cfg.num_hidden_layers,
         model.cfg.hidden_size,
         files.total_bytes() as f64 / 1e9,
@@ -2354,7 +2365,7 @@ fn run_deepseek4(mut args: Args) -> Result<()> {
         return save_quantized(&args.model, out, &files, model.quant);
     }
     if !mm_request(&args).is_empty() {
-        bail!("DeepSeek V4 takes text only");
+        bail!("{name} takes text only here");
     }
     // The draft (11 GB, mostly experts of which a pass reads a few) is mapped when the target
     // streams, so that its unused experts take no memory.

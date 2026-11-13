@@ -727,6 +727,73 @@ impl ChatFormat for DeepSeekChat {
     }
 }
 
+/// DeepSeek V4.1 (its `encoding/encoding.py`): V4's format with a `<｜System｜>` token in front of
+/// the system part (the system prompt, the tool schemas after a blank line, and in thinking mode
+/// a first line giving the reasoning effort as a number, 75 of 100 by default), and DSML tags
+/// whose names start with a space (`<｜DSML｜ calls>`).
+pub struct DeepSeek41Chat;
+
+impl DeepSeek41Chat {
+    /// The effort line of thinking mode (`"high"`, the encoder's default).
+    const EFFORT: &'static str = "Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+}
+
+impl ChatFormat for DeepSeek41Chat {
+    fn conversation_start(&self, system: Option<&str>, think: bool) -> String {
+        self.conversation_start_tools(system, think, &[])
+    }
+    fn user_turn(&self, content: &str, think: bool) -> String {
+        DeepSeekChat.user_turn(content, think)
+    }
+    fn end_of_model_turn(&self) -> String {
+        DeepSeekChat::EOS.to_string()
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        DeepSeekChat::EOS
+    }
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        ("<think>", "</think>")
+    }
+    fn starts_in_thinking(&self, think: bool) -> bool {
+        think
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, think: bool, tools: &[ToolSpec]) -> String {
+        let mut s = String::from("<｜begin▁of▁sentence｜>");
+        // (Tools are declared in a system message: an empty one when there is no system prompt.)
+        let has_system = system.is_some() || !tools.is_empty();
+        if think || has_system {
+            s.push_str("<｜System｜>");
+        }
+        if think {
+            s.push_str(Self::EFFORT);
+        }
+        s.push_str(system.unwrap_or(""));
+        if !tools.is_empty() {
+            s.push_str("\n\n");
+            s.push_str(&crate::tools::deepseek41::tools_block(tools));
+        }
+        s
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        crate::tools::deepseek41::MARKER
+    }
+    fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
+        crate::tools::deepseek41::parse_calls(raw)
+    }
+    fn tool_syntax(&self) -> Option<crate::constrain::ToolSyntax> {
+        Some(crate::constrain::ToolSyntax::Dsml41)
+    }
+    fn tool_results(&self, results: &[ToolResult], think: bool) -> String {
+        DeepSeekChat.tool_results(results, think)
+    }
+    fn assistant_text(&self, content: &str, calls: &[ToolCall]) -> String {
+        if calls.is_empty() {
+            return content.to_string();
+        }
+        format!("{}{}", content.trim_end(), crate::tools::deepseek41::calls(calls))
+    }
+}
+
 /// MiniMax M2 / M2.1 / M2.5 / M2.7 (and M3's text turns): `]~!b[` then `]~b]ROLE\n...[e~[\n` turns;
 /// replies always open a thinking block (`<think>\n` ends the generation prompt); tool results
 /// are a `tool` turn of `<response>` blocks. Without a system prompt the template puts the
@@ -1220,5 +1287,63 @@ mod tests {
             let t = f.assistant_text("Let me check.", &c);
             assert_eq!(f.parse_tool_calls(&t), c, "{t}");
         }
+    }
+
+    /// The renderings of DeepSeek V4.1's own encoder (`encoding/encoding.py` of the checkpoint,
+    /// `encode_messages`): chat and thinking mode, tools with and without a system prompt, a
+    /// round of tool calling.
+    #[test]
+    fn deepseek41_matches_encoder() {
+        let f = DeepSeek41Chat;
+        const EFFORT: &str = "Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+        assert_eq!(
+            f.first_turn(Some("Be brief."), false, &[], "Hi"),
+            "<｜begin▁of▁sentence｜><｜System｜>Be brief.<｜User｜>Hi<｜Assistant｜></think>"
+        );
+        assert_eq!(
+            f.first_turn(None, false, &[], "Hi"),
+            "<｜begin▁of▁sentence｜><｜User｜>Hi<｜Assistant｜></think>"
+        );
+        assert_eq!(
+            f.first_turn(None, true, &[], "Hi"),
+            format!("<｜begin▁of▁sentence｜><｜System｜>{EFFORT}<｜User｜>Hi<｜Assistant｜><think>")
+        );
+        assert_eq!(
+            f.first_turn(Some("Be brief."), true, &[], "Hi"),
+            format!("<｜begin▁of▁sentence｜><｜System｜>{EFFORT}Be brief.<｜User｜>Hi<｜Assistant｜><think>")
+        );
+        let tool = ToolSpec {
+            name: "get_weather".into(),
+            description: "Weather of a city.".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]}),
+        };
+        let tools = "## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"get_weather\", \"description\": \"Weather of a city.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\"}}, \"required\": [\"city\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n";
+        // Without a system prompt the tools are declared in an empty system message.
+        assert_eq!(
+            f.first_turn(None, true, std::slice::from_ref(&tool), "Paris?"),
+            format!("<｜begin▁of▁sentence｜><｜System｜>{EFFORT}\n\n{tools}<｜User｜>Paris?<｜Assistant｜><think>")
+        );
+        let call = ToolCall {
+            name: "get_weather".into(),
+            arguments: serde_json::json!({"city": "Paris", "days": 3}).as_object().unwrap().clone(),
+        };
+        let result = ToolResult {
+            name: "get_weather".into(),
+            content: "sunny".into(),
+        };
+        let mut s = f.first_turn(Some("Be brief."), false, std::slice::from_ref(&tool), "Paris?");
+        let reply = f.assistant_text("Let me check.", std::slice::from_ref(&call));
+        assert_eq!(f.parse_tool_calls(&reply), vec![call]);
+        s.push_str(&reply);
+        s.push_str(&f.tool_results(&[result], false));
+        s.push_str("Sunny.");
+        s.push_str(&f.end_of_model_turn());
+        s.push_str(&f.user_turn("Thanks", false));
+        assert_eq!(
+            s,
+            format!(
+                "<｜begin▁of▁sentence｜><｜System｜>Be brief.\n\n{tools}<｜User｜>Paris?<｜Assistant｜></think>Let me check.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>sunny</tool_result><｜Assistant｜></think>Sunny.<｜end▁of▁sentence｜><｜User｜>Thanks<｜Assistant｜></think>"
+            )
+        );
     }
 }

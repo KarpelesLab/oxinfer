@@ -106,6 +106,8 @@ pub enum ToolSyntax {
     Mistral,
     /// DeepSeek V4: a `<｜DSML｜tool_calls>` block.
     Dsml,
+    /// DeepSeek V4.1: the same with tag names that start with a space (`<｜DSML｜ calls>`).
+    Dsml41,
 }
 
 // ---- the vocabulary as bytes ----------------------------------------------------------------------
@@ -569,17 +571,22 @@ impl Builder<'_> {
                 s.extend(self.text("</function>\n</tool_call>"));
                 s
             }
-            ToolSyntax::Dsml => {
+            ToolSyntax::Dsml | ToolSyntax::Dsml41 => {
                 const D: &str = "｜DSML｜";
-                let mut s = self.text(&format!("\n\n<{D}tool_calls>\n<{D}invoke name=\"{name}\">\n"));
-                let close = self.text(&format!("</{D}parameter>\n"));
+                let (tc, inv, par) = if syntax == ToolSyntax::Dsml41 {
+                    (" calls", " invoke", " parameter")
+                } else {
+                    ("tool_calls", "invoke", "parameter")
+                };
+                let mut s = self.text(&format!("\n\n<{D}{tc}>\n<{D}{inv} name=\"{name}\">\n"));
+                let close = self.text(&format!("</{D}{par}>\n"));
                 let member = |b: &mut Self, key: Vec<Sym>, text: Vec<Vec<Sym>>, json: Vec<Vec<Sym>>| {
                     let mut alts = Vec::new();
                     for (values, string) in [(text, "true"), (json, "false")] {
                         if values.is_empty() {
                             continue;
                         }
-                        let mut m = b.text(&format!("<{D}parameter name=\""));
+                        let mut m = b.text(&format!("<{D}{par} name=\""));
                         m.extend(key.clone());
                         m.extend(b.text(&format!("\" string=\"{string}\">")));
                         m.push(Sym::Rule(b.g.rule(values)));
@@ -603,7 +610,7 @@ impl Builder<'_> {
                         s.extend(self.g.repeat(m, 0, None));
                     }
                 }
-                s.extend(self.text(&format!("</{D}invoke>\n</{D}tool_calls>")));
+                s.extend(self.text(&format!("</{D}{inv}>\n</{D}{tc}>")));
                 s
             }
         })
