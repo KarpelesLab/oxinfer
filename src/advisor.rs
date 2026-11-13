@@ -430,6 +430,31 @@ pub const CATALOG: &[Model] = &[
         .speed(26.3, 43)
         .moe()
         .note("supported, untested; a base model: it continues a text, there is no chat template"),
+    // Inkling-2 Small: never run on the real weights (neither release fits the download budget;
+    // the agreement with transformers is measured on tiny checkpoints, the vision tower on the
+    // real one; bytes per token from the layout of the releases).
+    Model::new(
+        "thinkingmachines/Inkling-2-Small-MXFP8",
+        Kind::Chat,
+        594.0,
+        622.8,
+        &[Text, ImageInput, Thinking, Tools],
+    )
+    .fixed(Format::Q8, "MXFP8")
+    .speed(23.5, 48)
+    .moe()
+    .note("supported, untested on the real weights; 73 GB of memory for the experts' scales; no MTP"),
+    Model::new(
+        "thinkingmachines/Inkling-2-Small",
+        Kind::Chat,
+        594.0,
+        393.5,
+        &[Text, ImageInput, Thinking, Tools],
+    )
+    .fixed(Format::Q4, "NVFP4")
+    .speed(19.0, 48)
+    .moe()
+    .note("supported, untested on the real weights; its NVFP4 experts are repacked in memory (290 GB): MXFP8 streams; no MTP"),
     Model::new(
         "MiniMaxAI/MiniMax-M3",
         Kind::Chat,
