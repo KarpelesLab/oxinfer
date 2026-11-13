@@ -2442,6 +2442,9 @@ impl crate::dspark::Target for QwenModel<'_> {
         // A folded head only runs through `linear` (which transforms its input).
         self.lm_head.fold.is_none().then_some(&self.lm_head)
     }
+    fn head_rows(&self, tokens: &[u32], out: &mut [f32]) -> bool {
+        self.lm_head.rows(tokens, self.cfg.hidden_size, out)
+    }
     fn vocab_size(&self) -> usize {
         self.cfg.vocab_size
     }

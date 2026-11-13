@@ -1,5 +1,6 @@
 //! Checks a DSpark draft against a reference (`tools/ref_dspark.py` for Mistral Large 4,
-//! `tools/ref_dspark_ds4.py` for DeepSeek V4, `tools/ref_dspark_hf.py` for Qwen / Gemma 4) and
+//! `tools/ref_dspark_ds4.py` for DeepSeek V4, `tools/ref_dspark_hf.py` for Qwen / Gemma 4,
+//! `tools/ref_dspine.py` for DSpine drafts) and
 //! measures its acceptance:
 //!
 //! ```text
@@ -104,6 +105,28 @@ fn check<M: Target<Sess: Clone>>(m: &M, d: &Dspark, tok: &Tokenizer, ids: &[u32]
     std::fs::create_dir_all(&o.out)?;
     write_f32(&o.out.join("feats.f32"), &all)?;
     write_f32(&o.out.join("logits.f32"), &dl)?;
+    // DSpine drafts: what `tools/ref_dspine.py` needs of the target, the embeddings of the anchor
+    // and of the mask token and the LM head rows of every slot's candidates (the entries of the
+    // slot's row the refinement kept), in slot order.
+    if let (Some(b), oxinfer::dspark::MaskEmbed::Token(mask)) = (&d.cfg.bridge, d.cfg.mask) {
+        let (h, v) = (m.hidden_size(), m.vocab_size());
+        let mut emb = vec![0f32; 2 * h];
+        m.embed_row(anchor, &mut emb[..h]);
+        m.embed_row(mask, &mut emb[h..]);
+        write_f32(&o.out.join("embed_rows.f32"), &emb)?;
+        let cand: Vec<u32> = dl
+            .chunks(v)
+            .flat_map(|row| (0..v as u32).filter(|&t| row[t as usize].is_finite()))
+            .collect();
+        if cand.len() != drafts.len() * b.top_k {
+            bail!("{} candidates for {} slots of {}", cand.len(), drafts.len(), b.top_k);
+        }
+        let mut rows = vec![0f32; cand.len() * h];
+        if !m.head_rows(&cand, &mut rows) {
+            bail!("the target cannot read LM head rows");
+        }
+        write_f32(&o.out.join("head_rows.f32"), &rows)?;
+    }
     let meta = serde_json::json!({"n": ids.len(), "anchor": anchor, "k": drafts.len(), "drafts": drafts, "ids": ids});
     std::fs::write(o.out.join("meta.json"), meta.to_string())?;
 

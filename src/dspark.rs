@@ -32,6 +32,9 @@
 //! Drafts load from a Hugging Face folder (`config.json` + safetensors) or a llama.cpp `dflash`
 //! GGUF.
 //!
+//! DSpine drafts (Tencent, `DFlashDraftModel` with `dflash_config.selected_prefix_code_bridge`)
+//! are a causal DFlash backbone with a "code bridge" in place of the Markov head, see [`Bridge`].
+//!
 //! The target verifies `[anchor, drafts..]` in one pass (standard speculative sampling, as
 //! [`crate::qwen_mtp`]); the features of the committed positions then join the draft's cache.
 //! The target side is the [`Target`] trait.
@@ -74,6 +77,12 @@ pub trait Target: TextLm {
     /// has one in a form the GPU plans take.
     fn lm_head(&self) -> Option<&Lin<'_>> {
         None
+    }
+    /// The rows of the LM head matrix for `tokens` (`[tokens.len(), hidden]`, so that a logit is
+    /// the row's dot product with a final-normed state); false, with `out` untouched, when the
+    /// target cannot read single rows (the caller then runs the whole head).
+    fn head_rows(&self, _tokens: &[u32], _out: &mut [f32]) -> bool {
+        false
     }
     /// The row of `token` in the input embedding table (`[hidden]`, before
     /// [`Target::embed_scale`]).
@@ -162,6 +171,20 @@ pub struct DsparkConfig {
     pub mask: MaskEmbed,
     /// Factor on the block's token embeddings (None: the target's, [`Target::embed_scale`]).
     pub embed_scale: Option<f32>,
+    /// DSpine's code bridge between the layers and its refinement of the drafts.
+    pub bridge: Option<BridgeConfig>,
+}
+
+/// The sizes of a DSpine code bridge (`dflash_config.selected_prefix_code_bridge`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BridgeConfig {
+    /// Width of a position's code (and of the per-token codebook rows).
+    pub code: usize,
+    /// Width of the gated message a position receives from its predecessor.
+    pub rank: usize,
+    pub eps: f32,
+    /// Candidates per slot the refinement chooses among (the top of the backbone's logits).
+    pub top_k: usize,
 }
 
 fn default_rope(theta: f64) -> crate::config::YarnParams {
@@ -230,6 +253,7 @@ impl DsparkConfig {
                 rope: default_rope(ds.rope_theta),
                 mask: MaskEmbed::Token(noise as u32),
                 embed_scale: None,
+                bridge: None,
                 backbone: Backbone::Ds4(Box::new(ds)),
             };
             if c.block_size < 2 || c.target_layers.is_empty() {
@@ -342,6 +366,7 @@ impl DsparkConfig {
             rope,
             mask,
             embed_scale,
+            bridge: None,
         };
         c.check()?;
         Ok(c)
@@ -498,6 +523,59 @@ impl DsparkConfig {
             .and_then(Json::as_bool)
             .unwrap_or(!archs.contains(&"DFlashDraftModel"));
         let mask = MaskEmbed::Token(need("mask_token_id")? as u32);
+        // DSpine: a code bridge written after every layer, the last write redone per slot with
+        // the token actually drafted before it. Other bridge variants are trained differently
+        // (and would draft noise through this path), so they are refused.
+        let bridge = match dfl.get("selected_prefix_code_bridge").filter(|v| v.is_object()) {
+            Some(br) => {
+                let flag = |k: &str| dfl.get(k).and_then(Json::as_bool);
+                let text = |k: &str| dfl.get(k).and_then(Json::as_str);
+                let every_layer = dfl
+                    .get("selected_prefix_feature_layers")
+                    .and_then(Json::as_array)
+                    .is_some_and(|a| a.iter().map(Json::as_u64).eq((1..=n_layers as u64).map(Some)));
+                let second = c.get("code_bridge_second_pass").filter(|v| v.is_object());
+                let refine = dfl.get("selected_prefix_last_write_refine").filter(|v| v.is_object());
+                let serial = second.is_none_or(|s| {
+                    s.get("mode").and_then(Json::as_str) == Some("serial_table")
+                        && s.get("first_exact").and_then(Json::as_u64) == Some(n_layers as u64 - 1)
+                }) && refine.is_none_or(|r| r.get("kind").and_then(Json::as_str) == Some("exact_sender"));
+                if flag("selected_prefix_feature_writes") != Some(true)
+                    || text("selected_prefix_feature_write_mode") != Some("independent")
+                    || flag("selected_prefix_terminal") != Some(false)
+                    || text("selected_prefix_decode_mode") != Some("serial")
+                    || flag("draft_block_causal") != Some(true)
+                    || !every_layer
+                    || !serial
+                    || causal.iter().any(|c| !c)
+                    || sample_from_anchor
+                {
+                    bail!(
+                        "this DSpine draft's code bridge variant is not supported (independent writes after every layer, serial \
+                         exact-sender refinement and a causal block are)"
+                    );
+                }
+                let top_k = second
+                    .and_then(|s| s.get("head_topk"))
+                    .or_else(|| refine.and_then(|r| r.get("head_topk")))
+                    .and_then(Json::as_u64)
+                    .context("DSpine config names no refinement width (head_topk)")? as usize;
+                let size = |k: &str| br.get(k).and_then(Json::as_u64).map(|v| v as usize);
+                let (Some(code), Some(rank)) = (size("code_size"), size("rank")) else {
+                    bail!("DSpine config has no bridge code_size / rank");
+                };
+                if code == 0 || rank == 0 || top_k == 0 {
+                    bail!("bad DSpine bridge sizes");
+                }
+                Some(BridgeConfig {
+                    code,
+                    rank,
+                    eps: br.get("eps").and_then(Json::as_f64).unwrap_or(1e-6) as f32,
+                    top_k,
+                })
+            }
+            None => None,
+        };
         let cfg = Self {
             hidden,
             n_layers,
@@ -530,6 +608,7 @@ impl DsparkConfig {
             mask,
             // Speculators embed with the verifier's raw table; the others like the target.
             embed_scale: speculators.then_some(1.0),
+            bridge,
         };
         cfg.check()?;
         Ok(cfg)
@@ -614,6 +693,40 @@ struct Markov<'a> {
     rank: usize,
 }
 
+/// DSpine's code bridge (Tencent, "Draft in Parallel, Condition Through Depth", arXiv
+/// 2609.36173; `selected_prefix_bridge.*`), which carries the dependency of a slot on the token
+/// before it through the depth of a parallel draft.
+///
+/// After every layer `l` each block row reads a unit-direction code from its residual stream
+/// (`read[l]`, scaled to norm `sqrt(code)`; the anchor row's code is its token's `codebook` row)
+/// and row `t > 0` receives a gated message from row `t - 1`,
+/// `sigmoid(gate c_t + pred_gate c_{t-1} + bias) * (prev c_{t-1})`, written back through
+/// `write[l]` times the row's RMS ([`Dspark::bridge_write`]). Inside the block the predecessor's
+/// code is a prediction (the row holds a mask token); once the tokens are drafted one after the
+/// other, the last layer's write is redone for each slot with the codebook row of the token
+/// actually chosen before it, and the slot's token is drawn among the `top_k` candidates of the
+/// parallel pass under the refined state ([`Dspark::refine`]; the reference's "serial last-write
+/// refinement", which tabulates the same products over the vocabulary).
+struct Bridge<'a> {
+    cfg: BridgeConfig,
+    read: Vec<Lin<'a>>,  // per layer [code, H]
+    write: Vec<Lin<'a>>, // per layer [H, rank]
+    gate: Lin<'a>,       // [rank, code], on the row's own code
+    gate_bias: Vec<f32>, // [rank]
+    pred_gate: Lin<'a>,  // [rank, code], on the predecessor's code
+    prev: Lin<'a>,       // [rank, code], the predecessor's message
+    codebook: Table<'a>, // [vocab, code]
+}
+
+/// What the last layer's bridge write leaves for the refinement, per block row: the residual
+/// stream before the write (`[nb, H]`), its RMS and the row's own gate term (`[nb, rank]`).
+#[derive(Default)]
+struct BridgeState {
+    raw: Vec<f32>,
+    rms: Vec<f32>,
+    q: Vec<f32>,
+}
+
 /// The confidence head: weights over `[hidden]` or `[hidden, markov_w1[prev]]`, and a bias.
 struct Confidence {
     w: Vec<f32>,
@@ -627,6 +740,7 @@ pub struct Dspark<'a> {
     dense: Option<Dense<'a>>,
     ds4: Option<crate::deepseek4::Ds4Draft<'a>>,
     markov: Option<Markov<'a>>,
+    bridge: Option<Bridge<'a>>,
     conf: Option<Confidence>,
     /// The draft's own embeddings / LM head, when it needs them (else the target's are used).
     embed: Option<Table<'a>>,
@@ -817,6 +931,7 @@ pub const KNOWN: &[(&str, &str, ByDefault)] = &[
     ("Qwen/Qwen3-14B", "Anbeeld/Qwen3-14B-DSpark-GGUF", ByDefault::Yes),
     ("Qwen/Qwen3.8-27B", "RadixArk/Qwen3.8-27B-DSpark", ByDefault::Fast),
     ("Qwen/Qwen3.8-27B", "jialinyyzz/Qwen3.8-27B-DSpark-drafter", ByDefault::No),
+    ("Qwen/Qwen3.8-27B", "tencent/Qwen3.8-27B-DSpine-b16", ByDefault::No),
     ("Qwen/Qwen3.5-35B-A3B", "jinzex/Qwen3.5-35B-A3B-DSpark", ByDefault::No),
     ("google/gemma-4-12B-it", "deepseek-ai/dspark_gemma4_12b_block7", ByDefault::Yes),
     ("google/gemma-4-12B-it", "ankk98/dspark-gemma4-12b-block7-Q4_0-GGUF", ByDefault::No),
@@ -1193,6 +1308,50 @@ impl<'a> Dspark<'a> {
         } else {
             None
         };
+        let bridge = match &c.bridge {
+            Some(b) => {
+                if gguf || markov.is_some() {
+                    bail!("DSpine drafts load from their Hugging Face folder, without a Markov head");
+                }
+                let n = |t: &str| format!("{}selected_prefix_bridge.{t}", nm.prefix);
+                // The format version of each part, and no terminal projection (`out`, trained
+                // away in the variant served here).
+                for v in [n("independent_write_version"), n("terminal_disabled_version")] {
+                    let one = files
+                        .bytes(&v)
+                        .ok()
+                        .is_some_and(|b| b.len() == 8 && b[0] == 1 && b[1..].iter().all(|x| *x == 0));
+                    if !one {
+                        bail!("DSpine draft: unsupported {v}");
+                    }
+                }
+                if has(&n("out.weight")) && files.bytes(&n("out.weight"))?.iter().any(|x| *x != 0) {
+                    bail!("DSpine draft with a terminal projection (not supported)");
+                }
+                // The bridge stays bf16 whatever the draft's weight format (as the reference).
+                let bl = |t: &str, n_out: usize, n_in: usize| -> Result<Lin<'a>> {
+                    shape(&n(t), &[n_out, n_in])?;
+                    load_lin(files, &n(t), n_out, n_in, Quant::Bf16)
+                };
+                let nl = c.n_layers;
+                shape(&n("early_read_weights"), &[nl - 1, b.code, h])?;
+                shape(&n("feature_write_weights"), &[nl, h, b.rank])?;
+                shape(&n("codebook"), &[vocab, b.code])?;
+                let mut read = crate::model::load_lin_experts(files, &n("early_read_weights"), nl - 1, b.code, h, Quant::Bf16)?;
+                read.push(bl("read_weight", b.code, h)?);
+                Some(Bridge {
+                    cfg: b.clone(),
+                    read,
+                    write: crate::model::load_lin_experts(files, &n("feature_write_weights"), nl, h, b.rank, Quant::Bf16)?,
+                    gate: bl("gate.weight", b.rank, b.code)?,
+                    gate_bias: vecf(&n("gate.bias"), b.rank)?,
+                    pred_gate: bl("predecessor_gate.weight", b.rank, b.code)?,
+                    prev: bl("prev.weight", b.rank, b.code)?,
+                    codebook: Table::load(files, &n("codebook"), vocab, b.code, Quant::Bf16)?,
+                })
+            }
+            None => None,
+        };
         let conf_alt = |n: String| {
             if gguf && !has(&n) {
                 n.replacen("conf_proj", "confidence.proj", 1)
@@ -1257,6 +1416,7 @@ impl<'a> Dspark<'a> {
                 dense: None,
                 ds4: Some(ds4),
                 markov,
+                bridge: None,
                 conf,
                 embed,
                 head,
@@ -1295,6 +1455,7 @@ impl<'a> Dspark<'a> {
             dense: Some(dense),
             ds4: None,
             markov,
+            bridge,
             conf,
             embed,
             head,
@@ -1593,7 +1754,14 @@ impl<'a> Dspark<'a> {
 
     /// Runs the block `[anchor, mask_1, ..]` of `nb` rows at positions `sess.len..` through the
     /// draft layers; returns the final-normed states `[nb, H]`.
-    fn block<M: Target + ?Sized>(&self, target: &M, sess: &DsparkSession, anchor: u32, nb: usize) -> Vec<f32> {
+    fn block<M: Target + ?Sized>(
+        &self,
+        target: &M,
+        sess: &DsparkSession,
+        anchor: u32,
+        nb: usize,
+        mut stash: Option<&mut BridgeState>,
+    ) -> Vec<f32> {
         let c = &self.cfg;
         let h = c.hidden;
         let pos = sess.len;
@@ -1646,9 +1814,115 @@ impl<'a> Dspark<'a> {
             } else {
                 add_inplace(&mut x, &o);
             }
+            if let Some(b) = &self.bridge {
+                let last = li + 1 == m.layers.len();
+                self.bridge_write(b, li, anchor, &mut x, nb, stash.as_deref_mut().filter(|_| last));
+            }
         }
         rmsnorm_f32w_rows_inplace(&mut x, h, &m.out_norm, c.eps);
         x
+    }
+
+    /// The bridge write after layer `li` on the block's residual streams `x` (`[nb, H]`, updated
+    /// in place; the anchor row is left as it is), see [`Bridge`]. `stash` receives the state
+    /// before the write.
+    fn bridge_write(&self, b: &Bridge, li: usize, anchor: u32, x: &mut [f32], nb: usize, stash: Option<&mut BridgeState>) {
+        let h = self.cfg.hidden;
+        let (cs, r, eps) = (b.cfg.code, b.cfg.rank, b.cfg.eps);
+        let sqrt_c = (cs as f32).sqrt();
+        let rms: Vec<f32> = x
+            .chunks_exact(h)
+            .map(|row| (dot(row, row) / h as f32).max(f32::MIN_POSITIVE).sqrt())
+            .collect();
+        let mut normed = x.to_vec();
+        for (row, &s) in normed.chunks_exact_mut(h).zip(&rms) {
+            scale_inplace(row, 1.0 / (s + eps));
+        }
+        let mut codes = vec![0f32; nb * cs];
+        self.lin(&mut [(&b.read[li], cs, &mut codes[..])], h, &normed, nb);
+        for row in codes.chunks_exact_mut(cs) {
+            let n = dot(row, row).sqrt();
+            scale_inplace(row, sqrt_c / (n + eps));
+        }
+        b.codebook.row(anchor as usize, &mut codes[..cs]);
+        scale_inplace(&mut codes[..cs], sqrt_c);
+        let (mut q, mut s, mut v) = (vec![0f32; nb * r], vec![0f32; nb * r], vec![0f32; nb * r]);
+        self.lin(
+            &mut [(&b.gate, r, &mut q[..]), (&b.pred_gate, r, &mut s[..]), (&b.prev, r, &mut v[..])],
+            cs,
+            &codes,
+            nb,
+        );
+        let mut msg = vec![0f32; nb * r];
+        for t in 1..nb {
+            for e in 0..r {
+                let g = 1.0 / (1.0 + (-(q[t * r + e] + s[(t - 1) * r + e] + b.gate_bias[e])).exp());
+                msg[t * r + e] = g * v[(t - 1) * r + e];
+            }
+        }
+        let mut delta = vec![0f32; nb * h];
+        self.lin(&mut [(&b.write[li], h, &mut delta[..])], r, &msg, nb);
+        if let Some(st) = stash {
+            st.raw = x.to_vec();
+            st.rms = rms.clone();
+            st.q = q;
+        }
+        for t in 1..nb {
+            axpy(&mut x[t * h..(t + 1) * h], rms[t], &delta[t * h..(t + 1) * h]);
+        }
+    }
+
+    /// The refined scores of block row `row` (a draft slot) once the token before it, `sender`,
+    /// is known: the last write redone with `sender`'s codebook row, the final norm, and the LM
+    /// head on the `top_k` candidates of `scores` (the slot's output of the parallel pass, ties
+    /// to the lower id). Rewrites `scores`: the candidates' refined values, everything else
+    /// excluded.
+    fn refine<M: Target + ?Sized>(&self, target: &M, b: &Bridge, st: &BridgeState, row: usize, sender: u32, scores: &mut [f32]) {
+        let c = &self.cfg;
+        let h = c.hidden;
+        let (cs, r) = (b.cfg.code, b.cfg.rank);
+        let mut idx: Vec<u32> = (0..scores.len() as u32).collect();
+        let k = b.cfg.top_k.min(idx.len());
+        if k < idx.len() {
+            idx.select_nth_unstable_by(k - 1, |a, z| scores[*z as usize].total_cmp(&scores[*a as usize]).then(a.cmp(z)));
+            idx.truncate(k);
+        }
+        idx.sort_unstable();
+        let mut e = vec![0f32; cs];
+        b.codebook.row(sender as usize, &mut e);
+        scale_inplace(&mut e, (cs as f32).sqrt());
+        let (mut s, mut v) = (vec![0f32; r], vec![0f32; r]);
+        self.lin(&mut [(&b.pred_gate, r, &mut s[..]), (&b.prev, r, &mut v[..])], cs, &e, 1);
+        let msg: Vec<f32> = (0..r)
+            .map(|i| v[i] / (1.0 + (-(st.q[row * r + i] + s[i] + b.gate_bias[i])).exp()))
+            .collect();
+        let mut x = vec![0f32; h];
+        self.lin(&mut [(b.write.last().unwrap(), h, &mut x[..])], r, &msg, 1);
+        scale_inplace(&mut x, st.rms[row]);
+        add_inplace(&mut x, &st.raw[row * h..(row + 1) * h]);
+        rmsnorm_f32w_inplace(&mut x, &self.dense().out_norm, c.eps);
+        // The candidates' head rows where they can be read; the whole head otherwise.
+        let mut rows = vec![0f32; k * h];
+        let mut cand: Vec<f32> = match &self.head {
+            Some(hd) if hd.rows(&idx, h, &mut rows) => rows.chunks_exact(h).map(|w| dot(w, &x)).collect(),
+            Some(hd) => {
+                let mut y = vec![0f32; scores.len()];
+                self.lin(&mut [(hd, scores.len(), &mut y[..])], h, &x, 1);
+                idx.iter().map(|&t| y[t as usize]).collect()
+            }
+            None if target.head_rows(&idx, &mut rows) => rows.chunks_exact(h).map(|w| dot(w, &x)).collect(),
+            None => {
+                let y = target.head_raw(&x, 1);
+                idx.iter().map(|&t| y[t as usize]).collect()
+            }
+        };
+        if let Some(cap) = c.softcap {
+            cand.iter_mut().for_each(|v| *v = (*v / cap).tanh() * cap);
+        }
+        scores.fill(f32::NEG_INFINITY);
+        for (&t, &l) in idx.iter().zip(&cand) {
+            scores[t as usize] = l;
+        }
     }
 
     /// MLA attention of the block rows `hn` (`[nb, H]`) over context positions `lo..` and the
@@ -1853,6 +2127,7 @@ impl<'a> Dspark<'a> {
         } else {
             c.block_rows()
         };
+        let mut stash = BridgeState::default();
         let (hid, mut logits) = match self.gpu_block(target, sess, anchor) {
             Some((hid, mut l)) => {
                 let v = l.len() / c.block_rows();
@@ -1861,7 +2136,7 @@ impl<'a> Dspark<'a> {
                 (hid, l)
             }
             None => {
-                let hid = self.block(target, sess, anchor, nb);
+                let hid = self.block(target, sess, anchor, nb, Some(&mut stash));
                 let rows = &hid[first * h..(first + k) * h];
                 let mut logits = match &self.head {
                     Some(hd) => {
@@ -1894,6 +2169,9 @@ impl<'a> Dspark<'a> {
         for i in 0..k {
             let li = &mut logits[i * v..(i + 1) * v];
             let hid_i = &rows[i * h..(i + 1) * h];
+            if let Some(b) = &self.bridge {
+                self.refine(target, b, &stash, first + i, prev, li);
+            }
             let mut w1 = Vec::new();
             if let Some(m) = &self.markov {
                 let r = m.rank;
@@ -2263,6 +2541,10 @@ impl Dspark<'_> {
     /// `block_rows` of them; the session is left as it was. None when the plans are missing or
     /// the device failed.
     fn gpu_block<M: Target + ?Sized>(&self, target: &M, sess: &mut DsparkSession, anchor: u32) -> Option<(Vec<f32>, Vec<f32>)> {
+        // The block plan has no bridge writes (the context plan is the same with or without).
+        if self.bridge.is_some() {
+            return None;
+        }
         let gp = self.gpu_plans(sess.fast)?;
         let _timer = crate::prof::start(crate::prof::Cat::Matmul);
         let nb = self.cfg.block_rows();
@@ -3369,6 +3651,299 @@ mod tests {
     /// The same check for Hugging Face GQA drafts: DeepSpec's layout (every slot predicts from
     /// the anchor), z-lab's DFlash layout (mask rows predict their own positions), and sliding,
     /// block-causal layers.
+    /// A two-layer DSpine draft (hidden H, random weights from `seed`): the Qwen3 backbone of
+    /// `toy_hf_draft` without the Markov and confidence heads, plus the code bridge (code 8,
+    /// rank 4, 4 candidates per slot, blocks of 4). `dflash` overrides keys of `dflash_config`.
+    fn toy_dspine_draft(dir: &Path, dflash: serde_json::Value, seed: u64) {
+        let (nh, nkv, hd, inter, nl, code, rank) = (2usize, 1usize, 16usize, 32usize, 2usize, 8usize, 4usize);
+        let mut st = seed;
+        let mut fill = |len: usize| -> Vec<u16> {
+            (0..len)
+                .map(|_| {
+                    st = st.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let x = ((st >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * 0.6;
+                    (x.to_bits() >> 16) as u16
+                })
+                .collect()
+        };
+        std::fs::create_dir_all(dir).unwrap();
+        let mut cfg = serde_json::json!({
+            "architectures": ["DFlashDraftModel"], "model_type": "qwen3", "hidden_size": H,
+            "num_hidden_layers": nl, "num_attention_heads": nh, "num_key_value_heads": nkv, "head_dim": hd,
+            "intermediate_size": inter, "rms_norm_eps": 1e-6, "vocab_size": V, "block_size": 4, "is_causal": true,
+            "rope_theta": 10000.0, "layer_types": ["sliding_attention", "sliding_attention"], "sliding_window": 64,
+            "use_sliding_window": true,
+            "code_bridge_second_pass": {"first_exact": nl - 1, "head_topk": 4, "mode": "serial_table"},
+            "dflash_config": {
+                "draft_block_causal": true, "mask_token_id": V - 1, "target_layer_ids": [0, 1],
+                "selected_prefix_code_bridge": {"code_size": code, "eps": 1e-6, "kappa": 10.0, "rank": rank},
+                "selected_prefix_decode_mode": "serial", "selected_prefix_feature_layers": [1, 2],
+                "selected_prefix_feature_write_mode": "independent", "selected_prefix_feature_writes": true,
+                "selected_prefix_last_write_refine": {"head_topk": 4, "kind": "exact_sender", "version": 1, "weight": 1.0},
+                "selected_prefix_terminal": false,
+            },
+        });
+        for (k, v) in dflash.as_object().unwrap() {
+            cfg["dflash_config"][k] = v.clone();
+        }
+        std::fs::write(dir.join("config.json"), cfg.to_string()).unwrap();
+        let ones = |n: usize| vec![(1f32.to_bits() >> 16) as u16; n];
+        let b = "selected_prefix_bridge.";
+        let mut t: Vec<(String, &str, Vec<usize>, Vec<u8>)> = Vec::new();
+        let mut bf = |name: String, shape: Vec<usize>, v: Vec<u16>| {
+            t.push((name, "BF16", shape, v.iter().flat_map(|x| x.to_le_bytes()).collect()));
+        };
+        bf("fc.weight".into(), vec![H, 2 * H], fill(2 * H * H));
+        bf("hidden_norm.weight".into(), vec![H], ones(H));
+        bf("norm.weight".into(), vec![H], ones(H));
+        for l in 0..nl {
+            for (n, sh) in [
+                ("input_layernorm.weight", vec![H]),
+                ("post_attention_layernorm.weight", vec![H]),
+                ("self_attn.q_norm.weight", vec![hd]),
+                ("self_attn.k_norm.weight", vec![hd]),
+                ("self_attn.q_proj.weight", vec![nh * hd, H]),
+                ("self_attn.k_proj.weight", vec![nkv * hd, H]),
+                ("self_attn.v_proj.weight", vec![nkv * hd, H]),
+                ("self_attn.o_proj.weight", vec![H, nh * hd]),
+                ("mlp.gate_proj.weight", vec![inter, H]),
+                ("mlp.up_proj.weight", vec![inter, H]),
+                ("mlp.down_proj.weight", vec![H, inter]),
+            ] {
+                let len: usize = sh.iter().product();
+                let v = if n.contains("norm") { ones(len) } else { fill(len) };
+                bf(format!("layers.{l}.{n}"), sh, v);
+            }
+        }
+        bf(format!("{b}codebook"), vec![V, code], fill(V * code));
+        bf(format!("{b}early_read_weights"), vec![nl - 1, code, H], fill((nl - 1) * code * H));
+        bf(format!("{b}read_weight"), vec![code, H], fill(code * H));
+        // Writes large enough to move the logits.
+        let big: Vec<u16> = fill(nl * H * rank)
+            .into_iter()
+            .map(|x| ((f32::from_bits((x as u32) << 16) * 8.0).to_bits() >> 16) as u16)
+            .collect();
+        bf(format!("{b}feature_write_weights"), vec![nl, H, rank], big);
+        bf(format!("{b}gate.weight"), vec![rank, code], fill(rank * code));
+        bf(format!("{b}gate.bias"), vec![rank], fill(rank));
+        bf(format!("{b}predecessor_gate.weight"), vec![rank, code], fill(rank * code));
+        bf(format!("{b}prev.weight"), vec![rank, code], fill(rank * code));
+        bf(format!("{b}out.weight"), vec![code, rank], vec![0u16; code * rank]);
+        for n in ["independent_write_version", "terminal_disabled_version"] {
+            t.push((format!("{b}{n}"), "I64", vec![], 1i64.to_le_bytes().to_vec()));
+        }
+        let mut header = serde_json::Map::new();
+        let mut off = 0usize;
+        for (name, dtype, shape, v) in &t {
+            header.insert(
+                name.clone(),
+                serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [off, off + v.len()]}),
+            );
+            off += v.len();
+        }
+        let hj = serde_json::to_vec(&header).unwrap();
+        let mut out = (hj.len() as u64).to_le_bytes().to_vec();
+        out.extend(hj);
+        for (_, _, _, v) in &t {
+            out.extend(v);
+        }
+        std::fs::write(dir.join("model.safetensors"), out).unwrap();
+    }
+
+    /// The toy target with a real LM head matrix (`[V, H]`), readable by rows or only as a whole.
+    struct HeadToy {
+        w: Vec<f32>,
+        rows: bool,
+    }
+
+    impl TextLm for HeadToy {
+        type Sess = ToySess;
+        fn new_session(&self) -> ToySess {
+            ToySess::default()
+        }
+        fn hidden_size(&self) -> usize {
+            H
+        }
+        fn n_layers(&self) -> usize {
+            2
+        }
+        fn session_len(&self, s: &ToySess) -> usize {
+            s.0.len()
+        }
+        fn forward_hidden_mm(&self, s: &mut ToySess, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {
+            Toy.forward_hidden_mm(s, tokens, mm)
+        }
+        fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
+            Toy.logits(hidden, t)
+        }
+    }
+
+    impl Target for HeadToy {
+        fn forward_feats(
+            &self,
+            s: &mut ToySess,
+            tokens: &[u32],
+            mm: &[(usize, &[f32])],
+            layers: &[usize],
+            feats: &mut Vec<f32>,
+        ) -> Vec<f32> {
+            Toy.forward_feats(s, tokens, mm, layers, feats)
+        }
+        fn embed_row(&self, token: u32, out: &mut [f32]) {
+            Toy.embed_row(token, out)
+        }
+        fn head_raw(&self, hidden: &[f32], t: usize) -> Vec<f32> {
+            (0..t)
+                .flat_map(|i| self.w.chunks(H).map(move |row| dot(row, &hidden[i * H..(i + 1) * H])))
+                .collect()
+        }
+        fn head_rows(&self, tokens: &[u32], out: &mut [f32]) -> bool {
+            for (&t, o) in tokens.iter().zip(out.chunks_mut(H)) {
+                o.copy_from_slice(&self.w[t as usize * H..(t as usize + 1) * H]);
+            }
+            self.rows
+        }
+        fn vocab_size(&self) -> usize {
+            V
+        }
+        fn truncate(&self, s: &mut ToySess, len: usize) {
+            Toy.truncate(s, len)
+        }
+    }
+
+    fn dspine(tag: &str, dflash: serde_json::Value) -> Result<(ModelFiles, DsparkConfig)> {
+        let dir = std::env::temp_dir().join(format!("oxinfer-dspine-test-{}-{tag}", std::process::id()));
+        toy_dspine_draft(&dir, dflash, 9);
+        let r = (|| Ok((ModelFiles::open(&dir, true)?, load_config(&dir)?)))();
+        std::fs::remove_dir_all(&dir).ok();
+        r
+    }
+
+    /// DSpine: the config is recognised (and other bridge variants refused), every slot keeps
+    /// the top candidates of the parallel pass, the first slot's refinement (whose sender is the
+    /// anchor, exactly what the block's own last write used) reproduces the parallel pass, later
+    /// slots depend on the token chosen before them, and reading the head by rows or as a whole
+    /// gives the same scores.
+    #[test]
+    fn dspine_bridge_and_refinement() {
+        let (files, cfg) = dspine("ok", serde_json::json!({})).unwrap();
+        assert_eq!(
+            cfg.bridge,
+            Some(BridgeConfig {
+                code: 8,
+                rank: 4,
+                eps: 1e-6,
+                top_k: 4
+            })
+        );
+        assert!(!cfg.sample_from_anchor && cfg.causal == [true, true] && cfg.max_draft() == 3);
+        for (tag, bad) in [
+            ("terminal", serde_json::json!({"selected_prefix_terminal": true})),
+            ("mode", serde_json::json!({"selected_prefix_feature_write_mode": "chained"})),
+            ("layers", serde_json::json!({"selected_prefix_feature_layers": [2]})),
+            ("decode", serde_json::json!({"selected_prefix_decode_mode": "parallel"})),
+        ] {
+            assert!(dspine(tag, bad).is_err(), "{tag}");
+        }
+        let dir = std::env::temp_dir().join(format!("oxinfer-dspine-test-{}-load", std::process::id()));
+        toy_dspine_draft(&dir, serde_json::json!({}), 9);
+        let d = Dspark::load(&dir, &files, H, V, Quant::Bf16).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+
+        let mut seed = 3u64;
+        let w: Vec<f32> = (0..V * H)
+            .map(|_| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+            })
+            .collect();
+        let (by_rows, whole) = (HeadToy { w: w.clone(), rows: true }, HeadToy { w, rows: false });
+        let mut sess = d.new_session();
+        let mut ts = by_rows.new_session();
+        let mut feats = Vec::new();
+        by_rows.forward_feats(&mut ts, &[5, 9, 13, 2, 7], &[], &d.cfg.target_layers, &mut feats);
+        d.inject(&mut sess, &feats, 5);
+        let anchor = 11u32;
+
+        // The parallel pass: the block's final states through the head.
+        let hid = d.block(&by_rows, &sess, anchor, 4, None);
+        let par = by_rows.head_raw(&hid[H..], 3);
+        let (dl, drafts) = d.draft_logits(&by_rows, &mut sess.clone(), anchor, 3);
+        let (dl2, drafts2) = d.draft_logits(&whole, &mut sess.clone(), anchor, 3);
+        assert_eq!(drafts, drafts2);
+        let mut moved = 0f32;
+        for i in 0..3 {
+            let (row, row2, p) = (&dl[i * V..(i + 1) * V], &dl2[i * V..(i + 1) * V], &par[i * V..(i + 1) * V]);
+            let kept: Vec<usize> = (0..V).filter(|&t| row[t].is_finite()).collect();
+            let mut top: Vec<usize> = (0..V).collect();
+            top.sort_by(|a, b| p[*b].total_cmp(&p[*a]).then(a.cmp(b)));
+            top.truncate(4);
+            top.sort_unstable();
+            assert_eq!(kept, top, "slot {i}: candidates");
+            assert!(row.iter().all(|v| v.is_finite() || *v == f32::NEG_INFINITY));
+            assert_eq!(
+                drafts[i] as usize,
+                *kept.iter().max_by(|a, b| row[**a].total_cmp(&row[**b])).unwrap()
+            );
+            for &t in &kept {
+                assert!((row[t] - row2[t]).abs() < 1e-4, "slot {i}: rows vs whole head");
+                if i == 0 {
+                    assert!((row[t] - p[t]).abs() < 1e-3, "slot 0, token {t}: {} vs {}", row[t], p[t]);
+                } else {
+                    moved = moved.max((row[t] - p[t]).abs());
+                }
+            }
+        }
+        assert!(moved > 1e-2, "later slots do not depend on their sender ({moved})");
+
+        // Another token before a slot changes that slot's scores (same candidates).
+        let b = d.bridge.as_ref().unwrap();
+        let mut st = BridgeState::default();
+        d.block(&by_rows, &sess, anchor, 4, Some(&mut st));
+        let score = |sender: u32| {
+            let mut l = par[V..2 * V].to_vec();
+            d.refine(&by_rows, b, &st, 2, sender, &mut l);
+            l
+        };
+        let (a, c) = (score(drafts[0]), score((drafts[0] + 1) % V as u32));
+        assert_eq!(&a, &dl[V..2 * V]);
+        assert!(a.iter().zip(&c).any(|(x, y)| x.is_finite() && (x - y).abs() > 1e-3));
+    }
+
+    /// Speculative decoding with a DSpine draft gives the plain greedy tokens.
+    #[test]
+    fn greedy_dspine_matches_plain_decoding() {
+        let toy = Toy;
+        let (files, _) = dspine("greedy", serde_json::json!({})).unwrap();
+        let dir = std::env::temp_dir().join(format!("oxinfer-dspine-test-{}-greedy-load", std::process::id()));
+        toy_dspine_draft(&dir, serde_json::json!({}), 9);
+        let d = Dspark::load(&dir, &files, H, V, Quant::Bf16).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let mut s = Sampler::new(0.0, 0, 1.0, 1);
+        for prompt in [&[5u32, 9, 13, 2, 7][..], &[5, 9, 13, 2, 7, 11]] {
+            let mut plain_s = toy.new_session();
+            let hs = crate::generate::prefill(&toy, &mut plain_s, prompt, 2, &[]);
+            let lg = toy.logits(&hs[hs.len() - H..], 1);
+            let plain = crate::generate::decode(&toy, &mut plain_s, lg, &mut s, &[], 40, &mut |_| Flow::Continue).tokens;
+            for k in 1..=3 {
+                let mut dec = DsparkDecoder::new(
+                    &toy,
+                    &d,
+                    DsparkOptions {
+                        draft_tokens: k,
+                        cost_aware: false,
+                        fast_verify: false,
+                        ..Default::default()
+                    },
+                );
+                let lg = dec.prefill(prompt, 2);
+                let spec = crate::generate::decode_rounds(&mut dec, &lg, &mut s, &[], 40, &mut |_| Flow::Continue);
+                assert_eq!(spec.tokens, plain, "k = {k}");
+                assert!(dec.stats.drafted > 0);
+            }
+        }
+    }
+
     #[test]
     fn greedy_dspark_gqa_matches_plain_decoding() {
         let toy = Toy;

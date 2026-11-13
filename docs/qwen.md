@@ -50,6 +50,29 @@ Q4 target: as many drafts accepted as with the bf16 draft on Qwen3.8-27B, and it
 instead of 31-34). Greedy output is the plain greedy output token for token; sampling keeps the
 target's distribution.
 
+**DSpine drafts** (Tencent, `tencent/Qwen3.8-27B-DSpine-b16`: a `DFlashDraftModel` whose
+`dflash_config` has a `selected_prefix_code_bridge`) are not a DFlash draft with training-only
+keys: the weights hold a second network, the *code bridge* (`selected_prefix_bridge.*`, a
+codebook row per token and read / write projections per draft layer), and without it the
+backbone drafts from states it was never trained to produce. After every draft layer each block
+row reads a code from its residual stream, receives a gated message from the row before it (the
+anchor row's code is its token's codebook row) and has it written back; then, as the tokens are
+chosen one after the other, the last layer's write is redone for each slot with the codebook row
+of the token actually drafted before it, and the slot's token is taken among the 16 best
+candidates of the parallel pass under that refined state (`Bridge` in `dspark.rs`; sampling
+draws from the same 16 with the usual acceptance test). The block is causal, 16 rows (15
+drafts), over an 8192-token window of the outputs of target layers 1, 16, 31, 46 and 61
+(counted from 0); the draft uses the target's embeddings and LM head. Only the served variant is read
+(independent writes after every layer, serial exact-sender refinement, no terminal projection);
+others are refused. The block's bridge runs on the CPU (the draft's GPU block plan is not used).
+
+Checked on Qwen3.8-27B (ISTA-DASLab's GSQ-RCO `IQ2_XS-mtp` GGUF as the target, CPU): the refined
+scores of all 15 slots of a block match a float32 numpy transcription of the reference's formulas
+(`tools/ref_dspine.py`, from github.com/Tencent/DSpine; largest difference 1e-4 on scores up to
+33), and over 112 greedy tokens of a code answer the output is the plain greedy output with
+97 of 116 drafts accepted, 7.4 tokens per target pass, 6.3 tok/s against 2.0 plain. It is a
+known draft of Qwen3.8-27B (`--draft tencent/Qwen3.8-27B-DSpine-b16`), not a default.
+
 **How a draft is found.** `--draft PATH` (or a repo id, `org/name:Q8_0` for one file of a GGUF
 repository) uses that draft. Without `--draft`, a draft is used when one is on disk and the pair
 is a default (the table below): a `dspark*` draft folder or GGUF inside the model folder (or a
