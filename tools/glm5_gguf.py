@@ -2,10 +2,11 @@
 with the metadata keys and tensor names of the published `glm5-next` / `glm-dsa` files
 (ggml-org/GLM-5.3-Flash-GGUF, unsloth/GLM-5.3-GGUF): `ssm_a` holds `-exp(A_log)`, `kv_b_proj`
 is split per head into `attn_k_b` (the key rows transposed) and `attn_v_b`, the experts are
-stacked. float32 tensors, no tokenizer: for `examples/glm5_check.rs`, which must print the same
+stacked. float32 tensors: for `examples/glm5_check.rs`, which must print the same
 numbers for the GGUF as for the folder.
 
-usage: glm5_gguf.py MODEL_DIR OUT.gguf      (needs the `gguf` package)
+usage: glm5_gguf.py MODEL_DIR OUT.gguf [PUBLISHED.gguf]      (needs the `gguf` package)
+With a published GGUF (its first part is enough), its tokenizer and chat template are copied.
 """
 import json, os, re, sys
 import numpy as np
@@ -126,6 +127,17 @@ for l in range(n):
         put(f"blk.{l}.ffn_gate_exps.weight", gu[:, :mi])
         put(f"blk.{l}.ffn_up_exps.weight", gu[:, mi:])
         put(f"blk.{l}.ffn_down_exps.weight", sd[lp + "mlp.experts.down_proj"])
+if len(sys.argv) > 3:
+    # The tokenizer and chat template of a published file (its first part is enough).
+    r = gguf.GGUFReader(sys.argv[3])
+    for name, f in r.fields.items():
+        if name.startswith("tokenizer."):
+            v = f.contents()
+            t = f.types[0]
+            if t == gguf.GGUFValueType.ARRAY:
+                w.add_array(name, v)
+            else:
+                w.add_key_value(name, v, t)
 w.write_header_to_file()
 w.write_kv_data_to_file()
 w.write_tensors_to_file()

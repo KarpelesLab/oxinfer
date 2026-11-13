@@ -2439,6 +2439,14 @@ fn run_glm5(mut args: Args) -> Result<()> {
     args.mmap |= args.stream;
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
     let mut model = oxinfer::glm5::Glm5Model::load(cfg, &files, args.quant)?;
+    // Prompt lookup verifies a draft in one pass and rolls back what the model refutes: the
+    // recurrent (KDA) layers of GLM-5.3-Flash cannot go back to an earlier position.
+    if model.cfg.kda.iter().any(|k| *k) {
+        if args.lookup == Some(true) {
+            eprintln!("[--lookup is not available for GLM-5.3-Flash (its linear-attention state cannot roll back): plain decoding]");
+        }
+        *LOOKUP.lock().unwrap() = None;
+    }
     let tok = load_tokenizer(&args.model)?;
     let fmt: &dyn ChatFormat = &chat::GlmChat;
     let eos = chat::GlmChat::stop_ids(&tok, eos);
