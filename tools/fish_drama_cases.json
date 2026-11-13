@@ -1,0 +1,22 @@
+[
+ {"text": "Hello there, how are you today?"},
+ {"text": "The quick brown fox jumps over the lazy dog.", "seed": 1},
+ {"text": "  Leading spaces, and a trailing newline.\n"},
+ {"text": "<|speaker:3|>A tagged line with [laughs] a cue and <whisper>soft words</whisper>."},
+ {"text": " 　<|speaker:15|> Tag after ideographic space."},
+ {"text": "你好，欢迎使用语音合成服务，今天的天气非常不错。"},
+ {"text": "他停顿了一下，低声说道：其实，我早就知道这件事了，只是一直没说出口。"},
+ {"text": "こんにちは、今日はいい天気ですね。散歩に行きましょう！"},
+ {"text": "Bonjour, comment allez-vous aujourd'hui ? Très bien, merci — et vous ?"},
+ {"text": "Numbers: 3.14159, 2,718 and 1e-5; e-mail: someone@example.com; URL https://example.com/a?b=c."},
+ {"text": "<|speaker:0|> First speaker.\n<|speaker:1|> Second speaker.\n<|speaker:0|> First again."},
+ {"text": "Emoji 😀 and symbols © ® ™ § ¶ † ‡ … “quotes” ‘single’ «guillemets»."},
+ {"text": "[sighs] Fine. If we miss it, it's on you. [laughs] Well, maybe that's fair."},
+ {"text": "Clone this voice.", "references": [["We asked over twenty different people, and they all said it was his.", 12]], "seed": 3},
+ {"text": "Two references.", "references": [["  First transcript with leading spaces.", 5], ["<|speaker:1|>Second, tagged.", 7]], "seed": 4},
+ {"text": "\n<|speaker:2|>Reference tag after white space.", "references": [[" \n<|speaker:2|> spaced tag", 3]], "seed": 5},
+ {"text": "The quarterly report is due on Thursday, so please finish it by five.", "references": [["We asked over twenty different people.", 9]], "history": [["The quarterly report is due on Wednesday, so please finish it by noon.", 20], ["The quarterly report is due on Thursday, so please finish it by noon.", 18]], "seed": 6},
+ {"text": "History only.", "history": [["An earlier chunk of the same text.", 11]], "seed": 7},
+ {"text": "Tabs\tand\r\ncarriage returns, zero​width, non breaking, ﬁ ligature, Ａ fullwidth."},
+ {"text": "Специальные символы: привет, мир! ¿Qué tal? مرحبا بالعالم. नमस्ते दुनिया."}
+]

@@ -132,8 +132,8 @@ oxinfer's side and the tool compares; `tools/fish_drama_tiny.py` writes a small 
 F=fish-speech   # a checkout of github.com/fishaudio/fish-speech
 M=drama-3       # the files of the Hugging Face repository
 python tools/fish_drama_tiny.py $F $M tiny            # and with --fp8: FP8 experts with block scales
-cargo run --release --example fish_check -- prompt tiny cases.json rows.json
-python tools/ref_fish_drama.py $F prompt tiny cases.json rows.json
+cargo run --release --example fish_check -- prompt tiny tools/fish_drama_cases.json rows.json
+python tools/ref_fish_drama.py $F prompt tiny tools/fish_drama_cases.json rows.json
 cargo run --release --example fish_check -- gen tiny out "Hello there, how are you today?" --steps 200
 python tools/ref_fish_drama.py $F gen tiny out
 cargo run --release --example fish_check -- gen $M out "Hello there, how are you today?" --temp 0.7 --steps 300
@@ -144,10 +144,11 @@ cargo run --release --example fish_check -- decode $M/codec.pth codes.npy out.f3
 python tools/ref_fish_drama.py $F decode $M/codec.pth codes.npy out.f32
 ```
 
-**Tokenizer and prompt.** 20 cases (English, Chinese, Japanese, French, Cyrillic, Arabic and
-Devanagari text, emoji and symbols, leading white space, speaker tags, bracketed cues, one and
-two references with tagged and untagged transcripts, one and two history turns): the 1017 rows
-are those of `build_drama3_prompt` with the `tokenizers` library.
+**Tokenizer and prompt.** The 20 cases of `tools/fish_drama_cases.json` (English, Chinese,
+Japanese, French, Cyrillic, Arabic and Devanagari text, emoji and symbols, leading white space,
+speaker tags, bracketed cues, one and two references with tagged and untagged transcripts, one
+and two history turns): the 1017 rows are those of `build_drama3_prompt` with the `tokenizers`
+library.
 
 **Backbone and tower.** Greedy generation (every draw of the reference's sampler replaced by the
 argmax) on the small random checkpoints, whose weights both sides read as the same float32
