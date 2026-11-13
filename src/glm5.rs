@@ -104,6 +104,9 @@ pub struct Glm5Config {
     pub hc_sinkhorn_iters: usize,
     pub hc_eps: f64,
     pub rms_norm_eps: f64,
+    /// The epsilon of the RMS norms of the query LoRA and of the latent (`rms_norm_eps` for
+    /// GLM-5.3-Flash; GLM-5.3 leaves them at the module's default).
+    pub latent_norm_eps: f64,
     pub rope_theta: f64,
     pub tie_word_embeddings: bool,
 }
@@ -215,6 +218,7 @@ impl Glm5Config {
             hc_sinkhorn_iters: opt("hc_sinkhorn_iters", 20),
             hc_eps: optf("hc_eps", 1e-6),
             rms_norm_eps: optf("rms_norm_eps", 1e-5),
+            latent_norm_eps: if flash { optf("rms_norm_eps", 1e-5) } else { 1e-6 },
             rope_theta: t
                 .get("rope_parameters")
                 .and_then(|r| r.get("rope_theta"))
@@ -1430,7 +1434,7 @@ impl<'a> Glm5Model<'a> {
         let (h, nh, lat, vd, ql) = (c.hidden_size, c.num_attention_heads, c.kv_lora_rank, c.v_head_dim, c.q_lora_rank);
         let (dn, dr) = (c.qk_nope_head_dim, c.qk_rope_head_dim);
         let qk = dn + dr;
-        let eps = c.rms_norm_eps as f32;
+        let eps = c.latent_norm_eps as f32;
         let (cos, sin) = rope;
         let half = dr / 2;
         let par = t > 1;
@@ -1727,5 +1731,306 @@ impl crate::dspark::Target for Glm5Model<'_> {
             sess.truncate(len),
             "GLM-5.3-Flash: the recurrent layers cannot go back to an earlier position"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names() {
+        assert_eq!(
+            gguf_name("blk.3.attn_k_b.weight", &[256, 512, 64], 45),
+            Some(("model.layers.3.self_attn.k_b".into(), vec![64, 512, 256]))
+        );
+        assert_eq!(
+            gguf_name("blk.0.ssm_conv1d_q.weight", &[4, 1, 8192], 45),
+            Some(("model.layers.0.self_attn.q_conv1d.weight".into(), vec![8192, 1, 4]))
+        );
+        assert_eq!(
+            gguf_name("blk.7.ffn_gate_exps.weight", &[4096, 2048, 288], 45),
+            Some(("model.layers.7.mlp.experts.gate_proj".into(), vec![288, 2048, 4096]))
+        );
+        assert_eq!(
+            gguf_name("blk.7.indexer_compressor_ape.weight", &[128, 4], 45)
+                .map(|x| x.0)
+                .as_deref(),
+            Some("model.layers.7.self_attn.indexer.index_kpool_compress_ape")
+        );
+        assert_eq!(
+            gguf_name("blk.0.ssm_a", &[64], 45).map(|x| x.0).as_deref(),
+            Some("model.layers.0.self_attn.ssm_a")
+        );
+        // The MTP block of a file that carries one is not read.
+        assert_eq!(gguf_name("blk.45.attn_q_a.weight", &[4096, 1536], 45), None);
+        assert_eq!(
+            gguf_name("output.weight", &[4096, 154880], 45).map(|x| x.1),
+            Some(vec![154880, 4096])
+        );
+    }
+
+    /// The fields of the releases' configs that decide the architecture.
+    #[test]
+    fn configs() {
+        let n = 45;
+        let types: Vec<&str> = (0..n)
+            .map(|i| {
+                if i % 4 == 3 {
+                    "deepseek_sparse_attention"
+                } else {
+                    "linear_attention"
+                }
+            })
+            .collect();
+        let flash = serde_json::json!({
+            "model_type": "glm5_next",
+            "text_config": {
+                "model_type": "glm5_next_text", "hidden_size": 4096, "num_hidden_layers": n, "num_attention_heads": 64,
+                "vocab_size": 154880, "intermediate_size": 12288, "moe_intermediate_size": 2048, "n_routed_experts": 288,
+                "num_experts_per_tok": 8, "kv_lora_rank": 512, "q_lora_rank": 1536, "qk_nope_head_dim": 256,
+                "qk_rope_head_dim": 0, "v_head_dim": 256, "index_topk": 2048, "index_kpool": 4, "first_k_dense_replace": 3,
+                "layer_types": types,
+                "linear_attn_config": {"num_heads": 64, "head_dim": 128, "short_conv_kernel_size": 4, "gate_lower_bound": -5.0},
+                "hc_mult": 4, "swiglu_limit": 10.0, "scoring_func": "sigmoid", "n_group": 1
+            }
+        });
+        let c = Glm5Config::from_json(&flash).unwrap();
+        assert_eq!((c.hc_mult, c.index_kpool, c.qk_head_dim(), c.kda_heads), (4, 4, 256, 64));
+        assert_eq!(c.kda.iter().filter(|k| **k).count(), 34);
+        assert_eq!(c.sparse.iter().filter(|s| **s).count(), 42);
+        assert!(c.indexer_full.iter().all(|f| *f));
+        assert_eq!(c.kda_lower_bound, Some(-5.0));
+        assert_eq!(c.latent_norm_eps, c.rms_norm_eps);
+        // GLM-5.3: no hyper-connections, no pools, an indexer every fourth layer after the first three.
+        let dsa = serde_json::json!({
+            "model_type": "glm_moe_dsa", "hidden_size": 6144, "num_hidden_layers": 78, "num_attention_heads": 64,
+            "vocab_size": 154880, "intermediate_size": 12288, "n_routed_experts": 256, "kv_lora_rank": 512,
+            "q_lora_rank": 2048, "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+            "index_topk_freq": 4, "index_skip_topk_offset": 3, "rope_parameters": {"rope_theta": 8000000, "rope_type": "default"}
+        });
+        let c = Glm5Config::from_json(&dsa).unwrap();
+        assert_eq!((c.hc_mult, c.index_kpool, c.qk_head_dim(), c.swiglu_limit), (1, 1, 256, 0.0));
+        assert_eq!(c.indexer_full.iter().filter(|f| **f).count(), 21);
+        assert!(c.kda.iter().all(|k| !*k));
+        assert_eq!((c.rope_theta, c.latent_norm_eps), (8e6, 1e-6));
+        assert!(Glm5Config::from_json(&serde_json::json!({"model_type": "llama"})).is_err());
+    }
+
+    /// A deterministic uniform generator in [-1, 1).
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> f32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+        }
+    }
+
+    /// Writes a tiny random checkpoint in the release's naming (float32): GLM-5.3-Flash (KDA and
+    /// MLA layers, one of them sharing the previous layer's choice, hyper-connections, pools of
+    /// 2) or GLM-5.3 (rotary MLA, a shared layer); returns its config.
+    fn tiny_checkpoint(dir: &std::path::Path, flash: bool, topk: usize) -> Glm5Config {
+        let kinds: &[&str] = if flash {
+            &["linear_attention", "indexed_attention", "indexed_attention", "linear_attention"]
+        } else {
+            &["indexed_attention"; 3]
+        };
+        let full: Vec<&str> = (0..kinds.len()).map(|l| if l == 2 { "shared" } else { "full" }).collect();
+        let mut j = serde_json::json!({
+            "model_type": if flash { "glm5_next_text" } else { "glm_moe_dsa" },
+            "hidden_size": 16, "num_hidden_layers": kinds.len(), "num_attention_heads": 2, "vocab_size": 32,
+            "intermediate_size": 24, "moe_intermediate_size": 8, "n_routed_experts": 4, "num_experts_per_tok": 2,
+            "routed_scaling_factor": 1.5, "kv_lora_rank": 6, "q_lora_rank": 8, "qk_nope_head_dim": 4,
+            "qk_rope_head_dim": if flash { 0 } else { 4 }, "v_head_dim": 4, "index_topk": topk, "index_head_dim": 8,
+            "index_n_heads": 4, "layer_types": kinds, "indexer_types": full, "first_k_dense_replace": 1,
+        });
+        if flash {
+            let o = j.as_object_mut().unwrap();
+            o.insert("index_kpool".into(), 2.into());
+            o.insert("swiglu_limit".into(), 0.5.into());
+            o.insert("linear_num_heads".into(), 2.into());
+            o.insert("linear_head_dim".into(), 4.into());
+        }
+        let c = Glm5Config::from_json(&j).unwrap();
+        let (h, nh, v, ql, lat) = (c.hidden_size, c.num_attention_heads, c.vocab_size, c.q_lora_rank, c.kv_lora_rank);
+        let (ne, mi, hc) = (c.n_routed_experts, c.moe_intermediate_size, c.hc_mult);
+        let (ni, di) = (c.index_n_heads, c.index_head_dim);
+        let mut rng = Rng(0x61e5);
+        let mut tensors: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
+        // `scale` times uniform noise, plus `bias`.
+        let mut add = |name: String, shape: &[usize], scale: f32, bias: f32| {
+            let n: usize = shape.iter().product();
+            let bytes = (0..n).flat_map(|_| (bias + scale * rng.next()).to_le_bytes()).collect();
+            tensors.push((name, shape.to_vec(), bytes));
+        };
+        let mat = |fan_in: usize, gain: f32| gain * (3.0 / fan_in as f32).sqrt();
+        let m = if flash { "model.language_model." } else { "model." };
+        add(format!("{m}embed_tokens.weight"), &[v, h], 1.7, 0.0);
+        add("lm_head.weight".into(), &[v, h], mat(h, 4.0), 0.0);
+        add(format!("{m}norm.weight"), &[h], 0.2, 1.0);
+        for l in 0..c.num_hidden_layers {
+            let p = format!("{m}layers.{l}.");
+            add(format!("{p}input_layernorm.weight"), &[h], 0.2, 1.0);
+            add(format!("{p}post_attention_layernorm.weight"), &[h], 0.2, 1.0);
+            if hc > 1 {
+                let mix = (2 + hc) * hc;
+                for part in ["attn", "ffn"] {
+                    add(format!("{p}hc_{part}_fn"), &[mix, hc * h], mat(hc * h, 4.0), 0.0);
+                    add(format!("{p}hc_{part}_base"), &[mix], 0.5, 0.0);
+                    add(format!("{p}hc_{part}_scale"), &[3], 0.25, 0.75);
+                }
+            }
+            let a = format!("{p}self_attn.");
+            if c.kda[l] {
+                let (kh, kd, kk) = (c.kda_heads, c.kda_head_dim, c.kda_kernel);
+                let w = kh * kd;
+                for n in ["q", "k", "v"] {
+                    add(format!("{a}{n}_proj.weight"), &[w, h], mat(h, 2.0), 0.0);
+                    add(format!("{a}{n}_conv1d.weight"), &[w, 1, kk], 0.6, 0.0);
+                }
+                add(format!("{a}f_a_proj.weight"), &[kd, h], mat(h, 2.0), 0.0);
+                add(format!("{a}f_b_proj.weight"), &[w, kd], mat(kd, 2.0), 0.0);
+                add(format!("{a}dt_bias"), &[w], 0.5, 0.0);
+                add(format!("{a}A_log"), &[kh], 1.0, 0.0);
+                add(format!("{a}b_proj.weight"), &[kh, h], mat(h, 2.0), 0.0);
+                add(format!("{a}g_a_proj.weight"), &[kd, h], mat(h, 2.0), 0.0);
+                add(format!("{a}g_b_proj.weight"), &[w, kd], mat(kd, 2.0), 0.0);
+                add(format!("{a}o_norm.weight"), &[kd], 0.2, 1.0);
+                add(format!("{a}o_proj.weight"), &[h, w], mat(w, 1.0), 0.0);
+            } else {
+                let (dn, dr, vd) = (c.qk_nope_head_dim, c.qk_rope_head_dim, c.v_head_dim);
+                add(format!("{a}q_a_proj.weight"), &[ql, h], mat(h, 2.0), 0.0);
+                add(format!("{a}q_a_layernorm.weight"), &[ql], 0.2, 1.0);
+                add(format!("{a}q_b_proj.weight"), &[nh * (dn + dr), ql], mat(ql, 3.0), 0.0);
+                add(format!("{a}kv_a_proj_with_mqa.weight"), &[lat + dr, h], mat(h, 2.0), 0.0);
+                add(format!("{a}kv_a_layernorm.weight"), &[lat], 0.2, 1.0);
+                add(format!("{a}kv_b_proj.weight"), &[nh * (dn + vd), lat], mat(lat, 3.0), 0.0);
+                add(format!("{a}o_proj.weight"), &[h, nh * vd], mat(nh * vd, 1.0), 0.0);
+                if c.indexer_full[l] {
+                    add(format!("{a}indexer.wq_b.weight"), &[ni * di, ql], mat(ql, 2.0), 0.0);
+                    add(format!("{a}indexer.wk.weight"), &[di, h], mat(h, 2.0), 0.0);
+                    add(format!("{a}indexer.k_norm.weight"), &[di], 0.2, 1.0);
+                    add(format!("{a}indexer.k_norm.bias"), &[di], 0.2, 0.0);
+                    add(format!("{a}indexer.weights_proj.weight"), &[ni, h], mat(h, 1.0), 0.0);
+                    if c.index_kpool > 1 {
+                        add(format!("{a}indexer.index_kpool_compress_ape"), &[c.index_kpool, di], 0.5, 0.0);
+                        add(format!("{a}indexer.index_kpool_compress_gate"), &[di, h], mat(h, 2.0), 0.0);
+                    }
+                }
+            }
+            let mut mlp = |p: String, inter: usize| {
+                add(format!("{p}gate_proj.weight"), &[inter, h], mat(h, 2.0), 0.0);
+                add(format!("{p}up_proj.weight"), &[inter, h], mat(h, 2.0), 0.0);
+                add(format!("{p}down_proj.weight"), &[h, inter], mat(inter, 1.0), 0.0);
+            };
+            if c.sparse[l] {
+                for e in (0..ne).map(|e| format!("experts.{e}")).chain(["shared_experts".to_string()]) {
+                    mlp(format!("{p}mlp.{e}."), mi);
+                }
+                add(format!("{p}mlp.gate.weight"), &[ne, h], mat(h, 3.0), 0.0);
+                add(format!("{p}mlp.gate.e_score_correction_bias"), &[ne], 0.3, 0.0);
+            } else {
+                mlp(format!("{p}mlp."), c.intermediate_size);
+            }
+        }
+        let mut head = serde_json::Map::new();
+        let mut data = Vec::new();
+        for (name, shape, bytes) in tensors {
+            let entry = serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [data.len(), data.len() + bytes.len()]});
+            head.insert(name, entry);
+            data.extend(bytes);
+        }
+        let mut head = serde_json::Value::Object(head).to_string();
+        while !head.len().is_multiple_of(8) {
+            head.push(' ');
+        }
+        let mut file = (head.len() as u64).to_le_bytes().to_vec();
+        file.extend_from_slice(head.as_bytes());
+        file.extend(data);
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("model.safetensors"), file).unwrap();
+        c
+    }
+
+    /// Without a reference (tools/glm5_tiny.py has it): on tiny random models of both kinds, the
+    /// logits do not depend on how the tokens are split into passes (the recurrent state, the
+    /// convolution history, the indexer's pools and the latent cache carry over), the indexer's
+    /// choice changes them, only GLM-5.3 can go back to an earlier position, and a steered
+    /// residual point changes them while a neutral spec does not.
+    #[test]
+    fn passes_and_interventions_on_tiny_models() {
+        use crate::intervene::{Compiled, Ctx, Point, Positions, Spec, Steer};
+        use std::sync::Arc;
+        for flash in [true, false] {
+            let load = |topk: usize| {
+                let dir = std::env::temp_dir().join(format!("oxinfer-glm5-test-{}-{flash}-{topk}", std::process::id()));
+                let cfg = tiny_checkpoint(&dir, flash, topk);
+                // Read into memory and leaked: the model borrows the files.
+                let files: &'static ModelFiles = Box::leak(Box::new(ModelFiles::open(&dir, true).unwrap()));
+                std::fs::remove_dir_all(&dir).ok();
+                Glm5Model::load(cfg, files, Quant::Bf16).unwrap()
+            };
+            let m = load(4);
+            let (h, v) = (m.cfg.hidden_size, m.cfg.vocab_size);
+            let ids: Vec<u32> = (0..41).map(|i| (i * 7 + 3) % v as u32).collect();
+            let more = [5u32, 17, 2];
+            // The logits after the prompt (in passes of `chunk`) and after each of `more`.
+            let run = |m: &Glm5Model, iv: Option<Arc<Compiled>>, chunk: usize| -> Vec<f32> {
+                let mut sess = m.new_session();
+                sess.iv.iv = iv;
+                let hs = crate::generate::prefill(m, &mut sess, &ids, chunk, &[]);
+                let mut out = m.logits(&hs[hs.len() - h..], 1);
+                for &t in &more {
+                    out.extend(m.forward(&mut sess, &[t]));
+                }
+                out
+            };
+            let diff = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+            let base = run(&m, None, ids.len());
+            assert!(base.iter().all(|x| x.is_finite()), "flash {flash}");
+            for chunk in [1, 3, 16] {
+                let d = diff(&base, &run(&m, None, chunk));
+                assert!(d < 2e-4, "flash {flash}: passes of {chunk} differ by {d}");
+            }
+            // The same weights attending densely give other logits: the indexer chose.
+            let dense = run(&load(1024), None, ids.len());
+            assert!(diff(&base, &dense) > 1e-3, "flash {flash}: the indexer's choice changes nothing");
+            let mut sess = m.new_session();
+            m.forward(&mut sess, &ids);
+            if flash {
+                assert!(!sess.truncate(20));
+            } else {
+                assert!(sess.truncate(20));
+                let a = m.forward(&mut sess, &ids[20..]);
+                let b = m.forward(&mut m.new_session(), &ids);
+                assert!(diff(&a, &b) < 2e-4);
+            }
+            let resolve = |s: &str| -> Result<std::path::PathBuf> { Ok(s.into()) };
+            let compile = |spec: &Spec| {
+                let ctx = Ctx {
+                    resolve: &resolve,
+                    calibration: None,
+                    saes: None,
+                };
+                Arc::new(Compiled::new(spec, &m, &ctx).unwrap())
+            };
+            let neutral = run(&m, Some(compile(&Spec::default())), 16);
+            assert!(diff(&base, &neutral) < 2e-4, "flash {flash}: a neutral spec changes the logits");
+            let steer = Spec {
+                steer: vec![Steer {
+                    vector: Some((0..h).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect()),
+                    layer: Some(1),
+                    alpha: 2.0,
+                    point: Point::Mid,
+                    positions: Positions::All,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let steered = run(&m, Some(compile(&steer)), ids.len());
+            assert!(diff(&base, &steered) > 1e-2, "flash {flash}: steering changes nothing");
+            let d = diff(&steered, &run(&m, Some(compile(&steer)), 3));
+            assert!(d < 2e-3, "flash {flash}: steered passes differ by {d}");
+        }
     }
 }

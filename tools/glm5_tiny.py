@@ -5,7 +5,12 @@ dense and MoE layers with clamped SwiGLU (Flash); MLA with RoPE and the per-toke
 (GLM-5.3).
 
 usage: glm5_tiny.py OUT_DIR [--arch flash|dsa] [--len N] [--gen N] [--seed S]
+                    [--tokenizer RELEASE_DIR [--chat CONVERSATION.json]]
 (environment: TOPK, KPOOL, LIMIT override `index_topk`, `index_kpool`, `swiglu_limit`)
+
+With --tokenizer the model takes the release's vocabulary and its tokenizer files (a folder with
+tokenizer.json, tokenizer_config.json and chat_template.jinja), and with --chat the prompt is
+that conversation rendered by the chat template (written to OUT_DIR/prompt.txt).
 
 Writes OUT_DIR/model (save_pretrained, which writes the tensor names of the zai-org release:
 `hc_attn_fn`, `self_attn.f_a_proj`, `q_conv1d`, one module per expert) and
@@ -18,7 +23,7 @@ import torch
 from safetensors.torch import save_file
 
 out = sys.argv[1]
-arch, plen, gen, seed = "flash", 150, 16, 0
+arch, plen, gen, seed, tokdir, chat = "flash", 150, 16, 0, None, None
 a = sys.argv[2:]
 for i, x in enumerate(a):
     if x == "--arch":
@@ -29,8 +34,13 @@ for i, x in enumerate(a):
         gen = int(a[i + 1])
     if x == "--seed":
         seed = int(a[i + 1])
+    if x == "--tokenizer":
+        tokdir = a[i + 1]
+    if x == "--chat":
+        chat = a[i + 1]
 torch.manual_seed(seed)
-V = 512
+# With the release's tokenizer: its vocabulary and special tokens.
+V, PAD, EOS = (154880, 154820, [154820, 154827, 154829]) if tokdir else (512, 0, [1, 2])
 
 if arch == "flash":
     from transformers.models.glm5_next.configuration_glm5_next import Glm5NextConfig
@@ -70,8 +80,8 @@ if arch == "flash":
         hc_sinkhorn_iters=20,
         hc_eps=1e-6,
         rms_norm_eps=1e-5,
-        pad_token_id=0,
-        eos_token_id=[1, 2],
+        pad_token_id=PAD,
+        eos_token_id=EOS,
         initializer_range=0.08,
         max_position_embeddings=4096,
     )
@@ -110,8 +120,8 @@ else:
         mlp_layer_types=["dense"] * 2 + ["sparse"] * (n - 2),
         indexer_types=["full", "full", "shared", "full", "shared", "full"],
         rms_norm_eps=1e-5,
-        pad_token_id=0,
-        eos_token_id=[1, 2],
+        pad_token_id=PAD,
+        eos_token_id=EOS,
         initializer_range=0.08,
         max_position_embeddings=4096,
     )
@@ -143,8 +153,9 @@ with torch.no_grad():
     for name, b in m.named_buffers():
         if name.endswith("e_score_correction_bias"):
             b.copy_(torch.randn_like(b) * 0.1)
-    # bf16-representable weights: oxinfer's bf16 matmuls are then exact.
-    for name, p in list(m.named_parameters()) + list(m.named_buffers()):
+    # bf16-representable weights: oxinfer's bf16 matmuls are then exact. (Only what the
+    # checkpoint stores: the rotary frequencies are a buffer computed from the config.)
+    for name, p in m.state_dict().items():
         if p.is_floating_point():
             p.copy_(p.to(torch.bfloat16).float())
 
@@ -154,8 +165,25 @@ m.save_pretrained(mdir)
 
 g = torch.Generator().manual_seed(seed + 1)
 ids = torch.randint(8, V - 8, (1, plen), generator=g)
+if tokdir:
+    import json, shutil
+    from transformers import AutoTokenizer
+
+    for f in ["tokenizer.json", "tokenizer_config.json", "chat_template.jinja"]:
+        shutil.copy(os.path.join(tokdir, f), mdir)
+    json.dump({"eos_token_id": EOS, "pad_token_id": PAD}, open(os.path.join(mdir, "generation_config.json"), "w"))
+    if chat:
+        # The prompt: a conversation ({"messages": [...], "tools": [...]}) through the chat template.
+        tk = AutoTokenizer.from_pretrained(mdir)
+        conv = json.load(open(chat))
+        text = tk.apply_chat_template(conv["messages"], tools=conv.get("tools"), add_generation_prompt=True, tokenize=False)
+        ids = torch.tensor([tk(text, add_special_tokens=False)["input_ids"]])
+        open(os.path.join(out, "prompt.txt"), "w").write(text)
 with torch.no_grad():
-    full = m(ids, use_cache=False).logits[0].float()
+    o = m(ids, use_cache=False, output_hidden_states=True)
+    full = o.logits[0].float()
+    # The residual stream after each layer (the mean of its copies with hyper-connections).
+    hidden = torch.stack([x[0].mean(dim=-2) if x.dim() == 4 else x[0] for x in o.hidden_states[-n:]]).float()
     o = m(ids, use_cache=True)
     cache = o.past_key_values
     last = o.logits[0, -1].float()
@@ -171,9 +199,12 @@ save_file(
     {
         "ids": ids[0].to(torch.int64),
         "logits": full.contiguous(),
+        "hidden": hidden.contiguous(),
         "gen": torch.tensor(toks, dtype=torch.int64),
         "decode_logits": torch.stack(rows).contiguous(),
     },
     os.path.join(out, "ref.safetensors"),
 )
 print("gen", toks)
+if tokdir:
+    open(os.path.join(out, "gen.txt"), "w").write(AutoTokenizer.from_pretrained(mdir).decode(toks))

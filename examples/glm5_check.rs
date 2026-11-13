@@ -4,7 +4,7 @@
 //! feeding each of them one at a time):
 //!
 //! ```text
-//! glm5_check MODEL REF.safetensors [--chunk N] [--cpu] [--mmap]
+//! glm5_check MODEL REF.safetensors [--chunk N] [--layers] [--cpu] [--mmap]
 //! ```
 //!
 //! Prints, for the prefill (in chunks of N tokens, default the whole prompt) and for the
@@ -69,15 +69,16 @@ fn report(what: &str, ours: &[f32], refs: &[f32], vocab: usize) {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: glm5_check MODEL REF.safetensors [--chunk N] [--cpu] [--mmap]";
+    let usage = "usage: glm5_check MODEL REF.safetensors [--chunk N] [--layers] [--cpu] [--mmap]";
     let model = args.next().context(usage)?;
     let refp = args.next().context(usage)?;
-    let (mut chunk, mut cpu, mut mmap) = (None, false, false);
+    let (mut chunk, mut cpu, mut mmap, mut layers) = (None, false, false, false);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--chunk" => chunk = Some(args.next().context("--chunk N")?.parse::<usize>()?),
             "--cpu" => cpu = true,
             "--mmap" => mmap = true,
+            "--layers" => layers = true,
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
@@ -110,6 +111,28 @@ fn main() -> Result<()> {
         t0.elapsed().as_secs_f64()
     );
     report("prefill", &ours, &refs, vocab);
+
+    // The residual stream after each layer (`hidden` `[layers, n, hidden]`), with `--layers`.
+    if layers && st.info("hidden").is_some() {
+        let href = f32s(&st, "hidden")?;
+        let (n, h, t) = (m.cfg.num_hidden_layers, m.cfg.hidden_size, ids.len());
+        let want: Vec<usize> = (1..=n).collect();
+        let mut feats = Vec::new();
+        m.forward_capture(&mut m.new_session(), &ids, &want, &mut feats);
+        for l in 0..n {
+            let (mut max, mut at, mut big) = (0f32, 0, 0f32);
+            for ti in 0..t {
+                for k in 0..h {
+                    let (a, b) = (feats[(ti * n + l) * h + k], href[(l * t + ti) * h + k]);
+                    big = big.max(b.abs());
+                    if (a - b).abs() > max {
+                        (max, at) = ((a - b).abs(), ti);
+                    }
+                }
+            }
+            println!("after layer {l}: max residual diff {max:.3e} (at position {at}; largest value {big:.2})");
+        }
+    }
 
     if st.info("gen").is_some() {
         let gen_ids = i64s(&st, "gen")?;
