@@ -462,6 +462,151 @@ pub mod deepseek41 {
     }
 }
 
+// ---- Kimi K3 ------------------------------------------------------------------------------------
+
+/// Kimi K3 / K3.1 (its `encoding_k3.py`, "XTML"): tags are `<|open|>name attr="value"<|sep|>`
+/// and `<|close|>name<|sep|>`. Tools are declared as compact JSON with sorted keys in a system
+/// message of type `tool-declare`; a reply calls them, after its response, in
+/// `<|open|>tools<|sep|>`: one `call tool="NAME" index="N"` per call holding an `argument
+/// key="K" type="T"` per argument (strings as they are, other values as JSON).
+pub mod kimi {
+    use super::*;
+
+    pub const OPEN: &str = "<|open|>";
+    pub const CLOSE: &str = "<|close|>";
+    pub const SEP: &str = "<|sep|>";
+    pub const END_OF_MSG: &str = "<|end_of_msg|>";
+
+    fn escape_attr(v: &str) -> String {
+        v.replace('&', "&amp;").replace('"', "&quot;")
+    }
+
+    fn unescape_attr(v: &str) -> String {
+        v.replace("&quot;", "\"").replace("&amp;", "&")
+    }
+
+    /// `<|open|>tag k="v" ...<|sep|>`.
+    pub fn open(tag: &str, attrs: &[(&str, &str)]) -> String {
+        let mut s = format!("{OPEN}{tag}");
+        for (k, v) in attrs {
+            s.push_str(&format!(" {k}=\"{}\"", escape_attr(v)));
+        }
+        s.push_str(SEP);
+        s
+    }
+
+    /// `<|close|>tag<|sep|>`.
+    pub fn close(tag: &str) -> String {
+        format!("{CLOSE}{tag}{SEP}")
+    }
+
+    /// A whole message: `open("message", attrs)`, the content, the closing tag and the end token.
+    pub fn message(attrs: &[(&str, &str)], content: &str) -> String {
+        format!("{}{content}{}{END_OF_MSG}", open("message", attrs), close("message"))
+    }
+
+    /// `v` with the keys of every object sorted (the encoder's `deep_sort_dict`).
+    fn sorted(v: &Value) -> Value {
+        match v {
+            Value::Object(o) => {
+                let mut keys: Vec<&String> = o.keys().collect();
+                keys.sort();
+                Value::Object(keys.into_iter().map(|k| (k.clone(), sorted(&o[k]))).collect())
+            }
+            Value::Array(a) => Value::Array(a.iter().map(sorted).collect()),
+            other => other.clone(),
+        }
+    }
+
+    /// The `tool-declare` system message that opens a conversation with tools.
+    pub fn tools_block(tools: &[ToolSpec]) -> String {
+        let list: Vec<Value> = tools
+            .iter()
+            .map(
+                |t| json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": t.parameters } }),
+            )
+            .collect();
+        let body = format!(
+            "# Tools\nHere are the available tools, described in JSONSchema.\n\n```json\n{}\n```",
+            sorted(&Value::Array(list))
+        );
+        message(&[("role", "system"), ("type", "tool-declare")], &body)
+    }
+
+    fn type_of(v: &Value) -> &'static str {
+        match v {
+            Value::Bool(_) => "boolean",
+            Value::Null => "null",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+            Value::Object(_) => "object",
+            Value::Array(_) => "array",
+        }
+    }
+
+    /// The `tools` block of a reply.
+    pub fn calls(calls: &[ToolCall]) -> String {
+        let mut s = open("tools", &[]);
+        for (i, c) in calls.iter().enumerate() {
+            s.push_str(&open("call", &[("tool", &c.name), ("index", &(i + 1).to_string())]));
+            for (k, v) in &c.arguments {
+                s.push_str(&open("argument", &[("key", k), ("type", type_of(v))]));
+                match v {
+                    Value::String(t) => s.push_str(t),
+                    other => s.push_str(&qwen::py_json(other)),
+                }
+                s.push_str(&close("argument"));
+            }
+            s.push_str(&close("call"));
+        }
+        s.push_str(&close("tools"));
+        s
+    }
+
+    /// The value of attribute `key` in the text of an opening tag.
+    fn attr(tag: &str, key: &str) -> Option<String> {
+        let at = tag.find(&format!(" {key}=\""))? + key.len() + 3;
+        Some(unescape_attr(&tag[at..at + tag[at..].find('"')?]))
+    }
+
+    /// The calls of a reply's `tools` block: every `call` with its `argument`s (a `string`
+    /// argument as its text, the others as the JSON they hold, or their text when that does not
+    /// parse), or the object of a `json` block.
+    pub fn parse_calls(raw: &str) -> Vec<ToolCall> {
+        let mut out = Vec::new();
+        let Some((_, block)) = raw.split_once(&open("tools", &[])) else {
+            return out;
+        };
+        let block = block.split(&close("tools")).next().unwrap_or(block);
+        for call in block.split(&format!("{OPEN}call ")).skip(1) {
+            let Some((head, body)) = call.split_once(SEP) else { continue };
+            let Some(name) = attr(&format!(" {head}"), "tool") else { continue };
+            let body = body.split(&close("call")).next().unwrap_or(body);
+            let mut arguments = Map::new();
+            if let Some((_, j)) = body.split_once(&format!("{OPEN}json ")) {
+                let j = j.split_once(SEP).map_or(j, |x| x.1);
+                let j = j.split(&close("json")).next().unwrap_or(j);
+                if let Ok(Value::Object(o)) = serde_json::from_str::<Value>(j) {
+                    arguments = o;
+                }
+            }
+            for arg in body.split(&format!("{OPEN}argument ")).skip(1) {
+                let Some((head, value)) = arg.split_once(SEP) else { continue };
+                let head = format!(" {head}");
+                let Some(key) = attr(&head, "key") else { continue };
+                let value = value.split(&close("argument")).next().unwrap_or(value);
+                let v = match attr(&head, "type").as_deref() {
+                    Some("string") | None => Value::String(value.to_string()),
+                    Some(_) => serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.to_string())),
+                };
+                arguments.insert(key, v);
+            }
+            out.push(ToolCall { name, arguments });
+        }
+        out
+    }
+}
+
 // ---- MiniMax M2 / M3 ----------------------------------------------------------------------------
 
 pub mod minimax {

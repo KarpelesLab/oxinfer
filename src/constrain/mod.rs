@@ -841,6 +841,10 @@ impl Cache {
         if *format == ResponseFormat::Text && *choice == ToolChoice::Auto {
             return Ok(None);
         }
+        // A reply made of tags of several tokens (Kimi K3) has no grammar here.
+        if fmt.tag_tokens().is_some() {
+            bail!("response_format and tool_choice are not supported for this model's chat format");
+        }
         let syntax = fmt.tool_syntax();
         let key = format!(
             "{format:?}|{choice:?}|{syntax:?}|{}",

@@ -315,7 +315,7 @@ impl Engine {
                     if !started {
                         bail!("the conversation must start with a user message (after the system messages)");
                     }
-                    text.push_str(&fmt.assistant_text(&m.content, &m.tool_calls));
+                    text.push_str(&fmt.assistant_text_after(&m.content, &m.tool_calls, think));
                     i += 1;
                 }
                 Role::Tool => {

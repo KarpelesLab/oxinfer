@@ -487,6 +487,19 @@ pub struct TextStream {
     eoc: u32,
     call: Option<u32>,
     thinking: bool,
+    tags: Option<Tags>,
+}
+
+/// The token ids of a format whose blocks are tags of several tokens
+/// ([`crate::chat::TagTokens`]), and the tag being read (whether it opens, its name's tokens).
+struct Tags {
+    open: u32,
+    close: u32,
+    sep: u32,
+    think: Vec<u32>,
+    calls: Vec<u32>,
+    tag: Option<(bool, Vec<u32>)>,
+    called: bool,
 }
 
 impl TextStream {
@@ -494,13 +507,32 @@ impl TextStream {
         let (soc, eoc) = fmt.think_tokens();
         let id = |t: &str| if t.is_empty() { None } else { tok.token_to_id(t) };
         let (soc, eoc) = (id(soc).unwrap_or(u32::MAX), id(eoc).unwrap_or(u32::MAX));
+        let tags = fmt.tag_tokens().and_then(|t| {
+            let name = |s: &str| tok.encode(s, false).ok().map(|e| e.get_ids().to_vec());
+            Some(Tags {
+                open: tok.token_to_id(t.open)?,
+                close: tok.token_to_id(t.close)?,
+                sep: tok.token_to_id(t.sep)?,
+                think: name(t.think)?,
+                calls: name(t.calls)?,
+                tag: None,
+                called: false,
+            })
+        });
         Self {
             printed: 0,
             soc,
             eoc,
             call: id(fmt.tool_call_marker()),
             thinking: fmt.starts_in_thinking(think),
+            tags,
         }
+    }
+
+    /// Whether the reply has opened its tool calls (formats with tags; the others open them
+    /// with one token, [`ChatFormat::tool_call_marker`]).
+    pub fn called(&self) -> bool {
+        self.tags.as_ref().is_some_and(|t| t.called)
     }
 
     /// The token ids that open and close a thinking block (`u32::MAX` if none).
@@ -516,6 +548,22 @@ impl TextStream {
     /// Tracks thinking blocks; call for each new token before [`TextStream::delta`]. Returns
     /// true if the token opened or closed a thinking block.
     pub fn on_token(&mut self, id: u32) -> bool {
+        if let Some(t) = &mut self.tags {
+            if id == t.open || id == t.close {
+                t.tag = Some((id == t.open, Vec::new()));
+            } else if id == t.sep {
+                if let Some((opens, name)) = t.tag.take() {
+                    if name == t.think {
+                        self.thinking = opens;
+                        return true;
+                    }
+                    t.called |= opens && name == t.calls;
+                }
+            } else if let Some((_, name)) = &mut t.tag {
+                name.push(id);
+            }
+            return false;
+        }
         if id == self.soc {
             self.thinking = true;
         } else if id == self.eoc {
@@ -534,7 +582,27 @@ impl TextStream {
             Some(i) => &out[..i],
             None => out,
         };
-        let shown: Vec<u32> = visible.iter().copied().filter(|&t| t != self.soc && t != self.eoc).collect();
+        let shown: Vec<u32> = match &self.tags {
+            // Tags are not text, and nothing is shown from the tag that opens the tool calls.
+            Some(t) => {
+                let (mut shown, mut tag): (Vec<u32>, Option<(bool, Vec<u32>)>) = (Vec::new(), None);
+                for &id in visible {
+                    if id == t.open || id == t.close {
+                        tag = Some((id == t.open, Vec::new()));
+                    } else if id == t.sep && tag.is_some() {
+                        if tag.take().is_some_and(|(opens, name)| opens && name == t.calls) {
+                            break;
+                        }
+                    } else if let Some((_, name)) = &mut tag {
+                        name.push(id);
+                    } else {
+                        shown.push(id);
+                    }
+                }
+                shown
+            }
+            None => visible.iter().copied().filter(|&t| t != self.soc && t != self.eoc).collect(),
+        };
         if let Ok(text) = tok.decode(&shown, true) {
             let stable = if !final_ && text.ends_with('\u{FFFD}') {
                 text.len().saturating_sub(3)

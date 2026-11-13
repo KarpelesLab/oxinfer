@@ -30,6 +30,17 @@ pub fn end_of_model_turn() -> String {
     format!("{EOT}\n")
 }
 
+/// Markup made of tags of several tokens (Kimi K3): an opening or closing token, the tag's name
+/// and attributes as text, a separator token. `think`: the name of the tag around the reasoning;
+/// `calls`: the name of the tag that opens a reply's tool calls.
+pub struct TagTokens {
+    pub open: &'static str,
+    pub close: &'static str,
+    pub sep: &'static str,
+    pub think: &'static str,
+    pub calls: &'static str,
+}
+
 /// Chat formatting for a model family.
 pub trait ChatFormat {
     fn conversation_start(&self, system: Option<&str>, think: bool) -> String;
@@ -77,6 +88,17 @@ pub trait ChatFormat {
     fn assistant_text(&self, content: &str, calls: &[ToolCall]) -> String {
         let _ = calls;
         content.to_string()
+    }
+    /// [`ChatFormat::assistant_text`] for formats whose reply depends on the generation prompt
+    /// before it (`think`: it opened a thinking block).
+    fn assistant_text_after(&self, content: &str, calls: &[ToolCall], think: bool) -> String {
+        let _ = think;
+        self.assistant_text(content, calls)
+    }
+    /// The tags of a format whose blocks are not delimited by single tokens (then
+    /// [`ChatFormat::think_tokens`] and [`ChatFormat::tool_call_marker`] are empty).
+    fn tag_tokens(&self) -> Option<TagTokens> {
+        None
     }
 }
 
@@ -838,6 +860,98 @@ impl ChatFormat for DeepSeek41Chat {
     }
 }
 
+/// Kimi K3 / K3.1 (its `encoding_k3.py`): messages are `<|open|>message role=".."<|sep|>` ...
+/// `<|close|>message<|sep|><|end_of_msg|>`, without a BOS token; a reply is a `think` block (in
+/// thinking mode), a `response` block and, when it calls tools, a `tools` block. Tools are
+/// declared in a first system message, before the system prompt. The encoder's optional system
+/// messages (`thinking_effort`, `tool_choice`, `response_format`) are not written.
+pub struct KimiChat;
+
+impl KimiChat {
+    /// `<|open|>message role="assistant"<|sep|>` and the block a reply starts in.
+    fn generation_prompt(think: bool) -> String {
+        use crate::tools::kimi::open;
+        open("message", &[("role", "assistant")]) + &open(if think { "think" } else { "response" }, &[])
+    }
+}
+
+impl ChatFormat for KimiChat {
+    fn conversation_start(&self, system: Option<&str>, think: bool) -> String {
+        self.conversation_start_tools(system, think, &[])
+    }
+    fn user_turn(&self, content: &str, think: bool) -> String {
+        crate::tools::kimi::message(&[("role", "user")], content) + &Self::generation_prompt(think)
+    }
+    fn end_of_model_turn(&self) -> String {
+        crate::tools::kimi::END_OF_MSG.to_string()
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        crate::tools::kimi::END_OF_MSG
+    }
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        // (Blocks are tags of several tokens: see `tag_tokens`.)
+        ("", "")
+    }
+    fn starts_in_thinking(&self, think: bool) -> bool {
+        think
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, _think: bool, tools: &[ToolSpec]) -> String {
+        let mut s = String::new();
+        if !tools.is_empty() {
+            s.push_str(&crate::tools::kimi::tools_block(tools));
+        }
+        if let Some(sys) = system {
+            s.push_str(&crate::tools::kimi::message(&[("role", "system")], sys));
+        }
+        s
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        ""
+    }
+    fn tag_tokens(&self) -> Option<TagTokens> {
+        Some(TagTokens {
+            open: crate::tools::kimi::OPEN,
+            close: crate::tools::kimi::CLOSE,
+            sep: crate::tools::kimi::SEP,
+            think: "think",
+            calls: "tools",
+        })
+    }
+    fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
+        crate::tools::kimi::parse_calls(raw)
+    }
+    fn tool_results(&self, results: &[ToolResult], think: bool) -> String {
+        let mut s = self.end_of_model_turn();
+        for (i, r) in results.iter().enumerate() {
+            let index = (i + 1).to_string();
+            s.push_str(&crate::tools::kimi::message(
+                &[("role", "tool"), ("tool", &r.name), ("index", &index)],
+                &r.content,
+            ));
+        }
+        s + &Self::generation_prompt(think)
+    }
+    fn assistant_text(&self, content: &str, calls: &[ToolCall]) -> String {
+        self.assistant_text_after(content, calls, false)
+    }
+    fn assistant_text_after(&self, content: &str, calls: &[ToolCall], think: bool) -> String {
+        use crate::tools::kimi::{close, open};
+        let mut s = String::new();
+        // After a generation prompt that opened the think block: it closes (a past reply's
+        // reasoning is not kept), then the response opens.
+        if think {
+            s.push_str(&close("think"));
+            s.push_str(&open("response", &[]));
+        }
+        s.push_str(content);
+        s.push_str(&close("response"));
+        if !calls.is_empty() {
+            s.push_str(&crate::tools::kimi::calls(calls));
+        }
+        s + &close("message")
+    }
+}
+
 /// MiniMax M2 / M2.1 / M2.5 / M2.7 (and M3's text turns): `]~!b[` then `]~b]ROLE\n...[e~[\n` turns;
 /// replies always open a thinking block (`<think>\n` ends the generation prompt); tool results
 /// are a `tool` turn of `<response>` blocks. Without a system prompt the template puts the
@@ -1557,5 +1671,96 @@ mod tests {
             "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hi<|assistant|><think>greet</think>Hello!<|user|>Bye<|assistant|><think>"
         );
         assert_eq!(f.user_turn("Hi", false), "<|user|>Hi<|assistant|><think></think>");
+    }
+
+    /// The renderings of Kimi K3's own encoder (`encoding_k3.py` of the checkpoint,
+    /// `build_chat_segments`): with and without thinking, a system prompt, tools, a past reply,
+    /// rounds of tool calling.
+    #[test]
+    fn kimi_matches_encoder() {
+        let f = KimiChat;
+        assert_eq!(
+            f.first_turn(None, true, &[], "Hi"),
+            "<|open|>message role=\"user\"<|sep|>Hi<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>"
+        );
+        assert_eq!(
+            f.first_turn(None, false, &[], "Hi"),
+            "<|open|>message role=\"user\"<|sep|>Hi<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>"
+        );
+        assert_eq!(
+            f.first_turn(Some("Be brief."), true, &[], "Hi"),
+            "<|open|>message role=\"system\"<|sep|>Be brief.<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Hi<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>"
+        );
+        let tool = ToolSpec {
+            name: "get_weather".into(),
+            description: "Weather in a city (°C)".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}, "days": {"type": "integer", "description": "forecast days"}},
+                "required": ["city"],
+            }),
+        };
+        let tools = std::slice::from_ref(&tool);
+        assert_eq!(
+            f.first_turn(Some("Be brief."), true, tools, "Weather?"),
+            "<|open|>message role=\"system\" type=\"tool-declare\"<|sep|># Tools\nHere are the available tools, described in JSONSchema.\n\n```json\n[{\"function\":{\"description\":\"Weather in a city (°C)\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"description\":\"forecast days\",\"type\":\"integer\"}},\"required\":[\"city\"],\"type\":\"object\"}},\"type\":\"function\"}]\n```<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"system\"<|sep|>Be brief.<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Weather?<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>"
+        );
+        assert_eq!(
+            f.first_turn(None, false, tools, "Weather?"),
+            "<|open|>message role=\"system\" type=\"tool-declare\"<|sep|># Tools\nHere are the available tools, described in JSONSchema.\n\n```json\n[{\"function\":{\"description\":\"Weather in a city (°C)\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"description\":\"forecast days\",\"type\":\"integer\"}},\"required\":[\"city\"],\"type\":\"object\"}},\"type\":\"function\"}]\n```<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Weather?<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>"
+        );
+        // A past reply, after either generation prompt.
+        for (think, want) in [
+            (
+                true,
+                "<|open|>message role=\"user\"<|sep|>Hi<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|><|close|>think<|sep|><|open|>response<|sep|>Hello!<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>And now?<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>",
+            ),
+            (
+                false,
+                "<|open|>message role=\"user\"<|sep|>Hi<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>Hello!<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>And now?<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>",
+            ),
+        ] {
+            let mut s = f.first_turn(None, think, &[], "Hi");
+            s.push_str(&f.assistant_text_after("Hello!", &[], think));
+            s.push_str(&f.end_of_model_turn());
+            s.push_str(&f.user_turn("And now?", think));
+            assert_eq!(s, want);
+        }
+        let call = ToolCall {
+            name: "get_weather".into(),
+            arguments: serde_json::json!({"city": "Paris \"FR\" & co", "days": 3, "opts": {"a": [1, 2.5], "b": null}, "raw": true})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        let result = |content: &str| ToolResult {
+            name: "get_weather".into(),
+            content: content.into(),
+        };
+        let mut s = f.first_turn(None, true, tools, "Weather?");
+        let reply = f.assistant_text_after("Let me check.", std::slice::from_ref(&call), true);
+        assert_eq!(f.parse_tool_calls(&reply), vec![call.clone()]);
+        s.push_str(&reply);
+        s.push_str(&f.tool_results(&[result("22 and sunny")], true));
+        assert_eq!(
+            s,
+            "<|open|>message role=\"system\" type=\"tool-declare\"<|sep|># Tools\nHere are the available tools, described in JSONSchema.\n\n```json\n[{\"function\":{\"description\":\"Weather in a city (°C)\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"description\":\"forecast days\",\"type\":\"integer\"}},\"required\":[\"city\"],\"type\":\"object\"}},\"type\":\"function\"}]\n```<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Weather?<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|><|close|>think<|sep|><|open|>response<|sep|>Let me check.<|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris \"FR\" & co<|close|>argument<|sep|><|open|>argument key=\"days\" type=\"number\"<|sep|>3<|close|>argument<|sep|><|open|>argument key=\"opts\" type=\"object\"<|sep|>{\"a\": [1, 2.5], \"b\": null}<|close|>argument<|sep|><|open|>argument key=\"raw\" type=\"boolean\"<|sep|>true<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"tool\" tool=\"get_weather\" index=\"1\"<|sep|>22 and sunny<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>"
+        );
+        let empty = ToolCall {
+            name: "get_weather".into(),
+            arguments: Default::default(),
+        };
+        let mut s = f.first_turn(None, false, tools, "Weather?");
+        let reply = f.assistant_text_after("", &[call.clone(), empty.clone()], false);
+        assert_eq!(f.parse_tool_calls(&reply), vec![call, empty]);
+        s.push_str(&reply);
+        s.push_str(&f.tool_results(&[result("22 and sunny"), result("no city")], false));
+        s.push_str(&f.assistant_text_after("Sunny.", &[], false));
+        s.push_str(&f.end_of_model_turn());
+        s.push_str(&f.user_turn("Thanks", false));
+        assert_eq!(
+            s,
+            "<|open|>message role=\"system\" type=\"tool-declare\"<|sep|># Tools\nHere are the available tools, described in JSONSchema.\n\n```json\n[{\"function\":{\"description\":\"Weather in a city (°C)\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"description\":\"forecast days\",\"type\":\"integer\"}},\"required\":[\"city\"],\"type\":\"object\"}},\"type\":\"function\"}]\n```<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Weather?<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris \"FR\" & co<|close|>argument<|sep|><|open|>argument key=\"days\" type=\"number\"<|sep|>3<|close|>argument<|sep|><|open|>argument key=\"opts\" type=\"object\"<|sep|>{\"a\": [1, 2.5], \"b\": null}<|close|>argument<|sep|><|open|>argument key=\"raw\" type=\"boolean\"<|sep|>true<|close|>argument<|sep|><|close|>call<|sep|><|open|>call tool=\"get_weather\" index=\"2\"<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"tool\" tool=\"get_weather\" index=\"1\"<|sep|>22 and sunny<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"tool\" tool=\"get_weather\" index=\"2\"<|sep|>no city<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>Sunny.<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Thanks<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>"
+        );
     }
 }
