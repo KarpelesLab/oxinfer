@@ -112,7 +112,13 @@ pub fn type_size(t: u32) -> Option<(usize, usize)> {
         27 => (1, 8),     // I64
         28 => (1, 8),     // F64
         29 => (256, 56),  // IQ1_M
+        34 => (256, 54),  // TQ1_0
+        35 => (256, 66),  // TQ2_0
         39 => (32, 17),   // MXFP4
+        41 => (128, 18),  // Q1_0
+        42 => (64, 18),   // Q2_0
+        142 => (128, 34), // PQ2_0 (PrismML fork)
+        143 => (128, 28), // PTQ1_0 (PrismML fork)
         30 => (1, 2),     // BF16
         _ => return None,
     })
@@ -1374,6 +1380,26 @@ pub fn scalar_metadata(h: &Header) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The header parser sizes every tensor type the kernels decode exactly as they do (a wrong
+    /// size would shift every later tensor).
+    #[test]
+    fn tensor_type_sizes_match_the_kernels() {
+        for kind in crate::ggml::GgmlType::ALL {
+            assert_eq!(type_size(kind.id()), Some((kind.block_size(), kind.type_size())), "{kind}");
+        }
+        // The 1-bit / ternary types: mainline's, and the PrismML fork's 142 / 143.
+        for (id, name) in [
+            (34, "TQ1_0"),
+            (35, "TQ2_0"),
+            (41, "Q1_0"),
+            (42, "Q2_0"),
+            (142, "PQ2_0"),
+            (143, "PTQ1_0"),
+        ] {
+            assert_eq!(crate::ggml::GgmlType::from_id(id).map(|k| k.name()), Some(name));
+        }
+    }
 
     fn put_str(b: &mut Vec<u8>, s: &str) {
         b.extend((s.len() as u64).to_le_bytes());

@@ -420,6 +420,9 @@ mod tests {
                 GgmlType::Q6_K => 208..210,
                 GgmlType::IQ1_M => 48..56,
                 GgmlType::MXFP4 => 0..1,
+                GgmlType::TQ1_0 => 52..54,
+                GgmlType::TQ2_0 => 64..66,
+                GgmlType::PTQ1_0 => 26..28,
                 _ => 0..2,
             };
             b[r.clone()].copy_from_slice(&sane[r]);
@@ -467,7 +470,7 @@ mod tests {
         let n_out = 9usize;
         for kind in GgmlType::ALL.into_iter().filter(|k| !k.is_float()) {
             // Block-of-32 formats get a block count that is not a multiple of 4 or 8.
-            let n_in = if kind.block_size() == QK_K { 3 * QK_K } else { 2 * QK_K + 96 };
+            let n_in = if kind.block_size() != 32 { 3 * QK_K } else { 2 * QK_K + 96 };
             let mut seed = 500 + kind.id() as u64;
             let mut raw = random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed);
             let ext = blocks(kind, &mut seed);

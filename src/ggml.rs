@@ -62,6 +62,10 @@ pub enum GgmlType {
     IQ4_XS = 23,
     IQ1_M = 29,
     BF16 = 30,
+    /// Ternary, base-3 packed (five trits per byte), one f16 scale per 256.
+    TQ1_0 = 34,
+    /// Ternary in 2-bit fields, one f16 scale per 256.
+    TQ2_0 = 35,
     /// OCP microscaling FP4: E2M1 values with one E8M0 power-of-two scale per 32 (DeepSeek V4's
     /// experts).
     MXFP4 = 39,
@@ -73,10 +77,19 @@ pub enum GgmlType {
     /// global scale as a whole-matrix [`BlockScales`]. Runs through the f32 path; GGUF files of
     /// this type (whose global scales are sidecar tensors) are not read.
     NVFP4 = 40,
+    /// One bit per weight (`+d` / `-d`), one f16 scale per 128 (the 1-bit Bonsai models).
+    Q1_0 = 41,
+    /// 2-bit codes `-1, 0, 1, 2` times one f16 scale per 64 (ternary checkpoints in mainline
+    /// llama.cpp: Ternary-Bonsai, the expert tensors of some GSQ-RCO files).
+    Q2_0 = 42,
+    /// PrismML's llama.cpp fork: [`GgmlType::Q2_0`]'s codes with one scale per 128.
+    PQ2_0 = 142,
+    /// PrismML's llama.cpp fork: [`GgmlType::TQ1_0`]'s base-3 packing with one scale per 128.
+    PTQ1_0 = 143,
 }
 
 impl GgmlType {
-    pub const ALL: [GgmlType; 23] = [
+    pub const ALL: [GgmlType; 29] = [
         GgmlType::F32,
         GgmlType::F16,
         GgmlType::Q4_0,
@@ -100,6 +113,12 @@ impl GgmlType {
         GgmlType::IQ1_M,
         GgmlType::BF16,
         GgmlType::MXFP4,
+        GgmlType::TQ1_0,
+        GgmlType::TQ2_0,
+        GgmlType::Q1_0,
+        GgmlType::Q2_0,
+        GgmlType::PQ2_0,
+        GgmlType::PTQ1_0,
     ];
 
     /// The type with GGUF id `id`, if supported.
@@ -137,6 +156,12 @@ impl GgmlType {
             MXFP4 => "MXFP4",
             F8E4M3 => "F8_E4M3",
             NVFP4 => "NVFP4",
+            TQ1_0 => "TQ1_0",
+            TQ2_0 => "TQ2_0",
+            Q1_0 => "Q1_0",
+            Q2_0 => "Q2_0",
+            PQ2_0 => "PQ2_0",
+            PTQ1_0 => "PTQ1_0",
         }
     }
     /// Elements per block.
@@ -145,7 +170,8 @@ impl GgmlType {
         match self {
             F32 | F16 | BF16 | F8E4M3 => 1,
             Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | IQ4_NL | MXFP4 => 32,
-            NVFP4 => 64,
+            NVFP4 | Q2_0 => 64,
+            Q1_0 | PQ2_0 | PTQ1_0 => 128,
             _ => QK_K,
         }
     }
@@ -177,6 +203,11 @@ impl GgmlType {
             IQ1_M => 56,
             MXFP4 => 17,
             NVFP4 => 36,
+            TQ1_0 => 54,
+            TQ2_0 => 66,
+            Q1_0 | Q2_0 => 18,
+            PQ2_0 => 34,
+            PTQ1_0 => 28,
         }
     }
     /// Runs through the f32 path (dequantized rows) rather than int8 dot products: plain float
@@ -441,6 +472,86 @@ fn grid4(g: u32, j: usize) -> u8 {
 fn iq4xs_scale(b: &[u8], ib: usize) -> i32 {
     let sh = u16at(b, 2);
     (((b[4 + ib / 2] >> (4 * (ib % 2))) & 0xF) as i32 | ((((sh >> (2 * ib)) & 3) as i32) << 4)) - 32
+}
+
+/// The five base-3 digits (0, 1, 2; least significant last) of a TQ1_0 byte: digit `n` is
+/// `((b * 3^n mod 256) * 3) >> 8`, ggml's fixed-point reading of `b / 256` as a base-3 fraction.
+const TRITS: [[i8; 5]; 256] = {
+    let mut t = [[0i8; 5]; 256];
+    let mut b = 0;
+    while b < 256 {
+        let (mut n, mut p) = (0, 1u32);
+        while n < 5 {
+            let q = (b as u32 * p) & 0xFF;
+            t[b][n] = ((q * 3) >> 8) as i8 - 1;
+            p *= 3;
+            n += 1;
+        }
+        b += 1;
+    }
+    t
+};
+
+/// One block of a 1-bit / ternary format as int8 values (`kind.block_size()` of them, in `-1..=2`)
+/// and the block's scale: element `i` is `q[i] * scale`.
+///
+/// TQ1_0 and PTQ1_0 store five trits per byte, in runs of bytes whose digits are laid out
+/// digit-major (digit `n` of byte `m` of a run of `c` bytes is element `n * c + m`): runs of 32
+/// and 16 bytes for TQ1_0's 48, of 16 and 8 for PTQ1_0's 24; the remaining 16 (8) elements are
+/// four trits per byte of `qh`, digit-major as well.
+fn low_bit_i8(kind: GgmlType, b: &[u8], q: &mut [i8]) -> f32 {
+    use GgmlType::*;
+    let two_bit = |qs: &[u8], q: &mut [i8]| {
+        for (j, v) in q.iter_mut().enumerate() {
+            *v = ((qs[j / 4] >> (2 * (j % 4))) & 3) as i8 - 1;
+        }
+    };
+    let trits = |qs: &[u8], runs: &[usize], qh: &[u8], q: &mut [i8]| {
+        let (mut at, mut o) = (0, 0);
+        for &c in runs {
+            for n in 0..5 {
+                for m in 0..c {
+                    q[o + n * c + m] = TRITS[qs[at + m] as usize][n];
+                }
+            }
+            at += c;
+            o += 5 * c;
+        }
+        for n in 0..4 {
+            for (h, &v) in qh.iter().enumerate() {
+                q[o + n * qh.len() + h] = TRITS[v as usize][n];
+            }
+        }
+    };
+    match kind {
+        Q1_0 => {
+            for (j, v) in q.iter_mut().enumerate() {
+                *v = if b[2 + j / 8] >> (j % 8) & 1 != 0 { 1 } else { -1 };
+            }
+            f16at(b, 0)
+        }
+        Q2_0 | PQ2_0 => {
+            two_bit(&b[2..], q);
+            f16at(b, 0)
+        }
+        TQ2_0 => {
+            // Two runs of 32 bytes, field-major: field `l` of byte `m` is element `32 * l + m`.
+            for (j, v) in q.iter_mut().enumerate() {
+                let (run, l, m) = (j / 128, (j % 128) / 32, j % 32);
+                *v = ((b[32 * run + m] >> (2 * l)) & 3) as i8 - 1;
+            }
+            f16at(b, 64)
+        }
+        TQ1_0 => {
+            trits(&b[..48], &[32, 16], &b[48..52], q);
+            f16at(b, 52)
+        }
+        PTQ1_0 => {
+            trits(&b[..24], &[16, 8], &b[24..26], q);
+            f16at(b, 26)
+        }
+        _ => unreachable!("{kind} is not a low-bit type"),
+    }
 }
 
 /// Dequantizes one row (`out.len()` elements) of `kind` from its raw bytes.
@@ -734,6 +845,13 @@ pub fn dequantize_row(kind: GgmlType, src: &[u8], out: &mut [f32]) {
                 for j in 0..16 {
                     y[j] = d * KVALUES_MXFP4[(b[1 + j] & 0xF) as usize] as f32;
                     y[j + 16] = d * KVALUES_MXFP4[(b[1 + j] >> 4) as usize] as f32;
+                }
+            }
+            TQ1_0 | TQ2_0 | Q1_0 | Q2_0 | PQ2_0 | PTQ1_0 => {
+                let mut q = [0i8; QK_K];
+                let d = low_bit_i8(kind, b, &mut q[..y.len()]);
+                for (o, &v) in y.iter_mut().zip(&q) {
+                    *o = v as f32 * d;
                 }
             }
             NVFP4 => {
@@ -1030,6 +1148,11 @@ pub fn decode_i8(kind: GgmlType, b: &[u8], q: &mut [i8], s: &mut [f32], m: &mut 
             }
             false
         }
+        TQ1_0 | TQ2_0 | Q1_0 | Q2_0 | PQ2_0 | PTQ1_0 => {
+            let d = low_bit_i8(kind, b, q);
+            s.fill(d);
+            false
+        }
         F32 | F16 | BF16 | F8E4M3 | NVFP4 => unreachable!("decode_i8 on f32-path type {kind}"),
     }
 }
@@ -1271,6 +1394,9 @@ pub fn random_blocks(kind: GgmlType, nb: usize, seed: &mut u64) -> Vec<u8> {
                     b[i..i + 2].copy_from_slice(&s.to_le_bytes());
                 }
             }
+            TQ1_0 => put_f16(b, 52, rnd(seed, true)),
+            TQ2_0 => put_f16(b, 64, rnd(seed, true)),
+            PTQ1_0 => put_f16(b, 26, rnd(seed, true)),
             // Scales 2^-10 .. 2^-4 (the doubled values reach 12).
             MXFP4 => b[0] = 118 + (lcg(seed) % 7) as u8,
             _ => put_f16(b, 0, rnd(seed, true)),
@@ -1303,7 +1429,9 @@ mod tests {
     }
 
     /// FNV-1a hashes of the f32 bits of gguf-py's `gguf.quants.dequantize` on `fixture(kind)`
-    /// (computed with `OXINFER_GGML_DUMP=dir` + tools/ggml_ref.py).
+    /// (computed with `OXINFER_GGML_DUMP=dir` + tools/ggml_ref.py). The 1-bit and ternary types
+    /// are checked against ggml's C `dequantize_row_*` instead (PQ2_0 and PTQ1_0: the ones of
+    /// PrismML's llama.cpp fork, release prism-b12128), see tools/ggml_ref_lowbit.c.
     const REF_HASHES: &[(GgmlType, u64)] = &[
         (GgmlType::BF16, 0x767e77c423088e31),
         (GgmlType::F16, 0xd03c69ee7934955f),
@@ -1328,6 +1456,12 @@ mod tests {
         (GgmlType::Q5_K, 0x4be2f59b66cc7042),
         (GgmlType::Q6_K, 0x20a51cc0feaae638),
         (GgmlType::Q8_0, 0x3199be3deddf5c1a),
+        (GgmlType::TQ1_0, 0xf3a5080e0f9a82a1),
+        (GgmlType::TQ2_0, 0x75f402a30558e65e),
+        (GgmlType::Q1_0, 0xd6bb5e18c2c2c8a5),
+        (GgmlType::Q2_0, 0x6306138cf9ed98b0),
+        (GgmlType::PQ2_0, 0xe1640de0c53de3a7),
+        (GgmlType::PTQ1_0, 0xdb481563547c344a),
     ];
 
     #[test]
@@ -1540,7 +1674,7 @@ mod tests {
         let mm = crate::kernels::cpu_has_i8mm();
         for kind in GgmlType::ALL.into_iter().filter(|k| neon::multi_kind(*k, 2).is_some()) {
             // Block-of-32 formats get a block count that is not a multiple of 4 (tail loops).
-            let n_in = if kind.block_size() == QK_K { 3 * QK_K } else { 3 * QK_K + 96 };
+            let n_in = if kind.block_size() != 32 { 3 * QK_K } else { 3 * QK_K + 96 };
             let mut seed = 31 + kind.id() as u64;
             let m = GgufMatrix::from_bytes(kind, &random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed), n_out, n_in).unwrap();
             for t in 2..=crate::ggml::neon::MULTI_MAX {
@@ -1576,7 +1710,7 @@ mod tests {
         crate::pool::init(3);
         let n_out = 37usize;
         for kind in GgmlType::ALL.into_iter().filter(|k| !k.is_float()) {
-            let n_in = if kind.block_size() == QK_K { 3 * QK_K } else { 3 * QK_K + 96 };
+            let n_in = if kind.block_size() != 32 { 3 * QK_K } else { 3 * QK_K + 96 };
             let mut seed = 13 + kind.id() as u64;
             let m = GgufMatrix::from_bytes(kind, &random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed), n_out, n_in).unwrap();
             let run = |x: &[f32], t: usize| {
@@ -1622,7 +1756,7 @@ mod tests {
         let n_out = 21usize;
         for kind in GgmlType::ALL {
             // Block-of-32 formats get a block count that is not a multiple of 4 (tail loops).
-            let n_in = if kind.block_size() == QK_K { 3 * QK_K } else { 3 * QK_K + 96 };
+            let n_in = if kind.block_size() != 32 { 3 * QK_K } else { 3 * QK_K + 96 };
             let mut seed = 77 + kind.id() as u64;
             let raw = random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed);
             let m = GgufMatrix::from_bytes(kind, &raw, n_out, n_in).unwrap();
