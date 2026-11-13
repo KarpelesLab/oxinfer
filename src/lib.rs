@@ -53,6 +53,8 @@ pub mod intervene;
 pub mod janus;
 pub mod kernels;
 pub mod kimi;
+pub mod longcat;
+pub mod longcat_chat;
 pub mod lookup;
 pub mod lora;
 #[cfg(feature = "media")]

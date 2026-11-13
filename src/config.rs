@@ -424,6 +424,8 @@ pub fn model_type(dir: &Path) -> Result<String> {
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
         })
+        // LongCat-2.0 and the LongCat-Flash releases have no `model_type`: by architecture.
+        .or_else(|| crate::longcat::arch_model_type(&raw).map(str::to_string))
         .context("config.json has no model_type")
 }
 
