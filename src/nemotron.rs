@@ -1159,6 +1159,33 @@ impl crate::intervene::Host for NemotronModel<'_> {
     }
 }
 
+/// What the command line's text loop needs of a model. The Mamba state cannot go back to an
+/// earlier position, so no draft is offered (`truncate` then panics).
+impl crate::dspark::Target for NemotronModel<'_> {
+    fn forward_feats(
+        &self,
+        sess: &mut NemotronSession,
+        tokens: &[u32],
+        mm: &[(usize, &[f32])],
+        layers: &[usize],
+        feats: &mut Vec<f32>,
+    ) -> Vec<f32> {
+        self.forward_capture(sess, tokens, mm, layers, feats)
+    }
+    fn embed_row(&self, token: u32, out: &mut [f32]) {
+        NemotronModel::embed_row(self, token, out)
+    }
+    fn head_raw(&self, hidden: &[f32], t: usize) -> Vec<f32> {
+        self.logits(hidden, t)
+    }
+    fn vocab_size(&self) -> usize {
+        self.cfg.vocab_size
+    }
+    fn truncate(&self, sess: &mut NemotronSession, len: usize) {
+        assert!(len >= sess.pos, "Nemotron-H: the Mamba state cannot go back to an earlier position");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

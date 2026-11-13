@@ -1138,6 +1138,89 @@ pub mod glm {
     }
 }
 
+// ---- Nemotron 3.5 -------------------------------------------------------------------------------
+
+/// Nemotron 3.5: XML declarations inside `<tools>` in the system turn; calls and results as
+/// Qwen 3.5 writes them (`<tool_call><function=NAME><parameter=K>...`, `<tool_response>`).
+pub mod nemotron {
+    use super::*;
+
+    /// A value as the template's `| string` writes it: text as is, the rest as Python prints it.
+    fn py_str(v: &Value) -> String {
+        match v {
+            Value::String(s) => s.clone(),
+            Value::Bool(b) => if *b { "True" } else { "False" }.to_string(),
+            Value::Null => "None".to_string(),
+            other => qwen::py_json(other),
+        }
+    }
+
+    /// An argument or an extra key: objects and arrays as JSON, the rest as `| string`.
+    fn text(v: &Value) -> String {
+        if v.is_object() || v.is_array() {
+            qwen::py_json(v)
+        } else {
+            py_str(v)
+        }
+    }
+
+    /// The template's `render_extra_keys`: every key of `o` not in `handled`, as an element.
+    fn extra_keys(o: &Value, handled: &[&str], s: &mut String) {
+        let Some(o) = o.as_object() else { return };
+        for (k, v) in o.iter().filter(|(k, _)| !handled.contains(&k.as_str())) {
+            s.push_str(&format!("\n<{k}>{}</{k}>", text(v)));
+        }
+    }
+
+    /// The block the template adds to the system turn when tools are given.
+    pub fn tools_block(tools: &[ToolSpec]) -> String {
+        let mut s = String::from("# Tools\n\nYou have access to the following functions:\n\n<tools>");
+        for t in tools {
+            s.push_str(&format!("\n<function>\n<name>{}</name>", t.name));
+            if !t.description.is_empty() {
+                s.push_str(&format!("\n<description>{}</description>", t.description.trim()));
+            }
+            s.push_str("\n<parameters>");
+            if let Some(props) = t.parameters.get("properties").and_then(Value::as_object) {
+                for (name, f) in props {
+                    s.push_str(&format!("\n<parameter>\n<name>{name}</name>"));
+                    if let Some(ty) = f.get("type") {
+                        s.push_str(&format!("\n<type>{}</type>", py_str(ty)));
+                    }
+                    if let Some(d) = f.get("description") {
+                        s.push_str(&format!("\n<description>{}</description>", py_str(d).trim()));
+                    }
+                    if let Some(e) = f.get("enum") {
+                        s.push_str(&format!("\n<enum>{}</enum>", qwen::py_json(e)));
+                    }
+                    extra_keys(f, &["name", "type", "description", "enum"], &mut s);
+                    s.push_str("\n</parameter>");
+                }
+            }
+            extra_keys(&t.parameters, &["type", "properties", "required"], &mut s);
+            if let Some(r) = t.parameters.get("required") {
+                s.push_str(&format!("\n<required>{}</required>", qwen::py_json(r)));
+            }
+            s.push_str("\n</parameters>\n</function>");
+        }
+        s.push_str("\n</tools>");
+        s.push_str(
+            "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>",
+        );
+        s
+    }
+
+    /// A call as the template renders it in a past reply, with its closing newline.
+    pub fn call(c: &ToolCall) -> String {
+        let mut s = format!("<tool_call>\n<function={}>\n", c.name);
+        for (k, v) in &c.arguments {
+            s.push_str(&format!("<parameter={k}>\n{}\n</parameter>\n", text(v)));
+        }
+        s.push_str("</function>\n</tool_call>\n");
+        s
+    }
+}
+
 // ---- built-in tools (command line) --------------------------------------------------------------
 
 /// Local wall-clock time: (`YYYY-MM-DD HH:MM:SS`, weekday, UTC offset in seconds, zone name).

@@ -60,6 +60,7 @@ use crate::glm5::{Glm5Model, Glm5Session};
 use crate::kimi::{KimiModel, KimiSession};
 use crate::mistral4::{Mistral4Model, Mistral4Session};
 use crate::model::{Model, Quant, Session};
+use crate::nemotron::{NemotronModel, NemotronSession};
 use crate::platform::DevicePref;
 use crate::qwen::{QwenModel, QwenSession};
 use crate::qwen_mtp::{MtpDecoder, MtpOptions, QwenMtp};
@@ -906,6 +907,8 @@ pub enum Family {
     Glm5,
     /// Kimi K3 / K3.1 (`kimi_k3`, `kimi_k31`).
     Kimi,
+    /// Nemotron-H (`nemotron_h`), and the language model of a NeMo speech LM (`nemo_speechlm`).
+    Nemotron,
 }
 
 /// Speculative decoding in use.
@@ -1035,6 +1038,10 @@ enum Lm {
         model: &'static Glm5Model<'static>,
         sess: Glm5Session,
     },
+    Nemotron {
+        model: &'static NemotronModel<'static>,
+        sess: NemotronSession,
+    },
     QwenDspark {
         dec: Box<DsparkDecoder<'static, QwenModel<'static>>>,
     },
@@ -1141,6 +1148,7 @@ impl Lm {
             Lm::DeepSeek4 { sess, .. } => sess.pos,
             Lm::Glm5 { sess, .. } => sess.pos,
             Lm::Kimi { sess, .. } => sess.pos,
+            Lm::Nemotron { sess, .. } => sess.pos,
             Lm::DeepSeek4Dspark { dec } => dec.sess.pos,
             Lm::QwenDspark { dec } => dec.sess.pos,
             Lm::GemmaDspark { dec } => dec.sess.pos,
@@ -1168,6 +1176,7 @@ impl Lm {
             Lm::DeepSeek4 { model, sess } => *sess = model.new_session(),
             Lm::Glm5 { model, sess } => *sess = model.new_session(),
             Lm::Kimi { model, sess } => *sess = model.new_session(),
+            Lm::Nemotron { model, sess } => *sess = model.new_session(),
             Lm::DeepSeek4Dspark { dec } => {
                 let opts = dec.opts.clone();
                 let lk = reset_lookup(dec.lookup.take());
@@ -1372,6 +1381,7 @@ impl Engine {
             "deepseek_v4" | "deepseek_v41" | "ernie5_5_moe" => Family::DeepSeek4,
             m if crate::glm5::is_model_type(m) => Family::Glm5,
             "kimi_k3" | "kimi_k31" => Family::Kimi,
+            m if crate::nemotron::is_model_type(m) => Family::Nemotron,
             other => bail!("unsupported model_type {other}"),
         };
         if family == Family::Llama && !chat::Llama3Chat::matches_model(&dir) {
@@ -1781,6 +1791,36 @@ impl Engine {
                     &chat::GlmChat as &'static (dyn ChatFormat + Sync),
                     model.quant,
                     c.num_hidden_layers,
+                    c.hidden_size,
+                    c.vocab_size,
+                    model.streamed_bytes(),
+                )
+            }
+            Family::Nemotron => {
+                if decision_dir.is_some() {
+                    bail!("decisions (decision_from) are not supported for Nemotron-H");
+                }
+                if opts.draft.as_deref().is_some_and(|d| d != "none") || mtp {
+                    bail!("speculative decoding is not supported for Nemotron-H");
+                }
+                if stream.is_some() {
+                    bail!("weight streaming is not supported for Nemotron-H");
+                }
+                decision = None;
+                let model = arena.keep(NemotronModel::load(
+                    crate::nemotron::NemotronConfig::load(&dir)?,
+                    files,
+                    opts.quant,
+                )?);
+                let c = &model.cfg;
+                (
+                    Lm::Nemotron {
+                        model,
+                        sess: model.new_session(),
+                    },
+                    &chat::NemotronChat as &'static (dyn ChatFormat + Sync),
+                    model.quant,
+                    c.num_hidden_layers(),
                     c.hidden_size,
                     c.vocab_size,
                     model.streamed_bytes(),
@@ -2312,6 +2352,7 @@ impl Engine {
             Lm::DeepSeek4 { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::Glm5 { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::Kimi { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
+            Lm::Nemotron { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::DeepSeek4Dspark { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("activation capture is not supported for Core ML models"),
@@ -2346,6 +2387,7 @@ impl Engine {
             Lm::DeepSeek4 { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::Glm5 { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::Kimi { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
+            Lm::Nemotron { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::DeepSeek4Dspark { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
@@ -2371,6 +2413,7 @@ impl Engine {
             Lm::DeepSeek4 { model, .. } => *model,
             Lm::Glm5 { model, .. } => *model,
             Lm::Kimi { model, .. } => *model,
+            Lm::Nemotron { model, .. } => *model,
             Lm::DeepSeek4Dspark { dec } => dec.model(),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
@@ -2391,6 +2434,7 @@ impl Engine {
             Lm::DeepSeek4 { sess, .. } => &mut sess.iv,
             Lm::Glm5 { sess, .. } => &mut sess.iv,
             Lm::Kimi { sess, .. } => &mut sess.iv,
+            Lm::Nemotron { sess, .. } => &mut sess.iv,
             Lm::DeepSeek4Dspark { dec } => &mut dec.sess.iv,
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => return,
@@ -2629,6 +2673,7 @@ impl Engine {
                 Lm::DeepSeek4 { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
                 Lm::Glm5 { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
                 Lm::Kimi { .. } => bail!("decisions are not supported for Kimi K3"),
+                Lm::Nemotron { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
                 Lm::DeepSeek4Dspark { dec } => run(dec.model(), &ids, &feats, chunk, need_logits)?,
                 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
                 Lm::CoreMl(_) => bail!("decisions are not supported for Core ML models"),
@@ -3037,6 +3082,18 @@ impl PendingTurn {
             }
             // No prompt-lookup rounds: the recurrent layers cannot roll a rejected draft back.
             Lm::Glm5 { model, sess } => {
+                let hs = generate::prefill(*model, sess, &ids, chunk, &overrides);
+                let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
+                st.prefill_secs = t0.elapsed().as_secs_f64();
+                let max = limit(sess.pos);
+                if max == 0 {
+                    empty(0.0)
+                } else {
+                    generate::decode(*model, sess, logits, sampler, stop, max, &mut cb)
+                }
+            }
+            // As GLM-5.3-Flash: the Mamba state cannot roll a rejected draft back.
+            Lm::Nemotron { model, sess } => {
                 let hs = generate::prefill(*model, sess, &ids, chunk, &overrides);
                 let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
                 st.prefill_secs = t0.elapsed().as_secs_f64();

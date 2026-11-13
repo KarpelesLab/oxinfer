@@ -1588,6 +1588,7 @@ fn run(mut args: Args) -> Result<()> {
         "deepseek_v4" | "deepseek_v41" | "ernie5_5_moe" => run_deepseek4(args),
         m if oxinfer::glm5::is_model_type(m) => run_glm5(args),
         "kimi_k3" | "kimi_k31" => run_kimi(args),
+        m if oxinfer::nemotron::is_model_type(m) => run_nemotron(args),
         other => bail!("unsupported model_type {other}"),
     }
 }
@@ -2588,6 +2589,48 @@ fn run_glm5(mut args: Args) -> Result<()> {
     model.set_stream(None);
     drop(streamer);
     r
+}
+
+/// Nemotron-H (`nemotron_h`), and the language model of a NeMo speech LM as a text model (see
+/// `oxinfer::nemotron`; `--transcribe` runs its audio side).
+fn run_nemotron(args: Args) -> Result<()> {
+    let t0 = Instant::now();
+    if args.mtp || args.draft.is_some() {
+        bail!("Nemotron-H: speculative decoding (--mtp, --draft) is not supported");
+    }
+    if args.stream {
+        bail!("Nemotron-H: weight streaming (--stream) is not supported");
+    }
+    let cfg = oxinfer::nemotron::NemotronConfig::load(&args.model)?;
+    let eos = config::load_eos_ids(&args.model);
+    let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
+    let model = oxinfer::nemotron::NemotronModel::load(cfg, &files, args.quant)?;
+    let tok = load_tokenizer(&args.model)?;
+    let fmt: &dyn ChatFormat = &chat::NemotronChat;
+    let eos = chat::with_turn_end(fmt, &tok, eos);
+    let c = &model.cfg;
+    eprintln!(
+        "[loaded Nemotron-H: {} blocks ({}), hidden {}, {:.1} GB checkpoint ({}), {} weights, {} threads, {:.2}s]",
+        c.num_hidden_layers(),
+        c.describe(),
+        c.hidden_size,
+        files.total_bytes() as f64 / 1e9,
+        if args.mmap { "mmap" } else { "in RAM" },
+        if files.metadata("format") == Some("gguf") {
+            "GGUF".to_string()
+        } else {
+            format!("{:?}", model.quant)
+        },
+        pool::threads(),
+        t0.elapsed().as_secs_f64()
+    );
+    if let Some(out) = &args.save_quantized {
+        return save_quantized(&args.model, out, &files, model.quant);
+    }
+    if !mm_request(&args).is_empty() {
+        bail!("Nemotron-H: attachments are not supported in a chat (a speech model transcribes audio with --transcribe FILE)");
+    }
+    run_text(&args, &model, &tok, &eos, fmt, Default::default())
 }
 
 /// The DSpark draft of a Qwen or Gemma 4 model: the one given, `auto` for the one beside the

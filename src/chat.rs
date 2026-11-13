@@ -1376,6 +1376,92 @@ impl ChatFormat for GlmChat {
     }
 }
 
+/// Nemotron 3.5 (the `chat_template.jinja` of NVIDIA-Nemotron-3.5-Lightning and of Nemotron 3.5
+/// Transcribe): ChatML turns. The template always writes a system turn, empty when there is no
+/// system prompt and no tools; the tools are declared in it as XML, after the prompt. The reply
+/// opens with `<think>`, closed at once without thinking; calls and results are Qwen 3.5's.
+pub struct NemotronChat;
+
+impl NemotronChat {
+    fn assistant(think: bool) -> &'static str {
+        if think {
+            "<|im_start|>assistant\n<think>\n"
+        } else {
+            "<|im_start|>assistant\n<think></think>"
+        }
+    }
+}
+
+impl ChatFormat for NemotronChat {
+    fn conversation_start(&self, system: Option<&str>, think: bool) -> String {
+        self.conversation_start_tools(system, think, &[])
+    }
+    fn user_turn(&self, content: &str, think: bool) -> String {
+        format!("<|im_start|>user\n{content}<|im_end|>\n{}", Self::assistant(think))
+    }
+    fn end_of_model_turn(&self) -> String {
+        "<|im_end|>\n".to_string()
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        "<|im_end|>"
+    }
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        ("<think>", "</think>")
+    }
+    fn starts_in_thinking(&self, think: bool) -> bool {
+        think
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, _think: bool, tools: &[ToolSpec]) -> String {
+        let sys = system.unwrap_or("");
+        let mut s = format!("<|im_start|>system\n{sys}");
+        if !tools.is_empty() {
+            if !sys.is_empty() {
+                s.push_str("\n\n");
+            }
+            s.push_str(&crate::tools::nemotron::tools_block(tools));
+        }
+        s.push_str("<|im_end|>\n");
+        s
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        "<tool_call>"
+    }
+    fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
+        crate::tools::qwen::parse_calls(raw)
+    }
+    fn parse_tool_calls_for(&self, raw: &str, tools: &[ToolSpec]) -> Vec<ToolCall> {
+        crate::tools::qwen::parse_calls_for(raw, tools)
+    }
+    fn tool_syntax(&self) -> Option<crate::constrain::ToolSyntax> {
+        Some(crate::constrain::ToolSyntax::QwenXml)
+    }
+    fn tool_results(&self, results: &[ToolResult], think: bool) -> String {
+        // The assistant turn ended (<|im_end|> was sampled, not fed); results come as a user turn.
+        let mut s = String::from("<|im_end|>\n<|im_start|>user\n");
+        for r in results {
+            s.push_str("<tool_response>\n");
+            s.push_str(&r.content);
+            s.push_str("\n</tool_response>\n");
+        }
+        s.push_str("<|im_end|>\n");
+        s.push_str(Self::assistant(think));
+        s
+    }
+    fn assistant_text(&self, content: &str, calls: &[ToolCall]) -> String {
+        if calls.is_empty() {
+            return content.trim().to_string();
+        }
+        // The template's layout: the text (after the closed `<think>` block) and a newline, then
+        // each call and a newline.
+        let mut s = content.trim().to_string();
+        s.push('\n');
+        for c in calls {
+            s.push_str(&crate::tools::nemotron::call(c));
+        }
+        s
+    }
+}
+
 /// `eos` plus the chat format's end-of-turn token, looked up in the tokenizer.
 pub fn with_turn_end(fmt: &dyn ChatFormat, tok: &crate::tokenizer::Tokenizer, mut eos: Vec<u32>) -> Vec<u32> {
     if let Some(id) = tok.token_to_id(fmt.end_of_turn_token())
@@ -1434,6 +1520,83 @@ mod tests {
             "[e~[\n]~b]tool\n<response>12:00</response>[e~[\n]~b]ai\n<think>\n"
         );
         assert_eq!(f.assistant_text("need tool\n</think>\n\n", &calls), reply);
+    }
+
+    /// The renderings of Nemotron 3.5's chat template (transformers' apply_chat_template on
+    /// NVIDIA-Nemotron-3.5-Lightning's and Nemotron 3.5 Transcribe's, which agree).
+    #[test]
+    fn nemotron_matches_template() {
+        let f = NemotronChat;
+        assert_eq!(
+            f.first_turn(None, true, &[], "Hi"),
+            "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+        assert_eq!(
+            f.first_turn(Some("Be brief."), false, &[], " Hi "),
+            "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\n Hi <|im_end|>\n<|im_start|>assistant\n<think></think>"
+        );
+        let tool = ToolSpec {
+            name: "get_time".into(),
+            description: " Current time ".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tz": {"type": "string", "description": "Zone", "enum": ["UTC", "JST"]},
+                    "n": {"type": "integer", "minimum": 1},
+                },
+                "required": ["tz"],
+                "additionalProperties": false,
+            }),
+        };
+        let tools = "# Tools\n\nYou have access to the following functions:\n\n<tools>\n<function>\n<name>get_time</name>\n<description>Current time</description>\n<parameters>\n<parameter>\n<name>tz</name>\n<type>string</type>\n<description>Zone</description>\n<enum>[\"UTC\", \"JST\"]</enum>\n</parameter>\n<parameter>\n<name>n</name>\n<type>integer</type>\n<minimum>1</minimum>\n</parameter>\n<additionalProperties>False</additionalProperties>\n<required>[\"tz\"]</required>\n</parameters>\n</function>\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>";
+        assert_eq!(
+            f.first_turn(None, false, std::slice::from_ref(&tool), "Time?"),
+            format!("<|im_start|>system\n{tools}<|im_end|>\n<|im_start|>user\nTime?<|im_end|>\n<|im_start|>assistant\n<think></think>")
+        );
+        assert_eq!(
+            f.first_turn(Some("Be brief."), true, std::slice::from_ref(&tool), "Time?"),
+            format!(
+                "<|im_start|>system\nBe brief.\n\n{tools}<|im_end|>\n<|im_start|>user\nTime?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+            )
+        );
+        // A reply with a call as the template renders it in the history, its parse, the results
+        // turn and the next turns.
+        let reply = "Let me check.\n<tool_call>\n<function=get_time>\n<parameter=tz>\nUTC\n</parameter>\n<parameter=n>\n3\n</parameter>\n<parameter=o>\n{\"a\": [1, 2]}\n</parameter>\n</function>\n</tool_call>\n";
+        let calls = f.parse_tool_calls_for(reply, std::slice::from_ref(&tool));
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_time");
+        assert_eq!(calls[0].arguments["tz"], "UTC");
+        assert_eq!(calls[0].arguments["n"], 3);
+        assert_eq!(calls[0].arguments["o"], serde_json::json!({"a": [1, 2]}));
+        assert_eq!(f.assistant_text("Let me check.", &calls), reply);
+        assert_eq!(
+            f.assistant_text("", &calls[..1]).lines().next(),
+            Some(""),
+            "a reply of calls alone starts on a new line"
+        );
+        let results = [
+            ToolResult {
+                name: "get_time".into(),
+                content: "12:00".into(),
+            },
+            ToolResult {
+                name: "get_time".into(),
+                content: "13:00".into(),
+            },
+        ];
+        assert_eq!(
+            f.tool_results(&results, false),
+            "<|im_end|>\n<|im_start|>user\n<tool_response>\n12:00\n</tool_response>\n<tool_response>\n13:00\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n<think></think>"
+        );
+        assert_eq!(
+            format!(
+                "{}{}{}",
+                f.assistant_text(" Noon. ", &[]),
+                f.end_of_model_turn(),
+                f.user_turn("Thanks", false)
+            ),
+            "Noon.<|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think></think>"
+        );
     }
 
     /// MiniMax-M3.1-Flash's template, as transformers renders it (adaptive thinking).
