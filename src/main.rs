@@ -27,6 +27,8 @@ mod step1x_cli;
 mod tts_cli;
 #[cfg(feature = "media")]
 mod whisper_cli;
+#[cfg(feature = "media")]
+mod zonos_cli;
 
 struct Args {
     model: PathBuf,
@@ -471,7 +473,14 @@ fn usage() -> ! {
          \x20 --ref-text TEXT      with its transcript; repeatable (more pairs: a steadier voice). Best\n\
          \x20                      with the pretrained model (unsloth/orpheus-3b-0.1-pretrained)\n\
          \x20 --snac-encode FILE   (--model a SNAC dir) audio to codes, a JSON array per codebook (-o FILE)\n\
-         \x20 --decode-codes FILE  (--model a SNAC dir) such codes back to a WAV (-o FILE)"
+         \x20 --decode-codes FILE  (--model a SNAC dir) such codes back to a WAV (-o FILE)\n\
+         \n\
+         text to speech (ZONOS3-Mini: Zyphra/ZONOS3-Mini, 44.1 kHz; see docs/zonos.md):\n\
+         \x20 --speak, --speak-file, --speak-split, --speak-json, --dump-pcm as above\n\
+         \x20 --voice NAME         a default voice (Savannah, Imogen, Rupert, ...), a speaker embedding or\n\
+         \x20                      reference codes as .npy, \"\" for none; --ref-audio FILE.npy is the same\n\
+         \x20 --snac NAME          the codec decoder: keep2 (default), full, or a zac GGUF file\n\
+         \x20 --temp, --top-p, --repetition-penalty, --max-tokens, --seed  (defaults 0.75, 0.69, 2.4, 2000 rows)"
     );
     eprintln!("\n{}", intervene_cli::USAGE);
     eprintln!("\n{}", flux_cli::USAGE);
@@ -1168,6 +1177,9 @@ fn main() -> Result<()> {
     // (A single safetensors file: a BFL FLUX checkpoint, local or `org/name/file.safetensors`.)
     args.model = if spec.ends_with(".safetensors") {
         resolve_file(&spec, args.cache_dir.as_deref())?
+    } else if !args.model.exists() && oxinfer::zonos::is_zonos(&args.model) {
+        // ZONOS3's repository: its loader fetches the few files it reads.
+        args.model.clone()
     } else {
         resolve_model(&spec, args.cache_dir.as_deref())?
     };
@@ -1543,6 +1555,10 @@ fn run(mut args: Args) -> Result<()> {
         || args.snac_encode.is_some()
         || args.decode_codes.is_some()
     {
+        #[cfg(feature = "media")]
+        if oxinfer::zonos::is_zonos(&args.model) {
+            return zonos_cli::run(&args);
+        }
         #[cfg(feature = "media")]
         return tts_cli::run(&args);
         #[cfg(not(feature = "media"))]

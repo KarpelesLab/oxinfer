@@ -84,6 +84,8 @@ pub(crate) enum Loaded {
     Image(Box<ImageModel>),
     Transcription(Box<crate::whisper::Transcriber>),
     Speech(Box<crate::tts::Speaker>),
+    /// ZONOS3 (also `/v1/audio/speech`).
+    Zonos(Box<crate::zonos::Zonos>),
 }
 
 impl Loaded {
@@ -93,7 +95,7 @@ impl Loaded {
             Loaded::Embedding(_) => Kind::Embedding,
             Loaded::Image(_) => Kind::Image,
             Loaded::Transcription(_) => Kind::Transcription,
-            Loaded::Speech(_) => Kind::Speech,
+            Loaded::Speech(_) | Loaded::Zonos(_) => Kind::Speech,
         }
     }
 }
@@ -311,6 +313,8 @@ impl Registry {
         let given = e.spec.option("kind").and_then(Kind::parse);
         let d = match given {
             Some(k) if k != Kind::Image => (k, None),
+            // Told apart by its name: the repository has no config.json to probe.
+            _ if crate::zonos::is_zonos(Path::new(&e.spec.source)) => (Kind::Speech, None),
             _ => {
                 let path = self.probe_path(&e.spec.source)?;
                 let (k, img) = detect_path(&path, &e.spec.source);
@@ -409,6 +413,21 @@ impl Registry {
                     o.set(k, v)?;
                 }
                 Loaded::Transcription(Box::new(crate::whisper::Transcriber::load(src, &o)?))
+            }
+            Kind::Speech if crate::zonos::is_zonos(Path::new(src)) => {
+                let mut o = crate::zonos::ZonosOptions {
+                    cache_dir: self.cache_dir.clone(),
+                    ..Default::default()
+                };
+                for (k, v) in &opts {
+                    match *k {
+                        "threads" => o.threads = Some(v.parse().with_context(|| format!("threads: {v:?}"))?),
+                        "decoder" => o.decoder = Some(v.to_string()),
+                        "exact" => o.exact = matches!(*v, "1" | "true" | "yes" | "on"),
+                        _ => bail!("unknown ZONOS3 option {k:?} (threads, decoder, exact)"),
+                    }
+                }
+                Loaded::Zonos(Box::new(crate::zonos::Zonos::load(src, &o)?))
             }
             Kind::Speech => {
                 let mut o = crate::tts::SpeakerOptions {
@@ -514,6 +533,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// The kind of the model at `path` (a directory or a GGUF file).
 pub(crate) fn detect_path(path: &Path, source: &str) -> (Kind, Option<ImageKind>) {
     let img = |k| (Kind::Image, Some(k));
+    if crate::zonos::is_zonos(path) {
+        return (Kind::Speech, None);
+    }
     if crate::gguf::is_gguf(path) {
         if crate::flux::is_flux_gguf(path) {
             return img(ImageKind::Flux);

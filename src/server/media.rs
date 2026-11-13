@@ -756,6 +756,57 @@ fn speech_voice(info: &crate::tts::SpeakerInfo, voice: Option<&str>) -> ApiResul
     })
 }
 
+/// The options of a ZONOS3 request: `voice` is one of the model's voices (OpenAI's names take the
+/// default voice, `none` no speaker); `temperature`, `top_p`, `top_k`, `repetition_penalty`,
+/// `max_tokens`, `speaker_mode`, `speaker_cfg_scale`, `loudness`, `fmax` and `speaking_rate` as
+/// in [`crate::zonos::ZonosSpeak`].
+fn zonos_options(z: &crate::zonos::Zonos, body: &Value, voice: Option<&str>, seed: u64) -> ApiResult<crate::zonos::ZonosSpeak> {
+    let mut o = crate::zonos::ZonosSpeak::default();
+    let num = |k: &str| body.get(k).and_then(Value::as_f64);
+    if let Some(v) = num("temperature") {
+        o.temperature = v as f32;
+    }
+    if let Some(v) = num("top_p") {
+        o.top_p = v as f32;
+    }
+    if let Some(v) = num("top_k") {
+        o.top_k = v as usize;
+    }
+    if let Some(v) = num("repetition_penalty") {
+        o.repetition_penalty = v as f32;
+    }
+    if let Some(v) = num("max_tokens") {
+        o.max_tokens = v as usize;
+    }
+    if let Some(v) = num("speaker_cfg_scale") {
+        o.speaker_cfg_scale = v as f32;
+    }
+    (o.loudness, o.fmax, o.speaking_rate) = (num("loudness"), num("fmax"), num("speaking_rate"));
+    match body.get("speaker_mode").and_then(Value::as_str) {
+        None | Some("embedding") => {}
+        Some("reference") => o.speaker_mode = crate::zonos::SpeakerMode::Reference,
+        Some(m) => return Err(ApiError::bad(format!("speaker_mode {m:?}: expected embedding or reference")).param("speaker_mode")),
+    }
+    o.seed = seed;
+    // Only the model's own voices: a request does not name files on the server.
+    o.voice = match voice {
+        Some(v) if v == "none" => Some(v.to_string()),
+        Some(v)
+            if z.voices()
+                .iter()
+                .any(|x| x.name.eq_ignore_ascii_case(v) || x.label.eq_ignore_ascii_case(v)) =>
+        {
+            Some(v.to_string())
+        }
+        Some(v) if !OPENAI_VOICES.contains(&v) => {
+            let names: Vec<&str> = z.voices().iter().map(|x| x.name.as_str()).collect();
+            return Err(ApiError::bad(format!("voice {v:?}: this model's voices are {}", names.join(", "))).param("voice"));
+        }
+        _ => None,
+    };
+    Ok(o)
+}
+
 /// `POST /v1/audio/speech` with an array as `input` (an extension): the utterances are generated
 /// as one batch ([`crate::tts::Speaker::speak_batch`]) and returned as JSON, `data[i].audio` the
 /// base64 WAV (or 16-bit PCM) of `input[i]`. `voice` is one name or an array, one per input.
@@ -785,17 +836,30 @@ fn speech_batch(
     };
     api.models.check(model, Kind::Speech)?;
     let mut lease = api.models.acquire(model, Kind::Speech)?;
-    let Loaded::Speech(sp) = lease.model() else { unreachable!() };
-    let opts: Vec<crate::tts::SpeakOptions> = voices
-        .iter()
-        .map(|v| {
-            let mut o = o.clone();
-            o.voice = speech_voice(sp.info(), *v)?;
-            Ok(o)
-        })
-        .collect::<ApiResult<_>>()?;
-    let items: Vec<crate::tts::Utterance> = texts.iter().zip(&opts).map(|(t, o)| crate::tts::Utterance::new(t, o)).collect();
-    let speeches = sp.speak_batch(&items).map_err(|e| ApiError::new(500, format!("{e:#}")))?;
+    let speeches = match lease.model() {
+        // ZONOS3: one utterance after the other.
+        Loaded::Zonos(z) => texts
+            .iter()
+            .zip(&voices)
+            .map(|(t, v)| {
+                let zo = zonos_options(z, body, *v, o.seed)?;
+                z.speak(t, &zo).map_err(|e| ApiError::new(500, format!("{e:#}")))
+            })
+            .collect::<ApiResult<Vec<_>>>()?,
+        Loaded::Speech(sp) => {
+            let opts: Vec<crate::tts::SpeakOptions> = voices
+                .iter()
+                .map(|v| {
+                    let mut o = o.clone();
+                    o.voice = speech_voice(sp.info(), *v)?;
+                    Ok(o)
+                })
+                .collect::<ApiResult<_>>()?;
+            let items: Vec<crate::tts::Utterance> = texts.iter().zip(&opts).map(|(t, o)| crate::tts::Utterance::new(t, o)).collect();
+            sp.speak_batch(&items).map_err(|e| ApiError::new(500, format!("{e:#}")))?
+        }
+        _ => unreachable!(),
+    };
     let (mut tin, mut tout) = (0, 0);
     let data: Vec<Value> = speeches
         .iter()
@@ -874,16 +938,30 @@ pub(super) fn speech(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
     let voice = s("voice");
     api.models.check(&model, Kind::Speech)?;
     let api2 = api.clone();
+    let body2 = body.clone();
     let mut run = move |sink: Option<Sink>| -> ApiResult<Option<crate::tts::Speech>> {
         let mut lease = api2.models.acquire(&model, Kind::Speech)?;
-        let Loaded::Speech(sp) = lease.model() else { unreachable!() };
-        o.voice = speech_voice(sp.info(), voice.as_deref())?;
+        let loaded = lease.model();
+        let zo = match loaded {
+            Loaded::Zonos(z) => Some(zonos_options(z, &body2, voice.as_deref(), o.seed)?),
+            Loaded::Speech(sp) => {
+                o.voice = speech_voice(sp.info(), voice.as_deref())?;
+                None
+            }
+            _ => unreachable!(),
+        };
+        // Either model, with the audio through `on` when streaming.
+        let speak = |on: Option<&mut dyn FnMut(&crate::tts::AudioChunk) -> Flow>| match (&*loaded, &zo, on) {
+            (Loaded::Zonos(z), Some(zo), Some(on)) => z.speak_stream(&input, zo, on),
+            (Loaded::Zonos(z), Some(zo), None) => z.speak(&input, zo),
+            (Loaded::Speech(sp), _, Some(on)) => sp.speak_stream(&input, &o, on),
+            (Loaded::Speech(sp), _, None) => sp.speak_detailed(&input, &o),
+            _ => unreachable!(),
+        };
         match sink {
-            None => Ok(Some(
-                sp.speak_detailed(&input, &o).map_err(|e| ApiError::new(500, format!("{e:#}")))?,
-            )),
+            None => Ok(Some(speak(None).map_err(|e| ApiError::new(500, format!("{e:#}")))?)),
             Some(sink) => {
-                let r = sp.speak_stream(&input, &o, &mut |c| {
+                let r = speak(Some(&mut |c| {
                     let pcm: Vec<u8> = c
                         .samples
                         .iter()
@@ -896,7 +974,7 @@ pub(super) fn speech(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
                         sink(&pcm)
                     };
                     if ok { Flow::Continue } else { Flow::Stop }
-                });
+                }));
                 match r {
                     Ok(speech) if sse => {
                         let ev = json!({
