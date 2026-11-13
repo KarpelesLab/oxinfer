@@ -431,6 +431,11 @@ pub struct QwenSession {
     /// derived from the vision spans (for pipelines that pass their own `position_ids`; prompt
     /// passes of several tokens).
     pub positions: Option<Vec<[usize; 3]>>,
+    /// DeepStack vision features (Qwen3-VL): `(layer, position, [n, hidden])` rows added to the
+    /// residual stream of the `n` tokens from sequence index `position` after `layer` (the
+    /// outputs recorded for `capture` are the layer's own, before the addition). Multi-token
+    /// CPU passes only (prompt encoding).
+    pub deepstack: Vec<(usize, usize, Vec<f32>)>,
     /// Qwen4-Exp state (n-gram contexts and conv, indexer keys; see `crate::qwen4exp`).
     pub(crate) exp: Option<Box<crate::qwen4exp::ExpSession>>,
 }
@@ -1075,6 +1080,7 @@ impl<'a> QwenModel<'a> {
             capture: Vec::new(),
             captured: Vec::new(),
             positions: None,
+            deepstack: Vec::new(),
             exp: self.exp.as_ref().map(|e| Box::new(e.new_session(cfg))),
         }
     }
@@ -1976,6 +1982,12 @@ impl<'a> QwenModel<'a> {
             }
             if sess.capture.contains(&l) {
                 sess.captured.push((l, x.clone()));
+            }
+            for (dl, pos, rows) in &sess.deepstack {
+                let n = rows.len() / h;
+                if *dl == l && *pos >= start && pos + n <= start + t {
+                    add_inplace(&mut x[(pos - start) * h..(pos - start + n) * h], rows);
+                }
             }
             // Streaming a MoE: guess the next layer's experts now, so they are read while its
             // attention runs.

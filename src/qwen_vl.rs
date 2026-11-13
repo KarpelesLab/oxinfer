@@ -59,6 +59,9 @@ pub struct VlImage {
     pub grid: (usize, usize),
     /// The size the image processor resized it to.
     pub size: (usize, usize),
+    /// DeepStack features (Qwen3-VL): `[n, hidden]` added to the image's tokens after language
+    /// model layer 0, 1, ...; empty for the other towers.
+    pub deep: Vec<Vec<f32>>,
 }
 
 impl VlImage {
@@ -90,6 +93,22 @@ pub struct QwenVl {
     pub tokenizer: crate::tokenizer::Tokenizer,
     pub dir: PathBuf,
     _files: Box<ModelFiles>,
+}
+
+/// The DeepStack rows of `images` for a session (`QwenSession::deepstack`): each image's
+/// features after the first layers, at its tokens (`refs`: the placeholder positions, in order).
+fn deepstack(images: &[VlImage], refs: &[(usize, &[f32])]) -> Result<Vec<(usize, usize, Vec<f32>)>> {
+    let mut out = Vec::new();
+    let mut at = 0;
+    for im in images {
+        let start = refs.get(at).map_or(0, |r| r.0);
+        if !im.deep.is_empty() && refs[at..at + im.n].iter().enumerate().any(|(k, r)| r.0 != start + k) {
+            bail!("an image's placeholder tokens are not contiguous (DeepStack features need one run)");
+        }
+        out.extend(im.deep.iter().enumerate().map(|(l, rows)| (l, start, rows.clone())));
+        at += im.n;
+    }
+    Ok(out)
 }
 
 /// The first of `cands` that holds `file`.
@@ -133,7 +152,7 @@ impl QwenVl {
                         model.cfg.hidden_size
                     );
                 }
-                Some(QwenVisionTower::load(m.vision.clone(), fs)?)
+                Some(QwenVisionTower::load_deep(m.vision.clone(), fs)?)
             }
             _ => None,
         };
@@ -155,6 +174,11 @@ impl QwenVl {
         self.model.cfg.hidden_size
     }
 
+    /// Whether the vision tower is loaded.
+    pub fn has_vision(&self) -> bool {
+        self.tower.is_some()
+    }
+
     /// Runs an RGB8 image through the image processor (smart resize within `max_pixels`, 0 for
     /// the processor's budget) and the vision tower.
     pub fn encode_image(&self, rgb: &[u8], w: usize, h: usize, max_pixels: usize) -> Result<VlImage> {
@@ -162,7 +186,7 @@ impl QwenVl {
             bail!("{}: loaded without a vision tower", self.dir.display());
         };
         let px = crate::qwen_vision::preprocess_image(rgb, w, h, &mm.image, max_pixels)?;
-        let emb = tower.encode(&px);
+        let (emb, deep) = tower.encode_deep(&px);
         let m = mm.vision.spatial_merge_size;
         let (_, gh, gw) = px.grid;
         let n = emb.len() / self.hidden_size();
@@ -172,6 +196,7 @@ impl QwenVl {
             n,
             grid: (gh / m, gw / m),
             size: (gw * p, gh * p),
+            deep,
         })
     }
 
@@ -230,6 +255,7 @@ impl QwenVl {
         }
         let ov = crate::mm::overrides(&ids, &feats, h)?;
         let refs: Vec<(usize, &[f32])> = ov.iter().map(|(i, v)| (*i, v.as_slice())).collect();
+        sess.deepstack = deepstack(images, &refs)?;
         let last = self.model.forward_hidden_mm(&mut sess, &ids, &refs);
         Ok(Hidden {
             ids,
@@ -275,6 +301,7 @@ impl QwenVl {
         }
         let ov = crate::mm::overrides(&ids, &feats, h)?;
         let refs: Vec<(usize, &[f32])> = ov.iter().map(|(i, v)| (*i, v.as_slice())).collect();
+        sess.deepstack = deepstack(images, &refs)?;
         let last = self.model.forward_hidden_mm(&mut sess, &ids, &refs);
         let mut logits = self.model.logits(&last[(ids.len() - 1) * h..], 1);
         let mut seen = vec![false; logits.len()];

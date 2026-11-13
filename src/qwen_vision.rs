@@ -7,8 +7,11 @@
 //! and the merger that folds every 2x2 block into one language-model token.
 //!
 //! The language model places the tokens with M-RoPE (see `QwenSession::add_vision_span`).
-//! DeepStack (feature injection into early decoder layers) is not used by these checkpoints
-//! (`deepstack_visual_indexes` is empty) and is rejected if present.
+//! DeepStack (Qwen3-VL's `deepstack_visual_indexes`: the tower's hidden states after a few of
+//! its layers, each through its own merger, added to the image tokens after the language
+//! model's first layers) is computed for conditioning encoders ([`Qwen35Tower::encode_deep`],
+//! `crate::qwen_vl`); the Qwen3.5-family checkpoints have none, and the chat engine does not
+//! run it.
 
 use crate::bert::{LayerNorm, gelu_erf};
 use crate::kernels::*;
@@ -727,6 +730,16 @@ pub enum QwenVisionTower<'a> {
 impl<'a> QwenVisionTower<'a> {
     /// Loads the tower `cfg` describes (bf16; see [`Qwen35Tower::load`]).
     pub fn load(cfg: QwenVisionConfig, files: &'a ModelFiles) -> Result<Self> {
+        // Callers of `encode` alone would drop the DeepStack features without a word.
+        if !cfg.deepstack_visual_indexes.is_empty() {
+            bail!("DeepStack vision features (deepstack_visual_indexes, Qwen3-VL) are not supported here");
+        }
+        Self::load_deep(cfg, files)
+    }
+
+    /// [`QwenVisionTower::load`] that accepts a Qwen3-VL tower with DeepStack features, for
+    /// callers that take them from [`QwenVisionTower::encode_deep`].
+    pub fn load_deep(cfg: QwenVisionConfig, files: &'a ModelFiles) -> Result<Self> {
         Ok(if cfg.minimax_m3 {
             Self::MiniMaxM3(Box::new(crate::minimax_vision::MiniMaxM3Tower::load(cfg, files)?))
         } else if cfg.is_qwen25() {
@@ -753,6 +766,15 @@ impl<'a> QwenVisionTower<'a> {
             Self::MiniMaxM3(t) => t.encode(px),
         }
     }
+
+    /// [`QwenVisionTower::encode`], and the DeepStack features of a Qwen3-VL tower (see
+    /// [`Qwen35Tower::encode_deep`]; none for the other towers).
+    pub fn encode_deep(&self, px: &Pixels) -> (Vec<f32>, Vec<Vec<f32>>) {
+        match self {
+            Self::Qwen35(t) => t.encode_deep(px),
+            _ => (self.encode(px), Vec::new()),
+        }
+    }
 }
 
 /// The Qwen3.5-family tower (see the module docs).
@@ -765,6 +787,9 @@ pub struct Qwen35Tower<'a> {
     merger_norm: LayerNorm,
     merger_fc1: VLin<'a>,
     merger_fc2: VLin<'a>,
+    /// DeepStack mergers (Qwen3-VL), one per entry of `deepstack_visual_indexes`: a LayerNorm
+    /// over each merge block's concatenated patches, then the merger's two layers.
+    deepstack: Vec<(LayerNorm, VLin<'a>, VLin<'a>)>,
     /// MLP width padded to a multiple of 64.
     inter: usize,
     inv_freq: Vec<f32>, // head_dim/4 frequencies per axis
@@ -776,9 +801,6 @@ impl<'a> Qwen35Tower<'a> {
     /// and the tower is small next to the language model. Tensors stored pre-quantized load as
     /// stored.
     pub fn load(cfg: QwenVisionConfig, files: &'a ModelFiles) -> Result<Self> {
-        if !cfg.deepstack_visual_indexes.is_empty() {
-            bail!("DeepStack vision features (deepstack_visual_indexes) are not supported");
-        }
         if let Some(a) = &cfg.hidden_act
             && a != "gelu_pytorch_tanh"
         {
@@ -795,6 +817,9 @@ impl<'a> Qwen35Tower<'a> {
         } else {
             bail!("the checkpoint has no vision tower (model.visual.*)");
         };
+        if gguf && !cfg.deepstack_visual_indexes.is_empty() {
+            bail!("DeepStack vision features (deepstack_visual_indexes) from an mmproj file are not supported");
+        }
         let name = |hf: &str| if gguf { mmproj_name(hf) } else { format!("{pre}{hf}") };
         let h = cfg.hidden_size;
         let (c, t, p) = (cfg.in_channels, cfg.temporal_patch_size, cfg.patch_size);
@@ -851,7 +876,18 @@ impl<'a> Qwen35Tower<'a> {
         let inv_freq = (0..spatial / 2)
             .map(|i| (1.0 / theta.powf((2 * i) as f64 / spatial as f64)) as f32)
             .collect();
+        let deepstack = (0..cfg.deepstack_visual_indexes.len())
+            .map(|i| {
+                let p = format!("deepstack_merger_list.{i}.");
+                Ok((
+                    LayerNorm::load(files, &name(&format!("{p}norm")), mh)?,
+                    dense(&format!("{p}linear_fc1"), mh, mh)?,
+                    dense(&format!("{p}linear_fc2"), cfg.out_hidden_size, mh)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
+            deepstack,
             patch_w,
             patch_b,
             pos_embed,
@@ -905,6 +941,13 @@ impl<'a> Qwen35Tower<'a> {
     /// Encodes preprocessed pixels into `[tokens, out_hidden_size]` language-model embeddings
     /// (tokens = patches / merge^2, in temporal-group then block order).
     pub fn encode(&self, px: &Pixels) -> Vec<f32> {
+        self.encode_deep(px).0
+    }
+
+    /// [`Qwen35Tower::encode`], and the DeepStack features (Qwen3-VL; `[tokens,
+    /// out_hidden_size]` per entry of `deepstack_visual_indexes`, which the language model adds
+    /// to the image tokens after its first layers).
+    pub fn encode_deep(&self, px: &Pixels) -> (Vec<f32>, Vec<Vec<f32>>) {
         let cfg = &self.cfg;
         let (gt, gh, gw) = px.grid;
         let per_t = gh * gw;
@@ -949,7 +992,8 @@ impl<'a> Qwen35Tower<'a> {
         let mut att = vec![0f32; n * h];
         let mut y = vec![0f32; n * h];
         let mut mid = vec![0f32; n * self.inter];
-        for b in &self.blocks {
+        let mut deep = Vec::new();
+        for (li, b) in self.blocks.iter().enumerate() {
             hn.copy_from_slice(&x);
             b.norm1.apply_rows(&mut hn, eps);
             b.qkv.forward(&hn, n, &mut qkv);
@@ -986,6 +1030,19 @@ impl<'a> Qwen35Tower<'a> {
             });
             b.fc2.forward(&mid, n, &mut y);
             add_inplace(&mut x, &y);
+            if let Some(i) = cfg.deepstack_visual_indexes.iter().position(|&d| d == li) {
+                let (norm, fc1, fc2) = &self.deepstack[i];
+                let mm = cfg.spatial_merge_size * cfg.spatial_merge_size;
+                let (tokens, mh) = (n / mm, h * mm);
+                let mut xn = x.clone();
+                norm.apply_rows(&mut xn, eps);
+                let mut m1 = vec![0f32; tokens * mh];
+                fc1.forward(&xn, tokens, &mut m1);
+                for_chunks(&mut m1, mh, true, |_, r| r.iter_mut().for_each(|v| *v = gelu_erf(*v)));
+                let mut out = vec![0f32; tokens * cfg.out_hidden_size];
+                fc2.forward(&m1, tokens, &mut out);
+                deep.push(out);
+            }
         }
 
         // Merger: LayerNorm per patch, each merge block's patches concatenated, MLP (exact GELU).
@@ -1001,7 +1058,7 @@ impl<'a> Qwen35Tower<'a> {
         });
         let mut out = vec![0f32; tokens * cfg.out_hidden_size];
         self.merger_fc2.forward(&m1, tokens, &mut out);
-        out
+        (out, deep)
     }
 }
 
