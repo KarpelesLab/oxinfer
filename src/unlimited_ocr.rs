@@ -29,7 +29,7 @@
 //!   markers of the prompt and of the reply. Without markers (text only, or images without
 //!   `<PAGE>`) the reference falls back to plain YaRN positions; so does this.
 //!
-//! The session is incremental where the reference recomputes: blocks summaries are final once a
+//! The session is incremental where the reference recomputes: block summaries are final once a
 //! block is full, and a full block is the only kind a query can select (the last four blocks are
 //! its local window). The first forward pass of a session is the prompt (it must come whole:
 //! which tokens belong to a page depends on where the last image ends); every later token is a

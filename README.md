@@ -93,6 +93,7 @@ too. The device is chosen at run time (`--device auto`: a GPU when one starts, e
 | [Nemotron 3.5 Lightning and Transcribe](docs/nemotron.md) | Mamba-2 / attention / MoE hybrid; a 34B speech LM for speech to text |
 | [Inkling-2 Small](docs/inkling.md) | 594B MoE with images (relative-bias attention, short convolutions, attention residual); the decoder on tiny checkpoints only |
 | [Qwen3.8-Flash-Next](docs/qwen-flash-next.md) | 125B MoE with an n-gram embedding table |
+| [Unlimited-OCR-2](docs/ocr.md) | document OCR: page images to text with layout, block-sparse attention |
 | [Image, video and audio input](docs/multimodal-input.md) | the vision and audio towers of Gemma 4 and Qwen, Qwen2.5-VL |
 
 **Images and audio**

@@ -14,6 +14,8 @@ official ones do) take images and videos. Files are decoded with the pure-Rust
 [oxideav](https://crates.io/crates/oxideav-core) crates: PNG, JPEG, WebP, GIF, BMP; WAV, MP3,
 FLAC, AAC/M4A, Ogg Vorbis/Opus, MKV audio (resampled to 16 kHz mono); and video (below).
 
+Unlimited-OCR-2 reads page images with its own encoder and prompt: see [Unlimited-OCR-2](ocr.md).
+
 - **Gemma 4 vision**: aspect-preserving bicubic resize to at most 280 soft tokens
   (`--max-soft-tokens` accepts 70/140/280/560/1120), 16x16 patches, a 16-layer ViT (hidden 768)
   with axial 2D RoPE and clipped linears, 3x3 patch pooling, then the vision embedder. A 640x480

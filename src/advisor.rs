@@ -465,6 +465,11 @@ pub const CATALOG: &[Model] = &[
     .moe(),
     Model::new("MiniMaxAI/MiniMax-Text-01", Kind::Chat, 456.0, 912.0, &[Text, Tools]).moe(),
     Model::new("MiniMaxAI/MiniMax-VL-01", Kind::Chat, 456.0, 913.0, &[Text, ImageInput, Tools]).moe(),
+    // Document OCR: pages in, text with its layout out (docs/ocr.md). 2.4B of the parameters are
+    // the routed experts of its 12 layers (6 of 64 per token), 0.4B its SAM + CLIP image encoder.
+    Model::new("baidu/Unlimited-OCR-2", Kind::Chat, 3.3, 6.7, &[Text, ImageInput])
+        .moe()
+        .note("document OCR: page images to text with layout blocks; not a chat model"),
     // DeepSeek V4.1 Flash: text only here (no vision tower), never run on the real weights (the
     // agreement with DeepSeek's code is measured on tiny checkpoints). Sizes with the 111 GB of
     // engram tables (IQ4_NL), which every conversion needs.
