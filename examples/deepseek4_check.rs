@@ -1,7 +1,8 @@
-//! Compares a DeepSeek V4 checkpoint run by oxinfer with reference outputs (as written by
-//! `tools/ref_deepseek4.py`: `ids` (I64), `logits` `[n, vocab]` at every prompt position, and
-//! optionally `gen` (I64, greedy tokens) with `decode_logits` `[len(gen), vocab]`, the logits after
-//! feeding each of them one at a time):
+//! Compares a DeepSeek V4 or V4.1 checkpoint run by oxinfer with reference outputs (as written by
+//! `tools/ref_deepseek4.py` / `tools/ref_deepseek41.py`: `ids` (I64), `logits` `[n, vocab]` at
+//! every prompt position, and optionally `gen` (I64, greedy tokens) with `decode_logits`
+//! `[len(gen), vocab]`, the logits after feeding each of them one at a time; for V4.1 also
+//! `image_at` / `image_embeds`, an image span of the prompt as the reference embeds it):
 //!
 //! ```text
 //! deepseek4_check MODEL REF.safetensors [--chunk N] [--cpu] [--mmap]
@@ -97,11 +98,26 @@ fn main() -> Result<()> {
     let vocab = m.cfg.vocab_size;
     let chunk = chunk.unwrap_or(ids.len()).max(1);
 
+    // DeepSeek V4.1: an image span of the prompt, as the reference's embeddings of its positions.
+    let h = m.cfg.hidden_size;
+    let (img_at, img) = if st.info("image_embeds").is_some() {
+        (i64s(&st, "image_at")?[0] as usize, f32s(&st, "image_embeds")?)
+    } else {
+        (0, Vec::new())
+    };
     let mut sess = m.new_session();
     let mut ours = Vec::with_capacity(refs.len());
     let t0 = std::time::Instant::now();
-    for c in ids.chunks(chunk) {
-        let hs = m.forward_hidden(&mut sess, c);
+    for (ci, c) in ids.chunks(chunk).enumerate() {
+        let start = ci * chunk;
+        let mm: Vec<(usize, &[f32])> = img
+            .chunks(h)
+            .enumerate()
+            .map(|(i, row)| (img_at + i, row))
+            .filter(|(p, _)| (start..start + c.len()).contains(p))
+            .map(|(p, row)| (p - start, row))
+            .collect();
+        let hs = m.forward_capture_mm(&mut sess, c, &mm, &[], &mut Vec::new());
         ours.extend(m.logits(&hs, c.len()));
     }
     eprintln!(

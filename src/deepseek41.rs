@@ -126,11 +126,16 @@ fn is_prime(n: i64) -> bool {
     true
 }
 
-/// An integer tensor (I32 / I64) as i64.
+/// An integer tensor (I32 / I64, also as GGUF types 26 / 27) as i64.
 fn ints(files: &ModelFiles, name: &str) -> Result<Vec<i64>> {
     let info = files.info(name).with_context(|| format!("missing tensor {name}"))?;
     let b = files.bytes(name)?;
-    Ok(match info.dtype.as_str() {
+    let dtype = match info.ggml {
+        Some(26) => "I32",
+        Some(27) => "I64",
+        _ => info.dtype.as_str(),
+    };
+    Ok(match dtype {
         "I32" | "U32" => b.as_chunks::<4>().0.iter().map(|x| i32::from_le_bytes(*x) as i64).collect(),
         "I64" | "U64" => b.as_chunks::<8>().0.iter().map(|x| i64::from_le_bytes(*x)).collect(),
         d => bail!("tensor {name}: dtype {d}, expected integers"),
