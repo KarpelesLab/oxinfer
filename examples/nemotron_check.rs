@@ -1,5 +1,5 @@
 //! Compares a Nemotron-H checkpoint run by oxinfer with reference outputs (as written by
-//! `tools/nemotron_tiny.py`: `ids` (I64), `logits` `[n, vocab]` at every prompt position, `gen`
+//! `tools/nemotron_tiny.py`: `ids` (I64), `logits` `[n, vocab]` at the last n prompt positions, `gen`
 //! (I64, greedy tokens), `decode_logits` `[len(gen), vocab]`, the logits after feeding each of
 //! them through transformers' cache, and `decode_logits_full`, the same positions of one uncached
 //! forward):
@@ -10,10 +10,10 @@
 //!
 //! Prints, for the prefill (in chunks of N tokens, default the whole prompt) and for the
 //! token-by-token decode, the largest logit difference, the mean KL divergence and the agreement
-//! of the top token. The decode is run twice: with the time step floor (NVIDIA's module, and
-//! this crate's default) against `decode_logits_full`, and without it against `decode_logits`
-//! (transformers' cached step does not clamp). `--dump` writes the logits compared (prefill
-//! rows, then the floored decode rows; f32).
+//! of the top token, with the Mamba time step as the model's config has it (no clamp: what
+//! llama.cpp computes) and with transformers' floor: its uncached forward floors every position
+//! (`logits`, `decode_logits_full`), its cached steps follow a floored prefill without a floor
+//! (`decode_logits`). `--dump` writes the unclamped logits (prefill rows, then decode rows; f32).
 
 use anyhow::{Context, Result};
 use oxinfer::nemotron::{NemotronConfig, NemotronModel};
@@ -112,48 +112,59 @@ fn main() -> Result<()> {
     let vocab = m.cfg.vocab_size;
     let chunk = chunk.unwrap_or(ids.len()).max(1);
 
-    let mut sess = m.new_session();
-    let mut ours = Vec::with_capacity(refs.len());
-    let t0 = std::time::Instant::now();
-    for c in ids.chunks(chunk) {
-        let hs = m.forward_hidden(&mut sess, c);
-        ours.extend(m.logits(&hs, c.len()));
-    }
-    eprintln!(
-        "[prefill {} tokens in chunks of {chunk}: {:.2}s]",
-        ids.len(),
-        t0.elapsed().as_secs_f64()
-    );
-    report("prefill", &ours, &refs, vocab);
+    // The time step: unclamped (the config's limit; llama.cpp, the Mamba kernels), or with
+    // transformers' floor of `time_step_min`, which its multi-token scan applies.
+    let floor = m.cfg.time_step_min as f32;
+    let prefill = |dt_min: f32| {
+        let mut sess = m.new_session();
+        sess.dt_min = dt_min;
+        let mut ours = Vec::with_capacity(ids.len() * vocab);
+        let t0 = std::time::Instant::now();
+        for c in ids.chunks(chunk) {
+            let hs = m.forward_hidden(&mut sess, c);
+            ours.extend(m.logits(&hs, c.len()));
+        }
+        eprintln!(
+            "[prefill {} tokens in chunks of {chunk}: {:.2}s]",
+            ids.len(),
+            t0.elapsed().as_secs_f64()
+        );
+        (sess, ours)
+    };
+    // A reference with fewer rows than the prompt has its last positions.
+    let (plain, ours) = prefill(m.new_session().dt_min);
+    report("prefill (no floor)", &ours[ours.len() - refs.len()..], &refs, vocab);
+    let (floored, with_floor) = prefill(floor);
+    report("prefill (floor)", &with_floor[with_floor.len() - refs.len()..], &refs, vocab);
+    let mut ours = ours;
 
     if st.info("gen").is_some() {
         let gen_ids = i64s(&st, "gen")?;
-        // With the floor (the default), against the uncached forward.
-        let mut floored = sess.clone();
-        let mut got = Vec::new();
-        for &tk in &gen_ids {
-            got.extend(m.forward(&mut floored, &[tk]));
-        }
+        let decode = |mut sess: oxinfer::nemotron::NemotronSession, dt_min: f32| {
+            sess.dt_min = dt_min;
+            let mut got = Vec::new();
+            for &tk in &gen_ids {
+                got.extend(m.forward(&mut sess, &[tk]));
+            }
+            got
+        };
+        let cached = f32s(&st, "decode_logits")?;
+        let got = decode(plain, m.new_session().dt_min);
+        report("decode (no floor)", &got, &cached, vocab);
+        report(
+            "decode (floor in the prefill only, as transformers' cached steps)",
+            &decode(floored.clone(), 0.0),
+            &cached,
+            vocab,
+        );
         if st.info("decode_logits_full").is_some() {
             report(
-                "decode (time step floor, vs the uncached forward)",
-                &got,
+                "decode (floor, vs the uncached forward)",
+                &decode(floored, floor),
                 &f32s(&st, "decode_logits_full")?,
                 vocab,
             );
         }
-        // Without it, against transformers' cached steps.
-        sess.dt_min = 0.0;
-        let mut free = Vec::new();
-        for &tk in &gen_ids {
-            free.extend(m.forward(&mut sess, &[tk]));
-        }
-        report(
-            "decode (no floor, vs transformers' cached steps)",
-            &free,
-            &f32s(&st, "decode_logits")?,
-            vocab,
-        );
         ours.extend(got);
     }
     if let Some(path) = dump {

@@ -434,7 +434,9 @@ fn usage() -> ! {
          \x20                      or repo id (org/name/subdir for a subfolder, e.g. autotrust/JEV-9B/vl),\n\
          \x20                      on top of --model (fetches the small files only)\n\
          \n\
-         speech to text (Whisper models: openai/whisper-*, distil-whisper/*; detected from config.json):\n\
+         speech to text (Whisper models: openai/whisper-*, distil-whisper/*, detected from config.json;\n\
+         NVIDIA Nemotron 3.5 Transcribe with --transcribe: one segment per file, --initial-prompt is\n\
+         the instruction given to the model, no timestamps, beam search or fallback):\n\
          \x20 --transcribe FILE    audio to transcribe (WAV/MP3/FLAC/AAC/OGG via oxideav; any length);\n\
          \x20                      repeat it for several files, decoded together (--batch N at a time,\n\
          \x20                      default 8) with the results each file gets alone\n\
@@ -2605,12 +2607,20 @@ fn run_nemotron(args: Args) -> Result<()> {
     let eos = config::load_eos_ids(&args.model);
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
     let model = oxinfer::nemotron::NemotronModel::load(cfg, &files, args.quant)?;
+    // Prompt lookup verifies a draft in one pass and rolls back what the model refutes: the
+    // Mamba-2 state cannot go back to an earlier position.
+    if model.cfg.blocks.contains(&oxinfer::nemotron::Block::Mamba) {
+        if args.lookup == Some(true) {
+            eprintln!("[--lookup is not available for Nemotron-H (its Mamba-2 state cannot roll back): plain decoding]");
+        }
+        *LOOKUP.lock().unwrap() = None;
+    }
     let tok = load_tokenizer(&args.model)?;
     let fmt: &dyn ChatFormat = &chat::NemotronChat;
     let eos = chat::with_turn_end(fmt, &tok, eos);
     let c = &model.cfg;
     eprintln!(
-        "[loaded Nemotron-H: {} blocks ({}), hidden {}, {:.1} GB checkpoint ({}), {} weights, {} threads, {:.2}s]",
+        "[loaded Nemotron-H: {} blocks ({}), hidden {}, {:.1} GB checkpoint ({}), {} weights reading {:.2} GB/token, {} threads, {:.2}s]",
         c.num_hidden_layers(),
         c.describe(),
         c.hidden_size,
@@ -2621,6 +2631,7 @@ fn run_nemotron(args: Args) -> Result<()> {
         } else {
             format!("{:?}", model.quant)
         },
+        model.streamed_bytes() as f64 / 1e9,
         pool::threads(),
         t0.elapsed().as_secs_f64()
     );

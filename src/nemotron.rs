@@ -10,7 +10,7 @@
 //! - Mamba-2 (`mamba` / `linear_attention`): one projection gives a gate, the convolution input
 //!   `x | B | C` and a time step per head; a causal depthwise convolution (kernel 4, with bias)
 //!   and SiLU; per head a `[head_dim, state]` matrix, `S <- exp(dt A) S + dt x B^T` with
-//!   `dt = max(softplus(dt + bias), time_step_min)` and `A = -exp(A_log)`, read as
+//!   `dt = softplus(dt + bias)` and `A = -exp(A_log)`, read as
 //!   `S C + D x` (`B` and `C` shared by the heads of a group); the read times `silu(gate)`,
 //!   RMS-normed per group, projected out. The state does not grow with the context, and the
 //!   recurrence here is the reference's chunked scan in closed form.
@@ -21,10 +21,12 @@
 //!   `down(relu(up x)^2)` (no gate projection, unlike the experts of [`crate::moe`]).
 //! - MLP (`mlp`): the same two-layer MLP, dense (the Nemotron-H 8B / 47B / 56B models).
 //!
-//! The time step floor: NVIDIA's own module clamps `dt` at `time_step_min` in every pass, and so
-//! does this one. transformers' port clamps in its multi-token scan only, so its cached
-//! one-token steps differ from its own uncached forward wherever a head's `dt` is below the
-//! floor ([`NemotronSession::dt_min`] reproduces either).
+//! The time step is clamped to the config's `time_step_limit`, `[0, inf]` in the released
+//! models: no clamp, as in NVIDIA's training and serving code (Megatron-LM's and vLLM's Mamba
+//! mixers) and in llama.cpp. transformers' PyTorch scan over several tokens instead floors `dt`
+//! at `time_step_min` (0.001, the lower end of the range `dt_bias` is initialized in) while its
+//! cached one-token step does not, so its uncached forward and its cached decoding differ
+//! wherever a head's `dt` is below that; [`NemotronSession::dt_min`] reproduces either.
 //!
 //! Checkpoints, told apart by their tensor names:
 //!
@@ -100,7 +102,10 @@ pub struct NemotronConfig {
     pub num_experts_per_tok: usize,
     pub routed_scaling_factor: f64,
     pub layer_norm_epsilon: f64,
-    /// The floor of the Mamba time step.
+    /// The range the Mamba time step is clamped to (`time_step_limit`; `[0, inf]`: no clamp).
+    pub time_step_limit: (f64, f64),
+    /// The lower end of the range `dt_bias` was initialized in, which transformers' scan uses
+    /// as a floor of the time step.
     pub time_step_min: f64,
 }
 
@@ -182,6 +187,12 @@ impl NemotronConfig {
         }
         let nh = num("num_attention_heads").unwrap_or(32);
         let hidden = need("hidden_size")?;
+        // NeMo writes an infinite bound as `{"__float__": "Infinity"}`.
+        let bound = |i: usize, default: f64| match t.get("time_step_limit").or(t.get("mamba_dt_limit")).and_then(|v| v.get(i)) {
+            Some(v) if v.is_object() => f64::INFINITY,
+            Some(v) => v.as_f64().unwrap_or(default),
+            None => default,
+        };
         let c = Self {
             hidden_size: hidden,
             vocab_size: need("vocab_size")?,
@@ -200,6 +211,7 @@ impl NemotronConfig {
             num_experts_per_tok: num("num_experts_per_tok").unwrap_or(0),
             routed_scaling_factor: float("routed_scaling_factor").unwrap_or(1.0),
             layer_norm_epsilon: float("layer_norm_epsilon").unwrap_or(1e-5),
+            time_step_limit: (bound(0, 0.0), bound(1, f64::INFINITY)),
             time_step_min: float("time_step_min").or(float("mamba_dt_min")).unwrap_or(0.001),
             blocks,
         };
@@ -255,7 +267,7 @@ impl NemotronConfig {
 
 /// The Hugging Face config (the keys [`NemotronConfig::from_json`] reads) of a llama.cpp
 /// `nemotron_h` / `nemotron_h_moe` header: a block with key-value heads is attention, one with a
-/// feed-forward width is MoE (or a dense MLP in a file without experts), the others are Mamba-2.
+/// feed-forward width is MoE (a dense MLP when it has no router), the others are Mamba-2.
 pub(crate) fn gguf_config(h: &crate::gguf::Header) -> Result<Value> {
     let arch = h.arch();
     let get = |k: &str| h.get(&format!("{arch}.{k}"));
@@ -273,10 +285,11 @@ pub(crate) fn gguf_config(h: &crate::gguf::Header) -> Result<Value> {
     let kv = per_layer("attention.head_count_kv")?;
     let ff = per_layer("feed_forward_length")?;
     let experts = opt("expert_count").unwrap_or(0);
+    let routed = |l: usize| h.tensors.iter().any(|t| t.name == format!("blk.{l}.ffn_gate_inp.weight"));
     let blocks: Vec<&str> = (0..n)
         .map(|l| match (kv[l] > 0, ff[l] > 0) {
             (true, _) => "attention",
-            (false, true) if experts > 0 => "moe",
+            (false, true) if routed(l) => "moe",
             (false, true) => "mlp",
             (false, false) => "mamba",
         })
@@ -303,7 +316,7 @@ pub(crate) fn gguf_config(h: &crate::gguf::Header) -> Result<Value> {
         "n_groups": need("ssm.group_count")?,
         "ssm_state_size": need("ssm.state_size")?,
         "conv_kernel": need("ssm.conv_kernel")?,
-        "intermediate_size": ff.iter().copied().find(|f| *f > 0).unwrap_or(0),
+        "intermediate_size": (0..n).find(|l| ff[*l] > 0 && kv[*l] == 0 && !routed(*l)).map_or(0, |l| ff[l]),
         "moe_intermediate_size": opt("expert_feed_forward_length").unwrap_or(0),
         "moe_shared_expert_intermediate_size": opt("expert_shared_feed_forward_length").unwrap_or(0),
         "n_routed_experts": experts,
@@ -429,9 +442,10 @@ enum LayerState {
 pub struct NemotronSession {
     layers: Vec<LayerState>,
     pub pos: usize,
-    /// The floor of the Mamba time step for the next passes (the config's `time_step_min`; 0
-    /// is transformers' cached one-token step, which does not clamp).
+    /// The range the Mamba time step is clamped to in the next passes: the config's
+    /// `time_step_limit` (a floor of `time_step_min` is transformers' multi-token scan).
     pub dt_min: f32,
+    pub dt_max: f32,
     /// Runtime interventions ([`crate::intervene`]).
     pub iv: crate::intervene::State,
 }
@@ -753,7 +767,8 @@ impl<'a> NemotronModel<'a> {
                 })
                 .collect(),
             pos: 0,
-            dt_min: c.time_step_min as f32,
+            dt_min: c.time_step_limit.0 as f32,
+            dt_max: c.time_step_limit.1 as f32,
             iv: Default::default(),
         }
     }
@@ -851,7 +866,7 @@ impl<'a> NemotronModel<'a> {
                 }
             }
         };
-        let dt_min = sess.dt_min;
+        let dt_limit = (sess.dt_min, sess.dt_max);
         let mut hn = vec![0f32; t * h];
         let mut o = vec![0f32; t * h];
         for (l, layer) in self.layers.iter().enumerate() {
@@ -860,7 +875,7 @@ impl<'a> NemotronModel<'a> {
             o.fill(0.0);
             let hook = iv.as_ref().and_then(|s| s.hook(l, start));
             match (&layer.mixer, &mut sess.layers[l]) {
-                (Mixer::Mamba(m), LayerState::Mamba { conv, ssm }) => self.mamba_forward(m, &hn, t, dt_min, conv, ssm, &mut o),
+                (Mixer::Mamba(m), LayerState::Mamba { conv, ssm }) => self.mamba_forward(m, &hn, t, dt_limit, conv, ssm, &mut o),
                 (Mixer::Attn(a), LayerState::Attn(cache)) => self.attn_forward(a, &hn, t, start, cache, &mut o),
                 (Mixer::Moe(m), _) => self.moe_forward(m, &hn, t, &mut o, hook.as_ref()),
                 (Mixer::Mlp(m), _) => self.mlp_forward(m, &hn, t, &mut o, hook.as_ref().filter(|k| k.edits(Target::Mlp)), Target::Mlp),
@@ -1012,7 +1027,7 @@ impl<'a> NemotronModel<'a> {
     /// Mamba-2 over `xa` (`[t, H]`, the normed block input) into `out`, updating the convolution
     /// history `conv` and the heads' states `ssm`.
     #[allow(clippy::too_many_arguments)]
-    fn mamba_forward(&self, m: &Mamba, xa: &[f32], t: usize, dt_min: f32, conv: &mut Vec<f32>, ssm: &mut [f32], out: &mut [f32]) {
+    fn mamba_forward(&self, m: &Mamba, xa: &[f32], t: usize, dt_limit: (f32, f32), conv: &mut Vec<f32>, ssm: &mut [f32], out: &mut [f32]) {
         let c = &self.cfg;
         let (h, nh, hd, ng, ns, kn) = (
             c.hidden_size,
@@ -1064,7 +1079,7 @@ impl<'a> NemotronModel<'a> {
                 let b = &row[inner + g * ns..inner + (g + 1) * ns];
                 let cc = &row[inner + (ng + g) * ns..inner + (ng + g + 1) * ns];
                 let z = proj[ti * pw + inner + cd + hh] + m.dt_bias[hh];
-                let dt = (if z > 20.0 { z } else { z.exp().ln_1p() }).max(dt_min);
+                let dt = (if z > 20.0 { z } else { z.exp().ln_1p() }).max(dt_limit.0).min(dt_limit.1);
                 let da = (dt * m.a[hh]).exp();
                 for (p, s) in st.chunks_mut(ns).enumerate() {
                     scale_inplace(s, da);
@@ -1203,6 +1218,10 @@ mod tests {
         assert_eq!(c.blocks, [Block::Mamba, Block::Moe, Block::Attention, Block::Moe, Block::Mlp]);
         assert_eq!(c.describe(), "1 Mamba-2, 1 attention, 2 MoE, 1 MLP");
         assert_eq!(c.conv_dim(), 32 + 2 * 2 * 8);
+        assert_eq!(c.time_step_limit, (0.0, f64::INFINITY));
+        let mut lim = j.clone();
+        lim["time_step_limit"] = json!([0.0005, {"__float__": "Infinity"}]);
+        assert_eq!(NemotronConfig::from_json(&lim).unwrap().time_step_limit, (0.0005, f64::INFINITY));
         // The speech LM's config nests it, with NeMo's or transformers' block names.
         let s = json!({"model_type": "nemo_speechlm", "llm_config": {
             "hidden_size": 32, "vocab_size": 64, "layers_block_type": ["mamba", "moe", "attention"],
@@ -1412,9 +1431,11 @@ mod tests {
             let mut b = m.new_session();
             let hb = m.forward_hidden_mm(&mut b, &[1, v as u32, 9], &[(1, &e)]);
             assert_eq!(ha, hb);
-            // The time step floor matters to this model, and a session carries it.
+            // No clamp by default; transformers' floor matters to this model, and a session
+            // carries it.
+            assert_eq!((s.dt_min, s.dt_max), (0.0, f32::INFINITY));
             let mut f = m.new_session();
-            f.dt_min = 0.0;
+            f.dt_min = m.cfg.time_step_min as f32;
             let hf = m.forward_hidden(&mut f, &ids);
             assert!(hs.iter().zip(&hf).any(|(a, b)| (a - b).abs() > 1e-6), "no head below the floor");
             // A steered residual point changes the logits.

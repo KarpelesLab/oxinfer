@@ -3,7 +3,10 @@ type on: Mamba-2 (several scan chunks, some heads below the time step floor), at
 positions (grouped queries), MoE with relu^2 experts and a shared expert, a dense MLP.
 
 usage: nemotron_tiny.py OUT_DIR [--layout release|stacked|nemo] [--len N] [--gen N] [--seed S]
-                        [--tokenizer RELEASE_DIR [--chat CONVERSATION.json]]
+                        [--blocks PATTERN] [--tokenizer RELEASE_DIR [--chat CONVERSATION.json]]
+
+--blocks: the mixers as a `hybrid_override_pattern` (M Mamba-2, * attention, E MoE, - MLP;
+default MEM*EM-*EME). llama.cpp's `nemotron_h_moe` has no dense MLP block: MEM*EME*EME.
 
 --layout: the tensor names of OUT_DIR/model/model.safetensors: the release's, which
 save_pretrained writes (`backbone.layers.*`, one module per expert; the default), the module's
@@ -17,9 +20,10 @@ that conversation rendered by the chat template (written to OUT_DIR/prompt.txt).
 
 Writes OUT_DIR/model and OUT_DIR/ref.safetensors: `ids` (I64), `logits` [len, vocab] (one
 uncached forward), `gen` (I64, greedy tokens), `decode_logits` [gen, vocab] (after feeding each
-of them through the cache: transformers' one-token step, which does not clamp the time step) and
-`decode_logits_full` [gen, vocab] (the same positions of one uncached forward over the prompt
-and the generated tokens, time steps clamped as in NVIDIA's module).
+of them through the cache) and `decode_logits_full` [gen, vocab] (the same positions of one
+uncached forward over the prompt and the generated tokens). The two differ: transformers'
+multi-token scan floors the Mamba time step at `time_step_min`, its cached one-token step does
+not (NVIDIA's own code floors in neither; see docs/nemotron.md).
 Needs transformers >= 5.24 (float32, CPU, eager attention).
 """
 import json, os, sys
@@ -29,7 +33,7 @@ from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHCon
 from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHForCausalLM
 
 out = sys.argv[1]
-layout, plen, gen, seed, tokdir, chat = "release", 150, 16, 0, None, None
+layout, plen, gen, seed, tokdir, chat, pattern = "release", 150, 16, 0, None, None, "MEM*EM-*EME"
 a = sys.argv[2:]
 for i, x in enumerate(a):
     if x == "--layout":
@@ -44,15 +48,17 @@ for i, x in enumerate(a):
         tokdir = a[i + 1]
     if x == "--chat":
         chat = a[i + 1]
+    if x == "--blocks":
+        pattern = a[i + 1]
 torch.manual_seed(seed)
 # With the release's tokenizer: its vocabulary and special tokens.
 V, PAD, EOS = (131072, 0, [2, 11]) if tokdir else (512, 0, [1, 2])
 
-M, A, E, D = "linear_attention", "full_attention", "moe", "mlp"
+KINDS = {"M": "linear_attention", "*": "full_attention", "E": "moe", "-": "mlp"}
 cfg = NemotronHConfig(
     vocab_size=V,
     hidden_size=64,
-    layers_block_type=[M, E, M, A, E, M, D, A, E, M, E],
+    layers_block_type=[KINDS[c] for c in pattern],
     num_attention_heads=4,
     num_key_value_heads=2,
     head_dim=16,
@@ -88,7 +94,7 @@ def randomize(model):
             elif name.endswith("A_log"):
                 p.copy_(torch.rand_like(p) * 2 - 1)
             elif name.endswith("dt_bias"):
-                # softplus(-7) is below the floor of 0.001
+                # softplus(-7) is below transformers' floor of 0.001
                 p.copy_(torch.randn_like(p) * 2 - 4)
             elif name.endswith("mixer.D"):
                 p.copy_(1.0 + torch.randn_like(p) * 0.3)
@@ -173,4 +179,4 @@ if __name__ == "__main__":
         os.path.join(out, "ref.safetensors"),
     )
     print(f"{layout}: {ids.shape[1]} prompt tokens, greedy {toks}")
-    print(f"cached steps vs uncached forward (the time step floor): max logit diff {(dec - full).abs().max():.3e}")
+    print(f"cached steps against the uncached forward (transformers' time step floor): max logit diff {(dec - full).abs().max():.3e}")
