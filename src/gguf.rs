@@ -1168,10 +1168,18 @@ pub fn hf_tensors(h: &Header) -> Result<Vec<HfTensor>> {
     // as OmniGen2), llama.cpp vision `clip` files (mmproj) and DFlash / DSpark drafts (`dflash`,
     // or `dspark` from llama.cpp's DSpark branch; see `crate::dspark`) keep their original tensor
     // names; T5 encoders (`t5encoder`) get the transformers names.
-    if matches!(
-        h.arch(),
-        "flux" | "sd3" | "qwen_image" | "pig" | "omnigen2" | "t5encoder" | "clip" | "dflash" | "dspark"
-    ) {
+    // (ComfyUI conversions of Qwen-Image-2.1 carry no metadata at all: a file without an
+    // architecture whose tensors are a diffusion model's keeps its names too.)
+    let bare_diffusion = h.arch().is_empty()
+        && h.tensors
+            .iter()
+            .any(|t| t.name.starts_with("model.diffusion_model.") || t.name == "img_in.weight");
+    if bare_diffusion
+        || matches!(
+            h.arch(),
+            "flux" | "sd3" | "qwen_image" | "qwen_image21" | "pig" | "omnigen2" | "t5encoder" | "clip" | "dflash" | "dspark"
+        )
+    {
         let t5 = h.arch() == "t5encoder";
         // DeepSeek V4 DSpark drafts: the stages (and their head) named as the target's layers.
         let ds4 = h.arch() == "dflash" && h.get("dflash.hyper_connection.count").is_some();

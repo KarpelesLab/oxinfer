@@ -31,11 +31,17 @@
 //! transformer at load; the transformer can come from a GGUF file (e.g. unsloth's
 //! `Qwen-Image-Edit-2511-GGUF`) and stream from storage. Components load on first use, and the
 //! 16 GB text encoder is dropped after encoding unless asked to stay.
+//!
+//! Qwen-Image-2.1 and -2.1-Turbo (`QwenImage21Pipeline`) are a different model behind the same
+//! [`Pipeline`]: a Qwen3-VL-8B text encoder, a 7B single-stream transformer (`transformer21`)
+//! and a 16x RGBA VAE; see `v21`.
 
 pub mod caption;
 pub mod controlnet;
 pub mod sched;
 pub mod transformer;
+pub mod transformer21;
+mod v21;
 pub mod vae;
 pub mod weights;
 
@@ -62,6 +68,8 @@ pub enum Kind {
     EditPlus,
     /// `QwenImageLayeredPipeline` (Qwen-Image-Layered): an image into RGBA layers.
     Layered,
+    /// `QwenImage21Pipeline` (Qwen-Image-2.1, -2.1-Turbo): text to image (RGBA).
+    V21,
 }
 
 /// The default `strength` of image to image and inpainting with a text-to-image model
@@ -84,6 +92,7 @@ fn kind_of(dir: &Path) -> Option<Kind> {
         "QwenImageEditPipeline" | "QwenImageEditInpaintPipeline" => Some(Kind::Edit),
         "QwenImageEditPlusPipeline" => Some(Kind::EditPlus),
         "QwenImageLayeredPipeline" => Some(Kind::Layered),
+        "QwenImage21Pipeline" => Some(Kind::V21),
         _ => None,
     }
 }
@@ -348,6 +357,13 @@ pub struct Pipeline {
     pub tcfg: TransformerConfig,
     text: Option<QwenVl>,
     tr: Option<LoadedTransformer>,
+    /// Qwen-Image-2.1: its transformer's config, the transformer once loaded, and the sampling
+    /// sigmas a distilled checkpoint saves (`model_index.json`'s `sample_sigmas`).
+    pub cfg21: Option<transformer21::Config21>,
+    tr21: Option<v21::LoadedTransformer21>,
+    pub sample_sigmas: Option<Vec<f32>>,
+    /// The alpha channel of the last image of an RGBA model (Qwen-Image-2.1), row-major.
+    pub alpha: Option<Vec<u8>>,
     control: Option<LoadedControl>,
     /// The caption the text encoder wrote for the last [`Pipeline::decompose`] without a prompt.
     pub caption: Option<String>,
@@ -542,16 +558,22 @@ impl Pipeline {
         crate::gpu::ensure(opts.device)?;
         let kind = kind_of(&dir).with_context(|| format!("{}: not a Qwen-Image diffusers pipeline", dir.display()))?;
         let tdir = dir.join("transformer");
-        let tcfg = if crate::fsx::exists(&tdir.join("config.json")) {
+        let cfg21 = match kind {
+            Kind::V21 => Some(transformer21::Config21::load(&tdir)?),
+            _ => None,
+        };
+        let tcfg = if let Some(c) = &cfg21 {
+            v21::shared_config(c)
+        } else if crate::fsx::exists(&tdir.join("config.json")) {
             TransformerConfig::load(&tdir)?
         } else {
             bail!("{}: no transformer/config.json", dir.display());
         };
         let sched = FlowMatch::load(&dir.join("scheduler").join("scheduler_config.json"))?;
         let vae = vae::Vae::load(&dir.join("vae"), true)?;
-        if (kind == Kind::Layered) != (vae.image_channels() == 4) {
+        if matches!(kind, Kind::Layered | Kind::V21) != (vae.image_channels() == 4) {
             bail!(
-                "{}: a {}-channel VAE does not fit this pipeline (Qwen-Image-Layered's is RGBA, the others' RGB)",
+                "{}: a {}-channel VAE does not fit this pipeline (Qwen-Image-Layered's and Qwen-Image-2.1's are RGBA, the others' RGB)",
                 dir.display(),
                 vae.image_channels()
             );
@@ -559,13 +581,14 @@ impl Pipeline {
         if (kind == Kind::Layered) != (tcfg.use_layer3d_rope && tcfg.use_additional_t_cond) {
             bail!("{}: the transformer's layered options do not fit the pipeline class", dir.display());
         }
-        if vae.cfg.z_dim * 4 != tcfg.in_channels {
+        if vae.cfg.z_dim * tcfg.patch_size * tcfg.patch_size != tcfg.in_channels {
             bail!(
                 "VAE latent channels {} do not match the transformer input {}",
                 vae.cfg.z_dim,
                 tcfg.in_channels
             );
         }
+        let sample_sigmas = if kind == Kind::V21 { v21::sample_sigmas(&dir) } else { None };
         Ok(Self {
             dir,
             kind,
@@ -574,6 +597,10 @@ impl Pipeline {
             tcfg,
             text: None,
             tr: None,
+            cfg21,
+            tr21: None,
+            sample_sigmas,
+            alpha: None,
             control: None,
             caption: None,
             vae,
@@ -585,6 +612,9 @@ impl Pipeline {
     /// The settings for `prompt` with this pipeline: Qwen's recommended ones ([`Params::new`]), or
     /// the Lightning ones when a Lightning LoRA is loaded (steps from its name).
     pub fn default_params(&self, prompt: &str) -> Params {
+        if self.kind == Kind::V21 {
+            return self.params21(prompt);
+        }
         match self.opts.lightning_steps() {
             Some(n) => Params::lightning(prompt, n),
             None => Params::new(prompt),
@@ -594,6 +624,7 @@ impl Pipeline {
     /// [`Params`] from a [`Request`].
     pub fn params(&self, r: &Request) -> Params {
         let mut p = match (r.lightning, self.opts.lightning_steps()) {
+            _ if self.kind == Kind::V21 => self.default_params(&r.prompt),
             (Some(true), n) => Params::lightning(&r.prompt, n.unwrap_or(4)),
             (Some(false), _) => Params::new(&r.prompt),
             (None, _) => self.default_params(&r.prompt),
@@ -702,7 +733,7 @@ impl Pipeline {
 
     /// Loads the transformer (if not loaded), merging the LoRA files.
     pub fn load_transformer(&mut self) -> Result<f64> {
-        if self.tr.is_some() {
+        if self.tr.is_some() || self.tr21.is_some() {
             return Ok(0.0);
         }
         let t0 = Instant::now();
@@ -723,6 +754,18 @@ impl Pipeline {
             .find(|p| fs.has(&format!("{p}img_in.weight")))
             .with_context(|| format!("{}: no img_in.weight (not a Qwen-Image transformer)", src.display()))?
             .to_string();
+        let is21 = fs.has(&format!("{prefix}modulation.1.weight"));
+        if is21 != (self.kind == Kind::V21) {
+            bail!(
+                "{}: {} transformer, which does not fit this pipeline",
+                src.display(),
+                if is21 { "a Qwen-Image-2.1" } else { "not a Qwen-Image-2.1" }
+            );
+        }
+        if is21 {
+            self.load_transformer21(files, prefix)?;
+            return Ok(t0.elapsed().as_secs_f64());
+        }
         let lora = if self.opts.loras.is_empty() {
             None
         } else {
@@ -791,6 +834,7 @@ impl Pipeline {
     /// Drops the transformer.
     pub fn unload_transformer(&mut self) {
         self.tr = None;
+        self.tr21 = None;
     }
 
     /// Loads the ControlNet of `Options::controlnet` (if not loaded), in its checkpoint precision.
@@ -849,7 +893,8 @@ impl Pipeline {
                 "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>{}<|im_end|>\n<|im_start|>assistant\n",
                 64,
             ),
-            Kind::EditPlus => (
+            // (Qwen-Image-2.1 builds its prompt in `v21`.)
+            Kind::EditPlus | Kind::V21 => (
                 "<|im_start|>system\nDescribe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
                 64,
             ),
@@ -894,6 +939,9 @@ impl Pipeline {
         if self.kind == Kind::Layered {
             bail!("{}: a layer-decomposition model; use decompose", self.dir.display());
         }
+        if self.kind == Kind::V21 {
+            return self.run21(&[], p, progress);
+        }
         if p.mask.is_some() && p.control.is_empty() {
             bail!("a mask needs the image to inpaint");
         }
@@ -910,6 +958,7 @@ impl Pipeline {
             bail!("an edit needs at least one input image");
         }
         match self.kind {
+            Kind::V21 => return self.run21(images, p, progress),
             Kind::Layered => bail!("{}: a layer-decomposition model; use decompose", self.dir.display()),
             Kind::TextToImage if images.len() > 1 => bail!("image to image takes one image"),
             Kind::Edit if images.len() > 1 => bail!("Qwen-Image-Edit takes one image (Edit-2509 / 2511 take several)"),

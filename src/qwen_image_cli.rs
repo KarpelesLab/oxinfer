@@ -126,7 +126,7 @@ pub fn run(args: &Args) -> Result<()> {
     if pipe.kind == Kind::Layered {
         return decompose(args, &mut pipe, p, images);
     }
-    if images.is_empty() && pipe.kind != Kind::TextToImage {
+    if images.is_empty() && !matches!(pipe.kind, Kind::TextToImage | Kind::V21) {
         eprintln!("[no --init-image: generating from the prompt alone]");
     }
     p.strength = args.strength;
@@ -181,10 +181,11 @@ pub fn run(args: &Args) -> Result<()> {
             String::new()
         },
         p.seed,
-        if lightning.is_some() {
-            ", Lightning scheduler (shift 3)"
-        } else {
-            ""
+        match (&pipe.sample_sigmas, lightning) {
+            (Some(s), _) if s.len() == p.steps => ", the checkpoint's saved sigmas",
+            (Some(_), _) => ", uniform sigmas (not the checkpoint's saved schedule)",
+            (None, Some(_)) => ", Lightning scheduler (shift 3)",
+            (None, None) => "",
         }
     );
     let mut progress = |i: usize, n: usize| eprint!("\r[step {i}/{n}]");
@@ -198,7 +199,23 @@ pub fn run(args: &Args) -> Result<()> {
         eprintln!("{l}");
     }
     let out = args.output.clone().unwrap_or_else(|| PathBuf::from("image.png"));
-    std::fs::write(&out, oxinfer::png::encode_rgb(img.width, img.height, &img.rgb)).with_context(|| format!("write {}", out.display()))?;
+    // An RGBA model (Qwen-Image-2.1) that drew transparency: a PNG with its alpha channel.
+    let png = match &pipe.alpha {
+        Some(alpha) if alpha.iter().any(|&v| v != 255) => {
+            let rgba: Vec<u8> = img
+                .rgb
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .zip(alpha)
+                .flat_map(|(p, &a)| [p[0], p[1], p[2], a])
+                .collect();
+            eprintln!("[the image has transparency: writing RGBA]");
+            oxinfer::png::encode_rgba(img.width, img.height, &rgba)
+        }
+        _ => oxinfer::png::encode_rgb(img.width, img.height, &img.rgb),
+    };
+    std::fs::write(&out, png).with_context(|| format!("write {}", out.display()))?;
     eprintln!(
         "[load text {:.1}s, encode {:.1}s | vae encode {:.1}s | load transformer {:.1}s | denoise {:.1}s ({} passes, {:.2}s each) | decode {:.1}s | {}x{} -> {}]",
         tm.load_text,
