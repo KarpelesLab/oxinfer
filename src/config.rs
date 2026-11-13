@@ -725,6 +725,18 @@ pub struct QwenConfig {
     /// Set for MiniMax-01 checkpoints: the linear layers are lightning attention.
     #[serde(skip)]
     pub lightning: bool,
+    /// IBM Granite (`model_type` "granite"): a Llama-style decoder whose attention scores are
+    /// scaled by `attention_multiplier` (not `1 / sqrt(head_dim)`), embeddings by
+    /// `embedding_multiplier`, each sublayer's output by `residual_multiplier` before it joins the
+    /// residual, and whose logits are divided by `logits_scaling`. Kept for Granite only.
+    #[serde(default)]
+    pub attention_multiplier: Option<f64>,
+    #[serde(default)]
+    pub embedding_multiplier: Option<f64>,
+    #[serde(default)]
+    pub residual_multiplier: Option<f64>,
+    #[serde(default)]
+    pub logits_scaling: Option<f64>,
 }
 
 /// `sparse_attention_config` of MiniMax M3's release.
@@ -763,7 +775,8 @@ impl QwenConfig {
             serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?
         };
         let mt = raw.get("model_type").and_then(|v| v.as_str());
-        let llama = mt == Some("llama");
+        let granite = mt == Some("granite");
+        let llama = mt == Some("llama") || granite;
         // Qwen2 / Qwen2.5 and their vision-language models: no query / key norms, biased q / k / v
         // projections, contiguous M-RoPE sections.
         let qwen2 = matches!(mt, Some("qwen2" | "qwen2_vl" | "qwen2_5_vl"));
@@ -790,6 +803,10 @@ impl QwenConfig {
             if cfg.rope_theta.is_none() && cfg.rope_parameters.is_none() {
                 cfg.rope_theta = Some(1_000_000.0);
             }
+        }
+        if !granite {
+            (cfg.attention_multiplier, cfg.embedding_multiplier) = (None, None);
+            (cfg.residual_multiplier, cfg.logits_scaling) = (None, None);
         }
         if llama {
             cfg.qk_norm = false;
@@ -903,6 +920,23 @@ impl QwenConfig {
             serde_json::Value::Array(a) => a.last().and_then(|v| v.as_u64()).map(|v| v as u32),
             _ => None,
         }
+    }
+    /// The factor on the attention scores: `1 / sqrt(head_dim)`, or Granite's multiplier.
+    pub fn attn_scale(&self) -> f32 {
+        match self.attention_multiplier {
+            Some(m) => m as f32,
+            None => (self.head_dim as f32).powf(-0.5),
+        }
+    }
+    /// Granite's `(embedding_multiplier, residual_multiplier, 1 / logits_scaling)` when one of
+    /// them is not 1 (Granite 3; Granite 4.1 / 4.2 set all three to 1).
+    pub fn granite_scales(&self) -> Option<(f32, f32, f32)> {
+        let s = (
+            self.embedding_multiplier.unwrap_or(1.0) as f32,
+            self.residual_multiplier.unwrap_or(1.0) as f32,
+            (1.0 / self.logits_scaling.unwrap_or(1.0)) as f32,
+        );
+        (s != (1.0, 1.0, 1.0)).then_some(s)
     }
     pub fn rope_theta(&self) -> f64 {
         self.rope_parameters

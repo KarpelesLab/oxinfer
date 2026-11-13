@@ -308,6 +308,10 @@ pub const CATALOG: &[Model] = &[
         .speed(3.06, 24)
         .note("half of its parameters are a per-layer embedding table read one row a token"),
     Model::new("Qwen/Qwen2.5-VL-3B-Instruct", Kind::Chat, 3.8, 7.5, &[Text, ImageInput]),
+    Model::new("ibm-granite/granite-4.2-3b", Kind::Chat, 3.7, 7.3, AGENT).speed(6.81, 40),
+    Model::new("ibm-granite/granite-4.2-3b-GGUF:Q4_K_M", Kind::Chat, 3.7, 2.2, AGENT)
+        .fixed(Format::GgufQ4K, "GGUF Q4_K_M")
+        .speed(2.10, 40),
     Model::new("mlx-community/Qwen3-4B-4bit", Kind::Chat, 4.0, 2.4, AGENT)
         .fixed(Format::Q4, "MLX 4-bit")
         .speed(2.39, 36),
@@ -332,6 +336,10 @@ pub const CATALOG: &[Model] = &[
     )
     .fixed(Format::Q4, "MLX 4-bit"),
     Model::new("Qwen/Qwen2.5-VL-7B-Instruct", Kind::Chat, 8.3, 16.6, &[Text, ImageInput]),
+    Model::new("webAI-Official/TwIL-8B:Q4_K_M-balanced", Kind::Chat, 8.8, 5.3, AGENT)
+        .fixed(Format::GgufQ4K, "GGUF Q4_K_M")
+        .speed(5.11, 40)
+        .note("a Granite 4.2 8B fine-tune that reasons at length (--think)"),
     Model::new("Qwen/Qwen3.5-9B", Kind::Chat, 9.0, 19.3, QWEN_VL).speed(15.87, 32),
     Model::new("autotrust/JEV-9B", Kind::Chat, 9.0, 18.2, &[Decisions, Text]).note("typed decisions; image decisions with its vl/ folder"),
     Model::new("google/gemma-4-12B-it", Kind::Chat, 12.0, 24.0, GEMMA_L).note("supported, untested"),

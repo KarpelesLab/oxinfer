@@ -313,6 +313,7 @@ impl Header {
             "qwen3" => "qwen3",
             "qwen2" => "qwen2",
             "llama" => "llama",
+            "granite" => "granite",
             "gemma4" => "gemma4_text",
             "mistral-large4" => "mistral_large4_text",
             "deepseek4" => "deepseek_v4",
@@ -325,7 +326,7 @@ impl Header {
             "kimi-k31" => "kimi_k31",
             "nemotron_h" | "nemotron_h_moe" => "nemotron_h",
             a => bail!(
-                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, llama, gemma4, mistral-large4, deepseek4, deepseek41, minimax-m2, minimax-m3, glm5-next, glm-dsa, nemotron_h, nemotron_h_moe and qwen2 are)"
+                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, llama, granite, gemma4, mistral-large4, deepseek4, deepseek41, minimax-m2, minimax-m3, glm5-next, glm-dsa, nemotron_h, nemotron_h_moe and qwen2 are)"
             ),
         })
     }
@@ -359,7 +360,8 @@ impl Header {
         if mt == "nemotron_h" {
             return crate::nemotron::gguf_config(self);
         }
-        let llama = mt == "llama";
+        let granite = mt == "granite";
+        let llama = mt == "llama" || granite;
         let minimax = matches!(mt, "minimax_m2" | "minimax_m3_vl_text");
         if let Some(t) = self.get(&format!("{}.rope.scaling.type", self.arch())).and_then(Value::as_str)
             && !matches!(t, "none" | "llama3")
@@ -398,6 +400,20 @@ impl Header {
             let rot = self.arch_u64("rope.dimension_count").unwrap_or(head_dim);
             if rot != head_dim {
                 bail!("GGUF Llama with partial RoPE ({rot} of {head_dim} dimensions) is not supported");
+            }
+            if granite {
+                // Granite's scales (llama.cpp: 0 or absent means the default).
+                let o = c.as_object_mut().unwrap();
+                for (k, g) in [
+                    ("attention_multiplier", "attention.scale"),
+                    ("embedding_multiplier", "embedding_scale"),
+                    ("residual_multiplier", "residual_scale"),
+                    ("logits_scaling", "logit_scale"),
+                ] {
+                    if let Some(v) = self.arch_f64(g).filter(|&v| v != 0.0) {
+                        o.insert(k.into(), json!(v));
+                    }
+                }
             }
         } else if minimax {
             // MiniMax M2: every layer a sigmoid-routed MoE without a shared expert, partial RoPE.
@@ -817,6 +833,8 @@ impl Header {
         // DeepSeek V3 / V4: digits in groups of up to three and CJK runs split off first, no
         // normalizer.
         let deepseek = matches!(pre, "deepseek-v3" | "joyai-llm");
+        // Granite (as its tokenizer.json): GPT-2's ByteLevel split, no normalizer.
+        let gpt2 = pre == "granite-docling";
         let regex = match pre {
             "deepseek-v3" | "joyai-llm" => {
                 r##"[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"##
@@ -840,8 +858,9 @@ impl Header {
             "llama-bpe" | "glm4" => {
                 r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
             }
+            "granite-docling" => r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
             p => bail!(
-                "GGUF pre-tokenizer {p:?} is not supported (qwen35, qwen2, llama-bpe, tekken, tekken-num3, deepseek-v3, joyai-llm and minimax-m2 are)"
+                "GGUF pre-tokenizer {p:?} is not supported (qwen35, qwen2, llama-bpe, granite-docling, tekken, tekken-num3, deepseek-v3, joyai-llm and minimax-m2 are)"
             ),
         };
         let tokens = self
@@ -892,7 +911,7 @@ impl Header {
             "truncation": null,
             "padding": null,
             "added_tokens": added,
-            "normalizer": if whole_words || deepseek { Json::Null } else { json!({"type": "NFC"}) },
+            "normalizer": if whole_words || deepseek || gpt2 { Json::Null } else { json!({"type": "NFC"}) },
             "pre_tokenizer": {"type": "Sequence", "pretokenizers": pretok},
             "post_processor": byte_level,
             "decoder": byte_level,
@@ -1137,7 +1156,7 @@ pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec
                     return Some((format!("model.layers.{l}.{n}"), shape));
                 }
                 (_, "attn_norm") => "input_layernorm.weight",
-                ("qwen3" | "qwen2" | "llama" | "minimax-m2" | "minimax-m3", "ffn_norm") => "post_attention_layernorm.weight",
+                ("qwen3" | "qwen2" | "llama" | "granite" | "minimax-m2" | "minimax-m3", "ffn_norm") => "post_attention_layernorm.weight",
                 // Qwen2's query / key / value biases.
                 (_, "attn_q") if suffix == "bias" => "self_attn.q_proj.bias",
                 (_, "attn_k") if suffix == "bias" => "self_attn.k_proj.bias",

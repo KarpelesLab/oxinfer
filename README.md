@@ -97,6 +97,7 @@ too. The device is chosen at run time (`--device auto`: a GPU when one starts, e
 | [Ripple-65B Preview](docs/ripple.md) | dense 65B with sliding and full attention layers, gated attention, value residuals; run as NVFP4 |
 | [Qwen3.8-Flash-Next](docs/qwen-flash-next.md) | 125B MoE with an n-gram embedding table |
 | [Unlimited-OCR-2](docs/ocr.md) | document OCR: page images to text with layout, block-sparse attention |
+| [IBM Granite 4 and TwIL-8B](docs/granite.md) | Granite 4.1 / 4.2 and their fine-tunes, safetensors and GGUF |
 | [Image, video and audio input](docs/multimodal-input.md) | the vision and audio towers of Gemma 4 and Qwen, Qwen2.5-VL |
 
 **Images and audio**

@@ -1426,6 +1426,8 @@ impl Engine {
             "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" | "qwen2" | "qwen2_5_vl"
             | "qwen3_vl" | "qwen4_exp" | "qwen4_exp_text" => Family::Qwen,
             "llama" => Family::Llama,
+            // Granite runs on the Llama (Qwen3) code path with its own scales and chat format.
+            "granite" => Family::Qwen,
             "minimax_m2" | "minimax_m3_vl" | "minimax_m3_vl_text" | "minimax" | "minimax_text_01" | "minimax_m1" | "minimax_vl_01" => {
                 Family::Qwen
             }
@@ -1444,6 +1446,12 @@ impl Engine {
         if family == Family::Llama && !chat::Llama3Chat::matches_model(&dir) {
             bail!(
                 "{}: the chat template is not Llama 3's (only the Llama 3 chat format is supported for Llama-architecture models)",
+                dir.display()
+            );
+        }
+        if model_type == "granite" && !chat::GraniteChat::matches_model(&dir) {
+            bail!(
+                "{}: the chat template is not Granite 4's (ChatML); Granite 3's chat format is not supported",
                 dir.display()
             );
         }
@@ -1590,6 +1598,8 @@ impl Engine {
                 decision = load_decision(decision_dir.as_deref(), &tok, &base, false, |ad| model.attach_lora(ad))?;
                 let fmt: &'static (dyn ChatFormat + Sync) = if family == Family::Llama {
                     &chat::Llama3Chat
+                } else if model_type == "granite" {
+                    &chat::GraniteChat
                 } else if model_type.starts_with("minimax") {
                     chat::minimax_for_model(&dir)
                 } else if model_type == "qwen2_5_vl" || model_type == "qwen2" {

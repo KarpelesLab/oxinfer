@@ -936,9 +936,20 @@ pub mod qwen {
 
     /// The system-prompt block the Qwen template inserts when tools are given.
     pub fn tools_block(tools: &[ToolSpec]) -> String {
+        tools_block_as(tools, true)
+    }
+
+    /// Granite 4's block: [`tools_block`] with each tool as its bare function object (`{"name":
+    /// ..., "description": ..., "parameters": ...}`, no `{"type": "function", ...}` around it).
+    pub fn tools_block_bare(tools: &[ToolSpec]) -> String {
+        tools_block_as(tools, false)
+    }
+
+    fn tools_block_as(tools: &[ToolSpec], wrapped: bool) -> String {
         let mut s = String::from("# Tools\n\nYou have access to the following functions:\n\n<tools>");
         for t in tools {
-            let v = json!({ "type": "function", "function": { "name": t.name, "description": t.description, "parameters": t.parameters } });
+            let f = json!({ "name": t.name, "description": t.description, "parameters": t.parameters });
+            let v = if wrapped { json!({ "type": "function", "function": f }) } else { f };
             s.push('\n');
             s.push_str(&py_json(&v));
         }

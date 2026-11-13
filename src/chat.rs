@@ -633,6 +633,97 @@ impl ChatFormat for Llama3Chat {
     }
 }
 
+/// IBM Granite 4.1 / 4.2 and their fine-tunes (their `chat_template.jinja`): ChatML turns, a
+/// system turn always (empty without a system prompt), the tools after the system prompt as bare
+/// JSON functions with Qwen 3.5's instructions and `<tool_call><function=...>` calls, results as
+/// `<tool_response>` blocks of one user turn. The reply opens with `<think>\n` when thinking, and
+/// with an empty `<think></think>` otherwise.
+pub struct GraniteChat;
+impl GraniteChat {
+    /// Whether the model's chat template is this format (ChatML: Granite 4.1 / 4.2) rather than
+    /// Granite 3's `<|start_of_role|>` turns; a model without a template counts as this format.
+    pub fn matches_model(dir: &std::path::Path) -> bool {
+        model_template(dir).is_none_or(|t| t.contains("<|im_start|>"))
+    }
+
+    fn think_tail(think: bool) -> &'static str {
+        if think { "<think>\n" } else { "<think></think>" }
+    }
+}
+impl ChatFormat for GraniteChat {
+    fn conversation_start(&self, system: Option<&str>, _think: bool) -> String {
+        format!("<|im_start|>system\n{}<|im_end|>\n", system.unwrap_or(""))
+    }
+    fn user_turn(&self, content: &str, think: bool) -> String {
+        format!(
+            "<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n{}",
+            Self::think_tail(think)
+        )
+    }
+    fn end_of_model_turn(&self) -> String {
+        "<|im_end|>\n".to_string()
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        "<|im_end|>"
+    }
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        ("<think>", "</think>")
+    }
+    fn starts_in_thinking(&self, think: bool) -> bool {
+        think
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, think: bool, tools: &[ToolSpec]) -> String {
+        if tools.is_empty() {
+            return self.conversation_start(system, think);
+        }
+        let mut s = String::from("<|im_start|>system\n");
+        if let Some(sys) = system.filter(|s| !s.is_empty()) {
+            s.push_str(sys);
+            s.push_str("\n\n");
+        }
+        s.push_str(&crate::tools::qwen::tools_block_bare(tools));
+        s.push_str("<|im_end|>\n");
+        s
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        "<tool_call>"
+    }
+    fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
+        crate::tools::qwen::parse_calls(raw)
+    }
+    fn parse_tool_calls_for(&self, raw: &str, tools: &[ToolSpec]) -> Vec<ToolCall> {
+        crate::tools::qwen::parse_calls_for(raw, tools)
+    }
+    fn tool_syntax(&self) -> Option<crate::constrain::ToolSyntax> {
+        Some(crate::constrain::ToolSyntax::QwenXml)
+    }
+    fn tool_results(&self, results: &[ToolResult], think: bool) -> String {
+        let mut s = String::from("<|im_end|>\n<|im_start|>user\n");
+        for r in results {
+            s.push_str("<tool_response>\n");
+            s.push_str(&r.content);
+            s.push_str("\n</tool_response>\n");
+        }
+        s.push_str("<|im_end|>\n<|im_start|>assistant\n");
+        s.push_str(Self::think_tail(think));
+        s
+    }
+    fn assistant_text(&self, content: &str, calls: &[ToolCall]) -> String {
+        if calls.is_empty() {
+            return content.to_string();
+        }
+        // The template's layout: the text and a newline (also after no text), then each call
+        // on its own lines.
+        let mut s = content.trim().to_string();
+        s.push('\n');
+        for c in calls {
+            s.push_str(&crate::tools::qwen::call(c, false));
+            s.push('\n');
+        }
+        s
+    }
+}
+
 /// Mistral Large 4 (its `chat_template.jinja`): `<s>[SYSTEM_PROMPT]...[/SYSTEM_PROMPT]`, the
 /// tools and `[MODEL_SETTINGS]{"reasoning_effort": "..."}[/MODEL_SETTINGS]` before the first
 /// user turn, `[INST]...[/INST]` user turns, replies closed by `</s>`. The template always sets
@@ -2494,6 +2585,59 @@ mod tests {
         assert_eq!(
             s,
             "<|open|>message role=\"system\" type=\"tool-declare\"<|sep|># Tools\nHere are the available tools, described in JSONSchema.\n\n```json\n[{\"function\":{\"description\":\"Weather in a city (°C)\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"description\":\"forecast days\",\"type\":\"integer\"}},\"required\":[\"city\"],\"type\":\"object\"}},\"type\":\"function\"}]\n```<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Weather?<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|><|close|>response<|sep|><|open|>tools<|sep|><|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|open|>argument key=\"city\" type=\"string\"<|sep|>Paris \"FR\" & co<|close|>argument<|sep|><|open|>argument key=\"days\" type=\"number\"<|sep|>3<|close|>argument<|sep|><|open|>argument key=\"opts\" type=\"object\"<|sep|>{\"a\": [1, 2.5], \"b\": null}<|close|>argument<|sep|><|open|>argument key=\"raw\" type=\"boolean\"<|sep|>true<|close|>argument<|sep|><|close|>call<|sep|><|open|>call tool=\"get_weather\" index=\"2\"<|sep|><|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"tool\" tool=\"get_weather\" index=\"1\"<|sep|>22 and sunny<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"tool\" tool=\"get_weather\" index=\"2\"<|sep|>no city<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>Sunny.<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|><|open|>message role=\"user\"<|sep|>Thanks<|close|>message<|sep|><|end_of_msg|><|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>"
+        );
+    }
+
+    /// The renderings of Granite 4.2's own chat template (transformers' apply_chat_template).
+    #[test]
+    fn granite_matches_template() {
+        let f = GraniteChat;
+        assert_eq!(
+            f.first_turn(None, false, &[], "Hi"),
+            "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think></think>"
+        );
+        assert_eq!(
+            f.first_turn(Some("Be brief."), true, &[], "Hi"),
+            "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+        let tool = ToolSpec {
+            name: "weather".into(),
+            description: "Get the weather.".into(),
+            parameters: serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]}),
+        };
+        let decl = r#"{"name": "weather", "description": "Get the weather.", "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city"]}}"#;
+        let tools = std::slice::from_ref(&tool);
+        let head = f.first_turn(Some("Be brief."), false, tools, "Weather in Paris?");
+        assert!(
+            head.starts_with(&format!(
+                "<|im_start|>system\nBe brief.\n\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{decl}\n</tools>\n\nIf you choose"
+            )),
+            "{head}"
+        );
+        assert!(
+            head.ends_with("</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think>")
+        );
+        assert!(
+            f.first_turn(None, false, tools, "Hi")
+                .starts_with("<|im_start|>system\n# Tools\n\n")
+        );
+        // A past reply with a call, and the results turn.
+        let call = "<tool_call>\n<function=weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>\n";
+        let calls = f.parse_tool_calls_for(call, tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            (calls[0].name.as_str(), &calls[0].arguments["days"]),
+            ("weather", &serde_json::json!(3))
+        );
+        assert_eq!(f.assistant_text("Let me check.", &calls), format!("Let me check.\n{call}"));
+        assert_eq!(f.assistant_text("", &calls), format!("\n{call}"));
+        let results = [ToolResult {
+            name: "weather".into(),
+            content: "{\"temp\": 21}".into(),
+        }];
+        assert_eq!(
+            f.tool_results(&results, false),
+            "<|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temp\": 21}\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n<think></think>"
         );
     }
 }

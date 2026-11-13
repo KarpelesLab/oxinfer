@@ -44,6 +44,7 @@ impl QwenModel<'_> {
             || self.cfg.qk_norm_full()
             || self.cfg.use_gemma_norm
             || self.cfg.attn_type_list.is_some()
+            || self.cfg.granite_scales().is_some()
             || self.layers.iter().any(|l| match &l.mixer {
                 Mixer::Lightning(_) => true,
                 Mixer::Attn(at) => at.indexer.is_some(),

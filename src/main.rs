@@ -1651,7 +1651,7 @@ fn run(mut args: Args) -> Result<()> {
         "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" | "qwen2" | "qwen2_5_vl"
         | "qwen3_vl" | "qwen4_exp" | "qwen4_exp_text" => run_qwen(args),
         // Llama 3 runs on the Qwen3 code path.
-        "llama" => run_qwen(args),
+        "llama" | "granite" => run_qwen(args),
         // MiniMax M2 / M2.1 / M2.5 / M2.7: the Qwen code path with MiniMax's attention norms and router.
         "minimax_m2" | "minimax_m3_vl" | "minimax_m3_vl_text" | "minimax" | "minimax_text_01" | "minimax_m1" | "minimax_vl_01" => {
             run_qwen(args)
@@ -2147,8 +2147,14 @@ fn run_qwen(mut args: Args) -> Result<()> {
     let mut model = qwen::QwenModel::load(cfg, &files, args.quant)?;
     let tok = load_tokenizer(&args.model)?;
     let qwen2_fmt;
-    let fmt: &dyn ChatFormat = if config::model_type(&args.model)?.starts_with("minimax") {
+    let model_type = config::model_type(&args.model)?;
+    let fmt: &dyn ChatFormat = if model_type.starts_with("minimax") {
         chat::minimax_for_model(&args.model)
+    } else if model_type == "granite" {
+        if !args.raw && !chat::GraniteChat::matches_model(&args.model) {
+            eprintln!("[warning: the model's chat template is not Granite 4's (ChatML); prompts use the Granite 4 format anyway]");
+        }
+        &chat::GraniteChat
     } else if model.cfg.qk_norm {
         chat::QwenChat::for_model(&args.model)
     } else if model.cfg.attention_bias {

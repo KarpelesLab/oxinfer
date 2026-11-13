@@ -1123,6 +1123,8 @@ impl<'a> QwenModel<'a> {
             };
         }
         let cfg = &self.cfg;
+        // Granite 3's embedding / residual / logit scales are applied on the CPU path only.
+        cfg.granite_scales().is_none().then_some(())?;
         let h = cfg.hidden_size;
         let eps = cfg.rms_norm_eps as f32;
         let (nh, nkv, hd) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
@@ -1433,7 +1435,7 @@ impl<'a> QwenModel<'a> {
                 nh,
                 nkv,
                 hd,
-                scale: (hd as f32).powf(-0.5),
+                scale: cfg.attn_scale(),
                 window: None,
                 gate: gated.then_some((qkv.at(hd), 2 * hd)),
                 block: None,
@@ -1818,6 +1820,9 @@ impl<'a> QwenModel<'a> {
         let _timer = prof::start(Cat::Head);
         let mut logits = vec![0f32; t * self.cfg.vocab_size];
         linear(&self.lm_head, self.cfg.vocab_size, self.cfg.hidden_size, hidden, t, &mut logits);
+        if let Some((_, _, inv)) = self.cfg.granite_scales() {
+            logits.iter_mut().for_each(|v| *v *= inv);
+        }
         logits
     }
 
@@ -1825,7 +1830,7 @@ impl<'a> QwenModel<'a> {
     /// one is active and the weights do not stream (a draft's head: the drafts may differ from
     /// the CPU's in the last bits, the verification keeps the output exact).
     pub fn logits_device(&self, hidden: &[f32], t: usize) -> Vec<f32> {
-        if self.stream.is_none() && t <= 4 {
+        if self.stream.is_none() && t <= 4 && self.cfg.granite_scales().is_none() {
             let _timer = prof::start(Cat::Head);
             let (v, h) = (self.cfg.vocab_size, self.cfg.hidden_size);
             let mut logits = vec![0f32; t * v];
@@ -1936,6 +1941,11 @@ impl<'a> QwenModel<'a> {
             let tok = tokens[ti] as usize;
             self.embed.row(tok, row);
         });
+        // Granite: scaled embeddings, and sublayer outputs scaled as they join the residual.
+        let granite = cfg.granite_scales();
+        if let Some((e, _, _)) = granite {
+            x.iter_mut().for_each(|v| *v *= e);
+        }
         for &(i, emb) in mm {
             x[i * h..(i + 1) * h].copy_from_slice(emb);
         }
@@ -1975,6 +1985,7 @@ impl<'a> QwenModel<'a> {
             let post = cfg.postnorm_scales(l);
             match post {
                 Some([(a, b), _]) => residual_scaled(&mut x, &hn, a, &y, b),
+                None if let Some((_, r, _)) = granite => x.iter_mut().zip(&y).for_each(|(x, y)| *x += r * y),
                 None => add_inplace(&mut x, &y),
             }
             if let Some(iv) = &iv {
@@ -1997,6 +2008,7 @@ impl<'a> QwenModel<'a> {
             );
             match post {
                 Some([_, (a, b)]) => residual_scaled(&mut x, &hn, a, &y, b),
+                None if let Some((_, r, _)) = granite => x.iter_mut().zip(&y).for_each(|(x, y)| *x += r * y),
                 None => add_inplace(&mut x, &y),
             }
             if let Some(iv) = &iv {
@@ -2106,7 +2118,7 @@ impl<'a> QwenModel<'a> {
         }
 
         // Split query / gate, norm, partial RoPE, fold in the 1/sqrt(hd) scaling.
-        let scale = (hd as f32).powf(-0.5);
+        let scale = cfg.attn_scale();
         let mut q = vec![0f32; t * nh * hd];
         let mut gate = vec![0f32; t * nh * hd];
         let par = t > 1;
