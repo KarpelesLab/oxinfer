@@ -18,6 +18,8 @@ mod bagel_cli;
 #[cfg(feature = "media")]
 mod fish_cli;
 mod flux_cli;
+#[cfg(feature = "media")]
+mod haru_cli;
 mod intervene_cli;
 mod janus_cli;
 mod minimax_h3_cli;
@@ -511,7 +513,14 @@ fn usage() -> ! {
          \x20 --ref-audio FILE     voice cloning: a reference clip (or its codes as .npy) with\n\
          \x20 --ref-text TEXT      its exact transcript (default: FILE's .txt); without one the model picks a voice\n\
          \x20 --voice NAME         a clip of the model's voices/ folder (NAME.wav with NAME.txt)\n\
-         \x20 --temp, --top-p, --max-tokens, --seed  (defaults 0.7, 0.9, 1024 frames; --temp 0 is greedy)"
+         \x20 --temp, --top-p, --max-tokens, --seed  (defaults 0.7, 0.9, 1024 frames; --temp 0 is greedy)\n\
+         \n\
+         speech to speech (Haru: higurashi-ai/Haru-4B, full duplex at 24 kHz; see docs/haru.md):\n\
+         \x20 --audio FILE         a recording of the user, played to the model frame by frame;\n\
+         \x20                      -o FILE is what the model says meanwhile (its text on stdout)\n\
+         \x20 --system TEXT        the character card; --ref-audio FILE the voice the model speaks with\n\
+         \x20 --guidance S         audio guidance (1 to 2, default 1.5); --temp, --top-k, --seed for the text\n\
+         \x20                      (defaults 0.7, 25); --speak-json '{{\"speak_first\": true}}'"
     );
     eprintln!("\n{}", intervene_cli::USAGE);
     eprintln!("\n{}", flux_cli::USAGE);
@@ -1622,6 +1631,10 @@ fn run(mut args: Args) -> Result<()> {
             "{}: Audio8 TTS is a text-to-speech model: use --speak TEXT -o out.wav",
             args.model.display()
         );
+    }
+    #[cfg(feature = "media")]
+    if oxinfer::haru::is_haru(&args.model) {
+        return haru_cli::run(&args);
     }
     let model_type = config::model_type(&args.model)?;
     if model_type == "whisper" || args.transcribe.is_some() {
