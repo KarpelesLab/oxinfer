@@ -503,6 +503,9 @@ pub const CATALOG: &[Model] = &[
         &[TextToSpeech, VoiceCloning],
     )
     .note("voice cloning from a reference clip"),
+    Model::new("Zyphra/ZONOS3-Mini", Kind::Tts, 0.8, 1.2, &[TextToSpeech, VoiceCloning])
+        .fixed(Format::GgufQ4, "GGUF Q4_0 / Q8_0")
+        .note("44.1 kHz, 43 languages, 27 voices; cloning from a clip's speaker embedding; on the CPU"),
     Model::new(
         "stable-diffusion-v1-5/stable-diffusion-v1-5",
         Kind::Image,
