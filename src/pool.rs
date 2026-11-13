@@ -134,6 +134,8 @@ pub(crate) fn raise_qos() {
 
 thread_local! {
     /// Set while this thread runs a pool job: a nested `Pool::run` would wait on itself.
+    // Already const; clippy (1.100) still flags it on Android's thread-local implementation.
+    #[allow(clippy::missing_const_for_thread_local)]
     static IN_JOB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
