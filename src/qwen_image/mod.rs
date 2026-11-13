@@ -68,7 +68,8 @@ pub enum Kind {
     EditPlus,
     /// `QwenImageLayeredPipeline` (Qwen-Image-Layered): an image into RGBA layers.
     Layered,
-    /// `QwenImage21Pipeline` (Qwen-Image-2.1, -2.1-Turbo): text to image (RGBA).
+    /// `QwenImage21Pipeline` (Qwen-Image-2.1, -2.1-Turbo): text to image, and editing with one
+    /// or more input images; RGBA.
     V21,
 }
 

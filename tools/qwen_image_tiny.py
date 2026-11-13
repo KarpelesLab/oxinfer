@@ -32,13 +32,16 @@ usage:
   qwen_image_tiny.py make21 SRC OUT [--seed S]
       Qwen-Image-2.1: SRC holds the real repo's small files (processor/, scheduler/,
       text_encoder/config.json, model_index.json). Writes OUT/base and OUT/turbo
-      (QwenImage21Pipeline), OUT/gguf (the transformer as GGUF files, and what they decode to)
-      and OUT/lora (a LoRA and the transformer with it merged). Needs a diffusers with the 2.1
-      pipeline (0.44.0.dev0, from source) and the `gguf` package.
-  qwen_image_tiny.py ref21 MODEL DUMP --prompt P [--size WxH] [--steps N] [--negative N --cfg F]
+      (QwenImage21Pipeline), OUT/gguf (the transformer as GGUF files, and what they decode to),
+      OUT/fp8 (an FP8 single file) and OUT/lora (a LoRA and the transformer with it merged).
+      Needs a diffusers with the 2.1 pipeline (0.43 ships it; these were run with 0.44.0.dev0
+      from source and transformers 5.23), torchvision, peft (LoRA) and the `gguf` package.
+  qwen_image_tiny.py ref21 MODEL DUMP --prompt P [--cond-image IMG ...] [--size WxH] [--steps N]
+      [--negative N --cfg F]
       [--transformer DIR | --transformer-gguf FILE] [--lora FILE --lora-scale F] [--bf16]
       [--low-mem] [--no-kv-cache] [--seed S]
-      The reference text-to-image run of a Qwen-Image-2.1 folder, used like `ref` (without
+      The reference run of a Qwen-Image-2.1 folder (text to image, or an edit of the
+      --cond-image files, which oxinfer takes as --init-image), used like `ref` (without
       --steps: the pipeline's own schedule, the saved sigmas of a Turbo checkpoint). On real
       weights: --transformer-gguf runs the weights a GGUF file decodes to (what oxinfer computes
       with from that file), --low-mem keeps one of text encoder and transformer in memory.
@@ -77,6 +80,7 @@ ap.add_argument("--lora-scale", type=float, default=1.0)
 ap.add_argument("--bf16", action="store_true", help="ref21: run in bfloat16 (real checkpoints)")
 ap.add_argument("--no-kv-cache", action="store_true", help="ref21: use_kv_cache=False")
 ap.add_argument("--transformer-gguf", help="ref21: the transformer from a GGUF file, dequantized")
+ap.add_argument("--cond-image", action="append", default=[], help="ref21: a condition image (an edit; repeatable)")
 ap.add_argument("--low-mem", action="store_true", help="ref21: drop the text encoder before loading the transformer")
 a = ap.parse_args()
 a.steps_given = a.steps is not None
@@ -404,7 +408,8 @@ def make21(src, out, seed):
     the same weights; the transformer again as GGUF files (OUT/gguf/tiny-21-comfy.gguf: ComfyUI's
     `model.diffusion_model.` names without metadata, Q8_0 blocks; OUT/gguf/tiny-21.gguf: plain
     names, `general.architecture = qwen_image21`, Q4_0 / Q8_0 blocks) and the weights those
-    decode to as diffusers folders (OUT/gguf/comfy, OUT/gguf/plain); a rank-4 LoRA
+    decode to as diffusers folders (OUT/gguf/comfy, OUT/gguf/plain); an FP8 "scaled" single file
+    in ComfyUI's layout (OUT/fp8/tiny21_fp8.safetensors, OUT/fp8/decoded); a rank-4 LoRA
     (OUT/lora/tiny_lora.safetensors, diffusers keys with alphas) and the transformer with it
     merged at strength 0.7 (OUT/lora/merged)."""
     import gguf
@@ -434,7 +439,7 @@ def make21(src, out, seed):
     rc = json.load(open(os.path.join(src, "text_encoder", "config.json")))
     text = dict(rc["text_config"])
     text.update(hidden_size=H, intermediate_size=128, num_attention_heads=4, num_key_value_heads=2, head_dim=16,
-                num_hidden_layers=3, rope_scaling={"mrope_interleaved": True, "mrope_section": [2, 3, 3], "rope_type": "default"})
+                num_hidden_layers=5, rope_scaling={"mrope_interleaved": True, "mrope_section": [2, 3, 3], "rope_type": "default"})
     vision = dict(rc["vision_config"])
     vision.update(depth=4, hidden_size=32, intermediate_size=64, num_heads=2, out_hidden_size=H,
                   deepstack_visual_indexes=[1, 2, 3])
@@ -498,6 +503,27 @@ def make21(src, out, seed):
         m.load_state_dict(dec)
         m.save_pretrained(os.path.join(gdir, folder))
 
+    # An FP8 "scaled" single file in ComfyUI's layout (as abenzerps' qwen-image-2.1-turbo-fp8),
+    # and what it decodes to.
+    fdir = os.path.join(out, "fp8")
+    os.makedirs(fdir, exist_ok=True)
+    f8 = torch.float8_e4m3fn
+    comfy, dec = {"scaled_fp8": torch.zeros(1)}, {}
+    for k, v in sd.items():
+        if v.ndim == 2 and not k.startswith(("img_in", "proj_out", "norm_out", "time_text_embed")):
+            s = (v.abs().max() / torch.finfo(f8).max).float()
+            q = (v / s).to(f8)
+            comfy[k] = q
+            comfy[k[: -len("weight")] + "scale_weight"] = s
+            dec[k] = q.float() * s
+        else:
+            comfy[k] = v.to(torch.bfloat16)
+            dec[k] = comfy[k].float()
+    save_file(comfy, os.path.join(fdir, "tiny21_fp8.safetensors"))
+    m = QwenImage21Transformer2DModel(**tkw).float().eval()
+    m.load_state_dict(dec)
+    m.save_pretrained(os.path.join(fdir, "decoded"))
+
     # A LoRA on the blocks' linear layers (diffusers keys, alpha 2 for rank 4), and its merge.
     ldir = os.path.join(out, "lora")
     os.makedirs(ldir, exist_ok=True)
@@ -525,7 +551,7 @@ def ref21(M, D):
     from PIL import Image
 
     os.makedirs(D, exist_ok=True)
-    names = ["prompt_embeds", "x0", "v0", "latents_out", "image"]
+    names = ["prompt_embeds", "cond_latents", "x0", "v0", "latents_out", "image"]
     if a.compare_only:
         for n in names:
             f = os.path.join(D, f"ref_{n}.npy")
@@ -535,6 +561,9 @@ def ref21(M, D):
         return
     dt = torch.bfloat16 if a.bf16 else torch.float32
     kw, pre = {}, None
+    cond = [Image.open(p).convert("RGB") for p in a.cond_image]
+    if a.low_mem and cond:
+        sys.exit("--low-mem runs text to image only")
     if a.low_mem:
         # Real checkpoints: the text encoder alone first, dropped before the transformer loads.
         import gc
@@ -576,7 +605,11 @@ def ref21(M, D):
                 fold[k] = v
         pipe.load_lora_weights(fold, adapter_name="l")
         pipe.set_adapters(["l"], adapter_weights=[a.lora_scale])
-    w, h = map(int, (a.size or "1024x1024").lower().split("x"))
+    if a.size or not cond:
+        w, h = map(int, (a.size or "1024x1024").lower().split("x"))
+    else:
+        from diffusers.pipelines.qwenimage21.pipeline_qwenimage21 import calculate_dimensions
+        w, h, _ = calculate_dimensions(1024 * 1024, cond[-1].size[0] / cond[-1].size[1])
     w, h = w // 32 * 32, h // 32 * 32
     lh, lw = h // 16, w // 16
     z = pipe.transformer.config.in_channels
@@ -587,6 +620,7 @@ def ref21(M, D):
     def hook(m, args, kws, out):
         cap.setdefault("v0", out[0][0][-lh * lw:])
         cap.setdefault("x0", kws["hidden_states"][0][-lh * lw:])
+        cap.setdefault("cond_latents", kws["hidden_states"][0][: -lh * lw])
 
     pipe.transformer.register_forward_hook(hook, with_kwargs=True)
     emb = []
@@ -600,6 +634,8 @@ def ref21(M, D):
     pipe.encode_prompt = encode_prompt
     call = dict(prompt=a.prompt, width=w, height=h, true_cfg_scale=a.cfg, output_type="latent",
                 latents=pipe._pack_latents(noise.to(dt), 1, z, lh, lw), use_kv_cache=not a.no_kv_cache)
+    if cond:
+        call["image"] = cond
     if pre is not None:
         call.update(prompt=None, prompt_embeds=pre[0])
         emb.extend(e[0] for e in pre)
@@ -613,6 +649,8 @@ def ref21(M, D):
         call["negative_prompt"] = a.negative
     lat = pipe(**call).images
     out = {"prompt_embeds": emb[0], "latents_out": lat[0], "x0": cap["x0"]}
+    if cond:
+        out["cond_latents"] = cap["cond_latents"]
     if a.cfg <= 1 or a.negative is None:
         out["v0"] = cap["v0"]
     if not a.own_embeds:
@@ -627,7 +665,7 @@ def ref21(M, D):
     out["image"] = px
     u8 = np.round(np.clip(px.numpy() * 0.5 + 0.5, 0, 1) * 255).astype(np.uint8)
     Image.fromarray(u8, "RGBA").save(os.path.join(D, "ref_image.png"))
-    print(f"2.1 t2i: {w}x{h}, {len(pipe.scheduler.timesteps)} steps, sigmas {[round(float(s), 6) for s in pipe.scheduler.sigmas]}")
+    print(f"2.1 {'edit' if cond else 't2i'}: {w}x{h}, {len(pipe.scheduler.timesteps)} steps, sigmas {[round(float(s), 6) for s in pipe.scheduler.sigmas]}")
     for n in names:
         if n in out:
             v = out[n].float().numpy()

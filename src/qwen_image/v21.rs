@@ -3,6 +3,10 @@
 //! - the prompt in the pipeline's own template (a system turn, "Comprehend and analyze the
 //!   provided prompt.", then the user turn) through the Qwen3-VL-8B text encoder; the
 //!   conditioning is the last layer's output *before* the final norm, minus the system turn;
+//! - an edit's input images, each resized to about 1024x1024, twice: through the text encoder's
+//!   vision tower (with its DeepStack features) as `<imageN><|vision_start|>...<|vision_end|>`
+//!   before the prompt, and through the VAE (opaque RGBA) into latent tokens that take the
+//!   places of the image's placeholders in the transformer's sequence;
 //! - the single-stream block-causal transformer (`transformer21`), the prompt's keys and values
 //!   computed once and reused by every step;
 //! - flow matching with Euler steps: `linspace(1, 1/steps, steps)` through the scheduler's
@@ -73,19 +77,22 @@ impl Pipeline {
         }
     }
 
-    /// The text encoder for Qwen-Image-2.1 (if not loaded): the language model alone.
-    fn load_text_encoder21(&mut self) -> Result<f64> {
-        if self.text.is_some() {
+    /// The text encoder for Qwen-Image-2.1 (if not loaded): the language model, and the vision
+    /// tower when there are condition images.
+    fn load_text_encoder21(&mut self, vision: bool) -> Result<f64> {
+        if self.text.as_ref().is_some_and(|t| t.has_vision() || !vision) {
             return Ok(0.0);
         }
+        self.text = None;
         let t0 = Instant::now();
         let pdir = self.dir.join("processor");
+        let has = |f: &str| crate::fsx::exists(&pdir.join(f));
         let vo = QwenVlOptions {
             quant: self.opts.text_quant,
             mmap: self.opts.mmap,
-            tokenizer_dir: crate::fsx::exists(&pdir.join("tokenizer.json")).then(|| pdir.clone()),
-            processor_dir: None,
-            vision: false,
+            tokenizer_dir: has("tokenizer.json").then(|| pdir.clone()),
+            processor_dir: (has("processor_config.json") || has("preprocessor_config.json")).then(|| pdir.clone()),
+            vision,
         };
         let vl = QwenVl::load(&self.dir.join("text_encoder"), &vo)?;
         if vl.hidden_size() != self.tcfg.joint_attention_dim {
@@ -99,15 +106,24 @@ impl Pipeline {
         Ok(t0.elapsed().as_secs_f64())
     }
 
-    /// The conditioning of `prompt` (text to image).
-    fn encode21(&self, prompt: &str) -> Result<Cond> {
+    /// The conditioning of `prompt` with the condition images `cond` (`<imageN>` and the image's
+    /// placeholders before the prompt, as the pipeline's template writes them).
+    fn encode21(&self, prompt: &str, cond: &[VlImage]) -> Result<Cond> {
         let vl = self.text.as_ref().context("text encoder not loaded")?;
         // Qwen has no BOS token: an empty prompt would leave the user turn empty.
         let prompt = if prompt.is_empty() { " " } else { prompt };
         let drop = vl.tokenize(SYSTEM)?.len();
-        let text = format!("{SYSTEM}<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n");
+        let pics: Vec<String> = cond
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("<image{}>{}", i + 1, c.placeholder()))
+            .collect();
+        let text = format!(
+            "{SYSTEM}<|im_start|>user\n{}{prompt}<|im_end|>\n<|im_start|>assistant\n",
+            pics.join(" ")
+        );
         let last = vl.model().cfg.num_hidden_layers - 1;
-        let mut h = vl.hidden_states(&text, &[], &[last])?;
+        let mut h = vl.hidden_states(&text, cond, &[last])?;
         let d = h.hidden;
         let n = h.ids.len();
         if n <= drop {
@@ -168,37 +184,63 @@ impl Pipeline {
         self.tr21.as_ref().map(|t| &t.t)
     }
 
-    /// Text to image with Qwen-Image-2.1.
+    /// Text to image with Qwen-Image-2.1, or with `images` an edit: the images condition the
+    /// prompt (through the text encoder's vision tower) and the transformer (their latents, in
+    /// the sequence where the prompt has their placeholders).
     pub(super) fn run21(&mut self, images: &[RgbImage], p: &Params, progress: &mut dyn FnMut(usize, usize)) -> Result<(Image, Timings)> {
         self.cancel.store(false, std::sync::atomic::Ordering::Relaxed);
         self.alpha = None;
-        if !images.is_empty() {
-            bail!(
-                "Qwen-Image-2.1: image editing (condition images) is not supported yet: its Qwen3-VL text encoder reads them through DeepStack vision features, which oxinfer does not run; text to image works"
-            );
-        }
         if p.mask.is_some() || p.strength.is_some() || !p.control.is_empty() {
             bail!("Qwen-Image-2.1: --strength, --mask and ControlNets are not supported");
+        }
+        for img in images {
+            if img.data.len() != img.width * img.height * 3 || img.data.is_empty() {
+                bail!("input image: {} bytes for {}x{} RGB", img.data.len(), img.width, img.height);
+            }
         }
         let mut tm = Timings::default();
         let sf = self.vae.scale();
         let mult = sf * 2;
-        let width = p.width.unwrap_or(1024) / mult * mult;
-        let height = p.height.unwrap_or(1024) / mult * mult;
+        // Condition images at about 1024x1024 (one resize for the text encoder and the VAE); the
+        // output takes the last one's aspect ratio.
+        let cond_rgb: Vec<Rgb> = images
+            .iter()
+            .map(|i| resized(i, calculate_dimensions(1024.0 * 1024.0, i.width as f64 / i.height as f64)))
+            .collect();
+        let (cw, ch) = cond_rgb.last().map_or((1024, 1024), |c| (c.1, c.2));
+        let width = p.width.unwrap_or(cw) / mult * mult;
+        let height = p.height.unwrap_or(ch) / mult * mult;
         if width < mult || height < mult {
             bail!("output size {width}x{height} is too small");
         }
         let guided = p.true_cfg > 1.0 && p.negative.is_some();
 
         // Conditioning (exact GPU matmuls, as for the other Qwen-Image text encoders).
-        tm.load_text = self.load_text_encoder21()?;
+        tm.load_text = self.load_text_encoder21(!images.is_empty())?;
         let t0 = Instant::now();
         let was_exact = crate::gpu::exact();
         crate::gpu::set_exact(true);
         let enc = (|| -> Result<(Cond, Option<Cond>)> {
-            let pos = self.encode21(&p.prompt)?;
+            let vl = self.text.as_ref().context("text encoder not loaded")?;
+            let cond: Vec<VlImage> = cond_rgb
+                .iter()
+                .map(|(rgb, w, h)| {
+                    let c = vl.encode_image(rgb, *w, *h, 0)?;
+                    // One placeholder per 2x2 latent tokens: the processor must keep the size.
+                    if c.size != (*w, *h) || c.n * 4 != (w / sf) * (h / sf) {
+                        bail!(
+                            "condition image {w}x{h}: the image processor made it {}x{} ({} tokens)",
+                            c.size.0,
+                            c.size.1,
+                            c.n
+                        );
+                    }
+                    Ok(c)
+                })
+                .collect::<Result<_>>()?;
+            let pos = self.encode21(&p.prompt, &cond)?;
             let neg = match (&p.negative, guided) {
-                (Some(n), true) => Some(self.encode21(n)?),
+                (Some(n), true) => Some(self.encode21(n, &cond)?),
                 _ => None,
             };
             Ok((pos, neg))
@@ -210,7 +252,7 @@ impl Pipeline {
             for (name, dst) in [("prompt_embeds_in.bin", Some(&mut pos)), ("negative_embeds_in.bin", neg.as_mut())] {
                 if let (Some(dst), true) = (dst, d.join(name).exists()) {
                     dst.hidden = read_f32(&d.join(name))?;
-                    dst.slots = vec![false; dst.hidden.len() / self.tcfg.joint_attention_dim];
+                    dst.slots.resize(dst.hidden.len() / self.tcfg.joint_attention_dim, false);
                 }
             }
         }
@@ -224,10 +266,37 @@ impl Pipeline {
         }
         self.check_cancel()?;
 
+        // The condition images' latents (the posterior's mode): opaque RGBA through the VAE.
+        let t1 = Instant::now();
+        let z = self.vae.cfg.z_dim;
+        let mut cond_tokens = Vec::new();
+        let mut cond_shapes = Vec::new();
+        for (rgb, w, h) in &cond_rgb {
+            let px: Vec<f32> = match self.vae.image_channels() {
+                4 => to_unit(rgb)
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .flat_map(|p| [p[0], p[1], p[2], 1.0])
+                    .collect(),
+                _ => to_unit(rgb),
+            };
+            let (lat, rh, rw) = self.vae.encode(&px, *h, *w)?;
+            cond_tokens.extend_from_slice(&lat);
+            cond_shapes.push(ImageShape {
+                frames: 1,
+                rows: rh,
+                cols: rw,
+            });
+        }
+        if !cond_tokens.is_empty() {
+            dump("cond_latents.bin", &cond_tokens);
+        }
+        tm.vae_encode = t1.elapsed().as_secs_f64();
+
         tm.load_transformer = self.load_transformer()?;
         let t2 = Instant::now();
         let tr = &self.tr21.as_ref().context("transformer not loaded")?.t;
-        let z = self.vae.cfg.z_dim;
         let (lh, lw) = (height / sf, width / sf);
         let target = ImageShape {
             frames: 1,
@@ -248,12 +317,12 @@ impl Pipeline {
         let sigmas = sched.plan(&base, Some(sched.mu(n0)))?.sigmas;
         let steps = sigmas.len() - 1;
         let _attn = AttnGuard(crate::gpu::set_exact_attention(true));
-        let mut pre: Prefix = tr.prefill(&pos.hidden, &pos.slots, &[], &[], target)?;
+        let mut pre: Prefix = tr.prefill(&pos.hidden, &pos.slots, &cond_tokens, &cond_shapes, target)?;
         let mut pre_neg = match &neg {
-            Some(n) => Some(tr.prefill(&n.hidden, &n.slots, &[], &[], target)?),
+            Some(n) => Some(tr.prefill(&n.hidden, &n.slots, &cond_tokens, &cond_shapes, target)?),
             None => None,
         };
-        drop((pos, neg));
+        drop((pos, neg, cond_tokens));
         for i in 0..steps {
             self.check_cancel()?;
             let (s, s_next) = (sigmas[i], sigmas[i + 1]);
