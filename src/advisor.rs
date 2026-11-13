@@ -382,6 +382,33 @@ pub const CATALOG: &[Model] = &[
     .moe(),
     Model::new("MiniMaxAI/MiniMax-Text-01", Kind::Chat, 456.0, 912.0, &[Text, Tools]).moe(),
     Model::new("MiniMaxAI/MiniMax-VL-01", Kind::Chat, 456.0, 913.0, &[Text, ImageInput, Tools]).moe(),
+    // DeepSeek V4.1 Flash: text only here (no vision tower), never run on the real weights (the
+    // agreement with DeepSeek's code is measured on tiny checkpoints). Sizes with the 111 GB of
+    // engram tables (IQ4_NL), which every conversion needs.
+    Model::new("unsloth/DeepSeek-V4.1-Flash-1017-GGUF:UD-IQ1_S", Kind::Chat, 748.0, 233.0, AGENT)
+        .fixed(Format::GgufLow, "GGUF UD-IQ1_S")
+        .moe()
+        .note("supported, untested; 111 GB of it engram tables read a few rows a token; text only"),
+    Model::new(
+        "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF:IQ2_XXS",
+        Kind::Chat,
+        748.0,
+        183.0,
+        AGENT,
+    )
+    .fixed(Format::GgufLow, "GGUF IQ2_XXS")
+    .moe()
+    .note("supported, untested; 192 of 384 experts kept; fetch DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf (111 GB, the repository's root) by hand"),
+    Model::new(
+        "AtomicChat/DeepSeek-V4.1-Flash-1017-Uncensored-GSQ-RCO-GGUF:IQ1_M",
+        Kind::Chat,
+        748.0,
+        232.0,
+        AGENT,
+    )
+    .fixed(Format::GgufLow, "GGUF IQ1_M")
+    .moe()
+    .note("supported, untested; needs DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf (111 GB) of ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF beside it"),
     Model::new(
         "unsloth/Mistral-Large-4-1T-A52B-GGUF:UD-Q2_K_XL",
         Kind::Chat,

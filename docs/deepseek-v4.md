@@ -151,7 +151,117 @@ C options `draft`, `draft_tokens`, `draft_p_min` work as for Mistral Large 4.
 
 Not done: the official FP8 / FP4 safetensors (above), the model's own MTP layer
 (`num_nextn_predict_layers`; DSpark replaces it), GPU decoding (no whole-pass Metal graph for this
-family; prefill only), the vision variant (`DeepSeek-V4-Flash-Vision-Exp`) and DeepSeek V4.1
-(`deepseek_v41`, a different architecture). DeepSeek-V4-Pro (1.6T, 49B active) has the same
-architecture and config keys and should load as GGUF, but was not tried (its smallest GGUFs are
-far beyond this machine's free disk).
+family; prefill only) and the vision variant (`DeepSeek-V4-Flash-Vision-Exp`). DeepSeek-V4-Pro
+(1.6T, 49B active) has the same architecture and config keys and should load as GGUF, but was not
+tried (its smallest GGUFs are far beyond this machine's free disk).
+
+## DeepSeek V4.1 Flash
+
+`deepseek-ai/DeepSeek-V4.1-Flash` and `-1017` (`deepseek_v41`; 40 layers of 5120, 384 experts of
+which 6 per token, 510 GB as FP8 with FP4 experts, 197 GB of that two engram tables) run on the
+DeepSeek V4 code (`deepseek41.rs`, a submodule of `deepseek4.rs`), as DeepSeek's own
+`inference/model.py` and `engram.py`. Text only: the vision tower is not implemented. **The real
+weights were never run**: every conversion needs more than the 150 GB this work could download
+(the smallest, with its engram tables, is 183 GB), so what follows was measured on tiny random
+checkpoints and on the headers of the released files. What differs from V4:
+
+- Hyper-connections in one pass: each sublayer computes its `pre` / `post` / `comb` weights from
+  the copies entering it but collapses them with the `pre` of the sublayer before it (the first
+  attention reads copy 0), and the final norm takes the copies collapsed with the last MoE's
+  `pre`. There is no `hc_head`.
+- No norm on the query heads; RMS norms with an epsilon of 1e-20.
+- Compressed keys are shared between layers. Layers 2, 8, 14 and 20 (`kv_source_layer_ids`)
+  compress their own input: at rate 2 (layers 2-19) a softmax over learned gates pools each pair
+  of tokens, without V4's position bias or overlap; at rate 1 (layers 20-39) every token gets a
+  second key, a projection and a norm. The layers after a key source attend to its keys.
+- The lightning indexers are shared too: layers 2, 8, 14, 20, 24, 28, 32 and 36
+  (`index_source_layer_ids`; 32 heads of 128, top 512) score the compressed keys, with index
+  keys the key source makes from its latents, and the layers down to the next index layer reuse
+  the choice. Layer 20 also keeps, per query, the 2048 best blocks of 8 compressed positions (a
+  block scores as its best position; the newest block is always kept), and the index layers
+  after it choose inside those blocks only.
+- Engram: before layers 1 and 14, the 2-grams, 3-grams and 4-grams ending at each token (over
+  compressed token ids, a table that folds case, accents and spacing: 99092 ids for the 129280
+  tokens) are hashed by 8 heads each into a table of 384M rows of 256; the 24 rows, projected,
+  give one key per residual copy and a value, and each copy gets the value times
+  `sigmoid(sign(d) sqrt(|d|))`, `d` the normalized product of copy and key. A decoded token
+  reads 48 rows of the tables (they are mapped, never loaded).
+- MoE: no hash-routed layers; the weights are renormalized with `norm_topk_prob`; the tokens of
+  an image span are selected with their own bias (`bias_vl`), take no engram lookup and stop the
+  n-grams of the tokens after them.
+
+As for V4, the reference's quantization simulations are left out (here: FP8 of the window keys
+and of the attention output, FP4 of the compressed keys with a scale per 16, FP4 of the indexer);
+whether llama.cpp leaves them out for this architecture was not checked.
+
+Checkpoints: GGUF files (`deepseek41`), and float safetensors in DeepSeek's naming (the tiny test
+checkpoints; the release's FP8 / FP4 tensors are not read, as for V4). Two GGUF layouts exist
+and both are read:
+
+- llama.cpp's (unsloth, ggml-org, ISTA-DASLab): the two engram tables as one
+  `per_layer_token_embd` (IQ4_NL, 111 GB, a part of its own), the hash inputs in the header
+  (`ple.layer_multipliers`, `ple.head_vocab_sizes`, `ple.head_offsets`, `engram.token_map`), the
+  product of the gate's two weights as `blk.N.engram_gate`. ISTA-DASLab's builds count the
+  table file among their parts without naming it as one
+  (`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`, at the repository's root): it is found beside the
+  parts or one folder up, by its header, but `org/repo:QUANT` does not fetch it.
+- AtomicChat's: the reference's hash buffers as tensors (`engram_token_map`, `engram_primes`,
+  `engram_offsets`, `engram_multipliers`), `engram_q` / `engram_k` apart, the config's own key
+  names, and the table file named by `deepseek41.engram.file` (the same ISTA-DASLab file, not in
+  AtomicChat's repository): it is read from beside the model or one folder up.
+
+The chat format is DeepSeek's `encoding/encoding.py` (`chat::DeepSeek41Chat`): V4's with a
+`<｜System｜>` token in front of the system part, in thinking mode a first line `Reasoning Effort:
+75 (range 1-100, ...)` (the encoder's default, "high"; not adjustable here), and DSML tags whose
+names start with a space (`<｜DSML｜ calls>`, ` invoke`, ` parameter`; forced tool calls included).
+The rendered prompts are byte-identical to the encoder's for chat and thinking mode, tools with
+and without a system prompt, and a round of tool calling (a unit test holds them). Tool
+namespaces, mid-conversation system messages, `latest_reminder` and task tokens are not
+rendered.
+
+Agreement with DeepSeek's code, run in float32 with its TileLang kernels replaced by PyTorch and
+the engram table read as floats (`tools/ref_deepseek41.py`), on a tiny random checkpoint in the
+official layout with every feature of the text model (`tools/deepseek41_tiny.py`: 8 layers at
+rates 0, 2, 2, 2, 1, 1, 1, 0; key sources at both rates; four index layers, one of them on
+another layer's keys; top 8 of up to 300 compressed keys; candidate blocks, 6 of 4, restricting
+the last index layer; engram before two layers with 3-grams and the real tokenizer's compressed
+ids; a 16-token window; YaRN; clamped experts), compared by `examples/deepseek4_check.rs`:
+
+| check (bf16 weights) | prefill: max logit diff / mean KL | 16 greedy decode steps |
+|---|---|---|
+| 60 tokens | 8.5e-5 / 5.2e-11 (60/60 top-1) | 8.0e-5 / 3.2e-11 (16/16 top-1) |
+| 300 tokens | 8.8e-5 / 5.0e-11 (300/300) | 5.4e-5 / 3.5e-11 (16/16) |
+| 300 tokens in passes of 1, 7, 64 | 7.6e-5, 7.6e-5, 8.8e-5 (300/300) | 5.2e-5, 5.2e-5, 5.4e-5 (16/16) |
+| 300 tokens, the reference itself prefilling 7 or 64 tokens then stepping | 9.0e-5, 8.3e-5 (300/300) | 4.8e-5, 4.6e-5 (16/16) |
+| 300 tokens with an image span of 10 positions (the reference's vision tower embeds a 126x84 picture; oxinfer is given those embeddings) | 1.3e-4 / 5.4e-11 (300/300) | 4.7e-5 / 2.8e-11 (16/16) |
+| the same checkpoint as GGUF in each released layout (`tools/deepseek41_gguf.py`: llama.cpp's, AtomicChat's, ISTA's unnamed table part) | 8.8e-5 (300/300), all three | 5.4e-5 (16/16) |
+
+The same top token at every step means the greedy continuations are identical. A unit test
+without a reference (`deepseek4::v41::tests::tiny_model`) holds that the logits do not depend on
+how the tokens are split into passes, that a rollback leaves no trace, and that the indexer's
+choice, the candidate blocks, the engram lookups and an image position each change the logits.
+
+On the released files, without their tensor data (sparse local files with the real headers,
+`deepseek4_check FILE --load`): the loader maps all 1043 tensors of
+unsloth/DeepSeek-V4.1-Flash-1017-GGUF UD-IQ1_S and of ISTA-DASLab's GSQ-RCO-Coder IQ2_XXS (192
+of the 384 experts kept: the expert count comes from the header), and the 1008 + 1 of
+AtomicChat's IQ1_M (with the 518 KB of its hash buffers fetched, which equal the other layout's
+header values); the tokenizer rebuilt from the GGUF metadata gives the ids of the official
+`tokenizer.json` on two test texts (special tokens, accents, CJK, code).
+
+```sh
+# every part in one folder (233 GB with the engram tables)
+./target/release/oxinfer --model unsloth/DeepSeek-V4.1-Flash-1017-GGUF:UD-IQ1_S -p "Why is the sky blue?"
+# ISTA-DASLab / AtomicChat: fetch the parts and DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf by hand, then
+./target/release/oxinfer --model DIR/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf --think -p "..."
+```
+
+Not done for V4.1: a run on the real weights (so no speed, no comparison with llama.cpp, and the
+assumption that `blk.N.engram_gate` is the product `q_weight * k_weight` is untested: the tiny
+GGUFs are written with that reading); image input (the ViT with 2D RoPE, the 3x3 aligner and the
+image processor; `mmproj` files are not read; the language model's side is in place and
+verified as above); DSpark (the `mtp.*` stages differ from V4's: 128 experts, a Markov head on the
+target's embedding and head, a confidence head; a `dspark*.gguf` beside the model is ignored and
+`--draft` refused); fetching ISTA-DASLab's table file with `org/repo:QUANT`; the FP8 / FP4
+release; GPU decoding. Runtime interventions use V4's hook points and were not measured on this
+architecture.

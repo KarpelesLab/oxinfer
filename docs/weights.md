@@ -42,7 +42,7 @@ fetches every part. Architectures: `qwen35`
 (Qwen3.5 / 3.6 / 3.8), `qwen35moe`, `qwen3`, `llama` (Llama 3.x, and Orpheus TTS, see
 [below](#llama-3-gguf)), `gemma4` (Gemma 4 text models, dense and 26B-A4B; see
 [Gemma 4 26B-A4B](gemma-4-26b.md#gemma-4-26b-a4b-moe)), `mistral-large4` (see
-[Mistral Large 4](mistral-large-4.md#mistral-large-4-1t-a52b), whose Pixtral `mmproj` file is read too) and `deepseek4`
+[Mistral Large 4](mistral-large-4.md#mistral-large-4-1t-a52b), whose Pixtral `mmproj` file is read too), `deepseek4` and `deepseek41`
 (see [DeepSeek V4](deepseek-v4.md#deepseek-v4-flash)). The tokenizer and chat template come from the
 GGUF metadata (the rebuilt tokenizer matches Qwen3.8's `tokenizer.json` on 305 test texts, and
 Gemma 4's, a SentencePiece-style BPE with byte fallback, on this README and multilingual text), and
