@@ -90,6 +90,7 @@ pub fn resolve(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
     if p.is_dir() || crate::gguf::is_gguf(p) {
         return Ok(p.to_path_buf());
     }
+    crate::gguf::check_magic(p)?;
     if let Some((repo, quant)) = spec.split_once(':')
         && repo.split('/').count() == 2
     {

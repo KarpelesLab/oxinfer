@@ -3111,6 +3111,7 @@ pub fn resolve_model(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
         if p.is_dir() || crate::gguf::is_gguf(&p) {
             Ok(p)
         } else {
+            crate::gguf::check_magic(&p)?;
             bail!("{spec}: not a directory or GGUF file (built without the `hf` feature, so repo ids cannot be fetched)")
         }
     }

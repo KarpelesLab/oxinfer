@@ -130,6 +130,19 @@ pub fn is_gguf(path: &Path) -> bool {
     path.is_file() && std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut m)).is_ok() && &m == b"GGUF"
 }
 
+/// Fails for a file named `*.gguf` that does not start with the GGUF magic (a damaged or
+/// truncated file: one quantization on the Hub has its whole header zeroed), which would
+/// otherwise be reported as "not a directory or repo id".
+pub fn check_magic(path: &Path) -> Result<()> {
+    if path.is_file() && path.extension().is_some_and(|e| e == "gguf") && !is_gguf(path) {
+        bail!(
+            "{}: not a GGUF file (it does not start with the GGUF magic: a damaged or incomplete download or upload)",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 struct Reader<R> {
     r: R,
     pos: usize,
@@ -1380,6 +1393,22 @@ pub fn scalar_metadata(h: &Header) -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `.gguf` file without the magic is reported as such; other paths are left to the caller.
+    #[test]
+    fn damaged_gguf_files_are_named() {
+        let dir = std::env::temp_dir().join(format!("oxinfer-gguf-magic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (bad, good, other) = (dir.join("zeroed.gguf"), dir.join("ok.gguf"), dir.join("notes.txt"));
+        std::fs::write(&bad, [0u8; 64]).unwrap();
+        std::fs::write(&good, b"GGUF\x03\0\0\0").unwrap();
+        std::fs::write(&other, b"hello").unwrap();
+        let e = check_magic(&bad).unwrap_err().to_string();
+        assert!(e.contains("not a GGUF file"), "{e}");
+        assert!(check_magic(&good).is_ok() && check_magic(&other).is_ok());
+        assert!(check_magic(&dir).is_ok() && check_magic(&dir.join("missing.gguf")).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// The header parser sizes every tensor type the kernels decode exactly as they do (a wrong
     /// size would shift every later tensor).
