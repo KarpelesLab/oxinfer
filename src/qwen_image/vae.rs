@@ -7,6 +7,14 @@
 //! single-head attention in the middle block, stride-2 downsampling after a `(0, 1, 0, 1)` zero
 //! pad, nearest 2x upsampling. Qwen-Image-Layered's VAE is the same network with four image
 //! channels (RGBA).
+//!
+//! `AutoencoderKLQwenImage21` (Qwen-Image-2.1: 64 latent channels, 16x compression, RGBA, a wider
+//! decoder) is the same family with `is_residual`: every level is a group of residual blocks and
+//! its resampling layer, with a parameter-free shortcut around the whole group added to its
+//! output: the mean over channel groups of the space-to-depth input going down (`AvgDown3D`), the
+//! channel-repeated depth-to-space input going up (`DupUp3D`). On one frame the temporal factor
+//! of a shortcut meets the zero frame the causal padding puts first: going down, the half of the
+//! folded channels that would come from it is zero; going up, the second temporal copy is kept.
 
 use crate::kernels::for_chunks;
 use crate::sd::ops::{Conv, Tensors, silu};
@@ -47,6 +55,12 @@ pub struct VaeConfig {
     pub temperal_downsample: Vec<bool>,
     pub latents_mean: Vec<f32>,
     pub latents_std: Vec<f32>,
+    /// Width of the decoder when it differs from the encoder's `base_dim` (Qwen-Image-2.1: 144).
+    #[serde(default)]
+    pub decoder_base_dim: Option<usize>,
+    /// Residual groups with shortcuts (`AutoencoderKLQwenImage21`).
+    #[serde(default)]
+    pub is_residual: bool,
 }
 
 /// Channel RMS norm: `x / max(|x|, 1e-12) * sqrt(C) * gamma` per pixel.
@@ -177,7 +191,74 @@ impl Attn {
     }
 }
 
+/// The shortcut around a residual group (`is_residual`), on one frame.
+#[derive(Clone, Copy)]
+enum Shortcut {
+    /// `AvgDown3D`: space-to-depth by `fs` (and a temporal factor `ft`), then the mean over
+    /// channel groups: `cin -> cout`.
+    AvgDown { cin: usize, cout: usize, ft: usize, fs: usize },
+    /// `DupUp3D`: channels repeated, then depth-to-space by 2 (and the temporal factor `ft`).
+    DupUp { cin: usize, cout: usize, ft: usize },
+}
+
+impl Shortcut {
+    /// The channel factor of the fold (temporal x spatial).
+    fn factor(&self) -> usize {
+        match *self {
+            Shortcut::AvgDown { ft, fs, .. } => ft * fs * fs,
+            Shortcut::DupUp { ft, .. } => ft * 4,
+        }
+    }
+
+    /// `x` `[h*w, cin]` to `[h2*w2, cout]`.
+    fn forward(&self, x: &[f32], h: usize, w: usize) -> Vec<f32> {
+        let factor = self.factor();
+        match *self {
+            Shortcut::AvgDown { cin, cout, ft, fs } => {
+                let gs = cin * factor / cout;
+                let (h2, w2) = (h / fs, w / fs);
+                let mut y = vec![0f32; h2 * w2 * cout];
+                let inv = 1.0 / gs as f32;
+                for_chunks(&mut y, cout, true, |p, r| {
+                    let (py, px) = (p / w2, p % w2);
+                    for (o, out) in r.iter_mut().enumerate() {
+                        let mut acc = 0f32;
+                        for e in o * gs..(o + 1) * gs {
+                            let (c, rem) = (e / factor, e % factor);
+                            // Every temporal slot but the last is a zero frame of the causal padding.
+                            if rem / (fs * fs) != ft - 1 {
+                                continue;
+                            }
+                            let (b, d) = ((rem / fs) % fs, rem % fs);
+                            acc += x[((py * fs + b) * w + px * fs + d) * cin + c];
+                        }
+                        *out = acc * inv;
+                    }
+                });
+                y
+            }
+            Shortcut::DupUp { cin, cout, ft } => {
+                let rep = cout * factor / cin;
+                let w2 = 2 * w;
+                let mut y = vec![0f32; 4 * h * w * cout];
+                for_chunks(&mut y, cout, true, |p, r| {
+                    let (py, px) = (p / w2, p % w2);
+                    let at = (py / 2) * w + px / 2;
+                    let src = &x[at * cin..(at + 1) * cin];
+                    let sub = (py % 2) * 2 + px % 2;
+                    for (o, out) in r.iter_mut().enumerate() {
+                        *out = src[((o * ft + ft - 1) * 4 + sub) / rep];
+                    }
+                });
+                y
+            }
+        }
+    }
+}
+
 enum Layer {
+    /// A residual group: its layers, plus the shortcut of the group's input.
+    Group(Vec<Layer>, Shortcut),
     Res(Box<Res>),
     Attn(Box<Attn>),
     /// Stride-2 convolution after a right / bottom zero pad.
@@ -189,6 +270,15 @@ enum Layer {
 impl Layer {
     fn forward(&self, x: Vec<f32>, h: usize, w: usize) -> (Vec<f32>, usize, usize) {
         match self {
+            Layer::Group(layers, sc) => {
+                let s = sc.forward(&x, h, w);
+                let (mut y, mut h, mut w) = (x, h, w);
+                for l in layers {
+                    (y, h, w) = l.forward(y, h, w);
+                }
+                crate::kernels::add_inplace(&mut y, &s);
+                (y, h, w)
+            }
             Layer::Res(r) => (r.forward(&x, h, w), h, w),
             Layer::Attn(a) => (a.forward(&x, h, w), h, w),
             Layer::Down(c) => c.forward(&x, h, w, 2),
@@ -256,22 +346,43 @@ impl Vae {
                 Layer::Res(Box::new(Res::load(&t, &format!("{p}.mid_block.resnets.1"), c, c)?)),
             ])
         };
+        let res = |p: String, cin: usize, cout: usize| -> Result<Layer> { Ok(Layer::Res(Box::new(Res::load(&t, &p, cin, cout)?))) };
+        let td = |i: usize| cfg.temperal_downsample.get(i).copied().unwrap_or(false);
         let enc = if encoder {
             let mut layers = Vec::new();
             let mut idx = 0;
             for i in 0..nm {
                 let (mut cin, cout) = (dims[i], dims[i + 1]);
-                for _ in 0..cfg.num_res_blocks {
-                    layers.push(Layer::Res(Box::new(Res::load(
-                        &t,
-                        &format!("encoder.down_blocks.{idx}"),
+                let down = i != nm - 1;
+                if cfg.is_residual {
+                    let sc = Shortcut::AvgDown {
                         cin,
                         cout,
-                    )?)));
+                        ft: if down && td(i) { 2 } else { 1 },
+                        fs: if down { 2 } else { 1 },
+                    };
+                    if !(cin * sc.factor()).is_multiple_of(cout) {
+                        bail!("vae: encoder level {i} cannot fold {cin} channels into {cout}");
+                    }
+                    let mut group = Vec::new();
+                    for j in 0..cfg.num_res_blocks {
+                        group.push(res(format!("encoder.down_blocks.{i}.resnets.{j}"), cin, cout)?);
+                        cin = cout;
+                    }
+                    if down {
+                        group.push(Layer::Down(
+                            conv(&t, &format!("encoder.down_blocks.{i}.downsampler.resample.1"))?.with_padding(0, 1),
+                        ));
+                    }
+                    layers.push(Layer::Group(group, sc));
+                    continue;
+                }
+                for _ in 0..cfg.num_res_blocks {
+                    layers.push(res(format!("encoder.down_blocks.{idx}"), cin, cout)?);
                     idx += 1;
                     cin = cout;
                 }
-                if i != nm - 1 {
+                if down {
                     layers.push(Layer::Down(
                         conv(&t, &format!("encoder.down_blocks.{idx}.resample.1"))?.with_padding(0, 1),
                     ));
@@ -290,22 +401,37 @@ impl Vae {
             None
         };
         // Decoder: dims reversed, starting from the top width.
-        let ddims: Vec<usize> = std::iter::once(b * mult[nm - 1]).chain(mult.iter().rev().map(|m| b * m)).collect();
+        let db = cfg.decoder_base_dim.unwrap_or(b);
+        let ddims: Vec<usize> = std::iter::once(db * mult[nm - 1])
+            .chain(mult.iter().rev().map(|m| db * m))
+            .collect();
         let mut layers = mid("decoder", ddims[0])?;
         for i in 0..nm {
-            let mut cin = if i > 0 { ddims[i] / 2 } else { ddims[i] };
+            let mut cin = if i > 0 && !cfg.is_residual { ddims[i] / 2 } else { ddims[i] };
             let cout = ddims[i + 1];
+            let up = i != nm - 1;
+            let sc = Shortcut::DupUp {
+                cin,
+                cout,
+                // `temperal_upsample` is `temperal_downsample` reversed.
+                ft: if up && td(nm.saturating_sub(2 + i)) { 2 } else { 1 },
+            };
+            let mut group = Vec::new();
             for j in 0..=cfg.num_res_blocks {
-                layers.push(Layer::Res(Box::new(Res::load(
-                    &t,
-                    &format!("decoder.up_blocks.{i}.resnets.{j}"),
-                    cin,
-                    cout,
-                )?)));
+                group.push(res(format!("decoder.up_blocks.{i}.resnets.{j}"), cin, cout)?);
                 cin = cout;
             }
-            if i != nm - 1 {
-                layers.push(Layer::Up(conv(&t, &format!("decoder.up_blocks.{i}.upsamplers.0.resample.1"))?));
+            if up {
+                let name = if cfg.is_residual { "upsampler" } else { "upsamplers.0" };
+                group.push(Layer::Up(conv(&t, &format!("decoder.up_blocks.{i}.{name}.resample.1"))?));
+            }
+            if cfg.is_residual && up {
+                if !(cout * sc.factor()).is_multiple_of(ddims[i]) {
+                    bail!("vae: decoder level {i} cannot spread {} channels over {cout}", ddims[i]);
+                }
+                layers.push(Layer::Group(group, sc));
+            } else {
+                layers.extend(group);
             }
         }
         let dec = Stack {
