@@ -90,6 +90,10 @@ pub struct ModelJson {
     byte_fallback: Option<bool>,
     #[serde(default)]
     ignore_merges: Option<bool>,
+    /// Not a `tokenizer.json` key: a merge ranks by the id of the token it makes instead of by
+    /// its place in the list (tiktoken vocabularies, see `crate::kimi::bpe_json`).
+    #[serde(default)]
+    rank_by_id: Option<bool>,
     #[serde(default)]
     max_input_chars_per_word: Option<usize>,
     #[serde(default)]
@@ -138,6 +142,7 @@ impl Model {
                     fuse_unk: m.fuse_unk.unwrap_or(false),
                     byte_fallback: m.byte_fallback.unwrap_or(false),
                     ignore_merges: m.ignore_merges.unwrap_or(false),
+                    rank_by_id: m.rank_by_id.unwrap_or(false),
                     dropout: m.dropout.filter(|&p| p > 0.0),
                 },
             )?),
@@ -248,6 +253,8 @@ pub struct BpeOptions {
     fuse_unk: bool,
     byte_fallback: bool,
     ignore_merges: bool,
+    /// Merges rank by the merged token's id (ties: the leftmost pair), as tiktoken merges.
+    rank_by_id: bool,
     /// Merge dropout probability (BPE-dropout regularization); None or 0 is deterministic.
     dropout: Option<f32>,
 }
@@ -296,7 +303,7 @@ impl Bpe {
             let im = vocab
                 .id(&merged)
                 .ok_or_else(|| anyhow!("merged token {merged:?} is not in the vocabulary"))?;
-            map.insert((ia, ib), (rank as u32, im));
+            map.insert((ia, ib), (if o.rank_by_id { im } else { rank as u32 }, im));
         }
         let mut bytes = Box::new([None; 256]);
         for (b, slot) in bytes.iter_mut().enumerate() {

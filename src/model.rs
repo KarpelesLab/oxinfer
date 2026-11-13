@@ -324,6 +324,10 @@ fn load_lin_stored<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: us
     if let Some(m) = files.mlx_q4(full, n_out, n_in)? {
         return Ok(Lin::q4(m));
     }
+    // MXFP4 (compressed-tensors): repacked into ggml's MXFP4 blocks.
+    if is_mxfp4(files, full) {
+        return Ok(Lin::gguf(mxfp4_matrix(files, full, n_out, n_in)?));
+    }
     // NVFP4 (compressed-tensors or ModelOpt): repacked into ggml's NVFP4 blocks.
     if is_nvfp4(files, full) {
         return Ok(Lin::gguf(nvfp4_matrix(files, full, n_out, n_in)?));
@@ -389,6 +393,48 @@ pub(crate) fn fp8_matrix(files: &ModelFiles, full: &str, n_out: usize, n_in: usi
     files.note_use(&sname, true, false);
     // SAFETY: the weight borrows `files`, which outlives every model holding it.
     GgufMatrix::fp8(unsafe { crate::quant::QBuf::borrowed(data) }, scales, n_out, n_in, block)
+}
+
+/// Whether `full` is a compressed-tensors MXFP4 weight (`mxfp4-pack-quantized`, the routed experts
+/// of Kimi K3): `.weight_packed` with one E8M0 scale byte per 32 values (`.weight_scale`, U8) and
+/// no tensor-wide scale.
+pub(crate) fn is_mxfp4(files: &ModelFiles, full: &str) -> bool {
+    let Some(base) = full.strip_suffix(".weight") else { return false };
+    files.has(&format!("{base}.weight_packed"))
+        && files.info(&format!("{base}.weight_scale")).is_some_and(|i| i.dtype == "U8")
+        && !files.has(&format!("{base}.weight_global_scale"))
+}
+
+/// An MXFP4 weight (`.weight_packed` `[n_out, n_in / 2]`: E2M1 codes, value `2i` in the low
+/// nibble of byte `i` and `2i + 1` in the high one; `.weight_scale` `[n_out, n_in / 32]`: an E8M0
+/// exponent per 32 values) repacked into ggml's MXFP4 blocks (the scale byte, then 16 bytes with
+/// value `j` in the low nibble and `j + 16` in the high one). Only bits move: the codes index the
+/// same values.
+pub(crate) fn mxfp4_matrix(files: &ModelFiles, full: &str, n_out: usize, n_in: usize) -> Result<GgufMatrix> {
+    let base = full.strip_suffix(".weight").unwrap_or(full);
+    let (pn, sn) = (format!("{base}.weight_packed"), format!("{base}.weight_scale"));
+    if !n_in.is_multiple_of(32) {
+        bail!("{pn}: MXFP4 rows of {n_in} are not whole blocks of 32");
+    }
+    let (pi, si) = (
+        files.info(&pn).context("MXFP4 packed weight")?,
+        files.info(&sn).context(sn.clone())?,
+    );
+    if pi.shape != [n_out, n_in / 2] || si.shape != [n_out, n_in / 32] || pi.dtype != "U8" {
+        bail!("{pn}: MXFP4 shapes {:?} / {:?} for [{n_out}, {n_in}]", pi.shape, si.shape);
+    }
+    let (packed, sc) = (files.bytes(&pn)?, files.bytes(&sn)?);
+    let mut out = crate::quant::PageVec::<u8>::zeroed(n_out * n_in / 32 * 17);
+    for ((ob, p), &s) in out.chunks_mut(17).zip(packed.chunks(16)).zip(sc) {
+        ob[0] = s;
+        let nib = |e: usize| (p[e / 2] >> (4 * (e % 2))) & 0xF;
+        for j in 0..16 {
+            ob[1 + j] = nib(j) | (nib(j + 16) << 4);
+        }
+    }
+    files.note_use(&pn, true, false);
+    files.note_use(&sn, true, false);
+    GgufMatrix::new(crate::ggml::GgmlType::MXFP4, out.into(), n_out, n_in)
 }
 
 /// Whether `full` is an NVFP4 weight: compressed-tensors' (`.weight_packed`) or ModelOpt's (a

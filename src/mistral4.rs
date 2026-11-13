@@ -321,7 +321,7 @@ pub struct Mistral4Model<'a> {
 }
 
 /// LayerNorm with weight and bias over each row of `x` (`n` wide), in place.
-fn layer_norm_rows(x: &mut [f32], n: usize, w: &[f32], b: &[f32], eps: f32) {
+pub(crate) fn layer_norm_rows(x: &mut [f32], n: usize, w: &[f32], b: &[f32], eps: f32) {
     for_chunks(x, n, x.len() > 64 * n, |_, r| {
         let mean = r.iter().sum::<f32>() / n as f32;
         let var = r.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n as f32;
@@ -365,7 +365,7 @@ pub(crate) fn per_head(ls: &[Lin], x: &[f32], t: usize, n_in: usize, n_out: usiz
 }
 
 /// The `k` largest of `scores` (ties to the lower position), sorted by position.
-fn top_positions(scores: &[f32], k: usize) -> Vec<u32> {
+pub(crate) fn top_positions(scores: &[f32], k: usize) -> Vec<u32> {
     let mut idx: Vec<u32> = (0..scores.len() as u32).collect();
     if k < idx.len() {
         idx.select_nth_unstable_by(k, |&a, &b| scores[b as usize].total_cmp(&scores[a as usize]).then(a.cmp(&b)));
@@ -410,6 +410,66 @@ fn route(logits: &[f32], k: usize, n_group: usize, topk_group: usize, scale: f32
     r
 }
 
+/// An MLA layer's `kv_b` (under `ap`, `...self_attn.`) as per-head `k_b` (`[lat, dn]`) and `v_b`
+/// (`[v, lat]`): GGUF stores them so; a `kv_b_proj` (`[nh * (dn + v), lat]`) has its key rows
+/// transposed into a bf16 copy and its value rows borrowed.
+pub(crate) fn load_kv_b<'a>(
+    files: &'a ModelFiles,
+    ap: &str,
+    nh: usize,
+    lat: usize,
+    dn: usize,
+    v: usize,
+) -> Result<(Vec<Lin<'a>>, Vec<Lin<'a>>)> {
+    let (kn, vn) = (format!("{ap}k_b"), format!("{ap}v_b"));
+    if files.has(&kn) {
+        let mut out = (Vec::with_capacity(nh), Vec::with_capacity(nh));
+        for (name, n_out, n_in, dst) in [(&kn, lat, dn, &mut out.0), (&vn, v, lat, &mut out.1)] {
+            let info = files.info(name).with_context(|| format!("missing tensor {name}"))?;
+            if info.shape != [nh, n_out, n_in] {
+                bail!("tensor {name} has shape {:?}, expected [{nh}, {n_out}, {n_in}]", info.shape);
+            }
+            files.note_use(name, true, false);
+            match files.ggml(name) {
+                Some(g) => {
+                    let (kind, bytes) = g?;
+                    for b in bytes.chunks(bytes.len() / nh) {
+                        dst.push(Lin::from_gguf(kind, b, n_out, n_in)?);
+                    }
+                }
+                None => {
+                    let w = files.bf16(name)?;
+                    dst.extend(w.chunks(n_out * n_in).map(Lin::bf16));
+                }
+            }
+        }
+        return Ok(out);
+    }
+    let name = format!("{ap}kv_b_proj.weight");
+    let info = files.info(&name).with_context(|| format!("missing tensor {name}"))?;
+    if info.shape != [nh * (dn + v), lat] {
+        bail!("tensor {name} has shape {:?}, expected [{}, {lat}]", info.shape, nh * (dn + v));
+    }
+    let w: &'a [u16] = if info.dtype == "F8_E4M3" {
+        bail!("{name}: an FP8 kv_b_proj is not supported (the official checkpoint keeps it in bf16)");
+    } else {
+        files.bf16(&name)?
+    };
+    let (mut kb, mut vb) = (Vec::with_capacity(nh), Vec::with_capacity(nh));
+    for h in 0..nh {
+        let rows = &w[h * (dn + v) * lat..(h + 1) * (dn + v) * lat];
+        let mut t = crate::quant::PageVec::<u16>::zeroed(lat * dn);
+        for c in 0..dn {
+            for r in 0..lat {
+                t[r * dn + c] = rows[c * lat + r];
+            }
+        }
+        kb.push(Lin::bf16_owned(t));
+        vb.push(Lin::bf16(&rows[dn * lat..]));
+    }
+    Ok((kb, vb))
+}
+
 /// Loads the model's tensors: shape checks, both name prefixes, GGUF's split `kv_b`.
 struct Loader<'a, 'c> {
     files: &'a ModelFiles,
@@ -447,54 +507,7 @@ impl<'a> Loader<'a, '_> {
     /// value rows borrowed.
     fn kv_b(&self, ap: &str, dn: usize) -> Result<(Vec<Lin<'a>>, Vec<Lin<'a>>)> {
         let c = self.cfg;
-        let (nh, lat, v) = (c.num_attention_heads, c.kv_lora_rank, c.v_head_dim);
-        let (kn, vn) = (format!("{ap}k_b"), format!("{ap}v_b"));
-        if self.files.has(&kn) {
-            let mut out = (Vec::with_capacity(nh), Vec::with_capacity(nh));
-            for (name, n_out, n_in, dst) in [(&kn, lat, dn, &mut out.0), (&vn, v, lat, &mut out.1)] {
-                let info = self.files.info(name).with_context(|| format!("missing tensor {name}"))?;
-                if info.shape != [nh, n_out, n_in] {
-                    bail!("tensor {name} has shape {:?}, expected [{nh}, {n_out}, {n_in}]", info.shape);
-                }
-                self.files.note_use(name, true, false);
-                match self.files.ggml(name) {
-                    Some(g) => {
-                        let (kind, bytes) = g?;
-                        for b in bytes.chunks(bytes.len() / nh) {
-                            dst.push(Lin::from_gguf(kind, b, n_out, n_in)?);
-                        }
-                    }
-                    None => {
-                        let w = self.files.bf16(name)?;
-                        dst.extend(w.chunks(n_out * n_in).map(Lin::bf16));
-                    }
-                }
-            }
-            return Ok(out);
-        }
-        let name = format!("{ap}kv_b_proj.weight");
-        let info = self.files.info(&name).with_context(|| format!("missing tensor {name}"))?;
-        if info.shape != [nh * (dn + v), lat] {
-            bail!("tensor {name} has shape {:?}, expected [{}, {lat}]", info.shape, nh * (dn + v));
-        }
-        let w: &'a [u16] = if info.dtype == "F8_E4M3" {
-            bail!("{name}: an FP8 kv_b_proj is not supported (the official checkpoint keeps it in bf16)");
-        } else {
-            self.files.bf16(&name)?
-        };
-        let (mut kb, mut vb) = (Vec::with_capacity(nh), Vec::with_capacity(nh));
-        for h in 0..nh {
-            let rows = &w[h * (dn + v) * lat..(h + 1) * (dn + v) * lat];
-            let mut t = crate::quant::PageVec::<u16>::zeroed(lat * dn);
-            for c in 0..dn {
-                for r in 0..lat {
-                    t[r * dn + c] = rows[c * lat + r];
-                }
-            }
-            kb.push(Lin::bf16_owned(t));
-            vb.push(Lin::bf16(&rows[dn * lat..]));
-        }
-        Ok((kb, vb))
+        load_kv_b(self.files, ap, c.num_attention_heads, c.kv_lora_rank, dn, c.v_head_dim)
     }
 
     fn attn(&self, l: usize) -> Result<Attn<'a>> {
@@ -1289,12 +1302,12 @@ fn cos_half(cos: &[f32], t: usize) -> usize {
 }
 
 #[derive(Clone, Copy)]
-struct SendPtrV(*mut Vec<u32>);
+pub(crate) struct SendPtrV(pub(crate) *mut Vec<u32>);
 unsafe impl Send for SendPtrV {}
 unsafe impl Sync for SendPtrV {}
 impl SendPtrV {
     #[inline(always)]
-    fn get(self) -> *mut Vec<u32> {
+    pub(crate) fn get(self) -> *mut Vec<u32> {
         self.0
     }
 }

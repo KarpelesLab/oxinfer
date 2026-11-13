@@ -2372,7 +2372,7 @@ fn residual_scaled(x: &mut [f32], hn: &[f32], a: f32, y: &[f32], b: f32) {
 
 /// Gated DeltaNet's gated RMSNorm per head (`hdv = w.len()`): `norm(o) * w * silu(z)` (sigmoid(z)
 /// for Qwen4-Exp).
-fn gated_norm(out: &mut [f32], z: &[f32], w: &[f32], eps: f32, sig: bool, par: bool) {
+pub(crate) fn gated_norm(out: &mut [f32], z: &[f32], w: &[f32], eps: f32, sig: bool, par: bool) {
     let hdv = w.len();
     for_chunks(out, hdv, par, |i, o| {
         let ss: f32 = o.iter().map(|v| v * v).sum::<f32>() / hdv as f32 + eps;
