@@ -1886,6 +1886,15 @@ impl<'a> QwenModel<'a> {
         sess.gpu_rec = None;
         if t > 1 && gpu {
             let t0 = std::time::Instant::now();
+            if self.exp.is_some() && !record && prefill_gpu(t, "plan") {
+                // Qwen4-Exp: the prefill plan builds while the decode plan makes the expert
+                // weights resident (most of a first pass's setup).
+                std::thread::scope(|s| {
+                    let pf = s.spawn(|| self.gpu_prefill_plan().is_some());
+                    let _ = self.gpu_plan();
+                    let _ = pf.join();
+                });
+            }
             let _ = self.gpu_plan();
             if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
                 eprintln!("[gpu plan ready in {:.2}s]", t0.elapsed().as_secs_f64());

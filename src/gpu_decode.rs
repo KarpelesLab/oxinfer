@@ -597,9 +597,14 @@ impl Clone for Slot {
     }
 }
 
-/// Compiled plans of a model by key (one per intervention layout; 0 is the plain model).
+/// Compiled plans of a model by key (one per intervention layout; 0 is the plain model), and
+/// a lock per key held while its plan builds (different keys build concurrently).
 #[derive(Default)]
-pub struct PlanCache(std::sync::Mutex<Vec<(u64, SharedPlan)>>);
+#[allow(clippy::type_complexity)]
+pub struct PlanCache(
+    std::sync::Mutex<Vec<(u64, SharedPlan)>>,
+    std::sync::Mutex<Vec<(u64, std::sync::Arc<std::sync::Mutex<()>>)>>,
+);
 
 /// A compiled plan shared by the sessions of a model (None: the model cannot use one).
 pub type SharedPlan = Option<std::sync::Arc<dyn DecodePlan>>;
@@ -610,11 +615,30 @@ impl PlanCache {
 
     /// The plan for `key`, built by `make` the first time (a failure is remembered too).
     pub fn get(&self, key: u64, make: impl FnOnce() -> Option<Box<dyn DecodePlan>>) -> Option<std::sync::Arc<dyn DecodePlan>> {
-        let mut v = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((_, p)) = v.iter().find(|(k, _)| *k == key) {
-            return p.clone();
+        let built = || -> Option<SharedPlan> {
+            let v = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            v.iter().find(|(k, _)| *k == key).map(|(_, p)| p.clone())
+        };
+        if let Some(p) = built() {
+            return p;
+        }
+        let lock = {
+            let mut b = self.1.lock().unwrap_or_else(|p| p.into_inner());
+            match b.iter().find(|(k, _)| *k == key) {
+                Some((_, l)) => l.clone(),
+                None => {
+                    let l = std::sync::Arc::new(std::sync::Mutex::new(()));
+                    b.push((key, l.clone()));
+                    l
+                }
+            }
+        };
+        let _building = lock.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(p) = built() {
+            return p;
         }
         let p: Option<std::sync::Arc<dyn DecodePlan>> = make().map(std::sync::Arc::from);
+        let mut v = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if key != 0 && v.iter().filter(|(k, _)| *k != 0).count() >= Self::KEEP {
             let i = v.iter().position(|(k, _)| *k != 0).unwrap();
             v.remove(i);

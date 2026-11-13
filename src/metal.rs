@@ -1388,7 +1388,10 @@ impl Drop for MetalWeight {
 
 /// An `MTLResidencySet` attached to the command queue, and its selectors.
 pub(crate) struct Residency {
-    set: Id,
+    /// Several sets, attached to the queue: buffers are spread over them and each set's
+    /// residency is requested from a thread of its own (the wiring of mapped files is the
+    /// bulk of a first pass's setup and goes faster in parallel).
+    sets: Vec<Id>,
     add: Sel,
     remove: Sel,
     commit: Sel,
@@ -1403,21 +1406,48 @@ unsafe impl Send for Residency {}
 unsafe impl Sync for Residency {}
 
 impl Residency {
-    /// Adds (or removes) buffers, then commits the change.
+    /// Adds (or removes) buffers, then commits the change (added buffers are made resident
+    /// before it returns).
     pub(crate) fn update(&self, ids: &[Id], add: bool) {
         let _g = self.lock.lock().unwrap();
-        // SAFETY: `set` is a live residency set and `ids` are live buffers.
+        let n = self.sets.len().min(ids.len()).max(1);
+        // SAFETY: the sets are live residency sets and `ids` are live buffers.
         unsafe {
-            for &id in ids {
-                (self.send_id)(self.set, if add { self.add } else { self.remove }, id);
+            for (i, &id) in ids.iter().enumerate() {
+                if add {
+                    (self.send_id)(self.sets[i % n], self.add, id);
+                } else {
+                    for &s in &self.sets {
+                        (self.send_id)(s, self.remove, id);
+                    }
+                }
             }
-            (self.send)(self.set, self.commit);
-            if add {
-                (self.send)(self.set, self.request);
+            for &s in if add { &self.sets[..n] } else { &self.sets[..] } {
+                (self.send)(s, self.commit);
             }
+        }
+        // Residency requested for the sets just added to, in parallel (78 GB of mapped expert
+        // weights: ~1 s from one thread, ~0.3-0.5 s from eight).
+        if add && n == 1 {
+            // SAFETY: a live residency set.
+            unsafe { (self.send)(self.sets[0], self.request) };
+        } else if add {
+            struct P(Id);
+            unsafe impl Send for P {}
+            unsafe impl Sync for P {}
+            let sets: Vec<P> = self.sets[..n].iter().map(|&s| P(s)).collect();
+            std::thread::scope(|sc| {
+                for s in &sets {
+                    // SAFETY: a live residency set.
+                    sc.spawn(move || unsafe { (self.send)(s.0, self.request) });
+                }
+            });
         }
     }
 }
+
+/// Residency sets attached to the queue (see `Residency`).
+const RESIDENCY_SETS: usize = 8;
 
 /// Device state of an MoE layer's routed experts (`Backend::upload_moe`).
 struct MoeDev {
@@ -1795,17 +1825,24 @@ impl MetalBackend {
             }
             let desc = unsafe { msg0(msg0(cls, o.sel(c"alloc")), o.sel(c"init")) };
             let new_set: unsafe extern "C" fn(Id, Sel, Id, *mut Id) -> Id = o.msg_send();
-            let mut err: Id = std::ptr::null_mut();
-            let set = unsafe { new_set(device, new_sel, desc, &mut err) };
+            let add: unsafe extern "C" fn(Id, Sel, Id) = o.msg_send();
+            let mut sets = Vec::new();
+            for _ in 0..RESIDENCY_SETS {
+                let mut err: Id = std::ptr::null_mut();
+                let set = unsafe { new_set(device, new_sel, desc, &mut err) };
+                if set.is_null() {
+                    break;
+                }
+                unsafe { add(queue, o.sel(c"addResidencySet:"), set) };
+                sets.push(set);
+            }
             let void: MsgVoid = o.msg_send();
             unsafe { void(desc, o.sel(c"release")) };
-            if set.is_null() {
+            if sets.is_empty() {
                 return None;
             }
-            let add: unsafe extern "C" fn(Id, Sel, Id) = o.msg_send();
-            unsafe { add(queue, o.sel(c"addResidencySet:"), set) };
             Some(std::sync::Arc::new(Residency {
-                set,
+                sets,
                 add: o.sel(c"addAllocation:"),
                 remove: o.sel(c"removeAllocation:"),
                 commit: o.sel(c"commit"),
