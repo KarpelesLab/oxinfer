@@ -375,6 +375,15 @@ pub const CATALOG: &[Model] = &[
         .speed(6.0, 40)
         .moe()
         .note("bytes per token from the active parameter count"),
+    // Ripple-65B: the NVFP4 checkpoint ran (its bytes per token are the loader's); the bf16 one
+    // was never downloaded (a token reads all of it but the embedding table).
+    Model::new("ricursiveAI/Ripple-65B-Preview-NVFP4", Kind::Chat, 65.0, 57.2, AGENT)
+        .fixed(Format::Q4, "NVFP4")
+        .speed(56.18, 80)
+        .note("MLPs in NVFP4, attention in bf16; needs 60 GB of memory"),
+    Model::new("ricursiveAI/Ripple-65B-Preview", Kind::Chat, 65.0, 129.6, AGENT)
+        .speed(128.5, 80)
+        .note("supported, untested (only its NVFP4 copy was run)"),
     Model::new("unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL", Kind::Chat, 125.0, 111.0, AGENT)
         .fixed(Format::GgufQ4K, "GGUF UD-Q4_K_XL")
         .speed(3.8, 48)
