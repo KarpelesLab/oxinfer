@@ -199,10 +199,11 @@ pub fn run(args: &Args) -> Result<()> {
         eprintln!("{l}");
     }
     let out = args.output.clone().unwrap_or_else(|| PathBuf::from("image.png"));
-    // An RGBA model (Qwen-Image-2.1) that drew transparency: a PNG with its alpha channel (an
-    // opaque picture's alpha still dips a few levels under 255 here and there).
+    // An RGBA model (Qwen-Image-2.1) that drew a transparent region (a thousandth of the pixels
+    // under half alpha): a PNG with its alpha channel. An opaque picture's alpha still dips
+    // under 255 here and there, down to half on a stray pixel.
     let png = match &pipe.alpha {
-        Some(alpha) if alpha.iter().any(|&v| v < 128) => {
+        Some(alpha) if alpha.iter().filter(|&&v| v < 128).count() * 1000 >= alpha.len() => {
             let rgba: Vec<u8> = img
                 .rgb
                 .as_chunks::<3>()

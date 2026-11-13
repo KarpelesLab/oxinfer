@@ -97,7 +97,7 @@ pub struct QwenVl {
 
 /// The DeepStack rows of `images` for a session (`QwenSession::deepstack`): each image's
 /// features after the first layers, at its tokens (`refs`: the placeholder positions, in order).
-fn deepstack(images: &[VlImage], refs: &[(usize, &[f32])]) -> Result<Vec<(usize, usize, Vec<f32>)>> {
+fn deepstack(images: &[VlImage], refs: &[(usize, &[f32])]) -> Result<Option<Box<crate::qwen::DeepStack>>> {
     let mut out = Vec::new();
     let mut at = 0;
     for im in images {
@@ -108,7 +108,7 @@ fn deepstack(images: &[VlImage], refs: &[(usize, &[f32])]) -> Result<Vec<(usize,
         out.extend(im.deep.iter().enumerate().map(|(l, rows)| (l, start, rows.clone())));
         at += im.n;
     }
-    Ok(out)
+    Ok((!out.is_empty()).then(|| Box::new(crate::qwen::DeepStack(out))))
 }
 
 /// The first of `cands` that holds `file`.

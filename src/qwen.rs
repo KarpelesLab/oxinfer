@@ -435,10 +435,14 @@ pub struct QwenSession {
     /// residual stream of the `n` tokens from sequence index `position` after `layer` (the
     /// outputs recorded for `capture` are the layer's own, before the addition). Multi-token
     /// CPU passes only (prompt encoding).
-    pub deepstack: Vec<(usize, usize, Vec<f32>)>,
+    pub deepstack: Option<Box<DeepStack>>,
     /// Qwen4-Exp state (n-gram contexts and conv, indexer keys; see `crate::qwen4exp`).
     pub(crate) exp: Option<Box<crate::qwen4exp::ExpSession>>,
 }
+
+/// The DeepStack rows of a session (see [`QwenSession::deepstack`]).
+#[derive(Clone, Debug, Default)]
+pub struct DeepStack(pub Vec<(usize, usize, Vec<f32>)>);
 
 impl QwenSession {
     /// Declares `gh` x `gw` vision tokens (row-major, one image or one temporal patch of a video)
@@ -1080,7 +1084,7 @@ impl<'a> QwenModel<'a> {
             capture: Vec::new(),
             captured: Vec::new(),
             positions: None,
-            deepstack: Vec::new(),
+            deepstack: None,
             exp: self.exp.as_ref().map(|e| Box::new(e.new_session(cfg))),
         }
     }
@@ -1983,7 +1987,7 @@ impl<'a> QwenModel<'a> {
             if sess.capture.contains(&l) {
                 sess.captured.push((l, x.clone()));
             }
-            for (dl, pos, rows) in &sess.deepstack {
+            for (dl, pos, rows) in sess.deepstack.iter().flat_map(|d| &d.0) {
                 let n = rows.len() / h;
                 if *dl == l && *pos >= start && pos + n <= start + t {
                     add_inplace(&mut x[(pos - start) * h..(pos - start + n) * h], rows);
