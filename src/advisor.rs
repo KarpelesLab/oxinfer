@@ -285,6 +285,7 @@ const STT: &[Cap] = &[SpeechToText, Translation];
 const EDIT: &[Cap] = &[ImageEdit];
 const JANUS: &[Cap] = &[TextToImage, ImageInput, Text];
 const PARAMS: &str = "bytes per token and layers from the parameter count";
+const GLM_TINY: &str = "text only (no vision tower, no MTP); only its header was loaded, not its weights";
 
 /// The models oxinfer was run with (the README's model table), by kind and size. What each can
 /// do is what the README states for it. Bytes per token: the loader's report where the
@@ -372,6 +373,33 @@ pub const CATALOG: &[Model] = &[
         .speed(4.4, 48)
         .moe()
         .note(PARAMS),
+    Model::new("unsloth/GLM-5.3-Flash-GGUF:UD-Q2_K_XL", Kind::Chat, 313.0, 109.0, AGENT)
+        .fixed(Format::GgufLow, "GGUF UD-Q2_K_XL")
+        .speed(8.95, 45)
+        .moe()
+        .note("text only (no vision tower, no MTP)"),
+    Model::new("ggml-org/GLM-5.3-Flash-GGUF:Q4_K", Kind::Chat, 313.0, 181.0, AGENT)
+        .fixed(Format::GgufQ4K, "GGUF Q4_K")
+        .speed(13.9, 45)
+        .moe()
+        .note(GLM_TINY),
+    Model::new("zai-org/GLM-5.3-Flash", Kind::Chat, 313.0, 328.0, AGENT)
+        .fixed(Format::Q8, "FP8")
+        .moe()
+        .note(GLM_TINY),
+    Model::new("nex-agi/Nex-N2.6", Kind::Chat, 313.0, 328.0, AGENT)
+        .fixed(Format::Q8, "FP8")
+        .moe()
+        .note("a GLM-5.3-Flash fine-tune; text only; not run (the same architecture and template)"),
+    Model::new("Scantist/GLM-5.3-SLIM-GGUF:UD-IQ2_M-E192", Kind::Chat, 573.0, 180.0, AGENT)
+        .fixed(Format::GgufLow, "GGUF UD-IQ2_M")
+        .speed(21.2, 78)
+        .moe()
+        .note("GLM-5.3 pruned to 192 experts; only its header was loaded, not its weights"),
+    Model::new("unsloth/GLM-5.3-GGUF:UD-IQ1_S", Kind::Chat, 754.0, 217.0, AGENT)
+        .fixed(Format::GgufLow, "GGUF UD-IQ1_S")
+        .moe()
+        .note("not run (GLM-5.3 was checked on tiny checkpoints and on the SLIM header)"),
     Model::new(
         "MiniMaxAI/MiniMax-M3",
         Kind::Chat,

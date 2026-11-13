@@ -4,12 +4,12 @@
 //! feeding each of them one at a time):
 //!
 //! ```text
-//! glm5_check MODEL REF.safetensors [--chunk N] [--layers] [--cpu] [--mmap]
+//! glm5_check MODEL REF.safetensors [--chunk N] [--layers] [--dump FILE] [--cpu] [--mmap]
 //! ```
 //!
 //! Prints, for the prefill (in chunks of N tokens, default the whole prompt) and for the
 //! token-by-token decode, the largest logit difference, the mean KL divergence and the agreement
-//! of the top token.
+//! of the top token. `--dump` writes the logits compared (prefill rows, then decode rows; f32).
 
 use anyhow::{Context, Result};
 use oxinfer::glm5::Glm5Model;
@@ -69,16 +69,18 @@ fn report(what: &str, ours: &[f32], refs: &[f32], vocab: usize) {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: glm5_check MODEL REF.safetensors [--chunk N] [--layers] [--cpu] [--mmap]";
+    let usage = "usage: glm5_check MODEL REF.safetensors [--chunk N] [--layers] [--dump FILE] [--cpu] [--mmap]";
     let model = args.next().context(usage)?;
     let refp = args.next().context(usage)?;
     let (mut chunk, mut cpu, mut mmap, mut layers) = (None, false, false, false);
+    let mut dump: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--chunk" => chunk = Some(args.next().context("--chunk N")?.parse::<usize>()?),
             "--cpu" => cpu = true,
             "--mmap" => mmap = true,
             "--layers" => layers = true,
+            "--dump" => dump = Some(args.next().context("--dump FILE")?),
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
@@ -142,6 +144,11 @@ fn main() -> Result<()> {
             got.extend(m.forward(&mut sess, &[tk]));
         }
         report("decode", &got, &dref, vocab);
+        ours.extend(got);
+    }
+    if let Some(path) = dump {
+        let bytes: Vec<u8> = ours.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(&path, bytes).with_context(|| format!("write {path}"))?;
     }
     Ok(())
 }

@@ -1427,6 +1427,8 @@ mod tests {
                 "<｜begin▁of▁sentence｜><｜System｜>Be brief.\n\n{tools}<｜User｜>Paris?<｜Assistant｜></think>Let me check.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>sunny</tool_result><｜Assistant｜></think>Sunny.<｜end▁of▁sentence｜><｜User｜>Thanks<｜Assistant｜></think>"
             )
         );
+    }
+
     /// The renderings of GLM-5.3-Flash's chat template (transformers' jinja environment; the
     /// templates of GLM-5.3 and Nex-N2.6 give the same text on these conversations).
     #[test]

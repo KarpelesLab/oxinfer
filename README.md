@@ -87,6 +87,7 @@ too. The device is chosen at run time (`--device auto`: a GPU when one starts, e
 | [Qwen3.5 / Qwen3.8](docs/qwen.md) | dense and MoE Qwen, MTP and DSpark speculative decoding |
 | [Mistral Large 4](docs/mistral-large-4.md) | 1T parameters streamed from storage, FP8 on the GPU |
 | [DeepSeek V4 Flash, V4.1 Flash](docs/deepseek-v4.md) | 284B MoE as GGUF; V4.1 (748B with its engram tables) on tiny checkpoints only |
+| [GLM-5.3 and GLM-5.3-Flash](docs/glm.md) | hyper-connections, KDA linear attention, MLA with the DSA indexer; text only |
 | [Qwen3.8-Flash-Next](docs/qwen-flash-next.md) | 125B MoE with an n-gram embedding table |
 | [Image, video and audio input](docs/multimodal-input.md) | the vision and audio towers of Gemma 4 and Qwen, Qwen2.5-VL |
 
