@@ -1575,6 +1575,100 @@ impl ChatFormat for InklingChat {
     }
 }
 
+/// Raon-1 (KRAFTON): Qwen3.5's ChatML template (trimmed turns, tools declared in the system turn
+/// and called as `<tool_call><function=...><parameter=...>`), except that a reply without
+/// thinking opens with `<think></think>` and a blank line (Qwen: `<think>`, a blank line,
+/// `</think>`).
+pub struct RaonChat;
+
+impl RaonChat {
+    /// What follows the assistant header in the generation prompt.
+    fn think_tail(think: bool) -> &'static str {
+        if think { "<think>\n" } else { "<think></think>\n\n" }
+    }
+}
+
+impl ChatFormat for RaonChat {
+    fn conversation_start(&self, system: Option<&str>, think: bool) -> String {
+        QWEN.conversation_start(system, think)
+    }
+    fn user_turn(&self, content: &str, think: bool) -> String {
+        format!(
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n{}",
+            content.trim(),
+            Self::think_tail(think)
+        )
+    }
+    fn end_of_model_turn(&self) -> String {
+        QWEN.end_of_model_turn()
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        QWEN.end_of_turn_token()
+    }
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        QWEN.think_tokens()
+    }
+    fn starts_in_thinking(&self, think: bool) -> bool {
+        think
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, think: bool, tools: &[ToolSpec]) -> String {
+        QWEN.conversation_start_tools(system, think, tools)
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        QWEN.tool_call_marker()
+    }
+    fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
+        QWEN.parse_tool_calls(raw)
+    }
+    fn parse_tool_calls_for(&self, raw: &str, tools: &[ToolSpec]) -> Vec<ToolCall> {
+        QWEN.parse_tool_calls_for(raw, tools)
+    }
+    fn tool_syntax(&self) -> Option<crate::constrain::ToolSyntax> {
+        QWEN.tool_syntax()
+    }
+    fn tool_results(&self, results: &[ToolResult], think: bool) -> String {
+        let mut s = String::from("<|im_end|>\n<|im_start|>user");
+        for r in results {
+            s.push_str("\n<tool_response>\n");
+            s.push_str(r.content.trim());
+            s.push_str("\n</tool_response>");
+        }
+        s.push_str("<|im_end|>\n<|im_start|>assistant\n");
+        s.push_str(Self::think_tail(think));
+        s
+    }
+    /// The template's layout: the trimmed text, a blank line, the calls one per line, their
+    /// arguments as strings or as Python writes JSON.
+    fn assistant_text(&self, content: &str, calls: &[ToolCall]) -> String {
+        let mut s = content.trim().to_string();
+        if !s.is_empty() && !calls.is_empty() {
+            s.push_str("\n\n");
+        }
+        for (i, c) in calls.iter().enumerate() {
+            if i > 0 {
+                s.push('\n');
+            }
+            s.push_str(&format!("<tool_call>\n<function={}>\n", c.name));
+            for (k, v) in &c.arguments {
+                let text = match v {
+                    serde_json::Value::String(t) => t.clone(),
+                    other => crate::tools::qwen::py_json(other),
+                };
+                s.push_str(&format!("<parameter={k}>\n{text}\n</parameter>\n"));
+            }
+            s.push_str("</function>\n</tool_call>");
+        }
+        s
+    }
+    /// After a generation prompt that opened a thinking block, a past reply (whose reasoning is
+    /// not kept) closes it first: an empty block, where the template would write
+    /// `<think></think>`.
+    fn assistant_text_after(&self, content: &str, calls: &[ToolCall], think: bool) -> String {
+        let body = self.assistant_text(content, calls);
+        if think { format!("\n</think>\n\n{body}") } else { body }
+    }
+}
+
 /// `eos` plus the chat format's end-of-turn token, looked up in the tokenizer.
 pub fn with_turn_end(fmt: &dyn ChatFormat, tok: &crate::tokenizer::Tokenizer, mut eos: Vec<u32>) -> Vec<u32> {
     if let Some(id) = tok.token_to_id(fmt.end_of_turn_token())
@@ -2032,6 +2126,100 @@ mod tests {
             "[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hi<|assistant|><think>greet</think>Hello!<|user|>Bye<|assistant|><think>"
         );
         assert_eq!(f.user_turn("Hi", false), "<|user|>Hi<|assistant|><think></think>");
+    }
+
+    /// Raon-1's format against its template (`chat_template.jinja` of KRAFTON/Raon-1-nano, rendered
+    /// by transformers): with and without thinking, a system prompt, tools, a past reply, rounds
+    /// of tool calling with nested arguments.
+    #[test]
+    fn raon_matches_template() {
+        let f = RaonChat;
+        assert_eq!(
+            f.first_turn(None, true, &[], "Hi"),
+            "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+        assert_eq!(
+            f.first_turn(None, false, &[], "  Hi \n"),
+            "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think></think>\n\n"
+        );
+        assert_eq!(
+            f.first_turn(Some("Be brief."), true, &[], "Hi"),
+            "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+        let tool = ToolSpec {
+            name: "get_weather".into(),
+            description: "Weather in a city (°C)".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}, "days": {"type": "integer", "description": "forecast days"}},
+                "required": ["city"],
+            }),
+        };
+        let tools = std::slice::from_ref(&tool);
+        assert_eq!(
+            f.first_turn(Some("Be brief."), false, tools, "Weather?"),
+            "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather in a city (°C)\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"description\": \"forecast days\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nBe brief.<|im_end|>\n<|im_start|>user\nWeather?<|im_end|>\n<|im_start|>assistant\n<think></think>\n\n"
+        );
+        let start = f.first_turn(None, true, tools, "Weather?");
+        assert_eq!(
+            start,
+            "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather in a city (°C)\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"description\": \"forecast days\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        );
+        // A past reply after a prompt without thinking is the template's; after one that opened
+        // a thinking block, the block is closed empty (the template writes `<think></think>`).
+        let mut s = f.first_turn(None, false, &[], "Hi");
+        s.push_str(&f.assistant_text_after("Hello!", &[], false));
+        s.push_str(&f.end_of_model_turn());
+        s.push_str(&f.user_turn("And now?", false));
+        assert_eq!(
+            s,
+            "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think></think>\n\nHello!<|im_end|>\n<|im_start|>user\nAnd now?<|im_end|>\n<|im_start|>assistant\n<think></think>\n\n"
+        );
+        assert_eq!(f.assistant_text_after("Hello!", &[], true), "\n</think>\n\nHello!");
+        // Rounds of tool calling.
+        let call = |args: serde_json::Value| ToolCall {
+            name: "get_weather".into(),
+            arguments: args.as_object().unwrap().clone(),
+        };
+        let result = |content: &str| ToolResult {
+            name: "get_weather".into(),
+            content: content.into(),
+        };
+        let start = f.first_turn(None, false, tools, "Weather?");
+        let mut s = start.clone();
+        s.push_str(&f.assistant_text_after("Let me check.", &[call(serde_json::json!({"city": "Paris", "days": 3}))], false));
+        s.push_str(&f.tool_results(&[result("22°C")], false));
+        assert_eq!(
+            s,
+            "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather in a city (°C)\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"description\": \"forecast days\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather?<|im_end|>\n<|im_start|>assistant\n<think></think>\n\nLet me check.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n22°C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>\n\n"
+        );
+        let mut s = start.clone();
+        let calls = [
+            call(serde_json::json!({"city": "Paris", "days": 3})),
+            call(serde_json::json!({"city": "Seoul"})),
+        ];
+        s.push_str(&f.assistant_text_after("", &calls, false));
+        s.push_str(&f.tool_results(&[result("22°C"), result("9°C\n")], false));
+        s.push_str(&f.assistant_text_after("Sunny.", &[], false));
+        s.push_str(&f.end_of_model_turn());
+        s.push_str(&f.user_turn("Thanks", false));
+        assert_eq!(
+            s,
+            "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather in a city (°C)\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"description\": \"forecast days\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather?<|im_end|>\n<|im_start|>assistant\n<think></think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nSeoul\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n22°C\n</tool_response>\n<tool_response>\n9°C\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>\n\nSunny.<|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think></think>\n\n"
+        );
+        let mut s = start.clone();
+        let nested = call(serde_json::json!({"city": "Paris", "opts": {"a": [1, 2.5], "b": null}, "raw": true}));
+        s.push_str(&f.assistant_text_after("", std::slice::from_ref(&nested), false));
+        s.push_str(&f.tool_results(&[result("ok")], false));
+        assert_eq!(
+            s,
+            "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Weather in a city (°C)\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"description\": \"forecast days\"}}, \"required\": [\"city\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather?<|im_end|>\n<|im_start|>assistant\n<think></think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=opts>\n{\"a\": [1, 2.5], \"b\": null}\n</parameter>\n<parameter=raw>\ntrue\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nok\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>\n\n"
+        );
+        // The calls read back from the text the model would have written.
+        assert_eq!(
+            f.parse_tool_calls_for(&f.assistant_text("", std::slice::from_ref(&nested)), tools),
+            vec![nested]
+        );
     }
 
     /// The renderings of Kimi K3's own encoder (`encoding_k3.py` of the checkpoint,
