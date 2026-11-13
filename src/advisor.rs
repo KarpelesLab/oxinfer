@@ -409,6 +409,18 @@ pub const CATALOG: &[Model] = &[
         .fixed(Format::GgufLow, "GGUF UD-IQ1_S")
         .moe()
         .note("not run (GLM-5.3 was checked on tiny checkpoints and on the SLIM header)"),
+    // ERNIE 5.5 Flash Base: a base model (completions, no chat template), never run on the real
+    // weights (the agreement with Baidu's code is measured on tiny checkpoints; bytes per token
+    // from the loader on the layout of the release).
+    Model::new("baidu/ERNIE-5.5-Flash-Base", Kind::Chat, 280.0, 288.0, &[Text])
+        .fixed(Format::Q8, "FP8")
+        .speed(14.2, 43)
+        .moe()
+        .note("supported, untested; a base model: it continues a text, there is no chat template"),
+    Model::new("baidu/ERNIE-5.5-Flash-Base-BF16", Kind::Chat, 280.0, 573.0, &[Text])
+        .speed(26.3, 43)
+        .moe()
+        .note("supported, untested; a base model: it continues a text, there is no chat template"),
     Model::new(
         "MiniMaxAI/MiniMax-M3",
         Kind::Chat,
