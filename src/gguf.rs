@@ -300,8 +300,10 @@ impl Header {
             "deepseek41" => "deepseek_v41",
             "minimax-m2" => "minimax_m2",
             "minimax-m3" => "minimax_m3_vl_text",
+            "glm5-next" => "glm5_next_text",
+            "glm-dsa" => "glm_moe_dsa",
             a => bail!(
-                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, llama, gemma4, mistral-large4, deepseek4, deepseek41, minimax-m2, minimax-m3 and qwen2 are)"
+                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, llama, gemma4, mistral-large4, deepseek4, deepseek41, minimax-m2, minimax-m3, glm5-next, glm-dsa and qwen2 are)"
             ),
         })
     }
@@ -325,6 +327,9 @@ impl Header {
         }
         if mt == "deepseek_v41" {
             return crate::deepseek4::gguf_config_v41(self, self.deepseek4_config()?);
+        }
+        if crate::glm5::is_model_type(mt) {
+            return crate::glm5::gguf_config(self);
         }
         let llama = mt == "llama";
         let minimax = matches!(mt, "minimax_m2" | "minimax_m3_vl_text");
@@ -776,7 +781,7 @@ impl Header {
         let pre = self.get("tokenizer.ggml.pre").and_then(Value::as_str).unwrap_or("");
         // Llama 3 and Mistral's tekken (as their tokenizer.json): no normalizer, and a word found
         // whole in the vocabulary is one token whatever the merges say (`ignore_merges`).
-        let whole_words = matches!(pre, "llama-bpe" | "tekken" | "tekken-num3" | "pixtral");
+        let whole_words = matches!(pre, "llama-bpe" | "glm4" | "tekken" | "tekken-num3" | "pixtral");
         let tekken = matches!(pre, "tekken" | "tekken-num3" | "pixtral");
         // DeepSeek V3 / V4: digits in groups of up to three and CJK runs split off first, no
         // normalizer.
@@ -800,7 +805,8 @@ impl Header {
                 r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
             }
             "qwen2" => r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
-            "llama-bpe" => {
+            // (GLM-4 / GLM-5 use the same split.)
+            "llama-bpe" | "glm4" => {
                 r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
             }
             p => bail!(
@@ -938,6 +944,10 @@ pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec
     }
     if arch == "deepseek41" {
         return crate::deepseek4::gguf_name_v41(&t.name, &t.ne);
+    }
+    // GLM-5.3 / GLM-5.3-Flash: the release's naming.
+    if matches!(arch, "glm5-next" | "glm-dsa") {
+        return crate::glm5::gguf_name(&t.name, &t.ne, n_layers);
     }
     let mut shape: Vec<usize> = t.ne.iter().rev().copied().collect();
     let name = match t.name.as_str() {

@@ -189,9 +189,9 @@ impl Mlp<'_> {
 /// A hyper-connection mixer: `f` `[(2 + hc) * hc, hc * H]` (or `[hc, hc * H]` for the head),
 /// `base`, and the `pre` / `post` / `comb` scales.
 pub(crate) struct Hc {
-    f: Vec<f32>,
-    base: Vec<f32>,
-    scale: Vec<f32>,
+    pub(crate) f: Vec<f32>,
+    pub(crate) base: Vec<f32>,
+    pub(crate) scale: Vec<f32>,
 }
 
 /// Pools `r` tokens (two overlapping series of `r` with `overlap`) into one key of `d`.

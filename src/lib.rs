@@ -41,6 +41,7 @@ pub mod fsx;
 pub mod generate;
 pub mod ggml;
 pub mod gguf;
+pub mod glm5;
 pub mod gpu;
 #[cfg(feature = "hf")]
 pub mod hf;
