@@ -298,10 +298,12 @@ encoder's vision tower as `<imageN><|vision_start|>...<|vision_end|>` before the
 own merger, are added to the image tokens after the language model's first three layers), and
 through the VAE as opaque RGBA into latent tokens, four of which stand in the transformer's
 sequence where the text encoder had one placeholder. The VAE decodes to RGBA: the command line
-writes an RGBA PNG when the picture has transparent pixels (alpha under one half somewhere; ask
-for them as the model card does, "This is an RGBA image with transparency. ... The image has
+writes an RGBA PNG when the picture has a transparent region (a thousandth of its pixels under
+half alpha; an opaque picture still has stray pixels a few levels under 255; ask
+for transparency as the model card does, "This is an RGBA image with transparency. ... The image has
 alpha channel and the background is transparent.") and RGB otherwise; the library returns the
-RGB channels as they are and keeps the alpha in `Pipeline::alpha`.
+RGB channels as they are (whatever colour the model put under a transparent region) and keeps
+the alpha in `Pipeline::alpha`; the C API and the server return those RGB channels.
 
 | Flag | Meaning with Qwen-Image-2.1 |
 |---|---|
@@ -371,10 +373,13 @@ reading a book in a sunlit library" as a clean anime illustration; chatrlabs' Q4
 fine-tune of Qwen-Image-2.1 with `general.architecture = qwen_image21`, Q4_K and Q6_K blocks)
 with Qwen-Image-2.1's scheduler, 16 steps and true CFG 5 gives a clean 512x512 photograph of its
 prompt (a fox on a park bench); the Turbo edit above with oxinfer's own noise keeps the street
-and the shop sign's lettering and covers the pavement and ledges in snow, with flakes falling.
+and the shop sign's lettering and covers the pavement and ledges in snow, with flakes falling;
+the model card's transparent
+sticker prompt ("... A cute cartoon dragon sticker. ...", 512x512, CPU) gives a dragon whose
+background has alpha 0 (49% of the pixels), written as an RGBA PNG.
 Not run on real weights: the bf16 transformers (14 GB; the code path is the tiny models'),
 `--quant`, the FP8 single file, Qwen-Image-2.1's own checkpoint and 40-step schedule (only the
-fine-tune above, at 16 steps), several input images, transparent pictures, 2048x2048.
+fine-tune above, at 16 steps), several input images, 2048x2048.
 
 **Speed** (64-core x86 with an RTX 5080, a shared machine, Q4_K_M GGUF with `--mmap`): 35 s per
 pass at 768x768 and 57 s at 1024x1024 on CUDA, 41 s at 768x768 on the CPU alone (the GGUF

@@ -469,8 +469,10 @@ void oxi_janus_chat_reset(OxiJanus *j);
  *
  * Qwen/Qwen-Image-Edit-2511, -Edit-2509, -Edit and Qwen/Qwen-Image diffusers folders (over
  * oxinfer::qwen_image): Qwen2.5-VL-7B encodes the instruction with the input images, the 20B
- * MMDiT denoises with the images' latents as extra tokens, the VAE decodes. Same threading rules
- * as engines: one call at a time, oxi_qwen_image_cancel() from any thread. */
+ * MMDiT denoises with the images' latents as extra tokens, the VAE decodes. Qwen/Qwen-Image-2.1
+ * and -2.1-Turbo folders load the same way (Qwen3-VL-8B, a 7B transformer; text to image and
+ * edits, the RGB channels of their RGBA output; no strength, mask or ControlNet). Same threading
+ * rules as engines: one call at a time, oxi_qwen_image_cancel() from any thread. */
 
 typedef struct OxiQwenImage OxiQwenImage;
 
