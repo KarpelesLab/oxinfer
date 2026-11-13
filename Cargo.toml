@@ -83,7 +83,7 @@ name = "steer"
 required-features = ["hf"]
 
 [features]
-default = ["media", "hf", "gpu", "server"]
+default = ["media", "hf", "gpu", "server", "update"]
 # oxideav-core's types in the public API (the `av` module): in-memory images, audio and video as
 # VideoFrame / AudioFrame + CodecParameters for the multimodal models, Whisper and Stable
 # Diffusion. Only the type crate: no codecs, containers or file code.
@@ -120,6 +120,9 @@ media = [
 ]
 # Fetching models from HuggingFace through rsurl.
 hf = ["dep:rsurl"]
+# `oxinfer --update`: self-update from the GitHub releases (archives unpacked with compcol and
+# fstool, both pure Rust).
+update = ["hf", "dep:compcol", "dep:fstool"]
 # Runtime-loaded GPU backends (CUDA, Metal, Vulkan); all optional at run time.
 gpu = ["dep:dlsym"]
 # The browser module (wasm32-unknown-unknown only): C-ABI exports for web/oxinfer.js and the
@@ -171,6 +174,8 @@ regex-syntax = { version = "0.8", default-features = false, features = ["std", "
 serde = { version = "1.0.229", features = ["derive"] }
 # preserve_order: tool schemas keep their key order (chat templates serialize them as given).
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
+compcol = { version = "0.7.8", default-features = false, features = ["std", "gzip", "zlib", "deflate"], optional = true }
+fstool = { version = "0.5.3", default-features = false, features = ["std", "alloc", "tar", "archive", "gzip"], optional = true }
 rsurl = { version = "0.1.20", default-features = false, features = ["purecrypto-tls", "idn"], optional = true }
 dlsym = { version = "0.0.2", optional = true }
 getrandom = { version = "0.3", default-features = false, optional = true }
@@ -190,3 +195,8 @@ opt-level = 3
 lto = "fat"
 codegen-units = 1
 debug = 1
+
+[lints.rust]
+# `fullrust` (libc-free static Linux, not in the `unix` family) is the target_os of the toolchain
+# the static release binary is built with; declared so that stock toolchains do not warn.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("fullrust"))'] }

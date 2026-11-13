@@ -123,6 +123,10 @@ struct Args {
     models_all: bool,
     models_kind: Option<oxinfer::advisor::Kind>,
     models_can: Vec<oxinfer::advisor::Cap>,
+    /// `--check-update` / `--update` (`--force`: reinstall the latest release).
+    check_update: bool,
+    update: bool,
+    force: bool,
     embed: bool,
     prompt_name: Option<String>,
     similarity: bool,
@@ -386,6 +390,9 @@ fn usage() -> ! {
          \x20 --image FILE         with --prompt: answer a question about the image (repeatable)\n\
          \x20 --chat               a conversation: more questions from standard input, one per line\n\
          \x20 --devices            list detected CPU features and GPUs, then exit\n\
+         \x20 --check-update       compare this binary with the latest GitHub release, then exit\n\
+         \x20 --update             download the latest release's binary for this platform and replace this\n\
+         \x20                      executable with it (--force: also when already up to date)\n\
          \x20 --models             list the tested models with what this machine can run: download size against\n\
          \x20                      the free disk space, memory against RAM and GPU memory, where each decodes\n\
          \x20                      and an estimated tokens/s (CPU kernels are timed for about a second);\n\
@@ -562,6 +569,9 @@ fn parse_args() -> Result<Args> {
         models_all: false,
         models_kind: None,
         models_can: Vec::new(),
+        check_update: false,
+        update: false,
+        force: false,
         embed: false,
         prompt_name: None,
         similarity: false,
@@ -758,6 +768,9 @@ fn parse_args() -> Result<Args> {
             }
             "--devices" => a.devices = true,
             "--models" => a.models = true,
+            "--check-update" => a.check_update = true,
+            "--update" => a.update = true,
+            "--force" => a.force = true,
             "--all" => a.models_all = true,
             "--can" => {
                 for v in val()?.split(',') {
@@ -885,7 +898,7 @@ fn parse_args() -> Result<Args> {
             }
         }
     }
-    if a.model.as_os_str().is_empty() && !a.devices && !a.models {
+    if a.model.as_os_str().is_empty() && !a.devices && !a.models && !a.check_update && !a.update {
         usage();
     }
     Ok(a)
@@ -1082,6 +1095,36 @@ fn report(prefill_tokens: usize, prefill_secs: f64, decode_tokens: usize, decode
     );
 }
 
+/// `--check-update` / `--update`: the latest GitHub release against this binary.
+#[cfg(feature = "update")]
+fn run_update(args: &Args) -> Result<()> {
+    use oxinfer::update::{CURRENT, Outcome, latest, platform_suffix, update};
+    if !args.update {
+        let rel = latest()?;
+        if rel.is_newer() {
+            let binary = match (platform_suffix(), rel.asset()) {
+                (_, Some(a)) => format!("{} ({:.1} MB); oxinfer --update installs it", a.name, a.size as f64 / 1e6),
+                (Some(s), None) => format!("no {s} binary attached to it"),
+                (None, None) => "no binary is published for this platform".to_string(),
+            };
+            println!("oxinfer {CURRENT}: {} is available ({}): {binary}", rel.version(), rel.html_url);
+        } else {
+            println!("oxinfer {CURRENT} is the latest release");
+        }
+        return Ok(());
+    }
+    match update(args.force, &mut |line| eprintln!("[{line}]"))? {
+        Outcome::UpToDate(v) => println!("oxinfer {CURRENT} is up to date (latest release: {v}); --force reinstalls it"),
+        Outcome::Updated(exe, v) => println!("updated {} from {CURRENT} to {v}", exe.display()),
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "update"))]
+fn run_update(_args: &Args) -> Result<()> {
+    anyhow::bail!("this build has no self-update (the `update` feature)")
+}
+
 /// `--models`: the catalog of tested models against this machine.
 fn run_models(args: &Args) -> Result<()> {
     pool::init(args.threads.unwrap_or_else(default_threads));
@@ -1116,6 +1159,9 @@ fn main() -> Result<()> {
     }
     if args.models {
         return run_models(&args);
+    }
+    if args.check_update || args.update {
+        return run_update(&args);
     }
     // Resolve repo ids to cached local directories.
     let spec = args.model.to_string_lossy().to_string();

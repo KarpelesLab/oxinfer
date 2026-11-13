@@ -96,6 +96,8 @@ pub mod tokenizer;
 pub mod tools;
 pub mod torch;
 pub mod tts;
+#[cfg(feature = "update")]
+pub mod update;
 pub mod vae_posterior;
 pub mod video;
 pub mod vision;

@@ -4658,6 +4658,32 @@ By default the whole safetensors file is read into RAM at startup (a few seconds
 gives steady decode speed from the first token. `--mmap` starts faster but pays page
 faults on the first pass.
 
+### Release binaries and self-update
+
+Each GitHub release carries the `oxinfer` binary (`.github/workflows/release-binaries.yml`,
+dispatched by release-plz on the new tag):
+
+| archive | built with | notes |
+|---|---|---|
+| `oxinfer-<tag>-linux-x86_64-static.tar.gz` | the [fullrust](https://github.com/KarpelesLab/fullrust) toolchain | a static executable with no libc and no interpreter: it needs only a Linux kernel. CPU only (it cannot load the CUDA / Vulkan libraries) and without `oxinfer serve` (httpsd does not build for that target yet) |
+| `oxinfer-<tag>-linux-x86_64.tar.gz`, `-linux-aarch64.tar.gz` | stable Rust, glibc | all default features |
+| `oxinfer-<tag>-windows-x86_64.zip`, `-windows-aarch64.zip` | stable Rust, MSVC | |
+| `oxinfer-<tag>-macos-universal.tar.gz` | stable Rust, both Apple architectures in one binary | |
+
+```sh
+oxinfer --check-update    # compares this binary with the latest release
+oxinfer --update          # downloads this platform's archive and replaces the executable
+```
+
+`--update` (`src/update.rs`, the `update` feature, on by default) reads the latest release from
+the GitHub API, downloads the archive named for the platform the binary was built for, unpacks
+it in memory (gzip with [compcol](https://crates.io/crates/compcol), the tar or zip container
+with [fstool](https://crates.io/crates/fstool)), writes the new executable beside the running
+one and swaps them by renames (on Windows the previous one stays as `oxinfer.exe.old` while it
+runs). `--force` reinstalls the latest release. What vouches for the download is GitHub over TLS
+and the size the API lists: the releases are not signed and no digest is checked. A binary built
+from source for a platform without an archive (Android, the BSDs, musl) reports that instead.
+
 ### What runs on this machine
 
 ```sh
