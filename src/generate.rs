@@ -488,6 +488,8 @@ pub struct TextStream {
     call: Option<u32>,
     thinking: bool,
     tags: Option<Tags>,
+    /// The token that opens a message header and those that end it ([`ChatFormat::message_header`]).
+    header: Option<(u32, Vec<u32>)>,
 }
 
 /// The token ids of a format whose blocks are tags of several tokens
@@ -526,6 +528,9 @@ impl TextStream {
             call: id(fmt.tool_call_marker()),
             thinking: fmt.starts_in_thinking(think),
             tags,
+            header: fmt
+                .message_header()
+                .and_then(|(open, ends)| Some((tok.token_to_id(open)?, ends.iter().filter_map(|t| tok.token_to_id(t)).collect()))),
         }
     }
 
@@ -601,7 +606,26 @@ impl TextStream {
                 }
                 shown
             }
-            None => visible.iter().copied().filter(|&t| t != self.soc && t != self.eoc).collect(),
+            None => {
+                // What a message header holds between its opening token and its content kind is a name.
+                let mut in_header = false;
+                visible
+                    .iter()
+                    .copied()
+                    .filter(|&t| {
+                        if let Some((open, ends)) = &self.header {
+                            if t == *open {
+                                in_header = true;
+                            } else if in_header && !ends.contains(&t) {
+                                return false;
+                            } else {
+                                in_header = false;
+                            }
+                        }
+                        t != self.soc && t != self.eoc
+                    })
+                    .collect()
+            }
         };
         if let Ok(text) = tok.decode(&shown, true) {
             let stable = if !final_ && text.ends_with('\u{FFFD}') {

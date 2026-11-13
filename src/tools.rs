@@ -1221,6 +1221,93 @@ pub mod nemotron {
     }
 }
 
+// ---- Inkling-2 ----------------------------------------------------------------------------------
+
+/// Inkling-2: tools are declared as one JSON array in a system message, a call is a model
+/// message named after the function whose content is `{"name": ..., "args": {...}}`, and a
+/// result is a tool message named after the function.
+pub mod inkling {
+    use super::*;
+
+    /// The content kind that marks a call in a reply.
+    pub const MARKER: &str = "<|content_invoke_tool_json|>";
+    const END: &str = "<|end_message|>";
+
+    /// `v` with the keys of every object sorted (the template's `tojson(sort_keys=true)`).
+    fn sorted(v: &Value) -> Value {
+        match v {
+            Value::Array(a) => Value::Array(a.iter().map(sorted).collect()),
+            Value::Object(o) => {
+                let mut keys: Vec<&String> = o.keys().collect();
+                keys.sort();
+                Value::Object(keys.into_iter().map(|k| (k.clone(), sorted(&o[k]))).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// The system message that declares the tools.
+    pub fn tools_block(tools: &[ToolSpec]) -> String {
+        let specs: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                // (The template takes empty parameters as `{}`.)
+                let empty = t.parameters.is_null() || t.parameters.as_object().is_some_and(|o| o.is_empty());
+                let parameters = if empty { json!({}) } else { sorted(&t.parameters) };
+                json!({ "description": t.description, "name": t.name, "parameters": parameters, "type": "function" })
+            })
+            .collect();
+        format!("<|message_system|>tool_declare<|content_xml|>{}{END}", Value::Array(specs))
+    }
+
+    /// Every call of a reply decoded with its special tokens.
+    pub fn parse_calls(raw: &str) -> Vec<ToolCall> {
+        let mut calls = Vec::new();
+        let mut parts = raw.split(MARKER);
+        let mut before = parts.next().unwrap_or("");
+        for part in parts {
+            let body = part.split(END).next().unwrap_or(part);
+            // The message is named after the function; the content names it again.
+            let header = before.rsplit("<|message_model|>").next().unwrap_or("").trim();
+            let v: Value = serde_json::from_str(body.trim()).unwrap_or(Value::Null);
+            let name = v.get("name").and_then(Value::as_str).unwrap_or(header);
+            if !name.is_empty() && !name.contains("<|") {
+                calls.push(ToolCall {
+                    name: name.to_string(),
+                    arguments: v.get("args").and_then(Value::as_object).cloned().unwrap_or_default(),
+                });
+            }
+            before = part;
+        }
+        calls
+    }
+
+    /// Calls as the template renders them after a reply's text.
+    pub fn calls(calls: &[ToolCall]) -> String {
+        let mut s = String::new();
+        for c in calls {
+            let mut keys: Vec<&String> = c.arguments.keys().collect();
+            keys.sort();
+            let args: Vec<String> = keys
+                .into_iter()
+                .map(|k| format!("{}:{}", Value::String(k.clone()), c.arguments[k]))
+                .collect();
+            s.push_str(&format!(
+                "<|message_model|>{}{MARKER}{{\"name\":{},\"args\":{{{}}}}}{END}",
+                c.name,
+                Value::String(c.name.clone()),
+                args.join(",")
+            ));
+        }
+        s
+    }
+
+    /// A tool message with a call's result.
+    pub fn response(r: &ToolResult) -> String {
+        format!("<|message_tool|>{}<|content_text|>{}{END}", r.name, r.content)
+    }
+}
+
 // ---- built-in tools (command line) --------------------------------------------------------------
 
 /// Local wall-clock time: (`YYYY-MM-DD HH:MM:SS`, weekday, UTC offset in seconds, zone name).

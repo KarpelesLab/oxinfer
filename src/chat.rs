@@ -100,6 +100,12 @@ pub trait ChatFormat {
     fn tag_tokens(&self) -> Option<TagTokens> {
         None
     }
+
+    /// For formats whose replies are messages with a header: the token that opens a message and
+    /// the tokens that end its header (what stands between is a name, not text of the reply).
+    fn message_header(&self) -> Option<(&'static str, &'static [&'static str])> {
+        None
+    }
 }
 
 pub struct GemmaChat;
@@ -1462,6 +1468,109 @@ impl ChatFormat for NemotronChat {
     }
 }
 
+/// Inkling-2 (its `chat_template.jinja`): a conversation is a sequence of messages, each
+/// `<|message_ROLE|>` (plus a name for tool calls and tool results), a content kind
+/// (`<|content_text|>`, `<|content_thinking|>`, ...), the content and `<|end_message|>`. A system
+/// message giving the thinking effort (0.9 with thinking, 0 without) comes before the first
+/// message that is not a system one; tools are declared in a system message of their own in
+/// front of everything. There is no generation prompt: the model opens its own messages (a
+/// thinking one, then a text one or tool calls) and ends its turn with
+/// `<|content_model_end_sampling|>`.
+pub struct InklingChat;
+
+impl InklingChat {
+    const END: &'static str = "<|end_message|>";
+    const END_TURN: &'static str = "<|content_model_end_sampling|>";
+    /// What opens a user message holding an image (placeholders up to `<|end_message|>`).
+    pub const IMAGE: &'static str = "<|message_user|><|content_image|>";
+    /// The placeholder of one image feature.
+    pub const IMAGE_TOKEN: &'static str = "<|unused_200054|>";
+
+    fn effort(think: bool) -> String {
+        let level = if think { "0.9" } else { "0" };
+        format!("<|message_system|><|content_text|>Thinking effort level: {level}{}", Self::END)
+    }
+}
+
+impl ChatFormat for InklingChat {
+    fn conversation_start(&self, system: Option<&str>, think: bool) -> String {
+        self.conversation_start_tools(system, think, &[])
+    }
+    fn user_turn(&self, content: &str, _think: bool) -> String {
+        // Images are messages of their own in front of the text (`mm::prepare` writes them at
+        // the start of the content).
+        let (mut images, mut text) = (String::new(), content);
+        while text.starts_with(Self::IMAGE)
+            && let Some(i) = text.find(Self::END)
+        {
+            let (message, rest) = text.split_at(i + Self::END.len());
+            images.push_str(message);
+            text = rest;
+        }
+        format!("{images}<|message_user|><|content_text|>{text}{}", Self::END)
+    }
+    fn end_of_model_turn(&self) -> String {
+        Self::END_TURN.to_string()
+    }
+    fn end_of_turn_token(&self) -> &'static str {
+        Self::END_TURN
+    }
+    fn think_tokens(&self) -> (&'static str, &'static str) {
+        // (A text message ends on the same token, which leaves thinking where it is: off.)
+        ("<|content_thinking|>", Self::END)
+    }
+    fn starts_in_thinking(&self, _think: bool) -> bool {
+        false
+    }
+    fn message_header(&self) -> Option<(&'static str, &'static [&'static str])> {
+        Some((
+            "<|message_model|>",
+            &[
+                "<|content_text|>",
+                "<|content_thinking|>",
+                "<|content_invoke_tool_json|>",
+                "<|content_invoke_tool_text|>",
+                "<|content_xml|>",
+                "<|content_tool_error|>",
+                "<|content_image|>",
+            ],
+        ))
+    }
+    fn conversation_start_tools(&self, system: Option<&str>, think: bool, tools: &[ToolSpec]) -> String {
+        let mut s = String::new();
+        if !tools.is_empty() {
+            s.push_str(&crate::tools::inkling::tools_block(tools));
+        }
+        if let Some(sys) = system {
+            s.push_str(&format!("<|message_system|><|content_text|>{sys}{}", Self::END));
+        }
+        s.push_str(&Self::effort(think));
+        s
+    }
+    fn tool_call_marker(&self) -> &'static str {
+        crate::tools::inkling::MARKER
+    }
+    fn parse_tool_calls(&self, raw: &str) -> Vec<ToolCall> {
+        crate::tools::inkling::parse_calls(raw)
+    }
+    fn tool_results(&self, results: &[ToolResult], _think: bool) -> String {
+        // The reply ended on its end-of-turn token (sampled, not fed).
+        let mut s = String::from(Self::END_TURN);
+        for r in results {
+            s.push_str(&crate::tools::inkling::response(r));
+        }
+        s
+    }
+    fn assistant_text(&self, content: &str, calls: &[ToolCall]) -> String {
+        let mut s = String::new();
+        if !content.is_empty() || calls.is_empty() {
+            s.push_str(&format!("<|message_model|><|content_text|>{content}{}", Self::END));
+        }
+        s.push_str(&crate::tools::inkling::calls(calls));
+        s
+    }
+}
+
 /// `eos` plus the chat format's end-of-turn token, looked up in the tokenizer.
 pub fn with_turn_end(fmt: &dyn ChatFormat, tok: &crate::tokenizer::Tokenizer, mut eos: Vec<u32>) -> Vec<u32> {
     if let Some(id) = tok.token_to_id(fmt.end_of_turn_token())
@@ -1748,6 +1857,91 @@ mod tests {
                 "<｜begin▁of▁sentence｜><｜System｜>Be brief.\n\n{tools}<｜User｜>Paris?<｜Assistant｜></think>Let me check.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls><｜end▁of▁sentence｜><｜User｜><tool_result>sunny</tool_result><｜Assistant｜></think>Sunny.<｜end▁of▁sentence｜><｜User｜>Thanks<｜Assistant｜></think>"
             )
         );
+    }
+
+    /// The renderings of Inkling-2-Small's chat template (transformers' jinja environment).
+    #[test]
+    fn inkling_matches_template() {
+        let f = InklingChat;
+        assert_eq!(
+            f.first_turn(Some("Be brief."), true, &[], "What is the capital of France?"),
+            "<|message_system|><|content_text|>Be brief.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is the capital of France?<|end_message|>"
+        );
+        assert_eq!(
+            f.first_turn(None, false, &[], "Hi"),
+            "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi<|end_message|>"
+        );
+        let tools = [
+            ToolSpec {
+                name: "get_time".into(),
+                description: "Current time in a timezone.".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {"tz": {"type": "string", "description": "IANA name"}, "n": {"type": "integer"}}, "required": ["tz"]}),
+            },
+            ToolSpec {
+                name: "calc".into(),
+                description: "Evaluate \"é\".".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {"expr": {"type": "string"}}}),
+            },
+        ];
+        let start = concat!(
+            r#"<|message_system|>tool_declare<|content_xml|>[{"description":"Current time in a timezone.","name":"get_time","parameters":{"properties":{"n":{"type":"integer"},"tz":{"description":"IANA name","type":"string"}},"required":["tz"],"type":"object"},"type":"function"},"#,
+            r#"{"description":"Evaluate \"é\".","name":"calc","parameters":{"properties":{"expr":{"type":"string"}},"type":"object"},"type":"function"}]<|end_message|>"#,
+            "<|message_system|><|content_text|>Be brief.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>",
+            "<|message_user|><|content_text|>Time in Tokyo?<|end_message|>"
+        );
+        assert_eq!(f.first_turn(Some("Be brief."), true, &tools, "Time in Tokyo?"), start);
+        // A reply with reasoning, text and two calls as the template renders it, its parse, the
+        // results and the next turns.
+        let thinking = "<|message_model|><|content_thinking|>need tool<|end_message|>";
+        let reply = concat!(
+            "<|message_model|><|content_text|>Let me check.<|end_message|>",
+            r#"<|message_model|>get_time<|content_invoke_tool_json|>{"name":"get_time","args":{"n":3,"tz":"Asia/Tokyo"}}<|end_message|>"#,
+            r#"<|message_model|>calc<|content_invoke_tool_json|>{"name":"calc","args":{"Opt":{"z":1,"a":[1.5,true,null]},"expr":"1+1"}}<|end_message|>"#
+        );
+        let calls = f.parse_tool_calls(&format!("{thinking}{reply}"));
+        assert_eq!(calls.len(), 2);
+        assert_eq!((calls[0].name.as_str(), calls[1].name.as_str()), ("get_time", "calc"));
+        assert_eq!(calls[0].arguments["tz"], "Asia/Tokyo");
+        assert_eq!(calls[0].arguments["n"], 3);
+        assert_eq!(calls[1].arguments["Opt"]["a"][0], 1.5);
+        assert_eq!(f.assistant_text("Let me check.", &calls), reply);
+        let results = [
+            ToolResult {
+                name: "get_time".into(),
+                content: "12:00".into(),
+            },
+            ToolResult {
+                name: "calc".into(),
+                content: "2".into(),
+            },
+        ];
+        assert_eq!(
+            f.tool_results(&results, true),
+            "<|content_model_end_sampling|><|message_tool|>get_time<|content_text|>12:00<|end_message|><|message_tool|>calc<|content_text|>2<|end_message|>"
+        );
+        assert_eq!(
+            format!(
+                "{}{}{}",
+                f.assistant_text("It is noon.", &[]),
+                f.end_of_model_turn(),
+                f.user_turn("Thanks, and in Paris?", true)
+            ),
+            "<|message_model|><|content_text|>It is noon.<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Thanks, and in Paris?<|end_message|>"
+        );
+        // An image is a message of its own in front of the text.
+        assert_eq!(
+            f.user_turn(
+                "<|message_user|><|content_image|><|unused_200054|><|unused_200054|><|end_message|>Describe this image.",
+                true
+            ),
+            "<|message_user|><|content_image|><|unused_200054|><|unused_200054|><|end_message|><|message_user|><|content_text|>Describe this image.<|end_message|>"
+        );
+        // A call without text has no text message; a reply without calls always has one.
+        assert!(
+            f.assistant_text("", &calls)
+                .starts_with("<|message_model|>get_time<|content_invoke_tool_json|>")
+        );
+        assert_eq!(f.assistant_text("", &[]), "<|message_model|><|content_text|><|end_message|>");
     }
 
     /// The renderings of GLM-5.3-Flash's chat template (transformers' jinja environment; the

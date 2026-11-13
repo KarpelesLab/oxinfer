@@ -1591,6 +1591,7 @@ fn run(mut args: Args) -> Result<()> {
         m if oxinfer::glm5::is_model_type(m) => run_glm5(args),
         "kimi_k3" | "kimi_k31" => run_kimi(args),
         m if oxinfer::nemotron::is_model_type(m) => run_nemotron(args),
+        m if oxinfer::inkling::is_model_type(m) => run_inkling(args),
         other => bail!("unsupported model_type {other}"),
     }
 }
@@ -2582,6 +2583,82 @@ fn run_glm5(mut args: Args) -> Result<()> {
     *STREAM.lock().unwrap() = streamer.clone();
     TRACE.store(args.stream_trace, std::sync::atomic::Ordering::Relaxed);
     let r = run_text(&args, &model, &tok, &eos, fmt, Default::default());
+    if let Some(s) = &streamer
+        && let Some(c) = s.cached_bytes()
+    {
+        eprintln!("[stream: {:.2} GB of the model files in the page cache at exit]", c as f64 / 1e9);
+    }
+    *STREAM.lock().unwrap() = None;
+    model.set_stream(None);
+    drop(streamer);
+    r
+}
+
+/// Inkling-2 (see `oxinfer::inkling`).
+fn run_inkling(mut args: Args) -> Result<()> {
+    let t0 = Instant::now();
+    if args.mtp || args.draft.is_some() {
+        bail!("Inkling-2: speculative decoding (--mtp, --draft) is not supported");
+    }
+    let cfg = oxinfer::inkling::Inkling2Config::load(&args.model)?;
+    let eos = config::load_eos_ids(&args.model);
+    // A checkpoint larger than most of RAM is streamed with a page-cache budget of 70% of RAM,
+    // unless `--no-stream` (or `--mmap`) asks for plain demand paging.
+    let size: u64 = oxinfer::safetensors::checkpoint_bytes(&args.model);
+    if oxinfer::inkling::too_big(size) && args.no_stream {
+        args.mmap = true;
+    }
+    if oxinfer::inkling::too_big(size) && !args.stream && !args.mmap {
+        let budget = oxinfer::inkling::default_stream().cache_budget.unwrap_or(0) as f64 / 1e9;
+        args.cache_budget_gb = Some(args.cache_budget_gb.unwrap_or(budget));
+        eprintln!(
+            "[the {:.0} GB checkpoint does not fit in memory: streaming it (--stream --cache-budget-gb {:.0})]",
+            size as f64 / 1e9,
+            args.cache_budget_gb.unwrap()
+        );
+        args.stream = true;
+    }
+    args.mmap |= args.stream;
+    let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
+    let mut model = oxinfer::inkling::Inkling2Model::load(cfg, &files, args.quant)?;
+    // Prompt lookup verifies a draft in one pass and rolls back what the model refutes: the
+    // convolutions cannot go back to an earlier position.
+    if args.lookup == Some(true) {
+        eprintln!("[--lookup is not available for Inkling-2 (its convolutions cannot roll back): plain decoding]");
+    }
+    *LOOKUP.lock().unwrap() = None;
+    let tok = load_tokenizer(&args.model)?;
+    let fmt: &dyn ChatFormat = &chat::InklingChat;
+    let eos = chat::with_turn_end(fmt, &tok, eos);
+    let c = &model.cfg;
+    eprintln!(
+        "[loaded Inkling-2: {} layers ({} sliding-window), hidden {}, {:.1} GB checkpoint ({}), {:?} weights streaming {:.2} GB/token, {} threads, {:.2}s]",
+        c.num_hidden_layers,
+        c.sliding.iter().filter(|s| **s).count(),
+        c.hidden_size,
+        files.total_bytes() as f64 / 1e9,
+        if args.mmap { "mmap" } else { "in RAM" },
+        model.quant,
+        model.streamed_bytes() as f64 / 1e9,
+        pool::threads(),
+        t0.elapsed().as_secs_f64()
+    );
+    if let Some(out) = &args.save_quantized {
+        return save_quantized(&args.model, out, &files, model.quant);
+    }
+    let mm = if mm_request(&args).is_empty() {
+        Default::default()
+    } else {
+        oxinfer::mm::prepare(&mm_request(&args), &files, model.cfg.hidden_size)?
+    };
+    let streamer = if args.stream {
+        Some(start_stream(&args, |o| oxinfer::stream::attach_inkling(&mut model, &files, o))?)
+    } else {
+        None
+    };
+    *STREAM.lock().unwrap() = streamer.clone();
+    TRACE.store(args.stream_trace, std::sync::atomic::Ordering::Relaxed);
+    let r = run_text(&args, &model, &tok, &eos, fmt, mm);
     if let Some(s) = &streamer
         && let Some(c) = s.cached_bytes()
     {

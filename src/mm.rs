@@ -256,6 +256,9 @@ fn prepare_sources(src: &Sources, files: &ModelFiles, text_hidden: usize) -> Res
     if let Some(pc) = crate::pixtral::PixtralConfig::load_with(args.model, &args.mmproj)? {
         return prepare_pixtral(src, files, text_hidden, pc);
     }
+    if let Some(ic) = crate::inkling_vision::Inkling2VisionConfig::load(args.model)? {
+        return prepare_inkling(src, files, text_hidden, ic);
+    }
     if let Some(qc) = qwen_vision::QwenMmConfig::load_with(args.model, &args.mmproj)? {
         return prepare_qwen(src, files, text_hidden, qc);
     }
@@ -444,6 +447,63 @@ fn prepare_pixtral(
             dump(&format!("{}_image.bin", prefix.display()), &emb)?;
         }
         text.push_str(&tower.placeholder(&px));
+        feats.push(MmFeature {
+            token_id: tower.cfg.image_token_id,
+            emb,
+            n,
+            grids: Vec::new(),
+        });
+    }
+    Ok((text, feats))
+}
+
+/// Inkling-2 images: each a user message of placeholders, one per tile of 40 x 40 pixels (the
+/// image is not resized), in front of the text.
+fn prepare_inkling(
+    src: &Sources,
+    files: &ModelFiles,
+    text_hidden: usize,
+    ic: crate::inkling_vision::Inkling2VisionConfig,
+) -> Result<(String, Vec<MmFeature>)> {
+    let args = src.req;
+    if src.n_videos() > 0 || src.n_audios() > 0 {
+        bail!("this model takes images only (no video or audio)");
+    }
+    let t = Instant::now();
+    let tower = crate::inkling_vision::Inkling2Vision::load(ic, files, text_hidden)?;
+    let (mut text, mut feats) = (String::new(), Vec::new());
+    for i in 0..src.n_images() {
+        let (what, img) = src.image(i)?;
+        let px = tower.preprocess(&img.data, img.width, img.height)?;
+        if args.max_soft_tokens > 0 && px.rows * px.cols > args.max_soft_tokens {
+            bail!(
+                "image {what}: {} tokens ({}x{} pixels in tiles of {}) is over --max-soft-tokens {} (images are not resized)",
+                px.rows * px.cols,
+                img.width,
+                img.height,
+                tower.cfg.tile(),
+                args.max_soft_tokens
+            );
+        }
+        let emb = tower.encode(&px);
+        let n = emb.len() / text_hidden;
+        eprintln!(
+            "[image {what}: {}x{} -> {}x{} tiles -> {} soft tokens, {:.2}s]",
+            img.width,
+            img.height,
+            px.cols,
+            px.rows,
+            n,
+            t.elapsed().as_secs_f64()
+        );
+        if let (Some(prefix), 0) = (args.dump_mm, i) {
+            dump(&format!("{}_pixels.bin", prefix.display()), &px.patches)?;
+            dump(&format!("{}_image.bin", prefix.display()), &emb)?;
+        }
+        // One user message holding a placeholder per tile.
+        text.push_str(crate::chat::InklingChat::IMAGE);
+        text.push_str(&crate::chat::InklingChat::IMAGE_TOKEN.repeat(n));
+        text.push_str("<|end_message|>");
         feats.push(MmFeature {
             token_id: tower.cfg.image_token_id,
             emb,
