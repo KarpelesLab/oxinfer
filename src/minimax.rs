@@ -33,6 +33,11 @@ impl<'a> Indexer<'a> {
     /// The indexer under `ap` (`...self_attn.`), if the layer has one: `index_q_proj`, ...
     /// (MiniMax's release) or `indexer.q_proj`, ... (transformers, GGUF).
     pub(crate) fn load(ld: &Loader<'a, '_>, ap: &str) -> Result<Option<Self>> {
+        // Qwen4-Exp's QSA indexer is another one (`crate::qwen4exp`), whose separate query and key
+        // projections llama.cpp GGUFs store under the names tested below.
+        if ld.cfg.is_exp() {
+            return Ok(None);
+        }
         let p = if ld.has(&format!("{ap}index_q_proj.weight")) {
             format!("{ap}index_")
         } else if ld.has(&format!("{ap}indexer.q_proj.weight")) {
