@@ -95,6 +95,10 @@ pub trait ChatFormat {
         let _ = think;
         self.assistant_text(content, calls)
     }
+    /// Whether a reply is shown with its special tokens (Unlimited-OCR's table tags are some).
+    fn keeps_special_tokens(&self) -> bool {
+        false
+    }
     /// The tags of a format whose blocks are not delimited by single tokens (then
     /// [`ChatFormat::think_tokens`] and [`ChatFormat::tool_call_marker`] are empty).
     fn tag_tokens(&self) -> Option<TagTokens> {

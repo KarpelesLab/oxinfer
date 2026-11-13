@@ -490,6 +490,8 @@ pub struct TextStream {
     tags: Option<Tags>,
     /// The token that opens a message header and those that end it ([`ChatFormat::message_header`]).
     header: Option<(u32, Vec<u32>)>,
+    /// Special tokens are part of the text ([`ChatFormat::keeps_special_tokens`]).
+    keep_special: bool,
 }
 
 /// The token ids of a format whose blocks are tags of several tokens
@@ -531,6 +533,7 @@ impl TextStream {
             header: fmt
                 .message_header()
                 .and_then(|(open, ends)| Some((tok.token_to_id(open)?, ends.iter().filter_map(|t| tok.token_to_id(t)).collect()))),
+            keep_special: fmt.keeps_special_tokens(),
         }
     }
 
@@ -627,7 +630,7 @@ impl TextStream {
                     .collect()
             }
         };
-        if let Ok(text) = tok.decode(&shown, true) {
+        if let Ok(text) = tok.decode(&shown, !self.keep_special) {
             let stable = if !final_ && text.ends_with('\u{FFFD}') {
                 text.len().saturating_sub(3)
             } else {
