@@ -169,6 +169,9 @@ pub(crate) struct Experts<'a> {
     /// rather than keeping all of them wrapped: set for expert sets too large to be wrapped twice
     /// (prefill and the GPU decode plan each wrap what they use).
     pub(crate) wrap_per_pass: std::sync::atomic::AtomicBool,
+    /// The rows of a fused gate/up weight alternate (gate `j` at `2j`, up `j` at `2j + 1`:
+    /// Inkling-2's `w13_weight`) instead of gate rows then up rows. CPU only.
+    pub(crate) interleaved: bool,
 }
 
 /// Indices and renormalized weights of the top-k experts of one token (softmax over all experts,
@@ -288,7 +291,32 @@ impl<'a> Experts<'a> {
             act,
             dev: std::sync::OnceLock::new(),
             wrap_per_pass: std::sync::atomic::AtomicBool::new(false),
+            interleaved: false,
         })
+    }
+
+    /// Experts whose fused gate/up weights (`[2 * inter, H]` each) have their rows interleaved.
+    pub fn interleaved(gate_up: Vec<Lin<'a>>, down: Vec<Lin<'a>>, top_k: usize, mi: usize, act: Act) -> Self {
+        Self {
+            gate_up: gate_up.into_iter().map(GateUp::Fused).collect(),
+            down,
+            top_k,
+            inter: mi,
+            act,
+            dev: std::sync::OnceLock::new(),
+            wrap_per_pass: std::sync::atomic::AtomicBool::new(false),
+            interleaved: true,
+        }
+    }
+
+    /// A fused gate/up output row as gate values then up values.
+    fn gate_then_up(&self, r: &mut [f32]) {
+        if self.interleaved {
+            let (t, mi) = (r.to_vec(), r.len() / 2);
+            for j in 0..mi {
+                (r[j], r[mi + j]) = (t[2 * j], t[2 * j + 1]);
+            }
+        }
     }
 
     pub fn n_experts(&self) -> usize {
@@ -335,7 +363,7 @@ impl<'a> Experts<'a> {
         };
         // The accelerator runs gate/up, the activation and down in one submission, which leaves
         // no place for a side path: experts with an active LoRA run on the CPU.
-        if !be.wants(2 * mi, h, t * self.top_k) || !self.act.on_device() || self.lora_active() {
+        if !be.wants(2 * mi, h, t * self.top_k) || !self.act.on_device() || self.lora_active() || self.interleaved {
             return false;
         }
         let act = self.act;
@@ -501,6 +529,7 @@ impl<'a> Experts<'a> {
             match &self.gate_up[e] {
                 GateUp::Fused(_) => {
                     for (ar, r) in ae.chunks_mut(mi).zip(gu.chunks_mut(2 * mi)) {
+                        self.gate_then_up(r);
                         let (g, u) = r.split_at_mut(mi);
                         self.act.apply(g, u);
                         ar.copy_from_slice(g);
@@ -638,6 +667,7 @@ impl<'a> Experts<'a> {
             linear_multi(&mut jobs, h, x, 1);
             let mut o = vec![0f32; h];
             for (&(e, w), gu) in r.iter().zip(gu.iter_mut()) {
+                self.gate_then_up(gu);
                 let (g, u) = gu.split_at_mut(mi);
                 act.apply(g, u);
                 if let Some(k) = hook {
@@ -668,6 +698,7 @@ impl<'a> Experts<'a> {
                         let mut gu = vec![0f32; n * 2 * mi];
                         linear(l, 2 * mi, h, &xs, n, &mut gu);
                         for (ar, r) in a.chunks_mut(mi).zip(gu.chunks_mut(2 * mi)) {
+                            self.gate_then_up(r);
                             let (g, u) = r.split_at_mut(mi);
                             act.apply(g, u);
                             ar.copy_from_slice(g);
@@ -753,6 +784,12 @@ impl<'a> Experts<'a> {
                 grouped_lora(&ls, &segs, &count, 2 * mi, h, &xs, &mut gu);
                 for_chunks(&mut a, mi, true, |i, ar| {
                     let r = &gu[i * 2 * mi..(i + 1) * 2 * mi];
+                    if self.interleaved {
+                        for (o, gu) in ar.iter_mut().zip(r.as_chunks::<2>().0) {
+                            *o = act.scalar(gu[0], gu[1]);
+                        }
+                        return;
+                    }
                     for ((o, &g), &u) in ar.iter_mut().zip(&r[..mi]).zip(&r[mi..]) {
                         *o = act.scalar(g, u);
                     }
@@ -803,6 +840,78 @@ mod tests {
 
     /// Serializes the tests that switch the batched kernels off (a process-wide setting).
     static BATCHED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Fused gate/up weights whose rows alternate (Inkling-2's `w13_weight`) give what gate rows
+    /// then up rows give, on bf16 and on Q8 weights: decode, short passes and grouped prefill.
+    #[test]
+    fn interleaved_gate_up_rows() {
+        let _guard = BATCHED.lock().unwrap_or_else(|p| p.into_inner());
+        crate::pool::init(3);
+        let (ne, k, mi, h) = (5usize, 2usize, 32usize, 64usize);
+        let mut seed = 23u64;
+        let mut rnd = |n: usize, amp: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| bf16_to_f32(half::bf16::from_f32(lcg(&mut seed) * amp).to_bits()))
+                .collect()
+        };
+        let lin = |w: &[f32], n_out: usize, n_in: usize, q8: bool| -> Lin<'static> {
+            if q8 {
+                return Lin::q8(crate::quant::quantize_f32(w, n_out, n_in));
+            }
+            let mut pv = crate::quant::PageVec::<u16>::zeroed(w.len());
+            for (d, v) in pv.iter_mut().zip(w) {
+                *d = half::bf16::from_f32(*v).to_bits();
+            }
+            Lin::bf16_owned(pv)
+        };
+        let act = Act::Situ {
+            beta: 0.8,
+            linear_beta: 1.5,
+        };
+        // Gate rows then up rows, and the same rows alternating.
+        let wgu: Vec<Vec<f32>> = (0..ne).map(|_| rnd(2 * mi * h, 0.3)).collect();
+        let wd: Vec<Vec<f32>> = (0..ne).map(|_| rnd(h * mi, 0.3)).collect();
+        let mixed: Vec<Vec<f32>> = wgu
+            .iter()
+            .map(|w| {
+                (0..2 * mi)
+                    .flat_map(|r| {
+                        let src = if r % 2 == 0 { r / 2 } else { mi + r / 2 };
+                        w[src * h..(src + 1) * h].iter().copied()
+                    })
+                    .collect()
+            })
+            .collect();
+        for q8 in [false, true] {
+            let plain = Experts {
+                gate_up: wgu.iter().map(|w| GateUp::Fused(lin(w, 2 * mi, h, q8))).collect(),
+                down: wd.iter().map(|w| lin(w, h, mi, q8)).collect(),
+                top_k: k,
+                inter: mi,
+                act,
+                dev: std::sync::OnceLock::new(),
+                wrap_per_pass: std::sync::atomic::AtomicBool::new(false),
+                interleaved: false,
+            };
+            let inter = Experts::interleaved(
+                mixed.iter().map(|w| lin(w, 2 * mi, h, q8)).collect(),
+                wd.iter().map(|w| lin(w, h, mi, q8)).collect(),
+                k,
+                mi,
+                act,
+            );
+            for t in [1usize, 5, 3 * TN + 1] {
+                let x = rnd(t * h, 1.0);
+                let routes: Vec<Vec<(usize, f32)>> = (0..t).map(|i| vec![(i % ne, 0.7), ((i * 3 + 1) % ne, 0.3)]).collect();
+                let (mut ya, mut yb) = (vec![0f32; t * h], vec![0f32; t * h]);
+                plain.forward(&x, t, h, &routes, &mut ya, None, None, None);
+                inter.forward(&x, t, h, &routes, &mut yb, None, None, None);
+                let max = ya.iter().zip(&yb).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                let big = ya.iter().fold(0f32, |m, v| m.max(v.abs()));
+                assert!(big > 0.1 && max <= 1e-5 * big, "q8 {q8}, {t} tokens: diff {max} of {big}");
+            }
+        }
+    }
 
     /// A LoRA on the routed experts, in both PEFT layouts (stacked 3-D parameters, one module
     /// per expert) on both storages of the base weights (fused and separate gate / up), against
@@ -899,6 +1008,7 @@ mod tests {
                         act: Act::Silu,
                         dev: std::sync::OnceLock::new(),
                         wrap_per_pass: std::sync::atomic::AtomicBool::new(false),
+                        interleaved: false,
                     };
                     let modules = if stacked {
                         vec![
@@ -982,6 +1092,7 @@ mod tests {
             act: Act::Silu,
             dev: std::sync::OnceLock::new(),
             wrap_per_pass: std::sync::atomic::AtomicBool::new(false),
+            interleaved: false,
         };
         let name = "layers.0.mlp.experts";
         let attach = |rank: usize, modules: Vec<(String, Vec<f32>, Vec<f32>, usize)>| -> anyhow::Result<usize> {
@@ -1065,6 +1176,7 @@ mod tests {
                     act: Act::Silu,
                     dev: std::sync::OnceLock::new(),
                     wrap_per_pass: std::sync::atomic::AtomicBool::new(false),
+                    interleaved: false,
                 };
                 for t in 1..TN {
                     let x: Vec<f32> = (0..t * h).map(|_| lcg(&mut seed)).collect();

@@ -46,6 +46,8 @@ pub mod gpu;
 pub mod hadamard;
 #[cfg(feature = "hf")]
 pub mod hf;
+pub mod inkling;
+pub mod inkling_vision;
 pub mod intervene;
 pub mod janus;
 pub mod kernels;

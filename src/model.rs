@@ -474,6 +474,18 @@ pub(crate) fn nvfp4_matrix(files: &ModelFiles, full: &str, n_out: usize, n_in: u
     let g = files.f32(&gn)?.first().copied().context("NVFP4 global scale")?;
     let factor = if ct { 1.0 / g } else { g };
     let (packed, sc) = (files.bytes(&pn)?, files.bytes(&sn)?);
+    files.note_use(&pn, true, false);
+    files.note_use(&sn, true, false);
+    files.note_use(&gn, true, false);
+    nvfp4_blocks(packed, sc, factor, n_out, n_in)
+}
+
+/// NVFP4 values (`packed`: `[n_out, n_in / 2]` E2M1 pairs, low nibble first; `sc`: `[n_out,
+/// n_in / 16]` E4M3 scales) times `factor`, repacked into ggml's NVFP4 blocks of 64.
+pub(crate) fn nvfp4_blocks(packed: &[u8], sc: &[u8], factor: f32, n_out: usize, n_in: usize) -> Result<GgufMatrix> {
+    if !n_in.is_multiple_of(64) || packed.len() != n_out * n_in / 2 || sc.len() != n_out * n_in / 16 {
+        bail!("NVFP4 [{n_out}, {n_in}]: {} value bytes and {} scales", packed.len(), sc.len());
+    }
     let nb = n_in / 64;
     let mut out = crate::quant::PageVec::<u8>::zeroed(n_out * nb * 36);
     for (r, orow) in out.chunks_mut(nb * 36).enumerate() {
@@ -491,9 +503,6 @@ pub(crate) fn nvfp4_matrix(files: &ModelFiles, full: &str, n_out: usize, n_in: u
             }
         }
     }
-    files.note_use(&pn, true, false);
-    files.note_use(&sn, true, false);
-    files.note_use(&gn, true, false);
     let mut m = GgufMatrix::new(crate::ggml::GgmlType::NVFP4, out.into(), n_out, n_in)?;
     let mut g = crate::quant::PageVec::<f32>::zeroed(1);
     g[0] = factor;
