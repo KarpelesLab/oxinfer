@@ -1,0 +1,98 @@
+//! llama-bench style throughput through the `engine` API, warm (one warm-up pass first, as
+//! llama-bench does): prompt processing of exactly N raw tokens (cut from
+//! `tools/bench/corpus.txt`) and plain decoding of G tokens after a short prompt, best and median
+//! of R repetitions:
+//! `cargo run --release --example parity_bench -- MODEL [pp=512,2048] [tg=128] [reps=3] [key=value ...]`
+//! (other options are `EngineOptions` keys, e.g. `device=cpu`, `lookup=0`, `draft=none`).
+
+use oxinfer::engine::{Engine, EngineOptions, Flow};
+
+fn main() -> anyhow::Result<()> {
+    let mut args = std::env::args().skip(1);
+    let model = args
+        .next()
+        .expect("usage: parity_bench MODEL [pp=..] [tg=N] [reps=N] [key=value ...]");
+    let mut opts = EngineOptions::default();
+    let (mut pps, mut tg, mut reps) = (vec![512usize, 2048], 128usize, 3usize);
+    for kv in args {
+        let (k, v) = kv.split_once('=').expect("options are key=value");
+        match k {
+            "pp" => {
+                pps = v
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse())
+                    .collect::<Result<_, _>>()?
+            }
+            "tg" => tg = v.parse()?,
+            "reps" => reps = v.parse()?,
+            _ => opts.set(k, v)?,
+        }
+    }
+    let mut e = Engine::load(&model, &opts)?;
+    let i = e.info();
+    eprintln!(
+        "[{} ({:?}, {:?}) on {} with {} threads]",
+        i.model_type, i.family, i.quant, i.device, i.threads
+    );
+    let corpus = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tools/bench/corpus.txt"))?;
+    let ids = e.tokenizer().encode(corpus.as_str(), false)?.get_ids().to_vec();
+    // Text of exactly n tokens (re-encoded: trim until it is).
+    let text_of = |e: &Engine, n: usize| -> anyhow::Result<String> {
+        let mut k = n.min(ids.len());
+        loop {
+            let s = e.tokenizer().decode(&ids[..k], false)?;
+            let c = e.tokenizer().encode(s.as_str(), false)?.get_ids().len();
+            if c <= n || k == 0 {
+                return Ok(s);
+            }
+            k -= c - n;
+        }
+    };
+    let run = |e: &mut Engine, prompt: &str, max: usize| -> anyhow::Result<(usize, f64, usize, f64)> {
+        e.reset();
+        e.config_mut().max_tokens = max;
+        e.complete(prompt, &mut |_| Flow::Continue)?;
+        let s = e.stats();
+        Ok((s.prompt_tokens, s.prefill_tok_s(), s.generated_tokens, s.decode_tok_s()))
+    };
+    let warm = text_of(&e, 64)?;
+    run(&mut e, &warm, 4)?;
+    let stat = |mut v: Vec<f64>| {
+        v.sort_by(|a, b| b.total_cmp(a));
+        format!(
+            "best {:.1} median {:.1} (all {:?})",
+            v[0],
+            v[v.len() / 2],
+            v.iter().map(|x| (x * 10.0).round() / 10.0).collect::<Vec<_>>()
+        )
+    };
+    for &n in &pps {
+        let p = text_of(&e, n)?;
+        // A warm-up at this size (plans and scratch are sized on first use).
+        run(&mut e, &p, 1)?;
+        let mut v = Vec::new();
+        let mut toks = 0;
+        for _ in 0..reps {
+            let (t, r, _, _) = run(&mut e, &p, 1)?;
+            toks = t;
+            v.push(r);
+        }
+        println!("pp{n} ({toks} tok): {}", stat(v));
+    }
+    if tg > 0 {
+        let p = text_of(&e, 16)?;
+        let mut v = Vec::new();
+        let mut g = 0;
+        for _ in 0..reps {
+            let (_, _, n, r) = run(&mut e, &p, tg)?;
+            g = n;
+            v.push(r);
+        }
+        println!("tg{tg} ({g} tok): {}", stat(v));
+    }
+    if std::env::var_os("OXINFER_PF_PROFILE").is_some() {
+        oxinfer::gpu::pf_report();
+    }
+    Ok(())
+}

@@ -14,6 +14,17 @@ impl<'a> Model<'a> {
     /// [`Self::gpu_graph`], plus for multi-token plans (`multi`: layers whose outputs to capture)
     /// the copies of those layers' outputs.
     fn gpu_graph_with<'s>(&'s self, lay: Option<&crate::intervene::GpuLayout>, multi: Option<&[usize]>) -> Option<Graph<'s>> {
+        self.gpu_graph_mode(lay, multi, false)
+    }
+
+    /// [`Self::gpu_graph_with`]; `prefill`: for a prefill plan (`Backend::decode_plan_prefill`):
+    /// no LM head.
+    fn gpu_graph_mode<'s>(
+        &'s self,
+        lay: Option<&crate::intervene::GpuLayout>,
+        multi: Option<&[usize]>,
+        prefill: bool,
+    ) -> Option<Graph<'s>> {
         let cfg = &self.cfg;
         if cfg.bidirectional() {
             return None;
@@ -63,7 +74,7 @@ impl<'a> Model<'a> {
         let act = g.buf(max_inter);
         let act2 = g.buf(max_inter);
         let hidden = g.buf(h);
-        let logits = g.buf(cfg.vocab_size);
+        let logits = g.buf(if prefill { 1 } else { cfg.vocab_size });
         g.input = x;
         g.hidden = hidden;
         g.n_hidden = h;
@@ -384,6 +395,9 @@ impl<'a> Model<'a> {
         }
         g.head_from = g.ops.len();
         g.units.push((g.ops.len(), self.layer_unit(nl)));
+        if prefill {
+            return Some(g);
+        }
         g.ops.push(lin(&self.head, cfg.vocab_size, h, hidden, logits, LinMode::Store)?);
         if let Some(cap) = cfg.final_logit_softcapping {
             g.ops.push(Op::Ew {
@@ -396,6 +410,22 @@ impl<'a> Model<'a> {
         }
         g.logits = Some((logits, cfg.vocab_size));
         Some(g)
+    }
+
+    /// The prefill chunk to use instead of `chunk`: passes on the GPU prefill plan take chunks of
+    /// the plan's size when given GPU-sized ones (1024 and up).
+    pub fn prefill_chunk(&self, chunk: usize) -> usize {
+        let plan = self.stream.is_none()
+            && chunk >= 1024
+            && !self.cfg.bidirectional()
+            && self.gpu_decode_on()
+            && crate::gpu::active().is_some()
+            && crate::qwen::prefill_gpu(crate::qwen::PREFILL_GPU_MIN, "plan");
+        if plan {
+            chunk.max(crate::qwen::prefill_plan_tokens())
+        } else {
+            chunk
+        }
     }
 
     /// Whether decode steps may run on the device: GPU decoding is on, and streamed weights (if
@@ -456,6 +486,103 @@ impl<'a> Model<'a> {
             }
             plan
         })
+    }
+
+    /// The GPU prefill plan (see `Backend::decode_plan_prefill`), compiled on first use; None
+    /// when unavailable.
+    fn gpu_prefill_plan(&self) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
+        if !self.gpu_decode_on() {
+            return None;
+        }
+        let tokens = crate::qwen::prefill_plan_tokens();
+        self.gpu_plans.get((1 << 61) | tokens as u64, || {
+            let be = crate::gpu::active()?;
+            let plan = self
+                .gpu_graph_mode(None, Some(&[]), true)
+                .and_then(|g| be.decode_plan_prefill(&g, tokens));
+            if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
+                eprintln!("[gpu prefill plan: {}]", if plan.is_some() { "built" } else { "none" });
+            }
+            plan
+        })
+    }
+
+    /// A prefill pass of `tokens` on the GPU prefill plan (chunks of the plan's size, the
+    /// activations on the device for the whole pass): the final-normed hidden states, as the
+    /// host path gives them (up to rounding). None (nothing changed) when unavailable; a failure
+    /// past the first chunk finishes the pass on the host path.
+    pub(super) fn gpu_prefill(&self, sess: &mut Session, tokens: &[u32]) -> Option<Vec<f32>> {
+        let t = tokens.len();
+        if sess.iv.active() || !sess.capture.is_empty() || self.stream.is_some() || self.cfg.bidirectional() {
+            return None;
+        }
+        let plan = self.gpu_prefill_plan()?;
+        let n = plan.tokens();
+        let cfg = &self.cfg;
+        let h = cfg.hidden_size;
+        let pw = cfg.num_hidden_layers * cfg.hidden_size_per_layer_input;
+        let mut hidden = vec![0f32; t * h];
+        let mut c = 0;
+        while c < t {
+            let m = n.min(t - c);
+            let toks = &tokens[c..c + m];
+            let mut x = Vec::with_capacity(m * h);
+            let mut x2 = Vec::new();
+            for &tok in toks {
+                x.extend_from_slice(&self.embed_scaled(tok));
+                if let Some(ple) = &self.ple {
+                    let o = x2.len();
+                    x2.resize(o + pw, 0.0);
+                    ple.embed.row(tok as usize, &mut x2[o..]);
+                }
+            }
+            let positions: Vec<usize> = (sess.pos..sess.pos + m).collect();
+            let mut cs = Vec::new();
+            for f in [&self.inv_freq_sliding, &self.inv_freq_full] {
+                let half = f.len();
+                let (co, si) = crate::kernels::rope_tables(&positions, f);
+                for j in 0..m {
+                    cs.extend_from_slice(&co[j * half..(j + 1) * half]);
+                    cs.extend_from_slice(&si[j * half..(j + 1) * half]);
+                }
+            }
+            let ok = {
+                let _timer = crate::prof::start(crate::prof::Cat::Matmul);
+                let mut kv: Vec<&mut LayerCache> = sess.caches.iter_mut().flatten().collect();
+                plan.step(
+                    &mut sess.gpu,
+                    Step {
+                        pos: sess.pos,
+                        t: m,
+                        rope_cs: &cs,
+                        x: &x,
+                        x2: &x2,
+                        kv: &mut kv,
+                        states: &mut [],
+                        hidden: &mut hidden[c * h..(c + m) * h],
+                        logits: None,
+                        params: None,
+                        capture: None,
+                        scratch: false,
+                        states_kept: false,
+                    },
+                )
+            };
+            if !ok {
+                break;
+            }
+            sess.pos += m;
+            c += m;
+        }
+        if c == 0 {
+            return None;
+        }
+        if c < t {
+            let hs = self.forward_hidden_cpu(sess, &tokens[c..], &[]);
+            hidden.truncate(c * h);
+            hidden.extend_from_slice(&hs);
+        }
+        Some(hidden)
     }
 
     /// Runs `tokens` (at most 16) through a multi-token GPU plan, as one-token GPU steps would one

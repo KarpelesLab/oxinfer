@@ -1167,12 +1167,23 @@ impl<'a> QwenModel<'a> {
         lay: Option<&crate::intervene::GpuLayout>,
         multi: Option<&[usize]>,
     ) -> Option<crate::gpu::decode::Graph<'s>> {
+        self.gpu_graph_mode(lay, multi, false)
+    }
+
+    /// [`Self::gpu_graph_with`]; `prefill`: for a prefill plan (`Backend::decode_plan_prefill`):
+    /// no LM head, and the Gated DeltaNet layers share their buffers (no replays).
+    fn gpu_graph_mode<'s>(
+        &'s self,
+        lay: Option<&crate::intervene::GpuLayout>,
+        multi: Option<&[usize]>,
+        prefill: bool,
+    ) -> Option<crate::gpu::decode::Graph<'s>> {
         use crate::gpu::decode::{Graph, LinMode, Op};
         use crate::intervene::GpuNeurons;
         if let Some(ex) = &self.exp {
             // Multi-token plans of Qwen4-Exp: speculative verification only (no capture layers).
             return if lay.is_none() && multi.is_none_or(|m| m.is_empty()) {
-                self.exp_gpu_graph(ex, multi.is_some(), false)
+                self.exp_gpu_graph(ex, multi.is_some(), prefill)
             } else {
                 None
             };
@@ -1228,7 +1239,7 @@ impl<'a> QwenModel<'a> {
         let sel = g.buf((2 * top_k).max(1));
         let eact = g.buf((top_k * e_inter).max(1));
         let hidden = g.buf(h);
-        let logits = g.buf(cfg.vocab_size);
+        let logits = g.buf(if prefill { 1 } else { cfg.vocab_size });
         g.input = x;
         g.hidden = hidden;
         g.n_hidden = h;
@@ -1401,7 +1412,7 @@ impl<'a> QwenModel<'a> {
         for (li, layer) in self.layers.iter().enumerate() {
             g.units.push((g.ops.len(), li));
             // Multi-token plans keep each recurrent layer's inputs in its own buffers.
-            let (gproj, gconv) = if multi.is_some() && matches!(layer.mixer, Mixer::Gdn(_)) {
+            let (gproj, gconv) = if multi.is_some() && !prefill && matches!(layer.mixer, Mixer::Gdn(_)) {
                 (g.buf(conv_dim + value_dim + 2 * nv), g.buf(conv_dim))
             } else {
                 (gproj, gconv)
@@ -1506,6 +1517,9 @@ impl<'a> QwenModel<'a> {
         g.ops.push(Op::norm(x, hidden, &self.final_norm, h, eps));
         g.head_from = g.ops.len();
         g.units.push((g.ops.len(), self.layers.len()));
+        if prefill {
+            return Some(g);
+        }
         g.ops.push(lin(&self.lm_head, cfg.vocab_size, h, hidden, logits, LinMode::Store)?);
         g.logits = Some((logits, cfg.vocab_size));
         Some(g)
@@ -1624,10 +1638,9 @@ impl<'a> QwenModel<'a> {
         (t <= MULTI_TOKENS).then(|| self.gpu_multi_plan(&[], n, fast))?
     }
 
-    /// Qwen4-Exp: the GPU prefill plan (see `Backend::decode_plan_prefill`), compiled on first
-    /// use; None when unavailable.
+    /// The GPU prefill plan (see `Backend::decode_plan_prefill`), compiled on first use; None
+    /// when unavailable.
     pub(crate) fn gpu_prefill_plan(&self) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
-        let ex = self.exp.as_ref()?;
         if !self.gpu_decode_on() {
             return None;
         }
@@ -1635,7 +1648,9 @@ impl<'a> QwenModel<'a> {
         self.gpu_plans.get((1 << 61) | tokens as u64, || {
             let be = crate::gpu::active()?;
             let t0 = std::time::Instant::now();
-            let plan = self.exp_gpu_graph(ex, true, true).and_then(|g| be.decode_plan_prefill(&g, tokens));
+            let plan = self
+                .gpu_graph_mode(None, Some(&[]), true)
+                .and_then(|g| be.decode_plan_prefill(&g, tokens));
             if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
                 eprintln!(
                     "[gpu prefill plan: {} in {:.2}s]",
@@ -1647,12 +1662,92 @@ impl<'a> QwenModel<'a> {
         })
     }
 
-    /// The prefill chunk to use instead of `chunk`: Qwen4-Exp passes on the GPU prefill plan take
-    /// chunks of the plan's size when given GPU-sized ones (1024 and up; each MoE layer's grouped
-    /// GEMMs get more tokens per expert).
+    /// A prefill pass of `tokens` on the GPU prefill plan ([`Self::gpu_prefill_plan`]; chunks of
+    /// the plan's size, the activations on the device for the whole pass): the final-normed
+    /// hidden states, as the host path gives them (up to rounding: half-precision GEMM inputs as
+    /// the host path's GPU GEMMs, attention and norms on the device). None (nothing changed) when
+    /// unavailable; a failure past the first chunk finishes the pass on the host path.
+    fn gpu_prefill(&self, sess: &mut QwenSession, tokens: &[u32], mm: &[(usize, &[f32])]) -> Option<Vec<f32>> {
+        let t = tokens.len();
+        if sess.iv.active() || !sess.capture.is_empty() || self.stream.is_some() || sess.positions.is_some() {
+            return None;
+        }
+        let plan = self.gpu_prefill_plan()?;
+        let n = plan.tokens();
+        let h = self.cfg.hidden_size;
+        let mut x = vec![0f32; t * h];
+        for_chunks(&mut x, h, t > 1, |ti, row| self.embed.row(tokens[ti] as usize, row));
+        for &(i, emb) in mm {
+            x[i * h..(i + 1) * h].copy_from_slice(emb);
+        }
+        let half = self.inv_freq.len();
+        let mut hidden = vec![0f32; t * h];
+        let mut c = 0;
+        while c < t {
+            let m = n.min(t - c);
+            let (cos, sin) = self.rope_cs(&sess.spans, sess.pos, m);
+            let mut cs = Vec::with_capacity(2 * m * half);
+            for j in 0..m {
+                cs.extend_from_slice(&cos[j * half..(j + 1) * half]);
+                cs.extend_from_slice(&sin[j * half..(j + 1) * half]);
+            }
+            let ok = {
+                let _timer = prof::start(Cat::Matmul);
+                let mut kv: Vec<&mut LayerCache> = sess.kv.iter_mut().flatten().collect();
+                let mut states: Vec<&mut [f32]> = sess
+                    .gdn
+                    .iter_mut()
+                    .flatten()
+                    .flat_map(|g| [&mut g.s[..], &mut g.conv[..]])
+                    .collect();
+                plan.step(
+                    &mut sess.gpu,
+                    crate::gpu::decode::Step {
+                        pos: sess.pos,
+                        t: m,
+                        rope_cs: &cs,
+                        x: &x[c * h..(c + m) * h],
+                        x2: &[],
+                        kv: &mut kv,
+                        states: &mut states,
+                        hidden: &mut hidden[c * h..(c + m) * h],
+                        logits: None,
+                        params: None,
+                        capture: None,
+                        scratch: false,
+                        states_kept: false,
+                    },
+                )
+            };
+            if !ok {
+                if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
+                    eprintln!("[gpu prefill step failed at {}]", sess.pos);
+                }
+                break;
+            }
+            sess.pos += m;
+            c += m;
+        }
+        sess.rec_span = None;
+        sess.gpu_states_kept = false;
+        if c == 0 {
+            return None;
+        }
+        if c < t {
+            // The rest on the host path.
+            let rest: Vec<(usize, &[f32])> = mm.iter().filter(|m| m.0 >= c).map(|&(i, e)| (i - c, e)).collect();
+            let hs = self.forward_impl(sess, &tokens[c..], &rest, false, false);
+            hidden.truncate(c * h);
+            hidden.extend_from_slice(&hs);
+        }
+        Some(hidden)
+    }
+
+    /// The prefill chunk to use instead of `chunk`: passes on the GPU prefill plan take chunks of
+    /// the plan's size when given GPU-sized ones (1024 and up; each MoE layer's grouped GEMMs get
+    /// more tokens per expert).
     pub fn prefill_chunk(&self, chunk: usize) -> usize {
-        let plan = self.exp.is_some()
-            && self.stream.is_none()
+        let plan = self.stream.is_none()
             && chunk >= 1024
             && self.gpu_decode_on()
             && crate::gpu::active().is_some()
@@ -1990,6 +2085,13 @@ impl<'a> QwenModel<'a> {
                 return hs;
             }
             return self.exp_forward(ex, sess, tokens, mm, record);
+        }
+        if gpu
+            && !record
+            && prefill_gpu(t, "plan")
+            && let Some(hs) = self.gpu_prefill(sess, tokens, mm)
+        {
+            return hs;
         }
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
@@ -2750,7 +2852,7 @@ pub(crate) const PREFILL_GPU_MIN: usize = 32;
 
 /// Tokens per step of the Qwen4-Exp GPU prefill plan (`OXINFER_PREFILL_TOKENS`, default 2048:
 /// 9-20% faster than 1024 at 4.5k tokens for ~1.5 GB more device memory).
-fn prefill_plan_tokens() -> usize {
+pub(crate) fn prefill_plan_tokens() -> usize {
     std::env::var("OXINFER_PREFILL_TOKENS")
         .ok()
         .and_then(|v| v.parse().ok())

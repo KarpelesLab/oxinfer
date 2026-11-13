@@ -84,6 +84,9 @@ impl TextLm for Model<'_> {
     fn forward(&self, sess: &mut Session, tokens: &[u32]) -> Vec<f32> {
         Model::forward(self, sess, tokens)
     }
+    fn prefill_chunk(&self, chunk: usize) -> usize {
+        Model::prefill_chunk(self, chunk)
+    }
 }
 
 impl TextLm for QwenModel<'_> {

@@ -1150,6 +1150,24 @@ pub struct Model<'a> {
     stream_choice: crate::gpu::decode::DeviceChoice,
 }
 
+/// `dst.extend_from_slice(src)` with the copy spread over the thread pool.
+fn par_extend(dst: &mut Vec<f32>, src: &[f32]) {
+    const CHUNK: usize = 1 << 16;
+    dst.reserve(src.len());
+    let old = dst.len();
+    let d = dst.spare_capacity_mut().as_mut_ptr() as usize;
+    let s = src.as_ptr() as usize;
+    let n = src.len();
+    crate::pool::run(n.div_ceil(CHUNK), &|i| {
+        let a = i * CHUNK;
+        let len = CHUNK.min(n - a);
+        // SAFETY: chunk `i` of the reserved spare capacity, written by this job only.
+        unsafe { std::ptr::copy_nonoverlapping((s as *const f32).add(a), (d as *mut f32).add(a), len) };
+    });
+    // SAFETY: every element of the extension was written above.
+    unsafe { dst.set_len(old + n) };
+}
+
 #[derive(Clone)]
 pub struct LayerCache {
     k: Vec<f32>,
@@ -1191,8 +1209,14 @@ impl LayerCache {
     }
     pub(crate) fn push(&mut self, k: &[f32], v: &[f32], t: usize) {
         debug_assert_eq!(k.len(), t * self.n_kv * self.hd);
-        self.k.extend_from_slice(k);
-        self.v.extend_from_slice(v);
+        if k.len() >= 1 << 17 {
+            // A prefill chunk's rows (from a device): copied by all threads.
+            par_extend(&mut self.k, k);
+            par_extend(&mut self.v, v);
+        } else {
+            self.k.extend_from_slice(k);
+            self.v.extend_from_slice(v);
+        }
         self.len += t;
     }
     #[inline(always)]
@@ -1665,6 +1689,12 @@ impl<'a> Model<'a> {
         if tokens.len() == 1
             && mm.is_empty()
             && let Some((hs, _)) = self.gpu_step(sess, tokens[0], false)
+        {
+            return hs;
+        }
+        if mm.is_empty()
+            && crate::qwen::prefill_gpu(tokens.len(), "plan")
+            && let Some(hs) = self.gpu_prefill(sess, tokens)
         {
             return hs;
         }
