@@ -31,3 +31,16 @@ M=~/.cache/oxinfer/hub/Qwen--Qwen3.5-4B
     --interventions spec.json --dump-logits ours.bin
 ./venv/bin/python tools/ref_intervene.py $M prompt.txt spec.json ours.bin
 ```
+
+GGUF files of the Qwen3.5 family are compared with llama.cpp on the same file, greedy token by
+greedy token: `tools/llama_logits_dump.cpp` (built against libllama) and
+`examples/qwen_greedy_dump.rs` write the output row of the prompt's last position and of every
+generated token, and `--compare` gives the number of identical steps and the largest
+log-probability difference over the top 10 until the first different token:
+
+```sh
+G=model.gguf
+cargo run --release --example qwen_greedy_dump -- $G "The history of the Roman Empire" 32 ours.bin --cpu --ids-out ids.txt
+./lgdump $G 0 ids.txt 32 llama.bin 16        # MODEL NGL IDS_FILE N_GEN OUT.bin THREADS
+cargo run --release --example qwen_greedy_dump -- --compare ours.bin llama.bin 248320
+```
