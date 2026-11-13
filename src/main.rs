@@ -13,6 +13,8 @@ use std::time::Instant;
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
 mod anemll_cli;
 mod bagel_cli;
+#[cfg(feature = "media")]
+mod fish_cli;
 mod flux_cli;
 mod intervene_cli;
 mod janus_cli;
@@ -495,7 +497,13 @@ fn usage() -> ! {
          \x20 --voice NAME         a default voice (Savannah, Imogen, Rupert, ...), a speaker embedding or\n\
          \x20                      reference codes as .npy, \"\" for none; --ref-audio FILE.npy is the same\n\
          \x20 --snac NAME          the codec decoder: keep2 (default), full, or a zac GGUF file\n\
-         \x20 --temp, --top-p, --repetition-penalty, --max-tokens, --seed  (defaults 0.75, 0.69, 2.4, 2000 rows)"
+         \x20 --temp, --top-p, --repetition-penalty, --max-tokens, --seed  (defaults 0.75, 0.69, 2.4, 2000 rows)\n\
+         \n\
+         text to speech (Drama 3: fishaudio/drama-3, 44.1 kHz, 41.5 GB; see docs/fish-drama.md):\n\
+         \x20 --speak, --speak-file, --speak-json, --dump-pcm, --mmap as above (long texts are cut into chunks)\n\
+         \x20 --ref-audio FILE     voice cloning: a reference clip (or its codes as .npy) with --ref-text TEXT\n\
+         \x20 --voice N            the speaker tag (0 to 15) of text without <|speaker:N|> tags\n\
+         \x20 --temp, --top-p, --max-tokens, --seed  (defaults 0.7, 0.7, 600 frames per chunk; --temp 0: greedy)"
     );
     eprintln!("\n{}", intervene_cli::USAGE);
     eprintln!("\n{}", flux_cli::USAGE);
@@ -1197,6 +1205,9 @@ fn main() -> Result<()> {
     } else if !args.model.exists() && oxinfer::zonos::is_zonos(&args.model) {
         // ZONOS3's repository: its loader fetches the few files it reads.
         args.model.clone()
+    } else if !args.model.exists() && oxinfer::fish::is_drama(&args.model) {
+        // Drama 3's repository: its loader also fetches the codec.
+        args.model.clone()
     } else {
         resolve_model(&spec, args.cache_dir.as_deref())?
     };
@@ -1520,6 +1531,16 @@ fn run(mut args: Args) -> Result<()> {
     }
     let plat = platform::detect();
     eprintln!("[platform: {}]", plat.summary());
+    // Drama 3 runs on the CPU (it was not tried on a device).
+    if oxinfer::fish::is_drama(&args.model) {
+        if args.speak.is_none() && args.speak_file.is_none() {
+            bail!("Fish Audio Drama 3 is a text-to-speech model: --speak TEXT -o out.wav (see docs/fish-drama.md)");
+        }
+        if matches!(args.device, platform::DevicePref::Gpu(_)) {
+            bail!("Fish Audio Drama 3 runs on the CPU only (--device cpu)");
+        }
+        args.device = platform::DevicePref::Cpu;
+    }
     let gpu = oxinfer::gpu::init(&plat, args.device)?;
     match gpu {
         Some(b) if b.decodes() && oxinfer::gpu::decode_enabled() => eprintln!(
@@ -1575,6 +1596,10 @@ fn run(mut args: Args) -> Result<()> {
         #[cfg(feature = "media")]
         if oxinfer::zonos::is_zonos(&args.model) {
             return zonos_cli::run(&args);
+        }
+        #[cfg(feature = "media")]
+        if oxinfer::fish::is_drama(&args.model) {
+            return fish_cli::run(&args);
         }
         #[cfg(feature = "media")]
         return tts_cli::run(&args);

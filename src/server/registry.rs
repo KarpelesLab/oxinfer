@@ -86,6 +86,8 @@ pub(crate) enum Loaded {
     Speech(Box<crate::tts::Speaker>),
     /// ZONOS3 (also `/v1/audio/speech`).
     Zonos(Box<crate::zonos::Zonos>),
+    /// Fish Audio Drama 3 (also `/v1/audio/speech`).
+    Drama(Box<crate::fish::Drama>),
 }
 
 impl Loaded {
@@ -95,7 +97,7 @@ impl Loaded {
             Loaded::Embedding(_) => Kind::Embedding,
             Loaded::Image(_) => Kind::Image,
             Loaded::Transcription(_) => Kind::Transcription,
-            Loaded::Speech(_) | Loaded::Zonos(_) => Kind::Speech,
+            Loaded::Speech(_) | Loaded::Zonos(_) | Loaded::Drama(_) => Kind::Speech,
         }
     }
 }
@@ -315,6 +317,7 @@ impl Registry {
             Some(k) if k != Kind::Image => (k, None),
             // Told apart by its name: the repository has no config.json to probe.
             _ if crate::zonos::is_zonos(Path::new(&e.spec.source)) => (Kind::Speech, None),
+            _ if !Path::new(&e.spec.source).exists() && crate::fish::is_drama(Path::new(&e.spec.source)) => (Kind::Speech, None),
             _ => {
                 let path = self.probe_path(&e.spec.source)?;
                 let (k, img) = detect_path(&path, &e.spec.source);
@@ -429,6 +432,21 @@ impl Registry {
                 }
                 Loaded::Zonos(Box::new(crate::zonos::Zonos::load(src, &o)?))
             }
+            Kind::Speech if crate::fish::is_drama(Path::new(src)) => {
+                let mut o = crate::fish::DramaOptions {
+                    cache_dir: self.cache_dir.clone(),
+                    ..Default::default()
+                };
+                for (k, v) in &opts {
+                    match *k {
+                        "threads" => o.threads = Some(v.parse().with_context(|| format!("threads: {v:?}"))?),
+                        "mmap" => o.mmap = matches!(*v, "1" | "true" | "yes" | "on"),
+                        "quant" => o.quant = crate::model::Quant::parse(v).with_context(|| format!("quant: {v:?} (bf16, q8, q4)"))?,
+                        _ => bail!("unknown Drama 3 option {k:?} (threads, mmap, quant)"),
+                    }
+                }
+                Loaded::Drama(Box::new(crate::fish::Drama::load(src, &o)?))
+            }
             Kind::Speech => {
                 let mut o = crate::tts::SpeakerOptions {
                     cache_dir: self.cache_dir.clone(),
@@ -533,7 +551,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// The kind of the model at `path` (a directory or a GGUF file).
 pub(crate) fn detect_path(path: &Path, source: &str) -> (Kind, Option<ImageKind>) {
     let img = |k| (Kind::Image, Some(k));
-    if crate::zonos::is_zonos(path) {
+    if crate::zonos::is_zonos(path) || crate::fish::is_drama(path) {
         return (Kind::Speech, None);
     }
     if crate::gguf::is_gguf(path) {

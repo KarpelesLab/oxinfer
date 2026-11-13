@@ -756,6 +756,30 @@ fn speech_voice(info: &crate::tts::SpeakerInfo, voice: Option<&str>) -> ApiResul
     })
 }
 
+/// The options of a Drama 3 request: `voice` is a speaker tag (`0` to `15`; anything else, such
+/// as OpenAI's names, is speaker 0); `temperature`, `top_p`, `top_k` and `max_tokens` (frames per
+/// chunk of text) as in [`crate::fish::DramaSpeak`]. Voices are not cloned through the server (a
+/// request does not name files on it).
+fn drama_options(body: &Value, voice: Option<&str>, seed: u64) -> crate::fish::DramaSpeak {
+    let mut o = crate::fish::DramaSpeak::default();
+    let num = |k: &str| body.get(k).and_then(Value::as_f64);
+    if let Some(v) = num("temperature") {
+        o.temperature = v as f32;
+    }
+    if let Some(v) = num("top_p") {
+        o.top_p = v as f32;
+    }
+    if let Some(v) = num("top_k") {
+        o.top_k = (v as usize).max(1);
+    }
+    if let Some(v) = num("max_tokens") {
+        o.max_tokens = v as usize;
+    }
+    o.seed = seed;
+    o.speaker = voice.and_then(|v| v.parse().ok()).filter(|n| *n <= 15).unwrap_or(0);
+    o
+}
+
 /// The options of a ZONOS3 request: `voice` is one of the model's voices (OpenAI's names take the
 /// default voice, `none` no speaker); `temperature`, `top_p`, `top_k`, `repetition_penalty`,
 /// `max_tokens`, `speaker_mode`, `speaker_cfg_scale`, `loudness`, `fmax` and `speaking_rate` as
@@ -844,6 +868,14 @@ fn speech_batch(
             .map(|(t, v)| {
                 let zo = zonos_options(z, body, *v, o.seed)?;
                 z.speak(t, &zo).map_err(|e| ApiError::new(500, format!("{e:#}")))
+            })
+            .collect::<ApiResult<Vec<_>>>()?,
+        Loaded::Drama(d) => texts
+            .iter()
+            .zip(&voices)
+            .map(|(t, v)| {
+                d.speak(t, &drama_options(body, *v, o.seed))
+                    .map_err(|e| ApiError::new(500, format!("{e:#}")))
             })
             .collect::<ApiResult<Vec<_>>>()?,
         Loaded::Speech(sp) => {
@@ -944,16 +976,20 @@ pub(super) fn speech(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
         let loaded = lease.model();
         let zo = match loaded {
             Loaded::Zonos(z) => Some(zonos_options(z, &body2, voice.as_deref(), o.seed)?),
+            Loaded::Drama(_) => None,
             Loaded::Speech(sp) => {
                 o.voice = speech_voice(sp.info(), voice.as_deref())?;
                 None
             }
             _ => unreachable!(),
         };
+        let dro = drama_options(&body2, voice.as_deref(), o.seed);
         // Either model, with the audio through `on` when streaming.
         let speak = |on: Option<&mut dyn FnMut(&crate::tts::AudioChunk) -> Flow>| match (&*loaded, &zo, on) {
             (Loaded::Zonos(z), Some(zo), Some(on)) => z.speak_stream(&input, zo, on),
             (Loaded::Zonos(z), Some(zo), None) => z.speak(&input, zo),
+            (Loaded::Drama(d), _, Some(on)) => d.speak_stream(&input, &dro, on),
+            (Loaded::Drama(d), _, None) => d.speak(&input, &dro),
             (Loaded::Speech(sp), _, Some(on)) => sp.speak_stream(&input, &o, on),
             (Loaded::Speech(sp), _, None) => sp.speak_detailed(&input, &o),
             _ => unreachable!(),
