@@ -721,14 +721,14 @@ struct VBlock<'a> {
 pub enum QwenVisionTower<'a> {
     Qwen35(Qwen35Tower<'a>),
     Qwen25(crate::qwen25_vision::Qwen25Tower<'a>),
-    MiniMaxM3(crate::minimax_vision::MiniMaxM3Tower<'a>),
+    MiniMaxM3(Box<crate::minimax_vision::MiniMaxM3Tower<'a>>),
 }
 
 impl<'a> QwenVisionTower<'a> {
     /// Loads the tower `cfg` describes (bf16; see [`Qwen35Tower::load`]).
     pub fn load(cfg: QwenVisionConfig, files: &'a ModelFiles) -> Result<Self> {
         Ok(if cfg.minimax_m3 {
-            Self::MiniMaxM3(crate::minimax_vision::MiniMaxM3Tower::load(cfg, files)?)
+            Self::MiniMaxM3(Box::new(crate::minimax_vision::MiniMaxM3Tower::load(cfg, files)?))
         } else if cfg.is_qwen25() {
             Self::Qwen25(crate::qwen25_vision::Qwen25Tower::load(cfg, files)?)
         } else {

@@ -1126,7 +1126,7 @@ mod tests {
             f.tool_results(&results, true),
             "[e~[\n]~b]tool\n<response>12:00</response>[e~[\n]~b]ai\n<think>\n"
         );
-        assert_eq!(f.assistant_text("need tool\n</think>\n\n", &calls), &reply[..]);
+        assert_eq!(f.assistant_text("need tool\n</think>\n\n", &calls), reply);
     }
 
     /// MiniMax-M3.1-Flash's template, as transformers renders it (adaptive thinking).

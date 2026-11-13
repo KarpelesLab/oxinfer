@@ -157,12 +157,14 @@ fn participate(shared: &Shared) -> bool {
     // SAFETY: the publisher keeps the region alive until `active` drops to zero after
     // it has cleared the pointer, and we incremented `active` before loading it.
     let region = unsafe { &*rp };
-    in_job(|| loop {
-        let i = region.next.fetch_add(1, Relaxed);
-        if i >= region.n {
-            break;
+    in_job(|| {
+        loop {
+            let i = region.next.fetch_add(1, Relaxed);
+            if i >= region.n {
+                break;
+            }
+            (region.f)(i);
         }
-        (region.f)(i);
     });
     shared.active.fetch_sub(1, SeqCst);
     true
@@ -286,12 +288,14 @@ impl Pool {
                 h.unpark();
             }
         }
-        in_job(|| loop {
-            let i = region.next.fetch_add(1, Relaxed);
-            if i >= n {
-                break;
+        in_job(|| {
+            loop {
+                let i = region.next.fetch_add(1, Relaxed);
+                if i >= n {
+                    break;
+                }
+                f(i);
             }
-            f(i);
         });
         s.region.store(std::ptr::null_mut(), SeqCst);
         while s.active.load(SeqCst) != 0 {

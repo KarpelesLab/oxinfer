@@ -164,9 +164,9 @@ pub(crate) fn f32_lin(w: &[f32], n_out: usize, n_in: usize) -> Result<Lin<'stati
 
 enum Qkv<'a> {
     /// `to_q`, `to_k`, `to_v`.
-    Split([DLin<'a>; 3]),
+    Split(Box<[DLin<'a>; 3]>),
     /// One projection whose rows are `[q k v]` per head (the release's `qkv_proj`).
-    Interleaved(DLin<'a>),
+    Interleaved(Box<DLin<'a>>),
 }
 
 struct Attn<'a> {
@@ -244,7 +244,7 @@ impl<'a> Dit<'a> {
                 Block {
                     norm1: norm(&format!("{p}norm1.weight"), h)?,
                     attn: Attn {
-                        qkv: Qkv::Interleaved(DLin::load(files, &format!("{p}attn.qkv_proj"), 3 * inner, h, false)?),
+                        qkv: Qkv::Interleaved(Box::new(DLin::load(files, &format!("{p}attn.qkv_proj"), 3 * inner, h, false)?)),
                         norm_q: norm(&format!("{p}attn.q_norm.weight"), hd)?,
                         norm_k: norm(&format!("{p}attn.k_norm.weight"), hd)?,
                         out: DLin::load(files, &format!("{p}attn.out_proj"), h, inner, false)?,
@@ -263,11 +263,11 @@ impl<'a> Dit<'a> {
                 Block {
                     norm1: norm(&format!("{p}norm1.weight"), h)?,
                     attn: Attn {
-                        qkv: Qkv::Split([
+                        qkv: Qkv::Split(Box::new([
                             DLin::load(files, &format!("{p}attn.to_q"), inner, h, false)?,
                             DLin::load(files, &format!("{p}attn.to_k"), inner, h, false)?,
                             DLin::load(files, &format!("{p}attn.to_v"), inner, h, false)?,
-                        ]),
+                        ])),
                         norm_q: norm(&format!("{p}attn.norm_q.weight"), hd)?,
                         norm_k: norm(&format!("{p}attn.norm_k.weight"), hd)?,
                         out: DLin::load(files, &format!("{p}attn.to_out.0"), h, inner, false)?,
@@ -405,7 +405,7 @@ impl<'a> Dit<'a> {
         }
         // q, k, v as [n, inner] each.
         let (mut q, mut k, v) = match &b.attn.qkv {
-            Qkv::Split([wq, wk, wv]) => (wq.forward(&hn, n), wk.forward(&hn, n), wv.forward(&hn, n)),
+            Qkv::Split(w) => (w[0].forward(&hn, n), w[1].forward(&hn, n), w[2].forward(&hn, n)),
             Qkv::Interleaved(w) => {
                 let f = w.forward(&hn, n);
                 let (mut q, mut k, mut v) = (vec![0f32; n * inner], vec![0f32; n * inner], vec![0f32; n * inner]);

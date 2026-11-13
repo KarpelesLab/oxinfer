@@ -75,9 +75,9 @@ impl VaeConfig {
 }
 
 enum Qkv<'a> {
-    Split([DLin<'a>; 3]),
+    Split(Box<[DLin<'a>; 3]>),
     /// `[q k v]` per head.
-    Interleaved(DLin<'a>),
+    Interleaved(Box<DLin<'a>>),
 }
 
 struct Block<'a> {
@@ -125,7 +125,7 @@ impl<'a> VaeDecoder<'a> {
             let p = format!("decoder.transformer_blocks.{l}.");
             let (qkv, out, fc1, gate_first, fc2) = if original {
                 (
-                    Qkv::Interleaved(DLin::load(files, &format!("{p}attn.to_qkv"), 3 * d, d, true)?),
+                    Qkv::Interleaved(Box::new(DLin::load(files, &format!("{p}attn.to_qkv"), 3 * d, d, true)?)),
                     DLin::load(files, &format!("{p}attn.to_out"), d, d, true)?,
                     DLin::load(files, &format!("{p}ff.w1"), 2 * ffn, d, true)?,
                     true,
@@ -133,11 +133,11 @@ impl<'a> VaeDecoder<'a> {
                 )
             } else {
                 (
-                    Qkv::Split([
+                    Qkv::Split(Box::new([
                         DLin::load(files, &format!("{p}attn.to_q"), d, d, true)?,
                         DLin::load(files, &format!("{p}attn.to_k"), d, d, true)?,
                         DLin::load(files, &format!("{p}attn.to_v"), d, d, true)?,
-                    ]),
+                    ])),
                     DLin::load(files, &format!("{p}attn.to_out.0"), d, d, true)?,
                     DLin::load(files, &format!("{p}ff.net.0.proj"), 2 * ffn, d, true)?,
                     false,
@@ -222,7 +222,7 @@ impl<'a> VaeDecoder<'a> {
             let mut hn = x.clone();
             rmsnorm_f32w_rows_inplace(&mut hn, d, &b.norm1, cfg.eps);
             let (mut q, mut k, v) = match &b.qkv {
-                Qkv::Split([a, bk, cv]) => (a.forward(&hn, n), bk.forward(&hn, n), cv.forward(&hn, n)),
+                Qkv::Split(w) => (w[0].forward(&hn, n), w[1].forward(&hn, n), w[2].forward(&hn, n)),
                 Qkv::Interleaved(wq) => {
                     let fused = wq.forward(&hn, n);
                     let (mut q, mut k, mut v) = (vec![0f32; n * d], vec![0f32; n * d], vec![0f32; n * d]);
