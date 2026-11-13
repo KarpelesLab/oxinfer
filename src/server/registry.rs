@@ -637,6 +637,8 @@ fn estimate(spec: &ModelSpec, cache_dir: Option<&Path>) -> u64 {
     };
     let bytes = disk_bytes(&path, 0);
     let factor = match (crate::gguf::is_gguf(&path), spec.option("quant")) {
+        // Drama 3: nine tenths of it are FP8 experts, kept as stored.
+        _ if crate::fish::is_drama(&path) => 1.0,
         (false, Some("q4" | "q4_0")) => 0.3,
         (false, Some("q8" | "int8")) => 0.55,
         _ => 1.0,
