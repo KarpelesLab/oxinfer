@@ -104,6 +104,7 @@ too. The device is chosen at run time (`--device auto`: a GPU when one starts, e
 | [Whisper](docs/whisper.md) | speech to text |
 | [Orpheus](docs/orpheus.md) | text to speech, batches, voice cloning, the SNAC codec |
 | [ZONOS3-Mini](docs/zonos.md) | text to speech at 44.1 kHz in 43 languages, default voices, cloning from a clip |
+| [Fish Audio Drama 3](docs/fish-drama.md) | not supported yet: what the checkpoint holds and what each stage would need |
 
 **Under the hood**
 
