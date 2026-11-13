@@ -301,6 +301,9 @@ pub const CATALOG: &[Model] = &[
     Model::new("bartowski/Llama-3.2-1B-Instruct-GGUF:Q8_0", Kind::Chat, 1.2, 1.3, &[Text])
         .fixed(Format::GgufQ8, "GGUF Q8_0")
         .speed(1.31, 16),
+    Model::new("prism-ml/Ternary-Bonsai-2-2B-gguf:PTQ1_0", Kind::Chat, 1.9, 0.43, AGENT)
+        .fixed(Format::GgufLow, "GGUF PTQ1_0 (ternary)")
+        .note("Hadamard-folded ternary weights (also :PQ2_0, :Q2_0); decodes on the CPU"),
     Model::new("Qwen/Qwen2.5-VL-3B-Instruct", Kind::Chat, 3.8, 7.5, &[Text, ImageInput]),
     Model::new("mlx-community/Qwen3-4B-4bit", Kind::Chat, 4.0, 2.4, AGENT)
         .fixed(Format::Q4, "MLX 4-bit")
@@ -345,7 +348,13 @@ pub const CATALOG: &[Model] = &[
     Model::new("MiniMaxAI/MiniMax-H3-Image-PE", Kind::Chat, 27.4, 18.0, &[Text, Thinking])
         .fixed(Format::Q4, "NVFP4")
         .note("the prompt enhancer of MiniMax-H3-Image (Qwen3.5-27B)"),
+    Model::new("prism-ml/Ternary-Bonsai-2-27B-gguf:PTQ1_0", Kind::Chat, 27.4, 5.9, AGENT)
+        .fixed(Format::GgufLow, "GGUF PTQ1_0 (ternary)")
+        .note("Qwen3.8-27B in Hadamard-folded ternary weights (also :PQ2_0, :Q2_0); decodes on the CPU"),
     Model::new("Qwen/Qwen3.8-27B", Kind::Chat, 27.8, 55.6, QWEN_VL).speed(51.0, 64),
+    Model::new("ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF:IQ2_XS-mtp", Kind::Chat, 27.8, 8.8, AGENT)
+        .fixed(Format::GgufLow, "GGUF GSQ-RCO IQ2_XS")
+        .note("a ggml type per tensor (1 to 6 bits), with the MTP layer for --mtp; also :IQ2_S, :IQ3_XXS, :IQ3_S"),
     Model::new("autotrust/JEV-27B", Kind::Chat, 27.8, 54.4, &[Decisions, Text]).note("typed decisions"),
     Model::new("autotrust/JEV-27B-VL", Kind::Chat, 27.8, 56.1, &[Decisions, Text, ImageInput]).note("typed decisions over text and images"),
     Model::new("google/gemma-4-31B-it", Kind::Chat, 31.0, 62.0, GEMMA_L).note("supported, untested"),

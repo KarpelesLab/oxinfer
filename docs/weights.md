@@ -54,8 +54,11 @@ vision files are read for Mistral Large 4 (`pixtral`) and Qwen3.5-family towers
 (`qwen3vl_merger`, see [Qwen3.8-Flash-Next](qwen-flash-next.md#qwen38-flash-next)); other models' image input needs
 the safetensors or MLX checkpoint. Weights stay in their GGUF
 format: F32, F16, BF16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q2_K-Q6_K, IQ1_S/IQ1_M, IQ2_XXS/XS/S,
-IQ3_XXS/S, IQ4_NL/XS and MXFP4 (`ggml.rs`, dequantization bit-exact with gguf-py), with NEON decode
-kernels for every type and Metal prefill kernels. On x86-64 with AVX2 every type's int8 dot
+IQ3_XXS/S, IQ4_NL/XS, MXFP4 and the 1-bit and ternary types Q1_0, Q2_0, TQ1_0, TQ2_0 and
+PrismML's PQ2_0 / PTQ1_0 (`ggml.rs`, dequantization bit-exact with gguf-py or, for the 1-bit and
+ternary types, ggml's C code; see [below](#mixed-low-bit-and-ternary-ggufs)), with NEON decode
+kernels for every type but those six (which take the portable decoder on ARM) and Metal prefill
+kernels. On x86-64 with AVX2 every type's int8 dot
 products run on `maddubs` / `madd`, and the block-of-32 formats, the K-quants and IQ4_XS are
 unpacked in registers (`kernels_ggml_x86.rs`; the grid-table i-quants IQ1-IQ3 still unpack through
 the portable decoder); every row is bit-identical to the portable kernel's. The i-quants (IQ1-IQ3) decode several times
@@ -65,6 +68,46 @@ oxinfer's own Q4/Q8. Embedded MTP layers (`blk.N.nextn.*`) work with `--mtp`.
 On HauhauCS's Qwen3.8-27B Q4_K_P the next-token distribution matches llama.cpp on the same file
 (same top 10, log-probabilities within 0.03, mean 0.013). F32/BF16 GGUFs from llama.cpp's
 converter match transformers to 5e-5. `--save-quantized` does not take GGUF input.
+
+### Mixed, low-bit and ternary GGUFs
+
+Files checked in November 2026 (raw prompt of 21 tokens, greedy, CPU; "llama.cpp" is mainline
+at 9daa0aa, 13 November 2026, built for the CPU, run on the same file through
+`tools/llama_logits_dump.cpp`, oxinfer through `examples/qwen_greedy_dump.rs`, whose `--compare`
+gives the numbers below: greedy tokens identical until the first difference, and the largest
+log-probability difference over the top 10 of those steps):
+
+| File | What it is | Result |
+|---|---|---|
+| `ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF:IQ2_XS-mtp` (8.8 GB) | GSQ-RCO: every tensor quantized at each standard ggml type with GSQ (a learned rounding), then one type chosen per tensor under a size budget (RCO). The file is ordinary GGUF with twelve types side by side (F32, BF16, Q2_K, Q4_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS); nothing new to decode | 32/32 tokens as llama.cpp, within 0.31; `--mtp` from the embedded layer: 3.58 tokens per forward, 88% of drafts accepted |
+| `DavidAU/Qwen3.5-9B-The-Defiant-Fable-Uncensored-Heretic-NEO-IMATRIX-MAX-MTP-GGUF:MTP-IQ3_M` (5.7 GB) | Qwen3.5-9B fine-tune with the MTP layer (`blk.32.nextn.*`), IQ3_S / Q4_K | 26 tokens as llama.cpp (within 0.65), then a near tie (0.334 against 0.316); `--mtp`: 2.33 tokens per forward. The repository's `MTP-IQ2_M` file is damaged on the Hub (its first 10.97 MB, the whole header, are zeros) |
+| `prism-ml/Ternary-Bonsai-2-2B-gguf` `Q2_0` / `PQ2_0` / `PTQ1_0` (0.4-0.5 GB) | ternary weights, Hadamard-folded, tied output head (below) | `Q2_0`: 48/48 tokens as llama.cpp, within 0.22; the other two packings give the same 48 tokens |
+| `prism-ml/Ternary-Bonsai-2-27B-gguf` `Q2_0` (7.6 GB) / `PTQ1_0` (5.9 GB) | the same for Qwen3.8-27B, with its own output head and the Gated DeltaNet permutation | `Q2_0`: 20 tokens as llama.cpp (within 0.07), then a near tie (0.328 against 0.323); `PTQ1_0`: the 32 tokens of `Q2_0`, within 0.06 |
+
+**Ternary-Bonsai 2** (PrismML) stores every matrix of the language model as ternary values with
+one f16 scale per group, in one of three packings: `Q2_0` (mainline llama.cpp's type 42: 2-bit
+codes, a scale per 64 weights, 2.25 bits per weight), `PQ2_0` (type 142 of PrismML's llama.cpp
+fork: the same codes, a scale per 128, 2.125 bits) and `PTQ1_0` (type 143: five trits per byte, a
+scale per 128, 1.75 bits). Mainline llama.cpp reads only the first; oxinfer reads the three (and
+mainline's Q1_0, TQ1_0 and TQ2_0, which share the decoder).
+
+Those weights are also *Hadamard-folded* (`prism.hadamard.*` metadata): each folded matrix is
+`W D H`, the original times a diagonal of signs and a block Walsh-Hadamard rotation, so the
+runtime has to flip and rotate the input of every such matmul (`H (D x)`, `hadamard.rs`), read
+the token embedding back through the inverse (`D (H z)`), and feed the Gated DeltaNet output
+projection its value heads in the checkpoint's order (`gdn_v_grouped`). A runtime that ignores the
+metadata loads the file and prints noise (llama.cpp before b11556 did; oxinfer before this
+support refused the files for their tensor type). Version 1 (27B: a separate output head) and
+version 2 (2B: the folded token embedding is also the output head) are read; anything else in
+that metadata is an error rather than a guess. Folded matmuls run on the CPU kernels (the GPU
+decode and prefill plans do not take them), so on a machine with a GPU these models decode at the
+CPU's speed. The six 1-bit / ternary types are unpacked in registers on x86-64 (AVX2, rows
+bit-identical to the portable decoder's: 19-42 ns per 256 weights and token on one thread, as
+Q2_K's 21 and Q4_K's 32, against 140-185 through the portable decoder) and take the portable
+decoder on ARM. On the test machine, shared and under load, so indicative only: the 2B on 8
+threads at 41 tok/s (`Q2_0`), 33 (`PQ2_0`) and 23 (`PTQ1_0`) where llama.cpp's CPU build gave 46
+on `Q2_0`; the 27B `PTQ1_0` at 6.9 tok/s on a chat prompt (2.1 before the AVX2 unpackers; a
+GSQ-RCO IQ2_XS file of the same model, whose i-quants unpack through the portable decoder: 2.3).
 
 ### Llama 3 GGUF
 

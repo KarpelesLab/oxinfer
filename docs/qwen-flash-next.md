@@ -159,3 +159,43 @@ with the matrix units), the attention ~11%, the GEMMs ~25%.
 
 Not done: video input from GGUF is wired the same way but untested, the merged-weight GGUF layout,
 and faster routed experts in prefill (less tile padding, or larger chunks).
+
+## Derivatives
+
+Checked in November 2026 from headers and configs (none of these was run with its weights):
+
+- **SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF** (`qwen4exp`, split in two, 66.8-83.9 GB):
+  the layout of unsloth's files (separate `attn_qkv` / `attn_gate`, `ssm_alpha` / `ssm_beta`,
+  `indexer.q_proj` / `k_proj`, 3D expert tensors, the n-gram table alone in the last part as
+  IQ4_NL) with a ggml type per tensor: F32, F16, BF16, Q8_0, Q3_K-Q6_K, IQ1_M-IQ4_XS, and the
+  ternary `Q2_0` (type 42) for most expert tensors of the `Q2_0` build and the `ffn_down_exps` of
+  the others. With that type readable (see [Mixed, low-bit and ternary GGUFs](weights.md#mixed-low-bit-and-ternary-ggufs)),
+  the `Q2_0` build's header and tensor table load and a forward pass runs (checked on files of
+  the real sizes holding the real headers and zero weights). Its `mtp-Qwen3.8-Flash-Next-Q*.gguf`
+  files are ordinary `qwen4exp` MTP sidecars (`--mtp-from`); `mtp-q2_0.gguf` and `strata/rt/` are
+  the Strata engine's own formats (architecture tag `qwen4exp-mtp`, raw `.bin` pools) and are
+  not read.
+- **Edge0/Edge0-145B-NVFP4** is not a Qwen4-Exp checkpoint in another container but another
+  network and another container. The network: each layer's 512 experts work in a latent space
+  (`D` projects the 2560-wide stream down to 1792, an expert is 1792 -> 640 -> 1792, `U` projects
+  the sum back), which the Qwen4-Exp code does not have. The container is a Strata "pack":
+  `model-skeleton.gguf` (`qwen4exp` metadata and the 1079 non-expert tensors in F32 / BF16 /
+  Q8_0, without any `ffn_*_exps`), `experts.bin` (47.6 GB: one fixed record of 1,935,376 bytes per
+  expert, 512 per layer, at the offsets of `native_experts.txt`), `dense.bin` (a 1.5 GB pool of
+  the small tensors, among them each expert tensor's scale and input-scale vectors, located by
+  the text index `index.txt`), `latent_dense_q4.bin` / `_q8.bin` (the latent block's dense weights
+  at 4 and 8 bits, `STRATA_LATENT_DENSE` in `model.json`), `labels.bin`, and the n-gram table as `ple-fp8.gguf` (one 51 GB I8 tensor of
+  FP8 E4M3 bytes with a single scale in `strata.ple.scale`). Reading it would take the latent
+  expert block, a reader for the pack index and its record layout (specified only by the Strata
+  / Edge0 sources), and an FP8 row table with a global scale.
+- **autotrust/Qwen3.8-Flash-Next-E384-FP4-V2** (`qwen4_exp` safetensors, 384 experts, the layout
+  of nvidia/Qwen3.8-Flash-Next-FP4-Local): the expert count comes from the config and per-expert
+  tensors (`experts.N.gate_proj` / `up_proj` / `down_proj`) are read, and so is ModelOpt NVFP4
+  with plain scales (`.weight` U8 + `.weight_scale` + `.weight_scale_2`, the form of its MTP
+  layer's experts). Three things are not: the main layers' NVFP4 scales are stored CSF-coded
+  (`.weight_scale.nvfp4_csf_fixed`, one base byte per row of 16 scales plus 4-bit offsets, with
+  `.nvfp4_csf_exceptions` as index / value pairs; the decoder is in the repository's
+  `vllm_patch/sitecustomize.py`); the attention projections are FP8 E4M3 with a U8
+  `.weight_scale` per row and 32 columns instead of the `.weight_scale_inv` blocks read today;
+  and the n-gram table is NVFP4 (`ngram_embedding.shard_K.weight` U8 + `.weight_scale`, one
+  `weight_scale_2` for the table) where bf16 or oxinfer-quantized shards are expected.
