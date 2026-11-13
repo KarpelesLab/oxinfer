@@ -46,6 +46,7 @@ pub mod gguf;
 pub mod glm5;
 pub mod gpu;
 pub mod hadamard;
+pub mod haru;
 #[cfg(feature = "hf")]
 pub mod hf;
 pub mod inkling;
