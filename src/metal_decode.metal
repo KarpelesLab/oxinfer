@@ -29,15 +29,17 @@ inline void xload(device const float* x, uint c, thread X32& xr) {
 }
 inline float hsum(float4 v) { return (v.x + v.y) + (v.z + v.w); }
 
-// Nibble products without shifts: the masked nibble of byte j of a word, converted to float, is
-// the value times 2^(8j) (low nibbles) or 2^(8j+4) (high nibbles); the powers are divided out once
-// per word group. `lo` gets x[4k+j] * low nibble j, `hi` x2[4k+j] * high nibble j.
+// Nibble products: `lo` gets x[4k+j] * low nibble j, `hi` x2[4k+j] * high nibble j, the four
+// nibbles of a word unpacked as bytes. (These kernels once multiplied by the masked nibbles in
+// place, the value times 2^(8j) or 2^(8j+4), with the powers divided out by the NIB_* weights of
+// the final dot: the same products and sums scaled by exact powers of two, so the results are
+// bit for bit those of the byte unpacking, which takes fewer instructions.)
 inline void nib_acc(uint w, float4 xa, float4 xb, thread float4& lo, thread float4& hi) {
-    lo += xa * float4(float(w & 0xFu), float(w & 0xF00u), float(w & 0xF0000u), float(w & 0xF000000u));
-    hi += xb * float4(float(w & 0xF0u), float(w & 0xF000u), float(w & 0xF00000u), float(w & 0xF0000000u));
+    lo += xa * float4(as_type<uchar4>(w & 0x0F0F0F0Fu));
+    hi += xb * float4(as_type<uchar4>((w >> 4) & 0x0F0F0F0Fu));
 }
-constant float4 NIB_LO = float4(1.f, 1.f / 256.f, 1.f / 65536.f, 1.f / 16777216.f);
-constant float4 NIB_HI = float4(1.f / 16.f, 1.f / 4096.f, 1.f / 1048576.f, 1.f / 268435456.f);
+constant float4 NIB_LO = float4(1.f);
+constant float4 NIB_HI = float4(1.f);
 
 // ---- bf16: chunk of 16 (32 bytes; tensors inside safetensors blobs are only 2-byte aligned).
 struct MBf { device const uchar* w; ulong rb; };
@@ -171,8 +173,8 @@ inline float mdot(MQ4_K f, uint row, uint c, thread const XKQ& x) {
 struct MQ5_K { device const uchar* w; ulong rb; };
 inline void bit_acc(uint w, uint sh, float4 xa, float4 xb, thread float4& lo, thread float4& hi) {
     uint a = (w >> sh) & 0x01010101u, b = (w >> (sh + 1)) & 0x01010101u;
-    lo += xa * float4(float(a & 1u), float(a & 0x100u), float(a & 0x10000u), float(a & 0x1000000u));
-    hi += xb * float4(float(b & 1u), float(b & 0x100u), float(b & 0x10000u), float(b & 0x1000000u));
+    lo += xa * float4(as_type<uchar4>(a));
+    hi += xb * float4(as_type<uchar4>(b));
 }
 inline float mdot(MQ5_K f, uint row, uint c, thread const XKQ& x) {
     uint k = c % 8, g = k / 2, h = k % 2;
@@ -454,8 +456,8 @@ template <typename F> inline void wdec(F f, uint row, uint c, thread WRow& w) { 
 template <typename F, typename X> inline float wdot(F f, thread const WRow& w, uint c, thread const X& xr) { return mdot(f, w.row, c, xr); }
 // The masked nibbles of a word as floats (see nib_acc): low nibbles in `l`, high in `h`.
 inline void nib_dec(uint w, thread float4& l, thread float4& h) {
-    l = float4(float(w & 0xFu), float(w & 0xF00u), float(w & 0xF0000u), float(w & 0xF000000u));
-    h = float4(float(w & 0xF0u), float(w & 0xF000u), float(w & 0xF00000u), float(w & 0xF0000000u));
+    l = float4(as_type<uchar4>(w & 0x0F0F0F0Fu));
+    h = float4(as_type<uchar4>((w >> 4) & 0x0F0F0F0Fu));
 }
 inline float q4_dot(thread const float4* nl, thread const float4* nh, thread const X32& xr) {
     float4 lo = 0.f, hi = 0.f;
