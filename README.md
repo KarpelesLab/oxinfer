@@ -90,6 +90,7 @@ too. The device is chosen at run time (`--device auto`: a GPU when one starts, e
 | [GLM-5.3 and GLM-5.3-Flash](docs/glm.md) | hyper-connections, KDA linear attention, MLA with the DSA indexer; text only |
 | [ERNIE 5.5 Flash Base](docs/ernie.md) | 280B MoE base model (HCA and MLA-DSA attention); on tiny checkpoints only |
 | [Kimi K3.1 Pro, Kimi K3](docs/kimi.md) | 2.8T MoE with linear and sparse attention, on tiny checkpoints only |
+| [Nemotron 3.5 Lightning and Transcribe](docs/nemotron.md) | Mamba-2 / attention / MoE hybrid; a 34B speech LM for speech to text |
 | [Qwen3.8-Flash-Next](docs/qwen-flash-next.md) | 125B MoE with an n-gram embedding table |
 | [Image, video and audio input](docs/multimodal-input.md) | the vision and audio towers of Gemma 4 and Qwen, Qwen2.5-VL |
 
@@ -103,6 +104,7 @@ too. The device is chosen at run time (`--device auto`: a GPU when one starts, e
 | [Qwen-Image, Qwen-Image-Edit and Qwen-Image-2.1](docs/qwen-image.md) | editing, text to image, ControlNet, layers; Qwen-Image-2.1 / 2.1-Turbo |
 | [OmniGen2](docs/omnigen2.md), [BAGEL](docs/bagel.md), [Step1X-Edit](docs/step1x-edit.md), [Janus-Pro](docs/janus.md) | instruction editing, unified generation and understanding |
 | [Whisper](docs/whisper.md) | speech to text |
+| [Nemotron 3.5 Transcribe](docs/nemotron.md#speech-to-text-nemotron-35-transcribe) | speech to text and speech translation with a speech LM |
 | [Orpheus](docs/orpheus.md) | text to speech, batches, voice cloning, the SNAC codec |
 | [ZONOS3-Mini](docs/zonos.md) | text to speech at 44.1 kHz in 43 languages, default voices, cloning from a clip |
 | [Fish Audio Drama 3](docs/fish-drama.md) | not supported yet: what the checkpoint holds and what each stage would need |

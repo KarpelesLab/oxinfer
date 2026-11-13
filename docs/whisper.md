@@ -5,6 +5,8 @@ translate audio of any length (`src/whisper/`): openai/whisper-{tiny, base, smal
 large-v3, large-v3-turbo}, the English-only `.en` models, and distil-whisper (the same network
 with fewer decoder layers, e.g. distil-whisper/distil-large-v3). Sizes come from `config.json`
 (80 mel bins, 128 for v3), special tokens and decoding defaults from `generation_config.json`.
+The same commands and endpoints run NVIDIA's Nemotron 3.5 Transcribe, a speech LM, with the
+differences listed in [Nemotron 3.5](nemotron.md#speech-to-text-nemotron-35-transcribe).
 
 ```sh
 ./target/release/oxinfer --model openai/whisper-small --transcribe talk.mp3              # text

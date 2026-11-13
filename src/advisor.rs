@@ -358,6 +358,15 @@ pub const CATALOG: &[Model] = &[
     Model::new("autotrust/JEV-27B", Kind::Chat, 27.8, 54.4, &[Decisions, Text]).note("typed decisions"),
     Model::new("autotrust/JEV-27B-VL", Kind::Chat, 27.8, 56.1, &[Decisions, Text, ImageInput]).note("typed decisions over text and images"),
     Model::new("google/gemma-4-31B-it", Kind::Chat, 31.0, 62.0, GEMMA_L).note("supported, untested"),
+    Model::new("ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF:Q4_0", Kind::Chat, 31.6, 18.9, AGENT)
+        .fixed(Format::GgufQ4, "GGUF Q4_0")
+        .speed(2.73, 52)
+        .moe()
+        .note("no MTP, no speculative decoding (Mamba-2 state)"),
+    Model::new("nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16", Kind::Chat, 31.6, 65.8, AGENT)
+        .speed(6.44, 52)
+        .moe()
+        .note("not run in this layout (its GGUF and the Transcribe fine-tune were); bytes per token from the parameter count"),
     Model::new("MiniMaxAI/SynLogic-32B", Kind::Chat, 32.8, 66.0, &[Text]).note("a Qwen2.5 fine-tune"),
     Model::new("Qwen/Qwen3.6-35B-A3B", Kind::Chat, 35.0, 69.0, AGENT)
         .speed(6.0, 40)
@@ -510,6 +519,8 @@ pub const CATALOG: &[Model] = &[
     Model::new("openai/whisper-medium", Kind::Speech, 0.769, 3.1, STT),
     Model::new("openai/whisper-large-v3-turbo", Kind::Speech, 0.809, 1.6, &[SpeechToText]),
     Model::new("openai/whisper-large-v3", Kind::Speech, 1.55, 3.1, STT),
+    Model::new("nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B", Kind::Speech, 34.0, 67.5, STT)
+        .note("a speech LM (audio encoders in front of Nemotron-H); one segment per file, no timestamps"),
     Model::new("isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF", Kind::Tts, 3.3, 2.5, &[TextToSpeech]).note("with hubertsiuzdak/snac_24khz"),
     Model::new("lex-au/Orpheus-3b-FT-Q8_0.gguf", Kind::Tts, 3.3, 4.1, &[TextToSpeech]).note("with hubertsiuzdak/snac_24khz"),
     Model::new("unsloth/orpheus-3b-0.1-ft", Kind::Tts, 3.3, 6.7, &[TextToSpeech]).note("with hubertsiuzdak/snac_24khz"),
