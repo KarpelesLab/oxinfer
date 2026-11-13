@@ -918,10 +918,10 @@ impl<'a> LongcatModel<'a> {
                 linear(&oe.projs[i], h, oe.dim, &e, t, &mut y);
                 add_inplace(&mut sum, &y);
             }
-            let inv = 1.0 / (n + 1) as f32;
+            let count = (n + 1) as f32;
             for ti in (0..t).filter(|&ti| !plain(ti)) {
                 for (o, s) in x[ti * h..(ti + 1) * h].iter_mut().zip(&sum[ti * h..(ti + 1) * h]) {
-                    *o = s * inv;
+                    *o = s / count;
                 }
             }
         }

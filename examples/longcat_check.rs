@@ -6,13 +6,16 @@
 //! ```text
 //! longcat_check MODEL REF.safetensors [--chunk N] [--cpu] [--mmap]
 //! longcat_check MODEL --load [TEXT...]
+//! longcat_check MODEL --nll IDS.txt [--chunk N] [--from K] [--cpu] [--mmap]
 //! ```
 //!
 //! Prints, for the prefill (in chunks of N tokens, default the whole prompt) and for the
 //! token-by-token decode, the largest logit difference, the mean KL divergence and the agreement
 //! of the top token. `--load` in place of the reference only opens the checkpoint (mapped: it
 //! works on a file whose tensor data was not downloaded) and prints the ids its tokenizer gives
-//! the texts that follow.
+//! the texts that follow. `--nll` runs the token ids of a file (numbers separated by commas or
+//! spaces) and prints the mean negative log-likelihood, in nats, the model gives each token after
+//! the ones before it: over all of them, and over those from position K on (default 0).
 
 use anyhow::{Context, Result};
 use oxinfer::longcat::{LongcatConfig, LongcatModel};
@@ -85,16 +88,19 @@ fn main() -> Result<()> {
     let refp = args.next().context(usage)?;
     let (mut chunk, mut cpu, mut mmap) = (None, false, false);
     let mut texts = Vec::new();
+    let (mut nll, mut from) = (None, 0usize);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--chunk" => chunk = Some(args.next().context("--chunk N")?.parse::<usize>()?),
             "--cpu" => cpu = true,
             "--mmap" => mmap = true,
+            "--from" => from = args.next().context("--from K")?.parse::<usize>()?,
             other if refp == "--load" => texts.push(other.to_string()),
+            other if refp == "--nll" && nll.is_none() => nll = Some(other.to_string()),
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
-    mmap |= refp == "--load";
+    mmap |= refp == "--load" || refp == "--nll";
     let dev = if cpu {
         oxinfer::platform::DevicePref::Cpu
     } else {
@@ -130,6 +136,49 @@ fn main() -> Result<()> {
                 println!("{:?}", enc.get_ids());
             }
         }
+        return Ok(());
+    }
+    if refp == "--nll" {
+        let text = std::fs::read_to_string(nll.context("--nll IDS.txt")?)?;
+        let ids: Vec<u32> = text
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<u32>())
+            .collect::<Result<_, _>>()?;
+        let vocab = m.cfg.vocab_size;
+        let chunk = chunk.unwrap_or(256).max(1);
+        let mut sess = m.new_session();
+        let (mut all, mut tail, mut n_tail, mut hits) = (0f64, 0f64, 0usize, 0usize);
+        let t0 = std::time::Instant::now();
+        let mut pos = 0;
+        for c in ids.chunks(chunk) {
+            let hs = m.forward_hidden_mm(&mut sess, c, &[]);
+            let lg = m.logits(&hs, c.len());
+            for (i, row) in lg.chunks(vocab).enumerate() {
+                // The row after token `pos + i` scores token `pos + i + 1`.
+                let Some(&next) = ids.get(pos + i + 1) else { break };
+                let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+                let lse = mx + row.iter().map(|&x| (x as f64 - mx).exp()).sum::<f64>().ln();
+                let l = lse - row[next as usize] as f64;
+                all += l;
+                hits += (row[next as usize] as f64 == mx) as usize;
+                if pos + i + 1 >= from {
+                    tail += l;
+                    n_tail += 1;
+                }
+            }
+            pos += c.len();
+        }
+        let n = ids.len() - 1;
+        println!(
+            "nll: {} tokens in passes of {chunk}, {:.1}s: mean {:.4} nats (perplexity {:.2}), top-1 {}/{n}; from position {from}: mean {:.4} over {n_tail}",
+            ids.len(),
+            t0.elapsed().as_secs_f64(),
+            all / n as f64,
+            (all / n as f64).exp(),
+            hits,
+            tail / n_tail.max(1) as f64
+        );
         return Ok(());
     }
     let st = SafeTensors::open(Path::new(&refp), true)?;
