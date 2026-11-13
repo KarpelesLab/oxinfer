@@ -6,6 +6,7 @@
 //!
 //! ```text
 //! deepseek4_check MODEL REF.safetensors [--chunk N] [--cpu] [--mmap]
+//! deepseek4_check MODEL --load [TEXT...]
 //! ```
 //!
 //! Prints, for the prefill (in chunks of N tokens, default the whole prompt) and for the
@@ -74,14 +75,17 @@ fn main() -> Result<()> {
     let model = args.next().context(usage)?;
     let refp = args.next().context(usage)?;
     let (mut chunk, mut cpu, mut mmap) = (None, false, false);
+    let mut texts = Vec::new();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--chunk" => chunk = Some(args.next().context("--chunk N")?.parse::<usize>()?),
             "--cpu" => cpu = true,
             "--mmap" => mmap = true,
+            other if refp == "--load" => texts.push(other.to_string()),
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
+    mmap |= refp == "--load";
     let dev = if cpu {
         oxinfer::platform::DevicePref::Cpu
     } else {
@@ -92,6 +96,33 @@ fn main() -> Result<()> {
     let cfg = oxinfer::config::DeepSeek4Config::load(&dir)?;
     let files = ModelFiles::open(&dir, !mmap)?;
     let m = DeepSeek4Model::load(cfg, &files, oxinfer::model::Quant::Bf16)?;
+    // `--load` in place of the reference: only open the checkpoint (mapped), to try the loader
+    // on the layout of a real file (even one whose tensor data was not downloaded), and print
+    // the ids its tokenizer gives the texts that follow.
+    if refp == "--load" {
+        let c = &m.cfg;
+        println!(
+            "loaded: {} layers of {}, {} experts (top {}), engram layers {:?}, key sources {:?}, index sources {:?}, {:.2} GB read per token, {} tensors, {:.1} GB",
+            c.num_hidden_layers,
+            c.hidden_size,
+            c.n_routed_experts,
+            c.num_experts_per_tok,
+            c.engram_layer_ids,
+            c.kv_source_layer_ids,
+            c.index_source_layer_ids,
+            m.streamed_bytes() as f64 / 1e9,
+            files.names().count(),
+            files.total_bytes() as f64 / 1e9
+        );
+        if oxinfer::gguf::is_gguf(&dir) {
+            let tok = oxinfer::gguf::header(&dir)?.tokenizer()?;
+            for text in texts {
+                let enc = tok.encode(text.as_str(), false).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+                println!("{:?}", enc.get_ids());
+            }
+        }
+        return Ok(());
+    }
     let st = SafeTensors::open(Path::new(&refp), true)?;
     let ids = i64s(&st, "ids")?;
     let refs = f32s(&st, "logits")?;
