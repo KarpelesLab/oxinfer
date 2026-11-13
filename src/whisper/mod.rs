@@ -323,15 +323,45 @@ pub struct TranscriberInfo {
     pub device: String,
     pub threads: usize,
     pub load_secs: f64,
+    /// `whisper`, or `nemotron-transcribe` for a NeMo speech LM (then `d_model` and
+    /// `encoder_layers` are the speech encoder's, `decoder_layers` the language model's blocks).
+    pub family: String,
 }
 
-/// A loaded Whisper model.
+/// A loaded speech-to-text model: Whisper, or NVIDIA Nemotron 3.5 Transcribe (a NeMo speech
+/// LM, [`crate::nemotron_asr`]), which takes the same calls with these differences: the whole
+/// recording is one prompt and one segment (no segment or word timestamps yet), the language is
+/// not detected, [`TranscribeOptions::initial_prompt`] replaces the instruction given to the
+/// model (a context or speaker-tag prompt of its model card), and beam search, fallback
+/// temperatures and a prefix do not apply.
 pub struct Transcriber {
+    core: Core,
+    info: TranscriberInfo,
+    cancel: Arc<AtomicBool>,
+}
+
+enum Core {
+    Whisper(Box<WhisperCore>),
+    Speech(Box<crate::nemotron_asr::SpeechLm>),
+}
+
+/// The parts of a Whisper [`Transcriber`], which its methods reach through `Deref`.
+#[doc(hidden)]
+pub struct WhisperCore {
     model: WhisperModel,
     tok: Tokenizer,
     sp: Special,
-    info: TranscriberInfo,
-    cancel: Arc<AtomicBool>,
+}
+
+impl std::ops::Deref for Transcriber {
+    type Target = WhisperCore;
+    /// Panics for a model that is not Whisper (every entry point checks first).
+    fn deref(&self) -> &WhisperCore {
+        match &self.core {
+            Core::Whisper(w) => w,
+            Core::Speech(_) => panic!("not a Whisper model"),
+        }
+    }
 }
 
 /// The options of a transcription resolved against the checkpoint (shared by a batch).
@@ -400,8 +430,44 @@ impl Transcriber {
         }
         let gpu = crate::gpu::ensure(opts.device)?;
         let model_type = crate::config::model_type(dir)?;
+        if model_type == crate::nemotron::SPEECHLM {
+            let quant = match opts.decoder {
+                Precision::Q8 => crate::model::Quant::Q8,
+                Precision::Q4 => crate::model::Quant::Q4,
+                _ => crate::model::Quant::Bf16,
+            };
+            let lm = crate::nemotron_asr::SpeechLm::load(dir, quant, opts.mmap)?;
+            let c = &lm.speech.cfg;
+            let info = TranscriberInfo {
+                path: dir.to_path_buf(),
+                d_model: c.asr.hidden_size,
+                encoder_layers: c.asr.num_hidden_layers,
+                decoder_layers: lm.lm.cfg.num_hidden_layers(),
+                n_mels: c.n_mels,
+                vocab_size: lm.lm.cfg.vocab_size,
+                multilingual: true,
+                encoder: Precision::Bf16,
+                decoder: match lm.lm.quant {
+                    crate::model::Quant::Q8 => Precision::Q8,
+                    crate::model::Quant::Q4 => Precision::Q4,
+                    crate::model::Quant::Bf16 => Precision::Bf16,
+                },
+                device: gpu.map_or("cpu".to_string(), |b| b.name().to_string()),
+                threads: pool::threads(),
+                load_secs: t0.elapsed().as_secs_f64(),
+                family: "nemotron-transcribe".to_string(),
+            };
+            return Ok(Self {
+                core: Core::Speech(Box::new(lm)),
+                info,
+                cancel: Arc::new(AtomicBool::new(false)),
+            });
+        }
         if model_type != "whisper" {
-            bail!("{}: model_type {model_type} is not a Whisper model", dir.display());
+            bail!(
+                "{}: model_type {model_type} is not a speech-to-text model (Whisper, Nemotron 3.5 Transcribe)",
+                dir.display()
+            );
         }
         let cfg = WhisperConfig::load(dir)?;
         let files = ModelFiles::open(dir, !opts.mmap)?;
@@ -422,11 +488,10 @@ impl Transcriber {
             device: gpu.map_or("cpu".to_string(), |b| b.name().to_string()),
             threads: pool::threads(),
             load_secs: t0.elapsed().as_secs_f64(),
+            family: "whisper".to_string(),
         };
         Ok(Self {
-            model,
-            tok,
-            sp,
+            core: Core::Whisper(Box::new(WhisperCore { model, tok, sp })),
             info,
             cancel: Arc::new(AtomicBool::new(false)),
         })
@@ -435,14 +500,120 @@ impl Transcriber {
     pub fn info(&self) -> &TranscriberInfo {
         &self.info
     }
+    /// The Whisper model (panics for another family, see [`TranscriberInfo::family`]).
     pub fn model(&self) -> &WhisperModel {
         &self.model
     }
     pub fn tokenizer(&self) -> &Tokenizer {
-        &self.tok
+        match &self.core {
+            Core::Whisper(w) => &w.tok,
+            Core::Speech(s) => &s.tok,
+        }
     }
+    /// Whisper's special tokens (panics for another family).
     pub fn special(&self) -> &Special {
         &self.sp
+    }
+    /// The Nemotron 3.5 Transcribe model, for requests beyond transcription (a question about
+    /// the audio, reasoning: [`crate::nemotron_asr::SpeechLm::run`]); None for Whisper.
+    pub fn speech_lm(&self) -> Option<&crate::nemotron_asr::SpeechLm> {
+        match &self.core {
+            Core::Speech(s) => Some(s),
+            Core::Whisper(_) => None,
+        }
+    }
+
+    /// Transcribes with a NeMo speech LM: each recording is one prompt, answered as one segment.
+    fn transcribe_speech(
+        &self,
+        lm: &crate::nemotron_asr::SpeechLm,
+        pcms: &[&[f32]],
+        o: &TranscribeOptions,
+        on_segment: &mut dyn FnMut(usize, &Segment) -> Flow,
+    ) -> Result<Vec<Transcript>> {
+        use crate::nemotron_asr::{Request, TRANSCRIBE_PROMPT, cleanup_generation_loops, translate_prompt};
+        if o.word_timestamps {
+            bail!("word timestamps are not supported for Nemotron 3.5 Transcribe (its word timestamp head is not read yet)");
+        }
+        if o.beam_size.is_some() || o.best_of.is_some() || o.patience.is_some() || o.length_penalty.is_some() {
+            bail!(
+                "beam_size, best_of, patience and length_penalty are Whisper's: Nemotron 3.5 Transcribe decodes greedily (or samples at a temperature)"
+            );
+        }
+        if o.prefix.is_some() {
+            bail!("prefix is not supported for Nemotron 3.5 Transcribe");
+        }
+        if o.temperatures.is_empty() {
+            bail!("temperatures must not be empty");
+        }
+        let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+        self.cancel.store(false, Ordering::SeqCst);
+        let prompt = match (&o.initial_prompt, o.task) {
+            (Some(p), _) => p.clone(),
+            (None, Some(Task::Translate)) => translate_prompt("English"),
+            _ => TRANSCRIBE_PROMPT.to_string(),
+        };
+        let rate = lm.speech.cfg.sample_rate as f64;
+        let mut outs = Vec::with_capacity(pcms.len());
+        for (i, pcm) in pcms.iter().enumerate() {
+            let language = o.language.clone().unwrap_or_default();
+            if self.cancel.load(Ordering::SeqCst) {
+                outs.push(Transcript {
+                    language,
+                    stopped: true,
+                    ..Default::default()
+                });
+                continue;
+            }
+            let started = Instant::now();
+            let req = Request {
+                prompt: &prompt,
+                temperature: o.temperatures[0],
+                seed: o.seed,
+                max_new_tokens: o.max_new_tokens,
+                ..Default::default()
+            };
+            let mut cancelled = false;
+            let reply = lm.run(pcm, &req, &mut |_| {
+                cancelled = self.cancel.load(Ordering::SeqCst);
+                if cancelled { Flow::Stop } else { Flow::Continue }
+            })?;
+            let audio_secs = pcm.len() as f64 / rate;
+            let text = cleanup_generation_loops(reply.text.trim());
+            let segment = Segment {
+                id: 0,
+                start: 0.0,
+                end: audio_secs,
+                text: text.clone(),
+                compression_ratio: compress::compression_ratio(&reply.tokens),
+                tokens: reply.tokens,
+                temperature: o.temperatures[0],
+                avg_logprob: reply.avg_logprob,
+                no_speech_prob: 0.0,
+                words: Vec::new(),
+            };
+            let total_secs = started.elapsed().as_secs_f64();
+            let stats = TranscribeStats {
+                audio_secs,
+                mel_secs: reply.feature_secs,
+                encode_secs: reply.encode_secs,
+                decode_secs: reply.prefill_secs + reply.decode_secs,
+                total_secs,
+                windows: reply.chunks,
+                tokens: segment.tokens.len(),
+                rtf: total_secs / audio_secs.max(1e-9),
+            };
+            let stop = on_segment(i, &segment) == Flow::Stop;
+            outs.push(Transcript {
+                text,
+                language,
+                language_probability: None,
+                segments: vec![segment],
+                stopped: cancelled || stop,
+                stats,
+            });
+        }
+        Ok(outs)
     }
 
     /// Stops the running (or next) transcription from any thread: it returns what is done,
@@ -509,6 +680,9 @@ impl Transcriber {
     /// The language distribution of the first 30 s: (code, probability) by decreasing
     /// probability. Fails for English-only models.
     pub fn detect_language(&self, pcm: &[f32]) -> Result<Vec<(String, f32)>> {
+        if matches!(self.core, Core::Speech(_)) {
+            bail!("language detection is Whisper's: Nemotron 3.5 Transcribe transcribes the language as spoken");
+        }
         if !self.sp.multilingual {
             bail!("this model is English-only");
         }
@@ -566,6 +740,9 @@ impl Transcriber {
         o: &TranscribeOptions,
         on_segment: &mut dyn FnMut(usize, &Segment) -> Flow,
     ) -> Result<Vec<Transcript>> {
+        if let Core::Speech(lm) = &self.core {
+            return self.transcribe_speech(lm, pcms, o, on_segment);
+        }
         let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
         self.cancel.store(false, Ordering::SeqCst);
         let plan = self.plan(o)?;

@@ -50,11 +50,14 @@ fn segment_text(format: Format, timestamps: bool, n: usize, s: &Segment) -> Stri
 /// The statistics line of one transcript.
 fn report(t: &Transcript, decoded: &str) {
     let s = &t.stats;
+    // A speech LM transcribes the language as spoken and does not report one.
+    let language = match (t.language.is_empty(), t.language_probability) {
+        (true, _) => "no language reported".to_string(),
+        (false, None) => format!("{} (given)", t.language),
+        (false, Some(p)) => format!("{} (detected, p={p:.2})", t.language),
+    };
     eprintln!(
-        "[{} ({}) | {:.1}s of audio{decoded} | features {:.2}s, encoder {:.2}s ({} windows), decoder {:.2}s ({} tokens) | {:.2}s total, {:.1}x real time]",
-        t.language,
-        t.language_probability
-            .map_or("given".to_string(), |p| format!("detected, p={p:.2}")),
+        "[{language} | {:.1}s of audio{decoded} | features {:.2}s, encoder {:.2}s ({} windows), decoder {:.2}s ({} tokens) | {:.2}s total, {:.1}x real time]",
         s.audio_secs,
         s.mel_secs,
         s.encode_secs,
@@ -147,7 +150,7 @@ pub fn run(args: &Args) -> Result<()> {
     let file = args
         .transcribe
         .as_ref()
-        .context("a Whisper model transcribes audio: use --transcribe FILE")?;
+        .context("a speech-to-text model transcribes audio: use --transcribe FILE")?;
     let format = match args.format.as_deref().unwrap_or("text") {
         "text" | "txt" => Format::Text,
         "json" => Format::Json,
@@ -169,7 +172,8 @@ pub fn run(args: &Args) -> Result<()> {
     let asr = Transcriber::load_dir(&args.model, &lo)?;
     let info = asr.info();
     eprintln!(
-        "[whisper: d_model {}, {} encoder / {} decoder layers, {} mel bins, {}; encoder {}, decoder {}; loaded in {:.2}s]",
+        "[{}: d_model {}, {} encoder / {} decoder layers, {} mel bins, {}; encoder {}, decoder {}; loaded in {:.2}s]",
+        info.family,
         info.d_model,
         info.encoder_layers,
         info.decoder_layers,

@@ -68,6 +68,7 @@ pub mod modernbert;
 mod moe;
 pub mod mpnet;
 pub mod nemotron;
+pub mod nemotron_asr;
 pub mod nomic_bert;
 pub mod omnigen2;
 pub mod pixtral;

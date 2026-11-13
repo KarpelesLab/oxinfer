@@ -564,7 +564,7 @@ pub(crate) fn detect_path(path: &Path, source: &str) -> (Kind, Option<ImageKind>
         img(ImageKind::Janus)
     } else if crate::embed::is_embedding_model(path) {
         (Kind::Embedding, None)
-    } else if crate::whisper::is_whisper(path) {
+    } else if crate::whisper::is_whisper(path) || crate::nemotron_asr::is_speech_lm(path) {
         (Kind::Transcription, None)
     } else if is_orpheus(path) {
         (Kind::Speech, None)

@@ -630,7 +630,7 @@ pub(super) fn transcriptions(api: &Arc<Api>, req: &ApiRequest, translate: bool) 
     let Loaded::Transcription(t) = lease.model() else { unreachable!() };
     // Bad search options (patience without beam_size, ...) are the request's fault.
     let mut trs = t.transcribe_batch(&refs, &o).map_err(|e| {
-        let bad = ["beam_size", "patience", "best_of", "length_penalty"];
+        let bad = ["beam_size", "patience", "best_of", "length_penalty", "word timestamps", "prefix"];
         let msg = format!("{e:#}");
         ApiError::new(if bad.iter().any(|k| msg.starts_with(k)) { 400 } else { 500 }, msg)
     })?;
