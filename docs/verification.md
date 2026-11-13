@@ -18,6 +18,18 @@ M=~/.cache/oxinfer/hub/Qwen--Qwen3.5-0.8B
     --ours ours --ours-logits ours.bin --ours-prompt prompt.txt --generate 40
 ```
 
+Unlimited-OCR-2 is compared with the code in its checkpoint (`tools/ref_unlimited_ocr.py`: token
+ids, pixel values, encoder features, packed embeddings, logits and the greedy reply; see
+[Unlimited-OCR-2](ocr.md#agreement-with-the-reference)):
+
+```sh
+M=~/.cache/oxinfer/hub/baidu--Unlimited-OCR-2
+./target/release/oxinfer --model $M --image page.png --device cpu --dump-mm ours --dump-logits ours.bin
+./target/release/oxinfer --model $M --image page.png --device cpu --show-tokens > ours.txt 2> ours.log
+./venv/bin/python tools/ref_unlimited_ocr.py $M --image page.png --ours ours --ours-logits ours.bin \
+    --ours-log ours.log --generate 600
+```
+
 Videos are compared as directories of frames (`ffmpeg -i clip.mp4 frames/%05d.png`, then
 `--video frames --frames-fps 24` on both sides), so both read the same pixels.
 
