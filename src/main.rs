@@ -1608,6 +1608,7 @@ fn run(mut args: Args) -> Result<()> {
         m if oxinfer::nemotron::is_model_type(m) => run_nemotron(args),
         m if oxinfer::inkling::is_model_type(m) => run_inkling(args),
         m if oxinfer::unlimited_ocr::is_model_type(m) => unlimited_ocr_cli::run(&args),
+        "raon1_nano" => run_raon(args),
         other => bail!("unsupported model_type {other}"),
     }
 }
@@ -2523,6 +2524,51 @@ fn run_kimi(mut args: Args) -> Result<()> {
     {
         eprintln!("[stream: {:.2} GB of the model files in the page cache at exit]", c as f64 / 1e9);
     }
+    *STREAM.lock().unwrap() = None;
+    model.set_stream(None);
+    drop(streamer);
+    r
+}
+
+/// Raon-1 nano (text; see `oxinfer::raon`).
+fn run_raon(mut args: Args) -> Result<()> {
+    let t0 = Instant::now();
+    if args.mtp || args.draft.is_some() {
+        bail!("Raon-1 has no speculative decoding here (its MTP layer is not read, no DSpark draft)");
+    }
+    if !mm_request(&args).is_empty() {
+        bail!("Raon-1 takes text only");
+    }
+    let cfg = oxinfer::raon::RaonConfig::load(&args.model)?;
+    let eos = config::load_eos_ids(&args.model);
+    args.mmap |= args.stream;
+    let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
+    let mut model = oxinfer::raon::RaonModel::load(cfg, &files, args.quant)?;
+    let tok = load_tokenizer(&args.model)?;
+    let fmt: &dyn ChatFormat = &chat::RaonChat;
+    let eos = chat::with_turn_end(fmt, &tok, eos);
+    eprintln!(
+        "[loaded Raon-1: {} layers, hidden {}, {} streams, {:.1} GB checkpoint ({}), {:?} weights, {} threads, {:.2}s]",
+        model.cfg.num_hidden_layers,
+        model.cfg.hidden_size,
+        model.cfg.streams(),
+        files.total_bytes() as f64 / 1e9,
+        if args.mmap { "mmap" } else { "in RAM" },
+        model.quant,
+        pool::threads(),
+        t0.elapsed().as_secs_f64()
+    );
+    if let Some(out) = &args.save_quantized {
+        return save_quantized(&args.model, out, &files, model.quant);
+    }
+    let streamer = if args.stream {
+        Some(start_stream(&args, |o| oxinfer::stream::attach_raon(&mut model, &files, o))?)
+    } else {
+        None
+    };
+    *STREAM.lock().unwrap() = streamer.clone();
+    TRACE.store(args.stream_trace, std::sync::atomic::Ordering::Relaxed);
+    let r = run_text(&args, &model, &tok, &eos, fmt, Default::default());
     *STREAM.lock().unwrap() = None;
     model.set_stream(None);
     drop(streamer);

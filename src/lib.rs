@@ -86,6 +86,7 @@ pub mod qwen_image;
 pub mod qwen_mtp;
 pub mod qwen_vision;
 pub mod qwen_vl;
+pub mod raon;
 pub mod resample;
 pub mod sae;
 pub mod safetensors;
