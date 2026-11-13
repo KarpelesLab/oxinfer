@@ -340,7 +340,8 @@ unsafe fn dot32(w: *const i8, x: *const i8) -> __m256i {
 }
 
 /// `p[g] = s[g] * xs[g / 2] * (sum of q * xq over the 16 elements of group g)` for the `bs / 16`
-/// groups of one block: the terms the portable kernel adds up, bit for bit.
+/// groups of one block (of 32, 64, 128 or 256 elements; nothing past the block is read): the
+/// terms the portable kernel adds up, bit for bit.
 #[inline(always)]
 unsafe fn products(q: *const i8, s: &[f32; 16], xq: *const i8, xs: *const f32, bs: usize, p: &mut [f32; 16]) {
     if bs == QBLOCK {
@@ -354,11 +355,23 @@ unsafe fn products(q: *const i8, s: &[f32; 16], xq: *const i8, xs: *const f32, b
         p[1] = s[1] * *xs * _mm_extract_epi32::<1>(t) as f32;
         return;
     }
-    debug_assert_eq!(bs, QK_K);
+    if bs == 2 * QBLOCK {
+        // Two blocks of 32 (Q2_0): [a01, a23, b01, b23 | a45, a67, b45, b67], added pairwise.
+        let t = _mm256_hadd_epi32(dot32(q, xq), dot32(q.add(32), xq.add(32)));
+        let t = _mm256_hadd_epi32(t, t);
+        let (lo, hi) = (_mm256_castsi256_si128(t), _mm256_extracti128_si256::<1>(t));
+        p[0] = s[0] * *xs * _mm_cvtsi128_si32(lo) as f32;
+        p[1] = s[1] * *xs * _mm_cvtsi128_si32(hi) as f32;
+        p[2] = s[2] * *xs.add(1) * _mm_extract_epi32::<1>(lo) as f32;
+        p[3] = s[3] * *xs.add(1) * _mm_extract_epi32::<1>(hi) as f32;
+        return;
+    }
+    // Blocks of 128 (Q1_0, PQ2_0, PTQ1_0) are one half of a super-block of 256.
+    debug_assert!(bs == QK_K || bs == QK_K / 2);
     // Natural group order from [a_lo, b_lo, c_lo, d_lo | a_hi, b_hi, c_hi, d_hi].
     let order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
     let twice = _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3);
-    for h in 0..2 {
+    for h in 0..bs / 128 {
         let (qh, xh) = (q.add(128 * h), xq.add(128 * h));
         let t0 = _mm256_hadd_epi32(dot32(qh, xh), dot32(qh.add(32), xh.add(32)));
         let t1 = _mm256_hadd_epi32(dot32(qh.add(64), xh.add(64)), dot32(qh.add(96), xh.add(96)));
