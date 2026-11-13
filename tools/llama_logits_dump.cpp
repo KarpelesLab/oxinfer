@@ -1,4 +1,5 @@
-// Greedy reference run: lgdump MODEL NGL IDS_FILE N_GEN OUT_BIN [THREADS]
+// Greedy reference run: lgdump MODEL NGL IDS_FILE N_GEN OUT_BIN [THREADS] [CTX] [f32]
+// (`f32`: a float32 KV cache instead of llama.cpp's float16 one, for tiny random checkpoints.)
 // Feeds the token ids (whitespace separated) as one batch, then generates N_GEN tokens greedily
 // one at a time. Writes, per step (the prompt's last position, then each generated token), the
 // full f32 output row; prints the chosen ids.
@@ -7,11 +8,12 @@
 #include <cstdlib>
 #include <vector>
 #include <fstream>
+#include <string>
 #include <chrono>
 
 int main(int argc, char ** argv) {
     if (argc < 6) {
-        fprintf(stderr, "usage: %s MODEL NGL IDS_FILE N_GEN OUT_BIN [THREADS] [CTX]\n", argv[0]);
+        fprintf(stderr, "usage: %s MODEL NGL IDS_FILE N_GEN OUT_BIN [THREADS] [CTX] [f32]\n", argv[0]);
         return 1;
     }
     const char * path = argv[1];
@@ -36,6 +38,10 @@ int main(int argc, char ** argv) {
     cp.n_ctx = n_ctx;
     cp.n_batch = n_ctx;
     cp.n_ubatch = 512;
+    if (argc > 8 && std::string(argv[8]) == "f32") {
+        cp.type_k = GGML_TYPE_F32;
+        cp.type_v = GGML_TYPE_F32;
+    }
     cp.n_threads = threads;
     cp.n_threads_batch = threads;
     llama_context * ctx = llama_init_from_model(model, cp);
