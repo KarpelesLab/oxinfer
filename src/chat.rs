@@ -308,20 +308,32 @@ impl ChatFormat for Gemma3Chat {
 pub struct QwenChat {
     pub reasoning_effort: bool,
     pub qwen3: bool,
+    /// The template has no thinking block at all (Qwen3 checkpoints trained without one, such as
+    /// MNN-Pocket): the reply follows the assistant header directly, thinking on or off.
+    pub no_think: bool,
 }
 
 /// Qwen3.5, Qwen3.8 (with the reasoning-effort instruction) and Qwen3 formats.
 pub static QWEN: QwenChat = QwenChat {
     reasoning_effort: false,
     qwen3: false,
+    no_think: false,
 };
 pub static QWEN_EFFORT: QwenChat = QwenChat {
     reasoning_effort: true,
     qwen3: false,
+    no_think: false,
 };
 pub static QWEN3: QwenChat = QwenChat {
     reasoning_effort: false,
     qwen3: true,
+    no_think: false,
+};
+/// Qwen3's format without its thinking block.
+pub static QWEN3_PLAIN: QwenChat = QwenChat {
+    reasoning_effort: false,
+    qwen3: true,
+    no_think: true,
 };
 
 impl QwenChat {
@@ -345,6 +357,7 @@ impl QwenChat {
     pub fn for_template(template: Option<&str>) -> &'static QwenChat {
         match template {
             Some(t) if t.contains("reasoning_effort") => &QWEN_EFFORT,
+            Some(t) if t.contains("<function-name>") && !t.contains("<think>") => &QWEN3_PLAIN,
             Some(t) if t.contains("<function-name>") => &QWEN3,
             _ => &QWEN,
         }
@@ -382,7 +395,7 @@ impl ChatFormat for QwenChat {
         "<|im_end|>"
     }
     fn think_tokens(&self) -> (&'static str, &'static str) {
-        ("<think>", "</think>")
+        if self.no_think { ("", "") } else { ("<think>", "</think>") }
     }
     fn starts_in_thinking(&self, think: bool) -> bool {
         think && !self.qwen3
@@ -460,6 +473,7 @@ impl QwenChat {
     /// What follows the assistant header in the generation prompt.
     fn think_tail(&self, think: bool) -> &'static str {
         match (think, self.qwen3) {
+            _ if self.no_think => "",
             (false, _) => "<think>\n\n</think>\n\n",
             (true, false) => "<think>\n",
             (true, true) => "",
@@ -1954,6 +1968,32 @@ mod tests {
     use super::*;
 
     const M27: &str = "You are a helpful assistant. Your name is MiniMax-M2.7 and is built by MiniMax.";
+
+    /// A Qwen3 template without a thinking block (MNN-Pocket-0.3B's): nothing after the header.
+    #[test]
+    fn qwen3_template_without_thinking() {
+        let with = "{{- '<think>\\n\\n</think>\\n\\n' }} {\"name\": <function-name>, \"arguments\": <args-json-object>}";
+        let without = "{\"name\": <function-name>, \"arguments\": <args-json-object>} {{- '<|im_start|>assistant\\n' }}";
+        assert!(!QwenChat::for_template(Some(with)).no_think);
+        let f = QwenChat::for_template(Some(without));
+        assert!(f.qwen3 && f.no_think);
+        for think in [false, true] {
+            assert_eq!(
+                f.first_turn(Some("Be brief."), think, &[], "Hi"),
+                "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n"
+            );
+            assert!(!f.starts_in_thinking(think));
+        }
+        assert_eq!(f.think_tokens(), ("", ""));
+        let results = [ToolResult {
+            name: "weather".into(),
+            content: "21".into(),
+        }];
+        assert_eq!(
+            f.tool_results(&results, false),
+            "<|im_end|>\n<|im_start|>user\n<tool_response>\n21\n</tool_response><|im_end|>\n<|im_start|>assistant\n"
+        );
+    }
 
     fn m27() -> MiniMaxChat {
         MiniMaxChat::for_template(Some(&format!("{{%- set model_identity = \"{M27}\" -%}}")))

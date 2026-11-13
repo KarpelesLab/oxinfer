@@ -294,6 +294,9 @@ const GLM_TINY: &str = "text only (no vision tower, no MTP); only its header was
 /// Qwen3.8-27B, parameters x bits where the note says so; the other chat models get no speed
 /// estimate.
 pub const CATALOG: &[Model] = &[
+    Model::new("taobao-mnn/MNN-Pocket-0.3B", Kind::Chat, 0.36, 0.72, &[Text])
+        .speed(0.61, 28)
+        .note("a small Qwen3 without a thinking block"),
     Model::new("Qwen/Qwen3.5-0.8B", Kind::Chat, 0.8, 1.7, QWEN_VL).speed(1.50, 24),
     Model::new("bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M", Kind::Chat, 1.2, 0.8, &[Text])
         .fixed(Format::GgufQ4K, "GGUF Q4_K_M")

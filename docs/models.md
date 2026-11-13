@@ -19,6 +19,7 @@
 | mlx-community/gemma-4-26b-a4b-it-4bit | 25.8B MoE | 15.4 GB (MLX 4-bit) | text and images (4-bit `switch_glu` experts) |
 | Gemma 4 GGUF (ggml-org/gemma-4-26B-A4B-it-GGUF, unsloth, bartowski, ...) | 25.8B MoE tested | 14.6 GB (Q4_0) - 27 GB (Q8_0) | text; same next token as transformers and llama.cpp (see [Gemma 4 26B-A4B](gemma-4-26b.md#gemma-4-26b-a4b-moe)) |
 | mlx-community/Qwen3-4B-4bit (Qwen3 dense) | 4.0B | 2.3 GB (MLX 4-bit) | text; matches the reference on the same weights (same top 10) |
+| taobao-mnn/MNN-Pocket-0.3B (a small Qwen3, bf16 safetensors; its chat template has no thinking block) | 0.36B | 0.72 GB | text; matches transformers float32 (max logit diff 5e-5 on three prompts of 16 to 1299 tokens, same greedy tokens on the CPU and with CUDA decoding); the prompt follows its template (no `<think>` block after the assistant header) |
 | mlx-community/gemma-3-4b-it-4bit (Gemma 3) | 4.3B | 3.4 GB (MLX 4-bit) | text only; matches the reference, also past the 1024-token window |
 | google/embeddinggemma-300m | 0.3B | 1.2 GB (fp32) | embeddings; matches sentence-transformers (see [Embeddings](embeddings.md#embeddings)) |
 | Qwen/Qwen3-Embedding-0.6B | 0.6B | 1.2 GB | embeddings; matches sentence-transformers |
