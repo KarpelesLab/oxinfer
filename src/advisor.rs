@@ -137,19 +137,96 @@ pub enum Source {
     Fixed(Format, &'static str),
 }
 
+/// What a model can do, as `--can` takes it and the table prints it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cap {
+    /// Text in, text out.
+    Text,
+    ImageInput,
+    VideoInput,
+    AudioInput,
+    /// A thinking block before the answer (`--think`).
+    Thinking,
+    /// Tool calls in the model's own format (`--tools`, the server's `tools`).
+    Tools,
+    /// Typed decisions (`--decide`, `/v1/decide`).
+    Decisions,
+    Embeddings,
+    TextToImage,
+    ImageToImage,
+    /// Editing an image from an instruction.
+    ImageEdit,
+    Inpainting,
+    /// A control image (edges, depth) or a ControlNet.
+    Control,
+    SpeechToText,
+    /// Speech in any language to English text.
+    Translation,
+    TextToSpeech,
+    VoiceCloning,
+}
+
+impl Cap {
+    pub const ALL: [Cap; 17] = [
+        Cap::Text,
+        Cap::ImageInput,
+        Cap::VideoInput,
+        Cap::AudioInput,
+        Cap::Thinking,
+        Cap::Tools,
+        Cap::Decisions,
+        Cap::Embeddings,
+        Cap::TextToImage,
+        Cap::ImageToImage,
+        Cap::ImageEdit,
+        Cap::Inpainting,
+        Cap::Control,
+        Cap::SpeechToText,
+        Cap::Translation,
+        Cap::TextToSpeech,
+        Cap::VoiceCloning,
+    ];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Cap::Text => "text",
+            Cap::ImageInput => "image-input",
+            Cap::VideoInput => "video-input",
+            Cap::AudioInput => "audio-input",
+            Cap::Thinking => "thinking",
+            Cap::Tools => "tools",
+            Cap::Decisions => "decisions",
+            Cap::Embeddings => "embeddings",
+            Cap::TextToImage => "text-to-image",
+            Cap::ImageToImage => "image-to-image",
+            Cap::ImageEdit => "image-edit",
+            Cap::Inpainting => "inpainting",
+            Cap::Control => "control",
+            Cap::SpeechToText => "speech-to-text",
+            Cap::Translation => "translation",
+            Cap::TextToSpeech => "text-to-speech",
+            Cap::VoiceCloning => "voice-cloning",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Cap::ALL.into_iter().find(|c| c.as_str() == s)
+    }
+}
+
 /// One tested model.
 #[derive(Clone, Copy, Debug)]
 pub struct Model {
     /// What `--model` takes.
     pub repo: &'static str,
     pub kind: Kind,
+    pub caps: &'static [Cap],
     /// Total parameters, in billions.
     pub params_b: f64,
     pub source: Source,
     /// Bytes to download (all the files the model needs), in GB.
     pub download_gb: f64,
-    /// Bytes read per decoded token as stored, in GB (the loader's `streaming N GB/token`); 0 for
-    /// the kinds without a speed estimate.
+    /// Bytes read per decoded token as stored, in GB (the loader's `streaming N GB/token`); 0
+    /// where no speed is estimated (the kinds other than chat, and the chat models whose bytes
+    /// per token were not measured).
     pub token_gb: f64,
     /// Transformer layers of the language model (0 where no speed is estimated).
     pub layers: u16,
@@ -159,217 +236,289 @@ pub struct Model {
     pub note: &'static str,
 }
 
-const fn chat(repo: &'static str, params_b: f64, download_gb: f64, token_gb: f64, layers: u16) -> Model {
-    Model {
-        repo,
-        kind: Kind::Chat,
-        params_b,
-        source: Source::Safetensors,
-        download_gb,
-        token_gb,
-        layers,
-        moe: false,
-        note: "",
+impl Model {
+    const fn new(repo: &'static str, kind: Kind, params_b: f64, download_gb: f64, caps: &'static [Cap]) -> Model {
+        Model {
+            repo,
+            kind,
+            caps,
+            params_b,
+            source: Source::Safetensors,
+            download_gb,
+            token_gb: 0.0,
+            layers: 0,
+            moe: false,
+            note: "",
+        }
+    }
+    /// Bytes read per token (GB) and layers: the model gets a speed estimate.
+    const fn speed(mut self, token_gb: f64, layers: u16) -> Model {
+        self.token_gb = token_gb;
+        self.layers = layers;
+        self
+    }
+    /// Stored in one fixed format (a GGUF file, an MLX 4-bit folder, FP8 / NVFP4 weights).
+    const fn fixed(mut self, format: Format, label: &'static str) -> Model {
+        self.source = Source::Fixed(format, label);
+        self
+    }
+    const fn moe(mut self) -> Model {
+        self.moe = true;
+        self
+    }
+    const fn note(mut self, note: &'static str) -> Model {
+        self.note = note;
+        self
+    }
+    pub fn can(&self, cap: Cap) -> bool {
+        self.caps.contains(&cap)
     }
 }
 
-const fn fixed(repo: &'static str, params_b: f64, format: Format, label: &'static str, gb: f64, token_gb: f64, layers: u16) -> Model {
-    Model {
-        repo,
-        kind: Kind::Chat,
-        params_b,
-        source: Source::Fixed(format, label),
-        download_gb: gb,
-        token_gb,
-        layers,
-        moe: false,
-        note: "",
-    }
-}
+use Cap::*;
+const QWEN_VL: &[Cap] = &[Text, ImageInput, VideoInput, Thinking, Tools];
+const GEMMA_E: &[Cap] = &[Text, ImageInput, VideoInput, AudioInput, Thinking, Tools];
+const GEMMA_L: &[Cap] = &[Text, ImageInput, Thinking, Tools];
+const AGENT: &[Cap] = &[Text, Thinking, Tools];
+const EMBED: &[Cap] = &[Embeddings];
+const STT: &[Cap] = &[SpeechToText, Translation];
+const EDIT: &[Cap] = &[ImageEdit];
+const JANUS: &[Cap] = &[TextToImage, ImageInput, Text];
+const PARAMS: &str = "bytes per token and layers from the parameter count";
 
-const fn other(repo: &'static str, kind: Kind, params_b: f64, download_gb: f64, note: &'static str) -> Model {
-    Model {
-        repo,
-        kind,
-        params_b,
-        source: Source::Safetensors,
-        download_gb,
-        token_gb: 0.0,
-        layers: 0,
-        moe: false,
-        note,
-    }
-}
-
-const fn moe(mut m: Model) -> Model {
-    m.moe = true;
-    m
-}
-
-const fn noted(mut m: Model, note: &'static str) -> Model {
-    m.note = note;
-    m
-}
-
-/// The models oxinfer was run with. Bytes per token: the loader's report where the checkpoint
-/// was loaded (Qwen3.5-0.8B / 9B, Qwen3-4B 4-bit, Gemma 4 26B-A4B 4-bit, Llama 3.2 1B), the
-/// README's performance table for Gemma 4 and Qwen3.8-27B, and parameters x bits for the three
-/// largest (marked in their notes).
+/// The models oxinfer was run with (the README's model table), by kind and size. What each can
+/// do is what the README states for it. Bytes per token: the loader's report where the
+/// checkpoint was loaded for the measurements of this file (Qwen3.5-0.8B / 9B, Qwen3-4B 4-bit,
+/// Gemma 4 26B-A4B 4-bit, Llama 3.2 1B), the README's performance table for Gemma 4 and
+/// Qwen3.8-27B, parameters x bits where the note says so; the other chat models get no speed
+/// estimate.
 pub const CATALOG: &[Model] = &[
-    chat("Qwen/Qwen3.5-0.8B", 0.8, 1.7, 1.50, 24),
-    fixed(
-        "bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M",
-        1.2,
-        Format::GgufQ4K,
-        "GGUF Q4_K_M",
-        0.8,
-        0.80,
-        16,
+    Model::new("Qwen/Qwen3.5-0.8B", Kind::Chat, 0.8, 1.7, QWEN_VL).speed(1.50, 24),
+    Model::new("bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M", Kind::Chat, 1.2, 0.8, &[Text])
+        .fixed(Format::GgufQ4K, "GGUF Q4_K_M")
+        .speed(0.80, 16),
+    Model::new("bartowski/Llama-3.2-1B-Instruct-GGUF:Q8_0", Kind::Chat, 1.2, 1.3, &[Text])
+        .fixed(Format::GgufQ8, "GGUF Q8_0")
+        .speed(1.31, 16),
+    Model::new("Qwen/Qwen2.5-VL-3B-Instruct", Kind::Chat, 3.8, 7.5, &[Text, ImageInput]),
+    Model::new("mlx-community/Qwen3-4B-4bit", Kind::Chat, 4.0, 2.4, AGENT)
+        .fixed(Format::Q4, "MLX 4-bit")
+        .speed(2.39, 36),
+    Model::new("mlx-community/gemma-3-4b-it-4bit", Kind::Chat, 4.3, 3.4, &[Text]).fixed(Format::Q4, "MLX 4-bit"),
+    Model::new("google/gemma-4-E2B-it", Kind::Chat, 5.1, 10.2, GEMMA_E).speed(4.6, 35),
+    Model::new(
+        "mlx-community/gemma-4-e2b-it-4bit",
+        Kind::Chat,
+        5.1,
+        3.6,
+        &[Text, ImageInput, AudioInput],
+    )
+    .fixed(Format::Q4, "MLX 4-bit"),
+    Model::new("MiniMaxAI/SynLogic-7B", Kind::Chat, 7.6, 15.0, &[Text]).note("a Qwen2.5 fine-tune"),
+    Model::new("google/gemma-4-E4B-it", Kind::Chat, 8.0, 16.0, GEMMA_E).speed(9.3, 42),
+    Model::new(
+        "mlx-community/gemma-4-e4b-it-4bit",
+        Kind::Chat,
+        8.0,
+        5.2,
+        &[Text, ImageInput, AudioInput],
+    )
+    .fixed(Format::Q4, "MLX 4-bit"),
+    Model::new("Qwen/Qwen2.5-VL-7B-Instruct", Kind::Chat, 8.3, 16.6, &[Text, ImageInput]),
+    Model::new("Qwen/Qwen3.5-9B", Kind::Chat, 9.0, 19.3, QWEN_VL).speed(15.87, 32),
+    Model::new("autotrust/JEV-9B", Kind::Chat, 9.0, 18.2, &[Decisions, Text]).note("typed decisions; image decisions with its vl/ folder"),
+    Model::new("google/gemma-4-12B-it", Kind::Chat, 12.0, 24.0, GEMMA_L).note("supported, untested"),
+    Model::new("google/gemma-4-26B-A4B-it", Kind::Chat, 25.8, 52.0, GEMMA_L)
+        .speed(7.6, 30)
+        .moe(),
+    Model::new("mlx-community/gemma-4-26b-a4b-it-4bit", Kind::Chat, 25.8, 15.4, &[Text, ImageInput])
+        .fixed(Format::Q4, "MLX 4-bit")
+        .speed(2.26, 30)
+        .moe(),
+    Model::new("ggml-org/gemma-4-26B-A4B-it-GGUF:Q4_0", Kind::Chat, 25.8, 14.6, &[Text])
+        .fixed(Format::GgufQ4, "GGUF Q4_0")
+        .moe(),
+    Model::new("autotrust/GEV-26B-Decide", Kind::Chat, 25.8, 52.2, &[Decisions, Text, ImageInput])
+        .moe()
+        .note("typed decisions over text and images"),
+    Model::new("MiniMaxAI/MiniMax-H3-Image-PE", Kind::Chat, 27.4, 18.0, &[Text, Thinking])
+        .fixed(Format::Q4, "NVFP4")
+        .note("the prompt enhancer of MiniMax-H3-Image (Qwen3.5-27B)"),
+    Model::new("Qwen/Qwen3.8-27B", Kind::Chat, 27.8, 55.6, QWEN_VL).speed(51.0, 64),
+    Model::new("autotrust/JEV-27B", Kind::Chat, 27.8, 54.4, &[Decisions, Text]).note("typed decisions"),
+    Model::new("autotrust/JEV-27B-VL", Kind::Chat, 27.8, 56.1, &[Decisions, Text, ImageInput]).note("typed decisions over text and images"),
+    Model::new("google/gemma-4-31B-it", Kind::Chat, 31.0, 62.0, GEMMA_L).note("supported, untested"),
+    Model::new("MiniMaxAI/SynLogic-32B", Kind::Chat, 32.8, 66.0, &[Text]).note("a Qwen2.5 fine-tune"),
+    Model::new("Qwen/Qwen3.6-35B-A3B", Kind::Chat, 35.0, 69.0, AGENT)
+        .speed(6.0, 40)
+        .moe()
+        .note("bytes per token from the active parameter count"),
+    Model::new("unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL", Kind::Chat, 125.0, 111.0, AGENT)
+        .fixed(Format::GgufQ4K, "GGUF UD-Q4_K_XL")
+        .speed(3.8, 48)
+        .moe()
+        .note("29 GB of it an n-gram table read a few rows a token; bytes per token and layers from the parameter count"),
+    Model::new("unsloth/MiniMax-M3.1-Flash-GGUF:UD-Q2_K_XL", Kind::Chat, 220.0, 144.0, AGENT)
+        .fixed(Format::GgufLow, "GGUF UD-Q2_K_XL")
+        .moe(),
+    Model::new("unsloth/MiniMax-M2.7-GGUF:UD-Q4_K_XL", Kind::Chat, 229.0, 141.0, AGENT)
+        .fixed(Format::GgufQ4K, "GGUF UD-Q4_K_XL")
+        .moe(),
+    Model::new("MiniMaxAI/MiniMax-M2.7", Kind::Chat, 229.0, 230.0, AGENT)
+        .fixed(Format::Q8, "FP8")
+        .moe(),
+    Model::new("unsloth/DeepSeek-V4-Flash-GGUF:UD-Q2_K_XL", Kind::Chat, 284.0, 97.0, AGENT)
+        .fixed(Format::GgufLow, "GGUF UD-Q2_K_XL")
+        .speed(4.4, 48)
+        .moe()
+        .note(PARAMS),
+    Model::new(
+        "MiniMaxAI/MiniMax-M3",
+        Kind::Chat,
+        427.0,
+        854.0,
+        &[Text, ImageInput, Thinking, Tools],
+    )
+    .moe(),
+    Model::new("MiniMaxAI/MiniMax-Text-01", Kind::Chat, 456.0, 912.0, &[Text, Tools]).moe(),
+    Model::new("MiniMaxAI/MiniMax-VL-01", Kind::Chat, 456.0, 913.0, &[Text, ImageInput, Tools]).moe(),
+    Model::new(
+        "unsloth/Mistral-Large-4-1T-A52B-GGUF:UD-Q2_K_XL",
+        Kind::Chat,
+        1000.0,
+        378.0,
+        &[Text, ImageInput, Tools],
+    )
+    .fixed(Format::GgufLow, "GGUF UD-Q2_K_XL")
+    .speed(19.6, 48)
+    .moe()
+    .note(PARAMS),
+    Model::new("sentence-transformers/all-MiniLM-L6-v2", Kind::Embedding, 0.023, 0.09, EMBED),
+    Model::new("BAAI/bge-small-en-v1.5", Kind::Embedding, 0.033, 0.13, EMBED),
+    Model::new(
+        "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        Kind::Embedding,
+        0.118,
+        0.47,
+        EMBED,
     ),
-    fixed(
-        "bartowski/Llama-3.2-1B-Instruct-GGUF:Q8_0",
-        1.2,
-        Format::GgufQ8,
-        "GGUF Q8_0",
-        1.3,
-        1.31,
-        16,
-    ),
-    fixed("mlx-community/Qwen3-4B-4bit", 4.0, Format::Q4, "MLX 4-bit", 2.4, 2.39, 36),
-    chat("google/gemma-4-E2B-it", 5.1, 10.2, 4.6, 35),
-    chat("google/gemma-4-E4B-it", 8.0, 16.0, 9.3, 42),
-    chat("Qwen/Qwen3.5-9B", 9.0, 19.3, 15.87, 32),
-    moe(chat("google/gemma-4-26B-A4B-it", 25.8, 52.0, 7.6, 30)),
-    moe(fixed(
-        "mlx-community/gemma-4-26b-a4b-it-4bit",
-        25.8,
-        Format::Q4,
-        "MLX 4-bit",
-        15.4,
-        2.26,
-        30,
-    )),
-    chat("Qwen/Qwen3.8-27B", 27.8, 55.6, 51.0, 64),
-    noted(
-        moe(chat("Qwen/Qwen3.6-35B-A3B", 35.0, 69.0, 6.0, 40)),
-        "bytes per token from the active parameter count",
-    ),
-    noted(
-        moe(fixed(
-            "unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL",
-            125.0,
-            Format::GgufQ4K,
-            "GGUF UD-Q4_K_XL",
-            111.0,
-            3.8,
-            48,
-        )),
-        "29 GB of it an n-gram table read a few rows a token; bytes per token and layers from the parameter count",
-    ),
-    noted(
-        moe(fixed(
-            "unsloth/DeepSeek-V4-Flash-GGUF:UD-Q2_K_XL",
-            284.0,
-            Format::GgufLow,
-            "GGUF UD-Q2_K_XL",
-            97.0,
-            4.4,
-            48,
-        )),
-        "bytes per token and layers from the parameter count",
-    ),
-    noted(
-        moe(fixed(
-            "unsloth/Mistral-Large-4-1T-A52B-GGUF:UD-Q2_K_XL",
-            1000.0,
-            Format::GgufLow,
-            "GGUF UD-Q2_K_XL",
-            378.0,
-            19.6,
-            48,
-        )),
-        "bytes per token and layers from the parameter count",
-    ),
-    other("BAAI/bge-small-en-v1.5", Kind::Embedding, 0.033, 0.13, ""),
-    other("google/embeddinggemma-300m", Kind::Embedding, 0.3, 1.2, ""),
-    other("Qwen/Qwen3-Embedding-0.6B", Kind::Embedding, 0.6, 1.2, ""),
-    other("BAAI/bge-m3", Kind::Embedding, 0.6, 2.3, "dense, sparse and ColBERT"),
-    other("NovaSearch/stella_en_1.5B_v5", Kind::Embedding, 1.5, 6.2, ""),
-    other("Alibaba-NLP/gte-Qwen2-1.5B-instruct", Kind::Embedding, 1.5, 7.1, ""),
-    other("openai/whisper-tiny", Kind::Speech, 0.039, 0.15, ""),
-    other("openai/whisper-small", Kind::Speech, 0.24, 0.97, ""),
-    other("openai/whisper-large-v3-turbo", Kind::Speech, 0.81, 1.6, ""),
-    other("openai/whisper-large-v3", Kind::Speech, 1.55, 3.1, ""),
-    other(
-        "isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF",
+    Model::new("intfloat/multilingual-e5-small", Kind::Embedding, 0.118, 0.47, EMBED).note("size from the parameter count"),
+    Model::new("google/embeddinggemma-300m", Kind::Embedding, 0.3, 1.2, EMBED),
+    Model::new("mixedbread-ai/mxbai-embed-large-v1", Kind::Embedding, 0.335, 1.3, EMBED),
+    Model::new("Qwen/Qwen3-Embedding-0.6B", Kind::Embedding, 0.6, 1.2, EMBED),
+    Model::new("BAAI/bge-m3", Kind::Embedding, 0.6, 2.3, EMBED).note("dense, sparse and ColBERT"),
+    Model::new("NovaSearch/stella_en_1.5B_v5", Kind::Embedding, 1.5, 6.2, EMBED).note("a head per output size (--dim)"),
+    Model::new("Alibaba-NLP/gte-Qwen2-1.5B-instruct", Kind::Embedding, 1.5, 7.1, EMBED),
+    Model::new("openai/whisper-tiny", Kind::Speech, 0.039, 0.15, STT),
+    Model::new("openai/whisper-base", Kind::Speech, 0.074, 0.29, STT),
+    Model::new("openai/whisper-small", Kind::Speech, 0.24, 0.97, STT),
+    Model::new("distil-whisper/distil-large-v3", Kind::Speech, 0.756, 1.5, &[SpeechToText]).note("English"),
+    Model::new("openai/whisper-medium", Kind::Speech, 0.769, 3.1, STT),
+    Model::new("openai/whisper-large-v3-turbo", Kind::Speech, 0.809, 1.6, &[SpeechToText]),
+    Model::new("openai/whisper-large-v3", Kind::Speech, 1.55, 3.1, STT),
+    Model::new("isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF", Kind::Tts, 3.3, 2.5, &[TextToSpeech]).note("with hubertsiuzdak/snac_24khz"),
+    Model::new("lex-au/Orpheus-3b-FT-Q8_0.gguf", Kind::Tts, 3.3, 4.1, &[TextToSpeech]).note("with hubertsiuzdak/snac_24khz"),
+    Model::new("unsloth/orpheus-3b-0.1-ft", Kind::Tts, 3.3, 6.7, &[TextToSpeech]).note("with hubertsiuzdak/snac_24khz"),
+    Model::new(
+        "unsloth/orpheus-3b-0.1-pretrained",
         Kind::Tts,
         3.3,
-        2.5,
-        "with hubertsiuzdak/snac_24khz",
-    ),
-    other("unsloth/orpheus-3b-0.1-ft", Kind::Tts, 3.3, 6.7, "with hubertsiuzdak/snac_24khz"),
-    other(
+        6.7,
+        &[TextToSpeech, VoiceCloning],
+    )
+    .note("voice cloning from a reference clip"),
+    Model::new(
         "stable-diffusion-v1-5/stable-diffusion-v1-5",
         Kind::Image,
         1.1,
         2.0,
-        "text to image, image to image, inpainting",
+        &[TextToImage, ImageToImage, Inpainting],
     ),
-    other("stabilityai/sd-turbo", Kind::Image, 1.3, 2.6, "one step"),
-    other(
-        "deepseek-ai/JanusFlow-1.3B",
+    Model::new(
+        "stable-diffusion-v1-5/stable-diffusion-inpainting",
         Kind::Image,
+        1.1,
         2.0,
-        4.4,
-        "384x384, also image understanding",
+        &[Inpainting],
     ),
-    other(
-        "deepseek-ai/Janus-Pro-1B",
+    Model::new("timbrooks/instruct-pix2pix", Kind::Image, 1.1, 2.0, EDIT),
+    Model::new("vinesmsuic/magicbrush-jul7", Kind::Image, 1.1, 4.3, EDIT),
+    Model::new("stabilityai/sd-turbo", Kind::Image, 1.3, 2.6, &[TextToImage, ImageToImage]).note("one step"),
+    Model::new("deepseek-ai/JanusFlow-1.3B", Kind::Image, 2.0, 4.4, JANUS).note("384x384"),
+    Model::new("deepseek-ai/Janus-Pro-1B", Kind::Image, 2.1, 4.2, JANUS).note("384x384"),
+    Model::new("stabilityai/sdxl-turbo", Kind::Image, 3.5, 7.0, &[TextToImage, ImageToImage]).note("fp16 files"),
+    Model::new(
+        "stabilityai/stable-diffusion-xl-base-1.0",
         Kind::Image,
-        2.1,
-        4.2,
-        "384x384, also image understanding",
-    ),
-    other("stabilityai/sdxl-turbo", Kind::Image, 3.5, 7.0, "fp16 files"),
-    other("stabilityai/stable-diffusion-xl-base-1.0", Kind::Image, 3.5, 7.0, "fp16 files"),
-    other(
-        "deepseek-ai/Janus-Pro-7B",
+        3.5,
+        7.0,
+        &[TextToImage, ImageToImage, Inpainting],
+    )
+    .note("fp16 files"),
+    Model::new("deepseek-ai/Janus-Pro-7B", Kind::Image, 7.4, 14.8, JANUS).note("384x384"),
+    Model::new(
+        "v2ray/stable-diffusion-3-medium-diffusers",
         Kind::Image,
-        7.4,
-        14.8,
-        "384x384, also image understanding",
-    ),
-    other(
+        7.2,
+        15.3,
+        &[TextToImage, ImageToImage],
+    )
+    .note("with T5-XXL; --no-t5 saves 9.5 GB"),
+    Model::new(
         "adamo1139/stable-diffusion-3.5-medium-ungated",
         Kind::Image,
         7.6,
         16.0,
-        "with T5-XXL; --no-t5 saves 9.5 GB",
-    ),
-    other(
-        "city96/FLUX.1-schnell-gguf",
+        &[TextToImage, ImageToImage],
+    )
+    .note("with T5-XXL; --no-t5 saves 9.5 GB"),
+    Model::new("city96/FLUX.1-schnell-gguf", Kind::Image, 12.0, 16.6, &[TextToImage])
+        .note("Q4_0 transformer + T5 / CLIP / VAE of --base; 4 steps"),
+    Model::new(
+        "city96/FLUX.1-dev-gguf",
         Kind::Image,
         12.0,
         16.6,
-        "Q4_0 transformer + T5 / CLIP / VAE of --base",
-    ),
-    other(
+        &[TextToImage, ImageToImage, Inpainting, Control],
+    )
+    .note("Q4_0 transformer + T5 / CLIP / VAE of --base; LoRAs, Canny / Depth control LoRAs, Redux"),
+    Model::new(
+        "QuantStack/FLUX.1-Kontext-dev-GGUF",
+        Kind::Image,
+        17.0,
+        16.6,
+        &[ImageEdit, TextToImage],
+    )
+    .note("Q4_0 transformer + T5 / CLIP / VAE of unsloth/FLUX.1-Kontext-dev"),
+    Model::new(
         "ByteDance-Seed/BAGEL-7B-MoT",
         Kind::Image,
         14.0,
         29.5,
-        "editing, text to image, understanding",
+        &[ImageEdit, TextToImage, ImageInput, Text, Thinking],
     ),
-    other("OmniGen2/OmniGen2", Kind::Image, 7.8, 31.2, "editing, in-context generation"),
-    other("unsloth/FLUX.1-Kontext-dev", Kind::Image, 17.0, 33.3, "instruction editing"),
-    other("stepfun-ai/Step1X-Edit-v1p2", Kind::Image, 20.7, 41.8, "instruction editing"),
-    other(
-        "Qwen/Qwen-Image-Edit-2511",
+    Model::new(
+        "OmniGen2/OmniGen2",
+        Kind::Image,
+        7.8,
+        31.2,
+        &[ImageEdit, TextToImage, ImageInput, Text],
+    )
+    .note("up to 5 input images"),
+    Model::new("unsloth/FLUX.1-Kontext-dev", Kind::Image, 17.0, 33.3, &[ImageEdit, TextToImage]),
+    Model::new("stepfun-ai/Step1X-Edit-v1p1-diffusers", Kind::Image, 20.7, 41.8, EDIT),
+    Model::new("stepfun-ai/Step1X-Edit-v1p2", Kind::Image, 20.7, 41.8, &[ImageEdit, Thinking]),
+    Model::new(
+        "Qwen/Qwen-Image-2512",
         Kind::Image,
         28.3,
         57.9,
-        "instruction editing; Qwen/Qwen-Image-2512 for text to image",
-    ),
+        &[TextToImage, ImageToImage, Inpainting, Control],
+    )
+    .note("ControlNet: InstantX/Qwen-Image-ControlNet-Union"),
+    Model::new("Qwen/Qwen-Image-Edit-2511", Kind::Image, 28.3, 57.9, &[ImageEdit, Inpainting]).note("one or more input images"),
+    Model::new("MiniMaxAI/MiniMax-H3-Image", Kind::Image, 63.0, 127.2, &[TextToImage])
+        .note("with MiniMax-H3's Qwen3-VL text encoder; 2048x2048 and up"),
 ];
 
 /// Fixed CPU cost per layer and decoded token, in milliseconds, on top of streaming the weights.
@@ -653,6 +802,13 @@ fn variants_of(m: &Model) -> Vec<(String, Format, &'static str, f64, f64)> {
     // (label, format, args, memory, bytes per token)
     match m.source {
         Source::Fixed(f, label) => vec![(label.to_string(), f, "", m.download_gb, m.token_gb)],
+        // Mixture of experts: every expert is quantized, so the whole checkpoint shrinks even
+        // where the bytes per token (and so the speed) are not known.
+        Source::Safetensors if m.token_gb == 0.0 && m.moe && m.kind == Kind::Chat => vec![
+            ("bf16".to_string(), Format::Bf16, "", m.download_gb, 0.0),
+            ("--quant q8".to_string(), Format::Q8, "--quant q8", m.download_gb * Q8_OF_BF16, 0.0),
+            ("--quant q4".to_string(), Format::Q4, "--quant q4", m.download_gb * Q4_OF_BF16, 0.0),
+        ],
         Source::Safetensors if m.token_gb == 0.0 => vec![("as stored".to_string(), Format::Bf16, "", m.download_gb, 0.0)],
         Source::Safetensors => {
             // Dense models: what is not read per token (embedding tables, vision and audio towers)
@@ -831,7 +987,7 @@ pub fn render(hw: &Hardware, rows: &[Row], all: bool) -> String {
     if !fmts.is_empty() {
         let _ = writeln!(s, "CPU kernels, GB/s: {}", fmts.join(", "));
     }
-    let mut lines: Vec<[String; 6]> = Vec::new();
+    let mut lines: Vec<[String; 7]> = Vec::new();
     let mut kind = None;
     for r in rows {
         if kind != Some(r.model.kind) {
@@ -843,6 +999,7 @@ pub fn render(hw: &Hardware, rows: &[Row], all: bool) -> String {
                 "MEMORY".into(),
                 "RUNS ON".into(),
                 "DECODE".into(),
+                "CAN".into(),
             ]);
         }
         for (i, v) in r.variants.iter().filter(|v| all || v.recommended).enumerate() {
@@ -870,10 +1027,15 @@ pub fn render(hw: &Hardware, rows: &[Row], all: bool) -> String {
                     Runs::InMemory => "fits in memory".to_string(),
                 },
                 speed,
+                if first {
+                    r.model.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", ")
+                } else {
+                    String::new()
+                },
             ]);
         }
     }
-    let mut width = [0usize; 6];
+    let mut width = [0usize; 7];
     for l in &lines {
         for (w, c) in width.iter_mut().zip(l) {
             *w = (*w).max(c.trim_start_matches('\n').chars().count());
@@ -930,6 +1092,7 @@ pub fn to_json(hw: &Hardware, rows: &[Row]) -> serde_json::Value {
         "models": rows.iter().map(|row| json!({
             "model": row.model.repo,
             "kind": row.model.kind.as_str(),
+            "capabilities": row.model.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
             "params_b": row.model.params_b,
             "download_gb": row.model.download_gb,
             "on_disk": row.on_disk,
@@ -981,7 +1144,21 @@ mod tests {
     fn catalog_is_consistent() {
         for m in CATALOG {
             assert!(m.download_gb > 0.0 && m.token_gb <= m.download_gb * 1.02, "{}", m.repo);
-            assert_eq!(m.kind == Kind::Chat, m.token_gb > 0.0 && m.layers > 0, "{}", m.repo);
+            assert_eq!(m.token_gb > 0.0, m.layers > 0, "{}", m.repo);
+            assert!(m.kind == Kind::Chat || m.token_gb == 0.0, "{}", m.repo);
+            assert!(!m.caps.is_empty(), "{}", m.repo);
+            let has = |c: Cap| m.can(c);
+            assert!(
+                match m.kind {
+                    Kind::Chat => has(Cap::Text),
+                    Kind::Embedding => has(Cap::Embeddings),
+                    Kind::Speech => has(Cap::SpeechToText),
+                    Kind::Tts => has(Cap::TextToSpeech),
+                    Kind::Image => has(Cap::TextToImage) || has(Cap::ImageEdit) || has(Cap::Inpainting),
+                },
+                "{}",
+                m.repo
+            );
             assert_eq!(CATALOG.iter().filter(|o| o.repo == m.repo).count(), 1, "{}", m.repo);
         }
         // Grouped by kind, as the table prints them.
@@ -1072,6 +1249,12 @@ mod tests {
         let j = to_json(&h, &rows);
         assert_eq!(j["models"].as_array().unwrap().len(), CATALOG.len());
         assert_eq!(j["models"][0]["variants"].as_array().unwrap().len(), 3);
+        assert_eq!(j["models"][0]["capabilities"][0], "text");
+        assert!(table.contains("CAN") && table.contains("text, image-input, video-input, thinking, tools"));
+        for c in Cap::ALL {
+            assert_eq!(Cap::parse(c.as_str()), Some(c));
+            assert!(CATALOG.iter().any(|m| m.can(c)), "{c:?} is used");
+        }
         assert_eq!(j["hardware"]["gpu"], serde_json::Value::Null);
         assert_eq!(cache_folder("org/name:Q4_K_M"), "org--name");
     }

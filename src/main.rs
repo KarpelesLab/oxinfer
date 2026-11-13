@@ -122,6 +122,7 @@ struct Args {
     models: bool,
     models_all: bool,
     models_kind: Option<oxinfer::advisor::Kind>,
+    models_can: Vec<oxinfer::advisor::Cap>,
     embed: bool,
     prompt_name: Option<String>,
     similarity: bool,
@@ -388,8 +389,9 @@ fn usage() -> ! {
          \x20 --models             list the tested models with what this machine can run: download size against\n\
          \x20                      the free disk space, memory against RAM and GPU memory, where each decodes\n\
          \x20                      and an estimated tokens/s (CPU kernels are timed for about a second);\n\
-         \x20                      --all lists every precision, --kind chat|embedding|image|speech|tts and\n\
-         \x20                      --model TEXT filter, --device cpu ignores the GPU, --json prints JSON\n\
+         \x20                      --all lists every precision; --kind chat|embedding|image|speech|tts,\n\
+         \x20                      --can CAP[,CAP] (image-input, tools, image-edit, speech-to-text, ...: the\n\
+         \x20                      CAN column) and --model TEXT filter; --device cpu ignores the GPU; --json\n\
          \x20 --device D           auto (default) | cpu | cuda | metal | vulkan\n\
          \x20 --gpu-decode M       on (default) | off: generate a whole token per GPU submission\n\
          \x20                      (Metal; Llama 3, Orpheus, Qwen3, Qwen3.5 / 3.8 dense)\n\
@@ -559,6 +561,7 @@ fn parse_args() -> Result<Args> {
         models: false,
         models_all: false,
         models_kind: None,
+        models_can: Vec::new(),
         embed: false,
         prompt_name: None,
         similarity: false,
@@ -756,6 +759,14 @@ fn parse_args() -> Result<Args> {
             "--devices" => a.devices = true,
             "--models" => a.models = true,
             "--all" => a.models_all = true,
+            "--can" => {
+                for v in val()?.split(',') {
+                    a.models_can.push(oxinfer::advisor::Cap::parse(v).with_context(|| {
+                        let all: Vec<&str> = oxinfer::advisor::Cap::ALL.iter().map(|c| c.as_str()).collect();
+                        format!("unknown capability {v} (one of {})", all.join(", "))
+                    })?);
+                }
+            }
             "--kind" => {
                 let v = val()?;
                 a.models_kind =
@@ -1078,7 +1089,11 @@ fn run_models(args: &Args) -> Result<()> {
     let filter = args.model.to_string_lossy().to_lowercase();
     let rows: Vec<_> = oxinfer::advisor::survey(&hw)
         .into_iter()
-        .filter(|r| args.models_kind.is_none_or(|k| r.model.kind == k) && r.model.repo.to_lowercase().contains(&filter))
+        .filter(|r| {
+            args.models_kind.is_none_or(|k| r.model.kind == k)
+                && args.models_can.iter().all(|c| r.model.can(*c))
+                && r.model.repo.to_lowercase().contains(&filter)
+        })
         .collect();
     if args.format.as_deref() == Some("json") {
         println!("{}", serde_json::to_string_pretty(&oxinfer::advisor::to_json(&hw, &rows))?);

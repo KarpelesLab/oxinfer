@@ -4665,13 +4665,15 @@ faults on the first pass.
 ./target/release/oxinfer --models --all --kind chat   # every precision of the chat models
 ./target/release/oxinfer --models --model gemma --json  # filtered by name, as JSON
 ./target/release/oxinfer --models --device cpu     # as if there were no GPU
+./target/release/oxinfer --models --can image-input,tools   # by capability
+./target/release/oxinfer --models --kind image --can inpainting
 ```
 
 `--models` checks the models of the table above against the machine and exits: the download
 against the free space of the cache directory (`on disk` when the repo is already there, `N GB
 short` when it does not fit), the memory each precision needs against the RAM and the GPU's
-memory, where it would decode, and an estimated decoding speed. On a Threadripper 9970X with an
-RTX 5080 (16 GB), 134 GB of RAM:
+memory, where it would decode, an estimated decoding speed, and what the model can do. On a
+Threadripper 9970X with an RTX 5080 (16 GB), 134 GB of RAM (the `CAN` column cut here):
 
 ```
 CHAT                                                    DISK     MEMORY  RUNS ON                       DECODE
@@ -4690,7 +4692,17 @@ One line per model shows the precision to pick: the most precise one that decode
 over 60% of the RAM are streamed from storage (they run, at a speed set by the storage, which is
 not estimated), and whole decode steps run on the GPU when the backend has decode plans for the
 weight format and the weights fit in 92% of its memory with 1 GB to spare. Embedding, image,
-Whisper and TTS models get the disk and memory verdicts only.
+Whisper and TTS models get the disk and memory verdicts only, and so do the chat models whose
+bytes per token were not measured (the MiniMax family, Qwen2.5-VL, the Jev decision models, the
+untested Gemma 4 12B / 31B, ...).
+
+The `CAN` column (`"capabilities"` in the JSON) lists what the README states for each model, and
+`--can A,B` keeps the models that have all of them: `text`, `image-input`, `video-input`,
+`audio-input`, `thinking`, `tools`, `decisions`, `embeddings`, `text-to-image`, `image-to-image`,
+`image-edit`, `inpainting`, `control`, `speech-to-text`, `translation`, `text-to-speech`,
+`voice-cloning`. The catalog is the model table above with one entry per repository or file (79 entries),
+the MiniMax models included; it is a list kept by hand in `src/advisor.rs`, not read from the
+checkpoints, so a fine-tune or another quantization of a listed model is not in it.
 
 The speed is the cost model the measurements follow (`src/advisor.rs`, `oxinfer::advisor`): a
 decoded token reads every dense weight once, so
