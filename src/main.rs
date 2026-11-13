@@ -12,6 +12,8 @@ use std::time::Instant;
 
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
 mod anemll_cli;
+#[cfg(feature = "media")]
+mod arktts_cli;
 mod bagel_cli;
 #[cfg(feature = "media")]
 mod fish_cli;
@@ -503,7 +505,13 @@ fn usage() -> ! {
          \x20 --speak, --speak-file, --speak-json, --dump-pcm, --mmap as above (long texts are cut into chunks)\n\
          \x20 --ref-audio FILE     voice cloning: a reference clip (or its codes as .npy) with --ref-text TEXT\n\
          \x20 --voice N            the speaker tag (0 to 15) of text without <|speaker:N|> tags\n\
-         \x20 --temp, --top-p, --max-tokens, --seed  (defaults 0.7, 0.7, 600 frames per chunk; --temp 0: greedy)"
+         \x20 --temp, --top-p, --max-tokens, --seed  (defaults 0.7, 0.7, 600 frames per chunk; --temp 0: greedy)\n\n\
+         text to speech (Audio8 TTS: Edge0/Audio8-TTS-Realistic-Air, 44.1 kHz; see docs/audio8-tts.md):\n\
+         \x20 --speak, --speak-file, --speak-split, --speak-stream, --speak-json, --dump-pcm as above\n\
+         \x20 --ref-audio FILE     voice cloning: a reference clip (or its codes as .npy) with\n\
+         \x20 --ref-text TEXT      its exact transcript (default: FILE's .txt); without one the model picks a voice\n\
+         \x20 --voice NAME         a clip of the model's voices/ folder (NAME.wav with NAME.txt)\n\
+         \x20 --temp, --top-p, --max-tokens, --seed  (defaults 0.7, 0.9, 1024 frames; --temp 0 is greedy)"
     );
     eprintln!("\n{}", intervene_cli::USAGE);
     eprintln!("\n{}", flux_cli::USAGE);
@@ -1601,10 +1609,19 @@ fn run(mut args: Args) -> Result<()> {
         if oxinfer::fish::is_drama(&args.model) {
             return fish_cli::run(&args);
         }
+        if oxinfer::arktts::is_arktts(&args.model) {
+            return arktts_cli::run(&args);
+        }
         #[cfg(feature = "media")]
         return tts_cli::run(&args);
         #[cfg(not(feature = "media"))]
         bail!("speech synthesis from the command line needs the `media` feature (audio encoding)");
+    }
+    if oxinfer::arktts::is_arktts(&args.model) {
+        bail!(
+            "{}: Audio8 TTS is a text-to-speech model: use --speak TEXT -o out.wav",
+            args.model.display()
+        );
     }
     let model_type = config::model_type(&args.model)?;
     if model_type == "whisper" || args.transcribe.is_some() {

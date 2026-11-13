@@ -831,6 +831,37 @@ fn zonos_options(z: &crate::zonos::Zonos, body: &Value, voice: Option<&str>, see
     Ok(o)
 }
 
+/// The options of an Audio8 TTS request: `voice` is one of the clips of the model's voices folder
+/// (OpenAI's names and `none`: no reference, the model picks a voice); `temperature`, `top_p`,
+/// `top_k` and `max_tokens` as in [`crate::arktts::ArkttsSpeak`].
+fn arktts_options(m: &crate::arktts::Arktts, body: &Value, voice: Option<&str>, seed: u64) -> ApiResult<crate::arktts::ArkttsSpeak> {
+    let mut o = crate::arktts::ArkttsSpeak::default();
+    let num = |k: &str| body.get(k).and_then(Value::as_f64);
+    o.temperature = num("temperature").map(|v| v as f32);
+    o.top_p = num("top_p").map(|v| v as f32);
+    o.top_k = num("top_k").map(|v| v as usize);
+    o.max_tokens = num("max_tokens").map(|v| v as usize);
+    o.seed = seed;
+    // Only the model's own voices: a request does not name files on the server.
+    o.voice = match voice {
+        Some(v) if m.voices().iter().any(|x| x.name.eq_ignore_ascii_case(v)) => Some(v.to_string()),
+        Some(v) if v != "none" && !OPENAI_VOICES.contains(&v) => {
+            let names: Vec<&str> = m.voices().iter().map(|x| x.name.as_str()).collect();
+            return Err(ApiError::bad(format!(
+                "voice {v:?}: this model's voices are the clips of its voices folder ({})",
+                if names.is_empty() {
+                    "none yet".to_string()
+                } else {
+                    names.join(", ")
+                }
+            ))
+            .param("voice"));
+        }
+        _ => None,
+    };
+    Ok(o)
+}
+
 /// `POST /v1/audio/speech` with an array as `input` (an extension): the utterances are generated
 /// as one batch ([`crate::tts::Speaker::speak_batch`]) and returned as JSON, `data[i].audio` the
 /// base64 WAV (or 16-bit PCM) of `input[i]`. `voice` is one name or an array, one per input.
@@ -875,6 +906,14 @@ fn speech_batch(
             .zip(&voices)
             .map(|(t, v)| {
                 d.speak(t, &drama_options(body, *v, o.seed))
+                    .map_err(|e| ApiError::new(500, format!("{e:#}")))
+            })
+            .collect::<ApiResult<Vec<_>>>()?,
+        Loaded::Arktts(m) => texts
+            .iter()
+            .zip(&voices)
+            .map(|(t, v)| {
+                m.speak(t, &arktts_options(m, body, *v, o.seed)?)
                     .map_err(|e| ApiError::new(500, format!("{e:#}")))
             })
             .collect::<ApiResult<Vec<_>>>()?,
@@ -977,6 +1016,7 @@ pub(super) fn speech(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
         let zo = match loaded {
             Loaded::Zonos(z) => Some(zonos_options(z, &body2, voice.as_deref(), o.seed)?),
             Loaded::Drama(_) => None,
+            Loaded::Arktts(_) => None,
             Loaded::Speech(sp) => {
                 o.voice = speech_voice(sp.info(), voice.as_deref())?;
                 None
@@ -984,12 +1024,18 @@ pub(super) fn speech(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
             _ => unreachable!(),
         };
         let dro = drama_options(&body2, voice.as_deref(), o.seed);
+        let ao = match loaded {
+            Loaded::Arktts(m) => Some(arktts_options(m, &body2, voice.as_deref(), o.seed)?),
+            _ => None,
+        };
         // Either model, with the audio through `on` when streaming.
         let speak = |on: Option<&mut dyn FnMut(&crate::tts::AudioChunk) -> Flow>| match (&*loaded, &zo, on) {
             (Loaded::Zonos(z), Some(zo), Some(on)) => z.speak_stream(&input, zo, on),
             (Loaded::Zonos(z), Some(zo), None) => z.speak(&input, zo),
             (Loaded::Drama(d), _, Some(on)) => d.speak_stream(&input, &dro, on),
             (Loaded::Drama(d), _, None) => d.speak(&input, &dro),
+            (Loaded::Arktts(m), _, Some(on)) => m.speak_stream(&input, ao.as_ref().expect("set above"), on),
+            (Loaded::Arktts(m), _, None) => m.speak(&input, ao.as_ref().expect("set above")),
             (Loaded::Speech(sp), _, Some(on)) => sp.speak_stream(&input, &o, on),
             (Loaded::Speech(sp), _, None) => sp.speak_detailed(&input, &o),
             _ => unreachable!(),

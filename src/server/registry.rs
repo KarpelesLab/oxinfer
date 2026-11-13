@@ -88,6 +88,8 @@ pub(crate) enum Loaded {
     Zonos(Box<crate::zonos::Zonos>),
     /// Fish Audio Drama 3 (also `/v1/audio/speech`).
     Drama(Box<crate::fish::Drama>),
+    /// Audio8 TTS (also `/v1/audio/speech`).
+    Arktts(Box<crate::arktts::Arktts>),
 }
 
 impl Loaded {
@@ -97,7 +99,7 @@ impl Loaded {
             Loaded::Embedding(_) => Kind::Embedding,
             Loaded::Image(_) => Kind::Image,
             Loaded::Transcription(_) => Kind::Transcription,
-            Loaded::Speech(_) | Loaded::Zonos(_) | Loaded::Drama(_) => Kind::Speech,
+            Loaded::Speech(_) | Loaded::Zonos(_) | Loaded::Drama(_) | Loaded::Arktts(_) => Kind::Speech,
         }
     }
 }
@@ -447,6 +449,9 @@ impl Registry {
                 }
                 Loaded::Drama(Box::new(crate::fish::Drama::load(src, &o)?))
             }
+            Kind::Speech if local_path(src, self.cache_dir.as_deref()).is_some_and(|p| crate::arktts::is_arktts(&p)) => {
+                Loaded::Arktts(Box::new(crate::arktts::load_for_server(src, &opts, self.cache_dir.clone())?))
+            }
             Kind::Speech => {
                 let mut o = crate::tts::SpeakerOptions {
                     cache_dir: self.cache_dir.clone(),
@@ -584,7 +589,7 @@ pub(crate) fn detect_path(path: &Path, source: &str) -> (Kind, Option<ImageKind>
         (Kind::Embedding, None)
     } else if crate::whisper::is_whisper(path) || crate::nemotron_asr::is_speech_lm(path) {
         (Kind::Transcription, None)
-    } else if is_orpheus(path) {
+    } else if is_orpheus(path) || crate::arktts::is_arktts(path) {
         (Kind::Speech, None)
     } else {
         (Kind::Chat, None)
