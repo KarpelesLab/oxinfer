@@ -59,6 +59,7 @@ use crate::generate::{self, Decoded, Flow as GFlow, TextStream};
 use crate::glm5::{Glm5Model, Glm5Session};
 use crate::inkling::{Inkling2Model, Inkling2Session};
 use crate::kimi::{KimiModel, KimiSession};
+use crate::longcat::{LongcatModel, LongcatSession};
 use crate::mistral4::{Mistral4Model, Mistral4Session};
 use crate::model::{Model, Quant, Session};
 use crate::nemotron::{NemotronModel, NemotronSession};
@@ -908,6 +909,8 @@ pub enum Family {
     DeepSeek4,
     /// GLM-5.3 and GLM-5.3-Flash (`glm_moe_dsa`, `glm5_next`).
     Glm5,
+    /// LongCat-2.5 and its siblings (`pro_v`, `LongcatCausalLM`).
+    Longcat,
     /// Kimi K3 / K3.1 (`kimi_k3`, `kimi_k31`).
     Kimi,
     /// Nemotron-H (`nemotron_h`), and the language model of a NeMo speech LM (`nemo_speechlm`).
@@ -1061,6 +1064,10 @@ enum Lm {
         model: &'static Glm5Model<'static>,
         sess: Glm5Session,
     },
+    Longcat {
+        model: &'static LongcatModel<'static>,
+        sess: LongcatSession,
+    },
     Nemotron {
         model: &'static NemotronModel<'static>,
         sess: NemotronSession,
@@ -1182,6 +1189,7 @@ impl Lm {
             Lm::Mistral4Dspark { dec } => dec.sess.pos,
             Lm::DeepSeek4 { sess, .. } => sess.pos,
             Lm::Glm5 { sess, .. } => sess.pos,
+            Lm::Longcat { sess, .. } => sess.pos,
             Lm::Kimi { sess, .. } => sess.pos,
             Lm::Nemotron { sess, .. } => sess.pos,
             Lm::Inkling2 { sess, .. } => sess.pos,
@@ -1214,6 +1222,7 @@ impl Lm {
             }
             Lm::DeepSeek4 { model, sess } => *sess = model.new_session(),
             Lm::Glm5 { model, sess } => *sess = model.new_session(),
+            Lm::Longcat { model, sess } => *sess = model.new_session(),
             Lm::Kimi { model, sess } => *sess = model.new_session(),
             Lm::Nemotron { model, sess } => *sess = model.new_session(),
             Lm::Inkling2 { model, sess } => *sess = model.new_session(),
@@ -1423,6 +1432,7 @@ impl Engine {
             "mistral_large4" | "mistral_large4_text" => Family::Mistral4,
             "deepseek_v4" | "deepseek_v41" | "ernie5_5_moe" => Family::DeepSeek4,
             m if crate::glm5::is_model_type(m) => Family::Glm5,
+            m if crate::longcat::is_model_type(m) => Family::Longcat,
             "kimi_k3" | "kimi_k31" => Family::Kimi,
             m if crate::nemotron::is_model_type(m) => Family::Nemotron,
             m if crate::inkling::is_model_type(m) => Family::Inkling2,
@@ -1489,6 +1499,7 @@ impl Engine {
                 Family::Mistral4 | Family::DeepSeek4 | Family::Glm5 | Family::Kimi | Family::Inkling2 | Family::Ripple
             ) && crate::mistral4::too_big(crate::safetensors::checkpoint_bytes(&dir))
         };
+        let too_big = too_big || (family == Family::Longcat && crate::longcat::too_big(crate::safetensors::checkpoint_bytes(&dir)));
         // Too big for memory: streamed with a page-cache budget unless told otherwise
         // (2.5-3.5x faster than demand paging on the 378 GB UD-Q2_K_XL, see the README).
         // Qwen and Gemma checkpoints larger than this device holds (a 27B on a 12 GB phone)
@@ -1887,6 +1898,33 @@ impl Engine {
                     sess: model.new_session(),
                 };
                 (lm, fmt, model.quant, c.num_hidden_layers, c.hidden_size, c.vocab_size, 0)
+            }
+            Family::Longcat => {
+                if decision_dir.is_some() {
+                    bail!("decisions (decision_from) are not supported for LongCat");
+                }
+                if opts.draft.as_deref().is_some_and(|d| d != "none") || mtp {
+                    bail!("speculative decoding is not supported for LongCat (its MTP layers are not read)");
+                }
+                decision = None;
+                let mut model = LongcatModel::load(crate::longcat::LongcatConfig::load(&dir)?, files, opts.quant)?;
+                if let Some(so) = stream.clone() {
+                    streamer = Some(crate::longcat::attach_stream(&mut model, files, so)?);
+                }
+                let model = arena.keep(model);
+                let c = &model.cfg;
+                (
+                    Lm::Longcat {
+                        model,
+                        sess: model.new_session(),
+                    },
+                    crate::longcat_chat::LongcatChat::for_model(&dir)? as &'static (dyn ChatFormat + Sync),
+                    model.quant,
+                    c.num_layers,
+                    c.hidden_size,
+                    c.vocab_size,
+                    model.streamed_bytes(),
+                )
             }
             Family::Glm5 => {
                 if decision_dir.is_some() {
@@ -2497,6 +2535,7 @@ impl Engine {
             Lm::GemmaDspark { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
             Lm::DeepSeek4 { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::Glm5 { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
+            Lm::Longcat { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::Kimi { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::Nemotron { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::Inkling2 { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
@@ -2536,6 +2575,7 @@ impl Engine {
             Lm::GemmaDspark { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
             Lm::DeepSeek4 { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::Glm5 { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
+            Lm::Longcat { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::Kimi { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::Nemotron { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::Inkling2 { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
@@ -2566,6 +2606,7 @@ impl Engine {
             Lm::GemmaDspark { dec } => dec.model(),
             Lm::DeepSeek4 { model, .. } => *model,
             Lm::Glm5 { model, .. } => *model,
+            Lm::Longcat { model, .. } => *model,
             Lm::Kimi { model, .. } => *model,
             Lm::Nemotron { model, .. } => *model,
             Lm::Inkling2 { model, .. } => *model,
@@ -2591,6 +2632,7 @@ impl Engine {
             Lm::GemmaDspark { dec } => &mut dec.sess.iv,
             Lm::DeepSeek4 { sess, .. } => &mut sess.iv,
             Lm::Glm5 { sess, .. } => &mut sess.iv,
+            Lm::Longcat { sess, .. } => &mut sess.iv,
             Lm::Kimi { sess, .. } => &mut sess.iv,
             Lm::Nemotron { sess, .. } => &mut sess.iv,
             Lm::Inkling2 { sess, .. } => &mut sess.iv,
@@ -2836,6 +2878,7 @@ impl Engine {
                 Lm::GemmaDspark { dec } => run(dec.model(), &ids, &feats, chunk, need_logits)?,
                 Lm::DeepSeek4 { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
                 Lm::Glm5 { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
+                Lm::Longcat { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
                 Lm::Kimi { .. } => bail!("decisions are not supported for Kimi K3"),
                 Lm::Nemotron { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
                 Lm::Inkling2 { model, .. } => run(*model, &ids, &feats, chunk, need_logits)?,
@@ -3284,6 +3327,18 @@ impl PendingTurn {
                     empty(0.0)
                 } else {
                     generate::decode(*model, sess, logits, sampler, stop, max, &mut cb)
+                }
+            }
+            Lm::Longcat { model, sess } => {
+                let base = sess.pos;
+                let hs = generate::prefill(*model, sess, &ids, chunk, &overrides);
+                let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
+                st.prefill_secs = t0.elapsed().as_secs_f64();
+                let max = limit(sess.pos);
+                if max == 0 {
+                    empty(0.0)
+                } else {
+                    plain!(*model, sess, base, logits, max)
                 }
             }
             // No prompt-lookup rounds: the recurrent layers cannot roll a rejected draft back.
