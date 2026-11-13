@@ -190,7 +190,7 @@ pub struct Transformer<'a> {
 
 /// LayerNorm without affine parameters (eps 1e-6) of each `n`-row, then `x * (1 + scale) +
 /// shift` with the modulation of each row's group.
-fn norm_modulate(x: &[f32], n: usize, mods: &[(&[f32], &[f32])], group: impl Fn(usize) -> usize + Sync) -> Vec<f32> {
+pub(super) fn norm_modulate(x: &[f32], n: usize, mods: &[(&[f32], &[f32])], group: impl Fn(usize) -> usize + Sync) -> Vec<f32> {
     let _t = crate::sd::ops::timing::start(crate::sd::ops::timing::LN);
     let mut y = vec![0f32; x.len()];
     for_chunks(&mut y, n, x.len() > n, |i, r| {
@@ -207,7 +207,7 @@ fn norm_modulate(x: &[f32], n: usize, mods: &[(&[f32], &[f32])], group: impl Fn(
 }
 
 /// `x[i] += gate * y[i]` per row, with the gate of each row's group.
-fn gated_add(x: &mut [f32], y: &[f32], n: usize, gates: &[&[f32]], group: impl Fn(usize) -> usize + Sync) {
+pub(super) fn gated_add(x: &mut [f32], y: &[f32], n: usize, gates: &[&[f32]], group: impl Fn(usize) -> usize + Sync) {
     let _t = crate::sd::ops::timing::start(6);
     for_chunks(x, n, x.len() > n, |i, r| {
         let g = gates[group(i)];
@@ -527,7 +527,7 @@ impl<'a> Transformer<'a> {
 }
 
 /// The timestep embedding of `sigma` through the embedder's two layers: `[inner]`.
-fn temb(t_lin1: &Dense, t_lin2: &Dense, sigma: f32) -> Vec<f32> {
+pub(super) fn temb(t_lin1: &Dense, t_lin2: &Dense, sigma: f32) -> Vec<f32> {
     // Timesteps(256, flip_sin_to_cos, shift 0, scale 1000) on sigma, in f32 as diffusers.
     let half = 128;
     let mut e = vec![0f32; 256];
@@ -582,7 +582,7 @@ fn mlp(fc1: &Dense, fc2: &Dense, x: &[f32], rows: usize) -> Vec<f32> {
 
 /// GELU with the tanh approximation, with a real tanh (PyTorch's `gelu(approximate="tanh")`).
 #[inline]
-fn gelu_tanh_exact(x: f32) -> f32 {
+pub(super) fn gelu_tanh_exact(x: f32) -> f32 {
     const K: f32 = 0.797_884_6;
     0.5 * x * (1.0 + (K * (x + 0.044_715 * x * x * x)).tanh())
 }
