@@ -213,6 +213,7 @@ pub(crate) fn shader_src() -> String {
             }
         }
     }
+    s.push_str(PFF_SRC);
     s
 }
 
@@ -245,6 +246,15 @@ impl MetalBackend {
 }
 
 const FV_SRC: &str = include_str!("metal_fastv.metal");
+/// Prefill attention on the SIMD-group matrices (`pff_<head dim>`, `MOp::PfFlash`).
+const PFF_SRC: &str = include_str!("metal_pfflash.metal");
+
+/// Whether prefill plans run plain causal attention on the SIMD-group matrices (`pff_*`;
+/// `OXINFER_PF_FLASH=0`: the per-token decode kernels).
+fn pf_flash() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OXINFER_PF_FLASH").map_or(true, |v| v != "0"))
+}
 /// Rows per threadgroup of the fast verification matmuls (`FV_R` in the shader).
 const FV_ROWS: usize = 32;
 /// The formats with fast matmuls (a chunk loader `fv_load8` in the shader); other formats keep the
@@ -1272,6 +1282,20 @@ enum MOp {
         eps: f32,
         sigmoid: bool,
     },
+    /// Prefill plans: causal (optionally windowed) attention of every token of the chunk on the
+    /// SIMD-group matrices (`pff_<hd>`); `a`: the shader's `PFF` without the start position and
+    /// token count; `qt` queries and `threads` threads per threadgroup.
+    PfFlash {
+        pipe: Id,
+        qt: usize,
+        threads: usize,
+        q: usize,
+        out: usize,
+        kv: usize,
+        gate: usize,
+        nh: usize,
+        a: [u32; 12],
+    },
     /// Prefill plans: attention of every token of the chunk (`pfa_D_G`), dense or QSA.
     PfAttn {
         pipe: Id,
@@ -1305,6 +1329,8 @@ struct PfExperts {
     inter: usize,
     k: usize,
     n_exp: usize,
+    /// GELU-tanh experts (Gemma 4), else SiLU.
+    gelu: bool,
 }
 
 /// A prefill plan's state beyond a multi-token plan's: arena offsets of the GEMM scratch (half
@@ -2127,8 +2153,8 @@ impl MetalBackend {
                         inter: ex.inter,
                         k: ex.k,
                         n_exp: n,
+                        gelu: ex.gelu,
                     });
-                    let _ = ex.gelu;
                     (vec![rng(ex.x, ex.h), rng(ex.sel, 2 * ex.k)], vec![rng(ex.y, ex.h)])
                 }
                 Op::Experts(ref ex) => {
@@ -2767,6 +2793,58 @@ impl MetalBackend {
                     window,
                     gate,
                     block,
+                } if pf && block.is_none() && pf_flash() && matches!(hd, 64 | 128 | 256 | 512) => {
+                    if nkv == 0 || !nh.is_multiple_of(nkv) || g.kv.get(kv) != Some(&(nkv, hd)) {
+                        return None;
+                    }
+                    // Heads of 256 and 512 split their dimensions over SIMD-groups (`pffs_*`).
+                    let (name, qt, threads) = match hd {
+                        256 => ("pffs_256", 32, 256),
+                        512 => ("pffs_512", 16, 256),
+                        _ => ("pff_", 32, 128),
+                    };
+                    let name = if hd <= 128 { format!("{name}{hd}") } else { name.to_string() };
+                    emit.push(MOp::PfFlash {
+                        pipe: self.named_pipeline(&name)?,
+                        qt,
+                        threads,
+                        q: byte(q),
+                        out: byte(out),
+                        kv,
+                        gate: gate.map_or(0, |(v, _)| boff[v.buf]),
+                        nh,
+                        a: [
+                            0,
+                            0,
+                            nh as u32,
+                            nkv as u32,
+                            scale.to_bits(),
+                            window.unwrap_or(0) as u32,
+                            ts(q) as u32,
+                            ts(out) as u32,
+                            gate.map_or(0, |(v, _)| ts(v)) as u32,
+                            gate.map_or(0, |(v, _)| v.off) as u32,
+                            gate.map_or(0, |(_, s)| s) as u32,
+                            gate.is_some() as u32,
+                        ],
+                    });
+                    let mut r = vec![rng(q, nh * hd), (KV_RES + kv, 0, usize::MAX)];
+                    if let Some((v, s)) = gate {
+                        r.push(rng(v, nh * s));
+                    }
+                    (r, vec![rng(out, nh * hd)])
+                }
+                Op::Attend {
+                    q,
+                    out,
+                    kv,
+                    nh,
+                    nkv,
+                    hd,
+                    scale,
+                    window,
+                    gate,
+                    block,
                 } => {
                     if block.is_some() && !mt {
                         return None;
@@ -3182,7 +3260,9 @@ impl MetalPlan<'_> {
             // if the host cache has grown back past it.
             m.synced = m.synced.min(c.len).min(c.kept);
             if m.cap < pos + t {
-                let cap = (pos + t).next_power_of_two().max(256);
+                // Room for at least one more token (a prompt of a power-of-two length is
+                // followed by decoding: no reallocation and copy on its first step).
+                let cap = (pos + t + 1).next_power_of_two().max(256);
                 let bytes = cap * row * 4;
                 let (k, v) = unsafe {
                     (
@@ -3200,8 +3280,9 @@ impl MetalPlan<'_> {
                 }
                 if m.synced > 0 {
                     unsafe {
-                        std::ptr::copy_nonoverlapping(self.f.contents(m.k), self.f.contents(k), m.synced * row * 4);
-                        std::ptr::copy_nonoverlapping(self.f.contents(m.v), self.f.contents(v), m.synced * row * 4);
+                        let n = m.synced * row;
+                        super::par_copy(self.f.contents(k) as *mut f32, self.f.contents(m.k) as *const f32, n);
+                        super::par_copy(self.f.contents(v) as *mut f32, self.f.contents(m.v) as *const f32, n);
                     }
                 }
                 for b in [m.k, m.v] {
@@ -3706,7 +3787,8 @@ impl MetalPlan<'_> {
             | MOp::PfTopk { .. }
             | MOp::PfExperts(_)
             | MOp::PfGdn { .. }
-            | MOp::PfAttn { .. } => unreachable!("prefill op in a multi-token plan"),
+            | MOp::PfAttn { .. }
+            | MOp::PfFlash { .. } => unreachable!("prefill op in a multi-token plan"),
         }
     }
 }
@@ -3969,7 +4051,7 @@ impl MetalPlan<'_> {
                 e.bytes(
                     &Sh {
                         n: mi as u32,
-                        gelu: 0,
+                        gelu: x.gelu as u32,
                         split: if x.up.is_some() { er as u32 } else { 0 },
                         limit: 0.0,
                     },
@@ -4059,6 +4141,29 @@ impl MetalPlan<'_> {
                 e.bytes(&[*eps, 0.0f32], 3);
                 e.bytes(&[ts[2], *zs, p.hdv, *sigmoid as u32], 4);
                 e.dispatch((p.nv as usize, t), p.hdv as usize);
+            }
+            MOp::PfFlash {
+                pipe,
+                qt,
+                threads,
+                q,
+                out,
+                kv,
+                gate,
+                nh,
+                a,
+            } => {
+                let mut a = *a;
+                a[0] = pos as u32;
+                a[1] = t as u32;
+                e.pipe(*pipe);
+                e.buf(arena, *q, 0);
+                e.buf(kvb[*kv].0, 0, 1);
+                e.buf(kvb[*kv].1, 0, 2);
+                e.buf(arena, *out, 3);
+                e.buf(arena, *gate, 4);
+                e.bytes(&a, 5);
+                e.dispatch((t.div_ceil(*qt), *nh), *threads);
             }
             MOp::PfAttn {
                 pipe,
@@ -4749,7 +4854,7 @@ impl DecodePlan for MetalPlan<'_> {
                         MOp::XHalf { .. } | MOp::Gemm { .. } | MOp::GemmF32 { .. } | MOp::AddRows { .. } => "mv",
                         MOp::PfTopk { .. } | MOp::PfExperts(_) => "moe",
                         MOp::PfGdn { .. } => "gdn",
-                        MOp::PfAttn { .. } => "attn",
+                        MOp::PfAttn { .. } | MOp::PfFlash { .. } => "attn",
                     };
                     if !o.split(',').any(|x| x == k) {
                         continue;
@@ -4772,7 +4877,8 @@ impl DecodePlan for MetalPlan<'_> {
                     | MOp::PfTopk { .. }
                     | MOp::PfExperts(_)
                     | MOp::PfGdn { .. }
-                    | MOp::PfAttn { .. } => unreachable!("prefill op in a one-token plan"),
+                    | MOp::PfAttn { .. }
+                    | MOp::PfFlash { .. } => unreachable!("prefill op in a one-token plan"),
                     MOp::Norm {
                         pipe,
                         x,
@@ -5147,6 +5253,7 @@ impl DecodePlan for MetalPlan<'_> {
                         MOp::PfGdn { .. } => "gdn rule".into(),
                         MOp::GdnConv { .. } => "conv".into(),
                         MOp::PfAttn { .. } => "attn".into(),
+                        MOp::PfFlash { .. } => "flash attn".into(),
                         MOp::QkRope { .. } => "qkrope".into(),
                         MOp::QsaKey { .. } => "qsa key".into(),
                         MOp::QsaScore { .. } => "qsa score".into(),
