@@ -404,6 +404,9 @@ fn usage() -> ! {
          \x20 --check-update       compare this binary with the latest GitHub release, then exit\n\
          \x20 --update             download the latest release's binary for this platform and replace this\n\
          \x20                      executable with it (--force: also when already up to date)\n\
+         \x20 --auto-update        with any other command: first install the latest release if it is newer\n\
+         \x20                      and this executable can be replaced (the next run uses it), else say that\n\
+         \x20                      one is available; checked at most once an hour\n\
          \x20 --models             list the tested models with what this machine can run: download size against\n\
          \x20                      the free disk space, memory against RAM and GPU memory, where each decodes\n\
          \x20                      and an estimated tokens/s (CPU kernels are timed for about a second);\n\
@@ -819,6 +822,8 @@ fn parse_args() -> Result<Args> {
             "--devices" => a.devices = true,
             "--models" => a.models = true,
             "--check-update" => a.check_update = true,
+            // Handled in `main`, before the arguments are read.
+            "--auto-update" => {}
             "--update" => a.update = true,
             "--force" => a.force = true,
             "--all" => a.models_all = true,
@@ -1197,10 +1202,38 @@ fn run_models(args: &Args) -> Result<()> {
     Ok(())
 }
 
+/// `--auto-update`, before anything else runs: a newer release replaces this executable when it
+/// can (the run in progress stays the old version), and is reported otherwise. Never an error.
+fn auto_update() {
+    #[cfg(feature = "update")]
+    {
+        use oxinfer::update::{Auto, CURRENT, auto_update};
+        match auto_update(&oxinfer::hf::cache_root(), &mut |line| eprintln!("[auto-update: {line}]")) {
+            Ok(Auto::UpToDate) => {}
+            Ok(Auto::Updated(exe, v)) => eprintln!(
+                "[auto-update: {} is now oxinfer {v}; this run continues as {CURRENT}]",
+                exe.display()
+            ),
+            Ok(Auto::Available { version, url, why }) => {
+                eprintln!("[auto-update: oxinfer {version} is available ({url}); not installed: {why}]")
+            }
+            Err(e) => eprintln!("[auto-update: the check failed: {e:#}]"),
+        }
+    }
+    #[cfg(not(feature = "update"))]
+    eprintln!("[auto-update: this build has no self-update (the `update` feature)]");
+}
+
 fn main() -> Result<()> {
+    // What an earlier update could not delete (Windows: the program was running).
+    #[cfg(feature = "update")]
+    oxinfer::update::remove_previous();
+    if std::env::args().skip(1).any(|a| a == "--auto-update") {
+        auto_update();
+    }
     #[cfg(feature = "server")]
     if std::env::args().nth(1).as_deref() == Some("serve") {
-        let rest: Vec<String> = std::env::args().skip(2).collect();
+        let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
         return server_cli::run(&rest);
     }
     let mut args = parse_args()?;

@@ -1,4 +1,5 @@
-//! Self-update from the project's GitHub releases (`oxinfer --check-update`, `oxinfer --update`).
+//! Self-update from the project's GitHub releases (`oxinfer --check-update`, `oxinfer --update`,
+//! and `--auto-update` in front of any other command).
 //!
 //! The latest release is read from the GitHub API, its archive for this platform downloaded
 //! (the names `release-binaries.yml` gives them), unpacked in memory (gzip with `compcol`, the
@@ -131,7 +132,8 @@ pub fn unpack(name: &str, archive: Vec<u8>) -> Result<Vec<u8>> {
 
 /// Puts `bin` in the place of the executable at `exe`: written beside it, then swapped in by
 /// renames, so an interrupted update leaves the old binary. The previous one is removed where
-/// the OS allows it (not on Windows while it runs: it stays as `<name>.old`).
+/// the OS allows it; on Windows, where a running program cannot be deleted, it stays as a hidden
+/// `<name>.old` that the next start deletes ([`remove_previous`]).
 pub fn replace_executable(exe: &Path, bin: &[u8]) -> Result<()> {
     let dir = exe.parent().context("the executable has no directory")?;
     let name = exe.file_name().context("the executable has no name")?.to_string_lossy().to_string();
@@ -157,9 +159,48 @@ pub fn replace_executable(exe: &Path, bin: &[u8]) -> Result<()> {
         let _ = std::fs::remove_file(&new);
         return Err(e).with_context(|| format!("replace {}", exe.display()));
     }
-    let _ = std::fs::remove_file(&old);
+    // Windows cannot delete a program that is running: the old one stays, hidden, until the
+    // next start removes it ([`remove_previous`]).
+    if std::fs::remove_file(&old).is_err() {
+        hide(&old);
+    }
     Ok(())
 }
+
+/// The name a replaced executable keeps while it cannot be deleted: `<name>.old` beside it.
+fn previous(exe: &Path) -> Option<PathBuf> {
+    let name = exe.file_name()?.to_string_lossy().to_string();
+    Some(exe.parent()?.join(format!("{name}.old")))
+}
+
+/// Deletes the executable a previous update replaced, if it was left behind (on Windows, where
+/// it was still running then). Called at every start; silent when there is nothing to do or the
+/// file is still in use.
+pub fn remove_previous() {
+    let old = std::env::current_exe().ok().as_deref().and_then(previous);
+    if let Some(old) = old.filter(|p| p.is_file()) {
+        let _ = std::fs::remove_file(old);
+    }
+}
+
+/// Marks a file hidden (Windows; a no-op elsewhere).
+#[cfg(windows)]
+fn hide(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetFileAttributesW(name: *const u16, attributes: u32) -> i32;
+    }
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 2;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call.
+    unsafe {
+        SetFileAttributesW(wide.as_ptr(), FILE_ATTRIBUTE_HIDDEN);
+    }
+}
+
+#[cfg(not(windows))]
+fn hide(_path: &Path) {}
 
 /// What [`update`] did.
 #[derive(Clone, Debug)]
@@ -177,6 +218,11 @@ pub fn update(force: bool, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
     if !force && !rel.is_newer() {
         return Ok(Outcome::UpToDate(rel.version().to_string()));
     }
+    install(&rel, log)
+}
+
+/// Installs `rel` over the running executable.
+fn install(rel: &Release, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
     let suffix = platform_suffix().context("no binary is published for this platform: build from source")?;
     let asset = rel
         .asset()
@@ -187,16 +233,108 @@ pub fn update(force: bool, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
         bail!("{}: got {} bytes, the release lists {}", asset.name, archive.len(), asset.size);
     }
     let bin = unpack(&asset.name, archive)?;
-    let exe = std::env::current_exe()
-        .and_then(std::fs::canonicalize)
-        .context("find the running executable")?;
+    let exe = current_exe()?;
     replace_executable(&exe, &bin)?;
     Ok(Outcome::Updated(exe, rel.version().to_string()))
+}
+
+fn current_exe() -> Result<PathBuf> {
+    std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .context("find the running executable")
+}
+
+/// What [`auto_update`] found.
+#[derive(Clone, Debug)]
+pub enum Auto {
+    /// Nothing newer (or the last check is more recent than [`AUTO_INTERVAL`]).
+    UpToDate,
+    /// Replaced the executable at the path with the version; the running process is the old one.
+    Updated(PathBuf, String),
+    /// A newer release (its version and page) that could not be installed, and why.
+    Available { version: String, url: String, why: String },
+}
+
+/// The least time between two checks of [`auto_update`]: GitHub allows 60 unauthenticated
+/// requests an hour per address, and a script may start oxinfer far more often.
+pub const AUTO_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// `--auto-update`: installs the latest release over the running executable when it is newer and
+/// the executable can be replaced; reports it otherwise. At most one check per [`AUTO_INTERVAL`]
+/// (a stamp file in `stamp_dir`, the cache directory). An error is a failed check (no network,
+/// GitHub's rate limit): the caller reports it and carries on.
+pub fn auto_update(stamp_dir: &Path, log: &mut dyn FnMut(&str)) -> Result<Auto> {
+    let stamp = stamp_dir.join("update-check");
+    let recent = std::fs::metadata(&stamp)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|d| d < AUTO_INTERVAL);
+    if recent {
+        return Ok(Auto::UpToDate);
+    }
+    let rel = latest()?;
+    // The check is done whatever follows: a release that cannot be installed is reported once
+    // per interval, not on every run.
+    let _ = std::fs::create_dir_all(stamp_dir).and_then(|()| std::fs::write(&stamp, rel.tag_name.as_bytes()));
+    if !rel.is_newer() {
+        return Ok(Auto::UpToDate);
+    }
+    let available = |why: String| Auto::Available {
+        version: rel.version().to_string(),
+        url: rel.html_url.clone(),
+        why,
+    };
+    // Before the download: is there a binary for this platform, and can this one be replaced?
+    if rel.asset().is_none() {
+        return Ok(available(match platform_suffix() {
+            Some(s) => format!("the release has no {s} binary"),
+            None => "no binary is published for this platform".to_string(),
+        }));
+    }
+    if let Err(e) = current_exe().and_then(|exe| replaceable(&exe)) {
+        return Ok(available(format!("{e:#}")));
+    }
+    Ok(match install(&rel, log) {
+        Ok(Outcome::Updated(exe, v)) => Auto::Updated(exe, v),
+        Ok(Outcome::UpToDate(_)) => Auto::UpToDate,
+        Err(e) => available(format!("{e:#}")),
+    })
+}
+
+/// Whether [`replace_executable`] can work on `exe`: a file can be created beside it.
+fn replaceable(exe: &Path) -> Result<()> {
+    let dir = exe.parent().context("the executable has no directory")?;
+    let probe = dir.join(format!(".{}.probe", exe.file_name().unwrap_or_default().to_string_lossy()));
+    std::fs::write(&probe, b"").with_context(|| format!("{} is not writable", dir.display()))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_update_checks_once_per_interval_and_probes_the_directory() {
+        let dir = std::env::temp_dir().join(format!("oxinfer-auto-update-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A fresh stamp: no request is made.
+        std::fs::write(dir.join("update-check"), b"v0").unwrap();
+        assert!(matches!(auto_update(&dir, &mut |_| ()).unwrap(), Auto::UpToDate));
+        assert!(replaceable(&dir.join("oxinfer")).is_ok());
+        assert!(!dir.join(".oxinfer.probe").exists());
+        assert!(replaceable(&dir.join("missing").join("oxinfer")).is_err());
+        // The swap: the new bytes at the path, nothing left beside it (off Windows).
+        let exe = dir.join("oxinfer");
+        std::fs::write(&exe, b"old").unwrap();
+        replace_executable(&exe, b"new").unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), b"new");
+        assert_eq!(previous(&exe).unwrap(), dir.join("oxinfer.old"));
+        #[cfg(not(windows))]
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "the executable and the stamp");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn versions() {

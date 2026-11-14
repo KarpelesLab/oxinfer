@@ -61,14 +61,25 @@ dispatched by release-plz on the new tag):
 ```sh
 oxinfer --check-update    # compares this binary with the latest release
 oxinfer --update          # downloads this platform's archive and replaces the executable
+oxinfer --auto-update --model google/gemma-4-E4B-it -p "Hi"   # the same check before a normal run
 ```
+
+`--auto-update` goes with any other command (`serve` included). Before the command runs it asks
+GitHub for the latest release, at most once an hour (a stamp file in the cache directory). A
+newer release is installed over the executable when that is possible, and the run in progress
+continues as the old version: the next one is the new. When it is not possible (the directory
+of the executable is not writable, no binary is published for the platform, the download
+fails) it prints one line saying which version is available and why it was not installed. A
+check that fails (no network, GitHub's rate limit) is reported the same way and never stops the
+command.
 
 `--update` (`src/update.rs`, the `update` feature, on by default) reads the latest release from
 the GitHub API, downloads the archive named for the platform the binary was built for, unpacks
 it in memory (gzip with [compcol](https://crates.io/crates/compcol), the tar or zip container
 with [fstool](https://crates.io/crates/fstool)), writes the new executable beside the running
-one and swaps them by renames (on Windows the previous one stays as `oxinfer.exe.old` while it
-runs). `--force` reinstalls the latest release. What vouches for the download is GitHub over TLS
+one and swaps them by renames. Windows cannot delete a program that is running: there the
+previous one is renamed to `oxinfer.exe.old` and marked hidden, and the next start of oxinfer
+deletes it. `--force` reinstalls the latest release. What vouches for the download is GitHub over TLS
 and the size the API lists: the releases are not signed and no digest is checked. A binary built
 from source for a platform without an archive (Android, the BSDs, musl) reports that instead.
 
