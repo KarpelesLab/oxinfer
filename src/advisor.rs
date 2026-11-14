@@ -33,6 +33,7 @@ pub enum Kind {
     Image,
     Speech,
     Tts,
+    Video,
 }
 
 impl Kind {
@@ -43,6 +44,7 @@ impl Kind {
             Kind::Image => "image",
             Kind::Speech => "speech-to-text",
             Kind::Tts => "text-to-speech",
+            Kind::Video => "video",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -52,6 +54,7 @@ impl Kind {
             "image" | "images" => Kind::Image,
             "speech" | "speech-to-text" | "stt" | "whisper" => Kind::Speech,
             "tts" | "text-to-speech" => Kind::Tts,
+            "video" | "videos" => Kind::Video,
             _ => return None,
         })
     }
@@ -164,10 +167,13 @@ pub enum Cap {
     Translation,
     TextToSpeech,
     VoiceCloning,
+    TextToVideo,
+    /// A first and / or last frame to video.
+    ImageToVideo,
 }
 
 impl Cap {
-    pub const ALL: [Cap; 17] = [
+    pub const ALL: [Cap; 19] = [
         Cap::Text,
         Cap::ImageInput,
         Cap::VideoInput,
@@ -185,6 +191,8 @@ impl Cap {
         Cap::Translation,
         Cap::TextToSpeech,
         Cap::VoiceCloning,
+        Cap::TextToVideo,
+        Cap::ImageToVideo,
     ];
     pub fn as_str(self) -> &'static str {
         match self {
@@ -205,6 +213,8 @@ impl Cap {
             Cap::Translation => "translation",
             Cap::TextToSpeech => "text-to-speech",
             Cap::VoiceCloning => "voice-cloning",
+            Cap::TextToVideo => "text-to-video",
+            Cap::ImageToVideo => "image-to-video",
         }
     }
     pub fn parse(s: &str) -> Option<Self> {
@@ -715,6 +725,8 @@ pub const CATALOG: &[Model] = &[
     Model::new("Qwen/Qwen-Image-2.1", Kind::Image, 16.2, 33.1, &[TextToImage, ImageEdit]).note("40 steps; RGBA output"),
     Model::new("MiniMaxAI/MiniMax-H3-Image", Kind::Image, 63.0, 127.2, &[TextToImage])
         .note("with MiniMax-H3's Qwen3-VL text encoder; 2048x2048 and up"),
+    Model::new("MiniMaxAI/MiniMax-H3", Kind::Video, 67.4, 140.1, &[TextToVideo, ImageToVideo])
+        .note("transformer/, text_encoder/ and vae/ of the 498 GB repository; 24 fps, 5 to 15 s; no audio track; on the CPU"),
 ];
 
 /// Fixed CPU cost per layer and decoded token, in milliseconds, on top of streaming the weights.
@@ -1350,6 +1362,7 @@ mod tests {
                     Kind::Embedding => has(Cap::Embeddings),
                     Kind::Speech => has(Cap::SpeechToText),
                     Kind::Tts => has(Cap::TextToSpeech),
+                    Kind::Video => has(Cap::TextToVideo),
                     Kind::Image => has(Cap::TextToImage) || has(Cap::ImageEdit) || has(Cap::Inpainting),
                 },
                 "{}",
