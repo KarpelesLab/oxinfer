@@ -30,6 +30,10 @@ M=~/.cache/oxinfer/hub/baidu--Unlimited-OCR-2
     --ours-log ours.log --generate 600
 ```
 
+LFM3-Omni is compared with the code in its checkpoint too (`tools/ref_lfm3_omni.py`: log-mel
+features, audio and image tokens, prompt ids, logits, greedy text, and for spoken replies the
+speech codes and the codec's waveform; see [LFM3-Omni](lfm3.md#agreement-with-the-reference)).
+
 Videos are compared as directories of frames (`ffmpeg -i clip.mp4 frames/%05d.png`, then
 `--video frames --frames-fps 24` on both sides), so both read the same pixels.
 
