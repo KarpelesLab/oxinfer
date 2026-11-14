@@ -311,6 +311,9 @@ pub const CATALOG: &[Model] = &[
         .speed(3.06, 24)
         .note("half of its parameters are a per-layer embedding table read one row a token"),
     Model::new("LiquidAI/LFM3-1.7B", Kind::Chat, 1.7, 3.5, AGENT).speed(3.46, 24),
+    Model::new("LiquidAI/LFM3-Omni-2B", Kind::Chat, 2.2, 4.5, &[Text, ImageInput, AudioInput, SpeechToText, TextToSpeech])
+        .speed(3.46, 24)
+        .note("text, images and audio in; text or 24 kHz speech out (--speak TEXT -o out.wav, --audio Q.wav -o reply.wav); on the CPU"),
     Model::new("Qwen/Qwen2.5-VL-3B-Instruct", Kind::Chat, 3.8, 7.5, &[Text, ImageInput]),
     Model::new("ibm-granite/granite-4.2-3b", Kind::Chat, 3.7, 7.3, AGENT).speed(6.81, 40),
     Model::new("ibm-granite/granite-4.2-3b-GGUF:Q4_K_M", Kind::Chat, 3.7, 2.2, AGENT)
