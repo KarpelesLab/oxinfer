@@ -24,6 +24,7 @@ mod intervene_cli;
 mod janus_cli;
 mod lfm3_omni_cli;
 mod minimax_h3_cli;
+mod minimax_h3_video_cli;
 mod omnigen2_cli;
 mod qwen_image_cli;
 mod sd3_cli;
@@ -119,6 +120,9 @@ struct Args {
     /// Image editing: the input images (repeatable: Qwen-Image-Edit-2509 / 2511 take several;
     /// the others the first), a mask (white = repaint), strength, image guidance.
     init_images: Vec<PathBuf>,
+    /// MiniMax-H3 (video): the frame count and the last keyframe.
+    frames: Option<usize>,
+    last_image: Option<PathBuf>,
     mask: Option<PathBuf>,
     strength: Option<f32>,
     image_guidance: Option<f32>,
@@ -365,6 +369,14 @@ fn usage() -> ! {
          \x20 --resolution N       Qwen-Image-Layered: 640 (default) or 1024\n\
          \x20 --quant q8|q4        transformer and text encoder precision; --mmap, --stream as above\n\
          \n\
+         MiniMax-H3 (MiniMaxAI/MiniMax-H3): text to video, first / last frame to video (-o, --size,\n\
+         --seed as above; see docs/video.md):\n\
+         \x20 --frames N           frames at 24 fps, rounded up to 17 n + 5 (default 124: 5.2 s)\n\
+         \x20 --steps N            points of the sigma grid: N - 1 forwards (default 50)\n\
+         \x20 --init-image FILE    the first frame; --last-image FILE the last frame\n\
+         \x20 -o FILE              .avi (Motion JPEG), .webp (animated, lossless, slow) or .png (a PNG\n\
+         \x20                      sequence FILE_0000.png ...); no audio track is written\n\
+         \n\
          OmniGen2 (OmniGen2/OmniGen2): image editing, in-context generation and text to image (-o,\n\
          --steps (default 50), --negative, --seed, --quant, --mmap as above):\n\
          \x20 --init-image FILE    image to edit (repeatable, up to 5: \"the cat from image 1 on the sofa\n\
@@ -608,6 +620,8 @@ fn parse_args() -> Result<Args> {
         guidance: None,
         negative: String::new(),
         init_images: Vec::new(),
+        frames: None,
+        last_image: None,
         transformer: None,
         qwen_image: Default::default(),
         size: None,
@@ -850,6 +864,8 @@ fn parse_args() -> Result<Args> {
             "--sampler" => a.sampler = Some(val()?),
             "--lora" => a.loras.push(oxinfer::sd::lora::LoraSpec::parse(&val()?)?),
             "--init-image" => a.init_images.push(PathBuf::from(val()?)),
+            "--frames" => a.frames = Some(val()?.parse()?),
+            "--last-image" => a.last_image = Some(PathBuf::from(val()?)),
             "--mask" => a.mask = Some(PathBuf::from(val()?)),
             "--strength" => a.strength = Some(val()?.parse()?),
             "--image-guidance" => a.image_guidance = Some(val()?.parse()?),
@@ -1625,6 +1641,9 @@ fn run(mut args: Args) -> Result<()> {
     }
     if oxinfer::minimax_h3::is_h3_image(&args.model) {
         return minimax_h3_cli::run(&args);
+    }
+    if oxinfer::minimax_h3::video::is_h3_video(&args.model) {
+        return minimax_h3_video_cli::run(&args);
     }
     if oxinfer::bagel::is_bagel(&args.model) {
         return bagel_cli::run(&args);

@@ -563,7 +563,7 @@ impl<'a> Dit<'a> {
             || n != n_text + nv + na
             || p.tags.len() != n
             || p.timestep_index.len() != n
-            || p.temb.len() % cfg.time_dim != 0
+            || !p.temb.len().is_multiple_of(cfg.time_dim)
         {
             bail!("packed sequence: the rows, indices and positions do not agree");
         }

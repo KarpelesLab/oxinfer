@@ -26,7 +26,7 @@ fn has_weights(dir: &std::path::Path) -> bool {
 }
 
 /// MiniMax-H3's text encoder folder.
-fn text_encoder(model: &std::path::Path) -> Result<PathBuf> {
+pub(crate) fn text_encoder(model: &std::path::Path) -> Result<PathBuf> {
     if let Ok(p) = std::env::var("OXINFER_H3_TEXT_ENCODER") {
         return Ok(PathBuf::from(p));
     }

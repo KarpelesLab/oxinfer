@@ -374,6 +374,49 @@ fn shift_of(dir: &Path, default: f32) -> f32 {
         .map_or(default, |s| s as f32)
 }
 
+/// The conditioning of `prompt` with `keyframes` (canvas-sized): `"<Picture i>: "` and a vision
+/// block per keyframe, then the prompt, after the 50th layer of the text encoder in
+/// `text_encoder` (`model`: the release folder, for its tokenizer).
+pub fn encode_prompt(model: &Path, text_encoder: &Path, prompt: &str, keyframes: &[&Image]) -> Result<Conditioning> {
+    use crate::qwen_vl::{QwenVl, QwenVlOptions};
+    let parent = text_encoder.parent().map(Path::to_path_buf).unwrap_or_default();
+    let opts = QwenVlOptions {
+        mmap: true,
+        vision: !keyframes.is_empty(),
+        tokenizer_dir: [model.join("tokenizer"), parent.join("tokenizer"), text_encoder.to_path_buf()]
+            .into_iter()
+            .find(|d| d.join("tokenizer.json").exists()),
+        ..Default::default()
+    };
+    let vl = QwenVl::load(text_encoder, &opts)?;
+    if vl.model().cfg.num_hidden_layers <= 50 {
+        bail!(
+            "the text encoder has {} layers; MiniMax-H3 conditions on its 50th",
+            vl.model().cfg.num_hidden_layers
+        );
+    }
+    let (mut ids, mut tags, mut images) = (Vec::new(), Vec::new(), Vec::new());
+    for (i, k) in keyframes.iter().enumerate() {
+        let im = vl.encode_image(&k.rgb, k.width, k.height, 0)?;
+        let label = vl.tokenize(&format!("<Picture {}>: ", i + 1))?;
+        let block = vl.tokenize(&im.placeholder())?;
+        tags.extend(std::iter::repeat_n(TAG_TEXT, label.len()));
+        tags.extend(std::iter::repeat_n(TAG_IMAGE, block.len()));
+        ids.extend(label);
+        ids.extend(block);
+        images.push(im);
+    }
+    let pids = vl.tokenize(prompt)?;
+    if pids.is_empty() {
+        bail!("empty prompt");
+    }
+    tags.extend(std::iter::repeat_n(TAG_TEXT, pids.len()));
+    ids.extend(pids);
+    let mut hs = vl.hidden_states_tokens(ids, &images, None, &[49])?;
+    let (_, text) = hs.layers.pop().context("layer 50 not captured")?;
+    Ok(Conditioning { text, tags })
+}
+
 impl VideoPipeline {
     /// Loads the DiT (`transformer/`) and the video VAE (`vae/`) of the release in `dir` (bf16,
     /// mapped); the text encoder from `text_encoder` when it is used.
@@ -451,46 +494,9 @@ impl VideoPipeline {
         out
     }
 
-    /// The conditioning of `prompt` with `keyframes` (canvas-sized): `"<Picture i>: "` and a vision
-    /// block per keyframe, then the prompt, after the text encoder's 50th layer.
+    /// [`encode_prompt`] with this release's text encoder.
     pub fn encode_prompt(&self, prompt: &str, keyframes: &[&Image]) -> Result<Conditioning> {
-        use crate::qwen_vl::{QwenVl, QwenVlOptions};
-        let parent = self.text_encoder_dir.parent().map(Path::to_path_buf).unwrap_or_default();
-        let opts = QwenVlOptions {
-            mmap: true,
-            vision: !keyframes.is_empty(),
-            tokenizer_dir: [self.dir.join("tokenizer"), parent.join("tokenizer"), self.text_encoder_dir.clone()]
-                .into_iter()
-                .find(|d| d.join("tokenizer.json").exists()),
-            ..Default::default()
-        };
-        let vl = QwenVl::load(&self.text_encoder_dir, &opts)?;
-        if vl.model().cfg.num_hidden_layers <= 50 {
-            bail!(
-                "the text encoder has {} layers; MiniMax-H3 conditions on its 50th",
-                vl.model().cfg.num_hidden_layers
-            );
-        }
-        let (mut ids, mut tags, mut images) = (Vec::new(), Vec::new(), Vec::new());
-        for (i, k) in keyframes.iter().enumerate() {
-            let im = vl.encode_image(&k.rgb, k.width, k.height, 0)?;
-            let label = vl.tokenize(&format!("<Picture {}>: ", i + 1))?;
-            let block = vl.tokenize(&im.placeholder())?;
-            tags.extend(std::iter::repeat_n(TAG_TEXT, label.len()));
-            tags.extend(std::iter::repeat_n(TAG_IMAGE, block.len()));
-            ids.extend(label);
-            ids.extend(block);
-            images.push(im);
-        }
-        let pids = vl.tokenize(prompt)?;
-        if pids.is_empty() {
-            bail!("empty prompt");
-        }
-        tags.extend(std::iter::repeat_n(TAG_TEXT, pids.len()));
-        ids.extend(pids);
-        let mut hs = vl.hidden_states_tokens(ids, &images, None, &[49])?;
-        let (_, text) = hs.layers.pop().context("layer 50 not captured")?;
-        Ok(Conditioning { text, tags })
+        encode_prompt(&self.dir, &self.text_encoder_dir, prompt, keyframes)
     }
 
     /// A keyframe's conditioning latents `[C, 1, lh, lw]` (normalized): the posterior sampled with

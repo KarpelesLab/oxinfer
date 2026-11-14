@@ -513,7 +513,9 @@ impl<'a> VaeDecoder<'a> {
         frames.append(&mut overlap);
         // The repeated latent frames decoded into frames nobody asked for.
         let tail = cfg.clip_length % r;
-        let cut: usize = (0..pad).map(|k| if tail != 0 && (t + k) % tcs == 0 { tail } else { r }).sum();
+        let cut: usize = (0..pad)
+            .map(|k| if tail != 0 && (t + k).is_multiple_of(tcs) { tail } else { r })
+            .sum();
         frames.truncate(frames.len().saturating_sub(cut));
         let nf = frames.len();
         let mut out = vec![0f32; 3 * nf * fplane];

@@ -69,6 +69,10 @@ fn main() -> Result<()> {
 
     // DiT: layout, the first step's velocities, the rows after the whole schedule.
     let tdir = dir.join("transformer");
+    if !tdir.exists() {
+        // A VAE-only case (the real VAE).
+        return Ok(());
+    }
     let files = ModelFiles::open(&tdir, false)?;
     let dit = Dit::load(DitConfig::load(&tdir)?, &files, None)?;
     let g = Geometry {
