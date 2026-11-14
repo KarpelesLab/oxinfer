@@ -120,6 +120,40 @@ impl TextLm for QwenModel<'_> {
     }
 }
 
+type PrefillHook<'f> = dyn FnMut(usize, usize) + 'f;
+
+thread_local! {
+    static PREFILL_HOOK: std::cell::Cell<Option<*mut PrefillHook<'static>>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` on this thread with `hook` receiving the progress of every [`prefill`] of more than
+/// one token inside it: `(tokens done, tokens of the prompt)`, before the first chunk and after
+/// each one. For callers that want to show something while a long prompt is read on a slow
+/// device (the server's streamed responses).
+pub fn with_prefill_progress<T>(hook: &mut PrefillHook<'_>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<*mut PrefillHook<'static>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PREFILL_HOOK.with(|h| h.set(self.0));
+        }
+    }
+    let p: *mut PrefillHook<'_> = hook;
+    // SAFETY: the pointer is only dereferenced on this thread while `hook` is borrowed: the
+    // guard removes it before this returns, also when unwinding.
+    let p: *mut PrefillHook<'static> = unsafe { std::mem::transmute(p) };
+    let _restore = Restore(PREFILL_HOOK.with(|h| h.replace(Some(p))));
+    f()
+}
+
+fn report_prefill(done: usize, total: usize) {
+    // Taken while called, so the hook is never re-entered.
+    if let Some(h) = PREFILL_HOOK.with(|c| c.take()) {
+        // SAFETY: see `with_prefill_progress`.
+        unsafe { (*h)(done, total) };
+        PREFILL_HOOK.with(|c| c.set(Some(h)));
+    }
+}
+
 /// Prefills `ids` in chunks of `chunk` tokens with multimodal overrides (`(position in ids,
 /// embedding)`); returns the hidden states of the last chunk. A chunk ending inside a run of
 /// consecutive overrides is stretched to the run's end when the model needs whole runs
@@ -142,6 +176,10 @@ pub fn prefill<M: TextLm + ?Sized>(model: &M, sess: &mut M::Sess, ids: &[u32], c
     };
     mm_pos.sort_unstable();
     let is_mm = |p: usize| mm_pos.binary_search(&p).is_ok();
+    let report = ids.len() > 1;
+    if report {
+        report_prefill(0, ids.len());
+    }
     while start < ids.len() {
         let mut end = (start + chunk.max(1)).min(ids.len());
         if whole {
@@ -157,6 +195,9 @@ pub fn prefill<M: TextLm + ?Sized>(model: &M, sess: &mut M::Sess, ids: &[u32], c
             .collect();
         hs = model.forward_hidden_mm(sess, c, &local);
         start = end;
+        if report {
+            report_prefill(end, ids.len());
+        }
     }
     hs
 }

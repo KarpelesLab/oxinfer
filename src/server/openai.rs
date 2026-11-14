@@ -1,7 +1,7 @@
 //! The text endpoints: chat completions, (legacy) completions and embeddings.
 
 use super::media::{TempFiles, random_seed, to_file};
-use super::registry::{Kind, Loaded};
+use super::registry::{Kind, Loaded, OnStage, Stage};
 use super::{Api, ApiError, ApiResponse, ApiResult, Output, Sink, now};
 use crate::constrain::Vocab;
 use crate::engine::{
@@ -45,6 +45,9 @@ struct Gen {
     n: usize,
     stream: bool,
     include_usage: bool,
+    /// `stream_options.progress`: what the request waits for as `progress` events (an
+    /// extension) instead of comment lines.
+    progress: bool,
     /// Log probabilities with this many alternatives per token.
     logprobs: Option<usize>,
 }
@@ -152,6 +155,7 @@ impl Gen {
             n,
             stream,
             include_usage: v.pointer("/stream_options/include_usage").and_then(Value::as_bool).unwrap_or(false),
+            progress: v.pointer("/stream_options/progress").and_then(Value::as_bool).unwrap_or(false),
             logprobs,
         })
     }
@@ -581,11 +585,114 @@ impl LogCollector {
     }
 }
 
-/// Runs the request's `n` choices on its model, streaming the text to `emit`.
-fn run_chat(api: &Api, req: &ChatRequest, emit: Emit) -> ApiResult<Vec<Choice>> {
+/// A byte count for a progress line: `412 kB`, `35.2 MB`, `1.74 GB`.
+fn size(n: u64) -> String {
+    match n {
+        0..1_000_000 => format!("{} kB", n.div_ceil(1000)),
+        1_000_000..1_000_000_000 => format!("{:.1} MB", n as f64 / 1e6),
+        _ => format!("{:.2} GB", n as f64 / 1e9),
+    }
+}
+
+/// What a streamed response says before its first token, so that a client is not left without a
+/// byte while a model downloads, loads, is busy with another request or reads a long prompt on a
+/// slow device. By default SSE comment lines (`: loading qwen`), which every SSE client skips
+/// and which keep the connection alive; with `stream_options.progress` an `event: progress`
+/// with a JSON body instead (an extension: OpenAI's clients do not expect named events here).
+/// At most one a second per stage, plus the one that completes a download or a prompt.
+struct Stages<'a> {
+    model: &'a str,
+    events: bool,
+    last: Option<(std::mem::Discriminant<Stage<'static>>, std::time::Instant)>,
+}
+
+impl<'a> Stages<'a> {
+    fn new(model: &'a str, events: bool) -> Self {
+        Stages { model, events, last: None }
+    }
+
+    /// The bytes to send for `st`, or None when one of its kind went out less than a second ago.
+    fn render(&mut self, st: &Stage) -> Option<String> {
+        let kind = std::mem::discriminant(&match *st {
+            Stage::Waiting => Stage::Waiting,
+            Stage::Loading => Stage::Loading,
+            Stage::Downloading { .. } => Stage::Downloading {
+                file: "",
+                index: 0,
+                count: 0,
+                done: 0,
+                total: None,
+            },
+            Stage::Prompt { .. } => Stage::Prompt { done: 0, total: 0 },
+        });
+        // The small files of a repository (configuration, tokenizer) come in a moment.
+        if matches!(*st, Stage::Downloading { index, total, .. } if index == 0 || total.is_some_and(|t| t < 1_000_000)) {
+            return None;
+        }
+        let complete = match *st {
+            Stage::Downloading { done, total, .. } => total == Some(done),
+            Stage::Prompt { done, total } => done == total,
+            _ => false,
+        };
+        let now = std::time::Instant::now();
+        if !complete
+            && self
+                .last
+                .is_some_and(|(k, t)| k == kind && now.duration_since(t) < std::time::Duration::from_secs(1))
+        {
+            return None;
+        }
+        self.last = Some((kind, now));
+        let m = self.model;
+        let (v, text) = match *st {
+            Stage::Waiting => (json!({ "stage": "waiting" }), format!("waiting: {m} is busy with another request")),
+            Stage::Loading => (json!({ "stage": "loading" }), format!("loading {m}")),
+            Stage::Downloading {
+                file,
+                index,
+                count,
+                done,
+                total,
+            } => (
+                json!({ "stage": "downloading", "file": file, "index": index, "count": count, "done": done, "total": total }),
+                match total {
+                    Some(t) if t > 0 => format!(
+                        "downloading {m}: {file} {:.0}% ({} of {})",
+                        100.0 * done as f64 / t as f64,
+                        size(done),
+                        size(t)
+                    ),
+                    _ => format!("downloading {m}: {file} ({})", size(done)),
+                },
+            ),
+            Stage::Prompt { done, total } => (
+                json!({ "stage": "prompt", "done": done, "total": total }),
+                format!("reading the prompt: {done} of {total} tokens"),
+            ),
+        };
+        Some(if self.events {
+            let mut v = v;
+            v["object"] = "progress".into();
+            v["model"] = m.into();
+            format!("event: progress\ndata: {v}\n\n")
+        } else {
+            format!(": {text}\n\n")
+        })
+    }
+}
+
+/// Runs the request's `n` choices on its model, streaming the text to `emit` and what it waits
+/// for before that to `on`.
+fn run_chat(api: &Api, req: &ChatRequest, emit: Emit, on: Option<OnStage<'_, '_>>) -> ApiResult<Vec<Choice>> {
     let mut temp = TempFiles::default();
     let messages = req.messages(api, &mut temp)?;
-    let mut lease = api.models.acquire(&req.model, Kind::Chat)?;
+    let mut on = on;
+    let mut lease = api.models.acquire_with(&req.model, Kind::Chat, on.as_deref_mut())?;
+    let mut prompt = |done: usize, total: usize| {
+        if let Some(on) = on.as_deref_mut() {
+            on(&Stage::Prompt { done, total });
+        }
+    };
     let spec = lease.spec().clone();
     let Loaded::Chat(engine) = lease.model() else { unreachable!() };
     configure(engine, &spec, req.think, &req.tools, req.params.max_tokens);
@@ -601,8 +708,8 @@ fn run_chat(api: &Api, req: &ChatRequest, emit: Emit) -> ApiResult<Vec<Choice>> 
         let (mut text, mut thinking) = (String::new(), String::new());
         let mut gone = false;
         let mut logs = LogCollector::new(engine, req.params.logprobs.is_some());
-        let reply = engine
-            .chat(&messages, &mut |d| {
+        let reply = crate::generate::with_prefill_progress(&mut prompt, || {
+            engine.chat(&messages, &mut |d| {
                 logs.push(d.logprob);
                 let ok = if d.thinking {
                     thinking.push_str(d.text);
@@ -615,7 +722,8 @@ fn run_chat(api: &Api, req: &ChatRequest, emit: Emit) -> ApiResult<Vec<Choice>> 
                 gone |= !ok;
                 if gone || filter.hit { Flow::Stop } else { Flow::Continue }
             })
-            .map_err(|e| ApiError::bad(format!("{e:#}")))?;
+        })
+        .map_err(|e| ApiError::bad(format!("{e:#}")))?;
         let rest = filter.finish();
         let (logprobs, last) = logs.finish(filter.hit);
         if !rest.is_empty() || !last.is_empty() {
@@ -703,7 +811,7 @@ pub(super) fn chat(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
             }),
         });
     }
-    let choices = run_chat(api, &req, &mut |_, _, _, _| true)?;
+    let choices = run_chat(api, &req, &mut |_, _, _, _| true, None)?;
     api.flush_prompt_cache_later(&req.model);
     let list: Vec<Value> = choices
         .iter()
@@ -751,20 +859,28 @@ fn stream_chat(api: &Api, req: &ChatRequest, id: &str, created: u64, sink: Sink)
     if !sse(sink, &chunk(json!({ "role": "assistant", "content": "" }), Value::Null)) {
         return;
     }
-    let r = run_chat(api, req, &mut |_, text, thinking, logprobs| {
-        let delta = if thinking {
-            json!({ "reasoning_content": text })
-        } else {
-            json!({ "content": text })
-        };
-        // The entries of the tokens whose text this piece (or an earlier, empty one) holds.
-        let logprobs = if req.params.logprobs.is_some() && !thinking {
-            LogEntry::chat(logprobs)
-        } else {
-            Value::Null
-        };
-        sse(sink, &chunk_with(delta, Value::Null, logprobs))
-    });
+    // The text and the stages before it go out through the same sink.
+    let out = std::cell::RefCell::new(&mut *sink);
+    let mut stages = Stages::new(&req.model, req.params.progress);
+    let r = run_chat(
+        api,
+        req,
+        &mut |_, text, thinking, logprobs| {
+            let delta = if thinking {
+                json!({ "reasoning_content": text })
+            } else {
+                json!({ "content": text })
+            };
+            // The entries of the tokens whose text this piece (or an earlier, empty one) holds.
+            let logprobs = if req.params.logprobs.is_some() && !thinking {
+                LogEntry::chat(logprobs)
+            } else {
+                Value::Null
+            };
+            sse(&mut **out.borrow_mut(), &chunk_with(delta, Value::Null, logprobs))
+        },
+        Some(&mut |st| stages.render(st).is_none_or(|s| (out.borrow_mut())(s.as_bytes()))),
+    );
     match r {
         Ok(choices) => {
             let Some(c) = choices.first() else { return };
@@ -840,7 +956,7 @@ pub(super) fn completions(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
                     })
                 };
                 let mut offset = 0;
-                let mut piece = |_: usize, t: &str, l: &[LogEntry]| {
+                let mut piece = |sink: Sink, _: usize, t: &str, l: &[LogEntry]| {
                     let logprobs = if job.params.logprobs.is_some() {
                         LogEntry::legacy(l, offset)
                     } else {
@@ -849,7 +965,14 @@ pub(super) fn completions(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
                     offset += t.chars().count();
                     sse(sink, &chunk(t, Value::Null, logprobs))
                 };
-                match job.run(&api, &mut piece) {
+                let out = std::cell::RefCell::new(&mut *sink);
+                let mut stages = Stages::new(&job.model, job.params.progress);
+                let r = job.run(
+                    &api,
+                    &mut |i, t, l| piece(&mut **out.borrow_mut(), i, t, l),
+                    Some(&mut |st| stages.render(st).is_none_or(|s| (out.borrow_mut())(s.as_bytes()))),
+                );
+                match r {
                     Ok(choices) => {
                         if let Some(c) = choices.first() {
                             sse(sink, &chunk("", c.finish.into(), Value::Null));
@@ -870,7 +993,7 @@ pub(super) fn completions(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
             }),
         });
     }
-    let choices = job.run(api, &mut |_, _, _| true)?;
+    let choices = job.run(api, &mut |_, _, _| true, None)?;
     let list: Vec<Value> = choices
         .iter()
         .enumerate()
@@ -905,8 +1028,19 @@ struct Completion {
 
 impl Completion {
     /// Every prompt `n` times; `emit(choice, text, log probabilities)` streams.
-    fn run(&self, api: &Api, emit: &mut dyn FnMut(usize, &str, &[LogEntry]) -> bool) -> ApiResult<Vec<Choice>> {
-        let mut lease = api.models.acquire(&self.model, Kind::Chat)?;
+    fn run(
+        &self,
+        api: &Api,
+        emit: &mut dyn FnMut(usize, &str, &[LogEntry]) -> bool,
+        on: Option<OnStage<'_, '_>>,
+    ) -> ApiResult<Vec<Choice>> {
+        let mut on = on;
+        let mut lease = api.models.acquire_with(&self.model, Kind::Chat, on.as_deref_mut())?;
+        let mut reading = |done: usize, total: usize| {
+            if let Some(on) = on.as_deref_mut() {
+                on(&Stage::Prompt { done, total });
+            }
+        };
         let spec = lease.spec().clone();
         let Loaded::Chat(engine) = lease.model() else { unreachable!() };
         let c = engine.config_mut();
@@ -942,15 +1076,16 @@ impl Completion {
                 let mut gone = false;
                 let echoed = text.chars().count();
                 let mut logs = LogCollector::new(engine, self.params.logprobs.is_some());
-                let reply = engine
-                    .complete(&prompt, &mut |d| {
+                let reply = crate::generate::with_prefill_progress(&mut reading, || {
+                    engine.complete(&prompt, &mut |d| {
                         logs.push(d.logprob);
                         let t = filter.push(d.text);
                         text.push_str(&t);
                         gone |= !t.is_empty() && !emit(k, &t, &logs.take());
                         if gone || filter.hit { Flow::Stop } else { Flow::Continue }
                     })
-                    .map_err(|e| ApiError::bad(format!("{e:#}")))?;
+                })
+                .map_err(|e| ApiError::bad(format!("{e:#}")))?;
                 let rest = filter.finish();
                 let (logprobs, last) = logs.finish(filter.hit);
                 if !rest.is_empty() || !last.is_empty() {
@@ -1045,6 +1180,51 @@ pub(super) fn embeddings(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stages_are_comments_or_events_and_throttled() {
+        let dl = |done| Stage::Downloading {
+            file: "model.safetensors",
+            index: 1,
+            count: 1,
+            done,
+            total: Some(2_000_000_000),
+        };
+        let mut s = Stages::new("qwen", false);
+        assert_eq!(s.render(&Stage::Loading).unwrap(), ": loading qwen\n\n");
+        assert_eq!(
+            s.render(&dl(500_000_000)).unwrap(),
+            ": downloading qwen: model.safetensors 25% (500.0 MB of 2.00 GB)\n\n"
+        );
+        // The same stage again within the second is dropped, unless it completes it.
+        assert!(s.render(&dl(600_000_000)).is_none());
+        assert!(s.render(&dl(2_000_000_000)).unwrap().contains("100%"));
+        assert_eq!(
+            s.render(&Stage::Waiting).unwrap(),
+            ": waiting: qwen is busy with another request\n\n"
+        );
+        assert_eq!(
+            s.render(&Stage::Prompt { done: 256, total: 900 }).unwrap(),
+            ": reading the prompt: 256 of 900 tokens\n\n"
+        );
+        assert!(s.render(&Stage::Prompt { done: 512, total: 900 }).is_none());
+        assert!(s.render(&Stage::Prompt { done: 900, total: 900 }).is_some());
+        // As events (stream_options.progress): one JSON object per event.
+        let mut s = Stages::new("qwen", true);
+        let e = s.render(&Stage::Prompt { done: 256, total: 900 }).unwrap();
+        let data = e.strip_prefix("event: progress\ndata: ").unwrap().strip_suffix("\n\n").unwrap();
+        let v: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(
+            v,
+            json!({"object": "progress", "model": "qwen", "stage": "prompt", "done": 256, "total": 900})
+        );
+        let p = ChatRequest::parse(&json!({
+            "model": "m", "messages": [{"role": "user", "content": "x"}],
+            "stream": true, "stream_options": {"progress": true},
+        }))
+        .unwrap();
+        assert!(p.params.progress);
+    }
 
     #[test]
     fn stop_filter_holds_partial_matches() {

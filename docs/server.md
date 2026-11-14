@@ -46,6 +46,35 @@ img = client.images.generate(model="sd", prompt="a lighthouse at dusk", size="51
 | `POST /v1/audio/transcriptions`, `/v1/audio/translations` | Whisper, Nemotron 3.5 Transcribe ([its differences](nemotron.md#speech-to-text-nemotron-35-transcribe): `prompt` is the instruction, one segment, no word timestamps or beam search) | multipart: `file` (any format oxideav decodes), `language`, `prompt`, `temperature`, `response_format` json / text / verbose_json / srt / vtt, `timestamp_granularities[]` word / segment, `beam_size`, `patience`, `length_penalty`, `best_of`; several `file` parts are transcribed as a batch and answered as a JSON array (json / verbose_json) |
 | `POST /v1/audio/speech` | Orpheus, ZONOS3-Mini (44.1 kHz, the audio sent once generated; its fields in [ZONOS3-Mini](zonos.md)), Fish Audio Drama 3 (44.1 kHz, the audio sent per chunk of text; `voice` a speaker tag 0 to 15, its fields in [Drama 3](fish-drama.md)), Audio8 TTS (44.1 kHz, streamed as it is generated; `voice` a clip of its voices folder; its fields in [Audio8 TTS](audio8-tts.md)) | `input`, `voice` (the model's voices; OpenAI's names take the default one), `response_format` wav or pcm (16-bit 24 kHz mono, streamed as it is generated), `stream_format` sse; extensions `seed`, `temperature`, `top_p`, `repetition_penalty`; an array as `input` (1 to 64 texts, `voice` one name or an array) is generated as one batch and answered as JSON, `data[i].audio` the base64 WAV (or PCM) of `input[i]` |
 
+### Progress before the first token
+
+A streamed chat or completion (`"stream": true`) says what it is waiting for, so that a client is
+not left without a byte while a model downloads or a long prompt is read on a slow device:
+
+```
+: loading qwen
+: downloading qwen: model.safetensors 42% (735.0 MB of 1.75 GB)
+: waiting: qwen is busy with another request
+: reading the prompt: 512 of 1219 tokens
+data: {"id":"chatcmpl-...","object":"chat.completion.chunk", ...}
+```
+
+These are SSE comment lines: every SSE client skips them (the `openai` clients included), and
+they keep the connection from timing out. At most one a second per stage, plus the one that
+completes a download or a prompt; small files (configuration, tokenizer) are not reported. With
+`"stream_options": {"progress": true}` (an extension) they are events with a JSON body instead,
+for clients that want to show them:
+
+```
+event: progress
+data: {"object":"progress","model":"qwen","stage":"downloading","file":"model.safetensors","index":1,"count":1,"done":735000000,"total":1750000000}
+```
+
+`stage` is `waiting`, `downloading` (`file`, `index` of `count` files, `done` of `total` bytes),
+`loading` or `prompt` (`done` of `total` tokens, per prefill chunk). A client that closes the
+connection during a download cancels it (the partial file is kept and resumed by the next
+request). Requests that are not streamed, and the other endpoints, are unchanged.
+
 Errors have OpenAI's shape (`{"error": {"message", "type", "param", "code"}}`) and status codes:
 400 for a bad request (also a model of the wrong kind for the endpoint), 401 without the API key,
 404 for an unknown model (`model_not_found`) or endpoint, 405, 413 over the body limit, 500 when

@@ -130,6 +130,30 @@ pub(crate) struct Registry {
     log: bool,
 }
 
+/// What a request is waiting for before its first token ([`Registry::acquire_with`], and the
+/// prompt pass of the generation that follows).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Stage<'a> {
+    /// Another request is using the model.
+    Waiting,
+    /// A file of the model is being fetched (`index` of `count` large files; 0 for metadata).
+    Downloading {
+        file: &'a str,
+        index: usize,
+        count: usize,
+        done: u64,
+        total: Option<u64>,
+    },
+    /// The model is being read into memory.
+    Loading,
+    /// The prompt is being read by the model: tokens done of its total.
+    Prompt { done: usize, total: usize },
+}
+
+/// Receives the [`Stage`]s of a request; false when the client is gone (a download is then
+/// cancelled, a wait given up).
+pub(crate) type OnStage<'a, 'f> = &'a mut (dyn FnMut(&Stage) -> bool + 'f);
+
 /// A model in use: the lock on its slot, held until dropped.
 pub(crate) struct Lease<'a> {
     pub entry: &'a Entry,
@@ -204,17 +228,67 @@ impl Registry {
 
     /// Waits for the model, loads it if needed, and checks its kind.
     pub fn acquire(&self, id: &str, want: Kind) -> ApiResult<Lease<'_>> {
+        self.acquire_with(id, want, None)
+    }
+
+    /// [`Registry::acquire`] reporting what it waits for to `on`: another request holding the
+    /// model, the files being fetched, the load.
+    pub fn acquire_with(&self, id: &str, want: Kind, mut on: Option<OnStage<'_, '_>>) -> ApiResult<Lease<'_>> {
+        let gone = || ApiError::new(499, "the client closed the request");
         let entry = self.find(id)?;
-        let mut guard = lock(&entry.slot);
-        if guard.is_none() {
-            let (kind, image) = self.detect(entry).map_err(|e| ApiError::new(500, format!("model {id}: {e:#}")))?;
-            if kind != want {
-                return Err(wrong_kind(id, kind, want));
+        let mut guard = match (&mut on, entry.slot.try_lock()) {
+            (_, Ok(g)) => g,
+            (_, Err(std::sync::TryLockError::Poisoned(p))) => p.into_inner(),
+            (None, Err(std::sync::TryLockError::WouldBlock)) => lock(&entry.slot),
+            // In use: say so every two seconds until it is free.
+            (Some(on), Err(std::sync::TryLockError::WouldBlock)) => {
+                let mut next = std::time::Instant::now();
+                loop {
+                    if std::time::Instant::now() >= next {
+                        if !on(&Stage::Waiting) {
+                            return Err(gone());
+                        }
+                        next = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    match entry.slot.try_lock() {
+                        Ok(g) => break g,
+                        Err(std::sync::TryLockError::Poisoned(p)) => break p.into_inner(),
+                        Err(std::sync::TryLockError::WouldBlock) => {}
+                    }
+                }
             }
-            *guard = Some(
+        };
+        if guard.is_none() {
+            let load = || -> ApiResult<Loaded> {
+                let (kind, image) = self.detect(entry).map_err(|e| ApiError::new(500, format!("model {id}: {e:#}")))?;
+                if kind != want {
+                    return Err(wrong_kind(id, kind, want));
+                }
                 self.load(entry, kind, image)
-                    .map_err(|e| ApiError::new(500, format!("load {id}: {e:#}")))?,
-            );
+                    .map_err(|e| ApiError::new(500, format!("load {id}: {e:#}")))
+            };
+            *guard = Some(match &mut on {
+                None => load()?,
+                Some(on) => {
+                    if !on(&Stage::Loading) {
+                        return Err(gone());
+                    }
+                    // Downloads report through the hook; once the last file is whole the rest
+                    // of the wait is the load.
+                    let mut hook = |p: &crate::hf::Progress| {
+                        let last = p.count > 0 && p.index == p.count && p.total == Some(p.done);
+                        on(&Stage::Downloading {
+                            file: p.file,
+                            index: p.index,
+                            count: p.count,
+                            done: p.done,
+                            total: p.total,
+                        }) && (!last || on(&Stage::Loading))
+                    };
+                    crate::hf::with_progress(&mut hook, || Ok(load())).map_err(|_| gone())??
+                }
+            });
         }
         let kind = guard.as_ref().unwrap().kind();
         if kind != want {
