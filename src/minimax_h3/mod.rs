@@ -15,6 +15,8 @@
 
 pub mod dit;
 pub mod vae;
+pub mod video;
+pub mod video_vae;
 
 use crate::clock::Instant;
 use crate::model::Quant;

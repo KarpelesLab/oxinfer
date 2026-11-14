@@ -14,6 +14,10 @@
 //! - output: RMSNorm with a per-timestep shift / scale, then the output head (H3-Image: one per
 //!   sampling step, the "PDD" heads of `pdd_fused_heads.safetensors`).
 //!
+//! MiniMax-H3 (video) adds an audio stream to the same stack: `audio_proj_in` / `audio_proj_out`
+//! over audio latent rows (tag 2), rows of every modality scattered through one sequence
+//! ([`Dit::forward_av`]).
+//!
 //! Loads the release's layout (`blocks.N.attn.qkv_proj` interleaved per head as `[q k v]`,
 //! `mlp.fc1` as `[gate; value]`, `final_layer.*`) as stored, or diffusers' (`transformer_blocks.N`,
 //! `to_q` / `to_k` / `to_v`, `ff.net.0.proj` as `[value; gate]`).
@@ -28,6 +32,7 @@ use std::path::Path;
 pub const MODALITIES: usize = 3;
 pub const TAG_IMAGE: u8 = 0;
 pub const TAG_TEXT: u8 = 1;
+pub const TAG_AUDIO: u8 = 2;
 
 #[derive(Debug, Clone)]
 pub struct DitConfig {
@@ -38,6 +43,8 @@ pub struct DitConfig {
     pub head_dim: usize,
     pub ffn: usize,
     pub in_channels: usize,
+    /// Channels of an audio latent row (MiniMax-H3; 0 for H3-Image).
+    pub audio_channels: usize,
     pub patch: [usize; 3],
     pub text_dim: usize,
     pub freq_dim: usize,
@@ -78,6 +85,7 @@ impl DitConfig {
             head_dim: u(&["attention_head_dim"], None)?,
             ffn: u(&["ffn_dim", "ffn_hidden_size"], None)?,
             in_channels: u(&["in_channels", "latents_dim"], None)?,
+            audio_channels: u(&["audio_in_channels", "audio_latents_dim"], Some(0))?,
             patch: [patch[0], patch[1], patch[2]],
             text_dim: u(&["text_dim"], None)?,
             freq_dim: u(&["freq_dim", "timestep_input_dim"], Some(256))?,
@@ -206,6 +214,8 @@ pub struct Dit<'a> {
     norm_out_ada: DLin<'a>,
     /// The output head of each sampling step (H3-Image), or the one head.
     heads_out: Vec<DLin<'a>>,
+    /// MiniMax-H3's audio projections (in, out).
+    audio: Option<(DLin<'a>, DLin<'a>)>,
     inv_freq: Vec<f32>,
 }
 
@@ -315,6 +325,15 @@ impl<'a> Dit<'a> {
                 .collect::<Result<Vec<_>>>()?,
             None => vec![DLin::load(files, &n("final_layer.video_out", "proj_out"), pd, h, true)?],
         };
+        let ain = n("audio_patch_proj", "audio_proj_in");
+        let audio = if cfg.audio_channels > 0 && files.has(&format!("{ain}.weight")) {
+            Some((
+                DLin::load(files, &ain, h, cfg.audio_channels, true)?,
+                DLin::load(files, &n("final_layer.audio_out", "audio_proj_out"), cfg.audio_channels, h, true)?,
+            ))
+        } else {
+            None
+        };
         let rd = cfg.rope_freq_dim;
         let inv_freq = (0..rd)
             .map(|i| (1.0 / cfg.rope_theta.powf((2 * i) as f64 / (2 * rd) as f64)) as f32)
@@ -345,6 +364,7 @@ impl<'a> Dit<'a> {
             norm_out: norm(&n("final_layer.norm.weight", "norm_out.norm.weight"), h)?,
             norm_out_ada: DLin::load(files, &n("final_layer.adaln_proj.linear", "norm_out.linear"), 2 * h, td, true)?,
             heads_out,
+            audio,
             inv_freq,
             cfg,
         })
@@ -368,7 +388,7 @@ impl<'a> Dit<'a> {
     }
 
     /// The timestep embedding (`[time_dim]`) of a `t` in `[0, 1]`.
-    fn time_embed(&self, t: f32) -> Vec<f32> {
+    pub fn time_embed(&self, t: f32) -> Vec<f32> {
         let e = crate::sd::ops::timestep_embedding(t, self.cfg.freq_dim, true, 0.0);
         let mut a = self.time1.forward(&e, 1);
         a.iter_mut().for_each(|v| *v = crate::sd::ops::silu(*v));
@@ -462,6 +482,45 @@ impl<'a> Dit<'a> {
         residual(x, &y, ada, h, 5);
     }
 
+    /// The block stack over the packed sequence `x` (`[n, H]`): `st` holds the SiLU of each distinct
+    /// timestep embedding (`[nt, time_dim]`), a row reads the AdaLN set of its `(timestep, tag)`.
+    fn stack(&self, x: &mut [f32], st: &[f32], timestep_index: &[usize], tags: &[u8], positions: &[[f32; 3]]) {
+        let h = self.cfg.hidden;
+        let n = x.len() / h;
+        let nt = st.len() / self.cfg.time_dim;
+        let (cos, sin) = self.rope(positions);
+        let six = 6 * h;
+        for b in &self.blocks {
+            // [nt, 3 * 6H]: the six vectors of each (timestep, modality), then one row per token.
+            let table = b.adaln.as_ref().unwrap().forward(st, nt);
+            let mut ada = vec![0f32; n * six];
+            for_chunks(&mut ada, six, true, |r, row| {
+                let k = timestep_index[r] * MODALITIES + tags[r] as usize;
+                row.copy_from_slice(&table[k * six..(k + 1) * six]);
+            });
+            self.block(b, x, n, Some(&ada), Some((&cos, &sin)));
+        }
+    }
+
+    /// The output norm of the rows `rows` of `x` (RMSNorm, then the shift / scale of each row's
+    /// timestep).
+    fn norm_out_rows(&self, x: &[f32], rows: &[usize], st: &[f32], timestep_index: &[usize]) -> Vec<f32> {
+        let h = self.cfg.hidden;
+        let nt = st.len() / self.cfg.time_dim;
+        let so = self.norm_out_ada.forward(st, nt);
+        let mut hn = vec![0f32; rows.len() * h];
+        for_chunks(&mut hn, h, true, |r, row| row.copy_from_slice(&x[rows[r] * h..(rows[r] + 1) * h]));
+        rmsnorm_f32w_rows_inplace(&mut hn, h, &self.norm_out, self.cfg.final_eps);
+        for_chunks(&mut hn, h, true, |r, row| {
+            let k = timestep_index[rows[r]];
+            let (shift, scale) = (&so[k * 2 * h..k * 2 * h + h], &so[k * 2 * h + h..(k + 1) * 2 * h]);
+            for ((v, &s), &c) in row.iter_mut().zip(scale).zip(shift) {
+                *v = *v * (1.0 + s) + c;
+            }
+        });
+        hn
+    }
+
     /// The velocity of the latent rows for one step (`head`: which output head).
     pub fn forward(&self, p: &Packed, text_embedded: &[f32], head: usize) -> Vec<f32> {
         let cfg = &self.cfg;
@@ -472,34 +531,80 @@ impl<'a> Dit<'a> {
         let mut x = vec![0f32; n * h];
         x[..n_text * h].copy_from_slice(text_embedded);
         x[n_text * h..].copy_from_slice(&self.proj_in.forward(p.image, n_img));
-        let temb: Vec<Vec<f32>> = p.timesteps.iter().map(|&t| self.time_embed(t)).collect();
-        let st: Vec<f32> = temb.iter().flat_map(|e| e.iter().map(|&v| crate::sd::ops::silu(v))).collect();
-        let nt = p.timesteps.len();
-        let (cos, sin) = self.rope(p.positions);
-        let six = 6 * h;
-        for b in &self.blocks {
-            // [nt, 3 * 6H]: the six vectors of each (timestep, modality), then one row per token.
-            let table = b.adaln.as_ref().unwrap().forward(&st, nt);
-            let mut ada = vec![0f32; n * six];
-            for_chunks(&mut ada, six, true, |r, row| {
-                let k = p.timestep_index[r] * MODALITIES + p.tags[r] as usize;
-                row.copy_from_slice(&table[k * six..(k + 1) * six]);
-            });
-            self.block(b, &mut x, n, Some(&ada), Some((&cos, &sin)));
-        }
+        let st: Vec<f32> = p
+            .timesteps
+            .iter()
+            .flat_map(|&t| self.time_embed(t).into_iter().map(crate::sd::ops::silu))
+            .collect();
+        self.stack(&mut x, &st, p.timestep_index, p.tags, p.positions);
         // Output norm with the per-timestep shift / scale, then the head over the latent rows.
-        let so = self.norm_out_ada.forward(&st, nt);
-        let mut hn = x[n_text * h..].to_vec();
-        rmsnorm_f32w_rows_inplace(&mut hn, h, &self.norm_out, cfg.final_eps);
-        for_chunks(&mut hn, h, true, |r, row| {
-            let k = p.timestep_index[n_text + r];
-            let (shift, scale) = (&so[k * 2 * h..k * 2 * h + h], &so[k * 2 * h + h..(k + 1) * 2 * h]);
-            for ((v, &s), &c) in row.iter_mut().zip(scale).zip(shift) {
-                *v = *v * (1.0 + s) + c;
-            }
-        });
+        let rows: Vec<usize> = (n_text..n).collect();
+        let hn = self.norm_out_rows(&x, &rows, &st, p.timestep_index);
         self.heads_out[head.min(self.heads_out.len() - 1)].forward(&hn, n_img)
     }
+
+    /// Whether the checkpoint has MiniMax-H3's audio stream.
+    pub fn has_audio(&self) -> bool {
+        self.audio.is_some()
+    }
+
+    /// MiniMax-H3's joint forward: the velocities of the video rows and of the audio rows, in the
+    /// order of `video_index` / `audio_index`.
+    pub fn forward_av(&self, p: &PackedAv) -> Result<(Vec<f32>, Vec<f32>)> {
+        let cfg = &self.cfg;
+        let h = cfg.hidden;
+        let (ain, aout) = self.audio.as_ref().map(|(a, b)| (a, b)).context("this DiT has no audio stream")?;
+        let n = p.positions.len();
+        let (nv, na) = (p.video_index.len(), p.audio_index.len());
+        let n_text = p.text_embedded.len() / h;
+        if p.video.len() != nv * cfg.patch_dim()
+            || p.audio.len() != na * cfg.audio_channels
+            || n_text != p.text_index.len()
+            || n != n_text + nv + na
+            || p.tags.len() != n
+            || p.timestep_index.len() != n
+            || p.temb.len() % cfg.time_dim != 0
+        {
+            bail!("packed sequence: the rows, indices and positions do not agree");
+        }
+        let mut x = vec![0f32; n * h];
+        for (src, index) in [
+            (p.text_embedded, p.text_index),
+            (&self.proj_in.forward(p.video, nv)[..], p.video_index),
+            (&ain.forward(p.audio, na)[..], p.audio_index),
+        ] {
+            for (r, &i) in index.iter().enumerate() {
+                x[i * h..(i + 1) * h].copy_from_slice(&src[r * h..(r + 1) * h]);
+            }
+        }
+        let st: Vec<f32> = p.temb.iter().map(|&v| crate::sd::ops::silu(v)).collect();
+        self.stack(&mut x, &st, p.timestep_index, p.tags, p.positions);
+        let v = self.heads_out[0].forward(&self.norm_out_rows(&x, p.video_index, &st, p.timestep_index), nv);
+        let a = aout.forward(&self.norm_out_rows(&x, p.audio_index, &st, p.timestep_index), na);
+        Ok((v, a))
+    }
+}
+
+/// The inputs of [`Dit::forward_av`]: rows of three modalities scattered through one sequence.
+pub struct PackedAv<'p> {
+    /// The refined text stream ([`Dit::embed_text`]), `[n_text, H]`.
+    pub text_embedded: &'p [f32],
+    /// Video latent patch rows `[n_video, patch_dim]` (conditioning rows first).
+    pub video: &'p [f32],
+    /// Audio latent rows `[n_audio, audio_channels]`.
+    pub audio: &'p [f32],
+    /// The sequence position of every text / video / audio row.
+    pub text_index: &'p [usize],
+    pub video_index: &'p [usize],
+    pub audio_index: &'p [usize],
+    /// `(t, h, w)` rotary coordinates of every row of the sequence.
+    pub positions: &'p [[f32; 3]],
+    /// The embeddings of the distinct timesteps (`[nt, time_dim]`, [`Dit::time_embed`]) and each
+    /// row's index into them.
+    pub temb: &'p [f32],
+    pub timestep_index: &'p [usize],
+    /// Each row's modality tag.
+    pub tags: &'p [u8],
 }
 
 /// `x = x * (1 + scale) + shift` with the AdaLN vectors of each row (`which`: 0 attention, 3
