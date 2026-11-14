@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/KarpelesLab/oxinfer/compare/v0.0.11...v0.0.12) - 2026-11-14
+
+### Other
+
+- MiniMax H3-Image: its VAE is no longer taken for the video VAE.
+- MiniMax-H3 video generation, what was checked and what is not supported.
+- The model catalog has a video kind with text-to-video and image-to-video capabilities, and MiniMax-H3 in it.
+- MiniMax H3 video: text to video and first / last frame to video from the command line (--frames, --last-image), written as Motion JPEG AVI, animated WebP or PNG frames.
+- MiniMax H3 video: the DiT's audio stream and the packed text / keyframe / audio / video sequence with its two schedules, checked against diffusers on tiny checkpoints.
+- MiniMax H3 video: the video VAE, a causal 3D CNN encoder and the ViT decoder with 3-axis RoPE, temporal clips and tiling.
+- LFM3-Omni in the model catalog, docs/models.md, docs/lfm3.md and the README index, with what was checked against the reference.
+- tools/ref_lfm3_omni.py compares features, tokens, logits, greedy text, speech codes and the codec's waveform with the checkpoint's own code.
+- LiquidAI/LFM3-Omni-2B reads audio and images through its own encoders, answers in text on the chat path, and speaks through the depth decoder and the Liquid codec (--speak, -o reply.wav).
+- Streamed chat and completion responses say what they wait for before the first token.
+
 ## [0.0.11](https://github.com/KarpelesLab/oxinfer/compare/v0.0.10...v0.0.11) - 2026-11-14
 
 ### Other
