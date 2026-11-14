@@ -7,6 +7,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.11](https://github.com/KarpelesLab/oxinfer/compare/v0.0.10...v0.0.11) - 2026-11-14
+
+### Other
+
+- a newer release replaces the executable before any command runs, or is reported when it cannot be.
+- The prompt-lookup test no longer asserts draft counts that depend on timing.
+- Granite, LFM3 and EmbeddingGemma 2 notes say only what was checked.
+- EmbeddingGemma 2: google/embeddinggemma-2 as an embedding backbone, with image and audio embeddings through Gemma 4's vision and audio towers.
+- chat templates without a thinking block (taobao-mnn/MNN-Pocket-0.3B) get no <think> prefill after the assistant header.
+- Liquid LFM3-1.7B runs on the Qwen path, its gated short convolutions as a mixer beside full and sliding-window attention, with its chat template and tool calls.
+- Granite 4: IBM Granite 4.1 / 4.2 and fine-tunes such as TwIL-8B run on the Llama path, from safetensors and GGUF, with their chat template and tool calls.
+- the catalog entry, the model table row, docs/haru.md with the measured agreement and its line in the README index.
+- the comparison with the PyTorch reference (tools/ref_haru.py records a greedy conversation and every normal value it draws; examples/haru_check.rs replays them: the reference clip, the codec both ways, prompt tokens, and per frame the text token, the hidden state, the latent and the audio).
+- the command line, in the shape of the reference's offline tool (--audio USER.wav -o REPLY.wav, --system for the card, --ref-audio for the voice; the model's text on standard output).
+- Haru-4B (haru, higurashi-ai/Haru-4B), full-duplex speech to speech, from the PyTorch reference (oxinfer::haru): a frame's three streams summed into one position of the Qwen3.5-4B text model, the MeanFlow audio head and the projectors, VibeVoice's causal codec with a state per layer, the prompt (character card, voice reference), the text stream's sampling with the DRY penalty, and a session stepped one frame at a time.
+- Audio8 TTS: the catalog entry, the model table row, docs/audio8-tts.md with the measured agreement, its line in the README index and the server's speech row.
+- Audio8 TTS: the comparison with the checkpoint's own code (tools/ref_arktts.py, examples/arktts_check.rs: token ids, the RoPE table, the codes of a reference clip, prompt rows, greedy frames and logits, the decoder's waveform).
+- Audio8 TTS: --speak on the command line (--ref-audio with --ref-text or a named clip of the voices folder, --speak-stream) and the server's /v1/audio/speech, streamed as it is generated.
+- Audio8 TTS (arktts, Edge0/Audio8-TTS-Realistic-Air): the model from the checkpoint's own code (oxinfer::arktts): the chat prompt in rows of a token and ten codes, the slow and fast transformers with their bf16-rounded RoPE tables, the sampler with its redraw of repeated semantic tokens, and the codec read from codec.pth (causal DAC decoder and encoder, window transformers, residual quantizers), decoded in windows and piece by piece for streaming.
+- documentation (docs/longcat.md with the sources of the architecture, the agreement on tiny checkpoints and the runs on LongCat-Flash-Lite-Sparse's real weights; the models table, the README index) and the --models catalog entries.
+- longcat_check --nll (the likelihood a checkpoint gives a token sequence, for runs on real weights), and the n-gram mean taken as a division like the reference.
+- the tiny checkpoint builder in the released layout (tools/longcat_tiny.py: LongCat-2.5's architecture, or LongCat-Flash-Lite's / LongCat-Flash-Chat's), the reference on transformers' LongcatFlash model and Meituan's NgramEmbedding with the indexer transcribed from SGLang-FluentLLM (tools/ref_longcat.py) and the comparison (examples/longcat_check.rs).
+- LongCat from the CLI and the engine: streamed from storage when larger than memory, the chat format chosen from the checkpoint's template, prompt-lookup rounds.
+- LongCat-2.5 (pro_v, LongcatCausalLM; also LongCat-2.0, LongCat-Flash-Lite-Sparse and the LongCat-Flash models they extend): the text model (two sublayers and a shortcut MoE per layer, MLA with LoRA scales and DeepSeek's YaRN, the sparse-attention indexer with keys always attended and a choice shared by the second attention, a softmax router with identity experts, the n-gram embedding read a few rows per token with the tokens left out of it) and the chat format with its tool calls; a config.json without model_type is recognized by its architecture.
+- The GGUF matmul test no longer depends on which tests run beside it.
+- Fish Audio Drama 3: the prompt cases of the reference check.
+- Fish Audio Drama 3: the catalog entry, docs/fish-drama.md with the measured agreement (fish-speech's PyTorch reference on small checkpoints and on the released weights), speed and memory, the models table, the README index and the server's speech row.
+- Fish Audio Drama 3: the server's memory estimate takes the checkpoint as stored whatever quant says (its FP8 experts are not requantized).
+- Fish Audio Drama 3: the checks against fish-speech's PyTorch reference (examples/fish_check.rs dumps prompt rows, frames, logits and codec output; tools/ref_fish_drama.py compares; tools/fish_drama_tiny.py writes a small random checkpoint with bf16 or FP8 experts).
+- Fish Audio Drama 3: --speak on the command line (--ref-audio with --ref-text, --voice as the speaker tag, --quant, --mmap; on the CPU) and the server's /v1/audio/speech.
+- Fish Audio Drama 3: the model (fish_omni): the prompt rows, the backbone on the Qwen3.5 MoE code with its FP8 experts as stored, the codebook tower with its caches over the sequence, the reference's sampler and chunking of long texts, and the codec (the causal DAC decoder, and the encoder for reference clips).
+- FP8 E4M3 rows are converted from their bits instead of through the table, in a form that vectorizes (AVX2 / AVX-512 where the CPU has them): the same values bit for bit, twice as fast on the conversion.
+- catalog entries, the model table row, docs/ripple.md and its line in the README index.
+- the model (sliding and full attention layers on Gemma's attention, gated attention, value residuals, a clamped MLP, an embedding scale) from Ricursive's modeling code, bf16 and NVFP4 checkpoints, CLI / engine dispatch, the check example.
+- its chat format (untrimmed ChatML turns, JSON tool calls), held against the template's jinja rendering, and replies whose reasoning and tool calls are marked in plain text filtered in the text stream.
+- catalog entry, the model table row, docs/raon.md and its line in the README index.
+- the model (delta attention with a write gate, gated MLA, four Raon_mHC residual streams, per-layer embeddings, tied head) from KRAFTON's modeling code, CLI / engine dispatch and a check example.
+- its chat format (Qwen3.5's ChatML template with its own no-thinking prompt), held against the template's jinja rendering.
+- Kimi's KDA and gated MLA layers as functions other families can call, with what Raon-1's delta attention adds (a write gate, the decay's own rank, queries and keys normed as F.normalize does).
+- the catalog entry, the model table row, docs/ocr.md and its line in the README index.
+- the comparison with the checkpoint's own code (tools/ref_unlimited_ocr.py: token ids, pixel values, encoder features, packed embeddings, logits, the greedy reply).
+- the command line (--image per page, the reply with its markup, the decoding rules as flags), the engine family and with it the OpenAI server's image input.
+- the model from Baidu's own code: page views (global view and 640 tiles), the SAM ViT-B into CLIP ViT-L encoder and its projector, the MoE decoder with DASH block-sparse attention (per-layer router, entmax prior, page candidates), two-axis page RoPE, the page count guard and the no-repeat n-gram rule.
+- Chat formats can ask for replies shown with their special tokens (ChatFormat::keeps_special_tokens), for models whose markup is made of them.
+- documentation (docs/inkling.md, the models table, the README index) and the --models catalog entries.
+- the tiny checkpoint builder with transformers' reference outputs (tools/inkling2_tiny.py: floats or packed NVFP4 / MXFP8 experts, chat prompts, an image), the reference for the vision tower alone (tools/ref_inkling2_vision.py) and the comparison (examples/inkling2_check.rs).
+- Inkling-2 from the CLI and the engine: its chat format (typed messages, the thinking effort, tool declarations, calls and results, images as messages of their own), message headers left out of the text of a reply, and images through the vision tower.
+- Inkling-2 (inkling2, thinkingmachines/Inkling-2-Small): the text decoder (attention with QK L2 clips, a relative-position bias, sinks and an output gate, short convolutions, sliding-window and full layers, the attention residual over block states, a soft-capped MoE and logits) and the vision tower (40-pixel tiles without resizing); experts read as the releases store them, interleaved gate / up rows in NVFP4, MXFP8 or floats.
+- Nemotron 3.5: catalog entries, docs/nemotron.md with the measured agreement (transformers on tiny checkpoints and on the real Transcribe weights, llama.cpp on the real Lightning Q4_0), the models table and the README index.
+- Nemotron 3.5 Transcribe: the audio side of the speech LM (NeMo's features, the speech recognition encoder, the Sortformer speaker encoder with its speaker cache, the projection), --transcribe and the server's transcription endpoints through whisper::Transcriber, with reference checks on a tiny checkpoint and on the real weights.
+- Nemotron 3.5: the Mamba-2 time step follows the config's time_step_limit (no clamp, as NVIDIA's training and serving code and llama.cpp; transformers' scan floors it at time_step_min, which a session can reproduce); a GGUF block is MoE when it has a router; no prompt-lookup rounds on the command line; a tiny GGUF writer.
+- Nemotron 3.5: the chat template (always a system turn, XML tool declarations, <think>, Qwen-style tool calls) and the command line and engine wiring.
+- Nemotron 3.5: the Nemotron-H text model (nemotron_h: Mamba-2, attention without positions, MoE with relu^2 experts), the release's, NeMo's and GGUF tensor layouts, with a tiny-checkpoint reference check.
+- Kimi K3.1: catalog entries, the model table row, docs/kimi.md and its line in the README index.
+- Kimi K3.1: the text model (KDA, gated MLA with the K3.1 indexers, cross-layer residuals, latent MoE) from Moonshot's modeling code, safetensors and GGUF layouts, the tiktoken tokenizer, CLI / engine dispatch and a check example.
+- Kimi K3.1: its chat format (encoding_k3.py: tagged messages, think / response / tools blocks, tool declarations and calls) and replies filtered by tag in the text stream.
+- Kimi K3.1: the SiTU expert activation, compressed-tensors MXFP4 weights repacked into ggml blocks, tiktoken-ranked BPE merges, Mistral Large 4's MLA helpers shared.
+- Fish Audio Drama 3: what the checkpoint holds and what each stage would need (docs/fish-drama.md); the model is not supported.
+- the catalog entry and the documentation (docs/zonos.md).
+- an example and a script that compare the tokenizer, the prompt, greedy generation, the decoder's waveform and the speaker embedding with Zyphra's PyTorch reference.
+- --speak on the command line and the server's /v1/audio/speech.
+- the language model, the ZAC 1 codec decoder and the speaker encoder of Zyphra/ZONOS3-Mini from its GGUF files (oxinfer::zonos).
+- ERNIE 5.5: documentation (docs/ernie.md, the models table, the README index) and the --models catalog entries.
+- ERNIE 5.5 from the CLI and the engine: the base model's prompt format (a text to continue, no system role), checkpoints whose shards have no index, and the tokenizer and the MTP layer in deepseek4_check --load.
+- Tokenizer regex: a plus after an interval repeats it (Oniguruma's reading, which the Python tokenizers library has), so that ERNIE 5.5's tokenizer groups digits by three from the right.
+- ERNIE 5.5: the reference in PyTorch (tools/ref_ernie55.py, from Baidu's vLLM plugin on DeepSeek's inference code), the tiny checkpoint builder, and the MTP layer in deepseek4_check.
+- ERNIE 5.5 (ernie5_5_moe, baidu/ERNIE-5.5-Flash-Base) on the DeepSeek V4 model: HCA layers with the head mix and the output gate, MLA layers with the DSA indexer, the SiTU dense layer and latent MoE, MultiMax, the MTP layer and a greedy decoder with its drafts; bf16 and FP8 checkpoints in Baidu's naming.
+- residency requested from eight sets in parallel; Flash-Next plans build concurrently
+- Flash-Next prefill plans: QSA score rows in a 32 MB ring instead of 512 MB
+- Metal MoE: grouped GEMM tiles of 128 / 32 / 16 rows; Q4_K and Q5_1 read as words
+- allow clippy's const thread-local false positive on Android
+- the fine-tunes run as smoke tests, and the count of types in the GSQ-RCO file.
+- Catalog and docs: the GSQ-RCO and Ternary-Bonsai 2 GGUFs, what was checked on the trending Qwen and Gemma 4 derivatives, and what the Edge0 and E384-FP4 layouts would need.
+- An example that dumps a Qwen model's greedy run in llama_logits_dump's format and compares two such runs.
+- The AVX2 group products stop at the block for ggml blocks of 64 and 128 elements.
+- AVX2 unpackers for the 1-bit and ternary GGUF types: 4 to 6 times fewer nanoseconds per weight than the portable decoder.
+- DSpine drafts (tencent/Qwen3.8-27B-DSpine-b16) draft through their code bridge: a write after every draft layer, the last one redone per slot with the token drafted before it.
+- A .gguf file without the GGUF magic is reported as damaged instead of as an unknown repo id.
+- Qwen4-Exp GGUF files load again: the MiniMax lightning-indexer loader no longer claims their QSA indexer weights.
+- Hadamard-folded GGUF checkpoints (prism.hadamard metadata, Ternary-Bonsai 2) run: folded weights get their input sign-flipped and rotated, the latent token embedding is rotated back.
+- GGUF files with the 1-bit and ternary ggml types load: Q1_0, Q2_0, TQ1_0, TQ2_0 and the PrismML fork's PQ2_0 and PTQ1_0.
+- catalog entries, docs/glm.md with the measured agreement (transformers on tiny checkpoints, llama.cpp on the real UD-Q2_K_XL), the models table and the README index; glm5_check --dump.
+- no prompt-lookup rounds for GLM-5.3-Flash on the command line, whose recurrent state cannot roll a refuted draft back; the tiny GGUF writer copies a published file's tokenizer.
+- the chat template (reasoning effort line, thinking, tool calls) and the command line, engine and streaming wiring.
+- GGUF files keep -exp(A_log) in ssm_a, GLM-5.3's latent norms have their own epsilon; a tiny GGUF writer, a per-layer check and unit tests.
+- the text model of GLM-5.3-Flash (glm5_next) and GLM-5.3 (glm_moe_dsa), with a tiny-checkpoint reference check.
+- the transparent-picture run and the RGBA rule in the docs, a note in the C header.
+- documentation (docs/qwen-image.md, models, the conditioning encoder) and the --models catalog entries.
+- the session's DeepStack rows behind a box (the session stays under clippy's variant-size bound), an RGBA PNG only for a transparent region.
+- editing with one or more input images (through the text encoder's vision tower and, as latent tokens, the transformer's sequence); an FP8 single file and edits in the tiny-checkpoint tool.
+- Qwen3-VL DeepStack vision features for the conditioning encoder (qwen_vl): the tower's intermediate features through their mergers, added to the image tokens after the language model's first layers.
+- Qwen-Image-2.1 and -2.1-Turbo: text to image through the Qwen-Image pipeline (Qwen3-VL text encoder, saved Turbo sigmas, GGUF transformers with or without metadata, LoRAs, RGBA output).
+- the single-stream block-causal transformer, the prompt's keys and values computed once and reused by every step.
+- the residual RGBA VAE (AutoencoderKLQwenImage21: 64 latent channels, 16x, a wider decoder, group shortcuts).
+- DeepSeek V4.1 Flash: an engram table per layer (blk.N.engram_embd) is read too; where the two GGUF layouts' correspondence comes from.
+- DeepSeek V4.1 Flash: catalog entries, the model table row and its section of the DeepSeek V4 page.
+- DeepSeek V4.1 Flash: deepseek4_check --load opens a checkpoint without running it (the released GGUF layouts, headers only) and prints its tokenizer's ids.
+- DeepSeek V4.1 Flash: a tiny GGUF writer in the layouts of the released conversions, integer GGUF tensors for the engram hash, image spans in the check example.
+- DeepSeek V4.1 Flash: its chat format (a system token, the reasoning effort line, DSML tags with a leading space) and the CLI / engine dispatch.
+- DeepSeek V4.1 Flash: the text model on the DeepSeek V4 code, from DeepSeek's naming and from deepseek41 GGUF files.
+
 ## [0.0.10](https://github.com/KarpelesLab/oxinfer/compare/v0.0.9...v0.0.10) - 2026-11-13
 
 ### Other
