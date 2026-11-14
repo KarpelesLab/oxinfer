@@ -32,6 +32,14 @@ pub struct VaeConfig {
     pub latents_std: Vec<f32>,
     pub tile: usize,
     pub overlap: usize,
+    /// Rotary axes: 2 (`(h, w)`, the image decoder) or 3 (`(t, h, w)`, the video decoder).
+    pub axes: usize,
+    /// Pixel frames per latent frame (1 for the image decoder).
+    pub patch_t: usize,
+    /// The video VAE's temporal chunking: pixel frames per encoded clip and the latent frames
+    /// dropped at the end of an encode.
+    pub clip_length: usize,
+    pub token_drop: usize,
 }
 
 impl VaeConfig {
@@ -54,6 +62,14 @@ impl VaeConfig {
                 .map(|v| v.as_f64().unwrap_or(0.0) as f32)
                 .collect())
         };
+        // The video VAE (`AutoencoderKLMiniMaxH3`) states its temporal geometry.
+        let video = c.get("clip_length").is_some() || c.get("temporal_downsample_factors").is_some();
+        let patch_t = c
+            .get("temporal_downsample_factors")
+            .and_then(|v| v.as_array())
+            .map_or(if video { 4 } else { 1 }, |a| {
+                a.iter().filter_map(|v| v.as_u64()).product::<u64>() as usize
+            });
         let heads = u("decoder_num_attention_heads", "heads", 16);
         let hd = u("decoder_attention_head_dim", "dim_head", 64);
         Ok(Self {
@@ -70,6 +86,10 @@ impl VaeConfig {
             latents_std: vec("latents_std")?,
             tile: c.get("vae_tile_size").and_then(|v| v.as_u64()).map_or(256, |v| v as usize),
             overlap: c.get("vae_tile_overlap_min").and_then(|v| v.as_u64()).map_or(64, |v| v as usize),
+            axes: if video { 3 } else { 2 },
+            patch_t: if video { patch_t } else { 1 },
+            clip_length: u("clip_length", "clip_length", 17),
+            token_drop: u("token_drop", "token_drop", 3),
         })
     }
 }
@@ -157,9 +177,11 @@ impl<'a> VaeDecoder<'a> {
             });
         }
         let rd = (hd as f64 * cfg.rope_ratio) as usize;
-        // inv_freq = 1 / theta ** arange(0, 1, 2 * axes / dim): rd / 4 frequencies per axis.
-        let step = 4.0 / rd as f64;
-        let inv_freq = (0..rd / 4).map(|i| (1.0 / cfg.rope_theta.powf(i as f64 * step)) as f32).collect();
+        // inv_freq = 1 / theta ** arange(0, 1, 2 * axes / dim): rd / (2 * axes) frequencies per axis.
+        let step = (2 * cfg.axes) as f64 / rd as f64;
+        let inv_freq = (0..rd / (2 * cfg.axes))
+            .map(|i| (1.0 / cfg.rope_theta.powf(i as f64 * step)) as f32)
+            .collect();
         let post_quant = {
             let w = files.f32("post_quant_conv.weight")?;
             if w.len() != c * c {
@@ -174,7 +196,7 @@ impl<'a> VaeDecoder<'a> {
             registers: v("decoder.register_tokens", cfg.registers * d)?,
             blocks,
             norm_out: (v("decoder.norm_out.weight", d)?, v("decoder.norm_out.bias", d)?),
-            proj_out: DLin::load(files, "decoder.proj_out", 3 * cfg.patch * cfg.patch, d, true)?,
+            proj_out: DLin::load(files, "decoder.proj_out", 3 * cfg.patch_t * cfg.patch * cfg.patch, d, true)?,
             inv_freq,
             cfg,
         })
@@ -182,10 +204,16 @@ impl<'a> VaeDecoder<'a> {
 
     /// Decodes one `[C, h, w]` latent tile into `[3, 16h, 16w]` (no tiling).
     fn decode_tile(&self, z: &[f32], h: usize, w: usize) -> Vec<f32> {
+        self.decode_block(z, 1, h, w)
+    }
+
+    /// Decodes one `[C, t, h, w]` latent block into `[3, t * patch_t, 16h, 16w]` (no tiling): every
+    /// latent voxel is one token.
+    fn decode_block(&self, z: &[f32], t: usize, h: usize, w: usize) -> Vec<f32> {
         let cfg = &self.cfg;
         let (c, d, nh) = (cfg.latent_channels, cfg.dim, cfg.heads);
         let hd = d / nh;
-        let np = h * w;
+        let np = t * h * w;
         // Channels-last pixels through the 1x1 conv.
         let mut px = vec![0f32; np * c];
         for (i, row) in px.chunks_mut(c).enumerate() {
@@ -198,18 +226,16 @@ impl<'a> VaeDecoder<'a> {
         let mut x = vec![0f32; n * d];
         x[..np * d].copy_from_slice(&self.proj_in.forward(&px, np));
         x[np * d..(np + cfg.registers) * d].copy_from_slice(&self.registers);
-        // RoPE: (h, w) in [-1, 1), the extra tokens at 0; angles [h | w] duplicated.
+        // RoPE: (h, w) or (t, h, w) in [-1, 1), the extra tokens at 0; angles [t | h | w] duplicated.
         let f = self.inv_freq.len();
-        let half = 2 * f;
+        let half = cfg.axes * f;
+        let centre = |i: usize, size: usize| 2.0 * ((i as f32 + 0.5) / size as f32) - 1.0;
         let (mut cos, mut sin) = (vec![1f32; n * half], vec![0f32; n * half]);
         let two_pi = 2.0 * std::f32::consts::PI;
         for i in 0..np {
-            let (r, col) = (i / w, i % w);
-            let pos = [
-                2.0 * ((r as f32 + 0.5) / h as f32) - 1.0,
-                2.0 * ((col as f32 + 0.5) / w as f32) - 1.0,
-            ];
-            for (axis, &p) in pos.iter().enumerate() {
+            let (fr, r, col) = (i / (h * w), i / w % h, i % w);
+            let pos3 = [centre(fr, t), centre(r, h), centre(col, w)];
+            for (axis, &p) in pos3[3 - cfg.axes..].iter().enumerate() {
                 for (j, &fr) in self.inv_freq.iter().enumerate() {
                     let a = two_pi * p * fr;
                     cos[i * half + axis * f + j] = a.cos();
@@ -281,7 +307,7 @@ impl<'a> VaeDecoder<'a> {
                 }
             });
         }
-        // LayerNorm, the patch head over the latent pixels, then [3, 16h, 16w].
+        // LayerNorm, the patch head over the latent voxels, then [3, t * pt, 16h, 16w].
         let (nw, nb) = &self.norm_out;
         for_chunks(&mut x[..np * d], d, true, |_, r| {
             let mean = r.iter().sum::<f32>() / d as f32;
@@ -291,16 +317,19 @@ impl<'a> VaeDecoder<'a> {
                 *v = (*v - mean) * inv * w + b;
             }
         });
-        let p = cfg.patch;
+        let (p, pt) = (cfg.patch, cfg.patch_t);
         let out = self.proj_out.forward(&x[..np * d], np);
-        let (oh, ow) = (h * p, w * p);
-        let mut img = vec![0f32; 3 * oh * ow];
+        let (of, oh, ow) = (t * pt, h * p, w * p);
+        let row = 3 * pt * p * p;
+        let mut img = vec![0f32; 3 * of * oh * ow];
         for i in 0..np {
-            let (r, col) = (i / w, i % w);
+            let (fr, r, col) = (i / (h * w), i / w % h, i % w);
             for ch in 0..3 {
-                for y in 0..p {
-                    for xx in 0..p {
-                        img[(ch * oh + r * p + y) * ow + col * p + xx] = out[i * 3 * p * p + (ch * p + y) * p + xx];
+                for tt in 0..pt {
+                    for y in 0..p {
+                        let src = i * row + ((ch * pt + tt) * p + y) * p;
+                        let dst = ((ch * of + fr * pt + tt) * oh + r * p + y) * ow + col * p;
+                        img[dst..dst + p].copy_from_slice(&out[src..src + p]);
                     }
                 }
             }
@@ -365,14 +394,152 @@ impl<'a> VaeDecoder<'a> {
                     .collect()
             })
             .collect();
-        stitch(&tiles, th, tw, &yov, &xov, h * p, w * p)
+        stitch(&tiles, 3, th, tw, &yov, &xov, h * p, w * p)
+    }
+
+    /// `_decode_clip`: one temporal clip `[C, t, h, w]` (denormalized) into `[3, t * patch_t, 16h,
+    /// 16w]`, spatially tiled like [`VaeDecoder::decode`].
+    fn decode_clip(&self, z: &[f32], t: usize, h: usize, w: usize) -> Vec<f32> {
+        let cfg = &self.cfg;
+        let (c, p) = (cfg.latent_channels, cfg.patch);
+        let (ys, th, yov) = self.split(h * p);
+        let (xs, tw, xov) = self.split(w * p);
+        let (lh, lw) = (th / p, tw / p);
+        let of = t * cfg.patch_t;
+        let tiles: Vec<Vec<Vec<f32>>> = ys
+            .iter()
+            .map(|&y0| {
+                xs.iter()
+                    .map(|&x0| {
+                        let (ly, lx) = (y0 / p, x0 / p);
+                        let mut tile = vec![0f32; c * t * lh * lw];
+                        for cf in 0..c * t {
+                            for r in 0..lh {
+                                let src = (cf * h + ly + r) * w + lx;
+                                tile[(cf * lh + r) * lw..(cf * lh + r + 1) * lw].copy_from_slice(&z[src..src + lw]);
+                            }
+                        }
+                        self.decode_block(&tile, t, lh, lw)
+                    })
+                    .collect()
+            })
+            .collect();
+        // `[3, F, th, tw]` tiles stitch as `3 * F` planes.
+        stitch(&tiles, 3 * of, th, tw, &yov, &xov, h * p, w * p)
+    }
+
+    /// The temporal chunking (`AutoencoderKLMiniMaxH3`): latent frames per clip, the latent frames a
+    /// decoded clip overlaps the next one by, the pixel frames cut at the start of a clip and the
+    /// pixel frames two clips cross-fade over.
+    pub fn chunking(&self) -> (usize, usize, usize, usize) {
+        let (clip, drop, r) = (self.cfg.clip_length, self.cfg.token_drop, self.cfg.patch_t);
+        let pre = (r - clip % r) % r;
+        let tcs = clip.div_ceil(r);
+        let token_overlap = (tcs - drop % tcs) % tcs;
+        (tcs, token_overlap, pre, (token_overlap * r).saturating_sub(pre))
+    }
+
+    /// Decodes normalized video latents `[C, t, h, w]` (denormalized here) into `[3, F, 16h, 16w]`
+    /// in the VAE's output range (ImageNet-normalized) and `F` (`AutoencoderKLMiniMaxH3._decode`):
+    /// clips of `tokens_chunk_size + token_overlap` latent frames, each decoded on its own
+    /// (spatially tiled), consecutive clips cross-faded over `frame_overlap` pixel frames.
+    pub fn decode_video(&self, latents: &[f32], t: usize, h: usize, w: usize) -> Result<(Vec<f32>, usize)> {
+        let cfg = &self.cfg;
+        let (c, r, drop) = (cfg.latent_channels, cfg.patch_t, cfg.token_drop);
+        let (tcs, token_overlap, pre, frame_overlap) = self.chunking();
+        if cfg.axes != 3 || latents.len() != c * t * h * w {
+            bail!("video decode: {} latent values for [{c}, {t}, {h}, {w}]", latents.len());
+        }
+        let vol = t * h * w;
+        let plane = h * w;
+        let pad = (tcs - (t + drop) % tcs) % tcs;
+        let chunks = ((t + drop + pad) / tcs).saturating_sub(usize::from(drop > 0));
+        if chunks == 0 {
+            bail!(
+                "video decode: {t} latent frames are fewer than one clip ({} needed)",
+                2 * tcs - drop
+            );
+        }
+        // Denormalized, the last frame repeated `pad` times: frame-major per channel.
+        let tp = t + pad;
+        let mut z = vec![0f32; c * tp * plane];
+        for ch in 0..c {
+            for f in 0..tp {
+                let src = ch * vol + f.min(t - 1) * plane;
+                let dst = (ch * tp + f) * plane;
+                for i in 0..plane {
+                    z[dst + i] = latents[src + i] * cfg.latents_std[ch] + cfg.latents_mean[ch];
+                }
+            }
+        }
+        let (oh, ow) = (h * cfg.patch, w * cfg.patch);
+        let fplane = oh * ow;
+        // Frames as `[3, oh, ow]` each.
+        let mut frames: Vec<Vec<f32>> = Vec::new();
+        let mut overlap: Vec<Vec<f32>> = Vec::new();
+        let cnf = tcs * r;
+        for i in 0..chunks {
+            let (t0, tl) = (i * tcs, (tcs + token_overlap).min(tp - i * tcs));
+            let mut clip = vec![0f32; c * tl * plane];
+            for ch in 0..c {
+                clip[ch * tl * plane..(ch + 1) * tl * plane].copy_from_slice(&z[(ch * tp + t0) * plane..(ch * tp + t0 + tl) * plane]);
+            }
+            let dec = self.decode_clip(&clip, tl, h, w);
+            let nf = tl * r;
+            let frame = |f: usize| -> Vec<f32> {
+                let mut o = vec![0f32; 3 * fplane];
+                for ch in 0..3 {
+                    o[ch * fplane..(ch + 1) * fplane].copy_from_slice(&dec[(ch * nf + f) * fplane..(ch * nf + f + 1) * fplane]);
+                }
+                o
+            };
+            for j in 0..1 + usize::from(drop > 0) {
+                let mut chunk: Vec<Vec<f32>> = ((j * cnf + pre).min(nf)..((j + 1) * cnf).min(nf)).map(&frame).collect();
+                if j == 0 {
+                    let e = overlap.len().min(chunk.len()).min(frame_overlap);
+                    for (k, b) in chunk.iter_mut().take(e).enumerate() {
+                        let wb = k as f32 / e as f32;
+                        let a = &overlap[overlap.len() - e + k];
+                        for (bv, &av) in b.iter_mut().zip(a) {
+                            *bv = av * (1.0 - wb) + *bv * wb;
+                        }
+                    }
+                    frames.append(&mut chunk);
+                } else {
+                    overlap = chunk;
+                }
+            }
+        }
+        frames.append(&mut overlap);
+        // The repeated latent frames decoded into frames nobody asked for.
+        let tail = cfg.clip_length % r;
+        let cut: usize = (0..pad).map(|k| if tail != 0 && (t + k) % tcs == 0 { tail } else { r }).sum();
+        frames.truncate(frames.len().saturating_sub(cut));
+        let nf = frames.len();
+        let mut out = vec![0f32; 3 * nf * fplane];
+        for (f, fr) in frames.iter().enumerate() {
+            for ch in 0..3 {
+                out[(ch * nf + f) * fplane..(ch * nf + f + 1) * fplane].copy_from_slice(&fr[ch * fplane..(ch + 1) * fplane]);
+            }
+        }
+        Ok((out, nf))
     }
 }
 
-/// `_stitch_tiles`: each tile blended with the original tile above and the original tile to its
+/// `_stitch_tiles` over `planes` planes per tile: each tile blended with the original tile above and the original tile to its
 /// left over the overlap, trimmed of its trailing overlaps, then laid out.
-fn stitch(tiles: &[Vec<Vec<f32>>], th: usize, tw: usize, yov: &[usize], xov: &[usize], oh: usize, ow: usize) -> Vec<f32> {
-    let mut out = vec![0f32; 3 * oh * ow];
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stitch(
+    tiles: &[Vec<Vec<f32>>],
+    planes: usize,
+    th: usize,
+    tw: usize,
+    yov: &[usize],
+    xov: &[usize],
+    oh: usize,
+    ow: usize,
+) -> Vec<f32> {
+    let mut out = vec![0f32; planes * oh * ow];
     let mut oy = 0;
     for (i, row) in tiles.iter().enumerate() {
         let keep_h = if i + 1 < tiles.len() { th - yov[i] } else { th };
@@ -382,7 +549,7 @@ fn stitch(tiles: &[Vec<Vec<f32>>], th: usize, tw: usize, yov: &[usize], xov: &[u
             if i > 0 {
                 let e = yov[i - 1].min(th);
                 let above = &tiles[i - 1][j];
-                for ch in 0..3 {
+                for ch in 0..planes {
                     for y in 0..e {
                         let wb = y as f32 / e as f32;
                         for x in 0..tw {
@@ -396,7 +563,7 @@ fn stitch(tiles: &[Vec<Vec<f32>>], th: usize, tw: usize, yov: &[usize], xov: &[u
             if j > 0 {
                 let e = xov[j - 1].min(tw);
                 let left = &row[j - 1];
-                for ch in 0..3 {
+                for ch in 0..planes {
                     for y in 0..th {
                         for x in 0..e {
                             let wb = x as f32 / e as f32;
@@ -408,7 +575,7 @@ fn stitch(tiles: &[Vec<Vec<f32>>], th: usize, tw: usize, yov: &[usize], xov: &[u
                 }
             }
             let keep_w = if j + 1 < row.len() { tw - xov[j] } else { tw };
-            for ch in 0..3 {
+            for ch in 0..planes {
                 for y in 0..keep_h.min(oh - oy) {
                     for x in 0..keep_w.min(ow - ox) {
                         out[(ch * oh + oy + y) * ow + ox + x] = t[(ch * th + y) * tw + x];
