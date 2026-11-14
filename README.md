@@ -109,6 +109,7 @@ too. The device is chosen at run time (`--device auto`: a GPU when one starts, e
 | [Stable Diffusion 3 / 3.5](docs/sd3.md) | text to image, image to image |
 | [FLUX.1](docs/flux.md) | Kontext editing, schnell / dev, Fill, Canny / Depth, Redux |
 | [Qwen-Image, Qwen-Image-Edit and Qwen-Image-2.1](docs/qwen-image.md) | editing, text to image, ControlNet, layers; Qwen-Image-2.1 / 2.1-Turbo |
+| [MiniMax-H3 video](docs/video.md) | text to video, first / last frame to video (no audio track yet) |
 | [OmniGen2](docs/omnigen2.md), [BAGEL](docs/bagel.md), [Step1X-Edit](docs/step1x-edit.md), [Janus-Pro](docs/janus.md) | instruction editing, unified generation and understanding |
 | [Whisper](docs/whisper.md) | speech to text |
 | [Nemotron 3.5 Transcribe](docs/nemotron.md#speech-to-text-nemotron-35-transcribe) | speech to text and speech translation with a speech LM |
