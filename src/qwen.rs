@@ -1879,7 +1879,17 @@ impl<'a> QwenModel<'a> {
         if let Some((_, _, inv)) = self.cfg.granite_scales() {
             logits.iter_mut().for_each(|v| *v *= inv);
         }
+        self.suppress(&mut logits);
         logits
+    }
+
+    /// Takes the config's suppressed tokens out of rows of logits.
+    fn suppress(&self, logits: &mut [f32]) {
+        for row in logits.chunks_mut(self.cfg.vocab_size) {
+            for &t in &self.cfg.suppress_tokens {
+                row[t as usize] = f32::NEG_INFINITY;
+            }
+        }
     }
 
     /// [`Self::logits`] of a few rows (1 to 4) on the accelerator's matrix-vector kernels when
@@ -1891,6 +1901,7 @@ impl<'a> QwenModel<'a> {
             let (v, h) = (self.cfg.vocab_size, self.cfg.hidden_size);
             let mut logits = vec![0f32; t * v];
             if crate::model::linear_rows_device(&mut [(&self.lm_head, None, v, &mut logits[..])], h, hidden, t) {
+                self.suppress(&mut logits);
                 return logits;
             }
         }

@@ -22,6 +22,7 @@ mod flux_cli;
 mod haru_cli;
 mod intervene_cli;
 mod janus_cli;
+mod lfm3_omni_cli;
 mod minimax_h3_cli;
 mod omnigen2_cli;
 mod qwen_image_cli;
@@ -1637,6 +1638,9 @@ fn run(mut args: Args) -> Result<()> {
     if args.embed || oxinfer::embed::is_embedding_model(&args.model) {
         return run_embed(&args);
     }
+    if oxinfer::lfm3_omni::is_omni(&args.model) && lfm3_omni_cli::wants_speech(&args) {
+        return lfm3_omni_cli::run(&args);
+    }
     if args.speak.is_some()
         || args.speak_file.is_some()
         || args.decode_tokens.is_some()
@@ -1682,7 +1686,7 @@ fn run(mut args: Args) -> Result<()> {
     match model_type.as_str() {
         "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" | "gemma3" | "gemma3_text" => run_gemma(args),
         "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" | "qwen2" | "qwen2_5_vl"
-        | "qwen3_vl" | "qwen4_exp" | "qwen4_exp_text" | "lfm3" => run_qwen(args),
+        | "qwen3_vl" | "qwen4_exp" | "qwen4_exp_text" | "lfm3" | "lfm3_omni" => run_qwen(args),
         // Llama 3 runs on the Qwen3 code path.
         "llama" | "granite" => run_qwen(args),
         // MiniMax M2 / M2.1 / M2.5 / M2.7: the Qwen code path with MiniMax's attention norms and router.

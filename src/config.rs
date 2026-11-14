@@ -726,6 +726,10 @@ pub struct QwenConfig {
     /// attention ones with a sigmoid gate per head and RoPE parameters per layer type.
     #[serde(skip)]
     pub lfm3: Option<crate::lfm3::Lfm3Config>,
+    /// Tokens the output head never offers (LFM3-Omni's placeholders and speech markers in a
+    /// text reply, see `crate::lfm3_omni`).
+    #[serde(skip)]
+    pub suppress_tokens: Vec<u32>,
     /// Set for MiniMax-01 checkpoints: the linear layers are lightning attention.
     #[serde(skip)]
     pub lightning: bool,
@@ -791,7 +795,8 @@ impl QwenConfig {
         // Qwen3-VL's text model is a dense Qwen3 (with M-RoPE, plain for text).
         let dense = matches!(mt, Some("qwen3" | "qwen3_vl" | "qwen3_vl_text")) || llama || qwen2 || minimax_m2;
         let image_token = raw.get("image_token_id").and_then(|v| v.as_u64());
-        let lfm3 = mt == Some("lfm3");
+        let lfm3 = matches!(mt, Some("lfm3" | "lfm3_omni"));
+        let suppress_tokens = crate::lfm3_omni::text_suppressed(&raw);
         let mut text = raw.get("text_config").cloned().unwrap_or(raw);
         let has_head_dim = text.get("head_dim").is_some_and(|v| v.is_u64());
         // LFM3's `rope_parameters` are per layer type: read by `crate::lfm3::configure`.
@@ -804,6 +809,7 @@ impl QwenConfig {
         let mut cfg: QwenConfig = serde_json::from_value(text).context("parse qwen text config")?;
         if let Some(raw) = &lfm3 {
             crate::lfm3::configure(&mut cfg, raw)?;
+            cfg.suppress_tokens = suppress_tokens;
         }
         if cfg.image_token_id.is_none() {
             cfg.image_token_id = image_token.map(|v| v as u32);

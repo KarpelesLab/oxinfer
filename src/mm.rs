@@ -259,6 +259,9 @@ fn prepare_sources(src: &Sources, files: &ModelFiles, text_hidden: usize) -> Res
     if let Some(ic) = crate::inkling_vision::Inkling2VisionConfig::load(args.model)? {
         return prepare_inkling(src, files, text_hidden, ic);
     }
+    if crate::lfm3_omni::is_omni(args.model) {
+        return prepare_lfm3_omni(src, files, text_hidden);
+    }
     if let Some(qc) = qwen_vision::QwenMmConfig::load_with(args.model, &args.mmproj)? {
         return prepare_qwen(src, files, text_hidden, qc);
     }
@@ -520,6 +523,87 @@ fn prepare_inkling(
 fn dump(path: &str, v: &[f32]) -> Result<()> {
     let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
     std::fs::write(path, b).with_context(|| format!("write {path}"))
+}
+
+/// LFM3-Omni: images through the LFM3 vision tower, audio through the audio encoder, each as a
+/// run of placeholders between `<|vision_start|>` and `<|vision_end|>` (see `crate::lfm3_omni`).
+fn prepare_lfm3_omni(src: &Sources, files: &ModelFiles, text_hidden: usize) -> Result<(String, Vec<MmFeature>)> {
+    use crate::lfm3_omni as omni;
+    let args = src.req;
+    if src.n_videos() > 0 {
+        bail!("video input is not supported for LFM3-Omni yet (images and audio are)");
+    }
+    let (mut text, mut feats) = (String::new(), Vec::new());
+    if src.n_images() == 0 && src.n_audios() == 0 {
+        return Ok((text, feats));
+    }
+    let cfg = omni::OmniConfig::load(args.model)?;
+    if src.n_images() > 0 {
+        let t = Instant::now();
+        let tower = omni::vision::VisionTower::load(omni::vision::VisionConfig::from_json(&cfg.raw)?, files, text_hidden)?;
+        let pc = qwen_vision::ProcessorConfig::load(args.model, false);
+        let unit = pc.patch_size * pc.merge_size;
+        for i in 0..src.n_images() {
+            let (what, img) = src.image(i)?;
+            let px = qwen_vision::preprocess_image(&img.data, img.width, img.height, &pc, args.max_soft_tokens * unit * unit)?;
+            let emb = tower.encode(&px);
+            let n = emb.len() / text_hidden;
+            eprintln!(
+                "[image {what}: {}x{} -> {}x{} patches -> {n} tokens, {:.2}s]",
+                img.width,
+                img.height,
+                px.grid.2,
+                px.grid.1,
+                t.elapsed().as_secs_f64()
+            );
+            if let (Some(prefix), 0) = (args.dump_mm, i) {
+                dump(&format!("{}_pixels.bin", prefix.display()), &px.data)?;
+                dump(&format!("{}_features.bin", prefix.display()), &tower.features(&px))?;
+                dump(&format!("{}_image.bin", prefix.display()), &emb)?;
+            }
+            text.push_str(&omni::image_placeholder(n));
+            feats.push(MmFeature {
+                token_id: cfg.image_token_id,
+                emb,
+                n,
+                grids: Vec::new(),
+            });
+        }
+    }
+    if src.n_audios() > 0 {
+        let t = Instant::now();
+        let fc = omni::audio::FeatureConfig::load(args.model)?;
+        let ec = omni::audio::EncoderConfig::from_json(&cfg.raw["audio_encoder_config"])?;
+        let enc = omni::audio::AudioEncoder::load(ec, files, text_hidden)?;
+        for i in 0..src.n_audios() {
+            let (what, pcm) = src.audio(i, omni::audio::SAMPLE_RATE)?;
+            let mel = omni::audio::log_mel(&pcm, &fc);
+            let frames = mel.len() / fc.n_mels;
+            let emb = enc.encode(&mel, frames);
+            let n = emb.len() / text_hidden;
+            eprintln!(
+                "[audio {what}: {:.2}s -> {frames} frames -> {n} tokens, {:.2}s]",
+                pcm.len() as f64 / omni::audio::SAMPLE_RATE as f64,
+                t.elapsed().as_secs_f64()
+            );
+            if let (Some(prefix), 0) = (args.dump_mm, i) {
+                dump(&format!("{}_mel.bin", prefix.display()), &mel)?;
+                dump(
+                    &format!("{}_audio_features.bin", prefix.display()),
+                    &enc.encode_features(&mel, frames).0,
+                )?;
+                dump(&format!("{}_audio.bin", prefix.display()), &emb)?;
+            }
+            text.push_str(&omni::audio_placeholder(n));
+            feats.push(MmFeature {
+                token_id: cfg.audio_token_id,
+                emb,
+                n,
+                grids: Vec::new(),
+            });
+        }
+    }
+    Ok((text, feats))
 }
 
 /// Gemma 4's video processor settings (`processor_config.json`'s `video_processor`).
