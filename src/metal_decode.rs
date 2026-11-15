@@ -6406,4 +6406,169 @@ mod tests {
             }
         }
     }
+
+    /// Matrix-unit GEMM kernel throughput (GPU time, several matrices per command buffer so the
+    /// weights come from memory): `OXINFER_GB_SHAPES=n_outxn_in,..`, `OXINFER_GB_T=512,2048`,
+    /// `OXINFER_GB_KINDS=Q8_0,Q4_K`, `OXINFER_GB_PIPES=mma:128,mma2:128` (kernel prefix and token
+    /// tile; outputs checked against the first).
+    #[test]
+    #[ignore]
+    fn mma_gemm_bench() {
+        let be = MetalBackend::new().unwrap();
+        if be.mma.is_none() {
+            return;
+        }
+        let env = |k: &str, d: &str| std::env::var(k).unwrap_or(d.into());
+        let shapes: Vec<(usize, usize)> = env("OXINFER_GB_SHAPES", "3840x3840,15360x3840,3840x15360")
+            .split(',')
+            .map(|s| {
+                let (a, b) = s.split_once('x').unwrap();
+                (a.parse().unwrap(), b.parse().unwrap())
+            })
+            .collect();
+        let ts: Vec<usize> = env("OXINFER_GB_T", "512,2048").split(',').map(|v| v.parse().unwrap()).collect();
+        let pipes: Vec<(String, usize, usize, bool, usize, bool)> = env("OXINFER_GB_PIPES", "mma:128")
+            .split(',')
+            .map(|v| {
+                let mut it = v.split(':');
+                let n = it.next().unwrap().to_string();
+                let tm = it.next().map_or(128, |x| x.parse().unwrap());
+                let tn = it.next().map_or(64, |x| x.parse().unwrap());
+                let swap = it.next() == Some("s");
+                let threads = it.next().filter(|x| !x.is_empty()).map_or(128, |x| x.parse().unwrap());
+                (n, tm, tn, swap, threads, it.next() == Some("f"))
+            })
+            .collect();
+        let mut seed = 7u64;
+        for kind in env("OXINFER_GB_KINDS", "Q8_0").split(',') {
+            let k = GGUF_GPU_TYPES.iter().copied().find(|t| t.name() == kind).unwrap();
+            for &(n_out, n_in) in &shapes {
+                let data = crate::ggml::random_blocks(k, n_out * n_in / k.block_size(), &mut seed);
+                let copies = (512usize << 20).div_ceil(data.len()).clamp(2, 16);
+                let dlen = data.len().next_multiple_of(4096);
+                let mut big = PageVec::<u8>::zeroed(copies * dlen);
+                for c in 0..copies {
+                    big[c * dlen..c * dlen + data.len()].copy_from_slice(&data);
+                }
+                // OXINFER_GB_FILE=path: the weights read from a mapped file instead (any bytes).
+                let file = std::env::var("OXINFER_GB_FILE")
+                    .ok()
+                    .map(|f| unsafe { memmap2::Mmap::map(&std::fs::File::open(f).unwrap()).unwrap() });
+                let wa = be.wrap(big.as_ptr(), big.len()).unwrap();
+                let anon: Vec<(Id, usize)> = (0..copies).map(|c| (wa.id, wa.offset_bytes + c * dlen)).collect();
+                // The GGUF's tensors of this shape and type (real weights), as many copies.
+                let real: Vec<(Id, usize)> = match (&file, std::env::var("OXINFER_GB_FILE")) {
+                    (Some(m), Ok(f)) => crate::gguf::read_header(std::path::Path::new(&f))
+                        .unwrap()
+                        .tensors
+                        .iter()
+                        .filter(|t| t.ne.len() == 2 && t.ne[0] == n_in && t.ne[1] == n_out && GgmlType::from_id(t.ggml_type) == Some(k))
+                        .map(|t| {
+                            let b = be.wrap(unsafe { m.as_ptr().add(t.start) }, t.end - t.start).unwrap();
+                            (b.id, b.offset_bytes)
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                let tmax = *ts.iter().max().unwrap();
+                let rows_max = tmax.next_multiple_of(128);
+                let mut xh = PageVec::<u16>::zeroed((rows_max * n_in).next_multiple_of(2048));
+                // OXINFER_GB_X=zero|gauss: other activations (gauss: normal with a few outliers
+                // at the row maximum, as real hidden states).
+                let xm = std::env::var("OXINFER_GB_X").unwrap_or_default();
+                for (i, v) in xh.iter_mut().enumerate() {
+                    let r = lcg(&mut seed);
+                    let f = match xm.as_str() {
+                        "zero" => 0.0,
+                        "gauss" if i % n_in == 7 => 16000.0,
+                        "gauss" => {
+                            let r2 = lcg(&mut seed);
+                            (-2.0 * (r + 0.5 + 1e-7).ln()).sqrt() * (std::f32::consts::TAU * r2).cos() * 300.0
+                        }
+                        _ => r * 8192.0,
+                    };
+                    *v = half::f16::from_f32(f).to_bits();
+                }
+                let mut rs = PageVec::<f32>::zeroed(rows_max.next_multiple_of(1024));
+                rs.iter_mut().for_each(|v| *v = 1.0 / 8192.0);
+                let ys: Vec<PageVec<f32>> = (0..2)
+                    .map(|_| PageVec::<f32>::zeroed((rows_max * n_out).next_multiple_of(1024)))
+                    .collect();
+                let xb = be.wrap(xh.as_ptr() as *const u8, xh.len() * 2).unwrap();
+                let rb = be.wrap(rs.as_ptr() as *const u8, rs.len() * 4).unwrap();
+                let yb: Vec<_> = ys.iter().map(|y| be.wrap(y.as_ptr() as *const u8, y.len() * 4).unwrap()).collect();
+                let rbytes = k.row_bytes(n_in);
+                for &t in &ts {
+                    let mut line = format!("{kind:>5} {n_out:>6}x{n_in:<6} t={t:<5}");
+                    let mut best = vec![f64::MAX; pipes.len()];
+                    let mut errs = vec![String::new(); pipes.len()];
+                    let mut warm = true;
+                    for _round in 0..6 {
+                        for (pi, (name, tm, tn, swap, threads, from_file)) in pipes.iter().enumerate() {
+                            let src = if *from_file { &real } else { &anon };
+                            if src.is_empty() {
+                                continue;
+                            }
+                            let rows = t.next_multiple_of(*tm);
+                            let Some(pipe) = be.named_pipeline(&format!("{name}_{kind}")) else {
+                                continue;
+                            };
+                            let enc = |e: &FastEnc, c: usize, y: usize| {
+                                e.pipe(pipe);
+                                let (wid, woff) = src[c % src.len()];
+                                e.buf(wid, woff, 0);
+                                e.buf(wid, woff, 1);
+                                e.buf(xb.id, xb.offset_bytes, 2);
+                                e.buf(yb[y].id, yb[y].offset_bytes, 3);
+                                e.bytes(
+                                    &crate::metal::MmaParams {
+                                        n_out: n_out as u32,
+                                        n_in: n_in as u32,
+                                        w_off: 0,
+                                        s_off: rbytes as u32,
+                                        rows: rows as u32,
+                                        _p: [0; 3],
+                                    },
+                                    4,
+                                );
+                                e.buf(rb.id, rb.offset_bytes, 5);
+                                if *swap {
+                                    e.dispatch((rows / tm, n_out / tn), *threads);
+                                } else {
+                                    e.dispatch((n_out / tn, rows / tm), *threads);
+                                }
+                            };
+                            let reps = 2 * copies;
+                            if warm {
+                                let t_warm = std::time::Instant::now();
+                                while t_warm.elapsed().as_millis() < 200 {
+                                    timed(&be, |e| (0..reps).for_each(|r| enc(e, r % copies, 1)));
+                                }
+                                warm = false;
+                            }
+                            let g = timed(&be, |e| (0..reps).for_each(|r| enc(e, r % copies, 1)));
+                            best[pi] = best[pi].min(g / reps as f64);
+                            if pi == 0 {
+                                timed(&be, |e| enc(e, 0, 0));
+                            } else if errs[pi].is_empty() {
+                                timed(&be, |e| enc(e, 0, 1));
+                                let (a, b) = (&ys[0][..t * n_out], &ys[1][..t * n_out]);
+                                let (mut d, mut m) = (0f32, 0f32);
+                                for (x, y) in a.iter().zip(b) {
+                                    d = d.max((x - y).abs());
+                                    m = m.max(x.abs());
+                                }
+                                errs[pi] = if d / m > 0.0 { format!("(d {:.1e})", d / m) } else { " ".into() };
+                            }
+                        }
+                    }
+                    for (pi, (name, tm, tn, ..)) in pipes.iter().enumerate() {
+                        let tf = 2.0 * (n_out * n_in * t) as f64 / best[pi] / 1e12;
+                        let _ = write!(line, " {name}/{tm}x{tn}: {tf:5.1}{}", errs[pi].trim_end());
+                    }
+                    println!("{line}");
+                }
+            }
+        }
+    }
 }

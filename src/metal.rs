@@ -1709,7 +1709,17 @@ impl MetalBackend {
         };
         let t_compile = Instant::now();
         let (lib, has_mma, mma_error) = match want_mma {
-            true => match compile(&format!("#define GTM {MMA_GTM}\n{base_src}{MMA_SHADER_SRC}"), true) {
+            true => match compile(
+                &format!(
+                    "#define GTM {MMA_GTM}\n{base_src}{MMA_SHADER_SRC}{}",
+                    // Kernel experiments (`mma_gemm_bench`): more source for the library.
+                    std::env::var("OXINFER_MMA_EXTRA")
+                        .ok()
+                        .and_then(|f| std::fs::read_to_string(f).ok())
+                        .unwrap_or_default()
+                ),
+                true,
+            ) {
                 Ok(l) => (l, true, None),
                 Err(e) => {
                     if apple10 || mma_env.is_some() || std::env::var_os("OXINFER_DEBUG").is_some() {
