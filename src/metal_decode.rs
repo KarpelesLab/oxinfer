@@ -661,6 +661,9 @@ pub(crate) fn pf_report() {
 
 /// Prefill GEMMs with fewer 128-row tiles than this take 32-row ones (measured on an M5 Max).
 const PF_SMALL_TILES: usize = 160;
+/// Command buffers of a prefill pass (without MoE layers): each layer's new keys and values are
+/// copied to the host caches once the part that wrote them has completed.
+const PF_PARTS: usize = 8;
 /// Prefill GEMMs: a last partial 128-row tile of at most this many rows takes 32-row tiles.
 const PF_REM_ROWS: usize = 64;
 /// Multi-token plans: bytes of QSA block score rows (see `MOp::QsaScore`).
@@ -681,6 +684,18 @@ pub(crate) fn run_concurrent(
     parts: &[std::ops::Range<usize>],
     encode: impl Fn(&FastEnc, std::ops::Range<usize>),
 ) -> (bool, f64) {
+    run_concurrent_then(b, f, parts, encode, |_| {})
+}
+
+/// [`run_concurrent`], calling `after(None)` once every part is committed and `after(Some(j))`
+/// once part j has completed (host work overlapping the GPU's).
+pub(crate) fn run_concurrent_then(
+    b: &MetalBackend,
+    f: &Fns,
+    parts: &[std::ops::Range<usize>],
+    encode: impl Fn(&FastEnc, std::ops::Range<usize>),
+    mut after: impl FnMut(Option<usize>),
+) -> (bool, f64) {
     unsafe {
         let t0 = Instant::now();
         let pool = (b.sels.pool_push)();
@@ -694,10 +709,14 @@ pub(crate) fn run_concurrent(
             cbs.push(cb);
         }
         let t1 = Instant::now();
+        after(None);
         let mut ok = true;
-        for &cb in &cbs {
+        for (j, &cb) in cbs.iter().enumerate() {
             (f.void)(cb, f.s_wait);
             let st = (f.status)(cb, f.s_status);
+            if st == 4 {
+                after(Some(j));
+            }
             if st != 4 && std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
                 let msg0: unsafe extern "C" fn(Id, Sel) -> Id = b.o.msg_send();
                 let err = msg0(cb, b.o.sel(c"error"));
@@ -5236,6 +5255,47 @@ impl DecodePlan for MetalPlan<'_> {
                 }
             }
         };
+        // The new keys and values go back to the host caches (scratch ones stay on the device,
+        // to be overwritten), each layer's as soon as the command buffer with the last op using
+        // its cache has completed, while the GPU runs the rest of the pass.
+        let mut kv_last = vec![0usize; self.kv.len()];
+        for (i, op) in self.ops[..end].iter().enumerate() {
+            if let MOp::QkRope { kv, .. }
+            | MOp::Attn { kv, .. }
+            | MOp::QsaKey { kv, .. }
+            | MOp::QsaScore { kv, .. }
+            | MOp::PfFlash { kv, .. }
+            | MOp::PfAttn { kv, .. } = op
+            {
+                kv_last[*kv] = i + 1;
+            }
+        }
+        let scratch = s.scratch;
+        if scratch {
+            for m in ms.kv.iter_mut() {
+                m.synced = pos;
+            }
+        }
+        let mut kv_done = vec![scratch; self.kv.len()];
+        let host_kv = &mut *s.kv;
+        let kv_shape = &self.kv;
+        let f = &self.f;
+        let mut sync_kv = |upto: usize| {
+            for (i, (m, c)) in ms.kv.iter_mut().zip(host_kv.iter_mut()).enumerate() {
+                if kv_done[i] || kv_last[i] > upto {
+                    continue;
+                }
+                kv_done[i] = true;
+                let row = kv_shape[i].0 * kv_shape[i].1;
+                unsafe {
+                    let k = std::slice::from_raw_parts((f.contents(m.k) as *const f32).add(pos * row), t * row);
+                    let v = std::slice::from_raw_parts((f.contents(m.v) as *const f32).add(pos * row), t * row);
+                    c.push(k, v, t);
+                }
+                m.synced = pos + t;
+                c.kept = c.len;
+            }
+        };
         let (ok, gpu) = if self.gate.is_some() {
             (self.run_streamed(end, t, &encode), 0.0)
         } else if let Some(pf) = &self.pf {
@@ -5293,7 +5353,19 @@ impl DecodePlan for MetalPlan<'_> {
             for (i, x) in stops {
                 {
                     if i > from {
-                        ok &= run_concurrent(self.be, &self.f, std::slice::from_ref(&(from..i)), |e, r| encode(e, r, &[])).0;
+                        let done = from;
+                        ok &= run_concurrent_then(
+                            self.be,
+                            &self.f,
+                            std::slice::from_ref(&(from..i)),
+                            |e, r| encode(e, r, &[]),
+                            |p| {
+                                if p.is_none() {
+                                    sync_kv(done)
+                                }
+                            },
+                        )
+                        .0;
                     }
                     match ok.then(|| self.pf_route(pf, &pf.experts[x], t)).flatten() {
                         Some(r) => pf_run.set(r),
@@ -5306,7 +5378,28 @@ impl DecodePlan for MetalPlan<'_> {
                 }
             }
             if ok && from < end {
-                ok &= run_concurrent(self.be, &self.f, std::slice::from_ref(&(from..end)), |e, r| encode(e, r, &[])).0;
+                // In PF_PARTS command buffers (cut at barriers), for the caches' copies.
+                let mut parts: Vec<std::ops::Range<usize>> = Vec::with_capacity(PF_PARTS);
+                for d in 1..PF_PARTS {
+                    let start = parts.last().map_or(from, |r| r.end);
+                    let cut = at((from + (end - from) * d / PF_PARTS).max(start));
+                    if cut > start && cut < end {
+                        parts.push(start..cut);
+                    }
+                }
+                parts.push(parts.last().map_or(from, |r| r.end)..end);
+                let first = from;
+                ok &= run_concurrent_then(
+                    self.be,
+                    &self.f,
+                    &parts,
+                    |e, r| encode(e, r, &[]),
+                    |p| match p {
+                        None => sync_kv(first),
+                        Some(j) => sync_kv(parts[j].end),
+                    },
+                )
+                .0;
             }
             (ok, 0.0)
         } else {
@@ -5339,23 +5432,7 @@ impl DecodePlan for MetalPlan<'_> {
                 }
             }
         }
-        // The new keys and values go back to the host caches (scratch ones stay on the device,
-        // to be overwritten).
-        if s.scratch {
-            for m in ms.kv.iter_mut() {
-                m.synced = pos;
-            }
-        }
-        for (i, (m, c)) in ms.kv.iter_mut().zip(s.kv.iter_mut()).enumerate().filter(|_| !s.scratch) {
-            let row = self.kv[i].0 * self.kv[i].1;
-            unsafe {
-                let k = std::slice::from_raw_parts((self.f.contents(m.k) as *const f32).add(pos * row), t * row);
-                let v = std::slice::from_raw_parts((self.f.contents(m.v) as *const f32).add(pos * row), t * row);
-                c.push(k, v, t);
-            }
-            m.synced = pos + t;
-            c.kept = c.len;
-        }
+        sync_kv(usize::MAX);
         if trace() {
             eprintln!(
                 "[metal decode step: sync {:.0} us, run {:.0} us, read back {:.0} us]",
