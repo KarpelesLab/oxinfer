@@ -661,6 +661,8 @@ pub(crate) fn pf_report() {
 
 /// Prefill GEMMs with fewer 128-row tiles than this take 32-row ones (measured on an M5 Max).
 const PF_SMALL_TILES: usize = 160;
+/// Prefill GEMMs: a last partial 128-row tile of at most this many rows takes 32-row tiles.
+const PF_REM_ROWS: usize = 64;
 /// Multi-token plans: bytes of QSA block score rows (see `MOp::QsaScore`).
 const QSA_SCORE_BYTES: usize = 32 << 20;
 
@@ -3916,29 +3918,42 @@ impl MetalPlan<'_> {
                 // Few 128-row tiles (narrow outputs): 32-row ones keep more of the GPU busy.
                 let small = tile == 0 && (n_out / pipes[0].1) * (rows / tm) < PF_SMALL_TILES;
                 let (tile, tm) = if small { (1, super::MMA_TM_S) } else { (tile, tm) };
-                let (pipe, tn) = pipes[tile];
-                e.pipe(pipe);
-                e.buf(*data, 0, 0);
-                e.buf(*scales, 0, 1);
-                e.buf(arena, pf.xh, 2);
-                e.buf(arena, *y, 3);
-                e.bytes(
-                    &super::MmaParams {
-                        n_out: *n_out as u32,
-                        n_in: *n_in as u32,
-                        w_off: *w_off,
-                        s_off: *s_off,
-                        rows: rows as u32,
-                        _p: [*ldy, 0, 0],
-                    },
-                    4,
-                );
-                e.buf(arena, pf.rs, 5);
-                if let Some((ob, op)) = offs {
-                    e.buf(*ob, 0, 6);
-                    e.bytes(op, 7);
+                // Whole tiles, and a short remainder in 32-row tiles rather than one mostly
+                // padded tile (513 tokens: 544 rows instead of 640); disjoint rows, one pass.
+                let full = if tile == 0 && !t.is_multiple_of(tm) && t % tm <= PF_REM_ROWS {
+                    t / tm * tm
+                } else {
+                    rows
+                };
+                let grids = [(tile, 0, full / tm), (1, full, (t - t.min(full)).div_ceil(super::MMA_TM_S))];
+                for (tile, start, n) in grids {
+                    if n == 0 {
+                        continue;
+                    }
+                    let (pipe, tn) = pipes[tile];
+                    e.pipe(pipe);
+                    e.buf(*data, 0, 0);
+                    e.buf(*scales, 0, 1);
+                    e.buf(arena, pf.xh, 2);
+                    e.buf(arena, *y, 3);
+                    e.bytes(
+                        &super::MmaParams {
+                            n_out: *n_out as u32,
+                            n_in: *n_in as u32,
+                            w_off: *w_off,
+                            s_off: *s_off,
+                            rows: rows as u32,
+                            _p: [*ldy, start as u32, 0],
+                        },
+                        4,
+                    );
+                    e.buf(arena, pf.rs, 5);
+                    if let Some((ob, op)) = offs {
+                        e.buf(*ob, 0, 6);
+                        e.bytes(op, 7);
+                    }
+                    e.dispatch((n_out / tn, n), 128);
                 }
-                e.dispatch((n_out / tn, rows / tm), 128);
             }
             MOp::GemmF32 {
                 pipe,

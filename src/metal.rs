@@ -808,7 +808,8 @@ const MMA_SHADER_SRC: &str = r#"
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace mpp::tensor_ops;
-// The first four fields as in P (the MK_* macros read them), then the row count.
+// The first four fields as in P (the MK_* macros read them), then the row count; dense
+// kernels: _p0 the output row stride (0: n_out), _p1 the first token row of the grid.
 struct MP { uint n_out; uint n_in; uint w_off; uint s_off; uint rows; uint _p0; uint _p1; uint _p2; };
 #define MKB 64
 typedef tensor<device half, dextents<int32_t, 2>, tensor_inline> XT;
@@ -887,9 +888,9 @@ kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[bu
                  uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
 #define MMAD(NAME, WT, MAKE) \
 MMA_SIG(NAME) { threadgroup half Ws[64 * MKB]; \
-    WT w = MAKE; mma_tile<WT, 128>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, tg.y * 128, tid, Ws, p._p0); } \
+    WT w = MAKE; mma_tile<WT, 128>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * 128, tid, Ws, p._p0); } \
 MMA_SIG(NAME##_s) { threadgroup half Ws[64 * MKB]; \
-    WT w = MAKE; mma_tile<WT, 32>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, tg.y * 32, tid, Ws, p._p0); }
+    WT w = MAKE; mma_tile<WT, 32>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * 32, tid, Ws, p._p0); }
 // Grouped: per-expert weight addresses, and one tile per threadgroup row. Each format comes with
 // tiles of GTM rows (NAME), 128 rows (NAME_l: the bulk of an expert's rows when it has many, the
 // weights dequantized once for 4x the rows) and 16 rows (NAME_s: an odd remainder, half the
@@ -917,12 +918,12 @@ kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[bu
                  uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { \
     threadgroup half Ws[64 * MKB]; \
     Q4A w = { MK_Q4, ob + op.o_off, op.gpr, op.gk }; \
-    mma_tile<Q4A, TM>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, tg.y * TM, tid, Ws, p._p0); }
+    mma_tile<Q4A, TM>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * TM, tid, Ws, p._p0); }
 MMA_Q4A(mma_q4a, 128) MMA_Q4A(mma_q4a_s, 32)
 #define MMA_BF(NAME, TN, TM) \
 kernel void NAME(device const ushort* qb [[buffer(0)]], device const half* xh [[buffer(2)]], device float* y [[buffer(3)]], \
                  constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]]) { \
-    mma_bf_tile<TM, TN>((device const bfloat*)(qb + p.w_off), xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * TN, tg.y * TM, p._p0); }
+    mma_bf_tile<TM, TN>((device const bfloat*)(qb + p.w_off), xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * TN, p._p1 + tg.y * TM, p._p0); }
 MMA_BF(mma_bf64, 64, 128) MMA_BF(mma_bf128, 128, 128) MMA_BF(mma_bf64_s, 64, 32) MMA_BF(mma_bf128_s, 128, 32)
 #define MMAG_BF(NAME, TM) \
 kernel void NAME(device const EP* ep [[buffer(0)]], device const GT* tiles [[buffer(1)]], device const half* xh [[buffer(2)]], \
