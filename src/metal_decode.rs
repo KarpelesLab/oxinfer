@@ -2018,7 +2018,7 @@ impl MetalBackend {
                     if pf && n_exp.is_multiple_of(64) && h.is_multiple_of(32) && ts(x) == h {
                         let woff = mw.data_off as usize;
                         emit.push(MOp::GemmF32 {
-                            pipe: self.named_pipeline("gemm_f32")?,
+                            pipe: self.named_pipeline("gemm_f32_s")?,
                             w: woff,
                             x: byte(x),
                             y: pf_tmp,
@@ -3998,7 +3998,7 @@ impl MetalPlan<'_> {
                 e.buf(arena, *x, 2);
                 e.buf(arena, *y, 3);
                 e.bytes(&[*n_out as u32, *n_in as u32, (*w / 4) as u32, 0], 4);
-                e.dispatch((n_out / 64, t.div_ceil(64)), 128);
+                e.dispatch((n_out / 32, t.div_ceil(32)), 128);
             }
             MOp::AddRows { pipe, y, x, gate, n, ts } => {
                 e.pipe(*pipe);

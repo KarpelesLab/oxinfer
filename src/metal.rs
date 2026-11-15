@@ -226,6 +226,30 @@ kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[bu
 #define MK_BF BfW{ (device const ushort*)qb + p.w_off, p.n_in }
 #define MK_F32 F32W{ (device const float*)qb + p.w_off, p.n_in }
 GEMM(gemm_bf, BfW, MK_BF) GEMM(gemm_q8, Q8W, MK_Q8) GEMM(gemm_q4, Q4W, MK_Q4) GEMM(gemm_f32, F32W, MK_F32)
+// f32 weights for few outputs (MoE routers): 32 outputs x 32 tokens per threadgroup, 4
+// SIMD-groups of 16 x 16 reading the weights straight from device memory; the same 8x8 products
+// in the same order as gemm_f32, so the same results, with 8x the threadgroups.
+kernel void gemm_f32_s(device const void* qb [[buffer(0)]], device const float* x [[buffer(2)]], device float* y [[buffer(3)]],
+                       constant P& p [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                       uint sg [[simdgroup_index_in_threadgroup]]) {
+    uint o0 = tg.x * 32 + (sg / 2) * 16, t0 = tg.y * 32 + (sg % 2) * 16;
+    device const float* ws = (device const float*)qb + p.w_off + (ulong)o0 * p.n_in;
+    device const float* xs = x + (ulong)t0 * p.n_in;
+    simdgroup_float8x8 c00(0.f), c01(0.f), c10(0.f), c11(0.f);
+    for (uint k = 0; k < p.n_in; k += 8) {
+        simdgroup_float8x8 a0, a1, b0, b1;
+        simdgroup_load(a0, ws + k, p.n_in);
+        simdgroup_load(a1, ws + (ulong)8 * p.n_in + k, p.n_in);
+        simdgroup_load(b0, xs + k, p.n_in, ulong2(0, 0), true);
+        simdgroup_load(b1, xs + (ulong)8 * p.n_in + k, p.n_in, ulong2(0, 0), true);
+        simdgroup_multiply_accumulate(c00, a0, b0, c00); simdgroup_multiply_accumulate(c01, a0, b1, c01);
+        simdgroup_multiply_accumulate(c10, a1, b0, c10); simdgroup_multiply_accumulate(c11, a1, b1, c11);
+    }
+    simdgroup_store(c00, y + (ulong)t0 * p.n_out + o0, p.n_out, ulong2(0, 0), true);
+    simdgroup_store(c01, y + (ulong)(t0 + 8) * p.n_out + o0, p.n_out, ulong2(0, 0), true);
+    simdgroup_store(c10, y + (ulong)t0 * p.n_out + o0 + 8, p.n_out, ulong2(0, 0), true);
+    simdgroup_store(c11, y + (ulong)(t0 + 8) * p.n_out + o0 + 8, p.n_out, ulong2(0, 0), true);
+}
 struct OP { uint o_off; uint gpr; uint gk; uint _p; };
 kernel void gemm_q4a(device const void* qb [[buffer(0)]], device const void* sb [[buffer(1)]],
                      device const float* x [[buffer(2)]], device float* y [[buffer(3)]], constant P& p [[buffer(4)]],
