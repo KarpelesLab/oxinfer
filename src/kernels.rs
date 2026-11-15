@@ -129,10 +129,10 @@ pub fn matmul_multi(jobs: &mut [(&[u16], usize, &mut [f32])], n_in: usize, x: &[
 
 /// Work items of a grouped matmul: `(job, row0, row1, token0, token1)`, row blocks of about
 /// `total_bytes / (8 * threads)` bytes and token chunks of at most 64 (whole TN tiles).
-fn grouped_blocks(segs: &[(usize, usize)], n_out: usize, row_bytes: usize) -> Vec<(u32, u32, u32, u32, u32)> {
+fn grouped_blocks(segs: &[(usize, usize)], n_out: usize, row_bytes: usize, rq: usize) -> Vec<(u32, u32, u32, u32, u32)> {
     let total = segs.iter().filter(|s| s.1 > 0).count() * n_out * row_bytes;
     let target = (total / (pool::threads() * 8)).max(64 * 1024);
-    let rows_per_block = (target / row_bytes).max(16) / 16 * 16;
+    let rows_per_block = (target / row_bytes).max(rq) / rq * rq;
     let mut blocks = Vec::new();
     for (j, &(s, len)) in segs.iter().enumerate() {
         debug_assert!(s.is_multiple_of(TN) && len.is_multiple_of(TN));
@@ -161,7 +161,7 @@ pub fn matmul_grouped(ws: &[&[u16]], segs: &[(usize, usize)], n_out: usize, n_in
     assert!(y.len() == rows * n_out && rows.is_multiple_of(TN));
     let _timer = prof::start(Cat::Matmul);
     prof::add_bytes(ws.iter().zip(segs).filter(|(_, s)| s.1 > 0).map(|(w, _)| w.len() * 2).sum());
-    let blocks = grouped_blocks(segs, n_out, n_in * 2);
+    let blocks = grouped_blocks(segs, n_out, n_in * 2, 16);
     let xt = pack_xt(x, rows, n_in);
     let yp = SendPtr(y.as_mut_ptr());
     pool::run(blocks.len(), &|b| {
@@ -191,7 +191,66 @@ pub fn matmul_quant_grouped<M: QMat>(ms: &[&M], segs: &[(usize, usize)], x: &[f3
     assert!(y.len() == rows * n_out && rows.is_multiple_of(TN));
     let _timer = prof::start(Cat::Matmul);
     prof::add_bytes(ms.iter().zip(segs).filter(|(_, s)| s.1 > 0).map(|(m, _)| m.bytes()).sum());
-    let blocks = grouped_blocks(segs, n_out, (ms[0].bytes() / n_out).max(1));
+    #[cfg(target_arch = "aarch64")]
+    if prefill_kernel() == PrefillGemm::Sme && sme::fits(n_in) {
+        // Each segment's tokens as their own 32-token panels (chunks of 64 tokens from the
+        // segment start, so whole panels).
+        let mut base = Vec::with_capacity(segs.len() + 1);
+        let mut tiles = 0;
+        for &(_, len) in segs {
+            base.push(tiles);
+            tiles += len.div_ceil(32);
+        }
+        base.push(tiles);
+        let mut xt = vec![0f32; tiles * 32 * n_in];
+        let xp = SendPtr(xt.as_mut_ptr());
+        pool::run(tiles, &|i| {
+            let j = base.partition_point(|&b| b <= i) - 1;
+            let (s, len) = segs[j];
+            let k = i - base[j];
+            // SAFETY: each panel is written by one task; rows past the segment are not read.
+            unsafe {
+                sme::pack32(
+                    x.as_ptr().add((s + 32 * k) * n_in),
+                    n_in,
+                    (len - 32 * k).min(32),
+                    n_in,
+                    xp.get().add(i * 32 * n_in),
+                )
+            }
+        });
+        let blocks = grouped_blocks(segs, n_out, (ms[0].bytes() / n_out).max(1), 32);
+        let yp = SendPtr(y.as_mut_ptr());
+        pool::run(blocks.len(), &|b| {
+            let (j, r0, r1, c0, c1) = blocks[b];
+            let (s, _) = segs[j as usize];
+            let xs = &xt[base[j as usize] * 32 * n_in..base[j as usize + 1] * 32 * n_in];
+            unsafe {
+                sme::gemm_rows(
+                    ms[j as usize],
+                    xs,
+                    c0 as usize - s,
+                    c1 as usize - s,
+                    r0 as usize,
+                    r1 as usize,
+                    yp.get().add(s * n_out),
+                )
+            }
+        });
+        return;
+    }
+    let blocks = grouped_blocks(segs, n_out, (ms[0].bytes() / n_out).max(1), 16);
+    #[cfg(target_arch = "aarch64")]
+    if let Some(two) = i8_planes().filter(|_| ms.iter().all(|m| m.i8_layout().is_some())) {
+        let xa = i8gemm::I8Act::new(x, rows, n_in, two);
+        let yp = SendPtr(y.as_mut_ptr());
+        pool::run(blocks.len(), &|b| {
+            let (j, r0, r1, c0, c1) = blocks[b];
+            let m = ms[j as usize];
+            unsafe { i8gemm::gemm_rows(m, &xa, c0 as usize, c1 as usize, r0 as usize, r1 as usize, yp.get()) }
+        });
+        return;
+    }
     let xt = pack_xt(x, rows, n_in);
     let yp = SendPtr(y.as_mut_ptr());
     pool::run(blocks.len(), &|b| {
@@ -969,11 +1028,47 @@ pub trait QMat: Sync {
     unsafe fn rows_multi(&self, _xa: &QAct, _pairs: Option<&PairAct>, _t: usize, _y: *mut f32, _r0: usize, _r1: usize) -> bool {
         false
     }
+    /// How rows unpack for the int8 prefill GEMM, if they do (aarch64).
+    fn i8_layout(&self) -> Option<I8Layout> {
+        None
+    }
+    /// Unpacks row `r` for the int8 prefill GEMM (see [`I8Layout`]): `q` gets `n_in` values,
+    /// `ds` and (`min32`) `mn` `n_in / 32`, (`sc16`) `sc` `n_in / 16`.
+    unsafe fn unpack_row_i8(&self, _r: usize, _q: *mut i8, _ds: *mut f32, _mn: *mut f32, _sc: *mut i32) {
+        unreachable!("no int8 GEMM layout")
+    }
 }
+
+/// How a matrix's rows unpack for the int8 prefill GEMM. Row element `i` (in block `b = i / 32`)
+/// is `ds[b] * sc[i / 16] * q[i]` (`sc = 1` unless `sc16`), and with `min32` the dot product
+/// also subtracts `mn[b]` times the exact f32 sum of the activations of block `b`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct I8Layout {
+    pub sc16: bool,
+    pub min32: bool,
+}
+
+#[cfg(target_arch = "aarch64")]
+#[path = "kernels_i8gemm.rs"]
+pub(crate) mod i8gemm;
+
+#[cfg(target_arch = "aarch64")]
+#[path = "kernels_sme.rs"]
+pub(crate) mod sme;
 
 impl QMat for QMatrix {
     fn n_out(&self) -> usize {
         self.n_out
+    }
+    #[cfg(target_arch = "aarch64")]
+    fn i8_layout(&self) -> Option<I8Layout> {
+        Some(I8Layout { sc16: false, min32: false })
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn unpack_row_i8(&self, r: usize, q: *mut i8, ds: *mut f32, _mn: *mut f32, _sc: *mut i32) {
+        let (n, bpr) = (self.n_in, self.n_in / QBLOCK);
+        std::ptr::copy_nonoverlapping(self.q.as_ptr().add(r * n), q, n);
+        std::ptr::copy_nonoverlapping(self.scales.as_ptr().add(r * bpr), ds, bpr);
     }
     fn n_in(&self) -> usize {
         self.n_in
@@ -1142,6 +1237,32 @@ impl QMat for Q4Matrix {
     fn n_out(&self) -> usize {
         self.n_out
     }
+    #[cfg(target_arch = "aarch64")]
+    fn i8_layout(&self) -> Option<I8Layout> {
+        Some(I8Layout {
+            sc16: false,
+            min32: self.offsets.is_some(),
+        })
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn unpack_row_i8(&self, r: usize, q: *mut i8, ds: *mut f32, mn: *mut f32, _sc: *mut i32) {
+        use std::arch::aarch64::*;
+        let (n, bpr) = (self.n_in, self.n_in / QBLOCK);
+        let src = self.q.as_ptr().add(r * n / 2);
+        let (m4, eight) = (vdupq_n_u8(0x0F), vdupq_n_s8(8));
+        for b in 0..bpr {
+            let v = vld1q_u8(src.add(16 * b));
+            vst1q_s8(q.add(32 * b), vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, m4)), eight));
+            vst1q_s8(q.add(32 * b + 16), vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v)), eight));
+            *ds.add(b) = crate::quant::f16_to_f32(self.scales[r * bpr + b]);
+        }
+        if let Some(o) = &self.offsets {
+            let gpr = n / o.group;
+            for b in 0..bpr {
+                *mn.add(b) = -bf16_to_f32(o.v[r * gpr + b * QBLOCK / o.group]);
+            }
+        }
+    }
     fn n_in(&self) -> usize {
         self.n_in
     }
@@ -1291,6 +1412,118 @@ pub fn multi_token_kernels() -> MultiTokenKernels {
     }
 }
 
+/// Kernels for quantized (and, with SME, float-stored) prefill matmuls on the CPU (more than
+/// [`decode_max_tokens`] tokens).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrefillGemm {
+    /// `Sme` where the CPU has SME (Apple M4 and later), else `F32`: the same f32 products as
+    /// before, faster.
+    Auto,
+    /// The f32 GEMM on the Scalable Matrix Extension's outer-product tiles (Apple M4 and later):
+    /// f32 activations, each product accumulated in input order like the NEON FMA GEMM (logits
+    /// bit-identical to `F32` on Llama 3.2 and Qwen3, KL 4e-7 on Gemma 4 12B); `F32` without SME.
+    Sme,
+    /// The SME GEMM on part of the row blocks (10/16, `OXINFER_SME_SHARE`) and `Int8x2` on the
+    /// cores' NEON units for the rest, at the same time (~10-20% faster than `Sme` alone); which
+    /// kernel computes a block does not depend on timing. `Int8x2` without SME.
+    Hybrid,
+    /// The int8 SDOT GEMM (aarch64) with the activations as two int8 planes per block of 32 (a
+    /// value and its rounding residual: about 16-bit precision); `F32` elsewhere.
+    Int8x2,
+    /// The int8 GEMM with one int8 plane, the decode kernels' rounding: faster than `Int8x2`,
+    /// less precise (KL ~1e-3 against `F32` after a 2.5k-token prompt).
+    Int8,
+    /// Dequantized weights times f32 activations on the NEON / AVX2 FMA GEMM.
+    F32,
+}
+
+impl std::str::FromStr for PrefillGemm {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> anyhow::Result<Self> {
+        Ok(match s {
+            "auto" | "default" | "" => Self::Auto,
+            "sme" => Self::Sme,
+            "hybrid" => Self::Hybrid,
+            "int8x2" => Self::Int8x2,
+            "int8" => Self::Int8,
+            "f32" | "float" | "fma" | "off" | "0" => Self::F32,
+            _ => anyhow::bail!("prefill GEMM must be auto, sme, hybrid, int8x2, int8 or f32, not {s:?}"),
+        })
+    }
+}
+
+static PREFILL_GEMM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Selects the CPU prefill GEMM (default `Auto`; also
+/// `OXINFER_PREFILL_GEMM=auto|sme|hybrid|int8x2|int8|f32`). Decoding (up to [`decode_max_tokens`]
+/// tokens) is not affected.
+pub fn set_prefill_gemm(g: PrefillGemm) {
+    let v = match g {
+        PrefillGemm::Auto => 1,
+        PrefillGemm::Sme => 2,
+        PrefillGemm::Hybrid => 3,
+        PrefillGemm::Int8x2 => 4,
+        PrefillGemm::Int8 => 5,
+        PrefillGemm::F32 => 6,
+    };
+    PREFILL_GEMM.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The CPU prefill GEMM selected (see [`prefill_kernel`] for the one that runs).
+pub fn prefill_gemm() -> PrefillGemm {
+    let mut v = PREFILL_GEMM.load(std::sync::atomic::Ordering::Relaxed);
+    if v == 0 {
+        let g = std::env::var("OXINFER_PREFILL_GEMM")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(PrefillGemm::Auto);
+        set_prefill_gemm(g);
+        v = PREFILL_GEMM.load(std::sync::atomic::Ordering::Relaxed);
+    }
+    match v {
+        1 => PrefillGemm::Auto,
+        2 => PrefillGemm::Sme,
+        3 => PrefillGemm::Hybrid,
+        4 => PrefillGemm::Int8x2,
+        5 => PrefillGemm::Int8,
+        _ => PrefillGemm::F32,
+    }
+}
+
+/// The CPU prefill GEMM that runs on this machine for the selected [`prefill_gemm`]: `Sme`
+/// (also for `Hybrid` with SME), `Int8x2`, `Int8` or `F32`.
+pub fn prefill_kernel() -> PrefillGemm {
+    let sme = sme_available();
+    let arm = cfg!(target_arch = "aarch64");
+    match prefill_gemm() {
+        PrefillGemm::Auto | PrefillGemm::Sme | PrefillGemm::Hybrid if sme => PrefillGemm::Sme,
+        PrefillGemm::Hybrid if arm => PrefillGemm::Int8x2,
+        g @ (PrefillGemm::Int8x2 | PrefillGemm::Int8) if arm => g,
+        _ => PrefillGemm::F32,
+    }
+}
+
+/// Whether the CPU has SME in the shape the SME GEMM uses (512-bit streaming vectors).
+pub fn sme_available() -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        sme::available()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        false
+    }
+}
+
+/// Whether this pass's int8 GEMM takes two activation planes (None: not the int8 GEMM).
+fn i8_planes() -> Option<bool> {
+    match prefill_kernel() {
+        PrefillGemm::Int8x2 => Some(true),
+        PrefillGemm::Int8 => Some(false),
+        _ => None,
+    }
+}
+
 static MOE_UNBATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// For benchmarks: `false` runs the routed experts of MoE decode and verification passes one
@@ -1399,7 +1632,13 @@ pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &
     let nthreads = pool::threads();
     let bytes_per_row = (total_bytes / refs.iter().map(|j| j.m.n_out()).sum::<usize>()).max(1);
     let target = (total_bytes / (nthreads * 8)).max(128 * 1024);
-    let rows_per_block = (target / bytes_per_row).max(16) / 16 * 16;
+    // Multiples of 32 rows (whole SME panels), 16 is enough elsewhere.
+    let rq = if t > decode_max && prefill_kernel() == PrefillGemm::Sme {
+        32
+    } else {
+        16
+    };
+    let rows_per_block = (target / bytes_per_row).max(rq) / rq * rq;
     let mut blocks: Vec<(u32, u32, u32)> = Vec::new();
     for (j, job) in refs.iter().enumerate() {
         let mut r = 0;
@@ -1409,36 +1648,131 @@ pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &
             r = r1;
         }
     }
-    // Prefill (and float-stored weights at any t): dequantize + f32 GEMM. Decode: int8 dot products.
+    // Decode: int8 dot products (float-stored weights: dequantize + f32 GEMM). Prefill: the
+    // selected `PrefillGemm` (see `Path`).
     let gemm = t > decode_max;
-    let dense = |m: &M| gemm || m.dense();
-    let xt = refs.iter().any(|j| dense(j.m)).then(|| pack_xt(x, t, n_in));
-    let xa = refs.iter().any(|j| !dense(j.m)).then(|| quantize_act(x, t, n_in));
+    #[cfg(target_arch = "aarch64")]
+    let sme_on = gemm && prefill_kernel() == PrefillGemm::Sme && sme::fits(n_in);
+    #[cfg(not(target_arch = "aarch64"))]
+    let sme_on = false;
+    // `Hybrid` with SME: the SME units take a share of the row blocks and the cores' NEON the
+    // rest (int8x2), at the same time.
+    let hybrid = sme_on && prefill_gemm() == PrefillGemm::Hybrid;
+    let planes = if !gemm {
+        None
+    } else if hybrid {
+        Some(true)
+    } else {
+        i8_planes()
+    };
     let (tchunks, tc) = if gemm { token_split(blocks.len(), t, nthreads) } else { (1, t) };
+    // SME: whole 32-token tiles per chunk.
+    let (tchunks, tc) = if sme_on {
+        (t.div_ceil(tc.next_multiple_of(32)), tc.next_multiple_of(32))
+    } else {
+        (tchunks, tc)
+    };
+    let (share, _) = hybrid_tuning();
+    let path = |b: usize| -> Path {
+        let m = refs[blocks[b / tchunks].0 as usize].m;
+        let int8 = planes.is_some() && m.i8_layout().is_some();
+        if !gemm {
+            if m.dense() { Path::F32 } else { Path::Decode }
+        } else if sme_on && !(int8 && hybrid && (b * share / 16 == (b + 1) * share / 16)) {
+            Path::Sme
+        } else if int8 {
+            Path::I8
+        } else {
+            Path::F32
+        }
+    };
+    let n_jobs = blocks.len() * tchunks;
+    let mut uses = [false; 4];
+    for b in 0..n_jobs {
+        uses[path(b) as usize] = true;
+    }
+    let xt = uses[Path::F32 as usize].then(|| pack_xt(x, t, n_in));
+    #[cfg(target_arch = "aarch64")]
+    let xs32 = uses[Path::Sme as usize].then(|| sme::pack_x(x, t, n_in));
+    let xa = uses[Path::Decode as usize].then(|| quantize_act(x, t, n_in));
+    #[cfg(target_arch = "aarch64")]
+    let xg = uses[Path::I8 as usize].then(|| i8gemm::I8Act::new(x, t, n_in, planes.unwrap()));
     let mode = multi_token_kernels();
     // Two tokens: the pair kernels already unpack each block once, and keep both accumulators in
     // registers.
     let multi = !gemm && (3..=MULTI_MAX).contains(&t) && mode != MultiTokenKernels::Pairs;
     let pairs =
-        (multi && mode == MultiTokenKernels::Auto && cpu_has_i8mm() && refs.iter().any(|j| !dense(j.m) && j.m.multi(t) == Some(true)))
+        (multi && mode == MultiTokenKernels::Auto && cpu_has_i8mm() && refs.iter().any(|j| !j.m.dense() && j.m.multi(t) == Some(true)))
             .then(|| PairAct::new(xa.as_ref().unwrap()));
-    pool::run(blocks.len() * tchunks, &|b| {
+    let run = |b: usize| {
         let (j, r0, r1) = blocks[b / tchunks];
         let job = refs[j as usize];
         let (r0, r1) = (r0 as usize, r1 as usize);
-        if dense(job.m) {
-            let c0 = (b % tchunks) * tc;
-            if c0 >= t {
-                return;
-            }
-            let c1 = (c0 + tc).min(t);
-            let xs = &x[c0 * n_in..c1 * n_in];
-            let xts = &xt.as_deref().unwrap()[c0 / TN * n_in * TN..];
-            unsafe { matmul_quant_block_prefill(job.m, xs, xts, c1 - c0, r0, r1, job.y.get().add(c0 * job.m.n_out())) }
+        let c0 = (b % tchunks) * tc;
+        if c0 >= t {
             return;
         }
-        unsafe { decode_rows(job.m, xa.as_ref().unwrap(), pairs.as_ref(), multi, job.y.get(), r0, r1) }
+        let c1 = (c0 + tc).min(t);
+        match path(b) {
+            #[cfg(target_arch = "aarch64")]
+            Path::Sme => unsafe { sme::gemm_rows(job.m, xs32.as_ref().unwrap(), c0, c1, r0, r1, job.y.get()) },
+            #[cfg(target_arch = "aarch64")]
+            Path::I8 => unsafe { i8gemm::gemm_rows(job.m, xg.as_ref().unwrap(), c0, c1, r0, r1, job.y.get()) },
+            Path::F32 => {
+                let xs = &x[c0 * n_in..c1 * n_in];
+                let xts = &xt.as_deref().unwrap()[c0 / TN * n_in * TN..];
+                unsafe { matmul_quant_block_prefill(job.m, xs, xts, c1 - c0, r0, r1, job.y.get().add(c0 * job.m.n_out())) }
+            }
+            Path::Decode => unsafe { decode_rows(job.m, xa.as_ref().unwrap(), pairs.as_ref(), multi, job.y.get(), r0, r1) },
+            #[allow(unreachable_patterns)]
+            _ => unreachable!(),
+        }
+    };
+    if !hybrid {
+        pool::run(n_jobs, &run);
+        return;
+    }
+    // Two queues: the first `sme_threads` tasks start on the SME blocks, the others on the NEON
+    // ones; each moves to the other queue when its own is empty. Which kernel computes a block
+    // depends on the block only, so results do not depend on the timing.
+    let (sq, nq): (Vec<usize>, Vec<usize>) = (0..n_jobs).partition(|&b| path(b) == Path::Sme);
+    let (si, ni) = (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0));
+    let (_, sme_threads) = hybrid_tuning();
+    pool::run(nthreads, &|w| {
+        let order = if w < sme_threads {
+            [(&sq, &si), (&nq, &ni)]
+        } else {
+            [(&nq, &ni), (&sq, &si)]
+        };
+        for (q, i) in order {
+            loop {
+                let k = i.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if k >= q.len() {
+                    break;
+                }
+                run(q[k]);
+            }
+        }
     });
+}
+
+/// How the driver computes one block of a quantized matmul.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Path {
+    Sme,
+    I8,
+    F32,
+    Decode,
+}
+
+/// The hybrid prefill's SME share of the row blocks (in sixteenths) and the number of tasks that
+/// start on the SME blocks (`OXINFER_SME_SHARE`, `OXINFER_SME_THREADS`).
+fn hybrid_tuning() -> (usize, usize) {
+    static T: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        let e = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        (e("OXINFER_SME_SHARE", 10).min(16), e("OXINFER_SME_THREADS", 4))
+    })
 }
 
 /// Decode kernels: rows `r0..r1` of `m` against all `xa.t` activation rows into `y[c*n_out + r]`,

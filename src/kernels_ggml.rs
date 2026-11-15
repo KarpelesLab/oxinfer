@@ -1491,6 +1491,125 @@ pub(super) unsafe fn rows_multi(
     true
 }
 
+// ---- Int8 prefill GEMM rows (`kernels::i8gemm`) ------------------------------------------------
+
+/// `(sc16, min32)` of `kind`'s rows for the int8 prefill GEMM (see `kernels::I8Layout`); None if
+/// `kind` has no row unpacker there.
+pub(super) fn i8_layout(kind: GgmlType) -> Option<(bool, bool)> {
+    use GgmlType::*;
+    Some(match kind {
+        Q8_0 | Q4_0 | IQ4_NL | MXFP4 | Q5_0 | IQ4_XS => (false, false),
+        Q4_1 | Q5_1 | Q4_K | Q5_K => (false, true),
+        Q6_K | Q3_K | IQ2_XXS | IQ2_XS | IQ2_S | IQ3_XXS | IQ3_S | IQ1_S | IQ1_M => (true, false),
+        _ => return None,
+    })
+}
+
+/// One row of `kind` (`n_in` elements at `row`) unpacked for the int8 prefill GEMM: centered
+/// int8 values `q`, f32 scales per 32 `ds`, and per `i8_layout` mins per 32 `mn` (subtracted
+/// times the activations' block sums) or integer scales per 16 `sc`.
+pub(super) unsafe fn unpack_row_i8(kind: GgmlType, row: *const u8, n_in: usize, q: *mut i8, ds: *mut f32, mn: *mut f32, sc: *mut i32) {
+    match kind {
+        GgmlType::Q8_0 => {
+            for b in 0..n_in / 32 {
+                let p = row.add(34 * b);
+                vst1q_s8(q.add(32 * b), vld1q_s8(p.add(2) as *const i8));
+                vst1q_s8(q.add(32 * b + 16), vld1q_s8(p.add(18) as *const i8));
+                *ds.add(b) = f16p(p);
+            }
+        }
+        GgmlType::Q4_0 => b32_i8::<Q4_0>(row, n_in, q, ds, mn),
+        GgmlType::IQ4_NL => b32_i8::<IQ4_NL>(row, n_in, q, ds, mn),
+        GgmlType::MXFP4 => b32_i8::<MXFP4>(row, n_in, q, ds, mn),
+        GgmlType::Q4_1 => b32_i8::<Q4_1>(row, n_in, q, ds, mn),
+        GgmlType::Q5_0 => b32_i8::<Q5_0>(row, n_in, q, ds, mn),
+        GgmlType::Q5_1 => b32_i8::<Q5_1>(row, n_in, q, ds, mn),
+        GgmlType::Q4_K => sb_i8::<MQ4K<false>>(row, n_in, q, ds, mn, sc),
+        GgmlType::Q5_K => sb_i8::<MQ4K<true>>(row, n_in, q, ds, mn, sc),
+        GgmlType::Q6_K => sb_i8::<MSb16<Q6K>>(row, n_in, q, ds, mn, sc),
+        GgmlType::Q3_K => sb_i8::<MSb16<Q3K>>(row, n_in, q, ds, mn, sc),
+        GgmlType::IQ4_XS => sb_i8::<MIq4Xs>(row, n_in, q, ds, mn, sc),
+        GgmlType::IQ2_XXS => sb_i8::<MSb16<Iq2Xxs>>(row, n_in, q, ds, mn, sc),
+        GgmlType::IQ2_XS => sb_i8::<MSb16<Iq2Xs>>(row, n_in, q, ds, mn, sc),
+        GgmlType::IQ2_S => sb_i8::<MSb16<Iq2S>>(row, n_in, q, ds, mn, sc),
+        GgmlType::IQ3_XXS => sb_i8::<MSb16<Iq3Xxs>>(row, n_in, q, ds, mn, sc),
+        GgmlType::IQ3_S => sb_i8::<MSb16<Iq3S>>(row, n_in, q, ds, mn, sc),
+        GgmlType::IQ1_S => sb_i8::<MSb16<Iq1S>>(row, n_in, q, ds, mn, sc),
+        GgmlType::IQ1_M => sb_i8::<MSb16<Iq1M>>(row, n_in, q, ds, mn, sc),
+        _ => unreachable!("no int8 GEMM rows for {kind}"),
+    }
+}
+
+/// [`unpack_row_i8`] for the blocks-of-32 nibble formats (`K` as in `q32`), nibbles centered.
+unsafe fn b32_i8<const K: u8>(row: *const u8, n_in: usize, q: *mut i8, ds: *mut f32, mn: *mut f32) {
+    let (tsz, qs) = match K {
+        Q4_0 | IQ4_NL => (18, 2),
+        MXFP4 => (17, 1),
+        Q4_1 => (20, 4),
+        Q5_0 => (22, 6),
+        _ => (24, 8),
+    };
+    let table = K == IQ4_NL || K == MXFP4;
+    let has_min = K == Q4_1 || K == Q5_1;
+    let five = K == Q5_0 || K == Q5_1;
+    let qoff: i8 = if five { 16 } else { 8 };
+    let m4 = vdupq_n_u8(0x0F);
+    let kv = vld1q_s8(if K == MXFP4 {
+        KVALUES_MXFP4.as_ptr()
+    } else {
+        KVALUES_IQ4NL.as_ptr()
+    });
+    for b in 0..n_in / 32 {
+        let p = row.add(b * tsz);
+        let v = vld1q_u8(p.add(qs));
+        let (mut lo, mut hi) = (vandq_u8(v, m4), vshrq_n_u8::<4>(v));
+        if five {
+            let (h0, h1) = sign_masks(rd32(p.add(qs - 4)));
+            let b16 = vdupq_n_u8(16);
+            lo = vorrq_u8(lo, vandq_u8(h0, b16));
+            hi = vorrq_u8(hi, vandq_u8(h1, b16));
+        }
+        let (lo, hi) = if table {
+            (vqtbl1q_s8(kv, lo), vqtbl1q_s8(kv, hi))
+        } else {
+            let o = vdupq_n_s8(qoff);
+            (vsubq_s8(vreinterpretq_s8_u8(lo), o), vsubq_s8(vreinterpretq_s8_u8(hi), o))
+        };
+        vst1q_s8(q.add(32 * b), lo);
+        vst1q_s8(q.add(32 * b + 16), hi);
+        let d = scale32::<K>(p);
+        *ds.add(b) = d;
+        if has_min {
+            *mn.add(b) = -(f16p(p.add(2)) + d * qoff as f32);
+        }
+    }
+}
+
+/// [`unpack_row_i8`] for the super-block formats, through their multi-token unpackers.
+unsafe fn sb_i8<F: Multi>(row: *const u8, n_in: usize, q: *mut i8, ds: *mut f32, mn: *mut f32, sc: *mut i32) {
+    for s in 0..n_in / QK_K {
+        let mut u = Unpacked {
+            w: [vdupq_n_s8(0); 16],
+            m: Meta::zero(),
+        };
+        F::unpack(row.add(s * F::TSZ), &mut u);
+        for (k, w) in u.w.iter().enumerate() {
+            vst1q_s8(q.add(QK_K * s + 16 * k), *w);
+        }
+        vst1q_f32(ds.add(8 * s), u.m.ds[0]);
+        vst1q_f32(ds.add(8 * s + 4), u.m.ds[1]);
+        if F::CORR == Corr::Min32 {
+            vst1q_f32(mn.add(8 * s), u.m.mn[0]);
+            vst1q_f32(mn.add(8 * s + 4), u.m.mn[1]);
+        }
+        if F::SC16 {
+            for k in 0..4 {
+                vst1q_s32(sc.add(16 * s + 4 * k), u.m.sc[k]);
+            }
+        }
+    }
+}
+
 // ---- Dequantization (prefill and tables) -------------------------------------------------------
 // The same unpacking, then f32 scaling in the operation order of ggml's reference code, so the
 // values are bit-identical to `super::dequantize_row`.
@@ -1508,9 +1627,30 @@ pub(super) unsafe fn dequant_row(kind: GgmlType, row: *const u8, n: usize, out: 
         GgmlType::IQ3_XXS => deq_sb16::<Iq3Xxs>(row, n, out),
         GgmlType::IQ3_S => deq_sb16::<Iq3S>(row, n, out),
         GgmlType::IQ4_XS => deq_iq4xs(row, n, out),
+        GgmlType::Q8_0 | GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::IQ4_NL => deq_b32(kind, row, n, out),
         _ => return false,
     }
     true
+}
+
+/// Q8_0, Q4_0, Q5_0 and IQ4_NL: `q * d` per block of 32, as ggml computes it (one f32 product
+/// of the centered integer or table value).
+unsafe fn deq_b32(kind: GgmlType, row: *const u8, n: usize, out: *mut f32) {
+    let mut q = [0i8; 32];
+    let mut d = 0f32;
+    let mut m = 0f32;
+    let tsz = kind.type_size();
+    for b in 0..n / 32 {
+        let p = row.add(b * tsz);
+        match kind {
+            GgmlType::Q8_0 => unpack_row_i8(kind, p, 32, q.as_mut_ptr(), &mut d, &mut m, std::ptr::null_mut()),
+            GgmlType::Q4_0 => b32_i8::<Q4_0>(p, 32, q.as_mut_ptr(), &mut d, &mut m),
+            GgmlType::Q5_0 => b32_i8::<Q5_0>(p, 32, q.as_mut_ptr(), &mut d, &mut m),
+            _ => b32_i8::<IQ4_NL>(p, 32, q.as_mut_ptr(), &mut d, &mut m),
+        }
+        st16(out.add(32 * b), vld1q_s8(q.as_ptr()), d);
+        st16(out.add(32 * b + 16), vld1q_s8(q.as_ptr().add(16)), d);
+    }
 }
 
 /// Stores `v * s` (16 int8 values times an f32 scale) at `o`.

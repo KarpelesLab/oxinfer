@@ -192,6 +192,15 @@ pub struct EngineOptions {
     /// prefill). Process-wide, applied on load; None leaves the current setting
     /// ([`crate::gpu::set_exact`]). Key `gpu_exact`.
     pub gpu_exact: Option<bool>,
+    /// CPU prefill matmuls ([`crate::kernels::PrefillGemm`]): `auto` (default: `sme` where the
+    /// CPU has SME, else `f32`), `sme` (the f32 GEMM on the SME tiles: same products as `f32`),
+    /// `hybrid` (SME and `int8x2` on the NEON units at once: faster, KL ~1e-5 against f32),
+    /// `int8x2` (int8 SDOT GEMM with a residual activation plane), `int8` (one plane: KL ~1e-3
+    /// against f32), `f32` (dequantized weights times f32 activations on the NEON / AVX2 FMA
+    /// GEMM). Process-wide, applied on load; None leaves the current setting
+    /// ([`crate::kernels::set_prefill_gemm`]; also `OXINFER_PREFILL_GEMM`). Decoding is
+    /// unaffected. Key `prefill_gemm`.
+    pub prefill_gemm: Option<crate::kernels::PrefillGemm>,
     /// MoE experts on the GPU during prefill. Process-wide, applied on load; None leaves the
     /// current setting ([`crate::gpu::set_moe_offload`]). Key `gpu_moe`.
     pub gpu_moe: Option<bool>,
@@ -405,6 +414,7 @@ impl Default for EngineOptions {
             coreml_units: None,
             coreml_prefill: CoreMlPrefill::Auto,
             gpu_exact: None,
+            prefill_gemm: None,
             gpu_moe: None,
             gpu_decode: None,
             stream_gpu: None,
@@ -483,6 +493,7 @@ impl EngineOptions {
         "coreml_units",
         "coreml_prefill",
         "gpu_exact",
+        "prefill_gemm",
         "gpu_moe",
         "gpu_decode",
         "stream_gpu",
@@ -586,6 +597,15 @@ impl EngineOptions {
                     .with_context(|| format!("coreml_prefill: unknown value {value:?} (auto|batch|pad|single)"))?
             }
             "gpu_exact" => self.gpu_exact = Some(parse_bool(key, value)?),
+            "prefill_gemm" => {
+                self.prefill_gemm = match value {
+                    "" => None,
+                    v => Some(
+                        v.parse()
+                            .with_context(|| format!("{key}: expected auto, sme, hybrid, int8x2, int8 or f32, got {v:?}"))?,
+                    ),
+                }
+            }
             "gpu_moe" => self.gpu_moe = Some(parse_bool(key, value)?),
             "gpu_decode" => self.gpu_decode = Some(parse_bool(key, value)?),
             "stream_gpu" => {
@@ -1402,6 +1422,9 @@ impl Engine {
         }
         if let Some(on) = opts.gpu_exact {
             crate::gpu::set_exact(on);
+        }
+        if let Some(g) = opts.prefill_gemm {
+            crate::kernels::set_prefill_gemm(g);
         }
         if let Some(on) = opts.gpu_moe {
             crate::gpu::set_moe_offload(on);
@@ -3732,6 +3755,7 @@ mod tests {
                 "coreml_prefill" => "pad",
                 "qos" => "background",
                 "draft_device" => "gpu",
+                "prefill_gemm" => "sme",
                 "mtp_from" | "draft" | "cache_dir" | "decision_from" => "x",
                 "interventions" => r#"{"neurons":[{"layer":1,"neuron":2,"op":"zero"}]}"#,
                 _ => "1",

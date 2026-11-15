@@ -1332,6 +1332,17 @@ impl QMat for GgufMatrix {
     fn dense(&self) -> bool {
         self.kind.is_float()
     }
+    #[cfg(target_arch = "aarch64")]
+    fn i8_layout(&self) -> Option<crate::kernels::I8Layout> {
+        if self.block_scales.is_some() {
+            return None;
+        }
+        neon::i8_layout(self.kind).map(|(sc16, min32)| crate::kernels::I8Layout { sc16, min32 })
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn unpack_row_i8(&self, r: usize, q: *mut i8, ds: *mut f32, mn: *mut f32, sc: *mut i32) {
+        unsafe { neon::unpack_row_i8(self.kind, self.data.as_ptr().add(r * self.row_bytes()), self.n_in, q, ds, mn, sc) }
+    }
     unsafe fn rows_t1(&self, xa: &QAct, c: usize, y: *mut f32, r0: usize, r1: usize) {
         unsafe { self.rows_impl::<1>(xa, c, y, 0, r0, r1) }
     }

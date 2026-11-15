@@ -268,6 +268,10 @@ fn usage() -> ! {
          \x20                      output is the plain greedy output token for token (default: fast\n\
          \x20                      batched matrix kernels on the GPU, whose logits differ from plain\n\
          \x20                      decoding in rounding; --fast-verify asks for them explicitly)\n\
+         \x20 --prefill-gemm G     CPU prefill matmuls: auto (default: sme with SME, else f32), sme\n\
+         \x20                      (f32 on the SME tiles), hybrid (SME + int8x2 at once), int8x2 (int8\n\
+         \x20                      GEMM with a residual activation plane, close to f32), int8 (faster,\n\
+         \x20                      coarser) or f32 (NEON / AVX2 FMA GEMM); env OXINFER_PREFILL_GEMM\n\
          \x20 --lookup / --no-lookup  prompt-lookup drafting (default on): drafts copied from the\n\
          \x20                      conversation where its last tokens occurred before (quoting, editing,\n\
          \x20                      summarizing), verified like other drafts (exact); rounds without a\n\
@@ -758,6 +762,7 @@ fn parse_args() -> Result<Args> {
             "--spec-draft-fixed" => a.mtp_fixed = true,
             "--fast-verify" => a.fast_verify = true,
             "--exact-verify" => a.fast_verify = false,
+            "--prefill-gemm" => oxinfer::kernels::set_prefill_gemm(val()?.parse()?),
             "--lookup" => a.lookup = Some(true),
             "--no-lookup" => a.lookup = Some(false),
             "--lookup-tokens" => a.lookup_tokens = Some(val()?.parse()?),
