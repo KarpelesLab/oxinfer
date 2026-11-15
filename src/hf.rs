@@ -203,6 +203,14 @@ pub fn resolve_gguf(repo: &str, quant: &str, cache_dir: Option<&Path>) -> Result
             f.ends_with(&want) && f[..f.len() - want.len()].ends_with(['-', '.', '_', '/'])
         })
         .collect();
+    // A repository's draft sidecars (`mtp-*.gguf`, `dflash-*.gguf`) often carry the same quant
+    // suffix as its models: with several matches, they give way to the model.
+    let is_sidecar = |f: &str| {
+        let base = f.rsplit('/').next().unwrap_or(f).to_ascii_lowercase();
+        ["mtp-", "dflash-", "dspark-"].iter().any(|p| base.starts_with(p))
+    };
+    let models: Vec<&&String> = hits.iter().copied().filter(|f| !is_sidecar(f)).collect();
+    let hits = if hits.len() > 1 && !models.is_empty() { models } else { hits };
     let name = match hits.as_slice() {
         [one] => one.to_string(),
         [] => bail!(

@@ -414,6 +414,10 @@ pub const CATALOG: &[Model] = &[
         .speed(3.8, 48)
         .moe()
         .note("29 GB of it an n-gram table read a few rows a token; bytes per token and layers from the parameter count"),
+    Model::new("SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF:IQ2_XS", Kind::Chat, 125.0, 68.5, AGENT)
+        .fixed(Format::GgufLow, "GGUF GSQ-RCO IQ2_XS")
+        .moe()
+        .note("abliterated Qwen3.8-Flash-Next, a ggml type per tensor; also :IQ3_XXS, :IQ3_S, :Q2_0 (ternary experts); supported, untested"),
     Model::new("unsloth/MiniMax-M3.1-Flash-GGUF:UD-Q2_K_XL", Kind::Chat, 220.0, 144.0, AGENT)
         .fixed(Format::GgufLow, "GGUF UD-Q2_K_XL")
         .moe(),
