@@ -67,6 +67,14 @@ pub fn matmul_multi(jobs: &mut [(&[u16], usize, &mut [f32])], n_in: usize, x: &[
     if t == 0 {
         return;
     }
+    #[cfg(target_arch = "aarch64")]
+    if t > decode_max_tokens() && prefill_kernel() == PrefillGemm::Sme && sme::fits(n_in) {
+        // Prefill on the SME tiles, through the quantized driver (bf16 rows widen exactly).
+        let mats: Vec<Bf16Mat> = jobs.iter().map(|(w, n_out, _)| Bf16Mat { w, n_out: *n_out, n_in }).collect();
+        let mut qj: Vec<(&Bf16Mat, &mut [f32])> = mats.iter().zip(jobs.iter_mut()).map(|(m, (_, _, y))| (m, &mut **y)).collect();
+        matmul_quant_multi(&mut qj, x, t);
+        return;
+    }
     let mut total_bytes = 0usize;
     let refs: Vec<JobRef> = jobs
         .iter_mut()
@@ -1002,6 +1010,39 @@ unsafe fn matmul_block_scalar(w: &[u16], n_out: usize, n_in: usize, x: &[f32], t
     });
 }
 
+/// bf16 weights as a float-stored matrix of the quantized driver (its SME prefill path).
+#[cfg(target_arch = "aarch64")]
+struct Bf16Mat<'a> {
+    w: &'a [u16],
+    n_out: usize,
+    n_in: usize,
+}
+
+#[cfg(target_arch = "aarch64")]
+impl QMat for Bf16Mat<'_> {
+    fn n_out(&self) -> usize {
+        self.n_out
+    }
+    fn n_in(&self) -> usize {
+        self.n_in
+    }
+    fn bytes(&self) -> usize {
+        self.w.len() * 2
+    }
+    fn dense(&self) -> bool {
+        true
+    }
+    fn dequantize_rows(&self, r0: usize, r1: usize, out: &mut [f32]) {
+        bf16_to_f32_slice(&self.w[r0 * self.n_in..r1 * self.n_in], &mut out[..(r1 - r0) * self.n_in]);
+    }
+    unsafe fn rows_t1(&self, _: &QAct, _: usize, _: *mut f32, _: usize, _: usize) {
+        unreachable!("bf16 rows run on the GEMM (dense)")
+    }
+    unsafe fn rows_tc(&self, _: &QAct, _: usize, _: usize, _: *mut f32, _: usize, _: usize) {
+        unreachable!("bf16 rows run on the GEMM (dense)")
+    }
+}
+
 /// A quantized weight matrix usable by the shared quantized-matmul driver.
 pub trait QMat: Sync {
     fn n_out(&self) -> usize;
@@ -1423,10 +1464,14 @@ pub enum PrefillGemm {
     /// f32 activations, each product accumulated in input order like the NEON FMA GEMM (logits
     /// bit-identical to `F32` on Llama 3.2 and Qwen3, KL 4e-7 on Gemma 4 12B); `F32` without SME.
     Sme,
-    /// The SME GEMM on part of the row blocks (10/16, `OXINFER_SME_SHARE`) and `Int8x2` on the
+    /// The SME GEMM on part of the row blocks (7/16, `OXINFER_SME_SHARE`) and `Int8x2` on the
     /// cores' NEON units for the rest, at the same time (~10-20% faster than `Sme` alone); which
     /// kernel computes a block does not depend on timing. `Int8x2` without SME.
     Hybrid,
+    /// `Hybrid` with `Int8` on the NEON units (5/16 of the blocks on SME): the fastest, with
+    /// llama.cpp's activation rounding on most rows (KL ~1e-4..1e-3 against `F32`). `Int8`
+    /// without SME.
+    Fast,
     /// The int8 SDOT GEMM (aarch64) with the activations as two int8 planes per block of 32 (a
     /// value and its rounding residual: about 16-bit precision); `F32` elsewhere.
     Int8x2,
@@ -1444,10 +1489,11 @@ impl std::str::FromStr for PrefillGemm {
             "auto" | "default" | "" => Self::Auto,
             "sme" => Self::Sme,
             "hybrid" => Self::Hybrid,
+            "fast" => Self::Fast,
             "int8x2" => Self::Int8x2,
             "int8" => Self::Int8,
             "f32" | "float" | "fma" | "off" | "0" => Self::F32,
-            _ => anyhow::bail!("prefill GEMM must be auto, sme, hybrid, int8x2, int8 or f32, not {s:?}"),
+            _ => anyhow::bail!("prefill GEMM must be auto, sme, hybrid, fast, int8x2, int8 or f32, not {s:?}"),
         })
     }
 }
@@ -1455,16 +1501,17 @@ impl std::str::FromStr for PrefillGemm {
 static PREFILL_GEMM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 /// Selects the CPU prefill GEMM (default `Auto`; also
-/// `OXINFER_PREFILL_GEMM=auto|sme|hybrid|int8x2|int8|f32`). Decoding (up to [`decode_max_tokens`]
+/// `OXINFER_PREFILL_GEMM=auto|sme|hybrid|fast|int8x2|int8|f32`). Decoding (up to [`decode_max_tokens`]
 /// tokens) is not affected.
 pub fn set_prefill_gemm(g: PrefillGemm) {
     let v = match g {
         PrefillGemm::Auto => 1,
         PrefillGemm::Sme => 2,
         PrefillGemm::Hybrid => 3,
-        PrefillGemm::Int8x2 => 4,
-        PrefillGemm::Int8 => 5,
-        PrefillGemm::F32 => 6,
+        PrefillGemm::Fast => 4,
+        PrefillGemm::Int8x2 => 5,
+        PrefillGemm::Int8 => 6,
+        PrefillGemm::F32 => 7,
     };
     PREFILL_GEMM.store(v, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1484,20 +1531,22 @@ pub fn prefill_gemm() -> PrefillGemm {
         1 => PrefillGemm::Auto,
         2 => PrefillGemm::Sme,
         3 => PrefillGemm::Hybrid,
-        4 => PrefillGemm::Int8x2,
-        5 => PrefillGemm::Int8,
+        4 => PrefillGemm::Fast,
+        5 => PrefillGemm::Int8x2,
+        6 => PrefillGemm::Int8,
         _ => PrefillGemm::F32,
     }
 }
 
 /// The CPU prefill GEMM that runs on this machine for the selected [`prefill_gemm`]: `Sme`
-/// (also for `Hybrid` with SME), `Int8x2`, `Int8` or `F32`.
+/// (also for `Hybrid` and `Fast` with SME), `Int8x2`, `Int8` or `F32`.
 pub fn prefill_kernel() -> PrefillGemm {
     let sme = sme_available();
     let arm = cfg!(target_arch = "aarch64");
     match prefill_gemm() {
-        PrefillGemm::Auto | PrefillGemm::Sme | PrefillGemm::Hybrid if sme => PrefillGemm::Sme,
+        PrefillGemm::Auto | PrefillGemm::Sme | PrefillGemm::Hybrid | PrefillGemm::Fast if sme => PrefillGemm::Sme,
         PrefillGemm::Hybrid if arm => PrefillGemm::Int8x2,
+        PrefillGemm::Fast if arm => PrefillGemm::Int8,
         g @ (PrefillGemm::Int8x2 | PrefillGemm::Int8) if arm => g,
         _ => PrefillGemm::F32,
     }
@@ -1655,13 +1704,14 @@ pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &
     let sme_on = gemm && prefill_kernel() == PrefillGemm::Sme && sme::fits(n_in);
     #[cfg(not(target_arch = "aarch64"))]
     let sme_on = false;
-    // `Hybrid` with SME: the SME units take a share of the row blocks and the cores' NEON the
-    // rest (int8x2), at the same time.
-    let hybrid = sme_on && prefill_gemm() == PrefillGemm::Hybrid;
+    // `Hybrid` / `Fast` with SME: the SME units take a share of the row blocks and the cores'
+    // NEON the rest (int8x2 / int8), at the same time.
+    let selected = prefill_gemm();
+    let hybrid = sme_on && matches!(selected, PrefillGemm::Hybrid | PrefillGemm::Fast);
     let planes = if !gemm {
         None
     } else if hybrid {
-        Some(true)
+        Some(selected == PrefillGemm::Hybrid)
     } else {
         i8_planes()
     };
@@ -1672,7 +1722,7 @@ pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &
     } else {
         (tchunks, tc)
     };
-    let (share, _) = hybrid_tuning();
+    let (share, _) = hybrid_tuning(selected == PrefillGemm::Fast);
     let path = |b: usize| -> Path {
         let m = refs[blocks[b / tchunks].0 as usize].m;
         let int8 = planes.is_some() && m.i8_layout().is_some();
@@ -1737,7 +1787,7 @@ pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &
     // depends on the block only, so results do not depend on the timing.
     let (sq, nq): (Vec<usize>, Vec<usize>) = (0..n_jobs).partition(|&b| path(b) == Path::Sme);
     let (si, ni) = (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0));
-    let (_, sme_threads) = hybrid_tuning();
+    let (_, sme_threads) = hybrid_tuning(false);
     pool::run(nthreads, &|w| {
         let order = if w < sme_threads {
             [(&sq, &si), (&nq, &ni)]
@@ -1765,14 +1815,20 @@ enum Path {
     Decode,
 }
 
-/// The hybrid prefill's SME share of the row blocks (in sixteenths) and the number of tasks that
-/// start on the SME blocks (`OXINFER_SME_SHARE`, `OXINFER_SME_THREADS`).
-fn hybrid_tuning() -> (usize, usize) {
-    static T: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
-    *T.get_or_init(|| {
-        let e = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-        (e("OXINFER_SME_SHARE", 10).min(16), e("OXINFER_SME_THREADS", 4))
-    })
+/// The hybrid prefill's SME share of the row blocks (in sixteenths; `fast`: against int8 rows)
+/// and the number of tasks that start on the SME blocks (`OXINFER_SME_SHARE`,
+/// `OXINFER_SME_THREADS`). M5 Max, Qwen3-8B Q8_0 pp512: int8x2 rows do best at 6-8 of 16 on
+/// SME, int8 rows at 3-6.
+fn hybrid_tuning(fast: bool) -> (usize, usize) {
+    static T: std::sync::OnceLock<(Option<usize>, usize)> = std::sync::OnceLock::new();
+    let (share, threads) = *T.get_or_init(|| {
+        let e = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok());
+        (
+            e("OXINFER_SME_SHARE").map(|s: usize| s.min(16)),
+            e("OXINFER_SME_THREADS").unwrap_or(4),
+        )
+    });
+    (share.unwrap_or(if fast { 5 } else { 7 }), threads)
 }
 
 /// Decode kernels: rows `r0..r1` of `m` against all `xa.t` activation rows into `y[c*n_out + r]`,
