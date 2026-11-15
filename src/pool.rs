@@ -275,6 +275,10 @@ impl Pool {
             }
             return;
         }
+        // The caller's prompt-processing flag (`kernels::lm_prefill`) holds in the workers too.
+        let lm = crate::kernels::in_lm_prefill();
+        let scoped = move |i: usize| crate::kernels::with_lm_prefill(lm, || f(i));
+        let f: &(dyn Fn(usize) + Sync) = &scoped;
         let s = &self.shared;
         // SAFETY: the region outlives every access: the pointer is cleared and `active`
         // observed zero before this function returns.

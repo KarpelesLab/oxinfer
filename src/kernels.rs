@@ -1457,9 +1457,14 @@ pub fn multi_token_kernels() -> MultiTokenKernels {
 /// [`decode_max_tokens`] tokens).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefillGemm {
-    /// `Sme` where the CPU has SME (Apple M4 and later), else `F32`: the same f32 products as
-    /// before, faster.
+    /// The default: `Fast` (llama.cpp's int8 activation rounding on most rows, SME beside it
+    /// where present; `F32` off aarch64) in a language model's prompt processing (inside
+    /// [`lm_prefill`]), `Exact` everywhere else (vision and audio towers, diffusion models,
+    /// embeddings, text encoders). [`PrefillGemm::Exact`] opts out everywhere.
     Auto,
+    /// The exact products: `Sme` where the CPU has SME (Apple M4 and later), else `F32`. Logits
+    /// as with the f32 GEMM (bit-identical on Llama 3.2 and Qwen3).
+    Exact,
     /// The f32 GEMM on the Scalable Matrix Extension's outer-product tiles (Apple M4 and later):
     /// f32 activations, each product accumulated in input order like the NEON FMA GEMM (logits
     /// bit-identical to `F32` on Llama 3.2 and Qwen3, KL 4e-7 on Gemma 4 12B); `F32` without SME.
@@ -1487,21 +1492,22 @@ impl std::str::FromStr for PrefillGemm {
     fn from_str(s: &str) -> anyhow::Result<Self> {
         Ok(match s {
             "auto" | "default" | "" => Self::Auto,
+            "exact" | "precise" => Self::Exact,
             "sme" => Self::Sme,
             "hybrid" => Self::Hybrid,
             "fast" => Self::Fast,
             "int8x2" => Self::Int8x2,
             "int8" => Self::Int8,
             "f32" | "float" | "fma" | "off" | "0" => Self::F32,
-            _ => anyhow::bail!("prefill GEMM must be auto, sme, hybrid, fast, int8x2, int8 or f32, not {s:?}"),
+            _ => anyhow::bail!("prefill GEMM must be auto, exact, sme, hybrid, fast, int8x2, int8 or f32, not {s:?}"),
         })
     }
 }
 
 static PREFILL_GEMM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Selects the CPU prefill GEMM (default `Auto`; also
-/// `OXINFER_PREFILL_GEMM=auto|sme|hybrid|fast|int8x2|int8|f32`). Decoding (up to [`decode_max_tokens`]
+/// Selects the CPU prefill GEMM (default `Auto`, i.e. `Fast`; also
+/// `OXINFER_PREFILL_GEMM=auto|exact|sme|hybrid|fast|int8x2|int8|f32`). Decoding (up to [`decode_max_tokens`]
 /// tokens) is not affected.
 pub fn set_prefill_gemm(g: PrefillGemm) {
     let v = match g {
@@ -1512,6 +1518,7 @@ pub fn set_prefill_gemm(g: PrefillGemm) {
         PrefillGemm::Int8x2 => 5,
         PrefillGemm::Int8 => 6,
         PrefillGemm::F32 => 7,
+        PrefillGemm::Exact => 8,
     };
     PREFILL_GEMM.store(v, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1534,7 +1541,49 @@ pub fn prefill_gemm() -> PrefillGemm {
         4 => PrefillGemm::Fast,
         5 => PrefillGemm::Int8x2,
         6 => PrefillGemm::Int8,
+        8 => PrefillGemm::Exact,
         _ => PrefillGemm::F32,
+    }
+}
+
+thread_local! {
+    /// Set while this thread (or the pool job it runs for such a thread) processes a language
+    /// model's prompt: `PrefillGemm::Auto` means `Fast` there.
+    // Already const; clippy (1.100) still flags it on Android's thread-local implementation.
+    #[allow(clippy::missing_const_for_thread_local)]
+    static LM_PREFILL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` as a language model's prompt processing: the default prefill GEMM ([`PrefillGemm::Auto`])
+/// takes llama.cpp's int8 activation rounding ([`PrefillGemm::Fast`]) for the matmuls it runs,
+/// also those the thread pool runs for it.
+pub fn lm_prefill<R>(f: impl FnOnce() -> R) -> R {
+    let prev = LM_PREFILL.with(|c| c.replace(true));
+    let r = f();
+    LM_PREFILL.with(|c| c.set(prev));
+    r
+}
+
+/// Whether this thread is inside [`lm_prefill`].
+pub(crate) fn in_lm_prefill() -> bool {
+    LM_PREFILL.with(|c| c.get())
+}
+
+/// Sets the [`lm_prefill`] flag of a pool worker to its caller's for one job.
+pub(crate) fn with_lm_prefill<R>(on: bool, f: impl FnOnce() -> R) -> R {
+    if !on {
+        return f();
+    }
+    lm_prefill(f)
+}
+
+/// The selected prefill GEMM with `Auto` and `Exact` resolved (`Fast` and `Sme`).
+fn prefill_effective() -> PrefillGemm {
+    match prefill_gemm() {
+        PrefillGemm::Auto if in_lm_prefill() => PrefillGemm::Fast,
+        PrefillGemm::Auto => PrefillGemm::Sme,
+        PrefillGemm::Exact => PrefillGemm::Sme,
+        g => g,
     }
 }
 
@@ -1543,8 +1592,8 @@ pub fn prefill_gemm() -> PrefillGemm {
 pub fn prefill_kernel() -> PrefillGemm {
     let sme = sme_available();
     let arm = cfg!(target_arch = "aarch64");
-    match prefill_gemm() {
-        PrefillGemm::Auto | PrefillGemm::Sme | PrefillGemm::Hybrid | PrefillGemm::Fast if sme => PrefillGemm::Sme,
+    match prefill_effective() {
+        PrefillGemm::Sme | PrefillGemm::Hybrid | PrefillGemm::Fast if sme => PrefillGemm::Sme,
         PrefillGemm::Hybrid if arm => PrefillGemm::Int8x2,
         PrefillGemm::Fast if arm => PrefillGemm::Int8,
         g @ (PrefillGemm::Int8x2 | PrefillGemm::Int8) if arm => g,
@@ -1706,7 +1755,7 @@ pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &
     let sme_on = false;
     // `Hybrid` / `Fast` with SME: the SME units take a share of the row blocks and the cores'
     // NEON the rest (int8x2 / int8), at the same time.
-    let selected = prefill_gemm();
+    let selected = prefill_effective();
     let hybrid = sme_on && matches!(selected, PrefillGemm::Hybrid | PrefillGemm::Fast);
     let planes = if !gemm {
         None

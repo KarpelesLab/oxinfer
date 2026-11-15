@@ -268,8 +268,9 @@ fn usage() -> ! {
          \x20                      output is the plain greedy output token for token (default: fast\n\
          \x20                      batched matrix kernels on the GPU, whose logits differ from plain\n\
          \x20                      decoding in rounding; --fast-verify asks for them explicitly)\n\
-         \x20 --prefill-gemm G     CPU prefill matmuls: auto (default: sme with SME, else f32), sme\n\
-         \x20                      (f32 on the SME tiles, same results as f32), hybrid (SME + int8x2\n\
+         \x20 --prefill-gemm G     CPU prefill matmuls: auto (default: fast), exact (the same\n\
+         \x20                      results as f32: sme with SME, else f32), sme (f32 on the SME\n\
+         \x20                      tiles), hybrid (SME + int8x2\n\
          \x20                      at once), fast (SME + int8 at once: fastest, least precise), int8x2\n\
          \x20                      (int8 GEMM with a residual activation plane, close to f32), int8\n\
          \x20                      or f32 (NEON / AVX2 FMA GEMM); env OXINFER_PREFILL_GEMM\n\

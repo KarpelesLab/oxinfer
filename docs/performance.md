@@ -139,7 +139,8 @@ CPU rows `-ngl 0 -dev none` with its default 6 threads) against `examples/parity
 same GGUF files (the engine API, warm like llama-bench: a warm-up pass of each size, then the
 median of 3 runs, 1 for the CPU rows of the larger models; raw text cut to exactly N tokens with
 the BOS, as llama-bench counts them; plain decoding: `lookup=0 draft=none mtp=0`; CPU rows
-`device=cpu` with its default 18 threads and default `prefill_gemm=auto`, i.e. the SME GEMM: see
+`device=cpu` with its default 18 threads and `prefill_gemm=sme`, the default when measured (now
+`exact`; the default is `fast`'s rounding, the column below): see
 [CPU prefill GEMMs](#cpu-prefill-gemms-november-2026)). M5 Max shared with other jobs; the engines
 interleaved model by model. The Metal columns were measured again on 2026-11-15 (load averages
 5-17; the GPU's clock followed the other jobs, so the same pass varied by up to 2x over an hour and
@@ -159,7 +160,7 @@ averages 11-31 (Llama 1B Q4_K_M at 2-4), so they vary by +-20%. tok/s, llama.cpp
 | Qwen3.8-27B Q4_K_P (HauhauCS) | 484 / 519 | 492 / 497 | 19.1 / 17.5 | 20.8 / 31.4 | 20.4 / 31.2 | 7.1 / 10.5 |
 
 CPU prefill with llama.cpp on more threads (its best is 12-16 on this machine; 18 drops sharply)
-and oxinfer's opt-in `prefill_gemm=fast` (same runs as the CPU columns above; tok/s,
+and oxinfer's `prefill_gemm=fast`, now the default for language models (same runs as the CPU columns above; tok/s,
 pp512 / pp2048):
 
 | model | llama.cpp 6 thr | 12 thr | 16 thr | oxinfer `auto` (SME) | `fast` | `f32` (before) |
@@ -239,18 +240,24 @@ Where oxinfer is still behind:
   units (see [CPU prefill GEMMs](#cpu-prefill-gemms-november-2026)), 1.6-2.5x the previous CPU
   prefill and ahead of llama.cpp's default 6 threads everywhere but Qwen3-8B pp2048 (0.94x), with
   the same results as before. But the SME units saturate with a few threads, while llama.cpp's
-  repacked int8 `SMMLA` kernels (int8 activations) keep scaling with free cores. The opt-in
-  `prefill_gemm=fast` (SME plus int8 on the NEON units, llama.cpp-like rounding) closes most of
-  the gap (0.75-1.6x of llama.cpp's best; 0.46x on the 26B-A4B, whose experts stay on SME) but
-  changes the results.
+  repacked int8 `SMMLA` kernels (int8 activations) keep scaling with free cores. `fast` (SME
+  plus int8 on the NEON units, llama.cpp-like rounding), the default for language models' prompts
+  since 2026-11-16 (`prefill_gemm=exact` opts out), closes most of the gap (0.75-1.6x of
+  llama.cpp's best; 0.46x on the 26B-A4B, whose experts stay on SME).
 
 #### CPU prefill GEMMs (November 2026)
 
 CPU prefill matmuls (more than `decode_max_tokens` tokens; decoding is unchanged) pick their
 kernel with the engine option `prefill_gemm` (`--prefill-gemm`, `OXINFER_PREFILL_GEMM`):
 
-- `auto` (default): `sme` where the CPU has the Scalable Matrix Extension (Apple M4 and later),
-  else `f32`.
+- `auto` (default): `fast` while a language model processes a prompt (`generate::prefill`, the
+  DSpark and MTP decoders' prefill, and the pool jobs they start: `kernels::lm_prefill`), i.e.
+  llama.cpp's int8 activation rounding, with the SME tiles beside it where present (`int8` on
+  aarch64 without SME, `f32` elsewhere); `exact` everywhere else (vision and audio towers,
+  diffusion models and their text encoders, embeddings), whose results some features rely on
+  (batched Whisper equal to single windows) or amplify (diffusion).
+- `exact`: the opt-out: `sme` where the CPU has the Scalable Matrix Extension (Apple M4 and
+  later), else `f32`; the same results as the f32 GEMM.
 - `sme`: f32 GEMM on the SME tiles. Weights are dequantized to f32 32 rows at a time as before,
   both operands are transposed to `[k][32]` panels through ZA, and each `FMOPA` adds a 16x16
   outer product into one of ZA's four f32 tiles. Every output is the same fused-multiply-add
@@ -280,8 +287,9 @@ prompts, `--no-system`) identical to `f32`'s:
 | `fast` | 1.1e-3 | 1.4e-3 | 2.2e-3 | 5 / 6 |
 | `int8` | 9.5e-4 | 6.6e-4 | 5.9e-3 | |
 
-The texts that parted did so at near ties after 30-50 tokens, which is why only `sme` (no change
-to the results) is the default. GEMM throughput (`examples/gemm_bench.rs`, 4096 x 4096 Q8_0, 512
+The texts that parted did so at near ties after 30-50 tokens; llama.cpp's own CPU prefill has the
+same rounding, which is why `fast` became the default for language models' prompts (with
+`exact` as the opt-out). GEMM throughput (`examples/gemm_bench.rs`, 4096 x 4096 Q8_0, 512
 tokens, M5 Max shared with other jobs): `f32` ~1.4 TFLOP/s on 18 threads, `sme` ~2.4 (1.1-1.3 on
 one thread; four threads already saturate the SME units, which the cores of a cluster share),
 `int8x2` ~2.1, `int8` ~3.9, `hybrid` ~2.7. On Qwen3-8B Q8_0 pp512 at a light load: `sme` 118-128

@@ -192,8 +192,9 @@ pub struct EngineOptions {
     /// prefill). Process-wide, applied on load; None leaves the current setting
     /// ([`crate::gpu::set_exact`]). Key `gpu_exact`.
     pub gpu_exact: Option<bool>,
-    /// CPU prefill matmuls ([`crate::kernels::PrefillGemm`]): `auto` (default: `sme` where the
-    /// CPU has SME, else `f32`), `sme` (the f32 GEMM on the SME tiles: same products as `f32`),
+    /// CPU prefill matmuls ([`crate::kernels::PrefillGemm`]): `auto` (default: `fast`, with
+    /// llama.cpp's int8 activation rounding), `exact` (the opt-out: `sme` where the CPU has SME,
+    /// else `f32`, the same results as the f32 GEMM), `sme` (the f32 GEMM on the SME tiles),
     /// `hybrid` (SME and `int8x2` on the NEON units at once: faster, KL ~1e-5 against f32),
     /// `fast` (SME and `int8` at once: fastest, KL ~1e-4..1e-3),
     /// `int8x2` (int8 SDOT GEMM with a residual activation plane), `int8` (one plane: KL ~1e-3
@@ -603,7 +604,7 @@ impl EngineOptions {
                     "" => None,
                     v => Some(
                         v.parse()
-                            .with_context(|| format!("{key}: expected auto, sme, hybrid, fast, int8x2, int8 or f32, got {v:?}"))?,
+                            .with_context(|| format!("{key}: expected auto, exact, sme, hybrid, fast, int8x2, int8 or f32, got {v:?}"))?,
                     ),
                 }
             }

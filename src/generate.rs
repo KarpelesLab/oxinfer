@@ -162,6 +162,16 @@ fn report_prefill(done: usize, total: usize) {
 /// consecutive overrides is stretched to the run's end when the model needs whole runs
 /// ([`TextLm::mm_runs_whole`]).
 pub fn prefill<M: TextLm + ?Sized>(model: &M, sess: &mut M::Sess, ids: &[u32], chunk: usize, overrides: &[(usize, Vec<f32>)]) -> Vec<f32> {
+    crate::kernels::lm_prefill(|| prefill_inner(model, sess, ids, chunk, overrides))
+}
+
+fn prefill_inner<M: TextLm + ?Sized>(
+    model: &M,
+    sess: &mut M::Sess,
+    ids: &[u32],
+    chunk: usize,
+    overrides: &[(usize, Vec<f32>)],
+) -> Vec<f32> {
     // Interventions limited to prompt / generated positions: the last prompt token is the first
     // "generated" position (its output is sampled).
     let base = model.session_len(sess);

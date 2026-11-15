@@ -734,6 +734,10 @@ impl<'m> MtpDecoder<'m> {
     /// `tokens` (`(index in tokens, embedding)`); declare their vision spans on `self.sess`
     /// first (`QwenSession::add_vision_span`). The MTP layer sees the placeholder tokens.
     pub fn prefill_mm(&mut self, tokens: &[u32], chunk: usize, overrides: &[(usize, Vec<f32>)]) -> Vec<f32> {
+        crate::kernels::lm_prefill(|| self.prefill_mm_inner(tokens, chunk, overrides))
+    }
+
+    fn prefill_mm_inner(&mut self, tokens: &[u32], chunk: usize, overrides: &[(usize, Vec<f32>)]) -> Vec<f32> {
         assert!(!tokens.is_empty());
         let h = self.model.cfg.hidden_size;
         let w = self.model.mtp_width();

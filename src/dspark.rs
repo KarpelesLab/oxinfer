@@ -2978,6 +2978,10 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
     /// `prefill` with multimodal soft tokens replacing the embeddings at some positions of
     /// `tokens` (`(index in tokens, embedding)`).
     pub fn prefill_mm(&mut self, tokens: &[u32], chunk: usize, overrides: &[(usize, Vec<f32>)]) -> Vec<f32> {
+        crate::kernels::lm_prefill(|| self.prefill_mm_inner(tokens, chunk, overrides))
+    }
+
+    fn prefill_mm_inner(&mut self, tokens: &[u32], chunk: usize, overrides: &[(usize, Vec<f32>)]) -> Vec<f32> {
         assert!(!tokens.is_empty());
         self.next = None;
         if let Some(lk) = &mut self.lookup {
