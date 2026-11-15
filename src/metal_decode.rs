@@ -1242,9 +1242,9 @@ enum MOp {
         stride: u32,
         n: u32,
     },
-    /// Prefill plans: `y = W x` on the matrix units from the scratch half rows, into rows `ldy`
-    /// floats apart (0: `n_out`). Pipelines and outputs per threadgroup for 128-, 32- and 64-row
-    /// tiles.
+    /// Prefill plans: `y = W x` (`y += W x` with `add`) on the matrix units from the scratch half
+    /// rows, into rows `ldy` floats apart (0: `n_out`). Pipelines and outputs per threadgroup for
+    /// 128-, 32- and 64-row tiles.
     Gemm {
         pipes: [(Id, usize); 3],
         data: Id,
@@ -1256,6 +1256,7 @@ enum MOp {
         n_in: usize,
         y: usize,
         ldy: u32,
+        add: bool,
     },
     /// Prefill plans: `y = W x` with f32 weights in the constants (`gemm_f32`, 64 x 64 tiles; the
     /// MoE routers), x rows `n_in` apart, y rows `n_out` apart.
@@ -1752,6 +1753,7 @@ impl MetalBackend {
                             n_in,
                             y: 0,
                             ldy: 0,
+                            add: false,
                         })
                     };
                     let mmas = if !pf || is_streamed(dev) || w2.as_ref().is_some_and(|(_, d)| is_streamed(d)) {
@@ -1787,7 +1789,16 @@ impl MetalBackend {
                                 set_y(&mut g1, byte(y), if ts(y) == n_out { 0 } else { ts(y) as u32 });
                                 emit.push(g1);
                             }
-                            (LinMode::Add | LinMode::AddGated(_), None) => {
+                            // The residual add in the GEMM's stores (same sums as `pf_add_rows`).
+                            (LinMode::Add, None) => {
+                                set_y(&mut g1, byte(y), ts(y) as u32);
+                                if let MOp::Gemm { add, .. } = &mut g1 {
+                                    *add = true;
+                                }
+                                emit.push(g1);
+                                r.push(rng(y, n_out));
+                            }
+                            (LinMode::AddGated(_), None) => {
                                 set_y(&mut g1, pf_tmp, 0);
                                 emit.push(g1);
                                 emit.push(MOp::Barrier);
@@ -3938,6 +3949,7 @@ impl MetalPlan<'_> {
                 n_in,
                 y,
                 ldy,
+                add,
             } => {
                 // Few 128-row tiles (narrow outputs): 64-row ones, or 32-row ones if those are
                 // still few, keep more of the GPU busy.
@@ -3972,7 +3984,7 @@ impl MetalPlan<'_> {
                             w_off: *w_off,
                             s_off: *s_off,
                             rows: rows as u32,
-                            _p: [*ldy, start as u32, 0],
+                            _p: [*ldy, start as u32, *add as u32],
                         },
                         4,
                     );

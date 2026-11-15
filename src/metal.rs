@@ -833,7 +833,8 @@ const MMA_SHADER_SRC: &str = r#"
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace mpp::tensor_ops;
 // The first four fields as in P (the MK_* macros read them), then the row count; dense
-// kernels: _p0 the output row stride (0: n_out), _p1 the first token row of the grid.
+// kernels: _p0 the output row stride (0: n_out), _p1 the first token row of the grid, _p2 nonzero
+// to add the products to the outputs.
 struct MP { uint n_out; uint n_in; uint w_off; uint s_off; uint rows; uint _p0; uint _p1; uint _p2; };
 #define MKB 64
 typedef tensor<device half, dextents<int32_t, 2>, tensor_inline> XT;
@@ -846,15 +847,18 @@ inline void scale_store(thread CT& c, device const float* rs, uint t0, DT d) {
         if (c.is_valid_element(i)) { auto idx = c.get_multidimensional_index(i); c[i] *= rs[t0 + idx[1]]; }
     c.store(d);
 }
-// The same into rows ldy floats apart (prefill plans: a view of a wider activation row).
+// The same into rows ldy floats apart (prefill plans: a view of a wider activation row), or
+// added to them (`add`: the residual adds of prefill plans).
 template <typename CT>
-inline void scale_store_ld(thread CT& c, device const float* rs, uint t0, device float* y, uint ldy, uint o0) {
+inline void scale_store_ld(thread CT& c, device const float* rs, uint t0, device float* y, uint ldy, uint o0, bool add = false) {
 #pragma unroll
     for (uint16_t i = 0; i < c.get_capacity(); ++i)
         if (c.is_valid_element(i)) {
             auto idx = c.get_multidimensional_index(i);
             uint r = t0 + idx[1];
-            y[(ulong)r * ldy + o0 + idx[0]] = c[i] * rs[r];
+            device float* o = y + (ulong)r * ldy + o0 + idx[0];
+            float v = c[i] * rs[r];
+            *o = add ? *o + v : v;
         }
 }
 template <typename CT>
@@ -864,7 +868,7 @@ inline void zero(thread CT& c) {
 }
 template <typename W, int TM>
 inline void mma_tile(W w, device const half* xh, device const float* rs, device float* y, uint n_out, uint n_in, uint rows,
-                     uint o0, uint t0, uint tid, threadgroup half* Ws, uint ldy = 0) {
+                     uint o0, uint t0, uint tid, threadgroup half* Ws, uint ldy = 0, uint add = 0) {
     XT X((device half*)xh, dextents<int32_t, 2>(n_in, rows));
     YT Y(y, dextents<int32_t, 2>(n_out, rows));
     constexpr auto desc = matmul2d_descriptor(TM, 64, MKB, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
@@ -885,12 +889,12 @@ inline void mma_tile(W w, device const half* xh, device const float* rs, device 
         op.run(a, Wt, c);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (ldy != 0) scale_store_ld(c, rs, t0, y, ldy, o0);
+    if (ldy != 0 || add != 0) scale_store_ld(c, rs, t0, y, ldy != 0 ? ldy : n_out, o0, add != 0);
     else scale_store(c, rs, t0, Y.slice(o0, t0));
 }
 template <int TM, int TN>
 inline void mma_bf_tile(device const bfloat* w, device const half* xh, device const float* rs, device float* y, uint n_out, uint n_in, uint rows,
-                        uint o0, uint t0, uint ldy = 0) {
+                        uint o0, uint t0, uint ldy = 0, uint add = 0) {
     XT X((device half*)xh, dextents<int32_t, 2>(n_in, rows));
     YT Y(y, dextents<int32_t, 2>(n_out, rows));
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> Wt((device bfloat*)w, dextents<int32_t, 2>(n_in, n_out));
@@ -901,7 +905,7 @@ inline void mma_bf_tile(device const bfloat* w, device const half* xh, device co
     auto c = op.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
     zero(c);
     op.run(a, b, c);
-    if (ldy != 0) scale_store_ld(c, rs, t0, y, ldy, o0);
+    if (ldy != 0 || add != 0) scale_store_ld(c, rs, t0, y, ldy != 0 ? ldy : n_out, o0, add != 0);
     else scale_store(c, rs, t0, Y.slice(o0, t0));
 }
 // Dense: 128-token tiles, 32-token tiles (`_s`) for short inputs and 64-token ones (`_m`) for
@@ -913,11 +917,11 @@ kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[bu
                  uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
 #define MMAD(NAME, WT, MAKE) \
 MMA_SIG(NAME) { threadgroup half Ws[64 * MKB]; \
-    WT w = MAKE; mma_tile<WT, 128>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * 128, tid, Ws, p._p0); } \
+    WT w = MAKE; mma_tile<WT, 128>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * 128, tid, Ws, p._p0, p._p2); } \
 MMA_SIG(NAME##_s) { threadgroup half Ws[64 * MKB]; \
-    WT w = MAKE; mma_tile<WT, 32>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * 32, tid, Ws, p._p0); } \
+    WT w = MAKE; mma_tile<WT, 32>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * 32, tid, Ws, p._p0, p._p2); } \
 MMA_SIG(NAME##_m) { threadgroup half Ws[64 * MKB]; \
-    WT w = MAKE; mma_tile<WT, 64>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * 64, tid, Ws, p._p0); }
+    WT w = MAKE; mma_tile<WT, 64>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * 64, tid, Ws, p._p0, p._p2); }
 // Grouped: per-expert weight addresses, and one tile per threadgroup row. Each format comes with
 // tiles of GTM rows (NAME), 128 rows (NAME_l: the bulk of an expert's rows when it has many, the
 // weights dequantized once for 4x the rows) and 16 rows (NAME_s: an odd remainder, half the
@@ -945,12 +949,12 @@ kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[bu
                  uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { \
     threadgroup half Ws[64 * MKB]; \
     Q4A w = { MK_Q4, ob + op.o_off, op.gpr, op.gk }; \
-    mma_tile<Q4A, TM>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * TM, tid, Ws, p._p0); }
+    mma_tile<Q4A, TM>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * TM, tid, Ws, p._p0, p._p2); }
 MMA_Q4A(mma_q4a, 128) MMA_Q4A(mma_q4a_s, 32) MMA_Q4A(mma_q4a_m, 64)
 #define MMA_BF(NAME, TN, TM) \
 kernel void NAME(device const ushort* qb [[buffer(0)]], device const half* xh [[buffer(2)]], device float* y [[buffer(3)]], \
                  constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]]) { \
-    mma_bf_tile<TM, TN>((device const bfloat*)(qb + p.w_off), xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * TN, p._p1 + tg.y * TM, p._p0); }
+    mma_bf_tile<TM, TN>((device const bfloat*)(qb + p.w_off), xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * TN, p._p1 + tg.y * TM, p._p0, p._p2); }
 MMA_BF(mma_bf64, 64, 128) MMA_BF(mma_bf128, 128, 128) MMA_BF(mma_bf64_s, 64, 32) MMA_BF(mma_bf128_s, 128, 32)
 MMA_BF(mma_bf64_m, 64, 64) MMA_BF(mma_bf128_m, 128, 64)
 #define MMAG_BF(NAME, TM) \
