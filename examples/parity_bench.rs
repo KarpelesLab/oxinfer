@@ -1,7 +1,7 @@
 //! llama-bench style throughput through the `engine` API, warm (one warm-up pass first, as
-//! llama-bench does): prompt processing of exactly N raw tokens (cut from
-//! `tools/bench/corpus.txt`) and plain decoding of G tokens after a short prompt, best and median
-//! of R repetitions:
+//! llama-bench does): prompt processing of exactly N tokens, the BOS included as llama-bench
+//! counts it (raw text cut from `tools/bench/corpus.txt`), and plain decoding of G tokens after
+//! a short prompt, best and median of R repetitions:
 //! `cargo run --release --example parity_bench -- MODEL [pp=512,2048] [tg=128] [reps=3] [key=value ...]`
 //! (other options are `EngineOptions` keys, e.g. `device=cpu`, `lookup=0`, `draft=none`).
 
@@ -68,7 +68,12 @@ fn main() -> anyhow::Result<()> {
         )
     };
     for &n in &pps {
-        let p = text_of(&e, n)?;
+        // Exactly n prompt tokens with the BOS the model adds, as llama-bench counts them.
+        let mut p = text_of(&e, n)?;
+        let (got, ..) = run(&mut e, &p, 1)?;
+        if got > n {
+            p = text_of(&e, n.saturating_sub(got - n))?;
+        }
         // A warm-up at this size (plans and scratch are sized on first use).
         run(&mut e, &p, 1)?;
         let mut v = Vec::new();
