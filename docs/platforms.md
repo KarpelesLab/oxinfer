@@ -33,9 +33,11 @@ On M5 / A19 (Apple10-family GPUs, whose cores have matrix units) the GEMMs run o
 through Metal 4 tensor operations (`matmul2d` from MetalPerformancePrimitives, compiled at run
 time with the rest of the shaders; nothing is needed at build time). Input rows are converted to
 half with a power-of-two scale per row (no overflow, no subnormals), quantized weights are
-dequantized per 64-wide K step into threadgroup memory as half, bf16 weights are read as bfloat
-straight from device memory, and accumulation is f32: every format with a GEMM (bf16, Q8, Q4,
-the GGUF types, FP8 E4M3 with 128x128 block scales) has a matrix-unit version. Kernel throughput at 2048 tokens is ~60 TFLOP/s for
+dequantized per 64-wide K step into threadgroup memory as half (Q8_0 and Q4_0 in half arithmetic,
+which gives the same values: their products are exact in f32 and rounded once either way), bf16
+weights are read as bfloat straight from device memory, and accumulation is f32: every format
+with a GEMM (bf16, Q8, Q4, the GGUF types, FP8 E4M3 with 128x128 block scales) has a matrix-unit
+version. Kernel throughput at 2048 tokens is ~60 TFLOP/s for
 bf16 and ~50 for Q4 (against ~11 for the f32 GEMM); per call, copies and submission included
 (`membench gpu`, 17408 x 5120):
 
@@ -96,7 +98,13 @@ the whole chunk, the matmuls as matrix-unit GEMMs, the routed experts as grouped
 causal or sliding-window attention as flash attention on 8x8 SIMD-group matrices
 (`metal_pfflash.metal`: S = Q K^T and O += P V with an online softmax per row, 32 queries per
 threadgroup sharing the key reads; heads of 256 and 512 split their dimensions over SIMD-groups).
-Only the new keys and values come back to the host caches. Interventions, captured layers,
+Token tiles are 128 rows, 64 for narrow outputs (fewer than 160 threadgroups of 128 rows: e.g.
+Llama-3.2-1B's 2048-wide projections at 512 tokens), 32 below that, and a last partial tile of
+up to 64 rows runs as 32-row tiles rather than one padded tile (513 tokens: 544 rows instead of
+640); residual adds happen in the GEMMs' stores, and the MoE routers run as an f32 GEMM of
+32x32 tiles. Only the new keys and values come back to the host caches, each layer's while the
+GPU runs the later layers (a pass is 8 command buffers; MoE passes are cut at every MoE layer
+anyway, for the routing). Interventions, captured layers,
 streamed weights, M-RoPE position lists and Gemma image prompts keep the op-by-op path
 (`OXINFER_PREFILL_GPU=0` forces it, `OXINFER_PF_FLASH=0` the per-token attention kernels). The
 last-token distribution is as close to the CPU path's as before or closer (Qwen3-8B Q8_0, 2.5k

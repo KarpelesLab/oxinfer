@@ -137,25 +137,26 @@ of precision.
 `llama-bench` (llama.cpp master `fe14cad`, 2026-11-13, Metal build; `-p 512,2048 -n 128 -r 3`,
 CPU rows `-ngl 0 -dev none` with its default 6 threads) against `examples/parity_bench.rs` on the
 same GGUF files (the engine API, warm like llama-bench: a warm-up pass of each size, then the
-median of 3 runs, 1 for the CPU rows of the larger models; raw text cut to exactly N tokens, 513 /
-2049 for Gemma with its BOS; plain decoding: `lookup=0 draft=none mtp=0`; CPU rows `device=cpu`
-with its default 18 threads and default `prefill_gemm=auto`, i.e. the SME GEMM: see
-[CPU prefill GEMMs](#cpu-prefill-gemms-november-2026)). M5 Max shared with other jobs (load
-averages 4-9 for the Metal rows; the CPU rows were re-measured after the SME GEMM at load
-averages 11-31, Llama 1B Q4_K_M at 2-4, so they vary by +-20%); the two engines interleaved
-model by model. tok/s, llama.cpp / oxinfer:
+median of 3 runs, 1 for the CPU rows of the larger models; raw text cut to exactly N tokens with
+the BOS, as llama-bench counts them; plain decoding: `lookup=0 draft=none mtp=0`; CPU rows
+`device=cpu` with its default 18 threads and default `prefill_gemm=auto`, i.e. the SME GEMM: see
+[CPU prefill GEMMs](#cpu-prefill-gemms-november-2026)). M5 Max shared with other jobs; the engines
+interleaved model by model. The Metal columns were measured again on 2026-11-15 (load averages
+5-17; the GPU's clock followed the other jobs, so the same pass varied by up to 2x over an hour and
+only interleaved runs compare); the CPU columns were re-measured after the SME GEMM at load
+averages 11-31 (Llama 1B Q4_K_M at 2-4), so they vary by +-20%. tok/s, llama.cpp / oxinfer:
 
 | model | Metal pp512 | pp2048 | tg128 | CPU pp512 | pp2048 | tg128 |
 |---|---|---|---|---|---|---|
-| Llama-3.2-1B Q4_K_M (bartowski) | 17808 / 11564 | 15010 / 12341 | 401 / 403 | 642 / 953 | 534 / 746 | 167 / 240 |
-| Llama-3.2-1B Q8_0 | 18293 / 12424 | 13543 / 11980 | 300 / 309 | 736 / 852 | 517 / 599 | 164 / 148 |
-| Orpheus 3B Q4_K_M | 5571 / 4390 | 4305 / 3831 | 186 / 182 (22 tok) | 208 / 308 | 179 / 216 | 56 / 95 (24 tok) |
-| Qwen3-8B Q8_0 | 2259 / 2268 | 2176 / 1966 | 62.2 / 61.6 | 107 / 115 | 97 / 91 | 28.9 / 26.6 |
-| Qwen3-14B Q8_0 | 1310 / 1318 | 1252 / 1144 | 35.5 / 35.9 | 57 / 61 | 48 / 51 | 15.8 / 16.1 |
-| Qwen3.5-9B BF16 (unsloth) | 2197 / 2516 | 1981 / 2015 | 32.1 / 35.1 | 97 / 135 | 103 / 125 | 1.4 / 16.4 |
-| Gemma 4 12B Q8_0 (ggml-org) | 1808 / 1049 | 1415 / 1142 | 37.6 / 38.3 | 67 / 80 | 63 / 81 | 17.6 / 17.2 |
-| Gemma 4 26B-A4B Q4_0 (ggml-org) | 3922 / 2437 | 3056 / 2340 | 114 / 126 | 150 / 162 | 128 / 148 | 58.6 / 53.4 |
-| Qwen3.8-27B Q4_K_P (HauhauCS) | 683 / 575 | 571 / 563 | 23.5 / 23 (best; 12-23) | 20.8 / 31.4 | 20.4 / 31.2 | 7.1 / 10.5 |
+| Llama-3.2-1B Q4_K_M (bartowski) | 17677 / 15039 | 16290 / 14476 | 419 / 388 | 642 / 953 | 534 / 746 | 167 / 240 |
+| Llama-3.2-1B Q8_0 | 17580 / 15587 | 14935 / 14172 | 305 / 298 | 736 / 852 | 517 / 599 | 164 / 148 |
+| Orpheus 3B Q4_K_M | 5625 / 4957 | 4990 / 4638 | 191 / 179 (22 tok) | 208 / 308 | 179 / 216 | 56 / 95 (24 tok) |
+| Qwen3-8B Q8_0 | 2345 / 2110 | 2225 / 1761 | 58.1 / 55.6 | 107 / 115 | 97 / 91 | 28.9 / 26.6 |
+| Qwen3-14B Q8_0 | 870 / 940 | 828 / 813 | 27.8 / 27.6 | 57 / 61 | 48 / 51 | 15.8 / 16.1 |
+| Qwen3.5-9B BF16 (unsloth) | 2126 / 2064 | 1466 / 1807 | 27.7 / 31.5 | 97 / 135 | 103 / 125 | 1.4 / 16.4 |
+| Gemma 4 12B Q8_0 (ggml-org) | 1292 / 1176 | 1189 / 1116 | 34.4 / 33.6 | 67 / 80 | 63 / 81 | 17.6 / 17.2 |
+| Gemma 4 26B-A4B Q4_0 (ggml-org) | 3760 / 3128 | 2597 / 2475 | 98 / 116 | 150 / 162 | 128 / 148 | 58.6 / 53.4 |
+| Qwen3.8-27B Q4_K_P (HauhauCS) | 484 / 519 | 492 / 497 | 19.1 / 17.5 | 20.8 / 31.4 | 20.4 / 31.2 | 7.1 / 10.5 |
 
 CPU prefill with llama.cpp on more threads (its best is 12-16 on this machine; 18 drops sharply)
 and oxinfer's opt-in `prefill_gemm=fast` (same runs as the CPU columns above; tok/s,
@@ -184,10 +185,25 @@ attention and norms on the CPU and a host round trip per layer: pp512 / pp2048 w
 heavier load (18-38). Now every model with a GPU decode graph prefills on whole-pass prefill
 plans with flash attention ([Decoding on the GPU](#decoding-on-the-gpu)): 2-12x faster, at or
 above llama.cpp on Qwen3-8B / 14B / 3.5-9B pp512 and the 27B pp2048, 0.6-0.9x on the rest
-(below). Decoding is level on Metal (the 27B's runs varied with the page cache, other jobs held
-100+ GB models) and on the CPU within noise (ahead on Llama 1B Q4_K_M, Orpheus and the 27B,
-5-10% behind on Qwen3-8B, Llama 1B Q8_0 and 26B-A4B in the loaded CPU pass); llama.cpp's CPU
-decode of the BF16 Qwen3.5-9B (Gated DeltaNet) runs at 1.4 tok/s.
+(the 2026-11-13 run; see below for the second round). Decoding is level on Metal (the 27B's runs
+varied with the page cache, other jobs held 100+ GB models) and on the CPU within noise (ahead on
+Llama 1B Q4_K_M, Orpheus and the 27B, 5-10% behind on Qwen3-8B, Llama 1B Q8_0 and 26B-A4B in the
+loaded CPU pass); llama.cpp's CPU decode of the BF16 Qwen3.5-9B (Gated DeltaNet) runs at 1.4 tok/s.
+
+The second round of Metal prefill work (the run above, against master `9b48923` interleaved in
+it: pp512 / pp2048 were 12361 / 12148, 12318 / 11893, 4944 / 4326, 1598 / 1573, 771 / 721,
+2162 / 1346, 972 / 1041 (Gemma at 513 / 2049 tokens), 2624 / 2327 and 513 / 494 in the table's
+order): a short last token tile runs as 32-row tiles instead of a padded 128-row one (Gemma's
+513 tokens took 640 rows, 25% more GEMM work), narrow outputs take 64-row tiles where they had
+32-row ones (Llama 1B pp512 +13%), Q8_0 and Q4_0 weights are dequantized in half arithmetic (the
+same values; GEMM kernels +5-15%), residual adds happen in the GEMM stores, the MoE routers'
+f32 GEMM has 8x the threadgroups, and each layer's new keys and values are copied to the host
+caches while the GPU runs the later layers (that copy had been 3-9% of a pass). Logits are
+bit-identical to master's and greedy output identical on all nine models (2 prompts x 64
+tokens). Alternating llama-bench and oxinfer twice more on four models (pp512 / pp2048 ratios):
+Qwen3-8B 0.79-0.85 / 0.92-0.94, Gemma 4 12B 0.90-0.93 / 0.95-0.96, Llama 1B Q4_K_M 0.80-0.88 /
+0.70-0.88, 26B-A4B 0.78-0.79 / 0.96-1.01; when the GPU ran at full clock, Gemma 4 12B pp512
+was 1600 / 1760-1780.
 
 Speculative decoding with a DSpark draft llama.cpp master loads (Anbeeld's Qwen3-14B-DSpark
 Q8_0 beside Qwen3-14B Q8_0; `--spec-type draft-dspark --spec-draft-n-max 7`, all layers on the
@@ -198,12 +214,18 @@ run each, loaded machine): code 94 / 99 tok/s, math 146 / 131, chat 74 / 58, pro
 
 Where oxinfer is still behind:
 
-- **Metal prefill at 512 tokens** (0.6-0.8x on Llama 1B, Orpheus, Gemma 4): the matrix-unit
-  GEMM runs at ~29 TFLOP/s on 512-token passes against ~42-55 at 2048 (see the `membench gpu`
-  table under [Platforms](platforms.md)); Gemma 4 12B spends ~85% of its pp512 pass
-  in GEMMs. Copying the new keys and values back to the host caches costs 3-6% more.
-- **Gemma 4 26B-A4B prefill**: the routed experts' grouped GEMMs (32-row tiles, mostly padding at
-  ~40 tokens per expert) and one routing read-back per layer.
+- **Metal prefill** (0.8-0.95x on Llama 1B, Orpheus, Qwen3-8B, Gemma 4 12B; level or ahead on
+  Qwen3-14B, Qwen3.5-9B pp2048 and the 27B): still the GEMMs, 85-90% of a pass. In the kernels
+  alone (`mma_gemm_bench`, 512 tokens) the dense GEMMs reach 40-50 TFLOP/s on Q8_0 / Q4_0 and
+  wide outputs, 30-47 on K-quants and 2048-wide outputs; K-quant blocks still dequantize in f32
+  (their scale and minimum products round twice, so half arithmetic would change results).
+  128x128 tiles, 8 SIMD-groups, 32-wide K steps, a token-major grid, software pipelining of the
+  next block's loads and split K were measured slower or no better (split K helped only the
+  narrowest outputs, before the reduction it would need).
+- **Gemma 4 26B-A4B prefill** (0.8x at 512 tokens, level at 2048): the routed experts' grouped
+  GEMMs are ~45% of the pass at ~17 TFLOP/s (about 32 rows per expert at 512 tokens); covering
+  each expert with fewer, fuller tiles (64- and 128-row) was slower than the 128 / 32 / 16-row
+  tiling. The dense parts have narrow outputs (2816).
 - **CPU prefill against llama.cpp on 12-16 threads** (0.45-0.7x on the Q8_0 / Q4 models, level on
   Orpheus and the 27B, ahead on the BF16 Qwen3.5-9B): oxinfer's default GEMM now runs on the SME
   units (see [CPU prefill GEMMs](#cpu-prefill-gemms-november-2026)), 1.6-2.5x the previous CPU
