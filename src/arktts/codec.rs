@@ -131,7 +131,11 @@ fn matrix(f: &ModelFiles, name: &str) -> Result<Mat> {
 mod bufs {
     use std::cell::RefCell;
 
-    thread_local!(static FREE: RefCell<Vec<Vec<f32>>> = const { RefCell::new(Vec::new()) });
+    thread_local! {
+        // Already const; clippy (1.100) still flags it on Android's thread-local implementation.
+        #[allow(clippy::missing_const_for_thread_local)]
+        static FREE: RefCell<Vec<Vec<f32>>> = const { RefCell::new(Vec::new()) };
+    }
 
     /// A buffer of `n` values whose contents are unspecified.
     pub fn take(n: usize) -> Vec<f32> {
