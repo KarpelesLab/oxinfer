@@ -2276,6 +2276,38 @@ mod tests {
     use super::*;
     use crate::quant::{dequantize_rows, dequantize_rows_q4, quantize_act, quantize_bf16, quantize_q4};
 
+    /// The SME GEMM gives the NEON f32 GEMM's bits on whole 8-row groups (each output is the
+    /// same fused-multiply-add chain over the inputs in order).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn sme_gemm_matches_neon_f32_bitwise() {
+        if !sme::available() {
+            eprintln!("no SME: skipped");
+            return;
+        }
+        use crate::ggml::{GgmlType, GgufMatrix, random_blocks};
+        for (kind, n_out, n_in, t) in [
+            (GgmlType::Q8_0, 64, 256, 40),
+            (GgmlType::Q4_K, 40, 512, 9),
+            (GgmlType::BF16, 16, 48, 70),
+        ] {
+            let mut seed = 9u64;
+            let bytes = random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed);
+            let m = GgufMatrix::from_bytes(kind, &bytes, n_out, n_in).unwrap();
+            let mut s = 3u64;
+            let x: Vec<f32> = (0..t * n_in).map(|_| lcg(&mut s)).collect();
+            let xt = pack_xt(&x, t, n_in);
+            let mut neon = vec![0f32; t * n_out];
+            unsafe { matmul_quant_block_prefill(&m, &x, &xt, t, 0, n_out, neon.as_mut_ptr()) };
+            let xs = sme::pack_x(&x, t, n_in);
+            let mut smey = vec![0f32; t * n_out];
+            unsafe { sme::gemm_rows(&m, &xs, 0, t, 0, n_out, smey.as_mut_ptr()) };
+            for (i, (a, b)) in neon.iter().zip(&smey).enumerate() {
+                assert_eq!(a.to_bits(), b.to_bits(), "{kind} [{}, {}]: {a} vs {b}", i / n_out, i % n_out);
+            }
+        }
+    }
+
     fn lcg(seed: &mut u64) -> f32 {
         *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         ((*seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0

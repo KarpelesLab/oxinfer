@@ -139,21 +139,43 @@ CPU rows `-ngl 0 -dev none` with its default 6 threads) against `examples/parity
 same GGUF files (the engine API, warm like llama-bench: a warm-up pass of each size, then the
 median of 3 runs, 1 for the CPU rows of the larger models; raw text cut to exactly N tokens, 513 /
 2049 for Gemma with its BOS; plain decoding: `lookup=0 draft=none mtp=0`; CPU rows `device=cpu`
-with its default 18 threads). M5 Max shared with other jobs (load averages 4-9 for the Metal rows,
-7-21 for the CPU rows, which therefore vary by +-20%); the two engines interleaved model by model.
-tok/s, llama.cpp / oxinfer:
+with its default 18 threads and default `prefill_gemm=auto`, i.e. the SME GEMM: see
+[CPU prefill GEMMs](#cpu-prefill-gemms-november-2026)). M5 Max shared with other jobs (load
+averages 4-9 for the Metal rows; the CPU rows were re-measured after the SME GEMM at load
+averages 11-31, Llama 1B Q4_K_M at 2-4, so they vary by +-20%); the two engines interleaved
+model by model. tok/s, llama.cpp / oxinfer:
 
 | model | Metal pp512 | pp2048 | tg128 | CPU pp512 | pp2048 | tg128 |
 |---|---|---|---|---|---|---|
-| Llama-3.2-1B Q4_K_M (bartowski) | 17808 / 11564 | 15010 / 12341 | 401 / 403 | 468 / 337 | 436 / 339 | 141 / 190 |
-| Llama-3.2-1B Q8_0 | 18293 / 12424 | 13543 / 11980 | 300 / 309 | 681 / 390 | 592 / 301 | 148 / 149 |
-| Orpheus 3B Q4_K_M | 5571 / 4390 | 4305 / 3831 | 186 / 182 (22 tok) | 178 / 126 | 156 / 90 | 60 / 68 (24 tok) |
-| Qwen3-8B Q8_0 | 2259 / 2268 | 2176 / 1966 | 62.2 / 61.6 | 70 / 45 | 95 / 66 | 28.4 / 24.7 |
-| Qwen3-14B Q8_0 | 1310 / 1318 | 1252 / 1144 | 35.5 / 35.9 | 50 / 37 | 48 / 34 | 13.2 / 14.9 |
-| Qwen3.5-9B BF16 (unsloth) | 2197 / 2516 | 1981 / 2015 | 32.1 / 35.1 | 86 / 62 | 80 / 66 | 1.4 / 15.0 |
-| Gemma 4 12B Q8_0 (ggml-org) | 1808 / 1049 | 1415 / 1142 | 37.6 / 38.3 | 67 / 36 | 61 / 43 | 18.5 / 20.6 |
-| Gemma 4 26B-A4B Q4_0 (ggml-org) | 3922 / 2437 | 3056 / 2340 | 114 / 126 | 138 / 137 | 127 / 107 | 57.5 / 63.8 |
-| Qwen3.8-27B Q4_K_P (HauhauCS) | 683 / 575 | 571 / 563 | 23.5 / 23 (best; 12-23) | 21.0 / 23.2 | 20.9 / 21.5 | 7.1 / 9.9 |
+| Llama-3.2-1B Q4_K_M (bartowski) | 17808 / 11564 | 15010 / 12341 | 401 / 403 | 642 / 953 | 534 / 746 | 167 / 240 |
+| Llama-3.2-1B Q8_0 | 18293 / 12424 | 13543 / 11980 | 300 / 309 | 736 / 852 | 517 / 599 | 164 / 148 |
+| Orpheus 3B Q4_K_M | 5571 / 4390 | 4305 / 3831 | 186 / 182 (22 tok) | 208 / 308 | 179 / 216 | 56 / 95 (24 tok) |
+| Qwen3-8B Q8_0 | 2259 / 2268 | 2176 / 1966 | 62.2 / 61.6 | 107 / 115 | 97 / 91 | 28.9 / 26.6 |
+| Qwen3-14B Q8_0 | 1310 / 1318 | 1252 / 1144 | 35.5 / 35.9 | 57 / 61 | 48 / 51 | 15.8 / 16.1 |
+| Qwen3.5-9B BF16 (unsloth) | 2197 / 2516 | 1981 / 2015 | 32.1 / 35.1 | 97 / 135 | 103 / 125 | 1.4 / 16.4 |
+| Gemma 4 12B Q8_0 (ggml-org) | 1808 / 1049 | 1415 / 1142 | 37.6 / 38.3 | 67 / 80 | 63 / 81 | 17.6 / 17.2 |
+| Gemma 4 26B-A4B Q4_0 (ggml-org) | 3922 / 2437 | 3056 / 2340 | 114 / 126 | 150 / 162 | 128 / 148 | 58.6 / 53.4 |
+| Qwen3.8-27B Q4_K_P (HauhauCS) | 683 / 575 | 571 / 563 | 23.5 / 23 (best; 12-23) | 20.8 / 31.4 | 20.4 / 31.2 | 7.1 / 10.5 |
+
+CPU prefill with llama.cpp on more threads (its best is 12-16 on this machine; 18 drops sharply)
+and oxinfer's opt-in `prefill_gemm=fast` (same runs as the CPU columns above; tok/s,
+pp512 / pp2048):
+
+| model | llama.cpp 6 thr | 12 thr | 16 thr | oxinfer `auto` (SME) | `fast` | `f32` (before) |
+|---|---|---|---|---|---|---|
+| Llama-3.2-1B Q4_K_M | 642 / 534 | 1072 / 900 | 1335 / 1173 | 953 / 746 | 1289 / 920 | 405 / 327 |
+| Llama-3.2-1B Q8_0 | 736 / 517 | 1313 / 1014 | (noisy) | 852 / 599 | 1066 / 827 | 416 / 323 |
+| Orpheus 3B Q4_K_M | 208 / 179 | 320 / 269 | 211 / 306 | 308 / 216 | 403 / 215 | 124 / 87 |
+| Qwen3-8B Q8_0 | 107 / 97 | 179 / 154 | 214 / 188 | 115 / 91 | 194 / 135 | 55 / 44 |
+| Qwen3-14B Q8_0 | 57 / 48 | 69 / 68 | 105 / 83 | 61 / 51 | 79 / 78 | 29 / 35 |
+| Qwen3.5-9B BF16 | 97 / 103 | 106 / 104 | 104 / 88 | 135 / 125 | 121 / 117 | 71 / 64 |
+| Gemma 4 12B Q8_0 | 67 / 63 | 124 / 105 | 151 / 128 | 80 / 81 | 134 / 124 | 48 / 40 |
+| Gemma 4 26B-A4B Q4_0 | 150 / 128 | 255 / 221 | 348 / 267 | 162 / 148 | 160 / 145 | 101 / 93 |
+| Qwen3.8-27B Q4_K_P | 20.8 / 20.4 | 31.4 / 30.6 | 32.7 / 19.8 | 31.4 / 31.2 | 53.0 / 47.0 | 18 / 19 |
+
+(`f32`: the previous default, measured in an earlier pass at load averages 8-45. Llama 1B
+Q4_K_M from a pass at load 2-4. `fast` changes nothing for float-stored weights and runs the
+MoE experts' grouped GEMMs on SME alone.)
 
 Before this round (master `779396c`), Metal prefill ran only the matmuls on the GPU, with
 attention and norms on the CPU and a host round trip per layer: pp512 / pp2048 were 1628 / 1017
@@ -163,8 +185,9 @@ heavier load (18-38). Now every model with a GPU decode graph prefills on whole-
 plans with flash attention ([Decoding on the GPU](#decoding-on-the-gpu)): 2-12x faster, at or
 above llama.cpp on Qwen3-8B / 14B / 3.5-9B pp512 and the 27B pp2048, 0.6-0.9x on the rest
 (below). Decoding is level on Metal (the 27B's runs varied with the page cache, other jobs held
-100+ GB models) and on the CPU ahead except Qwen3-8B; llama.cpp's CPU decode of the BF16
-Qwen3.5-9B (Gated DeltaNet) runs at 1.4 tok/s.
+100+ GB models) and on the CPU within noise (ahead on Llama 1B Q4_K_M, Orpheus and the 27B,
+5-10% behind on Qwen3-8B, Llama 1B Q8_0 and 26B-A4B in the loaded CPU pass); llama.cpp's CPU
+decode of the BF16 Qwen3.5-9B (Gated DeltaNet) runs at 1.4 tok/s.
 
 Speculative decoding with a DSpark draft llama.cpp master loads (Anbeeld's Qwen3-14B-DSpark
 Q8_0 beside Qwen3-14B Q8_0; `--spec-type draft-dspark --spec-draft-n-max 7`, all layers on the
@@ -181,9 +204,63 @@ Where oxinfer is still behind:
   in GEMMs. Copying the new keys and values back to the host caches costs 3-6% more.
 - **Gemma 4 26B-A4B prefill**: the routed experts' grouped GEMMs (32-row tiles, mostly padding at
   ~40 tokens per expert) and one routing read-back per layer.
-- **CPU prefill** (0.5-0.9x, level on 26B-A4B pp512, ahead on the 27B): llama.cpp repacks the weights for the int8 `SMMLA` / `SDOT`
-  instructions and multiplies int8 activations; oxinfer dequantizes to f32 and runs an FMA GEMM
-  at ~1.3 TFLOP/s. (Accelerate's `cblas_sgemm` measured 1.0-1.5 TFLOP/s here, no better.)
+- **CPU prefill against llama.cpp on 12-16 threads** (0.45-0.7x on the Q8_0 / Q4 models, level on
+  Orpheus and the 27B, ahead on the BF16 Qwen3.5-9B): oxinfer's default GEMM now runs on the SME
+  units (see [CPU prefill GEMMs](#cpu-prefill-gemms-november-2026)), 1.6-2.5x the previous CPU
+  prefill and ahead of llama.cpp's default 6 threads everywhere but Qwen3-8B pp2048 (0.94x), with
+  the same results as before. But the SME units saturate with a few threads, while llama.cpp's
+  repacked int8 `SMMLA` kernels (int8 activations) keep scaling with free cores. The opt-in
+  `prefill_gemm=fast` (SME plus int8 on the NEON units, llama.cpp-like rounding) closes most of
+  the gap (0.75-1.6x of llama.cpp's best; 0.46x on the 26B-A4B, whose experts stay on SME) but
+  changes the results.
+
+#### CPU prefill GEMMs (November 2026)
+
+CPU prefill matmuls (more than `decode_max_tokens` tokens; decoding is unchanged) pick their
+kernel with the engine option `prefill_gemm` (`--prefill-gemm`, `OXINFER_PREFILL_GEMM`):
+
+- `auto` (default): `sme` where the CPU has the Scalable Matrix Extension (Apple M4 and later),
+  else `f32`.
+- `sme`: f32 GEMM on the SME tiles. Weights are dequantized to f32 32 rows at a time as before,
+  both operands are transposed to `[k][32]` panels through ZA, and each `FMOPA` adds a 16x16
+  outer product into one of ZA's four f32 tiles. Every output is the same fused-multiply-add
+  chain in input order as the NEON GEMM's, so the logits are bit-identical to `f32` (Llama 3.2
+  1B, Qwen3-8B, Qwen3.5-9B BF16; KL 4e-7 on Gemma 4 12B, where some products round
+  differently).
+- `hybrid`: `sme` on 7/16 of the row blocks and `int8x2` on the cores' NEON units for the rest,
+  at the same time. Which kernel computes a block depends on the block only, not on timing.
+- `fast`: the same with `int8` on the NEON units (5/16 on SME).
+- `int8x2`: int8 `SDOT` GEMM (aarch64). Weight rows are unpacked four at a time into int8 tiles
+  interleaved by four values, with their scales per 32 (integer scales per 16, mins per 32); an
+  `SDOT` by element multiplies four activation bytes of one token against four rows. The
+  activations are an int8 value plus an int8 rounding residual per block of 32 (about 16-bit).
+- `int8`: the same with the value plane only (the decode kernels' rounding, and llama.cpp's for
+  its repacked formats).
+- `f32`: dequantized weights times f32 activations on the NEON / AVX2 FMA GEMM (the previous
+  path).
+
+Last-token KL against `f32` after a 2.5k-token raw prompt, and greedy text (64 tokens, two
+prompts, `--no-system`) identical to `f32`'s:
+
+| | Llama 3.2 1B Q8_0 | Qwen3-8B Q8_0 | Gemma 4 12B Q8_0 | greedy texts identical |
+|---|---|---|---|---|
+| `sme` | 0 | 0 | 3.8e-7 | 6 / 6 |
+| `hybrid` | 7.5e-7 | 4.6e-7 | 3.7e-6 | 4 / 6 |
+| `int8x2` | 2.3e-6 | 7.4e-7 | 1.4e-5 | |
+| `fast` | 1.1e-3 | 1.4e-3 | 2.2e-3 | 5 / 6 |
+| `int8` | 9.5e-4 | 6.6e-4 | 5.9e-3 | |
+
+The texts that parted did so at near ties after 30-50 tokens, which is why only `sme` (no change
+to the results) is the default. GEMM throughput (`examples/gemm_bench.rs`, 4096 x 4096 Q8_0, 512
+tokens, M5 Max shared with other jobs): `f32` ~1.4 TFLOP/s on 18 threads, `sme` ~2.4 (1.1-1.3 on
+one thread; four threads already saturate the SME units, which the cores of a cluster share),
+`int8x2` ~2.1, `int8` ~3.9, `hybrid` ~2.7. On Qwen3-8B Q8_0 pp512 at a light load: `sme` 118-128
+tok/s, `hybrid` 127-145, `fast` 216-226, against llama.cpp's 133 / 183 / 219 on 8 / 12 / 16
+threads: llama.cpp's repacked int8 kernels keep scaling with free cores while `sme` is bound by
+the SME units. Splitting the rows between the SME GEMM and the NEON f32 GEMM (which give the
+same bits, so the result would not change) gained ~12% on an idle machine with a fixed share,
+nothing under load, and lost with blocks handed out at run time (the slow NEON blocks finish
+last), so `auto` keeps the SME GEMM alone.
 
 #### Earlier comparisons (llama-server, op-by-op Metal prefill)
 
