@@ -866,6 +866,29 @@ inline void zero(thread CT& c) {
 #pragma unroll
     for (uint16_t i = 0; i < c.get_capacity(); ++i) if (c.is_valid_element(i)) c[i] = 0;
 }
+// A 32-block of weights as half: dequantized in f32, then converted; Q8_0 and Q4_0 in half
+// arithmetic from 16-bit loads instead (the same values: q d is exact in f32 and rounded once
+// either way), which cuts the dequantization's share of the GEMMs.
+template <typename W>
+inline void loadh(W w, uint row, uint b, thread half4* out) {
+    float4 t[8];
+    load(w, row, b, t);
+    for (uint i = 0; i < 8; i++) out[i] = half4(t[i]);
+}
+inline void loadh(Q8_0W w, uint row, uint b, thread half4* out) {
+    device const ushort* B = (device const ushort*)(w.g.q + (ulong)row * w.g.rb + b * 34);
+    half d = as_type<half>(B[0]);
+    for (uint i = 0; i < 8; i++) out[i] = half4(as_type<char4>(ushort2(B[1 + 2 * i], B[2 + 2 * i]))) * d;
+}
+inline void loadh(Q4_0W w, uint row, uint b, thread half4* out) {
+    device const ushort* B = (device const ushort*)(w.g.q + (ulong)row * w.g.rb + b * 18);
+    half d = as_type<half>(B[0]);
+    for (uint i = 0; i < 4; i++) {
+        uchar4 v = as_type<uchar4>(ushort2(B[1 + 2 * i], B[2 + 2 * i]));
+        out[i] = (half4(v & uchar(15)) - 8.h) * d;
+        out[i + 4] = (half4(v >> uchar(4)) - 8.h) * d;
+    }
+}
 template <typename W, int TM>
 inline void mma_tile(W w, device const half* xh, device const float* rs, device float* y, uint n_out, uint n_in, uint rows,
                      uint o0, uint t0, uint tid, threadgroup half* Ws, uint ldy = 0, uint add = 0) {
@@ -881,9 +904,9 @@ inline void mma_tile(W w, device const half* xh, device const float* rs, device 
     uint row = tid / 2, blk = tid % 2;   // each thread dequantizes one 32-block of one row
     threadgroup half4* wd = (threadgroup half4*)(Ws + row * MKB + blk * 32);
     for (uint k0 = 0; k0 < n_in; k0 += MKB) {
-        float4 wv[8];
-        load(w, o0 + row, k0 / 32 + blk, wv);
-        for (uint i = 0; i < 8; i++) wd[i] = half4(wv[i]);
+        half4 wv[8];
+        loadh(w, o0 + row, k0 / 32 + blk, wv);
+        for (uint i = 0; i < 8; i++) wd[i] = wv[i];
         threadgroup_barrier(mem_flags::mem_threadgroup);
         auto a = X.template slice<MKB, TM>(k0, t0);
         op.run(a, Wt, c);
