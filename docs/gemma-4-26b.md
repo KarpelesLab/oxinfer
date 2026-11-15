@@ -102,3 +102,42 @@ llama.cpp through `llama-server`, oxinfer as a fresh process per run; M5 Max at 
 On the CPU the two are level; with the GPU, llama.cpp runs the whole pass there (5x the prefill,
 2x the decode) while oxinfer keeps attention, routing and decode on the CPU. The greedy outputs
 agree: Q4_0 identical for 64 tokens on both devices, Q8_0 splitting at a near tie after 31-48.
+
+### Why the Metal prefill drifts further from the CPU here than on dense models
+
+After a 2681-token raw prompt (9 kB of this repository's documentation), the last-token
+distribution of the Metal prefill (whole-pass plan, matrix units) is a KL of 0.21-0.29 from the
+CPU's on the Q4_0 GGUF, where dense models sit at 1e-5 to 1e-4. Neither path is wrong; the model
+amplifies rounding through its routing, and this prompt position amplifies it most:
+
+- Routing is crowded. The router logits spread by about 0.8-1.1 over the 128 experts, so the 8th
+  and 9th are a median 0.04-0.07 apart; 1.4% of tokens have them within 1e-3, 13% within 1e-2.
+  Half-precision operands on the matrix units move the router logits by 9e-5 at the first layer,
+  enough for 6 of the 2681 tokens to swap an expert there; each swap changes that token by a few
+  percent, attention carries it to later tokens, and by the last layer 800-1000 tokens route
+  differently (router logits 2e-2 apart). The swapped experts held 4-9% of their token's routing
+  weight on average, the smallest shares, as near-ties do.
+- Even two f32 CPU GEMMs (`--prefill-gemm sme` and `f32`, differing only in summation order, 1e-7
+  apart after the first layers) disagree by a KL of 0.044 at that position: one near-tie at layer
+  12 grows into 10-12 differing routes per layer and a 6% different last hidden state.
+- llama.cpp shows the same: its Metal and CPU backends are a KL of 0.64 apart on the same tokens
+  (Q4_0), and Q4_0 against Q8_0 is a KL of 4.9 at this position in both engines. llama.cpp Metal is
+  0.05 from oxinfer's CPU path and 0.25 from its Metal plan. Other prompts are calmer: the same
+  prompt on the Q8_0 file gives 4e-3 (Metal plan against CPU), another 3k-token document 2e-3.
+- The paths agree layer by layer up to that amplification. With the pass cut after its first L
+  layers, the final hidden states of the plan and of the per-operation GPU path (CPU code, GPU
+  matmuls) differ from the CPU's by the same amount at every depth (median per token 1.4e-4 at
+  L = 1, 3e-4 at 6, 2e-3 at 12, 2e-2 at 18, 8e-2 at 30), with no step in the first 1024, the next
+  1024 or the tokens past the 2048-token plan step; with exact f32 matmuls (`OXINFER_METAL_MMA=0`,
+  which skips the plan) the GPU is a KL of 3.5e-6 to 3e-4 from the CPU. The plan's sliding / global
+  attention (heads of 256 and 512 in the flash kernel), routing weights, GELU experts,
+  per-expert scales and the dense MLP beside them match the CPU on a tiny random checkpoint of
+  this layout to rounding (`tests/gemma_moe_gpu.rs`: bf16 / Q8 / Q4, plan steps of 64 tokens past
+  a 48-token window, then GPU decode steps; 1e-3 to 3e-3 per token, against 0.37 with SiLU
+  experts).
+- Greedy decoding agrees where it can: on three chat prompts (64, 62 and 2716 tokens), 200 tokens
+  of oxinfer on Metal (plan prefill, GPU decode) are identical to llama.cpp Metal's, with or
+  without matrix units. The CPU decode (int8 activations, as llama.cpp's CPU backend) leaves them
+  at near-ties after 80, 137 and 34 tokens; llama.cpp's CPU backend leaves its Metal one after 5
+  and 122 tokens (and agrees for all 200 on the second prompt). `OXINFER_GPU_DECODE_CHECK=1` puts single GPU and CPU decode steps (same caches) at
+  a KL of about 1e-3, up to 0.09 at a routing near-tie.
