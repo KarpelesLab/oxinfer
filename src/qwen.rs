@@ -1641,15 +1641,24 @@ impl<'a> QwenModel<'a> {
     /// The GPU prefill plan (see `Backend::decode_plan_prefill`), compiled on first use; None
     /// when unavailable.
     pub(crate) fn gpu_prefill_plan(&self) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
+        self.gpu_prefill_plan_cap(&[])
+    }
+
+    /// [`Self::gpu_prefill_plan`] copying out the residual after each of `cap` (layer indices,
+    /// sorted): the features a speculative draft reads ([`crate::dspark::Target::forward_feats`]).
+    fn gpu_prefill_plan_cap(&self, cap: &[usize]) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
         if !self.gpu_decode_on() {
             return None;
         }
         let tokens = prefill_plan_tokens();
-        self.gpu_plans.get((1 << 61) | tokens as u64, || {
+        let key = cap.iter().fold((1u64 << 61) | tokens as u64, |k, &l| {
+            k.wrapping_mul(0x100000001b3).wrapping_add(l as u64 + 1)
+        });
+        self.gpu_plans.get(key, || {
             let be = crate::gpu::active()?;
             let t0 = std::time::Instant::now();
             let plan = self
-                .gpu_graph_mode(None, Some(&[]), true)
+                .gpu_graph_mode(None, Some(cap), true)
                 .and_then(|g| be.decode_plan_prefill(&g, tokens));
             if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
                 eprintln!(
@@ -1667,12 +1676,23 @@ impl<'a> QwenModel<'a> {
     /// hidden states, as the host path gives them (up to rounding: half-precision GEMM inputs as
     /// the host path's GPU GEMMs, attention and norms on the device). None (nothing changed) when
     /// unavailable; a failure past the first chunk finishes the pass on the host path.
-    fn gpu_prefill(&self, sess: &mut QwenSession, tokens: &[u32], mm: &[(usize, &[f32])]) -> Option<Vec<f32>> {
+    ///
+    /// With `cap` (layer indices, sorted), `captured` receives the residual after each of them,
+    /// `[t, cap.len(), hidden]`.
+    fn gpu_prefill(
+        &self,
+        sess: &mut QwenSession,
+        tokens: &[u32],
+        mm: &[(usize, &[f32])],
+        cap: &[usize],
+        captured: &mut Vec<f32>,
+    ) -> Option<Vec<f32>> {
         let t = tokens.len();
         if sess.iv.active() || !sess.capture.is_empty() || self.stream.is_some() || sess.positions.is_some() {
             return None;
         }
-        let plan = self.gpu_prefill_plan()?;
+        let plan = self.gpu_prefill_plan_cap(cap)?;
+        let nc = cap.len();
         let n = plan.tokens();
         let h = self.cfg.hidden_size;
         let mut x = vec![0f32; t * h];
@@ -1682,6 +1702,8 @@ impl<'a> QwenModel<'a> {
         }
         let half = self.inv_freq.len();
         let mut hidden = vec![0f32; t * h];
+        captured.clear();
+        captured.resize(t * nc * h, 0.0);
         let mut c = 0;
         while c < t {
             let m = n.min(t - c);
@@ -1713,7 +1735,7 @@ impl<'a> QwenModel<'a> {
                         hidden: &mut hidden[c * h..(c + m) * h],
                         logits: None,
                         params: None,
-                        capture: None,
+                        capture: (nc > 0).then(|| &mut captured[c * nc * h..(c + m) * nc * h]),
                         scratch: false,
                         states_kept: false,
                     },
@@ -1736,7 +1758,17 @@ impl<'a> QwenModel<'a> {
         if c < t {
             // The rest on the host path.
             let rest: Vec<(usize, &[f32])> = mm.iter().filter(|m| m.0 >= c).map(|&(i, e)| (i - c, e)).collect();
+            sess.capture = cap.to_vec();
+            sess.captured.clear();
             let hs = self.forward_impl(sess, &tokens[c..], &rest, false, false);
+            sess.capture.clear();
+            for (ci, &l) in cap.iter().enumerate() {
+                let rows = &sess.captured.iter().find(|r| r.0 == l).expect("captured layer").1;
+                for (j, row) in rows.chunks(h).enumerate() {
+                    captured[((c + j) * nc + ci) * h..((c + j) * nc + ci + 1) * h].copy_from_slice(row);
+                }
+            }
+            sess.captured.clear();
             hidden.truncate(c * h);
             hidden.extend_from_slice(&hs);
         }
@@ -2089,7 +2121,7 @@ impl<'a> QwenModel<'a> {
         if gpu
             && !record
             && prefill_gpu(t, "plan")
-            && let Some(hs) = self.gpu_prefill(sess, tokens, mm)
+            && let Some(hs) = self.gpu_prefill(sess, tokens, mm, &[], &mut Vec::new())
         {
             return hs;
         }
@@ -2285,6 +2317,41 @@ impl<'a> QwenModel<'a> {
         sel: Option<&[Option<Vec<u32>>]>,
         y: &mut [f32],
     ) {
+        self.attn_forward_impl(at, caches, hn, t, start, cos, sin, sel, false, y)
+    }
+
+    /// [`Self::attn_forward`] for a draft's layer (the MTP head's): a long pass (a prompt's)
+    /// attends on the GPU when it can, whatever the model (drafts only steer speculation, so
+    /// rounding that differs from the CPU's changes no output).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attn_forward_draft(
+        &self,
+        at: &Attn,
+        cache: &mut LayerCache,
+        hn: &[f32],
+        t: usize,
+        start: usize,
+        cos: &[f32],
+        sin: &[f32],
+        y: &mut [f32],
+    ) {
+        self.attn_forward_impl(at, &mut [cache], hn, t, start, cos, sin, None, true, y)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attn_forward_impl(
+        &self,
+        at: &Attn,
+        caches: &mut [&mut LayerCache],
+        hn: &[f32],
+        t: usize,
+        start: usize,
+        cos: &[f32],
+        sin: &[f32],
+        sel: Option<&[Option<Vec<u32>>]>,
+        draft: bool,
+        y: &mut [f32],
+    ) {
         let each = caches.len() > 1;
         debug_assert!(if each { caches.len() == t } else { caches.len() == 1 });
         let cfg = &self.cfg;
@@ -2400,9 +2467,11 @@ impl<'a> QwenModel<'a> {
         };
         let cache: &LayerCache = &*caches[0];
         let mut att = vec![0f32; t * nh * hd];
-        // Qwen4-Exp prefill: on the GPU (dense, or over each token's QSA selection).
+        // Qwen4-Exp prefill: on the GPU (dense, or over each token's QSA selection); a draft's
+        // long pass when the attention is plain causal.
+        let dense = at.window.is_none() && ix_sel.is_none() && !cfg.bidirectional;
         let on_gpu = !each
-            && prefill_gpu_exp(cfg, t, "attn")
+            && (prefill_gpu_exp(cfg, t, "attn") || (draft && dense && prefill_gpu(t, "attn")))
             && crate::gpu::active().is_some_and(|be| {
                 let (kc, vc) = cache.data();
                 be.attention_cached(&mut crate::gpu::AttnJob {
@@ -2617,7 +2686,37 @@ impl crate::dspark::Target for QwenModel<'_> {
     ) -> Vec<f32> {
         let (t, h) = (tokens.len(), self.cfg.hidden_size);
         // The residual entering layer `l` is layer `l - 1`'s output (the embeddings for 0).
-        sess.capture = layers.iter().filter(|&&l| l > 0).map(|&l| l - 1).collect();
+        let mut cap: Vec<usize> = layers.iter().filter(|&&l| l > 0).map(|&l| l - 1).collect();
+        cap.sort_unstable();
+        cap.dedup();
+        // A prompt: on the GPU prefill plan, which copies the captured rows out (a prefill pass
+        // records nothing for rewinds: drafts are only rewound within a verification pass).
+        let mut rows = Vec::new();
+        if self.exp.is_none()
+            && prefill_gpu(t, "plan")
+            && cap.last().is_none_or(|&l| l < self.layers.len())
+            && let Some(hs) = self.gpu_prefill(sess, tokens, mm, &cap, &mut rows)
+        {
+            let (nf, nc) = (layers.len(), cap.len());
+            feats.clear();
+            feats.resize(t * nf * h, 0.0);
+            for_chunks(feats, nf * h, true, |ti, f| {
+                for (fi, &l) in layers.iter().enumerate() {
+                    let out = &mut f[fi * h..(fi + 1) * h];
+                    if l == 0 {
+                        match mm.iter().find(|m| m.0 == ti) {
+                            Some(&(_, e)) => out.copy_from_slice(e),
+                            None => self.embed.row(tokens[ti] as usize, out),
+                        }
+                    } else {
+                        let ci = cap.binary_search(&(l - 1)).unwrap();
+                        out.copy_from_slice(&rows[(ti * nc + ci) * h..(ti * nc + ci + 1) * h]);
+                    }
+                }
+            });
+            return hs;
+        }
+        sess.capture = cap;
         sess.captured.clear();
         let hs = self.forward_impl(sess, tokens, mm, true, true);
         sess.capture.clear();

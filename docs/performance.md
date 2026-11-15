@@ -212,6 +212,14 @@ run each, loaded machine): code 94 / 99 tok/s, math 146 / 131, chat 74 / 58, pro
 (oxinfer's prose run varied 31-64 between two runs; plain decoding 33-35 in both engines). With
 `--spec-type draft-dflash` llama.cpp accepts none of this file's drafts.
 
+The matrix runs with `draft=none`. Until November 2026, the default drafts (DSpark for Qwen3
+4B / 8B / 14B and Gemma 4 12B, MTP for Qwen3.5-4B / 9B, fast-verification drafts for the 27B and
+Gemma 4 31B) kept the prompt off the prefill plans, since the drafts read captured layers: Qwen3-8B
+Q8_0 prefilled a 4.3k-token prompt at 87-140 tok/s with its default draft against ~2000 without.
+The plans now capture those layers on the device and the drafts' own context passes run on the
+GPU, so prefill with a default draft is within 0-25% of `--no-draft` (per-model numbers in
+[Prompts with a draft](speculative-decoding.md#prompts-with-a-draft)).
+
 Where oxinfer is still behind:
 
 - **Metal prefill** (0.8-0.95x on Llama 1B, Orpheus, Qwen3-8B, Gemma 4 12B; level or ahead on

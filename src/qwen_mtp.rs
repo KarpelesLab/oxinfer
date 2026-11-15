@@ -322,7 +322,7 @@ impl<'a> QwenMtp<'a> {
         let mut hn = vec![0f32; t * h];
         let mut y = vec![0f32; t * h];
         rmsnorm_f32w_rows(&x, h, &self.ln_in, eps, &mut hn);
-        model.attn_forward(&self.attn, &mut sess.kv, &hn, t, start, &cos, &sin, &mut y);
+        model.attn_forward_draft(&self.attn, &mut sess.kv, &hn, t, start, &cos, &sin, &mut y);
         add_inplace(&mut x, &y);
         rmsnorm_f32w_rows(&x, h, &self.ln_post, eps, &mut hn);
         let need = |ids: &[usize]| {

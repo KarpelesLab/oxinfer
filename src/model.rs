@@ -1694,7 +1694,7 @@ impl<'a> Model<'a> {
         }
         if mm.is_empty()
             && crate::qwen::prefill_gpu(tokens.len(), "plan")
-            && let Some(hs) = self.gpu_prefill(sess, tokens)
+            && let Some(hs) = self.gpu_prefill(sess, tokens, &[], &mut Vec::new())
         {
             return hs;
         }
@@ -1980,7 +1980,33 @@ impl crate::dspark::Target for Model<'_> {
     ) -> Vec<f32> {
         let (t, h) = (tokens.len(), self.cfg.hidden_size);
         // The residual entering layer `l` is layer `l - 1`'s output (the scaled embeddings for 0).
-        sess.capture = layers.iter().filter(|&&l| l > 0).map(|&l| l - 1).collect();
+        let mut cap: Vec<usize> = layers.iter().filter(|&&l| l > 0).map(|&l| l - 1).collect();
+        cap.sort_unstable();
+        cap.dedup();
+        // A prompt: on the GPU prefill plan, which copies the captured rows out.
+        let mut rows = Vec::new();
+        if mm.is_empty()
+            && crate::qwen::prefill_gpu(t, "plan")
+            && cap.last().is_none_or(|&l| l < self.layers.len())
+            && let Some(hs) = self.gpu_prefill(sess, tokens, &cap, &mut rows)
+        {
+            let (nf, nc) = (layers.len(), cap.len());
+            feats.clear();
+            feats.resize(t * nf * h, 0.0);
+            crate::kernels::for_chunks(feats, nf * h, true, |ti, f| {
+                for (fi, &l) in layers.iter().enumerate() {
+                    let out = &mut f[fi * h..(fi + 1) * h];
+                    if l == 0 {
+                        out.copy_from_slice(&self.embed_scaled(tokens[ti]));
+                    } else {
+                        let ci = cap.binary_search(&(l - 1)).unwrap();
+                        out.copy_from_slice(&rows[(ti * nc + ci) * h..(ti * nc + ci + 1) * h]);
+                    }
+                }
+            });
+            return hs;
+        }
+        sess.capture = cap;
         sess.captured.clear();
         let hs = self.forward_hidden_cpu(sess, tokens, mm);
         sess.capture.clear();

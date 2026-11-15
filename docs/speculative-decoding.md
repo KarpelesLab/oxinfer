@@ -61,6 +61,39 @@ llama.cpp patch (`QwenMtp::attach_sidecar` in the library). With HauhauCS's Qwen
 GGUF, greedy output with the embedded MTP layer or the FastMTP sidecar is token-for-token the
 plain greedy output.
 
+### Prompts with a draft
+
+A DSpark draft reads the target's residual stream at a few layers for every position, the prompt's
+included, and an MTP head runs its layer over the prompt's hidden states. On Metal the prompt still
+runs on the whole-pass prefill plan: the plan copies the residual after the draft's layers into a
+capture buffer on the device, read back once per 2048-token chunk (`gpu_prefill` with `cap` in
+`qwen.rs` / `model_gpu.rs`); the draft's context pass over the prompt (feature projection, keys and
+values of every draft layer) runs as a prefill plan of its own instead of 16 positions at a time or
+on the CPU; and the MTP layer's attention over a prompt runs on the GPU (`attn_forward_draft`).
+Until November 2026 a draft sent the prompt through the op-by-op path (GPU GEMMs, attention on the
+CPU: 8.7 ms per token for Qwen3-8B at 4.3k tokens, most of the pass) and the draft's context pass
+ran on the CPU, so default users prefilled 5-20x slower than with `--no-draft`. Prefill tok/s on a
+4.3k-4.8k-token prompt (default drafts and verification; M5 Max shared with other jobs, load
+averages 4-27, so +-15%):
+
+| Model | Draft | Before | Now | `--no-draft` |
+|---|---|---|---|---|
+| Qwen3-4B bf16 | DSpark | 124 | 2109 | 2356 |
+| Qwen3-8B Q8_0 | DSpark | 87-128 | 1915-1981 | 1980-2097 |
+| Qwen3-14B Q8_0 | DSpark | 105 | 957 | 928 |
+| Gemma 4 12B Q8_0 | DSpark | 327 | 1122 | 1246 |
+| Qwen3.5-4B bf16 | MTP | 2141 | 3195 | 3986 |
+| Qwen3.5-9B bf16 | MTP | 1203 | 1392 | 1693 |
+| Qwen3.8-27B q4 | RadixArk DSpark | 143 | 690 | 617 |
+| Gemma 4 31B q4 | RedHatAI DSpark | 98 | 274-416 | 366 |
+
+The captured rows are the plan's residuals, so they differ from the op-by-op path's in rounding
+only: with fixed 7-token drafts and exact verification, the drafts accepted were the same on every
+pair (e.g. Qwen3-8B 41 of 146, Gemma 4 12B 45 of 120, the 27B 35 of 78) but Gemma 4 31B (31 of 116
+before, 30 of 124 now). Greedy output is unchanged (identical to master's and, with exact
+verification, to `--no-draft`'s). Prompt lookup needs no captures and always prefilled on the
+plan.
+
 ## Multi-token passes and MoE experts on the CPU
 
 Speculative verification (and prompts shorter than 8 tokens) runs on the CPU's decode kernels,

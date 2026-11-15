@@ -753,6 +753,9 @@ pub struct Dspark<'a> {
     /// The same on the fast (batched, not batch-invariant) kernels, for sessions with
     /// [`DsparkOptions::fast_verify`].
     gpu_fast: std::sync::OnceLock<Option<GpuDraft>>,
+    /// The context pass as a GPU prefill plan (`Backend::decode_plan_prefill`), for the
+    /// features of a prompt; built on first use.
+    gpu_ctx_pf: std::sync::OnceLock<Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>>>,
 }
 
 /// The dense backbones: MLA (llama.cpp `graph_mistral_large4`) or grouped-query attention
@@ -1424,6 +1427,7 @@ impl<'a> Dspark<'a> {
                 device: std::sync::atomic::AtomicBool::new(false),
                 gpu: Default::default(),
                 gpu_fast: Default::default(),
+                gpu_ctx_pf: Default::default(),
                 cfg,
             });
         }
@@ -1463,6 +1467,7 @@ impl<'a> Dspark<'a> {
             device: std::sync::atomic::AtomicBool::new(false),
             gpu: Default::default(),
             gpu_fast: Default::default(),
+            gpu_ctx_pf: Default::default(),
             cfg,
         })
     }
@@ -1697,9 +1702,11 @@ impl<'a> Dspark<'a> {
             sess.len += t;
             return;
         }
-        if self.gpu_inject(sess, feats, t) {
+        let done = self.gpu_inject(sess, feats, t);
+        if done == t {
             return;
         }
+        let (feats, t) = (&feats[done * n_feat..], t - done);
         let m = self.dense();
         let mut x = vec![0f32; t * h];
         self.lin(&mut [(&m.fc, h, &mut x[..])], n_feat, feats, t);
@@ -2502,39 +2509,61 @@ impl Dspark<'_> {
         Some(gr)
     }
 
-    /// The context pass on the GPU, when the plans exist and `t` fits; false otherwise (nothing
-    /// changed).
-    fn gpu_inject(&self, sess: &mut DsparkSession, feats: &[f32], t: usize) -> bool {
-        let Some(gp) = self.gpu_plans(sess.fast) else { return false };
-        if t > gp.ctx.tokens() || sess.kv.len() != self.dense().layers.len() {
-            return false;
+    /// The context pass on the GPU, when the plans exist: the positions done (from the first;
+    /// the rest is left to the host). Up to 16 positions run on the context plan, more (a
+    /// prompt's) on its prefill version, a chunk at a time.
+    fn gpu_inject(&self, sess: &mut DsparkSession, feats: &[f32], t: usize) -> usize {
+        let Some(gp) = self.gpu_plans(sess.fast) else { return 0 };
+        if sess.kv.len() != self.dense().layers.len() {
+            return 0;
         }
-        let h = self.cfg.hidden;
-        let cs = self.rope_rows(sess.len, t);
-        let mut hidden = vec![0f32; t * h];
-        let mut kv: Vec<&mut LayerCache> = sess.kv.iter_mut().collect();
-        let ok = gp.ctx.step(
-            &mut sess.gpu_ctx,
-            crate::gpu::decode::Step {
-                pos: sess.len,
-                t,
-                rope_cs: &cs,
-                x: feats,
-                x2: &[],
-                kv: &mut kv,
-                states: &mut [],
-                hidden: &mut hidden,
-                logits: None,
-                params: None,
-                capture: None,
-                scratch: false,
-                states_kept: false,
-            },
-        );
-        if ok {
-            sess.len += t;
+        let pf = (t > gp.ctx.tokens()).then(|| self.gpu_ctx_pf()).flatten();
+        let plan = pf.as_ref().unwrap_or(&gp.ctx);
+        let (h, n) = (self.cfg.hidden, plan.tokens());
+        let nf = feats.len() / t;
+        let mut hidden = vec![0f32; n.min(t) * h];
+        let mut c = 0;
+        while c < t {
+            let m = n.min(t - c);
+            let cs = self.rope_rows(sess.len, m);
+            let mut kv: Vec<&mut LayerCache> = sess.kv.iter_mut().collect();
+            let ok = plan.step(
+                &mut sess.gpu_ctx,
+                crate::gpu::decode::Step {
+                    pos: sess.len,
+                    t: m,
+                    rope_cs: &cs,
+                    x: &feats[c * nf..(c + m) * nf],
+                    x2: &[],
+                    kv: &mut kv,
+                    states: &mut [],
+                    hidden: &mut hidden[..m * h],
+                    logits: None,
+                    params: None,
+                    capture: None,
+                    scratch: false,
+                    states_kept: false,
+                },
+            );
+            if !ok {
+                break;
+            }
+            sess.len += m;
+            c += m;
         }
-        ok
+        c
+    }
+
+    /// The prefill version of the context plan ([`Self::gpu_inject`]), built on first use.
+    fn gpu_ctx_pf(&self) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
+        self.gpu_ctx_pf
+            .get_or_init(|| {
+                let Backbone::Gqa(g) = &self.cfg.backbone else { return None };
+                let be = crate::gpu::active()?;
+                let plan = be.decode_plan_prefill(&self.ctx_graph(g)?, crate::qwen::prefill_plan_tokens())?;
+                Some(std::sync::Arc::from(plan))
+            })
+            .clone()
     }
 
     /// The block pass on the GPU: the final-normed rows and their (soft-capped) logits, all
@@ -2958,7 +2987,7 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         let h = self.model.hidden_size();
         let mut last = Vec::new();
         let mut start = 0;
-        for c in tokens.chunks(chunk.max(1)) {
+        for c in tokens.chunks(self.model.prefill_chunk(chunk).max(1)) {
             let end = start + c.len();
             let local: Vec<(usize, &[f32])> = overrides
                 .iter()

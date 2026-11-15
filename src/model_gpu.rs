@@ -490,15 +490,21 @@ impl<'a> Model<'a> {
 
     /// The GPU prefill plan (see `Backend::decode_plan_prefill`), compiled on first use; None
     /// when unavailable.
-    fn gpu_prefill_plan(&self) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
+    ///
+    /// The plan copies out the residual after each of `cap` (layer indices, sorted): the
+    /// features a speculative draft reads ([`crate::dspark::Target::forward_feats`]).
+    fn gpu_prefill_plan(&self, cap: &[usize]) -> Option<std::sync::Arc<dyn crate::gpu::decode::DecodePlan>> {
         if !self.gpu_decode_on() {
             return None;
         }
         let tokens = crate::qwen::prefill_plan_tokens();
-        self.gpu_plans.get((1 << 61) | tokens as u64, || {
+        let key = cap.iter().fold((1u64 << 61) | tokens as u64, |k, &l| {
+            k.wrapping_mul(0x100000001b3).wrapping_add(l as u64 + 1)
+        });
+        self.gpu_plans.get(key, || {
             let be = crate::gpu::active()?;
             let plan = self
-                .gpu_graph_mode(None, Some(&[]), true)
+                .gpu_graph_mode(None, Some(cap), true)
                 .and_then(|g| be.decode_plan_prefill(&g, tokens));
             if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
                 eprintln!("[gpu prefill plan: {}]", if plan.is_some() { "built" } else { "none" });
@@ -511,17 +517,23 @@ impl<'a> Model<'a> {
     /// activations on the device for the whole pass): the final-normed hidden states, as the
     /// host path gives them (up to rounding). None (nothing changed) when unavailable; a failure
     /// past the first chunk finishes the pass on the host path.
-    pub(super) fn gpu_prefill(&self, sess: &mut Session, tokens: &[u32]) -> Option<Vec<f32>> {
+    ///
+    /// With `cap` (layer indices, sorted), `captured` receives the residual after each of them,
+    /// `[t, cap.len(), hidden]`.
+    pub(super) fn gpu_prefill(&self, sess: &mut Session, tokens: &[u32], cap: &[usize], captured: &mut Vec<f32>) -> Option<Vec<f32>> {
         let t = tokens.len();
         if sess.iv.active() || !sess.capture.is_empty() || self.stream.is_some() || self.cfg.bidirectional() {
             return None;
         }
-        let plan = self.gpu_prefill_plan()?;
+        let plan = self.gpu_prefill_plan(cap)?;
         let n = plan.tokens();
         let cfg = &self.cfg;
         let h = cfg.hidden_size;
         let pw = cfg.num_hidden_layers * cfg.hidden_size_per_layer_input;
+        let nc = cap.len();
         let mut hidden = vec![0f32; t * h];
+        captured.clear();
+        captured.resize(t * nc * h, 0.0);
         let mut c = 0;
         while c < t {
             let m = n.min(t - c);
@@ -562,7 +574,7 @@ impl<'a> Model<'a> {
                         hidden: &mut hidden[c * h..(c + m) * h],
                         logits: None,
                         params: None,
-                        capture: None,
+                        capture: (nc > 0).then(|| &mut captured[c * nc * h..(c + m) * nc * h]),
                         scratch: false,
                         states_kept: false,
                     },
@@ -578,7 +590,17 @@ impl<'a> Model<'a> {
             return None;
         }
         if c < t {
+            sess.capture = cap.to_vec();
+            sess.captured.clear();
             let hs = self.forward_hidden_cpu(sess, &tokens[c..], &[]);
+            sess.capture.clear();
+            for (ci, &l) in cap.iter().enumerate() {
+                let rows = &sess.captured.iter().find(|r| r.0 == l).expect("captured layer").1;
+                for (j, row) in rows.chunks(h).enumerate() {
+                    captured[((c + j) * nc + ci) * h..((c + j) * nc + ci + 1) * h].copy_from_slice(row);
+                }
+            }
+            sess.captured.clear();
             hidden.truncate(c * h);
             hidden.extend_from_slice(&hs);
         }

@@ -5449,8 +5449,13 @@ impl DecodePlan for MetalPlan<'_> {
                 }
             }
             if let (Some(c), Some((off, n))) = (s.capture, self.capture) {
-                for j in 0..t {
-                    std::ptr::copy_nonoverlapping(base.add(off + j * self.strides[4]) as *const f32, c[j * n..].as_mut_ptr(), n);
+                if self.strides[4] == n * 4 {
+                    // Contiguous rows (prefill captures: up to hundreds of MB), in parallel.
+                    super::par_copy(c.as_mut_ptr(), base.add(off) as *const f32, t * n);
+                } else {
+                    for j in 0..t {
+                        std::ptr::copy_nonoverlapping(base.add(off + j * self.strides[4]) as *const f32, c[j * n..].as_mut_ptr(), n);
+                    }
                 }
             }
         }
