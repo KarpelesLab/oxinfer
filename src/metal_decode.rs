@@ -664,8 +664,11 @@ const PF_SMALL_TILES: usize = 160;
 /// Command buffers of a prefill pass (without MoE layers): each layer's new keys and values are
 /// copied to the host caches once the part that wrote them has completed.
 const PF_PARTS: usize = 8;
-/// Prefill GEMMs: a last partial 128-row tile of at most this many rows takes 32-row tiles.
+/// Prefill GEMMs: a last partial 128- or 64-row tile of at most this many rows takes 32-row
+/// tiles.
 const PF_REM_ROWS: usize = 64;
+/// Rows of the prefill GEMMs' middle tiles (`MOp::Gemm::pipes[2]`).
+const PF_TM_M: usize = 64;
 /// Multi-token plans: bytes of QSA block score rows (see `MOp::QsaScore`).
 const QSA_SCORE_BYTES: usize = 32 << 20;
 
@@ -1240,9 +1243,10 @@ enum MOp {
         n: u32,
     },
     /// Prefill plans: `y = W x` on the matrix units from the scratch half rows, into rows `ldy`
-    /// floats apart (0: `n_out`). Pipelines and outputs per threadgroup for 128- and 32-row tiles.
+    /// floats apart (0: `n_out`). Pipelines and outputs per threadgroup for 128-, 32- and 64-row
+    /// tiles.
     Gemm {
-        pipes: [(Id, usize); 2],
+        pipes: [(Id, usize); 3],
         data: Id,
         scales: Id,
         w_off: u32,
@@ -1728,13 +1732,14 @@ impl MetalBackend {
                         let affine = mw.offsets.is_some();
                         let pd = self.mma_pipe(w, affine, n_out, n_in, super::Tile::Dense)?;
                         let ps = self.mma_pipe(w, affine, n_out, n_in, super::Tile::Small)?;
+                        let pm = self.mma_pipe(w, affine, n_out, n_in, super::Tile::Mid)?;
                         let (_, elem_bytes, scale_bytes) = super::format_index(w);
                         let s_off = match w {
                             WeightRef::Gguf(m) => super::gguf_s_off(m, mw),
                             _ => mw.scales.as_ref().map(|s| s.offset_bytes / scale_bytes).unwrap_or(0),
                         };
                         Some(MOp::Gemm {
-                            pipes: [pd, ps],
+                            pipes: [pd, ps, pm],
                             data: mw.data.id,
                             scales: mw.scales.as_ref().map(|s| s.id).unwrap_or(mw.data.id),
                             w_off: (mw.data.offset_bytes / elem_bytes) as u32,
@@ -3934,15 +3939,20 @@ impl MetalPlan<'_> {
                 y,
                 ldy,
             } => {
-                // Few 128-row tiles (narrow outputs): 32-row ones keep more of the GPU busy.
-                let small = tile == 0 && (n_out / pipes[0].1) * (rows / tm) < PF_SMALL_TILES;
-                let (tile, tm) = if small { (1, super::MMA_TM_S) } else { (tile, tm) };
+                // Few 128-row tiles (narrow outputs): 64-row ones, or 32-row ones if those are
+                // still few, keep more of the GPU busy.
+                let few = |tm: usize| (n_out / pipes[0].1) * t.next_multiple_of(tm) / tm < PF_SMALL_TILES;
+                let (tile, tm) = match tile {
+                    0 if !few(tm) => (0, tm),
+                    0 if !few(PF_TM_M) => (2, PF_TM_M),
+                    _ => (1, super::MMA_TM_S),
+                };
                 // Whole tiles, and a short remainder in 32-row tiles rather than one mostly
                 // padded tile (513 tokens: 544 rows instead of 640); disjoint rows, one pass.
-                let full = if tile == 0 && !t.is_multiple_of(tm) && t % tm <= PF_REM_ROWS {
+                let full = if tile != 1 && !t.is_multiple_of(tm) && t % tm <= PF_REM_ROWS {
                     t / tm * tm
                 } else {
-                    rows
+                    t.next_multiple_of(tm)
                 };
                 let grids = [(tile, 0, full / tm), (1, full, (t - t.min(full)).div_ceil(super::MMA_TM_S))];
                 for (tile, start, n) in grids {

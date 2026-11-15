@@ -880,8 +880,9 @@ inline void mma_bf_tile(device const bfloat* w, device const half* xh, device co
     if (ldy != 0) scale_store_ld(c, rs, t0, y, ldy, o0);
     else scale_store(c, rs, t0, Y.slice(o0, t0));
 }
-// Dense: 128-token tiles, and 32-token tiles (`_s`) for short inputs. (MAKE expands to text with
-// commas, so it is only ever used directly in a body, never forwarded to another macro.)
+// Dense: 128-token tiles, 32-token tiles (`_s`) for short inputs and 64-token ones (`_m`) for
+// narrow outputs (prefill plans). (MAKE expands to text with commas, so it is only ever used
+// directly in a body, never forwarded to another macro.)
 #define MMA_SIG(NAME) \
 kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[buffer(1)]], device const half* xh [[buffer(2)]], \
                  device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], \
@@ -890,7 +891,9 @@ kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[bu
 MMA_SIG(NAME) { threadgroup half Ws[64 * MKB]; \
     WT w = MAKE; mma_tile<WT, 128>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * 128, tid, Ws, p._p0); } \
 MMA_SIG(NAME##_s) { threadgroup half Ws[64 * MKB]; \
-    WT w = MAKE; mma_tile<WT, 32>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * 32, tid, Ws, p._p0); }
+    WT w = MAKE; mma_tile<WT, 32>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * 32, tid, Ws, p._p0); } \
+MMA_SIG(NAME##_m) { threadgroup half Ws[64 * MKB]; \
+    WT w = MAKE; mma_tile<WT, 64>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * 64, tid, Ws, p._p0); }
 // Grouped: per-expert weight addresses, and one tile per threadgroup row. Each format comes with
 // tiles of GTM rows (NAME), 128 rows (NAME_l: the bulk of an expert's rows when it has many, the
 // weights dequantized once for 4x the rows) and 16 rows (NAME_s: an odd remainder, half the
@@ -919,12 +922,13 @@ kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[bu
     threadgroup half Ws[64 * MKB]; \
     Q4A w = { MK_Q4, ob + op.o_off, op.gpr, op.gk }; \
     mma_tile<Q4A, TM>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * TM, tid, Ws, p._p0); }
-MMA_Q4A(mma_q4a, 128) MMA_Q4A(mma_q4a_s, 32)
+MMA_Q4A(mma_q4a, 128) MMA_Q4A(mma_q4a_s, 32) MMA_Q4A(mma_q4a_m, 64)
 #define MMA_BF(NAME, TN, TM) \
 kernel void NAME(device const ushort* qb [[buffer(0)]], device const half* xh [[buffer(2)]], device float* y [[buffer(3)]], \
                  constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]]) { \
     mma_bf_tile<TM, TN>((device const bfloat*)(qb + p.w_off), xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * TN, p._p1 + tg.y * TM, p._p0); }
 MMA_BF(mma_bf64, 64, 128) MMA_BF(mma_bf128, 128, 128) MMA_BF(mma_bf64_s, 64, 32) MMA_BF(mma_bf128_s, 128, 32)
+MMA_BF(mma_bf64_m, 64, 64) MMA_BF(mma_bf128_m, 128, 64)
 #define MMAG_BF(NAME, TM) \
 kernel void NAME(device const EP* ep [[buffer(0)]], device const GT* tiles [[buffer(1)]], device const half* xh [[buffer(2)]], \
                  device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], \
@@ -1187,6 +1191,10 @@ pub(crate) fn group_tiles(count: &[usize]) -> (Vec<[u32; 4]>, [usize; 3], Vec<us
     (cls.concat(), n, start, rows)
 }
 
+fn find_kind(v: &[(GgmlType, Id)], k: GgmlType) -> Option<Id> {
+    v.iter().find(|(t, _)| *t == k).map(|(_, p)| *p)
+}
+
 /// Whether the device kernels take `m`: anything but FP8, or FP8 with the 128 x 128 block scales
 /// the shaders assume.
 fn fp8_ok(m: &crate::ggml::GgufMatrix) -> bool {
@@ -1291,11 +1299,12 @@ const MMA_GTM: usize = 32;
 /// K step of the matrix-unit GEMMs (`n_in` must be a multiple).
 const MMA_KB: usize = 64;
 
-/// Which matrix-unit GEMM: dense with 128- or 32-token tiles, or grouped (MoE).
+/// Which matrix-unit GEMM: dense with 128-, 32- or 64-token tiles, or grouped (MoE).
 #[derive(Clone, Copy, PartialEq)]
 enum Tile {
     Dense,
     Small,
+    Mid,
     Grouped,
 }
 
@@ -2348,7 +2357,23 @@ impl MetalBackend {
         if !n_in.is_multiple_of(MMA_KB) || !n_out.is_multiple_of(64) {
             return None;
         }
-        let find = |v: &[(GgmlType, Id)], k: GgmlType| v.iter().find(|(t, _)| *t == k).map(|(_, p)| *p);
+        if tile == Tile::Mid {
+            // Built on first use: the 128-token kernel's name with `_m`.
+            let (base, tn) = match w {
+                WeightRef::Bf16(_) if n_out.is_multiple_of(128) => ("mma_bf128".to_string(), 128),
+                WeightRef::Bf16(_) => ("mma_bf64".to_string(), 64),
+                WeightRef::Q8(_) => ("mma_q8".to_string(), 64),
+                WeightRef::Q4(_) if affine => ("mma_q4a".to_string(), 64),
+                WeightRef::Q4(_) => ("mma_q4".to_string(), 64),
+                WeightRef::Gguf(g) if !fp8_ok(g) => return None,
+                WeightRef::Gguf(g) => {
+                    find_kind(&m.gguf, g.kind)?;
+                    (format!("mma_{}", g.kind.name()), 64)
+                }
+            };
+            return Some((self.named_pipeline(&format!("{base}_m"))?, tn));
+        }
+        let find = find_kind;
         let small = tile == Tile::Small;
         let pick = |big: Id, s: Id| if small { s } else { big };
         Some(match (w, tile) {
