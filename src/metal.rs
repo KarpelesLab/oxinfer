@@ -3542,7 +3542,9 @@ mod tests {
     }
 
     /// Timing of `Backend::moe` at Qwen3.8-Flash-Next's shapes (512 experts, Q4_K gate / up,
-    /// Q5_1 down, top 10): `cargo test --release --lib moe_bench -- --ignored --nocapture`.
+    /// Q5_1 down, top 10): `cargo test --release --lib moe_bench -- --ignored --nocapture`, or
+    /// `OXINFER_MOE_SHAPE=experts,hidden,inter,k,GATE_TYPE,DOWN_TYPE[,gelu]` (Gemma 4 26B-A4B:
+    /// `128,2816,704,8,Q4_0,Q4_0,gelu`).
     /// Routes are uniform at random, or with `OXINFER_MOE_ROUTES=FILE` the median layer of each
     /// size recorded by a prefill-plan run with `OXINFER_PF_ROUTES=FILE` (real routing is far from
     /// uniform: at 2048 tokens the busiest expert takes about half of them).
@@ -3550,7 +3552,21 @@ mod tests {
     #[ignore]
     fn moe_bench() {
         let Some(be) = backend() else { return };
-        let (ne, h, mi, k) = (512usize, 2560usize, 640usize, 10usize);
+        let shape = std::env::var("OXINFER_MOE_SHAPE").unwrap_or("512,2560,640,10,Q4_K,Q5_1".into());
+        let f: Vec<&str> = shape.split(',').collect();
+        let (ne, h, mi, k): (usize, usize, usize, usize) = (
+            f[0].parse().unwrap(),
+            f[1].parse().unwrap(),
+            f[2].parse().unwrap(),
+            f[3].parse().unwrap(),
+        );
+        let kind = |n: &str| GgmlType::ALL.into_iter().find(|t| t.name() == n).unwrap();
+        let (gk, dk) = (kind(f[4]), kind(f[5]));
+        let act = if f.get(6) == Some(&"gelu") {
+            crate::gpu::MoeAct::GeluTanh
+        } else {
+            crate::gpu::MoeAct::Silu
+        };
         let mut seed = 11;
         // Random blocks with sane f16 scales (bytes 0..4 of each block, Q4_K; 0..4 Q5_1).
         let make = |kind: GgmlType, n_out: usize, n_in: usize, seed: &mut u64| {
@@ -3566,9 +3582,9 @@ mod tests {
             }
             q
         };
-        let g = make(GgmlType::Q4_K, mi, h, &mut seed);
-        let u = make(GgmlType::Q4_K, mi, h, &mut seed);
-        let d = make(GgmlType::Q5_1, h, mi, &mut seed);
+        let g = make(gk, mi, h, &mut seed);
+        let u = make(gk, mi, h, &mut seed);
+        let d = make(dk, h, mi, &mut seed);
         let mats = |q: &crate::quant::PageVec<u8>, kind: GgmlType, n_out: usize, n_in: usize| -> Vec<crate::ggml::GgufMatrix> {
             let sz = n_out * kind.row_bytes(n_in);
             (0..ne)
@@ -3581,15 +3597,11 @@ mod tests {
                 })
                 .collect()
         };
-        let (gm, um, dm) = (
-            mats(&g, GgmlType::Q4_K, mi, h),
-            mats(&u, GgmlType::Q4_K, mi, h),
-            mats(&d, GgmlType::Q5_1, h, mi),
-        );
+        let (gm, um, dm) = (mats(&g, gk, mi, h), mats(&u, gk, mi, h), mats(&d, dk, h, mi));
         let gw: Vec<WeightRef> = gm.iter().map(WeightRef::Gguf).collect();
         let uw: Vec<WeightRef> = um.iter().map(WeightRef::Gguf).collect();
         let dw: Vec<WeightRef> = dm.iter().map(WeightRef::Gguf).collect();
-        let dev = be.upload_moe(&gw, Some(&uw), &dw, h, mi, crate::gpu::MoeAct::Silu).unwrap();
+        let dev = be.upload_moe(&gw, Some(&uw), &dw, h, mi, act).unwrap();
         // Recorded layers: (tokens, rows per expert).
         let recorded: Option<Vec<(usize, Vec<usize>)>> = std::env::var_os("OXINFER_MOE_ROUTES").map(|p| {
             let b = std::fs::read(p).unwrap();

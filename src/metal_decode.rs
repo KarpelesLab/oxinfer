@@ -6427,7 +6427,10 @@ mod tests {
             })
             .collect();
         let ts: Vec<usize> = env("OXINFER_GB_T", "512,2048").split(',').map(|v| v.parse().unwrap()).collect();
-        let pipes: Vec<(String, usize, usize, bool, usize, bool)> = env("OXINFER_GB_PIPES", "mma:128")
+        // name:tm:tn:s(wap):threads:f(ile):splits (K split in parts, part sums apart); a name
+        // with % is the kernel name with the type there, else name_TYPE.
+        type Pipe = (String, usize, usize, bool, usize, bool, usize);
+        let pipes: Vec<Pipe> = env("OXINFER_GB_PIPES", "mma:128")
             .split(',')
             .map(|v| {
                 let mut it = v.split(':');
@@ -6436,7 +6439,8 @@ mod tests {
                 let tn = it.next().map_or(64, |x| x.parse().unwrap());
                 let swap = it.next() == Some("s");
                 let threads = it.next().filter(|x| !x.is_empty()).map_or(128, |x| x.parse().unwrap());
-                (n, tm, tn, swap, threads, it.next() == Some("f"))
+                let file = it.next() == Some("f");
+                (n, tm, tn, swap, threads, file, it.next().map_or(1, |x| x.parse().unwrap()))
             })
             .collect();
         let mut seed = 7u64;
@@ -6492,7 +6496,7 @@ mod tests {
                 let mut rs = PageVec::<f32>::zeroed(rows_max.next_multiple_of(1024));
                 rs.iter_mut().for_each(|v| *v = 1.0 / 8192.0);
                 let ys: Vec<PageVec<f32>> = (0..2)
-                    .map(|_| PageVec::<f32>::zeroed((rows_max * n_out).next_multiple_of(1024)))
+                    .map(|_| PageVec::<f32>::zeroed((4 * rows_max * n_out).next_multiple_of(1024)))
                     .collect();
                 let xb = be.wrap(xh.as_ptr() as *const u8, xh.len() * 2).unwrap();
                 let rb = be.wrap(rs.as_ptr() as *const u8, rs.len() * 4).unwrap();
@@ -6504,13 +6508,18 @@ mod tests {
                     let mut errs = vec![String::new(); pipes.len()];
                     let mut warm = true;
                     for _round in 0..6 {
-                        for (pi, (name, tm, tn, swap, threads, from_file)) in pipes.iter().enumerate() {
+                        for (pi, (name, tm, tn, swap, threads, from_file, splits)) in pipes.iter().enumerate() {
                             let src = if *from_file { &real } else { &anon };
                             if src.is_empty() {
                                 continue;
                             }
                             let rows = t.next_multiple_of(*tm);
-                            let Some(pipe) = be.named_pipeline(&format!("{name}_{kind}")) else {
+                            let pname = if name.contains('%') {
+                                name.replace('%', kind)
+                            } else {
+                                format!("{name}_{kind}")
+                            };
+                            let Some(pipe) = be.named_pipeline(&pname) else {
                                 continue;
                             };
                             let enc = |e: &FastEnc, c: usize, y: usize| {
@@ -6527,15 +6536,15 @@ mod tests {
                                         w_off: 0,
                                         s_off: rbytes as u32,
                                         rows: rows as u32,
-                                        _p: [0; 3],
+                                        _p: [0, 0, if *splits > 1 { *splits as u32 } else { 0 }],
                                     },
                                     4,
                                 );
                                 e.buf(rb.id, rb.offset_bytes, 5);
                                 if *swap {
-                                    e.dispatch((rows / tm, n_out / tn), *threads);
+                                    e.dispatch((rows / tm * splits, n_out / tn), *threads);
                                 } else {
-                                    e.dispatch((n_out / tn, rows / tm), *threads);
+                                    e.dispatch((n_out / tn, rows / tm * splits), *threads);
                                 }
                             };
                             let reps = 2 * copies;
@@ -6552,9 +6561,11 @@ mod tests {
                                 timed(&be, |e| enc(e, 0, 0));
                             } else if errs[pi].is_empty() {
                                 timed(&be, |e| enc(e, 0, 1));
-                                let (a, b) = (&ys[0][..t * n_out], &ys[1][..t * n_out]);
+                                let (a, b) = (&ys[0][..t * n_out], &ys[1][..]);
+                                let rows = t.next_multiple_of(*tm);
                                 let (mut d, mut m) = (0f32, 0f32);
-                                for (x, y) in a.iter().zip(b) {
+                                for (i, x) in a.iter().enumerate() {
+                                    let y: f32 = (0..*splits).map(|s| b[s * rows * n_out + i]).sum();
                                     d = d.max((x - y).abs());
                                     m = m.max(x.abs());
                                 }
@@ -6562,9 +6573,9 @@ mod tests {
                             }
                         }
                     }
-                    for (pi, (name, tm, tn, ..)) in pipes.iter().enumerate() {
+                    for (pi, (name, tm, tn, .., splits)) in pipes.iter().enumerate() {
                         let tf = 2.0 * (n_out * n_in * t) as f64 / best[pi] / 1e12;
-                        let _ = write!(line, " {name}/{tm}x{tn}: {tf:5.1}{}", errs[pi].trim_end());
+                        let _ = write!(line, " {name}/{tm}x{tn}/{splits}: {tf:5.1}{}", errs[pi].trim_end());
                     }
                     println!("{line}");
                 }
