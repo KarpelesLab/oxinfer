@@ -730,7 +730,11 @@ pub const CATALOG: &[Model] = &[
     Model::new("MiniMaxAI/MiniMax-H3-Image", Kind::Image, 63.0, 127.2, &[TextToImage])
         .note("with MiniMax-H3's Qwen3-VL text encoder; 2048x2048 and up"),
     Model::new("MiniMaxAI/MiniMax-H3", Kind::Video, 67.4, 140.1, &[TextToVideo, ImageToVideo])
-        .note("transformer/, text_encoder/ and vae/ of the 498 GB repository; 24 fps, 5 to 15 s; no audio track; on the CPU"),
+        .note(
+            "transformer/, text_encoder/ and vae/ of the 498 GB repository; 24 fps, 5 to 15 s; no audio track; on the CPU; \
+             Comfy-Org/MiniMax-H3's single files, the turbo LoRAs and a GGUF text encoder load too (48 GB, 4 or 8 \
+             forwards; not run on the real files: docs/video.md)",
+        ),
 ];
 
 /// Fixed CPU cost per layer and decoded token, in milliseconds, on top of streaming the weights.
