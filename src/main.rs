@@ -378,14 +378,17 @@ fn usage() -> ! {
          \x20 --resolution N       Qwen-Image-Layered: 640 (default) or 1024\n\
          \x20 --quant q8|q4        transformer and text encoder precision; --mmap, --stream as above\n\
          \n\
-         MiniMax-H3 (MiniMaxAI/MiniMax-H3): text to video, first / last frame to video (-o, --size,\n\
-         --seed as above; see docs/video.md):\n\
+         MiniMax-H3 (MiniMaxAI/MiniMax-H3, or a single-file transformer of Comfy-Org/MiniMax-H3 with\n\
+         --vae): text to video, first / last frame to video (-o, --size, --seed as above; see\n\
+         docs/video.md):\n\
          \x20 --frames N           frames at 24 fps, rounded up to 17 n + 5 (default 124: 5.2 s)\n\
          \x20 --steps N            points of the sigma grid: N - 1 forwards (default 50; a turbo\n\
          \x20                      LoRA: the steps in its name plus one)\n\
          \x20 --lora FILE[:SCALE]  a LoRA on the transformer (the 4 / 8-step turbo LoRAs)\n\
          \x20 --shift F, --audio-shift F   sigma shifts (default 12 and 3; a turbo LoRA: 6 for its\n\
          \x20                      768p files)\n\
+         \x20 --transformer FILE, --vae DIR   a part from another place (the transformer as one of\n\
+         \x20                      ComfyUI's single files)\n\
          \x20 --init-image FILE    the first frame; --last-image FILE the last frame\n\
          \x20 -o FILE              .avi (Motion JPEG and the 32 kHz stereo soundtrack as PCM), .webp\n\
          \x20                      (animated, lossless, slow) or .png (a PNG sequence FILE_0000.png\n\

@@ -24,7 +24,8 @@
 //! another order is redistributed by rows ([`Dit::lora_parts`]). The release's own layout
 //! (`qkv_proj` interleaved per head) has the names of ComfyUI's, so a `qkv_proj` module is always
 //! read as ComfyUI's. A key that is not a low-rank pair or a module that matches no layer is an
-//! error.
+//! error. Modules on the AdaLN projections (`minimax_h3_fl2v_turbo_8step_v1.2`) need the
+//! unpruned transformer: a "pruned" checkpoint has no `[.., time_dim]` projection to update.
 
 use super::dit::{Dit, LayerId};
 use crate::flux::lora::tensor_f32;
@@ -195,6 +196,11 @@ pub fn apply(dit: &mut Dit, specs: &[LoraSpec]) -> Result<Vec<String>> {
                 }
                 let l_in = dit.layer_mut(id).n_in;
                 if n_in != l_in {
+                    if module.ends_with("adaln_proj.linear") && dit.is_curve() {
+                        bail!(
+                            "LoRA {file}: module {key} updates an AdaLN projection, which this \"pruned\" transformer stores in curve form; use the unpruned transformer"
+                        );
+                    }
                     bail!("LoRA {file}: module {key} (down {ds:?}) does not fit its layer of {l_in} inputs; is it made for another model?");
                 }
                 // The rank components that reach this layer (a fused q / k / v pair is block

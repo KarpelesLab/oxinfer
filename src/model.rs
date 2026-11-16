@@ -395,6 +395,40 @@ pub(crate) fn fp8_matrix(files: &ModelFiles, full: &str, n_out: usize, n_in: usi
     GgufMatrix::fp8(unsafe { crate::quant::QBuf::borrowed(data) }, scales, n_out, n_in, block)
 }
 
+/// An FP8 E4M3 weight `wn` (`<module>.weight`, `[n_out, n_in]`) of a "scaled" checkpoint, used as
+/// stored: the bytes borrowed from the file, times `<module>.scale_weight` (ComfyUI) or
+/// `<module>.weight_scale` (lightx2v, and ComfyUI's `comfy_quant` files), a scalar or one value
+/// per output row; no scale tensor means 1.
+pub(crate) fn fp8_scaled<'a>(files: &'a ModelFiles, wn: &str, n_out: usize, n_in: usize) -> Result<Lin<'a>> {
+    let info = files.info(wn).with_context(|| format!("missing tensor {wn}"))?;
+    if info.shape != [n_out, n_in] {
+        bail!("tensor {wn} has shape {:?}, expected [{n_out}, {n_in}]", info.shape);
+    }
+    let base = wn.strip_suffix(".weight").unwrap_or(wn);
+    let sname = [format!("{base}.scale_weight"), format!("{base}.weight_scale")]
+        .into_iter()
+        .find(|n| files.has(n));
+    let (scales, block) = match &sname {
+        Some(n) => {
+            let v = files.f32(n)?;
+            match v.len() {
+                1 => (v, (n_out, n_in)),
+                l if l == n_out => (v, (1, n_in)),
+                l => bail!("{n}: {l} scales for a [{n_out}, {n_in}] weight (expected 1 or {n_out})"),
+            }
+        }
+        None => (vec![1.0], (n_out, n_in)),
+    };
+    let mut sp = crate::quant::PageVec::<f32>::zeroed(scales.len());
+    sp.copy_from_slice(&scales);
+    files.note_use(wn, true, false);
+    let data = files.bytes(wn)?;
+    // SAFETY: the weight borrows `files` for 'a, which outlives every model holding it.
+    let m = crate::ggml::GgufMatrix::fp8(unsafe { crate::quant::QBuf::borrowed(data) }, sp.into(), n_out, n_in, block)
+        .with_context(|| format!("tensor {wn}"))?;
+    Ok(Lin::gguf(m))
+}
+
 /// Whether `full` is a compressed-tensors MXFP4 weight (`mxfp4-pack-quantized`, the routed experts
 /// of Kimi K3): `.weight_packed` with one E8M0 scale byte per 32 values (`.weight_scale`, U8) and
 /// no tensor-wide scale.

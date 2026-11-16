@@ -45,8 +45,29 @@ const AUDIO_CHANNELS: usize = 2;
 const PIXEL_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const PIXEL_STD: [f32; 3] = [0.229, 0.224, 0.225];
 
-/// Whether `dir` is a MiniMax-H3 release in diffusers' layout (`MiniMaxH3ModularPipeline`).
+/// Whether `path` is a single-file MiniMax-H3 transformer (ComfyUI's
+/// `diffusion_models/minimax_h3_*.safetensors`: the release's tensor names, with the audio stream).
+pub fn is_h3_transformer_file(path: &Path) -> bool {
+    if !path.is_file() || path.extension().is_none_or(|e| e != "safetensors") {
+        return false;
+    }
+    crate::safetensors::SafeTensors::open(path, false).is_ok_and(|st| {
+        [
+            "video_patch_proj.weight",
+            "audio_patch_proj.weight",
+            "blocks.0.attn.qkv_proj.weight",
+        ]
+        .iter()
+        .all(|n| st.info(n).is_some())
+    })
+}
+
+/// Whether `dir` is a MiniMax-H3 release in diffusers' layout (`MiniMaxH3ModularPipeline`), or a
+/// single-file transformer ([`is_h3_transformer_file`]).
 pub fn is_h3_video(dir: &Path) -> bool {
+    if dir.is_file() {
+        return is_h3_transformer_file(dir);
+    }
     let Ok(b) = crate::fsx::read(&dir.join("model_index.json")) else {
         return false;
     };
@@ -389,6 +410,31 @@ pub struct Conditioning {
     pub tags: Vec<u8>,
 }
 
+/// Where the parts of a [`VideoPipeline`] come from.
+#[derive(Default)]
+pub struct Sources {
+    /// A release folder in diffusers' layout: its `transformer/`, `vae/`, `tokenizer/` and the two
+    /// schedulers' shifts. None: every part is given below, the shifts are 12 and 3.
+    pub dir: Option<PathBuf>,
+    /// The transformer instead of `dir/transformer`: a folder, or a single file in ComfyUI's
+    /// layout (bf16, "pruned", FP8 scaled: see [`super::dit`]).
+    pub transformer: Option<PathBuf>,
+    /// The video VAE's folder instead of `dir/vae`.
+    pub vae: Option<PathBuf>,
+    /// The Qwen3-VL-32B text encoder's folder.
+    pub text_encoder: PathBuf,
+}
+
+/// The tensors of a checkpoint folder or of a single safetensors file, mapped.
+fn open_part(path: &Path) -> Result<&'static ModelFiles> {
+    let files = if path.is_file() {
+        ModelFiles::open_file(path, false)
+    } else {
+        ModelFiles::open(path, false)
+    };
+    Ok(Box::leak(Box::new(files.with_context(|| path.display().to_string())?)))
+}
+
 pub struct VideoPipeline {
     pub dir: PathBuf,
     pub text_encoder_dir: PathBuf,
@@ -397,6 +443,8 @@ pub struct VideoPipeline {
     vae_files: &'static ModelFiles,
     /// The audio VAE's decoder, when the folder has `audio_vae/`.
     pub audio_vae: Option<AudioDecoder>,
+    /// The VAE's folder (the encoder reads its configuration).
+    vae_dir: PathBuf,
     /// The sigma shifts of the video and audio schedules.
     pub shifts: (f32, f32),
 }
@@ -457,47 +505,77 @@ impl VideoPipeline {
     /// mapped) and the audio VAE's decoder when `audio_vae/` is there; the text encoder from
     /// `text_encoder` when it is used.
     pub fn load(dir: &Path, text_encoder: &Path) -> Result<Self> {
-        let tdir = dir.join("transformer");
-        let dit_files: &'static ModelFiles = Box::leak(Box::new(ModelFiles::open(&tdir, false)?));
-        let dit = Dit::load(DitConfig::load(&tdir)?, dit_files, None)?;
-        if !dit.has_audio() {
-            bail!("{}: the transformer has no audio stream (not MiniMax-H3)", tdir.display());
-        }
-        let vdir = dir.join("vae");
-        let vae_files: &'static ModelFiles = Box::leak(Box::new(ModelFiles::open(&vdir, false)?));
-        let vae = VaeDecoder::load(VaeConfig::load(&vdir)?, vae_files)?;
-        if vae.cfg.axes != 3 {
-            bail!("{}: not a video VAE", vdir.display());
-        }
-        let adir = dir.join("audio_vae");
-        let audio_vae = if adir.join("config.json").exists() {
-            let a = AudioDecoder::load(&adir).with_context(|| format!("audio VAE in {}", adir.display()))?;
-            if a.cfg.latent_channels != dit.cfg.audio_channels {
-                bail!(
-                    "{}: {} latent channels, the transformer's audio rows have {}",
-                    adir.display(),
-                    a.cfg.latent_channels,
-                    dit.cfg.audio_channels
-                );
-            }
-            Some(a)
-        } else {
-            None
+        let src = Sources {
+            dir: Some(dir.to_path_buf()),
+            text_encoder: text_encoder.to_path_buf(),
+            ..Default::default()
         };
-        Ok(Self {
-            dir: dir.to_path_buf(),
-            text_encoder_dir: text_encoder.to_path_buf(),
-            dit,
-            vae,
-            vae_files,
-            audio_vae,
-            shifts: (shift_of(&dir.join("scheduler"), 12.0), shift_of(&dir.join("audio_scheduler"), 3.0)),
-        })
+        Self::load_from(&src)
     }
 
     /// Applies LoRA files to the transformer ([`super::lora`]); returns one report line per file.
     pub fn apply_loras(&mut self, specs: &[super::lora::LoraSpec]) -> Result<Vec<String>> {
         super::lora::apply(&mut self.dit, specs)
+    }
+
+    /// Loads the DiT and the video VAE from `src` (mapped, in their stored formats).
+    pub fn load_from(src: &Sources) -> Result<Self> {
+        let part = |given: &Option<PathBuf>, sub: &str| -> Result<PathBuf> {
+            match (given, &src.dir) {
+                (Some(p), _) => Ok(p.clone()),
+                (None, Some(d)) => Ok(d.join(sub)),
+                (None, None) => bail!("MiniMax-H3: no {sub} given (a single-file transformer needs the VAE named too)"),
+            }
+        };
+        let tpath = part(&src.transformer, "transformer")?;
+        let dit_files = open_part(&tpath)?;
+        let cfg = if tpath.is_file() {
+            DitConfig::from_files(dit_files)
+                .with_context(|| format!("{}: not a MiniMax-H3 transformer in ComfyUI's layout", tpath.display()))?
+        } else {
+            DitConfig::load(&tpath)?
+        };
+        let dit = Dit::load(cfg, dit_files, None)?;
+        if !dit.has_audio() {
+            bail!("{}: the transformer has no audio stream (not MiniMax-H3)", tpath.display());
+        }
+        let vpath = part(&src.vae, "vae")?;
+        let vae_files = open_part(&vpath)?;
+        let vae = VaeDecoder::load(VaeConfig::load(&vpath)?, vae_files)?;
+        if vae.cfg.axes != 3 {
+            bail!("{}: not a video VAE", vpath.display());
+        }
+        // The audio VAE comes with a release folder; without one the video has no soundtrack.
+        let audio_vae = match src.dir.as_ref().map(|d| d.join("audio_vae")) {
+            Some(adir) if adir.join("config.json").exists() => {
+                let a = AudioDecoder::load(&adir).with_context(|| format!("audio VAE in {}", adir.display()))?;
+                if a.cfg.latent_channels != dit.cfg.audio_channels {
+                    bail!(
+                        "{}: {} latent channels, the transformer's audio rows have {}",
+                        adir.display(),
+                        a.cfg.latent_channels,
+                        dit.cfg.audio_channels
+                    );
+                }
+                Some(a)
+            }
+            _ => None,
+        };
+        let shift = |sub: &str, default: f32| src.dir.as_ref().map_or(default, |d| shift_of(&d.join(sub), default));
+        Ok(Self {
+            dir: src
+                .dir
+                .clone()
+                .or_else(|| src.text_encoder.parent().map(Path::to_path_buf))
+                .unwrap_or_default(),
+            text_encoder_dir: src.text_encoder.clone(),
+            dit,
+            vae,
+            vae_files,
+            vae_dir: vpath,
+            audio_vae,
+            shifts: (shift("scheduler", 12.0), shift("audio_scheduler", 3.0)),
+        })
     }
 
     /// The canvas `(height, width)`, the aligned frame count and the latent geometry of `p`.
@@ -584,7 +662,7 @@ impl VideoPipeline {
 
     /// The video encoder (loaded on demand: only keyframes need it).
     pub fn encoder(&self) -> Result<VideoEncoder> {
-        VideoEncoder::load(&self.dir.join("vae"), &self.vae.cfg, self.vae_files)
+        VideoEncoder::load(&self.vae_dir, &self.vae.cfg, self.vae_files)
     }
 
     /// Decodes video rows (generated rows only) into RGB8 frames.

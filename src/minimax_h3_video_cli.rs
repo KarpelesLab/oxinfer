@@ -9,8 +9,11 @@
 //! the AVI, interleaved frame by frame; animated WebP has no audio and a PNG sequence is only
 //! frames, so both get a sibling `NAME.wav`.
 //!
-//! `--lora FILE[:SCALE]` applies LoRA files to the transformer; a turbo LoRA sets the step count
-//! and the shifts its name stands for (`--steps`, `--shift`, `--audio-shift` override them).
+//! `--model` is the release folder in diffusers' layout, or a single-file transformer in ComfyUI's
+//! layout (`Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors`) with
+//! `--vae DIR`; `--transformer` and `--vae` replace a part of a folder too.
+//! `--lora FILE[:SCALE]` applies LoRA files; a turbo LoRA sets the step count and the shifts its
+//! name stands for (`--steps`, `--shift`, `--audio-shift` override them).
 //!
 //! `OXINFER_H3_PROMPT_EMBEDS=FILE` keeps the text encoder's output of a text-only prompt in FILE
 //! (written when missing, read when present), so the 63 GB text encoder and the 66 GB transformer
@@ -19,7 +22,7 @@
 
 use crate::Args;
 use anyhow::{Context, Result, bail};
-use oxinfer::minimax_h3::video::{Conditioning, FPS, Video, VideoParams, VideoPipeline};
+use oxinfer::minimax_h3::video::{Conditioning, FPS, Sources, Video, VideoParams, VideoPipeline};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -39,9 +42,22 @@ fn load_image(path: &Path) -> Result<oxinfer::sd::Image> {
     bail!("built without the `media` feature: {} cannot be decoded", path.display())
 }
 
+/// A part given as a local path, `org/name/path/in/repo.safetensors` (or `.gguf`), or a
+/// repository id.
+fn resolve_part(spec: &str, args: &Args) -> Result<PathBuf> {
+    let p = Path::new(spec);
+    if p.exists() {
+        return Ok(p.to_path_buf());
+    }
+    if spec.ends_with(".safetensors") || spec.ends_with(".gguf") {
+        return oxinfer::engine::resolve_file(spec, args.cache_dir.as_deref());
+    }
+    oxinfer::engine::resolve_model(spec, args.cache_dir.as_deref())
+}
+
 /// Whether the transformer's weights are on disk (not only its configuration).
 fn has_dit(dir: &Path) -> bool {
-    if dir.join("diffusion_pytorch_model.safetensors").exists() {
+    if dir.is_file() || dir.join("diffusion_pytorch_model.safetensors").exists() {
         return true;
     }
     std::fs::read(dir.join("diffusion_pytorch_model.safetensors.index.json"))
@@ -279,11 +295,31 @@ pub fn run(args: &Args) -> Result<()> {
     if cache.is_some() && (p.first.is_some() || p.last.is_some()) {
         bail!("OXINFER_H3_PROMPT_EMBEDS holds a text-only prompt: unset it with keyframes");
     }
-    let have_dit = has_dit(&args.model.join("transformer"));
+    // The parts: a release folder, or a single-file transformer with the VAE named beside it.
+    let single = args.model.is_file();
+    let mut src = Sources {
+        dir: (!single).then(|| args.model.clone()),
+        transformer: match (&args.transformer, single) {
+            (Some(t), _) => Some(resolve_part(&t.to_string_lossy(), args)?),
+            (None, true) => Some(args.model.clone()),
+            (None, false) => None,
+        },
+        vae: args.flux.vae.as_deref().map(|v| resolve_part(v, args)).transpose()?,
+        ..Default::default()
+    };
+    if single && src.vae.is_none() {
+        bail!(
+            "{} is a single-file transformer: name the video VAE's folder (diffusers' layout) with --vae",
+            args.model.display()
+        );
+    }
+    let text_encoder = || crate::minimax_h3_cli::text_encoder(&args.model);
+    let tpath = src.transformer.clone().unwrap_or_else(|| args.model.join("transformer"));
+    let have_dit = has_dit(&tpath);
     let cond = match &cache {
         Some(f) if f.exists() => Some(read_embeds(f)?),
         Some(f) => {
-            let te = crate::minimax_h3_cli::text_encoder(&args.model)?;
+            let te = text_encoder()?;
             let c = oxinfer::minimax_h3::video::encode_prompt(&args.model, &te, &prompt, &[])?;
             write_embeds(f, &c)?;
             eprintln!(
@@ -303,15 +339,11 @@ pub fn run(args: &Args) -> Result<()> {
         }
         None => None,
     };
-    let te = if cond.is_some() {
-        PathBuf::new()
-    } else {
-        crate::minimax_h3_cli::text_encoder(&args.model)?
-    };
+    src.text_encoder = if cond.is_some() { PathBuf::new() } else { text_encoder()? };
     let t1 = Instant::now();
-    let mut pipe = VideoPipeline::load(&args.model, &te)?;
+    let mut pipe = VideoPipeline::load_from(&src)?;
     if pipe.audio_vae.is_none() {
-        eprintln!("[no audio_vae/ in {}: the video will have no soundtrack]", args.model.display());
+        eprintln!("[no audio_vae/ beside the model: the video will have no soundtrack]");
     }
     for line in pipe.apply_loras(&args.loras)? {
         eprintln!("{line}");

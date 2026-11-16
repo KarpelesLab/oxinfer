@@ -20,7 +20,22 @@
 //!
 //! Loads the release's layout (`blocks.N.attn.qkv_proj` interleaved per head as `[q k v]`,
 //! `mlp.fc1` as `[gate; value]`, `final_layer.*`) as stored, or diffusers' (`transformer_blocks.N`,
-//! `to_q` / `to_k` / `to_v`, `ff.net.0.proj` as `[value; gate]`).
+//! `to_q` / `to_k` / `to_v`, `ff.net.0.proj` as `[value; gate]`), or ComfyUI's single files
+//! ([`DitConfig::from_files`]): the release's tensor names with `qkv_proj` as `[q; k; v]`
+//! (`comfy/ldm/minimax/model.py`: `self.qkv_proj(x).split(heads * head_dim, dim=-1)`; the same
+//! 535 names as the release, so only where the file comes from tells the two apart), and
+//!
+//! - "pruned" files, which drop the time embedder and the `[6 H * 3, time_dim]` AdaLN weights (26
+//!   of the 66 GB) for their curve form (`adaln_curve_grid` in `comfy/model_detection.py`,
+//!   `MiniMaxH3Model._time_embedding`): `adaln_t_table` `[grid, k]` holds the coordinates of
+//!   `silu(time_embedder(t))` at `t = i / (grid - 1)` in a basis of `k` directions (1025 x 8 in
+//!   the release: the curve's principal components, its mean folded into the biases), a timestep
+//!   reads it by linear interpolation, and each `adaln_proj.linear` is `[.., k]` (float16, used
+//!   in float32) applied to those coordinates without the SiLU;
+//! - FP8 "scaled" weights (`float8_e4m3fn` times the scalar `<module>.weight_scale`, ComfyUI's
+//!   `QUANTIZATION.md`), used as stored. `input_scale` (a calibrated activation scale for
+//!   ComfyUI's FP8 kernels) and `comfy_quant` are not read: the product runs in float32 on the
+//!   decoded weights, ComfyUI's `full_precision_matrix_mult`.
 
 use crate::kernels::*;
 use crate::model::{Lin, Quant, linear, load_lin};
@@ -55,6 +70,9 @@ pub struct DitConfig {
     pub norm_eps: f32,
     pub qk_eps: f32,
     pub final_eps: f32,
+    /// `qkv_proj` rows are `[q; k; v]` (ComfyUI's single files) instead of `[q k v]` per head
+    /// (the release). Diffusers' layout has three matrices and ignores it.
+    pub qkv_stacked: bool,
 }
 
 impl DitConfig {
@@ -96,6 +114,69 @@ impl DitConfig {
             norm_eps: f(&["norm_eps"], 1e-5) as f32,
             qk_eps: f(&["qk_norm_eps"], 1e-5) as f32,
             final_eps: f(&["final_norm_eps"], 1e-5) as f32,
+            qkv_stacked: false,
+        })
+    }
+
+    /// The configuration of a ComfyUI single-file checkpoint, from its tensor shapes
+    /// (`comfy/model_detection.py`, the MiniMax H3 branch) and, where the file has one, the
+    /// `config` entry of its header (`{"transformer": {...}}` with the release's keys).
+    pub fn from_files(files: &ModelFiles) -> Result<Self> {
+        let dim = |n: &str, i: usize| -> Result<usize> {
+            files
+                .info(n)
+                .with_context(|| format!("missing tensor {n}"))?
+                .shape
+                .get(i)
+                .copied()
+                .with_context(|| format!("tensor {n} has no dimension {i}"))
+        };
+        let count = |prefix: &str| (0..).take_while(|i| files.has(&format!("{prefix}{i}.norm1.weight"))).count();
+        let meta: serde_json::Value = files
+            .metadata("config")
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+            .and_then(|v| v.get("transformer").cloned())
+            .unwrap_or(serde_json::Value::Null);
+        if meta.get("pdd_steps").and_then(|v| v.as_u64()).unwrap_or(1) > 1 {
+            bail!("a checkpoint with stacked PDD output heads (MiniMax-H3-Image) is not read from a single file");
+        }
+        let eps = |k: &str| meta.get(k).and_then(|v| v.as_f64()).unwrap_or(1e-5) as f32;
+        let head_dim = dim("blocks.0.attn.q_norm.weight", 0)?;
+        // The curve form has no time embedder: the AdaLN projections read `k` coordinates.
+        let (freq_dim, time_hidden, time_dim) = if files.has("adaln_t_table") {
+            (0, 0, dim("adaln_t_table", 1)?)
+        } else {
+            (
+                dim("time_embedder.proj_in.weight", 1)?,
+                dim("time_embedder.proj_in.weight", 0)?,
+                dim("time_embedder.proj_out.weight", 0)?,
+            )
+        };
+        let patch = [1, 2, 2];
+        Ok(Self {
+            hidden: dim("video_patch_proj.weight", 0)?,
+            layers: count("blocks."),
+            refiner_layers: count("token_refiner.blocks."),
+            heads: dim("blocks.0.attn.qkv_proj.weight", 0)? / (3 * head_dim),
+            head_dim,
+            ffn: dim("blocks.0.mlp.fc1.weight", 0)? / 2,
+            in_channels: dim("final_layer.video_out.weight", 0)? / patch.iter().product::<usize>(),
+            audio_channels: if files.has("audio_patch_proj.weight") {
+                dim("final_layer.audio_out.weight", 0)?
+            } else {
+                0
+            },
+            patch,
+            text_dim: dim("condition_proj.weight", 1)?,
+            freq_dim,
+            time_hidden,
+            time_dim,
+            rope_freq_dim: dim("rope.inv_freq", 0)?,
+            rope_theta: 10000.0,
+            norm_eps: eps("norm_eps"),
+            qk_eps: eps("qk_norm_eps"),
+            final_eps: eps("final_norm_eps"),
+            qkv_stacked: true,
         })
     }
     pub fn inner(&self) -> usize {
@@ -107,7 +188,8 @@ impl DitConfig {
 }
 
 /// A linear layer with an optional bias, float32 weights kept in float32 (the release keeps its
-/// patch, timestep and output layers so), others bf16 (or as stored).
+/// patch, timestep and output layers so), float16 ones in float16 (ComfyUI's fp16 VAE and curve
+/// AdaLN projections), FP8 "scaled" ones as stored, others bf16 (or as stored).
 pub(crate) struct DLin<'a> {
     pub(crate) w: Lin<'a>,
     pub(crate) b: Option<Vec<f32>>,
@@ -119,10 +201,14 @@ impl<'a> DLin<'a> {
     pub(crate) fn load(files: &'a ModelFiles, name: &str, n_out: usize, n_in: usize, bias: bool) -> Result<Self> {
         let wn = format!("{name}.weight");
         let info = files.info(&wn).with_context(|| format!("missing tensor {wn}"))?;
-        let w = if info.dtype == "F32" {
-            f32_lin(&files.f32(&wn)?, n_out, n_in)?
-        } else {
-            load_lin(files, &wn, n_out, n_in, Quant::Bf16)?
+        let w = match info.dtype.as_str() {
+            "F32" => f32_lin(&files.f32(&wn)?, n_out, n_in)?,
+            "F16" if info.shape == [n_out, n_in] => {
+                Lin::from_gguf(crate::ggml::GgmlType::F16, files.bytes(&wn)?, n_out, n_in).with_context(|| format!("tensor {wn}"))?
+            }
+            // ComfyUI's scalar `weight_scale` (DeepSeek-style block scales go through `load_lin`).
+            "F8_E4M3" if !files.has(&format!("{name}.weight_scale_inv")) => crate::model::fp8_scaled(files, &wn, n_out, n_in)?,
+            _ => load_lin(files, &wn, n_out, n_in, Quant::Bf16)?,
         };
         let b = if bias {
             let b = files.f32(&format!("{name}.bias"))?;
@@ -175,6 +261,8 @@ enum Qkv<'a> {
     Split(Box<[DLin<'a>; 3]>),
     /// One projection whose rows are `[q k v]` per head (the release's `qkv_proj`).
     Interleaved(Box<DLin<'a>>),
+    /// One projection whose rows are `[q; k; v]` (ComfyUI's `qkv_proj`).
+    Stacked(Box<DLin<'a>>),
 }
 
 struct Attn<'a> {
@@ -205,8 +293,10 @@ pub struct Dit<'a> {
     pub cfg: DitConfig,
     proj_in: DLin<'a>,
     context: DLin<'a>,
-    time1: DLin<'a>,
-    time2: DLin<'a>,
+    /// The time embedder's two layers; none in the curve form.
+    time: Option<(DLin<'a>, DLin<'a>)>,
+    /// The curve form's `adaln_t_table` (`[grid, time_dim]`, see the module docs).
+    curve: Option<Vec<f32>>,
     refiner: Vec<Block<'a>>,
     refiner_norm: Vec<f32>,
     blocks: Vec<Block<'a>>,
@@ -254,7 +344,10 @@ impl<'a> Dit<'a> {
                 Block {
                     norm1: norm(&format!("{p}norm1.weight"), h)?,
                     attn: Attn {
-                        qkv: Qkv::Interleaved(Box::new(DLin::load(files, &format!("{p}attn.qkv_proj"), 3 * inner, h, false)?)),
+                        qkv: {
+                            let w = Box::new(DLin::load(files, &format!("{p}attn.qkv_proj"), 3 * inner, h, false)?);
+                            if cfg.qkv_stacked { Qkv::Stacked(w) } else { Qkv::Interleaved(w) }
+                        },
                         norm_q: norm(&format!("{p}attn.q_norm.weight"), hd)?,
                         norm_k: norm(&format!("{p}attn.k_norm.weight"), hd)?,
                         out: DLin::load(files, &format!("{p}attn.out_proj"), h, inner, false)?,
@@ -335,29 +428,53 @@ impl<'a> Dit<'a> {
             None
         };
         let rd = cfg.rope_freq_dim;
-        let inv_freq = (0..rd)
+        let inv_freq: Vec<f32> = (0..rd)
             .map(|i| (1.0 / cfg.rope_theta.powf((2 * i) as f64 / (2 * rd) as f64)) as f32)
             .collect();
         if 6 * rd > hd {
             bail!("DiT heads of {hd} are too narrow for the 3-axis RoPE");
         }
+        // ComfyUI's files store the frequencies: they must be the ones computed here.
+        if files.has("rope.inv_freq") {
+            let stored = files.f32("rope.inv_freq")?;
+            if stored.len() != rd || stored.iter().zip(&inv_freq).any(|(a, b)| (a - b).abs() > 1e-5 * b.abs()) {
+                bail!("rope.inv_freq is not 1 / {} ^ (i / {rd})", cfg.rope_theta);
+            }
+        }
+        let curve = if files.has("adaln_t_table") {
+            let t = files.f32("adaln_t_table")?;
+            if t.len() < 2 * td || !t.len().is_multiple_of(td) {
+                bail!("adaln_t_table: {} values for rows of {td}", t.len());
+            }
+            Some(t)
+        } else {
+            None
+        };
+        let time = if curve.is_some() {
+            None
+        } else {
+            Some((
+                DLin::load(
+                    files,
+                    &n("time_embedder.proj_in", "time_embedder.linear_1"),
+                    cfg.time_hidden,
+                    cfg.freq_dim,
+                    true,
+                )?,
+                DLin::load(
+                    files,
+                    &n("time_embedder.proj_out", "time_embedder.linear_2"),
+                    td,
+                    cfg.time_hidden,
+                    true,
+                )?,
+            ))
+        };
         Ok(Self {
             proj_in: DLin::load(files, &n("video_patch_proj", "proj_in"), h, pd, true)?,
             context: DLin::load(files, &n("condition_proj", "context_embedder"), h, cfg.text_dim, true)?,
-            time1: DLin::load(
-                files,
-                &n("time_embedder.proj_in", "time_embedder.linear_1"),
-                cfg.time_hidden,
-                cfg.freq_dim,
-                true,
-            )?,
-            time2: DLin::load(
-                files,
-                &n("time_embedder.proj_out", "time_embedder.linear_2"),
-                td,
-                cfg.time_hidden,
-                true,
-            )?,
+            time,
+            curve,
             refiner,
             refiner_norm: norm("token_refiner.final_norm.weight", h)?,
             blocks,
@@ -387,12 +504,33 @@ impl<'a> Dit<'a> {
         x
     }
 
-    /// The timestep embedding (`[time_dim]`) of a `t` in `[0, 1]`.
+    /// The timestep embedding (`[time_dim]`) of a `t` in `[0, 1]`; in the curve form the row of
+    /// `adaln_t_table` at `t` (linear interpolation, `t` clamped to `[0, 1]`).
     pub fn time_embed(&self, t: f32) -> Vec<f32> {
+        if let Some(table) = &self.curve {
+            let td = self.cfg.time_dim;
+            let grid = table.len() / td;
+            let pos = t.clamp(0.0, 1.0) * (grid - 1) as f32;
+            let i0 = (pos.floor() as usize).min(grid - 2);
+            let w = pos - i0 as f32;
+            let (a, b) = (&table[i0 * td..(i0 + 1) * td], &table[(i0 + 1) * td..(i0 + 2) * td]);
+            return a.iter().zip(b).map(|(&x, &y)| x + w * (y - x)).collect();
+        }
+        let (time1, time2) = self.time.as_ref().expect("a DiT has a time embedder or a curve");
         let e = crate::sd::ops::timestep_embedding(t, self.cfg.freq_dim, true, 0.0);
-        let mut a = self.time1.forward(&e, 1);
+        let mut a = time1.forward(&e, 1);
         a.iter_mut().for_each(|v| *v = crate::sd::ops::silu(*v));
-        self.time2.forward(&a, 1)
+        time2.forward(&a, 1)
+    }
+
+    /// What the AdaLN projections read of timestep embeddings ([`Dit::time_embed`]): their SiLU,
+    /// or the curve form's coordinates as they are.
+    fn time_act(&self, temb: &[f32]) -> Vec<f32> {
+        if self.curve.is_some() {
+            temb.to_vec()
+        } else {
+            temb.iter().map(|&v| crate::sd::ops::silu(v)).collect()
+        }
     }
 
     /// RoPE `cos` / `sin` (`3 * rope_freq_dim` each) of every row.
@@ -437,6 +575,17 @@ impl<'a> Dit<'a> {
                         k[d..d + hd].copy_from_slice(&f[s + hd..s + 2 * hd]);
                         v[d..d + hd].copy_from_slice(&f[s + 2 * hd..s + 3 * hd]);
                     }
+                }
+                (q, k, v)
+            }
+            Qkv::Stacked(w) => {
+                let f = w.forward(&hn, n);
+                let (mut q, mut k, mut v) = (vec![0f32; n * inner], vec![0f32; n * inner], vec![0f32; n * inner]);
+                for r in 0..n {
+                    let s = r * 3 * inner;
+                    q[r * inner..(r + 1) * inner].copy_from_slice(&f[s..s + inner]);
+                    k[r * inner..(r + 1) * inner].copy_from_slice(&f[s + inner..s + 2 * inner]);
+                    v[r * inner..(r + 1) * inner].copy_from_slice(&f[s + 2 * inner..s + 3 * inner]);
                 }
                 (q, k, v)
             }
@@ -531,11 +680,8 @@ impl<'a> Dit<'a> {
         let mut x = vec![0f32; n * h];
         x[..n_text * h].copy_from_slice(text_embedded);
         x[n_text * h..].copy_from_slice(&self.proj_in.forward(p.image, n_img));
-        let st: Vec<f32> = p
-            .timesteps
-            .iter()
-            .flat_map(|&t| self.time_embed(t).into_iter().map(crate::sd::ops::silu))
-            .collect();
+        let temb: Vec<f32> = p.timesteps.iter().flat_map(|&t| self.time_embed(t)).collect();
+        let st = self.time_act(&temb);
         self.stack(&mut x, &st, p.timestep_index, p.tags, p.positions);
         // Output norm with the per-timestep shift / scale, then the head over the latent rows.
         let rows: Vec<usize> = (n_text..n).collect();
@@ -577,7 +723,7 @@ impl<'a> Dit<'a> {
                 x[i * h..(i + 1) * h].copy_from_slice(&src[r * h..(r + 1) * h]);
             }
         }
-        let st: Vec<f32> = p.temb.iter().map(|&v| crate::sd::ops::silu(v)).collect();
+        let st = self.time_act(p.temb);
         self.stack(&mut x, &st, p.timestep_index, p.tags, p.positions);
         let v = self.heads_out[0].forward(&self.norm_out_rows(&x, p.video_index, &st, p.timestep_index), nv);
         let a = aout.forward(&self.norm_out_rows(&x, p.audio_index, &st, p.timestep_index), na);
@@ -669,6 +815,7 @@ impl<'a> Dit<'a> {
         let id = |slot: u8| LayerId { refiner, block, slot };
         Some(match tail {
             "attn.qkv_proj" => match &b.attn.qkv {
+                Qkv::Stacked(_) => vec![(id(0), (0..3 * inner).collect())],
                 // Row `(head * 3 + j) * hd + i` of the release's matrix is row `i` of head `head`
                 // of q, k or v (`j`).
                 Qkv::Interleaved(_) => {
@@ -694,11 +841,16 @@ impl<'a> Dit<'a> {
         let b = &mut if id.refiner { &mut self.refiner } else { &mut self.blocks }[id.block];
         match (id.slot, &mut b.attn.qkv) {
             (0..=2, Qkv::Split(w)) => &mut w[id.slot as usize],
-            (0..=2, Qkv::Interleaved(w)) => w,
+            (0..=2, Qkv::Interleaved(w) | Qkv::Stacked(w)) => w,
             (3, _) => &mut b.attn.out,
             (4, _) => &mut b.ff.fc1,
             (5, _) => &mut b.ff.fc2,
             _ => b.adaln.as_mut().expect("the AdaLN projection of a LayerId"),
         }
+    }
+
+    /// Whether the AdaLN projections are in the curve form of ComfyUI's "pruned" files.
+    pub fn is_curve(&self) -> bool {
+        self.curve.is_some()
     }
 }
