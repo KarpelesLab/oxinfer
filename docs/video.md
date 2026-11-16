@@ -2,9 +2,9 @@
 
 `MiniMaxAI/MiniMax-H3` generates video with a stereo soundtrack from text (`t2va`), from a first
 and / or last frame (`fl2va`) or from reference images, videos and audio (`ref2va`). oxinfer runs
-the first two, video only: `src/minimax_h3/video.rs` follows diffusers' modular `minimax_h3`
-pipeline (`MiniMaxH3ModularPipeline`), with the DiT and the ViT VAE decoder it shares with
-[MiniMax-H3-Image](models.md).
+the first two: `src/minimax_h3/video.rs` follows diffusers' modular `minimax_h3` pipeline
+(`MiniMaxH3ModularPipeline`), with the DiT and the ViT VAE decoder it shares with
+[MiniMax-H3-Image](models.md), and `src/minimax_h3/audio_vae.rs` decodes the soundtrack.
 
 ```sh
 # text to video: 124 frames (5.2 s at 24 fps) at 1344x768, 49 forwards
@@ -19,10 +19,11 @@ pipeline (`MiniMaxH3ModularPipeline`), with the DiT and the ViT VAE decoder it s
 ```
 
 `--model` is a folder in the repository's diffusers layout: `model_index.json`, `transformer/`,
-`vae/`, `text_encoder/` (or `OXINFER_H3_TEXT_ENCODER`), `tokenizer/`, and the two
-`scheduler*/scheduler_config.json` (140 GB of the repository's 498 GB:
-`hf download MiniMaxAI/MiniMax-H3 --include model_index.json "transformer/*" "vae/*" "text_encoder/*" "tokenizer/*" "scheduler/*" "audio_scheduler/*"`).
-Passing the repository id itself has not been tried.
+`vae/`, `audio_vae/`, `text_encoder/` (or `OXINFER_H3_TEXT_ENCODER`), `tokenizer/`, and the two
+`scheduler*/scheduler_config.json` (141 GB of the repository's 498 GB:
+`hf download MiniMaxAI/MiniMax-H3 --include model_index.json "transformer/*" "vae/*" "audio_vae/*" "text_encoder/*" "tokenizer/*" "scheduler/*" "audio_scheduler/*"`).
+Without `audio_vae/` (0.6 GB) the soundtrack is skipped and a message says so. Passing the
+repository id itself has not been tried.
 
 | flag | |
 |---|---|
@@ -31,13 +32,18 @@ Passing the repository id itself has not been tried.
 | `--steps N` | points of the sigma grid, as diffusers' `num_inference_steps`: `N - 1` forwards (default 50) |
 | `--seed N` | noise seed (oxinfer's generator: not torch's, so a seed does not reproduce a diffusers video) |
 | `--init-image F`, `--last-image F` | the first / last frame |
-| `-o FILE` | `.avi`: Motion JPEG in AVI; `.webp`: animated WebP (lossless only, about 3 s per 320x288 frame to encode); anything else: a PNG sequence `FILE_0000.png`, ... |
+| `-o FILE` | `.avi`: Motion JPEG and the soundtrack in AVI; `.webp`: animated WebP (lossless only, about 3 s per 320x288 frame to encode) and `FILE.wav`; anything else: a PNG sequence `FILE_0000.png`, ... and `FILE.wav` |
 
 There is no pure-Rust H.264, VP9 or AV1 encoder in the oxideav crates oxinfer uses (the H.264
 crate decodes only), so no `.mp4` / `.webm` is written: Motion JPEG in AVI plays in ffmpeg-based
 players and converts with `ffmpeg -i fox.avi fox.mp4`. Without the `media` feature only the PNG
-sequence is available. **No audio track is written**: the audio latents are denoised with the video
-(the model is trained on the joint sequence) and then dropped, the audio VAE is not implemented.
+sequence is available.
+
+The soundtrack is stereo at 32 kHz, 800 samples per audio latent (a 124-frame request: 207
+latents, 5.175 s for 5.167 s of frames; nothing is trimmed). In an `.avi` it is a second stream
+of 16-bit PCM, one chunk after each frame (`ffmpeg -i fox.avi fox.mp4` keeps it). Animated WebP
+has no audio and a PNG sequence is only frames: both get a 16-bit stereo WAV next to them, named
+as the output without its extension (`-o fox.webp` and `-o fox.png` both write `fox.wav`).
 
 `OXINFER_H3_PROMPT_EMBEDS=FILE` keeps the text encoder's output of a text-only prompt in FILE
 (written when missing, read when present; the run stops after writing it when the transformer's
@@ -51,7 +57,7 @@ together.
 | transformer (`t2va`, `fl2va`) | `transformer/` | 66.3 GB, 33.1B parameters, bf16 (patch, timestep and output layers float32) | 50 blocks, width 5376, 56 heads of 128, SwiGLU 14336, text width 5120; about 13B of the parameters are the AdaLN projections (`6 x 5376 x 3` outputs per block from a 2688-wide timestep embedding) |
 | transformer (`ref2va`) | `transformer_ref/` | 66.3 GB | same architecture, other weights; not used |
 | video VAE | `vae/` | 10.4 GB, float32 | `f16t4d24`: a causal 3D CNN encoder (128 to 1024 channels, 16x in space, 4x in time, 24 latent channels) and a 36-layer ViT decoder (width 2048, 32 heads, 3-axis RoPE) that emits a 4x16x16 pixel block per latent voxel |
-| audio VAE | `audio_vae/` | 0.6 GB | 32 kHz, 40 latents of 32 channels per second and channel (DAC encoder, BigVGAN decoder); not implemented |
+| audio VAE | `audio_vae/` | 0.6 GB, float32 | mono, 32 kHz, 40 latents of 32 channels per second; a stereo soundtrack is two latent sequences. Decoder (0.26 GB of the file): a 1x1 convolution to 2048 channels and BigVGAN, seven transposed convolutions (x5, x5, x2 five times; 1024 to 8 channels) each followed by three AMP blocks with anti-aliased SnakeBeta activations, clamped to [-1, 1]. The encoder (a DAC waveform encoder and a causal attention projection) is not implemented: only `ref2va`'s reference audio goes through it |
 | text encoder | `text_encoder/` | 63.4 GB, bf16 | Qwen3-VL-32B (64 layers, width 5120); `hidden_states[50]` conditions the transformer |
 | schedulers | `scheduler/`, `audio_scheduler/` | | rectified flow, shift 12 (video) and 3 (audio) |
 
@@ -72,7 +78,10 @@ What a request does (`video.rs` has the details):
 - video and audio rows step down their own schedules in one forward; keyframe rows (the VAE
   encoder's sampled posterior, rounded through float16) are noised to `t = 0.999` and held there;
 - the video rows go through the VAE decoder: clips of 7 latent frames in 256-pixel tiles
-  overlapping by 64, consecutive clips cross-faded over 5 frames.
+  overlapping by 64, consecutive clips cross-faded over 5 frames;
+- the audio rows are split into their two channels, de-normalized (`latents * latents_std +
+  latents_mean`, 32 values each in the VAE's config) and decoded one channel at a time, whole (no
+  windows: 15 s take 3.2 s on the CPU).
 
 Against MiniMax-H3-Image, which oxinfer already ran: the same block stack, AdaLN table, RoPE and
 text path; the video model adds `audio_proj_in` / `audio_proj_out` and rows of three modalities at
@@ -94,6 +103,29 @@ fixed sigmas. The VAE decoder is the image decoder with a third rotary axis (`ro
 | DiT velocities of the first step (video / audio rows; derived from the stepped rows) | 8.2e-6 / 2.5e-6 |
 | video / audio rows after the 5-step schedule, keyframe rows held | 7.2e-7 / 4.8e-7 |
 
+The audio VAE's decoder has its own pair, `tools/minimax_h3_audio_tiny.py` and
+`examples/h3_audio_check.rs`: stereo audio rows as the DiT emits them, through diffusers'
+unpacking, de-normalization and `AutoencoderKLMiniMaxH3Audio.decode`, against
+`AudioDecoder::decode_rows` (float32, CPU):
+
+| | max abs diff | reference RMS | SNR |
+|---|---|---|---|
+| tiny random checkpoint (stages x5, x2, x2 with kernels 9, 4, 4), 37 latents per channel | 8.6e-8 | 0.038 | 124 dB |
+| real `audio_vae/`, the encoder's latents of a synthetic stereo signal, 207 latents (5.2 s) | 8.8e-6 | 0.27 | 121 dB |
+| real `audio_vae/`, seeded normal rows, 207 latents (5.2 s; 4.0% of the samples at the clamp) | 4.7e-5 | 0.52 | 103 dB |
+| real `audio_vae/`, seeded normal rows, 603 latents (15.1 s, a 362-frame request) | 5.9e-5 | 0.52 | 104 dB |
+
+The synthetic signal (left: a 100 Hz to 8 kHz sweep; right: a 220 Hz tone with four harmonics,
+amplitude-modulated at 3 Hz) is encoded by diffusers (the posterior's mode, normalized) to give
+rows in the range the decoder is trained for; diffusers' own decode of them correlates 0.962 /
+0.999 with the signal. The decoder takes 1.2 s for the 5.2 s soundtrack and 3.2 s for the 15.1 s
+one (64 cores). Normal rows are what the DiT starts from, not what it ends on: they decode to
+loud noise, which exercises the clamp.
+
+The AVI's audio stream is checked by a unit test that demuxes it with oxideav-avi (every frame
+and every PCM byte comes back); ffprobe reads the same file as `mjpeg` + `pcm_s16le`, 32 kHz,
+2 channels.
+
 On the real weights (CPU, 64 cores, 125 GB RAM):
 
 - the video VAE against diffusers in float32, a synthetic 22-frame 320x256 clip: encoder moments
@@ -106,7 +138,8 @@ On the real weights (CPU, 64 cores, 125 GB RAM):
   (the fox turns its head towards the camera and its breath appears). 22 frames is below the 5 s
   the release is trained for, and nothing larger or longer was run: the cost per forward grows at
   least linearly with the rows, and a default 1344x768, 124-frame request has 44 times as many.
-  Running diffusers' pipeline on the 66 GB transformer for a comparison was not attempted.
+  Running diffusers' pipeline on the 66 GB transformer for a comparison was not attempted. That
+  run predates the audio decoder: its audio latents were dropped.
 
 Not checked or not done:
 
@@ -114,9 +147,16 @@ Not checked or not done:
 - the prompt path with keyframes (label and vision block through `QwenVl`) ran only on a tiny
   random Qwen3-VL, without a numeric comparison; keyframes are resized with oxinfer's Lanczos, not
   compared with PIL's; the posterior and all noise come from oxinfer's generator;
-- `ref2va` (`transformer_ref/`), audio output, LoRAs (the 4 / 8-step turbo LoRAs, Pika H3 Flex,
-  character swap), the original `FL2VA/` layout's video VAE, GPU execution (the 66 GB transformer
-  runs on the CPU from mapped weights).
+- **no generated soundtrack was decoded or listened to**: the audio decoder was checked on its
+  own (above), with latents that did not come from the transformer, and no video run was made
+  with it (the transformer and text encoder were not on disk). Whether the real model's audio
+  rows decode to the sound the prompt describes is untested; so is the audio VAE on anything but
+  the CPU, and the WAV / AVI files were read back by programs, not played;
+- `ref2va` (`transformer_ref/`) and with it the audio VAE's encoder, LoRAs (the 4 / 8-step turbo
+  LoRAs, Pika H3 Flex, character swap), the original `FL2VA/` layout's video and audio VAEs
+  (`FL2VA/audio_vae/model.safetensors` has the same tensor names as `audio_vae/`, but its
+  `config.yaml` / `metadata.json` are not read), GPU execution (the 66 GB transformer runs on the
+  CPU from mapped weights).
 
 ## Smaller variants (not supported)
 
