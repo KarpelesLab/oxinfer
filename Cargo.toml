@@ -196,6 +196,16 @@ lto = "fat"
 codegen-units = 1
 debug = 1
 
+# CI's test builds (`cargo test --profile ci`): the release optimization level, so the tests run
+# the kernels at their real speed, without the whole-program LTO. `cargo test` links the library
+# into every test binary, binary and example (about fifty), and a fat-LTO link of each no longer
+# fits the hosted runners' memory.
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = 0
+
 [lints.rust]
 # `fullrust` (libc-free static Linux, not in the `unix` family) is the target_os of the toolchain
 # the static release binary is built with; declared so that stock toolchains do not warn.

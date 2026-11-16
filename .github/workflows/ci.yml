@@ -21,6 +21,9 @@ jobs:
   test:
     name: Test & lint (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # A cold build and the tests take well under an hour; a job that hangs stops here, not at
+    # the six-hour default.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -54,12 +57,15 @@ jobs:
           cargo clippy --lib --no-default-features --features oxideav -- -D warnings
           cargo clippy --all-targets -- -D warnings
 
+      # The `ci` profile (Cargo.toml) is `release` without the whole-program LTO, which every one
+      # of the test binaries, binaries and examples would otherwise link with.
       - name: Test (all features)
-        run: cargo test --release --all-features
+        run: cargo test --profile ci --all-features
 
   msrv:
     name: MSRV (rust-version)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       # Keep in step with `rust-version` in Cargo.toml.
@@ -70,6 +76,7 @@ jobs:
   cross:
     name: Cross-check (${{ matrix.target }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -94,6 +101,7 @@ jobs:
   web:
     name: Browser module and site
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
