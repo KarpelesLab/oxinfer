@@ -3,8 +3,14 @@
 //! compares with diffusers' outputs:
 //!
 //! ```text
-//! h3_video_check DIR
+//! h3_video_check DIR [--transformer PATH] [--lora FILE]... [--dit-ref PREFIX] [--vae FILE] [--vae-ref PREFIX]
 //! ```
+//!
+//! `--transformer` / `--vae` take the forms of `tools/minimax_h3_video_comfy.py` (ComfyUI's
+//! single files, "pruned", FP8 scaled, MiniMax's own layout) instead of DIR's diffusers folders,
+//! `--lora` applies LoRA files, and the `--*-ref` prefixes name that tool's references
+//! (`pruned_`, `fp8_`, `lora_`, `fp16_`, ...); with a `--transformer` the VAE part is skipped
+//! unless `--vae` is given too.
 
 use anyhow::{Context, Result};
 use oxinfer::minimax_h3::dit::{Dit, DitConfig};
@@ -33,29 +39,33 @@ fn cmp(name: &str, a: &[f32], b: &[f32]) {
     );
 }
 
-fn main() -> Result<()> {
-    let dir = std::env::args().nth(1).context("usage: h3_video_check DIR")?;
-    let dir = Path::new(&dir);
-    oxinfer::gpu::init(&oxinfer::platform::detect(), oxinfer::platform::DevicePref::Cpu)?;
-    let case: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("case.json"))?)?;
+/// The video VAE (encoder: a clip, a single frame; decoder: one clip, two clips, padded) from
+/// `path` (a diffusers folder or ComfyUI's single file) against the references named `pre`.
+fn check_vae(dir: &Path, case: &serde_json::Value, path: &Path, pre: &str) -> Result<()> {
     let u = |k: &str| case[k].as_u64().unwrap() as usize;
-
-    // Video VAE: encoder (a clip, a single frame), decoder (one clip, two clips, padded).
-    let vdir = dir.join("vae");
-    let vfiles = ModelFiles::open(&vdir, false)?;
-    let vae = VaeDecoder::load(VaeConfig::load(&vdir)?, &vfiles)?;
-    let enc = VideoEncoder::load(&vdir, &vae.cfg, &vfiles)?;
+    let (vfiles, json) = if path.is_file() {
+        let f = ModelFiles::open_file(path, false)?;
+        let j = VaeConfig::comfy_json(&f).context("not ComfyUI's single-file video VAE")??;
+        (f, j)
+    } else {
+        (
+            ModelFiles::open(path, false)?,
+            serde_json::from_slice(&std::fs::read(path.join("config.json"))?)?,
+        )
+    };
+    let vae = VaeDecoder::load(VaeConfig::from_json(&json)?, &vfiles)?;
+    let enc = VideoEncoder::load_json(&json, &vae.cfg, &vfiles)?;
     let (h, w, frames) = (u("h"), u("w"), u("frames"));
     let video = read(&dir.join("video.bin"))?;
     let (m, t, lh, lw) = enc.encode(&video, frames, h, w)?;
     println!("encoded {frames} frames -> [{}, {t}, {lh}, {lw}]", enc.channels);
-    cmp("VAE encode (clip)", &m, &read(&dir.join("moments.bin"))?);
+    cmp("VAE encode (clip)", &m, &read(&dir.join(format!("{pre}moments.bin")))?);
     let plane = h * w;
     let first: Vec<f32> = (0..3)
         .flat_map(|ch| video[ch * frames * plane..ch * frames * plane + plane].to_vec())
         .collect();
     let (m1, _, _, _) = enc.encode(&first, 1, h, w)?;
-    cmp("VAE encode (one frame)", &m1, &read(&dir.join("moments1.bin"))?);
+    cmp("VAE encode (one frame)", &m1, &read(&dir.join(format!("{pre}moments1.bin")))?);
     for (t, nf) in case["decode"].as_object().context("decode cases")? {
         let t: usize = t.parse()?;
         let (px, got) = vae.decode_video(&read(&dir.join(format!("latents_{t}.bin")))?, t, lh, lw)?;
@@ -63,18 +73,56 @@ fn main() -> Result<()> {
         cmp(
             &format!("VAE decode ({t} latent frames -> {got})"),
             &px,
-            &read(&dir.join(format!("decoded_{t}.bin")))?,
+            &read(&dir.join(format!("{pre}decoded_{t}.bin")))?,
         );
+    }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let mut args = std::env::args().skip(1);
+    let dir = args
+        .next()
+        .context("usage: h3_video_check DIR [--transformer PATH] [--lora FILE]... [--dit-ref PREFIX] [--vae FILE] [--vae-ref PREFIX]")?;
+    let dir = Path::new(&dir);
+    let (mut transformer, mut vae_path, mut loras) = (None, None, Vec::new());
+    let (mut dit_ref, mut vae_ref) = (String::new(), String::new());
+    while let Some(a) = args.next() {
+        let v = args.next().with_context(|| format!("{a} needs a value"))?;
+        match a.as_str() {
+            "--transformer" => transformer = Some(std::path::PathBuf::from(v)),
+            "--vae" => vae_path = Some(std::path::PathBuf::from(v)),
+            "--lora" => loras.push(oxinfer::minimax_h3::lora::LoraSpec::parse(&v)?),
+            "--dit-ref" => dit_ref = v,
+            "--vae-ref" => vae_ref = v,
+            _ => anyhow::bail!("unknown option {a}"),
+        }
+    }
+    oxinfer::gpu::init(&oxinfer::platform::detect(), oxinfer::platform::DevicePref::Cpu)?;
+    let case: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("case.json"))?)?;
+    let u = |k: &str| case[k].as_u64().unwrap() as usize;
+    if transformer.is_none() || vae_path.is_some() {
+        check_vae(dir, &case, &vae_path.unwrap_or_else(|| dir.join("vae")), &vae_ref)?;
     }
 
     // DiT: layout, the first step's velocities, the rows after the whole schedule.
-    let tdir = dir.join("transformer");
+    let tdir = transformer.unwrap_or_else(|| dir.join("transformer"));
     if !tdir.exists() {
         // A VAE-only case (the real VAE).
         return Ok(());
     }
-    let files = ModelFiles::open(&tdir, false)?;
-    let dit = Dit::load(DitConfig::load(&tdir)?, &files, None)?;
+    let (files, cfg) = if tdir.is_file() {
+        let f = ModelFiles::open_file(&tdir, false)?;
+        let c = DitConfig::from_files(&f)?;
+        (f, c)
+    } else {
+        (ModelFiles::open(&tdir, false)?, DitConfig::load(&tdir)?)
+    };
+    let mut dit = Dit::load(cfg, &files, None)?;
+    for line in oxinfer::minimax_h3::lora::apply(&mut dit, &loras)? {
+        println!("{line}");
+    }
+    let dit = dit;
     let g = Geometry {
         lt: u("lt"),
         lh: u("lh"),
@@ -113,15 +161,23 @@ fn main() -> Result<()> {
     cmp(
         "DiT video velocity (step 1)",
         &velocity(&video[c0..], &v1[c0..], &sv),
-        &read(&dir.join("dit_v0.bin"))?[c0..],
+        &read(&dir.join(format!("{dit_ref}dit_v0.bin")))?[c0..],
     );
     cmp(
         "DiT audio velocity (step 1)",
         &velocity(&audio, &a1, &sa),
-        &read(&dir.join("dit_a0.bin"))?,
+        &read(&dir.join(format!("{dit_ref}dit_a0.bin")))?,
     );
     let (vf, af) = denoise(&dit, &text, &tags, video, audio, g, &anchors, (&sv, &sa), &mut |_, _| {})?;
-    cmp("video rows after the schedule", &vf, &read(&dir.join("dit_video_final.bin"))?);
-    cmp("audio rows after the schedule", &af, &read(&dir.join("dit_audio_final.bin"))?);
+    cmp(
+        "video rows after the schedule",
+        &vf,
+        &read(&dir.join(format!("{dit_ref}dit_video_final.bin")))?,
+    );
+    cmp(
+        "audio rows after the schedule",
+        &af,
+        &read(&dir.join(format!("{dit_ref}dit_audio_final.bin")))?,
+    );
     Ok(())
 }
