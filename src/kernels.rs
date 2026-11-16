@@ -418,14 +418,19 @@ pub mod simd {
         }
     }
 
-    /// Loads 4 consecutive weights as f32.
+    /// Loads 4 consecutive weights (or one) as f32.
     pub trait LoadW4: Copy {
         unsafe fn load4(p: *const Self) -> float32x4_t;
+        unsafe fn load1(p: *const Self) -> f32;
     }
     impl LoadW4 for u16 {
         #[inline(always)]
         unsafe fn load4(p: *const u16) -> float32x4_t {
             vreinterpretq_f32_u32(vshll_n_u16::<16>(vld1_u16(p)))
+        }
+        #[inline(always)]
+        unsafe fn load1(p: *const u16) -> f32 {
+            super::bf16_to_f32(*p)
         }
     }
     impl LoadW4 for f32 {
@@ -433,11 +438,16 @@ pub mod simd {
         unsafe fn load4(p: *const f32) -> float32x4_t {
             vld1q_f32(p)
         }
+        #[inline(always)]
+        unsafe fn load1(p: *const f32) -> f32 {
+            *p
+        }
     }
 
     /// Prefill GEMM micro-kernel: 8 weight rows (row-major, starting at `w`) times TN=8 tokens
-    /// from a packed panel `xt` ([n_in][8]). Weights are loaded 4 at a time and broadcast by lane;
-    /// accumulators are vectors over tokens. Stores rows `rb..rb+8` for tokens `c0..c0+c_valid`.
+    /// from a packed panel `xt` ([n_in][8]). Weights are loaded 4 at a time and broadcast by lane
+    /// (the last `n_in % 4` one at a time); accumulators are vectors over tokens. Stores rows
+    /// `rb..rb+8` for tokens `c0..c0+c_valid`.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn gemm_8x8<W: LoadW4>(
@@ -453,7 +463,8 @@ pub mod simd {
         let zero = vdupq_n_f32(0.0);
         let mut acc = [[zero; 2]; 8];
         let mut k = 0;
-        while k < n_in {
+        let n4 = n_in / 4 * 4;
+        while k < n4 {
             let xp = xt.add(k * 8);
             let x0a = vld1q_f32(xp);
             let x0b = vld1q_f32(xp.add(4));
@@ -475,6 +486,18 @@ pub mod simd {
                 acc[r][1] = vfmaq_laneq_f32::<3>(acc[r][1], x3b, wq);
             }
             k += 4;
+        }
+        // A width that is not a multiple of 4 (small float-stored matrices): a 4-wide step would
+        // read the next row's weights and the next tile's activations.
+        while k < n_in {
+            let xa = vld1q_f32(xt.add(k * 8));
+            let xb = vld1q_f32(xt.add(k * 8 + 4));
+            for r in 0..8 {
+                let wv = W::load1(w.add(r * n_in + k));
+                acc[r][0] = vfmaq_n_f32(acc[r][0], xa, wv);
+                acc[r][1] = vfmaq_n_f32(acc[r][1], xb, wv);
+            }
+            k += 1;
         }
         let mut tmp = [0f32; 8];
         for r in 0..8 {
@@ -2539,6 +2562,32 @@ mod tests {
             let mut y = vec![0f32; t * n_out];
             matmul_quant_multi(&mut [(&q4, &mut y[..])], &x, t);
             check(&format!("q4 t={t}"), &y, &yr);
+        }
+    }
+
+    /// Float-stored matrices of any width through the prefill GEMM: the 8-row tiles of a width
+    /// that is not a multiple of 4 (NEON takes 4 inputs per step), with the leftover rows and a
+    /// last token tile that is not whole.
+    #[test]
+    fn float_prefill_gemm_takes_any_width() {
+        use crate::ggml::{GgmlType, GgufMatrix};
+        for (n_out, n_in) in [(24usize, 6usize), (19, 5), (16, 7), (8, 1), (27, 34), (16, 64)] {
+            let mut seed = 11u64;
+            let wf: Vec<f32> = (0..n_out * n_in).map(|_| lcg(&mut seed)).collect();
+            let bytes: Vec<u8> = wf.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let m = GgufMatrix::from_bytes(GgmlType::F32, &bytes, n_out, n_in).unwrap();
+            for t in [8usize, 17, 40] {
+                let x: Vec<f32> = (0..t * n_in).map(|_| lcg(&mut seed)).collect();
+                let yr = reference(&wf, n_out, n_in, &x, t);
+                // The f32 tiles themselves (the driver takes the SME ones where there are any).
+                let xt = pack_xt(&x, t, n_in);
+                let mut y = vec![f32::NAN; t * n_out];
+                unsafe { matmul_quant_block_prefill(&m, &x, &xt, t, 0, n_out, y.as_mut_ptr()) };
+                check(&format!("f32 tiles {n_out}x{n_in} t={t}"), &y, &yr);
+                let mut y = vec![f32::NAN; t * n_out];
+                matmul_quant_multi(&mut [(&m, &mut y[..])], &x, t);
+                check(&format!("f32 {n_out}x{n_in} t={t}"), &y, &yr);
+            }
         }
     }
 
