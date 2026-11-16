@@ -4,8 +4,10 @@
 //!
 //! The output follows the extension of `-o`: `.avi` is Motion JPEG in an AVI container and
 //! `.webp` an animated WebP (both through oxideav, the `media` feature: no pure-Rust H.264 / VP9 /
-//! AV1 encoder is available); anything else is a PNG sequence (`NAME_0000.png`, ...). No audio is
-//! written (the audio VAE is not implemented).
+//! AV1 encoder is available); anything else is a PNG sequence (`NAME_0000.png`, ...). The stereo
+//! soundtrack (32 kHz, decoded when the model folder has `audio_vae/`) is a 16-bit PCM stream in
+//! the AVI, interleaved frame by frame; animated WebP has no audio and a PNG sequence is only
+//! frames, so both get a sibling `NAME.wav`.
 //!
 //! `OXINFER_H3_PROMPT_EMBEDS=FILE` keeps the text encoder's output of a text-only prompt in FILE
 //! (written when missing, read when present), so the 63 GB text encoder and the 66 GB transformer
@@ -69,7 +71,8 @@ fn write_embeds(path: &Path, c: &Conditioning) -> Result<()> {
     std::fs::write(path, b).with_context(|| format!("write {}", path.display()))
 }
 
-/// Motion JPEG frames in an AVI (RIFF) container with an index.
+/// Motion JPEG frames in an AVI (RIFF) container with an index; the soundtrack, when there is
+/// one, as a second stream of 16-bit PCM, one chunk after each frame.
 #[cfg(feature = "media")]
 fn avi_mjpeg(v: &Video) -> Result<Vec<u8>> {
     let opts = oxideav_mjpeg::EncodeOptions::default();
@@ -96,10 +99,21 @@ fn avi_mjpeg(v: &Video) -> Result<Vec<u8>> {
         c
     };
     let (n, max) = (jpegs.len(), jpegs.iter().map(Vec::len).max().unwrap_or(0));
+    // The soundtrack: its rate, bytes per sample of every channel, and the samples of each frame
+    // (the last frame's chunk takes what is left).
+    let audio = v.audio.as_ref().filter(|a| !a.is_empty() && n > 0);
+    let (rate, block) = audio.map_or((0, 0), |a| (a.sample_rate as usize, 2 * a.channels.len()));
+    let span = |a: &oxinfer::minimax_h3::video::Soundtrack, i: usize| {
+        let end = if i + 1 == n { a.len() } else { ((i + 1) * rate / FPS).min(a.len()) };
+        (i * rate / FPS).min(end)..end
+    };
+    let max_audio = audio.map_or(0, |a| (0..n).map(|i| span(a, i).len() * block).max().unwrap_or(0));
     // avih: microseconds per frame, max bytes / s, padding, flags (has index), frames, initial
     // frames, streams, buffer size, width, height, reserved x4.
     let mut avih = Vec::new();
-    for x in [1_000_000 / FPS, max * FPS, 0, 0x10, n, 0, 1, max, v.width, v.height, 0, 0, 0, 0] {
+    let streams = 1 + audio.is_some() as usize;
+    let rest = [0, 0x10, n, 0, streams, max.max(max_audio), v.width, v.height, 0, 0, 0, 0];
+    for x in [1_000_000 / FPS, max * FPS + rate * block].into_iter().chain(rest) {
         avih.extend_from_slice(&u(x));
     }
     // strh: type, handler, flags, priority + language, initial frames, scale, rate, start, length,
@@ -122,15 +136,39 @@ fn avi_mjpeg(v: &Video) -> Result<Vec<u8>> {
     for x in [v.width * v.height * 3, 0, 0, 0, 0] {
         strf.extend_from_slice(&u(x));
     }
-    let strl = list(b"strl", &[chunk(b"strh", &strh), chunk(b"strf", &strf)].concat());
-    let hdrl = list(b"hdrl", &[chunk(b"avih", &avih), strl].concat());
+    let mut strls = list(b"strl", &[chunk(b"strh", &strh), chunk(b"strf", &strf)].concat());
+    if let Some(a) = audio {
+        // strh as above: one unit of `scale / rate` seconds is a sample of every channel.
+        let mut strh = b"auds\0\0\0\0".to_vec();
+        for x in [0, 0, 0, block, rate * block, 0, a.len(), max_audio, 0xFFFF_FFFF, block] {
+            strh.extend_from_slice(&u(x));
+        }
+        strh.extend_from_slice(&[0; 8]);
+        // strf: WAVEFORMATEX, integer PCM.
+        let mut strf = Vec::new();
+        strf.extend_from_slice(&1u16.to_le_bytes());
+        strf.extend_from_slice(&(a.channels.len() as u16).to_le_bytes());
+        strf.extend_from_slice(&u(rate));
+        strf.extend_from_slice(&u(rate * block));
+        strf.extend_from_slice(&(block as u16).to_le_bytes());
+        strf.extend_from_slice(&16u16.to_le_bytes());
+        strf.extend_from_slice(&0u16.to_le_bytes());
+        strls.extend(list(b"strl", &[chunk(b"strh", &strh), chunk(b"strf", &strf)].concat()));
+    }
+    let hdrl = list(b"hdrl", &[chunk(b"avih", &avih), strls].concat());
     let (mut movi, mut idx) = (Vec::new(), Vec::new());
-    for j in &jpegs {
-        idx.extend_from_slice(b"00dc");
+    let mut add = |id: &[u8; 4], data: &[u8]| {
+        idx.extend_from_slice(id);
         idx.extend_from_slice(&u(0x10));
         idx.extend_from_slice(&u(movi.len() + 4));
-        idx.extend_from_slice(&u(j.len()));
-        movi.extend(chunk(b"00dc", j));
+        idx.extend_from_slice(&u(data.len()));
+        movi.extend(chunk(id, data));
+    };
+    for (i, j) in jpegs.iter().enumerate() {
+        add(b"00dc", j);
+        if let Some(a) = audio {
+            add(b"01wb", &oxinfer::tts::pcm16_bytes(&a.interleaved(span(a, i))));
+        }
     }
     let body = [hdrl, list(b"movi", &movi), chunk(b"idx1", &idx)].concat();
     let mut out = b"RIFF".to_vec();
@@ -158,6 +196,21 @@ fn animated_webp(v: &Video) -> Result<Vec<u8>> {
         .map_err(|e| anyhow::anyhow!("WebP encode: {e}"))
 }
 
+/// Writes the soundtrack of `v`, when it has one, as `stem.wav`; returns what to report.
+fn write_wav(v: &Video, stem: &Path) -> Result<String> {
+    let Some(a) = v.audio.as_ref().filter(|a| !a.is_empty()) else {
+        return Ok(String::new());
+    };
+    let p = PathBuf::from(format!("{}.wav", stem.display()));
+    std::fs::write(&p, a.to_wav()).with_context(|| format!("write {}", p.display()))?;
+    Ok(format!(
+        " and {} ({} Hz, {} channels)",
+        p.display(),
+        a.sample_rate,
+        a.channels.len()
+    ))
+}
+
 /// Writes `v` as `out` says (see the module docs); returns what was written.
 fn write_video(v: &Video, out: &Path) -> Result<String> {
     let ext = out.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
@@ -165,12 +218,20 @@ fn write_video(v: &Video, out: &Path) -> Result<String> {
         #[cfg(feature = "media")]
         "avi" => {
             std::fs::write(out, avi_mjpeg(v)?).with_context(|| format!("write {}", out.display()))?;
-            Ok(format!("{} (Motion JPEG, {FPS} fps)", out.display()))
+            let audio = match v.audio.as_ref().filter(|a| !a.is_empty()) {
+                Some(a) => format!(", {} Hz 16-bit PCM, {} channels", a.sample_rate, a.channels.len()),
+                None => String::new(),
+            };
+            Ok(format!("{} (Motion JPEG, {FPS} fps{audio})", out.display()))
         }
         #[cfg(feature = "media")]
         "webp" => {
             std::fs::write(out, animated_webp(v)?).with_context(|| format!("write {}", out.display()))?;
-            Ok(format!("{} (animated WebP)", out.display()))
+            Ok(format!(
+                "{} (animated WebP){}",
+                out.display(),
+                write_wav(v, &out.with_extension(""))?
+            ))
         }
         #[cfg(not(feature = "media"))]
         "avi" | "webp" => bail!("built without the `media` feature: .{ext} cannot be written (use a .png name for a PNG sequence)"),
@@ -184,9 +245,10 @@ fn write_video(v: &Video, out: &Path) -> Result<String> {
                 std::fs::write(&p, oxinfer::png::encode_rgb(v.width, v.height, f)).with_context(|| format!("write {}", p.display()))?;
             }
             Ok(format!(
-                "{}_0000.png ... _{:04}.png",
+                "{}_0000.png ... _{:04}.png{}",
                 stem.display(),
-                v.frames.len().saturating_sub(1)
+                v.frames.len().saturating_sub(1),
+                write_wav(v, &stem)?
             ))
         }
     }
@@ -245,6 +307,9 @@ pub fn run(args: &Args) -> Result<()> {
     };
     let t1 = Instant::now();
     let pipe = VideoPipeline::load(&args.model, &te)?;
+    if pipe.audio_vae.is_none() {
+        eprintln!("[no audio_vae/ in {}: the video will have no soundtrack]", args.model.display());
+    }
     let (h, w, frames, g) = pipe.geometry(&p)?;
     let secs = frames as f64 / FPS as f64;
     if !(5.0..=15.0).contains(&secs) {
@@ -266,11 +331,61 @@ pub fn run(args: &Args) -> Result<()> {
     let out = args.output.clone().unwrap_or_else(|| PathBuf::from(default));
     let what = write_video(&video, &out)?;
     eprintln!(
-        "[{}x{}, {} frames | {:.1}s | wrote {what}; no audio track]",
+        "[{}x{}, {} frames | {:.1}s | wrote {what}{}]",
         video.width,
         video.height,
         video.frames.len(),
-        t0.elapsed().as_secs_f64()
+        t0.elapsed().as_secs_f64(),
+        if video.audio.is_some() { "" } else { "; no audio track" }
     );
     Ok(())
+}
+
+#[cfg(all(test, feature = "media"))]
+mod tests {
+    use super::*;
+    use oxideav_core::MediaType;
+    use oxinfer::minimax_h3::video::Soundtrack;
+
+    /// The AVI demuxed by oxideav: every frame and every audio sample comes back.
+    #[test]
+    fn avi_carries_the_soundtrack() {
+        let (w, h, n) = (32usize, 16usize, 5usize);
+        let frames: Vec<Vec<u8>> = (0..n).map(|f| (0..w * h * 3).map(|i| (i * 7 + f * 40) as u8).collect()).collect();
+        // A little longer than the frames, as the model's soundtracks are.
+        let len = n * 32000 / FPS + 123;
+        let ramp = |k: usize| -> Vec<f32> { (0..len).map(|i| ((i * k) % 2000) as f32 / 1000.0 - 1.0).collect() };
+        let audio = Soundtrack {
+            sample_rate: 32000,
+            channels: vec![ramp(3), ramp(7)],
+        };
+        let want = oxinfer::tts::pcm16_bytes(&audio.interleaved(0..len));
+        let v = Video {
+            width: w,
+            height: h,
+            frames,
+            audio: Some(audio),
+        };
+        let avi = avi_mjpeg(&v).unwrap();
+        let media = oxinfer::media::Media::new();
+        let ctx = media.context();
+        let mut input: Box<dyn oxideav_core::ReadSeek> = Box::new(std::io::Cursor::new(avi));
+        let format = ctx.containers.probe_input(&mut *input, Some("avi")).unwrap();
+        let mut demux = ctx.containers.open_demuxer(&format, input, &ctx.codecs).unwrap();
+        let streams = demux.streams().to_vec();
+        assert_eq!(streams.len(), 2);
+        let a = streams.iter().find(|s| s.params.media_type == MediaType::Audio).unwrap();
+        assert_eq!(a.params.sample_rate, Some(32000));
+        assert_eq!(a.params.channels, Some(2));
+        let (mut video_packets, mut pcm) = (0, Vec::new());
+        while let Ok(p) = demux.next_packet() {
+            if p.stream_index == a.index {
+                pcm.extend_from_slice(&p.data);
+            } else {
+                video_packets += 1;
+            }
+        }
+        assert_eq!(video_packets, n);
+        assert_eq!(pcm, want);
+    }
 }

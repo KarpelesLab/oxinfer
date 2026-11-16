@@ -380,8 +380,9 @@ fn usage() -> ! {
          \x20 --frames N           frames at 24 fps, rounded up to 17 n + 5 (default 124: 5.2 s)\n\
          \x20 --steps N            points of the sigma grid: N - 1 forwards (default 50)\n\
          \x20 --init-image FILE    the first frame; --last-image FILE the last frame\n\
-         \x20 -o FILE              .avi (Motion JPEG), .webp (animated, lossless, slow) or .png (a PNG\n\
-         \x20                      sequence FILE_0000.png ...); no audio track is written\n\
+         \x20 -o FILE              .avi (Motion JPEG and the 32 kHz stereo soundtrack as PCM), .webp\n\
+         \x20                      (animated, lossless, slow) or .png (a PNG sequence FILE_0000.png\n\
+         \x20                      ...), both with the soundtrack in FILE.wav\n\
          \n\
          OmniGen2 (OmniGen2/OmniGen2): image editing, in-context generation and text to image (-o,\n\
          --steps (default 50), --negative, --seed, --quant, --mmap as above):\n\
