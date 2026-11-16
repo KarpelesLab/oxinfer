@@ -41,7 +41,7 @@ const CONTEXT_FRAMES: usize = 16;
 
 /// `f(row index, row)` over the rows of `x` (`width` values each), in parallel over groups of
 /// rows.
-fn rows_par(x: &mut [f32], width: usize, f: impl Fn(usize, &mut [f32]) + Sync) {
+pub(crate) fn rows_par(x: &mut [f32], width: usize, f: impl Fn(usize, &mut [f32]) + Sync) {
     let group = (16384 / width.max(1)).max(1);
     let par = x.len() > 1 << 15;
     for_chunks(x, group * width, par, |g, block| {
@@ -81,7 +81,7 @@ pub(crate) fn apply_rope(x: &mut [f32], table: &[f32], head_dim: usize) {
 
 /// A weight tensor and its shape, with PyTorch's weight normalization folded in (`g * v / |v|`,
 /// the norm over every dimension but the first), in either naming.
-fn weight(f: &ModelFiles, p: &str) -> Result<(Vec<f32>, Vec<usize>)> {
+pub(crate) fn weight(f: &ModelFiles, p: &str) -> Result<(Vec<f32>, Vec<usize>)> {
     let (gn, vn) = if f.has(&format!("{p}.parametrizations.weight.original0")) {
         (
             format!("{p}.parametrizations.weight.original0"),
@@ -128,7 +128,7 @@ fn matrix(f: &ModelFiles, name: &str) -> Result<Mat> {
 
 /// Activation buffers reused within one thread, so that an utterance's hundreds of large
 /// buffers do not each come fresh from the system.
-mod bufs {
+pub(crate) mod bufs {
     use std::cell::RefCell;
 
     thread_local! {
@@ -318,16 +318,19 @@ fn gemm(w: &[f32], co: usize, k: usize, xs: &[f32], step: usize, nt: usize, y: &
 }
 
 /// A causal convolution (`ArkttsCausalConv1d`): `kernel - stride` steps of left padding (in
-/// dilated taps), the input padded on the right to whole strides.
-struct Conv {
+/// dilated taps), the input padded on the right to whole strides. [`Conv::centered`] is PyTorch's
+/// `padding = (k - 1) * dilation / 2` instead.
+pub(crate) struct Conv {
     /// `[c_out, k * c_in]`, tap by tap.
     w: Vec<f32>,
     b: Vec<f32>,
     c_in: usize,
-    c_out: usize,
+    pub(crate) c_out: usize,
     k: usize,
     stride: usize,
     dilation: usize,
+    /// Zero steps before the input.
+    pad: usize,
 }
 
 impl Conv {
@@ -342,8 +345,16 @@ impl Conv {
         Ok(Self::new(&w, [co, ci, k], vector(f, &format!("{p}.bias"), co)?, stride, dilation))
     }
 
+    /// A stride-1 convolution of an odd kernel that keeps its input's length, padded on both
+    /// sides (`[out, in, k]` as [`Conv::new`]).
+    pub(crate) fn centered(w: &[f32], shape: [usize; 3], b: Vec<f32>, dilation: usize) -> Self {
+        let mut c = Self::new(w, shape, b, 1, dilation);
+        c.pad = (c.k - 1) * dilation / 2;
+        c
+    }
+
     /// From a kernel in PyTorch's layout (`[out, in, k]`).
-    fn new(w: &[f32], [co, ci, k]: [usize; 3], b: Vec<f32>, stride: usize, dilation: usize) -> Self {
+    pub(crate) fn new(w: &[f32], [co, ci, k]: [usize; 3], b: Vec<f32>, stride: usize, dilation: usize) -> Self {
         let mut m = vec![0f32; co * k * ci];
         for o in 0..co {
             for i in 0..ci {
@@ -360,17 +371,18 @@ impl Conv {
             k,
             stride,
             dilation,
+            pad: (k - 1) * dilation + 1 - stride,
         }
     }
 
     /// `x` (`[t, c_in]`) to `[ceil(t / stride), c_out]`.
-    fn forward(&self, x: &[f32], t: usize) -> (Vec<f32>, usize) {
+    pub(crate) fn forward(&self, x: &[f32], t: usize) -> (Vec<f32>, usize) {
         let (ci, co, k, stride, dil) = (self.c_in, self.c_out, self.k, self.stride, self.dilation);
         let t_out = t.div_ceil(stride);
         let kk = k * ci;
         let mut y = bufs::take(t_out * co);
         // The input with its padding, so that every window is a run of rows (taps `dil` apart).
-        let pad = (k - 1) * dil + 1 - stride;
+        let pad = self.pad;
         let mut padded = Vec::new();
         let xp: &[f32] = if k == 1 && stride == 1 {
             x
@@ -409,7 +421,7 @@ impl Conv {
 
 /// A causal transposed convolution (`ArkttsCausalConvTranspose1d`) whose kernel is `taps`
 /// strides long: output step `t * stride + r` reads the inputs `t - taps + 1 ..= t`.
-struct ConvT {
+pub(crate) struct ConvT {
     /// `[stride * c_out, taps * c_in]`, the oldest input first.
     w: Vec<f32>,
     /// The bias, once per phase.
@@ -433,7 +445,7 @@ impl ConvT {
     }
 
     /// From a kernel in PyTorch's layout (`[in, out, k]`, `k` a multiple of `stride`).
-    fn new(w: &[f32], [ci, co, k]: [usize; 3], b: &[f32], stride: usize) -> Self {
+    pub(crate) fn new(w: &[f32], [ci, co, k]: [usize; 3], b: &[f32], stride: usize) -> Self {
         let taps = k / stride;
         let mut m = vec![0f32; stride * co * taps * ci];
         for r in 0..stride {
@@ -458,7 +470,7 @@ impl ConvT {
     }
 
     /// `x` (`[t, c_in]`) to `[t * stride, c_out]`.
-    fn forward(&self, x: &[f32], t: usize) -> (Vec<f32>, usize) {
+    pub(crate) fn forward(&self, x: &[f32], t: usize) -> (Vec<f32>, usize) {
         let (ci, n) = (self.c_in, self.stride * self.c_out);
         let mut y = bufs::take(t * n);
         let mut padded = Vec::new();
@@ -484,7 +496,7 @@ impl ConvT {
 }
 
 /// Snake: `x + sin(alpha x)^2 / (alpha + 1e-9)`, per channel.
-struct Snake {
+pub(crate) struct Snake {
     alpha: Vec<f32>,
     inv: Vec<f32>,
 }
@@ -506,13 +518,18 @@ unsafe fn snake_avx2(rows: &mut [f32], alpha: &[f32], inv: &[f32]) {
 }
 
 impl Snake {
+    /// `x + inv * sin(alpha x)^2` (SnakeBeta: a magnitude of its own).
+    pub(crate) fn new(alpha: Vec<f32>, inv: Vec<f32>) -> Self {
+        Self { alpha, inv }
+    }
+
     fn load(f: &ModelFiles, name: &str) -> Result<Self> {
         let alpha = f.f32(name)?;
         let inv = alpha.iter().map(|&a| 1.0 / (a + 1e-9)).collect();
         Ok(Self { alpha, inv })
     }
 
-    fn apply(&self, x: &mut [f32]) {
+    pub(crate) fn apply(&self, x: &mut [f32]) {
         let c = self.alpha.len();
         let group = (16384 / c).max(1) * c;
         for_chunks(x, group, x.len() > 1 << 15, |_, rows| {

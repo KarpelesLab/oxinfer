@@ -21,9 +21,13 @@
 //! - the video VAE's ViT decoder ([`super::vae::VaeDecoder::decode_video`]), ImageNet
 //!   de-normalization, 8-bit rounding.
 //!
-//! The audio latents are denoised with the video (the model is trained on the joint sequence) but
-//! not decoded: the audio VAE is not implemented, so the output is silent.
+//! - the audio rows, one sequence per stereo channel, through the audio VAE's decoder
+//!   ([`super::audio_vae::AudioDecoder`]): `latents * latents_std + latents_mean`, 800 samples
+//!   at 32 kHz per latent, each channel decoded on its own. Without `audio_vae/` the audio
+//!   latents are still denoised (the model is trained on the joint sequence) and the video is
+//!   silent.
 
+use super::audio_vae::AudioDecoder;
 use super::dit::{Dit, DitConfig, PackedAv, TAG_AUDIO, TAG_IMAGE, TAG_TEXT};
 use super::vae::{VaeConfig, VaeDecoder};
 use super::video_vae::VideoEncoder;
@@ -343,11 +347,40 @@ impl VideoParams {
     }
 }
 
-/// Generated frames (RGB8, row-major) at [`FPS`].
+/// Generated frames (RGB8, row-major) at [`FPS`] and their soundtrack.
 pub struct Video {
     pub width: usize,
     pub height: usize,
     pub frames: Vec<Vec<u8>>,
+    /// `None` when the release folder has no `audio_vae/`.
+    pub audio: Option<Soundtrack>,
+}
+
+/// A generated soundtrack: one waveform per channel (left, right), samples in `[-1, 1]`.
+pub struct Soundtrack {
+    pub sample_rate: u32,
+    pub channels: Vec<Vec<f32>>,
+}
+
+impl Soundtrack {
+    /// Samples per channel.
+    pub fn len(&self) -> usize {
+        self.channels.first().map_or(0, Vec::len)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The samples `range` of every channel, interleaved.
+    pub fn interleaved(&self, range: std::ops::Range<usize>) -> Vec<f32> {
+        range.flat_map(|i| self.channels.iter().map(move |c| c[i])).collect()
+    }
+
+    /// A 16-bit PCM WAV file.
+    pub fn to_wav(&self) -> Vec<u8> {
+        crate::tts::wav_bytes_channels(&self.interleaved(0..self.len()), self.sample_rate, self.channels.len() as u16)
+    }
 }
 
 /// The conditioning of one request: `[n, text_dim]` rows and their modality tags.
@@ -362,6 +395,8 @@ pub struct VideoPipeline {
     pub dit: Dit<'static>,
     pub vae: VaeDecoder<'static>,
     vae_files: &'static ModelFiles,
+    /// The audio VAE's decoder, when the folder has `audio_vae/`.
+    pub audio_vae: Option<AudioDecoder>,
     /// The sigma shifts of the video and audio schedules.
     pub shifts: (f32, f32),
 }
@@ -419,7 +454,8 @@ pub fn encode_prompt(model: &Path, text_encoder: &Path, prompt: &str, keyframes:
 
 impl VideoPipeline {
     /// Loads the DiT (`transformer/`) and the video VAE (`vae/`) of the release in `dir` (bf16,
-    /// mapped); the text encoder from `text_encoder` when it is used.
+    /// mapped) and the audio VAE's decoder when `audio_vae/` is there; the text encoder from
+    /// `text_encoder` when it is used.
     pub fn load(dir: &Path, text_encoder: &Path) -> Result<Self> {
         let tdir = dir.join("transformer");
         let dit_files: &'static ModelFiles = Box::leak(Box::new(ModelFiles::open(&tdir, false)?));
@@ -433,12 +469,28 @@ impl VideoPipeline {
         if vae.cfg.axes != 3 {
             bail!("{}: not a video VAE", vdir.display());
         }
+        let adir = dir.join("audio_vae");
+        let audio_vae = if adir.join("config.json").exists() {
+            let a = AudioDecoder::load(&adir).with_context(|| format!("audio VAE in {}", adir.display()))?;
+            if a.cfg.latent_channels != dit.cfg.audio_channels {
+                bail!(
+                    "{}: {} latent channels, the transformer's audio rows have {}",
+                    adir.display(),
+                    a.cfg.latent_channels,
+                    dit.cfg.audio_channels
+                );
+            }
+            Some(a)
+        } else {
+            None
+        };
         Ok(Self {
             dir: dir.to_path_buf(),
             text_encoder_dir: text_encoder.to_path_buf(),
             dit,
             vae,
             vae_files,
+            audio_vae,
             shifts: (shift_of(&dir.join("scheduler"), 12.0), shift_of(&dir.join("audio_scheduler"), 3.0)),
         })
     }
@@ -553,7 +605,20 @@ impl VideoPipeline {
             width: w,
             height: h,
             frames,
+            audio: None,
         })
+    }
+
+    /// Decodes the audio rows (`[2 n, channels]`, channel-major) into the stereo soundtrack;
+    /// `None` without an audio VAE.
+    pub fn decode_audio(&self, rows: &[f32]) -> Result<Option<Soundtrack>> {
+        let Some(vae) = &self.audio_vae else {
+            return Ok(None);
+        };
+        Ok(Some(Soundtrack {
+            sample_rate: vae.cfg.sampling_rate,
+            channels: vae.decode_rows(rows, AUDIO_CHANNELS)?,
+        }))
     }
 
     /// Text (and keyframes) to video. `cond`: a conditioning computed earlier
@@ -596,16 +661,19 @@ impl VideoPipeline {
         let audio = rng.normals(g.n_audio * AUDIO_CHANNELS * cfg.audio_channels);
         let (sv, sa) = (sigmas(p.steps, self.shifts.0), sigmas(p.steps, self.shifts.1));
         let t1 = Instant::now();
-        let (video, _audio) = denoise(&self.dit, &cond.text, &cond.tags, video, audio, g, &anchors, (&sv, &sa), progress)?;
+        let (video, audio) = denoise(&self.dit, &cond.text, &cond.tags, video, audio, g, &anchors, (&sv, &sa), progress)?;
         let t_dit = t1.elapsed().as_secs_f64();
         let t2 = Instant::now();
-        let out = self.decode(&video[n_cond_vals..], g)?;
+        let mut out = self.decode(&video[n_cond_vals..], g)?;
+        let t_vae = t2.elapsed().as_secs_f64();
+        let t3 = Instant::now();
+        out.audio = self.decode_audio(&audio)?;
         eprintln!(
-            "\n[MiniMax-H3: {w}x{h}, {frames} frames ({} latent), {} text rows, text {t_enc:.1}s, {} steps {t_dit:.1}s, VAE {:.1}s]",
+            "\n[MiniMax-H3: {w}x{h}, {frames} frames ({} latent), {} text rows, text {t_enc:.1}s, {} steps {t_dit:.1}s, VAE {t_vae:.1}s, audio VAE {:.1}s]",
             g.lt,
             cond.tags.len(),
             sv.len().min(sa.len()) - 1,
-            t2.elapsed().as_secs_f64()
+            t3.elapsed().as_secs_f64()
         );
         Ok(out)
     }

@@ -362,6 +362,16 @@ fn f32_to_i16(s: f32) -> i16 {
 
 /// A 16-bit PCM mono WAV file of `samples` (in [-1, 1]).
 pub fn wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
+    wav_bytes_channels(samples, sample_rate, 1)
+}
+
+/// `samples` (in [-1, 1]) as 16-bit little-endian PCM (rounded, clipped).
+pub fn pcm16_bytes(samples: &[f32]) -> Vec<u8> {
+    samples.iter().flat_map(|&s| f32_to_i16(s).to_le_bytes()).collect()
+}
+
+/// A 16-bit PCM WAV file of interleaved `samples` (in [-1, 1]) of `channels` channels.
+pub fn wav_bytes_channels(samples: &[f32], sample_rate: u32, channels: u16) -> Vec<u8> {
     let data = (samples.len() * 2) as u32;
     let mut b = Vec::with_capacity(44 + data as usize);
     b.extend_from_slice(b"RIFF");
@@ -369,10 +379,10 @@ pub fn wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     b.extend_from_slice(b"WAVEfmt ");
     b.extend_from_slice(&16u32.to_le_bytes());
     b.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    b.extend_from_slice(&1u16.to_le_bytes()); // mono
+    b.extend_from_slice(&channels.to_le_bytes());
     b.extend_from_slice(&sample_rate.to_le_bytes());
-    b.extend_from_slice(&(sample_rate * 2).to_le_bytes());
-    b.extend_from_slice(&2u16.to_le_bytes());
+    b.extend_from_slice(&(sample_rate * 2 * channels as u32).to_le_bytes());
+    b.extend_from_slice(&(2 * channels).to_le_bytes());
     b.extend_from_slice(&16u16.to_le_bytes());
     b.extend_from_slice(b"data");
     b.extend_from_slice(&data.to_le_bytes());

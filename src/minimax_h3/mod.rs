@@ -13,6 +13,7 @@
 //!   with its own output head, Euler along the predicted velocity: `x += (sigma - sigma_next) v`;
 //! - the VAE (`vae`), ImageNet de-normalization, 8-bit rounding (truncation, as `to(uint8)`).
 
+pub mod audio_vae;
 pub mod dit;
 pub mod vae;
 pub mod video;
