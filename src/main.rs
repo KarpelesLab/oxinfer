@@ -123,6 +123,9 @@ struct Args {
     /// MiniMax-H3 (video): the frame count and the last keyframe.
     frames: Option<usize>,
     last_image: Option<PathBuf>,
+    /// MiniMax-H3: the sigma shifts of the video and audio schedules.
+    shift: Option<f32>,
+    audio_shift: Option<f32>,
     mask: Option<PathBuf>,
     strength: Option<f32>,
     image_guidance: Option<f32>,
@@ -378,7 +381,11 @@ fn usage() -> ! {
          MiniMax-H3 (MiniMaxAI/MiniMax-H3): text to video, first / last frame to video (-o, --size,\n\
          --seed as above; see docs/video.md):\n\
          \x20 --frames N           frames at 24 fps, rounded up to 17 n + 5 (default 124: 5.2 s)\n\
-         \x20 --steps N            points of the sigma grid: N - 1 forwards (default 50)\n\
+         \x20 --steps N            points of the sigma grid: N - 1 forwards (default 50; a turbo\n\
+         \x20                      LoRA: the steps in its name plus one)\n\
+         \x20 --lora FILE[:SCALE]  a LoRA on the transformer (the 4 / 8-step turbo LoRAs)\n\
+         \x20 --shift F, --audio-shift F   sigma shifts (default 12 and 3; a turbo LoRA: 6 for its\n\
+         \x20                      768p files)\n\
          \x20 --init-image FILE    the first frame; --last-image FILE the last frame\n\
          \x20 -o FILE              .avi (Motion JPEG and the 32 kHz stereo soundtrack as PCM), .webp\n\
          \x20                      (animated, lossless, slow) or .png (a PNG sequence FILE_0000.png\n\
@@ -629,6 +636,8 @@ fn parse_args() -> Result<Args> {
         init_images: Vec::new(),
         frames: None,
         last_image: None,
+        shift: None,
+        audio_shift: None,
         transformer: None,
         qwen_image: Default::default(),
         size: None,
@@ -874,6 +883,8 @@ fn parse_args() -> Result<Args> {
             "--init-image" => a.init_images.push(PathBuf::from(val()?)),
             "--frames" => a.frames = Some(val()?.parse()?),
             "--last-image" => a.last_image = Some(PathBuf::from(val()?)),
+            "--shift" => a.shift = Some(val()?.parse()?),
+            "--audio-shift" => a.audio_shift = Some(val()?.parse()?),
             "--mask" => a.mask = Some(PathBuf::from(val()?)),
             "--strength" => a.strength = Some(val()?.parse()?),
             "--image-guidance" => a.image_guidance = Some(val()?.parse()?),

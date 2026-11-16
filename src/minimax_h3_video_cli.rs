@@ -9,6 +9,9 @@
 //! the AVI, interleaved frame by frame; animated WebP has no audio and a PNG sequence is only
 //! frames, so both get a sibling `NAME.wav`.
 //!
+//! `--lora FILE[:SCALE]` applies LoRA files to the transformer; a turbo LoRA sets the step count
+//! and the shifts its name stands for (`--steps`, `--shift`, `--audio-shift` override them).
+//!
 //! `OXINFER_H3_PROMPT_EMBEDS=FILE` keeps the text encoder's output of a text-only prompt in FILE
 //! (written when missing, read when present), so the 63 GB text encoder and the 66 GB transformer
 //! need not be on disk at the same time; when the transformer is missing the run stops after
@@ -306,9 +309,25 @@ pub fn run(args: &Args) -> Result<()> {
         crate::minimax_h3_cli::text_encoder(&args.model)?
     };
     let t1 = Instant::now();
-    let pipe = VideoPipeline::load(&args.model, &te)?;
+    let mut pipe = VideoPipeline::load(&args.model, &te)?;
     if pipe.audio_vae.is_none() {
         eprintln!("[no audio_vae/ in {}: the video will have no soundtrack]", args.model.display());
+    }
+    for line in pipe.apply_loras(&args.loras)? {
+        eprintln!("{line}");
+    }
+    // A turbo LoRA is distilled for a step count and a pair of shifts (its name says which).
+    if let Some(t) = args.loras.iter().find_map(|l| oxinfer::minimax_h3::lora::turbo_settings(&l.path)) {
+        if args.steps.is_none() {
+            p.steps = t.forwards + 1;
+        }
+        pipe.shifts = (t.video_shift, t.audio_shift);
+    }
+    if let Some(s) = args.shift {
+        pipe.shifts.0 = s;
+    }
+    if let Some(s) = args.audio_shift {
+        pipe.shifts.1 = s;
     }
     let (h, w, frames, g) = pipe.geometry(&p)?;
     let secs = frames as f64 / FPS as f64;
@@ -316,12 +335,14 @@ pub fn run(args: &Args) -> Result<()> {
         eprintln!("[warning: {frames} frames is {secs:.1}s; MiniMax-H3 is released for 5 to 15 seconds (124 to 362 frames)]");
     }
     eprintln!(
-        "[MiniMax-H3: {} blocks, {w}x{h}, {frames} frames at {FPS} fps ({} latent frames, {} video + {} audio rows), {} steps; loaded in {:.1}s]",
+        "[MiniMax-H3: {} blocks, {w}x{h}, {frames} frames at {FPS} fps ({} latent frames, {} video + {} audio rows), {} steps, shift {} (audio {}); loaded in {:.1}s]",
         pipe.dit.cfg.layers,
         g.lt,
         g.lt * (g.lh / 2) * (g.lw / 2),
         2 * g.n_audio,
-        p.steps - 1,
+        p.steps.saturating_sub(1),
+        pipe.shifts.0,
+        pipe.shifts.1,
         t1.elapsed().as_secs_f64()
     );
     let tp = Instant::now();

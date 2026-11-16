@@ -222,7 +222,7 @@ const PREFIXES: [&str; 5] = [
     "unet.",
 ];
 
-fn tensor_f32(st: &SafeTensors, name: &str) -> Result<Vec<f32>> {
+pub(crate) fn tensor_f32(st: &SafeTensors, name: &str) -> Result<Vec<f32>> {
     let info = st.info(name).with_context(|| format!("missing tensor {name}"))?;
     let b = st.bytes_cow(name)?;
     Ok(match info.dtype.as_str() {

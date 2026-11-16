@@ -15,6 +15,7 @@
 
 pub mod audio_vae;
 pub mod dit;
+pub mod lora;
 pub mod vae;
 pub mod video;
 pub mod video_vae;

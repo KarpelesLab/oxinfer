@@ -631,3 +631,74 @@ fn residual(x: &mut [f32], y: &[f32], ada: Option<&[f32]>, h: usize, which: usiz
         None => add_inplace(x, y),
     }
 }
+
+/// A stored linear layer of the DiT, for LoRA files ([`super::lora`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct LayerId {
+    refiner: bool,
+    /// `usize::MAX`: the final layer.
+    block: usize,
+    /// 0 - 2: the attention's stored projections (one fused matrix, or q / k / v), 3: its output,
+    /// 4 / 5: the feed-forward's two layers, 6: the AdaLN projection.
+    slot: u8,
+}
+
+impl<'a> Dit<'a> {
+    /// The stored layers behind a module in ComfyUI's naming (`blocks.N.attn.qkv_proj`,
+    /// `.attn.out_proj`, `.mlp.fc1`, `.mlp.fc2`, `.adaln_proj.linear`, the same under
+    /// `token_refiner.`, `final_layer.adaln_proj.linear`) and, for every output row of each, the
+    /// row of the module's output it holds, in ComfyUI's order: `qkv_proj` as `[q; k; v]`, `fc1` as
+    /// `[gate; value]`. None: no such module.
+    pub(crate) fn lora_parts(&self, module: &str) -> Option<Vec<(LayerId, Vec<usize>)>> {
+        let (inner, hd, ffn) = (self.cfg.inner(), self.cfg.head_dim, self.cfg.ffn);
+        if module == "final_layer.adaln_proj.linear" {
+            let id = LayerId {
+                refiner: false,
+                block: usize::MAX,
+                slot: 6,
+            };
+            return Some(vec![(id, (0..self.norm_out_ada.n_out).collect())]);
+        }
+        let (refiner, rest) = match module.strip_prefix("token_refiner.") {
+            Some(r) => (true, r),
+            None => (false, module),
+        };
+        let (idx, tail) = rest.strip_prefix("blocks.")?.split_once('.')?;
+        let block: usize = idx.parse().ok()?;
+        let b = if refiner { &self.refiner } else { &self.blocks }.get(block)?;
+        let id = |slot: u8| LayerId { refiner, block, slot };
+        Some(match tail {
+            "attn.qkv_proj" => match &b.attn.qkv {
+                // Row `(head * 3 + j) * hd + i` of the release's matrix is row `i` of head `head`
+                // of q, k or v (`j`).
+                Qkv::Interleaved(_) => {
+                    let rows = (0..3 * inner).map(|o| (o / hd % 3) * inner + o / (3 * hd) * hd + o % hd).collect();
+                    vec![(id(0), rows)]
+                }
+                Qkv::Split(_) => (0..3).map(|j| (id(j as u8), (j * inner..(j + 1) * inner).collect())).collect(),
+            },
+            "attn.out_proj" => vec![(id(3), (0..b.attn.out.n_out).collect())],
+            "mlp.fc1" if b.ff.gate_first => vec![(id(4), (0..2 * ffn).collect())],
+            "mlp.fc1" => vec![(id(4), (ffn..2 * ffn).chain(0..ffn).collect())],
+            "mlp.fc2" => vec![(id(5), (0..b.ff.fc2.n_out).collect())],
+            "adaln_proj.linear" => vec![(id(6), (0..b.adaln.as_ref()?.n_out).collect())],
+            _ => return None,
+        })
+    }
+
+    /// The layer of a [`LayerId`] from [`Dit::lora_parts`].
+    pub(crate) fn layer_mut(&mut self, id: LayerId) -> &mut DLin<'a> {
+        if id.block == usize::MAX {
+            return &mut self.norm_out_ada;
+        }
+        let b = &mut if id.refiner { &mut self.refiner } else { &mut self.blocks }[id.block];
+        match (id.slot, &mut b.attn.qkv) {
+            (0..=2, Qkv::Split(w)) => &mut w[id.slot as usize],
+            (0..=2, Qkv::Interleaved(w)) => w,
+            (3, _) => &mut b.attn.out,
+            (4, _) => &mut b.ff.fc1,
+            (5, _) => &mut b.ff.fc2,
+            _ => b.adaln.as_mut().expect("the AdaLN projection of a LayerId"),
+        }
+    }
+}

@@ -495,6 +495,11 @@ impl VideoPipeline {
         })
     }
 
+    /// Applies LoRA files to the transformer ([`super::lora`]); returns one report line per file.
+    pub fn apply_loras(&mut self, specs: &[super::lora::LoraSpec]) -> Result<Vec<String>> {
+        super::lora::apply(&mut self.dit, specs)
+    }
+
     /// The canvas `(height, width)`, the aligned frame count and the latent geometry of `p`.
     pub fn geometry(&self, p: &VideoParams) -> Result<(usize, usize, usize, Geometry)> {
         let multiple = self.vae.cfg.patch * self.dit.cfg.patch[1];
