@@ -311,6 +311,9 @@ impl Header {
             "qwen35moe" => "qwen3_5_moe_text",
             "qwen4exp" => "qwen4_exp_text",
             "qwen3" => "qwen3",
+            // Qwen3-VL's language model is a dense Qwen3 (its M-RoPE is plain RoPE on text); the
+            // vision tower is in a separate `mmproj` file.
+            "qwen3vl" => "qwen3",
             "qwen2" => "qwen2",
             "llama" => "llama",
             "granite" => "granite",
@@ -326,7 +329,7 @@ impl Header {
             "kimi-k31" => "kimi_k31",
             "nemotron_h" | "nemotron_h_moe" => "nemotron_h",
             a => bail!(
-                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, llama, granite, gemma4, mistral-large4, deepseek4, deepseek41, minimax-m2, minimax-m3, glm5-next, glm-dsa, nemotron_h, nemotron_h_moe and qwen2 are)"
+                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, qwen3vl, llama, granite, gemma4, mistral-large4, deepseek4, deepseek41, minimax-m2, minimax-m3, glm5-next, glm-dsa, nemotron_h, nemotron_h_moe and qwen2 are)"
             ),
         })
     }
@@ -1156,7 +1159,9 @@ pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec
                     return Some((format!("model.layers.{l}.{n}"), shape));
                 }
                 (_, "attn_norm") => "input_layernorm.weight",
-                ("qwen3" | "qwen2" | "llama" | "granite" | "minimax-m2" | "minimax-m3", "ffn_norm") => "post_attention_layernorm.weight",
+                ("qwen3" | "qwen3vl" | "qwen2" | "llama" | "granite" | "minimax-m2" | "minimax-m3", "ffn_norm") => {
+                    "post_attention_layernorm.weight"
+                }
                 // Qwen2's query / key / value biases.
                 (_, "attn_q") if suffix == "bias" => "self_attn.q_proj.bias",
                 (_, "attn_k") if suffix == "bias" => "self_attn.k_proj.bias",

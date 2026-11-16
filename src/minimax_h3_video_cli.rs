@@ -11,7 +11,7 @@
 //!
 //! `--model` is the release folder in diffusers' layout, or a single-file transformer in ComfyUI's
 //! layout (`Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors`) with
-//! `--vae FILE`; `--transformer` and `--vae` replace a part of a folder too.
+//! `--vae FILE`; `--transformer`, `--vae` and `--text-encoder` replace a part of a folder too.
 //! `--lora FILE[:SCALE]` applies LoRA files; a turbo LoRA sets the step count and the shifts its
 //! name stands for (`--steps`, `--shift`, `--audio-shift` override them).
 //!
@@ -305,6 +305,11 @@ pub fn run(args: &Args) -> Result<()> {
             (None, false) => None,
         },
         vae: args.flux.vae.as_deref().map(|v| resolve_part(v, args)).transpose()?,
+        // The text encoder at Q4 is not offered (Qwen-Image's moves its hidden states by ~25%).
+        text_quant: Some(match args.quant {
+            oxinfer::model::Quant::Q4 => oxinfer::model::Quant::Q8,
+            q => q,
+        }),
         ..Default::default()
     };
     if single && src.vae.is_none() {
@@ -313,14 +318,19 @@ pub fn run(args: &Args) -> Result<()> {
             args.model.display()
         );
     }
-    let text_encoder = || crate::minimax_h3_cli::text_encoder(&args.model);
+    let text_encoder = || -> Result<PathBuf> {
+        match &args.flux.text_encoder {
+            Some(t) => resolve_part(t, args),
+            None => crate::minimax_h3_cli::text_encoder(&args.model),
+        }
+    };
     let tpath = src.transformer.clone().unwrap_or_else(|| args.model.join("transformer"));
     let have_dit = has_dit(&tpath);
     let cond = match &cache {
         Some(f) if f.exists() => Some(read_embeds(f)?),
         Some(f) => {
             let te = text_encoder()?;
-            let c = oxinfer::minimax_h3::video::encode_prompt(&args.model, &te, &prompt, &[])?;
+            let c = oxinfer::minimax_h3::video::encode_prompt_quant(&args.model, &te, src.text_quant.unwrap(), &prompt, &[])?;
             write_embeds(f, &c)?;
             eprintln!(
                 "[text encoder: {} rows in {:.1}s, wrote {}]",

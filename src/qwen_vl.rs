@@ -122,7 +122,12 @@ impl QwenVl {
         let dir = crate::engine::resolve_model(&path_or_repo.to_string_lossy(), None)?;
         let parent = dir.parent().map(Path::to_path_buf).unwrap_or_default();
         let cands = [dir.clone(), parent.join("processor"), parent.join("tokenizer")];
-        let tok_dir = opts.tokenizer_dir.clone().or_else(|| find_dir(&cands, "tokenizer.json"));
+        // A GGUF file carries its own vocabulary.
+        let tok_dir = opts
+            .tokenizer_dir
+            .clone()
+            .or_else(|| find_dir(&cands, "tokenizer.json"))
+            .or_else(|| crate::gguf::is_gguf(&dir).then(|| dir.clone()));
         let tokenizer = match tok_dir {
             Some(d) => crate::engine::load_tokenizer(&d)?,
             None => {
@@ -136,7 +141,12 @@ impl QwenVl {
         // (every borrow of it) before `_files`.
         let fs: &'static ModelFiles = unsafe { &*(files.as_ref() as *const ModelFiles) };
         let model = QwenModel::load(cfg, fs, opts.quant)?;
-        let mut mm = QwenMmConfig::load(&dir)?;
+        // A GGUF file is the language model alone (its tower would be an `mmproj` file): text only.
+        let mut mm = if crate::gguf::is_gguf(&dir) {
+            None
+        } else {
+            QwenMmConfig::load(&dir)?
+        };
         if let Some(m) = &mut mm {
             let pdir = opts.processor_dir.clone().or_else(|| find_dir(&cands, "preprocessor_config.json"));
             if let Some(p) = pdir {

@@ -421,8 +421,10 @@ pub struct Sources {
     pub transformer: Option<PathBuf>,
     /// The video VAE instead of `dir/vae`: a folder, or ComfyUI's single file.
     pub vae: Option<PathBuf>,
-    /// The Qwen3-VL-32B text encoder's folder.
+    /// The Qwen3-VL-32B text encoder: a folder, or a GGUF file (text-only prompts).
     pub text_encoder: PathBuf,
+    /// The precision of the text encoder's weights (float checkpoints are quantized at load).
+    pub text_quant: Option<crate::model::Quant>,
 }
 
 /// The tensors of a checkpoint folder or of a single safetensors file, mapped.
@@ -438,6 +440,7 @@ fn open_part(path: &Path) -> Result<&'static ModelFiles> {
 pub struct VideoPipeline {
     pub dir: PathBuf,
     pub text_encoder_dir: PathBuf,
+    pub text_quant: crate::model::Quant,
     pub dit: Dit<'static>,
     pub vae: VaeDecoder<'static>,
     vae_files: &'static ModelFiles,
@@ -461,9 +464,27 @@ fn shift_of(dir: &Path, default: f32) -> f32 {
 /// block per keyframe, then the prompt, after the 50th layer of the text encoder in
 /// `text_encoder` (`model`: the release folder, for its tokenizer).
 pub fn encode_prompt(model: &Path, text_encoder: &Path, prompt: &str, keyframes: &[&Image]) -> Result<Conditioning> {
+    encode_prompt_quant(model, text_encoder, crate::model::Quant::Bf16, prompt, keyframes)
+}
+
+/// [`encode_prompt`] with the text encoder's weights at `quant` (a float checkpoint is quantized
+/// at load; a GGUF file is used in its own format). `text_encoder` is a folder or a GGUF file of
+/// Qwen3-VL-32B-Instruct, which the release's `text_encoder/` is (the same files, by their
+/// SHA-256); a GGUF file brings its own tokenizer and no vision tower, so no keyframes.
+pub fn encode_prompt_quant(
+    model: &Path,
+    text_encoder: &Path,
+    quant: crate::model::Quant,
+    prompt: &str,
+    keyframes: &[&Image],
+) -> Result<Conditioning> {
     use crate::qwen_vl::{QwenVl, QwenVlOptions};
     let parent = text_encoder.parent().map(Path::to_path_buf).unwrap_or_default();
+    if crate::gguf::is_gguf(text_encoder) && !keyframes.is_empty() {
+        bail!("a GGUF text encoder has no vision tower: keyframes need the safetensors text encoder");
+    }
     let opts = QwenVlOptions {
+        quant,
         mmap: true,
         vision: !keyframes.is_empty(),
         tokenizer_dir: [model.join("tokenizer"), parent.join("tokenizer"), text_encoder.to_path_buf()]
@@ -579,6 +600,7 @@ impl VideoPipeline {
                 .or_else(|| src.text_encoder.parent().map(Path::to_path_buf))
                 .unwrap_or_default(),
             text_encoder_dir: src.text_encoder.clone(),
+            text_quant: src.text_quant.unwrap_or(crate::model::Quant::Bf16),
             dit,
             vae,
             vae_files,
@@ -641,7 +663,7 @@ impl VideoPipeline {
 
     /// [`encode_prompt`] with this release's text encoder.
     pub fn encode_prompt(&self, prompt: &str, keyframes: &[&Image]) -> Result<Conditioning> {
-        encode_prompt(&self.dir, &self.text_encoder_dir, prompt, keyframes)
+        encode_prompt_quant(&self.dir, &self.text_encoder_dir, self.text_quant, prompt, keyframes)
     }
 
     /// A keyframe's conditioning latents `[C, 1, lh, lw]` (normalized): the posterior sampled with
