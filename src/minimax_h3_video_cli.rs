@@ -11,7 +11,7 @@
 //!
 //! `--model` is the release folder in diffusers' layout, or a single-file transformer in ComfyUI's
 //! layout (`Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors`) with
-//! `--vae DIR`; `--transformer` and `--vae` replace a part of a folder too.
+//! `--vae FILE`; `--transformer` and `--vae` replace a part of a folder too.
 //! `--lora FILE[:SCALE]` applies LoRA files; a turbo LoRA sets the step count and the shifts its
 //! name stands for (`--steps`, `--shift`, `--audio-shift` override them).
 //!
@@ -309,7 +309,7 @@ pub fn run(args: &Args) -> Result<()> {
     };
     if single && src.vae.is_none() {
         bail!(
-            "{} is a single-file transformer: name the video VAE's folder (diffusers' layout) with --vae",
+            "{} is a single-file transformer: name the video VAE with --vae (ComfyUI's minimax_h3_video_vae_fp16.safetensors or a diffusers vae folder)",
             args.model.display()
         );
     }

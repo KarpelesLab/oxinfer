@@ -419,7 +419,7 @@ pub struct Sources {
     /// The transformer instead of `dir/transformer`: a folder, or a single file in ComfyUI's
     /// layout (bf16, "pruned", FP8 scaled: see [`super::dit`]).
     pub transformer: Option<PathBuf>,
-    /// The video VAE's folder instead of `dir/vae`.
+    /// The video VAE instead of `dir/vae`: a folder, or ComfyUI's single file.
     pub vae: Option<PathBuf>,
     /// The Qwen3-VL-32B text encoder's folder.
     pub text_encoder: PathBuf,
@@ -443,8 +443,8 @@ pub struct VideoPipeline {
     vae_files: &'static ModelFiles,
     /// The audio VAE's decoder, when the folder has `audio_vae/`.
     pub audio_vae: Option<AudioDecoder>,
-    /// The VAE's folder (the encoder reads its configuration).
-    vae_dir: PathBuf,
+    /// The VAE's configuration in diffusers' keys (the encoder reads its geometry).
+    vae_json: serde_json::Value,
     /// The sigma shifts of the video and audio schedules.
     pub shifts: (f32, f32),
 }
@@ -541,7 +541,17 @@ impl VideoPipeline {
         }
         let vpath = part(&src.vae, "vae")?;
         let vae_files = open_part(&vpath)?;
-        let vae = VaeDecoder::load(VaeConfig::load(&vpath)?, vae_files)?;
+        let vae_json: serde_json::Value = if vpath.is_file() {
+            VaeConfig::comfy_json(vae_files).with_context(|| {
+                format!(
+                    "{}: not ComfyUI's single-file MiniMax-H3 video VAE (no minimax_h3_video_vae header entry)",
+                    vpath.display()
+                )
+            })??
+        } else {
+            serde_json::from_slice(&crate::fsx::read(&vpath.join("config.json"))?)?
+        };
+        let vae = VaeDecoder::load(VaeConfig::from_json(&vae_json)?, vae_files)?;
         if vae.cfg.axes != 3 {
             bail!("{}: not a video VAE", vpath.display());
         }
@@ -572,8 +582,8 @@ impl VideoPipeline {
             dit,
             vae,
             vae_files,
-            vae_dir: vpath,
             audio_vae,
+            vae_json,
             shifts: (shift("scheduler", 12.0), shift("audio_scheduler", 3.0)),
         })
     }
@@ -662,7 +672,7 @@ impl VideoPipeline {
 
     /// The video encoder (loaded on demand: only keyframes need it).
     pub fn encoder(&self) -> Result<VideoEncoder> {
-        VideoEncoder::load(&self.vae_dir, &self.vae.cfg, self.vae_files)
+        VideoEncoder::load_json(&self.vae_json, &self.vae.cfg, self.vae_files)
     }
 
     /// Decodes video rows (generated rows only) into RGB8 frames.

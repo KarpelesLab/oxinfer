@@ -45,7 +45,54 @@ pub struct VaeConfig {
 impl VaeConfig {
     /// `vae/config.json` (the release's `MiniMaxH3ImageVAE` keys or diffusers').
     pub fn load(dir: &std::path::Path) -> Result<Self> {
-        let c: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
+        Self::from_json(&serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?)
+    }
+
+    /// The configuration of ComfyUI's single-file video VAE (`minimax_h3_video_vae_fp16.safetensors`),
+    /// in diffusers' keys: the file's `minimax_h3_video_vae` header entry holds the latent
+    /// statistics, the clip geometry and MiniMax's original configuration (`source_config`:
+    /// `ch`, `ch_mult`, `space_down`, `time_down`, `vit_decoder_kwargs`, ...). None: not such a file.
+    pub fn comfy_json(files: &ModelFiles) -> Option<Result<serde_json::Value>> {
+        let meta = files.metadata("minimax_h3_video_vae")?;
+        Some((|| {
+            let m: serde_json::Value = serde_json::from_str(meta).context("the minimax_h3_video_vae header entry")?;
+            let src = m.get("source_config").context("minimax_h3_video_vae: no source_config")?;
+            let mut c = src.clone();
+            let o = c.as_object_mut().context("minimax_h3_video_vae: source_config is not an object")?;
+            for (to, from) in [
+                ("latents_mean", "latents_mean"),
+                ("latents_std", "latents_std"),
+                ("clip_length", "vae_clip_length"),
+                ("token_drop", "vae_token_drop"),
+            ] {
+                if let Some(v) = m.get(from) {
+                    o.insert(to.into(), v.clone());
+                }
+            }
+            for (to, from) in [
+                ("latent_channels", "z_channels"),
+                ("layers_per_block", "num_res_blocks"),
+                ("spatial_downsample_factors", "space_down"),
+                ("temporal_downsample_factors", "time_down"),
+                ("spatial_padding_mode", "padding_mode"),
+            ] {
+                if let Some(v) = src.get(from) {
+                    o.insert(to.into(), v.clone());
+                }
+            }
+            let ch = src.get("ch").and_then(|v| v.as_u64()).context("minimax_h3_video_vae: no ch")?;
+            let mult = src
+                .get("ch_mult")
+                .and_then(|v| v.as_array())
+                .context("minimax_h3_video_vae: no ch_mult")?;
+            let widths: Vec<u64> = mult.iter().filter_map(|v| v.as_u64().map(|m| m * ch)).collect();
+            o.insert("block_out_channels".into(), widths.into());
+            Ok(c)
+        })())
+    }
+
+    /// [`VaeConfig::load`] of a parsed `config.json`.
+    pub fn from_json(c: &serde_json::Value) -> Result<Self> {
         let k = c.get("vit_decoder_kwargs");
         let u = |a: &str, b: &str, d: usize| {
             c.get(a)

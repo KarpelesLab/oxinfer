@@ -387,8 +387,7 @@ fn usage() -> ! {
          \x20 --lora FILE[:SCALE]  a LoRA on the transformer (the 4 / 8-step turbo LoRAs)\n\
          \x20 --shift F, --audio-shift F   sigma shifts (default 12 and 3; a turbo LoRA: 6 for its\n\
          \x20                      768p files)\n\
-         \x20 --transformer FILE, --vae DIR   a part from another place (the transformer as one of\n\
-         \x20                      ComfyUI's single files)\n\
+         \x20 --transformer FILE, --vae FILE   a part from another place (ComfyUI's single files)\n\
          \x20 --init-image FILE    the first frame; --last-image FILE the last frame\n\
          \x20 -o FILE              .avi (Motion JPEG and the 32 kHz stereo soundtrack as PCM), .webp\n\
          \x20                      (animated, lossless, slow) or .png (a PNG sequence FILE_0000.png\n\

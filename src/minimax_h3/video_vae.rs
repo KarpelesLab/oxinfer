@@ -232,7 +232,15 @@ pub struct VideoEncoder {
 impl VideoEncoder {
     /// Loads the encoder of diffusers' layout (`vae/`: `encoder.*`, `quant_conv`).
     pub fn load(dir: &std::path::Path, cfg: &VaeConfig, files: &ModelFiles) -> Result<Self> {
-        let c: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
+        Self::load_json(&serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?, cfg, files)
+    }
+
+    /// [`VideoEncoder::load`] with the parsed `config.json` (or [`VaeConfig::comfy_json`]). The
+    /// tensors are diffusers' (`encoder.down_blocks.I.resnets.J.*`, `.conv_shortcut`,
+    /// `.downsamplers.0.conv`) or the original names ComfyUI's single file keeps
+    /// (`encoder.down.I.block.J.*`, `.nin_shortcut`, `.downsample.conv`; `comfy/ldm/minimax/vae.py`).
+    pub fn load_json(c: &serde_json::Value, cfg: &VaeConfig, files: &ModelFiles) -> Result<Self> {
+        let original = files.has("encoder.down.0.block.0.norm1.weight");
         let list = |k: &str| -> Result<Vec<usize>> {
             Ok(c.get(k)
                 .and_then(|v| v.as_array())
@@ -260,19 +268,29 @@ impl VideoEncoder {
             let cin = if i == 0 { channels[0] } else { channels[i - 1] };
             let mut resnets = Vec::new();
             for j in 0..layers {
-                let p = format!("encoder.down_blocks.{i}.resnets.{j}.");
+                let p = if original {
+                    format!("encoder.down.{i}.block.{j}.")
+                } else {
+                    format!("encoder.down_blocks.{i}.resnets.{j}.")
+                };
+                let shortcut = if original { "nin_shortcut" } else { "conv_shortcut" };
                 resnets.push(Resnet {
                     norm1: Gn::load(files, &format!("{p}norm1"), groups, eps)?,
                     conv1: Conv3::load(files, &format!("{p}conv1"), 1, 2, 1, 1)?,
                     norm2: Gn::load(files, &format!("{p}norm2"), groups, eps)?,
                     conv2: Conv3::load(files, &format!("{p}conv2"), 1, 2, 1, 1)?,
                     shortcut: (j == 0 && cin != ch)
-                        .then(|| Conv3::load(files, &format!("{p}conv_shortcut"), 0, 0, 1, 1))
+                        .then(|| Conv3::load(files, &format!("{p}{shortcut}"), 0, 0, 1, 1))
                         .transpose()?,
                 });
             }
+            let dname = if original {
+                format!("encoder.down.{i}.downsample.conv")
+            } else {
+                format!("encoder.down_blocks.{i}.downsamplers.0.conv")
+            };
             let down = (td[i] * sd[i] > 1)
-                .then(|| Conv3::load(files, &format!("encoder.down_blocks.{i}.downsamplers.0.conv"), 0, 2, td[i], sd[i]))
+                .then(|| Conv3::load(files, &dname, 0, 2, td[i], sd[i]))
                 .transpose()?
                 .map(|conv| (conv, sd[i] == 2));
             if sd[i] > 2 || (sd[i] == 1 && td[i] > 1) {
