@@ -542,7 +542,10 @@ What the frames show (contact sheets read by the model that ran this, not by a p
   rounding of the bf16 one the LoRA's header names as its base; a small change of the
   conditioning (Q4_K_M for Q8_0) adds or removes blobs. Which of these matters was not separated: the bf16
   transformers were not downloaded, 1344x768 at 124 frames was not run (37,869 rows), and
-  nothing was sampled in ComfyUI itself (its nodes and sampler, on a GPU);
+  nothing was sampled in ComfyUI itself (its nodes and sampler, on a GPU). One part of oxinfer
+  is shared by all three runs and so is not cleared by them: the prompt embedding, which comes
+  from oxinfer's reading of the Q8_0 GGUF text encoder and was not compared with the bf16
+  encoder's in transformers (the noise is oxinfer's too, and passes normality checks);
 - 448x256, 124 frames, 8-step LoRA (the dog): clean, softer and more natural than the 4-step clip;
 - 1344x768, 22 frames: clean and detailed (knit of the sweater, the hands on the mug), but the
   whole prompt is played in 0.9 s, below the 5 s the model is made for.
