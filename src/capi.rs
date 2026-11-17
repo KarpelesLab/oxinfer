@@ -2318,7 +2318,7 @@ pub unsafe extern "C" fn oxi_server_handle(
         let bytes = if len == 0 {
             Vec::new()
         } else {
-            unsafe { std::slice::from_raw_parts(body as *const u8, len) }.to_vec()
+            unsafe { std::slice::from_raw_parts(body.cast::<u8>(), len) }.to_vec()
         };
         let mut req = crate::server::ApiRequest::new(method, path, ct, bytes);
         req.authorization = unsafe { opt_str_arg(authorization, "authorization") }?.map(str::to_string);
