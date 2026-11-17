@@ -24,6 +24,11 @@
 //!
 //! `OXINFER_H3_LATENTS=FILE` keeps the denoised video and audio rows the same way: a second run
 //! with the same size and frame count decodes them again without the transformer's forwards.
+//!
+//! `OXINFER_H3_DUMP=DIR` keeps every forward's rows and velocities in DIR (and, with
+//! `OXINFER_H3_DUMP_BLOCKS=i`, forward `i`'s sequence after every block), for
+//! `tools/minimax_h3_video_ref.py` to compare with torch on the same inputs: see
+//! `oxinfer::minimax_h3::dit`.
 
 use crate::Args;
 use anyhow::{Context, Result, bail};

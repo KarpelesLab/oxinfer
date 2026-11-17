@@ -638,13 +638,17 @@ impl<'a> Dit<'a> {
 
     /// The block stack over the packed sequence `x` (`[n, H]`): `st` holds the SiLU of each distinct
     /// timestep embedding (`[nt, time_dim]`), a row reads the AdaLN set of its `(timestep, tag)`.
-    fn stack(&self, x: &mut [f32], st: &[f32], timestep_index: &[usize], tags: &[u8], positions: &[[f32; 3]]) {
+    fn stack(&self, x: &mut [f32], st: &[f32], timestep_index: &[usize], tags: &[u8], positions: &[[f32; 3]], dump: Option<&Dump>) {
         let h = self.cfg.hidden;
         let n = x.len() / h;
         let nt = st.len() / self.cfg.time_dim;
         let (cos, sin) = self.rope(positions);
         let six = 6 * h;
-        for b in &self.blocks {
+        let dump = dump.filter(|d| d.blocks);
+        if let Some(d) = dump {
+            d.write("x_in.bin", x);
+        }
+        for (bi, b) in self.blocks.iter().enumerate() {
             // [nt, 3 * 6H]: the six vectors of each (timestep, modality), then one row per token.
             let table = b.adaln.as_ref().unwrap().forward(st, nt);
             let mut ada = vec![0f32; n * six];
@@ -653,6 +657,9 @@ impl<'a> Dit<'a> {
                 row.copy_from_slice(&table[k * six..(k + 1) * six]);
             });
             self.block(b, x, n, Some(&ada), Some((&cos, &sin)));
+            if let Some(d) = dump {
+                d.write(&format!("blk_{bi}.bin"), x);
+            }
         }
     }
 
@@ -687,7 +694,7 @@ impl<'a> Dit<'a> {
         x[n_text * h..].copy_from_slice(&self.proj_in.forward(p.image, n_img));
         let temb: Vec<f32> = p.timesteps.iter().flat_map(|&t| self.time_embed(t)).collect();
         let st = self.time_act(&temb);
-        self.stack(&mut x, &st, p.timestep_index, p.tags, p.positions);
+        self.stack(&mut x, &st, p.timestep_index, p.tags, p.positions, None);
         // Output norm with the per-timestep shift / scale, then the head over the latent rows.
         let rows: Vec<usize> = (n_text..n).collect();
         let hn = self.norm_out_rows(&x, &rows, &st, p.timestep_index);
@@ -729,10 +736,61 @@ impl<'a> Dit<'a> {
             }
         }
         let st = self.time_act(p.temb);
-        self.stack(&mut x, &st, p.timestep_index, p.tags, p.positions);
+        let dump = Dump::from_env();
+        self.stack(&mut x, &st, p.timestep_index, p.tags, p.positions, dump.as_ref());
         let v = self.heads_out[0].forward(&self.norm_out_rows(&x, p.video_index, &st, p.timestep_index), nv);
         let a = aout.forward(&self.norm_out_rows(&x, p.audio_index, &st, p.timestep_index), na);
+        if let Some(d) = &dump {
+            let i = d.call;
+            d.write(&format!("s{i}_video_in.bin"), p.video);
+            d.write(&format!("s{i}_audio_in.bin"), p.audio);
+            d.write(&format!("s{i}_v.bin"), &v);
+            d.write(&format!("s{i}_a.bin"), &a);
+            d.write(&format!("s{i}_temb.bin"), p.temb);
+            d.write(
+                &format!("s{i}_tidx.bin"),
+                &p.timestep_index.iter().map(|&t| t as f32).collect::<Vec<f32>>(),
+            );
+            if i == 0 {
+                d.write("text_emb.bin", p.text_embedded);
+                d.write("positions.bin", p.positions.as_flattened());
+                d.write("tags.bin", &p.tags.iter().map(|&t| t as f32).collect::<Vec<f32>>());
+            }
+        }
         Ok((v, a))
+    }
+}
+
+/// `OXINFER_H3_DUMP=DIR`: what [`Dit::forward_av`] computes, kept as little-endian float32 files in
+/// DIR for a comparison with a reference on the same inputs (`tools/minimax_h3_video_ref.py`).
+/// Call `i` of the process (a sampling step) writes its video and audio rows (`s{i}_video_in.bin`,
+/// `s{i}_audio_in.bin`), its velocities (`s{i}_v.bin`, `s{i}_a.bin`), the timestep embeddings
+/// (`s{i}_temb.bin`) and each row's index into them (`s{i}_tidx.bin`); the first call also the
+/// refined text rows (`text_emb.bin`), the rotary positions (`positions.bin`) and the modality tags
+/// (`tags.bin`). With `OXINFER_H3_DUMP_BLOCKS=i`, call `i` also writes the packed sequence before
+/// the blocks (`x_in.bin`) and after each one (`blk_{n}.bin`: the whole sequence, 100 MB per
+/// block for 4682 rows).
+struct Dump {
+    dir: std::path::PathBuf,
+    call: usize,
+    blocks: bool,
+}
+
+impl Dump {
+    fn from_env() -> Option<Self> {
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let dir = std::path::PathBuf::from(std::env::var_os("OXINFER_H3_DUMP")?);
+        let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let blocks = std::env::var("OXINFER_H3_DUMP_BLOCKS").is_ok_and(|v| v.parse() == Ok(call));
+        Some(Self { dir, call, blocks })
+    }
+
+    fn write(&self, name: &str, v: &[f32]) {
+        let path = self.dir.join(name);
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        if let Err(e) = std::fs::write(&path, bytes) {
+            eprintln!("OXINFER_H3_DUMP: {}: {e}", path.display());
+        }
     }
 }
 

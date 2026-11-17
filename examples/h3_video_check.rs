@@ -10,7 +10,9 @@
 //! single files, "pruned", FP8 scaled, MiniMax's own layout) instead of DIR's diffusers folders,
 //! `--lora` applies LoRA files, and the `--*-ref` prefixes name that tool's references
 //! (`pruned_`, `fp8_`, `lora_`, `fp16_`, ...); with a `--transformer` the VAE part is skipped
-//! unless `--vae` is given too.
+//! unless `--vae` is given too. A case of `tools/minimax_h3_video_long.py` (the real model's heads
+//! on a real request's sequence: thousands of rows, no keyframes, a turbo LoRA's shifts) has no
+//! VAE part: `h3_video_check DIR --transformer DIR/transformer`.
 
 use anyhow::{Context, Result};
 use oxinfer::minimax_h3::dit::{Dit, DitConfig};
@@ -131,11 +133,20 @@ fn main() -> Result<()> {
     };
     let text = read(&dir.join("dit_text.bin"))?;
     let tags: Vec<u8> = read(&dir.join("dit_text_tags.bin"))?.iter().map(|&v| v as u8).collect();
-    let anchors = [Anchor::First, Anchor::Last];
+    // A case may name its keyframes and shifts (`tools/minimax_h3_video_long.py`); the tiny tool's
+    // cases have a first and a last keyframe and the release's shifts.
+    let anchors: Vec<Anchor> = match case.get("anchors").and_then(|a| a.as_array()) {
+        Some(a) => a
+            .iter()
+            .map(|v| if v.as_str() == Some("last") { Anchor::Last } else { Anchor::First })
+            .collect(),
+        None => vec![Anchor::First, Anchor::Last],
+    };
+    let shift = |i: usize, d: f32| case.get("shifts").and_then(|s| s[i].as_f64()).map_or(d, |v| v as f32);
     let lay = layout(&tags, g.lt, g.lh, g.lw, g.n_audio, dit.cfg.patch[1], &anchors);
     let pos: Vec<f32> = lay.positions.iter().flatten().copied().collect();
     cmp("layout positions", &pos, &read(&dir.join("dit_positions.bin"))?);
-    let (sv, sa) = (sigmas(u("steps"), 12.0), sigmas(u("steps"), 3.0));
+    let (sv, sa) = (sigmas(u("steps"), shift(0, 12.0)), sigmas(u("steps"), shift(1, 3.0)));
     cmp("video sigmas", &sv, &read(&dir.join("sigmas_video.bin"))?);
     cmp("audio sigmas", &sa, &read(&dir.join("sigmas_audio.bin"))?);
     let video = read(&dir.join("dit_video.bin"))?;
