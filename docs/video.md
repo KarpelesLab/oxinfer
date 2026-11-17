@@ -73,8 +73,11 @@ but not step-distilled: diffusers' default is 50 grid points.
 
 What a request does (`video.rs` has the details):
 
-- the prompt verbatim, no chat template, through the text encoder; each keyframe prepends
-  `"<Picture i>: "` and its Qwen3-VL vision block, whose rows are tagged as video for the AdaLN;
+- the prompt verbatim, no chat template and no token around it, through the text encoder; each
+  keyframe prepends `"<Picture i>: "` and its Qwen3-VL vision block, whose rows are tagged as video
+  for the AdaLN. The tokenizer is Qwen's with the seven tokens MiniMax's `tokenizer_config.json`
+  adds (`<d>`, `</d>`, `<|cutoff|>`, `<|lyrics_start|>`, `<|lyrics_end|>`, `<|caption_start|>`,
+  `<|caption_end|>`: ids 151669 to 151675, whatever file the vocabulary comes from);
 - `17 n + 5` frames become `5 n + 2` latent frames of `H/16 x W/16`, packed as 2x2 patches; the
   soundtrack is `round(frames / 24 * 40)` latents per stereo channel;
 - one sequence `[text | keyframe rows | audio rows | video rows]` with `(t, h, w)` rotary
@@ -389,7 +392,9 @@ the published `qwen3vl` files (`tools/qwen3vl_gguf.py`) gives transformers' logi
 header of the real `Qwen3-VL-32B-Instruct-Q4_K_M.gguf` (its first 24 MB in a sparse file: the
 weights read as zeros) loads through `QwenVl` as 64 layers of width 5120 with the release's
 configuration values, and three prompts tokenize to the same ids as with the release's
-`tokenizer.json`.
+`tokenizer.json`. Neither that file nor the GGUF's vocabulary has MiniMax's seven tokens (the
+GGUF's entries from 151669 on are unused `[PAD151669]`, ...): the pipeline adds them to both, see
+the prompt's tokens below.
 
 The single-file audio VAE against the release folder (both downloaded): `h3_audio_check` (`--write`
 keeps one decoder's waveform as the reference for another) decodes 207 seeded normal latents per
@@ -456,6 +461,69 @@ on the CPU in float32, float activations in every quantized layer):
   forward's velocities differ by 9.2% (video) and 1.8% (audio) for that reason, the last
   forward's by 3.8% and 1.4%.
 
+**The prompt's tokens and its embedding against transformers.** The runs above take oxinfer's
+prompt embedding, so the text path was checked on its own against diffusers' text step
+(`MiniMaxH3TextEncoderStep` and `get_qwen3vl_prompt_embeds`, diffusers 0.43.0 with transformers
+5.23.0), for the two prompts of the [real runs](#real-runs):
+
+- what the reference feeds the conditioner: `tokenizer(prompt, add_special_tokens=False)`, no
+  chat template, no system prompt, no padding or truncation, an attention mask of ones, and
+  `text_encoder.model(...).hidden_states[50]` handed to the transformer unchanged (no norm, no
+  crop, no scaling), every row tagged as text (1). ComfyUI (`comfy/text_encoders/minimax.py`)
+  builds the same sequence: the raw prompt, no template, no start or end token, the last of 50
+  layers without the final norm;
+- the release's `tokenizer/` is Qwen's `tokenizer.json` (26 added tokens, the last `</think>` at
+  151668) beside a `tokenizer_config.json` whose `additional_special_tokens` names seven more:
+  transformers appends them (`<d>` 151669, `</d>` 151670, `<|cutoff|>`, `<|lyrics_start|>`,
+  `<|lyrics_end|>`, `<|caption_start|>`, `<|caption_end|>` up to 151675), and ComfyUI adds the same
+  seven to its bundled Qwen tokenizer under the same ids (its `MINIMAX_EXTRA_TOKENS`; both
+  tokenizers give the same ids for the two prompts). **oxinfer read `tokenizer.json` alone, and a
+  GGUF's vocabulary has unused `[PAD151669]`... entries there, so it split the two tags**: the
+  speech prompt's ` <d>[` and `.</d>` were the six tokens ` <`, `d`, `>[` and `.</`, `d`, `>`
+  (159 tokens) where the reference has ` `, `<d>`, `[` and `.`, `</d>` (158). The pipeline now adds
+  the seven tokens to whichever tokenizer it loaded (`video::EXTRA_TOKENS`, a unit test on a
+  small vocabulary);
+- with that, `h3_text_check dump` gives the reference's ids for both prompts (124 and 158),
+  through the Q8_0 and the Q4_K_M GGUF's vocabulary and through the release's `tokenizer.json`
+  (the same embedding byte for byte as with the GGUF's vocabulary). The dog prompt has no such
+  tag: its ids were the reference's before the change, and the embedding the dog runs used is
+  the one the new code computes, byte for byte;
+- the embedding: `tools/minimax_h3_text_ref.py` reads the Q8_0 GGUF with the `gguf` package,
+  dequantizes each tensor to float32 and runs transformers' `Qwen3VLTextModel` on the
+  reference's ids (the configuration from the GGUF's metadata, which is the release's
+  `text_config`; one decoder layer refilled 50 times, each layer's output taken before the
+  final norm; float32 on the CPU), against oxinfer on the stored Q8_0 blocks:
+
+| `hidden_states[i]`, oxinfer against transformers | dog (124 tokens): relative, all rows / worst row | speech (158 tokens) | largest difference (values up to) |
+|---|---|---|---|
+| 1 | 2.6e-6 / 4.0e-6 | 2.6e-6 / 4.4e-6 | 9.0e-5 (rows of norm 23) |
+| 2, 3 | 4.0e-6, 4.4e-6 / 1.5e-5, 1.8e-5 | 3.9e-6, 4.3e-6 / 1.5e-5, 1.8e-5 | 6.3e-4 |
+| 10, 25 | 4.9e-6, 4.6e-6 / 1.5e-5, 1.4e-5 | 4.9e-6, 4.6e-6 / 1.5e-5, 1.4e-5 | 0.072 in the first row (15,350) |
+| 49 | 3.6e-6 / 2.1e-5 | 3.6e-6 / 1.7e-5 | 0.055 in the first row |
+| **50, the conditioning** | **3.6e-6 / 1.8e-5** (4.4e-6 without the first row; 1.2e-3 at most on rows of norm 300) | **3.6e-6 / 1.9e-5** | 0.055 in the first row (15,350) |
+| controls: oxinfer's 50 against the reference's 49 and 51; its rows shifted by one | 24% and 23% (median row), cosine 0.979 and 0.976; 470% and 73% | | |
+
+Every row's cosine with the reference is 1.0000000. The first row (the first token sees only
+itself) has a norm of 15,485, 50 times the others' 301 in the median; the reference has it too,
+and it is part of what the transformer is given. So for these prompts oxinfer's conditioning is
+transformers' `hidden_states[50]` of the same Q8_0 values to float32 rounding: the layer index,
+the missing final norm, the positions and the rows kept are the reference's. The release loads
+its text encoder in bfloat16: the same reference with the weights rounded to bfloat16 and
+computed in bfloat16 (`--dtype bf16`, the dog prompt) is 1.2% from the float32 one (0.87% in the
+median row, 9.1% in the worst; 0.35% already after the first layer), so the reference pipeline's
+own embedding is known no better than that.
+
+The other inputs those runs shared with oxinfer, read against the same diffusers source: the
+transformer's `forward` takes the video rows, the audio rows, the prompt embedding, the timesteps
+with their row indices, the tags, the positions and the three index lists, and nothing else (no
+frame rate, duration, size or guidance input, no negative prompt); the torch run built tags,
+positions and timesteps with diffusers' own helpers from the request's geometry and found
+oxinfer's positions equal. The noise is standard normal with no scaling (the first sigma is 1):
+diffusers draws the video noise as a `[1, 24, frames, h, w]` tensor and packs it as oxinfer does
+(frame-major rows of `[channel, 2, 2]`), then the audio noise directly as rows, in that order
+from one generator; oxinfer draws the same shapes in the same order from its own generator, so
+its noise is another sample, not torch's for the same seed.
+
 Not checked or not done:
 
 - the real runs are few and small (see [below](#real-runs)): nothing at 1344x768 longer than 22
@@ -476,8 +544,10 @@ Not checked or not done:
   transformers read 40, so the text path (above) and the command (run on the three quantized tiny
   transformers with the int8 VAE, a LoRA named `*turbo_4step*768p*` and a stored prompt embedding:
   4 forwards, 22 frames written) were run separately;
-- what a quantized text encoder does was measured on one prompt only (Q4_K_M against Q8_0, below);
-  neither was compared with the bf16 encoder, and `--quant q8` was not run;
+- the Q8_0 text encoder is computed as transformers computes it from the same values (above), but
+  what Q8_0 weights do to the embedding against the release's bf16 weights was not measured (the
+  63 GB encoder was not downloaded); Q4_K_M was compared with Q8_0 on two prompts (below), and
+  `--quant q8` was not run;
 - keyframes with a GGUF text encoder (the vision tower is a separate `mmproj` file, not read
   here) or with a single-file one (its `visual.*` tensors are there, but the tower's
   configuration is not, and it is not built from the shapes), LoRAs on the text encoder, LoRA
@@ -490,20 +560,23 @@ same request), a `--profile ci` build (release without LTO), `--seed 1`, every f
 `minimax_h3_fl2va_pruned_fp8_scaled` (21.0 GB), `minimax_h3_video_vae_fp16` (5.2 GB),
 `minimax_h3_audio_vae_fp32` (0.6 GB), a turbo LoRA (2.0 GB) and `Qwen3-VL-32B-Instruct-Q8_0.gguf`
 (34.8 GB). All of them load without a change to the loaders: transformer, VAEs and LoRA (208
-modules) in 6 to 10 s, the text encoder's 124- and 159-token prompts in 5.7 s with Q8_0 and 18.8 s
-with Q4_K_M (load included). Peak resident memory 28.6 GB (6.9 GB of it allocated, the rest mapped
+modules) in 6 to 10 s, the text encoder's 124- and 158-token prompts in 5.3 to 5.7 s with Q8_0 and
+18.8 s with Q4_K_M (load included). Peak resident memory 28.6 GB (6.9 GB of it allocated, the rest mapped
 weights), 31.2 GB when the text encoder runs in the same process. Two prompts in the release's
 form: a woman at a kitchen table who says `<d>[English] Good morning. The coffee is ready.</d>`
 and lifts a mug ("speech"), and a golden retriever on a lawn that barks three times, then pants
-("dog").
+("dog"). The speech prompt was first run with its `<d>` and `</d>` split into three tokens each
+(159 text rows, [above](#what-was-checked-1)); the 124-frame Q8_0 run was redone with the
+release's tokens (158 rows), the two other speech runs were not, and are marked "split tags".
 
 | run | rows | forwards | VAE | total |
 |---|---|---|---|---|
-| speech, 448x256, 124 frames, 4-step 768p LoRA (shifts 6 / 3) | 4144 video + 414 audio + 159 text | 4 in 1286 s (322 s each) | 319 s | 27 min |
-| dog, the same settings | 4717 in all | 4 in 1322 to 1894 s | 316 to 345 s | 27 to 38 min |
-| speech, the same with the Q4_K_M text encoder | | 4 in 1617 s | 320 s | 33 min |
-| dog, 448x256, 124 frames, 8-step LoRA (shifts 12 / 3) | 4717 in all | 8 in 2743 s (343 s each) | 317 s | 51 min |
-| speech, 1344x768, 22 frames, 4-step 768p LoRA | 7056 video + 74 audio + 159 text | 4 in 3004 s (751 s each) | 663 s | 61 min |
+| speech, 448x256, 124 frames, 4-step 768p LoRA (shifts 6 / 3) | 4144 video + 414 audio + 158 text | 4 in 1300 s (325 s each) | 310 s | 27 min |
+| the same with split tags | 4144 video + 414 audio + 159 text | 4 in 1286 s (322 s each) | 319 s | 27 min |
+| dog, the same settings | 4682 in all | 4 in 1322 to 1894 s | 316 to 345 s | 27 to 38 min |
+| speech (split tags), the same with the Q4_K_M text encoder | 4717 in all | 4 in 1617 s | 320 s | 33 min |
+| dog, 448x256, 124 frames, 8-step LoRA (shifts 12 / 3) | 4682 in all | 8 in 2743 s (343 s each) | 317 s | 51 min |
+| speech (split tags), 1344x768, 22 frames, 4-step 768p LoRA | 7056 video + 74 audio + 159 text | 4 in 3004 s (751 s each) | 663 s | 61 min |
 | dog, 448x256, 22 / 56 frames, 4-step 768p LoRA | 982 / 2214 in all | 4 in 147 s / 437 s | 45 s / 135 s | 3.3 / 9.7 min |
 
 The audio VAE takes 0.3 to 1.3 s. Attention is 46 to 60% of the forwards' time (`--profile`) and
@@ -517,10 +590,14 @@ What the frames show (contact sheets read by the model that ran this, not by a p
   background through the clip, the described actions in order (she speaks, smiles, lifts the mug
   and drinks; the dog barks with its head raised three times, then pants). **With flaws**: in the
   dog clip coloured blobs (green, yellow, pink, about 60 x 90 pixels) appear on the lawn and the
-  fence for about four frames each in most of the clip, and its contrast is harsh; the speech
-  clip has none with the Q8_0 encoder and two with Q4_K_M. The same prompt and seed at 22 and 56
-  frames, at 1344x768 and with the 8-step LoRA have none. The blobs are what these weights give
-  on this request, not something oxinfer adds:
+  fence for about four frames each in most of the clip, and its contrast is harsh. The speech
+  clip has them too with the release's tokens (blue, purple and pink, on the plants at the
+  window, the mug, the bowl and the cupboard, in about 15 of every third frame's 42); with the
+  split tags it had none with the Q8_0 encoder and two with Q4_K_M, so the first speech clip was
+  clean by the luck of a slightly different embedding, not because speech is spared. The dog
+  prompt and seed at 22 and 56 frames, the speech prompt (split tags) at 1344x768 and the dog
+  with the 8-step LoRA have none. The blobs are what these weights give on this request, not
+  something oxinfer adds:
   - they are in the denoised rows, not made by the VAE (decoding the first 17 latent frames
     alone gives the same blobs), and no value of those rows is out of range (all within 4.3
     standard deviations);
@@ -540,12 +617,19 @@ What the frames show (contact sheets read by the model that ran this, not by a p
   Why these weights do that here was not found. lightx2v's table gives 1344x768 as the 768p
   file's only training resolution, and this request is 448x256; the transformer is the FP8
   rounding of the bf16 one the LoRA's header names as its base; a small change of the
-  conditioning (Q4_K_M for Q8_0) adds or removes blobs. Which of these matters was not separated: the bf16
+  conditioning (Q4_K_M for Q8_0, or the speech prompt's two tags as one token each instead of
+  three) adds or removes blobs. Which of these matters was not separated: the bf16
   transformers were not downloaded, 1344x768 at 124 frames was not run (37,869 rows), and
-  nothing was sampled in ComfyUI itself (its nodes and sampler, on a GPU). One part of oxinfer
-  is shared by all three runs and so is not cleared by them: the prompt embedding, which comes
-  from oxinfer's reading of the Q8_0 GGUF text encoder and was not compared with the bf16
-  encoder's in transformers (the noise is oxinfer's too, and passes normality checks);
+  nothing was sampled in ComfyUI itself (its nodes and sampler, on a GPU). The prompt embedding,
+  which those three runs shared, is not the cause either: the dog prompt's token ids are the
+  ones diffusers' text step and ComfyUI's tokenizer give, and its embedding is transformers'
+  `hidden_states[50]` on the same Q8_0 values within 3.6e-6 (1.8e-5 in the worst row,
+  [above](#what-was-checked-1)). What is left of the conditioning is the Q8_0 rounding of the
+  encoder's weights, not measured against the bf16 encoder; for scale, the release's own
+  arithmetic (bfloat16 weights and activations instead of float32, in transformers on the same
+  values) moves that embedding by 1.2% (0.87% in the median row, 9.1% in the worst), and Q4_K_M
+  moves it by 5%. The noise is oxinfer's own generator's, standard normal in the reference's
+  layout (it passes normality checks);
 - 448x256, 124 frames, 8-step LoRA (the dog): clean, softer and more natural than the 4-step clip;
 - 1344x768, 22 frames: clean and detailed (knit of the sweater, the hands on the mug), but the
   whole prompt is played in 0.9 s, below the 5 s the model is made for.
@@ -555,9 +639,10 @@ with `--transcribe`; nobody listened):
 
 | run | level (RMS / peak, both channels alike) | content | Whisper |
 |---|---|---|---|
-| speech, 124 frames, Q8_0 | -31 dBFS / 0.33, no clipping, 69% of the 20 ms windows below -60 dBFS | two voiced segments with harmonics and formants at 0 to 0.7 s and 2.0 to 2.9 s, near silence between and after | `Good morning. The coffee is ready.` (English, p = 0.97) |
-| speech, 124 frames, Q4_K_M | -31 dBFS / 0.30 | the same two segments at the same times | `Good morning. The coffee is ready.` |
-| speech, 1344x768, 22 frames | -16.5 dBFS / 0.91 | continuous speech over the 0.9 s | `The coffee is ready.` |
+| speech, 124 frames, Q8_0 | -22 dBFS / 0.71 and 0.76, no clipping, 47% and 54% of the 20 ms windows below -60 dBFS | two voiced segments with harmonics and formants at 0.3 to 1.1 s and 2.0 to 2.9 s, near silence between and after | `Good morning. The coffee is ready.` (English, p = 1.00) |
+| the same with split tags | -31 dBFS / 0.33, no clipping, 69% silent windows | two voiced segments at 0 to 0.7 s and 2.0 to 2.9 s | `Good morning. The coffee is ready.` (p = 0.97) |
+| speech (split tags), 124 frames, Q4_K_M | -31 dBFS / 0.30 | the same two segments at the same times | `Good morning. The coffee is ready.` |
+| speech (split tags), 1344x768, 22 frames | -16.5 dBFS / 0.91 | continuous speech over the 0.9 s | `The coffee is ready.` |
 | dog, 124 frames, 4-step | -23 dBFS / 0.71, 63% silent windows | three bursts of 0.15 s at 0.9, 2.3 and 2.8 s, energy up to 15 kHz, most of it below 2 kHz; five weaker bursts from 3.6 s (panting) | `dog barking` |
 | dog, 124 frames, 8-step | -16 dBFS / 1.0, 0.17% of the samples at the clamp | three barks with clear harmonics at 0.9, 2.0 and 2.8 s, panting after, short chirps at 4 to 5 kHz (the prompt asks for birdsong) | `Woo! Woo! Woo!` |
 
@@ -567,12 +652,22 @@ samples per latent: 165,600 samples (5.175 s) for 124 frames (5.167 s), 29,600 (
 32 kHz stereo with that many samples, and ffmpeg converts them to H.264 + AAC. Whether the sound
 is in sync with the picture (lips, barks) was not judged.
 
-**The text encoder at Q4_K_M** against Q8_0, the speech prompt: `hidden_states[50]` differs by
-4.9% (relative, without the first row, whose norm is 50 times the others'; 5% in the median row,
-9.9% at most; cosine 0.9988 in the median row). The video is another sample of the same scene (the
-same woman, kitchen and actions, a different bowl on the counter; 22.7 dB PSNR between the two),
-with the two blobs noted above; the soundtrack has the same words at the same times (correlation
-0.85 with the Q8_0 one). One prompt and one seed: not enough to say Q4_K_M is worse.
+**The text encoder at Q4_K_M** against Q8_0: `hidden_states[50]` differs by 5.0% for the speech
+prompt and 5.4% for the dog prompt (relative, without the first row, whose norm is 50 times the
+others'; 4.9% in the median row of both, 9.9% and 20% at most; cosine 0.9988 in the median row).
+The videos were compared for the speech prompt with split tags (the embeddings differed by 4.9%
+there too): another sample of the same scene (the same woman, kitchen and actions, a different
+bowl on the counter; 22.7 dB PSNR between the two), with the two blobs noted above; the
+soundtrack has the same words at the same times (correlation 0.85 with the Q8_0 one). One prompt
+and one seed: not enough to say Q4_K_M is worse.
+
+**The speech prompt's tags.** With `<d>` and `</d>` as the release's single tokens instead of
+three tokens each, the 87 rows before the first tag are unchanged, and the 57 rows after the
+second differ by 6.8% from what they were (3.6% in the median row, 30% at most). The clip is
+another sample of the same scene with the same words (`Good morning.` now starts at 0.3 s
+instead of 0 s, the second sentence at 2.0 s in both), 9 dB louder, and with the blobs noted
+above where the first clip had none: one seed each, so neither the level nor the blobs can be
+put down to the tokens.
 
 ### Still not supported
 
