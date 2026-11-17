@@ -35,7 +35,12 @@
 //! - FP8 "scaled" weights (`float8_e4m3fn` times the scalar `<module>.weight_scale`, ComfyUI's
 //!   `QUANTIZATION.md`), used as stored. `input_scale` (a calibrated activation scale for
 //!   ComfyUI's FP8 kernels) and `comfy_quant` are not read: the product runs in float32 on the
-//!   decoded weights, ComfyUI's `full_precision_matrix_mult`.
+//!   decoded weights, ComfyUI's `full_precision_matrix_mult`;
+//! - `int8_tensorwise` weights with ConvRot (`*_int8_convrot.safetensors`: int8 rows with a scale
+//!   per row, stored rotated by a grouped regular Hadamard matrix; used as stored, the input
+//!   rotated first), read by [`crate::comfy_quant`] from each module's `comfy_quant` entry.
+//!   Float32 products too: ComfyUI's int8 kernels also round the rotated input to int8, which is
+//!   not done.
 
 use crate::kernels::*;
 use crate::model::{Lin, Quant, linear, load_lin};

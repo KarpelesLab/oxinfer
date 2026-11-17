@@ -72,6 +72,10 @@ pub enum GgmlType {
     /// FP8 E4M3 (`float8_e4m3fn`) with block scales ([`GgufMatrix::fp8`]): safetensors FP8 checkpoints,
     /// not a GGUF type (the id is outside GGUF's range, and [`GgmlType::ALL`] leaves it out).
     F8E4M3 = 0x1000,
+    /// Plain int8 values times the matrix's block scales ([`GgufMatrix::i8`]: one scale per row
+    /// or one for the matrix): ComfyUI's `int8_tensorwise` safetensors weights, not a GGUF type.
+    /// Runs through the f32 path, so activations are not rounded.
+    I8 = 0x1001,
     /// NVFP4 in ggml's layout (type 40): blocks of 64 E2M1 values with an unsigned E4M3 scale per
     /// 16, here from compressed-tensors checkpoints (MiniMax M3.1's experts) with the tensor's
     /// global scale as a whole-matrix [`BlockScales`]. Runs through the f32 path; GGUF files of
@@ -155,6 +159,7 @@ impl GgmlType {
             BF16 => "BF16",
             MXFP4 => "MXFP4",
             F8E4M3 => "F8_E4M3",
+            I8 => "I8",
             NVFP4 => "NVFP4",
             TQ1_0 => "TQ1_0",
             TQ2_0 => "TQ2_0",
@@ -168,7 +173,7 @@ impl GgmlType {
     pub fn block_size(self) -> usize {
         use GgmlType::*;
         match self {
-            F32 | F16 | BF16 | F8E4M3 => 1,
+            F32 | F16 | BF16 | F8E4M3 | I8 => 1,
             Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | IQ4_NL | MXFP4 => 32,
             NVFP4 | Q2_0 => 64,
             Q1_0 | PQ2_0 | PTQ1_0 => 128,
@@ -181,7 +186,7 @@ impl GgmlType {
         match self {
             F32 => 4,
             F16 | BF16 => 2,
-            F8E4M3 => 1,
+            F8E4M3 | I8 => 1,
             Q4_0 => 18,
             Q4_1 => 20,
             Q5_0 => 22,
@@ -215,7 +220,7 @@ impl GgmlType {
     pub fn is_float(self) -> bool {
         matches!(
             self,
-            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::F8E4M3 | GgmlType::NVFP4
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::F8E4M3 | GgmlType::NVFP4 | GgmlType::I8
         )
     }
     /// Bytes of a row of `n` elements (`n` must be a multiple of the block size).
@@ -335,6 +340,23 @@ impl GgufMatrix {
         Ok(m)
     }
 
+    /// An int8 matrix (`n_out` rows of `n_in` bytes) with one scale per row (`scales.len() ==
+    /// n_out`) or one for the whole matrix.
+    pub fn i8(data: QBuf<u8>, scales: QBuf<f32>, n_out: usize, n_in: usize) -> Result<Self> {
+        let rows = match scales.len() {
+            1 => n_out,
+            l if l == n_out => 1,
+            l => bail!("int8 [{n_out}, {n_in}]: {l} scales (expected 1 or {n_out})"),
+        };
+        let mut m = Self::new(GgmlType::I8, data, n_out, n_in)?;
+        m.block_scales = Some(BlockScales {
+            s: scales,
+            rows,
+            cols: n_in,
+        });
+        Ok(m)
+    }
+
     /// Wraps `data` (`n_out` rows of `kind.row_bytes(n_in)` bytes). Rows must hold whole blocks,
     /// and quantized formats need `n_in` to be a multiple of 32 (the activation block).
     pub fn new(kind: GgmlType, data: QBuf<u8>, n_out: usize, n_in: usize) -> Result<Self> {
@@ -386,6 +408,15 @@ impl GgufMatrix {
     /// as `dequantize_row`, through NEON or AVX2 where available.
     pub fn dequantize_rows(&self, r0: usize, r1: usize, out: &mut [f32]) {
         let n = self.n_in;
+        if self.kind == GgmlType::I8 {
+            for (i, r) in (r0..r1).enumerate() {
+                let s = self.block_scales.as_ref().map_or(1.0, |bs| bs.s[r / bs.rows]);
+                for (o, &q) in out[i * n..(i + 1) * n].iter_mut().zip(self.row(r)) {
+                    *o = q as i8 as f32 * s;
+                }
+            }
+            return;
+        }
         if let Some(bs) = self.block_scales.as_ref().filter(|_| self.kind != GgmlType::F8E4M3) {
             // Scales on top of what the kind decodes (NVFP4's global scale).
             let ncb = n.div_ceil(bs.cols);
@@ -616,6 +647,13 @@ pub fn dequantize_row(kind: GgmlType, src: &[u8], out: &mut [f32]) {
         BF16 => {
             for (o, c) in out.iter_mut().zip(src.as_chunks::<2>().0) {
                 *o = bf16_to_f32(u16::from_le_bytes(*c));
+            }
+            return;
+        }
+        // Unscaled, as F8E4M3 below.
+        I8 => {
+            for (o, &b) in out.iter_mut().zip(src) {
+                *o = b as i8 as f32;
             }
             return;
         }
@@ -918,7 +956,7 @@ pub fn dequantize_row(kind: GgmlType, src: &[u8], out: &mut [f32]) {
                     }
                 }
             }
-            F32 | F16 | BF16 | F8E4M3 => unreachable!(),
+            F32 | F16 | BF16 | F8E4M3 | I8 => unreachable!(),
         }
     }
 }
@@ -1194,7 +1232,7 @@ pub fn decode_i8(kind: GgmlType, b: &[u8], q: &mut [i8], s: &mut [f32], m: &mut 
             s.fill(d);
             false
         }
-        F32 | F16 | BF16 | F8E4M3 | NVFP4 => unreachable!("decode_i8 on f32-path type {kind}"),
+        F32 | F16 | BF16 | F8E4M3 | NVFP4 | I8 => unreachable!("decode_i8 on f32-path type {kind}"),
     }
 }
 

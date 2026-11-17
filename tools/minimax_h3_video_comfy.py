@@ -25,6 +25,18 @@ Writes into DIR/comfy:
   video_vae_fp16.safetensors        the video VAE as ComfyUI's single file: float16, MiniMax's names,
                                     the configuration in the `minimax_h3_video_vae` header entry
 
+and, when the `comfy_kitchen` package is installed (its quantizers write them), a second tiny
+transformer of width 64 (ConvRot groups are powers of 4) in ComfyUI's
+quantized forms, each `comfy_quant` entry as the files of Comfy-Org/MiniMax-H3 have it:
+  h3w_bf16.safetensors                 the wide transformer, unquantized
+  h3w_int8_convrot.safetensors         `int8_tensorwise` with ConvRot: the blocks' four matrices
+                                       (groups of 64) and AdaLN projections (groups of 16) as int8
+                                       rows with a scale per row
+  h3w_pruned_int8_convrot.safetensors  the pruned form with the blocks' four matrices so
+  lora_wide_comfyui.safetensors        a LoRA for the wide transformer
+  video_vae_int8_convrot.safetensors   the video VAE with the decoder blocks' four matrices as int8
+                                       ConvRot, its other decoder tensors float32
+
 and beside the tiny tool's references (`dit_v0.bin`, ...) the same outputs of diffusers for:
   pruned_*      the curve form (diffusers' model with the table and the [.., 8] projections)
   fp8_*         the curve form with the decoded FP8 weights
@@ -32,6 +44,14 @@ and beside the tiny tool's references (`dit_v0.bin`, ...) the same outputs of di
   loraadaln_*   the LoRA with the AdaLN modules merged
   fp8lora_*     the LoRA merged into the decoded FP8 weights, curve form
   fp16_*        the VAE with its weights rounded to float16 (moments, decoded clips)
+  wide_*        the wide transformer
+  int8_*, pint8_*   the wide transformer on the weights comfy_kitchen dequantizes from the two
+                quantized files (float32 products: ComfyUI's `full_precision_matrix_mult`)
+  pint8lora_*   the LoRA merged into the dequantized weights of the pruned int8 file
+  int8vae_*     the VAE with the dequantized decoder matrices of the int8 file
+  pint8a8_*     the pruned file through comfy_kitchen's `int8_linear`, which rounds the rotated
+                input of every quantized layer to int8 with a scale per row (what ComfyUI's int8
+                kernels compute; oxinfer does not)
 """
 import copy, json, os, sys
 
@@ -183,12 +203,20 @@ with torch.no_grad():
 mean = curve.mean(0)
 U, S, Vt = torch.linalg.svd(curve - mean, full_matrices=False)
 table = (U[:, :K] * S[:K]).float()
-pruned = {k: v for k, v in comfy.items() if not k.startswith("time_embedder.")}
-for k in [k for k in pruned if k.endswith("adaln_proj.linear.weight")]:
-    w, b = pruned[k].double(), pruned[k[:-6] + "bias"].double()
-    pruned[k] = (w @ Vt[:K].T).half()
-    pruned[k[:-6] + "bias"] = (b + w @ mean).half()
-pruned["adaln_t_table"] = table
+
+
+def prune(o, table, Vt, mean):
+    """ComfyUI state dict `o` in the curve form."""
+    pruned = {k: v for k, v in o.items() if not k.startswith("time_embedder.")}
+    for k in [k for k in pruned if k.endswith("adaln_proj.linear.weight")]:
+        w, b = pruned[k].double(), pruned[k[:-6] + "bias"].double()
+        pruned[k] = (w @ Vt[:K].T).half()
+        pruned[k[:-6] + "bias"] = (b + w @ mean).half()
+    pruned["adaln_t_table"] = table
+    return pruned
+
+
+pruned = prune(comfy, table, Vt, mean)
 
 
 def typed_pruned(o):
@@ -299,9 +327,9 @@ class Curve(torch.nn.Module):
         return torch.lerp(self.table[i0], self.table[i0 + 1], (p - i0).unsqueeze(1))
 
 
-def curve_model(o):
+def curve_model(o, base=None):
     """diffusers' model computing the curve form of ComfyUI state dict `o` (float32)."""
-    m = copy.deepcopy(dit)
+    m = copy.deepcopy(base or dit)
     full = {k: v.float() for k, v in o.items() if k != "adaln_t_table"}
     for k in [k for k in full if "adaln_proj.linear" in k]:
         full.pop(k)
@@ -356,8 +384,8 @@ def run(model, prefix):
     return rows
 
 
-def with_weights(state):
-    m = copy.deepcopy(dit)
+def with_weights(state, base=None):
+    m = copy.deepcopy(base or dit)
     m.load_state_dict(state)
     return m.eval()
 
@@ -378,6 +406,125 @@ dec_merged = merged(dec_sd, peft, lora_alpha)
 fp8_lora = dict(decoded)
 fp8_lora.update({k: v for k, v in to_comfy({**sd, **dec_merged}).items() if "adaln" not in k and not k.startswith("time_embedder.")})
 run(curve_model(fp8_lora), "fp8lora_")
+
+# ---- ComfyUI's int8 ConvRot forms, written by comfy_kitchen's quantizers --------------------------
+try:
+    import comfy_kitchen as ck
+    from comfy_kitchen.tensor import TensorWiseINT8Layout
+except ImportError:
+    ck = None
+    print("comfy_kitchen is not installed: the int8_convrot forms are not written")
+
+FOUR = (".qkv_proj.weight", ".out_proj.weight", ".fc1.weight", ".fc2.weight")
+
+
+def quantize(o, dec, key, fmt, group):
+    """Replaces `o[key]` by its quantized tensors (`fmt`: int8, ConvRot groups of `group`) and
+    `dec[key]` by comfy_kitchen's dequantization of them. Returns what `int8_linear` takes."""
+    base, w = key[: -len(".weight")], dec[key].float()
+    assert fmt == "int8"
+    q, p = TensorWiseINT8Layout.quantize(w, per_channel=True, convrot=True, convrot_groupsize=group)
+    o[key], o[base + ".weight_scale"] = q, p.scale
+    conf = {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": group}
+    dec[key] = TensorWiseINT8Layout.dequantize(q, p).float()
+    ops = ("int8", q, p.scale, group)
+    o[base + ".comfy_quant"] = torch.tensor(list(json.dumps(conf).encode()), dtype=torch.uint8)
+    return ops
+
+
+class A8(torch.nn.Module):
+    """A quantized layer as ComfyUI's int8 kernels compute it (comfy_kitchen's eager backend): the
+    input rotated, rounded to int8 with a scale per row, an integer product. `rows`: the rows of
+    the stored matrix this module holds."""
+
+    def __init__(self, ops, rows, bias=None):
+        super().__init__()
+        self.fmt, q, sc, self.group = ops
+        self.q, self.sc, self.bias = q[rows].contiguous(), sc[rows].contiguous(), bias
+
+    def forward(self, x):
+        return ck.int8_linear(x.float(), self.q, self.sc, self.bias, torch.float32, convrot=True, convrot_groupsize=self.group)
+
+
+def a8_model(m, ops):
+    """`m` with the quantized layers of `ops` (ComfyUI key -> `quantize`'s result) as `A8`."""
+    m = copy.deepcopy(m)
+    for key, op in ops.items():
+        cp = "token_refiner.blocks." if key.startswith("token_refiner.") else "blocks."
+        i, tail = key[len(cp):].split(".", 1)
+        blk = (m.token_refiner.refiner_blocks if cp.startswith("token") else m.transformer_blocks)[int(i)]
+        n = op[1].shape[0]
+        if tail == "attn.qkv_proj.weight":
+            for j, x in enumerate("qkv"):
+                setattr(blk.attn, f"to_{x}", A8(op, slice(j * n // 3, (j + 1) * n // 3)))
+        elif tail == "attn.out_proj.weight":
+            blk.attn.to_out[0] = A8(op, slice(None))
+        elif tail == "mlp.fc1.weight":  # diffusers: [value; gate]
+            blk.ff.net[0].proj = A8(op, torch.cat([torch.arange(n // 2, n), torch.arange(n // 2)]))
+        elif tail == "mlp.fc2.weight":
+            blk.ff.net[2] = A8(op, slice(None))
+        else:
+            raise KeyError(key)
+    return m
+
+
+if ck is not None:
+    torch.manual_seed(2)
+    wide = MiniMaxH3Transformer3DModel(
+        num_attention_heads=2, attention_head_dim=hd, hidden_size=64, num_layers=cfg.num_layers,
+        num_refiner_layers=cfg.num_refiner_layers, ffn_dim=ffn, in_channels=cfg.in_channels,
+        audio_in_channels=cfg.audio_in_channels, patch_size=tuple(cfg.patch_size), text_dim=cfg.text_dim,
+        freq_dim=cfg.freq_dim, time_embed_hidden_dim=cfg.time_embed_hidden_dim, time_embed_dim=32,
+        rope_freq_dim=cfg.rope_freq_dim,
+    ).float().eval()
+    with torch.no_grad():
+        for n, prm in wide.named_parameters():
+            prm.copy_((1.0 + torch.randn_like(prm) * 0.2) if "norm" in n and n.endswith("weight") else torch.randn_like(prm) * 0.1)
+            prm.copy_(prm.to(torch.bfloat16).float())
+    wsd = {k: v.clone() for k, v in wide.state_dict().items()}
+    wcomfy = to_comfy(wsd)
+    wcfg = {**release_cfg, "hidden_size": 64, "time_embed_dim": 32}
+    header = {"config": json.dumps({"transformer": {**wcfg, "image_model": "minimax_h3"}})}
+    save_file(typed(wcomfy), os.path.join(out, "h3w_bf16.safetensors"), header)
+    wfinal = run(wide, "wide_")
+
+    # The form of diffusion_models/minimax_h3_fl2va_int8_convrot.safetensors.
+    o, dec = dict(typed(wcomfy)), dict(wcomfy)
+    for k in [k for k in wcomfy if k.startswith("blocks.") and k.endswith(FOUR)]:
+        quantize(o, dec, k, "int8", 64)
+    for k in [k for k in wcomfy if k.startswith("blocks.") and k.endswith("adaln_proj.linear.weight")]:
+        quantize(o, dec, k, "int8", 16)
+    save_file(o, os.path.join(out, "h3w_int8_convrot.safetensors"), header)
+    r = run(with_weights(from_comfy(dec), wide), "int8_")
+    print(f"int8 ConvRot vs the wide transformer: max abs diff of the final rows {float((r - wfinal).abs().max()):.3e}")
+
+    with torch.no_grad():
+        wcurve = torch.nn.functional.silu(wide.time_embedder(wide.time_proj(t))).double()
+    wmean = wcurve.mean(0)
+    wU, wS, wVt = torch.linalg.svd(wcurve - wmean, full_matrices=False)
+    wpruned = prune(wcomfy, (wU[:, :K] * wS[:K]).float(), wVt, wmean)
+
+    # ..._pruned_int8_convrot.safetensors
+    o, dec, ops = dict(typed_pruned(wpruned)), dict(wpruned), {}
+    for k in [k for k in wpruned if k.startswith("blocks.") and k.endswith(FOUR)]:
+        ops[k] = quantize(o, dec, k, "int8", 64)
+    save_file(o, os.path.join(out, "h3w_pruned_int8_convrot.safetensors"))
+    r = run(curve_model(dec, wide), "pint8_")
+    ra = run(a8_model(curve_model(dec, wide), ops), "pint8a8_")
+    print(f"pruned int8 ConvRot: int8 activations (comfy_kitchen's int8_linear) vs float32 products, final rows: {float((ra - r).abs().max()):.3e}")
+
+    # A LoRA on it, merged into the dequantized weights.
+    wpeft = {}
+    for dp, _ in block_prefixes(wsd):
+        for m in ("attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0", "ff.net.0.proj", "ff.net.2"):
+            w = wsd[f"{dp}{m}.weight"]
+            wpeft[dp + m] = (bf16r(torch.randn(R, w.shape[1]) * 0.1), bf16r(torch.randn(w.shape[0], R) * 0.1))
+    save_file(comfy_lora(wpeft, lambda n: ALPHA), os.path.join(out, "lora_wide_comfyui.safetensors"), meta)
+    wdec_sd = from_comfy({k: v.float() for k, v in dec.items() if k != "adaln_t_table" and "adaln_proj.linear" not in k})
+    wl = dict(dec)
+    wl.update({k: v for k, v in to_comfy({**wsd, **merged(wdec_sd, wpeft, lora_alpha)}).items() if "adaln" not in k and not k.startswith("time_embedder.")})
+    run(curve_model(wl, wide), "pint8lora_")
+
 
 # ---- the video VAE as ComfyUI's single file --------------------------------------------------------
 vae = pretrained(AutoencoderKLMiniMaxH3, "vae")
@@ -437,4 +584,37 @@ with torch.no_grad():
     for t in case["decode"]:
         lat = load(f"latents_{t}.bin", (C, int(t), lh, lw))
         save(f"fp16_decoded_{t}.bin", vae.decode((lat * std + mean)[None], return_dict=False)[0][0].numpy())
+
+# ---- the video VAE with an int8 ConvRot decoder (vae/minimax_h3_video_vae_int8_convrot.safetensors) --
+if ck is not None:
+    iv = {k: (v if v.dim() == 5 else v.float()) for k, v in cv.items()}
+    dsd = {k: v.float() for k, v in vsd.items()}
+    heads = vc.decoder_num_attention_heads
+    for i in range(vc.decoder_num_layers):
+        p = f"decoder.transformer_blocks.{i}."
+        for mat in ("attn.to_qkv", "attn.to_out", "ff.w1", "ff.w2"):
+            w = cv[f"{p}{mat}.weight"].float()
+            group = next(g for g in (256, 64, 16, 4) if w.shape[1] % g == 0)
+            q, prm = TensorWiseINT8Layout.quantize(w, per_channel=True, convrot=True, convrot_groupsize=group)
+            iv[f"{p}{mat}.weight"], iv[f"{p}{mat}.weight_scale"] = q, prm.scale
+            iv[f"{p}{mat}.comfy_quant"] = torch.tensor(
+                list(json.dumps({"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": group}).encode()), dtype=torch.uint8)
+            d = TensorWiseINT8Layout.dequantize(q, prm).float()
+            if mat == "attn.to_qkv":  # [q k v] per head -> diffusers' three matrices
+                for x, wx in zip("qkv", d.reshape(heads, 3, vhd, -1).transpose(0, 1).reshape(d.shape).chunk(3)):
+                    dsd[f"{p}attn.to_{x}.weight"] = wx
+            elif mat == "ff.w1":
+                gate, value = d.chunk(2)
+                dsd[f"{p}ff.net.0.proj.weight"] = torch.cat([value, gate])
+            else:
+                dsd[p + {"attn.to_out": "attn.to_out.0", "ff.w2": "ff.net.2"}[mat] + ".weight"] = d
+    save_file({k: v.contiguous() for k, v in iv.items()}, os.path.join(out, "video_vae_int8_convrot.safetensors"),
+              {"minimax_h3_video_vae": json.dumps(vmeta)})
+    vae.load_state_dict(dsd)
+    with torch.no_grad():
+        save("int8vae_moments.bin", vae.encode(video, return_dict=False)[0].parameters[0].numpy())
+        save("int8vae_moments1.bin", vae.encode(video[:, :, :1], return_dict=False)[0].parameters[0].numpy())
+        for t in case["decode"]:
+            lat = load(f"latents_{t}.bin", (C, int(t), lh, lw))
+            save(f"int8vae_decoded_{t}.bin", vae.decode((lat * std + mean)[None], return_dict=False)[0][0].numpy())
 print("wrote", out)

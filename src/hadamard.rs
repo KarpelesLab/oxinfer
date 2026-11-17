@@ -31,6 +31,9 @@ pub struct Fold {
     /// `(head_dim, key_heads, repeat)`: the input holds `key_heads * repeat` value heads of
     /// `head_dim` in tiled order (head `k + key_heads * r`), read in grouped order (`r + repeat * k`).
     pub perm: Option<(usize, usize, usize)>,
+    /// The rotation is ComfyUI's ConvRot ([`fwht_regular`], `block` a power of 4) instead of the
+    /// Sylvester transform; `signs` may then be any per-input factor (see [`crate::comfy_quant`]).
+    pub regular: bool,
 }
 
 /// The normalized Walsh-Hadamard transform of `x` (a power-of-two length), in Sylvester order:
@@ -54,11 +57,44 @@ pub fn fwht(x: &mut [f32]) {
     x.iter_mut().for_each(|v| *v *= scale);
 }
 
+/// The normalized regular Hadamard transform of `x` (a power-of-four length): the Kronecker power
+/// of `[[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]]` over `sqrt(n)`, symmetric and
+/// its own inverse, every row summing to `sqrt(n)` (comfy_kitchen's `_build_hadamard`, the ConvRot
+/// rotation of ComfyUI's `int8_tensorwise` / `w6a8_int8` weights). A length of 1 is the identity.
+pub fn fwht_regular(x: &mut [f32]) {
+    let n = x.len();
+    debug_assert!(n.is_power_of_two() && n.trailing_zeros().is_multiple_of(2));
+    let mut h = 1;
+    while h < n {
+        for quad in x.chunks_exact_mut(4 * h) {
+            let (ab, cd) = quad.split_at_mut(2 * h);
+            let ((a, b), (c, d)) = (ab.split_at_mut(h), cd.split_at_mut(h));
+            for i in 0..h {
+                let t = a[i] + b[i] + c[i] + d[i];
+                (a[i], b[i], c[i], d[i]) = (t - 2.0 * d[i], t - 2.0 * c[i], t - 2.0 * b[i], t - 2.0 * a[i]);
+            }
+        }
+        h *= 4;
+    }
+    let scale = 1.0 / (n as f32).sqrt();
+    x.iter_mut().for_each(|v| *v *= scale);
+}
+
 impl Fold {
+    fn rotate(&self, x: &mut [f32]) {
+        if self.regular {
+            x.chunks_exact_mut(self.block).for_each(fwht_regular);
+        } else {
+            x.chunks_exact_mut(self.block).for_each(fwht);
+        }
+    }
+
     /// `H (D x)` of every row of `x` (rows of `n_in`), into `out`.
     pub fn apply(&self, x: &[f32], n_in: usize, out: &mut [f32]) {
         debug_assert!(x.len() == out.len() && x.len().is_multiple_of(n_in) && n_in.is_multiple_of(self.block));
-        for (xr, o) in x.chunks_exact(n_in).zip(out.chunks_exact_mut(n_in)) {
+        // Rows in parallel once there are enough of them (a diffusion transformer's sequence).
+        crate::kernels::for_chunks(out, n_in, x.len() >= 1 << 18, |i, o| {
+            let xr = &x[i * n_in..(i + 1) * n_in];
             match self.perm {
                 Some((hd, nk, rep)) => {
                     for k in 0..nk {
@@ -73,13 +109,13 @@ impl Fold {
             for (v, &s) in o.iter_mut().zip(&self.signs) {
                 *v *= s;
             }
-            o.chunks_exact_mut(self.block).for_each(fwht);
-        }
+            self.rotate(o);
+        });
     }
 
     /// A latent table row back in the model's basis, in place: `D (H z)`.
     pub fn unfold(&self, row: &mut [f32]) {
-        row.chunks_exact_mut(self.block).for_each(fwht);
+        self.rotate(row);
         for (v, &s) in row.iter_mut().zip(&self.signs) {
             *v *= s;
         }
@@ -238,6 +274,7 @@ pub fn parse(h: &Header) -> Result<Option<Spec>> {
             block,
             signs: sv,
             perm: perm_dims,
+            regular: false,
         });
         folds.insert((width, perm), f.clone());
         Ok(f)
@@ -341,6 +378,7 @@ mod tests {
                 block,
                 signs: signs.clone(),
                 perm,
+                regular: false,
             };
             let mut xf = vec![0f32; x.len()];
             f.apply(&x, n_in, &mut xf);
@@ -365,6 +403,7 @@ mod tests {
             block,
             signs: signs.clone(),
             perm: None,
+            regular: false,
         };
         // A latent row z = H (D e) reads back as e.
         let e: Vec<f32> = (0..n_in).map(|_| lcg(&mut seed)).collect();

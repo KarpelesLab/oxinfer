@@ -302,7 +302,10 @@ impl<'a> Table<'a> {
 /// present (zero-copy), otherwise bf16 quantized to `q` at load (and recorded for `--save-quantized`).
 pub fn load_lin<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usize, q: Quant) -> Result<Lin<'a>> {
     let mut l = load_lin_stored(files, full, n_out, n_in, q)?;
-    l.fold = files.fold(full, false);
+    // A ComfyUI weight brings its own input transform (its rotation).
+    if let Some(f) = files.fold(full, false) {
+        l.fold = Some(f);
+    }
     Ok(l)
 }
 
@@ -323,6 +326,10 @@ fn load_lin_stored<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: us
     // MLX 4-bit: repacked as affine Q4 whatever `q` asks for (other widths dequantize to bf16 below).
     if let Some(m) = files.mlx_q4(full, n_out, n_in)? {
         return Ok(Lin::q4(m));
+    }
+    // ComfyUI's `comfy_quant` weights (int8 with ConvRot).
+    if let Some(l) = crate::comfy_quant::lin(files, full, n_out, n_in)? {
+        return Ok(l);
     }
     // MXFP4 (compressed-tensors): repacked into ggml's MXFP4 blocks.
     if is_mxfp4(files, full) {
