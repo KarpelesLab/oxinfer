@@ -50,6 +50,9 @@ as the output without its extension (`-o fox.webp` and `-o fox.png` both write `
 weights are absent), so the 63 GB text encoder and the 66 GB transformer need not be on disk
 together. `OXINFER_H3_LATENTS=FILE` keeps the denoised video and audio rows the same way: a second
 run with the same size and frame count only decodes them (the two VAEs, no forwards).
+`OXINFER_H3_DUMP=DIR` keeps what every forward reads and returns as float32 files in DIR, for a
+comparison with another implementation on the same inputs (see
+[the real files against torch and ComfyUI](#what-was-checked-1)).
 
 ## The release
 
@@ -398,11 +401,67 @@ VAE as single files, a LoRA named `*turbo_4step*768p*`, a stored prompt embeddin
 shifts 6 / 3 and 22 frames written; `--steps`, `--shift` and `--audio-shift` override the LoRA's
 settings, and a single-file `--model` without `--vae` is refused.
 
+**A real request's sequence on a tiny transformer.** The tiny cases above have 191 rows, heads of
+32 and two keyframes. `tools/minimax_h3_video_long.py` writes a tiny random transformer with the
+real heads (128 wide, 16 rotary frequencies per axis) and diffusers' outputs on the sequence of a
+real request: 448x256, 124 frames (37 latent frames of 8 x 14 rows, 414 audio rows), no
+keyframes, 5 sigma points at shifts 6 / 3. `h3_video_check DIR --transformer DIR/transformer`
+(float32, CPU, max absolute difference):
+
+| transformer, sequence | first step's velocities, video / audio (mean magnitude) | rows after the 4 steps, video / audio (mean magnitude) |
+|---|---|---|
+| 3 heads, width 96, 3 blocks; 124 text rows, 4682 in all | 6.7e-6 / 2.5e-6 (0.90 / 0.87) | 1.9e-6 / 1.4e-6 (1.2 / 1.2) |
+| 7 heads, width 160, weights 2.5 times larger; 159 text rows, 4717 in all | 4.0e-4 / 3.1e-4 (17 / 14) | 1.5e-4 / 1.6e-4 (20 / 12) |
+
+**The real files against torch and ComfyUI.** A tiny checkpoint has neither the real weights'
+ranges (the packed sequence reaches 7e6 in the last blocks) nor their formats at full width, so
+one real request was redone outside oxinfer: the dog clip of the [real runs](#real-runs)
+(448x256, 124 frames, a 124-token prompt: 4682 rows, seed 1, the pruned FP8 transformer with the
+4-step 768p LoRA, the Q8_0 text encoder). `OXINFER_H3_DUMP=DIR` keeps every forward's rows and
+velocities, and with `OXINFER_H3_DUMP_BLOCKS=i` forward `i`'s sequence after every block.
+`tools/minimax_h3_video_ref.py` decodes the same two files in Python (FP8 times `weight_scale`,
+the LoRA merged in float32, the curve form of the timestep embedding) into diffusers'
+`MiniMaxH3Transformer3DModel` and runs its `forward`, its layout and timestep helpers and
+`MiniMaxH3Scheduler` unchanged, in float32 on the CPU, from oxinfer's noise and its prompt
+embedding (relative differences, torch against oxinfer):
+
+| what | video | audio |
+|---|---|---|
+| each of the 50 blocks on oxinfer's input of that block, first forward: the block's change of the sequence | 2.3e-6 to 2.0e-5 (median 5.8e-6) | (one sequence) |
+| the 50 blocks one after the other, first forward: the sequence after the last block | 5.1e-4 | |
+| one whole forward on oxinfer's rows before each of its four steps: the velocities | 3.2e-4, 3.1e-4, 2.6e-4, 1.6e-4 | 1.4e-5, 2.1e-5, 3.2e-5, 2.6e-5 |
+| the rows after the last step, from oxinfer's rows before it | 1.5e-4 (1.3e-2 at most, on values of standard deviation 1) | 2.7e-5 |
+| the whole sampling in torch from the same noise: the velocities of the four steps | 3.2e-4, 3.2e-3, 1.7e-2, 5.3e-2 | 1.4e-5, 9.5e-5, 1.3e-3, 8.1e-3 |
+| its final rows | 5.0% (per row: 0.035 rms in the median, 0.28 at most) | 0.84% |
+
+Each forward agrees within 3e-4; two samplings that each follow their own rows drift apart by
+about ten times per step, which is how much this model amplifies a difference of its input.
+Decoded by oxinfer's VAEs, the torch sampling's rows give the same clip as oxinfer's, flaws
+included (see the real runs).
+
+ComfyUI's own code on the same forward (`tools/minimax_h3_video_comfy_ref.py`: a ComfyUI
+checkout's `comfy.sd.load_diffusion_model`, `load_lora_for_models` and `MiniMaxH3Model.forward`
+on the CPU in float32, float activations in every quantized layer):
+
+- ComfyUI reads the file's unquantized tensors as oxinfer does (`condition_proj`, a norm, an
+  AdaLN projection, the video head: no difference), and its forward agrees with diffusers' on
+  the weights ComfyUI holds within 6.8e-5 (video) and 2.7e-6 (audio): the layout, the positions,
+  the curve form, the audio timestep and the block arithmetic are the same in the three
+  implementations;
+- its weights are not the same once a LoRA is loaded: on the CPU ComfyUI merges the LoRA into
+  each FP8 matrix and rounds the sum back to FP8 (stochastically, unbiased). In the first block
+  that rounding moves a matrix by 0.8 to 0.9% (relative, Frobenius) where the LoRA itself moves
+  it by 0.13 to 0.21%, and ComfyUI's change of the matrix has a cosine of 0.17 to 0.22 with the
+  LoRA's. oxinfer keeps the FP8 matrix and adds the LoRA's product in float32. The first
+  forward's velocities differ by 9.2% (video) and 1.8% (audio) for that reason, the last
+  forward's by 3.8% and 1.4%.
+
 Not checked or not done:
 
 - the real runs are few and small (see [below](#real-runs)): nothing at 1344x768 longer than 22
-  frames, no run compared with ComfyUI or diffusers on the same files, and the unpruned and
-  pruned bf16 transformers, the other LoRA versions and `--quant q8` were not run;
+  frames, one request compared with torch and with ComfyUI's code on the same files (above) and
+  the others not, no sampling in ComfyUI itself (its nodes, its sampler, a GPU), and the
+  unpruned and pruned bf16 transformers, the other LoRA versions and `--quant q8` were not run;
 - no run on the real int8 ConvRot or W6A8 transformers, the int8 VAE or a single-file text encoder
   (bf16, int8, NVFP4): the sampled rows above show that their weights are read as ComfyUI reads
   them; what int8, 6-bit or FP4 weights do to a video, and whether int8 does better than FP8, was
@@ -459,12 +518,31 @@ What the frames show (contact sheets read by the model that ran this, not by a p
   and drinks; the dog barks with its head raised three times, then pants). **With flaws**: in the
   dog clip coloured blobs (green, yellow, pink, about 60 x 90 pixels) appear on the lawn and the
   fence for about four frames each in most of the clip, and its contrast is harsh; the speech
-  clip has none with the Q8_0 encoder and two with Q4_K_M. They are in the denoised rows, not
-  made by the VAE (decoding the first 17 latent frames alone gives the same blobs), no value of
-  those rows is out of range (all within 4.3 standard deviations), and the same prompt and seed
-  at 22 and 56 frames, at 1344x768 and with the 8-step LoRA have none. The 4-step file is
-  distilled at 1344x768; whether ComfyUI gives the same blobs with it at 448x256 was not checked,
-  so a fault of oxinfer's that only shows on 4-step, 4000-row requests is not excluded;
+  clip has none with the Q8_0 encoder and two with Q4_K_M. The same prompt and seed at 22 and 56
+  frames, at 1344x768 and with the 8-step LoRA have none. The blobs are what these weights give
+  on this request, not something oxinfer adds:
+  - they are in the denoised rows, not made by the VAE (decoding the first 17 latent frames
+    alone gives the same blobs), and no value of those rows is out of range (all within 4.3
+    standard deviations);
+  - of the four forwards' estimates of the clean rows (`x + sigma v`, decoded), the first two
+    (sigma 1 and 0.947) are clean, blurred then sharper; the third (0.857) has the blobs,
+    faint; the fourth (0.667), which is the result, has them at full strength;
+  - torch on the same files, from the same noise and prompt embedding (diffusers' transformer
+    and scheduler, [above](#what-was-checked-1): every forward within 3e-4 of oxinfer's on the
+    same rows), gives the same clip with the same blobs at the same places and frames, whether
+    it follows its own rows through the four steps or oxinfer's;
+  - ComfyUI's own model code with its own reading of the two files (four `MiniMaxH3Model`
+    forwards on the CPU from the same noise and embedding, Euler steps, oxinfer's VAEs) gives
+    the same scene with blobs too: several at the same places and frames, more saturated
+    (orange, teal), and others elsewhere. Its weights differ from oxinfer's by the FP8 rounding
+    of the merged LoRA (above), so its clip is another sample of the same request.
+
+  Why these weights do that here was not found. lightx2v's table gives 1344x768 as the 768p
+  file's only training resolution, and this request is 448x256; the transformer is the FP8
+  rounding of the bf16 one the LoRA's header names as its base; a small change of the
+  conditioning (Q4_K_M for Q8_0) adds or removes blobs. Which of these matters was not separated: the bf16
+  transformers were not downloaded, 1344x768 at 124 frames was not run (37,869 rows), and
+  nothing was sampled in ComfyUI itself (its nodes and sampler, on a GPU);
 - 448x256, 124 frames, 8-step LoRA (the dog): clean, softer and more natural than the 4-step clip;
 - 1344x768, 22 frames: clean and detailed (knit of the sweater, the hands on the mug), but the
   whole prompt is played in 0.9 s, below the 5 s the model is made for.
