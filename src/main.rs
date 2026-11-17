@@ -12,7 +12,6 @@ use std::time::Instant;
 
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
 mod anemll_cli;
-#[cfg(feature = "media")]
 mod arktts_cli;
 mod bagel_cli;
 #[cfg(feature = "media")]

@@ -50,10 +50,11 @@ jobs:
       - name: Clippy (all features, warnings denied)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      # The feature sets dependents use: none, oxideav-core types only, and the defaults.
+      # The feature sets dependents use: none (there with the binary, tests and examples too, as
+      # their feature gates break unseen otherwise), oxideav-core types only, and the defaults.
       - name: Clippy (feature subsets)
         run: |
-          cargo clippy --lib --no-default-features -- -D warnings
+          cargo clippy --all-targets --no-default-features -- -D warnings
           cargo clippy --lib --no-default-features --features oxideav -- -D warnings
           cargo clippy --all-targets -- -D warnings
 
