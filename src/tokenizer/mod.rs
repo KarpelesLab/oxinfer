@@ -703,19 +703,55 @@ impl Tokenizer {
             t.added_ids.insert(tok.content.clone(), id);
             t.added.insert(id, tok);
         }
-        t.raw_matcher = Matcher::new(
-            t.added
+        t.build_matchers();
+        Ok(t)
+    }
+
+    /// The matchers of the added tokens (raw and normalized text).
+    fn build_matchers(&mut self) {
+        self.raw_matcher = Matcher::new(
+            self.added
                 .iter()
                 .filter(|(_, a)| !a.normalized)
                 .map(|(&id, a)| (a.content.as_str(), id)),
         );
-        t.norm_matcher = Matcher::new(
-            t.added
+        self.norm_matcher = Matcher::new(
+            self.added
                 .iter()
                 .filter(|(_, a)| a.normalized)
-                .map(|(&id, a)| (t.normalized_cache.get(&id).map(String::as_str).unwrap_or(a.content.as_str()), id)),
+                .map(|(&id, a)| (self.normalized_cache.get(&id).map(String::as_str).unwrap_or(a.content.as_str()), id)),
         );
-        Ok(t)
+    }
+
+    /// Adds special tokens (matched on the raw text, never split) at the given ids: what
+    /// transformers does with the `additional_special_tokens` of a `tokenizer_config.json` that
+    /// `tokenizer.json` does not hold, which it numbers after the last id. A token already there
+    /// under that id is left as it is; an id held by another token, or the token under another
+    /// id, is an error.
+    pub fn add_special_tokens_at(&mut self, tokens: &[(&str, u32)]) -> Result<()> {
+        for &(content, id) in tokens {
+            match (self.token_to_id(content), self.token_str(id)) {
+                (Some(have), _) if have != id => bail!("tokenizer: {content:?} is token {have}, not {id}"),
+                (Some(_), _) if self.added.contains_key(&id) => continue,
+                (None, Some(other)) => bail!("tokenizer: id {id} is {other:?}, not {content:?}"),
+                _ => {}
+            }
+            self.special.insert(content.to_string());
+            self.added_ids.insert(content.to_string(), id);
+            self.added.insert(
+                id,
+                AddedToken {
+                    content: content.to_string(),
+                    single_word: false,
+                    lstrip: false,
+                    rstrip: false,
+                    normalized: false,
+                    special: true,
+                },
+            );
+        }
+        self.build_matchers();
+        Ok(())
     }
 
     /// Sets (or clears) truncation (an error when the stride does not fit in the length left

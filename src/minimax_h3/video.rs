@@ -1,7 +1,9 @@
 //! MiniMax-H3: text to video and first / last frame to video (the `t2va` / `fl2va` tasks of the
 //! `transformer/` checkpoint), following diffusers' modular `minimax_h3` pipeline:
 //!
-//! - the prompt verbatim (no chat template, no special tokens) through the Qwen3-VL text encoder,
+//! - the prompt verbatim (no chat template, no BOS or other token around it) through the
+//!   Qwen3-VL text encoder with the release's tokenizer, which has seven tokens more than Qwen's
+//!   ([`EXTRA_TOKENS`]: `<d>` ... `</d>` around a line of dialogue),
 //!   conditioning on `hidden_states[50]`; a keyframe prepends `"<Picture i>: "` and its vision
 //!   block, whose rows are tagged as video;
 //! - `17 n + 5` frames at 24 fps on a canvas whose sides are multiples of 32: `5 n + 2` latent
@@ -536,37 +538,7 @@ pub fn encode_prompt_quant(
     prompt: &str,
     keyframes: &[&Image],
 ) -> Result<Conditioning> {
-    use crate::qwen_vl::{QwenVl, QwenVlOptions};
-    let parent = text_encoder.parent().map(Path::to_path_buf).unwrap_or_default();
-    if crate::gguf::is_gguf(text_encoder) && !keyframes.is_empty() {
-        bail!("a GGUF text encoder has no vision tower: keyframes need the safetensors text encoder");
-    }
-    if text_encoder.is_file() && !keyframes.is_empty() {
-        bail!("the vision tower of a single-file text encoder is not read: keyframes need the text encoder's folder");
-    }
-    let opts = QwenVlOptions {
-        quant,
-        mmap: true,
-        vision: !keyframes.is_empty(),
-        tokenizer_dir: [
-            model.join("tokenizer"),
-            parent.join("tokenizer"),
-            text_encoder.to_path_buf(),
-            // Beside a single-file text encoder.
-            parent.clone(),
-        ]
-        .into_iter()
-        .find(|d| d.join("tokenizer.json").exists()),
-        ..Default::default()
-    };
-    let vl = QwenVl::load(text_encoder, &opts)?;
-    // ComfyUI's single files stop after the 50th layer.
-    if vl.model().cfg.num_hidden_layers < 50 {
-        bail!(
-            "the text encoder has {} layers; MiniMax-H3 conditions on its 50th",
-            vl.model().cfg.num_hidden_layers
-        );
-    }
+    let vl = load_text_encoder(model, text_encoder, quant, !keyframes.is_empty())?;
     let (mut ids, mut tags, mut images) = (Vec::new(), Vec::new(), Vec::new());
     for (i, k) in keyframes.iter().enumerate() {
         let im = vl.encode_image(&k.rgb, k.width, k.height, 0)?;
@@ -584,9 +556,68 @@ pub fn encode_prompt_quant(
     }
     tags.extend(std::iter::repeat_n(TAG_TEXT, pids.len()));
     ids.extend(pids);
-    let mut hs = vl.hidden_states_tokens(ids, &images, None, &[49])?;
+    let mut hs = vl.hidden_states_tokens(ids, &images, None, &[TEXT_LAYER - 1])?;
     let (_, text) = hs.layers.pop().context("layer 50 not captured")?;
     Ok(Conditioning { text, tags })
+}
+
+/// The conditioning is transformers' `hidden_states[TEXT_LAYER]`: the residual stream after this
+/// many layers of the text encoder.
+pub const TEXT_LAYER: usize = 50;
+
+/// The tokens MiniMax's `tokenizer/tokenizer_config.json` adds to Qwen's vocabulary
+/// (`additional_special_tokens`): transformers numbers them after the last id of `tokenizer.json`
+/// (151668, `</think>`), and ComfyUI's `MINIMAX_EXTRA_TOKENS` names the same ids. Neither the
+/// release's `tokenizer.json` nor a GGUF of Qwen3-VL-32B-Instruct holds them (the GGUF's entries
+/// there are unused `[PAD151669]`, ...); without them the `<d>` and `</d>` around a line of
+/// dialogue are three tokens each.
+pub const EXTRA_TOKENS: [(&str, u32); 7] = [
+    ("<d>", 151669),
+    ("</d>", 151670),
+    ("<|cutoff|>", 151671),
+    ("<|lyrics_start|>", 151672),
+    ("<|lyrics_end|>", 151673),
+    ("<|caption_start|>", 151674),
+    ("<|caption_end|>", 151675),
+];
+
+/// The text encoder of [`encode_prompt_quant`] with the release's tokenizer: the one found for
+/// `text_encoder` (see there) with MiniMax's [`EXTRA_TOKENS`]. `vision`: with the vision tower
+/// (keyframes).
+pub fn load_text_encoder(model: &Path, text_encoder: &Path, quant: crate::model::Quant, vision: bool) -> Result<crate::qwen_vl::QwenVl> {
+    use crate::qwen_vl::{QwenVl, QwenVlOptions};
+    let parent = text_encoder.parent().map(Path::to_path_buf).unwrap_or_default();
+    if crate::gguf::is_gguf(text_encoder) && vision {
+        bail!("a GGUF text encoder has no vision tower: keyframes need the safetensors text encoder");
+    }
+    if text_encoder.is_file() && vision {
+        bail!("the vision tower of a single-file text encoder is not read: keyframes need the text encoder's folder");
+    }
+    let opts = QwenVlOptions {
+        quant,
+        mmap: true,
+        vision,
+        tokenizer_dir: [
+            model.join("tokenizer"),
+            parent.join("tokenizer"),
+            text_encoder.to_path_buf(),
+            // Beside a single-file text encoder.
+            parent.clone(),
+        ]
+        .into_iter()
+        .find(|d| d.join("tokenizer.json").exists()),
+        ..Default::default()
+    };
+    let mut vl = QwenVl::load(text_encoder, &opts)?;
+    // ComfyUI's single files stop after the 50th layer.
+    if vl.model().cfg.num_hidden_layers < TEXT_LAYER {
+        bail!(
+            "the text encoder has {} layers; MiniMax-H3 conditions on its {TEXT_LAYER}th",
+            vl.model().cfg.num_hidden_layers
+        );
+    }
+    vl.tokenizer.add_special_tokens_at(&EXTRA_TOKENS)?;
+    Ok(vl)
 }
 
 impl VideoPipeline {
@@ -901,6 +932,53 @@ mod tests {
         assert_eq!(latent_frames(124, 17, 5), 37);
         assert_eq!(latent_frames(22, 17, 5), 7);
         assert_eq!(audio_latents(124), 207);
+    }
+
+    /// A byte-level BPE tokenizer over printable ASCII with Qwen's last added token, as the
+    /// release's `tokenizer.json` (and a GGUF's vocabulary) has it: nothing at 151669 and after.
+    fn ascii_tokenizer() -> crate::tokenizer::Tokenizer {
+        let mut vocab = serde_json::Map::new();
+        for (i, c) in (b'!'..=b'~').enumerate() {
+            vocab.insert((c as char).to_string(), serde_json::json!(i));
+        }
+        vocab.insert("\u{120}".into(), serde_json::json!(vocab.len()));
+        let byte_level = serde_json::json!({"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false, "use_regex": false});
+        let j = serde_json::json!({
+            "version": "1.0",
+            "added_tokens": [{"id": 151668, "content": "</think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": false}],
+            "normalizer": {"type": "NFC"},
+            "pre_tokenizer": byte_level,
+            "decoder": byte_level,
+            "model": {"type": "BPE", "vocab": vocab, "merges": []},
+        });
+        crate::tokenizer::Tokenizer::from_bytes(serde_json::to_vec(&j).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn dialogue_tags_are_single_tokens() {
+        let text = "says: <d>[English] Hi.</d> Then";
+        let mut tok = ascii_tokenizer();
+        let ids = |t: &crate::tokenizer::Tokenizer| t.encode(text, false).unwrap().get_ids().to_vec();
+        let plain = ids(&tok);
+        assert!(!plain.iter().any(|&i| i >= 151669));
+        tok.add_special_tokens_at(&EXTRA_TOKENS).unwrap();
+        let got = ids(&tok);
+        // The ids of MiniMax's tokenizer_config.json through transformers, and of ComfyUI.
+        assert_eq!(tok.token_to_id("<d>"), Some(151669));
+        assert_eq!(tok.token_to_id("</d>"), Some(151670));
+        assert_eq!(tok.token_to_id("<|caption_end|>"), Some(151675));
+        assert_eq!(got.iter().filter(|&&i| i == 151669).count(), 1);
+        assert_eq!(got.iter().filter(|&&i| i == 151670).count(), 1);
+        // `<d>` and `</d>` were 3 and 4 tokens, the rest of the text is unchanged.
+        assert_eq!(got.len() + 5, plain.len());
+        let open = got.iter().position(|&i| i == 151669).unwrap();
+        assert_eq!(got[..open], plain[..open]);
+        assert_eq!(tok.decode(&got, false).unwrap(), text);
+        // A second time changes nothing; an id held by another token is refused.
+        tok.add_special_tokens_at(&EXTRA_TOKENS).unwrap();
+        assert_eq!(ids(&tok), got);
+        assert!(tok.add_special_tokens_at(&[("<x>", 151669)]).is_err());
+        assert!(tok.add_special_tokens_at(&[("<d>", 7)]).is_err());
     }
 
     #[test]
