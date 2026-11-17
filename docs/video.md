@@ -162,9 +162,10 @@ Not checked or not done:
 
 The official release needs 140 GB of downloads and 49 forwards. The repackaged files of
 `Comfy-Org/MiniMax-H3`, the turbo LoRAs of `lightx2v/Minimax-h3-Turbo` and a GGUF of the text
-encoder bring that to 48 to 63 GB and 4 or 8 forwards. **None of these files was downloaded or
+encoder bring that to 39 to 63 GB and 4 or 8 forwards. **None of these files was downloaded or
 run here**: their layouts were read from the safetensors headers and from sampled rows (HTTP range
-requests), the loaders are checked on tiny random checkpoints in the same forms (below).
+requests), the quantized formats from the source of ComfyUI and of its `comfy_kitchen` package, and
+the loaders are checked on tiny random checkpoints in the same forms (below).
 
 ```sh
 # 4 forwards: the pruned FP8 transformer (21.0 GB), the fp16 VAE (5.2 GB), the 4-step turbo LoRA
@@ -175,6 +176,14 @@ requests), the loaders are checked on tiny random checkpoints in the same forms 
     --lora loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors \
     --text-encoder Qwen3-VL-32B-Instruct-Q8_0.gguf \
     -p "integrated_multimodal_description: [Shot 1] ..." -o fox.avi
+# the same in ComfyUI's int8 files: transformer 21.0 GB, VAE 2.8 GB, and the text encoder as
+# NVFP4 (15.7 GB) with the release's tokenizer/tokenizer.json in a tokenizer/ folder beside it
+./target/release/oxinfer --device cpu \
+    --model diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
+    --vae vae/minimax_h3_video_vae_int8_convrot.safetensors \
+    --lora loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors \
+    --text-encoder text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
+    -p "integrated_multimodal_description: [Shot 1] ..." -o fox.avi
 # the release folder, 8 forwards
 ./target/release/oxinfer --model /path/to/MiniMax-H3 --device cpu \
     --lora minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors -p "..." -o fox.avi
@@ -184,7 +193,7 @@ requests), the loaders are checked on tiny random checkpoints in the same forms 
 |---|---|
 | `--model FILE` | a single-file transformer in ComfyUI's layout instead of the release folder; `--vae` is then required, the shifts are 12 and 3 (there is no scheduler folder), and there is no soundtrack: the audio VAE is only read from a release folder's `audio_vae/` |
 | `--transformer FILE\|DIR`, `--vae FILE\|DIR` | one part of a release folder from another place |
-| `--text-encoder DIR\|FILE.gguf` | a Qwen3-VL-32B-Instruct folder, or its language model as GGUF (text-only prompts: no `--init-image` / `--last-image`) |
+| `--text-encoder DIR\|FILE.gguf\|FILE.safetensors` | a Qwen3-VL-32B-Instruct folder, or its language model as GGUF, or one of ComfyUI's single files (`text_encoders/qwen3vl_32b_minimax_h3_{bf16,int8_convrot,nvfp4_awq}.safetensors`); a file is for text-only prompts (no `--init-image` / `--last-image`), and a safetensors file needs the release's `tokenizer.json`: in `--model`'s `tokenizer/`, in a `tokenizer/` folder beside the file or beside the file itself |
 | `--quant q8` | the text encoder's safetensors weights quantized at load (memory, not download; `q4` is taken as `q8`) |
 | `--lora FILE[:SCALE]` | LoRA files on the transformer, repeatable. A file named `*turbo_Nstep*` sets `--steps N + 1` and the shifts: 6 / 3 for the `768p` files, 12 / 3 for the others |
 | `--shift F`, `--audio-shift F` | the sigma shifts of the video and audio schedules |
@@ -201,6 +210,10 @@ Read from the files' headers and, where rows are quoted, from the same rows of s
 | `diffusion_models/minimax_h3_fl2va_bf16.safetensors` | 66.3 GB | the 535 tensors of MiniMax's own layout (`FL2VA/transformer`) with the same names, but `qkv_proj` as `[q; k; v]` where MiniMax's is `[q k v]` per head (row 0 of `to_k` of diffusers' block 0 is row 7168 of ComfyUI's `qkv_proj` and row 128 of MiniMax's, bit for bit); `fc1` is `[gate; value]` in both. The configuration is in the header |
 | `..._pruned_bf16.safetensors` | 40.2 GB | the same matrices (rows 0 and 7168 of block 0's `qkv_proj` are identical) without the time embedder and the 26 GB of AdaLN weights: `adaln_t_table` `[1025, 8]` and float16 `[.., 8]` projections, see below |
 | `..._pruned_fp8_scaled.safetensors` | 21.0 GB | the pruned form with the four matrices of each of the 50 blocks as `float8_e4m3fn` times a scalar `weight_scale` (the refiner's stay bf16) |
+| `..._int8_convrot.safetensors`, `..._pruned_int8_convrot.safetensors` | 34.0 / 21.0 GB | the bf16 / pruned bf16 file with the four matrices of each of the 50 blocks as `int8_tensorwise` with ConvRot (below); the unpruned file's AdaLN projections too, in groups of 64. The refiner's stay bf16. The format ComfyUI's README prefers over FP8 |
+| `..._pruned_w6a8.safetensors` | 16.0 GB | the pruned form with the blocks' four matrices and the video head as `w6a8_int8`, the refiner's four as int8 ConvRot |
+| `vae/minimax_h3_video_vae_int8_convrot.safetensors` | 2.8 GB | the fp16 file's tensors with the same names and header; the four matrices of each of the 36 decoder blocks as int8 ConvRot, the decoder's other tensors float32 |
+| `text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors`, `..._int8_convrot.safetensors`, `..._nvfp4_awq.safetensors` | 51.5 / 27.1 / 15.7 GB | the first 50 of Qwen3-VL-32B's 64 layers as `model.layers.N.*`, `model.embed_tokens` and the vision tower (`visual.*`), without final norm, head or configuration (`comfy/text_encoders/llama.py`, `Qwen3VL_32BConfig`: the conditioning is the last layer's output). The seven matrices of a layer in bf16, int8 ConvRot, or NVFP4 (below); the NVFP4 file's embedding is int8 with a scale per row. The tower is bf16 in all three |
 | `vae/minimax_h3_video_vae_fp16.safetensors` | 5.2 GB | MiniMax's original tensor names (`FL2VA/video_vae`: `encoder.down.I.block.J`, a fused per-head `to_qkv`, `ff.w1` as `[gate; value]`) in float16, the configuration in the header. Sampled rows equal diffusers' `vae/` within float16 rounding (1.5e-5; the encoder's within 3e-8) |
 | `loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors`, `..._turbo_8step_v1.0_comfyui_bf16.safetensors` | 2.0 GB | rank-128 pairs on `qkv_proj` (fused: rank 384 with a block-diagonal `B`), `out_proj`, `fc1`, `fc2` of the 50 blocks and the 2 refiner blocks, `.alpha` 128 / 384 (4-step) and 8 / 24 (8-step: scale 1/16) |
 | `text_encoder/` of the release | 63.4 GB | Qwen3-VL-32B-Instruct itself: its 14 shards have the SHA-256 of `Qwen/Qwen3-VL-32B-Instruct`'s. `unsloth/Qwen3-VL-32B-Instruct-GGUF` holds the language model in llama.cpp's `qwen3vl` layout; sampled rows of its BF16 file (queries, keys, values, output, the three MLP matrices, the embedding, three norms) are the release's bit for bit, its vocabulary and merges are the release tokenizer's |
@@ -214,6 +227,76 @@ without the SiLU. Checked against the full file: with the bf16 file's time embed
 pruned one differ by at most 2.7e-4 over the 1025 grid points (values up to 1.0), 1.8e-4 at the
 midpoints between them. So the pruned files are the same model to about 3e-4 in the AdaLN vectors;
 what that does to a video was not measured.
+
+**The quantized files.** A quantized module has a `comfy_quant` tensor (the bytes of a JSON
+object) beside its weight; `comfy/ops.py` loads it into a layout of the `comfy_kitchen` package,
+whose eager backend is the definition used here (`src/comfy_quant.rs`; read at comfy_kitchen
+0.2.41, `Comfy-Org/comfy-kitchen` at `bada696`, and ComfyUI at `c3fd8b9`):
+
+- `int8_tensorwise` with `"convrot": true` (`tensor/int8.py`, `tensor/int8_utils.py`): int8 rows
+  times a float32 scale per row (`weight_scale` `[N, 1]`), of the matrix rotated on its input side,
+  `W_rot = W H^T` over consecutive groups of `convrot_groupsize` inputs (256; 64 for the AdaLN
+  projections, whose 2688 inputs 256 does not divide). `H` is the normalized *regular* Hadamard
+  matrix, the Kronecker power of `[[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]]`
+  over `sqrt(n)`: symmetric, its own inverse, not the Sylvester matrix (which is why undoing a
+  Sylvester rotation gave correlation 0.00 to 0.03). `W x = W_rot (H x)`: the input is rotated,
+  then multiplied by the stored rows.
+- `w6a8_int8` (`tensor/w4a8_int8.py`, `backends/eager/w4a8_int8.py`): 6-bit codes in int8
+  `[N, 3K/4]`, a `K/2`-byte plane of low nibbles (column `2i` in the low nibble of byte `i`)
+  followed by a `K/4`-byte plane of the top two bits (column `c` in byte `c / 4`, bit
+  `2 (c % 4)`); `weight_s_rel`, an FP8 E4M3 scale per group of 32 columns (`group_size`), and
+  `weight_s_channel`, a float32 scale per row. A weight is
+  `clamp(round((code - 32) s_rel), -127, 127) s_channel`, in the ConvRot basis above (groups of
+  256): the reference decodes the codes to that int8 matrix before every product.
+- `nvfp4` (`tensor/nvfp4.py`, `float_utils.py`): E2M1 pairs with the first value in the *high*
+  nibble (ModelOpt and compressed-tensors, which oxinfer already read, put it in the low one), an
+  E4M3 scale per 16 values stored in cuBLAS's tiled order (`to_blocked`: tiles of 128 rows by 4
+  blocks, each stored as 32 rows of 16 with its four 32-row bands side by side) and a tensor-wide
+  `weight_scale_2`. The file is ModelOpt AWQ output: `o_proj` and `down_proj` have a
+  `pre_quant_scale` vector that multiplies their input, and the scale of the other five matrices
+  is folded into the norm before them (in layers 0, 25 and 49 `input_layernorm` and
+  `post_attention_layernorm` differ from the bf16 file's by factors of 0.06 to 18; `q_norm` /
+  `k_norm` are identical).
+
+Checked on sampled rows of the real files (range requests; two rows each of matrices in the
+first, a middle and the last block or layer), decoded as above against the same rows of the bf16
+files:
+
+| file | correlation with the bf16 row | relative L2 error |
+|---|---|---|
+| pruned int8 ConvRot transformer, the four matrices | 0.99991 to 0.99997 | 0.8% to 1.4% |
+| int8 ConvRot transformer, AdaLN projections (groups of 64) | 0.99997 | 0.75% to 0.83% |
+| W6A8 transformer, the four matrices (the same rows of the int8 file: 0.8% to 1.4%) | 0.99970 to 0.99974 | 2.3% to 2.5% |
+| int8 ConvRot video VAE, decoder matrices (against the fp16 file) | 0.99995 to 0.99997 | 0.7% to 1.0% |
+| int8 ConvRot text encoder | 0.99995 to 0.99996 | 0.9% to 1.0% |
+| NVFP4 text encoder, `o_proj` / `down_proj` times `pre_quant_scale` (without it: 0.89 to 0.98) | 0.9942 to 0.9954 | 9.5% to 10.8% |
+| NVFP4 text encoder, the other five times the ratio of the two files' norm weights | 0.9938 to 0.9957 | 9.3% to 11.1% |
+| NVFP4 text encoder, the int8 embedding rows | 0.99993 to 0.99997 | 0.8% to 1.2% |
+
+The errors are what the bit widths give (an int8 step on a rotated, near-Gaussian row; two and a
+half times that at 6 bits with a scale per 32; E2M1's eight magnitudes). With a wrong reading the
+same rows give: no rotation 0.01 to 0.09, the Sylvester matrix 0.00 to 0.03; NVFP4 with the low nibble first
+0.00, with the scales in row-major order 0.84 to 0.93 at a wrong magnitude.
+
+How they run: every product is float32 on the decoded weights, as for FP8. That is what ComfyUI
+computes where it has no int8 kernels (its "emulated ops", `supports_int8_compute`: the CPU, MPS,
+Intel XPU; and `full_precision_matrix_mult`, which the NVFP4 text encoder's entries ask for on
+every device). Elsewhere (CUDA, ROCm) ComfyUI rounds the rotated input of every int8 / W6A8 layer
+to int8 with one scale per row and multiplies integers (`int8_linear`: the "A8"). That rounding is
+not reproduced: on the tiny checkpoints the two computations differ by 5e-3 (int8) and 2e-2 (W6A8)
+after the schedule, where oxinfer is within 2e-6 of the float32 one (below). In memory:
+
+- int8 ConvRot weights are used from the mapped file as stored (one float32 scale per row beside
+  them); a row is converted to float32 on each pass, like an FP8 or bf16 row. Timed on a synthetic
+  `[21504, 5376]` matrix and 2048 rows (64 cores, while another job loaded the machine): 0.38 to
+  0.40 s with the rotation, 0.34 to 0.37 s as FP8, 0.30 to 0.33 s as bf16, so no gain in speed is
+  to be expected from the int8 file on the CPU: its advantage over FP8 would be accuracy, which
+  was not measured;
+- W6A8 weights are decoded at load to the int8 values above: 8 bits per weight in memory for 6 in
+  the file (19.3 GB of process memory for the 50 blocks instead of 14.5 GB of mapped file);
+- NVFP4 weights are repacked at load into ggml's NVFP4 blocks, as the other NVFP4 packings are
+  (4.5 bits per weight: 13.7 GB of process memory for the text encoder's 24.4B weights); its int8
+  embedding is read from the mapped file.
 
 **The turbo LoRAs.** Settings from lightx2v's model table (`github.com/ModelTC/Minimax-H3-Turbo`):
 `N` evaluations on the grid `(N - i) / N`, which is `--steps N + 1` here; video / audio shifts
@@ -246,6 +329,47 @@ absolute difference; the unchanged checkpoint gives 8.2e-6 / 2.5e-6 and 7.2e-7 /
 | LoRA on the pruned FP8 file (merged into the decoded weights, curve form) | 1.1e-5 / 2.0e-6 | 6.0e-7 / 4.8e-7 |
 | controls: no LoRA, and the LoRA at half strength, against the merged reference | 8.5e-2 / 9.3e-2, 4.3e-2 / 4.3e-2 | 8.7e-2 / 8.5e-2, 4.4e-2 / 4.3e-2 |
 
+The quantized forms are written by comfy_kitchen's own quantizers
+(`TensorWiseINT8Layout.quantize`, `AsymW4A8Int8Layout.quantize(bits=6)`) for a second tiny
+transformer of width 64 (a W6A8 row is a multiple of 32, a ConvRot group a power of 4), with the
+`comfy_quant` entries of the real files; the reference is diffusers on the weights comfy_kitchen
+dequantizes (same columns; the unquantized wide transformer gives 1.1e-5 / 2.6e-6 and
+1.2e-6 / 9.5e-7):
+
+| transformer (reference) | first step's velocities, video / audio | rows after the 5 steps, video / audio |
+|---|---|---|
+| int8 ConvRot, the blocks' four matrices in groups of 64 and the AdaLN projections in groups of 16 (diffusers on the dequantized weights) | 1.0e-5 / 2.9e-6 | 1.1e-6 / 9.5e-7 |
+| pruned int8 ConvRot (the curve form on the dequantized weights) | 1.0e-5 / 2.7e-6 | 7.2e-7 / 9.5e-7 |
+| pruned int8 ConvRot with a LoRA (merged into the dequantized weights) | 7.8e-6 / 2.4e-6 | 7.2e-7 / 9.5e-7 |
+| pruned W6A8: the blocks and the video head, the refiner as int8 ConvRot (the same) | 8.8e-6 / 2.5e-6 | 2.1e-6 / 7.2e-7 |
+| controls: the pruned int8 file without the LoRA; the W6A8 file against the int8 reference; the unquantized file against the int8 reference | 1.2e-1 / 2.2e-1, 9.9e-2 / 3.8e-2, 9.8e-3 / 9.5e-3 | 1.0e-1 / 2.1e-1, 1.0e-1 / 5.8e-2, 1.0e-2 / 1.3e-2 |
+| against comfy_kitchen's `int8_linear` / `w4a8_int8_linear` in every quantized layer (int8 activations, what ComfyUI's int8 kernels compute): pruned int8, pruned W6A8 | 6.6e-3 / 9.4e-3, 2.3e-2 / 1.1e-2 | 5.2e-3 / 4.4e-3, 2.0e-2 / 5.8e-3 |
+
+The int8 ConvRot video VAE (the tiny decoder's matrices quantized by comfy_kitchen, diffusers on
+the dequantized ones): encoder 1.1e-6 / 5.1e-7, decoder 7.2e-7 / 6.4e-7 / 7.2e-7 (1.8e-3 against
+the fp16 reference).
+
+ComfyUI's single-file text encoders: `tools/qwen3vl_comfy.py` writes a tiny random Qwen3-VL (6
+layers of width 128) as the three files, truncated to 4 layers, the NVFP4 one with random AWQ
+scales folded into the norms or stored as `pre_quant_scale` and an int8 embedding;
+`examples/h3_text_check.rs` compares the residual stream after the last stored layer with
+transformers' `hidden_states[4]` on the dequantized weights (14 tokens, values up to 6.5):
+
+| text encoder | max abs diff |
+|---|---|
+| the folder (transformers' own weights) | 5.4e-6 |
+| bf16 single file | 5.4e-6 |
+| int8 ConvRot single file (groups of 64) | 7.3e-6 |
+| NVFP4 single file | 6.0e-6 |
+| controls: the NVFP4 file against the bf16 reference, the bf16 file against the NVFP4 one | 3.2 |
+
+The pipeline's own text path (`encode_prompt_quant`: the release's `tokenizer/tokenizer.json`,
+the 50th layer) was run on the same tiny model with 52 layers and Qwen's vocabulary, the files
+truncated to 50, for a 22-token prompt in the release's form against transformers'
+`hidden_states[50]` on the ids of the `tokenizers` package (values up to 22): the folder and the
+bf16 file 3.4e-5, the int8 ConvRot file 8.1e-5, the NVFP4 file 4.3e-5 (15 against another file's
+reference).
+
 The tiny pruned checkpoint itself is 1.5e-4 from the unpruned one (a rank-8 basis and float16
 projections of a random 24-wide curve). The fp16 single-file VAE against diffusers with its weights
 rounded to float16: encoder 1.1e-6 (clip) / 5.1e-7 (one frame), decoder 7.2e-7 / 7.2e-7 / 6.0e-7.
@@ -265,24 +389,37 @@ settings, and a single-file `--model` without `--vae` is refused.
 
 Not checked or not done:
 
-- no run on the real files: not a single-file transformer, the fp16 VAE, a turbo LoRA or a GGUF
-  text encoder, so nothing is known here about speed, memory or the quality of 4- and 8-step
-  videos;
+- no run on the real files: not a single-file transformer in any form, a single-file VAE, a turbo
+  LoRA or a GGUF or single-file text encoder, so nothing is known here about speed, memory or the
+  quality of 4- and 8-step videos. For the quantized files the sampled rows above show that the
+  weights are read as ComfyUI reads them; what int8, 6-bit or FP4 weights do to a video, and
+  whether int8 does better than FP8, was not measured;
+- ComfyUI's int8 activation path (see "How they run"): a CUDA run of ComfyUI on the int8 or W6A8
+  file is a slightly different computation from oxinfer's, by an amount known only on the tiny
+  checkpoints;
+- the 34.0 GB unpruned int8 file's layout is the tiny file's (int8 AdaLN projections in their own
+  group size), but only four of its matrices were sampled; the `ref2va` files were not looked at
+  beyond their sizes;
+- the command itself with a single-file text encoder: the tiny encoders are 128 wide and the tiny
+  transformers read 40, so the text path (above) and the command (run on the three quantized tiny
+  transformers with the int8 VAE, a LoRA named `*turbo_4step*768p*` and a stored prompt embedding:
+  4 forwards, 22 frames written) were run separately;
 - what a quantized text encoder (`--quant q8`, a Q8_0 or Q4_K_M GGUF) does to `hidden_states[50]`
   and to the video. Qwen-Image's text encoder at Q4 moves its hidden states by about 25%
   ([qwen-image.md](qwen-image.md)), so the larger GGUF files are the safer choice until measured;
 - the video command itself with a GGUF text encoder (the tiny encoders have 3 layers and the
   pipeline conditions on the 50th): the parts above were run separately;
 - keyframes with a GGUF text encoder (the vision tower is a separate `mmproj` file, not read
-  here), LoRAs on the text encoder, LoRA keys other than the two namings above.
+  here) or with a single-file one (its `visual.*` tensors are there, but the tower's
+  configuration is not, and it is not built from the shapes), LoRAs on the text encoder, LoRA
+  keys other than the two namings above.
 
 ### Still not supported
 
 | files | why not |
 |---|---|
-| `Comfy-Org/MiniMax-H3`: `*_int8_convrot.safetensors` (transformer 21.0 / 34.0 GB, VAE 2.8 GB, text encoder 27.1 GB; the format ComfyUI's README prefers over FP8) | `int8_tensorwise` with `convrot`: int8 rows with a scale per row, to be multiplied by the input after a grouped Hadamard rotation (groups of 256, ComfyUI's `QUANTIZATION.md`). The rotation itself is in the `comfy_kitchen` package, not in ComfyUI's source: undoing a normalized Sylvester Hadamard per group of 256 on sampled rows of the pruned file does not give the bf16 rows (correlation 0.00 to 0.03) |
-| `..._pruned_w6a8.safetensors` (16.0 GB) | `w6a8_int8`: 6-bit codes packed into int8 `[N, 3K/4]` with FP8 group scales (`weight_s_rel`, groups of 32) and a scale per row (`weight_s_channel`), on the same rotation |
-| `text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors` (15.7 GB) | the first 50 layers as NVFP4 with ComfyUI's packing: on sampled rows, reading it as ModelOpt's NVFP4 (which oxinfer has) gives no correlation with the bf16 rows, and with the nibbles swapped 0.76 to 0.93 at the wrong magnitude, so the block scales are in `comfy_kitchen`'s "swizzled" order. It also needs `pre_quant_scale` (an input scale on `o_proj` and `down_proj`), the int8 embedding with a scale per row, and the file's names (`model.layers.N`, no configuration, no final norm) |
-| `text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors` (51.5 GB) | the first 50 layers and the vision tower under `model.layers.N` / `visual.*` without a configuration: a key remap that was not written (the GGUF files are smaller) |
+| ComfyUI's int8 kernels (`comfy_kitchen`'s `int8_linear`: the rotated input rounded to int8 per row, integer products) | the int8 and W6A8 files run on float32 products of the decoded weights instead (see "How they run"). oxinfer's int8 matmul kernels take activations in blocks of 32 with their own scales and weights with a scale per 32, not a scale per row and a rotation: wiring them in would give a third arithmetic, matching neither ComfyUI path, for a gain in speed that was not measured |
+| the vision tower of ComfyUI's single-file text encoders (keyframes with `--text-encoder FILE.safetensors`) | the files carry `visual.*` without the tower's configuration (ComfyUI hardcodes it: depth 27, width 1152, DeepStack after blocks 8, 16, 24); only the language model is read |
+| other `comfy_quant` formats: `asym_w4a8_int8` (4-bit codes with an optional codebook), `convrot_w4a4`; a `weight_correction` or `weight_codebook` beside a 6-bit weight; `mxfp8`, `float8_e5m2`; `input_scale` | none of `Comfy-Org/MiniMax-H3`'s files uses them. The first two and a 6-bit weight with a correction are refused by name; `mxfp8` and `float8_e5m2` entries are not interpreted here (nothing was written or checked for them in this model); `input_scale`, a calibrated activation scale for ComfyUI's FP8 / NVFP4 kernels, is ignored |
 | `diffusion_models/minimax_h3_ref2va_*`, `model_patches/*controlnet*`, `embeddings/*`, `vae/minimax_h3_sol_vae_*` | `ref2va`, the Fun ControlNet, prompt embeddings and the "sol" VAE are not implemented |
 | `VideoRebirthAI/hyperflow-h3-flash` | a 13.7B few-step (4 / 6 / 8) transformer as GGUF, 7.2 GB (Q3_K_M) to 14.9 GB (Q8_0), or 16 GB rotated INT8: another architecture on the same blocks, per its `hyperflow_h3_flash_transformer.py`: a second (endpoint) timestep embedder mixed with gate 0.25, three dropped blocks, 102 low-rank factored linears, its own sigma grids. The GGUF tensor layout was not read |
