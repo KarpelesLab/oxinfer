@@ -9,13 +9,22 @@
 //!   unless the entry says otherwise; MiniMax-H3's AdaLN projections use 64), `H` the normalized
 //!   regular Hadamard matrix ([`crate::hadamard::fwht_regular`]): the product is
 //!   `W x = W_rot (H x)`, the input rotated first.
+//! - `w6a8_int8` (`tensor/w4a8_int8.py`, `backends/eager/w4a8_int8.py`): 6-bit codes packed into
+//!   int8 `[N, 3K/4]` (a `K/2`-byte plane of low nibbles, column `2i` in the low nibble of byte
+//!   `i`, then a `K/4`-byte plane of the top two bits, column `c` in byte `c / 4` at bit
+//!   `2 (c % 4)`), an FP8 E4M3 scale per group of `group_size` columns (`weight_s_rel`) and a
+//!   float32 scale per row (`weight_s_channel`). A weight is
+//!   `clamp(round((code - 32) s_rel), -127, 127) s_channel`: the int8 value the reference's
+//!   kernels compute with, on the ConvRot rotation above. Decoded to that int8 matrix at load
+//!   (8 bits per weight in memory for 6 in the file).
 //!
 //! Every product runs in float32 on the decoded weights, which is what ComfyUI computes where it
 //! has no kernel for a format (its "emulated ops", `full_precision_matrix_mult`). ComfyUI's int8
-//! kernels also round the rotated input to int8 with one scale per row: that is not reproduced.
-//! `float8_e4m3fn` entries are left to [`crate::model::fp8_scaled`]; the other formats are refused.
+//! kernels also round the rotated input to int8 with one scale per row (the "A8" of W6A8): that is
+//! not reproduced. `float8_e4m3fn` entries are left to [`crate::model::fp8_scaled`]; the other
+//! formats are refused.
 
-use crate::ggml::GgufMatrix;
+use crate::ggml::{GgufMatrix, e4m3_to_f32};
 use crate::hadamard::Fold;
 use crate::model::Lin;
 use crate::quant::{PageVec, QBuf};
@@ -28,6 +37,8 @@ struct Conf {
     format: String,
     /// The ConvRot group size when the weight is stored rotated.
     convrot: Option<usize>,
+    /// Columns per `weight_s_rel` scale (W6A8).
+    group_size: usize,
 }
 
 fn conf(files: &ModelFiles, base: &str) -> Result<Option<Conf>> {
@@ -44,11 +55,13 @@ fn conf(files: &ModelFiles, base: &str) -> Result<Option<Conf>> {
     // `comfy/ops.py` reads each key from the entry, then from its `params` object.
     let key = |k: &str| v.get(k).or_else(|| v.get("params").and_then(|p| p.get(k)));
     let size = |k: &str, d: usize| key(k).and_then(|x| x.as_u64()).map_or(d, |x| x as usize);
-    let convrot = key("convrot")
-        .and_then(|x| x.as_bool())
-        .unwrap_or(false)
-        .then(|| size("convrot_groupsize", 256));
-    Ok(Some(Conf { format, convrot }))
+    let grouped = matches!(format.as_str(), "w6a8_int8" | "asym_w4a8_int8" | "convrot_w4a4");
+    let convrot = (grouped || key("convrot").and_then(|x| x.as_bool()).unwrap_or(false)).then(|| size("convrot_groupsize", 256));
+    Ok(Some(Conf {
+        format,
+        convrot,
+        group_size: size("group_size", 16),
+    }))
 }
 
 /// The input transform of a weight stored ConvRot-rotated over groups of `block` inputs.
@@ -82,6 +95,70 @@ fn int8_matrix(files: &ModelFiles, full: &str, base: &str, n_out: usize, n_in: u
     GgufMatrix::i8(unsafe { QBuf::borrowed(files.bytes(full)?) }, scales(&s), n_out, n_in).with_context(|| sn)
 }
 
+/// The W6A8 matrix `full` decoded to the int8 values the reference computes with, times its row
+/// scales (see the module docs).
+fn w6a8_matrix(files: &ModelFiles, full: &str, base: &str, c: &Conf, n_out: usize, n_in: usize) -> Result<GgufMatrix> {
+    let g = c.group_size;
+    if g < 16 || !g.is_multiple_of(16) || !n_in.is_multiple_of(32) || !n_in.is_multiple_of(g) {
+        bail!("{full}: 6-bit rows of {n_in} in groups of {g} (K divisible by 32, groups a multiple of 16)");
+    }
+    let (rn, cn) = (format!("{base}.weight_s_rel"), format!("{base}.weight_s_channel"));
+    let (wi, ri) = (
+        files.info(full).with_context(|| format!("missing tensor {full}"))?,
+        files.info(&rn).with_context(|| format!("missing tensor {rn}"))?,
+    );
+    let ng = n_in / g;
+    if wi.dtype != "I8" || wi.shape != [n_out, n_in * 3 / 4] || ri.shape != [n_out, ng] || !matches!(ri.dtype.as_str(), "F8_E4M3" | "U8") {
+        bail!(
+            "{full}: {} {:?} with {} {:?} group scales for a 6-bit [{n_out}, {n_in}] weight",
+            wi.dtype,
+            wi.shape,
+            ri.dtype,
+            ri.shape
+        );
+    }
+    if files.has(&format!("{base}.weight_codebook")) || files.has(&format!("{base}.weight_correction")) {
+        bail!("{full}: a 6-bit weight with a codebook or a correction");
+    }
+    let s_channel = files.f32(&cn)?;
+    if s_channel.len() != n_out {
+        bail!("{cn}: {} scales for {n_out} rows", s_channel.len());
+    }
+    let (packed, s_rel) = (files.bytes(full)?, files.bytes(&rn)?);
+    let rb = n_in * 3 / 4;
+    let mut out = PageVec::<u8>::zeroed(n_out * n_in);
+    let p = SendPtr(out.as_mut_ptr());
+    crate::pool::run(n_out, &|r| {
+        // SAFETY: rows are disjoint and `out` outlives the call.
+        let o = unsafe { std::slice::from_raw_parts_mut(p.get().add(r * n_in), n_in) };
+        let row = &packed[r * rb..(r + 1) * rb];
+        let (low, high) = row.split_at(n_in / 2);
+        for (gi, og) in o.chunks_mut(g).enumerate() {
+            let s = e4m3_to_f32(s_rel[r * ng + gi]);
+            for (j, v) in og.iter_mut().enumerate() {
+                let col = gi * g + j;
+                let code = ((low[col / 2] >> (4 * (col % 2))) & 0xF) | (((high[col / 4] >> (2 * (col % 4))) & 3) << 4);
+                // torch.round: halves to even.
+                *v = ((code as f32 - 32.0) * s).round_ties_even().clamp(-127.0, 127.0) as i8 as u8;
+            }
+        }
+    });
+    for n in [full, &rn, &cn] {
+        files.note_use(n, true, false);
+    }
+    GgufMatrix::i8(out.into(), scales(&s_channel), n_out, n_in)
+}
+
+#[derive(Clone, Copy)]
+struct SendPtr(*mut u8);
+unsafe impl Send for SendPtr {}
+unsafe impl Sync for SendPtr {}
+impl SendPtr {
+    fn get(self) -> *mut u8 {
+        self.0
+    }
+}
+
 /// The linear weight `full` (`[n_out, n_in]`) when its module has a `comfy_quant` entry in one of
 /// the formats of the module docs; None without an entry, or for one another loader reads.
 pub(crate) fn lin<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usize) -> Result<Option<Lin<'a>>> {
@@ -91,6 +168,7 @@ pub(crate) fn lin<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usi
     let Some(c) = conf(files, base)? else { return Ok(None) };
     let m = match c.format.as_str() {
         "int8_tensorwise" => int8_matrix(files, full, base, n_out, n_in)?,
+        "w6a8_int8" => w6a8_matrix(files, full, base, &c, n_out, n_in)?,
         "float8_e4m3fn" | "float8_e5m2" | "mxfp8" => return Ok(None),
         f => bail!("{full}: ComfyUI's {f} weights are not supported"),
     };

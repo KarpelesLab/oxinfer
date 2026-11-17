@@ -26,13 +26,16 @@ Writes into DIR/comfy:
                                     the configuration in the `minimax_h3_video_vae` header entry
 
 and, when the `comfy_kitchen` package is installed (its quantizers write them), a second tiny
-transformer of width 64 (ConvRot groups are powers of 4) in ComfyUI's
+transformer of width 64 (W6A8 rows are multiples of 32, ConvRot groups powers of 4) in ComfyUI's
 quantized forms, each `comfy_quant` entry as the files of Comfy-Org/MiniMax-H3 have it:
   h3w_bf16.safetensors                 the wide transformer, unquantized
   h3w_int8_convrot.safetensors         `int8_tensorwise` with ConvRot: the blocks' four matrices
                                        (groups of 64) and AdaLN projections (groups of 16) as int8
                                        rows with a scale per row
   h3w_pruned_int8_convrot.safetensors  the pruned form with the blocks' four matrices so
+  h3w_pruned_w6a8.safetensors          the pruned form with the blocks' four matrices and the video
+                                       head as `w6a8_int8` (6-bit codes, FP8 scales per 32, a scale
+                                       per row) and the refiner's as int8 ConvRot
   lora_wide_comfyui.safetensors        a LoRA for the wide transformer
   video_vae_int8_convrot.safetensors   the video VAE with the decoder blocks' four matrices as int8
                                        ConvRot, its other decoder tensors float32
@@ -45,13 +48,13 @@ and beside the tiny tool's references (`dit_v0.bin`, ...) the same outputs of di
   fp8lora_*     the LoRA merged into the decoded FP8 weights, curve form
   fp16_*        the VAE with its weights rounded to float16 (moments, decoded clips)
   wide_*        the wide transformer
-  int8_*, pint8_*   the wide transformer on the weights comfy_kitchen dequantizes from the two
-                quantized files (float32 products: ComfyUI's `full_precision_matrix_mult`)
+  int8_*, pint8_*, w6a8_*   the wide transformer on the weights comfy_kitchen dequantizes from the
+                three quantized files (float32 products: ComfyUI's `full_precision_matrix_mult`)
   pint8lora_*   the LoRA merged into the dequantized weights of the pruned int8 file
   int8vae_*     the VAE with the dequantized decoder matrices of the int8 file
-  pint8a8_*     the pruned file through comfy_kitchen's `int8_linear`, which rounds the rotated
-                input of every quantized layer to int8 with a scale per row (what ComfyUI's int8
-                kernels compute; oxinfer does not)
+  pint8a8_*, w6a8a8_*       the same two files through comfy_kitchen's `int8_linear` /
+                `w4a8_int8_linear`, which round the rotated input of every quantized layer to int8
+                with a scale per row (what ComfyUI's int8 kernels compute; oxinfer does not)
 """
 import copy, json, os, sys
 
@@ -407,27 +410,36 @@ fp8_lora = dict(decoded)
 fp8_lora.update({k: v for k, v in to_comfy({**sd, **dec_merged}).items() if "adaln" not in k and not k.startswith("time_embedder.")})
 run(curve_model(fp8_lora), "fp8lora_")
 
-# ---- ComfyUI's int8 ConvRot forms, written by comfy_kitchen's quantizers --------------------------
+# ---- ComfyUI's int8 ConvRot and W6A8 forms, written by comfy_kitchen's quantizers -----------------
 try:
     import comfy_kitchen as ck
-    from comfy_kitchen.tensor import TensorWiseINT8Layout
+    from comfy_kitchen.tensor import AsymW4A8Int8Layout, TensorWiseINT8Layout
+    from comfy_kitchen.tensor.w4a8_int8 import w4a8_int8_linear
 except ImportError:
     ck = None
-    print("comfy_kitchen is not installed: the int8_convrot forms are not written")
+    print("comfy_kitchen is not installed: the int8_convrot / w6a8 forms are not written")
 
 FOUR = (".qkv_proj.weight", ".out_proj.weight", ".fc1.weight", ".fc2.weight")
 
 
 def quantize(o, dec, key, fmt, group):
-    """Replaces `o[key]` by its quantized tensors (`fmt`: int8, ConvRot groups of `group`) and
-    `dec[key]` by comfy_kitchen's dequantization of them. Returns what `int8_linear` takes."""
+    """Replaces `o[key]` by its quantized tensors (`fmt`: int8 / w6a8, ConvRot groups of `group`)
+    and `dec[key]` by comfy_kitchen's dequantization of them. Returns what `int8_linear` /
+    `w4a8_int8_linear` take."""
     base, w = key[: -len(".weight")], dec[key].float()
-    assert fmt == "int8"
-    q, p = TensorWiseINT8Layout.quantize(w, per_channel=True, convrot=True, convrot_groupsize=group)
-    o[key], o[base + ".weight_scale"] = q, p.scale
-    conf = {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": group}
-    dec[key] = TensorWiseINT8Layout.dequantize(q, p).float()
-    ops = ("int8", q, p.scale, group)
+    if fmt == "int8":
+        q, p = TensorWiseINT8Layout.quantize(w, per_channel=True, convrot=True, convrot_groupsize=group)
+        o[key], o[base + ".weight_scale"] = q, p.scale
+        conf = {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": group}
+        dec[key] = TensorWiseINT8Layout.dequantize(q, p).float()
+        ops = ("int8", q, p.scale, group)
+    else:
+        q, p = AsymW4A8Int8Layout.quantize(w, group_size=32, convrot_groupsize=group, bits=6)
+        assert p.codebook is None and p.correction is None
+        o[key], o[base + ".weight_s_rel"], o[base + ".weight_s_channel"] = q, p.scale, p.s_channel
+        conf = {"format": "w6a8_int8", "group_size": 32, "convrot": True, "convrot_groupsize": group}
+        dec[key] = AsymW4A8Int8Layout.dequantize(q, p).float()
+        ops = ("w6a8", q, (p.scale, p.s_channel), group)
     o[base + ".comfy_quant"] = torch.tensor(list(json.dumps(conf).encode()), dtype=torch.uint8)
     return ops
 
@@ -440,10 +452,15 @@ class A8(torch.nn.Module):
     def __init__(self, ops, rows, bias=None):
         super().__init__()
         self.fmt, q, sc, self.group = ops
-        self.q, self.sc, self.bias = q[rows].contiguous(), sc[rows].contiguous(), bias
+        self.q = q[rows].contiguous()
+        self.sc = tuple(x[rows].contiguous() for x in sc) if isinstance(sc, tuple) else sc[rows].contiguous()
+        self.bias = bias
 
     def forward(self, x):
-        return ck.int8_linear(x.float(), self.q, self.sc, self.bias, torch.float32, convrot=True, convrot_groupsize=self.group)
+        if self.fmt == "int8":
+            return ck.int8_linear(x.float(), self.q, self.sc, self.bias, torch.float32, convrot=True, convrot_groupsize=self.group)
+        return w4a8_int8_linear(x.float(), self.q, self.sc[0], self.sc[1], bias=self.bias, group_size=32,
+                                convrot_groupsize=self.group, out_dtype=torch.float32)
 
 
 def a8_model(m, ops):
@@ -451,6 +468,10 @@ def a8_model(m, ops):
     m = copy.deepcopy(m)
     for key, op in ops.items():
         cp = "token_refiner.blocks." if key.startswith("token_refiner.") else "blocks."
+        if not key.startswith(cp):
+            assert key == "final_layer.video_out.weight", key
+            m.proj_out = A8(op, slice(None), m.proj_out.bias.data)
+            continue
         i, tail = key[len(cp):].split(".", 1)
         blk = (m.token_refiner.refiner_blocks if cp.startswith("token") else m.transformer_blocks)[int(i)]
         n = op[1].shape[0]
@@ -525,6 +546,16 @@ if ck is not None:
     wl.update({k: v for k, v in to_comfy({**wsd, **merged(wdec_sd, wpeft, lora_alpha)}).items() if "adaln" not in k and not k.startswith("time_embedder.")})
     run(curve_model(wl, wide), "pint8lora_")
 
+    # ..._pruned_w6a8.safetensors
+    o, dec, ops = dict(typed_pruned(wpruned)), dict(wpruned), {}
+    for k in [k for k in wpruned if k.endswith(FOUR)]:
+        ops[k] = quantize(o, dec, k, "w6a8" if k.startswith("blocks.") else "int8", 64)
+    ops["final_layer.video_out.weight"] = quantize(o, dec, "final_layer.video_out.weight", "w6a8", 64)
+    save_file(o, os.path.join(out, "h3w_pruned_w6a8.safetensors"))
+    r = run(curve_model(dec, wide), "w6a8_")
+    ra = run(a8_model(curve_model(dec, wide), ops), "w6a8a8_")
+    print(f"pruned W6A8: int8 activations (comfy_kitchen's w4a8_int8_linear) vs float32 products, final rows: {float((ra - r).abs().max()):.3e}")
+    print(f"pruned W6A8 vs the wide transformer: max abs diff of the final rows {float((r - wfinal).abs().max()):.3e}")
 
 # ---- the video VAE as ComfyUI's single file --------------------------------------------------------
 vae = pretrained(AutoencoderKLMiniMaxH3, "vae")

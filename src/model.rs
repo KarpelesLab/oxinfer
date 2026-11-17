@@ -327,7 +327,7 @@ fn load_lin_stored<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: us
     if let Some(m) = files.mlx_q4(full, n_out, n_in)? {
         return Ok(Lin::q4(m));
     }
-    // ComfyUI's `comfy_quant` weights (int8 with ConvRot).
+    // ComfyUI's `comfy_quant` weights (int8 with ConvRot, W6A8).
     if let Some(l) = crate::comfy_quant::lin(files, full, n_out, n_in)? {
         return Ok(l);
     }
