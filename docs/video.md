@@ -48,7 +48,8 @@ as the output without its extension (`-o fox.webp` and `-o fox.png` both write `
 `OXINFER_H3_PROMPT_EMBEDS=FILE` keeps the text encoder's output of a text-only prompt in FILE
 (written when missing, read when present; the run stops after writing it when the transformer's
 weights are absent), so the 63 GB text encoder and the 66 GB transformer need not be on disk
-together.
+together. `OXINFER_H3_LATENTS=FILE` keeps the denoised video and audio rows the same way: a second
+run with the same size and frame count only decodes them (the two VAEs, no forwards).
 
 ## The release
 
@@ -139,7 +140,8 @@ On the real weights (CPU, 64 cores, 125 GB RAM):
   the release is trained for, and nothing larger or longer was run: the cost per forward grows at
   least linearly with the rows, and a default 1344x768, 124-frame request has 44 times as many.
   Running diffusers' pipeline on the 66 GB transformer for a comparison was not attempted. That
-  run predates the audio decoder: its audio latents were dropped.
+  run predates the audio decoder: its audio latents were dropped. The runs with a soundtrack are
+  the ones on the smaller files, [below](#real-runs).
 
 Not checked or not done:
 
@@ -147,13 +149,10 @@ Not checked or not done:
 - the prompt path with keyframes (label and vision block through `QwenVl`) ran only on a tiny
   random Qwen3-VL, without a numeric comparison; keyframes are resized with oxinfer's Lanczos, not
   compared with PIL's; the posterior and all noise come from oxinfer's generator;
-- **no generated soundtrack was decoded or listened to**: the audio decoder was checked on its
-  own (above), with latents that did not come from the transformer, and no video run was made
-  with it (the transformer and text encoder were not on disk). Whether the real model's audio
-  rows decode to the sound the prompt describes is untested; so is the audio VAE on anything but
-  the CPU, and the WAV / AVI files were read back by programs, not played;
-- `ref2va` (`transformer_ref/`) and with it the audio VAE's encoder, a run with a LoRA or with the
-  smaller files (they load, see below), the character-swap LoRA, the original `FL2VA/` layout's video and audio VAEs
+- the soundtracks generated so far ([real runs](#real-runs)) were analysed and transcribed, not
+  listened to; none came from the release's own bf16 transformer or from a 50-step run; the audio
+  VAE ran on the CPU only;
+- `ref2va` (`transformer_ref/`) and with it the audio VAE's encoder, the character-swap LoRA, the original `FL2VA/` layout's video and audio VAEs
   (`FL2VA/audio_vae/model.safetensors` has the same tensor names as `audio_vae/`, but its
   `config.yaml` / `metadata.json` are not read), GPU execution (the 66 GB transformer runs on the
   CPU from mapped weights).
@@ -162,10 +161,13 @@ Not checked or not done:
 
 The official release needs 140 GB of downloads and 49 forwards. The repackaged files of
 `Comfy-Org/MiniMax-H3`, the turbo LoRAs of `lightx2v/Minimax-h3-Turbo` and a GGUF of the text
-encoder bring that to 39 to 63 GB and 4 or 8 forwards. **None of these files was downloaded or
-run here** (but the audio VAE, 0.6 GB): their layouts were read from the safetensors headers and from sampled rows (HTTP range
-requests), the quantized formats from the source of ComfyUI and of its `comfy_kitchen` package, and
-the loaders are checked on tiny random checkpoints in the same forms (below).
+encoder bring that to 39 to 63 GB and 4 or 8 forwards. Their layouts were first read from the
+safetensors headers and from sampled rows (HTTP range requests), the quantized formats from the
+source of ComfyUI and of its `comfy_kitchen` package, and the loaders checked on tiny random
+checkpoints in the same forms; then the pruned FP8 transformer, the fp16 video VAE, the fp32 audio
+VAE, the 4-step 768p and the 8-step LoRAs and the Q8_0 and Q4_K_M text encoders were downloaded
+and run ([real runs](#real-runs)). The other files in the tables below (the int8 ConvRot and W6A8
+files, the single-file text encoders, the bf16 transformers) were not.
 
 ```sh
 # 4 forwards: the pruned FP8 transformer (21.0 GB), the fp16 VAE (5.2 GB), the 4-step turbo LoRA
@@ -201,7 +203,8 @@ the loaders are checked on tiny random checkpoints in the same forms (below).
 | `--shift F`, `--audio-shift F` | the sigma shifts of the video and audio schedules |
 
 Each of these takes a local path or `org/name/path/in/repo.safetensors` (`.gguf`), fetched like
-`--lora` files elsewhere; fetching was not tried for these repositories.
+`--lora` files elsewhere; fetching was not tried for these repositories (the files of the real
+runs were downloaded with curl and given as paths).
 
 ### What the files are
 
@@ -211,7 +214,7 @@ Read from the files' headers and, where rows are quoted, from the same rows of s
 |---|---|---|
 | `diffusion_models/minimax_h3_fl2va_bf16.safetensors` | 66.3 GB | the 535 tensors of MiniMax's own layout (`FL2VA/transformer`) with the same names, but `qkv_proj` as `[q; k; v]` where MiniMax's is `[q k v]` per head (row 0 of `to_k` of diffusers' block 0 is row 7168 of ComfyUI's `qkv_proj` and row 128 of MiniMax's, bit for bit); `fc1` is `[gate; value]` in both. The configuration is in the header |
 | `..._pruned_bf16.safetensors` | 40.2 GB | the same matrices (rows 0 and 7168 of block 0's `qkv_proj` are identical) without the time embedder and the 26 GB of AdaLN weights: `adaln_t_table` `[1025, 8]` and float16 `[.., 8]` projections, see below |
-| `..._pruned_fp8_scaled.safetensors` | 21.0 GB | the pruned form with the four matrices of each of the 50 blocks as `float8_e4m3fn` times a scalar `weight_scale` (the refiner's stay bf16) |
+| `..._pruned_fp8_scaled.safetensors` | 21.0 GB | the pruned form with the four matrices of each of the 50 blocks as `float8_e4m3fn` times a scalar `weight_scale` (the refiner's stay bf16). Each also has a `comfy_quant` entry and, but for `fc2` (`"full_precision_matrix_mult": true`), a scalar `input_scale`: ComfyUI can round the layer's input to FP8 with it; oxinfer multiplies the float32 input by the decoded weights and does not read it. No byte of the sampled matrices (blocks 0, 1, 25, 49) is a NaN code |
 | `..._int8_convrot.safetensors`, `..._pruned_int8_convrot.safetensors` | 34.0 / 21.0 GB | the bf16 / pruned bf16 file with the four matrices of each of the 50 blocks as `int8_tensorwise` with ConvRot (below); the unpruned file's AdaLN projections too, in groups of 64. The refiner's stay bf16. The format ComfyUI's README prefers over FP8 |
 | `..._pruned_w6a8.safetensors` | 16.0 GB | the pruned form with the blocks' four matrices and the video head as `w6a8_int8`, the refiner's four as int8 ConvRot |
 | `vae/minimax_h3_video_vae_int8_convrot.safetensors` | 2.8 GB | the fp16 file's tensors with the same names and header; the four matrices of each of the 36 decoder blocks as int8 ConvRot, the decoder's other tensors float32 |
@@ -385,7 +388,7 @@ weights read as zeros) loads through `QwenVl` as 64 layers of width 5120 with th
 configuration values, and three prompts tokenize to the same ids as with the release's
 `tokenizer.json`.
 
-The single-file audio VAE is the one file of these that was downloaded: `h3_audio_check` (`--write`
+The single-file audio VAE against the release folder (both downloaded): `h3_audio_check` (`--write`
 keeps one decoder's waveform as the reference for another) decodes 207 seeded normal latents per
 channel with it within 3.7e-5 of the release folder's decode (107 dB SNR; the folded weight
 normalization rounds differently).
@@ -397,11 +400,13 @@ settings, and a single-file `--model` without `--vae` is refused.
 
 Not checked or not done:
 
-- no run on the real files: not a single-file transformer in any form, a single-file VAE, a turbo
-  LoRA or a GGUF or single-file text encoder, so nothing is known here about speed, memory or the
-  quality of 4- and 8-step videos. For the quantized files the sampled rows above show that the
-  weights are read as ComfyUI reads them; what int8, 6-bit or FP4 weights do to a video, and
-  whether int8 does better than FP8, was not measured;
+- the real runs are few and small (see [below](#real-runs)): nothing at 1344x768 longer than 22
+  frames, no run compared with ComfyUI or diffusers on the same files, and the unpruned and
+  pruned bf16 transformers, the other LoRA versions and `--quant q8` were not run;
+- no run on the real int8 ConvRot or W6A8 transformers, the int8 VAE or a single-file text encoder
+  (bf16, int8, NVFP4): the sampled rows above show that their weights are read as ComfyUI reads
+  them; what int8, 6-bit or FP4 weights do to a video, and whether int8 does better than FP8, was
+  not measured;
 - ComfyUI's int8 activation path (see "How they run"): a CUDA run of ComfyUI on the int8 or W6A8
   file is a slightly different computation from oxinfer's, by an amount known only on the tiny
   checkpoints;
@@ -412,15 +417,81 @@ Not checked or not done:
   transformers read 40, so the text path (above) and the command (run on the three quantized tiny
   transformers with the int8 VAE, a LoRA named `*turbo_4step*768p*` and a stored prompt embedding:
   4 forwards, 22 frames written) were run separately;
-- what a quantized text encoder (`--quant q8`, a Q8_0 or Q4_K_M GGUF) does to `hidden_states[50]`
-  and to the video. Qwen-Image's text encoder at Q4 moves its hidden states by about 25%
-  ([qwen-image.md](qwen-image.md)), so the larger GGUF files are the safer choice until measured;
-- the video command itself with a GGUF text encoder (the tiny encoders have 3 layers and the
-  pipeline conditions on the 50th): the parts above were run separately;
+- what a quantized text encoder does was measured on one prompt only (Q4_K_M against Q8_0, below);
+  neither was compared with the bf16 encoder, and `--quant q8` was not run;
 - keyframes with a GGUF text encoder (the vision tower is a separate `mmproj` file, not read
   here) or with a single-file one (its `visual.*` tensors are there, but the tower's
   configuration is not, and it is not built from the shapes), LoRAs on the text encoder, LoRA
   keys other than the two namings above.
+
+### Real runs
+
+On the CPU (64 cores, 125 GB RAM, shared with other jobs: timings vary by 1.5x between runs of the
+same request), a `--profile ci` build (release without LTO), `--seed 1`, every file mapped:
+`minimax_h3_fl2va_pruned_fp8_scaled` (21.0 GB), `minimax_h3_video_vae_fp16` (5.2 GB),
+`minimax_h3_audio_vae_fp32` (0.6 GB), a turbo LoRA (2.0 GB) and `Qwen3-VL-32B-Instruct-Q8_0.gguf`
+(34.8 GB). All of them load without a change to the loaders: transformer, VAEs and LoRA (208
+modules) in 6 to 10 s, the text encoder's 124- and 159-token prompts in 5.7 s with Q8_0 and 18.8 s
+with Q4_K_M (load included). Peak resident memory 28.6 GB (6.9 GB of it allocated, the rest mapped
+weights), 31.2 GB when the text encoder runs in the same process. Two prompts in the release's
+form: a woman at a kitchen table who says `<d>[English] Good morning. The coffee is ready.</d>`
+and lifts a mug ("speech"), and a golden retriever on a lawn that barks three times, then pants
+("dog").
+
+| run | rows | forwards | VAE | total |
+|---|---|---|---|---|
+| speech, 448x256, 124 frames, 4-step 768p LoRA (shifts 6 / 3) | 4144 video + 414 audio + 159 text | 4 in 1286 s (322 s each) | 319 s | 27 min |
+| dog, the same settings | 4717 in all | 4 in 1322 to 1894 s | 316 to 345 s | 27 to 38 min |
+| speech, the same with the Q4_K_M text encoder | | 4 in 1617 s | 320 s | 33 min |
+| dog, 448x256, 124 frames, 8-step LoRA (shifts 12 / 3) | 4717 in all | 8 in 2743 s (343 s each) | 317 s | 51 min |
+| speech, 1344x768, 22 frames, 4-step 768p LoRA | 7056 video + 74 audio + 159 text | 4 in 3004 s (751 s each) | 663 s | 61 min |
+| dog, 448x256, 22 / 56 frames, 4-step 768p LoRA | 982 / 2214 in all | 4 in 147 s / 437 s | 45 s / 135 s | 3.3 / 9.7 min |
+
+The audio VAE takes 0.3 to 1.3 s. Attention is 46 to 60% of the forwards' time (`--profile`) and
+grows with the square of the rows: a default request (1344x768, 124 frames, 37,869 rows) was not
+run and would take hours per forward here. The same request twice gives the same file byte for
+byte.
+
+What the frames show (contact sheets read by the model that ran this, not by a person):
+
+- 448x256, 124 frames, 4-step 768p LoRA: the prompts' scenes, sharp, the same person / dog and
+  background through the clip, the described actions in order (she speaks, smiles, lifts the mug
+  and drinks; the dog barks with its head raised three times, then pants). **With flaws**: in the
+  dog clip coloured blobs (green, yellow, pink, about 60 x 90 pixels) appear on the lawn and the
+  fence for about four frames each in most of the clip, and its contrast is harsh; the speech
+  clip has none with the Q8_0 encoder and two with Q4_K_M. They are in the denoised rows, not
+  made by the VAE (decoding the first 17 latent frames alone gives the same blobs), no value of
+  those rows is out of range (all within 4.3 standard deviations), and the same prompt and seed
+  at 22 and 56 frames, at 1344x768 and with the 8-step LoRA have none. The 4-step file is
+  distilled at 1344x768; whether ComfyUI gives the same blobs with it at 448x256 was not checked,
+  so a fault of oxinfer's that only shows on 4-step, 4000-row requests is not excluded;
+- 448x256, 124 frames, 8-step LoRA (the dog): clean, softer and more natural than the 4-step clip;
+- 1344x768, 22 frames: clean and detailed (knit of the sweater, the hands on the mug), but the
+  whole prompt is played in 0.9 s, below the 5 s the model is made for.
+
+What the soundtracks are (statistics, spectrograms and oxinfer's Whisper, `openai/whisper-small`
+with `--transcribe`; nobody listened):
+
+| run | level (RMS / peak, both channels alike) | content | Whisper |
+|---|---|---|---|
+| speech, 124 frames, Q8_0 | -31 dBFS / 0.33, no clipping, 69% of the 20 ms windows below -60 dBFS | two voiced segments with harmonics and formants at 0 to 0.7 s and 2.0 to 2.9 s, near silence between and after | `Good morning. The coffee is ready.` (English, p = 0.97) |
+| speech, 124 frames, Q4_K_M | -31 dBFS / 0.30 | the same two segments at the same times | `Good morning. The coffee is ready.` |
+| speech, 1344x768, 22 frames | -16.5 dBFS / 0.91 | continuous speech over the 0.9 s | `The coffee is ready.` |
+| dog, 124 frames, 4-step | -23 dBFS / 0.71, 63% silent windows | three bursts of 0.15 s at 0.9, 2.3 and 2.8 s, energy up to 15 kHz, most of it below 2 kHz; five weaker bursts from 3.6 s (panting) | `dog barking` |
+| dog, 124 frames, 8-step | -16 dBFS / 1.0, 0.17% of the samples at the clamp | three barks with clear harmonics at 0.9, 2.0 and 2.8 s, panting after, short chirps at 4 to 5 kHz (the prompt asks for birdsong) | `Woo! Woo! Woo!` |
+
+The two channels correlate 0.85 to 0.97 (stereo, not two copies). Every soundtrack has 800
+samples per latent: 165,600 samples (5.175 s) for 124 frames (5.167 s), 29,600 (0.925 s) for 22
+(0.917 s). ffprobe reads each AVI as `mjpeg` 24 fps with the right frame count and `pcm_s16le`
+32 kHz stereo with that many samples, and ffmpeg converts them to H.264 + AAC. Whether the sound
+is in sync with the picture (lips, barks) was not judged.
+
+**The text encoder at Q4_K_M** against Q8_0, the speech prompt: `hidden_states[50]` differs by
+4.9% (relative, without the first row, whose norm is 50 times the others'; 5% in the median row,
+9.9% at most; cosine 0.9988 in the median row). The video is another sample of the same scene (the
+same woman, kitchen and actions, a different bowl on the counter; 22.7 dB PSNR between the two),
+with the two blobs noted above; the soundtrack has the same words at the same times (correlation
+0.85 with the Q8_0 one). One prompt and one seed: not enough to say Q4_K_M is worse.
 
 ### Still not supported
 
