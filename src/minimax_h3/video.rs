@@ -470,7 +470,11 @@ pub fn encode_prompt(model: &Path, text_encoder: &Path, prompt: &str, keyframes:
 /// [`encode_prompt`] with the text encoder's weights at `quant` (a float checkpoint is quantized
 /// at load; a GGUF file is used in its own format). `text_encoder` is a folder or a GGUF file of
 /// Qwen3-VL-32B-Instruct, which the release's `text_encoder/` is (the same files, by their
-/// SHA-256); a GGUF file brings its own tokenizer and no vision tower, so no keyframes.
+/// SHA-256); a GGUF file brings its own tokenizer and no vision tower, so no keyframes. One of
+/// ComfyUI's single files (`qwen3vl_32b_minimax_h3_*.safetensors`: the first 50 layers, in bf16,
+/// int8 ConvRot or NVFP4, see [`crate::comfy_quant`]) is read for text-only prompts too, with the
+/// release's `tokenizer.json` in `model`'s `tokenizer/`, in a `tokenizer/` folder beside the file
+/// or beside the file itself.
 pub fn encode_prompt_quant(
     model: &Path,
     text_encoder: &Path,
@@ -483,17 +487,27 @@ pub fn encode_prompt_quant(
     if crate::gguf::is_gguf(text_encoder) && !keyframes.is_empty() {
         bail!("a GGUF text encoder has no vision tower: keyframes need the safetensors text encoder");
     }
+    if text_encoder.is_file() && !keyframes.is_empty() {
+        bail!("the vision tower of a single-file text encoder is not read: keyframes need the text encoder's folder");
+    }
     let opts = QwenVlOptions {
         quant,
         mmap: true,
         vision: !keyframes.is_empty(),
-        tokenizer_dir: [model.join("tokenizer"), parent.join("tokenizer"), text_encoder.to_path_buf()]
-            .into_iter()
-            .find(|d| d.join("tokenizer.json").exists()),
+        tokenizer_dir: [
+            model.join("tokenizer"),
+            parent.join("tokenizer"),
+            text_encoder.to_path_buf(),
+            // Beside a single-file text encoder.
+            parent.clone(),
+        ]
+        .into_iter()
+        .find(|d| d.join("tokenizer.json").exists()),
         ..Default::default()
     };
     let vl = QwenVl::load(text_encoder, &opts)?;
-    if vl.model().cfg.num_hidden_layers <= 50 {
+    // ComfyUI's single files stop after the 50th layer.
+    if vl.model().cfg.num_hidden_layers < 50 {
         bail!(
             "the text encoder has {} layers; MiniMax-H3 conditions on its 50th",
             vl.model().cfg.num_hidden_layers

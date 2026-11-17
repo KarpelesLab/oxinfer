@@ -739,6 +739,8 @@ impl<'a> QwenModel<'a> {
             Vec::new()
         } else if cfg.lfm3.is_some() {
             ld.norm(&format!("{prefix}embedding_norm.weight"), h)?
+        } else if cfg.no_final_norm {
+            vec![1.0; h]
         } else {
             ld.norm(&format!("{prefix}norm.weight"), h)?
         };

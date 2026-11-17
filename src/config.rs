@@ -586,6 +586,10 @@ pub struct QwenConfig {
     /// Query / key / value projections have biases (Qwen2, Qwen2.5-VL).
     #[serde(skip)]
     pub attention_bias: bool,
+    /// The checkpoint has no final norm (ComfyUI's truncated Qwen3-VL text encoders, read for
+    /// the residual stream after their last layer): the final-normed states use unit weights.
+    #[serde(skip)]
+    pub no_final_norm: bool,
     /// No causal mask: every token attends to the whole input (Qwen2 embedders such as
     /// gte-Qwen2 and stella, whose modeling code runs the decoder that way; set by `crate::embed`).
     #[serde(skip)]
@@ -782,6 +786,12 @@ impl QwenConfig {
         } else {
             serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?
         };
+        Self::from_json(raw, gguf)
+    }
+
+    /// The configuration from the contents of a `config.json` (`gguf`: built from a GGUF header,
+    /// whose tensors follow llama.cpp's conventions).
+    pub(crate) fn from_json(raw: serde_json::Value, gguf: bool) -> Result<Self> {
         let mt = raw.get("model_type").and_then(|v| v.as_str());
         let granite = mt == Some("granite");
         let llama = mt == Some("llama") || granite;

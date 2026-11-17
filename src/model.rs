@@ -279,6 +279,9 @@ impl<'a> Table<'a> {
             }
             return Ok(Table::Mlx { parts, q });
         }
+        if let Some(t) = crate::comfy_quant::table(files, full, rows, cols)? {
+            return Ok(t);
+        }
         // SAFETY: the table borrows `files` for 'a, which outlives every model holding it.
         if let Some(st) = unsafe { files.quantized(full, rows, cols)? } {
             return Ok(match st {
@@ -302,7 +305,7 @@ impl<'a> Table<'a> {
 /// present (zero-copy), otherwise bf16 quantized to `q` at load (and recorded for `--save-quantized`).
 pub fn load_lin<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usize, q: Quant) -> Result<Lin<'a>> {
     let mut l = load_lin_stored(files, full, n_out, n_in, q)?;
-    // A ComfyUI weight brings its own input transform (its rotation).
+    // A ComfyUI weight brings its own input transform (rotation, `pre_quant_scale`).
     if let Some(f) = files.fold(full, false) {
         l.fold = Some(f);
     }
@@ -327,7 +330,7 @@ fn load_lin_stored<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: us
     if let Some(m) = files.mlx_q4(full, n_out, n_in)? {
         return Ok(Lin::q4(m));
     }
-    // ComfyUI's `comfy_quant` weights (int8 with ConvRot, W6A8).
+    // ComfyUI's `comfy_quant` weights (int8 with ConvRot, W6A8, its NVFP4 packing).
     if let Some(l) = crate::comfy_quant::lin(files, full, n_out, n_in)? {
         return Ok(l);
     }

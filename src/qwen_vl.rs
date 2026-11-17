@@ -111,17 +111,41 @@ fn deepstack(images: &[VlImage], refs: &[(usize, &[f32])]) -> Result<Option<Box<
     Ok((!out.is_empty()).then(|| Box::new(crate::qwen::DeepStack(out))))
 }
 
+/// The language model's configuration of one of ComfyUI's single-file Qwen3-VL text encoders
+/// (`model.layers.N.*`, `model.embed_tokens`, no `config.json`; see [`crate::comfy_quant`]): the
+/// sizes from the tensor shapes, the rest Qwen3-VL's constants. Such a file stops after the layer
+/// it is read for and has no final norm.
+pub fn single_file_config(files: &ModelFiles) -> Result<crate::config::QwenConfig> {
+    let raw = crate::comfy_quant::qwen3vl_config(files)?.context("not a single-file Qwen3-VL text encoder")?;
+    let mut cfg = crate::config::QwenConfig::from_json(raw, false)?;
+    cfg.no_final_norm = !files.has("model.norm.weight");
+    Ok(cfg)
+}
+
 /// The first of `cands` that holds `file`.
 fn find_dir(cands: &[PathBuf], file: &str) -> Option<PathBuf> {
     cands.iter().find(|d| crate::fsx::exists(&d.join(file))).cloned()
 }
 
 impl QwenVl {
-    /// Loads a Qwen VL checkpoint folder (or a Hugging Face repo id, fetched into the cache).
+    /// Loads a Qwen VL checkpoint folder (or a Hugging Face repo id, fetched into the cache), a
+    /// GGUF file of its language model, or one of ComfyUI's single-file Qwen3-VL text encoders
+    /// (a `.safetensors` file: the language model alone, text only, its configuration from the
+    /// tensor shapes ([`crate::comfy_quant`]) and `tokenizer.json` beside it or in a `tokenizer/`
+    /// folder there).
     pub fn load(path_or_repo: &Path, opts: &QwenVlOptions) -> Result<Self> {
-        let dir = crate::engine::resolve_model(&path_or_repo.to_string_lossy(), None)?;
+        // One of ComfyUI's single-file Qwen3-VL text encoders: no configuration beside it.
+        let single = path_or_repo.is_file() && path_or_repo.extension().is_some_and(|e| e == "safetensors");
+        let dir = if single {
+            path_or_repo.to_path_buf()
+        } else {
+            crate::engine::resolve_model(&path_or_repo.to_string_lossy(), None)?
+        };
         let parent = dir.parent().map(Path::to_path_buf).unwrap_or_default();
-        let cands = [dir.clone(), parent.join("processor"), parent.join("tokenizer")];
+        let mut cands = vec![dir.clone(), parent.join("processor"), parent.join("tokenizer")];
+        if single {
+            cands.push(parent.clone());
+        }
         // A GGUF file carries its own vocabulary.
         let tok_dir = opts
             .tokenizer_dir
@@ -135,14 +159,23 @@ impl QwenVl {
                 qwen2_tokenizer_from_vocab(&d)?
             }
         };
-        let cfg = crate::config::QwenConfig::load(&dir)?;
-        let files = Box::new(ModelFiles::open(&dir, !opts.mmap)?);
+        let files = Box::new(if single {
+            ModelFiles::open_file(&dir, !opts.mmap)?
+        } else {
+            ModelFiles::open(&dir, !opts.mmap)?
+        });
+        let cfg = if single {
+            single_file_config(&files).with_context(|| dir.display().to_string())?
+        } else {
+            crate::config::QwenConfig::load(&dir)?
+        };
         // SAFETY: the box's heap block does not move, and `QwenVl` drops the model and tower
         // (every borrow of it) before `_files`.
         let fs: &'static ModelFiles = unsafe { &*(files.as_ref() as *const ModelFiles) };
         let model = QwenModel::load(cfg, fs, opts.quant)?;
         // A GGUF file is the language model alone (its tower would be an `mmproj` file): text only.
-        let mut mm = if crate::gguf::is_gguf(&dir) {
+        // A single safetensors file has a tower (`visual.*`) but not its configuration: not read.
+        let mut mm = if single || crate::gguf::is_gguf(&dir) {
             None
         } else {
             QwenMmConfig::load(&dir)?
