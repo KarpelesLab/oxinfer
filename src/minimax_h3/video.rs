@@ -23,7 +23,7 @@
 //!
 //! - the audio rows, one sequence per stereo channel, through the audio VAE's decoder
 //!   ([`super::audio_vae::AudioDecoder`]): `latents * latents_std + latents_mean`, 800 samples
-//!   at 32 kHz per latent, each channel decoded on its own. Without `audio_vae/` the audio
+//!   at 32 kHz per latent, each channel decoded on its own. Without an audio VAE the audio
 //!   latents are still denoised (the model is trained on the joint sequence) and the video is
 //!   silent.
 
@@ -373,7 +373,7 @@ pub struct Video {
     pub width: usize,
     pub height: usize,
     pub frames: Vec<Vec<u8>>,
-    /// `None` when the release folder has no `audio_vae/`.
+    /// `None` without an audio VAE (no `audio_vae/` in the release folder and none named).
     pub audio: Option<Soundtrack>,
 }
 
@@ -421,6 +421,9 @@ pub struct Sources {
     pub transformer: Option<PathBuf>,
     /// The video VAE instead of `dir/vae`: a folder, or ComfyUI's single file.
     pub vae: Option<PathBuf>,
+    /// The audio VAE instead of `dir/audio_vae`: a folder, or ComfyUI's single file. Without
+    /// either the video has no soundtrack.
+    pub audio_vae: Option<PathBuf>,
     /// The Qwen3-VL-32B text encoder: a folder, or a GGUF file (text-only prompts).
     pub text_encoder: PathBuf,
     /// The precision of the text encoder's weights (float checkpoints are quantized at load).
@@ -444,7 +447,7 @@ pub struct VideoPipeline {
     pub dit: Dit<'static>,
     pub vae: VaeDecoder<'static>,
     vae_files: &'static ModelFiles,
-    /// The audio VAE's decoder, when the folder has `audio_vae/`.
+    /// The audio VAE's decoder, when the folder has `audio_vae/` or one was named.
     pub audio_vae: Option<AudioDecoder>,
     /// The VAE's configuration in diffusers' keys (the encoder reads its geometry).
     vae_json: serde_json::Value,
@@ -553,7 +556,8 @@ impl VideoPipeline {
         super::lora::apply(&mut self.dit, specs)
     }
 
-    /// Loads the DiT and the video VAE from `src` (mapped, in their stored formats).
+    /// Loads the DiT and the video VAE from `src` (mapped, in their stored formats) and the audio
+    /// VAE's decoder when there is one.
     pub fn load_from(src: &Sources) -> Result<Self> {
         let part = |given: &Option<PathBuf>, sub: &str| -> Result<PathBuf> {
             match (given, &src.dir) {
@@ -590,21 +594,26 @@ impl VideoPipeline {
         if vae.cfg.axes != 3 {
             bail!("{}: not a video VAE", vpath.display());
         }
-        // The audio VAE comes with a release folder; without one the video has no soundtrack.
-        let audio_vae = match src.dir.as_ref().map(|d| d.join("audio_vae")) {
-            Some(adir) if adir.join("config.json").exists() => {
-                let a = AudioDecoder::load(&adir).with_context(|| format!("audio VAE in {}", adir.display()))?;
+        // The audio VAE: the one named, or the release folder's; without one there is no soundtrack.
+        let apath = match (&src.audio_vae, &src.dir) {
+            (Some(p), _) => Some(p.clone()),
+            (None, Some(d)) => Some(d.join("audio_vae")).filter(|a| a.join("config.json").exists()),
+            (None, None) => None,
+        };
+        let audio_vae = match apath {
+            Some(apath) => {
+                let a = AudioDecoder::load(&apath).with_context(|| format!("audio VAE in {}", apath.display()))?;
                 if a.cfg.latent_channels != dit.cfg.audio_channels {
                     bail!(
                         "{}: {} latent channels, the transformer's audio rows have {}",
-                        adir.display(),
+                        apath.display(),
                         a.cfg.latent_channels,
                         dit.cfg.audio_channels
                     );
                 }
                 Some(a)
             }
-            _ => None,
+            None => None,
         };
         let shift = |sub: &str, default: f32| src.dir.as_ref().map_or(default, |d| shift_of(&d.join(sub), default));
         Ok(Self {

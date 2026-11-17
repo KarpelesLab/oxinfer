@@ -2,11 +2,13 @@
 //! written by `tools/minimax_h3_audio_tiny.py` and compares with diffusers' waveform:
 //!
 //! ```text
-//! h3_audio_check AUDIO_VAE_DIR DIR [OUT.wav]
+//! h3_audio_check AUDIO_VAE DIR [OUT.wav | --write]
 //! ```
 //!
-//! `DIR` holds `audio_rows.bin` and `audio_decoded.bin`; `OUT.wav` receives the decoded stereo
-//! soundtrack.
+//! `AUDIO_VAE` is the release's `audio_vae/` folder or ComfyUI's single file. `DIR` holds
+//! `audio_rows.bin` and `audio_decoded.bin`; `OUT.wav` receives the decoded stereo soundtrack.
+//! `--write` writes `audio_decoded.bin` from this decoder instead of comparing, so that another
+//! form of the same VAE can be compared with it.
 
 use anyhow::{Context, Result};
 use oxinfer::minimax_h3::audio_vae::AudioDecoder;
@@ -21,7 +23,7 @@ fn read(p: &Path) -> Result<Vec<f32>> {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: h3_audio_check AUDIO_VAE_DIR DIR [OUT.wav]";
+    let usage = "usage: h3_audio_check AUDIO_VAE DIR [OUT.wav | --write]";
     let (vdir, dir) = (args.next().context(usage)?, args.next().context(usage)?);
     let dir = Path::new(&dir);
     oxinfer::gpu::init(&oxinfer::platform::detect(), oxinfer::platform::DevicePref::Cpu)?;
@@ -29,7 +31,7 @@ fn main() -> Result<()> {
     let vae = AudioDecoder::load(Path::new(&vdir))?;
     let t_load = t0.elapsed().as_secs_f64();
     let rows = read(&dir.join("audio_rows.bin"))?;
-    let want = read(&dir.join("audio_decoded.bin"))?;
+    let out = args.next();
     let t1 = Instant::now();
     let channels = vae.decode_rows(&rows, 2)?;
     let secs = channels[0].len() as f64 / vae.cfg.sampling_rate as f64;
@@ -41,6 +43,13 @@ fn main() -> Result<()> {
         t1.elapsed().as_secs_f64()
     );
     let got: Vec<f32> = channels.concat();
+    if out.as_deref() == Some("--write") {
+        let b: Vec<u8> = got.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(dir.join("audio_decoded.bin"), b)?;
+        println!("wrote {}", dir.join("audio_decoded.bin").display());
+        return Ok(());
+    }
+    let want = read(&dir.join("audio_decoded.bin"))?;
     assert_eq!(got.len(), want.len(), "sample count");
     let n = got.len() as f64;
     let max = got.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
@@ -53,7 +62,7 @@ fn main() -> Result<()> {
         100.0 * clamped,
         10.0 * (power / mse.max(1e-30)).log10()
     );
-    if let Some(out) = args.next() {
+    if let Some(out) = out {
         let s = Soundtrack {
             sample_rate: vae.cfg.sampling_rate,
             channels,

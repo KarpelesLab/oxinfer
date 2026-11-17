@@ -22,8 +22,8 @@ the first two: `src/minimax_h3/video.rs` follows diffusers' modular `minimax_h3`
 `vae/`, `audio_vae/`, `text_encoder/` (or `OXINFER_H3_TEXT_ENCODER`), `tokenizer/`, and the two
 `scheduler*/scheduler_config.json` (141 GB of the repository's 498 GB:
 `hf download MiniMaxAI/MiniMax-H3 --include model_index.json "transformer/*" "vae/*" "audio_vae/*" "text_encoder/*" "tokenizer/*" "scheduler/*" "audio_scheduler/*"`).
-Without `audio_vae/` (0.6 GB) the soundtrack is skipped and a message says so. Passing the
-repository id itself has not been tried.
+Without `audio_vae/` (0.6 GB) and without `--audio-vae` the soundtrack is skipped and a message
+says so. Passing the repository id itself has not been tried.
 
 | flag | |
 |---|---|
@@ -163,7 +163,7 @@ Not checked or not done:
 The official release needs 140 GB of downloads and 49 forwards. The repackaged files of
 `Comfy-Org/MiniMax-H3`, the turbo LoRAs of `lightx2v/Minimax-h3-Turbo` and a GGUF of the text
 encoder bring that to 39 to 63 GB and 4 or 8 forwards. **None of these files was downloaded or
-run here**: their layouts were read from the safetensors headers and from sampled rows (HTTP range
+run here** (but the audio VAE, 0.6 GB): their layouts were read from the safetensors headers and from sampled rows (HTTP range
 requests), the quantized formats from the source of ComfyUI and of its `comfy_kitchen` package, and
 the loaders are checked on tiny random checkpoints in the same forms (below).
 
@@ -173,6 +173,7 @@ the loaders are checked on tiny random checkpoints in the same forms (below).
 ./target/release/oxinfer --device cpu \
     --model diffusion_models/minimax_h3_fl2va_pruned_fp8_scaled.safetensors \
     --vae vae/minimax_h3_video_vae_fp16.safetensors \
+    --audio-vae vae/minimax_h3_audio_vae_fp32.safetensors \
     --lora loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors \
     --text-encoder Qwen3-VL-32B-Instruct-Q8_0.gguf \
     -p "integrated_multimodal_description: [Shot 1] ..." -o fox.avi
@@ -191,8 +192,9 @@ the loaders are checked on tiny random checkpoints in the same forms (below).
 
 | flag | |
 |---|---|
-| `--model FILE` | a single-file transformer in ComfyUI's layout instead of the release folder; `--vae` is then required, the shifts are 12 and 3 (there is no scheduler folder), and there is no soundtrack: the audio VAE is only read from a release folder's `audio_vae/` |
+| `--model FILE` | a single-file transformer in ComfyUI's layout instead of the release folder; `--vae` is then required, the shifts are 12 and 3 (there is no scheduler folder), and there is a soundtrack only with `--audio-vae` |
 | `--transformer FILE\|DIR`, `--vae FILE\|DIR` | one part of a release folder from another place |
+| `--audio-vae FILE\|DIR` | the audio VAE: ComfyUI's `vae/minimax_h3_audio_vae_fp32.safetensors` or the release's `audio_vae/` folder (0.6 GB either way) |
 | `--text-encoder DIR\|FILE.gguf\|FILE.safetensors` | a Qwen3-VL-32B-Instruct folder, or its language model as GGUF, or one of ComfyUI's single files (`text_encoders/qwen3vl_32b_minimax_h3_{bf16,int8_convrot,nvfp4_awq}.safetensors`); a file is for text-only prompts (no `--init-image` / `--last-image`), and a safetensors file needs the release's `tokenizer.json`: in `--model`'s `tokenizer/`, in a `tokenizer/` folder beside the file or beside the file itself |
 | `--quant q8` | the text encoder's safetensors weights quantized at load (memory, not download; `q4` is taken as `q8`) |
 | `--lora FILE[:SCALE]` | LoRA files on the transformer, repeatable. A file named `*turbo_Nstep*` sets `--steps N + 1` and the shifts: 6 / 3 for the `768p` files, 12 / 3 for the others |
@@ -215,6 +217,7 @@ Read from the files' headers and, where rows are quoted, from the same rows of s
 | `vae/minimax_h3_video_vae_int8_convrot.safetensors` | 2.8 GB | the fp16 file's tensors with the same names and header; the four matrices of each of the 36 decoder blocks as int8 ConvRot, the decoder's other tensors float32 |
 | `text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors`, `..._int8_convrot.safetensors`, `..._nvfp4_awq.safetensors` | 51.5 / 27.1 / 15.7 GB | the first 50 of Qwen3-VL-32B's 64 layers as `model.layers.N.*`, `model.embed_tokens` and the vision tower (`visual.*`), without final norm, head or configuration (`comfy/text_encoders/llama.py`, `Qwen3VL_32BConfig`: the conditioning is the last layer's output). The seven matrices of a layer in bf16, int8 ConvRot, or NVFP4 (below); the NVFP4 file's embedding is int8 with a scale per row. The tower is bf16 in all three |
 | `vae/minimax_h3_video_vae_fp16.safetensors` | 5.2 GB | MiniMax's original tensor names (`FL2VA/video_vae`: `encoder.down.I.block.J`, a fused per-head `to_qkv`, `ff.w1` as `[gate; value]`) in float16, the configuration in the header. Sampled rows equal diffusers' `vae/` within float16 rounding (1.5e-5; the encoder's within 3e-8) |
+| `vae/minimax_h3_audio_vae_fp32.safetensors` | 0.6 GB | the release's `audio_vae/` in float32 with the weight normalization of the BigVGAN convolutions folded in (`.weight` where the release has `.weight_g` / `.weight_v`; the 743 tensors under the same name are byte for byte the release's), the encoder included. The header has `latents_mean` / `latents_std` (the values of the release's `config.json`), `sample_rate`, and MiniMax's `kwargs` (`decoder_rates`); the AMP kernels and dilations are not in it and are taken as the release's (3, 7, 11 by the tensor shapes; 1, 3, 5) |
 | `loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors`, `..._turbo_8step_v1.0_comfyui_bf16.safetensors` | 2.0 GB | rank-128 pairs on `qkv_proj` (fused: rank 384 with a block-diagonal `B`), `out_proj`, `fc1`, `fc2` of the 50 blocks and the 2 refiner blocks, `.alpha` 128 / 384 (4-step) and 8 / 24 (8-step: scale 1/16) |
 | `text_encoder/` of the release | 63.4 GB | Qwen3-VL-32B-Instruct itself: its 14 shards have the SHA-256 of `Qwen/Qwen3-VL-32B-Instruct`'s. `unsloth/Qwen3-VL-32B-Instruct-GGUF` holds the language model in llama.cpp's `qwen3vl` layout; sampled rows of its BF16 file (queries, keys, values, output, the three MLP matrices, the embedding, three norms) are the release's bit for bit, its vocabulary and merges are the release tokenizer's |
 
@@ -381,6 +384,11 @@ header of the real `Qwen3-VL-32B-Instruct-Q4_K_M.gguf` (its first 24 MB in a spa
 weights read as zeros) loads through `QwenVl` as 64 layers of width 5120 with the release's
 configuration values, and three prompts tokenize to the same ids as with the release's
 `tokenizer.json`.
+
+The single-file audio VAE is the one file of these that was downloaded: `h3_audio_check` (`--write`
+keeps one decoder's waveform as the reference for another) decodes 207 seeded normal latents per
+channel with it within 3.7e-5 of the release folder's decode (107 dB SNR; the folded weight
+normalization rounds differently).
 
 The command line was run end to end on the tiny files (the pruned FP8 transformer and the fp16
 VAE as single files, a LoRA named `*turbo_4step*768p*`, a stored prompt embedding): 4 forwards at

@@ -125,6 +125,8 @@ struct Args {
     /// MiniMax-H3: the sigma shifts of the video and audio schedules.
     shift: Option<f32>,
     audio_shift: Option<f32>,
+    /// MiniMax-H3: the audio VAE (a folder or ComfyUI's single file) instead of `audio_vae/`.
+    audio_vae: Option<String>,
     mask: Option<PathBuf>,
     strength: Option<f32>,
     image_guidance: Option<f32>,
@@ -388,6 +390,8 @@ fn usage() -> ! {
          \x20                      768p files)\n\
          \x20 --transformer FILE, --vae FILE, --text-encoder DIR|GGUF   a part from another place:\n\
          \x20                      ComfyUI's single files, a Qwen3-VL-32B-Instruct GGUF (text only)\n\
+         \x20 --audio-vae DIR|FILE the audio VAE when the model folder has no audio_vae/ (a\n\
+         \x20                      single-file --model): the release's folder or ComfyUI's fp32 file\n\
          \x20 --quant q8           the text encoder quantized at load\n\
          \x20 --init-image FILE    the first frame; --last-image FILE the last frame\n\
          \x20 -o FILE              .avi (Motion JPEG and the 32 kHz stereo soundtrack as PCM), .webp\n\
@@ -641,6 +645,7 @@ fn parse_args() -> Result<Args> {
         last_image: None,
         shift: None,
         audio_shift: None,
+        audio_vae: None,
         transformer: None,
         qwen_image: Default::default(),
         size: None,
@@ -888,6 +893,7 @@ fn parse_args() -> Result<Args> {
             "--last-image" => a.last_image = Some(PathBuf::from(val()?)),
             "--shift" => a.shift = Some(val()?.parse()?),
             "--audio-shift" => a.audio_shift = Some(val()?.parse()?),
+            "--audio-vae" => a.audio_vae = Some(val()?),
             "--mask" => a.mask = Some(PathBuf::from(val()?)),
             "--strength" => a.strength = Some(val()?.parse()?),
             "--image-guidance" => a.image_guidance = Some(val()?.parse()?),

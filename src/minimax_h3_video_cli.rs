@@ -5,13 +5,15 @@
 //! The output follows the extension of `-o`: `.avi` is Motion JPEG in an AVI container and
 //! `.webp` an animated WebP (both through oxideav, the `media` feature: no pure-Rust H.264 / VP9 /
 //! AV1 encoder is available); anything else is a PNG sequence (`NAME_0000.png`, ...). The stereo
-//! soundtrack (32 kHz, decoded when the model folder has `audio_vae/`) is a 16-bit PCM stream in
+//! soundtrack (32 kHz, decoded when the model folder has `audio_vae/` or `--audio-vae` names the
+//! audio VAE: a folder, or ComfyUI's `vae/minimax_h3_audio_vae_fp32.safetensors`) is a 16-bit PCM stream in
 //! the AVI, interleaved frame by frame; animated WebP has no audio and a PNG sequence is only
 //! frames, so both get a sibling `NAME.wav`.
 //!
 //! `--model` is the release folder in diffusers' layout, or a single-file transformer in ComfyUI's
 //! layout (`Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors`) with
-//! `--vae FILE`; `--transformer`, `--vae` and `--text-encoder` replace a part of a folder too.
+//! `--vae FILE`; `--transformer`, `--vae`, `--audio-vae` and `--text-encoder` replace a part of a
+//! folder too.
 //! `--lora FILE[:SCALE]` applies LoRA files; a turbo LoRA sets the step count and the shifts its
 //! name stands for (`--steps`, `--shift`, `--audio-shift` override them).
 //!
@@ -305,6 +307,7 @@ pub fn run(args: &Args) -> Result<()> {
             (None, false) => None,
         },
         vae: args.flux.vae.as_deref().map(|v| resolve_part(v, args)).transpose()?,
+        audio_vae: args.audio_vae.as_deref().map(|v| resolve_part(v, args)).transpose()?,
         // The text encoder at Q4 is not offered (Qwen-Image's moves its hidden states by ~25%).
         text_quant: Some(match args.quant {
             oxinfer::model::Quant::Q4 => oxinfer::model::Quant::Q8,
@@ -353,7 +356,7 @@ pub fn run(args: &Args) -> Result<()> {
     let t1 = Instant::now();
     let mut pipe = VideoPipeline::load_from(&src)?;
     if pipe.audio_vae.is_none() {
-        eprintln!("[no audio_vae/ beside the model: the video will have no soundtrack]");
+        eprintln!("[no audio VAE (audio_vae/ in the model folder, or --audio-vae): the video will have no soundtrack]");
     }
     for line in pipe.apply_loras(&args.loras)? {
         eprintln!("{line}");

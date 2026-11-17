@@ -26,7 +26,7 @@ use crate::safetensors::ModelFiles;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
-/// `audio_vae/config.json`.
+/// `audio_vae/config.json`, or the `minimax_h3_audio_vae` header entry of ComfyUI's single file.
 #[derive(Clone, Debug)]
 pub struct AudioVaeConfig {
     pub latent_channels: usize,
@@ -41,7 +41,43 @@ pub struct AudioVaeConfig {
 
 impl AudioVaeConfig {
     pub fn load(dir: &Path) -> Result<Self> {
-        let c: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
+        Self::from_json(&serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?)
+    }
+
+    /// The configuration in the header of ComfyUI's single file
+    /// (`vae/minimax_h3_audio_vae_fp32.safetensors`: the release's tensors under the same names),
+    /// in diffusers' keys: `latents_mean` / `latents_std`, `sample_rate`, and MiniMax's own
+    /// `kwargs` (`decoder_rates`). None when the file has no such entry.
+    pub fn comfy_json(files: &ModelFiles) -> Option<Result<serde_json::Value>> {
+        let meta = files.metadata("minimax_h3_audio_vae")?;
+        Some((|| {
+            let m: serde_json::Value = serde_json::from_str(meta).context("the minimax_h3_audio_vae header entry")?;
+            let mut o = serde_json::Map::new();
+            for (to, from) in [
+                ("latents_mean", "latents_mean"),
+                ("latents_std", "latents_std"),
+                ("latent_channels", "latent_channels"),
+                ("sampling_rate", "sample_rate"),
+            ] {
+                if let Some(v) = m.get(from) {
+                    o.insert(to.into(), v.clone());
+                }
+            }
+            if let Some(k) = m.get("kwargs") {
+                match k.get("decoder_type").and_then(|v| v.as_str()) {
+                    None | Some("bigvgan") => {}
+                    Some(other) => bail!("minimax_h3_audio_vae: decoder_type {other}, only bigvgan is implemented"),
+                }
+                if let Some(v) = k.get("decoder_rates") {
+                    o.insert("decoder_rates".into(), v.clone());
+                }
+            }
+            Ok(serde_json::Value::Object(o))
+        })())
+    }
+
+    /// From a configuration in diffusers' keys.
+    pub fn from_json(c: &serde_json::Value) -> Result<Self> {
         let list = |v: &serde_json::Value| -> Vec<usize> {
             v.as_array()
                 .map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as usize)).collect())
@@ -299,10 +335,21 @@ pub struct AudioDecoder {
 }
 
 impl AudioDecoder {
-    /// Loads the decoder from `dir` (`config.json` and the weights, float32).
-    pub fn load(dir: &Path) -> Result<Self> {
-        let cfg = AudioVaeConfig::load(dir)?;
-        let files = ModelFiles::open(dir, false)?;
+    /// Loads the decoder (float32) from `path`: a folder (`config.json` and the weights), or
+    /// ComfyUI's single file with its configuration in the header.
+    pub fn load(path: &Path) -> Result<Self> {
+        if path.is_file() {
+            let files = ModelFiles::open_file(path, false)?;
+            let json = AudioVaeConfig::comfy_json(&files).with_context(|| {
+                format!(
+                    "{}: not ComfyUI's single-file MiniMax-H3 audio VAE (no minimax_h3_audio_vae header entry)",
+                    path.display()
+                )
+            })??;
+            return Self::from_files(AudioVaeConfig::from_json(&json)?, &files);
+        }
+        let cfg = AudioVaeConfig::load(path)?;
+        let files = ModelFiles::open(path, false)?;
         Self::from_files(cfg, &files)
     }
 
