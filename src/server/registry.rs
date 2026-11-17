@@ -137,6 +137,7 @@ pub(crate) enum Stage<'a> {
     /// Another request is using the model.
     Waiting,
     /// A file of the model is being fetched (`index` of `count` large files; 0 for metadata).
+    #[cfg_attr(not(feature = "hf"), allow(dead_code))] // only downloads report it
     Downloading {
         file: &'a str,
         index: usize,
@@ -276,17 +277,23 @@ impl Registry {
                     }
                     // Downloads report through the hook; once the last file is whole the rest
                     // of the wait is the load.
-                    let mut hook = |p: &crate::hf::Progress| {
-                        let last = p.count > 0 && p.index == p.count && p.total == Some(p.done);
-                        on(&Stage::Downloading {
-                            file: p.file,
-                            index: p.index,
-                            count: p.count,
-                            done: p.done,
-                            total: p.total,
-                        }) && (!last || on(&Stage::Loading))
-                    };
-                    crate::hf::with_progress(&mut hook, || Ok(load())).map_err(|_| gone())??
+                    #[cfg(feature = "hf")]
+                    {
+                        let mut hook = |p: &crate::hf::Progress| {
+                            let last = p.count > 0 && p.index == p.count && p.total == Some(p.done);
+                            on(&Stage::Downloading {
+                                file: p.file,
+                                index: p.index,
+                                count: p.count,
+                                done: p.done,
+                                total: p.total,
+                            }) && (!last || on(&Stage::Loading))
+                        };
+                        crate::hf::with_progress(&mut hook, || Ok(load())).map_err(|_| gone())??
+                    }
+                    // Without `hf` nothing is downloaded: the wait is the load alone.
+                    #[cfg(not(feature = "hf"))]
+                    load()?
                 }
             });
         }
