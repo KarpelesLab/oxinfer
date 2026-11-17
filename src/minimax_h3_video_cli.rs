@@ -21,6 +21,9 @@
 //! (written when missing, read when present), so the 63 GB text encoder and the 66 GB transformer
 //! need not be on disk at the same time; when the transformer is missing the run stops after
 //! writing it.
+//!
+//! `OXINFER_H3_LATENTS=FILE` keeps the denoised video and audio rows the same way: a second run
+//! with the same size and frame count decodes them again without the transformer's forwards.
 
 use crate::Args;
 use anyhow::{Context, Result, bail};
@@ -293,6 +296,7 @@ pub fn run(args: &Args) -> Result<()> {
     if let Some(i) = &args.last_image {
         p.last = Some(load_image(i)?);
     }
+    p.latents = std::env::var_os("OXINFER_H3_LATENTS").map(PathBuf::from);
     let cache = std::env::var_os("OXINFER_H3_PROMPT_EMBEDS").map(PathBuf::from);
     if cache.is_some() && (p.first.is_some() || p.last.is_some()) {
         bail!("OXINFER_H3_PROMPT_EMBEDS holds a text-only prompt: unset it with keyframes");
@@ -404,6 +408,9 @@ pub fn run(args: &Args) -> Result<()> {
         t0.elapsed().as_secs_f64(),
         if video.audio.is_some() { "" } else { "; no audio track" }
     );
+    if args.profile {
+        eprint!("[time by operation]\n{}", oxinfer::sd::ops::timing::report());
+    }
     Ok(())
 }
 

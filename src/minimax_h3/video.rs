@@ -335,6 +335,52 @@ pub fn denoise(
     Ok((video, audio))
 }
 
+const LATENTS_MAGIC: &[u8; 4] = b"H3LT";
+
+/// Denoised rows as a file: `H3LT`, then `lt`, `lh`, `lw`, `n_audio` and the two value counts as
+/// little-endian u32, then the video rows (generated rows only) and the audio rows in float32.
+pub fn write_latents(path: &Path, g: Geometry, video: &[f32], audio: &[f32]) -> Result<()> {
+    let mut b = LATENTS_MAGIC.to_vec();
+    for x in [g.lt, g.lh, g.lw, g.n_audio, video.len(), audio.len()] {
+        b.extend_from_slice(&(x as u32).to_le_bytes());
+    }
+    video.iter().chain(audio).for_each(|v| b.extend_from_slice(&v.to_le_bytes()));
+    std::fs::write(path, b).with_context(|| format!("write {}", path.display()))
+}
+
+/// The video and audio rows of [`write_latents`], for the geometry `g`.
+pub fn read_latents(path: &Path, g: Geometry) -> Result<(Vec<f32>, Vec<f32>)> {
+    let b = std::fs::read(path).with_context(|| path.display().to_string())?;
+    if b.len() < 28 || &b[..4] != LATENTS_MAGIC {
+        bail!("{}: not a MiniMax-H3 latent file", path.display());
+    }
+    let h: Vec<usize> = b[4..28]
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c) as usize)
+        .collect();
+    if h[..4] != [g.lt, g.lh, g.lw, g.n_audio] {
+        bail!(
+            "{}: latents of {} frames of {}x{} with {} audio latents, the request has {} of {}x{} with {}",
+            path.display(),
+            h[0],
+            h[1],
+            h[2],
+            h[3],
+            g.lt,
+            g.lh,
+            g.lw,
+            g.n_audio
+        );
+    }
+    let vals: Vec<f32> = b[28..].as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect();
+    if vals.len() != h[4] + h[5] {
+        bail!("{}: truncated", path.display());
+    }
+    Ok((vals[..h[4]].to_vec(), vals[h[4]..].to_vec()))
+}
+
 /// What [`VideoPipeline::generate`] needs.
 pub struct VideoParams {
     pub prompt: String,
@@ -350,6 +396,10 @@ pub struct VideoParams {
     /// The short edge and pixel budget of a canvas resolved from an aspect ratio.
     pub short_edge: usize,
     pub max_pixels: usize,
+    /// Keeps the denoised video and audio rows in this file ([`write_latents`]): written when
+    /// missing, read instead of denoising when present (the two VAEs can then be run again, or
+    /// other ones, on the same rows).
+    pub latents: Option<PathBuf>,
 }
 
 impl VideoParams {
@@ -364,6 +414,7 @@ impl VideoParams {
             last: None,
             short_edge: 768,
             max_pixels: 768 * 1344,
+            latents: None,
         }
     }
 }
@@ -766,6 +817,21 @@ impl VideoPipeline {
             bail!("--steps must be at least 2 (the sigma grid includes its end)");
         }
         let (h, w, frames, g) = self.geometry(p)?;
+        if let Some(f) = p.latents.as_ref().filter(|f| f.exists()) {
+            let (video, audio) = read_latents(f, g)?;
+            let t2 = Instant::now();
+            let mut out = self.decode(&video, g)?;
+            let t_vae = t2.elapsed().as_secs_f64();
+            let t3 = Instant::now();
+            out.audio = self.decode_audio(&audio)?;
+            eprintln!(
+                "[MiniMax-H3: {w}x{h}, {frames} frames ({} latent) from the rows in {}, VAE {t_vae:.1}s, audio VAE {:.1}s]",
+                g.lt,
+                f.display(),
+                t3.elapsed().as_secs_f64()
+            );
+            return Ok(out);
+        }
         let keys = Self::keyframes(p, w, h);
         let anchors: Vec<Anchor> = keys.iter().map(|k| k.0).collect();
         let t0 = Instant::now();
@@ -801,6 +867,9 @@ impl VideoPipeline {
         let t1 = Instant::now();
         let (video, audio) = denoise(&self.dit, &cond.text, &cond.tags, video, audio, g, &anchors, (&sv, &sa), progress)?;
         let t_dit = t1.elapsed().as_secs_f64();
+        if let Some(f) = &p.latents {
+            write_latents(f, g, &video[n_cond_vals..], &audio)?;
+        }
         let t2 = Instant::now();
         let mut out = self.decode(&video[n_cond_vals..], g)?;
         let t_vae = t2.elapsed().as_secs_f64();
@@ -866,6 +935,24 @@ mod tests {
         assert_eq!(l.positions[3 + 2 * rpf + 5][0], 3.0);
         assert!(l.positions[3 + 2 * rpf][2] < l.positions[3 + 2 * rpf + 5][2]);
         assert_eq!(l.tags[3 + 2 * rpf], TAG_AUDIO);
+    }
+
+    #[test]
+    fn latents_file_roundtrip() {
+        let g = Geometry {
+            lt: 2,
+            lh: 4,
+            lw: 6,
+            n_audio: 3,
+        };
+        let video: Vec<f32> = (0..2 * 2 * 3 * 8).map(|i| i as f32 * 0.5).collect();
+        let audio: Vec<f32> = (0..2 * 3 * 4).map(|i| -(i as f32)).collect();
+        let path = std::env::temp_dir().join(format!("oxinfer_h3_latents_{}.bin", std::process::id()));
+        write_latents(&path, g, &video, &audio).unwrap();
+        assert_eq!(read_latents(&path, g).unwrap(), (video, audio));
+        // Rows of another request are refused.
+        assert!(read_latents(&path, Geometry { lt: 3, ..g }).is_err());
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
