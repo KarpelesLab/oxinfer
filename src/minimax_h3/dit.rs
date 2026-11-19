@@ -555,9 +555,9 @@ impl<'a> Dit<'a> {
         (cos, sin)
     }
 
-    /// One block over `x` (`[n, H]`). `ada`: the per-row AdaLN vectors (`[n, 6H]`, shift / scale /
-    /// gate for attention then feed-forward), none for the refiner; `rope`: per-row cos / sin.
-    fn block(&self, b: &Block, x: &mut [f32], n: usize, ada: Option<&[f32]>, rope: Option<(&[f32], &[f32])>) {
+    /// One block over `x` (`[n, H]`). `ada`: the AdaLN vectors of every row (shift / scale / gate
+    /// for attention then feed-forward), none for the refiner; `rope`: per-row cos / sin.
+    fn block(&self, b: &Block, x: &mut [f32], n: usize, ada: Option<Ada>, rope: Option<(&[f32], &[f32])>) {
         let cfg = &self.cfg;
         let (h, nh, hd) = (cfg.hidden, cfg.heads, cfg.head_dim);
         let inner = nh * hd;
@@ -643,20 +643,17 @@ impl<'a> Dit<'a> {
         let n = x.len() / h;
         let nt = st.len() / self.cfg.time_dim;
         let (cos, sin) = self.rope(positions);
-        let six = 6 * h;
+        // Each row's AdaLN set, `(timestep, modality)`: read from the table, not copied out per row
+        // (that would be n * 6H floats per block, 4.8 GB at a 1344x768 video's 37k rows).
+        let key: Vec<usize> = (0..n).map(|r| timestep_index[r] * MODALITIES + tags[r] as usize).collect();
         let dump = dump.filter(|d| d.blocks);
         if let Some(d) = dump {
             d.write("x_in.bin", x);
         }
         for (bi, b) in self.blocks.iter().enumerate() {
-            // [nt, 3 * 6H]: the six vectors of each (timestep, modality), then one row per token.
+            // [nt * 3, 6H]: the six vectors of each (timestep, modality).
             let table = b.adaln.as_ref().unwrap().forward(st, nt);
-            let mut ada = vec![0f32; n * six];
-            for_chunks(&mut ada, six, true, |r, row| {
-                let k = timestep_index[r] * MODALITIES + tags[r] as usize;
-                row.copy_from_slice(&table[k * six..(k + 1) * six]);
-            });
-            self.block(b, x, n, Some(&ada), Some((&cos, &sin)));
+            self.block(b, x, n, Some(Ada { table: &table, key: &key, h }), Some((&cos, &sin)));
             if let Some(d) = dump {
                 d.write(&format!("blk_{bi}.bin"), x);
             }
@@ -816,12 +813,27 @@ pub struct PackedAv<'p> {
     pub tags: &'p [u8],
 }
 
+/// The AdaLN vectors of every row: row `r` reads set `key[r]` of `table` (`[sets, 6H]`).
+#[derive(Clone, Copy)]
+struct Ada<'t> {
+    table: &'t [f32],
+    key: &'t [usize],
+    h: usize,
+}
+
+impl Ada<'_> {
+    /// Vector `which` (0..6: shift, scale, gate for attention, then for the feed-forward) of row `r`.
+    fn get(&self, r: usize, which: usize) -> &[f32] {
+        let o = self.key[r] * 6 * self.h + which * self.h;
+        &self.table[o..o + self.h]
+    }
+}
+
 /// `x = x * (1 + scale) + shift` with the AdaLN vectors of each row (`which`: 0 attention, 3
 /// feed-forward; `[shift, scale, gate]` follow).
-fn modulate(x: &mut [f32], ada: &[f32], h: usize, which: usize) {
+fn modulate(x: &mut [f32], ada: Ada, h: usize, which: usize) {
     for_chunks(x, h, true, |r, row| {
-        let a = &ada[r * 6 * h..(r + 1) * 6 * h];
-        let (shift, scale) = (&a[which * h..(which + 1) * h], &a[(which + 1) * h..(which + 2) * h]);
+        let (shift, scale) = (ada.get(r, which), ada.get(r, which + 1));
         for ((v, &s), &c) in row.iter_mut().zip(scale).zip(shift) {
             *v = *v * (1.0 + s) + c;
         }
@@ -829,10 +841,10 @@ fn modulate(x: &mut [f32], ada: &[f32], h: usize, which: usize) {
 }
 
 /// `x += gate * y` (AdaLN gate `which`: 2 attention, 5 feed-forward), or `x += y`.
-fn residual(x: &mut [f32], y: &[f32], ada: Option<&[f32]>, h: usize, which: usize) {
+fn residual(x: &mut [f32], y: &[f32], ada: Option<Ada>, h: usize, which: usize) {
     match ada {
         Some(a) => for_chunks(x, h, true, |r, row| {
-            let g = &a[r * 6 * h + which * h..r * 6 * h + (which + 1) * h];
+            let g = a.get(r, which);
             for ((v, &yv), &gv) in row.iter_mut().zip(&y[r * h..(r + 1) * h]).zip(g) {
                 *v += gv * yv;
             }
