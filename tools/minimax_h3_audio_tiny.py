@@ -7,7 +7,9 @@ Without AUDIO_VAE_DIR a tiny random autoencoder is built and saved in OUT_DIR/au
 stages upsampling by 5, 2 and 2 with kernels 9, 4 and 4); with it the release's `audio_vae/` is
 loaded (float32). Writes OUT_DIR/audio_rows.bin (the stereo soundtrack as the DiT emits it:
 `[2 * LATENTS, latent_channels]` normalized rows, channel-major) and OUT_DIR/audio_decoded.bin
-(`[2, LATENTS * hop]` samples), little-endian f32. The rows are seeded normals, or with `signal`
+(`[2, LATENTS * hop]` samples), little-endian f32; and for the encoder OUT_DIR/audio_wave.bin
+(a stereo waveform, `[2, samples]`) with OUT_DIR/audio_enc_rows.bin (its normalized posterior
+mode as channel-major rows). The rows are seeded normals, or with `signal`
 the normalized posterior mode of diffusers' encoder on 5.175 s of a synthetic stereo signal (left:
 a 100 Hz to 8 kHz sweep; right: a 220 Hz tone with four harmonics, amplitude-modulated at 3 Hz),
 whose reconstruction error is printed. Then:
@@ -68,6 +70,15 @@ with torch.no_grad():
     audio = vae.decode(latents, return_dict=False)[0].float()[:, 0]
 rows.numpy().astype(np.float32).tofile(os.path.join(out, "audio_rows.bin"))
 audio.numpy().astype(np.float32).tofile(os.path.join(out, "audio_decoded.bin"))
+# The encoder (`ref2va`'s reference audio): a stereo waveform that does not fill its last
+# latent, through what `MiniMaxH3Ref2VAReferenceEncoderStep` does (one batch item per channel,
+# the posterior mode, normalized, channel-major rows).
+enc_wave = wave[:, 0] if signal else torch.randn(2, n * vae.hop_length - 7) * 0.3
+with torch.no_grad():
+    z = vae.encode(enc_wave[:, None], return_dict=False)[0].mode()
+enc_rows = ((z - mean) / std).permute(0, 2, 1).reshape(-1, C)
+enc_wave.numpy().astype(np.float32).tofile(os.path.join(out, "audio_wave.bin"))
+enc_rows.numpy().astype(np.float32).tofile(os.path.join(out, "audio_enc_rows.bin"))
 clipped = (audio.abs() >= 1.0).float().mean().item()
 if signal:
     for name, a, b in zip(("left (sweep)", "right (tone)"), audio, wave[:, 0]):

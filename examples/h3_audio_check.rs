@@ -1,5 +1,6 @@
 //! Runs MiniMax-H3's audio VAE decoder (`oxinfer::minimax_h3::audio_vae`) on the audio rows
-//! written by `tools/minimax_h3_audio_tiny.py` and compares with diffusers' waveform:
+//! written by `tools/minimax_h3_audio_tiny.py` and compares with diffusers' waveform (and its
+//! encoder on `audio_wave.bin`, when the case has one, with diffusers' rows):
 //!
 //! ```text
 //! h3_audio_check AUDIO_VAE DIR [OUT.wav | --write]
@@ -11,7 +12,7 @@
 //! form of the same VAE can be compared with it.
 
 use anyhow::{Context, Result};
-use oxinfer::minimax_h3::audio_vae::AudioDecoder;
+use oxinfer::minimax_h3::audio_vae::{AudioDecoder, AudioEncoder};
 use oxinfer::minimax_h3::video::Soundtrack;
 use std::path::Path;
 use std::time::Instant;
@@ -48,6 +49,22 @@ fn main() -> Result<()> {
         std::fs::write(dir.join("audio_decoded.bin"), b)?;
         println!("wrote {}", dir.join("audio_decoded.bin").display());
         return Ok(());
+    }
+    // The encoder, when the case has a waveform for it.
+    if let Ok(wave) = read(&dir.join("audio_wave.bin")) {
+        let enc = AudioEncoder::load(Path::new(&vdir))?;
+        let t2 = Instant::now();
+        let half = wave.len() / 2;
+        let rows = enc.encode_rows(&[wave[..half].to_vec(), wave[half..].to_vec()])?;
+        let want = read(&dir.join("audio_enc_rows.bin"))?;
+        assert_eq!(rows.len(), want.len(), "encoded row count");
+        let max = rows.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+        let scale = want.iter().map(|v| v.abs()).sum::<f32>() / want.len() as f32;
+        println!(
+            "audio VAE encode: 2 x {half} samples -> {} rows in {:.1}s, max abs diff {max:.3e}, ref mean |v| {scale:.3e}",
+            rows.len() / enc.cfg.latent_channels,
+            t2.elapsed().as_secs_f64()
+        );
     }
     let want = read(&dir.join("audio_decoded.bin"))?;
     assert_eq!(got.len(), want.len(), "sample count");

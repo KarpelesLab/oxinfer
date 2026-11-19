@@ -18,8 +18,8 @@
 //! The convolutions are the ones of the Audio8 codec ([`crate::arktts::codec`]) with centered
 //! padding. Activations are `[time, channels]`.
 //!
-//! The encoder (a DAC waveform encoder, a causal attention projection and the `mean_proj` /
-//! `logs_proj` heads) is not implemented: only reference audio (`ref2va`) goes through it.
+//! The encoder ([`AudioEncoder`]: a DAC waveform encoder, a causal attention projection and the
+//! `mean_proj` head; the posterior's `logs_proj` is never read) takes `ref2va`'s reference audio.
 
 use crate::arktts::codec::{Conv, ConvT, Snake, bufs, rows_par, weight};
 use crate::safetensors::ModelFiles;
@@ -37,6 +37,9 @@ pub struct AudioVaeConfig {
     pub dilations: Vec<Vec<usize>>,
     pub latents_mean: Vec<f32>,
     pub latents_std: Vec<f32>,
+    /// Heads of the encoder's causal attention projection (8 in the release, which does not
+    /// configure it).
+    pub heads: usize,
 }
 
 impl AudioVaeConfig {
@@ -127,6 +130,7 @@ impl AudioVaeConfig {
             dilations,
             latents_mean: floats("latents_mean")?,
             latents_std: floats("latents_std")?,
+            heads: c.get("num_attention_heads").and_then(|v| v.as_u64()).unwrap_or(8) as usize,
         };
         if cfg.latents_mean.len() != latent_channels || cfg.latents_std.len() != latent_channels {
             bail!("audio VAE config: latents_mean / latents_std are not {latent_channels} values");
@@ -361,18 +365,7 @@ impl AudioDecoder {
     /// Loads the decoder (float32) from `path`: a folder (`config.json` and the weights), or
     /// ComfyUI's single file with its configuration in the header.
     pub fn load(path: &Path) -> Result<Self> {
-        if path.is_file() {
-            let files = ModelFiles::open_file(path, false)?;
-            let json = AudioVaeConfig::comfy_json(&files).with_context(|| {
-                format!(
-                    "{}: not ComfyUI's single-file MiniMax-H3 audio VAE (no minimax_h3_audio_vae header entry)",
-                    path.display()
-                )
-            })??;
-            return Self::from_files(AudioVaeConfig::from_json(&json)?, &files);
-        }
-        let cfg = AudioVaeConfig::load(path)?;
-        let files = ModelFiles::open(path, false)?;
+        let (cfg, files) = open(path)?;
         Self::from_files(cfg, &files)
     }
 
@@ -465,6 +458,284 @@ impl AudioDecoder {
                 self.decode(&z)
             })
             .collect()
+    }
+}
+
+/// The configuration and weights of the audio VAE at `path`: a folder (`config.json` and the
+/// weights), or ComfyUI's single file with its configuration in the header.
+fn open(path: &Path) -> Result<(AudioVaeConfig, ModelFiles)> {
+    if path.is_file() {
+        let files = ModelFiles::open_file(path, false)?;
+        let json = AudioVaeConfig::comfy_json(&files).with_context(|| {
+            format!(
+                "{}: not ComfyUI's single-file MiniMax-H3 audio VAE (no minimax_h3_audio_vae header entry)",
+                path.display()
+            )
+        })??;
+        return Ok((AudioVaeConfig::from_json(&json)?, files));
+    }
+    Ok((AudioVaeConfig::load(path)?, ModelFiles::open(path, false)?))
+}
+
+/// A linear layer `[out, in]` (with its bias) as a 1x1 convolution over `[t, in]` rows.
+fn linear(f: &ModelFiles, p: &str) -> Result<Conv> {
+    let n = format!("{p}.weight");
+    let shape = f.info(&n).with_context(|| format!("missing tensor {n}"))?.shape.clone();
+    let [o, i] = shape[..] else { bail!("{n}: expected a matrix, got {shape:?}") };
+    Ok(Conv::new(&f.f32(&n)?, [o, i, 1], bias(f, p, o)?, 1, 1))
+}
+
+fn norm(f: &ModelFiles, p: &str) -> Result<(Vec<f32>, Vec<f32>)> {
+    Ok((f.f32(&format!("{p}.weight"))?, f.f32(&format!("{p}.bias"))?))
+}
+
+fn layer_norm(x: &[f32], (w, b): &(Vec<f32>, Vec<f32>)) -> Vec<f32> {
+    let mut y = x.to_vec();
+    crate::mistral4::layer_norm_rows(&mut y, w.len(), w, b, 1e-5);
+    y
+}
+
+/// DAC's residual unit: `x + conv1(snake(conv7_dilated(snake(x))))`.
+struct EncRes {
+    s1: Snake,
+    c1: Conv,
+    s2: Snake,
+    c2: Conv,
+}
+
+impl EncRes {
+    fn load(f: &ModelFiles, p: &str, dilation: usize) -> Result<Self> {
+        Ok(Self {
+            s1: Snake::load(f, &format!("{p}.block.0.alpha"))?,
+            c1: conv(f, &format!("{p}.block.1"), dilation)?,
+            s2: Snake::load(f, &format!("{p}.block.2.alpha"))?,
+            c2: conv(f, &format!("{p}.block.3"), 1)?,
+        })
+    }
+
+    fn forward(&self, x: &mut [f32], t: usize) {
+        let mut a = x.to_vec();
+        self.s1.apply(&mut a);
+        let (mut h, _) = self.c1.forward(&a, t);
+        self.s2.apply(&mut h);
+        let (o, _) = self.c2.forward(&h, t);
+        bufs::give(h);
+        add(x, &o, self.c2.c_out);
+        bufs::give(o);
+    }
+}
+
+struct EncBlock {
+    res: Vec<EncRes>,
+    snake: Snake,
+    down: Conv,
+}
+
+/// `pre_block`: `proj(norm3(x)) + attn(norm1(x))`, then `+ mlp(norm2(.))`, narrowing the trunk
+/// to the latent width. The causal attention's heads are averaged instead of concatenated and
+/// the head width is average-pooled down to the latent width.
+struct PreBlock {
+    norm1: (Vec<f32>, Vec<f32>),
+    norm2: (Vec<f32>, Vec<f32>),
+    norm3: (Vec<f32>, Vec<f32>),
+    qkv: Conv,
+    heads: usize,
+    attn_proj: Conv,
+    proj: Conv,
+    mlp_norm: (Vec<f32>, Vec<f32>),
+    w0: Conv,
+    w1: Conv,
+    w2: Conv,
+}
+
+impl PreBlock {
+    fn load(f: &ModelFiles, p: &str, heads: usize) -> Result<Self> {
+        let n = format!("{p}.attn.qkv.weight");
+        let shape = f.info(&n).with_context(|| format!("missing tensor {n}"))?.shape.clone();
+        let [o, i] = shape[..] else { bail!("{n}: expected a matrix, got {shape:?}") };
+        if o != 3 * i || !i.is_multiple_of(heads) {
+            bail!("{n}: {shape:?} is not a fused q, k, v projection of {heads} heads");
+        }
+        let mut b = f.f32(&format!("{p}.attn.q_bias"))?;
+        b.extend(std::iter::repeat_n(0.0, i));
+        b.extend(f.f32(&format!("{p}.attn.v_bias"))?);
+        let attn_proj = linear(f, &format!("{p}.attn.proj"))?;
+        if !(i / heads).is_multiple_of(attn_proj.c_out) {
+            bail!("{p}: heads of {} do not pool to {}", i / heads, attn_proj.c_out);
+        }
+        Ok(Self {
+            norm1: norm(f, &format!("{p}.norm1"))?,
+            norm2: norm(f, &format!("{p}.norm2"))?,
+            norm3: norm(f, &format!("{p}.norm3"))?,
+            qkv: Conv::new(&f.f32(&n)?, [o, i, 1], b, 1, 1),
+            heads,
+            attn_proj,
+            proj: linear(f, &format!("{p}.proj"))?,
+            mlp_norm: norm(f, &format!("{p}.mlp.norm"))?,
+            w0: linear(f, &format!("{p}.mlp.w0"))?,
+            w1: linear(f, &format!("{p}.mlp.w1"))?,
+            w2: linear(f, &format!("{p}.mlp.w2"))?,
+        })
+    }
+
+    /// `[t, trunk]` to `[t, latent]`.
+    fn forward(&self, x: &[f32], t: usize) -> Vec<f32> {
+        let (mut y, _) = self.proj.forward(&layer_norm(x, &self.norm3), t);
+        let (qkv, _) = self.qkv.forward(&layer_norm(x, &self.norm1), t);
+        let d = self.qkv.c_out / 3;
+        let (nh, hd, out) = (self.heads, d / self.heads, self.attn_proj.c_out);
+        let pool = hd / out;
+        let scale = 1.0 / (hd as f32).sqrt();
+        // Per query row: the causal attention of every head, averaged over heads and pooled.
+        let mut pooled = vec![0f32; t * out];
+        crate::kernels::for_chunks(&mut pooled, out, t > 1, |r, o| {
+            let q_row = &qkv[r * 3 * d..r * 3 * d + d];
+            let mut acc = vec![0f32; hd];
+            let mut s = vec![0f32; r + 1];
+            for h in 0..nh {
+                let q = &q_row[h * hd..(h + 1) * hd];
+                for (j, sj) in s.iter_mut().enumerate() {
+                    let k = &qkv[j * 3 * d + d + h * hd..j * 3 * d + d + (h + 1) * hd];
+                    *sj = q.iter().zip(k).map(|(a, b)| a * b).sum::<f32>() * scale;
+                }
+                let m = s.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut z = 0f32;
+                s.iter_mut().for_each(|v| {
+                    *v = (*v - m).exp();
+                    z += *v;
+                });
+                for (j, &p) in s.iter().enumerate() {
+                    let v = &qkv[j * 3 * d + 2 * d + h * hd..j * 3 * d + 2 * d + (h + 1) * hd];
+                    let w = p / z;
+                    acc.iter_mut().zip(v).for_each(|(a, &vv)| *a += w * vv);
+                }
+            }
+            for (c, ov) in o.iter_mut().enumerate() {
+                *ov = acc[c * pool..(c + 1) * pool].iter().sum::<f32>() / (pool * nh) as f32;
+            }
+        });
+        bufs::give(qkv);
+        let (a, _) = self.attn_proj.forward(&pooled, t);
+        add(&mut y, &a, out);
+        let hn = layer_norm(&layer_norm(&y, &self.norm2), &self.mlp_norm);
+        let (mut g, _) = self.w0.forward(&hn, t);
+        let (v, _) = self.w1.forward(&hn, t);
+        for (gv, &vv) in g.iter_mut().zip(&v) {
+            let x = *gv;
+            let th = (0.797_884_6 * (x + 0.044715 * x * x * x)).tanh();
+            *gv = 0.5 * x * (1.0 + th) * vv;
+        }
+        let (m, _) = self.w2.forward(&g, t);
+        add(&mut y, &m, out);
+        y
+    }
+}
+
+/// The audio VAE's encoder: a mono waveform to the posterior mean (`ref2va`'s reference audio).
+/// DAC's waveform encoder (a convolution of 7, then per stride a block of three residual units
+/// at dilations 1, 3 and 9, a Snake and a strided convolution of `2 * stride` doubling the
+/// channels, then a Snake and a convolution of 3), [`PreBlock`] and the `mean_proj` head.
+pub struct AudioEncoder {
+    pub cfg: AudioVaeConfig,
+    conv_in: Conv,
+    blocks: Vec<EncBlock>,
+    snake: Snake,
+    conv_out: Conv,
+    pre: PreBlock,
+    mean: Conv,
+}
+
+impl AudioEncoder {
+    /// Loads the encoder (float32), as [`AudioDecoder::load`].
+    pub fn load(path: &Path) -> Result<Self> {
+        let (cfg, files) = open(path)?;
+        Self::from_files(cfg, &files)
+    }
+
+    pub fn from_files(cfg: AudioVaeConfig, f: &ModelFiles) -> Result<Self> {
+        let mut blocks = Vec::new();
+        let mut i = 1;
+        while f.has(&format!("encoder.block.{i}.block.4.weight_v")) || f.has(&format!("encoder.block.{i}.block.4.weight")) {
+            let p = format!("encoder.block.{i}.block");
+            let (w, shape) = weight(f, &format!("{p}.4"))?;
+            let [co, ci, k] = shape3(&shape, &format!("{p}.4"))?;
+            if !k.is_multiple_of(2) {
+                bail!("{p}.4: an odd kernel ({k}) for a strided convolution of 2 * stride");
+            }
+            let stride = k / 2;
+            blocks.push(EncBlock {
+                res: [1, 3, 9]
+                    .iter()
+                    .enumerate()
+                    .map(|(j, &d)| EncRes::load(f, &format!("{p}.{j}"), d))
+                    .collect::<Result<_>>()?,
+                snake: Snake::load(f, &format!("{p}.3.alpha"))?,
+                down: Conv::padded(&w, [co, ci, k], bias(f, &format!("{p}.4"), co)?, stride, stride.div_ceil(2)),
+            });
+            i += 1;
+        }
+        if blocks.is_empty() {
+            bail!("audio VAE: no encoder blocks (encoder.block.1.block.4)");
+        }
+        let hop: usize = blocks.iter().map(|b| b.down.stride()).product();
+        if hop != cfg.hop() {
+            bail!("audio VAE: the encoder downsamples by {hop}, the decoder upsamples by {}", cfg.hop());
+        }
+        let mean = conv(f, "mean_proj", 1)?;
+        if mean.c_out != cfg.latent_channels {
+            bail!("mean_proj: {} channels for {} latent channels", mean.c_out, cfg.latent_channels);
+        }
+        Ok(Self {
+            conv_in: conv(f, "encoder.block.0", 1)?,
+            blocks,
+            snake: Snake::load(f, &format!("encoder.block.{i}.alpha"))?,
+            conv_out: conv(f, &format!("encoder.block.{}", i + 1), 1)?,
+            pre: PreBlock::load(f, "pre_block", cfg.heads)?,
+            mean,
+            cfg,
+        })
+    }
+
+    /// A mono waveform (right-padded with zeros to whole latents) to the posterior mean
+    /// `[ceil(samples / hop), latent_channels]`, in the VAE's own scale.
+    pub fn encode(&self, wave: &[f32]) -> Result<Vec<f32>> {
+        if wave.is_empty() {
+            bail!("audio VAE: nothing to encode");
+        }
+        let hop = self.cfg.hop();
+        let n = wave.len().div_ceil(hop) * hop;
+        let mut x0 = vec![0f32; n];
+        x0[..wave.len()].copy_from_slice(wave);
+        let (mut x, mut t) = self.conv_in.forward(&x0, n);
+        for b in &self.blocks {
+            for r in &b.res {
+                r.forward(&mut x, t);
+            }
+            b.snake.apply(&mut x);
+            let (y, nt) = b.down.forward(&x, t);
+            bufs::give(std::mem::replace(&mut x, y));
+            t = nt;
+        }
+        self.snake.apply(&mut x);
+        let (y, _) = self.conv_out.forward(&x, t);
+        bufs::give(x);
+        let h = self.pre.forward(&y, t);
+        bufs::give(y);
+        let (m, _) = self.mean.forward(&h, t);
+        bufs::clear();
+        Ok(m)
+    }
+
+    /// The pipeline's rows of a soundtrack (one waveform per channel): each channel encoded on
+    /// its own and normalized (`(z - latents_mean) / latents_std`), channel-major.
+    pub fn encode_rows(&self, channels: &[Vec<f32>]) -> Result<Vec<f32>> {
+        let c = self.cfg.latent_channels;
+        let mut rows = Vec::new();
+        for ch in channels {
+            let z = self.encode(ch)?;
+            rows.extend(z.iter().enumerate().map(|(i, &v)| (v - self.cfg.latents_mean[i % c]) / self.cfg.latents_std[i % c]));
+        }
+        Ok(rows)
     }
 }
 

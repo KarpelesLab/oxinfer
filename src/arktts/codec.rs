@@ -353,6 +353,14 @@ impl Conv {
         c
     }
 
+    /// PyTorch's `Conv1d(stride, padding = pad)` with zero padding, for an input whose length is
+    /// a multiple of `stride` and a kernel no longer than `2 * pad + stride`: `t / stride` steps.
+    pub(crate) fn padded(w: &[f32], shape: [usize; 3], b: Vec<f32>, stride: usize, pad: usize) -> Self {
+        let mut c = Self::new(w, shape, b, stride, 1);
+        c.pad = pad;
+        c
+    }
+
     /// From a kernel in PyTorch's layout (`[out, in, k]`).
     pub(crate) fn new(w: &[f32], [co, ci, k]: [usize; 3], b: Vec<f32>, stride: usize, dilation: usize) -> Self {
         let mut m = vec![0f32; co * k * ci];
@@ -373,6 +381,10 @@ impl Conv {
             dilation,
             pad: (k - 1) * dilation + 1 - stride,
         }
+    }
+
+    pub(crate) fn stride(&self) -> usize {
+        self.stride
     }
 
     /// `x` (`[t, c_in]`) to `[ceil(t / stride), c_out]`.
@@ -523,7 +535,7 @@ impl Snake {
         Self { alpha, inv }
     }
 
-    fn load(f: &ModelFiles, name: &str) -> Result<Self> {
+    pub(crate) fn load(f: &ModelFiles, name: &str) -> Result<Self> {
         let alpha = f.f32(name)?;
         let inv = alpha.iter().map(|&a| 1.0 / (a + 1e-9)).collect();
         Ok(Self { alpha, inv })
