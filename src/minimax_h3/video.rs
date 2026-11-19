@@ -64,23 +64,85 @@ pub fn is_h3_transformer_file(path: &Path) -> bool {
     })
 }
 
-/// Whether `dir` is a MiniMax-H3 release in diffusers' layout (`MiniMaxH3ModularPipeline`), or a
-/// single-file transformer ([`is_h3_transformer_file`]).
+/// Whether `dir` is a MiniMax-H3 release in diffusers' layout (`MiniMaxH3ModularPipeline`), one of
+/// the release's own partitions (`FL2VA/`, `Ref2VA/`: `MiniMaxH3Pipeline`), or a single-file
+/// transformer ([`is_h3_transformer_file`]).
 pub fn is_h3_video(dir: &Path) -> bool {
     if dir.is_file() {
         return is_h3_transformer_file(dir);
     }
-    let Ok(b) = crate::fsx::read(&dir.join("model_index.json")) else {
-        return false;
+    model_index(dir)
+        .and_then(|v| v.get("_class_name").and_then(|c| c.as_str()).map(String::from))
+        .is_some_and(|c| c == "MiniMaxH3ModularPipeline" || c == "MiniMaxH3Pipeline")
+}
+
+fn model_index(dir: &Path) -> Option<serde_json::Value> {
+    serde_json::from_slice(&crate::fsx::read(&dir.join("model_index.json")).ok()?).ok()
+}
+
+/// The partition of the release's own layout (`fl2va`, `ref2va`) when `dir` is one: `FL2VA/`
+/// holds `transformer/` (the original tensor names), `video_vae/` (its wrapper's `config.json`,
+/// the model in `source/`), `audio_vae/` (`config.json` with the latent statistics,
+/// `metadata.json` with the constructor's arguments), `text_encoder/` and `tokenizer/`.
+pub fn release_partition(dir: &Path) -> Option<String> {
+    let v = model_index(dir)?;
+    if v.get("_class_name")?.as_str()? != "MiniMaxH3Pipeline" {
+        return None;
+    }
+    Some(
+        v.get("_minimax_h3")
+            .and_then(|m| m.get("partition"))
+            .and_then(|p| p.as_str())
+            .unwrap_or("fl2va")
+            .to_string(),
+    )
+}
+
+/// The video VAE configuration of the release's layout (`video_vae/config.json` and
+/// `video_vae/source/config.json`, `AutoencoderKLLegacy`) in diffusers' keys
+/// (`AutoencoderKLMiniMaxH3`, as `scripts/convert_minimax_h3_to_diffusers.py` maps them).
+pub fn release_vae_json(video_vae: &Path) -> Result<serde_json::Value> {
+    let read = |p: &Path| -> Result<serde_json::Value> {
+        serde_json::from_slice(&crate::fsx::read(p)?).with_context(|| p.display().to_string())
     };
-    serde_json::from_slice::<serde_json::Value>(&b)
-        .ok()
-        .and_then(|v| {
-            v.get("_class_name")
-                .and_then(|c| c.as_str())
-                .map(|c| c == "MiniMaxH3ModularPipeline")
-        })
-        .unwrap_or(false)
+    let w = read(&video_vae.join("config.json"))?;
+    let src = video_vae.join(w.get("source_path").and_then(|v| v.as_str()).unwrap_or("source"));
+    let c = read(&src.join("config.json"))?;
+    let list = |v: Option<&serde_json::Value>| -> Vec<u64> {
+        v.and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64()).collect()).unwrap_or_default()
+    };
+    if c.get("use_vit_decoder").and_then(|v| v.as_bool()) == Some(false) {
+        bail!("{}: not the ViT decoder MiniMax-H3 releases", src.display());
+    }
+    let ch = c.get("ch").and_then(|v| v.as_u64()).unwrap_or(128);
+    let channels: Vec<u64> = list(c.get("ch_mult")).iter().map(|m| m * ch).collect();
+    let k = c.get("vit_decoder_kwargs").cloned().unwrap_or_default();
+    let get = |o: &serde_json::Value, key: &str| o.get(key).cloned().unwrap_or(serde_json::Value::Null);
+    let mut o = serde_json::json!({
+        "_class_name": "AutoencoderKLMiniMaxH3",
+        "latent_channels": get(&w, "latent_channels"),
+        "latents_mean": get(&w, "latents_mean"),
+        "latents_std": get(&w, "latents_std"),
+        "block_out_channels": channels,
+        "layers_per_block": c.get("num_res_blocks").and_then(|v| v.as_u64()).unwrap_or(2),
+        "spatial_downsample_factors": list(c.get("space_down")),
+        "temporal_downsample_factors": list(c.get("time_down")),
+        "spatial_padding_mode": c.get("padding_mode").and_then(|v| v.as_str()).unwrap_or("reflect"),
+        "decoder_num_layers": get(&k, "num_layers"),
+        "decoder_num_attention_heads": get(&k, "heads"),
+        "decoder_attention_head_dim": get(&k, "dim_head"),
+        "decoder_rope_theta": get(&k, "rope_theta"),
+        "decoder_rope_dim_ratio": get(&k, "rope_dim_ratio"),
+        "clip_length": get(&w, "vae_clip_length"),
+        "token_drop": get(&w, "vae_token_drop"),
+        "vae_tile_size": get(&w, "vae_tile_size"),
+        "vae_tile_overlap_min": get(&w, "vae_tile_overlap_min"),
+    });
+    // Unset entries take the loaders' defaults.
+    if let Some(m) = o.as_object_mut() {
+        m.retain(|_, v| !v.is_null());
+    }
+    Ok(o)
 }
 
 /// Which end of the video a keyframe is anchored to.
@@ -648,6 +710,13 @@ impl VideoPipeline {
                 (None, None) => bail!("MiniMax-H3: no {sub} given (a single-file transformer needs the VAE named too)"),
             }
         };
+        let partition = src.dir.as_deref().and_then(release_partition);
+        if let Some(p) = partition.as_deref()
+            && p != "fl2va"
+        {
+            bail!("MiniMax-H3: the {p} partition is not supported (only t2va / fl2va: the release's FL2VA/)");
+        }
+        let release = partition.is_some();
         let tpath = part(&src.transformer, "transformer")?;
         let dit_files = open_part(&tpath)?;
         let cfg = if tpath.is_file() {
@@ -660,9 +729,17 @@ impl VideoPipeline {
         if !dit.has_audio() {
             bail!("{}: the transformer has no audio stream (not MiniMax-H3)", tpath.display());
         }
-        let vpath = part(&src.vae, "vae")?;
+        let vpath = match (&src.vae, &src.dir) {
+            (None, Some(d)) if release => {
+                let w: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&d.join("video_vae/config.json"))?)?;
+                d.join("video_vae").join(w.get("source_path").and_then(|v| v.as_str()).unwrap_or("source"))
+            }
+            _ => part(&src.vae, "vae")?,
+        };
         let vae_files = open_part(&vpath)?;
-        let vae_json: serde_json::Value = if vpath.is_file() {
+        let vae_json: serde_json::Value = if release && src.vae.is_none() {
+            release_vae_json(vpath.parent().context("video VAE folder")?)?
+        } else if vpath.is_file() {
             VaeConfig::comfy_json(vae_files).with_context(|| {
                 format!(
                     "{}: not ComfyUI's single-file MiniMax-H3 video VAE (no minimax_h3_video_vae header entry)",
@@ -697,7 +774,14 @@ impl VideoPipeline {
             }
             None => None,
         };
-        let shift = |sub: &str, default: f32| src.dir.as_ref().map_or(default, |d| shift_of(&d.join(sub), default));
+        let shift = |sub: &str, key: &str, default: f32| {
+            src.dir.as_ref().map_or(default, |d| {
+                // The release's layout states them in model_index.json.
+                model_index(d)
+                    .and_then(|v| v.get("_minimax_h3")?.get("sigma_shift_scales")?.get(key)?.as_f64())
+                    .map_or_else(|| shift_of(&d.join(sub), default), |s| s as f32)
+            })
+        };
         Ok(Self {
             dir: src
                 .dir
@@ -711,7 +795,7 @@ impl VideoPipeline {
             vae_files,
             audio_vae,
             vae_json,
-            shifts: (shift("scheduler", 12.0), shift("audio_scheduler", 3.0)),
+            shifts: (shift("scheduler", "video", 12.0), shift("audio_scheduler", "audio", 3.0)),
         })
     }
 
@@ -1039,5 +1123,41 @@ mod tests {
         let lat: Vec<f32> = (0..c * t * h * w).map(|i| i as f32).collect();
         let rows = patchify_video(&lat, c, t, h, w, 2);
         assert_eq!(unpatchify_video(&rows, c, t, h, w, 2), lat);
+    }
+
+    #[test]
+    fn release_vae_config_in_diffusers_keys() {
+        // `FL2VA/video_vae/config.json` and `source/config.json` (abridged) give the keys of the
+        // root `vae/config.json` (`AutoencoderKLMiniMaxH3`).
+        let dir = std::env::temp_dir().join(format!("oxinfer-h3-vae-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("source")).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"_class_name": "MiniMaxH3VideoVAE", "source_path": "source", "vae_clip_length": 17, "vae_token_drop": 3,
+                "vae_tile_size": 256, "vae_tile_overlap_min": 64, "latent_channels": 2,
+                "latents_mean": [0.5, -0.25], "latents_std": [1.5, 2.0]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("source/config.json"),
+            r#"{"_class_name": "AutoencoderKLLegacy", "ch": 128, "ch_mult": [1, 2, 2, 4, 4, 8], "num_res_blocks": 2,
+                "padding_mode": "reflect", "space_down": [2, 2, 2, 2, 1, 1], "time_down": [1, 2, 2, 1, 1, 1],
+                "use_vit_decoder": true, "vit_decoder_kwargs": {"dim_head": 64, "heads": 32, "num_layers": 36,
+                "rope_dim_ratio": 0.75, "rope_theta": 100.0}}"#,
+        )
+        .unwrap();
+        let c = release_vae_json(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let want = serde_json::json!({
+            "_class_name": "AutoencoderKLMiniMaxH3", "latent_channels": 2, "latents_mean": [0.5, -0.25],
+            "latents_std": [1.5, 2.0], "block_out_channels": [128, 256, 256, 512, 512, 1024], "layers_per_block": 2,
+            "spatial_downsample_factors": [2, 2, 2, 2, 1, 1], "temporal_downsample_factors": [1, 2, 2, 1, 1, 1],
+            "spatial_padding_mode": "reflect", "decoder_num_layers": 36, "decoder_num_attention_heads": 32,
+            "decoder_attention_head_dim": 64, "decoder_rope_theta": 100.0, "decoder_rope_dim_ratio": 0.75,
+            "clip_length": 17, "token_drop": 3, "vae_tile_size": 256, "vae_tile_overlap_min": 64,
+        });
+        assert_eq!(c, want);
+        let cfg = VaeConfig::from_json(&c).unwrap();
+        assert_eq!((cfg.axes, cfg.patch_t, cfg.dim, cfg.layers, cfg.clip_length, cfg.token_drop), (3, 4, 2048, 36, 17, 3));
     }
 }

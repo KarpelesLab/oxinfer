@@ -66,9 +66,15 @@ comparison with another implementation on the same inputs (see
 | schedulers | `scheduler/`, `audio_scheduler/` | | rectified flow, shift 12 (video) and 3 (audio) |
 
 `FL2VA/` and `Ref2VA/` hold the same checkpoints in MiniMax's original layout (their own `.py`
-modules; the transformer's layout there is the one `Dit::load` already reads for H3-Image, with
-`audio_patch_proj` / `final_layer.audio_out`; the video VAE's `source/model.safetensors` layout is
-not read). The released weights are guidance-distilled (one forward per step, no negative prompt)
+modules). `--model .../FL2VA` runs too: the transformer's tensors there are the ones `Dit::load`
+already reads for H3-Image (with `audio_patch_proj` / `final_layer.audio_out`), the video VAE's
+`video_vae/source/model.safetensors` has the original names the VAE loaders read (`x_embedder`,
+per-head `to_qkv`, `ff.w1` as `[gate; up]`, `encoder.down.I.block.J`), and its configuration
+(`video_vae/config.json` for the latent statistics, clip length and tiles,
+`source/config.json` for the architecture) is mapped to diffusers' keys as
+`scripts/convert_minimax_h3_to_diffusers.py` does (identical to the root `vae/config.json`); the
+audio VAE's `config.json` has the latent statistics and `metadata.json` the decoder rates; the
+shifts come from `model_index.json` (`sigma_shift_scales`). `Ref2VA/` is refused. The released weights are guidance-distilled (one forward per step, no negative prompt)
 but not step-distilled: diffusers' default is 50 grid points.
 
 What a request does (`video.rs` has the details):
@@ -158,10 +164,16 @@ Not checked or not done:
 - the soundtracks generated so far ([real runs](#real-runs)) were analysed and transcribed, not
   listened to; none came from the release's own bf16 transformer or from a 50-step run; the audio
   VAE ran on the CPU only;
-- `ref2va` (`transformer_ref/`) and with it the audio VAE's encoder, the character-swap LoRA, the original `FL2VA/` layout's video and audio VAEs
-  (`FL2VA/audio_vae/model.safetensors` has the same tensor names as `audio_vae/`, but its
-  `config.yaml` / `metadata.json` are not read), GPU execution (the 66 GB transformer runs on the
-  CPU from mapped weights).
+- `ref2va` (`transformer_ref/`) and with it the audio VAE's encoder, the character-swap LoRA, GPU
+  execution (the 66 GB transformer runs on the CPU from mapped weights).
+
+The release's own bf16 weights from `FL2VA/` (192 cores, 251 GB RAM, CPU only): the fox prompt
+above in the `integrated_multimodal_description: [Shot 1] ...` form with an `Audio:` sentence,
+`--size 448x256 --frames 22 --steps 8 --seed 1`: 917 rows, 7 forwards in 236 s (34 s each, with a
+compile sharing the cores), VAE 54 s, audio VAE 1.8 s. The frames show the scene (a red fox
+trotting across the snow in golden backlight, its breath steaming, pines behind), sharp and
+coherent across the clip; ffprobe reads `mjpeg` 448x256, 22 frames and `pcm_s16le` 32 kHz stereo,
+29,600 samples. Not compared with a reference.
 
 ## Smaller files and turbo LoRAs
 

@@ -67,17 +67,21 @@ fn resolve_part(spec: &str, args: &Args) -> Result<PathBuf> {
 
 /// Whether the transformer's weights are on disk (not only its configuration).
 fn has_dit(dir: &Path) -> bool {
-    if dir.is_file() || dir.join("diffusion_pytorch_model.safetensors").exists() {
+    if dir.is_file() {
         return true;
     }
-    std::fs::read(dir.join("diffusion_pytorch_model.safetensors.index.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .is_some_and(|v| {
-            v["weight_map"]
-                .as_object()
-                .is_some_and(|m| m.values().filter_map(|f| f.as_str()).all(|f| dir.join(f).exists()))
-        })
+    // diffusers' names, or the release's own (`FL2VA/transformer/model-*.safetensors`).
+    ["diffusion_pytorch_model", "model"].iter().any(|stem| {
+        dir.join(format!("{stem}.safetensors")).exists()
+            || std::fs::read(dir.join(format!("{stem}.safetensors.index.json")))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                .is_some_and(|v| {
+                    v["weight_map"]
+                        .as_object()
+                        .is_some_and(|m| m.values().filter_map(|f| f.as_str()).all(|f| dir.join(f).exists()))
+                })
+    })
 }
 
 fn read_embeds(path: &Path) -> Result<Conditioning> {

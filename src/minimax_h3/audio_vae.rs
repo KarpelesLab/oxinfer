@@ -41,7 +41,30 @@ pub struct AudioVaeConfig {
 
 impl AudioVaeConfig {
     pub fn load(dir: &Path) -> Result<Self> {
-        Self::from_json(&serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?)
+        let mut c: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
+        // The release's own layout keeps the constructor's arguments in metadata.json.
+        if let Ok(b) = crate::fsx::read(&dir.join("metadata.json"))
+            && let Ok(m) = serde_json::from_slice::<serde_json::Value>(&b)
+            && let (Some(k), Some(o)) = (m.pointer("/metadata/kwargs").and_then(|k| k.as_object()), c.as_object_mut())
+        {
+            for (src, dst) in [("decoder_rates", "decoder_rates"), ("sample_rate", "sampling_rate")] {
+                if let Some(v) = k.get(src)
+                    && !o.contains_key(dst)
+                {
+                    o.insert(dst.to_string(), v.clone());
+                }
+            }
+            if k.get("decoder_type").and_then(|v| v.as_str()).is_some_and(|t| t != "bigvgan") {
+                bail!("{}: only the BigVGAN audio decoder is supported", dir.display());
+            }
+        }
+        if let Some(o) = c.as_object_mut()
+            && !o.contains_key("sampling_rate")
+            && let Some(v) = o.get("sample_rate").cloned()
+        {
+            o.insert("sampling_rate".to_string(), v);
+        }
+        Self::from_json(&c)
     }
 
     /// The configuration in the header of ComfyUI's single file
