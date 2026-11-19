@@ -2,7 +2,7 @@
 
 `MiniMaxAI/MiniMax-H3` generates video with a stereo soundtrack from text (`t2va`), from a first
 and / or last frame (`fl2va`) or from reference images, videos and audio (`ref2va`). oxinfer runs
-the first two: `src/minimax_h3/video.rs` follows diffusers' modular `minimax_h3` pipeline
+all three: `src/minimax_h3/video.rs` (and `ref2va.rs` for references) follows diffusers' modular `minimax_h3` pipeline
 (`MiniMaxH3ModularPipeline`), with the DiT and the ViT VAE decoder it shares with
 [MiniMax-H3-Image](models.md), and `src/minimax_h3/audio_vae.rs` decodes the soundtrack.
 
@@ -16,6 +16,9 @@ the first two: `src/minimax_h3/video.rs` follows diffusers' modular `minimax_h3`
 # first frame (and last frame) to video; the canvas takes the first image's aspect ratio
 ./target/release/oxinfer --model /path/to/MiniMax-H3 --device cpu -p "..." \
     --init-image first.png --last-image last.png -o clip.avi
+# references to video (the release's Ref2VA/): in the order the prompt names them
+./target/release/oxinfer --model /path/to/MiniMax-H3/Ref2VA --device cpu -p "subject_definitions: ..." \
+    --ref subject.png --ref motion.mp4 --ref voice.wav -o clip.avi
 ```
 
 `--model` is a folder in the repository's diffusers layout: `model_index.json`, `transformer/`,
@@ -32,6 +35,8 @@ says so. Passing the repository id itself has not been tried.
 | `--steps N` | points of the sigma grid, as diffusers' `num_inference_steps`: `N - 1` forwards (default 50) |
 | `--seed N` | noise seed (oxinfer's generator: not torch's, so a seed does not reproduce a diffusers video) |
 | `--init-image F`, `--last-image F` | the first / last frame |
+| `--ref F` (repeated) | `Ref2VA/` only: a reference, in the order the prompt's labels number them: an image (`.png`, `.jpg`, ...), an audio clip (`.wav`, `.mp3`, `.flac`, `.ogg`, `.opus`, `.m4a`, `.aac`) or a video (anything else, or a folder of frames at 24 fps) with its soundtrack when it has one. At most 9 images, 3 videos and 3 audio clips, 12 in all; audio cannot be the only kind |
+| `--ref-image-edge N` | the short edge image references are encoded at (default 2048, the release's; a smaller one makes fewer rows for a quick test) |
 | `-o FILE` | `.avi`: Motion JPEG and the soundtrack in AVI; `.webp`: animated WebP (lossless only, about 3 s per 320x288 frame to encode) and `FILE.wav`; anything else: a PNG sequence `FILE_0000.png`, ... and `FILE.wav` |
 
 There is no pure-Rust H.264, VP9 or AV1 encoder in the oxideav crates oxinfer uses (the H.264
@@ -59,7 +64,7 @@ comparison with another implementation on the same inputs (see
 | component | folder | size | |
 |---|---|---|---|
 | transformer (`t2va`, `fl2va`) | `transformer/` | 66.3 GB, 33.1B parameters, bf16 (patch, timestep and output layers float32) | 50 blocks, width 5376, 56 heads of 128, SwiGLU 14336, text width 5120; about 13B of the parameters are the AdaLN projections (`6 x 5376 x 3` outputs per block from a 2688-wide timestep embedding) |
-| transformer (`ref2va`) | `transformer_ref/` | 66.3 GB | same architecture, other weights; not used |
+| transformer (`ref2va`) | `transformer_ref/` | 66.3 GB | same architecture, other weights; oxinfer reads the copy in `Ref2VA/transformer/` |
 | video VAE | `vae/` | 10.4 GB, float32 | `f16t4d24`: a causal 3D CNN encoder (128 to 1024 channels, 16x in space, 4x in time, 24 latent channels) and a 36-layer ViT decoder (width 2048, 32 heads, 3-axis RoPE) that emits a 4x16x16 pixel block per latent voxel |
 | audio VAE | `audio_vae/` | 0.6 GB, float32 | mono, 32 kHz, 40 latents of 32 channels per second; a stereo soundtrack is two latent sequences. Decoder (0.26 GB of the file): a 1x1 convolution to 2048 channels and BigVGAN, seven transposed convolutions (x5, x5, x2 five times; 1024 to 8 channels) each followed by three AMP blocks with anti-aliased SnakeBeta activations, clamped to [-1, 1]. Encoder (`AudioEncoder`, only `ref2va`'s reference audio goes through it): a DAC waveform encoder (strides 2, 4, 4, 5, 5; Snake activations) to 2048 channels, a causal attention projection to 32 (8 heads of 256, averaged over the heads and pooled by 8 instead of concatenated) and `mean_proj`; against diffusers on 5.2 s of a synthetic stereo signal the rows are within 6.4e-5 (mean \|v\| 0.50), 1.0 s on the CPU (`tools/minimax_h3_audio_tiny.py OUT audio_vae signal`, `examples/h3_audio_check.rs`) |
 | text encoder | `text_encoder/` | 63.4 GB, bf16 | Qwen3-VL-32B (64 layers, width 5120); `hidden_states[50]` conditions the transformer |
@@ -74,7 +79,10 @@ per-head `to_qkv`, `ff.w1` as `[gate; up]`, `encoder.down.I.block.J`), and its c
 `source/config.json` for the architecture) is mapped to diffusers' keys as
 `scripts/convert_minimax_h3_to_diffusers.py` does (identical to the root `vae/config.json`); the
 audio VAE's `config.json` has the latent statistics and `metadata.json` the decoder rates; the
-shifts come from `model_index.json` (`sigma_shift_scales`). `Ref2VA/` is refused. The released weights are guidance-distilled (one forward per step, no negative prompt)
+shifts come from `model_index.json` (`sigma_shift_scales`). `--model .../Ref2VA` is the
+`ref2va` checkpoint in the same layout (only its `transformer/` differs from `FL2VA/`'s; the VAEs
+and the text encoder are the same files) and takes `--ref`; text-only and keyframe requests on it,
+or references on `FL2VA/`, are refused. The released weights are guidance-distilled (one forward per step, no negative prompt)
 but not step-distilled: diffusers' default is 50 grid points.
 
 What a request does (`video.rs` has the details):
@@ -164,8 +172,8 @@ Not checked or not done:
 - the soundtracks generated so far ([real runs](#real-runs)) were analysed and transcribed, not
   listened to; the one from the release's own bf16 transformer at 50 steps (below) was only
   measured; the audio VAE ran on the CPU only;
-- `ref2va` (`transformer_ref/`) and with it the audio VAE's encoder, the character-swap LoRA, GPU
-  execution (the 66 GB transformer runs on the CPU from mapped weights).
+- the character-swap LoRA; GPU execution (the 66 GB transformer runs on the CPU from mapped
+  weights).
 
 The release's own bf16 weights from `FL2VA/` (192 cores, 251 GB RAM, CPU only): the fox prompt
 above in the `integrated_multimodal_description: [Shot 1] ...` form with an `Audio:` sentence,
@@ -183,6 +191,45 @@ fox trotting left to right across the snow under the sunrise behind the pines, s
 drift of the scene or of the animal. ffprobe reads `mjpeg` 448x256, 124 frames (5.17 s) and
 `pcm_s16le` 32 kHz stereo, 165,600 samples; the soundtrack is quiet (-41.7 dB mean, -27.1 dB
 peak, both channels within 0.7 dB) and was not listened to or compared with a reference.
+
+## References (`ref2va`)
+
+`src/minimax_h3/ref2va.rs` follows diffusers' `MiniMaxH3Ref2VA*` steps (the module docs list
+them): references normalized onto 24 fps, their canvas and 32 kHz stereo; the presentation
+(`"<Audio j>: "`, `"<Picture i>: "` and a vision block, `"<Video k>: "` and a timestamped vision
+block per pair of the frames sampled at 2 fps, through Qwen3-VL's video processor), then the
+prompt; images and videos through the video VAE's encoder like keyframes, soundtracks through the
+audio VAE's encoder (`AudioEncoder`, the posterior mean); the packed sequence
+`[text | reference blocks | target audio | target video]` on the shared audio / video rotary
+clock; reference video rows held at `t = 0.999`, reference audio rows clean at `t = 1`. Prompts
+follow the release's `docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md` (`subject_definitions`,
+`summary`, `retention_analysis`, `detailed_description`, `overall_soundscape`,
+`non_diegetic_music`).
+
+What was checked:
+
+- the packed layout (positions, tags, row order, reference row counts) equals diffusers'
+  `build_ref2va_packed_sequence` exactly on a request with an image, a video with sound, an audio
+  clip and a second image (`tools/minimax_h3_ref2va_layout.py`, `examples/h3_ref2va_check.rs`);
+- the audio VAE's encoder: within 7e-7 of diffusers on a tiny random VAE, 6.4e-5 on the release's
+  weights (above);
+- unit tests: the 2 fps sampling and its `"<0.2 seconds>"` labels (half to even, as Python
+  formats them), the frame-rate resampling (30 fps to 24 drops one frame in five);
+- one run on the release's bf16 `Ref2VA/` (CPU, 192 cores): the fox frame of the 124-frame clip
+  above as `<Picture 1>` (`--ref-image-edge 512`: 896x512, 448 rows) and a synthetic 6 s
+  piano-like melody, stereo at 44.1 kHz, as `<Audio 1>` with `fully_copy` as the score;
+  `--size 448x256 --frames 124 --steps 9 --seed 1`: 898 text rows, 448 + 414 reference rows, 6318
+  rows in all; text encoder 27 s, references 15 s, 8 forwards in 967 s, VAE 73 s. The frames show
+  the reference's fox trotting left to right across its snowy clearing, leaving the frame at the
+  end, with a blue blotch in the trees in every frame (8 forwards of a 50-step model and a
+  reduced reference size; not investigated). The soundtrack copies the melody: the dominant
+  pitch of every note checked is the reference's (261, 523, 437, 347 Hz), the 10 ms loudness
+  envelopes correlate at 0.71 and the waveforms at 0.36 (left) and 0.29 (right); RMS 0.084 for
+  0.109.
+
+Not checked: video references on real weights (each is put on the 768-short-edge canvas, which
+makes tens of thousands of rows on the CPU), image references at their full 2048 short edge,
+`QwenVl::encode_video` against transformers, the presentation's hidden states against diffusers.
 
 ## Smaller files and turbo LoRAs
 
