@@ -653,7 +653,17 @@ impl<'a> Dit<'a> {
         for (bi, b) in self.blocks.iter().enumerate() {
             // [nt * 3, 6H]: the six vectors of each (timestep, modality).
             let table = b.adaln.as_ref().unwrap().forward(st, nt);
-            self.block(b, x, n, Some(Ada { table: &table, key: &key, h }), Some((&cos, &sin)));
+            self.block(
+                b,
+                x,
+                n,
+                Some(Ada {
+                    table: &table,
+                    key: &key,
+                    h,
+                }),
+                Some((&cos, &sin)),
+            );
             if let Some(d) = dump {
                 d.write(&format!("blk_{bi}.bin"), x);
             }

@@ -102,14 +102,15 @@ pub fn release_partition(dir: &Path) -> Option<String> {
 /// `video_vae/source/config.json`, `AutoencoderKLLegacy`) in diffusers' keys
 /// (`AutoencoderKLMiniMaxH3`, as `scripts/convert_minimax_h3_to_diffusers.py` maps them).
 pub fn release_vae_json(video_vae: &Path) -> Result<serde_json::Value> {
-    let read = |p: &Path| -> Result<serde_json::Value> {
-        serde_json::from_slice(&crate::fsx::read(p)?).with_context(|| p.display().to_string())
-    };
+    let read =
+        |p: &Path| -> Result<serde_json::Value> { serde_json::from_slice(&crate::fsx::read(p)?).with_context(|| p.display().to_string()) };
     let w = read(&video_vae.join("config.json"))?;
     let src = video_vae.join(w.get("source_path").and_then(|v| v.as_str()).unwrap_or("source"));
     let c = read(&src.join("config.json"))?;
     let list = |v: Option<&serde_json::Value>| -> Vec<u64> {
-        v.and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64()).collect()).unwrap_or_default()
+        v.and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_u64()).collect())
+            .unwrap_or_default()
     };
     if c.get("use_vit_decoder").and_then(|v| v.as_bool()) == Some(false) {
         bail!("{}: not the ViT decoder MiniMax-H3 releases", src.display());
@@ -732,7 +733,8 @@ impl VideoPipeline {
         let vpath = match (&src.vae, &src.dir) {
             (None, Some(d)) if release => {
                 let w: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&d.join("video_vae/config.json"))?)?;
-                d.join("video_vae").join(w.get("source_path").and_then(|v| v.as_str()).unwrap_or("source"))
+                d.join("video_vae")
+                    .join(w.get("source_path").and_then(|v| v.as_str()).unwrap_or("source"))
             }
             _ => part(&src.vae, "vae")?,
         };
@@ -1158,6 +1160,9 @@ mod tests {
         });
         assert_eq!(c, want);
         let cfg = VaeConfig::from_json(&c).unwrap();
-        assert_eq!((cfg.axes, cfg.patch_t, cfg.dim, cfg.layers, cfg.clip_length, cfg.token_drop), (3, 4, 2048, 36, 17, 3));
+        assert_eq!(
+            (cfg.axes, cfg.patch_t, cfg.dim, cfg.layers, cfg.clip_length, cfg.token_drop),
+            (3, 4, 2048, 36, 17, 3)
+        );
     }
 }

@@ -874,6 +874,189 @@ pub fn attention(q: &[f32], k: &[f32], v: &[f32], tq: usize, tk: usize, heads: u
 
 #[allow(clippy::too_many_arguments)]
 fn attention_cpu(q: &[f32], k: &[f32], v: &[f32], tq: usize, tk: usize, heads: usize, dh: usize, causal: bool) -> Vec<f32> {
+    #[cfg(has_simd)]
+    if tq * tk >= 64 * 64 && std::env::var_os("OXINFER_ATTN_TWO_PASS").is_none() {
+        return attention_blocked(q, k, v, tq, tk, heads, dh, causal);
+    }
+    attention_two_pass(q, k, v, tq, tk, heads, dh, causal)
+}
+
+/// Query rows per task of [`attention_blocked`] (a multiple of the GEMM tile's 8).
+const ATT_QB: usize = 32;
+/// Keys per block of [`attention_blocked`] (a multiple of 8).
+const ATT_KB: usize = 64;
+
+/// [`attention_two_pass`] as one task per (head, block of 32 queries), each streaming blocks of 64
+/// keys with an online softmax ("flash" attention) on the f32 GEMM micro-kernel: no `[tq, tk]`
+/// score matrix, and every core busy on its own tiles rather than all of them on one head's
+/// small products (which spends most of the time in the pool at a few thousand rows). The
+/// softmax is the same up to rounding (running maxima instead of one maximum per row).
+#[cfg(has_simd)]
+#[allow(clippy::too_many_arguments)]
+fn attention_blocked(q: &[f32], k: &[f32], v: &[f32], tq: usize, tk: usize, heads: usize, dh: usize, causal: bool) -> Vec<f32> {
+    use crate::kernels::simd::gemm_8x8;
+    let d = heads * dh;
+    let scale = 1.0 / (dh as f32).sqrt();
+    let nkb = tk.div_ceil(ATT_KB);
+    let tkp = nkb * ATT_KB;
+    let dhp = dh.next_multiple_of(8);
+    // Keys per head, row-major `[tkp, dh]` (zero rows past `tk`); values per head and key block,
+    // transposed: `[nkb][dhp][KB]` (the PV product's "weights" are the value columns).
+    let mut kp = vec![0f32; heads * tkp * dh];
+    for_chunks(&mut kp, tkp * dh, true, |h, kh| {
+        for j in 0..tk {
+            kh[j * dh..(j + 1) * dh].copy_from_slice(&k[j * d + h * dh..j * d + (h + 1) * dh]);
+        }
+    });
+    let mut vt = vec![0f32; heads * nkb * dhp * ATT_KB];
+    for_chunks(&mut vt, nkb * dhp * ATT_KB, true, |h, vh| {
+        for j in 0..tk {
+            let (b, jj) = (j / ATT_KB, j % ATT_KB);
+            let row = &v[j * d + h * dh..j * d + (h + 1) * dh];
+            for (c, &x) in row.iter().enumerate() {
+                vh[(b * dhp + c) * ATT_KB + jj] = x;
+            }
+        }
+    });
+    let nqb = tq.div_ceil(ATT_QB);
+    let mut out = vec![0f32; tq * d];
+    let op = SendPtr(out.as_mut_ptr());
+    crate::pool::run(heads * nqb, &|task| {
+        let (h, qb) = (task / nqb, task % nqb);
+        let q0 = qb * ATT_QB;
+        let nq = (tq - q0).min(ATT_QB);
+        let tiles = nq.div_ceil(8);
+        // The queries as GEMM panels `[tile][dh][8]`, scaled.
+        let mut qt = vec![0f32; tiles * dh * 8];
+        for i in 0..nq {
+            let src = &q[(q0 + i) * d + h * dh..(q0 + i) * d + (h + 1) * dh];
+            let (t, l) = (i / 8, i % 8);
+            for (c, &x) in src.iter().enumerate() {
+                qt[(t * dh + c) * 8 + l] = x * scale;
+            }
+        }
+        let mut s = vec![0f32; tiles * 8 * ATT_KB];
+        let mut pt = vec![0f32; tiles * ATT_KB * 8];
+        let mut tmp = vec![0f32; tiles * 8 * dhp];
+        let mut acc = vec![0f32; nq * dhp];
+        let mut m = vec![f32::NEG_INFINITY; nq];
+        let mut l = vec![0f32; nq];
+        let kh = &kp[h * tkp * dh..(h + 1) * tkp * dh];
+        let vh = &vt[h * nkb * dhp * ATT_KB..(h + 1) * nkb * dhp * ATT_KB];
+        // Causal: the blocks up to the last query's key.
+        let last_kb = if causal { ((q0 + nq - 1) / ATT_KB + 1).min(nkb) } else { nkb };
+        for b in 0..last_kb {
+            let j0 = b * ATT_KB;
+            // Scores `[tiles * 8, KB]`.
+            for g in 0..ATT_KB / 8 {
+                for t in 0..tiles {
+                    unsafe {
+                        gemm_8x8::<f32>(
+                            kh.as_ptr().add((j0 + g * 8) * dh),
+                            dh,
+                            qt.as_ptr().add(t * dh * 8),
+                            s.as_mut_ptr(),
+                            ATT_KB,
+                            g * 8,
+                            t * 8,
+                            8,
+                        );
+                    }
+                }
+            }
+            // Online softmax: rescale what was accumulated to the new maximum.
+            for i in 0..nq {
+                let row = &mut s[i * ATT_KB..(i + 1) * ATT_KB];
+                let lim = if causal {
+                    (q0 + i + 1).saturating_sub(j0).min(ATT_KB)
+                } else {
+                    ATT_KB
+                };
+                let lim = lim.min(tk.saturating_sub(j0));
+                let mut mx = m[i];
+                for &x in &row[..lim] {
+                    mx = mx.max(x);
+                }
+                let (t, ln) = (i / 8, i % 8);
+                if mx == f32::NEG_INFINITY {
+                    for jj in 0..ATT_KB {
+                        pt[(t * ATT_KB + jj) * 8 + ln] = 0.0;
+                    }
+                    continue;
+                }
+                let corr = (m[i] - mx).exp();
+                let mut sum = 0f32;
+                for (jj, &x) in row.iter().enumerate() {
+                    let e = if jj < lim { (x - mx).exp() } else { 0.0 };
+                    pt[(t * ATT_KB + jj) * 8 + ln] = e;
+                    sum += e;
+                }
+                l[i] = l[i] * corr + sum;
+                m[i] = mx;
+                if corr != 1.0 {
+                    acc[i * dhp..(i + 1) * dhp].iter_mut().for_each(|a| *a *= corr);
+                }
+            }
+            // Rows of a partial last tile have zero probabilities: their products are zero.
+            for i in nq..tiles * 8 {
+                let (t, ln) = (i / 8, i % 8);
+                for jj in 0..ATT_KB {
+                    pt[(t * ATT_KB + jj) * 8 + ln] = 0.0;
+                }
+            }
+            // `tmp = P V` for this block, `[tiles * 8, dhp]`, then accumulated.
+            let vb = &vh[b * dhp * ATT_KB..(b + 1) * dhp * ATT_KB];
+            for g in 0..dhp / 8 {
+                for t in 0..tiles {
+                    unsafe {
+                        gemm_8x8::<f32>(
+                            vb.as_ptr().add(g * 8 * ATT_KB),
+                            ATT_KB,
+                            pt.as_ptr().add(t * ATT_KB * 8),
+                            tmp.as_mut_ptr(),
+                            dhp,
+                            g * 8,
+                            t * 8,
+                            8,
+                        );
+                    }
+                }
+            }
+            for (a, &x) in acc.iter_mut().zip(&tmp[..nq * dhp]) {
+                *a += x;
+            }
+        }
+        for i in 0..nq {
+            let inv = if l[i] > 0.0 { 1.0 / l[i] } else { 0.0 };
+            // SAFETY: each task writes its own (rows, head) slices of `out`.
+            let o = unsafe { std::slice::from_raw_parts_mut(op.get().add((q0 + i) * d + h * dh), dh) };
+            for (o, &a) in o.iter_mut().zip(&acc[i * dhp..i * dhp + dh]) {
+                *o = a * inv;
+            }
+        }
+    });
+    out
+}
+
+#[cfg(has_simd)]
+#[derive(Clone, Copy)]
+struct SendPtr(*mut f32);
+#[cfg(has_simd)]
+unsafe impl Send for SendPtr {}
+#[cfg(has_simd)]
+unsafe impl Sync for SendPtr {}
+#[cfg(has_simd)]
+impl SendPtr {
+    #[inline(always)]
+    fn get(self) -> *mut f32 {
+        self.0
+    }
+}
+
+/// One head at a time: the scores of all queries against all keys, softmax, then the product with
+/// the values, each product on the (parallel) f32 GEMM.
+#[allow(clippy::too_many_arguments)]
+fn attention_two_pass(q: &[f32], k: &[f32], v: &[f32], tq: usize, tk: usize, heads: usize, dh: usize, causal: bool) -> Vec<f32> {
     let d = heads * dh;
     // Zero padding to multiples of 32 keeps the SIMD GEMM tiles on (and changes no dot product).
     let dhp = dh.next_multiple_of(32);
@@ -984,6 +1167,31 @@ impl Rng {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The blocked attention against the two-pass one: partial query tiles and key blocks, head
+    /// widths that are not multiples of 8, causal masks, fewer keys than queries.
+    #[cfg(has_simd)]
+    #[test]
+    fn blocked_attention_matches_two_pass() {
+        let mut rng = Rng::new(7);
+        for &(tq, tk, heads, dh, causal) in &[
+            (100usize, 100usize, 3usize, 64usize, false),
+            (77, 130, 2, 80, false),
+            (64, 64, 1, 128, true),
+            (129, 129, 2, 72, true),
+            (40, 300, 4, 36, false),
+            (300, 40, 2, 64, false),
+        ] {
+            let d = heads * dh;
+            let q: Vec<f32> = rng.normals(tq * d).iter().map(|x| x * 2.0).collect();
+            let k: Vec<f32> = rng.normals(tk * d).iter().map(|x| x * 2.0).collect();
+            let v = rng.normals(tk * d);
+            let a = attention_blocked(&q, &k, &v, tq, tk, heads, dh, causal);
+            let b = attention_two_pass(&q, &k, &v, tq, tk, heads, dh, causal);
+            let max = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max);
+            assert!(max < 2e-5, "tq {tq} tk {tk} heads {heads} dh {dh} causal {causal}: max diff {max}");
+        }
+    }
 
     /// f32 matmuls stay on the GEMM even when speculative decoding has raised the decode-kernel
     /// row limit above their (padded) row count.
