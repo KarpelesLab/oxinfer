@@ -162,8 +162,8 @@ Not checked or not done:
   random Qwen3-VL, without a numeric comparison; keyframes are resized with oxinfer's Lanczos, not
   compared with PIL's; the posterior and all noise come from oxinfer's generator;
 - the soundtracks generated so far ([real runs](#real-runs)) were analysed and transcribed, not
-  listened to; none came from the release's own bf16 transformer or from a 50-step run; the audio
-  VAE ran on the CPU only;
+  listened to; the one from the release's own bf16 transformer at 50 steps (below) was only
+  measured; the audio VAE ran on the CPU only;
 - `ref2va` (`transformer_ref/`) and with it the audio VAE's encoder, the character-swap LoRA, GPU
   execution (the 66 GB transformer runs on the CPU from mapped weights).
 
@@ -174,6 +174,15 @@ compile sharing the cores), VAE 54 s, audio VAE 1.8 s. The frames show the scene
 trotting across the snow in golden backlight, its breath steaming, pines behind), sharp and
 coherent across the clip; ffprobe reads `mjpeg` 448x256, 22 frames and `pcm_s16le` 32 kHz stereo,
 29,600 samples. Not compared with a reference.
+
+The same prompt at the release's defaults, `--frames 124 --seed 1` with no `--steps` (49 forwards,
+shifts 12 / 3 from `model_index.json`): 4144 video + 414 audio + 59 text rows, 49 forwards in
+5001 s (102 s each, 81 s when the machine was otherwise idle; attention, with the blocked kernel,
+is 467 s of it), VAE 284 s, audio VAE 1.2 s, 88 min in all. Frames 0, 40, 80 and 123 show the same
+fox trotting left to right across the snow under the sunrise behind the pines, sharp, with no
+drift of the scene or of the animal. ffprobe reads `mjpeg` 448x256, 124 frames (5.17 s) and
+`pcm_s16le` 32 kHz stereo, 165,600 samples; the soundtrack is quiet (-41.7 dB mean, -27.1 dB
+peak, both channels within 0.7 dB) and was not listened to or compared with a reference.
 
 ## Smaller files and turbo LoRAs
 
@@ -591,7 +600,8 @@ release's tokens (158 rows), the two other speech runs were not, and are marked 
 | speech (split tags), 1344x768, 22 frames, 4-step 768p LoRA | 7056 video + 74 audio + 159 text | 4 in 3004 s (751 s each) | 663 s | 61 min |
 | dog, 448x256, 22 / 56 frames, 4-step 768p LoRA | 982 / 2214 in all | 4 in 147 s / 437 s | 45 s / 135 s | 3.3 / 9.7 min |
 
-The audio VAE takes 0.3 to 1.3 s. Attention is 46 to 60% of the forwards' time (`--profile`) and
+These runs predate the blocked attention kernel (`sd::ops::attention_blocked`), which is 8 to 12
+times faster at these sizes. The audio VAE takes 0.3 to 1.3 s. Attention was 46 to 60% of the forwards' time (`--profile`) and
 grows with the square of the rows: a default request (1344x768, 124 frames, 37,869 rows) was not
 run and would take hours per forward here. The same request twice gives the same file byte for
 byte.
