@@ -62,12 +62,16 @@ pub struct VlImage {
     /// DeepStack features (Qwen3-VL): `[n, hidden]` added to the image's tokens after language
     /// model layer 0, 1, ...; empty for the other towers.
     pub deep: Vec<Vec<f32>>,
+    /// One temporal block of a video (its tokens are `<|video_pad|>`) rather than an image.
+    pub video: bool,
 }
 
 impl VlImage {
-    /// `<|vision_start|>` + one `<|image_pad|>` per token + `<|vision_end|>`.
+    /// `<|vision_start|>` + one `<|image_pad|>` (`<|video_pad|>` for a video block) per token +
+    /// `<|vision_end|>`.
     pub fn placeholder(&self) -> String {
-        format!("<|vision_start|>{}<|vision_end|>", "<|image_pad|>".repeat(self.n))
+        let pad = if self.video { "<|video_pad|>" } else { "<|image_pad|>" };
+        format!("<|vision_start|>{}<|vision_end|>", pad.repeat(self.n))
     }
 }
 
@@ -240,7 +244,36 @@ impl QwenVl {
             grid: (gh / m, gw / m),
             size: (gw * p, gh * p),
             deep,
+            video: false,
         })
+    }
+
+    /// Runs RGB8 frames (all `w`x`h`) through the video processor (one smart resize within the
+    /// clip's pixel budget, the last frame repeated to whole temporal patches) and the vision
+    /// tower: one [`VlImage`] per temporal patch, in order. Qwen3-VL labels each with its own
+    /// timestamp and places it in the prompt like an image (its rotary layout and the tower's
+    /// attention treat every temporal patch on its own).
+    pub fn encode_video(&self, frames: &[&[u8]], w: usize, h: usize) -> Result<Vec<VlImage>> {
+        let (Some(tower), Some(mm)) = (&self.tower, &self.mm) else {
+            bail!("{}: loaded without a vision tower", self.dir.display());
+        };
+        let px = crate::qwen_vision::preprocess_video(frames, w, h, &mm.video)?;
+        let (emb, deep) = tower.encode_deep(&px);
+        let m = mm.vision.spatial_merge_size;
+        let (gt, gh, gw) = px.grid;
+        let hs = self.hidden_size();
+        let n = emb.len() / hs / gt.max(1);
+        let p = mm.video.patch_size;
+        Ok((0..gt)
+            .map(|t| VlImage {
+                emb: emb[t * n * hs..(t + 1) * n * hs].to_vec(),
+                n,
+                grid: (gh / m, gw / m),
+                size: (gw * p, gh * p),
+                deep: deep.iter().map(|d| d[t * n * hs..(t + 1) * n * hs].to_vec()).collect(),
+                video: true,
+            })
+            .collect())
     }
 
     /// Tokenizes `text` (special tokens parsed, nothing added).
@@ -281,7 +314,7 @@ impl QwenVl {
             Some(mm) => images
                 .iter()
                 .map(|im| crate::mm::MmFeature {
-                    token_id: mm.image_token_id,
+                    token_id: if im.video { mm.video_token_id } else { mm.image_token_id },
                     emb: im.emb.clone(),
                     n: im.n,
                     grids: vec![im.grid],
@@ -329,7 +362,7 @@ impl QwenVl {
             Some(mm) => images
                 .iter()
                 .map(|im| crate::mm::MmFeature {
-                    token_id: mm.image_token_id,
+                    token_id: if im.video { mm.video_token_id } else { mm.image_token_id },
                     emb: im.emb.clone(),
                     n: im.n,
                     grids: vec![im.grid],

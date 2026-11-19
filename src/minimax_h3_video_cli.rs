@@ -1,6 +1,8 @@
 //! `oxinfer --model MiniMaxAI/MiniMax-H3 --prompt "..." --frames 124 --size 1344x768 -o out.avi`:
 //! text to video, and first / last frame to video with `--init-image` / `--last-image`, through
-//! `oxinfer::minimax_h3::video`.
+//! `oxinfer::minimax_h3::video`; with the release's `Ref2VA/`, video from references
+//! (`--ref FILE`, repeated in the order the prompt names them: images, audio clips by extension,
+//! anything else a video with its soundtrack) through `oxinfer::minimax_h3::ref2va`.
 //!
 //! The output follows the extension of `-o`: `.avi` is Motion JPEG in an AVI container and
 //! `.webp` an animated WebP (both through oxideav, the `media` feature: no pure-Rust H.264 / VP9 /
@@ -50,6 +52,47 @@ fn load_image(path: &Path) -> Result<oxinfer::sd::Image> {
     }
     #[cfg(not(feature = "media"))]
     bail!("built without the `media` feature: {} cannot be decoded", path.display())
+}
+
+/// A `--ref` file decoded at its own rates: an image, an audio clip (by extension) or a video
+/// with its soundtrack when it has one.
+fn load_ref(path: &Path) -> Result<oxinfer::minimax_h3::ref2va::RefInput> {
+    use oxinfer::minimax_h3::ref2va::RefInput;
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    const IMAGES: [&str; 9] = ["png", "jpg", "jpeg", "webp", "bmp", "gif", "tga", "tif", "tiff"];
+    const AUDIO: [&str; 8] = ["wav", "mp3", "flac", "ogg", "opus", "m4a", "aac", "f32"];
+    if IMAGES.contains(&ext.as_str()) {
+        return Ok(RefInput::Image(load_image(path)?));
+    }
+    #[cfg(feature = "media")]
+    {
+        let media = oxinfer::media::Media::new();
+        let sound = |p: &Path| -> Result<(Vec<Vec<f32>>, u32)> {
+            media.decode_audio(p)?.to_channels().with_context(|| p.display().to_string())
+        };
+        if AUDIO.contains(&ext.as_str()) {
+            let (c, rate) = sound(path)?;
+            return Ok(RefInput::Audio(c, rate));
+        }
+        let all = |n: usize, _fps: f64| (0..n).collect::<Vec<_>>();
+        let clip = oxinfer::video::load_clip(&media, path, &all, None).with_context(|| format!("decode {}", path.display()))?;
+        let audio = if path.is_dir() { None } else { sound(path).ok() };
+        let (w, h) = (clip.width, clip.height);
+        Ok(RefInput::Video {
+            frames: clip
+                .frames
+                .into_iter()
+                .map(|rgb| oxinfer::sd::Image { width: w, height: h, rgb })
+                .collect(),
+            fps: clip.fps,
+            audio,
+        })
+    }
+    #[cfg(not(feature = "media"))]
+    {
+        let _ = AUDIO;
+        bail!("built without the `media` feature: {} cannot be decoded", path.display())
+    }
 }
 
 /// A part given as a local path, `org/name/path/in/repo.safetensors` (or `.gguf`), or a
@@ -310,6 +353,10 @@ pub fn run(args: &Args) -> Result<()> {
     if cache.is_some() && (p.first.is_some() || p.last.is_some()) {
         bail!("OXINFER_H3_PROMPT_EMBEDS holds a text-only prompt: unset it with keyframes");
     }
+    if !args.refs.is_empty() && (p.first.is_some() || p.last.is_some()) {
+        bail!("--ref (Ref2VA/) and --init-image / --last-image (FL2VA/) are different tasks");
+    }
+    let refs = args.refs.iter().map(|r| load_ref(r)).collect::<Result<Vec<_>>>()?;
     // The parts: a release folder, or a single-file transformer with the VAE named beside it.
     let single = args.model.is_file();
     let mut src = Sources {
@@ -343,6 +390,7 @@ pub fn run(args: &Args) -> Result<()> {
     let tpath = src.transformer.clone().unwrap_or_else(|| args.model.join("transformer"));
     let have_dit = has_dit(&tpath);
     let cond = match &cache {
+        Some(_) if !refs.is_empty() => bail!("OXINFER_H3_PROMPT_EMBEDS holds a text-only prompt: unset it with --ref"),
         Some(f) if f.exists() => Some(read_embeds(f)?),
         Some(f) => {
             let te = text_encoder()?;
@@ -405,7 +453,22 @@ pub fn run(args: &Args) -> Result<()> {
     );
     let tp = Instant::now();
     let mut progress = |i: usize, n: usize| eprint!("\r[step {i}/{n}, {:.1}s]", tp.elapsed().as_secs_f64());
-    let video = pipe.generate(&p, cond, &mut progress)?;
+    let video = if refs.is_empty() {
+        pipe.generate(&p, cond, &mut progress)?
+    } else {
+        use oxinfer::minimax_h3::ref2va::{RefOptions, normalize};
+        let mut o = RefOptions {
+            short_edge: p.short_edge,
+            max_pixels: p.max_pixels,
+            ..Default::default()
+        };
+        if let Some(e) = args.ref_image_edge {
+            o.image_short_edge = e;
+        }
+        let rate = pipe.audio_vae.as_ref().map_or(32000, |a| a.cfg.sampling_rate);
+        let refs = normalize(refs, frames, rate, &o)?;
+        pipe.generate_ref(&p, &refs, cond, &mut progress)?
+    };
     let default = if cfg!(feature = "media") { "video.avi" } else { "video.png" };
     let out = args.output.clone().unwrap_or_else(|| PathBuf::from(default));
     let what = write_video(&video, &out)?;

@@ -86,6 +86,11 @@ impl AudioClip {
         }
     }
 
+    /// One waveform per channel in [-1, 1] at the stream's own sample rate (returned with them).
+    pub fn to_channels(&self) -> Result<(Vec<Vec<f32>>, u32)> {
+        audio_frames_to_channels(&self.frames, &self.params)
+    }
+
     /// The samples averaged over the channels, as f32 in [-1, 1], resampled to `rate` (see
     /// [`audio_frames_to_mono`]).
     pub fn to_mono(&self, rate: usize) -> Result<Vec<f32>> {
@@ -682,6 +687,18 @@ fn infer_format(af: &AudioFrame, channels: usize) -> Option<SampleFormat> {
 
 /// Appends the frame's samples, averaged across channels, as f32 in [-1, 1].
 fn append_mono(af: &AudioFrame, fmt: SampleFormat, channels: usize, out: &mut Vec<f32>) -> Result<()> {
+    let mut per = vec![Vec::new(); channels];
+    append_channels(af, fmt, channels, &mut per)?;
+    let n = per[0].len();
+    out.reserve(n);
+    for s in 0..n {
+        out.push(per.iter().map(|c| c[s]).sum::<f32>() / channels as f32);
+    }
+    Ok(())
+}
+
+/// Appends the samples of every channel of `af` to `out[channel]`.
+fn append_channels(af: &AudioFrame, fmt: SampleFormat, channels: usize, out: &mut [Vec<f32>]) -> Result<()> {
     let n = af.samples as usize;
     let bps = fmt.bytes_per_sample();
     // One plane per channel is read as planar even when the declared format is interleaved.
@@ -707,20 +724,37 @@ fn append_mono(af: &AudioFrame, fmt: SampleFormat, channels: usize, out: &mut Ve
             _ => return None,
         })
     };
-    out.reserve(n);
-    for s in 0..n {
-        let mut acc = 0f32;
-        for c in 0..channels {
+    for (c, o) in out.iter_mut().enumerate().take(channels) {
+        o.reserve(n);
+        for s in 0..n {
             let v = if planar {
                 sample(&af.data[c], s)
             } else {
                 sample(&af.data[0], s * channels + c)
             };
-            acc += v.ok_or_else(|| anyhow!("unsupported sample format {fmt:?}"))?;
+            o.push(v.ok_or_else(|| anyhow!("unsupported sample format {fmt:?}"))?);
         }
-        out.push(acc / channels as f32);
     }
     Ok(())
+}
+
+/// Decoded audio frames as one f32 waveform per channel in [-1, 1], at the stream's own rate
+/// (returned with them).
+pub fn audio_frames_to_channels(frames: &[AudioFrame], params: &CodecParameters) -> Result<(Vec<Vec<f32>>, u32)> {
+    let rate = params.sample_rate.unwrap_or(0);
+    if rate == 0 {
+        bail!("unknown sample rate");
+    }
+    let channels = params.channels.unwrap_or(1).max(1) as usize;
+    let mut out = vec![Vec::new(); channels];
+    for af in frames {
+        let fmt = params
+            .sample_format
+            .or_else(|| infer_format(af, channels))
+            .context("unknown sample format")?;
+        append_channels(af, fmt, channels, &mut out)?;
+    }
+    Ok((out, rate))
 }
 
 /// Decoded audio frames to mono f32 in [-1, 1] (channels averaged) at `rate` Hz, resampled with

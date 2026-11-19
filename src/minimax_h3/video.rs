@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 pub const FPS: usize = 24;
 /// The `t` a keyframe's rows are held at.
 pub const KEYFRAME_T: f32 = 0.999;
-const AUDIO_CHANNELS: usize = 2;
+pub(crate) const AUDIO_CHANNELS: usize = 2;
 const PIXEL_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const PIXEL_STD: [f32; 3] = [0.229, 0.224, 0.225];
 
@@ -229,8 +229,8 @@ fn numpy_sum(v: &[f64]) -> f64 {
     res
 }
 
-const FRAME_RESCALE: f64 = 5.0 / 3.0;
-const FRAMES_PER_LATENT: [f64; 5] = [1.0, 4.0, 4.0, 4.0, 4.0];
+pub(crate) const FRAME_RESCALE: f64 = 5.0 / 3.0;
+pub(crate) const FRAMES_PER_LATENT: [f64; 5] = [1.0, 4.0, 4.0, 4.0, 4.0];
 
 /// The packed sequence `[text | keyframe rows | audio rows | video rows]`.
 pub struct Layout {
@@ -242,6 +242,9 @@ pub struct Layout {
     pub audio_index: Vec<usize>,
     /// How many leading video rows are keyframe rows.
     pub n_cond: usize,
+    /// How many leading audio rows are reference soundtrack rows (`ref2va`): clean, held at
+    /// `t = 1` and never stepped.
+    pub n_cond_audio: usize,
 }
 
 /// `build_packed_sequence`: the layout of `lt` latent frames of `lh x lw` with `n_audio` audio
@@ -295,6 +298,7 @@ pub fn layout(text_tags: &[u8], lt: usize, lh: usize, lw: usize, n_audio: usize,
         video_index: (nt..a0).chain(v0..n).collect(),
         audio_index: (a0..v0).collect(),
         n_cond,
+        n_cond_audio: 0,
     }
 }
 
@@ -343,20 +347,36 @@ pub fn denoise(
     dit: &Dit,
     text: &[f32],
     text_tags: &[u8],
-    mut video: Vec<f32>,
-    mut audio: Vec<f32>,
+    video: Vec<f32>,
+    audio: Vec<f32>,
     g: Geometry,
     anchors: &[Anchor],
     sig: (&[f32], &[f32]),
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<(Vec<f32>, Vec<f32>)> {
+    let lay = layout(text_tags, g.lt, g.lh, g.lw, g.n_audio, dit.cfg.patch[1], anchors);
+    denoise_layout(dit, text, &lay, video, audio, sig, progress)
+}
+
+/// [`denoise`] over any packed layout: `video` holds `lay.n_cond` conditioning rows (already at
+/// `t = 0.999`) then the noise rows, `audio` `lay.n_cond_audio` clean reference rows then the
+/// noise rows. Returns the final rows, conditioning included.
+pub fn denoise_layout(
+    dit: &Dit,
+    text: &[f32],
+    lay: &Layout,
+    mut video: Vec<f32>,
+    mut audio: Vec<f32>,
+    sig: (&[f32], &[f32]),
+    progress: &mut dyn FnMut(usize, usize),
+) -> Result<(Vec<f32>, Vec<f32>)> {
     let cfg = &dit.cfg;
-    let lay = layout(text_tags, g.lt, g.lh, g.lw, g.n_audio, cfg.patch[1], anchors);
     let emb = dit.embed_text(text);
     let (pd, ac) = (cfg.patch_dim(), cfg.audio_channels);
     let (sv, sa) = sig;
     let steps = sv.len().min(sa.len()) - 1;
     let cond_idx = &lay.video_index[..lay.n_cond];
+    let cond_audio = &lay.audio_index[..lay.n_cond_audio];
     for i in 0..steps {
         let (tv, ta) = (1.0 - sv[i], 1.0 - sa[i]);
         // The distinct timesteps, sorted, and every row's index into them (text rows: the video's).
@@ -365,12 +385,16 @@ pub fn denoise(
         if lay.n_cond > 0 {
             ts.push(tc);
         }
+        if lay.n_cond_audio > 0 {
+            ts.push(1.0);
+        }
         ts.sort_by(|a, b| a.total_cmp(b));
         ts.dedup();
         let at = |t: f32| ts.iter().position(|&v| v == t).unwrap();
         let mut tidx = vec![at(tv); lay.positions.len()];
         cond_idx.iter().for_each(|&r| tidx[r] = at(tc));
         lay.audio_index.iter().for_each(|&r| tidx[r] = at(ta));
+        cond_audio.iter().for_each(|&r| tidx[r] = at(1.0));
         let temb: Vec<f32> = ts.iter().flat_map(|&t| dit.time_embed(t)).collect();
         let (v, a) = dit.forward_av(&PackedAv {
             text_embedded: &emb,
@@ -391,9 +415,9 @@ pub fn denoise(
                 *xv = r * *xv + (1.0 - r) * (*xv + st * vv);
             }
         };
-        let c0 = lay.n_cond * pd;
+        let (c0, a0) = (lay.n_cond * pd, lay.n_cond_audio * ac);
         step(&mut video[c0..], &v[c0..], tv, sv[i], sv[i + 1]);
-        step(&mut audio, &a, ta, sa[i], sa[i + 1]);
+        step(&mut audio[a0..], &a[a0..], ta, sa[i], sa[i + 1]);
         debug_assert_eq!(audio.len() % ac, 0);
         progress(i + 1, steps);
     }
@@ -565,6 +589,10 @@ pub struct VideoPipeline {
     vae_files: &'static ModelFiles,
     /// The audio VAE's decoder, when the folder has `audio_vae/` or one was named.
     pub audio_vae: Option<AudioDecoder>,
+    /// Where the audio VAE is (its encoder is loaded on demand: only `ref2va` needs it).
+    pub audio_vae_path: Option<PathBuf>,
+    /// The release partition the folder is (`fl2va`, `ref2va`), when it says.
+    pub partition: Option<String>,
     /// The VAE's configuration in diffusers' keys (the encoder reads its geometry).
     vae_json: serde_json::Value,
     /// The sigma shifts of the video and audio schedules.
@@ -714,8 +742,9 @@ impl VideoPipeline {
         let partition = src.dir.as_deref().and_then(release_partition);
         if let Some(p) = partition.as_deref()
             && p != "fl2va"
+            && p != "ref2va"
         {
-            bail!("MiniMax-H3: the {p} partition is not supported (only t2va / fl2va: the release's FL2VA/)");
+            bail!("MiniMax-H3: the {p} partition is not supported (the release's FL2VA/ and Ref2VA/ are)");
         }
         let release = partition.is_some();
         let tpath = part(&src.transformer, "transformer")?;
@@ -761,9 +790,9 @@ impl VideoPipeline {
             (None, Some(d)) => Some(d.join("audio_vae")).filter(|a| a.join("config.json").exists()),
             (None, None) => None,
         };
-        let audio_vae = match apath {
+        let audio_vae = match &apath {
             Some(apath) => {
-                let a = AudioDecoder::load(&apath).with_context(|| format!("audio VAE in {}", apath.display()))?;
+                let a = AudioDecoder::load(apath).with_context(|| format!("audio VAE in {}", apath.display()))?;
                 if a.cfg.latent_channels != dit.cfg.audio_channels {
                     bail!(
                         "{}: {} latent channels, the transformer's audio rows have {}",
@@ -796,6 +825,8 @@ impl VideoPipeline {
             vae,
             vae_files,
             audio_vae,
+            audio_vae_path: apath,
+            partition,
             vae_json,
             shifts: (shift("scheduler", "video", 12.0), shift("audio_scheduler", "audio", 3.0)),
         })
@@ -883,6 +914,39 @@ impl VideoPipeline {
             .collect())
     }
 
+    /// The conditioning latents `([C, t, lh, lw], t, lh, lw)` (normalized) of RGB8 frames of
+    /// `w`x`h` (one: a keyframe or an image reference; `17 n + 5`: a video reference): the
+    /// posterior sampled under its own generator (seed 42), rounded through float16.
+    pub fn encode_frames(&self, enc: &VideoEncoder, frames: &[&[u8]], w: usize, h: usize) -> Result<(Vec<f32>, usize, usize, usize)> {
+        let (plane, nf) = (w * h, frames.len());
+        let mut px = vec![0f32; 3 * nf * plane];
+        for (f, rgb) in frames.iter().enumerate() {
+            for i in 0..plane {
+                for ch in 0..3 {
+                    px[(ch * nf + f) * plane + i] = (rgb[i * 3 + ch] as f32 / 255.0 - PIXEL_MEAN[ch]) / PIXEL_STD[ch];
+                }
+            }
+        }
+        let (m, t, lh, lw) = enc.encode(&px, nf, h, w)?;
+        let n = self.vae.cfg.latent_channels * t * lh * lw;
+        let noise = Rng::new(42).normals(n);
+        let lat = (0..n)
+            .map(|i| {
+                let std = (0.5 * m[n + i].clamp(-30.0, 20.0)).exp();
+                let z = half::f16::from_f32(m[i] + std * noise[i]).to_f32();
+                let ch = i / (t * lh * lw);
+                (z - self.vae.cfg.latents_mean[ch]) / self.vae.cfg.latents_std[ch]
+            })
+            .collect();
+        Ok((lat, t, lh, lw))
+    }
+
+    /// The audio VAE's encoder (loaded on demand: only `ref2va`'s soundtracks need it).
+    pub fn audio_encoder(&self) -> Result<super::audio_vae::AudioEncoder> {
+        let p = self.audio_vae_path.as_ref().context("reference audio needs the audio VAE (audio_vae/ or --audio-vae)")?;
+        super::audio_vae::AudioEncoder::load(p).with_context(|| format!("audio VAE encoder in {}", p.display()))
+    }
+
     /// The video encoder (loaded on demand: only keyframes need it).
     pub fn encoder(&self) -> Result<VideoEncoder> {
         VideoEncoder::load_json(&self.vae_json, &self.vae.cfg, self.vae_files)
@@ -930,6 +994,9 @@ impl VideoPipeline {
     /// Text (and keyframes) to video. `cond`: a conditioning computed earlier
     /// ([`VideoPipeline::encode_prompt`]) instead of running the text encoder.
     pub fn generate(&self, p: &VideoParams, cond: Option<Conditioning>, progress: &mut dyn FnMut(usize, usize)) -> Result<Video> {
+        if self.partition.as_deref() == Some("ref2va") {
+            bail!("the release's Ref2VA/ generates from references only (--ref); text and keyframes need FL2VA/");
+        }
         if p.steps < 2 {
             bail!("--steps must be at least 2 (the sigma grid includes its end)");
         }

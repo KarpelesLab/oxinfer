@@ -122,6 +122,10 @@ struct Args {
     /// MiniMax-H3 (video): the frame count and the last keyframe.
     frames: Option<usize>,
     last_image: Option<PathBuf>,
+    /// MiniMax-H3 `ref2va` (the release's Ref2VA/): the references in order (images, videos,
+    /// audio clips), and the short edge image references are encoded at.
+    refs: Vec<PathBuf>,
+    ref_image_edge: Option<usize>,
     /// MiniMax-H3: the sigma shifts of the video and audio schedules.
     shift: Option<f32>,
     audio_shift: Option<f32>,
@@ -394,6 +398,9 @@ fn usage() -> ! {
          \x20                      single-file --model): the release's folder or ComfyUI's fp32 file\n\
          \x20 --quant q8           the text encoder quantized at load\n\
          \x20 --init-image FILE    the first frame; --last-image FILE the last frame\n\
+         \x20 --ref FILE           Ref2VA/: a reference, in the order the prompt names them (repeat;\n\
+         \x20                      up to 9 images, 3 videos with their sound, 3 audio clips);\n\
+         \x20                      --ref-image-edge N encodes images at a short edge of N (2048)\n\
          \x20 -o FILE              .avi (Motion JPEG and the 32 kHz stereo soundtrack as PCM), .webp\n\
          \x20                      (animated, lossless, slow) or .png (a PNG sequence FILE_0000.png\n\
          \x20                      ...), both with the soundtrack in FILE.wav\n\
@@ -643,6 +650,8 @@ fn parse_args() -> Result<Args> {
         init_images: Vec::new(),
         frames: None,
         last_image: None,
+        refs: Vec::new(),
+        ref_image_edge: None,
         shift: None,
         audio_shift: None,
         audio_vae: None,
@@ -891,6 +900,8 @@ fn parse_args() -> Result<Args> {
             "--init-image" => a.init_images.push(PathBuf::from(val()?)),
             "--frames" => a.frames = Some(val()?.parse()?),
             "--last-image" => a.last_image = Some(PathBuf::from(val()?)),
+            "--ref" => a.refs.push(PathBuf::from(val()?)),
+            "--ref-image-edge" => a.ref_image_edge = Some(val()?.parse()?),
             "--shift" => a.shift = Some(val()?.parse()?),
             "--audio-shift" => a.audio_shift = Some(val()?.parse()?),
             "--audio-vae" => a.audio_vae = Some(val()?),

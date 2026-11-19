@@ -55,6 +55,7 @@ pub struct Params {
 }
 
 /// A generated image: tightly packed RGB8.
+#[derive(Clone)]
 pub struct Image {
     pub width: usize,
     pub height: usize,
