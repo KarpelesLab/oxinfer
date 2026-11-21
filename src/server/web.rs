@@ -61,6 +61,24 @@ pub fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
     Some((bytes, ct))
 }
 
+/// This machine's name (for the page title), without a `.local` suffix.
+fn hostname() -> Option<String> {
+    #[cfg(unix)]
+    let name = {
+        unsafe extern "C" {
+            fn gethostname(name: *mut std::ffi::c_char, len: usize) -> std::ffi::c_int;
+        }
+        let mut buf = [0u8; 256];
+        // SAFETY: the buffer is valid for its length; the name is NUL-terminated within it (or
+        // truncated, which the search for the NUL below handles).
+        let r = unsafe { gethostname(buf.as_mut_ptr().cast(), buf.len() - 1) };
+        (r == 0).then(|| String::from_utf8_lossy(&buf[..buf.iter().position(|&b| b == 0).unwrap_or(0)]).into_owned())
+    };
+    #[cfg(not(unix))]
+    let name = std::env::var("COMPUTERNAME").ok();
+    name.map(|n| n.trim_end_matches(".local").to_string()).filter(|n| !n.is_empty())
+}
+
 /// Whether the GUI is embedded in this build (it is unless `src/server/webui` was missing).
 pub fn has_gui() -> bool {
     ASSETS.iter().any(|(n, _)| *n == "index.html")
@@ -357,6 +375,7 @@ fn management(api: &Arc<Api>, w: &WebState, req: &ApiRequest, rest: &str) -> Api
             "auth_required": api.opts.api_key.is_some(),
             "admin": w.admin,
             "api_base": "/v1",
+            "hostname": hostname(),
             "features": {"hf": cfg!(feature = "hf"), "media": cfg!(feature = "media")},
         }));
     }
@@ -472,6 +491,17 @@ fn find_job(w: &WebState, id: &str) -> ApiResult<Arc<Job>> {
         .ok_or_else(|| ApiError::new(404, format!("no download {id:?}")))
 }
 
+/// The family of the model in `path` when it answers in speech (`lfm3_omni`, `haru`): the GUI's voice chat.
+fn speaks(path: &Path) -> Option<&'static str> {
+    if crate::lfm3_omni::is_omni(path) {
+        Some("lfm3_omni")
+    } else if crate::haru::is_haru(path) {
+        Some("haru")
+    } else {
+        None
+    }
+}
+
 /// The kind of what is in a cache folder, as the server would detect it.
 fn cache_kind(e: &crate::model_cache::Entry) -> Option<&'static str> {
     if !e.usable {
@@ -497,6 +527,7 @@ fn cache(api: &Api, w: &WebState) -> ApiResult<Value> {
                 .collect();
             j["catalog"] = json!(in_catalog);
             j["kind"] = json!(cache_kind(e));
+            j["audio_out"] = json!(speaks(&e.path).filter(|_| e.usable));
             j["loaded"] = json!(api.models.uses_folder(&e.path));
             j["downloading"] = json!(w.downloading(&e.path));
         }
@@ -769,6 +800,7 @@ fn models(api: &Api, w: &WebState) -> Value {
                 "loaded": s.loaded,
                 "busy": s.busy,
                 "memory": s.bytes,
+                "audio_out": api.models.local_path(&s.spec.id).and_then(|p| speaks(&p)),
                 "state": state,
                 "load": load,
             })
@@ -829,14 +861,14 @@ fn catalog(api: &Arc<Api>, w: &WebState) -> Value {
             });
             m["cached"] = json!(cached);
             m["cache_bytes"] = json!(e.map(|e| e.bytes));
-            m["servable"] = json!(row.model.kind != crate::advisor::Kind::Video);
+            m["servable"] = json!(true);
             m["server_kind"] = json!(match row.model.kind {
                 crate::advisor::Kind::Chat => Some("chat"),
                 crate::advisor::Kind::Embedding => Some("embedding"),
                 crate::advisor::Kind::Image => Some("image"),
                 crate::advisor::Kind::Speech => Some("transcription"),
                 crate::advisor::Kind::Tts => Some("speech"),
-                crate::advisor::Kind::Video => None,
+                crate::advisor::Kind::Video => Some("video"),
             });
         }
     }

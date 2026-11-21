@@ -1,16 +1,42 @@
 <script setup>
 // Text to speech on the native backend (/v1/audio/speech): text in, a WAV file out, played here
 // and saved on demand. Each clip stays in the list until the page is closed.
-import { computed, onUnmounted, ref } from 'vue';
+import { computed, onUnmounted, ref, watch } from 'vue';
 import { store } from '../lib/native.js';
 import ModelPicker from './ModelPicker.vue';
 
 const emit = defineEmits(['manage']);
 
-// Orpheus' voices; the other models name theirs in the error when one is wrong.
-const VOICES = ['tara', 'leah', 'jess', 'leo', 'dan', 'mia', 'zac', 'zoe'];
-
 const model = computed({ get: () => store.chosen.speech || '', set: (v) => (store.chosen.speech = v) });
+// The model's voices (GET /v1/audio/voices, which loads the model when it is not loaded yet).
+const voices = ref(null); // { data: [{id, name, label, language}], default, accepts_any, note }
+const voicesError = ref('');
+const voicesLoading = ref(false);
+let voicesFor = '';
+
+async function loadVoices() {
+  const m = model.value;
+  if (!m || voicesFor === m) return;
+  voicesFor = m;
+  voices.value = null;
+  voicesError.value = '';
+  voicesLoading.value = true;
+  try {
+    const v = await store.api.get(`v1/audio/voices?model=${encodeURIComponent(m)}`);
+    if (voicesFor !== m) return;
+    voices.value = v;
+    if (voice.value && !v.data.some((x) => x.id === voice.value) && !v.accepts_any) voice.value = '';
+  } catch (e) {
+    if (voicesFor === m) voicesError.value = e.message;
+    voicesFor = '';
+  }
+  voicesLoading.value = false;
+}
+watch(model, loadVoices, { immediate: true });
+function voiceLabel(v) {
+  const extra = [v.language, v.label && v.label !== v.name ? v.label : '', v.description].filter(Boolean).join(', ');
+  return extra ? `${v.name} (${extra})` : v.name;
+}
 const text = ref('Hello! This voice was made on your own computer.');
 const voice = ref('');
 const temperature = ref('');
@@ -70,11 +96,19 @@ onUnmounted(() => clips.value.forEach((c) => URL.revokeObjectURL(c.url)));
       <ModelPicker v-model="model" kind="speech" title="Text-to-speech model" @manage="emit('manage')" />
       <section aria-labelledby="tts-set-h">
         <h2 id="tts-set-h">Voice and sampling</h2>
-        <label class="block">Voice
+        <label v-if="voices && voices.data.length && !voices.accepts_any" class="block">Voice
+          <select v-model="voice" class="field" data-testid="voice-picker">
+            <option value="">Default{{ voices.default ? ` (${voices.default})` : '' }}</option>
+            <option v-for="v in voices.data" :key="v.id" :value="v.id">{{ voiceLabel(v) }}</option>
+          </select>
+        </label>
+        <label v-else class="block">Voice
           <input v-model="voice" class="field" type="text" list="voices" placeholder="the model’s default" spellcheck="false" />
         </label>
-        <datalist id="voices"><option v-for="v in VOICES" :key="v" :value="v"></option></datalist>
-        <p class="hint">Orpheus: tara, leah, jess, leo, dan, mia, zac, zoe. Other models list theirs if the name is wrong.</p>
+        <datalist id="voices"><option v-for="v in voices?.data || []" :key="v.id" :value="v.id"></option></datalist>
+        <p v-if="voicesLoading" class="hint" role="status">Loading the model to list its voices…</p>
+        <p v-else-if="voices" class="hint">{{ voices.data.length }} voice{{ voices.data.length === 1 ? '' : 's' }}<template v-if="voices.note">: {{ voices.note }}</template>.</p>
+        <p v-if="voicesError" class="error" role="alert">Voices: {{ voicesError }}</p>
         <label class="inline">Temperature <input v-model="temperature" class="num" type="number" min="0" max="2" step="0.1" placeholder="default" /></label>
         <label class="inline">Top-p <input v-model="topP" class="num" type="number" min="0.05" max="1" step="0.05" placeholder="default" /></label>
         <label class="inline">Repetition penalty <input v-model="repetition" class="num" type="number" min="1" max="2" step="0.05" placeholder="default" /></label>

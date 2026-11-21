@@ -40,14 +40,129 @@ img = client.images.generate(model="sd", prompt="a lighthouse at dusk", size="51
 | Endpoint | Models | Notes |
 |---|---|---|
 | `GET /v1/models`, `/v1/models/{id}` | all | the whitelist, with `kind` and `loaded` |
-| `POST /v1/chat/completions` | chat (Gemma 4 / 3, Qwen 3.5 / 3.8 / 3, Llama 3, Mistral Large 4, DeepSeek V4, Core ML) | system / developer, multi-turn, `image_url` (data: or http(s) URLs) and `video_url` parts (vision checkpoints), `input_audio` (Gemma 4), `tools` / `tool_choice` (`auto`, `none`, `required` or a function: forced calls) with `tool_calls` out, `response_format` (`json_object`, `json_schema`: constrained decoding), `logprobs` / `top_logprobs`, `temperature`, `top_p`, `top_k`, `max_tokens` / `max_completion_tokens`, `stop`, `seed`, `n`, `stream` (SSE, `stream_options.include_usage`), thinking with `reasoning_effort` (`none` off, anything else on), `enable_thinking` or `chat_template_kwargs.enable_thinking`, returned as `reasoning_content` |
+| `POST /v1/chat/completions` | chat (Gemma 4 / 3, Qwen 3.5 / 3.8 / 3, Llama 3, Mistral Large 4, DeepSeek V4, Core ML) | system / developer, multi-turn, `image_url` (data: or http(s) URLs) and `video_url` parts (vision checkpoints), `input_audio` (Gemma 4), `tools` / `tool_choice` (`auto`, `none`, `required` or a function: forced calls) with `tool_calls` out, `response_format` (`json_object`, `json_schema`: constrained decoding), `logprobs` / `top_logprobs`, `temperature`, `top_p`, `top_k`, `max_tokens` / `max_completion_tokens`, `stop`, `seed`, `n`, `stream` (SSE, `stream_options.include_usage`), thinking with `reasoning_effort` (`none` off, anything else on), `enable_thinking` or `chat_template_kwargs.enable_thinking`, returned as `reasoning_content`; `modalities: ["text", "audio"]` with `audio` (LFM3-Omni, Haru: a spoken reply, [below](#spoken-replies-lfm3-omni-haru)) |
 | `POST /v1/messages`, `/v1/messages/count_tokens` | chat | Anthropic's Messages API (Claude Code, the `anthropic` SDKs): see [below](#anthropic-messages-api) |
 | `POST /v1/completions` | chat | raw continuations (no template): `prompt` as text, texts or token ids, `echo`, `stop`, `stream` |
 | `POST /v1/embeddings` | embedding | `encoding_format` float / base64, `dimensions` (Matryoshka); `prompt_name` (extension) |
-| `POST /v1/images/generations` | image (Stable Diffusion, FLUX.1, Qwen-Image, OmniGen2, Step1X-Edit, BAGEL, Janus-Pro) | `size`, `n`, `response_format` (`b64_json`, or `url` as a PNG data URL); extensions `seed`, `steps`, `guidance`, `negative_prompt` |
-| `POST /v1/images/edits` | image | multipart: `image` (or `image[]`, several for Qwen-Image-Edit-2509+ and OmniGen2), `mask` (Stable Diffusion), `prompt`, the same fields, `strength` |
+| `POST /v1/images/generations` | image (Stable Diffusion, SD 3 / 3.5, FLUX.1, Qwen-Image, OmniGen2, Step1X-Edit, BAGEL, Janus-Pro, MiniMax-H3-Image) | `size`, `n`, `response_format` (`b64_json`, or `url` as a PNG data URL), `stream` (server-sent events with a progress event per step, [below](#image-progress)); extensions `seed`, `steps`, `guidance`, `negative_prompt` |
+| `POST /v1/images/edits` | image | multipart: `image` (or `image[]`, several for Qwen-Image-Edit-2509+ and OmniGen2), `mask` (Stable Diffusion), `prompt`, the same fields, `strength` (SD 3: image to image) |
 | `POST /v1/audio/transcriptions`, `/v1/audio/translations` | Whisper, Nemotron 3.5 Transcribe ([its differences](nemotron.md#speech-to-text-nemotron-35-transcribe): `prompt` is the instruction, one segment, no word timestamps or beam search) | multipart: `file` (any format oxideav decodes), `language`, `prompt`, `temperature`, `response_format` json / text / verbose_json / srt / vtt, `timestamp_granularities[]` word / segment, `beam_size`, `patience`, `length_penalty`, `best_of`; several `file` parts are transcribed as a batch and answered as a JSON array (json / verbose_json) |
-| `POST /v1/audio/speech` | Orpheus, ZONOS3-Mini (44.1 kHz, the audio sent once generated; its fields in [ZONOS3-Mini](zonos.md)), Fish Audio Drama 3 (44.1 kHz, the audio sent per chunk of text; `voice` a speaker tag 0 to 15, its fields in [Drama 3](fish-drama.md)), Audio8 TTS (44.1 kHz, streamed as it is generated; `voice` a clip of its voices folder; its fields in [Audio8 TTS](audio8-tts.md)) | `input`, `voice` (the model's voices; OpenAI's names take the default one), `response_format` wav or pcm (16-bit 24 kHz mono, streamed as it is generated), `stream_format` sse; extensions `seed`, `temperature`, `top_p`, `repetition_penalty`; an array as `input` (1 to 64 texts, `voice` one name or an array) is generated as one batch and answered as JSON, `data[i].audio` the base64 WAV (or PCM) of `input[i]` |
+| `POST /v1/audio/speech` | Orpheus, LFM3-Omni (its text to speech, [below](#spoken-replies-lfm3-omni-haru)), ZONOS3-Mini (44.1 kHz, the audio sent once generated; its fields in [ZONOS3-Mini](zonos.md)), Fish Audio Drama 3 (44.1 kHz, the audio sent per chunk of text; `voice` a speaker tag 0 to 15, its fields in [Drama 3](fish-drama.md)), Audio8 TTS (44.1 kHz, streamed as it is generated; `voice` a clip of its voices folder; its fields in [Audio8 TTS](audio8-tts.md)) | `input`, `voice` (the model's voices; OpenAI's names take the default one), `response_format` wav or pcm (16-bit 24 kHz mono, streamed as it is generated), `stream_format` sse; extensions `seed`, `temperature`, `top_p`, `repetition_penalty`; an array as `input` (1 to 64 texts, `voice` one name or an array) is generated as one batch and answered as JSON, `data[i].audio` the base64 WAV (or PCM) of `input[i]` |
+| `GET /v1/audio/voices?model=ID` | speech models, LFM3-Omni | the model's voices up front (it is loaded first when needed): `data` (`id`, `name`, and `label` / `language` for ZONOS3), `default`, `aliases` (OpenAI's names, which take the default), `accepts_any`; `/v1/models/{id}` also has `voices` once the model is loaded |
+| `POST /v1/videos` (also `/v1/videos/generations`), `GET /v1/videos`, `GET /v1/videos/{id}`, `GET /v1/videos/{id}/content`, `POST /v1/videos/{id}/cancel`, `DELETE /v1/videos/{id}` | video (MiniMax-H3) | asynchronous jobs in the shape of OpenAI's videos API: see [below](#video-generation) |
+
+Spoken replies, image progress and video jobs are described below; in the library they are
+`Api::handle` on their paths, in C `oxi_server_handle` (and the direct entry points named in each
+section).
+
+### Spoken replies (LFM3-Omni, Haru)
+
+`POST /v1/chat/completions` with `"modalities": ["text", "audio"]` answers in speech, in OpenAI's
+shape (`audio: {"voice", "format"}`, the reply in `choices[0].message.audio`: `data` the base64
+audio, `transcript` its text, `id`, `expires_at`; `content` is null), from two kinds of model:
+
+- **LFM3-Omni** (`LiquidAI/LFM3-Omni-2B`, a chat model): the last user message (text, images,
+  `input_audio`) and the system prompt (default "Respond with interleaved text and audio.") get an
+  answer in text and speech (`lfm3_omni::Mode::Interleaved`). Earlier turns are not replayed: a
+  spoken reply runs on a session of its own and leaves the model's text conversation as it was.
+  `temperature`, `top_k`, `seed` and `max_tokens` (slots: text tokens and 80 ms speech frames)
+  sample the speech; the voice is the model's own (`audio.voice` takes `female`, `male` or
+  OpenAI's names). In the library `Engine::speak_omni`, in C `oxi_engine_speak_omni`.
+- **Haru** (`higurashi-ai/Haru-4B`, a speech model): the user's recording (an `input_audio` part
+  of the last user message) is played to the model frame by frame, as in a live conversation,
+  then silence until it has answered and gone quiet for 1.2 s (at most `max_reply_seconds`,
+  default 12, an extension); the reply is what it said after the recording. The system prompt is
+  its character card, `audio.voice_reference` (an extension: a `data:` or `http(s)://` URL of a
+  clip) the voice it speaks with; `temperature`, `top_k`, `top_p` and `seed` sample its text
+  stream. In the library `Haru::respond` (`haru::turn`), in C `oxi_haru_respond`.
+
+`audio.format` is `wav` (default) or `pcm16` (16-bit little-endian mono at 24 kHz). With
+`"stream": true` (`pcm16` only, as OpenAI) the chunks carry `delta.audio.transcript` as the text
+grows and `delta.audio.data` (base64 PCM16, at most a second each: Haru's as it is made,
+LFM3-Omni's once its codec has decoded the reply), then a `finish_reason`, `usage` with
+`stream_options.include_usage`, and `data: [DONE]`.
+
+`POST /v1/audio/speech` on LFM3-Omni is its text to speech (`voice` `female`, the default, or
+`male`; `instructions` replaces the system prompt "Perform TTS in American English using a
+female voice."; `seed`, `temperature`, `top_k`, `repetition_penalty`, `max_tokens`), answered as
+WAV or `pcm` once generated. On Haru it is refused (Haru speaks only in answer to a recording).
+
+### Image progress
+
+`/v1/images/generations` and `/v1/images/edits` (a `stream` form field) take `"stream": true`
+(as OpenAI's `gpt-image` streaming): the answer is then server-sent events, each with `event:`
+and a JSON `data` of the same `type`:
+
+- `image_generation.progress` (edits: `image_edit.progress`, an extension) while the request
+  waits: `stage` `waiting` (another request uses the model), `downloading` (`file`, `index`,
+  `count`, `done`, `total`), `loading`; then one per denoising step: `stage: "generating"`,
+  `image_index` of `n`, `step` of `steps` (Janus: one per image token row, `steps` 0), `elapsed`;
+- `image_generation.completed` per image, as OpenAI's: `b64_json` (or `url`), `size`,
+  `output_format`, `created_at`, `image_index`;
+- `error` with OpenAI's error object if it fails after the stream started.
+
+No preview images are made (`partial_images` is accepted and none is sent: a preview would cost
+a VAE decode per step). Without `stream` the request and response are unchanged. The client going
+away stops FLUX.1, BAGEL, SD 3 and Janus between steps; the others finish the image first.
+
+Stable Diffusion 3 / 3.5 (a diffusers folder whose `model_index.json` names a
+`StableDiffusion3*` class, or an SD 3 GGUF transformer with the `base` option) and
+MiniMax-H3-Image are image models of the server: SD 3 generates and edits (image to image,
+`strength`, default 0.6; its load options are [SD 3's](sd3.md): `quant`, `text_quant`,
+`transformer`, `text_encoder`, `base`, `t5`, `device`, `vae_encoder`); MiniMax-H3-Image generates
+from text only, with its own six steps (`steps` and `guidance` are refused) and the text encoder
+found as the command line finds it (`OXINFER_H3_TEXT_ENCODER`, the release folder, the caches) or
+named with the `text_encoder` option.
+
+### Video generation
+
+MiniMax-H3 (a release folder, or a single-file transformer with the `vae` option) is a `video`
+model: `/v1/videos` follows OpenAI's videos API (Sora's) with asynchronous jobs, as a generation
+takes minutes to hours.
+
+```sh
+curl -s localhost:8080/v1/videos -H 'Content-Type: application/json' \
+  -d '{"model": "h3", "prompt": "A red fox trots across a snowy clearing ...", "seconds": "5", "size": "448x256"}'
+# {"id": "video_...", "object": "video", "status": "queued", "progress": 0, ...}
+curl -s localhost:8080/v1/videos/video_...                     # status, progress, stage, step / steps
+curl -s localhost:8080/v1/videos/video_.../events              # the same as server-sent events until it ends
+curl -s localhost:8080/v1/videos/video_.../content -o fox.avi  # once "completed"
+curl -s 'localhost:8080/v1/videos/video_.../content?variant=audio' -o fox.wav
+curl -s -X POST localhost:8080/v1/videos/video_.../cancel
+curl -s -X DELETE localhost:8080/v1/videos/video_...
+# first / last frame (multipart, OpenAI's input_reference is the first frame)
+curl -s localhost:8080/v1/videos -F model=h3 -F prompt="..." -F input_reference=@first.png -F last_frame=@last.png
+```
+
+| Field | |
+|---|---|
+| `model`, `prompt` | required |
+| `seconds` | a number or a string (OpenAI's); frames at 24 fps, rounded up to `17 n + 5` (default 124: 5.2 s). `frames` sets the count directly |
+| `size` | `WxH`, multiples of 32 (default: 16:9 at a 768 short edge, or the first frame's aspect ratio) |
+| `steps`, `seed` | points of the sigma grid (default 50, or a turbo LoRA's); the noise seed (default random) |
+| `input_reference` / `first_frame`, `last_frame` | images: first / last frame to video (`fl2va`) |
+| `references` | images, audio clips and videos, in the order the prompt names them (ref2va: a model whose folder is the release's `Ref2VA/`); `ref_image_edge` the short edge image references are encoded at |
+
+In JSON the media are `data:` or `http(s)://` URLs (`input_reference` may be OpenAI's
+`{"image_url": ...}`); in a multipart body files (`references[]` repeated) or URL fields. The
+`video` object has OpenAI's fields (`id`, `object`, `model`, `status` `queued` / `in_progress` /
+`completed` / `failed`, and `cancelled` here, `progress` 0 to 100, `created_at`, `completed_at`,
+`expires_at`, `size`, `seconds`, `prompt`, `error`) and some of its own: `stage` (`queued`,
+`waiting`, `downloading` with `download`, `loading`, `generating`, `decoding`, `encoding`),
+`step` / `steps`, `frames`, `fps`, `has_audio`, `elapsed`, `variants` (the byte size of each
+file). Jobs run one at a time per model (others wait, `stage: "waiting"`); cancelling stops
+the job between two denoising steps, or before the model loads. `content?variant=` is `video`
+(Motion JPEG and the stereo 32 kHz soundtrack as 16-bit PCM in AVI: no pure-Rust H.264 / VP9
+encoder is available, so not OpenAI's MP4; `ffmpeg -i clip.avi clip.mp4` converts it; built
+without `media` there is no AVI), `audio` (WAV) or `thumbnail` (the first frame as PNG). Finished
+jobs keep their files in memory for an hour (`expires_at`); the server keeps the last 32 jobs.
+
+The model's options: `text_encoder`, `transformer`, `vae`, `audio_vae` (parts replacing the
+folder's: paths, `org/name/file.safetensors` or repo ids), `quant` (the text encoder's: `bf16` or
+`q8`), `lora` (`FILE[:SCALE]`, repeatable; a turbo LoRA sets the step count and the shifts),
+`shift`, `audio_shift`. In the library the pipeline is `minimax_h3::video::VideoPipeline`
+(`VideoParams::cancel` stops it), the files `minimax_h3::encode`; in C `oxi_video_load`,
+`oxi_video_generate` and `oxi_video_free`.
 
 ### Anthropic Messages API
 
@@ -156,7 +271,7 @@ of the loader for the other kinds (Whisper `encoder` / `decoder` precision, Orph
 
 | Key | Meaning |
 |---|---|
-| `kind` | `chat`, `embedding`, `image`, `transcription` or `speech` (default: detected) |
+| `kind` | `chat`, `embedding`, `image`, `transcription`, `speech` or `video` (default: detected) |
 | `system` | system prompt when a request has none (default none; `default` for the CLI's prompt with the date and time) |
 | `think` | thinking by default (`1`); requests override it |
 | `max_tokens` | reply length when a request sets none (default 4096) |

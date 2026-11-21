@@ -807,8 +807,57 @@ fn usage(choices: &[Choice]) -> Value {
     })
 }
 
+/// What a spoken reply reads of a chat request ([`super::speech`]): the model, the system
+/// prompt (the last system message, if any), and the last user message's text and attachments
+/// (written to `temp`). Earlier turns are not replayed.
+pub(super) struct SpokenInput {
+    pub model: String,
+    pub system: Option<String>,
+    pub text: String,
+    pub media: Attachments,
+    pub seed: Option<u64>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<usize>,
+    pub max_tokens: Option<usize>,
+    pub stream: bool,
+    pub include_usage: bool,
+}
+
+pub(super) fn spoken_input(api: &Api, body: &Value, temp: &mut TempFiles) -> ApiResult<SpokenInput> {
+    let req = ChatRequest::parse(body)?;
+    let msgs = req.messages(api, temp)?;
+    let system = msgs.iter().rev().find(|m| m.role == Role::System).map(|m| m.content.clone());
+    let user = msgs
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User)
+        .ok_or_else(|| ApiError::bad("a spoken reply answers a user message: none was given").param("messages"))?;
+    Ok(SpokenInput {
+        model: req.model.clone(),
+        system,
+        text: user.content.clone(),
+        media: user.media.clone(),
+        seed: req.params.seed,
+        temperature: req.params.temperature,
+        top_p: req.params.top_p,
+        top_k: req.params.top_k,
+        max_tokens: req.params.max_tokens,
+        stream: req.params.stream,
+        include_usage: req.params.include_usage,
+    })
+}
+
 /// `POST /v1/chat/completions`.
 pub(super) fn chat(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
+    // Audio out (OpenAI's `modalities: ["text", "audio"]`): LFM3-Omni, Haru.
+    if body
+        .get("modalities")
+        .and_then(Value::as_array)
+        .is_some_and(|m| m.iter().any(|x| x == "audio"))
+    {
+        return super::speech::spoken_chat(api, body);
+    }
     let req = ChatRequest::parse(body)?;
     api.models.check(&req.model, Kind::Chat)?;
     let id = api.new_id("chatcmpl-");

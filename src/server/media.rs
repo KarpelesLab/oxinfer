@@ -266,6 +266,8 @@ struct ImageJob {
     guidance: Option<f32>,
     strength: Option<f32>,
     as_url: bool,
+    /// Server-sent events with the progress and the images (`stream: true`).
+    stream: bool,
     images: Vec<RgbImage>,
     mask: Option<RgbImage>,
     /// Pipeline-specific settings by name (MOSS-Image: `sampler`, `scheduler`,
@@ -318,6 +320,23 @@ impl ImageJob {
         {
             return Err(ApiError::bad("output_format: only png is supported").param("output_format"));
         }
+        let stream = match get("stream") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => b,
+            Some(Value::String(t)) => match t.trim() {
+                "true" | "1" => true,
+                "false" | "0" | "" => false,
+                _ => return Err(ApiError::bad("stream must be a boolean").param("stream")),
+            },
+            Some(_) => return Err(ApiError::bad("stream must be a boolean").param("stream")),
+        };
+        // Previews of the steps are not made (decoding the latents at every step costs a VAE
+        // pass): partial images are accepted and none is sent.
+        if let Some(k) = num("partial_images")?
+            && !(0.0..=3.0).contains(&k)
+        {
+            return Err(ApiError::bad("partial_images must be between 0 and 3").param("partial_images"));
+        }
         Ok(Self {
             model,
             prompt,
@@ -333,6 +352,7 @@ impl ImageJob {
                 .iter()
                 .filter_map(|k| get(k).filter(|v| !v.is_null()).map(|v| (k.to_string(), v)))
                 .collect(),
+            stream,
             ..Self::default()
         })
     }
@@ -364,7 +384,7 @@ fn setting(v: &Value) -> String {
 /// `POST /v1/images/generations`.
 pub(super) fn image_generations(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
     let job = ImageJob::parse(&|k| body.get(k).cloned())?;
-    run_images(api, job)
+    run_images(api, job, "image_generation")
 }
 
 /// `POST /v1/images/edits` (multipart: `image` or `image[]` files, an optional `mask`).
@@ -384,31 +404,127 @@ pub(super) fn image_edits(api: &Arc<Api>, req: &ApiRequest) -> ApiResult<Output>
     if let Some(m) = field(&parts, "mask") {
         job.mask = decode_images(vec![m.data.clone()])?.pop();
     }
-    run_images(api, job)
+    run_images(api, job, "image_edit")
 }
 
-fn run_images(api: &Arc<Api>, job: ImageJob) -> ApiResult<Output> {
+/// An image's entry of the response: base64 PNG, or a `data:` URL.
+fn image_json(job: &ImageJob, (w, h, rgb): &(usize, usize, Vec<u8>)) -> Value {
+    let b64 = crate::b64::encode(&crate::png::encode_rgb(*w, *h, rgb));
+    if job.as_url {
+        json!({ "url": format!("data:image/png;base64,{b64}") })
+    } else {
+        json!({ "b64_json": b64 })
+    }
+}
+
+/// Runs an image request: one JSON response, or with `stream` server-sent events
+/// ([`stream_images`]). `event` is OpenAI's event prefix (`image_generation`, `image_edit`).
+fn run_images(api: &Arc<Api>, job: ImageJob, event: &'static str) -> ApiResult<Output> {
     api.models.check(&job.model, Kind::Image)?;
+    if job.stream {
+        let api = api.clone();
+        return Ok(Output::Stream {
+            content_type: "text/event-stream".into(),
+            producer: Box::new(move |sink| stream_images(&api, &job, event, sink)),
+        });
+    }
     let mut lease = api.models.acquire(&job.model, Kind::Image)?;
     let Loaded::Image(m) = lease.model() else { unreachable!() };
     let seed = job.seed.unwrap_or_else(random_seed);
-    let imgs = generate_images(m, &job, seed).map_err(|e| ApiError::new(500, format!("{e:#}")))?;
+    let imgs = generate_images(m, &job, seed, &mut |_, _, _| true).map_err(|e| ApiError::new(500, format!("{e:#}")))?;
     drop(lease);
-    let data: Vec<Value> = imgs
-        .iter()
-        .map(|(w, h, rgb)| {
-            let b64 = crate::b64::encode(&crate::png::encode_rgb(*w, *h, rgb));
-            if job.as_url {
-                json!({ "url": format!("data:image/png;base64,{b64}") })
-            } else {
-                json!({ "b64_json": b64 })
-            }
-        })
-        .collect();
+    let data: Vec<Value> = imgs.iter().map(|i| image_json(&job, i)).collect();
     Ok(Output::Full(ApiResponse::json(
         200,
         &json!({ "created": now(), "data": data, "output_format": "png" }),
     )))
+}
+
+/// One server-sent event: `event: TYPE` and the JSON (which has the same `type`).
+fn sse_event(sink: Sink, v: &Value) -> bool {
+    let kind = v["type"].as_str().unwrap_or("message");
+    sink(format!("event: {kind}\ndata: {v}\n\n").as_bytes())
+}
+
+/// The streamed form of an image request (OpenAI's `stream: true`, with progress events of
+/// its own): `{event}.progress` events while the request waits for the model, the model
+/// downloads or loads (`stage`: `waiting`, `downloading` with `file` / `done` / `total`,
+/// `loading`), then one per denoising step (`stage: "generating"`, `image_index` of `n`, `step`
+/// of `steps`); then `{event}.completed` per image with its `b64_json` (OpenAI's shape), or an
+/// `error` event. The client going away stops the pipelines that can be stopped between steps.
+fn stream_images(api: &Arc<Api>, job: &ImageJob, event: &'static str, sink: Sink) {
+    let t0 = std::time::Instant::now();
+    let progress = format!("{event}.progress");
+    let elapsed = || (t0.elapsed().as_secs_f64() * 10.0).round() / 10.0;
+    let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    let mut gone = false;
+    let mut on_stage = |st: &super::registry::Stage| {
+        use super::registry::Stage;
+        let v = match st {
+            Stage::Waiting => json!({ "type": progress, "stage": "waiting", "elapsed": elapsed() }),
+            Stage::Loading => json!({ "type": progress, "stage": "loading", "elapsed": elapsed() }),
+            Stage::Downloading {
+                file,
+                index,
+                count,
+                done,
+                total,
+            } => {
+                // At most five a second, and the one completing a file.
+                if last.elapsed() < std::time::Duration::from_millis(200) && total.is_none_or(|t| *done < t) {
+                    return true;
+                }
+                last = std::time::Instant::now();
+                json!({ "type": progress, "stage": "downloading", "file": file, "index": index, "count": count, "done": done, "total": total, "elapsed": elapsed() })
+            }
+            Stage::Prompt { .. } => return true,
+        };
+        sse_event(&mut *sink, &v)
+    };
+    let mut lease = match api.models.acquire_with(&job.model, Kind::Image, Some(&mut on_stage)) {
+        Ok(l) => l,
+        Err(e) => {
+            sse_event(sink, &json!({ "type": "error", "error": e.to_json()["error"] }));
+            return;
+        }
+    };
+    let Loaded::Image(m) = lease.model() else { unreachable!() };
+    let seed = job.seed.unwrap_or_else(random_seed);
+    let n = job.n;
+    let mut on_step = |i: usize, step: usize, steps: usize| {
+        if gone {
+            return false;
+        }
+        let v = json!({ "type": progress, "stage": "generating", "image_index": i, "n": n, "step": step, "steps": steps, "elapsed": elapsed() });
+        gone = !sse_event(&mut *sink, &v);
+        !gone
+    };
+    let r = generate_images(m, job, seed, &mut on_step);
+    drop(lease);
+    match r {
+        Ok(imgs) => {
+            for (i, img) in imgs.iter().enumerate() {
+                let mut v = image_json(job, img);
+                v["type"] = json!(format!("{event}.completed"));
+                v["image_index"] = json!(i);
+                v["created_at"] = json!(now());
+                v["size"] = json!(format!("{}x{}", img.0, img.1));
+                v["output_format"] = json!("png");
+                v["quality"] = json!("auto");
+                v["background"] = json!("opaque");
+                if !sse_event(sink, &v) {
+                    return;
+                }
+            }
+        }
+        Err(_) if gone => {}
+        Err(e) => {
+            sse_event(
+                sink,
+                &json!({ "type": "error", "error": ApiError::new(500, format!("{e:#}")).to_json()["error"] }),
+            );
+        }
+    }
 }
 
 pub(super) fn random_seed() -> u64 {
@@ -418,8 +534,18 @@ pub(super) fn random_seed() -> u64 {
     (t.as_nanos() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 16
 }
 
-/// Runs the pipeline `n` times (seeds `seed`, `seed + 1`, ...; Janus: one batch).
-fn generate_images(m: &mut ImageModel, job: &ImageJob, seed: u64) -> anyhow::Result<Vec<(usize, usize, Vec<u8>)>> {
+/// Runs the pipeline `n` times (seeds `seed`, `seed + 1`, ...; Janus: one batch). `on_step`
+/// receives `(image, step, steps)` after each denoising step (Janus: each image token row);
+/// false stops the pipelines that can stop between steps (the request then fails).
+///
+/// A new image backend is one more [`ImageModel`] variant (loaded in the registry's
+/// `load_image`) and one more arm here, reporting its steps through `step`.
+fn generate_images(
+    m: &mut ImageModel,
+    job: &ImageJob,
+    seed: u64,
+    on_step: &mut dyn FnMut(usize, usize, usize) -> bool,
+) -> anyhow::Result<Vec<(usize, usize, Vec<u8>)>> {
     use anyhow::bail;
     let (w, h) = (job.size.map(|s| s.0), job.size.map(|s| s.1));
     let first = job.images.first();
@@ -443,11 +569,16 @@ fn generate_images(m: &mut ImageModel, job: &ImageJob, seed: u64) -> anyhow::Res
         if let (Some(w), Some(h)) = (w, h) {
             (o.width, o.height) = (w, h);
         }
-        let (imgs, _) = j.generate_images(&job.prompt, &o, &mut |_| Flow::Continue)?;
+        let mut k = 0;
+        let (imgs, _) = j.generate_images(&job.prompt, &o, &mut |_| {
+            k += 1;
+            if on_step(0, k, 0) { Flow::Continue } else { Flow::Stop }
+        })?;
         return Ok(imgs.into_iter().map(|i| (i.width, i.height, i.rgb)).collect());
     }
     for i in 0..job.n {
         let seed = seed.wrapping_add(i as u64);
+        let mut step = |k: usize, n: usize| on_step(i, k, n);
         let img = match m {
             ImageModel::Sd(pipe) => {
                 let edit = first.map(|im| {
@@ -479,8 +610,12 @@ fn generate_images(m: &mut ImageModel, job: &ImageJob, seed: u64) -> anyhow::Res
                     sampler: pipe.default_sampler(),
                 };
                 let (img, _) = match &edit {
-                    Some(e) => pipe.generate_from(&p, e, &mut |_, _| {})?,
-                    None => pipe.generate(&p, &mut |_, _| {})?,
+                    Some(e) => pipe.generate_from(&p, e, &mut |k, n| {
+                        step(k, n);
+                    })?,
+                    None => pipe.generate(&p, &mut |k, n| {
+                        step(k, n);
+                    })?,
                 };
                 (img.width, img.height, img.rgb)
             }
@@ -495,8 +630,8 @@ fn generate_images(m: &mut ImageModel, job: &ImageJob, seed: u64) -> anyhow::Res
                     ..Default::default()
                 };
                 let (img, _) = match first {
-                    Some(im) => pipe.edit(im, &job.prompt, &o, &mut |_, _| true)?,
-                    None => pipe.generate(&job.prompt, &o, &mut |_, _| true)?,
+                    Some(im) => pipe.edit(im, &job.prompt, &o, &mut step)?,
+                    None => pipe.generate(&job.prompt, &o, &mut step)?,
                 };
                 (img.width, img.height, img.rgb)
             }
@@ -518,9 +653,13 @@ fn generate_images(m: &mut ImageModel, job: &ImageJob, seed: u64) -> anyhow::Res
                     bail!("Qwen-Image-Layered returns RGBA layers; use the command line or the library");
                 }
                 let (img, _) = if job.images.is_empty() {
-                    pipe.generate(&p, &mut |_, _| {})?
+                    pipe.generate(&p, &mut |k, n| {
+                        step(k, n);
+                    })?
                 } else {
-                    pipe.edit(&job.images, &p, &mut |_, _| {})?
+                    pipe.edit(&job.images, &p, &mut |k, n| {
+                        step(k, n);
+                    })?
                 };
                 (img.width, img.height, img.rgb)
             }
@@ -537,9 +676,13 @@ fn generate_images(m: &mut ImageModel, job: &ImageJob, seed: u64) -> anyhow::Res
                 };
                 let p = r.params();
                 let (img, _) = if job.images.is_empty() {
-                    pipe.generate(&p, &mut |_, _| {})?
+                    pipe.generate(&p, &mut |k, n| {
+                        step(k, n);
+                    })?
                 } else {
-                    pipe.edit(&job.images, &p, &mut |_, _| {})?
+                    pipe.edit(&job.images, &p, &mut |k, n| {
+                        step(k, n);
+                    })?
                 };
                 (img.width, img.height, img.rgb)
             }
@@ -556,8 +699,12 @@ fn generate_images(m: &mut ImageModel, job: &ImageJob, seed: u64) -> anyhow::Res
                 };
                 let p = r.params();
                 let (img, _) = match first {
-                    Some(im) => pipe.edit(im, &p, &mut |_, _| {})?,
-                    None => pipe.generate(&p, &mut |_, _| {})?,
+                    Some(im) => pipe.edit(im, &p, &mut |k, n| {
+                        step(k, n);
+                    })?,
+                    None => pipe.generate(&p, &mut |k, n| {
+                        step(k, n);
+                    })?,
                 };
                 (img.width, img.height, img.rgb)
             }
@@ -573,8 +720,8 @@ fn generate_images(m: &mut ImageModel, job: &ImageJob, seed: u64) -> anyhow::Res
                     o.steps = s;
                 }
                 let (img, _) = match first {
-                    Some(im) => b.edit(im, &job.prompt, &o, &mut |_, _| true)?,
-                    None => b.generate(&job.prompt, &o, &mut |_, _| true)?,
+                    Some(im) => b.edit(im, &job.prompt, &o, &mut step)?,
+                    None => b.generate(&job.prompt, &o, &mut step)?,
                 };
                 (img.width, img.height, img.rgb)
             }
@@ -599,7 +746,43 @@ fn generate_images(m: &mut ImageModel, job: &ImageJob, seed: u64) -> anyhow::Res
                 for (k, v) in &job.extra {
                     p.set(k, &setting(v))?;
                 }
-                let (img, _) = pipe.generate(&p, &mut |_, _| {})?;
+                let (img, _) = pipe.generate(&p, &mut |k, n| {
+                    step(k, n);
+                })?;
+                (img.width, img.height, img.rgb)
+            }
+            ImageModel::Sd3(pipe) => {
+                let o = crate::sd3::Options {
+                    steps: job.steps,
+                    guidance: job.guidance,
+                    negative_prompt: job.negative.clone(),
+                    width: w,
+                    height: h,
+                    strength: job.strength.unwrap_or(0.6),
+                    seed,
+                    ..Default::default()
+                };
+                let (img, _) = match first {
+                    Some(im) => pipe.img2img(im, &job.prompt, &o, &mut step)?,
+                    None => pipe.generate(&job.prompt, &o, &mut step)?,
+                };
+                (img.width, img.height, img.rgb)
+            }
+            ImageModel::H3Image(pipe) => {
+                if first.is_some() {
+                    bail!("MiniMax-H3-Image generates images from text only (no edits)");
+                }
+                let mut p = crate::minimax_h3::Params::new(&job.prompt);
+                if let (Some(w), Some(h)) = (w, h) {
+                    (p.width, p.height) = (w, h);
+                }
+                p.seed = seed;
+                if job.steps.is_some() || job.guidance.is_some() {
+                    bail!("MiniMax-H3-Image is distilled to its own steps without guidance: leave steps and guidance out");
+                }
+                let img = pipe.generate(&p, &mut |k, n| {
+                    step(k, n);
+                })?;
                 (img.width, img.height, img.rgb)
             }
             ImageModel::Janus(_) => unreachable!(),
@@ -793,9 +976,16 @@ fn subtitles(segments: &[crate::whisper::Segment], vtt: bool) -> String {
 // ---- text to speech ---------------------------------------------------------------------------
 
 /// OpenAI's voice names, which map to the model's default voice.
-const OPENAI_VOICES: [&str; 13] = [
+pub(super) const OPENAI_VOICES: [&str; 13] = [
     "alloy", "ash", "ballad", "cedar", "coral", "echo", "fable", "marin", "nova", "onyx", "sage", "shimmer", "verse",
 ];
+
+fn haru_is_not_tts(model: &str) -> ApiError {
+    ApiError::bad(format!(
+        "the model {model:?} (Haru) is speech to speech: send a recording to /v1/chat/completions with modalities [\"text\", \"audio\"]"
+    ))
+    .param("model")
+}
 
 /// The model's voice for a request's `voice` (OpenAI's names take the default one).
 fn speech_voice(info: &crate::tts::SpeakerInfo, voice: Option<&str>) -> ApiResult<Option<String>> {
@@ -983,6 +1173,7 @@ fn speech_batch(
             let items: Vec<crate::tts::Utterance> = texts.iter().zip(&opts).map(|(t, o)| crate::tts::Utterance::new(t, o)).collect();
             sp.speak_batch(&items).map_err(|e| ApiError::new(500, format!("{e:#}")))?
         }
+        Loaded::Haru(_) => return Err(haru_is_not_tts(model)),
         _ => unreachable!(),
     };
     let (mut tin, mut tout) = (0, 0);
@@ -1061,6 +1252,12 @@ pub(super) fn speech(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
         return speech_batch(api, body, &model, inputs, &format, o);
     }
     let voice = s("voice");
+    if super::speech::speech_goes_to_omni(api, &model) {
+        if sse {
+            return Err(ApiError::bad("stream_format: LFM3-Omni's speech is not streamed").param("stream_format"));
+        }
+        return super::speech::omni_speech(api, body, &model, &input, &format);
+    }
     api.models.check(&model, Kind::Speech)?;
     let api2 = api.clone();
     let body2 = body.clone();
@@ -1075,6 +1272,7 @@ pub(super) fn speech(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
                 o.voice = speech_voice(sp.info(), voice.as_deref())?;
                 None
             }
+            Loaded::Haru(_) => return Err(haru_is_not_tts(&model)),
             _ => unreachable!(),
         };
         let dro = drama_options(&body2, voice.as_deref(), o.seed);

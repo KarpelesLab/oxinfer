@@ -3,7 +3,7 @@
 // of the server's models, or a downloaded one loaded here. Setting models up (the catalog,
 // downloads, the cache) is the Models view (`manage`).
 import { computed, onMounted, ref, watch } from 'vue';
-import { store, modelsOf, loadLine, refresh, fmtBytes } from '../lib/native.js';
+import { store, modelsOf, serves, loadLine, refresh, fmtBytes } from '../lib/native.js';
 
 const props = defineProps({
   kind: { type: String, required: true },
@@ -12,7 +12,7 @@ const props = defineProps({
 });
 const emit = defineEmits(['update:modelValue', 'manage']);
 
-const KIND_WORD = { chat: 'chat', image: 'image', transcription: 'speech-to-text', speech: 'text-to-speech', embedding: 'embedding' };
+const KIND_WORD = { chat: 'chat', image: 'image', transcription: 'speech-to-text', speech: 'text-to-speech', embedding: 'embedding', voice: 'voice-chat', video: 'video' };
 const word = computed(() => KIND_WORD[props.kind] || props.kind);
 const models = computed(() => modelsOf(props.kind));
 const current = computed(() => models.value.find((m) => m.id === props.modelValue));
@@ -27,7 +27,7 @@ const downloaded = computed(() => {
   const listed = new Set((store.status?.models || []).map((m) => m.source));
   const out = [];
   for (const e of cached.value) {
-    if (e.kind !== props.kind || !e.usable) continue;
+    if (!e.usable || !serves(e, props.kind)) continue;
     for (const s of e.specs) if (!listed.has(s)) out.push({ spec: s, bytes: e.bytes, name: e.name });
   }
   return out;

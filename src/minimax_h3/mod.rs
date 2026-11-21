@@ -15,6 +15,8 @@
 
 pub mod audio_vae;
 pub mod dit;
+#[cfg(feature = "media")]
+pub mod encode;
 pub mod lora;
 pub mod ref2va;
 pub mod vae;
@@ -39,6 +41,57 @@ pub fn is_h3_image(dir: &Path) -> bool {
         .ok()
         .and_then(|v| v.get("_class_name").and_then(|c| c.as_str()).map(|c| c == "MiniMaxH3ImagePipeline"))
         .unwrap_or(false)
+}
+
+/// Whether a checkpoint folder holds its weights (not only its configuration).
+fn has_weights(dir: &Path) -> bool {
+    if dir.join("model.safetensors").exists() {
+        return true;
+    }
+    let Ok(b) = crate::fsx::read(&dir.join("model.safetensors.index.json")) else {
+        return false;
+    };
+    serde_json::from_slice::<serde_json::Value>(&b).is_ok_and(|v| {
+        v["weight_map"]
+            .as_object()
+            .is_some_and(|m| m.values().filter_map(|f| f.as_str()).all(|f| dir.join(f).exists()))
+    })
+}
+
+/// MiniMax-H3's text encoder (Qwen3-VL-32B, `text_encoder/` of `MiniMaxAI/MiniMax-H3`), which
+/// MiniMax-H3-Image and the video pipeline both read: `OXINFER_H3_TEXT_ENCODER`, else
+/// `text_encoder/` (or `FL2VA/text_encoder/`) of `model` (or of the release above a `FL2VA/` /
+/// `Ref2VA/` folder), else of `MiniMaxAI/MiniMax-H3` in the oxinfer download cache (`cache_dir`,
+/// or the default one) or in the Hugging Face cache.
+pub fn find_text_encoder(model: &Path, cache_dir: Option<&Path>) -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("OXINFER_H3_TEXT_ENCODER") {
+        return Ok(PathBuf::from(p));
+    }
+    let mut roots = vec![model.to_path_buf()];
+    if let Some(parent) = model.parent().filter(|_| model.ends_with("Ref2VA") || model.ends_with("FL2VA")) {
+        roots.push(parent.to_path_buf());
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut caches: Vec<PathBuf> = cache_dir.map(Path::to_path_buf).into_iter().collect();
+    caches.push(PathBuf::from(format!("{home}/.cache/oxinfer/hub")));
+    caches.push(PathBuf::from(format!("{home}/.cache/huggingface/hub")));
+    for cache in caches {
+        roots.push(cache.join("MiniMaxAI--MiniMax-H3"));
+        if let Ok(rd) = std::fs::read_dir(cache.join("models--MiniMaxAI--MiniMax-H3/snapshots")) {
+            roots.extend(rd.flatten().map(|e| e.path()));
+        }
+    }
+    for r in &roots {
+        for sub in ["text_encoder", "FL2VA/text_encoder"] {
+            let p = r.join(sub);
+            if p.join("config.json").exists() && has_weights(&p) {
+                return Ok(p);
+            }
+        }
+    }
+    bail!(
+        "MiniMax-H3's text encoder was not found: download it (`hf download MiniMaxAI/MiniMax-H3 --include 'text_encoder/*'`), set OXINFER_H3_TEXT_ENCODER, or name it (the text_encoder option)"
+    )
 }
 
 /// What [`Pipeline::generate`] needs.

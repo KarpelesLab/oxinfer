@@ -995,3 +995,391 @@ fn prompt_cache_across_restarts() {
     s.stop().unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn b64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let (mut acc, mut bits) = (0u32, 0);
+    for c in s.bytes().filter(|&c| c != b'=') {
+        acc = acc << 6 | B64.iter().position(|&x| x == c)? as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+fn b64_encode(b: &[u8]) -> String {
+    let mut s = String::new();
+    for c in b.chunks(3) {
+        let n = c.iter().enumerate().fold(0u32, |a, (i, &x)| a | (x as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            s.push(if i <= c.len() {
+                B64[(n >> (18 - 6 * i) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    s
+}
+
+/// A folder with only a `model_index.json` / `config.json`: detected as a kind, fails to load.
+fn fake_model(tag: &str, file: &str, body: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("oxinfer-fake-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join(file), body).unwrap();
+    d
+}
+
+fn wait_video(addr: SocketAddr, id: &str, until: &[&str]) -> Value {
+    for _ in 0..600 {
+        let (st, body) = request(addr, "GET", &format!("/v1/videos/{id}"), "");
+        assert_eq!(st, 200, "{body}");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        if until.contains(&v["status"].as_str().unwrap()) {
+            return v;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("video {id} did not reach {until:?}");
+}
+
+#[test]
+fn videos_routing_and_jobs() {
+    let h3 = fake_model("h3", "model_index.json", r#"{"_class_name": "MiniMaxH3ModularPipeline"}"#);
+    let chat = fake_model("chat", "config.json", r#"{"model_type": "llama", "vocab_size": 128256}"#);
+    let s = serve(&format!("model=v={}; model=c={}", h3.display(), chat.display()));
+    let a = s.addr();
+    let (st, body) = request(a, "GET", "/v1/models/v", "");
+    assert_eq!(
+        (st, serde_json::from_str::<Value>(&body).unwrap()["kind"].clone()),
+        (200, json!("video"))
+    );
+    // Checked before a job is made.
+    for (req, code, param) in [
+        (json!({"model": "v"}), 400, "prompt"),
+        (json!({"prompt": "x"}), 400, "model"),
+        (json!({"model": "nope", "prompt": "x"}), 404, "model"),
+        (json!({"model": "c", "prompt": "x"}), 400, "model"),
+        (json!({"model": "v", "prompt": "x", "size": "100x100"}), 400, "size"),
+        (json!({"model": "v", "prompt": "x", "seconds": 0}), 400, "seconds"),
+        (json!({"model": "v", "prompt": "x", "steps": 1}), 400, "steps"),
+        (
+            json!({"model": "v", "prompt": "x", "first_frame": "/etc/passwd"}),
+            400,
+            "first_frame",
+        ),
+    ] {
+        let (st, body) = request(a, "POST", "/v1/videos", &req.to_string());
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(st, code, "{req}: {body}");
+        if param != "first_frame" {
+            assert_eq!(v["error"]["param"], param, "{req}: {body}");
+        }
+    }
+    // A job: created at once, then failing to load the model (the folder has no weights).
+    let (st, body) = request(
+        a,
+        "POST",
+        "/v1/videos",
+        &json!({"model": "v", "prompt": "a fox", "seconds": "5", "size": "448x256"}).to_string(),
+    );
+    assert_eq!(st, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        (v["object"].as_str(), v["status"].as_str(), v["size"].as_str()),
+        (Some("video"), Some("queued"), Some("448x256"))
+    );
+    let id = v["id"].as_str().unwrap().to_string();
+    assert!(id.starts_with("video_"));
+    let done = wait_video(a, &id, &["failed", "completed"]);
+    assert_eq!(done["status"], "failed", "{done}");
+    assert!(done["error"]["message"].as_str().unwrap().contains("v"), "{done}");
+    let (st, body) = request(a, "GET", &format!("/v1/videos/{id}/content?variant=video"), "");
+    assert_eq!(st, 409, "{body}");
+    // The multipart form (OpenAI's shape) and the alias route.
+    let form = "--B\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nv\r\n--B\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nwaves\r\n--B--\r\n";
+    let (st, body) = request_with(
+        a,
+        "POST",
+        "/v1/videos/generations",
+        &["Host: localhost", "Content-Type: multipart/form-data; boundary=B"],
+        form,
+    );
+    assert_eq!(st, 200, "{body}");
+    let id2 = serde_json::from_str::<Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+    let (st, body) = request(a, "POST", &format!("/v1/videos/{id2}/cancel"), "");
+    assert_eq!(st, 200, "{body}");
+    let v = wait_video(a, &id2, &["failed", "cancelled", "completed"]);
+    assert_ne!(v["status"], "completed");
+    // The list, newest first, then deletion.
+    let (st, body) = request(a, "GET", "/v1/videos?limit=10", "");
+    let list: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!((st, list["object"].as_str()), (200, Some("list")));
+    assert_eq!(list["data"][0]["id"], id2.as_str());
+    assert_eq!(list["data"][1]["id"], id.as_str());
+    let (st, body) = request(a, "GET", "/v1/videos?limit=1", "");
+    assert_eq!(
+        (st, serde_json::from_str::<Value>(&body).unwrap()["has_more"].clone()),
+        (200, json!(true))
+    );
+    let (st, body) = request(a, "GET", &format!("/v1/videos/{id}/events"), "");
+    assert_eq!(st, 200);
+    assert!(body.contains("event: video") && body.contains("\"failed\""), "{body}");
+    let (st, body) = request(a, "DELETE", &format!("/v1/videos/{id}"), "");
+    assert_eq!(
+        (st, serde_json::from_str::<Value>(&body).unwrap()["deleted"].clone()),
+        (200, json!(true))
+    );
+    let (st, _) = request(a, "GET", &format!("/v1/videos/{id}"), "");
+    assert_eq!(st, 404);
+    let (st, _) = request(a, "PUT", "/v1/videos", "");
+    assert_eq!(st, 405);
+    s.stop().unwrap();
+    for d in [h3, chat] {
+        std::fs::remove_dir_all(d).ok();
+    }
+}
+
+#[test]
+fn voices_spoken_chat_and_image_streams() {
+    let chat = fake_model("chat2", "config.json", r#"{"model_type": "llama", "vocab_size": 128256}"#);
+    let tts = fake_model("tts", "config.json", r#"{"model_type": "llama", "vocab_size": 156940}"#);
+    let sd = fake_model("sd", "model_index.json", r#"{"_class_name": "StableDiffusionPipeline"}"#);
+    let s = serve(&format!(
+        "model=c={}; model=t={}; model=sd={}",
+        chat.display(),
+        tts.display(),
+        sd.display()
+    ));
+    let a = s.addr();
+    let (st, body) = request(a, "GET", "/v1/audio/voices", "");
+    assert_eq!(st, 400, "{body}");
+    let (st, body) = request(a, "GET", "/v1/audio/voices?model=c", "");
+    assert_eq!(st, 400, "{body}");
+    assert!(body.contains("not a speech model"), "{body}");
+    // A speech model is loaded to list its voices: this one has no weights.
+    let (st, body) = request(a, "GET", "/v1/audio/voices?model=t", "");
+    assert_eq!(st, 500, "{body}");
+    // Audio out from a text-only model, a format the server does not write, a streamed WAV.
+    let msgs = json!([{"role": "user", "content": "hi"}]);
+    for (extra, param) in [
+        (json!({"model": "c", "audio": {"format": "wav"}}), "modalities"),
+        (json!({"model": "c", "audio": {"format": "mp3"}}), "audio"),
+        (json!({"model": "c", "stream": true, "audio": {"format": "wav"}}), "audio"),
+        (json!({"model": "t"}), "model"),
+    ] {
+        let mut req = extra.clone();
+        req["messages"] = msgs.clone();
+        req["modalities"] = json!(["text", "audio"]);
+        let (st, body) = request(a, "POST", "/v1/chat/completions", &req.to_string());
+        let v: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(st, if param == "model" { 500 } else { 400 }, "{req}: {body}");
+        if st == 400 {
+            assert_eq!(v["error"]["param"], param, "{req}: {body}");
+        }
+    }
+    // An image stream: the error comes as an event once the stream has started.
+    let (st, body) = request(
+        a,
+        "POST",
+        "/v1/images/generations",
+        &json!({"model": "sd", "prompt": "x", "stream": true}).to_string(),
+    );
+    assert_eq!(st, 200, "{body}");
+    assert!(
+        body.contains("event: image_generation.progress") && body.contains("\"stage\":\"loading\""),
+        "{body}"
+    );
+    assert!(body.contains("event: error"), "{body}");
+    let (st, _) = request(
+        a,
+        "POST",
+        "/v1/images/generations",
+        &json!({"model": "sd", "prompt": "x", "stream": "maybe"}).to_string(),
+    );
+    assert_eq!(st, 400);
+    let (st, _) = request(
+        a,
+        "POST",
+        "/v1/images/generations",
+        &json!({"model": "nope", "prompt": "x", "stream": true}).to_string(),
+    );
+    assert_eq!(st, 404);
+    s.stop().unwrap();
+    for d in [chat, tts, sd] {
+        std::fs::remove_dir_all(d).ok();
+    }
+}
+
+/// The SSE events of a body: (event name, JSON data).
+fn events(body: &str) -> Vec<(String, Value)> {
+    body.split("\n\n")
+        .filter_map(|ev| {
+            let name = ev.lines().find_map(|l| l.strip_prefix("event: "))?.to_string();
+            let data = ev.lines().find_map(|l| l.strip_prefix("data: "))?;
+            Some((name, serde_json::from_str(data).ok()?))
+        })
+        .collect()
+}
+
+#[test]
+fn sd3_images_with_step_progress() {
+    let dir = std::env::temp_dir().join(format!("oxinfer-sd3-tiny-{}", std::process::id()));
+    oxinfer::sd3::tiny::write_tiny_release(&dir).unwrap();
+    let s = serve(&format!("model=sd3={}", dir.display()));
+    let a = s.addr();
+    let (_, body) = request(a, "GET", "/v1/models/sd3", "");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["kind"], "image", "{body}");
+    // The plain request and response are as before.
+    let req = json!({"model": "sd3", "prompt": "a red fox", "size": "64x64", "steps": 3, "seed": 1});
+    let (st, body) = request(a, "POST", "/v1/images/generations", &req.to_string());
+    assert_eq!(st, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let png = b64_decode(v["data"][0]["b64_json"].as_str().unwrap()).unwrap();
+    assert!(png.starts_with(b"\x89PNG"));
+    // Streamed: one progress event per step, then the image.
+    let mut sreq = req.clone();
+    sreq["stream"] = json!(true);
+    sreq["n"] = json!(2);
+    let (st, body) = request(a, "POST", "/v1/images/generations", &sreq.to_string());
+    assert_eq!(st, 200, "{body}");
+    let ev = events(&body);
+    let steps: Vec<(u64, u64, u64)> = ev
+        .iter()
+        .filter(|(n, v)| n == "image_generation.progress" && v["stage"] == "generating")
+        .map(|(_, v)| {
+            (
+                v["image_index"].as_u64().unwrap(),
+                v["step"].as_u64().unwrap(),
+                v["steps"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(steps, [(0, 1, 3), (0, 2, 3), (0, 3, 3), (1, 1, 3), (1, 2, 3), (1, 3, 3)], "{body}");
+    let done: Vec<&Value> = ev
+        .iter()
+        .filter(|(n, _)| n == "image_generation.completed")
+        .map(|(_, v)| v)
+        .collect();
+    assert_eq!(done.len(), 2);
+    assert_eq!(done[0]["size"], "64x64");
+    assert_eq!(
+        b64_decode(done[0]["b64_json"].as_str().unwrap()).unwrap(),
+        png,
+        "same seed, same image"
+    );
+    // An edit (image to image), streamed as image_edit events.
+    let form = "--B\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nsd3\r\n--B\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nwinter\r\n--B\r\nContent-Disposition: form-data; name=\"stream\"\r\n\r\ntrue\r\n--B\r\nContent-Disposition: form-data; name=\"steps\"\r\n\r\n5\r\n--B\r\nContent-Disposition: form-data; name=\"image\"; filename=\"in.png\"\r\nContent-Type: image/png\r\n\r\n";
+    let mut raw = form.as_bytes().to_vec();
+    raw.extend_from_slice(&png);
+    raw.extend_from_slice(b"\r\n--B--\r\n");
+    let mut c = std::net::TcpStream::connect(a).unwrap();
+    write!(
+        c,
+        "POST /v1/images/edits HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary=B\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        raw.len()
+    )
+    .unwrap();
+    c.write_all(&raw).unwrap();
+    let mut out = Vec::new();
+    c.read_to_end(&mut out).unwrap();
+    let text = String::from_utf8_lossy(&out);
+    assert!(
+        text.contains("event: image_edit.progress") && text.contains("event: image_edit.completed"),
+        "{text}"
+    );
+    s.stop().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Decodes a WAV body: (sample rate, samples).
+fn wav(bytes: &[u8]) -> (u32, usize) {
+    assert_eq!(&bytes[..4], b"RIFF");
+    let rate = u32::from_le_bytes(bytes[24..28].try_into().unwrap());
+    (rate, (bytes.len() - 44) / 2)
+}
+
+#[test]
+#[ignore = "fetches LiquidAI/LFM3-Omni-2B (4.5 GB)"]
+fn lfm3_omni_speech_and_voice_chat() {
+    let m = env("OXINFER_E2E_OMNI", "LiquidAI/LFM3-Omni-2B");
+    let s = serve(&format!("model=omni={m}"));
+    let a = s.addr();
+    let (st, body) = request(a, "GET", "/v1/audio/voices?model=omni", "");
+    assert_eq!(st, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!((v["default"].as_str(), v["data"].as_array().unwrap().len()), (Some("female"), 2));
+    // Text to speech through /v1/audio/speech.
+    let req = json!({"model": "omni", "input": "Hello from the server.", "voice": "male", "seed": 3});
+    let mut c = std::net::TcpStream::connect(a).unwrap();
+    let b = req.to_string();
+    write!(c, "POST /v1/audio/speech HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len()).unwrap();
+    let mut raw = Vec::new();
+    c.read_to_end(&mut raw).unwrap();
+    let at = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    assert!(String::from_utf8_lossy(&raw[..at]).contains(" 200 "));
+    let (rate, n) = wav(&raw[at..]);
+    assert_eq!(rate, 24000);
+    assert!(n > 24000 / 2, "{n} samples");
+    // A voice chat: the answer as text and speech.
+    let req = json!({"model": "omni", "modalities": ["text", "audio"], "audio": {"voice": "alloy", "format": "wav"}, "seed": 1,
+        "messages": [{"role": "user", "content": "What is the capital of France? Answer in one short sentence."}]});
+    let (st, body) = request(a, "POST", "/v1/chat/completions", &req.to_string());
+    assert_eq!(st, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let audio = &v["choices"][0]["message"]["audio"];
+    eprintln!("transcript: {}", audio["transcript"]);
+    assert!(audio["transcript"].as_str().unwrap().to_lowercase().contains("paris"), "{body}");
+    let (rate, n) = wav(&b64_decode(audio["data"].as_str().unwrap()).unwrap());
+    assert!(rate == 24000 && n > 24000, "{n} samples");
+    // Streamed: transcript pieces, then PCM16.
+    let mut sreq = req.clone();
+    sreq["stream"] = json!(true);
+    sreq["audio"]["format"] = json!("pcm16");
+    let (st, body) = request(a, "POST", "/v1/chat/completions", &sreq.to_string());
+    assert_eq!(st, 200, "{body}");
+    assert!(
+        body.contains("\"transcript\"") && body.contains("\"data\"") && body.ends_with("data: [DONE]\n\n"),
+        "{body}"
+    );
+    s.stop().unwrap();
+}
+
+#[test]
+#[ignore = "fetches higurashi-ai/Haru-4B (10.5 GB) and LiquidAI/LFM3-Omni-2B (for a recording)"]
+fn haru_speech_to_speech() {
+    let haru = env("OXINFER_E2E_HARU", "higurashi-ai/Haru-4B");
+    let omni = env("OXINFER_E2E_OMNI", "LiquidAI/LFM3-Omni-2B");
+    let s = serve(&format!("model=haru={haru}; model=omni={omni}"));
+    let a = s.addr();
+    // A recording of a question, spoken by LFM3-Omni.
+    let req = json!({"model": "omni", "input": "Hi! How are you doing today?", "seed": 2});
+    let mut c = std::net::TcpStream::connect(a).unwrap();
+    let b = req.to_string();
+    write!(c, "POST /v1/audio/speech HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}", b.len()).unwrap();
+    let mut raw = Vec::new();
+    c.read_to_end(&mut raw).unwrap();
+    let at = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let question = &raw[at..];
+    let (st, body) = request(a, "GET", "/v1/audio/voices?model=haru", "");
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["family"], "haru");
+    let req = json!({"model": "haru", "modalities": ["text", "audio"], "seed": 1, "max_reply_seconds": 8,
+        "messages": [{"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": b64_encode(question), "format": "wav"}}]}]});
+    let (st, body) = request(a, "POST", "/v1/chat/completions", &req.to_string());
+    assert_eq!(st, 200, "{}", &body[..body.len().min(400)]);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let audio = &v["choices"][0]["message"]["audio"];
+    eprintln!("haru: {} ({}s)", audio["transcript"], audio["duration"]);
+    let (rate, n) = wav(&b64_decode(audio["data"].as_str().unwrap()).unwrap());
+    assert!(rate == 24000 && n > 2400, "{n} samples");
+    // Text to speech is not Haru's.
+    let (st, body) = request(a, "POST", "/v1/audio/speech", &json!({"model": "haru", "input": "hi"}).to_string());
+    assert_eq!(st, 400, "{body}");
+    s.stop().unwrap();
+}

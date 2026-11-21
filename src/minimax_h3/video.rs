@@ -365,11 +365,27 @@ pub fn denoise_layout(
     dit: &Dit,
     text: &[f32],
     lay: &Layout,
+    video: Vec<f32>,
+    audio: Vec<f32>,
+    sig: (&[f32], &[f32]),
+    progress: &mut dyn FnMut(usize, usize),
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    denoise_cancellable(dit, text, lay, video, audio, sig, progress, None)
+}
+
+/// [`denoise_layout`] that stops with an error between two steps once `cancel` is set.
+#[allow(clippy::too_many_arguments)]
+pub fn denoise_cancellable(
+    dit: &Dit,
+    text: &[f32],
+    lay: &Layout,
     mut video: Vec<f32>,
     mut audio: Vec<f32>,
     sig: (&[f32], &[f32]),
     progress: &mut dyn FnMut(usize, usize),
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
+    let cancelled = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed));
     let cfg = &dit.cfg;
     let emb = dit.embed_text(text);
     let (pd, ac) = (cfg.patch_dim(), cfg.audio_channels);
@@ -378,6 +394,9 @@ pub fn denoise_layout(
     let cond_idx = &lay.video_index[..lay.n_cond];
     let cond_audio = &lay.audio_index[..lay.n_cond_audio];
     for i in 0..steps {
+        if cancelled() {
+            bail!("cancelled");
+        }
         let (tv, ta) = (1.0 - sv[i], 1.0 - sa[i]);
         // The distinct timesteps, sorted, and every row's index into them (text rows: the video's).
         let tc = tv.max(KEYFRAME_T);
@@ -489,9 +508,17 @@ pub struct VideoParams {
     /// missing, read instead of denoising when present (the two VAEs can then be run again, or
     /// other ones, on the same rows).
     pub latents: Option<PathBuf>,
+    /// Set from another thread to stop the generation between two denoising steps (it then
+    /// returns an error saying "cancelled").
+    pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl VideoParams {
+    /// Whether [`VideoParams::cancel`] is set.
+    pub fn cancelled(&self) -> bool {
+        self.cancel.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     pub fn new(prompt: &str) -> Self {
         Self {
             prompt: prompt.to_string(),
@@ -504,6 +531,7 @@ impl VideoParams {
             short_edge: 768,
             max_pixels: 768 * 1344,
             latents: None,
+            cancel: None,
         }
     }
 }
@@ -1052,7 +1080,11 @@ impl VideoPipeline {
         let audio = rng.normals(g.n_audio * AUDIO_CHANNELS * cfg.audio_channels);
         let (sv, sa) = (sigmas(p.steps, self.shifts.0), sigmas(p.steps, self.shifts.1));
         let t1 = Instant::now();
-        let (video, audio) = denoise(&self.dit, &cond.text, &cond.tags, video, audio, g, &anchors, (&sv, &sa), progress)?;
+        let lay = layout(&cond.tags, g.lt, g.lh, g.lw, g.n_audio, cfg.patch[1], &anchors);
+        let (video, audio) = denoise_cancellable(&self.dit, &cond.text, &lay, video, audio, (&sv, &sa), progress, p.cancel.as_deref())?;
+        if p.cancelled() {
+            bail!("cancelled");
+        }
         let t_dit = t1.elapsed().as_secs_f64();
         if let Some(f) = &p.latents {
             write_latents(f, g, &video[n_cond_vals..], &audio)?;
@@ -1071,6 +1103,90 @@ impl VideoPipeline {
         );
         Ok(out)
     }
+}
+
+/// A MiniMax-H3 part named by an option: a local path, `org/name/path/in/repo.safetensors` (or
+/// `.gguf`), or a repository id.
+fn video_part(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
+    let p = Path::new(spec);
+    if p.exists() {
+        return Ok(p.to_path_buf());
+    }
+    if spec.ends_with(".safetensors") || spec.ends_with(".gguf") {
+        return crate::engine::resolve_file(spec, cache_dir);
+    }
+    crate::engine::resolve_model(spec, cache_dir)
+}
+
+/// Loads a MiniMax-H3 video model (a release folder, a single-file transformer, or a repo id)
+/// with the server's and the C API's options: `text_encoder`, `transformer`, `vae`,
+/// `audio_vae` (parts replacing the folder's), `quant` / `text_quant` (the text encoder's
+/// precision: bf16 or q8), `lora` (`FILE[:SCALE]`, repeatable; a turbo LoRA sets the step count
+/// and the shifts), `shift`, `audio_shift`. Returns the pipeline and the step count a turbo LoRA
+/// is distilled for.
+pub fn load_with_options(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Path>) -> Result<(VideoPipeline, Option<usize>)> {
+    use crate::model::Quant;
+    let path = Path::new(src);
+    let model = if path.exists() {
+        path.to_path_buf()
+    } else {
+        crate::engine::resolve_model(src, cache_dir)?
+    };
+    let single = model.is_file();
+    let mut s = Sources {
+        dir: (!single).then(|| model.clone()),
+        transformer: single.then(|| model.clone()),
+        text_quant: Some(Quant::Bf16),
+        ..Default::default()
+    };
+    let (mut te, mut loras, mut shift, mut audio_shift) = (None, Vec::new(), None, None);
+    let num = |k: &str, v: &str| -> Result<f32> { v.parse().with_context(|| format!("{k}: not a number: {v:?}")) };
+    for (k, v) in opts {
+        match *k {
+            "text_encoder" => te = Some(video_part(v, cache_dir)?),
+            "transformer" => s.transformer = Some(video_part(v, cache_dir)?),
+            "vae" => s.vae = Some(video_part(v, cache_dir)?),
+            "audio_vae" => s.audio_vae = Some(video_part(v, cache_dir)?),
+            "quant" | "text_quant" => {
+                // Q4 moves the text encoder's hidden states too far (as for Qwen-Image's).
+                s.text_quant = Some(match Quant::parse(v).with_context(|| format!("{k}: {v:?} (bf16, q8)"))? {
+                    Quant::Q4 => Quant::Q8,
+                    q => q,
+                })
+            }
+            "lora" => {
+                let mut l = crate::minimax_h3::lora::LoraSpec::parse(v)?;
+                l.path = video_part(&l.path.to_string_lossy(), cache_dir)?;
+                loras.push(l);
+            }
+            "shift" => shift = Some(num(k, v)?),
+            "audio_shift" => audio_shift = Some(num(k, v)?),
+            k => bail!("unknown MiniMax-H3 option {k:?} (text_encoder, transformer, vae, audio_vae, quant, lora, shift, audio_shift)"),
+        }
+    }
+    if single && s.vae.is_none() {
+        bail!("{src} is a single-file transformer: name the video VAE with the vae option");
+    }
+    s.text_encoder = match te {
+        Some(t) => t,
+        None => crate::minimax_h3::find_text_encoder(&model, cache_dir)?,
+    };
+    let mut pipe = VideoPipeline::load_from(&s)?;
+    for line in pipe.apply_loras(&loras)? {
+        eprintln!("{line}");
+    }
+    let mut steps = None;
+    if let Some(t) = loras.iter().find_map(|l| crate::minimax_h3::lora::turbo_settings(&l.path)) {
+        steps = Some(t.forwards + 1);
+        pipe.shifts = (t.video_shift, t.audio_shift);
+    }
+    if let Some(v) = shift {
+        pipe.shifts.0 = v;
+    }
+    if let Some(v) = audio_shift {
+        pipe.shifts.1 = v;
+    }
+    Ok((pipe, steps))
 }
 
 #[cfg(test)]

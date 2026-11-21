@@ -37,7 +37,7 @@ use super::audio_vae::AudioEncoder;
 use super::dit::{TAG_AUDIO, TAG_IMAGE, TAG_TEXT};
 use super::video::{
     AUDIO_CHANNELS, Conditioning, FPS, FRAME_RESCALE, FRAMES_PER_LATENT, Geometry, Image, KEYFRAME_T, Layout, Video, VideoParams,
-    VideoPipeline, denoise_layout, patchify_video, read_latents, resolve_canvas, sigmas, write_latents,
+    VideoPipeline, patchify_video, read_latents, resolve_canvas, sigmas, write_latents,
 };
 use crate::clock::Instant;
 use crate::sd::ops::Rng;
@@ -537,7 +537,11 @@ impl VideoPipeline {
         );
         let (sv, sa) = (sigmas(p.steps, self.shifts.0), sigmas(p.steps, self.shifts.1));
         let t2 = Instant::now();
-        let (video, audio) = denoise_layout(&self.dit, &cond.text, &lay, video, audio, (&sv, &sa), progress)?;
+        let (video, audio) =
+            super::video::denoise_cancellable(&self.dit, &cond.text, &lay, video, audio, (&sv, &sa), progress, p.cancel.as_deref())?;
+        if p.cancelled() {
+            bail!("cancelled");
+        }
         let t_dit = t2.elapsed().as_secs_f64();
         let (video, audio) = (&video[n_cond_vals..], &audio[n_cond_audio_vals..]);
         if let Some(f) = &p.latents {

@@ -32,6 +32,7 @@
 
 pub mod codec;
 pub mod head;
+pub mod turn;
 
 use crate::config::QwenConfig;
 use crate::model::Quant;

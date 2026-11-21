@@ -133,7 +133,7 @@ fn with_cors(api: &Api, mut r: Response) -> Response {
     if let Some(origin) = &api.options().cors {
         r = r
             .header("Access-Control-Allow-Origin", origin.clone())
-            .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            .header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
             .header(
                 "Access-Control-Allow-Headers",
                 "Authorization, Content-Type, X-Api-Key, Anthropic-Version, Anthropic-Beta",
@@ -152,7 +152,11 @@ fn handle(api: &Arc<Api>, req: &Request) -> Response {
         return with_cors(api, Response::new(status(204)));
     }
     let h = req.headers();
-    let mut r = ApiRequest::new(&method, req.path(), h.get("content-type"), req.body().to_vec());
+    let full = match req.query() {
+        Some(q) if !q.is_empty() => format!("{}?{q}", req.path()),
+        _ => req.path().to_string(),
+    };
+    let mut r = ApiRequest::new(&method, &full, h.get("content-type"), req.body().to_vec());
     // Anthropic's clients send the key as x-api-key.
     r.authorization = h
         .get("authorization")

@@ -27,6 +27,7 @@ pub mod audio;
 pub(crate) mod blocks;
 pub mod codec;
 pub mod vision;
+pub mod voice;
 
 use crate::kernels::*;
 use crate::model::{Lin, Quant, linear, load_lin};

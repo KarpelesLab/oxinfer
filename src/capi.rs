@@ -2382,6 +2382,388 @@ pub unsafe extern "C" fn oxi_bagel_understand_file(
     })
 }
 
+// ---- spoken replies (LFM3-Omni, Haru) and video (MiniMax-H3) -------------------------------
+
+/// A JSON options object (NULL or empty: `{}`).
+unsafe fn json_options(p: *const c_char, what: &str) -> Result<serde_json::Value> {
+    match unsafe { opt_str_arg(p, what) }? {
+        None => Ok(serde_json::json!({})),
+        Some(s) if s.trim().is_empty() => Ok(serde_json::json!({})),
+        Some(s) => {
+            let v: serde_json::Value = serde_json::from_str(s).with_context(|| format!("{what} is not JSON"))?;
+            if !v.is_object() {
+                bail!("{what}: expected a JSON object");
+            }
+            Ok(v)
+        }
+    }
+}
+
+/// `key=value` options separated by `;` or newlines.
+fn kv_options(s: Option<&str>) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for item in s.unwrap_or("").split(['\n', ';']) {
+        let item = item.trim();
+        if item.is_empty() || item.starts_with('#') {
+            continue;
+        }
+        let (k, v) = item.split_once('=').with_context(|| format!("option {item:?} is not key=value"))?;
+        out.push((k.trim().to_string(), v.trim().to_string()));
+    }
+    Ok(out)
+}
+
+/// A spoken reply of LFM3-Omni (`Engine::speak_omni`): `text` with `media_json` (attachments, the
+/// format of oxi_engine_send_media). `options_json`: `mode` (`interleaved`, a voice chat: the
+/// default; `audio`, text to speech: `text` is what to say), `system`, `voice` (`female` / `male`,
+/// text to speech), `temperature`, `top_k`, `repetition_penalty`, `seed`, `max_tokens`. The text
+/// goes to `cb` as it grows, the audio to `on_audio` once decoded (24 kHz mono). Returns 0, or -1.
+#[cfg(not(target_arch = "wasm32"))]
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn oxi_engine_speak_omni(
+    e: *mut OxiEngine,
+    text: *const c_char,
+    media_json: *const c_char,
+    options_json: *const c_char,
+    cb: OxiTokenFn,
+    on_audio: OxiAudioFn,
+    user: *mut c_void,
+) -> c_int {
+    guard(-1, || {
+        let e = unsafe { engine(e) }?;
+        let text = unsafe { str_arg(text, "text") }?;
+        let media = match unsafe { opt_str_arg(media_json, "media_json") }? {
+            None => Attachments::default(),
+            Some(j) => Attachments::from_json(&serde_json::from_str(j).context("media_json is not JSON")?)?,
+        };
+        let o = unsafe { json_options(options_json, "options_json") }?;
+        let mode = match o["mode"].as_str() {
+            None | Some("interleaved") => crate::lfm3_omni::Mode::Interleaved,
+            Some("audio") => crate::lfm3_omni::Mode::Audio,
+            Some(m) => bail!("mode {m:?}: interleaved or audio"),
+        };
+        let mut g = lock(e);
+        let mut sp = crate::lfm3_omni::SpeechOptions::load(&g.info().path);
+        if let Some(v) = o["temperature"].as_f64() {
+            sp.temperature = v as f32;
+        }
+        if let Some(v) = o["top_k"].as_u64() {
+            sp.top_k = v as usize;
+        }
+        if let Some(v) = o["repetition_penalty"].as_f64() {
+            sp.repetition_penalty = v as f32;
+        }
+        if let Some(v) = o["seed"].as_u64() {
+            sp.seed = v;
+        }
+        if let Some(v) = o["max_tokens"].as_u64() {
+            sp.max_new = (v as usize).max(1);
+        }
+        let mut so = crate::lfm3_omni::voice::SpokenOptions::new(mode);
+        so.system = o["system"].as_str().map(str::to_string);
+        so.voice = o["voice"].as_str().map(str::to_string);
+        so.speech = Some(sp);
+        let r = g.speak_omni(text, &media, &so, &mut |piece| {
+            if let Some(f) = cb {
+                unsafe { f(user, piece.as_ptr() as *const c_char, piece.len(), 0) };
+            }
+        })?;
+        if let Some(f) = on_audio {
+            unsafe { f(user, r.samples.as_ptr(), r.samples.len(), 0, r.sample_rate as c_int) };
+        }
+        Ok(0)
+    })
+}
+
+/// A Haru handle (speech to speech).
+#[cfg(not(target_arch = "wasm32"))]
+pub struct OxiHaru {
+    haru: Mutex<crate::haru::Haru>,
+}
+
+/// Loads Haru (a folder or `higurashi-ai/Haru-4B`); `options`: `quant` (bf16, q8, q4), `mmap`,
+/// `threads`, `cache_dir`.
+#[cfg(not(target_arch = "wasm32"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_haru_load(
+    model: *const c_char,
+    options: *const c_char,
+    progress: OxiProgressFn,
+    user: *mut c_void,
+) -> *mut OxiHaru {
+    guard(std::ptr::null_mut(), || {
+        let model = unsafe { str_arg(model, "model") }?;
+        let mut o = crate::haru::HaruOptions::default();
+        for (k, v) in kv_options(unsafe { opt_str_arg(options, "options") }?)? {
+            match k.as_str() {
+                "quant" => o.quant = crate::model::Quant::parse(&v).with_context(|| format!("quant: {v:?} (bf16, q8, q4)"))?,
+                "mmap" => o.mmap = matches!(v.as_str(), "1" | "true" | "yes" | "on"),
+                "threads" => o.threads = Some(v.parse().with_context(|| format!("threads: {v:?}"))?),
+                "cache_dir" => o.cache_dir = Some(v.into()),
+                k => bail!("unknown Haru option {k:?} (quant, mmap, threads, cache_dir)"),
+            }
+        }
+        let h = with_progress(progress, user, || crate::haru::Haru::load(model, &o))?;
+        Ok(Box::into_raw(Box::new(OxiHaru { haru: Mutex::new(h) })))
+    })
+}
+
+/// One turn with Haru (`Haru::respond`): `n` mono samples of the user at `sample_rate` in, the
+/// answer out: its text to `cb` and its audio (24 kHz) to `on_audio`, frame by frame as made
+/// (either returning non-zero stops). `options_json`: `system` (the character card), `reference`
+/// (a voice clip file), `temperature`, `top_k`, `top_p`, `guidance`, `seed`, `max_reply_seconds`,
+/// `end_silence_seconds`, `include_overlap`. Returns 0, or -1.
+#[cfg(not(target_arch = "wasm32"))]
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn oxi_haru_respond(
+    h: *mut OxiHaru,
+    samples: *const f32,
+    n: usize,
+    sample_rate: c_int,
+    options_json: *const c_char,
+    cb: OxiTokenFn,
+    on_audio: OxiAudioFn,
+    user: *mut c_void,
+) -> c_int {
+    guard(-1, || {
+        let h = unsafe { h.as_ref() }.context("haru is NULL")?;
+        if samples.is_null() || n == 0 {
+            bail!("no samples");
+        }
+        if sample_rate <= 0 {
+            bail!("sample_rate must be positive");
+        }
+        let o = unsafe { json_options(options_json, "options_json") }?;
+        let haru = h.haru.lock().unwrap_or_else(|p| p.into_inner());
+        let rate = haru.info().sample_rate;
+        let pcm = unsafe { std::slice::from_raw_parts(samples, n) };
+        let user_audio = crate::audio::resample(pcm, sample_rate as usize, rate as usize);
+        let mut t = crate::haru::turn::TurnOptions {
+            system: o["system"].as_str().unwrap_or("").to_string(),
+            ..Default::default()
+        };
+        if let Some(r) = o["reference"].as_str() {
+            t.reference = Some(haru.load_reference(std::path::Path::new(r))?);
+        }
+        let f = |k: &str| o[k].as_f64().map(|v| v as f32);
+        if let Some(v) = f("temperature") {
+            t.config.temperature = v;
+        }
+        if let Some(v) = o["top_k"].as_u64() {
+            t.config.top_k = v as usize;
+        }
+        if let Some(v) = f("top_p") {
+            t.config.top_p = v;
+        }
+        if let Some(v) = f("guidance") {
+            t.config.guidance_scale = v;
+        }
+        if let Some(v) = o["seed"].as_u64() {
+            t.config.seed = v;
+        }
+        if let Some(v) = f("max_reply_seconds") {
+            t.max_reply_seconds = v;
+        }
+        if let Some(v) = f("end_silence_seconds") {
+            t.end_silence_seconds = v;
+        }
+        t.include_overlap = o["include_overlap"].as_bool().unwrap_or(false);
+        let mut at = 0u64;
+        haru.respond(&user_audio, &t, &mut |text, audio| {
+            let mut go = true;
+            if !text.is_empty()
+                && let Some(f) = cb
+            {
+                go &= unsafe { f(user, text.as_ptr() as *const c_char, text.len(), 0) } == 0;
+            }
+            if let Some(f) = on_audio {
+                go &= unsafe { f(user, audio.as_ptr(), audio.len(), at, rate as c_int) } == 0;
+            }
+            at += audio.len() as u64;
+            go
+        })?;
+        Ok(0)
+    })
+}
+
+/// Frees a Haru handle (NULL is ignored).
+#[cfg(not(target_arch = "wasm32"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_haru_free(h: *mut OxiHaru) {
+    if !h.is_null() {
+        guard((), || {
+            drop(unsafe { Box::from_raw(h) });
+            Ok(())
+        })
+    }
+}
+
+/// A MiniMax-H3 video pipeline handle.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct OxiVideo {
+    pipe: Mutex<(crate::minimax_h3::video::VideoPipeline, Option<usize>)>,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Loads MiniMax-H3 (a release folder, a single-file transformer or a repo id); `options` as the
+/// server's (`text_encoder`, `transformer`, `vae`, `audio_vae`, `quant`, `lora`, `shift`,
+/// `audio_shift`) plus `cache_dir`.
+#[cfg(not(target_arch = "wasm32"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_video_load(
+    model: *const c_char,
+    options: *const c_char,
+    progress: OxiProgressFn,
+    user: *mut c_void,
+) -> *mut OxiVideo {
+    guard(std::ptr::null_mut(), || {
+        let model = unsafe { str_arg(model, "model") }?;
+        let mut opts = kv_options(unsafe { opt_str_arg(options, "options") }?)?;
+        let cache = opts
+            .iter()
+            .position(|(k, _)| k == "cache_dir")
+            .map(|i| std::path::PathBuf::from(opts.remove(i).1));
+        let o: Vec<(&str, &str)> = opts.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        let p = with_progress(progress, user, || {
+            crate::minimax_h3::video::load_with_options(model, &o, cache.as_deref())
+        })?;
+        Ok(Box::into_raw(Box::new(OxiVideo {
+            pipe: Mutex::new(p),
+            cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })))
+    })
+}
+
+/// Generates a video. `params_json`: `prompt` (required), `frames` or `seconds`, `size`
+/// (`"WxH"`), `steps`, `seed`, `first_frame` / `last_frame` (image files), `references` (files,
+/// ref2va), `ref_image_edge`. `progress` gets each denoising step (non-zero cancels). Writes the
+/// AVI (Motion JPEG and PCM; the `media` feature) to `out_avi` and the soundtrack WAV to
+/// `out_wav` when they are not NULL. Returns 0, 2 when cancelled, or -1.
+#[cfg(not(target_arch = "wasm32"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_video_generate(
+    v: *mut OxiVideo,
+    params_json: *const c_char,
+    progress: OxiStepFn,
+    user: *mut c_void,
+    out_avi: *const c_char,
+    out_wav: *const c_char,
+) -> c_int {
+    guard(-1, || {
+        use std::sync::atomic::Ordering;
+        let v = unsafe { v.as_ref() }.context("video is NULL")?;
+        let o = unsafe { json_options(params_json, "params_json") }?;
+        let out_avi = unsafe { opt_str_arg(out_avi, "out_avi") }?;
+        let out_wav = unsafe { opt_str_arg(out_wav, "out_wav") }?;
+        let prompt = o["prompt"].as_str().context("params_json: no prompt")?;
+        let g = v.pipe.lock().unwrap_or_else(|p| p.into_inner());
+        let (pipe, turbo_steps) = &*g;
+        let mut p = crate::minimax_h3::video::VideoParams::new(prompt);
+        if let Some(s) = o["size"].as_str() {
+            let (w, h) = s
+                .split_once(['x', 'X'])
+                .and_then(|(w, h)| Some((w.trim().parse().ok()?, h.trim().parse().ok()?)))
+                .with_context(|| format!("size {s:?}: expected WIDTHxHEIGHT"))?;
+            p.size = Some((w, h));
+        }
+        if let Some(f) = o["frames"].as_u64() {
+            p.frames = f as usize;
+        } else if let Some(s) = o["seconds"].as_f64().or_else(|| o["seconds"].as_str().and_then(|s| s.parse().ok())) {
+            p.frames = (s * crate::minimax_h3::video::FPS as f64).round().max(1.0) as usize;
+        }
+        if let Some(s) = o["steps"].as_u64().map(|s| s as usize).or(*turbo_steps) {
+            p.steps = s;
+        }
+        p.seed = o["seed"].as_u64().unwrap_or(0);
+        #[cfg(feature = "media")]
+        {
+            let img = |k: &str| {
+                o[k].as_str()
+                    .map(|f| crate::minimax_h3::encode::load_image(std::path::Path::new(f)))
+                    .transpose()
+            };
+            p.first = img("first_frame")?;
+            p.last = img("last_frame")?;
+        }
+        v.cancel.store(false, Ordering::Relaxed);
+        p.cancel = Some(v.cancel.clone());
+        let cancel = v.cancel.clone();
+        let mut step = |i: usize, n: usize| {
+            if let Some(f) = progress
+                && unsafe { f(user, i as c_int, n as c_int) } != 0
+            {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        };
+        let refs: Vec<&str> = o["references"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|r| r.as_str()).collect())
+            .unwrap_or_default();
+        let r = if refs.is_empty() {
+            pipe.generate(&p, None, &mut step)
+        } else {
+            #[cfg(feature = "media")]
+            {
+                use crate::minimax_h3::ref2va::{RefOptions, normalize};
+                let inputs = refs
+                    .iter()
+                    .map(|f| crate::minimax_h3::encode::load_reference(std::path::Path::new(f)))
+                    .collect::<Result<Vec<_>>>()?;
+                let mut ro = RefOptions {
+                    short_edge: p.short_edge,
+                    max_pixels: p.max_pixels,
+                    ..Default::default()
+                };
+                if let Some(e) = o["ref_image_edge"].as_u64() {
+                    ro.image_short_edge = e as usize;
+                }
+                let (_, _, frames, _) = pipe.geometry(&p)?;
+                let rate = pipe.audio_vae.as_ref().map_or(32000, |a| a.cfg.sampling_rate);
+                pipe.generate_ref(&p, &normalize(inputs, frames, rate, &ro)?, None, &mut step)
+            }
+            #[cfg(not(feature = "media"))]
+            bail!("built without the `media` feature: references cannot be decoded")
+        };
+        let video = match r {
+            Err(_) if v.cancel.load(Ordering::Relaxed) => return Ok(2),
+            r => r?,
+        };
+        if let Some(path) = out_avi {
+            #[cfg(feature = "media")]
+            std::fs::write(path, crate::minimax_h3::encode::avi_mjpeg(&video)?).with_context(|| format!("write {path}"))?;
+            #[cfg(not(feature = "media"))]
+            bail!("built without the `media` feature: no AVI can be written ({path})");
+        }
+        if let (Some(path), Some(a)) = (out_wav, &video.audio) {
+            std::fs::write(path, a.to_wav()).with_context(|| format!("write {path}"))?;
+        }
+        Ok(0)
+    })
+}
+
+/// Stops a running oxi_video_generate between two steps (any thread).
+#[cfg(not(target_arch = "wasm32"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_video_cancel(v: *const OxiVideo) {
+    if let Some(v) = unsafe { v.as_ref() } {
+        v.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Frees a video handle (NULL is ignored).
+#[cfg(not(target_arch = "wasm32"))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_video_free(v: *mut OxiVideo) {
+    if !v.is_null() {
+        guard((), || {
+            drop(unsafe { Box::from_raw(v) });
+            Ok(())
+        })
+    }
+}
+
 // ---- OpenAI-compatible server ---------------------------------------------------------------
 
 /// Receives bytes of a response body (`len` bytes at `data`); return non-zero to stop a streamed

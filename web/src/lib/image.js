@@ -7,6 +7,8 @@
 //     -> { width, height, rgb } or { width, height, url }
 // image / mask: { width, height, rgb, url } as ImageStudio decodes them (url: a PNG data URL).
 
+import { readSse } from './api.js';
+
 export class WasmImage {
   constructor(engine) {
     this.engine = engine;
@@ -51,7 +53,9 @@ export class HttpImage {
     return { size: 512, steps: null, guidance: null, turbo: false, edit: 'any', native: true };
   }
 
-  async generate(p) {
+  /// Streamed (`stream: true`): `onStep(i, n)` after each denoising step, `onStage(event)` while
+  /// the request waits for the model or it loads.
+  async generate(p, onStep, onStage) {
     this.ctl = new AbortController();
     const opt = (k, v) => (v === null || v === undefined || v === '' || Number.isNaN(v) ? {} : { [k]: v });
     let r;
@@ -62,6 +66,7 @@ export class HttpImage {
       f.append('image', await pngBlob(p.image), 'image.png');
       if (p.mask) f.append('mask', await pngBlob(p.mask), 'mask.png');
       f.append('response_format', 'b64_json');
+      f.append('stream', 'true');
       for (const [k, v] of Object.entries({ ...opt('negative_prompt', p.negative), ...opt('steps', p.steps), ...opt('guidance', p.guidance), ...opt('seed', p.seed), ...opt('strength', p.strength) })) {
         f.append(k, String(v));
       }
@@ -75,6 +80,7 @@ export class HttpImage {
           size: `${p.width}x${p.height}`,
           n: 1,
           response_format: 'b64_json',
+          stream: true,
           ...opt('negative_prompt', p.negative),
           ...opt('steps', p.steps),
           ...opt('guidance', p.guidance),
@@ -83,10 +89,29 @@ export class HttpImage {
         signal: this.ctl.signal,
       });
     }
-    const v = await r.json();
-    if (v.error) throw new Error(v.error.message);
-    const b64 = v.data?.[0]?.b64_json;
-    const url = b64 ? `data:image/png;base64,${b64}` : v.data?.[0]?.url;
+    let b64 = null;
+    let failure = null;
+    await readSse(r, (event, data) => {
+      if (event === 'comment') return;
+      let v;
+      try {
+        v = JSON.parse(data);
+      } catch {
+        return;
+      }
+      if (v.type?.endsWith('.progress')) {
+        if (v.stage === 'generating') onStep?.(v.step, v.steps);
+        else onStage?.(v);
+      } else if (v.type?.endsWith('.completed')) {
+        b64 = v.b64_json;
+        return false;
+      } else if (v.type === 'error' || v.error) {
+        failure = (v.error && v.error.message) || 'the model failed';
+        return false;
+      }
+    });
+    if (failure) throw new Error(failure);
+    const url = b64 ? `data:image/png;base64,${b64}` : null;
     if (!url) throw new Error('the server returned no image');
     return { ...(await imageSize(url)), url };
   }

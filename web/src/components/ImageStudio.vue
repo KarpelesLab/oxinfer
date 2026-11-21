@@ -78,6 +78,17 @@ let gpuHost = null;
 const session = ref(null);
 
 // ---- native: the server's image models ----
+// What the server reports before the first step (waiting, downloading, loading).
+const nativeStage = ref(null);
+const nativeLine = computed(() => {
+  const s = nativeStage.value;
+  if (s?.stage === 'waiting') return 'Waiting for the model to be free…';
+  if (s?.stage === 'downloading') return `Downloading ${s.file}${s.total ? `: ${Math.round((100 * s.done) / s.total)}%` : '…'}`;
+  if (s?.stage === 'loading') return 'Loading the model…';
+  if (step.n && step.i >= step.n) return 'Decoding the image…';
+  if (step.n) return `Step ${step.i} of ${step.n}`;
+  return 'Starting on the server…';
+});
 const nativeModel = computed({ get: () => store.chosen.image || '', set: (v) => (store.chosen.image = v) });
 if (props.native) {
   steps.value = '';
@@ -229,7 +240,8 @@ async function generate() {
   error.value = '';
   phase.value = 'generating';
   if (randomSeed.value) seed.value = Math.floor(Math.random() * 2 ** 31);
-  Object.assign(step, { i: 0, n: runSteps.value });
+  Object.assign(step, { i: 0, n: props.native ? 0 : runSteps.value });
+  nativeStage.value = null;
   await nextTick();
   await pause();
   const t0 = performance.now();
@@ -250,7 +262,11 @@ async function generate() {
         strength: usesStrength.value ? strength.value : 0,
         imageGuidance: imageGuidance.value,
       },
-      (i, n) => Object.assign(step, { i, n }),
+      (i, n) => {
+        nativeStage.value = null;
+        Object.assign(step, { i, n });
+      },
+      (v) => (nativeStage.value = v),
     );
     const secs = (performance.now() - t0) / 1e3;
     await nextTick();
@@ -454,7 +470,7 @@ onMounted(async () => {
           }}
         </p>
         <p v-if="phase === 'generating'" class="working" role="status">
-          {{ native ? 'Generating on the server…' : step.i < step.n ? `Denoising, step ${step.i + 1} of ${step.n}…` : 'Decoding the image…' }}
+          {{ native ? nativeLine : step.i < step.n ? `Denoising, step ${step.i + 1} of ${step.n}…` : 'Decoding the image…' }}
         </p>
         <p v-if="result && phase !== 'generating'" class="meta">
           {{ result.width }}×{{ result.height }} in {{ result.secs.toFixed(1) }} s, seed {{ result.seed }}.

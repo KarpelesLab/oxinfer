@@ -37,15 +37,18 @@ as before. Both modes are the same Vue app: `web/src/lib/chat.js` and `web/src/l
 one session interface each, with a wasm implementation (the engine in the tab) and an HTTP one
 (`/v1/chat/completions`, `/v1/images/*`), and the views (`ChatView.vue`, `ImageStudio.vue`) drive
 whichever they are given. `web/src/lib/api.js` is the client of the server (the management API,
-streamed chat, server-sent events).
+streamed chat, server-sent events). In native mode the page is titled `oxinfer on HOSTNAME` (the
+machine's name, from `/api/web/info`'s `hostname`).
 
 | View | |
 |---|---|
 | **Models** | this computer (memory, the memory budget, GPUs), the cache's disk (free and total), the models in use with their load state, the downloads, the [catalog](cli.md#what-runs-on-this-machine) grouped by kind (chat, vision-language, images, speech to text, text to speech, embeddings, video) with the download size, the memory of the recommended precision, whether it fits this machine and its estimated speed, whether it is downloaded and the notes; any other model by its spec; the downloaded models with size, kind, last use, `catalog` / `in use` / `downloading` / `incomplete` marks, *Load…* and *Delete* (after a confirmation; refused while the model is loaded or downloading) |
 | **Chat** | streamed replies, thinking on or off (shown apart, folded once the answer starts), images, audio and video attached to a message for the models that read them (vision checkpoints, Gemma 4's audio, Unlimited-OCR-2's page images), the page's tools (`get_datetime`, `run_javascript` in a sandboxed worker) through `tools` and `tool_calls`, temperature, top-p, the longest reply, the system prompt, the speed of the last reply, *Stop* (closing the request stops the generation) |
-| **Image** | the Image mode of the wasm site on the server's image models (Stable Diffusion, FLUX.1, Qwen-Image, OmniGen2, Step1X-Edit, BAGEL, Janus-Pro): text to image, and with an input image the edit endpoint (instruction edits, image to image, a mask for inpainting), size, steps and guidance (empty: the pipeline's own), seed, what to leave out; *Save as PNG* |
+| **Image** | the Image mode of the wasm site on the server's image models (Stable Diffusion, SD 3 / 3.5, FLUX.1, Qwen-Image, OmniGen2, Step1X-Edit, BAGEL, Janus-Pro, MiniMax-H3-Image): text to image, and with an input image the edit endpoint (instruction edits, image to image, a mask for inpainting), size, steps and guidance (empty: the pipeline's own), seed, what to leave out; the request is streamed (`stream: true`, [image progress](server.md#image-progress)), so the page says what it waits for (another request, the download, the load) and then *Step N of M*; *Save as PNG* |
 | **Transcribe** | a file (any format the server decodes, video included) or a recording from the microphone (made into a 16 kHz WAV in the page), transcription or translation to English, language, plain text, text with segment and word timings, SRT or WebVTT, temperature, beam size, a prompt; copy or download the text |
-| **Speak** | text to speech with the voice, temperature, top-p, repetition penalty and seed; each clip with a player and a *Download WAV* link |
+| **Speak** | text to speech (the speech models, and LFM3-Omni's) with a voice picker filled from [`/v1/audio/voices`](server.md#spoken-replies-lfm3-omni-haru) (the model is loaded to list them; ZONOS3's with their language, a text field for pretrained Orpheus checkpoints, which take any name), temperature, top-p, repetition penalty and seed; each clip with a player and a *Download WAV* link |
+| **Voice chat** | the models that answer in speech (LFM3-Omni, Haru): a recording from the microphone or an audio file (made into a 24 kHz WAV in the page), and for LFM3-Omni a typed question too; the system prompt (Haru: its character card), Haru's voice reference clip and longest answer, the seed; each turn with your recording, the model's transcript, a player and *Download WAV* (`/v1/chat/completions` with `modalities: ["text", "audio"]`) |
+| **Video** | MiniMax-H3 video jobs (`/v1/videos`): the prompt, seconds, size, steps, seed, first and last frames, references (Ref2VA); the job's progress (its stage, *Step N of M*, the time so far) followed as server-sent events, *Cancel*; the jobs of the server listed (they run on without the page: leave and come back); a finished video played in the page (the AVI's Motion JPEG frames drawn on a canvas in time with the WAV soundtrack, which browsers cannot play as an AVI), *Download AVI* and *Download WAV*, *Delete* |
 | **Connect apps** | copy-paste configuration for other programs, with this server's address, API key (hidden until shown) and chat model ids: an `opencode.json` provider block (`@ai-sdk/openai-compatible`), Claude Code's environment (it speaks Anthropic's API, which the server answers at [`/v1/messages`](server.md#anthropic-messages-api)), curl for both APIs, `OPENAI_BASE_URL` / `OPENAI_API_KEY`, the `openai` Python and JavaScript SDKs, Aider, and notes for Continue, Open WebUI and other OpenAI-compatible clients; a copy button on each; a warning when the server listens on loopback only (other machines cannot reach it) |
 | **Embed** | a query against texts, one per line, ranked by cosine similarity, with the prompt name and Matryoshka dimensions |
 
@@ -182,8 +185,11 @@ Rebuild it after changing `web/src/` (`npm run build` still builds the GitHub Pa
 
 ## Not done yet
 
-- Video generation (MiniMax-H3, `oxinfer --model .../MiniMax-H3 -o clip.avi`) has no server
-  route, so the GUI lists those models (kind `video`) as command-line only. Neither do
-  LFM3-Omni's and Haru's speech output, nor SD3 / MiniMax-H3-Image as image models of the server.
-- Image generation shows no per-step progress (`/v1/images/*` answers once done).
-- The voices of a speech model are not listed up front: a wrong name is answered with the list.
+- The video page and route were tested with a tiny random MiniMax-H3 release (the real one is
+  141 GB of weights, not downloaded here): the pipeline's numerics are the library's, checked
+  against the reference as docs/video.md says, but no real video was made through the server.
+- No preview images while an image denoises (`partial_images` is accepted, none is sent): a
+  preview costs a VAE decode per step; the pipelines report steps only.
+- The video is AVI (Motion JPEG and PCM), not MP4: no pure-Rust H.264 / VP9 / AV1 encoder is
+  available to oxinfer, so the page plays it itself and other players need ffmpeg-based ones.
+

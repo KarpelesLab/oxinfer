@@ -44,9 +44,19 @@ export function startPolling() {
   timer = setInterval(refresh, fast ? 700 : 3000);
 }
 
-/// The models of the backend that serve `kind` (chat, embedding, image, transcription, speech).
+/// Whether a model (or a cache entry) of `kind` serves the views of `want`: chat, embedding,
+/// image, transcription, speech (text to speech: the speech models but Haru, and LFM3-Omni),
+/// voice (spoken replies: LFM3-Omni and Haru), video.
+export function serves(m, want) {
+  const kind = m.kind || 'chat';
+  if (want === 'voice') return !!m.audio_out;
+  if (want === 'speech') return (kind === 'speech' && m.audio_out !== 'haru') || m.audio_out === 'lfm3_omni';
+  return kind === want;
+}
+
+/// The models of the backend that serve `kind` (see `serves`).
 export function modelsOf(kind) {
-  return (store.status?.models || []).filter((m) => m.kind === kind || (!m.kind && kind === 'chat'));
+  return (store.status?.models || []).filter((m) => serves(m, kind));
 }
 
 export function fmtBytes(n) {

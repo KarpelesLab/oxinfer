@@ -16,6 +16,8 @@ import ModelPicker from './components/ModelPicker.vue';
 import ModelsView from './components/ModelsView.vue';
 import TranscribeView from './components/TranscribeView.vue';
 import SpeechView from './components/SpeechView.vue';
+import VoiceView from './components/VoiceView.vue';
+import VideoView from './components/VideoView.vue';
 import EmbedView from './components/EmbedView.vue';
 import ConnectView from './components/ConnectView.vue';
 
@@ -37,6 +39,8 @@ const NATIVE_MODES = [
   ['image', 'Image'],
   ['transcribe', 'Transcribe'],
   ['speak', 'Speak'],
+  ['voice', 'Voice chat'],
+  ['video', 'Video'],
   ['embed', 'Embed'],
   ['connect', 'Connect apps'],
 ];
@@ -229,6 +233,8 @@ function onNativeTools(on) {
 onMounted(async () => {
   backend.value = await detectBackend();
   if (native.value) {
+    const host = backend.value.info?.hostname;
+    document.title = host ? `oxinfer on ${host}` : 'oxinfer: local models';
     const api = new HttpApi(backend.value.info);
     setup(api, backend.value.info);
     await refresh();
@@ -307,6 +313,8 @@ onMounted(async () => {
       <ImageStudio v-else-if="mode === 'image'" :device="device" :log="log" native @manage="setMode('models')" />
       <TranscribeView v-else-if="mode === 'transcribe'" @manage="setMode('models')" />
       <SpeechView v-else-if="mode === 'speak'" @manage="setMode('models')" />
+      <VoiceView v-else-if="mode === 'voice'" @manage="setMode('models')" />
+      <VideoView v-else-if="mode === 'video'" @manage="setMode('models')" />
       <EmbedView v-else-if="mode === 'embed'" @manage="setMode('models')" />
       <ConnectView v-else-if="mode === 'connect'" @manage="setMode('models')" />
     </template>

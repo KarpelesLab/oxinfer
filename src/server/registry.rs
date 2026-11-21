@@ -20,8 +20,11 @@ pub enum Kind {
     Image,
     /// Speech to text: `/v1/audio/transcriptions`, `/v1/audio/translations`.
     Transcription,
-    /// Text to speech: `/v1/audio/speech`.
+    /// Text to speech: `/v1/audio/speech` (and Haru's speech to speech: `/v1/chat/completions`
+    /// with `modalities: ["text", "audio"]`).
     Speech,
+    /// Video generation (MiniMax-H3): `/v1/videos`, an asynchronous job.
+    Video,
 }
 
 impl Kind {
@@ -32,6 +35,7 @@ impl Kind {
             "image" | "images" => Kind::Image,
             "transcription" | "asr" | "whisper" | "stt" => Kind::Transcription,
             "speech" | "tts" => Kind::Speech,
+            "video" | "videos" => Kind::Video,
             _ => return None,
         })
     }
@@ -42,6 +46,7 @@ impl Kind {
             Kind::Image => "image",
             Kind::Transcription => "transcription",
             Kind::Speech => "speech",
+            Kind::Video => "video",
         }
     }
 }
@@ -57,6 +62,10 @@ pub(crate) enum ImageKind {
     Bagel,
     Janus,
     Moss,
+    /// Stable Diffusion 3 / 3.5 (a diffusers folder or an SD 3 GGUF transformer).
+    Sd3,
+    /// MiniMax-H3-Image.
+    H3Image,
 }
 
 /// An embedding model with the checkpoint it borrows.
@@ -77,8 +86,16 @@ pub(crate) enum ImageModel {
     Bagel(crate::bagel::Bagel),
     Janus(crate::janus::Janus),
     Moss(crate::moss_image::Pipeline),
+    Sd3(crate::sd3::Pipeline),
+    H3Image(crate::minimax_h3::Pipeline),
 }
 
+/// A MiniMax-H3 video pipeline with the settings its options gave.
+pub(crate) struct VideoModel {
+    pub pipe: crate::minimax_h3::video::VideoPipeline,
+    /// The step count a turbo LoRA is distilled for (requests without `steps` take it).
+    pub steps: Option<usize>,
+}
 /// A loaded model.
 pub(crate) enum Loaded {
     Chat(Box<Engine>),
@@ -92,6 +109,9 @@ pub(crate) enum Loaded {
     Drama(Box<crate::fish::Drama>),
     /// Audio8 TTS (also `/v1/audio/speech`).
     Arktts(Box<crate::arktts::Arktts>),
+    /// Haru (speech to speech: `/v1/chat/completions` with audio in and out).
+    Haru(Box<crate::haru::Haru>),
+    Video(Box<VideoModel>),
 }
 
 impl Loaded {
@@ -101,7 +121,8 @@ impl Loaded {
             Loaded::Embedding(_) => Kind::Embedding,
             Loaded::Image(_) => Kind::Image,
             Loaded::Transcription(_) => Kind::Transcription,
-            Loaded::Speech(_) | Loaded::Zonos(_) | Loaded::Drama(_) | Loaded::Arktts(_) => Kind::Speech,
+            Loaded::Speech(_) | Loaded::Zonos(_) | Loaded::Drama(_) | Loaded::Arktts(_) | Loaded::Haru(_) => Kind::Speech,
+            Loaded::Video(_) => Kind::Video,
         }
     }
 }
@@ -342,6 +363,29 @@ impl Registry {
     /// The memory the loaded models may take together, in bytes (None: unlimited).
     pub fn budget(&self) -> Option<u64> {
         self.budget
+    }
+
+    /// The model's kind, detected now when it is not known yet (a repo id not fetched has its
+    /// small files fetched for this).
+    pub fn kind_of(&self, id: &str) -> ApiResult<Kind> {
+        let e = self.find(id)?;
+        match e.kind() {
+            Some(k) => Ok(k),
+            None => Ok(self.detect(e).map_err(|err| ApiError::new(500, format!("model {id}: {err:#}")))?.0),
+        }
+    }
+
+    /// `f` on the loaded model when it is loaded and idle (never waits, never loads).
+    pub fn peek<R>(&self, id: &str, f: impl FnOnce(&mut Loaded) -> R) -> Option<R> {
+        let e = self.find(id).ok()?;
+        let mut g = e.slot.try_lock().ok()?;
+        g.as_mut().map(f)
+    }
+
+    /// The model's files when they are on disk (a local path, or a repo in the cache).
+    pub fn local_path(&self, id: &str) -> Option<PathBuf> {
+        let e = self.find(id).ok()?;
+        local_path(&e.spec.source, self.cache_dir.as_deref())
     }
 
     /// The cache directory repo ids are fetched to (None: the default).
@@ -657,6 +701,20 @@ impl Registry {
                 }
                 Loaded::Drama(Box::new(crate::fish::Drama::load(src, &o)?))
             }
+            Kind::Speech if local_path(src, self.cache_dir.as_deref()).is_some_and(|p| crate::haru::is_haru(&p)) => {
+                let mut o = crate::haru::HaruOptions {
+                    cache_dir: self.cache_dir.clone(),
+                    ..Default::default()
+                };
+                for (k, v) in &opts {
+                    match *k {
+                        "quant" => o.quant = Quant::parse(v).with_context(|| format!("quant: {v:?} (bf16, q8, q4)"))?,
+                        "mmap" => o.mmap = matches!(*v, "1" | "true" | "yes" | "on"),
+                        _ => bail!("unknown Haru option {k:?} (quant, mmap)"),
+                    }
+                }
+                Loaded::Haru(Box::new(crate::haru::Haru::load(src, &o)?))
+            }
             Kind::Speech if local_path(src, self.cache_dir.as_deref()).is_some_and(|p| crate::arktts::is_arktts(&p)) => {
                 Loaded::Arktts(Box::new(crate::arktts::load_for_server(src, &opts, self.cache_dir.clone())?))
             }
@@ -674,6 +732,7 @@ impl Registry {
                 let ik = image.context("not an image pipeline oxinfer knows")?;
                 Loaded::Image(Box::new(load_image(ik, src, &opts, self.cache_dir.as_deref(), cache.as_deref())?))
             }
+            Kind::Video => Loaded::Video(Box::new(load_video(src, &opts, self.cache_dir.as_deref())?)),
         };
         // Repo ids are resolved now: count what is on disk.
         let est = match spec.option("memory_gb") {
@@ -748,7 +807,33 @@ fn load_image(ik: ImageKind, src: &str, opts: &[(&str, &str)], cache_dir: Option
             src,
             &options!(crate::janus::JanusOptions::default(), true),
         )?),
+        ImageKind::Sd3 => ImageModel::Sd3(crate::sd3::Pipeline::load(
+            src,
+            &options!(crate::sd3::LoadOptions::default(), true),
+        )?),
+        ImageKind::H3Image => {
+            let dir = crate::engine::resolve_model(src, cache_dir)?;
+            let mut te = None;
+            for (k, v) in opts {
+                match *k {
+                    "text_encoder" => te = Some(crate::engine::resolve_model(v, cache_dir)?),
+                    k => bail!("unknown MiniMax-H3-Image option {k:?} (text_encoder)"),
+                }
+            }
+            let te = match te {
+                Some(t) => t,
+                None => crate::minimax_h3::find_text_encoder(&dir, cache_dir)?,
+            };
+            ImageModel::H3Image(crate::minimax_h3::Pipeline::load(&dir, &te)?)
+        }
     })
+}
+
+/// Loads a MiniMax-H3 video model with its options
+/// ([`crate::minimax_h3::video::load_with_options`]).
+fn load_video(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Path>) -> Result<VideoModel> {
+    let (pipe, steps) = crate::minimax_h3::video::load_with_options(src, opts, cache_dir)?;
+    Ok(VideoModel { pipe, steps })
 }
 
 fn wrong_kind(id: &str, kind: Kind, want: Kind) -> ApiError {
@@ -776,6 +861,9 @@ pub(crate) fn detect_path(path: &Path, source: &str) -> (Kind, Option<ImageKind>
         if crate::flux::is_flux_gguf(path) {
             return img(ImageKind::Flux);
         }
+        if crate::sd3::is_sd3_gguf(path) {
+            return img(ImageKind::Sd3);
+        }
         // Orpheus GGUFs are plain Llama files; their names tell them apart.
         let name = format!("{source} {}", path.display()).to_ascii_lowercase();
         return if name.contains("orpheus") {
@@ -783,6 +871,9 @@ pub(crate) fn detect_path(path: &Path, source: &str) -> (Kind, Option<ImageKind>
         } else {
             (Kind::Chat, None)
         };
+    }
+    if crate::minimax_h3::video::is_h3_video(path) {
+        return (Kind::Video, None);
     }
     if crate::moss_image::is_moss_image(path) {
         img(ImageKind::Moss)
@@ -796,6 +887,10 @@ pub(crate) fn detect_path(path: &Path, source: &str) -> (Kind, Option<ImageKind>
         img(ImageKind::Bagel)
     } else if crate::step1x::is_step1x(path) {
         img(ImageKind::Step1x)
+    } else if crate::minimax_h3::is_h3_image(path) {
+        img(ImageKind::H3Image)
+    } else if crate::sd3::is_sd3_dir(path) {
+        img(ImageKind::Sd3)
     } else if crate::sd::is_diffusers(path) {
         img(ImageKind::Sd)
     } else if crate::janus::is_janus(path) {
@@ -804,7 +899,7 @@ pub(crate) fn detect_path(path: &Path, source: &str) -> (Kind, Option<ImageKind>
         (Kind::Embedding, None)
     } else if crate::whisper::is_whisper(path) || crate::nemotron_asr::is_speech_lm(path) {
         (Kind::Transcription, None)
-    } else if is_orpheus(path) || crate::arktts::is_arktts(path) {
+    } else if is_orpheus(path) || crate::arktts::is_arktts(path) || crate::haru::is_haru(path) {
         (Kind::Speech, None)
     } else {
         (Kind::Chat, None)
@@ -906,10 +1001,17 @@ mod tests {
 
     #[test]
     fn kinds() {
-        for k in [Kind::Chat, Kind::Embedding, Kind::Image, Kind::Transcription, Kind::Speech] {
+        for k in [
+            Kind::Chat,
+            Kind::Embedding,
+            Kind::Image,
+            Kind::Transcription,
+            Kind::Speech,
+            Kind::Video,
+        ] {
             assert_eq!(Kind::parse(k.as_str()), Some(k));
         }
-        assert_eq!(Kind::parse("video"), None);
+        assert_eq!(Kind::parse("audio"), None);
         let e = wrong_kind("m", Kind::Embedding, Kind::Chat);
         assert!(
             e.message.contains("is an embedding model; this endpoint needs a chat model"),
@@ -939,6 +1041,14 @@ mod tests {
         assert_eq!(detect_path(&sd, "sd"), (Kind::Image, Some(ImageKind::Sd)));
         let fx = sub("fx", "model_index.json", r#"{"_class_name": "FluxKontextPipeline"}"#);
         assert_eq!(detect_path(&fx, "fx"), (Kind::Image, Some(ImageKind::Flux)));
+        let sd3 = sub("sd3", "model_index.json", r#"{"_class_name": "StableDiffusion3Pipeline"}"#);
+        assert_eq!(detect_path(&sd3, "sd3"), (Kind::Image, Some(ImageKind::Sd3)));
+        let h3i = sub("h3i", "model_index.json", r#"{"_class_name": "MiniMaxH3ImagePipeline"}"#);
+        assert_eq!(detect_path(&h3i, "h3i"), (Kind::Image, Some(ImageKind::H3Image)));
+        let h3 = sub("h3", "model_index.json", r#"{"_class_name": "MiniMaxH3ModularPipeline"}"#);
+        assert_eq!(detect_path(&h3, "h3"), (Kind::Video, None));
+        let haru = sub("haru", "config.json", r#"{"model_type": "haru"}"#);
+        assert_eq!(detect_path(&haru, "haru").0, Kind::Speech);
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -951,10 +951,68 @@ char *oxi_bagel_understand_rgb(OxiBagel *b, const char *question, const uint8_t 
 char *oxi_bagel_understand_file(OxiBagel *b, const char *question, const char *path, const char *options_json, oxi_token_fn cb,
                                 void *user);
 
+/* ---- Spoken replies (LFM3-Omni, Haru) ------------------------------------------------------ */
+
+/* A spoken reply of LFM3-Omni on an engine of it: `text` with `media_json` (attachments, as
+ * oxi_engine_send_media; NULL: none). `options_json` (NULL: defaults):
+ *   {"mode": "interleaved" | "audio",   a voice chat (the answer as text and speech; default), or
+ *                                        text to speech (`text` is what to say)
+ *    "system": "...",                    the system prompt (default: the mode's)
+ *    "voice": "female" | "male",         text to speech without a system prompt
+ *    "temperature": 0.4, "top_k": 0, "repetition_penalty": 1.2, "seed": 0, "max_tokens": 1024}
+ * The text goes to `cb` as it grows (`thinking` 0), the audio to `on_audio` once decoded (one
+ * call: 24 kHz mono, `start` 0). The engine's conversation is left as it was. Returns 0, or -1. */
+int oxi_engine_speak_omni(OxiEngine *engine, const char *text, const char *media_json, const char *options_json, oxi_token_fn cb,
+                          oxi_audio_fn on_audio, void *user);
+
+typedef struct OxiHaru OxiHaru;
+
+/* Loads Haru (speech to speech: a folder or "higurashi-ai/Haru-4B"); `options`: key=value lines
+ * or ';'-separated: quant (bf16, q8, q4), mmap, threads, cache_dir. NULL on error. */
+OxiHaru *oxi_haru_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
+
+/* One turn: `n` mono samples of the user at `sample_rate` are played to the model as live, then
+ * silence until it has answered and gone quiet. Its text goes to `cb` and its audio (24 kHz) to
+ * `on_audio`, frame by frame (either returning non-zero stops). `options_json` (NULL: defaults):
+ *   {"system": "...", "reference": "voice.wav", "temperature": 0.7, "top_k": 25, "top_p": 1.0,
+ *    "guidance": 1.5, "seed": 0, "max_reply_seconds": 12, "end_silence_seconds": 1.2,
+ *    "include_overlap": false}
+ * Returns 0, or -1. */
+int oxi_haru_respond(OxiHaru *h, const float *samples, size_t n, int sample_rate, const char *options_json, oxi_token_fn cb,
+                     oxi_audio_fn on_audio, void *user);
+
+/* Frees a Haru handle (NULL is ignored). */
+void oxi_haru_free(OxiHaru *h);
+
+/* ---- Video generation (MiniMax-H3) --------------------------------------------------------- */
+
+typedef struct OxiVideo OxiVideo;
+
+/* Loads MiniMax-H3 (a release folder, a single-file transformer or a repo id); `options`:
+ * key=value (text_encoder, transformer, vae, audio_vae, quant, lora, shift, audio_shift,
+ * cache_dir). NULL on error. */
+OxiVideo *oxi_video_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
+
+/* Generates a video. `params_json`:
+ *   {"prompt": "...", "frames": 124 | "seconds": 5, "size": "1344x768", "steps": 50, "seed": 0,
+ *    "first_frame": "first.png", "last_frame": "last.png",      (fl2va)
+ *    "references": ["a.png", "voice.wav", "motion.mp4"], "ref_image_edge": 2048}   (ref2va)
+ * `progress` gets each denoising step (non-zero cancels). Writes the AVI (Motion JPEG and 16-bit
+ * PCM; needs the `media` feature) to `out_avi` and the soundtrack to `out_wav` when they are not
+ * NULL. Returns 0, 2 when cancelled, or -1. */
+int oxi_video_generate(OxiVideo *v, const char *params_json, oxi_step_fn progress, void *user, const char *out_avi,
+                       const char *out_wav);
+
+/* Stops a running oxi_video_generate between two steps (any thread). */
+void oxi_video_cancel(const OxiVideo *v);
+
+/* Frees a video handle (NULL is ignored). */
+void oxi_video_free(OxiVideo *v);
+
 /* ---- OpenAI-compatible server (cargo features `capi` + `server`) -----------------------------
  * The OpenAI API (GET /v1/models; POST /v1/chat/completions, /v1/completions, /v1/embeddings,
  * /v1/images/generations, /v1/images/edits, /v1/audio/transcriptions, /v1/audio/translations,
- * /v1/audio/speech) over a whitelist of models, served over HTTP(S) or called directly. Models
+ * /v1/audio/speech; GET /v1/audio/voices; the /v1/videos jobs) over a whitelist of models, served over HTTP(S) or called directly. Models
  * load on first use, run one request at a time each, and the least recently used idle ones are
  * unloaded when a model to load would not fit in the memory budget. Calls may come from any
  * thread. */

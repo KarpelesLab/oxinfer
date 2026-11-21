@@ -4,54 +4,18 @@
 //! oxinfer / Hugging Face download caches.
 
 use crate::Args;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use oxinfer::minimax_h3::{Params, Pipeline};
 use std::path::PathBuf;
 use std::time::Instant;
 
-/// Whether a checkpoint folder holds its weights (not only its configuration).
-fn has_weights(dir: &std::path::Path) -> bool {
-    if dir.join("model.safetensors").exists() {
-        return true;
-    }
-    let Ok(b) = std::fs::read(dir.join("model.safetensors.index.json")) else {
-        return false;
-    };
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&b) else {
-        return false;
-    };
-    v["weight_map"]
-        .as_object()
-        .is_some_and(|m| m.values().filter_map(|f| f.as_str()).all(|f| dir.join(f).exists()))
-}
-
-/// MiniMax-H3's text encoder folder.
-pub(crate) fn text_encoder(model: &std::path::Path) -> Result<PathBuf> {
-    if let Ok(p) = std::env::var("OXINFER_H3_TEXT_ENCODER") {
-        return Ok(PathBuf::from(p));
-    }
-    let mut roots = vec![model.to_path_buf()];
-    let home = std::env::var("HOME").unwrap_or_default();
-    for cache in [format!("{home}/.cache/oxinfer/hub"), format!("{home}/.cache/huggingface/hub")] {
-        if let Ok(rd) = std::fs::read_dir(format!("{cache}/models--MiniMaxAI--MiniMax-H3/snapshots")) {
-            roots.extend(rd.flatten().map(|e| e.path()));
-        }
-    }
-    for r in &roots {
-        for sub in ["text_encoder", "FL2VA/text_encoder"] {
-            let p = r.join(sub);
-            if p.join("config.json").exists() && has_weights(&p) {
-                return Ok(p);
-            }
-        }
-    }
-    bail!(
-        "MiniMax-H3's text encoder was not found: download it (`hf download MiniMaxAI/MiniMax-H3 --include 'text_encoder/*'`) or set OXINFER_H3_TEXT_ENCODER"
-    )
+/// MiniMax-H3's text encoder folder ([`oxinfer::minimax_h3::find_text_encoder`]).
+pub(crate) fn text_encoder(model: &std::path::Path, cache_dir: Option<&std::path::Path>) -> Result<PathBuf> {
+    oxinfer::minimax_h3::find_text_encoder(model, cache_dir)
 }
 
 pub fn run(args: &Args) -> Result<()> {
-    let te = text_encoder(&args.model)?;
+    let te = text_encoder(&args.model, args.cache_dir.as_deref())?;
     let t0 = Instant::now();
     let pipe = Pipeline::load(&args.model, &te)?;
     eprintln!(

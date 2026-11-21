@@ -1422,6 +1422,8 @@ pub struct Engine {
     fingerprint_source: String,
     /// The LoRA adapters attached at load ([`EngineOptions::loras`]).
     loras: Vec<crate::lora::Attached>,
+    /// LFM3-Omni's speech head and codec, loaded on the first [`Engine::speak_omni`].
+    omni_voice: Option<Box<crate::lfm3_omni::voice::Voice>>,
     /// Must stay last: the model, sessions and references above point into it.
     _arena: Arena,
 }
@@ -2248,6 +2250,7 @@ impl Engine {
             pcache,
             pcache_min: opts.prompt_cache_min_tokens.unwrap_or(64),
             pcache_pending: false,
+            omni_voice: None,
             fingerprint: String::new(),
             fingerprint_source: String::new(),
             loras,
@@ -2321,6 +2324,7 @@ impl Engine {
             pcache: None,
             pcache_min: 0,
             pcache_pending: false,
+            omni_voice: None,
             fingerprint: String::new(),
             fingerprint_source: String::new(),
             loras: Vec::new(),
@@ -2868,6 +2872,43 @@ impl Engine {
         let reply = self.turn(&text, &feats, think)?.finish(self, on_delta)?;
         self.turns += 1;
         Ok(reply)
+    }
+
+    /// Whether the model can answer in speech ([`Engine::speak_omni`]: LFM3-Omni).
+    pub fn can_speak(&self) -> bool {
+        crate::lfm3_omni::is_omni(&self.info.path) && matches!(self.lm, Lm::Qwen { .. })
+    }
+
+    /// A spoken reply of LFM3-Omni to `user` with `media` (images, audio clips): text to speech
+    /// ([`crate::lfm3_omni::Mode::Audio`]: `user` is the text to say) or a voice chat
+    /// (`Mode::Interleaved`: the answer as text and speech). It runs on a session of its own:
+    /// the conversation of [`Engine::send`] / [`Engine::chat`] is left as it was. The speech head
+    /// and the codec load on the first call. `on_text` receives the reply's text as it grows.
+    pub fn speak_omni(
+        &mut self,
+        user: &str,
+        media: &Attachments,
+        o: &crate::lfm3_omni::voice::SpokenOptions,
+        on_text: &mut dyn FnMut(&str),
+    ) -> Result<crate::lfm3_omni::voice::SpokenReply> {
+        if !crate::lfm3_omni::is_omni(&self.info.path) {
+            bail!(
+                "{}: spoken replies are LFM3-Omni's (this model answers in text)",
+                self.info.path.display()
+            );
+        }
+        let Lm::Qwen { model, .. } = &self.lm else {
+            bail!("LFM3-Omni speech needs the plain decoder (no speculative decoding)");
+        };
+        let model: &'static QwenModel<'static> = model;
+        if self.omni_voice.is_none() {
+            self.omni_voice = Some(Box::new(crate::lfm3_omni::voice::Voice::load(&self.info.path, self.files)?));
+        }
+        let (mm_text, feats) = self.prepare_media(media)?;
+        let voice = self.omni_voice.as_deref().expect("loaded above");
+        let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+        let chunk = if self.prefill_chunk == 0 { 256 } else { self.prefill_chunk };
+        voice.reply(model, &self.tok, user, &mm_text, &feats, o, chunk, on_text)
     }
 
     /// The placeholder text and soft tokens of a message's attachments (nothing when empty).

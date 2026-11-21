@@ -47,6 +47,8 @@ mod media;
 mod openai;
 mod registry;
 mod sign;
+mod speech;
+mod video;
 pub mod web;
 
 pub use registry::Kind;
@@ -180,7 +182,12 @@ impl ModelSpec {
 
     fn check(&self) -> Result<()> {
         if let Some(k) = self.option("kind") {
-            Kind::parse(k).with_context(|| format!("{}: unknown kind {k:?} (chat, embedding, image, transcription, speech)", self.id))?;
+            Kind::parse(k).with_context(|| {
+                format!(
+                    "{}: unknown kind {k:?} (chat, embedding, image, transcription, speech, video)",
+                    self.id
+                )
+            })?;
         }
         for (k, _) in &self.options {
             if ["threads", "qos", "efficiency_threads"].contains(&k.as_str()) {
@@ -413,6 +420,8 @@ pub struct ApiRequest {
     pub method: String,
     /// The path, without the query string (`/v1/chat/completions`).
     pub path: String,
+    /// The query string, without the `?` (empty when none).
+    pub query: String,
     /// The `Content-Type` header (JSON or `multipart/form-data`).
     pub content_type: Option<String>,
     /// The `Authorization` header (`Bearer KEY`), checked when [`ServerOptions::api_key`] is set.
@@ -424,10 +433,13 @@ pub struct ApiRequest {
 }
 
 impl ApiRequest {
+    /// A request; `path` may end with a query string (`/v1/videos/ID/content?variant=audio`).
     pub fn new(method: &str, path: &str, content_type: Option<&str>, body: Vec<u8>) -> Self {
+        let (path, query) = path.split_once('?').unwrap_or((path, ""));
         Self {
             method: method.to_string(),
-            path: path.split('?').next().unwrap_or_default().to_string(),
+            path: path.to_string(),
+            query: query.to_string(),
             content_type: content_type.map(str::to_string),
             authorization: None,
             origin: None,
@@ -441,10 +453,42 @@ impl ApiRequest {
         Self::new("POST", path, Some("application/json"), body.as_bytes().to_vec())
     }
 
+    /// The value of `key` in the query string (percent-decoded; `+` is a space).
+    pub fn query_param(&self, key: &str) -> Option<String> {
+        self.query.split('&').find_map(|kv| {
+            let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+            (percent_decode(k) == key).then(|| percent_decode(v))
+        })
+    }
+
     pub fn with_authorization(mut self, value: &str) -> Self {
         self.authorization = Some(value.to_string());
         self
     }
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < b.len() => match std::str::from_utf8(&b[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+            {
+                Some(v) => {
+                    out.push(v);
+                    i += 2;
+                }
+                None => out.push(b'%'),
+            },
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A complete response.
@@ -582,6 +626,8 @@ pub struct Api {
     web: Option<web::WebState>,
     /// Signs and checks the thinking blocks of `/v1/messages`.
     signer: sign::ThinkingSigner,
+    /// The video jobs (`/v1/videos`).
+    videos: video::Videos,
 }
 
 impl Api {
@@ -610,6 +656,7 @@ impl Api {
             signer: sign::ThinkingSigner::new(opts.thinking_key.as_deref()),
             opts,
             ids: AtomicU64::new(0),
+            videos: video::Videos::default(),
         });
         if api.opts.preload {
             api.models.preload()?;
@@ -730,6 +777,11 @@ impl Api {
                     .and_then(|d| d.as_array())
                     .and_then(|d| d.iter().find(|m| m["id"] == id).cloned())
                     .ok_or_else(|| ApiError::new(404, format!("the model {id:?} does not exist")).code("model_not_found"))?;
+                let mut m = m;
+                // The voices of a loaded speech model (`/v1/audio/voices` loads it to tell).
+                if let Some(v) = speech::loaded_voices(self, id) {
+                    m["voices"] = v;
+                }
                 Ok(Output::Full(ApiResponse::json(200, &m)))
             }
             "/v1/chat/completions" if post => openai::chat(self, &json_body(req)?),
@@ -742,6 +794,10 @@ impl Api {
             "/v1/audio/transcriptions" if post => media::transcriptions(self, req, false),
             "/v1/audio/translations" if post => media::transcriptions(self, req, true),
             "/v1/audio/speech" if post => media::speech(self, &json_body(req)?),
+            "/v1/audio/voices" if get => speech::voices(self, req),
+            "/v1/videos" | "/v1/videos/generations" if post => video::create(self, req),
+            "/v1/videos" if get => video::list(self, req),
+            p if p.starts_with("/v1/videos/") && p != "/v1/videos/generations" => video::route(self, req, &p["/v1/videos/".len()..]),
             "/v1/models"
             | "/v1/chat/completions"
             | "/v1/messages"
@@ -752,7 +808,10 @@ impl Api {
             | "/v1/images/edits"
             | "/v1/audio/transcriptions"
             | "/v1/audio/translations"
-            | "/v1/audio/speech" => Err(wrong_method()),
+            | "/v1/audio/speech"
+            | "/v1/audio/voices"
+            | "/v1/videos"
+            | "/v1/videos/generations" => Err(wrong_method()),
             _ => Err(ApiError::new(404, format!("unknown endpoint {}", req.path))),
         }
     }
@@ -828,7 +887,8 @@ mod tests {
         let m = ModelSpec::parse("org/repo:Q4_K_M").unwrap();
         assert_eq!((m.id.as_str(), m.source.as_str()), ("org/repo:Q4_K_M", "org/repo:Q4_K_M"));
         assert!(ModelSpec::parse("x=y,novalue").is_err());
-        assert!(ModelSpec::parse("x=y,kind=video").is_err());
+        assert!(ModelSpec::parse("x=y,kind=audio").is_err());
+        assert_eq!(ModelSpec::parse("x=y,kind=video").unwrap().option("kind"), Some("video"));
         assert!(ModelSpec::parse("x=y,threads=4").is_err());
         let m =
             ModelSpec::from_json(&json!({"id": "e", "model": "BAAI/bge-small-en-v1.5", "options": {"kind": "embedding", "memory_gb": 1}}))
