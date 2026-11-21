@@ -1618,7 +1618,18 @@ fn video_jobs_with_a_tiny_minimax_h3() {
         .filter_map(|e| e["step"].as_u64())
         .collect();
     assert!(steps.windows(2).all(|w| w[0] <= w[1]), "{steps:?}");
-    let (st, ct, avi) = get_bytes(a, &format!("/v1/videos/{id}/content"));
+    // MP4 by default: H.264 (an `avc1` sample entry) and AAC (`mp4a`).
+    let (st, ct, mp4) = get_bytes(a, &format!("/v1/videos/{id}/content"));
+    assert_eq!((st, ct.as_str(), &mp4[4..8]), (200, "video/mp4", &b"ftyp"[..]));
+    let has = |b: &[u8], tag: &[u8]| b.windows(tag.len()).any(|w| w == tag);
+    assert!(has(&mp4, b"avc1") && has(&mp4, b"mp4a"), "H.264 and AAC tracks");
+    // AVI (Motion JPEG and PCM) when asked for.
+    let req = json!({"model": "h3", "prompt": "A red fox.", "size": "64x64", "frames": 22, "steps": 3, "response_format": "avi"});
+    let (st, body) = request(a, "POST", "/v1/videos", &req.to_string());
+    assert_eq!(st, 200, "{body}");
+    let ida = serde_json::from_str::<Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+    assert_eq!(wait_video(a, &ida, &["completed", "failed"])["status"], "completed");
+    let (st, ct, avi) = get_bytes(a, &format!("/v1/videos/{ida}/content"));
     assert_eq!(
         (st, ct.as_str(), &avi[..4], &avi[8..12]),
         (200, "video/x-msvideo", &b"RIFF"[..], &b"AVI "[..])
@@ -1628,6 +1639,13 @@ fn video_jobs_with_a_tiny_minimax_h3() {
         2 * 22,
         "22 frames and their index entries"
     );
+    let (st, _) = request(
+        a,
+        "POST",
+        "/v1/videos",
+        &json!({"model": "h3", "prompt": "x", "response_format": "gif"}).to_string(),
+    );
+    assert_eq!(st, 400);
     let (st, ct, wav) = get_bytes(a, &format!("/v1/videos/{id}/content?variant=audio"));
     assert_eq!((st, ct.as_str(), &wav[..4]), (200, "audio/wav", &b"RIFF"[..]));
     assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 2, "stereo");

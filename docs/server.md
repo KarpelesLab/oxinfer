@@ -126,7 +126,7 @@ curl -s localhost:8080/v1/videos -H 'Content-Type: application/json' \
 # {"id": "video_...", "object": "video", "status": "queued", "progress": 0, ...}
 curl -s localhost:8080/v1/videos/video_...                     # status, progress, stage, step / steps
 curl -s localhost:8080/v1/videos/video_.../events              # the same as server-sent events until it ends
-curl -s localhost:8080/v1/videos/video_.../content -o fox.avi  # once "completed"
+curl -s localhost:8080/v1/videos/video_.../content -o fox.mp4  # once "completed"
 curl -s 'localhost:8080/v1/videos/video_.../content?variant=audio' -o fox.wav
 curl -s -X POST localhost:8080/v1/videos/video_.../cancel
 curl -s -X DELETE localhost:8080/v1/videos/video_...
@@ -142,6 +142,7 @@ curl -s localhost:8080/v1/videos -F model=h3 -F prompt="..." -F input_reference=
 | `steps`, `seed` | points of the sigma grid (default 50, or a turbo LoRA's); the noise seed (default random) |
 | `input_reference` / `first_frame`, `last_frame` | images: first / last frame to video (`fl2va`) |
 | `references` | images, audio clips and videos, in the order the prompt names them (ref2va: a model whose folder is the release's `Ref2VA/`); `ref_image_edge` the short edge image references are encoded at |
+| `response_format` | the video file: `mp4` (H.264 + AAC, the default), `webm` (VP9 + Opus) or `avi` (Motion JPEG + PCM) |
 
 In JSON the media are `data:` or `http(s)://` URLs (`input_reference` may be OpenAI's
 `{"image_url": ...}`); in a multipart body files (`references[]` repeated) or URL fields. The
@@ -152,9 +153,10 @@ In JSON the media are `data:` or `http(s)://` URLs (`input_reference` may be Ope
 `step` / `steps`, `frames`, `fps`, `has_audio`, `elapsed`, `variants` (the byte size of each
 file). Jobs run one at a time per model (others wait, `stage: "waiting"`); cancelling stops
 the job between two denoising steps, or before the model loads. `content?variant=` is `video`
-(Motion JPEG and the stereo 32 kHz soundtrack as 16-bit PCM in AVI: no pure-Rust H.264 / VP9
-encoder is available, so not OpenAI's MP4; `ffmpeg -i clip.avi clip.mp4` converts it; built
-without `media` there is no AVI), `audio` (WAV) or `thumbnail` (the first frame as PNG). Finished
+(by default MP4, as OpenAI's: H.264 and the stereo 32 kHz soundtrack as AAC-LC, encoded by
+oxideav; the request's `response_format` picks `webm`, VP9 and Opus at 48 kHz in WebM, or `avi`,
+Motion JPEG and 16-bit PCM; built without `media` there is no video file), `audio` (WAV) or
+`thumbnail` (the first frame as PNG). Finished
 jobs keep their files in memory for an hour (`expires_at`); the server keeps the last 32 jobs.
 
 The model's options: `text_encoder`, `transformer`, `vae`, `audio_vae` (parts replacing the

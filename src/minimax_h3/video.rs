@@ -536,6 +536,45 @@ impl VideoParams {
     }
 }
 
+/// The container and codecs a video is written with (`minimax_h3::encode`, the `media` feature).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoFormat {
+    /// H.264 and AAC in MP4: what every browser and player takes (the default).
+    Mp4,
+    /// VP9 and Opus in WebM (Matroska).
+    Webm,
+    /// Motion JPEG and 16-bit PCM in AVI.
+    Avi,
+}
+
+impl VideoFormat {
+    /// From a name or a file extension: `mp4`, `webm`, `avi`.
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "mp4" | "m4v" | "h264" => Self::Mp4,
+            "webm" | "vp9" => Self::Webm,
+            "avi" | "mjpeg" => Self::Avi,
+            _ => return None,
+        })
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Mp4 => "mp4",
+            Self::Webm => "webm",
+            Self::Avi => "avi",
+        }
+    }
+
+    pub fn mime(self) -> &'static str {
+        match self {
+            Self::Mp4 => "video/mp4",
+            Self::Webm => "video/webm",
+            Self::Avi => "video/x-msvideo",
+        }
+    }
+}
+
 /// Generated frames (RGB8, row-major) at [`FPS`] and their soundtrack.
 pub struct Video {
     pub width: usize,

@@ -1,16 +1,16 @@
-//! `oxinfer --model MiniMaxAI/MiniMax-H3 --prompt "..." --frames 124 --size 1344x768 -o out.avi`:
+//! `oxinfer --model MiniMaxAI/MiniMax-H3 --prompt "..." --frames 124 --size 1344x768 -o out.mp4`:
 //! text to video, and first / last frame to video with `--init-image` / `--last-image`, through
 //! `oxinfer::minimax_h3::video`; with the release's `Ref2VA/`, video from references
 //! (`--ref FILE`, repeated in the order the prompt names them: images, audio clips by extension,
 //! anything else a video with its soundtrack) through `oxinfer::minimax_h3::ref2va`.
 //!
-//! The output follows the extension of `-o`: `.avi` is Motion JPEG in an AVI container and
-//! `.webp` an animated WebP (both through oxideav, the `media` feature: no pure-Rust H.264 / VP9 /
-//! AV1 encoder is available); anything else is a PNG sequence (`NAME_0000.png`, ...). The stereo
-//! soundtrack (32 kHz, decoded when the model folder has `audio_vae/` or `--audio-vae` names the
-//! audio VAE: a folder, or ComfyUI's `vae/minimax_h3_audio_vae_fp32.safetensors`) is a 16-bit PCM stream in
-//! the AVI, interleaved frame by frame; animated WebP has no audio and a PNG sequence is only
-//! frames, so both get a sibling `NAME.wav`.
+//! The output follows the extension of `-o` (all through oxideav, the `media` feature): `.mp4` is
+//! H.264 and AAC in MP4 (the default), `.webm` VP9 and Opus in WebM, `.avi` Motion JPEG and 16-bit
+//! PCM in AVI, `.webp` an animated WebP; anything else is a PNG sequence (`NAME_0000.png`, ...).
+//! The stereo soundtrack (32 kHz, decoded when the model folder has `audio_vae/` or `--audio-vae`
+//! names the audio VAE: a folder, or ComfyUI's `vae/minimax_h3_audio_vae_fp32.safetensors`) is the
+//! file's audio stream; animated WebP has no audio and a PNG sequence is only frames, so both get
+//! a sibling `NAME.wav`.
 //!
 //! `--model` is the release folder in diffusers' layout, or a single-file transformer in ComfyUI's
 //! layout (`Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_bf16.safetensors`) with
@@ -110,7 +110,7 @@ fn write_embeds(path: &Path, c: &Conditioning) -> Result<()> {
 }
 
 #[cfg(feature = "media")]
-use oxinfer::minimax_h3::encode::{animated_webp, avi_mjpeg};
+use oxinfer::minimax_h3::encode::{VideoFormat, animated_webp, encode_video};
 
 /// Writes the soundtrack of `v`, when it has one, as `stem.wav`; returns what to report.
 fn write_wav(v: &Video, stem: &Path) -> Result<String> {
@@ -132,13 +132,19 @@ fn write_video(v: &Video, out: &Path) -> Result<String> {
     let ext = out.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     match ext.as_str() {
         #[cfg(feature = "media")]
-        "avi" => {
-            std::fs::write(out, avi_mjpeg(v)?).with_context(|| format!("write {}", out.display()))?;
+        "mp4" | "m4v" | "webm" | "avi" => {
+            let f = VideoFormat::parse(&ext).expect("listed above");
+            std::fs::write(out, encode_video(v, f)?).with_context(|| format!("write {}", out.display()))?;
+            let (vc, ac) = match f {
+                VideoFormat::Mp4 => ("H.264", "AAC"),
+                VideoFormat::Webm => ("VP9", "Opus"),
+                VideoFormat::Avi => ("Motion JPEG", "16-bit PCM"),
+            };
             let audio = match v.audio.as_ref().filter(|a| !a.is_empty()) {
-                Some(a) => format!(", {} Hz 16-bit PCM, {} channels", a.sample_rate, a.channels.len()),
+                Some(a) => format!(", {ac} {} channels", a.channels.len()),
                 None => String::new(),
             };
-            Ok(format!("{} (Motion JPEG, {FPS} fps{audio})", out.display()))
+            Ok(format!("{} ({vc}, {FPS} fps{audio})", out.display()))
         }
         #[cfg(feature = "media")]
         "webp" => {
@@ -150,9 +156,13 @@ fn write_video(v: &Video, out: &Path) -> Result<String> {
             ))
         }
         #[cfg(not(feature = "media"))]
-        "avi" | "webp" => bail!("built without the `media` feature: .{ext} cannot be written (use a .png name for a PNG sequence)"),
-        "mp4" | "mkv" | "webm" | "mov" | "gif" => {
-            bail!(".{ext} output is not supported: use .avi (Motion JPEG), .webp (animated) or .png (a PNG sequence)")
+        "mp4" | "m4v" | "webm" | "avi" | "webp" => {
+            bail!("built without the `media` feature: .{ext} cannot be written (use a .png name for a PNG sequence)")
+        }
+        "mkv" | "mov" | "gif" => {
+            bail!(
+                ".{ext} output is not supported: use .mp4 (H.264 + AAC), .webm (VP9 + Opus), .avi (Motion JPEG), .webp (animated) or .png (a PNG sequence)"
+            )
         }
         _ => {
             let stem = out.with_extension("");
@@ -309,7 +319,7 @@ pub fn run(args: &Args) -> Result<()> {
         let refs = normalize(refs, frames, rate, &o)?;
         pipe.generate_ref(&p, &refs, cond, &mut progress)?
     };
-    let default = if cfg!(feature = "media") { "video.avi" } else { "video.png" };
+    let default = if cfg!(feature = "media") { "video.mp4" } else { "video.png" };
     let out = args.output.clone().unwrap_or_else(|| PathBuf::from(default));
     let what = write_video(&video, &out)?;
     eprintln!(

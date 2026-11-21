@@ -997,10 +997,11 @@ OxiVideo *oxi_video_load(const char *model, const char *options, oxi_progress_fn
  *   {"prompt": "...", "frames": 124 | "seconds": 5, "size": "1344x768", "steps": 50, "seed": 0,
  *    "first_frame": "first.png", "last_frame": "last.png",      (fl2va)
  *    "references": ["a.png", "voice.wav", "motion.mp4"], "ref_image_edge": 2048}   (ref2va)
- * `progress` gets each denoising step (non-zero cancels). Writes the AVI (Motion JPEG and 16-bit
- * PCM; needs the `media` feature) to `out_avi` and the soundtrack to `out_wav` when they are not
- * NULL. Returns 0, 2 when cancelled, or -1. */
-int oxi_video_generate(OxiVideo *v, const char *params_json, oxi_step_fn progress, void *user, const char *out_avi,
+ * `progress` gets each denoising step (non-zero cancels). Writes the video (needs the `media`
+ * feature) to `out_video` in the format of its extension: .mp4 (H.264 + AAC; also for other
+ * names), .webm (VP9 + Opus), .avi (Motion JPEG + 16-bit PCM); and the soundtrack to `out_wav`,
+ * when they are not NULL. Returns 0, 2 when cancelled, or -1. */
+int oxi_video_generate(OxiVideo *v, const char *params_json, oxi_step_fn progress, void *user, const char *out_video,
                        const char *out_wav);
 
 /* Stops a running oxi_video_generate between two steps (any thread). */

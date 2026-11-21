@@ -9,16 +9,16 @@ all three: `src/minimax_h3/video.rs` (and `ref2va.rs` for references) follows di
 ```sh
 # text to video: 124 frames (5.2 s at 24 fps) at 1344x768, 49 forwards
 ./target/release/oxinfer --model /path/to/MiniMax-H3 --device cpu \
-    -p "integrated_multimodal_description: [Shot 1] A red fox trots across a snowy clearing ..." -o fox.avi
+    -p "integrated_multimodal_description: [Shot 1] A red fox trots across a snowy clearing ..." -o fox.mp4
 # smaller and shorter
 ./target/release/oxinfer --model /path/to/MiniMax-H3 --device cpu -p "..." \
-    --size 448x256 --frames 124 --steps 50 --seed 1 -o fox.avi
+    --size 448x256 --frames 124 --steps 50 --seed 1 -o fox.mp4
 # first frame (and last frame) to video; the canvas takes the first image's aspect ratio
 ./target/release/oxinfer --model /path/to/MiniMax-H3 --device cpu -p "..." \
-    --init-image first.png --last-image last.png -o clip.avi
+    --init-image first.png --last-image last.png -o clip.mp4
 # references to video (the release's Ref2VA/): in the order the prompt names them
 ./target/release/oxinfer --model /path/to/MiniMax-H3/Ref2VA --device cpu -p "subject_definitions: ..." \
-    --ref subject.png --ref motion.mp4 --ref voice.wav -o clip.avi
+    --ref subject.png --ref motion.mp4 --ref voice.wav -o clip.mp4
 ```
 
 `--model` is a folder in the repository's diffusers layout: `model_index.json`, `transformer/`,
@@ -37,16 +37,24 @@ says so. Passing the repository id itself has not been tried.
 | `--init-image F`, `--last-image F` | the first / last frame |
 | `--ref F` (repeated) | `Ref2VA/` only: a reference, in the order the prompt's labels number them: an image (`.png`, `.jpg`, ...), an audio clip (`.wav`, `.mp3`, `.flac`, `.ogg`, `.opus`, `.m4a`, `.aac`) or a video (anything else, or a folder of frames at 24 fps) with its soundtrack when it has one. At most 9 images, 3 videos and 3 audio clips, 12 in all; audio cannot be the only kind |
 | `--ref-image-edge N` | the short edge image references are encoded at (default 2048, the release's; a smaller one makes fewer rows for a quick test) |
-| `-o FILE` | `.avi`: Motion JPEG and the soundtrack in AVI; `.webp`: animated WebP (lossless only, about 3 s per 320x288 frame to encode) and `FILE.wav`; anything else: a PNG sequence `FILE_0000.png`, ... and `FILE.wav` |
+| `-o FILE` | `.mp4` (the default name is `video.mp4`): H.264 and the soundtrack as AAC-LC in MP4; `.webm`: VP9 and Opus (48 kHz) in WebM; `.avi`: Motion JPEG and 16-bit PCM in AVI; `.webp`: animated WebP (lossless only, about 3 s per 320x288 frame to encode) and `FILE.wav`; anything else: a PNG sequence `FILE_0000.png`, ... and `FILE.wav` |
 
-There is no pure-Rust H.264, VP9 or AV1 encoder in the oxideav crates oxinfer uses (the H.264
-crate decodes only), so no `.mp4` / `.webm` is written: Motion JPEG in AVI plays in ffmpeg-based
-players and converts with `ffmpeg -i fox.avi fox.mp4`. Without the `media` feature only the PNG
-sequence is available.
+The files are written by oxideav (`minimax_h3::encode::encode_video`; the server and the C API
+take the same choice): H.264 by oxideav-h264 (Baseline profile, CAVLC, the level that fits the
+size and rate, e.g. 2.1 at 448x256, constant QP 20, an IDR picture every second), AAC-LC by
+oxideav-aac (64 kb/s per channel) and MP4 by oxideav-mp4 (0.0.11 or later: it takes the AAC
+encoder's ADTS frames and writes their `AudioSpecificConfig`); VP9 by oxideav-vp9, Opus by
+oxideav-opus (48 kHz only: the soundtrack is resampled) and WebM by oxideav-mkv. Baseline H.264
+plays in every browser (checked in Chrome: a `<video>` element plays it with its sound). The
+H.264 encode took about 0.25 s per 448x256 frame here (an M5 Max), VP9 about 0.6 s; Motion JPEG
+is two orders of magnitude faster. The WebM has no `Duration` (oxideav-mkv does not write the
+Segment's duration), so players learn the length only at the end. Without the `media` feature
+only the PNG sequence is
+available.
 
 The soundtrack is stereo at 32 kHz, 800 samples per audio latent (a 124-frame request: 207
-latents, 5.175 s for 5.167 s of frames; nothing is trimmed). In an `.avi` it is a second stream
-of 16-bit PCM, one chunk after each frame (`ffmpeg -i fox.avi fox.mp4` keeps it). Animated WebP
+latents, 5.175 s for 5.167 s of frames; nothing is trimmed). In an `.mp4` it is an AAC track, in
+a `.webm` an Opus track, in an `.avi` a stream of 16-bit PCM, one chunk after each frame. Animated WebP
 has no audio and a PNG sequence is only frames: both get a 16-bit stereo WAV next to them, named
 as the output without its extension (`-o fox.webp` and `-o fox.png` both write `fox.wav`).
 
@@ -150,7 +158,12 @@ loud noise, which exercises the clamp.
 
 The AVI's audio stream is checked by a unit test that demuxes it with oxideav-avi (every frame
 and every PCM byte comes back); ffprobe reads the same file as `mjpeg` + `pcm_s16le`, 32 kHz,
-2 channels.
+2 channels. The MP4 and WebM files are decoded back by oxideav in unit tests
+(`minimax_h3::encode`): every frame, at 43 dB PSNR for an IDR picture and 31 dB for the P
+pictures of a synthetic clip with sharp moving edges (libx264 at the same QP and profile gives
+the same PSNR at less than half the size), and the tiny random MiniMax-H3 release's noise at
+about 19 dB (noise is the hardest content; libx264 does no better); ffmpeg decodes both files
+cleanly to the same frames and ffprobe reads `h264` Baseline + `aac` LC, and `vp9` + `opus`.
 
 On the real weights (CPU, 64 cores, 125 GB RAM):
 
@@ -257,7 +270,7 @@ files, the single-file text encoders, the bf16 transformers) were not.
     --audio-vae vae/minimax_h3_audio_vae_fp32.safetensors \
     --lora loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors \
     --text-encoder Qwen3-VL-32B-Instruct-Q8_0.gguf \
-    -p "integrated_multimodal_description: [Shot 1] ..." -o fox.avi
+    -p "integrated_multimodal_description: [Shot 1] ..." -o fox.mp4
 # the same in ComfyUI's int8 files: transformer 21.0 GB, VAE 2.8 GB, and the text encoder as
 # NVFP4 (15.7 GB) with the release's tokenizer/tokenizer.json in a tokenizer/ folder beside it
 ./target/release/oxinfer --device cpu \
@@ -265,10 +278,10 @@ files, the single-file text encoders, the bf16 transformers) were not.
     --vae vae/minimax_h3_video_vae_int8_convrot.safetensors \
     --lora loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors \
     --text-encoder text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors \
-    -p "integrated_multimodal_description: [Shot 1] ..." -o fox.avi
+    -p "integrated_multimodal_description: [Shot 1] ..." -o fox.mp4
 # the release folder, 8 forwards
 ./target/release/oxinfer --model /path/to/MiniMax-H3 --device cpu \
-    --lora minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors -p "..." -o fox.avi
+    --lora minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors -p "..." -o fox.mp4
 ```
 
 | flag | |

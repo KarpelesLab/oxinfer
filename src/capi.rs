@@ -2639,8 +2639,9 @@ pub unsafe extern "C" fn oxi_video_load(
 /// Generates a video. `params_json`: `prompt` (required), `frames` or `seconds`, `size`
 /// (`"WxH"`), `steps`, `seed`, `first_frame` / `last_frame` (image files), `references` (files,
 /// ref2va), `ref_image_edge`. `progress` gets each denoising step (non-zero cancels). Writes the
-/// AVI (Motion JPEG and PCM; the `media` feature) to `out_avi` and the soundtrack WAV to
-/// `out_wav` when they are not NULL. Returns 0, 2 when cancelled, or -1.
+/// video (the `media` feature) to `out_video` in the format of its extension (`.mp4`: H.264 and
+/// AAC, also for other names; `.webm`: VP9 and Opus; `.avi`: Motion JPEG and PCM) and the
+/// soundtrack WAV to `out_wav` when they are not NULL. Returns 0, 2 when cancelled, or -1.
 #[cfg(not(target_arch = "wasm32"))]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxi_video_generate(
@@ -2648,14 +2649,14 @@ pub unsafe extern "C" fn oxi_video_generate(
     params_json: *const c_char,
     progress: OxiStepFn,
     user: *mut c_void,
-    out_avi: *const c_char,
+    out_video: *const c_char,
     out_wav: *const c_char,
 ) -> c_int {
     guard(-1, || {
         use std::sync::atomic::Ordering;
         let v = unsafe { v.as_ref() }.context("video is NULL")?;
         let o = unsafe { json_options(params_json, "params_json") }?;
-        let out_avi = unsafe { opt_str_arg(out_avi, "out_avi") }?;
+        let out_video = unsafe { opt_str_arg(out_video, "out_video") }?;
         let out_wav = unsafe { opt_str_arg(out_wav, "out_wav") }?;
         let prompt = o["prompt"].as_str().context("params_json: no prompt")?;
         let g = v.pipe.lock().unwrap_or_else(|p| p.into_inner());
@@ -2730,11 +2731,16 @@ pub unsafe extern "C" fn oxi_video_generate(
             Err(_) if v.cancel.load(Ordering::Relaxed) => return Ok(2),
             r => r?,
         };
-        if let Some(path) = out_avi {
+        if let Some(path) = out_video {
             #[cfg(feature = "media")]
-            std::fs::write(path, crate::minimax_h3::encode::avi_mjpeg(&video)?).with_context(|| format!("write {path}"))?;
+            {
+                // The format from the extension: .mp4 (the default for others), .webm, .avi.
+                let ext = std::path::Path::new(path).extension().and_then(|e| e.to_str()).unwrap_or("mp4");
+                let f = crate::minimax_h3::video::VideoFormat::parse(ext).unwrap_or(crate::minimax_h3::video::VideoFormat::Mp4);
+                std::fs::write(path, crate::minimax_h3::encode::encode_video(&video, f)?).with_context(|| format!("write {path}"))?;
+            }
             #[cfg(not(feature = "media"))]
-            bail!("built without the `media` feature: no AVI can be written ({path})");
+            bail!("built without the `media` feature: no video file can be written ({path})");
         }
         if let (Some(path), Some(a)) = (out_wav, &video.audio) {
             std::fs::write(path, a.to_wav()).with_context(|| format!("write {path}"))?;

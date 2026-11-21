@@ -1,9 +1,8 @@
 <script setup>
 // Video generation on the native backend (MiniMax-H3, /v1/videos): a job per request, followed
-// while it waits for the model, loads it and denoises; once it is done its AVI (Motion JPEG and
-// PCM, which browsers do not play) is taken apart here and played on a canvas in time with the
-// soundtrack (the WAV variant), and both can be saved.
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
+// while it waits for the model, loads it and denoises; once it is done its MP4 (H.264 and AAC)
+// plays in a <video> element and, with the soundtrack (the WAV variant), can be saved.
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { store, fmtBytes, fmtSecs } from '../lib/native.js';
 import { readSse } from '../lib/api.js';
 import ModelPicker from './ModelPicker.vue';
@@ -16,6 +15,7 @@ const seconds = ref('5');
 const size = ref('');
 const steps = ref('');
 const seed = ref('');
+const format = ref('mp4');
 const first = ref(null);
 const last = ref(null);
 const refs = ref([]);
@@ -91,6 +91,7 @@ function form() {
   if (size.value.trim()) f.append('size', size.value.trim());
   if (steps.value) f.append('steps', steps.value);
   if (seed.value) f.append('seed', seed.value);
+  f.append('response_format', format.value);
   if (first.value) f.append('first_frame', first.value, first.value.name);
   if (last.value) f.append('last_frame', last.value, last.value.name);
   for (const r of refs.value) f.append('references[]', r, r.name);
@@ -132,34 +133,10 @@ async function remove(j) {
 }
 
 // ---- the player ------------------------------------------------------------------------------
-const canvas = ref(null);
-const audioEl = ref(null);
-const player = ref(null); // { id, frames: ImageBitmap[], fps, aviUrl, wavUrl, width, height }
+// The video file (MP4: H.264 and AAC, by default) in a <video> element with its own soundtrack.
+const player = ref(null); // { id, url, type, name, wavUrl, bytes }
 const loadingPlayer = ref(false);
-const playing = ref(false);
-const position = ref(0); // frame index
-let raf = 0;
-let clock = { t0: 0, from: 0 };
-
-/// The frames (JPEG) of a Motion JPEG AVI: the `00dc` chunks of its `movi` list.
-function aviFrames(buf) {
-  const b = new Uint8Array(buf);
-  const dv = new DataView(buf);
-  const tag = (o) => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
-  const out = [];
-  const walk = (start, end) => {
-    let o = start;
-    while (o + 8 <= end) {
-      const id = tag(o);
-      const n = dv.getUint32(o + 4, true);
-      if (id === 'RIFF' || id === 'LIST') walk(o + 12, Math.min(end, o + 8 + n));
-      else if (/^\d\ddc$|^\d\ddb$/.test(id)) out.push(b.subarray(o + 8, o + 8 + n));
-      o += 8 + n + (n & 1);
-    }
-  };
-  walk(0, b.length);
-  return out;
-}
+const EXT = { 'video/mp4': 'mp4', 'video/webm': 'webm', 'video/x-msvideo': 'avi' };
 
 async function openPlayer(j) {
   if (player.value?.id === j.id || j.status !== 'completed') return;
@@ -167,14 +144,11 @@ async function openPlayer(j) {
   loadingPlayer.value = true;
   try {
     const base = `v1/videos/${encodeURIComponent(j.id)}/content?variant=`;
-    const avi = await (await store.api.raw(`${base}video`)).blob();
-    const frames = await Promise.all(aviFrames(await avi.arrayBuffer()).map((f) => createImageBitmap(new Blob([f], { type: 'image/jpeg' }))));
+    const blob = await (await store.api.raw(`${base}video`)).blob();
+    const type = blob.type || 'video/mp4';
     let wavUrl = '';
     if (j.has_audio) wavUrl = URL.createObjectURL(await (await store.api.raw(`${base}audio`)).blob());
-    player.value = { id: j.id, frames, fps: j.fps || 24, aviUrl: URL.createObjectURL(avi), wavUrl, width: frames[0]?.width || 0, height: frames[0]?.height || 0 };
-    position.value = 0;
-    await nextTick();
-    draw(0);
+    player.value = { id: j.id, url: URL.createObjectURL(blob), type, name: `oxinfer-video.${EXT[type] || 'mp4'}`, wavUrl, bytes: blob.size };
   } catch (e) {
     error.value = `The video could not be opened (${e.message}).`;
   }
@@ -182,74 +156,11 @@ async function openPlayer(j) {
 }
 
 function closePlayer() {
-  pause();
   const p = player.value;
   if (!p) return;
-  p.frames.forEach((f) => f.close?.());
-  URL.revokeObjectURL(p.aviUrl);
+  URL.revokeObjectURL(p.url);
   if (p.wavUrl) URL.revokeObjectURL(p.wavUrl);
   player.value = null;
-}
-
-function draw(i) {
-  const p = player.value;
-  const c = canvas.value;
-  if (!p || !c || !p.frames.length) return;
-  const f = p.frames[Math.max(0, Math.min(p.frames.length - 1, i))];
-  c.getContext('2d').drawImage(f, 0, 0, c.width, c.height);
-}
-
-function now() {
-  const a = audioEl.value;
-  if (a && player.value?.wavUrl && !a.paused) return a.currentTime;
-  return clock.from + (performance.now() - clock.t0) / 1e3;
-}
-
-function tick() {
-  const p = player.value;
-  if (!p || !playing.value) return;
-  const i = Math.floor(now() * p.fps);
-  if (i >= p.frames.length) {
-    pause();
-    position.value = p.frames.length - 1;
-    draw(position.value);
-    return;
-  }
-  if (i !== position.value) {
-    position.value = i;
-    draw(i);
-  }
-  raf = requestAnimationFrame(tick);
-}
-
-function play() {
-  const p = player.value;
-  if (!p) return;
-  if (position.value >= p.frames.length - 1) position.value = 0;
-  const from = position.value / p.fps;
-  clock = { t0: performance.now(), from };
-  playing.value = true;
-  const a = audioEl.value;
-  if (a && p.wavUrl) {
-    a.currentTime = from;
-    a.play().catch(() => {});
-  }
-  raf = requestAnimationFrame(tick);
-}
-
-function pause() {
-  playing.value = false;
-  cancelAnimationFrame(raf);
-  audioEl.value?.pause();
-}
-
-function seek(e) {
-  const i = Number(e.target.value);
-  const was = playing.value;
-  pause();
-  position.value = i;
-  draw(i);
-  if (was) play();
 }
 
 watch(job, (j) => {
@@ -277,6 +188,13 @@ onUnmounted(() => {
         <label class="inline">Seconds <input v-model="seconds" class="num" type="number" min="0.5" max="15" step="0.5" /></label>
         <label class="inline">Size <input v-model="size" class="num wide" type="text" placeholder="1344x768" spellcheck="false" /></label>
         <label class="inline">Steps <input v-model="steps" class="num" type="number" min="2" max="200" placeholder="50" /></label>
+        <label class="inline">File
+          <select v-model="format" aria-label="Video file format">
+            <option value="mp4">MP4 (H.264 + AAC)</option>
+            <option value="webm">WebM (VP9 + Opus)</option>
+            <option value="avi">AVI (Motion JPEG + PCM)</option>
+          </select>
+        </label>
         <label class="inline">Seed <input v-model="seed" class="num" type="number" min="0" placeholder="random" /></label>
         <p class="hint">At 24 frames a second, rounded up to 17 n + 5 frames; the size in multiples of 32. MiniMax-H3 is made for 5 to 15 seconds.</p>
         <label class="block">First frame <input type="file" accept="image/*" @change="first = $event.target.files[0] || null" /></label>
@@ -308,19 +226,12 @@ onUnmounted(() => {
           <template v-else>
             <p v-if="loadingPlayer" class="working" role="status">Opening the video…</p>
             <div v-if="player" class="player-box">
-              <canvas ref="canvas" :width="player.width" :height="player.height" class="screen" data-testid="video-canvas"></canvas>
-              <audio v-if="player.wavUrl" ref="audioEl" :src="player.wavUrl" preload="auto"></audio>
-              <div class="controls">
-                <button type="button" class="primary" data-testid="video-play" @click="playing ? pause() : play()">{{ playing ? 'Pause' : 'Play' }}</button>
-                <input type="range" min="0" :max="player.frames.length - 1" :value="position" aria-label="Position" @input="seek" />
-                <span class="hint">{{ (position / player.fps).toFixed(1) }} / {{ (player.frames.length / player.fps).toFixed(1) }} s</span>
-              </div>
+              <video :src="player.url" controls playsinline class="screen" data-testid="video-player"></video>
               <p class="hint">
-                {{ player.width }}x{{ player.height }}, {{ player.frames.length }} frames{{ player.wavUrl ? ', with sound' : ', no soundtrack' }} ·
-                <a :href="player.aviUrl" download="oxinfer-video.avi">Download AVI</a>
+                {{ job.size }}, {{ job.frames }} frames{{ job.has_audio ? ', with sound' : ', no soundtrack' }} · {{ (player.bytes / 1e6).toFixed(1) }} MB ·
+                <a :href="player.url" :download="player.name">Download {{ player.name.split('.').pop().toUpperCase() }}</a>
                 <template v-if="player.wavUrl"> · <a :href="player.wavUrl" download="oxinfer-video.wav">Download WAV</a></template>
               </p>
-              <p class="hint">The AVI (Motion JPEG with PCM sound) plays in VLC and mpv; <code>ffmpeg -i oxinfer-video.avi out.mp4</code> converts it.</p>
             </div>
           </template>
         </div>
@@ -364,15 +275,6 @@ onUnmounted(() => {
   height: auto;
   background: #000;
   border-radius: 4px;
-}
-.controls {
-  display: flex;
-  gap: 0.75rem;
-  align-items: center;
-  margin-top: 0.5rem;
-}
-.controls input[type='range'] {
-  flex: 1;
 }
 .list li {
   padding: 0.25rem 0;

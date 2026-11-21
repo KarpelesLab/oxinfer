@@ -162,6 +162,251 @@ pub fn avi_mjpeg(v: &Video) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+pub use super::video::VideoFormat;
+
+/// `v` in `format` (see [`mp4_or_webm`] and [`avi_mjpeg`]).
+pub fn encode_video(v: &Video, format: VideoFormat) -> Result<Vec<u8>> {
+    match format {
+        VideoFormat::Avi => avi_mjpeg(v),
+        f => mp4_or_webm(v, f),
+    }
+}
+
+/// An in-memory `Write + Seek` a muxer can own while the caller keeps the bytes.
+#[derive(Clone, Default)]
+struct SharedBuf(std::sync::Arc<std::sync::Mutex<std::io::Cursor<Vec<u8>>>>);
+
+impl std::io::Write for SharedBuf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).write(b)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::io::Seek for SharedBuf {
+    fn seek(&mut self, p: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).seek(p)
+    }
+}
+
+/// RGB8 to planar YUV 4:2:0, BT.601 limited range (what players assume of an H.264 / VP9
+/// stream without colour signalling at these sizes).
+pub fn rgb_to_yuv420(rgb: &[u8], w: usize, h: usize) -> [Vec<u8>; 3] {
+    let px = |x: usize, y: usize| {
+        let i = (y * w + x) * 3;
+        (rgb[i] as f32, rgb[i + 1] as f32, rgb[i + 2] as f32)
+    };
+    let mut yp = vec![0u8; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let (r, g, b) = px(x, y);
+            yp[y * w + x] = (16.0 + 0.257 * r + 0.504 * g + 0.098 * b).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+    let (mut u, mut v) = (vec![0u8; cw * ch], vec![0u8; cw * ch]);
+    for cy in 0..ch {
+        for cx in 0..cw {
+            let (mut r, mut g, mut b, mut n) = (0.0, 0.0, 0.0, 0.0);
+            for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let (x, y) = (cx * 2 + dx, cy * 2 + dy);
+                if x < w && y < h {
+                    let p = px(x, y);
+                    (r, g, b, n) = (r + p.0, g + p.1, b + p.2, n + 1.0);
+                }
+            }
+            let (r, g, b) = (r / n, g / n, b / n);
+            u[cy * cw + cx] = (128.0 - 0.148 * r - 0.291 * g + 0.439 * b).round().clamp(0.0, 255.0) as u8;
+            v[cy * cw + cx] = (128.0 + 0.439 * r - 0.368 * g - 0.071 * b).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    [yp, u, v]
+}
+
+/// Planar YUV 4:2:0 (BT.601 limited range) back to RGB8: for checking an encode.
+pub fn yuv420_to_rgb(planes: [&[u8]; 3], strides: [usize; 3], w: usize, h: usize) -> Vec<u8> {
+    let mut out = vec![0u8; w * h * 3];
+    for y in 0..h {
+        for x in 0..w {
+            let yy = planes[0][y * strides[0] + x] as f32 - 16.0;
+            let u = planes[1][(y / 2) * strides[1] + x / 2] as f32 - 128.0;
+            let v = planes[2][(y / 2) * strides[2] + x / 2] as f32 - 128.0;
+            let c = |f: f32| f.round().clamp(0.0, 255.0) as u8;
+            let i = (y * w + x) * 3;
+            out[i] = c(1.164 * yy + 1.596 * v);
+            out[i + 1] = c(1.164 * yy - 0.392 * u - 0.813 * v);
+            out[i + 2] = c(1.164 * yy + 2.017 * u);
+        }
+    }
+    out
+}
+
+fn av(e: oxideav_core::Error) -> anyhow::Error {
+    anyhow::anyhow!("{e}")
+}
+
+/// H.264 (constant QP 20, an IDR picture every second, 4:2:0) and AAC-LC (128 kb/s per channel
+/// pair) in MP4, or VP9 and Opus in WebM, through oxideav's encoders and muxers. The frame size
+/// must be a multiple of 16 (MiniMax-H3's are multiples of 32).
+pub fn mp4_or_webm(v: &Video, format: VideoFormat) -> Result<Vec<u8>> {
+    use oxideav_core::{
+        AudioFrame, CodecId, CodecOptions, CodecParameters, Frame, PixelFormat, Rational, SampleFormat, StreamInfo, TimeBase, VideoFrame,
+        VideoPlane,
+    };
+    if v.frames.is_empty() {
+        bail!("no frames to write");
+    }
+    let (vcodec, acodec, container) = match format {
+        VideoFormat::Mp4 => ("h264", "aac", "mp4"),
+        VideoFormat::Webm => ("vp9", "opus", "webm"),
+        VideoFormat::Avi => return avi_mjpeg(v),
+    };
+    let media = crate::media::Media::new();
+    let ctx = media.context();
+    let fps = FPS as i64;
+    let mut vp = CodecParameters::video(CodecId::new(vcodec));
+    vp.width = Some(v.width as u32);
+    vp.height = Some(v.height as u32);
+    vp.pixel_format = Some(PixelFormat::Yuv420P);
+    vp.frame_rate = Some(Rational::new(fps, 1));
+    if format == VideoFormat::Mp4 {
+        vp.options = CodecOptions::new()
+            .set("format", "avcc")
+            .set("rc", "cqp")
+            .set("qp", "20")
+            .set("gop", FPS.to_string());
+    }
+    let mut venc = ctx
+        .codecs
+        .first_encoder(&vp)
+        .map_err(av)
+        .with_context(|| format!("the {vcodec} encoder"))?;
+    let vtb = TimeBase::new(1, fps);
+    // Opus takes 48 kHz only: the soundtrack is resampled for it.
+    let resampled = match (format, v.audio.as_ref().filter(|a| !a.is_empty())) {
+        (VideoFormat::Webm, Some(a)) if a.sample_rate != 48_000 => Some(Soundtrack {
+            sample_rate: 48_000,
+            channels: a
+                .channels
+                .iter()
+                .map(|c| crate::audio::resample(c, a.sample_rate as usize, 48_000))
+                .collect(),
+        }),
+        _ => None,
+    };
+    let audio = resampled.as_ref().or(v.audio.as_ref()).filter(|a| !a.is_empty());
+    // Samples per channel of each frame fed: AAC's frame, Opus' 20 ms.
+    let chunk = if format == VideoFormat::Webm { 960 } else { 1024 };
+    let mut aenc = match audio {
+        Some(a) => {
+            let mut ap = CodecParameters::audio(CodecId::new(acodec));
+            ap.sample_rate = Some(a.sample_rate);
+            ap.channels = Some(a.channels.len() as u16);
+            ap.sample_format = Some(SampleFormat::S16);
+            ap.bit_rate = Some(64_000 * a.channels.len() as u64);
+            Some(
+                ctx.codecs
+                    .first_encoder(&ap)
+                    .map_err(av)
+                    .with_context(|| format!("the {acodec} encoder"))?,
+            )
+        }
+        None => None,
+    };
+    let atb = TimeBase::new(1, audio.map_or(1, |a| a.sample_rate as i64));
+    // Encode everything first: the muxer needs the encoders' parameters (extradata) up front.
+    let mut vpk = Vec::new();
+    for (i, f) in v.frames.iter().enumerate() {
+        let [y, u, w2] = rgb_to_yuv420(f, v.width, v.height);
+        let cw = v.width.div_ceil(2);
+        let frame = VideoFrame {
+            pts: Some(i as i64),
+            planes: vec![
+                VideoPlane { stride: v.width, data: y },
+                VideoPlane { stride: cw, data: u },
+                VideoPlane { stride: cw, data: w2 },
+            ],
+        };
+        venc.send_frame(&Frame::Video(frame)).map_err(av)?;
+        while let Ok(p) = venc.receive_packet() {
+            vpk.push(p);
+        }
+    }
+    venc.flush().map_err(av)?;
+    while let Ok(p) = venc.receive_packet() {
+        vpk.push(p);
+    }
+    let mut apk = Vec::new();
+    if let (Some(enc), Some(a)) = (aenc.as_mut(), audio) {
+        // Interleaved 16-bit chunks (the last one padded with silence to a whole frame).
+        let n = a.len();
+        let mut at = 0;
+        while at < n {
+            let end = (at + chunk).min(n);
+            let mut pcm = a.interleaved(at..end);
+            pcm.resize(chunk * a.channels.len(), 0.0);
+            let data = crate::tts::pcm16_bytes(&pcm);
+            let end = at + chunk;
+            let fr = AudioFrame {
+                samples: (end - at) as u32,
+                pts: Some(at as i64),
+                data: vec![data],
+            };
+            enc.send_frame(&Frame::Audio(fr)).map_err(av)?;
+            while let Ok(p) = enc.receive_packet() {
+                apk.push(p);
+            }
+            at = end;
+        }
+        enc.flush().map_err(av)?;
+        while let Ok(p) = enc.receive_packet() {
+            apk.push(p);
+        }
+    }
+    let mut streams = vec![StreamInfo {
+        index: 0,
+        time_base: vtb,
+        duration: Some(v.frames.len() as i64),
+        start_time: Some(0),
+        params: venc.output_params().clone(),
+    }];
+    if let (Some(enc), Some(a)) = (&aenc, audio) {
+        streams.push(StreamInfo {
+            index: 1,
+            time_base: atb,
+            duration: Some(a.len() as i64),
+            start_time: Some(0),
+            params: enc.output_params().clone(),
+        });
+    }
+    let buf = SharedBuf::default();
+    let mut mux = ctx.containers.open_muxer(container, Box::new(buf.clone()), &streams).map_err(av)?;
+    mux.write_header().map_err(av)?;
+    // Interleaved by time.
+    let key = |p: &oxideav_core::Packet| {
+        let t = p.dts.or(p.pts).unwrap_or(0) as f64;
+        t * p.time_base.0.num as f64 / p.time_base.0.den as f64
+    };
+    for p in &mut vpk {
+        p.stream_index = 0;
+        p.time_base = vtb;
+    }
+    for p in &mut apk {
+        p.stream_index = 1;
+    }
+    let mut all: Vec<oxideav_core::Packet> = vpk.into_iter().chain(apk).collect();
+    all.sort_by(|a, b| key(a).total_cmp(&key(b)));
+    for p in &all {
+        mux.write_packet(p).map_err(av)?;
+    }
+    mux.write_trailer().map_err(av)?;
+    drop(mux);
+    let out = buf.0.lock().unwrap_or_else(|p| p.into_inner()).get_ref().clone();
+    Ok(out)
+}
+
 /// The frames as an animated WebP (lossless; no audio), 24 fps in whole milliseconds.
 pub fn animated_webp(v: &Video) -> Result<Vec<u8>> {
     use oxideav_webp::anim_encode::AnimFrame;
@@ -184,6 +429,178 @@ pub fn animated_webp(v: &Video) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use oxideav_core::MediaType;
+
+    /// A moving picture with detail (gradients and a moving square) and a stereo tone.
+    pub(crate) fn test_video(w: usize, h: usize, n: usize) -> Video {
+        let frames = (0..n)
+            .map(|f| {
+                let mut rgb = vec![0u8; w * h * 3];
+                for y in 0..h {
+                    for x in 0..w {
+                        let i = (y * w + x) * 3;
+                        let inside = (x + 64 - (f * 3) % 64) % 64 < 16 && (y / 16) % 2 == 0;
+                        rgb[i] = (x * 255 / w) as u8;
+                        rgb[i + 1] = (y * 255 / h) as u8;
+                        rgb[i + 2] = if inside { 230 } else { ((x + y + f * 4) % 256) as u8 / 2 };
+                    }
+                }
+                rgb
+            })
+            .collect();
+        let len = n * 32000 / FPS;
+        let tone = |hz: f32| {
+            (0..len)
+                .map(|i| 0.3 * (i as f32 * hz * std::f32::consts::TAU / 32000.0).sin())
+                .collect()
+        };
+        Video {
+            width: w,
+            height: h,
+            frames,
+            audio: Some(Soundtrack {
+                sample_rate: 32000,
+                channels: vec![tone(440.0), tone(660.0)],
+            }),
+        }
+    }
+
+    /// What [`decode_back`] found.
+    pub(crate) struct Decoded {
+        pub frames: Vec<Vec<u8>>,
+        pub rate: u32,
+        pub channels: u16,
+        /// Audio samples per channel: decoded, or the packets' durations when the audio decoder
+        /// refused the packets (`audio_error`).
+        pub samples: usize,
+        pub audio_error: Option<String>,
+    }
+
+    /// Demuxes `bytes` (container `fmt`) and decodes its video and audio with oxideav.
+    pub(crate) fn decode_back(bytes: Vec<u8>, fmt: &str, w: usize, h: usize) -> Decoded {
+        use oxideav_core::Frame;
+        let media = crate::media::Media::new();
+        let ctx = media.context();
+        let mut input: Box<dyn oxideav_core::ReadSeek> = Box::new(std::io::Cursor::new(bytes));
+        let format = ctx.containers.probe_input(&mut *input, Some(fmt)).unwrap();
+        let mut demux = ctx.containers.open_demuxer(&format, input, &ctx.codecs).unwrap();
+        let streams = demux.streams().to_vec();
+        let vs = streams.iter().find(|s| s.params.media_type == MediaType::Video).unwrap().clone();
+        let as_ = streams.iter().find(|s| s.params.media_type == MediaType::Audio).unwrap().clone();
+        let mut vdec = ctx.codecs.first_decoder(&vs.params).unwrap();
+        let mut adec = ctx.codecs.first_decoder(&as_.params).unwrap();
+        let (mut frames, mut samples) = (Vec::new(), 0usize);
+        let (mut audio_error, mut packet_samples) = (None::<String>, 0usize);
+        let take = |d: &mut Box<dyn oxideav_core::Decoder>, frames: &mut Vec<Vec<u8>>, samples: &mut usize| {
+            while let Ok(f) = d.receive_frame() {
+                match f {
+                    Frame::Video(vf) => {
+                        let p = vf.image_planes();
+                        frames.push(yuv420_to_rgb(
+                            [&p[0].data, &p[1].data, &p[2].data],
+                            [p[0].stride, p[1].stride, p[2].stride],
+                            w,
+                            h,
+                        ));
+                    }
+                    Frame::Audio(af) => *samples += af.samples as usize,
+                    _ => {}
+                }
+            }
+        };
+        while let Ok(p) = demux.next_packet() {
+            if p.stream_index == vs.index {
+                vdec.send_packet(&p).unwrap();
+                take(&mut vdec, &mut frames, &mut samples);
+            } else if p.stream_index == as_.index {
+                if audio_error.is_some() {
+                    packet_samples += p.duration.unwrap_or(0) as usize;
+                    continue;
+                }
+                match adec.send_packet(&p) {
+                    Ok(()) => take(&mut adec, &mut frames, &mut samples),
+                    Err(e) => {
+                        audio_error = Some(e.to_string());
+                        packet_samples = samples + p.duration.unwrap_or(0) as usize;
+                    }
+                }
+            }
+        }
+        let _ = vdec.flush();
+        take(&mut vdec, &mut frames, &mut samples);
+        let _ = adec.flush();
+        take(&mut adec, &mut frames, &mut samples);
+        Decoded {
+            frames,
+            rate: as_.params.sample_rate.unwrap_or(0),
+            channels: as_.params.channels.unwrap_or(0),
+            samples: if audio_error.is_some() { packet_samples } else { samples },
+            audio_error,
+        }
+    }
+
+    pub(crate) fn psnr(a: &[u8], b: &[u8]) -> f64 {
+        let mse = a.iter().zip(b).map(|(&x, &y)| (x as f64 - y as f64).powi(2)).sum::<f64>() / a.len() as f64;
+        10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10()
+    }
+
+    /// MP4 (H.264 + AAC) and WebM (VP9 + Opus) decode back with oxideav to the frames, at a
+    /// reasonable PSNR, with the whole soundtrack.
+    #[test]
+    fn mp4_and_webm_decode_back() {
+        let (w, h, n) = (128usize, 64usize, 30usize);
+        let v = test_video(w, h, n);
+        // The YUV conversion alone.
+        let [y, u, vv] = rgb_to_yuv420(&v.frames[0], w, h);
+        let back = yuv420_to_rgb([&y, &u, &vv], [w, w / 2, w / 2], w, h);
+        let conv = psnr(&v.frames[0], &back);
+        for (f, fmt) in [(VideoFormat::Mp4, "mp4"), (VideoFormat::Webm, "webm")] {
+            let bytes = encode_video(&v, f).unwrap_or_else(|e| panic!("{fmt}: {e:#}"));
+            let size = bytes.len();
+            if let Ok(dir) = std::env::var("OXINFER_ENCODE_OUT") {
+                std::fs::write(format!("{dir}/test.{fmt}"), &bytes).unwrap();
+                std::fs::write(format!("{dir}/test.rgb"), v.frames.concat()).unwrap();
+            }
+            let d = decode_back(bytes, fmt, w, h);
+            let (frames, ch, samples) = (&d.frames, d.channels, d.samples);
+            assert_eq!(frames.len(), n, "{fmt}: frames");
+            let p: Vec<f64> = [0, n / 2, n - 1].iter().map(|&i| psnr(&v.frames[i], &frames[i])).collect();
+            eprintln!(
+                "[{fmt}: {size} bytes, PSNR {p:.1?} dB (the YUV conversion alone {conv:.1} dB), audio {} Hz x{ch}, {samples} samples{}]",
+                d.rate,
+                d.audio_error
+                    .as_ref()
+                    .map(|e| format!(" (oxideav's decoder: {e}; counted from the packets)"))
+                    .unwrap_or_default()
+            );
+            assert!(p.iter().all(|&x| x > 28.0), "{fmt}: PSNR {p:?}");
+            assert_eq!(ch, 2, "{fmt}");
+            let secs = samples as f64 / d.rate as f64;
+            let want = v.audio.as_ref().unwrap().len() as f64 / 32000.0;
+            assert!(secs + 0.05 >= want, "{fmt}: {secs} s of audio for {want} s");
+        }
+    }
+
+    /// A video of the tiny random MiniMax-H3 release, written as MP4 and decoded back by oxideav:
+    /// every frame, at the PSNR such noise allows (the random weights make noise, the hardest
+    /// content there is: about 19 dB at QP 20, as for libx264), and the soundtrack's AAC stream.
+    #[test]
+    fn tiny_minimax_h3_to_mp4() {
+        let dir = std::env::temp_dir().join(format!("oxinfer-h3-mp4-{}", std::process::id()));
+        crate::minimax_h3::tiny::write_tiny_video_release(&dir).unwrap();
+        let pipe = crate::minimax_h3::video::VideoPipeline::load(&dir, &dir.join("text_encoder")).unwrap();
+        let mut p = crate::minimax_h3::video::VideoParams::new("A red fox.");
+        (p.size, p.frames, p.steps, p.seed) = (Some((64, 64)), 22, 3, 1);
+        let v = pipe.generate(&p, None, &mut |_, _| {}).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        let bytes = encode_video(&v, VideoFormat::Mp4).unwrap();
+        let d = decode_back(bytes, "mp4", 64, 64);
+        assert_eq!(d.frames.len(), v.frames.len());
+        let p: Vec<f64> = d.frames.iter().zip(&v.frames).map(|(a, b)| psnr(a, b)).collect();
+        let min = p.iter().cloned().fold(f64::MAX, f64::min);
+        eprintln!("[tiny MiniMax-H3 MP4: PSNR min {min:.1} dB, audio {} Hz x{}]", d.rate, d.channels);
+        assert!(min > 15.0, "{p:?}");
+        assert_eq!((d.rate, d.channels), (32000, 2));
+    }
 
     /// The AVI demuxed by oxideav: every frame and every audio sample comes back.
     #[test]

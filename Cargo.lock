@@ -488,9 +488,9 @@ dependencies = [
 
 [[package]]
 name = "oxideav-mp4"
-version = "0.0.10"
+version = "0.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3fb26f41df4d00b495208a5943ae59cb33e6aff5c40a505a944b3e9361ffddc"
+checksum = "e7766473a510b620ddcd87ea772d2b8193c566d9069799bd362ea695bc9562bd"
 dependencies = [
  "aes",
  "cbc",

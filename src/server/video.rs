@@ -10,7 +10,7 @@
 //! | `GET /v1/videos` | the jobs, newest first |
 //! | `GET /v1/videos/{id}` | one job |
 //! | `GET /v1/videos/{id}/events` | the job as server-sent events until it ends (an extension) |
-//! | `GET /v1/videos/{id}/content?variant=video\|audio\|thumbnail` | the AVI (Motion JPEG and 16-bit PCM), the WAV soundtrack, the first frame as PNG |
+//! | `GET /v1/videos/{id}/content?variant=video\|audio\|thumbnail` | the video (MP4: H.264 and AAC, by default), the WAV soundtrack, the first frame as PNG |
 //! | `POST /v1/videos/{id}/cancel` | stops it between two steps (an extension) |
 //! | `DELETE /v1/videos/{id}` | cancels it if it runs and forgets it |
 //!
@@ -42,8 +42,8 @@ const KEEP_JOBS: usize = 32;
 /// What a job makes: the files of a completed one.
 #[derive(Default)]
 struct Files {
-    /// Motion JPEG and PCM in AVI (the `media` feature).
-    avi: Option<Vec<u8>>,
+    /// The video file in the request's format (the `media` feature).
+    video: Option<(Vec<u8>, &'static str)>,
     wav: Option<Vec<u8>>,
     thumbnail: Option<Vec<u8>>,
 }
@@ -117,7 +117,7 @@ impl Job {
             "download": s.download,
             "elapsed": elapsed.map(|e| (e * 10.0).round() / 10.0),
             "variants": {
-                "video": s.files.avi.as_ref().map(|b| b.len()),
+                "video": s.files.video.as_ref().map(|b| b.0.len()),
                 "audio": s.files.wav.as_ref().map(|b| b.len()),
                 "thumbnail": s.files.thumbnail.as_ref().map(|b| b.len()),
             },
@@ -175,6 +175,9 @@ struct Request {
     steps: Option<usize>,
     seed: Option<u64>,
     ref_image_edge: Option<usize>,
+    /// The video file's format: `mp4` (H.264 and AAC, the default), `webm` (VP9 and Opus), `avi`
+    /// (Motion JPEG and PCM).
+    format: crate::minimax_h3::video::VideoFormat,
     /// Local files of the first / last frame and of the references (`temp` owns them).
     first: Option<std::path::PathBuf>,
     last: Option<std::path::PathBuf>,
@@ -291,6 +294,11 @@ impl Request {
             None | Some("") | Some("auto") => None,
             Some(sz) => Some(parse_size(sz)?),
         };
+        let format = match s("response_format").or_else(|| s("format")).as_deref() {
+            None | Some("") => crate::minimax_h3::video::VideoFormat::Mp4,
+            Some(f) => crate::minimax_h3::video::VideoFormat::parse(f)
+                .ok_or_else(|| ApiError::bad(format!("response_format {f:?}: mp4, webm or avi")).param("response_format"))?,
+        };
         if !refs.is_empty() && (first.is_some() || last.is_some()) {
             return Err(ApiError::bad("references (ref2va) and first / last frames (fl2va) are different tasks").param("references"));
         }
@@ -306,6 +314,7 @@ impl Request {
             steps,
             seed: num("seed")?.map(|v| v as u64),
             ref_image_edge: num("ref_image_edge")?.map(|v| v as usize),
+            format,
             first,
             last,
             refs,
@@ -537,11 +546,13 @@ fn run(api: &Api, j: &Job, r: Request) -> ApiResult<()> {
     let mut files = Files {
         wav: video.audio.as_ref().filter(|a| !a.is_empty()).map(|a| a.to_wav()),
         thumbnail: video.frames.first().map(|f| crate::png::encode_rgb(video.width, video.height, f)),
-        avi: None,
+        video: None,
     };
     #[cfg(feature = "media")]
     {
-        files.avi = Some(crate::minimax_h3::encode::avi_mjpeg(&video).map_err(ApiError::internal)?);
+        let f = r.format;
+        let bytes = crate::minimax_h3::encode::encode_video(&video, f).map_err(ApiError::internal)?;
+        files.video = Some((bytes, f.mime()));
     }
     j.set(|s| s.files = files);
     Ok(())
@@ -644,22 +655,20 @@ pub(super) fn route(api: &Arc<Api>, req: &ApiRequest, rest: &str) -> ApiResult<O
                 .code("video_not_ready"));
             }
             let (bytes, ct, what) = match variant.as_str() {
-                "video" | "avi" => (
-                    &s.files.avi,
-                    "video/x-msvideo",
-                    "the AVI (built without the `media` feature, or expired)",
+                "video" => (
+                    s.files.video.as_ref().map(|v| &v.0),
+                    s.files.video.as_ref().map_or("video/mp4", |v| v.1),
+                    "a video file (built without the `media` feature, or expired)",
                 ),
                 "audio" | "wav" => (
-                    &s.files.wav,
+                    s.files.wav.as_ref(),
                     "audio/wav",
                     "a soundtrack (the model has no audio VAE, or it expired)",
                 ),
-                "thumbnail" | "png" => (&s.files.thumbnail, "image/png", "a thumbnail (expired)"),
+                "thumbnail" | "png" => (s.files.thumbnail.as_ref(), "image/png", "a thumbnail (expired)"),
                 v => return Err(ApiError::bad(format!("variant {v:?}: video, audio or thumbnail")).param("variant")),
             };
-            let b = bytes
-                .as_ref()
-                .ok_or_else(|| ApiError::new(404, format!("video {id} has no {what}")))?;
+            let b = bytes.ok_or_else(|| ApiError::new(404, format!("video {id} has no {what}")))?;
             Ok(Output::Full(ApiResponse {
                 status: 200,
                 content_type: ct.into(),
