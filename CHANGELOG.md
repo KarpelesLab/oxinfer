@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.13](https://github.com/KarpelesLab/oxinfer/compare/v0.0.12...v0.0.13) - 2026-11-21
+
+### Other
+
+- Anthropic /v1/messages: signed thinking blocks, Claude Code's request extras
+- Browser build: no std::time on wasm32-unknown-unknown in a chat turn
+
 ## [0.0.12](https://github.com/KarpelesLab/oxinfer/compare/v0.0.11...v0.0.12) - 2026-11-21
 
 ### Other
