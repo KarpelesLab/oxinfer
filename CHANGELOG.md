@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.14](https://github.com/KarpelesLab/oxinfer/compare/v0.0.13...v0.0.14) - 2026-11-21
+
+### Other
+
+- decode attention per key/value head, leaner KV caches, Mini docs and catalog
+- the inkling2_loop decoder, GGUF (llama.cpp's and unsloth's layouts), mmproj vision, NVFP4 int8 kernels, quantized KV caches
+- GGUF transformers (molbal/Kromoss-GGUF, arch moss_image), low-rank LoRAs as float32 matmuls beside the base one on the GPU (CPU: the low-rank kernel), oxinfer --presets, --help section; docs/moss-image.md (architecture, LoRAs, presets, verification against diffusers, speed), models table and README rows
+- MOSS-Image (lodestones/Kromoss) text to image: Qwen3.5-9B conditioning, the 42-block SiTU DiT, FLUX.2 VAE decoding; LoRA (low-rank side paths, LyCORIS LoKr / LoHa merged), the release's schedule plus ComfyUI's er_sde / beta57; CLI (--preset), C API (oxi_moss_image_*), server; curated presets in the catalog (kromoss, kromoss-dmd2, kromoss-dmd, kromoss-famegrid)
+- Thinking signatures: purecrypto's HMAC-SHA256 and OS RNG instead of a local SHA-256
+
 ## [0.0.13](https://github.com/KarpelesLab/oxinfer/compare/v0.0.12...v0.0.13) - 2026-11-21
 
 ### Other
