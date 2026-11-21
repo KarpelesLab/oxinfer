@@ -69,6 +69,37 @@ impl Sampler {
     }
 }
 
+/// Where the noise comes from: oxinfer's own generator, or PyTorch's CPU generator
+/// ([`crate::torch_rng`]) as diffusers and ComfyUI draw it: the initial latents
+/// `torch.randn([1, 128, h / 16, w / 16])` from `manual_seed(seed)` (diffusers' pipeline with a
+/// CPU generator, ComfyUI's `prepare_noise`), and ER-SDE's step noise from a second CPU generator
+/// seeded `seed + 1`, one `randn` of the latent's shape per step (ComfyUI's `default_noise_sampler`
+/// when it samples on the CPU; on CUDA or MPS ComfyUI draws step noise from the device's own
+/// generator, which is not reproduced).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Noise {
+    #[default]
+    Oxinfer,
+    Torch,
+}
+
+impl Noise {
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s.to_ascii_lowercase().as_str() {
+            "oxinfer" | "default" => Self::Oxinfer,
+            "torch" | "comfy" | "comfyui" | "diffusers" => Self::Torch,
+            _ => return None,
+        })
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Oxinfer => "oxinfer",
+            Self::Torch => "torch",
+        }
+    }
+}
+
 /// `torch.linspace(start, end, steps)` in float32 (ATen's CPU kernel: the first half counted
 /// from `start`, the second from `end`).
 pub fn linspace_f32(start: f32, end: f32, steps: usize) -> Vec<f32> {

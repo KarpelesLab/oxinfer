@@ -23,14 +23,17 @@
 //! files in that layout (`molbal/Kromoss-GGUF`: Q4_K / Q6_K / Q8_0 blocks). The fused matrix is
 //! split by rows without copying.
 
+use super::convrot;
 use super::lora::LoraSet;
 use crate::flux::transformer::{gated_add, rms_heads, silu};
 use crate::flux::weights::{Dense, Loader, forward_many};
+use crate::gpu::dit::Lin as DitLin;
 use crate::kernels::for_chunks;
 use crate::model::{Lin, Quant};
 use crate::safetensors::ModelFiles;
 use anyhow::{Result, bail};
 use std::path::Path;
+use std::sync::Mutex;
 
 /// `config.json` of the transformer (the release's defaults where a key is missing).
 #[derive(Clone, Debug, PartialEq)]
@@ -222,21 +225,24 @@ fn add(x: &mut [f32], y: &[f32]) {
     });
 }
 
-/// A low-rank LoRA path beside a layer, as two float32 matmuls (`up (down x)`, the strengths
-/// folded into `up`): they run wherever the base matmul runs (on the GPU when there is one).
+/// A low-rank LoRA path beside a layer, as two matmuls (`up (down x)`, the strengths folded into
+/// `up`) over float16 weights, the rank padded to a multiple of 64 with zeros: they run wherever
+/// the base matmul runs (on the GPU when there is one, on the matrix units in half precision
+/// there; the update is a small part of the output, so its rounding stays well below the bf16
+/// base weights').
 pub struct Side {
     down: Dense<'static>,
     up: Dense<'static>,
 }
 
-/// An f32 matrix `[n_out, n_in]` as a layer (a float32 "GGUF" weight, exact on every backend).
-fn f32_dense(w: &[f32], n_out: usize, n_in: usize) -> Dense<'static> {
-    let mut v = crate::quant::PageVec::<u8>::zeroed(w.len() * 4);
-    for (o, x) in v.as_chunks_mut::<4>().0.iter_mut().zip(w) {
-        *o = x.to_le_bytes();
+/// An f32 matrix `[n_out, n_in]` as a float16 "GGUF" layer.
+fn f16_dense(w: &[f32], n_out: usize, n_in: usize) -> Dense<'static> {
+    let mut v = crate::quant::PageVec::<u8>::zeroed(w.len() * 2);
+    for (o, x) in v.as_chunks_mut::<2>().0.iter_mut().zip(w) {
+        *o = half::f16::from_f32(*x).to_le_bytes();
     }
     let m = crate::ggml::GgufMatrix {
-        kind: crate::ggml::GgmlType::F32,
+        kind: crate::ggml::GgmlType::F16,
         data: v.into(),
         n_out,
         n_in,
@@ -250,15 +256,60 @@ fn f32_dense(w: &[f32], n_out: usize, n_in: usize) -> Dense<'static> {
     }
 }
 
+/// The side path of `down` (`[r, n_in]`) and `up` (`[n_out, r]`), the rank padded to 64.
+fn side(a: &[f32], b: &[f32], r: usize, n_in: usize, n_out: usize) -> Side {
+    let rp = r.next_multiple_of(64);
+    let mut ap = a.to_vec();
+    ap.resize(rp * n_in, 0.0);
+    let mut bp = vec![0f32; n_out * rp];
+    for (o, row) in bp.chunks_mut(rp).zip(b.chunks(r)) {
+        o[..r].copy_from_slice(row);
+    }
+    Side {
+        down: f16_dense(&ap, rp, n_in),
+        up: f16_dense(&bp, n_out, rp),
+    }
+}
+
+/// A layer as the device's whole-pass plans see it (its device state uploaded on first use).
+fn dit_dense<'a>(d: &'a Dense) -> Option<DitLin<'a>> {
+    Some(DitLin {
+        w: d.w.as_ref(),
+        // A rotated weight's input is rotated by the plan (or, for a side path, is the rotated
+        // input of its layer).
+        dev: d.w.device_weight_unfolded(d.n_out, d.n_in)?,
+        n_out: d.n_out,
+        n_in: d.n_in,
+        bias: d.b.as_deref(),
+        side: None,
+        rot: None,
+    })
+}
+
 /// A linear layer with an optional LoRA side path.
 pub struct Layer<'a> {
     d: Dense<'a>,
     side: Option<Side>,
+    /// ComfyUI's ConvRot: the weight is stored rotated over groups of this many inputs (the
+    /// `Lin` carries the input transform for the CPU path).
+    rot: Option<usize>,
 }
 
 impl Layer<'_> {
     pub fn n_out(&self) -> usize {
         self.d.n_out
+    }
+
+    fn dit(&self) -> Option<DitLin<'_>> {
+        let mut l = dit_dense(&self.d)?;
+        if self.d.w.has_lora() {
+            return None;
+        }
+        l.rot = self.rot;
+        if let Some(s) = &self.side {
+            l.side = Some((Box::new(dit_dense(&s.down)?), Box::new(dit_dense(&s.up)?)));
+        }
+        Some(l)
     }
 
     fn forward(&self, x: &[f32], rows: usize) -> Vec<f32> {
@@ -341,6 +392,33 @@ pub struct TextCond {
     pub len: usize,
 }
 
+/// One pass of [`Transformer::forward_batch`]: a prompt and the blocks left out.
+pub struct Pass<'a> {
+    pub text: &'a TextCond,
+    pub skip: &'a [usize],
+}
+
+/// How [`Transformer::forward_batch`] uses the device.
+#[derive(Clone, Copy, Debug)]
+pub struct GpuPass {
+    /// Whole passes on the device when it can run them.
+    pub enabled: bool,
+    /// Attention with float32 operands there (else half).
+    pub exact_attention: bool,
+    /// The passes of a step in one batch.
+    pub batch: bool,
+}
+
+impl Default for GpuPass {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            exact_attention: false,
+            batch: true,
+        }
+    }
+}
+
 /// The per-step modulations.
 pub struct StepMod {
     /// shift, scale, gate (attention), shift, scale, gate (feed-forward); `dim` each.
@@ -363,6 +441,8 @@ pub struct Transformer {
     pub weight_bytes: usize,
     /// Report lines of the LoRA files applied at load.
     pub lora_report: Vec<String>,
+    /// The device's whole-pass session (activation buffers), made on first use.
+    gpu: Mutex<Option<Box<dyn crate::gpu::dit::Session>>>,
     // Declared last: dropped after every layer borrowing it.
     _files: Box<ModelFiles>,
 }
@@ -388,7 +468,31 @@ impl<'f> LayerReader<'f, '_> {
     /// path), quantized to the loader's precision when `quantize`.
     fn rows(&self, tensor: &str, r0: usize, r1: usize, name: &str, quantize: bool) -> Result<Layer<'f>> {
         let merged = self.lora.merged(name);
-        let d = if merged {
+        let cr = convrot::conf(self.ld.files, tensor)?;
+        let rot = cr.as_ref().and_then(|c| c.rot);
+        let d = if let Some(c) = &cr {
+            let base = convrot::rows(self.ld.files, tensor, c, r0, r1)?;
+            if merged {
+                // Merged in the original basis, then rotated back and quantized to int8 blocks.
+                let (n, n_in) = (base.n_out, base.n_in);
+                let mut w = vec![0f32; n * n_in];
+                let idx: Vec<u32> = (0..n as u32).collect();
+                if !base.w.rows(&idx, n_in, &mut w) {
+                    bail!("{tensor}: rows cannot be read back for a LoRA merge");
+                }
+                convrot::rotate_rows(&mut w, rot);
+                self.lora.merge_into(name, &mut w, n, n_in)?;
+                convrot::rotate_rows(&mut w, rot);
+                Dense {
+                    w: Lin::q8(crate::quant::quantize_f32(&w, n, n_in)),
+                    b: base.b,
+                    n_out: n,
+                    n_in,
+                }
+            } else {
+                base
+            }
+        } else if merged {
             let base = self.ld.rows(tensor, r0, r1, false)?;
             let (n, n_in) = (base.n_out, base.n_in);
             let mut w = vec![0f32; n * n_in];
@@ -423,21 +527,24 @@ impl<'f> LayerReader<'f, '_> {
             self.ld.rows(tensor, r0, r1, quantize)?
         };
         let mut d = d;
+        let fold = rot.map(convrot::fold);
+        d.w.fold = fold.clone();
         let mut side = None;
-        if let Some((a, b, r)) = self.lora.runtime(name, d.n_out, d.n_in)? {
+        if let Some((mut a, b, r)) = self.lora.runtime(name, d.n_out, d.n_in)? {
             if crate::gpu::active().is_some() {
-                // On the accelerator: two float32 matmuls beside the base one.
-                side = Some(Side {
-                    down: f32_dense(&a, r, d.n_in),
-                    up: f32_dense(&b, d.n_out, r),
-                });
+                // On the accelerator: two matmuls beside the base one. Beside a rotated weight
+                // the side path takes the rotated input too: `A x = (A H) (H x)`.
+                convrot::rotate_rows(&mut a, rot);
+                let mut s = self::side(&a, &b, r, d.n_in, d.n_out);
+                s.down.w.fold = fold;
+                side = Some(s);
             } else {
                 // On the CPU: the low-rank kernel after the base matmul.
                 let (n_out, n_in) = (d.n_out, d.n_in);
                 d.w.set_lora(Some(Box::new(crate::lora::LoraDelta::fixed(a, &b, r, n_in, n_out))));
             }
         }
-        Ok(Layer { d, side })
+        Ok(Layer { d, side, rot })
     }
 
     fn dense(&self, tensor: &str, name: &str, quantize: bool) -> Result<Layer<'f>> {
@@ -472,14 +579,14 @@ impl Transformer {
         if !files.has("video_embedder.weight") {
             bail!("{}: no video_embedder.weight (not a MOSS-Image transformer)", path.display());
         }
-        for probe in ["layers.0.proj.qkv.weight", "layers.0.proj.q.weight"] {
-            if let Some(i) = files.info(probe)
+        for probe in ["layers.0.proj.qkv", "layers.0.proj.q"] {
+            if let Some(i) = files.info(&format!("{probe}.weight"))
                 && !matches!(i.dtype.as_str(), "BF16" | "F16" | "F32")
-                && files.ggml(probe).is_none()
+                && files.ggml(&format!("{probe}.weight")).is_none_or(|g| g.is_err())
+                && convrot::conf(&files, probe)?.is_none()
             {
                 bail!(
-                    "{}: block weights stored as {} (ComfyUI's int8 ConvRot files) are not supported; use the bf16 file, \
-                     the diffusers folder or a GGUF quant",
+                    "{}: block weights stored as {} without a ComfyUI quantization entry are not supported",
                     path.display(),
                     i.dtype
                 );
@@ -602,6 +709,7 @@ impl Transformer {
             blocks,
             weight_bytes,
             lora_report,
+            gpu: Mutex::new(None),
             _files: files,
         })
     }
@@ -710,6 +818,96 @@ impl Transformer {
             block: self.shared_mod.forward_vec(&time),
             head: self.head_mod.forward_vec(&time),
         }
+    }
+
+    /// The velocities of latent tokens `x` (`[lh * lw, latent_channels]`, row-major) under several
+    /// prompts / skip lists at once (the guidance branches of a step): with `gpu` set and a
+    /// device that runs whole passes, in one batch on the device (attention with half-precision
+    /// operands unless `exact_attention`, every branch in one batch with `batch`), else one
+    /// [`Self::forward`] each.
+    pub fn forward_batch(&self, x: &[f32], lh: usize, lw: usize, m: &StepMod, passes: &[Pass], gpu: GpuPass) -> Vec<Vec<f32>> {
+        if gpu.enabled
+            && let Some(v) = self.forward_device(x, lh, lw, m, passes, gpu)
+        {
+            return v;
+        }
+        passes.iter().map(|p| self.forward(x, lh, lw, p.text, m, p.skip)).collect()
+    }
+
+    fn forward_device(&self, x: &[f32], lh: usize, lw: usize, m: &StepMod, passes: &[Pass], gpu: GpuPass) -> Option<Vec<Vec<f32>>> {
+        let be = crate::gpu::active()?;
+        let _t = crate::prof::start(crate::prof::Cat::Matmul);
+        let c = &self.cfg;
+        let mut blocks = Vec::with_capacity(self.blocks.len());
+        for b in &self.blocks {
+            blocks.push(crate::gpu::dit::Block {
+                norm1: &b.norm1,
+                norm2: &b.norm2,
+                q_norm: &b.q_norm,
+                k_norm: &b.k_norm,
+                q: b.qkv[0].dit()?,
+                k: b.qkv[1].dit()?,
+                v: b.qkv[2].dit()?,
+                o: b.o.dit()?,
+                up_gate: b.up_gate.dit()?,
+                down: b.down.dit()?,
+            });
+        }
+        let model = crate::gpu::dit::Model {
+            dim: c.dim,
+            heads: c.heads,
+            head_dim: c.head_dim(),
+            ffn: c.ffn_dim,
+            latent: c.latent_channels,
+            eps: 1e-6,
+            video: self.video_emb.dit()?,
+            blocks,
+            final_norm: &self.final_norm,
+            final_linear: self.final_linear.dit()?,
+            half_attention: !gpu.exact_attention,
+        };
+        let ropes: Vec<Rope> = passes
+            .iter()
+            .map(|p| Rope::new(&positions(lh, lw, p.text.len), c.head_dim(), c.rope_base))
+            .collect();
+        let seqs: Vec<crate::gpu::dit::Seq> = passes
+            .iter()
+            .zip(&ropes)
+            .map(|(p, r)| crate::gpu::dit::Seq {
+                text: &p.text.tokens,
+                text_len: p.text.len,
+                cos: &r.cos,
+                sin: &r.sin,
+                skip: p.skip,
+            })
+            .collect();
+        let mut sess = self.gpu.lock().unwrap_or_else(|e| e.into_inner());
+        if sess.is_none() {
+            *sess = Some(be.dit_session()?);
+        }
+        let s = sess.as_mut()?;
+        let mut out = vec![Vec::new(); passes.len()];
+        let ok = if gpu.batch {
+            s.forward(&model, x, lh * lw, &seqs, &m.block, &m.head, &mut out)
+        } else {
+            seqs.iter().zip(out.iter_mut()).all(|(q, o)| {
+                s.forward(
+                    &model,
+                    x,
+                    lh * lw,
+                    std::slice::from_ref(q),
+                    &m.block,
+                    &m.head,
+                    std::slice::from_mut(o),
+                )
+            })
+        };
+        ok.then_some(out)
+    }
+
+    /// Drops the device session's buffers (they are made again on the next device pass).
+    pub fn release_device(&self) {
+        *self.gpu.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// The velocity of latent tokens `x` (`[lh * lw, latent_channels]`, row-major) under `text`,

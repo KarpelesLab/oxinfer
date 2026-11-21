@@ -116,6 +116,7 @@ pub mod stream;
 pub mod tokenizer;
 pub mod tools;
 pub mod torch;
+pub mod torch_rng;
 pub mod tts;
 pub mod unlimited_ocr;
 #[cfg(feature = "update")]

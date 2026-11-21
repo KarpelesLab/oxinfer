@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 #[path = "gpu_decode.rs"]
 pub mod decode;
+#[path = "gpu_dit.rs"]
+pub mod dit;
 
 /// A weight matrix in one of the supported storage formats (`[n_out, n_in]`).
 pub enum WeightRef<'a> {
@@ -188,6 +190,11 @@ pub trait Backend: Send + Sync {
         _out: &mut [f32],
     ) -> bool {
         false
+    }
+    /// A session running whole diffusion-transformer passes on the device (see [`dit`]); None
+    /// when the backend has none.
+    fn dit_session(&'static self) -> Option<Box<dyn dit::Session>> {
+        None
     }
     /// See [`AttnJob`]. False when the backend does not run it (the caller then does).
     fn attention_cached(&self, _j: &mut AttnJob) -> bool {

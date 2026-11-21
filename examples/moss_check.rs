@@ -110,6 +110,39 @@ fn main() -> Result<()> {
         }
         oxinfer::prof::report(t_all.elapsed().as_secs_f64(), 2);
     }
+    if all || what == "batch" {
+        // Both branches through `forward_batch` (whole passes on the device when it runs them),
+        // three times: the first builds the session and maps the weights.
+        let tr = pipe.transformer();
+        let c = tr.cfg.latent_channels;
+        let x = read_f32(&refd.join("step_x.bin"))?;
+        let n = x.len() / c;
+        let side = (n as f64).sqrt() as usize;
+        let (lh, lw) = (side, n / side);
+        let xt = oxinfer::flux::vae::chw_to_hwc(&x, c, lh, lw);
+        let t = read_f32(&refd.join("step_t.bin"))?[0];
+        let m = tr.step_mod(t);
+        let cond = tr.embed_text(&read_f32(&refd.join("cond_text.bin"))?)?;
+        let unc = tr.embed_text(&read_f32(&refd.join("uncond_text.bin"))?)?;
+        let skip = [22usize];
+        let passes = [
+            oxinfer::moss_image::transformer::Pass { text: &cond, skip: &[] },
+            oxinfer::moss_image::transformer::Pass { text: &unc, skip: &skip },
+        ];
+        for rep in 0..3 {
+            let t1 = std::time::Instant::now();
+            let vs = tr.forward_batch(&xt, lh, lw, &m, &passes, pipe.opts.gpu);
+            let secs = t1.elapsed().as_secs_f64();
+            for (tag, v) in ["cond", "uncond"].iter().zip(&vs) {
+                let v = oxinfer::flux::vae::hwc_to_chw(v, c, lh, lw);
+                compare(
+                    &format!("[{rep}] batch {tag} velocity ({secs:.2}s for both)"),
+                    &v,
+                    &read_f32(&refd.join(format!("step_{tag}.bin")))?,
+                );
+            }
+        }
+    }
     if all || what == "vae" {
         let vae = pipe.vae();
         let c = vae.mean.len();
@@ -118,7 +151,10 @@ fn main() -> Result<()> {
         let side = (n as f64).sqrt() as usize;
         let (lh, lw) = (side, n / side);
         let t1 = std::time::Instant::now();
+        oxinfer::prof::reset();
         let img = vae.decode(&oxinfer::flux::vae::chw_to_hwc(&z, c, lh, lw), lh, lw);
+        oxinfer::prof::report(t1.elapsed().as_secs_f64(), 1);
+        eprint!("{}", oxinfer::sd::ops::timing::report());
         let secs = t1.elapsed().as_secs_f64();
         let want = read_f32(&refd.join("vae_img.bin"))?;
         let img = oxinfer::flux::vae::hwc_to_chw(&img, 3, 16 * lh, 16 * lw);

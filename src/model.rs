@@ -763,6 +763,12 @@ impl<'a> Lin<'a> {
         let be = crate::gpu::active()?;
         self.dev.get_or_init(|| be.upload(&self.as_ref(), n_out, n_in)).as_ref()
     }
+    /// [`Self::device_weight`] for a Hadamard-folded weight too: for callers that transform the
+    /// input themselves (whole-pass device plans).
+    pub(crate) fn device_weight_unfolded(&self, n_out: usize, n_in: usize) -> Option<&crate::gpu::DeviceWeight> {
+        let be = crate::gpu::active()?;
+        self.dev.get_or_init(|| be.upload(&self.as_ref(), n_out, n_in)).as_ref()
+    }
     /// Device-side state for this layer if the active accelerator wants the op at this size.
     fn device_state(&self, n_out: usize, n_in: usize, t: usize) -> Option<&crate::gpu::DeviceWeight> {
         let be = crate::gpu::active()?;

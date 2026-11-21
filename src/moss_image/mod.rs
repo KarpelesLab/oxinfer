@@ -23,6 +23,7 @@
 //! branch). Presets ([`crate::advisor::PRESETS`]) bundle a base, LoRAs, a trigger word and the
 //! sampling settings their authors recommend.
 
+pub mod convrot;
 pub mod lora;
 pub mod sched;
 pub mod transformer;
@@ -32,11 +33,12 @@ use crate::model::Quant;
 use crate::safetensors::ModelFiles;
 pub use crate::sd::Image;
 use anyhow::{Context, Result, bail};
-pub use sched::{Sampler, Schedule};
+pub use sched::{Noise, Sampler, Schedule};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use transformer::{StepMod, TextCond, Transformer};
+pub use transformer::GpuPass;
+use transformer::{Pass, StepMod, Transformer};
 
 /// The release's default block left out of the negative branch.
 pub const DEFAULT_UNCOND_SKIP: &[usize] = &[22];
@@ -85,6 +87,9 @@ pub struct Options {
     pub cache_dir: Option<PathBuf>,
     /// The preset applied ([`crate::advisor::PRESETS`]): its generation defaults.
     pub preset: Option<&'static crate::advisor::Preset>,
+    /// How transformer passes use the device (whole passes on it, attention precision, the
+    /// guidance branches batched).
+    pub gpu: GpuPass,
 }
 
 impl Default for Options {
@@ -102,6 +107,7 @@ impl Default for Options {
             device: crate::platform::DevicePref::Auto,
             cache_dir: None,
             preset: None,
+            gpu: GpuPass::default(),
         }
     }
 }
@@ -121,12 +127,18 @@ impl Options {
         "device",
         "cache_dir",
         "preset",
+        "gpu_pass",
+        "exact_attention",
+        "batch_guidance",
     ];
 
     /// Sets an option by name (the C API's and the server's `key=value` options): `quant`,
     /// `text_quant` (bf16, q8, q4), `transformer`, `text_encoder`, `vae`, `lora` (`FILE[:STRENGTH]`,
     /// repeatable), `lora_merge`, `keep_text_encoder`, `in_memory`, `device`, `cache_dir`, `preset`
-    /// (a preset id: its LoRAs are added and its generation settings become the defaults).
+    /// (a preset id: its LoRAs are added and its generation settings become the defaults),
+    /// `gpu_pass` (whole transformer passes on the device, default on), `exact_attention` (their
+    /// attention with float32 operands instead of half), `batch_guidance` (a step's guidance
+    /// branches in one device batch, default on).
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         let flag = || match value.to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => Ok(true),
@@ -150,6 +162,9 @@ impl Options {
             }
             "cache_dir" => self.cache_dir = Some(PathBuf::from(value)),
             "preset" => self.apply_preset(value)?,
+            "gpu_pass" => self.gpu.enabled = flag()?,
+            "exact_attention" => self.gpu.exact_attention = flag()?,
+            "batch_guidance" => self.gpu.batch = flag()?,
             _ => bail!("unknown MOSS-Image option {key:?} ({})", Self::KEYS.join(", ")),
         }
         Ok(())
@@ -208,6 +223,9 @@ pub struct Params {
     pub sampler: Sampler,
     /// A word put at the start of the prompt unless the prompt has it (a LoRA's trigger).
     pub trigger: String,
+    /// The noise generator ([`Noise::Torch`]: PyTorch's CPU stream, the same initial noise as
+    /// diffusers and ComfyUI for a seed).
+    pub noise: Noise,
 }
 
 impl Params {
@@ -229,6 +247,7 @@ impl Params {
             schedule: Schedule::Moss,
             sampler: Sampler::Euler,
             trigger: String::new(),
+            noise: Noise::Oxinfer,
         }
     }
 
@@ -251,6 +270,7 @@ impl Params {
         "scheduler",
         "sampler",
         "trigger",
+        "noise",
     ];
 
     /// Sets a generation setting by name (preset defaults, `key=value` requests): see
@@ -288,6 +308,7 @@ impl Params {
             }
             "sampler" => self.sampler = Sampler::parse(value).with_context(|| format!("sampler: {value:?} (euler, er_sde)"))?,
             "trigger" => self.trigger = value.to_string(),
+            "noise" => self.noise = Noise::parse(value).with_context(|| format!("noise: {value:?} (oxinfer, torch)"))?,
             _ => bail!("unknown MOSS-Image setting {key:?} ({})", Self::KEYS.join(", ")),
         }
         Ok(())
@@ -348,6 +369,7 @@ pub struct Request {
     pub schedule: Option<Schedule>,
     pub sampler: Option<Sampler>,
     pub trigger: Option<String>,
+    pub noise: Option<Noise>,
 }
 
 impl Request {
@@ -377,6 +399,7 @@ impl Request {
         if let Some(t) = &self.trigger {
             p.trigger = t.clone();
         }
+        p.noise = self.noise.unwrap_or(p.noise);
         p
     }
 }
@@ -409,19 +432,38 @@ pub struct Vae {
 
 impl Vae {
     /// Loads a diffusers `AutoencoderKLFlux2` folder (decoder and batch-norm statistics).
-    pub fn load(dir: &Path) -> Result<Self> {
-        let wp = ["diffusion_pytorch_model.safetensors", "diffusion_pytorch_model.fp16.safetensors"]
-            .iter()
-            .map(|n| dir.join(n))
-            .find(|p| crate::fsx::exists(p))
-            .with_context(|| format!("no VAE weights in {}", dir.display()))?;
-        let cfg: serde_json::Value = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
+    ///
+    /// `path` may also be a single safetensors file: diffusers-named (`flux2-vae_small.safetensors`)
+    /// or in Black Forest Labs' layout as ComfyUI ships the FLUX.2 VAE (`vae/flux2-vae.safetensors`:
+    /// `decoder.up.N.block.M`, `decoder.mid.attn_1`, `decoder.post_quant_conv`, `bn.*`); the batch
+    /// norm's epsilon is then read from a `config.json` beside it, else the FLUX.2 default 1e-4.
+    pub fn load(path: &Path) -> Result<Self> {
+        let (wp, cfg_path) = if path.is_file() {
+            (path.to_path_buf(), path.with_file_name("config.json"))
+        } else {
+            let wp = ["diffusion_pytorch_model.safetensors", "diffusion_pytorch_model.fp16.safetensors"]
+                .iter()
+                .map(|n| path.join(n))
+                .find(|p| crate::fsx::exists(p))
+                .with_context(|| format!("no VAE weights in {}", path.display()))?;
+            (wp, path.join("config.json"))
+        };
+        let cfg: serde_json::Value = match crate::fsx::read(&cfg_path) {
+            Ok(b) => serde_json::from_slice(&b)?,
+            Err(_) if path.is_file() => serde_json::Value::Null,
+            Err(e) => return Err(e).with_context(|| format!("{}", cfg_path.display())),
+        };
         let eps = cfg["batch_norm_eps"].as_f64().unwrap_or(1e-4);
-        let mut t = crate::sd::ops::Tensors::open(&wp)?;
+        let st = crate::safetensors::SafeTensors::open(&wp, false)?;
+        let bfl = st.names().any(|n| n.starts_with("decoder.up.") && n.contains(".block."));
+        let mut t = if bfl {
+            crate::flux::vae::open_bfl(&wp)?.0
+        } else {
+            crate::sd::ops::Tensors::open(&wp)?
+        };
         // The release decodes in float32: float32 weights stay exact (a bf16 pair each).
         t.set_split_f32(std::env::var_os("OXINFER_MOSS_VAE_BF16").is_none());
         let decoder = crate::sd::vae::VaeDecoder::from_tensors(&t, 1.0, 0.0)?;
-        let st = crate::safetensors::SafeTensors::open(&wp, false)?;
         let mean = crate::flux::lora::tensor_f32(&st, "bn.running_mean").context("VAE: no bn.running_mean (not a FLUX.2 VAE)")?;
         let var = crate::flux::lora::tensor_f32(&st, "bn.running_var")?;
         let std = var.iter().map(|&v| (v as f64 + eps).sqrt() as f32).collect();
@@ -769,9 +811,12 @@ impl Pipeline {
         let c = self.tr.cfg.latent_channels;
         let t0 = Instant::now();
         let mut rng = crate::sd::ops::Rng::new(p.seed);
+        // PyTorch's streams: the initial noise from the seed, ER-SDE's from seed + 1.
+        let mut torch_step = (p.noise == Noise::Torch).then(|| crate::torch_rng::TorchGenerator::new(p.seed.wrapping_add(1)));
         let noise = match dumped("noise.bin")? {
             Some(n) if n.len() == c * lh * lw => n,
             Some(n) => bail!("noise.bin has {} values, expected {}", n.len(), c * lh * lw),
+            None if p.noise == Noise::Torch => crate::torch_rng::TorchGenerator::new(p.seed).randn(c * lh * lw),
             None => rng.normals(c * lh * lw),
         };
         // [c, lh, lw] (the reference's layout) to tokens [lh * lw, c].
@@ -787,35 +832,49 @@ impl Pipeline {
             let sigma = run.sigma(i);
             let m: StepMod = self.tr.step_mod(sigma * 1000.0);
             let active = (p.slg_start..p.slg_stop).contains(&(i as f32 / steps as f32));
-            let pass = |text: &TextCond, skip: &[usize]| self.tr.forward(&x, lh, lw, text, &m, skip);
-            let vc = pass(&cond, &[]);
-            tm.transformer_calls += 1;
-            let mut v = vc.clone();
+            // The branches of the step, in one batch where the device takes them.
+            let mut passes = vec![Pass { text: &cond, skip: &[] }];
             if let Some(u) = &unc {
                 let skip: &[usize] = if active { &p.uncond_skip_layers } else { &[] };
-                let vu = pass(u, skip);
-                tm.transformer_calls += 1;
-                for ((o, &a), &b) in v.iter_mut().zip(&vc).zip(&vu) {
+                passes.push(Pass { text: u, skip });
+            }
+            let slg = !p.slg_layers.is_empty() && p.slg_scale > 0.0 && active;
+            if slg {
+                passes.push(Pass {
+                    text: &cond,
+                    skip: &p.slg_layers,
+                });
+            }
+            let mut vs = self.tr.forward_batch(&x, lh, lw, &m, &passes, self.opts.gpu);
+            tm.transformer_calls += passes.len();
+            let vslg = if slg { vs.pop() } else { None };
+            let vu = if unc.is_some() { vs.pop() } else { None };
+            let vc = vs.pop().unwrap();
+            let mut v = vc.clone();
+            if let Some(vu) = &vu {
+                for ((o, &a), &b) in v.iter_mut().zip(&vc).zip(vu) {
                     *o = b + p.guidance * (a - b);
                 }
                 if i == 0 {
-                    dump("our_v0_uncond.bin", &vu);
+                    dump("our_v0_uncond.bin", vu);
                 }
             }
-            if !p.slg_layers.is_empty() && p.slg_scale > 0.0 && active {
-                let vs = pass(&cond, &p.slg_layers);
-                tm.transformer_calls += 1;
+            if let Some(vs) = &vslg {
                 if !cfg_on {
-                    v.clone_from(&vs);
+                    v.clone_from(vs);
                 }
-                for ((o, &a), &b) in v.iter_mut().zip(&vc).zip(&vs) {
+                for ((o, &a), &b) in v.iter_mut().zip(&vc).zip(vs) {
                     *o += p.slg_scale * (a - b);
                 }
             }
             if i == 0 {
                 dump("our_v0_cond.bin", &vc);
             }
-            run.step(i, &mut x, &v, &mut |n| rng.normals(n));
+            run.step(i, &mut x, &v, &mut |n| match &mut torch_step {
+                // Drawn in the latent's [128, h, w] order, used as tokens.
+                Some(g) => crate::flux::vae::chw_to_hwc(&g.randn(n), c, lh, lw),
+                None => rng.normals(n),
+            });
             progress(i + 1, steps);
         }
         tm.denoise = t0.elapsed().as_secs_f64();

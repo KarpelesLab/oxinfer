@@ -44,6 +44,8 @@ use std::time::Instant;
 
 #[path = "metal_decode.rs"]
 pub(crate) mod decode;
+#[path = "metal_dit.rs"]
+mod dit;
 #[path = "metal_prefill.rs"]
 mod prefill;
 
@@ -1745,7 +1747,12 @@ impl MetalBackend {
             Some("1") => true,
             _ => apple10,
         };
-        let base_src = format!("{SHADER_SRC}{}{GGUF_SHADER_SRC}{}", gguf_shader_tables(), decode::shader_src());
+        let base_src = format!(
+            "{SHADER_SRC}{}{GGUF_SHADER_SRC}{}{}",
+            gguf_shader_tables(),
+            decode::shader_src(),
+            dit::SRC
+        );
         let compile = |src: &str, metal4: bool| -> Result<Id> {
             let src = CString::new(src)?;
             let ns_src = unsafe { msg_str(nsstring_cls, o.sel(c"stringWithUTF8String:"), src.as_ptr()) };
@@ -3200,6 +3207,10 @@ impl Backend for MetalBackend {
         let f: MsgU = self.o.msg_send();
         let v = unsafe { f(self.device, self.o.sel(c"recommendedMaxWorkingSetSize")) };
         (v > 0).then_some(v)
+    }
+
+    fn dit_session(&'static self) -> Option<Box<dyn crate::gpu::dit::Session>> {
+        self.dit_session_impl()
     }
 
     fn attention_cached(&self, j: &mut crate::gpu::AttnJob) -> bool {

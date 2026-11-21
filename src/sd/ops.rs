@@ -219,6 +219,9 @@ pub struct Linear {
     pub n_in: usize,
     /// The rounding residual of `w` (f32 checkpoints with [`Tensors::set_split_f32`]).
     lo: Option<Box<Linear>>,
+    /// For a device whose kernels take whole tiles of 64 outputs: this layer with zero rows up
+    /// to the next multiple of 64 (made on first use; None when the rows cannot be read).
+    padded: std::sync::OnceLock<Option<Box<Linear>>>,
 }
 
 impl Linear {
@@ -265,6 +268,7 @@ impl Linear {
             n_out,
             n_in,
             lo: None,
+            padded: std::sync::OnceLock::new(),
         })
     }
 
@@ -550,6 +554,20 @@ impl Linear {
     fn device_conv(&self, x: &[f32], g: crate::gpu::ConvGeom, pre: Option<Pre>) -> Option<Vec<f32>> {
         let be = crate::gpu::active()?;
         let t = g.oh * g.ow;
+        if !self.n_out.is_multiple_of(64) && g.cin.is_multiple_of(32) && be.wants(self.n_out.next_multiple_of(64), self.n_in, t) {
+            // Through the zero-padded layer, then the real outputs of each row.
+            let p = self.padded.get_or_init(|| self.padded_copy().map(Box::new)).as_ref()?;
+            let yp = p.device_conv(x, g, pre)?;
+            let (n, np) = (self.n_out, p.n_out);
+            let mut y = vec![0f32; t * n];
+            for_chunks(&mut y, n * 256, t > 1024, |c, out| {
+                for (j, o) in out.chunks_mut(n).enumerate() {
+                    let r = c * 256 + j;
+                    o.copy_from_slice(&yp[r * np..r * np + n]);
+                }
+            });
+            return Some(y);
+        }
         if !g.cin.is_multiple_of(32) || !be.wants(self.n_out, self.n_in, t) {
             return None;
         }
@@ -577,6 +595,26 @@ impl Linear {
             });
         }
         Some(y)
+    }
+
+    /// This layer (and its residual part) with zero rows up to a multiple of 64 outputs.
+    fn padded_copy(&self) -> Option<Linear> {
+        let np = self.n_out.next_multiple_of(64);
+        let mut w = vec![0f32; np * self.n_in];
+        let idx: Vec<u32> = (0..self.n_out as u32).collect();
+        if !self.w.rows(&idx, self.n_in, &mut w[..self.n_out * self.n_in]) {
+            return None;
+        }
+        let b = self.b.as_ref().map(|b| {
+            let mut v = b.clone();
+            v.resize(np, 0.0);
+            v
+        });
+        let mut l = Self::from_parts(&w, np, self.n_in, b).ok()?;
+        if let Some(lo) = &self.lo {
+            l.lo = Some(Box::new(lo.padded_copy()?));
+        }
+        Some(l)
     }
 
     /// The layer applied to `pre(x)` (`rows` rows): normalization fused on the device when the

@@ -798,6 +798,16 @@ pub const CATALOG: &[Model] = &[
     Model::new("molbal/Kromoss-GGUF:Q4_K_M", Kind::Image, 13.5, 21.7, &[TextToImage])
         .fixed(Format::GgufQ4K, "GGUF Q4_K_M transformer")
         .note("the transformer as GGUF (also Q6_K, Q8_0); text encoder and VAE from lodestones/Kromoss"),
+    Model::new("molbal/Kromoss-GGUF:Q8_CR", Kind::Image, 13.5, 23.5, &[TextToImage])
+        .fixed(Format::GgufQ8, "GGUF Q8_CR transformer (ComfyUI ConvRot int8)")
+        .note("rotated int8 rows (5.4 GB), the int8 of kromoss_int8_convrot; text encoder and VAE from lodestones/Kromoss"),
+    Model::new("molbal/Kromoss-GGUF:Q4_CR_L", Kind::Image, 13.5, 21.9, &[TextToImage])
+        .fixed(Format::GgufQ4, "GGUF Q4_CR_L transformer (ComfyUI ConvRot int4 / int8)")
+        .note("rotated int4 feed-forward, int8 attention (3.8 GB); text encoder and VAE from lodestones/Kromoss"),
+    Model::new("OpenMOSS-Team/MOSS-Image-SFT", Kind::Image, 13.5, 29.5, &[TextToImage])
+        .note("the release's instruction-tuned MOSS-Image (Qwen3.5-9B, the cached Qwen/Qwen3.5-9B is reused); 50 steps, CFG 3"),
+    Model::new("OpenMOSS-Team/MOSS-Image-Base", Kind::Image, 13.5, 29.5, &[TextToImage])
+        .note("the release's base model, Kromoss' starting point; 50 steps, CFG 3"),
     Model::new("MiniMaxAI/MiniMax-H3-Image", Kind::Image, 63.0, 127.2, &[TextToImage])
         .note("with MiniMax-H3's Qwen3-VL text encoder; 2048x2048 and up"),
     Model::new("MiniMaxAI/MiniMax-H3", Kind::Video, 67.4, 140.1, &[TextToVideo, ImageToVideo])

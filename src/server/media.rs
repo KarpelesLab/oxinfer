@@ -370,6 +370,7 @@ const EXTRA_KEYS: &[&str] = &[
     "scheduler",
     "sampler",
     "trigger",
+    "noise",
 ];
 
 /// A JSON value as a `key=value` setting (arrays comma-joined).

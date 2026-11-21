@@ -24,6 +24,8 @@ pub struct MossArgs {
     pub slg_stop: Option<f32>,
     /// `--trigger WORD` (`""`: none).
     pub trigger: Option<String>,
+    /// `--noise oxinfer|torch`.
+    pub noise: Option<String>,
     /// `--lora-merge`: merge low-rank LoRAs into the weights.
     pub lora_merge: bool,
     /// `--moss KEY=VALUE`: any load option or generation setting by name.
@@ -41,6 +43,7 @@ impl MossArgs {
             "--slg-start" => self.slg_start = Some(val()?.parse()?),
             "--slg-stop" => self.slg_stop = Some(val()?.parse()?),
             "--trigger" => self.trigger = Some(val()?),
+            "--noise" => self.noise = Some(val()?),
             "--lora-merge" => self.lora_merge = true,
             "--moss" => {
                 let v = val()?;
@@ -170,6 +173,9 @@ pub fn run(args: &Args) -> Result<()> {
     }
     if let Some(t) = &m.trigger {
         p.trigger = t.clone();
+    }
+    if let Some(n) = &m.noise {
+        p.set("noise", n)?;
     }
     for (k, v) in &gen_set {
         p.set(k, v)?;

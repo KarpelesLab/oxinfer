@@ -2,7 +2,8 @@
 
 MOSS-Image (OpenMOSS-Team/MOSS-Image-Base / -SFT) is a 5B single-stream diffusion transformer
 conditioned by Qwen3.5-9B and decoded by the FLUX.2 VAE. `lodestones/Kromoss` is a full fine-tune
-of MOSS-Image-Base at 1024 px with the same layout, so the same code reads both (only Kromoss was run). `src/moss_image/`
+of MOSS-Image-Base at 1024 px with the same layout, so the same code reads all three (each checked against the
+release's pipeline, see [Verification](#verification)). `src/moss_image/`
 follows the release's diffusers pipeline (`pipeline_moss_image.py`, `MOSSImagePipeline`); a folder
 is recognised from `model_index.json` (`MOSSImagePipeline`) or `transformer/config.json`.
 
@@ -15,6 +16,14 @@ is recognised from `model_index.json` (`MOSSImagePipeline`) or `transformer/conf
 ./target/release/oxinfer --preset kromoss-famegrid -p "a candid portrait photo of a woman in a cafe" -o famegrid.png
 # a GGUF transformer (text encoder and VAE from lodestones/Kromoss; or --transformer FILE.gguf)
 ./target/release/oxinfer --model molbal/Kromoss-GGUF:Q4_K_M -p "..." -o q4.png
+# ComfyUI's ConvRot quants: the int8 single file, or molbal's Q8_CR / Q4_CR_L GGUFs
+./target/release/oxinfer --model lodestones/Kromoss --transformer lodestones/Kromoss/diffusion_models/kromoss_int8_convrot.safetensors -p "..." -o i8.png
+./target/release/oxinfer --model molbal/Kromoss-GGUF:Q4_CR_L -p "..." -o q4cr.png
+# the release's own models, and ComfyUI's single-file FLUX.2 VAE (the full-size decoder)
+./target/release/oxinfer --model OpenMOSS-Team/MOSS-Image-SFT -p "..." -o sft.png
+./target/release/oxinfer --model lodestones/Kromoss --vae Comfy-Org/MOSS-Image/vae/flux2-vae.safetensors -p "..." -o big-vae.png
+# the same initial noise as diffusers (generator=torch.Generator("cpu").manual_seed(7)) and ComfyUI (seed 7)
+./target/release/oxinfer --model lodestones/Kromoss --noise torch --seed 7 -p "..." -o same-noise.png
 ```
 
 | Flag | Meaning |
@@ -27,8 +36,9 @@ is recognised from `model_index.json` (`MOSSImagePipeline`) or `transformer/conf
 | `--lora FILE[:STRENGTH]` | a LoRA (repeatable; local or `org/name/file.safetensors`); `--lora-merge` merges low-rank ones too |
 | `--trigger WORD` | put first in the prompt unless it is there (presets set it) |
 | `--quant q8\|q4`, `--text-quant` | transformer / text-encoder precision |
-| `--transformer SPEC`, `--text-encoder SPEC`, `--vae SPEC` | components from elsewhere: a diffusers folder, ComfyUI's single file (`diffusion_models/kromoss_bf16.safetensors`), a GGUF file |
-| `--moss KEY=VALUE` | any load option or generation setting by name (`oxinfer::moss_image::Options::KEYS`, `Params::KEYS`) |
+| `--transformer SPEC`, `--text-encoder SPEC`, `--vae SPEC` | components from elsewhere: a diffusers folder, ComfyUI's single file (`diffusion_models/kromoss_bf16.safetensors`, `kromoss_int8_convrot.safetensors`; for the VAE `flux2-vae_small.safetensors` or BFL-layout `flux2-vae.safetensors`), a GGUF file (Q8_0 / Q6_K / Q4_K_M, Q8_CR / Q4_CR_L) |
+| `--noise oxinfer\|torch` | the noise generator: oxinfer's (default) or PyTorch's CPU stream (see [Noise](#noise)) |
+| `--moss KEY=VALUE` | any load option or generation setting by name (`oxinfer::moss_image::Options::KEYS`, `Params::KEYS`), e.g. `gpu_pass=0` (the per-op GPU path), `exact_attention=1`, `batch_guidance=0` (see [On the GPU](#on-the-gpu)) |
 
 ## What runs
 
@@ -65,9 +75,67 @@ is recognised from `model_index.json` (`MOSSImagePipeline`) or `transformer/conf
 
 Weights: the diffusers `transformer/` (bf16, borrowed from the mapping; `--quant q8|q4` at load),
 ComfyUI's single file (fused `proj.qkv`, split by rows without copying) and GGUF files in that layout
-(`molbal/Kromoss-GGUF`: Q8_0, Q6_K, Q4_K_M). ComfyUI's int8 ConvRot files (`kromoss_int8_convrot`,
-`Q4_CR_L` / `Q8_CR` GGUFs) store rotated int8 / int4 blocks oxinfer does not read; they are refused
-with a message.
+(`molbal/Kromoss-GGUF`: Q8_0, Q6_K, Q4_K_M), and ComfyUI's ConvRot quants (`src/moss_image/convrot.rs`):
+
+- `kromoss_int8_convrot.safetensors` (made by the release's `quantize_convrot.py`) and molbal's `Q8_CR`
+  GGUF hold the same values: the 168 block linears as int8 `[out, in]` times a float32 scale per row,
+  each row rotated by the normalized regular Hadamard matrix `H` (Kronecker powers of
+  `H4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]]`, symmetric and its own inverse) over groups of
+  256 inputs, so that `W x = (W H) (H x)`. The entry saying so is the JSON of tensor
+  `{module}.comfy_quant` (safetensors) or of metadata `comfy.gguf.quant.{module}.weight` (GGUF:
+  `{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 256}`);
+- `Q4_CR_L` keeps `qkv` and `o` in that int8 form and stores the feed-forward as `int4_cr`: two
+  codes per byte (column `2 i` in the low nibble of byte `i`, two's complement -8..7) times a
+  float16 scale per row, rotated the same way (ComfyUI-GGUF's Q4_CR; the `w4a4` / `w4a8` backings
+  and `quant_group_size` only name its kernels).
+
+oxinfer keeps the stored values exactly (int8 rows as its int8 blocks with the row scale per block,
+borrowed from the mapping; int4 rows as ggml `Q4_0` blocks with the row scale) and rotates the layer's
+input instead: on the CPU through the Hadamard-folded weights of `crate::hadamard`, on the GPU in the
+whole-pass plan (`dit_rot_half`). LoRAs work over them: a low-rank side path takes the rotated input
+with its down matrix rotated too (`A x = (A H) (H x)`), a LoKr update is merged in the original basis,
+rotated back and stored as int8 blocks. ComfyUI's kernels also round the rotated activations to int8
+(the "A8"); that is not done (activations stay float).
+
+## On the GPU
+
+With Metal on a GPU with matrix units (M5, A19), a transformer pass runs as a whole on the device
+(`src/gpu_dit.rs`, `src/metal_dit.rs`, `src/metal_dit.metal`): the model describes its layers once per
+call, and every block of every guidance branch of a step is encoded into a few command buffers (6
+blocks each, committed as they are encoded) with the activations in device buffers that live as long as
+the pipeline. Only the latents, the text tokens, the rotary tables and the modulations go in, only the
+velocities come out. The matmuls are the matrix-unit GEMMs of the prefill plans (inputs as half with a
+power-of-two scale per row, made by the kernel producing them: the modulated RMS norm, SiTU), attention
+the fused `flash_attn128_mma` kernel per sequence (half operands; `exact_attention=1` takes the float32
+one), and the per-head q / k norms with the rotary embedding, the gated residuals and biases have
+kernels of their own. The branches of a step (conditional, negative, skip-layer) share every matmul:
+their rows are stacked (each padded to 64), attention runs per branch, and a block a branch leaves out
+is computed but not added for it. `gpu_pass=0` goes back to the per-op path (one GEMM per submission,
+the rest on the CPU), `batch_guidance=0` runs the branches one after the other. Without matrix units, or
+for a layer the GEMMs do not take, the per-op path runs.
+
+The VAE decoder runs per op on the GPU (its convolutions with the group norm fused in); a layer whose
+outputs are not a multiple of 64 (the 96-channel top level of the small decoder, the RGB output) now
+runs as a zero-padded copy instead of on the CPU.
+
+## Noise
+
+`noise=torch` (`--noise torch`) draws the initial latents as PyTorch does on the CPU
+(`src/torch_rng.rs`: `at::mt19937` seeded as `manual_seed`, then `torch.randn`'s float32 Box-Muller over
+blocks of 16): `torch.randn([1, 128, h / 16, w / 16], generator=torch.Generator("cpu").manual_seed(seed))`,
+which is both what the release's diffusers pipeline draws with a CPU generator and what ComfyUI's
+`prepare_noise` draws for that seed (always on the CPU), bit for bit (checked on 524288 values against
+PyTorch 2.15 on macOS; the same libm math as PyTorch's scalar path, so Linux matches Linux; PyTorch's
+AVX2 variant on x86 may differ in the last bits). ER-SDE's fresh noise then comes from a second CPU
+generator seeded `seed + 1`, one `randn` of the latent's shape per step, as ComfyUI's
+`default_noise_sampler` does when ComfyUI samples on the CPU.
+
+This reproduces ComfyUI's noise, not its pixels: when ComfyUI samples on CUDA or MPS, ER-SDE's step
+noise comes from that device's generator (Philox on CUDA, Metal's own on MPS), which PyTorch does not
+document as a stable algorithm and which is not reproduced here; and with the same noise the image
+still differs from ComfyUI's by the arithmetic (its bf16 activations against oxinfer's float32 ones,
+the 30 dB of the verification table). With Euler (deterministic once the initial noise is fixed) the
+same seed gives ComfyUI's and diffusers' composition.
 
 ## LoRAs
 
@@ -125,7 +193,7 @@ request_json, on_image, on_step, user)` (every `Params` field as JSON), `oxi_pre
 Server: `oxinfer serve --model kromoss-famegrid --model lodestones/Kromoss`. `/v1/images/generations`
 takes `prompt`, `size`, `n`, `seed`, `steps`, `guidance`, `negative_prompt`, and the MOSS-Image fields
 `sampler`, `scheduler`, `shift`, `uncond_skip_layers`, `slg_layers`, `slg_scale`, `slg_start`,
-`slg_stop`, `trigger`; load options (`lora`, `lora_merge`, `quant`, `preset`, ...) go in the model spec.
+`slg_stop`, `trigger`, `noise`; load options (`lora`, `lora_merge`, `quant`, `preset`, ...) go in the model spec.
 
 ## Verification
 
@@ -148,8 +216,7 @@ compares the components; reference dumps from a script in the session's scratchp
 
 ComfyUI's schedules and `er_sde` are checked in the unit tests against ComfyUI's own code (beta57,
 beta and simple sigmas to 2e-6 with scipy's beta quantiles; the ER-SDE update on a toy model to
-1e-4). The ER-SDE sampler draws its noise from oxinfer's generator, so its images are not
-ComfyUI's pixel for pixel.
+1e-4). With `noise=torch` the initial and step noise are ComfyUI's (on the CPU; see [Noise](#noise)).
 
 FameGrid (the full stack, `--preset kromoss-famegrid`, seed 7, "famegrid, a candid portrait photo of a
 young man reading a book in a sunlit cafe") against the same settings without the LoRA: the LoRA turns

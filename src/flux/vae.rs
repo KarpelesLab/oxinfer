@@ -211,27 +211,7 @@ impl Vae {
     /// BAGEL, Step1X-Edit: `encoder.down.N.block.M`, `mid.attn_1`, ...), with FLUX.1's latent
     /// normalization (scale 0.3611, shift 0.1159). Without `encoder` only the decoder is read.
     pub fn load_bfl(path: &Path, encoder: bool) -> Result<Self> {
-        let t = Tensors::open_renamed(path, bfl_to_diffusers)?;
-        let levels = t
-            .names()
-            .filter_map(|n| n.strip_prefix("decoder.up.")?.split('.').next()?.parse::<usize>().ok())
-            .max()
-            .map_or(0, |m| m + 1);
-        if levels == 0 || !t.has("decoder.conv_in.weight") {
-            bail!("{}: not a BFL autoencoder (no decoder.up.*)", path.display());
-        }
-        // The decoder's levels are stored lowest resolution first (`up.0`); diffusers counts
-        // from the top. Rename again now that the depth is known.
-        let mut t = Tensors::open_renamed(path, |n| {
-            let n = bfl_to_diffusers(n)?;
-            match n.strip_prefix("decoder.up_blocks.") {
-                Some(rest) => {
-                    let (i, tail) = rest.split_once('.')?;
-                    Some(format!("decoder.up_blocks.{}.{tail}", levels - 1 - i.parse::<usize>().ok()?))
-                }
-                None => Some(n),
-            }
-        })?;
+        let (mut t, levels) = open_bfl(path)?;
         let (scaling_factor, shift_factor) = (0.3611, 0.1159);
         let decoder = VaeDecoder::from_tensors(&t, scaling_factor, shift_factor)?;
         // f32 checkpoints keep their encoder's precision (see `load`).
@@ -269,12 +249,48 @@ impl Vae {
     }
 }
 
+/// An autoencoder in Black Forest Labs' layout (also ComfyUI's single files, e.g.
+/// `flux2-vae.safetensors`) with its tensors under diffusers' names, and its number of levels.
+pub(crate) fn open_bfl(path: &Path) -> Result<(Tensors, usize)> {
+    let t = Tensors::open_renamed(path, bfl_to_diffusers)?;
+    let levels = t
+        .names()
+        .filter_map(|n| n.strip_prefix("decoder.up.")?.split('.').next()?.parse::<usize>().ok())
+        .max()
+        .map_or(0, |m| m + 1);
+    if levels == 0 || !t.has("decoder.conv_in.weight") {
+        bail!("{}: not a BFL autoencoder (no decoder.up.*)", path.display());
+    }
+    // The decoder's levels are stored lowest resolution first (`up.0`); diffusers counts
+    // from the top. Rename again now that the depth is known.
+    let t = Tensors::open_renamed(path, |n| {
+        let n = bfl_to_diffusers(n)?;
+        match n.strip_prefix("decoder.up_blocks.") {
+            Some(rest) => {
+                let (i, tail) = rest.split_once('.')?;
+                Some(format!("decoder.up_blocks.{}.{tail}", levels - 1 - i.parse::<usize>().ok()?))
+            }
+            None => Some(n),
+        }
+    })?;
+    Ok((t, levels))
+}
+
 /// A BFL autoencoder tensor name in diffusers' `AutoencoderKL` naming (decoder levels keep the
 /// BFL index; [`Vae::load_bfl`] reverses them).
 fn bfl_to_diffusers(n: &str) -> Option<String> {
     let (part, rest) = n.split_once('.')?;
     if part != "encoder" && part != "decoder" {
         return None;
+    }
+    // FLUX.2 keeps its (de)quantization convolutions inside the encoder / decoder.
+    if let Some(r) = rest.strip_prefix("post_quant_conv.").or_else(|| rest.strip_prefix("quant_conv.")) {
+        let top = if rest.starts_with("post_") {
+            "post_quant_conv"
+        } else {
+            "quant_conv"
+        };
+        return Some(format!("{top}.{r}"));
     }
     let block = |s: &str| {
         s.replace("nin_shortcut", "conv_shortcut")

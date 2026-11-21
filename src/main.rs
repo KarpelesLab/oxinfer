@@ -406,8 +406,10 @@ fn usage() -> ! {
          \x20 --slg-layers L, --slg-scale F, --slg-start F, --slg-stop F   skip-layer guidance\n\
          \x20 --sampler euler|er_sde, --scheduler moss|simple|beta|beta57, --shift F (default 5)\n\
          \x20 --trigger WORD       put first in the prompt unless there; --lora-merge merges low-rank LoRAs\n\
+         \x20 --noise torch        PyTorch's CPU noise for the seed (diffusers' and ComfyUI's initial latents)\n\
          \x20 --transformer SPEC, --text-encoder SPEC, --vae SPEC   parts from elsewhere (GGUF, ComfyUI file)\n\
-         \x20 --moss KEY=VALUE     any MOSS-Image option or setting by name\n\
+         \x20 --moss KEY=VALUE     any MOSS-Image option or setting by name (gpu_pass=0: per-op GPU path,\n\
+         \x20                      exact_attention=1, batch_guidance=0)\n\
          \n\
          MiniMax-H3 (MiniMaxAI/MiniMax-H3, or a single-file transformer of Comfy-Org/MiniMax-H3 with\n\
          --vae): text to video, first / last frame to video (-o, --size, --seed as above; see\n\
