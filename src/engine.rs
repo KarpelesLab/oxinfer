@@ -107,7 +107,8 @@ pub struct EngineOptions {
     /// Compute device (process-wide; set by the first engine). Key `device`
     /// (`auto`, `cpu`, `metal`, `cuda`, `vulkan`).
     pub device: DevicePref,
-    /// Tokens per prefill chunk (default 256 on the CPU, 1024 with a GPU). Key `prefill_chunk`.
+    /// Tokens per prefill chunk (default 256 on the CPU, 1024 with a GPU; Inkling-2: 2048, or 512
+    /// with less than 32 GB of memory). Key `prefill_chunk`.
     pub prefill_chunk: Option<usize>,
     /// Maximum tokens in the conversation (prompt and replies); a turn that does not fit fails
     /// and replies stop at the limit. Key `max_context`. Default: unlimited.
@@ -2153,7 +2154,14 @@ impl Engine {
             info,
             files,
             // Bigger prefill chunks keep the GPU busier; on the CPU 256 keeps activations in cache.
-            prefill_chunk: opts.prefill_chunk.unwrap_or(if gpu.is_some() { 1024 } else { 256 }),
+            // (Inkling-2: big chunks for its 128 experts, see `inkling::default_prefill_chunk`.)
+            prefill_chunk: opts.prefill_chunk.unwrap_or(if family == Family::Inkling2 {
+                crate::inkling::default_prefill_chunk()
+            } else if gpu.is_some() {
+                1024
+            } else {
+                256
+            }),
             max_context: opts.max_context,
             draft_tokens: opts.draft_tokens.unwrap_or(6),
             turns: 0,

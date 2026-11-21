@@ -1730,7 +1730,15 @@ fn run(mut args: Args) -> Result<()> {
     }
     // Bigger prefill chunks keep the GPU busier (577 vs 431 tok/s on E4B q4 at 1024 vs 256);
     // on the CPU 256 keeps the activations in cache.
-    args.prefill_chunk = Some(args.prefill_chunk.unwrap_or(if gpu.is_some() { 1024 } else { 256 }));
+    // (Inkling-2: big chunks for its 128 experts, see `oxinfer::inkling::default_prefill_chunk`.)
+    let inkling = config::model_type(&args.model).is_ok_and(|m| oxinfer::inkling::is_model_type(&m));
+    args.prefill_chunk = Some(args.prefill_chunk.unwrap_or(if inkling {
+        oxinfer::inkling::default_prefill_chunk()
+    } else if gpu.is_some() {
+        1024
+    } else {
+        256
+    }));
     if oxinfer::omnigen2::is_omnigen2(&args.model) {
         if !omnigen2_cli::is_understanding(&args) {
             return omnigen2_cli::run(&args);

@@ -1,5 +1,7 @@
 //! Thinking Machines' Inkling-2 text decoder, as transformers' `Inkling2TextModel` (`inkling2`:
-//! thinkingmachines/Inkling-2-Small and Inkling-2-Small-MXFP8). The vision tower is in
+//! thinkingmachines/Inkling-2-Small and Inkling-2-Small-MXFP8) and `Inkling2LoopTextModel`
+//! (`inkling2_loop`: thinkingmachines/Inkling-2-Mini, see [`LoopConfig`]), from the releases or
+//! from GGUF files ([`gguf_config`], [`gguf_name`]). The vision tower is in
 //! [`crate::inkling_vision`].
 //!
 //! - The token embedding goes through an RMS norm. There are no position embeddings and no
@@ -530,6 +532,17 @@ pub(crate) fn gguf_name(name: &str, ne: &[usize]) -> Option<(String, Vec<usize>)
     Some((format!("{P}layers.{l}.{n}"), sh))
 }
 
+/// The prefill chunk when none is asked for: 2048 tokens on machines of 32 GB or more (each of
+/// a layer's 128 experts then sees about 128 of them, enough for its weights to be decoded once
+/// for many: prefill is 2-3x faster than with 256), 512 below (a chunk of 2048 holds about 3 GB
+/// of activations).
+pub fn default_prefill_chunk() -> usize {
+    match crate::platform::total_memory() {
+        Some(m) if m >= 32 << 30 => 2048,
+        _ => 512,
+    }
+}
+
 /// Weight streaming for a checkpoint that does not fit in memory (as Mistral Large 4).
 pub fn default_stream() -> crate::stream::StreamOptions {
     crate::mistral4::default_stream()
@@ -666,10 +679,25 @@ impl KvRows {
     }
     /// Appends rows (`x.len()` a multiple of 32 for Q8).
     fn push(&mut self, x: &[f32]) {
+        // Grown by an eighth at a time rather than doubled: at a long context the caches are
+        // most of the memory.
+        fn room<T>(v: &mut Vec<T>, add: usize) {
+            if v.capacity() - v.len() < add {
+                v.reserve_exact(add.max(v.len() / 8).max(1 << 16));
+            }
+        }
         match self.mode {
-            KvCache::F32 => self.f.extend_from_slice(x),
-            KvCache::F16 => self.h.extend(x.iter().map(|&v| half::f16::from_f32(v).to_bits())),
+            KvCache::F32 => {
+                room(&mut self.f, x.len());
+                self.f.extend_from_slice(x)
+            }
+            KvCache::F16 => {
+                room(&mut self.h, x.len());
+                self.h.extend(x.iter().map(|&v| half::f16::from_f32(v).to_bits()))
+            }
             KvCache::Q8 => {
+                room(&mut self.q, x.len());
+                room(&mut self.s, x.len() / 32);
                 for b in x.chunks(32) {
                     let amax = b.iter().fold(0f32, |m, v| m.max(v.abs()));
                     let d = amax / 127.0;
@@ -699,9 +727,10 @@ impl KvRows {
         match self.mode {
             KvCache::F32 => &self.f[at..at + n],
             KvCache::F16 => {
-                for (o, &h) in out.iter_mut().zip(&self.h[at..at + n]) {
-                    *o = crate::quant::f16_to_f32(h);
-                }
+                use half::slice::HalfFloatSliceExt;
+                // SAFETY: f16 and u16 have the same layout.
+                let h: &[half::f16] = unsafe { std::slice::from_raw_parts(self.h[at..at + n].as_ptr() as *const half::f16, n) };
+                h.convert_to_f32_slice(out);
                 out
             }
             KvCache::Q8 => {
@@ -1700,9 +1729,7 @@ impl<'a> Inkling2Model<'a> {
         st.k.push(&k);
         st.v.push(&v);
 
-        let groups = nh / nkv;
-        let scaling = (d as f32).powf(-0.5);
-        let (first, extent) = (st.first, a.extent);
+        let first = st.first;
         let (ck, cv) = (&st.k, &st.v);
         let mut att = vec![0f32; t * w];
         // Prefill chunks: key blocks through the GEMM micro-kernel (`OXINFER_INKLING_ATTN=loop`
@@ -1715,40 +1742,9 @@ impl<'a> Inkling2Model<'a> {
         if blocked {
             attend_blocked(a, dr, &q, &r, &sink, ck, cv, first, start, t, &mut att);
         }
-        for_chunks(&mut att, d, !blocked, |task, o| {
-            if blocked {
-                return;
-            }
-            let (i, hh) = (task / nh, task % nh);
-            let kvh = hh / groups;
-            let p = start + i;
-            let lo = match a.window {
-                Some(win) => (p + 1).saturating_sub(win).max(first),
-                None => first,
-            };
-            let n = p + 1 - lo;
-            let qh = &q[task * d..(task + 1) * d];
-            // The relative bias by backward distance: this head's mix of the profiles.
-            let nb = n.min(extent);
-            let mut bias = vec![0f32; nb];
-            for (&rv, prof) in r[task * dr..(task + 1) * dr].iter().zip(a.rel.chunks(extent)) {
-                axpy(&mut bias, rv, &prof[..nb]);
-            }
-            // Scores of positions `lo..=p`, then the sink.
-            let mut s = vec![0f32; n + 1];
-            let mut tmp = vec![0f32; d];
-            for (j, sv) in s[..n].iter_mut().enumerate() {
-                let at = (lo + j - first) * kw + kvh * d;
-                let dist = p - (lo + j);
-                *sv = dot(qh, ck.get(at, &mut tmp)) * scaling + if dist < nb { bias[dist] } else { 0.0 };
-            }
-            s[n] = sink[task];
-            softmax_inplace(&mut s);
-            for (j, &wj) in s[..n].iter().enumerate() {
-                let at = (lo + j - first) * kw + kvh * d;
-                axpy(o, wj, cv.get(at, &mut tmp));
-            }
-        });
+        if !blocked {
+            attend_grouped(a, dr, &q, &r, &sink, ck, cv, first, start, t, &mut att);
+        }
         // A sliding layer never reads further back than its window: what is older goes, a window's
         // worth at a time.
         if let Some(win) = a.window {
@@ -1766,6 +1762,140 @@ impl<'a> Inkling2Model<'a> {
         drop(_timer);
         linear(&a.o, h, w, &att, t, out);
     }
+}
+
+/// The attention of a few queries (decoding, short passes): one task per (query, key/value
+/// head, slice of the keys), the query heads of a key/value head together so that each cached
+/// key and value is decoded once for all of them; the slices' partial softmaxes are merged with
+/// the sink after. The same as one softmax over the keys and the sink up to rounding.
+#[allow(clippy::too_many_arguments)]
+fn attend_grouped(
+    a: &Attn,
+    dr: usize,
+    q: &[f32],
+    r: &[f32],
+    sink: &[f32],
+    ck: &KvRows,
+    cv: &KvRows,
+    first: usize,
+    start: usize,
+    t: usize,
+    out: &mut [f32],
+) {
+    let Heads {
+        heads: nh,
+        kv_heads: nkv,
+        head_dim: d,
+    } = a.hd;
+    let (kw, w, groups) = (nkv * d, nh * d, nh / nkv);
+    let scaling = (d as f32).powf(-0.5);
+    let extent = a.extent;
+    let range = |i: usize| -> (usize, usize) {
+        let p = start + i;
+        let lo = match a.window {
+            Some(win) => (p + 1).saturating_sub(win).max(first),
+            None => first,
+        };
+        (lo, p + 1)
+    };
+    // Slices of at least 512 keys, as many as keep the cores busy.
+    let longest = (0..t).map(|i| range(i).1 - range(i).0).max().unwrap_or(1);
+    let want = crate::pool::threads().div_ceil(t * nkv).max(1);
+    let slices = want.min(longest.div_ceil(512)).max(1);
+    // Per (query, kv head, slice, head of the group): running max, sum, then `d` accumulators.
+    let stride = d + 2;
+    let mut part = vec![0f32; t * nkv * slices * groups * stride];
+    let pp = SendMutPtr(part.as_mut_ptr());
+    crate::pool::run(t * nkv * slices, &|task| {
+        let (i, g, sl) = (task / (nkv * slices), task / slices % nkv, task % slices);
+        let (lo, hi) = range(i);
+        let n = hi - lo;
+        let (j0, j1) = (lo + n * sl / slices, lo + n * (sl + 1) / slices);
+        // SAFETY: each task writes its own slots of `part`.
+        let res = unsafe { std::slice::from_raw_parts_mut(pp.get().add(task * groups * stride), groups * stride) };
+        if j0 == j1 {
+            for h in 0..groups {
+                res[h * stride] = f32::NEG_INFINITY;
+            }
+            return;
+        }
+        let p = start + i;
+        // The relative bias of the distances this slice covers, per head.
+        let (dmin, dmax) = (p + 1 - j1, p - j0);
+        let nb = (dmax + 1).min(extent).saturating_sub(dmin);
+        let mut bias = vec![0f32; groups * nb];
+        for h in 0..groups {
+            let hh = g * groups + h;
+            let rq = &r[(i * nh + hh) * dr..(i * nh + hh + 1) * dr];
+            let bh = &mut bias[h * nb..(h + 1) * nb];
+            for (&rv, prof) in rq.iter().zip(a.rel.chunks(extent)) {
+                if nb > 0 {
+                    axpy(bh, rv, &prof[dmin..dmin + nb]);
+                }
+            }
+        }
+        let len = j1 - j0;
+        let mut s = vec![0f32; groups * len];
+        let mut tmp = vec![0f32; d];
+        let qs: Vec<&[f32]> = (0..groups)
+            .map(|h| {
+                let hh = g * groups + h;
+                &q[i * w + hh * d..i * w + (hh + 1) * d]
+            })
+            .collect();
+        for (jj, j) in (j0..j1).enumerate() {
+            let kr = ck.get((j - first) * kw + g * d, &mut tmp);
+            let dist = p - j;
+            for (h, qh) in qs.iter().enumerate() {
+                let b = if dist >= dmin && dist - dmin < nb {
+                    bias[h * nb + dist - dmin]
+                } else {
+                    0.0
+                };
+                s[h * len + jj] = dot(qh, kr) * scaling + b;
+            }
+        }
+        for h in 0..groups {
+            let sh = &mut s[h * len..(h + 1) * len];
+            let m = sh.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let mut l = 0f32;
+            for x in sh.iter_mut() {
+                *x = (*x - m).exp();
+                l += *x;
+            }
+            res[h * stride] = m;
+            res[h * stride + 1] = l;
+        }
+        for (jj, j) in (j0..j1).enumerate() {
+            let vr = cv.get((j - first) * kw + g * d, &mut tmp);
+            for h in 0..groups {
+                let wj = s[h * len + jj];
+                axpy(&mut res[h * stride + 2..(h + 1) * stride], wj, vr);
+            }
+        }
+    });
+    // Merge the slices with the sink (a logit with a zero value).
+    for_chunks(out, d, t * nh > 1, |task, o| {
+        let (i, hh) = (task / nh, task % nh);
+        let (g, h) = (hh / groups, hh % groups);
+        let at = |sl: usize| ((i * nkv + g) * slices + sl) * groups * stride + h * stride;
+        let mut m = sink[i * nh + hh];
+        for sl in 0..slices {
+            m = m.max(part[at(sl)]);
+        }
+        let mut l = (sink[i * nh + hh] - m).exp();
+        o.fill(0.0);
+        for sl in 0..slices {
+            let base = at(sl);
+            if part[base] == f32::NEG_INFINITY {
+                continue;
+            }
+            let c = (part[base] - m).exp();
+            l += c * part[base + 1];
+            axpy(o, c, &part[base + 2..base + stride]);
+        }
+        scale_inplace(o, 1.0 / l);
+    });
 }
 
 /// `OXINFER_INKLING_ATTN=loop`: prefill attention one query at a time (as decoding).
@@ -1974,14 +2104,10 @@ fn attend_blocked(
     }
 }
 
-#[cfg(has_simd)]
 #[derive(Clone, Copy)]
 struct SendMutPtr(*mut f32);
-#[cfg(has_simd)]
 unsafe impl Send for SendMutPtr {}
-#[cfg(has_simd)]
 unsafe impl Sync for SendMutPtr {}
-#[cfg(has_simd)]
 impl SendMutPtr {
     #[inline(always)]
     fn get(self) -> *mut f32 {
@@ -2011,11 +2137,6 @@ impl crate::generate::TextLm for Inkling2Model<'_> {
     }
     fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
         Inkling2Model::logits(self, hidden, t)
-    }
-    /// At least 2048 tokens: each of the 128 experts of a layer then sees about 128 of them,
-    /// enough for its weights to be decoded once for many (prefill is 2-3x faster than with 256).
-    fn prefill_chunk(&self, chunk: usize) -> usize {
-        chunk.max(2048)
     }
 }
 

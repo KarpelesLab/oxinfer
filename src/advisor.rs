@@ -480,6 +480,41 @@ pub const CATALOG: &[Model] = &[
         .speed(26.3, 43)
         .moe()
         .note("supported, untested; a base model: it continues a text, there is no chat template"),
+    // Inkling-2 Mini: the loop runs layers 6..18 three times (48 layer applications per token,
+    // which is what `speed` counts; bytes per token from the loader on each file).
+    Model::new(
+        "thinkingmachines/Inkling-2-Mini",
+        Kind::Chat,
+        26.4,
+        19.5,
+        &[Text, ImageInput, Thinking, Tools],
+    )
+    .fixed(Format::Q4, "NVFP4")
+    .speed(5.34, 48)
+    .moe()
+    .note("matches transformers on the real weights; CPU decode (no GPU decode plan yet); no MTP"),
+    Model::new(
+        "ggml-org/Inkling-2-Mini-GGUF:Q8_0",
+        Kind::Chat,
+        26.4,
+        27.8,
+        &[Text, ImageInput, Thinking, Tools],
+    )
+    .fixed(Format::GgufQ8, "GGUF Q8_0")
+    .speed(5.11, 48)
+    .moe()
+    .note("images with the mmproj beside it; CPU decode; no MTP"),
+    Model::new(
+        "unsloth/Inkling-2-Mini-GGUF:UD-IQ3_XXS",
+        Kind::Chat,
+        26.4,
+        11.7,
+        &[Text, ImageInput, Thinking, Tools],
+    )
+    .fixed(Format::GgufLow, "GGUF UD-IQ3_XXS")
+    .speed(2.92, 48)
+    .moe()
+    .note("unsloth's own layout (the root files); --kv-cache q8 for long contexts on 16-24 GB"),
     // Inkling-2 Small: never run on the real weights (neither release fits the download budget;
     // the agreement with transformers is measured on tiny checkpoints, the vision tower on the
     // real one; bytes per token from the layout of the releases).
