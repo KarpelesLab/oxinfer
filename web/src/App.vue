@@ -20,6 +20,7 @@ import VoiceView from './components/VoiceView.vue';
 import VideoView from './components/VideoView.vue';
 import EmbedView from './components/EmbedView.vue';
 import ConnectView from './components/ConnectView.vue';
+import UpdateBanner from './components/UpdateBanner.vue';
 
 const WASM_URL = `${import.meta.env.BASE_URL}oxinfer.wasm`;
 const REPO = 'https://github.com/KarpelesLab/oxinfer';
@@ -272,6 +273,7 @@ onMounted(async () => {
       <a class="repo" :href="REPO">Source on GitHub</a>
     </nav>
   </header>
+  <UpdateBanner v-if="native && store.api && !store.needKey" />
 
   <main v-if="!backend" class="layout single" aria-busy="true"><p class="empty pad">Starting…</p></main>
 

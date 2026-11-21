@@ -334,6 +334,148 @@ fn web_auth_and_read_only() {
     std::fs::remove_dir_all(cache.parent().unwrap()).ok();
 }
 
+/// A release feed (GitHub's release JSON) at `dir/name`: version `tag`, with an archive for this
+/// platform at `asset_url` when given.
+#[cfg(feature = "update")]
+fn release_feed(dir: &std::path::Path, name: &str, tag: &str, asset_url: Option<&str>) -> String {
+    let assets: Vec<Value> = match (asset_url, oxinfer::update::platform_suffix()) {
+        (Some(u), Some(s)) => vec![json!({"name": format!("oxinfer-{tag}-{s}.tar.gz"), "browser_download_url": u, "size": 1000})],
+        _ => vec![],
+    };
+    let path = dir.join(name);
+    let v = json!({"tag_name": tag, "html_url": format!("https://github.com/KarpelesLab/oxinfer/releases/tag/{tag}"), "assets": assets});
+    std::fs::write(&path, v.to_string()).unwrap();
+    path.display().to_string()
+}
+
+/// `GET /api/web/update` of `api` until its check (or its update job) is done.
+#[cfg(feature = "update")]
+fn update_state(api: &std::sync::Arc<Api>, job: bool) -> Value {
+    let req = oxinfer::server::ApiRequest::new("GET", "/api/web/update", None, vec![]);
+    for _ in 0..200 {
+        let r = api.handle(&req).collect();
+        assert_eq!(r.status, 200);
+        let v: Value = serde_json::from_slice(&r.body).unwrap();
+        let running = if job {
+            ["checking", "downloading", "restarting"].contains(&v["job"]["state"].as_str().unwrap_or(""))
+        } else {
+            v["checking"] == true
+        };
+        if !running {
+            return v;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("the update check did not end");
+}
+
+#[test]
+#[cfg(feature = "update")]
+fn web_update_check_and_update() {
+    let (cache, _) = temp_cache("update");
+    let dir = cache.parent().unwrap().to_path_buf();
+    // Nothing listens on port 9: the download fails, so the test binary is never replaced.
+    let newer = release_feed(&dir, "newer.json", "v999.0.0", Some("http://127.0.0.1:9/oxinfer.tar.gz"));
+    let older = release_feed(&dir, "older.json", "v0.0.1", None);
+    let api_with = |extra: &str| {
+        let o = ServerOptions::from_pairs(&format!("web=1; log=0; cache_dir={}; {extra}", cache.display())).unwrap();
+        Api::new(o).unwrap()
+    };
+    let post = || oxinfer::server::ApiRequest::post_json("/api/web/update", "{}");
+    let error = |r: &oxinfer::server::ApiResponse| serde_json::from_slice::<Value>(&r.body).unwrap()["error"].clone();
+
+    // Over HTTP: the first answer is "checking", then the release from the feed.
+    let s = serve(&format!("web=1; cache_dir={}; update_feed={newer}", cache.display()));
+    let local = ["Host: localhost", "Content-Type: application/json"];
+    let (st, body) = request_with(s.addr(), "GET", "/api/web/update", &local, "");
+    assert_eq!(st, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["current"], env!("CARGO_PKG_VERSION"));
+    assert!(v["state"] == "checking" || v["state"] == "available", "{v}");
+    let mut v = v;
+    for _ in 0..200 {
+        if v["state"] != "checking" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        v = serde_json::from_str(&request_with(s.addr(), "GET", "/api/web/update", &local, "").1).unwrap();
+    }
+    assert_eq!(v["state"], "available", "{v}");
+    assert_eq!((v["latest"].as_str(), v["newer"].as_bool()), (Some("999.0.0"), Some(true)));
+    assert_eq!(v["url"], "https://github.com/KarpelesLab/oxinfer/releases/tag/v999.0.0");
+    assert!(v["checked"].as_u64().is_some());
+    // Not the oxinfer program (a library user, as here): the GUI shows the command instead.
+    assert_eq!(v["can_update"], false);
+    assert!(v["why_not"].as_str().unwrap().contains("another program"), "{v}");
+    assert_eq!(v["command"], "oxinfer --update");
+    let (st, body) = request_with(s.addr(), "POST", "/api/web/update", &local, "{}");
+    assert_eq!(st, 409, "{body}");
+    assert!(body.contains("cannot_update"), "{body}");
+    s.stop().unwrap();
+
+    // Not newer.
+    let api = api_with(&format!("update_feed={older}"));
+    let v = update_state(&api, false);
+    assert_eq!(
+        (v["state"].as_str(), v["newer"].as_bool(), v["latest"].as_str()),
+        (Some("up_to_date"), Some(false), Some("0.0.1")),
+        "{v}"
+    );
+    assert!(v["why_not"].is_null() && v["can_update"] == false, "{v}");
+    // A failed check.
+    let api = api_with(&format!("update_feed={}", dir.join("missing.json").display()));
+    let v = update_state(&api, false);
+    assert_eq!(v["state"], "error", "{v}");
+    assert!(v["error"].as_str().unwrap().contains("release feed"), "{v}");
+    assert!(v["latest"].is_null());
+
+    // Turned off: no check (the feed would fail) and no update.
+    let api = api_with(&format!("update_check=0; update_feed={}", dir.join("missing.json").display()));
+    let v = update_state(&api, false);
+    assert_eq!(
+        (v["enabled"].as_bool(), v["state"].as_str()),
+        (Some(false), Some("disabled")),
+        "{v}"
+    );
+    assert!(v["error"].is_null() && v["latest"].is_null());
+    oxinfer::server::web::allow_self_update(&api, None);
+    let r = api.handle(&post()).collect();
+    assert_eq!((r.status, error(&r)["code"].as_str()), (403, Some("update_check_off")));
+
+    // Read-only (a non-loopback address without a key): refused, whatever the program.
+    let api = api_with(&format!("listen=0.0.0.0:0; update_feed={newer}"));
+    oxinfer::server::web::allow_self_update(&api, None);
+    let v = update_state(&api, false);
+    assert_eq!(v["can_update"], false);
+    assert!(v["why_not"].as_str().unwrap().contains("read-only"), "{v}");
+    let r = api.handle(&post()).collect();
+    assert_eq!((r.status, error(&r)["code"].as_str()), (403, Some("read_only")));
+
+    // The oxinfer program (allowed, no restart hook): the update job runs and fails to download.
+    let api = api_with(&format!("update_feed={newer}"));
+    oxinfer::server::web::allow_self_update(&api, None);
+    let v = update_state(&api, false);
+    assert_eq!(v["can_update"], oxinfer::update::platform_suffix().is_some(), "{v}");
+    let r = api.handle(&post()).collect();
+    assert_eq!(r.status, 200);
+    let job: Value = serde_json::from_slice(&r.body).unwrap();
+    assert!(
+        ["checking", "downloading", "error"].contains(&job["state"].as_str().unwrap()),
+        "{job}"
+    );
+    let v = update_state(&api, true);
+    assert_eq!(v["job"]["state"], "error", "{v}");
+    let exe = std::env::current_exe().unwrap();
+    assert!(exe.is_file(), "the test binary is still there");
+    // Not newer: the job says so, nothing is downloaded.
+    let api = api_with(&format!("update_feed={older}"));
+    oxinfer::server::web::allow_self_update(&api, None);
+    assert_eq!(api.handle(&post()).collect().status, 200);
+    let v = update_state(&api, true);
+    assert_eq!(v["job"]["state"], "up_to_date", "{v}");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn anthropic_messages_routing_and_errors() {
     let s = serve("model=m=/nonexistent/model; api_key=k");

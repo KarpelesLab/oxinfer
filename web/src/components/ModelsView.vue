@@ -231,6 +231,8 @@ onUnmounted(() => clearInterval(timer));
         <template v-if="store.status">
           <p class="device">{{ store.status.platform }}</p>
           <dl class="speed">
+            <dt>oxinfer</dt>
+            <dd>{{ store.status.version }}</dd>
             <dt>Memory</dt>
             <dd>{{ fmtBytes(store.status.memory) }}{{ store.status.memory_available ? `, ${fmtBytes(store.status.memory_available)} free` : '' }}</dd>
             <dt>For models</dt>

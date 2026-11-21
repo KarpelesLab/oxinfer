@@ -23,6 +23,7 @@ oxinfer web --model qwen=Qwen/Qwen3.5-0.8B,quant=q8 --memory-gb 24
 | `--no-open` | do not open the GUI in the default browser |
 | `--api-key KEY` | requests need `Authorization: Bearer KEY`, the GUI's too (default `$OXINFER_API_KEY`); the browser opened at start gets the key in the address fragment, keeps it in its local storage and removes it from the address bar; another browser asks for it |
 | `--model [ID=]SOURCE[,KEY=VALUE...]` | models listed from the start, as with `serve` |
+| `--no-update-check` | do not look for newer oxinfer releases (see [Updates](#updates)) |
 
 and the other options of [`oxinfer serve`](server.md) (`--memory-gb`, `--cache-dir`, `--threads`,
 `--prompt-cache`, `--cors`, `--tls-cert` / `--tls-key`, `--self-signed`, `--preload`, `--quiet`,
@@ -113,6 +114,47 @@ list must be loaded once from the GUI, or given with `--model`).
   Its system prompt and tool definitions are long, so the first request reads a long prompt, and
   a small model is a weak agent: use the largest chat model the machine runs well.
 
+## Updates
+
+When a newer oxinfer release is out, a line under the header says so (*oxinfer 0.2.0 is
+available*), with a link to its release notes. The Models view shows the running version under
+*This computer*.
+
+- **The check.** The first time the page asks (`GET /api/web/update`), the server asks GitHub for
+  the latest release in the background (the page gets `"state": "checking"` and asks again a few
+  seconds later), then answers from memory: at most one request every 6 hours (30 minutes after
+  a failure). The request is the anonymous `GET
+  https://api.github.com/repos/KarpelesLab/oxinfer/releases/latest` that `oxinfer --check-update`
+  makes: no token, no cookie, no identifier, nothing about this machine or its models. The answer
+  is kept in the cache directory (`update-release.json`), so restarting oxinfer does not ask
+  again. `--no-update-check` (`update_check=0`) turns it off: no request is made, nothing is shown,
+  and the GUI cannot update.
+- **Update and restart.** When the server may change things (the management API's rule:
+  loopback, or an API key) and the release has a binary for this platform, the line has an
+  *Update and restart* button. The server downloads the release's archive, replaces its own
+  executable (as `oxinfer --update` does: the new file is written beside it and swapped in by a
+  rename, so a failed update leaves the old one), then starts the new one with the same arguments
+  on the same address and port, without opening another browser tab. On Linux and macOS it
+  `exec`s it (the same process, in the same terminal; the listening socket closes with the exec
+  and the new process binds it again); on Windows it starts the new process and exits (the old
+  executable stays as a hidden `oxinfer.exe.old` until the next start deletes it). The page shows
+  the progress, waits for the server to answer with the new version and reloads itself. The
+  update is refused (409) while a download, a model load or a request is running; a request that
+  starts during the download delays the restart until it ends (two minutes at most). Loaded models
+  are not kept: those given with `--model` are listed again and load on use, those loaded from the
+  GUI must be loaded again.
+- **When it cannot.** With a read-only management API, without a binary for this platform, when
+  the executable's directory is not writable (a package manager's install), or when the server
+  runs inside another program (the Rust library, the C API's `oxi_server_new` with `web=1`: that
+  program's executable is not oxinfer's and is never replaced), the line shows the command to run
+  instead: `oxinfer --update`. If the restart itself fails, the status says the new version is
+  installed and oxinfer must be restarted by hand.
+
+`update_feed=FILE_OR_URL` (or `$OXINFER_UPDATE_FEED`, also read by `--check-update` and
+`--update`) replaces GitHub's API with a JSON file or URL of the same shape (`tag_name`,
+`html_url`, `assets` with `name`, `browser_download_url`, `size`): for tests and mirrors. The
+answer of such a feed is not kept in the cache directory.
+
 ## Management API
 
 Under `/api/web/`, apart from `/v1`. Every endpoint but `info` needs the API key when one is set.
@@ -134,6 +176,8 @@ Under `/api/web/`, apart from `/v1`. Every endpoint but `info` needs the API key
 | `GET /api/web/models` | the models: `id`, `source`, `options`, `kind`, `loaded`, `busy`, `memory`, `state` (`unloaded`, `queued`, `waiting`, `downloading`, `loading`, `ready`, `busy`, `error`), `load` (the stage's details: file and bytes while downloading, the error) |
 | `POST /api/web/models/load` | `{"model": SPEC, "id": NAME, "options": {KEY: VALUE} or "K=V,..."}`: lists the model and loads it in the background; `{"id", "load"}` |
 | `POST /api/web/models/unload` | `{"id"}`: unloads it now (409 while a request uses it; a load in progress is cancelled). It stays listed and loads again on its next request |
+| `GET /api/web/update` | `{enabled, state, current, latest, newer, url, checked, checking, error, can_update, why_not, command, job}`: `state` is `checking`, `available`, `up_to_date`, `error`, `unknown`, `disabled` (`--no-update-check`) or `unsupported` (a build without the `update` feature); `url` the release notes; `checked` the Unix time of the answer; `can_update` whether `POST` would install it, else `why_not` and `command` (`oxinfer --update`); `job` the update started from the GUI, if any |
+| `POST /api/web/update` | installs the latest release and restarts into it (see [Updates](#updates)); answers the job: `state` (`checking`, `downloading`, `restarting`, `updated`: installed, restart by hand; `up_to_date`, `error`), `version`, `file`, `size`, `message`, `error`, `started`. 403 when read-only (`read_only`) or turned off (`update_check_off`), 409 while busy (`busy`) or when this process cannot replace itself (`cannot_update`); a job already running (or done, waiting for a restart) is returned as it is |
 
 ### Security
 
@@ -142,7 +186,7 @@ Under `/api/web/`, apart from `/v1`. Every endpoint but `info` needs the API key
 - **Non-loopback without a key: read-only.** Bound to an address other than loopback
   (`--host 0.0.0.0`, a LAN address) without an API key, `oxinfer web` prints a warning and the
   management API refuses every change with 403 (`"code": "read_only"`): no downloads, deletions,
-  loads or unloads, from anyone. Listing the catalog, the cache and the status still works, and so
+  loads, unloads or updates, from anyone. Listing the catalog, the cache and the status still works, and so
   do `/v1` and the models listed with `--model`. Set a key to manage models remotely.
 - **Cross-site requests.** Requests that change something (POST, DELETE) must be JSON (a plain
   HTML form or a `text/plain` fetch from another site cannot set that type without a CORS
@@ -170,7 +214,10 @@ In Rust: `oxinfer::model_cache::{list, entry_at, locate, remove, disk_space, to_
 `oxinfer::hf::plan` (what a download takes) and the server's `ServerOptions::web` (key `web=1`),
 `Api::add_model`, `Api::unload`. In C (`include/oxinfer.h`): `oxi_cache_list`,
 `oxi_cache_remove`, `oxi_download_plan`, and `web=1` in the options of `oxi_server_new` serves the
-GUI and the management API from an embedding application.
+GUI and the management API from an embedding application (`update_check=0` there turns the
+release check off; such a server never replaces an executable). `oxinfer::server::web::allow_self_update`
+is what lets `oxinfer web` replace and restart itself. The engine and the C API make no update
+check of their own.
 
 "Last used" is when oxinfer last loaded the model: each load writes the time into a small
 `.oxinfer-last-used` file in the model's cache folder (not counted in its size).

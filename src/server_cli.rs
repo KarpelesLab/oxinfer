@@ -77,6 +77,7 @@ pub fn parse_options(o: &mut ServerOptions, args: &[String], usage: &str, comman
             "l" => o.set("listen", &val()?)?,
             "preload" | "download" | "self-signed" | "local-media" => o.set(&flag.replace('-', "_"), "1")?,
             "no-remote-media" => o.set("remote_media", "0")?,
+            "no-update-check" => o.set("update_check", "0")?,
             "quiet" | "q" => o.set("log", "0")?,
             f if f.starts_with(|c: char| c.is_ascii_alphabetic()) => {
                 let key = f.replace('-', "_");

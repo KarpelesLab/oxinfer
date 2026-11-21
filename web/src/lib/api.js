@@ -178,6 +178,12 @@ export class HttpApi {
   removeCached(name) {
     return this.post('api/web/cache/delete', { name });
   }
+  updateStatus() {
+    return this.get('api/web/update');
+  }
+  startUpdate() {
+    return this.post('api/web/update', {});
+  }
   load(model, { id, options } = {}) {
     return this.post('api/web/models/load', { model, id, options });
   }

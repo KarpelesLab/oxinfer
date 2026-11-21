@@ -263,6 +263,15 @@ pub struct ServerOptions {
     /// no longer verify (such blocks are dropped without an error); set one to keep them valid
     /// across restarts and between servers that share it.
     pub thinking_key: Option<String>,
+    /// The web GUI tells when a newer oxinfer release is out (key `update_check`, default on;
+    /// `--no-update-check`): at most one anonymous request to GitHub's release API every few
+    /// hours, made in the background (see [`web`], `GET /api/web/update`). Off: no request, and
+    /// no update from the GUI.
+    pub update_check: bool,
+    /// Where that check reads the latest release (key `update_feed`): a JSON file or an
+    /// `http(s)://` URL in the shape of GitHub's release API; default `$OXINFER_UPDATE_FEED`,
+    /// else GitHub (see `update::latest_from`). For tests and mirrors.
+    pub update_feed: Option<String>,
 }
 
 impl Default for ServerOptions {
@@ -289,6 +298,8 @@ impl Default for ServerOptions {
             prompt_cache_gb: None,
             web: false,
             thinking_key: None,
+            update_check: true,
+            update_feed: None,
         }
     }
 }
@@ -325,6 +336,8 @@ impl ServerOptions {
         "prompt_cache_gb",
         "web",
         "thinking_key",
+        "update_check",
+        "update_feed",
         "config",
     ];
 
@@ -361,6 +374,8 @@ impl ServerOptions {
             "prompt_cache_gb" => self.prompt_cache_gb = opt_str(value).map(|v| num(&v)).transpose()?,
             "web" => self.web = parse_bool(key, value)?,
             "thinking_key" => self.thinking_key = opt_str(value),
+            "update_check" => self.update_check = parse_bool(key, value)?,
+            "update_feed" => self.update_feed = opt_str(value),
             "config" => {
                 let text = std::fs::read_to_string(value).with_context(|| format!("config: {value}"))?;
                 let v: Value = serde_json::from_str(&text).with_context(|| format!("config: {value}"))?;

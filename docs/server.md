@@ -285,7 +285,7 @@ requests need `Authorization: Bearer KEY`), `--cors ORIGIN`, `--max-body-mb N` (
 `--prompt-cache DIR|auto` and `--prompt-cache-gb F` (the chat models' prompt cache),
 `--thinking-key KEY` (the key of [thinking signatures](#anthropic-messages-api)),
 `--tls-cert FILE --tls-key FILE` or `--self-signed` for HTTPS, `--workers N` (connections served
-at once, default 32), `--quiet`; `web=1` (the key of `ServerOptions` and `oxi_server_new`; what `oxinfer web` sets) also serves the [web GUI](web.md) and its `/api/web/` management API. Media URLs in requests may be `data:` URLs or `http(s)://` URLs,
+at once, default 32), `--quiet`; `web=1` (the key of `ServerOptions` and `oxi_server_new`; what `oxinfer web` sets) also serves the [web GUI](web.md) and its `/api/web/` management API, whose release check (at most one anonymous request to GitHub every 6 hours, made only when the GUI asks; [Updates](web.md#updates)) `--no-update-check` / `update_check=0` turns off (`update_feed=FILE_OR_URL` reads the release from elsewhere; `serve` without `web` never checks). Media URLs in requests may be `data:` URLs or `http(s)://` URLs,
 which the server fetches (`--no-remote-media` turns that off); local paths and `file://` URLs
 only with `--local-media`, for trusted clients. `--config FILE` reads the same options as JSON:
 

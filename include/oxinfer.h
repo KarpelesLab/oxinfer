@@ -1050,7 +1050,11 @@ typedef int (*oxi_bytes_fn)(void *user, const char *data, size_t len);
  *                        (catalog, downloads, cache, loading models; see docs/web.md)
  *   thinking_key=KEY     key of the HMAC signatures of /v1/messages thinking blocks, checked
  *                        when clients send them back (default: random per server)
- *   config=PATH          read a JSON file of these options
+ *   update_check=0|1     with web=1: the GUI tells when a newer oxinfer release is out (default
+ *                        1: one anonymous GitHub request at most every 6 hours, when the GUI
+ *                        asks; 0: none). An embedding application is never updated by it.
+ *   update_feed=PATH|URL with web=1: read the latest release from there instead of GitHub
+ *   config=PATH         read a JSON file of these options
  * `progress` (may be NULL) reports downloads made by preload / download. Returns NULL on error. */
 OxiServer *oxi_server_new(const char *options, oxi_progress_fn progress, void *user);
 

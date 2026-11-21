@@ -17,12 +17,20 @@
 //! | `GET /api/web/models` | the models clients can use (`/v1/models`), with their load state |
 //! | `POST /api/web/models/load` | `{"model", "id", "options"}`: adds the model and loads it in the background |
 //! | `POST /api/web/models/unload` | `{"id"}`: unloads it (it stays listed and loads again on use) |
+//! | `GET /api/web/update` | this version, the latest release, whether it is newer and can be installed from here |
+//! | `POST /api/web/update` | installs the latest release over this executable and restarts into it ([`allow_self_update`]) |
 //!
 //! Every endpoint but `info` needs the API key when one is set. Requests that change anything
 //! (POST, DELETE) must be JSON and, when the browser sends an `Origin`, come from the page's own
 //! origin; on a loopback listener the `Host` must be a loopback name (against DNS rebinding).
 //! Bound to a non-loopback address without an API key, the management API is read-only:
-//! downloads, deletions, loads and unloads are refused with 403 (`oxinfer web` warns at start).
+//! downloads, deletions, loads, unloads and updates are refused with 403 (`oxinfer web` warns at
+//! start).
+
+mod update;
+
+pub use update::{RESTART_ENV, Restart, allow_self_update};
+use update::{Updates, start_update, update_status};
 
 use super::{Api, ApiError, ApiRequest, ApiResponse, ApiResult, ModelSpec, Output};
 use crate::server::registry::{Stage, detect_path};
@@ -250,6 +258,8 @@ pub(crate) struct WebState {
     /// The CPU kernel rates of the catalog's speed estimates, once measured (in the background).
     rates: Mutex<Option<[f64; 7]>>,
     calibrating: AtomicBool,
+    /// The release check of `GET /api/web/update` ([`super::ServerOptions::update_check`]).
+    updates: Updates,
 }
 
 impl WebState {
@@ -267,6 +277,7 @@ impl WebState {
             platform: OnceLock::new(),
             rates: Mutex::new(None),
             calibrating: AtomicBool::new(false),
+            updates: Updates::new(opts),
         }
     }
 
@@ -459,6 +470,8 @@ fn management(api: &Arc<Api>, w: &WebState, req: &ApiRequest, rest: &str) -> Api
             j.cancel.store(true, Ordering::Relaxed);
             json_ok(j.to_json())
         }
+        (["update"], true, _, _) => json_ok(update_status(api, w)),
+        (["update"], _, true, _) => start_update(api, w),
         (["models"], true, _, _) => json_ok(models(api, w)),
         (["models", "load"], _, true, _) => load(api, w, &body(req)?),
         (["models", "unload"], _, true, _) => {

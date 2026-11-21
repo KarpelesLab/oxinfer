@@ -38,7 +38,7 @@ pub fn platform_suffix() -> Option<&'static str> {
 }
 
 /// One file attached to a release.
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct Asset {
     pub name: String,
     pub browser_download_url: String,
@@ -49,7 +49,7 @@ pub struct Asset {
 }
 
 /// A release as the GitHub API describes it.
-#[derive(Clone, Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 pub struct Release {
     pub tag_name: String,
     #[serde(default)]
@@ -100,11 +100,37 @@ pub fn newer(a: &str, b: &str) -> bool {
     false
 }
 
+/// The environment variable that replaces the GitHub API as the source of the latest release:
+/// a JSON file or an `http(s)://` URL in the API's shape (`tag_name`, `html_url`, `assets`), for
+/// tests and mirrors.
+pub const FEED_ENV: &str = "OXINFER_UPDATE_FEED";
+
 /// The latest published release (`GET /repos/<repo>/releases/latest`, unauthenticated: GitHub
-/// allows 60 such requests an hour per address).
+/// allows 60 such requests an hour per address), or what `$OXINFER_UPDATE_FEED` names.
 pub fn latest() -> Result<Release> {
-    let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let body = crate::hf::http_get(&url).context("ask GitHub for the latest release")?;
+    latest_from(None)
+}
+
+/// [`latest`] from `feed` (a JSON file or an `http(s)://` URL, see [`FEED_ENV`]) when given,
+/// else `$OXINFER_UPDATE_FEED`, else the GitHub API. The request is an anonymous GET: no token,
+/// no cookie, nothing about this machine but what any HTTP request shows.
+pub fn latest_from(feed: Option<&str>) -> Result<Release> {
+    let env = std::env::var(FEED_ENV).ok().filter(|f| !f.is_empty());
+    let (url, body) = match feed.filter(|f| !f.is_empty()).or(env.as_deref()) {
+        Some(f) if f.starts_with("http://") || f.starts_with("https://") => (
+            f.to_string(),
+            crate::hf::http_get(f).with_context(|| format!("read the release feed {f}"))?,
+        ),
+        Some(f) => (
+            f.to_string(),
+            std::fs::read(f).with_context(|| format!("read the release feed {f}"))?,
+        ),
+        None => {
+            let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+            let body = crate::hf::http_get(&url).context("ask GitHub for the latest release")?;
+            (url, body)
+        }
+    };
     serde_json::from_slice(&body).with_context(|| format!("parse {url}"))
 }
 
@@ -214,7 +240,12 @@ pub enum Outcome {
 /// Downloads the latest release when it is newer than this binary (or `force`) and replaces the
 /// running executable with it. `log` receives progress lines.
 pub fn update(force: bool, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
-    let rel = latest()?;
+    update_from(None, force, log)
+}
+
+/// [`update`] with the release read from `feed` ([`latest_from`]).
+pub fn update_from(feed: Option<&str>, force: bool, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
+    let rel = latest_from(feed)?;
     if !force && !rel.is_newer() {
         return Ok(Outcome::UpToDate(rel.version().to_string()));
     }
@@ -222,7 +253,7 @@ pub fn update(force: bool, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
 }
 
 /// Installs `rel` over the running executable.
-fn install(rel: &Release, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
+pub fn install(rel: &Release, log: &mut dyn FnMut(&str)) -> Result<Outcome> {
     let suffix = platform_suffix().context("no binary is published for this platform: build from source")?;
     let asset = rel
         .asset()
@@ -300,6 +331,18 @@ pub fn auto_update(stamp_dir: &Path, log: &mut dyn FnMut(&str)) -> Result<Auto> 
         Ok(Outcome::UpToDate(_)) => Auto::UpToDate,
         Err(e) => available(format!("{e:#}")),
     })
+}
+
+/// Why this program cannot replace itself with `rel`'s binary (None: it can): no binary for this
+/// platform in the release, or a directory it cannot write to.
+pub fn cannot_install(rel: &Release) -> Option<String> {
+    if rel.asset().is_none() {
+        return Some(match platform_suffix() {
+            Some(s) => format!("release {} has no {s} binary", rel.tag_name),
+            None => "no binary is published for this platform".to_string(),
+        });
+    }
+    current_exe().and_then(|exe| replaceable(&exe)).err().map(|e| format!("{e:#}"))
 }
 
 /// Whether [`replace_executable`] can work on `exe`: a file can be created beside it.

@@ -20,6 +20,8 @@ options:\n\
 \x20                       $OXINFER_API_KEY if set). Without one on a non-loopback address the\n\
 \x20                       GUI's management API is read-only (no downloads, deletions or loads)\n\
 \x20 --model [ID=]SOURCE   a model listed (and loadable) from the start; repeatable\n\
+\x20 --no-update-check     do not ask GitHub for the latest release (the GUI tells when a newer\n\
+\x20                       oxinfer is out, checking at most every 6 hours, and can install it)\n\
 \x20 and the other options of `oxinfer serve` (--memory-gb, --cache-dir, --threads,\n\
 \x20 --prompt-cache, --cors, --tls-cert/--tls-key, --self-signed, --preload, --quiet, ...)";
 
@@ -56,6 +58,22 @@ pub fn run(args: &[String]) -> Result<()> {
     if listen.is_some() && (host.is_some() || port.is_some()) {
         bail!("--listen and --host / --port: give one or the other");
     }
+    // Restarted after an update from the GUI: the address it had, no new browser tab.
+    let restarted = std::env::var(oxinfer::server::web::RESTART_ENV).ok().filter(|a| !a.is_empty());
+    if let Some(a) = &restarted {
+        // SAFETY: nothing else runs yet (no thread reads the environment).
+        unsafe { std::env::remove_var(oxinfer::server::web::RESTART_ENV) };
+        (listen, host, port, open) = (Some(a.clone()), None, None, false);
+        // The previous process may not have let the port go yet (Windows: it exits after
+        // starting this one).
+        for _ in 0..100 {
+            if std::net::TcpListener::bind(a.as_str()).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        eprintln!("[restarted as oxinfer {}]", env!("CARGO_PKG_VERSION"));
+    }
     o.set("web", "1")?;
     if !oxinfer::server::web::has_gui() {
         eprintln!("[this build has no web GUI files (src/server/webui); only the APIs are served]");
@@ -76,6 +94,9 @@ pub fn run(args: &[String]) -> Result<()> {
     o.set("listen", addr)?;
     let api = Api::new(o.clone())?;
     let running = http::start(api.clone())?;
+    // The GUI may update this executable, then start the new one on the same address.
+    let addr = running.addr();
+    oxinfer::server::web::allow_self_update(&api, Some(Box::new(move |exe| restart(exe, addr))));
     let url = running.url();
     let shown = match running.addr().ip() {
         ip if ip.is_unspecified() => url.replacen(&ip.to_string(), "localhost", 1).replace("[::]", "localhost"),
@@ -108,6 +129,28 @@ pub fn run(args: &[String]) -> Result<()> {
         open_browser(&target);
     }
     running.wait()
+}
+
+/// Runs `exe` (this program's path, where an update put the new binary) in place of this process,
+/// with the same arguments, on `addr` ([`oxinfer::server::web::RESTART_ENV`]). Unix: `exec`, the
+/// same process (its id, its terminal); the listening socket closes with the exec (sockets are
+/// close-on-exec) and the new one binds again (`SO_REUSEADDR`). Elsewhere: starts the new
+/// process and exits (it waits for the port). Returns only on failure.
+fn restart(exe: &std::path::Path, addr: std::net::SocketAddr) -> Result<()> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(std::env::args_os().skip(1))
+        .env(oxinfer::server::web::RESTART_ENV, addr.to_string());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let e = cmd.exec();
+        Err(anyhow::anyhow!("exec {}: {e}", exe.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        cmd.spawn().map_err(|e| anyhow::anyhow!("start {}: {e}", exe.display()))?;
+        std::process::exit(0)
+    }
 }
 
 fn join(host: &str, port: u16) -> String {
