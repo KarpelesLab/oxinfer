@@ -337,6 +337,22 @@ onUnmounted(() => clearInterval(timer));
         <button v-if="!showAll && group === 'all' && !query && (catalog?.models?.length || 0) > shown.length" type="button" class="link" @click="showAll = true">
           Show all {{ catalog.models.length }} models
         </button>
+        <template v-if="catalog?.presets?.length && (group === 'all' || group === 'image') && !query">
+          <h3 class="presets-h">Presets</h3>
+          <p class="hint">A catalog model with LoRAs and generation settings, set up under the preset's name (its LoRAs download with the first load).</p>
+          <ul class="cards">
+            <li v-for="p in catalog.presets" :key="p.id" class="card" :data-preset="p.id">
+              <div class="card-head">
+                <h3 class="mono">{{ p.id }}</h3>
+                <span v-if="p.listed" class="badge good">Set up</span>
+                <span v-else-if="p.base_cached" class="badge">base downloaded</span>
+              </div>
+              <p class="facts">{{ p.base }}{{ p.extra_download_gb ? ` + ${p.extra_download_gb} GB of LoRA` : '' }} · {{ Object.entries(p.defaults).map(([k, v]) => `${k} ${v}`).join(', ') }}</p>
+              <p class="hint note">{{ p.note }}</p>
+              <button type="button" class="quiet small" @click="openSetup(p.id)">{{ p.base_cached ? 'Load…' : 'Set up…' }}</button>
+            </li>
+          </ul>
+        </template>
       </section>
 
       <section class="block-section" aria-labelledby="any-h">
@@ -620,5 +636,8 @@ onUnmounted(() => clearInterval(timer));
   .manage {
     grid-template-columns: 1fr;
   }
+}
+.presets-h {
+  margin: 1.5rem 0 0.25rem;
 }
 </style>

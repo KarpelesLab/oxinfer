@@ -6,7 +6,8 @@
 //! |---|---|
 //! | `GET /api/web/info` | `{"oxinfer": true, "version", "auth_required", "admin", ...}`; needs no key |
 //! | `GET /api/web/status` | the machine, the memory budget, the cache's disk, the models and downloads |
-//! | `GET /api/web/catalog` | the tested models ([`crate::advisor`]) with what fits this machine and what is cached |
+//! | `GET /api/web/catalog` | the tested models ([`crate::advisor`]) with what fits this machine and what is cached, and the presets |
+//! | `GET /api/web/presets` | the catalog's presets with whether their base model is downloaded and whether one is listed |
 //! | `GET /api/web/cache` | the cache folders ([`crate::model_cache`]) with size, last use, kind, in use |
 //! | `POST /api/web/cache/delete` | `{"name"}`: removes a cache folder (refused while in use) |
 //! | `GET /api/web/disk` | free and total bytes of the cache's file system |
@@ -425,6 +426,7 @@ fn management(api: &Arc<Api>, w: &WebState, req: &ApiRequest, rest: &str) -> Api
     match (segs.as_slice(), get, post, delete) {
         (["status"], true, _, _) => json_ok(status(api, w)),
         (["catalog"], true, _, _) => json_ok(catalog(api, w)),
+        (["presets"], true, _, _) => json_ok(json!({"data": presets(api)})),
         (["disk"], true, _, _) => {
             let d = crate::model_cache::disk_space(cache_dir);
             json_ok(
@@ -446,7 +448,8 @@ fn management(api: &Arc<Api>, w: &WebState, req: &ApiRequest, rest: &str) -> Api
         (["downloads"], _, true, _) => {
             let b = body(req)?;
             let spec = str_field(&b, &["model", "spec"]).ok_or_else(|| ApiError::bad("downloads: no \"model\"").param("model"))?;
-            let j = start_download(api, w, spec)?;
+            // A preset (`kromoss-dmd2`) downloads its base model; its LoRAs come with the load.
+            let j = start_download(api, w, base_of(spec))?;
             json_ok(j.to_json())
         }
         (["downloads", id], true, _, _) => json_ok(find_job(w, id)?.to_json()),
@@ -568,8 +571,34 @@ fn delete_entry(api: &Api, w: &WebState, name: &str) -> ApiResult<Output> {
     json_ok(json!({"name": name, "removed": true, "freed": freed}))
 }
 
+/// The model a spec downloads: a preset's base model, else the spec itself.
+fn base_of(spec: &str) -> &str {
+    match crate::advisor::preset(spec) {
+        Some(p) if !Path::new(spec).exists() => p.base,
+        _ => spec,
+    }
+}
+
+/// The catalog's presets ([`crate::advisor::PRESETS`]) with whether their base model is
+/// downloaded and whether one is listed under the preset's id.
+fn presets(api: &Api) -> Value {
+    let entries = crate::model_cache::list(api.models.cache_dir()).unwrap_or_default();
+    let listed: Vec<String> = api.models.status().into_iter().map(|s| s.spec.id).collect();
+    let mut v = crate::advisor::presets_json();
+    if let Some(list) = v.as_array_mut() {
+        for p in list {
+            let base = p["base"].as_str().unwrap_or_default().to_string();
+            p["base_cached"] = json!(entries.iter().any(|e| e.usable && e.repo.as_deref() == Some(base.as_str())));
+            p["listed"] = json!(listed.iter().any(|id| p["id"] == id.as_str()));
+        }
+    }
+    v
+}
+
 fn plan(api: &Api, b: &Value) -> ApiResult<Output> {
     let spec = str_field(b, &["model", "spec"]).ok_or_else(|| ApiError::bad("plan: no \"model\"").param("model"))?;
+    let shown = spec;
+    let spec = base_of(spec);
     let cache_dir = api.models.cache_dir();
     let disk = crate::model_cache::disk_space(cache_dir);
     if Path::new(spec).exists() {
@@ -581,7 +610,8 @@ fn plan(api: &Api, b: &Value) -> ApiResult<Output> {
     {
         let p = crate::hf::plan(spec, cache_dir).map_err(|e| ApiError::bad(format!("{e:#}")).param("model"))?;
         let mut v = p.to_json();
-        v["model"] = json!(spec);
+        v["model"] = json!(shown);
+        v["base"] = json!(spec);
         v["local"] = json!(false);
         v["free"] = json!(disk.map(|d| d.0));
         v["fits"] = json!(disk.is_none_or(|d| d.0 >= p.missing()));
@@ -589,7 +619,7 @@ fn plan(api: &Api, b: &Value) -> ApiResult<Output> {
     }
     #[cfg(not(feature = "hf"))]
     Err(ApiError::bad(format!(
-        "{spec}: not a local path, and this build cannot fetch models (the `hf` feature)"
+        "{shown}: not a local path, and this build cannot fetch models (the `hf` feature)"
     )))
 }
 
@@ -888,6 +918,7 @@ fn catalog(api: &Arc<Api>, w: &WebState) -> Value {
         }
     }
     v["calibrated"] = json!(rates.is_some());
+    v["presets"] = presets(api);
     v
 }
 

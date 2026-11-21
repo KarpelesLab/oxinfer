@@ -96,7 +96,38 @@ const fraction = computed(() => {
   return l?.total ? l.done / l.total : 0;
 });
 
-onMounted(loadCache);
+// Image models: the catalog's presets (a base model with LoRAs and settings, `kromoss-dmd2`) not
+// listed yet; loading one fetches what it lacks.
+const presets = ref([]);
+const preset = ref('');
+async function loadPresets() {
+  if (props.kind !== 'image') return;
+  try {
+    presets.value = (await store.api.get('api/web/presets')).data;
+  } catch {
+    presets.value = [];
+  }
+}
+const unlisted = computed(() => presets.value.filter((p) => !(store.status?.models || []).some((m) => m.id === p.id)));
+async function loadPreset() {
+  if (!preset.value) return;
+  error.value = '';
+  working.value = true;
+  try {
+    const r = await store.api.load(preset.value);
+    emit('update:modelValue', r.id);
+    preset.value = '';
+    await refresh();
+  } catch (e) {
+    error.value = e.message;
+  }
+  working.value = false;
+}
+
+onMounted(() => {
+  loadCache();
+  loadPresets();
+});
 </script>
 
 <template>
@@ -136,6 +167,15 @@ onMounted(loadCache);
         </select>
       </div>
       <button type="button" class="primary" :disabled="!pick || working" @click="loadSpec">Load</button>
+    </template>
+    <template v-if="unlisted.length">
+      <label class="block">Load a preset
+        <select v-model="preset" class="field" data-testid="preset-picker">
+          <option value="">Choose…</option>
+          <option v-for="p in unlisted" :key="p.id" :value="p.id">{{ p.id }}: {{ p.note }}{{ p.base_cached ? '' : ` (downloads ${p.base})` }}</option>
+        </select>
+      </label>
+      <button type="button" class="primary" :disabled="!preset || working" @click="loadPreset">Load preset</button>
     </template>
     <p v-if="error" class="error" role="alert">{{ error }}</p>
     <p class="hint"><button type="button" class="link" @click="emit('manage')">Browse the catalog and set up models</button></p>

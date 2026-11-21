@@ -137,6 +137,20 @@ fn web_gui_and_management_api() {
         assert_eq!(st, 200);
         assert!(body.contains("<div id=\"app\">"), "{body}");
     }
+    // The catalog's presets, for the Image page and the catalog (none downloaded in this cache).
+    let (st, body) = request_with(a, "GET", "/api/web/presets", &local, "");
+    assert_eq!(st, 200, "{body}");
+    let presets: Value = serde_json::from_str(&body).unwrap();
+    let dmd2 = presets["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == "kromoss-dmd2")
+        .expect("kromoss-dmd2");
+    assert_eq!(
+        (dmd2["base"].as_str(), dmd2["base_cached"].as_bool(), dmd2["listed"].as_bool()),
+        (Some("lodestones/Kromoss"), Some(false), Some(false))
+    );
     let (st, body) = request_with(a, "GET", "/api/web/info", &local, "");
     let v: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(
