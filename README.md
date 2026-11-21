@@ -5,21 +5,56 @@
 [![docs.rs](https://img.shields.io/docsrs/oxinfer)](https://docs.rs/oxinfer)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**[Try it in your browser](https://karpeleslab.github.io/oxinfer/)**: Qwen 3.5 0.8B downloads from
-Hugging Face and runs in the tab, with WebGPU when the browser has it; MLX 4-bit Gemma 4, Gemma 3
-and Qwen3 models load from the mirror too. Early days: the crate is at 0.0.x and the API and file
-formats may still change.
+Local inference in pure Rust for language, vision, image, speech and embedding models: run
+Hugging Face checkpoints (safetensors, GGUF, MLX) on the CPU of any machine, on Metal, CUDA and
+Vulkan GPUs, or in a browser tab. Early days: the crate is at 0.0.x and the API and file formats
+may still change.
 
-Local LLM inference in pure Rust: Gemma 4 (text, images, video, audio), Qwen 3.5 / 3.6 / 3.8
-(text, images, video), Mistral Large 4 (text, images; 1T parameters streamed from storage),
-DeepSeek V4 Flash (text; 284B parameters), Qwen3.8-Flash-Next (text; 125B + a 51B n-gram table read
-from storage), Gemma 3 and Qwen 3 today, more model families as they come; also
-embeddings, Stable Diffusion, FLUX.1 Kontext, Qwen-Image-Edit, OmniGen2, BAGEL and Step1X-Edit image editing, Whisper speech to text, Orpheus and ZONOS3-Mini text to speech. No BLAS, no ML framework: weights are read straight out
-of the safetensors files (HuggingFace checkpoints or MLX 4-bit ones) and every operation
-(matmuls, attention, norms, RoPE, sampling) is implemented here, with hand-written SIMD kernels
-(NEON, AVX2, wasm simd128) and its own thread pool. The CPU path runs everywhere; GPUs (Metal,
-CUDA, WebGPU in the browser) are detected at run time and used for prefill when present, with
-nothing linked at build time.
+## Get started
+
+1. **Get the binary** from the [latest release](https://github.com/KarpelesLab/oxinfer/releases/latest)
+   (macOS, Linux and Windows archives), or build it: `cargo build --release`.
+2. **Run `oxinfer web`.** It opens `http://127.0.0.1:8090/` in your browser.
+3. **Pick a model** from the catalog. It shows each model's size and whether it fits this
+   machine, downloads it with live progress, and loads it. Then chat (with images), generate
+   images, transcribe, synthesize speech or compare embeddings.
+
+The same address serves an OpenAI-compatible API (`/v1`) and Anthropic's (`/v1/messages`). The
+*Connect apps* page has ready-to-paste settings for opencode, Claude Code, Aider and the `openai`
+SDKs. More in [docs/web.md](docs/web.md).
+
+No install at all: **[try it in your browser](https://karpeleslab.github.io/oxinfer/)** (small
+models run in the tab, with WebGPU when the browser has it).
+
+## Quick start: the command line
+
+```sh
+cargo build --release          # or take a binary from the GitHub releases
+./target/release/oxinfer --models                                   # what this machine can run, with estimated speeds
+./target/release/oxinfer --model google/gemma-4-E4B-it -p "Explain RMSNorm in two sentences."
+./target/release/oxinfer --model google/gemma-4-E4B-it --chat       # interactive, multi-turn
+./target/release/oxinfer --model google/gemma-4-E4B-it --image photo.jpg -p "What is this?"
+./target/release/oxinfer --model openai/whisper-small --transcribe talk.mp3
+./target/release/oxinfer serve --model google/gemma-4-E4B-it        # OpenAI-compatible HTTP server
+./target/release/oxinfer web                                        # the browser GUI, see above
+```
+
+A Hugging Face repo id is downloaded to the cache on first use; a local folder or GGUF file works
+too. The device is chosen at run time (`--device auto`: a GPU when one starts, else the CPU).
+[docs/cli.md](docs/cli.md) has the flags, the release binaries, `--update`, `--models` and
+`oxinfer models list` / `rm` for the downloaded models; [docs/library.md](docs/library.md) the
+Rust and C API.
+
+## What it is
+
+oxinfer runs chat and vision-language models (dense and mixture-of-experts, up to trillion-parameter
+ones streamed from storage), image generation and editing, video, speech to text, text to speech
+and embeddings; the full list, with what was checked for each, is in
+[Supported models](docs/models.md). No BLAS, no ML framework: weights are read straight out of
+the checkpoint files (safetensors, GGUF, MLX) and every operation (matmuls, attention, norms,
+RoPE, sampling) is implemented here, with hand-written SIMD kernels (NEON, SME, AVX2, wasm
+simd128) and its own thread pool. The CPU path runs everywhere; GPUs (Metal, CUDA, Vulkan, WebGPU
+in the browser) are detected at run time, with nothing linked at build time.
 
 Output is validated against the `transformers` float32 reference: on Gemma 4 E2B-it the
 last-token logits agree to a max absolute difference of about 1e-4 and greedy decoding produces
@@ -44,57 +79,6 @@ Correctness comes first in both: every model and every fast path is checked agai
 implementation (the [verification](docs/verification.md#verifying-against-the-reference) section and the per-model
 notes give the measured agreement), and a speed-up that changes the output must say so and stay
 optional.
-
-## Get started: the web GUI
-
-The easiest way to use oxinfer is its browser GUI, running models on your own machine:
-
-1. **Get the binary.** Download the archive for your system from the
-   [latest release](https://github.com/KarpelesLab/oxinfer/releases/latest)
-   (`macos-universal`, `linux-x86_64`, `linux-aarch64`, `windows-x86_64`, `windows-aarch64`) and
-   unpack it, or build it with `cargo build --release` (the binary is then
-   `target/release/oxinfer`).
-2. **Start it:**
-
-   ```sh
-   oxinfer web
-   ```
-
-   It opens `http://127.0.0.1:8090/` in your browser.
-3. **Pick a model.** The *Models* page lists the curated catalog by kind (chat, vision, image
-   generation and editing, speech to text, text to speech, embeddings), with each model's size
-   and whether it fits this machine; any Hugging Face repo, GGUF file or local folder can be
-   typed in too. The setup checks the disk space, downloads the model with live progress (it
-   can be cancelled and resumes where it stopped), and loads it.
-4. **Use it.** The pages for chat (with images and thinking), images, transcription, speech and
-   embeddings work with the loaded model. The *Models* page also shows the free disk space and
-   the downloaded models, and deletes the ones you no longer need.
-
-The same address serves an OpenAI-compatible API under `/v1` and Anthropic's API under
-`/v1/messages`. Coding agents and other programs can therefore use the models the GUI loads while
-it is open: *Connect apps* gives ready-to-paste settings for opencode, Claude Code, Aider, the
-`openai` SDKs and curl. `oxinfer web --no-open` skips opening the browser, and `--host 0.0.0.0
---api-key KEY` makes it reachable from other machines. The rest is in
-[docs/web.md](docs/web.md).
-
-## Quick start: the command line
-
-```sh
-cargo build --release          # or take a binary from the GitHub releases
-./target/release/oxinfer --models                                   # what this machine can run, with estimated speeds
-./target/release/oxinfer --model google/gemma-4-E4B-it -p "Explain RMSNorm in two sentences."
-./target/release/oxinfer --model google/gemma-4-E4B-it --chat       # interactive, multi-turn
-./target/release/oxinfer --model google/gemma-4-E4B-it --image photo.jpg -p "What is this?"
-./target/release/oxinfer --model openai/whisper-small --transcribe talk.mp3
-./target/release/oxinfer serve --model google/gemma-4-E4B-it        # OpenAI-compatible HTTP server
-./target/release/oxinfer web                                        # the browser GUI, see above
-```
-
-A Hugging Face repo id is downloaded to the cache on first use; a local folder or GGUF file works
-too. The device is chosen at run time (`--device auto`: a GPU when one starts, else the CPU).
-[docs/cli.md](docs/cli.md) has the flags, the release binaries, `--update`, `--models` and
-`oxinfer models list` / `rm` for the downloaded models; [docs/library.md](docs/library.md) the
-Rust and C API.
 
 ## Documentation
 
