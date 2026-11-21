@@ -826,6 +826,8 @@ pub struct Inkling2Model<'a> {
     stream: Option<crate::stream::StreamHook>,
     /// Whole passes on the GPU, decided at the first pass ([`DevEngine`]).
     device: std::sync::OnceLock<Option<Box<dyn DevEngine>>>,
+    /// Engines replaced since (see `attach_lora`).
+    retired: Vec<Box<dyn DevEngine>>,
 }
 
 struct Loader<'a, 'c> {
@@ -1254,6 +1256,7 @@ impl<'a> Inkling2Model<'a> {
             kv: KvCache::F32,
             stream: None,
             device: std::sync::OnceLock::new(),
+            retired: Vec::new(),
         };
         // Routed experts that cannot all stay in memory are read through the page cache as they
         // are routed: no accelerator mapping may pin them.
@@ -1273,6 +1276,11 @@ impl<'a> Inkling2Model<'a> {
     /// map to these (`blk.N.attn_output.weight` is `layers.N.attn.wo_ud`, `ffn_down_exps` the
     /// experts' `down_proj`). Returns the number patched.
     pub fn attach_lora(&mut self, ad: &mut crate::lora::LoraAdapter) -> Result<usize> {
+        // The GPU engine takes no adapted weights: decided again at the next pass. The engine it
+        // replaces stays to bring the sessions that ran on it back to the host caches.
+        if let Some(Some(e)) = std::mem::take(&mut self.device).into_inner() {
+            self.retired.push(e);
+        }
         let c = &self.cfg;
         let (h, v, dr) = (c.hidden_size, c.vocab_size, c.d_rel);
         let rank = c.loop_cfg.map_or(0, |l| l.gate_rank);
@@ -1584,12 +1592,17 @@ impl<'a> Inkling2Model<'a> {
         }
         drop(timer);
         let iv = sess.iv.active().then(|| sess.iv.clone());
-        if let Some(d) = self.device() {
-            if iv.is_none() && layers.is_empty() {
+        match self.device() {
+            Some(d) if iv.is_none() && layers.is_empty() => {
                 feats.clear();
                 return d.forward(self, sess, &x, t);
             }
-            d.to_host(self, sess);
+            Some(d) => d.to_host(self, sess),
+            None => {
+                if let Some(r) = self.retired.last() {
+                    r.to_host(self, sess);
+                }
+            }
         }
         let point = |p: usize, x: &mut [f32]| {
             if let Some(iv) = &iv {

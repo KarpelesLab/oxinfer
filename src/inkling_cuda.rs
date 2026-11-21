@@ -588,6 +588,8 @@ pub(super) struct Engine {
     kfuncs: HashMap<u32, [F; 8]>,
     /// `OXINFER_INKLING_PROFILE=1`: time per kernel (calls, seconds), launches synchronized.
     prof: Option<Mutex<HashMap<usize, (u64, f64)>>>,
+    /// Two buffers of a pass's `[tokens, hidden]` for the prefill convolutions (0: none yet).
+    conv_scratch: (u64, u64),
     /// Launches whose events are not read yet (function, start, end).
     pending: Mutex<Vec<(usize, usize, usize)>>,
     owned: Mutex<Vec<u64>>,
@@ -732,7 +734,9 @@ fn cached_module(be: &CudaBackend, src: &str, kinds: &[u32]) -> Result<F> {
     be.load_image(&img)
 }
 
-const FIXED: [&str; 28] = [
+const FIXED: [&str; 30] = [
+    "sconv_par",
+    "sconv_hist",
     "rms_rows",
     "mix_1",
     "mix_3",
@@ -895,6 +899,8 @@ impl Engine {
         }
         let arena = e.make_arena(m)?;
         *e.arena.lock().unwrap() = arena;
+        let cw = (CHUNK * h.max(e.max_kv_heads * 128)) * 4;
+        e.conv_scratch = (e.alloc(cw).ok()?, e.alloc(cw).ok()?);
         debug(&format!(
             "{:.1} GB of weights on the device in {:.1} s (kinds {kinds:?})",
             total as f64 / 1e9,
@@ -959,6 +965,7 @@ impl Engine {
                 .is_ok_and(|v| v != "0")
                 .then(|| Mutex::new(HashMap::new())),
             pending: Mutex::new(Vec::new()),
+            conv_scratch: (0, 0),
             owned: Mutex::new(Vec::new()),
             layers: Vec::new(),
             head: Dw {
@@ -1438,8 +1445,7 @@ impl Engine {
     #[allow(clippy::too_many_arguments)]
     fn lin(&self, w: &Dw, x: u64, y: u64, t: usize, xs: usize, ys: usize, add: bool) {
         let (n_in, n_out) = (w.n_in as u32, w.n_out as u32);
-        // f32 matrices (the message gates, small) stay in f32 whatever t, as on the CPU.
-        if t <= MV_T || w.kind == 0 {
+        if t <= MV_T {
             self.go(
                 w.mv,
                 (ceil(w.n_out, 4), t as u32, 1),
@@ -1465,7 +1471,7 @@ impl Engine {
     /// Several matrices over one input (`jobs`: matrix, output, output stride): one launch per
     /// run of up to 8 of a kind on the matvec path.
     fn lin_many(&self, jobs: &[(&Dw, u64, usize)], x: u64, xs: usize, t: usize) {
-        if t > MV_T || jobs.iter().any(|j| j.0.kind == 0) {
+        if t > MV_T {
             for &(w, y, ys) in jobs {
                 self.lin(w, x, y, t, xs, ys, false);
             }
@@ -1550,7 +1556,7 @@ impl Engine {
     /// A message gate over input `x` and message `msg` into `out`.
     fn gate(&self, ar: &Arena, g: &(Dw, Dw, Dw), x: u64, msg: u64, out: u64, t: usize) {
         let h = self.h;
-        if g.1.kind == g.2.kind {
+        if t <= MV_T && g.1.kind == g.2.kind {
             let r = self.rank as u32;
             self.go(
                 g.0.gdown,
@@ -1600,7 +1606,18 @@ impl Engine {
             ..Default::default()
         };
         p.j[..jobs.len()].copy_from_slice(jobs);
-        self.go(self.f("sconv"), (ceil(ch, 128), jobs.len() as u32, 1), 128, &mut args![p]);
+        let ar = self.conv_scratch;
+        if t < 8 || ar.0 == 0 {
+            self.go(self.f("sconv"), (ceil(ch, 128), jobs.len() as u32, 1), 128, &mut args![p]);
+            return;
+        }
+        // Prefill: a thread per (channel, token) into scratch, then the history, then the copy.
+        let n = jobs.len() as u32;
+        self.go(self.f("sconv_par"), (ceil(ch, 128), t as u32, n), 128, &mut args![p, ar.0, ar.1]);
+        self.go(self.f("sconv_hist"), (ceil(ch, 128), 1, n), 128, &mut args![p]);
+        for (j, y) in jobs.iter().zip([ar.0, ar.1]) {
+            self.copy(j.x, y, t * ch);
+        }
     }
 
     #[cfg(test)]
@@ -2428,7 +2445,9 @@ mod tests {
                 let add = t == 3;
                 e.lin(&dw, px, py, t, n_in, n_out, add);
                 let y = down(&e, py, t * n_out);
-                let tol = if t <= MV_T { 2e-5 } else { 3e-3 };
+                // Of the summed magnitudes: the matvec sums in f32, the GEMM in split halves
+                // (measured: ~3e-8 and ~7e-8).
+                let tol = if t <= MV_T { 2e-7 } else { 4e-7 };
                 for tok in 0..t {
                     for r in 0..n_out {
                         let (mut s, mut mag) = (0f64, 0f64);
@@ -2442,7 +2461,7 @@ mod tests {
                         }
                         let got = y[tok * n_out + r] as f64;
                         assert!(
-                            (got - s).abs() <= tol * mag + 1e-6,
+                            (got - s).abs() <= tol * mag + 1e-9,
                             "{name}, {t} rows, row {r} token {tok}: {got} against {s} (magnitude {mag})"
                         );
                     }
@@ -2503,7 +2522,7 @@ mod tests {
                 e.experts(&ar, &r_dw, b_dev, &gu_dw, &dn_dw, inter, px, py, t);
                 let y = down(&e, py, t * h);
                 let ids = down_bytes(&e, ar.ids, t * k * 4);
-                let tol = if t <= MV_T { 1e-4 } else { 6e-3 };
+                let tol = 5e-6;
                 for tok in 0..t {
                     let xr = &x[tok * h..(tok + 1) * h];
                     let lg: Vec<f32> = (0..ne)

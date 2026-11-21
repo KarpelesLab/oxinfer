@@ -9,6 +9,12 @@
 //! inkling2_cuda_check MODEL [options] [--depth D]            # CUDA only: speed (two runs)
 //! ```
 //!
+//! `--tail N` (with `--load` of an `--all` reference): the last N prompt tokens are fed as decode
+//! steps instead, and their logits compared with the reference's prompt positions: decode steps
+//! against the CPU's f32 prefill GEMM (its decode kernels round activations to int8).
+//!
+//! `--keep N` (with `--all`): only the logits of the last N prompt positions are kept.
+//!
 //! `--depth D` first runs D untimed tokens (in chunks of `--chunk`), as llama-bench's `-d`: the
 //! prompt and the decode steps are then timed at that context.
 
@@ -51,6 +57,8 @@ fn main() -> Result<()> {
     let (mut plen, mut chunk, mut steps, mut kv, mut all, mut cpu) = (300usize, 512usize, 16usize, KvCache::F32, false, false);
     let (mut save, mut load) = (None, None);
     let mut depth = 0usize;
+    let mut tail = 0usize;
+    let mut keep = usize::MAX;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--prompt-len" => plen = args.next().context("N")?.parse()?,
@@ -62,6 +70,8 @@ fn main() -> Result<()> {
             "--save" => save = Some(args.next().context("FILE")?),
             "--load" => load = Some(args.next().context("FILE")?),
             "--depth" => depth = args.next().context("D")?.parse()?,
+            "--tail" => tail = args.next().context("N")?.parse()?,
+            "--keep" => keep = args.next().context("N")?.parse()?,
             o => anyhow::bail!("unknown argument {o}"),
         }
     }
@@ -86,6 +96,7 @@ fn main() -> Result<()> {
         .collect();
     let u = m.cfg.unpadded_vocab_size;
     let (pre, tokens) = tokens.split_at(depth);
+    let (tokens, tail_toks) = tokens.split_at(tokens.len() - tail);
     let run = |forced: Option<&[u32]>| -> Run {
         let h = m.cfg.hidden_size;
         let mut sess = m.new_session();
@@ -95,11 +106,15 @@ fn main() -> Result<()> {
         let mut out = Vec::new();
         let t0 = Instant::now();
         let mut last = Vec::new();
+        let first_kept = tokens.len().saturating_sub(keep);
+        let mut at = 0;
         for c in tokens.chunks(chunk) {
             let hs = m.forward_hidden(&mut sess, c);
-            if all {
-                out.extend(m.logits(&hs, c.len()).chunks(u).map(|r| r.to_vec()));
+            if all && at + c.len() > first_kept {
+                let skip = first_kept.saturating_sub(at);
+                out.extend(m.logits(&hs[skip * h..], c.len() - skip).chunks(u).map(|r| r.to_vec()));
             }
+            at += c.len();
             last = hs[hs.len() - h..].to_vec();
         }
         let lg = m.logits(&last, 1);
@@ -108,6 +123,9 @@ fn main() -> Result<()> {
             out.push(lg.clone());
         }
         let mut toks = vec![argmax(&lg) as u32];
+        for &tk in tail_toks {
+            out.push(m.forward(&mut sess, &[tk]));
+        }
         let t1 = Instant::now();
         for i in 0..steps {
             let tk = forced.map_or(toks[i], |f| f[i]);
@@ -167,7 +185,7 @@ fn main() -> Result<()> {
         .collect();
     let rg = run(Some(&ref_toks));
     report("device, the reference's tokens", &rg);
-    let n_pf = if all { plen } else { 1 };
+    let n_pf = if all { tokens.len().min(keep) } else { 1 };
     let (mut kmax, mut ksum, mut dmax, mut same) = (0f64, 0f64, 0f32, 0usize);
     for (i, (a, b)) in ref_logits.iter().zip(&rg.logits).enumerate() {
         let k = kl(a, b);
@@ -176,7 +194,7 @@ fn main() -> Result<()> {
         ksum += k;
         dmax = dmax.max(d);
         same += (argmax(a) == argmax(b)) as usize;
-        if all && i < n_pf && (k > 1e-3 || i % 100 == 0) && std::env::var("CHECK_VERBOSE").is_ok() {
+        if std::env::var("CHECK_VERBOSE").is_ok() && (k > 1e-3 || i % 100 == 0 || std::env::var("CHECK_VERBOSE").is_ok_and(|v| v == "2")) {
             println!("  position {i}: KL {k:.3e}, max diff {d:.3e}");
         }
         if i == n_pf - 1 {
@@ -189,8 +207,9 @@ fn main() -> Result<()> {
     }
     let n = ref_logits.len().min(rg.logits.len()) - n_pf;
     if n > 0 {
+        let what = if tail > 0 { "decode steps on prompt tokens" } else { "decode" };
         println!(
-            "decode: max logit diff {dmax:.3e}, mean KL {:.3e}, max KL {kmax:.3e}, same top {same}/{n}",
+            "{what}: max logit diff {dmax:.3e}, mean KL {:.3e}, max KL {kmax:.3e}, same top {same}/{n}",
             ksum / n as f64
         );
     }

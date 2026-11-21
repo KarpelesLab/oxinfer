@@ -563,12 +563,14 @@ __device__ __forceinline__ u32 pack_h2(float a, float b) {
     return r;
 }
 
-// (hi, lo) f16 pairs of two floats: hi = f16(v), lo = f16(v - hi), so hi + lo carries ~22 bits.
+// (hi, lo) f16 pairs of two floats: hi = f16(v), lo = f16((v - hi) 2^11), so hi + lo 2^-11
+// carries ~22 bits; the scale keeps lo out of f16's subnormals (the products of lo terms are
+// summed apart and scaled back).
 __device__ __forceinline__ void split_h2(float a, float b, u32& hi, u32& lo) {
     hi = pack_h2(a, b);
     float ha, hb;
     asm("{.reg .f16 l, h; mov.b32 {l, h}, %2; cvt.f32.f16 %0, l; cvt.f32.f16 %1, h;}" : "=f"(ha), "=f"(hb) : "r"(hi));
-    lo = pack_h2(a - ha, b - hb);
+    lo = pack_h2((a - ha) * 2048.f, (b - hb) * 2048.f);
 }
 
 __device__ __forceinline__ void mma16816(float* c, const u32* a, const u32* b) {
@@ -640,13 +642,16 @@ __device__ __forceinline__ void gemm_body(const W& w, const GemmP& p) {
         wok = wr < p.n_out;
     }
     const u8* wrow = base + (u64)wr * w.rb;
-    float acc[2][4][4];
+    float acc[2][4][4], accl[2][4][4];
 #pragma unroll
     for (int a = 0; a < 2; a++)
 #pragma unroll
         for (int b = 0; b < 4; b++)
 #pragma unroll
-            for (int c = 0; c < 4; c++) acc[a][b][c] = 0.f;
+            for (int c = 0; c < 4; c++) {
+                acc[a][b][c] = 0.f;
+                accl[a][b][c] = 0.f;
+            }
     u32 wm = (warp >> 1) * 32, wn = (warp & 1) * 32;
     u32 g = lane >> 2, c4 = lane & 3;
     u32 nb = p.n_in / 32;
@@ -696,6 +701,17 @@ __device__ __forceinline__ void gemm_body(const W& w, const GemmP& p) {
             }
         }
         __syncthreads();
+        // X3: this K step's products in fresh accumulators, added to the running sums with f32
+        // adds (the tensor cores' accumulation truncates).
+        float st[X3 ? 2 : 1][4][4], stl[X3 ? 2 : 1][4][4];
+        if constexpr (X3) {
+#pragma unroll
+            for (int a = 0; a < 2; a++)
+#pragma unroll
+                for (int bb = 0; bb < 4; bb++)
+#pragma unroll
+                    for (int c = 0; c < 4; c++) st[a][bb][c] = stl[a][bb][c] = 0.f;
+        }
 #pragma unroll
         for (int kk = 0; kk < 2; kk++) {
             u32 kb = 8 * kk; // in half2 units
@@ -717,7 +733,12 @@ __device__ __forceinline__ void gemm_body(const W& w, const GemmP& p) {
 #pragma unroll
             for (int mt = 0; mt < 2; mt++)
 #pragma unroll
-                for (int nt = 0; nt < 4; nt++) mma16816(acc[mt][nt], af[mt], bf[nt]);
+                for (int nt = 0; nt < 4; nt++) {
+                    if constexpr (X3)
+                        mma16816(st[mt][nt], af[mt], bf[nt]);
+                    else
+                        mma16816(acc[mt][nt], af[mt], bf[nt]);
+                }
             if constexpr (X3) {
                 u32 al[2][4], bl[4][2];
 #pragma unroll
@@ -738,12 +759,31 @@ __device__ __forceinline__ void gemm_body(const W& w, const GemmP& p) {
                 for (int mt = 0; mt < 2; mt++)
 #pragma unroll
                     for (int nt = 0; nt < 4; nt++) {
-                        mma16816(acc[mt][nt], al[mt], bf[nt]);
-                        mma16816(acc[mt][nt], af[mt], bl[nt]);
+                        mma16816(stl[mt][nt], al[mt], bf[nt]);
+                        mma16816(stl[mt][nt], af[mt], bl[nt]);
                     }
             }
         }
+        if constexpr (X3) {
+#pragma unroll
+            for (int a = 0; a < 2; a++)
+#pragma unroll
+                for (int bb = 0; bb < 4; bb++)
+#pragma unroll
+                    for (int c = 0; c < 4; c++) {
+                        acc[a][bb][c] += st[a][bb][c];
+                        accl[a][bb][c] += stl[a][bb][c];
+                    }
+        }
         __syncthreads();
+    }
+    if constexpr (X3) {
+#pragma unroll
+        for (int a = 0; a < 2; a++)
+#pragma unroll
+            for (int b = 0; b < 4; b++)
+#pragma unroll
+                for (int c = 0; c < 4; c++) acc[a][b][c] += accl[a][b][c] * (1.f / 2048.f);
     }
     if (p.mode == 2) {
         // Gate columns in warps 0 / 2 (wn = 0), up columns in warps 1 / 3: through shared memory.
@@ -1108,6 +1148,40 @@ extern "C" __global__ void sconv(ConvJobs P) {
         if (k > 1) win[k - 2] = cur;
     }
     for (u32 i = 0; i + 1 < k; i++) hist[(u64)i * ch + c] = win[i];
+}
+
+// Prefill convolutions, a thread per (channel, token), out of place into y; `sconv_fin` then
+// copies y back and moves the history on.
+extern "C" __global__ void sconv_par(ConvJobs P, float* y0, float* y1) {
+    const ConvJob& J = P.j[blockIdx.z];
+    float* y = blockIdx.z ? y1 : y0;
+    u32 c = blockIdx.x * blockDim.x + threadIdx.x, ti = blockIdx.y;
+    u32 ch = P.ch, k = P.k;
+    if (c >= ch) return;
+    u32 grp = J.dyn ? c / (ch / P.groups) : 0;
+    const float* dr = J.dyn ? J.dyn + ((u64)ti * P.groups + grp) * k : nullptr;
+    float acc = J.x[(u64)ti * ch + c];
+    for (u32 l = 0; l < k; l++) {
+        // Input ti - l: x, or the history before x (oldest first).
+        int src = (int)ti - (int)l;
+        float v = src >= 0 ? J.x[(u64)src * ch + c] : J.hist[(u64)((int)k - 1 + src) * ch + c];
+        acc += (J.taps[(u64)l * ch + c] + (dr ? dr[l] : 0.f)) * v;
+    }
+    y[(u64)ti * ch + c] = acc * P.norm;
+}
+// After `sconv_par` (and before y is copied over x): the history becomes the last k - 1 inputs,
+// from x where it has them, else from the old history.
+extern "C" __global__ void sconv_hist(ConvJobs P) {
+    const ConvJob& J = P.j[blockIdx.z];
+    u32 ch = P.ch, k = P.k, t = P.t;
+    u32 i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ch) return;
+    float w[8];
+    for (u32 q = 0; q + 1 < k; q++) {
+        int src = (int)t - (int)(k - 1) + (int)q;
+        w[q] = src >= 0 ? J.x[(u64)src * ch + i] : J.hist[(u64)((int)k - 1 + src) * ch + i];
+    }
+    for (u32 q = 0; q + 1 < k; q++) J.hist[(u64)q * ch + i] = w[q];
 }
 
 // Per-vector post-processing of n-value vectors (a warp each; nv per token, rows `stride` apart):
