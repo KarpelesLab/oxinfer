@@ -1,10 +1,7 @@
-//! Generated videos as files, and references read from files (the `media` feature): Motion JPEG
-//! with the soundtrack in AVI ([`avi_mjpeg`]), animated WebP ([`animated_webp`]), and
+//! Generated videos as files, and references read from files (the `media` feature): H.264 and
+//! AAC in MP4 or VP9 and Opus in WebM ([`mp4_or_webm`], oxideav's encoders and muxers), Motion
+//! JPEG with the soundtrack in AVI ([`avi_mjpeg`]), animated WebP ([`animated_webp`]), and
 //! [`load_reference`] for ref2va (an image, an audio clip or a video with its soundtrack).
-//!
-//! No pure-Rust H.264, VP9 or AV1 encoder is available in the oxideav crates oxinfer uses, so
-//! there is no `.mp4` / `.webm` output: AVI plays in ffmpeg-based players (`ffmpeg -i clip.avi
-//! clip.mp4` converts it), animated WebP in browsers (without sound).
 
 use super::ref2va::RefInput;
 use super::video::{FPS, Soundtrack, Video};
@@ -247,14 +244,36 @@ fn av(e: oxideav_core::Error) -> anyhow::Error {
     anyhow::anyhow!("{e}")
 }
 
-/// H.264 (constant QP 20, an IDR picture every second, 4:2:0) and AAC-LC (128 kb/s per channel
-/// pair) in MP4, or VP9 and Opus in WebM, through oxideav's encoders and muxers. The frame size
-/// must be a multiple of 16 (MiniMax-H3's are multiples of 32).
+/// Frames per independently encoded chunk of the video: H.264's IDR period and VP9's keyframe
+/// interval (one second). Each chunk starts with an IDR picture / keyframe, so the chunks are
+/// encoded in parallel, by one encoder each, and their packets concatenated. VP9's encoder codes
+/// only its first frame as a keyframe (no interval option), so this is also what gives a WebM a
+/// seek point every second (about 2 % more bytes than one keyframe in all).
+const CHUNK: usize = FPS;
+
+/// The H.264 encoder's options: CABAC, so Main profile (every browser plays it; about 3x faster
+/// than oxideav-h264's CAVLC path, whose P macroblocks are slower to decide), constant QP 19
+/// (with CABAC, about the size of CAVLC at QP 20 for more quality), an IDR picture every chunk.
+/// The packets are AVCC samples and the parameter sets the encoder's extradata (`avcC`).
+fn h264_options() -> oxideav_core::CodecOptions {
+    oxideav_core::CodecOptions::new()
+        .set("format", "avcc")
+        .set("cabac", "true")
+        .set("rc", "cqp")
+        .set("qp", "19")
+        .set("gop", CHUNK.to_string())
+}
+
+/// H.264 (Main profile, CABAC, constant QP 19, an IDR picture every second, 4:2:0) and AAC-LC
+/// (64 kb/s per channel) in MP4, or VP9 (a keyframe every second) and Opus (48 kHz) in WebM,
+/// through oxideav's encoders and muxers. The frame size must be a multiple of 16 (MiniMax-H3's
+/// are multiples of 32).
 pub fn mp4_or_webm(v: &Video, format: VideoFormat) -> Result<Vec<u8>> {
     use oxideav_core::{
-        AudioFrame, CodecId, CodecOptions, CodecParameters, Frame, PixelFormat, Rational, SampleFormat, StreamInfo, TimeBase, VideoFrame,
-        VideoPlane,
+        AudioFrame, CodecId, CodecParameters, Encoder, Frame, Packet, PixelFormat, Rational, SampleFormat, StreamInfo, TimeBase,
+        VideoFrame, VideoPlane,
     };
+    use std::sync::Mutex;
     if v.frames.is_empty() {
         bail!("no frames to write");
     }
@@ -272,19 +291,69 @@ pub fn mp4_or_webm(v: &Video, format: VideoFormat) -> Result<Vec<u8>> {
     vp.pixel_format = Some(PixelFormat::Yuv420P);
     vp.frame_rate = Some(Rational::new(fps, 1));
     if format == VideoFormat::Mp4 {
-        vp.options = CodecOptions::new()
-            .set("format", "avcc")
-            .set("rc", "cqp")
-            .set("qp", "20")
-            .set("gop", FPS.to_string());
+        vp.options = h264_options();
     }
-    let mut venc = ctx
-        .codecs
-        .first_encoder(&vp)
-        .map_err(av)
-        .with_context(|| format!("the {vcodec} encoder"))?;
     let vtb = TimeBase::new(1, fps);
-    // Opus takes 48 kHz only: the soundtrack is resampled for it.
+    // One encoder per chunk, each run on a thread of the pool.
+    let starts: Vec<usize> = (0..v.frames.len()).step_by(CHUNK).collect();
+    let mut encoders = Vec::with_capacity(starts.len());
+    for _ in &starts {
+        let e = ctx
+            .codecs
+            .first_encoder(&vp)
+            .map_err(av)
+            .with_context(|| format!("the {vcodec} encoder"))?;
+        encoders.push(Mutex::new(e));
+    }
+    let chunks: Vec<Mutex<Option<Result<Vec<Packet>>>>> = starts.iter().map(|_| Mutex::new(None)).collect();
+    let encode_chunk = |enc: &mut Box<dyn Encoder>, start: usize| -> Result<Vec<Packet>> {
+        let mut out = Vec::new();
+        let cw = v.width.div_ceil(2);
+        for (i, f) in v.frames.iter().enumerate().skip(start).take(CHUNK) {
+            let [y, u, w2] = rgb_to_yuv420(f, v.width, v.height);
+            let frame = VideoFrame {
+                pts: Some(i as i64),
+                planes: vec![
+                    VideoPlane { stride: v.width, data: y },
+                    VideoPlane { stride: cw, data: u },
+                    VideoPlane { stride: cw, data: w2 },
+                ],
+            };
+            enc.send_frame(&Frame::Video(frame)).map_err(av)?;
+            while let Ok(p) = enc.receive_packet() {
+                out.push(p);
+            }
+        }
+        enc.flush().map_err(av)?;
+        while let Ok(p) = enc.receive_packet() {
+            out.push(p);
+        }
+        Ok(out)
+    };
+    crate::pool::run(starts.len(), &|c| {
+        let mut enc = encoders[c].lock().unwrap_or_else(|p| p.into_inner());
+        let r = encode_chunk(&mut enc, starts[c]);
+        *chunks[c].lock().unwrap_or_else(|p| p.into_inner()) = Some(r);
+    });
+    let mut vpk = Vec::new();
+    for c in chunks {
+        vpk.extend(
+            c.into_inner()
+                .unwrap_or_else(|p| p.into_inner())
+                .context("a chunk was not encoded")??,
+        );
+    }
+    let encoders: Vec<Box<dyn Encoder>> = encoders
+        .into_iter()
+        .map(|m| m.into_inner().unwrap_or_else(|p| p.into_inner()))
+        .collect();
+    let vparams = encoders[0].output_params().clone();
+    // The chunks share one sample description (H.264: the avcC with the parameter sets).
+    if encoders.iter().any(|e| e.output_params().extradata != vparams.extradata) {
+        bail!("the {vcodec} encoders of the chunks disagree on their configuration");
+    }
+    // Opus takes 8 / 12 / 16 / 24 / 48 kHz (oxideav-opus 0.0.14: 48 only); a 32 kHz soundtrack is
+    // resampled to 48 kHz, not down to 24 (which would cut its band at 12 kHz).
     let resampled = match (format, v.audio.as_ref().filter(|a| !a.is_empty())) {
         (VideoFormat::Webm, Some(a)) if a.sample_rate != 48_000 => Some(Soundtrack {
             sample_rate: 48_000,
@@ -316,28 +385,6 @@ pub fn mp4_or_webm(v: &Video, format: VideoFormat) -> Result<Vec<u8>> {
         None => None,
     };
     let atb = TimeBase::new(1, audio.map_or(1, |a| a.sample_rate as i64));
-    // Encode everything first: the muxer needs the encoders' parameters (extradata) up front.
-    let mut vpk = Vec::new();
-    for (i, f) in v.frames.iter().enumerate() {
-        let [y, u, w2] = rgb_to_yuv420(f, v.width, v.height);
-        let cw = v.width.div_ceil(2);
-        let frame = VideoFrame {
-            pts: Some(i as i64),
-            planes: vec![
-                VideoPlane { stride: v.width, data: y },
-                VideoPlane { stride: cw, data: u },
-                VideoPlane { stride: cw, data: w2 },
-            ],
-        };
-        venc.send_frame(&Frame::Video(frame)).map_err(av)?;
-        while let Ok(p) = venc.receive_packet() {
-            vpk.push(p);
-        }
-    }
-    venc.flush().map_err(av)?;
-    while let Ok(p) = venc.receive_packet() {
-        vpk.push(p);
-    }
     let mut apk = Vec::new();
     if let (Some(enc), Some(a)) = (aenc.as_mut(), audio) {
         // Interleaved 16-bit chunks (the last one padded with silence to a whole frame).
@@ -370,33 +417,55 @@ pub fn mp4_or_webm(v: &Video, format: VideoFormat) -> Result<Vec<u8>> {
         time_base: vtb,
         duration: Some(v.frames.len() as i64),
         start_time: Some(0),
-        params: venc.output_params().clone(),
+        params: vparams,
     }];
     if let (Some(enc), Some(a)) = (&aenc, audio) {
+        let mut params = enc.output_params().clone();
+        // oxideav-aac 0.1.7 leaves its AudioSpecificConfig out of the parameters (its packets are
+        // ADTS frames, which oxideav-mp4 0.0.11 strips): the esds gets the AAC-LC one explicitly.
+        if format == VideoFormat::Mp4 && params.extradata.is_empty() {
+            params.extradata = oxideav_aac::asc_writer::aac_lc_asc(a.sample_rate, a.channels.len() as u8);
+        }
         streams.push(StreamInfo {
             index: 1,
             time_base: atb,
             duration: Some(a.len() as i64),
             start_time: Some(0),
-            params: enc.output_params().clone(),
+            params,
         });
     }
     let buf = SharedBuf::default();
-    let mut mux = ctx.containers.open_muxer(container, Box::new(buf.clone()), &streams).map_err(av)?;
+    let mut mux = match format {
+        // The concrete muxer, for the Segment's Duration: the registry's `webm` muxer writes
+        // none, and browsers then report an infinite duration until the end is read.
+        VideoFormat::Webm => {
+            let mut m = oxideav_mkv::mux::MkvMuxer::new_webm(Box::new(buf.clone()), &streams).map_err(av)?;
+            let secs = audio.map_or(0.0, |a| a.len() as f64 / a.sample_rate as f64);
+            let secs = secs.max(v.frames.len() as f64 / FPS as f64);
+            m.set_duration(std::time::Duration::from_secs_f64(secs)).map_err(av)?;
+            Box::new(m) as Box<dyn oxideav_core::Muxer>
+        }
+        _ => ctx.containers.open_muxer(container, Box::new(buf.clone()), &streams).map_err(av)?,
+    };
     mux.write_header().map_err(av)?;
     // Interleaved by time.
-    let key = |p: &oxideav_core::Packet| {
+    let key = |p: &Packet| {
         let t = p.dts.or(p.pts).unwrap_or(0) as f64;
         t * p.time_base.0.num as f64 / p.time_base.0.den as f64
     };
     for p in &mut vpk {
         p.stream_index = 0;
+        // oxideav-vp9 labels its packets 1/1000 s although their pts count frames.
         p.time_base = vtb;
     }
     for p in &mut apk {
         p.stream_index = 1;
+        // Every AAC / Opus packet is a random-access point. oxideav-opus leaves the flag unset,
+        // and oxideav-mkv then writes SimpleBlocks without their keyframe bit, which Chrome
+        // refuses to play ("demuxer seek failed").
+        p.flags.keyframe = true;
     }
-    let mut all: Vec<oxideav_core::Packet> = vpk.into_iter().chain(apk).collect();
+    let mut all: Vec<Packet> = vpk.into_iter().chain(apk).collect();
     all.sort_by(|a, b| key(a).total_cmp(&key(b)));
     for p in &all {
         mux.write_packet(p).map_err(av)?;
@@ -467,75 +536,81 @@ mod tests {
     /// What [`decode_back`] found.
     pub(crate) struct Decoded {
         pub frames: Vec<Vec<u8>>,
+        /// The soundtrack as [`crate::media::Media::decode_audio`] decodes it, per channel.
+        pub audio: Vec<Vec<f32>>,
         pub rate: u32,
-        pub channels: u16,
-        /// Audio samples per channel: decoded, or the packets' durations when the audio decoder
-        /// refused the packets (`audio_error`).
-        pub samples: usize,
-        pub audio_error: Option<String>,
+        /// The container's duration (seconds), when it states one.
+        pub duration: Option<f64>,
+        /// Video packets flagged as keyframes, and audio packets not flagged.
+        pub video_keyframes: usize,
+        pub audio_not_keyframes: usize,
     }
 
-    /// Demuxes `bytes` (container `fmt`) and decodes its video and audio with oxideav.
+    /// Demuxes `bytes` (container `fmt`) and decodes its video with oxideav, and its audio the
+    /// way oxinfer reads a reference clip ([`crate::media::Media::decode_audio`]).
     pub(crate) fn decode_back(bytes: Vec<u8>, fmt: &str, w: usize, h: usize) -> Decoded {
         use oxideav_core::Frame;
         let media = crate::media::Media::new();
         let ctx = media.context();
+        let file = std::env::temp_dir().join(format!("oxinfer-decode-back-{}-{w}x{h}.{fmt}", std::process::id()));
+        std::fs::write(&file, &bytes).unwrap();
         let mut input: Box<dyn oxideav_core::ReadSeek> = Box::new(std::io::Cursor::new(bytes));
         let format = ctx.containers.probe_input(&mut *input, Some(fmt)).unwrap();
         let mut demux = ctx.containers.open_demuxer(&format, input, &ctx.codecs).unwrap();
+        let duration = demux.duration_micros().map(|us| us as f64 / 1e6);
         let streams = demux.streams().to_vec();
         let vs = streams.iter().find(|s| s.params.media_type == MediaType::Video).unwrap().clone();
-        let as_ = streams.iter().find(|s| s.params.media_type == MediaType::Audio).unwrap().clone();
+        let audio_index = streams.iter().find(|s| s.params.media_type == MediaType::Audio).unwrap().index;
         let mut vdec = ctx.codecs.first_decoder(&vs.params).unwrap();
-        let mut adec = ctx.codecs.first_decoder(&as_.params).unwrap();
-        let (mut frames, mut samples) = (Vec::new(), 0usize);
-        let (mut audio_error, mut packet_samples) = (None::<String>, 0usize);
-        let take = |d: &mut Box<dyn oxideav_core::Decoder>, frames: &mut Vec<Vec<u8>>, samples: &mut usize| {
-            while let Ok(f) = d.receive_frame() {
-                match f {
-                    Frame::Video(vf) => {
-                        let p = vf.image_planes();
-                        frames.push(yuv420_to_rgb(
-                            [&p[0].data, &p[1].data, &p[2].data],
-                            [p[0].stride, p[1].stride, p[2].stride],
-                            w,
-                            h,
-                        ));
-                    }
-                    Frame::Audio(af) => *samples += af.samples as usize,
-                    _ => {}
-                }
+        let (mut frames, mut video_keyframes, mut audio_not_keyframes) = (Vec::new(), 0, 0);
+        let take = |d: &mut Box<dyn oxideav_core::Decoder>, frames: &mut Vec<Vec<u8>>| {
+            while let Ok(Frame::Video(vf)) = d.receive_frame() {
+                let p = vf.image_planes();
+                frames.push(yuv420_to_rgb(
+                    [&p[0].data, &p[1].data, &p[2].data],
+                    [p[0].stride, p[1].stride, p[2].stride],
+                    w,
+                    h,
+                ));
             }
         };
         while let Ok(p) = demux.next_packet() {
             if p.stream_index == vs.index {
+                video_keyframes += p.flags.keyframe as usize;
                 vdec.send_packet(&p).unwrap();
-                take(&mut vdec, &mut frames, &mut samples);
-            } else if p.stream_index == as_.index {
-                if audio_error.is_some() {
-                    packet_samples += p.duration.unwrap_or(0) as usize;
-                    continue;
-                }
-                match adec.send_packet(&p) {
-                    Ok(()) => take(&mut adec, &mut frames, &mut samples),
-                    Err(e) => {
-                        audio_error = Some(e.to_string());
-                        packet_samples = samples + p.duration.unwrap_or(0) as usize;
-                    }
-                }
+                take(&mut vdec, &mut frames);
+            } else if p.stream_index == audio_index {
+                audio_not_keyframes += !p.flags.keyframe as usize;
             }
         }
         let _ = vdec.flush();
-        take(&mut vdec, &mut frames, &mut samples);
-        let _ = adec.flush();
-        take(&mut adec, &mut frames, &mut samples);
+        take(&mut vdec, &mut frames);
+        let (audio, rate) = media.decode_audio(&file).unwrap().to_channels().unwrap();
+        std::fs::remove_file(&file).ok();
         Decoded {
             frames,
-            rate: as_.params.sample_rate.unwrap_or(0),
-            channels: as_.params.channels.unwrap_or(0),
-            samples: if audio_error.is_some() { packet_samples } else { samples },
-            audio_error,
+            audio,
+            rate,
+            duration,
+            video_keyframes,
+            audio_not_keyframes,
         }
+    }
+
+    /// The signal-to-noise ratio (dB) of `got` against `want` over `want`'s middle, at the
+    /// codec delay (up to 4096 samples) that fits best.
+    pub(crate) fn snr(want: &[f32], got: &[f32]) -> f64 {
+        let (lo, hi) = (want.len() / 8, want.len() * 7 / 8);
+        (0..4096.min(got.len().saturating_sub(hi)))
+            .map(|d| {
+                let (mut s, mut e) = (0f64, 0f64);
+                for i in lo..hi {
+                    let (a, b) = (want[i] as f64, got[i + d] as f64);
+                    (s, e) = (s + a * a, e + (a - b) * (a - b));
+                }
+                10.0 * (s / e.max(1e-12)).log10()
+            })
+            .fold(f64::MIN, f64::max)
     }
 
     pub(crate) fn psnr(a: &[u8], b: &[u8]) -> f64 {
@@ -543,8 +618,9 @@ mod tests {
         10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10()
     }
 
-    /// MP4 (H.264 + AAC) and WebM (VP9 + Opus) decode back with oxideav to the frames, at a
-    /// reasonable PSNR, with the whole soundtrack.
+    /// MP4 (H.264 + AAC) and WebM (VP9 + Opus) decode back with oxideav: every frame (two chunks,
+    /// encoded apart, each starting with a keyframe) at a reasonable PSNR, and the soundtrack's
+    /// two tones; the WebM states its duration and flags its audio packets as keyframes.
     #[test]
     fn mp4_and_webm_decode_back() {
         let (w, h, n) = (128usize, 64usize, 30usize);
@@ -553,6 +629,7 @@ mod tests {
         let [y, u, vv] = rgb_to_yuv420(&v.frames[0], w, h);
         let back = yuv420_to_rgb([&y, &u, &vv], [w, w / 2, w / 2], w, h);
         let conv = psnr(&v.frames[0], &back);
+        let secs = v.audio.as_ref().unwrap().len() as f64 / 32000.0;
         for (f, fmt) in [(VideoFormat::Mp4, "mp4"), (VideoFormat::Webm, "webm")] {
             let bytes = encode_video(&v, f).unwrap_or_else(|e| panic!("{fmt}: {e:#}"));
             let size = bytes.len();
@@ -561,22 +638,44 @@ mod tests {
                 std::fs::write(format!("{dir}/test.rgb"), v.frames.concat()).unwrap();
             }
             let d = decode_back(bytes, fmt, w, h);
-            let (frames, ch, samples) = (&d.frames, d.channels, d.samples);
-            assert_eq!(frames.len(), n, "{fmt}: frames");
-            let p: Vec<f64> = [0, n / 2, n - 1].iter().map(|&i| psnr(&v.frames[i], &frames[i])).collect();
+            assert_eq!(d.frames.len(), n, "{fmt}: frames");
+            let p: Vec<f64> = d.frames.iter().zip(&v.frames).map(|(a, b)| psnr(a, b)).collect();
+            let min = p.iter().cloned().fold(f64::MAX, f64::min);
+            // The two tones at the decoded rate (48 kHz for Opus).
+            let tone = |hz: f32, len: usize| -> Vec<f32> {
+                (0..len)
+                    .map(|i| 0.3 * (i as f32 * hz * std::f32::consts::TAU / d.rate as f32).sin())
+                    .collect()
+            };
+            let want_len = (secs * d.rate as f64) as usize;
+            let s: Vec<f64> = [440.0, 660.0]
+                .iter()
+                .zip(&d.audio)
+                .map(|(&hz, got)| snr(&tone(hz, want_len), got))
+                .collect();
             eprintln!(
-                "[{fmt}: {size} bytes, PSNR {p:.1?} dB (the YUV conversion alone {conv:.1} dB), audio {} Hz x{ch}, {samples} samples{}]",
+                "[{fmt}: {size} bytes, PSNR min {min:.1} dB (the YUV conversion alone {conv:.1} dB), {} keyframes, \
+                 audio {} Hz x{}, {} samples, SNR {s:.1?} dB, duration {:?}]",
+                d.video_keyframes,
                 d.rate,
-                d.audio_error
-                    .as_ref()
-                    .map(|e| format!(" (oxideav's decoder: {e}; counted from the packets)"))
-                    .unwrap_or_default()
+                d.audio.len(),
+                d.audio[0].len(),
+                d.duration
             );
-            assert!(p.iter().all(|&x| x > 28.0), "{fmt}: PSNR {p:?}");
-            assert_eq!(ch, 2, "{fmt}");
-            let secs = samples as f64 / d.rate as f64;
-            let want = v.audio.as_ref().unwrap().len() as f64 / 32000.0;
-            assert!(secs + 0.05 >= want, "{fmt}: {secs} s of audio for {want} s");
+            assert!(min > 28.0, "{fmt}: PSNR {p:?}");
+            assert_eq!(d.video_keyframes, n.div_ceil(CHUNK), "{fmt}: a keyframe per chunk");
+            assert_eq!(d.audio.len(), 2, "{fmt}");
+            assert!(
+                d.audio[0].len() as f64 / d.rate as f64 + 0.05 >= secs,
+                "{fmt}: {} samples",
+                d.audio[0].len()
+            );
+            assert!(s.iter().all(|&x| x > 15.0), "{fmt}: SNR {s:?}");
+            if f == VideoFormat::Webm {
+                let dur = d.duration.expect("the WebM's Duration");
+                assert!((dur - secs.max(n as f64 / FPS as f64)).abs() < 0.01, "{dur}");
+                assert_eq!(d.audio_not_keyframes, 0);
+            }
         }
     }
 
@@ -597,9 +696,35 @@ mod tests {
         assert_eq!(d.frames.len(), v.frames.len());
         let p: Vec<f64> = d.frames.iter().zip(&v.frames).map(|(a, b)| psnr(a, b)).collect();
         let min = p.iter().cloned().fold(f64::MAX, f64::min);
-        eprintln!("[tiny MiniMax-H3 MP4: PSNR min {min:.1} dB, audio {} Hz x{}]", d.rate, d.channels);
+        let a = v.audio.as_ref().unwrap();
+        let s: Vec<f64> = a.channels.iter().zip(&d.audio).map(|(want, got)| snr(want, got)).collect();
+        eprintln!(
+            "[tiny MiniMax-H3 MP4: PSNR min {min:.1} dB, audio {} Hz x{}, SNR {s:.1?} dB]",
+            d.rate,
+            d.audio.len()
+        );
         assert!(min > 15.0, "{p:?}");
-        assert_eq!((d.rate, d.channels), (32000, 2));
+        assert_eq!((d.rate, d.audio.len()), (32000, 2));
+        assert!(d.audio[0].len() >= a.len());
+    }
+
+    /// How long a 124-frame 448x256 video (5.2 s) takes to write as MP4 and as WebM:
+    /// `cargo test --release --lib encode_speed -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn encode_speed() {
+        let v = test_video(448, 256, 124);
+        for (f, fmt) in [(VideoFormat::Mp4, "mp4"), (VideoFormat::Webm, "webm")] {
+            let t = std::time::Instant::now();
+            let bytes = encode_video(&v, f).unwrap();
+            let s = t.elapsed().as_secs_f64();
+            eprintln!(
+                "[{fmt}: {s:.2} s ({:.3} s per frame, {} threads), {} bytes]",
+                s / v.frames.len() as f64,
+                crate::pool::threads(),
+                bytes.len()
+            );
+        }
     }
 
     /// The AVI demuxed by oxideav: every frame and every audio sample comes back.

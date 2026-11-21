@@ -107,6 +107,7 @@ impl Media {
             .ok_or_else(|| anyhow!("{}: no audio stream", path.display()))?;
         let mut decoder = oxideav_pipeline::make_decoder(&self.ctx.codecs, &stream.params)
             .map_err(|e| anyhow!("no decoder for {:?}: {e}", stream.params.codec_id))?;
+        let adts = AdtsHeader::for_stream(&stream.params);
         let mut frames = Vec::new();
         let take = |frame: Frame, frames: &mut Vec<oxideav_core::AudioFrame>| {
             if let Frame::Audio(af) = frame {
@@ -122,6 +123,10 @@ impl Media {
             if pkt.stream_index != stream.index {
                 continue;
             }
+            let pkt = match adts.as_ref().and_then(|h| h.wrap(&pkt.data)) {
+                Some(data) => oxideav_core::Packet { data, ..pkt },
+                None => pkt,
+            };
             decoder.send_packet(&pkt).map_err(|e| anyhow!("decode: {e}"))?;
             loop {
                 match decoder.receive_frame() {
@@ -142,5 +147,61 @@ impl Media {
     pub fn load_audio(&self, path: &Path, target_rate: usize) -> Result<Vec<f32>> {
         let clip = self.decode_audio(path)?;
         clip.to_mono(target_rate).with_context(|| path.display().to_string())
+    }
+}
+
+/// The ADTS header of an AAC track whose packets are bare access units configured by an
+/// `AudioSpecificConfig` (MP4's `esds`, Matroska's CodecPrivate): oxideav-aac 0.1.7, its latest
+/// release, decodes only ADTS or LOAS ("packet has neither an ADTS nor a LOAS syncword"), so
+/// those packets are given the ADTS header the configuration implies.
+pub(crate) struct AdtsHeader {
+    /// `profile_ObjectType` (`audioObjectType - 1`).
+    profile: u8,
+    /// `sampling_frequency_index`.
+    rate_index: u8,
+    /// `channel_configuration`.
+    channels: u8,
+}
+
+impl AdtsHeader {
+    /// For an `aac` stream with an AudioSpecificConfig ADTS can carry: AAC Main, LC, SSR or LTP
+    /// (object types 1 to 4) at a tabulated rate, with a channel configuration of 1 to 7.
+    pub(crate) fn for_stream(params: &oxideav_core::CodecParameters) -> Option<Self> {
+        let asc = &params.extradata;
+        if params.codec_id.as_str() != "aac" || asc.len() < 2 {
+            return None;
+        }
+        let aot = asc[0] >> 3;
+        let rate_index = ((asc[0] & 7) << 1) | (asc[1] >> 7);
+        let channels = (asc[1] >> 3) & 15;
+        ((1..=4).contains(&aot) && rate_index < 13 && (1..=7).contains(&channels)).then_some(Self {
+            profile: aot - 1,
+            rate_index,
+            channels,
+        })
+    }
+
+    /// `au` behind its 7-byte ADTS header; `None` when it already is an ADTS frame (a raw data
+    /// block starts with a 3-bit element id below 7, never with the 12-bit syncword) or is too
+    /// long for one.
+    pub(crate) fn wrap(&self, au: &[u8]) -> Option<Vec<u8>> {
+        let len = au.len() + 7;
+        if (au.len() >= 2 && au[0] == 0xFF && au[1] & 0xF0 == 0xF0) || len >= 1 << 13 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(len);
+        out.extend_from_slice(&[
+            0xFF,
+            // MPEG-4, layer 0, no CRC.
+            0xF1,
+            (self.profile << 6) | (self.rate_index << 2) | (self.channels >> 2),
+            ((self.channels & 3) << 6) | (len >> 11) as u8,
+            (len >> 3) as u8,
+            ((len & 7) << 5) as u8 | 0x1F,
+            // Buffer fullness 0x7FF (variable rate), one raw data block.
+            0xFC,
+        ]);
+        out.extend_from_slice(au);
+        Some(out)
     }
 }

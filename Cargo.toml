@@ -157,7 +157,8 @@ oxideav-mov = { version = ">=0.0.6, <0.1", optional = true }
 oxideav-ogg = { version = "0.1.9", optional = true }
 oxideav-vorbis = { version = ">=0.0.12, <0.1", optional = true }
 oxideav-opus = { version = ">=0.0.14, <0.1", optional = true }
-oxideav-mkv = { version = ">=0.0.11, <0.1", optional = true }
+# 0.0.12: demuxed packets carry the SimpleBlock keyframe bit (0.0.11 flagged every packet).
+oxideav-mkv = { version = ">=0.0.12, <0.1", optional = true }
 oxideav-avi = { version = ">=0.0.10, <0.1", optional = true }
 oxideav-h264 = { version = "0.1.9", optional = true }
 oxideav-h265 = { version = ">=0.0.15, <0.1", optional = true }

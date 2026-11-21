@@ -40,17 +40,28 @@ says so. Passing the repository id itself has not been tried.
 | `-o FILE` | `.mp4` (the default name is `video.mp4`): H.264 and the soundtrack as AAC-LC in MP4; `.webm`: VP9 and Opus (48 kHz) in WebM; `.avi`: Motion JPEG and 16-bit PCM in AVI; `.webp`: animated WebP (lossless only, about 3 s per 320x288 frame to encode) and `FILE.wav`; anything else: a PNG sequence `FILE_0000.png`, ... and `FILE.wav` |
 
 The files are written by oxideav (`minimax_h3::encode::encode_video`; the server and the C API
-take the same choice): H.264 by oxideav-h264 (Baseline profile, CAVLC, the level that fits the
-size and rate, e.g. 2.1 at 448x256, constant QP 20, an IDR picture every second), AAC-LC by
-oxideav-aac (64 kb/s per channel) and MP4 by oxideav-mp4 (0.0.11 or later: it takes the AAC
-encoder's ADTS frames and writes their `AudioSpecificConfig`); VP9 by oxideav-vp9, Opus by
-oxideav-opus (48 kHz only: the soundtrack is resampled) and WebM by oxideav-mkv. Baseline H.264
-plays in every browser (checked in Chrome: a `<video>` element plays it with its sound). The
-H.264 encode took about 0.25 s per 448x256 frame here (an M5 Max), VP9 about 0.6 s; Motion JPEG
-is two orders of magnitude faster. The WebM has no `Duration` (oxideav-mkv does not write the
-Segment's duration), so players learn the length only at the end. Without the `media` feature
-only the PNG sequence is
-available.
+take the same choice): H.264 by oxideav-h264 (Main profile with CABAC, the level that fits the
+size and rate, e.g. 2.1 at 448x256, constant QP 19, an IDR picture every second), AAC-LC by
+oxideav-aac (64 kb/s per channel) and MP4 by oxideav-mp4 (0.0.11 or later, which strips the AAC
+encoder's ADTS headers; the `esds` gets the AAC-LC `AudioSpecificConfig` from oxinfer, since
+oxideav-aac 0.1.7 does not report it); VP9 by oxideav-vp9, Opus by oxideav-opus (the 32 kHz
+soundtrack is resampled to 48 kHz) and WebM by oxideav-mkv, with the Segment's `Duration`. Each
+second of video (an IDR picture or VP9 keyframe and what follows) is encoded by its own encoder
+on its own thread and the packets concatenated: oxideav-vp9 has no keyframe interval of its own,
+so this is also what makes a WebM seekable. Both play in Chrome with their sound (a `<video>`
+element: the MP4, and the WebM, whose duration is known at `loadedmetadata`); Main-profile
+H.264 plays in every browser. Encoding one 448x256 frame on one core here (an M5 Max) took about
+0.09 s for H.264 (0.18 s with CAVLC / Baseline, which oxideav-h264 0.1.12 decides more slowly;
+its unreleased master is 14x faster) and 0.16 s for VP9; with the chunks in parallel a
+124-frame 448x256 video takes 4.0 s as MP4 and 8.9 s as WebM (`cargo test --release --lib
+encode_speed -- --ignored --nocapture`; 22.8 s and 33.3 s with CAVLC and one encoder). Motion
+JPEG is two orders of magnitude faster. Against libx264 at the same PSNR the H.264 files are 25
+to 50 % larger, against libvpx the VP9 ones about 70 %. Without the `media` feature only the PNG
+sequence is available.
+
+oxideav-aac 0.1.7 decodes ADTS or LOAS only, not the bare access units of an MP4 / Matroska
+track, so oxinfer gives those an ADTS header built from the track's `AudioSpecificConfig` when it
+reads them (`.m4a` references, a reference video's soundtrack: `Media::decode_audio`).
 
 The soundtrack is stereo at 32 kHz, 800 samples per audio latent (a 124-frame request: 207
 latents, 5.175 s for 5.167 s of frames; nothing is trimmed). In an `.mp4` it is an AAC track, in
