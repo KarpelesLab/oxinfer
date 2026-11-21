@@ -1323,10 +1323,7 @@ pub mod inkling {
 
 /// Local wall-clock time: (`YYYY-MM-DD HH:MM:SS`, weekday, UTC offset in seconds, zone name).
 pub fn local_now() -> (String, &'static str, i64, String) {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
+    let secs = crate::clock::unix_time().as_secs() as i64;
     let (offset, zone) = local_offset(secs);
     let t = secs + offset;
     let (days, rem) = (t.div_euclid(86400), t.rem_euclid(86400));

@@ -1658,7 +1658,7 @@ impl<'a> QwenModel<'a> {
         });
         self.gpu_plans.get(key, || {
             let be = crate::gpu::active()?;
-            let t0 = std::time::Instant::now();
+            let t0 = crate::clock::Instant::now();
             let plan = self
                 .gpu_graph_mode(None, Some(cap), true)
                 .and_then(|g| be.decode_plan_prefill(&g, tokens));
@@ -2086,7 +2086,7 @@ impl<'a> QwenModel<'a> {
         assert!(t > 0);
         sess.gpu_rec = None;
         if t > 1 && gpu {
-            let t0 = std::time::Instant::now();
+            let t0 = crate::clock::Instant::now();
             if self.exp.is_some() && !record && prefill_gpu(t, "plan") {
                 // Qwen4-Exp: the prefill plan builds while the decode plan makes the expert
                 // weights resident (most of a first pass's setup).

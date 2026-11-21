@@ -264,9 +264,7 @@ fn random_f32() -> f32 {
     use std::cell::Cell;
     thread_local! {
         static STATE: Cell<u64> = Cell::new({
-            let t = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos() as u64);
+            let t = crate::clock::unix_time().as_nanos() as u64;
             let local = 0u8;
             (t ^ (&local as *const u8 as u64).rotate_left(32)) | 1
         });

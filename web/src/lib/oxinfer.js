@@ -618,7 +618,8 @@ export class Oxinfer {
       host_release: (id) => {
         g.hostFiles[id] = null;
       },
-      host_now_ms: () => performance.now(),
+      // Wall-clock milliseconds (monotonic within the page): the module's Instant and dates.
+      host_now_ms: () => performance.timeOrigin + performance.now(),
       host_random: (p, n) => {
         const v = g.u8(p, n);
         for (let i = 0; i < n; i += 65536) crypto.getRandomValues(v.subarray(i, Math.min(n, i + 65536)));
