@@ -1270,7 +1270,7 @@ pub fn hf_tensors(h: &Header) -> Result<Vec<HfTensor>> {
     if bare_diffusion
         || matches!(
             h.arch(),
-            "flux" | "sd3" | "qwen_image" | "qwen_image21" | "pig" | "omnigen2" | "t5encoder" | "clip" | "dflash" | "dspark"
+            "flux" | "sd3" | "qwen_image" | "qwen_image21" | "pig" | "omnigen2" | "moss_image" | "t5encoder" | "clip" | "dflash" | "dspark"
         )
     {
         let t5 = h.arch() == "t5encoder";

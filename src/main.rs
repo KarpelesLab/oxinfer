@@ -146,6 +146,8 @@ struct Args {
     devices: bool,
     /// `--models`: what runs on this machine (`--all`: every variant; `--kind K`).
     models: bool,
+    /// `--presets`: the curated presets (base, LoRAs, settings).
+    presets: bool,
     models_all: bool,
     models_kind: Option<oxinfer::advisor::Kind>,
     models_can: Vec<oxinfer::advisor::Cap>,
@@ -388,6 +390,17 @@ fn usage() -> ! {
          \x20 --resolution N       Qwen-Image-Layered: 640 (default) or 1024\n\
          \x20 --quant q8|q4        transformer and text encoder precision; --mmap, --stream as above\n\
          \n\
+         MOSS-Image (lodestones/Kromoss, OpenMOSS-Team/MOSS-Image-*; see docs/moss-image.md): text to\n\
+         image (-o, --steps, --guidance, --negative, --size, --seed, --lora as above):\n\
+         \x20 --preset ID          a curated stack (--presets lists them): kromoss, kromoss-dmd2 (8 steps),\n\
+         \x20                      kromoss-dmd, kromoss-famegrid; also as --model ID\n\
+         \x20 --uncond-skip L      blocks left out of the negative branch (default 22; none: plain CFG)\n\
+         \x20 --slg-layers L, --slg-scale F, --slg-start F, --slg-stop F   skip-layer guidance\n\
+         \x20 --sampler euler|er_sde, --scheduler moss|simple|beta|beta57, --shift F (default 5)\n\
+         \x20 --trigger WORD       put first in the prompt unless there; --lora-merge merges low-rank LoRAs\n\
+         \x20 --transformer SPEC, --text-encoder SPEC, --vae SPEC   parts from elsewhere (GGUF, ComfyUI file)\n\
+         \x20 --moss KEY=VALUE     any MOSS-Image option or setting by name\n\
+         \n\
          MiniMax-H3 (MiniMaxAI/MiniMax-H3, or a single-file transformer of Comfy-Org/MiniMax-H3 with\n\
          --vae): text to video, first / last frame to video (-o, --size, --seed as above; see\n\
          docs/video.md):\n\
@@ -454,6 +467,7 @@ fn usage() -> ! {
          \x20 --auto-update        with any other command: first install the latest release if it is newer\n\
          \x20                      and this executable can be replaced (the next run uses it), else say that\n\
          \x20                      one is available; checked at most once an hour\n\
+         \x20 --presets            list the curated presets (base, LoRAs, trigger, settings); --format json\n\
          \x20 --models             list the tested models with what this machine can run: download size against\n\
          \x20                      the free disk space, memory against RAM and GPU memory, where each decodes\n\
          \x20                      and an estimated tokens/s (CPU kernels are timed for about a second);\n\
@@ -672,6 +686,7 @@ fn parse_args() -> Result<Args> {
         device: platform::DevicePref::Auto,
         devices: false,
         models: false,
+        presets: false,
         models_all: false,
         models_kind: None,
         models_can: Vec::new(),
@@ -877,6 +892,7 @@ fn parse_args() -> Result<Args> {
             }
             "--devices" => a.devices = true,
             "--models" => a.models = true,
+            "--presets" => a.presets = true,
             "--check-update" => a.check_update = true,
             // Handled in `main`, before the arguments are read.
             "--auto-update" => {}
@@ -1018,7 +1034,7 @@ fn parse_args() -> Result<Args> {
             }
         }
     }
-    if a.model.as_os_str().is_empty() && !a.devices && !a.models && !a.check_update && !a.update {
+    if a.model.as_os_str().is_empty() && !a.devices && !a.models && !a.presets && !a.check_update && !a.update {
         match &a.moss.preset {
             // `--preset ID` alone: the preset's base model.
             Some(id) => a.model = PathBuf::from(id),
@@ -1320,6 +1336,28 @@ fn main() -> Result<()> {
     let mut args = parse_args()?;
     if args.devices {
         print!("{}", platform::detect().report());
+        return Ok(());
+    }
+    if args.presets {
+        if args.format.as_deref() == Some("json") {
+            println!("{}", serde_json::to_string_pretty(&oxinfer::advisor::presets_json())?);
+        } else {
+            for p in oxinfer::advisor::PRESETS {
+                let set = |kv: &[(&str, &str)]| kv.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(" ");
+                println!("{:<18} {}  {}", p.id, p.base, p.note);
+                println!("{:<18} load: {}", "", if p.load.is_empty() { "-".into() } else { set(p.load) });
+                println!(
+                    "{:<18} defaults: {}{}",
+                    "",
+                    set(p.defaults),
+                    if p.trigger.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" trigger={}", p.trigger)
+                    }
+                );
+            }
+        }
         return Ok(());
     }
     if args.models {

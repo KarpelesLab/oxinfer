@@ -422,10 +422,21 @@ impl<'f> LayerReader<'f, '_> {
         } else {
             self.ld.rows(tensor, r0, r1, quantize)?
         };
-        let side = self.lora.runtime(name, d.n_out, d.n_in)?.map(|(a, b, r)| Side {
-            down: f32_dense(&a, r, d.n_in),
-            up: f32_dense(&b, d.n_out, r),
-        });
+        let mut d = d;
+        let mut side = None;
+        if let Some((a, b, r)) = self.lora.runtime(name, d.n_out, d.n_in)? {
+            if crate::gpu::active().is_some() {
+                // On the accelerator: two float32 matmuls beside the base one.
+                side = Some(Side {
+                    down: f32_dense(&a, r, d.n_in),
+                    up: f32_dense(&b, d.n_out, r),
+                });
+            } else {
+                // On the CPU: the low-rank kernel after the base matmul.
+                let (n_out, n_in) = (d.n_out, d.n_in);
+                d.w.set_lora(Some(Box::new(crate::lora::LoraDelta::fixed(a, &b, r, n_in, n_out))));
+            }
+        }
         Ok(Layer { d, side })
     }
 

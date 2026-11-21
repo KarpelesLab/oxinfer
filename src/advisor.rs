@@ -738,9 +738,9 @@ pub const CATALOG: &[Model] = &[
     Model::new("Qwen/Qwen-Image-2.1", Kind::Image, 16.2, 33.1, &[TextToImage, ImageEdit]).note("40 steps; RGBA output"),
     Model::new("lodestones/Kromoss", Kind::Image, 13.5, 29.5, &[TextToImage])
         .note("MOSS-Image fine-tune with Qwen3.5-9B (the cached Qwen/Qwen3.5-9B is reused); 50 steps, CFG 3; presets kromoss-dmd2, kromoss-famegrid"),
-    Model::new("molbal/Kromoss-GGUF:Q8_0", Kind::Image, 13.5, 24.8, &[TextToImage])
-        .fixed(Format::GgufQ8, "GGUF Q8_0 transformer")
-        .note("--transformer for lodestones/Kromoss (also Q6_K, Q4_K_M); text encoder and VAE from the base"),
+    Model::new("molbal/Kromoss-GGUF:Q4_K_M", Kind::Image, 13.5, 21.7, &[TextToImage])
+        .fixed(Format::GgufQ4K, "GGUF Q4_K_M transformer")
+        .note("the transformer as GGUF (also Q6_K, Q8_0); text encoder and VAE from lodestones/Kromoss"),
     Model::new("MiniMaxAI/MiniMax-H3-Image", Kind::Image, 63.0, 127.2, &[TextToImage])
         .note("with MiniMax-H3's Qwen3-VL text encoder; 2048x2048 and up"),
     Model::new("MiniMaxAI/MiniMax-H3", Kind::Video, 67.4, 140.1, &[TextToVideo, ImageToVideo])
