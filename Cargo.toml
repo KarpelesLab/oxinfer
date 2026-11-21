@@ -133,7 +133,7 @@ web = ["dep:getrandom"]
 capi = []
 # The OpenAI-compatible server (`oxinfer serve`, `oxinfer::server`): request handling for every
 # model kind, and an HTTP(S) listener through httpsd (not on wasm).
-server = ["dep:httpsd"]
+server = ["dep:httpsd", "dep:purecrypto"]
 
 [dependencies]
 oxideav-core = { version = "0.1.41", optional = true }
@@ -176,6 +176,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
 compcol = { version = "0.7.8", default-features = false, features = ["std", "gzip", "zlib", "deflate"], optional = true }
 fstool = { version = "0.5.3", default-features = false, features = ["std", "alloc", "tar", "archive", "gzip"], optional = true }
+purecrypto = { version = "0.10.6", default-features = false, features = ["std", "hash", "rng"], optional = true }
 rsurl = { version = "0.1.20", default-features = false, features = ["purecrypto-tls", "idn"], optional = true }
 dlsym = { version = "0.0.2", optional = true }
 getrandom = { version = "0.3", default-features = false, optional = true }

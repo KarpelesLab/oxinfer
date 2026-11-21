@@ -99,6 +99,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fbe9a1760292869e621e78fe025e3588acfbf29b2947758aacd2eb31cc179dd3"
 
 [[package]]
+name = "compcol"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4be160df80e77bdf4902bb026c6a0f6c700ec7793379c26305d45e293e17b8c"
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -637,6 +643,7 @@ dependencies = [
  "oxideav-vp8",
  "oxideav-vp9",
  "oxideav-webp",
+ "purecrypto",
  "regex",
  "regex-syntax",
  "rsurl",
@@ -667,12 +674,12 @@ checksum = "a36bc230de119a5b48640e34f6ad3966e2afc4ad4c571a09d5da9b0486a79854"
 
 [[package]]
 name = "purecrypto"
-version = "0.10.4"
+version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3195d112344906f1ef5f634a7e1840d864044f9674ed62fdfd720ff2bbfc8bcb"
+checksum = "36f943243cf00add6222fc0decfc3a17f37942bd82e8465a9d354eeb13822263"
 dependencies = [
  "cacrt",
- "compcol 0.7.9",
+ "compcol 0.8.0",
 ]
 
 [[package]]
