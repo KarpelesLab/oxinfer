@@ -906,6 +906,408 @@ fn stream_chat(api: &Api, req: &ChatRequest, id: &str, created: u64, sink: Sink)
     sink(b"data: [DONE]\n\n");
 }
 
+// ---- Anthropic Messages API -------------------------------------------------------------------
+
+/// The text of an Anthropic content value: a string, or the text of its `text` blocks.
+fn anthropic_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|b| b.get("type").and_then(Value::as_str).unwrap_or("text") == "text")
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// An Anthropic image block's source as a URL (`data:` for base64 images).
+fn anthropic_image(b: &Value) -> ApiResult<String> {
+    let s = b
+        .get("source")
+        .ok_or_else(|| ApiError::bad("image block without a source").param("messages"))?;
+    match s.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            let mt = s.get("media_type").and_then(Value::as_str).unwrap_or("image/png");
+            let data = s.get("data").and_then(Value::as_str).unwrap_or_default();
+            Ok(format!("data:{mt};base64,{data}"))
+        }
+        Some("url") => Ok(s.get("url").and_then(Value::as_str).unwrap_or_default().to_string()),
+        t => Err(ApiError::bad(format!("image source type {t:?} is not supported (base64, url)")).param("messages")),
+    }
+}
+
+/// An Anthropic Messages request (`/v1/messages`) as the OpenAI chat request it means: the
+/// system prompt as a system message, `tool_use` blocks as tool calls, `tool_result` blocks as tool
+/// messages, images as image parts, `thinking` as the thinking switch, the tools and tool choice
+/// in OpenAI's shape. Thinking blocks of earlier replies and cache-control marks are dropped.
+fn anthropic_to_openai(v: &Value) -> ApiResult<Value> {
+    let bad = |m: &str, p: &'static str| ApiError::bad(m.to_string()).param(p);
+    let mut msgs: Vec<Value> = Vec::new();
+    match v.get("system") {
+        None | Some(Value::Null) => {}
+        Some(s) => {
+            let t = anthropic_text(s);
+            if !t.is_empty() {
+                msgs.push(json!({ "role": "system", "content": t }));
+            }
+        }
+    }
+    for m in v
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| bad("messages must be an array", "messages"))?
+    {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or_default();
+        let content = m.get("content").unwrap_or(&Value::Null);
+        let blocks: Vec<Value> = match content {
+            Value::String(s) => vec![json!({ "type": "text", "text": s })],
+            Value::Array(a) => a.clone(),
+            _ => return Err(bad("content must be a string or an array of blocks", "messages")),
+        };
+        match role {
+            "assistant" => {
+                let mut text = String::new();
+                let mut calls = Vec::new();
+                for b in &blocks {
+                    match b.get("type").and_then(Value::as_str) {
+                        Some("text") => text.push_str(b.get("text").and_then(Value::as_str).unwrap_or_default()),
+                        Some("tool_use") => calls.push(json!({
+                            "id": b.get("id").cloned().unwrap_or(Value::Null),
+                            "type": "function",
+                            "function": { "name": b.get("name").cloned().unwrap_or(Value::Null), "arguments": b.get("input").cloned().unwrap_or(json!({})) },
+                        })),
+                        _ => {} // thinking, redacted_thinking, server tool blocks
+                    }
+                }
+                let mut msg = json!({ "role": "assistant", "content": text });
+                if !calls.is_empty() {
+                    msg["tool_calls"] = Value::Array(calls);
+                }
+                msgs.push(msg);
+            }
+            "user" => {
+                let mut parts: Vec<Value> = Vec::new();
+                for b in &blocks {
+                    match b.get("type").and_then(Value::as_str) {
+                        Some("text") => {
+                            parts.push(json!({ "type": "text", "text": b.get("text").and_then(Value::as_str).unwrap_or_default() }))
+                        }
+                        Some("image") => parts.push(json!({ "type": "image_url", "image_url": { "url": anthropic_image(b)? } })),
+                        Some("tool_result") => {
+                            let c = b.get("content").unwrap_or(&Value::Null);
+                            let mut t = anthropic_text(c);
+                            if b.get("is_error").and_then(Value::as_bool) == Some(true) {
+                                t = format!("Error: {t}");
+                            }
+                            msgs.push(json!({ "role": "tool", "tool_call_id": b.get("tool_use_id").cloned().unwrap_or(Value::Null), "content": t }));
+                        }
+                        Some("document") => {
+                            // A plain-text document: its text.
+                            if let Some(d) = b.pointer("/source/data").and_then(Value::as_str)
+                                && b.pointer("/source/type").and_then(Value::as_str) == Some("text")
+                            {
+                                parts.push(json!({ "type": "text", "text": d }));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if !parts.is_empty() {
+                    msgs.push(json!({ "role": "user", "content": parts }));
+                }
+            }
+            // (Some clients put system turns among the messages.)
+            "system" => {
+                let t = anthropic_text(content);
+                if !t.is_empty() {
+                    msgs.push(json!({ "role": "system", "content": t }));
+                }
+            }
+            r => return Err(bad(&format!("unknown message role {r:?} (user, assistant)"), "messages")),
+        }
+    }
+    let mut out = json!({ "model": v.get("model").cloned().unwrap_or(Value::Null), "messages": msgs });
+    for (from, to) in [
+        ("max_tokens", "max_tokens"),
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("top_k", "top_k"),
+        ("stop_sequences", "stop"),
+        ("stream", "stream"),
+    ] {
+        if let Some(x) = v.get(from).filter(|x| !x.is_null()) {
+            out[to] = x.clone();
+        }
+    }
+    match v.pointer("/thinking/type").and_then(Value::as_str) {
+        Some("enabled" | "adaptive") => out["think"] = true.into(),
+        Some("disabled") => out["think"] = false.into(),
+        _ => {}
+    }
+    if let Some(tools) = v.get("tools").and_then(Value::as_array) {
+        // Client tools only: Anthropic's server tools (web search, code execution) have a type.
+        let list: Vec<Value> = tools
+            .iter()
+            .filter(|t| t.get("type").and_then(Value::as_str).is_none_or(|ty| ty == "custom"))
+            .map(|t| {
+                json!({ "type": "function", "function": {
+                    "name": t.get("name").cloned().unwrap_or(Value::Null),
+                    "description": t.get("description").cloned().unwrap_or(Value::Null),
+                    "parameters": t.get("input_schema").cloned().unwrap_or(json!({ "type": "object", "properties": {} })),
+                }})
+            })
+            .collect();
+        if !list.is_empty() {
+            out["tools"] = Value::Array(list);
+        }
+    }
+    if let Some(tc) = v.get("tool_choice").filter(|t| !t.is_null())
+        && out.get("tools").is_some()
+    {
+        out["tool_choice"] = match tc.get("type").and_then(Value::as_str) {
+            Some("any") => "required".into(),
+            Some("none") => "none".into(),
+            Some("tool") => json!({ "type": "function", "function": { "name": tc.get("name").cloned().unwrap_or(Value::Null) } }),
+            _ => "auto".into(),
+        };
+    }
+    Ok(out)
+}
+
+fn anthropic_stop(finish: &str) -> &'static str {
+    match finish {
+        "tool_calls" => "tool_use",
+        "length" => "max_tokens",
+        _ => "end_turn",
+    }
+}
+
+/// An error in Anthropic's shape (`{"type": "error", "error": {"type", "message"}}`).
+fn anthropic_error(e: &ApiError) -> Value {
+    let kind = match e.status {
+        400 | 405 | 413 | 415 | 422 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        503 => "overloaded_error",
+        _ => "api_error",
+    };
+    json!({ "type": "error", "error": { "type": kind, "message": e.message } })
+}
+
+fn anthropic_tool_id(api: &Api) -> String {
+    api.new_id("toolu_")
+}
+
+/// `POST /v1/messages`: Anthropic's Messages API (what Claude Code and the `anthropic` SDKs
+/// speak) over the chat models: system prompt, text and image blocks, tools with `tool_use` /
+/// `tool_result` blocks, thinking (`thinking` blocks), `max_tokens`, `stop_sequences`, sampling,
+/// and streaming in Anthropic's event format. Errors have Anthropic's shape.
+pub(super) fn messages(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
+    match messages_inner(api, body) {
+        Ok(o) => Ok(o),
+        Err(e) => Ok(Output::Full(ApiResponse::json(e.status, &anthropic_error(&e)))),
+    }
+}
+
+fn messages_inner(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
+    if body.get("max_tokens").is_none() {
+        return Err(ApiError::bad("max_tokens is required").param("max_tokens"));
+    }
+    let req = ChatRequest::parse(&anthropic_to_openai(body)?)?;
+    api.models.check(&req.model, Kind::Chat)?;
+    let id = api.new_id("msg_");
+    if req.params.stream {
+        let api = api.clone();
+        return Ok(Output::Stream {
+            content_type: "text/event-stream".into(),
+            producer: Box::new(move |sink| {
+                stream_messages(&api, &req, &id, sink);
+                api.flush_prompt_cache_later(&req.model);
+            }),
+        });
+    }
+    let choices = run_chat(api, &req, &mut |_, _, _, _| true, None)?;
+    api.flush_prompt_cache_later(&req.model);
+    let c = choices.first().ok_or_else(|| ApiError::new(499, "the client closed the request"))?;
+    let mut content = Vec::new();
+    if !c.thinking.is_empty() {
+        content.push(json!({ "type": "thinking", "thinking": c.thinking, "signature": "" }));
+    }
+    if !c.text.is_empty() || c.tool_calls.is_empty() {
+        content.push(json!({ "type": "text", "text": c.text }));
+    }
+    for t in &c.tool_calls {
+        content
+            .push(json!({ "type": "tool_use", "id": anthropic_tool_id(api), "name": t.name, "input": Value::Object(t.arguments.clone()) }));
+    }
+    Ok(Output::Full(ApiResponse::json(
+        200,
+        &json!({
+            "id": id,
+            "type": "message",
+            "role": "assistant",
+            "model": req.model,
+            "content": content,
+            "stop_reason": anthropic_stop(c.finish),
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": c.prompt_tokens - c.cached_tokens,
+                "cache_read_input_tokens": c.cached_tokens,
+                "cache_creation_input_tokens": 0,
+                "output_tokens": c.completion_tokens,
+            },
+        }),
+    )))
+}
+
+fn event(sink: Sink, name: &str, v: &Value) -> bool {
+    sink(format!("event: {name}\ndata: {v}\n\n").as_bytes())
+}
+
+/// The streamed form: `message_start`, a `thinking` and / or `text` content block with its
+/// deltas, a `tool_use` block per call (its input in one `input_json_delta`), `message_delta`
+/// with the stop reason and `message_stop`; `ping` while the model loads or reads the prompt.
+fn stream_messages(api: &Api, req: &ChatRequest, id: &str, sink: Sink) {
+    let start = json!({
+        "type": "message_start",
+        "message": {
+            "id": id, "type": "message", "role": "assistant", "model": req.model, "content": [],
+            "stop_reason": null, "stop_sequence": null, "usage": { "input_tokens": 0, "output_tokens": 0 },
+        },
+    });
+    if !event(sink, "message_start", &start) {
+        return;
+    }
+    let out = std::cell::RefCell::new(&mut *sink);
+    // The open block: its index and whether it is thinking.
+    let mut block: Option<(usize, bool)> = None;
+    let mut next = 0usize;
+    let mut last_ping: Option<std::time::Instant> = None;
+    let r = run_chat(
+        api,
+        req,
+        &mut |_, text, thinking, _| {
+            let mut s = out.borrow_mut();
+            if block.is_some_and(|(_, t)| t != thinking) {
+                let (i, _) = block.take().unwrap();
+                if !event(&mut **s, "content_block_stop", &json!({ "type": "content_block_stop", "index": i })) {
+                    return false;
+                }
+            }
+            if block.is_none() {
+                let cb = if thinking {
+                    json!({ "type": "thinking", "thinking": "", "signature": "" })
+                } else {
+                    json!({ "type": "text", "text": "" })
+                };
+                if !event(
+                    &mut **s,
+                    "content_block_start",
+                    &json!({ "type": "content_block_start", "index": next, "content_block": cb }),
+                ) {
+                    return false;
+                }
+                block = Some((next, thinking));
+                next += 1;
+            }
+            let delta = if thinking {
+                json!({ "type": "thinking_delta", "thinking": text })
+            } else {
+                json!({ "type": "text_delta", "text": text })
+            };
+            let i = block.unwrap().0;
+            event(
+                &mut **s,
+                "content_block_delta",
+                &json!({ "type": "content_block_delta", "index": i, "delta": delta }),
+            )
+        },
+        // At most one ping a second.
+        Some(&mut |_| {
+            if last_ping.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1)) {
+                return true;
+            }
+            last_ping = Some(std::time::Instant::now());
+            (out.borrow_mut())(b"event: ping\ndata: {\"type\": \"ping\"}\n\n")
+        }),
+    );
+    let sink = out.into_inner();
+    match r {
+        Ok(choices) => {
+            let Some(c) = choices.first() else { return };
+            if let Some((i, _)) = block.take() {
+                event(sink, "content_block_stop", &json!({ "type": "content_block_stop", "index": i }));
+            }
+            for t in &c.tool_calls {
+                let cb = json!({ "type": "tool_use", "id": anthropic_tool_id(api), "name": t.name, "input": {} });
+                event(
+                    sink,
+                    "content_block_start",
+                    &json!({ "type": "content_block_start", "index": next, "content_block": cb }),
+                );
+                let args = Value::Object(t.arguments.clone()).to_string();
+                let d =
+                    json!({ "type": "content_block_delta", "index": next, "delta": { "type": "input_json_delta", "partial_json": args } });
+                event(sink, "content_block_delta", &d);
+                event(sink, "content_block_stop", &json!({ "type": "content_block_stop", "index": next }));
+                next += 1;
+            }
+            let d = json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": anthropic_stop(c.finish), "stop_sequence": null },
+                "usage": { "input_tokens": c.prompt_tokens - c.cached_tokens, "cache_read_input_tokens": c.cached_tokens, "output_tokens": c.completion_tokens },
+            });
+            event(sink, "message_delta", &d);
+            event(sink, "message_stop", &json!({ "type": "message_stop" }));
+        }
+        Err(e) => {
+            event(sink, "error", &anthropic_error(&e));
+        }
+    }
+}
+
+/// `POST /v1/messages/count_tokens`: the tokens of the request's system prompt, messages and tool
+/// definitions with the model's tokenizer (loading the model if needed), plus a few per message
+/// for the template's markers: an estimate within a few tokens of the formatted prompt.
+pub(super) fn count_tokens(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
+    let r = (|| -> ApiResult<Value> {
+        let oa = anthropic_to_openai(body)?;
+        let model = oa
+            .get("model")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ApiError::bad("model is required").param("model"))?;
+        api.models.check(model, Kind::Chat)?;
+        let mut text = String::new();
+        let mut n_msgs = 0;
+        for m in oa["messages"].as_array().into_iter().flatten() {
+            n_msgs += 1;
+            match &m["content"] {
+                Value::String(s) => text.push_str(s),
+                Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).for_each(|t| text.push_str(t)),
+                _ => {}
+            }
+            for c in m["tool_calls"].as_array().into_iter().flatten() {
+                text.push_str(&c["function"].to_string());
+            }
+            text.push('\n');
+        }
+        if let Some(t) = oa.get("tools") {
+            text.push_str(&t.to_string());
+        }
+        let mut lease = api.models.acquire(model, Kind::Chat)?;
+        let Loaded::Chat(engine) = lease.model() else { unreachable!() };
+        let n = engine.tokenizer().encode(text.as_str(), false).map_err(ApiError::internal)?.len();
+        Ok(json!({ "input_tokens": n + 4 * n_msgs }))
+    })();
+    Ok(Output::Full(match r {
+        Ok(v) => ApiResponse::json(200, &v),
+        Err(e) => ApiResponse::json(e.status, &anthropic_error(&e)),
+    }))
+}
+
 // ---- completions ------------------------------------------------------------------------------
 
 /// `POST /v1/completions`: raw continuations, no chat template.
@@ -1401,5 +1803,58 @@ mod tests {
             .unwrap()
             .sampling(&super::super::ModelSpec::new("x").unwrap(), 1);
         assert_eq!((s.temperature, s.top_k, s.top_p), (1.0, 0, 1.0));
+    }
+
+    #[test]
+    fn anthropic_messages_as_chat() {
+        let v = json!({
+            "model": "m", "max_tokens": 100, "stream": true, "stop_sequences": ["END"],
+            "system": [{"type": "text", "text": "Be brief.", "cache_control": {"type": "ephemeral"}}],
+            "thinking": {"type": "enabled", "budget_tokens": 1000},
+            "tools": [
+                {"name": "read", "description": "Reads a file", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}},
+                {"type": "web_search_20250305", "name": "web_search"}
+            ],
+            "tool_choice": {"type": "tool", "name": "read"},
+            "messages": [
+                {"role": "user", "content": "Read a.txt"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "...", "signature": "x"},
+                    {"type": "text", "text": "Reading."},
+                    {"type": "tool_use", "id": "toolu_1", "name": "read", "input": {"path": "a.txt"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "hello"}]},
+                    {"type": "text", "text": "And now?"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+                ]}
+            ]
+        });
+        let o = anthropic_to_openai(&v).unwrap();
+        let r = ChatRequest::parse(&o).unwrap();
+        assert_eq!(r.messages.len(), 5);
+        assert_eq!((r.messages[0].role, r.messages[0].text.as_str()), (Role::System, "Be brief."));
+        assert_eq!(r.messages[2].text, "Reading.");
+        assert_eq!(r.messages[2].tool_calls[0].1.name, "read");
+        assert_eq!(r.messages[2].tool_calls[0].1.arguments["path"], "a.txt");
+        assert_eq!(
+            (r.messages[3].role, r.messages[3].text.as_str(), r.messages[3].name.as_deref()),
+            (Role::Tool, "hello", Some("read"))
+        );
+        assert_eq!(r.messages[4].text, "And now?");
+        assert_eq!(r.messages[4].media, vec![MediaPart::Image("data:image/png;base64,AAAA".into())]);
+        assert_eq!(r.tools.len(), 1, "server tools are left out");
+        assert_eq!(r.tool_choice, ToolChoice::Function("read".into()));
+        assert_eq!((r.think, r.params.stream, r.params.max_tokens), (Some(true), true, Some(100)));
+        assert_eq!(r.params.stop, vec!["END".to_string()]);
+        assert_eq!(anthropic_stop("tool_calls"), "tool_use");
+        assert_eq!(anthropic_stop("length"), "max_tokens");
+        let any = anthropic_to_openai(&json!({"model": "m", "messages": [], "tools": v["tools"], "tool_choice": {"type": "any"}})).unwrap();
+        assert_eq!(any["tool_choice"], "required");
+        assert!(anthropic_to_openai(&json!({"model": "m", "messages": [{"role": "tool", "content": "x"}]})).is_err());
+        let sys =
+            anthropic_to_openai(&json!({"model": "m", "messages": [{"role": "system", "content": "x"}, {"role": "user", "content": "y"}]}))
+                .unwrap();
+        assert_eq!(sys["messages"][0], json!({"role": "system", "content": "x"}));
     }
 }

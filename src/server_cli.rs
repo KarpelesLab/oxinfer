@@ -39,9 +39,12 @@ options:\n\
 \x20 --workers N           connections served at once (default 32)\n\
 \x20 --quiet               no request log";
 
-/// Runs the server with the arguments after `serve`.
-pub fn run(args: &[String]) -> Result<()> {
-    let mut o = ServerOptions::default();
+/// A caller's own flags: `(flag, value getter)`, true when it handled the flag.
+pub type ExtraFlags<'a> = dyn FnMut(&str, &mut dyn FnMut() -> Result<String>) -> Result<bool> + 'a;
+
+/// Parses the options shared by `serve` and `web` into `o` (after its defaults);
+/// `extra` takes the flags of the caller first (true: handled).
+pub fn parse_options(o: &mut ServerOptions, args: &[String], usage: &str, command: &str, extra: &mut ExtraFlags) -> Result<()> {
     if let Ok(k) = std::env::var("OXINFER_API_KEY")
         && !k.is_empty()
     {
@@ -60,9 +63,12 @@ pub fn run(args: &[String]) -> Result<()> {
                 None => it.next().cloned().with_context(|| format!("{a} needs a value")),
             }
         };
+        if extra(flag, &mut val)? {
+            continue;
+        }
         match flag {
             "h" | "help" => {
-                eprintln!("{USAGE}");
+                eprintln!("{usage}");
                 std::process::exit(2);
             }
             "m" | "model" => o.set("model", &val()?)?,
@@ -72,14 +78,21 @@ pub fn run(args: &[String]) -> Result<()> {
             "quiet" | "q" => o.set("log", "0")?,
             f if f.starts_with(|c: char| c.is_ascii_alphabetic()) => {
                 let key = f.replace('-', "_");
-                if !ServerOptions::KEYS.contains(&key.as_str()) {
-                    bail!("unknown option {a} (oxinfer serve --help)");
+                if !ServerOptions::KEYS.contains(&key.as_str()) || key == "web" {
+                    bail!("unknown option {a} (oxinfer {command} --help)");
                 }
                 o.set(&key, &val()?)?
             }
-            _ => bail!("unexpected argument {a} (oxinfer serve --help)"),
+            _ => bail!("unexpected argument {a} (oxinfer {command} --help)"),
         }
     }
+    Ok(())
+}
+
+/// Runs the server with the arguments after `serve`.
+pub fn run(args: &[String]) -> Result<()> {
+    let mut o = ServerOptions::default();
+    parse_options(&mut o, args, USAGE, "serve", &mut |_, _| Ok(false))?;
     if o.models.is_empty() {
         eprintln!("{USAGE}");
         bail!("no models: list them with --model (only the listed models can be requested)");

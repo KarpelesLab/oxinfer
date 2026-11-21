@@ -24,6 +24,7 @@ mod janus_cli;
 mod lfm3_omni_cli;
 mod minimax_h3_cli;
 mod minimax_h3_video_cli;
+mod models_cli;
 mod omnigen2_cli;
 mod qwen_image_cli;
 mod sd3_cli;
@@ -33,6 +34,8 @@ mod step1x_cli;
 #[cfg(feature = "media")]
 mod tts_cli;
 mod unlimited_ocr_cli;
+#[cfg(feature = "server")]
+mod web_cli;
 #[cfg(feature = "media")]
 mod whisper_cli;
 #[cfg(feature = "media")]
@@ -1291,6 +1294,15 @@ fn main() -> Result<()> {
     if std::env::args().nth(1).as_deref() == Some("serve") {
         let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
         return server_cli::run(&rest);
+    }
+    #[cfg(feature = "server")]
+    if std::env::args().nth(1).as_deref() == Some("web") {
+        let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
+        return web_cli::run(&rest);
+    }
+    if std::env::args().nth(1).as_deref() == Some("models") {
+        let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
+        return models_cli::run(&rest);
     }
     let mut args = parse_args()?;
     if args.devices {

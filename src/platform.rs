@@ -223,6 +223,13 @@ pub fn total_memory() -> Option<u64> {
 /// Bytes an unprivileged process may still write on the file system holding `path` (its nearest
 /// existing ancestor), when the platform says: `statvfs` on Linux and Apple systems.
 pub fn free_disk(path: &std::path::Path) -> Option<u64> {
+    disk_space(path).map(|(free, _)| free)
+}
+
+/// `(free, total)` bytes of the file system holding `path` (its nearest existing ancestor):
+/// what an unprivileged process may still write, and the size of the file system. `statvfs` on
+/// Linux and Apple systems; None elsewhere.
+pub fn disk_space(path: &std::path::Path) -> Option<(u64, u64)> {
     #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios"))]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -237,11 +244,12 @@ pub fn free_disk(path: &std::path::Path) -> Option<u64> {
             return None;
         }
         // f_bsize, f_frsize, f_blocks, f_bfree, f_bavail: all 64-bit on 64-bit Linux; on Apple
-        // systems the two sizes are 64-bit and the block counts 32-bit.
+        // systems the two sizes are 64-bit and the block counts 32-bit. Counts are in f_frsize
+        // units.
         #[cfg(all(any(target_os = "linux", target_os = "android"), target_pointer_width = "64"))]
-        return buf[1].checked_mul(buf[4]);
+        return Some((buf[1].checked_mul(buf[4])?, buf[1].checked_mul(buf[2])?));
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        return buf[1].checked_mul(buf[3] & 0xffff_ffff);
+        return Some((buf[1].checked_mul(buf[3] & 0xffff_ffff)?, buf[1].checked_mul(buf[2] & 0xffff_ffff)?));
         #[allow(unreachable_code)]
         None
     }

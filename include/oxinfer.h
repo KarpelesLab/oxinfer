@@ -56,6 +56,22 @@ char *oxi_devices(void);
  * Support/oxinfer/hub in the app container). `progress` may be NULL. */
 char *oxi_download(const char *spec, const char *cache_dir, oxi_progress_fn progress, void *user);
 
+/* What oxi_download(spec) would fetch, as JSON, without downloading it:
+ * {"repo", "dir", "total", "missing", "files": [{"name", "size", "have"}]} (bytes; "have" is what
+ * the cache holds already). NULL on error (a local path, no such repo, no network). */
+char *oxi_download_plan(const char *spec, const char *cache_dir);
+
+/* The model cache (`cache_dir` NULL for the default) as JSON: {"path", "free", "total", "bytes",
+ * "entries": [{"name", "repo", "path", "bytes", "files", "modified", "last_used", "ggufs",
+ * "usable", "specs"}]}; "free" / "total" are the disk's, "specs" what loads each entry. */
+char *oxi_cache_list(const char *cache_dir);
+
+/* Deletes one cache entry, named by its folder ("org--name") or repo id ("org/name"), with its
+ * files; only folders directly inside the cache directory are removed (no "..", no paths, a
+ * symbolic link as a link). Returns the bytes freed, or -1. The caller makes sure no model of
+ * it is loaded. */
+int64_t oxi_cache_remove(const char *cache_dir, const char *name);
+
 /* Loads a model: a directory, a .gguf file or a repo id (downloaded first, see oxi_download).
  * `options`: NULL or "key=value" pairs separated by newlines or ';':
  *   threads=N            CPU threads (default: all cores; process-wide)
@@ -907,6 +923,8 @@ typedef int (*oxi_bytes_fn)(void *user, const char *data, size_t len);
  *   tls_cert=PATH, tls_key=PATH, self_signed=0|1   HTTPS
  *   workers=N            connections served at once (default 32)
  *   log=0|1              one stderr line per request (default 1)
+ *   web=0|1              also serve the web GUI at / and its management API under /api/web/
+ *                        (catalog, downloads, cache, loading models; see docs/web.md)
  *   config=PATH          read a JSON file of these options
  * `progress` (may be NULL) reports downloads made by preload / download. Returns NULL on error. */
 OxiServer *oxi_server_new(const char *options, oxi_progress_fn progress, void *user);

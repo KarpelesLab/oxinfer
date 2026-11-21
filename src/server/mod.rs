@@ -46,6 +46,7 @@ pub mod http;
 mod media;
 mod openai;
 mod registry;
+pub mod web;
 
 pub use registry::Kind;
 
@@ -233,6 +234,10 @@ pub struct ServerOptions {
     /// The prompt cache's size cap in GB (key `prompt_cache_gb`, default 20; see
     /// [`crate::engine::EngineOptions::prompt_cache_gb`]).
     pub prompt_cache_gb: Option<f64>,
+    /// Also serve the web GUI at `/` and its management API under `/api/web/` (key `web`;
+    /// `oxinfer web`): browsing the model catalog, downloads with progress, loading and
+    /// unloading models (which then join the whitelist), the cache and its disk. See [`web`].
+    pub web: bool,
 }
 
 impl Default for ServerOptions {
@@ -257,6 +262,7 @@ impl Default for ServerOptions {
             log: true,
             prompt_cache: None,
             prompt_cache_gb: None,
+            web: false,
         }
     }
 }
@@ -291,6 +297,7 @@ impl ServerOptions {
         "log",
         "prompt_cache",
         "prompt_cache_gb",
+        "web",
         "config",
     ];
 
@@ -325,6 +332,7 @@ impl ServerOptions {
                 }
             }
             "prompt_cache_gb" => self.prompt_cache_gb = opt_str(value).map(|v| num(&v)).transpose()?,
+            "web" => self.web = parse_bool(key, value)?,
             "config" => {
                 let text = std::fs::read_to_string(value).with_context(|| format!("config: {value}"))?;
                 let v: Value = serde_json::from_str(&text).with_context(|| format!("config: {value}"))?;
@@ -388,6 +396,9 @@ pub struct ApiRequest {
     pub content_type: Option<String>,
     /// The `Authorization` header (`Bearer KEY`), checked when [`ServerOptions::api_key`] is set.
     pub authorization: Option<String>,
+    /// The `Origin` and `Host` headers, checked by the web GUI's management API.
+    pub origin: Option<String>,
+    pub host: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -398,6 +409,8 @@ impl ApiRequest {
             path: path.split('?').next().unwrap_or_default().to_string(),
             content_type: content_type.map(str::to_string),
             authorization: None,
+            origin: None,
+            host: None,
             body,
         }
     }
@@ -515,7 +528,9 @@ impl ApiError {
     fn kind(&self) -> &'static str {
         match self.status {
             401 => "authentication_error",
+            403 => "permission_error",
             404 => "not_found_error",
+            409 => "conflict_error",
             413 | 400 | 405 | 415 | 422 => "invalid_request_error",
             503 => "service_unavailable",
             _ => "server_error",
@@ -542,6 +557,8 @@ pub struct Api {
     opts: ServerOptions,
     models: registry::Registry,
     ids: AtomicU64,
+    /// The web GUI's state, when [`ServerOptions::web`].
+    web: Option<web::WebState>,
 }
 
 impl Api {
@@ -566,6 +583,7 @@ impl Api {
         models.prompt_cache_gb = opts.prompt_cache_gb;
         let api = Arc::new(Api {
             models,
+            web: opts.web.then(|| web::WebState::new(&opts)),
             opts,
             ids: AtomicU64::new(0),
         });
@@ -584,6 +602,27 @@ impl Api {
     /// The whitelist's ids with their kind (None until detected) and whether they are loaded.
     pub fn models(&self) -> Vec<(String, Option<Kind>, bool)> {
         self.models.list()
+    }
+
+    /// Adds a model to the whitelist while the server runs (as the web GUI's loads do): false
+    /// when one with the same id, source and options is listed already. A listed model with the
+    /// same id but another source or options is replaced (unloaded first), unless a request is
+    /// using it.
+    pub fn add_model(&self, spec: ModelSpec) -> Result<bool> {
+        spec.check()?;
+        self.models.add(spec).map_err(|e| anyhow::anyhow!(e.message))
+    }
+
+    /// Unloads model `id` now (it stays listed and loads again on its next request): false when
+    /// it was not loaded; an error when it is not listed or a request is using it.
+    pub fn unload(&self, id: &str) -> Result<bool> {
+        self.models.unload(id).map_err(|e| anyhow::anyhow!(e.message))
+    }
+
+    /// Whether the web GUI's management API is read-only: [`ServerOptions::web`] on a
+    /// non-loopback address without an API key (see [`web`]).
+    pub fn web_read_only(&self) -> bool {
+        self.web.as_ref().is_some_and(web::WebState::read_only)
     }
 
     /// Writes a chat model's waiting prompt-cache snapshot on another thread, after the response
@@ -617,7 +656,12 @@ impl Api {
             Ok(o) => o,
             Err(e) => Output::Full(e.response()),
         };
-        if self.opts.log {
+        // The GUI's files and its polling would drown the log.
+        let quiet = self.web.is_some()
+            && req.method.eq_ignore_ascii_case("GET")
+            && !req.path.starts_with("/v1/")
+            && !matches!(&out, Output::Full(r) if r.status >= 400);
+        if self.opts.log && !quiet {
             let status = match &out {
                 Output::Full(r) => r.status.to_string(),
                 Output::Stream { .. } => "stream".into(),
@@ -628,6 +672,11 @@ impl Api {
     }
 
     fn route(self: &Arc<Self>, req: &ApiRequest) -> ApiResult<Output> {
+        if let Some(w) = &self.web
+            && let Some(out) = web::route(self, w, req)
+        {
+            return out;
+        }
         let path = req.path.trim_end_matches('/');
         let path = if path.starts_with("/v1/") || path == "/health" {
             path.to_string()
@@ -658,6 +707,8 @@ impl Api {
                 Ok(Output::Full(ApiResponse::json(200, &m)))
             }
             "/v1/chat/completions" if post => openai::chat(self, &json_body(req)?),
+            "/v1/messages" if post => openai::messages(self, &json_body(req)?),
+            "/v1/messages/count_tokens" if post => openai::count_tokens(self, &json_body(req)?),
             "/v1/completions" if post => openai::completions(self, &json_body(req)?),
             "/v1/embeddings" if post => openai::embeddings(self, &json_body(req)?),
             "/v1/images/generations" if post => media::image_generations(self, &json_body(req)?),
@@ -667,6 +718,8 @@ impl Api {
             "/v1/audio/speech" if post => media::speech(self, &json_body(req)?),
             "/v1/models"
             | "/v1/chat/completions"
+            | "/v1/messages"
+            | "/v1/messages/count_tokens"
             | "/v1/completions"
             | "/v1/embeddings"
             | "/v1/images/generations"

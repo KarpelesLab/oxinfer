@@ -116,7 +116,9 @@ fn status(code: u16) -> StatusCode {
         204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
+        409 => "Conflict",
         405 => "Method Not Allowed",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
@@ -132,7 +134,10 @@ fn with_cors(api: &Api, mut r: Response) -> Response {
         r = r
             .header("Access-Control-Allow-Origin", origin.clone())
             .header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            .header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+            .header(
+                "Access-Control-Allow-Headers",
+                "Authorization, Content-Type, X-Api-Key, Anthropic-Version, Anthropic-Beta",
+            )
             .header("Access-Control-Max-Age", "86400");
         if origin != "*" {
             r = r.header("Vary", "Origin");
@@ -148,11 +153,32 @@ fn handle(api: &Arc<Api>, req: &Request) -> Response {
     }
     let h = req.headers();
     let mut r = ApiRequest::new(&method, req.path(), h.get("content-type"), req.body().to_vec());
-    r.authorization = h.get("authorization").map(str::to_string);
+    // Anthropic's clients send the key as x-api-key.
+    r.authorization = h
+        .get("authorization")
+        .map(str::to_string)
+        .or_else(|| h.get("x-api-key").map(|k| format!("Bearer {k}")));
+    r.origin = h.get("origin").map(str::to_string);
+    r.host = h.get("host").map(str::to_string);
     let resp = match api.handle(&r) {
-        Output::Full(full) => Response::new(status(full.status))
-            .header("Content-Type", full.content_type)
-            .body(full.body),
+        Output::Full(full) => {
+            let mut resp = Response::new(status(full.status)).header("Content-Type", full.content_type.clone());
+            if api.options().web && !req.path().starts_with("/v1/") && !req.path().starts_with("/api/") {
+                // The GUI's files: those under assets/ have their hash in their name.
+                let cc = if req.path().starts_with("/assets/") {
+                    "public, max-age=31536000, immutable"
+                } else {
+                    "no-cache"
+                };
+                resp = resp.header("Cache-Control", cc);
+            }
+            if api.options().web {
+                resp = resp
+                    .header("X-Content-Type-Options", "nosniff")
+                    .header("Referrer-Policy", "no-referrer");
+            }
+            resp.body(full.body)
+        }
         Output::Stream { content_type, producer } => streamed(content_type, producer),
     };
     with_cors(api, resp)

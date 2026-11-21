@@ -91,6 +91,331 @@ fn routing_and_errors() {
     s2.stop().unwrap();
 }
 
+/// One HTTP/1.1 request with its own header lines (`Host` included); the status and the body.
+fn request_with(addr: SocketAddr, method: &str, path: &str, headers: &[&str], body: &str) -> (u16, String) {
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    let mut head = format!("{method} {path} HTTP/1.1\r\n");
+    for h in headers {
+        head.push_str(h);
+        head.push_str("\r\n");
+    }
+    write!(s, "{head}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, rest) = text.split_once("\r\n\r\n").unwrap();
+    (head.split(' ').nth(1).unwrap().parse().unwrap(), rest.to_string())
+}
+
+/// A temporary model cache: `org--model` (a configuration and a weight file), `org--gguf` (a
+/// GGUF file), and a folder beside the cache that must never be touched.
+fn temp_cache(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = std::env::temp_dir().join(format!("oxinfer-webtest-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let cache = base.join("hub");
+    let m = cache.join("org--model");
+    std::fs::create_dir_all(&m).unwrap();
+    std::fs::write(m.join("config.json"), r#"{"model_type": "bert"}"#).unwrap();
+    std::fs::write(m.join("model.safetensors"), vec![0u8; 4096]).unwrap();
+    std::fs::create_dir_all(cache.join("org--gguf")).unwrap();
+    std::fs::write(cache.join("org--gguf/m-Q4_K_M.gguf"), b"GGUF").unwrap();
+    let outside = base.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep.bin"), b"precious").unwrap();
+    (cache, outside)
+}
+
+#[test]
+fn web_gui_and_management_api() {
+    let (cache, outside) = temp_cache("api");
+    let s = serve(&format!("web=1; cache_dir={}", cache.display()));
+    let a = s.addr();
+    let local = ["Host: localhost", "Content-Type: application/json"];
+    // The GUI (when this build embeds it) and the info endpoint need nothing.
+    if oxinfer::server::web::has_gui() {
+        let (st, body) = request_with(a, "GET", "/", &["Host: localhost"], "");
+        assert_eq!(st, 200);
+        assert!(body.contains("<div id=\"app\">"), "{body}");
+    }
+    let (st, body) = request_with(a, "GET", "/api/web/info", &local, "");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        (st, &v["oxinfer"], &v["auth_required"], &v["admin"]),
+        (200, &json!(true), &json!(false), &json!(true))
+    );
+    // The catalog: the tested models, with their kinds and what fits.
+    let (st, body) = request_with(a, "GET", "/api/web/catalog", &local, "");
+    assert_eq!(st, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let models = v["models"].as_array().unwrap();
+    assert!(models.len() > 20);
+    assert!(models.iter().any(|m| m["kind"] == "chat" && m["server_kind"] == "chat"));
+    assert!(
+        models
+            .iter()
+            .any(|m| m["kind"] == "speech-to-text" && m["server_kind"] == "transcription")
+    );
+    assert!(
+        models.iter().all(|m| m["cached"] == false),
+        "nothing of the catalog is in this cache"
+    );
+    // The cache: both folders, sizes, kinds and the specs that load them.
+    let (st, body) = request_with(a, "GET", "/api/web/cache", &local, "");
+    assert_eq!(st, 200, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let entries = v["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 2, "{body}");
+    let m = entries.iter().find(|e| e["name"] == "org--model").unwrap();
+    assert_eq!(
+        (&m["repo"], &m["bytes"], &m["loaded"]),
+        (&json!("org/model"), &json!(4096 + 22), &json!(false))
+    );
+    let g = entries.iter().find(|e| e["name"] == "org--gguf").unwrap();
+    assert_eq!(g["specs"], json!(["org/gguf:Q4_K_M"]));
+    let (st, body) = request_with(a, "GET", "/api/web/disk", &local, "");
+    assert_eq!(st, 200, "{body}");
+    // Deletion: names that leave the cache are refused, and nothing outside is touched.
+    for bad in ["../outside", "..", "/", "org--model/config.json", "a/b/c", ".hidden"] {
+        let (st, body) = request_with(a, "POST", "/api/web/cache/delete", &local, &json!({"name": bad}).to_string());
+        assert!(st == 400 || st == 404, "{bad:?}: {st} {body}");
+    }
+    let (st, _) = request_with(
+        a,
+        "POST",
+        "/api/web/cache/delete",
+        &local,
+        &json!({"name": "org--missing"}).to_string(),
+    );
+    assert_eq!(st, 404);
+    assert!(outside.join("keep.bin").exists() && cache.join("org--model").exists());
+    // Cross-site requests: another origin, no JSON content type, a rebinding Host.
+    let del = json!({"name": "org/model"}).to_string();
+    let (st, _) = request_with(
+        a,
+        "POST",
+        "/api/web/cache/delete",
+        &["Host: localhost", "Content-Type: application/json", "Origin: http://evil.example"],
+        &del,
+    );
+    assert_eq!(st, 403);
+    let (st, _) = request_with(
+        a,
+        "POST",
+        "/api/web/cache/delete",
+        &["Host: localhost", "Content-Type: text/plain"],
+        &del,
+    );
+    assert_eq!(st, 415);
+    let (st, _) = request_with(
+        a,
+        "POST",
+        "/api/web/cache/delete",
+        &["Host: evil.example", "Content-Type: application/json"],
+        &del,
+    );
+    assert_eq!(st, 403);
+    assert!(cache.join("org--model").exists());
+    // The page's own origin may.
+    let own = "Origin: http://localhost";
+    let (st, body) = request_with(
+        a,
+        "POST",
+        "/api/web/cache/delete",
+        &["Host: localhost", "Content-Type: application/json", own],
+        &del,
+    );
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["freed"], json!(4096 + 22));
+    assert!(!cache.join("org--model").exists() && cache.join("org--gguf").exists() && outside.join("keep.bin").exists());
+    // A model added from the GUI joins /v1/models; a load of a missing path fails, reported.
+    let load = json!({"model": "/nonexistent/oxinfer-model", "id": "x"}).to_string();
+    let (st, body) = request_with(a, "POST", "/api/web/models/load", &local, &load);
+    assert_eq!(st, 200, "{body}");
+    let (_, body) = request_with(a, "GET", "/v1/models", &local, "");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["data"][0]["id"], "x");
+    let mut state = Value::Null;
+    for _ in 0..100 {
+        let (_, body) = request_with(a, "GET", "/api/web/models", &local, "");
+        state = serde_json::from_str::<Value>(&body).unwrap()["data"][0].clone();
+        if state["state"] == "error" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert_eq!(state["state"], "error", "{state}");
+    // Downloads of a local path, and unknown jobs.
+    let (st, _) = request_with(
+        a,
+        "POST",
+        "/api/web/downloads",
+        &local,
+        &json!({"model": outside.display().to_string()}).to_string(),
+    );
+    assert_eq!(st, 400);
+    let (st, _) = request_with(a, "GET", "/api/web/downloads/nope", &local, "");
+    assert_eq!(st, 404);
+    let (st, _) = request_with(a, "GET", "/api/web/nothing", &local, "");
+    assert_eq!(st, 404);
+    s.stop().unwrap();
+    std::fs::remove_dir_all(cache.parent().unwrap()).ok();
+}
+
+#[test]
+fn web_auth_and_read_only() {
+    let (cache, _) = temp_cache("auth");
+    let s = serve(&format!("web=1; api_key=k; cache_dir={}", cache.display()));
+    let a = s.addr();
+    let (st, body) = request_with(a, "GET", "/api/web/info", &["Host: 127.0.0.1"], "");
+    assert_eq!(st, 200);
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["auth_required"], true);
+    for p in [
+        "/api/web/status",
+        "/api/web/catalog",
+        "/api/web/cache",
+        "/api/web/models",
+        "/v1/models",
+    ] {
+        let (st, _) = request_with(a, "GET", p, &["Host: 127.0.0.1"], "");
+        assert_eq!(st, 401, "{p}");
+        let (st, _) = request_with(a, "GET", p, &["Host: 127.0.0.1", "Authorization: Bearer k"], "");
+        assert_eq!(st, 200, "{p}");
+    }
+    let (st, _) = request_with(
+        a,
+        "POST",
+        "/api/web/cache/delete",
+        &["Host: 127.0.0.1", "Content-Type: application/json"],
+        r#"{"name": "org--gguf"}"#,
+    );
+    assert_eq!(st, 401);
+    assert!(cache.join("org--gguf").exists());
+    if oxinfer::server::web::has_gui() {
+        let (st, _) = request_with(a, "GET", "/", &["Host: 127.0.0.1"], "");
+        assert_eq!(st, 200, "the page itself needs no key (it asks for it)");
+    }
+    s.stop().unwrap();
+    // Without the web option nothing of it is served.
+    let s = serve("model=m=/nonexistent/model");
+    let (st, _) = request_with(s.addr(), "GET", "/api/web/info", &["Host: localhost"], "");
+    assert_eq!(st, 404);
+    s.stop().unwrap();
+    // A non-loopback listener without a key: the management API reads, but changes nothing
+    // (through the API itself: no socket is bound).
+    let mut o = ServerOptions::from_pairs(&format!("web=1; log=0; listen=0.0.0.0:0; cache_dir={}", cache.display())).unwrap();
+    o.set("workers", "2").unwrap();
+    let api = Api::new(o).unwrap();
+    assert!(api.web_read_only());
+    let mut req = oxinfer::server::ApiRequest::new("GET", "/api/web/cache", None, vec![]);
+    assert_eq!(api.handle(&req).collect().status, 200);
+    req = oxinfer::server::ApiRequest::post_json("/api/web/cache/delete", r#"{"name": "org--gguf"}"#);
+    let r = api.handle(&req).collect();
+    assert_eq!(r.status, 403);
+    assert_eq!(serde_json::from_slice::<Value>(&r.body).unwrap()["error"]["code"], "read_only");
+    req = oxinfer::server::ApiRequest::post_json("/api/web/downloads", r#"{"model": "org/x"}"#);
+    assert_eq!(api.handle(&req).collect().status, 403);
+    assert!(cache.join("org--gguf").exists());
+    std::fs::remove_dir_all(cache.parent().unwrap()).ok();
+}
+
+#[test]
+fn anthropic_messages_routing_and_errors() {
+    let s = serve("model=m=/nonexistent/model; api_key=k");
+    let a = s.addr();
+    let msg = json!({"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}).to_string();
+    // Anthropic's clients send the key as x-api-key (or as a bearer token).
+    let (st, body) = request_with(
+        a,
+        "POST",
+        "/v1/messages",
+        &["Host: localhost", "Content-Type: application/json"],
+        &msg,
+    );
+    assert_eq!(st, 401, "{body}");
+    let ok_key = [
+        "Host: localhost",
+        "Content-Type: application/json",
+        "x-api-key: k",
+        "anthropic-version: 2023-06-01",
+    ];
+    let (st, body) = request_with(a, "POST", "/v1/messages?beta=true", &ok_key, &msg);
+    // The model's files are missing: a load failure, in Anthropic's error shape.
+    assert_eq!(st, 500, "{body}");
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!((&v["type"], &v["error"]["type"]), (&json!("error"), &json!("api_error")), "{body}");
+    let other = json!({"model": "x", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}).to_string();
+    let (st, body) = request_with(a, "POST", "/v1/messages", &ok_key, &other);
+    assert_eq!(st, 404);
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["error"]["type"], "not_found_error");
+    let no_max = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]}).to_string();
+    let (st, body) = request_with(a, "POST", "/v1/messages", &ok_key, &no_max);
+    assert_eq!(st, 400);
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["error"]["type"],
+        "invalid_request_error"
+    );
+    let (st, _) = request_with(a, "GET", "/v1/messages", &ok_key, "");
+    assert_eq!(st, 405);
+    let (st, body) = request_with(a, "POST", "/v1/messages/count_tokens", &ok_key, &other);
+    assert_eq!(st, 404, "{body}");
+    s.stop().unwrap();
+}
+
+#[test]
+#[ignore = "fetches Qwen/Qwen3-0.6B"]
+fn anthropic_messages_with_a_model() {
+    let model = env("OXINFER_E2E_CHAT", "Qwen/Qwen3-0.6B");
+    let s = serve(&format!("model=m={model}"));
+    let a = s.addr();
+    let h = ["Host: localhost", "Content-Type: application/json"];
+    let tools = json!([{"name": "get_weather", "description": "The weather in a city", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]);
+    let body = json!({"model": "m", "max_tokens": 200, "temperature": 0, "tools": tools, "tool_choice": {"type": "any"},
+        "messages": [{"role": "user", "content": "What is the weather in Paris?"}]});
+    let (st, out) = request_with(a, "POST", "/v1/messages", &h, &body.to_string());
+    assert_eq!(st, 200, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["stop_reason"], "tool_use", "{out}");
+    let call = v["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["type"] == "tool_use")
+        .unwrap()
+        .clone();
+    assert_eq!(call["name"], "get_weather");
+    // The result back, streamed this time.
+    let body = json!({"model": "m", "max_tokens": 100, "temperature": 0, "stream": true, "tools": tools,
+        "messages": [{"role": "user", "content": "What is the weather in Paris?"},
+            {"role": "assistant", "content": [call.clone()]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call["id"], "content": "Sunny, 21 C"}]}]});
+    let (st, out) = request(a, "POST", "/v1/messages", &body.to_string());
+    assert_eq!(st, 200);
+    for e in [
+        "event: message_start",
+        "event: content_block_start",
+        "event: content_block_delta",
+        "event: message_delta",
+        "event: message_stop",
+    ] {
+        assert!(out.contains(e), "{e} missing: {out}");
+    }
+    let text: String = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+        .filter_map(|v| v["delta"]["text"].as_str().map(str::to_string))
+        .collect();
+    assert!(text.to_lowercase().contains("sunny") || text.contains("21"), "{text}");
+    let (st, out) = request(
+        a,
+        "POST",
+        "/v1/messages/count_tokens",
+        &json!({"model": "m", "messages": [{"role": "user", "content": "Hello there"}]}).to_string(),
+    );
+    assert_eq!(st, 200, "{out}");
+    assert!(serde_json::from_str::<Value>(&out).unwrap()["input_tokens"].as_u64().unwrap() > 2);
+    s.stop().unwrap();
+}
+
 fn env(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }

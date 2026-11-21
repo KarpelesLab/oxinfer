@@ -6,7 +6,7 @@ use crate::engine::{Engine, EngineOptions};
 use crate::model::Quant;
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 /// What a model does (which endpoints take it).
@@ -115,10 +115,57 @@ pub(crate) struct Entry {
     last_used: AtomicU64,
     /// Memory counted for the model while loaded (0: not loaded).
     bytes: AtomicU64,
+    /// Replaced by a later entry with the same id ([`Registry::add`]): no longer found by id.
+    retired: AtomicBool,
+}
+
+impl Entry {
+    fn new(spec: &ModelSpec, cache_dir: Option<&Path>) -> Self {
+        Entry {
+            spec: spec.clone(),
+            slot: Mutex::new(None),
+            // Models on disk already: their kind for the listing, without fetching anything.
+            detected: Mutex::new(local_path(&spec.source, cache_dir).and_then(|p| {
+                let d = detect_path(&p, &spec.source);
+                match spec.option("kind").and_then(Kind::parse) {
+                    Some(k) if k != d.0 => None,
+                    _ => Some(d),
+                }
+            })),
+            last_used: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            retired: AtomicBool::new(false),
+        }
+    }
+
+    fn kind(&self) -> Option<Kind> {
+        lock(&self.detected)
+            .map(|d| d.0)
+            .or_else(|| self.spec.option("kind").and_then(Kind::parse))
+    }
+
+    fn busy(&self) -> bool {
+        matches!(self.slot.try_lock(), Err(std::sync::TryLockError::WouldBlock))
+    }
+}
+
+/// A model of the registry as [`Registry::status`] reports it.
+#[derive(Clone, Debug)]
+pub(crate) struct EntryStatus {
+    pub spec: ModelSpec,
+    pub kind: Option<Kind>,
+    pub loaded: bool,
+    /// A request (or a load) holds it.
+    pub busy: bool,
+    /// Memory counted for it while loaded.
+    pub bytes: u64,
 }
 
 pub(crate) struct Registry {
-    entries: Vec<Entry>,
+    /// Boxed, and never removed or replaced while the registry lives (a replaced model is only
+    /// marked `retired`), so references to entries stay valid for as long as `&self`.
+    #[allow(clippy::vec_box)] // the boxes are what keeps the entries' addresses stable
+    entries: Mutex<Vec<Box<Entry>>>,
     budget: Option<u64>,
     cache_dir: Option<PathBuf>,
     /// The server-wide prompt cache of chat models (a model's own `prompt_cache` overrides it).
@@ -177,25 +224,9 @@ fn server_key(k: &str) -> bool {
 
 impl Registry {
     pub fn new(specs: &[ModelSpec], budget: Option<u64>, cache_dir: Option<PathBuf>, log: bool) -> Self {
-        let entries = specs
-            .iter()
-            .map(|s| Entry {
-                spec: s.clone(),
-                slot: Mutex::new(None),
-                // Models on disk already: their kind for the listing, without fetching anything.
-                detected: Mutex::new(local_path(&s.source, cache_dir.as_deref()).and_then(|p| {
-                    let d = detect_path(&p, &s.source);
-                    match s.option("kind").and_then(Kind::parse) {
-                        Some(k) if k != d.0 => None,
-                        _ => Some(d),
-                    }
-                })),
-                last_used: AtomicU64::new(0),
-                bytes: AtomicU64::new(0),
-            })
-            .collect();
+        let entries = specs.iter().map(|s| Box::new(Entry::new(s, cache_dir.as_deref()))).collect();
         Self {
-            entries,
+            entries: Mutex::new(entries),
             budget,
             cache_dir,
             prompt_cache: None,
@@ -206,22 +237,120 @@ impl Registry {
         }
     }
 
+    /// Every entry, retired ones included.
+    fn all(&self) -> Vec<&Entry> {
+        let g = lock(&self.entries);
+        // SAFETY: each entry is boxed (its address does not move when the vector grows) and is
+        // never removed or replaced before the registry is dropped, which `&self` outlives.
+        g.iter().map(|b| unsafe { &*(&**b as *const Entry) }).collect()
+    }
+
+    /// The entries clients can use.
+    fn active(&self) -> Vec<&Entry> {
+        self.all().into_iter().filter(|e| !e.retired.load(Ordering::Relaxed)).collect()
+    }
+
     pub fn find(&self, id: &str) -> ApiResult<&Entry> {
-        self.entries.iter().find(|e| e.spec.id == id).ok_or_else(|| {
-            let known: Vec<&str> = self.entries.iter().map(|e| e.spec.id.as_str()).collect();
+        let active = self.active();
+        active.iter().find(|e| e.spec.id == id).copied().ok_or_else(|| {
+            let known: Vec<&str> = active.iter().map(|e| e.spec.id.as_str()).collect();
             ApiError::new(404, format!("the model {id:?} does not exist (available: {})", known.join(", ")))
                 .param("model")
                 .code("model_not_found")
         })
     }
 
+    /// Adds a model to the whitelist (the web GUI's models). An entry with the same id and the
+    /// same source and options is kept as it is (returns false); one that differs is replaced
+    /// once it is idle (it is unloaded first; a 409 while a request uses it).
+    pub fn add(&self, spec: ModelSpec) -> ApiResult<bool> {
+        // Entry::new reads the model's configuration when it is on disk: before the lock.
+        let fresh = Box::new(Entry::new(&spec, self.cache_dir.as_deref()));
+        let mut entries = lock(&self.entries);
+        let old = entries.iter().find(|e| !e.retired.load(Ordering::Relaxed) && e.spec.id == spec.id);
+        if let Some(old) = old {
+            if old.spec == spec {
+                return Ok(false);
+            }
+            // (try_lock: never waits for a slot while holding the list.)
+            let mut g = old
+                .slot
+                .try_lock()
+                .map_err(|_| ApiError::new(409, format!("{} is in use; try again once its request is done", spec.id)))?;
+            *g = None;
+            old.bytes.store(0, Ordering::Relaxed);
+            old.retired.store(true, Ordering::Relaxed);
+        }
+        entries.push(fresh);
+        Ok(true)
+    }
+
+    /// Unloads model `id` now: false when it was not loaded, a 409 while a request uses it.
+    pub fn unload(&self, id: &str) -> ApiResult<bool> {
+        let e = self.find(id)?;
+        let mut g = e
+            .slot
+            .try_lock()
+            .map_err(|_| ApiError::new(409, format!("{id} is in use; try again once its request is done")))?;
+        let was = g.take().is_some();
+        e.bytes.store(0, Ordering::Relaxed);
+        if was && self.log {
+            eprintln!("[unloaded {id}]");
+        }
+        Ok(was)
+    }
+
+    /// Loads model `id` now if it is not loaded (fetching it first when needed), reporting to
+    /// `on` as [`Registry::acquire_with`] does; returns its kind.
+    pub fn load_now(&self, id: &str, on: OnStage<'_, '_>) -> ApiResult<Kind> {
+        let e = self.find(id)?;
+        let kind = match e.kind() {
+            Some(k) => k,
+            None => self.detect(e).map_err(|err| ApiError::new(500, format!("model {id}: {err:#}")))?.0,
+        };
+        drop(self.acquire_with(id, kind, Some(on))?);
+        Ok(kind)
+    }
+
+    /// The whitelist's models with their state.
+    pub fn status(&self) -> Vec<EntryStatus> {
+        self.active()
+            .into_iter()
+            .map(|e| EntryStatus {
+                spec: e.spec.clone(),
+                kind: e.kind(),
+                loaded: e.bytes.load(Ordering::Relaxed) > 0,
+                busy: e.busy(),
+                bytes: e.bytes.load(Ordering::Relaxed),
+            })
+            .collect()
+    }
+
+    /// Whether a model whose files are under `folder` is loaded or in use.
+    pub fn uses_folder(&self, folder: &Path) -> bool {
+        let real = std::fs::canonicalize(folder).unwrap_or_else(|_| folder.to_path_buf());
+        self.all().into_iter().any(|e| {
+            (e.bytes.load(Ordering::Relaxed) > 0 || e.busy())
+                && crate::model_cache::folder_of(&e.spec.source, self.cache_dir.as_deref())
+                    .and_then(|f| std::fs::canonicalize(f).ok())
+                    .is_some_and(|f| f == real)
+        })
+    }
+
+    /// The memory the loaded models may take together, in bytes (None: unlimited).
+    pub fn budget(&self) -> Option<u64> {
+        self.budget
+    }
+
+    /// The cache directory repo ids are fetched to (None: the default).
+    pub fn cache_dir(&self) -> Option<&Path> {
+        self.cache_dir.as_deref()
+    }
+
     /// Checks that `id` is listed and, when its kind is already known, that it is `want`.
     pub fn check(&self, id: &str, want: Kind) -> ApiResult<()> {
         let e = self.find(id)?;
-        let kind = lock(&e.detected)
-            .map(|d| d.0)
-            .or_else(|| e.spec.option("kind").and_then(Kind::parse));
-        match kind {
+        match e.kind() {
             Some(k) if k != want => Err(wrong_kind(id, k, want)),
             _ => Ok(()),
         }
@@ -319,20 +448,15 @@ impl Registry {
 
     /// `(id, kind, loaded)` of every model.
     pub fn list(&self) -> Vec<(String, Option<Kind>, bool)> {
-        self.entries
-            .iter()
-            .map(|e| {
-                let kind = lock(&e.detected)
-                    .map(|d| d.0)
-                    .or_else(|| e.spec.option("kind").and_then(Kind::parse));
-                (e.spec.id.clone(), kind, e.bytes.load(Ordering::Relaxed) > 0)
-            })
+        self.active()
+            .into_iter()
+            .map(|e| (e.spec.id.clone(), e.kind(), e.bytes.load(Ordering::Relaxed) > 0))
             .collect()
     }
 
     /// Fetches every model (and detects its kind).
     pub fn download(&self) -> Result<()> {
-        for e in &self.entries {
+        for e in self.active() {
             self.detect(e)?;
             if e.spec.source.contains('/') && !Path::new(&e.spec.source).exists() {
                 crate::engine::resolve_model(&e.spec.source, self.cache_dir.as_deref()).with_context(|| e.spec.id.clone())?;
@@ -343,7 +467,7 @@ impl Registry {
 
     /// Loads every model (as far as the memory budget allows: later ones may unload earlier ones).
     pub fn preload(&self) -> Result<()> {
-        for e in &self.entries {
+        for e in self.active() {
             let mut g = lock(&e.slot);
             if g.is_none() {
                 let (kind, image) = self.detect(e)?;
@@ -363,14 +487,15 @@ impl Registry {
     fn make_room(&self, except: Option<&Entry>, need: u64) {
         let budget = self.budget.unwrap_or(u64::MAX);
         let mut tried: Vec<*const Entry> = Vec::new();
+        let entries = self.all();
         loop {
-            let used: u64 = self.entries.iter().map(|e| e.bytes.load(Ordering::Relaxed)).sum();
+            let used: u64 = entries.iter().map(|e| e.bytes.load(Ordering::Relaxed)).sum();
             if need != u64::MAX && used.saturating_add(need) <= budget {
                 return;
             }
-            let victim = self
-                .entries
+            let victim = entries
                 .iter()
+                .copied()
                 .filter(|e| e.bytes.load(Ordering::Relaxed) > 0)
                 .filter(|e| except.is_none_or(|x| !std::ptr::eq(*e, x)) && !tried.contains(&(*e as *const Entry)))
                 .min_by_key(|e| e.last_used.load(Ordering::Relaxed));
@@ -554,6 +679,7 @@ impl Registry {
             None => estimate(spec, self.cache_dir.as_deref()),
         };
         e.bytes.store(est.clamp(1, budget), Ordering::Relaxed);
+        crate::model_cache::touch(src, self.cache_dir.as_deref());
         if self.log {
             eprintln!("[loaded {} in {:.1}s]", spec.id, t0.elapsed().as_secs_f64());
         }
@@ -813,12 +939,12 @@ mod tests {
         let specs: Vec<ModelSpec> = ["a", "b", "c"].iter().map(|s| ModelSpec::new(s).unwrap()).collect();
         let r = Registry::new(&specs, Some(100), None, false);
         // Pretend every model is loaded (a slot holding a model is only needed to unload it).
-        for (i, e) in r.entries.iter().enumerate() {
+        for (i, e) in r.all().into_iter().enumerate() {
             e.bytes.store(40, Ordering::Relaxed);
             e.last_used.store([3, 1, 2][i], Ordering::Relaxed);
         }
         // Nothing is in the slots, so nothing can be unloaded: the loop ends.
         r.make_room(None, 50);
-        assert!(r.entries.iter().all(|e| e.bytes.load(Ordering::Relaxed) == 40));
+        assert!(r.all().iter().all(|e| e.bytes.load(Ordering::Relaxed) == 40));
     }
 }

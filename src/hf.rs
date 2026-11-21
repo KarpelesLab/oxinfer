@@ -184,7 +184,22 @@ fn gguf_models(list: &Listing) -> Vec<&String> {
 /// ends in `QUANT.gguf` (case-insensitive, e.g. `Q4_K_M` or `FastMTP-32K`), fetched alone.
 pub fn resolve_gguf(repo: &str, quant: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
     let list = listing(repo)?;
-    let ggufs = gguf_models(&list);
+    let (name, parts) = gguf_parts(repo, quant, &list)?;
+    let root = cache_dir.map(Path::to_path_buf).unwrap_or_else(cache_root);
+    let dir = root.join(repo.replace('/', "--"));
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    for (i, p) in parts.iter().enumerate() {
+        let (size, src) = list
+            .get(p)
+            .with_context(|| format!("{repo}: split GGUF part {p} is not in the listing"))?;
+        fetch_file(repo, &dir, p, *size, src, i + 1, parts.len())?;
+    }
+    Ok(dir.join(name))
+}
+
+/// The GGUF file of `repo` for `quant` and its parts (itself alone unless it is split).
+fn gguf_parts(repo: &str, quant: &str, list: &Listing) -> Result<(String, Vec<String>)> {
+    let ggufs = gguf_models(list);
     let want = format!("{}.gguf", quant.to_ascii_lowercase());
     // A split model is matched by its first part's name without `-00001-of-0000N`; the later
     // parts are not models of their own.
@@ -228,16 +243,91 @@ pub fn resolve_gguf(repo: &str, quant: &str, cache_dir: Option<&Path>) -> Result
             .collect(),
         None => vec![name.clone()],
     };
+    Ok((name, parts))
+}
+
+/// One file of a [`Plan`].
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct PlanFile {
+    /// The path in the repository.
+    pub name: String,
+    /// Its size, when the listing gives it.
+    pub size: Option<u64>,
+    /// Bytes of it already in the cache (a whole file, or the part an interrupted download left).
+    pub have: u64,
+}
+
+/// What fetching a model takes ([`plan`]).
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct Plan {
+    /// The repository (`org/name`).
+    pub repo: String,
+    /// Its folder in the cache.
+    pub dir: PathBuf,
+    /// The files [`resolve`] fetches, in order (the small configuration files it reads to decide
+    /// are not counted).
+    pub files: Vec<PlanFile>,
+}
+
+impl Plan {
+    /// Bytes of all the files (those of unknown size not counted).
+    pub fn total(&self) -> u64 {
+        self.files.iter().map(|f| f.size.unwrap_or(f.have)).sum()
+    }
+    /// Bytes still to download.
+    pub fn missing(&self) -> u64 {
+        self.files.iter().map(|f| f.size.map_or(0, |s| s.saturating_sub(f.have))).sum()
+    }
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "repo": self.repo,
+            "dir": self.dir.display().to_string(),
+            "total": self.total(),
+            "missing": self.missing(),
+            "files": self.files.iter().map(|f| serde_json::json!({"name": f.name, "size": f.size, "have": f.have})).collect::<Vec<_>>(),
+        })
+    }
+}
+
+/// The files a [`resolve`] of `spec` (`org/name` or `org/name:QUANT`) would fetch, with their
+/// sizes and what the cache already has, without downloading anything (the few small files that
+/// decide which weights are needed, such as a weight index, are read into memory). Errors for a
+/// local path.
+pub fn plan(spec: &str, cache_dir: Option<&Path>) -> Result<Plan> {
+    if Path::new(spec).exists() {
+        bail!("{spec}: a local path, nothing to fetch");
+    }
+    let (repo, quant) = match spec.split_once(':') {
+        Some((r, q)) if r.split('/').count() == 2 => (r, Some(q)),
+        _ => (spec, None),
+    };
+    let parts: Vec<&str> = repo.split('/').collect();
+    if parts.len() != 2 || parts.iter().any(|s| s.is_empty() || s.starts_with('.')) || repo.starts_with('/') {
+        bail!("{spec}: not a HuggingFace repo id of the form org/name (or org/name:QUANT)");
+    }
     let root = cache_dir.map(Path::to_path_buf).unwrap_or_else(cache_root);
     let dir = root.join(repo.replace('/', "--"));
-    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-    for (i, p) in parts.iter().enumerate() {
-        let (size, src) = list
-            .get(p)
-            .with_context(|| format!("{repo}: split GGUF part {p} is not in the listing"))?;
-        fetch_file(repo, &dir, p, *size, src, i + 1, parts.len())?;
-    }
-    Ok(dir.join(name))
+    let list = listing(repo)?;
+    let names = match quant {
+        Some(q) => gguf_parts(repo, q, &list)?.1,
+        None => repo_files(repo, &list, &mut |name| peek_meta(repo, &dir, &list, name))?,
+    };
+    let files = names
+        .into_iter()
+        .map(|name| {
+            let size = list.get(&name).and_then(|(s, _)| *s);
+            let have = std::fs::metadata(dir.join(&name)).map(|m| m.len()).unwrap_or(0);
+            let have = size.map_or(have, |s| have.min(s));
+            PlanFile { name, size, have }
+        })
+        .collect();
+    Ok(Plan {
+        repo: repo.to_string(),
+        dir,
+        files,
+    })
 }
 
 /// Percent-encodes a repository path for a URL (keeps `/` and unreserved characters).
@@ -457,63 +547,63 @@ fn anemll_wanted(name: &str) -> bool {
         || name.contains(".mlpackage/"))
 }
 
-/// Files of a diffusers pipeline repository (`model_index.json` at the root, as for
-/// `timbrooks/instruct-pix2pix`): the index, each component's configs and tokenizer files, and one
-/// weight file per component (safetensors, the fp16 variant when there is one: half the download,
-/// and the weights are kept in bf16 anyway; PyTorch `.bin` only when a component has no
-/// safetensors). The safety checker and the full single-file checkpoints at the root are skipped.
-fn diffusers_files(list: &Listing) -> Vec<String> {
-    let mut files = vec!["model_index.json".to_string()];
-    let mut dirs: Vec<&str> = list
-        .keys()
-        .filter_map(|k| k.split_once('/').map(|(d, _)| d))
-        .filter(|d| !matches!(*d, "safety_checker" | "feature_extractor"))
-        .collect();
-    dirs.sort();
-    dirs.dedup();
-    for d in dirs {
-        let mut names: Vec<&String> = list.keys().filter(|k| k.split_once('/').is_some_and(|(p, _)| p == d)).collect();
-        names.sort();
-        for n in &names {
-            if n.ends_with(".json") || n.ends_with(".txt") || n.ends_with(".model") {
-                files.push(n.to_string());
-            }
-        }
-        // Safetensors when there are any, else PyTorch `.bin` (older exports); fp16 first.
-        for ext in [".safetensors", ".bin"] {
-            let w: Vec<&&String> = names.iter().filter(|n| n.ends_with(ext)).collect();
-            if let Some(f) = w.iter().find(|n| n.ends_with(&format!(".fp16{ext}"))).or_else(|| w.first()) {
-                files.push(f.to_string());
-                break;
-            }
-        }
-    }
-    files
-}
-
 fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
     let list = listing(repo)?;
-    if list.contains_key("model_index.json") {
-        return fetch_diffusers(repo, dir, &list, &[]);
+    let files = repo_files(repo, &list, &mut |name| fetch_meta(repo, dir, &list, name))?;
+    fetch_listed(repo, dir, &list, &files)
+}
+
+/// Reads a small file of the listing that decides which files a fetch takes (`modules.json`,
+/// a weight index), fetching it into the repository's folder.
+type Meta<'a> = dyn FnMut(&str) -> Result<Vec<u8>> + 'a;
+
+fn fetch_meta(repo: &str, dir: &Path, list: &Listing, name: &str) -> Result<Vec<u8>> {
+    let (size, src) = list.get(name).with_context(|| format!("{repo}: {name} is not in the listing"))?;
+    fetch_file(repo, dir, name, *size, src, 0, 0)?;
+    std::fs::read(dir.join(name)).with_context(|| format!("read {}", dir.join(name).display()))
+}
+
+/// The same without writing anything: the cached copy, else the file fetched into memory.
+fn peek_meta(repo: &str, dir: &Path, list: &Listing, name: &str) -> Result<Vec<u8>> {
+    let (size, src) = list.get(name).with_context(|| format!("{repo}: {name} is not in the listing"))?;
+    if let Ok(b) = std::fs::read(dir.join(name))
+        && size.is_none_or(|s| s == b.len() as u64)
+    {
+        return Ok(b);
     }
-    if is_anemll_listing(&list) {
-        let mut files: Vec<&String> = list.keys().filter(|k| anemll_wanted(k)).collect();
+    match src {
+        Source::Inline(b) => Ok(b.clone()),
+        Source::Url(u) => {
+            let resp = request(u, u.starts_with("https://huggingface.co/"))?
+                .send()
+                .map_err(|e| anyhow!("{repo}/{name}: {e}"))?;
+            if resp.status != 200 {
+                bail!("{repo}/{name}: HTTP {}", resp.status);
+            }
+            Ok(resp.body)
+        }
+    }
+}
+
+/// Fetches `files` of the listing (counted 1 to N in the progress reports).
+fn fetch_listed(repo: &str, dir: &Path, list: &Listing, files: &[String]) -> Result<()> {
+    let count = files.len();
+    for (i, f) in files.iter().enumerate() {
+        let (size, src) = list.get(f).with_context(|| format!("{repo}: {f} is not in the listing"))?;
+        fetch_file(repo, dir, f, *size, src, i + 1, count)?;
+    }
+    Ok(())
+}
+
+/// The files a fetch of the repository takes (besides the small ones `meta` reads).
+fn repo_files(repo: &str, list: &Listing, meta: &mut Meta) -> Result<Vec<String>> {
+    if list.contains_key("model_index.json") {
+        return diffusers_component_files(list, &[], meta);
+    }
+    if is_anemll_listing(list) {
+        let mut files: Vec<String> = list.keys().filter(|k| anemll_wanted(k)).cloned().collect();
         files.sort();
-        let count = files.len();
-        for (i, f) in files.iter().enumerate() {
-            let (size, src) = &list[*f];
-            fetch_file(repo, dir, f, *size, src, i + 1, count)?;
-        }
-        return Ok(());
-    }
-    if list.contains_key("model_index.json") {
-        let files = diffusers_files(&list);
-        let count = files.len();
-        for (i, f) in files.iter().enumerate() {
-            let (size, src) = &list[f];
-            fetch_file(repo, dir, f, *size, src, i + 1, count)?;
-        }
-        return Ok(());
+        return Ok(files);
     }
     let mut files: Vec<String> = SMALL_FILES
         .iter()
@@ -530,9 +620,8 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
     files.extend(decision.into_iter().map(str::to_string));
     // sentence-transformers layout (embedding models): the module list, the prompts, and each
     // module's folder (pooling, dense projections); BGE-M3's sparse and multi-vector heads.
-    if let Some((size, src)) = list.get("modules.json") {
-        fetch_file(repo, dir, "modules.json", *size, src, 0, 0)?;
-        let modules: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("modules.json"))?)?;
+    if list.contains_key("modules.json") {
+        let modules: serde_json::Value = serde_json::from_slice(&meta("modules.json")?)?;
         for f in [
             "config_sentence_transformers.json",
             "sentence_bert_config.json",
@@ -586,9 +675,7 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
     if list.contains_key("model.safetensors") {
         files.push("model.safetensors".into());
     } else if let Some(index) = index {
-        let (size, src) = &list[index];
-        fetch_file(repo, dir, index, *size, src, 0, 0)?;
-        let idx: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(index))?)?;
+        let idx: serde_json::Value = serde_json::from_slice(&meta(index)?)?;
         let mut shards: Vec<String> = idx["weight_map"]
             .as_object()
             .context("weight_map")?
@@ -608,10 +695,9 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
         files.push("diffusion_pytorch_model.safetensors".into());
     } else if list.contains_key("pytorch_model.bin") {
         files.push("pytorch_model.bin".into());
-    } else if let Some((size, src)) = list.get("pytorch_model.bin.index.json") {
+    } else if list.contains_key("pytorch_model.bin.index.json") {
         // Sharded PyTorch checkpoints (e.g. deepseek-ai/Janus-Pro-7B).
-        fetch_file(repo, dir, "pytorch_model.bin.index.json", *size, src, 0, 0)?;
-        let idx: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("pytorch_model.bin.index.json"))?)?;
+        let idx: serde_json::Value = serde_json::from_slice(&meta("pytorch_model.bin.index.json")?)?;
         let mut shards: Vec<String> = idx["weight_map"]
             .as_object()
             .context("weight_map")?
@@ -621,20 +707,15 @@ fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
         shards.sort();
         shards.dedup();
         files.extend(shards);
-    } else if !gguf_models(&list).is_empty() {
+    } else if !gguf_models(list).is_empty() {
         bail!(
             "{repo} holds GGUF files; pick one as {repo}:QUANT (e.g. {repo}:Q4_K_M): {}",
-            gguf_models(&list).iter().map(|f| f.as_str()).collect::<Vec<_>>().join(", ")
+            gguf_models(list).iter().map(|f| f.as_str()).collect::<Vec<_>>().join(", ")
         );
     } else {
         bail!("{repo}: no safetensors or pytorch_model.bin weights found");
     }
-    let count = files.len();
-    for (i, f) in files.iter().enumerate() {
-        let (size, src) = list.get(f).with_context(|| format!("{repo}: {f} is not in the listing"))?;
-        fetch_file(repo, dir, f, *size, src, i + 1, count)?;
-    }
-    Ok(())
+    Ok(files)
 }
 
 /// A diffusers pipeline repository (`model_index.json`) without the components in `skip` (e.g.
@@ -655,7 +736,8 @@ pub fn resolve_diffusers(spec: &str, skip: &[&str], cache_dir: Option<&Path>) ->
     if !list.contains_key("model_index.json") {
         bail!("{spec}: not a diffusers pipeline (no model_index.json)");
     }
-    fetch_diffusers(spec, &dir, &list, skip)?;
+    let files = diffusers_component_files(&list, skip, &mut |name| fetch_meta(spec, &dir, &list, name))?;
+    fetch_listed(spec, &dir, &list, &files)?;
     Ok(dir)
 }
 
@@ -663,10 +745,8 @@ pub fn resolve_diffusers(spec: &str, skip: &[&str], cache_dir: Option<&Path>) ->
 /// those in `skip`), the component folder's configs, tokenizer files and weights (sharded or
 /// not; the full-precision file over an `.fp16` variant, safetensors over `.bin`). Top-level
 /// single-file checkpoints (`flux1-dev.safetensors`, `ae.safetensors`, ...) are left out.
-fn fetch_diffusers(repo: &str, dir: &Path, list: &Listing, skip: &[&str]) -> Result<()> {
-    let (size, src) = &list["model_index.json"];
-    fetch_file(repo, dir, "model_index.json", *size, src, 0, 0)?;
-    let index: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("model_index.json"))?)?;
+fn diffusers_component_files(list: &Listing, skip: &[&str], meta: &mut Meta) -> Result<Vec<String>> {
+    let index: serde_json::Value = serde_json::from_slice(&meta("model_index.json")?)?;
     let mut files: Vec<String> = Vec::new();
     for (comp, v) in index.as_object().context("model_index.json is not an object")? {
         let named = v.as_array().is_some_and(|a| a.first().is_some_and(|x| !x.is_null()));
@@ -700,9 +780,7 @@ fn fetch_diffusers(repo: &str, dir: &Path, list: &Listing, skip: &[&str]) -> Res
             }
         }
         if let Some(idx) = weights_index {
-            let (size, src) = &list[&idx];
-            fetch_file(repo, dir, &idx, *size, src, 0, 0)?;
-            let v: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join(&idx))?)?;
+            let v: serde_json::Value = serde_json::from_slice(&meta(&idx)?)?;
             let mut shards: Vec<String> = v["weight_map"]
                 .as_object()
                 .context("weight_map")?
@@ -714,12 +792,7 @@ fn fetch_diffusers(repo: &str, dir: &Path, list: &Listing, skip: &[&str]) -> Res
             files.extend(shards);
         }
     }
-    let count = files.len();
-    for (i, f) in files.iter().enumerate() {
-        let (size, src) = list.get(f).with_context(|| format!("{repo}: {f} is not in the listing"))?;
-        fetch_file(repo, dir, f, *size, src, i + 1, count)?;
-    }
-    Ok(())
+    Ok(files)
 }
 
 fn human_gb(b: u64) -> String {

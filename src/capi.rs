@@ -180,6 +180,39 @@ pub unsafe extern "C" fn oxi_download(
     })
 }
 
+/// What a download of `spec` takes, as JSON (`{"repo", "dir", "total", "missing", "files"}`),
+/// without downloading it.
+#[cfg(feature = "hf")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_download_plan(spec: *const c_char, cache_dir: *const c_char) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let spec = unsafe { str_arg(spec, "spec") }?;
+        let cache = unsafe { opt_str_arg(cache_dir, "cache_dir") }?.map(std::path::PathBuf::from);
+        Ok(out_string(crate::hf::plan(spec, cache.as_deref())?.to_json().to_string()))
+    })
+}
+
+/// The model cache as JSON: `{"path", "free", "total", "bytes", "entries": [{"name", "repo",
+/// "path", "bytes", "files", "modified", "last_used", "ggufs", "usable", "specs"}]}`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_cache_list(cache_dir: *const c_char) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let cache = unsafe { opt_str_arg(cache_dir, "cache_dir") }?.map(std::path::PathBuf::from);
+        Ok(out_string(crate::model_cache::to_json(cache.as_deref())?.to_string()))
+    })
+}
+
+/// Deletes the cache entry `name` (a folder name `org--name` or a repo id `org/name`; nothing
+/// outside the cache directory); returns the bytes freed, or -1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_cache_remove(cache_dir: *const c_char, name: *const c_char) -> i64 {
+    guard(-1, || {
+        let cache = unsafe { opt_str_arg(cache_dir, "cache_dir") }?.map(std::path::PathBuf::from);
+        let name = unsafe { str_arg(name, "name") }?;
+        Ok(crate::model_cache::remove(name, cache.as_deref())? as i64)
+    })
+}
+
 /// Frees an engine (NULL is ignored). No other call on it may be running.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxi_engine_free(e: *mut OxiEngine) {

@@ -75,6 +75,7 @@ pub mod mistral4;
 pub mod mm;
 pub mod mm_config;
 pub mod model;
+pub mod model_cache;
 pub mod modernbert;
 mod moe;
 pub mod mpnet;
