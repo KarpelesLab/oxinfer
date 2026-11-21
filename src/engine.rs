@@ -194,7 +194,9 @@ pub struct EngineOptions {
     pub coreml_prefill: CoreMlPrefill,
     /// GPU matmuls bit-identical to the CPU (no half-precision matrix units on M5/A19; slower
     /// prefill). Process-wide, applied on load; None leaves the current setting
-    /// ([`crate::gpu::set_exact`]). Key `gpu_exact`.
+    /// ([`crate::gpu::set_exact`]). Inkling-2 on CUDA takes its prefill GEMMs in split halves
+    /// (within ~1e-6 of f32) unless this is `false`, which gives plain f16 operands (~15% faster
+    /// prefill). Key `gpu_exact`.
     pub gpu_exact: Option<bool>,
     /// CPU prefill matmuls ([`crate::kernels::PrefillGemm`]): `auto` (default: `fast`, with
     /// llama.cpp's int8 activation rounding), `exact` (the opt-out: `sme` where the CPU has SME,
@@ -211,8 +213,9 @@ pub struct EngineOptions {
     /// current setting ([`crate::gpu::set_moe_offload`]). Key `gpu_moe`.
     pub gpu_moe: Option<bool>,
     /// Single-token decode steps entirely on the GPU (one submission per token) where the backend
-    /// supports the model (Metal: dense Llama 3 / Qwen3 / Qwen3.5 / 3.8 layers); everything else
-    /// stays as it was. Process-wide, applied on load; None leaves the current setting (default
+    /// supports the model (Metal: dense Llama 3 / Qwen3 / Qwen3.5 / 3.8 layers; CUDA: those and
+    /// Inkling-2, whose prompts then run whole on the GPU as well); everything else stays as it
+    /// was. Process-wide, applied on load; None leaves the current setting (default
     /// on; [`crate::gpu::set_decode`]). Key `gpu_decode`.
     pub gpu_decode: Option<bool>,
     /// Streamed models (see [`EngineOptions::stream`]) decode on the GPU too: the resident layers

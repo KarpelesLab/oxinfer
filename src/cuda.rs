@@ -430,6 +430,8 @@ pub struct CudaBackend {
     staging: Mutex<Staging>,
     stats: Stats,
     name: String,
+    /// Compute capability (major, minor).
+    sm: (c_int, c_int),
 }
 unsafe impl Send for CudaBackend {}
 unsafe impl Sync for CudaBackend {}
@@ -468,47 +470,11 @@ impl CudaBackend {
         check(&cu, unsafe { cu.cuCtxSetCurrent(ctx) }, "cuCtxSetCurrent")?;
 
         // Compile the kernels for this device with NVRTC.
-        let nvrtc = {
-            use dlsym::Bindings;
-            // SAFETY: as above.
-            unsafe { Nvrtc::open_first(NVRTC_CANDIDATES.iter().copied()) }
-                .map_err(|e| anyhow!("libnvrtc (ships with the CUDA toolkit): {e}"))?
-        };
-        let src = CString::new(format!("{KERNEL_SRC}{}", include_str!("cuda_decode.cu")))?;
-        let name = CString::new("oxinfer.cu")?;
-        let mut prog: *mut c_void = std::ptr::null_mut();
-        let rc = unsafe { nvrtc.nvrtcCreateProgram(&mut prog, src.as_ptr(), name.as_ptr(), 0, std::ptr::null(), std::ptr::null()) };
-        if rc != 0 {
-            bail!("nvrtcCreateProgram failed ({rc})");
-        }
-        let arch = CString::new(format!("--gpu-architecture=sm_{major}{minor}"))?;
-        let opts = [arch.as_ptr(), c"--use_fast_math".as_ptr()];
-        let rc = unsafe { nvrtc.nvrtcCompileProgram(prog, opts.len() as c_int, opts.as_ptr()) };
-        if rc != 0 {
-            let mut n = 0usize;
-            unsafe { nvrtc.nvrtcGetProgramLogSize(prog, &mut n) };
-            let mut log = vec![0u8; n.max(1)];
-            unsafe { nvrtc.nvrtcGetProgramLog(prog, log.as_mut_ptr() as *mut c_char) };
-            unsafe { nvrtc.nvrtcDestroyProgram(&mut prog) };
-            bail!("NVRTC compilation failed ({rc}):\n{}", String::from_utf8_lossy(&log));
-        }
-        let mut n = 0usize;
-        let cubin_rc = unsafe { nvrtc.nvrtcGetCUBINSize(prog, &mut n) };
-        // Prefer a native binary: PTX carries the toolkit's version, which a driver older than the
-        // toolkit refuses to load, whereas a binary for this exact core needs no driver JIT.
-        let mut image;
-        if cubin_rc == Some(0) && n > 0 {
-            image = vec![0u8; n];
-            unsafe { nvrtc.nvrtcGetCUBIN(prog, image.as_mut_ptr() as *mut c_char) };
-        } else {
-            unsafe { nvrtc.nvrtcGetPTXSize(prog, &mut n) };
-            image = vec![0u8; n.max(1)];
-            unsafe { nvrtc.nvrtcGetPTX(prog, image.as_mut_ptr() as *mut c_char) };
-        }
-        unsafe { nvrtc.nvrtcDestroyProgram(&mut prog) };
-        if *image.last().unwrap_or(&1) != 0 {
-            image.push(0);
-        }
+        let image = nvrtc_image(
+            &format!("{KERNEL_SRC}{}", include_str!("cuda_decode.cu")),
+            "oxinfer.cu",
+            (major, minor),
+        )?;
         let mut module: *mut c_void = std::ptr::null_mut();
         check(
             &cu,
@@ -566,6 +532,7 @@ impl CudaBackend {
             staging: Mutex::new(Staging::default()),
             stats: Stats::default(),
             name: format!("cuda (sm_{major}{minor})"),
+            sm: (major, minor),
         })
     }
 
@@ -1058,6 +1025,85 @@ impl CudaBackend {
 
 /// The upload cache's key of a weight: its address, length and a fingerprint of samples of its
 /// bytes (memory freed and reused at the same address by other weights must not hit).
+/// Compiles `src` with NVRTC for compute capability `sm` into a native binary (or PTX when NVRTC
+/// cannot give one), NUL-terminated for `cuModuleLoadData`.
+fn nvrtc_image(src: &str, name: &str, sm: (c_int, c_int)) -> Result<Vec<u8>> {
+    let nvrtc = {
+        use dlsym::Bindings;
+        // SAFETY: libnvrtc's initialisers have no preconditions.
+        unsafe { Nvrtc::open_first(NVRTC_CANDIDATES.iter().copied()) }
+            .map_err(|e| anyhow!("libnvrtc (ships with the CUDA toolkit): {e}"))?
+    };
+    let src = CString::new(src)?;
+    let name = CString::new(name)?;
+    let mut prog: *mut c_void = std::ptr::null_mut();
+    let rc = unsafe { nvrtc.nvrtcCreateProgram(&mut prog, src.as_ptr(), name.as_ptr(), 0, std::ptr::null(), std::ptr::null()) };
+    if rc != 0 {
+        bail!("nvrtcCreateProgram failed ({rc})");
+    }
+    let arch = CString::new(format!("--gpu-architecture=sm_{}{}", sm.0, sm.1))?;
+    let opts = [arch.as_ptr(), c"--use_fast_math".as_ptr()];
+    let rc = unsafe { nvrtc.nvrtcCompileProgram(prog, opts.len() as c_int, opts.as_ptr()) };
+    if rc != 0 {
+        let mut n = 0usize;
+        unsafe { nvrtc.nvrtcGetProgramLogSize(prog, &mut n) };
+        let mut log = vec![0u8; n.max(1)];
+        unsafe { nvrtc.nvrtcGetProgramLog(prog, log.as_mut_ptr() as *mut c_char) };
+        unsafe { nvrtc.nvrtcDestroyProgram(&mut prog) };
+        bail!("NVRTC compilation failed ({rc}):\n{}", String::from_utf8_lossy(&log));
+    }
+    let mut n = 0usize;
+    let cubin_rc = unsafe { nvrtc.nvrtcGetCUBINSize(prog, &mut n) };
+    // Prefer a native binary: PTX carries the toolkit's version, which a driver older than the
+    // toolkit refuses to load, whereas a binary for this exact core needs no driver JIT.
+    let mut image;
+    if cubin_rc == Some(0) && n > 0 {
+        image = vec![0u8; n];
+        unsafe { nvrtc.nvrtcGetCUBIN(prog, image.as_mut_ptr() as *mut c_char) };
+    } else {
+        unsafe { nvrtc.nvrtcGetPTXSize(prog, &mut n) };
+        image = vec![0u8; n.max(1)];
+        unsafe { nvrtc.nvrtcGetPTX(prog, image.as_mut_ptr() as *mut c_char) };
+    }
+    unsafe { nvrtc.nvrtcDestroyProgram(&mut prog) };
+    if *image.last().unwrap_or(&1) != 0 {
+        image.push(0);
+    }
+    Ok(image)
+}
+
+/// What model code that runs its own kernels needs of the backend ([`crate::inkling`]'s CUDA
+/// path): the driver, the context, and modules compiled from its sources.
+impl CudaBackend {
+    pub(crate) fn driver(&self) -> &std::sync::Arc<Cu> {
+        &self.cu
+    }
+    /// The primary context, made current on the calling thread.
+    pub(crate) fn context(&self) -> Option<*mut c_void> {
+        self.bind().then_some(self.ctx)
+    }
+    /// The compute capability (major, minor).
+    pub(crate) fn sm(&self) -> (i32, i32) {
+        self.sm
+    }
+    /// `src` compiled for this device (a native binary, or PTX), for [`Self::load_image`].
+    pub(crate) fn compile(&self, src: &str, name: &str) -> Result<Vec<u8>> {
+        nvrtc_image(src, name, self.sm)
+    }
+    /// Loads a compiled module (from [`Self::compile`]).
+    pub(crate) fn load_image(&self, image: &[u8]) -> Result<*mut c_void> {
+        if !self.bind() {
+            bail!("cuCtxSetCurrent failed");
+        }
+        let mut module: *mut c_void = std::ptr::null_mut();
+        self.check(
+            unsafe { self.cu.cuModuleLoadData(&mut module, image.as_ptr() as *const c_void) },
+            "cuModuleLoadData",
+        )?;
+        Ok(module)
+    }
+}
+
 fn weight_key(w: &WeightRef) -> Option<(usize, usize, u64)> {
     fn sample(b: &[u8], h: &mut u64) {
         let n = b.len();
@@ -1113,6 +1159,9 @@ unsafe impl Send for CudaWeightBox {}
 unsafe impl Sync for CudaWeightBox {}
 
 impl Backend for CudaBackend {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
     fn name(&self) -> &str {
         &self.name
     }

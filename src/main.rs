@@ -484,7 +484,8 @@ fn usage() -> ! {
          \x20                      CAN column) and --model TEXT filter; --device cpu ignores the GPU; --json\n\
          \x20 --device D           auto (default) | cpu | cuda | metal | vulkan\n\
          \x20 --gpu-decode M       on (default) | off: generate a whole token per GPU submission\n\
-         \x20                      (Metal; Llama 3, Orpheus, Qwen3, Qwen3.5 / 3.8 dense)\n\
+         \x20                      (Metal; Llama 3, Orpheus, Qwen3, Qwen3.5 / 3.8 dense; CUDA: also\n\
+         \x20                      Inkling-2, whose prefill then runs whole on the GPU too)\n\
          \x20 --dump-logits FILE   write last-prompt-token logits (f32 LE) and exit\n\
          \n\
          ANEMLL Core ML models (a meta.yaml folder; macOS 15 / iOS 18, Apple Neural Engine):\n\

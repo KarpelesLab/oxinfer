@@ -291,6 +291,11 @@ pub trait Backend: Send + Sync {
     fn stats(&self) -> Option<String> {
         None
     }
+    /// The backend as its concrete type, for model code that runs kernels of its own on it
+    /// (Inkling-2's CUDA path). None by default.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 static ACTIVE: OnceLock<Option<Box<dyn Backend>>> = OnceLock::new();
@@ -331,6 +336,16 @@ pub fn exact_attention() -> bool {
 }
 
 static EXACT_ATTN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`set_exact`] when it was called (or `OXINFER_METAL_MMA` set), else None: for backends whose
+/// default is the exact path.
+pub fn exact_forced() -> Option<bool> {
+    match EXACT.load(Ordering::Relaxed) {
+        1 => Some(true),
+        2 => Some(false),
+        _ => std::env::var("OXINFER_METAL_MMA").ok().map(|v| v == "0"),
+    }
+}
 
 /// See [`set_exact`].
 pub fn exact() -> bool {

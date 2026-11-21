@@ -47,6 +47,10 @@
 //! The convolutions keep only their last inputs, so a session cannot go back to an earlier
 //! position (no prompt lookup, no draft model).
 
+#[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
+#[path = "inkling_cuda.rs"]
+mod cuda;
+
 use crate::intervene::{NeuronHook, Target};
 use crate::kernels::*;
 use crate::model::{Lin, Quant, Table, linear, linear_multi, load_lin, load_lin_experts, table_quant};
@@ -750,6 +754,37 @@ impl KvRows {
     }
 }
 
+/// Whole passes on an accelerator (CUDA: `inkling_cuda.rs`), chosen when the model first runs.
+/// A session's state then lives on the device ([`DevBox`]); a pass the device does not take
+/// (interventions, captured layers) first brings it back to the host caches.
+pub(crate) trait DevEngine: Send + Sync {
+    /// Runs the embedded tokens `x` (`[t, hidden]`, embedding norm applied) from `sess.pos` and
+    /// advances it: the final-normed hidden states.
+    fn forward(&self, m: &Inkling2Model, sess: &mut Inkling2Session, x: &[f32], t: usize) -> Vec<f32>;
+    /// The unembedding of `hidden` (`[t, hidden]`), soft-capped when `cap`; None leaves it to the
+    /// CPU.
+    fn head(&self, m: &Inkling2Model, hidden: &[f32], t: usize, cap: bool) -> Option<Vec<f32>>;
+    /// Moves the device state of `sess`, if any, back into its host caches.
+    fn to_host(&self, m: &Inkling2Model, sess: &mut Inkling2Session);
+}
+
+/// A session's state on a device ([`DevEngine`]).
+pub(crate) trait DevSession: Send + Sync {
+    fn clone_box(&self) -> Box<dyn DevSession>;
+    /// Bytes of its attention caches.
+    fn bytes(&self) -> usize;
+    fn as_any(&mut self) -> &mut dyn std::any::Any;
+}
+
+/// See [`DevSession`]: authoritative while set (the host caches are then stale).
+pub(crate) struct DevBox(pub(crate) Box<dyn DevSession>);
+
+impl Clone for DevBox {
+    fn clone(&self) -> Self {
+        DevBox(self.0.clone_box())
+    }
+}
+
 /// The decoding state of one layer.
 #[derive(Clone, Default)]
 struct LayerState {
@@ -767,6 +802,8 @@ pub struct Inkling2Session {
     pub pos: usize,
     /// Runtime interventions ([`crate::intervene`]).
     pub iv: crate::intervene::State,
+    /// The state on the device, when the model runs there.
+    dev: Option<DevBox>,
 }
 
 pub struct Inkling2Model<'a> {
@@ -783,6 +820,8 @@ pub struct Inkling2Model<'a> {
     layers: Vec<Layer<'a>>,
     /// Weight streaming: unit `l` is layer `l`, unit `num_hidden_layers` the LM head.
     stream: Option<crate::stream::StreamHook>,
+    /// Whole passes on the GPU, decided at the first pass ([`DevEngine`]).
+    device: std::sync::OnceLock<Option<Box<dyn DevEngine>>>,
 }
 
 struct Loader<'a, 'c> {
@@ -1210,6 +1249,7 @@ impl<'a> Inkling2Model<'a> {
             quant,
             kv: KvCache::F32,
             stream: None,
+            device: std::sync::OnceLock::new(),
         };
         // Routed experts that cannot all stay in memory are read through the page cache as they
         // are routed: no accelerator mapping may pin them.
@@ -1303,7 +1343,22 @@ impl<'a> Inkling2Model<'a> {
                 .collect(),
             pos: 0,
             iv: Default::default(),
+            dev: None,
         }
+    }
+
+    /// The device that runs whole passes, if any (decided once, at the first pass: the active
+    /// backend, `--gpu-decode`, the weights' kinds and size).
+    fn device(&self) -> Option<&dyn DevEngine> {
+        self.device
+            .get_or_init(|| {
+                #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
+                if let Some(e) = cuda::Engine::new(self) {
+                    return Some(Box::new(e) as Box<dyn DevEngine>);
+                }
+                None
+            })
+            .as_deref()
     }
 
     /// Measurements only: puts `n` positions of placeholder keys and values (pseudo-random,
@@ -1342,6 +1397,9 @@ impl<'a> Inkling2Model<'a> {
 
     /// Bytes of the attention caches of `sess`.
     pub fn kv_bytes(&self, sess: &Inkling2Session) -> usize {
+        if let Some(d) = &sess.dev {
+            return d.0.bytes();
+        }
         sess.layers.iter().map(|l| l.k.bytes() + l.v.bytes()).sum()
     }
 
@@ -1433,6 +1491,9 @@ impl<'a> Inkling2Model<'a> {
 
     /// The unembedding over `hidden` (`[t, hidden]`), cut to the tokens: `[t, unpadded_vocab]`.
     fn head(&self, hidden: &[f32], t: usize, cap: bool) -> Vec<f32> {
+        if let Some(l) = self.device().and_then(|d| d.head(self, hidden, t, cap)) {
+            return l;
+        }
         let c = &self.cfg;
         let _timer = prof::start(Cat::Head);
         let (v, u) = (c.vocab_size, c.unpadded_vocab_size);
@@ -1519,6 +1580,13 @@ impl<'a> Inkling2Model<'a> {
         }
         drop(timer);
         let iv = sess.iv.active().then(|| sess.iv.clone());
+        if let Some(d) = self.device() {
+            if iv.is_none() && layers.is_empty() {
+                feats.clear();
+                return d.forward(self, sess, &x, t);
+            }
+            d.to_host(self, sess);
+        }
         let point = |p: usize, x: &mut [f32]| {
             if let Some(iv) = &iv {
                 iv.point(p, x, h, start);
