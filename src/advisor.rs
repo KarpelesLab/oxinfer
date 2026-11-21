@@ -515,6 +515,16 @@ pub const CATALOG: &[Model] = &[
     .speed(2.92, 48)
     .moe()
     .note("unsloth's own layout (the root files); --kv-cache q8 for long contexts on 16-24 GB"),
+    Model::new(
+        "AtomicChat/Inkling-2-Mini-Uncensored-GGUF:AD-Q4_K",
+        Kind::Chat,
+        26.4,
+        16.5,
+        &[Text, ImageInput, Thinking, Tools],
+    )
+    .fixed(Format::GgufQ4, "GGUF AD-Q4_K")
+    .moe()
+    .note("uncensored (a rank-1 refusal-direction LoRA baked in); llama.cpp's layout; also :AD-IQ3_S (13.3 GB), :AD-IQ2_M (8.7 GB, run); images with the mmproj beside it"),
     // Inkling-2 Small: never run on the real weights (neither release fits the download budget;
     // the agreement with transformers is measured on tiny checkpoints, the vision tower on the
     // real one; bytes per token from the layout of the releases).
