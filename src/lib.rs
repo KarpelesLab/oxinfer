@@ -44,6 +44,7 @@ pub mod flux;
 pub mod fsx;
 pub mod generate;
 pub mod ggml;
+pub mod ggml_quant;
 pub mod gguf;
 pub mod glm5;
 pub mod gpu;

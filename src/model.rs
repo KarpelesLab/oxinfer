@@ -813,10 +813,10 @@ impl<'a> Lin<'a> {
     }
     /// Merges LoRA update `d` (at its current strength) into the weight: the matrix is decoded
     /// to f32, updated, and stored again in its float format (bf16, or a GGUF f32 / f16 / bf16
-    /// tensor; other GGUF float kinds as bf16), or quantized again (Q8 / Q4 weights in their
-    /// format, GGUF blocks as Q8, which the weight's own block format cannot be re-made from
-    /// here). False,
-    /// with the weight untouched, for a Hadamard-folded weight (whose rows are in another
+    /// tensor; other GGUF float kinds as bf16), or quantized again: Q8 / Q4 weights in their
+    /// format, GGUF blocks in their own type with [`crate::ggml_quant`] (the same memory), as Q8
+    /// for the few block types without a quantizer (IQ1, NVFP4, FP8). False, with the weight
+    /// untouched, for a Hadamard-folded weight (whose rows are in another
     /// basis): the update then stays a runtime one.
     pub fn merge_lora(&mut self, d: &crate::lora::LoraDelta) -> Result<bool> {
         let (n_out, n_in) = d.shape();
@@ -855,6 +855,13 @@ impl<'a> Lin<'a> {
                 Weight::Gguf(GgufMatrix::new(GgmlType::F16, v.into(), n_out, n_in)?)
             }
             Weight::Gguf(m) if m.kind.is_float() => to_bf16(&w),
+            // A block format with a quantizer: back to the same format (no importance matrix
+            // here: llama.cpp's deterministic paths, least squares where those are crude).
+            Weight::Gguf(m) if m.block_scales.is_none() && crate::ggml_quant::can_quantize(m.kind) => {
+                let mut v = crate::quant::PageVec::<u8>::zeroed(n_out * m.kind.row_bytes(n_in));
+                crate::ggml_quant::quantize_matrix_into(m.kind, &w, n_in, None, crate::ggml_quant::Fit::Best, &mut v);
+                Weight::Gguf(GgufMatrix::new(m.kind, v.into(), n_out, n_in)?)
+            }
             Weight::Gguf(_) => Weight::Q8(crate::quant::quantize_f32(&w, n_out, n_in)),
         };
         self.dev = std::sync::OnceLock::new();
