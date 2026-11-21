@@ -48,6 +48,22 @@ faults on the first pass.
 
 ## Release binaries and self-update
 
+The installers download the latest release's binary for this machine:
+
+```sh
+curl -fsSL https://karpeleslab.github.io/oxinfer/install.sh | sh      # macOS, Linux
+irm https://karpeleslab.github.io/oxinfer/install.ps1 | iex            # Windows (PowerShell)
+```
+
+- **`install.sh`** puts `oxinfer` in `~/.local/bin`, or `$OXINFER_INSTALL_DIR`, and says how to add that folder to `PATH` when it isn't there. It takes options after `sh -s --`:
+  - `--dir DIR`: install into DIR.
+  - `--version vX.Y.Z` (or `$OXINFER_VERSION`): install that release instead of the latest.
+  - `--static`: on x86_64 Linux, take the static build. This build is also chosen when the system has no glibc.
+  - `--web`: start `oxinfer web` once installed.
+- **`install.ps1`** puts `oxinfer.exe` in `%LOCALAPPDATA%\oxinfer\bin`, or `$env:OXINFER_INSTALL_DIR`, and adds that folder to the user's `PATH`. `$env:OXINFER_VERSION` picks a release instead of the latest.
+
+Both scripts live in `web/public/` and are published with the browser demo on GitHub Pages. Later updates use `oxinfer --update` (below).
+
 Each GitHub release carries the `oxinfer` binary (`.github/workflows/release-binaries.yml`,
 dispatched by release-plz on the new tag):
 

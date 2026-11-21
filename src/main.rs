@@ -445,6 +445,7 @@ fn usage() -> ! {
          \x20 --image FILE         with --prompt: answer a question about the image (repeatable)\n\
          \x20 --chat               a conversation: more questions from standard input, one per line\n\
          \x20 --devices            list detected CPU features and GPUs, then exit\n\
+         \x20 --version, -V        print the version, then exit
          \x20 --check-update       compare this binary with the latest GitHub release, then exit\n\
          \x20 --update             download the latest release's binary for this platform and replace this\n\
          \x20                      executable with it (--force: also when already up to date)\n\
@@ -1287,6 +1288,10 @@ fn main() -> Result<()> {
     // What an earlier update could not delete (Windows: the program was running).
     #[cfg(feature = "update")]
     oxinfer::update::remove_previous();
+    if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
+        println!("oxinfer {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     if std::env::args().skip(1).any(|a| a == "--auto-update") {
         auto_update();
     }

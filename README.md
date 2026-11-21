@@ -12,8 +12,17 @@ may still change.
 
 ## Get started
 
-1. **Get the binary** from the [latest release](https://github.com/KarpelesLab/oxinfer/releases/latest)
-   (macOS, Linux and Windows archives), or build it: `cargo build --release`.
+1. **Install it:**
+
+   ```sh
+   curl -fsSL https://karpeleslab.github.io/oxinfer/install.sh | sh                 # macOS, Linux
+   ```
+   ```powershell
+   irm https://karpeleslab.github.io/oxinfer/install.ps1 | iex                       # Windows
+   ```
+
+   or take an archive from the [latest release](https://github.com/KarpelesLab/oxinfer/releases/latest),
+   or build it: `cargo build --release`.
 2. **Run `oxinfer web`.** It opens `http://127.0.0.1:8090/` in your browser.
 3. **Pick a model** from the catalog. It shows each model's size and whether it fits this
    machine, downloads it with live progress, and loads it. Then chat (with images), generate
