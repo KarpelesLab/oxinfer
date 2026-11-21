@@ -7,6 +7,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.12](https://github.com/KarpelesLab/oxinfer/compare/v0.0.11...v0.0.12) - 2026-11-21
+
+### Other
+
+- One-line installers (install.sh for macOS / Linux, install.ps1 for Windows) on GitHub Pages; oxinfer --version
+- get started first, the model list moved to docs/models.md
+- get started with oxinfer web
+- Web GUI: native backend mode, model setup, every modality, Connect apps; docs/web.md
+- oxinfer web backend: the GUI's management API, the model cache, Anthropic's /v1/messages
+- MiniMax-H3 ref2va and audio VAE
+- PixilabAI/Zawen-v0.1-35B-A3B and mradermacher's Q4_K_M GGUF of it
+- a description that does not name models
+- MiniMax-H3 ref2va: usage, what was checked, and a first run on the release's Ref2VA/ (an image reference and a melody copied as the score: the fox of the reference, the melody's pitches and envelope)
+- MiniMax-H3 ref2va: video from references (the release's Ref2VA/): --ref FILE for images, videos with their soundtrack and audio clips, normalized as diffusers' setup step does; the presentation with <Picture i> / <Audio j> / <Video k> labels and timestamped Qwen3-VL video blocks (QwenVl::encode_video); the references through the video VAE's encoder and the audio VAE's; the [text | references | target audio | target video] layout (equal to diffusers' build_ref2va_packed_sequence on a mixed request: tools/minimax_h3_ref2va_layout.py, examples/h3_ref2va_check.rs); reference soundtracks held clean at t = 1 in the denoising loop
+- MiniMax-H3 audio VAE: the encoder (DAC waveform encoder, causal attention projection, mean_proj) for ref2va's reference audio; within 7e-7 of diffusers on a tiny random VAE and 6.4e-5 on the release's weights over 5.2 s of stereo
+- MiniMax-H3 FL2VA at the release's defaults on the CPU: 124 frames, 49 forwards on the bf16 transformer in 5001 s (attention 467 s with the blocked kernel), coherent frames, a quiet stereo soundtrack
+- blocked CPU kernel with an online softmax
+- MiniMax H3 video: the release's own FL2VA/ layout
+- MiniMax-H3 DiT: read the AdaLN vectors from their table per row
+- the MiniMax-H3 prompt conditioning against diffusers and transformers on the real Q8_0 text encoder: the dog prompt's token ids are the reference's and its embedding is transformers' hidden_states[50] on the same dequantized values within 3.6e-6 (1.8e-5 in the worst row; 24% against hidden_states[49] or [51]), so the blobs of the dog clip do not come from the text path; the speech prompt's <d> and </d> were split and are now the release's tokens, its 448x256 clip was redone and has blobs too; the release's bfloat16 arithmetic moves the embedding by 1.2%, Q4_K_M by 5%; the transformer takes no input the earlier torch runs did not build with diffusers' helpers, and the noise has the reference's layout and no scaling. Q8_0 against the bf16 weights stays unmeasured. tools/minimax_h3_text_ref.py run --dtype bf16.
+- MiniMax H3 video: the prompt's tokenizer has the seven tokens MiniMax's tokenizer_config.json adds to Qwen's (<d>, </d>, <|cutoff|>, <|lyrics_start|>, <|lyrics_end|>, <|caption_start|>, <|caption_end|> at 151669 to 151675, as transformers and ComfyUI number them), whether the vocabulary comes from the release's tokenizer.json or from a GGUF: a line of dialogue's <d> and </d> were split into three tokens each. h3_text_check dump writes the pipeline's token ids and hidden states of a prompt on the real text encoder, and tools/minimax_h3_text_ref.py computes the same hidden states in transformers from the GGUF's dequantized tensors and compares.
+- the MiniMax-H3 reference runs share oxinfer's prompt embedding, which they do not clear.
+- the coloured blobs of the 4-step 768p LoRA at 448x256 are the weights' doing, not oxinfer's: torch on the same files agrees with every oxinfer forward within 3e-4 (each block within 2e-5) and gives the same blobs from the same noise, ComfyUI's model code agrees with diffusers within 7e-5 on equal weights and gives blobs too; the blobs first show in the third forward; ComfyUI rounds a merged LoRA back to FP8 on the CPU, which oxinfer does not; the cause in the weights is not found.
+- MiniMax H3 video: OXINFER_H3_DUMP=DIR keeps every forward's rows and velocities (and one forward's sequence after every block), tools/minimax_h3_video_ref.py redoes a real request in torch from them (diffusers' transformer and scheduler on the decoded pruned FP8 file with the LoRA merged: block by block, one forward, or the whole sampling), tools/minimax_h3_video_comfy_ref.py does a forward or the sampling with ComfyUI's own code, and tools/minimax_h3_video_long.py with h3_video_check compares a tiny transformer with the real heads on a real request's 4682 rows.
+- MiniMax-H3 video run on the real small files (pruned FP8 transformer, fp16 video VAE, fp32 audio VAE, 4- and 8-step LoRAs, Q8_0 and Q4_K_M text encoders): load times, memory, timings per forward at 448x256 and 1344x768, what the frames show, the soundtracks' statistics and Whisper transcripts, the coloured blobs of the 4-step 768p LoRA at 448x256, and what stays unverified.
+- MiniMax H3 video: OXINFER_H3_LATENTS=FILE keeps the denoised video and audio rows (written when missing, decoded again without the transformer when present), and --profile prints the time by operation.
+- MiniMax H3 video: --audio-vae DIR|FILE names the audio VAE (Sources.audio_vae), so a single-file --model run has a soundtrack: the release's audio_vae/ folder or ComfyUI's vae/minimax_h3_audio_vae_fp32.safetensors, its configuration read from the file's header; that file decodes within 3.7e-5 of the folder (h3_audio_check --write).
+- MiniMax-H3 video from ComfyUI's quantized files (int8 ConvRot transformers and VAE, the W6A8 transformer, the text encoder as one file in bf16, int8 ConvRot or NVFP4): the formats as comfy_kitchen defines them, sampled rows of the real files against the bf16 ones, the agreement on tiny checkpoints, memory, what was not run and what stays unsupported.
+- MiniMax H3 video: the text encoder from ComfyUI's single files (--text-encoder qwen3vl_32b_minimax_h3_{bf16,int8_convrot,nvfp4_awq}.safetensors, text-only prompts): the 50 stored layers with their configuration from the tensor shapes and no final norm; NVFP4 in comfy_kitchen's packing (high nibble first, block scales in cuBLAS's tiled order) repacked into ggml's blocks, pre_quant_scale on the input, the int8 embedding with a scale per row; tools/qwen3vl_comfy.py writes a tiny Qwen3-VL in the three forms and examples/h3_text_check.rs compares the conditioning with transformers.
+- MiniMax H3 video: ComfyUI's W6A8 file (*_pruned_w6a8.safetensors): 6-bit codes with an FP8 scale per group and a scale per row, decoded at load to the int8 values comfy_kitchen computes with, on the ConvRot rotation; tools/minimax_h3_video_comfy.py writes the tiny transformer in that form (blocks and video head, the refiner as int8 ConvRot) and references through comfy_kitchen's int8-activation kernels beside the float32 ones.
+- MiniMax H3 video: ComfyUI's int8 ConvRot files (the transformer's *_int8_convrot.safetensors, pruned or not, and the video VAE's): int8 rows with a scale per row used as stored, their input rotated by comfy_kitchen's grouped regular Hadamard matrix (src/comfy_quant.rs, from each module's comfy_quant entry); tools/minimax_h3_video_comfy.py writes a wide tiny transformer and the tiny VAE in that form with comfy_kitchen's quantizer, with references on the dequantized weights.
+- The C API's request body pointer is cast with .cast::<u8>(), which clippy accepts where c_char is u8 (aarch64 Linux) as well as where it is i8.
+- The `server` feature builds without `hf`: a model's load reports download progress only when downloads exist.
+- The binary builds without the `media` feature: the Audio8 TTS command line needs none of it (WAV in and out), and CI's clippy covers --all-targets --no-default-features.
+- MiniMax-H3 video from ComfyUI's single files, the turbo LoRAs and a GGUF text encoder: flags, what the files hold, what was checked on tiny checkpoints and on sampled rows, what was not run and what stays unsupported.
+- MiniMax H3 video: tools/minimax_h3_video_comfy.py writes the tiny checkpoints as ComfyUI's single files (bf16, pruned, FP8 scaled, the fp16 VAE) and a LoRA in both namings with diffusers references; h3_video_check takes --transformer, --vae and --lora.
+- MiniMax H3 video: the text encoder from --text-encoder, a Qwen3-VL-32B-Instruct folder or its language model as a GGUF file (llama.cpp's qwen3vl architecture, text-only prompts), or quantized at load with --quant q8.
+- MiniMax H3 video: the video VAE from ComfyUI's fp16 single file (--vae FILE), its configuration read from the file's header and the encoder under MiniMax's tensor names.
+- MiniMax H3 video: the transformer from ComfyUI's single files (--model FILE --vae DIR, --transformer): bf16, the pruned form with its AdaLN curve table, and pruned FP8 scaled weights used as stored.
+- MiniMax H3 video: LoRA files on the transformer (--lora), the 4- and 8-step turbo LoRAs with the step count and sigma shifts their names stand for (--shift, --audio-shift).
+- The NEON prefill GEMM takes float-stored matrices of any width.
+- CI tests build with the `ci` profile (release without whole-program LTO), and every job has a time limit.
+- MiniMax-H3's soundtrack, how it is written, what was checked of the audio VAE and that no generated soundtrack was decoded or listened to.
+- MiniMax H3 video: the audio VAE's decoder checked against diffusers (tools/minimax_h3_audio_tiny.py, examples/h3_audio_check.rs), on a tiny random checkpoint (8.6e-8) and on the real audio_vae/ (8.8e-6 on the encoder's latents of a synthetic signal, 5.9e-5 on normal rows).
+- MiniMax H3 video: the soundtrack is written from the command line, as a 16-bit PCM stream in the .avi (one chunk after each frame) and as a .wav next to an animated WebP or a PNG sequence.
+- MiniMax H3 video: the audio VAE's decoder (BigVGAN with anti-aliased SnakeBeta activations), and the pipeline decodes the denoised audio rows into a 32 kHz stereo soundtrack.
+- CPU prefill: llama.cpp's int8 rounding by default for language models' prompts; `exact` opts out
+- Gemma 4 26B-A4B: Metal-vs-CPU prefill drift is routing amplification, not a bug
+- Prefill plans with captured layers: prompts with drafts stay on the GPU
+- second round of Metal prefill work, llama-bench matrix's Metal columns
+- Metal matrix-unit GEMMs: Q8_0 and Q4_0 weights dequantized in half
+- Metal prefill: residual adds in the GEMM stores
+- Metal prefill: MoE router GEMMs on 8x the threadgroups
+- Metal prefill GEMMs: 64-row tiles for narrow outputs
+- Metal benches: K splits and kernel name patterns in mma_gemm_bench, moe_bench shapes
+- matrix-unit GEMM kernel benchmark (mma_gemm_bench)
+- Metal prefill: copy each layer's new keys and values while the GPU runs on
+- Metal prefill GEMMs: a short last token tile in 32-row tiles
+- count the BOS in the prompt length, as llama-bench does
+- CPU prefill GEMMs and the re-measured CPU matrix; SME bit-equality test
+- CPU prefill: bf16 weights on SME; `fast` hybrid of SME and int8
+- CPU prefill: f32 GEMM on the SME tiles; int8 SDOT GEMM options
+- SC117's GSQ-RCO abliterated Qwen3.8-Flash-Next GGUF; REPO:QUANT prefers the model over its draft sidecars
+- allow clippy's const thread-local false positive on Android
+- llama-bench matrix against llama.cpp master; whole-pass GPU prefill
+- Metal decode: unpack Q4/Q4_0/Q4_K/Q5_K nibbles and Q5_K high bits as bytes
+- Whole-pass GPU prefill for Llama, Qwen3, Qwen3.5 and Gemma 3/4
+- Metal prefill plans: flash attention on the SIMD-group matrices
+- MiniMax H3-Image: its VAE is no longer taken for the video VAE.
+- MiniMax-H3 video generation, what was checked and what is not supported.
+- The model catalog has a video kind with text-to-video and image-to-video capabilities, and MiniMax-H3 in it.
+- MiniMax H3 video: text to video and first / last frame to video from the command line (--frames, --last-image), written as Motion JPEG AVI, animated WebP or PNG frames.
+- MiniMax H3 video: the DiT's audio stream and the packed text / keyframe / audio / video sequence with its two schedules, checked against diffusers on tiny checkpoints.
+- MiniMax H3 video: the video VAE, a causal 3D CNN encoder and the ViT decoder with 3-axis RoPE, temporal clips and tiling.
+- LFM3-Omni in the model catalog, docs/models.md, docs/lfm3.md and the README index, with what was checked against the reference.
+- tools/ref_lfm3_omni.py compares features, tokens, logits, greedy text, speech codes and the codec's waveform with the checkpoint's own code.
+- LiquidAI/LFM3-Omni-2B reads audio and images through its own encoders, answers in text on the chat path, and speaks through the depth decoder and the Liquid codec (--speak, -o reply.wav).
+- Streamed chat and completion responses say what they wait for before the first token.
+
 ## [0.0.11](https://github.com/KarpelesLab/oxinfer/compare/v0.0.10...v0.0.11) - 2026-11-14
 
 ### Other
