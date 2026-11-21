@@ -295,6 +295,14 @@ impl<'a> Experts<'a> {
         })
     }
 
+    /// Experts with fused gate/up weights (`[2 * inter, H]` each: gate rows, then up rows).
+    pub fn fused(gate_up: Vec<Lin<'a>>, down: Vec<Lin<'a>>, top_k: usize, mi: usize, act: Act) -> Self {
+        Self {
+            interleaved: false,
+            ..Self::interleaved(gate_up, down, top_k, mi, act)
+        }
+    }
+
     /// Experts whose fused gate/up weights (`[2 * inter, H]` each) have their rows interleaved.
     pub fn interleaved(gate_up: Vec<Lin<'a>>, down: Vec<Lin<'a>>, top_k: usize, mi: usize, act: Act) -> Self {
         Self {

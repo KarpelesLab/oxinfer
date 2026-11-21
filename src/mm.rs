@@ -256,8 +256,8 @@ fn prepare_sources(src: &Sources, files: &ModelFiles, text_hidden: usize) -> Res
     if let Some(pc) = crate::pixtral::PixtralConfig::load_with(args.model, &args.mmproj)? {
         return prepare_pixtral(src, files, text_hidden, pc);
     }
-    if let Some(ic) = crate::inkling_vision::Inkling2VisionConfig::load(args.model)? {
-        return prepare_inkling(src, files, text_hidden, ic);
+    if let Some((ic, side)) = crate::inkling_vision::Inkling2VisionConfig::load_with(args.model, &args.mmproj)? {
+        return prepare_inkling(src, files, text_hidden, ic, side);
     }
     if crate::lfm3_omni::is_omni(args.model) {
         return prepare_lfm3_omni(src, files, text_hidden);
@@ -470,13 +470,26 @@ fn prepare_inkling(
     files: &ModelFiles,
     text_hidden: usize,
     ic: crate::inkling_vision::Inkling2VisionConfig,
+    side: Option<std::path::PathBuf>,
 ) -> Result<(String, Vec<MmFeature>)> {
     let args = src.req;
     if src.n_videos() > 0 || src.n_audios() > 0 {
         bail!("this model takes images only (no video or audio)");
     }
+    if side.is_none() && crate::gguf::is_gguf(args.model) {
+        bail!("no mmproj file beside the GGUF model (give one with --mmproj)");
+    }
     let t = Instant::now();
-    let tower = crate::inkling_vision::Inkling2Vision::load(ic, files, text_hidden)?;
+    // A GGUF model's tower: the mmproj file, under the checkpoint's names.
+    let side = match side {
+        Some(p) => {
+            let mut f = ModelFiles::open(&p, true)?;
+            f.rename(crate::inkling_vision::mmproj_name);
+            Some(f)
+        }
+        None => None,
+    };
+    let tower = crate::inkling_vision::Inkling2Vision::load(ic, side.as_ref().unwrap_or(files), text_hidden)?;
     let (mut text, mut feats) = (String::new(), Vec::new());
     for i in 0..src.n_images() {
         let (what, img) = src.image(i)?;

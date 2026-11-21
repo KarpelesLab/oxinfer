@@ -112,6 +112,9 @@ pub struct EngineOptions {
     /// Maximum tokens in the conversation (prompt and replies); a turn that does not fit fails
     /// and replies stop at the limit. Key `max_context`. Default: unlimited.
     pub max_context: Option<usize>,
+    /// Inkling-2: how the attention caches store keys and values. Key `kv_cache` (`f32`,
+    /// `f16`, `q8`). Default f32 (exact).
+    pub kv_cache: crate::inkling::KvCache,
     /// Qwen3.5/3.8: speculative decoding with the checkpoint's multi-token prediction layer
     /// (greedy and sampled; same output distribution). Also on, unless `draft` is set
     /// (`none`: plain decoding), for the models of [`crate::qwen_mtp::BY_DEFAULT`]. Key `mtp`.
@@ -176,7 +179,7 @@ pub struct EngineOptions {
     /// `0`).
     pub stream_mode: StreamMode,
     /// Mistral Large 4 and Qwen3.5-family models (Qwen3.8-Flash-Next) from GGUF: where the
-    /// vision tower (llama.cpp `mmproj` GGUF: `pixtral`, `qwen3vl_merger`) comes from. Default: an
+    /// vision tower (llama.cpp `mmproj` GGUF: `pixtral`, `qwen3vl_merger`, `inkling2v`) comes from. Default: an
     /// `mmproj*.gguf` beside the model (in its folder or the one above); a file (path or
     /// `org/repo/file`, which is downloaded) also replaces the tower of a safetensors
     /// checkpoint; `none` disables image input. Key `mmproj` (`auto`, `none`, or the file).
@@ -400,6 +403,7 @@ impl Default for EngineOptions {
             device: DevicePref::Auto,
             prefill_chunk: None,
             max_context: None,
+            kv_cache: crate::inkling::KvCache::F32,
             mtp: false,
             mtp_from: None,
             mtp_fixed: false,
@@ -473,6 +477,7 @@ impl EngineOptions {
         "device",
         "prefill_chunk",
         "max_context",
+        "kv_cache",
         "mtp",
         "mtp_from",
         "mtp_fixed",
@@ -542,6 +547,7 @@ impl EngineOptions {
             }
             "prefill_chunk" => self.prefill_chunk = parse_opt_usize(key, value)?,
             "max_context" => self.max_context = parse_opt_usize(key, value)?,
+            "kv_cache" => self.kv_cache = crate::inkling::KvCache::parse(value)?,
             "mtp" => self.mtp = parse_bool(key, value)?,
             "mtp_from" => {
                 self.mtp_from = opt_str(value);
@@ -1999,6 +2005,7 @@ impl Engine {
                 }
                 decision = None;
                 let mut model = Inkling2Model::load(crate::inkling::Inkling2Config::load(&dir)?, files, opts.quant)?;
+                model.kv = opts.kv_cache;
                 if let Some(so) = stream.clone() {
                     streamer = Some(crate::stream::attach_inkling(&mut model, files, so)?);
                 }
@@ -2781,7 +2788,13 @@ impl Engine {
                 Family::Mistral4 => {
                     bail!("this checkpoint has no vision tower (for a GGUF model: no mmproj file beside it; set the mmproj option)")
                 }
-                Family::Inkling2 if crate::inkling_vision::Inkling2VisionConfig::load(&self.info.path)?.is_some() => {}
+                Family::Inkling2 if self.mmproj == crate::pixtral::Mmproj::None => bail!("image input is disabled (mmproj none)"),
+                Family::Inkling2 if crate::inkling_vision::Inkling2VisionConfig::load_with(&self.info.path, &self.mmproj)?.is_some() => {}
+                Family::Inkling2 if crate::gguf::is_gguf(&self.info.path) => {
+                    bail!(
+                        "this checkpoint has no vision tower (for a GGUF model: no inkling2v mmproj file beside it; set the mmproj option)"
+                    )
+                }
                 _ => bail!("attachments are supported for Gemma 4 and Qwen3.5-family vision models only"),
             }
             let req = mm::MmRequest {
@@ -3758,6 +3771,7 @@ mod tests {
                 "qos" => "background",
                 "draft_device" => "gpu",
                 "prefill_gemm" => "sme",
+                "kv_cache" => "q8",
                 "mtp_from" | "draft" | "cache_dir" | "decision_from" => "x",
                 "interventions" => r#"{"neurons":[{"layer":1,"neuron":2,"op":"zero"}]}"#,
                 _ => "1",

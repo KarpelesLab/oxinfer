@@ -115,6 +115,7 @@ pub fn type_size(t: u32) -> Option<(usize, usize)> {
         34 => (256, 54),  // TQ1_0
         35 => (256, 66),  // TQ2_0
         39 => (32, 17),   // MXFP4
+        40 => (64, 36),   // NVFP4
         41 => (128, 18),  // Q1_0
         42 => (64, 18),   // Q2_0
         142 => (128, 34), // PQ2_0 (PrismML fork)
@@ -328,8 +329,10 @@ impl Header {
             "kimi-k3" => "kimi_k3",
             "kimi-k31" => "kimi_k31",
             "nemotron_h" | "nemotron_h_moe" => "nemotron_h",
+            "inkling2" => "inkling2",
+            "inkling2_loop" => "inkling2_loop",
             a => bail!(
-                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, qwen3vl, llama, granite, gemma4, mistral-large4, deepseek4, deepseek41, minimax-m2, minimax-m3, glm5-next, glm-dsa, nemotron_h, nemotron_h_moe and qwen2 are)"
+                "GGUF architecture {a:?} is not supported (qwen35, qwen35moe, qwen4exp, qwen3, qwen3vl, llama, granite, gemma4, mistral-large4, deepseek4, deepseek41, minimax-m2, minimax-m3, glm5-next, glm-dsa, nemotron_h, nemotron_h_moe, inkling2, inkling2_loop and qwen2 are)"
             ),
         })
     }
@@ -362,6 +365,9 @@ impl Header {
         }
         if mt == "nemotron_h" {
             return crate::nemotron::gguf_config(self);
+        }
+        if crate::inkling::is_model_type(mt) {
+            return crate::inkling::gguf_config(self);
         }
         let granite = mt == "granite";
         let llama = mt == "llama" || granite;
@@ -831,7 +837,8 @@ impl Header {
         }
         // Llama 3 and Mistral's tekken (as their tokenizer.json): no normalizer, and a word found
         // whole in the vocabulary is one token whatever the merges say (`ignore_merges`).
-        let whole_words = matches!(pre, "llama-bpe" | "glm4" | "tekken" | "tekken-num3" | "pixtral");
+        // (Inkling-2: the GPT-4o split of MiniMax's, `ignore_merges`, no normalizer.)
+        let whole_words = matches!(pre, "llama-bpe" | "glm4" | "tekken" | "tekken-num3" | "pixtral" | "inkling2");
         let tekken = matches!(pre, "tekken" | "tekken-num3" | "pixtral");
         // DeepSeek V3 / V4: digits in groups of up to three and CJK runs split off first, no
         // normalizer.
@@ -853,7 +860,7 @@ impl Header {
                 r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
             }
             // MiniMax M2 / M3 (as its tokenizer.json): the GPT-4o split with digits in threes.
-            "minimax-m2" => {
+            "minimax-m2" | "inkling2" => {
                 r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
             }
             "qwen2" => r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
@@ -863,7 +870,7 @@ impl Header {
             }
             "granite-docling" => r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+",
             p => bail!(
-                "GGUF pre-tokenizer {p:?} is not supported (qwen35, qwen2, llama-bpe, granite-docling, tekken, tekken-num3, deepseek-v3, joyai-llm and minimax-m2 are)"
+                "GGUF pre-tokenizer {p:?} is not supported (qwen35, qwen2, llama-bpe, granite-docling, tekken, tekken-num3, deepseek-v3, joyai-llm, minimax-m2 and inkling2 are)"
             ),
         };
         let tokens = self
@@ -1025,6 +1032,10 @@ pub fn hf_tensor(arch: &str, t: &Tensor, n_layers: usize) -> Option<(String, Vec
     }
     if matches!(arch, "kimi-k3" | "kimi-k31") {
         return crate::kimi::gguf_name(&t.name, &t.ne);
+    }
+    // Inkling-2: the release's naming.
+    if matches!(arch, "inkling2" | "inkling2_loop") {
+        return crate::inkling::gguf_name(&t.name, &t.ne);
     }
     // Nemotron-H: transformers' naming.
     if matches!(arch, "nemotron_h" | "nemotron_h_moe") {

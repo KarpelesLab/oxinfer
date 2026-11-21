@@ -65,7 +65,30 @@ const P: &str = "model.llm.";
 
 /// Whether `model_type` is one of this family's.
 pub fn is_model_type(mt: &str) -> bool {
-    matches!(mt, "inkling2" | "inkling2_text")
+    matches!(mt, "inkling2" | "inkling2_text" | "inkling2_loop" | "inkling2_loop_text")
+}
+
+/// The looped middle of `inkling2_loop` (Inkling-2-Mini): layers `start..end` run `passes`
+/// times with shared weights. Every pass after the first restarts from the stream and the block
+/// states entering `start`, and its layers mix into their inputs messages read from the previous
+/// pass (`gate_rank`: the rank of the gates that mix them).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LoopConfig {
+    pub start: usize,
+    pub end: usize,
+    pub passes: usize,
+    pub gate_rank: usize,
+}
+
+/// One application of a layer in the unrolled sequence of a pass through the model.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Step {
+    /// The layer whose weights run.
+    pub layer: usize,
+    /// The pass through the loop (0 outside it).
+    pub pass: usize,
+    /// The cache slot (keys, values and convolution inputs) of this application.
+    pub slot: usize,
 }
 
 /// The head layout of one kind of layer.
@@ -109,12 +132,18 @@ pub struct Inkling2Config {
     pub rms_norm_eps: f64,
     /// The placeholder token of an image feature.
     pub image_token_id: u32,
+    /// The looped layers (`inkling2_loop`).
+    pub loop_cfg: Option<LoopConfig>,
 }
 
 impl Inkling2Config {
-    /// The config of a checkpoint folder (`config.json`).
+    /// The config of a checkpoint folder (`config.json`) or GGUF file.
     pub fn load(dir: &Path) -> Result<Self> {
-        let raw: Value = serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?;
+        let raw: Value = if crate::gguf::is_gguf(dir) {
+            crate::gguf::header(dir)?.config_json()?
+        } else {
+            serde_json::from_slice(&crate::fsx::read(&dir.join("config.json"))?)?
+        };
         Self::from_json(&raw)
     }
 
@@ -199,7 +228,7 @@ impl Inkling2Config {
             }
         }
         let vocab_size = int(&["vocab_size"], Some(201024))?;
-        let c = Self {
+        let mut c = Self {
             hidden_size: int(&["hidden_size"], None)?,
             num_hidden_layers: n,
             vocab_size,
@@ -225,7 +254,41 @@ impl Inkling2Config {
             final_logit_softcapping: num(&["final_logit_softcapping"], 30.0)?,
             rms_norm_eps: num(&["rms_norm_eps"], 1e-6)?,
             image_token_id: raw.get("image_token_id").and_then(Value::as_u64).unwrap_or(200054) as u32,
+            loop_cfg: None,
         };
+        if mt.starts_with("inkling2_loop") || t.get("loop_config").is_some_and(Value::is_object) {
+            // The release's `loop_config`, or transformers' `loop_*` fields (its defaults otherwise).
+            let lc = t.get("loop_config").filter(|v| v.is_object());
+            let pick = |release: &str, tf: &str, default: usize| -> Result<usize> {
+                match lc.and_then(|o| o.get(release)).or_else(|| t.get(tf)).filter(|v| !v.is_null()) {
+                    Some(v) => v
+                        .as_u64()
+                        .map(|v| v as usize)
+                        .with_context(|| format!("config: {release} is not an integer")),
+                    None => Ok(default),
+                }
+            };
+            if lc.and_then(|o| o.get("is_varloop")).and_then(Value::as_bool) == Some(true) {
+                bail!("Inkling-2: a variable loop (is_varloop) is not supported");
+            }
+            let l = LoopConfig {
+                start: pick("core_start", "loop_layer_index_start", 6)?,
+                end: pick("core_end", "loop_layer_index_end", 18)?,
+                passes: pick("num_passes", "loop_num_passes", 3)?,
+                gate_rank: pick("gate_rank", "loop_gate_rank", 64)?,
+            };
+            if l.passes == 0
+                || l.start == 0
+                || l.start >= l.end
+                || l.end > n
+                || !l.start.is_multiple_of(block)
+                || !l.end.is_multiple_of(block)
+                || l.gate_rank == 0
+            {
+                bail!("Inkling-2: invalid loop {l:?} for {n} layers in blocks of {block}");
+            }
+            c.loop_cfg = Some(l);
+        }
         if c.conv_kernel_size == 0 || c.n_layers_per_attn_res_block == 0 || c.sliding_window_size == 0 {
             bail!("Inkling-2: a kernel, a window or a block of 0");
         }
@@ -239,6 +302,232 @@ impl Inkling2Config {
     pub fn heads(&self, l: usize) -> Heads {
         if self.sliding[l] { self.swa } else { self.full }
     }
+
+    /// Whether layer `l` is in the loop.
+    pub fn looped(&self, l: usize) -> bool {
+        self.loop_cfg.is_some_and(|c| (c.start..c.end).contains(&l))
+    }
+
+    /// The layers in the order a pass runs them: the layers before the loop, the loop `passes`
+    /// times, the rest. The first pass through the loop uses the layers' own cache slots, the
+    /// others slots after them (as transformers' and llama.cpp's caches).
+    pub fn steps(&self) -> Vec<Step> {
+        let n = self.num_hidden_layers;
+        let one = |layer| Step {
+            layer,
+            pass: 0,
+            slot: layer,
+        };
+        let Some(c) = self.loop_cfg else {
+            return (0..n).map(one).collect();
+        };
+        let core = c.end - c.start;
+        let mut v: Vec<Step> = (0..c.end).map(one).collect();
+        for pass in 1..c.passes {
+            v.extend((c.start..c.end).map(|layer| Step {
+                layer,
+                pass,
+                slot: n + (pass - 1) * core + layer - c.start,
+            }));
+        }
+        v.extend((c.end..n).map(one));
+        v
+    }
+
+    /// Cache slots of a session (one per layer application of a pass).
+    pub fn n_slots(&self) -> usize {
+        self.num_hidden_layers + self.loop_cfg.map_or(0, |c| (c.passes - 1) * (c.end - c.start))
+    }
+}
+
+/// The release's `config.json` of a GGUF file of llama.cpp's `inkling2` / `inkling2_loop`
+/// architectures.
+pub(crate) fn gguf_config(hd: &crate::gguf::Header) -> Result<Value> {
+    use crate::gguf::Value as G;
+    let arch = hd.arch().to_string();
+    let get = |k: &str| hd.get(&format!("{arch}.{k}"));
+    let int = |k: &str| get(k).and_then(G::as_u64).map(|v| v as usize);
+    let need = |k: &str| int(k).with_context(|| format!("GGUF metadata has no {arch}.{k}"));
+    let float = |k: &str| {
+        get(k)
+            .and_then(G::as_f64)
+            .with_context(|| format!("GGUF metadata has no {arch}.{k}"))
+    };
+    // The loop: llama.cpp's `inkling2_loop` (`loop.start`, ...), or unsloth's `inkling2` files
+    // (`num_loops`, `loop.core_start`, ...), whose block count and per-layer arrays cover the
+    // layer applications of a pass (the loop unrolled), not the layers.
+    let lp = if arch == "inkling2_loop" {
+        if matches!(get("loop.varying"), Some(G::Bool(true))) {
+            bail!("GGUF {arch}: a variable loop (loop.varying) is not supported");
+        }
+        Some((
+            need("loop.start")?,
+            need("loop.end")?,
+            need("loop.count")?,
+            need("loop.gate_rank")?,
+            false,
+        ))
+    } else if let Some(p) = int("num_loops").filter(|&p| p > 1) {
+        Some((need("loop.core_start")?, need("loop.core_end")?, p, need("loop.gate_rank")?, true))
+    } else {
+        None
+    };
+    let applications = need("block_count")?;
+    let n = match lp {
+        Some((s, e, p, _, true)) => applications
+            .checked_sub((p - 1) * (e.saturating_sub(s)))
+            .context("GGUF: a loop longer than the blocks")?,
+        _ => applications,
+    };
+    // Entry of layer `l` in a per-layer array of `len` (per application when unrolled).
+    let entry = |l: usize, len: usize| -> usize {
+        match lp {
+            Some((s, e, p, _, true)) if len == applications && l >= e => l + (p - 1) * (e - s),
+            _ => l,
+        }
+    };
+    let flags: Vec<bool> = get("attention.sliding_window_pattern")
+        .and_then(G::as_array)
+        .context("GGUF metadata has no attention.sliding_window_pattern")?
+        .iter()
+        .map(|v| matches!(v, G::Bool(true)))
+        .collect();
+    if flags.len() != n && flags.len() != applications {
+        bail!("GGUF {arch}: {} sliding-window flags for {n} layers", flags.len());
+    }
+    let pattern: Vec<bool> = (0..n).map(|l| flags[entry(l, flags.len())]).collect();
+    // Per-layer head counts: those of a full layer and of a sliding one.
+    let per_layer = |k: &str| -> Result<Vec<usize>> {
+        match get(k) {
+            Some(G::Array(a)) if a.len() == n || a.len() == applications => {
+                Ok((0..n).map(|l| a[entry(l, a.len())].as_u64().unwrap_or(0) as usize).collect())
+            }
+            Some(v) if v.as_u64().is_some() => Ok(vec![v.as_u64().unwrap() as usize; n]),
+            _ => bail!("GGUF metadata has no {arch}.{k} for {n} layers"),
+        }
+    };
+    let (heads, kv) = (per_layer("attention.head_count")?, per_layer("attention.head_count_kv")?);
+    let of = |v: &[usize], swa: bool| (0..n).find(|&l| pattern[l] == swa).map_or(v[0], |l| v[l]);
+    let head_dim = need("attention.key_length")?;
+    let mut text = serde_json::json!({
+        "hidden_size": need("embedding_length")?,
+        "num_hidden_layers": n,
+        "vocab_size": need("vocab_size")?,
+        "unpadded_vocab_size": need("vocab_size_unpadded")?,
+        "num_attention_heads": of(&heads, false),
+        "num_key_value_heads": of(&kv, false),
+        "head_dim": head_dim,
+        "swa_num_attention_heads": of(&heads, true),
+        "swa_num_key_value_heads": of(&kv, true),
+        "swa_head_dim": int("attention.key_length_swa").unwrap_or(head_dim),
+        "sliding_window_size": need("attention.sliding_window")?,
+        "local_layer_ids": (0..n).filter(|&l| pattern[l]).collect::<Vec<_>>(),
+        "d_rel": need("attention.relative_length")?,
+        "rel_extent": need("attention.relative_extent")?,
+        "log_scaling_n_floor": need("attention.log_scale_floor")?,
+        "log_scaling_alpha": float("attention.log_scale_alpha")?,
+        "qk_l2_clip_threshold": float("attention.qk_clip")?,
+        "rel_l2_clip_threshold": float("attention.relative_clip")?,
+        "sconv_kernel_size": need("shortconv.l_cache")?,
+        "n_layers_per_attn_res_block": need("attn_res.block_size")?,
+        "n_routed_experts": need("expert_count")?,
+        "num_experts_per_tok": need("expert_used_count")?,
+        "n_shared_experts": 0,
+        "moe_intermediate_size": need("expert_feed_forward_length")?,
+        "route_scale": float("expert_weights_scale")?,
+        "mlp_gate_softcap": float("activation.situ_beta")?,
+        "mlp_up_softcap": float("activation.situ_linear_beta")?,
+        "final_logit_softcapping": float("final_logit_softcapping")?,
+        "rms_norm_eps": float("attention.layer_norm_rms_epsilon")?,
+    });
+    let mut mt = arch.clone();
+    if let Some((s, e, p, rank, _)) = lp {
+        text["loop_config"] = serde_json::json!({
+            "core_start": s, "core_end": e, "num_passes": p, "gate_rank": rank, "is_varloop": false,
+        });
+        mt = "inkling2_loop".into();
+    }
+    Ok(serde_json::json!({"model_type": mt, "text_config": text}))
+}
+
+/// The release's name (`model.llm.*`) and shape of a tensor of a GGUF file of llama.cpp's
+/// `inkling2` / `inkling2_loop` architectures, or None for tensors the loader does not read.
+/// The relative-bias bank is transposed there (it goes under `..._t`); the experts' gate and up
+/// rows are not interleaved (`gate_up_proj`, `down_proj`); each looped layer has its four
+/// message queries (`loop_msg_query`).
+pub(crate) fn gguf_name(name: &str, ne: &[usize]) -> Option<(String, Vec<usize>)> {
+    let shape: Vec<usize> = ne.iter().rev().copied().collect();
+    let top = match name {
+        "token_embd.weight" => Some("embed.weight"),
+        "token_embd_norm.weight" => Some("embed_norm.weight"),
+        "output.weight" => Some("unembed.weight"),
+        "output_norm.weight" => Some("norm.weight"),
+        "output_res_query.weight" => Some("attn_res.output_query"),
+        // unsloth's files: the release's two tables of message queries.
+        "loop_res_query.weight" => Some("middle_cycle_cross_pass_queries"),
+        "loop_kv_res_query.weight" => Some("middle_cycle_cross_pass_kv_queries"),
+        _ => None,
+    };
+    if let Some(t) = top {
+        return Some((format!("{P}{t}"), shape));
+    }
+    let (l, rest) = name.strip_prefix("blk.")?.split_once('.')?;
+    let l: usize = l.parse().ok()?;
+    // ggml `{kernel, channels}` -> a depthwise Conv1d's `[channels, 1, kernel]`.
+    let conv_shape = || vec![ne[1], 1, ne[0]];
+    let (n, sh): (String, Vec<usize>) = match rest {
+        "attn_q.weight" => ("attn.wq_du.weight".into(), shape),
+        "attn_k.weight" => ("attn.wk_dv.weight".into(), shape),
+        "attn_v.weight" => ("attn.wv_dv.weight".into(), shape),
+        "attn_output.weight" => ("attn.wo_ud.weight".into(), shape),
+        "attn_gate.weight" => ("attn.gate_attn.weight".into(), shape),
+        "attn_rel.weight" => ("attn.wr_du.weight".into(), shape),
+        "attn_sink_proj.weight" => ("attn.attn_sink_proj.weight".into(), shape),
+        "attn_q_clip.weight" => ("attn.q_l2_clip.scale".into(), shape),
+        "attn_rel_clip.weight" => ("attn.rel_l2_clip.scale".into(), shape),
+        "attn_rel_bias.weight" => ("attn.rel_logits_proj.proj_t".into(), shape),
+        "attn_k_conv.weight" => ("attn.k_sconv.weight".into(), conv_shape()),
+        "attn_v_conv.weight" => ("attn.v_sconv.weight".into(), conv_shape()),
+        "attn_k_conv_proj.weight" => ("attn.k_sconv.weight_proj".into(), shape),
+        "attn_v_conv_proj.weight" => ("attn.v_sconv.weight_proj".into(), shape),
+        "attn_post_conv.weight" => ("attn_sconv.weight".into(), conv_shape()),
+        "ffn_post_conv.weight" => ("mlp_sconv.weight".into(), conv_shape()),
+        "attn_norm.weight" => ("attn_norm.weight".into(), shape),
+        "attn_q_inp_norm.weight" => ("q_input_norm.weight".into(), shape),
+        "attn_k_inp_norm.weight" => ("k_input_norm.weight".into(), shape),
+        "attn_v_inp_norm.weight" => ("v_input_norm.weight".into(), shape),
+        "ffn_norm.weight" => ("mlp_norm.weight".into(), shape),
+        "ffn_gate_inp.weight" => ("mlp.gate.weight".into(), shape),
+        "exp_probs_b.bias" => ("mlp.gate.bias".into(), shape),
+        "ffn_gate_up_exps.weight" => ("mlp.experts.gate_up_proj".into(), shape),
+        "ffn_down_exps.weight" => ("mlp.experts.down_proj".into(), shape),
+        "ffn_gate_up_exps.scale" => ("mlp.experts.gate_up_scale".into(), shape),
+        "ffn_down_exps.scale" => ("mlp.experts.down_scale".into(), shape),
+        "loop_msg_query.weight" => ("loop_msg_query".into(), shape),
+        // (`attn_queries.{i}` belongs to layer `i + 1`.)
+        "attn_res_query.weight" if l > 0 => return Some((format!("{P}attn_res.attn_queries.{}", l - 1), shape)),
+        "ffn_res_query.weight" => return Some((format!("{P}attn_res.mlp_queries.{l}"), shape)),
+        r => {
+            // llama.cpp's `loop_q_ctrl_down`, unsloth's `loop_attn_down`.
+            let r = r.strip_prefix("loop_")?.strip_suffix(".weight")?;
+            let (kind, part) = r.split_once("_ctrl_").or_else(|| r.rsplit_once('_'))?;
+            let kind = match kind {
+                "q" | "attn" => "attn",
+                "k" => "k",
+                "v" => "v",
+                "ffn" | "mlp" => "mlp",
+                _ => return None,
+            };
+            let part = match part {
+                "down" => "down_weight",
+                "gain" => "gain_weight",
+                "forget" => "forget_weight",
+                _ => return None,
+            };
+            (format!("controllers.{kind}.{part}"), shape)
+        }
+    };
+    Some((format!("{P}layers.{l}.{n}"), sh))
 }
 
 /// Weight streaming for a checkpoint that does not fit in memory (as Mistral Large 4).
@@ -288,7 +577,25 @@ enum InNorm {
     Qkv(Vec<f32>, Vec<f32>, Vec<f32>),
 }
 
+/// A message gate of a looped layer: `(1 - tanh(forget g)) x + tanh(gain g) m` for its input `x`
+/// and message `m`, where `g = down [rms(x); rms(m)]`.
+struct Gate<'a> {
+    down: Lin<'a>,   // [rank, 2 H]
+    forget: Lin<'a>, // [H, rank]
+    gain: Lin<'a>,   // [H, rank]
+}
+
+/// What a looped layer has for the passes after the first.
+struct LoopIn<'a> {
+    /// The gates of the query, key, value and MLP inputs.
+    gates: [Gate<'a>; 4],
+    /// The four message queries (query, key, value, MLP), `[4, H]`.
+    query: Vec<f32>,
+}
+
 struct Layer<'a> {
+    /// The message gates and queries of a looped layer.
+    looped: Option<LoopIn<'a>>,
     /// The first layer of a block: its input becomes a block state.
     boundary: bool,
     /// The attention residual's queries before the attention (none on layer 0): `[H]`, or
@@ -306,12 +613,120 @@ struct Layer<'a> {
     experts: Experts<'a>,
 }
 
+/// How the attention caches store keys and values ([`Inkling2Model::kv`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum KvCache {
+    /// float32 (exact).
+    #[default]
+    F32,
+    /// IEEE half precision (keys are clipped to an L2 norm of 22.6 and values RMS-normed, so
+    /// both fit easily).
+    F16,
+    /// int8 with one float32 scale per 32 values (as ggml's Q8_0, a quarter of float32).
+    Q8,
+}
+
+impl KvCache {
+    /// `f32` (or `auto`), `f16` or `q8`.
+    pub fn parse(s: &str) -> Result<Self> {
+        Ok(match s.trim().to_ascii_lowercase().as_str() {
+            "" | "auto" | "f32" | "fp32" => KvCache::F32,
+            "f16" | "fp16" | "half" => KvCache::F16,
+            "q8" | "q8_0" | "int8" => KvCache::Q8,
+            o => bail!("kv cache {o:?}: f32, f16 or q8"),
+        })
+    }
+    /// Bytes per stored value.
+    pub fn bytes_per_value(self) -> f64 {
+        match self {
+            KvCache::F32 => 4.0,
+            KvCache::F16 => 2.0,
+            KvCache::Q8 => 1.125,
+        }
+    }
+}
+
+/// Rows of keys or values (`[width]` each) in one of the [`KvCache`] layouts.
+#[derive(Clone, Default)]
+struct KvRows {
+    mode: KvCache,
+    f: Vec<f32>,
+    h: Vec<u16>,
+    q: Vec<i8>,
+    /// Q8: one scale per 32 values.
+    s: Vec<f32>,
+}
+
+impl KvRows {
+    fn new(mode: KvCache) -> Self {
+        Self {
+            mode,
+            ..Default::default()
+        }
+    }
+    /// Appends rows (`x.len()` a multiple of 32 for Q8).
+    fn push(&mut self, x: &[f32]) {
+        match self.mode {
+            KvCache::F32 => self.f.extend_from_slice(x),
+            KvCache::F16 => self.h.extend(x.iter().map(|&v| half::f16::from_f32(v).to_bits())),
+            KvCache::Q8 => {
+                for b in x.chunks(32) {
+                    let amax = b.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let d = amax / 127.0;
+                    let inv = if d > 0.0 { 1.0 / d } else { 0.0 };
+                    self.q.extend(b.iter().map(|&v| (v * inv).round() as i8));
+                    self.s.push(d);
+                }
+            }
+        }
+    }
+    /// Drops the first `n` values.
+    fn drop_front(&mut self, n: usize) {
+        match self.mode {
+            KvCache::F32 => drop(self.f.drain(..n)),
+            KvCache::F16 => drop(self.h.drain(..n)),
+            KvCache::Q8 => {
+                self.q.drain(..n);
+                self.s.drain(..n / 32);
+            }
+        }
+    }
+    /// Values `at..at + out.len()` (`at` and the length multiples of 32 for Q8) as float32:
+    /// borrowed when stored so, else decoded into `out`.
+    #[inline]
+    fn get<'b>(&'b self, at: usize, out: &'b mut [f32]) -> &'b [f32] {
+        let n = out.len();
+        match self.mode {
+            KvCache::F32 => &self.f[at..at + n],
+            KvCache::F16 => {
+                for (o, &h) in out.iter_mut().zip(&self.h[at..at + n]) {
+                    *o = crate::quant::f16_to_f32(h);
+                }
+                out
+            }
+            KvCache::Q8 => {
+                for (b, (oc, qc)) in out.chunks_mut(32).zip(self.q[at..at + n].chunks(32)).enumerate() {
+                    let d = self.s[at / 32 + b];
+                    for (o, &q) in oc.iter_mut().zip(qc) {
+                        *o = q as f32 * d;
+                    }
+                }
+                out
+            }
+        }
+    }
+    /// Bytes held.
+    fn bytes(&self) -> usize {
+        self.f.len() * 4 + self.h.len() * 2 + self.q.len() + self.s.len() * 4
+    }
+}
+
 /// The decoding state of one layer.
 #[derive(Clone, Default)]
 struct LayerState {
     /// Clipped keys and normed values of positions `first..`, `[kv * d]` each.
-    k: Vec<f32>,
-    v: Vec<f32>,
+    k: KvRows,
+    v: KvRows,
     first: usize,
     /// The last `kernel - 1` inputs of the key, value, attention and MLP convolutions.
     hist: [Vec<f32>; 4],
@@ -328,6 +743,9 @@ pub struct Inkling2Session {
 pub struct Inkling2Model<'a> {
     pub cfg: Inkling2Config,
     pub quant: Quant,
+    /// How new sessions store their keys and values (Q8 falls back to F16 for heads that are
+    /// not whole blocks of 32).
+    pub kv: KvCache,
     embed: Table<'a>,
     embed_norm: Vec<f32>,
     lm_head: Lin<'a>,
@@ -390,10 +808,15 @@ impl<'a> Loader<'a, '_> {
 
     fn kv_conv(&self, p: &str, ch: usize, kv: usize) -> Result<KvConv<'a>> {
         let k = self.cfg.conv_kernel_size;
-        if self.files.has(&format!("{p}static_w")) {
+        if self.files.has(&format!("{p}weight_proj")) {
             Ok(KvConv::Dynamic {
-                // `[kernel, channels]`, tap index = lag.
-                taps: self.getf(&format!("{p}static_w"), k * ch)?,
+                // `static_w` is `[kernel, channels]`, tap index = lag; a GGUF file has the taps
+                // in the layout of the static convolutions.
+                taps: if self.files.has(&format!("{p}static_w")) {
+                    self.getf(&format!("{p}static_w"), k * ch)?
+                } else {
+                    self.conv(&format!("{p}weight"), ch)?
+                },
                 proj: self.lin_fp(&format!("{p}weight_proj"), kv * k, self.cfg.hidden_size)?,
             })
         } else {
@@ -485,6 +908,55 @@ impl<'a> Loader<'a, '_> {
         }
     }
 
+    /// The bank of relative-bias profiles, `[d_rel, extent]` (a GGUF file stores it transposed,
+    /// under `NAME_t`).
+    fn rel(&self, full: &str, dr: usize, extent: usize) -> Result<Vec<f32>> {
+        let tn = format!("{full}_t");
+        if !self.files.has(&tn) {
+            return self.getf(full, dr * extent);
+        }
+        let w = self.getf(&tn, dr * extent)?;
+        let mut out = vec![0f32; dr * extent];
+        for e in 0..extent {
+            for d in 0..dr {
+                out[d * extent + e] = w[e * dr + d];
+            }
+        }
+        Ok(out)
+    }
+
+    /// The message gates and queries of looped layer `l`.
+    fn looped(&self, l: usize) -> Result<Option<LoopIn<'a>>> {
+        let c = self.cfg;
+        let Some(lc) = c.loop_cfg.filter(|_| c.looped(l)) else {
+            return Ok(None);
+        };
+        let (h, r) = (c.hidden_size, lc.gate_rank);
+        let gate = |kind: &str| -> Result<Gate<'a>> {
+            let p = format!("{P}layers.{l}.controllers.{kind}.");
+            Ok(Gate {
+                down: self.lin_fp(&format!("{p}down_weight"), r, 2 * h)?,
+                forget: self.lin_fp(&format!("{p}forget_weight"), h, r)?,
+                gain: self.lin_fp(&format!("{p}gain_weight"), h, r)?,
+            })
+        };
+        let gates = [gate("attn")?, gate("k")?, gate("v")?, gate("mlp")?];
+        // A GGUF file has each layer's four queries; the release two tables of `[2 * core, H]`:
+        // the query and MLP queries of each looped layer, then its key and value queries.
+        let own = format!("{P}layers.{l}.loop_msg_query");
+        let query = if self.files.has(&own) {
+            self.getf(&own, 4 * h)?
+        } else {
+            let core = lc.end - lc.start;
+            let qm = self.getf(&format!("{P}middle_cycle_cross_pass_queries"), 2 * core * h)?;
+            let kv = self.getf(&format!("{P}middle_cycle_cross_pass_kv_queries"), 2 * core * h)?;
+            let i = l - lc.start;
+            let row = |t: &[f32], j: usize| t[(2 * i + j) * h..(2 * i + j + 1) * h].to_vec();
+            [row(&qm, 0), row(&kv, 0), row(&kv, 1), row(&qm, 1)].concat()
+        };
+        Ok(Some(LoopIn { gates, query }))
+    }
+
     fn attn(&self, l: usize) -> Result<Attn<'a>> {
         let c = self.cfg;
         let (h, hd, dr) = (c.hidden_size, c.heads(l), c.d_rel);
@@ -504,7 +976,7 @@ impl<'a> Loader<'a, '_> {
             o: self.lin(&format!("{ap}wo_ud.weight"), h, w)?,
             q_scale: self.getf(&format!("{ap}q_l2_clip.scale"), w)?,
             r_scale: self.getf(&format!("{ap}rel_l2_clip.scale"), hd.heads * dr)?,
-            rel: self.getf(&format!("{ap}rel_logits_proj.proj"), dr * extent)?,
+            rel: self.rel(&format!("{ap}rel_logits_proj.proj"), dr, extent)?,
             k_conv: self.kv_conv(&format!("{ap}k_sconv."), kw, hd.kv_heads)?,
             v_conv: self.kv_conv(&format!("{ap}v_sconv."), kw, hd.kv_heads)?,
         })
@@ -541,14 +1013,34 @@ impl<'a> Loader<'a, '_> {
             linear_beta: c.mlp_up_softcap as f32,
         };
         let ep = format!("{lp}mlp.experts.");
-        let experts = Experts::interleaved(
-            self.experts(&format!("{ep}w13_weight"), 2 * mi, h)?,
-            self.experts(&format!("{ep}w2_weight"), h, mi)?,
-            k,
-            mi,
-            act,
-        );
+        let experts = if self.files.has(&format!("{ep}gate_up_proj")) {
+            // A GGUF file: gate rows, then up rows; unsloth's files scale each expert's outputs
+            // (`.scale`, one factor per expert).
+            let load = |name: &str, n_out: usize, n_in: usize| -> Result<Vec<Lin<'a>>> {
+                let mut v = crate::model::load_lin_experts(self.files, &format!("{ep}{name}_proj"), ne, n_out, n_in, self.quant)?;
+                let sn = format!("{ep}{name}_scale");
+                if self.files.has(&sn) {
+                    for (l, f) in v.iter_mut().zip(self.getf(&sn, ne)?) {
+                        match &mut l.w {
+                            crate::model::Weight::Gguf(m) => m.set_factor(f).with_context(|| sn.clone())?,
+                            _ => bail!("{sn}: the experts are not in a GGUF format"),
+                        }
+                    }
+                }
+                Ok(v)
+            };
+            Experts::fused(load("gate_up", 2 * mi, h)?, load("down", h, mi)?, k, mi, act)
+        } else {
+            Experts::interleaved(
+                self.experts(&format!("{ep}w13_weight"), 2 * mi, h)?,
+                self.experts(&format!("{ep}w2_weight"), h, mi)?,
+                k,
+                mi,
+                act,
+            )
+        };
         Ok(Layer {
+            looped: self.looped(l)?,
             boundary: l.is_multiple_of(c.n_layers_per_attn_res_block),
             attn_query,
             mlp_query: self.getf(&format!("{P}attn_res.mlp_queries.{l}"), h)?,
@@ -687,6 +1179,7 @@ impl<'a> Inkling2Model<'a> {
             layers,
             cfg,
             quant,
+            kv: KvCache::F32,
             stream: None,
         };
         // Routed experts that cannot all stay in memory are read through the page cache as they
@@ -704,12 +1197,23 @@ impl<'a> Inkling2Model<'a> {
     pub fn new_session(&self) -> Inkling2Session {
         let c = &self.cfg;
         let back = c.conv_kernel_size - 1;
+        let mut slot_layer = vec![0usize; c.n_slots()];
+        for s in c.steps() {
+            slot_layer[s.slot] = s.layer;
+        }
         Inkling2Session {
-            layers: (0..c.num_hidden_layers)
+            layers: slot_layer
+                .into_iter()
                 .map(|l| {
                     let hd = c.heads(l);
                     let kw = hd.kv_heads * hd.head_dim;
+                    let mode = match self.kv {
+                        KvCache::Q8 if !hd.head_dim.is_multiple_of(32) => KvCache::F16,
+                        m => m,
+                    };
                     LayerState {
+                        k: KvRows::new(mode),
+                        v: KvRows::new(mode),
                         hist: [
                             vec![0f32; back * kw],
                             vec![0f32; back * kw],
@@ -723,6 +1227,64 @@ impl<'a> Inkling2Model<'a> {
             pos: 0,
             iv: Default::default(),
         }
+    }
+
+    /// Measurements only: puts `n` positions of placeholder keys and values (pseudo-random,
+    /// clipped and normed like real ones) in the caches of a fresh session, as a context of `n`
+    /// tokens would (the sliding-window layers keep their last window), so that the memory and
+    /// the speed of decoding at that context can be measured without running the prompt. The
+    /// output is meaningless.
+    #[doc(hidden)]
+    pub fn fill_for_bench(&self, sess: &mut Inkling2Session, n: usize) {
+        let c = &self.cfg;
+        let mut slot_layer = vec![0usize; c.n_slots()];
+        for s in c.steps() {
+            slot_layer[s.slot] = s.layer;
+        }
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+        };
+        for (st, &l) in sess.layers.iter_mut().zip(&slot_layer) {
+            let hd = c.heads(l);
+            let kw = hd.kv_heads * hd.head_dim;
+            let keep = if c.sliding[l] { n.min(c.sliding_window_size) } else { n };
+            let mut row = vec![0f32; kw];
+            for _ in 0..keep {
+                for x in row.iter_mut() {
+                    *x = rnd();
+                }
+                st.k.push(&row);
+                st.v.push(&row);
+            }
+            st.first = n - keep;
+        }
+        sess.pos = n;
+    }
+
+    /// Bytes of the attention caches of `sess`.
+    pub fn kv_bytes(&self, sess: &Inkling2Session) -> usize {
+        sess.layers.iter().map(|l| l.k.bytes() + l.v.bytes()).sum()
+    }
+
+    /// Attention-cache bytes per token of context, once the sliding-window layers are full (the
+    /// full-attention applications: every pass of a looped layer keeps its own cache), and the
+    /// most the sliding-window applications hold whatever the context.
+    pub fn kv_bytes_per_token(&self, kv: KvCache) -> (f64, f64) {
+        let c = &self.cfg;
+        let (mut full, mut sliding) = (0f64, 0f64);
+        for s in c.steps() {
+            let hd = c.heads(s.layer);
+            let per = 2.0 * (hd.kv_heads * hd.head_dim) as f64 * kv.bytes_per_value();
+            if c.sliding[s.layer] {
+                // At most twice the window is kept (it is cut a window at a time).
+                sliding += per * (2 * c.sliding_window_size) as f64;
+            } else {
+                full += per;
+            }
+        }
+        (full, sliding)
     }
 
     fn dense_lins<'s>(&'s self, l: &'s Layer<'a>) -> Vec<&'s Lin<'a>> {
@@ -739,7 +1301,9 @@ impl<'a> Inkling2Model<'a> {
     /// Weight bytes read per decoded token (the routed experts at top-k).
     pub fn streamed_bytes(&self) -> usize {
         let mut n = self.lm_head.bytes();
-        for l in &self.layers {
+        // (A looped layer is read once per pass.)
+        for s in self.cfg.steps() {
+            let l = &self.layers[s.layer];
             n += self.dense_lins(l).iter().map(|w| w.bytes()).sum::<usize>();
             n += l.experts.bytes_per_token();
         }
@@ -897,10 +1461,36 @@ impl<'a> Inkling2Model<'a> {
         // The inputs of the first layer of each block so far, RMS-normed (all that reads them).
         let mut states: Vec<Vec<f32>> = Vec::new();
         let conv_norm = 1.0 / ((c.conv_kernel_size + 1) as f32).sqrt();
-        for (l, layer) in self.layers.iter().enumerate() {
-            capture(l, &x);
+        let steps = c.steps();
+        // The stream and the number of block states entering the loop.
+        let mut pre: (Vec<f32>, usize) = (Vec::new(), 0);
+        // What the messages of a pass are read from: the previous pass's block states after its
+        // first one, and its output.
+        let mut bank: Option<(Vec<Vec<f32>>, Vec<f32>)> = None;
+        for (si, step) in steps.iter().enumerate() {
+            let l = step.layer;
+            let layer = &self.layers[l];
+            if let Some(lc) = c.loop_cfg
+                && l == lc.start
+            {
+                if step.pass == 0 {
+                    pre = (x.clone(), states.len());
+                } else {
+                    // Every pass starts again from the loop's input.
+                    let prev = states.split_off(pre.1 + 1);
+                    states.truncate(pre.1);
+                    bank = Some((prev, std::mem::replace(&mut x, pre.0.clone())));
+                }
+            }
+            capture(si, &x);
             let _unit = crate::stream::enter(&self.stream, l);
-            let st = &mut sess.layers[l];
+            let st = &mut sess.layers[step.slot];
+            // The messages of this layer (query, key, value, MLP), in the passes after the first.
+            let msgs = match (&bank, &layer.looped) {
+                (Some((bs, bx)), Some(li)) if step.pass > 0 => Some((li, mix(bs, bx, &li.query, h))),
+                _ => None,
+            };
+            let gated = |i: usize, src: &[f32]| -> Option<Vec<f32>> { msgs.as_ref().map(|(li, m)| self.gate(&li.gates[i], src, &m[i], t)) };
             // What the attention reads: the layer's input, or mixes of it with the block states.
             let mixed = layer.attn_query.as_ref().map(|q| mix(&states, &x, q, h));
             let input = |i: usize| -> &[f32] {
@@ -915,13 +1505,22 @@ impl<'a> Inkling2Model<'a> {
                 y
             };
             let mut a = vec![0f32; t * h];
-            match &layer.ln_in {
-                InNorm::One(w) => {
+            match (&layer.ln_in, msgs.is_some()) {
+                (InNorm::One(w), false) => {
                     let xn = normed(w, input(0));
                     self.attention(&layer.attn, [&xn, &xn, &xn], t, start, st, &mut a);
                 }
-                InNorm::Qkv(wq, wk, wv) => {
-                    let (xq, xk, xv) = (normed(wq, input(0)), normed(wk, input(1)), normed(wv, input(2)));
+                // The messages make the query, key and value inputs of a sliding layer differ.
+                (InNorm::One(w), true) => {
+                    let [xq, xk, xv] = [0, 1, 2].map(|i| normed(w, &gated(i, input(0)).unwrap()));
+                    self.attention(&layer.attn, [&xq, &xk, &xv], t, start, st, &mut a);
+                }
+                (InNorm::Qkv(wq, wk, wv), m) => {
+                    let src = |i: usize| match m {
+                        true => std::borrow::Cow::Owned(gated(i, input(i)).unwrap()),
+                        false => std::borrow::Cow::Borrowed(input(i)),
+                    };
+                    let (xq, xk, xv) = (normed(wq, &src(0)), normed(wk, &src(1)), normed(wv, &src(2)));
                     self.attention(&layer.attn, [&xq, &xk, &xv], t, start, st, &mut a);
                 }
             }
@@ -934,11 +1533,14 @@ impl<'a> Inkling2Model<'a> {
             } else {
                 add_inplace(&mut x, &a);
             }
-            point(2 * l + 1, &mut x);
+            point(2 * si + 1, &mut x);
             let mut hn = mix(&states, &x, &layer.mlp_query, h).pop().unwrap();
+            if let Some(g) = gated(3, &hn) {
+                hn = g;
+            }
             rmsnorm_f32w_rows_inplace(&mut hn, h, &layer.ln_post, eps);
             let mut o = vec![0f32; t * h];
-            let hook = iv.as_ref().and_then(|s| s.hook(l, start));
+            let hook = iv.as_ref().and_then(|s| s.hook(si, start));
             {
                 let need = |ids: &[usize]| {
                     if let Some(s) = &self.stream {
@@ -950,12 +1552,39 @@ impl<'a> Inkling2Model<'a> {
             }
             short_conv(&layer.mlp_conv, None, &mut st.hist[3], &mut o, h, conv_norm);
             add_inplace(&mut x, &o);
-            point(2 * l + 2, &mut x);
+            point(2 * si + 2, &mut x);
         }
-        capture(self.layers.len(), &x);
+        capture(steps.len(), &x);
         let mut out = mix(&states, &x, &self.final_query, h).pop().unwrap();
         rmsnorm_f32w_rows_inplace(&mut out, h, &self.final_norm, eps);
         sess.pos += t;
+        out
+    }
+
+    /// A message gate over the input `x` and the message `m` (`[t, H]` each).
+    fn gate(&self, g: &Gate, x: &[f32], m: &[f32], t: usize) -> Vec<f32> {
+        let _timer = prof::start(Cat::Norm);
+        let h = self.cfg.hidden_size;
+        let r = self.cfg.loop_cfg.map_or(0, |c| c.gate_rank);
+        let eps = self.cfg.rms_norm_eps as f32;
+        let mut cat = vec![0f32; t * 2 * h];
+        for_chunks(&mut cat, 2 * h, t > 4, |ti, row| {
+            row[..h].copy_from_slice(&x[ti * h..(ti + 1) * h]);
+            row[h..].copy_from_slice(&m[ti * h..(ti + 1) * h]);
+            rms_unit(&mut row[..h], eps);
+            rms_unit(&mut row[h..], eps);
+        });
+        let mut d = vec![0f32; t * r];
+        linear(&g.down, r, 2 * h, &cat, t, &mut d);
+        let (mut f, mut gn) = (vec![0f32; t * h], vec![0f32; t * h]);
+        linear_multi(&mut [(&g.forget, h, &mut f[..]), (&g.gain, h, &mut gn[..])], r, &d, t);
+        let mut out = vec![0f32; t * h];
+        for_chunks(&mut out, h, t > 4, |ti, o| {
+            let at = ti * h;
+            for (j, o) in o.iter_mut().enumerate() {
+                *o = (1.0 - f[at + j].tanh()) * x[at + j] + gn[at + j].tanh() * m[at + j];
+            }
+        });
         out
     }
 
@@ -1068,15 +1697,28 @@ impl<'a> Inkling2Model<'a> {
         for_chunks(&mut k, d, t > 1, |_, kh| l2_clip(kh, qk_clip));
         let eps = c.rms_norm_eps as f32;
         for_chunks(&mut v, d, t > 1, |_, vh| rms_unit(vh, eps));
-        st.k.extend_from_slice(&k);
-        st.v.extend_from_slice(&v);
+        st.k.push(&k);
+        st.v.push(&v);
 
         let groups = nh / nkv;
         let scaling = (d as f32).powf(-0.5);
         let (first, extent) = (st.first, a.extent);
         let (ck, cv) = (&st.k, &st.v);
         let mut att = vec![0f32; t * w];
-        for_chunks(&mut att, d, true, |task, o| {
+        // Prefill chunks: key blocks through the GEMM micro-kernel (`OXINFER_INKLING_ATTN=loop`
+        // keeps the per-query loop below).
+        #[cfg(has_simd)]
+        let blocked = t >= ATT_QB && !loop_attention();
+        #[cfg(not(has_simd))]
+        let blocked = false;
+        #[cfg(has_simd)]
+        if blocked {
+            attend_blocked(a, dr, &q, &r, &sink, ck, cv, first, start, t, &mut att);
+        }
+        for_chunks(&mut att, d, !blocked, |task, o| {
+            if blocked {
+                return;
+            }
             let (i, hh) = (task / nh, task % nh);
             let kvh = hh / groups;
             let p = start + i;
@@ -1094,16 +1736,17 @@ impl<'a> Inkling2Model<'a> {
             }
             // Scores of positions `lo..=p`, then the sink.
             let mut s = vec![0f32; n + 1];
+            let mut tmp = vec![0f32; d];
             for (j, sv) in s[..n].iter_mut().enumerate() {
                 let at = (lo + j - first) * kw + kvh * d;
                 let dist = p - (lo + j);
-                *sv = dot(qh, &ck[at..at + d]) * scaling + if dist < nb { bias[dist] } else { 0.0 };
+                *sv = dot(qh, ck.get(at, &mut tmp)) * scaling + if dist < nb { bias[dist] } else { 0.0 };
             }
             s[n] = sink[task];
             softmax_inplace(&mut s);
             for (j, &wj) in s[..n].iter().enumerate() {
                 let at = (lo + j - first) * kw + kvh * d;
-                axpy(o, wj, &cv[at..at + d]);
+                axpy(o, wj, cv.get(at, &mut tmp));
             }
         });
         // A sliding layer never reads further back than its window: what is older goes, a window's
@@ -1112,8 +1755,8 @@ impl<'a> Inkling2Model<'a> {
             let keep = (start + t + 1).saturating_sub(win);
             if keep >= st.first + win {
                 let cut = (keep - st.first) * kw;
-                st.k.drain(..cut);
-                st.v.drain(..cut);
+                st.k.drop_front(cut);
+                st.v.drop_front(cut);
                 st.first = keep;
             }
         }
@@ -1122,6 +1765,227 @@ impl<'a> Inkling2Model<'a> {
         }
         drop(_timer);
         linear(&a.o, h, w, &att, t, out);
+    }
+}
+
+/// `OXINFER_INKLING_ATTN=loop`: prefill attention one query at a time (as decoding).
+#[cfg(has_simd)]
+fn loop_attention() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OXINFER_INKLING_ATTN").is_ok_and(|v| v == "loop"))
+}
+
+/// Query rows per task of [`attend_blocked`] (a multiple of the GEMM tile's 8).
+#[cfg(has_simd)]
+const ATT_QB: usize = 32;
+/// Keys per block of [`attend_blocked`] (a multiple of 8).
+#[cfg(has_simd)]
+const ATT_KB: usize = 64;
+
+/// The attention of a prefill chunk (`t` queries at positions `start..start + t`, already in the
+/// cache) as one task per (query head, block of 32 queries), each streaming blocks of 64 keys
+/// through the f32 GEMM micro-kernel with an online softmax (as `sd::ops::attention_blocked`),
+/// plus what Inkling-2's attention adds: the relative bias by backward distance, the sliding
+/// window, and the sink (the running maximum starts at the sink's logit with a weight of 1).
+/// The keys and values a chunk reads are copied out of the cache once per key/value head.
+/// The same as the per-query loop of [`Inkling2Model::attention`] up to rounding.
+#[cfg(has_simd)]
+#[allow(clippy::too_many_arguments)]
+fn attend_blocked(
+    a: &Attn,
+    dr: usize,
+    q: &[f32],
+    r: &[f32],
+    sink: &[f32],
+    ck: &KvRows,
+    cv: &KvRows,
+    first: usize,
+    start: usize,
+    t: usize,
+    out: &mut [f32],
+) {
+    use crate::kernels::simd::gemm_8x8;
+    let Heads {
+        heads: nh,
+        kv_heads: nkv,
+        head_dim: d,
+    } = a.hd;
+    let (kw, w, groups) = (nkv * d, nh * d, nh / nkv);
+    let scaling = (d as f32).powf(-0.5);
+    let extent = a.extent;
+    // The keys any query of the chunk may read: `kmin..start + t`.
+    let kmin = match a.window {
+        Some(win) => (start + 1).saturating_sub(win).max(first),
+        None => first,
+    };
+    let nk = start + t - kmin;
+    let nkb = nk.div_ceil(ATT_KB);
+    let dhp = d.next_multiple_of(8);
+    // One key/value head at a time (copies of its keys and values in the chunk's range): keys
+    // per block, row-major `[KB, d]` (zero rows past the end); values transposed per block,
+    // `[dhp][KB]`.
+    let nqb = t.div_ceil(ATT_QB);
+    let op = SendMutPtr(out.as_mut_ptr());
+    let mut kbuf = vec![0f32; nkb * ATT_KB * d];
+    let mut vbuf = vec![0f32; nkb * dhp * ATT_KB];
+    for g in 0..nkv {
+        for_chunks(&mut kbuf, ATT_KB * d, nkb > 1, |b, blk| {
+            let mut tmp = vec![0f32; d];
+            for jj in 0..ATT_KB.min(nk - b * ATT_KB) {
+                let pos = kmin + b * ATT_KB + jj;
+                blk[jj * d..(jj + 1) * d].copy_from_slice(ck.get((pos - first) * kw + g * d, &mut tmp));
+            }
+        });
+        for_chunks(&mut vbuf, dhp * ATT_KB, nkb > 1, |b, blk| {
+            let mut tmp = vec![0f32; d];
+            for jj in 0..ATT_KB.min(nk - b * ATT_KB) {
+                let pos = kmin + b * ATT_KB + jj;
+                for (c, &x) in cv.get((pos - first) * kw + g * d, &mut tmp).iter().enumerate() {
+                    blk[c * ATT_KB + jj] = x;
+                }
+            }
+        });
+        let (kh, vh) = (&kbuf[..], &vbuf[..]);
+        crate::pool::run(groups * nqb, &|task| {
+            let (hh, qb) = (g * groups + task / nqb, task % nqb);
+            let q0 = qb * ATT_QB;
+            let nq = (t - q0).min(ATT_QB);
+            let tiles = nq.div_ceil(8);
+            // The queries as GEMM panels `[tile][d][8]`, scaled.
+            let mut qt = vec![0f32; tiles * d * 8];
+            for i in 0..nq {
+                let src = &q[(q0 + i) * w + hh * d..(q0 + i) * w + (hh + 1) * d];
+                let (tl, ln) = (i / 8, i % 8);
+                for (c, &x) in src.iter().enumerate() {
+                    qt[(tl * d + c) * 8 + ln] = x * scaling;
+                }
+            }
+            // Each query's bias by backward distance: its mix of the profiles.
+            let mut bias = vec![0f32; nq * extent];
+            for i in 0..nq {
+                let rq = &r[((q0 + i) * nh + hh) * dr..((q0 + i) * nh + hh + 1) * dr];
+                let bi = &mut bias[i * extent..(i + 1) * extent];
+                for (&rv, prof) in rq.iter().zip(a.rel.chunks(extent)) {
+                    axpy(bi, rv, prof);
+                }
+            }
+            let mut s = vec![0f32; tiles * 8 * ATT_KB];
+            let mut pt = vec![0f32; tiles * ATT_KB * 8];
+            let mut tmp = vec![0f32; tiles * 8 * dhp];
+            let mut acc = vec![0f32; nq * dhp];
+            // The sink: a logit with a zero value.
+            let mut m: Vec<f32> = (0..nq).map(|i| sink[(q0 + i) * nh + hh]).collect();
+            let mut l = vec![1f32; nq];
+            let (p_first, p_last) = (start + q0, start + q0 + nq - 1);
+            let lo_first = match a.window {
+                Some(win) => (p_first + 1).saturating_sub(win).max(kmin),
+                None => kmin,
+            };
+            for b in (lo_first - kmin) / ATT_KB..(p_last - kmin) / ATT_KB + 1 {
+                let j0 = kmin + b * ATT_KB;
+                for gg in 0..ATT_KB / 8 {
+                    for tl in 0..tiles {
+                        // SAFETY: the panels and the score tile are sized for these offsets.
+                        unsafe {
+                            gemm_8x8::<f32>(
+                                kh.as_ptr().add((b * ATT_KB + gg * 8) * d),
+                                d,
+                                qt.as_ptr().add(tl * d * 8),
+                                s.as_mut_ptr(),
+                                ATT_KB,
+                                gg * 8,
+                                tl * 8,
+                                8,
+                            );
+                        }
+                    }
+                }
+                for i in 0..nq {
+                    let p = start + q0 + i;
+                    let lo = match a.window {
+                        Some(win) => (p + 1).saturating_sub(win).max(first),
+                        None => first,
+                    };
+                    let row = &mut s[i * ATT_KB..(i + 1) * ATT_KB];
+                    let (tl, ln) = (i / 8, i % 8);
+                    let mut mx = m[i];
+                    for (jj, x) in row.iter_mut().enumerate() {
+                        let pos = j0 + jj;
+                        if pos < lo || pos > p {
+                            *x = f32::NEG_INFINITY;
+                            continue;
+                        }
+                        let dist = p - pos;
+                        if dist < extent {
+                            *x += bias[i * extent + dist];
+                        }
+                        mx = mx.max(*x);
+                    }
+                    let corr = (m[i] - mx).exp();
+                    let mut sum = 0f32;
+                    for (jj, &x) in row.iter().enumerate() {
+                        let e = if x == f32::NEG_INFINITY { 0.0 } else { (x - mx).exp() };
+                        pt[(tl * ATT_KB + jj) * 8 + ln] = e;
+                        sum += e;
+                    }
+                    l[i] = l[i] * corr + sum;
+                    m[i] = mx;
+                    if corr != 1.0 {
+                        acc[i * dhp..(i + 1) * dhp].iter_mut().for_each(|v| *v *= corr);
+                    }
+                }
+                for i in nq..tiles * 8 {
+                    let (tl, ln) = (i / 8, i % 8);
+                    for jj in 0..ATT_KB {
+                        pt[(tl * ATT_KB + jj) * 8 + ln] = 0.0;
+                    }
+                }
+                let vb = &vh[b * dhp * ATT_KB..(b + 1) * dhp * ATT_KB];
+                for gg in 0..dhp / 8 {
+                    for tl in 0..tiles {
+                        // SAFETY: as above.
+                        unsafe {
+                            gemm_8x8::<f32>(
+                                vb.as_ptr().add(gg * 8 * ATT_KB),
+                                ATT_KB,
+                                pt.as_ptr().add(tl * ATT_KB * 8),
+                                tmp.as_mut_ptr(),
+                                dhp,
+                                gg * 8,
+                                tl * 8,
+                                8,
+                            );
+                        }
+                    }
+                }
+                for (av, &x) in acc.iter_mut().zip(&tmp[..nq * dhp]) {
+                    *av += x;
+                }
+            }
+            for i in 0..nq {
+                let inv = 1.0 / l[i];
+                // SAFETY: each task writes its own (query, head) slices of `out`.
+                let o = unsafe { std::slice::from_raw_parts_mut(op.get().add((q0 + i) * w + hh * d), d) };
+                for (o, &av) in o.iter_mut().zip(&acc[i * dhp..i * dhp + d]) {
+                    *o = av * inv;
+                }
+            }
+        });
+    }
+}
+
+#[cfg(has_simd)]
+#[derive(Clone, Copy)]
+struct SendMutPtr(*mut f32);
+#[cfg(has_simd)]
+unsafe impl Send for SendMutPtr {}
+#[cfg(has_simd)]
+unsafe impl Sync for SendMutPtr {}
+#[cfg(has_simd)]
+impl SendMutPtr {
+    #[inline(always)]
+    fn get(self) -> *mut f32 {
+        self.0
     }
 }
 
@@ -1147,6 +2011,11 @@ impl crate::generate::TextLm for Inkling2Model<'_> {
     }
     fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
         Inkling2Model::logits(self, hidden, t)
+    }
+    /// At least 2048 tokens: each of the 128 experts of a layer then sees about 128 of them,
+    /// enough for its weights to be decoded once for many (prefill is 2-3x faster than with 256).
+    fn prefill_chunk(&self, chunk: usize) -> usize {
+        chunk.max(2048)
     }
 }
 

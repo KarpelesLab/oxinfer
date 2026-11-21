@@ -1247,9 +1247,13 @@ fn find_kind(v: &[(GgmlType, Id)], k: GgmlType) -> Option<Id> {
 }
 
 /// Whether the device kernels take `m`: anything but FP8, or FP8 with the 128 x 128 block scales
-/// the shaders assume.
+/// the shaders assume; not other formats with extra scales (row-wide factors the shaders would
+/// leave out).
 fn fp8_ok(m: &crate::ggml::GgufMatrix) -> bool {
-    m.kind != GgmlType::F8E4M3 || m.block_scales.as_ref().is_some_and(|b| b.rows == 128 && b.cols == 128)
+    match &m.block_scales {
+        None => m.kind != GgmlType::F8E4M3,
+        Some(b) => m.kind == GgmlType::F8E4M3 && b.rows == 128 && b.cols == 128,
+    }
 }
 
 /// `P::s_off` of a GGUF matrix: the row length in bytes, or for FP8 the offset of its block

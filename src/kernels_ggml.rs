@@ -75,6 +75,7 @@ pub(super) unsafe fn rows<const TC: usize>(m: &GgufMatrix, x: &Act, y: *mut f32,
         GgmlType::Q4_1 => q32::<TC, Q4_1>,
         GgmlType::Q5_0 => q32::<TC, Q5_0>,
         GgmlType::Q5_1 => q32::<TC, Q5_1>,
+        GgmlType::NVFP4 => nvfp4::<TC>,
         _ => return false,
     };
     let rb = m.row_bytes();
@@ -749,6 +750,49 @@ unsafe fn iq4xs<const TC: usize>(row: *const u8, n_in: usize, x: &Act) -> [f32; 
 }
 
 /// Q8_0: blocks of 32 int8 with an f16 scale, four blocks per step.
+/// NVFP4 in ggml's blocks of 64 (four unsigned E4M3 scales, then per 16 values 8 bytes whose low
+/// nibbles are elements 0..8 and high nibbles 8..16): E2M1 codes through MXFP4's doubled table,
+/// halved scales. Without the tensor-wide factor, which the caller applies.
+unsafe fn nvfp4<const TC: usize>(row: *const u8, n_in: usize, x: &Act) -> [f32; TC] {
+    let lut = super::ue4m3_half_table();
+    let kv = vld1q_s8(KVALUES_MXFP4.as_ptr());
+    let m4 = vdupq_n_u8(0x0F);
+    let zero = vdupq_n_s32(0);
+    let bpr = n_in / 32;
+    let mut acc = [vdupq_n_f32(0.0); TC];
+    for blk in 0..n_in / 64 {
+        let b = row.add(36 * blk);
+        let d = [
+            lut[*b as usize],
+            lut[*b.add(1) as usize],
+            lut[*b.add(2) as usize],
+            lut[*b.add(3) as usize],
+        ];
+        let dv = vld1q_f32(d.as_ptr());
+        let (u0, u1) = (vld1q_u8(b.add(4)), vld1q_u8(b.add(20)));
+        let (l0, h0) = (vandq_u8(u0, m4), vshrq_n_u8::<4>(u0));
+        let (l1, h1) = (vandq_u8(u1, m4), vshrq_n_u8::<4>(u1));
+        let w = [
+            vqtbl1q_s8(kv, vcombine_u8(vget_low_u8(l0), vget_low_u8(h0))),
+            vqtbl1q_s8(kv, vcombine_u8(vget_high_u8(l0), vget_high_u8(h0))),
+            vqtbl1q_s8(kv, vcombine_u8(vget_low_u8(l1), vget_low_u8(h1))),
+            vqtbl1q_s8(kv, vcombine_u8(vget_high_u8(l1), vget_high_u8(h1))),
+        ];
+        for c in 0..TC {
+            let xq = x.q.add(c * n_in + 64 * blk);
+            let a0 = sdot(zero, w[0], vld1q_s8(xq));
+            let a1 = sdot(zero, w[1], vld1q_s8(xq.add(16)));
+            let a2 = sdot(zero, w[2], vld1q_s8(xq.add(32)));
+            let a3 = sdot(zero, w[3], vld1q_s8(xq.add(48)));
+            let s = vpaddq_s32(vpaddq_s32(a0, a1), vpaddq_s32(a2, a3));
+            let xs = vld1_f32(x.s.add(c * bpr + 2 * blk));
+            let xsv = vcombine_f32(vdup_lane_f32::<0>(xs), vdup_lane_f32::<1>(xs));
+            acc[c] = vfmaq_f32(acc[c], vcvtq_f32_s32(s), vmulq_f32(dv, xsv));
+        }
+    }
+    finish(acc)
+}
+
 unsafe fn q8_0<const TC: usize>(row: *const u8, n_in: usize, x: &Act) -> [f32; TC] {
     let bpr = n_in / 32;
     let zero = vdupq_n_s32(0);
@@ -1369,7 +1413,14 @@ pub(super) fn multi_kind(kind: GgmlType, t: usize) -> Option<bool> {
 fn cols_kind(kind: GgmlType) -> bool {
     matches!(
         kind,
-        GgmlType::Q8_0 | GgmlType::Q4_0 | GgmlType::IQ4_NL | GgmlType::MXFP4 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1
+        GgmlType::Q8_0
+            | GgmlType::Q4_0
+            | GgmlType::IQ4_NL
+            | GgmlType::MXFP4
+            | GgmlType::Q4_1
+            | GgmlType::Q5_0
+            | GgmlType::Q5_1
+            | GgmlType::NVFP4
     )
 }
 
@@ -1401,6 +1452,7 @@ unsafe fn cols_multi(m: &GgufMatrix, x: &Act, t: usize, y: *mut f32, ys: usize, 
                 GgmlType::MXFP4 => q32::<$TC, MXFP4>,
                 GgmlType::Q4_1 => q32::<$TC, Q4_1>,
                 GgmlType::Q5_0 => q32::<$TC, Q5_0>,
+                GgmlType::NVFP4 => nvfp4::<$TC>,
                 _ => q32::<$TC, Q5_1>,
             }
         };

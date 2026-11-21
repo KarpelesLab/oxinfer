@@ -127,7 +127,8 @@ impl GgmlType {
 
     /// The type with GGUF id `id`, if supported.
     pub fn from_id(id: u32) -> Option<GgmlType> {
-        Self::ALL.into_iter().find(|t| *t as u32 == id)
+        // (NVFP4 is a GGUF type, read by the kernels, but has no dequantization fixture.)
+        Self::ALL.into_iter().chain([GgmlType::NVFP4]).find(|t| *t as u32 == id)
     }
     pub fn id(self) -> u32 {
         self as u32
@@ -216,11 +217,12 @@ impl GgmlType {
         }
     }
     /// Runs through the f32 path (dequantized rows) rather than int8 dot products: plain float
-    /// storage, and NVFP4 (whose 16-value scales the int8 kernels' 32-value blocks cannot take).
+    /// storage and FP8. (NVFP4 takes the int8 kernels: its E2M1 codes doubled, its per-16
+    /// scales halved, the tensor-wide factor applied to the sums.)
     pub fn is_float(self) -> bool {
         matches!(
             self,
-            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::F8E4M3 | GgmlType::NVFP4 | GgmlType::I8
+            GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 | GgmlType::F8E4M3 | GgmlType::I8
         )
     }
     /// Bytes of a row of `n` elements (`n` must be a multiple of the block size).
@@ -472,6 +474,12 @@ pub(crate) fn e8m0_half(e: u8) -> f32 {
     } else {
         f32::from_bits((e as u32 - 1) << 23)
     }
+}
+
+/// [`ue4m3_half`] of every byte.
+pub(crate) fn ue4m3_half_table() -> &'static [f32; 256] {
+    static T: std::sync::OnceLock<[f32; 256]> = std::sync::OnceLock::new();
+    T.get_or_init(|| std::array::from_fn(|i| ue4m3_half(i as u8)))
 }
 
 /// Half the value of an unsigned E4M3 scale byte (ggml's `ggml_ue4m3_to_fp32`: NVFP4's values are
@@ -936,8 +944,9 @@ pub fn dequantize_row(kind: GgmlType, src: &[u8], out: &mut [f32]) {
             NVFP4 => {
                 // Four sub-blocks of 16: an unsigned E4M3 scale (halved, the values doubled), then
                 // 8 bytes holding elements j (low nibble) and j + 8 (high).
+                let lut = ue4m3_half_table();
                 for s in 0..4 {
-                    let d = ue4m3_half(b[s]);
+                    let d = lut[b[s] as usize];
                     let q = &b[4 + 8 * s..4 + 8 * s + 8];
                     for j in 0..8 {
                         y[16 * s + j] = d * KVALUES_MXFP4[(q[j] & 0xF) as usize] as f32;
@@ -1232,7 +1241,19 @@ pub fn decode_i8(kind: GgmlType, b: &[u8], q: &mut [i8], s: &mut [f32], m: &mut 
             s.fill(d);
             false
         }
-        F32 | F16 | BF16 | F8E4M3 | NVFP4 | I8 => unreachable!("decode_i8 on f32-path type {kind}"),
+        NVFP4 => {
+            let lut = ue4m3_half_table();
+            for sb in 0..4 {
+                s[sb] = lut[b[sb] as usize];
+                for j in 0..8 {
+                    let v = b[4 + 8 * sb + j];
+                    q[16 * sb + j] = KVALUES_MXFP4[(v & 0xF) as usize];
+                    q[16 * sb + j + 8] = KVALUES_MXFP4[(v >> 4) as usize];
+                }
+            }
+            false
+        }
+        F32 | F16 | BF16 | F8E4M3 | I8 => unreachable!("decode_i8 on f32-path type {kind}"),
     }
 }
 
@@ -1315,8 +1336,54 @@ unsafe fn dot_row_generic<const TC: usize>(kind: GgmlType, row: &[u8], x: &Act) 
 }
 
 impl GgufMatrix {
+    /// The factor of each row that the int8 kernels leave out: block scales as wide as the rows
+    /// on a format that has its own scales (NVFP4's tensor-wide scale, the per-expert scales of
+    /// unsloth's Inkling-2 files).
+    fn sum_factor(&self, r: usize) -> Option<f32> {
+        let bs = self.block_scales.as_ref().filter(|_| !self.kind.is_float())?;
+        debug_assert!(bs.cols >= self.n_in);
+        Some(bs.s[r / bs.rows])
+    }
+
+    /// Multiplies the whole matrix by `f` (as a row-wide block scale; see `sum_factor`). Only
+    /// for formats of the int8 kernels that have no block scales yet.
+    pub fn set_factor(&mut self, f: f32) -> anyhow::Result<()> {
+        if self.kind.is_float() || self.block_scales.is_some() {
+            anyhow::bail!("a {} matrix cannot take a tensor-wide scale", self.kind);
+        }
+        let mut s = crate::quant::PageVec::<f32>::zeroed(1);
+        s[0] = f;
+        self.block_scales = Some(BlockScales {
+            s: s.into(),
+            rows: self.n_out,
+            cols: self.n_in,
+        });
+        Ok(())
+    }
+
+    /// `y[c * ys + r] *= sum_factor(r)` for rows `r0..r1` and `tc` columns.
+    unsafe fn apply_factor(&self, tc: usize, y: *mut f32, ys: usize, r0: usize, r1: usize) {
+        if self.sum_factor(r0).is_none() {
+            return;
+        }
+        for r in r0..r1 {
+            let f = self.sum_factor(r).unwrap();
+            for c in 0..tc {
+                unsafe { *y.add(c * ys + r) *= f };
+            }
+        }
+    }
+
     /// Rows `r0..r1` against activation rows `c0..c0+TC`, into `y[c * ys + r]` (c from 0).
     unsafe fn rows_impl<const TC: usize>(&self, xa: &QAct, c0: usize, y: *mut f32, ys: usize, r0: usize, r1: usize) {
+        unsafe {
+            self.rows_raw::<TC>(xa, c0, y, ys, r0, r1);
+            self.apply_factor(TC, y, ys, r0, r1);
+        }
+    }
+
+    /// [`Self::rows_impl`] without [`Self::sum_factor`].
+    unsafe fn rows_raw<const TC: usize>(&self, xa: &QAct, c0: usize, y: *mut f32, ys: usize, r0: usize, r1: usize) {
         let x = Act::new(xa, c0);
         if self.kind.is_float() {
             // Not reached through the matmul driver (float rows take the f32 path); kept correct.
@@ -1398,7 +1465,13 @@ impl QMat for GgufMatrix {
     unsafe fn rows_multi(&self, xa: &QAct, pairs: Option<&PairAct>, t: usize, y: *mut f32, r0: usize, r1: usize) -> bool {
         #[cfg(target_arch = "aarch64")]
         {
-            unsafe { neon::rows_multi(self, &Act::new(xa, 0), pairs, t, y, self.n_out, r0, r1) }
+            unsafe {
+                let done = neon::rows_multi(self, &Act::new(xa, 0), pairs, t, y, self.n_out, r0, r1);
+                if done {
+                    self.apply_factor(t, y, self.n_out, r0, r1);
+                }
+                done
+            }
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
@@ -1843,6 +1916,63 @@ mod tests {
                 let x: Vec<f32> = (0..t * n_in).map(|_| (lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0).collect();
                 let alone: Vec<u32> = (0..t).flat_map(|c| run(&x[c * n_in..(c + 1) * n_in], 1)).collect();
                 assert_eq!(run(&x, t), alone, "{kind} t={t}");
+            }
+        }
+    }
+
+    /// NVFP4 (not a GGUF type of [`GgmlType::ALL`]) on the int8 kernels: the one-token kernel of
+    /// this target equals the portable one and the dequantized product (up to the activations'
+    /// int8 rounding), with and without a tensor-wide factor; multi-token passes give every row
+    /// bit-identical to a one-token pass.
+    #[test]
+    fn nvfp4_int8_kernels() {
+        crate::pool::init(3);
+        assert_eq!(GgmlType::from_id(40), Some(GgmlType::NVFP4));
+        let (n_out, n_in) = (19usize, 5 * 64);
+        let mut seed = 77u64;
+        let mut bytes: Vec<u8> = (0..n_out * n_in / 64 * 36).map(|_| lcg(&mut seed) as u8).collect();
+        for b in bytes.as_chunks_mut::<36>().0 {
+            for s in &mut b[..4] {
+                // Finite scales, around 1 (exponents 5..9 of 15).
+                *s = ((5 + lcg(&mut seed) % 5) << 3) as u8 | (lcg(&mut seed) & 7) as u8;
+            }
+        }
+        for factor in [None, Some(0.37f32)] {
+            let mut m = GgufMatrix::from_bytes(GgmlType::NVFP4, &bytes, n_out, n_in).unwrap();
+            if let Some(f) = factor {
+                m.set_factor(f).unwrap();
+            }
+            let mut w = vec![0f32; n_out * n_in];
+            m.dequantize_rows(0, n_out, &mut w);
+            for t in [1usize, 2, 5, 9] {
+                let x: Vec<f32> = (0..t * n_in).map(|_| (lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0).collect();
+                let xa = crate::quant::quantize_act(&x, t, n_in);
+                let mut y1 = vec![0f32; t * n_out];
+                for c in 0..t {
+                    unsafe { m.rows_t1(&xa, c, y1.as_mut_ptr().add(c * n_out), 0, n_out) };
+                    for r in 0..n_out {
+                        let exact: f32 = (0..n_in).map(|i| w[r * n_in + i] * x[c * n_in + i]).sum();
+                        let mag: f32 = (0..n_in).map(|i| (w[r * n_in + i] * x[c * n_in + i]).abs()).sum();
+                        let got = y1[c * n_out + r];
+                        // (The activations are rounded to int8 per 32: under 1% of each product.)
+                        assert!((got - exact).abs() <= 0.01 * mag + 1e-3, "row {r}: {got} vs {exact} (of {mag})");
+                        let x1 = Act::new(&xa, c);
+                        let mut portable = unsafe { dot_row_generic::<1>(GgmlType::NVFP4, m.row(r), &x1)[0] };
+                        if let Some(f) = factor {
+                            portable *= f;
+                        }
+                        assert!(
+                            (got - portable).abs() <= 1e-4 * (1.0 + got.abs()),
+                            "row {r}: {got} vs portable {portable}"
+                        );
+                    }
+                }
+                if t > 1 {
+                    let mut y = vec![0f32; t * n_out];
+                    crate::kernels::matmul_quant_multi_at(&mut [(&m, &mut y[..])], &x, t, 15);
+                    let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+                    assert_eq!(bits(&y), bits(&y1), "t={t} factor={factor:?}");
+                }
             }
         }
     }

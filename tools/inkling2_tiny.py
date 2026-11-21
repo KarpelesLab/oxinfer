@@ -6,7 +6,7 @@ convolutions, attention sinks and output gates, the attention residual over the 
 (one and three queries), the MoE with a selection bias and soft caps that bite, the final soft
 cap and an unembedding wider than the vocabulary.
 
-usage: inkling2_tiny.py OUT_DIR [--len N] [--gen N] [--seed S] [--packed]
+usage: inkling2_tiny.py OUT_DIR [--len N] [--gen N] [--seed S] [--packed] [--loop]
                         [--tokenizer RELEASE_DIR [--chat CONVERSATION.json]]
                         [--image FILE.png]
 (environment: WINDOW, EXTENT, FLOOR, QK_CLIP, REL_CLIP, KERNEL, BLOCK override
@@ -20,6 +20,10 @@ processor_config.json), and with --chat the prompt is that conversation ({"messa
 OUT_DIR/prompt.txt). With --image (and --tokenizer) the prompt is one user message with that
 image and a text, through the processor; `pixel_values` and `image_grid_thw` go to the
 reference file, and `image_features` (the projected features, one row per image token).
+
+With --loop the model is an `inkling2_loop` one (Inkling-2-Mini's architecture): blocks of 3,
+layers 3 to 8 (two blocks, a full layer in each) run three times with message gates of rank 8;
+transformers' `Inkling2LoopForConditionalGeneration` is the reference.
 
 With --packed the routed experts are stored as the releases store them: the layers of the first
 half in NVFP4 (E2M1 pairs, an E4M3 scale per 16, `amax` per expert over one denominator), the
@@ -37,7 +41,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 out = sys.argv[1]
-plen, gen, seed, tokdir, chat, image, packed = 150, 16, 0, None, None, None, False
+plen, gen, seed, tokdir, chat, image, packed, loop = 150, 16, 0, None, None, None, False, False
 a = sys.argv[2:]
 for i, x in enumerate(a):
     if x == "--len":
@@ -54,6 +58,8 @@ for i, x in enumerate(a):
         image = a[i + 1]
     if x == "--packed":
         packed = True
+    if x == "--loop":
+        loop = True
 torch.manual_seed(seed)
 # With the release's tokenizer: its vocabulary (the unembedding is padded) and its stop token.
 V, UNPADDED, EOS, IMAGE = (201024, 200058, 200006, 200054) if tokdir else (512, 500, 1, 499)
@@ -82,10 +88,10 @@ text = dict(
     moe_intermediate_size=64,
     n_routed_experts=16,
     num_experts_per_tok=4,
-    route_scale=8.0,
+    route_scale=float(os.environ.get("ROUTE", "8.0")),
     qk_l2_clip_threshold=float(os.environ.get("QK_CLIP", "2.0")),
     rel_l2_clip_threshold=float(os.environ.get("REL_CLIP", "2.0")),
-    n_layers_per_attn_res_block=int(os.environ.get("BLOCK", "6")),
+    n_layers_per_attn_res_block=int(os.environ.get("BLOCK", "3" if loop else "6")),
     mlp_gate_softcap=0.8,
     mlp_up_softcap=1.5,
     final_logit_softcapping=3.0,
@@ -105,9 +111,26 @@ vision = dict(
     text_hidden_size=64,
     rope_parameters={"rope_type": "axial", "rope_theta": 10000.0},
 )
-cfg = Inkling2Config(text_config=text, vision_config=vision, image_token_id=IMAGE)
-cfg._attn_implementation = "eager"
-m = Inkling2ForConditionalGeneration(cfg).float().eval()
+if loop:
+    from transformers.models.inkling2_loop.configuration_inkling2_loop import Inkling2LoopConfig
+    from transformers.models.inkling2_loop.modeling_inkling2_loop import Inkling2LoopForConditionalGeneration
+
+    text.update(
+        loop_layer_index_start=3,
+        loop_layer_index_end=9,
+        loop_num_passes=3,
+        loop_gate_rank=8,
+        layer_types=["hybrid" if i % 3 == 2 else "hybrid_sliding" for i in range(n)],
+    )
+    cfg = Inkling2LoopConfig(text_config=text, vision_config=dict(vision, model_type="inkling2_vision"), image_token_id=IMAGE)
+    cfg._attn_implementation = "eager"
+    cfg._experts_implementation = "eager"
+    m = Inkling2LoopForConditionalGeneration(cfg).float().eval()
+else:
+    cfg = Inkling2Config(text_config=text, vision_config=vision, image_token_id=IMAGE)
+    cfg._attn_implementation = "eager"
+    cfg._experts_implementation = "eager"
+    m = Inkling2ForConditionalGeneration(cfg).float().eval()
 
 with torch.no_grad():
     for name, p in m.named_parameters():
@@ -124,12 +147,14 @@ with torch.no_grad():
         if name.endswith("norm.weight") or "layernorm" in name:
             p.copy_(1.0 + torch.randn_like(p) * 0.2)
         elif name.endswith(".query"):
-            p.copy_(torch.randn_like(p) * 2.0)
+            p.copy_(torch.randn_like(p) * float(os.environ.get("QSCALE", "2.0")))
         elif name.endswith("conv1d.weight") or name.endswith("static_weight"):
             p.copy_(torch.randn_like(p) * 0.4)
-        elif name.endswith("l2_clip.scale"):
+        elif name.endswith("l2_clip.scale") or name.endswith("norm.scale"):
             p.copy_(1.0 + torch.randn_like(p) * 0.4)
-        elif name.endswith("rel_logits_proj.proj"):
+        elif "_message_gate." in name:
+            p.copy_(torch.randn_like(p) * (0.15 if "down_proj" in name else 0.4))
+        elif name.endswith("rel_logits_proj.proj") or name.endswith("relative_position_bias.proj"):
             p.copy_(torch.randn_like(p) * 0.6)
         elif name.endswith("sink_proj.weight") or name.endswith("gate_proj.weight"):
             p.copy_(torch.randn_like(p) * 0.3)
@@ -143,7 +168,11 @@ with torch.no_grad():
             p.copy_(torch.randn_like(p) * 0.3)
     for name, b in m.named_buffers():
         if name.endswith("e_score_correction_bias"):
-            b.copy_(torch.randn_like(b) * 0.1)
+            # SPREAD > 0 spaces the selection biases of the experts (a random order), so that
+            # fewer choices are near-ties: a deep model (the loop) flips them on float32 rounding.
+            spread = float(os.environ.get("SPREAD", "0.25" if loop else "0"))
+            ladder = torch.randperm(b.numel()).float() * spread
+            b.copy_(torch.randn_like(b) * 0.1 + ladder)
     # bf16-representable weights: oxinfer's bf16 matmuls are then exact.
     for name, p in m.state_dict().items():
         if p.is_floating_point():
@@ -247,6 +276,11 @@ if tokdir:
         text = tk.apply_chat_template(conv["messages"], tools=conv.get("tools"), add_generation_prompt=True, tokenize=False, **more)
         ids = torch.tensor([tk(text, add_special_tokens=False)["input_ids"]])
         open(os.path.join(out, "prompt.txt"), "w").write(text)
+# F64=1: the reference in float64 (the loop's tiny models are sensitive to float32 rounding:
+# compare to the exact model).
+if os.environ.get("F64") == "1":
+    m = type(m).from_pretrained(mdir, dtype=torch.float64, attn_implementation="eager", experts_implementation="eager").eval()
+    kw = {k: (v.double() if v.is_floating_point() else v) for k, v in kw.items()}
 with torch.no_grad():
     full = m(ids, use_cache=False, **kw).logits[0].float()
     o = m(ids, use_cache=True, **kw)

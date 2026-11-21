@@ -195,11 +195,15 @@ impl Mmproj {
     }
 }
 
-/// `clip.projector_type` of llama.cpp mmproj file `path` (`pixtral`, `qwen3vl_merger`, ...); None
+/// `clip.projector_type` (or `clip.vision.projector_type`) of llama.cpp mmproj file `path` (`pixtral`, `qwen3vl_merger`, ...); None
 /// when it cannot be read or has none.
 pub fn projector_type(path: &Path) -> Option<String> {
     let h = crate::gguf::header(path).ok()?;
-    h.get("clip.projector_type").and_then(|v| v.as_str()).map(str::to_string)
+    // (llama.cpp writes it under `clip.vision.` for some towers.)
+    h.get("clip.projector_type")
+        .or_else(|| h.get("clip.vision.projector_type"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
 }
 
 /// The llama.cpp `mmproj*.gguf` vision file beside GGUF model `model` (in its folder or the

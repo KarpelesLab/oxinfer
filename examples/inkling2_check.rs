@@ -15,6 +15,10 @@
 //! tower instead and reports how far they are from the reference's.
 //! `--vision-only` (with `--image`) compares the tower's features alone, for a checkpoint that has
 //! only the vision tower's tensors (`tools/ref_inkling2_vision.py`).
+//! `--feats FILE` writes the stream entering each step of a whole-prompt pass (the loop of
+//! `inkling2_loop` unrolled) and the last output, `[n, steps + 1, hidden]` f32.
+//! `--prompt-text FILE` also checks that the model's tokenizer gives the reference's ids on the
+//! text of its prompt.
 //! `--dump` writes the logits compared (prefill rows, then decode rows; f32). `--stream` reads
 //! the weights through the streamer (see docs/streaming.md), as an oversized checkpoint is.
 
@@ -81,6 +85,8 @@ fn main() -> Result<()> {
     let refp = args.next().context(usage)?;
     let (mut chunk, mut cpu, mut mmap, mut stream, mut vision_only) = (None, false, false, false, false);
     let mut dump: Option<String> = None;
+    let mut feats_out: Option<String> = None;
+    let mut prompt_text: Option<String> = None;
     let mut image: Option<String> = None;
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -90,6 +96,8 @@ fn main() -> Result<()> {
             "--stream" => stream = true,
             "--vision-only" => vision_only = true,
             "--dump" => dump = Some(args.next().context("--dump FILE")?),
+            "--feats" => feats_out = Some(args.next().context("--feats FILE")?),
+            "--prompt-text" => prompt_text = Some(args.next().context("--prompt-text FILE")?),
             "--image" => image = Some(args.next().context("--image FILE")?),
             other => anyhow::bail!("unknown argument {other}"),
         }
@@ -137,6 +145,26 @@ fn main() -> Result<()> {
     let ids = i64s(&st, "ids")?;
     let refs = f32s(&st, "logits")?;
     let vocab = m.cfg.unpadded_vocab_size;
+    if let Some(path) = &prompt_text {
+        // The model's tokenizer (a GGUF file's is rebuilt from its vocabulary) on the
+        // reference's prompt text, against the reference's ids.
+        let text = std::fs::read_to_string(path)?;
+        let tok = oxinfer::engine::load_tokenizer(&dir)?;
+        let mine = tok
+            .encode(text.as_str(), false)
+            .map_err(|e| anyhow::anyhow!("encode: {e}"))?
+            .get_ids()
+            .to_vec();
+        println!(
+            "tokenizer: {} ids, {}",
+            mine.len(),
+            if mine == ids {
+                "the reference's".to_string()
+            } else {
+                format!("DIFFERENT from the reference's {} ids", ids.len())
+            }
+        );
+    }
     let chunk = chunk.unwrap_or(ids.len()).max(1);
 
     // Image features for the placeholders of the prompt: the reference's, or our tower's.
@@ -186,6 +214,16 @@ fn main() -> Result<()> {
             .map(|(k, &p)| (p - from, &feats[k * h..(k + 1) * h]))
             .collect()
     };
+    if let Some(path) = &feats_out {
+        // The stream entering every step of the pass (the loop unrolled), and the last output:
+        // `[t, steps + 1, hidden]`.
+        let n = m.cfg.steps().len();
+        let layers: Vec<usize> = (0..=n).collect();
+        let mut f = Vec::new();
+        m.forward_capture(&mut m.new_session(), &ids, &overrides(0, ids.len()), &layers, &mut f);
+        let bytes: Vec<u8> = f.iter().flat_map(|x| x.to_le_bytes()).collect();
+        std::fs::write(path, bytes).with_context(|| format!("write {path}"))?;
+    }
     let mut sess = m.new_session();
     let mut ours = Vec::with_capacity(refs.len());
     let t0 = std::time::Instant::now();

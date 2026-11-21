@@ -12,6 +12,10 @@
 //!
 //! Images with an alpha channel are composited onto a checkerboard by the reference processor;
 //! here images are decoded to RGB before they arrive, so transparency is not reproduced.
+//!
+//! The tower is read from the checkpoint (`model.visual.*`) or, for a GGUF model, from
+//! llama.cpp's `mmproj` file (projector `inkling2v`), renamed to the checkpoint's names
+//! ([`mmproj_name`]); its patch embedding is a convolution there (channel-major patches).
 
 use crate::kernels::*;
 use crate::model::{Lin, Quant, linear, linear_multi, load_lin};
@@ -49,13 +53,63 @@ impl Inkling2VisionConfig {
             return Ok(None);
         };
         let raw: Value = serde_json::from_slice(&bytes)?;
-        if raw.get("model_type").and_then(Value::as_str) != Some("inkling2") {
+        if !matches!(raw.get("model_type").and_then(Value::as_str), Some("inkling2" | "inkling2_loop")) {
             return Ok(None);
         }
         match raw.get("vision_config").filter(|v| v.is_object()) {
             Some(v) => Self::from_json(v, raw.get("image_token_id").and_then(Value::as_u64).unwrap_or(200054) as u32).map(Some),
             None => Ok(None),
         }
+    }
+
+    /// [`Self::load`] with the `mmproj` choice of a request: for a GGUF model the tower of the
+    /// `mmproj` file beside it (or the one given), returned with the settings.
+    pub fn load_with(dir: &Path, mmproj: &crate::pixtral::Mmproj) -> Result<Option<(Self, Option<std::path::PathBuf>)>> {
+        use crate::pixtral::{Mmproj, projector_type};
+        let ours = |p: &Path| projector_type(p).as_deref() == Some("inkling2v");
+        match mmproj {
+            Mmproj::None => return Ok(None),
+            Mmproj::File(p) if !ours(p) => return Ok(None),
+            Mmproj::File(p) => return Ok(Some((Self::from_mmproj(p)?, Some(p.clone())))),
+            Mmproj::Auto => {}
+        }
+        if crate::gguf::is_gguf(dir) {
+            return match crate::pixtral::mmproj_for(dir) {
+                Some(p) if ours(&p) => Ok(Some((Self::from_mmproj(&p)?, Some(p)))),
+                _ => Ok(None),
+            };
+        }
+        Ok(Self::load(dir)?.map(|c| (c, None)))
+    }
+
+    /// The settings of a llama.cpp `mmproj` file (`clip.vision.*`).
+    pub fn from_mmproj(path: &Path) -> Result<Self> {
+        let h = crate::gguf::header(path)?;
+        let int = |k: &str| {
+            h.get(&format!("clip.vision.{k}"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .with_context(|| format!("{}: no clip.vision.{k}", path.display()))
+        };
+        let patch = int("patch_size")?;
+        let proj = h
+            .tensors
+            .iter()
+            .find(|t| t.name == "mm.1.weight")
+            .map(|t| t.ne[1])
+            .context("mmproj: no mm.1.weight")?;
+        let v = serde_json::json!({
+            "hidden_size": int("embedding_length")?,
+            "num_hidden_layers": int("block_count")?,
+            "num_attention_heads": int("attention.head_count")?,
+            "intermediate_size": int("feed_forward_length")?,
+            "patch_size": patch,
+            "spatial_merge_size": int("spatial_merge_size")?,
+            "posemb_grid_size": int("image_size")? / patch,
+            "projection_hidden_dim": proj,
+            "layer_norm_eps": h.get("clip.vision.attention.layer_norm_epsilon").and_then(|v| v.as_f64()).unwrap_or(1e-5),
+        });
+        Self::from_json(&v, 200054)
     }
 
     pub fn from_json(v: &Value, image_token_id: u32) -> Result<Self> {
@@ -180,6 +234,40 @@ fn taps(i: usize, size: usize, side: usize) -> [(usize, f32); 2] {
     [(clamp(f), 1.0 - d), (clamp(f + 1.0), d)]
 }
 
+/// The checkpoint's name of a tensor of llama.cpp's `inkling2v` `mmproj` file (None: not read).
+/// The patch embedding, a convolution there, goes under `..._chw`.
+pub fn mmproj_name(name: &str) -> Option<String> {
+    let top = match name {
+        "v.class_embd" => "backbone.embeddings.class_embedding",
+        "v.class_position_embd.weight" => "backbone.embeddings.cls_position_embedding",
+        "v.patch_embd.weight" => "backbone.embeddings.patch_embedding.weight_chw",
+        "v.position_embd.weight" => "backbone.embeddings.position_embedding",
+        "v.pre_ln.weight" => "backbone.ln_pre.weight",
+        "v.pre_ln.bias" => "backbone.ln_pre.bias",
+        "mm.1.weight" => "proj_in.weight",
+        "mm.2.weight" => "proj_out.weight",
+        n => {
+            let (l, rest) = n.strip_prefix("v.blk.")?.split_once('.')?;
+            let (base, suffix) = rest.rsplit_once('.')?;
+            let m = match (base, suffix) {
+                ("ln1", s) => format!("ln_1.{s}"),
+                ("ln2", s) => format!("ln_2.{s}"),
+                ("ls1", "weight") => "ls_1.gamma".into(),
+                ("ls2", "weight") => "ls_2.gamma".into(),
+                ("ffn_up", s) => format!("mlp.c_fc.{s}"),
+                ("ffn_down", s) => format!("mlp.c_proj.{s}"),
+                ("attn_q", s) => format!("self_attn.q_proj.{s}"),
+                ("attn_k", s) => format!("self_attn.k_proj.{s}"),
+                ("attn_v", s) => format!("self_attn.v_proj.{s}"),
+                ("attn_out", s) => format!("self_attn.out_proj.{s}"),
+                _ => return None,
+            };
+            return Some(format!("{P}backbone.layers.{l}.{m}"));
+        }
+    };
+    Some(format!("{P}{top}"))
+}
+
 impl<'a> Inkling2Vision<'a> {
     pub fn load(cfg: Inkling2VisionConfig, files: &'a ModelFiles, text_hidden: usize) -> Result<Self> {
         let (h, inter) = (cfg.hidden_size, cfg.intermediate_size);
@@ -200,10 +288,30 @@ impl<'a> Inkling2Vision<'a> {
         };
         let norm =
             |name: &str| -> Result<(Vec<f32>, Vec<f32>)> { Ok((getf(&format!("{name}.weight"), h)?, getf(&format!("{name}.bias"), h)?)) };
-        if !files.has(&format!("{P}backbone.embeddings.patch_embedding.weight")) {
-            bail!("this checkpoint has no vision tower ({P}backbone.*)");
-        }
         let d = 3 * cfg.patch_size * cfg.patch_size;
+        let pe = "backbone.embeddings.patch_embedding.weight";
+        let patch = if files.has(&format!("{P}{pe}_chw")) {
+            // An mmproj file: `[H, 3, p, p]` -> the checkpoint's `[H, p, p, 3]` (row, column,
+            // channel).
+            let w = getf(&format!("{pe}_chw"), h * d)?;
+            let p = cfg.patch_size;
+            let mut out = crate::quant::PageVec::<u8>::zeroed(h * d * 4);
+            let o = out.as_chunks_mut::<4>().0;
+            for r in 0..h {
+                for c in 0..3 {
+                    for y in 0..p {
+                        for x in 0..p {
+                            o[r * d + (y * p + x) * 3 + c] = w[r * d + (c * p + y) * p + x].to_le_bytes();
+                        }
+                    }
+                }
+            }
+            Lin::gguf(crate::ggml::GgufMatrix::new(crate::ggml::GgmlType::F32, out.into(), h, d)?)
+        } else if files.has(&format!("{P}{pe}")) {
+            lin(pe, h, d)?
+        } else {
+            bail!("this checkpoint has no vision tower ({P}backbone.*)");
+        };
         let m2 = cfg.spatial_merge_size * cfg.spatial_merge_size;
         let mut class = getf("backbone.embeddings.class_embedding", h)?;
         add_inplace(&mut class, &getf("backbone.embeddings.cls_position_embedding", h)?);
@@ -224,7 +332,7 @@ impl<'a> Inkling2Vision<'a> {
             });
         }
         Ok(Self {
-            patch: lin("backbone.embeddings.patch_embedding.weight", h, d)?,
+            patch,
             position: getf(
                 "backbone.embeddings.position_embedding",
                 cfg.posemb_grid_size * cfg.posemb_grid_size * h,
