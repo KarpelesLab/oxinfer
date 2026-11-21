@@ -203,6 +203,21 @@ pub fn f32_to_bf16(f: f32) -> u16 {
     ((b + 0x7FFF + ((b >> 16) & 1)) >> 16) as u16
 }
 
+/// `w` (`[n_out, n_in]`) as a float32 "GGUF" weight.
+fn f32_lin(w: &[f32], n_out: usize, n_in: usize) -> Lin<'static> {
+    let mut v = PageVec::<u8>::zeroed(w.len() * 4);
+    for (o, x) in v.as_chunks_mut::<4>().0.iter_mut().zip(w) {
+        *o = x.to_le_bytes();
+    }
+    Lin::gguf(crate::ggml::GgufMatrix {
+        kind: crate::ggml::GgmlType::F32,
+        data: v.into(),
+        n_out,
+        n_in,
+        block_scales: None,
+    })
+}
+
 fn to_bf16_pages(v: &[f32]) -> PageVec<u16> {
     let mut out = PageVec::<u16>::zeroed(v.len());
     for (o, &x) in out.iter_mut().zip(v) {
@@ -222,6 +237,9 @@ pub struct Linear {
     /// For a device whose kernels take whole tiles of 64 outputs: this layer with zero rows up
     /// to the next multiple of 64 (made on first use; None when the rows cannot be read).
     padded: std::sync::OnceLock<Option<Box<Linear>>>,
+    /// The float32 weights of a split layer (`lo`) as one float32 matrix, for an accelerator that
+    /// convolves with float32 weights directly (one convolution instead of the bf16 pair).
+    exact: Option<Lin<'static>>,
 }
 
 impl Linear {
@@ -243,6 +261,9 @@ impl Linear {
     fn with_residual(mut self, w: &[f32]) -> Result<Self> {
         let r: Vec<f32> = w.iter().map(|&v| v - f32::from_bits((f32_to_bf16(v) as u32) << 16)).collect();
         self.lo = Some(Box::new(Self::from_parts(&r, self.n_out, self.n_in, None)?));
+        if crate::gpu::active().is_some() {
+            self.exact = Some(f32_lin(w, self.n_out, self.n_in));
+        }
         Ok(self)
     }
 
@@ -269,6 +290,7 @@ impl Linear {
             n_in,
             lo: None,
             padded: std::sync::OnceLock::new(),
+            exact: None,
         })
     }
 
@@ -572,9 +594,30 @@ impl Linear {
             return None;
         }
         let _t = timing::start(timing::CONV);
-        let dev = self.w.device_weight(self.n_out, self.n_in)?;
         let mut y = vec![0f32; t * self.n_out];
         let spec = pre.as_ref().map(|p| p.spec());
+        // A split layer as one float32 convolution where the backend has one.
+        if let Some(ex) = &self.exact
+            && let Some(dev) = ex.device_weight(self.n_out, self.n_in)
+        {
+            let mut job = crate::gpu::Job {
+                w: ex.as_ref(),
+                dev,
+                n_out: self.n_out,
+                y: &mut y,
+            };
+            if be.conv2d(x, &g, spec.as_ref(), &mut job) {
+                if let Some(b) = &self.b {
+                    for_chunks(&mut y, self.n_out, true, |_, r| {
+                        for (v, &bb) in r.iter_mut().zip(b) {
+                            *v += bb;
+                        }
+                    });
+                }
+                return Some(y);
+            }
+        }
+        let dev = self.w.device_weight(self.n_out, self.n_in)?;
         let mut job = crate::gpu::Job {
             w: self.w.as_ref(),
             dev,
@@ -613,6 +656,13 @@ impl Linear {
         let mut l = Self::from_parts(&w, np, self.n_in, b).ok()?;
         if let Some(lo) = &self.lo {
             l.lo = Some(Box::new(lo.padded_copy()?));
+        }
+        if let Some(ex) = &self.exact {
+            let mut we = vec![0f32; np * self.n_in];
+            if !ex.rows(&idx, self.n_in, &mut we[..self.n_out * self.n_in]) {
+                return None;
+            }
+            l.exact = Some(f32_lin(&we, np, self.n_in));
         }
         Some(l)
     }

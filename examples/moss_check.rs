@@ -129,9 +129,12 @@ fn main() -> Result<()> {
             oxinfer::moss_image::transformer::Pass { text: &cond, skip: &[] },
             oxinfer::moss_image::transformer::Pass { text: &unc, skip: &skip },
         ];
-        for rep in 0..3 {
+        // MOSS_CHECK_REPS=N: N rounds; MOSS_CHECK_SINGLE=1: the conditional branch alone.
+        let reps = std::env::var("MOSS_CHECK_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+        let n = if std::env::var_os("MOSS_CHECK_SINGLE").is_some() { 1 } else { 2 };
+        for rep in 0..reps {
             let t1 = std::time::Instant::now();
-            let vs = tr.forward_batch(&xt, lh, lw, &m, &passes, pipe.opts.gpu);
+            let vs = tr.forward_batch(&xt, lh, lw, &m, &passes[..n], pipe.opts.gpu);
             let secs = t1.elapsed().as_secs_f64();
             for (tag, v) in ["cond", "uncond"].iter().zip(&vs) {
                 let v = oxinfer::flux::vae::hwc_to_chw(v, c, lh, lw);

@@ -206,13 +206,23 @@ compares the components; reference dumps from a script in the session's scratchp
 |---|---|---|
 | prompt token ids (26) and the empty negative's (10) | identical | identical |
 | Qwen3.5-9B features (bf16 weights) | rel L2 3.3e-6 / 6.3e-6 | 5.5e-4 / 6.3e-6 |
-| one transformer pass at 1024x1024, t = 952: conditional / unconditional without block 22 | 2.6e-6 / 1.5e-6 | 3.9e-4 / 3.7e-4 |
+| one transformer pass at 1024x1024, t = 952: conditional / unconditional without block 22 | 2.6e-6 / 1.5e-6 | 4.2e-4 / 3.5e-4 (whole-pass plan, both branches in one batch; 3.3e-4 / 3.2e-4 with `exact_attention=1`; the per-op path: 4.7e-4 / 3.7e-4) |
+| the same pass, OpenMOSS-Team/MOSS-Image-Base / MOSS-Image-SFT (their own reference) | | 3.9e-4 / 4.1e-4, 4.3e-4 / 4.4e-4 |
+| ConvRot int8 (`kromoss_int8_convrot`, and `Q8_CR`: the same values), t = 1000, against the reference with the dequantized weights | | 3.5e-4 / 3.0e-4 (the per-op path, rotated layers on the CPU: 3.2e-4 / 2.9e-4); 7.2e-3 / 6.5e-3 against the bf16 weights (the int8 rounding) |
+| `Q4_CR_L` (int4 feed-forward), the same way | | 3.4e-4 / 3.1e-4 (7.0e-2 / 5.9e-2 against the bf16 weights, about Q4_K_M's 6.6e-2) |
 | VAE decode of a 64x64x128 latent | 127.3 dB (rel 3.5e-6) | 102.1 dB |
+| the same latent through ComfyUI's full-size `flux2-vae.safetensors` (BFL layout) against diffusers' `AutoencoderKLFlux2` with that decoder | | 100.7 dB |
 | 10 steps, CFG 3, 512x512, same initial noise and conditioning, float32 reference | 75.2 dB (latent rel 1.5e-4) | |
 | 50 steps, CFG 3, 1024x1024 against the official bf16 run on MPS (same noise / conditioning) | | 31.5 dB (same image; the reference's bf16 activations dominate) |
 | DMD2 LoRA, 8 steps, CFG 1, against the reference with the README's forward hooks (bf16, MPS) | | 29.6 dB, same image |
 | FameGrid LoKr at 1.4 merged into bf16 as ComfyUI does, 24 Euler steps, CFG 2.5, against the same in the reference | | 33.8 dB, same image |
 | GGUF Q4_K_M transformer (molbal/Kromoss-GGUF), one pass against the float32 reference | | 6.6e-2 (Q4 weight noise; the 8-step DMD2 image keeps the subject and setting, its details move) |
+
+`noise=torch`: 524288 values of `torch.randn([1, 128, 64, 64], generator=torch.Generator("cpu").manual_seed(7))`
+and the reference runs' dumped initial noise (seed 42, 512 and 1024 px) are reproduced bit for bit. ComfyUI's
+own `flux2-vae_small.safetensors` (Comfy-Org/MOSS-Image, also in lodestones/Kromoss' `vae/`) is not the same
+checkpoint as the diffusers `vae/diffusion_pytorch_model.safetensors` (110 tensors differ, the batch-norm
+statistics among them): through it the reference latent decodes 82 dB from the diffusers VAE's image.
 
 ComfyUI's schedules and `er_sde` are checked in the unit tests against ComfyUI's own code (beta57,
 beta and simple sigmas to 2e-6 with scipy's beta quantiles; the ER-SDE update on a toy model to

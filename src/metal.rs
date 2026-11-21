@@ -260,7 +260,7 @@ kernel void gemm_q4a(device const void* qb [[buffer(0)]], device const void* sb 
                      uint sg [[simdgroup_index_in_threadgroup]]) {
     threadgroup float Ws[64 * LD];
     Q4A w = { MK_Q4, ob + op.o_off, op.gpr, op.gk }; gemm_body<Q4A>(w, x, y, p, tg, tid, sg, Ws); }
-CONV(conv_bf, BfW, MK_BF) CONV(conv_q8, Q8W, MK_Q8) CONV(conv_q4, Q4W, MK_Q4)
+CONV(conv_bf, BfW, MK_BF) CONV(conv_q8, Q8W, MK_Q8) CONV(conv_q4, Q4W, MK_Q4) CONV(conv_f32, F32W, MK_F32)
 
 // ---- Normalization statistics and softmax --------------------------------------------------------
 // Two passes (mean, then the mean squared deviation) for accuracy.
@@ -2820,9 +2820,16 @@ impl Backend for MetalBackend {
 
     fn conv2d(&self, x: &[f32], g: &crate::gpu::ConvGeom, norm: Option<&crate::gpu::NormSpec>, job: &mut Job) -> bool {
         use crate::gpu::NormKind;
-        if matches!(job.w, WeightRef::Gguf(_)) {
-            return false;
-        }
+        // Float32 weights (GGUF F32: exact float32 convolutions, `conv_f32`); other GGUF formats
+        // have no convolution kernel.
+        let f32_pipe = match &job.w {
+            WeightRef::Gguf(m) if m.kind == GgmlType::F32 => match self.named_pipeline("conv_f32") {
+                Some(p) => Some(p),
+                None => return false,
+            },
+            WeightRef::Gguf(_) => return false,
+            _ => None,
+        };
         let n_in = g.k * g.k * g.cin;
         let t = g.oh * g.ow;
         let npx = g.h * g.w;
@@ -2945,7 +2952,10 @@ impl Backend for MetalBackend {
                 }
                 None => {}
             }
-            let (fi, elem_bytes, scale_bytes) = format_index(&job.w);
+            let (fi, elem_bytes, scale_bytes) = match f32_pipe {
+                Some(_) => (0, 4, 1),
+                None => format_index(&job.w),
+            };
             let params = ConvParams {
                 n_out: job.n_out as u32,
                 n_in: n_in as u32,
@@ -2971,7 +2981,7 @@ impl Backend for MetalBackend {
                 },
                 _p: 0,
             };
-            set_pipe(enc, self.sels.set_pipeline, self.conv_pipes[fi]);
+            set_pipe(enc, self.sels.set_pipeline, f32_pipe.unwrap_or(self.conv_pipes[fi]));
             set_buf(enc, self.sels.set_buffer, mw.data.id, 0, 0);
             set_buf(
                 enc,
