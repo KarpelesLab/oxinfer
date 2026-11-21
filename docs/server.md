@@ -70,19 +70,33 @@ and plain-text `document` blocks; `tool_use` blocks of assistant turns as tool c
 (`name`, `description`, `input_schema`; Anthropic's server tools such as web search are left
 out) and `tool_choice` (`auto`, `any`, `tool`, `none`); `thinking` (`enabled` or `adaptive`:
 thinking on, `disabled`: off, absent: the model's default); `max_tokens` (required, as with
-Anthropic), `temperature`, `top_p`, `top_k`, `stop_sequences`. Thinking blocks of earlier turns
-and `cache_control` marks are ignored (the server's own cache reuse applies). The reply has
-`thinking`, `text` and `tool_use` content blocks, `stop_reason` `end_turn`, `max_tokens` or
-`tool_use`, and `usage` (`input_tokens`, `cache_read_input_tokens`, `output_tokens`). With
-`"stream": true` it is Anthropic's event stream: `message_start`, `content_block_start` /
-`content_block_delta` (`thinking_delta`, `text_delta`, and `input_json_delta` with a tool call's
-whole input) / `content_block_stop`, `message_delta`, `message_stop`, and `ping` events while the
-model loads or reads the prompt. Errors have Anthropic's shape (`{"type": "error", "error":
-{"type", "message"}}`). The key may come as `x-api-key` as well as `Authorization: Bearer`.
+Anthropic), `temperature`, `top_p`, `top_k`, `stop_sequences`. Consecutive messages of one role
+are one turn, as with Anthropic. `cache_control` marks (on any block, the system prompt or the
+tools), `metadata`, the `anthropic-beta` and `anthropic-version` headers and the `?beta=true`
+query are accepted and ignored (the server's own cache reuse applies). The reply has
+`thinking`, `text` and `tool_use` content blocks, `stop_reason` `end_turn`, `max_tokens`,
+`stop_sequence` (with `stop_sequence` set) or `tool_use`, and `usage` (`input_tokens`,
+`cache_read_input_tokens`, `output_tokens`). With `"stream": true` it is Anthropic's event
+stream: `message_start`, `content_block_start` / `content_block_delta` (`thinking_delta` and a
+closing `signature_delta`, `text_delta`, and `input_json_delta` with a tool call's whole input) /
+`content_block_stop`, `message_delta`, `message_stop`, and `ping` events while the model loads or
+reads the prompt. Errors have Anthropic's shape (`{"type": "error", "error": {"type",
+"message"}}`), a missing key or a malformed body included. The key may come as `x-api-key` as
+well as `Authorization: Bearer`.
+
+Thinking blocks carry a `signature`: an HMAC-SHA256 of the thinking text under the server's key
+(`--thinking-key KEY`, key `thinking_key`; by default a random key per start). Clients such as
+Claude Code send the blocks back in later turns, interleaved with `tool_use` and `tool_result`
+turns; a block whose signature verifies is accepted, and its reasoning counts in
+`count_tokens` within the current tool loop (the model's own record of the conversation holds
+it, so it is not fed again). A block that does not verify (edited, from another server, or from
+before a restart with a random key) and `redacted_thinking` blocks are dropped without an error:
+nothing a client sends as thinking reaches the model. Servers that share a key accept each
+other's blocks, and a set key keeps them valid across restarts.
 `/v1/messages/count_tokens` counts the system prompt, messages and tool definitions with the
 model's tokenizer (loading it if needed), plus four tokens per message for the template: an
-estimate within a few tokens. Not supported: thinking signatures (sent empty), redacted thinking,
-the server tools, PDF documents, the Batches and Files APIs. In the library it is `Api::handle`
+estimate within a few tokens. Not supported: the server tools, PDF documents, images in tool
+results, the Batches and Files APIs. In the library it is `Api::handle`
 on that path, in C `oxi_server_handle`.
 
 ### Progress before the first token
@@ -154,6 +168,7 @@ Server options: `--listen ADDR` (port 0 picks one), `--api-key KEY` (or `$OXINFE
 requests need `Authorization: Bearer KEY`), `--cors ORIGIN`, `--max-body-mb N` (default 16),
 `--preload`, `--download`, `--memory-gb F`, `--cache-dir DIR`, `--threads N`,
 `--prompt-cache DIR|auto` and `--prompt-cache-gb F` (the chat models' prompt cache),
+`--thinking-key KEY` (the key of [thinking signatures](#anthropic-messages-api)),
 `--tls-cert FILE --tls-key FILE` or `--self-signed` for HTTPS, `--workers N` (connections served
 at once, default 32), `--quiet`; `web=1` (the key of `ServerOptions` and `oxi_server_new`; what `oxinfer web` sets) also serves the [web GUI](web.md) and its `/api/web/` management API. Media URLs in requests may be `data:` URLs or `http(s)://` URLs,
 which the server fetches (`--no-remote-media` turns that off); local paths and `file://` URLs

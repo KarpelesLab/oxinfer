@@ -331,6 +331,13 @@ fn anthropic_messages_routing_and_errors() {
         &msg,
     );
     assert_eq!(st, 401, "{body}");
+    // In Anthropic's error shape, as every error of these endpoints.
+    let v: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        (&v["type"], &v["error"]["type"]),
+        (&json!("error"), &json!("authentication_error")),
+        "{body}"
+    );
     let ok_key = [
         "Host: localhost",
         "Content-Type: application/json",
@@ -357,7 +364,42 @@ fn anthropic_messages_routing_and_errors() {
     assert_eq!(st, 405);
     let (st, body) = request_with(a, "POST", "/v1/messages/count_tokens", &ok_key, &other);
     assert_eq!(st, 404, "{body}");
+    let (st, body) = request_with(a, "POST", "/v1/messages", &ok_key, "{not json");
+    assert_eq!(st, 400, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["type"], "error", "{body}");
+    // What Claude Code sends besides the conversation: beta headers, cache-control marks,
+    // metadata, thinking blocks of earlier turns (signed by another server here, or redacted),
+    // interleaved with tool calls and results. All accepted: the request gets as far as the load.
+    let claude_code = json!({
+        "model": "m", "max_tokens": 10, "stream": true, "metadata": {"user_id": "session"},
+        "thinking": {"type": "enabled", "budget_tokens": 4000},
+        "system": [{"type": "text", "text": "You are a coding agent.", "cache_control": {"type": "ephemeral"}}],
+        "tools": [{"name": "Bash", "description": "Runs a command", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}},
+                   "cache_control": {"type": "ephemeral"}}],
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "List the files", "cache_control": {"type": "ephemeral"}}]},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "I should run ls.", "signature": "AaGVsbG8gd29ybGQgdGhpcyBpcyBub3QgYSBzaWduYXR1cmU="},
+                {"type": "redacted_thinking", "data": "EmwKAhgBEgy3va3pzix"},
+                {"type": "tool_use", "id": "toolu_01", "name": "Bash", "input": {"command": "ls"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_01", "content": "a.txt", "cache_control": {"type": "ephemeral"}}]}
+        ]
+    })
+    .to_string();
+    let mut beta = ok_key.to_vec();
+    beta.push("anthropic-beta: interleaved-thinking-2025-05-14,prompt-caching-2024-07-31,fine-grained-tool-streaming-2025-05-14");
+    let (st, body) = request_with(a, "POST", "/v1/messages?beta=true", &beta, &claude_code);
+    // Streamed: the stream starts, and the load failure comes as its error event.
+    assert_eq!(st, 200, "{body}");
+    assert!(body.contains("event: message_start") && body.contains("event: error"), "{body}");
+    assert!(sse_events(&body).iter().any(|e| e["error"]["type"] == "api_error"), "{body}");
     s.stop().unwrap();
+    // The signing key is a server option.
+    let mut o = ServerOptions::default();
+    o.set("thinking_key", "secret").unwrap();
+    assert_eq!(o.thinking_key.as_deref(), Some("secret"));
+    let o = ServerOptions::from_json(&json!({"thinking_key": "k2"})).unwrap();
+    assert_eq!(o.thinking_key.as_deref(), Some("k2"));
 }
 
 #[test]
@@ -413,6 +455,86 @@ fn anthropic_messages_with_a_model() {
     );
     assert_eq!(st, 200, "{out}");
     assert!(serde_json::from_str::<Value>(&out).unwrap()["input_tokens"].as_u64().unwrap() > 2);
+    s.stop().unwrap();
+}
+
+/// The events of an Anthropic stream, as JSON.
+fn sse_events(out: &str) -> Vec<Value> {
+    out.lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+        .collect()
+}
+
+#[test]
+#[ignore = "fetches Qwen/Qwen3-0.6B"]
+fn anthropic_thinking_signatures() {
+    let model = env("OXINFER_E2E_CHAT", "Qwen/Qwen3-0.6B");
+    let s = serve(&format!("model=m={model}; thinking_key=shared"));
+    let a = s.addr();
+    let tools = json!([{"name": "get_weather", "description": "The weather in a city", "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]);
+    let q = json!({"role": "user", "content": "What is the weather in Paris? Use the tool."});
+    let body = json!({"model": "m", "max_tokens": 600, "temperature": 0, "tools": tools, "thinking": {"type": "enabled", "budget_tokens": 500},
+        "messages": [q]});
+    let (st, out) = request(a, "POST", "/v1/messages", &body.to_string());
+    assert_eq!(st, 200, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    let content = v["content"].as_array().unwrap().clone();
+    let thinking = content.iter().find(|b| b["type"] == "thinking").expect("a thinking block").clone();
+    assert!(!thinking["thinking"].as_str().unwrap().is_empty());
+    let sig = thinking["signature"].as_str().unwrap().to_string();
+    assert!(!sig.is_empty(), "{out}");
+    assert_eq!(v["stop_reason"], "tool_use", "{out}");
+    let call = content.iter().find(|b| b["type"] == "tool_use").unwrap().clone();
+
+    // Sent back (thinking, then the call) with the tool's result: the tool loop goes on.
+    let turn = |thinking: &Value| {
+        json!({"model": "m", "max_tokens": 300, "temperature": 0, "tools": tools, "thinking": {"type": "enabled", "budget_tokens": 200},
+            "messages": [q, {"role": "assistant", "content": [thinking, call]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": call["id"], "content": "Sunny, 21 C"}]}]})
+    };
+    let mut tampered = thinking.clone();
+    tampered["signature"] = json!(format!("{}x", &sig[..sig.len() - 1]));
+    // count_tokens counts the reasoning of the current tool loop when its signature verifies.
+    let count = |b: &Value| {
+        let (st, out) = request(a, "POST", "/v1/messages/count_tokens", &b.to_string());
+        assert_eq!(st, 200, "{out}");
+        serde_json::from_str::<Value>(&out).unwrap()["input_tokens"].as_u64().unwrap()
+    };
+    assert!(count(&turn(&thinking)) > count(&turn(&tampered)));
+    // Another server with the same key verifies it too; one with its own random key does not.
+    let s2 = serve(&format!("model=m={model}; thinking_key=shared"));
+    let (st, out) = request(s2.addr(), "POST", "/v1/messages/count_tokens", &turn(&thinking).to_string());
+    assert_eq!(
+        (st, serde_json::from_str::<Value>(&out).unwrap()["input_tokens"].as_u64().unwrap()),
+        (200, count(&turn(&thinking)))
+    );
+    s2.stop().unwrap();
+    let s3 = serve(&format!("model=m={model}"));
+    let (st, out) = request(s3.addr(), "POST", "/v1/messages/count_tokens", &turn(&thinking).to_string());
+    assert_eq!(
+        (st, serde_json::from_str::<Value>(&out).unwrap()["input_tokens"].as_u64().unwrap()),
+        (200, count(&turn(&tampered)))
+    );
+    s3.stop().unwrap();
+
+    // Streamed: the thinking block ends with a signature_delta that verifies its deltas.
+    let mut b = turn(&tampered);
+    b["stream"] = json!(true);
+    let (st, out) = request(a, "POST", "/v1/messages", &b.to_string());
+    assert_eq!(st, 200, "{out}");
+    let ev = sse_events(&out);
+    let text: String = ev.iter().filter_map(|e| e["delta"]["thinking"].as_str()).collect();
+    let sigs: Vec<&str> = ev.iter().filter_map(|e| e["delta"]["signature"].as_str()).collect();
+    assert_eq!(sigs.len(), 1, "{out}");
+    let i = ev.iter().position(|e| e["delta"]["type"] == "signature_delta").unwrap();
+    assert_eq!(ev[i + 1]["type"], "content_block_stop", "the signature closes the block");
+    let answer: String = ev.iter().filter_map(|e| e["delta"]["text"].as_str()).collect();
+    assert!(answer.to_lowercase().contains("sunny") || answer.contains("21"), "{answer}");
+    // That signature verifies: the streamed block counts in a next tool loop's tokens.
+    let streamed = json!({"type": "thinking", "thinking": text, "signature": sigs[0]});
+    let bad = json!({"type": "thinking", "thinking": text, "signature": sig});
+    assert!(count(&turn(&streamed)) > count(&turn(&bad)));
     s.stop().unwrap();
 }
 

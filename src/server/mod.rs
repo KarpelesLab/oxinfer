@@ -46,6 +46,7 @@ pub mod http;
 mod media;
 mod openai;
 mod registry;
+mod sign;
 pub mod web;
 
 pub use registry::Kind;
@@ -238,6 +239,12 @@ pub struct ServerOptions {
     /// `oxinfer web`): browsing the model catalog, downloads with progress, loading and
     /// unloading models (which then join the whitelist), the cache and its disk. See [`web`].
     pub web: bool,
+    /// The key of the signatures of the thinking blocks `/v1/messages` returns (key
+    /// `thinking_key`, any string): an HMAC-SHA256 of the thinking text, checked when a client
+    /// sends the block back. Default: a random key per start, so signatures from before a restart
+    /// no longer verify (such blocks are dropped without an error); set one to keep them valid
+    /// across restarts and between servers that share it.
+    pub thinking_key: Option<String>,
 }
 
 impl Default for ServerOptions {
@@ -263,6 +270,7 @@ impl Default for ServerOptions {
             prompt_cache: None,
             prompt_cache_gb: None,
             web: false,
+            thinking_key: None,
         }
     }
 }
@@ -298,6 +306,7 @@ impl ServerOptions {
         "prompt_cache",
         "prompt_cache_gb",
         "web",
+        "thinking_key",
         "config",
     ];
 
@@ -333,6 +342,7 @@ impl ServerOptions {
             }
             "prompt_cache_gb" => self.prompt_cache_gb = opt_str(value).map(|v| num(&v)).transpose()?,
             "web" => self.web = parse_bool(key, value)?,
+            "thinking_key" => self.thinking_key = opt_str(value),
             "config" => {
                 let text = std::fs::read_to_string(value).with_context(|| format!("config: {value}"))?;
                 let v: Value = serde_json::from_str(&text).with_context(|| format!("config: {value}"))?;
@@ -559,6 +569,8 @@ pub struct Api {
     ids: AtomicU64,
     /// The web GUI's state, when [`ServerOptions::web`].
     web: Option<web::WebState>,
+    /// Signs and checks the thinking blocks of `/v1/messages`.
+    signer: sign::ThinkingSigner,
 }
 
 impl Api {
@@ -584,6 +596,7 @@ impl Api {
         let api = Arc::new(Api {
             models,
             web: opts.web.then(|| web::WebState::new(&opts)),
+            signer: sign::ThinkingSigner::new(opts.thinking_key.as_deref()),
             opts,
             ids: AtomicU64::new(0),
         });
@@ -654,6 +667,8 @@ impl Api {
         let t0 = std::time::Instant::now();
         let out = match self.route(req) {
             Ok(o) => o,
+            // Anthropic's clients read errors in Anthropic's shape (a missing key, a body too large).
+            Err(e) if openai::is_anthropic_path(&req.path) => Output::Full(openai::anthropic_error_response(&e)),
             Err(e) => Output::Full(e.response()),
         };
         // The GUI's files and its polling would drown the log.

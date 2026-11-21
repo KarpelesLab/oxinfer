@@ -405,6 +405,8 @@ struct StopFilter<'a> {
     stops: &'a [String],
     held: String,
     hit: bool,
+    /// The stop sequence that was hit.
+    which: Option<String>,
 }
 
 impl<'a> StopFilter<'a> {
@@ -413,6 +415,7 @@ impl<'a> StopFilter<'a> {
             stops,
             held: String::new(),
             hit: false,
+            which: None,
         }
     }
 
@@ -425,8 +428,14 @@ impl<'a> StopFilter<'a> {
             return s.to_string();
         }
         self.held.push_str(s);
-        if let Some(i) = self.stops.iter().filter_map(|st| self.held.find(st.as_str())).min() {
+        if let Some((i, st)) = self
+            .stops
+            .iter()
+            .filter_map(|st| self.held.find(st.as_str()).map(|i| (i, st)))
+            .min_by_key(|&(i, _)| i)
+        {
             self.hit = true;
+            self.which = Some(st.clone());
             let out = self.held[..i].to_string();
             self.held.clear();
             return out;
@@ -529,6 +538,8 @@ struct Choice {
     thinking: String,
     tool_calls: Vec<ToolCall>,
     finish: &'static str,
+    /// The stop sequence that ended the reply.
+    stop_sequence: Option<String>,
     prompt_tokens: usize,
     cached_tokens: usize,
     completion_tokens: usize,
@@ -736,6 +747,7 @@ fn run_chat(api: &Api, req: &ChatRequest, emit: Emit, on: Option<OnStage<'_, '_>
         out.push(Choice {
             logprobs,
             finish: finish_reason(&reply, filter.hit),
+            stop_sequence: filter.which.take(),
             text,
             thinking,
             tool_calls: if filter.hit { Vec::new() } else { reply.tool_calls.clone() },
@@ -941,8 +953,15 @@ fn anthropic_image(b: &Value) -> ApiResult<String> {
 /// An Anthropic Messages request (`/v1/messages`) as the OpenAI chat request it means: the
 /// system prompt as a system message, `tool_use` blocks as tool calls, `tool_result` blocks as tool
 /// messages, images as image parts, `thinking` as the thinking switch, the tools and tool choice
-/// in OpenAI's shape. Thinking blocks of earlier replies and cache-control marks are dropped.
-fn anthropic_to_openai(v: &Value) -> ApiResult<Value> {
+/// in OpenAI's shape. Consecutive messages of one role are one turn, as Anthropic merges them.
+///
+/// Thinking blocks of earlier replies whose signature `signer` verifies become the assistant
+/// message's `reasoning_content` (the engine does not feed it again: its own record of the
+/// conversation holds the reasoning; `count_tokens` counts it within the current tool loop).
+/// Blocks that fail (edited, signed by another server or before a restart with a random key, or
+/// no signer) are dropped without an error, as are `redacted_thinking` blocks, Anthropic's server
+/// tool blocks, and the fields that do not change the reply (`cache_control`, `metadata`, ...).
+fn anthropic_to_openai(v: &Value, signer: Option<&super::sign::ThinkingSigner>) -> ApiResult<Value> {
     let bad = |m: &str, p: &'static str| ApiError::bad(m.to_string()).param(p);
     let mut msgs: Vec<Value> = Vec::new();
     match v.get("system") {
@@ -969,6 +988,7 @@ fn anthropic_to_openai(v: &Value) -> ApiResult<Value> {
         match role {
             "assistant" => {
                 let mut text = String::new();
+                let mut thinking = String::new();
                 let mut calls = Vec::new();
                 for b in &blocks {
                     match b.get("type").and_then(Value::as_str) {
@@ -978,10 +998,42 @@ fn anthropic_to_openai(v: &Value) -> ApiResult<Value> {
                             "type": "function",
                             "function": { "name": b.get("name").cloned().unwrap_or(Value::Null), "arguments": b.get("input").cloned().unwrap_or(json!({})) },
                         })),
-                        _ => {} // thinking, redacted_thinking, server tool blocks
+                        Some("thinking") => {
+                            let t = b.get("thinking").and_then(Value::as_str).unwrap_or_default();
+                            let sig = b.get("signature").and_then(Value::as_str).unwrap_or_default();
+                            if !t.is_empty() && signer.is_some_and(|s| s.verify(t, sig)) {
+                                thinking.push_str(t);
+                            }
+                        }
+                        _ => {} // redacted_thinking, server tool blocks
                     }
                 }
+                // Consecutive assistant messages are one turn.
+                if let Some(prev) = msgs
+                    .last_mut()
+                    .filter(|m| m["role"] == "assistant" && m.get("tool_calls").is_none())
+                {
+                    let mut t = prev["content"].as_str().unwrap_or_default().to_string();
+                    t.push_str(&text);
+                    prev["content"] = t.into();
+                    if !thinking.is_empty() {
+                        let mut r = prev
+                            .get("reasoning_content")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        r.push_str(&thinking);
+                        prev["reasoning_content"] = r.into();
+                    }
+                    if !calls.is_empty() {
+                        prev["tool_calls"] = Value::Array(calls);
+                    }
+                    continue;
+                }
                 let mut msg = json!({ "role": "assistant", "content": text });
+                if !thinking.is_empty() {
+                    msg["reasoning_content"] = thinking.into();
+                }
                 if !calls.is_empty() {
                     msg["tool_calls"] = Value::Array(calls);
                 }
@@ -1015,7 +1067,14 @@ fn anthropic_to_openai(v: &Value) -> ApiResult<Value> {
                     }
                 }
                 if !parts.is_empty() {
-                    msgs.push(json!({ "role": "user", "content": parts }));
+                    // Consecutive user messages are one turn.
+                    if let Some(prev) = msgs.last_mut().filter(|m| m["role"] == "user")
+                        && let Some(a) = prev["content"].as_array_mut()
+                    {
+                        a.extend(parts);
+                    } else {
+                        msgs.push(json!({ "role": "user", "content": parts }));
+                    }
                 }
             }
             // (Some clients put system turns among the messages.)
@@ -1076,8 +1135,9 @@ fn anthropic_to_openai(v: &Value) -> ApiResult<Value> {
     Ok(out)
 }
 
-fn anthropic_stop(finish: &str) -> &'static str {
-    match finish {
+fn anthropic_stop(c: &Choice) -> &'static str {
+    match c.finish {
+        _ if c.stop_sequence.is_some() => "stop_sequence",
         "tool_calls" => "tool_use",
         "length" => "max_tokens",
         _ => "end_turn",
@@ -1097,6 +1157,18 @@ fn anthropic_error(e: &ApiError) -> Value {
     json!({ "type": "error", "error": { "type": kind, "message": e.message } })
 }
 
+/// Whether `path` is an endpoint of Anthropic's API (errors in its shape).
+pub(super) fn is_anthropic_path(path: &str) -> bool {
+    let p = path.trim_end_matches('/');
+    let p = p.strip_prefix("/v1").unwrap_or(p);
+    p == "/messages" || p == "/messages/count_tokens"
+}
+
+/// An error of an Anthropic endpoint as its response.
+pub(super) fn anthropic_error_response(e: &ApiError) -> ApiResponse {
+    ApiResponse::json(e.status, &anthropic_error(e))
+}
+
 fn anthropic_tool_id(api: &Api) -> String {
     api.new_id("toolu_")
 }
@@ -1112,12 +1184,36 @@ pub(super) fn messages(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
     }
 }
 
+/// The thinking blocks (and redacted ones) of a request's assistant turns: (verified, dropped).
+fn thinking_blocks(api: &Api, body: &Value) -> (usize, usize) {
+    let (mut ok, mut dropped) = (0, 0);
+    let msgs = body.get("messages").and_then(Value::as_array).into_iter().flatten();
+    for b in msgs.filter_map(|m| m.get("content").and_then(Value::as_array)).flatten() {
+        match b.get("type").and_then(Value::as_str) {
+            Some("thinking") => {
+                let t = b.get("thinking").and_then(Value::as_str).unwrap_or_default();
+                let s = b.get("signature").and_then(Value::as_str).unwrap_or_default();
+                if api.signer.verify(t, s) { ok += 1 } else { dropped += 1 }
+            }
+            Some("redacted_thinking") => dropped += 1,
+            _ => {}
+        }
+    }
+    (ok, dropped)
+}
+
 fn messages_inner(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
     if body.get("max_tokens").is_none() {
         return Err(ApiError::bad("max_tokens is required").param("max_tokens"));
     }
-    let req = ChatRequest::parse(&anthropic_to_openai(body)?)?;
+    let req = ChatRequest::parse(&anthropic_to_openai(body, Some(&api.signer))?)?;
     api.models.check(&req.model, Kind::Chat)?;
+    if api.opts.log {
+        let (ok, dropped) = thinking_blocks(api, body);
+        if ok + dropped > 0 {
+            eprintln!("[messages: thinking blocks sent back: {ok} verified, {dropped} dropped]");
+        }
+    }
     let id = api.new_id("msg_");
     if req.params.stream {
         let api = api.clone();
@@ -1134,7 +1230,7 @@ fn messages_inner(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
     let c = choices.first().ok_or_else(|| ApiError::new(499, "the client closed the request"))?;
     let mut content = Vec::new();
     if !c.thinking.is_empty() {
-        content.push(json!({ "type": "thinking", "thinking": c.thinking, "signature": "" }));
+        content.push(json!({ "type": "thinking", "thinking": c.thinking, "signature": api.signer.sign(&c.thinking) }));
     }
     if !c.text.is_empty() || c.tool_calls.is_empty() {
         content.push(json!({ "type": "text", "text": c.text }));
@@ -1151,8 +1247,8 @@ fn messages_inner(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
             "role": "assistant",
             "model": req.model,
             "content": content,
-            "stop_reason": anthropic_stop(c.finish),
-            "stop_sequence": null,
+            "stop_reason": anthropic_stop(c),
+            "stop_sequence": c.stop_sequence,
             "usage": {
                 "input_tokens": c.prompt_tokens - c.cached_tokens,
                 "cache_read_input_tokens": c.cached_tokens,
@@ -1168,8 +1264,9 @@ fn event(sink: Sink, name: &str, v: &Value) -> bool {
 }
 
 /// The streamed form: `message_start`, a `thinking` and / or `text` content block with its
-/// deltas, a `tool_use` block per call (its input in one `input_json_delta`), `message_delta`
-/// with the stop reason and `message_stop`; `ping` while the model loads or reads the prompt.
+/// deltas (a thinking block ends with its `signature_delta`), a `tool_use` block per call (its
+/// input in one `input_json_delta`), `message_delta` with the stop reason and `message_stop`;
+/// `ping` while the model loads or reads the prompt.
 fn stream_messages(api: &Api, req: &ChatRequest, id: &str, sink: Sink) {
     let start = json!({
         "type": "message_start",
@@ -1184,6 +1281,18 @@ fn stream_messages(api: &Api, req: &ChatRequest, id: &str, sink: Sink) {
     let out = std::cell::RefCell::new(&mut *sink);
     // The open block: its index and whether it is thinking.
     let mut block: Option<(usize, bool)> = None;
+    // The open thinking block's text, signed when it closes.
+    let thought = std::cell::RefCell::new(String::new());
+    let close = |s: &mut dyn FnMut(&[u8]) -> bool, (i, thinking): (usize, bool)| {
+        if thinking {
+            let sig = api.signer.sign(&std::mem::take(&mut *thought.borrow_mut()));
+            let d = json!({ "type": "content_block_delta", "index": i, "delta": { "type": "signature_delta", "signature": sig } });
+            if !event(s, "content_block_delta", &d) {
+                return false;
+            }
+        }
+        event(s, "content_block_stop", &json!({ "type": "content_block_stop", "index": i }))
+    };
     let mut next = 0usize;
     let mut last_ping: Option<std::time::Instant> = None;
     let r = run_chat(
@@ -1191,11 +1300,8 @@ fn stream_messages(api: &Api, req: &ChatRequest, id: &str, sink: Sink) {
         req,
         &mut |_, text, thinking, _| {
             let mut s = out.borrow_mut();
-            if block.is_some_and(|(_, t)| t != thinking) {
-                let (i, _) = block.take().unwrap();
-                if !event(&mut **s, "content_block_stop", &json!({ "type": "content_block_stop", "index": i })) {
-                    return false;
-                }
+            if block.is_some_and(|(_, t)| t != thinking) && !close(&mut **s, block.take().unwrap()) {
+                return false;
             }
             if block.is_none() {
                 let cb = if thinking {
@@ -1214,6 +1320,7 @@ fn stream_messages(api: &Api, req: &ChatRequest, id: &str, sink: Sink) {
                 next += 1;
             }
             let delta = if thinking {
+                thought.borrow_mut().push_str(text);
                 json!({ "type": "thinking_delta", "thinking": text })
             } else {
                 json!({ "type": "text_delta", "text": text })
@@ -1238,8 +1345,8 @@ fn stream_messages(api: &Api, req: &ChatRequest, id: &str, sink: Sink) {
     match r {
         Ok(choices) => {
             let Some(c) = choices.first() else { return };
-            if let Some((i, _)) = block.take() {
-                event(sink, "content_block_stop", &json!({ "type": "content_block_stop", "index": i }));
+            if let Some(b) = block.take() {
+                close(sink, b);
             }
             for t in &c.tool_calls {
                 let cb = json!({ "type": "tool_use", "id": anthropic_tool_id(api), "name": t.name, "input": {} });
@@ -1257,7 +1364,7 @@ fn stream_messages(api: &Api, req: &ChatRequest, id: &str, sink: Sink) {
             }
             let d = json!({
                 "type": "message_delta",
-                "delta": { "stop_reason": anthropic_stop(c.finish), "stop_sequence": null },
+                "delta": { "stop_reason": anthropic_stop(c), "stop_sequence": c.stop_sequence },
                 "usage": { "input_tokens": c.prompt_tokens - c.cached_tokens, "cache_read_input_tokens": c.cached_tokens, "output_tokens": c.completion_tokens },
             });
             event(sink, "message_delta", &d);
@@ -1274,7 +1381,7 @@ fn stream_messages(api: &Api, req: &ChatRequest, id: &str, sink: Sink) {
 /// for the template's markers: an estimate within a few tokens of the formatted prompt.
 pub(super) fn count_tokens(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
     let r = (|| -> ApiResult<Value> {
-        let oa = anthropic_to_openai(body)?;
+        let oa = anthropic_to_openai(body, Some(&api.signer))?;
         let model = oa
             .get("model")
             .and_then(Value::as_str)
@@ -1282,8 +1389,16 @@ pub(super) fn count_tokens(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
         api.models.check(model, Kind::Chat)?;
         let mut text = String::new();
         let mut n_msgs = 0;
-        for m in oa["messages"].as_array().into_iter().flatten() {
+        let msgs = oa["messages"].as_array().cloned().unwrap_or_default();
+        // The current tool loop (after the last user turn): its replies' reasoning is in the context.
+        let loop_start = msgs.iter().rposition(|m| m["role"] == "user").unwrap_or(0);
+        for (k, m) in msgs.iter().enumerate() {
             n_msgs += 1;
+            if k > loop_start
+                && let Some(r) = m["reasoning_content"].as_str()
+            {
+                text.push_str(r);
+            }
             match &m["content"] {
                 Value::String(s) => text.push_str(s),
                 Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).for_each(|t| text.push_str(t)),
@@ -1501,6 +1616,7 @@ impl Completion {
                     logprobs,
                     generated_chars: text.chars().count() - echoed,
                     finish: finish_reason(&reply, filter.hit),
+                    stop_sequence: filter.which.take(),
                     text,
                     thinking: String::new(),
                     tool_calls: Vec::new(),
@@ -1830,7 +1946,8 @@ mod tests {
                 ]}
             ]
         });
-        let o = anthropic_to_openai(&v).unwrap();
+        let o = anthropic_to_openai(&v, None).unwrap();
+        assert!(o["messages"][2].get("reasoning_content").is_none(), "unsigned thinking is dropped");
         let r = ChatRequest::parse(&o).unwrap();
         assert_eq!(r.messages.len(), 5);
         assert_eq!((r.messages[0].role, r.messages[0].text.as_str()), (Role::System, "Be brief."));
@@ -1847,14 +1964,72 @@ mod tests {
         assert_eq!(r.tool_choice, ToolChoice::Function("read".into()));
         assert_eq!((r.think, r.params.stream, r.params.max_tokens), (Some(true), true, Some(100)));
         assert_eq!(r.params.stop, vec!["END".to_string()]);
-        assert_eq!(anthropic_stop("tool_calls"), "tool_use");
-        assert_eq!(anthropic_stop("length"), "max_tokens");
-        let any = anthropic_to_openai(&json!({"model": "m", "messages": [], "tools": v["tools"], "tool_choice": {"type": "any"}})).unwrap();
+        let choice = |finish, stop: Option<&str>| Choice {
+            logprobs: None,
+            text: String::new(),
+            thinking: String::new(),
+            tool_calls: Vec::new(),
+            finish,
+            stop_sequence: stop.map(str::to_string),
+            prompt_tokens: 0,
+            cached_tokens: 0,
+            completion_tokens: 0,
+            generated_chars: 0,
+        };
+        assert_eq!(anthropic_stop(&choice("tool_calls", None)), "tool_use");
+        assert_eq!(anthropic_stop(&choice("length", None)), "max_tokens");
+        assert_eq!(anthropic_stop(&choice("stop", None)), "end_turn");
+        assert_eq!(anthropic_stop(&choice("stop", Some("END"))), "stop_sequence");
+        let any = anthropic_to_openai(
+            &json!({"model": "m", "messages": [], "tools": v["tools"], "tool_choice": {"type": "any"}}),
+            None,
+        )
+        .unwrap();
         assert_eq!(any["tool_choice"], "required");
-        assert!(anthropic_to_openai(&json!({"model": "m", "messages": [{"role": "tool", "content": "x"}]})).is_err());
-        let sys =
-            anthropic_to_openai(&json!({"model": "m", "messages": [{"role": "system", "content": "x"}, {"role": "user", "content": "y"}]}))
-                .unwrap();
+        assert!(anthropic_to_openai(&json!({"model": "m", "messages": [{"role": "tool", "content": "x"}]}), None).is_err());
+        let sys = anthropic_to_openai(
+            &json!({"model": "m", "messages": [{"role": "system", "content": "x"}, {"role": "user", "content": "y"}]}),
+            None,
+        )
+        .unwrap();
         assert_eq!(sys["messages"][0], json!({"role": "system", "content": "x"}));
+    }
+
+    #[test]
+    fn anthropic_thinking_blocks() {
+        let signer = super::super::sign::ThinkingSigner::new(Some("k"));
+        let good = signer.sign("First I list the files.");
+        let v = json!({
+            "model": "m", "max_tokens": 10, "metadata": {"user_id": "u"},
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "List", "cache_control": {"type": "ephemeral"}}]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "First I list the files.", "signature": good},
+                    {"type": "redacted_thinking", "data": "opaque"},
+                    {"type": "thinking", "thinking": "Edited.", "signature": good},
+                    {"type": "tool_use", "id": "toolu_1", "name": "ls", "input": {}}
+                ]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "a.txt"}]},
+                // Interleaved: a second reply of the same tool loop, split in two messages.
+                {"role": "assistant", "content": [{"type": "text", "text": "Found "}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "a.txt."}]},
+                {"role": "user", "content": "Thanks"},
+                {"role": "user", "content": [{"type": "text", "text": "Bye"}]}
+            ]
+        });
+        let o = anthropic_to_openai(&v, Some(&signer)).unwrap();
+        let m = o["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 5, "{m:?}");
+        assert_eq!(m[1]["reasoning_content"], "First I list the files.", "only the verified block");
+        assert_eq!(m[1]["tool_calls"][0]["function"]["name"], "ls");
+        assert_eq!(m[2]["role"], "tool");
+        assert_eq!(m[3], json!({"role": "assistant", "content": "Found a.txt."}));
+        assert_eq!(m[4]["content"].as_array().unwrap().len(), 2);
+        // Another server's key: dropped, no error.
+        let o = anthropic_to_openai(&v, Some(&super::super::sign::ThinkingSigner::new(Some("other")))).unwrap();
+        assert!(o["messages"][1].get("reasoning_content").is_none());
+        let r = ChatRequest::parse(&o).unwrap();
+        assert_eq!(r.messages.len(), 5);
+        assert!(is_anthropic_path("/v1/messages") && is_anthropic_path("/messages/count_tokens/") && !is_anthropic_path("/v1/models"));
     }
 }

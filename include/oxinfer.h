@@ -925,6 +925,8 @@ typedef int (*oxi_bytes_fn)(void *user, const char *data, size_t len);
  *   log=0|1              one stderr line per request (default 1)
  *   web=0|1              also serve the web GUI at / and its management API under /api/web/
  *                        (catalog, downloads, cache, loading models; see docs/web.md)
+ *   thinking_key=KEY     key of the HMAC signatures of /v1/messages thinking blocks, checked
+ *                        when clients send them back (default: random per server)
  *   config=PATH          read a JSON file of these options
  * `progress` (may be NULL) reports downloads made by preload / download. Returns NULL on error. */
 OxiServer *oxi_server_new(const char *options, oxi_progress_fn progress, void *user);

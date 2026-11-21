@@ -37,6 +37,8 @@ options:\n\
 \x20 --tls-cert FILE --tls-key FILE  HTTPS with this certificate chain and key (PEM)\n\
 \x20 --self-signed         HTTPS with a generated self-signed certificate\n\
 \x20 --workers N           connections served at once (default 32)\n\
+\x20 --thinking-key KEY    key of the signatures of /v1/messages thinking blocks (default: random\n\
+\x20                       per start; set it to keep them valid across restarts)\n\
 \x20 --quiet               no request log";
 
 /// A caller's own flags: `(flag, value getter)`, true when it handled the flag.
