@@ -58,7 +58,7 @@ is recognised from `model_index.json` (`MOSSImagePipeline`) or `transformer/conf
   RMS norms with weights, per-head q / k RMS norms. Rotary embeddings on 4 axes of 16 frequencies
   (`10000^(-i/16)`), rotate-half: image token `(y, x)` at `(0, L, y - (H-1)/2, x - (W-1)/2)` for an
   `L`-token prompt, text token `j` at `(0, j, 0, 0)`; the image positions depend on the prompt's
-  length, so the conditional and unconditional passes run separately.
+  length, so each guidance branch has rotary tables of its own.
 - **Guidance.** `uncond + g (cond - uncond)` with the negative branch run without block 22
   (`uncond_skip_layers`); guidance 1 runs only the conditional pass. Optional skip-layer guidance
   adds a third pass.
@@ -236,26 +236,43 @@ documentary shot looking down at the book.
 
 ## Speed
 
-Apple M5 Max (18 CPU cores, 128 GB), 1024x1024, bf16 weights, seconds. A pass is one
+Apple M5 Max (18 CPU cores, 40-core GPU, 128 GB), 1024x1024, bf16 weights, seconds. A pass is one
 transformer forward (4096 image tokens + the prompt); 50 steps with CFG are 100 passes, the 8-step
-DMD presets 8.
+DMD presets 8. "denoise" times include the first pass (weights mapped and made resident, the device
+session's buffers made).
 
 | | per pass | 50 steps, CFG 3 | 8 steps, DMD2 | VAE decode |
 |---|---|---|---|---|
-| oxinfer Metal | 3.4-3.8 | 381 | 39 (4.9 per pass with the LoRA) | 6.6-7.4 |
-| oxinfer Metal, GGUF Q4_K_M transformer | | | 47 (5.9 per pass) | |
+| oxinfer Metal, the per-op path (before; quiet machine) | 3.4 | 340 | 37.3 (4.7 per pass with the LoRA) | 6.6-6.9 |
+| oxinfer Metal, whole passes (quiet machine) | 1.4 (both branches of a step: 2.8) | | | |
+| oxinfer Metal, whole passes, final build (load 9-14, GPU idle when each run started) | 1.8 (single branch: 2.0-2.9, faster as the GPU clocks up) | 180 | 17.1-17.9 (2.1-2.2 per pass with the LoRA) | 2.2-2.8 |
+| the per-op path / whole passes, interleaved in one busy hour* | 3.9 / 2.2 | 387 / 219 | 47-49 / 21.5-23.6 | 7.2-10.3 / 4.0-5.1, 2.4-2.5 with `conv_f32` |
+| whole passes, ConvRot `Q8_CR` / `Q4_CR_L` transformer, busy* | | | 19.5 / 19.2 (2.4 per pass) | |
+| whole passes, FameGrid preset (LoKr merged, ER-SDE, 24 steps CFG 2.5), busy* | 2.1 | 98.7 for its 48 passes | | |
 | diffusers on MPS (bf16, the release's pipeline) | 2.43 | 244 | 23 (2.9 per pass with the hooks) | about 3 |
-| oxinfer CPU | 32-34 | about 55 min | 58-60 per pass with the LoRA* | 12 |
+| oxinfer CPU** | 30 | about 50 min | 40 per pass with the LoRA | 10.4 |
+| oxinfer CPU, FameGrid (LoKr merged into bf16)** | 43 | | | |
 | diffusers on the CPU, float32 | 121 | | | |
 
-\* measured while other jobs kept the machine's load average at 60-80; the transformer pass alone
-measured 32-34 s on a quieter machine.
+\* Load average 9-16 from other jobs, and the GPU shared with them (headless browsers running WebGPU
+pages, other agents' tests): the same per-op GEMM that took 4.3 ms on the quiet machine took 7.0 ms
+then. Before and after ran alternately, so their ratio (1.8x for 50 steps, 2.1-2.2x for DMD2, 1.8x
+for the VAE before `conv_f32`, then 4.1 -> 2.4 s) is the comparison to read; batching the guidance
+branches (`batch_guidance`) made no measurable difference (215 vs 219 s), the passes being bound by
+the GEMMs either way.
 
-Where a Metal pass goes (`examples/moss_check.rs` prints it): matmuls 2.7 s (about 14.5 TFLOPS
-over the pass's 39 TFLOPs), attention 0.7 s, the SiTU feed-forward activation and rotary embeddings on
-the CPU 0.4 s, norms 0.14 s, and 0.8 s of copies in and out of GPU buffers. diffusers on MPS is about
-1.5 times faster per pass; closing that gap needs the elementwise work on the GPU and fewer round
-trips. ComfyUI and stable-diffusion.cpp (whose `moss_image` support is in a fork) were not run here.
-The text encoder takes 2-4 s per call (mapped Qwen3.5-9B, read again after the first call from the
-page cache).
+\*\* Each run started with the 1-minute load average below 6; the base pass (29.7 / 30.3 s, the CPU
+path unchanged: rel L2 2.1e-6 / 1.5e-6 against the float32 reference) ran alone, while other jobs
+started during the DMD2 and FameGrid runs (load 40 and 60 at their ends), so those two are upper
+bounds; the LoKr-merged model costs the same per pass as the base one. On the CPU the pass is 62%
+matmuls and 36% attention.
+
+Where a whole Metal pass goes, from the per-op GEMM timings (quiet machine): the matmuls about 1.0 s
+(39 TFLOPs at ~40 TFLOPS on the matrix units; the `ffn_down` GEMM is the slowest at ~26 TFLOPS), the
+flash attention about 0.2 s, and the remaining ~0.2 s of the measured 1.4 s the row kernels
+(modulated norms, q / k norms with the rotary embedding, SiTU, gated residuals, input rotation for
+ConvRot) and the barriers between dispatches; on the CPU only the rotary tables and the modulation
+vectors. ComfyUI and stable-diffusion.cpp (whose `moss_image` support is
+in a fork) were not run here. The text encoder takes 1-4 s per call (mapped Qwen3.5-9B, read again
+after the first call from the page cache).
 
