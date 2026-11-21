@@ -1,0 +1,882 @@
+// Inkling-2 kernels (metal_inkling.rs): appended to the decode library, whose matvec templates
+// (`mv_acc`, the weight loaders) the expert kernels use. Activations are float rows of the plan's
+// arena (`a`, offsets in floats) for the tokens of a step (one row per token, `h` floats apart
+// unless said otherwise); the model's small tables are in the constants (`c`).
+//
+// Every kernel computes a token's results the same way whatever the number of tokens of the step
+// (the token is a grid dimension), so that a speculative verification pass gives exactly the
+// logits one-token steps give.
+#pragma clang fp reassociate(off)
+
+// The sum of `v` over a threadgroup of `nt` threads (all get it). `red` holds 32 floats.
+inline float ink_sum(float v, threadgroup float* red, uint tid, uint nt) {
+    v = simd_sum(v);
+    uint nsg = (nt + 31) / 32;
+    if (tid % 32 == 0) red[tid / 32] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float s = 0.f;
+    for (uint i = 0; i < nsg; i++) s += red[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return s;
+}
+
+// ---- The attention residual: per query (grid x) and token (grid y), the softmax mix
+// (`q . state / sqrt(h)`) of the block states `s[0..ns]` (already RMS-normed, rows h apart per
+// token) and of the RMS-normed x; with `norm`, the result is RMS-normed with the weights at
+// `nw + query * h`. Output row of (query, token): `out + query * out_qs + token * h`.
+struct IMixP { uint h; uint ns; uint norm; uint x; uint q; uint out; uint out_qs; uint nw; float scale; float eps; float mix_eps; uint _p; uint s[16]; };
+// (One threadgroup of 1024 per (query, token).)
+inline void ink_mix_body(device float* a, device const float* c, constant IMixP& p, uint qi, uint ti, uint tid, uint sg, uint lane,
+                         threadgroup float* red) {
+    constexpr uint nt = 1024;
+    uint h = p.h, ns = p.ns;
+    device const float* x = a + p.x + (ulong)ti * h;
+    device const float* q = c + p.q + (ulong)qi * h;
+    // SIMD-group j < ns: q . state j; ns: q . x; ns + 1: x . x (one SIMD-group per dot product).
+    if (sg <= ns + 1) {
+        device const float* v = sg < ns ? a + p.s[sg] + (ulong)ti * h : x;
+        device const float* w = sg <= ns ? q : x;
+        float d = 0.f;
+        for (uint i = lane; i < h; i += 32) d = fma(w[i], v[i], d);
+        d = simd_sum(d);
+        if (lane == 0) red[sg] = d;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float r = rsqrt(red[ns + 1] / float(h) + p.mix_eps);
+    float sc[17];
+    float m = -INFINITY;
+    for (uint j = 0; j <= ns; j++) {
+        sc[j] = (j == ns ? red[j] * r : red[j]) * p.scale;
+        m = max(m, sc[j]);
+    }
+    float l = 0.f;
+    for (uint j = 0; j <= ns; j++) { sc[j] = exp(sc[j] - m); l += sc[j]; }
+    for (uint j = 0; j <= ns; j++) sc[j] /= l;
+    device float* out = a + p.out + (ulong)qi * p.out_qs + (ulong)ti * h;
+    float oss = 0.f;
+    for (uint i = tid; i < h; i += nt) {
+        float v = sc[ns] * (x[i] * r);
+        for (uint j = 0; j < ns; j++) v += sc[j] * a[p.s[j] + (ulong)ti * h + i];
+        out[i] = v;
+        oss += v * v;
+    }
+    if (p.norm == 0) return;
+    oss = simd_sum(oss);
+    if (lane == 0) red[32 + sg] = oss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.f;
+    for (uint g = 0; g < nt / 32; g++) tot += red[32 + g];
+    float rn = rsqrt(tot / float(h) + p.eps);
+    device const float* w = c + p.nw + (ulong)qi * h;
+    for (uint i = tid; i < h; i += nt) out[i] = out[i] * rn * w[i];
+}
+kernel void ink_mix(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IMixP& p [[buffer(2)]],
+                    uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[64];
+    ink_mix_body(a, c, p, tg.x, tg.y, tid, sg, lane, red);
+}
+
+// ---- RMS norm of rows (grid x: token): `out = x * rsqrt(mean(x^2) + eps) (* w)`; rows `xs` /
+// `os` floats apart. In place allowed.
+struct INormP { uint h; float eps; uint x; uint out; uint w; uint has_w; uint xs; uint os; };
+kernel void ink_norm(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant INormP& p [[buffer(2)]],
+                     uint ti [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                     uint nt [[threads_per_threadgroup]]) {
+    threadgroup float red[32];
+    device const float* x = a + p.x + (ulong)ti * p.xs;
+    device float* out = a + p.out + (ulong)ti * p.os;
+    float ss = 0.f;
+    for (uint i = tid; i < p.h; i += nt) ss += x[i] * x[i];
+    ss = ink_sum(ss, red, tid, nt);
+    float r = rsqrt(ss / float(p.h) + p.eps);
+    for (uint i = tid; i < p.h; i += nt) out[i] = x[i] * r * (p.has_w != 0 ? c[p.w + i] : 1.f);
+}
+
+// ---- A message gate's mix (grid: channel blocks, token): `out = (1 - tanh f) x + tanh(g) m`.
+struct IGmP { uint h; uint x; uint m; uint f; uint g; uint out; };
+kernel void ink_gmix(device float* a [[buffer(0)]], constant IGmP& p [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
+    uint i = gid.x, ti = gid.y;
+    if (i >= p.h) return;
+    ulong o = (ulong)ti * p.h + i;
+    float x = a[p.x + o], m = a[p.m + o];
+    a[p.out + o] = (1.f - precise::tanh(a[p.f + o])) * x + precise::tanh(a[p.g + o]) * m;
+}
+
+// The same and the RMS norm of the result with the weights at `w` into `nout` (one threadgroup of
+// 1024 per token).
+struct IGnP { uint h; uint x; uint m; uint f; uint g; uint nout; uint w; float eps; };
+kernel void ink_gmix_norm(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IGnP& p [[buffer(2)]],
+                          uint ti [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[32];
+    float ss = 0.f;
+    for (uint i = tid; i < p.h; i += 1024) {
+        ulong o = (ulong)ti * p.h + i;
+        float v = (1.f - precise::tanh(a[p.f + o])) * a[p.x + o] + precise::tanh(a[p.g + o]) * a[p.m + o];
+        a[p.nout + o] = v;
+        ss += v * v;
+    }
+    ss = simd_sum(ss);
+    if (lane == 0) red[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tot = 0.f;
+    for (uint g = 0; g < 32; g++) tot += red[g];
+    float r = rsqrt(tot / float(p.h) + p.eps);
+    for (uint i = tid; i < p.h; i += 1024) {
+        ulong o = (ulong)ti * p.h + i;
+        a[p.nout + o] = a[p.nout + o] * r * c[p.w + i];
+    }
+}
+
+// ---- Copies (grid: channel blocks, token): `n` floats per token, rows `n` apart.
+// Rows of `n` floats; destination rows `ds` floats apart.
+struct ICopyP { uint n; uint src; uint dst; uint ds; };
+kernel void ink_copy(device float* a [[buffer(0)]], constant ICopyP& p [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.n) return;
+    a[p.dst + (ulong)gid.y * p.ds + gid.x] = a[p.src + (ulong)gid.y * p.n + gid.x];
+}
+
+// ---- KV cache rows: float32, half or int8 with a float scale per 32 values (separate buffer).
+// KFMT 0: f32, 1: f16, 2: q8.
+template <int KFMT>
+inline float kv_get(device const uchar* kb, device const float* ks, ulong idx) {
+    if (KFMT == 0) return ((device const float*)kb)[idx];
+    if (KFMT == 1) return float(((device const half*)kb)[idx]);
+    return float(((device const char*)kb)[idx]) * ks[idx / 32];
+}
+// Four values from `idx` (a multiple of 4).
+template <int KFMT>
+inline float4 kv_get4(device const uchar* kb, device const float* ks, ulong idx) {
+    if (KFMT == 0) return *(device const float4*)((device const float*)kb + idx);
+    if (KFMT == 1) return float4(*(device const half4*)((device const half*)kb + idx));
+    return float4(*(device const char4*)((device const char*)kb + idx)) * ks[idx / 32];
+}
+
+// ---- Keys and values of the tokens (grid: kv head, token; one thread per channel of a head):
+// the short convolutions (learned taps `[lag][kw]`, plus with `dynamic` a tap per (token, kv
+// head, lag) at `kd` / `vd`), the inputs of earlier positions from the rings (row of position q
+// at `(q + kn - 1) % ring_cap`; the step's own tokens from their rows); then the key's L2 clip
+// and the value's RMS norm, into the caches at the token's position (row `pos % cap` when
+// `cap` is set: a sliding window's ring; else the position). The raw inputs go to the rings.
+struct IKvP { uint kw; uint hd; uint kn; uint nkv; uint dynamic; float norm; float clip; float eps; uint k; uint v; uint kd; uint vd;
+              uint tk; uint tv; uint pos; uint ring_cap; uint cap; float clip_eps; uint ring_write; uint row_base; };
+template <int KFMT>
+inline void kv_store(device uchar* cb, device float* cs, ulong idx, float v, uint lane) {
+    if (KFMT == 0) ((device float*)cb)[idx] = v;
+    else if (KFMT == 1) ((device half*)cb)[idx] = half(v);
+    else {
+        float amax = simd_max(fabs(v));
+        float d = amax / 127.f;
+        float inv = d > 0.f ? 1.f / d : 0.f;
+        ((device char*)cb)[idx] = char(clamp(round(v * inv), -128.f, 127.f));
+        if (lane == 0) cs[idx / 32] = d;
+    }
+}
+template <int KFMT>
+inline void ink_kv_body(device float* a, device const float* c, constant IKvP& p, device float* rk, device float* rv,
+                        device uchar* kc, device uchar* vc, device float* ksc, device float* vsc, uint g, uint ti, uint tid,
+                        threadgroup float* red) {
+    uint ch = g * p.hd + tid, kw = p.kw, kn = p.kn;
+    uint pos = p.pos + ti;
+    float rk_in = a[p.k + (ulong)ti * kw + ch], rv_in = a[p.v + (ulong)ti * kw + ch];
+    float sk = rk_in, sv = rv_in;
+    for (uint lag = 0; lag < kn; lag++) {
+        float xk, xv;
+        if (lag <= ti) {
+            xk = a[p.k + (ulong)(ti - lag) * kw + ch];
+            xv = a[p.v + (ulong)(ti - lag) * kw + ch];
+        } else {
+            int q = int(pos) - int(lag);
+            ulong r = (ulong)((q + int(kn) - 1 + int(p.ring_cap)) % int(p.ring_cap)) * kw + ch;
+            xk = rk[r];
+            xv = rv[r];
+        }
+        float wk = c[p.tk + lag * kw + ch], wv = c[p.tv + lag * kw + ch];
+        if (p.dynamic != 0) {
+            wk += a[p.kd + ((ulong)ti * p.nkv + g) * kn + lag];
+            wv += a[p.vd + ((ulong)ti * p.nkv + g) * kn + lag];
+        }
+        sk += wk * xk;
+        sv += wv * xv;
+    }
+    sk *= p.norm;
+    sv *= p.norm;
+    float nk = ink_sum(sk * sk, red, tid, p.hd);
+    float f = p.clip / (sqrt(nk) + p.clip_eps);
+    if (f < 1.f) sk *= f;
+    float nv = ink_sum(sv * sv, red, tid, p.hd);
+    sv *= rsqrt(nv / float(p.hd) + p.eps);
+    ulong row = p.cap != 0 ? pos % p.cap : pos - p.row_base;
+    kv_store<KFMT>(kc, ksc, row * kw + ch, sk, tid % 32);
+    kv_store<KFMT>(vc, vsc, row * kw + ch, sv, tid % 32);
+    if (p.ring_write != 0) {
+        ulong wr = (ulong)((pos + kn - 1) % p.ring_cap) * kw + ch;
+        rk[wr] = rk_in;
+        rv[wr] = rv_in;
+    }
+}
+#define INK_KV(F) \
+kernel void ink_kv_##F(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IKvP& p [[buffer(2)]], \
+                      device float* rk [[buffer(3)]], device float* rv [[buffer(4)]], device uchar* kc [[buffer(5)]], \
+                      device uchar* vc [[buffer(6)]], device float* ksc [[buffer(7)]], device float* vsc [[buffer(8)]], \
+                      uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { \
+    threadgroup float red[32]; ink_kv_body<F>(a, c, p, rk, rv, kc, vc, ksc, vsc, tg.x, tg.y, tid, red); }
+INK_KV(0) INK_KV(1) INK_KV(2)
+
+// ---- Queries and relative vectors (grid: query head, token; one thread per channel): scaled
+// per channel, clipped to an L2 norm, times `1 + alpha ln(max(1, (pos + 1) / floor))` when
+// `alpha` is set (full layers). In place.
+struct IQP { uint w; uint hd; uint dr; uint nh; uint q; uint r; uint qs; uint rs; float qclip; float rclip; float alpha; float floor_;
+             uint pos; float clip_eps; uint _p0; uint _p1; };
+kernel void ink_q(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IQP& p [[buffer(2)]],
+                  uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float red[32];
+    uint hh = tg.x, ti = tg.y;
+    float tau = 1.f;
+    if (p.alpha != 0.f) tau = 1.f + p.alpha * log(max(1.f, float(p.pos + ti + 1) / p.floor_));
+    device float* q = a + p.q + (ulong)ti * p.w + hh * p.hd;
+    float v = q[tid] * c[p.qs + hh * p.hd + tid];
+    float n = ink_sum(v * v, red, tid, p.hd);
+    float f = p.qclip / (sqrt(n) + p.clip_eps);
+    if (f < 1.f) v *= f;
+    q[tid] = v * tau;
+    device float* r = a + p.r + ((ulong)ti * p.nh + hh) * p.dr;
+    float rv = tid < p.dr ? r[tid] * c[p.rs + hh * p.dr + tid] : 0.f;
+    float rn = ink_sum(rv * rv, red, tid, p.hd);
+    float rf = p.rclip / (sqrt(rn) + p.clip_eps);
+    if (rf < 1.f) rv *= rf;
+    if (tid < p.dr) r[tid] = rv * tau;
+}
+
+// ---- Attention of the tokens' queries (grid: kv head, key split, token): the G query heads of a
+// key/value head over a slice of `chunk` keys of the token's range, with the relative bias of
+// each backward distance below `extent` (the token's relative vector against the bank `rel`,
+// `[dr][extent]` in the constants); partial softmax results to `part` (per token, head and
+// split: D * 32 accumulators, then the max and the sum). The token at position `pos + t` sees
+// positions `max(first, pos + t + 1 - window)..pos + t` (`window` 0: all); key q is cache row
+// `q % cap` (`cap` 0: q).
+struct IAP { uint nh; uint nkv; uint hd; uint dr; uint pos; uint window; uint cap; uint extent; uint _p0; uint maxsplit;
+             float scale; uint q; uint r; uint part; uint rel; uint kw; uint tbase; uint tmp; uint _p1; uint _p2; };
+inline void ink_range(constant IAP& p, uint ti, thread uint& lo, thread uint& hi) {
+    uint pp = p.pos + ti;
+    hi = pp + 1;
+    lo = p.window != 0 && hi > p.window ? hi - p.window : 0;
+}
+// Keys per split of a token's range of `len` keys, and the splits (at most `ms`): the same rule for
+// every token, its own length.
+inline uint ink_chunk(uint len, uint ms) { return max(256u, ((len + ms - 1) / ms + 31) / 32 * 32); }
+inline uint ink_nsplit(uint len, uint ms) { return max(1u, (len + ink_chunk(len, ms) - 1) / ink_chunk(len, ms)); }
+// Where key j is: the rows of the pass's own tokens (`tmp`: positions from `tbase`, a prefill pass
+// longer than a window's ring keeps them apart), else the cache (ring row `j % cap`).
+#define INK_ROW(j) ((p.tmp != 0 && (j) >= p.tbase) ? (ulong)((j) - p.tbase) : (p.cap != 0 ? (ulong)((j) % p.cap) : (ulong)(j)))
+#define INK_KB(j) (p.tmp != 0 && (j) >= p.tbase ? tk : kc)
+#define INK_VB(j) (p.tmp != 0 && (j) >= p.tbase ? tv : vc)
+#define INK_KS(j) (p.tmp != 0 && (j) >= p.tbase ? tks : ksc)
+#define INK_VS(j) (p.tmp != 0 && (j) >= p.tbase ? tvs : vsc)
+template <int D, int G, int KFMT>
+inline void ink_attn_body(device float* a, device const float* c, constant IAP& p, device const uchar* kc, device const uchar* vc,
+                          device const float* ksc, device const float* vsc, device const uchar* tk, device const uchar* tv,
+                          device const float* tks, device const float* tvs, uint g, uint split, uint ti, uint tid, uint sg, uint lane,
+                          threadgroup float* sm, threadgroup float* so, threadgroup float* qs, threadgroup float* bias) {
+    constexpr uint HD = D * 32;
+    uint lo, hi;
+    ink_range(p, ti, lo, hi);
+    uint ns = ink_nsplit(hi - lo, p.maxsplit), chunk = ink_chunk(hi - lo, p.maxsplit);
+    if (split >= ns) return;
+    uint j0 = lo + split * chunk, j1 = min(hi, j0 + chunk);
+    uint h0 = g * G, pp = p.pos + ti;
+    for (uint i = tid; i < G * HD; i += 256) qs[i] = a[p.q + (ulong)ti * p.nh * HD + h0 * HD + i] * p.scale;
+    // The bias of the distances this slice covers: pp - j for j in j0..j1, below the extent.
+    uint dmin = pp + 1 - j1, dmax = pp - j0;
+    uint nb = dmin < p.extent ? min(dmax + 1, p.extent) - dmin : 0;
+    for (uint i = tid; i < G * 1024; i += 256) {
+        uint gg = i / 1024, k = i % 1024;
+        if (k >= nb) continue;
+        float b = 0.f;
+        device const float* rq = a + p.r + ((ulong)ti * p.nh + h0 + gg) * p.dr;
+        for (uint d = 0; d < p.dr; d++) b += rq[d] * c[p.rel + d * p.extent + dmin + k];
+        bias[gg * 1024 + k] = b;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float o[G][D], m[G], l[G];
+    for (int gg = 0; gg < G; gg++) {
+        m[gg] = -INFINITY;
+        l[gg] = 0.f;
+        for (int d = 0; d < D; d++) o[gg][d] = 0.f;
+    }
+    ulong koff = (ulong)g * HD;
+    for (uint base = j0 + sg * 32; base < j1; base += 8 * 32) {
+        uint j = base + lane;
+        float s[G];
+        for (int gg = 0; gg < G; gg++) s[gg] = -INFINITY;
+        if (j < j1) {
+            ulong row = INK_ROW(j) * p.kw + koff;
+            device const uchar* kcb = INK_KB(j);
+            device const float* ksb = INK_KS(j);
+            float acc[G];
+            for (int gg = 0; gg < G; gg++) acc[gg] = 0.f;
+            for (uint d = 0; d < HD; d += 4) {
+                float4 k4 = kv_get4<KFMT>(kcb, ksb, row + d);
+                for (int gg = 0; gg < G; gg++) {
+                    float4 q4 = ((threadgroup const float4*)(qs + gg * HD))[d / 4];
+                    acc[gg] = fma(k4.x, q4.x, acc[gg]);
+                    acc[gg] = fma(k4.y, q4.y, acc[gg]);
+                    acc[gg] = fma(k4.z, q4.z, acc[gg]);
+                    acc[gg] = fma(k4.w, q4.w, acc[gg]);
+                }
+            }
+            uint dist = pp - j;
+            for (int gg = 0; gg < G; gg++) s[gg] = acc[gg] + (dist >= dmin && dist - dmin < nb ? bias[gg * 1024 + dist - dmin] : 0.f);
+        }
+        float e[G];
+        for (int gg = 0; gg < G; gg++) {
+            float mn = max(m[gg], simd_max(s[gg]));
+            float al = mn == -INFINITY ? 1.f : exp(m[gg] - mn);
+            e[gg] = j < j1 ? exp(s[gg] - mn) : 0.f;
+            l[gg] = l[gg] * al + simd_sum(e[gg]);
+            for (int d = 0; d < D; d++) o[gg][d] *= al;
+            m[gg] = mn;
+        }
+        uint nbk = min(32u, j1 - base);
+        for (uint t = 0; t < nbk; t++) {
+            uint jj = base + t;
+            ulong row = INK_ROW(jj) * p.kw + koff + lane * D;
+            device const uchar* vcb = INK_VB(jj);
+            device const float* vsb = INK_VS(jj);
+            float v[D];
+            for (int d = 0; d < D; d += 4) {
+                float4 v4 = kv_get4<KFMT>(vcb, vsb, row + d);
+                v[d] = v4.x; v[d + 1] = v4.y; v[d + 2] = v4.z; v[d + 3] = v4.w;
+            }
+            for (int gg = 0; gg < G; gg++) {
+                float et = simd_shuffle(e[gg], t);
+                for (int d = 0; d < D; d++) o[gg][d] = fma(et, v[d], o[gg][d]);
+            }
+        }
+    }
+    for (int gg = 0; gg < G; gg++) {
+        uint hh = h0 + gg;
+        if (lane == 0) { sm[sg] = m[gg]; sm[8 + sg] = l[gg]; }
+        for (int d = 0; d < D; d++) so[sg * HD + lane * D + d] = o[gg][d];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float M = sm[0];
+        for (uint s2 = 1; s2 < 8; s2++) M = max(M, sm[s2]);
+        float L = 0.f;
+        for (uint s2 = 0; s2 < 8; s2++) L += sm[s2] == -INFINITY ? 0.f : sm[8 + s2] * exp(sm[s2] - M);
+        device float* pr = a + p.part + (((ulong)ti * p.nh + hh) * p.maxsplit + split) * (HD + 2);
+        for (uint i = tid; i < HD; i += 256) {
+            float acc = 0.f;
+            for (uint s2 = 0; s2 < 8; s2++) if (sm[s2] != -INFINITY) acc += so[s2 * HD + i] * exp(sm[s2] - M);
+            pr[i] = acc;
+        }
+        if (tid == 0) { pr[HD] = M; pr[HD + 1] = L; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+#define INK_ATTN(D, G, F) \
+kernel void ink_attn_##D##_##G##_##F(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IAP& p [[buffer(2)]], \
+                         device const uchar* kc [[buffer(3)]], device const uchar* vc [[buffer(4)]], device const float* ksc [[buffer(5)]], \
+                         device const float* vsc [[buffer(6)]], device const uchar* tk [[buffer(7)]], device const uchar* tv [[buffer(8)]], \
+                         device const float* tks [[buffer(9)]], device const float* tvs [[buffer(10)]], \
+                         uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
+    threadgroup float sm[16]; threadgroup float so[8 * D * 32]; threadgroup float qs[G * D * 32]; threadgroup float bias[G * 1024]; \
+    ink_attn_body<D, G, F>(a, c, p, kc, vc, ksc, vsc, tk, tv, tks, tvs, tg.x, tg.y, tg.z, tid, sg, lane, sm, so, qs, bias); }
+INK_ATTN(4, 3, 0) INK_ATTN(4, 3, 1) INK_ATTN(4, 3, 2)
+INK_ATTN(4, 1, 0) INK_ATTN(4, 1, 1) INK_ATTN(4, 1, 2)
+INK_ATTN(4, 2, 0) INK_ATTN(4, 2, 1) INK_ATTN(4, 2, 2)
+INK_ATTN(4, 4, 0) INK_ATTN(4, 4, 1) INK_ATTN(4, 4, 2)
+
+// ---- The splits of each (token, head) merged with the sink (one more logit, `sink`, of a zero
+// value), then gated: `out = softmax-weighted values * sigmoid(gate)` (grid: head, token).
+struct IACP { uint nh; uint hd; uint maxsplit; uint part; uint sink; uint gate; uint out; uint pos; uint window; uint _p0; uint _p1; uint _p2; };
+kernel void ink_attn_merge(device float* a [[buffer(0)]], constant IACP& p [[buffer(1)]],
+                           uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    uint hh = tg.x, ti = tg.y, hd = p.hd;
+    uint hi = p.pos + ti + 1;
+    uint lo = p.window != 0 && hi > p.window ? hi - p.window : 0;
+    uint ns = ink_nsplit(hi - lo, p.maxsplit);
+    device const float* ph = a + p.part + ((ulong)ti * p.nh + hh) * p.maxsplit * (hd + 2);
+    float sink = a[p.sink + (ulong)ti * p.nh + hh];
+    float M = sink;
+    for (uint s = 0; s < ns; s++) M = max(M, ph[s * (hd + 2) + hd]);
+    float L = exp(sink - M);
+    for (uint s = 0; s < ns; s++) {
+        float ms = ph[s * (hd + 2) + hd];
+        if (ms != -INFINITY) L += ph[s * (hd + 2) + hd + 1] * exp(ms - M);
+    }
+    for (uint i = tid; i < hd; i += 128) {
+        float acc = 0.f;
+        for (uint s = 0; s < ns; s++) {
+            float ms = ph[s * (hd + 2) + hd];
+            if (ms != -INFINITY) acc += ph[s * (hd + 2) + i] * exp(ms - M);
+        }
+        ulong o = (ulong)ti * p.nh * hd + hh * hd + i;
+        float gt = a[p.gate + o];
+        a[p.out + o] = acc / L * (1.0f / (1.0f + exp(-gt)));
+    }
+}
+
+// ---- The convolutions after the attention and the MLP (grid: channel blocks, token): `y = (x +
+// sum_lag taps[lag] x[t - lag]) * norm` over the inputs `x` (earlier positions from the ring),
+// then `out = y` (mode 0) or `out += y` (mode 1). The inputs go to the ring.
+struct ICrP { uint h; uint kn; uint x; uint out; uint taps; uint pos; uint mode; float norm; uint ring_cap; uint ntok; uint ring_write; uint _p1;
+              uint od; uint ok; uint _q0; uint _q1; };
+// The input of token `tj` at channel `i`: its row of `x`, or with `ok` the sum of its `ok` slots of
+// `od` (the routed experts' rows, in slot order).
+inline float conv_in(device const float* a, constant ICrP& p, uint tj, uint i) {
+    if (p.ok == 0) return a[p.x + (ulong)tj * p.h + i];
+    float v = 0.f;
+    for (uint s = 0; s < p.ok; s++) v += a[p.od + ((ulong)tj * p.ok + s) * p.h + i];
+    return v;
+}
+inline void ink_conv_one(device float* a, device const float* c, constant ICrP& p, device float* ring, uint i, uint ti) {
+    uint h = p.h, kn = p.kn;
+    uint pos = p.pos + ti;
+    float xin = conv_in(a, p, ti, i);
+    float s = xin;
+    for (uint lag = 0; lag < kn; lag++) {
+        float xv;
+        if (lag <= ti) xv = lag == 0 ? xin : conv_in(a, p, ti - lag, i);
+        else {
+            int q = int(pos) - int(lag);
+            xv = ring[(ulong)((q + int(kn) - 1 + int(p.ring_cap)) % int(p.ring_cap)) * h + i];
+        }
+        s += c[p.taps + lag * h + i] * xv;
+    }
+    s *= p.norm;
+    // The ring takes the raw inputs of the last tokens (positions of earlier tokens are read above
+    // from their rows, never from the ring, so the writes do not race with the reads).
+    if (p.ring_write != 0) ring[(ulong)((pos + kn - 1) % p.ring_cap) * h + i] = xin;
+    device float* o = a + p.out + (ulong)ti * h + i;
+    if (p.mode == 0) *o = s; else *o += s;
+}
+kernel void ink_conv(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant ICrP& p [[buffer(2)]],
+                     device float* ring [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.h) return;
+    ink_conv_one(a, c, p, ring, gid.x, gid.y);
+}
+
+// ---- Matrix-vector products with float32 weights in the constants (the MoE routers; grid:
+// blocks of 8 rows, token; one SIMD-group per row).
+struct IMvfP { uint n_out; uint n_in; uint w; uint x; uint y; uint _p0; uint _p1; uint _p2; };
+kernel void ink_mvf(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IMvfP& p [[buffer(2)]],
+                    uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                    uint lane [[thread_index_in_simdgroup]]) {
+    uint r = tg.x * 8 + sg, ti = tg.y;
+    if (r >= p.n_out) return;
+    device const float4* w = (device const float4*)(c + p.w + (ulong)r * p.n_in);
+    device const float4* x = (device const float4*)(a + p.x + (ulong)ti * p.n_in);
+    float4 acc = 0.f;
+    for (uint i = lane; i < p.n_in / 4; i += 32) acc = fma(w[i], x[i], acc);
+    float s = simd_sum((acc.x + acc.y) + (acc.z + acc.w));
+    if (lane == 0) a[p.y + (ulong)ti * p.n_out + r] = s;
+}
+
+// ---- Sigmoid routing (grid: token; one thread per expert, n <= 1024): the k experts of the
+// largest `sigmoid(logit) + bias` (ties to the lower index), weighted by their sigmoid scores
+// renormalized over the k, times `scale`: ids (uint bits) then weights into `sel` (2 k per token).
+struct IRouteP { uint n; uint k; uint logits; uint sel; uint bias; float scale; uint single; uint grp; uint asg; uint _p0; uint _p1; uint _p2; };
+kernel void ink_route(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IRouteP& p [[buffer(2)]],
+                      uint ti [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                      uint nt [[threads_per_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float bv[32];
+    threadgroup uint bi[32];
+    threadgroup float chosen[64];
+    uint n = p.n, k = p.k;
+    device float* sel = a + p.sel + (ulong)ti * 2 * k;
+    float sc = tid < n ? 1.f / (1.f + exp(-a[p.logits + (ulong)ti * n + tid])) : 0.f;
+    float v = tid < n ? sc + c[p.bias + tid] : -INFINITY;
+    uint nsg = (nt + 31) / 32;
+    for (uint j = 0; j < k; j++) {
+        float m = simd_max(v);
+        uint idx = v == m ? tid : 0xffffffffu;
+        idx = simd_min(idx);
+        if (lane == 0) { bv[sg] = m; bi[sg] = idx; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float best = bv[0]; uint bidx = bi[0];
+        for (uint i = 1; i < nsg; i++) if (bv[i] > best || (bv[i] == best && bi[i] < bidx)) { best = bv[i]; bidx = bi[i]; }
+        if (tid == bidx) { v = -INFINITY; chosen[j] = sc; }
+        if (tid == 0) sel[j] = as_type<float>(bidx);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        float s = 0.f;
+        for (uint j = 0; j < k; j++) s += chosen[j];
+        for (uint j = 0; j < k; j++) sel[k + j] = chosen[j] / s * p.scale;
+        if (p.single != 0) {
+            device uint* g = (device uint*)(a + p.grp);
+            device uint* asg = (device uint*)(a + p.asg);
+            g[0] = k;
+            for (uint j = 0; j < k; j++) {
+                g[1 + 3 * j] = as_type<uint>(sel[j]);
+                g[2 + 3 * j] = 1;
+                g[3 + 3 * j] = j;
+                asg[j] = j;
+            }
+        }
+    }
+}
+
+// ---- The router's logits (as `ink_mvf`) and the routing (as `ink_route`) in one threadgroup of
+// 1024 per token (n <= 1024; decoding passes).
+struct IRrP { uint n; uint k; uint x; uint sel; uint bias; float scale; uint w; uint n_in; uint single; uint grp; uint asg; uint _p; };
+// `grp` / `asg` (with `single`): the grouping of `ink_xgroup` for a pass of one token (its experts
+// are distinct: one group each).
+inline void ink_route_body(device float* a, device const float* c, constant IRrP& p, uint ti, uint tid, uint sg, uint lane,
+                           threadgroup float* lg, threadgroup float* bv, threadgroup uint* bi, threadgroup float* chosen) {
+    uint n = p.n, k = p.k;
+    device const float4* x = (device const float4*)(a + p.x + (ulong)ti * p.n_in);
+    for (uint r = sg; r < n; r += 32) {
+        device const float4* w = (device const float4*)(c + p.w + (ulong)r * p.n_in);
+        float4 acc = 0.f;
+        for (uint i = lane; i < p.n_in / 4; i += 32) acc = fma(w[i], x[i], acc);
+        float s = simd_sum((acc.x + acc.y) + (acc.z + acc.w));
+        if (lane == 0) lg[r] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device float* sel = a + p.sel + (ulong)ti * 2 * k;
+    float sc = tid < n ? 1.f / (1.f + exp(-lg[tid])) : 0.f;
+    float v = tid < n ? sc + c[p.bias + tid] : -INFINITY;
+    for (uint j = 0; j < k; j++) {
+        float m = simd_max(v);
+        uint idx = v == m ? tid : 0xffffffffu;
+        idx = simd_min(idx);
+        if (lane == 0) { bv[sg] = m; bi[sg] = idx; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float best = bv[0]; uint bidx = bi[0];
+        for (uint i = 1; i < 32; i++) if (bv[i] > best || (bv[i] == best && bi[i] < bidx)) { best = bv[i]; bidx = bi[i]; }
+        if (tid == bidx) { v = -INFINITY; chosen[j] = sc; }
+        if (tid == 0) sel[j] = as_type<float>(bidx);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        float s = 0.f;
+        for (uint j = 0; j < k; j++) s += chosen[j];
+        for (uint j = 0; j < k; j++) sel[k + j] = chosen[j] / s * p.scale;
+        if (p.single != 0) {
+            device uint* g = (device uint*)(a + p.grp);
+            device uint* asg = (device uint*)(a + p.asg);
+            g[0] = k;
+            for (uint j = 0; j < k; j++) {
+                g[1 + 3 * j] = as_type<uint>(sel[j]);
+                g[2 + 3 * j] = 1;
+                g[3 + 3 * j] = j;
+                asg[j] = j;
+            }
+        }
+    }
+}
+kernel void ink_router_route(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IRrP& p [[buffer(2)]],
+                             uint ti [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                             uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float lg[1024];
+    threadgroup float bv[32];
+    threadgroup uint bi[32];
+    threadgroup float chosen[64];
+    ink_route_body(a, c, p, ti, tid, sg, lane, lg, bv, bi, chosen);
+}
+// The convolution after the attention, the MLP's input mix (with `mp`), and with `route` the
+// router and the routing (`rp`), in one threadgroup of 1024 per token.
+kernel void ink_conv_mix(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant ICrP& cp [[buffer(2)]],
+                         device float* ring [[buffer(3)]], constant IMixP& mp [[buffer(4)]], constant IRrP& rp [[buffer(5)]],
+                         constant uint& route [[buffer(6)]],
+                         uint ti [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[64];
+    threadgroup float lg[1024];
+    threadgroup float bv[32];
+    threadgroup uint bi[32];
+    threadgroup float chosen[64];
+    for (uint i = tid; i < cp.h; i += 1024) ink_conv_one(a, c, cp, ring, i, ti);
+    threadgroup_barrier(mem_flags::mem_device);
+    ink_mix_body(a, c, mp, 0, ti, tid, sg, lane, red);
+    if (route == 0) return;
+    threadgroup_barrier(mem_flags::mem_device);
+    ink_route_body(a, c, rp, ti, tid, sg, lane, lg, bv, bi, chosen);
+}
+
+// ---- The soft-capped logits of the tokens (`cap tanh(x / cap)`), cut to the first `u` of each
+// row of `v` (grid: blocks, token).
+struct ICapP { uint v; uint u; uint x; uint out; float cap; uint _p0; uint _p1; uint _p2; };
+kernel void ink_softcap(device float* a [[buffer(0)]], constant ICapP& p [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.u) return;
+    float x = a[p.x + (ulong)gid.y * p.v + gid.x];
+    a[p.out + (ulong)gid.y * p.u + gid.x] = precise::tanh(x / p.cap) * p.cap;
+}
+
+// ---- Weight formats of the experts beyond the decode library's. NVFP4 (ggml's blocks of 64:
+// four unsigned E4M3 scales, halved, then four runs of 8 bytes holding elements j and j + 8 of
+// a sub-block of 16; the codes through MXFP4's doubled table): chunk b of 32 values is half of
+// block b / 2.
+struct NVFP4W { GgW g; };
+inline void load(NVFP4W w, uint row, uint b, thread float4* out) {
+    device const uchar* B = w.g.q + (ulong)row * w.g.rb + (b / 2) * 36;
+    for (uint s2 = 0; s2 < 2; s2++) {
+        uint s = 2 * (b % 2) + s2;
+        float d = float(as_type<half>(ushort(ushort(B[s] & 0x7f) << 7))) * 128.f;
+        uchar4 v0 = ld4(B + 4 + 8 * s), v1 = ld4(B + 8 + 8 * s);
+        out[4 * s2 + 0] = kvm4(v0 & uchar(15)) * d;
+        out[4 * s2 + 1] = kvm4(v1 & uchar(15)) * d;
+        out[4 * s2 + 2] = kvm4(v0 >> uchar(4)) * d;
+        out[4 * s2 + 3] = kvm4(v1 >> uchar(4)) * d;
+    }
+}
+// MXFP8: E4M3 bytes with a float scale per 32 values of a row (the E8M0 exponents expanded).
+struct MXF8W { device const uchar* q; device const float* s; uint n_in; };
+inline void load(MXF8W w, uint row, uint b, thread float4* out) {
+    float d = w.s[(ulong)row * (w.n_in / 32) + b] * 256.f;
+    device const uchar* B = w.q + (ulong)row * w.n_in + b * 32;
+    for (uint i = 0; i < 8; i++) out[i] = e4m3x4(ld4(B + 4 * i)) * d;
+}
+
+// ---- Routed experts (threadgroups of 4 SIMD-groups, each computing two outputs). Expert e's
+// projection is at tab[e]: data, scales (address, 0 if none), the factor of its outputs, the row
+// bytes. Pair kernels (grid: blocks of 8 outputs j, slot, token): the gate and up rows of the
+// token's slot-th expert (`il` 2: interleaved rows 2j, 2j + 1; else gate rows j and up rows
+// inter + j), `act = cap_g tanh(g / cap_g) sigmoid(g) * cap_u tanh(u / cap_u)` (SiTU) into `act`
+// (`[token][slot][inter]`). Sum kernels (grid: blocks of 8 rows, token): `y = sum over slots of
+// weight * factor * (down_e act)`.
+struct IXT { ulong q; ulong s; float factor; uint rb; ulong _p; };
+struct IXP { uint inter; uint h; uint k; uint il; uint off; uint x; uint sel; uint act; uint y; float cap_g; float cap_u; uint add; };
+#define INK_XP(NAME, T, X, CH, MAKE) \
+kernel void NAME##_pair(device float* a [[buffer(0)]], device const IXT* tab [[buffer(1)]], constant IXP& p [[buffer(2)]], \
+                        uint3 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], \
+                        uint lane [[thread_index_in_simdgroup]]) { \
+    uint j = (tg.x * 4 + sg) * 2, s = tg.y, ti = tg.z; \
+    if (j >= p.inter) return; \
+    device const float* sel = a + p.sel + (ulong)ti * 2 * p.k; \
+    IXT e = tab[as_type<uint>(sel[s])]; \
+    T f = MAKE(e, p.h); \
+    device const float* x = a + p.x + (ulong)ti * p.h; \
+    float g[2], u[2]; \
+    if (p.il == 2) { \
+        float acc[4] = { 0.f, 0.f, 0.f, 0.f }, acc2[4] = { 0.f, 0.f, 0.f, 0.f }; \
+        mv_acc<T, X, CH, 4, 1>(f, f, false, 0, x, p.h, 2 * p.inter, 2 * j, 0, lane, acc, acc2, 1.f); \
+        g[0] = simd_sum(acc[0]); u[0] = simd_sum(acc[1]); g[1] = simd_sum(acc[2]); u[1] = simd_sum(acc[3]); \
+    } else { \
+        float acc[2] = { 0.f, 0.f }, acc2[2] = { 0.f, 0.f }; \
+        mv_acc<T, X, CH, 2, 1>(f, f, true, p.off, x, p.h, 2 * p.inter, j, 0, lane, acc, acc2, 1.f); \
+        g[0] = simd_sum(acc[0]); g[1] = simd_sum(acc[1]); u[0] = simd_sum(acc2[0]); u[1] = simd_sum(acc2[1]); \
+    } \
+    if (lane == 0) \
+        for (uint i = 0; i < 2 && j + i < p.inter; i++) { \
+            float gg = g[i] * e.factor, uu = u[i] * e.factor; \
+            float cu = p.cap_u > 0.f ? p.cap_u * precise::tanh(uu / p.cap_u) : uu; \
+            a[p.act + ((ulong)ti * p.k + s) * p.inter + j + i] = p.cap_g * precise::tanh(gg / p.cap_g) / (1.f + exp(-gg)) * cu; \
+        } } \
+kernel void NAME##_sum(device float* a [[buffer(0)]], device const IXT* tab [[buffer(1)]], constant IXP& p [[buffer(2)]], \
+                       uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], \
+                       uint lane [[thread_index_in_simdgroup]]) { \
+    uint r = (tg.x * 4 + sg) * 2, ti = tg.y; \
+    if (r >= p.h) return; \
+    device const float* sel = a + p.sel + (ulong)ti * 2 * p.k; \
+    float acc[2] = { 0.f, 0.f }, acc2[2] = { 0.f, 0.f }; \
+    for (uint s = 0; s < p.k; s++) { \
+        IXT e = tab[as_type<uint>(sel[s])]; T f = MAKE(e, p.inter); \
+        mv_acc<T, X, CH, 2, 1>(f, f, false, 0, a + p.act + ((ulong)ti * p.k + s) * p.inter, p.inter, p.h, r, 0, lane, acc, acc2, \
+                               sel[p.k + s] * e.factor); \
+    } \
+    float v0 = simd_sum(acc[0]), v1 = simd_sum(acc[1]); \
+    if (lane == 0) { \
+        device float* y = a + p.y + (ulong)ti * p.h + r; \
+        if (p.add != 0) { y[0] += v0; if (r + 1 < p.h) y[1] += v1; } else { y[0] = v0; if (r + 1 < p.h) y[1] = v1; } \
+    } }
+// Q2_0 (ggml type 42): an f16 scale, then 16 bytes of 2-bit codes `c - 1` (element j: bits
+// 2 (j % 4) of byte j / 4) per block of 64; chunk b of 32 is half of block b / 2.
+struct Q2_0W { GgW g; };
+inline void load(Q2_0W w, uint row, uint b, thread float4* out) {
+    device const uchar* B = w.g.q + (ulong)row * w.g.rb + (b / 2) * 18;
+    float d = h2f(B);
+    device const uchar* q = B + 2 + 8 * (b % 2);
+    for (uint i = 0; i < 8; i++) {
+        uint c = q[i];
+        out[i] = (float4(float(c & 3), float((c >> 2) & 3), float((c >> 4) & 3), float(c >> 6)) - 1.f) * d;
+    }
+}
+
+// ---- Runtime LoRA updates (`crate::lora`): `y += s B (A x)` beside a matvec or GEMM. The down
+// half (grid: rank, token; one SIMD-group each): `u[t][r] = A[r] . x[t]`; the up half (grid: blocks
+// of outputs, token): `y[t][o] += s sum_r Bt[r][o] u[t][r]`. A and Bt are float32 tables.
+struct ILaP { uint n_in; uint r; uint x; uint u; };
+kernel void ink_lora_a(device float* a [[buffer(0)]], device const float* A [[buffer(1)]], constant ILaP& p [[buffer(2)]],
+                       uint2 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint r = tg.x, ti = tg.y;
+    device const float* w = A + (ulong)r * p.n_in;
+    device const float* x = a + p.x + (ulong)ti * p.n_in;
+    float s = 0.f;
+    for (uint i = lane; i < p.n_in; i += 32) s = fma(w[i], x[i], s);
+    s = simd_sum(s);
+    if (lane == 0) a[p.u + (ulong)ti * p.r + r] = s;
+}
+struct ILbP { uint n_out; uint r; uint u; uint y; float s; uint _p0; uint _p1; uint _p2; };
+kernel void ink_lora_b(device float* a [[buffer(0)]], device const float* Bt [[buffer(1)]], constant ILbP& p [[buffer(2)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    uint o = gid.x, ti = gid.y;
+    if (o >= p.n_out) return;
+    float v = 0.f;
+    for (uint k = 0; k < p.r; k++) v = fma(Bt[(ulong)k * p.n_out + o], a[p.u + (ulong)ti * p.r + k], v);
+    a[p.y + (ulong)ti * p.n_out + o] += p.s * v;
+}
+// The same for the routed experts' down projections, per expert: entry e of the table holds its
+// A and Bt (addresses), its rank and its strength. The down half (grid: rank, slot, token; or with
+// `rows`, grid: rank, row: the grouped rows of a prefill, each of its expert `rexp[row]`, inputs
+// half rows scaled by `rs[row]`): `u[slot] = A_e . act[slot]`; the up half (grid: blocks of
+// outputs, token): `y[t] += sum_s w_s s_e Bt_e u[map[t k + s]]` (map: identity without `rows`).
+struct IXL { ulong a; ulong bt; uint r; float s; ulong _p; };
+struct IXlaP { uint n_in; uint k; uint rmax; uint act; uint u; uint sel; uint rows; uint _p; };
+kernel void ink_xlora_a(device float* a [[buffer(0)]], device const IXL* tab [[buffer(1)]], constant IXlaP& p [[buffer(2)]],
+                        device const half* ah [[buffer(3)]], device const float* rs [[buffer(4)]], device const uint* rexp [[buffer(5)]],
+                        uint3 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    uint r = tg.x;
+    uint e, slot;
+    if (p.rows != 0) {
+        slot = tg.y;
+        if (slot >= p.rows) return;
+        e = rexp[slot];
+        if (e == 0xffffffffu) return;
+    } else {
+        slot = tg.z * p.k + tg.y;
+        e = as_type<uint>(a[p.sel + (ulong)tg.z * 2 * p.k + tg.y]);
+    }
+    IXL x = tab[e];
+    if (r >= x.r) return;
+    device const float* w = (device const float*)x.a + (ulong)r * p.n_in;
+    float s = 0.f;
+    if (p.rows != 0) {
+        device const half* v = ah + (ulong)slot * p.n_in;
+        for (uint i = lane; i < p.n_in; i += 32) s = fma(w[i], float(v[i]), s);
+        s *= rs[slot];
+    } else {
+        device const float* v = a + p.act + (ulong)slot * p.n_in;
+        for (uint i = lane; i < p.n_in; i += 32) s = fma(w[i], v[i], s);
+    }
+    s = simd_sum(s);
+    if (lane == 0) a[p.u + (ulong)slot * p.rmax + r] = s;
+}
+struct IXlbP { uint n_out; uint k; uint rmax; uint u; uint sel; uint y; uint mapped; uint _p; };
+kernel void ink_xlora_b(device float* a [[buffer(0)]], device const IXL* tab [[buffer(1)]], constant IXlbP& p [[buffer(2)]],
+                        device const uint* map [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
+    uint o = gid.x, ti = gid.y;
+    if (o >= p.n_out) return;
+    device const float* sel = a + p.sel + (ulong)ti * 2 * p.k;
+    float acc = 0.f;
+    for (uint s = 0; s < p.k; s++) {
+        IXL x = tab[as_type<uint>(sel[s])];
+        uint slot = p.mapped != 0 ? map[ti * p.k + s] : ti * p.k + s;
+        device const float* bt = (device const float*)x.bt;
+        float v = 0.f;
+        for (uint q = 0; q < x.r; q++) v = fma(bt[(ulong)q * p.n_out + o], a[p.u + (ulong)slot * p.rmax + q], v);
+        acc += sel[p.k + s] * x.s * v;
+    }
+    a[p.y + (ulong)ti * p.n_out + o] += acc;
+}
+
+// ---- The routed experts of a pass grouped by expert (decoding and verification passes), so
+// that tokens choosing the same expert read its weights once (from the cache for all but the
+// first). `ink_xgroup` (one threadgroup of t k <= 1024 threads, one per (token, slot)
+// assignment): the experts in order of first appearance, each with its assignments, as `grp`
+// (`[count of groups] [expert, count, start]...`) and `asg` (assignment ids `token * k + slot`,
+// grouped). A token's results do not depend on the grouping.
+struct IXgP { uint k; uint n; uint sel; uint grp; uint asg; uint _p0; uint _p1; uint _p2; };
+kernel void ink_xgroup(device float* a [[buffer(0)]], constant IXgP& p [[buffer(1)]], uint i [[thread_index_in_threadgroup]]) {
+    threadgroup uint ex[1024];
+    threadgroup uint fs[1024];
+    uint k = p.k, n = p.n;
+    if (i < n) ex[i] = as_type<uint>(a[p.sel + (ulong)(i / k) * 2 * k + i % k]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // The first assignment of each one's expert.
+    uint e = i < n ? ex[i] : 0, first = i;
+    if (i < n)
+        for (uint j = 0; j < i; j++) if (ex[j] == e) { first = j; break; }
+    fs[i] = first;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (i >= n) return;
+    // Its group (the leaders before `first`), the assignments of the earlier groups, its rank in
+    // its group and the group's size.
+    uint gid = 0, before = 0, rank = 0, cnt = 0, ng = 0;
+    for (uint j = 0; j < n; j++) {
+        uint fj = fs[j];
+        if (fj == j) { ng++; if (j < first) gid++; }
+        if (fj < first) before++;
+        if (fj == first) { cnt++; if (j < i) rank++; }
+    }
+    device uint* g = (device uint*)(a + p.grp);
+    device uint* asg = (device uint*)(a + p.asg);
+    asg[before + rank] = i;
+    if (i == first) {
+        g[1 + 3 * gid] = e;
+        g[2 + 3 * gid] = cnt;
+        g[3 + 3 * gid] = before;
+    }
+    if (i == 0) g[0] = ng;
+}
+// Per (token, slot): the down projection's rows times the routing weight and the expert's factor,
+// into `od` (`[t k][h]`); `ink_xcombine` sums a token's slots in order into `y`.
+struct IXcP { uint h; uint k; uint od; uint y; uint add; uint _p0; uint _p1; uint _p2; };
+kernel void ink_xcombine(device float* a [[buffer(0)]], constant IXcP& p [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
+    uint r = gid.x, ti = gid.y;
+    if (r >= p.h) return;
+    float v = 0.f;
+    for (uint s = 0; s < p.k; s++) v += a[p.od + ((ulong)ti * p.k + s) * p.h + r];
+    device float* y = a + p.y + (ulong)ti * p.h + r;
+    if (p.add != 0) *y += v; else *y = v;
+}
+// The pair and down kernels over the groups (grid: blocks of 8 outputs, group): as `_pair` for
+// every assignment of the group; the down rows of every assignment into `od`. (`p.y` is `od`.)
+#define INK_XG(NAME, T, X, CH, MAKE) \
+kernel void NAME##_gpair(device float* a [[buffer(0)]], device const IXT* tab [[buffer(1)]], constant IXP& p [[buffer(2)]], \
+                         constant uint2& gq [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]], \
+                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
+    uint j = (tg.x * 4 + sg) * 2; \
+    device const uint* g = (device const uint*)(a + gq.x); \
+    device const uint* asg = (device const uint*)(a + gq.y); \
+    if (j >= p.inter || tg.y >= g[0]) return; \
+    uint ge = g[1 + 3 * tg.y], cnt = g[2 + 3 * tg.y], st = g[3 + 3 * tg.y]; \
+    IXT e = tab[ge]; \
+    T f = MAKE(e, p.h); \
+    for (uint q = 0; q < cnt; q++) { \
+        uint asn = asg[st + q], ti = asn / p.k, s = asn % p.k; \
+        device const float* x = a + p.x + (ulong)ti * p.h; \
+        float gv[2], uv[2]; \
+        if (p.il == 2) { \
+            float acc[4] = { 0.f, 0.f, 0.f, 0.f }, acc2[4] = { 0.f, 0.f, 0.f, 0.f }; \
+            mv_acc<T, X, CH, 4, 1>(f, f, false, 0, x, p.h, 2 * p.inter, 2 * j, 0, lane, acc, acc2, 1.f); \
+            gv[0] = simd_sum(acc[0]); uv[0] = simd_sum(acc[1]); gv[1] = simd_sum(acc[2]); uv[1] = simd_sum(acc[3]); \
+        } else { \
+            float acc[2] = { 0.f, 0.f }, acc2[2] = { 0.f, 0.f }; \
+            mv_acc<T, X, CH, 2, 1>(f, f, true, p.off, x, p.h, 2 * p.inter, j, 0, lane, acc, acc2, 1.f); \
+            gv[0] = simd_sum(acc[0]); gv[1] = simd_sum(acc[1]); uv[0] = simd_sum(acc2[0]); uv[1] = simd_sum(acc2[1]); \
+        } \
+        if (lane == 0) \
+            for (uint i = 0; i < 2 && j + i < p.inter; i++) { \
+                float gg = gv[i] * e.factor, uu = uv[i] * e.factor; \
+                float cu = p.cap_u > 0.f ? p.cap_u * precise::tanh(uu / p.cap_u) : uu; \
+                a[p.act + ((ulong)ti * p.k + s) * p.inter + j + i] = p.cap_g * precise::tanh(gg / p.cap_g) / (1.f + exp(-gg)) * cu; \
+            } \
+    } } \
+kernel void NAME##_gsum(device float* a [[buffer(0)]], device const IXT* tab [[buffer(1)]], constant IXP& p [[buffer(2)]], \
+                        constant uint2& gq [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]], \
+                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
+    uint r = (tg.x * 4 + sg) * 2; \
+    device const uint* g = (device const uint*)(a + gq.x); \
+    device const uint* asg = (device const uint*)(a + gq.y); \
+    if (r >= p.h || tg.y >= g[0]) return; \
+    uint ge = g[1 + 3 * tg.y], cnt = g[2 + 3 * tg.y], st = g[3 + 3 * tg.y]; \
+    IXT e = tab[ge]; \
+    T f = MAKE(e, p.inter); \
+    for (uint q = 0; q < cnt; q++) { \
+        uint asn = asg[st + q], ti = asn / p.k, s = asn % p.k; \
+        float acc[2] = { 0.f, 0.f }, acc2[2] = { 0.f, 0.f }; \
+        mv_acc<T, X, CH, 2, 1>(f, f, false, 0, a + p.act + (ulong)asn * p.inter, p.inter, p.h, r, 0, lane, acc, acc2, \
+                               a[p.sel + (ulong)ti * 2 * p.k + p.k + s] * e.factor); \
+        float v0 = simd_sum(acc[0]), v1 = simd_sum(acc[1]); \
+        if (lane == 0) { \
+            device float* y = a + p.y + (ulong)asn * p.h + r; \
+            y[0] = v0; \
+            if (r + 1 < p.h) y[1] = v1; \
+        } \
+    } }
+

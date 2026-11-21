@@ -94,6 +94,20 @@ before, 30 of 124 now). Greedy output is unchanged (identical to master's and, w
 verification, to `--no-draft`'s). Prompt lookup needs no captures and always prefilled on the
 plan.
 
+### Inkling-2-Mini's drafter
+
+Inkling-2-Mini ships its own 3-layer block drafter (`mtp.safetensors`, `--mtp`; unsloth's GGUF
+conversion `dspark-Inkling-2-Mini-Q8_0.gguf`, `--draft`), which runs as a DSpark draft
+(`src/inkling_draft.rs`, after llama.cpp's `graph_inkling2`): per-layer softmax mixes of the
+target's streams at 4 depths as its context, a block of 8, and a recurrent head whose correction
+goes through the target's LM head. Sessions go back up to 64 positions (the short convolutions
+keep their inputs in rings by position), rounds verify at most 6 drafts (7-token passes stay on
+the bit-exact decode kernels), and greedy output is plain greedy output. It accepts 35-51% of 3
+drafts (2.0-2.5 tokens per forward) and 18-35% of 6; on the CPU a verification pass costs about
+its token count in steps (every token reads its own 8 experts), so the cost-aware rounds fall back
+to plain steps there; on the GPU a 4-token verification still costs 1.5-2.5 steps, and drafting
+did not beat plain decoding yet (lookup was within a few percent of it). Numbers: [Inkling-2 Mini](inkling.md#speculative-decoding).
+
 ## Multi-token passes and MoE experts on the CPU
 
 Speculative verification (and prompts shorter than 8 tokens) runs on the CPU's decode kernels,

@@ -739,6 +739,8 @@ pub struct Dspark<'a> {
     /// The backbone: dense MLA or grouped-query attention layers, or DeepSeek V4 stages.
     dense: Option<Dense<'a>>,
     ds4: Option<crate::deepseek4::Ds4Draft<'a>>,
+    /// Inkling-2-Mini's own block drafter (`crate::inkling_draft`).
+    ink: Option<crate::inkling_draft::InkDraft<'a>>,
     markov: Option<Markov<'a>>,
     bridge: Option<Bridge<'a>>,
     conf: Option<Confidence>,
@@ -801,6 +803,10 @@ pub struct DsparkSession {
     /// Run the GPU passes on the fast plans ([`DsparkOptions::fast_verify`]).
     pub fast: bool,
     pub len: usize,
+    /// Inkling-2's drafter: the head's context rows (`[H]` each) of positions `rnn_start..len`.
+    rnn: Vec<f32>,
+    rnn_start: usize,
+    rnn_w: usize,
 }
 
 impl DsparkSession {
@@ -819,6 +825,10 @@ impl DsparkSession {
             }
             for c in &mut self.kv {
                 c.truncate(len);
+            }
+            if self.rnn_w > 0 {
+                self.rnn.truncate(len.saturating_sub(self.rnn_start) * self.rnn_w);
+                self.rnn_start = self.rnn_start.min(len);
             }
             self.start = self.start.min(len);
             self.len = len;
@@ -944,6 +954,8 @@ pub const KNOWN: &[(&str, &str, ByDefault)] = &[
         ByDefault::Fast,
     ),
     ("google/gemma-4-31B-it", "Hikari07jp/DSpark-Gemma-4-31B-draft", ByDefault::No),
+    // Inkling-2-Mini's own drafter (`mtp.safetensors` of the release) as unsloth converted it.
+    ("thinkingmachines/Inkling-2-Mini", "unsloth/Inkling-2-Mini-GGUF", ByDefault::No),
 ];
 
 /// Whether a `-`-separated part of a GGUF file name is its quantization (`Q8_0`, `IQ4_XS`,
@@ -1061,6 +1073,10 @@ fn find_draft(model: &Path, fast: bool) -> Option<(PathBuf, bool)> {
             return Some((p, def));
         }
     }
+    // Inkling-2's release: its own drafter (`mtp.safetensors`).
+    if !gguf && let Some(p) = crate::inkling_draft::mtp_file(folder) {
+        return Some((p, known.iter().any(|d| d.1)));
+    }
     let cache = folder.parent()?;
     known
         .iter()
@@ -1117,14 +1133,20 @@ pub fn is_draft(path: &Path) -> bool {
     if crate::gguf::is_gguf(path) {
         return crate::gguf::header(path).is_ok_and(|h| matches!(h.arch(), "dflash" | "dspark"));
     }
-    hf_config(path).is_some()
+    hf_config(path).is_some() || crate::inkling_draft::mtp_config(path).is_some()
 }
 
 /// The draft's config: a GGUF header or a Hugging Face `config.json`.
 pub fn load_config(path: &Path) -> Result<DsparkConfig> {
     if crate::gguf::is_gguf(path) {
         let h = crate::gguf::header(path)?;
+        if h.tensors.iter().any(|t| t.name == "dspark_fuse.weight") {
+            return Ok(crate::inkling_draft::InkDraftConfig::from_header(&h)?.dspark());
+        }
         return DsparkConfig::from_header(&h);
+    }
+    if let Some(m) = crate::inkling_draft::mtp_config(path) {
+        return Ok(crate::inkling_draft::InkDraftConfig::from_hf(&m)?.dspark());
     }
     let raw = hf_config(path).with_context(|| format!("{}: not a DSpark draft", path.display()))?;
     DsparkConfig::from_hf(&raw)
@@ -1161,8 +1183,47 @@ impl<'a> Dspark<'a> {
     /// its passes in 23-27 ms instead of 31-34).
     pub fn load(path: &Path, files: &'a ModelFiles, target_hidden: usize, vocab: usize, quant: Quant) -> Result<Self> {
         let gguf = crate::gguf::is_gguf(path);
-        let cfg = load_config(path)?;
+        let mut cfg = load_config(path)?;
         let has = |n: &str| files.has(n);
+        if crate::inkling_draft::is_ink_draft(has) {
+            let icfg = match crate::inkling_draft::mtp_config(path) {
+                Some(m) => crate::inkling_draft::InkDraftConfig::from_hf(&m)?,
+                None => crate::inkling_draft::InkDraftConfig::from_header(&*crate::gguf::header(path)?)?,
+            };
+            if icfg.hidden != target_hidden {
+                bail!(
+                    "the Inkling-2 draft (hidden {}) is for a target of hidden size {}",
+                    icfg.hidden,
+                    target_hidden
+                );
+            }
+            // Its last target layer is the target's final-normed output, which
+            // `Inkling2Model::forward_capture` reports one index after the stream leaving the
+            // last layer application.
+            if let Some(l) = cfg.target_layers.last_mut() {
+                *l += 1;
+            }
+            // Rounds verify at most `inkling::MAX_DRAFT` drafts (the block keeps its 8 rows).
+            cfg.block_size = cfg.block_size.min(crate::inkling::MAX_DRAFT + 1);
+            let ink = crate::inkling_draft::InkDraft::load(files, icfg, gguf, quant)?;
+            let _ = vocab;
+            return Ok(Self {
+                dense: None,
+                ds4: None,
+                ink: Some(ink),
+                markov: None,
+                bridge: None,
+                conf: None,
+                embed: None,
+                head: None,
+                target_hidden,
+                device: std::sync::atomic::AtomicBool::new(false),
+                gpu: Default::default(),
+                gpu_fast: Default::default(),
+                gpu_ctx_pf: Default::default(),
+                cfg,
+            });
+        }
         if has("d2t") || has("model.d2t") || files.names().any(|n| n.starts_with("selector_") || n.starts_with("lilicorr")) {
             bail!("this DFlash draft needs a reduced vocabulary, selector or LiLiCorr head (not supported)");
         }
@@ -1418,6 +1479,7 @@ impl<'a> Dspark<'a> {
             return Ok(Self {
                 dense: None,
                 ds4: Some(ds4),
+                ink: None,
                 markov,
                 bridge: None,
                 conf,
@@ -1458,6 +1520,7 @@ impl<'a> Dspark<'a> {
         Ok(Self {
             dense: Some(dense),
             ds4: None,
+            ink: None,
             markov,
             bridge,
             conf,
@@ -1480,6 +1543,15 @@ impl<'a> Dspark<'a> {
     /// exact). Off by default; [`DsparkDecoder::new`] sets it from [`DsparkOptions::device`].
     pub fn set_device(&self, on: bool) {
         self.device.store(on, std::sync::atomic::Ordering::Relaxed);
+        if let Some(d) = &self.ink {
+            d.set_device(on);
+        }
+    }
+
+    /// The most tokens a prompt-lookup round beside this draft may verify, when the target needs
+    /// a bound (Inkling-2: [`crate::inkling::MAX_DRAFT`]).
+    pub fn lookup_cap(&self) -> Option<usize> {
+        self.ink.as_ref().map(|_| crate::inkling::MAX_DRAFT)
     }
 
     /// Whether the draft runs its matmuls on the accelerator (see [`Dspark::set_device`]).
@@ -1556,6 +1628,9 @@ impl<'a> Dspark<'a> {
             gpu_block: Default::default(),
             fast: false,
             len: 0,
+            rnn: Vec::new(),
+            rnn_start: 0,
+            rnn_w: 0,
         }
     }
 
@@ -1567,6 +1642,9 @@ impl<'a> Dspark<'a> {
             .map_or(0, |m| m.w2.bytes() + m.joint.as_ref().map_or(0, |j| j.0.bytes()));
         if let Some(d) = &self.ds4 {
             return d.pass_bytes(self.cfg.block_size) + markov;
+        }
+        if let Some(d) = &self.ink {
+            return d.pass_bytes();
         }
         let m = self.dense();
         let mut n = m.fc.bytes();
@@ -1700,6 +1778,26 @@ impl<'a> Dspark<'a> {
                 sess.a[li].extend_from_slice(&kv);
             }
             sess.len += t;
+            return;
+        }
+        if let Some(d) = &self.ink {
+            let (kv, rnn) = d.context(feats, t, sess.len);
+            for (li, (k, v)) in kv.into_iter().enumerate() {
+                sess.push(li, &k, &v);
+            }
+            if sess.rnn.is_empty() {
+                sess.rnn_start = sess.len;
+            }
+            sess.rnn_w = h;
+            sess.rnn.extend_from_slice(&rnn);
+            sess.len += t;
+            // The head reads the row before the anchor: keep a few beyond the rollback depth.
+            let kept = (sess.len - sess.rnn_start).saturating_sub(2 * SLACK);
+            if kept > 0 {
+                sess.rnn.drain(..kept * h);
+                sess.rnn_start += kept;
+            }
+            sess.trim();
             return;
         }
         let done = self.gpu_inject(sess, feats, t);
@@ -2125,6 +2223,9 @@ impl<'a> Dspark<'a> {
         let _timer = crate::prof::start(crate::prof::Cat::Other);
         let c = &self.cfg;
         let k = k.clamp(1, c.max_draft());
+        if let Some(d) = &self.ink {
+            return self.ink_slots(d, target, sess, anchor, k, choose);
+        }
         let first = usize::from(!c.sample_from_anchor);
         // The trained block runs whole (its rows attend to each other), except on the MLA
         // backbone (Mistral Large 4), which runs the anchor and the `k` slots.
@@ -2225,6 +2326,48 @@ impl<'a> Dspark<'a> {
     }
 }
 
+impl Dspark<'_> {
+    /// [`Dspark::slots`] for Inkling-2's drafter (`crate::inkling_draft`): the whole block, the
+    /// target's LM head over its draft rows, then the head slot by slot.
+    fn ink_slots<M: Target + ?Sized>(
+        &self,
+        d: &crate::inkling_draft::InkDraft,
+        target: &M,
+        sess: &mut DsparkSession,
+        anchor: u32,
+        k: usize,
+        choose: &mut ChooseSlot,
+    ) -> Vec<u32> {
+        let h = self.cfg.hidden;
+        let pos = sess.len;
+        let s: &DsparkSession = sess;
+        let ctx = |li: usize, lo: usize| s.range(li, lo.max(s.start), pos);
+        let hid = d.block(target, anchor, pos, &ctx);
+        let rows = &hid[h..(1 + k) * h];
+        let mut logits = match self.device().then(|| target.head_raw_device(rows, k)).flatten() {
+            Some(y) => y,
+            None => target.head_raw(rows, k),
+        };
+        let v = logits.len() / k;
+        // The head's context: the features of the position before the anchor.
+        let context = match pos.checked_sub(1).filter(|&p| p >= s.rnn_start) {
+            Some(p) => s.rnn[(p - s.rnn_start) * h..(p - s.rnn_start + 1) * h].to_vec(),
+            None => vec![0f32; h],
+        };
+        let mut state = vec![0f32; d.rank()];
+        let mut prev = anchor;
+        let mut out = Vec::with_capacity(k);
+        for i in 0..k {
+            let li = &mut logits[i * v..(i + 1) * v];
+            d.slot(target, prev, &mut state, &rows[i * h..(i + 1) * h], &context, li);
+            let Some(t) = choose(i, li, None) else { break };
+            prev = t;
+            out.push(t);
+        }
+        out
+    }
+}
+
 /// The GPU side of a GQA draft: the context and block passes as multi-token decode plans
 /// (`crate::gpu::decode`), so a round runs the draft and the verification without CPU matmuls.
 impl Dspark<'_> {
@@ -2241,6 +2384,9 @@ impl Dspark<'_> {
                 return None;
             }
             let Backbone::Gqa(g) = &self.cfg.backbone else { return None };
+            if self.ink.is_some() {
+                return None;
+            }
             let be = crate::gpu::active()?;
             let head = self.head.as_ref().or(head)?;
             let rows = self.cfg.block_rows();
@@ -3167,8 +3313,8 @@ where
 {
     pub fn write_state<W: std::io::Write>(&self, w: &mut crate::snapshot::SnapWriter<W>) -> Result<()> {
         use crate::snapshot::SessionState;
-        if self.draft.ds4.is_some() {
-            bail!("session snapshots are not supported with a DeepSeek V4 draft");
+        if self.draft.ds4.is_some() || self.draft.ink.is_some() {
+            bail!("session snapshots are not supported with a DeepSeek V4 or Inkling-2 draft");
         }
         self.sess.write_state(w)?;
         let d = &self.dsess;

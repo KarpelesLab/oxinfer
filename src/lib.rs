@@ -53,6 +53,7 @@ pub mod haru;
 #[cfg(feature = "hf")]
 pub mod hf;
 pub mod inkling;
+pub mod inkling_draft;
 pub mod inkling_vision;
 pub mod intervene;
 pub mod janus;

@@ -3032,9 +3032,16 @@ fn run_glm5(mut args: Args) -> Result<()> {
 /// Inkling-2 (see `oxinfer::inkling`).
 fn run_inkling(mut args: Args) -> Result<()> {
     let t0 = Instant::now();
-    if args.mtp || args.draft.is_some() {
-        bail!("Inkling-2: speculative decoding (--mtp, --draft) is not supported");
-    }
+    // The drafter (`oxinfer::inkling_draft`): the release's MTP head with `--mtp`, or a DSpark
+    // draft (unsloth's conversion of it) with `--draft`.
+    let mut draft = if args.mtp {
+        Some(
+            oxinfer::inkling_draft::mtp_file(&args.model)
+                .with_context(|| format!("--mtp: no mtp.safetensors (the release's MTP head) in {}", args.model.display()))?,
+        )
+    } else {
+        pick_dspark(&args)?
+    };
     let cfg = oxinfer::inkling::Inkling2Config::load(&args.model)?;
     let eos = config::load_eos_ids(&args.model);
     // A checkpoint larger than most of RAM is streamed with a page-cache budget of 70% of RAM,
@@ -3058,12 +3065,18 @@ fn run_inkling(mut args: Args) -> Result<()> {
     let mut model = oxinfer::inkling::Inkling2Model::load(cfg, &files, args.quant)?;
     model.kv = args.kv_cache;
     attach_loras(&args, &mut model)?;
-    // Prompt lookup verifies a draft in one pass and rolls back what the model refutes: the
-    // convolutions cannot go back to an earlier position.
-    if args.lookup == Some(true) {
-        eprintln!("[--lookup is not available for Inkling-2 (its convolutions cannot roll back): plain decoding]");
+    // (Prompt lookup rolls back what the model refutes: a session goes back up to
+    // `inkling::ROLLBACK` positions.)
+    if let Some(lk) = LOOKUP.lock().unwrap().as_mut() {
+        lk.opts.max_draft = lk.opts.max_draft.min(oxinfer::inkling::MAX_DRAFT);
     }
-    *LOOKUP.lock().unwrap() = None;
+    // A device whose sessions cannot go back (CUDA) runs neither lookup rounds nor drafts.
+    if !model.can_rollback() {
+        if draft.take().is_some() || args.lookup == Some(true) {
+            eprintln!("[speculative decoding is not available on this device (its sessions cannot go back): plain decoding]");
+        }
+        *LOOKUP.lock().unwrap() = None;
+    }
     let tok = load_tokenizer(&args.model)?;
     let fmt: &dyn ChatFormat = &chat::InklingChat;
     let eos = chat::with_turn_end(fmt, &tok, eos);
@@ -3103,7 +3116,18 @@ fn run_inkling(mut args: Args) -> Result<()> {
     };
     *STREAM.lock().unwrap() = streamer.clone();
     TRACE.store(args.stream_trace, std::sync::atomic::Ordering::Relaxed);
-    let r = run_text(&args, &model, &tok, &eos, fmt, mm);
+    let draft_files = match &draft {
+        Some(d) => Some(safetensors::ModelFiles::open(d, true)?),
+        None => None,
+    };
+    let r = match (&draft, &draft_files) {
+        (Some(d), Some(f)) => {
+            let dr = load_dspark(d, f, model.cfg.hidden_size, model.cfg.vocab_size, model.quant)?;
+            oxinfer::inkling::check_draft(&model, &dr)?;
+            run_dspark(&args, &model, &dr, &tok, &eos, fmt, streamer.as_deref(), mm)
+        }
+        _ => run_text(&args, &model, &tok, &eos, fmt, mm),
+    };
     if let Some(s) = &streamer
         && let Some(c) = s.cached_bytes()
     {
@@ -3608,6 +3632,9 @@ fn run_dspark<M: oxinfer::dspark::Target<Sess: Clone>>(
         Sampler::new(args.temperature, args.top_k, args.top_p, args.seed).with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0));
     let mut dec = DsparkDecoder::new(model, draft, opts);
     dec.lookup = make_lookup(args, eos);
+    if let (Some(lk), Some(cap)) = (dec.lookup.as_mut(), draft.lookup_cap()) {
+        lk.opts.max_draft = lk.opts.max_draft.min(cap);
+    }
     eprintln!(
         "[DSpark speculative decoding: {} draft tokens{}, {}{}]",
         dec.opts.draft_tokens,

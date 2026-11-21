@@ -1122,6 +1122,9 @@ enum Lm {
     DeepSeek4Dspark {
         dec: Box<DsparkDecoder<'static, DeepSeek4Model<'static>>>,
     },
+    Inkling2Dspark {
+        dec: Box<DsparkDecoder<'static, Inkling2Model<'static>>>,
+    },
     Glm5 {
         model: &'static Glm5Model<'static>,
         sess: Glm5Session,
@@ -1229,6 +1232,7 @@ impl Lm {
             Lm::QwenMtp { dec } => dec.lookup.as_mut(),
             Lm::Mistral4Dspark { dec } => dec.lookup.as_mut(),
             Lm::DeepSeek4Dspark { dec } => dec.lookup.as_mut(),
+            Lm::Inkling2Dspark { dec } => dec.lookup.as_mut(),
             Lm::QwenDspark { dec } => dec.lookup.as_mut(),
             Lm::GemmaDspark { dec } => dec.lookup.as_mut(),
             _ => None,
@@ -1259,6 +1263,7 @@ impl Lm {
             Lm::Ripple { sess, .. } => sess.pos,
             Lm::Raon { sess, .. } => sess.pos,
             Lm::DeepSeek4Dspark { dec } => dec.sess.pos,
+            Lm::Inkling2Dspark { dec } => dec.sess.pos,
             Lm::QwenDspark { dec } => dec.sess.pos,
             Lm::GemmaDspark { dec } => dec.sess.pos,
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
@@ -1292,6 +1297,12 @@ impl Lm {
             Lm::Ripple { model, sess } => *sess = model.new_session(),
             Lm::Raon { model, sess } => *sess = model.new_session(),
             Lm::DeepSeek4Dspark { dec } => {
+                let opts = dec.opts.clone();
+                let lk = reset_lookup(dec.lookup.take());
+                **dec = DsparkDecoder::new(dec.model(), dec.draft(), opts);
+                dec.lookup = lk;
+            }
+            Lm::Inkling2Dspark { dec } => {
                 let opts = dec.opts.clone();
                 let lk = reset_lookup(dec.lookup.take());
                 **dec = DsparkDecoder::new(dec.model(), dec.draft(), opts);
@@ -1556,15 +1567,20 @@ impl Engine {
             .collect::<Result<Vec<_>>>()?;
         let mut loras = Vec::new();
         let mtp = opts.mtp || side_dir.is_some();
-        if mtp && family != Family::Qwen {
-            bail!("MTP speculative decoding is for Qwen3.5/3.8 models");
+        if mtp && !(family == Family::Qwen || (family == Family::Inkling2 && side_dir.is_none())) {
+            bail!("MTP speculative decoding is for Qwen3.5/3.8 and Inkling-2 models");
         }
         let dspark_given = draft_dir.as_deref().is_some_and(crate::dspark::is_draft);
         if draft_dir.is_some() && !dspark_given && family != Family::Gemma4 {
             bail!("a drafter model is for Gemma 4 (other families take DSpark drafts)");
         }
-        if dspark_given && !matches!(family, Family::Gemma4 | Family::Qwen | Family::Mistral4 | Family::DeepSeek4) {
-            bail!("DSpark drafts are for Qwen, Gemma 4, Mistral Large 4 and DeepSeek V4 models");
+        if dspark_given
+            && !matches!(
+                family,
+                Family::Gemma4 | Family::Qwen | Family::Mistral4 | Family::DeepSeek4 | Family::Inkling2
+            )
+        {
+            bail!("DSpark drafts are for Qwen, Gemma 4, Mistral Large 4, DeepSeek V4 and Inkling-2 models");
         }
         if dspark_given && mtp {
             bail!("choose MTP or a DSpark draft, not both");
@@ -2071,9 +2087,6 @@ impl Engine {
                 if decision_dir.is_some() {
                     bail!("decisions (decision_from) are not supported for Inkling-2");
                 }
-                if opts.draft.as_deref().is_some_and(|d| d != "none") || mtp {
-                    bail!("speculative decoding is not supported for Inkling-2");
-                }
                 decision = None;
                 let mut model = Inkling2Model::load(crate::inkling::Inkling2Config::load(&dir)?, files, opts.quant)?;
                 model.kv = opts.kv_cache;
@@ -2083,11 +2096,34 @@ impl Engine {
                 }
                 let model = arena.keep(model);
                 let c = &model.cfg;
-                (
-                    Lm::Inkling2 {
+                // The drafter (`crate::inkling_draft`): the release's `mtp.safetensors` for MTP,
+                // or a DSpark draft (unsloth's conversion of it) as for the other families.
+                let draft = match (mtp, &dspark) {
+                    (true, _) => Some(
+                        crate::inkling_draft::mtp_file(&dir)
+                            .with_context(|| format!("{}: no mtp.safetensors (the release's MTP head) beside the model", dir.display()))?,
+                    ),
+                    (false, d) => d.clone(),
+                };
+                // (A device whose sessions cannot go back runs no drafts.)
+                let draft = draft.filter(|_| model.can_rollback());
+                let lm = match draft {
+                    Some(d) => {
+                        let dr = load_dspark(&mut arena, &d, c.hidden_size, c.vocab_size, model.quant)?;
+                        crate::inkling::check_draft(model, dr)?;
+                        let mut dopts = dspark_opts(chat::with_turn_end(&chat::InklingChat, &tok, eos.clone()), streamer.is_some());
+                        dopts.draft_tokens = dopts.draft_tokens.min(crate::inkling::MAX_DRAFT);
+                        Lm::Inkling2Dspark {
+                            dec: Box::new(DsparkDecoder::new(model, dr, dopts)),
+                        }
+                    }
+                    None => Lm::Inkling2 {
                         model,
                         sess: model.new_session(),
                     },
+                };
+                (
+                    lm,
                     &chat::InklingChat as &'static (dyn ChatFormat + Sync),
                     model.quant,
                     c.num_hidden_layers,
@@ -2138,7 +2174,7 @@ impl Engine {
             stop
         };
         let mut lm = lm;
-        let lookup = opts.lookup.unwrap_or(crate::lookup::BY_DEFAULT).then(|| {
+        let mut lookup = opts.lookup.unwrap_or(crate::lookup::BY_DEFAULT).then(|| {
             crate::lookup::Lookup::new(crate::lookup::LookupOptions {
                 max_draft: opts.lookup_tokens.unwrap_or(crate::lookup::DEFAULT_MAX_DRAFT),
                 min_match: opts.lookup_min_match.unwrap_or(2),
@@ -2158,6 +2194,13 @@ impl Engine {
                 None
             }
             Lm::DeepSeek4Dspark { dec } => {
+                dec.lookup = lookup;
+                None
+            }
+            Lm::Inkling2Dspark { dec } => {
+                if let Some(lk) = lookup.as_mut() {
+                    lk.opts.max_draft = lk.opts.max_draft.min(crate::inkling::MAX_DRAFT);
+                }
                 dec.lookup = lookup;
                 None
             }
@@ -2192,7 +2235,11 @@ impl Engine {
         let speculative = match &lm {
             Lm::QwenMtp { .. } => Speculative::Mtp,
             Lm::Gemma { drafter: Some(_), .. } => Speculative::Drafter,
-            Lm::Mistral4Dspark { .. } | Lm::DeepSeek4Dspark { .. } | Lm::QwenDspark { .. } | Lm::GemmaDspark { .. } => Speculative::Dspark,
+            Lm::Mistral4Dspark { .. }
+            | Lm::DeepSeek4Dspark { .. }
+            | Lm::Inkling2Dspark { .. }
+            | Lm::QwenDspark { .. }
+            | Lm::GemmaDspark { .. } => Speculative::Dspark,
             _ => Speculative::None,
         };
         let info = ModelInfo {
@@ -2700,6 +2747,7 @@ impl Engine {
             Lm::Ripple { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::Raon { model, .. } => crate::intervene::capture_layers(*model, &ids, pool, chunk),
             Lm::DeepSeek4Dspark { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
+            Lm::Inkling2Dspark { dec } => crate::intervene::capture_layers(dec.model(), &ids, pool, chunk),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("activation capture is not supported for Core ML models"),
         }
@@ -2740,6 +2788,7 @@ impl Engine {
             Lm::Ripple { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::Raon { model, .. } => crate::intervene::calibrate(*model, ids, chunk),
             Lm::DeepSeek4Dspark { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
+            Lm::Inkling2Dspark { dec } => crate::intervene::calibrate(dec.model(), ids, chunk),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
         }
@@ -2771,6 +2820,7 @@ impl Engine {
             Lm::Ripple { model, .. } => *model,
             Lm::Raon { model, .. } => *model,
             Lm::DeepSeek4Dspark { dec } => dec.model(),
+            Lm::Inkling2Dspark { dec } => dec.model(),
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => bail!("interventions are not supported for Core ML models"),
         };
@@ -2797,6 +2847,7 @@ impl Engine {
             Lm::Ripple { sess, .. } => &mut sess.iv,
             Lm::Raon { sess, .. } => &mut sess.iv,
             Lm::DeepSeek4Dspark { dec } => &mut dec.sess.iv,
+            Lm::Inkling2Dspark { dec } => &mut dec.sess.iv,
             #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
             Lm::CoreMl(_) => return,
         };
@@ -3102,6 +3153,7 @@ impl Engine {
                 Lm::Ripple { .. } => bail!("decisions are not supported for Ripple"),
                 Lm::Raon { .. } => bail!("decisions are not supported for Raon-1"),
                 Lm::DeepSeek4Dspark { dec } => run(dec.model(), &ids, &feats, chunk, need_logits)?,
+                Lm::Inkling2Dspark { dec } => run(dec.model(), &ids, &feats, chunk, need_logits)?,
                 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
                 Lm::CoreMl(_) => bail!("decisions are not supported for Core ML models"),
             }
@@ -3470,6 +3522,20 @@ impl PendingTurn {
                     d
                 }
             }
+            Lm::Inkling2Dspark { dec } => {
+                let logits = dec.prefill_mm(&ids, chunk, &overrides);
+                st.prefill_secs = t0.elapsed().as_secs_f64();
+                let max = limit(dec.sess.pos);
+                if max == 0 {
+                    empty(0.0)
+                } else {
+                    let before = dec.stats.clone();
+                    let d = generate::decode_rounds(&mut **dec, &logits, sampler, stop, max, &mut cb);
+                    st.drafted = dec.stats.drafted - before.drafted;
+                    st.accepted = dec.stats.accepted - before.accepted;
+                    d
+                }
+            }
             Lm::DeepSeek4Dspark { dec } => {
                 dec.sess.iv.gen_from = dec.sess.pos + ids.len() - 1;
                 let logits = dec.prefill_mm(&ids, chunk, &overrides);
@@ -3569,16 +3635,23 @@ impl PendingTurn {
                     generate::decode(*model, sess, logits, sampler, stop, max, &mut cb)
                 }
             }
-            // No prompt-lookup rounds either: the convolutions cannot roll a rejected draft back.
+            // (Prompt lookup: a session goes back up to `inkling::ROLLBACK` positions.)
             Lm::Inkling2 { model, sess } => {
+                let base = sess.pos;
+                if let Some(lk) = lookup.as_mut() {
+                    lk.opts.max_draft = lk.opts.max_draft.min(crate::inkling::MAX_DRAFT);
+                }
                 let hs = generate::prefill(*model, sess, &ids, chunk, &overrides);
                 let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
                 st.prefill_secs = t0.elapsed().as_secs_f64();
                 let max = limit(sess.pos);
                 if max == 0 {
                     empty(0.0)
-                } else {
+                } else if !model.can_rollback() {
+                    // (A device whose sessions cannot go back: no lookup rounds.)
                     generate::decode(*model, sess, logits, sampler, stop, max, &mut cb)
+                } else {
+                    plain!(*model, sess, base, logits, max)
                 }
             }
             // As GLM-5.3-Flash: the Mamba state cannot roll a rejected draft back.

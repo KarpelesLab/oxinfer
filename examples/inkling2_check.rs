@@ -88,6 +88,7 @@ fn main() -> Result<()> {
     let mut feats_out: Option<String> = None;
     let mut prompt_text: Option<String> = None;
     let mut image: Option<String> = None;
+    let mut kv = oxinfer::inkling::KvCache::F32;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--chunk" => chunk = Some(args.next().context("--chunk N")?.parse::<usize>()?),
@@ -99,6 +100,7 @@ fn main() -> Result<()> {
             "--feats" => feats_out = Some(args.next().context("--feats FILE")?),
             "--prompt-text" => prompt_text = Some(args.next().context("--prompt-text FILE")?),
             "--image" => image = Some(args.next().context("--image FILE")?),
+            "--kv" => kv = oxinfer::inkling::KvCache::parse(&args.next().context("--kv f32|f16|q8")?)?,
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
@@ -136,6 +138,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let mut m = Inkling2Model::load(cfg, &files, oxinfer::model::Quant::Bf16)?;
+    m.kv = kv;
     let streamer = if stream {
         Some(oxinfer::stream::attach_inkling(&mut m, &files, oxinfer::inkling::default_stream())?)
     } else {
@@ -242,10 +245,19 @@ fn main() -> Result<()> {
         let gen_ids = i64s(&st, "gen")?;
         let dref = f32s(&st, "decode_logits")?;
         let mut got = Vec::with_capacity(dref.len());
-        for &tk in &gen_ids {
+        let mut back = Vec::with_capacity(dref.len());
+        let mut sess2 = sess.clone();
+        for (i, &tk) in gen_ids.iter().enumerate() {
             got.extend(m.forward(&mut sess, &[tk]));
+            // The same after a rejected draft: a few other tokens run (one pass), then rolled back.
+            let pos = sess2.pos;
+            let junk: Vec<u32> = (0..1 + i % 5).map(|j| ((tk as usize + 17 * j + 3) % vocab) as u32).collect();
+            m.forward(&mut sess2, &junk);
+            sess2.truncate(pos)?;
+            back.extend(m.forward(&mut sess2, &[tk]));
         }
         report("decode", &got, &dref, vocab);
+        report("decode after rollbacks", &back, &dref, vocab);
         // Greedy decoding on our own: the token after the prompt, then after each of ours.
         let am = |v: &[f32]| v.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).unwrap().0 as u32;
         let mut sess = m.new_session();

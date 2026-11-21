@@ -492,7 +492,7 @@ mod tests {
                 n += 1;
             }
         }
-        assert_eq!(n, 19, "formats");
+        assert_eq!(n, 20, "formats");
     }
 
     #[test]

@@ -299,7 +299,7 @@ pub trait Backend: Send + Sync {
         None
     }
     /// The backend as its concrete type, for model code that runs kernels of its own on it
-    /// (Inkling-2's CUDA path). None by default.
+    /// (Inkling-2's CUDA and Metal engines). None by default.
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         None
     }

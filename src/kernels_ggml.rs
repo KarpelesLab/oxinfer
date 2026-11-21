@@ -76,6 +76,7 @@ pub(super) unsafe fn rows<const TC: usize>(m: &GgufMatrix, x: &Act, y: *mut f32,
         GgmlType::Q5_0 => q32::<TC, Q5_0>,
         GgmlType::Q5_1 => q32::<TC, Q5_1>,
         GgmlType::NVFP4 => nvfp4::<TC>,
+        GgmlType::Q2_0 => q2_0::<TC>,
         _ => return false,
     };
     let rb = m.row_bytes();
@@ -793,6 +794,53 @@ unsafe fn nvfp4<const TC: usize>(row: *const u8, n_in: usize, x: &Act) -> [f32; 
     finish(acc)
 }
 
+/// The 64 weights of a Q2_0 block (an f16 scale, then 16 bytes of 2-bit codes `c - 1`: element
+/// `j` in bits `2 (j % 4)` of byte `j / 4`) as four vectors of 16 in element order.
+#[inline(always)]
+unsafe fn q2_0_unpack(b: *const u8) -> [int8x16_t; 4] {
+    let v = vld1q_u8(b.add(2));
+    let m3 = vdupq_n_u8(3);
+    // Field k of byte i is element 4 i + k: interleave the four fields byte by byte.
+    let e0 = vandq_u8(v, m3);
+    let e1 = vandq_u8(vshrq_n_u8::<2>(v), m3);
+    let e2 = vandq_u8(vshrq_n_u8::<4>(v), m3);
+    let e3 = vshrq_n_u8::<6>(v);
+    let (a_lo, a_hi) = (vreinterpretq_u16_u8(vzip1q_u8(e0, e1)), vreinterpretq_u16_u8(vzip2q_u8(e0, e1)));
+    let (b_lo, b_hi) = (vreinterpretq_u16_u8(vzip1q_u8(e2, e3)), vreinterpretq_u16_u8(vzip2q_u8(e2, e3)));
+    let one = vdupq_n_s8(1);
+    let w = |u: uint16x8_t| vsubq_s8(vreinterpretq_s8_u16(u), one);
+    [
+        w(vzip1q_u16(a_lo, b_lo)),
+        w(vzip2q_u16(a_lo, b_lo)),
+        w(vzip1q_u16(a_hi, b_hi)),
+        w(vzip2q_u16(a_hi, b_hi)),
+    ]
+}
+
+/// Q2_0 (ggml type 42: ternary checkpoints, low-bit experts): blocks of 64 with one f16 scale.
+unsafe fn q2_0<const TC: usize>(row: *const u8, n_in: usize, x: &Act) -> [f32; TC] {
+    let zero = vdupq_n_s32(0);
+    let bpr = n_in / 32;
+    let mut acc = [vdupq_n_f32(0.0); TC];
+    for blk in 0..n_in / 64 {
+        let b = row.add(18 * blk);
+        let w = q2_0_unpack(b);
+        let dv = vdupq_n_f32(f16p(b));
+        for c in 0..TC {
+            let xq = x.q.add(c * n_in + 64 * blk);
+            let a0 = sdot(zero, w[0], vld1q_s8(xq));
+            let a1 = sdot(zero, w[1], vld1q_s8(xq.add(16)));
+            let a2 = sdot(zero, w[2], vld1q_s8(xq.add(32)));
+            let a3 = sdot(zero, w[3], vld1q_s8(xq.add(48)));
+            let s = vpaddq_s32(vpaddq_s32(a0, a1), vpaddq_s32(a2, a3));
+            let xs = vld1_f32(x.s.add(c * bpr + 2 * blk));
+            let xsv = vcombine_f32(vdup_lane_f32::<0>(xs), vdup_lane_f32::<1>(xs));
+            acc[c] = vfmaq_f32(acc[c], vcvtq_f32_s32(s), vmulq_f32(dv, xsv));
+        }
+    }
+    finish(acc)
+}
+
 unsafe fn q8_0<const TC: usize>(row: *const u8, n_in: usize, x: &Act) -> [f32; TC] {
     let bpr = n_in / 32;
     let zero = vdupq_n_s32(0);
@@ -1421,6 +1469,7 @@ fn cols_kind(kind: GgmlType) -> bool {
             | GgmlType::Q5_0
             | GgmlType::Q5_1
             | GgmlType::NVFP4
+            | GgmlType::Q2_0
     )
 }
 
@@ -1453,6 +1502,7 @@ unsafe fn cols_multi(m: &GgufMatrix, x: &Act, t: usize, y: *mut f32, ys: usize, 
                 GgmlType::Q4_1 => q32::<$TC, Q4_1>,
                 GgmlType::Q5_0 => q32::<$TC, Q5_0>,
                 GgmlType::NVFP4 => nvfp4::<$TC>,
+                GgmlType::Q2_0 => q2_0::<$TC>,
                 _ => q32::<$TC, Q5_1>,
             }
         };
@@ -1550,7 +1600,7 @@ pub(super) unsafe fn rows_multi(
 pub(super) fn i8_layout(kind: GgmlType) -> Option<(bool, bool)> {
     use GgmlType::*;
     Some(match kind {
-        Q8_0 | Q4_0 | IQ4_NL | MXFP4 | Q5_0 | IQ4_XS => (false, false),
+        Q8_0 | Q4_0 | IQ4_NL | MXFP4 | Q5_0 | IQ4_XS | Q2_0 => (false, false),
         Q4_1 | Q5_1 | Q4_K | Q5_K => (false, true),
         Q6_K | Q3_K | IQ2_XXS | IQ2_XS | IQ2_S | IQ3_XXS | IQ3_S | IQ1_S | IQ1_M => (true, false),
         _ => return None,
@@ -1576,6 +1626,17 @@ pub(super) unsafe fn unpack_row_i8(kind: GgmlType, row: *const u8, n_in: usize, 
         GgmlType::Q4_1 => b32_i8::<Q4_1>(row, n_in, q, ds, mn),
         GgmlType::Q5_0 => b32_i8::<Q5_0>(row, n_in, q, ds, mn),
         GgmlType::Q5_1 => b32_i8::<Q5_1>(row, n_in, q, ds, mn),
+        GgmlType::Q2_0 => {
+            for b in 0..n_in / 64 {
+                let p = row.add(18 * b);
+                for (k, w) in q2_0_unpack(p).iter().enumerate() {
+                    vst1q_s8(q.add(64 * b + 16 * k), *w);
+                }
+                let d = f16p(p);
+                *ds.add(2 * b) = d;
+                *ds.add(2 * b + 1) = d;
+            }
+        }
         GgmlType::Q4_K => sb_i8::<MQ4K<false>>(row, n_in, q, ds, mn, sc),
         GgmlType::Q5_K => sb_i8::<MQ4K<true>>(row, n_in, q, ds, mn, sc),
         GgmlType::Q6_K => sb_i8::<MSb16<Q6K>>(row, n_in, q, ds, mn, sc),

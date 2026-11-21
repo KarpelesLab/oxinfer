@@ -44,8 +44,10 @@
 //! E4M3 scale per 16 and `amax / outer_scale_denominator` per expert) repacked at load into
 //! ggml's NVFP4 blocks, or plain floats.
 //!
-//! The convolutions keep only their last inputs, so a session cannot go back to an earlier
-//! position (no prompt lookup, no draft model).
+//! A session can go back up to [`ROLLBACK`] positions ([`Inkling2Session::truncate`], what
+//! speculative decoding needs): the convolutions keep their last inputs in rings of
+//! `kernel - 1 + ROLLBACK` rows indexed by position, and the sliding-window caches keep that many
+//! positions more than their window.
 
 #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
 #[path = "inkling_cuda.rs"]
@@ -68,6 +70,15 @@ const MIX_EPS: f32 = 1e-6;
 const CLIP_EPS: f32 = 1e-6;
 /// The prefix of the text decoder's tensors.
 const P: &str = "model.llm.";
+/// Positions a session can go back ([`Inkling2Session::truncate`]): the convolutions' rings keep
+/// this many inputs beyond the `kernel - 1` they read, the sliding-window caches this many
+/// positions beyond their window.
+pub const ROLLBACK: usize = 64;
+/// Most draft tokens a speculative round of this family verifies: a pass of `MAX_DRAFT + 1`
+/// tokens stays on the CPU's decode kernels (routed experts included, `kernels::TN`), whose rows
+/// are those of one-token forwards bit for bit, so greedy output is plain greedy output. (Longer
+/// passes take the prefill path: other rounding, and several times slower on the CPU.)
+pub const MAX_DRAFT: usize = crate::kernels::TN - 2;
 
 /// Whether `model_type` is one of this family's.
 pub fn is_model_type(mt: &str) -> bool {
@@ -344,6 +355,15 @@ impl Inkling2Config {
     pub fn n_slots(&self) -> usize {
         self.num_hidden_layers + self.loop_cfg.map_or(0, |c| (c.passes - 1) * (c.end - c.start))
     }
+
+    /// The layer of each cache slot.
+    pub fn slot_layers(&self) -> Vec<usize> {
+        let mut v = vec![0usize; self.n_slots()];
+        for s in self.steps() {
+            v[s.slot] = s.layer;
+        }
+        v
+    }
 }
 
 /// The release's `config.json` of a GGUF file of llama.cpp's `inkling2` / `inkling2_loop`
@@ -536,6 +556,143 @@ pub(crate) fn gguf_name(name: &str, ne: &[usize]) -> Option<(String, Vec<usize>)
     Some((format!("{P}layers.{l}.{n}"), sh))
 }
 
+/// Whether `files` is an mlx-lm checkpoint of the family (`mlx-community/Inkling-2-Mini-4bit`:
+/// mlx-lm's names, `model.language_model.*`), read under the release's names ([`mlx_name`]).
+pub(crate) fn is_mlx_layout(files: &ModelFiles) -> bool {
+    files.is_mlx() && files.has("model.language_model.final_input.query")
+}
+
+/// The release's name of a tensor of an mlx-lm checkpoint (mlx-lm's `sanitize` undone), or None
+/// to keep it. Quantized matrices keep their `.weight` / `.scales` / `.biases` parts; the
+/// experts (the release's bytes as words) go back under `w13_weight` / `w2_weight` with their
+/// scales and global scales; the message queries of all looped layers (`[core, 4, H]`, query,
+/// key, value, MLP) become one table, `loop_msg_query_all`.
+pub(crate) fn mlx_name(n: &str) -> Option<String> {
+    if let Some(sfx) = n.strip_prefix("lm_head.") {
+        return Some(format!("{P}unembed.{sfx}"));
+    }
+    if let Some(r) = n.strip_prefix("model.vision_tower.") {
+        return Some(mlx_vision_name(r));
+    }
+    let r = n.strip_prefix("model.language_model.")?;
+    let top = match r {
+        "embed_norm.weight" => Some("embed_norm.weight".to_string()),
+        "norm.weight" => Some("norm.weight".to_string()),
+        "final_input.query" => Some("attn_res.output_query".to_string()),
+        "message_input.query" => Some("loop_msg_query_all".to_string()),
+        _ => r.strip_prefix("embed_tokens.").map(|sfx| format!("embed.{sfx}")),
+    };
+    if let Some(t) = top {
+        return Some(format!("{P}{t}"));
+    }
+    let (l, rest) = r.strip_prefix("layers.")?.split_once('.')?;
+    let li: usize = l.parse().ok()?;
+    match rest {
+        // (Layer 0 has no attention residual query: `attn_queries.{i}` is layer `i + 1`'s.)
+        "attention_input.query" => return Some(format!("{P}attn_res.attn_queries.{}", li.checked_sub(1)?)),
+        "mlp_input.query" => return Some(format!("{P}attn_res.mlp_queries.{li}")),
+        _ => {}
+    }
+    let own = |s: &str| Some(format!("{P}layers.{li}.{s}"));
+    match rest {
+        "input_layernorm.weight" => return own("attn_norm.weight"),
+        "post_attention_layernorm.weight" => return own("mlp_norm.weight"),
+        "q_input_layernorm.weight" => return own("q_input_norm.weight"),
+        "k_input_layernorm.weight" => return own("k_input_norm.weight"),
+        "v_input_layernorm.weight" => return own("v_input_norm.weight"),
+        "post_attention_convolution.conv1d.weight" => return own("attn_sconv.weight"),
+        "post_mlp_convolution.conv1d.weight" => return own("mlp_sconv.weight"),
+        "mlp.gate.weight" => return own("mlp.gate.weight"),
+        "mlp.gate.e_score_correction_bias" => return own("mlp.gate.bias"),
+        _ => {}
+    }
+    if let Some((kind, part)) = rest.split_once("_message_gate.") {
+        let kind = if kind == "q" { "attn" } else { kind };
+        let part = match part {
+            "down_proj.weight" => "down_weight",
+            "forget_gate_proj.weight" => "forget_weight",
+            "message_gate_proj.weight" => "gain_weight",
+            _ => return None,
+        };
+        return own(&format!("controllers.{kind}.{part}"));
+    }
+    if let Some(e) = rest.strip_prefix("mlp.experts.") {
+        let (proj, part) = e.split_once('.')?;
+        let w = match proj {
+            "gate_up_proj" => "w13_weight",
+            "down_proj" => "w2_weight",
+            _ => return None,
+        };
+        return match part {
+            "weight" => own(&format!("mlp.experts.{w}")),
+            "scales" => own(&format!("mlp.experts.{w}_scale")),
+            "global_scale" => own(&format!("mlp.experts.{w}_global_scale")),
+            _ => None,
+        };
+    }
+    let a = rest.strip_prefix("self_attn.")?;
+    for (from, to) in [
+        ("q_proj.", "wq_du."),
+        ("k_proj.", "wk_dv."),
+        ("v_proj.", "wv_dv."),
+        ("r_proj.", "wr_du."),
+        ("o_proj.", "wo_ud."),
+        ("gate_proj.", "gate_attn."),
+        ("sink_proj.", "attn_sink_proj."),
+    ] {
+        if let Some(sfx) = a.strip_prefix(from) {
+            return own(&format!("attn.{to}{sfx}"));
+        }
+    }
+    for kv in ["k_sconv.", "v_sconv."] {
+        if let Some(p) = a.strip_prefix(kv) {
+            let to = match p {
+                "conv1d.weight" => "weight".to_string(),
+                "static_weight" => "static_w".to_string(),
+                // The release's `weight_proj` has no `.weight` part (its MLX parts follow it).
+                "weight_proj.weight" => "weight_proj".to_string(),
+                _ => p.to_string(),
+            };
+            return own(&format!("attn.{kv}{to}"));
+        }
+    }
+    // q_l2_clip.scale, rel_l2_clip.scale, rel_logits_proj.proj
+    own(&format!("attn.{a}"))
+}
+
+/// The release's name (`model.visual.*`) of an mlx-lm vision tower tensor (after
+/// `model.vision_tower.`).
+fn mlx_vision_name(r: &str) -> String {
+    if let Some(s) = r.strip_prefix("pre_layernorm.") {
+        return format!("model.visual.backbone.ln_pre.{s}");
+    }
+    if let Some(s) = r.strip_prefix("merger.linear_1.") {
+        return format!("model.visual.proj_in.{s}");
+    }
+    if let Some(s) = r.strip_prefix("merger.linear_2.") {
+        return format!("model.visual.proj_out.{s}");
+    }
+    let mut s = r.to_string();
+    if let Some(p) = s.strip_suffix("embeddings.position_embedding.weight") {
+        s = format!("{p}embeddings.position_embedding");
+    }
+    if let Some(rest) = s.strip_prefix("layers.")
+        && let Some((l, part)) = rest.split_once('.')
+    {
+        let part = match part {
+            p if p.starts_with("layernorm_before.") => p.replacen("layernorm_before.", "ln_1.", 1),
+            p if p.starts_with("layernorm_after.") => p.replacen("layernorm_after.", "ln_2.", 1),
+            p if p.starts_with("mlp.fc1.") => p.replacen("mlp.fc1.", "mlp.c_fc.", 1),
+            p if p.starts_with("mlp.fc2.") => p.replacen("mlp.fc2.", "mlp.c_proj.", 1),
+            "lambda_1" => "ls_1.gamma".to_string(),
+            "lambda_2" => "ls_2.gamma".to_string(),
+            p => p.to_string(),
+        };
+        s = format!("layers.{l}.{part}");
+    }
+    format!("model.visual.backbone.{s}")
+}
+
 /// The prefill chunk when none is asked for: 2048 tokens on machines of 32 GB or more (each of
 /// a layer's 128 experts then sees about 128 of them, enough for its weights to be decoded once
 /// for many: prefill is 2-3x faster than with 256), 512 below (a chunk of 2048 holds about 3 GB
@@ -545,6 +702,18 @@ pub fn default_prefill_chunk() -> usize {
         Some(m) if m >= 32 << 30 => 2048,
         _ => 512,
     }
+}
+
+/// Checks that a DSpark draft reads streams this target has: Inkling-2's drafter
+/// (`crate::inkling_draft`) reads layer applications of a pass and, last, the final-normed
+/// output (index `steps().len() + 1` of [`Inkling2Model::forward_capture`]).
+pub fn check_draft(m: &Inkling2Model, d: &crate::dspark::Dspark) -> Result<()> {
+    let n = m.cfg.steps().len();
+    let tl = &d.cfg.target_layers;
+    if tl.iter().any(|&l| l > n + 1) || tl.last() != Some(&(n + 1)) {
+        bail!("the draft reads target layers {tl:?}; this Inkling-2 model has {n} layer applications per pass");
+    }
+    Ok(())
 }
 
 /// Weight streaming for a checkpoint that does not fit in memory (as Mistral Large 4).
@@ -560,7 +729,7 @@ pub fn too_big(bytes: u64) -> bool {
 /// The convolution of keys or values.
 // Two per layer, built once.
 #[allow(clippy::large_enum_variant)]
-enum KvConv<'a> {
+pub(crate) enum KvConv<'a> {
     /// Learned taps, `[lag][channels]` (lag 0 is the current token).
     Static(Vec<f32>),
     /// Learned taps plus per-token ones: `proj` (`[kv_heads * kernel, H]`) gives one tap per
@@ -568,66 +737,66 @@ enum KvConv<'a> {
     Dynamic { taps: Vec<f32>, proj: Lin<'a> },
 }
 
-struct Attn<'a> {
-    hd: Heads,
+pub(crate) struct Attn<'a> {
+    pub(crate) hd: Heads,
     /// Sliding-window attention over this many tokens (the current one included).
-    window: Option<usize>,
+    pub(crate) window: Option<usize>,
     /// Backward distances that have a relative bias.
-    extent: usize,
-    q: Lin<'a>,        // [heads * d, H]
-    k: Lin<'a>,        // [kv * d, H]
-    v: Lin<'a>,        // [kv * d, H]
-    r: Lin<'a>,        // [heads * d_rel, H]
-    gate: Lin<'a>,     // [heads * d, H]
-    sink: Lin<'a>,     // [heads, H]
-    o: Lin<'a>,        // [H, heads * d]
-    q_scale: Vec<f32>, // [heads * d]
-    r_scale: Vec<f32>, // [heads * d_rel]
-    rel: Vec<f32>,     // [d_rel, extent]
-    k_conv: KvConv<'a>,
-    v_conv: KvConv<'a>,
+    pub(crate) extent: usize,
+    pub(crate) q: Lin<'a>,        // [heads * d, H]
+    pub(crate) k: Lin<'a>,        // [kv * d, H]
+    pub(crate) v: Lin<'a>,        // [kv * d, H]
+    pub(crate) r: Lin<'a>,        // [heads * d_rel, H]
+    pub(crate) gate: Lin<'a>,     // [heads * d, H]
+    pub(crate) sink: Lin<'a>,     // [heads, H]
+    pub(crate) o: Lin<'a>,        // [H, heads * d]
+    pub(crate) q_scale: Vec<f32>, // [heads * d]
+    pub(crate) r_scale: Vec<f32>, // [heads * d_rel]
+    pub(crate) rel: Vec<f32>,     // [d_rel, extent]
+    pub(crate) k_conv: KvConv<'a>,
+    pub(crate) v_conv: KvConv<'a>,
 }
 
 /// The norms before the attention: one, or one each for queries, keys and values.
-enum InNorm {
+pub(crate) enum InNorm {
     One(Vec<f32>),
     Qkv(Vec<f32>, Vec<f32>, Vec<f32>),
 }
 
 /// A message gate of a looped layer: `(1 - tanh(forget g)) x + tanh(gain g) m` for its input `x`
 /// and message `m`, where `g = down [rms(x); rms(m)]`.
-struct Gate<'a> {
-    down: Lin<'a>,   // [rank, 2 H]
-    forget: Lin<'a>, // [H, rank]
-    gain: Lin<'a>,   // [H, rank]
+pub(crate) struct Gate<'a> {
+    pub(crate) down: Lin<'a>,   // [rank, 2 H]
+    pub(crate) forget: Lin<'a>, // [H, rank]
+    pub(crate) gain: Lin<'a>,   // [H, rank]
 }
 
 /// What a looped layer has for the passes after the first.
-struct LoopIn<'a> {
+pub(crate) struct LoopIn<'a> {
     /// The gates of the query, key, value and MLP inputs.
-    gates: [Gate<'a>; 4],
+    pub(crate) gates: [Gate<'a>; 4],
     /// The four message queries (query, key, value, MLP), `[4, H]`.
-    query: Vec<f32>,
+    pub(crate) query: Vec<f32>,
 }
 
-struct Layer<'a> {
+pub(crate) struct Layer<'a> {
     /// The message gates and queries of a looped layer.
-    looped: Option<LoopIn<'a>>,
+    pub(crate) looped: Option<LoopIn<'a>>,
     /// The first layer of a block: its input becomes a block state.
-    boundary: bool,
+    pub(crate) boundary: bool,
     /// The attention residual's queries before the attention (none on layer 0): `[H]`, or
     /// `[3, H]` on a full layer.
-    attn_query: Option<Vec<f32>>,
-    mlp_query: Vec<f32>,
-    ln_in: InNorm,
-    ln_post: Vec<f32>,
-    attn: Attn<'a>,
+    pub(crate) attn_query: Option<Vec<f32>>,
+    pub(crate) mlp_query: Vec<f32>,
+    pub(crate) ln_in: InNorm,
+    pub(crate) ln_post: Vec<f32>,
+    pub(crate) attn: Attn<'a>,
     /// The convolutions after the attention and after the MLP, `[lag][H]`.
-    attn_conv: Vec<f32>,
-    mlp_conv: Vec<f32>,
-    router: Vec<f32>, // [n_exp, H]
-    bias: Vec<f32>,   // [n_exp]
-    experts: Experts<'a>,
+    pub(crate) attn_conv: Vec<f32>,
+    pub(crate) mlp_conv: Vec<f32>,
+    pub(crate) router: Vec<f32>, // [n_exp, H]
+    pub(crate) bias: Vec<f32>,   // [n_exp]
+    pub(crate) experts: Experts<'a>,
 }
 
 /// How the attention caches store keys and values ([`Inkling2Model::kv`]).
@@ -665,17 +834,17 @@ impl KvCache {
 
 /// Rows of keys or values (`[width]` each) in one of the [`KvCache`] layouts.
 #[derive(Clone, Default)]
-struct KvRows {
-    mode: KvCache,
-    f: Vec<f32>,
-    h: Vec<u16>,
-    q: Vec<i8>,
+pub(crate) struct KvRows {
+    pub(crate) mode: KvCache,
+    pub(crate) f: Vec<f32>,
+    pub(crate) h: Vec<u16>,
+    pub(crate) q: Vec<i8>,
     /// Q8: one scale per 32 values.
-    s: Vec<f32>,
+    pub(crate) s: Vec<f32>,
 }
 
 impl KvRows {
-    fn new(mode: KvCache) -> Self {
+    pub(crate) fn new(mode: KvCache) -> Self {
         Self {
             mode,
             ..Default::default()
@@ -709,6 +878,17 @@ impl KvRows {
                     self.q.extend(b.iter().map(|&v| (v * inv).round() as i8));
                     self.s.push(d);
                 }
+            }
+        }
+    }
+    /// Keeps the first `n` values (`n` a multiple of 32 for Q8).
+    fn truncate(&mut self, n: usize) {
+        match self.mode {
+            KvCache::F32 => self.f.truncate(n),
+            KvCache::F16 => self.h.truncate(n),
+            KvCache::Q8 => {
+                self.q.truncate(n);
+                self.s.truncate(n / 32);
             }
         }
     }
@@ -754,10 +934,38 @@ impl KvRows {
     }
 }
 
-/// Whole passes on an accelerator (CUDA: `inkling_cuda.rs`), chosen when the model first runs.
-/// A session's state then lives on the device ([`DevBox`]); a pass the device does not take
-/// (interventions, captured layers) first brings it back to the host caches.
+/// Whole passes on an accelerator (CUDA: `inkling_cuda.rs`; Metal: `crate::metal::inkling`),
+/// chosen when the model first runs. A session's state then lives on the device ([`DevBox`]); a
+/// pass the device does not take (interventions, captured layers on CUDA, more tokens than
+/// [`DevEngine::max_tokens`]) first brings it back to the host caches ([`DevEngine::to_host`]).
 pub(crate) trait DevEngine: Send + Sync {
+    /// Most tokens of a pass the device takes.
+    fn max_tokens(&self) -> usize {
+        usize::MAX
+    }
+    /// Positions a session on the device can go back ([`Inkling2Session::truncate`]); 0 when it
+    /// cannot (prompt lookup and draft models then stay off).
+    fn rollback(&self) -> usize {
+        0
+    }
+    /// Runs the embedded tokens `x` (`[t, hidden]`, embedding norm applied) from `sess.pos`,
+    /// advancing it, into `want`; false when the device does not take the pass (the session is
+    /// then untouched). By default [`DevEngine::forward`] and the head, without captured streams.
+    fn run(&self, m: &Inkling2Model, sess: &mut Inkling2Session, x: &[f32], t: usize, want: DevWant) -> bool {
+        if want.capture.is_some() {
+            return false;
+        }
+        let h = m.cfg.hidden_size;
+        let hs = self.forward(m, sess, x, t);
+        if let Some((l, rows)) = want.logits {
+            let r = rows.min(t);
+            *l = m.head(&hs[(t - r) * h..], r, true);
+        }
+        if let Some(hv) = want.hidden {
+            *hv = hs;
+        }
+        true
+    }
     /// Runs the embedded tokens `x` (`[t, hidden]`, embedding norm applied) from `sess.pos` and
     /// advances it: the final-normed hidden states.
     fn forward(&self, m: &Inkling2Model, sess: &mut Inkling2Session, x: &[f32], t: usize) -> Vec<f32>;
@@ -774,10 +982,17 @@ pub(crate) trait DevSession: Send + Sync {
     /// Bytes of its attention caches.
     fn bytes(&self) -> usize;
     #[cfg_attr(
-        not(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))),
+        not(all(
+            feature = "gpu",
+            any(not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")), target_arch = "aarch64")
+        )),
         allow(dead_code)
     )]
     fn as_any(&mut self) -> &mut dyn std::any::Any;
+    /// Goes back from position `pos` to `len`; false when the device state cannot.
+    fn truncate(&mut self, _pos: usize, _len: usize) -> bool {
+        false
+    }
 }
 
 /// See [`DevSession`]: authoritative while set (the host caches are then stale).
@@ -789,25 +1004,126 @@ impl Clone for DevBox {
     }
 }
 
+/// The last inputs of a short convolution by position: the row of position `p` (from
+/// `-(kernel - 1)`, zeros before the first token) is at `(p + kernel - 1) % cap`; `cap` is
+/// `kernel - 1 + ROLLBACK` rows, so that after going back up to [`ROLLBACK`] positions the
+/// `kernel - 1` inputs before the new position are still there.
+#[derive(Clone, Default)]
+pub(crate) struct ConvRing {
+    pub(crate) rows: Vec<f32>,
+    pub(crate) ch: usize,
+    pub(crate) back: usize,
+}
+
+impl ConvRing {
+    fn new(kernel: usize, ch: usize) -> Self {
+        let back = kernel - 1;
+        Self {
+            rows: vec![0f32; (back + ROLLBACK) * ch],
+            ch,
+            back,
+        }
+    }
+    pub(crate) fn cap(&self) -> usize {
+        self.back + ROLLBACK
+    }
+    /// The slot of position `p` (`p >= -(kernel - 1)`).
+    pub(crate) fn slot(&self, p: isize) -> usize {
+        (p + self.back as isize).rem_euclid(self.cap() as isize) as usize
+    }
+    fn row(&self, p: isize) -> &[f32] {
+        let s = self.slot(p);
+        &self.rows[s * self.ch..(s + 1) * self.ch]
+    }
+    fn row_mut(&mut self, p: isize) -> &mut [f32] {
+        let s = self.slot(p);
+        &mut self.rows[s * self.ch..(s + 1) * self.ch]
+    }
+    /// The `kernel - 1` inputs before position `pos`, oldest first (a device's history).
+    #[cfg_attr(
+        not(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))),
+        allow(dead_code)
+    )]
+    pub(crate) fn last(&self, pos: usize) -> Vec<f32> {
+        (pos as isize - self.back as isize..pos as isize)
+            .flat_map(|p| self.row(p).iter().copied())
+            .collect()
+    }
+    /// Sets the `kernel - 1` inputs before position `pos` from `v` (oldest first).
+    #[cfg_attr(
+        not(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))),
+        allow(dead_code)
+    )]
+    pub(crate) fn set_last(&mut self, pos: usize, v: &[f32]) {
+        let ch = self.ch;
+        for (i, p) in (pos as isize - self.back as isize..pos as isize).enumerate() {
+            self.row_mut(p).copy_from_slice(&v[i * ch..(i + 1) * ch]);
+        }
+    }
+}
+
 /// The decoding state of one layer.
 #[derive(Clone, Default)]
-struct LayerState {
+pub(crate) struct LayerState {
     /// Clipped keys and normed values of positions `first..`, `[kv * d]` each.
-    k: KvRows,
-    v: KvRows,
-    first: usize,
-    /// The last `kernel - 1` inputs of the key, value, attention and MLP convolutions.
-    hist: [Vec<f32>; 4],
+    pub(crate) k: KvRows,
+    pub(crate) v: KvRows,
+    pub(crate) first: usize,
+    /// The recent inputs of the key, value, attention and MLP convolutions.
+    pub(crate) hist: [ConvRing; 4],
 }
 
 #[derive(Clone)]
 pub struct Inkling2Session {
-    layers: Vec<LayerState>,
+    pub(crate) layers: Vec<LayerState>,
     pub pos: usize,
     /// Runtime interventions ([`crate::intervene`]).
     pub iv: crate::intervene::State,
     /// The state on the device, when the model runs there.
-    dev: Option<DevBox>,
+    pub(crate) dev: Option<DevBox>,
+}
+
+/// What a device pass returns ([`DevEngine::run`]).
+pub(crate) struct DevWant<'w> {
+    /// The final-normed hidden states `[t, hidden]`.
+    pub hidden: Option<&'w mut Vec<f32>>,
+    /// The soft-capped logits `[rows, unpadded vocab]` of the last `rows` tokens.
+    pub logits: Option<(&'w mut Vec<f32>, usize)>,
+    /// The streams entering the given steps (`[t, steps.len() * hidden]`, see
+    /// [`Inkling2Model::forward_capture`]).
+    pub capture: Option<(&'w [usize], &'w mut Vec<f32>)>,
+}
+
+impl Inkling2Session {
+    /// Goes back to position `len` (at most [`ROLLBACK`] before the current one), as if the
+    /// tokens from `len` on had not been run.
+    pub fn truncate(&mut self, len: usize) -> Result<()> {
+        if len >= self.pos {
+            return Ok(());
+        }
+        if self.pos - len > ROLLBACK {
+            bail!(
+                "Inkling-2: a session goes back at most {ROLLBACK} positions ({} asked)",
+                self.pos - len
+            );
+        }
+        if let Some(d) = &mut self.dev {
+            if !d.0.truncate(self.pos, len) {
+                bail!("Inkling-2: this device's sessions cannot go back to an earlier position");
+            }
+            self.pos = len;
+            return Ok(());
+        }
+        for st in &mut self.layers {
+            // (A sliding layer keeps `ROLLBACK` positions more than its window.)
+            let rows = len.saturating_sub(st.first);
+            let row = st.hist[0].ch;
+            st.k.truncate(rows * row);
+            st.v.truncate(rows * row);
+        }
+        self.pos = len;
+        Ok(())
+    }
 }
 
 pub struct Inkling2Model<'a> {
@@ -816,12 +1132,12 @@ pub struct Inkling2Model<'a> {
     /// How new sessions store their keys and values (Q8 falls back to F16 for heads that are
     /// not whole blocks of 32).
     pub kv: KvCache,
-    embed: Table<'a>,
-    embed_norm: Vec<f32>,
-    lm_head: Lin<'a>,
-    final_norm: Vec<f32>,
-    final_query: Vec<f32>,
-    layers: Vec<Layer<'a>>,
+    pub(crate) embed: Table<'a>,
+    pub(crate) embed_norm: Vec<f32>,
+    pub(crate) lm_head: Lin<'a>,
+    pub(crate) final_norm: Vec<f32>,
+    pub(crate) final_query: Vec<f32>,
+    pub(crate) layers: Vec<Layer<'a>>,
     /// Weight streaming: unit `l` is layer `l`, unit `num_hidden_layers` the LM head.
     stream: Option<crate::stream::StreamHook>,
     /// Whole passes on the GPU, decided at the first pass ([`DevEngine`]).
@@ -913,18 +1229,34 @@ impl<'a> Loader<'a, '_> {
             }
             Ok(())
         };
-        match info.dtype.as_str() {
+        // mlx-lm's checkpoints: the release's bytes as 32-bit words (4 bits a weight: NVFP4, with
+        // its scales as bytes and `global_scale = amax * 6 * 448 / denominator`; 8: MXFP8).
+        let mlx = info.dtype == "U32" && info.shape.len() == 3 && info.shape[..2] == [ne, n_out];
+        let dtype = match (mlx, info.shape.last().copied().unwrap_or(0) * 32) {
+            (true, b) if b == 4 * n_in => "U8",
+            (true, b) if b == 8 * n_in => "F8_E4M3",
+            _ => info.dtype.as_str(),
+        };
+        match dtype {
             // NVFP4: E2M1 pairs, an E4M3 scale per 16, and per expert `amax / denominator`.
             "U8" => {
-                if info.shape != [ne, n_out, n_in / 2] || !n_in.is_multiple_of(16) {
+                let words = if mlx { n_in / 8 } else { n_in / 2 };
+                if info.shape != [ne, n_out, words] || !n_in.is_multiple_of(16) {
                     bail!("{full}: NVFP4 shape {:?} for [{ne}, {n_out}, {n_in}]", info.shape);
                 }
                 scale_shape(16)?;
-                if f.info(&sn).is_some_and(|i| i.dtype != "F8_E4M3") {
+                if f.info(&sn).is_some_and(|i| i.dtype != "F8_E4M3" && !(mlx && i.dtype == "U8")) {
                     bail!("{sn}: NVFP4 scales must be E4M3");
                 }
-                let amax = self.getf(&format!("{full}_amax"), ne)?;
-                let den = self.getf(&format!("{full}_outer_scale_denominator"), 1)?[0];
+                let (amax, den) = if mlx {
+                    // (`amax / denominator` is `global_scale / (6 * 448)`.)
+                    (self.getf(&format!("{full}_global_scale"), ne)?, 2688.0)
+                } else {
+                    (
+                        self.getf(&format!("{full}_amax"), ne)?,
+                        self.getf(&format!("{full}_outer_scale_denominator"), 1)?[0],
+                    )
+                };
                 if den == 0.0 {
                     bail!("{full}_outer_scale_denominator is 0");
                 }
@@ -954,7 +1286,7 @@ impl<'a> Loader<'a, '_> {
             }
             // MXFP8: E4M3 values, an E8M0 exponent per 32 along each row, used in place.
             "F8_E4M3" => {
-                if info.shape != [ne, n_out, n_in] {
+                if info.shape != [ne, n_out, if mlx { n_in / 4 } else { n_in }] {
                     bail!("{full}: MXFP8 shape {:?} for [{ne}, {n_out}, {n_in}]", info.shape);
                 }
                 scale_shape(32)?;
@@ -1018,8 +1350,14 @@ impl<'a> Loader<'a, '_> {
         // A GGUF file has each layer's four queries; the release two tables of `[2 * core, H]`:
         // the query and MLP queries of each looped layer, then its key and value queries.
         let own = format!("{P}layers.{l}.loop_msg_query");
+        let all = format!("{P}loop_msg_query_all");
         let query = if self.files.has(&own) {
             self.getf(&own, 4 * h)?
+        } else if self.files.has(&all) {
+            // mlx-lm's table of every looped layer's four queries.
+            let core = lc.end - lc.start;
+            let t = self.getf(&all, core * 4 * h)?;
+            t[(l - lc.start) * 4 * h..(l - lc.start + 1) * 4 * h].to_vec()
         } else {
             let core = lc.end - lc.start;
             let qm = self.getf(&format!("{P}middle_cycle_cross_pass_queries"), 2 * core * h)?;
@@ -1151,17 +1489,21 @@ fn rms_unit(x: &mut [f32], eps: f32) {
     scale_inplace(x, r);
 }
 
-/// A causal depthwise convolution with a skip over `x` (`[t, ch]`), in place:
-/// `(sum_lag taps[lag] * x[t - lag] + x[t]) * norm`. `hist` holds the `kernel - 1` inputs before
-/// `x` and is left holding the last ones. With `dynamic` (`[t, groups * kernel]`), channel `c`
-/// of token `t` adds `dynamic[t][c / (ch / groups) * kernel + lag]` to its taps.
-fn short_conv(taps: &[f32], dynamic: Option<(&[f32], usize)>, hist: &mut Vec<f32>, x: &mut [f32], ch: usize, norm: f32) {
+/// A causal depthwise convolution with a skip over `x` (`[t, ch]`, positions `start..`), in
+/// place: `(sum_lag taps[lag] * x[t - lag] + x[t]) * norm`. `hist` holds the inputs before `x`
+/// and gets those of `x`. With `dynamic` (`[t, groups * kernel]`), channel `c` of token `t` adds
+/// `dynamic[t][c / (ch / groups) * kernel + lag]` to its taps.
+fn short_conv(taps: &[f32], dynamic: Option<(&[f32], usize)>, hist: &mut ConvRing, x: &mut [f32], ch: usize, norm: f32, start: usize) {
     let k = taps.len() / ch;
     let t = x.len() / ch;
-    let back = (k - 1) * ch;
-    debug_assert_eq!(hist.len(), back);
-    let mut seq = std::mem::take(hist);
+    debug_assert_eq!((hist.ch, hist.back), (ch, k - 1));
+    // The `k - 1` inputs before `x`, then `x`.
+    let mut seq = Vec::with_capacity((k - 1 + t) * ch);
+    for p in start as isize - (k - 1) as isize..start as isize {
+        seq.extend_from_slice(hist.row(p));
+    }
     seq.extend_from_slice(x);
+    let back = (k - 1) * ch;
     for_chunks(x, ch, t > 1, |ti, row| {
         // Row `ti` of `x` is row `ti + k - 1` of `seq`.
         for (c, o) in row.iter_mut().enumerate() {
@@ -1189,7 +1531,10 @@ fn short_conv(taps: &[f32], dynamic: Option<(&[f32], usize)>, hist: &mut Vec<f32
         }
         scale_inplace(row, norm);
     });
-    *hist = seq[t * ch..].to_vec();
+    for ti in t.saturating_sub(hist.cap())..t {
+        hist.row_mut((start + ti) as isize)
+            .copy_from_slice(&seq[back + ti * ch..back + (ti + 1) * ch]);
+    }
 }
 
 /// The attention residual: for each of the `nq` queries (`[nq, h]`) and each token, the softmax
@@ -1276,7 +1621,8 @@ impl<'a> Inkling2Model<'a> {
     /// map to these (`blk.N.attn_output.weight` is `layers.N.attn.wo_ud`, `ffn_down_exps` the
     /// experts' `down_proj`). Returns the number patched.
     pub fn attach_lora(&mut self, ad: &mut crate::lora::LoraAdapter) -> Result<usize> {
-        // The GPU engine takes no adapted weights: decided again at the next pass. The engine it
+        // The GPU engine is built for the weights' adapters (Metal runs them as side paths, CUDA
+        // leaves adapted models to the CPU): decided again at the next pass. The engine it
         // replaces stays to bring the sessions that ran on it back to the host caches.
         if let Some(Some(e)) = std::mem::take(&mut self.device).into_inner() {
             self.retired.push(e);
@@ -1326,10 +1672,7 @@ impl<'a> Inkling2Model<'a> {
     pub fn new_session(&self) -> Inkling2Session {
         let c = &self.cfg;
         let back = c.conv_kernel_size - 1;
-        let mut slot_layer = vec![0usize; c.n_slots()];
-        for s in c.steps() {
-            slot_layer[s.slot] = s.layer;
-        }
+        let slot_layer = c.slot_layers();
         Inkling2Session {
             layers: slot_layer
                 .into_iter()
@@ -1344,10 +1687,10 @@ impl<'a> Inkling2Model<'a> {
                         k: KvRows::new(mode),
                         v: KvRows::new(mode),
                         hist: [
-                            vec![0f32; back * kw],
-                            vec![0f32; back * kw],
-                            vec![0f32; back * c.hidden_size],
-                            vec![0f32; back * c.hidden_size],
+                            ConvRing::new(back + 1, kw),
+                            ConvRing::new(back + 1, kw),
+                            ConvRing::new(back + 1, c.hidden_size),
+                            ConvRing::new(back + 1, c.hidden_size),
                         ],
                         ..Default::default()
                     }
@@ -1359,18 +1702,89 @@ impl<'a> Inkling2Model<'a> {
         }
     }
 
+    /// Runs `tokens` on the device when it can (`want` as [`DevWant`]); false otherwise (the
+    /// session then has its state on the host).
+    fn run_device(&self, sess: &mut Inkling2Session, tokens: &[u32], mm: &[(usize, &[f32])], want: DevWant) -> bool {
+        let t = tokens.len();
+        if sess.iv.active() || t == 0 {
+            self.to_host(sess);
+            return false;
+        }
+        let Some(d) = self.device().filter(|d| t <= d.max_tokens()) else {
+            self.to_host(sess);
+            return false;
+        };
+        let x = self.embed_rows(tokens, mm);
+        if d.run(self, sess, &x, t, want) {
+            return true;
+        }
+        self.to_host(sess);
+        false
+    }
+
+    /// The input rows of `tokens`: the normed embeddings, the positions listed in `mm` taking
+    /// the given rows.
+    fn embed_rows(&self, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {
+        let h = self.cfg.hidden_size;
+        let eps = self.cfg.rms_norm_eps as f32;
+        let t = tokens.len();
+        let _timer = prof::start(Cat::Embed);
+        if let Some(s) = &self.stream {
+            let rows: Vec<(usize, usize)> = tokens.iter().flat_map(|&tk| self.embed.row_ranges(tk as usize, h)).collect();
+            s.need_ranges(&rows);
+        }
+        let mut x = vec![0f32; t * h];
+        for_chunks(&mut x, h, t > 1, |ti, row| {
+            self.embed.row(tokens[ti] as usize, row);
+            rmsnorm_f32w_inplace(row, &self.embed_norm, eps);
+        });
+        for &(i, e) in mm {
+            x[i * h..(i + 1) * h].copy_from_slice(e);
+        }
+        x
+    }
+
     /// The device that runs whole passes, if any (decided once, at the first pass: the active
     /// backend, `--gpu-decode`, the weights' kinds and size).
-    fn device(&self) -> Option<&dyn DevEngine> {
+    pub(crate) fn device(&self) -> Option<&dyn DevEngine> {
+        if self.stream.is_some() || !crate::gpu::decode_enabled() {
+            return None;
+        }
         self.device
             .get_or_init(|| {
                 #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
                 if let Some(e) = cuda::Engine::new(self) {
                     return Some(Box::new(e) as Box<dyn DevEngine>);
                 }
+                #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+                if let Some(e) = crate::metal::inkling::build(self) {
+                    return Some(e);
+                }
                 None
             })
             .as_deref()
+    }
+
+    /// Brings the state of `sess` back to the host caches when it is on the device.
+    pub(crate) fn to_host(&self, sess: &mut Inkling2Session) {
+        if sess.dev.is_some() {
+            // (The engine now, else the one an adapter's attach replaced: see `attach_lora`.)
+            match self.device.get().and_then(|d| d.as_deref()).or(self.retired.last().map(|e| &**e)) {
+                Some(d) => d.to_host(self, sess),
+                None => sess.dev = None,
+            }
+        }
+    }
+
+    /// Positions a session of this model can go back ([`Inkling2Session::truncate`]): what its
+    /// device allows (0 on CUDA), [`ROLLBACK`] on the CPU. Speculative decoding needs one.
+    pub fn rollback_limit(&self) -> usize {
+        self.device().map_or(ROLLBACK, |d| d.rollback())
+    }
+
+    /// Whether sessions of this model can go back at all (prompt lookup and drafts need it).
+    pub fn can_rollback(&self) -> bool {
+        self.rollback_limit() > 0
     }
 
     /// Measurements only: puts `n` positions of placeholder keys and values (pseudo-random,
@@ -1393,7 +1807,7 @@ impl<'a> Inkling2Model<'a> {
         for (st, &l) in sess.layers.iter_mut().zip(&slot_layer) {
             let hd = c.heads(l);
             let kw = hd.kv_heads * hd.head_dim;
-            let keep = if c.sliding[l] { n.min(c.sliding_window_size) } else { n };
+            let keep = if c.sliding[l] { n.min(c.sliding_window_size + ROLLBACK) } else { n };
             let mut row = vec![0f32; kw];
             for _ in 0..keep {
                 for x in row.iter_mut() {
@@ -1425,8 +1839,9 @@ impl<'a> Inkling2Model<'a> {
             let hd = c.heads(s.layer);
             let per = 2.0 * (hd.kv_heads * hd.head_dim) as f64 * kv.bytes_per_value();
             if c.sliding[s.layer] {
-                // At most twice the window is kept (it is cut a window at a time).
-                sliding += per * (2 * c.sliding_window_size) as f64;
+                // At most twice the window and the rollback margin are kept (the cache is cut
+                // a window at a time).
+                sliding += per * (2 * c.sliding_window_size + ROLLBACK) as f64;
             } else {
                 full += per;
             }
@@ -1548,6 +1963,22 @@ impl<'a> Inkling2Model<'a> {
 
     /// Runs `tokens` and returns the logits after the last one.
     pub fn forward(&self, sess: &mut Inkling2Session, tokens: &[u32]) -> Vec<f32> {
+        let mut logits = Vec::new();
+        // `OXINFER_GPU_DECODE_CHECK`: the same step on the CPU, from a host copy.
+        let before = (crate::gpu::decode::check() && self.device().is_some()).then(|| sess.clone());
+        let want = DevWant {
+            hidden: None,
+            logits: Some((&mut logits, 1)),
+            capture: None,
+        };
+        if self.run_device(sess, tokens, &[], want) {
+            if let Some(mut b) = before {
+                let h = self.cfg.hidden_size;
+                let hs = self.forward_host(&mut b, tokens, &[], &[], &mut Vec::new());
+                crate::gpu::decode::report(b.pos - 1, &self.logits(&hs[hs.len() - h..], 1), &logits);
+            }
+            return logits;
+        }
         let h = self.cfg.hidden_size;
         let hs = self.forward_hidden(sess, tokens);
         self.logits(&hs[hs.len() - h..], 1)
@@ -1561,8 +1992,9 @@ impl<'a> Inkling2Model<'a> {
 
     /// [`Self::forward_hidden`] where the positions listed in `mm` (relative to this call) take
     /// the given embedding (an image feature, which skips the embedding norm), and that also
-    /// writes to `feats` (`[t, layers.len() * hidden]`) the stream entering each of `layers`,
-    /// `num_hidden_layers` standing for the last layer's output.
+    /// writes to `feats` (`[t, layers.len() * hidden]`) the stream entering each of `layers` (the
+    /// steps of a pass, [`Inkling2Config::steps`]), `steps().len()` standing for the last
+    /// layer's output and `steps().len() + 1` for the final-normed output.
     pub fn forward_capture(
         &self,
         sess: &mut Inkling2Session,
@@ -1573,37 +2005,52 @@ impl<'a> Inkling2Model<'a> {
     ) -> Vec<f32> {
         let t = tokens.len();
         assert!(t > 0);
+        {
+            let mut hidden = Vec::new();
+            let want = DevWant {
+                hidden: Some(&mut hidden),
+                logits: None,
+                capture: (!layers.is_empty()).then_some((layers, &mut *feats)),
+            };
+            if self.run_device(sess, tokens, mm, want) {
+                if layers.is_empty() {
+                    feats.clear();
+                }
+                self.capture_final(layers, feats, &hidden, t);
+                return hidden;
+            }
+        }
+        self.forward_host(sess, tokens, mm, layers, feats)
+    }
+
+    /// Writes the final-normed output `hidden` (`[t, H]`) into the `feats` slots of index
+    /// `steps().len() + 1` (a device pass captures the streams entering steps only).
+    fn capture_final(&self, layers: &[usize], feats: &mut [f32], hidden: &[f32], t: usize) {
+        let (h, nf, fin) = (self.cfg.hidden_size, layers.len(), self.cfg.steps().len() + 1);
+        for (k, _) in layers.iter().enumerate().filter(|e| *e.1 == fin) {
+            for ti in 0..t {
+                feats[(ti * nf + k) * h..(ti * nf + k + 1) * h].copy_from_slice(&hidden[ti * h..(ti + 1) * h]);
+            }
+        }
+    }
+
+    /// [`Self::forward_capture`] on the CPU.
+    fn forward_host(
+        &self,
+        sess: &mut Inkling2Session,
+        tokens: &[u32],
+        mm: &[(usize, &[f32])],
+        layers: &[usize],
+        feats: &mut Vec<f32>,
+    ) -> Vec<f32> {
+        let t = tokens.len();
+        self.to_host(sess);
         let c = &self.cfg;
         let h = c.hidden_size;
         let eps = c.rms_norm_eps as f32;
         let start = sess.pos;
-        let timer = prof::start(Cat::Embed);
-        if let Some(s) = &self.stream {
-            let rows: Vec<(usize, usize)> = tokens.iter().flat_map(|&tk| self.embed.row_ranges(tk as usize, h)).collect();
-            s.need_ranges(&rows);
-        }
-        let mut x = vec![0f32; t * h];
-        for_chunks(&mut x, h, t > 1, |ti, row| {
-            self.embed.row(tokens[ti] as usize, row);
-            rmsnorm_f32w_inplace(row, &self.embed_norm, eps);
-        });
-        for &(i, e) in mm {
-            x[i * h..(i + 1) * h].copy_from_slice(e);
-        }
-        drop(timer);
+        let mut x = self.embed_rows(tokens, mm);
         let iv = sess.iv.active().then(|| sess.iv.clone());
-        match self.device() {
-            Some(d) if iv.is_none() && layers.is_empty() => {
-                feats.clear();
-                return d.forward(self, sess, &x, t);
-            }
-            Some(d) => d.to_host(self, sess),
-            None => {
-                if let Some(r) = self.retired.last() {
-                    r.to_host(self, sess);
-                }
-            }
-        }
         let point = |p: usize, x: &mut [f32]| {
             if let Some(iv) = &iv {
                 iv.point(p, x, h, start);
@@ -1687,7 +2134,7 @@ impl<'a> Inkling2Model<'a> {
                 }
             }
             drop(mixed);
-            short_conv(&layer.attn_conv, None, &mut st.hist[2], &mut a, h, conv_norm);
+            short_conv(&layer.attn_conv, None, &mut st.hist[2], &mut a, h, conv_norm, start);
             // The stream inside the block: a block's first layer starts it from its attention.
             if layer.boundary {
                 for_chunks(&mut x, h, t > 4, |_, r| rms_unit(r, MIX_EPS));
@@ -1712,13 +2159,15 @@ impl<'a> Inkling2Model<'a> {
                 let need: NeedExperts = self.stream.as_ref().map(|_| &need as &dyn Fn(&[usize]));
                 self.moe(layer, &hn, t, &mut o, need, hook.as_ref());
             }
-            short_conv(&layer.mlp_conv, None, &mut st.hist[3], &mut o, h, conv_norm);
+            short_conv(&layer.mlp_conv, None, &mut st.hist[3], &mut o, h, conv_norm, start);
             add_inplace(&mut x, &o);
             point(2 * si + 2, &mut x);
         }
         capture(steps.len(), &x);
         let mut out = mix(&states, &x, &self.final_query, h).pop().unwrap();
         rmsnorm_f32w_rows_inplace(&mut out, h, &self.final_norm, eps);
+        // (One more index: the final-normed output, what Inkling-2's drafter reads last.)
+        capture(steps.len() + 1, &out);
         sess.pos += t;
         out
     }
@@ -1819,10 +2268,16 @@ impl<'a> Inkling2Model<'a> {
         let _timer = prof::start(Cat::Attention);
         for (conv, x, dy, hist) in [(&a.k_conv, &mut k, &kd, 0), (&a.v_conv, &mut v, &vd, 1)] {
             match conv {
-                KvConv::Static(taps) => short_conv(taps, None, &mut st.hist[hist], x, kw, 1.0 / ((kn + 1) as f32).sqrt()),
-                KvConv::Dynamic { taps, .. } => {
-                    short_conv(taps, Some((dy, nkv)), &mut st.hist[hist], x, kw, 1.0 / ((2 * kn + 1) as f32).sqrt())
-                }
+                KvConv::Static(taps) => short_conv(taps, None, &mut st.hist[hist], x, kw, 1.0 / ((kn + 1) as f32).sqrt(), start),
+                KvConv::Dynamic { taps, .. } => short_conv(
+                    taps,
+                    Some((dy, nkv)),
+                    &mut st.hist[hist],
+                    x,
+                    kw,
+                    1.0 / ((2 * kn + 1) as f32).sqrt(),
+                    start,
+                ),
             }
         }
         // The full layers scale queries and relative vectors up with the position.
@@ -1879,9 +2334,9 @@ impl<'a> Inkling2Model<'a> {
             attend_grouped(a, dr, &q, &r, &sink, ck, cv, first, start, t, &mut att);
         }
         // A sliding layer never reads further back than its window: what is older goes, a window's
-        // worth at a time.
+        // worth at a time, keeping `ROLLBACK` positions more for a session that goes back.
         if let Some(win) = a.window {
-            let keep = (start + t + 1).saturating_sub(win);
+            let keep = (start + t + 1).saturating_sub(win + ROLLBACK);
             if keep >= st.first + win {
                 let cut = (keep - st.first) * kw;
                 st.k.drop_front(cut);
@@ -2271,6 +2726,9 @@ impl crate::generate::TextLm for Inkling2Model<'_> {
     fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
         Inkling2Model::logits(self, hidden, t)
     }
+    fn forward(&self, sess: &mut Inkling2Session, tokens: &[u32]) -> Vec<f32> {
+        Inkling2Model::forward(self, sess, tokens)
+    }
 }
 
 /// Runtime interventions (`crate::intervene`): the stream after the embedding, after each
@@ -2308,8 +2766,8 @@ impl crate::intervene::Host for Inkling2Model<'_> {
     }
 }
 
-/// What a speculative decoder needs of its target. The convolutions cannot go back to an earlier
-/// position, so no draft is offered for this model (`truncate` then panics).
+/// What a speculative decoder needs of its target (a session goes back up to [`ROLLBACK`]
+/// positions).
 impl crate::dspark::Target for Inkling2Model<'_> {
     fn forward_feats(
         &self,
@@ -2321,11 +2779,51 @@ impl crate::dspark::Target for Inkling2Model<'_> {
     ) -> Vec<f32> {
         self.forward_capture(sess, tokens, mm, layers, feats)
     }
+    fn forward_verify(&self, sess: &mut Inkling2Session, tokens: &[u32], layers: &[usize], feats: &mut Vec<f32>, _fast: bool) -> Vec<f32> {
+        let t = tokens.len();
+        let mut logits = Vec::new();
+        let mut hidden = Vec::new();
+        let final_out = layers.contains(&(self.cfg.steps().len() + 1));
+        let want = DevWant {
+            hidden: final_out.then_some(&mut hidden),
+            logits: Some((&mut logits, t)),
+            capture: (!layers.is_empty()).then_some((layers, &mut *feats)),
+        };
+        if self.run_device(sess, tokens, &[], want) {
+            self.capture_final(layers, feats, &hidden, t);
+            return logits;
+        }
+        let hs = self.forward_capture(sess, tokens, &[], layers, feats);
+        self.logits(&hs, t)
+    }
+    // The model's input: the embedding after its RMS norm (what a draft's anchor row takes).
     fn embed_row(&self, token: u32, out: &mut [f32]) {
-        Inkling2Model::embed_row(self, token, out)
+        Inkling2Model::embed_row(self, token, out);
+        rmsnorm_f32w_inplace(out, &self.embed_norm, self.cfg.rms_norm_eps as f32);
     }
     fn head_raw(&self, hidden: &[f32], t: usize) -> Vec<f32> {
         self.head(hidden, t, false)
+    }
+    // A draft's few rows on the accelerator's matrix-vector kernels (4 rows per submission).
+    fn head_raw_device(&self, hidden: &[f32], t: usize) -> Option<Vec<f32>> {
+        let c = &self.cfg;
+        let (h, v, u) = (c.hidden_size, c.vocab_size, c.unpadded_vocab_size);
+        if self.stream.is_some() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(t * u);
+        let mut y = vec![0f32; 4 * v];
+        for r0 in (0..t).step_by(4) {
+            let n = (t - r0).min(4);
+            let jobs = &mut [(&self.lm_head, None, v, &mut y[..n * v])];
+            if !crate::model::linear_rows_device(jobs, h, &hidden[r0 * h..(r0 + n) * h], n) {
+                return None;
+            }
+            for r in 0..n {
+                out.extend_from_slice(&y[r * v..r * v + u]);
+            }
+        }
+        Some(out)
     }
     // The logits cover the tokens only (the unembedding is padded).
     #[allow(clippy::misnamed_getters)]
@@ -2333,7 +2831,9 @@ impl crate::dspark::Target for Inkling2Model<'_> {
         self.cfg.unpadded_vocab_size
     }
     fn truncate(&self, sess: &mut Inkling2Session, len: usize) {
-        assert!(len >= sess.pos, "Inkling-2: the convolutions cannot go back to an earlier position");
+        if let Err(e) = sess.truncate(len) {
+            panic!("{e}");
+        }
     }
 }
 
@@ -2393,15 +2893,113 @@ mod tests {
                 .collect();
             let d = |a: usize, b: usize| dynamic.then(|| (&dy[a * 2 * k..b * 2 * k], 2));
             let mut whole = x.clone();
-            short_conv(&taps, d(0, t), &mut vec![0f32; (k - 1) * ch], &mut whole, ch, 0.5);
-            let mut hist = vec![0f32; (k - 1) * ch];
+            short_conv(&taps, d(0, t), &mut ConvRing::new(k, ch), &mut whole, ch, 0.5, 0);
+            let mut hist = ConvRing::new(k, ch);
             let mut steps = x.clone();
             for ti in 0..t {
-                short_conv(&taps, d(ti, ti + 1), &mut hist, &mut steps[ti * ch..(ti + 1) * ch], ch, 0.5);
+                short_conv(&taps, d(ti, ti + 1), &mut hist, &mut steps[ti * ch..(ti + 1) * ch], ch, 0.5, ti);
             }
-            for ((a, b), w) in whole.iter().zip(&steps).zip(&want) {
-                assert!((a - w).abs() < 1e-5 && (b - w).abs() < 1e-5, "{a} {b} {w}");
+            // Going back: tokens 2.. again after junk at positions 2..4.
+            let mut back = ConvRing::new(k, ch);
+            let mut again = x.clone();
+            short_conv(&taps, d(0, 2), &mut back, &mut again[..2 * ch], ch, 0.5, 0);
+            let mut junk = vec![7.0f32; 3 * ch];
+            short_conv(&taps, d(2, 5), &mut back, &mut junk, ch, 0.5, 2);
+            short_conv(&taps, d(2, t), &mut back, &mut again[2 * ch..], ch, 0.5, 2);
+            for (((a, b), c), w) in whole.iter().zip(&steps).zip(&again).zip(&want) {
+                assert!(
+                    (a - w).abs() < 1e-5 && (b - w).abs() < 1e-5 && (c - w).abs() < 1e-5,
+                    "{a} {b} {c} {w}"
+                );
             }
+        }
+    }
+
+    /// mlx-lm's names go back to the release's (`sanitize` of mlx-lm's `inkling2`, undone).
+    #[test]
+    fn mlx_names() {
+        let m = |n: &str| mlx_name(n).unwrap();
+        for (mlx, release) in [
+            ("lm_head.scales", "model.llm.unembed.scales"),
+            ("model.language_model.embed_tokens.biases", "model.llm.embed.biases"),
+            ("model.language_model.final_input.query", "model.llm.attn_res.output_query"),
+            (
+                "model.language_model.layers.7.attention_input.query",
+                "model.llm.attn_res.attn_queries.6",
+            ),
+            ("model.language_model.layers.7.mlp_input.query", "model.llm.attn_res.mlp_queries.7"),
+            (
+                "model.language_model.layers.3.input_layernorm.weight",
+                "model.llm.layers.3.attn_norm.weight",
+            ),
+            (
+                "model.language_model.layers.5.k_input_layernorm.weight",
+                "model.llm.layers.5.k_input_norm.weight",
+            ),
+            (
+                "model.language_model.layers.9.q_message_gate.message_gate_proj.weight",
+                "model.llm.layers.9.controllers.attn.gain_weight",
+            ),
+            (
+                "model.language_model.layers.9.mlp_message_gate.down_proj.weight",
+                "model.llm.layers.9.controllers.mlp.down_weight",
+            ),
+            (
+                "model.language_model.layers.2.post_mlp_convolution.conv1d.weight",
+                "model.llm.layers.2.mlp_sconv.weight",
+            ),
+            (
+                "model.language_model.layers.2.self_attn.o_proj.scales",
+                "model.llm.layers.2.attn.wo_ud.scales",
+            ),
+            (
+                "model.language_model.layers.2.self_attn.sink_proj.weight",
+                "model.llm.layers.2.attn.attn_sink_proj.weight",
+            ),
+            (
+                "model.language_model.layers.2.self_attn.k_sconv.conv1d.weight",
+                "model.llm.layers.2.attn.k_sconv.weight",
+            ),
+            (
+                "model.language_model.layers.5.self_attn.v_sconv.static_weight",
+                "model.llm.layers.5.attn.v_sconv.static_w",
+            ),
+            (
+                "model.language_model.layers.5.self_attn.v_sconv.weight_proj.weight",
+                "model.llm.layers.5.attn.v_sconv.weight_proj",
+            ),
+            (
+                "model.language_model.layers.5.self_attn.v_sconv.weight_proj.biases",
+                "model.llm.layers.5.attn.v_sconv.weight_proj.biases",
+            ),
+            (
+                "model.language_model.layers.5.self_attn.q_l2_clip.scale",
+                "model.llm.layers.5.attn.q_l2_clip.scale",
+            ),
+            (
+                "model.language_model.layers.0.mlp.gate.e_score_correction_bias",
+                "model.llm.layers.0.mlp.gate.bias",
+            ),
+            (
+                "model.language_model.layers.0.mlp.experts.gate_up_proj.global_scale",
+                "model.llm.layers.0.mlp.experts.w13_weight_global_scale",
+            ),
+            (
+                "model.language_model.layers.21.mlp.experts.down_proj.scales",
+                "model.llm.layers.21.mlp.experts.w2_weight_scale",
+            ),
+            ("model.vision_tower.layers.4.lambda_2", "model.visual.backbone.layers.4.ls_2.gamma"),
+            (
+                "model.vision_tower.layers.4.mlp.fc1.bias",
+                "model.visual.backbone.layers.4.mlp.c_fc.bias",
+            ),
+            ("model.vision_tower.merger.linear_1.weight", "model.visual.proj_in.weight"),
+            (
+                "model.vision_tower.embeddings.position_embedding.weight",
+                "model.visual.backbone.embeddings.position_embedding",
+            ),
+        ] {
+            assert_eq!(m(mlx), release, "{mlx}");
         }
     }
 

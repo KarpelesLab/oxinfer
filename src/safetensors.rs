@@ -742,6 +742,10 @@ impl ModelFiles {
         if crate::deepseek4::is_native(&files) {
             files.rename(crate::deepseek4::native_name);
         }
+        // Inkling-2 from mlx-lm (`model.language_model.*`), under the release's names.
+        if crate::inkling::is_mlx_layout(&files) {
+            files.rename(crate::inkling::mlx_name);
+        }
         Ok(files)
     }
 
@@ -778,12 +782,13 @@ impl ModelFiles {
                     .collect()
             })
             .unwrap_or_default();
-        // Scales and their matrix may sit in different shards.
+        // Scales and their matrix may sit in different shards. (Byte scales are those of the
+        // microscaled formats, NVFP4 / MXFP8, not affine groups: left to the model's loader.)
         let scales: Vec<(String, usize)> = self
             .shards
             .iter()
             .flat_map(|sh| sh.tensors.iter())
-            .filter(|(n, _)| n.ends_with(".scales"))
+            .filter(|(n, t)| n.ends_with(".scales") && t.dtype != "U8")
             .map(|(n, t)| (n.clone(), *t.shape.last().unwrap_or(&0)))
             .collect();
         for (sn, s_cols) in scales {

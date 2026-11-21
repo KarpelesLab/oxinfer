@@ -2091,7 +2091,8 @@ impl Engine {
         for (hs, d) in sess.layers.iter().zip(&ds.slots) {
             let kw = d.kw;
             for (i, hp) in d.hist.iter().enumerate() {
-                let v = &hs.hist[i];
+                // The host's ring by position; the device keeps the last `kernel - 1` inputs.
+                let v = hs.hist[i].last(pos);
                 unsafe { self.cu.cuMemcpyHtoD_v2(*hp, v.as_ptr() as *const c_void, v.len() * 4) };
             }
             // Rows first..pos to rows p % cap: at most two runs (the ring wraps once).
@@ -2134,7 +2135,7 @@ impl Engine {
             for (i, hp) in d.hist.iter().enumerate() {
                 let mut v = vec![0f32; d.hist_len[i]];
                 unsafe { self.cu.cuMemcpyDtoH_v2(v.as_mut_ptr() as *mut c_void, *hp, v.len() * 4) };
-                hs.hist[i] = v;
+                hs.hist[i].set_last(pos, &v);
             }
             let l = &self.layers[li];
             let first = if l.full { 0 } else { pos.saturating_sub(self.window) };
@@ -2719,14 +2720,18 @@ mod tests {
         for dynamic in [false, true] {
             for t in [1usize, 7] {
                 let taps = rnds(kn * ch, &mut seed, 0.5);
-                let mut hist = rnds((kn - 1) * ch, &mut seed, 1.0);
+                let hist = rnds((kn - 1) * ch, &mut seed, 1.0);
                 let mut x = rnds(t * ch, &mut seed, 1.0);
                 let dy = rnds(t * groups * kn, &mut seed, 0.3);
                 let (px, ph, pt) = (e.upf(&x).unwrap(), e.upf(&hist).unwrap(), e.upf(&taps).unwrap());
                 let pd = if dynamic { e.upf(&dy).unwrap() } else { 0 };
                 e.sconv(px, ph, pt, pd, ch, groups, t, 0.4);
                 let (gx, gh) = (down(&e, px, t * ch), down(&e, ph, (kn - 1) * ch));
-                super::super::short_conv(&taps, dynamic.then_some((&dy[..], groups)), &mut hist, &mut x, ch, 0.4);
+                // The host's ring holds the same inputs before position 0.
+                let mut ring = super::super::ConvRing::new(kn, ch);
+                ring.set_last(0, &hist);
+                super::super::short_conv(&taps, dynamic.then_some((&dy[..], groups)), &mut ring, &mut x, ch, 0.4, 0);
+                let hist = ring.last(t);
                 for (a, b) in gx.iter().zip(&x).chain(gh.iter().zip(&hist)) {
                     assert!((a - b).abs() < 1e-5, "short conv (dynamic {dynamic}, {t} tokens): {a} against {b}");
                 }

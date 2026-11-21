@@ -76,15 +76,15 @@ layer:
   tile, concatenated, go through a two-layer GELU MLP to 4608. The features replace the
   placeholder tokens after the embedding norm.
 
-Not implemented: the **MTP head** (`mtp.safetensors`, 3.4 GB: 5 layers that read the main
-model's states at 8 depths, a block size of 8 and a Markov head of rank 256). transformers does
-not run it either, so there is nothing to compare it with yet. The config's
+The **MTP head** (`mtp.safetensors`) runs for Mini as a DSpark draft, see
+[Speculative decoding](#speculative-decoding) (Small's head, 3.4 GB, was not tried). The config's
 `temporal_patch_size` (video) is unused by transformers too. The reference processor composites
 transparent images onto a checkerboard; oxinfer decodes images to RGB first.
 
-The convolutions keep only their last three inputs, so a session cannot go back to an earlier
-position: there is no prompt lookup and no draft model for this family. The cache of a local
-layer holds at most 2048 positions whatever the context length.
+The convolutions keep their recent inputs in rings indexed by position and the local layers
+keep 64 positions beyond their window, so a session can go back up to 64 positions
+(`inkling::ROLLBACK`, what speculative decoding needs). The cache of a local layer holds at most
+2112 positions whatever the context length.
 
 ## Checkpoints
 
@@ -296,7 +296,8 @@ tables (`middle_cycle_cross_pass_queries`: the query and MLP queries of each loo
 
 - **The release**: the experts of layers 0-19 in NVFP4 (repacked at load into ggml's NVFP4
   blocks, 4.5 bits a weight), of layers 20-23 in MXFP8 (read in place), the rest in bf16.
-  `mtp.safetensors` (the MTP head) is not read.
+  `mtp.safetensors` (the MTP head) is the drafter of `--mtp`
+  ([Speculative decoding](#speculative-decoding)).
 - **llama.cpp's `inkling2_loop`** (ggml-org's Q8_0, IQ4_NL, BF16): the tensors renamed back to
   the release's names (`gguf_name`), the relative-bias tables transposed, the experts' gate and up
   rows not interleaved, four message queries per looped layer.
@@ -309,6 +310,23 @@ tables (`middle_cycle_cross_pass_queries`: the query and MLP queries of each loo
   warns that mainline llama.cpp gets them wrong until its PR 32704).
 - **mmproj** (`inkling2v`, ggml-org's and unsloth's): the tower under the release's names, its
   patch embedding (a convolution there) laid out again as the release's linear layer.
+- **AtomicChat's GGUF files** (`AtomicChat/Inkling-2-Mini-GGUF`, AD-* and plain quants, and
+  `AtomicChat/Inkling-2-Mini-Uncensored-GGUF`): llama.cpp's `inkling2_loop` layout, read as
+  ggml-org's. Their low-bit experts mix types per layer: AD-IQ2_M has IQ2_XXS gate/up experts
+  and IQ4_NL or Q2_0 (ggml type 42, 2-bit codes `-1..2` with an f16 scale per 64) down experts,
+  AD-Q4_K Q4_K gate/up and Q5_0 down. Q2_0 has its own SDOT decode kernel and int8 prefill rows
+  (it went through the portable per-block decoding before: AD-IQ2_M decoded at 4.8-8.8 tok/s on
+  the CPU, 17-21 after, as fast as Q8_0 measured alongside, at a load of 21-35).
+- **mlx-lm's MLX checkpoints** (`mlx-community/Inkling-2-Mini-4bit`, mlx-lm's `inkling2`,
+  17.3 GB): mlx-lm's names (`model.language_model.*`, `lm_head`, `model.vision_tower.*`) mapped
+  back to the release's (`mlx_name`); the attention, embedding and LM head matrices in affine
+  4-bit groups of 64 (read as oxinfer's Q4 with MLX offsets), the experts the release's bytes as
+  32-bit words (NVFP4 with `global_scale = amax * 6 * 448 / denominator`, MXFP8), read as the
+  release's; the message queries of the looped layers in one table. Against mlx-lm itself
+  (PR 2086, on the GPU) on four raw-text prompts: mean KL of the next token 2.6e-5 to 1.2e-3,
+  the same top 5 (CPU, int8 activations); against the release, as UD-IQ3_XXS is (KL 5e-4 to
+  5e-2, same top token). The vision tower (bf16) is read too. oMLX's `oQ4e` files are another
+  layout (fused projections) and are not read.
 
 NVFP4 matrices (the release's experts, unsloth's NVFP4 layers) run on the int8 kernels: E2M1
 codes through MXFP4's doubled table and the per-16 E4M3 scales halved, so a 16-value group is
@@ -363,7 +381,8 @@ misread loop would not do. The plain tiny checkpoints still match as before (1.9
 
 ## Long contexts and memory
 
-The sliding-window layers keep at most twice their window (2048 positions); the full-attention
+The sliding-window layers keep at most twice their window and 64 positions more on the CPU
+(2112 positions), a ring of `window + 64` (1088) on the GPU; the full-attention
 layers keep everything, and past `log_scaling_n_floor` (8192 here, 128000 for Small) their
 queries and relative vectors grow with `1 + 0.1 ln(pos / 8192)`. Of the 48 applications, 8 are
 full attention (layers 5 and 23, and layers 11 and 17 once per pass), so a token of context
@@ -371,9 +390,9 @@ costs 8 x 2 x 1024 values:
 
 | `--kv-cache` (`kv_cache` key) | Per token of context | Sliding windows (fixed) | 128k context |
 |---|---:|---:|---:|
-| `f32` (default, exact) | 64 KB | 671 MB | 8.6 GB |
-| `f16` | 32 KB | 336 MB | 4.6 GB |
-| `q8` (int8, a float32 scale per 32) | 18 KB | 189 MB | 2.6 GB |
+| `f32` (default, exact) | 64 KB | 692 MB | 8.6 GB |
+| `f16` | 32 KB | 346 MB | 4.6 GB |
+| `q8` (int8, a float32 scale per 32) | 18 KB | 195 MB | 2.6 GB |
 
 Measured with `examples/inkling2_ctx_bench` (the caches filled with placeholder keys and values,
 so that decoding at a context can be timed without running the prompt; peak memory from
@@ -408,38 +427,207 @@ use, taken here as RAM - 4 GB (macOS and the rest). With `q8`:
 A 16 GB Mac can still run UD-IQ3_XXS memory-mapped (`--mmap`): the weights are then page cache
 that macOS may drop and read again, slower but working.
 
+## On the GPU
+
+With the Metal backend (the default on Apple Silicon), every pass runs on the GPU
+(`src/metal_inkling.rs`, `metal_inkling.metal`, `metal_inkling_pf.metal`), the whole model in one
+submission per pass, with the activations, the attention caches and the convolution rings
+resident on the device:
+
+- **Passes of up to 16 tokens** (decoding, speculative verification): the attention residual's
+  mixes (one threadgroup per query and token), the message gates of the loop's later passes,
+  the projections on the decode library's matvec kernels (its exact multi-token kernels for
+  several tokens), the key / value convolutions with their L2 clip and norm written straight to
+  the caches, the scaled and clipped queries and relative vectors (with the log scaling of the
+  full layers), attention in splits of keys with the relative bias of each distance, the sliding
+  window, the sink and the output gate, the post-attention convolution fused with the MLP's mix
+  and the sigmoid routing, the routed experts grouped by expert (tokens of a pass that choose the
+  same expert read it once) in their stored format (NVFP4, MXFP8, Q2_0, every GGUF type of the
+  decode kernels, the per-expert factors of unsloth's files), the post-MLP convolution summing the
+  experts' slots, the final mix, the LM head and the logit cap. Every token of a pass is computed
+  as it would be alone (the token is a grid dimension of every kernel; the splits of a token's
+  keys depend on its own range), so a verification pass gives exactly the logits of one-token
+  steps and speculative decoding stays exact.
+- **Prefill passes** of up to 512 tokens (longer prompts in pieces): the same, with the dense
+  projections on the matrix-unit GEMMs (half operands, f32 accumulation; float32 loop gates on
+  the f32 GEMM) and the routed experts as grouped matrix-unit GEMMs over each expert's tokens
+  (the routing read back at each MoE layer to build the tiles), SiTU and the routing-weighted sum
+  on the device. A pass longer than a sliding window's spare rows keeps its keys and values in the
+  arena and moves its last rows to the window's ring after; the convolution rings are written
+  once the convolutions have read them.
+- **KV caches** in f32, f16 or q8 rows (`--kv-cache`), the sliding windows as rings of
+  `window + 64` rows by position, the full-attention caches growing; a session's state moves to
+  the device on its first GPU pass and back to the host when a pass runs on the CPU (cloning a
+  session reads it back), and `truncate` works on either side.
+- **LoRA adapters** (`--lora`) run on the device too: the dense updates as a down / up pair of
+  kernels beside each matmul, the experts' down-projection updates per expert from an address
+  table whose strengths are written at each pass (switching an adapter needs no rebuild); the
+  embedding's update stays with the host's lookup; gate / up expert updates send the passes back
+  to the CPU.
+
+The Metal engine and the CUDA one (`src/inkling_cuda.rs`) are two implementations of the same
+device interface in `src/inkling.rs` (`DevEngine` for the passes, `DevSession` for a session's
+state on the device): the host side (embedding, interventions and captured layers on the CPU,
+LoRA strengths, moving a session between host and device, going back for speculative decoding)
+is shared. A device says how far its sessions go back (`Inkling2Model::rollback_limit`): 64
+positions on Metal and the CPU, none on CUDA, where prompt lookup and draft models stay off and
+decoding is plain.
+
+`OXINFER_GPU_DECODE=0` (or `--gpu-decode off`) keeps the passes on the CPU,
+`OXINFER_INKLING_PREFILL=0` the prefill passes; `OXINFER_GPU_DECODE_CHECK=1` runs each decode
+step on the CPU too and prints the difference; `OXINFER_INKLING_SKIP=dense,attn,exp,...` leaves
+kinds of ops out (measurements only). The kernels compile on first use (about 1.5 s, cached by
+the system after).
+
+**Correctness.** Against transformers float32 on the release (the 24-token chat prompt and 16
+greedy steps of [Verification](#verification-1)):
+
+| Pass | Max logit diff | Mean KL | Same top token | Greedy (16) |
+|---|---:|---:|---:|---:|
+| prompt in passes of 7 on the GPU (decode kernels) | 6.7e-4 | 2.2e-10 | 24/24 | |
+| 16 greedy steps on the GPU | 1.2e-4 | 3.8e-12 | 16/16 | 16/16 |
+| the same after rolled-back junk passes | 1.2e-4 | 3.8e-12 | 16/16 | |
+| prompt as one prefill pass (matrix-unit GEMMs) | 0.69 | 1.0e-4 | 24/24 | 16/16 |
+
+ggml-org Q8_0 (against the same reference): decode KL 7.1e-4 (the CPU path: 1.1e-3, whose int8
+activations round more), 4.0e-4 with q8 caches; unsloth UD-IQ3_XXS with f16 caches 2.8e-3 (CPU
+9.2e-3); greedy 16/16 everywhere. GPU prefill against the CPU path on the last logits: Q8_0 after
+117, 207, 903 and 2447 tokens KL 2e-9, 4e-10, 4e-11, 2e-10 (same top token);
+AtomicChat AD-IQ2_M with the Uncensored LoRA after 600 tokens KL 1.1e-8 (the adapter itself moves
+the logits by up to 4.2), and its decode steps the CPU's top token at every step (KL 1e-9 to
+3e-3).
+
 ## Speed
 
-18-core M5 Max (128 GB), shared with other work while measured (the CPU numbers moved by up to
-2x between runs; the best of the runs here). oxinfer: a 2456-token prompt, then 64 tokens;
-llama.cpp (master of 2026-11-21, Metal, flash attention): `llama-bench` on ggml-org's Q8_0.
+18-core M5 Max (128 GB, Apple10 GPU with matrix units), shared with other jobs (load averages 6-12
+for the table below; an image-generation job of another session used the GPU at times, so the
+same run moved by 10-20% between repeats). oxinfer: `examples/inkling2_bench` on the engine API
+(as `llama-bench`: a prompt of N random tokens into a fresh session, N tokens generated after a
+1-token prompt, after a warm-up pass of each, the median of 3 runs; f32 KV caches); llama.cpp:
+`llama-bench -p 512,2048 -n 128 -r 3 -fa 1` (master of 2026-11-21, Metal, its default f16
+caches), interleaved model by model. tok/s:
 
-| | Prefill (tok/s) | Decode (tok/s) |
+| Checkpoint | engine | pp512 | pp2048 | tg128 |
+|---|---|---:|---:|---:|
+| ggml-org Q8_0 (27.8 GB) | llama.cpp, Metal | 996 | 822 | 36.5 |
+| | **oxinfer, Metal** | **1542** | **1346** | **49.1** |
+| | oxinfer, CPU (a 2456-token prompt, measured before) | 116 | | 17.1 |
+| AtomicChat AD-Q4_K (16.5 GB) | llama.cpp, Metal | 1000 | 715 | 39.9 |
+| | **oxinfer, Metal** | **1701** | **1252** | **54.2** |
+| release (NVFP4 / MXFP8 experts, bf16 dense; 19.5 GB) | oxinfer, Metal | 1646 | 1243 | 46.8 |
+| unsloth UD-IQ3_XXS (11.7 GB) | oxinfer, Metal | 1692 | 1211 | 55.5 |
+| mlx-community 4bit (17.3 GB) | **oxinfer, Metal** | **1658** | **1349** | **54.4** |
+| | mlx-lm (PR 2086), MLX 0.32.4 | 1387-1490 | 1056-1440 | 29-35 |
+| mlx-community oQ4e-mtp (16.9 GB) | oMLX 0.8.2, its MTP off / on | 1164-1452 | 912-1127 | 30-35 / 25-42 |
+
+(llama.cpp's mainline reads unsloth's root files wrongly and has no NVFP4 GGUF path for the
+release; the MLX rows are mlx-lm's and oMLX's own measurements on this machine, load 9-31, see
+below.) Decode at a context of 8k / 32k (`examples/inkling2_ctx_bench`, the caches filled with
+placeholder rows; llama.cpp `-d 8192,32768 -n 32`), Q8_0:
+
+| | 8k | 32k |
 |---|---:|---:|
-| oxinfer, release (NVFP4), CPU | 101 | 16.8 |
-| oxinfer, release, `--device auto` (dense prefill matmuls on Metal) | 117 | 15.9 |
-| oxinfer, ggml-org Q8_0, CPU | 116 | 17.1 |
-| oxinfer, ggml-org Q8_0, `--device auto` | 116 | 18.7 |
-| oxinfer, unsloth UD-IQ3_XXS, CPU | 95 | 17.8 |
-| llama.cpp, Q8_0, Metal | 667 (pp512), 501 (pp2048) | 30.6 (tg64), 33.2 (tg32) |
-| llama.cpp, Q8_0, Metal, 8k / 32k of context | 460 / 255 (pp2048) | 26.5 / 25.5 |
-| llama.cpp, Q8_0, `-ngl 0` | 5.3 (pp512) | 0.06 |
+| llama.cpp (f16 caches) | 35.3 | 32.6 |
+| oxinfer, f32 caches | 46.4 | 40.1 |
+| oxinfer, f16 caches | 47.6 | 43.9 |
 
-oxinfer decodes on the CPU only: there is no GPU decode plan for this family yet (its
-attention residual, message gates, short convolutions, relative-bias attention with sinks and
-L2 clips have no device ops), and prefill puts only the dense matmuls (and a GGUF file's
-experts) on Metal. So llama.cpp's Metal backend is 1.8x faster at decoding and 4-6x at
-prefill; with its CPU backend llama.cpp is far slower than oxinfer on this machine.
+A decoded token reads 5.1 GB of Q8_0 (48 layer applications, 8 routed experts each, the LM
+head): 49 tok/s is ~250 GB/s. Skipping kinds of ops (`OXINFER_INKLING_SKIP`) shows the routed
+experts take a third of a step's GPU time at Q8_0, the dense matmuls an eighth, attention, the
+residual mixes and the loop's gates a few percent each; at 4 bits (2.7-2.9 GB a token) the
+small kernels between the matmuls (about 15 dependent stages per layer application, 24 per
+looped one) leave decoding at 54-59 tok/s rather than the 100+ of the bytes alone. Verification
+passes (speculative decoding) cost 1.6-1.9x a step at 4 tokens (Q8_0: 18-20 ms for 1 token,
+31-33 ms for 4; the experts of a pass are grouped so that a shared one is read once, but most of
+a pass's 32 choices differ).
 
-Decode at long contexts (CPU, UD-IQ3_XXS, see above): 13 tok/s at 8k, 5.7 at 32k, 3.7 at 128k
-with `q8` caches; on a real 41871-token prompt 5.1 tok/s after a prefill of 49 tok/s.
+**The 125 tok/s and 1750 tok/s figures** reported for Inkling-2-Mini on a 48 GB M5 Max with EXO
+could not be traced or reproduced: EXO's model cards (`exo-explore/exo`, main of 2026-11-06)
+have no Inkling-2-Mini (only an older "Inkling-Small" card, whose MTP layers EXO drops), EXO has
+no speculative decoding, and its pinned mlx-lm predates Inkling 2 (only the unmerged mlx-lm PR
+2086 runs it). The only public trace of "125" is a skipped entry of a benchmark collection
+citing a partner video without quant or protocol. On this machine mlx-lm decodes the
+`mlx-community/Inkling-2-Mini-4bit` checkpoint at 29-35 tok/s and prefills at 1056-1490 tok/s;
+oMLX (the only MLX engine with the release's drafter, on by default for `-mtp` checkpoints:
+block 8, depth 7) reaches 37-42 tok/s on code (63-65% of drafts accepted) and 25-31 on prose
+(45-51%). 125 tok/s of plain decoding is not plausible on this chip (the best published
+single-token figures for the model are about 46 tok/s on an M5 Max); 1750 tok/s of prefill is
+(mlx-swift-lm reports 1834-1852 on an M5 Max; oxinfer: 1542-1701 at pp512).
+
+## Speculative decoding
+
+A session goes back up to 64 positions (`Inkling2Session::truncate`: the convolutions read
+their last inputs from rings of `kernel - 1 + 64` rows indexed by position, the sliding windows
+keep 64 positions more), so a rejected draft is undone exactly. Three drafters:
+
+- **The release's MTP head** (`--mtp`, `mtp=1`; `mtp.safetensors` beside the release) and
+  **unsloth's conversion of it** (`--draft PATH` or `--draft auto`, `draft=...`:
+  `dspark-Inkling-2-Mini-Q8_0.gguf` at the root of `unsloth/Inkling-2-Mini-GGUF`, found beside
+  unsloth's files and, for the release and ggml-org's files, in the download cache). They are the
+  same 3-layer block drafter (`src/inkling_draft.rs`), run by the DSpark decoder
+  (`crate::dspark`), as llama.cpp's `graph_inkling2` (ggml-org/llama.cpp PR 32218, `src/models/
+  dspark.cpp`; transformers has no definition of it): per draft layer a softmax mix (one row of
+  `fuse_weight`) of the target's streams entering applications 5, 23 and 41 and of its
+  final-normed output, normed (`dflare_norm`) and projected by the layer's own context
+  projections into its key / value cache; a block of the anchor and 7 mask rows through 3 Qwen3-
+  style layers (RoPE theta 1e6, non-causal, windows of 1024 on layers 0 and 2) and the target's LM
+  head; and a recurrent head (rank 256, `rnn_proj` over `[state, markov_w1[prev], hidden,
+  context]`) whose correction also goes through the target's LM head (run here as one product with
+  `head * hidden_out`, `[vocab, 256]`, made once from the target's head). The GGUF and the
+  safetensors tensors were checked to be the same values (the fuse weights, norms and mask
+  byte for byte after the upcast).
+- **Prompt lookup** (`--lookup`, `lookup=1`, on by default as for the other families).
+
+A round verifies at most 6 drafts (`inkling::MAX_DRAFT`): a pass of up to 7 tokens stays on the
+CPU's decode kernels, routed experts included, whose rows are those of one-token forwards bit
+for bit; an 8-token pass takes the prefill path, which rounds differently (greedy output then
+drifted at near-ties) and costs several times more.
+
+Greedy output with each drafter is the plain greedy output token for token: 45 runs (3
+checkpoints x code / prose / chat x lookup, cost-aware draft, 3 and 6 fixed drafts; 96 tokens,
+`--no-system`) all gave the plain text. Acceptance (drafts accepted / drafted, tokens per
+target forward; CPU, `--draft-tokens N --mtp-fixed`):
+
+| Checkpoint, drafter | code, 3 drafts | prose, 3 | chat, 3 | code, 6 | prose, 6 | chat, 6 |
+|---|---|---|---|---|---|---|
+| ggml-org Q8_0, unsloth's Q8_0 draft | 51%, 2.50 | 43%, 2.26 | 35%, 2.02 | 35%, 2.97 | 26%, 2.44 | 20%, 2.16 |
+| release (NVFP4), `--mtp` (bf16) | 47%, 2.38 | 51%, 2.50 | 35%, 2.02 | 31%, 2.79 | 31%, 2.79 | 20%, 2.16 |
+| unsloth UD-IQ3_XXS, unsloth's Q8_0 draft | 49%, 2.44 | 35%, 2.02 | 45%, 2.32 | 27%, 2.57 | 18%, 2.07 | 25%, 2.44 |
+
+On the CPU none of it pays: the experts make a verification pass cost nearly its token count in
+one-token steps (each token reads 8 experts of 128 of its own; a pass of 4 tokens took 140-290
+ms against 50-70 for one token, of 7 tokens 160-380 ms), so 2-3 tokens per forward decode slower
+than plain steps. The default cost-aware rounds therefore fall back to plain steps after a few
+probes (1.1-1.6 tokens per forward, within 10-30% of plain decoding on a machine at load 15-33;
+the draft's first pass also builds its head product, about 0.5 s). Prompt lookup found few matches
+on these prompts (1.01-1.13 tokens per forward).
+
+On the GPU (Metal decode plans; the draft's matmuls and the target's LM head over its rows on the
+accelerator's matrix-vector kernels, a draft pass of about 12-18 ms) it does not pay yet either:
+a verification pass of 4 tokens takes 29-52 ms against 17-20 ms for a step, of 7 tokens 47-105 ms.
+The same 45 runs on the GPU (128 tokens, load 8-19), every output again the plain greedy text,
+decode tok/s:
+
+| Checkpoint | plain | lookup | draft, cost-aware | 3 drafts | 6 drafts |
+|---|---|---|---|---|---|
+| ggml-org Q8_0 (code / prose / chat) | 59 / 60 / 57 | 62 / 64 / 55 | 52 / 50 / 47 | 49 / 41 / 37 | 36 / 26 / 24 |
+| release, `--mtp` | 50 / 50 / 28* | 51 / 10* / 45 | 43 / 30 / 46 | 34 / 41 / 33 | 23 / 14 / 23 |
+| UD-IQ3_XXS | 64 / 61 / 61 | 62 / 51 / 58 | 50 / 44 / 49 | 40 / 29 / 32 | 26 / 21 / 22 |
+
+(* runs slowed by the other jobs.) Acceptance on the GPU: 34-49% of 3 drafts (2.0-2.4 tokens
+per forward), 19-27% of 6 (2.1-2.6). With a verification pass that cost about one step, 3 drafts
+would give about 2x; the drafter is what the speed of multi-token passes on the device decides.
+
+```sh
+oxinfer --model thinkingmachines/Inkling-2-Mini --mtp --prompt "..."
+oxinfer --model unsloth/Inkling-2-Mini-GGUF:UD-IQ3_XXS --draft auto --prompt "..."
+```
 
 ## Not done
 
-- **Decoding on the GPU** (above), the main gap to llama.cpp.
-- **The MTP head** (`mtp.safetensors`: 3 layers reading the stream at applications 5, 23, 41
-  and the output, a block of 8 and a Markov head) and **unsloth's DSpark draft**
-  (`dspark-Inkling-2-Mini-Q8_0.gguf`): speculative decoding needs a session that can go back to
-  an earlier position, and the short convolutions keep only their last inputs; transformers runs
-  neither, so there would be nothing to check the head against.
+- Decoding at 4 bits is bound by the chain of small kernels between the matmuls (above), not
+  by the bytes: fusing more of them (the post-MLP convolution with the next layer's mixes, the
+  message gates' low-rank matmuls) is what would move it.
+- The experts' gate / up LoRA updates run on the CPU (the passes go back there); the AtomicChat
+  adapter has none.
 - No GGUF of Small was tried (the same code reads its layout).

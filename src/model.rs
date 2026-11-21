@@ -873,6 +873,14 @@ impl<'a> Lin<'a> {
         self.dev = std::sync::OnceLock::new();
         Ok(true)
     }
+    /// The runtime LoRA update attached, on or off (accelerator engines copy it).
+    #[cfg_attr(
+        not(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn lora_ref(&self) -> Option<&crate::lora::LoraDelta> {
+        self.lora.as_deref()
+    }
     pub fn has_lora(&self) -> bool {
         self.lora.is_some()
     }

@@ -46,6 +46,8 @@ use std::time::Instant;
 pub(crate) mod decode;
 #[path = "metal_dit.rs"]
 mod dit;
+#[path = "metal_inkling.rs"]
+pub(crate) mod inkling;
 #[path = "metal_prefill.rs"]
 mod prefill;
 
@@ -2738,6 +2740,9 @@ impl MetalBackend {
 }
 
 impl Backend for MetalBackend {
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
     fn name(&self) -> &str {
         "metal"
     }

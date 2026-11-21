@@ -3,7 +3,7 @@
 use super::*;
 use std::fmt::Write as _;
 
-const SRC: &str = include_str!("metal_decode.metal");
+pub(crate) const SRC: &str = include_str!("metal_decode.metal");
 /// The QSA kernels (Qwen4-Exp sparse attention), after `SRC` (they use its attention body).
 const QSA_SRC: &str = include_str!("metal_qsa.metal");
 
@@ -619,6 +619,16 @@ impl FastEnc<'_> {
             w: groups.0,
             h: groups.1,
             d: 1,
+        };
+        let t = MtlSize { w: threads, h: 1, d: 1 };
+        unsafe { (self.f.dispatch)(self.enc, self.f.s_dispatch, &g, &t) };
+    }
+    /// [`Self::dispatch`] over a 3-D grid of threadgroups.
+    pub(crate) fn dispatch3(&self, groups: (usize, usize, usize), threads: usize) {
+        let g = MtlSize {
+            w: groups.0,
+            h: groups.1,
+            d: groups.2,
         };
         let t = MtlSize { w: threads, h: 1, d: 1 };
         unsafe { (self.f.dispatch)(self.enc, self.f.s_dispatch, &g, &t) };
