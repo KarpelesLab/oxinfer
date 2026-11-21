@@ -134,16 +134,37 @@ With `--lora-merge` (`lora_merge=1`), each update is added to its weight at load
 | bf16, GGUF BF16 | bf16 | the update rounded with the weight (bf16) |
 | GGUF F16 / F32 | F16 / F32 | the same, in f16 / f32 |
 | oxinfer Q8 / Q4 (`--quant`) | Q8 / Q4 again | re-quantized: the rounding error of a fresh quantization |
-| GGUF block formats (Q4_K, IQ2_M's Q2_0, IQ4_NL, ...) | oxinfer Q8 (int8 per 32) | re-quantized at 8 bits: close to the float merge, but more memory than the low-bit original |
+| GGUF block formats: Q4_0 / Q4_1 / Q5_0 / Q5_1 / Q8_0, Q2_K to Q6_K, IQ2_XXS / IQ2_XS / IQ2_S, IQ3_XXS / IQ3_S, IQ4_NL / IQ4_XS, TQ1_0 / TQ2_0, Q1_0 / Q2_0, MXFP4 | their own type, same size | re-quantized with `ggml_quant` (llama.cpp's quantizers, no importance matrix): the rounding error of a fresh quantization at that type |
+| other GGUF block formats (IQ1_S / IQ1_M, NVFP4, FP8) | oxinfer Q8 (int8 per 32) | re-quantized at 8 bits |
 
 The embedding's update always stays a runtime one. It costs `r * hidden` per token looked up.
 Hadamard-folded weights also stay runtime. Merged updates cost nothing per token, but their
-strength is fixed (`set_lora_strength` refuses them), and the memory grows wherever low-bit weights
-become Q8. Inkling-2-Mini AD-IQ2_M with AtomicChat's adapter merged peaks at 18.7 GB resident,
-against about 9 GB unmerged. That adapter touches every routed expert of `ffn_down_exps`. Its
-logits are within KL 3e-4 to 1.2e-3 of the runtime adapter's. Runtime adapters are the default
-because a merge into the original low-bit format cannot be redone here: there is no ggml block
-quantizer in oxinfer. AtomicChat's baked files are such merges, re-quantized by llama.cpp.
+strength is fixed (`set_lora_strength` refuses them), and they carry a fresh quantization's
+rounding. The merged tensors are new allocations: on a default load (the file copied to memory) the
+originals stay in that copy, so memory grows by the merged tensors' size; with `--mmap` the
+originals are reclaimable file pages, and a merged model costs about what an unmerged one does.
+Use `--mmap` with `--lora-merge`.
+
+Inkling-2-Mini AD-IQ2_M with AtomicChat's adapter (3096 updates, every routed expert of
+`ffn_down_exps`): 9.0 GB peak with the runtime adapter, 12.4 GB merged on a default load (18.7 GB
+when merges were stored as Q8), 3.8 GB footprint merged with `--mmap`. KL against the runtime
+adapter on five raw prompts 1.6e-3 to 8.9e-3, same top 1 throughout; AtomicChat's baked file (the
+same merge, re-quantized by llama.cpp) is 2.6e-3 to 1.3e-2 from it, so the merge is as close to
+the runtime adapter as llama.cpp's. The Q8 merge was closer (3e-4 to 1.2e-3) at about twice the
+memory. Q2_0 (IQ2_M's experts) is re-quantized with a least-squares fit rather than llama.cpp's
+absmax rounding, which never uses the `+2d` level that 6% of those weights take (KL 0.13 to 0.18
+that way).
+
+The quantizers (`oxinfer::ggml_quant`: `quantize_row`, `quantize_matrix`, with or without an
+importance matrix) give llama.cpp's bytes: identical blocks for every type on 352 rows (random
+rows with outliers and Llama-3.2-1B weights, with and without a random importance matrix) against
+`ggml_quantize_chunk` built with `-ffp-contract=off`; against the stock arm64 build, whose clang
+contracts multiply-adds into FMAs, 97.8 to 100% of blocks are identical (near ties) with the same
+RMSE to 1e-4. Departures, for inputs llama.cpp cannot take: IQ2_XXS / IQ2_XS without an importance
+matrix use all ones (llama.cpp aborts), and IQ3_S rows with an all-zero group of 32 keep their
+index and sign pointers moving (llama.cpp's encoder corrupts the following groups there).
+`examples/ggml_quant_check.rs` compares against llama.cpp's output. `--save-quantized` still
+writes oxinfer's Q8 / Q4 safetensors, not GGUF.
 
 ## Verification
 
@@ -158,7 +179,7 @@ prompt; the adapter moves them by up to 3.2 (KL 0.22 against the base):
 | bartowski Q4_K_M GGUF | bit-identical |
 | unsloth bf16 safetensors + PEFT vs F16 GGUF + GGUF adapter | max diff 3.3e-5, KL 1.7e-11 (as the two bases without an adapter) |
 | F16 GGUF, runtime vs `--lora-merge` | KL 3.1e-5 (the merged weights re-rounded to f16) |
-| Q4_K_M GGUF, runtime vs `--lora-merge` | KL 2.1e-3 (re-quantized as Q8) |
+| Q4_K_M GGUF, runtime vs `--lora-merge` | KL 1.2e-2 to 3.9e-2 on three prompts (re-quantized as Q4_K; 2.1e-3 when merges were stored as Q8. The base Q4_K_M is KL 6.6e-2 from F16) |
 
 The same adapter without the embedding update was run against llama.cpp's `llama-completion
 --lora-scaled FILE:0.7` on the F16 file. Three raw prompts, 48 greedy tokens: identical text in
