@@ -1,6 +1,6 @@
 import { defineConfig } from 'vite';
 import vue from '@vitejs/plugin-vue';
-import { createReadStream, statSync } from 'node:fs';
+import { createReadStream, readFileSync, statSync } from 'node:fs';
 import { join, normalize, sep } from 'node:path';
 
 // GitHub Pages serves a project site under /<repo>/. Override with PAGES_BASE ("/" for local use).
@@ -40,12 +40,28 @@ function localModels() {
   };
 }
 
-export default defineConfig({
-  base,
-  plugins: [vue(), localModels()],
-  build: {
-    target: 'es2022',
-    // The .wasm lives in public/ and is fetched at run time, not bundled.
-    assetsInlineLimit: 0,
-  },
+// `npm run build:native` (`--mode native`): the GUI `oxinfer web` embeds, written to
+// ../src/server/webui (committed, so that building oxinfer needs no node), with relative paths
+// and without the .wasm (that page drives the native engine over HTTP).
+function faviconOnly() {
+  return {
+    name: 'oxinfer-favicon',
+    generateBundle() {
+      this.emitFile({ type: 'asset', fileName: 'favicon.svg', source: readFileSync(new URL('./public/favicon.svg', import.meta.url)) });
+    },
+  };
+}
+
+export default defineConfig(({ mode }) => {
+  const native = mode === 'native';
+  return {
+    base: native ? './' : base,
+    plugins: [vue(), localModels(), ...(native ? [faviconOnly()] : [])],
+    build: {
+      target: 'es2022',
+      // The .wasm lives in public/ and is fetched at run time, not bundled.
+      assetsInlineLimit: 0,
+      ...(native ? { outDir: '../src/server/webui', emptyOutDir: true, copyPublicDir: false } : {}),
+    },
+  };
 });

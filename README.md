@@ -60,6 +60,7 @@ cargo build --release          # or take a binary from the GitHub releases
 A Hugging Face repo id is downloaded to the cache on first use; a local folder or GGUF file works
 too. The device is chosen at run time (`--device auto`: a GPU when one starts, else the CPU).
 [docs/cli.md](docs/cli.md) has the flags, the release binaries, `--update` and `--models`;
+`oxinfer web` opens a browser GUI for every kind of model ([docs/web.md](docs/web.md));
 [docs/library.md](docs/library.md) the Rust and C API.
 
 ## Documentation
@@ -73,6 +74,7 @@ too. The device is chosen at run time (`--device auto`: a GPU when one starts, e
 | [Supported models](docs/models.md) | every tested checkpoint with its size and measured agreement with the reference |
 | [Getting weights](docs/weights.md) | Hugging Face downloads, the mirror, GGUF files, MLX checkpoints |
 | [OpenAI-compatible server](docs/server.md) | chat, embeddings, images, audio; structured outputs, forced tool calls, log probabilities |
+| [Web GUI on this machine](docs/web.md) | `oxinfer web`: the browser GUI with native models, the catalog, downloads, the model cache |
 | [Tool calling](docs/tool-calling.md) | built-in and caller-defined tools |
 | [Session snapshots and the prompt cache](docs/sessions.md) | saving and restoring a conversation's state |
 | [Embeddings](docs/embeddings.md) | dense, sparse and ColBERT embedding models |

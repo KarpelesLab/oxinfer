@@ -1,6 +1,8 @@
 # OpenAI-compatible server
 
-`oxinfer serve` exposes the OpenAI API over a whitelist of models: only the models given with
+`oxinfer serve` exposes the OpenAI API over a whitelist of models (`oxinfer web` serves the same
+API next to a browser GUI that sets models up and adds them to the list: see
+[The web GUI on this machine](web.md)): only the models given with
 `--model` can be requested, by their id. Each is `[ID=]SOURCE[,KEY=VALUE...]`: a local folder or
 file, a repo id (fetched on first use, or at start with `--download`) or `org/name:QUANT` for a
 GGUF repo, an optional id (default: the source) and the model's options. HTTP and HTTPS are
@@ -39,12 +41,49 @@ img = client.images.generate(model="sd", prompt="a lighthouse at dusk", size="51
 |---|---|---|
 | `GET /v1/models`, `/v1/models/{id}` | all | the whitelist, with `kind` and `loaded` |
 | `POST /v1/chat/completions` | chat (Gemma 4 / 3, Qwen 3.5 / 3.8 / 3, Llama 3, Mistral Large 4, DeepSeek V4, Core ML) | system / developer, multi-turn, `image_url` (data: or http(s) URLs) and `video_url` parts (vision checkpoints), `input_audio` (Gemma 4), `tools` / `tool_choice` (`auto`, `none`, `required` or a function: forced calls) with `tool_calls` out, `response_format` (`json_object`, `json_schema`: constrained decoding), `logprobs` / `top_logprobs`, `temperature`, `top_p`, `top_k`, `max_tokens` / `max_completion_tokens`, `stop`, `seed`, `n`, `stream` (SSE, `stream_options.include_usage`), thinking with `reasoning_effort` (`none` off, anything else on), `enable_thinking` or `chat_template_kwargs.enable_thinking`, returned as `reasoning_content` |
+| `POST /v1/messages`, `/v1/messages/count_tokens` | chat | Anthropic's Messages API (Claude Code, the `anthropic` SDKs): see [below](#anthropic-messages-api) |
 | `POST /v1/completions` | chat | raw continuations (no template): `prompt` as text, texts or token ids, `echo`, `stop`, `stream` |
 | `POST /v1/embeddings` | embedding | `encoding_format` float / base64, `dimensions` (Matryoshka); `prompt_name` (extension) |
 | `POST /v1/images/generations` | image (Stable Diffusion, FLUX.1, Qwen-Image, OmniGen2, Step1X-Edit, BAGEL, Janus-Pro) | `size`, `n`, `response_format` (`b64_json`, or `url` as a PNG data URL); extensions `seed`, `steps`, `guidance`, `negative_prompt` |
 | `POST /v1/images/edits` | image | multipart: `image` (or `image[]`, several for Qwen-Image-Edit-2509+ and OmniGen2), `mask` (Stable Diffusion), `prompt`, the same fields, `strength` |
 | `POST /v1/audio/transcriptions`, `/v1/audio/translations` | Whisper, Nemotron 3.5 Transcribe ([its differences](nemotron.md#speech-to-text-nemotron-35-transcribe): `prompt` is the instruction, one segment, no word timestamps or beam search) | multipart: `file` (any format oxideav decodes), `language`, `prompt`, `temperature`, `response_format` json / text / verbose_json / srt / vtt, `timestamp_granularities[]` word / segment, `beam_size`, `patience`, `length_penalty`, `best_of`; several `file` parts are transcribed as a batch and answered as a JSON array (json / verbose_json) |
 | `POST /v1/audio/speech` | Orpheus, ZONOS3-Mini (44.1 kHz, the audio sent once generated; its fields in [ZONOS3-Mini](zonos.md)), Fish Audio Drama 3 (44.1 kHz, the audio sent per chunk of text; `voice` a speaker tag 0 to 15, its fields in [Drama 3](fish-drama.md)), Audio8 TTS (44.1 kHz, streamed as it is generated; `voice` a clip of its voices folder; its fields in [Audio8 TTS](audio8-tts.md)) | `input`, `voice` (the model's voices; OpenAI's names take the default one), `response_format` wav or pcm (16-bit 24 kHz mono, streamed as it is generated), `stream_format` sse; extensions `seed`, `temperature`, `top_p`, `repetition_penalty`; an array as `input` (1 to 64 texts, `voice` one name or an array) is generated as one batch and answered as JSON, `data[i].audio` the base64 WAV (or PCM) of `input[i]` |
+
+### Anthropic Messages API
+
+`POST /v1/messages` answers Anthropic's Messages API over the same chat models, so that clients
+written for it work against a local model, Claude Code among them:
+
+```sh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8080     # the server, without /v1
+export ANTHROPIC_AUTH_TOKEN=oxinfer                  # the API key, or anything without one
+export ANTHROPIC_MODEL=qwen ANTHROPIC_SMALL_FAST_MODEL=qwen ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen
+claude
+curl -s localhost:8080/v1/messages -H 'Content-Type: application/json' -H 'anthropic-version: 2023-06-01' \
+  -d '{"model": "qwen", "max_tokens": 256, "messages": [{"role": "user", "content": "Hi"}]}'
+```
+
+The request is the chat request it means (`anthropic_to_openai` in `src/server/openai.rs`):
+`system` (a string or text blocks) as the system prompt; `text`, `image` (base64 or URL sources)
+and plain-text `document` blocks; `tool_use` blocks of assistant turns as tool calls and
+`tool_result` blocks (`is_error` prefixes the text with `Error:`) as tool results; `tools`
+(`name`, `description`, `input_schema`; Anthropic's server tools such as web search are left
+out) and `tool_choice` (`auto`, `any`, `tool`, `none`); `thinking` (`enabled` or `adaptive`:
+thinking on, `disabled`: off, absent: the model's default); `max_tokens` (required, as with
+Anthropic), `temperature`, `top_p`, `top_k`, `stop_sequences`. Thinking blocks of earlier turns
+and `cache_control` marks are ignored (the server's own cache reuse applies). The reply has
+`thinking`, `text` and `tool_use` content blocks, `stop_reason` `end_turn`, `max_tokens` or
+`tool_use`, and `usage` (`input_tokens`, `cache_read_input_tokens`, `output_tokens`). With
+`"stream": true` it is Anthropic's event stream: `message_start`, `content_block_start` /
+`content_block_delta` (`thinking_delta`, `text_delta`, and `input_json_delta` with a tool call's
+whole input) / `content_block_stop`, `message_delta`, `message_stop`, and `ping` events while the
+model loads or reads the prompt. Errors have Anthropic's shape (`{"type": "error", "error":
+{"type", "message"}}`). The key may come as `x-api-key` as well as `Authorization: Bearer`.
+`/v1/messages/count_tokens` counts the system prompt, messages and tool definitions with the
+model's tokenizer (loading it if needed), plus four tokens per message for the template: an
+estimate within a few tokens. Not supported: thinking signatures (sent empty), redacted thinking,
+the server tools, PDF documents, the Batches and Files APIs. In the library it is `Api::handle`
+on that path, in C `oxi_server_handle`.
 
 ### Progress before the first token
 
@@ -116,7 +155,7 @@ requests need `Authorization: Bearer KEY`), `--cors ORIGIN`, `--max-body-mb N` (
 `--preload`, `--download`, `--memory-gb F`, `--cache-dir DIR`, `--threads N`,
 `--prompt-cache DIR|auto` and `--prompt-cache-gb F` (the chat models' prompt cache),
 `--tls-cert FILE --tls-key FILE` or `--self-signed` for HTTPS, `--workers N` (connections served
-at once, default 32), `--quiet`. Media URLs in requests may be `data:` URLs or `http(s)://` URLs,
+at once, default 32), `--quiet`; `web=1` (the key of `ServerOptions` and `oxi_server_new`; what `oxinfer web` sets) also serves the [web GUI](web.md) and its `/api/web/` management API. Media URLs in requests may be `data:` URLs or `http(s)://` URLs,
 which the server fetches (`--no-remote-media` turns that off); local paths and `file://` URLs
 only with `--local-media`, for trusted clients. `--config FILE` reads the same options as JSON:
 

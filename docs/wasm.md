@@ -30,6 +30,9 @@ always read into memory.
 
 ## Browser (WebGPU)
 
+(The same site runs on a native backend when `oxinfer web` serves it, with every model kind the
+server has: see [The web GUI on this machine](web.md).)
+
 The site has a Chat mode and an Image mode. Image mode loads SD 1.5 with the LCM-LoRA by default
 (2.1 GB of fp16 weights plus 135 MB from Hugging Face; 4 Euler ancestral steps without guidance,
 about 8 s per 512x512 image in Chrome on the M5 Max with the machine busy, 63 dB from the native

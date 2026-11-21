@@ -7,6 +7,7 @@
     "wasm": "cd .. && cargo build-web && cp target/wasm32-unknown-unknown/release/oxinfer.wasm web/public/oxinfer.wasm",
     "dev": "vite",
     "build": "vite build",
+    "build:native": "vite build --mode native",
     "preview": "vite preview",
     "smoke": "node scripts/smoke.mjs"
   },

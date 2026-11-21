@@ -1,10 +1,23 @@
 <script setup>
+// Two backends, one app. Hosted on its own (GitHub Pages, `npm run dev`) the models run in this
+// tab as WebAssembly with WebGPU (lib/oxinfer.js). Served by `oxinfer web`, /api/web/info answers
+// and the page drives that machine's engine over HTTP instead (lib/api.js), with views for every
+// kind of model it serves and for setting models up.
 import { computed, nextTick, onMounted, reactive, ref } from 'vue';
 import { Oxinfer, WebGpuHost, hasJspi } from './lib/oxinfer.js';
 import { cachedBytes, clearCache, loadFromFolder, loadModel } from './lib/loader.js';
-import Reply from './components/Reply.vue';
+import { WasmChat, HttpChat } from './lib/chat.js';
+import { HttpApi, detectBackend } from './lib/api.js';
+import { store, setup, refresh, startPolling, modelsOf } from './lib/native.js';
+import { systemPrompt } from './lib/tools.js';
+import ChatView from './components/ChatView.vue';
 import ImageStudio from './components/ImageStudio.vue';
-import { TOOL_SPECS, runTool, systemPrompt } from './lib/tools.js';
+import ModelPicker from './components/ModelPicker.vue';
+import ModelsView from './components/ModelsView.vue';
+import TranscribeView from './components/TranscribeView.vue';
+import SpeechView from './components/SpeechView.vue';
+import EmbedView from './components/EmbedView.vue';
+import ConnectView from './components/ConnectView.vue';
 
 const WASM_URL = `${import.meta.env.BASE_URL}oxinfer.wasm`;
 const REPO = 'https://github.com/KarpelesLab/oxinfer';
@@ -14,7 +27,31 @@ const SUGGESTIONS = ['mlx-community/gemma-4-e2b-it-4bit', 'mlx-community/Qwen3-4
 
 const params = new URLSearchParams(location.search);
 const auto = params.get('auto') === '1';
-const mode = ref(params.get('mode') === 'image' ? 'image' : 'chat');
+const WASM_MODES = [
+  ['chat', 'Chat'],
+  ['image', 'Image'],
+];
+const NATIVE_MODES = [
+  ['models', 'Models'],
+  ['chat', 'Chat'],
+  ['image', 'Image'],
+  ['transcribe', 'Transcribe'],
+  ['speak', 'Speak'],
+  ['embed', 'Embed'],
+  ['connect', 'Connect apps'],
+];
+const mode = ref(params.get('mode') || 'chat');
+// null while the backend is being detected.
+const backend = ref(null);
+const native = computed(() => backend.value?.native === true);
+const modes = computed(() => (native.value ? NATIVE_MODES : WASM_MODES));
+
+function setMode(m) {
+  mode.value = m;
+  const u = new URL(location.href);
+  u.searchParams.set('mode', m);
+  history.replaceState(null, '', u);
+}
 
 // ---- device -------------------------------------------------------------------------------------
 const device = reactive({ checked: false, gpuName: '', gpu: false });
@@ -53,25 +90,29 @@ const graphicsLine = computed(() => {
   return 'No WebGPU in this browser, so everything runs on the CPU.';
 });
 
-// ---- model loading ------------------------------------------------------------------------------
+// ---- wasm model loading -------------------------------------------------------------------------
 const source = ref('preset'); // 'preset' | 'custom' | 'folder'
 const custom = ref(params.get('model') || '');
 const folderFiles = ref(null);
 const precision = ref(params.get('quant') || 'q8');
 const useGpu = ref(params.get('gpu') !== '0');
-const phase = ref('idle'); // idle | loading | preparing | ready | generating
+const phase = ref('idle'); // idle | loading | preparing | ready
+const busy = ref(false);
 const error = ref('');
 const progress = reactive({ file: '', index: 0, count: 0, got: 0, size: 0, phase: '' });
 const modelName = ref('');
 const storage = ref(0);
+const chatView = ref(null);
+const wasmSession = ref(null);
+const toolsOn = ref(params.get('tools') !== '0');
+const systemText = ref('');
 
-let engine = null;
 let gpuHost = null;
 
 if (params.get('model')) source.value = 'custom';
 
 const canLoad = computed(() => {
-  if (phase.value === 'loading' || phase.value === 'preparing' || phase.value === 'generating') return false;
+  if (phase.value === 'loading' || phase.value === 'preparing' || busy.value) return false;
   if (source.value === 'custom') return custom.value.trim().length > 0;
   if (source.value === 'folder') return !!folderFiles.value?.length;
   return true;
@@ -99,16 +140,26 @@ function onFolder(e) {
 
 const pause = () => new Promise((r) => setTimeout(r, 0));
 
+function resetSystem() {
+  systemText.value = systemPrompt({ tools: toolsOn.value, gpuName: gpuHost ? device.gpuName : '', modelName: modelName.value });
+}
+
+function onTools(on) {
+  // Takes effect from the next conversation: the declarations live in its first system turn.
+  toolsOn.value = on;
+  resetSystem();
+}
+
 async function load() {
   error.value = '';
   phase.value = 'loading';
   Object.assign(progress, { file: '', index: 0, count: 0, got: 0, size: 0, phase: '' });
-  messages.value = [];
-  stats.value = null;
+  wasmSession.value = null;
+  chatView.value?.newConversation();
   try {
     if (gpuHost) gpuHost.device.destroy();
     gpuHost = useGpu.value && device.gpu && hasJspi ? await WebGpuHost.create(log) : null;
-    engine = await Oxinfer.create(WASM_URL, { gpu: gpuHost, log });
+    const engine = await Oxinfer.create(WASM_URL, { gpu: gpuHost, log });
     const onProgress = (p) => Object.assign(progress, p);
     if (source.value === 'folder') {
       const first = folderFiles.value[0];
@@ -123,15 +174,15 @@ async function load() {
     await nextTick();
     await pause();
     engine.load('/model', precision.value);
-    engine.setSampling({ temperature: temperature.value, topK: 64, topP: 0.95, seed: Date.now() % 1e9 });
+    const s = new WasmChat(engine);
+    s.setTools(toolsOn.value);
+    wasmSession.value = s;
     resetSystem();
-    applyTools();
     phase.value = 'ready';
   } catch (e) {
     error.value = friendly(e);
     log(`[error] ${e.message || e}`);
     phase.value = 'idle';
-    engine = null;
   }
   storage.value = await cachedBytes();
 }
@@ -150,133 +201,53 @@ async function forgetDownloads() {
   storage.value = await cachedBytes();
 }
 
-// ---- chat ---------------------------------------------------------------------------------------
-const messages = ref([]); // { role: 'user' | 'model', text }
-const draft = ref(params.get('prompt') || '');
-const temperature = ref(Number(params.get('temp') ?? 0.7));
-const maxTokens = ref(Number(params.get('max') || 512));
-const think = ref(false);
-const stats = ref(null);
-let stopRequested = false;
-const transcript = ref(null);
+// ---- native ---------------------------------------------------------------------------------
+const keyDraft = ref('');
+const chatModel = computed({
+  get: () => store.chosen.chat || '',
+  set: (v) => (store.chosen.chat = v),
+});
+const chatModelInfo = computed(() => modelsOf('chat').find((m) => m.id === chatModel.value));
+const httpSession = computed(() => (native.value && chatModel.value ? new HttpChat(store.api, chatModel.value) : null));
+const nativeSystem = ref('');
 
-// ---- tools and system prompt ----
-const useTools = ref(params.get('tools') !== '0');
-const systemText = ref('');
-const MAX_TOOL_ROUNDS = 5;
-
-function resetSystem() {
-  systemText.value = systemPrompt({ tools: useTools.value, gpuName: gpuHost ? device.gpuName : '', modelName: modelName.value });
+function resetNativeSystem() {
+  nativeSystem.value = systemPrompt({ tools: toolsOn.value, native: store.status?.platform || 'this computer', modelName: chatModelInfo.value?.id || '' });
 }
 
-function applyTools() {
-  engine?.setTools(useTools.value ? TOOL_SPECS : []);
+function saveKey() {
+  store.api.setKey(keyDraft.value.trim());
+  keyDraft.value = '';
+  refresh();
 }
 
-function toggleTools() {
-  // Takes effect from the next conversation: the declarations live in its first system turn.
-  applyTools();
-  resetSystem();
-  newConversation();
-}
-
-function toolLabel(m) {
-  if (m.name === 'get_datetime') return m.running ? 'Checking the date and time…' : 'Checked the date and time';
-  if (m.name === 'run_javascript') return m.running ? 'Running JavaScript…' : 'Ran JavaScript';
-  return m.running ? `Calling ${m.name}…` : `Called ${m.name}`;
-}
-
-async function send() {
-  const text = draft.value.trim();
-  if (!engine || !text || phase.value !== 'ready') return;
-  draft.value = '';
-  stopRequested = false;
-  phase.value = 'generating';
-  messages.value.push({ role: 'user', text });
-  messages.value.push({ role: 'model', text: '' });
-  let reply = messages.value[messages.value.length - 1];
-  await scrollDown();
-  try {
-    engine.setSampling({ temperature: temperature.value, topK: 64, topP: 0.95, seed: Date.now() % 1e9 });
-    const t0 = performance.now();
-    const promptTokens = await engine.chatTurn(text, { system: systemText.value.trim() || null, think: think.value, maxTokens: maxTokens.value });
-    const t1 = performance.now();
-    let tokens = 0;
-    for (let round = 0; ; round++) {
-      while (!stopRequested && (await engine.next()) >= 0) {
-        tokens++;
-        const t = engine.text();
-        if (!t.endsWith('�')) reply.text = t;
-        await pause(); // a real task boundary, so the browser paints between tokens
-        if (tokens % 8 === 0) scrollDown();
-      }
-      reply.text = engine.text();
-      if (stopRequested || !useTools.value || round >= MAX_TOOL_ROUNDS) break;
-      const calls = engine.toolCalls();
-      if (!calls.length) break;
-      // The model asked for tools: show each call, run it, feed the results back, keep going.
-      if (!reply.text.trim()) messages.value.splice(messages.value.indexOf(reply), 1);
-      const results = [];
-      for (const c of calls) {
-        messages.value.push({ role: 'tool', name: c.name, args: c.arguments, result: '', running: true });
-        const m = messages.value[messages.value.length - 1];
-        await scrollDown();
-        m.result = await runTool(c);
-        m.running = false;
-        log(`[tool ${c.name}(${JSON.stringify(c.arguments)}) -> ${m.result.replace(/\n/g, '\\n').slice(0, 300)}]`);
-        results.push({ name: c.name, content: m.result });
-      }
-      messages.value.push({ role: 'model', text: '' });
-      reply = messages.value[messages.value.length - 1];
-      await scrollDown();
-      await engine.toolResults(results);
-    }
-    const t2 = performance.now();
-    stats.value = { promptTokens, prefill: promptTokens / ((t1 - t0) / 1e3), tokens, decode: tokens / Math.max(1e-3, (t2 - t1) / 1e3), stopped: stopRequested };
-    log(`[prefill ${promptTokens} tok at ${stats.value.prefill.toFixed(1)} tok/s | decode ${tokens} tok at ${stats.value.decode.toFixed(1)} tok/s]`);
-    if (auto) log(`[output] ${reply.text.replace(/\n/g, '\\n')}`);
-  } catch (e) {
-    error.value = friendly(e);
-    log(`[error] ${e.message || e}`);
-  }
-  phase.value = 'ready';
-  scrollDown();
-}
-
-function stop() {
-  stopRequested = true;
-}
-
-function newConversation() {
-  if (!engine || phase.value === 'generating') return;
-  engine.reset();
-  messages.value = [];
-  stats.value = null;
-}
-
-function onKey(e) {
-  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
-    e.preventDefault();
-    send();
-  }
-}
-
-async function scrollDown() {
-  await nextTick();
-  const el = transcript.value;
-  if (el) el.scrollTop = el.scrollHeight;
+function onNativeTools(on) {
+  toolsOn.value = on;
+  resetNativeSystem();
 }
 
 onMounted(async () => {
+  backend.value = await detectBackend();
+  if (native.value) {
+    const api = new HttpApi(backend.value.info);
+    setup(api, backend.value.info);
+    await refresh();
+    startPolling();
+    if (!params.get('mode')) mode.value = modelsOf('chat').some((m) => m.loaded) ? 'chat' : 'models';
+    if (!NATIVE_MODES.some(([m]) => m === mode.value)) mode.value = 'models';
+    resetNativeSystem();
+    return;
+  }
+  if (!WASM_MODES.some(([m]) => m === mode.value)) mode.value = 'chat';
   await probeDevice();
   storage.value = await cachedBytes();
   if (auto) log(`[browser: ${navigator.userAgent}; jspi ${hasJspi}; webgpu ${device.gpu ? device.gpuName : 'none'}]`);
   if (auto && mode.value === 'chat') {
     await load();
-    for (let i = 0; i < Number(params.get('repeat') || 1) && engine; i++) {
-      newConversation();
-      draft.value = params.get('prompt') || 'Hello';
-      await send();
+    for (let i = 0; i < Number(params.get('repeat') || 1) && wasmSession.value; i++) {
+      chatView.value.newConversation();
+      chatView.value.draft = params.get('prompt') || 'Hello';
+      await chatView.value.send();
     }
     fetch('/exit', { method: 'POST' }).catch(() => {});
   }
@@ -286,22 +257,84 @@ onMounted(async () => {
 <template>
   <header class="masthead">
     <h1 class="wordmark">oxinfer</h1>
-    <p class="lede">Chat with a language model or make images, all in this tab. The weights download once and stay in this browser; nothing you type leaves the page.</p>
+    <p v-if="native" class="lede">Every model runs on {{ store.status?.platform ? 'this computer' : 'the computer that serves this page' }}. Pick one in Models, then chat, make images, transcribe, speak or search.</p>
+    <p v-else class="lede">Chat with a language model or make images, all in this tab. The weights download once and stay in this browser; nothing you type leaves the page.</p>
     <nav class="nav">
       <div class="modes" role="group" aria-label="Mode">
-        <button type="button" :aria-pressed="mode === 'chat'" @click="mode = 'chat'">Chat</button>
-        <button type="button" :aria-pressed="mode === 'image'" @click="mode = 'image'">Image</button>
+        <button v-for="[m, label] in modes" :key="m" type="button" :aria-pressed="mode === m" @click="setMode(m)">{{ label }}</button>
       </div>
       <a class="repo" :href="REPO">Source on GitHub</a>
     </nav>
   </header>
 
-  <ImageStudio v-if="mode === 'image'" :device="device" :auto="auto" :log="log" @storage="(v) => (storage = v)" />
-  <main v-else class="layout">
-    <aside class="side">
+  <main v-if="!backend" class="layout single" aria-busy="true"><p class="empty pad">Starting…</p></main>
+
+  <!-- ---------------------------------------------------------------- native backend -->
+  <template v-else-if="native">
+    <main v-if="store.needKey" class="layout single">
+      <form class="keyform" @submit.prevent="saveKey">
+        <h2>This server needs its API key</h2>
+        <p class="hint">It was started with <code>--api-key</code>. The key stays in this browser.</p>
+        <label class="block">API key <input v-model="keyDraft" class="field" type="password" autocomplete="current-password" autofocus /></label>
+        <button class="primary" type="submit" :disabled="!keyDraft.trim()">Continue</button>
+      </form>
+    </main>
+    <template v-else>
+      <p v-if="store.error" class="banner error" role="alert">{{ store.error }}</p>
+      <ModelsView v-if="mode === 'models'" @use="setMode" />
+      <ChatView
+        v-else-if="mode === 'chat'"
+        :session="httpSession"
+        :model-name="chatModel"
+        :ready="!!chatModelInfo"
+        :log="log"
+        :system="nativeSystem"
+        :initial-tools="toolsOn"
+        native
+        @reset-system="resetNativeSystem"
+        @tools="onNativeTools"
+      >
+        <template #model>
+          <ModelPicker v-model="chatModel" kind="chat" title="Chat model" @manage="setMode('models')" />
+        </template>
+        <template #after>
+          <details class="more">
+            <summary>Log</summary>
+            <pre class="log">{{ logs.join('\n') || 'Nothing yet.' }}</pre>
+          </details>
+        </template>
+      </ChatView>
+      <ImageStudio v-else-if="mode === 'image'" :device="device" :log="log" native @manage="setMode('models')" />
+      <TranscribeView v-else-if="mode === 'transcribe'" @manage="setMode('models')" />
+      <SpeechView v-else-if="mode === 'speak'" @manage="setMode('models')" />
+      <EmbedView v-else-if="mode === 'embed'" @manage="setMode('models')" />
+      <ConnectView v-else-if="mode === 'connect'" @manage="setMode('models')" />
+    </template>
+  </template>
+
+  <!-- ---------------------------------------------------------------- wasm in this tab -->
+  <ImageStudio v-else-if="mode === 'image'" :device="device" :auto="auto" :log="log" @storage="(v) => (storage = v)" />
+  <ChatView
+    v-else
+    ref="chatView"
+    :session="wasmSession"
+    :model-name="modelName"
+    :ready="phase === 'ready'"
+    :log="log"
+    :auto="auto"
+    :system="systemText"
+    :initial-draft="params.get('prompt') || ''"
+    :initial-temperature="Number(params.get('temp') ?? 0.7)"
+    :initial-max-tokens="Number(params.get('max') || 512)"
+    :initial-tools="toolsOn"
+    @busy="(b) => (busy = b)"
+    @reset-system="resetSystem"
+    @tools="onTools"
+  >
+    <template #model>
       <section aria-labelledby="model-h">
         <h2 id="model-h">Model</h2>
-        <fieldset class="choices" :disabled="phase === 'loading' || phase === 'preparing' || phase === 'generating'">
+        <fieldset class="choices" :disabled="phase === 'loading' || phase === 'preparing' || busy">
           <legend class="sr-only">Where the model comes from</legend>
           <label class="choice">
             <input v-model="source" type="radio" value="preset" />
@@ -343,7 +376,7 @@ onMounted(async () => {
         <div class="row">
           <label class="inline">
             Precision
-            <select v-model="precision" :disabled="phase !== 'idle' && phase !== 'ready'">
+            <select v-model="precision" :disabled="phase === 'loading' || phase === 'preparing' || busy">
               <option value="q8">8-bit</option>
               <option value="q4">4-bit</option>
               <option value="bf16">16-bit</option>
@@ -354,7 +387,7 @@ onMounted(async () => {
         <p class="hint">Precision applies to original checkpoints. MLX models and folders from <code>--save-quantized</code> keep their own.</p>
 
         <button class="primary" type="button" :disabled="!canLoad" @click="load">
-          {{ phase === 'ready' || phase === 'generating' ? 'Load again' : 'Load model' }}
+          {{ phase === 'ready' ? 'Load again' : 'Load model' }}
         </button>
 
         <div v-if="phase === 'loading'" class="progress" role="status">
@@ -362,7 +395,7 @@ onMounted(async () => {
           <p>{{ progressLine }}</p>
         </div>
         <p v-else-if="phase === 'preparing'" class="status" role="status">Preparing the weights. The page may not respond for a few seconds.</p>
-        <p v-else-if="phase === 'ready' || phase === 'generating'" class="status ready" role="status">{{ modelName }} is ready.</p>
+        <p v-else-if="phase === 'ready'" class="status ready" role="status">{{ modelName }} is ready.</p>
         <p v-if="error" class="error" role="alert">{{ error }}</p>
       </section>
 
@@ -371,30 +404,8 @@ onMounted(async () => {
         <p class="device">{{ graphicsLine }}</p>
         <p class="device">The browser build uses one CPU thread with SIMD, so replies are slower than the native app.</p>
       </section>
-
-      <section v-if="stats" aria-labelledby="speed-h">
-        <h2 id="speed-h">Last reply</h2>
-        <dl class="speed">
-          <dt>Prompt</dt>
-          <dd>{{ stats.promptTokens }} tokens at {{ stats.prefill.toFixed(0) }} per second</dd>
-          <dt>Reply</dt>
-          <dd>{{ stats.tokens }} tokens at {{ stats.decode.toFixed(1) }} per second{{ stats.stopped ? ', stopped' : '' }}</dd>
-        </dl>
-      </section>
-
-      <details class="more">
-        <summary>Settings</summary>
-        <label class="inline">Temperature <input v-model.number="temperature" class="num" type="number" min="0" max="2" step="0.1" /></label>
-        <label class="inline">Longest reply <input v-model.number="maxTokens" class="num" type="number" min="1" max="8192" step="1" /> tokens</label>
-        <label class="inline"><input v-model="think" type="checkbox" /> Let the model think first</label>
-        <label class="inline"><input v-model="useTools" type="checkbox" @change="toggleTools" /> Let the model use tools</label>
-        <p class="hint">It can read the date and time, and run JavaScript in a sandboxed worker with no network or storage access.</p>
-        <label class="block">System prompt
-          <textarea v-model="systemText" class="sys" rows="7" spellcheck="false" aria-label="System prompt"></textarea>
-        </label>
-        <p class="hint">Applies from the next conversation. <button class="link" type="button" :disabled="!engine" @click="resetSystem">Reset</button></p>
-      </details>
-
+    </template>
+    <template #after>
       <details class="more">
         <summary>Log</summary>
         <pre class="log">{{ logs.join('\n') || 'Nothing yet.' }}</pre>
@@ -404,45 +415,8 @@ onMounted(async () => {
         Downloaded models use {{ fmtBytes(storage) }} of this browser’s storage.
         <button class="link" type="button" @click="forgetDownloads">Delete them</button>
       </p>
-    </aside>
-
-    <section class="chat" aria-label="Conversation">
-      <div ref="transcript" class="transcript" aria-live="polite">
-        <p v-if="!messages.length" class="empty">
-          {{ phase === 'ready' ? 'Ask it something.' : 'Load a model, then ask it something.' }}
-        </p>
-        <template v-for="(m, i) in messages" :key="i">
-          <details v-if="m.role === 'tool'" class="tool" :open="m.name === 'run_javascript' && !m.running">
-            <summary>{{ toolLabel(m) }}</summary>
-            <pre v-if="m.name === 'run_javascript'" class="code">{{ m.args.code }}</pre>
-            <pre v-if="m.result" class="result">{{ m.result }}</pre>
-          </details>
-          <article v-else :class="['msg', m.role]">
-            <h3 class="who">{{ m.role === 'user' ? 'You' : modelName }}</h3>
-            <p v-if="m.role === 'user'" class="said">{{ m.text }}</p>
-            <Reply v-else-if="m.text" :text="m.text" />
-            <p v-else class="thinking">{{ i > 0 && messages[i - 1].role === 'tool' ? 'Reading the result…' : 'Reading your message…' }}</p>
-          </article>
-        </template>
-      </div>
-
-      <form class="composer" @submit.prevent="send">
-        <textarea
-          v-model="draft"
-          rows="2"
-          :placeholder="phase === 'ready' || phase === 'generating' ? 'Message' : 'Load a model first'"
-          aria-label="Message"
-          :disabled="!engine"
-          @keydown="onKey"
-        ></textarea>
-        <div class="actions">
-          <button v-if="phase === 'generating'" type="button" class="primary" @click="stop">Stop</button>
-          <button v-else type="submit" class="primary" :disabled="phase !== 'ready' || !draft.trim()">Send</button>
-          <button type="button" class="quiet" :disabled="phase !== 'ready' || !messages.length" @click="newConversation">New conversation</button>
-        </div>
-      </form>
-    </section>
-  </main>
+    </template>
+  </ChatView>
 </template>
 
 <style scoped>
@@ -479,6 +453,7 @@ onMounted(async () => {
 }
 .modes {
   display: inline-flex;
+  flex-wrap: wrap;
   border: 1px solid var(--line);
   border-radius: 4px;
   overflow: hidden;
@@ -497,295 +472,24 @@ onMounted(async () => {
   background: var(--verdigris-deep);
   color: var(--paper);
 }
-
-.layout {
-  flex: 1;
-  min-height: 0;
-  display: grid;
-  grid-template-columns: minmax(17rem, 23rem) 1fr;
+.single {
+  grid-template-columns: 1fr;
 }
-.side {
-  overflow-y: auto;
-  padding: 1.25rem clamp(1rem, 3vw, 2rem) 2rem;
-  border-right: 1px solid var(--line);
+.pad {
+  padding: 0 clamp(1rem, 4vw, 3rem);
 }
-.side section + section,
-.side section + details,
-.side details + details,
-.side details + p {
-  margin-top: 1.5rem;
+.keyform {
+  max-width: 28rem;
+  padding: 2rem clamp(1rem, 4vw, 3rem);
 }
-h2 {
-  margin: 0 0 0.6rem;
-  font-family: var(--display);
-  font-size: 1.15rem;
-  font-weight: 650;
-  letter-spacing: -0.01em;
-}
-.choices {
-  border: 0;
+.banner {
   margin: 0;
-  padding: 0;
-  display: grid;
-  gap: 0.5rem;
-}
-.choice {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 0.6rem;
-  align-items: start;
-  cursor: pointer;
-}
-.choice input {
-  margin-top: 0.35rem;
-  accent-color: var(--verdigris);
-}
-.choice small {
-  display: block;
-  color: var(--muted);
-  font-size: 0.85rem;
-  line-height: 1.4;
-}
-.field {
-  width: 100%;
-  padding: 0.45rem 0.6rem;
-  border: 1px solid var(--line);
-  border-radius: 4px;
+  padding: 0.5rem clamp(1rem, 4vw, 2.5rem);
+  border-bottom: 1px solid var(--line);
   background: var(--surface);
-}
-.row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem 1.25rem;
-  margin-top: 1rem;
-}
-.inline {
-  display: flex;
-  align-items: center;
-  gap: 0.45rem;
-  margin: 0.35rem 0;
-}
-.inline select,
-.num {
-  padding: 0.25rem 0.4rem;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  background: var(--surface);
-}
-.num {
-  width: 5.5rem;
-}
-.hint {
-  margin: 0.4rem 0 0;
-  color: var(--muted);
-  font-size: 0.85rem;
-}
-button {
-  cursor: pointer;
-}
-button:disabled {
-  cursor: default;
-  opacity: 0.45;
-}
-.primary {
-  margin-top: 1rem;
-  padding: 0.55rem 1.2rem;
-  border: 0;
-  border-radius: 4px;
-  background: var(--verdigris-deep);
-  color: var(--paper);
-  font-weight: 650;
-}
-.quiet {
-  margin-top: 1rem;
-  padding: 0.5rem 0.9rem;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  background: transparent;
-}
-.link {
-  padding: 0;
-  border: 0;
-  background: none;
-  color: var(--verdigris-deep);
-  text-decoration: underline;
-  text-underline-offset: 0.15em;
-}
-.progress p,
-.status,
-.error {
-  margin: 0.6rem 0 0;
-  font-size: 0.9rem;
-}
-.bar {
-  height: 6px;
-  margin-top: 1rem;
-  background: var(--line);
-  border-radius: 3px;
-  overflow: hidden;
-}
-.fill {
-  height: 100%;
-  background: var(--verdigris);
-  transition: width 0.2s linear;
-}
-.ready {
-  color: var(--verdigris-deep);
-}
-.error {
-  color: var(--error);
-}
-.device {
-  margin: 0 0 0.5rem;
-  font-size: 0.92rem;
-}
-.speed {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: 0.15rem 0.75rem;
-  margin: 0;
-  font-size: 0.92rem;
-  font-variant-numeric: tabular-nums;
-}
-.speed dt {
-  color: var(--muted);
-}
-.speed dd {
-  margin: 0;
-}
-.block {
-  display: grid;
-  gap: 0.3rem;
-  margin: 0.8rem 0 0;
-}
-.sys {
-  width: 100%;
-  padding: 0.45rem 0.6rem;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  background: var(--surface);
-  font-size: 0.8rem;
-  line-height: 1.4;
-  resize: vertical;
-}
-.tool {
-  max-width: 68ch;
-  margin: -0.6rem 0 1.4rem;
-  padding: 0.4rem 0.75rem;
-  border-left: 3px solid var(--copper);
-  background: var(--surface);
-  border-radius: 0 4px 4px 0;
-  font-size: 0.9rem;
-}
-.tool summary {
-  cursor: pointer;
-  color: var(--muted);
-  font-family: var(--display);
-  font-weight: 600;
-}
-.tool pre {
-  margin: 0.5rem 0 0.2rem;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  font-size: 0.8rem;
-}
-.tool .code {
-  padding: 0.5rem;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  background: var(--paper);
-}
-.more summary {
-  cursor: pointer;
-  font-family: var(--display);
-  font-weight: 600;
-}
-.log {
-  max-height: 14rem;
-  overflow: auto;
-  margin: 0.5rem 0 0;
-  padding: 0.6rem;
-  background: var(--surface);
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  font-size: 0.75rem;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
 }
 
-.chat {
-  display: grid;
-  grid-template-rows: 1fr auto;
-  min-height: 0;
-}
-.transcript {
-  overflow-y: auto;
-  padding: 1.5rem clamp(1rem, 4vw, 3rem);
-}
-.empty {
-  margin: 3rem 0 0;
-  color: var(--muted);
-  font-family: var(--display);
-  font-size: 1.4rem;
-}
-.msg {
-  max-width: 68ch;
-  margin: 0 0 1.6rem;
-}
-.who {
-  margin: 0 0 0.2rem;
-  font-family: var(--display);
-  font-size: 0.85rem;
-  font-weight: 600;
-  color: var(--muted);
-}
-.user .said {
-  margin: 0;
-  padding-left: 0.8rem;
-  border-left: 3px solid var(--verdigris);
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-.model :deep(.reply) {
-  line-height: 1.6;
-}
-.thinking {
-  margin: 0;
-  color: var(--muted);
-}
-.composer {
-  padding: 0.75rem clamp(1rem, 4vw, 3rem) 1rem;
-  border-top: 1px solid var(--line);
-  background: var(--surface);
-}
-.composer textarea {
-  display: block;
-  width: 100%;
-  max-width: 68ch;
-  min-height: 3.2rem;
-  resize: vertical;
-  padding: 0.6rem 0.75rem;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  background: var(--paper);
-}
-.actions {
-  display: flex;
-  gap: 0.6rem;
-}
-.actions .primary,
-.actions .quiet {
-  margin-top: 0.6rem;
-}
-.sr-only {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
-  clip: rect(0 0 0 0);
-}
-
-@media (max-width: 760px) {
+@media (max-width: 1000px) {
   .masthead {
     grid-template-columns: 1fr auto;
   }
@@ -794,16 +498,11 @@ button:disabled {
     grid-row: 2;
     margin-top: 0.5rem;
   }
-  .layout {
-    grid-template-columns: 1fr;
-    height: auto;
-  }
-  .side {
-    border-right: 0;
-    border-bottom: 1px solid var(--line);
-  }
-  .chat {
-    min-height: 70dvh;
+  .nav {
+    grid-column: 1 / -1;
+    grid-row: 3;
+    margin-top: 0.75rem;
+    flex-wrap: wrap;
   }
 }
 </style>

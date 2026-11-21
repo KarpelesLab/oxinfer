@@ -1,13 +1,23 @@
 <script setup>
 // Text-to-image with Stable Diffusion (SD 1.5 with the LCM-LoRA by default) in the same module as
 // the chat, and image editing: InstructPix2Pix instruction edits ("make it snowy"; with the same
-// LCM-LoRA, 4 steps), image-to-image and inpainting with a mask.
-import { computed, nextTick, onMounted, reactive, ref } from 'vue';
+// LCM-LoRA, 4 steps), image-to-image and inpainting with a mask. With `native`, the image models
+// of the oxinfer server instead (Stable Diffusion, FLUX.1, Qwen-Image, OmniGen2, ...), through
+// /v1/images/generations and /v1/images/edits: the same page, another session (lib/image.js).
+import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue';
 import { Oxinfer, WebGpuHost, hasJspi } from '../lib/oxinfer.js';
 import { cachedBytes, loadDiffusersFromFolder, loadDiffusersFromUrl, loadLoras, sourceBase } from '../lib/loader.js';
+import { HttpImage, WasmImage } from '../lib/image.js';
+import { store } from '../lib/native.js';
+import ModelPicker from './ModelPicker.vue';
 
-const props = defineProps({ device: { type: Object, required: true }, auto: { type: Boolean, default: false }, log: { type: Function, required: true } });
-const emit = defineEmits(['storage']);
+const props = defineProps({
+  device: { type: Object, required: true },
+  auto: { type: Boolean, default: false },
+  log: { type: Function, required: true },
+  native: { type: Boolean, default: false },
+});
+const emit = defineEmits(['storage', 'manage']);
 
 const WASM_URL = `${import.meta.env.BASE_URL}oxinfer.wasm`;
 // Presets carry their own sampling defaults: the LCM-LoRA makes SD 1.5 a 4-step model without
@@ -64,6 +74,26 @@ const imageGuidance = ref(1.5);
 const canvas = ref(null);
 let engine = null;
 let gpuHost = null;
+// What generates: the wasm pipeline once loaded, or the chosen model of the server.
+const session = ref(null);
+
+// ---- native: the server's image models ----
+const nativeModel = computed({ get: () => store.chosen.image || '', set: (v) => (store.chosen.image = v) });
+if (props.native) {
+  steps.value = '';
+  guidance.value = '';
+  editKind.value = 'any';
+  strength.value = 0.8;
+  watch(
+    nativeModel,
+    (m) => {
+      session.value = m ? new HttpImage(store.api, m) : null;
+      modelName.value = m;
+      phase.value = m ? 'ready' : 'idle';
+    },
+    { immediate: true },
+  );
+}
 
 const busy = computed(() => ['loading', 'preparing', 'generating'].includes(phase.value));
 const canLoad = computed(() => !busy.value && (PRESETS[source.value] || (source.value === 'custom' && custom.value.trim()) || (source.value === 'folder' && folderFiles.value?.length)));
@@ -111,6 +141,7 @@ async function load() {
     await pause();
     engine.sdLoad('/model', loras);
     if (params.get('check') === '1') engine.gpuCheckEnable();
+    session.value = new WasmImage(engine);
     const d = preset || engine.sdDefaults();
     steps.value = Number(params.get('steps') || d.steps);
     guidance.value = Number(params.get('guidance') ?? d.guidance);
@@ -128,6 +159,7 @@ async function load() {
     props.log(`[error] ${e.message || e}`);
     phase.value = 'idle';
     engine = null;
+    session.value = null;
   }
   emit('storage', await cachedBytes());
 }
@@ -177,13 +209,15 @@ function clearInput() {
 }
 
 const editing = computed(() => !!inputImg.value);
-const needsImage = computed(() => editKind.value !== 'img2img');
+const needsImage = computed(() => editKind.value !== 'img2img' && editKind.value !== 'any');
 const usesStrength = computed(() => editKind.value !== 'instruct');
 // Image-to-image runs the last steps * strength steps of the schedule: at least one.
-const runSteps = computed(() => (editing.value && usesStrength.value && strength.value < 1 ? Math.max(steps.value, Math.ceil(1 / strength.value - 1e-4)) : steps.value));
+const runSteps = computed(() =>
+  props.native || !(editing.value && usesStrength.value && strength.value < 1) ? steps.value : Math.max(steps.value, Math.ceil(1 / strength.value - 1e-4)),
+);
 
 async function generate() {
-  if (!engine || phase.value !== 'ready' || !prompt.value.trim()) return;
+  if (!session.value || phase.value !== 'ready' || !prompt.value.trim()) return;
   if (needsImage.value && !inputImg.value) {
     error.value = editKind.value === 'instruct' ? 'This model edits images: choose an image first.' : 'This inpainting model needs an image and a mask.';
     return;
@@ -200,18 +234,27 @@ async function generate() {
   await pause();
   const t0 = performance.now();
   try {
-    engine.sdSetInput(inputImg.value, usesStrength.value ? maskImg.value : null, {
-      strength: usesStrength.value ? strength.value : 0,
-      imageGuidance: imageGuidance.value,
-    });
     const side = editing.value ? 0 : size.value;
-    const img = await engine.sdGenerate(
-      { prompt: prompt.value, negative: negative.value, steps: runSteps.value, guidance: guidance.value, seed: seed.value, width: side, height: side, ancestral: ancestral.value },
+    const img = await session.value.generate(
+      {
+        prompt: prompt.value,
+        negative: negative.value,
+        steps: props.native && steps.value === '' ? null : runSteps.value,
+        guidance: props.native && guidance.value === '' ? null : guidance.value,
+        seed: seed.value,
+        width: side,
+        height: side,
+        ancestral: ancestral.value,
+        image: inputImg.value,
+        mask: usesStrength.value ? maskImg.value : null,
+        strength: usesStrength.value ? strength.value : 0,
+        imageGuidance: imageGuidance.value,
+      },
       (i, n) => Object.assign(step, { i, n }),
     );
     const secs = (performance.now() - t0) / 1e3;
     await nextTick();
-    draw(img);
+    await draw(img);
     result.value = { width: img.width, height: img.height, secs, seed: seed.value };
     props.log(`[image ${img.width}x${img.height} in ${secs.toFixed(1)}s, seed ${seed.value}]`);
   } catch (e) {
@@ -221,11 +264,19 @@ async function generate() {
   phase.value = 'ready';
 }
 
-function draw(img) {
+async function draw(img) {
   const c = canvas.value;
   if (!c) return;
   c.width = img.width;
   c.height = img.height;
+  if (img.url) {
+    // The server's PNG.
+    const el = new Image();
+    el.src = img.url;
+    await el.decode();
+    c.getContext('2d').drawImage(el, 0, 0);
+    return;
+  }
   const rgba = new Uint8ClampedArray(img.width * img.height * 4);
   for (let i = 0, j = 0; i < img.rgb.length; i += 3, j += 4) {
     rgba[j] = img.rgb[i];
@@ -270,7 +321,8 @@ onMounted(async () => {
 <template>
   <main class="layout">
     <aside class="side">
-      <section aria-labelledby="img-model-h">
+      <ModelPicker v-if="native" v-model="nativeModel" kind="image" title="Image model" @manage="emit('manage')" />
+      <section v-else aria-labelledby="img-model-h">
         <h2 id="img-model-h">Image model</h2>
         <fieldset class="choices" :disabled="busy">
           <legend class="sr-only">Where the model comes from</legend>
@@ -335,7 +387,9 @@ onMounted(async () => {
               ? 'Choose a picture, then say what to change.'
               : editKind === 'inpaint'
                 ? 'Choose a picture and a mask: white parts are repainted from the description.'
-                : 'Optional. The description then redraws the picture; with a mask, only its white parts.'
+                : editKind === 'any'
+                  ? 'Optional. Editing models (FLUX Kontext, Qwen-Image-Edit, OmniGen2, …) follow the instruction; Stable Diffusion redraws the picture, with a mask only its white parts.'
+                  : 'Optional. The description then redraws the picture; with a mask, only its white parts.'
           }}
         </p>
         <label class="block">Image
@@ -359,9 +413,10 @@ onMounted(async () => {
 
       <section v-if="phase === 'ready' || phase === 'generating'" aria-labelledby="img-set-h">
         <h2 id="img-set-h">Settings</h2>
-        <label class="inline">Steps <input v-model.number="steps" class="num" type="number" min="1" max="100" /></label>
-        <label class="inline">Guidance <input v-model.number="guidance" class="num" type="number" min="0" max="20" step="0.5" /></label>
-        <label class="inline">Sampler
+        <label class="inline">Steps <input v-model.number="steps" class="num" type="number" min="1" max="100" :placeholder="native ? 'default' : ''" /></label>
+        <label class="inline">Guidance <input v-model.number="guidance" class="num" type="number" min="0" max="20" step="0.5" :placeholder="native ? 'default' : ''" /></label>
+        <p v-if="native" class="hint">Empty: the model’s own defaults.</p>
+        <label v-if="!native" class="inline">Sampler
           <select v-model="ancestral">
             <option :value="false">Euler</option>
             <option :value="true">Euler ancestral</option>
@@ -390,14 +445,16 @@ onMounted(async () => {
         <p v-if="!result && phase !== 'generating'" class="empty">
           {{
             phase !== 'ready'
-              ? 'Load an image model, then describe a picture.'
+              ? native
+                ? 'Set up an image model, then describe a picture.'
+                : 'Load an image model, then describe a picture.'
               : editKind === 'instruct'
                 ? 'Choose an image, then say what to change.'
                 : 'Describe an image, then press Generate.'
           }}
         </p>
         <p v-if="phase === 'generating'" class="working" role="status">
-          {{ step.i < step.n ? `Denoising, step ${step.i + 1} of ${step.n}…` : 'Decoding the image…' }}
+          {{ native ? 'Generating on the server…' : step.i < step.n ? `Denoising, step ${step.i + 1} of ${step.n}…` : 'Decoding the image…' }}
         </p>
         <p v-if="result && phase !== 'generating'" class="meta">
           {{ result.width }}×{{ result.height }} in {{ result.secs.toFixed(1) }} s, seed {{ result.seed }}.
@@ -410,7 +467,7 @@ onMounted(async () => {
           rows="2"
           :placeholder="phase === 'idle' ? 'Load a model first' : editKind === 'instruct' ? 'Say what to change, e.g. make it winter' : 'Describe the image'"
           :aria-label="editKind === 'instruct' ? 'Edit instruction' : 'Image description'"
-          :disabled="!engine"
+          :disabled="!session"
           @keydown="onKey"
         ></textarea>
         <div class="actions">

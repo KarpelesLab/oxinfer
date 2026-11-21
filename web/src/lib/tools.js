@@ -100,10 +100,17 @@ export async function runTool(call) {
   }
 }
 
-/// A system prompt describing where the model runs.
-export function systemPrompt({ tools, gpuName, modelName }) {
+/// A system prompt describing where the model runs: this browser tab (wasm), or with `native`
+/// (the backend's platform summary) the computer that serves the page.
+export function systemPrompt({ tools, gpuName, modelName, native }) {
   const n = navigator;
   const now = datetimeNow();
+  if (native) {
+    const env = [`computer: ${native}`, `time zone: ${now.zone}`, `local date and time when this conversation started: ${now.weekday} ${now.local}`, `language: ${n.language}`];
+    let s = `You are ${modelName ? `${modelName}, ` : ''}a helpful assistant running locally on the user's own computer with oxinfer. Nothing the user types leaves their machine, and you have no internet access.\n\nEnvironment:\n- ${env.join('\n- ')}`;
+    if (tools) s += TOOLS_NOTE;
+    return s;
+  }
   const brand = n.userAgentData?.brands?.filter((b) => !/not.a.brand/i.test(b.brand)).map((b) => `${b.brand} ${b.version}`).join(', ');
   const platform = n.userAgentData?.platform || n.platform || 'unknown';
   const env = [
@@ -117,8 +124,9 @@ export function systemPrompt({ tools, gpuName, modelName }) {
     gpuName ? `GPU (WebGPU): ${gpuName}` : 'no WebGPU, running on the CPU',
   ];
   let s = `You are ${modelName ? `${modelName}, ` : ''}a helpful assistant running entirely inside the user's web browser, in this tab, with oxinfer (WebAssembly${gpuName ? ' and WebGPU' : ''}). Nothing the user types leaves their device, and you have no internet access.\n\nEnvironment:\n- ${env.join('\n- ')}`;
-  if (tools) {
-    s += '\n\nYou can call tools. Use get_datetime when the current time matters (the time above may be stale), and run_javascript for exact calculations, dates or data processing instead of guessing. Answer directly when no tool is needed.';
-  }
+  if (tools) s += TOOLS_NOTE;
   return s;
 }
+
+const TOOLS_NOTE =
+  '\n\nYou can call tools. Use get_datetime when the current time matters (the time above may be stale), and run_javascript for exact calculations, dates or data processing instead of guessing. Answer directly when no tool is needed.';
