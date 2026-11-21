@@ -1223,6 +1223,54 @@ impl<'a> Inkling2Model<'a> {
         Ok(m)
     }
 
+    /// Attaches the modules of a runtime LoRA adapter (see `crate::lora`) by the release's module
+    /// names (`layers.N.attn.wo_ud`, `layers.N.mlp.experts`, `layers.N.controllers.attn.down_weight`,
+    /// `lm_head` for the unembedding), and its token-embedding update. A GGUF adapter's names
+    /// map to these (`blk.N.attn_output.weight` is `layers.N.attn.wo_ud`, `ffn_down_exps` the
+    /// experts' `down_proj`). Returns the number patched.
+    pub fn attach_lora(&mut self, ad: &mut crate::lora::LoraAdapter) -> Result<usize> {
+        let c = &self.cfg;
+        let (h, v, dr) = (c.hidden_size, c.vocab_size, c.d_rel);
+        let rank = c.loop_cfg.map_or(0, |l| l.gate_rank);
+        let k = c.conv_kernel_size;
+        if let Some(d) = ad.take_embed(v, h)? {
+            self.embed.add_lora(d);
+        }
+        for (l, layer) in self.layers.iter_mut().enumerate() {
+            let p = format!("layers.{l}.");
+            ad.attach_experts(&mut layer.experts, &format!("{p}mlp.experts"), h)?;
+            let a = &mut layer.attn;
+            let hd = a.hd;
+            let (w, kw) = (hd.heads * hd.head_dim, hd.kv_heads * hd.head_dim);
+            for (lin, name, n_out, n_in) in [
+                (&mut a.q, "wq_du", w, h),
+                (&mut a.k, "wk_dv", kw, h),
+                (&mut a.v, "wv_dv", kw, h),
+                (&mut a.r, "wr_du", hd.heads * dr, h),
+                (&mut a.gate, "gate_attn", w, h),
+                (&mut a.sink, "attn_sink_proj", hd.heads, h),
+                (&mut a.o, "wo_ud", h, w),
+            ] {
+                ad.attach(lin, &format!("{p}attn.{name}"), n_out, n_in, None, None)?;
+            }
+            for (conv, name) in [(&mut a.k_conv, "k_sconv"), (&mut a.v_conv, "v_sconv")] {
+                if let KvConv::Dynamic { proj, .. } = conv {
+                    ad.attach(proj, &format!("{p}attn.{name}.weight_proj"), hd.kv_heads * k, h, None, None)?;
+                }
+            }
+            if let Some(li) = &mut layer.looped {
+                for (g, kind) in li.gates.iter_mut().zip(["attn", "k", "v", "mlp"]) {
+                    let q = format!("{p}controllers.{kind}.");
+                    ad.attach(&mut g.down, &format!("{q}down_weight"), rank, 2 * h, None, None)?;
+                    ad.attach(&mut g.forget, &format!("{q}forget_weight"), h, rank, None, None)?;
+                    ad.attach(&mut g.gain, &format!("{q}gain_weight"), h, rank, None, None)?;
+                }
+            }
+        }
+        ad.attach(&mut self.lm_head, "lm_head", v, h, None, None)?;
+        ad.finish()
+    }
+
     pub fn new_session(&self) -> Inkling2Session {
         let c = &self.cfg;
         let back = c.conv_kernel_size - 1;

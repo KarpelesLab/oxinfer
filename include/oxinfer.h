@@ -153,6 +153,13 @@ int64_t oxi_cache_remove(const char *cache_dir, const char *name);
  *                        decision assets, on the multimodal Qwen/Qwen3.5-9B).
  *   interventions=JSON|@FILE  runtime interventions from the first message on (the JSON of
  *                        oxi_engine_set_interventions, on one line, or @ and a file holding it)
+ *   lora=FILE[:SCALE]    Qwen, Llama, Gemma, Inkling-2: a LoRA adapter applied at run time
+ *                        (repeatable, one per line; scale 1): a PEFT folder (adapter_config.json +
+ *                        adapter_model.safetensors, or ORG/NAME holding one) or a llama.cpp GGUF
+ *                        adapter for a GGUF base of its architecture (ORG/NAME/FILE.gguf works).
+ *                        lora=none clears the list; a JSON array of specs adds them all.
+ *   lora_merge=1         merge the LoRA updates into the weights instead (float weights: exact;
+ *                        quantized ones re-quantized, GGUF blocks as Q8; strengths become fixed)
  * Returns NULL on error. */
 OxiEngine *oxi_engine_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
 
@@ -306,6 +313,16 @@ char *oxi_decide_info_json(OxiEngine *engine);
  * Vector files: safetensors with `layers.N` (the output of layer N), llama.cpp / repeng GGUF
  * control vectors (`direction.N`, same meaning) or torch .pt. Returns 0 or -1. */
 int oxi_engine_set_interventions(OxiEngine *engine, const char *spec_json);
+
+/* The LoRA adapters attached at load (lora= options) as a JSON array of {"index", "path",
+ * "format" ("peft" or "gguf"), "rank", "alpha", "strength", "modules", "merged", "bytes",
+ * "skipped"}. Free with oxi_string_free. */
+char *oxi_engine_loras_json(OxiEngine *engine);
+
+/* Sets the strength of LoRA adapter `index` (0 switches it off: exactly the base model) for the
+ * following messages; the conversation starts again. Returns 0, or -1 for no such adapter or one
+ * merged into the weights (lora_merge=1). */
+int oxi_engine_set_lora_strength(OxiEngine *engine, size_t index, float strength);
 
 /* The interventions in effect as JSON ("null" when none). Free with oxi_string_free. */
 char *oxi_engine_interventions_json(OxiEngine *engine);

@@ -918,8 +918,8 @@ impl<'a> QwenModel<'a> {
 
     /// Attaches the modules of a runtime LoRA adapter (see `crate::lora`) to the layers they
     /// target, by Hugging Face module name (whatever the checkpoint format; GGUF's tiled Gated
-    /// DeltaNet value heads are reordered to match). Errors when a module matches no layer or
-    /// has another shape. Returns the number of layers patched.
+    /// DeltaNet value heads are reordered to match), and to the token embedding. Errors when a
+    /// module matches no layer or has another shape. Returns the number of layers patched.
     pub fn attach_lora(&mut self, ad: &mut crate::lora::LoraAdapter) -> Result<usize> {
         use crate::lora::tiled_v_rows;
         let cfg = &self.cfg;
@@ -941,19 +941,18 @@ impl<'a> QwenModel<'a> {
         let paired = cfg.rope_interleaved;
         let q_rows = paired.then(|| crate::lora::rope_pair_rows(nh, hd));
         let k_rows = paired.then(|| crate::lora::rope_pair_rows(nkv, hd));
+        if let Some(d) = ad.take_embed(cfg.vocab_size, h)? {
+            self.embed.add_lora(d);
+        }
         // Routed experts: one update per expert, in either PEFT layout.
         for (l, layer) in self.layers.iter_mut().enumerate() {
             if let Ffn::Moe(moe) = &mut layer.ffn {
                 ad.attach_experts(&mut moe.experts, &format!("layers.{l}.mlp.experts"), h)?;
             }
         }
-        let mut set =
-            |lin: &mut Lin<'a>, name: String, n_out: usize, n_in: usize, rows: Option<&[usize]>, cols: Option<&[usize]>| -> Result<()> {
-                if let Some(d) = ad.take(&name, n_out, n_in, rows, cols)? {
-                    lin.set_lora(Some(d));
-                }
-                Ok(())
-            };
+        let mut set = |lin: &mut Lin<'a>, name: String, n_out: usize, n_in: usize, rows: Option<&[usize]>, cols: Option<&[usize]>| {
+            ad.attach(lin, &name, n_out, n_in, rows, cols)
+        };
         for (l, layer) in self.layers.iter_mut().enumerate() {
             let lp = format!("layers.{l}.");
             match &mut layer.mixer {

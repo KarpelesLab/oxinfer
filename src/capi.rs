@@ -511,6 +511,47 @@ pub unsafe extern "C" fn oxi_decide_info_json(e: *mut OxiEngine) -> *mut c_char 
     })
 }
 
+// ---- LoRA adapters --------------------------------------------------------------------------
+
+/// The LoRA adapters attached at load (`lora=` options) as a JSON array of `{"index", "path",
+/// "format", "rank", "alpha", "strength", "modules", "merged", "bytes", "skipped"}`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_engine_loras_json(e: *mut OxiEngine) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let g = lock(unsafe { engine(e) }?);
+        let v: Vec<serde_json::Value> = g
+            .loras()
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                serde_json::json!({
+                    "index": i,
+                    "path": l.path.to_string_lossy(),
+                    "format": l.format,
+                    "rank": l.rank,
+                    "alpha": l.alpha,
+                    "strength": l.strength_now(),
+                    "modules": l.modules,
+                    "merged": l.merged,
+                    "bytes": l.bytes,
+                    "skipped": l.skipped,
+                })
+            })
+            .collect();
+        Ok(out_string(serde_json::Value::Array(v).to_string()))
+    })
+}
+
+/// Sets the strength of LoRA adapter `index` (0 switches it off); the conversation starts again.
+/// Returns 0 or -1 (no such adapter, or one merged into the weights).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_engine_set_lora_strength(e: *mut OxiEngine, index: usize, strength: f32) -> c_int {
+    guard(-1, || {
+        lock(unsafe { engine(e) }?).set_lora_strength(index, strength)?;
+        Ok(0)
+    })
+}
+
 // ---- runtime interventions ------------------------------------------------------------------
 
 /// Sets the runtime interventions (a `crate::intervene::Spec` as JSON; NULL or "" removes them).

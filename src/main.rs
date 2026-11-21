@@ -346,6 +346,12 @@ fn usage() -> ! {
          \x20 --mmproj FILE|none   Mistral Large 4, Qwen3.5-family (Qwen3.8-Flash-Next): the vision tower\n\
          \x20                      (llama.cpp mmproj GGUF, path or org/repo/file; default: the checkpoint's,\n\
          \x20                      or the mmproj*.gguf beside a GGUF model), or none\n\
+         \x20 --lora FILE[:SCALE]  Qwen, Llama, Gemma, Inkling-2: a LoRA adapter applied at run time\n\
+         \x20                      (repeatable; scale 1): a PEFT folder (adapter_config.json +\n\
+         \x20                      adapter_model.safetensors, or org/repo holding one) or a llama.cpp\n\
+         \x20                      GGUF adapter (for a GGUF base of its architecture; org/repo/file.gguf)\n\
+         \x20 --lora-merge         merge the LoRA updates into the weights at load (float weights: exact;\n\
+         \x20                      quantized ones are re-quantized, GGUF blocks as Q8)\n\
          \x20 --cache-dir DIR      where fetched models are cached\n\
          \x20 --download-only      fetch the model (and drafter) and exit\n\
          \x20 --save-quantized DIR write a checkpoint with the weights already quantized to --quant (loads\n\
@@ -1401,8 +1407,9 @@ fn main() -> Result<()> {
         let spec = d.to_string_lossy().to_string();
         args.mtp_from = Some(resolve_model(&spec, args.cache_dir.as_deref())?);
     }
+    // A file, or a PEFT adapter folder (language models) fetched as one.
     for l in &mut args.loras {
-        l.path = resolve_file(&l.path.to_string_lossy(), args.cache_dir.as_deref())?;
+        l.path = oxinfer::lora::resolve(&l.path.to_string_lossy(), args.cache_dir.as_deref())?;
     }
     if args.download_only {
         eprintln!("[model at {}]", args.model.display());
@@ -1461,6 +1468,8 @@ fn run_session(args: &Args) -> Result<()> {
         opts.set("prompt_cache", p)?;
     }
     opts.prompt_cache_gb = args.prompt_cache_gb;
+    opts.loras = args.loras.clone();
+    opts.lora_merge = args.moss.lora_merge;
     let mut e = Engine::load(&args.model.to_string_lossy(), &opts)?;
     let info = e.info().clone();
     eprintln!(
@@ -1590,6 +1599,8 @@ fn run_decide(args: &Args) -> Result<()> {
     opts.prefill_chunk = args.prefill_chunk;
     opts.cache_dir = args.cache_dir.clone();
     opts.decision_from = args.decision_from.clone();
+    opts.loras = args.loras.clone();
+    opts.lora_merge = args.moss.lora_merge;
     opts.stream_mode = match (args.stream, args.no_stream) {
         (true, _) => oxinfer::engine::StreamMode::On,
         (_, true) => oxinfer::engine::StreamMode::Off,
@@ -1824,6 +1835,32 @@ fn run(mut args: Args) -> Result<()> {
     if model_type == "multi_modality" {
         return janus_cli::run(&args);
     }
+    let adaptable = matches!(
+        model_type.as_str(),
+        "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" | "gemma3" | "gemma3_text"
+    ) || matches!(
+        model_type.as_str(),
+        "qwen3"
+            | "qwen3_5"
+            | "qwen3_5_text"
+            | "qwen3_5_moe"
+            | "qwen3_5_moe_text"
+            | "qwen3_6"
+            | "qwen3_8"
+            | "qwen2"
+            | "qwen2_5_vl"
+            | "qwen3_vl"
+            | "qwen4_exp"
+            | "qwen4_exp_text"
+            | "lfm3"
+            | "lfm3_omni"
+            | "llama"
+            | "granite"
+    ) || model_type.starts_with("minimax")
+        || oxinfer::inkling::is_model_type(&model_type);
+    if !args.loras.is_empty() && !adaptable {
+        bail!("--lora: LoRA adapters are supported for Qwen, Llama, Gemma and Inkling-2 models, not {model_type}");
+    }
     match model_type.as_str() {
         "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" | "gemma3" | "gemma3_text" => run_gemma(args),
         "qwen3" | "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6" | "qwen3_8" | "qwen2" | "qwen2_5_vl"
@@ -1846,6 +1883,15 @@ fn run(mut args: Args) -> Result<()> {
         "raon1_nano" => run_raon(args),
         other => bail!("unsupported model_type {other}"),
     }
+}
+
+/// Attaches the `--lora` adapters to a language model (see `oxinfer::lora`), merged with
+/// `--lora-merge`.
+fn attach_loras<M: oxinfer::lora::Adaptable>(args: &Args, model: &mut M) -> Result<()> {
+    for l in oxinfer::lora::attach_specs(model, &args.loras, &args.model, args.moss.lora_merge)? {
+        eprintln!("[LoRA {}]", l.summary());
+    }
+    Ok(())
 }
 
 /// The system prompt in effect: `--system`, else the default one (unless `--no-system`, a raw
@@ -2335,6 +2381,7 @@ fn run_qwen(mut args: Args) -> Result<()> {
     let eos = config::load_eos_ids(&args.model);
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
     let mut model = qwen::QwenModel::load(cfg, &files, args.quant)?;
+    attach_loras(&args, &mut model)?;
     let tok = load_tokenizer(&args.model)?;
     let qwen2_fmt;
     let model_type = config::model_type(&args.model)?;
@@ -3007,6 +3054,7 @@ fn run_inkling(mut args: Args) -> Result<()> {
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
     let mut model = oxinfer::inkling::Inkling2Model::load(cfg, &files, args.quant)?;
     model.kv = args.kv_cache;
+    attach_loras(&args, &mut model)?;
     // Prompt lookup verifies a draft in one pass and rolls back what the model refutes: the
     // convolutions cannot go back to an earlier position.
     if args.lookup == Some(true) {
@@ -3709,6 +3757,7 @@ fn run_gemma(mut args: Args) -> Result<()> {
     let eos = config::load_eos_ids(&args.model);
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
     let mut model = Model::load(cfg, &files, args.quant)?;
+    attach_loras(&args, &mut model)?;
     let streamer = if args.stream {
         Some(start_stream(&args, |o| oxinfer::stream::attach_gemma(&mut model, &files, o))?)
     } else {

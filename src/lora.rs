@@ -10,7 +10,18 @@
 //!
 //! Keys are PEFT's: `base_model.model.<module path>.lora_A.weight` (`[r, in]`) and `.lora_B.weight`
 //! (`[out, r]`). Module paths are matched from `layers.N.` on (the `model.` / `model.language_model.`
-//! prefix differs between the text-only and the multimodal classes) or as `lm_head`.
+//! prefix differs between the text-only and the multimodal classes) or as `lm_head`. The token
+//! embedding's `lora_embedding_A` (`[r, vocab]`) / `lora_embedding_B` (`[hidden, r]`) go on the
+//! embedding table ([`EmbedDelta`]).
+//!
+//! llama.cpp's GGUF adapters (`convert_lora_to_gguf.py`) are read too ([`gguf`]): their tensor
+//! names are mapped to the same module paths, their layout is the base GGUF file's.
+//!
+//! User adapters ([`attach_specs`], `--lora FILE[:SCALE]`, the engine's `lora` option) are on from
+//! load with a strength (the `:SCALE`, a factor on `alpha / r` that can change at run time; 0 is
+//! the base model's code path), several of them chain on the same layer, and with merging on
+//! ([`LoraAdapter::set_merge`]) updates go into the weights instead where the weight allows it
+//! ([`crate::model::Lin::merge_lora`]).
 //!
 //! Routed MoE experts (Qwen MoE: `layers.N.mlp.experts`, Gemma 4 26B-A4B: `layers.N.experts`) are
 //! adapted per expert, in either layout PEFT produces for them ([`LoraAdapter::attach_experts`]):
@@ -38,9 +49,14 @@ use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-/// The low-rank update of one linear layer, attached to its `Lin`.
+mod gguf;
+
+pub use crate::sd::lora::LoraSpec;
+
+/// The low-rank update of one linear layer, attached to its `Lin`. Several adapters on the same
+/// layer chain their updates ([`LoraDelta::push`]).
 pub struct LoraDelta {
     /// `[r, n_in]`
     a: Vec<f32>,
@@ -51,6 +67,25 @@ pub struct LoraDelta {
     n_out: usize,
     scale: f32,
     active: Arc<AtomicBool>,
+    /// The adapter's strength (`f32` bits): a factor on `scale` that can change at run time (0
+    /// turns the update off).
+    gain: Arc<AtomicU32>,
+    /// The update of the next adapter on the same layer.
+    next: Option<Box<LoraDelta>>,
+}
+
+/// A strength of 1 (the bits of `1.0f32`), for an adapter's [`LoraAdapter::gain`].
+pub(crate) fn unit_gain() -> Arc<AtomicU32> {
+    Arc::new(AtomicU32::new(1f32.to_bits()))
+}
+
+/// The strength `on` and `gain` give an update of `scale` now.
+#[inline]
+fn strength(on: &AtomicBool, gain: &AtomicU32, scale: f32) -> f32 {
+    if !on.load(Ordering::Relaxed) {
+        return 0.0;
+    }
+    scale * f32::from_bits(gain.load(Ordering::Relaxed))
 }
 
 impl LoraDelta {
@@ -74,21 +109,77 @@ impl LoraDelta {
             n_out,
             scale: 1.0,
             active: Arc::new(AtomicBool::new(true)),
+            gain: unit_gain(),
+            next: None,
         }
     }
 
+    /// The strength this update alone is applied with now (0 when its adapter is off).
+    #[inline]
+    fn strength(&self) -> f32 {
+        strength(&self.active, &self.gain, self.scale)
+    }
+
+    /// Whether this update or one chained after it is switched on (with a nonzero strength).
     #[inline]
     pub(crate) fn is_active(&self) -> bool {
-        self.active.load(Ordering::Relaxed)
+        self.strength() != 0.0 || self.next.as_ref().is_some_and(|n| n.is_active())
     }
 
-    /// Parameter bytes held (f32).
+    /// Chains `d` after this update (and those already chained).
+    pub(crate) fn push(&mut self, d: Box<LoraDelta>) {
+        match &mut self.next {
+            Some(n) => n.push(d),
+            None => self.next = Some(d),
+        }
+    }
+
+    /// Parameter bytes held (f32), chained updates included.
     pub fn bytes(&self) -> usize {
-        (self.a.len() + self.bt.len()) * 4
+        (self.a.len() + self.bt.len()) * 4 + self.next.as_ref().map_or(0, |n| n.bytes())
     }
 
-    /// `y += scale * B (A x)` for `t` rows of `x` (`[t, n_in]`) into `y` (`[t, n_out]`).
+    /// The layer's shape, `(n_out, n_in)`.
+    pub(crate) fn shape(&self) -> (usize, usize) {
+        (self.n_out, self.n_in)
+    }
+
+    /// `w += s * B A` (this update alone, `s` its scale times its adapter's strength) for the
+    /// weight `w` (`[n_out, n_in]`, row-major): the update merged into a float copy of the weight.
+    pub(crate) fn merge_into(&self, w: &mut [f32]) {
+        let (r, n_in, n_out) = (self.r, self.n_in, self.n_out);
+        assert_eq!(w.len(), n_out * n_in, "LoRA merge shape mismatch");
+        let s = self.scale * f32::from_bits(self.gain.load(Ordering::Relaxed));
+        let wp = SendPtr(w.as_mut_ptr());
+        const ROWS: usize = 64;
+        pool::run(n_out.div_ceil(ROWS), &|j| {
+            for o in j * ROWS..((j + 1) * ROWS).min(n_out) {
+                // SAFETY: each row of w is written by one item.
+                let row = unsafe { std::slice::from_raw_parts_mut(wp.get().add(o * n_in), n_in) };
+                for k in 0..r {
+                    let c = s * self.bt[k * n_out + o];
+                    for (v, &a) in row.iter_mut().zip(&self.a[k * n_in..(k + 1) * n_in]) {
+                        *v += c * a;
+                    }
+                }
+            }
+        });
+    }
+
+    /// `y += scale * B (A x)` for `t` rows of `x` (`[t, n_in]`) into `y` (`[t, n_out]`), for each
+    /// chained update that is switched on.
     pub(crate) fn apply(&self, x: &[f32], t: usize, y: &mut [f32]) {
+        let s = self.strength();
+        if s != 0.0 {
+            self.apply_one(x, t, y, s);
+        }
+        if let Some(n) = &self.next {
+            n.apply(x, t, y);
+        }
+    }
+
+    /// `y += scale * B (A x)` for this update alone.
+    fn apply_one(&self, x: &[f32], t: usize, y: &mut [f32], scale: f32) {
         let (r, n_in, n_out) = (self.r, self.n_in, self.n_out);
         assert_eq!(x.len(), t * n_in, "LoRA input shape mismatch");
         assert_eq!(y.len(), t * n_out, "LoRA output shape mismatch");
@@ -124,7 +215,7 @@ impl LoraDelta {
                 }
             }
             for v in ug.iter_mut() {
-                *v *= self.scale;
+                *v *= scale;
             }
         });
         // y += u B^T over (token group, column block) items.
@@ -172,6 +263,57 @@ impl LoraDelta {
                 }
             }
         });
+    }
+}
+
+/// The low-rank update of a token embedding table: row `t` gets `scale * B a_t`, `a_t` row `t`
+/// of the adapter's `[vocab, r]` table (PEFT's `lora_embedding_A` transposed, llama.cpp's
+/// `token_embd.weight.lora_a`) and `B` `[hidden, r]`. Attached to the table
+/// ([`crate::model::Table::add_lora`]); always applied at run time (it costs `r * hidden` per
+/// token looked up).
+pub struct EmbedDelta {
+    /// `[vocab, r]`
+    a: Vec<f32>,
+    /// `[r, hidden]`
+    bt: Vec<f32>,
+    r: usize,
+    vocab: usize,
+    hidden: usize,
+    scale: f32,
+    active: Arc<AtomicBool>,
+    gain: Arc<AtomicU32>,
+    next: Option<Box<EmbedDelta>>,
+}
+
+impl EmbedDelta {
+    /// Adds the update of every chained adapter that is on to `out`, the row of token `tok`.
+    pub(crate) fn add_row(&self, tok: usize, out: &mut [f32]) {
+        let s = strength(&self.active, &self.gain, self.scale);
+        if s != 0.0 && tok < self.vocab && out.len() == self.hidden {
+            let at = &self.a[tok * self.r..(tok + 1) * self.r];
+            for (k, &ak) in at.iter().enumerate() {
+                let c = s * ak;
+                for (o, &b) in out.iter_mut().zip(&self.bt[k * self.hidden..(k + 1) * self.hidden]) {
+                    *o += c * b;
+                }
+            }
+        }
+        if let Some(n) = &self.next {
+            n.add_row(tok, out);
+        }
+    }
+
+    /// Chains `d` after this update.
+    pub(crate) fn push(&mut self, d: Box<EmbedDelta>) {
+        match &mut self.next {
+            Some(n) => n.push(d),
+            None => self.next = Some(d),
+        }
+    }
+
+    /// Parameter bytes held (f32), chained updates included.
+    pub fn bytes(&self) -> usize {
+        (self.a.len() + self.bt.len()) * 4 + self.next.as_ref().map_or(0, |n| n.bytes())
     }
 }
 
@@ -429,22 +571,57 @@ fn is_stacked(key: &str) -> bool {
 /// A PEFT LoRA adapter, loaded and waiting to be attached to a model ([`LoraAdapter::take`] by
 /// module, then [`LoraAdapter::finish`]).
 pub struct LoraAdapter {
+    /// The adapter folder (PEFT) or file (GGUF).
     pub dir: PathBuf,
-    /// Rank from the config (zero-padded components are dropped per module on load).
+    /// Rank from the config (zero-padded components are dropped per module on load); a GGUF
+    /// adapter's largest rank.
     pub rank: usize,
     pub alpha: f32,
-    /// `alpha / r` (or `alpha / sqrt(r)` with rsLoRA).
+    /// `alpha / r` (or `alpha / sqrt(r)` with rsLoRA). A GGUF adapter whose tensors have
+    /// different ranks has each one's `alpha / r` folded into its `B` at load and 1 here.
     pub scale: f32,
     pub target_modules: Vec<String>,
+    /// `peft` or `gguf`.
+    pub format: &'static str,
+    /// GGUF adapters: the tensors that were skipped (norm vectors, which llama.cpp ignores too).
+    pub skipped: Vec<String>,
     modules: BTreeMap<String, Pair>,
+    /// The token embedding's update.
+    embed: Option<EmbedPair>,
+    /// The tensors are in the layout of the base model's GGUF file (a llama.cpp adapter): rows
+    /// and columns a GGUF checkpoint reorders are already in its order.
+    stored_order: bool,
     active: Arc<AtomicBool>,
+    /// The adapter's strength (the user scale), shared by its attached updates.
+    gain: Arc<AtomicU32>,
+    /// Merge the updates into the weights at attach time where the weight allows it.
+    merge: bool,
     attached: usize,
+    merged: usize,
     bytes: usize,
+}
+
+/// An embedding update before it is attached: `a` `[vocab, r]`, `b` `[hidden, r]`.
+struct EmbedPair {
+    a: Vec<f32>,
+    b: Vec<f32>,
+    r: usize,
+    vocab: usize,
+    hidden: usize,
 }
 
 /// Whether `dir` holds a PEFT adapter.
 pub fn is_adapter_dir(dir: &Path) -> bool {
     dir.join("adapter_config.json").is_file() && dir.join("adapter_model.safetensors").is_file()
+}
+
+/// Whether PEFT module path `module` is the token embedding of the language model.
+fn is_embedding(module: &str) -> bool {
+    let m = module.strip_prefix("base_model.model.").unwrap_or(module);
+    ["model.language_model.", "language_model.model.", "language_model.", "model.", ""]
+        .iter()
+        .any(|p| m.strip_prefix(p) == Some("embed_tokens"))
+        || m == "model.llm.embed"
 }
 
 /// The module path of a PEFT key, from `layers.` on, or `lm_head`; None for keys of other parts
@@ -454,7 +631,15 @@ fn canonical(module: &str) -> Option<String> {
     if m == "lm_head" || m.ends_with(".lm_head") && !m.contains("layers.") {
         return Some("lm_head".into());
     }
-    for p in ["model.language_model.", "language_model.model.", "language_model.", "model.", ""] {
+    // (`model.llm.`: Inkling-2.)
+    for p in [
+        "model.language_model.",
+        "language_model.model.",
+        "language_model.",
+        "model.llm.",
+        "model.",
+        "",
+    ] {
         if let Some(rest) = m.strip_prefix(p)
             && rest.starts_with("layers.")
         {
@@ -529,7 +714,25 @@ impl LoraAdapter {
         let path = dir.join("adapter_model.safetensors");
         let st = SafeTensors::open(&path, true)?;
         let mut halves: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
+        // The embedding's `lora_embedding_A` (`[r, vocab]`) and `lora_embedding_B` (`[hidden, r]`).
+        let mut emb: (Option<String>, Option<String>) = (None, None);
         for name in st.names() {
+            let ea = name
+                .strip_suffix(".lora_embedding_A")
+                .or_else(|| name.strip_suffix(".lora_embedding_A.default"));
+            let eb = name
+                .strip_suffix(".lora_embedding_B")
+                .or_else(|| name.strip_suffix(".lora_embedding_B.default"));
+            if let Some(m) = ea.or(eb) {
+                if !is_embedding(m) {
+                    bail!("{}: {name} is not the language model's token embedding", path.display());
+                }
+                let slot = if ea.is_some() { &mut emb.0 } else { &mut emb.1 };
+                if slot.replace(name.clone()).is_some() {
+                    bail!("{}: two embedding updates", path.display());
+                }
+                continue;
+            }
             let (module, is_a) = if let Some(m) = name
                 .strip_suffix(".lora_A.weight")
                 .or_else(|| name.strip_suffix(".lora_A.default.weight"))
@@ -579,20 +782,168 @@ impl LoraAdapter {
                 bail!("{}: module {key} appears twice", path.display());
             }
         }
-        if modules.is_empty() {
+        let embed = match emb {
+            (None, None) => None,
+            (Some(an), Some(bn)) => {
+                let (at, ash) = tensor_f32(&st, &an)?;
+                let (b, bsh) = tensor_f32(&st, &bn)?;
+                if ash.len() != 2 || bsh.len() != 2 || ash[0] != bsh[1] {
+                    bail!(
+                        "{}: lora_embedding_A {ash:?} and lora_embedding_B {bsh:?} do not form a low-rank pair",
+                        path.display()
+                    );
+                }
+                let (r, vocab, hidden) = (ash[0], ash[1], bsh[0]);
+                let mut a = vec![0f32; vocab * r];
+                for k in 0..r {
+                    for t in 0..vocab {
+                        a[t * r + k] = at[k * vocab + t];
+                    }
+                }
+                bytes += (a.len() + b.len()) * 4;
+                Some(EmbedPair { a, b, r, vocab, hidden })
+            }
+            _ => bail!(
+                "{}: the embedding update lacks its lora_embedding_A or lora_embedding_B",
+                path.display()
+            ),
+        };
+        if modules.is_empty() && embed.is_none() {
             bail!("{}: no LoRA modules", path.display());
         }
-        Ok(Self {
+        let mut ad = Self::empty(dir, "peft", rank, alpha, scale);
+        ad.target_modules = target_modules;
+        ad.modules = modules;
+        ad.embed = embed;
+        ad.bytes = bytes;
+        Ok(ad)
+    }
+
+    /// An adapter without modules, switched off.
+    fn empty(dir: &Path, format: &'static str, rank: usize, alpha: f32, scale: f32) -> Self {
+        Self {
             dir: dir.to_path_buf(),
             rank,
             alpha,
             scale,
-            target_modules,
-            modules,
+            target_modules: Vec::new(),
+            format,
+            skipped: Vec::new(),
+            modules: BTreeMap::new(),
+            embed: None,
+            stored_order: false,
             active: Arc::new(AtomicBool::new(false)),
+            gain: unit_gain(),
+            merge: false,
             attached: 0,
-            bytes,
-        })
+            merged: 0,
+            bytes: 0,
+        }
+    }
+
+    /// Loads a llama.cpp LoRA adapter (`general.type = adapter`, `adapter.type = lora`, as
+    /// `convert_lora_to_gguf.py` writes them) for the base model whose GGUF header is `base`:
+    /// see [`gguf`]. Its tensors are named after the base file's (`blk.N.attn_output.weight.lora_a`)
+    /// and laid out as stored there, so it only goes on a GGUF base of the same architecture.
+    pub fn load_gguf(path: &Path, base: &crate::gguf::Header) -> Result<Self> {
+        gguf::load(path, base)
+    }
+
+    /// A PEFT adapter folder (or its `adapter_model.safetensors`), or a llama.cpp GGUF adapter
+    /// file, for the base model at `base` (a directory or a `.gguf` file).
+    pub fn open(path: &Path, base: &Path) -> Result<Self> {
+        if crate::gguf::is_gguf(path) {
+            if !crate::gguf::is_gguf(base) {
+                bail!(
+                    "{}: a llama.cpp (GGUF) LoRA adapter goes on a GGUF base model (its tensors are laid out as the base file's), \
+                     not on {}; use the adapter's PEFT form (adapter_config.json + adapter_model.safetensors) for other checkpoints",
+                    path.display(),
+                    base.display()
+                );
+            }
+            let h = crate::gguf::header(base)?;
+            return Self::load_gguf(path, &h);
+        }
+        let dir = if path.is_file() && path.file_name().is_some_and(|n| n == "adapter_model.safetensors") {
+            path.parent().unwrap_or(Path::new("."))
+        } else {
+            path
+        };
+        if !is_adapter_dir(dir) {
+            bail!(
+                "{}: not a language-model LoRA adapter (a PEFT folder with adapter_config.json and adapter_model.safetensors, \
+                 or a llama.cpp GGUF adapter)",
+                path.display()
+            );
+        }
+        Self::load(dir)
+    }
+
+    /// Sets the strength (the user scale: the updates are `strength * scale * B A x`), and
+    /// switches the adapter on for good (unlike the decision adapters, which are switched per
+    /// request).
+    pub fn set_strength(&mut self, s: f32) {
+        self.gain.store(s.to_bits(), Ordering::Relaxed);
+        self.active.store(true, Ordering::Relaxed);
+    }
+
+    /// Merge the updates into the weights as they are attached (see [`LoraAdapter::put`]).
+    pub fn set_merge(&mut self, on: bool) {
+        self.merge = on;
+    }
+
+    /// The strength handle shared by the attached updates (`f32` bits).
+    pub fn gain(&self) -> Arc<AtomicU32> {
+        self.gain.clone()
+    }
+
+    /// How many of the attached updates were merged into their weights.
+    pub fn merged(&self) -> usize {
+        self.merged
+    }
+
+    /// Attaches update `d` to `lin`: merged into the weight when merging is on and the weight
+    /// allows it ([`crate::model::Lin::merge_lora`]), else chained as a runtime update.
+    pub(crate) fn put(&mut self, lin: &mut crate::model::Lin, d: Box<LoraDelta>) -> Result<()> {
+        if self.merge && lin.merge_lora(&d)? {
+            self.merged += 1;
+            return Ok(());
+        }
+        lin.add_lora(d);
+        Ok(())
+    }
+
+    /// Takes the token embedding's update for a table of `vocab x hidden` (None when the
+    /// adapter has none). Errors on another shape.
+    pub fn take_embed(&mut self, vocab: usize, hidden: usize) -> Result<Option<Box<EmbedDelta>>> {
+        let Some(p) = self.embed.take() else {
+            return Ok(None);
+        };
+        if p.vocab != vocab || p.hidden != hidden {
+            bail!(
+                "LoRA embedding update is [{} x {}] but the model's embedding is [{vocab} x {hidden}]: the adapter is for another base model",
+                p.vocab,
+                p.hidden
+            );
+        }
+        let mut bt = vec![0f32; p.r * hidden];
+        for o in 0..hidden {
+            for k in 0..p.r {
+                bt[k * hidden + o] = p.b[o * p.r + k];
+            }
+        }
+        self.attached += 1;
+        Ok(Some(Box::new(EmbedDelta {
+            a: p.a,
+            bt,
+            r: p.r,
+            vocab,
+            hidden,
+            scale: self.scale,
+            active: self.active.clone(),
+            gain: self.gain.clone(),
+            next: None,
+        })))
     }
 
     /// The switch shared by every attached module (off at load).
@@ -616,7 +967,8 @@ impl LoraAdapter {
 
     /// Takes the update of module `name` for a layer of `n_out x n_in`, or None when the adapter
     /// does not target it. `rows[p]` / `cols[p]`, when given, name the adapter's row / column
-    /// that the model stores at `p` (checkpoints that reorder heads, e.g. GGUF).
+    /// that the model stores at `p` (checkpoints that reorder heads, e.g. GGUF); a GGUF adapter
+    /// is already in the stored order and ignores them.
     pub fn take(
         &mut self,
         name: &str,
@@ -629,6 +981,22 @@ impl LoraAdapter {
             return Ok(None);
         };
         Ok(Some(self.delta(p, rows, cols)))
+    }
+
+    /// [`LoraAdapter::take`], attaching the update to `lin` ([`LoraAdapter::put`]).
+    pub(crate) fn attach(
+        &mut self,
+        lin: &mut crate::model::Lin,
+        name: &str,
+        n_out: usize,
+        n_in: usize,
+        rows: Option<&[usize]>,
+        cols: Option<&[usize]>,
+    ) -> Result<()> {
+        if let Some(d) = self.take(name, n_out, n_in, rows, cols)? {
+            self.put(lin, d)?;
+        }
+        Ok(())
     }
 
     /// The pair of module `name`, checked against a layer of `n_out x n_in`.
@@ -648,6 +1016,7 @@ impl LoraAdapter {
 
     /// The update of `p`, counted as attached (`rows` / `cols` as in [`LoraAdapter::take`]).
     fn delta(&mut self, p: Pair, rows: Option<&[usize]>, cols: Option<&[usize]>) -> Box<LoraDelta> {
+        let (rows, cols) = if self.stored_order { (None, None) } else { (rows, cols) };
         let (r, n_in, n_out) = (p.r, p.n_in, p.n_out);
         let mut a = p.a;
         if let Some(cols) = cols {
@@ -674,13 +1043,17 @@ impl LoraAdapter {
             n_out,
             scale: self.scale,
             active: self.active.clone(),
+            gain: self.gain.clone(),
+            next: None,
         })
     }
 
     /// Attaches the adapter's modules for the routed experts `ex` of a MoE layer, whose module
     /// path is `name` (`layers.N.mlp.experts`, `layers.N.experts`), in either PEFT layout (see
-    /// the module docs): each expert's weights get their own update, applied to the tokens
-    /// routed to that expert. Errors on a module that fits no expert weight.
+    /// the module docs) or one module per expert with fused gate/up rows (`name.E.gate_up_proj`,
+    /// how a GGUF adapter's `ffn_gate_up_exps` stack is taken apart): each expert's weights get
+    /// their own update, applied to the tokens routed to that expert. Errors on a module that
+    /// fits no expert weight.
     pub(crate) fn attach_experts(&mut self, ex: &mut crate::moe::Experts, name: &str, h: usize) -> Result<()> {
         use crate::moe::GateUp;
         let (ne, mi) = (ex.n_experts(), ex.inter);
@@ -727,20 +1100,32 @@ impl LoraAdapter {
             key.push_str(".base_layer");
         }
         // One module per expert.
-        for (e, pe) in pairs.iter_mut().enumerate() {
+        for (e, (pe, fe)) in pairs.iter_mut().zip(fused.iter_mut()).enumerate() {
             for (i, (m, n_out, n_in)) in [("gate_proj", mi, h), ("up_proj", mi, h), ("down_proj", h, mi)]
                 .into_iter()
                 .enumerate()
             {
                 let key = format!("{name}.{e}.{m}");
                 if let Some(p) = self.take_pair(&key, n_out, n_in)? {
-                    if (i < 2 && fused[e].is_some()) || pe[i].is_some() {
+                    if (i < 2 && fe.is_some()) || pe[i].is_some() {
                         bail!("LoRA module {key}: the adapter also targets the stacked parameter of this weight");
                     }
                     pe[i] = Some(p);
                 }
             }
+            let key = format!("{name}.{e}.gate_up_proj");
+            if let Some(p) = self.take_pair(&key, 2 * mi, h)? {
+                if fe.is_some() || pe[0].is_some() || pe[1].is_some() {
+                    bail!("LoRA module {key}: the adapter targets this expert's gate / up weights twice");
+                }
+                *fe = Some(p);
+            }
         }
+        // Interleaved gate/up rows (Inkling-2's `w13_weight`): stored row `2j` is gate row `j`,
+        // `2j + 1` up row `j`.
+        let interleave: Option<Vec<usize>> = ex
+            .interleaved
+            .then(|| (0..2 * mi).map(|p| if p % 2 == 0 { p / 2 } else { mi + p / 2 }).collect());
         for (e, (([gate, up, down], fused), gu)) in pairs.into_iter().zip(fused).zip(ex.gate_up.iter_mut()).enumerate() {
             match gu {
                 GateUp::Fused(l) => {
@@ -750,7 +1135,8 @@ impl LoraAdapter {
                         None => None,
                     };
                     if let Some(p) = p {
-                        l.set_lora(Some(self.delta(p, None, None)));
+                        let d = self.delta(p, interleave.as_deref(), None);
+                        self.put(l, d)?;
                     }
                 }
                 GateUp::Split(g, u) => {
@@ -762,15 +1148,18 @@ impl LoraAdapter {
                         None => (gate, up),
                     };
                     if let Some(p) = gate {
-                        g.set_lora(Some(self.delta(p, None, None)));
+                        let d = self.delta(p, None, None);
+                        self.put(g, d)?;
                     }
                     if let Some(p) = up {
-                        u.set_lora(Some(self.delta(p, None, None)));
+                        let d = self.delta(p, None, None);
+                        self.put(u, d)?;
                     }
                 }
             }
             if let Some(p) = down {
-                ex.down[e].set_lora(Some(self.delta(p, None, None)));
+                let d = self.delta(p, None, None);
+                self.put(&mut ex.down[e], d)?;
             }
         }
         Ok(())
@@ -785,6 +1174,12 @@ impl LoraAdapter {
                 self.modules.len()
             );
         }
+        if self.embed.is_some() {
+            bail!(
+                "LoRA adapter {}: it updates the token embedding, which this model does not take an update on",
+                self.dir.display()
+            );
+        }
         Ok(self.attached)
     }
 
@@ -792,6 +1187,160 @@ impl LoraAdapter {
     pub fn bytes(&self) -> usize {
         self.bytes
     }
+}
+
+/// A language model that runtime LoRA adapters attach to (by Hugging Face module name, see the
+/// module docs): Qwen / Llama ([`crate::qwen::QwenModel`]), Gemma ([`crate::model::Model`]),
+/// Inkling-2 ([`crate::inkling::Inkling2Model`]).
+pub trait Adaptable {
+    /// Attaches the modules of `ad` to the layers they target and returns how many were attached
+    /// (errors when one matches no layer or has another shape).
+    fn attach_lora(&mut self, ad: &mut LoraAdapter) -> Result<usize>;
+}
+
+impl Adaptable for crate::qwen::QwenModel<'_> {
+    fn attach_lora(&mut self, ad: &mut LoraAdapter) -> Result<usize> {
+        crate::qwen::QwenModel::attach_lora(self, ad)
+    }
+}
+
+impl Adaptable for crate::model::Model<'_> {
+    fn attach_lora(&mut self, ad: &mut LoraAdapter) -> Result<usize> {
+        crate::model::Model::attach_lora(self, ad)
+    }
+}
+
+impl Adaptable for crate::inkling::Inkling2Model<'_> {
+    fn attach_lora(&mut self, ad: &mut LoraAdapter) -> Result<usize> {
+        crate::inkling::Inkling2Model::attach_lora(self, ad)
+    }
+}
+
+/// An adapter attached by [`attach_specs`].
+#[derive(Clone, Debug)]
+pub struct Attached {
+    /// The adapter folder (PEFT) or file (GGUF).
+    pub path: PathBuf,
+    /// `peft` or `gguf`.
+    pub format: &'static str,
+    pub rank: usize,
+    pub alpha: f32,
+    /// The strength it was loaded with (the `:SCALE` of `FILE[:SCALE]`).
+    pub strength: f32,
+    /// Updates attached (layers, experts, the embedding), and of those merged into the weights.
+    pub modules: usize,
+    pub merged: usize,
+    /// Parameter bytes (f32) held for the runtime updates.
+    pub bytes: usize,
+    /// Tensors of the file that were skipped (norm vectors of GGUF adapters).
+    pub skipped: Vec<String>,
+    gain: Arc<AtomicU32>,
+}
+
+impl Attached {
+    /// The strength now.
+    pub fn strength_now(&self) -> f32 {
+        f32::from_bits(self.gain.load(Ordering::Relaxed))
+    }
+
+    /// Changes the strength of the runtime updates (0: off, exactly the base model). Merged
+    /// updates are in the weights and cannot change: an error when there are any.
+    pub fn set_strength(&self, s: f32) -> Result<()> {
+        if self.merged > 0 {
+            bail!(
+                "LoRA {}: {} of its updates are merged into the weights (lora_merge), so its strength is fixed",
+                self.path.display(),
+                self.merged
+            );
+        }
+        if !s.is_finite() {
+            bail!("LoRA strength {s} is not a finite number");
+        }
+        self.gain.store(s.to_bits(), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// A one-line description for logs.
+    pub fn summary(&self) -> String {
+        let mut s = format!(
+            "{} ({}, rank {}, alpha {}, strength {}): {} update(s)",
+            self.path.display(),
+            self.format,
+            self.rank,
+            self.alpha,
+            self.strength,
+            self.modules
+        );
+        if self.merged > 0 {
+            s.push_str(&format!(", {} merged into the weights", self.merged));
+        }
+        s.push_str(&format!(", {:.1} MB", self.bytes as f64 / 1e6));
+        if !self.skipped.is_empty() {
+            s.push_str(&format!(", {} tensor(s) skipped", self.skipped.len()));
+        }
+        s
+    }
+}
+
+/// Loads each adapter of `specs` (a PEFT folder or a llama.cpp GGUF adapter; see
+/// [`LoraAdapter::open`]) for the base model at `base` and attaches it to `model` with its
+/// strength, switched on; with `merge`, updates go into the weights where they allow it
+/// ([`crate::model::Lin::merge_lora`]).
+pub fn attach_specs<M: Adaptable + ?Sized>(model: &mut M, specs: &[LoraSpec], base: &Path, merge: bool) -> Result<Vec<Attached>> {
+    let mut out = Vec::with_capacity(specs.len());
+    for s in specs {
+        let mut ad = LoraAdapter::open(&s.path, base).with_context(|| format!("LoRA {}", s.path.display()))?;
+        ad.set_strength(s.scale);
+        ad.set_merge(merge);
+        let n = model
+            .attach_lora(&mut ad)
+            .with_context(|| format!("attach LoRA {}", s.path.display()))?;
+        out.push(Attached {
+            path: ad.dir.clone(),
+            format: ad.format,
+            rank: ad.rank,
+            alpha: ad.alpha,
+            strength: s.scale,
+            modules: n,
+            merged: ad.merged,
+            bytes: ad.bytes,
+            skipped: ad.skipped.clone(),
+            gain: ad.gain(),
+        });
+    }
+    Ok(out)
+}
+
+/// Resolves the path of a language-model LoRA spec: a local file or folder as it is; with the
+/// `hf` feature, `org/name/path/in/repo` (a file, e.g. a GGUF adapter) or a repo id (`org/name`,
+/// `org/name/subfolder`) holding a PEFT adapter, fetched into the cache. Other repos fall back to
+/// [`crate::engine::resolve_file`] (a repo holding a single safetensors file).
+pub fn resolve(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
+    let p = Path::new(spec);
+    if p.exists() {
+        return Ok(p.to_path_buf());
+    }
+    #[cfg(feature = "hf")]
+    {
+        let parts: Vec<&str> = spec.split('/').collect();
+        let file_like = parts.last().is_some_and(|l| l.contains('.'));
+        if parts.len() >= 2 && !file_like && !spec.starts_with('/') && !spec.contains(':') {
+            let repo = format!("{}/{}", parts[0], parts[1]);
+            let sub = parts[2..].join("/");
+            let names: Vec<String> = ["adapter_config.json", "adapter_model.safetensors"]
+                .iter()
+                .map(|n| if sub.is_empty() { n.to_string() } else { format!("{sub}/{n}") })
+                .collect();
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            if let Ok(dir) = crate::hf::resolve_files(&repo, &refs, cache_dir) {
+                let dir = if sub.is_empty() { dir } else { dir.join(&sub) };
+                if is_adapter_dir(&dir) {
+                    return Ok(dir);
+                }
+            }
+        }
+    }
+    crate::engine::resolve_file(spec, cache_dir)
 }
 
 #[cfg(test)]
@@ -807,17 +1356,10 @@ impl LoraAdapter {
                 (name, Pair { a, b, r, n_in, n_out })
             })
             .collect();
-        Self {
-            dir: PathBuf::new(),
-            rank,
-            alpha: scale * rank as f32,
-            scale,
-            target_modules: Vec::new(),
-            modules,
-            active: Arc::new(AtomicBool::new(true)),
-            attached: 0,
-            bytes: 0,
-        }
+        let mut ad = Self::empty(Path::new(""), "peft", rank, scale * rank as f32, scale);
+        ad.modules = modules;
+        ad.active.store(true, Ordering::Relaxed);
+        ad
     }
 }
 
@@ -922,26 +1464,7 @@ mod tests {
         let a: Vec<f32> = (0..r * n_in).map(|_| rnd()).collect();
         let b: Vec<f32> = (0..n_out * r).map(|_| rnd()).collect();
         let x: Vec<f32> = (0..t * n_in).map(|_| rnd()).collect();
-        let mut ad = LoraAdapter {
-            dir: PathBuf::new(),
-            rank: r,
-            alpha: 2.0 * r as f32,
-            scale: 2.0,
-            target_modules: Vec::new(),
-            modules: BTreeMap::from([(
-                "m".to_string(),
-                Pair {
-                    a: a.clone(),
-                    b: b.clone(),
-                    r,
-                    n_in,
-                    n_out,
-                },
-            )]),
-            active: Arc::new(AtomicBool::new(true)),
-            attached: 0,
-            bytes: 0,
-        };
+        let mut ad = LoraAdapter::for_test(r, 2.0, vec![("m".to_string(), a.clone(), b.clone(), n_in)]);
         let d = ad.take("m", n_out, n_in, None, None).unwrap().unwrap();
         assert!(ad.finish().is_ok());
         let mut y = vec![1f32; t * n_out];
@@ -977,6 +1500,8 @@ mod tests {
                 n_out,
                 scale: 2.0,
                 active: Arc::new(AtomicBool::new(true)),
+                gain: unit_gain(),
+                next: None,
             };
             let x = vec![0.5f32; t * n_in];
             let mut y = vec![0f32; t * n_out];

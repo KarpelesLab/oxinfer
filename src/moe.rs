@@ -998,7 +998,10 @@ mod tests {
         let name = "layers.0.mlp.experts";
         for q8 in [false, true] {
             for fused in [true, false] {
-                for stacked in [true, false] {
+                // Stacked peft parameters, one peft module per expert, or one fused gate / up
+                // module per expert (`name.E.gate_up_proj`, a GGUF adapter's `ffn_gate_up_exps`).
+                for layout in 0..3 {
+                    let stacked = layout == 0;
                     let gate_up = (0..ne)
                         .map(|e| {
                             if fused {
@@ -1027,8 +1030,12 @@ mod tests {
                         let mut v = Vec::new();
                         for e in 0..ne {
                             let (a, b) = factors(&a_gu, &b_gu, h, e);
-                            v.push((format!("{name}.{e}.gate_proj"), a.clone(), b[..mi * r].to_vec(), h));
-                            v.push((format!("{name}.{e}.up_proj"), a, b[mi * r..].to_vec(), h));
+                            if layout == 2 {
+                                v.push((format!("{name}.{e}.gate_up_proj"), a, b, h));
+                            } else {
+                                v.push((format!("{name}.{e}.gate_proj"), a.clone(), b[..mi * r].to_vec(), h));
+                                v.push((format!("{name}.{e}.up_proj"), a, b[mi * r..].to_vec(), h));
+                            }
                             let (a, b) = factors(&a_d, &b_d, mi, e);
                             v.push((format!("{name}.{e}.down_proj"), a, b, mi));
                         }
@@ -1038,7 +1045,7 @@ mod tests {
                     ad.attach_experts(&mut ex, name, h).unwrap();
                     assert_eq!(ad.finish().unwrap(), if fused { 2 * ne } else { 3 * ne });
                     let switch = ad.switch();
-                    let what = format!("q8 {q8} fused {fused} stacked {stacked}");
+                    let what = format!("q8 {q8} fused {fused} layout {layout}");
                     for t in [1, 3, TN - 1, TN + 5] {
                         let x: Vec<f32> = (0..t * h).map(|_| lcg(&mut seed)).collect();
                         let routes: Vec<Vec<(usize, f32)>> = (0..t)
@@ -1126,8 +1133,15 @@ mod tests {
         );
         let e = attach(r, vec![module("4.gate_proj", mi, h)]).unwrap_err().to_string();
         assert!(e.contains("match no layer"), "{e}");
-        let e = attach(r, vec![module("0.gate_up_proj", 2 * mi, h)]).unwrap_err().to_string();
+        let e = attach(r, vec![module("0.w13_proj", 2 * mi, h)]).unwrap_err().to_string();
         assert!(e.contains("match no layer"), "{e}");
+        // A fused gate / up module per expert (how GGUF adapter stacks come apart) is taken,
+        // once.
+        assert_eq!(attach(r, vec![module("0.gate_up_proj", 2 * mi, h)]).unwrap(), 1);
+        let e = attach(r, vec![module("0.gate_up_proj", 2 * mi, h), module("0.up_proj", mi, h)])
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("twice"), "{e}");
         let e = attach(r, vec![module("0.down_proj", h, 2 * mi)]).unwrap_err().to_string();
         assert!(e.contains("another base model"), "{e}");
         // Both layouts on one weight.

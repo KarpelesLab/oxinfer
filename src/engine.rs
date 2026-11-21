@@ -229,6 +229,20 @@ pub struct EngineOptions {
     /// `autotrust/JEV-9B/vl`, the image decision assets for `Qwen/Qwen3.5-9B`). Key
     /// `decision_from`.
     pub decision_from: Option<String>,
+    /// Language models (Qwen / Llama / Granite / MiniMax on the Qwen code path, Gemma 4 / 3,
+    /// Inkling-2): LoRA adapters attached at load and applied at run time, unmerged, in order
+    /// (see [`crate::lora`]): a PEFT folder (`adapter_config.json` + `adapter_model.safetensors`,
+    /// or a repo id holding one) or a llama.cpp GGUF adapter (`convert_lora_to_gguf.py`, for a
+    /// GGUF base of the same architecture), each `FILE[:SCALE]` (scale 1 by default, as llama.cpp's
+    /// `--lora-scaled`). [`Engine::loras`] lists them and [`Engine::set_lora_strength`] changes a
+    /// strength (0 switches an adapter off). Key `lora`: repeatable (each adds one; `none` or an
+    /// empty value clears the list; a JSON array of specs adds them all).
+    pub loras: Vec<crate::lora::LoraSpec>,
+    /// Merge the LoRA updates into the weights at load instead ([`crate::model::Lin::merge_lora`]):
+    /// exact (up to bf16 rounding) on float weights, re-quantized on quantized ones (Q8 / Q4 in
+    /// their format, GGUF blocks as Q8: more memory, and a rounding error next to the update's);
+    /// embedding updates stay runtime ones and strengths become fixed. Key `lora_merge`.
+    pub lora_merge: bool,
     /// Runtime interventions from the first request on (see [`Engine::set_interventions`]).
     /// Key `interventions`: the [`crate::intervene::Spec`] as JSON, or `@FILE` for a JSON file.
     pub interventions: Option<crate::intervene::Spec>,
@@ -426,6 +440,8 @@ impl Default for EngineOptions {
             gpu_decode: None,
             stream_gpu: None,
             decision_from: None,
+            loras: Vec::new(),
+            lora_merge: false,
             interventions: None,
             lookup: None,
             lookup_tokens: None,
@@ -506,6 +522,8 @@ impl EngineOptions {
         "gpu_decode",
         "stream_gpu",
         "decision_from",
+        "lora",
+        "lora_merge",
         "interventions",
         "lookup",
         "lookup_tokens",
@@ -624,6 +642,18 @@ impl EngineOptions {
                 }
             }
             "decision_from" => self.decision_from = opt_str(value),
+            "lora" => match value.trim() {
+                "" | "none" => self.loras.clear(),
+                v if v.starts_with('[') => {
+                    let specs: Vec<String> =
+                        serde_json::from_str(v).with_context(|| format!("{key}: expected a JSON array of FILE[:SCALE] strings"))?;
+                    for s in specs {
+                        self.loras.push(crate::lora::LoraSpec::parse(&s)?);
+                    }
+                }
+                v => self.loras.push(crate::lora::LoraSpec::parse(v)?),
+            },
+            "lora_merge" => self.lora_merge = parse_bool(key, value)?,
             "lookup" => {
                 self.lookup = match value {
                     "" | "auto" => None,
@@ -1290,10 +1320,11 @@ fn reset_lookup(lk: Option<crate::lookup::Lookup>) -> Option<crate::lookup::Look
     })
 }
 
-/// The fingerprint of a loaded model for snapshots: the checkpoint, its precision and format,
-/// the device and the speculative decoding (whose caches are part of the state), hashed.
-fn fingerprint(info: &ModelInfo, opts: &EngineOptions) -> String {
-    let s = format!(
+/// What the fingerprint of a loaded model for snapshots covers besides its LoRA adapters: the
+/// checkpoint, its precision and format, the device and the speculative decoding (whose caches
+/// are part of the state).
+fn fingerprint_source(info: &ModelInfo, opts: &EngineOptions) -> String {
+    format!(
         "oxinfer-snapshot-1|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{}|{:?}",
         info.path.display(),
         info.checkpoint_bytes,
@@ -1306,7 +1337,16 @@ fn fingerprint(info: &ModelInfo, opts: &EngineOptions) -> String {
         opts.mtp_from,
         opts.fast_verify,
         opts.draft_device,
-    );
+    )
+}
+
+/// The fingerprint of a loaded model for snapshots: [`fingerprint_source`] and the LoRA
+/// adapters (each one's file and strength now), hashed.
+fn fingerprint(source: &str, loras: &[crate::lora::Attached]) -> String {
+    let mut s = source.to_string();
+    for l in loras {
+        s += &format!("|lora:{}:{}:{}", l.path.display(), l.strength_now(), l.merged);
+    }
     format!("{:016x}", crate::snapshot::hash64(&[s.as_bytes()]))
 }
 
@@ -1378,6 +1418,10 @@ pub struct Engine {
     pcache_pending: bool,
     /// Identifies the model and the settings its state depends on, for snapshots.
     fingerprint: String,
+    /// What [`fingerprint`] hashes besides the LoRA adapters.
+    fingerprint_source: String,
+    /// The LoRA adapters attached at load ([`EngineOptions::loras`]).
+    loras: Vec<crate::lora::Attached>,
     /// Must stay last: the model, sessions and references above point into it.
     _arena: Arena,
 }
@@ -1487,6 +1531,25 @@ impl Engine {
                 dir.display()
             );
         }
+        if !opts.loras.is_empty()
+            && !matches!(
+                family,
+                Family::Gemma4 | Family::Gemma3 | Family::Qwen | Family::Llama | Family::Inkling2
+            )
+        {
+            bail!("LoRA adapters (lora) are supported for Qwen, Llama, Gemma and Inkling-2 models, not {model_type}");
+        }
+        let lora_specs = opts
+            .loras
+            .iter()
+            .map(|l| {
+                Ok(crate::lora::LoraSpec {
+                    path: crate::lora::resolve(&l.path.to_string_lossy(), opts.cache_dir.as_deref())?,
+                    scale: l.scale,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut loras = Vec::new();
         let mtp = opts.mtp || side_dir.is_some();
         if mtp && family != Family::Qwen {
             bail!("MTP speculative decoding is for Qwen3.5/3.8 models");
@@ -1570,6 +1633,7 @@ impl Engine {
                     vocab_size: c.vocab_size,
                 };
                 decision = load_decision(decision_dir.as_deref(), &tok, &base, true, |ad| model.attach_lora(ad))?;
+                loras = crate::lora::attach_specs(&mut model, &lora_specs, &dir, opts.lora_merge)?;
                 if let Some(so) = &stream {
                     streamer = Some(crate::stream::attach_gemma(&mut model, files, so.clone())?);
                 }
@@ -1628,6 +1692,7 @@ impl Engine {
                     vocab_size: c.vocab_size,
                 };
                 decision = load_decision(decision_dir.as_deref(), &tok, &base, false, |ad| model.attach_lora(ad))?;
+                loras = crate::lora::attach_specs(&mut model, &lora_specs, &dir, opts.lora_merge)?;
                 let fmt: &'static (dyn ChatFormat + Sync) = if family == Family::Llama {
                     &chat::Llama3Chat
                 } else if model_type == "granite" {
@@ -2007,6 +2072,7 @@ impl Engine {
                 decision = None;
                 let mut model = Inkling2Model::load(crate::inkling::Inkling2Config::load(&dir)?, files, opts.quant)?;
                 model.kv = opts.kv_cache;
+                loras = crate::lora::attach_specs(&mut model, &lora_specs, &dir, opts.lora_merge)?;
                 if let Some(so) = stream.clone() {
                     streamer = Some(crate::stream::attach_inkling(&mut model, files, so)?);
                 }
@@ -2183,10 +2249,13 @@ impl Engine {
             pcache_min: opts.prompt_cache_min_tokens.unwrap_or(64),
             pcache_pending: false,
             fingerprint: String::new(),
+            fingerprint_source: String::new(),
+            loras,
             _arena: arena,
         })
         .map(|mut e| {
-            e.fingerprint = fingerprint(&e.info, opts);
+            e.fingerprint_source = fingerprint_source(&e.info, opts);
+            e.fingerprint = fingerprint(&e.fingerprint_source, &e.loras);
             e
         })
         .and_then(|mut e| {
@@ -2253,6 +2322,8 @@ impl Engine {
             pcache_min: 0,
             pcache_pending: false,
             fingerprint: String::new(),
+            fingerprint_source: String::new(),
+            loras: Vec::new(),
             _arena: arena,
         })
     }
@@ -2490,6 +2561,33 @@ impl Engine {
         self.unfed = None;
         self.chat_ids = None;
         self.install_iv();
+    }
+
+    /// The LoRA adapters attached at load ([`EngineOptions::loras`]), in order.
+    pub fn loras(&self) -> &[crate::lora::Attached] {
+        &self.loras
+    }
+
+    /// Changes the strength of LoRA adapter `index` (in [`Engine::loras`]; 0 switches it off,
+    /// which runs exactly the base model's code path) for the following requests. The
+    /// conversation starts again (its cache was computed at the old strength), after the prompt
+    /// cache got what was pending; the prompt cache tells the strengths apart. An error for an
+    /// adapter merged into the weights (`lora_merge`).
+    pub fn set_lora_strength(&mut self, index: usize, strength: f32) -> Result<()> {
+        let n = self.loras.len();
+        let l = self
+            .loras
+            .get(index)
+            .with_context(|| format!("no LoRA adapter {index} ({n} attached)"))?
+            .clone();
+        if l.merged > 0 || !strength.is_finite() {
+            return l.set_strength(strength);
+        }
+        self.flush_prompt_cache()?;
+        l.set_strength(strength)?;
+        self.fingerprint = fingerprint(&self.fingerprint_source, &self.loras);
+        self.reset();
+        Ok(())
     }
 
     // ---- runtime interventions (crate::intervene) ----

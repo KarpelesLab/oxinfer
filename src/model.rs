@@ -90,6 +90,8 @@ pub enum Table<'a> {
     },
     /// A table of Hadamard-latent rows (see [`crate::hadamard`]): each row read is transformed back.
     Folded(Box<Table<'a>>, std::sync::Arc<crate::hadamard::Fold>),
+    /// A table with runtime LoRA updates of its rows (see [`crate::lora::EmbedDelta`]).
+    Adapted(Box<Table<'a>>, Box<crate::lora::EmbedDelta>),
 }
 
 impl<'a> Table<'a> {
@@ -121,7 +123,7 @@ impl<'a> Table<'a> {
             ],
             Table::Gguf(m) => vec![span(m.row(r))],
             Table::Host { .. } | Table::Mlx { .. } => Vec::new(),
-            Table::Folded(t, _) => t.row_ranges(r, cols),
+            Table::Folded(t, _) | Table::Adapted(t, _) => t.row_ranges(r, cols),
         }
     }
 
@@ -139,6 +141,10 @@ impl<'a> Table<'a> {
             Table::Folded(t, f) => {
                 t.row(r, out);
                 f.unfold(out);
+            }
+            Table::Adapted(t, d) => {
+                t.row(r, out);
+                d.add_row(r, out);
             }
             Table::Gguf(m) => m.dequantize_rows(r, r + 1, out),
             Table::Mlx { parts, q } => {
@@ -218,6 +224,7 @@ impl<'a> Table<'a> {
             Table::Q4(m) => m.bytes(),
             Table::Gguf(m) => m.bytes(),
             Table::Folded(t, _) => t.bytes(),
+            Table::Adapted(t, d) => t.bytes() + d.bytes(),
             Table::Host { .. } => 0,
             Table::Mlx { parts, .. } => parts
                 .iter()
@@ -227,6 +234,16 @@ impl<'a> Table<'a> {
                 })
                 .sum(),
         }
+    }
+
+    /// Adds a runtime LoRA update of the rows (after any already attached).
+    pub fn add_lora(&mut self, d: Box<crate::lora::EmbedDelta>) {
+        if let Table::Adapted(_, e) = self {
+            e.push(d);
+            return;
+        }
+        let t = std::mem::replace(self, Table::Bf16(&[]));
+        *self = Table::Adapted(Box::new(t), d);
     }
 
     /// Loads table `full` (`[rows, cols]`): the pre-quantized form when the checkpoint has one,
@@ -782,6 +799,62 @@ impl<'a> Lin<'a> {
     /// Attaches (or with None removes) a runtime LoRA update (see `crate::lora`).
     pub fn set_lora(&mut self, d: Option<Box<crate::lora::LoraDelta>>) {
         self.lora = d;
+    }
+    /// Adds a runtime LoRA update after any already attached (several adapters on one layer).
+    pub fn add_lora(&mut self, d: Box<crate::lora::LoraDelta>) {
+        match &mut self.lora {
+            Some(l) => l.push(d),
+            None => self.lora = Some(d),
+        }
+    }
+    /// Merges LoRA update `d` (at its current strength) into the weight: the matrix is decoded
+    /// to f32, updated, and stored again in its float format (bf16, or a GGUF f32 / f16 / bf16
+    /// tensor; other GGUF float kinds as bf16), or quantized again (Q8 / Q4 weights in their
+    /// format, GGUF blocks as Q8, which the weight's own block format cannot be re-made from
+    /// here). False,
+    /// with the weight untouched, for a Hadamard-folded weight (whose rows are in another
+    /// basis): the update then stays a runtime one.
+    pub fn merge_lora(&mut self, d: &crate::lora::LoraDelta) -> Result<bool> {
+        let (n_out, n_in) = d.shape();
+        if self.fold.is_some() {
+            return Ok(false);
+        }
+        let mut w = vec![0f32; n_out * n_in];
+        let rows: Vec<u32> = (0..n_out as u32).collect();
+        if !self.rows(&rows, n_in, &mut w) {
+            return Ok(false);
+        }
+        d.merge_into(&mut w);
+        let to_bf16 = |w: &[f32]| {
+            let mut v = crate::quant::PageVec::<u16>::zeroed(w.len());
+            for (o, &x) in v.iter_mut().zip(w) {
+                *o = half::bf16::from_f32(x).to_bits();
+            }
+            Weight::Bf16(v.into(), std::marker::PhantomData)
+        };
+        self.w = match &self.w {
+            Weight::Bf16(..) => to_bf16(&w),
+            Weight::Q8(_) => Weight::Q8(crate::quant::quantize_f32(&w, n_out, n_in)),
+            Weight::Q4(_) => Weight::Q4(crate::quant::quantize_q4_f32(&w, n_out, n_in)),
+            Weight::Gguf(m) if m.kind == GgmlType::F32 => {
+                let mut v = crate::quant::PageVec::<u8>::zeroed(w.len() * 4);
+                for (o, x) in v.as_chunks_mut::<4>().0.iter_mut().zip(&w) {
+                    *o = x.to_le_bytes();
+                }
+                Weight::Gguf(GgufMatrix::new(GgmlType::F32, v.into(), n_out, n_in)?)
+            }
+            Weight::Gguf(m) if m.kind == GgmlType::F16 => {
+                let mut v = crate::quant::PageVec::<u8>::zeroed(w.len() * 2);
+                for (o, &x) in v.as_chunks_mut::<2>().0.iter_mut().zip(&w) {
+                    *o = half::f16::from_f32(x).to_le_bytes();
+                }
+                Weight::Gguf(GgufMatrix::new(GgmlType::F16, v.into(), n_out, n_in)?)
+            }
+            Weight::Gguf(m) if m.kind.is_float() => to_bf16(&w),
+            Weight::Gguf(_) => Weight::Q8(crate::quant::quantize_f32(&w, n_out, n_in)),
+        };
+        self.dev = std::sync::OnceLock::new();
+        Ok(true)
     }
     pub fn has_lora(&self) -> bool {
         self.lora.is_some()
@@ -1519,21 +1592,19 @@ impl<'a> Model<'a> {
     }
 
     /// Attaches the modules of a runtime LoRA adapter (see `crate::lora`) to the attention and
-    /// MLP projections, the routed experts (26B-A4B) and the LM head, by Hugging Face module
-    /// name. Returns the number patched.
+    /// MLP projections, the routed experts (26B-A4B), the token embedding and the LM head, by
+    /// Hugging Face module name. Returns the number patched.
     pub fn attach_lora(&mut self, ad: &mut crate::lora::LoraAdapter) -> Result<usize> {
         let (h, nh) = (self.cfg.hidden_size, self.cfg.num_attention_heads);
+        if let Some(d) = ad.take_embed(self.cfg.vocab_size, h)? {
+            self.embed.add_lora(d);
+        }
         for (l, layer) in self.layers.iter_mut().enumerate() {
             if let Some(m) = &mut layer.moe {
                 ad.attach_experts(&mut m.experts, &format!("layers.{l}.experts"), h)?;
             }
         }
-        let mut set = |lin: &mut Lin<'a>, name: String, n_out: usize, n_in: usize| -> Result<()> {
-            if let Some(d) = ad.take(&name, n_out, n_in, None, None)? {
-                lin.set_lora(Some(d));
-            }
-            Ok(())
-        };
+        let mut set = |lin: &mut Lin<'a>, name: String, n_out: usize, n_in: usize| ad.attach(lin, &name, n_out, n_in, None, None);
         for (l, layer) in self.layers.iter_mut().enumerate() {
             let p = format!("layers.{l}.");
             let (hd, kv, inter) = (layer.hd, layer.n_kv * layer.hd, layer.inter);
