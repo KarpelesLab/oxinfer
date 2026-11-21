@@ -400,6 +400,15 @@ pub const CATALOG: &[Model] = &[
         .speed(6.0, 40)
         .moe()
         .note("bytes per token from the active parameter count"),
+    Model::new("PixilabAI/Zawen-v0.1-35B-A3B", Kind::Chat, 35.0, 69.3, AGENT)
+        .speed(6.0, 40)
+        .moe()
+        .note("a Qwen3.6-35B-A3B fine-tune for roleplay and creative writing; text only (no vision tower)"),
+    Model::new("mradermacher/Zawen-v0.1-35B-A3B-GGUF:Q4_K_M", Kind::Chat, 35.0, 21.2, AGENT)
+        .fixed(Format::GgufQ4, "GGUF Q4_K_M")
+        .speed(1.84, 40)
+        .moe()
+        .note("Zawen in GGUF; also :IQ4_XS, :Q5_K_M, :Q6_K, :Q8_0"),
     // Ripple-65B: the NVFP4 checkpoint ran (its bytes per token are the loader's); the bf16 one
     // was never downloaded (a token reads all of it but the embedding table).
     Model::new("ricursiveAI/Ripple-65B-Preview-NVFP4", Kind::Chat, 65.0, 57.2, AGENT)
