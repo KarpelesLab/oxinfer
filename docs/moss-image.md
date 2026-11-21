@@ -250,8 +250,8 @@ session's buffers made).
 | whole passes, ConvRot `Q8_CR` / `Q4_CR_L` transformer, busy* | | | 19.5 / 19.2 (2.4 per pass) | |
 | whole passes, FameGrid preset (LoKr merged, ER-SDE, 24 steps CFG 2.5), busy* | 2.1 | 98.7 for its 48 passes | | |
 | diffusers on MPS (bf16, the release's pipeline) | 2.43 | 244 | 23 (2.9 per pass with the hooks) | about 3 |
-| oxinfer CPU** | 30 | about 50 min | 40 per pass with the LoRA | 10.4 |
-| oxinfer CPU, FameGrid (LoKr merged into bf16)** | 43 | | | |
+| oxinfer CPU** | 30 | about 50 min | 38.6 per pass with the LoRA | 10.4 |
+| oxinfer CPU, FameGrid (LoKr merged into bf16)** | 30.4 | | | |
 | diffusers on the CPU, float32 | 121 | | | |
 
 \* Load average 9-16 from other jobs, and the GPU shared with them (headless browsers running WebGPU
@@ -261,11 +261,12 @@ for the VAE before `conv_f32`, then 4.1 -> 2.4 s) is the comparison to read; bat
 branches (`batch_guidance`) made no measurable difference (215 vs 219 s), the passes being bound by
 the GEMMs either way.
 
-\*\* Each run started with the 1-minute load average below 6; the base pass (29.7 / 30.3 s, the CPU
-path unchanged: rel L2 2.1e-6 / 1.5e-6 against the float32 reference) ran alone, while other jobs
-started during the DMD2 and FameGrid runs (load 40 and 60 at their ends), so those two are upper
-bounds; the LoKr-merged model costs the same per pass as the base one. On the CPU the pass is 62%
-matmuls and 36% attention.
+\*\* Each run started with the 1-minute load average below 6 or 7 (oxinfer itself takes it to about
+18-20). The base pass (29.7 / 30.3 s; the CPU path is unchanged: rel L2 2.1e-6 / 1.5e-6 against the
+float32 reference) is 62% matmuls and 36% attention. The DMD2 LoRA's 252 rank-128 modules, run by the
+CPU low-rank kernel beside each matmul, add about 9 s per pass (two runs: 38.6 and 40.0 s); the
+FameGrid LoKr, merged at load, adds nothing (30.4 s; a first run at 42.8 s had other jobs start
+during it, load 60 at its end).
 
 Where a whole Metal pass goes, from the per-op GEMM timings (quiet machine): the matmuls about 1.0 s
 (39 TFLOPs at ~40 TFLOPS on the matrix units; the `ffn_down` GEMM is the slowest at ~26 TFLOPS), the
