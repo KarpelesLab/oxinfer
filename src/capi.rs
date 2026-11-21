@@ -1283,6 +1283,98 @@ pub unsafe extern "C" fn oxi_omnigen2_edit(
     })
 }
 
+// ---- MOSS-Image (text to image; Kromoss and its presets) -------------------------------------
+
+/// A MOSS-Image pipeline handle.
+pub struct OxiMossImage {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pipe: Mutex<crate::moss_image::Pipeline>,
+}
+
+/// Loads a MOSS-Image diffusers folder, repo id or preset id (`key=value` options, see the header).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_moss_image_load(
+    model: *const c_char,
+    options: *const c_char,
+    progress: OxiProgressFn,
+    user: *mut c_void,
+) -> *mut OxiMossImage {
+    guard(std::ptr::null_mut(), || {
+        let model = unsafe { str_arg(model, "model") }?;
+        let mut o = crate::moss_image::Options::default();
+        for item in unsafe { opt_str_arg(options, "options") }?.unwrap_or("").split(['\n', ';']) {
+            let item = item.trim();
+            if item.is_empty() || item.starts_with('#') {
+                continue;
+            }
+            let (k, v) = item.split_once('=').with_context(|| format!("option {item:?} is not key=value"))?;
+            o.set(k.trim(), v.trim())?;
+        }
+        let p = with_progress(progress, user, || crate::moss_image::Pipeline::load(model, o))?;
+        Ok(Box::into_raw(Box::new(OxiMossImage {
+            cancel: p.cancel_handle(),
+            pipe: Mutex::new(p),
+        })))
+    })
+}
+
+/// Frees a MOSS-Image pipeline (NULL is ignored). No other call on it may be running.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_moss_image_free(q: *mut OxiMossImage) {
+    if !q.is_null() {
+        guard((), || {
+            drop(unsafe { Box::from_raw(q) });
+            Ok(())
+        })
+    }
+}
+
+/// Stops the running generation between denoising steps (any thread).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_moss_image_cancel(q: *const OxiMossImage) {
+    if let Some(q) = unsafe { q.as_ref() } {
+        q.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Generates the image of `request_json` (defaults: the pipeline's preset, else the release's);
+/// the result goes to `on_image`. Returns 1, or -1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_moss_image_generate(
+    q: *mut OxiMossImage,
+    request_json: *const c_char,
+    on_image: OxiImageFn,
+    on_step: OxiStepFn,
+    user: *mut c_void,
+) -> c_int {
+    guard(-1, || {
+        let q = unsafe { q.as_ref() }.context("pipeline is NULL")?;
+        let req: crate::moss_image::Request =
+            serde_json::from_str(unsafe { str_arg(request_json, "request_json") }?).context("request_json")?;
+        let mut pipe = q.pipe.lock().unwrap_or_else(|p| p.into_inner());
+        let params = pipe.request_params(&req);
+        let cancel = q.cancel.clone();
+        let mut progress = |i: usize, n: usize| {
+            if let Some(cb) = on_step
+                && unsafe { cb(user, i as c_int, n as c_int) } != 0
+            {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        };
+        let (img, _) = pipe.generate(&params, &mut progress)?;
+        if let Some(cb) = on_image {
+            unsafe { cb(user, 0, img.width as c_int, img.height as c_int, img.rgb.as_ptr(), img.rgb.len()) };
+        }
+        Ok(1)
+    })
+}
+
+/// The curated presets as a JSON array (`crate::advisor::PRESETS`); free with `oxi_string_free`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_presets_json() -> *mut c_char {
+    guard(std::ptr::null_mut(), || Ok(out_string(crate::advisor::presets_json().to_string())))
+}
+
 // ---- Step1X-Edit (image editing) -------------------------------------------------------------
 
 /// A Step1X-Edit pipeline handle.

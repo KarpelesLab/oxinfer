@@ -312,7 +312,7 @@ pub fn plan(spec: &str, cache_dir: Option<&Path>) -> Result<Plan> {
     let list = listing(repo)?;
     let names = match quant {
         Some(q) => gguf_parts(repo, q, &list)?.1,
-        None => repo_files(repo, &list, &mut |name| peek_meta(repo, &dir, &list, name))?,
+        None => repo_files(repo, &list, &mut |name| peek_meta(repo, &dir, &list, name), Some(&dir))?,
     };
     let files = names
         .into_iter()
@@ -549,7 +549,7 @@ fn anemll_wanted(name: &str) -> bool {
 
 fn fetch_repo(repo: &str, dir: &Path) -> Result<()> {
     let list = listing(repo)?;
-    let files = repo_files(repo, &list, &mut |name| fetch_meta(repo, dir, &list, name))?;
+    let files = repo_files(repo, &list, &mut |name| fetch_meta(repo, dir, &list, name), Some(dir))?;
     fetch_listed(repo, dir, &list, &files)
 }
 
@@ -596,9 +596,9 @@ fn fetch_listed(repo: &str, dir: &Path, list: &Listing, files: &[String]) -> Res
 }
 
 /// The files a fetch of the repository takes (besides the small ones `meta` reads).
-fn repo_files(repo: &str, list: &Listing, meta: &mut Meta) -> Result<Vec<String>> {
+fn repo_files(repo: &str, list: &Listing, meta: &mut Meta, dir: Option<&Path>) -> Result<Vec<String>> {
     if list.contains_key("model_index.json") {
-        return diffusers_component_files(list, &[], meta);
+        return diffusers_component_files(list, &[], meta, dir);
     }
     if is_anemll_listing(list) {
         let mut files: Vec<String> = list.keys().filter(|k| anemll_wanted(k)).cloned().collect();
@@ -736,7 +736,7 @@ pub fn resolve_diffusers(spec: &str, skip: &[&str], cache_dir: Option<&Path>) ->
     if !list.contains_key("model_index.json") {
         bail!("{spec}: not a diffusers pipeline (no model_index.json)");
     }
-    let files = diffusers_component_files(&list, skip, &mut |name| fetch_meta(spec, &dir, &list, name))?;
+    let files = diffusers_component_files(&list, skip, &mut |name| fetch_meta(spec, &dir, &list, name), Some(&dir))?;
     fetch_listed(spec, &dir, &list, &files)?;
     Ok(dir)
 }
@@ -745,8 +745,23 @@ pub fn resolve_diffusers(spec: &str, skip: &[&str], cache_dir: Option<&Path>) ->
 /// those in `skip`), the component folder's configs, tokenizer files and weights (sharded or
 /// not; the full-precision file over an `.fp16` variant, safetensors over `.bin`). Top-level
 /// single-file checkpoints (`flux1-dev.safetensors`, `ae.safetensors`, ...) are left out.
-fn diffusers_component_files(list: &Listing, skip: &[&str], meta: &mut Meta) -> Result<Vec<String>> {
+fn diffusers_component_files(list: &Listing, skip: &[&str], meta: &mut Meta, dir: Option<&Path>) -> Result<Vec<String>> {
     let index: serde_json::Value = serde_json::from_slice(&meta("model_index.json")?)?;
+    // MOSS-Image's text encoder is Qwen/Qwen3.5-9B unchanged: not fetched again when the cache
+    // holds that repo (the pipeline reads it from there).
+    let mut skip = skip.to_vec();
+    if index["_class_name"] == "MOSSImagePipeline"
+        && dir.is_some_and(|dir| {
+            dir.parent().is_some_and(|root| {
+                let q = root.join(crate::moss_image::QWEN35_9B.replace('/', "--"));
+                ["model.safetensors.index.json", "model.safetensors"]
+                    .iter()
+                    .any(|n| q.join(n).exists())
+            }) && !dir.join("text_encoder").join("model.safetensors.index.json").exists()
+        })
+    {
+        skip.push("text_encoder");
+    }
     let mut files: Vec<String> = Vec::new();
     for (comp, v) in index.as_object().context("model_index.json is not an object")? {
         let named = v.as_array().is_some_and(|a| a.first().is_some_and(|x| !x.is_null()));

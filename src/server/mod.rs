@@ -110,7 +110,7 @@ impl ModelSpec {
         if !id.is_empty() {
             spec.id = id;
         }
-        spec.options = options;
+        spec.options.extend(options);
         spec.check()?;
         Ok(spec)
     }
@@ -119,6 +119,17 @@ impl ModelSpec {
     pub fn new(source: &str) -> Result<Self> {
         if source.is_empty() {
             bail!("empty model source");
+        }
+        // A preset of the catalog (`kromoss-famegrid`): its base model with `preset=ID`, which the
+        // pipeline expands into its LoRAs and generation defaults.
+        if let Some(p) = crate::advisor::preset(source)
+            && !std::path::Path::new(source).exists()
+        {
+            return Ok(Self {
+                id: source.to_string(),
+                source: p.base.to_string(),
+                options: vec![("preset".to_string(), p.id.to_string())],
+            });
         }
         Ok(Self {
             id: source.to_string(),

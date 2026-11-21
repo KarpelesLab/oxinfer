@@ -736,6 +736,11 @@ pub const CATALOG: &[Model] = &[
     Model::new("Qwen/Qwen-Image-2.1-Turbo", Kind::Image, 16.2, 32.4, &[TextToImage, ImageEdit])
         .note("8 steps; GGUF transformers: abenzerps/Qwen-Image-2.1-Turbo-Quantized"),
     Model::new("Qwen/Qwen-Image-2.1", Kind::Image, 16.2, 33.1, &[TextToImage, ImageEdit]).note("40 steps; RGBA output"),
+    Model::new("lodestones/Kromoss", Kind::Image, 13.5, 29.5, &[TextToImage])
+        .note("MOSS-Image fine-tune with Qwen3.5-9B (the cached Qwen/Qwen3.5-9B is reused); 50 steps, CFG 3; presets kromoss-dmd2, kromoss-famegrid"),
+    Model::new("molbal/Kromoss-GGUF:Q8_0", Kind::Image, 13.5, 24.8, &[TextToImage])
+        .fixed(Format::GgufQ8, "GGUF Q8_0 transformer")
+        .note("--transformer for lodestones/Kromoss (also Q6_K, Q4_K_M); text encoder and VAE from the base"),
     Model::new("MiniMaxAI/MiniMax-H3-Image", Kind::Image, 63.0, 127.2, &[TextToImage])
         .note("with MiniMax-H3's Qwen3-VL text encoder; 2048x2048 and up"),
     Model::new("MiniMaxAI/MiniMax-H3", Kind::Video, 67.4, 140.1, &[TextToVideo, ImageToVideo])
@@ -745,6 +750,112 @@ pub const CATALOG: &[Model] = &[
              forwards; not run on the real files: docs/video.md)",
         ),
 ];
+
+/// A curated stack: a base model of the catalog with LoRA files at set strengths, a trigger word
+/// and the generation settings the authors recommend. `oxinfer --preset ID` (or `--model ID`),
+/// the server's model sources and the pipelines' `preset` option take the id.
+#[derive(Clone, Copy, Debug)]
+pub struct Preset {
+    pub id: &'static str,
+    /// The catalog model it runs on (what `--model` takes).
+    pub base: &'static str,
+    /// The pipeline that reads [`Preset::load`] and [`Preset::defaults`] (`moss-image`).
+    pub pipeline: &'static str,
+    /// Load options of that pipeline (`lora` = `org/name/file.safetensors:STRENGTH`, ...).
+    pub load: &'static [(&'static str, &'static str)],
+    /// Generation defaults (`steps`, `guidance`, `sampler`, `scheduler`, ...); requests override them.
+    pub defaults: &'static [(&'static str, &'static str)],
+    /// Put at the start of prompts that lack it.
+    pub trigger: &'static str,
+    /// Downloads on top of the base, in GB.
+    pub extra_download_gb: f64,
+    /// Where the LoRA files come from and where the settings are documented.
+    pub source: &'static str,
+    pub note: &'static str,
+}
+
+/// The curated presets.
+pub const PRESETS: &[Preset] = &[
+    Preset {
+        id: "kromoss",
+        base: "lodestones/Kromoss",
+        pipeline: "moss-image",
+        load: &[],
+        defaults: &[("steps", "50"), ("guidance", "3"), ("uncond_skip_layers", "22")],
+        trigger: "",
+        extra_download_gb: 0.0,
+        source: "https://huggingface.co/lodestones/Kromoss (README: 50 steps, CFG 3, shift 5, negative branch without block 22)",
+        note: "the full model, as the release's pipeline",
+    },
+    Preset {
+        id: "kromoss-dmd2",
+        base: "lodestones/Kromoss",
+        pipeline: "moss-image",
+        load: &[("lora", "lodestones/Kromoss/8-steps-dmd2-lora.safetensors:1")],
+        defaults: &[("steps", "8"), ("guidance", "1")],
+        trigger: "",
+        extra_download_gb: 1.2,
+        source: "https://huggingface.co/lodestones/Kromoss (8-steps-dmd2-lora: 8 steps, CFG 1, no negative branch)",
+        note: "8-step turbo LoRA (DMD2), about 12x faster than 50 steps with CFG",
+    },
+    Preset {
+        id: "kromoss-dmd",
+        base: "lodestones/Kromoss",
+        pipeline: "moss-image",
+        load: &[("lora", "lodestones/Kromoss/8-steps-dmd-lora.safetensors:1")],
+        defaults: &[("steps", "8"), ("guidance", "1")],
+        trigger: "",
+        extra_download_gb: 1.2,
+        source: "https://huggingface.co/lodestones/Kromoss (8-steps-dmd-lora: 8 steps, CFG 1)",
+        note: "8-step turbo LoRA (data-space DMD)",
+    },
+    Preset {
+        id: "kromoss-famegrid",
+        base: "lodestones/Kromoss",
+        pipeline: "moss-image",
+        load: &[("lora", "Lnypuuuu/txt2image/FameGrid-MOSS-Preview.safetensors:1.4")],
+        defaults: &[
+            ("steps", "24"),
+            ("guidance", "2.5"),
+            ("sampler", "er_sde"),
+            ("scheduler", "beta57"),
+            ("uncond_skip_layers", "none"),
+        ],
+        trigger: "famegrid",
+        extra_download_gb: 0.58,
+        source: "FameGrid Moss Image Preview by UltraMuse (civitai.com/models/2088956, version 3478421: trigger famegrid, \
+                 ER_SDE + beta57, 24 steps, CFG 2.5, weight 1.5-2; Kromoss bf16 recommended); ungated copy with the same \
+                 SHA-256 at huggingface.co/Lnypuuuu/txt2image",
+        note: "photographic social-media look (a LyCORIS LoKr, merged at load) at strength 1.4",
+    },
+];
+
+/// The preset of that id.
+pub fn preset(id: &str) -> Option<&'static Preset> {
+    PRESETS.iter().find(|p| p.id == id)
+}
+
+/// The presets as JSON (`oxinfer --presets --format json`).
+pub fn presets_json() -> serde_json::Value {
+    serde_json::Value::Array(
+        PRESETS
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "id": p.id,
+                    "base": p.base,
+                    "pipeline": p.pipeline,
+                    "load": p.load.iter().map(|(k, v)| serde_json::json!([k, v])).collect::<Vec<_>>(),
+                    "defaults": p.defaults.iter().map(|(k, v)| (k.to_string(), serde_json::json!(v))).collect::<serde_json::Map<_, _>>(),
+                    "trigger": p.trigger,
+                    "extra_download_gb": p.extra_download_gb,
+                    "source": p.source,
+                    "note": p.note,
+                })
+            })
+            .collect(),
+    )
+}
 
 /// Fixed CPU cost per layer and decoded token, in milliseconds, on top of streaming the weights.
 ///

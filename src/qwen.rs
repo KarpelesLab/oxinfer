@@ -708,6 +708,9 @@ impl<'a> QwenModel<'a> {
             "language_model.model."
         } else if ld.has("model.embed_tokens.weight") {
             "model."
+        } else if ld.has("language_model.embed_tokens.weight") {
+            // transformers' bare `Qwen3_5Model` (MOSS-Image's text encoder): no `model.` level.
+            "language_model."
         } else if ld.has("embed_tokens.weight") {
             "" // a bare text model (embedding checkpoints)
         } else {

@@ -25,6 +25,7 @@ mod lfm3_omni_cli;
 mod minimax_h3_cli;
 mod minimax_h3_video_cli;
 mod models_cli;
+mod moss_image_cli;
 mod omnigen2_cli;
 mod qwen_image_cli;
 mod sd3_cli;
@@ -217,6 +218,7 @@ struct Args {
     iv: intervene_cli::IvArgs,
     // FLUX.1 / Kontext.
     flux: flux_cli::FluxArgs,
+    moss: moss_image_cli::MossArgs,
     // Stable Diffusion 3 / 3.5.
     sd3: sd3_cli::Sd3Args,
     // BAGEL.
@@ -732,6 +734,7 @@ fn parse_args() -> Result<Args> {
         max_tokens_set: None,
         iv: Default::default(),
         flux: Default::default(),
+        moss: Default::default(),
         sd3: Default::default(),
         bagel: Default::default(),
         ocr: Default::default(),
@@ -1004,6 +1007,7 @@ fn parse_args() -> Result<Args> {
             "--repetition-penalty" | "--repeat-penalty" => a.repetition_penalty = Some(val()?.parse()?),
             "-h" | "--help" => usage(),
             _ if a.iv.parse(&k, &mut val)? => {}
+            _ if a.moss.parse(&k, &mut val)? => {}
             _ if a.flux.parse(&k, &mut val)? => {}
             _ if a.sd3.parse(&k, &mut val)? => {}
             _ if a.bagel.parse(&k, &mut val)? => {}
@@ -1015,7 +1019,11 @@ fn parse_args() -> Result<Args> {
         }
     }
     if a.model.as_os_str().is_empty() && !a.devices && !a.models && !a.check_update && !a.update {
-        usage();
+        match &a.moss.preset {
+            // `--preset ID` alone: the preset's base model.
+            Some(id) => a.model = PathBuf::from(id),
+            None => usage(),
+        }
     }
     Ok(a)
 }
@@ -1323,7 +1331,12 @@ fn main() -> Result<()> {
     // Resolve repo ids to cached local directories.
     let spec = args.model.to_string_lossy().to_string();
     // (A single safetensors file: a BFL FLUX checkpoint, local or `org/name/file.safetensors`.)
-    args.model = if spec.ends_with(".safetensors") {
+    // A preset id (`--model kromoss-famegrid`, or `--preset` with no model): its pipeline
+    // resolves the base and the LoRA files.
+    let preset = oxinfer::advisor::preset(&spec).is_some();
+    args.model = if preset {
+        args.model.clone()
+    } else if spec.ends_with(".safetensors") {
         resolve_file(&spec, args.cache_dir.as_deref())?
     } else if !args.model.exists() && oxinfer::zonos::is_zonos(&args.model) {
         // ZONOS3's repository: its loader fetches the few files it reads.
@@ -1682,6 +1695,9 @@ fn run(mut args: Args) -> Result<()> {
         }
         // Questions about images: the model's Qwen2.5-VL as a chat model.
         args = omnigen2_cli::understanding_args(args);
+    }
+    if moss_image_cli::wants(&args) {
+        return moss_image_cli::run(&args);
     }
     if oxinfer::flux::is_flux_dir(&args.model)
         || oxinfer::flux::is_flux_gguf(&args.model)

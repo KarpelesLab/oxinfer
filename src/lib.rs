@@ -78,6 +78,7 @@ pub mod model;
 pub mod model_cache;
 pub mod modernbert;
 mod moe;
+pub mod moss_image;
 pub mod mpnet;
 pub mod nemotron;
 pub mod nemotron_asr;

@@ -587,6 +587,54 @@ void oxi_omnigen2_cancel(const OxiOmniGen2 *q);
 int oxi_omnigen2_edit(OxiOmniGen2 *q, const char *request_json, const uint8_t *const *rgb, const int *widths,
                       const int *heights, int n, oxi_image_fn on_image, oxi_step_fn on_step, void *user);
 
+/* ---- MOSS-Image: text to image (lodestones/Kromoss, OpenMOSS-Team/MOSS-Image-*) ---------------
+ *
+ * MOSS-Image diffusers folders (over oxinfer::moss_image): Qwen3.5-9B encodes the prompt, the 5B
+ * single-stream DiT denoises (CFG with block 22 left out of the negative branch by default), the
+ * FLUX.2 VAE decodes. Same threading rules as engines: one call at a time, oxi_moss_image_cancel()
+ * from any thread. */
+
+typedef struct OxiMossImage OxiMossImage;
+
+/* Loads a pipeline: a directory, a repo id, or a preset id ("kromoss", "kromoss-dmd2",
+ * "kromoss-dmd", "kromoss-famegrid"; see oxi_presets_json()). The transformer and VAE load now,
+ * the text encoder on first use. `options`: `key=value` lines or `;`-separated pairs, NULL for
+ * the defaults:
+ *   preset=ID              a preset's LoRAs and generation defaults
+ *   quant=bf16|q8|q4       transformer precision
+ *   text_quant=bf16|q8|q4  text encoder precision
+ *   transformer=PATH       another transformer: diffusers folder, ComfyUI single file, or GGUF
+ *                          (molbal/Kromoss-GGUF/kromoss-Q8_0.gguf)
+ *   text_encoder=PATH      the Qwen3.5-9B weights from elsewhere (default: text_encoder/, or the
+ *                          cached Qwen/Qwen3.5-9B, which is the same model)
+ *   vae=PATH               another FLUX.2 VAE folder
+ *   lora=FILE[:STRENGTH]   a LoRA (kohya / PEFT low-rank, LyCORIS LoKr / LoHa; repeatable)
+ *   lora_merge=0|1         merge low-rank LoRAs into the weights too (faster on a GPU)
+ *   keep_text_encoder=0|1  keep the text encoder loaded between calls (default 0)
+ *   in_memory=0|1          read the transformer into memory instead of mapping it
+ *   cache_dir=DIR, device=auto|cpu|metal|cuda|vulkan */
+OxiMossImage *oxi_moss_image_load(const char *model, const char *options, oxi_progress_fn progress, void *user);
+
+/* Frees a pipeline (NULL is ignored); no other call on it may be running. */
+void oxi_moss_image_free(OxiMossImage *q);
+
+/* Stops the running generation between denoising steps (any thread); it then fails. */
+void oxi_moss_image_cancel(const OxiMossImage *q);
+
+/* Generates an image. `request_json`: {"prompt": "...", every other key optional, defaults
+ * from the preset, else the release's: "negative": "", "steps": 50, "guidance": 3, "seed": 42,
+ * "width" / "height": 1024 (multiples of 16), "uncond_skip_layers": [22], "slg_layers": [],
+ * "slg_scale": 0, "slg_start": 0, "slg_stop": 1, "shift": 5,
+ * "schedule": "moss" | "simple" | "beta" | "beta57", "sampler": "euler" | "er_sde",
+ * "trigger": "famegrid" (put first in prompts lacking it)}. The image is passed to `on_image`
+ * (index 0); `on_step` (may be NULL) after every step, non-zero cancels. Returns 1, or -1. */
+int oxi_moss_image_generate(OxiMossImage *q, const char *request_json, oxi_image_fn on_image, oxi_step_fn on_step,
+                            void *user);
+
+/* The curated presets (base model, LoRAs and strengths, trigger word, generation defaults) as a
+ * JSON array; free with oxi_string_free(). */
+char *oxi_presets_json(void);
+
 /* ---- Step1X-Edit: instruction-based image editing ---------------------------------------------
  *
  * stepfun-ai/Step1X-Edit-v1p2 (and -v1p2-preview, -v1p1-diffusers) diffusers folders (over

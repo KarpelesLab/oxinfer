@@ -268,6 +268,9 @@ struct ImageJob {
     as_url: bool,
     images: Vec<RgbImage>,
     mask: Option<RgbImage>,
+    /// Pipeline-specific settings by name (MOSS-Image: `sampler`, `scheduler`,
+    /// `uncond_skip_layers`, ...; see `crate::moss_image::Params::KEYS`).
+    extra: Vec<(String, Value)>,
 }
 
 impl ImageJob {
@@ -326,8 +329,35 @@ impl ImageJob {
             guidance: num("guidance")?.or(num("guidance_scale")?).map(|v| v as f32),
             strength: num("strength")?.map(|v| v as f32),
             as_url,
+            extra: EXTRA_KEYS
+                .iter()
+                .filter_map(|k| get(k).filter(|v| !v.is_null()).map(|v| (k.to_string(), v)))
+                .collect(),
             ..Self::default()
         })
+    }
+}
+
+/// Request fields beyond the OpenAI API that some pipelines read (MOSS-Image).
+const EXTRA_KEYS: &[&str] = &[
+    "uncond_skip_layers",
+    "slg_layers",
+    "slg_scale",
+    "slg_start",
+    "slg_stop",
+    "shift",
+    "schedule",
+    "scheduler",
+    "sampler",
+    "trigger",
+];
+
+/// A JSON value as a `key=value` setting (arrays comma-joined).
+fn setting(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a.iter().map(setting).collect::<Vec<_>>().join(","),
+        other => other.to_string(),
     }
 }
 
@@ -546,6 +576,30 @@ fn generate_images(m: &mut ImageModel, job: &ImageJob, seed: u64) -> anyhow::Res
                     Some(im) => b.edit(im, &job.prompt, &o, &mut |_, _| true)?,
                     None => b.generate(&job.prompt, &o, &mut |_, _| true)?,
                 };
+                (img.width, img.height, img.rgb)
+            }
+            ImageModel::Moss(pipe) => {
+                if first.is_some() {
+                    bail!("MOSS-Image models generate images from text only (no edits)");
+                }
+                let mut p = pipe.params(&job.prompt);
+                if let Some(n) = &job.negative {
+                    p.negative = n.clone();
+                }
+                if let Some(s) = job.steps {
+                    p.steps = s;
+                }
+                if let Some(g) = job.guidance {
+                    p.guidance = g;
+                }
+                if let (Some(w), Some(h)) = (w, h) {
+                    (p.width, p.height) = (w, h);
+                }
+                p.seed = seed;
+                for (k, v) in &job.extra {
+                    p.set(k, &setting(v))?;
+                }
+                let (img, _) = pipe.generate(&p, &mut |_, _| {})?;
                 (img.width, img.height, img.rgb)
             }
             ImageModel::Janus(_) => unreachable!(),

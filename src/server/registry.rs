@@ -56,6 +56,7 @@ pub(crate) enum ImageKind {
     Step1x,
     Bagel,
     Janus,
+    Moss,
 }
 
 /// An embedding model with the checkpoint it borrows.
@@ -75,6 +76,7 @@ pub(crate) enum ImageModel {
     Step1x(crate::step1x::Pipeline),
     Bagel(crate::bagel::Bagel),
     Janus(crate::janus::Janus),
+    Moss(crate::moss_image::Pipeline),
 }
 
 /// A loaded model.
@@ -738,6 +740,10 @@ fn load_image(ik: ImageKind, src: &str, opts: &[(&str, &str)], cache_dir: Option
             src,
             &options!(crate::bagel::LoadOptions::default(), true),
         )?),
+        ImageKind::Moss => ImageModel::Moss(crate::moss_image::Pipeline::load(
+            src,
+            options!(crate::moss_image::Options::default(), true),
+        )?),
         ImageKind::Janus => ImageModel::Janus(crate::janus::Janus::load(
             src,
             &options!(crate::janus::JanusOptions::default(), true),
@@ -778,7 +784,9 @@ pub(crate) fn detect_path(path: &Path, source: &str) -> (Kind, Option<ImageKind>
             (Kind::Chat, None)
         };
     }
-    if crate::omnigen2::is_omnigen2(path) {
+    if crate::moss_image::is_moss_image(path) {
+        img(ImageKind::Moss)
+    } else if crate::omnigen2::is_omnigen2(path) {
         img(ImageKind::OmniGen2)
     } else if crate::flux::is_flux_dir(path) {
         img(ImageKind::Flux)
