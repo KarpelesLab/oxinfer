@@ -510,7 +510,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("oxinfer-sd3-tiny-{}", std::process::id()));
         write_tiny_release(&dir).unwrap();
         assert!(crate::sd3::is_sd3_dir(&dir));
-        let p = Pipeline::load(dir.to_str().unwrap(), &LoadOptions::default());
+        let p = Pipeline::load(
+            dir.to_str().unwrap(),
+            &LoadOptions {
+                // Not Auto: the test process must not settle on a GPU other tests do not use.
+                device: crate::platform::DevicePref::Cpu,
+                ..LoadOptions::default()
+            },
+        );
         let res = p.and_then(|p| {
             assert!(p.t5.is_some() && p.vae.encoder.is_some());
             assert_eq!(p.transformer.cfg.dual_attention_layers, vec![0]);
