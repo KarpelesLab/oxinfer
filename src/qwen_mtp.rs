@@ -31,7 +31,7 @@ use crate::model::{LayerCache, Lin, Quant, Table, linear};
 use crate::qwen::{Attn, Ffn, Loader, QwenModel, QwenSession};
 use crate::safetensors::ModelFiles;
 use crate::sampler::Sampler;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 
 /// A trimmed output head for drafting: logits over `d2t.len()` tokens, draft index `i` standing
 /// for target token `d2t[i]`.
@@ -170,6 +170,29 @@ impl<'a> QwenMtp<'a> {
             stream: None,
             exp: None,
         })
+    }
+
+    /// Attaches the MTP layer's modules of a LoRA adapter (`mtp.fc`, `mtp.layers.0.*`: GGUF
+    /// adapters' `blk.N.nextn.eh_proj` and the layer's tensors past the main layers; PEFT keys
+    /// `mtp.*`). Errors when one matches nothing (Qwen4-Exp's MTP layer takes none).
+    pub fn attach_lora(&mut self, cfg: &QwenConfig, ad: &mut crate::lora::LoraAdapter) -> Result<usize> {
+        if self.exp.is_some() {
+            ad.finish()?;
+            return Ok(0);
+        }
+        let h = self.hidden;
+        let (nh, nkv, hd) = (cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim);
+        let qw = if cfg.attn_output_gate { 2 * nh * hd } else { nh * hd };
+        ad.attach(&mut self.fc, "mtp.fc", h, 2 * h, None, None)?;
+        crate::qwen::lora_attn(
+            ad,
+            &mut self.attn,
+            "mtp.layers.0.self_attn.",
+            [qw, nh * hd, nkv * hd, h],
+            [&None, &None],
+        )?;
+        crate::qwen::lora_ffn(ad, &mut self.ffn, "mtp.layers.0.mlp.", h)?;
+        ad.finish()
     }
 
     /// The weights of each streaming unit: the layer (with `fc`), then the trimmed draft head.
@@ -450,9 +473,15 @@ impl<'a> QwenMtp<'a> {
 
 impl<'a> QwenModel<'a> {
     /// Loads this model's MTP layer from `files` (usually the checkpoint the model came from; a
-    /// sidecar with the same tensor names works too) at the model's precision.
+    /// sidecar with the same tensor names works too) at the model's precision, with the `mtp.*`
+    /// modules of the LoRA adapters attached to the model.
     pub fn load_mtp<'b>(&self, files: &'b ModelFiles) -> Result<QwenMtp<'b>> {
-        QwenMtp::load(&self.cfg, files, self.quant)
+        let mut m = QwenMtp::load(&self.cfg, files, self.quant)?;
+        for mut ad in self.mtp_loras() {
+            m.attach_lora(&self.cfg, &mut ad)
+                .with_context(|| format!("attach LoRA {} to the MTP layer", ad.dir.display()))?;
+        }
+        Ok(m)
     }
 }
 

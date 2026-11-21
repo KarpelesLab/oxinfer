@@ -120,6 +120,44 @@ fn tiny_gemma_moe() -> PathBuf {
     dir
 }
 
+/// A random PEFT adapter for [`tiny_gemma_moe`] in `dir`: attention query / output, the dense
+/// MLP and the routed experts (one module per expert; layer 1 gate / up only, layer 3 down only).
+fn tiny_adapter(dir: &Path) -> PathBuf {
+    let ad = dir.join("adapter");
+    std::fs::create_dir_all(&ad).unwrap();
+    let (heads, hd, ghd, inter, r) = (2usize, 256usize, 512usize, 256usize, 4usize);
+    let mut s = 99u64;
+    let mut t = Vec::new();
+    let mut pair = |name: String, n_out: usize, n_in: usize| {
+        let a: Vec<f32> = (0..r * n_in).map(|_| lcg(&mut s) * 2.0 / (n_in as f32).sqrt()).collect();
+        let b: Vec<f32> = (0..n_out * r).map(|_| lcg(&mut s) * 0.1).collect();
+        t.push((format!("base_model.model.{name}.lora_A.weight"), vec![r, n_in], a));
+        t.push((format!("base_model.model.{name}.lora_B.weight"), vec![n_out, r], b));
+    };
+    for l in 0..LAYERS {
+        let p = format!("model.layers.{l}.");
+        let d = if l % 2 == 0 { hd } else { ghd };
+        pair(format!("{p}self_attn.q_proj"), heads * d, H);
+        pair(format!("{p}self_attn.o_proj"), H, heads * d);
+        pair(format!("{p}mlp.gate_proj"), inter, H);
+        pair(format!("{p}mlp.up_proj"), inter, H);
+        pair(format!("{p}mlp.down_proj"), H, inter);
+        for e in 0..N_EXP {
+            if l != 3 {
+                pair(format!("{p}experts.{e}.gate_proj"), MI, H);
+                pair(format!("{p}experts.{e}.up_proj"), MI, H);
+            }
+            if l != 1 {
+                pair(format!("{p}experts.{e}.down_proj"), H, MI);
+            }
+        }
+    }
+    write_safetensors(&ad.join("adapter_model.safetensors"), &t);
+    let cfg = serde_json::json!({ "peft_type": "LORA", "r": r, "lora_alpha": 2 * r, "target_modules": ["q_proj"] });
+    std::fs::write(ad.join("adapter_config.json"), serde_json::to_vec(&cfg).unwrap()).unwrap();
+    ad
+}
+
 /// Largest relative difference (L2) of a row of `a` from the same row of `b` (rows of `n`).
 fn worst_row(a: &[f32], b: &[f32], n: usize) -> f32 {
     assert_eq!(a.len(), b.len());
@@ -171,6 +209,47 @@ fn gpu_prefill_plan_and_decode_match_cpu() {
         eprintln!("{quant:?}: prefill worst token {prefill:.2e}, decode worst step {decode:.2e}");
         assert!(prefill < 1e-2, "{quant:?}: prefill hidden states differ by {prefill}");
         assert!(decode < 2e-2, "{quant:?}: decode logits differ by {decode}");
+    }
+    // A runtime LoRA adapter (dense layers and every expert), on the device's side paths, at two
+    // strengths: the plans read the strength before every step.
+    let ad = tiny_adapter(&dir);
+    for quant in [Quant::Bf16, Quant::Q8] {
+        let mut model = Model::load(cfg.clone(), &files, quant).unwrap();
+        let spec = oxinfer::lora::LoraSpec {
+            path: ad.clone(),
+            scale: 1.0,
+        };
+        let att = oxinfer::lora::attach_specs(&mut model, &[spec], &dir, false).unwrap();
+        let mut refs = Vec::new();
+        for strength in [1.0f32, 0.4] {
+            att[0].set_strength(strength).unwrap();
+            oxinfer::gpu::set_exact(true);
+            oxinfer::gpu::set_decode(Some(false));
+            let all: Vec<u32> = tokens.iter().chain(&next).copied().collect();
+            let h_all = model.forward_hidden(&mut model.new_session(), &all);
+            let h_ref = &h_all[..tokens.len() * H];
+            let l_ref: Vec<Vec<f32>> = (tokens.len()..all.len())
+                .map(|i| model.logits(&h_all[i * H..(i + 1) * H], 1))
+                .collect();
+            oxinfer::gpu::set_exact(false);
+            oxinfer::gpu::set_decode(Some(true));
+            let mut s_gpu = model.new_session();
+            let h_gpu = model.forward_hidden(&mut s_gpu, &tokens);
+            let l_gpu: Vec<Vec<f32>> = next.iter().map(|&tk| model.forward(&mut s_gpu, &[tk])).collect();
+            let prefill = worst_row(&h_gpu, h_ref, H);
+            let decode = l_gpu.iter().zip(&l_ref).map(|(a, b)| worst_row(a, b, VOCAB)).fold(0f32, f32::max);
+            eprintln!("{quant:?} + LoRA at {strength}: prefill worst token {prefill:.2e}, decode worst step {decode:.2e}");
+            assert!(prefill < 1e-2, "{quant:?} + LoRA: prefill hidden states differ by {prefill}");
+            assert!(decode < 2e-2, "{quant:?} + LoRA: decode logits differ by {decode}");
+            refs.push(l_ref);
+        }
+        // The strengths give outputs further apart than the device is from the CPU.
+        let apart = refs[0]
+            .iter()
+            .zip(&refs[1])
+            .map(|(a, b)| worst_row(a, b, VOCAB))
+            .fold(0f32, f32::max);
+        assert!(apart > 0.1, "{quant:?}: the adapter's strength barely matters ({apart})");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

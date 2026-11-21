@@ -193,6 +193,7 @@ enum COp {
         r2off: u32,
         gelu: u32,
         add: u32,
+        lora: Option<Box<CxLora>>,
     },
     Norm {
         f: F,
@@ -282,6 +283,42 @@ enum COp {
         kind: u32,
         p: [f32; 3],
     },
+    /// `Op::LoraDown`: partial sums of `u = A x` over chunks of `LORA_CHUNK` inputs.
+    LoraDown {
+        f: F,
+        a: P,
+        x: P,
+        u: P,
+        n_in: u32,
+        r: u32,
+        nch: u32,
+    },
+    /// `Op::LoraUp`: `y += g sum_k u_k S_k bt_k` (`str`: the strengths).
+    LoraUp {
+        f: F,
+        bt: P,
+        sc: P,
+        str: P,
+        u: P,
+        y: P,
+        gate: P,
+        r: u32,
+        nch: u32,
+        n_out: u32,
+    },
+}
+
+/// The LoRA updates of a `COp::Experts` (`Experts::lora`): kernels, the stacks (A, B^T,
+/// strength ids, rank), the strengths, the raw gate / up outputs and the low-rank scratch.
+struct CxLora {
+    down: F,
+    act: F,
+    up: F,
+    gate_up: Option<(P, P, P, u32)>,
+    dn: Option<(P, P, P, u32)>,
+    str: P,
+    raw: P,
+    u: P,
 }
 
 impl COp {
@@ -290,7 +327,19 @@ impl COp {
         match self {
             COp::Mv { w, x, y, gate, .. } => vec![&mut w.q, &mut x.a, &mut y.a, &mut gate.a],
             COp::Topk { logits, sel, scale, .. } => vec![&mut logits.a, &mut sel.a, &mut scale.a],
-            COp::Experts { x, act, y, sel, .. } => vec![&mut x.a, &mut act.a, &mut y.a, &mut sel.a],
+            COp::Experts { x, act, y, sel, lora, .. } => {
+                let mut v = vec![&mut x.a, &mut act.a, &mut y.a, &mut sel.a];
+                if let Some(l) = lora {
+                    let CxLora {
+                        gate_up, dn, str, raw, u, ..
+                    } = &mut **l;
+                    for (a, bt, sc, _) in gate_up.iter_mut().chain(dn.iter_mut()) {
+                        v.extend([&mut a.a, &mut bt.a, &mut sc.a]);
+                    }
+                    v.extend([&mut str.a, &mut raw.a, &mut u.a]);
+                }
+                v
+            }
             COp::Norm { x, out, w, .. } => vec![&mut x.a, &mut out.a, &mut w.a],
             COp::AddNorm { y, x, out, wy, wn, .. } => vec![&mut y.a, &mut x.a, &mut out.a, &mut wy.a, &mut wn.a],
             COp::QkRope {
@@ -321,6 +370,10 @@ impl COp {
             }
             COp::Glu { g, u, out, .. } => vec![&mut g.a, &mut u.a, &mut out.a],
             COp::Ew { a, b, out, .. } => vec![&mut a.a, &mut b.a, &mut out.a],
+            COp::LoraDown { a, x, u, .. } => vec![&mut a.a, &mut x.a, &mut u.a],
+            COp::LoraUp {
+                bt, sc, str, u, y, gate, ..
+            } => vec![&mut bt.a, &mut sc.a, &mut str.a, &mut u.a, &mut y.a, &mut gate.a],
         }
     }
 }
@@ -365,6 +418,8 @@ pub(super) struct CudaPlan<'b> {
     events: Vec<*mut c_void>,
     /// Per op: the states it writes last.
     last_writer: Vec<Vec<usize>>,
+    /// The LoRA strengths' device address, and where to read them before a step.
+    strengths: (u64, Vec<crate::lora::Strength>),
 }
 unsafe impl Send for CudaPlan<'_> {}
 unsafe impl Sync for CudaPlan<'_> {}
@@ -512,6 +567,8 @@ fn op_name(op: &Op) -> &'static str {
         Op::QsaKey { .. } => "qsa-key",
         Op::QsaSelect { .. } => "qsa-select",
         Op::AttendSel { .. } => "qsa-attention",
+        Op::LoraDown { .. } => "lora-down",
+        Op::LoraUp { .. } => "lora-up",
     }
 }
 
@@ -563,6 +620,11 @@ impl CudaBackend {
         let kv_rows: Vec<usize> = g.kv.iter().map(|&(n, hd)| n * hd).collect();
         let kvout_len = 2 * tokens * kv_rows.iter().sum::<usize>();
         let kvout_off = region(kvout_len * 4);
+        let str_off = region(g.strengths.len().max(1) * 4);
+        let str_p = P {
+            a: A | str_off as u64,
+            ts: 0,
+        };
         let mut part_floats = 0usize;
         let mut consts: Vec<f32> = Vec::new();
         let mut cst = |v: &[f32]| -> P {
@@ -796,6 +858,39 @@ impl CudaBackend {
                             p,
                         });
                     }
+                    Op::LoraDown { ref a, x, u, r, n_in } => ops.push(COp::LoraDown {
+                        f: self.func("dlora_down")?,
+                        a: cst(a),
+                        x: byte(x),
+                        u: byte(u),
+                        n_in: n_in as u32,
+                        r: r as u32,
+                        nch: crate::gpu::decode::lora_chunks(n_in) as u32,
+                    }),
+                    Op::LoraUp {
+                        ref bt,
+                        ref scale,
+                        u,
+                        y,
+                        gate,
+                        r,
+                        n_in,
+                        n_out,
+                    } => {
+                        let sc: Vec<f32> = scale.iter().map(|&i| f32::from_bits(i)).collect();
+                        ops.push(COp::LoraUp {
+                            f: self.func("dlora_up")?,
+                            bt: cst(bt),
+                            sc: cst(&sc),
+                            str: str_p,
+                            u: byte(u),
+                            y: byte(y),
+                            gate: gate.map_or(P::default(), byte),
+                            r: r as u32,
+                            nch: crate::gpu::decode::lora_chunks(n_in) as u32,
+                            n_out: n_out as u32,
+                        });
+                    }
                     Op::Glu { g: gv, u, out, n, gelu } => ops.push(COp::Glu {
                         f: self.func("dglu")?,
                         g: byte(gv),
@@ -1004,6 +1099,28 @@ impl CudaBackend {
                             Some(u) => tab(u)?,
                             None => tab_g,
                         };
+                        let lora = match &ex.lora {
+                            Some(l) => {
+                                let mut stack = |st: &Option<crate::gpu::decode::LoraStack>| {
+                                    st.as_ref().map(|st| {
+                                        let sc: Vec<f32> = st.scale.iter().map(|&i| f32::from_bits(i)).collect();
+                                        (cst(&st.a), cst(&st.bt), cst(&sc), st.r as u32)
+                                    })
+                                };
+                                let (gate_up, dn) = (stack(&l.gate_up), stack(&l.down));
+                                Some(Box::new(CxLora {
+                                    down: self.func("dxlora_down")?,
+                                    act: self.func("dxlora_act")?,
+                                    up: self.func("dxlora_up")?,
+                                    gate_up,
+                                    dn,
+                                    str: str_p,
+                                    raw: byte(l.raw),
+                                    u: byte(l.u),
+                                }))
+                            }
+                            None => None,
+                        };
                         ops.push(COp::Experts {
                             pair: self.func(&format!("dmvx_{fg}_pair"))?,
                             sum: self.func(&format!("dmvx_{fd}_sum"))?,
@@ -1020,6 +1137,7 @@ impl CudaBackend {
                             r2off: if ex.up.is_some() { 0 } else { ex.inter as u32 },
                             gelu: ex.gelu as u32,
                             add: ex.add as u32,
+                            lora,
                         });
                     }
                     Op::Steer { .. } | Op::NeuronEdit { .. } | Op::HcPre { .. } | Op::HcPost { .. } | Op::PleGate { .. } => return None,
@@ -1126,6 +1244,7 @@ impl CudaBackend {
                 })
                 .collect(),
             last_writer,
+            strengths: (arena + str_off as u64, g.strengths.clone()),
             pinned: {
                 let n: usize = g.states.iter().sum();
                 let mut p: *mut c_void = std::ptr::null_mut();
@@ -1286,19 +1405,57 @@ impl CudaPlan<'_> {
                 r2off,
                 gelu,
                 add,
+                ref lora,
             } => {
                 let (x, act, y, sel) = (x.at(j), act.at(j), y.at(j), sel.at(j));
-                be.launch(
-                    pair,
-                    (inter.div_ceil(MV_ROWS), k),
-                    32 * MV_ROWS,
-                    &mut args![tab_g, tab_u, x, act, inter, h, r2off, gelu, sel],
-                ) && be.launch(
+                let Some(l) = lora else {
+                    return be.launch(
+                        pair,
+                        (inter.div_ceil(MV_ROWS), k),
+                        32 * MV_ROWS,
+                        &mut args![tab_g, tab_u, x, act, inter, h, r2off, gelu, sel],
+                    ) && be.launch(
+                        sum,
+                        (h.div_ceil(MV_ROWS), 1),
+                        32 * MV_ROWS,
+                        &mut args![tab_d, act, y, h, inter, k, add, sel],
+                    );
+                };
+                let (raw, u, st) = (l.raw.at(j), l.u.at(j), l.str.a);
+                // With a gate / up update: the raw outputs, their updates, then the activation.
+                let pre = match l.gate_up {
+                    Some((a, bt, sc, r)) => {
+                        let (a, bt, sc, zero, two) = (a.a, bt.a, sc.a, 0u32, 2u32);
+                        be.launch(
+                            pair,
+                            (inter.div_ceil(MV_ROWS), k),
+                            32 * MV_ROWS,
+                            &mut args![tab_g, tab_u, x, raw, inter, h, r2off, two, sel],
+                        ) && be.launch(l.down, (r, k), 128, &mut args![a, x, u, sel, h, r, zero])
+                            && be.launch(
+                                l.act,
+                                (inter.div_ceil(256), k),
+                                256,
+                                &mut args![raw, u, bt, sc, st, sel, act, inter, r, gelu],
+                            )
+                    }
+                    None => be.launch(
+                        pair,
+                        (inter.div_ceil(MV_ROWS), k),
+                        32 * MV_ROWS,
+                        &mut args![tab_g, tab_u, x, act, inter, h, r2off, gelu, sel],
+                    ),
+                };
+                pre && be.launch(
                     sum,
                     (h.div_ceil(MV_ROWS), 1),
                     32 * MV_ROWS,
                     &mut args![tab_d, act, y, h, inter, k, add, sel],
-                )
+                ) && l.dn.is_none_or(|(a, bt, sc, r)| {
+                    let (a, bt, sc) = (a.a, bt.a, sc.a);
+                    be.launch(l.down, (r, k), 128, &mut args![a, act, u, sel, inter, r, inter])
+                        && be.launch(l.up, (h.div_ceil(256), 1), 256, &mut args![u, bt, sc, st, sel, y, h, r, k])
+                })
             }
             COp::Norm {
                 f,
@@ -1405,6 +1562,31 @@ impl CudaPlan<'_> {
             COp::Ew { f, a, b, out, n, kind, p } => {
                 let (a, b, out) = (a.at(j), b.at(j), out.at(j));
                 be.launch(f, (n.div_ceil(256), 1), 256, &mut args![a, b, out, n, kind, p[0], p[1], p[2]])
+            }
+            COp::LoraDown { f, a, x, u, n_in, r, nch } => {
+                let (a, x, u) = (a.a, x.at(j), u.at(j));
+                be.launch(f, (r * nch, 1), 256, &mut args![a, x, u, n_in, r])
+            }
+            COp::LoraUp {
+                f,
+                bt,
+                sc,
+                str,
+                u,
+                y,
+                gate,
+                r,
+                nch,
+                n_out,
+            } => {
+                let (bt, sc, st, u, y, gate) = (bt.a, sc.a, str.a, u.at(j), y.at(j), gate.at(j));
+                let has_gate = (gate != 0) as u32;
+                be.launch(
+                    f,
+                    (n_out.div_ceil(256), 1),
+                    256,
+                    &mut args![bt, sc, st, u, y, gate, r, nch, n_out, has_gate],
+                )
             }
         }
     }
@@ -1528,6 +1710,12 @@ impl DecodePlan for CudaPlan<'_> {
             src += n;
             dst += (self.tokens * 2 * half * 4) as u64;
         }
+        if !self.strengths.1.is_empty() {
+            let v: Vec<f32> = self.strengths.1.iter().map(|s| s.get()).collect();
+            if !be.htod(self.strengths.0, &v) {
+                return false;
+            }
+        }
         let want_logits = s.logits.is_some() && self.logits.is_some();
         let end = if want_logits { self.ops.len() } else { self.head_from };
         let queue = self.async_states();
@@ -1554,6 +1742,7 @@ impl DecodePlan for CudaPlan<'_> {
                     COp::GdnRule { .. } => "gdn-rule",
                     COp::Glu { .. } => "glu",
                     COp::Ew { .. } => "ew",
+                    COp::LoraDown { .. } | COp::LoraUp { .. } => "lora",
                 };
                 let e = kinds.entry(k).or_default();
                 e.0 += 1;

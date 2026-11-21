@@ -237,6 +237,44 @@ pub struct QwenModel<'a> {
     stream_choice: crate::gpu::decode::DeviceChoice,
     /// Qwen4-Exp (hyper-connections, n-gram embedding, QSA; see `crate::qwen4exp`).
     pub(crate) exp: Option<Box<crate::qwen4exp::Exp<'a>>>,
+    /// LoRA modules of the MTP layer, kept until it loads (see [`QwenModel::mtp_loras`]).
+    mtp_loras: std::sync::Mutex<Vec<crate::lora::LoraAdapter>>,
+}
+
+/// Attaches `ad`'s modules of a full-attention block at `p` (`layers.N.self_attn.`): `dims` are
+/// the query (with its gate), attention output, key / value and hidden widths, `rows` the stored
+/// query and key row orders (Llama GGUF).
+pub(crate) fn lora_attn(
+    ad: &mut crate::lora::LoraAdapter,
+    a: &mut Attn,
+    p: &str,
+    dims: [usize; 4],
+    rows: [&Option<Vec<usize>>; 2],
+) -> Result<()> {
+    let [qw, ow, kvw, h] = dims;
+    ad.attach(&mut a.q, &format!("{p}q_proj"), qw, h, rows[0].as_deref(), None)?;
+    ad.attach(&mut a.k, &format!("{p}k_proj"), kvw, h, rows[1].as_deref(), None)?;
+    ad.attach(&mut a.v, &format!("{p}v_proj"), kvw, h, None, None)?;
+    ad.attach(&mut a.o, &format!("{p}o_proj"), h, ow, None, None)
+}
+
+/// Attaches `ad`'s modules of a feed-forward block at `p` (`layers.N.mlp.`): a dense MLP, or a
+/// MoE's routed experts (one update per expert, in either PEFT layout) and shared expert.
+pub(crate) fn lora_ffn(ad: &mut crate::lora::LoraAdapter, f: &mut Ffn, p: &str, h: usize) -> Result<()> {
+    let (m, p) = match f {
+        Ffn::Dense(m) => (m, p.to_string()),
+        Ffn::Moe(moe) => {
+            ad.attach_experts(&mut moe.experts, &format!("{p}experts"), h)?;
+            match &mut moe.shared {
+                Some(s) => (s, format!("{p}shared_expert.")),
+                None => return Ok(()),
+            }
+        }
+    };
+    let inter = m.inter;
+    ad.attach(&mut m.gate, &format!("{p}gate_proj"), inter, h, None, None)?;
+    ad.attach(&mut m.up, &format!("{p}up_proj"), inter, h, None, None)?;
+    ad.attach(&mut m.down, &format!("{p}down_proj"), h, inter, None, None)
 }
 
 /// Most tokens of a multi-token GPU pass (speculative verification).
@@ -913,7 +951,14 @@ impl<'a> QwenModel<'a> {
             gpu_plans: Default::default(),
             stream_choice: Default::default(),
             exp,
+            mtp_loras: Default::default(),
         })
+    }
+
+    /// The `mtp.*` modules of the attached LoRA adapters, for the MTP layer
+    /// ([`crate::qwen_mtp::QwenMtp::attach_lora`]): each a copy sharing its adapter's strength.
+    pub(crate) fn mtp_loras(&self) -> Vec<crate::lora::LoraAdapter> {
+        self.mtp_loras.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     /// Attaches the modules of a runtime LoRA adapter (see `crate::lora`) to the layers they
@@ -944,55 +989,34 @@ impl<'a> QwenModel<'a> {
         if let Some(d) = ad.take_embed(cfg.vocab_size, h)? {
             self.embed.add_lora(d);
         }
-        // Routed experts: one update per expert, in either PEFT layout.
-        for (l, layer) in self.layers.iter_mut().enumerate() {
-            if let Ffn::Moe(moe) = &mut layer.ffn {
-                ad.attach_experts(&mut moe.experts, &format!("layers.{l}.mlp.experts"), h)?;
-            }
-        }
-        let mut set = |lin: &mut Lin<'a>, name: String, n_out: usize, n_in: usize, rows: Option<&[usize]>, cols: Option<&[usize]>| {
-            ad.attach(lin, &name, n_out, n_in, rows, cols)
-        };
         for (l, layer) in self.layers.iter_mut().enumerate() {
             let lp = format!("layers.{l}.");
             match &mut layer.mixer {
                 Mixer::Lightning(_) | Mixer::Conv(_) => {}
                 Mixer::Gdn(g) => {
                     let p = format!("{lp}linear_attn.");
-                    set(
+                    ad.attach(
                         &mut g.qkv,
-                        format!("{p}in_proj_qkv"),
+                        &format!("{p}in_proj_qkv"),
                         2 * key_dim + value_dim,
                         h,
                         qkv_rows.as_deref(),
                         None,
                     )?;
-                    set(&mut g.z, format!("{p}in_proj_z"), value_dim, h, v_rows.as_deref(), None)?;
-                    set(&mut g.b, format!("{p}in_proj_b"), nv, h, head_rows.as_deref(), None)?;
-                    set(&mut g.a, format!("{p}in_proj_a"), nv, h, head_rows.as_deref(), None)?;
-                    set(&mut g.out, format!("{p}out_proj"), h, value_dim, None, v_rows.as_deref())?;
+                    ad.attach(&mut g.z, &format!("{p}in_proj_z"), value_dim, h, v_rows.as_deref(), None)?;
+                    ad.attach(&mut g.b, &format!("{p}in_proj_b"), nv, h, head_rows.as_deref(), None)?;
+                    ad.attach(&mut g.a, &format!("{p}in_proj_a"), nv, h, head_rows.as_deref(), None)?;
+                    ad.attach(&mut g.out, &format!("{p}out_proj"), h, value_dim, None, v_rows.as_deref())?;
                 }
-                Mixer::Attn(a) => {
-                    let p = format!("{lp}self_attn.");
-                    set(&mut a.q, format!("{p}q_proj"), qw, h, q_rows.as_deref(), None)?;
-                    set(&mut a.k, format!("{p}k_proj"), nkv * hd, h, k_rows.as_deref(), None)?;
-                    set(&mut a.v, format!("{p}v_proj"), nkv * hd, h, None, None)?;
-                    set(&mut a.o, format!("{p}o_proj"), h, nh * hd, None, None)?;
-                }
+                Mixer::Attn(a) => lora_attn(ad, a, &format!("{lp}self_attn."), [qw, nh * hd, nkv * hd, h], [&q_rows, &k_rows])?,
             }
-            let (m, p) = match &mut layer.ffn {
-                Ffn::Dense(m) => (m, format!("{lp}mlp.")),
-                Ffn::Moe(moe) => match &mut moe.shared {
-                    Some(s) => (s, format!("{lp}mlp.shared_expert.")),
-                    None => continue,
-                },
-            };
-            let inter = m.inter;
-            set(&mut m.gate, format!("{p}gate_proj"), inter, h, None, None)?;
-            set(&mut m.up, format!("{p}up_proj"), inter, h, None, None)?;
-            set(&mut m.down, format!("{p}down_proj"), h, inter, None, None)?;
+            lora_ffn(ad, &mut layer.ffn, &format!("{lp}mlp."), h)?;
         }
-        set(&mut self.lm_head, "lm_head".into(), cfg.vocab_size, h, None, None)?;
+        ad.attach(&mut self.lm_head, "lm_head", cfg.vocab_size, h, None, None)?;
+        // The MTP layer's modules (`mtp.*`) wait for it (`QwenModel::load_mtp`).
+        if let Some(m) = ad.split_mtp() {
+            self.mtp_loras.lock().unwrap_or_else(|p| p.into_inner()).push(m);
+        }
         ad.finish()
     }
 
@@ -1202,7 +1226,7 @@ impl<'a> QwenModel<'a> {
         let qw = if gated { 2 * nh * hd } else { nh * hd };
         // Streamed weights (layers outside the resident set) are wrapped by the plan per step.
         let dev = |l: &'s Lin, n_out: usize, n_in: usize| -> Option<&crate::gpu::DeviceWeight> {
-            if l.has_lora() || l.fold.is_some() {
+            if l.fold.is_some() {
                 return None;
             }
             if l.is_transient() {
@@ -1282,6 +1306,35 @@ impl<'a> QwenModel<'a> {
                 mode,
             })
         };
+        // Linear ops and their runtime LoRA updates (after all of them: the updates of a group
+        // then wait for the matvecs together).
+        type Job<'s> = (
+            &'s Lin<'s>,
+            usize,
+            usize,
+            crate::gpu::decode::View,
+            crate::gpu::decode::View,
+            LinMode,
+        );
+        let put_all = |g: &mut Graph<'s>, jobs: &[Job<'s>]| -> Option<()> {
+            for &(l, n_out, n_in, x, y, mode) in jobs {
+                g.ops.push(lin(l, n_out, n_in, x, y, mode)?);
+            }
+            let mut ups = Vec::new();
+            for &(l, _, _, x, y, mode) in jobs {
+                let gate = match mode {
+                    LinMode::AddGated(v) => Some(v),
+                    _ => None,
+                };
+                if let Some((down, up)) = g.lora_ops(l, x, y, gate)? {
+                    g.ops.push(down);
+                    ups.push(up);
+                }
+            }
+            g.ops.extend(ups);
+            Some(())
+        };
+        let put = |g: &mut Graph<'s>, l: &'s Lin, n_out: usize, n_in: usize, x, y, mode| put_all(g, &[(l, n_out, n_in, x, y, mode)]);
         // down(silu(gate(hn)) * up(hn)) added to x: one paired matvec when gate and up share a
         // format, else two and an elementwise op.
         let mlp = |g: &mut Graph<'s>, m: &'s Mlp<'s>, down_mode: LinMode, edit: Option<GpuNeurons>| -> Option<()> {
@@ -1289,7 +1342,7 @@ impl<'a> QwenModel<'a> {
                 return None;
             }
             let (gw, uw) = (m.gate.as_ref(), m.up.as_ref());
-            if crate::gpu::decode::pairable(&gw, &uw) {
+            if crate::gpu::decode::pairable(&gw, &uw) && !m.gate.has_lora() && !m.up.has_lora() {
                 g.ops.push(Op::Linear {
                     w: gw,
                     dev: dev(&m.gate, m.inter, h)?,
@@ -1301,8 +1354,13 @@ impl<'a> QwenModel<'a> {
                     mode: LinMode::SiluPair,
                 });
             } else {
-                g.ops.push(lin(&m.gate, m.inter, h, hn, act2, LinMode::Store)?);
-                g.ops.push(lin(&m.up, m.inter, h, hn, act, LinMode::Store)?);
+                put_all(
+                    g,
+                    &[
+                        (&m.gate, m.inter, h, hn, act2, LinMode::Store),
+                        (&m.up, m.inter, h, hn, act, LinMode::Store),
+                    ],
+                )?;
                 g.ops.push(Op::Glu {
                     g: act2,
                     u: act,
@@ -1318,7 +1376,7 @@ impl<'a> QwenModel<'a> {
                     n: e.n,
                 });
             }
-            g.ops.push(lin(&m.down, h, m.inter, act, x, down_mode)?);
+            put(g, &m.down, h, m.inter, act, x, down_mode)?;
             Some(())
         };
         // The feed-forward block of a layer on hn, added to x: a dense MLP, or the MoE's routed
@@ -1332,7 +1390,7 @@ impl<'a> QwenModel<'a> {
             // Streamed experts (always on-demand parts of their layer) are wrapped per step by
             // the plan once routing chose them.
             let streams = self.stream.is_some();
-            let off = |l: &Lin| l.has_lora() || (l.is_transient() && !streams);
+            let off = |l: &Lin| l.is_transient() && !streams;
             if m.experts.act != crate::moe::Act::Silu || m.experts.down.iter().any(off) {
                 return None;
             }
@@ -1365,6 +1423,7 @@ impl<'a> QwenModel<'a> {
                     _ => return None,
                 }
             }
+            let lora = g.expert_lora(&m.experts, m.experts.top_k)?;
             g.ops.push(Op::Experts(crate::gpu::decode::Experts {
                 gate,
                 up: (!up.is_empty()).then_some(up),
@@ -1379,6 +1438,7 @@ impl<'a> QwenModel<'a> {
                 gelu: false,
                 add: true,
                 edits: ee.map(|e| (hot.at(e.hot), e.n)),
+                lora,
             }));
             Some(())
         };
@@ -1432,11 +1492,15 @@ impl<'a> QwenModel<'a> {
                     let st = g.states.len();
                     g.states.push(nv * hdk * hdv);
                     g.states.push((cfg.linear_conv_kernel_dim - 1) * conv_dim);
-                    g.ops.push(lin(&gd.qkv, conv_dim, h, hn, gproj, LinMode::Store)?);
-                    g.ops.push(lin(&gd.z, value_dim, h, hn, gproj.at(conv_dim), LinMode::Store)?);
-                    g.ops.push(lin(&gd.b, nv, h, hn, gproj.at(conv_dim + value_dim), LinMode::Store)?);
-                    g.ops
-                        .push(lin(&gd.a, nv, h, hn, gproj.at(conv_dim + value_dim + nv), LinMode::Store)?);
+                    put_all(
+                        &mut g,
+                        &[
+                            (&gd.qkv, conv_dim, h, hn, gproj, LinMode::Store),
+                            (&gd.z, value_dim, h, hn, gproj.at(conv_dim), LinMode::Store),
+                            (&gd.b, nv, h, hn, gproj.at(conv_dim + value_dim), LinMode::Store),
+                            (&gd.a, nv, h, hn, gproj.at(conv_dim + value_dim + nv), LinMode::Store),
+                        ],
+                    )?;
                     g.ops.push(Op::GdnConv {
                         x: gproj,
                         out: gconv,
@@ -1463,7 +1527,7 @@ impl<'a> QwenModel<'a> {
                         norm_w: &gd.norm_w,
                         eps,
                     }));
-                    g.ops.push(lin(&gd.out, h, value_dim, gout, x, LinMode::Add)?);
+                    put(&mut g, &gd.out, h, value_dim, gout, x, LinMode::Add)?;
                     steer(&mut g, 2 * li + 1);
                     g.ops.push(Op::norm(x, hn, &layer.ln_post, h, eps));
                     ffn(&mut g, &layer.ffn, li)?;
@@ -1477,9 +1541,14 @@ impl<'a> QwenModel<'a> {
             }
             let slot = g.kv.len();
             g.kv.push((nkv, hd));
-            g.ops.push(lin(&at.q, qw, h, hn, qkv, LinMode::Store)?);
-            g.ops.push(lin(&at.k, nkv * hd, h, hn, qkv.at(qw), LinMode::Store)?);
-            g.ops.push(lin(&at.v, nkv * hd, h, hn, qkv.at(qw + nkv * hd), LinMode::Store)?);
+            put_all(
+                &mut g,
+                &[
+                    (&at.q, qw, h, hn, qkv, LinMode::Store),
+                    (&at.k, nkv * hd, h, hn, qkv.at(qw), LinMode::Store),
+                    (&at.v, nkv * hd, h, hn, qkv.at(qw + nkv * hd), LinMode::Store),
+                ],
+            )?;
             g.ops.push(Op::QkRope {
                 qkv,
                 q_out: qo,
@@ -1511,7 +1580,7 @@ impl<'a> QwenModel<'a> {
                 gate: gated.then_some((qkv.at(hd), 2 * hd)),
                 block: None,
             });
-            g.ops.push(lin(&at.o, h, nh * hd, att, x, LinMode::Add)?);
+            put(&mut g, &at.o, h, nh * hd, att, x, LinMode::Add)?;
             steer(&mut g, 2 * li + 1);
             g.ops.push(Op::norm(x, hn, &layer.ln_post, h, eps));
             ffn(&mut g, &layer.ffn, li)?;
@@ -1524,7 +1593,7 @@ impl<'a> QwenModel<'a> {
         if prefill {
             return Some(g);
         }
-        g.ops.push(lin(&self.lm_head, cfg.vocab_size, h, hidden, logits, LinMode::Store)?);
+        put(&mut g, &self.lm_head, cfg.vocab_size, h, hidden, logits, LinMode::Store)?;
         g.logits = Some((logits, cfg.vocab_size));
         Some(g)
     }

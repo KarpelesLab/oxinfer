@@ -470,6 +470,9 @@ pub(crate) enum MvMode {
     SiluPair = 2,
     GeluPair = 3,
     AddGated = 4,
+    /// The experts' pair kernels with LoRA updates: the raw gate and up outputs (`2 n_out` per
+    /// slot), the activation taken after the updates (`xlora_act`).
+    RawPair = 5,
 }
 
 impl MetalBackend {
@@ -1079,6 +1082,8 @@ enum MOp {
         /// Multi-token plans: the x, selection, activation and y strides in bytes (each token's
         /// experts through the single-token kernels: tokens route to different experts).
         t: Option<[usize; 4]>,
+        /// Runtime LoRA updates of the experts (`Experts::lora`).
+        lora: Option<Box<XLora>>,
     },
     QkRope {
         pipe: Id,
@@ -1125,6 +1130,26 @@ enum MOp {
         gelu: u32,
         /// Multi-token plans: the pipeline and the g, u, out strides.
         t: Option<(Id, [u32; 4])>,
+    },
+    /// `Op::LoraDown`: partial sums of `u = A x` (`lora_down`, a threadgroup per chunk, component
+    /// and token); `a` in the constants.
+    LoraDown {
+        pipe: Id,
+        a: usize,
+        x: usize,
+        u: usize,
+        p: LoraParams,
+    },
+    /// `Op::LoraUp`: `y += g sum_k u_k S_k bt_k` (`lora_up`, 256 outputs per threadgroup);
+    /// `bt`, `sc` in the constants, the strengths at `MetalPlan::strengths` in the arena.
+    LoraUp {
+        pipe: Id,
+        bt: usize,
+        sc: usize,
+        u: usize,
+        y: usize,
+        gate: Option<usize>,
+        p: LoraParams,
     },
     /// See `Op::PleGate`.
     PleGate {
@@ -1337,6 +1362,44 @@ enum MOp {
     },
 }
 
+/// `lora_down` / `lora_up` parameters (see the shader's `LoraP`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct LoraParams {
+    n_in: u32,
+    r: u32,
+    n_out: u32,
+    xs: u32,
+    us: u32,
+    ys: u32,
+    gs: u32,
+    has_gate: u32,
+}
+
+/// One stack of expert LoRA updates in the constants (`LoraStack`): A, B^T, strength ids.
+#[derive(Clone)]
+struct XStack {
+    a: usize,
+    bt: usize,
+    sc: usize,
+    r: u32,
+}
+
+/// The LoRA updates of an `MOp::Experts` (see `Experts::lora`): the pipelines, the stacks, and
+/// the arena offsets of the raw gate / up outputs and of the low-rank scratch (token strides in
+/// bytes for multi-token plans).
+#[derive(Clone)]
+struct XLora {
+    down: Id,
+    act: Id,
+    up: Id,
+    gate_up: Option<XStack>,
+    dn: Option<XStack>,
+    raw: usize,
+    u: usize,
+    t: [usize; 2],
+}
+
 /// The routed experts of a prefill plan's MoE layer (`MOp::PfExperts`): grouped GEMM pipelines,
 /// the experts' address tables (data, scales), GGUF row bytes, and the activations.
 struct PfExperts {
@@ -1357,6 +1420,18 @@ struct PfExperts {
     n_exp: usize,
     /// GELU-tanh experts (Gemma 4), else SiLU.
     gelu: bool,
+    /// Runtime LoRA updates of the experts (`Experts::lora`).
+    lora: Option<PfXLora>,
+}
+
+/// The LoRA updates of a prefill plan's routed experts: `pfx_lora_down` / `pfx_lora_add`, the
+/// gate / up and down stacks, and the larger rank.
+struct PfXLora {
+    down: Id,
+    add: Id,
+    gate_up: Option<XStack>,
+    dn: Option<XStack>,
+    r: usize,
 }
 
 /// A prefill plan's state beyond a multi-token plan's: arena offsets of the GEMM scratch (half
@@ -1369,7 +1444,7 @@ struct PfState {
     experts: Vec<PfExperts>,
     /// Staging: the buffer and offsets of src, tiles, slots, xh, rs, gu, ah, rs2, o.
     stage: Id,
-    st: [usize; 9],
+    st: [usize; 11],
     max_rows: usize,
     max_tiles: usize,
 }
@@ -1414,6 +1489,8 @@ pub(crate) struct MetalPlan<'b> {
     /// cold values in the arena.
     params: Option<((usize, usize), (usize, usize))>,
     params_key: AtomicU64,
+    /// LoRA updates: the arena offset of their strengths, and where to read them before a step.
+    strengths: (usize, Vec<crate::lora::Strength>),
     /// One step at a time (the arena is shared).
     lock: Mutex<()>,
     /// Identifies the slots this plan can use: plans of the same model (one-token, multi-token,
@@ -1619,6 +1696,9 @@ impl MetalBackend {
         let rope_off = total;
         total += (tokens * 2 * g.rope_halves.iter().sum::<usize>() * 4).next_multiple_of(256);
         let rope_table = |r: usize| rope_off + tokens * 2 * g.rope_halves[..r].iter().sum::<usize>() * 4;
+        // The LoRA strengths (`Graph::strengths`), written before every step.
+        let str_off = total;
+        total += (g.strengths.len().max(1) * 4).next_multiple_of(256);
         // Prefill plans: the GEMM scratch (half rows, their scales, outputs before an add or a
         // pair's activation).
         let (mut pf_xh, mut pf_rs, mut pf_tmp, mut pf_tmp_n) = (0, 0, 0, 0);
@@ -2123,6 +2203,31 @@ impl MetalBackend {
                     if ex.edits.is_some() || ex.add {
                         return None;
                     }
+                    let lora = match &ex.lora {
+                        Some(l) => {
+                            let mut stack = |st: &Option<crate::gpu::decode::LoraStack>| {
+                                st.as_ref().map(|st| {
+                                    let sc: Vec<f32> = st.scale.iter().map(|&i| f32::from_bits(i)).collect();
+                                    XStack {
+                                        a: cst(&st.a),
+                                        bt: cst(&st.bt),
+                                        sc: cst(&sc),
+                                        r: st.r as u32,
+                                    }
+                                })
+                            };
+                            let (gate_up, dn) = (stack(&l.gate_up), stack(&l.down));
+                            let r = gate_up.as_ref().map_or(0, |s| s.r).max(dn.as_ref().map_or(0, |s| s.r)) as usize;
+                            Some(PfXLora {
+                                down: self.named_pipeline("pfx_lora_down")?,
+                                add: self.named_pipeline("pfx_lora_add")?,
+                                gate_up,
+                                dn,
+                                r,
+                            })
+                        }
+                        None => None,
+                    };
                     let (tabs, fused, _, _, _) = self.expert_tables(ex, &mut owned, &mut shared, &mut indirect, None)?;
                     let n = ex.gate.len();
                     // Grouped GEMM tables: (data, scales) per expert, from the decode tables.
@@ -2191,6 +2296,7 @@ impl MetalBackend {
                         k: ex.k,
                         n_exp: n,
                         gelu: ex.gelu,
+                        lora,
                     });
                     (vec![rng(ex.x, ex.h), rng(ex.sel, 2 * ex.k)], vec![rng(ex.y, ex.h)])
                 }
@@ -2232,6 +2338,33 @@ impl MetalBackend {
                         Some((v, n)) => Some((self.named_pipeline("dec_neuron_edit")?, byte(v), n as u32)),
                         None => None,
                     };
+                    let lora = match &ex.lora {
+                        Some(l) => {
+                            let mut stack = |st: &Option<crate::gpu::decode::LoraStack>| {
+                                st.as_ref().map(|st| {
+                                    let sc: Vec<f32> = st.scale.iter().map(|&i| f32::from_bits(i)).collect();
+                                    XStack {
+                                        a: cst(&st.a),
+                                        bt: cst(&st.bt),
+                                        sc: cst(&sc),
+                                        r: st.r as u32,
+                                    }
+                                })
+                            };
+                            let (gate_up, dn) = (stack(&l.gate_up), stack(&l.down));
+                            Some(Box::new(XLora {
+                                down: self.named_pipeline("xlora_down")?,
+                                act: self.named_pipeline("xlora_act")?,
+                                up: self.named_pipeline("xlora_up")?,
+                                gate_up,
+                                dn,
+                                raw: byte(l.raw),
+                                u: byte(l.u),
+                                t: [ts(l.raw) * 4, ts(l.u) * 4],
+                            }))
+                        }
+                        None => None,
+                    };
                     emit.push(MOp::Experts {
                         pair: self.named_pipeline(&format!("mvx_{}_pair", pf.0.name()))?,
                         sum: self.named_pipeline(&format!("mvx_{}_sum", pf.1.name()))?,
@@ -2250,6 +2383,7 @@ impl MetalBackend {
                         k: ex.k,
                         edit,
                         t: mt.then(|| [ts(ex.x) * 4, ts(ex.sel) * 4, ts(ex.act) * 4, ts(ex.y) * 4]),
+                        lora,
                     });
                     let mut r = vec![
                         rng(ex.x, ex.h),
@@ -2260,7 +2394,15 @@ impl MetalBackend {
                     if let Some((v, n)) = ex.edits {
                         r.push(rng(v, n * crate::intervene::GPU_ENTRY));
                     }
-                    (r, vec![rng(ex.act, ex.k * ex.inter), rng(ex.y, ex.h)])
+                    let mut w = vec![rng(ex.act, ex.k * ex.inter), rng(ex.y, ex.h)];
+                    if let Some(l) = &ex.lora {
+                        w.push(rng(l.raw, 2 * ex.k * ex.inter));
+                        w.push(rng(
+                            l.u,
+                            ex.k * l.gate_up.as_ref().map_or(0, |s| s.r).max(l.down.as_ref().map_or(0, |s| s.r)),
+                        ));
+                    }
+                    (r, w)
                 }
                 Op::AddNorm {
                     y,
@@ -2383,6 +2525,61 @@ impl MetalBackend {
                         },
                     });
                     (vec![rng(k, hc * n), rng(q, hc * n), rng(v, n)], vec![rng(out, hc * n)])
+                }
+                Op::LoraDown { ref a, x, u, r, n_in } => {
+                    let nch = crate::gpu::decode::lora_chunks(n_in);
+                    emit.push(MOp::LoraDown {
+                        pipe: self.named_pipeline("lora_down")?,
+                        a: cst(a),
+                        x: byte(x),
+                        u: byte(u),
+                        p: LoraParams {
+                            n_in: n_in as u32,
+                            r: r as u32,
+                            n_out: nch as u32,
+                            xs: ts(x) as u32,
+                            us: ts(u) as u32,
+                            ys: 0,
+                            gs: 0,
+                            // (LoraDown: whether x and its rows are 16-byte aligned, for float4 loads.)
+                            has_gate: (byte(x) % 16 == 0 && ts(x) % 4 == 0 && n_in % 4 == 0) as u32,
+                        },
+                    });
+                    (vec![rng(x, n_in)], vec![rng(u, r * nch)])
+                }
+                Op::LoraUp {
+                    ref bt,
+                    ref scale,
+                    u,
+                    y,
+                    gate,
+                    r,
+                    n_in,
+                    n_out,
+                } => {
+                    let nch = crate::gpu::decode::lora_chunks(n_in);
+                    let sc: Vec<f32> = scale.iter().map(|&i| f32::from_bits(i)).collect();
+                    emit.push(MOp::LoraUp {
+                        pipe: self.named_pipeline("lora_up")?,
+                        bt: cst(bt),
+                        sc: cst(&sc),
+                        u: byte(u),
+                        y: byte(y),
+                        gate: gate.map(byte),
+                        p: LoraParams {
+                            n_in: nch as u32,
+                            r: r as u32,
+                            n_out: n_out as u32,
+                            xs: 0,
+                            us: ts(u) as u32,
+                            ys: ts(y) as u32,
+                            gs: gate.map_or(0, ts) as u32,
+                            has_gate: gate.is_some() as u32,
+                        },
+                    });
+                    let mut rd = vec![rng(u, r * nch), rng(y, n_out)];
+                    rd.extend(gate.map(|v| rng(v, 1)));
+                    (rd, vec![rng(y, n_out)])
                 }
                 Op::Glu { g: gv, u, out, n, gelu } => {
                     emit.push(MOp::Glu {
@@ -3005,8 +3202,11 @@ impl MetalBackend {
                 max_rows * mi * 2,
                 (max_rows + 128) * 4,
                 max_rows * h * 4,
+                // LoRA updates: each row's expert, the low-rank scratch.
+                max_rows * 4,
+                max_rows * pf_experts.iter().filter_map(|x| x.lora.as_ref()).map(|l| l.r).max().unwrap_or(0) * 4,
             ];
-            let mut st = [0usize; 9];
+            let mut st = [0usize; 11];
             let mut sz = 0;
             for (o, n) in st.iter_mut().zip(sizes) {
                 *o = sz;
@@ -3105,6 +3305,7 @@ impl MetalBackend {
             states: g.states.clone(),
             params: g.params.map(|((h, hn), (c, cn))| ((byte(h), hn), (byte(c), cn))),
             params_key: AtomicU64::new(0),
+            strengths: (str_off, g.strengths.clone()),
             lock: Mutex::new(()),
             id: layout_id(g),
             gate: if streamed.is_empty() && experts.is_empty() {
@@ -3460,9 +3661,13 @@ impl MetalPlan<'_> {
                 k,
                 edit: None,
                 t: tk,
+                lora,
             } => {
                 // Every token's gate / up pairs, then every token's down projections.
                 let [sx, ssel, sact, sy] = tk.expect("multi-token experts");
+                if lora.is_some() {
+                    return self.encode_xlora(e, op, arena, consts, t, [sx, ssel, sact, sy]);
+                }
                 let p = |n_out: usize, n_in: usize, mode: MvMode, q: (u32, u32), r2: usize| MvParams {
                     n_out: n_out as u32,
                     n_in: n_in as u32,
@@ -3604,6 +3809,7 @@ impl MetalPlan<'_> {
                 e.bytes(&ts, 5);
                 e.dispatch(((*n as usize).div_ceil(256), t), 256);
             }
+            MOp::LoraDown { .. } | MOp::LoraUp { .. } => self.encode_lora(e, op, arena, consts, t),
             MOp::Glu {
                 g, u, out, n, gelu, t: tk, ..
             } => {
@@ -3830,6 +4036,204 @@ impl MetalPlan<'_> {
     }
 }
 
+/// `pfx_lora_*` parameters (see the shader's `PxLoraP`).
+#[repr(C)]
+struct PxLoraParams {
+    n_in: u32,
+    r: u32,
+    n: u32,
+    xs: u32,
+    split: u32,
+    gelu: u32,
+    _p: [u32; 2],
+}
+
+/// `xlora_*` parameters (see the shader's `XLoraP`).
+#[repr(C)]
+struct XLoraParams {
+    n_in: u32,
+    r: u32,
+    n_out: u32,
+    xs: u32,
+    k: u32,
+    gelu: u32,
+    _p: [u32; 2],
+}
+
+impl MetalPlan<'_> {
+    /// Encodes `MOp::LoraDown` / `MOp::LoraUp` for `t` tokens.
+    fn encode_lora(&self, e: &FastEnc, op: &MOp, arena: Id, consts: Id, t: usize) {
+        match op {
+            MOp::LoraDown { pipe, a, x, u, p } => {
+                e.pipe(*pipe);
+                e.buf(consts, *a, 0);
+                e.buf(arena, *x, 1);
+                e.buf(arena, *u, 2);
+                e.bytes(p, 3);
+                e.dispatch(((p.n_out * p.r) as usize, t), 256);
+            }
+            MOp::LoraUp {
+                pipe,
+                bt,
+                sc,
+                u,
+                y,
+                gate,
+                p,
+            } => {
+                e.pipe(*pipe);
+                e.buf(consts, *bt, 0);
+                e.buf(consts, *sc, 1);
+                e.buf(arena, self.strengths.0, 2);
+                e.buf(arena, *u, 3);
+                e.buf(arena, *y, 4);
+                e.buf(arena, gate.unwrap_or(*y), 5);
+                e.bytes(p, 6);
+                e.dispatch(((p.n_out as usize).div_ceil(256), t), 256);
+            }
+            _ => {}
+        }
+    }
+
+    /// Encodes an `MOp::Experts` with LoRA updates for `t` tokens (`ts`: the x, selection,
+    /// activation and y strides in bytes; 0 for one token), each stage over every token: the
+    /// pairs (raw outputs with a gate / up update), the updates and the activation, the neuron
+    /// edits, the down projections, then their updates.
+    fn encode_xlora(&self, e: &FastEnc, op: &MOp, arena: Id, consts: Id, t: usize, ts: [usize; 4]) {
+        let MOp::Experts {
+            pair,
+            sum,
+            tabs,
+            fused,
+            gelu,
+            add,
+            g,
+            d,
+            x,
+            sel,
+            act,
+            y,
+            h,
+            inter,
+            k,
+            edit,
+            lora: Some(l),
+            ..
+        } = op
+        else {
+            return;
+        };
+        let [sx, ssel, sact, sy] = ts;
+        let [sraw, su] = if t > 1 { l.t } else { [0, 0] };
+        let (h, mi, k) = (*h, *inter, *k);
+        let p = |n_out: usize, n_in: usize, mode: MvMode, q: (u32, u32), r2: usize| MvParams {
+            n_out: n_out as u32,
+            n_in: n_in as u32,
+            mode: mode as u32,
+            rows_per_tg: 1,
+            gpr: q.0,
+            gk: q.1,
+            ldy: k as u32,
+            _p: r2 as u32,
+            ..Default::default()
+        };
+        let xp = |n_in: usize, r: u32, n_out: usize, xs: usize| XLoraParams {
+            n_in: n_in as u32,
+            r,
+            n_out: n_out as u32,
+            xs: xs as u32,
+            k: k as u32,
+            gelu: *gelu as u32,
+            _p: [0; 2],
+        };
+        e.pipe(*pair);
+        e.buf(tabs[0], 0, 0);
+        e.buf(if *fused { tabs[0] } else { tabs[1] }, 0, 1);
+        let am = match (&l.gate_up, *gelu) {
+            (Some(_), _) => MvMode::RawPair,
+            (None, true) => MvMode::GeluPair,
+            (None, false) => MvMode::SiluPair,
+        };
+        e.bytes(&p(mi, h, am, *g, if *fused { mi } else { 0 }), 4);
+        let out = if l.gate_up.is_some() { (l.raw, sraw) } else { (*act, sact) };
+        for j in 0..t {
+            e.buf(arena, *x + j * sx, 2);
+            e.buf(arena, out.0 + j * out.1, 3);
+            e.buf(arena, *sel + j * ssel, 5);
+            e.dispatch((mi, k), 32);
+        }
+        e.barrier();
+        if let Some(gu) = &l.gate_up {
+            e.pipe(l.down);
+            e.buf(consts, gu.a, 0);
+            e.bytes(&xp(h, gu.r, 2 * mi, 0), 4);
+            for j in 0..t {
+                e.buf(arena, *x + j * sx, 1);
+                e.buf(arena, l.u + j * su, 2);
+                e.buf(arena, *sel + j * ssel, 3);
+                e.dispatch((gu.r as usize, k), 128);
+            }
+            e.barrier();
+            e.pipe(l.act);
+            e.buf(consts, gu.bt, 2);
+            e.buf(consts, gu.sc, 3);
+            e.buf(arena, self.strengths.0, 4);
+            e.bytes(&xp(h, gu.r, mi, 0), 7);
+            for j in 0..t {
+                e.buf(arena, l.raw + j * sraw, 0);
+                e.buf(arena, l.u + j * su, 1);
+                e.buf(arena, *sel + j * ssel, 5);
+                e.buf(arena, *act + j * sact, 6);
+                e.dispatch((mi.div_ceil(256), k), 256);
+            }
+            e.barrier();
+        }
+        if let Some((pipe, hot, n)) = edit {
+            e.pipe(*pipe);
+            e.buf(arena, *act, 0);
+            e.buf(arena, *hot, 1);
+            e.buf(arena, *sel, 2);
+            e.bytes(&[*n, mi as u32, k as u32, 1u32], 3);
+            e.dispatch(((*n as usize).div_ceil(64), 1), 64);
+            e.barrier();
+        }
+        e.pipe(*sum);
+        e.buf(tabs[2], 0, 0);
+        e.buf(tabs[2], 0, 1);
+        e.bytes(&p(h, mi, if *add { MvMode::Add } else { MvMode::Store }, *d, 0), 4);
+        for j in 0..t {
+            e.buf(arena, *act + j * sact, 2);
+            e.buf(arena, *y + j * sy, 3);
+            e.buf(arena, *sel + j * ssel, 5);
+            e.dispatch((h, 1), 32);
+        }
+        if let Some(dn) = &l.dn {
+            e.barrier();
+            e.pipe(l.down);
+            e.buf(consts, dn.a, 0);
+            e.bytes(&xp(mi, dn.r, h, mi), 4);
+            for j in 0..t {
+                e.buf(arena, *act + j * sact, 1);
+                e.buf(arena, l.u + j * su, 2);
+                e.buf(arena, *sel + j * ssel, 3);
+                e.dispatch((dn.r as usize, k), 128);
+            }
+            e.barrier();
+            e.pipe(l.up);
+            e.buf(consts, dn.bt, 1);
+            e.buf(consts, dn.sc, 2);
+            e.buf(arena, self.strengths.0, 3);
+            e.bytes(&xp(mi, dn.r, h, mi), 6);
+            for j in 0..t {
+                e.buf(arena, l.u + j * su, 0);
+                e.buf(arena, *sel + j * ssel, 4);
+                e.buf(arena, *y + j * sy, 5);
+                e.dispatch((h.div_ceil(256), 1), 256);
+            }
+        }
+    }
+}
+
 impl MetalPlan<'_> {
     /// Prefill plans: the routing of `t` tokens for `x`'s layer, read back from the arena, as
     /// grouped GEMM work in the staging buffer (as `Backend::moe`): each expert's rows gathered
@@ -3874,6 +4278,8 @@ impl MetalPlan<'_> {
         unsafe {
             let src = std::slice::from_raw_parts_mut(sb.add(pf.st[0]) as *mut u32, rows);
             src.fill(u32::MAX);
+            let rexp = std::slice::from_raw_parts_mut(sb.add(pf.st[9]) as *mut u32, rows);
+            rexp.fill(u32::MAX);
             let slots = std::slice::from_raw_parts_mut(sb.add(pf.st[2]) as *mut [u32; 2], t * k);
             for j in 0..t {
                 for i in 0..k {
@@ -3881,6 +4287,7 @@ impl MetalPlan<'_> {
                     let r = start[e];
                     start[e] += 1;
                     src[r] = j as u32;
+                    rexp[r] = e as u32;
                     slots[j * k + i] = [r as u32, wts[j * k + i].to_bits()];
                 }
             }
@@ -4093,6 +4500,46 @@ impl MetalPlan<'_> {
                     None => grouped(x.pipes.0, x.tabs[0], st(3), st(5), st(4), &params(2 * mi, h, x.row_bytes.0)),
                 }
                 e.barrier();
+                let split = if x.up.is_some() { er as u32 } else { 0 };
+                let lp = |n_in: usize, r: u32, n: usize, xs: u32| PxLoraParams {
+                    n_in: n_in as u32,
+                    r,
+                    n: n as u32,
+                    xs,
+                    split,
+                    gelu: x.gelu as u32,
+                    _p: [0; 2],
+                };
+                // LoRA updates (`lora`): u = A_e (x or act) per row, then the rows' outputs += ...
+                let lora_pass = |stk: &XStack, l: &PfXLora, inp: (Id, usize), p: &PxLoraParams, out: usize, two: u32| {
+                    e.pipe(l.down);
+                    e.buf(consts, stk.a, 0);
+                    e.buf(inp.0, inp.1, 1);
+                    e.buf(sb, st(0), 2);
+                    e.buf(sb, st(9), 3);
+                    e.buf(sb, st(10), 4);
+                    e.bytes(p, 5);
+                    e.dispatch((stk.r as usize, er), 128);
+                    e.barrier();
+                    e.pipe(l.add);
+                    e.buf(sb, st(10), 0);
+                    e.buf(consts, stk.bt, 1);
+                    e.buf(consts, stk.sc, 2);
+                    e.buf(arena, self.strengths.0, 3);
+                    e.buf(sb, st(0), 4);
+                    e.buf(sb, st(9), 5);
+                    e.buf(sb, out, 6);
+                    e.bytes(p, 7);
+                    e.bytes(&two, 8);
+                    let w = if two != 0 { 2 * p.n } else { p.n } as usize;
+                    e.dispatch((w.div_ceil(256), er), 256);
+                    e.barrier();
+                };
+                if let Some(l) = &x.lora
+                    && let Some(gu) = &l.gate_up
+                {
+                    lora_pass(gu, l, (arena, x.x), &lp(h, gu.r, mi, x.x_stride), st(5), 1);
+                }
                 #[repr(C)]
                 struct Sh {
                     n: u32,
@@ -4117,6 +4564,11 @@ impl MetalPlan<'_> {
                 e.barrier();
                 grouped(x.pipes.1, x.tabs[2], st(6), st(8), st(7), &params(h, mi, x.row_bytes.1));
                 e.barrier();
+                if let Some(l) = &x.lora
+                    && let Some(dn) = &l.dn
+                {
+                    lora_pass(dn, l, (sb, st(5)), &lp(mi, dn.r, h, 0), st(8), 0);
+                }
                 #[repr(C)]
                 struct Cb {
                     n: u32,
@@ -4860,6 +5312,10 @@ impl DecodePlan for MetalPlan<'_> {
             (None, None) => {}
             _ => return false,
         }
+        for (i, st) in self.strengths.1.iter().enumerate() {
+            // SAFETY: the plan reserved one float per strength at this offset of the arena.
+            unsafe { *(base.add(self.strengths.0) as *mut f32).add(i) = st.get() };
+        }
         let want_logits = s.logits.is_some() && self.logits.is_some();
         let end = if want_logits { self.ops.len() } else { self.head_from };
         let kvb: Vec<(Id, Id)> = ms.kv.iter().map(|m| (m.k, m.v)).collect();
@@ -4903,6 +5359,7 @@ impl DecodePlan for MetalPlan<'_> {
                         MOp::QkRope { .. } => "qk",
                         MOp::GdnConv { .. } | MOp::GdnRule { .. } => "gdn",
                         MOp::Glu { .. } | MOp::Ew { .. } | MOp::PleGate { .. } => "glu",
+                        MOp::LoraDown { .. } | MOp::LoraUp { .. } => "lora",
                         MOp::Steer { .. } | MOp::NeuronEdit { .. } => "iv",
                         MOp::AddNorm { .. } => "norm",
                         MOp::Attn { .. } => "attn",
@@ -4997,8 +5454,13 @@ impl DecodePlan for MetalPlan<'_> {
                         inter,
                         k,
                         edit,
+                        lora,
                         ..
                     } => {
+                        if lora.is_some() {
+                            self.encode_xlora(e, op, arena, consts, 1, [0; 4]);
+                            continue;
+                        }
                         let p = |n_out: usize, n_in: usize, mode: MvMode, q: (u32, u32), r2: usize| MvParams {
                             n_out: n_out as u32,
                             n_in: n_in as u32,
@@ -5118,6 +5580,7 @@ impl DecodePlan for MetalPlan<'_> {
                         e.bytes(&[*n, 0u32, 0, 0], 3);
                         e.dispatch(((*n as usize).div_ceil(64), 1), 64);
                     }
+                    MOp::LoraDown { .. } | MOp::LoraUp { .. } => self.encode_lora(e, op, arena, consts, 1),
                     MOp::Glu {
                         pipe, g, u, out, n, gelu, ..
                     } => {

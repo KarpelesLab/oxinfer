@@ -37,15 +37,12 @@ impl<'a> Model<'a> {
         // plan per step (see `crate::gpu::decode::Graph::units`).
         let streams = self.stream.is_some();
         let dev = |l: &'s Lin, n_out: usize, n_in: usize| -> Option<&'s crate::gpu::DeviceWeight> {
-            if l.has_lora() {
-                return None;
-            }
             if l.is_transient() {
                 return streams.then(crate::gpu::decode::streamed_weight);
             }
             l.device_weight(n_out, n_in)
         };
-        let off = |l: &Lin| l.has_lora() || (l.is_transient() && !streams);
+        let off = |l: &Lin| l.is_transient() && !streams;
         let lin = |l: &'s Lin, n_out: usize, n_in: usize, x, y, mode| -> Option<Op<'s>> {
             Some(Op::Linear {
                 w: l.as_ref(),
@@ -58,6 +55,31 @@ impl<'a> Model<'a> {
                 mode,
             })
         };
+        // Linear ops and their runtime LoRA updates (after all of them: the updates of a group
+        // then wait for the matvecs together).
+        type Job<'s> = (
+            &'s Lin<'s>,
+            usize,
+            usize,
+            crate::gpu::decode::View,
+            crate::gpu::decode::View,
+            LinMode,
+        );
+        let put_all = |g: &mut Graph<'s>, jobs: &[Job<'s>]| -> Option<()> {
+            for &(l, n_out, n_in, x, y, mode) in jobs {
+                g.ops.push(lin(l, n_out, n_in, x, y, mode)?);
+            }
+            let mut ups = Vec::new();
+            for &(l, _, _, x, y, _) in jobs {
+                if let Some((down, up)) = g.lora_ops(l, x, y, None)? {
+                    g.ops.push(down);
+                    ups.push(up);
+                }
+            }
+            g.ops.extend(ups);
+            Some(())
+        };
+        let put = |g: &mut Graph<'s>, l: &'s Lin, n_out: usize, n_in: usize, x, y, mode| put_all(g, &[(l, n_out, n_in, x, y, mode)]);
         let max_hd = self.layers.iter().map(|l| l.hd).max()?;
         let max_kv = self.layers.iter().map(|l| l.n_kv).max()?;
         let max_inter = self.layers.iter().map(|l| l.inter).max()?;
@@ -109,7 +131,7 @@ impl<'a> Model<'a> {
                 let emb = g.buf(nl * p);
                 g.input2 = Some((emb, nl * p));
                 g.units.push((g.ops.len(), 0));
-                g.ops.push(lin(&ple.proj, nl * p, h, x, pli, LinMode::Store)?);
+                put(&mut g, &ple.proj, nl * p, h, x, pli, LinMode::Store)?;
                 g.ops.push(Op::Norm {
                     x: pli,
                     out: pli,
@@ -187,15 +209,14 @@ impl<'a> Model<'a> {
                 g.ops.push(Op::norm(x, hn, &layer.ln_in, h, eps));
             }
             let (dense_edit, expert_edit) = lay.map_or((None, None), |y| y.neurons[l]);
-            g.ops.push(lin(&layer.q, nh * hd, h, hn, qkv, LinMode::Store)?);
+            let mut qkv_jobs: Vec<Job<'s>> = vec![(&layer.q, nh * hd, h, hn, qkv, LinMode::Store)];
             if layer.own_kv {
-                g.ops
-                    .push(lin(layer.k.as_ref()?, n_kv * hd, h, hn, qkv.at(nh * hd), LinMode::Store)?);
+                qkv_jobs.push((layer.k.as_ref()?, n_kv * hd, h, hn, qkv.at(nh * hd), LinMode::Store));
                 if !layer.k_eq_v {
-                    g.ops
-                        .push(lin(layer.v.as_ref()?, n_kv * hd, h, hn, qkv.at((nh + n_kv) * hd), LinMode::Store)?);
+                    qkv_jobs.push((layer.v.as_ref()?, n_kv * hd, h, hn, qkv.at((nh + n_kv) * hd), LinMode::Store));
                 }
             }
+            put_all(&mut g, &qkv_jobs)?;
             g.ops.push(Op::QkRope {
                 qkv,
                 q_out: qo,
@@ -231,7 +252,7 @@ impl<'a> Model<'a> {
                 gate: None,
                 block: None,
             });
-            g.ops.push(lin(&layer.o, h, nh * hd, att, ob, LinMode::Store)?);
+            put(&mut g, &layer.o, h, nh * hd, att, ob, LinMode::Store)?;
             // A hooked point splits the fused residual step: add, hook, then the norm.
             let mid = hooked(2 * l + 1).is_some();
             g.ops.push(Op::AddNorm {
@@ -249,7 +270,7 @@ impl<'a> Model<'a> {
             }
             let inter = layer.inter;
             let (gw, uw) = (layer.gate.as_ref(), layer.up.as_ref());
-            if pairable(&gw, &uw) {
+            if pairable(&gw, &uw) && !layer.gate.has_lora() && !layer.up.has_lora() {
                 g.ops.push(Op::Linear {
                     w: gw,
                     dev: dev(&layer.gate, inter, h)?,
@@ -261,8 +282,13 @@ impl<'a> Model<'a> {
                     mode: LinMode::GeluPair,
                 });
             } else {
-                g.ops.push(lin(&layer.gate, inter, h, hn, act2, LinMode::Store)?);
-                g.ops.push(lin(&layer.up, inter, h, hn, act, LinMode::Store)?);
+                put_all(
+                    &mut g,
+                    &[
+                        (&layer.gate, inter, h, hn, act2, LinMode::Store),
+                        (&layer.up, inter, h, hn, act, LinMode::Store),
+                    ],
+                )?;
                 g.ops.push(Op::Glu {
                     g: act2,
                     u: act,
@@ -278,7 +304,7 @@ impl<'a> Model<'a> {
                     n: e.n,
                 });
             }
-            g.ops.push(lin(&layer.down, h, inter, act, ob, LinMode::Store)?);
+            put(&mut g, &layer.down, h, inter, act, ob, LinMode::Store)?;
             if let Some(m) = &layer.moe {
                 // Routed experts beside the dense MLP, on the same residual x:
                 // ob = norm(ob, post_dense) + norm(experts(norm(x, pre)), post).
@@ -327,6 +353,7 @@ impl<'a> Model<'a> {
                 if m.experts.down.iter().any(off) {
                     return None;
                 }
+                let lora = g.expert_lora(&m.experts, m.experts.top_k)?;
                 g.ops.push(Op::Experts(crate::gpu::decode::Experts {
                     gate,
                     up: (!up.is_empty()).then_some(up),
@@ -341,6 +368,7 @@ impl<'a> Model<'a> {
                     gelu: true,
                     add: false,
                     edits: expert_edit.map(|e| (hot.at(e.hot), e.n)),
+                    lora,
                 }));
                 g.ops.push(one(eo, ob, Some(&m.ln_post), true));
             }
@@ -357,7 +385,7 @@ impl<'a> Model<'a> {
                 eps,
             });
             if let Some((pw, pli)) = ple {
-                g.ops.push(lin(&pw.gate, p, h, x, gp, LinMode::Store)?);
+                put(&mut g, &pw.gate, p, h, x, gp, LinMode::Store)?;
                 g.ops.push(Op::Glu {
                     g: gp,
                     u: pli.at(l * p),
@@ -365,7 +393,7 @@ impl<'a> Model<'a> {
                     n: p,
                     gelu: true,
                 });
-                g.ops.push(lin(&pw.proj, h, p, gp, ob, LinMode::Store)?);
+                put(&mut g, &pw.proj, h, p, gp, ob, LinMode::Store)?;
                 g.ops.push(Op::AddNorm {
                     y: ob,
                     x,
@@ -398,7 +426,7 @@ impl<'a> Model<'a> {
         if prefill {
             return Some(g);
         }
-        g.ops.push(lin(&self.head, cfg.vocab_size, h, hidden, logits, LinMode::Store)?);
+        put(&mut g, &self.head, cfg.vocab_size, h, hidden, logits, LinMode::Store)?;
         if let Some(cap) = cfg.final_logit_softcapping {
             g.ops.push(Op::Ew {
                 kind: Ew::Softcap(cap as f32),

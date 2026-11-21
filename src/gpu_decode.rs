@@ -264,6 +264,31 @@ pub enum Op<'a> {
         cap: usize,
         sel: View,
     },
+    /// The first half of the runtime LoRA updates of a linear op (see `crate::lora`): `u = A x`
+    /// (`a` `[r, n_in]`) as partial sums over chunks of [`LORA_CHUNK`] inputs, `u[c * r + k]`
+    /// the sum of chunk `c` for component `k` ([`lora_chunks`] chunks). It only reads `x`, so it
+    /// runs beside the matvec.
+    LoraDown {
+        a: Cow<'a, [f32]>,
+        x: View,
+        u: View,
+        r: usize,
+        n_in: usize,
+    },
+    /// The second half, after the matvec: `y += g * sum_k u_k S[scale[k]] B^T[k]` with `u_k` the
+    /// sum of the chunks of [`Op::LoraDown`] in order, `bt` `[r, n_out]`, `S` the strengths of
+    /// [`Graph::strengths`] (written before every step) and `g` the sigmoid of the scalar at
+    /// `gate` (a gated shared expert, [`LinMode::AddGated`]) or 1.
+    LoraUp {
+        bt: Cow<'a, [f32]>,
+        scale: Vec<u32>,
+        u: View,
+        y: View,
+        gate: Option<View>,
+        r: usize,
+        n_in: usize,
+        n_out: usize,
+    },
     /// [`Op::Attend`] under QSA: over the positions [`Op::QsaSelect`] wrote to `sel`, or all of
     /// them while every block fits the budget (`top` blocks of `ratio`).
     AttendSel {
@@ -279,6 +304,53 @@ pub enum Op<'a> {
         ratio: usize,
         top: usize,
     },
+}
+
+/// The largest rank (all chained adapters of a layer together) of [`Op::LoraUp`].
+pub const LORA_MAX_RANK: usize = 256;
+
+/// Inputs per partial sum of [`Op::LoraDown`].
+pub const LORA_CHUNK: usize = 1024;
+
+/// Partial sums per component of [`Op::LoraDown`] over `n_in` inputs.
+pub fn lora_chunks(n_in: usize) -> usize {
+    n_in.div_ceil(LORA_CHUNK)
+}
+
+/// Low-rank updates on the device ([`Op::LoraDown`], [`Op::LoraUp`]): `a` is `[r, n_in]`, `bt`
+/// (B transposed) `[r, n_out]`, component `k` taking strength `scale[k]` of
+/// [`Graph::strengths`]. Chained adapters are concatenated along the rank.
+pub struct LoraSide<'a> {
+    pub a: Cow<'a, [f32]>,
+    pub bt: Cow<'a, [f32]>,
+    pub scale: Vec<u32>,
+    pub r: usize,
+    pub n_in: usize,
+    pub n_out: usize,
+}
+
+/// The LoRA updates of every expert of an MoE layer ([`Experts::lora`]), padded to one rank `r`
+/// (zero components where an expert has fewer): `a` `[n_exp, r, n_in]`, `bt` `[n_exp, r,
+/// n_out]`, `scale` `[n_exp, r]` (strength ids, see [`LoraSide`]).
+pub struct LoraStack {
+    pub a: Vec<f32>,
+    pub bt: Vec<f32>,
+    pub scale: Vec<u32>,
+    pub r: usize,
+    pub n_in: usize,
+    pub n_out: usize,
+}
+
+/// Runtime LoRA updates of routed experts: `gate_up` on the fused gate then up rows (`n_out = 2
+/// * inter`, either storage), `down` on the down projections. With `gate_up` the pair matvecs
+/// write the raw gate / up outputs to `raw` (`[k, 2 * inter]`), the updates are added and the
+/// activation taken from there; `down`'s update is added to `y` with each slot's routing weight.
+/// `u` is `[k, max rank]` scratch.
+pub struct ExpertLora {
+    pub gate_up: Option<LoraStack>,
+    pub down: Option<LoraStack>,
+    pub raw: View,
+    pub u: View,
 }
 
 /// Elementwise ops ([`Op::Ew`]).
@@ -334,6 +406,8 @@ pub struct Experts<'a> {
     /// Neuron edits of the routed experts' activations (entries with expert ids, see
     /// [`crate::intervene::GpuNeurons`]): `(hot, n)`.
     pub edits: Option<(View, usize)>,
+    /// Runtime LoRA updates of the experts.
+    pub lora: Option<Box<ExpertLora>>,
 }
 
 /// Whether two weights can form one [`LinMode::SiluPair`] / [`LinMode::GeluPair`] matvec (same
@@ -413,6 +487,9 @@ pub struct Graph<'a> {
     /// the wrap once the device has read it, so the pages can leave the cache.
     pub units: Vec<(usize, usize)>,
     pub gate: Option<std::sync::Arc<dyn UnitGate>>,
+    /// The strengths of the LoRA updates ([`Op::LoraUp`], [`Experts::lora`]), read before every
+    /// step.
+    pub strengths: Vec<crate::lora::Strength>,
 }
 
 /// The weight streamer as a decode plan sees it (see [`Graph::units`]).
@@ -495,7 +572,7 @@ pub fn is_streamed(dev: &DeviceWeight) -> bool {
     dev.is::<StreamedWeight>()
 }
 
-impl Graph<'_> {
+impl<'a> Graph<'a> {
     pub fn new() -> Self {
         Graph {
             bufs: Vec::new(),
@@ -514,7 +591,162 @@ impl Graph<'_> {
             capture: None,
             units: Vec::new(),
             gate: None,
+            strengths: Vec::new(),
         }
+    }
+
+    /// The id of strength `s` in [`Graph::strengths`] (added if new).
+    pub fn strength_id(&mut self, s: crate::lora::Strength) -> u32 {
+        match self.strengths.iter().position(|o| o.same(&s)) {
+            Some(i) => i as u32,
+            None => {
+                self.strengths.push(s);
+                (self.strengths.len() - 1) as u32
+            }
+        }
+    }
+
+    /// The device form of `d` and the updates chained after it (None when they have no
+    /// components).
+    pub fn lora_side(&mut self, d: &'a crate::lora::LoraDelta) -> Option<LoraSide<'a>> {
+        let (n_out, n_in) = d.shape();
+        let links: Vec<&crate::lora::LoraDelta> = d.links().filter(|l| l.factors().2 > 0).collect();
+        let mut scale = Vec::new();
+        for l in &links {
+            let id = self.strength_id(l.strength_handle());
+            scale.extend(std::iter::repeat_n(id, l.factors().2));
+        }
+        let (a, bt): (Cow<'a, [f32]>, Cow<'a, [f32]>) = match links[..] {
+            [] => return None,
+            [l] => (Cow::Borrowed(l.factors().0), Cow::Borrowed(l.factors().1)),
+            _ => (
+                Cow::Owned(links.iter().flat_map(|l| l.factors().0).copied().collect()),
+                Cow::Owned(links.iter().flat_map(|l| l.factors().1).copied().collect()),
+            ),
+        };
+        Some(LoraSide {
+            a,
+            bt,
+            r: scale.len(),
+            scale,
+            n_in,
+            n_out,
+        })
+    }
+
+    /// The runtime LoRA updates of the linear op of `l` (input `x`, output `y`, `gate` for
+    /// [`LinMode::AddGated`]): [`Op::LoraDown`], to go beside the matvec, and [`Op::LoraUp`],
+    /// after it; `Some(None)` without updates, None when the device cannot take them (a rank
+    /// above [`LORA_MAX_RANK`]).
+    #[allow(clippy::type_complexity)]
+    pub fn lora_ops(&mut self, l: &'a crate::model::Lin, x: View, y: View, gate: Option<View>) -> Option<Option<(Op<'a>, Op<'a>)>> {
+        let Some(LoraSide {
+            a,
+            bt,
+            scale,
+            r,
+            n_in,
+            n_out,
+        }) = l.lora_delta().and_then(|d| self.lora_side(d))
+        else {
+            return Some(None);
+        };
+        if r > LORA_MAX_RANK {
+            return None;
+        }
+        let u = self.buf(r * lora_chunks(n_in));
+        Some(Some((
+            Op::LoraDown { a, x, u, r, n_in },
+            Op::LoraUp {
+                bt,
+                scale,
+                u,
+                y,
+                gate,
+                r,
+                n_in,
+                n_out,
+            },
+        )))
+    }
+
+    /// The runtime LoRA updates of routed experts `ex` ([`Experts::lora`]; `Some(None)` without
+    /// any), or None when the device cannot take them (interleaved gate / up rows).
+    pub(crate) fn expert_lora(&mut self, ex: &'a crate::moe::Experts, k: usize) -> Option<Option<Box<ExpertLora>>> {
+        use crate::moe::GateUp;
+        let (ne, mi) = (ex.n_experts(), ex.inter);
+        let mut gu: Vec<Vec<(&crate::lora::LoraDelta, usize)>> = Vec::with_capacity(ne);
+        let mut dn: Vec<Vec<(&crate::lora::LoraDelta, usize)>> = Vec::with_capacity(ne);
+        let chain = |l: &'a crate::model::Lin, row0: usize| -> Vec<(&'a crate::lora::LoraDelta, usize)> {
+            l.lora_delta()
+                .map(|d| d.links().filter(|l| l.factors().2 > 0).map(|l| (l, row0)).collect())
+                .unwrap_or_default()
+        };
+        for (g, d) in ex.gate_up.iter().zip(&ex.down) {
+            gu.push(match g {
+                GateUp::Fused(l) => chain(l, 0),
+                GateUp::Split(a, b) => chain(a, 0).into_iter().chain(chain(b, mi)).collect(),
+            });
+            dn.push(chain(d, 0));
+        }
+        let any = |v: &[Vec<(&crate::lora::LoraDelta, usize)>]| v.iter().any(|l| !l.is_empty());
+        if !any(&gu) && !any(&dn) {
+            return Some(None);
+        }
+        if ex.interleaved && any(&gu) {
+            return None;
+        }
+        let mut stack = |v: &[Vec<(&crate::lora::LoraDelta, usize)>], n_in: usize, n_out: usize| -> Option<LoraStack> {
+            let r = v.iter().map(|l| l.iter().map(|(d, _)| d.factors().2).sum::<usize>()).max()?;
+            if r == 0 {
+                return None;
+            }
+            let mut a = vec![0f32; ne * r * n_in];
+            let mut bt = vec![0f32; ne * r * n_out];
+            let mut scale = vec![0u32; ne * r];
+            for (e, links) in v.iter().enumerate() {
+                let mut c = 0;
+                for &(d, row0) in links {
+                    let (da, dbt, dr) = d.factors();
+                    let (dn_out, dn_in) = d.shape();
+                    if dn_in != n_in || row0 + dn_out > n_out {
+                        return None;
+                    }
+                    let id = self.strength_id(d.strength_handle());
+                    for j in 0..dr {
+                        let row = e * r + c + j;
+                        a[row * n_in..(row + 1) * n_in].copy_from_slice(&da[j * n_in..(j + 1) * n_in]);
+                        bt[row * n_out + row0..row * n_out + row0 + dn_out].copy_from_slice(&dbt[j * dn_out..(j + 1) * dn_out]);
+                        scale[row] = id;
+                    }
+                    c += dr;
+                }
+            }
+            Some(LoraStack {
+                a,
+                bt,
+                scale,
+                r,
+                n_in,
+                n_out,
+            })
+        };
+        let gate_up = if any(&gu) {
+            let h = gu.iter().flatten().next().map(|(d, _)| d.shape().1)?;
+            Some(stack(&gu, h, 2 * mi)?)
+        } else {
+            None
+        };
+        let down = if any(&dn) {
+            let h = dn.iter().flatten().next().map(|(d, _)| d.shape().0)?;
+            Some(stack(&dn, mi, h)?)
+        } else {
+            None
+        };
+        let r = gate_up.as_ref().map_or(0, |s| s.r).max(down.as_ref().map_or(0, |s| s.r));
+        let raw = self.buf(if gate_up.is_some() { k * 2 * mi } else { 1 });
+        let u = self.buf(k * r);
+        Some(Some(Box::new(ExpertLora { gate_up, down, raw, u })))
     }
     /// Adds an activation buffer of `n` floats.
     pub fn buf(&mut self, n: usize) -> View {

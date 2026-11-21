@@ -796,6 +796,10 @@ impl<'a> Lin<'a> {
         }
         true
     }
+    /// The runtime LoRA updates (chained), on or off (GPU plans read their strength per step).
+    pub(crate) fn lora_delta(&self) -> Option<&crate::lora::LoraDelta> {
+        self.lora.as_deref()
+    }
     /// Attaches (or with None removes) a runtime LoRA update (see `crate::lora`).
     pub fn set_lora(&mut self, d: Option<Box<crate::lora::LoraDelta>>) {
         self.lora = d;

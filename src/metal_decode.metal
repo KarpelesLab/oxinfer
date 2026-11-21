@@ -287,6 +287,10 @@ inline void mv_finish(thread float* acc, thread float* acc2, device float* y, ui
         else if (mode == 3) {
             float t = 0.7978845608f * (a + 0.044715f * a * a * a);
             y[o] = 0.5f * a * (1.0f + precise::tanh(t)) * b;
+        } else if (mode == 5) {
+            // Raw pair (experts with LoRA updates): gate then up outputs, 2 n_out per slot.
+            y[o] = a;
+            y[n_out + o] = b;
         } else y[o] += a / (1.0f + exp(-gate[0]));
     }
 }
@@ -1054,7 +1058,7 @@ MVX_SIG(NAME##_pair) { threadgroup float red[2]; \
     float acc[1] = { 0.f }, acc2[1] = { 0.f }; \
     T f = MAKE(e); T f2 = MAKE(e2); \
     mv_acc<T, X, CH, 1, 1>(f, f2, true, p._p, x, p.n_in, p.n_out, tg.x, sg, lane, acc, acc2, 1.f); \
-    mv_finish<1, 1>(acc, acc2, y + (ulong)s * p.n_out, p.mode, tg.x, p.n_out, sg, lane, red, sel); } \
+    mv_finish<1, 1>(acc, acc2, y + (ulong)s * p.n_out * (p.mode == 5u ? 2u : 1u), p.mode, tg.x, p.n_out, sg, lane, red, sel); } \
 MVX_SIG(NAME##_sum) { threadgroup float red[2]; \
     float acc[1] = { 0.f }, acc2[1] = { 0.f }; \
     for (uint s = 0; s < p.ldy; s++) { \
@@ -1308,4 +1312,186 @@ kernel void dec_ple_gate_t(device const float* k [[buffer(0)]], device const flo
     float sig = 1.0f / (1.0f + precise::exp(-g));
     device float* o = out + (ulong)t * ts.w + (ulong)s * n;
     for (uint i = tid; i < n; i += nt) o[i] = sig * vs[i];
+}
+
+// ---- Runtime LoRA updates (crate::lora, `Op::Lora`) -----------------------------------------------
+// p: n_in, r, n_out, then the token strides of x, u, y and the gate, and whether there is a gate.
+struct LoraP { uint n_in, r, n_out, xs, us, ys, gs, has_gate; };
+// Partial sums of u = A x over chunks of 1024 inputs: threadgroup (c * r + k, t) writes
+// u[t, c * r + k] = A[k, chunk c] . x[t, chunk c] (p.n_out: the chunks).
+kernel void lora_down(device const float* a [[buffer(0)]], device const float* x [[buffer(1)]], device float* u [[buffer(2)]],
+                      constant LoraP& p [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]],
+                      uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[32];
+    uint k = tg.x % p.r, c = tg.x / p.r, t = tg.y;
+    uint i0 = c * 1024, i1 = min(i0 + 1024, p.n_in);
+    device const float* ar = a + (ulong)k * p.n_in;
+    device const float* xr = x + (ulong)t * p.xs;
+    float s = 0.f;
+    if (p.has_gate != 0u) {
+        device const float4* a4 = (device const float4*)(ar + i0);
+        device const float4* x4 = (device const float4*)(xr + i0);
+        uint i = tid;
+        if (i < (i1 - i0) / 4) s = dot(a4[i], x4[i]);
+    } else {
+        for (uint i = i0 + tid; i < i1; i += 256) s += ar[i] * xr[i];
+    }
+    s = tg_total(s, 256, sg, lane, red);
+    if (tid == 0) u[(ulong)t * p.us + tg.x] = s;
+}
+// y[t, o] += g_t sum_k u_k S[sc[k]] bt[k, o], u_k the sum of component k's chunks in order (p.n_in:
+// the chunks), g_t the sigmoid of the gate or 1: threadgroup (256 outputs, t).
+kernel void lora_up(device const float* bt [[buffer(0)]], device const uint* sc [[buffer(1)]], device const float* str [[buffer(2)]],
+                    device const float* u [[buffer(3)]], device float* y [[buffer(4)]], device const float* gate [[buffer(5)]],
+                    constant LoraP& p [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
+                    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float us[256];
+    uint t = tg.y;
+    device const float* ut = u + (ulong)t * p.us;
+    for (uint k = tid; k < p.r; k += 256) {
+        float v = 0.f;
+        for (uint c = 0; c < p.n_in; c++) v += ut[c * p.r + k];
+        us[k] = v * str[sc[k]];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float g = p.has_gate != 0u ? 1.0f / (1.0f + exp(-gate[(ulong)t * p.gs])) : 1.0f;
+    uint o = tg.x * 256 + tid;
+    if (o >= p.n_out) return;
+    // Four independent sums keep several loads of B in flight.
+    float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+    device const float* b = bt + o;
+    ulong n = p.n_out;
+    uint k = 0;
+    for (; k + 4 <= p.r; k += 4) {
+        a0 += us[k] * b[k * n];
+        a1 += us[k + 1] * b[(k + 1) * n];
+        a2 += us[k + 2] * b[(k + 2) * n];
+        a3 += us[k + 3] * b[(k + 3) * n];
+    }
+    for (; k < p.r; k++) a0 += us[k] * b[k * n];
+    y[(ulong)t * p.ys + o] += g * ((a0 + a1) + (a2 + a3));
+}
+// Routed experts (`Experts::lora`), one token: the stacks are [n_exp, r, ...], `sel` holds the k
+// expert ids (as uint bits) then their weights. p: n_in, r, n_out, the x stride between slots (0:
+// one x for all), k, gelu.
+struct XLoraP { uint n_in, r, n_out, xs, k, gelu, _p0, _p1; };
+// u[s, c] = A_e[c] . x_s for slot s's expert e: threadgroup (c, s).
+kernel void xlora_down(device const float* a [[buffer(0)]], device const float* x [[buffer(1)]], device float* u [[buffer(2)]],
+                       device const float* sel [[buffer(3)]], constant XLoraP& p [[buffer(4)]],
+                       uint2 tg [[threadgroup_position_in_grid]], uint2 tid2 [[thread_position_in_threadgroup]],
+                       uint2 nt2 [[threads_per_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[32];
+    uint tid = tid2.x, nt = nt2.x, c = tg.x, s = tg.y;
+    uint e = as_type<uint>(sel[s]);
+    device const float* ar = a + ((ulong)e * p.r + c) * p.n_in;
+    device const float* xr = x + (ulong)s * p.xs;
+    float acc = 0.f;
+    if ((p.n_in & 3u) == 0u && (p.xs & 3u) == 0u) {
+        device const float4* a4 = (device const float4*)ar;
+        device const float4* x4 = (device const float4*)xr;
+        for (uint i = tid; i < p.n_in / 4; i += nt) acc += dot(a4[i], x4[i]);
+    } else {
+        for (uint i = tid; i < p.n_in; i += nt) acc += ar[i] * xr[i];
+    }
+    acc = tg_total(acc, nt, sg, lane, red);
+    if (tid == 0) u[s * p.r + c] = acc;
+}
+// The activation of slot s from its raw gate / up outputs (`raw`: [k, 2 n_out]) plus their
+// updates: act[s, o] = act(g + dg) * (v + dv). Thread (o, s).
+kernel void xlora_act(device const float* raw [[buffer(0)]], device const float* u [[buffer(1)]], device const float* bt [[buffer(2)]],
+                      device const uint* sc [[buffer(3)]], device const float* str [[buffer(4)]], device const float* sel [[buffer(5)]],
+                      device float* act [[buffer(6)]], constant XLoraP& p [[buffer(7)]], uint2 gid [[thread_position_in_grid]]) {
+    uint o = gid.x, s = gid.y, n = p.n_out, w = 2 * n;
+    if (o >= n) return;
+    uint e = as_type<uint>(sel[s]);
+    device const float* b = bt + (ulong)e * p.r * w;
+    device const uint* sce = sc + (ulong)e * p.r;
+    device const float* us = u + s * p.r;
+    float g = raw[(ulong)s * w + o], v = raw[(ulong)s * w + n + o];
+    for (uint c = 0; c < p.r; c++) {
+        float f = us[c] * str[sce[c]];
+        g += f * b[(ulong)c * w + o];
+        v += f * b[(ulong)c * w + n + o];
+    }
+    float a;
+    if (p.gelu != 0u) {
+        float t = 0.7978845608f * (g + 0.044715f * g * g * g);
+        a = 0.5f * g * (1.0f + precise::tanh(t));
+    } else {
+        a = g / (1.0f + exp(-g));
+    }
+    act[(ulong)s * n + o] = a * v;
+}
+// y[o] += sum_s weight_s sum_c u[s, c] S[sc] bt_e[c, o] (the down projections' updates). Thread o.
+kernel void xlora_up(device const float* u [[buffer(0)]], device const float* bt [[buffer(1)]], device const uint* sc [[buffer(2)]],
+                     device const float* str [[buffer(3)]], device const float* sel [[buffer(4)]], device float* y [[buffer(5)]],
+                     constant XLoraP& p [[buffer(6)]], uint o [[thread_position_in_grid]]) {
+    if (o >= p.n_out) return;
+    float acc = 0.f;
+    for (uint s = 0; s < p.k; s++) {
+        uint e = as_type<uint>(sel[s]);
+        device const float* b = bt + (ulong)e * p.r * p.n_out;
+        device const uint* sce = sc + (ulong)e * p.r;
+        float a = 0.f;
+        for (uint c = 0; c < p.r; c++) a += u[s * p.r + c] * str[sce[c]] * b[(ulong)c * p.n_out + o];
+        acc += sel[p.k + s] * a;
+    }
+    y[o] += acc;
+}
+// Prefill plans' routed experts with LoRA updates: rows gathered by expert (`MOp::PfExperts`),
+// `src[j]` the token of row j (all ones for padding), `rexp[j]` its expert. p: n_in, r, n (the
+// output width per gate or up half, or of the down projections), the x stride, `split` (gate and
+// up rows stored apart: up row j at split + j) and gelu.
+struct PxLoraP { uint n_in, r, n, xs, split, gelu, _p0, _p1; };
+inline float pfx_act(float g, float u, uint gelu) {
+    return gelu != 0u ? g / (1.0f + exp(-1.5957691f * (g + 0.044715f * g * g * g))) * u : g / (1.0f + exp(-g)) * u;
+}
+// u[j, c] = A_e[c] . x[src[j]] (`gu` null) or A_e[c] . act(gate_j, up_j) from the gate / up rows
+// `gu` (the down projections' input): threadgroup (c, j).
+kernel void pfx_lora_down(device const float* a [[buffer(0)]], device const float* x [[buffer(1)]], device const uint* src [[buffer(2)]],
+                          device const uint* rexp [[buffer(3)]], device float* u [[buffer(4)]], constant PxLoraP& p [[buffer(5)]],
+                          uint2 tg [[threadgroup_position_in_grid]], uint2 tid2 [[thread_position_in_threadgroup]],
+                          uint2 nt2 [[threads_per_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[32];
+    uint tid = tid2.x, nt = nt2.x, c = tg.x, j = tg.y;
+    uint e = rexp[j];
+    if (src[j] == 0xffffffffu || e == 0xffffffffu) {
+        if (tid == 0) u[(ulong)j * p.r + c] = 0.f;
+        return;
+    }
+    device const float* ar = a + ((ulong)e * p.r + c) * p.n_in;
+    float acc = 0.f;
+    if (p.xs != 0u) {
+        device const float* xr = x + (ulong)src[j] * p.xs;
+        for (uint i = tid; i < p.n_in; i += nt) acc += ar[i] * xr[i];
+    } else {
+        device const float* g = x + (ulong)j * (p.split != 0u ? 1u : 2u) * p.n_in;
+        device const float* v = p.split != 0u ? x + (ulong)(p.split + j) * p.n_in : g + p.n_in;
+        for (uint i = tid; i < p.n_in; i += nt) acc += ar[i] * pfx_act(g[i], v[i], p.gelu);
+    }
+    acc = tg_total(acc, nt, sg, lane, red);
+    if (tid == 0) u[(ulong)j * p.r + c] = acc;
+}
+// Gate / up rows (`two` != 0: 2 n outputs per row, stored as the GEMMs wrote them) or down rows
+// (n outputs) of row j: out += sum_c u[j, c] S[sc] bt_e[c, o]. Thread (o, j).
+kernel void pfx_lora_add(device const float* u [[buffer(0)]], device const float* bt [[buffer(1)]], device const uint* sc [[buffer(2)]],
+                         device const float* str [[buffer(3)]], device const uint* src [[buffer(4)]], device const uint* rexp [[buffer(5)]],
+                         device float* out [[buffer(6)]], constant PxLoraP& p [[buffer(7)]], constant uint& two [[buffer(8)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    uint o = gid.x, j = gid.y, w = two != 0u ? 2 * p.n : p.n;
+    if (o >= w) return;
+    uint e = rexp[j];
+    if (src[j] == 0xffffffffu || e == 0xffffffffu) return;
+    device const float* b = bt + (ulong)e * p.r * w;
+    device const uint* sce = sc + (ulong)e * p.r;
+    float acc = 0.f;
+    for (uint c = 0; c < p.r; c++) acc += u[(ulong)j * p.r + c] * str[sce[c]] * b[(ulong)c * w + o];
+    ulong at;
+    if (two == 0u) at = (ulong)j * p.n + o;
+    else if (p.split != 0u) at = o < p.n ? (ulong)j * p.n + o : (ulong)(p.split + j) * p.n + (o - p.n);
+    else at = (ulong)j * 2 * p.n + o;
+    out[at] += acc;
 }

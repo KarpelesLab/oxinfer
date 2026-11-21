@@ -74,6 +74,27 @@ pub struct LoraDelta {
     next: Option<Box<LoraDelta>>,
 }
 
+/// The strength one update is applied with, read at run time (GPU plans copy it to the device
+/// before every step, so a strength change needs no new plan).
+#[derive(Clone)]
+pub struct Strength {
+    active: Arc<AtomicBool>,
+    gain: Arc<AtomicU32>,
+    scale: f32,
+}
+
+impl Strength {
+    /// The strength now (0 while its adapter is off).
+    pub fn get(&self) -> f32 {
+        strength(&self.active, &self.gain, self.scale)
+    }
+
+    /// Whether `o` always gives the same strength (the same adapter switch, strength and scale).
+    pub fn same(&self, o: &Strength) -> bool {
+        Arc::ptr_eq(&self.active, &o.active) && Arc::ptr_eq(&self.gain, &o.gain) && self.scale.to_bits() == o.scale.to_bits()
+    }
+}
+
 /// A strength of 1 (the bits of `1.0f32`), for an adapter's [`LoraAdapter::gain`].
 pub(crate) fn unit_gain() -> Arc<AtomicU32> {
     Arc::new(AtomicU32::new(1f32.to_bits()))
@@ -124,6 +145,25 @@ impl LoraDelta {
     #[inline]
     pub(crate) fn is_active(&self) -> bool {
         self.strength() != 0.0 || self.next.as_ref().is_some_and(|n| n.is_active())
+    }
+
+    /// This update and those chained after it.
+    pub(crate) fn links(&self) -> impl Iterator<Item = &LoraDelta> {
+        std::iter::successors(Some(self), |d| d.next.as_deref())
+    }
+
+    /// The run-time strength of this update alone.
+    pub(crate) fn strength_handle(&self) -> Strength {
+        Strength {
+            active: self.active.clone(),
+            gain: self.gain.clone(),
+            scale: self.scale,
+        }
+    }
+
+    /// `A` (`[r, n_in]`), `B` transposed (`[r, n_out]`) and the rank of this update alone.
+    pub(crate) fn factors(&self) -> (&[f32], &[f32], usize) {
+        (&self.a, &self.bt, self.r)
     }
 
     /// Chains `d` after this update (and those already chained).
@@ -468,6 +508,7 @@ impl SendPtr {
 }
 
 /// One module of the adapter file, before it is attached.
+#[derive(Clone)]
 struct Pair {
     a: Vec<f32>, // [r, n_in]
     b: Vec<f32>, // [n_out, r]
@@ -570,6 +611,7 @@ fn is_stacked(key: &str) -> bool {
 
 /// A PEFT LoRA adapter, loaded and waiting to be attached to a model ([`LoraAdapter::take`] by
 /// module, then [`LoraAdapter::finish`]).
+#[derive(Clone)]
 pub struct LoraAdapter {
     /// The adapter folder (PEFT) or file (GGUF).
     pub dir: PathBuf,
@@ -602,6 +644,7 @@ pub struct LoraAdapter {
 }
 
 /// An embedding update before it is attached: `a` `[vocab, r]`, `b` `[hidden, r]`.
+#[derive(Clone)]
 struct EmbedPair {
     a: Vec<f32>,
     b: Vec<f32>,
@@ -624,12 +667,20 @@ fn is_embedding(module: &str) -> bool {
         || m == "model.llm.embed"
 }
 
-/// The module path of a PEFT key, from `layers.` on, or `lm_head`; None for keys of other parts
-/// (vision towers, MTP layers, embeddings).
+/// The module path of a PEFT key, from `layers.` on, or `lm_head`, or for the MTP layer of
+/// Qwen3.5 / 3.8 `mtp.layers.0. ...` and `mtp.fc`; None for keys of other parts (vision towers,
+/// embeddings).
 fn canonical(module: &str) -> Option<String> {
     let m = module.strip_prefix("base_model.model.").unwrap_or(module);
     if m == "lm_head" || m.ends_with(".lm_head") && !m.contains("layers.") {
         return Some("lm_head".into());
+    }
+    for p in ["model.mtp.", "mtp."] {
+        if let Some(rest) = m.strip_prefix(p)
+            && (rest.starts_with("layers.") || rest == "fc")
+        {
+            return Some(format!("mtp.{rest}"));
+        }
     }
     // (`model.llm.`: Inkling-2.)
     for p in [
@@ -949,6 +1000,24 @@ impl LoraAdapter {
     /// The switch shared by every attached module (off at load).
     pub fn switch(&self) -> Arc<AtomicBool> {
         self.active.clone()
+    }
+
+    /// Moves the MTP layer's modules (`mtp.*`) into an adapter of their own, which shares this
+    /// one's strength (None when there are none): the MTP layer loads after the model.
+    pub(crate) fn split_mtp(&mut self) -> Option<Self> {
+        let keys: Vec<String> = self.modules.keys().filter(|k| k.starts_with("mtp.")).cloned().collect();
+        if keys.is_empty() {
+            return None;
+        }
+        let mut m = Self::empty(&self.dir, self.format, self.rank, self.alpha, self.scale);
+        (m.stored_order, m.merge) = (self.stored_order, self.merge);
+        (m.active, m.gain) = (self.active.clone(), self.gain.clone());
+        for k in keys {
+            let p = self.modules.remove(&k).unwrap();
+            m.bytes += (p.a.len() + p.b.len()) * 4;
+            m.modules.insert(k, p);
+        }
+        Some(m)
     }
 
     /// The largest `layers.N` index the adapter touches, plus one.
@@ -1449,7 +1518,11 @@ mod tests {
             Some("layers.0.linear_attn.in_proj_qkv")
         );
         assert_eq!(canonical("base_model.model.lm_head").as_deref(), Some("lm_head"));
-        assert_eq!(canonical("base_model.model.mtp.layers.0.mlp.up_proj"), None);
+        assert_eq!(
+            canonical("base_model.model.mtp.layers.0.mlp.up_proj").as_deref(),
+            Some("mtp.layers.0.mlp.up_proj")
+        );
+        assert_eq!(canonical("mtp.fc").as_deref(), Some("mtp.fc"));
         assert_eq!(canonical("base_model.model.model.visual.blocks.0.attn.qkv"), None);
     }
 

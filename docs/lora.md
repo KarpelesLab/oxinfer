@@ -2,9 +2,10 @@
 
 oxinfer applies LoRA adapters to the language models at run time without merging them: the base
 weights stay as they were loaded (bf16, Q8 / Q4, MLX, any GGUF block format), and each adapted
-layer adds `strength * scale * B (A x)` to its output. The low-rank products run on the CPU in f32,
-after the base matmul. An adapter at strength 0 runs exactly the base model's code path. Two
-formats are read, for the same families:
+layer adds `strength * scale * B (A x)` to its output. The low-rank products run in f32 after the
+base matmul: on the CPU, or in the GPU decode and prefill plans (Metal, CUDA) as side paths of the
+matvecs (see [GPU plans](#gpu-plans)). On the CPU an adapter at strength 0 runs exactly the base
+model's code path. Two formats are read, for the same families:
 
 - **PEFT**: a folder with `adapter_config.json` and `adapter_model.safetensors`, as `peft` saves it,
   or a Hugging Face repo id holding one;
@@ -37,21 +38,48 @@ adapter.
 | Server | the same model options: `qwen=Qwen/Qwen3-8B,lora=./adapter:0.5,lora=./other`; in a JSON config, `"options": {"lora": ["./a", "./b:0.5"]}` (an array) or one string |
 
 The prompt cache keys snapshots by the adapters and their strengths, so a cached conversation of
-the base model is never restored into an adapted one (or the reverse). Models with an adapter
-decode without the GPU decode plan and run their experts on the CPU in prefill while it is on
-(the device runs those in one submission, with no place for the side path); dense prefill matmuls
-stay on the GPU. A strength set to 0 keeps that cost; drop the adapter to get it back.
+the base model is never restored into an adapted one (or the reverse).
+
+## GPU plans
+
+Qwen-path and Gemma models with runtime adapters keep their GPU decode plans (single-token,
+multi-token for MTP / DSpark / lookup verification, Metal and CUDA) and their whole-pass Metal
+prefill plans. Each adapted linear op gets two ops in the plan graph (`gpu::decode::Op::LoraDown`
+/ `LoraUp`): `u = A x` as partial sums over chunks of 1024 inputs, which only reads the input and
+runs beside the matvec, then `y += sum_k u_k S_k B^T_k` after it (with the shared expert's
+sigmoid gate where there is one). The matvecs of one input (query / key / value, gate / up, the
+Gated DeltaNet projections) are grouped, so their updates add one barrier per group. Gate / up
+pairs with an update run as two matvecs and an activation instead of one paired matvec. Chained
+adapters are concatenated along the rank (up to 256 per layer on the device; more falls back to
+the CPU path).
+
+Routed experts get per-expert side paths (`gpu::decode::Experts::lora`, every expert's `A` and
+`B^T` stacked and zero-padded to one rank): with a gate / up update the expert pair kernels write
+the raw gate and up outputs, the updates of each routed slot are added and the activation taken
+from there; the down projections' updates are added to the output with each slot's routing weight.
+In the Metal prefill plan the same runs on the grouped expert rows (each row's expert recorded with
+the routing). Prefill without a plan (`OXINFER_PREFILL_GPU=0`, models the plan does not cover)
+still runs adapted experts on the CPU, the dense matmuls on the GPU.
+
+The strengths are read on the host before every step and written to the device (`Graph::strengths`
+by adapter switch, gain and scale), so `set_lora_strength`, a decision adapter switched per request
+or a strength of 0 changes nothing in the plan. At strength 0 the side paths still run (and add
+zeros): drop the adapter for the base model's speed.
 
 ## Families and what is adapted
 
 | Family | Layers | Experts | Embedding | Head |
 |---|---|---|---|---|
-| Qwen3 / 3.5 / 3.6 / 3.8 (dense and MoE), Qwen2 / 2.5-VL, Llama 3, Granite 4, MiniMax, LFM3 (the Qwen code path) | attention `q/k/v/o_proj`, Gated DeltaNet `in_proj_qkv/z/a/b`, `out_proj`, MLP and shared-expert `gate/up/down_proj` | routed experts, per expert | yes | `lm_head` (untied) |
+| Qwen3 / 3.5 / 3.6 / 3.8 (dense and MoE), Qwen2 / 2.5-VL, Llama 3, Granite 4, MiniMax, LFM3 (the Qwen code path) | attention `q/k/v/o_proj`, Gated DeltaNet `in_proj_qkv/z/a/b`, `out_proj`, MLP and shared-expert `gate/up/down_proj`; the Qwen3.5 / 3.8 MTP layer (`mtp.fc`, its attention, MLP or experts) | routed experts, per expert | yes | `lm_head` (untied) |
 | Gemma 4 / 3 | attention and MLP projections | 26B-A4B routed experts | yes (before the `sqrt(hidden)` scale, as in llama.cpp) | `lm_head` |
 | Inkling-2 (`inkling2`, `inkling2_loop`) | `wq_du`, `wk_dv`, `wv_dv`, `wr_du`, `gate_attn`, `attn_sink_proj`, `wo_ud`, the dynamic convolutions' `weight_proj`, the loop gates' `controllers.*` | routed experts (`gate_up_proj`, `down_proj`; interleaved `w13` rows of the release are handled) | yes (before the embedding norm) | `unembed` (as `lm_head`) |
 
-Other families (Mistral Large 4, DeepSeek V4, GLM-5.3, Kimi, LongCat, Nemotron, Core ML models)
-refuse `lora` with an error. An adapter module that matches no layer, or a layer of another shape,
+MTP-layer modules (PEFT `mtp.fc`, `mtp.layers.0.*`; GGUF `blk.N.nextn.eh_proj` and the tensors of
+the blocks past the main layers) wait in the model until its MTP layer loads (`load_mtp`, when MTP
+drafting is on) and are attached there: they change the drafts, not the verified text. Without the
+MTP layer they are not used. Qwen4-Exp (Qwen3.8-Flash-Next) MTP layers refuse them, as do the
+other families. Other families (Mistral Large 4, DeepSeek V4, GLM-5.3, Kimi, LongCat, Nemotron,
+Core ML models) refuse `lora` with an error. An adapter module that matches no layer, or a layer of another shape,
 is an error at load: nothing is skipped silently. A looped Inkling layer is adapted once, so its
 update applies in every pass, as with the weights it updates (llama.cpp shares them the same way).
 
@@ -79,7 +107,8 @@ embedding in `llm_graph_context`:
   an alpha (absent or 0), `s` is just `scale`. With one rank throughout, `alpha / r` is applied as
   the PEFT path applies its scale. With mixed ranks, each pair's `alpha / r` is folded into its `B`;
 - `*_norm.weight` tensors (which `mergekit-extract-lora` adds) are skipped, as llama.cpp skips
-  them. Any other tensor is an error, as are activated LoRAs (`adapter.alora.invocation_tokens`)
+  them. MTP-layer tensors (`blk.N.nextn.eh_proj`, blocks past `block_count - nextn_predict_layers`)
+  go on the MTP layer (see above). Any other tensor is an error, as are activated LoRAs (`adapter.alora.invocation_tokens`)
   and adapters of another architecture than the model's (`general.architecture`, as in llama.cpp).
 
 Names map to the models' module paths through the tables the GGUF loader uses
@@ -169,6 +198,42 @@ text on 3/5 (sky, bicycle, tomatoes). The other two split at near ties after 14 
 "for" / "to") and 31 words (autumn). On the baked file without an adapter, the two engines agree
 to the end on 1/5 (Canberra). They split on the other four after 4 to 25 words. So with the
 adapter they agree at least as closely as they do on a plain file of this quantization.
+
+**(d) The MTP layer.** A random rank-8 PEFT adapter of Qwen3.5-0.8B's MTP layer only (`mtp.fc`,
+its `q/k/v/o_proj`, `gate/up/down_proj`), with MTP drafting (3 tokens, greedy): the text is
+identical to plain decoding in every case (drafts are verified), and the drafts follow the adapter.
+With `B` of std 0.3 acceptance falls from 69% to 0%, with std 0.01 to 63%; `--lora-merge` (bf16)
+gives the same acceptance and per-round histogram as the runtime adapter.
+
+**(e) GPU against CPU.** `OXINFER_GPU_DECODE_CHECK=1` runs every GPU decode step on the CPU too
+(64 greedy tokens of a raw prompt, `--no-lookup`):
+
+| Model, adapter | max KL per step | greedy text | without the adapter |
+|---|---|---|---|
+| Llama-3.2-1B F16 GGUF, GGUF adapter of (a) at 0.7 (113 updates) | 9e-12 | identical | 1.3e-11 |
+| Qwen3.5-0.8B bf16, rank 8 on attention, Gated DeltaNet and MLPs | 6e-12 | identical | 6.6e-12 |
+| Gemma 4 12B bf16, rank 16 on the MLPs, strength 0.5 | 1.8e-9 | identical (40 tokens) | |
+| Llama-3.2-1B Q4_K_M | 9e-4 | identical | 9.5e-4 (the CPU's int8 activations) |
+| Qwen3.5-35B-A3B oxinfer Q4, rank 4 on every expert of 5 layers, shared experts, attention (2298 updates) | 4.8e-3, same argmax at every step | splits at a near tie after 9 lines | 2.9e-3 |
+
+Prefill plan, last-token distribution after a 2358-token prompt (Qwen3.5-0.8B bf16, the adapter
+above at 0.3): KL 2.8e-7 against the CPU (8.8e-8 without it), 0.21 s against 0.18 s. The routed
+experts' side paths in exact arithmetic are checked by `tests/gemma_moe_gpu.rs`: a tiny Gemma 4
+MoE with an adapter on its attention, dense MLP and every expert (gate / up only, down only, and
+both), prefill plan and decode steps against the CPU, at two strengths on the same plans (the
+same error as without the adapter: 2.4e-3 prefill and 1.6e-3 decode in bf16; strengths 1 and 0.4
+are further apart than 0.1).
+
+Decode speed on Metal, tok/s (M5 Max, a loaded machine, so +-10%; 128 to 256 tokens):
+
+| Model, adapter | base, GPU | adapter, GPU | adapter, CPU decode (before) |
+|---|---|---|---|
+| Llama-3.2-1B Q4_K_M, rank 8, 113 updates | 300-360 | 235-310 | 80-180 |
+| Qwen3-8B Q4_K_M, rank 16 on all 252 projections | 80-87 | 61-73 | 12-35 |
+| Qwen3.5-35B-A3B oxinfer Q4, 2298 updates (experts of 5 layers) | 155 | 139 | 60 |
+
+The cost is mostly the extra barrier after each group of adapted matvecs and the `B` reads (the
+adapter's f32 factors are read once per token: 175 MB for the Qwen3-8B adapter).
 
 Unit tests: `moe::tests::expert_lora_matches_merged_weights` checks expert updates against
 weights merged in f64 for the three expert layouts: PEFT stacked, PEFT per expert, and the

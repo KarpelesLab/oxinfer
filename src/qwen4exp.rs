@@ -1394,6 +1394,7 @@ impl<'a> QwenModel<'a> {
                 gelu: false,
                 add: false,
                 edits: None,
+                lora: None,
             }));
             // The shared expert, sigmoid-gated, added to the routed experts' sum.
             let (sg, su) = (sh.gate.as_ref(), sh.up.as_ref());

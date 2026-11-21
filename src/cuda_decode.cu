@@ -259,7 +259,14 @@ __device__ __forceinline__ void dmvx_pair(const DW* tab, const DW* tab2, const f
     unsigned int e = __float_as_uint(sel[s]);
     float a = warp_sum(rowdot<F>(tab[e], row, x, h, lane));
     float b = warp_sum(rowdot<F>(tab2[e], row + r2off, x, h, lane));
-    if (lane == 0) act[(size_t)s * inter + row] = (gelu ? dgelu(a) : a / (1.0f + expf(-a))) * b;
+    if (lane != 0) return;
+    // gelu 2: the raw gate then up outputs (2 inter per slot), for LoRA updates (`dxlora_act`).
+    if (gelu == 2) {
+        act[(size_t)s * 2 * inter + row] = a;
+        act[(size_t)s * 2 * inter + inter + row] = b;
+    } else {
+        act[(size_t)s * inter + row] = (gelu ? dgelu(a) : a / (1.0f + expf(-a))) * b;
+    }
 }
 template <int F>
 __device__ __forceinline__ void dmvx_sum(const DW* tab, const float* act, float* y, unsigned int h, unsigned int inter, unsigned int k,
@@ -630,4 +637,80 @@ extern "C" __global__ void dew(const float* a, const float* b, float* out, unsig
     else if (kind == 1) out[i] = tanhf(v / p0) * p0;
     else if (kind == 2) out[i] = (v * p0 + b[i] * p1) * p2;
     else { float u = v * p0; out[i] = u / (1.0f + expf(-u)); }
+}
+
+// ---- Runtime LoRA updates (crate::lora, `Op::Lora`; one token per launch, as the Metal kernels).
+// Partial sums of u = A x over chunks of 1024 inputs: block c * r + k writes u[c * r + k].
+extern "C" __global__ void dlora_down(const float* a, const float* x, float* u, unsigned int n_in, unsigned int r) {
+    __shared__ float red[32];
+    unsigned int k = blockIdx.x % r, c = blockIdx.x / r;
+    unsigned int i0 = c * 1024, i1 = min(i0 + 1024, n_in);
+    const float* ar = a + (size_t)k * n_in;
+    float s = 0.f;
+    for (unsigned int i = i0 + threadIdx.x; i < i1; i += blockDim.x) s += ar[i] * x[i];
+    s = dblock_sum(s, red);
+    if (threadIdx.x == 0) u[blockIdx.x] = s;
+}
+// y[o] += g sum_k u_k S[sc[k]] bt[k, o], u_k the sum of component k's chunks in order (g: the
+// sigmoid of *gate, or 1).
+extern "C" __global__ void dlora_up(const float* bt, const unsigned int* sc, const float* str, const float* u, float* y,
+                                    const float* gate, unsigned int r, unsigned int nch, unsigned int n_out, unsigned int has_gate) {
+    __shared__ float us[256];
+    for (unsigned int k = threadIdx.x; k < r && k < 256; k += blockDim.x) {
+        float v = 0.f;
+        for (unsigned int c = 0; c < nch; c++) v += u[c * r + k];
+        us[k] = v * str[sc[k]];
+    }
+    __syncthreads();
+    unsigned int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= n_out || r > 256) return;
+    float acc = 0.f;
+    for (unsigned int k = 0; k < r; k++) acc += us[k] * bt[(size_t)k * n_out + o];
+    if (has_gate) acc *= dsig(gate[0]);
+    y[o] += acc;
+}
+// Routed experts (`Experts::lora`): stacks [n_exp, r, ...]; `sel` holds the k ids then weights.
+// u[s, c] = A_e[c] . x_s (x_s = x + s * xs): block (c, s).
+extern "C" __global__ void dxlora_down(const float* a, const float* x, float* u, const float* sel, unsigned int n_in, unsigned int r,
+                                       unsigned int xs) {
+    __shared__ float red[32];
+    unsigned int c = blockIdx.x, s = blockIdx.y, e = __float_as_uint(sel[s]);
+    const float* ar = a + ((size_t)e * r + c) * n_in;
+    const float* xr = x + (size_t)s * xs;
+    float v = 0.f;
+    for (unsigned int i = threadIdx.x; i < n_in; i += blockDim.x) v += ar[i] * xr[i];
+    v = dblock_sum(v, red);
+    if (threadIdx.x == 0) u[s * r + c] = v;
+}
+// act[s, o] = act(g + dg) * (v + dv) from the raw pair outputs (`raw`: [k, 2 n]).
+extern "C" __global__ void dxlora_act(const float* raw, const float* u, const float* bt, const unsigned int* sc, const float* str,
+                                      const float* sel, float* act, unsigned int n, unsigned int r, unsigned int gelu) {
+    unsigned int o = blockIdx.x * blockDim.x + threadIdx.x, s = blockIdx.y, w = 2 * n;
+    if (o >= n) return;
+    unsigned int e = __float_as_uint(sel[s]);
+    const float* b = bt + (size_t)e * r * w;
+    const unsigned int* sce = sc + (size_t)e * r;
+    float g = raw[(size_t)s * w + o], v = raw[(size_t)s * w + n + o];
+    for (unsigned int c = 0; c < r; c++) {
+        float f = u[s * r + c] * str[sce[c]];
+        g += f * b[(size_t)c * w + o];
+        v += f * b[(size_t)c * w + n + o];
+    }
+    act[(size_t)s * n + o] = (gelu ? dgelu(g) : g / (1.0f + expf(-g))) * v;
+}
+// y[o] += sum_s weight_s sum_c u[s, c] S[sc] bt_e[c, o].
+extern "C" __global__ void dxlora_up(const float* u, const float* bt, const unsigned int* sc, const float* str, const float* sel,
+                                     float* y, unsigned int n_out, unsigned int r, unsigned int k) {
+    unsigned int o = blockIdx.x * blockDim.x + threadIdx.x;
+    if (o >= n_out) return;
+    float acc = 0.f;
+    for (unsigned int s = 0; s < k; s++) {
+        unsigned int e = __float_as_uint(sel[s]);
+        const float* b = bt + (size_t)e * r * n_out;
+        const unsigned int* sce = sc + (size_t)e * r;
+        float a = 0.f;
+        for (unsigned int c = 0; c < r; c++) a += u[s * r + c] * str[sce[c]] * b[(size_t)c * n_out + o];
+        acc += sel[k + s] * a;
+    }
+    y[o] += acc;
 }

@@ -334,6 +334,42 @@ mod tests {
         }
     }
 
+    /// MTP-layer tensors (past the main layers, `blk.N.nextn.*`) map to the MTP layer's modules.
+    #[test]
+    fn maps_mtp_tensors() {
+        let mut h = base("qwen35");
+        h.meta.insert("qwen35.block_count".into(), Value::U(3));
+        h.meta.insert("qwen35.nextn_predict_layers".into(), Value::U(1));
+        let n = h.n_layers();
+        assert_eq!(n, 2);
+        assert_eq!(
+            module_of("qwen35", "blk.2.nextn.eh_proj.weight", &[64, 32], n).as_deref(),
+            Some("mtp.fc")
+        );
+        assert_eq!(
+            module_of("qwen35", "blk.2.attn_output.weight", &[32, 32], n).as_deref(),
+            Some("mtp.layers.0.self_attn.o_proj")
+        );
+        assert_eq!(
+            module_of("qwen35", "blk.1.attn_output.weight", &[32, 32], n).as_deref(),
+            Some("layers.1.self_attn.o_proj")
+        );
+        let mut ad = LoraAdapter::empty(Path::new("x"), "gguf", 1, 0.0, 1.0);
+        for k in ["mtp.fc", "layers.0.mlp.down_proj"] {
+            let p = Pair {
+                a: vec![1.0; 4],
+                b: vec![1.0; 4],
+                r: 1,
+                n_in: 4,
+                n_out: 4,
+            };
+            ad.modules.insert(k.into(), p);
+        }
+        let m = ad.split_mtp().unwrap();
+        assert_eq!(m.modules.keys().collect::<Vec<_>>(), ["mtp.fc"]);
+        assert_eq!(ad.modules.keys().collect::<Vec<_>>(), ["layers.0.mlp.down_proj"]);
+    }
+
     /// `lora` options: repeated keys add, a JSON array adds them all, `none` clears.
     #[test]
     fn engine_options() {
