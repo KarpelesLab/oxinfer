@@ -45,7 +45,39 @@ implementation (the [verification](docs/verification.md#verifying-against-the-re
 notes give the measured agreement), and a speed-up that changes the output must say so and stay
 optional.
 
-## Quick start
+## Get started: the web GUI
+
+The easiest way to use oxinfer is its browser GUI, running models on your own machine:
+
+1. **Get the binary.** Download the archive for your system from the
+   [latest release](https://github.com/KarpelesLab/oxinfer/releases/latest)
+   (`macos-universal`, `linux-x86_64`, `linux-aarch64`, `windows-x86_64`, `windows-aarch64`) and
+   unpack it, or build it with `cargo build --release` (the binary is then
+   `target/release/oxinfer`).
+2. **Start it:**
+
+   ```sh
+   oxinfer web
+   ```
+
+   It opens `http://127.0.0.1:8090/` in your browser.
+3. **Pick a model.** The *Models* page lists the curated catalog by kind (chat, vision, image
+   generation and editing, speech to text, text to speech, embeddings), with each model's size
+   and whether it fits this machine; any Hugging Face repo, GGUF file or local folder can be
+   typed in too. The setup checks the disk space, downloads the model with live progress (it
+   can be cancelled and resumes where it stopped), and loads it.
+4. **Use it.** The pages for chat (with images and thinking), images, transcription, speech and
+   embeddings work with the loaded model. The *Models* page also shows the free disk space and
+   the downloaded models, and deletes the ones you no longer need.
+
+The same address serves an OpenAI-compatible API under `/v1` and Anthropic's API under
+`/v1/messages`. Coding agents and other programs can therefore use the models the GUI loads while
+it is open: *Connect apps* gives ready-to-paste settings for opencode, Claude Code, Aider, the
+`openai` SDKs and curl. `oxinfer web --no-open` skips opening the browser, and `--host 0.0.0.0
+--api-key KEY` makes it reachable from other machines. The rest is in
+[docs/web.md](docs/web.md).
+
+## Quick start: the command line
 
 ```sh
 cargo build --release          # or take a binary from the GitHub releases
@@ -55,13 +87,14 @@ cargo build --release          # or take a binary from the GitHub releases
 ./target/release/oxinfer --model google/gemma-4-E4B-it --image photo.jpg -p "What is this?"
 ./target/release/oxinfer --model openai/whisper-small --transcribe talk.mp3
 ./target/release/oxinfer serve --model google/gemma-4-E4B-it        # OpenAI-compatible HTTP server
+./target/release/oxinfer web                                        # the browser GUI, see above
 ```
 
 A Hugging Face repo id is downloaded to the cache on first use; a local folder or GGUF file works
 too. The device is chosen at run time (`--device auto`: a GPU when one starts, else the CPU).
-[docs/cli.md](docs/cli.md) has the flags, the release binaries, `--update` and `--models`;
-`oxinfer web` opens a browser GUI for every kind of model ([docs/web.md](docs/web.md));
-[docs/library.md](docs/library.md) the Rust and C API.
+[docs/cli.md](docs/cli.md) has the flags, the release binaries, `--update`, `--models` and
+`oxinfer models list` / `rm` for the downloaded models; [docs/library.md](docs/library.md) the
+Rust and C API.
 
 ## Documentation
 
