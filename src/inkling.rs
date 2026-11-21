@@ -773,6 +773,10 @@ pub(crate) trait DevSession: Send + Sync {
     fn clone_box(&self) -> Box<dyn DevSession>;
     /// Bytes of its attention caches.
     fn bytes(&self) -> usize;
+    #[cfg_attr(
+        not(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))),
+        allow(dead_code)
+    )]
     fn as_any(&mut self) -> &mut dyn std::any::Any;
 }
 
