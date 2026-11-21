@@ -219,46 +219,73 @@ pub fn mtp_config(path: &std::path::Path) -> Option<serde_json::Value> {
 /// A layer's keys and values of some positions (`[t, n_kv * hd]` each).
 pub type KeysValues = (Vec<f32>, Vec<f32>);
 
-struct InkLayer<'a> {
-    attn_norm: Vec<f32>,
-    ffn_norm: Vec<f32>,
-    ctx_norm: Vec<f32>,
-    q: Lin<'a>,
-    k: Lin<'a>,
-    v: Lin<'a>,
-    o: Lin<'a>,
-    k_ctx: Lin<'a>,
-    v_ctx: Lin<'a>,
-    q_norm: Vec<f32>,
-    k_norm: Vec<f32>,
-    k_ctx_norm: Vec<f32>,
-    gate: Lin<'a>,
-    up: Lin<'a>,
-    down: Lin<'a>,
+pub(crate) struct InkLayer<'a> {
+    pub(crate) attn_norm: Vec<f32>,
+    pub(crate) ffn_norm: Vec<f32>,
+    pub(crate) ctx_norm: Vec<f32>,
+    pub(crate) q: Lin<'a>,
+    pub(crate) k: Lin<'a>,
+    pub(crate) v: Lin<'a>,
+    pub(crate) o: Lin<'a>,
+    pub(crate) k_ctx: Lin<'a>,
+    pub(crate) v_ctx: Lin<'a>,
+    pub(crate) q_norm: Vec<f32>,
+    pub(crate) k_norm: Vec<f32>,
+    pub(crate) k_ctx_norm: Vec<f32>,
+    pub(crate) gate: Lin<'a>,
+    pub(crate) up: Lin<'a>,
+    pub(crate) down: Lin<'a>,
 }
 
 /// The loaded drafter (weights borrowed from its files).
 pub struct InkDraft<'a> {
     pub cfg: InkDraftConfig,
-    layers: Vec<InkLayer<'a>>,
+    pub(crate) layers: Vec<InkLayer<'a>>,
     /// Softmaxed rows of `fuse_weight`: per draft layer, then the head (`[layers + 1, n_targets]`).
-    fuse: Vec<f32>,
-    rnn_norm: Vec<f32>,
-    out_norm: Vec<f32>,
-    mask: Vec<f32>,
-    w1: Table<'a>,
-    joint: Lin<'a>,
-    joint_b: Vec<f32>,
+    pub(crate) fuse: Vec<f32>,
+    pub(crate) rnn_norm: Vec<f32>,
+    pub(crate) out_norm: Vec<f32>,
+    pub(crate) mask: Vec<f32>,
+    pub(crate) w1: Table<'a>,
+    pub(crate) joint: Lin<'a>,
+    pub(crate) joint_b: Vec<f32>,
     /// `hidden_out` as f32 `[H, rank]`, and its bias.
-    hid_out: Vec<f32>,
-    hid_b: Vec<f32>,
-    rank: usize,
-    inv_freq: Vec<f32>,
+    pub(crate) hid_out: Vec<f32>,
+    pub(crate) hid_b: Vec<f32>,
+    pub(crate) rank: usize,
+    pub(crate) inv_freq: Vec<f32>,
     /// The target's LM head times `hidden_out` (`[vocab, rank]`, bf16) and times its bias, made on
     /// first use.
-    proj: std::sync::OnceLock<(Lin<'static>, Vec<f32>)>,
+    pub(crate) proj: std::sync::OnceLock<(Lin<'static>, Vec<f32>)>,
     /// Run the matmuls of a few rows on the accelerator (see [`InkDraft::set_device`]).
-    device: std::sync::atomic::AtomicBool,
+    pub(crate) device: std::sync::atomic::AtomicBool,
+    /// The drafter on the accelerator (see [`InkDraftDevice`]), made on the first draft pass
+    /// that runs there.
+    gpu: std::sync::OnceLock<Option<Box<dyn InkDraftDevice>>>,
+    /// Rows of `markov_w1` (the padded vocabulary, the rows of the target's LM head).
+    pub(crate) w1_rows: usize,
+}
+
+/// The drafter on an accelerator (`crate::metal::inkling_draft`): whole draft passes and context
+/// injections in one submission each, over a device copy of a session's cache (`slot`).
+pub(crate) trait InkDraftDevice: Send + Sync {
+    /// Makes the device cache hold positions `from..to` of the host's (`rows`: per layer its
+    /// keys and values of those positions).
+    fn upload(&self, slot: &mut crate::gpu::decode::Slot, from: usize, to: usize, rows: &[(&[f32], &[f32])]) -> bool;
+    /// [`InkDraft::context`] of `t` positions from `pos`, written to the device cache too.
+    fn context(&self, slot: &mut crate::gpu::decode::Slot, feats: &[f32], t: usize, pos: usize) -> Option<(Vec<KeysValues>, Vec<f32>)>;
+    /// A greedy draft pass: the block (`x0`: its input rows), the target's head over the first
+    /// `k` draft rows and the head's chain, each slot's token the first maximum of its logits;
+    /// returns the soft-capped logits `[k, vocab]` and the tokens.
+    fn draft(
+        &self,
+        slot: &mut crate::gpu::decode::Slot,
+        x0: &[f32],
+        context: &[f32],
+        pos: usize,
+        anchor: u32,
+        k: usize,
+    ) -> Option<(Vec<f32>, Vec<u32>)>;
 }
 
 impl<'a> InkDraft<'a> {
@@ -338,6 +365,8 @@ impl<'a> InkDraft<'a> {
                 .collect(),
             proj: std::sync::OnceLock::new(),
             device: std::sync::atomic::AtomicBool::new(false),
+            gpu: std::sync::OnceLock::new(),
+            w1_rows: vocab_rows,
             cfg,
         })
     }
@@ -573,6 +602,58 @@ impl<'a> InkDraft<'a> {
 
     pub fn rank(&self) -> usize {
         self.rank
+    }
+
+    /// The block's input rows: the anchor's embedding (the target's input row) and the mask rows.
+    pub fn block_input<M: Target + ?Sized>(&self, target: &M, anchor: u32) -> Vec<f32> {
+        let (h, nb) = (self.cfg.hidden, self.cfg.block_size);
+        let mut x = vec![0f32; nb * h];
+        target.embed_row(anchor, &mut x[..h]);
+        for i in 1..nb {
+            x[i * h..(i + 1) * h].copy_from_slice(&self.mask);
+        }
+        x
+    }
+
+    /// The drafter on the accelerator, once a draft pass made it (injections then run there too).
+    pub(crate) fn device_ready(&self) -> Option<&dyn InkDraftDevice> {
+        if !self.device.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        self.gpu.get().and_then(|g| g.as_deref())
+    }
+
+    /// The drafter on the accelerator for target `target` (made on first use), when the draft
+    /// runs there and the backend has the kernels (`OXINFER_INK_DRAFT_CPU=1` keeps it on the CPU).
+    pub(crate) fn device_for<M: Target + ?Sized>(&self, target: &M) -> Option<&dyn InkDraftDevice> {
+        if !self.device.load(std::sync::atomic::Ordering::Relaxed) || std::env::var_os("OXINFER_INK_DRAFT_CPU").is_some() {
+            return None;
+        }
+        self.gpu
+            .get_or_init(|| {
+                #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+                {
+                    let dbg = std::env::var_os("OXINFER_DEBUG").is_some();
+                    let Some(head) = target.lm_head() else {
+                        if dbg {
+                            eprintln!("[inkling draft: the target has no LM head for the device]");
+                        }
+                        return None;
+                    };
+                    let (proj, cvec) = self.projection(target);
+                    let d = crate::metal::inkling_draft::build(self, head, self.w1_rows, proj, cvec);
+                    if dbg {
+                        eprintln!("[inkling draft: on the device: {}]", d.is_some());
+                    }
+                    d
+                }
+                #[cfg(not(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64")))]
+                {
+                    let _ = (target, self.w1_rows);
+                    None
+                }
+            })
+            .as_deref()
     }
 }
 

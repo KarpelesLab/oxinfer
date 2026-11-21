@@ -2111,8 +2111,9 @@ impl Engine {
                     Some(d) => {
                         let dr = load_dspark(&mut arena, &d, c.hidden_size, c.vocab_size, model.quant)?;
                         crate::inkling::check_draft(model, dr)?;
+                        dr.set_verify_cap(model.max_draft());
                         let mut dopts = dspark_opts(chat::with_turn_end(&chat::InklingChat, &tok, eos.clone()), streamer.is_some());
-                        dopts.draft_tokens = dopts.draft_tokens.min(crate::inkling::MAX_DRAFT);
+                        dopts.draft_tokens = dopts.draft_tokens.min(model.max_draft());
                         Lm::Inkling2Dspark {
                             dec: Box::new(DsparkDecoder::new(model, dr, dopts)),
                         }
@@ -2199,7 +2200,7 @@ impl Engine {
             }
             Lm::Inkling2Dspark { dec } => {
                 if let Some(lk) = lookup.as_mut() {
-                    lk.opts.max_draft = lk.opts.max_draft.min(crate::inkling::MAX_DRAFT);
+                    lk.opts.max_draft = lk.opts.max_draft.min(dec.model().max_draft());
                 }
                 dec.lookup = lookup;
                 None
@@ -3639,7 +3640,7 @@ impl PendingTurn {
             Lm::Inkling2 { model, sess } => {
                 let base = sess.pos;
                 if let Some(lk) = lookup.as_mut() {
-                    lk.opts.max_draft = lk.opts.max_draft.min(crate::inkling::MAX_DRAFT);
+                    lk.opts.max_draft = lk.opts.max_draft.min(model.max_draft());
                 }
                 let hs = generate::prefill(*model, sess, &ids, chunk, &overrides);
                 let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);

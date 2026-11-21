@@ -741,6 +741,8 @@ pub struct Dspark<'a> {
     ds4: Option<crate::deepseek4::Ds4Draft<'a>>,
     /// Inkling-2-Mini's own block drafter (`crate::inkling_draft`).
     ink: Option<crate::inkling_draft::InkDraft<'a>>,
+    /// See [`Dspark::verify_cap`] (0: the default).
+    verify_cap: std::sync::atomic::AtomicUsize,
     markov: Option<Markov<'a>>,
     bridge: Option<Bridge<'a>>,
     conf: Option<Confidence>,
@@ -807,6 +809,10 @@ pub struct DsparkSession {
     rnn: Vec<f32>,
     rnn_start: usize,
     rnn_w: usize,
+    /// Inkling-2's drafter on the accelerator: the device copy of the cache, and how many
+    /// positions of it match the host's.
+    ink_dev: crate::gpu::decode::Slot,
+    ink_sync: usize,
 }
 
 impl DsparkSession {
@@ -826,6 +832,7 @@ impl DsparkSession {
             for c in &mut self.kv {
                 c.truncate(len);
             }
+            self.ink_sync = self.ink_sync.min(len);
             if self.rnn_w > 0 {
                 self.rnn.truncate(len.saturating_sub(self.rnn_start) * self.rnn_w);
                 self.rnn_start = self.rnn_start.min(len);
@@ -1203,14 +1210,13 @@ impl<'a> Dspark<'a> {
             if let Some(l) = cfg.target_layers.last_mut() {
                 *l += 1;
             }
-            // Rounds verify at most `inkling::MAX_DRAFT` drafts (the block keeps its 8 rows).
-            cfg.block_size = cfg.block_size.min(crate::inkling::MAX_DRAFT + 1);
             let ink = crate::inkling_draft::InkDraft::load(files, icfg, gguf, quant)?;
             let _ = vocab;
             return Ok(Self {
                 dense: None,
                 ds4: None,
                 ink: Some(ink),
+                verify_cap: Default::default(),
                 markov: None,
                 bridge: None,
                 conf: None,
@@ -1480,6 +1486,7 @@ impl<'a> Dspark<'a> {
                 dense: None,
                 ds4: Some(ds4),
                 ink: None,
+                verify_cap: Default::default(),
                 markov,
                 bridge: None,
                 conf,
@@ -1521,6 +1528,7 @@ impl<'a> Dspark<'a> {
             dense: Some(dense),
             ds4: None,
             ink: None,
+            verify_cap: Default::default(),
             markov,
             bridge,
             conf,
@@ -1548,10 +1556,19 @@ impl<'a> Dspark<'a> {
         }
     }
 
-    /// The most tokens a prompt-lookup round beside this draft may verify, when the target needs
-    /// a bound (Inkling-2: [`crate::inkling::MAX_DRAFT`]).
-    pub fn lookup_cap(&self) -> Option<usize> {
-        self.ink.as_ref().map(|_| crate::inkling::MAX_DRAFT)
+    /// The most draft tokens a round with this draft (or prompt lookup beside it) may verify,
+    /// when the target needs a bound (Inkling-2: [`crate::inkling::MAX_DRAFT`] unless
+    /// [`Dspark::set_verify_cap`] says otherwise).
+    pub fn verify_cap(&self) -> Option<usize> {
+        self.ink.as_ref().map(|_| {
+            let c = self.verify_cap.load(std::sync::atomic::Ordering::Relaxed);
+            if c == 0 { crate::inkling::MAX_DRAFT } else { c }
+        })
+    }
+
+    /// Sets [`Dspark::verify_cap`] (Inkling-2's drafter: `Inkling2Model::max_draft`).
+    pub fn set_verify_cap(&self, n: usize) {
+        self.verify_cap.store(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether the draft runs its matmuls on the accelerator (see [`Dspark::set_device`]).
@@ -1631,6 +1648,8 @@ impl<'a> Dspark<'a> {
             rnn: Vec::new(),
             rnn_start: 0,
             rnn_w: 0,
+            ink_dev: Default::default(),
+            ink_sync: 0,
         }
     }
 
@@ -1781,7 +1800,17 @@ impl<'a> Dspark<'a> {
             return;
         }
         if let Some(d) = &self.ink {
-            let (kv, rnn) = d.context(feats, t, sess.len);
+            // On the accelerator once a draft pass made the drafter there (the device copy of the
+            // cache brought up to date first).
+            let on_dev = d
+                .device_ready()
+                .filter(|dv| Self::ink_sync(*dv, sess))
+                .and_then(|dv| dv.context(&mut sess.ink_dev, feats, t, sess.len));
+            let synced = on_dev.is_some();
+            let (kv, rnn) = on_dev.unwrap_or_else(|| d.context(feats, t, sess.len));
+            if synced {
+                sess.ink_sync = sess.len + t;
+            }
             for (li, (k, v)) in kv.into_iter().enumerate() {
                 sess.push(li, &k, &v);
             }
@@ -2340,6 +2369,30 @@ impl Dspark<'_> {
     ) -> Vec<u32> {
         let h = self.cfg.hidden;
         let pos = sess.len;
+        // The head's context: the features of the position before the anchor.
+        let context = match pos.checked_sub(1).filter(|&p| p >= sess.rnn_start && sess.rnn_w > 0) {
+            Some(p) => sess.rnn[(p - sess.rnn_start) * h..(p - sess.rnn_start + 1) * h].to_vec(),
+            None => vec![0f32; h],
+        };
+        // The whole pass on the accelerator (greedy chain; a choice other than the slot's first
+        // maximum ends the block there).
+        if let Some(dv) = d.device_for(target).filter(|dv| Self::ink_sync(*dv, sess)) {
+            let x0 = d.block_input(target, anchor);
+            if let Some((mut lg, toks)) = dv.draft(&mut sess.ink_dev, &x0, &context, pos, anchor, k) {
+                let v = lg.len() / k;
+                let mut out = Vec::with_capacity(k);
+                for (i, &want) in toks.iter().enumerate() {
+                    let Some(t) = choose(i, &mut lg[i * v..(i + 1) * v], None) else {
+                        break;
+                    };
+                    out.push(t);
+                    if t != want {
+                        break;
+                    }
+                }
+                return out;
+            }
+        }
         let s: &DsparkSession = sess;
         let ctx = |li: usize, lo: usize| s.range(li, lo.max(s.start), pos);
         let hid = d.block(target, anchor, pos, &ctx);
@@ -2349,11 +2402,6 @@ impl Dspark<'_> {
             None => target.head_raw(rows, k),
         };
         let v = logits.len() / k;
-        // The head's context: the features of the position before the anchor.
-        let context = match pos.checked_sub(1).filter(|&p| p >= s.rnn_start) {
-            Some(p) => s.rnn[(p - s.rnn_start) * h..(p - s.rnn_start + 1) * h].to_vec(),
-            None => vec![0f32; h],
-        };
         let mut state = vec![0f32; d.rank()];
         let mut prev = anchor;
         let mut out = Vec::with_capacity(k);
@@ -2365,6 +2413,23 @@ impl Dspark<'_> {
             out.push(t);
         }
         out
+    }
+
+    /// Brings the device copy of Inkling-2's drafter cache up to the host's positions; false
+    /// when the device cannot.
+    fn ink_sync(dv: &dyn crate::inkling_draft::InkDraftDevice, sess: &mut DsparkSession) -> bool {
+        let (from, to) = (sess.ink_sync.max(sess.start), sess.len);
+        if from < to {
+            let mut slot = std::mem::take(&mut sess.ink_dev);
+            let rows: Vec<(&[f32], &[f32])> = (0..sess.a.len()).map(|li| sess.range(li, from, to)).collect();
+            let ok = dv.upload(&mut slot, from, to, &rows);
+            sess.ink_dev = slot;
+            if !ok {
+                return false;
+            }
+        }
+        sess.ink_sync = to;
+        true
     }
 }
 

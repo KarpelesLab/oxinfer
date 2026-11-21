@@ -3068,7 +3068,7 @@ fn run_inkling(mut args: Args) -> Result<()> {
     // (Prompt lookup rolls back what the model refutes: a session goes back up to
     // `inkling::ROLLBACK` positions.)
     if let Some(lk) = LOOKUP.lock().unwrap().as_mut() {
-        lk.opts.max_draft = lk.opts.max_draft.min(oxinfer::inkling::MAX_DRAFT);
+        lk.opts.max_draft = lk.opts.max_draft.min(model.max_draft());
     }
     // A device whose sessions cannot go back (CUDA) runs neither lookup rounds nor drafts.
     if !model.can_rollback() {
@@ -3124,6 +3124,7 @@ fn run_inkling(mut args: Args) -> Result<()> {
         (Some(d), Some(f)) => {
             let dr = load_dspark(d, f, model.cfg.hidden_size, model.cfg.vocab_size, model.quant)?;
             oxinfer::inkling::check_draft(&model, &dr)?;
+            dr.set_verify_cap(model.max_draft());
             run_dspark(&args, &model, &dr, &tok, &eos, fmt, streamer.as_deref(), mm)
         }
         _ => run_text(&args, &model, &tok, &eos, fmt, mm),
@@ -3630,9 +3631,13 @@ fn run_dspark<M: oxinfer::dspark::Target<Sess: Clone>>(
     };
     let mut sampler =
         Sampler::new(args.temperature, args.top_k, args.top_p, args.seed).with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0));
+    let opts = DsparkOptions {
+        draft_tokens: opts.draft_tokens.min(draft.verify_cap().unwrap_or(usize::MAX)),
+        ..opts
+    };
     let mut dec = DsparkDecoder::new(model, draft, opts);
     dec.lookup = make_lookup(args, eos);
-    if let (Some(lk), Some(cap)) = (dec.lookup.as_mut(), draft.lookup_cap()) {
+    if let (Some(lk), Some(cap)) = (dec.lookup.as_mut(), draft.verify_cap()) {
         lk.opts.max_draft = lk.opts.max_draft.min(cap);
     }
     eprintln!(

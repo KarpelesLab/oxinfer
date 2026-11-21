@@ -578,10 +578,12 @@ keep 64 positions more), so a rejected draft is undone exactly. Three drafters:
   byte for byte after the upcast).
 - **Prompt lookup** (`--lookup`, `lookup=1`, on by default as for the other families).
 
-A round verifies at most 6 drafts (`inkling::MAX_DRAFT`): a pass of up to 7 tokens stays on the
-CPU's decode kernels, routed experts included, whose rows are those of one-token forwards bit
-for bit; an 8-token pass takes the prefill path, which rounds differently (greedy output then
-drifted at near-ties) and costs several times more.
+On the CPU a round verifies at most 6 drafts (`inkling::MAX_DRAFT`): a pass of up to 7 tokens
+stays on the CPU's decode kernels, routed experts included, whose rows are those of one-token
+forwards bit for bit; an 8-token pass takes the prefill path, which rounds differently (greedy
+output then drifted at near-ties) and costs several times more. When the passes run on the GPU,
+whose passes of up to 16 tokens give one-token results, the bound is 15
+(`Inkling2Model::max_draft`; the drafter's block gives 7).
 
 Greedy output with each drafter is the plain greedy output token for token: 45 runs (3
 checkpoints x code / prose / chat x lookup, cost-aware draft, 3 and 6 fixed drafts; 96 tokens,
@@ -602,21 +604,32 @@ probes (1.1-1.6 tokens per forward, within 10-30% of plain decoding on a machine
 the draft's first pass also builds its head product, about 0.5 s). Prompt lookup found few matches
 on these prompts (1.01-1.13 tokens per forward).
 
-On the GPU (Metal decode plans; the draft's matmuls and the target's LM head over its rows on the
-accelerator's matrix-vector kernels, a draft pass of about 12-18 ms) it does not pay yet either:
-a verification pass of 4 tokens takes 29-52 ms against 17-20 ms for a step, of 7 tokens 47-105 ms.
-The same 45 runs on the GPU (128 tokens, load 8-19), every output again the plain greedy text,
-decode tok/s:
+On the GPU the whole draft pass is one Metal submission (`src/metal_inkling_draft.rs`): the 3
+layers over the block on the decode library's multi-token matvecs, RoPE, the block's attention
+over a device copy of the draft's cache, the target's LM head over the draft rows, and the
+recurrent head's chain with each slot's greedy token chosen on the device (its logits come back
+for the acceptance rule; a sampled choice other than the slot's first maximum ends the block
+there). The context of committed positions is injected in a second submission (0.3 ms), and the
+device cache follows the host's (which stays authoritative: rows it gained otherwise are uploaded
+first). A draft pass of 3 slots takes 3.2-3.4 ms on the GPU, 4-5 ms in all (12-18 ms before, with
+one submission per matmul of 4 rows). The drafts are the CPU drafter's: the same acceptance, token
+for token, on the runs checked.
 
-| Checkpoint | plain | lookup | draft, cost-aware | 3 drafts | 6 drafts |
+The same 45 runs on the GPU (128 tokens, load 8-19 from other jobs; verification passes with the
+routed experts grouped by expert: 4 tokens in 25-37 ms against 17-21 ms for a step), every
+output the plain greedy text, decode tok/s (code / prose / chat):
+
+| Checkpoint | plain | lookup | draft, cost-aware | 3 drafts | 7 drafts |
 |---|---|---|---|---|---|
-| ggml-org Q8_0 (code / prose / chat) | 59 / 60 / 57 | 62 / 64 / 55 | 52 / 50 / 47 | 49 / 41 / 37 | 36 / 26 / 24 |
-| release, `--mtp` | 50 / 50 / 28* | 51 / 10* / 45 | 43 / 30 / 46 | 34 / 41 / 33 | 23 / 14 / 23 |
-| UD-IQ3_XXS | 64 / 61 / 61 | 62 / 51 / 58 | 50 / 44 / 49 | 40 / 29 / 32 | 26 / 21 / 22 |
+| ggml-org Q8_0 | 52 / 52 / 52 | 55 / 56 / 52 | 58 / 50 / 47 | **61** / 50 / 48 | 49 / 37 / 35 |
+| release, `--mtp` | 48 / 48 / 49 | 52 / 52 / 48 | 48 / 49 / 44 | 48 / 49 / 45 | 40 / 36 / 31 |
+| UD-IQ3_XXS | 58 / 58 / 58 | 59 / 61 / 59 | 50 / 52 / 49 | 56 / 46 / 50 | 37 / 32 / 32 |
 
-(* runs slowed by the other jobs.) Acceptance on the GPU: 34-49% of 3 drafts (2.0-2.4 tokens
-per forward), 19-27% of 6 (2.1-2.6). With a verification pass that cost about one step, 3 drafts
-would give about 2x; the drafter is what the speed of multi-token passes on the device decides.
+Tokens per target forward with 3 drafts: 2.40-2.59 on code, 1.98-2.23 on prose, 2.02-2.15 on
+chat (34-53% of the drafts accepted); with 7, 2.08-3.02 (16-30%). Drafting now pays on code
+(Q8_0: +16% with 3 drafts) and is about even elsewhere; a verification pass of 4 tokens still
+costs 1.5-1.9 steps, so the speed-up is set by the target's multi-token passes. Prompt lookup
+adds 0-8%.
 
 ```sh
 oxinfer --model thinkingmachines/Inkling-2-Mini --mtp --prompt "..."

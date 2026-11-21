@@ -105,8 +105,9 @@ keep their inputs in rings by position), rounds verify at most 6 drafts (7-token
 the bit-exact decode kernels), and greedy output is plain greedy output. It accepts 35-51% of 3
 drafts (2.0-2.5 tokens per forward) and 18-35% of 6; on the CPU a verification pass costs about
 its token count in steps (every token reads its own 8 experts), so the cost-aware rounds fall back
-to plain steps there; on the GPU a 4-token verification still costs 1.5-2.5 steps, and drafting
-did not beat plain decoding yet (lookup was within a few percent of it). Numbers: [Inkling-2 Mini](inkling.md#speculative-decoding).
+to plain steps there. On the GPU the draft pass is one Metal submission (3-4 ms for 3 slots) and
+a 4-token verification costs 1.5-1.9 steps: 3 drafts gain 16% on code (Q8_0, 52 -> 61 tok/s) and
+are about even on prose and chat; lookup adds 0-8%. Numbers: [Inkling-2 Mini](inkling.md#speculative-decoding).
 
 ## Multi-token passes and MoE experts on the CPU
 

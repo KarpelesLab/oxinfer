@@ -79,6 +79,9 @@ pub const ROLLBACK: usize = 64;
 /// are those of one-token forwards bit for bit, so greedy output is plain greedy output. (Longer
 /// passes take the prefill path: other rounding, and several times slower on the CPU.)
 pub const MAX_DRAFT: usize = crate::kernels::TN - 2;
+/// [`MAX_DRAFT`] when the passes run on the accelerator, whose passes of up to 16 tokens give
+/// one-token results ([`Inkling2Model::max_draft`]).
+pub const DEVICE_MAX_DRAFT: usize = 15;
 
 /// Whether `model_type` is one of this family's.
 pub fn is_model_type(mt: &str) -> bool {
@@ -1702,6 +1705,18 @@ impl<'a> Inkling2Model<'a> {
         }
     }
 
+    /// Most draft tokens a speculative round verifies: [`DEVICE_MAX_DRAFT`] when the passes run
+    /// on the accelerator, else [`MAX_DRAFT`]; within what a session can go back
+    /// ([`Self::rollback_limit`]: 0 on CUDA, where speculation is off).
+    pub fn max_draft(&self) -> usize {
+        let lim = self.rollback_limit().saturating_sub(1);
+        if self.device().is_some() {
+            DEVICE_MAX_DRAFT.min(lim)
+        } else {
+            MAX_DRAFT.min(lim)
+        }
+    }
+
     /// Runs `tokens` on the device when it can (`want` as [`DevWant`]); false otherwise (the
     /// session then has its state on the host).
     fn run_device(&self, sess: &mut Inkling2Session, tokens: &[u32], mm: &[(usize, &[f32])], want: DevWant) -> bool {
@@ -2805,6 +2820,9 @@ impl crate::dspark::Target for Inkling2Model<'_> {
         self.head(hidden, t, false)
     }
     // A draft's few rows on the accelerator's matrix-vector kernels (4 rows per submission).
+    fn lm_head(&self) -> Option<&Lin<'_>> {
+        self.stream.is_none().then_some(&self.lm_head)
+    }
     fn head_raw_device(&self, hidden: &[f32], t: usize) -> Option<Vec<f32>> {
         let c = &self.cfg;
         let (h, v, u) = (c.hidden_size, c.vocab_size, c.unpadded_vocab_size);

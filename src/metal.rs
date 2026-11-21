@@ -48,6 +48,8 @@ pub(crate) mod decode;
 mod dit;
 #[path = "metal_inkling.rs"]
 pub(crate) mod inkling;
+#[path = "metal_inkling_draft.rs"]
+pub(crate) mod inkling_draft;
 #[path = "metal_prefill.rs"]
 mod prefill;
 
