@@ -59,6 +59,11 @@ run with the same size and frame count only decodes them (the two VAEs, no forwa
 comparison with another implementation on the same inputs (see
 [the real files against torch and ComfyUI](#what-was-checked-1)).
 
+
+The server runs it too, as asynchronous jobs in the shape of OpenAI's videos API (`/v1/videos`:
+see [video generation](server.md#video-generation)), and the web GUI has a *Video* page that
+follows a job and plays the result; in C it is `oxi_video_load` / `oxi_video_generate`.
+
 ## The release
 
 | component | folder | size | |

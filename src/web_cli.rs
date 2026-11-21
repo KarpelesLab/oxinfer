@@ -6,10 +6,10 @@ use oxinfer::server::{Api, ServerOptions, http};
 
 pub const USAGE: &str = "usage: oxinfer web [--host ADDR] [--port N] [--no-open] [--api-key KEY] [options]\n\
 \n\
-Serves the web GUI (chat, images, speech to text, text to speech, embeddings; the model catalog,\n\
-downloads with progress, the model cache) at http://HOST:PORT/, and the OpenAI-compatible API of\n\
-`oxinfer serve` at http://HOST:PORT/v1 for other clients at the same time. Models picked in the\n\
-GUI join the API's model list.\n\
+Serves the web GUI (chat, images, speech to text, text to speech, voice chat, video, embeddings;\n\
+the model catalog, downloads with progress, the model cache) at http://HOST:PORT/, and the\n\
+OpenAI-compatible API of `oxinfer serve` at http://HOST:PORT/v1 for other clients at the same\n\
+time. Models picked in the GUI join the API's model list.\n\
 \n\
 options:\n\
 \x20 --host ADDR           address to listen on (default 127.0.0.1)\n\

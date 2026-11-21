@@ -70,8 +70,8 @@ audio, `transcript` its text, `id`, `expires_at`; `content` is null), from two k
   OpenAI's names). In the library `Engine::speak_omni`, in C `oxi_engine_speak_omni`.
 - **Haru** (`higurashi-ai/Haru-4B`, a speech model): the user's recording (an `input_audio` part
   of the last user message) is played to the model frame by frame, as in a live conversation,
-  then silence until it has answered and gone quiet for 1.2 s (at most `max_reply_seconds`,
-  default 12, an extension); the reply is what it said after the recording. The system prompt is
+  then silence until it has answered and gone quiet for 2 s (no text and no sound;
+  `end_silence_seconds`), at most `max_reply_seconds` (default 12; both extensions); the reply is what it said after the recording. The system prompt is
   its character card, `audio.voice_reference` (an extension: a `data:` or `http(s)://` URL of a
   clip) the voice it speaks with; `temperature`, `top_k`, `top_p` and `seed` sample its text
   stream. In the library `Haru::respond` (`haru::turn`), in C `oxi_haru_respond`.

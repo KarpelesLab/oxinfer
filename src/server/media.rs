@@ -777,6 +777,10 @@ fn generate_images(
                     (p.width, p.height) = (w, h);
                 }
                 p.seed = seed;
+                // The smallest canvas, as the command line (default 2048 x 2048).
+                if let Some(a) = std::env::var("OXINFER_H3_MIN_AREA").ok().and_then(|a| a.parse().ok()) {
+                    p.min_area = a;
+                }
                 if job.steps.is_some() || job.guidance.is_some() {
                     bail!("MiniMax-H3-Image is distilled to its own steps without guidance: leave steps and guidance out");
                 }

@@ -975,7 +975,7 @@ OxiHaru *oxi_haru_load(const char *model, const char *options, oxi_progress_fn p
  * silence until it has answered and gone quiet. Its text goes to `cb` and its audio (24 kHz) to
  * `on_audio`, frame by frame (either returning non-zero stops). `options_json` (NULL: defaults):
  *   {"system": "...", "reference": "voice.wav", "temperature": 0.7, "top_k": 25, "top_p": 1.0,
- *    "guidance": 1.5, "seed": 0, "max_reply_seconds": 12, "end_silence_seconds": 1.2,
+ *    "guidance": 1.5, "seed": 0, "max_reply_seconds": 12, "end_silence_seconds": 2.0,
  *    "include_overlap": false}
  * Returns 0, or -1. */
 int oxi_haru_respond(OxiHaru *h, const float *samples, size_t n, int sample_rate, const char *options_json, oxi_token_fn cb,

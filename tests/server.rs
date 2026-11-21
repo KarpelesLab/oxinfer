@@ -1383,3 +1383,172 @@ fn haru_speech_to_speech() {
     assert_eq!(st, 400, "{body}");
     s.stop().unwrap();
 }
+
+/// A GET returning raw bytes: (status, content type, body).
+fn get_bytes(addr: SocketAddr, path: &str) -> (u16, String, Vec<u8>) {
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    write!(s, "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).unwrap();
+    let at = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let head = String::from_utf8_lossy(&raw[..at]).to_ascii_lowercase();
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    let ct = head
+        .lines()
+        .find_map(|l| l.strip_prefix("content-type: "))
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mut body = raw[at..].to_vec();
+    if head.contains("transfer-encoding: chunked") {
+        let (mut out, mut rest) = (Vec::new(), &body[..]);
+        while let Some(nl) = rest.windows(2).position(|w| w == b"\r\n") {
+            let n = usize::from_str_radix(std::str::from_utf8(&rest[..nl]).unwrap().trim(), 16).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&rest[nl + 2..nl + 2 + n]);
+            rest = &rest[nl + 4 + n..];
+        }
+        body = out;
+    }
+    (status, ct, body)
+}
+
+#[test]
+fn video_jobs_with_a_tiny_minimax_h3() {
+    let base = std::env::temp_dir().join(format!("oxinfer-h3-tiny-{}", std::process::id()));
+    let (video, image) = (base.join("video"), base.join("image"));
+    oxinfer::minimax_h3::tiny::write_tiny_video_release(&video).unwrap();
+    oxinfer::minimax_h3::tiny::write_tiny_image_release(&image).unwrap();
+    let s = serve(&format!("model=h3={}; model=h3i={}", video.display(), image.display()));
+    let a = s.addr();
+    // Text to video, then first and last frame to video (images as data: URLs).
+    let req = json!({"model": "h3", "prompt": "A red fox trots across the snow.", "size": "64x64", "frames": 22, "steps": 4, "seed": 3});
+    let (st, body) = request(a, "POST", "/v1/videos", &req.to_string());
+    assert_eq!(st, 200, "{body}");
+    let id = serde_json::from_str::<Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+    let (st, stream) = request(a, "GET", &format!("/v1/videos/{id}/events"), "");
+    assert_eq!(st, 200);
+    let v = wait_video(a, &id, &["completed", "failed"]);
+    assert_eq!(v["status"], "completed", "{v}");
+    assert_eq!(
+        (v["progress"].as_u64(), v["frames"].as_u64(), v["size"].as_str()),
+        (Some(100), Some(22), Some("64x64"))
+    );
+    assert_eq!((v["steps"].as_u64(), v["has_audio"].as_bool()), (Some(3), Some(true)), "{v}");
+    let steps: Vec<u64> = stream
+        .split("\n\n")
+        .filter_map(|e| e.strip_prefix("event: video\ndata: "))
+        .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+        .filter(|e| e["stage"] == "generating")
+        .filter_map(|e| e["step"].as_u64())
+        .collect();
+    assert!(steps.windows(2).all(|w| w[0] <= w[1]), "{steps:?}");
+    let (st, ct, avi) = get_bytes(a, &format!("/v1/videos/{id}/content"));
+    assert_eq!(
+        (st, ct.as_str(), &avi[..4], &avi[8..12]),
+        (200, "video/x-msvideo", &b"RIFF"[..], &b"AVI "[..])
+    );
+    assert_eq!(
+        avi.windows(4).filter(|w| w == b"00dc").count(),
+        2 * 22,
+        "22 frames and their index entries"
+    );
+    let (st, ct, wav) = get_bytes(a, &format!("/v1/videos/{id}/content?variant=audio"));
+    assert_eq!((st, ct.as_str(), &wav[..4]), (200, "audio/wav", &b"RIFF"[..]));
+    assert_eq!(u16::from_le_bytes([wav[22], wav[23]]), 2, "stereo");
+    let (st, ct, png) = get_bytes(a, &format!("/v1/videos/{id}/content?variant=thumbnail"));
+    assert_eq!((st, ct.as_str(), &png[..4]), (200, "image/png", &b"\x89PNG"[..]));
+    let first = format!("data:image/png;base64,{}", b64_encode(&png));
+    let req = json!({"model": "h3", "prompt": "The fox turns around.", "size": "64x64", "frames": 22, "steps": 3, "input_reference": {"image_url": first}, "last_frame": first});
+    let (st, body) = request(a, "POST", "/v1/videos", &req.to_string());
+    assert_eq!(st, 200, "{body}");
+    let id2 = serde_json::from_str::<Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+    let v = wait_video(a, &id2, &["completed", "failed"]);
+    assert_eq!(
+        (v["status"].as_str(), v["size"].as_str()),
+        (Some("completed"), Some("64x64")),
+        "{v}"
+    );
+    // References (ref2va): an image and an audio clip, uploaded.
+    let mut form = Vec::new();
+    for (k, v) in [
+        ("model", "h3"),
+        ("prompt", "subject_definitions: <Picture 1>, voice: <Audio 1>"),
+        ("frames", "22"),
+        ("steps", "3"),
+        ("size", "64x64"),
+        ("ref_image_edge", "64"),
+    ] {
+        form.extend_from_slice(format!("--B\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n").as_bytes());
+    }
+    for (name, ct, data) in [("a.png", "image/png", &png), ("b.wav", "audio/wav", &wav)] {
+        form.extend_from_slice(
+            format!("--B\r\nContent-Disposition: form-data; name=\"references[]\"; filename=\"{name}\"\r\nContent-Type: {ct}\r\n\r\n")
+                .as_bytes(),
+        );
+        form.extend_from_slice(data);
+        form.extend_from_slice(b"\r\n");
+    }
+    form.extend_from_slice(b"--B--\r\n");
+    let mut c = std::net::TcpStream::connect(a).unwrap();
+    write!(
+        c,
+        "POST /v1/videos HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary=B\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        form.len()
+    )
+    .unwrap();
+    c.write_all(&form).unwrap();
+    let mut out = String::new();
+    c.read_to_string(&mut out).unwrap();
+    let body = out.split_once("\r\n\r\n").unwrap().1;
+    let id3 = serde_json::from_str::<Value>(body).unwrap()["id"].as_str().unwrap().to_string();
+    let v = wait_video(a, &id3, &["completed", "failed"]);
+    assert_eq!(v["status"], "completed", "{v}");
+    // Cancelled between steps: many steps, cancelled once it denoises.
+    let req = json!({"model": "h3", "prompt": "x", "size": "64x64", "frames": 22, "steps": 200});
+    let (_, body) = request(a, "POST", "/v1/videos", &req.to_string());
+    let id4 = serde_json::from_str::<Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
+    for _ in 0..2000 {
+        let (_, b) = request(a, "GET", &format!("/v1/videos/{id4}"), "");
+        if serde_json::from_str::<Value>(&b).unwrap()["step"].as_u64() > Some(1) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    request(a, "POST", &format!("/v1/videos/{id4}/cancel"), "");
+    let v = wait_video(a, &id4, &["completed", "failed", "cancelled"]);
+    assert_eq!(v["status"], "cancelled", "{v}");
+    // MiniMax-H3-Image as an image model (a small canvas: OXINFER_H3_MIN_AREA).
+    // SAFETY: set before any other thread of this test reads it; no other test reads it.
+    unsafe { std::env::set_var("OXINFER_H3_MIN_AREA", "4096") };
+    let (st, body) = request(
+        a,
+        "POST",
+        "/v1/images/generations",
+        &json!({"model": "h3i", "prompt": "a fox", "size": "64x64", "stream": true}).to_string(),
+    );
+    assert_eq!(st, 200, "{body}");
+    let ev = events(&body);
+    assert!(
+        ev.iter()
+            .filter(|(n, v)| n == "image_generation.progress" && v["stage"] == "generating")
+            .count()
+            >= 1,
+        "{body}"
+    );
+    assert!(
+        ev.iter().any(|(n, v)| n == "image_generation.completed" && v["size"] == "64x64"),
+        "{body}"
+    );
+    let (st, body) = request(
+        a,
+        "POST",
+        "/v1/images/generations",
+        &json!({"model": "h3i", "prompt": "a fox", "steps": 4}).to_string(),
+    );
+    assert_eq!(st, 500, "{body}");
+    s.stop().unwrap();
+    std::fs::remove_dir_all(&base).ok();
+}

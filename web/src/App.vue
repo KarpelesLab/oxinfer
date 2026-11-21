@@ -263,7 +263,7 @@ onMounted(async () => {
 <template>
   <header class="masthead">
     <h1 class="wordmark">oxinfer</h1>
-    <p v-if="native" class="lede">Every model runs on {{ store.status?.platform ? 'this computer' : 'the computer that serves this page' }}. Pick one in Models, then chat, make images, transcribe, speak or search.</p>
+    <p v-if="native" class="lede">Every model runs on {{ store.status?.platform ? 'this computer' : 'the computer that serves this page' }}. Pick one in Models, then chat, make images and videos, transcribe, speak, talk or search.</p>
     <p v-else class="lede">Chat with a language model or make images, all in this tab. The weights download once and stay in this browser; nothing you type leaves the page.</p>
     <nav class="nav">
       <div class="modes" role="group" aria-label="Mode">
@@ -497,7 +497,7 @@ onMounted(async () => {
   background: var(--surface);
 }
 
-@media (max-width: 1000px) {
+@media (max-width: 1500px) {
   .masthead {
     grid-template-columns: 1fr auto;
   }

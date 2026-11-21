@@ -36,6 +36,10 @@ point `--model` at a folder you already have.
 | `--text-encoder SPEC` | a T5 encoder GGUF (`city96/t5-v1_1-xxl-encoder-gguf:Q8_0`) replacing `text_encoder_3/` |
 | `--base SPEC` | with a GGUF `--model`: the diffusers SD 3 folder the text encoders, VAE and tokenizers come from (required: there is no ungated default) |
 
+The server serves these folders as image models (`/v1/images/generations`, and image to image
+through `/v1/images/edits`; the load options are `LoadOptions`' keys), with the steps streamed as
+progress events: see [image progress](server.md#image-progress).
+
 **What runs.** The prompt goes through three encoders. CLIP-L and OpenCLIP-bigG
 (`CLIPTextModelWithProjection`, `sd3::clip`) each give their penultimate hidden states (77
 tokens, 768 and 1280 wide) and a projected pooled embedding; the states are concatenated to 2048

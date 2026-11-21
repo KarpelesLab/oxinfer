@@ -2901,6 +2901,21 @@ impl Engine {
             bail!("LFM3-Omni speech needs the plain decoder (no speculative decoding)");
         };
         let model: &'static QwenModel<'static> = model;
+        // The codec (`audio_tokenizer/`) is not part of the model's download: fetched on first use
+        // for a repo in the download cache (`org--name`).
+        #[cfg(feature = "hf")]
+        if self.omni_voice.is_none() && !self.info.path.join("audio_tokenizer").join("config.json").is_file() {
+            let dir = &self.info.path;
+            let repo = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.split_once("--"))
+                .map(|(org, name)| format!("{org}/{name}"));
+            if let (Some(repo), Some(root)) = (repo, dir.parent()) {
+                crate::hf::resolve_prefix(&repo, "audio_tokenizer", Some(root))
+                    .with_context(|| format!("{repo}: the codec (audio_tokenizer/)"))?;
+            }
+        }
         if self.omni_voice.is_none() {
             self.omni_voice = Some(Box::new(crate::lfm3_omni::voice::Voice::load(&self.info.path, self.files)?));
         }

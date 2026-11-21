@@ -359,7 +359,8 @@ onUnmounted(() => {
 }
 .screen {
   display: block;
-  max-width: 100%;
+  /* Small videos scaled up for a look; large ones fit the column. */
+  width: min(100%, 640px);
   height: auto;
   background: #000;
   border-radius: 4px;

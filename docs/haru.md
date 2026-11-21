@@ -169,8 +169,11 @@ threads, float32) takes about 800 ms per frame.
 - **Live audio**: no microphone, no playback, no WebRTC or web demo; the command line plays a
   recording to the model. `DuplexSession` is the frame-by-frame interface a live front end
   needs.
-- **The server**: no endpoint. The OpenAI speech and transcription endpoints are one-way, and a
-  full-duplex stream needs a realtime protocol that oxinfer's server does not have.
+- **The server**: turn by turn only. Chat completions with `modalities: ["text", "audio"]` and
+  the user's recording as `input_audio` play it to the model as live, then silence until it has
+  answered and gone quiet ([spoken replies](server.md#spoken-replies-lfm3-omni-haru);
+  `Haru::respond` in `haru::turn`, `oxi_haru_respond` in C; the GUI's *Voice chat* page). A
+  full-duplex stream would need a realtime protocol that oxinfer's server does not have.
 - **GPU**: a frame's step runs on the CPU (oxinfer's GPU decoding takes token ids, not
   embeddings). Everything here was run with `--device cpu`; with a GPU backend active the
   prompt's pass may use it, which was not tried.

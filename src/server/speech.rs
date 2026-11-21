@@ -216,6 +216,7 @@ pub(super) fn spoken_chat(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
     };
     // Haru: the longest answer after the recording, in seconds (an extension).
     let max_reply = body.get("max_reply_seconds").and_then(Value::as_f64).map(|v| v as f32);
+    let end_silence = body.get("end_silence_seconds").and_then(Value::as_f64).map(|v| v as f32);
     let id = api.new_id("chatcmpl-");
     let audio_id = api.new_id("audio_");
     let created = now();
@@ -292,6 +293,9 @@ pub(super) fn spoken_chat(api: &Arc<Api>, body: &Value) -> ApiResult<Output> {
             o.config.seed = input.seed.unwrap_or_else(random_seed);
             if let Some(s) = max_reply {
                 o.max_reply_seconds = s;
+            }
+            if let Some(s) = end_silence {
+                o.end_silence_seconds = s;
             }
             let t = h
                 .respond(&user, &o, &mut |text, audio| {

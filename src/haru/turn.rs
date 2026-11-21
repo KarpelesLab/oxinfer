@@ -20,7 +20,7 @@ pub struct TurnOptions {
     /// The longest answer, in seconds of silence played after the recording (default 12).
     pub max_reply_seconds: f32,
     /// The turn ends once the model has spoken after the recording and then been silent (no
-    /// text) for this long (default 1.2 s).
+    /// text, and its audio below -40 dBFS: the speech lags the text) for this long (default 2 s).
     pub end_silence_seconds: f32,
     /// Keep what the model said while the user spoke too (default false: the answer only, from
     /// the end of the recording).
@@ -34,7 +34,7 @@ impl Default for TurnOptions {
             reference: None,
             config: DuplexConfig::default(),
             max_reply_seconds: 12.0,
-            end_silence_seconds: 1.2,
+            end_silence_seconds: 2.0,
             include_overlap: false,
         }
     }
@@ -94,7 +94,9 @@ impl Haru {
         for index in 0..total {
             ran = index + 1;
             let tail = index >= user_frames;
-            let silent = frame.text.trim().is_empty();
+            // Quiet: no text, and no sound (the audio of a word comes after its text).
+            let rms = (frame.audio.iter().map(|v| v * v).sum::<f32>() / frame.audio.len().max(1) as f32).sqrt();
+            let silent = frame.text.trim().is_empty() && rms < 0.01;
             if tail || o.include_overlap {
                 if !on_frame(&frame.text, &frame.audio) {
                     break;
@@ -123,10 +125,18 @@ impl Haru {
                 frame = session.step(next)?;
             }
         }
-        // The trailing quiet frames of the answer are dropped, keeping 0.2 s.
+        // The trailing quiet frames of the answer are dropped, keeping 0.3 s.
         if finished && !o.include_overlap {
-            let keep = (quiet_frames * fs).saturating_sub(rate as usize / 5);
+            let keep = (quiet_frames * fs).saturating_sub(rate as usize * 3 / 10);
             samples.truncate(samples.len().saturating_sub(keep));
+        }
+        // And the silence before it (the model's pause before it answers), keeping 0.2 s.
+        if !o.include_overlap {
+            let loud = samples
+                .chunks(fs)
+                .position(|f| (f.iter().map(|v| v * v).sum::<f32>() / f.len() as f32).sqrt() >= 0.003)
+                .unwrap_or(0);
+            samples.drain(..(loud * fs).saturating_sub(rate as usize / 5).min(samples.len()));
         }
         Ok(Turn {
             text: text.split_whitespace().collect::<Vec<_>>().join(" "),

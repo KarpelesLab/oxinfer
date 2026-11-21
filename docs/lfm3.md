@@ -112,8 +112,12 @@ M=LiquidAI/LFM3-Omni-2B
 Text replies go through the normal chat path and the engine (`--chat`, `oxinfer serve`,
 `Engine::send_with_media`): the placeholders and the two markers that open speech are taken out
 of the output head, which is what the reference's `generation_mode="text"` does. A reply that
-writes a WAV (`--speak`, or `-o FILE.wav` with a prompt) runs `src/lfm3_omni_cli.rs`, from the
-command line only.
+writes a WAV (`--speak`, or `-o FILE.wav` with a prompt) runs `src/lfm3_omni_cli.rs`; in the
+library it is `Engine::speak_omni` (`lfm3_omni::voice`), in C `oxi_engine_speak_omni`, and the
+server answers in speech for chat completions with `modalities: ["text", "audio"]` and on
+`/v1/audio/speech` (see [spoken replies](server.md#spoken-replies-lfm3-omni-haru); the GUI's
+*Voice chat* and *Speak* pages). The codec (`audio_tokenizer/`) is fetched on the first spoken
+reply when the model came from the download cache without it.
 
 | Task | System prompt (the model card's) | Command line |
 |---|---|---|

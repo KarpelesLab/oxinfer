@@ -130,6 +130,19 @@ pub fn resolve_files(spec: &str, names: &[&str], cache_dir: Option<&Path>) -> Re
     Ok(dir)
 }
 
+/// Every file of repo `spec` under the folder `prefix` (`audio_tokenizer/`), fetched into the
+/// repo's cache directory, which is returned: the parts of a model its main download leaves out.
+pub fn resolve_prefix(spec: &str, prefix: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
+    let list = listing(spec)?;
+    let prefix = format!("{}/", prefix.trim_end_matches('/'));
+    let mut names: Vec<&str> = list.keys().map(String::as_str).filter(|n| n.starts_with(&prefix)).collect();
+    if names.is_empty() {
+        bail!("{spec} has no {prefix} folder");
+    }
+    names.sort_unstable();
+    resolve_files(spec, &names, cache_dir)
+}
+
 /// A single file: a local path is used as is; otherwise `spec` is `org/name/path/in/repo` (or
 /// `org/name` when the repo holds exactly one safetensors file), fetched into the repo's cache
 /// directory. For LoRA files and other single-file downloads.
