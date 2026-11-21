@@ -1665,8 +1665,9 @@ fn video_jobs_with_a_tiny_minimax_h3() {
     let id3 = serde_json::from_str::<Value>(body).unwrap()["id"].as_str().unwrap().to_string();
     let v = wait_video(a, &id3, &["completed", "failed"]);
     assert_eq!(v["status"], "completed", "{v}");
-    // Cancelled between steps: many steps, cancelled once it denoises.
-    let req = json!({"model": "h3", "prompt": "x", "size": "64x64", "frames": 22, "steps": 200});
+    // Cancelled between steps: a large canvas and many steps (slow enough even for the tiny
+    // model), cancelled once it denoises.
+    let req = json!({"model": "h3", "prompt": "x", "size": "768x768", "frames": 22, "steps": 200});
     let (_, body) = request(a, "POST", "/v1/videos", &req.to_string());
     let id4 = serde_json::from_str::<Value>(&body).unwrap()["id"].as_str().unwrap().to_string();
     for _ in 0..2000 {

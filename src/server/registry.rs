@@ -148,13 +148,19 @@ impl Entry {
             spec: spec.clone(),
             slot: Mutex::new(None),
             // Models on disk already: their kind for the listing, without fetching anything.
-            detected: Mutex::new(local_path(&spec.source, cache_dir).and_then(|p| {
-                let d = detect_path(&p, &spec.source);
-                match spec.option("kind").and_then(Kind::parse) {
-                    Some(k) if k != d.0 => None,
-                    _ => Some(d),
-                }
-            })),
+            detected: Mutex::new(
+                local_path(&spec.source, cache_dir)
+                    .map(|p| detect_path(&p, &spec.source))
+                    // Told apart by their names (no config file to probe), as `detect` does.
+                    .or_else(|| {
+                        let p = Path::new(&spec.source);
+                        (crate::zonos::is_zonos(p) || crate::fish::is_drama(p)).then_some((Kind::Speech, None))
+                    })
+                    .and_then(|d| match spec.option("kind").and_then(Kind::parse) {
+                        Some(k) if k != d.0 => None,
+                        _ => Some(d),
+                    }),
+            ),
             last_used: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             retired: AtomicBool::new(false),
