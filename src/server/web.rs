@@ -69,7 +69,7 @@ pub fn asset(path: &str) -> Option<(&'static [u8], &'static str)> {
     Some((bytes, ct))
 }
 
-/// This machine's name (for the page title), without a `.local` suffix.
+/// This machine's name (for the page title), without a `.local` / `.localdomain` suffix.
 fn hostname() -> Option<String> {
     #[cfg(unix)]
     let name = {
@@ -84,7 +84,8 @@ fn hostname() -> Option<String> {
     };
     #[cfg(not(unix))]
     let name = std::env::var("COMPUTERNAME").ok();
-    name.map(|n| n.trim_end_matches(".local").to_string()).filter(|n| !n.is_empty())
+    name.map(|n| n.trim_end_matches(".localdomain").trim_end_matches(".local").to_string())
+        .filter(|n| !n.is_empty())
 }
 
 /// Whether the GUI is embedded in this build (it is unless `src/server/webui` was missing).

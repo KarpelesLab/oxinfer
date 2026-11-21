@@ -947,7 +947,10 @@ fn local_path(source: &str, cache_dir: Option<&Path>) -> Option<PathBuf> {
 /// The memory a model takes, from the size of its weight files (a repo id not fetched yet: 0),
 /// scaled down when it is quantized at load.
 fn estimate(spec: &ModelSpec, cache_dir: Option<&Path>) -> u64 {
-    let Some(path) = local_path(&spec.source, cache_dir) else {
+    // (A repo without a config file oxinfer probes, such as ZONOS3: its cache folder.)
+    let found =
+        local_path(&spec.source, cache_dir).or_else(|| crate::model_cache::folder_of(&spec.source, cache_dir).filter(|f| f.is_dir()));
+    let Some(path) = found else {
         return 0;
     };
     let bytes = disk_bytes(&path, 0);
