@@ -70,7 +70,10 @@ pub enum RefInput {
 pub enum Reference {
     Image(Image),
     /// Frames at 24 fps on their canvas; the soundtrack at the audio VAE's rate, stereo.
-    Video { frames: Vec<Image>, audio: Option<[Vec<f32>; 2]> },
+    Video {
+        frames: Vec<Image>,
+        audio: Option<[Vec<f32>; 2]>,
+    },
     Audio([Vec<f32>; 2]),
 }
 
@@ -166,7 +169,10 @@ pub fn normalize(refs: Vec<RefInput>, frames: usize, rate: u32, o: &RefOptions) 
         }
     }
     if refs.len() > MAX_REFERENCES {
-        bail!("MiniMax-H3 accepts at most {MAX_REFERENCES} references in total, got {}", refs.len());
+        bail!(
+            "MiniMax-H3 accepts at most {MAX_REFERENCES} references in total, got {}",
+            refs.len()
+        );
     }
     if na == refs.len() {
         bail!("an audio reference has to be paired with at least one image or video reference");
@@ -183,7 +189,10 @@ pub fn normalize(refs: Vec<RefInput>, frames: usize, rate: u32, o: &RefOptions) 
                         bail!("a reference image must be within 1:4 and 4:1, got {}x{}", im.width, im.height);
                     }
                     let scale = o.image_short_edge as f64 / im.width.min(im.height) as f64;
-                    let side = |v: usize| o.multiple.max((v as f64 * scale / o.multiple as f64).round_ties_even() as usize * o.multiple);
+                    let side = |v: usize| {
+                        o.multiple
+                            .max((v as f64 * scale / o.multiple as f64).round_ties_even() as usize * o.multiple)
+                    };
                     Reference::Image(resize(&im, side(im.width), side(im.height)))
                 }
                 RefInput::Video { frames: fr, fps, audio } => {
@@ -219,7 +228,9 @@ pub fn sample_video_frames(n: usize, temporal_patch: usize) -> Result<(Vec<usize
     }
     if idx.len() < temporal_patch {
         let min = ((temporal_patch - 1) as f64 * stride).round() as usize + 1;
-        bail!("a reference video is read at 2 fps in groups of {temporal_patch} frames, so it must run at least {min} frames at 24 fps, got {n}");
+        bail!(
+            "a reference video is read at 2 fps in groups of {temporal_patch} frames, so it must run at least {min} frames at 24 fps, got {n}"
+        );
     }
     let mut ts: Vec<f64> = (0..idx.len()).map(|i| i as f64 / VIDEO_SAMPLE_FPS).collect();
     while !ts.len().is_multiple_of(temporal_patch) {
@@ -251,7 +262,12 @@ pub fn encode_presentation(vl: &crate::qwen_vl::QwenVl, prompt: &str, refs: &[Re
         ids.extend(t);
         Ok(())
     };
-    let temporal = vl.mm.as_ref().context("the text encoder has no vision configuration")?.video.temporal_patch_size;
+    let temporal = vl
+        .mm
+        .as_ref()
+        .context("the text encoder has no vision configuration")?
+        .video
+        .temporal_patch_size;
     let (mut n_image, mut n_video, mut n_audio) = (0, 0, 0);
     for r in refs {
         if r.has_audio() {
@@ -273,7 +289,11 @@ pub fn encode_presentation(vl: &crate::qwen_vl::QwenVl, prompt: &str, refs: &[Re
                 let picked: Vec<&[u8]> = idx.iter().map(|&i| frames[i].rgb.as_slice()).collect();
                 let vb = vl.encode_video(&picked, frames[0].width, frames[0].height)?;
                 if vb.len() != times.len() {
-                    bail!("the video processor made {} blocks of a reference, MiniMax-H3 labels {}", vb.len(), times.len());
+                    bail!(
+                        "the video processor made {} blocks of a reference, MiniMax-H3 labels {}",
+                        vb.len(),
+                        times.len()
+                    );
                 }
                 for (b, &t) in vb.into_iter().zip(&times) {
                     text(&mut ids, &mut tags, &timestamp_label(t))?;
@@ -477,7 +497,11 @@ impl VideoPipeline {
                     let v = vi.next().unwrap();
                     (v.t, v.h, v.w)
                 }),
-                audio: if r.has_audio() { ai.next().unwrap().len() / ac / AUDIO_CHANNELS } else { 0 },
+                audio: if r.has_audio() {
+                    ai.next().unwrap().len() / ac / AUDIO_CHANNELS
+                } else {
+                    0
+                },
                 image: matches!(r, Reference::Image(_)),
             })
             .collect();
@@ -488,7 +512,12 @@ impl VideoPipeline {
         let mut video = Vec::new();
         for v in &vis {
             let noise = rng.normals(v.lat.len());
-            let noised: Vec<f32> = v.lat.iter().zip(&noise).map(|(&x, &n)| KEYFRAME_T * x + (1.0 - KEYFRAME_T) * n).collect();
+            let noised: Vec<f32> = v
+                .lat
+                .iter()
+                .zip(&noise)
+                .map(|(&x, &n)| KEYFRAME_T * x + (1.0 - KEYFRAME_T) * n)
+                .collect();
             video.extend(patchify_video(&noised, c, v.t, v.h, v.w, patch));
         }
         let n_cond_vals = video.len();

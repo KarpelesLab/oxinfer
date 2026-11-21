@@ -27,11 +27,20 @@ fn main() -> Result<()> {
                 (v[0], v[1], v[2])
             });
             let audio = if kind != "image" { aud.next().unwrap() } else { 0 };
-            RefBlock { visual, audio, image: kind == "image" }
+            RefBlock {
+                visual,
+                audio,
+                image: kind == "image",
+            }
         })
         .collect();
     let t = us(&c["target"]);
-    let g = Geometry { lt: t[0], lh: t[1], lw: t[2], n_audio: t[3] };
+    let g = Geometry {
+        lt: t[0],
+        lh: t[1],
+        lw: t[2],
+        n_audio: t[3],
+    };
     let lay = layout(&tags, &blocks, g, 2);
     let want: Vec<[f64; 3]> = c["positions"]
         .as_array()

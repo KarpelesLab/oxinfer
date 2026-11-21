@@ -67,9 +67,8 @@ fn load_ref(path: &Path) -> Result<oxinfer::minimax_h3::ref2va::RefInput> {
     #[cfg(feature = "media")]
     {
         let media = oxinfer::media::Media::new();
-        let sound = |p: &Path| -> Result<(Vec<Vec<f32>>, u32)> {
-            media.decode_audio(p)?.to_channels().with_context(|| p.display().to_string())
-        };
+        let sound =
+            |p: &Path| -> Result<(Vec<Vec<f32>>, u32)> { media.decode_audio(p)?.to_channels().with_context(|| p.display().to_string()) };
         if AUDIO.contains(&ext.as_str()) {
             let (c, rate) = sound(path)?;
             return Ok(RefInput::Audio(c, rate));

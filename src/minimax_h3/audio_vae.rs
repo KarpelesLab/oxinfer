@@ -481,7 +481,9 @@ fn open(path: &Path) -> Result<(AudioVaeConfig, ModelFiles)> {
 fn linear(f: &ModelFiles, p: &str) -> Result<Conv> {
     let n = format!("{p}.weight");
     let shape = f.info(&n).with_context(|| format!("missing tensor {n}"))?.shape.clone();
-    let [o, i] = shape[..] else { bail!("{n}: expected a matrix, got {shape:?}") };
+    let [o, i] = shape[..] else {
+        bail!("{n}: expected a matrix, got {shape:?}")
+    };
     Ok(Conv::new(&f.f32(&n)?, [o, i, 1], bias(f, p, o)?, 1, 1))
 }
 
@@ -552,7 +554,9 @@ impl PreBlock {
     fn load(f: &ModelFiles, p: &str, heads: usize) -> Result<Self> {
         let n = format!("{p}.attn.qkv.weight");
         let shape = f.info(&n).with_context(|| format!("missing tensor {n}"))?.shape.clone();
-        let [o, i] = shape[..] else { bail!("{n}: expected a matrix, got {shape:?}") };
+        let [o, i] = shape[..] else {
+            bail!("{n}: expected a matrix, got {shape:?}")
+        };
         if o != 3 * i || !i.is_multiple_of(heads) {
             bail!("{n}: {shape:?} is not a fused q, k, v projection of {heads} heads");
         }
@@ -679,7 +683,10 @@ impl AudioEncoder {
         }
         let hop: usize = blocks.iter().map(|b| b.down.stride()).product();
         if hop != cfg.hop() {
-            bail!("audio VAE: the encoder downsamples by {hop}, the decoder upsamples by {}", cfg.hop());
+            bail!(
+                "audio VAE: the encoder downsamples by {hop}, the decoder upsamples by {}",
+                cfg.hop()
+            );
         }
         let mean = conv(f, "mean_proj", 1)?;
         if mean.c_out != cfg.latent_channels {
@@ -733,7 +740,11 @@ impl AudioEncoder {
         let mut rows = Vec::new();
         for ch in channels {
             let z = self.encode(ch)?;
-            rows.extend(z.iter().enumerate().map(|(i, &v)| (v - self.cfg.latents_mean[i % c]) / self.cfg.latents_std[i % c]));
+            rows.extend(
+                z.iter()
+                    .enumerate()
+                    .map(|(i, &v)| (v - self.cfg.latents_mean[i % c]) / self.cfg.latents_std[i % c]),
+            );
         }
         Ok(rows)
     }

@@ -943,7 +943,10 @@ impl VideoPipeline {
 
     /// The audio VAE's encoder (loaded on demand: only `ref2va`'s soundtracks need it).
     pub fn audio_encoder(&self) -> Result<super::audio_vae::AudioEncoder> {
-        let p = self.audio_vae_path.as_ref().context("reference audio needs the audio VAE (audio_vae/ or --audio-vae)")?;
+        let p = self
+            .audio_vae_path
+            .as_ref()
+            .context("reference audio needs the audio VAE (audio_vae/ or --audio-vae)")?;
         super::audio_vae::AudioEncoder::load(p).with_context(|| format!("audio VAE encoder in {}", p.display()))
     }
 
