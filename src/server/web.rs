@@ -822,6 +822,7 @@ fn status(api: &Api, w: &WebState) -> Value {
         "memory_available": crate::platform::available_memory(),
         "memory_budget": api.models.budget(),
         "gpus": plat.gpus.iter().map(|g| json!({"backend": g.kind.as_str(), "name": g.name, "memory": g.memory_bytes, "unified": g.unified_memory})).collect::<Vec<_>>(),
+        "accelerators": crate::advisor::accelerators(plat, crate::platform::DevicePref::Auto).iter().map(crate::advisor::Accelerator::to_json).collect::<Vec<_>>(),
         "cache": {"path": crate::model_cache::root(cache_dir).display().to_string(), "free": disk.map(|d| d.0), "total": disk.map(|d| d.1)},
         "admin": w.admin,
         "listen": api.opts.listen,

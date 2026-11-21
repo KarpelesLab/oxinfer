@@ -27,6 +27,8 @@ let watching = null;
 
 const isPath = computed(() => /^(\/|~|\.|[A-Za-z]:\\)/.test(props.spec));
 const variants = computed(() => props.model?.variants || []);
+// The variant picked below (the recommended one at first): where it runs on this machine.
+const chosen = computed(() => variants.value[variant.value]);
 const guessChat = computed(() => !props.model || props.model.kind === 'chat');
 const options = computed(() => {
   const o = {};
@@ -159,6 +161,7 @@ onUnmounted(() => watching?.abort());
               {{ fmtBytes(plan.free) }} free on the disk{{ plan.fits ? '.' : ': not enough room. Delete downloaded models in the list below first.' }}
             </p>
             <p v-if="model" class="hint">{{ model.variants.length > 1 ? 'Recommended here' : 'Runs as' }}: {{ model.variants.find((v) => v.recommended)?.label || model.variants[0].label }}, {{ (model.variants.find((v) => v.recommended) || model.variants[0]).memory_gb.toFixed(1) }} GB of memory. Some pipelines fetch a few more parts when they load.</p>
+            <p v-if="chosen?.accelerator" class="accel"><strong>Runs on:</strong> {{ chosen.accelerator }}</p>
           </template>
         </template>
       </li>
@@ -206,7 +209,7 @@ onUnmounted(() => watching?.abort());
             <input v-model="variant" type="radio" :value="i" />
             <span>
               <strong>{{ v.label === 'bf16' ? 'As stored (bf16)' : v.label.replace('--quant ', '') + ' (quantized at load)' }}</strong>
-              <small>{{ v.memory_gb.toFixed(1) }} GB in memory, {{ v.runs_on === 'streamed' ? 'streamed from disk' : `on the ${v.runs_on === 'gpu' ? 'GPU' : v.runs_on === 'cpu' ? 'CPU' : 'machine'}` }}{{ v.decode_tok_s ? `, ~${v.decode_tok_s.toFixed(0)} tokens/s` : '' }}{{ v.recommended ? ' — recommended' : '' }}</small>
+              <small>{{ v.memory_gb.toFixed(1) }} GB in memory, {{ v.accelerator || (v.runs_on === 'streamed' ? 'streamed from disk' : `on the ${v.runs_on === 'gpu' ? 'GPU' : v.runs_on === 'cpu' ? 'CPU' : 'machine'}`) }}{{ v.decode_tok_s ? `, ~${v.decode_tok_s.toFixed(0)} tokens/s` : '' }}{{ v.recommended ? ' — recommended' : '' }}</small>
             </span>
           </label>
         </fieldset>
@@ -307,6 +310,9 @@ onUnmounted(() => watching?.abort());
 .files .num {
   white-space: nowrap;
   font-variant-numeric: tabular-nums;
+}
+.accel {
+  font-size: 0.92rem;
 }
 .actions {
   display: flex;

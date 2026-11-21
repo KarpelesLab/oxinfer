@@ -1002,6 +1002,10 @@ pub struct Hardware {
     pub disk_free_gb: Option<f64>,
     /// CPU streaming rate per [`Format::ALL`] entry, GB/s ([`calibrate`]).
     pub cpu_rates: [f64; 7],
+    /// Core ML loads (Apple Silicon): models converted for the Neural Engine run.
+    pub neural_engine: bool,
+    /// Every accelerator found, one line each ([`accelerators`]).
+    pub accelerators: Vec<Accelerator>,
 }
 
 /// `$OXINFER_CACHE`, else `~/.cache/oxinfer/hub` (as [`crate::hf::cache_root`], without the
@@ -1094,7 +1098,10 @@ impl Hardware {
             unified: g.unified_memory,
         });
         let cache_dir = cache_dir.map(Path::to_path_buf).unwrap_or_else(default_cache_dir);
+        let accelerators = accelerators(plat, device);
         Hardware {
+            neural_engine: accelerators.iter().any(|a| a.backend == "neural-engine" && a.available),
+            accelerators,
             summary: plat.summary(),
             cores: plat.cpu.cores,
             ram_gb: plat.cpu.memory_bytes.map(|b| b as f64 / 1e9),
@@ -1178,6 +1185,8 @@ pub struct Variant {
     /// The one to pick: the most precise variant decoding in memory at 10 tokens/s or more,
     /// else the fastest in memory, else the smallest.
     pub recommended: bool,
+    /// Which accelerator the engine uses for it here ([`Accel`]).
+    pub accel: Accel,
 }
 
 /// A catalog entry on the hardware.
@@ -1274,7 +1283,9 @@ impl Row {
                     (true, Some((g, b)), c) if c.is_none_or(|c| g > c) => (Runs::Gpu, Some(g), Some(b)),
                     (true, _, c) => (Runs::Cpu, c, c.map(|_| Basis::Calibrated)),
                 };
+                let accel = accel_of(m, &label, format, memory_gb, runs == Runs::Streamed, hw);
                 Variant {
+                    accel,
                     label,
                     format,
                     args,
@@ -1324,6 +1335,403 @@ pub fn survey(hw: &Hardware) -> Vec<Row> {
     CATALOG.iter().map(|m| Row::new(m, hw)).collect()
 }
 
+/// Where one part of a model's work runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unit {
+    Cpu,
+    Gpu(GpuKind),
+    /// Apple's Neural Engine, through Core ML.
+    NeuralEngine,
+}
+
+impl Unit {
+    /// `cpu`, `metal`, `cuda`, `vulkan` or `neural-engine`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Unit::Cpu => "cpu",
+            Unit::Gpu(k) => k.as_str(),
+            Unit::NeuralEngine => "neural-engine",
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Unit::Cpu => "CPU",
+            Unit::Gpu(GpuKind::Metal) => "GPU (Metal)",
+            Unit::Gpu(GpuKind::Cuda) => "GPU (CUDA)",
+            Unit::Gpu(GpuKind::Vulkan) => "GPU (Vulkan)",
+            Unit::NeuralEngine => "Neural Engine",
+        }
+    }
+}
+
+/// Which accelerator the engine uses for a variant on this machine, with the defaults
+/// (`--device auto`, `--gpu-decode on`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Accel {
+    /// The prompt (chat models), the audio encoder (speech to text), or the whole pipeline (the
+    /// other kinds, which have one stage).
+    pub prefill: Unit,
+    /// Token generation; the same as `prefill` for the kinds with one stage.
+    pub decode: Unit,
+    /// Decoding times the GPU and the CPU on the first tokens and keeps the faster (a streamed
+    /// mixture of experts on unified memory, `gpu::decode::DeviceChoice`).
+    pub decode_measured: bool,
+    /// The weights are read from storage as they are needed.
+    pub streamed: bool,
+    /// What the GUI and the table print: `GPU (Metal) prefill + decode`, `GPU (CUDA) prefill, CPU
+    /// decode`, `CPU`, `CPU, streamed from disk`, `Neural Engine`, ...
+    pub label: String,
+}
+
+/// What the engine has for a model, as far as the accelerators go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EnginePath {
+    /// A whole-token decode graph (`gpu::decode`, `qwen.rs` / `model_gpu.rs`): Llama 3 (Orpheus
+    /// TTS too), Qwen3 / 3.5 / 3.6 / 3.8 dense and MoE, Granite 4, Gemma 3 / 4. The GPU runs the
+    /// prompt and every decoded token.
+    Graph,
+    /// Qwen4-Exp (Qwen3.8-Flash-Next): a decode graph Metal runs and CUDA declines.
+    GraphMetal,
+    /// The shared linear layers only (`model::linear_multi`): the GPU takes the prompt's large
+    /// matmuls, decoding runs on the CPU (the families without a graph, and Qwen2.5 / LFM3 /
+    /// MiniMax, whose layers the graph does not cover).
+    Matmuls,
+    /// Speech to text (Whisper): the encoder on the GPU, text decoding on the CPU.
+    Encoder,
+    /// One stage whose products (convolutions, attention, matmuls) run on the GPU: images,
+    /// embeddings.
+    Pipeline,
+    /// The CPU alone (Hadamard-folded ternary weights, the pipelines whose docs say so).
+    Cpu,
+    /// A Core ML package (ANEMLL): the Neural Engine.
+    CoreMl,
+}
+
+/// The engine path of a catalog entry, from its family (named in its repo id) and kind. An entry
+/// not listed here (a family added later) is taken as [`EnginePath::Matmuls`] for chat, the path every
+/// language model has.
+fn path_of(m: &Model) -> EnginePath {
+    let r = m.repo.to_ascii_lowercase();
+    let has = |s: &[&str]| s.iter().any(|p| r.contains(p));
+    if r.starts_with("anemll/") {
+        return EnginePath::CoreMl;
+    }
+    match m.kind {
+        Kind::Chat if has(&["ternary-bonsai"]) => EnginePath::Cpu,
+        Kind::Chat if has(&["flash-next"]) => EnginePath::GraphMetal,
+        Kind::Chat
+            if has(&[
+                "qwen3.5",
+                "qwen3.6",
+                "qwen3.8",
+                "qwen3-",
+                "mnn-pocket",
+                "zawen",
+                "jev-",
+                "llama-3",
+                "gemma-3",
+                "gemma-4",
+                "gev-",
+                "granite-4",
+                "twil-",
+                "minimax-h3-image-pe",
+            ]) =>
+        {
+            EnginePath::Graph
+        }
+        Kind::Chat => EnginePath::Matmuls,
+        Kind::Speech if has(&["whisper"]) => EnginePath::Encoder,
+        Kind::Speech => EnginePath::Matmuls,
+        Kind::Tts if has(&["orpheus"]) => EnginePath::Graph,
+        Kind::Tts | Kind::Video => EnginePath::Cpu,
+        Kind::Image | Kind::Embedding => EnginePath::Pipeline,
+    }
+}
+
+/// Whether the backend has kernels for the bulk of the weights: Metal takes every format but
+/// NVFP4 and MXFP8 (FP8 with 128 x 128 block scales only); CUDA and Vulkan take bf16 and
+/// oxinfer's / MLX's Q8 and Q4 blocks, no GGUF or FP8 (`cuda.rs` / `vulkan.rs` `upload_weight`).
+/// A GGUF file is also recognized by its repo id (entries such as the Orpheus GGUFs are listed
+/// without a fixed format).
+fn gpu_takes(kind: GpuKind, format: Format, label: &str, repo: &str) -> bool {
+    if label.contains("NVFP4") || label.contains("MXFP8") || label.contains("ternary") {
+        return false;
+    }
+    let gguf = repo.to_ascii_lowercase().contains("gguf");
+    match kind {
+        GpuKind::Metal => true,
+        GpuKind::Cuda | GpuKind::Vulkan => matches!(format, Format::Bf16 | Format::Q8 | Format::Q4) && !label.contains("FP8") && !gguf,
+    }
+}
+
+fn accel_of(m: &Model, label: &str, format: Format, memory_gb: f64, streamed: bool, hw: &Hardware) -> Accel {
+    let path = path_of(m);
+    let gpu = hw.gpu.as_ref().filter(|g| gpu_takes(g.kind, format, label, m.repo));
+    let single = !matches!(m.kind, Kind::Chat | Kind::Speech | Kind::Tts);
+    let (prefill, decode, measured) = match path {
+        EnginePath::CoreMl => (Unit::NeuralEngine, Unit::NeuralEngine, false),
+        EnginePath::Cpu => (Unit::Cpu, Unit::Cpu, false),
+        _ if single => {
+            let u = gpu.map_or(Unit::Cpu, |g| Unit::Gpu(g.kind));
+            (u, u, false)
+        }
+        _ => {
+            let prefill = gpu.map_or(Unit::Cpu, |g| Unit::Gpu(g.kind));
+            let graph = match path {
+                EnginePath::Graph => true,
+                EnginePath::GraphMetal => gpu.is_some_and(|g| g.kind == GpuKind::Metal),
+                _ => false,
+            };
+            // A device decode plan keeps every weight on the device: on a discrete GPU they must
+            // fit its memory; unified memory wraps the host's (streamed layers per pass). FP8
+            // has Metal GEMMs but no decode matvec.
+            let on_gpu = gpu.filter(|g| {
+                graph
+                    && g.kind != GpuKind::Vulkan
+                    && !label.contains("FP8")
+                    && (g.unified || g.memory_gb.is_some_and(|mem| memory_gb + GPU_HEADROOM_GB <= GPU_FRACTION * mem))
+            });
+            let measured = streamed && m.moe && on_gpu.is_some_and(|g| g.unified);
+            (prefill, on_gpu.map_or(Unit::Cpu, |g| Unit::Gpu(g.kind)), measured)
+        }
+    };
+    let mut text = match (path, prefill, decode) {
+        (EnginePath::CoreMl, ..) if hw.neural_engine => "Neural Engine (Core ML)".to_string(),
+        (EnginePath::CoreMl, ..) => "Neural Engine (Core ML), not available here".to_string(),
+        (_, Unit::Cpu, Unit::Cpu) => "CPU".to_string(),
+        (_, Unit::Gpu(GpuKind::Vulkan), _) if single => "GPU (Vulkan) matmuls, the rest on the CPU".to_string(),
+        (EnginePath::Encoder, p, _) => format!("{} encoder, CPU decode", p.label()),
+        (_, p, _) if single => p.label().to_string(),
+        (_, p, _) if measured => format!("{} prefill, GPU or CPU decode (the faster)", p.label()),
+        (_, p, d) if p == d => format!("{} prefill + decode", p.label()),
+        (_, p, d) => format!("{} prefill, {} decode", p.label(), d.label()),
+    };
+    if streamed {
+        text.push_str(", streamed from disk");
+    }
+    Accel {
+        prefill,
+        decode,
+        decode_measured: measured,
+        streamed,
+        label: text,
+    }
+}
+
+/// One accelerator of the machine, as the GUI's machine panel and `--models` list them.
+#[derive(Clone, Debug)]
+pub struct Accelerator {
+    /// `cpu`, `metal`, `cuda`, `vulkan`, `neural-engine`, or `gpu` for the line saying there is
+    /// none.
+    pub backend: &'static str,
+    pub name: String,
+    pub available: bool,
+    /// What `--device auto` (or the device asked for) uses: the CPU always, one GPU at most.
+    pub used: bool,
+    /// The CPU's SIMD features (`neon`, `dotprod`, `i8mm`, `sme`, `avx2`, `avx512f`, `simd128`,
+    /// ...).
+    pub features: Vec<&'static str>,
+    pub memory_gb: Option<f64>,
+    /// What models may take on this path: the CPU keeps in memory weights up to 60% of RAM
+    /// (larger ones stream from storage); a discrete GPU decodes models whose weights fit in
+    /// this; a unified one shares the RAM, up to the system's working-set limit.
+    pub budget_gb: Option<f64>,
+    pub unified: bool,
+    /// Runs the prompt's matmuls / whole decode steps.
+    pub prefill: bool,
+    pub decode: bool,
+    /// One sentence for people.
+    pub status: String,
+}
+
+fn feature_name(f: &str) -> &str {
+    match f {
+        "neon" => "NEON",
+        "dotprod" => "SDOT",
+        "i8mm" => "i8mm",
+        "sme" => "SME",
+        "sve" => "SVE",
+        "sve2" => "SVE2",
+        "avx" => "AVX",
+        "avx2" => "AVX2",
+        "fma" => "FMA",
+        "f16c" => "F16C",
+        "avx512f" => "AVX-512",
+        "avx512bw" => "AVX-512BW",
+        "avx512vnni" => "AVX-512 VNNI",
+        "avxvnni" => "AVX-VNNI",
+        "avx512bf16" => "AVX-512 BF16",
+        "simd128" => "wasm simd128",
+        "sse4.2" => "SSE4.2",
+        f => f,
+    }
+}
+
+/// Whether Core ML loads, and why not.
+fn neural_engine() -> Result<(), String> {
+    #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+    return crate::coreml::available().map_err(|e| e.to_string());
+    #[allow(unreachable_code)]
+    Err("needs Apple Silicon and a build with the gpu feature".to_string())
+}
+
+/// The CPU, every GPU found (or a line saying there is none) and, on Apple systems, the Neural
+/// Engine, with what each does for oxinfer. `device` is the `--device` preference.
+pub fn accelerators(plat: &Platform, device: DevicePref) -> Vec<Accelerator> {
+    let ram = plat.cpu.memory_bytes.map(|b| b as f64 / 1e9);
+    let cpu_budget = ram.map(|r| RAM_FRACTION * r);
+    let mut features = plat.cpu.features.clone();
+    if crate::kernels::sme_available() {
+        features.push("sme");
+    }
+    #[cfg(target_arch = "x86_64")]
+    let kernels = format!("; kernels: {}", crate::kernels::simd::level_name());
+    #[cfg(not(target_arch = "x86_64"))]
+    let kernels = "";
+    let mut out = vec![Accelerator {
+        backend: "cpu",
+        name: format!("{} CPU, {} cores", plat.cpu.arch, plat.cpu.cores),
+        available: true,
+        used: true,
+        status: format!(
+            "{}{kernels}; runs every model{}",
+            if features.is_empty() {
+                "no SIMD extension detected (portable kernels)".to_string()
+            } else {
+                features.iter().map(|f| feature_name(f)).collect::<Vec<_>>().join(", ")
+            },
+            cpu_budget.map_or(String::new(), |b| format!(
+                ": up to {} of weights in memory (60% of RAM), larger models stream from disk",
+                gb(b)
+            )),
+        ),
+        features,
+        memory_gb: ram,
+        budget_gb: cpu_budget,
+        unified: false,
+        prefill: true,
+        decode: true,
+    }];
+    let used = plat.pick(device);
+    for g in &plat.gpus {
+        let is_used = used.is_some_and(|u| u.kind == g.kind && u.index == g.index);
+        let mem = g.memory_bytes.map(|b| b as f64 / 1e9);
+        let decode = g.kind != GpuKind::Vulkan;
+        let budget = if g.unified_memory {
+            mem.map(|m| ram.map_or(m, |r| m.min(r)))
+        } else {
+            mem.map(|m| (GPU_FRACTION * m - GPU_HEADROOM_GB).max(0.0))
+        };
+        let does = if decode {
+            "prefill + decode (Llama, Qwen3 / 3.5 / 3.8, Granite 4, Gemma 3 / 4; prompt matmuls for the others)"
+        } else {
+            "prompt matmuls only (bf16, Q8, Q4): decoding stays on the CPU"
+        };
+        let memory = match (g.unified_memory, budget, ram) {
+            (true, Some(b), Some(r)) => format!("; shares the system's {} of RAM, {} of it usable by the GPU", gb(r), gb(b)),
+            (true, Some(b), None) => format!("; shares the system's RAM, {} usable by the GPU", gb(b)),
+            (false, Some(b), _) => format!(
+                "; {} of its own memory: models up to {} decode on it",
+                gb(mem.unwrap_or(0.0)),
+                gb(b)
+            ),
+            _ => String::new(),
+        };
+        let status = if is_used {
+            format!("{does}{memory}")
+        } else if g.is_software() {
+            "a software rasterizer (slower than the CPU kernels): not used".to_string()
+        } else if device == DevicePref::Cpu {
+            "not used (--device cpu)".to_string()
+        } else {
+            format!(
+                "not used ({} is picked first); --device {} selects it",
+                used.map_or("another device", |u| u.kind.as_str()),
+                g.kind.as_str()
+            )
+        };
+        out.push(Accelerator {
+            backend: g.kind.as_str(),
+            name: g.name.clone(),
+            available: !g.is_software(),
+            used: is_used,
+            features: Vec::new(),
+            memory_gb: mem,
+            budget_gb: budget,
+            unified: g.unified_memory,
+            prefill: true,
+            decode,
+            status,
+        });
+    }
+    if plat.gpus.is_empty() {
+        out.push(Accelerator {
+            backend: "gpu",
+            name: "GPU".to_string(),
+            available: false,
+            used: false,
+            features: Vec::new(),
+            memory_gb: None,
+            budget_gb: None,
+            unified: false,
+            prefill: false,
+            decode: false,
+            status: "No GPU detected: models run on the CPU".to_string(),
+        });
+    }
+    if cfg!(target_vendor = "apple") {
+        let ne = neural_engine();
+        out.push(Accelerator {
+            backend: "neural-engine",
+            name: "Neural Engine (Core ML)".to_string(),
+            available: ne.is_ok(),
+            used: ne.is_ok(),
+            features: Vec::new(),
+            memory_gb: None,
+            budget_gb: None,
+            unified: true,
+            prefill: ne.is_ok(),
+            decode: ne.is_ok(),
+            status: match ne {
+                Ok(()) => "available: runs models converted for Core ML (ANEMLL, anemll/* repos)".to_string(),
+                Err(e) => format!("not available: {e}"),
+            },
+        });
+    }
+    out
+}
+
+impl Accelerator {
+    pub fn to_json(&self) -> serde_json::Value {
+        let r = |v: Option<f64>| v.map(|v| (v * 1e3).round() / 1e3);
+        serde_json::json!({
+            "backend": self.backend,
+            "name": self.name,
+            "available": self.available,
+            "used": self.used,
+            "features": self.features,
+            "memory_gb": r(self.memory_gb),
+            "budget_gb": r(self.budget_gb),
+            "unified_memory": self.unified,
+            "prefill": self.prefill,
+            "decode": self.decode,
+            "status": self.status,
+        })
+    }
+}
+
+impl Accel {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "label": self.label,
+            "prefill": self.prefill.as_str(),
+            "decode": self.decode.as_str(),
+            "decode_measured": self.decode_measured,
+            "streamed": self.streamed,
+        })
+    }
+}
+
 fn gb(v: f64) -> String {
     if v < 10.0 { format!("{v:.1} GB") } else { format!("{v:.0} GB") }
 }
@@ -1347,6 +1755,14 @@ pub fn render(hw: &Hardware, rows: &[Row], all: bool) -> String {
         opt(hw.disk_free_gb),
         hw.cache_dir.display()
     );
+    for a in &hw.accelerators {
+        let name = match a.backend {
+            "cpu" => format!("CPU ({})", a.name),
+            "gpu" | "neural-engine" => a.name.clone(),
+            b => format!("GPU {} ({b})", a.name),
+        };
+        let _ = writeln!(s, "  {name}: {}", a.status);
+    }
     match (&hw.gpu, hw.gpu_ref()) {
         (Some(g), Some((r, same))) => {
             let _ = writeln!(
@@ -1413,12 +1829,7 @@ pub fn render(hw: &Hardware, rows: &[Row], all: bool) -> String {
                 format!("{}{}", v.label, if all && v.recommended { " *" } else { "" }),
                 if first { disk } else { String::new() },
                 gb(v.memory_gb),
-                match v.runs {
-                    Runs::Gpu => "GPU".to_string(),
-                    Runs::Cpu => "CPU".to_string(),
-                    Runs::Streamed => "storage (over 60% of memory)".to_string(),
-                    Runs::InMemory => "fits in memory".to_string(),
-                },
+                v.accel.label.clone(),
                 speed,
                 if first {
                     r.model.caps.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", ")
@@ -1481,6 +1892,8 @@ pub fn to_json(hw: &Hardware, rows: &[Row]) -> serde_json::Value {
                 "reference_device": hw.gpu_ref().map(|(r, _)| r.device),
             })),
             "cpu_kernel_gb_per_s": rates,
+            "accelerators": hw.accelerators.iter().map(Accelerator::to_json).collect::<Vec<_>>(),
+            "neural_engine": hw.neural_engine,
         },
         "models": rows.iter().map(|row| json!({
             "model": row.model.repo,
@@ -1492,6 +1905,7 @@ pub fn to_json(hw: &Hardware, rows: &[Row]) -> serde_json::Value {
             "disk_short_gb": ro(row.disk_short_gb),
             "moe": row.model.moe,
             "note": row.model.note,
+            "accelerator": row.recommended().accel.label,
             "variants": row.variants.iter().map(|v| json!({
                 "label": v.label,
                 "format": v.format.as_str(),
@@ -1502,6 +1916,8 @@ pub fn to_json(hw: &Hardware, rows: &[Row]) -> serde_json::Value {
                 "decode_tok_s": ro(v.tok_s),
                 "basis": v.basis.map(Basis::as_str),
                 "recommended": v.recommended,
+                "accelerator": v.accel.label,
+                "accel": v.accel.to_json(),
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
     })
@@ -1526,6 +1942,8 @@ mod tests {
             cache_dir: PathBuf::from("/nonexistent/oxinfer-advisor-test"),
             disk_free_gb: Some(disk),
             cpu_rates: [100.0, 100.0, 70.0, 60.0, 50.0, 50.0, 40.0],
+            neural_engine: false,
+            accelerators: Vec::new(),
         }
     }
 
@@ -1651,5 +2069,174 @@ mod tests {
         }
         assert_eq!(j["hardware"]["gpu"], serde_json::Value::Null);
         assert_eq!(cache_folder("org/name:Q4_K_M"), "org--name");
+        // The accelerator fields: per variant, the recommended one per model, the hardware list.
+        assert_eq!(j["models"][0]["variants"][0]["accelerator"], "CPU");
+        assert_eq!(j["models"][0]["variants"][0]["accel"]["prefill"], "cpu");
+        assert_eq!(j["models"][0]["variants"][0]["accel"]["decode"], "cpu");
+        assert_eq!(j["models"][0]["accelerator"], "CPU");
+        assert!(j["hardware"]["accelerators"].is_array());
+        assert_eq!(j["hardware"]["neural_engine"], false);
+    }
+
+    fn unified(ram: f64, gpu: f64) -> Hardware {
+        let mut h = hw(ram, Some((GpuKind::Metal, "Apple M5 Max", gpu)), 500.0);
+        h.gpu.as_mut().unwrap().unified = true;
+        h
+    }
+
+    fn label<'a>(rows: &'a [Row], repo: &str, i: usize) -> &'a str {
+        &row(rows, repo).variants[i].accel.label
+    }
+
+    #[test]
+    fn accelerator_per_model() {
+        // Metal, unified memory: the families with a decode graph run whole on the GPU, the
+        // others only their prompt there.
+        let rows = survey(&unified(128.0, 110.0));
+        let a = &row(&rows, "Qwen/Qwen3.5-9B").variants[0].accel;
+        assert_eq!((a.prefill, a.decode), (Unit::Gpu(GpuKind::Metal), Unit::Gpu(GpuKind::Metal)));
+        assert_eq!(a.label, "GPU (Metal) prefill + decode");
+        assert_eq!(
+            label(&rows, "bartowski/Llama-3.2-1B-Instruct-GGUF:Q4_K_M", 0),
+            "GPU (Metal) prefill + decode"
+        );
+        assert_eq!(
+            label(&rows, "mlx-community/gemma-4-26b-a4b-it-4bit", 0),
+            "GPU (Metal) prefill + decode"
+        );
+        assert_eq!(
+            label(&rows, "unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL", 0),
+            "GPU (Metal) prefill, GPU or CPU decode (the faster), streamed from disk"
+        );
+        // Qwen2.5 (attention biases), LFM3 (convolutions), DeepSeek V4 (no graph): CPU decode.
+        assert_eq!(label(&rows, "MiniMaxAI/SynLogic-7B", 0), "GPU (Metal) prefill, CPU decode");
+        assert_eq!(label(&rows, "LiquidAI/LFM3-1.7B", 0), "GPU (Metal) prefill, CPU decode");
+        // FP8 has Metal GEMMs, no decode matvec; NVFP4 neither.
+        assert_eq!(label(&rows, "MiniMaxAI/MiniMax-H3-Image-PE", 0), "CPU");
+        // Folded ternary weights: the CPU alone.
+        assert_eq!(label(&rows, "prism-ml/Ternary-Bonsai-2-2B-gguf:PTQ1_0", 0), "CPU");
+        // A streamed mixture of experts on unified memory: both are timed.
+        let small = survey(&unified(64.0, 50.0));
+        let v = &row(&small, "Qwen/Qwen3.6-35B-A3B").variants[0];
+        assert!(v.accel.decode_measured && v.accel.streamed, "{:?}", v.accel);
+        assert_eq!(
+            v.accel.label,
+            "GPU (Metal) prefill, GPU or CPU decode (the faster), streamed from disk"
+        );
+        // The other kinds.
+        assert_eq!(label(&rows, "openai/whisper-small", 0), "GPU (Metal) encoder, CPU decode");
+        assert_eq!(label(&rows, "stabilityai/sd-turbo", 0), "GPU (Metal)");
+        assert_eq!(label(&rows, "BAAI/bge-m3", 0), "GPU (Metal)");
+        assert_eq!(label(&rows, "unsloth/orpheus-3b-0.1-ft", 0), "GPU (Metal) prefill + decode");
+        assert_eq!(label(&rows, "Zyphra/ZONOS3-Mini", 0), "CPU");
+        assert_eq!(label(&rows, "MiniMaxAI/MiniMax-H3", 0), "CPU, streamed from disk");
+
+        // CUDA: no GGUF, no Qwen4-Exp; decoding needs the weights in VRAM.
+        let rows = survey(&hw(128.0, Some((GpuKind::Cuda, "NVIDIA GeForce RTX 5080", 16.6)), 500.0));
+        assert_eq!(label(&rows, "Qwen/Qwen3.5-9B", 0), "GPU (CUDA) prefill, CPU decode");
+        assert_eq!(label(&rows, "Qwen/Qwen3.5-9B", 1), "GPU (CUDA) prefill + decode");
+        assert_eq!(label(&rows, "bartowski/Llama-3.2-1B-Instruct-GGUF:Q8_0", 0), "CPU");
+        assert_eq!(label(&rows, "isaiahbjork/orpheus-3b-0.1-ft-Q4_K_M-GGUF", 0), "CPU");
+        assert_eq!(label(&rows, "stabilityai/sd-turbo", 0), "GPU (CUDA)");
+        // Vulkan: prompt matmuls only.
+        let rows = survey(&hw(128.0, Some((GpuKind::Vulkan, "Some GPU", 24.0)), 500.0));
+        assert_eq!(label(&rows, "Qwen/Qwen3.5-0.8B", 0), "GPU (Vulkan) prefill, CPU decode");
+        assert_eq!(label(&rows, "stabilityai/sd-turbo", 0), "GPU (Vulkan) matmuls, the rest on the CPU");
+        // No GPU.
+        let rows = survey(&hw(128.0, None, 500.0));
+        assert!(rows.iter().all(|r| {
+            r.variants
+                .iter()
+                .all(|v| v.accel.prefill == Unit::Cpu && v.accel.decode == Unit::Cpu)
+        }));
+
+        // Core ML packages: the Neural Engine, or a note that it is missing.
+        static ANE: Model = Model::new("anemll/anemll-Qwen-Qwen3-0.6B-ctx512_0.3.4", Kind::Chat, 0.6, 1.2, &[Cap::Text]);
+        let mut h = unified(128.0, 110.0);
+        assert_eq!(
+            Row::new(&ANE, &h).variants[0].accel.label,
+            "Neural Engine (Core ML), not available here"
+        );
+        h.neural_engine = true;
+        let a = &Row::new(&ANE, &h).variants[0].accel;
+        assert_eq!(
+            (a.prefill, a.decode, a.label.as_str()),
+            (Unit::NeuralEngine, Unit::NeuralEngine, "Neural Engine (Core ML)")
+        );
+    }
+
+    #[test]
+    fn machine_accelerators() {
+        use crate::platform::{CpuInfo, GpuInfo};
+        let cpu = CpuInfo {
+            arch: "aarch64",
+            os: "macos",
+            features: vec!["neon", "dotprod", "i8mm"],
+            cores: 18,
+            memory_bytes: Some(137_400_000_000),
+        };
+        let metal = GpuInfo {
+            kind: GpuKind::Metal,
+            index: 0,
+            name: "Apple M5 Max".into(),
+            memory_bytes: Some(115_400_000_000),
+            driver: String::new(),
+            unified_memory: true,
+        };
+        let plat = Platform {
+            cpu: cpu.clone(),
+            gpus: vec![metal],
+            notes: Vec::new(),
+        };
+        let list = accelerators(&plat, DevicePref::Auto);
+        assert_eq!(list[0].backend, "cpu");
+        assert!(list[0].status.starts_with("NEON, SDOT, i8mm"), "{}", list[0].status);
+        assert!((list[0].budget_gb.unwrap() - 0.6 * 137.4).abs() < 1e-6);
+        let g = &list[1];
+        assert_eq!(
+            (g.backend, g.used, g.prefill, g.decode, g.unified),
+            ("metal", true, true, true, true)
+        );
+        assert!(
+            g.status
+                .contains("shares the system's 137 GB of RAM, 115 GB of it usable by the GPU"),
+            "{}",
+            g.status
+        );
+        assert_eq!(list.iter().any(|a| a.backend == "neural-engine"), cfg!(target_vendor = "apple"));
+        // --device cpu: the GPU is listed, not used.
+        let list = accelerators(&plat, DevicePref::Cpu);
+        assert!(!list[1].used && list[1].status.contains("--device cpu"));
+        // CUDA beside Vulkan on one card: CUDA is used, its own memory bounds decoding.
+        let card = |kind, mem| GpuInfo {
+            kind,
+            index: 0,
+            name: "NVIDIA GeForce RTX 5080".into(),
+            memory_bytes: Some(mem),
+            driver: String::new(),
+            unified_memory: false,
+        };
+        let plat = Platform {
+            cpu: cpu.clone(),
+            gpus: vec![card(GpuKind::Cuda, 16_600_000_000), card(GpuKind::Vulkan, 17_100_000_000)],
+            notes: Vec::new(),
+        };
+        let list = accelerators(&plat, DevicePref::Auto);
+        assert!(list[1].used && list[1].decode && !list[1].unified);
+        assert!((list[1].budget_gb.unwrap() - (0.92 * 16.6 - 1.0)).abs() < 1e-6);
+        assert!(
+            !list[2].used && !list[2].decode && list[2].status.contains("cuda is picked first"),
+            "{}",
+            list[2].status
+        );
+        // No GPU.
+        let plat = Platform {
+            cpu,
+            gpus: Vec::new(),
+            notes: Vec::new(),
+        };
+        let list = accelerators(&plat, DevicePref::Auto);
+        assert_eq!(list[1].status, "No GPU detected: models run on the CPU");
+        assert_eq!(list[1].to_json()["available"], false);
     }
 }

@@ -159,6 +159,23 @@ fn web_gui_and_management_api() {
         models.iter().all(|m| m["cached"] == false),
         "nothing of the catalog is in this cache"
     );
+    // Which accelerator each variant uses, and the machine's accelerators.
+    assert!(models.iter().all(|m| {
+        m["accelerator"].is_string()
+            && m["variants"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|v| v["accelerator"].is_string() && v["accel"]["decode"].is_string())
+    }));
+    assert_eq!(v["hardware"]["accelerators"][0]["backend"], "cpu");
+    // The status lists them too: the CPU first, then the GPUs (or a line saying there is none).
+    let (st, body) = request_with(a, "GET", "/api/web/status", &local, "");
+    assert_eq!(st, 200);
+    let v: Value = serde_json::from_str(&body).unwrap();
+    let acc = v["accelerators"].as_array().unwrap();
+    assert_eq!((&acc[0]["backend"], &acc[0]["used"]), (&json!("cpu"), &json!(true)));
+    assert!(acc.len() >= 2 && acc.iter().all(|x| x["status"].is_string() && x["prefill"].is_boolean()));
     // The cache: both folders, sizes, kinds and the specs that load them.
     let (st, body) = request_with(a, "GET", "/api/web/cache", &local, "");
     assert_eq!(st, 200, "{body}");

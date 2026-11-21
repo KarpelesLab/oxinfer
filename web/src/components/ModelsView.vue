@@ -68,13 +68,30 @@ function recommended(m) {
   return m.variants.find((v) => v.recommended) || m.variants[0];
 }
 
+// Where the recommended variant runs here (`accel.label`: "GPU (Metal) prefill + decode",
+// "GPU (CUDA) prefill, CPU decode", "CPU", ..., with ", streamed from disk").
+function accelText(v) {
+  return (v.accelerator || '').replace(/, streamed from disk$/, '');
+}
+
 function fit(m) {
   const v = recommended(m);
-  if (!m.servable) return { cls: 'warn', text: 'Not served here (command line only)' };
-  if (m.disk_short_gb) return { cls: 'bad', text: `${m.disk_short_gb.toFixed(1)} GB short on disk` };
-  if (v.runs_on === 'streamed') return { cls: 'warn', text: 'Larger than memory: streams from disk, slowly' };
+  const speed = v.decode_tok_s ? ` · ~${v.decode_tok_s >= 10 ? v.decode_tok_s.toFixed(0) : v.decode_tok_s.toFixed(1)} tokens/s` : '';
+  if (!m.servable) return { cls: 'warn', text: 'Not served here (command line only)', accel: accelText(v) };
+  if (m.disk_short_gb) return { cls: 'bad', text: `${m.disk_short_gb.toFixed(1)} GB short on disk`, accel: accelText(v) };
+  if (v.runs_on === 'streamed') return { cls: 'warn', text: 'Larger than memory: streams from disk, slowly', accel: accelText(v) };
+  if (v.accelerator) return { cls: 'good', text: `Fits · ${accelText(v)}${speed}`, accel: '' };
   const where = v.runs_on === 'gpu' ? 'on the GPU' : v.runs_on === 'cpu' ? 'on the CPU' : 'in memory';
-  return { cls: 'good', text: `Fits ${where}${v.decode_tok_s ? `, ~${v.decode_tok_s >= 10 ? v.decode_tok_s.toFixed(0) : v.decode_tok_s.toFixed(1)} tokens/s` : ''}` };
+  return { cls: 'good', text: `Fits ${where}${speed}`, accel: '' };
+}
+
+const ACCEL_KIND = { cpu: 'CPU', metal: 'GPU · Metal', cuda: 'GPU · CUDA', vulkan: 'GPU · Vulkan', gpu: 'GPU', 'neural-engine': 'Neural Engine' };
+
+function accelState(a) {
+  if (a.used && a.backend === 'neural-engine') return { cls: 'good', text: 'available' };
+  if (a.used && (a.prefill || a.decode)) return { cls: 'good', text: a.backend === 'cpu' ? 'always' : a.decode ? 'prefill + decode' : 'prefill' };
+  if (a.available) return { cls: 'muted', text: 'not used' };
+  return { cls: 'muted', text: 'none' };
 }
 
 async function loadCatalog() {
@@ -218,11 +235,23 @@ onUnmounted(() => clearInterval(timer));
             <dd>{{ fmtBytes(store.status.memory) }}{{ store.status.memory_available ? `, ${fmtBytes(store.status.memory_available)} free` : '' }}</dd>
             <dt>For models</dt>
             <dd>{{ store.status.memory_budget ? fmtBytes(store.status.memory_budget) : 'no limit' }}</dd>
-            <template v-for="g in store.status.gpus" :key="g.name">
-              <dt>GPU</dt>
-              <dd>{{ g.name }} ({{ g.backend }}{{ g.memory ? `, ${fmtBytes(g.memory)}` : '' }})</dd>
+            <template v-if="!store.status.accelerators">
+              <template v-for="g in store.status.gpus" :key="g.name">
+                <dt>GPU</dt>
+                <dd>{{ g.name }} ({{ g.backend }}{{ g.memory ? `, ${fmtBytes(g.memory)}` : '' }})</dd>
+              </template>
             </template>
           </dl>
+          <ul v-if="store.status.accelerators" class="plain accels" aria-label="Accelerators">
+            <li v-for="a in store.status.accelerators" :key="`${a.backend}-${a.name}`" :class="['accel', { off: !a.used }]">
+              <div class="accel-head">
+                <span class="accel-kind">{{ ACCEL_KIND[a.backend] || a.backend }}</span>
+                <span :class="['badge', accelState(a).cls]">{{ accelState(a).text }}</span>
+              </div>
+              <span v-if="a.backend !== 'gpu' && a.backend !== 'neural-engine'" class="accel-name">{{ a.name }}<template v-if="a.memory_gb && a.backend !== 'cpu'"> · {{ a.memory_gb.toFixed(0) }} GB{{ a.unified_memory ? ' unified' : '' }}</template></span>
+              <span class="accel-status">{{ a.status }}</span>
+            </li>
+          </ul>
         </template>
       </section>
 
@@ -297,6 +326,7 @@ onUnmounted(() => clearInterval(timer));
               {{ recommended(m).label }}, {{ recommended(m).memory_gb.toFixed(1) }} GB in memory
             </p>
             <p :class="['fit', fit(m).cls]">{{ fit(m).text }}</p>
+            <p v-if="fit(m).accel" class="accel-line">Runs on: {{ fit(m).accel }}</p>
             <p class="caps">{{ m.capabilities.join(' · ') }}</p>
             <p v-if="m.note" class="hint note">{{ m.note }}</p>
             <button type="button" class="quiet small" :disabled="!m.servable" @click="openSetup(m.model, m)">{{ m.cached ? 'Load…' : 'Set up…' }}</button>
@@ -447,6 +477,45 @@ onUnmounted(() => clearInterval(timer));
 }
 .note {
   margin-top: 0;
+}
+.accel-line {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.accels {
+  margin-top: 0.6rem;
+}
+.accel {
+  display: grid;
+  gap: 0.1rem;
+  padding: 0.45rem 0;
+  border-top: 1px solid var(--line);
+  font-size: 0.86rem;
+}
+.accel.off .accel-kind,
+.accel.off .accel-name {
+  color: var(--muted);
+}
+.accel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+.accel-kind {
+  font-family: var(--display);
+  font-weight: 650;
+}
+.accel-name {
+  overflow-wrap: anywhere;
+}
+.accel-status {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+.badge.muted {
+  color: var(--muted);
 }
 .card .quiet {
   align-self: start;
