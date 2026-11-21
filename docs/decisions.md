@@ -110,6 +110,9 @@ matmul, also when the base matmul runs on the GPU). Not supported: Core ML model
 adaptive thinking of the reference server (`"thinking": "auto"`: System 2 reasoning folded into the
 probabilities; the base model itself chats as usual in the same engine).
 
+The same runtime LoRA machinery takes user adapters on the language models (PEFT folders and
+llama.cpp GGUF adapters, `--lora` / the `lora` option), see [LoRA adapters](lora.md).
+
 **LoRA on routed MoE experts.** An adapter may also target the routed experts of a MoE base
 (Qwen3.5 / 3.6 MoE: `layers.N.mlp.experts`; Gemma 4 26B-A4B: `layers.N.experts`): each expert
 gets its own low-rank update, applied to the tokens routed to it, on every CPU path of the

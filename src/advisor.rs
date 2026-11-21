@@ -525,6 +525,18 @@ pub const CATALOG: &[Model] = &[
     .fixed(Format::GgufQ4, "GGUF AD-Q4_K")
     .moe()
     .note("uncensored (a rank-1 refusal-direction LoRA baked in); llama.cpp's layout; also :AD-IQ3_S (13.3 GB), :AD-IQ2_M (8.7 GB, run); images with the mmproj beside it"),
+    // The same quantizations without the LoRA, which AtomicChat ships separately: applied at
+    // run time (`--lora`), switchable, closer to the baked files than the base (docs/lora.md).
+    Model::new(
+        "AtomicChat/Inkling-2-Mini-GGUF:AD-IQ2_M",
+        Kind::Chat,
+        26.4,
+        8.7,
+        &[Text, ImageInput, Thinking, Tools],
+    )
+    .fixed(Format::GgufLow, "GGUF AD-IQ2_M")
+    .moe()
+    .note("the base of the Uncensored files; + --lora AtomicChat/Inkling-2-Mini-Uncensored-GGUF/Inkling-2-Mini-Uncensored-LoRA.gguf (44 MB) applies their LoRA at run time (strength :SCALE, 0 = off) instead of a second 8.7 GB file; also :AD-Q4_K (16.5 GB), :AD-IQ3_S (13.3 GB)"),
     // Inkling-2 Small: never run on the real weights (neither release fits the download budget;
     // the agreement with transformers is measured on tiny checkpoints, the vision tower on the
     // real one; bytes per token from the layout of the releases).

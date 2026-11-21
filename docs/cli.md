@@ -31,6 +31,8 @@ Useful flags:
 | `--mtp` | Qwen3.5/3.8: speculative decoding with the checkpoint's multi-token-prediction layer (greedy and sampled) |
 | `--mtp-fixed` | with `--mtp`, always draft `--draft-tokens` instead of adapting between 1 and N |
 | `--mtp-from DIR` | `--mtp` with the MTP weights taken from another checkpoint (e.g. the original of a converted copy) |
+| `--lora FILE[:SCALE]` | Qwen, Llama, Gemma, Inkling-2: a LoRA adapter applied at run time (repeatable; scale 1, as llama.cpp's `--lora-scaled`): a PEFT folder or a llama.cpp GGUF adapter; image models: a LoRA merged into the pipeline, as before (see [LoRA adapters](lora.md)) |
+| `--lora-merge` | merge the language-model LoRAs into the weights at load (float weights exact, quantized ones re-quantized) |
 | `--mmap` | map weights from disk instead of copying them into RAM |
 | `--save-quantized DIR` | write a pre-quantized, text-only checkpoint at `--quant` precision (see [Pre-quantized checkpoints](performance.md#pre-quantized-checkpoints)) and exit |
 | `--devices` | list detected CPU features and GPUs (Metal, CUDA, Vulkan) and exit |

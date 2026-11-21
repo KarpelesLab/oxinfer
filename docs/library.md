@@ -30,6 +30,10 @@ decoding, streaming detokenization) and the model, session and sampler types. A 
 engine (`capi` feature, `include/oxinfer.h`) and a SwiftUI test app for iOS are in `ios/`
 (see `ios/README.md`). Neuron edits, steering vectors, directional ablation and SAE features are
 `Engine::set_interventions` (see [Runtime interventions](interventions.md#runtime-interventions-neuron-edits-steering-abliteration-sae-features)).
+LoRA adapters (PEFT folders and llama.cpp GGUF adapters) are the `lora` option, repeatable
+(`opts.set("lora", "adapter.gguf:0.5")`, or `EngineOptions::loras`), applied at run time or merged
+with `lora_merge`; `Engine::loras` lists them and `Engine::set_lora_strength` changes one (see
+[LoRA adapters](lora.md)).
 `Engine::save_session` / `Engine::load_session` write and restore a conversation's caches, and the
 `prompt_cache` option keeps them in a directory for `Engine::chat` (see
 [Session snapshots and the prompt cache](sessions.md#session-snapshots-and-the-prompt-cache)); prompt-lookup

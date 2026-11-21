@@ -106,6 +106,7 @@ optional.
 | [Embeddings](docs/embeddings.md) | dense, sparse and ColBERT embedding models |
 | [Typed decisions](docs/decisions.md) | the Jev decision models, over text and images |
 | [Runtime interventions](docs/interventions.md) | neuron edits, steering, abliteration, SAE features |
+| [LoRA adapters](docs/lora.md) | PEFT and llama.cpp GGUF adapters on language models, at run time or merged |
 
 **Text models**
 

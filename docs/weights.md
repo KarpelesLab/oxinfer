@@ -160,6 +160,25 @@ dequantized weights oxinfer is the closer of the two, so the gap comes from how 
 intermediate values (both quantize activations to int8 for the integer dot products), not from a
 different reading of the weights.
 
+### GGUF LoRA adapters
+
+llama.cpp's adapter files (`general.type = adapter`, `adapter.type = lora`, from
+`convert_lora_to_gguf.py`) load with `--lora FILE[:SCALE]` on a GGUF base of the same
+architecture, as in `llama-cli --lora` / `--lora-scaled`. They are applied at run time, unmerged,
+or merged with `--lora-merge`:
+
+```sh
+./target/release/oxinfer --model AtomicChat/Inkling-2-Mini-GGUF:AD-IQ2_M \
+  --lora AtomicChat/Inkling-2-Mini-Uncensored-GGUF/Inkling-2-Mini-Uncensored-LoRA.gguf -p "Hello"
+```
+
+Their tensors (`blk.N.attn_output.weight.lora_a` / `.lora_b`, expert stacks `ffn_*_exps` with one
+pair per expert, `token_embd`) are named and laid out as the base file's, the Llama query / key
+permutation and Qwen3.5's tiled value heads included. So they go on a GGUF base as they are, and
+a safetensors base takes the PEFT form of the adapter instead. The layouts, the scale
+(`adapter.lora.alpha / r * SCALE`), the families, merging and the checks against PEFT, llama.cpp
+and AtomicChat's baked files are in [LoRA adapters](lora.md).
+
 ## MLX checkpoints
 
 MLX repos (mlx-community and the like) store each matrix as packed 4-bit values (`.weight`, eight
