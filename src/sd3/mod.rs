@@ -20,6 +20,8 @@
 //! classifier-free (two passes per step when the scale is above 1).
 
 pub mod clip;
+#[doc(hidden)]
+pub mod tiny;
 pub mod transformer;
 
 use crate::clock::Instant;
