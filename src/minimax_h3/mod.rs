@@ -19,6 +19,8 @@ pub mod dit;
 pub mod encode;
 pub mod lora;
 pub mod ref2va;
+#[doc(hidden)]
+pub mod tiny;
 pub mod vae;
 pub mod video;
 pub mod video_vae;
