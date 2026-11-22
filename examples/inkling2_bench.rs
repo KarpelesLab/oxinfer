@@ -86,12 +86,20 @@ fn main() -> Result<()> {
     if tg > 0 {
         let am = |v: &[f32]| v.iter().enumerate().max_by(|x, y| x.1.total_cmp(y.1)).unwrap().0 as u32;
         let mut times = Vec::new();
+        // (`INKLING2_BENCH_SUM`: the greedy tokens of the last run and a digest of its logits'
+        // bits, to see whether two builds or settings compute the same steps.)
+        let mut digest = 0u64;
+        let mut toks = Vec::new();
         for rep in 0..=reps {
             let mut sess = m.new_session();
             let mut tok = am(&m.forward(&mut sess, &[rnd()]));
+            (digest, toks) = (0, Vec::new());
             let t0 = std::time::Instant::now();
             for _ in 0..if rep == 0 { 8 } else { tg } {
-                tok = am(&m.forward(&mut sess, &[tok]));
+                let l = m.forward(&mut sess, &[tok]);
+                tok = am(&l);
+                toks.push(tok);
+                digest = l.iter().fold(digest, |d, v| d.rotate_left(7) ^ u64::from(v.to_bits()));
             }
             if rep > 0 {
                 times.push(t0.elapsed().as_secs_f64());
@@ -99,6 +107,9 @@ fn main() -> Result<()> {
         }
         let t = median(times);
         println!("tg{tg}: {:.1} tok/s ({:.2} ms/token)", tg as f64 / t, t * 1e3 / tg as f64);
+        if std::env::var_os("INKLING2_BENCH_SUM").is_some() {
+            println!("tokens {toks:?} logits digest {digest:016x}");
+        }
     }
     // Verification passes (speculative decoding): N tokens at once after a short prompt, rolled
     // back after each.

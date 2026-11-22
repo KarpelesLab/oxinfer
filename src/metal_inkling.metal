@@ -350,9 +350,10 @@ inline void ink_attn_body(device float* a, device const float* c, constant IAP& 
     // The bias of the distances this slice covers: pp - j for j in j0..j1, below the extent.
     uint dmin = pp + 1 - j1, dmax = pp - j0;
     uint nb = dmin < p.extent ? min(dmax + 1, p.extent) - dmin : 0;
-    for (uint i = tid; i < G * 1024; i += 256) {
-        uint gg = i / 1024, k = i % 1024;
-        if (k >= nb) continue;
+    // (Item i: head i / nb, distance dmin + i % nb; the threads on the items there are rather than
+    // on G * 1024 slots, most of them past the distances of a short range.)
+    for (uint i = tid; i < G * nb; i += 256) {
+        uint gg = i / nb, k = i % nb;
         float b = 0.f;
         device const float* rq = a + p.r + ((ulong)ti * p.nh + h0 + gg) * p.dr;
         for (uint d = 0; d < p.dr; d++) b += rq[d] * c[p.rel + d * p.extent + dmin + k];
