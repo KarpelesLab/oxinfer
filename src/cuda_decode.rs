@@ -451,6 +451,9 @@ pub(super) struct CudaPlan<'b> {
     _cached: Vec<super::CacheRefs>,
     /// A prefill plan: the kernels over every token of a step.
     pf: Option<PfFuncs>,
+    /// Prefill plans: pinned host memory the step's new keys and values come down through (tens
+    /// of megabytes per step, several times slower into pageable memory), or null.
+    kv_pinned: *mut f32,
 }
 
 /// `dglu_t`, `dew_t`, `dqk_rope_t`, `dattn_combine_t`, `dgdn_conv_t`, `dgdn_rule_t` and
@@ -474,8 +477,10 @@ impl Drop for CudaPlan<'_> {
             for &p in &self.owned {
                 unsafe { self.be.cu.cuMemFree_v2(p) };
             }
-            if !self.pinned.0.is_null() {
-                unsafe { self.be.cu.cuMemFreeHost(self.pinned.0 as *mut c_void) };
+            for p in [self.pinned.0, self.kv_pinned] {
+                if !p.is_null() {
+                    unsafe { self.be.cu.cuMemFreeHost(p as *mut c_void) };
+                }
             }
         }
     }
@@ -1374,6 +1379,13 @@ impl CudaBackend {
             last_writer,
             strengths: (arena + str_off as u64, g.strengths.clone()),
             _cached: cached,
+            kv_pinned: {
+                let mut p: *mut c_void = std::ptr::null_mut();
+                if !pf || kvout_len == 0 || unsafe { self.cu.cuMemAllocHost_v2(&mut p, kvout_len * 4) } != 0 {
+                    p = std::ptr::null_mut();
+                }
+                p as *mut f32
+            },
             pf: if pf {
                 Some(PfFuncs {
                     glu: self.func("dglu_t")?,
@@ -2149,8 +2161,15 @@ impl DecodePlan for CudaPlan<'_> {
             }
             return true;
         }
-        let mut kvo = vec![0f32; self.kvout.1];
-        if !kvo.is_empty() && !dtoh(&mut kvo, self.kvout.0) {
+        let mut kvo_vec = Vec::new();
+        let kvo: &mut [f32] = if self.kv_pinned.is_null() {
+            kvo_vec.resize(self.kvout.1, 0f32);
+            &mut kvo_vec
+        } else {
+            // SAFETY: `kvout.1` floats of pinned memory owned by the plan; steps hold its lock.
+            unsafe { std::slice::from_raw_parts_mut(self.kv_pinned, self.kvout.1) }
+        };
+        if !kvo.is_empty() && !dtoh(kvo, self.kvout.0) {
             return false;
         }
         let mut o = 0;
