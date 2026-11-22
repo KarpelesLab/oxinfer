@@ -679,8 +679,8 @@ release's tokens (158 rows), the two other speech runs were not, and are marked 
 These runs predate the blocked attention kernel (`sd::ops::attention_blocked`), which is 8 to 12
 times faster at these sizes. The audio VAE takes 0.3 to 1.3 s. Attention was 46 to 60% of the forwards' time (`--profile`) and
 grows with the square of the rows: a default request (1344x768, 124 frames, 37,869 rows) was not
-run and would take hours per forward here. The same request twice gives the same file byte for
-byte.
+run on the CPU and would take hours per forward here (on a GPU: [below](#on-cuda)). The same
+request twice gives the same file byte for byte.
 
 What the frames show (contact sheets read by the model that ran this, not by a person):
 
@@ -717,8 +717,9 @@ What the frames show (contact sheets read by the model that ran this, not by a p
   rounding of the bf16 one the LoRA's header names as its base; a small change of the
   conditioning (Q4_K_M for Q8_0, or the speech prompt's two tags as one token each instead of
   three) adds or removes blobs. Which of these matters was not separated: the bf16
-  transformers were not downloaded, 1344x768 at 124 frames was not run (37,869 rows), and
-  nothing was sampled in ComfyUI itself (its nodes and sampler, on a GPU). The prompt embedding,
+  transformers were not downloaded and nothing was sampled in ComfyUI itself (its nodes and
+  sampler, on a GPU). The dog request at 1344x768 with 124 frames, run later on CUDA, has no
+  blob in any frame ([below](#on-cuda)). The prompt embedding,
   which those three runs shared, is not the cause either: the dog prompt's token ids are the
   ones diffusers' text step and ComfyUI's tokenizer give, and its embedding is transformers'
   `hidden_states[50]` on the same Q8_0 values within 3.6e-6 (1.8e-5 in the worst row,
@@ -783,30 +784,31 @@ embedding):
 
 | | CPU | CUDA |
 |---|---|---|
-| one forward | 194 s (457 s in a run of one forward while the machine's other jobs were busier) | 8.6 s (12.8 to 13.4 s the first one: the LoRA factors as halves, 23 to 27 blocks copied to the device) |
-| the 4 forwards | 774.7 s | 38.6 s |
-| video VAE decode (124 frames) | 160 to 187 s | 6.4 to 8.1 s |
+| one forward | 194 s (457 s in a run of one forward while the machine's other jobs were busier) | 5.9 to 6.1 s (7.6 s the first one: the LoRA factors as halves in 1.4 s; the 25 to 28 blocks kept on the device are copied there as each first runs) |
+| the 4 forwards | 774.7 s | 25.2 s |
+| video VAE decode (124 frames) | 160 to 187 s (88.8 s when decoded again for the comparison below) | 4.9 to 5.0 s |
 | audio VAE decode | 1.2 s | 1.1 s |
-| load (transformer, VAEs, LoRA) | 5.6 s | 6.2 s |
-| the whole run, prompt embedding kept | 943 s (15.7 min) | 54 s |
+| load (transformer, VAEs, LoRA) | 5.6 s | 5.9 s |
+| the whole run, prompt embedding kept | 943 s (15.7 min) | 39 s |
 
 The text encoder is not in these totals (5.3 to 13.6 s on the CPU for the 124-token prompt with
 the Q8_0 GGUF, load included: GGUF weights have no device kernels). Peak resident memory of the
 CUDA run 30.4 GB, 6.2 GB of it allocated.
 
 Where one forward's time goes (`--profile`; on the device with `OXINFER_H3_GPU_PROF=1`, which
-waits for the GPU after every stage):
+waits for the GPU after every stage; `OXINFER_H3_GPU_PROF=vae` times the VAE decoder's blocks
+instead):
 
 | stage | CPU | CUDA |
 |---|---|---|
-| `qkv_proj` with its LoRA | 52.2 s | 1.90 s |
-| attention (56 heads over 4682 rows) | 16.0 s | 2.54 s |
-| `out_proj` with its LoRA | 17.8 s | 0.42 s |
-| `fc1` with its LoRA | 56.0 s | 2.44 s |
-| `fc2` with its LoRA | 41.0 s | 0.96 s |
+| `qkv_proj` with its LoRA | 52.2 s | 1.34 s |
+| attention (56 heads of 128 over 4682 rows) | 16.0 s | 1.18 s |
+| `out_proj` with its LoRA | 17.8 s | 0.44 s |
+| `fc1` with its LoRA | 56.0 s | 1.73 s |
+| `fc2` with its LoRA | 41.0 s | 0.95 s |
 | norms and AdaLN, query / key norms and RoPE, SwiGLU, residuals | 6.0 s | 0.22 s |
-| copying the blocks that are not kept on the device | | 1.16 s (while the block before runs: not in the 8.6 s) |
-| the whole forward | 193.7 s | 8.6 s |
+| copying the blocks that are not kept on the device | | about 1 s (while the block before runs: not in the 6.1 s) |
+| the whole forward | 193.7 s | 6.1 s |
 
 The CPU column is a quarter of the four forwards of the run above. The CPU's time depends on
 what else the machine runs: the forward measured alone took 457.5 s with the same split (the
@@ -814,17 +816,51 @@ four projections 426.8 s of it, attention 17.9 s), and the earlier runs above 32
 forward. The four projections, float32 GEMMs over weights decoded eight rows at a time, are 86
 to 93% of a CPU forward.
 
-**1344x768.** One forward of the same prompt at 1344x768, 124 frames (37,834 rows; `--steps 2`,
-so the frames are noise and only the times mean something): 302.5 s, with 4 of the 50 blocks
-kept on the device beside the activations (15.2 of the 16 GB in use), then the VAE's 124 frames
-in 82.9 s and the audio in 1.2 s; 396 s in all, peak resident memory 33.0 GB (7.8 GB allocated).
-The four forwards of a clip were not run at that size, on either device.
+How the device column got there (stages of the transformer's blocks alone,
+`h3_forward_bench` on kept inputs; at 1344x768 the first 5 blocks, per block). Each row gives
+the same velocities as the one before unless a distance is given:
+
+| the CUDA forward | 448x256 (4682 rows) | 1344x768 (37,834 rows) |
+|---|---|---|
+| the first engine: attention as three launches per head and query chunk (scores, softmax, product with the values) | 8.6 s: `qkv_proj` 1.90, attention 2.54, `out_proj` 0.42, `fc1` 2.44, `fc2` 0.96 | 309 s; per block 0.30, 5.05, 0.07, 0.39, 0.14 s: attention 82% |
+| attention as one kernel that keeps no score matrix (below): the forward 2.1e-5 from the one before at 448x256; at 1344x768 the rows after one step 8.5e-5 from the ones before | 7.4 s: attention 1.34 | 137 s; attention 1.71 s per block |
+| that kernel reads a step's keys and values one phase ahead | attention 1.18 | attention 1.48 s per block |
+| a projection's outputs in groups whose weights stay in the cache while every row passes | 6.1 s: 1.34, 1.18, 0.44, 1.73, 0.95 | 114.5 s (a run's first forward, its copies included); per block 0.22, 1.48, 0.07, 0.27, 0.14 s: attention 65% |
+
+**1344x768.** The dog request at the size the 4-step LoRA was trained for (1344x768, 124 frames,
+37,834 rows, the same embedding and seed, the LoRA's four forwards): 448.7 s for the forwards
+(112.2 s each), the VAE's 124 frames in 65.9 s and the audio in 1.1 s; 525 s in
+all, peak resident memory 33.1 GB (7.9 GB allocated). With the engine of the table's second row
+the same clip took 619 s (the forwards 543.1 s, the VAE 66.1 s) and with the first one a
+forward alone took 309 s and the VAE 82.5 s; the two clips' rows are the same bit for bit. 4
+to 9 of the 50 blocks stay on the device beside
+the 9.4 GB of activations; the others are copied while the block before them runs, which costs
+nothing measurable at this size (a block computes for 2 s). Attention is quadratic in the rows:
+65% of a forward here, 19% at 448x256. It was not run on the CPU.
+
+**What the CUDA clips show** (contact sheets and full frames read by the model that ran this,
+not by a person). At 448x256 the CUDA clip is the CPU clip: the same dog, lawn, fence and
+house, the same motion, and the same coloured blobs at the same places in the same frames
+(every third frame of both, side by side); the two files are 39.9 dB apart (PSNR of the Motion
+JPEG frames, the rows 2.5%), and the clip did not change to the eye from the first engine to
+this one (44.5 dB). At 1344x768 the same prompt and seed give another sample of the scene, sharp
+(fur, grass blades, the pickets and the brick), the same dog and background through the clip:
+it wags its tail, raises its head and barks with its mouth open about five times, then pants.
+**No coloured blob in any of its 124 frames** (three sheets of every third frame at 336 pixels
+a frame, three frames at full size). Its soundtrack has five bursts of 0.15 s (0.7, 1.5, 2.1,
+2.7 and 3.4 s, harmonics below 3 kHz, energy up to 15 kHz) where the prompt asks for three
+barks, -24.6 dBFS, peak 0.60, 80% of the 20 ms windows silent; nobody listened. So the request
+that gives blobs at 448x256 gives none at the resolution the 4-step LoRA was trained for. One
+prompt and one seed: with the clean 22- and 56-frame clips at 448x256 and the clean 22-frame
+speech clip at 1344x768 ([above](#real-runs)) it fits the blobs coming from using that LoRA
+off its resolution on a long clip, and does not prove it (the speech prompt was not run at
+1344x768 with 124 frames, nor another seed).
 
 **Memory.** A block is about 0.45 GB on the device (0.385 GB of FP8 bytes as stored, the rest its
-LoRA factors), the transformer 22 GB: 23 to 27 blocks stay there and the others go through two
+LoRA factors), the transformer 22 GB: 23 to 28 blocks stay there and the others go through two
 slots, each copied while the block before it runs. The activations of 4682 rows take 1.2 GB
-(the feed-forward runs in row chunks and the attention in query chunks of at most 256 MB of
-scores, so neither grows with the square of the sequence). The transformer's blocks leave the
+and those of 37,834 rows 9.4 GB (the feed-forward runs in row chunks and the attention keeps
+no scores, so neither grows with the square of the sequence). The transformer's blocks leave the
 device before the VAE decodes (its 36 float16 blocks are 4.8 GB and all fit), and the VAE's
 after.
 
@@ -838,28 +874,59 @@ and against torch (diffusers' transformer in float32 on the same inputs,
 
 | forward | CUDA against the CPU path | CUDA against torch | the CPU path against torch |
 |---|---|---|---|
-| 1 (the same inputs for all three) | 9.5e-5 / 4.4e-6 (max abs 5.9e-3 / 3.5e-5, mean \|v\| 1.14 / 0.74) | 4.1e-5 / 2.4e-6 | 1.0e-4 / 4.8e-6 |
+| 1 (the same inputs for all three), the first engine | 9.5e-5 / 4.4e-6 (max abs 5.9e-3 / 3.5e-5, mean \|v\| 1.14 / 0.74) | 4.1e-5 / 2.4e-6 | 1.0e-4 / 4.8e-6 |
+| 1, the engine as it is now | 1.0e-4 / 4.6e-6 (max abs 6.8e-3 / 3.4e-5) | 3.8e-5 / 2.4e-6 | |
 | 2, 3, 4 (the inputs an earlier CPU run kept) | | 5.0e-5, 1.3e-4, 4.9e-5 / 3.9e-6, 5.1e-6, 3.1e-6 | 3.1e-4, 2.6e-4, 1.6e-4 / 2.1e-5, 3.2e-5, 2.6e-5 (that earlier run) |
 
-After the four steps the video rows are within 2.1% (relative L2) of torch's own four steps
-from the same noise and the audio rows within 0.24%; the CPU path's are within 2.6% and 0.29%
-of torch's and 2.3% and 0.17% of the CUDA run's (the 4-step schedule amplifies a forward's
-rounding, [above](#what-was-checked-1)). The
-VAE's decoded frames are within 3.8e-5 of the CPU's (mean 6.2e-7, mean magnitude 0.84). The
+Rows 2 to 4 are the first engine's. The running softmax adds in another order than the
+two-pass one: the forward moved by 2.1e-5 / 1.0e-6 when the attention kernel changed (max abs
+8.7e-4 / 6.0e-6), and not by one bit with the changes after it. After the four steps the video
+rows are within 1.9% (relative L2) of torch's own four steps from the same noise and the audio
+rows within 0.18% (2.1% and 0.24% with the first engine, whose rows are 0.90% and 0.093% from
+today's); the CPU path's are within 2.6% and 0.29% of torch's and 2.5% and 0.21% of the CUDA
+run's (the 4-step schedule amplifies a forward's rounding, [above](#what-was-checked-1)). The
+VAE's decoded frames are within 5.7e-5 of the CPU's (mean 6.2e-7, mean magnitude 0.84; 3.8e-5
+and the same mean with the first engine's attention). The
 engine's own tests compare both kinds of stack (FP8 with AdaLN, weighted query / key norms and
 LoRA side paths; float16 with biases and scaled residuals) with their definition in float64 on
 random weights: within 2e-5 of the largest value, whole and in chunks
 (`cargo test --lib minimax_h3::cuda`, on a machine with an NVIDIA GPU).
 
+**The kernels.** A projection is a GEMM whose 128-thread blocks compute 64 rows x 64 outputs in
+32-wide steps through shared memory. Its weights are 38 to 154 MB, and each tile of 64 rows
+read all of them from the device's memory again: the outputs now go in groups of 16 MB of
+weights, every row passing one group before the next (`qkv_proj` and `fc1`, 1.4 times faster;
+`fc2` measured the same either way, and `out_proj`, 38 MB, is left in one group, where groups
+measured 6% slower). Without the reads (the first step's operands used again and again: wrong
+results, a floor for the time) the four projections take 0.79 of what they take now, 0.61 of
+what they took without the groups. The attention walks, per block of 64 queries and one head,
+the keys 64 at a time: the scores of 64 x 64 stay in the tensor cores' accumulators, each row
+keeps a running maximum and sum (rescaling what it has when the maximum grows), and
+`exp(s - m)` goes into the product with the values as two halves, so the n x n scores never
+reach the device's memory (the first engine wrote them, read them back for the softmax, wrote
+the probabilities as halves and read those). It is 2.2 times faster at 448x256 and 3.4 times
+at 1344x768, and it also runs the VAE decoder's attention (heads of 64). A block of 8 warps
+takes 92 KB of shared memory for heads of 128; without the reads of keys and values the kernel
+would take 0.8 of its time.
+`OXINFER_H3_GPU_FLASH=0` keeps the three-launch attention (the engine's tests run both), and
+`OXINFER_H3_GPU_HOT=MB` sets the group size (4 to 48 MB measured alike, 1 MB slower than no
+groups).
+
+Tried and not kept: reading a GEMM step's operands one step ahead into registers (5% slower);
+4 warps instead of 8 on the attention's tile (9% slower); the two second-half products of the
+attention one after the other or interleaved (the same).
+
 Tried and not kept as the default: plain float16 operands (`OXINFER_H3_GPU_EXACT=0`, one
-tensor-core product instead of two or three) take 6.5 s of device time per forward instead of
-8.5 s, with velocities 9.5e-3 from the CPU's on average and 0.33 at most (against 7.8e-5 and
+tensor-core product instead of two or three) took 6.5 s of device time per forward instead of
+8.5 s with the first engine, with velocities 9.5e-3 from the CPU's on average and 0.33 at most (against 7.8e-5 and
 5.9e-3). `OXINFER_H3_GPU=0` keeps the CPU path; `OXINFER_GPU_PLAN_DEBUG=1` says what the device
 took or why it declined.
 
-Not done: the text encoder on the GPU; the transformer's other weight formats there; requests
-whose activations do not fit beside two blocks (the CPU path then runs); a comparison of the
-decoded frames by eye.
+Not done: the text encoder on the GPU (its Q8_0 GGUF is 34.8 GB and has no device kernels);
+the transformer's other weight formats there (the bf16, int8 ConvRot and W6A8 files were not on
+the disk of these runs); requests whose activations do not fit beside two blocks (the CPU path
+then runs); the VAE decoder's tiles, which still go to the device one at a time (28 tiles per
+clip of latent frames at 1344x768, 66 s of the 525); a second prompt or seed at 1344x768.
 
 ### Still not supported
 
