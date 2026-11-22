@@ -1313,8 +1313,19 @@ impl<'a> Loader<'a, '_> {
                     f.note_use(n, true, false);
                 }
                 let (per, sper) = (n_out * n_in, n_out * n_in / 32);
+                let in_place = crate::ggml::e8m0_in_place();
                 let lins: Result<Vec<Lin>> = (0..ne)
                     .map(|e| {
+                        if in_place {
+                            // SAFETY: both borrow `files`, which outlives every model holding them.
+                            let (d, s) = unsafe {
+                                (
+                                    QBuf::borrowed(&data[e * per..(e + 1) * per]),
+                                    QBuf::borrowed(&sc[e * sper..(e + 1) * sper]),
+                                )
+                            };
+                            return Ok(Lin::gguf(GgufMatrix::fp8_e8m0(d, s, n_out, n_in, (1, 32))?));
+                        }
                         let mut s = PageVec::<f32>::zeroed(sper);
                         for (d, &b) in s.iter_mut().zip(&sc[e * sper..(e + 1) * sper]) {
                             *d = if b == 255 { f32::NAN } else { (2f32).powi(b as i32 - 127) };
@@ -1324,8 +1335,8 @@ impl<'a> Loader<'a, '_> {
                         Ok(Lin::gguf(GgufMatrix::fp8(d, s.into(), n_out, n_in, (1, 32))?))
                     })
                     .collect();
-                // (The values are read in place; the exponents were expanded.)
-                if lins.is_ok() {
+                // (The values are read in place; the exponents too on the CPU, else expanded.)
+                if lins.is_ok() && !in_place {
                     f.discard(&sn);
                 }
                 lins

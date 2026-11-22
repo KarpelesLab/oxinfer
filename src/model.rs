@@ -405,6 +405,22 @@ pub(crate) fn fp8_matrix(files: &ModelFiles, full: &str, n_out: usize, n_in: usi
         .map(|b| (b, b))
         .or_else(|| (sr == n_out && sc > 0 && n_in.div_ceil(n_in.div_ceil(sc)) == sc).then(|| (1, n_in.div_ceil(sc))))
         .with_context(|| format!("{sname}: scale grid {:?} fits no block of [{n_out}, {n_in}]", si.shape))?;
+    let data = files.bytes(full)?;
+    if (si.dtype == "U8" || si.dtype == "F8_E8M0") && crate::ggml::e8m0_in_place() {
+        // MXFP8 on the CPU: the exponent bytes borrowed from the file.
+        let b = files.bytes(&sname)?;
+        files.note_use(&sname, true, false);
+        // SAFETY: both borrow `files`, which outlives every model holding the matrix.
+        return unsafe {
+            GgufMatrix::fp8_e8m0(
+                crate::quant::QBuf::borrowed(data),
+                crate::quant::QBuf::borrowed(b),
+                n_out,
+                n_in,
+                block,
+            )
+        };
+    }
     let scales: crate::quant::QBuf<f32> = {
         let b = files.bytes(&sname)?;
         if si.dtype == "U8" || si.dtype == "F8_E8M0" {
@@ -424,7 +440,6 @@ pub(crate) fn fp8_matrix(files: &ModelFiles, full: &str, n_out: usize, n_in: usi
             p.into()
         }
     };
-    let data = files.bytes(full)?;
     files.note_use(&sname, true, false);
     // SAFETY: the weight borrows `files`, which outlives every model holding it.
     GgufMatrix::fp8(unsafe { crate::quant::QBuf::borrowed(data) }, scales, n_out, n_in, block)
@@ -577,6 +592,7 @@ pub(crate) fn nvfp4_blocks(packed: &[u8], sc: &[u8], factor: f32, n_out: usize, 
     g[0] = factor;
     m.block_scales = Some(crate::ggml::BlockScales {
         s: g.into(),
+        e8m0: None,
         rows: n_out,
         cols: n_in,
     });
@@ -749,7 +765,11 @@ impl<'a> Lin<'a> {
             }
             Weight::Gguf(m) => {
                 let mut v = vec![span(&m.data[..])];
-                v.extend(m.block_scales.as_ref().map(|b| span(&b.s[..])));
+                v.extend(
+                    m.block_scales
+                        .as_ref()
+                        .map(|b| b.e8m0.as_ref().map_or(span(&b.s[..]), |e| span(&e[..]))),
+                );
                 v
             }
         }

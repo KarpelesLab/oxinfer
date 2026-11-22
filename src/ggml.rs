@@ -249,12 +249,52 @@ pub struct GgufMatrix {
     pub block_scales: Option<BlockScales>,
 }
 
-/// The block scales of an FP8 matrix: `s[(r / rows) * n_in.div_ceil(cols) + c / cols]` scales
-/// weight `(r, c)`.
+/// The block scales of an FP8 matrix: scale `(r / rows) * n_in.div_ceil(cols) + c / cols` (see
+/// [`BlockScales::get`]) scales weight `(r, c)`.
 pub struct BlockScales {
+    /// The scales as f32 (empty when `e8m0` holds them).
     pub s: QBuf<f32>,
+    /// MXFP8's E8M0 exponent bytes as stored, `2^(e - 127)` (255: NaN), in place of `s`: a
+    /// quarter of the memory. Only for FP8 E4M3 matrices on the CPU kernels (the GPU paths take
+    /// `s`).
+    pub e8m0: Option<QBuf<u8>>,
     pub rows: usize,
     pub cols: usize,
+}
+
+impl BlockScales {
+    /// Scale `i`.
+    #[inline(always)]
+    pub fn get(&self, i: usize) -> f32 {
+        match &self.e8m0 {
+            Some(e) => e8m0_to_f32(e[i]),
+            None => self.s[i],
+        }
+    }
+    /// The number of scales.
+    pub fn len(&self) -> usize {
+        self.e8m0.as_ref().map_or(self.s.len(), |e| e.len())
+    }
+    /// Whether there are none.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Whether MXFP8 matrices keep their E8M0 scale bytes as stored (a quarter of the f32 scales'
+/// memory): when no GPU backend is active, since the GPU kernels take f32 scales.
+pub fn e8m0_in_place() -> bool {
+    crate::gpu::active().is_none()
+}
+
+/// The value of an E8M0 scale byte: `2^(b - 127)` (exact, `2^-127` a subnormal), 255 is NaN.
+#[inline(always)]
+pub fn e8m0_to_f32(b: u8) -> f32 {
+    match b {
+        255 => f32::NAN,
+        0 => f32::from_bits(0x0040_0000),
+        _ => f32::from_bits((b as u32) << 23),
+    }
 }
 
 /// The value of an FP8 E4M3 (`float8_e4m3fn`: no infinities, 0x7f / 0xff are NaN) byte.
@@ -336,6 +376,28 @@ impl GgufMatrix {
         let mut m = Self::new(GgmlType::F8E4M3, data, n_out, n_in)?;
         m.block_scales = Some(BlockScales {
             s: scales,
+            e8m0: None,
+            rows: block.0,
+            cols: block.1,
+        });
+        Ok(m)
+    }
+
+    /// [`Self::fp8`] with E8M0 exponent bytes for scales (MXFP8), kept as they are: decoded as
+    /// the CPU kernels read them, with the same values as their f32 expansion.
+    pub fn fp8_e8m0(data: QBuf<u8>, scales: QBuf<u8>, n_out: usize, n_in: usize, block: (usize, usize)) -> Result<Self> {
+        let want = n_out.div_ceil(block.0) * n_in.div_ceil(block.1);
+        if scales.len() != want {
+            bail!(
+                "FP8 [{n_out}, {n_in}] with {:?} blocks needs {want} scales, got {}",
+                block,
+                scales.len()
+            );
+        }
+        let mut m = Self::new(GgmlType::F8E4M3, data, n_out, n_in)?;
+        m.block_scales = Some(BlockScales {
+            s: crate::quant::PageVec::<f32>::zeroed(0).into(),
+            e8m0: Some(scales),
             rows: block.0,
             cols: block.1,
         });
@@ -353,6 +415,7 @@ impl GgufMatrix {
         let mut m = Self::new(GgmlType::I8, data, n_out, n_in)?;
         m.block_scales = Some(BlockScales {
             s: scales,
+            e8m0: None,
             rows,
             cols: n_in,
         });
@@ -412,7 +475,7 @@ impl GgufMatrix {
         let n = self.n_in;
         if self.kind == GgmlType::I8 {
             for (i, r) in (r0..r1).enumerate() {
-                let s = self.block_scales.as_ref().map_or(1.0, |bs| bs.s[r / bs.rows]);
+                let s = self.block_scales.as_ref().map_or(1.0, |bs| bs.get(r / bs.rows));
                 for (o, &q) in out[i * n..(i + 1) * n].iter_mut().zip(self.row(r)) {
                     *o = q as i8 as f32 * s;
                 }
@@ -425,8 +488,9 @@ impl GgufMatrix {
             for (i, r) in (r0..r1).enumerate() {
                 let o = &mut out[i * n..(i + 1) * n];
                 dequantize_row(self.kind, self.row(r), o);
-                let srow = &bs.s[(r / bs.rows) * ncb..(r / bs.rows + 1) * ncb];
-                for (oc, &s) in o.chunks_mut(bs.cols).zip(srow) {
+                let b0 = (r / bs.rows) * ncb;
+                for (j, oc) in o.chunks_mut(bs.cols).enumerate() {
+                    let s = bs.get(b0 + j);
                     oc.iter_mut().for_each(|v| *v *= s);
                 }
             }
@@ -436,10 +500,10 @@ impl GgufMatrix {
             let scaled = e4m3_scaled_fn();
             let ncb = n.div_ceil(bs.cols);
             for (i, r) in (r0..r1).enumerate() {
-                let srow = &bs.s[(r / bs.rows) * ncb..(r / bs.rows + 1) * ncb];
+                let b0 = (r / bs.rows) * ncb;
                 let (o, w) = (&mut out[i * n..(i + 1) * n], self.row(r));
-                for ((oc, wc), &s) in o.chunks_mut(bs.cols).zip(w.chunks(bs.cols)).zip(srow) {
-                    scaled(wc, s, oc);
+                for (j, (oc, wc)) in o.chunks_mut(bs.cols).zip(w.chunks(bs.cols)).enumerate() {
+                    scaled(wc, bs.get(b0 + j), oc);
                 }
             }
             return;
@@ -1365,7 +1429,7 @@ impl GgufMatrix {
     fn sum_factor(&self, r: usize) -> Option<f32> {
         let bs = self.block_scales.as_ref().filter(|_| !self.kind.is_float())?;
         debug_assert!(bs.cols >= self.n_in);
-        Some(bs.s[r / bs.rows])
+        Some(bs.get(r / bs.rows))
     }
 
     /// Multiplies the whole matrix by `f` (as a row-wide block scale; see `sum_factor`). Only
@@ -1378,6 +1442,7 @@ impl GgufMatrix {
         s[0] = f;
         self.block_scales = Some(BlockScales {
             s: s.into(),
+            e8m0: None,
             rows: self.n_out,
             cols: self.n_in,
         });
@@ -2069,6 +2134,66 @@ mod tests {
             let mut yr = f32_reference(&wf, n_out, n_in, &x[..8 * n_in], 8);
             yr.extend(f32_reference(&wf2, n_out, n_in, &x[8 * n_in..], 16));
             check(&format!("{kind} grouped"), &y, &yr, 1e-4);
+        }
+    }
+}
+
+#[cfg(test)]
+mod e8m0_tests {
+    use super::*;
+    use crate::kernels::matmul_quant_multi;
+
+    /// E8M0 bytes decoded in the kernels give the bits of their f32 expansion (the loaders'
+    /// `2^(e - 127)`, NaN for 255): the byte itself, dequantized rows, and matmuls of 1 and 40
+    /// tokens.
+    #[test]
+    fn e8m0_scales_match_f32_expansion() {
+        for b in 0..=255u8 {
+            let want = if b == 255 { f32::NAN } else { (2f32).powi(b as i32 - 127) };
+            assert_eq!(e8m0_to_f32(b).to_bits(), want.to_bits(), "byte {b}");
+        }
+        crate::pool::init(4);
+        let (n_out, n_in) = (70usize, 256usize);
+        let mut seed = 3u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        // Finite E4M3 bytes (no 0x7f / 0xff) and exponents around 1 (some extreme ones).
+        let data: Vec<u8> = (0..n_out * n_in)
+            .map(|_| {
+                let b = (next() & 0xFF) as u8;
+                if b & 0x7F == 0x7F { b & 0xF0 } else { b }
+            })
+            .collect();
+        let e8: Vec<u8> = (0..n_out * n_in / 32)
+            .map(|i| match i % 37 {
+                0 => 0,
+                1 => 1,
+                2 => 250,
+                _ => 120 + (next() % 14) as u8,
+            })
+            .collect();
+        let f: Vec<f32> = e8.iter().map(|&b| (2f32).powi(b as i32 - 127)).collect();
+        let pv = |v: &[u8]| {
+            let mut p = crate::quant::PageVec::<u8>::zeroed(v.len());
+            p.copy_from_slice(v);
+            p
+        };
+        let mut fs = crate::quant::PageVec::<f32>::zeroed(f.len());
+        fs.copy_from_slice(&f);
+        let a = GgufMatrix::fp8(pv(&data).into(), fs.into(), n_out, n_in, (1, 32)).unwrap();
+        let b = GgufMatrix::fp8_e8m0(pv(&data).into(), pv(&e8).into(), n_out, n_in, (1, 32)).unwrap();
+        let (mut da, mut db) = (vec![0f32; n_out * n_in], vec![0f32; n_out * n_in]);
+        a.dequantize_rows(0, n_out, &mut da);
+        b.dequantize_rows(0, n_out, &mut db);
+        assert!(da.iter().zip(&db).all(|(x, y)| x.to_bits() == y.to_bits()), "dequantized rows");
+        for t in [1usize, 40] {
+            let x: Vec<f32> = (0..t * n_in).map(|i| ((i * 7919) % 2001) as f32 / 1000.0 - 1.0).collect();
+            let (mut ya, mut yb) = (vec![0f32; t * n_out], vec![0f32; t * n_out]);
+            matmul_quant_multi(&mut [(&a, &mut ya[..])], &x, t);
+            matmul_quant_multi(&mut [(&b, &mut yb[..])], &x, t);
+            assert!(ya.iter().zip(&yb).all(|(x, y)| x.to_bits() == y.to_bits()), "{t} tokens");
         }
     }
 }
