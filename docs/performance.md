@@ -290,15 +290,17 @@ Where oxinfer is still behind:
   each expert with fewer, fuller tiles (64- and 128-row) was slower than the 128 / 32 / 16-row
   tiling. The dense parts have narrow outputs (2816). Routing now stays on the GPU (no host
   round trip per MoE layer); fusing gate and up is moot for this checkpoint (one fused tensor).
-- **CPU prefill against llama.cpp on 12-16 threads** (0.45-0.7x on the Q8_0 / Q4 models, level on
-  Orpheus and the 27B, ahead on the BF16 Qwen3.5-9B): oxinfer's default GEMM now runs on the SME
-  units (see [CPU prefill GEMMs](#cpu-prefill-gemms-november-2026)), 1.6-2.5x the previous CPU
-  prefill and ahead of llama.cpp's default 6 threads everywhere but Qwen3-8B pp2048 (0.94x), with
-  the same results as before. But the SME units saturate with a few threads, while llama.cpp's
-  repacked int8 `SMMLA` kernels (int8 activations) keep scaling with free cores. `fast` (SME
-  plus int8 on the NEON units, llama.cpp-like rounding), the default for language models' prompts
-  since 2026-11-16 (`prefill_gemm=exact` opts out), closes most of the gap (0.75-1.6x of
-  llama.cpp's best; 0.46x on the 26B-A4B, whose experts stay on SME).
+- **CPU prefill against llama.cpp on 12-16 threads**: level or ahead on the models measured in
+  [CPU round 3](#cpu-round-3-november-2026) (the 26B-A4B's routed experts now take the int8
+  GEMM too, and Qwen / Llama prompts no longer attend with a per-head loop), on a machine too
+  loaded for clean ratios; llama.cpp's 16-thread runs collapsed under the load while
+  oxinfer's work-claiming pool held up. Per-core throughput is not ahead: both engines' int8
+  kernels issue at the SDOT rate (~340 GOP/s on one core).
+- **CPU decode of small Q8_0 models** (Llama 3.2 1B Q8_0: 160-175 tok/s against llama.cpp's
+  186-192 at 8 threads): the one-row Q8_0 kernel reads 67 GB/s on one core where plain streaming
+  does 91 and llama.cpp's repacked `Q8_0_4x8` kernel ~80; see round 3 for what was tried.
+  Qwen3-8B (Q8_0, Q4_K_M), Gemma 4 12B, 26B-A4B, Orpheus and Llama 1B Q4_K_M decode level with
+  or ahead of llama.cpp's best thread count.
 
 #### CPU prefill GEMMs (November 2026)
 
@@ -464,6 +466,83 @@ Where oxinfer is still behind on this machine:
 - **Decode kernels**: bound by memory bandwidth here, so nothing was gained there beyond the
   i-quant unpackers; the Gated DeltaNet update (two passes over each state per token, 8% of
   the 27B's decode) could read its states once less.
+
+#### CPU round 3 (November 2026)
+
+Three changes to CPU prompt processing (`device=cpu`), all inside `fast` (the default for
+language models' prompts) except the attention, which applies in every mode:
+
+- **Mixture-of-experts experts on the int8 GEMM.** The grouped matmuls of routed experts
+  (`matmul_quant_grouped`) ran on the SME units alone, which saturate with a few threads. Under
+  `fast` they now run the int8 SDOT GEMM on every core, skipping each expert segment's zero
+  padding rows (`OXINFER_GROUPED_SME_SHARE=N` puts N/16 of the blocks back on SME; any share
+  measured slower: 0 335, 4 285, 16 159 tok/s). `hybrid` keeps 7/16 on SME.
+- **Qwen-family prompt attention as GEMMs.** Qwen3, Llama 3, Orpheus and the attention layers of
+  Qwen3.5 attended over a prompt chunk with the per-(token, head) loop of decoding: at 2.3k
+  tokens that was 44% of a Qwen3-8B prefill (5.2 of 11.7 ms per token). Chunks of 32 or more
+  tokens now take `attention_prefill` (Gemma's already did): score and value GEMMs per block of
+  queries and KV head. Each KV head's keys and transposed values are copied once per call into
+  buffers reused by all query blocks (the old code built them per block, through freshly
+  allocated vectors whose page faults cost as much as the GEMMs), and the softmax's
+  exponentials run in their own vectorized loop (same bits). Verification passes (16 tokens or
+  fewer) are unchanged, so exact speculative decoding still equals plain decoding.
+- **MXFP8 scales in place** (CPU only): FP8 E4M3 matrices with E8M0 block exponents (the
+  Inkling-2 MXFP8 experts, `fp8_matrix` checkpoints) borrow the exponent bytes from the mapped
+  file and decode `2^(e - 127)` from the bits as they dequantize, instead of an f32 copy made at
+  load: a quarter of the memory (Inkling-2-Small-MXFP8: ~18 GB of mapped bytes instead of ~73 GB
+  of f32 copies). Bit-identical to the expansion (`ggml::e8m0_tests`). With a GPU backend active
+  the expansion stays, because the Metal and CUDA MXFP8 kernels read f32 scales.
+
+Correctness: Qwen3-8B Q8_0, last-token KL after a 2.8k-token raw prompt: `exact` before / after
+9.1e-8 (the attention's summation order), `fast` before / after 8.8e-4 (fast against exact:
+5.9e-4 before, 8.7e-4 after); greedy 64-token continuations of two raw prompts: the prose one
+identical in all four runs, the code one flips one near-tie (`usize` / `u32`) between
+binaries in each mode. Gemma 4 26B-A4B Q4_0 (whose routing amplifies any rounding): KL against
+`exact` 3.3e-3 with the int8 experts, 1.1e-2 with the previous SME experts; top-1 unchanged.
+
+Throughput, M5 Max shared with other agents' builds and GPU jobs (load averages in brackets:
+the 30-70 runs are interleaved llama.cpp / this branch / the previous master `ab2da10`, best of
+3, and say more about relative speed than absolute), tok/s:
+
+| model | llama.cpp 12 thr | 16 thr | oxinfer before | after |
+|---|---|---|---|---|
+| 26B-A4B Q4_0 pp512 [7-15] | 240 | 274 | 180 | 357-373 |
+| 26B-A4B Q4_0 pp512 / pp2048 [38] | 241 / 203 | 73 / 74 | 111 / 149 | 194 / 219 |
+| Qwen3-8B Q8_0 pp512 / pp2048 [38] | 187 / 134 | 78 / 50 | 132 / 92 | 153 / 147 |
+| Qwen3-8B Q4_K_M pp512 / pp2048 [38-68] | 83 / 56 | 38 / 36 | 89 / 65 | 87 / 92 |
+| Llama 3.2 1B Q4_K_M pp512 / pp2048 [60] | 481 / 270 | 79 / 56 | 595 / 282 | 527 / 375 |
+| Llama 3.2 1B Q8_0 pp512 / pp2048 [60] | 232 / 397 | 101 / 115 | 619 / 335 | 592 / 740 |
+| Gemma 4 12B Q8_0 pp512 / pp2048 [48] | 49 / 44 | 19 / 34 | 96 / 57 | 70 / 58 |
+| Gemma 4 12B Q8_0 pp512, two more rounds [18-28] | | | 113 / 115 | 125 / 101 |
+| Orpheus 3B Q4_K_M pp512 / pp2048 [19-48] | 71 / 131 | 80 / 79 | 339 / 201 | 405 / 344 |
+| Qwen3-8B Q8_0, 2.3k-token CLI prompt [8-11], ms per token | | | 11.7 (attention 5.2) | 7.1 (attention 1.7) |
+
+The MTP prefill overhead of the GPU (18-20%) does not exist on the CPU: Qwen3.5-9B (`quant=q8`)
+pp512 / pp2048 with its MTP layer against `mtp=0`, three interleaved rounds: 158 / 142 vs 172 /
+154, 163 / 148 vs 158 / 150, 171 / 156 vs 151 / 151 (the layer is ~3% of the compute).
+
+Decode (tg128, best thread count of each, interleaved, load 6-30): Qwen3-8B Q8_0 31.6 vs
+llama.cpp 31.4 (10 threads), Q4_K_M 42.1 vs 41.8; Gemma 4 12B Q8_0 17.3 vs 17.6; 26B-A4B 61.5 vs
+58.5; Orpheus 86.8 vs 63.6; Llama 3.2 1B Q4_K_M 213.9 vs 175.8; Llama 3.2 1B Q8_0 174.7 vs 186-192
+(the one gap). On one thread llama.cpp is ahead (Qwen3-8B Q4_K_M 8.2 vs 6.7, Q8_0 9.2 vs 8.4):
+its repacked kernels need fewer instructions per weight. `examples/matvec_bench` measured where
+the Q8_0 decode time goes:
+
+- one core streams 91 GB/s of plain reads, the Q8_0 kernel 67 GB/s (about 48 instructions per 4
+  blocks: compute-bound), a prototype of llama.cpp's 4-row interleaved `Q8_0_4x8` layout 80 GB/s;
+  at 8-18 threads both kernels land at 210-230 GB/s, so the repack (a second copy of the weights,
+  and every kernel taught the layout) would not move multi-threaded decode;
+- two rows per call sharing the activation loads, software prefetch at 0.5-8 KB ahead, and
+  other row-block sizes (1-32 blocks per thread, 16-512 KB) measured no better;
+- plain streaming in 128 KB blocks loses ~15% against 0.25-0.5 MB blocks, but the matvec did not
+  follow that trend within the noise;
+- running decode attention as one parallel region instead of three at short contexts was within
+  noise.
+
+The int8 prefill kernel already issues at the SDOT rate (~340 GOP/s on one core); SMMLA
+(i8mm) issues at half that rate for twice the multiply-adds, so llama.cpp's SMMLA kernels are no
+faster per core. SME's int8 outer products (SMOPA) would be ~2x the SME f32 rate, but applying a
+per-block scale needs the int32 tiles read out every 32 values, which costs more than it gains.
 
 #### Earlier comparisons (llama-server, op-by-op Metal prefill)
 
