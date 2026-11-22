@@ -714,3 +714,216 @@ extern "C" __global__ void dxlora_up(const float* u, const float* bt, const unsi
     }
     y[o] += acc;
 }
+
+// ---- Prefill plans (`decode_plan_prefill`): the ops above over every token of a step in one
+// launch. Token `j` of the step reads and writes rows `j` strides further (in floats), the
+// arithmetic per token being the single-token kernel's.
+
+// out = act(g) * u; grid (blocks of n, tokens).
+extern "C" __global__ void dglu_t(const float* g, const float* u, float* out, unsigned int n, unsigned int gelu, unsigned int gs,
+                                  unsigned int us, unsigned int os) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t t = blockIdx.y;
+    if (i >= n) return;
+    float a = g[t * gs + i];
+    out[t * os + i] = (gelu ? dgelu(a) : a / (1.0f + expf(-a))) * u[t * us + i];
+}
+
+// `dew` per token; grid (blocks of n, tokens).
+extern "C" __global__ void dew_t(const float* a, const float* b, float* out, unsigned int n, unsigned int kind, float p0, float p1,
+                                 float p2, unsigned int as, unsigned int bs, unsigned int os) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t t = blockIdx.y;
+    if (i >= n) return;
+    float v = a[t * as + i];
+    float* o = out + t * os + i;
+    if (kind == 0) *o = v * p0;
+    else if (kind == 1) *o = tanhf(v / p0) * p0;
+    else if (kind == 2) *o = (v * p0 + b[t * bs + i] * p1) * p2;
+    else { float u = v * p0; *o = u / (1.0f + expf(-u)); }
+}
+
+// `dqk_rope` per token: grid (nh + 2 nkv, tokens). Token j is at position sp[4 j]; its RoPE row
+// is 2 half_rot floats after the previous one's, its kout / vout rows nkv hd.
+extern "C" __global__ void dqk_rope_t(const float* qkv, float* qo, float* kc, float* vc, float* kout, float* vout, const float* qn,
+                                      const float* kn, const float* cs, const unsigned int* sp, DQP p, unsigned int qs, unsigned int os) {
+    __shared__ float buf[512];
+    __shared__ float red[32];
+    size_t tok = blockIdx.y;
+    qkv += tok * qs;
+    qo += tok * os;
+    cs += tok * 2 * p.half_rot;
+    unsigned int h = blockIdx.x, i = threadIdx.x, hd = p.hd, pos = sp[4 * tok];
+    size_t row = (size_t)p.nkv * hd;
+    kout += tok * row;
+    vout += tok * row;
+    unsigned int kind = h < p.nh ? 0 : (h < p.nh + p.nkv ? 1 : 2);
+    unsigned int hh = kind == 0 ? h : (kind == 1 ? h - p.nh : h - p.nh - p.nkv);
+    float v = kind == 0 ? qkv[hh * p.q_stride + i]
+            : (kind == 1 || p.v_from_k) ? qkv[p.k_off + hh * hd + i] : qkv[p.v_off + hh * hd + i];
+    bool norm = kind == 0 ? p.has_qn != 0 : (kind == 1 ? p.has_kn != 0 : p.v_norm != 0);
+    if (norm) {
+        float s = dblock_sum(v * v, red);
+        v = v * rsqrtf(s / (float)hd + p.eps);
+        if (kind == 0) v *= qn[i];
+        else if (kind == 1) v *= kn[i];
+    }
+    if (kind == 2) {
+        vc[(size_t)pos * row + hh * hd + i] = v;
+        vout[hh * hd + i] = v;
+        return;
+    }
+    buf[i] = v;
+    __syncthreads();
+    unsigned int hr = p.half_rot;
+    if (i < 2 * hr) {
+        if (p.interleaved) {
+            unsigned int j = i / 2;
+            float c = cs[j], s = cs[hr + j];
+            float x1 = buf[2 * j], x2 = buf[2 * j + 1];
+            v = (i % 2 == 0) ? x1 * c - x2 * s : x2 * c + x1 * s;
+        } else {
+            unsigned int j = i % hr;
+            float c = cs[j], s = cs[hr + j];
+            float x1 = buf[j], x2 = buf[j + hr];
+            v = (i < hr) ? x1 * c - x2 * s : x2 * c + x1 * s;
+        }
+    }
+    if (kind == 0) qo[hh * hd + i] = v;
+    else {
+        kc[(size_t)pos * row + hh * hd + i] = v;
+        kout[hh * hd + i] = v;
+    }
+}
+
+// `dattn_*` for a batch of tokens: grid (head groups, 64 chunks, tokens of the batch); q, out,
+// gate and sp point at the batch's first token, `part` holds nh * 64 * (hd + 2) floats per token
+// of the batch.
+#define DATTNT(D, G) \
+extern "C" __global__ void dattnt_##D##_##G(const float* q, const float* kc, const float* vc, float* out, const float* gate, float* part, \
+                                            const unsigned int* sp, DAP p, unsigned int qs, unsigned int os, unsigned int gs) { \
+    size_t t = blockIdx.z; \
+    dattn_body<D, G>(q + t * qs, kc, vc, out + t * os, gate + t * gs, part + t * p.nh * 64 * (D * 32 + 2), sp + 4 * t, p); }
+DATTNT(2, 1) DATTNT(2, 2) DATTNT(2, 4) DATTNT(2, 8) DATTNT(4, 1) DATTNT(4, 2) DATTNT(4, 4) DATTNT(8, 1) DATTNT(8, 2) DATTNT(16, 1)
+__device__ __forceinline__ void dattn_combine_body(const float* part, float* out, const float* gate, const unsigned int* sp, DAP p,
+                                                   unsigned int hd) {
+    unsigned int len, lo, chunk, nsplit;
+    attn_split(sp, p, len, lo, chunk, nsplit);
+    if (nsplit <= 1) return;
+    const float NEG = -__uint_as_float(0x7f800000u);
+    unsigned int h = blockIdx.x;
+    const float* ph = part + (size_t)h * 64 * (hd + 2);
+    float M = NEG;
+    for (unsigned int s = 0; s < nsplit; s++) M = fmaxf(M, ph[s * (hd + 2) + hd]);
+    float L = 0.f;
+    for (unsigned int s = 0; s < nsplit; s++) {
+        float ms = ph[s * (hd + 2) + hd];
+        if (ms != NEG) L += ph[s * (hd + 2) + hd + 1] * expf(ms - M);
+    }
+    for (unsigned int i = threadIdx.x; i < hd; i += blockDim.x) {
+        float acc = 0.f;
+        for (unsigned int s = 0; s < nsplit; s++) {
+            float ms = ph[s * (hd + 2) + hd];
+            if (ms != NEG) acc += ph[s * (hd + 2) + i] * expf(ms - M);
+        }
+        float r = acc / L;
+        if (p.has_gate) r *= dsig(gate[h * p.g_stride + i]);
+        out[h * hd + i] = r;
+    }
+}
+extern "C" __global__ void dattn_combine_t(const float* part, float* out, const float* gate, const unsigned int* sp, DAP p, unsigned int hd,
+                                           unsigned int os, unsigned int gs) {
+    size_t t = blockIdx.y;
+    dattn_combine_body(part + t * p.nh * 64 * (hd + 2), out + t * os, gate + t * gs, sp + 4 * t, p, hd);
+}
+
+// `dgdn_conv` over nt tokens in order, a thread per channel keeping the channel's history
+// (kc <= 9) in registers.
+extern "C" __global__ void dgdn_conv_t(const float* x, float* out, float* st, const float* w, unsigned int dim, unsigned int kc,
+                                       unsigned int nt, unsigned int xs, unsigned int os) {
+    unsigned int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= dim) return;
+    float h[8], wk[9];
+    for (unsigned int j = 0; j + 1 < kc; j++) h[j] = st[j * dim + ch];
+    for (unsigned int j = 0; j < kc; j++) wk[j] = w[ch * kc + j];
+    for (size_t t = 0; t < nt; t++) {
+        float xv = x[t * xs + ch];
+        float s = 0.f;
+        for (unsigned int j = 0; j + 1 < kc; j++) s += wk[j] * h[j];
+        s += wk[kc - 1] * xv;
+        out[t * os + ch] = s / (1.0f + expf(-s));
+        for (unsigned int j = 0; j + 2 < kc; j++) h[j] = h[j + 1];
+        h[kc - 2] = xv;
+    }
+    for (unsigned int j = 0; j + 1 < kc; j++) st[j * dim + ch] = h[j];
+}
+
+// `dgdn_rule` over nt tokens in order: the state stays in the threads' registers between tokens
+// (read once before the first, written once after the last).
+__device__ __forceinline__ void dgdn_rule_t_body(const float* c, const float* z, const float* b, const float* a, float* out,
+                                                 float* state, const float* cst, DGR p, unsigned int nt, unsigned int cs, unsigned int zs,
+                                                 unsigned int bs, unsigned int as, unsigned int os) {
+    __shared__ float qs[256], ks[256], red[1024], red2[32];
+    unsigned int hv = blockIdx.x, tid = threadIdx.x;
+    unsigned int hdk = p.hdk, hdv = p.hdv, np = hdk / 32;
+    unsigned int hk = (p.flags & 1u) ? hv % p.nk : hv / (p.nv / p.nk);
+    unsigned int part = tid / hdv, j = tid % hdv;
+    float* S = state + (size_t)hv * hdk * hdv + part * 32 * hdv + j;
+    float s[32];
+    for (unsigned int d = 0; d < 32; d++) s[d] = S[d * hdv];
+    for (size_t t = 0; t < nt; t++) {
+        const float* ct = c + t * cs;
+        float q = 0.f, k = 0.f;
+        if (tid < hdk) {
+            q = ct[hk * hdk + tid];
+            k = ct[p.key_dim + hk * hdk + tid];
+            qs[tid] = q;
+            ks[tid] = k;
+        }
+        float qinv = 1.0f / sqrtf(dtg_sum(q * q, hdk, red2) + 1e-6f) * p.qscale;
+        float kinv = 1.0f / sqrtf(dtg_sum(k * k, hdk, red2) + 1e-6f);
+        float beta = 1.0f / (1.0f + expf(-b[t * bs + hv]));
+        float ga = a[t * as + hv] + cst[p.nv + hv];
+        float spl = ga > 20.f ? ga : logf(1.0f + expf(ga));
+        float decay = expf(cst[hv] * spl);
+        float kv = 0.f;
+        for (unsigned int d = 0; d < 32; d++) {
+            s[d] = s[d] * decay;
+            kv += s[d] * (ks[part * 32 + d] * kinv);
+        }
+        red[part * hdv + j] = kv;
+        __syncthreads();
+        float kvm = 0.f;
+        for (unsigned int i = 0; i < np; i++) kvm += red[i * hdv + j];
+        float delta = (ct[2 * p.key_dim + hv * hdv + j] - kvm) * beta;
+        float o = 0.f;
+        for (unsigned int d = 0; d < 32; d++) {
+            s[d] += (ks[part * 32 + d] * kinv) * delta;
+            o += s[d] * (qs[part * 32 + d] * qinv);
+        }
+        __syncthreads();
+        red[part * hdv + j] = o;
+        __syncthreads();
+        float ov = 0.f;
+        if (tid < hdv)
+            for (unsigned int i = 0; i < np; i++) ov += red[i * hdv + j];
+        float r = rsqrtf(dtg_sum(ov * ov, hdv, red2) / (float)hdv + p.eps);
+        if (tid < hdv) {
+            float zz = z[t * zs + hv * hdv + j];
+            out[t * os + hv * hdv + j] = ov * r * cst[2 * p.nv + j] * ((p.flags & 2u) ? dsig(zz) : zz / (1.0f + expf(-zz)));
+        }
+    }
+    for (unsigned int d = 0; d < 32; d++) S[d * hdv] = s[d];
+}
+// Blocks of up to 512 threads (hdk / 32 * hdv; the registers a thread may take depend on it), or
+// up to 1024.
+extern "C" __global__ void __launch_bounds__(512) dgdn_rule_t(const float* c, const float* z, const float* b, const float* a, float* out,
+                                                              float* state, const float* cst, DGR p, unsigned int nt, unsigned int cs,
+                                                              unsigned int zs, unsigned int bs, unsigned int as, unsigned int os) {
+    dgdn_rule_t_body(c, z, b, a, out, state, cst, p, nt, cs, zs, bs, as, os);
+}
+extern "C" __global__ void __launch_bounds__(1024) dgdn_rule_t1k(const float* c, const float* z, const float* b, const float* a, float* out,
+                                                                 float* state, const float* cst, DGR p, unsigned int nt, unsigned int cs,
+                                                                 unsigned int zs, unsigned int bs, unsigned int as, unsigned int os) {
+    dgdn_rule_t_body(c, z, b, a, out, state, cst, p, nt, cs, zs, bs, as, os);
+}

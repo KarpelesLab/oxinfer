@@ -23,7 +23,7 @@
 //! GGUF weights in the ternary / 1-bit formats or in MoE experts, and graphs whose weights do not
 //! all fit in VRAM (`OXINFER_GPU_PLAN_DEBUG=1` says which op).
 
-use super::{Cu, CudaBackend, CudaWeight, CudaWeightBox, Wg};
+use super::{Cu, CudaBackend, CudaWeight, CudaWeightBox, GemmP, Wg};
 use crate::gpu::WeightRef;
 use crate::gpu::decode::{DecodePlan, Ew, Graph, LinMode, Op, Slot, Step, View};
 use std::ffi::c_void;
@@ -37,6 +37,14 @@ const MV_ROWS: u32 = 4;
 const MV_NR: u32 = 4;
 /// Most tokens of a multi-token plan (the multi-token matvec's register tiles).
 const MAX_TOKENS: usize = 16;
+/// Most tokens of a prefill plan's step, and the default (`OXINFER_CUDA_PREFILL_TOKENS`): the
+/// arena keeps every activation of a step (about 0.4 MB per token for Qwen3.8-27B).
+const PF_MAX_TOKENS: usize = 2048;
+const PF_TOKENS: usize = 512;
+/// Tokens per attention launch of a prefill plan (the split partials are kept per token).
+const PF_ATTN: usize = 32;
+/// Prefill plans take the GEMM from this many tokens on (a matvec per token below).
+const PF_GEMM_MIN: usize = 8;
 
 /// Pointers to the kernel arguments, for `cuLaunchKernel` (in one statement with the launch, so
 /// temporaries outlive it).
@@ -175,9 +183,9 @@ enum COp {
         gate: P,
     },
     /// A matvec over a ggml block format (`mv_K`): mode 0 stores, 1 adds; every token of the step
-    /// in one launch.
+    /// in one launch. `fg`: the GEMM (`gemmi_K`) prefill plans take instead.
     Gmv {
-        f: F,
+        k: super::GgKernels,
         w: Wg,
         x: P,
         y: P,
@@ -247,6 +255,8 @@ enum COp {
     },
     Attn {
         f: F,
+        /// The kernel over a batch of tokens (prefill plans; else null).
+        ft: F,
         combine: F,
         q: P,
         out: P,
@@ -439,6 +449,21 @@ pub(super) struct CudaPlan<'b> {
     strengths: (u64, Vec<crate::lora::Strength>),
     /// The shared expert weights the plan reads.
     _cached: Vec<super::CacheRefs>,
+    /// A prefill plan: the kernels over every token of a step.
+    pf: Option<PfFuncs>,
+}
+
+/// `dglu_t`, `dew_t`, `dqk_rope_t`, `dattn_combine_t`, `dgdn_conv_t`, `dgdn_rule_t` and
+/// `dgdn_rule_t1k` (blocks of more than 512 threads).
+#[derive(Clone, Copy)]
+struct PfFuncs {
+    glu: F,
+    ew: F,
+    qk: F,
+    combine: F,
+    conv: F,
+    rule: F,
+    rule1k: F,
 }
 unsafe impl Send for CudaPlan<'_> {}
 unsafe impl Sync for CudaPlan<'_> {}
@@ -620,7 +645,24 @@ impl CudaBackend {
 
     /// Compiles `g` for steps of up to `tokens` tokens (1: the single-token plan).
     pub(super) fn build_plan(&self, g: &Graph, tokens: usize) -> Option<CudaPlan<'_>> {
-        if !self.bind() || g.params.is_some() || tokens == 0 || tokens > MAX_TOKENS {
+        self.build_plan_mode(g, tokens, false)
+    }
+
+    /// Compiles `g` as a prefill plan (`Backend::decode_plan_prefill`): steps of up to
+    /// `OXINFER_CUDA_PREFILL_TOKENS` tokens (default 512, at most `tokens`), the matmuls as
+    /// tensor-core GEMMs over the stored GGUF blocks and every other op over all the step's
+    /// tokens in one launch (attention in batches). Graphs with weights in other formats are
+    /// declined (their prompts keep the op-by-op path).
+    pub(super) fn build_plan_pf(&self, g: &Graph, tokens: usize) -> Option<CudaPlan<'_>> {
+        let n = std::env::var("OXINFER_CUDA_PREFILL_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(PF_TOKENS);
+        self.build_plan_mode(g, tokens.min(n).clamp(2, PF_MAX_TOKENS), true)
+    }
+
+    fn build_plan_mode(&self, g: &Graph, tokens: usize, pf: bool) -> Option<CudaPlan<'_>> {
+        if !self.bind() || g.params.is_some() || tokens == 0 || (!pf && tokens > MAX_TOKENS) {
             return None;
         }
         let mt = tokens > 1;
@@ -753,9 +795,9 @@ impl CudaBackend {
                                 return None;
                             }
                             let (k, wg) = Wg::of(cw)?;
-                            let mut mv = |f: F, w: Wg, y: P, mode: u32| {
+                            let mut mv = |k: super::GgKernels, w: Wg, y: P, mode: u32| {
                                 ops.push(COp::Gmv {
-                                    f,
+                                    k,
                                     w,
                                     x: byte(x),
                                     y,
@@ -765,15 +807,15 @@ impl CudaBackend {
                                 })
                             };
                             match (mode, w2) {
-                                (LinMode::Store, None) => mv(k.mv, wg, byte(y), 0),
-                                (LinMode::Add, None) => mv(k.mv, wg, byte(y), 1),
+                                (LinMode::Store, None) => mv(k, wg, byte(y), 0),
+                                (LinMode::Add, None) => mv(k, wg, byte(y), 1),
                                 (LinMode::SiluPair | LinMode::GeluPair, Some((WeightRef::Gguf(_), d2))) => {
                                     let (k2, wg2) = Wg::of(&d2.downcast_ref::<CudaWeightBox>()?.0)?;
                                     let ts = if mt { n_out.next_multiple_of(64) } else { n_out };
                                     pair_floats = pair_floats.max(ts);
                                     let gate = P { a: G, ts: (ts * 4) as u64 };
-                                    mv(k.mv, wg, gate, 0);
-                                    mv(k2.mv, wg2, byte(y), 0);
+                                    mv(k, wg, gate, 0);
+                                    mv(k2, wg2, byte(y), 0);
                                     ops.push(COp::Glu {
                                         f: self.func("dglu")?,
                                         g: gate,
@@ -786,6 +828,10 @@ impl CudaBackend {
                                 _ => return None,
                             }
                             continue;
+                        }
+                        // Prefill plans have GEMMs for the GGUF formats only.
+                        if pf {
+                            return None;
                         }
                         let name = fmt(w)?;
                         let cw2 = match w2 {
@@ -985,7 +1031,7 @@ impl CudaBackend {
                         if g.kv.get(kv) != Some(&(nkv, hd)) {
                             return None;
                         }
-                        part_floats = part_floats.max(nh * ATTN_SPLIT * (hd + 2));
+                        part_floats = part_floats.max(nh * ATTN_SPLIT * (hd + 2) * if pf { PF_ATTN } else { 1 });
                         let rep = nh / nkv;
                         let grp = [8, 4, 2, 1]
                             .into_iter()
@@ -997,6 +1043,11 @@ impl CudaBackend {
                         };
                         ops.push(COp::Attn {
                             f: self.func(&format!("dattn_{d}_{grp}"))?,
+                            ft: if pf {
+                                self.func(&format!("dattnt_{d}_{grp}"))?
+                            } else {
+                                std::ptr::null_mut()
+                            },
                             combine: self.func("dattn_combine")?,
                             q: byte(q),
                             out: byte(out),
@@ -1017,7 +1068,7 @@ impl CudaBackend {
                         });
                     }
                     Op::GdnConv { x, out, state, w, dim, kc } => {
-                        if kc < 2 || w.len() != dim * kc || g.states.get(state) != Some(&((kc - 1) * dim)) {
+                        if kc < 2 || w.len() != dim * kc || g.states.get(state) != Some(&((kc - 1) * dim)) || (pf && kc > 9) {
                             return None;
                         }
                         ops.push(COp::GdnConv {
@@ -1028,7 +1079,7 @@ impl CudaBackend {
                             w: cst(w),
                             dim: dim as u32,
                             kc: kc as u32,
-                            save: if mt { save(dim) } else { P::default() },
+                            save: if mt && !pf { save(dim) } else { P::default() },
                         });
                     }
                     Op::GdnRule(ref r) => {
@@ -1068,7 +1119,7 @@ impl CudaBackend {
                                 hdv: r.hdv as u32,
                             },
                             threads: (r.hdk / 32 * r.hdv) as u32,
-                            save: if mt { lens.map(&mut save) } else { [P::default(); 4] },
+                            save: if mt && !pf { lens.map(&mut save) } else { [P::default(); 4] },
                             lens: lens.map(|n| n as u32),
                         });
                     }
@@ -1223,6 +1274,17 @@ impl CudaBackend {
         let part_off = region(part_floats.max(1) * 4);
         let pair_off = region(pair_floats.max(1) * tokens * 4);
         let save_off: Vec<usize> = saves.iter().map(|&n| region(n * 4)).collect();
+        if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
+            let (mut free, mut all) = (0usize, 0usize);
+            unsafe { self.cu.cuMemGetInfo_v2(&mut free, &mut all) };
+            debug(&format!(
+                "plan of {tokens} token(s){}: arena {} MB, {} of {} MB of VRAM free",
+                if pf { " (prefill)" } else { "" },
+                total >> 20,
+                free >> 20,
+                all >> 20
+            ));
+        }
         let Some(arena) = self.alloc_zeroed(total) else {
             debug("no VRAM for the activation arena");
             free(&owned);
@@ -1312,6 +1374,19 @@ impl CudaBackend {
             last_writer,
             strengths: (arena + str_off as u64, g.strengths.clone()),
             _cached: cached,
+            pf: if pf {
+                Some(PfFuncs {
+                    glu: self.func("dglu_t")?,
+                    ew: self.func("dew_t")?,
+                    qk: self.func("dqk_rope_t")?,
+                    combine: self.func("dattn_combine_t")?,
+                    conv: self.func("dgdn_conv_t")?,
+                    rule: self.func("dgdn_rule_t")?,
+                    rule1k: self.func("dgdn_rule_t1k")?,
+                })
+            } else {
+                None
+            },
             pinned: {
                 let n: usize = g.states.iter().sum();
                 let mut p: *mut c_void = std::ptr::null_mut();
@@ -1332,6 +1407,11 @@ impl CudaPlan<'_> {
         for (i, (m, c)) in slot.kv.iter_mut().zip(kv.iter_mut()).enumerate() {
             let row = self.kv[i].0 * self.kv[i].1;
             if c.len != pos || c.n_kv * c.hd != row {
+                debug(&format!(
+                    "KV cache {i} holds {} positions of {} floats, the step expects {pos} of {row}",
+                    c.len,
+                    c.n_kv * c.hd
+                ));
                 return false;
             }
             // A truncation (rewind) since the last step invalidates the copy from there on.
@@ -1340,6 +1420,7 @@ impl CudaPlan<'_> {
                 let cap = (pos + t).next_power_of_two().max(256);
                 let bytes = cap * row * 4;
                 let (Some(k), Some(v)) = (self.be.alloc_zeroed(bytes), self.be.alloc_zeroed(bytes)) else {
+                    debug(&format!("no VRAM for KV cache {i} ({} MB)", (2 * bytes) >> 20));
                     return false;
                 };
                 unsafe {
@@ -1441,7 +1522,7 @@ impl CudaPlan<'_> {
                 )
             }
             COp::Gmv {
-                f,
+                k,
                 w,
                 x,
                 y,
@@ -1450,7 +1531,7 @@ impl CudaPlan<'_> {
                 mode,
             } => {
                 let (x, y, one) = (x.at(j), y.at(j), 0u32);
-                be.launch(f, (n_out.div_ceil(8), 1), 256, &mut args![w, x, y, n_in, n_out, one, one, mode])
+                be.launch(k.mv, (n_out.div_ceil(8), 1), 256, &mut args![w, x, y, n_in, n_out, one, one, mode])
             }
             COp::Topk {
                 f,
@@ -1595,6 +1676,7 @@ impl CudaPlan<'_> {
                 p,
                 grp,
                 hd,
+                ..
             } => {
                 let m = &slot.kv[kv];
                 let (q, out, gate, part) = (q.at(j), out.at(j), gate.at(j), self.part);
@@ -1670,10 +1752,148 @@ impl CudaPlan<'_> {
         }
     }
 
+    /// A prefill plan's launch of `op` over the step's `t` tokens at once; None for the ops
+    /// without such a kernel (they run token by token).
+    fn launch_pf(&self, pf: &PfFuncs, op: &COp, slot: &CudaSlot, t: usize) -> Option<bool> {
+        let be = self.be;
+        let tt = t as u32;
+        let st = |p: P| (p.ts / 4) as u32;
+        Some(match *op {
+            COp::Gmv {
+                k,
+                w,
+                x,
+                y,
+                n_out,
+                n_in,
+                mode,
+            } if t >= PF_GEMM_MIN => {
+                let p = GemmP {
+                    x: x.a,
+                    y: y.a,
+                    n_in,
+                    n_out,
+                    rows: tt,
+                    xs: st(x),
+                    ys: st(y),
+                    mode,
+                    ..GemmP::default()
+                };
+                be.gemm_gg_p(k, w, p)
+            }
+            COp::Norm {
+                f,
+                x,
+                out,
+                w,
+                mut p,
+                rows: 1,
+                threads,
+            } => {
+                // A row per token.
+                (p.x_stride, p.o_stride) = (st(x), st(out));
+                let (x, out, w) = (x.a, out.a, w.a);
+                be.launch(f, (tt, 1), threads, &mut args![x, out, w, p])
+            }
+            COp::Glu { g, u, out, n, gelu, .. } => {
+                let (ga, ua, oa, gs, us, os) = (g.a, u.a, out.a, st(g), st(u), st(out));
+                be.launch(pf.glu, (n.div_ceil(256), tt), 256, &mut args![ga, ua, oa, n, gelu, gs, us, os])
+            }
+            COp::Ew { a, b, out, n, kind, p, .. } => {
+                let (aa, ba, oa, sa, sb, so) = (a.a, b.a, out.a, st(a), st(b), st(out));
+                be.launch(
+                    pf.ew,
+                    (n.div_ceil(256), tt),
+                    256,
+                    &mut args![aa, ba, oa, n, kind, p[0], p[1], p[2], sa, sb, so],
+                )
+            }
+            COp::QkRope {
+                qkv,
+                qo,
+                kv,
+                kout,
+                vout,
+                qn,
+                kn,
+                cs,
+                p,
+                ..
+            } => {
+                let (kc, vc) = slot.kv.get(kv).map_or((0, 0), |m| (m.k, m.v));
+                let (qa, oa, ko, vo, qn, kn, cs, sp, qs, os) = (qkv.a, qo.a, kout.a, vout.a, qn.a, kn.a, cs.a, self.sp, st(qkv), st(qo));
+                be.launch(
+                    pf.qk,
+                    (p.nh + 2 * p.nkv, tt),
+                    p.hd,
+                    &mut args![qa, oa, kc, vc, ko, vo, qn, kn, cs, sp, p, qs, os],
+                )
+            }
+            COp::Attn {
+                ft,
+                q,
+                out,
+                kv,
+                gate,
+                p,
+                grp,
+                hd,
+                ..
+            } if !ft.is_null() && p.block == 0 => {
+                let m = &slot.kv[kv];
+                let (qs, os, gs, part) = (st(q), st(out), st(gate), self.part);
+                (0..t).step_by(PF_ATTN).all(|j0| {
+                    let nb = (t - j0).min(PF_ATTN) as u32;
+                    let (qa, oa, ga, sp) = (q.at(j0), out.at(j0), gate.at(j0), self.sp + 16 * j0 as u64);
+                    be.launch3(
+                        ft,
+                        (p.nh / grp, ATTN_SPLIT as u32, nb),
+                        256,
+                        &mut args![qa, m.k, m.v, oa, ga, part, sp, p, qs, os, gs],
+                    ) && be.launch(pf.combine, (p.nh, nb), 256, &mut args![part, oa, ga, sp, p, hd, os, gs])
+                })
+            }
+            COp::GdnConv {
+                x, out, state, w, dim, kc, ..
+            } => {
+                let (xa, oa, sa, w, xs, os) = (x.a, out.a, slot.states[state].0, w.a, st(x), st(out));
+                be.launch(pf.conv, (dim.div_ceil(256), 1), 256, &mut args![xa, oa, sa, w, dim, kc, tt, xs, os])
+            }
+            COp::GdnRule {
+                c,
+                z,
+                b,
+                a,
+                out,
+                state,
+                cst,
+                p,
+                threads,
+                ..
+            } => {
+                let (ca, za, ba, aa, oa, sa, cst) = (c.a, z.a, b.a, a.a, out.a, slot.states[state].0, cst.a);
+                let (cs, zs, bs, as_, os) = (st(c), st(z), st(b), st(a), st(out));
+                be.launch(
+                    if threads > 512 { pf.rule1k } else { pf.rule },
+                    (p.nv, 1),
+                    threads,
+                    &mut args![ca, za, ba, aa, oa, sa, cst, p, tt, cs, zs, bs, as_, os],
+                )
+            }
+            _ => return None,
+        })
+    }
+
     /// Launches `op` over the step's `t` tokens: matvecs at once, the rest token by token; the
     /// recurrent ops keep their inputs first (multi-token plans).
     fn launch_tokens(&self, op: &COp, slot: &CudaSlot, t: usize) -> bool {
         let be = self.be;
+        if let Some(pf) = &self.pf
+            && t > 1
+            && let Some(ok) = self.launch_pf(pf, op, slot, t)
+        {
+            return ok;
+        }
         match *op {
             COp::Mv {
                 fk: Some(fk),
@@ -1700,7 +1920,7 @@ impl CudaPlan<'_> {
                 });
             }
             COp::Gmv {
-                f,
+                k,
                 w,
                 x,
                 y,
@@ -1711,7 +1931,7 @@ impl CudaPlan<'_> {
                 // A grid row per token: each token's sums are the single-token launch's.
                 let (xa, ya, xs, ys) = (x.a, y.a, (x.ts / 4) as u32, (y.ts / 4) as u32);
                 return be.launch(
-                    f,
+                    k.mv,
                     (n_out.div_ceil(8), t as u32),
                     256,
                     &mut args![w, xa, ya, n_in, n_out, xs, ys, mode],
@@ -1822,6 +2042,7 @@ impl DecodePlan for CudaPlan<'_> {
         for (i, op) in self.ops[..end].iter().enumerate() {
             let ts = std::time::Instant::now();
             if !self.launch_tokens(op, ms, t) {
+                debug(&format!("step of {t} token(s): op {i} of {} did not launch", self.ops.len()));
                 return false;
             }
             if per_op {

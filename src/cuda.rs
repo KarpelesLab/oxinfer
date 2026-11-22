@@ -750,12 +750,17 @@ impl CudaBackend {
 
     /// Launches `f` on the default stream; `params` point at each kernel argument.
     fn launch(&self, f: *mut c_void, grid: (u32, u32), block: u32, params: &mut [*mut c_void]) -> bool {
+        self.launch3(f, (grid.0, grid.1, 1), block, params)
+    }
+
+    /// [`Self::launch`] with a three-dimensional grid.
+    fn launch3(&self, f: *mut c_void, grid: (u32, u32, u32), block: u32, params: &mut [*mut c_void]) -> bool {
         let rc = unsafe {
             self.cu.cuLaunchKernel(
                 f,
                 grid.0,
                 grid.1,
-                1,
+                grid.2,
                 block,
                 1,
                 1,
@@ -788,11 +793,14 @@ impl CudaBackend {
         if let Some(k) = self.gg.lock().unwrap().get(&id) {
             return *k;
         }
-        let src = format!(
-            "#define GGML_ONLY 1\n#define HAS_{id} 1\n{}{}",
-            ggml_tables_src(),
-            include_str!("inkling_cuda.cu")
-        );
+        let body = include_str!("inkling_cuda.cu");
+        // Tests may take the kernels from a file (`ggml_bench`: no rebuild per kernel edit).
+        #[cfg(test)]
+        let body = &std::env::var("OXINFER_GGML_CU")
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_else(|| body.to_string());
+        let src = format!("#define GGML_ONLY 1\n#define HAS_{id} 1\n{}{body}", ggml_tables_src());
         let k = match self.cached_module(&src, &format!("ggml-{{sm}}-{id}"), "ggml.cu") {
             Ok(module) => {
                 let get = |name: String| -> Option<*mut c_void> {
@@ -1236,19 +1244,28 @@ impl CudaBackend {
     /// `x` are `n_in` floats apart and rows of `y` `n_out` (`mode` 1 adds).
     #[allow(clippy::too_many_arguments)]
     fn gemm_gg(&self, k: GgKernels, w: Wg, x: u64, n_in: usize, y: u64, n_out: usize, t: usize, mode: u32) -> bool {
-        let p = GemmP {
-            x,
-            y,
-            n_in: n_in as u32,
-            n_out: n_out as u32,
-            rows: t as u32,
-            xs: n_in as u32,
-            ys: n_out as u32,
-            mode,
-            ..GemmP::default()
-        };
+        self.gemm_gg_p(
+            k,
+            w,
+            GemmP {
+                x,
+                y,
+                n_in: n_in as u32,
+                n_out: n_out as u32,
+                rows: t as u32,
+                xs: n_in as u32,
+                ys: n_out as u32,
+                mode,
+                ..GemmP::default()
+            },
+        )
+    }
+
+    /// Queues the GEMM `p` over a ggml matrix (`rows` rows of `x`, `xs` floats apart, into rows
+    /// of `y`, `ys` apart).
+    fn gemm_gg_p(&self, k: GgKernels, w: Wg, p: GemmP) -> bool {
         let mut params = [&w as *const Wg as *mut c_void, &p as *const GemmP as *mut c_void];
-        self.launch(k.gemmi, (n_out.div_ceil(64) as u32, t.div_ceil(64) as u32), 128, &mut params)
+        self.launch(k.gemmi, (p.n_out.div_ceil(64), p.rows.div_ceil(64)), 128, &mut params)
     }
 
     fn ensure_staging(&self, st: &mut Staging, x_bytes: usize, y_bytes: usize) -> bool {
@@ -1879,6 +1896,15 @@ impl Backend for CudaBackend {
         tokens: usize,
     ) -> Option<Box<dyn crate::gpu::decode::DecodePlan + 's>> {
         self.build_plan(g, tokens)
+            .map(|p| Box::new(p) as Box<dyn crate::gpu::decode::DecodePlan + 's>)
+    }
+
+    fn decode_plan_prefill<'s>(
+        &'s self,
+        g: &crate::gpu::decode::Graph,
+        tokens: usize,
+    ) -> Option<Box<dyn crate::gpu::decode::DecodePlan + 's>> {
+        self.build_plan_pf(g, tokens)
             .map(|p| Box::new(p) as Box<dyn crate::gpu::decode::DecodePlan + 's>)
     }
 
@@ -2766,6 +2792,335 @@ mod tests {
         let bytes = random_blocks(TQ2_0, n_out * n_in / TQ2_0.block_size(), &mut seed);
         let m = GgufMatrix::from_bytes(TQ2_0, &bytes, n_out, n_in).unwrap();
         assert!(be.upload_weight(&WeightRef::Gguf(&m)).is_none());
+    }
+
+    /// A decode graph over GGUF weights (an attention layer with gated heads and a gate / up
+    /// pair, a Gated DeltaNet layer) as a single-token plan, a multi-token plan and a prefill
+    /// plan: the multi-token plan's steps give the single-token steps' bits, the prefill plan's
+    /// (GEMMs, the other ops over all tokens at once, steps that start at a later position and
+    /// end inside a token tile) their values up to the GEMMs' rounding, for the hidden states,
+    /// the keys and values and the recurrent states.
+    #[test]
+    fn ggml_plans_match_single_token_steps() {
+        use crate::ggml::{GgmlType, GgufMatrix, random_blocks};
+        use crate::gpu::decode::{DecodePlan, GdnRule, Graph, LinMode, Op, Slot, Step};
+        use crate::model::LayerCache;
+        use GgmlType::*;
+        let Some(be) = backend() else { return };
+        let (h, nh, nkv, hd, inter) = (256usize, 4usize, 2usize, 64usize, 512usize);
+        let (nk, nv, hdk, hdv, kc) = (2usize, 4usize, 32usize, 32usize, 4usize);
+        let (key_dim, value_dim) = (nk * hdk, nv * hdv);
+        let conv_dim = 2 * key_dim + value_dim;
+        let qw = 2 * nh * hd;
+        let mut seed = 99u64;
+        // (format, rows, columns, factor on the outputs: keeps the activations near 1).
+        let specs = [
+            (Q4_K, qw, h, 0.02f32),
+            (Q8_0, nkv * hd, h, 0.02),
+            (IQ4_XS, nkv * hd, h, 0.02),
+            (Q6_K, h, nh * hd, 0.02),
+            (IQ3_S, inter, h, 0.02),
+            (IQ3_S, inter, h, 0.02),
+            (Q5_K, h, inter, 0.02),
+            (Q3_K, conv_dim, h, 0.02),
+            (Q4_0, value_dim, h, 0.05),
+            (F32, nv, h, 1.0),
+            (Q8_0, nv, h, 0.05),
+            (Q4_0, h, value_dim, 0.05),
+        ];
+        let ms: Vec<GgufMatrix> = specs
+            .iter()
+            .map(|&(kind, n_out, n_in, f)| {
+                let bytes = random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed);
+                let mut m = GgufMatrix::from_bytes(kind, &bytes, n_out, n_in).unwrap();
+                if !kind.is_float() {
+                    m.set_factor(f).unwrap();
+                }
+                m
+            })
+            .collect();
+        let devs: Vec<DeviceWeight> = ms
+            .iter()
+            .map(|m| be.upload(&WeightRef::Gguf(m), m.n_out, m.n_in).expect("device weight"))
+            .collect();
+        let ones = vec![1f32; h];
+        let qn: Vec<f32> = (0..hd).map(|_| 1.0 + rnd(&mut seed) * 0.2).collect();
+        let conv_w: Vec<f32> = (0..conv_dim * kc).map(|_| rnd(&mut seed)).collect();
+        let decay: Vec<f32> = (0..nv).map(|_| -0.5 - rnd(&mut seed).abs()).collect();
+        let dt_bias: Vec<f32> = (0..nv).map(|_| rnd(&mut seed)).collect();
+        let norm_w: Vec<f32> = (0..hdv).map(|_| 1.0 + rnd(&mut seed) * 0.2).collect();
+        let mut g = Graph::new();
+        let x = g.buf(h);
+        let hn = g.buf(h);
+        let qkv = g.buf(qw + 2 * nkv * hd);
+        let qo = g.buf(nh * hd);
+        let att = g.buf(nh * hd);
+        let act = g.buf(inter);
+        let gproj = g.buf(conv_dim + value_dim + 2 * nv);
+        let gconv = g.buf(conv_dim);
+        let gout = g.buf(value_dim);
+        let hidden = g.buf(h);
+        (g.input, g.hidden, g.n_hidden) = (x, hidden, h);
+        g.rope_halves = vec![hd / 2];
+        g.kv = vec![(nkv, hd)];
+        g.states = vec![nv * hdk * hdv, (kc - 1) * conv_dim];
+        let lin = |i: usize, x, y, mode| Op::Linear {
+            w: WeightRef::Gguf(&ms[i]),
+            dev: &devs[i],
+            w2: None,
+            n_out: ms[i].n_out,
+            n_in: ms[i].n_in,
+            x,
+            y,
+            mode,
+        };
+        g.ops.push(Op::norm(x, hn, &ones, h, 1e-6));
+        g.ops.push(lin(0, hn, qkv, LinMode::Store));
+        g.ops.push(lin(1, hn, qkv.at(qw), LinMode::Store));
+        g.ops.push(lin(2, hn, qkv.at(qw + nkv * hd), LinMode::Store));
+        g.ops.push(Op::QkRope {
+            qkv,
+            q_out: qo,
+            kv: 0,
+            nh,
+            nkv,
+            hd,
+            half_rot: hd / 2,
+            q_stride: 2 * hd,
+            k_off: qw,
+            v_off: qw + nkv * hd,
+            interleaved: false,
+            q_norm: Some(&qn),
+            k_norm: Some(&qn),
+            eps: 1e-6,
+            rope: 0,
+            v_norm: false,
+            v_from_k: false,
+        });
+        g.ops.push(Op::Attend {
+            q: qo,
+            out: att,
+            kv: 0,
+            nh,
+            nkv,
+            hd,
+            scale: 0.05,
+            window: None,
+            gate: Some((qkv.at(hd), 2 * hd)),
+            block: None,
+        });
+        g.ops.push(lin(3, att, x, LinMode::Add));
+        g.ops.push(Op::norm(x, hn, &ones, h, 1e-6));
+        g.ops.push(Op::Linear {
+            w: WeightRef::Gguf(&ms[4]),
+            dev: &devs[4],
+            w2: Some((WeightRef::Gguf(&ms[5]), &devs[5])),
+            n_out: inter,
+            n_in: h,
+            x: hn,
+            y: act,
+            mode: LinMode::SiluPair,
+        });
+        g.ops.push(lin(6, act, x, LinMode::Add));
+        g.ops.push(Op::norm(x, hn, &ones, h, 1e-6));
+        g.ops.push(lin(7, hn, gproj, LinMode::Store));
+        g.ops.push(lin(8, hn, gproj.at(conv_dim), LinMode::Store));
+        g.ops.push(lin(9, hn, gproj.at(conv_dim + value_dim), LinMode::Store));
+        g.ops.push(lin(10, hn, gproj.at(conv_dim + value_dim + nv), LinMode::Store));
+        g.ops.push(Op::GdnConv {
+            x: gproj,
+            out: gconv,
+            state: 1,
+            w: &conv_w,
+            dim: conv_dim,
+            kc,
+        });
+        g.ops.push(Op::GdnRule(GdnRule {
+            c: gconv,
+            z: gproj.at(conv_dim),
+            b: gproj.at(conv_dim + value_dim),
+            a: gproj.at(conv_dim + value_dim + nv),
+            out: gout,
+            state: 0,
+            nk,
+            nv,
+            hdk,
+            hdv,
+            tiled: true,
+            sigmoid_gate: false,
+            decay_coef: &decay,
+            dt_bias: &dt_bias,
+            norm_w: &norm_w,
+            eps: 1e-6,
+        }));
+        g.ops.push(lin(11, gout, x, LinMode::Add));
+        g.ops.push(Op::norm(x, hidden, &ones, h, 1e-6));
+        g.head_from = g.ops.len();
+
+        // 107 tokens: more than three attention batches, and a partial GEMM tile.
+        let n = 107usize;
+        let xin: Vec<f32> = (0..n * h).map(|_| rnd(&mut seed) * 2.0).collect();
+        let half = hd / 2;
+        let cs: Vec<f32> = (0..n)
+            .flat_map(|p| {
+                let ang = move |j: usize| p as f32 * 0.37f32.powf(j as f32 / half as f32);
+                (0..half).map(move |j| ang(j).cos()).chain((0..half).map(move |j| ang(j).sin()))
+            })
+            .collect();
+        // Runs the tokens in steps of the given sizes: hidden states, keys, values, states.
+        let run = |plan: &dyn DecodePlan, steps: &[usize]| -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+            let mut slot = Slot(None);
+            let mut cache = LayerCache::new(nkv, hd);
+            let mut s0 = vec![0f32; nv * hdk * hdv];
+            let mut s1 = vec![0f32; (kc - 1) * conv_dim];
+            let mut hs = vec![0f32; n * h];
+            let mut pos = 0;
+            for &t in steps {
+                let mut kv = [&mut cache];
+                let mut states: [&mut [f32]; 2] = [&mut s0, &mut s1];
+                assert!(
+                    plan.step(
+                        &mut slot,
+                        Step {
+                            pos,
+                            t,
+                            rope_cs: &cs[pos * hd..(pos + t) * hd],
+                            x: &xin[pos * h..(pos + t) * h],
+                            x2: &[],
+                            kv: &mut kv,
+                            states: &mut states,
+                            hidden: &mut hs[pos * h..(pos + t) * h],
+                            logits: None,
+                            params: None,
+                            capture: None,
+                            scratch: false,
+                            states_kept: false,
+                        },
+                    ),
+                    "step of {t} tokens at {pos}"
+                );
+                pos += t;
+            }
+            assert_eq!(pos, n);
+            let (k, v) = cache.data();
+            s0.extend_from_slice(&s1);
+            (hs, k.to_vec(), v.to_vec(), s0)
+        };
+        let one = be.build_plan(&g, 1).expect("single-token plan");
+        let multi = be.build_plan(&g, 8).expect("multi-token plan");
+        let pf = be.build_plan_pf(&g, 2048).expect("prefill plan");
+        let r1 = run(&one, &vec![1; n]);
+        assert!(r1.0.iter().all(|v| v.is_finite()) && r1.0.iter().any(|&v| v.abs() > 0.1));
+        // Multi-token steps: a grid row per token of the same kernels.
+        let rm = run(&multi, &[8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 3]);
+        for (what, a, b) in [
+            ("hidden", &r1.0, &rm.0),
+            ("keys", &r1.1, &rm.1),
+            ("values", &r1.2, &rm.2),
+            ("states", &r1.3, &rm.3),
+        ] {
+            assert!(
+                a.iter().zip(b).all(|(p, q)| p.to_bits() == q.to_bits()),
+                "multi-token plan: {what} differ from single-token steps"
+            );
+        }
+        // Prefill steps: 40 tokens, then 67 on top of them (GEMMs from 8 tokens on).
+        let rp = run(&pf, &[40, 67]);
+        for (what, a, b) in [
+            ("hidden", &r1.0, &rp.0),
+            ("keys", &r1.1, &rp.1),
+            ("values", &r1.2, &rp.2),
+            ("states", &r1.3, &rp.3),
+        ] {
+            let scale = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let worst = a.iter().zip(b).fold(0f32, |m, (p, q)| m.max((p - q).abs()));
+            assert!(
+                worst <= 2e-4 * scale,
+                "prefill plan: {what} differ by {worst:.2e} (largest value {scale:.2e})"
+            );
+        }
+    }
+
+    /// `cargo test --profile ci --lib ggml_bench -- --ignored --nocapture`: the ggml matvec (GB/s
+    /// of weights read) and GEMM (TFLOP/s at 512 tokens) on matrices of Qwen3.8-27B's shapes.
+    /// `OXINFER_GGML_CU=file` compiles the kernels from a file, `BENCH_KINDS=23,21` picks formats.
+    #[test]
+    #[ignore]
+    fn ggml_bench() {
+        use crate::ggml::{GgmlType, GgufMatrix, random_blocks};
+        let Some(be) = backend() else { return };
+        assert!(be.bind());
+        let kinds: Vec<u32> = std::env::var("BENCH_KINDS")
+            .map(|v| v.split(',').map(|k| k.parse().unwrap()).collect())
+            .unwrap_or_else(|_| vec![23, 21, 12]);
+        let t = 512usize;
+        let mut seed = 5;
+        for id in kinds {
+            let kind = GgmlType::from_id(id).unwrap();
+            for (n_out, n_in) in [(17408usize, 5120usize), (5120, 17408)] {
+                let bytes = random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed);
+                let m = GgufMatrix::from_bytes(kind, &bytes, n_out, n_in).unwrap();
+                let cw = be.upload_weight(&WeightRef::Gguf(&m)).unwrap();
+                let (k, w) = Wg::of(&cw).unwrap();
+                let x: Vec<f32> = (0..t * n_in).map(|_| rnd(&mut seed)).collect();
+                let dx = be.upload_bytes(x.as_ptr() as *const u8, x.len() * 4).unwrap();
+                let mut dy = 0u64;
+                assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut dy, t * n_out * 4) }, 0);
+                let sync = || assert_eq!(unsafe { be.cu.cuCtxSynchronize() }, 0);
+                let (ni, no, zero) = (n_in as u32, n_out as u32, 0u32);
+                let mv = || {
+                    let mut args = [
+                        &w as *const _ as *mut c_void,
+                        &dx as *const _ as *mut c_void,
+                        &dy as *const _ as *mut c_void,
+                        &ni as *const _ as *mut c_void,
+                        &no as *const _ as *mut c_void,
+                        &zero as *const _ as *mut c_void,
+                        &zero as *const _ as *mut c_void,
+                        &zero as *const _ as *mut c_void,
+                    ];
+                    assert!(be.launch(k.mv, (no.div_ceil(8), 1), 256, &mut args));
+                };
+                let p = GemmP {
+                    x: dx,
+                    y: dy,
+                    n_in: ni,
+                    n_out: no,
+                    rows: t as u32,
+                    xs: ni,
+                    ys: no,
+                    ..GemmP::default()
+                };
+                let gemm = || assert!(be.gemm_gg_p(k, w, p));
+                mv();
+                gemm();
+                sync();
+                let t0 = Instant::now();
+                for _ in 0..50 {
+                    mv();
+                }
+                sync();
+                let mv_s = t0.elapsed().as_secs_f64() / 50.0;
+                let t0 = Instant::now();
+                for _ in 0..5 {
+                    gemm();
+                }
+                sync();
+                let g_s = t0.elapsed().as_secs_f64() / 5.0;
+                eprintln!(
+                    "{kind} {n_out} x {n_in}: matvec {:.0} us = {:.0} GB/s; gemm of {t} tokens {:.2} ms = {:.1} TFLOP/s",
+                    mv_s * 1e6,
+                    (n_out * m.row_bytes()) as f64 / mv_s / 1e9,
+                    g_s * 1e3,
+                    2.0 * (t * n_out * n_in) as f64 / g_s / 1e12
+                );
+                be.free_weight(&cw);
+                unsafe {
+                    be.cu.cuMemFree_v2(dx);
+                    be.cu.cuMemFree_v2(dy);
+                }
+            }
+        }
     }
 
     /// `cargo test --release --lib decode_matvec_bench -- --ignored --nocapture`: the decode
