@@ -118,7 +118,7 @@ optional.
 | [Gemma 4 26B-A4B](docs/gemma-4-26b.md) | the mixture-of-experts Gemma 4 |
 | [Qwen3.5 / Qwen3.8](docs/qwen.md) | dense and MoE Qwen, MTP and DSpark speculative decoding |
 | [Mistral Large 4](docs/mistral-large-4.md) | 1T parameters streamed from storage, FP8 on the GPU |
-| [DeepSeek V4 Flash, V4.1 Flash](docs/deepseek-v4.md) | 284B MoE as GGUF; V4.1 (748B with its engram tables) on tiny checkpoints only |
+| [DeepSeek V4 Flash, V4.1 Flash](docs/deepseek-v4.md) | 284B MoE as GGUF; V4.1 (748B with its engram tables) streamed from a 231 GB IQ1_M, long prompts at 66-87 tok/s |
 | [GLM-5.3 and GLM-5.3-Flash](docs/glm.md) | hyper-connections, KDA linear attention, MLA with the DSA indexer; text only |
 | [ERNIE 5.5 Flash Base](docs/ernie.md) | 280B MoE base model (HCA and MLA-DSA attention); on tiny checkpoints only |
 | [Kimi K3.1 Pro, Kimi K3](docs/kimi.md) | 2.8T MoE with linear and sparse attention, on tiny checkpoints only |

@@ -160,10 +160,9 @@ tried (its smallest GGUFs are far beyond this machine's free disk).
 `deepseek-ai/DeepSeek-V4.1-Flash` and `-1017` (`deepseek_v41`; 40 layers of 5120, 384 experts of
 which 6 per token, 510 GB as FP8 with FP4 experts, 197 GB of that two engram tables) run on the
 DeepSeek V4 code (`deepseek41.rs`, a submodule of `deepseek4.rs`), as DeepSeek's own
-`inference/model.py` and `engram.py`. Text only: the vision tower is not implemented. **The real
-weights were never run**: every conversion needs more than the 150 GB this work could download
-(the smallest, with its engram tables, is 183 GB), so what follows was measured on tiny random
-checkpoints and on the headers of the released files. What differs from V4:
+`inference/model.py` and `engram.py`. Text only: the vision tower is not implemented. It was
+checked against DeepSeek's code on tiny random checkpoints, and against llama.cpp on the real
+weights (ISTA-DASLab's IQ1_M build, 231 GB: [below](#on-the-real-weights)). What differs from V4:
 
 - Hyper-connections in one pass: each sublayer computes its `pre` / `post` / `comb` weights from
   the copies entering it but collapses them with the `pre` of the sublayer before it (the first
@@ -204,7 +203,8 @@ and both are read:
   product of the gate's two weights as `blk.N.engram_gate`. ISTA-DASLab's builds count the
   table file among their parts without naming it as one
   (`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`, at the repository's root): it is found beside the
-  parts or one folder up, by its header, but `org/repo:QUANT` does not fetch it.
+  parts or one folder up, by its header, and `org/repo:QUANT` fetches it with the parts (linked
+  under the missing part's name, as llama.cpp opens parts by name).
 - AtomicChat's: the reference's hash buffers as tensors (`engram_token_map`, `engram_primes`,
   `engram_offsets`, `engram_multipliers`), `engram_q` / `engram_k` apart, the config's own key
   names, and the table file named by `deepseek41.engram.file` (the same ISTA-DASLab file, not in
@@ -257,16 +257,92 @@ header values); the tokenizer rebuilt from the GGUF metadata gives the ids of th
 ```sh
 # every part in one folder (233 GB with the engram tables)
 ./target/release/oxinfer --model unsloth/DeepSeek-V4.1-Flash-1017-GGUF:UD-IQ1_S -p "Why is the sky blue?"
-# ISTA-DASLab / AtomicChat: fetch the parts and DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf by hand, then
-./target/release/oxinfer --model DIR/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf --think -p "..."
+# ISTA-DASLab: the parts and the engram file (231 GB), as run below
+./target/release/oxinfer --model ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF:IQ1_M --think -p "..."
+# AtomicChat: its parts and ISTA-DASLab's DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf beside them, then
+./target/release/oxinfer --model DIR/FIRST-PART.gguf -p "..."
 ```
 
-Not done for V4.1: a run on the real weights (so no speed and no comparison with llama.cpp, whose
-`deepseek41` code was not read: the GGUF layouts are known from the released headers and from
-ISTA-DASLab's script only); image input (the ViT with 2D RoPE, the 3x3 aligner and the
+### On the real weights
+
+ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF IQ1_M (120.7 GB of backbone in five parts and
+the 110.6 GB engram file), on an M5 Max with 137 GB of memory, Metal, against llama.cpp master
+(`deepseek41`, CPU) on the same file. The checkpoint does not fit in memory, so it is streamed:
+5.4 GB stays resident, the 115 GB of routed experts are read on demand through a 90 GB page
+cache, and the engram rows are mapped. The process's resident set is about 100 GB (mapped page
+cache); its own memory (peak footprint) is 6.7 GB at 8k tokens and 9.7 GB at 128k.
+
+- Greedy decoding: on six prompts (chat, thinking, French, code, a 560-token wikitext excerpt),
+  the same 33 tokens as llama.cpp at every step (mean KL 0.0002-0.0045, top-20 overlap 19 of
+  20). The chat template renders the same bytes as llama.cpp's Jinja template.
+- Perplexity, wikitext-2 test, 16 chunks of 512 (llama-perplexity's chunking and scoring,
+  `deepseek4_check --ppl`): 2.9751 against llama.cpp's 2.9774, the running value within 0.9% after every chunk;
+  the 287,597 token ids of the whole file are identical. (A first run gave 2.6747: the check
+  put a BOS in front of each chunk while this GGUF says `add_bos_token = false`, which
+  llama-perplexity follows. With a BOS the model predicts this text better; the tool now follows
+  the header.)
+
+Long prompts: a passphrase hidden 2% into wikitext (`Read the following text carefully` ... the
+text ... `What is the secret passphrase?`), chat template, greedy. "Load" is the machine's load
+average at start and end (other jobs shared the machine).
+
+| prompt | prefill | decode | passphrase | peak footprint | load |
+|---|---|---|---|---|---|
+| 7,666 tokens | 86.6 tok/s (89 s) | 13.9 tok/s | found | 6.8 GB | 10.0 / 8.5 |
+| 32,287 | 73.4 tok/s (7.3 min) | 8.7 tok/s | found | 8.2 GB | 3.2 / 16.3 |
+| 126,134 | 65.6 tok/s (32 min) | 8.5 tok/s | found | 9.7 GB | 3.0 / 15.7 |
+
+(Before the cache change below; with it, the 32k prompt reads at 79.4 tok/s. The 126k prompt on
+the code before the GPU attention and the indexer changes: 37.9 tok/s, 55 min.)
+
+(Decode is that of the 9 tokens of the answer, with prompt-lookup drafting; a short prompt on a
+cold page cache decodes at 2.4-5 tok/s, the experts coming from storage.)
+
+Context memory: per position, the window keys of the last 128 positions (a constant), the
+compressed keys of the four key-source layers (512 floats; layers 2, 8 and 14 at rate 2, layer
+20 at rate 1: 5 KiB per position in f32) and their index keys (128 floats: 1.25 KiB), and the
+engram id (4 bytes): **6.25 KiB per position, 6.4 GB at 1,048,576 tokens**, f32 throughout.
+llama.cpp allocates a 40 KiB-per-position window cache (f16, 40 layers) for the whole context
+plus its compressed caches: about 45 GB at 1M.
+
+So a 1M-token context fits beside the streamed weights (5.4 GB resident + 6.4 GB of context +
+the prefill's scratch). Time is the limit: the cost of a prompt token grows slowly with the
+context (the indexers score every compressed key; attention itself reads a fixed 512 chosen
+keys and the window), from about 12.7 ms at the start to 12.7 + 0.041 ms per thousand positions
+(fitted on the per-chunk rates of the 126k run), so 1M tokens take about 10 hours to read, the
+last chunks at ~18 tok/s.
+
+Prefill speed, the changes behind those figures:
+
+- The prefill attention reads, per query, its window and the 512 compressed keys its indexer
+  chose. On the CPU the scores and outputs of 32 queries are GEMMs over the union of their keys
+  (it used to be every compressed key); on Metal (`metal_ds4.rs`), blocks of 256 queries share a
+  table of their keys and each head reads only its query's rows (`OXINFER_DS4_GPU_ATTN=0`: CPU).
+  Same greedy tokens as the CPU path, mean KL < 1e-4. 32k prompt: 41.6 -> 68.6 tok/s.
+- The indexers score blocks of 64 queries against tiles of 8192 keys (the scores held stay
+  bounded at any context), and after V4.1's candidate layer a query scores only the keys of its
+  2048 candidate blocks instead of all of them.
+- Streamed, a prefill chunk of 256 tokens routes to nearly every expert of every layer and reads
+  them again (about 50 GB a chunk): a streamed DeepSeek V4 / V4.1 prefills in chunks of at least
+  2048 tokens (`deepseek4::STREAM_PREFILL_CHUNK`; `--prefill-chunk` / `prefill_chunk` above it
+  are kept). 8k prompt: as fast as 8192-token chunks, with 6.6 GB of peak memory instead of 17.
+- Streamed experts are cached in the page cache up to a budget (90 GB here), least recently used
+  first. A prefill chunk uses nearly every expert of every layer, chunk after chunk: a cycle
+  over 115 GB, in which least-recently-used evicts each expert just before its next use. A pass
+  that uses at least half of a layer's experts now only fills free room in the cache (decode
+  steps keep least-recently-used). 32k prompt, back to back: 79.4 tok/s against 74.6, 82% of the
+  experts needed found cached instead of 51%, 300 GB read from the SSD instead of 717.
+
+Tried and not kept (32k prompt unless said): reading the next layer's 384 experts ahead whole
+during a big pass (8k: 82.9 tok/s against 86.6; 32k: 76.4 against 73.4, but 1840 GB read from the
+SSD instead of 717: the read-ahead defeats the page cache); 8192-token chunks (75.7 tok/s against
+73.4, 441 GB read instead of 717, but 21.6 GB of peak memory instead of 8.2 and a colder cache
+after the prefill).
+
+Not done for V4.1: image input (the ViT with 2D RoPE, the 3x3 aligner and the
 image processor; `mmproj` files are not read; the language model's side is in place and
 verified as above); DSpark (the `mtp.*` stages differ from V4's: 128 experts, a Markov head on the
 target's embedding and head, a confidence head; a `dspark*.gguf` beside the model is ignored and
-`--draft` refused); fetching ISTA-DASLab's table file with `org/repo:QUANT`; the FP8 / FP4
-release; GPU decoding. Runtime interventions use V4's hook points and were not measured on this
+`--draft` refused); the other GGUF builds on their real weights (unsloth's, the Coder and
+AtomicChat builds: headers only); the FP8 / FP4 release; GPU decoding. Runtime interventions use V4's hook points and were not measured on this
 architecture.

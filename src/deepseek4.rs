@@ -169,6 +169,13 @@ pub fn default_stream() -> crate::stream::StreamOptions {
     crate::mistral4::default_stream()
 }
 
+/// The smallest prefill chunk of a streamed checkpoint. A chunk of 256 tokens routes to nearly
+/// all the experts of every layer, so each one reads them again (V4.1 IQ1_M: ~50 GB per chunk);
+/// at 2048 about half of them are still in the page cache from the chunk before (beyond, every
+/// chunk reads all of them: the experts outgrow the cache and are read in a cycle). Measured on
+/// V4.1, an 8k-token prompt: 2048 as fast as 8192 with 6.6 GB of peak memory instead of 17.
+pub const STREAM_PREFILL_CHUNK: usize = 2048;
+
 /// Whether a checkpoint of `bytes` is too big to hold in memory (over 60% of RAM).
 pub fn too_big(bytes: u64) -> bool {
     crate::mistral4::too_big(bytes)
@@ -1302,11 +1309,62 @@ fn select_lag<R: Send>(
     lag: usize,
     finish: &(dyn Fn(usize, &mut [f32]) -> R + Sync),
 ) -> Vec<Option<R>> {
+    select_cand(c, iq, iw, is, t, start, lag, None, finish)
+}
+
+/// [`select_lag`] where some queries may only choose inside blocks of keys (`cand`: per query the
+/// sorted blocks, None for all, and the block size; DeepSeek V4.1's candidate blocks): those
+/// queries score only the keys of their blocks, the others are left at minus infinity.
+#[allow(clippy::too_many_arguments)]
+fn select_cand<R: Send>(
+    c: &DeepSeek4Config,
+    iq: &[f32],
+    iw: &[f32],
+    is: &CompState,
+    t: usize,
+    start: usize,
+    lag: usize,
+    cand: Option<(&[Option<Vec<u32>>], usize)>,
+    finish: &(dyn Fn(usize, &mut [f32]) -> R + Sync),
+) -> Vec<Option<R>> {
     let (ni, di, topk, r) = (c.index_n_heads, c.index_head_dim, c.index_topk, is.ratio);
     let mut sel: Vec<Option<R>> = (0..t).map(|_| None).collect();
     // The keys query `i` may choose from.
     let seen = |i: usize| (start + i + 1).saturating_sub(lag) / r;
-    let rows: Vec<usize> = (0..t).filter(|&i| seen(i) > topk).collect();
+    let blocks_of = |i: usize| cand.and_then(|(cb, _)| cb.get(i)).and_then(Option::as_deref);
+    let all: Vec<usize> = (0..t).filter(|&i| seen(i) > topk).collect();
+    // Queries restricted to blocks: each one's scores over its blocks' keys (the per-key
+    // arithmetic of the decode path), in parallel over the queries.
+    let (restricted, rows): (Vec<usize>, Vec<usize>) = all.into_iter().partition(|&i| blocks_of(i).is_some());
+    if !restricted.is_empty() {
+        let _timer = prof::start(Cat::Attention);
+        let bs = cand.unwrap().1;
+        let keys = &is.keys;
+        let mut res: Vec<Option<R>> = (0..restricted.len()).map(|_| None).collect();
+        let rp = SendPtrV(res.as_mut_ptr());
+        crate::pool::run(restricted.len(), &|ri| {
+            let i = restricted[ri];
+            let nv = seen(i);
+            let mut s = vec![f32::NEG_INFINITY; nv];
+            let qs: Vec<&[f32]> = (0..ni).map(|hh| &iq[(i * ni + hh) * di..(i * ni + hh + 1) * di]).collect();
+            let mut d = vec![0f32; ni];
+            for &b in blocks_of(i).unwrap() {
+                for wi in (b as usize * bs)..((b as usize + 1) * bs).min(nv) {
+                    crate::attn::dots(&qs, &keys[wi * di..(wi + 1) * di], &mut d);
+                    let mut acc = 0f32;
+                    for hh in 0..ni {
+                        acc += iw[i * ni + hh] * d[hh].max(0.0);
+                    }
+                    s[wi] = acc;
+                }
+            }
+            // SAFETY: each task writes its own slot.
+            unsafe { *rp.get().add(ri) = Some(finish(i, &mut s)) };
+        });
+        for (&i, v) in restricted.iter().zip(res) {
+            sel[i] = v;
+        }
+    }
     if rows.is_empty() {
         return sel;
     }
@@ -1359,18 +1417,40 @@ fn select_lag<R: Send>(
             unsafe { *op.get().add(ri) = Some(v) };
         });
     } else {
-        let n = seen(t - 1);
-        let rb = ((1usize << 22) / (ni * n.max(1))).clamp(1, 64);
-        for (bi, blk) in rows.chunks(rb).enumerate() {
+        // Blocks of queries against tiles of keys: every key is read once per block of queries
+        // and the GEMM output held stays bounded at any context length; each query keeps its
+        // head-summed scores.
+        const QB: usize = 64;
+        const KT: usize = 8192;
+        for (bi, blk) in rows.chunks(QB).enumerate() {
             let mut qb = vec![0f32; blk.len() * ni * di];
             for (k, &i) in blk.iter().enumerate() {
                 qb[k * ni * di..(k + 1) * ni * di].copy_from_slice(&iq[i * ni * di..(i + 1) * ni * di]);
             }
-            let sc = crate::sd::ops::matmul_f32(&keys[..n * di], n, di, &qb, blk.len() * ni);
+            let mut sv: Vec<Vec<f32>> = blk.iter().map(|&i| vec![0f32; seen(i)]).collect();
+            let nb = blk.iter().map(|&i| seen(i)).max().unwrap_or(0);
+            for k0 in (0..nb).step_by(KT) {
+                let k1 = (k0 + KT).min(nb);
+                let kt = k1 - k0;
+                let sc = crate::sd::ops::matmul_f32(&keys[k0 * di..k1 * di], kt, di, &qb, blk.len() * ni);
+                let svp = SendPtrV(sv.as_mut_ptr());
+                crate::pool::run(blk.len(), &|k| {
+                    // SAFETY: each task writes its own query's scores.
+                    let s = unsafe { &mut *svp.get().add(k) };
+                    for wi in k0..k1.min(s.len()) {
+                        let mut acc = 0f32;
+                        for hh in 0..ni {
+                            acc += iw[blk[k] * ni + hh] * sc[(k * ni + hh) * kt + wi - k0].max(0.0);
+                        }
+                        s[wi] = acc;
+                    }
+                });
+            }
+            let svp = SendPtrV(sv.as_mut_ptr());
             crate::pool::run(blk.len(), &|k| {
-                let v = score_row(blk[k], &|hh, wi| sc[(k * ni + hh) * n + wi]);
-                // SAFETY: each task writes its own slot.
-                unsafe { *op.get().add(bi * rb + k) = Some(v) };
+                // SAFETY: each task takes its own query's scores and writes its own slot.
+                let v = finish(blk[k], unsafe { &mut *svp.get().add(k) });
+                unsafe { *op.get().add(bi * QB + k) = Some(v) };
             });
         }
     }
@@ -1466,37 +1546,81 @@ fn attend_dims(
         );
         return;
     }
-    // Blocks of queries: scores and outputs as GEMMs over the union of their keys.
+    // On Metal, blocks of queries with a table of their keys (the block's window positions, then
+    // the compressed keys any of them chose): each head reads only its own query's rows.
+    #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+    if hd == 512 && crate::gpu::active().is_some() {
+        const QB: usize = 256;
+        let mut done = true;
+        for b0 in (0..t).step_by(QB) {
+            let b1 = (b0 + QB).min(t);
+            let wlo = (start + b0 + 1).saturating_sub(win);
+            let nw = start + b1 - wlo;
+            let lists: Vec<(std::ops::Range<usize>, Vec<u32>)> = (b0..b1).map(keys_of).collect();
+            let mut uni: Vec<u32> = lists.iter().flat_map(|l| l.1.iter().copied()).collect();
+            uni.sort_unstable();
+            uni.dedup();
+            let mut table = vec![0f32; (nw + uni.len()) * hd];
+            for_chunks(&mut table, hd, true, |r, row| {
+                row.copy_from_slice(if r < nw { raw(wlo + r) } else { ckey(uni[r - nw] as usize) });
+            });
+            let (mut idx, mut meta) = (Vec::new(), Vec::with_capacity(2 * (b1 - b0)));
+            for (wr, cks) in &lists {
+                meta.extend([idx.len() as u32, (wr.len() + cks.len()) as u32]);
+                idx.extend(wr.clone().map(|j| (j - wlo) as u32));
+                idx.extend(cks.iter().map(|w| (nw + uni.binary_search(w).unwrap()) as u32));
+            }
+            let (qs, os) = (&q[b0 * nh * hd..b1 * nh * hd], &mut out[b0 * nh * hd..b1 * nh * hd]);
+            if !crate::metal::ds4::attend(qs, &table, &idx, &meta, sink, nh, scale, os) {
+                done = false;
+                break;
+            }
+        }
+        if done {
+            return;
+        }
+    }
+    // Blocks of queries: scores and outputs as GEMMs over the union of their keys (the window
+    // positions of the block, then the compressed keys any of its queries chose, in order), so
+    // that a long context costs the chosen keys and not every compressed key.
     const B: usize = 32;
     for b0 in (0..t).step_by(B) {
         let b1 = (b0 + B).min(t);
         let (pf, pl) = (start + b0, start + b1 - 1);
         let wlo = (pf + 1).saturating_sub(win);
         let nw = pl + 1 - wlo;
-        let nc = (pl + 1).checked_div(ratio).unwrap_or(0);
-        let nk = nw + nc;
+        let lists: Vec<(std::ops::Range<usize>, Vec<u32>)> = (b0..b1).map(keys_of).collect();
+        let mut uni: Vec<u32> = lists.iter().flat_map(|l| l.1.iter().copied()).collect();
+        uni.sort_unstable();
+        uni.dedup();
+        // Each query's compressed keys as columns of the union.
+        let cols: Vec<Vec<usize>> = lists
+            .iter()
+            .map(|(_, cks)| cks.iter().map(|w| nw + uni.binary_search(w).unwrap()).collect())
+            .collect();
+        let nk = nw + uni.len();
         let nkp = nk.next_multiple_of(32);
         let mut km = vec![0f32; nkp * hd];
         for j in 0..nw {
             km[j * hd..(j + 1) * hd].copy_from_slice(raw(wlo + j));
         }
-        for w in 0..nc {
-            km[(nw + w) * hd..(nw + w + 1) * hd].copy_from_slice(ckey(w));
+        for (u, &w) in uni.iter().enumerate() {
+            km[(nw + u) * hd..(nw + u + 1) * hd].copy_from_slice(ckey(w as usize));
         }
         let rows = (b1 - b0) * nh;
         let sc = crate::sd::ops::matmul_f32(&km, nkp, hd, &q[b0 * nh * hd..b1 * nh * hd], rows);
         let mut p = vec![0f32; rows * nkp];
         for_chunks(&mut p, nkp, true, |r, pr| {
-            let i = b0 + r / nh;
+            let qi = r / nh;
             let hh = r % nh;
-            let (wr, cks) = keys_of(i);
+            let (wr, cc) = (lists[qi].0.clone(), &cols[qi]);
             let s = &sc[r * nkp..(r + 1) * nkp];
             let mut m = sink[hh];
             for j in wr.clone() {
                 m = m.max(s[j - wlo] * scale);
             }
-            for &w in &cks {
-                m = m.max(s[nw + w as usize] * scale);
+            for &c in cc {
+                m = m.max(s[c] * scale);
             }
             let mut tot = (sink[hh] - m).exp();
             for j in wr {
@@ -1504,9 +1628,9 @@ fn attend_dims(
                 pr[j - wlo] = e;
                 tot += e;
             }
-            for &w in &cks {
-                let e = (s[nw + w as usize] * scale - m).exp();
-                pr[nw + w as usize] = e;
+            for &c in cc {
+                let e = (s[c] * scale - m).exp();
+                pr[c] = e;
                 tot += e;
             }
             let inv = 1.0 / tot;
@@ -1835,6 +1959,15 @@ impl crate::generate::TextLm for DeepSeek4Model<'_> {
     }
     fn session_len(&self, sess: &DeepSeek4Session) -> usize {
         sess.pos
+    }
+    /// Streamed, a prefill chunk reads (nearly) every routed expert from storage again: at least
+    /// [`STREAM_PREFILL_CHUNK`] tokens per chunk.
+    fn prefill_chunk(&self, chunk: usize) -> usize {
+        if self.stream.is_some() {
+            chunk.max(STREAM_PREFILL_CHUNK)
+        } else {
+            chunk
+        }
     }
     fn forward_hidden_mm(&self, sess: &mut DeepSeek4Session, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {
         self.forward_capture_mm(sess, tokens, mm, &[], &mut Vec::new())

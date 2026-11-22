@@ -606,6 +606,19 @@ pub const CATALOG: &[Model] = &[
         .fixed(Format::GgufLow, "GGUF UD-IQ1_S")
         .moe()
         .note("supported, untested; 111 GB of it engram tables read a few rows a token; text only"),
+    // The smallest complete V4.1 checkpoint (120.7 GB of backbone + the 110.6 GB engram file,
+    // which `org/repo:IQ1_M` fetches as the build's sixth part): run on the real weights.
+    Model::new(
+        "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF:IQ1_M",
+        Kind::Chat,
+        748.0,
+        231.3,
+        AGENT,
+    )
+    .fixed(Format::GgufLow, "GGUF IQ1_M")
+    .speed(7.18, 40)
+    .moe()
+    .note("tested: same greedy tokens and perplexity as llama.cpp on the same file; streamed (5.4 GB resident); text only"),
     Model::new(
         "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-Coder-GGUF:IQ2_XXS",
         Kind::Chat,

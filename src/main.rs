@@ -2158,7 +2158,7 @@ fn run_text<M: oxinfer::dspark::Target + oxinfer::intervene::Host>(
             // The attachments belong to the first turn.
             let overrides = oxinfer::mm::bind(model, &mut sess, &ids, &std::mem::take(&mut mm_feats))?;
             let t = Instant::now();
-            let hs = generate::prefill(model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
+            let hs = prefill_logged(model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
             let logits = model.logits(&hs[hs.len() - h..], 1);
             let prefill_secs = t.elapsed().as_secs_f64();
             prof::reset();
@@ -2217,7 +2217,7 @@ fn run_text<M: oxinfer::dspark::Target + oxinfer::intervene::Host>(
     let overrides = oxinfer::mm::bind(model, &mut sess, &ids, &mm_feats)?;
     let t = Instant::now();
     let s0 = prefill_trace_start();
-    let hs = generate::prefill(model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
+    let hs = prefill_logged(model, &mut sess, &ids, args.prefill_chunk.unwrap_or(256), &overrides);
     let logits = model.logits(&hs[hs.len() - h..], 1);
     let prefill_secs = t.elapsed().as_secs_f64();
     prefill_trace_end(s0, ids.len(), prefill_secs);
@@ -2762,7 +2762,9 @@ fn run_deepseek4(mut args: Args) -> Result<()> {
         Some(d) => run_dspark(&args, &model, d, &tok, &eos, fmt, streamer.as_deref(), Default::default()),
         None => run_text(&args, &model, &tok, &eos, fmt, Default::default()),
     };
+    // (`mincore` over V4.1's 231 GB of files takes seconds: only when tracing.)
     if let Some(s) = &streamer
+        && args.stream_trace
         && let Some(c) = s.cached_bytes()
     {
         eprintln!("[stream: {:.2} GB of the model files in the page cache at exit]", c as f64 / 1e9);
@@ -3372,6 +3374,36 @@ fn start_stream(
         eprintln!("[stream: {} resident units could not be locked or copied]", plan.resident_failures);
     }
     Ok(s)
+}
+
+/// [`generate::prefill`] that, for a prompt of 16k tokens or more, prints a line after each chunk
+/// (tokens done, time so far, the rate of that chunk): a long prompt on a streamed checkpoint
+/// takes hours, and the rate falls as the context grows.
+fn prefill_logged<M: generate::TextLm + ?Sized>(
+    model: &M,
+    sess: &mut M::Sess,
+    ids: &[u32],
+    chunk: usize,
+    overrides: &[(usize, Vec<f32>)],
+) -> Vec<f32> {
+    if ids.len() < 16384 {
+        return generate::prefill(model, sess, ids, chunk, overrides);
+    }
+    let t0 = Instant::now();
+    let mut last = (0usize, t0);
+    let mut hook = |done: usize, total: usize| {
+        if done > last.0 {
+            let now = Instant::now();
+            let rate = (done - last.0) as f64 / now.duration_since(last.1).as_secs_f64().max(1e-9);
+            eprintln!(
+                "[prefill {done}/{total} tokens, {:.0}s, {rate:.1} tok/s for the last {}]",
+                now.duration_since(t0).as_secs_f64(),
+                done - last.0
+            );
+            last = (done, now);
+        }
+    };
+    generate::with_prefill_progress(&mut hook, || generate::prefill(model, sess, ids, chunk, overrides))
 }
 
 /// The streaming statistics before a prefill, when `--stream-trace` prints them.

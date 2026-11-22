@@ -20,8 +20,9 @@
 //! A checkpoint larger than most of RAM is streamed as the CLI streams it.
 //!
 //! `--ppl TEXT_FILE N_CTX N_CHUNKS` (GGUF) is `llama-perplexity -c N_CTX --chunks N_CHUNKS` on the
-//! same text: the text tokenized after a BOS, cut into chunks of `N_CTX` tokens, each run from an
-//! empty context with its first token replaced by BOS, the second half of each chunk scored.
+//! same text: the text tokenized (after a BOS if the header adds one), cut into chunks of `N_CTX`
+//! tokens, each run from an empty context (its first token replaced by that BOS), the second half
+//! of each chunk scored; `--ids-out` writes the token ids.
 //!
 //! Prints, for the prefill (in chunks of N tokens, default the whole prompt) and for the
 //! token-by-token decode, the largest logit difference, the mean KL divergence and the agreement
@@ -88,18 +89,23 @@ fn report(what: &str, ours: &[f32], refs: &[f32], vocab: usize) {
 }
 
 /// `--ppl`: see the module documentation.
-fn perplexity(m: &DeepSeek4Model, dir: &Path, text: &str, n_ctx: usize, n_chunks: usize) -> Result<()> {
+fn perplexity(m: &DeepSeek4Model, dir: &Path, text: &str, n_ctx: usize, n_chunks: usize, ids_out: Option<&str>) -> Result<()> {
     let hd = oxinfer::gguf::header(dir)?;
     let bos = hd
         .get("tokenizer.ggml.bos_token_id")
         .and_then(oxinfer::gguf::Value::as_u64)
         .context("no BOS token id in the GGUF header")? as u32;
+    // As llama-perplexity: a BOS only where the header says one is added.
+    let add_bos = !matches!(hd.get("tokenizer.ggml.add_bos_token"), Some(oxinfer::gguf::Value::Bool(false)));
     let tok = hd.tokenizer()?;
     let enc = tok
         .encode(std::fs::read_to_string(text)?.as_str(), false)
         .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
-    let mut ids = vec![bos];
+    let mut ids = if add_bos { vec![bos] } else { Vec::new() };
     ids.extend_from_slice(enc.get_ids());
+    if let Some(f) = ids_out {
+        std::fs::write(f, ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(" "))?;
+    }
     let n_chunks = n_chunks.min(ids.len() / n_ctx);
     let (h, vocab) = (m.cfg.hidden_size, m.cfg.vocab_size);
     let first = n_ctx / 2;
@@ -107,7 +113,9 @@ fn perplexity(m: &DeepSeek4Model, dir: &Path, text: &str, n_ctx: usize, n_chunks
     let t0 = std::time::Instant::now();
     for ci in 0..n_chunks {
         let mut chunk = ids[ci * n_ctx..(ci + 1) * n_ctx].to_vec();
-        chunk[0] = bos;
+        if add_bos {
+            chunk[0] = bos;
+        }
         let mut sess = m.new_session();
         let mut hs = Vec::with_capacity(n_ctx * h);
         for piece in chunk.chunks(256) {
@@ -246,7 +254,7 @@ fn main() -> Result<()> {
         };
         let r = match (greedy, ppl) {
             (Some((prompt, n_gen, out)), _) => greedy_dump(&m, &dir, &prompt, n_gen, &out, ids_out.as_deref()),
-            (_, Some((text, n_ctx, n_chunks))) => perplexity(&m, &dir, &text, n_ctx, n_chunks),
+            (_, Some((text, n_ctx, n_chunks))) => perplexity(&m, &dir, &text, n_ctx, n_chunks, ids_out.as_deref()),
             _ => unreachable!(),
         };
         m.set_stream(None);

@@ -110,7 +110,11 @@ pass routes to: a MoE layer's unit holds its attention / DeltaNet weights, the r
 shared expert, and each routed expert is an on-demand part of it (`UnitSpec::parts`) that the
 layer requests once routing is known (`StreamHook::need_parts`), read with priority over the
 read-ahead and then kept in a part cache (least recently used out) sized by what the budget
-leaves (`StreamOptions::part_cache_bytes`). Zawen in oxinfer Q4 (19.5 GB), 6 GB budget at
+leaves (`StreamOptions::part_cache_bytes`). A pass that used at least half of a unit's parts
+(a prefill chunk, which routes to nearly every expert of every layer and does so again at the
+next chunk) only fills free room: with more experts than the cache holds, read in a cycle,
+least-recently-used would evict each one just before its next use (DeepSeek V4.1, a 32k-token
+prompt: 82% of the needed experts cached instead of 51%, 79.4 tok/s instead of 74.6). Zawen in oxinfer Q4 (19.5 GB), 6 GB budget at
 2 GB/s, 3 threads, plain greedy: 0.13 -> 7.3 tok/s (14.2 -> 0.12 GB read per token: the dense
 part, 1.1 GB, is resident and 78% of the requested experts come from the 4.1 GB part cache),
 same tokens as without streaming. Guessing the next layer's experts from the residual stream

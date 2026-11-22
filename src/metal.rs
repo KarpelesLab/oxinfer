@@ -46,6 +46,8 @@ use std::time::Instant;
 pub(crate) mod decode;
 #[path = "metal_dit.rs"]
 mod dit;
+#[path = "metal_ds4.rs"]
+pub(crate) mod ds4;
 #[path = "metal_inkling.rs"]
 pub(crate) mod inkling;
 #[path = "metal_inkling_draft.rs"]

@@ -695,16 +695,10 @@ fn attn(
             let ws = (di as f32).powf(-0.5) * (ni as f32).powf(-0.5);
             iw.iter_mut().for_each(|w| *w *= ws);
             let (bs, tb) = (c.candidate_block_size, c.candidate_topk_blocks);
-            let cand = &shared.cand;
-            let res = select_with(c, &iq, &iw, is, t, start, &|i, s: &mut [f32]| {
+            // After the candidate source, a query scores only the keys of its candidate blocks.
+            let cand = uses.then_some((&shared.cand[..], bs));
+            let res = select_cand(c, &iq, &iw, is, t, start, 0, cand, &|_, s: &mut [f32]| {
                 let made = if makes { candidate_blocks(s, tb, bs) } else { None };
-                if uses && let Some(blocks) = &cand[i] {
-                    for (j, v) in s.iter_mut().enumerate() {
-                        if blocks.binary_search(&((j / bs) as u32)).is_err() {
-                            *v = f32::NEG_INFINITY;
-                        }
-                    }
-                }
                 (top_positions(s, topk), made)
             });
             let mut cands = Vec::with_capacity(if makes { t } else { 0 });
