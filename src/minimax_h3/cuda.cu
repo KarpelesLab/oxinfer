@@ -78,7 +78,7 @@ __device__ __forceinline__ void pow2_for(float m, float& f, float& inv) {
 
 // ---- GEMM: Y[m][n] (= or +=) f rs[m] sum_k X[m][k] W[n][k] + bias[n] (`rs`, `bias`: or null).
 // A 128-thread block computes 64
-// rows x 64 outputs in 32-wide K steps. X: half2 planes `xh` (and `xl`), rows of n_in / 2 words.
+// rows x 64 outputs in 32-wide K steps (the grid: see `cg` below). X: half2 planes `xh` (and `xl`), rows of n_in / 2 words.
 // W: FP8 bytes (WK 0; rows of n_in bytes) or half2 planes `w` (and `wl`; WK 1).
 // NP: 1 (xh w), 2 (+ xl w), 3 (+ xh wl).
 
@@ -96,7 +96,7 @@ struct GemmP {
     u64 ys;
     u32 n_in, n_out, rows, add;
     float f;
-    u32 pad;
+    u32 cg;
 };
 
 template <int WK, int NP>
@@ -107,10 +107,13 @@ __device__ __forceinline__ void gemm_body(const GemmP& p) {
     u32* Al = smem + (NP >= 2 ? 2 : 0) * GBM * GLD;
     u32* Bl = smem + (NP == 3 ? 3 : 0) * GBM * GLD;
     u32 tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    u32 r0 = blockIdx.y * GBM;
-    if (r0 >= p.rows) return;
+    // The grid: x, one of `cg` tiles of 64 outputs; y, every tile of 64 rows for one group of
+    // `cg`, then for the next (a group's weights stay in the cache while the rows pass).
+    u32 rt = (p.rows + GBM - 1) / GBM;
+    u32 r0 = (blockIdx.y % rt) * GBM;
     u32 nr = min((u32)GBM, p.rows - r0);
-    u32 n0 = blockIdx.x * 64;
+    u32 n0 = ((blockIdx.y / rt) * p.cg + blockIdx.x) * 64;
+    if (n0 >= p.n_out) return;
     u32 lr = tid >> 1, lh = tid & 1;
     u32 half_in = p.n_in / 2;
     const u32* xhr = p.xh + (u64)(r0 + lr) * half_in;
@@ -476,6 +479,7 @@ __device__ __forceinline__ void zero8(u32* d) {
 #pragma unroll
     for (int i = 0; i < 8; i++) d[i] = 0u;
 }
+__device__ __forceinline__ void store4(u32* d, uint4 v) { d[0] = v.x, d[1] = v.y, d[2] = v.z, d[3] = v.w; }
 
 // One 32-wide K step (from word k0) of a warp's 32 x 8 NT products: A rows from `a0` on in `ah` /
 // `al` (rows of `ald` words), B rows from `b0` on in `bh` / `bl`, three products; their sum
@@ -575,19 +579,41 @@ __device__ __forceinline__ void flash_body(const AttP& p) {
         l[a][0] = l[a][1] = 0.f;
     }
     u32 half_nk = p.nk / 2;
-    for (u32 k0 = 0; k0 < p.n; k0 += FK) {
+    // A step's keys and values are read from the device's memory into registers one phase ahead
+    // (while the products before them run), then stored to shared memory.
+    const int KN = HW / 16, VN = 8 / TPR;
+    uint4 kr[2][KN], vq[2][VN];
+    auto read_keys = [&](u32 k0) {
 #pragma unroll
-        for (u32 i = 0; i < HW / 4; i += 8) {
+        for (int i = 0; i < KN; i++) {
             if (k0 + tr < p.n) {
-                u64 at = ((u64)head * p.n + k0 + tr) * HW + to + i;
-                put8(Bh + tr * QLD + to + i, p.kh + at);
-                put8(Bl + tr * QLD + to + i, p.kl + at);
+                u64 at = ((u64)head * p.n + k0 + tr) * HW + to + 4 * i;
+                kr[0][i] = *(const uint4*)(p.kh + at);
+                kr[1][i] = *(const uint4*)(p.kl + at);
             } else {
-                zero8(Bh + tr * QLD + to + i);
-                zero8(Bl + tr * QLD + to + i);
+                kr[0][i] = kr[1][i] = make_uint4(0u, 0u, 0u, 0u);
             }
         }
+    };
+    read_keys(0);
+    for (u32 k0 = 0; k0 < p.n; k0 += FK) {
+#pragma unroll
+        for (int i = 0; i < KN; i++) {
+            store4(Bh + tr * QLD + to + 4 * i, kr[0][i]);
+            store4(Bl + tr * QLD + to + 4 * i, kr[1][i]);
+        }
         __syncthreads();
+#pragma unroll
+        for (int i = 0; i < VN; i++) {
+            u32 w0 = k0 / 2 + vo + 4 * i;
+            if (w0 < half_nk) {
+                u64 at = ((u64)head * HD + vr) * half_nk + w0;
+                vq[0][i] = *(const uint4*)(p.vh + at);
+                vq[1][i] = *(const uint4*)(p.vl + at);
+            } else {
+                vq[0][i] = vq[1][i] = make_uint4(0u, 0u, 0u, 0u);
+            }
+        }
         float s[2][2][4];
 #pragma unroll
         for (int a = 0; a < 2; a++)
@@ -621,16 +647,9 @@ __device__ __forceinline__ void flash_body(const AttP& p) {
         __syncthreads();
         // Every warp has its scores: the keys' place takes the values of the step's keys.
 #pragma unroll
-        for (u32 i = 0; i < 32 / TPR; i += 8) {
-            u32 w0 = k0 / 2 + vo + i;
-            if (w0 < half_nk) {
-                u64 at = ((u64)head * HD + vr) * half_nk + w0;
-                put8(Bh + vr * PLD + vo + i, p.vh + at);
-                put8(Bl + vr * PLD + vo + i, p.vl + at);
-            } else {
-                zero8(Bh + vr * PLD + vo + i);
-                zero8(Bl + vr * PLD + vo + i);
-            }
+        for (int i = 0; i < VN; i++) {
+            store4(Bh + vr * PLD + vo + 4 * i, vq[0][i]);
+            store4(Bl + vr * PLD + vo + 4 * i, vq[1][i]);
         }
         float alpha[2][2];
 #pragma unroll
@@ -662,6 +681,7 @@ __device__ __forceinline__ void flash_body(const AttP& p) {
             }
         }
         __syncthreads();
+        read_keys(k0 + FK);
 #pragma unroll
         for (int mt = 0; mt < 2; mt++) {
 #pragma unroll

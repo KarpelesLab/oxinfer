@@ -5,9 +5,13 @@
 //! biases and LoRA side paths.
 //!
 //! Per block: the RMS norm and AdaLN modulation, the four projections and their low-rank side
-//! paths, the per-head query / key norms and RoPE, the attention (per head: scores, softmax,
-//! product with the values), SwiGLU and the gated or scaled residuals. The host computes what
-//! comes before and after the blocks, and the AdaLN tables.
+//! paths, the per-head query / key norms and RoPE, the attention, SwiGLU and the gated or
+//! scaled residuals. The host computes what comes before and after the blocks, and the AdaLN
+//! tables.
+//!
+//! The attention of heads 64 or 128 wide is one kernel that walks the keys 64 at a time with a
+//! running softmax, the scores staying in the accumulators (`attn_flash`); other widths take
+//! three launches per head and query chunk (scores, softmax, product with the values).
 //!
 //! The products run on the tensor cores (f16 operands, f32 accumulation). FP8 and float16
 //! weights are exact in a half. An f32 operand (activations, attention operands, LoRA factors
@@ -18,8 +22,9 @@
 //! Weights: as many blocks as fit stay on the device (a block of the FP8 transformer is 0.45 GB
 //! with a turbo LoRA's factors, the 50 of them 22 GB); the others are copied into one of two
 //! slots while the block before them runs. Activations are sized for the sequence (1.2 GB for
-//! the transformer's 4682 rows of a 448x256 clip); the feed-forward runs in row chunks and the
-//! attention in query chunks so that neither grows with the square of the sequence.
+//! the transformer's 4682 rows of a 448x256 clip, 9.4 GB for the 37,834 of a 1344x768 one); the
+//! feed-forward runs in row chunks and the attention keeps no scores (or runs in query chunks)
+//! so that neither grows with the square of the sequence.
 //!
 //! Declined (the CPU path runs): other weight formats, q / k / v as separate matrices,
 //! Hadamard-folded weights, heads that are not a multiple of 64 wide, widths that are not
@@ -72,6 +77,8 @@ macro_rules! args {
 const RESERVE: usize = 512 << 20;
 /// The scores of one attention launch (queries x keys, f32), at most.
 const SCORE_BYTES: usize = 256 << 20;
+/// The weights of one group of a GEMM's outputs, at most (`OXINFER_H3_GPU_HOT`, in MB, overrides).
+const HOT_BYTES: usize = 16 << 20;
 /// Alignment of every piece of a block's weights.
 const ALIGN: usize = 256;
 /// "No such piece" among a block's offsets.
@@ -107,7 +114,8 @@ struct GemmP {
     rows: u32,
     add: u32,
     f: f32,
-    pad: u32,
+    /// Tiles of 64 outputs per group ([`Engine::gemm`] sets it).
+    cg: u32,
 }
 
 /// `AttP` of `cuda.cu`.
@@ -192,6 +200,25 @@ fn to_planes(v: &[f32], rows: usize, cols: usize) -> Planes {
         lo: has_lo.then_some(lo),
         factor,
     }
+}
+
+/// `[cols, rows]` from `m` (`[rows, cols]`), across threads.
+fn transposed(m: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    assert_eq!(m.len(), rows * cols);
+    let mut t = vec![0f32; rows * cols];
+    let per = cols.div_ceil(crate::pool::threads().clamp(1, 32)).max(1);
+    std::thread::scope(|s| {
+        for (i, part) in t.chunks_mut(per * rows).enumerate() {
+            s.spawn(move || {
+                for (j, row) in part.chunks_mut(rows).enumerate() {
+                    for (k, v) in row.iter_mut().enumerate() {
+                        *v = m[k * cols + i * per + j];
+                    }
+                }
+            });
+        }
+    });
+    t
 }
 
 /// One low-rank side path on the host: `A` `[r, n_in]`, `B` `[n_out, r]`.
@@ -438,6 +465,9 @@ struct State {
     arena: Arena,
     /// Blocks kept on the device (base pointers), and the two slots of the others.
     resident: Vec<Option<u64>>,
+    /// Whether a kept block's weights are there yet (copied when the block first runs, while
+    /// the block before it computes).
+    filled: Vec<bool>,
     placed: bool,
     slots: [u64; 2],
     events: [F; 2],
@@ -480,6 +510,8 @@ pub(super) struct Engine {
     /// The attention runs without a score matrix (`attn_flash`: heads 64 or 128 wide, and a device that
     /// gives a block its shared memory; `OXINFER_H3_GPU_FLASH=0` keeps the three-launch form).
     flash: bool,
+    /// The weights of one group of a GEMM's outputs (bytes), at most.
+    hot: usize,
 }
 
 // SAFETY: the raw pointers are driver handles; every use binds the context and goes through
@@ -539,6 +571,7 @@ impl Engine {
             bail!("widths {h} / {inner} / {ffn} or heads of {hd} have no kernel");
         }
         // Layouts and side paths.
+        let t0 = crate::clock::Instant::now();
         let mut blocks = Vec::with_capacity(src.n_blocks());
         let mut loras = Vec::with_capacity(src.n_blocks());
         let (mut block_cap, mut rmax) = (0usize, 0usize);
@@ -554,13 +587,7 @@ impl Engine {
                     if r == 0 {
                         continue;
                     }
-                    // B from its transpose.
-                    let mut bm = vec![0f32; l.n_out * r];
-                    for k in 0..r {
-                        for o in 0..l.n_out {
-                            bm[o * r + k] = bt[k * l.n_out + o];
-                        }
-                    }
+                    let bm = transposed(bt, r, l.n_out);
                     rmax = rmax.max(r.next_multiple_of(32));
                     hl.push(HostLora {
                         a: to_planes(a, r, l.n_in),
@@ -575,6 +602,10 @@ impl Engine {
             blocks.push((lay, bytes));
             loras.push(host);
         }
+        debug(
+            what,
+            &format!("layouts and side paths as halves in {:.2} s", t0.elapsed().as_secs_f64()),
+        );
         let x: Cuh = {
             use dlsym::Bindings;
             // SAFETY: libcuda is already initialised by the backend.
@@ -633,6 +664,7 @@ impl Engine {
             state: Mutex::new(State {
                 arena: Arena::default(),
                 resident: vec![None; n_blocks],
+                filled: vec![false; n_blocks],
                 placed: false,
                 slots: [0; 2],
                 events,
@@ -643,6 +675,10 @@ impl Engine {
             score_bytes: SCORE_BYTES,
             chunk_rows: usize::MAX,
             flash,
+            hot: std::env::var("OXINFER_H3_GPU_HOT")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .map_or(HOT_BYTES, |mb| mb << 20),
         })
     }
 
@@ -795,11 +831,12 @@ impl Engine {
                 unsafe { self.x.cuMemFree_v2(p) };
             }
         }
+        st.filled.fill(false);
         st.placed = false;
     }
 
-    /// Keeps as many blocks on the device as fit beside two slots for the others.
-    fn place_blocks(&self, src: &dyn Source, st: &mut State) -> bool {
+    /// Room on the device for as many blocks as fit beside two slots for the others.
+    fn place_blocks(&self, st: &mut State) -> bool {
         if st.placed {
             return true;
         }
@@ -812,10 +849,6 @@ impl Engine {
                 break;
             }
             let Some(p) = self.alloc(bytes) else { break };
-            if !self.upload_block(src, bi, p) {
-                unsafe { self.x.cuMemFree_v2(p) };
-                return false;
-            }
             st.resident[bi] = Some(p);
         }
         if st.resident.iter().any(|r| r.is_none()) {
@@ -875,6 +908,21 @@ impl Engine {
         }
     }
 
+    /// Launches a GEMM over weights of `w_row` bytes per output: the outputs go in groups whose
+    /// weights fit [`Engine::hot`], every row passing one group before the next (the weights of
+    /// a projection are 77 to 154 MB, the cache a fraction of that: in one group, each tile of
+    /// 64 rows would read them all from the device's memory again).
+    fn gemm(&self, f: F, mut p: GemmP, w_row: usize) {
+        let (ct, rt) = (ceil(p.n_out as usize, 64), ceil(p.rows as usize, 64));
+        let mut cg = ((self.hot / (64 * w_row.max(1))) as u32).clamp(1, ct);
+        // (Weights of up to three groups stay in one: measured faster at 38 MB.)
+        if rt * ct.div_ceil(cg) > 65535 || ct <= 3 * cg {
+            cg = ct;
+        }
+        p.cg = cg;
+        self.go(f, (cg, rt * ct.div_ceil(cg)), 128, &mut args![p]);
+    }
+
     /// `y (= or +=) f rs W x (+ bias)` with the planes of `w` (`[n_out][n_in]`).
     #[allow(clippy::too_many_arguments)]
     fn gemm_h(
@@ -912,9 +960,9 @@ impl Engine {
             rows: rows as u32,
             add: add as u32,
             f,
-            pad: 0,
+            cg: 0,
         };
-        self.go(self.f.gemm_h[np - 1], (ceil(n_out, 64), ceil(rows, 64)), 128, &mut args![p]);
+        self.gemm(self.f.gemm_h[np - 1], p, n_in * 2 * (np - 1).max(1));
     }
 
     /// `y = W x + bias` of projection `l` and its side paths over `rows` rows whose planes are
@@ -935,14 +983,9 @@ impl Engine {
                 rows: rows as u32,
                 add: 0,
                 f: l.f,
-                pad: 0,
+                cg: 0,
             };
-            self.go(
-                self.f.gemm_f8[exact() as usize],
-                (ceil(l.n_out, 64), ceil(rows, 64)),
-                128,
-                &mut args![p],
-            );
+            self.gemm(self.f.gemm_f8[exact() as usize], p, l.n_in);
         } else {
             let w = DPlanes {
                 hi: l.w,
@@ -992,7 +1035,7 @@ impl Engine {
             return false;
         }
         let tab_floats = ada.map_or(0, |a| a.tables[0].len());
-        if !self.make_arena(st, n, tab_floats) || !self.place_blocks(src, st) {
+        if !self.make_arena(st, n, tab_floats) || !self.place_blocks(st) {
             self.release_blocks(st);
             return false;
         }
@@ -1022,10 +1065,20 @@ impl Engine {
         let mut tm = crate::clock::Instant::now();
         use super::dit::stage;
         for bi in 0..self.blocks.len() {
-            // The block's weights: on the device, or copied into the slot the block before the
-            // last one used (once that one is done).
+            // The block's weights: on the device (copied there at its first run), or copied into
+            // the slot the block before the last one used (once that one is done). Either copy
+            // runs while the device computes the block before.
             let base = match st.resident[bi] {
-                Some(p) => p,
+                Some(p) => {
+                    if !st.filled[bi] {
+                        if !self.upload_block(src, bi, p) {
+                            self.failed.store(true, Relaxed);
+                            break;
+                        }
+                        st.filled[bi] = true;
+                    }
+                    p
+                }
                 None => {
                     let p = st.slots[slot];
                     unsafe { self.x.cuEventSynchronize(st.events[slot]) };
@@ -1154,9 +1207,9 @@ impl Engine {
                         rows: qn as u32,
                         add: 0,
                         f: 1.0,
-                        pad: 0,
+                        cg: 0,
                     };
-                    self.go(self.f.gemm_h[np_att - 1], (ceil(n, 64), ceil(qn, 64)), 128, &mut args![p]);
+                    self.gemm(self.f.gemm_h[np_att - 1], p, hd * 4);
                     self.go(
                         self.f.softmax_split,
                         (qn as u32, 1),
@@ -1178,9 +1231,9 @@ impl Engine {
                         rows: qn as u32,
                         add: 0,
                         f: 1.0,
-                        pad: 0,
+                        cg: 0,
                     };
-                    self.go(self.f.gemm_h[np_att - 1], (ceil(hd, 64), ceil(qn, 64)), 128, &mut args![p]);
+                    self.gemm(self.f.gemm_h[np_att - 1], p, nk * 4);
                 }
             }
             self.mark(&mut tm, stage::ATTN);
@@ -1592,6 +1645,17 @@ mod tests {
                     let err = got.iter().zip(&want).map(|(a, b)| (*a as f64 - b).abs()).fold(0f64, f64::max);
                     assert!(err < 2e-5 * peak, "15 sets, chunked {chunked}: max error {err:e} of {peak:e}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn transposes() {
+        let m: Vec<f32> = (0..3 * 70).map(|i| i as f32).collect();
+        let t = transposed(&m, 3, 70);
+        for r in 0..3 {
+            for c in 0..70 {
+                assert_eq!(t[c * 3 + r], m[r * 70 + c]);
             }
         }
     }
