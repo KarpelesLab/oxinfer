@@ -4,6 +4,8 @@ name = "oxinfer"
 version = "0.0.15"
 edition = "2024"
 rust-version = "1.95"
+# `cargo run` starts oxinfer (there is also the membench binary).
+default-run = "oxinfer"
 description = "Local inference in pure Rust for language, vision, image, speech and embedding models: SIMD CPU kernels everywhere, GPUs detected at run time, and a WebAssembly + WebGPU browser build."
 repository = "https://github.com/KarpelesLab/oxinfer"
 homepage = "https://karpeleslab.github.io/oxinfer/"
