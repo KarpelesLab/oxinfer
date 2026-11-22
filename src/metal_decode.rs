@@ -248,6 +248,8 @@ impl MetalBackend {
 const FV_SRC: &str = include_str!("metal_fastv.metal");
 /// Prefill attention on the SIMD-group matrices (`pff_<head dim>`, `MOp::PfFlash`).
 const PFF_SRC: &str = include_str!("metal_pfflash.metal");
+/// Prefill attention on the matrix units (`pfm_*`), compiled with the matrix-unit GEMMs.
+pub(crate) const PFM_SRC: &str = include_str!("metal_pfmma.metal");
 
 /// Whether prefill plans run plain causal attention on the SIMD-group matrices (`pff_*`;
 /// `OXINFER_PF_FLASH=0`: the per-token decode kernels).
@@ -255,6 +257,17 @@ fn pf_flash() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("OXINFER_PF_FLASH").map_or(true, |v| v != "0"))
 }
+/// Whether prefill plans attend on the matrix units (`pfm_*`, reading the chunk's keys and
+/// values as half rows; `OXINFER_PF_MMA_ATTN=0`: the f32 SIMD-group kernels `pff_*`).
+fn pf_mma_attn() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OXINFER_PF_MMA_ATTN").map_or(true, |v| v != "0"))
+}
+/// Range ids of the half key / value slots of `pfm_*` (one per slot from here).
+const PF_KVH_RES: usize = PF_RES + 16;
+/// Positions before a chunk that `pfm_*`'s half rows hold beyond the chunk's own (a later chunk
+/// starting further on attends with `pff_*`).
+const PF_KVH_PAST: usize = 6144;
 /// Rows per threadgroup of the fast verification matmuls (`FV_R` in the shader).
 const FV_ROWS: usize = 32;
 /// The formats with fast matmuls (a chunk loader `fv_load8` in the shader); other formats keep the
@@ -1187,6 +1200,9 @@ enum MOp {
         qn: Option<usize>,
         kn: Option<usize>,
         p: QkParams,
+        /// Prefill plans: the arena offsets of the half key and value rows to write as well, and
+        /// their positions (`MOp::PfFlash::half`).
+        half: Option<(usize, usize, usize)>,
         /// Where this op's RoPE table starts in the step's cos / sin floats.
         cs: usize,
         /// Multi-token plans: the pipeline, the qkv and query-output strides in floats, and the
@@ -1440,6 +1456,21 @@ enum MOp {
         gate: usize,
         nh: usize,
         a: [u32; 12],
+        /// `pfm_*`: the arena offsets of the half key and value rows and their positions; a
+        /// step past them takes `alt` (`pff_*`: pipeline, queries and threads per threadgroup).
+        half: Option<(usize, usize, usize)>,
+        alt: (Id, usize, usize),
+    },
+    /// Prefill plans: the cache positions before the chunk (from `window` before it, 0: all) as
+    /// half rows for `pfm_*` (`pf_kv_half`; `n4` float4s per row).
+    PfKvHalf {
+        pipe: Id,
+        kv: usize,
+        kh: usize,
+        vh: usize,
+        n4: u32,
+        window: usize,
+        cap: usize,
     },
     /// Prefill plans: attention of every token of the chunk (`pfa_D_G`), dense or QSA.
     PfAttn {
@@ -1852,6 +1883,82 @@ impl MetalBackend {
             total += (2 * tokens * no * 4).next_multiple_of(256);
         }
         // The view whose half rows the scratch holds, and the routed experts.
+        // Matrix-unit attention (`pfm_*`): a cache written by one QkRope of the plan and read by
+        // plain Attends only gets a slot of half key and value rows (by position, up to
+        // PF_KVH_PAST before the chunk), which the QkRope fills for the chunk and `pf_kv_half` for
+        // the positions before; caches whose lives (first write to last read) do not overlap
+        // share a slot. (arena offset of the keys, of the values, positions) per cache.
+        let mut kvh: Vec<Option<(usize, usize, usize)>> = vec![None; g.kv.len()];
+        let mut kvh_window: Vec<usize> = vec![0; g.kv.len()];
+        let mut kvh_slot: Vec<usize> = vec![0; g.kv.len()];
+        if pf && pf_flash() && pf_mma_attn() {
+            // (first writer, writers, last reader, ok) per cache, and the widest window (0: none).
+            let mut life: Vec<(usize, usize, usize, bool)> = vec![(usize::MAX, 0, 0, true); g.kv.len()];
+            let mut full = vec![false; g.kv.len()];
+            for (i, op) in g.ops.iter().enumerate() {
+                match *op {
+                    Op::QkRope { kv, nkv, .. } if nkv > 0 => {
+                        let l = &mut life[kv];
+                        l.0 = l.0.min(i);
+                        l.1 += 1;
+                    }
+                    Op::Attend {
+                        kv,
+                        block,
+                        hd,
+                        nh,
+                        nkv,
+                        window,
+                        ..
+                    } => {
+                        match window {
+                            Some(w) => kvh_window[kv] = kvh_window[kv].max(w),
+                            None => full[kv] = true,
+                        }
+                        let l = &mut life[kv];
+                        l.2 = i;
+                        l.3 &= block.is_none() && matches!(hd, 64 | 128 | 256 | 512) && nkv > 0 && nh.is_multiple_of(nkv);
+                    }
+                    Op::QsaKey { kv, .. } | Op::QsaSelect { kv, .. } | Op::AttendSel { kv, .. } => life[kv].3 = false,
+                    _ => {}
+                }
+            }
+            // Slots: (last reader, bytes).
+            let mut slots: Vec<(usize, usize)> = Vec::new();
+            let mut order: Vec<usize> = (0..g.kv.len())
+                .filter(|&k| life[k].1 == 1 && life[k].3 && life[k].2 > life[k].0)
+                .collect();
+            order.sort_by_key(|&k| life[k].0);
+            let mut assigned: Vec<Option<usize>> = vec![None; g.kv.len()];
+            let rows = tokens + PF_KVH_PAST;
+            for k in order {
+                if full[k] {
+                    kvh_window[k] = 0;
+                }
+                let bytes = (rows * g.kv[k].0 * g.kv[k].1 * 2).next_multiple_of(256);
+                let s = match slots.iter().position(|sl| sl.0 < life[k].0) {
+                    Some(s) => s,
+                    None => {
+                        slots.push((0, 0));
+                        slots.len() - 1
+                    }
+                };
+                slots[s].0 = life[k].2;
+                slots[s].1 = slots[s].1.max(bytes);
+                assigned[k] = Some(s);
+            }
+            let mut at = Vec::with_capacity(slots.len());
+            for sl in &slots {
+                at.push(total);
+                total += 2 * sl.1;
+            }
+            for k in 0..g.kv.len() {
+                if let Some(s) = assigned[k] {
+                    kvh[k] = Some((at[s], at[s] + slots[s].1, rows));
+                    kvh_slot[k] = s;
+                }
+            }
+        }
         let mut xh_of: Option<(usize, usize, usize)> = None;
         let mut pf_experts: Vec<PfExperts> = Vec::new();
         // Constants: every vector 64-byte aligned.
@@ -2155,6 +2262,19 @@ impl MetalBackend {
                     if hd > 512 || !hd.is_multiple_of(32) || 2 * half_rot > hd || g.rope_halves.get(rope) != Some(&half_rot) {
                         return None;
                     }
+                    if nkv > 0
+                        && let Some((kh, vh, cap)) = kvh[kv]
+                    {
+                        emit.push(MOp::PfKvHalf {
+                            pipe: self.named_pipeline("pf_kv_half")?,
+                            kv,
+                            kh,
+                            vh,
+                            n4: (nkv * hd / 4) as u32,
+                            window: kvh_window[kv],
+                            cap,
+                        });
+                    }
                     emit.push(MOp::QkRope {
                         pipe: self.named_pipeline("dec_qk_rope")?,
                         qkv: byte(qkv),
@@ -2179,6 +2299,7 @@ impl MetalBackend {
                             v_from_k: v_from_k as u32,
                             _p: [0; 2],
                         },
+                        half: if nkv > 0 { kvh[kv] } else { None },
                         cs: g.rope_halves[..rope].iter().map(|h| 2 * h).sum(),
                         t: if mt {
                             Some((
@@ -2197,6 +2318,9 @@ impl MetalBackend {
                     let mut w = vec![rng(q_out, nh * hd)];
                     if nkv > 0 {
                         w.push((KV_RES + kv, 0, usize::MAX));
+                        if kvh[kv].is_some() {
+                            w.push((PF_KVH_RES + kvh_slot[kv], 0, usize::MAX));
+                        }
                     }
                     (vec![rng(qkv, end)], w)
                 }
@@ -3164,15 +3288,33 @@ impl MetalBackend {
                     if nkv == 0 || !nh.is_multiple_of(nkv) || g.kv.get(kv) != Some(&(nkv, hd)) {
                         return None;
                     }
-                    // Heads of 256 and 512 split their dimensions over SIMD-groups (`pffs_*`).
-                    let (name, qt, threads) = match hd {
-                        256 => ("pffs_256", 32, 256),
-                        512 => ("pffs_512", 16, 256),
-                        _ => ("pff_", 32, 128),
+                    // Heads of 256 and 512 split their dimensions over SIMD-groups (`pffs_*`);
+                    // on the matrix units (`pfm_*`), queries and threads per threadgroup as the
+                    // kernels' instances.
+                    let (alt, aqt, athreads) = match hd {
+                        256 => ("pffs_256".to_string(), 32, 256),
+                        512 => ("pffs_512".to_string(), 16, 256),
+                        _ => (format!("pff_{hd}"), 32, 128),
                     };
-                    let name = if hd <= 128 { format!("{name}{hd}") } else { name.to_string() };
+                    let alt = (self.named_pipeline(&alt)?, aqt, athreads);
+                    let mut half = kvh[kv];
+                    let mma = match hd {
+                        64 => Some(("pfm_64", 32, 128)),
+                        128 => Some(("pfm_128", 16, 128)),
+                        256 => Some(("pfm_256", 16, 128)),
+                        512 => Some(("pfm_512", 16, 256)),
+                        _ => None,
+                    }
+                    .filter(|_| half.is_some())
+                    .and_then(|(n, q, th)| Some((self.named_pipeline(n)?, q, th)));
+                    if mma.is_none() {
+                        half = None;
+                    }
+                    let (pipe, qt, threads) = mma.unwrap_or(alt);
                     emit.push(MOp::PfFlash {
-                        pipe: self.named_pipeline(&name)?,
+                        half,
+                        alt,
+                        pipe,
                         qt,
                         threads,
                         q: byte(q),
@@ -3196,6 +3338,9 @@ impl MetalBackend {
                         ],
                     });
                     let mut r = vec![rng(q, nh * hd), (KV_RES + kv, 0, usize::MAX)];
+                    if half.is_some() {
+                        r.push((PF_KVH_RES + kvh_slot[kv], 0, usize::MAX));
+                    }
                     if let Some((v, s)) = gate {
                         r.push(rng(v, nh * s));
                     }
@@ -3917,11 +4062,14 @@ impl MetalPlan<'_> {
                 kn,
                 p,
                 t: tk,
+                half,
                 ..
             } => {
                 let (pipe, sq, so, cs) = tk.expect("multi-token rope");
                 let mut p = *p;
                 p.pos = pos as u32;
+                let half = half.filter(|h| pos + t <= h.2);
+                p._p[0] = half.is_some() as u32;
                 e.pipe(pipe);
                 e.buf(arena, *qkv, 0);
                 e.buf(arena, *qo, 1);
@@ -3932,6 +4080,10 @@ impl MetalPlan<'_> {
                 e.bytes(&p, 6);
                 e.buf(arena, cs, 7);
                 e.bytes(&[sq, so, 2 * p.half_rot, 0u32], 8);
+                if let Some((kh, vh, _)) = half {
+                    e.buf(arena, kh, 9);
+                    e.buf(arena, vh, 10);
+                }
                 e.dispatch(((p.nh + 2 * p.nkv) as usize, t), p.hd as usize);
             }
             MOp::AddNorm {
@@ -4191,7 +4343,8 @@ impl MetalPlan<'_> {
             | MOp::PfExperts(_)
             | MOp::PfGdn { .. }
             | MOp::PfAttn { .. }
-            | MOp::PfFlash { .. } => unreachable!("prefill op in a multi-token plan"),
+            | MOp::PfFlash { .. }
+            | MOp::PfKvHalf { .. } => unreachable!("prefill op in a multi-token plan"),
         }
     }
 }
@@ -4877,18 +5030,46 @@ impl MetalPlan<'_> {
                 gate,
                 nh,
                 a,
+                half,
+                alt,
             } => {
                 let mut a = *a;
                 a[0] = pos as u32;
                 a[1] = t as u32;
-                e.pipe(*pipe);
+                let mma = half.filter(|h| pos + t <= h.2);
+                let (pipe, qt, threads) = if mma.is_some() { (*pipe, *qt, *threads) } else { *alt };
+                e.pipe(pipe);
                 e.buf(arena, *q, 0);
                 e.buf(kvb[*kv].0, 0, 1);
                 e.buf(kvb[*kv].1, 0, 2);
                 e.buf(arena, *out, 3);
                 e.buf(arena, *gate, 4);
                 e.bytes(&a, 5);
-                e.dispatch((t.div_ceil(*qt), *nh), *threads);
+                if let Some((kh, vh, _)) = mma {
+                    e.buf(arena, kh, 6);
+                    e.buf(arena, vh, 7);
+                }
+                e.dispatch((t.div_ceil(qt), *nh), threads);
+            }
+            MOp::PfKvHalf {
+                pipe,
+                kv,
+                kh,
+                vh,
+                n4,
+                window,
+                cap,
+            } => {
+                let lo = if *window > 0 { pos.saturating_sub(*window) } else { 0 };
+                if pos > lo && pos + t <= *cap {
+                    e.pipe(*pipe);
+                    e.buf(kvb[*kv].0, 0, 0);
+                    e.buf(kvb[*kv].1, 0, 1);
+                    e.buf(arena, *kh, 2);
+                    e.buf(arena, *vh, 3);
+                    e.bytes(&[*n4, lo as u32], 4);
+                    e.dispatch(((*n4 as usize).div_ceil(256), pos - lo), 256);
+                }
             }
             MOp::PfAttn {
                 pipe,
@@ -5585,7 +5766,7 @@ impl DecodePlan for MetalPlan<'_> {
                         MOp::XHalf { .. } | MOp::Gemm { .. } | MOp::GemmF32 { .. } | MOp::AddRows { .. } => "mv",
                         MOp::PfTopk { .. } | MOp::PfExperts(_) => "moe",
                         MOp::PfGdn { .. } => "gdn",
-                        MOp::PfAttn { .. } | MOp::PfFlash { .. } => "attn",
+                        MOp::PfAttn { .. } | MOp::PfFlash { .. } | MOp::PfKvHalf { .. } => "attn",
                     };
                     if !o.split(',').any(|x| x == k) {
                         continue;
@@ -5627,7 +5808,8 @@ impl DecodePlan for MetalPlan<'_> {
                     | MOp::PfExperts(_)
                     | MOp::PfGdn { .. }
                     | MOp::PfAttn { .. }
-                    | MOp::PfFlash { .. } => unreachable!("prefill op in a one-token plan"),
+                    | MOp::PfFlash { .. }
+                    | MOp::PfKvHalf { .. } => unreachable!("prefill op in a one-token plan"),
                     MOp::Norm {
                         pipe,
                         x,
@@ -6053,6 +6235,7 @@ impl DecodePlan for MetalPlan<'_> {
                         MOp::GdnConv { .. } => "conv".into(),
                         MOp::PfAttn { .. } => "attn".into(),
                         MOp::PfFlash { .. } => "flash attn".into(),
+                        MOp::PfKvHalf { .. } => "kv half".into(),
                         MOp::QkRope { .. } => "qkrope".into(),
                         MOp::QsaKey { .. } => "qsa key".into(),
                         MOp::QsaScore { .. } => "qsa score".into(),
@@ -7145,6 +7328,114 @@ mod tests {
                             String::new()
                         }
                     );
+                }
+                println!("{line}");
+            }
+        }
+    }
+
+    /// Prefill attention kernels (`PfFlash`'s): GPU time of a chunk's causal attention over an f32
+    /// cache (and its half copy, buffers 6 and 7), outputs checked against the first pipeline. `OXINFER_AB_SHAPES=nh:nkv:hd,..`,
+    /// `OXINFER_AB_T=512,2048` (queries), `OXINFER_AB_START=0` (cached positions before them),
+    /// `OXINFER_AB_WINDOW=0`, `OXINFER_AB_PIPES=pff_128:32:128,pfm_128:32:128` (kernel, queries
+    /// and threads per threadgroup; `%` in a name is replaced by the head size).
+    #[test]
+    #[ignore]
+    fn pf_attn_bench() {
+        let be = MetalBackend::new().unwrap();
+        let env = |k: &str, d: &str| std::env::var(k).unwrap_or(d.into());
+        let start: usize = env("OXINFER_AB_START", "0").parse().unwrap();
+        let window: usize = env("OXINFER_AB_WINDOW", "0").parse().unwrap();
+        let mut seed = 11u64;
+        for shape in env("OXINFER_AB_SHAPES", "32:8:128").split(',') {
+            let v: Vec<usize> = shape.split(':').map(|x| x.parse().unwrap()).collect();
+            let (nh, nkv, hd) = (v[0], v[1], v[2]);
+            for t in env("OXINFER_AB_T", "512,2048").split(',').map(|x| x.parse::<usize>().unwrap()) {
+                let n = start + t;
+                let q: PageVec<f32> = {
+                    let mut q = PageVec::<f32>::zeroed(t.next_multiple_of(128) * nh * hd);
+                    q.iter_mut().for_each(|x| *x = lcg(&mut seed) * 6.0);
+                    q
+                };
+                let mut kc = PageVec::<f32>::zeroed(n.next_multiple_of(128) * nkv * hd);
+                let mut vc = PageVec::<f32>::zeroed(n.next_multiple_of(128) * nkv * hd);
+                kc.iter_mut().for_each(|x| *x = lcg(&mut seed) * 6.0);
+                vc.iter_mut().for_each(|x| *x = lcg(&mut seed) * 2.0);
+                // Half copies of the cache (`pfm_*` reads those).
+                let half_of = |c: &PageVec<f32>| {
+                    let mut h = PageVec::<u16>::zeroed(c.len());
+                    h.iter_mut().zip(c.iter()).for_each(|(h, &x)| *h = half::f16::from_f32(x).to_bits());
+                    h
+                };
+                let (kh, vh) = (half_of(&kc), half_of(&vc));
+                let wkh = be.wrap(kh.as_ptr() as *const u8, kh.len() * 2).unwrap();
+                let wvh = be.wrap(vh.as_ptr() as *const u8, vh.len() * 2).unwrap();
+                let outs: Vec<PageVec<f32>> = (0..2).map(|_| PageVec::<f32>::zeroed(t.next_multiple_of(128) * nh * hd)).collect();
+                let wq = be.wrap(q.as_ptr() as *const u8, q.len() * 4).unwrap();
+                let wk = be.wrap(kc.as_ptr() as *const u8, kc.len() * 4).unwrap();
+                let wv = be.wrap(vc.as_ptr() as *const u8, vc.len() * 4).unwrap();
+                let wo: Vec<_> = outs
+                    .iter()
+                    .map(|o| be.wrap(o.as_ptr() as *const u8, o.len() * 4).unwrap())
+                    .collect();
+                let a: [u32; 12] = [
+                    start as u32,
+                    t as u32,
+                    nh as u32,
+                    nkv as u32,
+                    (1.0f32 / (hd as f32).sqrt()).to_bits(),
+                    window as u32,
+                    (nh * hd) as u32,
+                    (nh * hd) as u32,
+                    0,
+                    0,
+                    0,
+                    0,
+                ];
+                let pipes = env("OXINFER_AB_PIPES", "pff_%:32:128,pfm_%:32:128");
+                let mut line = format!("{nh}x{hd} kv {nkv} t={t} start={start}");
+                let flops = {
+                    // Causal pairs (within the window) times 4 hd flops per head.
+                    let pairs: usize = (start..n).map(|p| if window > 0 { (p + 1).min(window) } else { p + 1 }).sum();
+                    4.0 * (pairs * hd * nh) as f64
+                };
+                for (pi, spec) in pipes.split(',').enumerate() {
+                    let mut it = spec.split(':');
+                    let name = it.next().unwrap().replace('%', &hd.to_string());
+                    let qt: usize = it.next().unwrap().parse().unwrap();
+                    let threads: usize = it.next().unwrap().parse().unwrap();
+                    let Some(pipe) = be.named_pipeline(&name) else {
+                        let _ = write!(line, " {name}: missing");
+                        continue;
+                    };
+                    let o = (pi > 0) as usize;
+                    let enc = |e: &FastEnc| {
+                        e.pipe(pipe);
+                        e.buf(wq.id, wq.offset_bytes, 0);
+                        e.buf(wk.id, wk.offset_bytes, 1);
+                        e.buf(wv.id, wv.offset_bytes, 2);
+                        e.buf(wo[o].id, wo[o].offset_bytes, 3);
+                        e.buf(wq.id, wq.offset_bytes, 4);
+                        e.bytes(&a, 5);
+                        e.buf(wkh.id, wkh.offset_bytes, 6);
+                        e.buf(wvh.id, wvh.offset_bytes, 7);
+                        e.dispatch((t.div_ceil(qt), nh), threads);
+                    };
+                    timed(&be, |e| enc(e));
+                    let mut best = f64::MAX;
+                    for _ in 0..8 {
+                        best = best.min(timed(&be, |e| (0..4).for_each(|_| enc(e))) / 4.0);
+                    }
+                    let mut err = String::new();
+                    if pi > 0 {
+                        let (mut d, mut m) = (0f32, 0f32);
+                        for (x, y) in outs[0][..t * nh * hd].iter().zip(&outs[1][..t * nh * hd]) {
+                            d = d.max((x - y).abs());
+                            m = m.max(x.abs());
+                        }
+                        err = format!(" (d {:.1e})", d / m);
+                    }
+                    let _ = write!(line, " {name}: {:.3} ms {:.1} TF{err}", best * 1e3, flops / best / 1e12);
                 }
                 println!("{line}");
             }

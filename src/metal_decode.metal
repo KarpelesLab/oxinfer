@@ -702,7 +702,7 @@ struct QP { uint nh; uint nkv; uint hd; uint half_rot; uint q_stride; uint k_off
 template <typename CS>
 inline void qk_rope_body(device const float* qkv, device float* qo, device float* kc, device float* vc, device const float* qn,
                          device const float* kn, constant QP& p, uint pos, CS cs, uint h, uint i, uint sg, uint lane,
-                         threadgroup float* buf, threadgroup float* red);
+                         threadgroup float* buf, threadgroup float* red, device half* kh = nullptr, device half* vh = nullptr);
 kernel void dec_qk_rope(device const float* qkv [[buffer(0)]], device float* qo [[buffer(1)]], device float* kc [[buffer(2)]],
                         device float* vc [[buffer(3)]], device const float* qn [[buffer(4)]], device const float* kn [[buffer(5)]],
                         constant QP& p [[buffer(6)]], constant float* cs [[buffer(7)]],
@@ -713,21 +713,24 @@ kernel void dec_qk_rope(device const float* qkv [[buffer(0)]], device float* qo 
     qk_rope_body(qkv, qo, kc, vc, qn, kn, p, p.pos, cs, h, i, sg, lane, buf, red);
 }
 // Several tokens (grid y): token t at position pos + t, inputs and query outputs `ts.x` / `ts.y`
-// floats apart, its cos / sin `ts.z` floats apart in `cs`.
+// floats apart, its cos / sin `ts.z` floats apart in `cs`. With `_p0` (prefill plans), the keys
+// and values also go to `kh` / `vh` as half rows (`pfm_*` reads them), clamped to its range.
 kernel void dec_qk_rope_t(device const float* qkv [[buffer(0)]], device float* qo [[buffer(1)]], device float* kc [[buffer(2)]],
                           device float* vc [[buffer(3)]], device const float* qn [[buffer(4)]], device const float* kn [[buffer(5)]],
                           constant QP& p [[buffer(6)]], device const float* cs [[buffer(7)]], constant uint4& ts [[buffer(8)]],
+                          device half* kh [[buffer(9)]], device half* vh [[buffer(10)]],
                           uint2 tg [[threadgroup_position_in_grid]], uint i [[thread_index_in_threadgroup]],
                           uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float buf[512];
     threadgroup float red[16];
     uint t = tg.y;
-    qk_rope_body(qkv + (ulong)t * ts.x, qo + (ulong)t * ts.y, kc, vc, qn, kn, p, p.pos + t, cs + (ulong)t * ts.z, tg.x, i, sg, lane, buf, red);
+    qk_rope_body(qkv + (ulong)t * ts.x, qo + (ulong)t * ts.y, kc, vc, qn, kn, p, p.pos + t, cs + (ulong)t * ts.z, tg.x, i, sg, lane, buf, red,
+                 kh, vh);
 }
 template <typename CS>
 inline void qk_rope_body(device const float* qkv, device float* qo, device float* kc, device float* vc, device const float* qn,
                          device const float* kn, constant QP& p, uint pos, CS cs, uint h, uint i, uint sg, uint lane,
-                         threadgroup float* buf, threadgroup float* red) {
+                         threadgroup float* buf, threadgroup float* red, device half* kh, device half* vh) {
     uint hd = p.hd;
     uint kind = h < p.nh ? 0 : (h < p.nh + p.nkv ? 1 : 2); // query, key, value head
     uint hh = kind == 0 ? h : (kind == 1 ? h - p.nh : h - p.nh - p.nkv);
@@ -747,6 +750,7 @@ inline void qk_rope_body(device const float* qkv, device float* qo, device float
     }
     if (kind == 2) {
         vc[((ulong)pos * p.nkv + hh) * hd + i] = v;
+        if (p._p0 != 0) vh[((ulong)pos * p.nkv + hh) * hd + i] = half(clamp(v, -65504.f, 65504.f));
         return;
     }
     buf[i] = v;
@@ -766,7 +770,20 @@ inline void qk_rope_body(device const float* qkv, device float* qo, device float
         }
     }
     if (kind == 0) qo[hh * hd + i] = v;
-    else kc[((ulong)pos * p.nkv + hh) * hd + i] = v;
+    else {
+        kc[((ulong)pos * p.nkv + hh) * hd + i] = v;
+        if (p._p0 != 0) kh[((ulong)pos * p.nkv + hh) * hd + i] = half(clamp(v, -65504.f, 65504.f));
+    }
+}
+
+// ---- Prefill plans (`pfm_*`): cache rows p.y .. p.y + grid y - 1 (p.x float4s each) of keys
+// and values as half rows, clamped to its range.
+kernel void pf_kv_half(device const float4* kc [[buffer(0)]], device const float4* vc [[buffer(1)]], device half4* kh [[buffer(2)]],
+                       device half4* vh [[buffer(3)]], constant uint2& p [[buffer(4)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.x) return;
+    ulong at = (ulong)(p.y + gid.y) * p.x + gid.x;
+    kh[at] = half4(clamp(kc[at], -65504.f, 65504.f));
+    vh[at] = half4(clamp(vc[at], -65504.f, 65504.f));
 }
 
 // ---- Attention of one query per head over the cache (positions lo..len-1). One threadgroup of
