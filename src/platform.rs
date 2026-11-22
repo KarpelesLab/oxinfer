@@ -588,6 +588,16 @@ pub mod gpu {
             "libMoltenVK.dylib",
         ];
 
+        /// Held while this process creates or destroys a Vulkan instance or device, one at a
+        /// time. NVIDIA's driver (580.173 on a DGX Spark) can lock up when several threads do so
+        /// at once: one of its own threads spins in its exit handler while `vkDestroyDevice`
+        /// waits for it and every other call waits for the loader (2 of 9 runs of the test
+        /// suite, whose Vulkan tests each open their own devices).
+        pub fn lifecycle() -> std::sync::MutexGuard<'static, ()> {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            LOCK.lock().unwrap_or_else(|e| e.into_inner())
+        }
+
         #[repr(C)]
         struct InstanceCreateInfo {
             s_type: u32,
@@ -618,6 +628,7 @@ pub mod gpu {
             }
             let _ = &last;
             let vk = lib.ok_or_else(|| "libvulkan not installed".to_string())?;
+            let _one = lifecycle();
             let info = InstanceCreateInfo {
                 s_type: 1, // VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO
                 p_next: std::ptr::null(),

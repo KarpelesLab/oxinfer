@@ -480,6 +480,9 @@ impl Drop for Core {
         unsafe {
             if !self.dev.is_null() {
                 self.vk.vkDeviceWaitIdle(self.dev);
+            }
+            let _one = crate::platform::gpu::vulkan::lifecycle();
+            if !self.dev.is_null() {
                 self.vk.vkDestroyDevice(self.dev, std::ptr::null());
             }
             self.vk.vkDestroyInstance(self.inst, std::ptr::null());
@@ -759,10 +762,12 @@ impl VulkanBackend {
             exts: std::ptr::null(),
         };
         let mut inst: Ptr = std::ptr::null_mut();
-        check(
-            unsafe { vk.vkCreateInstance(&info, std::ptr::null(), &mut inst) },
-            "vkCreateInstance",
-        )?;
+        // One at a time in the process (see `lifecycle`); `core` below takes it again when it
+        // is dropped, so it is never held across a return.
+        let one = crate::platform::gpu::vulkan::lifecycle();
+        let rc = unsafe { vk.vkCreateInstance(&info, std::ptr::null(), &mut inst) };
+        drop(one);
+        check(rc, "vkCreateInstance")?;
         // From here on `core` owns the instance (and the device once it exists).
         let mut core = Core {
             vk,
@@ -886,10 +891,10 @@ impl VulkanBackend {
             features: std::ptr::null(),
         };
         let mut dev: Ptr = std::ptr::null_mut();
-        check(
-            unsafe { vk.vkCreateDevice(pd, &dinfo, std::ptr::null(), &mut dev) },
-            "vkCreateDevice",
-        )?;
+        let one = crate::platform::gpu::vulkan::lifecycle();
+        let rc = unsafe { vk.vkCreateDevice(pd, &dinfo, std::ptr::null(), &mut dev) };
+        drop(one);
+        check(rc, "vkCreateDevice")?;
         let mut queue: Ptr = std::ptr::null_mut();
         unsafe { vk.vkGetDeviceQueue(dev, family, 0, &mut queue) };
         core.pd = pd;
