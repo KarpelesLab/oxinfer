@@ -205,8 +205,8 @@ IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4. Three things run on the
   CPU path (the op-by-op GEMM checks its input on the host). Run on Qwen3.8-27B, Llama 3.2 1B and Orpheus 3B; Qwen3 and Qwen3.5 GGUF files build the
   same graph and were not run.
 - **Prompts, op by op** (interventions, image prompts' position lists, or when the plan cannot
-  be built): the same GEMM for the prefill-sized matmuls, the rest on the CPU (the 27B: 162
-  tok/s at 512 tokens).
+  be built): the same GEMM for the prefill-sized matmuls, the rest on the CPU (the 27B: 213
+  tok/s at 512 tokens, against 199 on the CPU alone).
 
 Still on the CPU, automatically: the ternary and 1-bit formats (TQ1_0, TQ2_0, Q1_0, Q2_0, PQ2_0,
 PTQ1_0) and FP8 matrices with block scales (no kernels; a model with one such matrix decodes on
@@ -220,37 +220,59 @@ path.
 Measured on the RTX 5080 against the CPU path (32 threads) and llama.cpp's CUDA backend (master
 `e300919`, 2026-11-22, `llama-bench -ngl 99 -p 512,2048 -n 128 -r 3`), `examples/parity_bench.rs`
 as in [the llama-bench matrix](performance.md#llama-bench-matrix-november-2026) (`lookup=0
-draft=none mtp=0`, median of 3), the engines one after the other per model, load average 15-21
-from other jobs; tok/s:
+draft=none mtp=0`, median of 3; release build). The oxinfer rows are from the tree with the
+[x86-64 CPU prefill](performance.md#x86-64-cpu-prefill-november-2026) work (the CPU's prompts on
+its int8 GEMM, the default; `exact`: `prefill_gemm=exact`, the f32 GEMM), at load averages 5-24;
+the llama.cpp rows from earlier the same day, at load averages 15-21, beside the
+same CUDA code (which measured 539 / 509 / 31.2 on the 27B then). tok/s:
 
 | Model | | pp512 | pp2048 | decode |
 |---|---|---:|---:|---:|
-| Qwen3.8-27B UD-Q3_K_XL (unsloth, 13.1 GB: IQ4_XS, IQ3_S, IQ3_XXS, IQ2_*, Q2_K-Q6_K, Q8_0, IQ4_NL) | CPU (`device=cuda` before) | 82.6 | | 5.3 |
-| | CUDA | 539 | 509 | 31.2 |
+| Qwen3.8-27B UD-Q3_K_XL (unsloth, 13.1 GB: IQ4_XS, IQ3_S, IQ3_XXS, IQ2_*, Q2_K-Q6_K, Q8_0, IQ4_NL) | CPU (what `device=cuda` ran before) | 199 (`exact` 81.5) | | 5.1 |
+| | CUDA | 537 | 516 | 31.1 |
 | | llama.cpp | 2488 | 2476 | 58.1 |
-| Llama-3.2-1B Q4_K_M (Q4_K, Q6_K) | CPU | 995 | | 70 |
-| | CUDA | 8899 | 7644 | 512 |
+| Llama-3.2-1B Q4_K_M (Q4_K, Q6_K) | CPU | 2405 (`exact` 1235) | | 74 |
+| | CUDA | 8485 | 7440 | 498 |
 | | llama.cpp | 43978 | 46597 | 755 |
-| Llama-3.2-1B Q8_0 | CPU | 1002 | | 46 |
-| | CUDA | 8986 | 7749 | 457 |
+| Llama-3.2-1B Q8_0 | CPU | 2288 (`exact` 1240) | | 48 |
+| | CUDA | 8971 | 7617 | 451 |
 | | llama.cpp | 46176 | 48477 | 533 |
-| Orpheus 3B Q4_K_M (the CPU's and CUDA's decode over 22 tokens) | CPU | 454 | | 29 |
-| | CUDA | 2370 | 1573 | 227 |
+| Orpheus 3B Q4_K_M (the CPU's and CUDA's decode over 22 tokens) | CPU | 1154 (`exact` 557) | | 32 |
+| | CUDA | 2352 | 1605 | 230 |
 | | llama.cpp | 18239 | 17757 | 319 |
 
 Agreement with the CPU path (`examples/qwen_greedy_dump.rs`: a raw prompt of 1,500 characters fed
-as one batch, then greedy tokens one at a time, the logits of every step compared): the prompt's
-last-token distribution within KL 4e-11 to 7e-7 on the 27B (largest logit difference 0.012) and
-2e-12 to 1.1e-7 on Llama 1B (0.005); decode steps differ as on the other
-quantized formats (the CPU kernels quantize activations to int8, the GPU keeps them f32): mean
-KL 1e-4 to 5e-4 per step (1.6e-3 on one 27B prompt), and with `OXINFER_GPU_DECODE_CHECK=1` on the
-27B 1.5e-4 with the same top token on 40 of 40 steps. Greedy tokens identical to the CPU's: 27B 3 of
-4 prompts over 32 tokens (the fourth parts at token 20, 0.337 against 0.335), Llama 1B Q4_K_M 5
-of 5 over 48, Q8_0 3 of 5 (the others part at tokens 26 and 28, 0.097 against 0.091 and 0.054
-against 0.053). `cargo test --lib cuda::tests::ggml` checks the matvec and the GEMM of every
-format against the dequantized rows' products in f64 (2e-6 of the summed magnitudes), and a
+as one batch, then greedy tokens one at a time, the logits of every step compared; four prompts
+on the 27B, five on Llama 1B Q4_K_M). The plan's GEMMs keep f32 activations, so the prompt
+matches the CPU's f32 GEMM (`OXINFER_PREFILL_GEMM=exact`): last-token distribution within KL
+4e-11 to 7e-7 on the 27B (largest logit difference 0.012) and 2e-12 to 1.1e-7 on Llama 1B
+(0.005). Against the CPU's default for prompts, the int8 GEMM (`fast`), it differs by that
+GEMM's rounding: KL 6e-6 to 8e-3 on the 27B (logits up to 0.62) and 1.3e-4 to 1.5e-3 on Llama
+1B (0.28). Decode steps differ as on the other quantized formats (the CPU kernels quantize
+activations to int8, the GPU keeps them f32): mean KL 1e-4 to 7e-4 per step (1.2e-3 to 1.6e-3
+on one 27B prompt), and with `OXINFER_GPU_DECODE_CHECK=1` on the 27B 1.5e-4 with the same top
+token on 40 of 40 steps. Greedy tokens identical to the CPU's:
+
+| | CPU prompt on `exact` | CPU prompt on `fast` (default) |
+|---|---|---|
+| Qwen3.8-27B, 32 tokens | 3 of 4 (the fourth parts at token 20, 0.337 against 0.335) | 2 of 4 (one parts at token 20, one at the first token, 0.147 against 0.144) |
+| Llama-3.2-1B Q4_K_M, 48 tokens | 5 of 5 | 4 of 5 (the fifth parts at token 6, 0.059 against 0.056) |
+| Llama-3.2-1B Q8_0, 48 tokens (before the CPU work, when its prompt GEMM was the f32 one) | 3 of 5 (the others part at tokens 26 and 28, 0.097 against 0.091 and 0.054 against 0.053) | |
+
+`cargo test --lib cuda::tests::ggml` checks the matvec and the GEMM of every
+format against the dequantized rows' products in f64 (2e-6 of the summed magnitudes), a
 graph with an attention layer and a Gated DeltaNet layer over GGUF weights as a single-token, a
-multi-token (bit-identical) and a prefill plan (2e-4 of the largest value).
+multi-token (bit-identical) and a prefill plan (2e-4 of the largest value), and that a load,
+run, drop and reload leaves the device's free memory where it was.
+
+**Memory.** GGUF device weights are owned like the other formats': a matrix's copy by its layer,
+freed when the model drops it; the plans' arenas, constants and pinned buffers by the plans,
+which the model owns; the KV copies and recurrent states by the session. So an unload (the
+server's idle unload, a model dropped by the host) returns the device memory: three load / run /
+drop rounds leave 14142 MB free after each drop of Llama-3.2-1B Q4_K_M (13116 MB while loaded)
+and 14140, 14140 and 14138 MB after the 27B's (1476 MB while loaded), with the same text each
+round. Only the compiled kernels of the formats seen stay for the process, as the main module
+does.
 
 Where the time goes, and what is left against llama.cpp (0.1-0.2x on prompts, 0.5-0.9x
 decoding):
