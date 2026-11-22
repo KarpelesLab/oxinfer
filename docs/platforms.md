@@ -16,7 +16,7 @@ GPU (metal #0): Apple M5 Max, memory 115.4 GB (unified with CPU)
 | Apple Silicon (macOS, iOS) | NEON kernels (CPU prefill GEMMs on the SME tiles on M4 and later, `prefill_gemm`) + Metal GEMM for prefill; on M5 / A19 the GPU matrix units (prefill GEMMs and MoE experts); single-token decode entirely on the GPU (Llama 3, Qwen3 / 3.5 / 3.8 incl. MoE, Gemma 3 / 4 incl. 26B-A4B) | measured; the f32 GEMM gives bit-identical logits to the CPU path, the matrix units (default where present) ~3e-4 relative per product (`OXINFER_METAL_MMA=0` for bit-identical); iOS: runs in the Simulator (CPU and Metal; `ios/`), Inkling-2 Mini there greedy-identical to the Mac on CPU, Metal and streamed ([iOS / iPadOS](inkling.md#ios--ipados)) |
 | Apple Neural Engine (macOS 15 / iOS 18) | Core ML, for ANEMLL-converted models | measured on macOS; builds for iOS; see [Core ML](coreml.md#core-ml--apple-neural-engine) |
 | x86-64 (Linux, Windows, macOS) | AVX2 + FMA + F16C kernels chosen at run time: bf16 / f32 dot tiles and prefill GEMM, Q8 via `maddubs`, Q4, every GGUF format, decode attention; scalar fallback below AVX2 or with `OXINFER_SIMD=scalar` (`--devices` prints the set in use). With AVX-512F the prefill GEMM takes 16 rows x 16 tokens per step and is cache-blocked by columns, bit-identical to the AVX2 GEMM (`OXINFER_SIMD=avx2` keeps the latter; see [x86-64 CPU kernels](performance.md#x86-64-cpu-kernels-november-2026)); the grid-table i-quants unpack with AVX2. With AVX-512 VNNI a language model's prompt takes the int8 prefill GEMM (`vpdpbusd`; `prefill_gemm=fast`, the default there, with the decode kernels' activation rounding; `prefill_gemm=exact` keeps the f32 GEMM; see [x86-64 CPU prefill](performance.md#x86-64-cpu-prefill-november-2026)), and without it `fast` is the f32 GEMM; a Qwen-family prompt's attention is the per-head loop with AVX2 / AVX-512 kernels (the bits of one-token attention; faster here than the score and value GEMMs other architectures take), and the Gated DeltaNet rule and element-wise passes use AVX2 / AVX-512 with the scalar loops' bits; Q4's multi-token column kernel and LoRA's dot products are NEON-only (x86 runs the token-pair and portable loops) | executed on Linux on one Zen 5 CPU (Threadripper 9970X); Windows and macOS compile only. Every AVX2 kernel is tested directly against its scalar fallback (bit for bit for the integer parts, GGUF rows and attention; 1e-6 of the summed magnitudes for the f32 sums). Qwen3.5-0.8B on 5 prompts, AVX2 against scalar: last-prompt-token logits within 4.8e-5 (bf16, Q8, Q4), same top 10; 64 greedy tokens identical in 14/15 runs, and bf16 within 5e-5 of transformers float32 with the same argmax (5/5). Q8 decode steps differ between the two by 0.4-0.6 in the largest logit (same top 1 on 317/320 teacher-forced steps), as far as either is from bf16: the integer block sums are identical (a build with the AVX2 integer path and the scalar order of f32 additions gives the scalar logits bit for bit over 169 steps), the f32 additions are ordered differently, and re-quantizing activations to int8 at every matmul amplifies that. Llama-3.2-1B GGUF (Q4_K_M, Q8_0): decode-kernel passes (`--prefill-chunk 1`) give bit-identical logits and greedy text to the portable path (10/10); with the f32 prefill GEMM the last hidden state differs by rounding (up to 1.8e-4 on values up to 17) and the logits by either ~2e-5 or 1.6e-3 to 5.7e-3: the LM head of the last token is a one-token pass on int8 activations, and the larger figure appears exactly when that rounding moves one to three of the 2048 int8 activations by one step (7/16 pseudo-random prompts on Q4_K_M, 5/16 on Q8_0; an f32 LM head pass on the same states stays within 1e-4 on all 32); on the 5 chat prompts 4.8e-3 / 3.5e-5 at most, 48 greedy tokens identical in 3/5 and 5/5 |
-| Linux / Windows + NVIDIA | CUDA driver API + NVRTC-compiled kernels (`cuda.rs`): prefill GEMMs (bf16, Q8, Q4, affine Q4), MoE experts (resident or streamed), convolutions, group / layer norms, attention; whole decode steps, single-token and multi-token (speculative verification); Inkling-2 / Mini whole prefill and decode passes on kernels of its own (every GGUF format but the ternary / 1-bit ones, NVFP4, MXFP8); loaded as a native binary, so a toolkit newer than the driver works | measured on Linux on one RTX 5080 (NVRTC 13.4, driver CUDA 13.2) and one RTX PRO 6000 Blackwell (Inkling-2), see [CUDA](#cuda); Windows and other GPUs not run |
+| Linux / Windows + NVIDIA | CUDA driver API + NVRTC-compiled kernels (`cuda.rs`): prefill GEMMs (bf16, Q8, Q4, affine Q4, the GGUF block formats), MoE experts (resident or streamed), convolutions, group / layer norms, attention; whole decode steps, single-token and multi-token (speculative verification), over the same formats; whole-pass prefill plans for GGUF weights ([below](#cuda)); Inkling-2 / Mini whole prefill and decode passes on kernels of its own (every GGUF format but the ternary / 1-bit ones, NVFP4, MXFP8); loaded as a native binary, so a toolkit newer than the driver works | measured on Linux on one RTX 5080 (NVRTC 13.4, driver CUDA 13.2) and one RTX PRO 6000 Blackwell (Inkling-2), see [CUDA](#cuda); Windows and other GPUs not run |
 | Android (aarch64) | NEON kernels | cross-compiles (`aarch64-linux-android`) |
 | Vulkan (any GPU with a Vulkan 1.0 driver) | compute shaders through the Vulkan loader (`vulkan.rs`, SPIR-V embedded in the binary): prefill GEMMs only (bf16, Q8, Q4, affine Q4); MoE experts, convolutions, norms, attention and decoding stay on the CPU | measured on Linux on one RTX 5080 (NVIDIA driver, Vulkan 1.4): logits bit-identical to the CPU path and the same greedy text for the four weight formats, see [Vulkan](#vulkan); integrated GPUs, other vendors, Windows, Android and MoltenVK not run |
 | wasm32 (WASI) | simd128 kernels (bf16, Q8, Q4), threads via wasi-threads | measured: Qwen3.5-0.8B Q8 at 123 tok/s decode with 16 threads under wasmtime 30, identical output to native; see below |
@@ -142,12 +142,12 @@ cuda`.
 Short inputs stay on the CPU (see `wants`), but opening the device costs about 0.1 s at start-up.
 
 Prompt speed with `--quant` weights that fit, measured again in November 2026 with llama-bench
-style passes (Qwen3.5-9B: q4 391-397 tok/s at 512 tokens and 364-368 at 2048, where the time
-goes, and the comparison with llama.cpp on a GGUF file, which this backend leaves to the CPU):
-[x86-64 CPU kernels](performance.md#x86-64-cpu-kernels-november-2026).
+style passes (Qwen3.5-9B: q4 391-397 tok/s at 512 tokens and 364-368 at 2048, and where the time
+goes): [x86-64 CPU kernels](performance.md#x86-64-cpu-kernels-november-2026).
 
 **Decoding.** Whole decode steps run on the GPU as compiled plans of the decode graph
-(`cuda_decode.rs`, the kernels ported from Metal's): matvecs (bf16, Q8, Q4, affine Q4), norms,
+(`cuda_decode.rs`, the kernels ported from Metal's): matvecs (bf16, Q8, Q4, affine Q4, the GGUF
+block formats, see below), norms,
 RoPE, attention (split over up to 64 chunks for long contexts), Gated DeltaNet, MoE routing and
 experts. 128 greedy tokens after a short chat prompt (fixed system prompt; the default one
 carries the time), same machine:
@@ -173,7 +173,8 @@ plain GPU decoding here (40 and 154 tok/s against 107 and 172): the drafts run o
 Q4 verification pass is compute-bound on the CUDA cores. So with CUDA decoding they are not the
 default (`Backend::prefers_plain_decode`); `--mtp` / `--draft` still use them.
 
-Declined (decoding stays on the CPU): interventions, Qwen4-Exp, GGUF weights (Inkling-2 aside, see below), and models whose
+Declined (decoding stays on the CPU): interventions, Qwen4-Exp, GGUF weights in the ternary /
+1-bit formats or in MoE experts (below), and models whose
 weights do not all fit in VRAM: Gemma 4 26B-A4B's experts do not on 16 GB
 (`OXINFER_GPU_PLAN_DEBUG=1` names the op). Recurrent states go up and down every step (copied back
 on a second stream under the remaining layers; the upload is skipped when nothing on the host
@@ -182,6 +183,95 @@ The image-model timings include loading and quantizing the weights.
 
 `cargo test --lib cuda::` compares every kernel with a reference computed in f64 from its
 definition; it fails if a kernel does not compile or load, and skips without an NVIDIA GPU or NVRTC.
+
+**GGUF weights.** A GGUF file's matrices are copied to the device as stored and read there by
+the kernels Inkling-2's engine already had for them (`inkling_cuda.cu`, compiled once per ggml
+format the first time a weight of it is uploaded and kept in `~/.cache/oxinfer/kernels`): F32,
+F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS,
+IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4. Three things run on them:
+
+- **Decode steps**: a matvec per format, a warp per row, activations f32 (a gate / up pair is
+  two matvecs and the activation). Multi-token plans (speculative verification) launch the same
+  kernel with a grid row per token, so their results are the single-token steps' bit for bit.
+- **Prompts, whole pass** (`decode_plan_prefill`, steps of up to 512 tokens,
+  `OXINFER_CUDA_PREFILL_TOKENS`; `OXINFER_PREFILL_GPU=0` keeps the op-by-op path): the matmuls as
+  tensor-core GEMMs with the weights' integer values as stored (exact in f16), the activations as
+  pairs of halves and each 16-column step's sums scaled in f32 (`gemmi_*`); RMSNorm, RoPE, the
+  activations, the Gated DeltaNet convolution and delta rule (the state in registers across the
+  step's tokens) over all tokens in one launch; attention with the decode kernel, 32 tokens per
+  launch; the hidden states, the new keys and values and the recurrent states come back to the
+  host. The halves hold activations below 32768 in magnitude: a kernel checks every GEMM input
+  on the device, and a step with a larger or non-finite value is dropped whole and runs on the
+  CPU path (the op-by-op GEMM checks its input on the host). Run on Qwen3.8-27B, Llama 3.2 1B and Orpheus 3B; Qwen3 and Qwen3.5 GGUF files build the
+  same graph and were not run.
+- **Prompts, op by op** (interventions, image prompts' position lists, or when the plan cannot
+  be built): the same GEMM for the prefill-sized matmuls, the rest on the CPU (the 27B: 162
+  tok/s at 512 tokens).
+
+Still on the CPU, automatically: the ternary and 1-bit formats (TQ1_0, TQ2_0, Q1_0, Q2_0, PQ2_0,
+PTQ1_0) and FP8 matrices with block scales (no kernels; a model with one such matrix decodes on
+the CPU), models with GGUF MoE experts (`qwen35moe`, Gemma 4 26B-A4B: the expert kernels read
+bf16 / Q8 / Q4 only; their dense matmuls take the GEMM in prompts), Hadamard-folded matrices,
+and models whose weights do not all fit in VRAM. Gemma GGUF files go through the same kernels
+(their sandwich norm one token at a time in a prefill plan) and were not run: none is on this
+machine. Prefill plans exist for GGUF weights only: bf16 / Q8 / Q4 prompts keep the op-by-op
+path.
+
+Measured on the RTX 5080 against the CPU path (32 threads) and llama.cpp's CUDA backend (master
+`e300919`, 2026-11-22, `llama-bench -ngl 99 -p 512,2048 -n 128 -r 3`), `examples/parity_bench.rs`
+as in [the llama-bench matrix](performance.md#llama-bench-matrix-november-2026) (`lookup=0
+draft=none mtp=0`, median of 3), the engines one after the other per model, load average 15-21
+from other jobs; tok/s:
+
+| Model | | pp512 | pp2048 | decode |
+|---|---|---:|---:|---:|
+| Qwen3.8-27B UD-Q3_K_XL (unsloth, 13.1 GB: IQ4_XS, IQ3_S, IQ3_XXS, IQ2_*, Q2_K-Q6_K, Q8_0, IQ4_NL) | CPU (`device=cuda` before) | 82.6 | | 5.3 |
+| | CUDA | 539 | 509 | 31.2 |
+| | llama.cpp | 2488 | 2476 | 58.1 |
+| Llama-3.2-1B Q4_K_M (Q4_K, Q6_K) | CPU | 995 | | 70 |
+| | CUDA | 8899 | 7644 | 512 |
+| | llama.cpp | 43978 | 46597 | 755 |
+| Llama-3.2-1B Q8_0 | CPU | 1002 | | 46 |
+| | CUDA | 8986 | 7749 | 457 |
+| | llama.cpp | 46176 | 48477 | 533 |
+| Orpheus 3B Q4_K_M (the CPU's and CUDA's decode over 22 tokens) | CPU | 454 | | 29 |
+| | CUDA | 2370 | 1573 | 227 |
+| | llama.cpp | 18239 | 17757 | 319 |
+
+Agreement with the CPU path (`examples/qwen_greedy_dump.rs`: a raw prompt of 1,500 characters fed
+as one batch, then greedy tokens one at a time, the logits of every step compared): the prompt's
+last-token distribution within KL 4e-11 to 7e-7 on the 27B (largest logit difference 0.012) and
+2e-12 to 1.1e-7 on Llama 1B (0.005); decode steps differ as on the other
+quantized formats (the CPU kernels quantize activations to int8, the GPU keeps them f32): mean
+KL 1e-4 to 5e-4 per step (1.6e-3 on one 27B prompt), and with `OXINFER_GPU_DECODE_CHECK=1` on the
+27B 1.5e-4 with the same top token on 40 of 40 steps. Greedy tokens identical to the CPU's: 27B 3 of
+4 prompts over 32 tokens (the fourth parts at token 20, 0.337 against 0.335), Llama 1B Q4_K_M 5
+of 5 over 48, Q8_0 3 of 5 (the others part at tokens 26 and 28, 0.097 against 0.091 and 0.054
+against 0.053). `cargo test --lib cuda::tests::ggml` checks the matvec and the GEMM of every
+format against the dequantized rows' products in f64 (2e-6 of the summed magnitudes), and a
+graph with an attention layer and a Gated DeltaNet layer over GGUF weights as a single-token, a
+multi-token (bit-identical) and a prefill plan (2e-4 of the largest value).
+
+Where the time goes, and what is left against llama.cpp (0.1-0.2x on prompts, 0.5-0.9x
+decoding):
+
+- **Prompts**: the GEMMs, 807 of the 910 ms of a 512-token step of the 27B (attention 28 ms, the
+  delta rule 51, the convolutions 11; `OXINFER_CUDA_DECODE_TRACE=2`, which waits for the device
+  after every kernel) and 37 of 49 ms on Llama 1B. `gemmi_*` reaches 22-38 TFLOP/s on the 27B's
+  shapes (IQ4_XS and Q4_K 36-38, IQ3_S 22-29, IQ2_S 26;
+  `cargo test --profile ci --lib ggml_bench -- --ignored --nocapture`), and llama.cpp processes
+  4.6x the tokens per second on the same card. In the kernel, by taking each part out in turn:
+  unpacking the weights is 20% of the time on IQ4_XS and 40% on IQ3_S, loading and splitting the
+  activations 15-25%, the second (low halves) tensor-core product 17%, the f32 scaling of the
+  sums under 3%. Measured and not kept: tiles of 256 tokens x 128 outputs with 16-column steps,
+  so that a weight is unpacked once per 256 tokens (26-27 TFLOP/s on IQ4_XS against 34-38);
+  weights and activations both split into halves, three products and no f32 scaling (25-27);
+  plain f16 operands, which are inexact (59 on IQ4_XS, 28 on IQ3_S).
+- **Decoding**: of the 27B's 32 ms per token, about 19 are the 497 matvecs by the kernels' own
+  rates (12.3 GB of weights: 710-830 GB/s on IQ4_XS, Q4_K and Q5_K, near what the card's memory
+  gives, 570-610 on IQ3_S and IQ3_XXS, 360-490 on the IQ2 formats and Q3_K), 6.6 the Gated
+  DeltaNet states' copy into host memory after every step (149 MB) and about 3 the other
+  kernels.
 
 **Inkling-2 / Inkling-2-Mini** run whole passes on the GPU with an engine of their own
 (`src/inkling_cuda.rs`, `inkling_cuda.cu`: the attention residual's mixes, the loop's message

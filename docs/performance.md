@@ -503,7 +503,7 @@ at `-ngl 0` (pp512 534 tok/s), and `-ngl 99 -r 3` for the CUDA row. tok/s:
 | Qwen3.5-9B `--quant q8`, CPU, 64 threads | 134 / 137 | 204 / 198 | | 6.7 / 6.7 | 6.8 / 6.5 | |
 | Qwen3.5-9B `--quant q4`, CUDA (pp512 / pp2048) | 300 / 251, 300 / 312 | 296 / 248, 306 / 306 | | 108.5 / 105.2 | 105.7 / 103.2 | |
 | Qwen3.5-9B `--quant q8`, CUDA (one round) | 317 / 272 | 320 / 298 | | 70.6 | 72.1 | |
-| Qwen3.8-27B UD-Q3_K_XL, `device=cuda` (GGUF weights stay on the CPU) | | 73.8 | 2497 (`-ngl 99`; pp2048 2488) | | 4.3 | 58.1 |
+| Qwen3.8-27B UD-Q3_K_XL, `device=cuda` (GGUF weights stayed on the CPU then; on the device since: 539 / 31.2, see [CUDA](platforms.md#cuda)) | | 73.8 | 2497 (`-ngl 99`; pp2048 2488) | | 4.3 | 58.1 |
 
 (Decode: 24-64 tokens after a 16-token prompt on the CPU, 128 on CUDA. The "after" columns are
 the two kernel changes below, on 64 threads; the zero-filling and the thread default came after
@@ -579,10 +579,13 @@ Where oxinfer is still behind on this machine:
   FLOP per cycle) is about where llama.cpp already is. An int8 GEMM for x86-64 changes the
   logits by the rounding documented under [CPU prefill GEMMs](#cpu-prefill-gemms-november-2026),
   so it was left out of this exact pass.
-- **CUDA with GGUF weights.** The CUDA backend has no GEMM or decode kernels for the GGUF
-  block formats, so `--device cuda` runs a GGUF file on the CPU: 74 tok/s at pp512 and 4.3
+- **CUDA with GGUF weights.** When this was measured the CUDA backend had no kernels for the
+  GGUF block formats, so `--device cuda` ran a GGUF file on the CPU: 74 tok/s at pp512 and 4.3
   decoding on the 27B, against llama.cpp's 2497 and 58.1 with every layer on the GPU (12.2 GiB
-  of the card's 16). This is the largest gap on this machine.
+  of the card's 16). GGUF weights now decode and prefill on the device (539 tok/s at pp512,
+  31.2 decoding, against 2488 and 58.1 in the same session; every block format but the ternary
+  and 1-bit ones): [CUDA](platforms.md#cuda) has the table, the agreement with the CPU path and
+  where the remaining time goes (the prefill GEMM, at 22-38 TFLOP/s).
 - **CUDA prefill** (safetensors weights; no GGUF of the 9B on disk for llama.cpp). `--profile`,
   Qwen3.5-9B q4, 641-token prompt, 2.48 s before the zero-filling change: the GEMM kernels
   0.57 s (128 launches), the host-device copies of their activations 0.61 s (copy-in 0.22,

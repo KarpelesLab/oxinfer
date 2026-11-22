@@ -59,8 +59,9 @@ format: F32, F16, BF16, Q4_0/Q4_1/Q5_0/Q5_1/Q8_0, Q2_K-Q6_K, IQ1_S/IQ1_M, IQ2_XX
 IQ3_XXS/S, IQ4_NL/XS, MXFP4 and the 1-bit and ternary types Q1_0, Q2_0, TQ1_0, TQ2_0 and
 PrismML's PQ2_0 / PTQ1_0 (`ggml.rs`, dequantization bit-exact with gguf-py or, for the 1-bit and
 ternary types, ggml's C code; see [below](#mixed-low-bit-and-ternary-ggufs)), with NEON decode
-kernels for every type but those six (which take the portable decoder on ARM) and Metal prefill
-kernels. On x86-64 with AVX2 every type's int8 dot
+kernels for every type but those six (which take the portable decoder on ARM), Metal prefill
+kernels, and CUDA decode and prefill kernels for every type but those six
+([CUDA](platforms.md#cuda)). On x86-64 with AVX2 every type's int8 dot
 products run on `maddubs` / `madd`, and the block-of-32 formats, the K-quants and IQ4_XS are
 unpacked in registers (`kernels_ggml_x86.rs`; the grid-table i-quants IQ1-IQ3 still unpack through
 the portable decoder); every row is bit-identical to the portable kernel's. The i-quants (IQ1-IQ3) decode several times
