@@ -291,6 +291,7 @@ average at start and end (other jobs shared the machine).
 | 7,666 tokens | 86.6 tok/s (89 s) | 13.9 tok/s | found | 6.8 GB | 10.0 / 8.5 |
 | 32,287 | 73.4 tok/s (7.3 min) | 8.7 tok/s | found | 8.2 GB | 3.2 / 16.3 |
 | 126,134 | 65.6 tok/s (32 min) | 8.5 tok/s | found | 9.7 GB | 3.0 / 15.7 |
+| 1,004,522 | 44 tok/s average over the first 546,816 (3.4 h), then stopped | not reached | not reached | 20.3 GB | 7.2 / 15.9 |
 
 (Before the cache change below; with it, the 32k prompt reads at 79.4 tok/s. The 126k prompt on
 the code before the GPU attention and the indexer changes: 37.9 tok/s, 55 min.)
@@ -308,9 +309,33 @@ plus its compressed caches: about 45 GB at 1M.
 So a 1M-token context fits beside the streamed weights (5.4 GB resident + 6.4 GB of context +
 the prefill's scratch). Time is the limit: the cost of a prompt token grows slowly with the
 context (the indexers score every compressed key; attention itself reads a fixed 512 chosen
-keys and the window), from about 12.7 ms at the start to 12.7 + 0.041 ms per thousand positions
-(fitted on the per-chunk rates of the 126k run), so 1M tokens take about 10 hours to read, the
-last chunks at ~18 tok/s.
+keys and the window).
+
+A 1,004,522-token passphrase prompt (the same test, the passphrase 2% in) was started and
+stopped by hand after 3.4 hours, at 546,816 tokens (54%), when the machine had to stop: no
+crash, but **no recall result at 1M**. Measured on the way (load average 7 at start, 13-23
+during the run from other jobs):
+
+| tokens read | time | rate of the last 2048 | peak footprint |
+|---|---|---|---|
+| 32,768 | 7.1 min | 73 tok/s | |
+| 131,072 | 33 min | 57 tok/s | |
+| 262,144 | 78 min | 43 tok/s | 12 GB |
+| 393,216 | 2.25 h | 34-37 tok/s | 15 GB |
+| 524,288 | 3.25 h | 35-39 tok/s | 16 GB |
+| 546,816 | 3.42 h | 35.5 tok/s | 20.3 GB (process peak) |
+
+The resident set stayed at ~100 GB (mapped page cache; 101 GB at most). The process's own
+memory grew faster than the 6.25 KiB of context per token (about 20 KB per token: growing
+buffers and the allocator's free memory; not chased). A straight-line fit of the time per token
+against the position (14.1 ms + 0.031 ms per thousand positions over this run; the rate held at
+~35-39 tok/s past 350k) puts the whole 1M prompt at about 8.3 hours, the last chunks near
+22 tok/s; the 126k run's fit (12.7 + 0.041) gave 10 hours. Decode at 1M was not reached; at 126k
+it is 8.5 tok/s.
+
+So: a 1M context allocates and runs on this machine, and its first 547k tokens were read
+without trouble, but finding a fact across the full 1M was not measured; the deepest recall
+measured is 126k.
 
 Prefill speed, the changes behind those figures:
 
