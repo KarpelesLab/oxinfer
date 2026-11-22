@@ -684,6 +684,97 @@ pub unsafe fn q4_rows_t1(m: &crate::quant::Q4Matrix, xq: *const i8, xs: *const f
     }
 }
 
+/// `out[j] = dot(q, keys[j * stride..])` for `n` keys of `hd` values, with the bits of
+/// `kernels::dot`: 8 partial sums per product (a multiply then an add, no FMA) added up in order,
+/// then the leftover elements. Eight keys go at a time, so eight independent sums are in flight
+/// instead of one that waits for each of its additions.
+///
+/// # Safety
+/// The CPU has AVX2; `q` covers `hd` values, `keys` `(n - 1) * stride + hd`, `out` `n`.
+#[target_feature(enable = "avx2")]
+pub unsafe fn dots_avx2(q: *const f32, hd: usize, keys: *const f32, stride: usize, n: usize, out: *mut f32) {
+    #[inline(always)]
+    unsafe fn pass<const K: usize>(q: *const f32, hd: usize, keys: *const f32, stride: usize, out: *mut f32) {
+        let chunks = hd / 8;
+        let mut acc = [_mm256_setzero_ps(); K];
+        for i in 0..chunks {
+            let qv = _mm256_loadu_ps(q.add(8 * i));
+            for k in 0..K {
+                acc[k] = _mm256_add_ps(acc[k], _mm256_mul_ps(qv, _mm256_loadu_ps(keys.add(k * stride + 8 * i))));
+            }
+        }
+        for k in 0..K {
+            let mut a = [0f32; 8];
+            _mm256_storeu_ps(a.as_mut_ptr(), acc[k]);
+            let mut s = a.iter().sum::<f32>();
+            for i in chunks * 8..hd {
+                s += *q.add(i) * *keys.add(k * stride + i);
+            }
+            *out.add(k) = s;
+        }
+    }
+    let mut j = 0;
+    while j + 8 <= n {
+        pass::<8>(q, hd, keys.add(j * stride), stride, out.add(j));
+        j += 8;
+    }
+    if j + 4 <= n {
+        pass::<4>(q, hd, keys.add(j * stride), stride, out.add(j));
+        j += 4;
+    }
+    while j < n {
+        pass::<1>(q, hd, keys.add(j * stride), stride, out.add(j));
+        j += 1;
+    }
+}
+
+/// `y[i] += alpha * x[i]` for `n` values (a multiply then an add per element, as the scalar
+/// loop: the same bits at any vector width).
+///
+/// # Safety
+/// [`avx2`] is true; `y` and `x` cover `n` values.
+pub unsafe fn axpy(y: *mut f32, alpha: f32, x: *const f32, n: usize) {
+    if avx512() {
+        axpy_avx512(y, alpha, x, n)
+    } else {
+        axpy_avx2(y, alpha, x, n)
+    }
+}
+
+#[target_feature(enable = "avx512f,avx2")]
+unsafe fn axpy_avx512(y: *mut f32, alpha: f32, x: *const f32, n: usize) {
+    let a = _mm512_set1_ps(alpha);
+    let mut i = 0;
+    while i + 16 <= n {
+        _mm512_storeu_ps(
+            y.add(i),
+            _mm512_add_ps(_mm512_loadu_ps(y.add(i)), _mm512_mul_ps(a, _mm512_loadu_ps(x.add(i)))),
+        );
+        i += 16;
+    }
+    while i < n {
+        *y.add(i) += alpha * *x.add(i);
+        i += 1;
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn axpy_avx2(y: *mut f32, alpha: f32, x: *const f32, n: usize) {
+    let a = _mm256_set1_ps(alpha);
+    let mut i = 0;
+    while i + 8 <= n {
+        _mm256_storeu_ps(
+            y.add(i),
+            _mm256_add_ps(_mm256_loadu_ps(y.add(i)), _mm256_mul_ps(a, _mm256_loadu_ps(x.add(i)))),
+        );
+        i += 8;
+    }
+    while i < n {
+        *y.add(i) += alpha * *x.add(i);
+        i += 1;
+    }
+}
+
 /// Q4: columns `k0..k1` of row `r` for the int8 prefill GEMM ([`crate::kernels::QMat::unpack_cols_i8`]):
 /// the nibbles minus 8 (low nibbles first in each block of 32), the f16 scales and the offsets.
 ///

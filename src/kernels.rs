@@ -2388,10 +2388,35 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     s
 }
 
+/// `out[j] = dot(q, &keys[j * stride..][..q.len()])` for every `j`: the bits of [`dot`], with
+/// several keys in flight at a time on x86-64 (each sum keeps its own order).
+pub fn dots(q: &[f32], keys: &[f32], stride: usize, out: &mut [f32]) {
+    let (hd, n) = (q.len(), out.len());
+    if n == 0 {
+        return;
+    }
+    assert!(keys.len() >= (n - 1) * stride + hd, "keys too short");
+    #[cfg(target_arch = "x86_64")]
+    if simd::avx2() {
+        // SAFETY: AVX2 was detected; the lengths were checked above.
+        unsafe { simd::dots_avx2(q.as_ptr(), hd, keys.as_ptr(), stride, n, out.as_mut_ptr()) };
+        return;
+    }
+    for (j, o) in out.iter_mut().enumerate() {
+        *o = dot(q, &keys[j * stride..j * stride + hd]);
+    }
+}
+
 /// y += alpha * x
 #[inline]
 pub fn axpy(y: &mut [f32], alpha: f32, x: &[f32]) {
     debug_assert_eq!(y.len(), x.len());
+    #[cfg(target_arch = "x86_64")]
+    if y.len() >= 16 && simd::avx2() {
+        // SAFETY: AVX2 was detected; both slices cover the length given.
+        unsafe { simd::axpy(y.as_mut_ptr(), alpha, x.as_ptr(), y.len().min(x.len())) };
+        return;
+    }
     for (yi, &xi) in y.iter_mut().zip(x) {
         *yi += alpha * xi;
     }

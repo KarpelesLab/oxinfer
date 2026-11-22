@@ -1387,6 +1387,11 @@ impl LayerCache {
         let o = (pos * self.n_kv + kvh) * self.hd;
         &self.k[o..o + self.hd]
     }
+    /// The keys of KV head `kvh` from position `pos` on: one every `n_kv * hd` values.
+    #[inline(always)]
+    pub fn k_from(&self, pos: usize, kvh: usize) -> &[f32] {
+        &self.k[(pos * self.n_kv + kvh) * self.hd..]
+    }
     #[inline(always)]
     pub fn v_at(&self, pos: usize, kvh: usize) -> &[f32] {
         let o = (pos * self.n_kv + kvh) * self.hd;
@@ -2416,10 +2421,16 @@ pub(crate) fn attention_ext(
         let n = hi - lo;
         let qbase = (ti * nh + h0) * hd;
         let mut scores = vec![0f32; group * n];
-        for j in 0..n {
-            let k = cache.k_at(lo + j, kvh);
+        if n > 0 {
+            // Each head against its keys (`dot`'s bits, several keys in flight on x86-64).
+            let keys = cache.k_from(lo, kvh);
             for h in 0..group {
-                scores[h * n + j] = dot(&q[qbase + h * hd..qbase + (h + 1) * hd], k);
+                crate::kernels::dots(
+                    &q[qbase + h * hd..qbase + (h + 1) * hd],
+                    keys,
+                    n_kv * hd,
+                    &mut scores[h * n..(h + 1) * n],
+                );
             }
         }
         for h in 0..group {
