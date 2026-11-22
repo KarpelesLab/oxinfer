@@ -110,7 +110,7 @@ pass routes to: a MoE layer's unit holds its attention / DeltaNet weights, the r
 shared expert, and each routed expert is an on-demand part of it (`UnitSpec::parts`) that the
 layer requests once routing is known (`StreamHook::need_parts`), read with priority over the
 read-ahead and then kept in a part cache (least recently used out) sized by what the budget
-leaves (`StreamOptions::part_cache_bytes`). A pass that used at least half of a unit's parts
+leaves (`StreamOptions::part_cache_bytes`). A pass that used at least half of a unit's parts, 16 or more,
 (a prefill chunk, which routes to nearly every expert of every layer and does so again at the
 next chunk) only fills free room: with more experts than the cache holds, read in a cycle,
 least-recently-used would evict each one just before its next use (DeepSeek V4.1, a 32k-token

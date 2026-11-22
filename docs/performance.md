@@ -32,6 +32,15 @@ With the Metal backend (default on Apple Silicon) prefill runs on the GPU:
 
 (616-token prompt.)
 
+A checkpoint larger than memory streams its experts (DeepSeek V4.1 Flash IQ1_M, 231 GB, on the
+M5 Max's 137 GB): a prefill chunk routes to nearly every expert of every layer, so the chunk size
+and the expert cache decide how much is read from the SSD. Streamed DeepSeek V4 / V4.1 prefills
+in chunks of at least 2048 tokens, and a pass that uses most of a layer's experts no longer
+evicts the cache's oldest ones (a cycle over more experts than the cache holds is the worst case
+of least-recently-used). A 32k-token prompt: 41.6 tok/s before the sparse attention moved to
+Metal, 73-75 after, 79.4 with the cache change (300 GB read instead of 717); 126k tokens at 65.6
+tok/s. See [DeepSeek V4.1](deepseek-v4.md#on-the-real-weights).
+
 CPU decode attention (`attn.rs`). When a decode step has fewer (token, KV head) pairs than threads
 (single-token steps of GQA models, one shared key-value head as in DeepSeek V4, Mistral Large 4's
 MLA latent cache, short speculative verification passes), attention runs in three parallel phases

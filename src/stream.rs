@@ -1001,14 +1001,15 @@ impl Streamer {
             if !(inner.managed && inner.opts.evict) {
                 return;
             }
-            // A pass that used most of a unit's parts (a prefill chunk of a MoE: nearly every
+            // A pass that used half of a unit's parts or more (a prefill chunk of a MoE: nearly every
             // expert of every layer, again at the next chunk) reads more experts than the cache
             // holds, in a cycle: least-recently-used would evict each one just before its next
             // use. Such a pass only fills free room, so that what the cache holds is a hit at
             // the next chunk (DeepSeek V4.1 IQ1_M, 115 GB of experts over a 90 GB cache, a 32k
             // prompt: 82% of the experts it needed were cached instead of 51%, 300 GB read
             // instead of 717, 79.4 tok/s instead of 74.6).
-            let scan = 2 * used.len() >= inner.units[u].parts.len();
+            // (Units of a few parts keep least-recently-used.)
+            let scan = used.len() >= 16 && 2 * used.len() >= inner.units[u].parts.len();
             for k in used {
                 out.extend(pc.admit(k, inner.units[k.0].parts[k.1].bytes, scan));
             }

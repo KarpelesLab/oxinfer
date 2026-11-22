@@ -78,6 +78,24 @@ pub(crate) fn attend(q: &[f32], keys: &[f32], idx: &[u32], meta: &[u32], sink: &
     else {
         return false;
     };
+    attend_on(be, q, keys, idx, meta, sink, nh, scale, out)
+}
+
+/// [`attend`] on `be`.
+#[allow(clippy::too_many_arguments)]
+fn attend_on(
+    be: &MetalBackend,
+    q: &[f32],
+    keys: &[f32],
+    idx: &[u32],
+    meta: &[u32],
+    sink: &[f32],
+    nh: usize,
+    scale: f32,
+    out: &mut [f32],
+) -> bool {
+    const HD: usize = 512;
+    let t = meta.len() / 2;
     let Some(pipe) = pipeline(be) else {
         return false;
     };
@@ -145,9 +163,10 @@ mod tests {
     /// rows (repeated rows and an empty list included).
     #[test]
     fn attend_matches_cpu() {
-        if crate::gpu::init(&crate::platform::detect(), crate::platform::DevicePref::Auto).is_err() || crate::gpu::active().is_none() {
+        // A backend of its own: the process-wide one would put the other tests on the GPU.
+        let Ok(be) = super::MetalBackend::new() else {
             return;
-        }
+        };
         let (t, nh, hd, nk) = (5, 16, 512, 300);
         let mut seed = 0x0d54u64;
         let mut rng = move || {
@@ -166,7 +185,7 @@ mod tests {
         let scale = (hd as f32).powf(-0.5);
         let mut out = vec![f32::NAN; t * nh * hd];
         assert!(
-            super::attend(&q, &keys, &idx, &meta, &sink, nh, scale, &mut out),
+            super::attend_on(&be, &q, &keys, &idx, &meta, &sink, nh, scale, &mut out),
             "the Metal kernel did not run"
         );
         let mut worst = 0f32;
