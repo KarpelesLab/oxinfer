@@ -2924,6 +2924,11 @@ pub struct DsparkDecoder<'m, M: Target> {
 ///   gives the most expected tokens per second of the round, from the measured cost of verifying
 ///   each length and each draft's chance of being accepted, estimated from its probability under
 ///   the draft model (calibrated online: drafts by probability bin, accepted or not).
+/// - How many to draft ([`Adaptive::best_k`]), where a draft pass costs more for more drafts (an
+///   Inkling-2 pass runs its head once per draft): the length with the most expected tokens per
+///   second from each slot's recent acceptance rate (given the slots before it were accepted) and
+///   the measured cost of drafting and verifying each length; one round in 8 drafts one more, so
+///   the next slot's rate stays measured.
 #[derive(Clone, Debug)]
 pub struct Adaptive {
     /// Recent cost of a draft pass, and of verifying (and committing) `t` drafts, with the number
@@ -2940,6 +2945,13 @@ pub struct Adaptive {
     pub probe: usize,
     /// This round was a probe (drafted against the measured rates).
     probing: bool,
+    /// Recent cost of a draft pass by its number of drafts.
+    pub draft_k: Vec<(f64, usize)>,
+    /// Decayed counts per slot of drafts verified after an accepted one (or first), and of
+    /// those accepted.
+    pub slots: Vec<(f64, f64)>,
+    /// Draft rounds so far (one in 8 explores a longer draft).
+    rounds: usize,
 }
 
 impl Default for Adaptive {
@@ -2952,6 +2964,9 @@ impl Default for Adaptive {
             plain_run: 0,
             probe: Self::PROBE,
             probing: false,
+            draft_k: Vec::new(),
+            slots: Vec::new(),
+            rounds: 0,
         }
     }
 }
@@ -2965,6 +2980,8 @@ impl Adaptive {
     const PRIOR: f64 = 2.0;
     /// Decay of the calibration counts per verified draft (a window of about 500 drafts).
     const BIN_DECAY: f64 = 0.998;
+    /// Decay of the per-slot acceptance counts per draft round (a window of about 30 rounds).
+    const SLOT_DECAY: f64 = 0.97;
 
     /// A moving average whose second sample replaces the first (which may include compiling a
     /// GPU plan or warming caches).
@@ -2984,6 +3001,22 @@ impl Adaptive {
             return;
         }
         Self::ema(&mut self.draft, draft);
+        if self.draft_k.len() <= probs.len() {
+            self.draft_k.resize(probs.len() + 1, (0.0, 0));
+        }
+        Self::ema(&mut self.draft_k[probs.len()], draft);
+        self.rounds += 1;
+        if self.slots.len() < verified {
+            self.slots.resize(verified, (0.0, 0.0));
+        }
+        for (j, s) in self.slots.iter_mut().enumerate() {
+            s.0 *= Self::SLOT_DECAY;
+            s.1 *= Self::SLOT_DECAY;
+            if j < verified.min(accepted + 1) {
+                s.0 += f64::from(u8::from(j < accepted));
+                s.1 += 1.0;
+            }
+        }
         for (j, &p) in probs.iter().enumerate().take(verified.min(accepted + 1)) {
             for b in &mut self.bins {
                 b.0 *= Self::BIN_DECAY;
@@ -3057,13 +3090,63 @@ impl Adaptive {
             return 0;
         };
         if self.gain.0 * plain >= self.gain.1 {
-            return k_max;
+            return self.best_k(k_max);
         }
         if self.plain_run >= self.probe {
             self.probing = true;
-            return k_max;
+            return self.best_k(k_max);
         }
         0
+    }
+
+    /// The number of drafts (1 to `k_max`) with the most expected tokens per second (see the
+    /// type's docs); `k_max` until the first slot's rate and some lengths are measured.
+    pub fn best_k(&self, k_max: usize) -> usize {
+        if k_max <= 1 || self.slots.first().is_none_or(|s| s.1 < 4.0) {
+            return k_max;
+        }
+        let mut best = (k_max, 0.0);
+        let (mut e, mut p, mut rate_prev) = (1.0, 1.0, 0.5);
+        for k in 1..=k_max {
+            // A slot's rate given the ones before it were accepted (one pseudo-count at the
+            // previous slot's rate: a slot rarely reached keeps a rate near it).
+            let (a, n) = self.slots.get(k - 1).copied().unwrap_or((0.0, 0.0));
+            rate_prev = (a + rate_prev) / (n + 1.0);
+            p *= rate_prev;
+            e += p;
+            let (Some(d), Some(v)) = (Self::interp(&self.draft_k, k), self.verify_time(k)) else {
+                return k_max;
+            };
+            let rate = e / (d + v).max(1e-9);
+            if rate > best.1 {
+                best = (k, rate);
+            }
+        }
+        if self.rounds % 8 == 7 {
+            return (best.0 + 1).min(k_max);
+        }
+        best.0
+    }
+
+    /// A cost measured by length (`(ema, count)` per length): measured, else linear between the
+    /// nearest measured lengths, else extended from the two last (or flat from one).
+    fn interp(m: &[(f64, usize)], k: usize) -> Option<f64> {
+        let pts: Vec<(usize, f64)> = m.iter().enumerate().filter(|e| e.1.1 > 0).map(|(j, e)| (j, e.0)).collect();
+        let lo = pts.iter().rev().find(|e| e.0 <= k);
+        let hi = pts.iter().find(|e| e.0 >= k);
+        match (lo, hi) {
+            (Some(a), Some(b)) if a.0 == b.0 => Some(a.1),
+            (Some(a), Some(b)) => Some(a.1 + (b.1 - a.1) * (k - a.0) as f64 / (b.0 - a.0) as f64),
+            (Some(a), None) => {
+                let prev = pts.iter().rev().find(|e| e.0 < a.0);
+                Some(match prev {
+                    Some(b) => a.1 + (a.1 - b.1).max(0.0) * (k - a.0) as f64 / (a.0 - b.0) as f64,
+                    None => a.1,
+                })
+            }
+            (None, Some(a)) => Some(a.1),
+            (None, None) => None,
+        }
     }
 
     /// How many of the proposed drafts (probabilities `probs`) to verify, given the draft pass
@@ -3212,6 +3295,9 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
             start = end;
             let hs = self.run(c, &local);
             last = hs[hs.len() - h..].to_vec();
+        }
+        if let Some(d) = &self.draft.ink {
+            d.warm(self.model);
         }
         self.model.logits(&last, 1)
     }

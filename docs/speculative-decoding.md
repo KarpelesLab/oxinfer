@@ -102,12 +102,14 @@ conversion `dspark-Inkling-2-Mini-Q8_0.gguf`, `--draft`), which runs as a DSpark
 target's streams at 4 depths as its context, a block of 8, and a recurrent head whose correction
 goes through the target's LM head. Sessions go back up to 64 positions (the short convolutions
 keep their inputs in rings by position), rounds verify at most 6 drafts (7-token passes stay on
-the bit-exact decode kernels), and greedy output is plain greedy output. It accepts 35-51% of 3
-drafts (2.0-2.5 tokens per forward) and 18-35% of 6; on the CPU a verification pass costs about
-its token count in steps (every token reads its own 8 experts), so the cost-aware rounds fall back
-to plain steps there. On the GPU the draft pass is one Metal submission (3-4 ms for 3 slots) and
-a 4-token verification costs 1.5-1.9 steps: 3 drafts gain 16% on code (Q8_0, 52 -> 61 tok/s) and
-are about even on prose and chat; lookup adds 0-8%. Numbers: [Inkling-2 Mini](inkling.md#speculative-decoding).
+the bit-exact decode kernels), and greedy output is plain greedy output. Its acceptance matches
+llama.cpp's own implementation on the same prompts (77-78% of 3 drafts on code, 47-48% on prose,
+35-38% on chat); on the CPU a verification pass costs about its token count in steps (every
+token reads its own 8 experts), so the cost-aware rounds fall back to plain steps there. On the
+GPU the draft pass is one Metal submission (3-4 ms for 3 slots) and a 4-token verification costs
+1.6-2 steps: drafts gain 45-65% on code (Q8_0, 58 -> 80-95 tok/s), are about even on prose and
+chat, and the cost-aware rounds (which also choose how many to draft) stay near plain speed where
+drafting does not pay. Numbers: [Inkling-2 Mini](inkling.md#speculative-decoding).
 
 ## Multi-token passes and MoE experts on the CPU
 

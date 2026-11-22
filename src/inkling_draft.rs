@@ -540,9 +540,19 @@ impl<'a> InkDraft<'a> {
         x
     }
 
+    /// Makes what the first draft pass would otherwise make (the head's product with the
+    /// target's LM head, and the accelerator's drafter): run at the end of a prefill, so that
+    /// decoding starts at full speed.
+    pub(crate) fn warm<M: Target + ?Sized>(&self, target: &M) {
+        if self.device_for(target).is_none() {
+            self.projection(target);
+        }
+    }
+
     /// The head's product with the target's LM head (see the module docs), made once.
     fn projection<M: Target + ?Sized>(&self, target: &M) -> &(Lin<'static>, Vec<f32>) {
         self.proj.get_or_init(|| {
+            let t0 = std::time::Instant::now();
             let (h, r) = (self.cfg.hidden, self.rank);
             // Rows of hidden_out^T (one per rank), then its bias: `[r + 1, H]` through the head.
             let mut rows = vec![0f32; (r + 1) * h];
@@ -553,12 +563,28 @@ impl<'a> InkDraft<'a> {
             }
             rows[r * h..].copy_from_slice(&self.hid_b);
             let y = target.head_raw(&rows, r + 1);
+            let t1 = t0.elapsed().as_secs_f64() * 1e3;
             let v = y.len() / (r + 1);
+            // `[r, v]` to bf16 `[v, r]`: tiles of 256 tokens in parallel, each reading its rows of y
+            // contiguously (a plain loop over j then t wrote 51M scattered values: ~200 ms).
             let mut w = crate::quant::PageVec::<u16>::zeroed(v * r);
-            for j in 0..r {
-                for (t, &yv) in y[j * v..(j + 1) * v].iter().enumerate() {
-                    w[t * r + j] = half::bf16::from_f32(yv).to_bits();
+            const TILE: usize = 256;
+            let wp = SendU16(w.as_mut_ptr());
+            crate::pool::run(v.div_ceil(TILE), &|ti| {
+                let (t0, t1) = (ti * TILE, (ti * TILE + TILE).min(v));
+                // SAFETY: tile ti writes rows t0..t1 of w only.
+                let out = unsafe { std::slice::from_raw_parts_mut(wp.get().add(t0 * r), (t1 - t0) * r) };
+                for j in 0..r {
+                    for (k, &yv) in y[j * v + t0..j * v + t1].iter().enumerate() {
+                        out[k * r + j] = half::bf16::from_f32(yv).to_bits();
+                    }
                 }
+            });
+            if std::env::var_os("OXINFER_DEBUG").is_some() {
+                eprintln!(
+                    "[inkling draft: head product in {:.0} ms ({t1:.0} ms the head)]",
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
             }
             (Lin::bf16_owned(w), y[r * v..].to_vec())
         })
@@ -641,9 +667,14 @@ impl<'a> InkDraft<'a> {
                         return None;
                     };
                     let (proj, cvec) = self.projection(target);
+                    let t0 = std::time::Instant::now();
                     let d = crate::metal::inkling_draft::build(self, head, self.w1_rows, proj, cvec);
                     if dbg {
-                        eprintln!("[inkling draft: on the device: {}]", d.is_some());
+                        eprintln!(
+                            "[inkling draft: on the device: {} ({:.0} ms)]",
+                            d.is_some(),
+                            t0.elapsed().as_secs_f64() * 1e3
+                        );
                     }
                     d
                 }
@@ -654,6 +685,17 @@ impl<'a> InkDraft<'a> {
                 }
             })
             .as_deref()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SendU16(*mut u16);
+unsafe impl Send for SendU16 {}
+unsafe impl Sync for SendU16 {}
+impl SendU16 {
+    #[inline(always)]
+    fn get(self) -> *mut u16 {
+        self.0
     }
 }
 

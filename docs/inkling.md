@@ -685,21 +685,65 @@ first). A draft pass of 3 slots takes 3.2-3.4 ms on the GPU, 4-5 ms in all (12-1
 one submission per matmul of 4 rows). The drafts are the CPU drafter's: the same acceptance, token
 for token, on the runs checked.
 
-The same 45 runs on the GPU (128 tokens, load 8-19 from other jobs; verification passes with the
-routed experts grouped by expert: 4 tokens in 25-37 ms against 17-21 ms for a step), every
-output the plain greedy text, decode tok/s (code / prose / chat):
+**Against the reference.** llama.cpp's implementation (PR 32218 at 0a9105de, built here:
+`llama-speculative-simple --spec-type draft-dspark --spec-draft-n-max 3`, greedy) and oxinfer
+on the same raw prompts (the chat template's rendering of one user turn, thinking effort 0.9)
+with ggml-org Q8_0 and unsloth's draft accept the same share of 3 drafts: 78% / 77% on code
+(89 / 88 of 114), 47% / 48% on prose, 38% / 35% on chat. A line-by-line reading of the two found
+no difference either: the head's state starts at zero each round and is carried slot to slot,
+`prev` is the anchor then each slot's first maximum; the head's context is the mix of position
+`n - 1` (the last position the target ran); the features are the streams entering visits 5, 23
+and 41 of the 48 (a later pass of the loop restarts from the prelude's output, as here) and the
+final-normed output; the block is always 8 rows (later mask rows change earlier predictions
+through the non-causal attention), drafts read rows 1..7 (`sample_from_anchor` false). The lower
+acceptance in the table above is that of its prompts (rendered without the effort line, the
+model answers without thinking; a thinking preamble restates the request, which the drafter
+predicts well). oMLX's 63-65% on code are on its own prompts.
 
-| Checkpoint | plain | lookup | draft, cost-aware | 3 drafts | 7 drafts |
-|---|---|---|---|---|---|
-| ggml-org Q8_0 | 52 / 52 / 52 | 55 / 56 / 52 | 58 / 50 / 47 | **61** / 50 / 48 | 49 / 37 / 35 |
-| release, `--mtp` | 48 / 48 / 49 | 52 / 52 / 48 | 48 / 49 / 44 | 48 / 49 / 45 | 40 / 36 / 31 |
-| UD-IQ3_XXS | 58 / 58 / 58 | 59 / 61 / 59 | 50 / 52 / 49 | 56 / 46 / 50 | 37 / 32 / 32 |
+**One-time costs.** The head's product with the target's LM head (`[vocab, 256]`) took 250-320
+ms in the first draft pass, a quarter of a 128-token reply's decoding: 44 ms of LM head and
+200+ ms of a single-threaded transpose. Transposed in parallel tiles and made at the end of the
+prefill with the device drafter (51 ms in all), it no longer counts in decoding.
 
-Tokens per target forward with 3 drafts: 2.40-2.59 on code, 1.98-2.23 on prose, 2.02-2.15 on
-chat (34-53% of the drafts accepted); with 7, 2.08-3.02 (16-30%). Drafting now pays on code
-(Q8_0: +16% with 3 drafts) and is about even elsewhere; a verification pass of 4 tokens still
-costs 1.5-1.9 steps, so the speed-up is set by the target's multi-token passes. Prompt lookup
-adds 0-8%.
+**Draft length.** The cost-aware rounds drafted the whole block (7) whenever they drafted, then
+verified the most profitable part; but a draft pass on the GPU costs more for more drafts (its
+head runs once per slot, reading the 103 MB product each time). They now also choose how many to
+draft: the length with the most expected tokens per second, from each slot's recent acceptance
+rate given the slots before it were accepted (decayed over about 30 rounds) and the measured
+cost of drafting and verifying each length; one round in 8 drafts one more, so the next slot
+stays measured (`dspark::Adaptive::best_k`). A/B against the whole block (256 tokens, Q8_0,
+load 5): code 79.1 / 78.6 -> 80.1 / 79.9 tok/s, prose 60.9 / 60.3 -> 68.2 / 67.8, chat 53.3 /
+49.5 -> 54.7 / 47.1 (both near plain: few draft rounds).
+
+Decode tok/s on the GPU (same raw prompts, 256 tokens, load 4-8; every output the plain greedy
+text; "3 drafts" is `--mtp-fixed --draft-tokens 3`, "auto" the default cost-aware rounds):
+
+| Checkpoint, drafter | | plain | 3 drafts | auto |
+|---|---|---:|---:|---:|
+| ggml-org Q8_0, unsloth's draft | code | 55-58 | 70-85 | 65-81 |
+| | prose | 55-58 | 51-53 | 60-65 |
+| | chat | 56-57 | 45-46 | 54-55 |
+| release, `--mtp` | code | 55.8 | 84.0 | 80.4 |
+| | prose | 51.6 | 56.3 | 53.5 |
+| | chat | 49.9 | 53.1 | 48.3 |
+| unsloth UD-IQ3_XXS, its draft | code | 62.5 | 57.7 | 58.0 |
+| | prose | 54.1 | 44.4 | 54.2 |
+| | chat | 59.3 | 43.7 | 58.3 |
+
+(At 128 tokens, Q8_0: code 58.5 -> 93.8-95.8 with 3 drafts, prose 57.9 -> 71-77, chat even.)
+Drafting pays where the drafts are accepted (code: +45-65%); on prose and chat (35-48% of 3
+drafts) it is about even, and the cost-aware rounds stay near plain speed where it does not pay.
+At 4 bits (UD-IQ3_XXS) a verification pass of 4 tokens costs two steps (32 against 15 ms: the
+experts the tokens do not share), so even code loses with fixed drafts; the cost-aware rounds
+keep plain speed there.
+
+**Tree verification** (several candidates per slot, verified in one pass) is not worth it on
+this model: every node of a tree is a token of the verification pass and reads its own 8
+experts, 3.1-3.6 ms each (a fifth of a step), and a sibling only helps when the first choice
+was rejected (35-65% of rounds on prose and chat) and is then right itself; it pays only if the
+draft's second choice is right more than about a third of those times. The drafter also gives
+one chain (each slot's head is conditioned on the previous slot's token), so a branch needs its
+own draft pass. Shorter chains chosen per round (above) are the better use of the expert floor.
 
 ```sh
 oxinfer --model thinkingmachines/Inkling-2-Mini --mtp --prompt "..."
