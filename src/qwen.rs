@@ -326,76 +326,154 @@ impl DeltaRule {
     /// if given, writing each token's output to `out` (`[t, value_dim]`). Parallel over value
     /// heads.
     fn run(&self, s: &mut [f32], c: &[f32], b: &[f32], a: &[f32], t: usize, out: Option<&mut [f32]>) {
+        let (hdk, hdv) = (self.hdk, self.hdv);
+        let op = out.map(|o| SendPtrF(o.as_mut_ptr()));
+        let sp = SendPtrF(s.as_mut_ptr());
+        pool::run(self.nv, &|hv| {
+            // SAFETY: each head owns its own state slab and output columns.
+            let s = unsafe { std::slice::from_raw_parts_mut(sp.get().add(hv * hdk * hdv), hdk * hdv) };
+            // The same element-wise arithmetic at any vector width (no fused multiply-adds).
+            #[cfg(target_arch = "x86_64")]
+            {
+                if crate::kernels::simd::avx512() {
+                    // SAFETY: AVX-512F was detected.
+                    return unsafe { self.head_avx512(s, c, b, a, t, hv, op) };
+                }
+                if crate::kernels::simd::avx2() {
+                    // SAFETY: AVX2 was detected.
+                    return unsafe { self.head_avx2(s, c, b, a, t, hv, op) };
+                }
+            }
+            self.head(s, c, b, a, t, hv, op)
+        });
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512f")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn head_avx512(&self, s: &mut [f32], c: &[f32], b: &[f32], a: &[f32], t: usize, hv: usize, op: Option<SendPtrF>) {
+        self.head(s, c, b, a, t, hv, op)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn head_avx2(&self, s: &mut [f32], c: &[f32], b: &[f32], a: &[f32], t: usize, hv: usize, op: Option<SendPtrF>) {
+        self.head(s, c, b, a, t, hv, op)
+    }
+
+    /// Value head `hv` of [`Self::run`] over its state `s` (`[hdk, hdv]`). Per token the rule is
+    /// two passes over the state: decay it and read `k^T S`, then add `k (x) delta` and read
+    /// `q^T S`. A token's second pass and the next token's first are done as one here (each
+    /// element takes the same operations in the same order), so the state is read and written
+    /// once per token instead of twice, except for the first and the last pass of the span.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn head(&self, s: &mut [f32], c: &[f32], b: &[f32], a: &[f32], t: usize, hv: usize, op: Option<SendPtrF>) {
         let (nk, nv, hdk, hdv) = (self.nk, self.nv, self.hdk, self.hdv);
         let (key_dim, value_dim) = (nk * hdk, nv * hdv);
         let conv_dim = 2 * key_dim + value_dim;
         let rep = nv / nk;
-        let op = out.map(|o| SendPtrF(o.as_mut_ptr()));
-        let sp = SendPtrF(s.as_mut_ptr());
         let qscale = (hdk as f32).powf(-0.5);
-        pool::run(nv, &|hv| {
-            let hk = if self.tiled { hv % nk } else { hv / rep };
-            // SAFETY: each head owns its own state slab and output columns.
-            let s = unsafe { std::slice::from_raw_parts_mut(sp.get().add(hv * hdk * hdv), hdk * hdv) };
-            let mut qn = vec![0f32; hdk];
-            let mut kn = vec![0f32; hdk];
-            let mut kvmem = vec![0f32; hdv];
-            let mut delta = vec![0f32; hdv];
-            for i in 0..t {
-                let row = &c[i * conv_dim..(i + 1) * conv_dim];
-                let qv = &row[hk * hdk..(hk + 1) * hdk];
-                let kv = &row[key_dim + hk * hdk..key_dim + (hk + 1) * hdk];
-                let vv = &row[2 * key_dim + hv * hdv..2 * key_dim + (hv + 1) * hdv];
-                let qn_inv = (qv.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt().recip();
-                let kn_inv = (kv.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt().recip();
-                for d in 0..hdk {
-                    qn[d] = qv[d] * qn_inv * qscale;
-                    kn[d] = kv[d] * kn_inv;
-                }
-                let beta = 1.0 / (1.0 + fast_exp(-b[i * nv + hv]));
-                let ga = a[i * nv + hv] + self.dt_bias[hv];
-                let softplus = if ga > 20.0 { ga } else { (1.0 + ga.exp()).ln() };
-                let decay = (self.decay_coef[hv] * softplus).exp();
-                // S *= decay; kvmem = k^T S
-                kvmem.fill(0.0);
-                for dk in 0..hdk {
-                    let srow = &mut s[dk * hdv..(dk + 1) * hdv];
-                    let kd = kn[dk];
-                    for j in 0..hdv {
-                        srow[j] *= decay;
-                        kvmem[j] += srow[j] * kd;
-                    }
-                }
-                for j in 0..hdv {
-                    delta[j] = (vv[j] - kvmem[j]) * beta;
-                }
-                // S += k (x) delta; out = q^T S
-                match op {
-                    Some(op) => {
-                        // SAFETY: each (token, head) output slice is written by this head only.
-                        let o = unsafe { std::slice::from_raw_parts_mut(op.get().add(i * value_dim + hv * hdv), hdv) };
-                        o.fill(0.0);
-                        for dk in 0..hdk {
-                            let srow = &mut s[dk * hdv..(dk + 1) * hdv];
-                            let (kd, qd) = (kn[dk], qn[dk]);
-                            for j in 0..hdv {
-                                srow[j] += kd * delta[j];
-                                o[j] += srow[j] * qd;
-                            }
+        let hk = if self.tiled { hv % nk } else { hv / rep };
+        if t == 0 {
+            return;
+        }
+        let (mut qn, mut kn) = (vec![0f32; hdk], vec![0f32; hdk]);
+        let (mut qn2, mut kn2) = (vec![0f32; hdk], vec![0f32; hdk]);
+        let mut kvmem = vec![0f32; hdv];
+        let mut delta = vec![0f32; hdv];
+        // Token `i`'s normalized query and key, and its (beta, decay).
+        let prep = |i: usize, qn: &mut [f32], kn: &mut [f32]| -> (f32, f32) {
+            let row = &c[i * conv_dim..(i + 1) * conv_dim];
+            let qv = &row[hk * hdk..(hk + 1) * hdk];
+            let kv = &row[key_dim + hk * hdk..key_dim + (hk + 1) * hdk];
+            let qn_inv = (qv.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt().recip();
+            let kn_inv = (kv.iter().map(|x| x * x).sum::<f32>() + 1e-6).sqrt().recip();
+            for d in 0..hdk {
+                qn[d] = qv[d] * qn_inv * qscale;
+                kn[d] = kv[d] * kn_inv;
+            }
+            let beta = 1.0 / (1.0 + fast_exp(-b[i * nv + hv]));
+            let ga = a[i * nv + hv] + self.dt_bias[hv];
+            let softplus = if ga > 20.0 { ga } else { (1.0 + ga.exp()).ln() };
+            (beta, (self.decay_coef[hv] * softplus).exp())
+        };
+        let (mut beta, decay) = prep(0, &mut qn, &mut kn);
+        // S *= decay; kvmem = k^T S
+        for dk in 0..hdk {
+            let srow = &mut s[dk * hdv..(dk + 1) * hdv];
+            let kd = kn[dk];
+            for j in 0..hdv {
+                srow[j] *= decay;
+                kvmem[j] += srow[j] * kd;
+            }
+        }
+        for i in 0..t {
+            let vv = &c[i * conv_dim + 2 * key_dim + hv * hdv..i * conv_dim + 2 * key_dim + (hv + 1) * hdv];
+            for j in 0..hdv {
+                delta[j] = (vv[j] - kvmem[j]) * beta;
+            }
+            let next = (i + 1 < t).then(|| prep(i + 1, &mut qn2, &mut kn2));
+            // SAFETY: each (token, head) output slice is written by this head only.
+            let mut o = op.map(|op| unsafe { std::slice::from_raw_parts_mut(op.get().add(i * value_dim + hv * hdv), hdv) });
+            if let Some(o) = o.as_deref_mut() {
+                o.fill(0.0);
+            }
+            // S += k (x) delta; out = q^T S; then the next token's S *= decay; kvmem = k^T S.
+            match (o, next) {
+                (Some(o), Some((_, decay2))) => {
+                    kvmem.fill(0.0);
+                    for dk in 0..hdk {
+                        let srow = &mut s[dk * hdv..(dk + 1) * hdv];
+                        let (kd, qd, kd2) = (kn[dk], qn[dk], kn2[dk]);
+                        for j in 0..hdv {
+                            let v = srow[j] + kd * delta[j];
+                            o[j] += v * qd;
+                            let w = v * decay2;
+                            srow[j] = w;
+                            kvmem[j] += w * kd2;
                         }
                     }
-                    None => {
-                        for dk in 0..hdk {
-                            let srow = &mut s[dk * hdv..(dk + 1) * hdv];
-                            let kd = kn[dk];
-                            for j in 0..hdv {
-                                srow[j] += kd * delta[j];
-                            }
+                }
+                (None, Some((_, decay2))) => {
+                    kvmem.fill(0.0);
+                    for dk in 0..hdk {
+                        let srow = &mut s[dk * hdv..(dk + 1) * hdv];
+                        let (kd, kd2) = (kn[dk], kn2[dk]);
+                        for j in 0..hdv {
+                            let w = (srow[j] + kd * delta[j]) * decay2;
+                            srow[j] = w;
+                            kvmem[j] += w * kd2;
+                        }
+                    }
+                }
+                (Some(o), None) => {
+                    for dk in 0..hdk {
+                        let srow = &mut s[dk * hdv..(dk + 1) * hdv];
+                        let (kd, qd) = (kn[dk], qn[dk]);
+                        for j in 0..hdv {
+                            srow[j] += kd * delta[j];
+                            o[j] += srow[j] * qd;
+                        }
+                    }
+                }
+                (None, None) => {
+                    for dk in 0..hdk {
+                        let srow = &mut s[dk * hdv..(dk + 1) * hdv];
+                        let kd = kn[dk];
+                        for j in 0..hdv {
+                            srow[j] += kd * delta[j];
                         }
                     }
                 }
             }
-        });
+            if let Some((beta2, _)) = next {
+                beta = beta2;
+                std::mem::swap(&mut qn, &mut qn2);
+                std::mem::swap(&mut kn, &mut kn2);
+            }
+        }
     }
 }
 
