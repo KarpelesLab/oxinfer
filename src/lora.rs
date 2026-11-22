@@ -137,31 +137,12 @@ impl LoraDelta {
 
     /// The strength this update alone is applied with now (0 when its adapter is off).
     #[inline]
-    fn strength(&self) -> f32 {
+    pub(crate) fn strength(&self) -> f32 {
         strength(&self.active, &self.gain, self.scale)
     }
 
     /// Whether this update or one chained after it is switched on (with a nonzero strength).
     #[inline]
-    /// This update alone as an accelerator takes it: `A` (`[r, n_in]`), `B` transposed (`[r,
-    /// n_out]`), the rank, and the strength it is applied with now.
-    #[cfg_attr(
-        not(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64")),
-        allow(dead_code)
-    )]
-    pub(crate) fn device_parts(&self) -> (&[f32], &[f32], usize, f32) {
-        (&self.a, &self.bt, self.r, self.strength())
-    }
-
-    /// The update chained after this one (another adapter on the same layer).
-    #[cfg_attr(
-        not(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64")),
-        allow(dead_code)
-    )]
-    pub(crate) fn chained(&self) -> Option<&LoraDelta> {
-        self.next.as_deref()
-    }
-
     pub(crate) fn is_active(&self) -> bool {
         self.strength() != 0.0 || self.next.as_ref().is_some_and(|n| n.is_active())
     }

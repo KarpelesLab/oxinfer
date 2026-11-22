@@ -1219,9 +1219,8 @@ impl InkMetal {
             };
             // The adapters' updates, copied (they are small and do not change).
             let mut lora = Vec::new();
-            let mut d = l.lora_ref();
-            while let Some(x) = d {
-                let (a, bt, r, _) = x.device_parts();
+            for x in l.lora_delta().into_iter().flat_map(|d| d.links()) {
+                let (a, bt, r) = x.factors();
                 let mk = |v: &[f32]| -> anyhow::Result<Id> {
                     let (id, p) = be.ink_buffer(v.len().max(1) * 4).context("LoRA buffer")?;
                     unsafe { std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, p, v.len() * 4) };
@@ -1238,7 +1237,6 @@ impl InkMetal {
                     d: x as *const _,
                 });
                 rmax.set(rmax.get().max(r));
-                d = x.chained();
             }
             Ok(Dw {
                 w,
@@ -1352,12 +1350,12 @@ impl InkMetal {
                 let mut deltas = Vec::with_capacity(ne);
                 let mut rx = 0usize;
                 for l in &ex.down {
-                    match l.lora_ref() {
+                    match l.lora_delta() {
                         Some(d) => {
-                            if d.chained().is_some() {
+                            if d.links().nth(1).is_some() {
                                 bail!("layer {li}: chained expert LoRAs");
                             }
-                            let (a, bt, r, _) = d.device_parts();
+                            let (a, bt, r) = d.factors();
                             let o = data.len();
                             data.extend_from_slice(a);
                             data.resize(data.len().next_multiple_of(4), 0.0);
@@ -1817,7 +1815,7 @@ impl InkMetal {
         // The LoRA updates beside it: `u = A x`, then `y += s Bt u` once the matvec wrote y.
         for l in &d.lora {
             // SAFETY: the update lives with the model, which outlives its engine.
-            let s = unsafe { (*l.d).device_parts().3 };
+            let s = unsafe { (*l.d).strength() };
             if s == 0.0 || l.r == 0 {
                 continue;
             }
@@ -2972,7 +2970,7 @@ impl InkMetal {
             if let Some(xl) = &ld.exp.xlora {
                 for (i, d) in xl.deltas.iter().enumerate() {
                     // SAFETY: the table holds one entry per expert; the deltas live with the model.
-                    let s = d.map_or(0.0, |d| unsafe { (*d).device_parts().3 });
+                    let s = d.map_or(0.0, |d| unsafe { (*d).strength() });
                     unsafe {
                         let ent = (xl.tab_p as *mut XlEntry).add(i);
                         (*ent).s = s;
