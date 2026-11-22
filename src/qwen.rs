@@ -2574,6 +2574,7 @@ impl<'a> QwenModel<'a> {
             }
             Some(sel) if sel.iter().any(|s| s.is_some()) => crate::qwen4exp::attention_sel(&q, cache, nh, t, start, sel, &mut att),
             _ if cfg.bidirectional => crate::model::attention_masked(&q, cache, nh, t, start, None, false, &mut att),
+            _ if t >= crate::model::PREFILL_ATTN_MIN => crate::model::attention_prefill(&q, cache, nh, t, start, at.window, None, &mut att),
             _ => attention(&q, cache, nh, t, start, at.window, &mut att),
         }
         if gated {

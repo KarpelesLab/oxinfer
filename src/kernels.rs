@@ -233,6 +233,17 @@ pub fn matmul_quant_grouped<M: QMat>(ms: &[&M], segs: &[(usize, usize)], x: &[f3
     prof::add_bytes(ms.iter().zip(segs).filter(|(_, s)| s.1 > 0).map(|(m, _)| m.bytes()).sum());
     #[cfg(target_arch = "aarch64")]
     if prefill_kernel() == PrefillGemm::Sme && sme::fits(n_in) {
+        // `Hybrid` / `Fast`: the int8 GEMM on the NEON units takes a share of the blocks (all
+        // of them with `grouped_sme_share` 0), as in `matmul_quant_multi`.
+        let selected = prefill_effective();
+        let int8 = matches!(selected, PrefillGemm::Hybrid | PrefillGemm::Fast) && ms.iter().all(|m| m.i8_layout().is_some());
+        let share = if int8 {
+            grouped_sme_share(selected == PrefillGemm::Fast)
+        } else {
+            16
+        };
+        let blocks = grouped_blocks(segs, n_out, (ms[0].bytes() / n_out).max(1), 32);
+        let on_sme = |b: usize| share == 16 || b * share / 16 != (b + 1) * share / 16;
         // Each segment's tokens as their own 32-token panels (chunks of 64 tokens from the
         // segment start, so whole panels).
         let mut base = Vec::with_capacity(segs.len() + 1);
@@ -242,41 +253,65 @@ pub fn matmul_quant_grouped<M: QMat>(ms: &[&M], segs: &[(usize, usize)], x: &[f3
             tiles += len.div_ceil(32);
         }
         base.push(tiles);
-        let mut xt = vec![0f32; tiles * 32 * n_in];
-        let xp = SendPtr(xt.as_mut_ptr());
-        pool::run(tiles, &|i| {
-            let j = base.partition_point(|&b| b <= i) - 1;
-            let (s, len) = segs[j];
-            let k = i - base[j];
-            // SAFETY: each panel is written by one task; rows past the segment are not read.
-            unsafe {
-                sme::pack32(
-                    x.as_ptr().add((s + 32 * k) * n_in),
-                    n_in,
-                    (len - 32 * k).min(32),
-                    n_in,
-                    xp.get().add(i * 32 * n_in),
-                )
-            }
-        });
-        let blocks = grouped_blocks(segs, n_out, (ms[0].bytes() / n_out).max(1), 32);
+        let xt = if share > 0 {
+            let mut xt = vec![0f32; tiles * 32 * n_in];
+            let xp = SendPtr(xt.as_mut_ptr());
+            pool::run(tiles, &|i| {
+                let j = base.partition_point(|&b| b <= i) - 1;
+                let (s, len) = segs[j];
+                let k = i - base[j];
+                // SAFETY: each panel is written by one task; rows past the segment are not read.
+                unsafe {
+                    sme::pack32(
+                        x.as_ptr().add((s + 32 * k) * n_in),
+                        n_in,
+                        (len - 32 * k).min(32),
+                        n_in,
+                        xp.get().add(i * 32 * n_in),
+                    )
+                }
+            });
+            xt
+        } else {
+            Vec::new()
+        };
+        let xa = int8.then(|| i8gemm::I8Act::new(x, rows, n_in, selected == PrefillGemm::Hybrid));
+        // The int8 blocks skip a segment's trailing zero rows (its padding: their outputs are
+        // zero whatever the weights) and store zeros there.
+        let ends: Vec<usize> = segs
+            .iter()
+            .map(|&(s, len)| {
+                let mut e = s + len;
+                while e > s && x[(e - 1) * n_in..e * n_in].iter().all(|&v| v == 0.0) {
+                    e -= 1;
+                }
+                e
+            })
+            .collect();
         let yp = SendPtr(y.as_mut_ptr());
-        pool::run(blocks.len(), &|b| {
+        let run = |b: usize| {
             let (j, r0, r1, c0, c1) = blocks[b];
             let (s, _) = segs[j as usize];
-            let xs = &xt[base[j as usize] * 32 * n_in..base[j as usize + 1] * 32 * n_in];
-            unsafe {
-                sme::gemm_rows(
-                    ms[j as usize],
-                    xs,
-                    c0 as usize - s,
-                    c1 as usize - s,
-                    r0 as usize,
-                    r1 as usize,
-                    yp.get().add(s * n_out),
-                )
+            let m = ms[j as usize];
+            let (r0, r1, c0, c1) = (r0 as usize, r1 as usize, c0 as usize, c1 as usize);
+            if on_sme(b) {
+                let xs = &xt[base[j as usize] * 32 * n_in..base[j as usize + 1] * 32 * n_in];
+                unsafe { sme::gemm_rows(m, xs, c0 - s, c1 - s, r0, r1, yp.get().add(s * n_out)) }
+            } else {
+                let e = ends[j as usize].clamp(c0, c1);
+                unsafe { i8gemm::gemm_rows(m, xa.as_ref().unwrap(), c0, e, r0, r1, yp.get()) }
+                for c in e..c1 {
+                    // SAFETY: this block owns rows r0..r1 of these tokens.
+                    unsafe { std::ptr::write_bytes(yp.get().add(c * n_out + r0), 0, r1 - r0) }
+                }
             }
-        });
+        };
+        if share == 16 || share == 0 {
+            pool::run(blocks.len(), &run);
+        } else {
+            let (sq, nq): (Vec<usize>, Vec<usize>) = (0..blocks.len()).partition(|&b| on_sme(b));
+            two_queues(&sq, &nq, &run);
+        }
         return;
     }
     let blocks = grouped_blocks(segs, n_out, (ms[0].bytes() / n_out).max(1), 16);
@@ -1934,17 +1969,22 @@ pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &
         pool::run(n_jobs, &run);
         return;
     }
-    // Two queues: the first `sme_threads` tasks start on the SME blocks, the others on the NEON
-    // ones; each moves to the other queue when its own is empty. Which kernel computes a block
-    // depends on the block only, so results do not depend on the timing.
     let (sq, nq): (Vec<usize>, Vec<usize>) = (0..n_jobs).partition(|&b| path(b) == Path::Sme);
+    two_queues(&sq, &nq, &run);
+}
+
+/// Runs the blocks of two queues (`sq` on the SME units, `nq` on the NEON units) at the same
+/// time: the first `sme_threads` tasks start on `sq`, the others on `nq`; each moves to the
+/// other queue when its own is empty. Which kernel computes a block depends on the block only,
+/// so results do not depend on the timing.
+fn two_queues(sq: &[usize], nq: &[usize], run: &(dyn Fn(usize) + Sync)) {
     let (si, ni) = (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0));
     let (_, sme_threads) = hybrid_tuning(false);
-    pool::run(nthreads, &|w| {
+    pool::run(pool::threads(), &|w| {
         let order = if w < sme_threads {
-            [(&sq, &si), (&nq, &ni)]
+            [(sq, &si), (nq, &ni)]
         } else {
-            [(&nq, &ni), (&sq, &si)]
+            [(nq, &ni), (sq, &si)]
         };
         for (q, i) in order {
             loop {
@@ -1981,6 +2021,20 @@ fn hybrid_tuning(fast: bool) -> (usize, usize) {
         )
     });
     (share.unwrap_or(if fast { 5 } else { 7 }), threads)
+}
+
+/// The SME share (in sixteenths) of the grouped matmuls' blocks (mixture-of-experts prefill) in
+/// `hybrid` / `fast` (`OXINFER_GROUPED_SME_SHARE`).
+#[cfg(target_arch = "aarch64")]
+fn grouped_sme_share(fast: bool) -> usize {
+    static S: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let s = *S.get_or_init(|| {
+        std::env::var("OXINFER_GROUPED_SME_SHARE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .map(|s: usize| s.min(16))
+    });
+    s.unwrap_or(if fast { 0 } else { 7 })
 }
 
 /// Decode kernels: rows `r0..r1` of `m` against all `xa.t` activation rows into `y[c*n_out + r]`,
@@ -2508,10 +2562,22 @@ pub fn apply_rope_interleaved(v: &mut [f32], cos: &[f32], sin: &[f32]) {
 }
 
 pub fn softmax_inplace(x: &mut [f32]) {
-    let max = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0f32;
+    // The maximum over 8 lanes (any order gives the same maximum).
+    let (c8, tail) = x.as_chunks::<8>();
+    let mut m8 = [f32::NEG_INFINITY; 8];
+    for c in c8 {
+        for (m, &v) in m8.iter_mut().zip(c) {
+            *m = m.max(v);
+        }
+    }
+    let max = m8.iter().chain(tail).copied().fold(f32::NEG_INFINITY, f32::max);
+    // The exponentials in their own loop (which vectorizes), then the sum in order: the same bits
+    // as one loop doing both, several times faster.
     for v in x.iter_mut() {
         *v = fast_exp(*v - max);
+    }
+    let mut sum = 0f32;
+    for v in x.iter() {
         sum += *v;
     }
     let inv = 1.0 / sum;
@@ -2723,6 +2789,56 @@ mod tests {
         let mut y = vec![0f32; rows * n_out];
         matmul_quant_grouped(&q.iter().collect::<Vec<_>>(), &segs, &x, &mut y);
         check("grouped q4", &y, &want(&qf));
+    }
+
+    /// Grouped matmuls in a language model's prompt (`fast`: the int8 GEMM, beside SME where
+    /// present) against the dequantized weights, with zero padding rows at segment ends (skipped
+    /// by the int8 blocks, which must still store zeros there).
+    #[test]
+    fn grouped_fast_matches_reference() {
+        use crate::ggml::{GgmlType, GgufMatrix, random_blocks};
+        crate::pool::init(4);
+        let (n_out, n_in) = (72usize, 256usize);
+        let mut seed = 9u64;
+        let segs = [(0usize, 8usize), (8, 0), (8, 16), (24, 72), (96, 40)];
+        let real = [5usize, 0, 16, 70, 33];
+        let rows = 136;
+        let mut x: Vec<f32> = (0..rows * n_in).map(|_| lcg(&mut seed)).collect();
+        for (&(s, len), &r) in segs.iter().zip(&real) {
+            x[(s + r) * n_in..(s + len) * n_in].fill(0.0);
+        }
+        for kind in [GgmlType::Q8_0, GgmlType::Q4_0, GgmlType::Q4_K] {
+            let ms: Vec<GgufMatrix> = (0..segs.len())
+                .map(|_| {
+                    GgufMatrix::from_bytes(kind, &random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed), n_out, n_in).unwrap()
+                })
+                .collect();
+            let wf: Vec<Vec<f32>> = ms
+                .iter()
+                .map(|m| {
+                    let mut f = vec![0f32; n_out * n_in];
+                    m.dequantize_rows(0, n_out, &mut f);
+                    f
+                })
+                .collect();
+            let mut want = vec![0f32; rows * n_out];
+            for (j, &(s, len)) in segs.iter().enumerate() {
+                let r = reference(&wf[j], n_out, n_in, &x[s * n_in..(s + len) * n_in], len);
+                want[s * n_out..(s + len) * n_out].copy_from_slice(&r);
+            }
+            let mut y = vec![f32::NAN; rows * n_out];
+            lm_prefill(|| matmul_quant_grouped(&ms.iter().collect::<Vec<_>>(), &segs, &x, &mut y));
+            let scale = want.iter().fold(0f32, |a, v| a.max(v.abs()));
+            for (i, (a, b)) in y.iter().zip(&want).enumerate() {
+                assert!((a - b).abs() <= 2e-2 * scale, "{kind} grouped fast [{i}]: {a} vs {b}");
+            }
+            for (&(s, len), &r) in segs.iter().zip(&real) {
+                assert!(
+                    y[(s + r) * n_out..(s + len) * n_out].iter().all(|&v| v == 0.0),
+                    "{kind}: padding rows"
+                );
+            }
+        }
     }
 
     #[test]

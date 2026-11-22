@@ -2425,7 +2425,7 @@ pub(crate) fn attention_ext(
 }
 
 /// Chunks of at least this many tokens take [`attention_prefill`].
-const PREFILL_ATTN_MIN: usize = 32;
+pub(crate) const PREFILL_ATTN_MIN: usize = 32;
 
 /// Causal (optionally sliding-window, `ext`-extended: see [`attention_ext`]) attention for a
 /// prefill chunk as GEMMs: per block of queries and KV head, the scores of the group's query
@@ -2477,37 +2477,88 @@ pub(crate) fn attention_prefill(
     // Query blocks keep the score matrix to a few tens of MB.
     let max_keys = (0..t).map(hi_of).max().unwrap_or(0) - lo_of(0);
     let tb = ((1usize << 23) / (rep * max_keys.max(1))).clamp(8, 256);
+    // Every key a query sees is in `ka..kb`. Each KV head's keys (`[npall][dhp]`) and transposed
+    // values (`[hd][npall]`), zero past `kb`, are copied once per call; each block of queries
+    // multiplies by a range of them. The buffers are reused from block to block (fresh ones
+    // would be zeroed by page faults each time).
+    let (ka, kb) = (lo_of(0), (0..t).map(hi_of).max().unwrap_or(0));
+    let (nall, npall) = (kb - ka, (kb - ka).next_multiple_of(32));
+    let mut kh = vec![0f32; n_kv * npall * dhp];
+    for_chunks(&mut kh, dhp, nall * n_kv > 64, |r, row| {
+        let (g, j) = (r / npall, r % npall);
+        if j < nall {
+            row[..hd].copy_from_slice(cache.k_at(ka + j, g));
+        }
+    });
+    let mut vt = vec![0f32; n_kv * hd * npall];
+    {
+        // Blocks of 64 keys per task, each written into the `hd` rows of its head.
+        let kblocks = nall.div_ceil(64);
+        let vp = SendPtr(vt.as_mut_ptr());
+        crate::pool::run(n_kv * kblocks, &|i| {
+            let (g, b) = (i / kblocks, i % kblocks);
+            for j in 64 * b..(64 * b + 64).min(nall) {
+                for (c, &x) in cache.v_at(ka + j, g).iter().enumerate() {
+                    // SAFETY: each task writes its own keys' columns of its head's rows.
+                    unsafe { *vp.get().add((g * hd + c) * npall + j) = x }
+                }
+            }
+        });
+    }
+    let rows_max = (tb * rep).max(8);
+    let mut qh = vec![0f32; rows_max * dhp];
+    let mut p = vec![0f32; rows_max * npall];
+    let mut o = vec![0f32; rows_max * hd];
     let mut b0 = 0;
     while b0 < t {
         let b1 = (b0 + tb).min(t);
         let k0 = lo_of(b0);
         let k1 = (b0..b1).map(hi_of).max().unwrap();
-        let (n, np) = (k1 - k0, (k1 - k0).next_multiple_of(32));
+        // Keys `k0..k0 + np` (padded to 32, within the copied ones).
+        let np = (k1 - k0).next_multiple_of(32).min(npall - (k0 - ka));
         let rows = (b1 - b0) * rep;
+        // At least 8 rows (the GEMM's tile; padding rows are zero).
+        let rp = rows.max(8);
         for g in 0..n_kv {
-            let mut qh = vec![0f32; rows * dhp];
-            for_chunks(&mut qh, dhp, rows > 64, |r, row| {
-                let (ti, h) = (b0 + r / rep, g * rep + r % rep);
-                row[..hd].copy_from_slice(&q[(ti * nh + h) * hd..(ti * nh + h + 1) * hd]);
-            });
-            let mut kh = vec![0f32; n * dhp];
-            for_chunks(&mut kh, dhp, n > 64, |j, row| row[..hd].copy_from_slice(cache.k_at(k0 + j, g)));
-            let mut vt = vec![0f32; hd * np];
-            for_chunks(&mut vt, np, true, |c, row| {
-                for (j, x) in row[..n].iter_mut().enumerate() {
-                    *x = cache.v_at(k0 + j, g)[c];
+            let qh = &mut qh[..rp * dhp];
+            for_chunks(qh, dhp, rows > 64, |r, row| {
+                if r < rows {
+                    let (ti, h) = (b0 + r / rep, g * rep + r % rep);
+                    row[..hd].copy_from_slice(&q[(ti * nh + h) * hd..(ti * nh + h + 1) * hd]);
+                } else {
+                    row.fill(0.0);
                 }
             });
-            let sc = crate::sd::ops::matmul_f32(&kh, n, dhp, &qh, rows);
-            let mut p = vec![0f32; rows * np];
-            for_chunks(&mut p, np, true, |r, row| {
+            // Scores `[rp][np]`, then the weights in place (zero outside each row's keys).
+            let km = Strided {
+                m: &kh[(g * npall + k0 - ka) * dhp..],
+                n_out: np,
+                n_in: dhp,
+                ld: dhp,
+            };
+            let p = &mut p[..rp * np];
+            matmul_quant_multi(&mut [(&km, &mut p[..])], qh, rp);
+            for_chunks(p, np, true, |r, row| {
+                if r >= rows {
+                    row.fill(0.0);
+                    return;
+                }
                 let ti = b0 + r / rep;
                 let (lo, hi) = (lo_of(ti) - k0, hi_of(ti) - k0);
-                row[lo..hi].copy_from_slice(&sc[r * n + lo..r * n + hi]);
+                row[..lo].fill(0.0);
+                row[hi..].fill(0.0);
                 softmax_inplace(&mut row[lo..hi]);
             });
-            let o = crate::sd::ops::matmul_f32(&vt, hd, np, &p, rows);
+            let vm = Strided {
+                m: &vt[g * hd * npall + (k0 - ka)..],
+                n_out: hd,
+                n_in: np,
+                ld: npall,
+            };
+            let o = &mut o[..rp * hd];
+            matmul_quant_multi(&mut [(&vm, &mut o[..])], p, rp);
             let op = SendPtr(out.as_mut_ptr());
+            let o = &*o;
             crate::pool::run(rows, &|r| {
                 let (ti, h) = (b0 + r / rep, g * rep + r % rep);
                 // SAFETY: each row writes its own [hd] slice of `out`.
@@ -2519,6 +2570,41 @@ pub(crate) fn attention_prefill(
     }
 }
 
+/// A row-major f32 matrix of `n_out` rows of `n_in` values, `ld` apart (a column range of a wider
+/// one), as the GEMM's weights.
+struct Strided<'a> {
+    m: &'a [f32],
+    n_out: usize,
+    n_in: usize,
+    ld: usize,
+}
+
+impl QMat for Strided<'_> {
+    fn n_out(&self) -> usize {
+        self.n_out
+    }
+    fn n_in(&self) -> usize {
+        self.n_in
+    }
+    fn bytes(&self) -> usize {
+        self.n_out * self.n_in * 4
+    }
+    fn dense(&self) -> bool {
+        true
+    }
+    fn dequantize_rows(&self, r0: usize, r1: usize, out: &mut [f32]) {
+        for (r, o) in (r0..r1).zip(out.chunks_mut(self.n_in)) {
+            o.copy_from_slice(&self.m[r * self.ld..r * self.ld + self.n_in]);
+        }
+    }
+    unsafe fn rows_t1(&self, _: &crate::quant::QAct, _: usize, _: *mut f32, _: usize, _: usize) {
+        unreachable!("f32 matmuls run on the GEMM (dense)")
+    }
+    unsafe fn rows_tc(&self, _: &crate::quant::QAct, _: usize, _: usize, _: *mut f32, _: usize, _: usize) {
+        unreachable!("f32 matmuls run on the GEMM (dense)")
+    }
+}
+
 #[derive(Clone, Copy)]
 struct SendPtr(*mut f32);
 unsafe impl Send for SendPtr {}
@@ -2527,5 +2613,38 @@ impl SendPtr {
     #[inline(always)]
     fn get(self) -> *mut f32 {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The prefill attention (GEMMs over shared key / value copies) against the per-head loop,
+    /// for a chunk after earlier positions, with and without a window, and short blocks.
+    #[test]
+    fn prefill_attention_matches_per_head_loop() {
+        crate::pool::init(4);
+        let (nh, n_kv, hd) = (8usize, 2usize, 64usize);
+        let mut seed = 11u64;
+        let mut r = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 40) % 2001) as f32 / 1000.0 - 1.0
+        };
+        for (start, t, window) in [(0usize, 40usize, None), (13, 300, None), (5, 97, Some(64)), (200, 33, Some(50))] {
+            let mut cache = LayerCache::new(n_kv, hd);
+            let n = start + t;
+            let k: Vec<f32> = (0..n * n_kv * hd).map(|_| r()).collect();
+            let v: Vec<f32> = (0..n * n_kv * hd).map(|_| r()).collect();
+            cache.push(&k, &v, n);
+            let q: Vec<f32> = (0..t * nh * hd).map(|_| 0.2 * r()).collect();
+            let mut want = vec![0f32; t * nh * hd];
+            let mut got = vec![f32::NAN; t * nh * hd];
+            attention_ext(&q, &cache, nh, t, start, window, true, None, &mut want);
+            attention_prefill(&q, &cache, nh, t, start, window, None, &mut got);
+            for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                assert!((a - b).abs() <= 1e-5, "start {start} t {t} window {window:?} [{i}]: {a} vs {b}");
+            }
+        }
     }
 }

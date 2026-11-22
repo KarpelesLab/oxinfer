@@ -1,4 +1,4 @@
-//! Times the CPU prefill GEMMs (random weights): sme, hybrid, int8x2 and f32:
+//! Times the CPU prefill GEMMs (random weights): sme, hybrid, int8x2, f32, int8 and fast:
 //! `cargo run --release --example gemm_bench -- [TYPES] [THREADS] [N_OUT] [N_IN] [TOKENS]`
 //! (TYPES: GGUF types like `Q8_0,Q4_K`, or `OXQ8` / `OXQ4`; defaults Q8_0, 1 thread,
 //! 4096 x 4096, 512 tokens). Prints GOP/s (2 per multiply-add), best of 7 interleaved rounds.
@@ -42,25 +42,34 @@ fn main() -> anyhow::Result<()> {
         let ops = 2.0 * (n_out * n_in * t) as f64 / 1e9;
         let g = |s: f64| ops / s;
         println!(
-            "{name:<8} sme {:7.1}  hybrid {:7.1}  int8x2 {:7.1}  f32 {:7.1} GOP/s",
+            "{name:<8} sme {:7.1}  hybrid {:7.1}  int8x2 {:7.1}  f32 {:7.1}  int8 {:7.1}  fast {:7.1} GOP/s",
             g(a[0]),
             g(a[1]),
             g(a[2]),
-            g(a[3])
+            g(a[3]),
+            g(a[4]),
+            g(a[5])
         );
     }
     Ok(())
 }
 
-fn bench<M: QMat>(m: &M, t: usize, rounds: usize) -> [f64; 4] {
+fn bench<M: QMat>(m: &M, t: usize, rounds: usize) -> [f64; 6] {
     let n_in = m.n_in();
     let x: Vec<f32> = (0..t * n_in).map(|i| ((i * 7919) % 2001) as f32 / 1000.0 - 1.0).collect();
     let mut y = vec![0f32; t * m.n_out()];
-    let mut best = [f64::MAX; 4];
+    let mut best = [f64::MAX; 6];
     for _ in 0..rounds {
-        for (i, g) in [PrefillGemm::Sme, PrefillGemm::Hybrid, PrefillGemm::Int8x2, PrefillGemm::F32]
-            .into_iter()
-            .enumerate()
+        for (i, g) in [
+            PrefillGemm::Sme,
+            PrefillGemm::Hybrid,
+            PrefillGemm::Int8x2,
+            PrefillGemm::F32,
+            PrefillGemm::Int8,
+            PrefillGemm::Fast,
+        ]
+        .into_iter()
+        .enumerate()
         {
             set_prefill_gemm(g);
             let t0 = Instant::now();

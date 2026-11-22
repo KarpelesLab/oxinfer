@@ -369,6 +369,9 @@ pub(crate) unsafe fn gemm_rows<M: QMat + ?Sized>(m: &M, xa: &I8Act, c0: usize, c
     let n_in = m.n_in();
     let n_out = m.n_out();
     debug_assert!(xa.n_in == n_in && c1 <= xa.t);
+    if c0 >= c1 {
+        return;
+    }
     scratch::SCRATCH.with(|sc| {
         let mut sc = sc.borrow_mut();
         let Scratch { tiles: tl, rows } = &mut *sc;
