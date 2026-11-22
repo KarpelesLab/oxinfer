@@ -1392,6 +1392,11 @@ impl LayerCache {
     pub fn k_from(&self, pos: usize, kvh: usize) -> &[f32] {
         &self.k[(pos * self.n_kv + kvh) * self.hd..]
     }
+    /// The values of KV head `kvh` from position `pos` on: one every `n_kv * hd` values.
+    #[inline(always)]
+    pub fn v_from(&self, pos: usize, kvh: usize) -> &[f32] {
+        &self.v[(pos * self.n_kv + kvh) * self.hd..]
+    }
     #[inline(always)]
     pub fn v_at(&self, pos: usize, kvh: usize) -> &[f32] {
         let o = (pos * self.n_kv + kvh) * self.hd;
@@ -2438,12 +2443,11 @@ pub(crate) fn attention_ext(
         }
         // SAFETY: tasks write disjoint [group*hd] ranges of `out`.
         let o = unsafe { std::slice::from_raw_parts_mut(op.get().add(qbase), group * hd) };
-        o.fill(0.0);
-        for j in 0..n {
-            let v = cache.v_at(lo + j, kvh);
-            for h in 0..group {
-                axpy(&mut o[h * hd..(h + 1) * hd], scores[h * n + j], v);
-            }
+        if n == 0 {
+            o.fill(0.0);
+        } else {
+            // Each head's value rows added in key order (the bits of an `axpy` per key).
+            crate::kernels::weighted_values(&scores, cache.v_from(lo, kvh), n_kv * hd, hd, o);
         }
     };
     if par {

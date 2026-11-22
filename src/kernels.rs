@@ -2489,6 +2489,44 @@ pub fn dots(q: &[f32], keys: &[f32], stride: usize, out: &mut [f32]) {
     }
 }
 
+/// `out[r * hd + c] = sum_j w[r * n + j] * values[j * stride + c]` for `out.len() / hd` rows of
+/// `n = w.len() / rows` weights: each row is what [`axpy`] of every value row in order into a
+/// zeroed row gives, bit for bit (attention outputs of the query heads that share a value
+/// sequence). On x86-64 the sums stay in registers while the keys pass.
+pub fn weighted_values(w: &[f32], values: &[f32], stride: usize, hd: usize, out: &mut [f32]) {
+    let rows = out.len() / hd.max(1);
+    if rows == 0 || hd == 0 {
+        return;
+    }
+    let n = w.len() / rows;
+    assert!(out.len() == rows * hd && w.len() == rows * n);
+    if n == 0 {
+        out.fill(0.0);
+        return;
+    }
+    assert!(values.len() >= (n - 1) * stride + hd, "values too short");
+    #[allow(unused_mut)]
+    let mut done = 0;
+    #[cfg(target_arch = "x86_64")]
+    if simd::avx2() {
+        // SAFETY: AVX2 was detected; the lengths were checked above.
+        done = unsafe { simd::weighted_values(w.as_ptr(), rows, n, values.as_ptr(), stride, hd, out.as_mut_ptr()) };
+    }
+    if done == hd {
+        return;
+    }
+    // The columns left: one sum per element, in key order.
+    for r in 0..rows {
+        let o = &mut out[r * hd + done..(r + 1) * hd];
+        o.fill(0.0);
+        for (j, &x) in w[r * n..(r + 1) * n].iter().enumerate() {
+            for (c, a) in o.iter_mut().enumerate() {
+                *a += x * values[j * stride + done + c];
+            }
+        }
+    }
+}
+
 /// y += alpha * x
 #[inline]
 pub fn axpy(y: &mut [f32], alpha: f32, x: &[f32]) {
@@ -2747,19 +2785,28 @@ pub fn softmax_inplace(x: &mut [f32]) {
         }
     }
     let max = m8.iter().chain(tail).copied().fold(f32::NEG_INFINITY, f32::max);
-    // The exponentials in their own loop (which vectorizes), then the sum in order: the same bits
-    // as one loop doing both, several times faster.
-    for v in x.iter_mut() {
-        *v = fast_exp(*v - max);
-    }
+    // The exponentials at the CPU's vector width, then their sum in order as before.
+    wide(
+        #[inline(always)]
+        || {
+            for v in x.iter_mut() {
+                *v = fast_exp(*v - max);
+            }
+        },
+    );
     let mut sum = 0f32;
     for v in x.iter() {
         sum += *v;
     }
     let inv = 1.0 / sum;
-    for v in x.iter_mut() {
-        *v *= inv;
-    }
+    wide(
+        #[inline(always)]
+        || {
+            for v in x.iter_mut() {
+                *v *= inv;
+            }
+        },
+    );
 }
 
 #[cfg(test)]
@@ -3203,6 +3250,65 @@ mod tests {
             let mut bs = 3u64;
             let bytes = random_blocks(kind, n_out * n_in / kind.block_size(), &mut bs);
             go(kind.name(), &GgufMatrix::from_bytes(kind, &bytes, n_out, n_in).unwrap());
+        }
+    }
+
+    /// The attention kernels against the loops they replace, bit for bit: scores of several keys
+    /// at a time, and value rows added into the heads that share them.
+    #[test]
+    fn attention_kernels_match_dot_and_axpy_bitwise() {
+        let mut seed = 31u64;
+        for hd in [1usize, 7, 8, 16, 24, 48, 64, 100, 128, 200, 256] {
+            for n in [0usize, 1, 3, 4, 5, 8, 13, 21] {
+                let stride = 3 * hd + 5;
+                let keys: Vec<f32> = (0..n.max(1) * stride).map(|_| lcg(&mut seed)).collect();
+                let q: Vec<f32> = (0..hd).map(|_| lcg(&mut seed)).collect();
+                let mut got = vec![f32::NAN; n];
+                dots(&q, &keys, stride, &mut got);
+                for (j, g) in got.iter().enumerate() {
+                    let want = dot(&q, &keys[j * stride..j * stride + hd]);
+                    assert_eq!(g.to_bits(), want.to_bits(), "dots hd {hd} key {j} of {n}");
+                }
+                for rows in 1..=7 {
+                    let w: Vec<f32> = (0..rows * n).map(|_| lcg(&mut seed)).collect();
+                    let mut want = vec![0f32; rows * hd];
+                    for j in 0..n {
+                        for r in 0..rows {
+                            for c in 0..hd {
+                                want[r * hd + c] += w[r * n + j] * keys[j * stride + c];
+                            }
+                        }
+                    }
+                    let mut got = vec![f32::NAN; rows * hd];
+                    weighted_values(&w, &keys, stride, hd, &mut got);
+                    for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                        assert_eq!(a.to_bits(), b.to_bits(), "values hd {hd} n {n} rows {rows} at {i}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// `softmax_inplace` (exponentials at the vector width) against the one-loop form.
+    #[test]
+    fn softmax_matches_scalar_bitwise() {
+        let mut seed = 77u64;
+        for n in [1usize, 2, 7, 16, 33, 100, 1000] {
+            let x: Vec<f32> = (0..n).map(|_| lcg(&mut seed) * 12.0).collect();
+            let max = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut want = x.clone();
+            let mut sum = 0f32;
+            for v in want.iter_mut() {
+                *v = fast_exp(*v - max);
+                sum += *v;
+            }
+            let inv = 1.0 / sum;
+            want.iter_mut().for_each(|v| *v *= inv);
+            let mut got = x.clone();
+            softmax_inplace(&mut got);
+            for (a, b) in got.iter().zip(&want) {
+                assert_eq!(a.to_bits(), b.to_bits(), "n {n}");
+            }
         }
     }
 

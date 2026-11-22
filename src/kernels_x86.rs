@@ -728,6 +728,135 @@ pub unsafe fn dots_avx2(q: *const f32, hd: usize, keys: *const f32, stride: usiz
     }
 }
 
+/// `out[r][c] = sum_j w[r][j] * values[j * stride + c]` for the first columns `c` of `hd`, from
+/// zero in order of `j`, a multiply then an add (the bits of an `axpy` per key into a zeroed
+/// row); returns the number of columns done (the rest is the caller's). The sums of up to four
+/// rows over 64 columns stay in registers while the keys pass, so each value is loaded once for
+/// the rows that share it and nothing is stored per key.
+///
+/// # Safety
+/// [`avx2`] is true; `w` holds `rows` rows of `n` weights (`rows * n`), `values` covers
+/// `(n - 1) * stride + hd`, `out` is `rows * hd`.
+pub unsafe fn weighted_values(w: *const f32, rows: usize, n: usize, values: *const f32, stride: usize, hd: usize, out: *mut f32) -> usize {
+    let wide = avx512();
+    let mut r = 0;
+    let mut done = 0;
+    while r < rows {
+        let g = if wide {
+            let g = if rows - r >= 4 {
+                4
+            } else if rows - r >= 2 {
+                2
+            } else {
+                1
+            };
+            done = match g {
+                4 => weighted_avx512::<4>(w.add(r * n), n, values, stride, hd, out.add(r * hd)),
+                2 => weighted_avx512::<2>(w.add(r * n), n, values, stride, hd, out.add(r * hd)),
+                _ => weighted_avx512::<1>(w.add(r * n), n, values, stride, hd, out.add(r * hd)),
+            };
+            g
+        } else {
+            let g = if rows - r >= 2 { 2 } else { 1 };
+            done = match g {
+                2 => weighted_avx2::<2>(w.add(r * n), n, values, stride, hd, out.add(r * hd)),
+                _ => weighted_avx2::<1>(w.add(r * n), n, values, stride, hd, out.add(r * hd)),
+            };
+            g
+        };
+        r += g;
+    }
+    done
+}
+
+#[target_feature(enable = "avx512f,avx2")]
+unsafe fn weighted_avx512<const R: usize>(w: *const f32, n: usize, values: *const f32, stride: usize, hd: usize, out: *mut f32) -> usize {
+    let z = _mm512_setzero_ps();
+    let mut c = 0;
+    while c + 64 <= hd {
+        let mut acc = [[z; 4]; R];
+        for j in 0..n {
+            let p = values.add(j * stride + c);
+            let v = [
+                _mm512_loadu_ps(p),
+                _mm512_loadu_ps(p.add(16)),
+                _mm512_loadu_ps(p.add(32)),
+                _mm512_loadu_ps(p.add(48)),
+            ];
+            for r in 0..R {
+                let x = _mm512_set1_ps(*w.add(r * n + j));
+                for q in 0..4 {
+                    acc[r][q] = _mm512_add_ps(acc[r][q], _mm512_mul_ps(x, v[q]));
+                }
+            }
+        }
+        for r in 0..R {
+            for q in 0..4 {
+                _mm512_storeu_ps(out.add(r * hd + c + 16 * q), acc[r][q]);
+            }
+        }
+        c += 64;
+    }
+    while c + 16 <= hd {
+        let mut acc = [z; R];
+        for j in 0..n {
+            let v = _mm512_loadu_ps(values.add(j * stride + c));
+            for r in 0..R {
+                acc[r] = _mm512_add_ps(acc[r], _mm512_mul_ps(_mm512_set1_ps(*w.add(r * n + j)), v));
+            }
+        }
+        for r in 0..R {
+            _mm512_storeu_ps(out.add(r * hd + c), acc[r]);
+        }
+        c += 16;
+    }
+    c
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn weighted_avx2<const R: usize>(w: *const f32, n: usize, values: *const f32, stride: usize, hd: usize, out: *mut f32) -> usize {
+    let z = _mm256_setzero_ps();
+    let mut c = 0;
+    while c + 32 <= hd {
+        let mut acc = [[z; 4]; R];
+        for j in 0..n {
+            let p = values.add(j * stride + c);
+            let v = [
+                _mm256_loadu_ps(p),
+                _mm256_loadu_ps(p.add(8)),
+                _mm256_loadu_ps(p.add(16)),
+                _mm256_loadu_ps(p.add(24)),
+            ];
+            for r in 0..R {
+                let x = _mm256_set1_ps(*w.add(r * n + j));
+                for q in 0..4 {
+                    acc[r][q] = _mm256_add_ps(acc[r][q], _mm256_mul_ps(x, v[q]));
+                }
+            }
+        }
+        for r in 0..R {
+            for q in 0..4 {
+                _mm256_storeu_ps(out.add(r * hd + c + 8 * q), acc[r][q]);
+            }
+        }
+        c += 32;
+    }
+    while c + 8 <= hd {
+        let mut acc = [z; R];
+        for j in 0..n {
+            let v = _mm256_loadu_ps(values.add(j * stride + c));
+            for r in 0..R {
+                acc[r] = _mm256_add_ps(acc[r], _mm256_mul_ps(_mm256_set1_ps(*w.add(r * n + j)), v));
+            }
+        }
+        for r in 0..R {
+            _mm256_storeu_ps(out.add(r * hd + c), acc[r]);
+        }
+        c += 8;
+    }
+    c
+}
+
 /// `y[i] += alpha * x[i]` for `n` values (a multiply then an add per element, as the scalar
 /// loop: the same bits at any vector width).
 ///
