@@ -3425,7 +3425,7 @@ impl PendingTurn {
                         d
                     }
                     _ => {
-                        let logits = model.logits(&last, 1);
+                        let logits = model.logits_device(&last, 1);
                         plain!(*model, sess, base, logits, max)
                     }
                 }
@@ -3436,7 +3436,8 @@ impl PendingTurn {
                     sess.add_vision_span(base + p, gh, gw);
                 }
                 let hs = generate::prefill(*model, sess, &ids, chunk, &overrides);
-                let logits = model.logits(&hs[hs.len() - model.cfg.hidden_size..], 1);
+                // The last row's head on the device when there is one (the CPU's took ~1-4 ms).
+                let logits = model.logits_device(&hs[hs.len() - model.cfg.hidden_size..], 1);
                 st.prefill_secs = t0.elapsed().as_secs_f64();
                 let max = limit(sess.pos);
                 if max == 0 {

@@ -1763,8 +1763,27 @@ impl<'a> Model<'a> {
 
     /// Softcapped logits `[t, vocab]` for final-normed hidden states `[t, hidden]`.
     pub fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
+        let logits = self.logits_raw(hidden, t);
+        self.softcap(logits)
+    }
+
+    /// [`Self::logits`] of a few rows (1 to 4) on the accelerator's matrix-vector kernels when
+    /// one is active and the weights do not stream: a prompt's last row, whose head on the CPU
+    /// took longer than the device's (the GPU decode steps' heads round the same way).
+    pub fn logits_device(&self, hidden: &[f32], t: usize) -> Vec<f32> {
+        if self.stream.is_none() && t <= 4 {
+            let _timer = prof::start(Cat::Head);
+            let (v, h) = (self.cfg.vocab_size, self.cfg.hidden_size);
+            let mut logits = vec![0f32; t * v];
+            if linear_rows_device(&mut [(&self.head, None, v, &mut logits[..])], h, hidden, t) {
+                return self.softcap(logits);
+            }
+        }
+        self.logits(hidden, t)
+    }
+
+    fn softcap(&self, mut logits: Vec<f32>) -> Vec<f32> {
         let cfg = &self.cfg;
-        let mut logits = self.logits_raw(hidden, t);
         let _timer = prof::start(Cat::Head);
         if let Some(cap) = cfg.final_logit_softcapping {
             let cap = cap as f32;
