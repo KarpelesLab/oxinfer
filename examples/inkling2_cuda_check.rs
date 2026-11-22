@@ -13,6 +13,8 @@
 //! steps instead, and their logits compared with the reference's prompt positions: decode steps
 //! against the CPU's f32 prefill GEMM (its decode kernels round activations to int8).
 //!
+//! `--seed N` picks another pseudo-random prompt.
+//!
 //! `--keep N` (with `--all`): only the logits of the last N prompt positions are kept.
 //!
 //! `--depth D` first runs D untimed tokens (in chunks of `--chunk`), as llama-bench's `-d`: the
@@ -59,6 +61,7 @@ fn main() -> Result<()> {
     let mut depth = 0usize;
     let mut tail = 0usize;
     let mut keep = usize::MAX;
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--prompt-len" => plen = args.next().context("N")?.parse()?,
@@ -72,6 +75,7 @@ fn main() -> Result<()> {
             "--depth" => depth = args.next().context("D")?.parse()?,
             "--tail" => tail = args.next().context("N")?.parse()?,
             "--keep" => keep = args.next().context("N")?.parse()?,
+            "--seed" => seed ^= args.next().context("N")?.parse::<u64>()?.wrapping_mul(0x9E37_79B9_7F4A_7C15),
             o => anyhow::bail!("unknown argument {o}"),
         }
     }
@@ -85,7 +89,7 @@ fn main() -> Result<()> {
     let files = ModelFiles::open(&dir, true)?;
     let mut m = Inkling2Model::load(Inkling2Config::load(&dir)?, &files, oxinfer::model::Quant::Bf16)?;
     m.kv = kv;
-    let mut s = 0x2545_F491_4F6C_DD1Du64;
+    let mut s = seed;
     let tokens: Vec<u32> = (0..plen + depth)
         .map(|_| {
             s ^= s << 13;

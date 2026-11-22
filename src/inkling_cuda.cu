@@ -445,6 +445,33 @@ __device__ __forceinline__ void gate_down_body(const W& w, const float* x, const
     if (threadIdx.x == 0) d[(u64)tok * r + row] = tot * w.f;
 }
 
+// The same for prefill: a block (8 warps) per token, the norms computed once, each warp taking
+// every 8th row.
+template <int K>
+__device__ __forceinline__ void gate_down_t_body(const W& w, const float* x, const float* m, float* d, u32 h, u32 r, float eps) {
+    __shared__ float red[32];
+    __shared__ float cat[4608];
+    u32 tok = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const float* xr = x + (u64)tok * h;
+    const float* mr = m + (u64)tok * h;
+    float sx = 0.f, sm = 0.f;
+    for (u32 i = threadIdx.x; i < h; i += blockDim.x) {
+        sx += xr[i] * xr[i];
+        sm += mr[i] * mr[i];
+    }
+    float rx = rsqrtf(block_sum2(sx, red) / (float)h + eps);
+    float rm = rsqrtf(block_sum2(sm, red) / (float)h + eps);
+    for (u32 i = threadIdx.x; i < h; i += blockDim.x) {
+        cat[i] = xr[i] * rx;
+        cat[h + i] = mr[i] * rm;
+    }
+    __syncthreads();
+    for (u32 row = warp; row < r; row += 8) {
+        float v = rowdot<K>(w, w.q + (u64)row * w.rb, w.s, row, cat, 2 * h / 32, lane);
+        if (lane == 0) d[(u64)tok * r + row] = v * w.f;
+    }
+}
+
 // The gate itself: out = (1 - tanh(forget d)) x + tanh(gain d) m, a warp per output.
 __device__ __forceinline__ float tanh_acc(float x);
 template <int K>
@@ -591,6 +618,9 @@ struct GemmP {
     const Tile* tiles;
     const u32* ntiles;
     const float* wrow;
+    // X3: x already split (`split_rows`): hi and lo half2 rows of n_in / 2, or null.
+    const u32* xh;
+    const u32* xl;
     u32 n_in, n_out, rows, xs, ys, mode, mi, inter;
     float beta, lbeta;
 };
@@ -626,10 +656,15 @@ __device__ __forceinline__ void gemm_body(const W& w, const GemmP& p) {
     // (tid / 2, parts (tid % 2) * 4 .. + 3).
     u32 lr = tid >> 1, lh = tid & 1;
     const float* xrow = nullptr;
+    const u32 *xhr = nullptr, *xlr = nullptr;
     if (lr < nr) {
         u32 gr = r0 + lr;
         u32 src = p.gidx ? (u32)p.gidx[gr] : gr;
         xrow = p.x + (u64)src * p.xs;
+        if (X3 && p.xh) {
+            xhr = p.xh + (u64)src * (p.n_in / 2);
+            xlr = p.xl + (u64)src * (p.n_in / 2);
+        }
     }
     u32 wr;
     bool wok;
@@ -657,7 +692,15 @@ __device__ __forceinline__ void gemm_body(const W& w, const GemmP& p) {
     u32 nb = p.n_in / 32;
     for (u32 b = 0; b < nb; b++) {
         // X: 16 floats -> 8 half2.
-        if (xrow) {
+        if (X3 && xhr) {
+            const uint4* ph = (const uint4*)(xhr + 16 * b + 8 * lh);
+            const uint4* pl = (const uint4*)(xlr + 16 * b + 8 * lh);
+            uint4 h0 = ph[0], h1 = ph[1], l0 = pl[0], l1 = pl[1];
+            u32* ah = As + lr * GLD + 8 * lh;
+            u32* al2 = Al + lr * GLD + 8 * lh;
+            ah[0] = h0.x, ah[1] = h0.y, ah[2] = h0.z, ah[3] = h0.w, ah[4] = h1.x, ah[5] = h1.y, ah[6] = h1.z, ah[7] = h1.w;
+            al2[0] = l0.x, al2[1] = l0.y, al2[2] = l0.z, al2[3] = l0.w, al2[4] = l1.x, al2[5] = l1.y, al2[6] = l1.z, al2[7] = l1.w;
+        } else if (xrow) {
             const float4* xp = (const float4*)(xrow + 32 * b + 16 * lh);
 #pragma unroll
             for (int i = 0; i < 4; i++) {
@@ -840,6 +883,10 @@ __device__ __forceinline__ void gemm_body(const W& w, const GemmP& p) {
     extern "C" __global__ void __launch_bounds__(256)                                                                                      \
         gate_down_##K(W w, const float* x, const float* m, float* d, u32 h, u32 r, float eps) {                                            \
         gate_down_body<K>(w, x, m, d, h, r, eps);                                                                                          \
+    }                                                                                                                                      \
+    extern "C" __global__ void __launch_bounds__(256)                                                                                      \
+        gate_down_t_##K(W w, const float* x, const float* m, float* d, u32 h, u32 r, float eps) {                                          \
+        gate_down_t_body<K>(w, x, m, d, h, r, eps);                                                                                        \
     }                                                                                                                                      \
     extern "C" __global__ void __launch_bounds__(256)                                                                                      \
         gate_out_##K(W wf, W wg, const float* d, const float* x, const float* m, float* out, u32 h, u32 r) {                               \
@@ -1095,6 +1142,17 @@ extern "C" __global__ void gate_cat(const float* x, const float* m, float* cat, 
         o[i] = xr[i] * ra;
         o[h + i] = mr[i] * rb;
     }
+}
+
+// The split halves of `rows` rows of k values (x rows `xs` apart) for the GEMMs: hi[r][i] and
+// lo[r][i] the half2 of elements 2i, 2i + 1.
+extern "C" __global__ void split_rows(const float* x, u32 xs, u32 rows, u32 k, u32* hi, u32* lo) {
+    u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    u64 per = k / 2;
+    if (i >= (u64)rows * per) return;
+    u64 r = i / per, c = i % per;
+    float2 v = *(const float2*)(x + r * xs + 2 * c);
+    split_h2(v.x, v.y, hi[i], lo[i]);
 }
 
 // out = (1 - tanh f) x + tanh(g) m (elementwise over n values).
@@ -1402,6 +1460,151 @@ ATTN(2)
 ATTN(3)
 ATTN(4)
 
+// Prefill attention, tiled: a block (4 warps) takes QT = 8 consecutive queries of one key/value
+// head (each warp 2 of them, with the G query heads of the group) and walks their keys 32 at a
+// time, the keys and values staged in shared memory once for all the queries. Scores with a
+// lane per key (the queries' rows broadcast from shared memory), an online softmax per row, the
+// values with a lane per 4 dimensions. Writes the same partial results as `attn_*` (split
+// `blockIdx.z` of the keys from the first query's lowest key to the last query's position).
+#define AQT 8
+#define AKT 32
+template <int F, int G>
+__device__ __forceinline__ void attnt_body(const AttP& p, u32 t) {
+    // Keys transposed (a lane per key reads consecutive words), values, the queries' rows and
+    // relative vectors: 46 KB for G = 3 (static shared memory stops at 48).
+    __shared__ float Kt[128][AKT];
+    __shared__ __align__(16) float Vs[AKT][128];
+    __shared__ float Qs[AQT * G][128];
+    __shared__ float Rs[AQT * G][16];
+    u32 g = blockIdx.x, q0 = blockIdx.y * AQT, sp = blockIdx.z;
+    u32 warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    u32 kw = p.nkv * 128, nq = min((u32)AQT, t - q0);
+    u32 base = (u32)p.info[0];
+    // This block's key range: [lowest key of its first query, position of its last query].
+    u32 plast = base + q0 + nq - 1, pfirst = base + q0;
+    u32 lo_all = p.window && pfirst + 1 > p.window ? pfirst + 1 - p.window : 0;
+    u32 n = plast + 1 - lo_all;
+    u32 j0 = lo_all + (u32)((u64)n * sp / p.ns), j1 = lo_all + (u32)((u64)n * (sp + 1) / p.ns);
+    // The queries' rows (pre-scaled) and relative vectors.
+    for (u32 i = threadIdx.x; i < AQT * G * 128; i += blockDim.x) {
+        u32 row = i / 128, d = i % 128, qi = row / G, h = row % G;
+        Qs[row][d] = qi < nq ? p.q[(u64)(q0 + qi) * p.qs + (g * G + h) * 128 + d] * p.scaling : 0.f;
+    }
+    for (u32 i = threadIdx.x; i < AQT * G * 16; i += blockDim.x) {
+        u32 row = i / 16, z = i % 16, qi = row / G, h = row % G;
+        Rs[row][z] = qi < nq && z < p.dr ? p.r[(u64)(q0 + qi) * p.rs + (g * G + h) * p.dr + z] : 0.f;
+    }
+    // Warp w: queries 2w, 2w + 1, rows (query, head).
+    constexpr u32 RW = 2 * G;
+    float m[RW], l[RW];
+    float4 acc[RW];
+#pragma unroll
+    for (u32 r = 0; r < RW; r++) {
+        m[r] = -INFINITY;
+        l[r] = 0.f;
+        acc[r] = make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+    __syncthreads();
+    for (u32 k0 = j0; k0 < j1; k0 += AKT) {
+        // Stage keys k0 .. k0 + 31 (decoded to f32).
+        for (u32 i = threadIdx.x; i < AKT * 32; i += blockDim.x) {
+            u32 kk = i / 32, c4 = i % 32, j = k0 + kk;
+            float4 kv = make_float4(0.f, 0.f, 0.f, 0.f), vv = kv;
+            if (j < j1) {
+                u64 row = j % p.cap;
+                kv = kv_load<F>(p.kc, p.ks, row, kw, g * 128 + 4 * c4);
+                vv = kv_load<F>(p.vc, p.vs, row, kw, g * 128 + 4 * c4);
+            }
+            Kt[4 * c4][kk] = kv.x, Kt[4 * c4 + 1][kk] = kv.y, Kt[4 * c4 + 2][kk] = kv.z, Kt[4 * c4 + 3][kk] = kv.w;
+            *(float4*)&Vs[kk][4 * c4] = vv;
+        }
+        __syncthreads();
+        u32 j = k0 + lane;
+        // Scores: lane = key, eight partial sums per score added as a tree (one f32 chain of 128
+        // products is 10x less accurate, enough to move near-tied expert choices downstream).
+        float sc[RW];
+        {
+            float ps[RW][8];
+#pragma unroll
+            for (u32 r = 0; r < RW; r++)
+#pragma unroll
+                for (u32 u = 0; u < 8; u++) ps[r][u] = 0.f;
+            for (u32 d = 0; d < 128; d += 8) {
+#pragma unroll
+                for (u32 u = 0; u < 8; u++) {
+                    float kd = Kt[d + u][lane];
+#pragma unroll
+                    for (u32 r = 0; r < RW; r++) ps[r][u] += Qs[warp * RW + r][d + u] * kd;
+                }
+            }
+#pragma unroll
+            for (u32 r = 0; r < RW; r++) sc[r] = ((ps[r][0] + ps[r][1]) + (ps[r][2] + ps[r][3])) + ((ps[r][4] + ps[r][5]) + (ps[r][6] + ps[r][7]));
+        }
+#pragma unroll
+        for (u32 r = 0; r < RW; r++) {
+            u32 qi = warp * 2 + r / G;
+            u32 pos = base + q0 + qi;
+            u32 lo = p.window && pos + 1 > p.window ? pos + 1 - p.window : 0;
+            bool ok = qi < nq && j < j1 && j <= pos && j >= lo;
+            float s = -INFINITY;
+            if (ok) {
+                u32 dist = pos - j;
+                float b = 0.f;
+                if (dist < p.extent)
+                    for (u32 z = 0; z < p.dr; z++) b += Rs[warp * RW + r][z] * p.rel[(u64)z * p.extent + dist];
+                s = sc[r] + b;
+            }
+            float bm = warp_max(s);
+            float mn = fmaxf(m[r], bm);
+            float e = s == -INFINITY ? 0.f : __expf(s - mn);
+            float a = m[r] == -INFINITY ? 0.f : __expf(m[r] - mn);
+            float es = warp_sum(e);
+            if (mn == -INFINITY) {
+                sc[r] = 0.f;
+                continue;
+            }
+            l[r] = l[r] * a + es;
+            m[r] = mn;
+            acc[r].x *= a, acc[r].y *= a, acc[r].z *= a, acc[r].w *= a;
+            sc[r] = e;
+        }
+        // Values: lane = dims 4 lane .. 4 lane + 3; this tile's sum apart, then added to the running
+        // one (a single chain over all the keys is several times less accurate).
+        float4 ta[RW];
+#pragma unroll
+        for (u32 r = 0; r < RW; r++) ta[r] = make_float4(0.f, 0.f, 0.f, 0.f);
+        for (u32 kk = 0; kk < AKT; kk++) {
+            float4 vv = *(const float4*)&Vs[kk][4 * lane];
+#pragma unroll
+            for (u32 r = 0; r < RW; r++) {
+                float pr = __shfl_sync(0xffffffffu, sc[r], kk);
+                ta[r].x += pr * vv.x, ta[r].y += pr * vv.y, ta[r].z += pr * vv.z, ta[r].w += pr * vv.w;
+            }
+        }
+#pragma unroll
+        for (u32 r = 0; r < RW; r++) acc[r].x += ta[r].x, acc[r].y += ta[r].y, acc[r].z += ta[r].z, acc[r].w += ta[r].w;
+        __syncthreads();
+    }
+#pragma unroll
+    for (u32 r = 0; r < RW; r++) {
+        u32 qi = warp * 2 + r / G, h = r % G;
+        if (qi >= nq) continue;
+        float* out = p.part + (((u64)(q0 + qi) * p.nh + g * G + h) * p.ns + sp) * 130;
+        out[4 * lane] = acc[r].x, out[4 * lane + 1] = acc[r].y, out[4 * lane + 2] = acc[r].z, out[4 * lane + 3] = acc[r].w;
+        if (lane == 0) {
+            out[128] = m[r];
+            out[129] = m[r] == -INFINITY ? 0.f : l[r];
+        }
+    }
+}
+#define ATTNT(G)                                                                                               \
+    extern "C" __global__ void __launch_bounds__(128) attnt_f32_##G(AttP p, u32 t) { attnt_body<0, G>(p, t); } \
+    extern "C" __global__ void __launch_bounds__(128) attnt_f16_##G(AttP p, u32 t) { attnt_body<1, G>(p, t); } \
+    extern "C" __global__ void __launch_bounds__(128) attnt_q8_##G(AttP p, u32 t) { attnt_body<2, G>(p, t); }
+ATTNT(1)
+ATTNT(2)
+ATTNT(3)
+
 // Merges the splits with the sink (a logit with a zero value) and gates the result:
 // out[tok][hh * 128 + c] = o * sigmoid(gate). A block of 128 threads per (token, head).
 extern "C" __global__ void attn_merge(const float* part, const float* sink, const float* gate, float* out, u32 nh, u32 ns, u32 sink_s, u32 gate_s) {
@@ -1422,45 +1625,46 @@ extern "C" __global__ void attn_merge(const float* part, const float* sink, cons
     out[(u64)tok * nh * 128 + hh * 128 + c] = o / l / (1.f + __expf(-gv));
 }
 
+// A float as an unsigned integer in the same order (NaN below everything, -inf above it).
+__device__ __forceinline__ u32 ord_key(float f) {
+    u32 b = __float_as_uint(f);
+    if ((b & 0x7fffffffu) > 0x7f800000u) return 0;
+    return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
 // Sigmoid routing: per token (a warp), the k experts with the largest sigmoid(logit) + bias (ties
 // to the lower index), in that order, weighted by their sigmoid scores renormalized, times scale.
+// The choice compares integer keys (score order, then the lower index), so NaN scores (the
+// lowest) cannot leave a slot empty.
 extern "C" __global__ void route_k(const float* logits, const float* bias, int* ids, float* wts, u32 ne, u32 k, float scale, u32 t) {
     u32 warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     u32 tok = blockIdx.x * (blockDim.x >> 5) + warp;
     if (tok >= t) return;
-    float sv[8], ch[8];
+    float sv[8];
+    u64 key[8];
     u32 per = (ne + 31) / 32;
     for (u32 i = 0; i < per; i++) {
         u32 e = lane + 32 * i;
         float lg = e < ne ? logits[(u64)tok * ne + e] : 0.f;
         sv[i] = 1.f / (1.f + expf(-lg));
-        ch[i] = e < ne ? sv[i] + bias[e] : -INFINITY;
+        key[i] = e < ne ? ((u64)(ord_key(sv[i] + bias[e]) + 1) << 32) | (0xffffffffu - e) : 0;
     }
     float sum = 0.f;
     for (u32 kk = 0; kk < k; kk++) {
-        float best = -INFINITY;
-        u32 bi = 0xffffffffu;
-        for (u32 i = 0; i < per; i++) {
-            u32 e = lane + 32 * i;
-            if (ch[i] > best || (ch[i] == best && e < bi)) {
-                best = ch[i];
-                bi = e;
-            }
-        }
+        u64 best = 0;
+        for (u32 i = 0; i < per; i++) best = key[i] > best ? key[i] : best;
         for (int o = 16; o > 0; o >>= 1) {
-            float ob = __shfl_xor_sync(0xffffffffu, best, o);
-            u32 oi = __shfl_xor_sync(0xffffffffu, bi, o);
-            if (ob > best || (ob == best && oi < bi)) {
-                best = ob;
-                bi = oi;
-            }
+            u64 ob = __shfl_xor_sync(0xffffffffu, best, o);
+            best = ob > best ? ob : best;
         }
+        u32 bi = 0xffffffffu - (u32)best;
         float s = 0.f;
         if (bi % 32 == lane) {
             s = sv[bi / 32];
-            ch[bi / 32] = -INFINITY;
+            key[bi / 32] = 0;
         }
         s = __shfl_sync(0xffffffffu, s, bi % 32);
+        s = s == s ? s : 0.f;
         sum += s;
         if (lane == 0) {
             ids[tok * k + kk] = (int)bi;
@@ -1468,7 +1672,7 @@ extern "C" __global__ void route_k(const float* logits, const float* bias, int* 
         }
     }
     __syncwarp();
-    if (lane < k) wts[tok * k + lane] = wts[tok * k + lane] / sum * scale;
+    if (lane < k) wts[tok * k + lane] = sum > 0.f ? wts[tok * k + lane] / sum * scale : 0.f;
 }
 
 // The MoE segments of a prefill pass (one block of 1024 threads): per expert its routed slots

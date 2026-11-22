@@ -1084,6 +1084,8 @@ pub struct Inkling2Session {
     pub iv: crate::intervene::State,
     /// The state on the device, when the model runs there.
     pub(crate) dev: Option<DevBox>,
+    /// The device could not hold this session's caches: it runs on the host from then on.
+    pub(crate) dev_off: bool,
 }
 
 /// What a device pass returns ([`DevEngine::run`]).
@@ -1702,6 +1704,7 @@ impl<'a> Inkling2Model<'a> {
             pos: 0,
             iv: Default::default(),
             dev: None,
+            dev_off: false,
         }
     }
 
@@ -1721,7 +1724,7 @@ impl<'a> Inkling2Model<'a> {
     /// session then has its state on the host).
     fn run_device(&self, sess: &mut Inkling2Session, tokens: &[u32], mm: &[(usize, &[f32])], want: DevWant) -> bool {
         let t = tokens.len();
-        if sess.iv.active() || t == 0 {
+        if sess.iv.active() || t == 0 || sess.dev_off {
             self.to_host(sess);
             return false;
         }

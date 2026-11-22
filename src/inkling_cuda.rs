@@ -87,6 +87,8 @@ const SPLITS_SLIDING: usize = 16;
 const MAX_STATES: usize = 11;
 /// Kept free on the device beyond the weights and activations.
 const RESERVE: usize = 1 << 30;
+/// Kept free when a session's caches are allocated or grown (the session then moves to the host).
+const SESS_RESERVE: usize = 256 << 20;
 
 fn debug(why: &str) {
     if std::env::var("OXINFER_GPU_PLAN_DEBUG").is_ok_and(|v| v != "0") {
@@ -126,6 +128,8 @@ struct Dw {
     gout: F,
     /// The GEMM in split halves (`gpu::exact`).
     gemmx: F,
+    /// A message gate's down projection for prefill (a block per token).
+    gdown_t: F,
 }
 
 impl Dw {
@@ -134,14 +138,15 @@ impl Dw {
     /// ~2e-3), or f16 operands, ~15% faster, with `gpu_exact=0` ([`crate::gpu::set_exact`]) or
     /// `OXINFER_INKLING_EXACT=0` (which wins).
     fn gemm_f(&self) -> F {
-        static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
-        let env = *ENV.get_or_init(|| std::env::var("OXINFER_INKLING_EXACT").ok().map(|v| v != "0"));
-        if env.or_else(crate::gpu::exact_forced).unwrap_or(true) {
-            self.gemmx
-        } else {
-            self.gemm
-        }
+        if split_gemm() { self.gemmx } else { self.gemm }
     }
+}
+
+/// See [`Dw::gemm_f`].
+fn split_gemm() -> bool {
+    static ENV: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| std::env::var("OXINFER_INKLING_EXACT").ok().map(|v| v != "0"));
+    env.or_else(crate::gpu::exact_forced).unwrap_or(true)
 }
 
 #[repr(C)]
@@ -221,6 +226,8 @@ struct GemmP {
     tiles: u64,
     ntiles: u64,
     wrow: u64,
+    xh: u64,
+    xl: u64,
     n_in: u32,
     n_out: u32,
     rows: u32,
@@ -585,11 +592,13 @@ pub(super) struct Engine {
     module: F,
     stream: F,
     funcs: HashMap<&'static str, F>,
-    kfuncs: HashMap<u32, [F; 8]>,
+    kfuncs: HashMap<u32, [F; 9]>,
     /// `OXINFER_INKLING_PROFILE=1`: time per kernel (calls, seconds), launches synchronized.
     prof: Option<Mutex<HashMap<usize, (u64, f64)>>>,
     /// Two buffers of a pass's `[tokens, hidden]` for the prefill convolutions (0: none yet).
     conv_scratch: (u64, u64),
+    /// The split halves of a GEMM's input (hi, lo, capacity in half pairs).
+    xsplit: (u64, u64, usize),
     /// Launches whose events are not read yet (function, start, end).
     pending: Mutex<Vec<(usize, usize, usize)>>,
     owned: Mutex<Vec<u64>>,
@@ -734,7 +743,17 @@ fn cached_module(be: &CudaBackend, src: &str, kinds: &[u32]) -> Result<F> {
     be.load_image(&img)
 }
 
-const FIXED: [&str; 30] = [
+const FIXED: [&str; 40] = [
+    "attnt_f32_1",
+    "attnt_f16_1",
+    "attnt_q8_1",
+    "attnt_f32_2",
+    "attnt_f16_2",
+    "attnt_q8_2",
+    "attnt_f32_3",
+    "attnt_f16_3",
+    "attnt_q8_3",
+    "split_rows",
     "sconv_par",
     "sconv_hist",
     "rms_rows",
@@ -901,6 +920,10 @@ impl Engine {
         *e.arena.lock().unwrap() = arena;
         let cw = (CHUNK * h.max(e.max_kv_heads * 128)) * 4;
         e.conv_scratch = (e.alloc(cw).ok()?, e.alloc(cw).ok()?);
+        // The largest GEMM input: a chunk of the widest projection input, or the experts' rows.
+        let widest = (2 * h).max(e.max_heads * 128).max(mi);
+        let pairs = (CHUNK * widest).max(CHUNK * e.k_top * mi) / 2;
+        e.xsplit = (e.alloc(pairs * 4).ok()?, e.alloc(pairs * 4).ok()?, pairs);
         debug(&format!(
             "{:.1} GB of weights on the device in {:.1} s (kinds {kinds:?})",
             total as f64 / 1e9,
@@ -932,7 +955,7 @@ impl Engine {
         for n in FIXED {
             funcs.insert(n, get(n)?);
         }
-        let mut kfuncs: HashMap<u32, [F; 8]> = HashMap::new();
+        let mut kfuncs: HashMap<u32, [F; 9]> = HashMap::new();
         for &k in kinds {
             kfuncs.insert(
                 k,
@@ -945,6 +968,7 @@ impl Engine {
                     get(&format!("gate_down_{k}"))?,
                     get(&format!("gate_out_{k}"))?,
                     get(&format!("gemmx_{k}"))?,
+                    get(&format!("gate_down_t_{k}"))?,
                 ],
             );
         }
@@ -966,6 +990,7 @@ impl Engine {
                 .then(|| Mutex::new(HashMap::new())),
             pending: Mutex::new(Vec::new()),
             conv_scratch: (0, 0),
+            xsplit: (0, 0, 0),
             owned: Mutex::new(Vec::new()),
             layers: Vec::new(),
             head: Dw {
@@ -981,6 +1006,7 @@ impl Engine {
                 gdown: null,
                 gout: null,
                 gemmx: null,
+                gdown_t: null,
             },
             final_norm: 0,
             final_query: 0,
@@ -1095,7 +1121,7 @@ impl Engine {
     }
 
     /// One matrix, or (several) experts stacked at a common stride.
-    fn up_lins(&self, ls: &[&Lin], n_out: usize, n_in: usize, kf: &HashMap<u32, [F; 8]>) -> Result<Dw> {
+    fn up_lins(&self, ls: &[&Lin], n_out: usize, n_in: usize, kf: &HashMap<u32, [F; 9]>) -> Result<Dw> {
         let hs: Vec<HostW> = ls
             .iter()
             .map(|l| host_w(l, n_in).ok_or_else(|| anyhow!("unsupported weight")))
@@ -1170,11 +1196,12 @@ impl Engine {
             gdown: f[5],
             gout: f[6],
             gemmx: f[7],
+            gdown_t: f[8],
         })
     }
 
     /// A float32 matrix from host values.
-    fn up_f32(&self, w: &[f32], n_out: usize, n_in: usize, kf: &HashMap<u32, [F; 8]>) -> Result<Dw> {
+    fn up_f32(&self, w: &[f32], n_out: usize, n_in: usize, kf: &HashMap<u32, [F; 9]>) -> Result<Dw> {
         let f = kf[&0];
         Ok(Dw {
             a: WArg {
@@ -1197,10 +1224,11 @@ impl Engine {
             gdown: f[5],
             gout: f[6],
             gemmx: f[7],
+            gdown_t: f[8],
         })
     }
 
-    fn upload_model(&mut self, m: &Inkling2Model, kf: &HashMap<u32, [F; 8]>) -> Result<()> {
+    fn upload_model(&mut self, m: &Inkling2Model, kf: &HashMap<u32, [F; 9]>) -> Result<()> {
         let c = &m.cfg;
         let (h, kn) = (c.hidden_size, c.conv_kernel_size);
         self.head = self.up_lins(&[&m.lm_head], c.vocab_size, h, kf)?;
@@ -1429,7 +1457,17 @@ impl Engine {
                 if g as usize == f {
                     return format!(
                         "{}_{k}",
-                        ["mv", "gemm", "moe_gu", "moe_dn", "mvm", "gate_down", "gate_out", "gemmx"][i]
+                        [
+                            "mv",
+                            "gemm",
+                            "moe_gu",
+                            "moe_dn",
+                            "mvm",
+                            "gate_down",
+                            "gate_out",
+                            "gemmx",
+                            "gate_down_t"
+                        ][i]
                     );
                 }
             }
@@ -1453,27 +1491,60 @@ impl Engine {
                 &mut args![w.a, x, y, n_in, n_out, xs as u32, ys as u32, add as u32],
             );
         } else {
-            let p = GemmP {
-                x,
-                y,
-                n_in,
-                n_out,
-                rows: t as u32,
-                xs: xs as u32,
-                ys: ys as u32,
-                mode: add as u32,
-                ..Default::default()
-            };
-            self.go(w.gemm_f(), (ceil(w.n_out, 64), ceil(t, 64), 1), 128, &mut args![w.a, p]);
+            let sp = self.split(x, xs, t, w.n_in);
+            self.gemm(w, x, y, t, xs, ys, add, sp);
         }
+    }
+
+    /// The split halves of `rows` rows of `k` values (for the split GEMMs), in the engine's
+    /// buffer; (0, 0) when the GEMMs take f16 operands or the buffer is too small.
+    fn split(&self, x: u64, xs: usize, rows: usize, k: usize) -> (u64, u64) {
+        let (hi, lo, cap) = self.xsplit;
+        if !split_gemm() || hi == 0 || rows * k / 2 > cap {
+            return (0, 0);
+        }
+        let n = (rows * k / 2) as u32;
+        self.go(
+            self.f("split_rows"),
+            (n.div_ceil(256), 1, 1),
+            256,
+            &mut args![x, xs as u32, rows as u32, k as u32, hi, lo],
+        );
+        (hi, lo)
+    }
+
+    /// The GEMM of `w` over `t` rows of x (pre-split halves `sp`, or (0, 0)).
+    #[allow(clippy::too_many_arguments)]
+    fn gemm(&self, w: &Dw, x: u64, y: u64, t: usize, xs: usize, ys: usize, add: bool, sp: (u64, u64)) {
+        let p = GemmP {
+            x,
+            y,
+            xh: sp.0,
+            xl: sp.1,
+            n_in: w.n_in as u32,
+            n_out: w.n_out as u32,
+            rows: t as u32,
+            xs: xs as u32,
+            ys: ys as u32,
+            mode: add as u32,
+            ..Default::default()
+        };
+        self.go(w.gemm_f(), (ceil(w.n_out, 64), ceil(t, 64), 1), 128, &mut args![w.a, p]);
     }
 
     /// Several matrices over one input (`jobs`: matrix, output, output stride): one launch per
     /// run of up to 8 of a kind on the matvec path.
     fn lin_many(&self, jobs: &[(&Dw, u64, usize)], x: u64, xs: usize, t: usize) {
         if t > MV_T {
+            // One split of the input for all of them.
+            let n_in = jobs[0].0.n_in;
+            let sp = if jobs.iter().all(|j| j.0.n_in == n_in) {
+                self.split(x, xs, t, n_in)
+            } else {
+                (0, 0)
+            };
             for &(w, y, ys) in jobs {
-                self.lin(w, x, y, t, xs, ys, false);
+                self.gemm(w, x, y, t, xs, ys, false, sp);
             }
             return;
         }
@@ -1572,13 +1643,24 @@ impl Engine {
             );
             return;
         }
-        self.go(
-            self.f("gate_cat"),
-            (t as u32, 1, 1),
-            256,
-            &mut args![x, msg, ar.cat, h as u32, self.eps],
-        );
-        self.lin(&g.0, ar.cat, ar.gd, t, 2 * h, self.rank, false);
+        if 2 * h <= 4608 {
+            // A block per token (`gate_down_t`'s shared input holds 4608 values).
+            let r = self.rank as u32;
+            self.go(
+                g.0.gdown_t,
+                (t as u32, 1, 1),
+                256,
+                &mut args![g.0.a, x, msg, ar.gd, h as u32, r, self.eps],
+            );
+        } else {
+            self.go(
+                self.f("gate_cat"),
+                (t as u32, 1, 1),
+                256,
+                &mut args![x, msg, ar.cat, h as u32, self.eps],
+            );
+            self.lin(&g.0, ar.cat, ar.gd, t, 2 * h, self.rank, false);
+        }
         self.lin(&g.1, ar.gd, ar.gf, t, self.rank, h, false);
         self.lin(&g.2, ar.gd, ar.gg, t, self.rank, h, false);
         let n = (t * h) as u32;
@@ -1750,6 +1832,26 @@ impl Engine {
             rs: (nh * dr) as u32,
             scaling: (d as f32).powf(-0.5),
         };
+        if t >= 16 && nh / nkv <= 3 {
+            // Prefill: query tiles of 8 sharing their keys and values (`attnt_*`); splits of the
+            // keys when the tiles alone do not fill the device.
+            let tiles = t.div_ceil(8);
+            // (The partial results hold 1024 x heads rows: tokens x splits stays within that.)
+            let ns = (512 / (tiles * nkv)).clamp(1, (1024 / t).clamp(1, 32)) as u32;
+            let mut p = p;
+            p.ns = ns;
+            let name = format!("attnt_{}_{}", ["f32", "f16", "q8"][fmt as usize], nh / nkv);
+            let f = *self.funcs.iter().find(|(k, _)| **k == name).unwrap().1;
+            self.go(f, (nkv as u32, tiles as u32, ns), 128, &mut args![p, t as u32]);
+            self.go(
+                self.f("attn_merge"),
+                (nh as u32, t as u32, 1),
+                128,
+                &mut args![ar.part, ar.sink, ar.g, ar.att, nh as u32, ns, nh as u32, w as u32],
+            );
+            self.lin(&l.o, ar.att, ar.a, t, w, h, false);
+            return;
+        }
         self.go(self.attn_f(fmt, nh / nkv), (nkv as u32, t as u32, ns as u32), 128, &mut args![p]);
         self.go(
             self.f("attn_merge"),
@@ -1823,8 +1925,11 @@ impl Engine {
             &mut args![ar.perm, ar.wts, ar.tok, ar.wrow, n, k as u32],
         );
         let max_tiles = (t * k).div_ceil(64) + ne;
+        let sp = self.split(x, h, t, h);
         let p = GemmP {
             x,
+            xh: sp.0,
+            xl: sp.1,
             y: ar.mid,
             gidx: ar.tok,
             tiles: ar.tiles,
@@ -1842,8 +1947,11 @@ impl Engine {
             ..Default::default()
         };
         self.go(gu.gemm_f(), (ceil(mi, 32), max_tiles as u32, 1), 128, &mut args![gu.a, p]);
+        let sp = self.split(ar.mid, mi, t * k, mi);
         let p = GemmP {
             x: ar.mid,
+            xh: sp.0,
+            xl: sp.1,
             y: ar.dmoe,
             tiles: ar.tiles,
             ntiles: ar.ntiles,
@@ -1986,10 +2094,30 @@ impl Engine {
     /// The cache capacity a slot needs for `pos` positions (sliding layers: a fixed ring).
     fn cap_for(&self, l: &DLayer, pos: usize) -> usize {
         if l.full {
-            pos.max(4096).next_power_of_two()
+            pos.max(4096).next_multiple_of(1024)
         } else {
             (self.window + CHUNK).next_multiple_of(256)
         }
+    }
+
+    /// A zeroed device buffer, if the device keeps [`SESS_RESERVE`] free after it.
+    fn try_alloc(&self, n: usize) -> Option<u64> {
+        // Tests: `OXINFER_INKLING_SESS_LIMIT=BYTES` refuses larger buffers (the host fallback).
+        static LIMIT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+        if LIMIT
+            .get_or_init(|| std::env::var("OXINFER_INKLING_SESS_LIMIT").ok().and_then(|v| v.parse().ok()))
+            .is_some_and(|l| n > l)
+        {
+            return None;
+        }
+        let (mut free, mut tot) = (0usize, 0usize);
+        unsafe { self.x.cuMemGetInfo_v2(&mut free, &mut tot) };
+        if free < n + SESS_RESERVE {
+            return None;
+        }
+        let p = DevSess::alloc(&self.x, n)?;
+        unsafe { self.x.cuMemsetD8Async(p, 0, n.max(256), self.stream) };
+        Some(p)
     }
 
     /// A fresh device session for `m` able to hold `pos` positions.
@@ -2018,75 +2146,119 @@ impl Engine {
             let l = &self.layers[li];
             let kw = l.nkv * 128;
             let cap = self.cap_for(l, pos);
-            let a = |n: usize| -> Option<u64> {
-                let p = DevSess::alloc(&self.x, n)?;
-                unsafe { self.x.cuMemsetD8Async(p, 0, n.max(256), self.stream) };
-                Some(p)
-            };
             let hist_len = [back * kw, back * kw, back * self.h, back * self.h];
-            let slot = Slot {
-                k: a(cap * kw * el)?,
-                v: a(cap * kw * el)?,
-                ks: if fmt == 2 { a(cap * kw / 32 * 4)? } else { 0 },
-                vs: if fmt == 2 { a(cap * kw / 32 * 4)? } else { 0 },
+            // Every buffer of the slot, or none (what was allocated goes with `sess`).
+            let mut slot = Slot {
+                k: 0,
+                v: 0,
+                ks: 0,
+                vs: 0,
                 cap,
                 kw,
-                hist: [a(hist_len[0] * 4)?, a(hist_len[1] * 4)?, a(hist_len[2] * 4)?, a(hist_len[3] * 4)?],
+                hist: [0; 4],
                 hist_len,
             };
+            let q8 = fmt == 2;
+            let ok = (|| -> Option<()> {
+                slot.k = self.try_alloc(cap * kw * el)?;
+                slot.v = self.try_alloc(cap * kw * el)?;
+                if q8 {
+                    slot.ks = self.try_alloc(cap * kw / 32 * 4)?;
+                    slot.vs = self.try_alloc(cap * kw / 32 * 4)?;
+                }
+                for i in 0..4 {
+                    slot.hist[i] = self.try_alloc(hist_len[i] * 4)?;
+                }
+                Some(())
+            })();
             sess.slots.push(slot);
+            ok?;
         }
         unsafe { self.x.cuStreamSynchronize(self.stream) };
         Some(sess)
     }
 
-    /// Grows the full layers' caches of `s` to hold `need` positions (copying what they hold).
-    fn grow(&self, m: &Inkling2Model, s: &mut DevSess, need: usize) {
+    /// Grows the full layers' caches of `s` to hold `need` positions (copying what they hold), by
+    /// a quarter at least; false (nothing changed) when the device cannot hold them.
+    fn grow(&self, m: &Inkling2Model, s: &mut DevSess, need: usize) -> bool {
         let el = [4usize, 2, 1][s.fmt as usize];
         let c = &m.cfg;
         let mut slot_layer = vec![0usize; c.n_slots()];
         for st in c.steps() {
             slot_layer[st.slot] = st.layer;
         }
-        let mut changed = false;
-        for (sl, &li) in s.slots.iter_mut().zip(&slot_layer) {
+        // The new buffers first: (slot, cap, [k, v, ks, vs]).
+        let mut new: Vec<(usize, usize, [u64; 4])> = Vec::new();
+        let free_all = |new: &[(usize, usize, [u64; 4])]| {
+            for (_, _, b) in new {
+                for &p in b {
+                    if p != 0 {
+                        unsafe { self.x.cuMemFree_v2(p) };
+                    }
+                }
+            }
+        };
+        for (i, (sl, &li)) in s.slots.iter().zip(&slot_layer).enumerate() {
             let l = &self.layers[li];
             if !l.full || sl.cap >= need {
                 continue;
             }
-            let cap = self.cap_for(l, need);
-            let mv = |old: u64, bytes_old: usize, bytes_new: usize| -> u64 {
-                if old == 0 {
-                    return 0;
+            let cap = need.max(sl.cap + sl.cap / 4).next_multiple_of(1024);
+            let n = cap * sl.kw;
+            let mut b = [0u64; 4];
+            let sizes = [
+                n * el,
+                n * el,
+                if sl.ks != 0 { n / 32 * 4 } else { 0 },
+                if sl.vs != 0 { n / 32 * 4 } else { 0 },
+            ];
+            for (p, &bytes) in b.iter_mut().zip(&sizes) {
+                if bytes > 0 {
+                    match self.try_alloc(bytes) {
+                        Some(d) => *p = d,
+                        None => {
+                            new.push((i, cap, b));
+                            free_all(&new);
+                            debug(&format!("no device memory for {need} positions of context"));
+                            return false;
+                        }
+                    }
                 }
-                let d = DevSess::alloc(&self.x, bytes_new).expect("inkling cuda: out of device memory for the attention caches");
-                unsafe {
-                    self.x.cuMemcpyDtoDAsync_v2(d, old, bytes_old, self.stream);
-                    self.x.cuStreamSynchronize(self.stream);
-                    self.x.cuMemFree_v2(old);
-                }
-                d
-            };
+            }
+            new.push((i, cap, b));
+        }
+        if new.is_empty() {
+            return true;
+        }
+        for (i, cap, b) in new {
+            let sl = &mut s.slots[i];
             let n_old = sl.cap * sl.kw;
-            let n_new = cap * sl.kw;
-            sl.k = mv(sl.k, n_old * el, n_new * el);
-            sl.v = mv(sl.v, n_old * el, n_new * el);
-            sl.ks = mv(sl.ks, n_old / 32 * 4, n_new / 32 * 4);
-            sl.vs = mv(sl.vs, n_old / 32 * 4, n_new / 32 * 4);
+            for (old, (d, bytes)) in [&mut sl.k, &mut sl.v, &mut sl.ks, &mut sl.vs].into_iter().zip(b.into_iter().zip([
+                n_old * el,
+                n_old * el,
+                n_old / 32 * 4,
+                n_old / 32 * 4,
+            ])) {
+                if *old != 0 {
+                    unsafe { self.x.cuMemcpyDtoDAsync_v2(d, *old, bytes, self.stream) };
+                    let o = std::mem::replace(old, d);
+                    unsafe {
+                        self.x.cuStreamSynchronize(self.stream);
+                        self.x.cuMemFree_v2(o);
+                    }
+                }
+            }
             sl.cap = cap;
-            changed = true;
         }
-        if changed {
-            s.drop_graph();
-        }
+        s.drop_graph();
+        true
     }
 
-    /// Copies the host caches and histories of `sess` into a new device session.
-    fn upload_sess(&self, m: &Inkling2Model, sess: &Inkling2Session) -> DevSess {
+    /// Copies the host caches and histories of `sess` into a new device session with room for
+    /// `room` more positions (None when the device cannot hold it).
+    fn upload_sess(&self, m: &Inkling2Model, sess: &Inkling2Session, room: usize) -> Option<DevSess> {
         let pos = sess.pos;
-        let ds = self
-            .new_sess(m, pos + CHUNK)
-            .expect("inkling cuda: out of device memory for a session");
+        let ds = self.new_sess(m, pos + room)?;
         let el = [4usize, 2, 1][ds.fmt as usize];
         for (hs, d) in sess.layers.iter().zip(&ds.slots) {
             let kw = d.kw;
@@ -2117,7 +2289,7 @@ impl Engine {
                 }
             }
         }
-        ds
+        Some(ds)
     }
 
     /// Writes a device session back into the host caches of `sess` (the device copy is dropped).
@@ -2183,12 +2355,20 @@ impl Engine {
     }
 
     /// Runs `x` (`[t, hidden]`) through the device session of `sess`.
-    fn run(&self, m: &Inkling2Model, sess: &mut Inkling2Session, x: &[f32], t: usize) -> Vec<f32> {
+    /// None, with `sess` as it was, when the device cannot hold its caches for this call.
+    fn run_pass(&self, m: &Inkling2Model, sess: &mut Inkling2Session, x: &[f32], t: usize) -> Option<Vec<f32>> {
         let h = self.h;
         assert!(unsafe { self.x.cuCtxSetCurrent(self.ctx) } == 0, "inkling cuda: context");
         if sess.dev.is_none() {
-            let ds = self.upload_sess(m, sess);
+            let ds = self.upload_sess(m, sess, t.max(CHUNK))?;
             sess.dev = Some(DevBox(Box::new(ds)));
+        }
+        // Room for the whole call before any of it runs.
+        {
+            let ds: &mut DevSess = sess.dev.as_mut().unwrap().0.as_any().downcast_mut::<DevSess>().unwrap();
+            if !self.grow(m, ds, sess.pos + t) {
+                return None;
+            }
         }
         let ar = self.arena.lock().unwrap();
         let mut out = vec![0f32; t * h];
@@ -2201,7 +2381,6 @@ impl Engine {
                 ds.drop_graph();
                 ds.engine = self as *const Engine as usize;
             }
-            self.grow(m, ds, pos + n);
             let info = [pos as i32, 0, 0, 0];
             unsafe {
                 self.x
@@ -2237,7 +2416,7 @@ impl Engine {
             sess.pos += n;
             done += n;
         }
-        out
+        Some(out)
     }
 
     /// Captures a one-token pass as a graph.
@@ -2316,8 +2495,27 @@ fn graphs() -> bool {
 }
 
 impl DevEngine for Engine {
+    fn run(&self, m: &Inkling2Model, sess: &mut Inkling2Session, x: &[f32], t: usize, want: super::DevWant) -> bool {
+        if want.capture.is_some() {
+            return false;
+        }
+        let Some(hs) = self.run_pass(m, sess, x, t) else {
+            // The device cannot hold this session: it stays on the host from now on.
+            sess.dev_off = true;
+            return false;
+        };
+        if let Some((l, rows)) = want.logits {
+            let r = rows.min(t);
+            *l = self.logits(&hs[(t - r) * self.h..], r, true);
+        }
+        if let Some(hv) = want.hidden {
+            *hv = hs;
+        }
+        true
+    }
     fn forward(&self, m: &Inkling2Model, sess: &mut Inkling2Session, x: &[f32], t: usize) -> Vec<f32> {
-        self.run(m, sess, x, t)
+        self.run_pass(m, sess, x, t)
+            .expect("inkling cuda: no device memory for the session")
     }
     fn head(&self, _m: &Inkling2Model, hidden: &[f32], t: usize, cap: bool) -> Option<Vec<f32>> {
         Some(self.logits(hidden, t, cap))
@@ -2576,21 +2774,30 @@ mod tests {
     fn attention_matches_definition() {
         let Some(be) = backend() else { return };
         let e = Engine::bare(be, &[0]).unwrap();
-        let (nh, nkv, d, dr, extent) = (6usize, 2usize, 128usize, 16usize, 20usize);
+        let (nh, nkv, d, dr, extent) = (24usize, 8usize, 128usize, 16usize, 1024usize);
         let (kw, w) = (nkv * d, nh * d);
         let mut seed = 5u64;
         let info = zeros(&e, 4);
         let rel = rnds(dr * extent, &mut seed, 0.5);
         let p_rel = e.upf(&rel).unwrap();
         for fmt in 0..3u32 {
-            for window in [0usize, 13] {
-                let cap = if window > 0 { 32 } else { 64 };
+            // (window, queries, position of the first): three queries on the per-query kernel, more
+            // on the tiled one (`attnt_*`, tiles of 8), the model's window and extent last.
+            for (window, t, t0) in [
+                (0usize, 3usize, 40usize),
+                (13, 3, 40),
+                (0, 21, 40),
+                (13, 21, 40),
+                (0, 100, 40),
+                (37, 100, 40),
+                (1024, 200, 900),
+            ] {
+                let cap = 2048;
                 let el = [4usize, 2, 1][fmt as usize];
                 let kc = e.alloc(cap * kw * el).unwrap();
                 let vc = e.alloc(cap * kw * el).unwrap();
                 let ks = e.alloc(cap * kw / 32 * 4).unwrap();
                 let vs = e.alloc(cap * kw / 32 * 4).unwrap();
-                let (t0, t) = (40usize, 3usize);
                 let store = |pos: usize, n: usize, seed: &mut u64| {
                     let kv = (e.upf(&rnds(n * kw, seed, 1.0)).unwrap(), e.upf(&rnds(n * kw, seed, 1.0)).unwrap());
                     set_info(&e, info, pos);
@@ -2603,8 +2810,10 @@ mod tests {
                     );
                     down(&e, kv.0, 1);
                 };
-                store(0, t0 - 20, &mut seed);
-                store(t0 - 20, 20, &mut seed);
+                if t0 >= 20 {
+                    store(0, t0 - 20, &mut seed);
+                    store(t0 - 20, 20, &mut seed);
+                }
                 store(t0, t, &mut seed);
                 set_info(&e, info, t0);
                 // The stored rows, decoded.
@@ -2620,7 +2829,7 @@ mod tests {
                         .collect()
                 };
                 let (kd, vd) = (decode(kc, ks), decode(vc, vs));
-                let q = rnds(t * w, &mut seed, 0.3);
+                let q = rnds(t * w, &mut seed, 3.0);
                 let r = rnds(t * nh * dr, &mut seed, 1.0);
                 let sink = rnds(t * nh, &mut seed, 1.0);
                 let gate = rnds(t * w, &mut seed, 2.0);
@@ -2649,7 +2858,13 @@ mod tests {
                         rs: (nh * dr) as u32,
                         scaling: (d as f32).powf(-0.5),
                     };
-                    e.go(e.attn_f(fmt, nh / nkv), (nkv as u32, t as u32, ns as u32), 128, &mut args![p]);
+                    if t >= 16 {
+                        let name = format!("attnt_{}_{}", ["f32", "f16", "q8"][fmt as usize], nh / nkv);
+                        let f = *e.funcs.iter().find(|(k, _)| **k == name).unwrap().1;
+                        e.go(f, (nkv as u32, t.div_ceil(8) as u32, ns as u32), 128, &mut args![p, t as u32]);
+                    } else {
+                        e.go(e.attn_f(fmt, nh / nkv), (nkv as u32, t as u32, ns as u32), 128, &mut args![p]);
+                    }
                     e.go(
                         e.f("attn_merge"),
                         (nh as u32, t as u32, 1),
@@ -2695,12 +2910,65 @@ mod tests {
                                 let want = o / (1.0 + (-gv).exp());
                                 let have = got[i * w + hh * d + c] as f64;
                                 assert!(
-                                    (have - want).abs() < 2e-5,
-                                    "format {fmt} window {window} splits {ns}: query {i} head {hh} dim {c}: {have} against {want}"
+                                    (have - want).abs() < 2e-6 * (1.0 + want.abs()),
+                                    "format {fmt} window {window} splits {ns}, {t} queries: query {i} head {hh} dim {c}: {have} against {want}"
                                 );
                             }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    /// The top k is the CPU's (`route_sigmoid`) on ordinary logits, ties included, and picks k
+    /// distinct valid experts whatever NaNs the logits hold.
+    #[test]
+    fn routing_matches_cpu_and_survives_nan() {
+        let Some(be) = backend() else { return };
+        let e = Engine::bare(be, &[0]).unwrap();
+        let (ne, k, t) = (128usize, 8usize, 6usize);
+        let mut seed = 9u64;
+        let bias = rnds(ne, &mut seed, 0.05);
+        let mut lg = rnds(t * ne, &mut seed, 3.0);
+        // Token 1: ties; token 3: a few NaNs; token 4: all NaN; token 5: infinities.
+        for j in 0..ne {
+            lg[ne + j] = (j % 4) as f32;
+        }
+        for j in [3usize, 50, 90] {
+            lg[3 * ne + j] = f32::NAN;
+        }
+        for j in 0..ne {
+            lg[4 * ne + j] = f32::NAN;
+        }
+        lg[5 * ne + 7] = f32::INFINITY;
+        lg[5 * ne + 8] = f32::NEG_INFINITY;
+        let (pl, pb, ids, wts) = (e.upf(&lg).unwrap(), e.upf(&bias).unwrap(), zeros(&e, t * k), zeros(&e, t * k));
+        e.go(
+            e.f("route_k"),
+            (ceil(t, 4), 1, 1),
+            128,
+            &mut args![pl, pb, ids, wts, ne as u32, k as u32, 2.5f32, t as u32],
+        );
+        let raw = down_bytes(&e, ids, t * k * 4);
+        let got: Vec<i32> = raw.as_chunks::<4>().0.iter().map(|c| i32::from_le_bytes(*c)).collect();
+        let w = down(&e, wts, t * k);
+        for tok in 0..t {
+            let row = &got[tok * k..(tok + 1) * k];
+            let mut u: Vec<i32> = row.to_vec();
+            u.sort_unstable();
+            u.dedup();
+            assert_eq!(u.len(), k, "token {tok}: {row:?}");
+            assert!(row.iter().all(|&i| (0..ne as i32).contains(&i)), "token {tok}: {row:?}");
+            if [0usize, 1, 2].contains(&tok) {
+                let want = crate::moe::route_sigmoid(&lg[tok * ne..(tok + 1) * ne], &bias, k, 2.5);
+                for (sl, &(ex, wt)) in want.iter().enumerate() {
+                    assert_eq!(row[sl] as usize, ex, "token {tok} slot {sl}");
+                    assert!(
+                        (w[tok * k + sl] - wt).abs() < 1e-5,
+                        "token {tok} slot {sl}: {} against {wt}",
+                        w[tok * k + sl]
+                    );
                 }
             }
         }
