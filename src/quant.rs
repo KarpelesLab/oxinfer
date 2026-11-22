@@ -403,14 +403,21 @@ impl PairAct {
 
 /// Dequantizes rows `r0..r1` of `m` into `out` (f32, row-major, `(r1-r0) * n_in`).
 pub fn dequantize_rows(m: &QMatrix, r0: usize, r1: usize, out: &mut [f32]) {
+    dequantize_block(m, r0, r1, 0, m.n_in, out)
+}
+
+/// Columns `k0..k1` (multiples of [`QBLOCK`]) of rows `r0..r1` of `m` into `out` (f32,
+/// row-major, `(r1-r0) * (k1-k0)`): the values [`dequantize_rows`] gives there.
+pub fn dequantize_block(m: &QMatrix, r0: usize, r1: usize, k0: usize, k1: usize, out: &mut [f32]) {
     let n_in = m.n_in;
     let bpr = m.blocks_per_row();
+    let (b0, b1, n) = (k0 / QBLOCK, k1 / QBLOCK, k1 - k0);
+    debug_assert!(k0.is_multiple_of(QBLOCK) && k1.is_multiple_of(QBLOCK) && k1 <= n_in);
     for (i, r) in (r0..r1).enumerate() {
-        let qrow = &m.q[r * n_in..(r + 1) * n_in];
-        let srow = &m.scales[r * bpr..(r + 1) * bpr];
-        let orow = &mut out[i * n_in..(i + 1) * n_in];
-        for b in 0..bpr {
-            let s = srow[b];
+        let qrow = &m.q[r * n_in + k0..r * n_in + k1];
+        let srow = &m.scales[r * bpr + b0..r * bpr + b1];
+        let orow = &mut out[i * n..(i + 1) * n];
+        for (b, &s) in srow.iter().enumerate() {
             for j in 0..QBLOCK {
                 orow[b * QBLOCK + j] = qrow[b * QBLOCK + j] as f32 * s;
             }
@@ -584,22 +591,31 @@ fn f32_to_bf16(x: f32) -> u16 {
 
 /// Dequantizes rows `r0..r1` of `m` into `out` (f32 row-major).
 pub fn dequantize_rows_q4(m: &Q4Matrix, r0: usize, r1: usize, out: &mut [f32]) {
+    dequantize_block_q4(m, r0, r1, 0, m.n_in, out)
+}
+
+/// Columns `k0..k1` (multiples of [`QBLOCK`]) of rows `r0..r1` of `m` into `out` (f32,
+/// row-major, `(r1-r0) * (k1-k0)`): the values [`dequantize_rows_q4`] gives there.
+pub fn dequantize_block_q4(m: &Q4Matrix, r0: usize, r1: usize, k0: usize, k1: usize, out: &mut [f32]) {
     let n_in = m.n_in;
     let bpr = n_in / QBLOCK;
+    let (b0, b1, n) = (k0 / QBLOCK, k1 / QBLOCK, k1 - k0);
+    debug_assert!(k0.is_multiple_of(QBLOCK) && k1.is_multiple_of(QBLOCK) && k1 <= n_in);
     for (i, r) in (r0..r1).enumerate() {
         let qrow = &m.q[r * n_in / 2..(r + 1) * n_in / 2];
         let srow = &m.scales[r * bpr..(r + 1) * bpr];
-        let orow = &mut out[i * n_in..(i + 1) * n_in];
-        for b in 0..bpr {
+        let orow = &mut out[i * n..(i + 1) * n];
+        for b in b0..b1 {
             let d = f16_to_f32(srow[b]);
             let m = m
                 .offsets
                 .as_ref()
                 .map_or(0.0, |o| bf16_to_f32(o.v[r * (n_in / o.group) + b * QBLOCK / o.group]));
+            let o = &mut orow[(b - b0) * QBLOCK..(b - b0 + 1) * QBLOCK];
             for j in 0..16 {
                 let byte = qrow[b * 16 + j];
-                orow[b * QBLOCK + j] = ((byte & 0x0F) as i32 - 8) as f32 * d + m;
-                orow[b * QBLOCK + j + 16] = ((byte >> 4) as i32 - 8) as f32 * d + m;
+                o[j] = ((byte & 0x0F) as i32 - 8) as f32 * d + m;
+                o[j + 16] = ((byte >> 4) as i32 - 8) as f32 * d + m;
             }
         }
     }

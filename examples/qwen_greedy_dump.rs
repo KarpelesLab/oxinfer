@@ -2,7 +2,7 @@
 //! `tools/llama_logits_dump.cpp` (same output format, so the two can be compared):
 //!
 //! ```text
-//! qwen_greedy_dump MODEL TEXT|@IDS_FILE N_GEN OUT.bin [--cpu] [--ids-out FILE]
+//! qwen_greedy_dump MODEL TEXT|@IDS_FILE N_GEN OUT.bin [--cpu] [--quant q8|q4] [--ids-out FILE]
 //! qwen_greedy_dump --compare A.bin B.bin VOCAB
 //! ```
 //!
@@ -69,7 +69,7 @@ fn main() -> Result<()> {
     if a.first().map(String::as_str) == Some("--compare") {
         return compare(&a[1], &a[2], a[3].parse()?);
     }
-    let usage = "usage: qwen_greedy_dump MODEL TEXT|@IDS_FILE N_GEN OUT.bin [--cpu] [--ids-out FILE]";
+    let usage = "usage: qwen_greedy_dump MODEL TEXT|@IDS_FILE N_GEN OUT.bin [--cpu] [--quant q8|q4] [--ids-out FILE]";
     let (model, text, n_gen, out) = (
         a.first().context(usage)?,
         a.get(1).context(usage)?,
@@ -99,7 +99,14 @@ fn main() -> Result<()> {
     }
     let cfg = oxinfer::config::QwenConfig::load(dir)?;
     let files = ModelFiles::open(dir, false)?;
-    let m = QwenModel::load(cfg, &files, oxinfer::model::Quant::Bf16)?;
+    // `--quant`: quantize float weights at load, as the command line's flag does.
+    let quant = match a.iter().position(|x| x == "--quant").and_then(|i| a.get(i + 1)).map(String::as_str) {
+        Some("q8") => oxinfer::model::Quant::Q8,
+        Some("q4") => oxinfer::model::Quant::Q4,
+        Some(q) => anyhow::bail!("--quant takes q8 or q4, not {q:?}"),
+        None => oxinfer::model::Quant::Bf16,
+    };
+    let m = QwenModel::load(cfg, &files, quant)?;
     let h = m.cfg.hidden_size;
     let mut sess = m.new_session();
     let mut rows: Vec<u8> = Vec::new();

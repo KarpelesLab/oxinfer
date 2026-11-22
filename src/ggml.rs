@@ -445,19 +445,42 @@ impl GgufMatrix {
             return;
         }
         for (i, r) in (r0..r1).enumerate() {
-            let o = &mut out[i * n..(i + 1) * n];
-            #[cfg(target_arch = "aarch64")]
-            // SAFETY: the row holds `n` elements of `kind` and `o` has room for them.
-            if unsafe { neon::dequant_row(self.kind, self.row(r).as_ptr(), n, o.as_mut_ptr()) } {
-                continue;
-            }
-            #[cfg(target_arch = "x86_64")]
-            // SAFETY: AVX2 was detected; the row holds `n` elements of `kind` and `o` has room.
-            if crate::kernels::simd::avx2() && unsafe { avx2::dequant_row(self.kind, self.row(r), n, o.as_mut_ptr()) } {
-                continue;
-            }
-            dequantize_row(self.kind, self.row(r), o);
+            self.dequant_bytes(self.row(r), &mut out[i * n..(i + 1) * n]);
         }
+    }
+
+    /// Whole blocks of a row (`src`) into their `o.len()` elements, through NEON or AVX2 where
+    /// available: `dequantize_row`'s values. Not for the kinds with block scales.
+    fn dequant_bytes(&self, src: &[u8], o: &mut [f32]) {
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: `src` holds `o.len()` elements of `kind` and `o` has room for them.
+        if unsafe { neon::dequant_row(self.kind, src.as_ptr(), o.len(), o.as_mut_ptr()) } {
+            return;
+        }
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: AVX2 was detected; `src` holds `o.len()` elements of `kind` and `o` has room.
+        if crate::kernels::simd::avx2() && unsafe { avx2::dequant_row(self.kind, src, o.len(), o.as_mut_ptr()) } {
+            return;
+        }
+        dequantize_row(self.kind, src, o);
+    }
+
+    /// Columns `k0..k1` of rows `r0..r1` into `out` (f32 row-major, `(r1 - r0) * (k1 - k0)`),
+    /// the values [`Self::dequantize_rows`] gives there; false (nothing written) when the
+    /// columns do not fall on block boundaries or the matrix has block scales.
+    pub fn dequantize_block(&self, r0: usize, r1: usize, k0: usize, k1: usize, out: &mut [f32]) -> bool {
+        let (bs, ts) = (self.kind.block_size(), self.kind.type_size());
+        if self.block_scales.is_some() || matches!(self.kind, GgmlType::I8 | GgmlType::F8E4M3) {
+            return false;
+        }
+        if !k0.is_multiple_of(bs) || !k1.is_multiple_of(bs) || k1 > self.n_in || k0 >= k1 {
+            return false;
+        }
+        let n = k1 - k0;
+        for (i, r) in (r0..r1).enumerate() {
+            self.dequant_bytes(&self.row(r)[k0 / bs * ts..k1 / bs * ts], &mut out[i * n..(i + 1) * n]);
+        }
+        true
     }
 }
 
@@ -1433,6 +1456,9 @@ impl QMat for GgufMatrix {
     }
     fn dequantize_rows(&self, r0: usize, r1: usize, out: &mut [f32]) {
         GgufMatrix::dequantize_rows(self, r0, r1, out)
+    }
+    fn dequantize_block(&self, r0: usize, r1: usize, k0: usize, k1: usize, out: &mut [f32]) -> bool {
+        GgufMatrix::dequantize_block(self, r0, r1, k0, k1, out)
     }
     fn dense(&self) -> bool {
         self.kind.is_float()

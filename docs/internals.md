@@ -25,7 +25,10 @@
   the f32 GEMM tiles); `png.rs`: a dependency-free PNG writer.
 - `kernels.rs`: NEON kernels (`kernels_x86.rs`, `kernels_wasm.rs`: the AVX2 and simd128 equivalents, selected by `build.rs` through the `has_simd` cfg). Decode tiles stream 1–2 weight rows with 8 accumulators (the prefetcher
   prefers few long streams); prefill packs activations into 8-token panels and runs an 8-row x 8-token
-  outer-product kernel that broadcasts bf16 weights by lane; `kernels_ggml.rs`: the GGUF formats'
+  outer-product kernel that broadcasts bf16 weights by lane (x86-64 with AVX-512: 16 rows x 16 tokens,
+  cache-blocked by columns, `gemm_blocked`: a pool job of 64 rows x 256 tokens dequantizes 16 rows of a
+  512-column block at a time and keeps its partial sums between blocks, so the activations of a block stay in
+  L2 while the job's rows pass over them; the same fused multiply-add chains, so the same bits); `kernels_ggml.rs`: the GGUF formats'
   one-token and multi-token (SDOT / SMMLA) decode kernels and dequantization (`kernels_ggml_x86.rs`: the AVX2 ones). Also RMSNorm, GELU (tanh approximation via
   a fast exp), RoPE tables, softmax.
 - `quant.rs`: Q8 (32 weights per f32 scale) and Q4_0 (two nibbles per byte, f16 scale) block

@@ -28,24 +28,53 @@ pub unsafe fn f16c_to_f32(h: u16) -> f32 {
     _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(h as i32)))
 }
 
-/// True when the AVX2 + FMA kernels are in use (cached): the CPU has both and
-/// `OXINFER_SIMD=scalar` does not ask for the scalar fallbacks (to compare the two paths).
+/// True when the CPU has AVX-512F next to AVX2, FMA and F16C, whatever `OXINFER_SIMD` says.
+pub fn cpu_has_avx512() -> bool {
+    cpu_has_avx2() && is_x86_feature_detected!("avx512f")
+}
+
+/// The kernel level in use (cached): 1 scalar, 2 AVX2 + FMA, 3 the same with the AVX-512 prefill
+/// GEMM. `OXINFER_SIMD=scalar` selects the scalar fallbacks and `OXINFER_SIMD=avx2` keeps the
+/// 256-bit GEMM on a CPU with AVX-512 (to compare the paths).
 #[inline]
-pub fn avx2() -> bool {
+fn level() -> u8 {
     match LEVEL.load(Ordering::Relaxed) {
         0 => {
-            let off = matches!(std::env::var("OXINFER_SIMD").as_deref(), Ok("scalar" | "off" | "0"));
-            let ok = !off && cpu_has_avx2();
-            LEVEL.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
-            ok
+            let env = std::env::var("OXINFER_SIMD");
+            let l = match env.as_deref() {
+                Ok("scalar" | "off" | "0") => 1,
+                _ if !cpu_has_avx2() => 1,
+                Ok("avx2") => 2,
+                _ if cpu_has_avx512() => 3,
+                _ => 2,
+            };
+            LEVEL.store(l, Ordering::Relaxed);
+            l
         }
-        l => l == 2,
+        l => l,
     }
 }
 
-/// The kernel set in use, for reports: `avx2+fma` or `scalar`.
+/// True when the AVX2 + FMA kernels are in use: the CPU has both and `OXINFER_SIMD=scalar` does
+/// not ask for the scalar fallbacks (to compare the two paths).
+#[inline]
+pub fn avx2() -> bool {
+    level() >= 2
+}
+
+/// True when the AVX-512 prefill GEMM is in use (the other kernels are the AVX2 ones).
+#[inline]
+pub fn avx512() -> bool {
+    level() == 3
+}
+
+/// The kernel set in use, for reports: `avx2+fma+avx512f`, `avx2+fma` or `scalar`.
 pub fn level_name() -> &'static str {
-    if avx2() { "avx2+fma" } else { "scalar" }
+    match level() {
+        3 => "avx2+fma+avx512f",
+        2 => "avx2+fma",
+        _ => "scalar",
+    }
 }
 
 pub trait Load8: Copy {
@@ -78,17 +107,27 @@ impl Load8 for f32 {
 /// Loads one weight broadcast to all lanes (prefill GEMM).
 pub trait LoadW4: Copy + Load8 {
     unsafe fn bcast(p: *const Self) -> __m256;
+    /// The same over 16 lanes. Inlined into `#[target_feature(enable = "avx512f")]` functions only.
+    unsafe fn bcast16(p: *const Self) -> __m512;
 }
 impl LoadW4 for u16 {
     #[inline(always)]
     unsafe fn bcast(p: *const u16) -> __m256 {
         _mm256_set1_ps(f32::from_bits((*p as u32) << 16))
     }
+    #[inline(always)]
+    unsafe fn bcast16(p: *const u16) -> __m512 {
+        _mm512_set1_ps(f32::from_bits((*p as u32) << 16))
+    }
 }
 impl LoadW4 for f32 {
     #[inline(always)]
     unsafe fn bcast(p: *const f32) -> __m256 {
         _mm256_broadcast_ss(&*p)
+    }
+    #[inline(always)]
+    unsafe fn bcast16(p: *const f32) -> __m512 {
+        _mm512_set1_ps(*p)
     }
 }
 
@@ -320,6 +359,116 @@ unsafe fn gemm_8x8_avx2<W: LoadW4>(
         for c in 0..c_valid {
             *y.add((c0 + c) * n_out + rb + r) = tmp[c];
         }
+    }
+}
+
+/// The prefill GEMM on AVX-512: `rows` (a multiple of 8) weight rows starting at `w` times the
+/// tokens of the 8-token panels `g0..g1` of `xt` (as [`gemm_8x8`] takes them; `t` tokens in all),
+/// two panels and up to 16 rows per kernel call, the panels outermost so that a pair stays in
+/// L2 while all the rows pass over it. Every output is the fused multiply-add chain over `k` of
+/// [`gemm_8x8`]'s AVX2 kernel, so the results are bit-identical to it.
+///
+/// # Safety
+/// [`avx512`] is true; the pointers cover the rows, panels and outputs named.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gemm_tiles_avx512<W: LoadW4>(
+    w: *const W,
+    rows: usize,
+    n_in: usize,
+    xt: *const f32,
+    g0: usize,
+    g1: usize,
+    t: usize,
+    y: *mut f32,
+    n_out: usize,
+    rb: usize,
+) {
+    debug_assert!(rows.is_multiple_of(8));
+    let mut tile = g0;
+    while tile < g1 {
+        let c0 = tile * 8;
+        let xa = xt.add(tile * n_in * 8);
+        // An odd last panel is paired with itself; its second copy is not stored.
+        let (xb, cv) = if tile + 1 < g1 {
+            (xa.add(n_in * 8), (t - c0).min(16))
+        } else {
+            (xa, (t - c0).min(8))
+        };
+        let mut r = 0;
+        while r + 16 <= rows {
+            gemm_x16_avx512::<W, 16>(w.add(r * n_in), n_in, xa, xb, y, n_out, rb + r, c0, cv);
+            r += 16;
+        }
+        if r < rows {
+            gemm_x16_avx512::<W, 8>(w.add(r * n_in), n_in, xa, xb, y, n_out, rb + r, c0, cv);
+        }
+        tile += 2;
+    }
+}
+
+/// R weight rows times the 16 tokens of two 8-token panels (`xa`, `xb`: `[n_in][8]`): one
+/// accumulator of 16 tokens per row, weights broadcast.
+#[target_feature(enable = "avx512f,avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn gemm_x16_avx512<W: LoadW4, const R: usize>(
+    w: *const W,
+    n_in: usize,
+    xa: *const f32,
+    xb: *const f32,
+    y: *mut f32,
+    n_out: usize,
+    rb: usize,
+    c0: usize,
+    c_valid: usize,
+) {
+    let mut acc = [_mm512_setzero_ps(); R];
+    for k in 0..n_in {
+        let lo = _mm512_castpd256_pd512(_mm256_castps_pd(_mm256_loadu_ps(xa.add(k * 8))));
+        let xv = _mm512_castpd_ps(_mm512_insertf64x4::<1>(lo, _mm256_castps_pd(_mm256_loadu_ps(xb.add(k * 8)))));
+        for r in 0..R {
+            acc[r] = _mm512_fmadd_ps(W::bcast16(w.add(r * n_in + k)), xv, acc[r]);
+        }
+    }
+    let mut tmp = [0f32; 16];
+    for r in 0..R {
+        _mm512_storeu_ps(tmp.as_mut_ptr(), acc[r]);
+        for c in 0..c_valid {
+            *y.add((c0 + c) * n_out + rb + r) = tmp[c];
+        }
+    }
+}
+
+/// One column block of the cache-blocked prefill GEMM: `acc[r][c] += sum_k w[r][k] * x[k][c]`
+/// for `rows` (16 or 8) rows of `kn` dequantized weights each (row-major at `w`) and the 16
+/// tokens of the panels `xa` and `xb` (`[kn][8]`), `acc` being `[rows][16]`. The sums continue
+/// the fused multiply-add chains of the previous column block in column order.
+///
+/// # Safety
+/// [`avx512`] is true; the pointers cover what is named.
+pub unsafe fn gemm_acc_avx512(w: *const f32, rows: usize, kn: usize, xa: *const f32, xb: *const f32, acc: *mut f32) {
+    if rows == 16 {
+        gemm_acc::<16>(w, kn, xa, xb, acc)
+    } else {
+        debug_assert_eq!(rows, 8);
+        gemm_acc::<8>(w, kn, xa, xb, acc)
+    }
+}
+
+#[target_feature(enable = "avx512f,avx2,fma")]
+unsafe fn gemm_acc<const R: usize>(w: *const f32, kn: usize, xa: *const f32, xb: *const f32, acc: *mut f32) {
+    let mut a = [_mm512_setzero_ps(); R];
+    for r in 0..R {
+        a[r] = _mm512_loadu_ps(acc.add(16 * r));
+    }
+    for k in 0..kn {
+        let lo = _mm512_castpd256_pd512(_mm256_castps_pd(_mm256_loadu_ps(xa.add(k * 8))));
+        let xv = _mm512_castpd_ps(_mm512_insertf64x4::<1>(lo, _mm256_castps_pd(_mm256_loadu_ps(xb.add(k * 8)))));
+        for r in 0..R {
+            a[r] = _mm512_fmadd_ps(_mm512_set1_ps(*w.add(r * kn + k)), xv, a[r]);
+        }
+    }
+    for r in 0..R {
+        _mm512_storeu_ps(acc.add(16 * r), a[r]);
     }
 }
 
@@ -585,8 +734,75 @@ mod tests {
         // The dispatch follows the CPU unless OXINFER_SIMD=scalar turns the AVX2 kernels off.
         let off = matches!(std::env::var("OXINFER_SIMD").as_deref(), Ok("scalar" | "off" | "0"));
         assert_eq!(avx2(), cpu_has_avx2() && !off);
-        assert_eq!(level_name(), if avx2() { "avx2+fma" } else { "scalar" });
+        let wide = avx2() && cpu_has_avx512() && std::env::var("OXINFER_SIMD").as_deref() != Ok("avx2");
+        assert_eq!(avx512(), wide);
+        let name = if wide {
+            "avx2+fma+avx512f"
+        } else if avx2() {
+            "avx2+fma"
+        } else {
+            "scalar"
+        };
+        assert_eq!(level_name(), name);
         eprintln!("x86-64 kernels in use: {}", level_name());
+    }
+
+    /// The AVX-512 GEMM gives the AVX2 GEMM's bits: 8 to 40 rows, any number of panels (an odd
+    /// last one included) and of valid tokens in the last panel, and it writes nothing else.
+    fn gemm_wide<W: Wt>(seed: &mut u64) {
+        for n_in in [1usize, 7, 37, 96, 1056] {
+            let (n_out, rb) = (47usize, 3usize);
+            let w: Vec<W> = (0..40 * n_in).map(|_| W::of(unit(seed))).collect();
+            for t in [1usize, 7, 8, 9, 16, 17, 24, 29, 40] {
+                let tiles = t.div_ceil(8);
+                // The padding tokens of the last panel hold values too: they must not reach `y`.
+                let xt: Vec<f32> = (0..tiles * n_in * 8).map(|_| unit(seed) * 2.0).collect();
+                for (rows, g0) in [(16usize, 0usize), (8, 0), (40, 0), (24, tiles / 2), (8, tiles - 1)] {
+                    let mut ya = vec![f32::NAN; t * n_out];
+                    let mut yw = ya.clone();
+                    unsafe {
+                        for tile in g0..tiles {
+                            let c0 = tile * 8;
+                            for h in 0..rows / 8 {
+                                gemm_8x8_avx2::<W>(
+                                    w.as_ptr().add(h * 8 * n_in),
+                                    n_in,
+                                    xt.as_ptr().add(tile * n_in * 8),
+                                    ya.as_mut_ptr(),
+                                    n_out,
+                                    rb + 8 * h,
+                                    c0,
+                                    (t - c0).min(8),
+                                );
+                            }
+                        }
+                        gemm_tiles_avx512::<W>(w.as_ptr(), rows, n_in, xt.as_ptr(), g0, tiles, t, yw.as_mut_ptr(), n_out, rb);
+                    }
+                    for (i, (a, b)) in ya.iter().zip(&yw).enumerate() {
+                        assert_eq!(
+                            a.to_bits(),
+                            b.to_bits(),
+                            "{} n_in={n_in} t={t} rows={rows} panels {g0}..{tiles}: y[{}][{}] {a} vs {b}",
+                            W::NAME,
+                            i / n_out,
+                            i % n_out
+                        );
+                    }
+                    assert!(ya[g0 * 8 * n_out + rb].is_finite() && ya[(t - 1) * n_out + rb + rows - 1].is_finite());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn avx512_gemm_matches_avx2_bit_for_bit() {
+        if skip() || !cpu_has_avx512() {
+            eprintln!("skipped: no AVX-512");
+            return;
+        }
+        let mut seed = 5u64;
+        gemm_wide::<u16>(&mut seed);
+        gemm_wide::<f32>(&mut seed);
     }
 
     /// F16C conversion of the f16 scales equals the software one for all 65536 values.
