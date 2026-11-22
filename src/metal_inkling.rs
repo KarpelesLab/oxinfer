@@ -608,6 +608,9 @@ struct ExpDev {
     off: u32,
     grouped: Option<Grouped>,
     xlora: Option<XLora>,
+    /// The gate / up projections' updates: `A x` per slot first, the pair kernels add the rest
+    /// before SiTU (prefill passes then take the pair kernels too, not the grouped GEMMs).
+    xlora_gu: Option<XLora>,
 }
 
 /// An expert's down-projection LoRA update in the address table (`IXL`).
@@ -1428,9 +1431,6 @@ impl InkMetal {
                     crate::moe::GateUp::Fused(l) => l,
                     crate::moe::GateUp::Split(..) => bail!("split expert projections"),
                 };
-                if gl.has_lora() {
-                    bail!("expert gate / up LoRAs");
-                }
                 for (lin, n_out, n_in, tab, fmt) in [
                     (gl, 2 * mi, h, &mut tab_gu, &mut gu_fmt),
                     (&ex.down[e], h, mi, &mut tab_d, &mut d_fmt),
@@ -1462,13 +1462,16 @@ impl InkMetal {
                 Ok(id)
             };
             let (gu_fmt, d_fmt) = (gu_fmt.unwrap(), d_fmt.unwrap());
-            // The down projections' LoRA updates (one per expert at most).
-            let xlora = if ex.down.iter().any(|l| l.has_lora()) {
+            // The experts' LoRA updates of one projection kind (one per expert at most).
+            let xlora_of = |lins: Vec<&Lin>, owned: &mut Vec<Id>, indirect: &mut Vec<Id>| -> anyhow::Result<Option<XLora>> {
+                if !lins.iter().any(|l| l.has_lora()) {
+                    return Ok(None);
+                }
                 let mut data: Vec<f32> = Vec::new();
                 let mut at = Vec::with_capacity(ne);
                 let mut deltas = Vec::with_capacity(ne);
                 let mut rx = 0usize;
-                for l in &ex.down {
+                for l in lins {
                     match l.lora_delta() {
                         Some(d) => {
                             if d.links().nth(1).is_some() {
@@ -1511,15 +1514,23 @@ impl InkMetal {
                 unsafe { std::ptr::copy_nonoverlapping(ents.as_ptr() as *const u8, tab_p, bytes) };
                 owned.push(tab);
                 rmax.set(rmax.get().max(rx));
-                Some(XLora {
+                Ok(Some(XLora {
                     tab,
                     tab_p,
                     deltas,
                     rmax: rx,
-                })
-            } else {
-                None
+                }))
             };
+            let xlora = xlora_of(ex.down.iter().collect(), &mut owned, &mut indirect)?;
+            let gu_lins: Vec<&Lin> = ex
+                .gate_up
+                .iter()
+                .map(|g| match g {
+                    crate::moe::GateUp::Fused(l) => l,
+                    crate::moe::GateUp::Split(l, _) => l,
+                })
+                .collect();
+            let xlora_gu = xlora_of(gu_lins, &mut owned, &mut indirect)?;
             // Prefill: the grouped GEMMs, where both formats have them.
             let mmag = |f: &str| -> Option<[Id; 3]> {
                 let n = match f {
@@ -1533,7 +1544,7 @@ impl InkMetal {
                     lib.pipeline(be, &format!("{n}_s"))?,
                 ])
             };
-            let grouped = match (lib.mma, mmag(&gu_fmt), mmag(&d_fmt)) {
+            let grouped = match (lib.mma && xlora_gu.is_none(), mmag(&gu_fmt), mmag(&d_fmt)) {
                 (true, Some(gu), Some(d)) => {
                     let ep = |t: &[XEntry], owned: &mut Vec<Id>| -> anyhow::Result<Id> {
                         let v: Vec<[u64; 2]> = t.iter().map(|x| [x.q, x.s]).collect();
@@ -1566,6 +1577,7 @@ impl InkMetal {
                 off: if ex.interleaved { 1 } else { mi as u32 },
                 grouped,
                 xlora,
+                xlora_gu,
             };
             layers.push(LayerDev {
                 sliding: c.sliding[li],
@@ -2906,11 +2918,14 @@ impl InkMetal {
                 add: 0,
             };
             let gq = [b.grp as u32, b.asg as u32];
+            let lq = self.gu_lora(e, c, ld, t);
             e.pipe(ld.exp.gpair);
             e.buf(c.a, 0, 0);
             e.buf(ld.exp.tab_gu, 0, 1);
             e.bytes(&xp, 2);
             e.bytes(&gq, 3);
+            e.buf(lq.0, 0, 4);
+            e.bytes(&lq.1, 5);
             if !self.skip(SK_EXP) {
                 e.dispatch((self.inter.div_ceil(4 * xrk().0 / xrk().1), n), 128);
             }
@@ -2978,10 +2993,13 @@ impl InkMetal {
                 cap_u: self.caps.1,
                 add: 0,
             };
+            let lq = self.gu_lora(e, c, ld, t);
             e.pipe(ld.exp.pair);
             e.buf(c.a, 0, 0);
             e.buf(ld.exp.tab_gu, 0, 1);
             e.bytes(&xp, 2);
+            e.buf(lq.0, 0, 3);
+            e.bytes(&lq.1, 4);
             if !self.skip(SK_EXP) {
                 e.dispatch3((self.inter.div_ceil(8), self.topk, t), 128);
             }
@@ -3012,7 +3030,58 @@ impl InkMetal {
     /// from `act`, or with `rows` (prefill: the grouped rows, their experts and half
     /// activations) from those.
     fn xlora(&self, e: &Pe, c: &Cx, xl: &XLora, t: usize, rows: Option<(usize, &PfBufs)>) {
+        self.xlora_a(e, c, xl, t, rows, false);
+        #[repr(C)]
+        struct Pb {
+            n_out: u32,
+            k: u32,
+            rmax: u32,
+            u: u32,
+            sel: u32,
+            y: u32,
+            mapped: u32,
+            _p: u32,
+        }
+        let h = self.h;
+        e.pipe(self.p.xlora_b);
+        e.buf(c.a, 0, 0);
+        e.buf(xl.tab, 0, 1);
+        e.bytes(
+            &Pb {
+                n_out: h as u32,
+                k: self.topk as u32,
+                rmax: c.b.lora_r as u32,
+                u: c.b.lu as u32,
+                sel: c.b.sel as u32,
+                y: c.b.o as u32,
+                mapped: rows.is_some() as u32,
+                _p: 0,
+            },
+            2,
+        );
+        e.buf(c.a, rows.map_or(0, |r| r.1.map * 4), 3);
+        e.dispatch((h.div_ceil(256), t), 256);
+        e.barrier();
+    }
+
+    /// The gate / up projections' updates of `ld`, if any: their first half (then a barrier), and
+    /// the table and parameters the pair kernels take (`IXQ`; off without updates).
+    fn gu_lora(&self, e: &Pe, c: &Cx, ld: &LayerDev, t: usize) -> (Id, [u32; 4]) {
+        match &ld.exp.xlora_gu {
+            Some(xl) => {
+                self.xlora_a(e, c, xl, t, None, true);
+                (xl.tab, [1, c.b.lu as u32, c.b.lora_r as u32, 0])
+            }
+            None => (c.a, [0; 4]),
+        }
+    }
+
+    /// The first half of the experts' updates `xl`: `u = A_e x` per slot into `lu`, x the slot's
+    /// activations (down projections) or with `tok` the token's MLP input (gate / up).
+    #[allow(clippy::too_many_arguments)]
+    fn xlora_a(&self, e: &Pe, c: &Cx, xl: &XLora, t: usize, rows: Option<(usize, &PfBufs)>, tok: bool) {
         let (h, k, mi) = (self.h, self.topk, self.inter);
+        let (n_in, act) = if tok { (h, c.b.hn) } else { (mi, c.b.act) };
         #[repr(C)]
         struct Pa {
             n_in: u32,
@@ -3022,21 +3091,21 @@ impl InkMetal {
             u: u32,
             sel: u32,
             rows: u32,
-            _p: u32,
+            tok: u32,
         }
         e.pipe(self.p.xlora_a);
         e.buf(c.a, 0, 0);
         e.buf(xl.tab, 0, 1);
         e.bytes(
             &Pa {
-                n_in: mi as u32,
+                n_in: n_in as u32,
                 k: k as u32,
                 rmax: c.b.lora_r as u32,
-                act: c.b.act as u32,
+                act: act as u32,
                 u: c.b.lu as u32,
                 sel: c.b.sel as u32,
                 rows: rows.map_or(0, |r| r.0) as u32,
-                _p: 0,
+                tok: tok as u32,
             },
             2,
         );
@@ -3055,43 +3124,13 @@ impl InkMetal {
             }
         }
         e.barrier();
-        #[repr(C)]
-        struct Pb {
-            n_out: u32,
-            k: u32,
-            rmax: u32,
-            u: u32,
-            sel: u32,
-            y: u32,
-            mapped: u32,
-            _p: u32,
-        }
-        e.pipe(self.p.xlora_b);
-        e.buf(c.a, 0, 0);
-        e.buf(xl.tab, 0, 1);
-        e.bytes(
-            &Pb {
-                n_out: h as u32,
-                k: k as u32,
-                rmax: c.b.lora_r as u32,
-                u: c.b.lu as u32,
-                sel: c.b.sel as u32,
-                y: c.b.o as u32,
-                mapped: rows.is_some() as u32,
-                _p: 0,
-            },
-            2,
-        );
-        e.buf(c.a, rows.map_or(0, |r| r.1.map * 4), 3);
-        e.dispatch((h.div_ceil(256), t), 256);
-        e.barrier();
     }
 
     /// The strengths of the experts' LoRA updates now, into their tables (adapters switch on and
     /// off at run time).
     fn lora_strengths(&self) {
-        for ld in &self.layers {
-            if let Some(xl) = &ld.exp.xlora {
+        for xl in self.layers.iter().flat_map(|ld| ld.exp.xlora.iter().chain(&ld.exp.xlora_gu)) {
+            {
                 for (i, d) in xl.deltas.iter().enumerate() {
                     // SAFETY: the table holds one entry per expert; the deltas live with the model.
                     let s = d.map_or(0.0, |d| unsafe { (*d).strength() });

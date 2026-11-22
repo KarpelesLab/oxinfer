@@ -462,8 +462,13 @@ resident on the device:
 - **LoRA adapters** (`--lora`) run on the device too: the dense updates as a down / up pair of
   kernels beside each matmul, the experts' down-projection updates per expert from an address
   table whose strengths are written at each pass (switching an adapter needs no rebuild); the
-  embedding's update stays with the host's lookup; gate / up expert updates send the passes back
-  to the CPU.
+  embedding's update stays with the host's lookup. The experts' gate / up updates too: `A x` per
+  slot first, then the pair kernels add `s Bt u` to the gate and up rows before SiTU (prefill
+  passes then take the per-slot pair kernels rather than the grouped GEMMs: 935 against 1125
+  tok/s on a 600-token Q8_0 prompt, decode unchanged). Checked with a synthetic PEFT adapter
+  (rank 2, gate / up updates of all 128 experts on layers 3 and 10, down updates on layer 3,
+  moving the logits by 1.0-1.3) on ggml-org Q8_0 and the release: prefill against the CPU with
+  the adapter KL 3.8e-10 / 6.6e-10, every decode step the CPU's top token.
 
 The Metal engine and the CUDA one (`src/inkling_cuda.rs`) are two implementations of the same
 device interface in `src/inkling.rs` (`DevEngine` for the passes, `DevSession` for a session's
@@ -670,9 +675,18 @@ oxinfer --model unsloth/Inkling-2-Mini-GGUF:UD-IQ3_XXS --draft auto --prompt "..
 
 ## Not done
 
-- Decoding at 4 bits is bound by the chain of small kernels between the matmuls (above), not
-  by the bytes: fusing more of them (the post-MLP convolution with the next layer's mixes, the
-  message gates' low-rank matmuls) is what would move it.
-- The experts' gate / up LoRA updates run on the CPU (the passes go back there); the AtomicChat
-  adapter has none.
+- 125 tok/s of decoding (the figure reported with EXO, see above): 59 at Q8_0, 70 at 4 bits
+  here. At 4 bits a step is a third small kernels between the matmuls (805 dependent stages) and
+  the experts read at 300 GB/s rather than the ~500 of Q8_0; fusions that add work to every
+  threadgroup of a stage lose (the routing folded into the experts' kernel: -7%), so what is left
+  is fewer stages with no more work each (the message gates' norms into their low-rank matmul,
+  the attention's merge when a token has one split) and expert kernels of more memory parallelism.
+- Speculative decoding is bounded by the experts a verification pass reads (3.1 ms a token at 4
+  bits, above), whatever the drafter: no batching of the pass shares experts the tokens do not
+  share. The multi-token matvecs of the rest (0.4-1.6 ms a token) could still shrink.
+- CUDA sessions do not go back (no prompt lookup or drafts there): its sliding rings already keep
+  1024 positions more than the window and its full caches are by position, but its convolution
+  histories hold the last 3 inputs only. Keeping a pass's inputs per convolution (the history and
+  the pass's rows, `[3 + t][ch]`) beside them would let `truncate` copy the 3 rows before the new
+  position back; not done without a CUDA device to check it on.
 - No GGUF of Small was tried (the same code reads its layout).

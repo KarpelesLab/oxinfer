@@ -651,15 +651,31 @@ inline void load(MXF8W w, uint row, uint b, thread float4* out) {
 // (`[token][slot][inter]`). Sum kernels (grid: blocks of 8 rows, token): `y = sum over slots of
 // weight * factor * (down_e act)`.
 struct IXT { ulong q; ulong s; float factor; uint rb; ulong _p; };
+// An expert's LoRA update (`ink_xlora_*`): A and Bt (addresses), its rank and strength.
+struct IXL { ulong a; ulong bt; uint r; float s; ulong _p; };
+// The gate / up rows' LoRA updates of the pair kernels: `on`, the arena offset of the slots' `A x`
+// (`[t k][rmax]`, from `ink_xlora_a`) and rmax.
+struct IXQ { uint on; uint u; uint rmax; uint _p; };
+// The update of stored gate / up row `row` of expert `ex`'s pair for slot `slot`: `s Bt[.][row] . u`.
+inline float ink_gu_lora(device const float* a, device const IXL* lt, constant IXQ& lq, uint ex, uint slot, uint row, uint n_out) {
+    IXL x = lt[ex];
+    device const float* bt = (device const float*)x.bt;
+    device const float* u = a + lq.u + (ulong)slot * lq.rmax;
+    float v = 0.f;
+    for (uint q = 0; q < x.r; q++) v = fma(bt[(ulong)q * n_out + row], u[q], v);
+    return x.s * v;
+}
 struct IXP { uint inter; uint h; uint k; uint il; uint off; uint x; uint sel; uint act; uint y; float cap_g; float cap_u; uint add; };
 #define INK_XP(NAME, T, X, CH, MAKE) \
 kernel void NAME##_pair(device float* a [[buffer(0)]], device const IXT* tab [[buffer(1)]], constant IXP& p [[buffer(2)]], \
+                        device const IXL* lt [[buffer(3)]], constant IXQ& lq [[buffer(4)]], \
                         uint3 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], \
                         uint lane [[thread_index_in_simdgroup]]) { \
     uint j = (tg.x * 4 + sg) * 2, s = tg.y, ti = tg.z; \
     if (j >= p.inter) return; \
     device const float* sel = a + p.sel + (ulong)ti * 2 * p.k; \
-    IXT e = tab[as_type<uint>(sel[s])]; \
+    uint ex = as_type<uint>(sel[s]); \
+    IXT e = tab[ex]; \
     T f = MAKE(e, p.h); \
     device const float* x = a + p.x + (ulong)ti * p.h; \
     float g[2], u[2]; \
@@ -675,6 +691,11 @@ kernel void NAME##_pair(device float* a [[buffer(0)]], device const IXT* tab [[b
     if (lane == 0) \
         for (uint i = 0; i < 2 && j + i < p.inter; i++) { \
             float gg = g[i] * e.factor, uu = u[i] * e.factor; \
+            if (lq.on != 0) { \
+                uint rg = p.il == 2 ? 2 * (j + i) : j + i, ru = rg + p.off; \
+                gg += ink_gu_lora(a, lt, lq, ex, ti * p.k + s, rg, 2 * p.inter); \
+                uu += ink_gu_lora(a, lt, lq, ex, ti * p.k + s, ru, 2 * p.inter); \
+            } \
             float cu = p.cap_u > 0.f ? p.cap_u * precise::tanh(uu / p.cap_u) : uu; \
             a[p.act + ((ulong)ti * p.k + s) * p.inter + j + i] = p.cap_g * precise::tanh(gg / p.cap_g) / (1.f + exp(-gg)) * cu; \
         } } \
@@ -736,8 +757,7 @@ kernel void ink_lora_b(device float* a [[buffer(0)]], device const float* Bt [[b
 // `rows`, grid: rank, row: the grouped rows of a prefill, each of its expert `rexp[row]`, inputs
 // half rows scaled by `rs[row]`): `u[slot] = A_e . act[slot]`; the up half (grid: blocks of
 // outputs, token): `y[t] += sum_s w_s s_e Bt_e u[map[t k + s]]` (map: identity without `rows`).
-struct IXL { ulong a; ulong bt; uint r; float s; ulong _p; };
-struct IXlaP { uint n_in; uint k; uint rmax; uint act; uint u; uint sel; uint rows; uint _p; };
+struct IXlaP { uint n_in; uint k; uint rmax; uint act; uint u; uint sel; uint rows; uint tok; };
 kernel void ink_xlora_a(device float* a [[buffer(0)]], device const IXL* tab [[buffer(1)]], constant IXlaP& p [[buffer(2)]],
                         device const half* ah [[buffer(3)]], device const float* rs [[buffer(4)]], device const uint* rexp [[buffer(5)]],
                         uint3 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
@@ -761,7 +781,8 @@ kernel void ink_xlora_a(device float* a [[buffer(0)]], device const IXL* tab [[b
         for (uint i = lane; i < p.n_in; i += 32) s = fma(w[i], float(v[i]), s);
         s *= rs[slot];
     } else {
-        device const float* v = a + p.act + (ulong)slot * p.n_in;
+        // (`tok`: every slot of a token reads the token's row, the gate / up updates' input.)
+        device const float* v = a + p.act + (ulong)(p.tok != 0 ? tg.z : slot) * p.n_in;
         for (uint i = lane; i < p.n_in; i += 32) s = fma(w[i], v[i], s);
     }
     s = simd_sum(s);
@@ -863,8 +884,8 @@ inline void ink_ksum(thread float* v, uint n, uint sg, uint lane, threadgroup fl
     }
 }
 #define INK_XG(NAME, T, X, CH, MAKE) \
-inline void NAME##_pair_one(device float* a, IXT e, constant IXP& p, uint j, uint kp, uint sg, uint lane, uint ti, uint s, \
-                            threadgroup float* red) { \
+inline void NAME##_pair_one(device float* a, IXT e, uint ex, constant IXP& p, uint j, uint kp, uint sg, uint lane, uint ti, uint s, \
+                            threadgroup float* red, device const IXL* lt, constant IXQ& lq) { \
     T f = MAKE(e, p.h); \
     device const float* x = a + p.x + (ulong)ti * p.h; \
     float v[4 * INK_XR]; \
@@ -883,12 +904,18 @@ inline void NAME##_pair_one(device float* a, IXT e, constant IXP& p, uint j, uin
     if (lane == 0 && kp == 0) \
         for (uint i = 0; i < INK_XR && j + i < p.inter; i++) { \
             float gg = v[i] * e.factor, uu = v[INK_XR + i] * e.factor; \
+            if (lq.on != 0) { \
+                uint rg = p.il == 2 ? 2 * (j + i) : j + i, ru = rg + p.off; \
+                gg += ink_gu_lora(a, lt, lq, ex, ti * p.k + s, rg, 2 * p.inter); \
+                uu += ink_gu_lora(a, lt, lq, ex, ti * p.k + s, ru, 2 * p.inter); \
+            } \
             float cu = p.cap_u > 0.f ? p.cap_u * precise::tanh(uu / p.cap_u) : uu; \
             a[p.act + ((ulong)ti * p.k + s) * p.inter + j + i] = p.cap_g * precise::tanh(gg / p.cap_g) / (1.f + exp(-gg)) * cu; \
         } \
 } \
 kernel void NAME##_gpair(device float* a [[buffer(0)]], device const IXT* tab [[buffer(1)]], constant IXP& p [[buffer(2)]], \
-                         constant uint2& gq [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]], \
+                         constant uint2& gq [[buffer(3)]], device const IXL* lt [[buffer(4)]], constant IXQ& lq [[buffer(5)]], \
+                         uint2 tg [[threadgroup_position_in_grid]], \
                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
     threadgroup float red[4 * 4 * INK_XR]; \
     uint j = (tg.x * (4 / INK_XK) + sg / INK_XK) * INK_XR, kp = sg % INK_XK; \
@@ -899,7 +926,7 @@ kernel void NAME##_gpair(device float* a [[buffer(0)]], device const IXT* tab [[
     IXT e = tab[ge]; \
     for (uint q = 0; q < cnt; q++) { \
         uint asn = asg[st + q]; \
-        NAME##_pair_one(a, e, p, j, kp, sg, lane, asn / p.k, asn % p.k, red); \
+        NAME##_pair_one(a, e, ge, p, j, kp, sg, lane, asn / p.k, asn % p.k, red, lt, lq); \
     } } \
 kernel void NAME##_gsum(device float* a [[buffer(0)]], device const IXT* tab [[buffer(1)]], constant IXP& p [[buffer(2)]], \
                         constant uint2& gq [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]], \

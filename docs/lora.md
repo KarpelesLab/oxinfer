@@ -66,6 +66,11 @@ by adapter switch, gain and scale), so `set_lora_strength`, a decision adapter s
 or a strength of 0 changes nothing in the plan. At strength 0 the side paths still run (and add
 zeros): drop the adapter for the base model's speed.
 
+Inkling-2 has its own Metal engine (docs/inkling.md, "On the GPU") with the same side paths:
+the dense updates beside each matmul, the routed experts' down updates per slot, and their gate /
+up updates added by the pair kernels before SiTU (prefill passes with those take the per-slot
+pair kernels rather than the grouped GEMMs). Its CUDA engine leaves adapted models to the CPU.
+
 ## Families and what is adapted
 
 | Family | Layers | Experts | Embedding | Head |
