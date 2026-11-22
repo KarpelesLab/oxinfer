@@ -66,6 +66,38 @@ reports what was chosen (`stream`, `device_memory`). Override with options:
 the CPU), `draft=none` (plain decoding), `threads=6`. With the increased-memory-limit
 entitlement the app gets more, and the default budget follows.
 
+### Inkling-2 Mini (26B MoE) on an iPhone or iPad
+
+Which file and what to expect: [docs/inkling.md, iOS / iPadOS](../docs/inkling.md#ios--ipados)
+(in short: `UD-IQ2_XXS`, 8.5 GB; streamed from flash on 8 and 12 GB phones, whole passes on the
+GPU on a 16 GB iPad). Steps:
+
+1. Build and install OxinferTest as above, **with** the entitlements file (paid developer
+   account): without the increased memory limit the app gets about half of the memory.
+2. Free 9 GB of storage. In the app, model: `unsloth/Inkling-2-Mini-GGUF:UD-IQ2_XXS`, options:
+
+   ```
+   kv_cache=q8
+   max_context=8192
+   ```
+
+   and Load. The download (8.5 GB) resumes if the app is closed; or copy
+   `Inkling-2-Mini-UD-IQ2_XXS.gguf` from a Mac (Finder > the device > Files > oxinfer) and pick
+   it under "On device", with the same options.
+3. After loading, the stats area (and Xcode's console) shows the info JSON: `device_memory.app_available` is the app's
+   limit, `stream` is null when the weights stayed in memory (16 GB iPad: GPU passes) or gives
+   the page-cache budget when they stream (8-12 GB phones: CPU passes). Send a prompt; the
+   stats line has the prefill and decode speeds.
+4. To report: device model, `device_memory` and `stream` from the info line, the stats line
+   after a 200-token answer, and whether the app was killed (jetsam) at any point. To compare
+   the text with a Mac's, run `ios/capi_greedy.c` on both (below) or set `temperature=0` and an
+   empty system prompt in your own host.
+
+If loading or the first answer kills the app, set `memory_limit_gb=4` (a smaller budget: more
+of the experts read from flash) and tell what `app_available` said. `stream=off` keeps the file
+plainly mapped (demand-paged by the OS) and `device=cpu` keeps everything off the GPU, for
+comparison.
+
 ## Simulator
 
 ```sh

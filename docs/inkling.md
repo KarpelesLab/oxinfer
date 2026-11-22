@@ -914,6 +914,91 @@ oxinfer --model thinkingmachines/Inkling-2-Mini --mtp --prompt "..."
 oxinfer --model unsloth/Inkling-2-Mini-GGUF:UD-IQ3_XXS --draft auto --prompt "..."
 ```
 
+## iOS / iPadOS
+
+Mini runs on iPhones and iPads through the C API (`ios/`, the `OxinferTest` app): the same
+engine, the weights memory-mapped (the default on iOS: mapped file pages are clean memory, not
+charged to the app the way copied ones are). What the app may use decides how it runs:
+
+- **The budget**: what `os_proc_available_memory` leaves the app less 1 GB, at most 60% of the
+  device's memory and 85% of Metal's working set (`stream::DeviceMemory`, as for Qwen and
+  Gemma). Mini needs beside its weights 1.3 GB of runtime, the sliding windows (195 MB with
+  `kv_cache=q8`) and 18 KB a token of context (q8; `inkling::runtime_bytes`, which assumes 4096
+  tokens unless `max_context` says otherwise); prefill chunks are 512 tokens.
+- **Weights within the budget** (less that runtime): every pass on the GPU, as on a Mac
+  ([On the GPU](#on-the-gpu)).
+- **Larger**: streamed from flash (`crate::stream`): the dense weights (0.83 GB) stay resident,
+  the routed experts are read as they are routed and the most recent kept in what is left of the
+  budget; the passes run on the CPU (the whole-pass GPU engine does not stream; the Metal backend
+  still takes the prefill matmuls). The output is the same as without streaming.
+- **A GPU engine never maps more than the budget**: weights over it keep the passes on the CPU
+  (`[inkling: the 8.5 GB of weights exceed the GPU budget ...]`), so `stream=off` on a phone
+  demand-pages the mapped file on the CPU instead of wiring it for the GPU.
+- `memory_limit_gb` (C API, library, server; `--memory-limit-gb` on the command line) caps the
+  app's memory: the same decisions on a Mac with a phone's 6-8 GB, or a smaller share on purpose.
+  `OXINFER_DEVICE_MEM_GB` / `OXINFER_APP_MEM_GB` / `OXINFER_GPU_WORKING_SET_GB` set the device's
+  figures instead (`SIMCTL_CHILD_` prefix in the Simulator).
+
+What fits, with `kv_cache=q8` and 4096 tokens of context (the weights' share is the budget less
+0.5 GB; each 1k tokens more takes 19 MB off it):
+
+| Device | Memory | Budget (60%) | In memory, GPU passes | Streamed (CPU passes) |
+|---|---:|---:|---|---|
+| iPhone 15 Pro / Pro Max, 16 / 16 Plus / 16 Pro / 16e, 17, iPad Pro M4 256-512 GB | 8 GiB | 5.2 GB | none | `UD-IQ2_XXS` (8.5 GB): 0.8 GB of dense weights resident, about 3 GB of experts cached |
+| iPhone 17 Pro / Pro Max / Air, iPad Pro M5 256-512 GB | 12 GiB | 7.7 GB | none (`UD-IQ1_S`, 7.8 GB, is 0.5 GB over) | `UD-IQ2_XXS`: about 5.5 GB of experts cached; `UD-IQ3_XXS` (11.7 GB) |
+| iPad Pro M4 / M5 1-2 TB | 16 GiB | 10.3 GB | `UD-IQ2_XXS` (8.5 GB) up to about 75k tokens, `AD-IQ2_M` (8.7 GB) up to about 65k, `UD-Q2_K_XL` (9.1 GB) up to about 40k | `UD-IQ3_XXS` (11.7 GB) |
+
+The budget assumes the app is allowed at least 60% of the memory plus 1 GB, which takes the
+increased-memory-limit entitlement (below); with a lower limit it is that limit less 1 GB, and
+`oxi_engine_info_json` reports what was decided (`device_memory`, `stream`). On the 8 and 12 GB
+phones `UD-IQ2_XXS` is the file: the smallest that keeps the model's quality (unsloth's dynamic
+2-bit; `UD-IQ1_S` saves 0.7 GB, not enough to fit anywhere it would not), and streaming it
+reads, measured on the Mac with the phone's budgets emulated (200 tokens of a story, after the
+prompt), 0.09 GB from flash per token with a 4.3 GB budget (stalled 22% of the time at the
+Mac's SSD speed) and 0.01 GB with 6.7 GB (6%). `UD-IQ3_XXS` streams on the 12 GB phone too, at
+a higher quality and more reading. The app's own (dirty) memory stays small either way: peak
+footprint 0.57-0.71 GB streaming, 1.46 GB with the whole passes on the GPU over the mapped file
+(macOS's accounting, UD-IQ2_XXS, 200 tokens; Metal's mapping of the file is not charged
+there).
+
+**Options** (one `key=value` per line in OxinferTest): `kv_cache=q8` (a quarter of the f32
+caches, KL against f32 within the GGUF quantization's), `max_context=8192` (or more on the iPad;
+only the context actually used costs memory, but the budget is reckoned for this length);
+nothing else is needed: streaming and its budget, mmap, the GPU or CPU passes and the prefill
+chunk follow the device. `draft=auto` (unsloth's DSpark drafter, 0.4 GB more) is not worth it
+when streaming (each drafted token routes its own experts).
+
+**Entitlements**: `com.apple.developer.kernel.increased-memory-limit` (without it an app gets
+roughly half the memory and the budget follows: an 8 GB phone still streams, a 16 GB iPad then
+streams too) and `com.apple.developer.kernel.extended-virtual-addressing` (to map an 8-12 GB
+file); both are in `OxinferTest.entitlements` and need a paid developer account.
+
+**Verified in the Simulator** (Apple silicon, iOS 26.3, iPhone 17 Pro; `ios/capi_greedy.c`
+through `xcrun simctl spawn`, the model files read from the Mac's cache), greedy, no system
+prompt, against the same program on the Mac:
+
+| File | CPU | Metal (whole passes) | Streamed, phone budget |
+|---|---|---|---|
+| unsloth UD-IQ2_XXS (8.5 GB) | 200/200 tokens identical | 200/200 identical | identical (8 GB phone: CPU passes, 4.3 GB budget) |
+| AtomicChat AD-IQ2_M (8.7 GB) | identical | identical | |
+| unsloth UD-IQ3_XXS (11.7 GB) | identical | identical | identical (12 GB phone: 6.7 GB budget) |
+
+(A 200-token story after a 24-token prompt; the streamed runs against the Mac streaming with
+`memory_limit_gb`, and against the CPU path without streaming, which they also equal; the
+16 GB iPad's budget kept UD-IQ2_XXS in memory with GPU passes, again the same text.)
+
+The Simulator's GPU has no matrix units, so it runs the kernels the Mac runs with
+`OXINFER_METAL_MMA=0`, and the outputs are compared with those (with the matrix units the Mac's
+prefill rounds differently and its text departs after about 30 tokens, at a near tie). The
+Simulator reports no app limit (`os_proc_available_memory` is 0 there) and the Mac's memory, so
+the phone budgets were set through the environment.
+
+**Not verified**: a real iPhone or iPad. The speed there (the A18 / A19 CPU, the GPU, flash
+reads under streaming), the app limit the entitlement actually grants on each model, whether
+Metal's mapping of the file counts against that limit, and jetsam's behaviour near it are
+unmeasured; the Simulator's speed means nothing (its Metal is the host GPU behind a
+virtualization layer). [ios/README.md](../ios/README.md) has the steps to try it on a device.
+
 ## Not done
 
 - 125 tok/s of decoding (the figure reported with EXO, see above): 66 at Q8_0, 82 at 4 bits

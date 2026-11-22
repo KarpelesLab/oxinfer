@@ -28,6 +28,7 @@ before the lookup (with priority over the read-ahead) rather than faulting in pa
 |---|---|
 | `--stream` | stream weights from the mapped file, reading ahead in execution order |
 | `--cache-budget-gb F` | page cache the model may use (resident set = F - prefetch window; streamed units evicted after use) |
+| `--memory-limit-gb F` (`memory_limit_gb`) | the memory the model may use, as an iOS app's limit: streaming, its budget and Inkling-2's GPU fit are decided on it (a phone's 6-8 GB tried on a desktop) |
 | `--resident-mb N` | resident set size instead of the budget's |
 | `--prefetch-mb N` | read-ahead window (default 768) |
 | `--resident-mode M` | `cache` (clean file pages, default), `lock` (`mlock`), `copy` (anonymous memory over the same addresses) |
