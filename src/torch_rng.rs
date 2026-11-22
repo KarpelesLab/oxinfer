@@ -137,8 +137,13 @@ mod tests {
             -1088479008,
         ];
         let v = TorchGenerator::new(42).randn(20);
+        // Bit for bit with macOS's libm; another system's `ln` / `cos` can round a last bit
+        // otherwise (glibc on x86-64: one value 1 ulp away; PyTorch itself there, on its AVX2
+        // path, is up to 5 ulps from these).
+        let ulps = if cfg!(target_os = "macos") { 0 } else { 2 };
         for (i, (a, b)) in v.iter().zip(want).enumerate() {
-            assert_eq!(a.to_bits(), b as u32, "{i}: {a} vs {}", f32::from_bits(b as u32));
+            let d = (a.to_bits() as i64 - b as u32 as i64).abs();
+            assert!(d <= ulps, "{i}: {a} vs {} ({d} ulps)", f32::from_bits(b as u32));
         }
     }
 
