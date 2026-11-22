@@ -355,6 +355,116 @@ same bits, so the result would not change) gained ~12% on an idle machine with a
 nothing under load, and lost with blocks handed out at run time (the slow NEON blocks finish
 last), so `auto` keeps the SME GEMM alone.
 
+#### x86-64 CPU kernels (November 2026)
+
+Measured on a Threadripper 9970X (32 cores / 64 threads, AVX-512, 1 MiB of L2 per core, 125 GB)
+with an RTX 5080, Linux, while two other sessions ran builds and model jobs on the same machine
+(load average 45-75 from them throughout: the absolute numbers are low for this CPU, and only
+interleaved runs compare). `membench` read 67-68 GB/s from memory at 12-18 threads under that
+load. `examples/parity_bench.rs` as in the matrix above (`lookup=0 draft=none mtp=0`, a warm-up
+pass per size, then the median of 3 runs); "before / after" are master `ce587c7` and this
+work, the two builds alternated twice (both medians given). llama.cpp is master `225a534`
+(2026-11-22, CUDA build): `llama-bench -ngl 0 -t 32 -r 2` for the CPU row, with no CUDA device
+visible (`CUDA_VISIBLE_DEVICES=`), since with one it runs the prompt's matmuls on the GPU even
+at `-ngl 0` (pp512 534 tok/s), and `-ngl 99 -r 3` for the CUDA row. tok/s:
+
+| model, device | pp512 before | after | llama.cpp | decode before | after | llama.cpp |
+|---|---|---|---|---|---|---|
+| Qwen3.8-27B UD-Q3_K_XL (unsloth GGUF), CPU, 64 threads | 39.9 / 39.2 | 69.8 / 69.4 | 168 | 2.8 / 2.6 | 4.5 / 4.2 | 4.1 |
+| the same, 32 threads (the default now) | | 68.0 / 65.5 / 67.8 | | | 5.0 / 4.7 / 4.9 | |
+| Qwen3.5-9B `--quant q4`, CPU, 64 threads | 131 / 132 | 201 / 202 | | 11.4 / 11.3 | 11.2 / 11.3 | |
+| Qwen3.5-9B `--quant q8`, CPU, 64 threads | 134 / 137 | 204 / 198 | | 6.7 / 6.7 | 6.8 / 6.5 | |
+| Qwen3.5-9B `--quant q4`, CUDA (pp512 / pp2048) | 300 / 251, 300 / 312 | 296 / 248, 306 / 306 | | 108.5 / 105.2 | 105.7 / 103.2 | |
+| Qwen3.5-9B `--quant q8`, CUDA (one round) | 317 / 272 | 320 / 298 | | 70.6 | 72.1 | |
+| Qwen3.8-27B UD-Q3_K_XL, `device=cuda` (GGUF weights stay on the CPU) | | 73.8 | 2497 (`-ngl 99`; pp2048 2488) | | 4.3 | 58.1 |
+
+(Decode: 24-64 tokens after a 16-token prompt on the CPU, 128 on CUDA. The "after" columns are
+the two kernel changes below, on 64 threads; the zero-filling and the thread default came after
+and have their own interleaved figures.) What changed:
+
+- **Prefill GEMM.** The 8-row x 8-token GEMM dequantized 8 whole rows and passed them over every
+  token panel, so every 8 rows streamed the whole packed prompt (35 MB at 512 tokens x 17408
+  inputs) from L3 or memory: on 64 threads it ran at 1.4-1.5 TFLOP/s on a 5120 x 17408 matrix
+  (`examples/gemm_bench.rs`, 512 tokens) and 2.5-2.7 on 17408 x 5120, against ~210 GFLOP/s for
+  one thread alone. With AVX-512F (chosen at run time) the GEMM now takes 16 rows x 16 tokens
+  per step and walks the columns in blocks of 512 (`gemm_blocked` in `kernels.rs`): a pool job
+  of 64 rows x 256 tokens dequantizes 16 rows of one column block (32 KiB, in L1), multiplies
+  them with its 16 panels of that block (512 KiB, in L2 for all the job's rows) and keeps its
+  partial sums between blocks: 4.0-4.7 TFLOP/s on both shapes. Each output is still one fused
+  multiply-add chain over the columns in order, so the logits are bit-identical to the AVX2
+  GEMM's (`OXINFER_SIMD=avx2` keeps that one). 16 x 16 tiles over whole rows, without the
+  column blocks, gave 1.5-2.0 TFLOP/s: the kernel was not what held the GEMM back. Other block
+  sizes were measured and not kept: 256 columns 3.6-3.8, 1024 columns x 128 tokens 2.6, 128-row
+  jobs 3.8-3.9, 32-row jobs 3.7-4.0.
+- **Grid-table i-quants** (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S: 46% of the weights of the
+  27B file above) went through the scalar `decode_i8`; they unpack with AVX2 now (four 8-value
+  grid entries, or eight gathered 4-value ones, negated by 32 sign bits in one register), for
+  decoding and for the prefill dequantization: 109-139 -> 28-38 ns per 256 weights and token
+  on one thread (`examples/kernel_bench.rs`; IQ4_XS 18, Q4_K 26). That alone took the 27B from
+  2.7 to 4.1-4.2 tok/s decoding and from 37.9 to 41.1 tok/s at pp512.
+- **Zero-filled temporaries.** A layer's outputs for a whole prompt are megabytes each (200 MB
+  per layer of the 27B at 641 tokens), every one made with `vec![0f32; n]` and then fully
+  written by its matmul; once the allocator reuses freed blocks, that zeroing runs on the
+  calling thread alone, about 24 ms per layer whatever the device. `kernels::zeros` fills them
+  across the pool (the Qwen-family forward, `qwen.rs`; allocations under 1 MiB as before).
+  Interleaved with the build before it, 64 threads, two rounds: Qwen3.5-9B q4 on CUDA pp512
+  309 / 317 -> 391 / 397 and pp2048 274 / 285 -> 364 / 368 tok/s; on the CPU pp512 203 / 194 ->
+  226 / 206 and pp2048 192 / 189 -> 204 / 192; the 27B GGUF on the CPU pp512 67.5 / 68.8 -> 75.6 / 74.8.
+- **Threads.** The pool takes one thread per physical core by default where the logical CPUs are
+  SMT siblings (Linux, from sysfs; `--threads` / `threads=` as before). Interleaved, 32 against
+  64 threads, three rounds each: the 27B decodes at 5.0 / 4.7 / 4.9 against 4.2 / 4.3 / 4.5
+  tok/s, Qwen3.5-9B q4 at 11.9 / 14.0 / 13.9 against 11.5 / 11.9 / 12.1 and q8 at 7.3 / 7.3 / 7.5
+  against 6.5 / 6.7 / 6.6. pp512 is level on the 27B (68.0 / 65.5 / 67.8 against 66.6 / 68.2 /
+  68.5) and 1-5% lower on the 9B (q4 191 / 198 / 203 against 194 / 202 / 206, q8 191 / 201 / 215
+  against 199 / 202 / 226) on this loaded machine, where 64 threads also take a larger share of
+  the CPU from the other jobs.
+
+Results are the same: 24 greedy tokens after a 2,600-character prompt fed as one batch
+(`examples/qwen_greedy_dump.rs`, the logits of the 25 steps and the tokens compared byte for
+byte): the 27B GGUF against the previous build (two prompts), and Qwen3.5-9B q4 and q8 against
+the AVX2 GEMM of the same build; then the build with the zero-filling change and 32 threads
+against the one before it on 64 (the 27B GGUF and Qwen3.5-9B q4 on the CPU, Qwen3.5-9B q4 on
+CUDA). The thread count does not enter any result.
+
+Where the time goes now (`--profile`, 27B GGUF on the CPU, 641-token prompt then 24 tokens, 64
+threads):
+
+- Prefill, 15.0 ms per token before the zero-filling change: matmuls 73% (the GEMM, at 55-65%
+  of what 32 cores' FMA units give alone: 32 x ~210 GFLOP/s), attention and the Gated DeltaNet
+  recurrence 9%, elementwise and norms 3%, 16% outside the timers, which was the zero-filling
+  above. Running malloc with huge pages (`glibc.malloc.hugetlb=1`) or without returning freed
+  blocks to the system had changed nothing (Qwen3.5-9B q4 pp512 196-204, pp2048 188-195 tok/s
+  in every variant): the cost was the fill itself, not the page faults.
+- Decode, 229 ms per token: matmuls 89%, streaming 12.2 GB per token at 60 GB/s of the 67-68 the
+  machine gave; the Gated DeltaNet states and attention 8% (48 states of 3.1 MB read and written
+  twice per token); the LM head 5%. Qwen3.5-9B decodes at the same wall: q4 5.6 GB x 11.3 and
+  q8 9.6 GB x 6.7 are both 63-64 GB/s. So CPU decoding here is bound by memory bandwidth, and
+  equal to llama.cpp's on the same file (4.1 tok/s).
+
+Where oxinfer is still behind on this machine:
+
+- **CPU prefill against llama.cpp** (0.42x on the 27B GGUF: 70 against 168 tok/s). llama.cpp
+  multiplies int8 activations with the quantized weights (AVX-512 VNNI, 64 products per
+  instruction against 16 for an FMA), which is `prefill_gemm=fast`'s rounding; oxinfer has that
+  GEMM on aarch64 only, and on x86-64 `fast` is the f32 GEMM, whose ceiling (32 cores x 64
+  FLOP per cycle) is about where llama.cpp already is. An int8 GEMM for x86-64 changes the
+  logits by the rounding documented under [CPU prefill GEMMs](#cpu-prefill-gemms-november-2026),
+  so it was left out of this exact pass.
+- **CUDA with GGUF weights.** The CUDA backend has no GEMM or decode kernels for the GGUF
+  block formats, so `--device cuda` runs a GGUF file on the CPU: 74 tok/s at pp512 and 4.3
+  decoding on the 27B, against llama.cpp's 2497 and 58.1 with every layer on the GPU (12.2 GiB
+  of the card's 16). This is the largest gap on this machine.
+- **CUDA prefill** (safetensors weights; no GGUF of the 9B on disk for llama.cpp). `--profile`,
+  Qwen3.5-9B q4, 641-token prompt, 2.48 s before the zero-filling change: the GEMM kernels
+  0.57 s (128 launches), the host-device copies of their activations 0.61 s (copy-in 0.22,
+  copy-out 0.38, pageable memory), attention and the Gated DeltaNet on the CPU 0.39 s, 0.79 s
+  outside the timers (the zero-filling). The layers still run op by op with a host round trip
+  per group of matmuls, as Metal's prefill did before its whole-pass plans. CUDA decoding (108
+  tok/s q4, 71-72 q8) is one plan per token and was not touched.
+- **Decode kernels**: bound by memory bandwidth here, so nothing was gained there beyond the
+  i-quant unpackers; the Gated DeltaNet update (two passes over each state per token, 8% of
+  the 27B's decode) could read its states once less.
+
 #### Earlier comparisons (llama-server, op-by-op Metal prefill)
 
 Same GGUF file in both engines, same prompt tokens (llama.cpp gets the text oxinfer's chat

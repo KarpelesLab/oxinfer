@@ -51,6 +51,29 @@ mod scratch {
 }
 use scratch::SCRATCH;
 
+/// A zeroed `Vec<f32>` of `n` elements, filled across the pool when large. A prompt's per-layer
+/// temporaries are megabytes each and fully written by the matmuls that follow: zeroing them on
+/// the calling thread alone (what `vec![0f32; n]` does once the allocator reuses freed blocks)
+/// was most of the prefill time outside the kernels.
+pub fn zeros(n: usize) -> Vec<f32> {
+    /// Below this (1 MiB), the parallel region costs more than it saves.
+    const MIN: usize = 1 << 18;
+    if n < MIN || pool::threads() == 1 {
+        return vec![0f32; n];
+    }
+    let mut v: Vec<f32> = Vec::with_capacity(n);
+    let p = SendPtr(v.as_mut_ptr());
+    let chunk = (n / (pool::threads() * 2)).max(MIN / 4);
+    pool::run(n.div_ceil(chunk), &|i| {
+        let (a, b) = (i * chunk, ((i + 1) * chunk).min(n));
+        // SAFETY: the chunks are disjoint and inside the allocation.
+        unsafe { std::ptr::write_bytes(p.get().add(a), 0, b - a) };
+    });
+    // SAFETY: all `n` elements were written above (zero bytes are 0.0).
+    unsafe { v.set_len(n) };
+    v
+}
+
 /// y[t][o] = sum_i w[o][i] * x[t][i]
 ///
 /// `w` is `[n_out, n_in]` bf16 row-major (PyTorch Linear layout),
@@ -2611,6 +2634,19 @@ mod tests {
             let mut bs = 9u64;
             let bytes = random_blocks(kind, n_out * n_in / kind.block_size(), &mut bs);
             go(kind.name(), &GgufMatrix::from_bytes(kind, &bytes, n_out, n_in).unwrap());
+        }
+    }
+
+    /// `zeros` gives `n` zeros whatever path fills them (the pool's chunks cover every element).
+    #[test]
+    fn parallel_zeros_are_all_zero() {
+        crate::pool::init(4);
+        for n in [0usize, 1, (1 << 18) - 1, 1 << 18, (1 << 18) + 1, 3 * (1 << 18) + 12345, 1 << 22] {
+            // Dirty the allocator's free blocks first, so that a missed element would show.
+            drop(vec![1.5f32; n]);
+            let v = zeros(n);
+            assert_eq!(v.len(), n);
+            assert!(v.iter().all(|x| x.to_bits() == 0), "n={n}");
         }
     }
 

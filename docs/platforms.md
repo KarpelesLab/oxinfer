@@ -141,6 +141,11 @@ cuda`.
 
 Short inputs stay on the CPU (see `wants`), but opening the device costs about 0.1 s at start-up.
 
+Prompt speed with `--quant` weights that fit, measured again in November 2026 with llama-bench
+style passes (Qwen3.5-9B: q4 391-397 tok/s at 512 tokens and 364-368 at 2048, where the time
+goes, and the comparison with llama.cpp on a GGUF file, which this backend leaves to the CPU):
+[x86-64 CPU kernels](performance.md#x86-64-cpu-kernels-november-2026).
+
 **Decoding.** Whole decode steps run on the GPU as compiled plans of the decode graph
 (`cuda_decode.rs`, the kernels ported from Metal's): matvecs (bf16, Q8, Q4, affine Q4), norms,
 RoPE, attention (split over up to 64 chunks for long contexts), Gated DeltaNet, MoE routing and
