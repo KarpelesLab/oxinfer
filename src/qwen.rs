@@ -2656,9 +2656,17 @@ impl<'a> QwenModel<'a> {
             _ => attention(&q, cache, nh, t, start, at.window, &mut att),
         }
         if gated {
-            for (a, &g) in att.iter_mut().zip(&gate) {
-                *a *= 1.0 / (1.0 + fast_exp(-g));
-            }
+            for_chunks(&mut att, nh * hd, par, |i, row| {
+                let g = &gate[i * nh * hd..];
+                crate::kernels::wide(
+                    #[inline(always)]
+                    || {
+                        for (a, &g) in row.iter_mut().zip(g) {
+                            *a *= 1.0 / (1.0 + fast_exp(-g));
+                        }
+                    },
+                )
+            });
         }
         if let Some(hg) = &at.head_gate {
             let mut g = crate::kernels::zeros(t * nh);
@@ -2706,21 +2714,40 @@ impl<'a> QwenModel<'a> {
         let mut c = crate::kernels::zeros(t * conv_dim);
         {
             let st_conv = &st.conv;
-            let src = |i: isize, ch: usize| -> f32 {
+            // Input row `i` (negative: the rows kept from before the pass).
+            let src = |i: isize| -> &[f32] {
                 if i >= 0 {
-                    qkv[i as usize * conv_dim + ch]
+                    &qkv[i as usize * conv_dim..(i as usize + 1) * conv_dim]
                 } else {
-                    st_conv[((kc as isize - 1 + i) as usize) * conv_dim + ch]
+                    let r = (kc as isize - 1 + i) as usize;
+                    &st_conv[r * conv_dim..(r + 1) * conv_dim]
                 }
             };
-            for_chunks(&mut c, conv_dim, t > 1, |i, row| {
-                for ch in 0..conv_dim {
-                    let mut s = 0f32;
-                    for j in 0..kc {
-                        s += gd.conv_w[ch * kc + j] * src(i as isize - (kc as isize - 1) + j as isize, ch);
-                    }
-                    row[ch] = s / (1.0 + fast_exp(-s));
+            // The taps as `[tap][channel]`, so that each tap is one pass over the channels: every
+            // channel still adds its taps in order from zero.
+            let mut wt = vec![0f32; kc * conv_dim];
+            for (ch, w) in gd.conv_w.chunks_exact(kc).enumerate() {
+                for (j, &v) in w.iter().enumerate() {
+                    wt[j * conv_dim + ch] = v;
                 }
+            }
+            for_chunks(&mut c, conv_dim, t > 1, |i, row| {
+                crate::kernels::wide(
+                    #[inline(always)]
+                    || {
+                        row.fill(0.0);
+                        for j in 0..kc {
+                            let x = src(i as isize - (kc as isize - 1) + j as isize);
+                            let w = &wt[j * conv_dim..(j + 1) * conv_dim];
+                            for ((s, &w), &x) in row.iter_mut().zip(w).zip(x) {
+                                *s += w * x;
+                            }
+                        }
+                        for s in row.iter_mut() {
+                            *s = *s / (1.0 + fast_exp(-*s));
+                        }
+                    },
+                )
             });
         }
         let rule = DeltaRule {
@@ -2816,11 +2843,21 @@ pub(crate) fn gated_norm(out: &mut [f32], z: &[f32], w: &[f32], eps: f32, sig: b
         let ss: f32 = o.iter().map(|v| v * v).sum::<f32>() / hdv as f32 + eps;
         let r = ss.powf(-0.5);
         let zz = &z[i * hdv..(i + 1) * hdv];
-        for j in 0..hdv {
-            let g = zz[j];
-            let gate = if sig { 1.0 / (1.0 + (-g).exp()) } else { g / (1.0 + fast_exp(-g)) };
-            o[j] = o[j] * r * w[j] * gate;
+        if sig {
+            for j in 0..hdv {
+                o[j] = o[j] * r * w[j] * (1.0 / (1.0 + (-zz[j]).exp()));
+            }
+            return;
         }
+        crate::kernels::wide(
+            #[inline(always)]
+            || {
+                for j in 0..hdv {
+                    let g = zz[j];
+                    o[j] = o[j] * r * w[j] * (g / (1.0 + fast_exp(-g)));
+                }
+            },
+        )
     });
 }
 

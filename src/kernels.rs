@@ -74,6 +74,34 @@ pub fn zeros(n: usize) -> Vec<f32> {
     v
 }
 
+/// Runs `f` compiled for AVX-512F or AVX2 where the CPU has them (x86-64; as is elsewhere). For
+/// element-wise loops: the compiler then takes 16 or 8 values per step instead of the 4 of
+/// baseline SSE2, and rounds (`fast_exp`) in line instead of through a libm call per value. No
+/// operation is fused or reordered, so the results are the same bits.
+#[inline(always)]
+pub(crate) fn wide<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(target_arch = "x86_64")]
+    {
+        #[target_feature(enable = "avx512f")]
+        unsafe fn avx512<R>(f: impl FnOnce() -> R) -> R {
+            f()
+        }
+        #[target_feature(enable = "avx2")]
+        unsafe fn avx2<R>(f: impl FnOnce() -> R) -> R {
+            f()
+        }
+        if simd::avx512() {
+            // SAFETY: AVX-512F was detected.
+            return unsafe { avx512(f) };
+        }
+        if simd::avx2() {
+            // SAFETY: AVX2 was detected.
+            return unsafe { avx2(f) };
+        }
+    }
+    f()
+}
+
 /// y[t][o] = sum_i w[o][i] * x[t][i]
 ///
 /// `w` is `[n_out, n_in]` bf16 row-major (PyTorch Linear layout),
@@ -2509,10 +2537,16 @@ pub fn silu_mul(a: &mut [f32], b: &[f32]) {
     let par = a.len() >= PAR_MIN;
     let chunk = if par { par_chunk(a.len()) } else { a.len() };
     for_chunks(a, chunk, par, |i, c| {
-        for (ai, &bi) in c.iter_mut().zip(&b[i * chunk..]) {
-            let x = *ai;
-            *ai = x / (1.0 + fast_exp(-x)) * bi;
-        }
+        let b = &b[i * chunk..];
+        wide(
+            #[inline(always)]
+            || {
+                for (ai, &bi) in c.iter_mut().zip(b) {
+                    let x = *ai;
+                    *ai = x / (1.0 + fast_exp(-x)) * bi;
+                }
+            },
+        )
     });
 }
 
