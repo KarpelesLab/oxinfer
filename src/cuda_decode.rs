@@ -19,6 +19,12 @@
 //! GGUF weights are read as stored by kernels of their own (`inkling_cuda.cu`'s matvec, one module
 //! per ggml format: [`COp::Gmv`]); a gate / up pair of them is two matvecs and the activation.
 //!
+//! Prefill plans (`Backend::decode_plan_prefill`, GGUF weights only) are multi-token plans of up
+//! to 512 tokens whose matvecs run as tensor-core GEMMs over the stored blocks (`gemmi_K`) and
+//! whose other ops take every token of the step in one launch (`*_t` kernels: the Gated DeltaNet
+//! conv and rule loop over the tokens on the device; attention in batches of 32 tokens); ops
+//! without such a kernel run token by token, as in the other multi-token plans.
+//!
 //! Declined (the model then decodes on the CPU): interventions, Qwen4-Exp's hyper-connection ops,
 //! GGUF weights in the ternary / 1-bit formats or in MoE experts, and graphs whose weights do not
 //! all fit in VRAM (`OXINFER_GPU_PLAN_DEBUG=1` says which op).
@@ -457,9 +463,12 @@ pub(super) struct CudaPlan<'b> {
 }
 
 /// `dglu_t`, `dew_t`, `dqk_rope_t`, `dattn_combine_t`, `dgdn_conv_t`, `dgdn_rule_t` and
-/// `dgdn_rule_t1k` (blocks of more than 512 threads).
+/// `dgdn_rule_t1k` (blocks of more than 512 threads); `dguard_t` and the flag it sets (in the
+/// arena) when a GEMM input does not fit the kernels' f16 halves.
 #[derive(Clone, Copy)]
 struct PfFuncs {
+    guard: F,
+    flag: u64,
     glu: F,
     ew: F,
     qk: F,
@@ -1276,6 +1285,7 @@ impl CudaBackend {
         if head_from == usize::MAX {
             head_from = ops.len();
         }
+        let flag_off = region(4);
         let part_off = region(part_floats.max(1) * 4);
         let pair_off = region(pair_floats.max(1) * tokens * 4);
         let save_off: Vec<usize> = saves.iter().map(|&n| region(n * 4)).collect();
@@ -1388,6 +1398,8 @@ impl CudaBackend {
             },
             pf: if pf {
                 Some(PfFuncs {
+                    guard: self.func("dguard_t")?,
+                    flag: arena + flag_off as u64,
                     glu: self.func("dglu_t")?,
                     ew: self.func("dew_t")?,
                     qk: self.func("dqk_rope_t")?,
@@ -1780,6 +1792,10 @@ impl CudaPlan<'_> {
                 n_in,
                 mode,
             } if t >= PF_GEMM_MIN => {
+                let (xa, xs, flag) = (x.a, st(x), pf.flag);
+                if !be.launch(pf.guard, (n_in.div_ceil(256).min(8), tt), 256, &mut args![xa, n_in, xs, flag]) {
+                    return Some(false);
+                }
                 let p = GemmP {
                     x: x.a,
                     y: y.a,
@@ -2039,6 +2055,11 @@ impl DecodePlan for CudaPlan<'_> {
             src += n;
             dst += (self.tokens * 2 * half * 4) as u64;
         }
+        if let Some(pf) = &self.pf
+            && !be.htod(pf.flag, &[0u32])
+        {
+            return false;
+        }
         if !self.strengths.1.is_empty() {
             let v: Vec<f32> = self.strengths.1.iter().map(|s| s.get()).collect();
             if !be.htod(self.strengths.0, &v) {
@@ -2100,6 +2121,19 @@ impl DecodePlan for CudaPlan<'_> {
             unsafe { be.cu.cuCtxSynchronize() };
         }
         let t2 = std::time::Instant::now();
+        // A GEMM input out of the f16 halves' range: nothing of the step is kept (the caches and
+        // the states are still the host's).
+        if let Some(pf) = &self.pf {
+            let mut flag = 1u32;
+            if unsafe { be.cu.cuMemcpyDtoH_v2(&mut flag as *mut u32 as *mut c_void, pf.flag, 4) } != 0 || flag != 0 {
+                debug(&format!("step of {t} token(s) declined: an activation outside the GEMMs' range"));
+                // Copies queued for the states must not land in the pinned buffer later.
+                if !self.copy_stream.is_null() {
+                    unsafe { be.cu.cuStreamSynchronize(self.copy_stream) };
+                }
+                return false;
+            }
+        }
         // Results down (each copy waits for the kernels before it on the stream).
         let dtoh = |dst: &mut [f32], src: u64| unsafe { be.cu.cuMemcpyDtoH_v2(dst.as_mut_ptr() as *mut c_void, src, dst.len() * 4) == 0 };
         let down = |dst: &mut [f32], (p, n, ts): (u64, usize, usize)| -> bool {

@@ -413,6 +413,20 @@ struct GemmP {
     lbeta: f32,
 }
 
+/// Whether every value is finite and below 32768 in magnitude: what the ggml GEMMs' split into
+/// f16 halves holds (`split_h2` in `inkling_cuda.cu`). Checked across the thread pool.
+fn fits_halves(x: &[f32]) -> bool {
+    const CHUNK: usize = 1 << 16;
+    let bad = std::sync::atomic::AtomicBool::new(false);
+    crate::pool::run(x.len().div_ceil(CHUNK), &|i| {
+        let c = &x[i * CHUNK..((i + 1) * CHUNK).min(x.len())];
+        if c.iter().fold(0u32, |m, v| m.max(v.to_bits() & 0x7fff_ffff)) >= 0x4700_0000 {
+            bad.store(true, Ordering::Relaxed);
+        }
+    });
+    !bad.load(Ordering::Relaxed)
+}
+
 /// The ggml formats with device kernels (`dq<K>` in `inkling_cuda.cu`): every block format but
 /// the ternary and 1-bit ones, and the float ones.
 fn gg_supported(kind: crate::ggml::GgmlType) -> bool {
@@ -1807,6 +1821,10 @@ impl Backend for CudaBackend {
         if jobs.is_empty() || !n_in.is_multiple_of(32) || x.len() < t * n_in {
             return false;
         }
+        // The ggml GEMM takes the activations as pairs of f16 halves.
+        if jobs.iter().any(|j| matches!(j.w, WeightRef::Gguf(_))) && !fits_halves(&x[..t * n_in]) {
+            return false;
+        }
         let t_pad = t.div_ceil(TILE) * TILE;
         let mut y_total = 0;
         for j in jobs.iter() {
@@ -2788,6 +2806,28 @@ mod tests {
             }
             be.free_weight(&cw);
         }
+        // Activations the GEMM's f16 halves cannot hold are declined too.
+        {
+            let bytes = random_blocks(Q4_K, 64 * n_in / Q4_K.block_size(), &mut seed);
+            let m = GgufMatrix::from_bytes(Q4_K, &bytes, 64, n_in).unwrap();
+            let dev = be.upload(&WeightRef::Gguf(&m), 64, n_in).unwrap();
+            let mut xb: Vec<f32> = (0..64 * n_in).map(|_| rnd(&mut seed)).collect();
+            let mut y = vec![0f32; 64 * 64];
+            let mut go = |xb: &[f32]| {
+                let mut jobs = [Job {
+                    w: WeightRef::Gguf(&m),
+                    dev: &dev,
+                    n_out: 64,
+                    y: &mut y,
+                }];
+                be.matmul(xb, 64, n_in, &mut jobs)
+            };
+            assert!(go(&xb));
+            xb[7 * n_in + 3] = -4.0e4;
+            assert!(!go(&xb));
+            xb[7 * n_in + 3] = f32::NAN;
+            assert!(!go(&xb));
+        }
         // Formats without kernels are declined (the CPU path keeps them).
         let bytes = random_blocks(TQ2_0, n_out * n_in / TQ2_0.block_size(), &mut seed);
         let m = GgufMatrix::from_bytes(TQ2_0, &bytes, n_out, n_in).unwrap();
@@ -3038,6 +3078,39 @@ mod tests {
                 worst <= 2e-4 * scale,
                 "prefill plan: {what} differ by {worst:.2e} (largest value {scale:.2e})"
             );
+        }
+        // An input the GEMMs cannot take (here not a number) declines the step and leaves the
+        // host's caches and states alone.
+        {
+            let mut slot = Slot(None);
+            let mut cache = LayerCache::new(nkv, hd);
+            let mut s0 = vec![0f32; nv * hdk * hdv];
+            let mut s1 = vec![0f32; (kc - 1) * conv_dim];
+            let mut bad = xin[..16 * h].to_vec();
+            bad[5 * h + 9] = f32::NAN;
+            let mut hs = vec![0f32; 16 * h];
+            let mut kv = [&mut cache];
+            let mut states: [&mut [f32]; 2] = [&mut s0, &mut s1];
+            let ok = pf.step(
+                &mut slot,
+                Step {
+                    pos: 0,
+                    t: 16,
+                    rope_cs: &cs[..16 * hd],
+                    x: &bad,
+                    x2: &[],
+                    kv: &mut kv,
+                    states: &mut states,
+                    hidden: &mut hs,
+                    logits: None,
+                    params: None,
+                    capture: None,
+                    scratch: false,
+                    states_kept: false,
+                },
+            );
+            assert!(!ok, "a step with a non-finite activation must be declined");
+            assert!(cache.len == 0 && s0.iter().chain(&s1).all(|&v| v == 0.0));
         }
     }
 

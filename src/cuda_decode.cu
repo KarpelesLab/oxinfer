@@ -927,3 +927,14 @@ extern "C" __global__ void __launch_bounds__(1024) dgdn_rule_t1k(const float* c,
                                                                  unsigned int zs, unsigned int bs, unsigned int as, unsigned int os) {
     dgdn_rule_t_body(c, z, b, a, out, state, cst, p, nt, cs, zs, bs, as, os);
 }
+
+// ---- The GEMMs of a prefill plan take their inputs as pairs of f16 halves: sets *flag when a
+// value of the step's rows (n floats each, xs apart; grid (blocks, tokens)) is 32768 or more in
+// magnitude or not finite, and the host then declines the step (the CPU path runs it).
+extern "C" __global__ void dguard_t(const float* x, unsigned int n, unsigned int xs, unsigned int* flag) {
+    const float* r = x + (size_t)blockIdx.y * xs;
+    unsigned int top = 0u;
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
+        top = max(top, __float_as_uint(r[i]) & 0x7fffffffu);
+    if (top >= 0x47000000u) *flag = 1u;
+}
