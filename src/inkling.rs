@@ -951,6 +951,16 @@ pub(crate) trait DevEngine: Send + Sync {
     fn rollback(&self) -> usize {
         0
     }
+    /// Most tokens of a pass whose rows are those of one-token passes (speculative verification
+    /// stays within it: [`Inkling2Model::max_draft`]).
+    fn exact_tokens(&self) -> usize {
+        usize::MAX
+    }
+    /// Whether [`DevEngine::run`] takes captured streams (draft models read them at every round;
+    /// without, their rounds would run on the CPU).
+    fn captures(&self) -> bool {
+        true
+    }
     /// Runs the embedded tokens `x` (`[t, hidden]`, embedding norm applied) from `sess.pos`,
     /// advancing it, into `want`; false when the device does not take the pass (the session is
     /// then untouched). By default [`DevEngine::forward`] and the head, without captured streams.
@@ -1041,27 +1051,6 @@ impl ConvRing {
     fn row_mut(&mut self, p: isize) -> &mut [f32] {
         let s = self.slot(p);
         &mut self.rows[s * self.ch..(s + 1) * self.ch]
-    }
-    /// The `kernel - 1` inputs before position `pos`, oldest first (a device's history).
-    #[cfg_attr(
-        not(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))),
-        allow(dead_code)
-    )]
-    pub(crate) fn last(&self, pos: usize) -> Vec<f32> {
-        (pos as isize - self.back as isize..pos as isize)
-            .flat_map(|p| self.row(p).iter().copied())
-            .collect()
-    }
-    /// Sets the `kernel - 1` inputs before position `pos` from `v` (oldest first).
-    #[cfg_attr(
-        not(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))),
-        allow(dead_code)
-    )]
-    pub(crate) fn set_last(&mut self, pos: usize, v: &[f32]) {
-        let ch = self.ch;
-        for (i, p) in (pos as isize - self.back as isize..pos as isize).enumerate() {
-            self.row_mut(p).copy_from_slice(&v[i * ch..(i + 1) * ch]);
-        }
     }
 }
 
@@ -1706,15 +1695,20 @@ impl<'a> Inkling2Model<'a> {
     }
 
     /// Most draft tokens a speculative round verifies: [`DEVICE_MAX_DRAFT`] when the passes run
-    /// on the accelerator, else [`MAX_DRAFT`]; within what a session can go back
-    /// ([`Self::rollback_limit`]: 0 on CUDA, where speculation is off).
+    /// on the accelerator (within its passes of one-token results: 3 on CUDA), else
+    /// [`MAX_DRAFT`]; within what a session can go back ([`Self::rollback_limit`]).
     pub fn max_draft(&self) -> usize {
         let lim = self.rollback_limit().saturating_sub(1);
-        if self.device().is_some() {
-            DEVICE_MAX_DRAFT.min(lim)
-        } else {
-            MAX_DRAFT.min(lim)
+        match self.device() {
+            Some(d) => DEVICE_MAX_DRAFT.min(lim).min(d.exact_tokens().saturating_sub(1)),
+            None => MAX_DRAFT.min(lim),
         }
+    }
+
+    /// Whether draft models can run (sessions go back, and the device takes the passes that
+    /// capture their streams: not on CUDA, where prompt lookup still runs).
+    pub fn can_draft(&self) -> bool {
+        self.can_rollback() && self.device().is_none_or(|d| d.captures())
     }
 
     /// Runs `tokens` on the device when it can (`want` as [`DevWant`]); false otherwise (the

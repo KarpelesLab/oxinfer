@@ -475,8 +475,22 @@ device interface in `src/inkling.rs` (`DevEngine` for the passes, `DevSession` f
 state on the device): the host side (embedding, interventions and captured layers on the CPU,
 LoRA strengths, moving a session between host and device, going back for speculative decoding)
 is shared. A device says how far its sessions go back (`Inkling2Model::rollback_limit`): 64
-positions on Metal and the CPU, none on CUDA, where prompt lookup and draft models stay off and
-decoding is plain.
+positions on Metal, CUDA and the CPU.
+
+On CUDA the convolutions' histories are rings of the recent inputs by position (`kernel - 1 + 64`
+rows, the host's `ConvRing` layout: a session moves between host and device by copying them), the
+sliding layers' caches rings of `window + 1024` rows and the full layers' caches rows by position,
+so going back is setting the position: the rows from there on are written again by the next
+passes. Passes of up to 4 tokens run on the matvec kernels with the one-token pass's attention
+splits, so their rows are those of one-token passes; speculative rounds verify up to 3 drafts
+there (`DevEngine::exact_tokens`: longer passes take the prefill GEMMs, which round differently).
+Prompt lookup runs on CUDA; draft models do not (their rounds capture streams the CUDA engine
+does not return, which would send every round to the CPU). Not run on a CUDA device here: the
+ignored test `tests/inkling_cuda_rollback.rs` (`cargo test --release --test inkling_cuda_rollback
+-- --ignored --nocapture --test-threads 1`, on the real Q8_0 weights) checks going back 1-64
+positions against an uninterrupted run and greedy decoding with prompt lookup against plain
+greedy decoding; `small_ops_match_cpu` in `inkling_cuda.rs` checks the convolutions' rings against
+the host's at several positions, past a wrap and after going back.
 
 `OXINFER_GPU_DECODE=0` (or `--gpu-decode off`) keeps the passes on the CPU,
 `OXINFER_INKLING_PREFILL=0` the prefill passes; `OXINFER_GPU_DECODE_CHECK=1` runs each decode
@@ -684,9 +698,6 @@ oxinfer --model unsloth/Inkling-2-Mini-GGUF:UD-IQ3_XXS --draft auto --prompt "..
 - Speculative decoding is bounded by the experts a verification pass reads (3.1 ms a token at 4
   bits, above), whatever the drafter: no batching of the pass shares experts the tokens do not
   share. The multi-token matvecs of the rest (0.4-1.6 ms a token) could still shrink.
-- CUDA sessions do not go back (no prompt lookup or drafts there): its sliding rings already keep
-  1024 positions more than the window and its full caches are by position, but its convolution
-  histories hold the last 3 inputs only. Keeping a pass's inputs per convolution (the history and
-  the pass's rows, `[3 + t][ch]`) beside them would let `truncate` copy the 3 rows before the new
-  position back; not done without a CUDA device to check it on.
+- Draft models on CUDA (the engine returns no captured streams); its rollback is untested on a
+  CUDA device (see above).
 - No GGUF of Small was tried (the same code reads its layout).

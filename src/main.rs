@@ -3070,12 +3070,15 @@ fn run_inkling(mut args: Args) -> Result<()> {
     if let Some(lk) = LOOKUP.lock().unwrap().as_mut() {
         lk.opts.max_draft = lk.opts.max_draft.min(model.max_draft());
     }
-    // A device whose sessions cannot go back (CUDA) runs neither lookup rounds nor drafts.
+    // A device whose sessions cannot go back runs neither lookup rounds nor drafts; one that
+    // sends the drafts' captured passes to the CPU (CUDA) runs no drafts.
     if !model.can_rollback() {
         if draft.take().is_some() || args.lookup == Some(true) {
             eprintln!("[speculative decoding is not available on this device (its sessions cannot go back): plain decoding]");
         }
         *LOOKUP.lock().unwrap() = None;
+    } else if !model.can_draft() && draft.take().is_some() {
+        eprintln!("[draft models are not available on this device (it does not capture their streams): prompt lookup only]");
     }
     let tok = load_tokenizer(&args.model)?;
     let fmt: &dyn ChatFormat = &chat::InklingChat;

@@ -19,12 +19,20 @@
 //! Decode steps are captured once per session as a CUDA graph (positions are read on the device),
 //! so a token is one graph launch.
 //!
+//! Sessions go back up to [`ROLLBACK`] positions (speculative decoding): the convolutions'
+//! histories are rings of recent inputs by position, as the host's `ConvRing`, and the attention
+//! caches are read by position, so `truncate` only sets the position. Passes of up to [`MV_T`]
+//! tokens give one-token results (the matvec kernels, the one-token attention splits), which
+//! bounds the drafts a round verifies.
+//!
 //! Declined (the CPU path runs): weight kinds without a kernel (the ternary and 1-bit GGUF types,
 //! affine Q4), LoRA adapters, Hadamard-folded weights, streamed weights, head sizes other than
 //! 128, more than 4 query heads per key/value head, and models that do not fit in VRAM
 //! (`OXINFER_GPU_PLAN_DEBUG=1` says why; `OXINFER_INKLING_GPU=0` keeps the CPU path).
 
-use super::{DevBox, DevEngine, DevSession, Gate, InNorm, Inkling2Model, Inkling2Session, KvCache, KvConv, KvRows, LayerState, MIX_EPS};
+use super::{
+    DevBox, DevEngine, DevSession, Gate, InNorm, Inkling2Model, Inkling2Session, KvCache, KvConv, KvRows, LayerState, MIX_EPS, ROLLBACK,
+};
 use crate::cuda::{Cu, CudaBackend};
 use crate::ggml::GgmlType;
 use crate::model::{Lin, Weight};
@@ -210,6 +218,10 @@ struct ConvJobs {
     t: u32,
     groups: u32,
     norm: f32,
+    /// The rows of the histories' rings (`kernel - 1 +` [`ROLLBACK`]).
+    cap: u32,
+    /// The pass's first position (`info[0]`).
+    info: u64,
 }
 
 #[repr(C)]
@@ -484,6 +496,13 @@ impl DevSession for DevSess {
     }
     fn as_any(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+    /// Going back is forgetting the later positions: the convolutions' rings keep [`ROLLBACK`]
+    /// positions of inputs, the sliding layers' rings `window + CHUNK` rows and the full layers'
+    /// caches every position (the rows from `len` on are written again by the next passes), and
+    /// the captured step reads its position on the device.
+    fn truncate(&mut self, pos: usize, len: usize) -> bool {
+        len <= pos && pos - len <= ROLLBACK
     }
 }
 
@@ -1591,18 +1610,22 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn sconv(&self, x: u64, hist: u64, taps: u64, dyn_: u64, ch: usize, groups: usize, t: usize, norm: f32) {
-        self.sconvs(&[ConvJob { x, hist, taps, dyn_ }], ch, groups, t, norm);
+    fn sconv(&self, x: u64, hist: u64, taps: u64, dyn_: u64, ch: usize, groups: usize, t: usize, norm: f32, info: u64) {
+        self.sconvs(&[ConvJob { x, hist, taps, dyn_ }], ch, groups, t, norm, info);
     }
 
-    /// One or two convolutions of the same shape in one launch.
-    fn sconvs(&self, jobs: &[ConvJob], ch: usize, groups: usize, t: usize, norm: f32) {
+    /// One or two convolutions of the same shape in one launch (`info`: the pass's position on
+    /// the device; the histories are rings by position, see `inkling_cuda.cu`).
+    #[allow(clippy::too_many_arguments)]
+    fn sconvs(&self, jobs: &[ConvJob], ch: usize, groups: usize, t: usize, norm: f32, info: u64) {
         let mut p = ConvJobs {
             ch: ch as u32,
             k: self.conv_k as u32,
             t: t as u32,
             groups: groups as u32,
             norm,
+            cap: (self.conv_k - 1 + ROLLBACK) as u32,
+            info,
             ..Default::default()
         };
         p.j[..jobs.len()].copy_from_slice(jobs);
@@ -1705,6 +1728,7 @@ impl Engine {
             nkv,
             t,
             norm,
+            ar.info,
         );
         let alpha = if l.full { self.alpha } else { 0.0 };
         self.vec_posts(
@@ -1724,7 +1748,9 @@ impl Engine {
             128,
             &mut args![ar.k, ar.v, s.k, s.v, s.ks, s.vs, kw as u32, t as u32, s.cap as u32, fmt, ar.info],
         );
-        let ns = if t == 1 {
+        // (Passes on the matvec path split the keys as one-token passes do: a token's attention
+        // does not depend on the pass, so speculative verification gives one-token results.)
+        let ns = if t <= MV_T {
             if l.full { SPLITS_FULL } else { SPLITS_SLIDING }
         } else {
             (256 / (t * nkv)).clamp(1, if l.full { SPLITS_FULL } else { SPLITS_SLIDING })
@@ -1945,7 +1971,7 @@ impl Engine {
                 }
             };
             self.attention(ar, l, xs[0], xs[1], xs[2], slot, s.fmt, t);
-            self.sconv(ar.a, slot.hist[2], l.attn_taps, 0, h, 1, t, conv_norm);
+            self.sconv(ar.a, slot.hist[2], l.attn_taps, 0, h, 1, t, conv_norm, ar.info);
             if l.boundary {
                 let st = free.pop().expect("inkling cuda: block states");
                 self.rms(ar.x, st, 0, h, MIX_EPS, t);
@@ -1972,7 +1998,7 @@ impl Engine {
                 }
             };
             self.moe(ar, l, hn, ar.o, t);
-            self.sconv(ar.o, slot.hist[3], l.mlp_taps, 0, h, 1, t, conv_norm);
+            self.sconv(ar.o, slot.hist[3], l.mlp_taps, 0, h, 1, t, conv_norm, ar.info);
             self.go(
                 self.f("add_k"),
                 ((n as u32).div_ceil(256), 1, 1),
@@ -2023,7 +2049,9 @@ impl Engine {
                 unsafe { self.x.cuMemsetD8Async(p, 0, n.max(256), self.stream) };
                 Some(p)
             };
-            let hist_len = [back * kw, back * kw, back * self.h, back * self.h];
+            // The convolutions' rings of recent inputs (the host's `ConvRing` layout).
+            let rows = back + ROLLBACK;
+            let hist_len = [rows * kw, rows * kw, rows * self.h, rows * self.h];
             let slot = Slot {
                 k: a(cap * kw * el)?,
                 v: a(cap * kw * el)?,
@@ -2091,8 +2119,9 @@ impl Engine {
         for (hs, d) in sess.layers.iter().zip(&ds.slots) {
             let kw = d.kw;
             for (i, hp) in d.hist.iter().enumerate() {
-                // The host's ring by position; the device keeps the last `kernel - 1` inputs.
-                let v = hs.hist[i].last(pos);
+                // The host's ring by position, as the device keeps it.
+                let v = &hs.hist[i].rows;
+                assert_eq!(v.len(), d.hist_len[i], "inkling cuda: a convolution ring's size");
                 unsafe { self.cu.cuMemcpyHtoD_v2(*hp, v.as_ptr() as *const c_void, v.len() * 4) };
             }
             // Rows first..pos to rows p % cap: at most two runs (the ring wraps once).
@@ -2133,9 +2162,9 @@ impl Engine {
         for ((hs, d), &li) in sess.layers.iter_mut().zip(&ds.slots).zip(&slot_layer) {
             let kw = d.kw;
             for (i, hp) in d.hist.iter().enumerate() {
-                let mut v = vec![0f32; d.hist_len[i]];
+                let v = &mut hs.hist[i].rows;
+                assert_eq!(v.len(), d.hist_len[i], "inkling cuda: a convolution ring's size");
                 unsafe { self.cu.cuMemcpyDtoH_v2(v.as_mut_ptr() as *mut c_void, *hp, v.len() * 4) };
-                hs.hist[i].set_last(pos, &v);
             }
             let l = &self.layers[li];
             let first = if l.full { 0 } else { pos.saturating_sub(self.window) };
@@ -2316,6 +2345,18 @@ fn graphs() -> bool {
 }
 
 impl DevEngine for Engine {
+    fn rollback(&self) -> usize {
+        ROLLBACK
+    }
+    /// Passes on the matvec path ([`MV_T`] tokens) give one-token results (the prefill GEMMs
+    /// round differently).
+    fn exact_tokens(&self) -> usize {
+        MV_T
+    }
+    /// (Captured streams send the pass to the CPU.)
+    fn captures(&self) -> bool {
+        false
+    }
     fn forward(&self, m: &Inkling2Model, sess: &mut Inkling2Session, x: &[f32], t: usize) -> Vec<f32> {
         self.run(m, sess, x, t)
     }
@@ -2714,29 +2755,51 @@ mod tests {
         crate::pool::init(4);
         let mut e = Engine::bare(be, &[0]).unwrap();
         let mut seed = 3u64;
-        // Short convolutions, static and with per-token taps, one token and seven.
+        // Short convolutions, static and with per-token taps, of 1, 7, 12 and 70 tokens (longer
+        // than the ring) at several positions, on the one-thread-per-channel kernel and on the
+        // per-token one (with scratch): the outputs and the whole ring of recent inputs against
+        // the host's `ConvRing` (the same layout), then going back (as `truncate`: nothing but
+        // the position) and running again.
         let (ch, kn, groups) = (96usize, 4usize, 3usize);
         e.conv_k = kn;
-        for dynamic in [false, true] {
-            for t in [1usize, 7] {
-                let taps = rnds(kn * ch, &mut seed, 0.5);
-                let hist = rnds((kn - 1) * ch, &mut seed, 1.0);
-                let mut x = rnds(t * ch, &mut seed, 1.0);
-                let dy = rnds(t * groups * kn, &mut seed, 0.3);
-                let (px, ph, pt) = (e.upf(&x).unwrap(), e.upf(&hist).unwrap(), e.upf(&taps).unwrap());
-                let pd = if dynamic { e.upf(&dy).unwrap() } else { 0 };
-                e.sconv(px, ph, pt, pd, ch, groups, t, 0.4);
-                let (gx, gh) = (down(&e, px, t * ch), down(&e, ph, (kn - 1) * ch));
-                // The host's ring holds the same inputs before position 0.
-                let mut ring = super::super::ConvRing::new(kn, ch);
-                ring.set_last(0, &hist);
-                super::super::short_conv(&taps, dynamic.then_some((&dy[..], groups)), &mut ring, &mut x, ch, 0.4, 0);
-                let hist = ring.last(t);
-                for (a, b) in gx.iter().zip(&x).chain(gh.iter().zip(&hist)) {
-                    assert!((a - b).abs() < 1e-5, "short conv (dynamic {dynamic}, {t} tokens): {a} against {b}");
+        let info = zeros(&e, 4);
+        let cap = kn - 1 + ROLLBACK;
+        for scratch in [false, true] {
+            e.conv_scratch = if scratch {
+                (zeros(&e, 70 * ch), zeros(&e, 70 * ch))
+            } else {
+                (0, 0)
+            };
+            for dynamic in [false, true] {
+                for (t, pos, back) in [(1usize, 0usize, 0usize), (7, 5, 3), (12, 61, 7), (70, 130, 1), (3, 200, 64)] {
+                    let taps = rnds(kn * ch, &mut seed, 0.5);
+                    let mut ring = super::super::ConvRing::new(kn, ch);
+                    ring.rows = rnds(cap * ch, &mut seed, 1.0);
+                    let ph = e.upf(&ring.rows).unwrap();
+                    let pt = e.upf(&taps).unwrap();
+                    // A pass at `pos`, then (going back `back`) one at `pos + t - back`.
+                    let mut at = pos;
+                    for step in 0..2 {
+                        let mut x = rnds(t * ch, &mut seed, 1.0);
+                        let dy = rnds(t * groups * kn, &mut seed, 0.3);
+                        let px = e.upf(&x).unwrap();
+                        let pd = if dynamic { e.upf(&dy).unwrap() } else { 0 };
+                        set_info(&e, info, at);
+                        e.sconv(px, ph, pt, pd, ch, groups, t, 0.4, info);
+                        let (gx, gh) = (down(&e, px, t * ch), down(&e, ph, cap * ch));
+                        super::super::short_conv(&taps, dynamic.then_some((&dy[..], groups)), &mut ring, &mut x, ch, 0.4, at);
+                        for (a, b) in gx.iter().zip(&x).chain(gh.iter().zip(&ring.rows)) {
+                            assert!(
+                                (a - b).abs() < 1e-5,
+                                "short conv (scratch {scratch}, dynamic {dynamic}, {t} tokens at {at}, pass {step}): {a} against {b}"
+                            );
+                        }
+                        at = (at + t).saturating_sub(back);
+                    }
                 }
             }
         }
+        e.conv_scratch = (0, 0);
         // Mixes: 3 states, 3 queries, 5 tokens, and none of the states.
         let (h, t) = (256usize, 5usize);
         e.h = h;

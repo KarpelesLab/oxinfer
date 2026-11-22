@@ -2105,8 +2105,9 @@ impl Engine {
                     ),
                     (false, d) => d.clone(),
                 };
-                // (A device whose sessions cannot go back runs no drafts.)
-                let draft = draft.filter(|_| model.can_rollback());
+                // (A device whose sessions cannot go back, or that sends the drafts' captured
+                // passes to the CPU, runs no drafts.)
+                let draft = draft.filter(|_| model.can_draft());
                 let lm = match draft {
                     Some(d) => {
                         let dr = load_dspark(&mut arena, &d, c.hidden_size, c.vocab_size, model.quant)?;

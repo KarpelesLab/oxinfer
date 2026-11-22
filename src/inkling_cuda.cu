@@ -1109,9 +1109,12 @@ extern "C" __global__ void add_k(float* x, const float* a, u32 n) {
 }
 
 // The causal depthwise convolution with a skip, in place over x ([t, ch]): a thread per channel
-// walks the tokens in order with the last k - 1 inputs in registers; `hist` ([k - 1][ch], oldest
-// first) holds them between passes. `dyn` ([t][groups * k]): per-token taps added to channel c's
-// (group c / (ch / groups)).
+// walks the tokens in order with the last k - 1 inputs in registers. `hist` is the ring of the
+// recent inputs by position, as the host's `ConvRing`: `cap` (= k - 1 + 64) rows, the input of
+// position p (>= -(k - 1); zeros before the first token) in row (p + k - 1) % cap, so that a
+// session going back up to 64 positions still finds the k - 1 inputs before its new position.
+// The pass's first position is info[0]. `dyn` ([t][groups * k]): per-token taps added to channel
+// c's (group c / (ch / groups)).
 struct ConvJob {
     float* x;
     float* hist;
@@ -1122,7 +1125,11 @@ struct ConvJobs {
     ConvJob j[2];
     u32 ch, k, t, groups;
     float norm;
+    u32 cap;
+    const int* info;
 };
+// The ring row of position p (p >= -(k - 1)).
+__device__ __forceinline__ u64 ring_row(long long p, u32 k, u32 cap) { return (u64)((p + (long long)(k - 1)) % (long long)cap); }
 extern "C" __global__ void sconv(ConvJobs P) {
     const ConvJob& J = P.j[blockIdx.y];
     float* x = J.x;
@@ -1133,8 +1140,9 @@ extern "C" __global__ void sconv(ConvJobs P) {
     float norm = P.norm;
     u32 c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= ch) return;
+    long long pos = P.info[0];
     float win[8];
-    for (u32 i = 0; i + 1 < k; i++) win[i] = hist[(u64)i * ch + c];
+    for (u32 i = 0; i + 1 < k; i++) win[i] = hist[ring_row(pos - (long long)(k - 1) + i, k, P.cap) * ch + c];
     float tp[8];
     for (u32 l = 0; l < k; l++) tp[l] = taps[(u64)l * ch + c];
     u32 grp = dyn ? c / (ch / groups) : 0;
@@ -1146,12 +1154,13 @@ extern "C" __global__ void sconv(ConvJobs P) {
         x[(u64)ti * ch + c] = acc * norm;
         for (u32 i = 0; i + 2 < k; i++) win[i] = win[i + 1];
         if (k > 1) win[k - 2] = cur;
+        // (The rows read above were read first; a pass longer than the ring keeps its last rows.)
+        hist[ring_row(pos + ti, k, P.cap) * ch + c] = cur;
     }
-    for (u32 i = 0; i + 1 < k; i++) hist[(u64)i * ch + c] = win[i];
 }
 
-// Prefill convolutions, a thread per (channel, token), out of place into y; `sconv_fin` then
-// copies y back and moves the history on.
+// Prefill convolutions, a thread per (channel, token), out of place into y; `sconv_hist` then
+// writes the pass's inputs to the ring (and y is copied back over x).
 extern "C" __global__ void sconv_par(ConvJobs P, float* y0, float* y1) {
     const ConvJob& J = P.j[blockIdx.z];
     float* y = blockIdx.z ? y1 : y0;
@@ -1164,24 +1173,20 @@ extern "C" __global__ void sconv_par(ConvJobs P, float* y0, float* y1) {
     for (u32 l = 0; l < k; l++) {
         // Input ti - l: x, or the history before x (oldest first).
         int src = (int)ti - (int)l;
-        float v = src >= 0 ? J.x[(u64)src * ch + c] : J.hist[(u64)((int)k - 1 + src) * ch + c];
+        float v = src >= 0 ? J.x[(u64)src * ch + c] : J.hist[ring_row((long long)P.info[0] + src, k, P.cap) * ch + c];
         acc += (J.taps[(u64)l * ch + c] + (dr ? dr[l] : 0.f)) * v;
     }
     y[(u64)ti * ch + c] = acc * P.norm;
 }
-// After `sconv_par` (and before y is copied over x): the history becomes the last k - 1 inputs,
-// from x where it has them, else from the old history.
+// After `sconv_par` (which read the ring's rows before the pass) and before y is copied over x:
+// the pass's inputs into the ring (its last `cap` when it is longer).
 extern "C" __global__ void sconv_hist(ConvJobs P) {
     const ConvJob& J = P.j[blockIdx.z];
     u32 ch = P.ch, k = P.k, t = P.t;
     u32 i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= ch) return;
-    float w[8];
-    for (u32 q = 0; q + 1 < k; q++) {
-        int src = (int)t - (int)(k - 1) + (int)q;
-        w[q] = src >= 0 ? J.x[(u64)src * ch + i] : J.hist[(u64)((int)k - 1 + src) * ch + i];
-    }
-    for (u32 q = 0; q + 1 < k; q++) J.hist[(u64)q * ch + i] = w[q];
+    long long pos = P.info[0];
+    for (u32 ti = t > P.cap ? t - P.cap : 0; ti < t; ti++) J.hist[ring_row(pos + ti, k, P.cap) * ch + i] = J.x[(u64)ti * ch + i];
 }
 
 // Per-vector post-processing of n-value vectors (a warp each; nv per token, rows `stride` apart):
