@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.15](https://github.com/KarpelesLab/oxinfer/compare/v0.0.14...v0.0.15) - 2026-11-22
+
+### Other
+
+- Merge remote-tracking branch 'origin/master'
+- Merge inkling-cuda-rollback: CUDA rollback from the Metal side, joined with the CUDA engine's
+- where a decode step's time goes now, what moved it and what did not (serial encoder, staging, fusions); Not done
+- Inkling-2 CUDA: sessions go back, exact passes of up to 16 tokens, captured streams for drafts
+- Inkling-2 Metal: the one-threadgroup kernels without latency chains; the message gates in fewer, wider kernels
+- Inkling-2 on CUDA: sessions go back (prompt lookup on CUDA), convolution histories as rings
+- Inkling-2 Metal: the one-threadgroup kernels without latency chains; the message gates in fewer, wider kernels
+- torch_rng test: bit for bit on macOS, within 2 ulps elsewhere
+- Inkling-2 CUDA: tiled prefill attention, gate projections per token, NaN-proof routing, sessions that outgrow the device go back to the host
+- Inkling-2 Metal: the routed experts' gate / up LoRA updates on the GPU
+- Inkling-2 Metal: a stage profiler, NVFP4 without table lookups, one expert output per SIMD-group
+- Inkling-2 Metal: the LoRA factors through master's LoraDelta::links / factors and Lin::lora_delta
+- Inkling-2-Mini's drafter on Metal: a whole draft pass in one submission
+- Inkling-2 on Metal: whole decode and prefill passes on the GPU, rollback, speculative decoding, LoRA
+- H.264 with CABAC, one encoder per second in parallel; WebM with its Duration and playable in Chrome; AAC from MP4 decodes
+- CPU timings with the DMD2 and FameGrid LoRAs on a quieter machine
+- speed after whole-pass Metal plans (before / after, CPU with LoRAs), verification rows, Base / SFT
+- split float32 layers as one float32 convolution on Metal (conv_f32); moss_check single-branch reps
+- whole transformer passes on Metal, ConvRot quants, single-file VAEs, Base / SFT, PyTorch noise
+- LoRA merges into the GGUF block types, the ggml quantizers against llama.cpp
+- ggml block quantizers; LoRA merges keep GGUF weights in their own type
+- GPU side paths in the Metal / CUDA decode and prefill plans (Qwen, Gemma, per-expert MoE), MTP-layer adapters
+- Inkling-2 CUDA: prefill GEMMs within ~5e-8 of f32, parallel convolutions, gates as GEMMs
+- DevSession::as_any is used by the CUDA path only (no dead-code error elsewhere)
+- Inkling-2 on CUDA: whole decode steps and whole prefill passes on the GPU
+- Video as MP4 (H.264 + AAC) through oxideav by default; WebM (VP9 + Opus) and AVI on request
+- Web GUI: MOSS-Image presets on the Image page and in the catalog; plan and download take a preset id
+- ZONOS3 / Drama 3 listed as speech models before they load; a steadier video cancel test
+- the page title without .localdomain; models without a probed config file are counted from their cache folder
+- rebuilt with the accelerator panel, the update banner, voice chat and video
+- Web GUI: tell when a newer oxinfer release is out, one-click update and restart
+- Models page and --models: which accelerators this machine has and which one each model uses
+- end-to-end video test on the tiny MiniMax-H3; Haru turns end on silence; LFM3-Omni codec fetch
+- :tiny: tiny random MiniMax-H3 and MiniMax-H3-Image releases for end-to-end tests
+- video jobs, spoken replies, SD3 / H3-Image, image progress, voices; GUI pages
+- :tiny: run the test on the CPU, so the test process does not settle on Metal
+- a tiny random SD 3.5 diffusers folder for end-to-end tests
+- LoRA adapters (PEFT and GGUF), verification; catalog: AtomicChat/Inkling-2-Mini-GGUF with the Uncensored LoRA at run time
+- llama.cpp GGUF adapters, user adapters on Qwen / Llama / Gemma / Inkling-2
+- AtomicChat/Inkling-2-Mini-Uncensored-GGUF (AD-Q4_K, AD-IQ3_S, AD-IQ2_M)
+
 ## [0.0.14](https://github.com/KarpelesLab/oxinfer/compare/v0.0.13...v0.0.14) - 2026-11-21
 
 ### Other
