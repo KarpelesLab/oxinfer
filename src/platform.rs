@@ -474,13 +474,17 @@ pub mod gpu {
                     unsafe { cu.cuDeviceGetAttribute(&mut minor, 76, d) };
                     cc = format!(", compute capability {major}.{minor}");
                 }
+                // CU_DEVICE_ATTRIBUTE_INTEGRATED: the device shares the system's memory (Jetson,
+                // DGX Spark), and its total is the system's.
+                let mut integrated = 0;
+                let unified = unsafe { cu.cuDeviceGetAttribute(&mut integrated, 18, d) } == Some(0) && integrated != 0;
                 out.push(GpuInfo {
                     kind: GpuKind::Cuda,
                     index: d as usize,
                     name: cstr(name.as_ptr()),
                     memory_bytes: Some(mem as u64),
                     driver: format!("CUDA driver {}.{}{cc}", ver / 1000, (ver % 1000) / 10),
-                    unified_memory: false,
+                    unified_memory: unified,
                 });
             }
             Ok(out)

@@ -28,6 +28,23 @@ const MIN_T: usize = 32;
 const MIN_FLOPS: f64 = 1e9;
 const VRAM_RESERVE: usize = 512 << 20;
 
+/// Whether the device in use shares the system's memory (`CU_DEVICE_ATTRIBUTE_INTEGRATED`: Jetson,
+/// DGX Spark). Set when a backend opens its device.
+static INTEGRATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The memory an allocation on the device can still take, from what `cuMemGetInfo` gave. On an
+/// integrated device the driver reports the system's free pages (`MemFree`, measured on a DGX
+/// Spark), which leaves out the page cache the kernel gives back on demand: the files a model was
+/// just read from would count against it. There the system's available memory is the figure,
+/// when it is larger.
+pub(crate) fn usable_free(free: usize, total: usize) -> usize {
+    if !INTEGRATED.load(Ordering::Relaxed) {
+        return free;
+    }
+    let avail = crate::platform::available_memory().map_or(0, |a| a.min(total as u64) as usize);
+    free.max(avail)
+}
+
 dlsym::library! {
     pub struct Cu {
         unsafe extern "C" {
@@ -650,6 +667,11 @@ impl CudaBackend {
             cu.cuDeviceGetAttribute(&mut major, 75, dev); // COMPUTE_CAPABILITY_MAJOR
             cu.cuDeviceGetAttribute(&mut minor, 76, dev);
         }
+        let mut integrated = 0;
+        // CU_DEVICE_ATTRIBUTE_INTEGRATED
+        if unsafe { cu.cuDeviceGetAttribute(&mut integrated, 18, dev) } == 0 {
+            INTEGRATED.store(integrated != 0, Ordering::Relaxed);
+        }
         let mut ctx: *mut c_void = std::ptr::null_mut();
         check(
             &cu,
@@ -730,7 +752,7 @@ impl CudaBackend {
     fn upload_bytes(&self, ptr: *const u8, bytes: usize) -> Option<u64> {
         let (mut free, mut total) = (0usize, 0usize);
         unsafe { self.cu.cuMemGetInfo_v2(&mut free, &mut total) };
-        if free < bytes + VRAM_RESERVE {
+        if usable_free(free, total) < bytes + VRAM_RESERVE {
             return None;
         }
         let mut d = 0u64;
@@ -1503,7 +1525,7 @@ impl Backend for CudaBackend {
             return None;
         }
         let (mut free, mut total) = (0usize, 0usize);
-        (unsafe { self.cu.cuMemGetInfo_v2(&mut free, &mut total) } == 0).then_some((free as u64, total as u64))
+        (unsafe { self.cu.cuMemGetInfo_v2(&mut free, &mut total) } == 0).then(|| (usable_free(free, total) as u64, total as u64))
     }
 
     fn stats(&self) -> Option<String> {

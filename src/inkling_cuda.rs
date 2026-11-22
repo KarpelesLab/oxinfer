@@ -840,6 +840,7 @@ impl Engine {
         };
         let (mut free, mut tot) = (0usize, 0usize);
         unsafe { e.x.cuMemGetInfo_v2(&mut free, &mut tot) };
+        let free = crate::cuda::usable_free(free, tot);
         let arena_bytes = Self::arena_bytes(m);
         if free < total + arena_bytes + RESERVE {
             debug(&format!(
@@ -2094,6 +2095,7 @@ impl Engine {
         }
         let (mut free, mut tot) = (0usize, 0usize);
         unsafe { self.x.cuMemGetInfo_v2(&mut free, &mut tot) };
+        let free = crate::cuda::usable_free(free, tot);
         if free < n + SESS_RESERVE {
             return None;
         }

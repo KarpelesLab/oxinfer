@@ -695,7 +695,7 @@ impl Engine {
     fn free_mem(&self) -> usize {
         let (mut free, mut total) = (0usize, 0usize);
         unsafe { self.x.cuMemGetInfo_v2(&mut free, &mut total) };
-        free
+        crate::cuda::usable_free(free, total)
     }
 
     fn htod(&self, dst: u64, src: &[u8]) -> bool {
