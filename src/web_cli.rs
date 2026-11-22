@@ -14,6 +14,12 @@ http://HOST:PORT/, the OpenAI-compatible API at /v1 (/v1/models, /v1/chat/comple
 /v1/messages. `oxinfer web` also opens the GUI in the browser; `oxinfer serve` does not\n\
 (--open / --no-open change that). Models picked in the GUI join the API's model list.\n\
 \n\
+Requests may also name models not listed: a repo id (org/name, org/name:QUANT) or a preset of the\n\
+catalog is fetched when it is not in the cache (if it fits on the disk and in --memory-gb), loaded\n\
+and run, within the request (--no-auto-models: listed models only). Loaded models are unloaded\n\
+after --idle-unload minutes unused, when another load needs their memory (RAM or GPU), and while\n\
+the system runs short of memory.\n\
+\n\
 --model SOURCE lists a model from the start: SOURCE is a local directory or file, a repo id\n\
 (org/name, fetched on first use) or org/name:QUANT (a GGUF file of the repo); ID is the name\n\
 clients use (default: SOURCE). Model options: the engine's (quant, device, mmap, stream,\n\
@@ -38,6 +44,8 @@ options:\n\
 \x20 --download            fetch every listed model at start\n\
 \x20 --memory-gb N         memory for loaded models together; least recently used ones are\n\
 \x20                       unloaded to make room (default 80% of RAM)\n\
+\x20 --idle-unload MIN     unload models unused for MIN minutes (default 30; 0: never)\n\
+\x20 --no-auto-models      only the listed models (and those loaded in the GUI) can be requested\n\
 \x20 --cache-dir DIR       where repo ids are fetched to\n\
 \x20 --prompt-cache DIR    keep chat models' session snapshots in DIR (auto:\n\
 \x20                       ~/.cache/oxinfer/prompt-cache) across requests and restarts\n\

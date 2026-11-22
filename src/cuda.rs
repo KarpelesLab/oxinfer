@@ -378,6 +378,8 @@ struct MoeDev {
     /// Transient copies (`upload_moe_transient`): freed with this state, with the context to
     /// make current for that. Resident ones live in the shared cache.
     owner: Option<(std::sync::Arc<Cu>, *mut c_void)>,
+    /// Resident ones: this state's references to the shared cache (freed with the last one).
+    _refs: Option<CacheRefs>,
 }
 unsafe impl Send for MoeDev {}
 unsafe impl Sync for MoeDev {}
@@ -408,6 +410,46 @@ struct Stats {
     copy_out_ns: AtomicU64,
 }
 
+type WKey = (usize, usize, u64);
+/// The shared weights by key, with the number of references to each.
+type WCache = std::sync::Arc<Mutex<std::collections::HashMap<WKey, (CudaWeight, usize)>>>;
+
+/// References to weights of the backend's shared cache: released on drop, each weight freed with
+/// its last reference.
+struct CacheRefs {
+    cache: WCache,
+    cu: std::sync::Arc<Cu>,
+    ctx: *mut c_void,
+    keys: Vec<WKey>,
+}
+// SAFETY: the context pointer is only made current; the cache is behind its lock.
+unsafe impl Send for CacheRefs {}
+unsafe impl Sync for CacheRefs {}
+
+impl Drop for CacheRefs {
+    fn drop(&mut self) {
+        if self.keys.is_empty() {
+            return;
+        }
+        let mut c = self.cache.lock().unwrap_or_else(|p| p.into_inner());
+        let current = unsafe { self.cu.cuCtxSetCurrent(self.ctx) } == 0;
+        for k in &self.keys {
+            let Some(e) = c.get_mut(k) else { continue };
+            e.1 -= 1;
+            if e.1 == 0 {
+                let (cw, _) = c.remove(k).unwrap();
+                if current {
+                    for p in [cw.data, cw.scales, cw.offsets] {
+                        if p != 0 {
+                            unsafe { self.cu.cuMemFree_v2(p) };
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub struct CudaBackend {
     /// Shared with per-session decode state, which frees its buffers on drop.
     cu: std::sync::Arc<Cu>,
@@ -415,8 +457,8 @@ pub struct CudaBackend {
     ctx: *mut c_void,
     module: *mut c_void,
     /// Expert weights by host address and length: uploaded once, shared by the prefill MoE path
-    /// and decode plans (never freed, like the other device weights).
-    wcache: Mutex<std::collections::HashMap<(usize, usize, u64), CudaWeight>>,
+    /// and decode plans, freed with the last [`CacheRefs`] holding them (the model's unload).
+    wcache: WCache,
     /// bf16, q8, q4
     funcs: [*mut c_void; 3],
     /// GEMM over affine Q4 weights.
@@ -523,7 +565,7 @@ impl CudaBackend {
             cu: std::sync::Arc::new(cu),
             ctx,
             module,
-            wcache: Mutex::new(std::collections::HashMap::new()),
+            wcache: Default::default(),
             funcs,
             func_q4a,
             conv_funcs,
@@ -672,44 +714,45 @@ impl CudaBackend {
         (unsafe { self.cu.cuModuleGetFunction(&mut f, self.module, c.as_ptr()) } == 0).then_some(f)
     }
 
-    /// [`Self::upload_weight`] through the cache of shared weights; the flag tells whether this
-    /// call uploaded it.
-    fn upload_cached(&self, w: &WeightRef) -> Option<(CudaWeight, bool)> {
-        let key = weight_key(w)?;
-        if let Some(cw) = self.wcache.lock().unwrap().get(&key) {
-            return Some((*cw, false));
+    /// No references yet to the shared cache.
+    fn cache_refs(&self) -> CacheRefs {
+        CacheRefs {
+            cache: self.wcache.clone(),
+            cu: self.cu.clone(),
+            ctx: self.ctx,
+            keys: Vec::new(),
         }
-        let cw = self.upload_weight(w)?;
-        self.wcache.lock().unwrap().insert(key, cw);
-        Some((cw, true))
+    }
+
+    /// [`Self::upload_weight`] through the cache of shared weights, the reference counted in `refs`.
+    fn upload_cached(&self, w: &WeightRef, refs: &mut CacheRefs) -> Option<CudaWeight> {
+        let key = weight_key(w)?;
+        let mut c = self.wcache.lock().unwrap_or_else(|p| p.into_inner());
+        let cw = match c.get_mut(&key) {
+            Some(e) => {
+                e.1 += 1;
+                e.0
+            }
+            None => {
+                let cw = self.upload_weight(w)?;
+                c.insert(key, (cw, 1));
+                cw
+            }
+        };
+        refs.keys.push(key);
+        Some(cw)
     }
 
     /// Every weight of `groups` through the cache, or none: what this call uploaded is freed again
-    /// when one does not fit.
-    fn upload_all(&self, groups: &[&[WeightRef]]) -> Option<Vec<Vec<CudaWeight>>> {
+    /// when one does not fit (the references are dropped).
+    fn upload_all(&self, groups: &[&[WeightRef]]) -> Option<(Vec<Vec<CudaWeight>>, CacheRefs)> {
+        let mut refs = self.cache_refs();
         let mut out: Vec<Vec<CudaWeight>> = Vec::with_capacity(groups.len());
-        let mut new: Vec<(&WeightRef, CudaWeight)> = Vec::new();
         for ws in groups {
-            let mut v = Vec::with_capacity(ws.len());
-            for w in ws.iter() {
-                match self.upload_cached(w) {
-                    Some((cw, fresh)) => {
-                        if fresh {
-                            new.push((w, cw));
-                        }
-                        v.push(cw);
-                    }
-                    None => {
-                        for (w, cw) in &new {
-                            self.forget_cached(w, cw);
-                        }
-                        return None;
-                    }
-                }
-            }
+            let v = ws.iter().map(|w| self.upload_cached(w, &mut refs)).collect::<Option<Vec<_>>>()?;
             out.push(v);
         }
-        Some(out)
+        Some((out, refs))
     }
 
     /// `upload_moe` (`resident`: through the shared cache, kept) or `upload_moe_transient` (owned
@@ -744,12 +787,13 @@ impl CudaBackend {
         // All experts or none (VRAM): a partial upload is freed again.
         let mut groups: Vec<&[WeightRef]> = vec![gate_up, down];
         groups.extend(up);
-        let mut all = if resident {
-            self.upload_all(&groups)?
+        let (all, refs) = if resident {
+            let (a, r) = self.upload_all(&groups)?;
+            (a, Some(r))
         } else {
-            self.upload_owned(&groups)?
-        }
-        .into_iter();
+            (self.upload_owned(&groups)?, None)
+        };
+        let mut all = all.into_iter();
         let (gu, dw) = (all.next()?, all.next()?);
         let upw = all.next();
         Some(Box::new(MoeDev {
@@ -759,6 +803,7 @@ impl CudaBackend {
             funcs,
             act,
             owner: (!resident).then(|| (self.cu.clone(), self.ctx)),
+            _refs: refs,
         }))
     }
     #[allow(clippy::too_many_arguments)]
@@ -951,13 +996,6 @@ impl CudaBackend {
             out.push(v);
         }
         Some(out)
-    }
-
-    /// Drops a weight [`Self::upload_cached`] just uploaded.
-    fn forget_cached(&self, w: &WeightRef, cw: &CudaWeight) {
-        let Some(key) = weight_key(w) else { return };
-        self.wcache.lock().unwrap().remove(&key);
-        self.free_weight(cw);
     }
 
     fn free_weight(&self, cw: &CudaWeight) {
@@ -1191,10 +1229,23 @@ fn check(cu: &Cu, rc: c_int, what: &str) -> Result<()> {
     Err(anyhow!("{what}: {text}"))
 }
 
-/// Device weights are never freed individually: a model's layers live as long as the process.
-struct CudaWeightBox(CudaWeight);
+/// A device weight, freed when its model drops it (with the context to make current for that).
+struct CudaWeightBox(CudaWeight, std::sync::Arc<Cu>, *mut c_void);
 unsafe impl Send for CudaWeightBox {}
 unsafe impl Sync for CudaWeightBox {}
+
+impl Drop for CudaWeightBox {
+    fn drop(&mut self) {
+        if unsafe { self.1.cuCtxSetCurrent(self.2) } != 0 {
+            return;
+        }
+        for p in [self.0.data, self.0.scales, self.0.offsets] {
+            if p != 0 {
+                unsafe { self.1.cuMemFree_v2(p) };
+            }
+        }
+    }
+}
 
 impl Backend for CudaBackend {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
@@ -1202,6 +1253,14 @@ impl Backend for CudaBackend {
     }
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn device_memory(&self) -> Option<(u64, u64)> {
+        if !self.bind() {
+            return None;
+        }
+        let (mut free, mut total) = (0usize, 0usize);
+        (unsafe { self.cu.cuMemGetInfo_v2(&mut free, &mut total) } == 0).then_some((free as u64, total as u64))
     }
 
     fn stats(&self) -> Option<String> {
@@ -1226,7 +1285,7 @@ impl Backend for CudaBackend {
         if !self.bind() {
             return None;
         }
-        Some(Box::new(CudaWeightBox(self.upload_weight(w)?)))
+        Some(Box::new(CudaWeightBox(self.upload_weight(w)?, self.cu.clone(), self.ctx)))
     }
 
     fn conv2d(&self, x: &[f32], g: &crate::gpu::ConvGeom, norm: Option<&crate::gpu::NormSpec>, job: &mut Job) -> bool {

@@ -140,6 +140,10 @@ pub(crate) struct Entry {
     bytes: AtomicU64,
     /// Replaced by a later entry with the same id ([`Registry::add`]): no longer found by id.
     retired: AtomicBool,
+    /// When the model was last used ([`now_ms`]): at the start and the end of each request.
+    used_at: AtomicU64,
+    /// Device memory the model took when it was loaded (0: none, or no discrete GPU).
+    vram: AtomicU64,
 }
 
 impl Entry {
@@ -164,6 +168,8 @@ impl Entry {
             last_used: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             retired: AtomicBool::new(false),
+            used_at: AtomicU64::new(now_ms()),
+            vram: AtomicU64::new(0),
         }
     }
 
@@ -246,6 +252,27 @@ impl Lease<'_> {
     }
 }
 
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        // The idle time counts from the end of the request.
+        self.entry.used_at.store(now_ms(), Ordering::Relaxed);
+    }
+}
+
+/// Milliseconds since the first call (the clock of [`Entry::used_at`]).
+fn now_ms() -> u64 {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// `(free, total)` device memory of the GPU backend, when one is running and has its own.
+fn device_memory() -> Option<(u64, u64)> {
+    crate::gpu::active().and_then(|b| b.device_memory())
+}
+
+/// Device memory kept free beside a model being loaded (its activations, caches).
+const VRAM_SPARE: u64 = 1 << 30;
+
 /// Server-side model keys (not passed to the loaders).
 fn server_key(k: &str) -> bool {
     ModelSpec::KEYS.contains(&k)
@@ -308,10 +335,74 @@ impl Registry {
                 .map_err(|_| ApiError::new(409, format!("{} is in use; try again once its request is done", spec.id)))?;
             *g = None;
             old.bytes.store(0, Ordering::Relaxed);
+            old.vram.store(0, Ordering::Relaxed);
             old.retired.store(true, Ordering::Relaxed);
         }
         entries.push(fresh);
         Ok(true)
+    }
+
+    /// Lists model `id` when a request names it without it being listed
+    /// ([`super::ServerOptions::auto_models`]): a repo id (`org/name`, `org/name:QUANT`) or a
+    /// preset of the catalog, not a local path. When its files are not all on disk, they must fit
+    /// on the cache's disk (with a margin) and the model in the memory budget; the download and
+    /// the load are then those of the request's [`Registry::acquire_with`]. Ok without listing
+    /// anything when `id` is not such a name (the request then fails as for any unknown model).
+    pub fn admit(&self, id: &str) -> ApiResult<()> {
+        if self.find(id).is_ok() || !auto_name(id) {
+            return Ok(());
+        }
+        let spec = ModelSpec::new(id).map_err(|e| ApiError::bad(format!("{e:#}")).param("model"))?;
+        let cache = self.cache_dir.as_deref();
+        let gb = |b: u64| b as f64 / 1e9;
+        let mut mem = estimate(&spec, cache);
+        if local_path(&spec.source, cache).is_none() {
+            #[cfg(not(feature = "hf"))]
+            return Ok(());
+            #[cfg(feature = "hf")]
+            {
+                let p = crate::hf::plan(&spec.source, cache).map_err(|e| {
+                    ApiError::new(404, format!("the model {id:?} is not listed, and cannot be fetched: {e:#}"))
+                        .param("model")
+                        .code("model_not_found")
+                })?;
+                if let Some((free, total)) = crate::model_cache::disk_space(cache) {
+                    let margin = (total / 100).max(1 << 30);
+                    if p.missing().saturating_add(margin) > free {
+                        return Err(ApiError::new(
+                            507,
+                            format!(
+                                "{id}: {:.1} GB to download, {:.1} GB free on the model cache's disk (keeping {:.1} GB)",
+                                gb(p.missing()),
+                                gb(free),
+                                gb(margin)
+                            ),
+                        )
+                        .param("model")
+                        .code("insufficient_storage"));
+                    }
+                }
+                mem = mem.max(p.total());
+            }
+        }
+        if let Some(budget) = self.budget
+            && mem > budget
+        {
+            return Err(ApiError::new(
+                507,
+                format!(
+                    "{id} takes about {:.1} GB of memory; the loaded models may take {:.1} GB together (--memory-gb)",
+                    gb(mem),
+                    gb(budget)
+                ),
+            )
+            .param("model")
+            .code("insufficient_memory"));
+        }
+        if self.add(spec)? && self.log {
+            eprintln!("[listed {id} on request (~{:.1} GB)]", gb(mem));
+        }
+        Ok(())
     }
 
     /// Unloads model `id` now: false when it was not loaded, a 409 while a request uses it.
@@ -323,6 +414,7 @@ impl Registry {
             .map_err(|_| ApiError::new(409, format!("{id} is in use; try again once its request is done")))?;
         let was = g.take().is_some();
         e.bytes.store(0, Ordering::Relaxed);
+        e.vram.store(0, Ordering::Relaxed);
         if was && self.log {
             eprintln!("[unloaded {id}]");
         }
@@ -483,6 +575,7 @@ impl Registry {
             return Err(wrong_kind(id, kind, want));
         }
         entry.last_used.store(self.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+        entry.used_at.store(now_ms(), Ordering::Relaxed);
         Ok(Lease { entry, guard })
     }
 
@@ -526,6 +619,7 @@ impl Registry {
                 *g = Some(self.load(e, kind, image).with_context(|| format!("load {}", e.spec.id))?);
             }
             e.last_used.store(self.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+            e.used_at.store(now_ms(), Ordering::Relaxed);
         }
         Ok(())
     }
@@ -536,31 +630,83 @@ impl Registry {
         self.make_room(None, need);
     }
 
-    fn make_room(&self, except: Option<&Entry>, need: u64) {
+    /// Unloads idle models, least recently used first, until `need` more bytes fit: in the
+    /// budget, in the memory the system can still give (keeping its reserve, see
+    /// [`crate::platform::memory_headroom`]) and, for `gpu`, in the GPU's free memory (only
+    /// models that took some of it are unloaded for that). `u64::MAX`: all of them.
+    fn make_room_for(&self, except: Option<&Entry>, need: u64, gpu: bool) {
         let budget = self.budget.unwrap_or(u64::MAX);
         let mut tried: Vec<*const Entry> = Vec::new();
         let entries = self.all();
         loop {
             let used: u64 = entries.iter().map(|e| e.bytes.load(Ordering::Relaxed)).sum();
-            if need != u64::MAX && used.saturating_add(need) <= budget {
+            let all = need == u64::MAX;
+            let over_budget = all || used.saturating_add(need) > budget;
+            let short_ram = !all && crate::platform::memory_headroom().is_some_and(|h| h < need);
+            // On the GPU: what the model can put there (at most the device, less a spare).
+            let short_vram =
+                !all && gpu && device_memory().is_some_and(|(free, total)| free < need.min(total.saturating_sub(VRAM_SPARE)) + VRAM_SPARE);
+            if !over_budget && !short_ram && !short_vram {
                 return;
             }
             let victim = entries
                 .iter()
                 .copied()
                 .filter(|e| e.bytes.load(Ordering::Relaxed) > 0)
+                .filter(|e| over_budget || short_ram || e.vram.load(Ordering::Relaxed) > 0)
                 .filter(|e| except.is_none_or(|x| !std::ptr::eq(*e, x)) && !tried.contains(&(*e as *const Entry)))
                 .min_by_key(|e| e.last_used.load(Ordering::Relaxed));
             let Some(v) = victim else { return };
             tried.push(v as *const Entry);
-            // A model in use is not unloaded.
-            if let Ok(mut g) = v.slot.try_lock()
-                && g.is_some()
-            {
-                *g = None;
-                let b = v.bytes.swap(0, Ordering::Relaxed);
-                if self.log {
-                    eprintln!("[unloaded {} ({:.1} GB) to make room]", v.spec.id, b as f64 / 1e9);
+            let why = if over_budget {
+                "to make room"
+            } else if short_ram {
+                "to make room in memory"
+            } else {
+                "to make room on the GPU"
+            };
+            self.drop_model(v, why);
+        }
+    }
+
+    fn make_room(&self, except: Option<&Entry>, need: u64) {
+        self.make_room_for(except, need, false);
+    }
+
+    /// Unloads `e` unless a request uses it (true when it did).
+    fn drop_model(&self, e: &Entry, why: &str) -> bool {
+        let Ok(mut g) = e.slot.try_lock() else { return false };
+        if g.take().is_none() {
+            return false;
+        }
+        let b = e.bytes.swap(0, Ordering::Relaxed);
+        e.vram.store(0, Ordering::Relaxed);
+        if self.log {
+            eprintln!("[unloaded {} ({:.1} GB) {why}]", e.spec.id, b as f64 / 1e9);
+        }
+        true
+    }
+
+    /// The background upkeep ([`super::Api`] runs it every few seconds): unloads the models idle
+    /// for `idle` or longer, and while the system is short of memory (below its reserve, other
+    /// programs' demand included), the least recently used idle model.
+    pub fn sweep(&self, idle: Option<std::time::Duration>) {
+        let now = now_ms();
+        let loaded = || self.all().into_iter().filter(|e| e.bytes.load(Ordering::Relaxed) > 0);
+        if let Some(idle) = idle {
+            for e in loaded() {
+                let since = now.saturating_sub(e.used_at.load(Ordering::Relaxed));
+                if since >= idle.as_millis() as u64 && !e.busy() {
+                    self.drop_model(e, &format!("after {} idle", minutes(since)));
+                }
+            }
+        }
+        if crate::platform::memory_headroom() == Some(0) {
+            let mut idle: Vec<&Entry> = loaded().filter(|e| !e.busy()).collect();
+            idle.sort_by_key(|e| e.last_used.load(Ordering::Relaxed));
+            for e in idle {
+                if self.drop_model(e, "(the system is short of memory)") {
+                    break;
                 }
             }
         }
@@ -625,7 +771,11 @@ impl Registry {
             None => estimate(spec, self.cache_dir.as_deref()),
         };
         let budget = self.budget.unwrap_or(u64::MAX);
-        self.make_room(Some(e), est.min(budget));
+        // Chat models go to the GPU unless told otherwise; the device memory they take is
+        // measured around the load.
+        let gpu = kind == Kind::Chat && spec.option("device").is_none_or(|d| !d.eq_ignore_ascii_case("cpu"));
+        self.make_room_for(Some(e), est.min(budget), gpu);
+        let vram_before = device_memory();
         if self.log {
             eprintln!("[loading {} ({}, ~{:.1} GB)]", spec.id, kind.as_str(), est as f64 / 1e9);
         }
@@ -746,6 +896,13 @@ impl Registry {
             None => estimate(spec, self.cache_dir.as_deref()),
         };
         e.bytes.store(est.clamp(1, budget), Ordering::Relaxed);
+        let vram = match (vram_before, device_memory()) {
+            (Some((before, _)), Some((after, _))) => before.saturating_sub(after),
+            // The GPU started with this load.
+            (None, Some((after, total))) => total.saturating_sub(after),
+            _ => 0,
+        };
+        e.vram.store(vram, Ordering::Relaxed);
         crate::model_cache::touch(src, self.cache_dir.as_deref());
         if self.log {
             eprintln!("[loaded {} in {:.1}s]", spec.id, t0.elapsed().as_secs_f64());
@@ -840,6 +997,36 @@ fn load_image(ik: ImageKind, src: &str, opts: &[(&str, &str)], cache_dir: Option
 fn load_video(src: &str, opts: &[(&str, &str)], cache_dir: Option<&Path>) -> Result<VideoModel> {
     let (pipe, steps) = crate::minimax_h3::video::load_with_options(src, opts, cache_dir)?;
     Ok(VideoModel { pipe, steps })
+}
+
+/// Whether a model name a request gives may be listed on request ([`Registry::admit`]): a repo
+/// id (`org/name`, `org/name:QUANT`) or a preset of the catalog; never a path.
+fn auto_name(id: &str) -> bool {
+    if crate::advisor::preset(id).is_some() {
+        return true;
+    }
+    let repo = id.split_once(':').map_or(id, |(r, _)| r);
+    let parts: Vec<&str> = repo.split('/').collect();
+    parts.len() == 2
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && !p.starts_with('.') && p.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)))
+        && id
+            .split_once(':')
+            .is_none_or(|(_, q)| !q.is_empty() && q.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)))
+        && !Path::new(id).exists()
+}
+
+/// `40 s`, `12 min`, `1.5 h`.
+fn minutes(ms: u64) -> String {
+    let m = ms as f64 / 60e3;
+    if m < 1.0 {
+        format!("{:.0} s", ms as f64 / 1e3)
+    } else if m < 90.0 {
+        format!("{m:.0} min")
+    } else {
+        format!("{:.1} h", m / 60.0)
+    }
 }
 
 fn wrong_kind(id: &str, kind: Kind, want: Kind) -> ApiError {

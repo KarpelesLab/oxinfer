@@ -327,7 +327,7 @@ fn str_field<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a str> {
 }
 
 /// The host part of a `Host` header or of an origin's authority (`[::1]:8080` gives `::1`).
-fn host_name(authority: &str) -> &str {
+pub(crate) fn host_name(authority: &str) -> &str {
     let a = authority.trim();
     if let Some(rest) = a.strip_prefix('[') {
         return rest.split(']').next().unwrap_or_default();
@@ -337,7 +337,7 @@ fn host_name(authority: &str) -> &str {
         .map_or(a, |(h, _)| h)
 }
 
-fn loopback_name(host: &str) -> bool {
+pub(crate) fn loopback_name(host: &str) -> bool {
     let h = host.to_ascii_lowercase();
     h == "localhost" || h.ends_with(".localhost") || h.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }

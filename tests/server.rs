@@ -1744,3 +1744,98 @@ fn video_jobs_with_a_tiny_minimax_h3() {
     s.stop().unwrap();
     std::fs::remove_dir_all(&base).ok();
 }
+
+/// Models a request names without them being listed (`auto_models`): a repo in the cache joins
+/// the list; not without `auto_models`, not for another site's page, not past the memory budget.
+#[test]
+fn auto_models_admission() {
+    let base = std::env::temp_dir().join(format!("oxinfer-auto-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let m = base.join("hub/org--model");
+    std::fs::create_dir_all(&m).unwrap();
+    std::fs::write(m.join("config.json"), r#"{"model_type": "bert"}"#).unwrap();
+    std::fs::write(m.join("modules.json"), "[]").unwrap();
+    // Over 1 MB: counted as weights.
+    std::fs::write(m.join("model.safetensors"), vec![0u8; 3 << 20]).unwrap();
+    let cache = format!("cache_dir={}", base.join("hub").display());
+    let embed = json!({"model": "org/model", "input": "hi"}).to_string();
+    let ids = |a: SocketAddr| -> Vec<String> {
+        let (_, body) = request(a, "GET", "/v1/models", "");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let off = serve(&cache);
+    let (st, body) = request(off.addr(), "POST", "/v1/embeddings", &embed);
+    assert_eq!(st, 404, "{body}");
+    off.stop().unwrap();
+
+    let on = serve(&format!("{cache}; auto_models=1"));
+    let a = on.addr();
+    // Another site's page: not listed.
+    let headers = ["Host: localhost", "Origin: http://evil.example", "Content-Type: application/json"];
+    let (st, _) = request_with(a, "POST", "/v1/embeddings", &headers, &embed);
+    assert_eq!(st, 404);
+    // A path is never listed on request.
+    let path = json!({"model": m.display().to_string(), "input": "hi"}).to_string();
+    let (st, _) = request(a, "POST", "/v1/embeddings", &path);
+    assert_eq!(st, 404);
+    assert!(ids(a).is_empty());
+    // The repo in the cache: listed and loaded (its weights are not real: the load fails).
+    let (st, body) = request(a, "POST", "/v1/embeddings", &embed);
+    assert_eq!(st, 500, "{body}");
+    assert!(body.contains("load org/model"), "{body}");
+    assert_eq!(ids(a), ["org/model"]);
+    on.stop().unwrap();
+
+    let small = serve(&format!("{cache}; auto_models=1; memory_gb=0.001"));
+    let (st, body) = request(small.addr(), "POST", "/v1/embeddings", &embed);
+    assert_eq!(st, 507, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).unwrap()["error"]["code"],
+        "insufficient_memory"
+    );
+    assert!(ids(small.addr()).is_empty());
+    small.stop().unwrap();
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// A model fetched and loaded because a request names it, then unloaded once idle.
+#[test]
+#[ignore = "fetches Qwen/Qwen3-0.6B"]
+fn auto_models_fetch_and_idle_unload() {
+    let chat = env("OXINFER_E2E_CHAT", "Qwen/Qwen3-0.6B");
+    // 3 s of idleness (the upkeep looks every 5 s).
+    let s = serve("auto_models=1; idle_unload_min=0.05");
+    let a = s.addr();
+    let req = json!({"model": chat, "messages": [{"role": "user", "content": "Reply with just OK."}], "max_tokens": 20});
+    let (st, body) = request(a, "POST", "/v1/chat/completions", &req.to_string());
+    assert_eq!(st, 200, "{body}");
+    let loaded = || {
+        let (_, body) = request(a, "GET", "/v1/models", "");
+        let v: Value = serde_json::from_str(&body).unwrap();
+        let m = v["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["id"] == chat.as_str())
+            .cloned()
+            .unwrap();
+        m["loaded"].as_bool().unwrap()
+    };
+    assert!(loaded());
+    let t0 = std::time::Instant::now();
+    while loaded() {
+        assert!(t0.elapsed().as_secs() < 30, "still loaded after 30 s");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    // Asked again: loaded again.
+    let (st, body) = request(a, "POST", "/v1/chat/completions", &req.to_string());
+    assert_eq!(st, 200, "{body}");
+    s.stop().unwrap();
+}

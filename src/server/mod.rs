@@ -272,6 +272,18 @@ pub struct ServerOptions {
     /// `http(s)://` URL in the shape of GitHub's release API; default `$OXINFER_UPDATE_FEED`,
     /// else GitHub (see `update::latest_from`). For tests and mirrors.
     pub update_feed: Option<String>,
+    /// Requests may name models that are not listed (key `auto_models`; default off, on for
+    /// `oxinfer serve` / `web`): a repo id (`org/name`, `org/name:QUANT`) or a preset of the
+    /// catalog joins the list, is fetched when its files are not in the cache (if they fit on
+    /// the disk and the model in [`ServerOptions::memory_budget`]; a 507 otherwise) and loaded,
+    /// all within the request. Only where models may be managed: a loopback listener or one with
+    /// an [`ServerOptions::api_key`], and not for cross-site browser requests.
+    pub auto_models: bool,
+    /// Loaded models unused this long are unloaded (key `idle_unload_min`, minutes; default 30,
+    /// `0` never). Idle models are also unloaded, least recently used first, when another load
+    /// needs their memory (the budget, the system's or the GPU's) and while the system runs short
+    /// of memory (other programs' demand included).
+    pub idle_unload: Option<std::time::Duration>,
 }
 
 impl Default for ServerOptions {
@@ -300,6 +312,8 @@ impl Default for ServerOptions {
             thinking_key: None,
             update_check: true,
             update_feed: None,
+            auto_models: false,
+            idle_unload: Some(std::time::Duration::from_secs(30 * 60)),
         }
     }
 }
@@ -338,6 +352,8 @@ impl ServerOptions {
         "thinking_key",
         "update_check",
         "update_feed",
+        "auto_models",
+        "idle_unload_min",
         "config",
     ];
 
@@ -376,6 +392,19 @@ impl ServerOptions {
             "thinking_key" => self.thinking_key = opt_str(value),
             "update_check" => self.update_check = parse_bool(key, value)?,
             "update_feed" => self.update_feed = opt_str(value),
+            "auto_models" => self.auto_models = parse_bool(key, value)?,
+            "idle_unload_min" => {
+                self.idle_unload = match value {
+                    "" | "0" | "off" | "never" | "none" => None,
+                    v => {
+                        let m = num(v)?;
+                        if !(m > 0.0 && m.is_finite()) {
+                            bail!("idle_unload_min: expected minutes > 0 (0 or off: never), got {v:?}");
+                        }
+                        Some(std::time::Duration::from_secs_f64(m * 60.0))
+                    }
+                }
+            }
             "config" => {
                 let text = std::fs::read_to_string(value).with_context(|| format!("config: {value}"))?;
                 let v: Value = serde_json::from_str(&text).with_context(|| format!("config: {value}"))?;
@@ -613,6 +642,7 @@ impl ApiError {
             409 => "conflict_error",
             413 | 400 | 405 | 415 | 422 => "invalid_request_error",
             503 => "service_unavailable",
+            507 => "insufficient_storage",
             _ => "server_error",
         }
     }
@@ -643,6 +673,8 @@ pub struct Api {
     signer: sign::ThinkingSigner,
     /// The video jobs (`/v1/videos`).
     videos: video::Videos,
+    /// The listener is a loopback address.
+    loopback: bool,
 }
 
 impl Api {
@@ -662,6 +694,7 @@ impl Api {
         let budget = opts
             .memory_budget
             .or_else(|| crate::platform::total_memory().map(|m| (m / 10 * 8).min(crate::platform::memory_headroom().unwrap_or(u64::MAX))));
+        let opts_listen = opts.listen.clone();
         let mut models = registry::Registry::new(&opts.models, budget, opts.cache_dir.clone(), opts.log);
         models.prompt_cache = opts.prompt_cache.clone();
         models.prompt_cache_gb = opts.prompt_cache_gb;
@@ -672,6 +705,19 @@ impl Api {
             opts,
             ids: AtomicU64::new(0),
             videos: video::Videos::default(),
+            loopback: std::net::ToSocketAddrs::to_socket_addrs(&opts_listen)
+                .ok()
+                .and_then(|mut a| a.next())
+                .is_some_and(|a| a.ip().is_loopback()),
+        });
+        // The upkeep: idle models out, and models out while the system is short of memory.
+        let weak = Arc::downgrade(&api);
+        let _ = std::thread::Builder::new().name("oxinfer-upkeep".into()).spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let Some(api) = weak.upgrade() else { break };
+                api.models.sweep(api.opts.idle_unload);
+            }
         });
         if api.opts.preload {
             api.models.preload()?;
@@ -779,6 +825,7 @@ impl Api {
         if req.body.len() > self.opts.max_body {
             return Err(ApiError::new(413, format!("request body over {} bytes", self.opts.max_body)));
         }
+        self.admit(req)?;
         let get = req.method.eq_ignore_ascii_case("GET");
         let post = req.method.eq_ignore_ascii_case("POST");
         let wrong_method = || ApiError::new(405, format!("{} is not allowed on {path}", req.method));
@@ -831,6 +878,30 @@ impl Api {
         }
     }
 
+    /// Lists the model the request names when it is not listed and may be
+    /// ([`ServerOptions::auto_models`], [`registry::Registry::admit`]).
+    fn admit(&self, req: &ApiRequest) -> ApiResult<()> {
+        if !self.opts.auto_models || !(self.loopback || self.opts.api_key.is_some()) {
+            return Ok(());
+        }
+        // A page of another site (its own Origin), or one whose name resolves to this loopback
+        // address (DNS rebinding: its own Host), does not fetch models.
+        if let Some(origin) = &req.origin {
+            let authority = origin.split_once("://").map_or(origin.as_str(), |(_, a)| a);
+            if !req.host.as_deref().is_some_and(|h| h.eq_ignore_ascii_case(authority)) {
+                return Ok(());
+            }
+        }
+        if self.loopback
+            && let Some(h) = &req.host
+            && !web::loopback_name(web::host_name(h))
+        {
+            return Ok(());
+        }
+        let Some(id) = requested_model(req) else { return Ok(()) };
+        self.models.admit(&id)
+    }
+
     fn check_auth(&self, req: &ApiRequest) -> ApiResult<()> {
         let Some(key) = &self.opts.api_key else { return Ok(()) };
         let given = req
@@ -866,6 +937,27 @@ impl Api {
             .collect();
         json!({ "object": "list", "data": data })
     }
+}
+
+/// The `model` a request names: its JSON body's, its form's, or its query's.
+fn requested_model(req: &ApiRequest) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct Named {
+        model: Option<String>,
+    }
+    let ct = req.content_type.as_deref().unwrap_or_default();
+    let m = if ct.starts_with("multipart/") {
+        media::multipart(Some(ct), &req.body)
+            .ok()?
+            .into_iter()
+            .find(|p| p.name == "model")
+            .map(|p| p.text())
+    } else if !req.body.is_empty() {
+        serde_json::from_slice::<Named>(&req.body).ok()?.model
+    } else {
+        req.query_param("model")
+    };
+    m.filter(|m| !m.is_empty())
 }
 
 fn json_body(req: &ApiRequest) -> ApiResult<Value> {

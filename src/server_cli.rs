@@ -9,6 +9,8 @@ pub type ExtraFlags<'a> = dyn FnMut(&str, &mut dyn FnMut() -> Result<String>) ->
 /// Parses the options shared by `serve` and `web` into `o` (after its defaults);
 /// `extra` takes the flags of the caller first (true: handled).
 pub fn parse_options(o: &mut ServerOptions, args: &[String], usage: &str, command: &str, extra: &mut ExtraFlags) -> Result<()> {
+    // The command line's server takes the models requests name (the library's default is off).
+    o.set("auto_models", "1")?;
     if let Ok(k) = std::env::var("OXINFER_API_KEY")
         && !k.is_empty()
     {
@@ -40,6 +42,9 @@ pub fn parse_options(o: &mut ServerOptions, args: &[String], usage: &str, comman
             "preload" | "download" | "self-signed" | "local-media" => o.set(&flag.replace('-', "_"), "1")?,
             "no-remote-media" => o.set("remote_media", "0")?,
             "no-update-check" => o.set("update_check", "0")?,
+            "no-auto-models" => o.set("auto_models", "0")?,
+            "auto-models" => o.set("auto_models", "1")?,
+            "idle-unload" => o.set("idle_unload_min", &val()?)?,
             "quiet" | "q" => o.set("log", "0")?,
             f if f.starts_with(|c: char| c.is_ascii_alphabetic()) => {
                 let key = f.replace('-', "_");

@@ -420,6 +420,8 @@ pub(super) struct CudaPlan<'b> {
     last_writer: Vec<Vec<usize>>,
     /// The LoRA strengths' device address, and where to read them before a step.
     strengths: (u64, Vec<crate::lora::Strength>),
+    /// The shared expert weights the plan reads.
+    _cached: Vec<super::CacheRefs>,
 }
 unsafe impl Send for CudaPlan<'_> {}
 unsafe impl Sync for CudaPlan<'_> {}
@@ -667,6 +669,8 @@ impl CudaBackend {
             ts: (2 * g.rope_halves[r] * 4) as u64,
         };
         let mut owned: Vec<u64> = Vec::new();
+        // References to the shared expert weights, released with the plan.
+        let mut cached: Vec<super::CacheRefs> = Vec::new();
         let free = |owned: &[u64]| {
             for &p in owned {
                 unsafe { self.cu.cuMemFree_v2(p) };
@@ -1086,7 +1090,8 @@ impl CudaBackend {
                         if let Some(u) = &ex.up {
                             groups.push(u);
                         }
-                        let all = self.upload_all(&groups)?;
+                        let (all, r) = self.upload_all(&groups)?;
+                        cached.push(r);
                         let mut tab = |ws: &[CudaWeight]| -> Option<u64> {
                             let t: Vec<Dw> = ws.iter().map(Dw::of).collect();
                             let p = self.upload_bytes(t.as_ptr() as *const u8, std::mem::size_of_val(&t[..]))?;
@@ -1245,6 +1250,7 @@ impl CudaBackend {
                 .collect(),
             last_writer,
             strengths: (arena + str_off as u64, g.strengths.clone()),
+            _cached: cached,
             pinned: {
                 let n: usize = g.states.iter().sum();
                 let mut p: *mut c_void = std::ptr::null_mut();

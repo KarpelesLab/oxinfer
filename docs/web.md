@@ -25,10 +25,14 @@ oxinfer web --model qwen=Qwen/Qwen3.5-0.8B,quant=q8 --memory-gb 24
 | `--model [ID=]SOURCE[,KEY=VALUE...]` | models listed from the start, as with `serve` |
 | `--no-update-check` | do not look for newer oxinfer releases (see [Updates](#updates)) |
 
-and the other options of [`oxinfer serve`](server.md) (`--memory-gb`, `--cache-dir`, `--threads`,
+and the other options of [`oxinfer serve`](server.md) (`--memory-gb`, `--idle-unload`,
+`--no-auto-models`, `--cache-dir`, `--threads`,
 `--prompt-cache`, `--cors`, `--tls-cert` / `--tls-key`, `--self-signed`, `--preload`, `--quiet`,
 ...). The GUI's files are built into the binary (`src/server/webui/`, see [Building](#building)),
-so nothing else is needed at run time.
+so nothing else is needed at run time. API clients do not need the GUI to fetch or load anything: a
+request naming a repo id that is not listed fetches and loads it
+([Models on request](server.md#models-on-request)), and idle models are unloaded after 30 minutes
+or when their memory is needed.
 
 ## The GUI
 

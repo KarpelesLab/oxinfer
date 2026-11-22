@@ -3,8 +3,8 @@
 `oxinfer serve` and `oxinfer web` are the same server: the OpenAI API under `/v1`, Anthropic's
 `/v1/messages`, and the [web GUI](web.md) with its management API, on one port (default
 `127.0.0.1:8080`, or the next free one when no port is given). `oxinfer web` also opens the GUI in
-the browser. The models clients can request are the ones given with `--model` and the ones set up
-in the GUI, by their id. Each `--model` is `[ID=]SOURCE[,KEY=VALUE...]`: a local folder or
+the browser. The models clients can request are the ones given with `--model`, the ones set up
+in the GUI, by their id, and any other repo id a request names ([Models on request](#models-on-request)). Each `--model` is `[ID=]SOURCE[,KEY=VALUE...]`: a local folder or
 file, a repo id (fetched on first use, or at start with `--download`) or `org/name:QUANT` for a
 GGUF repo, an optional id (default: the source) and the model's options. HTTP and HTTPS are
 served by [httpsd](https://crates.io/crates/httpsd) (its thread-pool runtime, no async runtime).
@@ -249,7 +249,7 @@ request). Requests that are not streamed, and the other endpoints, are unchanged
 Errors have OpenAI's shape (`{"error": {"message", "type", "param", "code"}}`) and status codes:
 400 for a bad request (also a model of the wrong kind for the endpoint), 401 without the API key,
 404 for an unknown model (`model_not_found`) or endpoint, 405, 413 over the body limit, 500 when
-loading or running fails. The paths also work without `/v1`.
+loading or running fails, 507 when a model named on request does not fit on the disk or in memory. The paths also work without `/v1`.
 
 The kind of each model (chat, embedding, image, transcription, speech) comes from its files
 (fetching only the small configuration files of a repo id that is not in the cache yet), or the
@@ -257,7 +257,11 @@ The kind of each model (chat, embedding, image, transcription, speech) comes fro
 runs one request at a time; the others wait for it. When a model to load would not fit in the
 memory budget (`--memory-gb`, default 80% of RAM; each model counts the size of its weight files,
 scaled for `quant`, or its `memory_gb` option) next to the loaded ones, the least recently used
-idle models are unloaded first. A chat request that extends the previous conversation of a model
+idle models are unloaded first; so are those that took GPU memory when a chat model to load
+would not fit in the GPU's free memory, and any idle model while the system has less memory
+available than its reserve (20% of RAM, at most 2 GB; other programs' demand counts). Models
+unused for `--idle-unload` minutes (default 30, `0` never; `idle_unload_min`) are unloaded too.
+A chat request that extends the previous conversation of a model
 (the same messages, the reply as it was returned and new messages, as chat clients send them)
 reuses its cache: only the new tokens are fed (`usage.prompt_tokens_details.cached_tokens`); this
 works for Qwen3.5's recurrent layers too, and a conversation whose earlier messages carry media is
@@ -265,6 +269,29 @@ fed again. Models without recurrent state also keep the prefix a new conversatio
 previous one. With `--prompt-cache DIR` (or `auto`; per model `prompt_cache=`), conversations are
 also kept on disk across requests, conversations and restarts and restored when a prompt starts
 with one (see [Session snapshots and the prompt cache](sessions.md#session-snapshots-and-the-prompt-cache)).
+
+### Models on request
+
+A request may name a model that is not listed: a repo id (`org/name`, or `org/name:QUANT` for a
+GGUF repo) or a preset of the catalog. It joins the list (`/v1/models`), its files are fetched
+when the cache does not have them all, and it is loaded and run, all within that request (a
+streamed chat request reports the download and the load as progress events). Before fetching,
+the server checks that the missing files fit on the cache's disk, keeping 1% of it (at least
+1 GB) free, and that the model fits in `--memory-gb`; otherwise the request fails with a 507
+(`insufficient_storage` or `insufficient_memory`) and nothing is fetched. A name the hub does not
+have is a 404 (`model_not_found`). Local paths are never taken this way (give them with
+`--model`).
+
+```sh
+curl -s localhost:8080/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model": "ggml-org/Inkling-2-Mini-GGUF:Q8_0", "messages": [{"role": "user", "content": "Hi"}]}'
+```
+
+This is on for `oxinfer serve` and `oxinfer web` (`--no-auto-models` turns it off; in the library
+and the C API, `auto_models=1` turns it on). It only works where models may be managed: a
+loopback listener, or one with `--api-key`. Requests from another site's page (an `Origin` that is
+not the server's, or on a loopback listener a `Host` that is not a loopback name) never add
+models.
 
 Model options: those of the engine for chat models (`quant`, `device`, `mmap`, `stream`, `mmproj`,
 `draft`, `mtp`, `lookup`, `prompt_cache`, `max_context`, `prefill_chunk`, `gpu_decode`, ...; see
@@ -284,7 +311,8 @@ of the loader for the other kinds (Whisper `encoder` / `decoder` precision, Orph
 
 Server options: `--listen ADDR` (port 0 picks one), `--api-key KEY` (or `$OXINFER_API_KEY`;
 requests need `Authorization: Bearer KEY`), `--cors ORIGIN`, `--max-body-mb N` (default 16),
-`--preload`, `--download`, `--memory-gb F`, `--cache-dir DIR`, `--threads N`,
+`--preload`, `--download`, `--memory-gb F`, `--idle-unload MIN`, `--no-auto-models`,
+`--cache-dir DIR`, `--threads N`,
 `--prompt-cache DIR|auto` and `--prompt-cache-gb F` (the chat models' prompt cache),
 `--thinking-key KEY` (the key of [thinking signatures](#anthropic-messages-api)),
 `--tls-cert FILE --tls-key FILE` or `--self-signed` for HTTPS, `--workers N` (connections served

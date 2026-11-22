@@ -264,6 +264,11 @@ pub trait Backend: Send + Sync {
     fn working_set(&self) -> Option<u64> {
         None
     }
+    /// `(free, total)` bytes of the device's own memory, when it has some (a discrete GPU) and
+    /// says: what loading another model can still put there.
+    fn device_memory(&self) -> Option<(u64, u64)> {
+        None
+    }
     /// Whether this backend's plain decoding outruns speculative decoding (whose drafts run on the
     /// CPU): the speculative defaults (MTP, DSpark drafts) then give way to plain decoding; asking
     /// for them explicitly still uses them.

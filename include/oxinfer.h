@@ -1061,6 +1061,14 @@ typedef int (*oxi_bytes_fn)(void *user, const char *data, size_t len);
  *                        1: one anonymous GitHub request at most every 6 hours, when the GUI
  *                        asks; 0: none). An embedding application is never updated by it.
  *   update_feed=PATH|URL with web=1: read the latest release from there instead of GitHub
+ *   auto_models=0|1      requests may name models not listed: a repo id (org/name,
+ *                        org/name:QUANT) or a catalog preset is fetched if it fits on the disk
+ *                        and in memory_gb (else a 507), then loaded (default 0; oxinfer serve
+ *                        and web: 1). Loopback listeners or with api_key only; never for
+ *                        cross-site browser requests
+ *   idle_unload_min=F    unload models unused for F minutes (default 30; 0: never); idle models
+ *                        also go when a load needs their RAM or GPU memory, and while the
+ *                        system is short of memory
  *   config=PATH         read a JSON file of these options
  * `progress` (may be NULL) reports downloads made by preload / download. Returns NULL on error. */
 OxiServer *oxi_server_new(const char *options, oxi_progress_fn progress, void *user);
