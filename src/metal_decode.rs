@@ -520,6 +520,7 @@ pub(crate) struct Fns {
     set_buf: MsgSetBuffer,
     set_bytes: MsgSetBytes,
     dispatch: MsgDispatch,
+    dispatch_ind: unsafe extern "C" fn(Id, Sel, Id, usize, *const MtlSize),
     barrier: unsafe extern "C" fn(Id, Sel, u64),
     use_res: unsafe extern "C" fn(Id, Sel, *const Id, usize, usize),
     enc_type: unsafe extern "C" fn(Id, Sel, u64) -> Id,
@@ -531,6 +532,7 @@ pub(crate) struct Fns {
     s_buf: Sel,
     s_bytes: Sel,
     s_dispatch: Sel,
+    s_dispatch_ind: Sel,
     s_barrier: Sel,
     s_use_res: Sel,
     s_enc_type: Sel,
@@ -551,6 +553,7 @@ impl Fns {
             set_buf: o.msg_send(),
             set_bytes: o.msg_send(),
             dispatch: o.msg_send(),
+            dispatch_ind: o.msg_send(),
             barrier: o.msg_send(),
             use_res: o.msg_send(),
             enc_type: o.msg_send(),
@@ -562,6 +565,7 @@ impl Fns {
             s_buf: b.sels.set_buffer,
             s_bytes: b.sels.set_bytes,
             s_dispatch: b.sels.dispatch,
+            s_dispatch_ind: o.sel(c"dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:"),
             s_barrier: o.sel(c"memoryBarrierWithScope:"),
             s_use_res: b.sels.use_resources,
             s_enc_type: o.sel(c"computeCommandEncoderWithDispatchType:"),
@@ -633,6 +637,12 @@ impl FastEnc<'_> {
         let t = MtlSize { w: threads, h: 1, d: 1 };
         unsafe { (self.f.dispatch)(self.enc, self.f.s_dispatch, &g, &t) };
     }
+    /// [`Self::dispatch`] with the threadgroup counts read by the GPU from `buf` at `offset`
+    /// (three u32s, written by an earlier dispatch).
+    pub(crate) fn dispatch_indirect(&self, buf: Id, offset: usize, threads: usize) {
+        let t = MtlSize { w: threads, h: 1, d: 1 };
+        unsafe { (self.f.dispatch_ind)(self.enc, self.f.s_dispatch_ind, buf, offset, &t) };
+    }
     /// Makes buffers reached only through addresses resident for this encoder.
     pub(crate) fn use_resources(&self, ids: &[Id]) {
         if !ids.is_empty() {
@@ -700,6 +710,8 @@ const PF_PARTS: usize = 8;
 /// Prefill GEMMs: a last partial 128- or 64-row tile of at most this many rows takes 32-row
 /// tiles.
 const PF_REM_ROWS: usize = 64;
+/// u32s of the device MoE routing's indirect dispatch sizes (`pf_route`'s `args`).
+const PF_ROUTE_ARGS: usize = 21;
 /// Rows of the prefill GEMMs' middle tiles (`MOp::Gemm::pipes[2]`).
 const PF_TM_M: usize = 64;
 /// Multi-token plans: bytes of QSA block score rows (see `MOp::QsaScore`).
@@ -1472,9 +1484,12 @@ struct PfState {
     rs: usize,
     tmp: usize,
     experts: Vec<PfExperts>,
-    /// Staging: the buffer and offsets of src, tiles, slots, xh, rs, gu, ah, rs2, o.
+    /// The device routing pipeline (`pf_route`), when the MoE layers route on the GPU.
+    route: Option<Id>,
+    /// Staging: the buffer and offsets of src, tiles, slots, xh, rs, gu, ah, rs2, o, each row's
+    /// expert, the LoRA scratch and the routing's dispatch sizes.
     stage: Id,
-    st: [usize; 11],
+    st: [usize; 12],
     max_rows: usize,
     max_tiles: usize,
 }
@@ -3224,7 +3239,8 @@ impl MetalBackend {
             let max_tiles = max_rows / 16 + 1;
             let sizes = [
                 max_rows * 4,
-                max_tiles * 16,
+                // Three classes of tiles (the device routing keeps them apart).
+                3 * max_tiles * 16,
                 tokens * k.max(1) * 8,
                 max_rows * h * 2,
                 (max_rows + 128) * 4,
@@ -3235,8 +3251,10 @@ impl MetalBackend {
                 // LoRA updates: each row's expert, the low-rank scratch.
                 max_rows * 4,
                 max_rows * pf_experts.iter().filter_map(|x| x.lora.as_ref()).map(|l| l.r).max().unwrap_or(0) * 4,
+                // The device routing's indirect dispatch sizes.
+                PF_ROUTE_ARGS * 4,
             ];
-            let mut st = [0usize; 11];
+            let mut st = [0usize; 12];
             let mut sz = 0;
             for (o, n) in st.iter_mut().zip(sizes) {
                 *o = sz;
@@ -3247,10 +3265,19 @@ impl MetalBackend {
             if stage.is_null() {
                 return None;
             }
+            // Routing on the device (no stop for the host at each MoE layer) unless an expert
+            // layer has LoRA updates (their grids follow the rows) or routes are being recorded.
+            let route = (!pf_experts.is_empty()
+                && pf_experts.iter().all(|x| x.lora.is_none() && x.n_exp <= 1024 && x.k <= 16)
+                && std::env::var_os("OXINFER_PF_ROUTES").is_none()
+                && std::env::var("OXINFER_PF_GPU_ROUTE").map_or(true, |v| v != "0"))
+            .then(|| self.named_pipeline("pf_route"))
+            .flatten();
             Some(PfState {
                 xh: pf_xh,
                 rs: pf_rs,
                 tmp: pf_tmp,
+                route,
                 experts: pf_experts,
                 stage,
                 st,
@@ -4481,6 +4508,50 @@ impl MetalPlan<'_> {
                 let (h, mi) = (x.h, x.inter);
                 let st = |j: usize| pf.st[j];
                 let sb = pf.stage;
+                // Routed on the device: the grids' sizes come from `pf_route`'s output.
+                let dev = pf.route.is_some();
+                if let Some(route) = pf.route {
+                    #[repr(C)]
+                    struct Rt {
+                        t: u32,
+                        k: u32,
+                        n_exp: u32,
+                        sel_stride: u32,
+                        max_tiles: u32,
+                        gu_x: u32,
+                        dn_x: u32,
+                        _p: u32,
+                    }
+                    e.pipe(route);
+                    e.buf(arena, x.sel, 0);
+                    e.buf(sb, st(0), 1);
+                    e.buf(sb, st(9), 2);
+                    e.buf(sb, st(2), 3);
+                    e.buf(sb, st(1), 4);
+                    e.buf(sb, st(11), 5);
+                    e.bytes(
+                        &Rt {
+                            t: t as u32,
+                            k: x.k as u32,
+                            n_exp: x.n_exp as u32,
+                            sel_stride: x.sel_stride as u32,
+                            max_tiles: pf.max_tiles as u32,
+                            gu_x: (if x.up.is_some() { mi } else { 2 * mi } / 64) as u32,
+                            dn_x: (h / 64) as u32,
+                            _p: 0,
+                        },
+                        6,
+                    );
+                    e.dispatch((1, 1), 256);
+                    e.barrier();
+                }
+                let per_row = |threads: usize| {
+                    if dev {
+                        e.dispatch_indirect(sb, st(11), threads);
+                    } else {
+                        e.dispatch((er, 1), threads);
+                    }
+                };
                 e.pipe(m.x_half);
                 e.buf(arena, x.x, 0);
                 e.buf(sb, st(3), 1);
@@ -4495,42 +4566,55 @@ impl MetalPlan<'_> {
                     3,
                 );
                 e.buf(sb, st(0), 4);
-                e.dispatch((er, 1), 256);
+                per_row(256);
                 e.barrier();
+                // (The grouped kernels take each tile's rows from the tile.)
                 let params = |n_out: usize, n_in: usize, s_off: u32| super::MmaParams {
                     n_out: n_out as u32,
                     n_in: n_in as u32,
                     w_off: 0,
                     s_off,
-                    rows: er as u32,
+                    rows: if dev { pf.max_rows } else { er } as u32,
                     _p: [0; 3],
                 };
-                // One grid per tile size (disjoint rows: no barrier between them).
-                let grouped = |pipes: [Id; 3], ep: Id, xh: usize, out: usize, rs: usize, p: &super::MmaParams| {
+                // One grid per tile size (disjoint rows: no barrier between them); `arg`: the
+                // first of the device routing's dispatch sizes for these grids.
+                let grouped = |pipes: [Id; 3], ep: Id, xh: usize, out: usize, rs: usize, p: &super::MmaParams, arg: usize| {
                     let mut first = 0;
-                    for (pipe, n) in [pipes[1], pipes[0], pipes[2]].into_iter().zip(nt) {
-                        if n > 0 {
+                    for (c, (pipe, n)) in [pipes[1], pipes[0], pipes[2]].into_iter().zip(nt).enumerate() {
+                        if dev || n > 0 {
                             e.pipe(pipe);
                             e.buf(ep, 0, 0);
-                            e.buf(sb, st(1) + first * 16, 1);
+                            e.buf(sb, st(1) + if dev { c * pf.max_tiles } else { first } * 16, 1);
                             e.buf(sb, xh, 2);
                             e.buf(sb, out, 3);
                             e.bytes(p, 4);
                             e.buf(sb, rs, 5);
-                            e.dispatch((p.n_out as usize / 64, n), 128);
+                            if dev {
+                                e.dispatch_indirect(sb, st(11) + (arg + 3 * c) * 4, 128);
+                            } else {
+                                e.dispatch((p.n_out as usize / 64, n), 128);
+                            }
                         }
                         first += n;
                     }
                 };
+                // Separate gate and up outputs: up's rows after all the gate rows (the most a
+                // layer can have when routed on the device).
+                let up_at = st(5) + if dev { pf.max_rows } else { er } * mi * 4;
+                let split = if x.up.is_some() {
+                    (if dev { pf.max_rows } else { er }) as u32
+                } else {
+                    0
+                };
                 match x.up {
                     Some((pu, rb)) => {
-                        grouped(x.pipes.0, x.tabs[0], st(3), st(5), st(4), &params(mi, h, x.row_bytes.0));
-                        grouped(pu, x.tabs[1], st(3), st(5) + er * mi * 4, st(4), &params(mi, h, rb));
+                        grouped(x.pipes.0, x.tabs[0], st(3), st(5), st(4), &params(mi, h, x.row_bytes.0), 3);
+                        grouped(pu, x.tabs[1], st(3), up_at, st(4), &params(mi, h, rb), 3);
                     }
-                    None => grouped(x.pipes.0, x.tabs[0], st(3), st(5), st(4), &params(2 * mi, h, x.row_bytes.0)),
+                    None => grouped(x.pipes.0, x.tabs[0], st(3), st(5), st(4), &params(2 * mi, h, x.row_bytes.0), 3),
                 }
                 e.barrier();
-                let split = if x.up.is_some() { er as u32 } else { 0 };
                 let lp = |n_in: usize, r: u32, n: usize, xs: u32| PxLoraParams {
                     n_in: n_in as u32,
                     r,
@@ -4585,14 +4669,14 @@ impl MetalPlan<'_> {
                     &Sh {
                         n: mi as u32,
                         gelu: x.gelu as u32,
-                        split: if x.up.is_some() { er as u32 } else { 0 },
+                        split,
                         limit: 0.0,
                     },
                     3,
                 );
-                e.dispatch((er, 1), 256);
+                per_row(256);
                 e.barrier();
-                grouped(x.pipes.1, x.tabs[2], st(6), st(8), st(7), &params(h, mi, x.row_bytes.1));
+                grouped(x.pipes.1, x.tabs[2], st(6), st(8), st(7), &params(h, mi, x.row_bytes.1), 12);
                 e.barrier();
                 if let Some(l) = &x.lora
                     && let Some(dn) = &l.dn
@@ -5814,7 +5898,8 @@ impl DecodePlan for MetalPlan<'_> {
         let (ok, gpu) = if self.gate.is_some() {
             (self.run_streamed(end, t, &encode), 0.0)
         } else if let Some(pf) = &self.pf {
-            // One command buffer up to each MoE layer, whose routing is read back first.
+            // One command buffer up to each MoE layer, whose routing is read back first (unless
+            // it is routed on the device).
             let mut from = 0;
             let mut ok = true;
             if pf_prof() {
@@ -5823,7 +5908,9 @@ impl DecodePlan for MetalPlan<'_> {
                     if matches!(op, MOp::Barrier) {
                         continue;
                     }
-                    if let MOp::PfExperts(x) = op {
+                    if let MOp::PfExperts(x) = op
+                        && pf.route.is_none()
+                    {
                         match self.pf_route(pf, &pf.experts[*x], t) {
                             Some(r) => pf_run.set(r),
                             None => return false,
@@ -5859,9 +5946,10 @@ impl DecodePlan for MetalPlan<'_> {
                 }
                 from = end;
             }
+            // (Routed on the device: no stops.)
             let stops: Vec<(usize, usize)> = (from..end)
                 .filter_map(|i| match self.ops[i] {
-                    MOp::PfExperts(x) => Some((i, x)),
+                    MOp::PfExperts(x) if pf.route.is_none() => Some((i, x)),
                     _ => None,
                 })
                 .collect();

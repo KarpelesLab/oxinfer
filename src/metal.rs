@@ -580,19 +580,23 @@ inline void scale_min_k4(uint j, device const uchar* s, thread float& sc, thread
 // blocks within them; same values as reading bytes): the byte reads were a large part of the
 // matrix-unit GEMMs' time.
 inline uint byte_of(uint w, uint i) { return (w >> (8 * i)) & 255u; }
-struct Q4_KW { GgW g; };
-inline void load(Q4_KW w, uint row, uint b, thread float4* out) {
-    device const uint* B = (device const uint*)sblk(w.g, row, b, 144);
-    uint j = b % 8;
-    half2 dm = as_type<half2>(B[0]);
-    uint s0 = B[1], s1 = B[2], s2 = B[3]; // scale_min_k4's 12 bytes
-    float sc, mn;
+// The scale and minimum of 32-block j of a Q4_K / Q5_K super-block from its 12 scale bytes
+// (`scale_min_k4`, read as three words).
+inline void scale_min_w(uint j, uint s0, uint s1, uint s2, thread float& sc, thread float& mn) {
     if (j < 4) { sc = float(byte_of(s0, j) & 63); mn = float(byte_of(s1, j) & 63); }
     else {
         uint a = byte_of(s2, j - 4);
         sc = float((a & 15) | ((byte_of(s0, j - 4) >> 6) << 4));
         mn = float((a >> 4) | ((byte_of(s1, j - 4) >> 6) << 4));
     }
+}
+struct Q4_KW { GgW g; };
+inline void load(Q4_KW w, uint row, uint b, thread float4* out) {
+    device const uint* B = (device const uint*)sblk(w.g, row, b, 144);
+    uint j = b % 8;
+    half2 dm = as_type<half2>(B[0]);
+    float sc, mn;
+    scale_min_w(j, B[1], B[2], B[3], sc, mn);
     float d1 = float(dm.x) * sc, m1 = float(dm.y) * mn;
     device const uint2* q = (device const uint2*)(B + 4 + 8 * (j / 2));
     uint sh = 4 * (j % 2);
@@ -602,31 +606,42 @@ inline void load(Q4_KW w, uint row, uint b, thread float4* out) {
         out[2 * i + 1] = f4(as_type<uchar4>((u.y >> sh) & 0x0F0F0F0Fu)) * d1 - m1;
     }
 }
+// Q5_K: as words too (176-byte blocks).
 struct Q5_KW { GgW g; };
 inline void load(Q5_KW w, uint row, uint b, thread float4* out) {
-    device const uchar* B = sblk(w.g, row, b, 176);
+    device const uint* B = (device const uint*)sblk(w.g, row, b, 176);
     uint j = b % 8;
-    float sc, mn; scale_min_k4(j, B + 4, sc, mn);
-    float d1 = h2f(B) * sc, m1 = h2f(B + 2) * mn;
-    device const uchar* q = B + 48 + 32 * (j / 2);
-    uchar sh = uchar(4 * (j % 2));
-    for (uint i = 0; i < 8; i++) {
-        uchar4 hb = ((ld4(B + 16 + 4 * i) >> uchar(j)) & uchar(1)) << uchar(4);
-        out[i] = f4(((ld4(q + 4 * i) >> sh) & uchar(15)) | hb) * d1 - m1;
+    half2 dm = as_type<half2>(B[0]);
+    float sc, mn;
+    scale_min_w(j, B[1], B[2], B[3], sc, mn);
+    float d1 = float(dm.x) * sc, m1 = float(dm.y) * mn;
+    device const uint2* qh = (device const uint2*)(B + 4);
+    device const uint2* q = (device const uint2*)(B + 12 + 8 * (j / 2));
+    uint sh = 4 * (j % 2);
+    for (uint i = 0; i < 4; i++) {
+        uint2 u = q[i], h = qh[i];
+        uint2 v = ((u >> sh) & 0x0F0F0F0Fu) | (((h >> j) & 0x01010101u) << 4);
+        out[2 * i] = f4(as_type<uchar4>(v.x)) * d1 - m1;
+        out[2 * i + 1] = f4(as_type<uchar4>(v.y)) * d1 - m1;
     }
 }
+// Q6_K blocks (210 bytes) are 2-byte aligned: read as 16-bit words (same values as bytes; the
+// byte reads made Q6_K the slowest of the matrix-unit GEMMs, 15-25% behind these).
 struct Q6_KW { GgW g; };
 inline void load(Q6_KW w, uint row, uint b, thread float4* out) {
     device const uchar* B = sblk(w.g, row, b, 210);
     uint j = b % 8, n = j / 4, jj = j % 4;
-    float d = h2f(B + 208);
-    device const uchar* ql = B + 64 * n + 32 * (jj & 1);
-    device const uchar* qh = B + 128 + 32 * n;
-    uchar lsh = uchar(4 * (jj >> 1)), hsh = uchar(2 * jj);
+    device const ushort* ql = (device const ushort*)(B + 64 * n + 32 * (jj & 1));
+    device const ushort* qh = (device const ushort*)(B + 128 + 32 * n);
+    uint scs = *(device const ushort*)(B + 192 + 8 * n + 2 * jj);
+    float d = float(as_type<half>(*(device const ushort*)(B + 208)));
+    float dl0 = d * float(as_type<char>(uchar(scs & 255))), dl1 = d * float(as_type<char>(uchar(scs >> 8)));
+    uint lsh = 4 * (jj >> 1), hsh = 2 * jj;
     for (uint i = 0; i < 8; i++) {
-        float dl = d * float(as_type<char>(B[192 + 8 * n + 2 * jj + i / 4]));
-        uchar4 q = ((ld4(ql + 4 * i) >> lsh) & uchar(15)) | (((ld4(qh + 4 * i) >> hsh) & uchar(3)) << uchar(4));
-        out[i] = (f4(q) - 32.f) * dl;
+        uint l = uint(ql[2 * i]) | (uint(ql[2 * i + 1]) << 16);
+        uint h = uint(qh[2 * i]) | (uint(qh[2 * i + 1]) << 16);
+        uint q = ((l >> lsh) & 0x0F0F0F0Fu) | (((h >> hsh) & 0x03030303u) << 4);
+        out[i] = (f4(as_type<uchar4>(q)) - 32.f) * (i < 4 ? dl0 : dl1);
     }
 }
 struct Q3_KW { GgW g; };
@@ -1159,6 +1174,79 @@ kernel void moe_combine(device const float* o [[buffer(0)]], device const float2
         acc += s.y * *(device const float4*)(o + (ulong)as_type<uint>(s.x) * p.n + c);
     }
     *(device float4*)(out + (ulong)t * p.ldo + c) = acc;
+}
+// The routing of a prefill chunk's MoE layer on the device, as the host's `pf_route` lays it
+// out (so the GPU need not stop for the host at each MoE layer): per token, `k` expert ids (as
+// bits) then `k` weights in `sel`. One threadgroup of 256: the experts' entries are counted,
+// thread 0 cuts the experts' segments (16-row multiples) into tiles as `group_tiles` (class c
+// from tile c * max_tiles), then the entries are placed in token order, 256 at a time (each
+// entry's rank among the chunk's entries of its expert by a scan of the chunk): the gathered
+// row's source token (`src`, ~0 for padding), its expert (`rexp`) and each slot's [row, weight].
+// `args`: indirect dispatch sizes, (rows, 1, 1), then (gu_x, tiles of class c, 1) for c = 0..2,
+// then (dn_x, tiles of class c, 1).
+struct RT { uint t; uint k; uint n_exp; uint sel_stride; uint max_tiles; uint gu_x; uint dn_x; uint _p; };
+#define RT_THREADS 256
+inline uint rt_id(device const float* sel, constant RT& p, uint i) {
+    return as_type<uint>(sel[(ulong)(i / p.k) * p.sel_stride + i % p.k]);
+}
+kernel void pf_route(device const float* sel [[buffer(0)]], device uint* src [[buffer(1)]], device uint* rexp [[buffer(2)]],
+                     device uint2* slots [[buffer(3)]], device uint4* tiles [[buffer(4)]], device uint* args [[buffer(5)]],
+                     constant RT& p [[buffer(6)]], uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup atomic_uint cnt[1024];
+    threadgroup uint start[1024];
+    threadgroup uint ce[RT_THREADS];
+    threadgroup uint total;
+    uint n = p.t * p.k;
+    for (uint x = tid; x < p.n_exp; x += RT_THREADS) atomic_store_explicit(&cnt[x], 0u, memory_order_relaxed);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < n; i += RT_THREADS) {
+        uint e = rt_id(sel, p, i);
+        if (e < p.n_exp) atomic_fetch_add_explicit(&cnt[e], 1u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint rows = 0, nc0 = 0, nc1 = 0, nc2 = 0;
+        for (uint x = 0; x < p.n_exp; x++) {
+            uint len = (atomic_load_explicit(&cnt[x], memory_order_relaxed) + 15) / 16 * 16, t0 = 0;
+            for (; t0 + 128 <= len; t0 += 128) tiles[nc0++] = uint4(x, rows, len, t0);
+            for (; t0 + GTM <= len; t0 += GTM) tiles[p.max_tiles + nc1++] = uint4(x, rows, len, t0);
+            if (t0 < len) tiles[2 * p.max_tiles + nc2++] = uint4(x, rows, len, t0);
+            start[x] = rows;
+            rows += len;
+        }
+        uint nc[3] = { nc0, nc1, nc2 };
+        args[0] = rows; args[1] = 1; args[2] = 1;
+        for (uint c = 0; c < 3; c++) {
+            args[3 + 3 * c] = p.gu_x; args[4 + 3 * c] = nc[c]; args[5 + 3 * c] = 1;
+            args[12 + 3 * c] = p.dn_x; args[13 + 3 * c] = nc[c]; args[14 + 3 * c] = 1;
+        }
+        total = rows;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint rows = total;
+    for (uint r = tid; r < rows; r += RT_THREADS) { src[r] = 0xffffffffu; rexp[r] = 0xffffffffu; }
+    threadgroup_barrier(mem_flags::mem_device);
+    for (uint c0 = 0; c0 < n; c0 += RT_THREADS) {
+        uint i = c0 + tid, m = min(uint(RT_THREADS), n - c0);
+        uint e = i < n ? rt_id(sel, p, i) : 0xffffffffu;
+        ce[tid] = e;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint before = 0, same = 0;
+        if (e < p.n_exp) {
+            for (uint q = 0; q < m; q++) {
+                bool hit = ce[q] == e;
+                before += hit && q < tid;
+                same += hit;
+            }
+            uint r = start[e] + before, j = i / p.k, s = i % p.k;
+            src[r] = j;
+            rexp[r] = e;
+            slots[i] = uint2(r, as_type<uint>(sel[(ulong)j * p.sel_stride + p.k + s]));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (e < p.n_exp && before + 1 == same) start[e] += same;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 }
 "#;
 
