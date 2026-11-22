@@ -87,7 +87,8 @@ pub use crate::sampler::TokenLogprob;
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct EngineOptions {
-    /// CPU worker threads (process-wide; default: all cores). Key `threads`.
+    /// CPU worker threads (process-wide; default: one per physical core, see
+    /// [`pool::default_threads`]). Key `threads`.
     pub threads: Option<usize>,
     /// Scheduling class of the CPU threads (process-wide, applied with `threads`; Apple
     /// platforms: the QoS class, `Background` keeping them on the efficiency cores). Key `qos`

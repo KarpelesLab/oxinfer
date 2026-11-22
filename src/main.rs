@@ -1064,7 +1064,7 @@ fn parse_args() -> Result<Args> {
 }
 
 fn default_threads() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    pool::default_threads()
 }
 
 /// The command line's attachments, prepared for a model of hidden size `hidden`.

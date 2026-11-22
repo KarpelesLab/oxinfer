@@ -74,7 +74,7 @@ int64_t oxi_cache_remove(const char *cache_dir, const char *name);
 
 /* Loads a model: a directory, a .gguf file or a repo id (downloaded first, see oxi_download).
  * `options`: NULL or "key=value" pairs separated by newlines or ';':
- *   threads=N            CPU threads (default: all cores; process-wide)
+ *   threads=N            CPU threads (default: one per physical core; process-wide)
  *   quant=bf16|q8|q4     precision for checkpoints that are not already quantized (default bf16)
  *   mmap=0|1             map weights instead of reading them into memory (default 1 on iOS)
  *   preload=0|1          with mmap, touch all weight pages while loading

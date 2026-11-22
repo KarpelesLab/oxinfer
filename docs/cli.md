@@ -18,7 +18,7 @@ Useful flags:
 | `--print-prompt` | print the fully formatted prompt and exit |
 | `--raw` | feed the prompt as-is after `<bos>`, no chat template |
 | `--max-tokens N` | cap on generated tokens |
-| `--threads N` | worker threads (default: all cores) |
+| `--threads N` | worker threads (default: one per physical core; every logical CPU where SMT siblings cannot be told apart) |
 | `--quant q8` | quantize streamed weights to int8 at load (blocks of 32, f32 scales); ~1.8x less memory traffic |
 | `--quant q4` | GGUF-style Q4_0 (blocks of 32, 4-bit, f16 scale) for all streamed weights; ~3.5x less traffic |
 | `--draft DIR` | speculative decoding with Google's `gemma-4-E4B-it-assistant` drafter (greedy only; output identical to plain greedy), or a DSpark draft (greedy and sampled): Mistral Large 4 / DeepSeek V4 a draft GGUF (default: the `dspark*.gguf` beside the model, which `auto` requires), Qwen / Gemma 4 a Hugging Face draft or dflash GGUF, see [DSpark](mistral-large-4.md#dspark-speculative-decoding) and [Qwen and Gemma 4 drafts](qwen.md#dspark-drafts-for-qwen-and-gemma-4) |

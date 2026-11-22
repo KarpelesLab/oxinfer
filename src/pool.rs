@@ -101,6 +101,40 @@ pub fn cpu_cores() -> (usize, usize) {
     (all, 0)
 }
 
+/// Threads the pool takes by default: one per physical core where logical CPUs are SMT siblings
+/// (Linux, from sysfs), else every logical CPU. The second thread of a core adds nothing to
+/// kernels bound by memory bandwidth or by the FMA units, and halves the cache each one has.
+pub fn default_threads() -> usize {
+    let all = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    #[cfg(target_os = "linux")]
+    if let Some(cores) = linux_physical_cores(all) {
+        return cores;
+    }
+    all
+}
+
+/// The number of physical cores among the CPUs this process may run on, when it differs from
+/// `all` (the logical CPUs available): the distinct `thread_siblings_list` of the allowed CPUs.
+/// None when anything is unreadable or a quota (not the affinity mask) limits the process.
+#[cfg(target_os = "linux")]
+fn linux_physical_cores(all: usize) -> Option<usize> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let list = status.lines().find_map(|l| l.strip_prefix("Cpus_allowed_list:"))?.trim();
+    let mut cpus = Vec::new();
+    for part in list.split(',') {
+        let (a, b) = part.split_once('-').unwrap_or((part, part));
+        cpus.extend(a.trim().parse::<usize>().ok()?..=b.trim().parse::<usize>().ok()?);
+    }
+    if cpus.len() != all {
+        return None;
+    }
+    let mut cores = std::collections::BTreeSet::new();
+    for c in cpus {
+        cores.insert(std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{c}/topology/thread_siblings_list")).ok()?);
+    }
+    (!cores.is_empty() && cores.len() < all).then_some(cores.len())
+}
+
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn set_qos(q: Qos) {
     unsafe extern "C" {
@@ -361,7 +395,7 @@ pub fn options() -> PoolOptions {
 pub fn get() -> &'static Pool {
     let p = GLOBAL.load(Acquire);
     if p.is_null() {
-        init(thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+        init(default_threads());
         return get();
     }
     unsafe { &*p }
@@ -374,4 +408,16 @@ pub fn run(n: usize, f: &(dyn Fn(usize) + Sync)) {
 
 pub fn threads() -> usize {
     get().threads()
+}
+
+#[cfg(test)]
+mod tests {
+    /// The default is at least one thread and at most the logical CPUs (one per core with SMT).
+    #[test]
+    fn default_threads_is_within_the_logical_cpus() {
+        let all = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        let d = super::default_threads();
+        assert!((1..=all).contains(&d), "{d} threads for {all} logical CPUs");
+        eprintln!("default threads: {d} of {all} logical CPUs");
+    }
 }
