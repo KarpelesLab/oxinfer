@@ -714,6 +714,16 @@ inline void load(MXF8W w, uint row, uint b, thread float4* out) {
     device const uchar* B = w.q + (ulong)row * w.n_in + b * 32;
     for (uint i = 0; i < 8; i++) out[i] = e4m3x4(ld4(B + 4 * i)) * d;
 }
+// MXFP8 with the E8M0 exponent bytes as stored (borrowed from the mapped file): `2^(e - 127)`
+// decoded from the bits as the CPU does (0: 2^-127, 255: NaN), the same floats as the expanded
+// scales, so the same outputs bit for bit.
+struct MXF8B { device const uchar* q; device const uchar* e; uint n_in; };
+inline float e8m0f(uint e) { return as_type<float>(e == 255 ? 0x7fc00000u : e == 0 ? 0x00400000u : e << 23); }
+inline void load(MXF8B w, uint row, uint b, thread float4* out) {
+    float d = e8m0f(w.e[(ulong)row * (w.n_in / 32) + b]) * 256.f;
+    device const uchar* B = w.q + (ulong)row * w.n_in + b * 32;
+    for (uint i = 0; i < 8; i++) out[i] = e4m3x4(ld4(B + 4 * i)) * d;
+}
 
 // ---- Routed experts (threadgroups of 4 SIMD-groups, each computing two outputs). Expert e's
 // projection is at tab[e]: data, scales (address, 0 if none), the factor of its outputs, the row

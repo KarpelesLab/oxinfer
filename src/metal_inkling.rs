@@ -227,6 +227,13 @@ fn expert_formats() -> Vec<(String, String, &'static str, usize, String)> {
             "MGen<MXF8W>{ MXF8W{ (device const uchar*)(e).q, (device const float*)(e).s, n } }".into(),
         ),
         (
+            "mxf8b".into(),
+            "MGen<MXF8B>".into(),
+            "X32",
+            32,
+            "MGen<MXF8B>{ MXF8B{ (device const uchar*)(e).q, (device const uchar*)(e).s, n } }".into(),
+        ),
+        (
             "MXFP4".into(),
             "MGen<MXFP4W>".into(),
             "X32",
@@ -914,10 +921,17 @@ fn expert_weight(w: &WeightRef, n_out: usize, n_in: usize) -> Option<XWeight> {
             let mut factor = 1.0;
             let mut scales = None;
             let name = match (&g.block_scales, g.kind) {
-                (Some(b), GgmlType::F8E4M3) if b.rows == 1 && b.cols == 32 => {
-                    scales = Some((b.s.as_ptr() as *const u8, b.s.len() * 4));
-                    "mxf8".to_string()
-                }
+                (Some(b), GgmlType::F8E4M3) if b.rows == 1 && b.cols == 32 => match &b.e8m0 {
+                    // The E8M0 bytes as stored (decoded in the kernels), or their f32 expansion.
+                    Some(e) => {
+                        scales = Some((e.as_ptr(), e.len()));
+                        "mxf8b".to_string()
+                    }
+                    None => {
+                        scales = Some((b.s.as_ptr() as *const u8, b.s.len() * 4));
+                        "mxf8".to_string()
+                    }
+                },
                 (Some(_), GgmlType::F8E4M3) => return None,
                 (Some(b), k) if !k.is_float() && b.rows >= n_out && b.cols >= n_in && b.s.len() == 1 => {
                     factor = b.s[0];
@@ -1556,7 +1570,7 @@ impl InkMetal {
             // Prefill: the grouped GEMMs, where both formats have them.
             let mmag = |f: &str| -> Option<[Id; 3]> {
                 let n = match f {
-                    "bf" | "q8" | "nvfp4" | "mxf8" => format!("mmag_{f}"),
+                    "bf" | "q8" | "nvfp4" | "mxf8" | "mxf8b" => format!("mmag_{f}"),
                     "F32" => return None,
                     k => format!("mmag_{k}"),
                 };
@@ -3724,5 +3738,177 @@ impl DevEngine for InkMetal {
             d.pos = sess.pos;
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod mxf8_tests {
+    use super::*;
+
+    fn lcg(s: &mut u64) -> u32 {
+        *s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (*s >> 33) as u32
+    }
+
+    /// The MXFP8 expert kernels reading the E8M0 bytes (`mxf8b`) against the ones reading their
+    /// f32 expansion (`mxf8`), bit for bit: the decode path's grouped down kernel (`_gsum`) and
+    /// the prefill's grouped matrix-unit GEMMs (`mmag_*`, every tile size).
+    #[test]
+    fn mxf8_byte_scales_match_f32_scales() {
+        let Ok(be) = MetalBackend::new() else { return };
+        let lib = library(&be).unwrap();
+        let f = Fns::new(&be);
+        let (ne, n_out, n_in) = (2usize, 128usize, 512usize);
+        let mut seed = 5u64;
+        // E4M3 values without NaNs (0x7f, 0xff); exponents over a wide range, 0 included.
+        let q: Vec<u8> = (0..ne * n_out * n_in)
+            .map(|_| match lcg(&mut seed) as u8 {
+                0x7f | 0xff => 0x10,
+                v => v,
+            })
+            .collect();
+        let e: Vec<u8> = (0..ne * n_out * n_in / 32)
+            .map(|i| if i % 97 == 0 { 0 } else { 100 + (lcg(&mut seed) % 50) as u8 })
+            .collect();
+        let s: Vec<f32> = e.iter().map(|&b| crate::ggml::e8m0_to_f32(b)).collect();
+        let buf = |bytes: &[u8]| {
+            let (id, p) = be.ink_buffer(bytes.len()).unwrap();
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len()) };
+            let addr = be.gpu_address(&super::super::Buf { id, offset_bytes: 0 });
+            (id, addr)
+        };
+        let f32b = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let (qb, qa) = buf(&q);
+        let (eb, ea) = buf(&e);
+        let (sb, sa) = buf(&f32b(&s));
+        let (per, sper) = ((n_out * n_in) as u64, (n_out * n_in / 32) as u64);
+        let run = |enc: &dyn Fn(&FastEnc)| {
+            let (ok, _) = run_concurrent(&be, &f, &[std::ops::Range { start: 0, end: 1 }], |fe, _| {
+                fe.use_resources(&[qb, eb, sb]);
+                enc(fe)
+            });
+            assert!(ok);
+        };
+
+        // Decode: tokens 0..t through expert 1's down rows (`gsum`, `h` = n_out, `inter` = n_in).
+        let t = 5usize;
+        let (g_off, asg_off, sel_off, act_off) = (0usize, 16, 32, 64);
+        let y_off = act_off + t * n_in;
+        let arena = y_off + t * n_out;
+        let mut outs: Vec<Vec<u32>> = Vec::new();
+        for (fmt, sc, sstride) in [("mxf8", sa, sper * 4), ("mxf8b", ea, sper)] {
+            let pipe = lib.pipeline(&be, &format!("ink_x_{fmt}_gsum")).unwrap();
+            let tab: Vec<XEntry> = (0..ne as u64)
+                .map(|x| XEntry {
+                    q: qa + x * per,
+                    s: sc + x * sstride,
+                    factor: 1.0,
+                    rb: n_in as u32,
+                    _p: 0,
+                })
+                .collect();
+            let tab_bytes = unsafe { std::slice::from_raw_parts(tab.as_ptr() as *const u8, std::mem::size_of_val(&tab[..])) };
+            let (tb, _) = buf(tab_bytes);
+            let (ab, ap) = be.ink_buffer(arena * 4).unwrap();
+            let a = unsafe { std::slice::from_raw_parts_mut(ap as *mut f32, arena) };
+            let ua = |i: usize, v: u32| unsafe { *(ap as *mut u32).add(i) = v };
+            ua(g_off, 1);
+            ua(g_off + 1, 1);
+            ua(g_off + 2, t as u32);
+            ua(g_off + 3, 0);
+            for i in 0..t {
+                ua(asg_off + i, i as u32);
+                a[sel_off + 2 * i + 1] = 1.0;
+            }
+            let mut xs = 9u64;
+            for v in &mut a[act_off..y_off] {
+                *v = (lcg(&mut xs) as f32 / u32::MAX as f32 - 0.5) * 4.0;
+            }
+            let xp = XP {
+                inter: n_in as u32,
+                h: n_out as u32,
+                k: 1,
+                sel: sel_off as u32,
+                act: act_off as u32,
+                y: y_off as u32,
+                ..Default::default()
+            };
+            let lpr = lanes_per_row(n_in, 32, 8);
+            let gq = [g_off as u32, asg_off as u32, lpr, lpr];
+            run(&|fe| {
+                fe.use_resources(&[tb]);
+                fe.pipe(pipe);
+                fe.buf(ab, 0, 0);
+                fe.buf(tb, 0, 1);
+                fe.bytes(&xp, 2);
+                fe.bytes(&gq, 3);
+                fe.dispatch((n_out.div_ceil(4 * 32 / lpr as usize), 1), 128);
+            });
+            outs.push(a[y_off..].iter().map(|v| v.to_bits()).collect());
+            assert!(a[y_off..].iter().any(|v| *v != 0.0), "{fmt}: no output");
+            be.ink_release(ab);
+            be.ink_release(tb);
+        }
+        assert_eq!(outs[0], outs[1], "decode (gsum): byte scales differ from f32 scales");
+
+        // Prefill: the grouped GEMMs over 150 rows of expert 0 and 37 of expert 1.
+        if lib.mma {
+            let (tiles, ncls, _, rows) = super::super::group_tiles(&[150, 37]);
+            let mut outs: Vec<Vec<u32>> = Vec::new();
+            for (fmt, sc, sstride) in [("mxf8", sa, sper * 4), ("mxf8b", ea, sper)] {
+                let pipes: Vec<Id> = ["", "_l", "_s"]
+                    .iter()
+                    .map(|x| lib.pipeline(&be, &format!("mmag_{fmt}{x}")).unwrap())
+                    .collect();
+                let ep: Vec<[u64; 2]> = (0..ne as u64).map(|x| [qa + x * per, sc + x * sstride]).collect();
+                let (epb, _) = buf(unsafe { std::slice::from_raw_parts(ep.as_ptr() as *const u8, ep.len() * 16) });
+                let (tlb, _) = buf(unsafe { std::slice::from_raw_parts(tiles.as_ptr() as *const u8, tiles.len() * 16) });
+                let mut xs = 11u64;
+                let xh: Vec<u8> = (0..rows * n_in)
+                    .flat_map(|_| {
+                        // Halves of magnitude 1/4 to 2, either sign.
+                        let r = lcg(&mut xs);
+                        (((r >> 31) << 15 | (13 + (r >> 12) % 3) << 10 | (r & 0x3ff)) as u16).to_le_bytes()
+                    })
+                    .collect();
+                let (xb, _) = buf(&xh);
+                let (rb, _) = buf(&f32b(&vec![0.5f32; rows]));
+                let (yb, yp) = be.ink_buffer(rows * n_out * 4).unwrap();
+                let p = super::super::MmaParams {
+                    n_out: n_out as u32,
+                    n_in: n_in as u32,
+                    w_off: 0,
+                    s_off: 0,
+                    rows: rows as u32,
+                    _p: [0; 3],
+                };
+                run(&|fe| {
+                    let mut first = 0;
+                    for (pipe, n) in [pipes[1], pipes[0], pipes[2]].into_iter().zip(ncls) {
+                        if n > 0 {
+                            fe.pipe(pipe);
+                            fe.buf(epb, 0, 0);
+                            fe.buf(tlb, first * 16, 1);
+                            fe.buf(xb, 0, 2);
+                            fe.buf(yb, 0, 3);
+                            fe.bytes(&p, 4);
+                            fe.buf(rb, 0, 5);
+                            fe.dispatch((n_out / 64, n), 128);
+                        }
+                        first += n;
+                    }
+                });
+                let y = unsafe { std::slice::from_raw_parts(yp as *const f32, rows * n_out) };
+                assert!(y.iter().any(|v| *v != 0.0), "{fmt}: no output");
+                outs.push(y.iter().map(|v| v.to_bits()).collect());
+                for b in [epb, tlb, xb, rb, yb] {
+                    be.ink_release(b);
+                }
+            }
+            assert_eq!(outs[0], outs[1], "prefill (mmag): byte scales differ from f32 scales");
+        }
+        for b in [qb, eb, sb] {
+            be.ink_release(b);
+        }
     }
 }

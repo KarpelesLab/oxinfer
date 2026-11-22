@@ -236,7 +236,8 @@ fn wo_a<'a>(ld: &Loader<'a, '_>, name: &str, groups: usize, rank: usize, n_in: u
             let rows = rank.div_ceil(br);
             let first = g * rank / br;
             let mut s = crate::quant::PageVec::<f32>::zeroed(rows * ncb);
-            s.copy_from_slice(&bs.s[first * ncb..(first + rows) * ncb]);
+            // (`get`: the scales may be MXFP8 exponent bytes kept in place.)
+            s.iter_mut().enumerate().for_each(|(i, v)| *v = bs.get(first * ncb + i));
             let d = &data[g * rank * n_in..(g + 1) * rank * n_in];
             // SAFETY: the weight borrows `files`, which outlives every model holding it.
             let m = crate::ggml::GgufMatrix::fp8(unsafe { crate::quant::QBuf::borrowed(d) }, s.into(), rank, n_in, (br, bc))?;

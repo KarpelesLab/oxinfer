@@ -79,3 +79,5 @@ kernel void ink_combine(device float* a [[buffer(0)]], constant ICbP& p [[buffer
 // Grouped expert GEMMs of the formats the matrix-unit library leaves out.
 #define MK_MXF8 MXF8W{ (device const uchar*)qb, (device const float*)sb, p.n_in }
 MMAG(mmag_nvfp4, NVFP4W, MK_GG(NVFP4W)) MMAG(mmag_Q2_0, Q2_0W, MK_GG(Q2_0W)) MMAG(mmag_mxf8, MXF8W, MK_MXF8)
+#define MK_MXF8B MXF8B{ (device const uchar*)qb, (device const uchar*)sb, p.n_in }
+MMAG(mmag_mxf8b, MXF8B, MK_MXF8B)

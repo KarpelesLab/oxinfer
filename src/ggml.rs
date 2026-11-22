@@ -255,8 +255,8 @@ pub struct BlockScales {
     /// The scales as f32 (empty when `e8m0` holds them).
     pub s: QBuf<f32>,
     /// MXFP8's E8M0 exponent bytes as stored, `2^(e - 127)` (255: NaN), in place of `s`: a
-    /// quarter of the memory. Only for FP8 E4M3 matrices on the CPU kernels (the GPU paths take
-    /// `s`).
+    /// quarter of the memory. Only for FP8 E4M3 matrices, on the CPU kernels and Metal's MXFP8
+    /// expert kernels (the other GPU paths take `s`).
     pub e8m0: Option<QBuf<u8>>,
     pub rows: usize,
     pub cols: usize,
@@ -282,9 +282,14 @@ impl BlockScales {
 }
 
 /// Whether MXFP8 matrices keep their E8M0 scale bytes as stored (a quarter of the f32 scales'
-/// memory): when no GPU backend is active, since the GPU kernels take f32 scales.
+/// memory): on the CPU and on Metal, whose MXFP8 kernels decode the bytes too; not under the
+/// other GPU backends, whose kernels take f32 scales. `OXINFER_MXFP8_SCALES=f32` expands them
+/// anyway (comparisons).
 pub fn e8m0_in_place() -> bool {
-    crate::gpu::active().is_none()
+    if std::env::var("OXINFER_MXFP8_SCALES").is_ok_and(|v| v == "f32") {
+        return false;
+    }
+    crate::gpu::active().is_none_or(|b| b.name() == "metal")
 }
 
 /// The value of an E8M0 scale byte: `2^(b - 127)` (exact, `2^-127` a subnormal), 255 is NaN.
