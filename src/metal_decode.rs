@@ -1394,7 +1394,8 @@ enum MOp {
         n: u32,
     },
     /// Prefill plans: `Norm` of token rows (`pf_norm_half`) that also leaves their half rows in
-    /// the GEMM scratch, as `XHalf` would.
+    /// the GEMM scratch, as `XHalf` would (`p._p` = 1: only those, when nothing reads the f32
+    /// rows).
     NormHalf {
         pipe: Id,
         x: usize,
@@ -1402,8 +1403,9 @@ enum MOp {
         w: Option<usize>,
         p: NormParams,
     },
-    /// Prefill plans: `Glu` of token rows (`pf_glu_half`; `ts` the g, u, out strides) that also
-    /// leaves their half rows in the GEMM scratch.
+    /// Prefill plans: `Glu` of token rows (`pf_glu_half`; `ts` the g, u, out strides, then 1 when
+    /// nothing reads the f32 rows, which are then not stored) that also leaves their half rows in
+    /// the GEMM scratch.
     GluHalf {
         pipe: Id,
         g: usize,
@@ -1996,6 +1998,10 @@ impl MetalBackend {
             }
         }
         let mut xh_of: Option<(usize, usize, usize)> = None;
+        // Prefill plans: the reads of each op's group (its first compiled op), and the f32 rows
+        // the fused half conversions write (their op).
+        let mut group_reads: Vec<(usize, Vec<Range>)> = Vec::new();
+        let mut fused_rows: Vec<(usize, Range)> = Vec::new();
         let mut pf_experts: Vec<PfExperts> = Vec::new();
         // Constants: every vector 64-byte aligned.
         let mut consts: Vec<f32> = Vec::new();
@@ -2030,8 +2036,10 @@ impl MetalBackend {
                 head_from = ops.len();
             }
             let mut emit: Vec<MOp> = Vec::new();
-            // The view whose half rows this op leaves in the GEMM scratch (fused conversions).
+            // The view whose half rows this op leaves in the GEMM scratch (fused conversions),
+            // and the f32 rows it writes as well (dropped below when nothing reads them).
             let mut xh_next: Option<(usize, usize, usize)> = None;
+            let mut fused_out: Option<Range> = None;
             let (r, w): (Vec<Range>, Vec<Range>) = match *op {
                 Op::Norm {
                     x,
@@ -2075,6 +2083,7 @@ impl MetalBackend {
                         });
                         xh_next = Some((out.buf, out.off, n));
                         let span = |v: View, s: usize| rng(v, (rows - 1) * s + n);
+                        fused_out = Some(span(out, out_stride));
                         break 'norm (vec![span(x, x_stride)], vec![span(out, out_stride), (PF_RES, 0, usize::MAX)]);
                     }
                     emit.push(MOp::Norm {
@@ -2153,9 +2162,11 @@ impl MetalBackend {
                         }
                     };
                     if let Some((mut g1, g2)) = mmas {
-                        let mut r = vec![rng(x, n_in), (PF_RES, 0, usize::MAX)];
+                        // (x itself only when converted here: the GEMMs read the half rows.)
+                        let mut r = vec![(PF_RES, 0, usize::MAX)];
                         let mut wv = vec![];
                         if xh_of != Some((x.buf, x.off, n_in)) {
+                            r.push(rng(x, n_in));
                             emit.push(MOp::XHalf {
                                 pipe: self.named_pipeline("x_half")?,
                                 x: byte(x),
@@ -2227,6 +2238,7 @@ impl MetalBackend {
                                         ts: ts_glu,
                                     });
                                     xh_next = Some((y.buf, y.off, n_out));
+                                    fused_out = Some(rng(y, n_out));
                                     wv.push((PF_RES, 0, usize::MAX));
                                 } else {
                                     emit.push(MOp::Glu {
@@ -3508,6 +3520,13 @@ impl MetalBackend {
             if xh_next.is_some() {
                 xh_of = xh_next;
             }
+            if pf {
+                group_reads.push((ops.len(), r.clone()));
+                if let Some(f) = fused_out {
+                    let at = emit.iter().position(|o| matches!(o, MOp::NormHalf { .. } | MOp::GluHalf { .. }));
+                    fused_rows.extend(at.map(|j| (ops.len() + j, f)));
+                }
+            }
             ops.extend(emit);
             if let Some((w, w2)) = smv {
                 streamed.push(StreamedMv { mop: ops.len() - 1, w, w2 });
@@ -3521,6 +3540,24 @@ impl MetalBackend {
         }
         if head_from == usize::MAX {
             head_from = ops.len();
+        }
+        // A fused conversion's f32 rows that no later op and not the host reads are not stored.
+        {
+            let mut host: Vec<Range> = vec![rng(g.hidden, g.n_hidden)];
+            host.extend(g.logits.map(|(v, n)| rng(v, n)));
+            host.extend(g.capture.map(|(v, n)| rng(v, n)));
+            host.extend(g.input2.map(|(v, n)| rng(v, n)));
+            for &(j, f) in &fused_rows {
+                let f = [f];
+                if overlaps(&host, &f) || group_reads.iter().any(|(i, r)| *i > j && overlaps(r, &f)) {
+                    continue;
+                }
+                match &mut ops[j] {
+                    MOp::NormHalf { p, .. } => p._p = 1,
+                    MOp::GluHalf { ts, .. } => ts[3] = 1,
+                    _ => {}
+                }
+            }
         }
         // Streaming units: every streamed matvec must lie in a unit that is not resident.
         let mut units: Vec<PlanUnit> = Vec::new();

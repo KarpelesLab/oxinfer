@@ -1072,7 +1072,8 @@ inline float pf_tg_max(float m, uint sg, uint lane, threadgroup float* red) {
     return max(max(max(red[0], red[1]), max(red[2], red[3])), max(max(red[4], red[5]), max(red[6], red[7])));
 }
 // dec_glu_t's rows (the same values), one threadgroup of 256 per token, also as the scaled half
-// rows `x_half` makes of them (`xh`, `rs`) for the next GEMM.
+// rows `x_half` makes of them (`xh`, `rs`) for the next GEMM (only those with ts.w: nothing reads
+// the f32 rows).
 #define PF_GLU_V 64
 kernel void pf_glu_half(device const float* g [[buffer(0)]], device const float* u [[buffer(1)]], device float* out [[buffer(2)]],
                         constant uint2& p [[buffer(3)]], constant uint4& ts [[buffer(4)]], device half* xh [[buffer(5)]],
@@ -1093,7 +1094,7 @@ kernel void pf_glu_half(device const float* g [[buffer(0)]], device const float*
             act = a / (1.0f + exp(-a));
         }
         v[j] = act * u[(ulong)t * ts.y + i];
-        out[(ulong)t * ts.z + i] = v[j];
+        if (ts.w == 0) out[(ulong)t * ts.z + i] = v[j];
         m = max(m, abs(v[j]));
     }
     m = pf_tg_max(m, sg, lane, red);
@@ -1107,8 +1108,8 @@ kernel void pf_glu_half(device const float* g [[buffer(0)]], device const float*
     if (tid == 0) rs[t] = inv;
 }
 // RMSNorm of token rows (dec_rms_norm's, summed in another order), one threadgroup of 256 per
-// token, n % 4 == 0 and n <= 256 * 4 * PF_NORM_V: the f32 rows and their scaled half rows for the
-// next GEMM (x_half's).
+// token, n % 4 == 0 and n <= 256 * 4 * PF_NORM_V: the f32 rows (unless p._p: nothing reads them)
+// and their scaled half rows for the next GEMM (x_half's).
 #define PF_NORM_V 8
 kernel void pf_norm_half(device const float* x [[buffer(0)]], device float* out [[buffer(1)]], device const float* w [[buffer(2)]],
                          constant NP& p [[buffer(3)]], device half* xh [[buffer(4)]], device float* rs [[buffer(5)]],
@@ -1138,7 +1139,7 @@ kernel void pf_norm_half(device const float* x [[buffer(0)]], device float* out 
         if (i < n4) {
             float4 y = v[j] * k;
             if (p.has_w != 0) y *= w4[i];
-            o[i] = y;
+            if (p._p == 0) o[i] = y;
             v[j] = y;
             float4 a = abs(y);
             m = max(m, max(max(a.x, a.y), max(a.z, a.w)));
