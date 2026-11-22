@@ -1286,7 +1286,7 @@ mod tests {
                     let mut p = params(w, h, fmt);
                     p.color_signal = *sig;
                     let ours = video_frame_to_rgb(&frame, &p).unwrap().data;
-                    // oxideav-pixfmt 0.1.11 has a debug assertion on the formats it lacks.
+                    // Older oxideav-pixfmt releases had a debug assertion on formats they lacked.
                     let convert = || oxideav_image::Image::from_video_frame(frame, &p).and_then(|i| i.to_rgb8());
                     let theirs = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(convert)) {
                         Ok(Ok(v)) => v,
@@ -1307,6 +1307,8 @@ mod tests {
         compared.dedup();
         skipped.dedup();
         eprintln!("same bytes: {compared:?}\nnot converted by oxideav-image: {skipped:?}");
-        assert_eq!(compared.len(), formats.len() - 3, "all but Rgbx, 5-6-5 and 5-5-5");
+        // Every format (oxideav-image 0.0.7 added Rgbx, 5-6-5 and 5-5-5); only odd widths it refuses
+        // for 4:1:1 and packed 4:2:2 are skipped.
+        assert_eq!(compared.len(), formats.len(), "every format at some size");
     }
 }
