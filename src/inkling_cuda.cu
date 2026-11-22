@@ -1166,10 +1166,12 @@ extern "C" __global__ void add_k(float* x, const float* a, u32 n) {
     if (i < n) x[i] += a[i];
 }
 
-// The causal depthwise convolution with a skip, in place over x ([t, ch]): a thread per channel
-// walks the tokens in order with the last k - 1 inputs in registers; `hist` ([k - 1][ch], oldest
-// first) holds them between passes. `dyn` ([t][groups * k]): per-token taps added to channel c's
-// (group c / (ch / groups)).
+// The causal depthwise convolution with a skip, in place over x ([t, ch]) for the positions
+// pos .. pos + t - 1 (pos = info[0]). `hist` is a ring of `ring` rows by position (the host's
+// ConvRing: position p in row (p + k - 1) % ring, `ring` = k - 1 + the positions a session can go
+// back), so the inputs before a pass are found whatever position it starts at; every pass writes
+// its inputs to it. `dyn` ([t][groups * k]): per-token taps added to channel c's (group
+// c / (ch / groups)).
 struct ConvJob {
     float* x;
     float* hist;
@@ -1178,9 +1180,14 @@ struct ConvJob {
 };
 struct ConvJobs {
     ConvJob j[2];
-    u32 ch, k, t, groups;
+    const int* info;
+    u32 ch, k, t, groups, ring;
     float norm;
 };
+__device__ __forceinline__ u64 ring_row(int p, u32 k, u32 ring) { return (u64)((p + (int)k - 1 + 1024 * (int)ring) % (int)ring); }
+
+// Decode (a few tokens): a thread per channel walking the tokens, the last k - 1 inputs in
+// registers.
 extern "C" __global__ void sconv(ConvJobs P) {
     const ConvJob& J = P.j[blockIdx.y];
     float* x = J.x;
@@ -1188,11 +1195,12 @@ extern "C" __global__ void sconv(ConvJobs P) {
     const float* taps = J.taps;
     const float* dyn = J.dyn;
     u32 ch = P.ch, k = P.k, t = P.t, groups = P.groups;
+    int pos = P.info[0];
     float norm = P.norm;
     u32 c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= ch) return;
     float win[8];
-    for (u32 i = 0; i + 1 < k; i++) win[i] = hist[(u64)i * ch + c];
+    for (u32 i = 0; i + 1 < k; i++) win[i] = hist[ring_row(pos - (int)(k - 1) + (int)i, k, P.ring) * ch + c];
     float tp[8];
     for (u32 l = 0; l < k; l++) tp[l] = taps[(u64)l * ch + c];
     u32 grp = dyn ? c / (ch / groups) : 0;
@@ -1202,44 +1210,43 @@ extern "C" __global__ void sconv(ConvJobs P) {
         float acc = cur + (tp[0] + (dr ? dr[0] : 0.f)) * cur;
         for (u32 l = 1; l < k; l++) acc += (tp[l] + (dr ? dr[l] : 0.f)) * win[k - 1 - l];
         x[(u64)ti * ch + c] = acc * norm;
+        hist[ring_row(pos + (int)ti, k, P.ring) * ch + c] = cur;
         for (u32 i = 0; i + 2 < k; i++) win[i] = win[i + 1];
         if (k > 1) win[k - 2] = cur;
     }
-    for (u32 i = 0; i + 1 < k; i++) hist[(u64)i * ch + c] = win[i];
 }
 
-// Prefill convolutions, a thread per (channel, token), out of place into y; `sconv_fin` then
-// copies y back and moves the history on.
+// Prefill convolutions, a thread per (channel, token), out of place into y; `sconv_hist` then
+// writes the pass's inputs to the ring (before y is copied over x).
 extern "C" __global__ void sconv_par(ConvJobs P, float* y0, float* y1) {
     const ConvJob& J = P.j[blockIdx.z];
     float* y = blockIdx.z ? y1 : y0;
     u32 c = blockIdx.x * blockDim.x + threadIdx.x, ti = blockIdx.y;
     u32 ch = P.ch, k = P.k;
+    int pos = P.info[0];
     if (c >= ch) return;
     u32 grp = J.dyn ? c / (ch / P.groups) : 0;
     const float* dr = J.dyn ? J.dyn + ((u64)ti * P.groups + grp) * k : nullptr;
     float acc = J.x[(u64)ti * ch + c];
     for (u32 l = 0; l < k; l++) {
-        // Input ti - l: x, or the history before x (oldest first).
+        // Input ti - l: x, or the ring before x.
         int src = (int)ti - (int)l;
-        float v = src >= 0 ? J.x[(u64)src * ch + c] : J.hist[(u64)((int)k - 1 + src) * ch + c];
+        float v = src >= 0 ? J.x[(u64)src * ch + c] : J.hist[ring_row(pos + src, k, P.ring) * ch + c];
         acc += (J.taps[(u64)l * ch + c] + (dr ? dr[l] : 0.f)) * v;
     }
     y[(u64)ti * ch + c] = acc * P.norm;
 }
-// After `sconv_par` (and before y is copied over x): the history becomes the last k - 1 inputs,
-// from x where it has them, else from the old history.
+// The last min(t, ring) inputs of the pass into the ring.
 extern "C" __global__ void sconv_hist(ConvJobs P) {
     const ConvJob& J = P.j[blockIdx.z];
-    u32 ch = P.ch, k = P.k, t = P.t;
-    u32 i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= ch) return;
-    float w[8];
-    for (u32 q = 0; q + 1 < k; q++) {
-        int src = (int)t - (int)(k - 1) + (int)q;
-        w[q] = src >= 0 ? J.x[(u64)src * ch + i] : J.hist[(u64)((int)k - 1 + src) * ch + i];
-    }
-    for (u32 q = 0; q + 1 < k; q++) J.hist[(u64)q * ch + i] = w[q];
+    u32 ch = P.ch, t = P.t;
+    int pos = P.info[0];
+    u32 n = min(t, P.ring);
+    u64 i = (u64)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (u64)n * ch) return;
+    u32 r = (u32)(i / ch), c = (u32)(i % ch);
+    u32 ti = t - n + r;
+    J.hist[ring_row(pos + (int)ti, P.k, P.ring) * ch + c] = J.x[(u64)ti * ch + c];
 }
 
 // Per-vector post-processing of n-value vectors (a warp each; nv per token, rows `stride` apart):

@@ -24,7 +24,9 @@
 //! 128, more than 4 query heads per key/value head, and models that do not fit in VRAM
 //! (`OXINFER_GPU_PLAN_DEBUG=1` says why; `OXINFER_INKLING_GPU=0` keeps the CPU path).
 
-use super::{DevBox, DevEngine, DevSession, Gate, InNorm, Inkling2Model, Inkling2Session, KvCache, KvConv, KvRows, LayerState, MIX_EPS};
+use super::{
+    DevBox, DevEngine, DevSession, Gate, InNorm, Inkling2Model, Inkling2Session, KvCache, KvConv, KvRows, LayerState, MIX_EPS, ROLLBACK,
+};
 use crate::cuda::{Cu, CudaBackend};
 use crate::ggml::GgmlType;
 use crate::model::{Lin, Weight};
@@ -76,8 +78,10 @@ macro_rules! args {
     ($($v:expr),* $(,)?) => { [$( &$v as *const _ as *mut c_void ),*] };
 }
 
-/// Most tokens a pass runs on the matvec kernels (more take the GEMMs).
-const MV_T: usize = 4;
+/// Most tokens a pass runs on the decode kernels (more take the GEMMs and the tiled attention):
+/// every token of such a pass is computed as in a pass of its own (speculative verification
+/// stays exact).
+const MV_T: usize = 16;
 /// Most tokens of one device pass (longer calls run in chunks).
 const CHUNK: usize = 1024;
 /// Key splits of a decode step's attention: full and sliding layers.
@@ -85,6 +89,8 @@ const SPLITS_FULL: usize = 32;
 const SPLITS_SLIDING: usize = 16;
 /// Block states the mixes take (`MAXS` in the kernels).
 const MAX_STATES: usize = 11;
+/// Most captured streams per token (`DevWant::capture`; DSpark drafts read four).
+const MAX_CAPTURE: usize = 8;
 /// Kept free on the device beyond the weights and activations.
 const RESERVE: usize = 1 << 30;
 /// Kept free when a session's caches are allocated or grown (the session then moves to the host).
@@ -210,10 +216,12 @@ struct ConvJob {
 #[derive(Clone, Copy, Default)]
 struct ConvJobs {
     j: [ConvJob; 2],
+    info: u64,
     ch: u32,
     k: u32,
     t: u32,
     groups: u32,
+    ring: u32,
     norm: f32,
 }
 
@@ -391,11 +399,15 @@ pub(super) struct DevSess {
     slots: Vec<Slot>,
     /// 0 f32, 1 f16, 2 q8.
     fmt: u32,
-    /// The captured decode step and the cache capacities it was captured with.
-    graph: Option<(F, F, Vec<usize>)>,
+    /// Captured passes of up to `MV_T` tokens.
+    graphs: Vec<PassGraph>,
     /// The engine whose buffers a graph uses.
     engine: usize,
 }
+/// A captured pass: (tokens, captured steps, the cache capacities it was captured with,
+/// executable, graph).
+type PassGraph = (usize, Vec<usize>, Vec<usize>, F, F);
+
 // SAFETY: device addresses and driver handles; the driver API is thread-safe and the context is
 // made current before use.
 unsafe impl Send for DevSess {}
@@ -406,7 +418,7 @@ impl DevSess {
         unsafe { self.x.cuCtxSetCurrent(self.ctx) == 0 }
     }
     fn drop_graph(&mut self) {
-        if let Some((exec, g, _)) = self.graph.take() {
+        for (_, _, _, exec, g) in self.graphs.drain(..) {
             unsafe {
                 self.x.cuGraphExecDestroy(exec);
                 self.x.cuGraphDestroy(g);
@@ -482,7 +494,7 @@ impl DevSession for DevSess {
             ctx: self.ctx,
             slots,
             fmt: self.fmt,
-            graph: None,
+            graphs: Vec::new(),
             engine: self.engine,
         })
     }
@@ -491,6 +503,11 @@ impl DevSession for DevSess {
     }
     fn as_any(&mut self) -> &mut dyn std::any::Any {
         self
+    }
+    /// Nothing to undo: the caches are by position (the sliding rings keep `CHUNK` rows more
+    /// than the window), and so are the convolutions' rings.
+    fn truncate(&mut self, pos: usize, len: usize) -> bool {
+        pos - len <= ROLLBACK
     }
 }
 
@@ -580,6 +597,8 @@ struct Arena {
     tiles: u64,
     ntiles: u64,
     cnt: u64,
+    /// Captured streams, `[MAX_CAPTURE][tokens][hidden]`.
+    cap: u64,
     /// The unembedding of up to 16 rows.
     head: u64,
     head_out: u64,
@@ -1092,6 +1111,7 @@ impl Engine {
             tiles: 0,
             ntiles: 0,
             cnt: 0,
+            cap: 0,
             head: 0,
             head_out: 0,
         }
@@ -1378,6 +1398,7 @@ impl Engine {
             tiles: f(3 * (tk / 64 + self.ne + 1))?,
             ntiles: f(1)?,
             cnt: f(self.ne)?,
+            cap: f(MAX_CAPTURE * t * h)?,
             head: f(16 * self.vocab)?,
             head_out: f(16 * self.vocab)?,
         })
@@ -1673,17 +1694,22 @@ impl Engine {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn sconv(&self, x: u64, hist: u64, taps: u64, dyn_: u64, ch: usize, groups: usize, t: usize, norm: f32) {
-        self.sconvs(&[ConvJob { x, hist, taps, dyn_ }], ch, groups, t, norm);
+    fn sconv(&self, x: u64, hist: u64, taps: u64, dyn_: u64, ch: usize, groups: usize, t: usize, norm: f32, info: u64) {
+        self.sconvs(&[ConvJob { x, hist, taps, dyn_ }], ch, groups, t, norm, info);
     }
 
-    /// One or two convolutions of the same shape in one launch.
-    fn sconvs(&self, jobs: &[ConvJob], ch: usize, groups: usize, t: usize, norm: f32) {
+    /// One or two convolutions of the same shape in one launch, for the positions from
+    /// `info[0]`, their histories rings of `kernel - 1 + ROLLBACK` rows by position.
+    #[allow(clippy::too_many_arguments)]
+    fn sconvs(&self, jobs: &[ConvJob], ch: usize, groups: usize, t: usize, norm: f32, info: u64) {
+        let ring = self.conv_k - 1 + ROLLBACK;
         let mut p = ConvJobs {
+            info,
             ch: ch as u32,
             k: self.conv_k as u32,
             t: t as u32,
             groups: groups as u32,
+            ring: ring as u32,
             norm,
             ..Default::default()
         };
@@ -1696,7 +1722,7 @@ impl Engine {
         // Prefill: a thread per (channel, token) into scratch, then the history, then the copy.
         let n = jobs.len() as u32;
         self.go(self.f("sconv_par"), (ceil(ch, 128), t as u32, n), 128, &mut args![p, ar.0, ar.1]);
-        self.go(self.f("sconv_hist"), (ceil(ch, 128), 1, n), 128, &mut args![p]);
+        self.go(self.f("sconv_hist"), (ceil(t.min(ring) * ch, 128), 1, n), 128, &mut args![p]);
         for (j, y) in jobs.iter().zip([ar.0, ar.1]) {
             self.copy(j.x, y, t * ch);
         }
@@ -1787,6 +1813,7 @@ impl Engine {
             nkv,
             t,
             norm,
+            ar.info,
         );
         let alpha = if l.full { self.alpha } else { 0.0 };
         self.vec_posts(
@@ -1806,7 +1833,8 @@ impl Engine {
             128,
             &mut args![ar.k, ar.v, s.k, s.v, s.ks, s.vs, kw as u32, t as u32, s.cap as u32, fmt, ar.info],
         );
-        let ns = if t == 1 {
+        // Up to MV_T tokens: each token's keys split as in a pass of its own.
+        let ns = if t <= MV_T {
             if l.full { SPLITS_FULL } else { SPLITS_SLIDING }
         } else {
             (256 / (t * nkv)).clamp(1, if l.full { SPLITS_FULL } else { SPLITS_SLIDING })
@@ -1832,7 +1860,7 @@ impl Engine {
             rs: (nh * dr) as u32,
             scaling: (d as f32).powf(-0.5),
         };
-        if t >= 16 && nh / nkv <= 3 {
+        if t > MV_T && nh / nkv <= 3 {
             // Prefill: query tiles of 8 sharing their keys and values (`attnt_*`); splits of the
             // keys when the tiles alone do not fill the device.
             let tiles = t.div_ceil(8);
@@ -1976,7 +2004,9 @@ impl Engine {
 
     /// One pass of `t` tokens (their embeddings in `ar.x`, the position in `ar.info`) into
     /// `ar.out` (final-normed hidden states), as `Inkling2Model::forward_capture`.
-    fn pass(&self, m: &Inkling2Model, ar: &Arena, s: &DevSess, t: usize) {
+    /// `capture`: the steps whose entering stream goes to `ar.cap` (`[capture.len()][t][hidden]`;
+    /// `steps().len()` the last layer's output).
+    fn pass(&self, m: &Inkling2Model, ar: &Arena, s: &DevSess, t: usize, capture: &[usize]) {
         let c = &m.cfg;
         let h = self.h;
         let n = t * h;
@@ -1985,7 +2015,13 @@ impl Engine {
         let mut states: Vec<u64> = Vec::new();
         let mut pre_n = 0usize;
         let mut bank: Option<Vec<u64>> = None;
-        for step in c.steps() {
+        let steps = c.steps();
+        let grab = |si: usize| {
+            for (k, _) in capture.iter().enumerate().filter(|e| *e.1 == si) {
+                self.copy(ar.cap + (k * n * 4) as u64, ar.x, n);
+            }
+        };
+        for (si, step) in steps.iter().enumerate() {
             let l = &self.layers[step.layer];
             let slot = &s.slots[step.slot];
             if let Some(lc) = c.loop_cfg
@@ -2004,6 +2040,8 @@ impl Engine {
                     self.copy(ar.x, ar.pre_x, n);
                 }
             }
+            // (The stream entering the step: after the loop's restart, as the CPU captures it.)
+            grab(si);
             let msgs = match (&bank, &l.looped) {
                 (Some(bs), Some(lp)) if step.pass > 0 => {
                     self.mix(bs, ar.bank_x, lp.query, 4, &ar.msgs, &[], t);
@@ -2053,7 +2091,7 @@ impl Engine {
                 }
             };
             self.attention(ar, l, xs[0], xs[1], xs[2], slot, s.fmt, t);
-            self.sconv(ar.a, slot.hist[2], l.attn_taps, 0, h, 1, t, conv_norm);
+            self.sconv(ar.a, slot.hist[2], l.attn_taps, 0, h, 1, t, conv_norm, ar.info);
             if l.boundary {
                 let st = free.pop().expect("inkling cuda: block states");
                 self.rms(ar.x, st, 0, h, MIX_EPS, t);
@@ -2080,7 +2118,7 @@ impl Engine {
                 }
             };
             self.moe(ar, l, hn, ar.o, t);
-            self.sconv(ar.o, slot.hist[3], l.mlp_taps, 0, h, 1, t, conv_norm);
+            self.sconv(ar.o, slot.hist[3], l.mlp_taps, 0, h, 1, t, conv_norm, ar.info);
             self.go(
                 self.f("add_k"),
                 ((n as u32).div_ceil(256), 1, 1),
@@ -2088,6 +2126,7 @@ impl Engine {
                 &mut args![ar.x, ar.o, n as u32],
             );
         }
+        grab(steps.len());
         self.mix(&states, ar.x, self.final_query, 1, &[ar.out], &[self.final_norm], t);
     }
 
@@ -2139,14 +2178,16 @@ impl Engine {
             ctx: self.ctx,
             slots: Vec::new(),
             fmt,
-            graph: None,
+            graphs: Vec::new(),
             engine: self as *const Engine as usize,
         };
         for &li in &slot_layer {
             let l = &self.layers[li];
             let kw = l.nkv * 128;
             let cap = self.cap_for(l, pos);
-            let hist_len = [back * kw, back * kw, back * self.h, back * self.h];
+            // The convolutions' rings by position, as the host's (`ConvRing`).
+            let rows = back + ROLLBACK;
+            let hist_len = [rows * kw, rows * kw, rows * self.h, rows * self.h];
             // Every buffer of the slot, or none (what was allocated goes with `sess`).
             let mut slot = Slot {
                 k: 0,
@@ -2263,8 +2304,9 @@ impl Engine {
         for (hs, d) in sess.layers.iter().zip(&ds.slots) {
             let kw = d.kw;
             for (i, hp) in d.hist.iter().enumerate() {
-                // The host's ring by position; the device keeps the last `kernel - 1` inputs.
-                let v = hs.hist[i].last(pos);
+                // The host's ring by position, in the device's layout.
+                let v = &hs.hist[i].rows;
+                debug_assert_eq!(v.len(), d.hist_len[i]);
                 unsafe { self.cu.cuMemcpyHtoD_v2(*hp, v.as_ptr() as *const c_void, v.len() * 4) };
             }
             // Rows first..pos to rows p % cap: at most two runs (the ring wraps once).
@@ -2305,12 +2347,13 @@ impl Engine {
         for ((hs, d), &li) in sess.layers.iter_mut().zip(&ds.slots).zip(&slot_layer) {
             let kw = d.kw;
             for (i, hp) in d.hist.iter().enumerate() {
-                let mut v = vec![0f32; d.hist_len[i]];
+                let v = &mut hs.hist[i].rows;
+                v.resize(d.hist_len[i], 0.0);
                 unsafe { self.cu.cuMemcpyDtoH_v2(v.as_mut_ptr() as *mut c_void, *hp, v.len() * 4) };
-                hs.hist[i].set_last(pos, &v);
             }
             let l = &self.layers[li];
-            let first = if l.full { 0 } else { pos.saturating_sub(self.window) };
+            // (A sliding layer keeps `ROLLBACK` positions more than its window, as on the host.)
+            let first = if l.full { 0 } else { pos.saturating_sub(self.window + ROLLBACK) };
             let n = pos - first;
             let rows_of = |dev: u64, devs: u64| -> KvRows {
                 let mut kr = KvRows::new(mode);
@@ -2356,7 +2399,22 @@ impl Engine {
 
     /// Runs `x` (`[t, hidden]`) through the device session of `sess`.
     /// None, with `sess` as it was, when the device cannot hold its caches for this call.
-    fn run_pass(&self, m: &Inkling2Model, sess: &mut Inkling2Session, x: &[f32], t: usize) -> Option<Vec<f32>> {
+    /// `capture`: the steps whose entering streams go to `feats` (`[t][capture.len()][hidden]`;
+    /// the final-normed one, `steps().len() + 1`, is the caller's).
+    fn run_pass(
+        &self,
+        m: &Inkling2Model,
+        sess: &mut Inkling2Session,
+        x: &[f32],
+        t: usize,
+        capture: &[usize],
+        mut feats: Option<&mut Vec<f32>>,
+    ) -> Option<Vec<f32>> {
+        let nf = capture.len();
+        if let Some(f) = feats.as_deref_mut() {
+            f.clear();
+            f.resize(t * nf * self.h, 0.0);
+        }
         let h = self.h;
         assert!(unsafe { self.x.cuCtxSetCurrent(self.ctx) } == 0, "inkling cuda: context");
         if sess.dev.is_none() {
@@ -2388,29 +2446,42 @@ impl Engine {
                 self.x
                     .cuMemcpyHtoDAsync_v2(ar.x, x[done * h..].as_ptr() as *const c_void, n * h * 4, self.stream);
             }
-            if n == 1 && graphs() && self.prof.is_none() {
+            if n <= MV_T && graphs() && self.prof.is_none() {
+                // Passes of a few tokens as CUDA graphs, one per token count and captured steps.
                 let caps: Vec<usize> = ds.slots.iter().map(|s| s.cap).collect();
-                if ds.graph.as_ref().is_some_and(|g| g.2 != caps) {
+                if ds.graphs.first().is_some_and(|g| g.2 != caps) {
                     ds.drop_graph();
                 }
-                if ds.graph.is_none() {
-                    ds.graph = self.capture(m, &ar, ds).map(|(e, g)| (e, g, caps));
+                if !ds.graphs.iter().any(|g| g.0 == n && g.1 == capture)
+                    && let Some((e, g)) = self.capture(m, &ar, ds, n, capture)
+                {
+                    ds.graphs.push((n, capture.to_vec(), caps, e, g));
                 }
-                match &ds.graph {
-                    Some((exec, _, _)) => assert!(
-                        unsafe { self.x.cuGraphLaunch(*exec, self.stream) } == 0,
-                        "inkling cuda: graph launch"
-                    ),
-                    None => self.pass(m, &ar, ds, 1),
+                match ds.graphs.iter().find(|g| g.0 == n && g.1 == capture) {
+                    Some(g) => assert!(unsafe { self.x.cuGraphLaunch(g.3, self.stream) } == 0, "inkling cuda: graph launch"),
+                    None => self.pass(m, &ar, ds, n, capture),
                 }
             } else {
-                self.pass(m, &ar, ds, n);
+                self.pass(m, &ar, ds, n, capture);
             }
+            let mut cap = vec![0f32; if feats.is_some() { nf * n * h } else { 0 }];
             unsafe {
                 self.x
                     .cuMemcpyDtoHAsync_v2(out[done * h..].as_mut_ptr() as *mut c_void, ar.out, n * h * 4, self.stream);
+                if !cap.is_empty() {
+                    self.x
+                        .cuMemcpyDtoHAsync_v2(cap.as_mut_ptr() as *mut c_void, ar.cap, cap.len() * 4, self.stream);
+                }
                 let rc = self.x.cuStreamSynchronize(self.stream);
                 assert!(rc == 0, "inkling cuda: a pass failed ({rc})");
+            }
+            if let Some(f) = feats.as_deref_mut() {
+                for k in 0..nf {
+                    for ti in 0..n {
+                        let dst = ((done + ti) * nf + k) * h;
+                        f[dst..dst + h].copy_from_slice(&cap[(k * n + ti) * h..(k * n + ti + 1) * h]);
+                    }
+                }
             }
             self.prof_collect();
             sess.pos += n;
@@ -2419,14 +2490,14 @@ impl Engine {
         Some(out)
     }
 
-    /// Captures a one-token pass as a graph.
-    fn capture(&self, m: &Inkling2Model, ar: &Arena, ds: &DevSess) -> Option<(F, F)> {
+    /// Captures a pass of `t` tokens as a graph.
+    fn capture(&self, m: &Inkling2Model, ar: &Arena, ds: &DevSess, t: usize, capture: &[usize]) -> Option<(F, F)> {
         unsafe {
             if self.x.cuStreamBeginCapture_v2(self.stream, 1) != 0 {
                 return None;
             }
         }
-        self.pass(m, ar, ds, 1);
+        self.pass(m, ar, ds, t, capture);
         let mut g = std::ptr::null_mut();
         if unsafe { self.x.cuStreamEndCapture(self.stream, &mut g) } != 0 || g.is_null() {
             debug("graph capture failed");
@@ -2495,11 +2566,18 @@ fn graphs() -> bool {
 }
 
 impl DevEngine for Engine {
+    fn rollback(&self) -> usize {
+        ROLLBACK
+    }
     fn run(&self, m: &Inkling2Model, sess: &mut Inkling2Session, x: &[f32], t: usize, want: super::DevWant) -> bool {
-        if want.capture.is_some() {
+        let (capture, feats) = match want.capture {
+            Some((c, f)) => (c, Some(f)),
+            None => (&[][..], None),
+        };
+        if capture.len() > MAX_CAPTURE {
             return false;
         }
-        let Some(hs) = self.run_pass(m, sess, x, t) else {
+        let Some(hs) = self.run_pass(m, sess, x, t, capture, feats) else {
             // The device cannot hold this session: it stays on the host from now on.
             sess.dev_off = true;
             return false;
@@ -2514,7 +2592,7 @@ impl DevEngine for Engine {
         true
     }
     fn forward(&self, m: &Inkling2Model, sess: &mut Inkling2Session, x: &[f32], t: usize) -> Vec<f32> {
-        self.run_pass(m, sess, x, t)
+        self.run_pass(m, sess, x, t, &[], None)
             .expect("inkling cuda: no device memory for the session")
     }
     fn head(&self, _m: &Inkling2Model, hidden: &[f32], t: usize, cap: bool) -> Option<Vec<f32>> {
@@ -2982,25 +3060,28 @@ mod tests {
         crate::pool::init(4);
         let mut e = Engine::bare(be, &[0]).unwrap();
         let mut seed = 3u64;
-        // Short convolutions, static and with per-token taps, one token and seven.
+        // Short convolutions, static and with per-token taps, over rings by position: one token
+        // and seven (the decode kernel), 70 (the prefill kernels; more than the ring holds), from
+        // position 100 (the ring wraps).
         let (ch, kn, groups) = (96usize, 4usize, 3usize);
         e.conv_k = kn;
+        e.conv_scratch = (zeros(&e, 70 * ch), zeros(&e, 70 * ch));
+        let info = zeros(&e, 4);
         for dynamic in [false, true] {
-            for t in [1usize, 7] {
+            for t in [1usize, 7, 70] {
+                let pos = 100usize;
+                set_info(&e, info, pos);
                 let taps = rnds(kn * ch, &mut seed, 0.5);
-                let hist = rnds((kn - 1) * ch, &mut seed, 1.0);
+                let mut ring = super::super::ConvRing::new(kn, ch);
+                ring.rows = rnds(ring.rows.len(), &mut seed, 1.0);
                 let mut x = rnds(t * ch, &mut seed, 1.0);
                 let dy = rnds(t * groups * kn, &mut seed, 0.3);
-                let (px, ph, pt) = (e.upf(&x).unwrap(), e.upf(&hist).unwrap(), e.upf(&taps).unwrap());
+                let (px, ph, pt) = (e.upf(&x).unwrap(), e.upf(&ring.rows).unwrap(), e.upf(&taps).unwrap());
                 let pd = if dynamic { e.upf(&dy).unwrap() } else { 0 };
-                e.sconv(px, ph, pt, pd, ch, groups, t, 0.4);
-                let (gx, gh) = (down(&e, px, t * ch), down(&e, ph, (kn - 1) * ch));
-                // The host's ring holds the same inputs before position 0.
-                let mut ring = super::super::ConvRing::new(kn, ch);
-                ring.set_last(0, &hist);
-                super::super::short_conv(&taps, dynamic.then_some((&dy[..], groups)), &mut ring, &mut x, ch, 0.4, 0);
-                let hist = ring.last(t);
-                for (a, b) in gx.iter().zip(&x).chain(gh.iter().zip(&hist)) {
+                e.sconv(px, ph, pt, pd, ch, groups, t, 0.4, info);
+                let (gx, gh) = (down(&e, px, t * ch), down(&e, ph, ring.rows.len()));
+                super::super::short_conv(&taps, dynamic.then_some((&dy[..], groups)), &mut ring, &mut x, ch, 0.4, pos);
+                for (a, b) in gx.iter().zip(&x).chain(gh.iter().zip(&ring.rows)) {
                     assert!((a - b).abs() < 1e-5, "short conv (dynamic {dynamic}, {t} tokens): {a} against {b}");
                 }
             }

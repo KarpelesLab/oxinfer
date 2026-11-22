@@ -15,6 +15,10 @@
 //!
 //! `--seed N` picks another pseudo-random prompt.
 //!
+//! `--rollback R` (device only): after the decode steps, goes back R positions and feeds the same
+//! tokens again, one at a time and then as one pass, comparing the logits with the first time
+//! (a session's caches and convolution rings by position: they must match exactly).
+//!
 //! `--keep N` (with `--all`): only the logits of the last N prompt positions are kept.
 //!
 //! `--depth D` first runs D untimed tokens (in chunks of `--chunk`), as llama-bench's `-d`: the
@@ -62,6 +66,7 @@ fn main() -> Result<()> {
     let mut tail = 0usize;
     let mut keep = usize::MAX;
     let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut rollback = 0usize;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--prompt-len" => plen = args.next().context("N")?.parse()?,
@@ -75,6 +80,7 @@ fn main() -> Result<()> {
             "--depth" => depth = args.next().context("D")?.parse()?,
             "--tail" => tail = args.next().context("N")?.parse()?,
             "--keep" => keep = args.next().context("N")?.parse()?,
+            "--rollback" => rollback = args.next().context("R")?.parse()?,
             "--seed" => seed ^= args.next().context("N")?.parse::<u64>()?.wrapping_mul(0x9E37_79B9_7F4A_7C15),
             o => anyhow::bail!("unknown argument {o}"),
         }
@@ -164,6 +170,45 @@ fn main() -> Result<()> {
             b.extend(l.iter().flat_map(|v| v.to_le_bytes()));
         }
         std::fs::write(f, b)?;
+        return Ok(());
+    }
+    if rollback > 0 {
+        let mut sess = m.new_session();
+        for c in tokens.chunks(chunk) {
+            m.forward_hidden(&mut sess, c);
+        }
+        let mut toks = vec![];
+        let mut first = vec![];
+        let mut tk = 1000u32;
+        for _ in 0..steps {
+            let lg = m.forward(&mut sess, &[tk]);
+            toks.push(tk);
+            tk = argmax(&lg) as u32;
+            first.push(lg);
+        }
+        let back = rollback.min(steps);
+        sess.truncate(sess.pos - back)?;
+        let mut worst = 0f32;
+        for i in steps - back..steps {
+            let lg = m.forward(&mut sess, &[toks[i]]);
+            worst = worst.max(lg.iter().zip(&first[i]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max));
+        }
+        println!("rollback {back}, one token at a time: max logit diff {worst:.3e} against the first time");
+        sess.truncate(sess.pos - back)?;
+        let hs = m.forward_hidden(&mut sess, &toks[steps - back..]);
+        let lg = m.logits(&hs, back);
+        let u = m.cfg.unpadded_vocab_size;
+        let mut worst = 0f32;
+        for (j, i) in (steps - back..steps).enumerate() {
+            worst = worst.max(
+                lg[j * u..(j + 1) * u]
+                    .iter()
+                    .zip(&first[i])
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max),
+            );
+        }
+        println!("rollback {back}, as one pass of {back}: max logit diff {worst:.3e} against one-token steps");
         return Ok(());
     }
     let Some(f) = load else {

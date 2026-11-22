@@ -1042,27 +1042,6 @@ impl ConvRing {
         let s = self.slot(p);
         &mut self.rows[s * self.ch..(s + 1) * self.ch]
     }
-    /// The `kernel - 1` inputs before position `pos`, oldest first (a device's history).
-    #[cfg_attr(
-        not(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))),
-        allow(dead_code)
-    )]
-    pub(crate) fn last(&self, pos: usize) -> Vec<f32> {
-        (pos as isize - self.back as isize..pos as isize)
-            .flat_map(|p| self.row(p).iter().copied())
-            .collect()
-    }
-    /// Sets the `kernel - 1` inputs before position `pos` from `v` (oldest first).
-    #[cfg_attr(
-        not(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))),
-        allow(dead_code)
-    )]
-    pub(crate) fn set_last(&mut self, pos: usize, v: &[f32]) {
-        let ch = self.ch;
-        for (i, p) in (pos as isize - self.back as isize..pos as isize).enumerate() {
-            self.row_mut(p).copy_from_slice(&v[i * ch..(i + 1) * ch]);
-        }
-    }
 }
 
 /// The decoding state of one layer.
