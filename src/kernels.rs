@@ -2991,9 +2991,10 @@ mod tests {
             matmul(&w, n_out, n_in, &x, t, &mut y);
             check(&format!("bf16 t={t}"), &y, &yr);
             // Whatever GEMM the driver took (the cache-blocked AVX-512 one through the quantized
-            // driver, where there is one), the bits are those of the row-block kernel.
+            // driver, where there is one), the bits are those of the row-block kernel. Not the
+            // SME GEMM's on a partial group of 8 rows (see `sme_gemm_matches_neon_f32_bitwise`).
             #[cfg(has_simd)]
-            {
+            if !(t > decode_max_tokens() && sme_available()) {
                 let xt = (t >= TN).then(|| pack_xt(&x, t, n_in));
                 let mut yb = vec![0f32; t * n_out];
                 unsafe { matmul_block(&w, n_out, n_in, &x, xt.as_deref(), t, 0, n_out, yb.as_mut_ptr()) };
