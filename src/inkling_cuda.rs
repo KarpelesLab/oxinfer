@@ -2569,6 +2569,10 @@ impl DevEngine for Engine {
     fn rollback(&self) -> usize {
         ROLLBACK
     }
+    /// Passes of up to `MV_T` tokens run on the decode kernels, each token as alone.
+    fn exact_tokens(&self) -> usize {
+        MV_T
+    }
     fn run(&self, m: &Inkling2Model, sess: &mut Inkling2Session, x: &[f32], t: usize, want: super::DevWant) -> bool {
         let (capture, feats) = match want.capture {
             Some((c, f)) => (c, Some(f)),

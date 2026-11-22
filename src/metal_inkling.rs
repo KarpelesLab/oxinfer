@@ -38,6 +38,8 @@ const SRC: &str = include_str!("metal_inkling.metal");
 /// Dispatches and barriers encoded so far (`OXINFER_INKLING_PROFILE` reports them per pass).
 static DISPATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 static BARRIERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Where each pipeline of a profile was set (`Pe::pipe`).
+static PIPE_SITES: std::sync::Mutex<std::collections::BTreeMap<usize, String>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// `OXINFER_INKLING_PROFILE=N`: passes of up to [`MAX_T`] tokens run cut at every barrier, each
 /// stage in a command buffer of its own, and every N passes (default 16) the GPU time per kernel
@@ -89,7 +91,16 @@ impl<'f> Pe<'f> {
             pr.stage.borrow_mut().push(p as usize);
         }
     }
+    #[track_caller]
     fn pipe(&self, p: Id) {
+        if self.prof.is_some() {
+            // (Pipelines of other libraries are named by where they were set.)
+            let l = std::panic::Location::caller();
+            PIPE_SITES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(p as usize, format!("{}:{}", l.file(), l.line()));
+        }
         self.note(p);
         self.fe().pipe(p);
     }
@@ -308,6 +319,12 @@ struct MixP {
     mix_eps: f32,
     _p: u32,
     s: [u32; 16],
+    cat: u32,
+    cat_qs: u32,
+    cat_ts: u32,
+    cat_last: u32,
+    cat_n: u32,
+    _p1: [u32; 3],
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -780,6 +797,7 @@ struct Pipes {
     xcombine: Id,
     conv_mix: Id,
     gmix_norm: Id,
+    gfg: Id,
     lora_a: Id,
     lora_b: Id,
     xlora_a: Id,
@@ -1298,6 +1316,12 @@ impl InkMetal {
             };
             let (nr1, ks1) = if specialized(w.fmt) { (1, ks) } else { (2, 4) };
             let one = (be.mv_pipe(w.fmt, nr1, ks1).context("mv pipeline")?, nr1, ks1);
+            if profile_every() > 0 {
+                eprintln!(
+                    "[inkling profile: matvec [{n_out}, {n_in}] {:?}: pipeline {:#x}]",
+                    w.fmt, one.0 as usize
+                );
+            }
             let mk = |tt: usize| -> anyhow::Result<(Id, usize, usize)> {
                 Ok((
                     be.mvk_pipe(w.fmt, mvk_rows(tt), ks, tt).context("mvk pipeline")?,
@@ -1792,6 +1816,7 @@ impl InkMetal {
             xgroup: pipe("ink_xgroup")?,
             conv_mix: pipe("ink_conv_mix")?,
             gmix_norm: pipe("ink_gmix_norm")?,
+            gfg: pipe("ink_gfg")?,
             xcombine: pipe("ink_xcombine")?,
             lora_a: pipe("ink_lora_a")?,
             lora_b: pipe("ink_lora_b")?,
@@ -2006,7 +2031,8 @@ impl InkMetal {
         let a = c.a;
         if t == 1 {
             let (pipe, nr, ks) = d.one;
-            e.note(pipe);
+            // (The profile's label: the matvec's shape.)
+            e.note(((d.w.n_out << 44) | (d.w.n_in << 24) | (pipe as usize & 0xff_ffff)) as Id);
             encode_mv(&e.fe(), pipe, nr, ks, &d.w, None, (a, x * 4), (a, y * 4), mode, (a, 0));
             return;
         }
@@ -2160,6 +2186,25 @@ impl InkMetal {
 
     #[allow(clippy::too_many_arguments)]
     fn mix(&self, e: &Pe, c: &Cx, states: &[usize], x: usize, q: usize, nq: usize, out: usize, norm: Option<usize>, t: usize) {
+        self.mix_cat(e, c, states, x, q, nq, out, norm, t, None);
+    }
+
+    /// [`Self::mix`], with `cat` (gate inputs `i0 ..`, the last query into `n` of them) also the
+    /// output normed without a weight as the message gates' first stage takes it ([`Self::gate_cat`]).
+    #[allow(clippy::too_many_arguments)]
+    fn mix_cat(
+        &self,
+        e: &Pe,
+        c: &Cx,
+        states: &[usize],
+        x: usize,
+        q: usize,
+        nq: usize,
+        out: usize,
+        norm: Option<usize>,
+        t: usize,
+        cat: Option<(usize, bool, usize)>,
+    ) {
         let mut p = MixP {
             h: self.h as u32,
             ns: states.len() as u32,
@@ -2176,6 +2221,9 @@ impl InkMetal {
         };
         for (d, &s) in p.s.iter_mut().zip(states) {
             *d = c.state(s) as u32;
+        }
+        if let Some(cat) = cat {
+            self.gate_cat(c, &mut p, cat);
         }
         self.std(e, c, self.p.mix);
         e.bytes(&p, 2);
@@ -2215,15 +2263,18 @@ impl InkMetal {
 
     /// Message gates `which` (gate index, input, norm weights, output) with messages `msgs + i`:
     /// the gated inputs RMS-normed into the outputs.
-    fn gates(&self, e: &Pe, c: &Cx, g: &[GateDev; 4], which: &[(usize, usize, usize, usize)], t: usize) {
+    fn gates(&self, e: &Pe, c: &Cx, g: &[GateDev; 4], which: &[(usize, usize, usize, usize)], t: usize, normed: bool) {
         let (h, th) = (self.h, c.b.tm * self.h);
         let b = c.b;
-        for &(i, src, _, _) in which {
-            let cat = b.gcat + i * 2 * th;
-            self.norm(e, c, src, cat, None, self.eps, h, 2 * h, t);
-            self.norm(e, c, b.msgs + i * th, cat + h, None, self.eps, h, 2 * h, t);
+        // (`normed`: the mixes that made the inputs wrote them normed, `mix_cat`.)
+        if !normed {
+            for &(i, src, _, _) in which {
+                let cat = b.gcat + i * 2 * th;
+                self.norm(e, c, src, cat, None, self.eps, h, 2 * h, t);
+                self.norm(e, c, b.msgs + i * th, cat + h, None, self.eps, h, 2 * h, t);
+            }
+            e.barrier();
         }
-        e.barrier();
         for &(i, ..) in which {
             self.mv(
                 e,
@@ -2239,6 +2290,63 @@ impl InkMetal {
             }
         }
         e.barrier();
+        // Float32 or bf16 forget / gain rows of the rank: both matvecs and the mix per channel in
+        // one kernel (`ink_gfg`), then the norm.
+        let fast = |d: &Dw| -> Option<u32> {
+            let el = match d.w.fmt {
+                MvFmt::Gguf(GgmlType::F32) => 4,
+                MvFmt::Bf16 => 2,
+                _ => return None,
+            };
+            (d.lora.is_empty() && self.rank.is_multiple_of(16) && d.w.gpr as usize == self.rank * el).then_some((el == 2) as u32)
+        };
+        if let Some(bf) = which
+            .iter()
+            .map(|&(i, ..)| fast(&g[i].forget).zip(fast(&g[i].gain)))
+            .try_fold(None, |acc: Option<u32>, f| {
+                let (a1, a2) = f?;
+                (a1 == a2 && acc.is_none_or(|x| x == a1)).then_some(Some(a1))
+            })
+            .flatten()
+        {
+            for &(i, src, _, _) in which {
+                #[repr(C)]
+                struct P {
+                    h: u32,
+                    rank: u32,
+                    d: u32,
+                    x: u32,
+                    m: u32,
+                    out: u32,
+                    bf: u32,
+                    _p: u32,
+                }
+                e.pipe(self.p.gfg);
+                e.buf(c.a, 0, 0);
+                e.buf(g[i].forget.w.data, g[i].forget.w.data_off as usize, 1);
+                e.buf(g[i].gain.w.data, g[i].gain.w.data_off as usize, 2);
+                e.bytes(
+                    &P {
+                        h: h as u32,
+                        rank: self.rank as u32,
+                        d: (b.gd + i * c.b.tm * self.rank) as u32,
+                        x: src as u32,
+                        m: (b.msgs + i * th) as u32,
+                        out: (b.gf + i * th) as u32,
+                        bf,
+                        _p: 0,
+                    },
+                    3,
+                );
+                e.dispatch((h.div_ceil(64), t), 256);
+            }
+            e.barrier();
+            for &(i, _, w, out) in which {
+                self.norm(e, c, b.gf + i * th, out, Some(w), self.eps, h, h, t);
+            }
+            e.barrier();
+            return;
+        }
         for &(i, ..) in which {
             let d = b.gd + i * c.b.tm * self.rank;
             self.mv(e, c, &g[i].forget, d, b.gf + i * th, t, MvMode::Store);
@@ -2304,6 +2412,18 @@ impl InkMetal {
     }
 
     /// The parameters of one query's mix (`ink_mix`).
+    /// Points the mix `p` at the message gates' normed inputs: gate `i0` on (`msgs`: the second half
+    /// of each gate's row, the messages' norm), its last query into gates up to 2 (the attention's
+    /// three gates read the last of fewer queries).
+    fn gate_cat(&self, c: &Cx, p: &mut MixP, (i0, msgs, last): (usize, bool, usize)) {
+        let (h, th) = (self.h, c.b.tm * self.h);
+        p.cat = (c.b.gcat + i0 * 2 * th + if msgs { h } else { 0 }) as u32;
+        p.cat_qs = (2 * th) as u32;
+        p.cat_ts = (2 * h) as u32;
+        p.cat_last = last as u32;
+        p.cat_n = if msgs { 1 } else { (3 - i0).saturating_sub(last).max(1) as u32 };
+    }
+
     fn mix_p(&self, c: &Cx, states: &[usize], x: usize, q: usize, out: usize, norm: Option<usize>) -> MixP {
         let mut p = MixP {
             h: self.h as u32,
@@ -2486,7 +2606,7 @@ impl InkMetal {
         let msgs = match (&sp.bank, &ld.gates) {
             (Some(bank), Some((_, lq))) => {
                 if !self.skip(SK_MIX) {
-                    self.mix(e, c, bank, b.bankx, *lq, 4, b.msgs, None, t);
+                    self.mix_cat(e, c, bank, b.bankx, *lq, 4, b.msgs, None, t, Some((0, true, 3)));
                 }
                 true
             }
@@ -2509,7 +2629,7 @@ impl InkMetal {
             }
             (Some((q, nq)), true) => {
                 if !self.skip(SK_MIX) {
-                    self.mix(e, c, &sp.attn_states, b.x, q, nq, b.mixed, None, t);
+                    self.mix_cat(e, c, &sp.attn_states, b.x, q, nq, b.mixed, None, t, Some((0, false, nq - 1)));
                 }
                 e.barrier();
                 let (g, _) = ld.gates.as_ref().unwrap();
@@ -2520,7 +2640,7 @@ impl InkMetal {
                     })
                     .collect();
                 if !self.skip(SK_GATES) {
-                    self.gates(e, c, g, &which, t);
+                    self.gates(e, c, g, &which, t, !self.skip(SK_MIX));
                 }
                 3
             }
@@ -2764,6 +2884,10 @@ impl InkMetal {
                 if msgs { b.hm } else { b.hn },
                 (!msgs).then_some(ld.ln_post),
             );
+            let mut mp = mp;
+            if msgs {
+                self.gate_cat(c, &mut mp, (3, false, 0));
+            }
             let rp = self.route_p(b, ld, t);
             e.pipe(self.p.conv_mix);
             e.buf(c.a, 0, 0);
@@ -2779,7 +2903,7 @@ impl InkMetal {
             if msgs {
                 let (g, _) = ld.gates.as_ref().unwrap();
                 if !self.skip(SK_GATES) {
-                    self.gates(e, c, g, &[(3, b.hm, ld.ln_post, b.hn)], t);
+                    self.gates(e, c, g, &[(3, b.hm, ld.ln_post, b.hn)], t, true);
                 }
             }
             let _ = rp;
@@ -2796,12 +2920,12 @@ impl InkMetal {
         // The MLP's input.
         if msgs {
             if !self.skip(SK_MIX) {
-                self.mix(e, c, &sp.mlp_states, b.x, ld.mlp_query, 1, b.hm, None, t);
+                self.mix_cat(e, c, &sp.mlp_states, b.x, ld.mlp_query, 1, b.hm, None, t, Some((3, false, 0)));
             }
             e.barrier();
             let (g, _) = ld.gates.as_ref().unwrap();
             if !self.skip(SK_GATES) {
-                self.gates(e, c, g, &[(3, b.hm, ld.ln_post, b.hn)], t);
+                self.gates(e, c, g, &[(3, b.hm, ld.ln_post, b.hn)], t, !self.skip(SK_MIX));
             }
         } else if !self.skip(SK_MIX) {
             self.mix(e, c, &sp.mlp_states, b.x, ld.mlp_query, 1, b.hn, Some(ld.ln_post), t);
@@ -3339,8 +3463,9 @@ impl InkMetal {
     /// stage by stage (`OXINFER_INKLING_PROFILE`); prints the time per kernel every few passes.
     #[allow(clippy::too_many_arguments)]
     fn run_profiled(&self, c: &Cx, t: usize, pos: usize, dev: &InkDev, capture: &[usize], head_rows: usize, res: &[Id]) -> bool {
-        type Acc = (usize, usize, usize, Vec<(Vec<usize>, f64, usize)>);
-        static ACC: std::sync::Mutex<Acc> = std::sync::Mutex::new((0, 0, 0, Vec::new()));
+        // (Passes of one token count apart: a pass of another size starts the count again.)
+        type Acc = (usize, usize, usize, Vec<(Vec<usize>, f64, usize)>, usize);
+        static ACC: std::sync::Mutex<Acc> = std::sync::Mutex::new((0, 0, 0, Vec::new(), 0));
         let pool = unsafe { (self.be.sels.pool_push)() };
         let (cb, enc) = begin_enc(self.be, &self.f);
         let pr = Prof {
@@ -3371,6 +3496,9 @@ impl InkMetal {
         end_timed(self.be, &self.f, pr.cb.get(), e.enc.get());
         unsafe { (self.be.sels.pool_pop)(pool) };
         let mut acc = ACC.lock().unwrap_or_else(|p| p.into_inner());
+        if acc.4 != t {
+            *acc = (0, 0, 0, Vec::new(), t);
+        }
         acc.0 += 1;
         acc.1 += DISPATCHES.load(std::sync::atomic::Ordering::Relaxed) - d0;
         acc.2 += BARRIERS.load(std::sync::atomic::Ordering::Relaxed) - b0;
@@ -3399,7 +3527,16 @@ impl InkMetal {
                     let label: Vec<String> = k
                         .iter()
                         .filter(|&&p| p != 0)
-                        .map(|p| names.get(p).cloned().unwrap_or_else(|| format!("matvec@{:x}", p & 0xffff)))
+                        .map(|p| {
+                            names.get(p).cloned().unwrap_or_else(|| {
+                                if p >> 44 != 0 {
+                                    format!("matvec {}x{}", p >> 44, (p >> 24) & 0xf_ffff)
+                                } else {
+                                    let sites = PIPE_SITES.lock().unwrap_or_else(|e| e.into_inner());
+                                    format!("pipeline set at {}", sites.get(p).map_or("?", |s| s.as_str()))
+                                }
+                            })
+                        })
                         .collect();
                     (label.join("+"), g / passes * 1e6, *n as f64 / passes)
                 })
@@ -3425,7 +3562,7 @@ impl InkMetal {
             for (l, us, n) in rows.iter().take(40) {
                 eprintln!("  {us:8.1} us {:5.1}%  {n:6.1} stages  {l}", us / total * 100.0);
             }
-            *acc = (0, 0, 0, Vec::new());
+            *acc = (0, 0, 0, Vec::new(), t);
         }
         true
     }

@@ -24,7 +24,10 @@ inline float ink_sum(float v, threadgroup float* red, uint tid, uint nt) {
 // (`q . state / sqrt(h)`) of the block states `s[0..ns]` (already RMS-normed, rows h apart per
 // token) and of the RMS-normed x; with `norm`, the result is RMS-normed with the weights at
 // `nw + query * h`. Output row of (query, token): `out + query * out_qs + token * h`.
-struct IMixP { uint h; uint ns; uint norm; uint x; uint q; uint out; uint out_qs; uint nw; float scale; float eps; float mix_eps; uint _p; uint s[16]; };
+// `cat` (nonzero): the output also normed without a weight into `cat + qi cat_qs + ti cat_ts` (the
+// message gates' inputs); the query `cat_last` into `cat_n` consecutive ones.
+struct IMixP { uint h; uint ns; uint norm; uint x; uint q; uint out; uint out_qs; uint nw; float scale; float eps; float mix_eps; uint _p; uint s[16];
+               uint cat; uint cat_qs; uint cat_ts; uint cat_last; uint cat_n; uint _p1; uint _p2; uint _p3; };
 // (One threadgroup of 1024 per (query, token).)
 inline void ink_mix_body(device float* a, device const float* c, constant IMixP& p, uint qi, uint ti, uint tid, uint sg, uint lane,
                          threadgroup float* red) {
@@ -32,14 +35,29 @@ inline void ink_mix_body(device float* a, device const float* c, constant IMixP&
     uint h = p.h, ns = p.ns;
     device const float* x = a + p.x + (ulong)ti * h;
     device const float* q = c + p.q + (ulong)qi * h;
-    // SIMD-group j < ns: q . state j; ns: q . x; ns + 1: x . x (one SIMD-group per dot product).
-    if (sg <= ns + 1) {
-        device const float* v = sg < ns ? a + p.s[sg] + (ulong)ti * h : x;
-        device const float* w = sg <= ns ? q : x;
-        float d = 0.f;
-        for (uint i = lane; i < h; i += 32) d = fma(w[i], v[i], d);
-        d = simd_sum(d);
-        if (lane == 0) red[sg] = d;
+    // j < ns: q . state j; ns: q . x; ns + 1: x . x. Every thread takes a few elements of each
+    // (a few loads in flight per thread rather than one SIMD-group's walk over the row), then the
+    // sums over the threadgroup (`red` from 64: 32 SIMD-groups x 18).
+    float d[18];
+    for (uint j = 0; j < 18; j++) d[j] = 0.f;
+    for (uint i = tid; i < h; i += nt) {
+        float xv = x[i], qv = q[i];
+        for (uint j = 0; j < 16; j++)
+            if (j < ns) d[j] = fma(qv, a[p.s[j] + (ulong)ti * h + i], d[j]);
+        d[16] = fma(qv, xv, d[16]);
+        d[17] = fma(xv, xv, d[17]);
+    }
+    for (uint j = 0; j < 18; j++) {
+        float v = simd_sum(d[j]);
+        if (lane == 0) red[64 + sg * 18 + j] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 18) {
+        float t = 0.f;
+        for (uint g = 0; g < nt / 32; g++) t += red[64 + g * 18 + tid];
+        // (Stored where the rest reads them: states at j, q . x at ns, x . x at ns + 1.)
+        uint j = tid < 16 ? tid : ns + (tid - 16);
+        if (tid < ns || tid >= 16) red[j] = t;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float r = rsqrt(red[ns + 1] / float(h) + p.mix_eps);
@@ -60,7 +78,7 @@ inline void ink_mix_body(device float* a, device const float* c, constant IMixP&
         out[i] = v;
         oss += v * v;
     }
-    if (p.norm == 0) return;
+    if (p.norm == 0 && p.cat == 0) return;
     oss = simd_sum(oss);
     if (lane == 0) red[32 + sg] = oss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -68,12 +86,17 @@ inline void ink_mix_body(device float* a, device const float* c, constant IMixP&
     for (uint g = 0; g < nt / 32; g++) tot += red[32 + g];
     float rn = rsqrt(tot / float(h) + p.eps);
     device const float* w = c + p.nw + (ulong)qi * h;
-    for (uint i = tid; i < h; i += nt) out[i] = out[i] * rn * w[i];
+    uint copies = p.cat == 0 ? 0 : (qi == p.cat_last ? p.cat_n : 1);
+    for (uint i = tid; i < h; i += nt) {
+        float v = out[i];
+        for (uint k = 0; k < copies; k++) a[p.cat + (ulong)(qi + k) * p.cat_qs + (ulong)ti * p.cat_ts + i] = v * rn;
+        if (p.norm != 0) out[i] = v * rn * w[i];
+    }
 }
 kernel void ink_mix(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IMixP& p [[buffer(2)]],
                     uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float red[64];
+    threadgroup float red[64 + 32 * 18];
     ink_mix_body(a, c, p, tg.x, tg.y, tid, sg, lane, red);
 }
 
@@ -126,6 +149,43 @@ kernel void ink_gmix_norm(device float* a [[buffer(0)]], device const float* c [
     for (uint i = tid; i < p.h; i += 1024) {
         ulong o = (ulong)ti * p.h + i;
         a[p.nout + o] = a[p.nout + o] * r * c[p.w + i];
+    }
+}
+
+// ---- A message gate's forget and gain matvecs over its rank inputs `d` (float32 or bf16 rows of
+// `rank` values, a multiple of 16) and its mix, per channel: `out = (1 - tanh f) x + tanh(g) m`
+// (grid: blocks of 64 channels, token; 8 SIMD-groups of 8 channels, 4 lanes per channel: rows this
+// short leave most lanes of a SIMD-group per row idle). The norm follows (`ink_norm`).
+struct IGfP { uint h; uint rank; uint d; uint x; uint m; uint out; uint bf; uint _p; };
+inline float4 gf_w(device const uchar* w, uint bf, ulong i) {
+    if (bf != 0) {
+        device const ushort* u = (device const ushort*)w + i;
+        return float4(as_type<float>(uint(u[0]) << 16), as_type<float>(uint(u[1]) << 16), as_type<float>(uint(u[2]) << 16),
+                      as_type<float>(uint(u[3]) << 16));
+    }
+    return float4(*((device const packed_float4*)((device const float*)w + i)));
+}
+kernel void ink_gfg(device float* a [[buffer(0)]], device const uchar* fw [[buffer(1)]], device const uchar* gw [[buffer(2)]],
+                    constant IGfP& p [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]],
+                    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    uint row = tg.x * 64 + sg * 8 + lane / 4, part = lane % 4, ti = tg.y;
+    uint r = min(row, p.h - 1), per = p.rank / 4;
+    device const float* d = a + p.d + (ulong)ti * p.rank + part * per;
+    ulong w0 = (ulong)r * p.rank + part * per;
+    float f = 0.f, g = 0.f;
+    for (uint i = 0; i < per; i += 4) {
+        float4 dv = float4(*((device const packed_float4*)(d + i)));
+        float4 fv = gf_w(fw, p.bf, w0 + i), gv = gf_w(gw, p.bf, w0 + i);
+        f = fma(fv.x, dv.x, f); f = fma(fv.y, dv.y, f); f = fma(fv.z, dv.z, f); f = fma(fv.w, dv.w, f);
+        g = fma(gv.x, dv.x, g); g = fma(gv.y, dv.y, g); g = fma(gv.z, dv.z, g); g = fma(gv.w, dv.w, g);
+    }
+    f += simd_shuffle_xor(f, 1);
+    f += simd_shuffle_xor(f, 2);
+    g += simd_shuffle_xor(g, 1);
+    g += simd_shuffle_xor(g, 2);
+    if (part == 0 && row < p.h) {
+        ulong o = (ulong)ti * p.h + row;
+        a[p.out + o] = (1.f - precise::tanh(f)) * a[p.x + o] + precise::tanh(g) * a[p.m + o];
     }
 }
 
@@ -316,14 +376,20 @@ inline void ink_attn_body(device float* a, device const float* c, constant IAP& 
             device const float* ksb = INK_KS(j);
             float acc[G];
             for (int gg = 0; gg < G; gg++) acc[gg] = 0.f;
-            for (uint d = 0; d < HD; d += 4) {
-                float4 k4 = kv_get4<KFMT>(kcb, ksb, row + d);
-                for (int gg = 0; gg < G; gg++) {
-                    float4 q4 = ((threadgroup const float4*)(qs + gg * HD))[d / 4];
-                    acc[gg] = fma(k4.x, q4.x, acc[gg]);
-                    acc[gg] = fma(k4.y, q4.y, acc[gg]);
-                    acc[gg] = fma(k4.z, q4.z, acc[gg]);
-                    acc[gg] = fma(k4.w, q4.w, acc[gg]);
+            // (The key's loads 8 at a time: in flight together rather than one per step.)
+            for (uint d0 = 0; d0 < HD; d0 += 32) {
+                float4 k8[8];
+                for (uint u = 0; u < 8; u++) k8[u] = kv_get4<KFMT>(kcb, ksb, row + d0 + 4 * u);
+                for (uint u = 0; u < 8; u++) {
+                    float4 k4 = k8[u];
+                    uint d = d0 + 4 * u;
+                    for (int gg = 0; gg < G; gg++) {
+                        float4 q4 = ((threadgroup const float4*)(qs + gg * HD))[d / 4];
+                        acc[gg] = fma(k4.x, q4.x, acc[gg]);
+                        acc[gg] = fma(k4.y, q4.y, acc[gg]);
+                        acc[gg] = fma(k4.z, q4.z, acc[gg]);
+                        acc[gg] = fma(k4.w, q4.w, acc[gg]);
+                    }
                 }
             }
             uint dist = pp - j;
@@ -339,19 +405,24 @@ inline void ink_attn_body(device float* a, device const float* c, constant IAP& 
             m[gg] = mn;
         }
         uint nbk = min(32u, j1 - base);
-        for (uint t = 0; t < nbk; t++) {
-            uint jj = base + t;
-            ulong row = INK_ROW(jj) * p.kw + koff + lane * D;
-            device const uchar* vcb = INK_VB(jj);
-            device const float* vsb = INK_VS(jj);
-            float v[D];
-            for (int d = 0; d < D; d += 4) {
-                float4 v4 = kv_get4<KFMT>(vcb, vsb, row + d);
-                v[d] = v4.x; v[d + 1] = v4.y; v[d + 2] = v4.z; v[d + 3] = v4.w;
+        // (The values of 8 keys loaded together, then accumulated in key order.)
+        for (uint t0 = 0; t0 < nbk; t0 += 8) {
+            float v8[8][D];
+            for (uint u = 0; u < 8; u++) {
+                uint jj = min(base + t0 + u, j1 - 1);
+                ulong row = INK_ROW(jj) * p.kw + koff + lane * D;
+                device const uchar* vcb = INK_VB(jj);
+                device const float* vsb = INK_VS(jj);
+                for (int d = 0; d < D; d += 4) {
+                    float4 v4 = kv_get4<KFMT>(vcb, vsb, row + d);
+                    v8[u][d] = v4.x; v8[u][d + 1] = v4.y; v8[u][d + 2] = v4.z; v8[u][d + 3] = v4.w;
+                }
             }
-            for (int gg = 0; gg < G; gg++) {
-                float et = simd_shuffle(e[gg], t);
-                for (int d = 0; d < D; d++) o[gg][d] = fma(et, v[d], o[gg][d]);
+            for (uint u = 0; u < 8 && t0 + u < nbk; u++) {
+                for (int gg = 0; gg < G; gg++) {
+                    float et = simd_shuffle(e[gg], t0 + u);
+                    for (int d = 0; d < D; d++) o[gg][d] = fma(et, v8[u][d], o[gg][d]);
+                }
             }
         }
     }
@@ -585,7 +656,7 @@ kernel void ink_conv_mix(device float* a [[buffer(0)]], device const float* c [[
                          constant uint& route [[buffer(6)]],
                          uint ti [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float red[64];
+    threadgroup float red[64 + 32 * 18];
     threadgroup float lg[1024];
     threadgroup float bv[32];
     threadgroup uint bi[32];
