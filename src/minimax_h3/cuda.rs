@@ -698,8 +698,15 @@ impl Engine {
         crate::cuda::usable_free(free, total)
     }
 
+    /// Copies to the device and returns once the bytes are there: `cuMemcpyHtoD` may return while
+    /// a copy of 64 KB or less from pageable memory is still on its way, ordered on the default
+    /// stream only, which the kernels' stream (`CU_STREAM_NON_BLOCKING`) does not wait for.
     fn htod(&self, dst: u64, src: &[u8]) -> bool {
-        src.is_empty() || unsafe { self.x.cuMemcpyHtoD_v2(dst, src.as_ptr() as *const c_void, src.len()) } == 0
+        src.is_empty()
+            || unsafe {
+                self.x.cuMemcpyHtoD_v2(dst, src.as_ptr() as *const c_void, src.len()) == 0
+                    && self.x.cuStreamSynchronize(std::ptr::null_mut()) == 0
+            }
     }
 
     /// Copies block `bi` to `base`.

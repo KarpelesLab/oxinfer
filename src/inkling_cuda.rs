@@ -1071,9 +1071,27 @@ impl Engine {
         Ok(d)
     }
 
+    /// `cuMemcpyHtoD`, returning once the bytes are on the device. The driver's call may return
+    /// while a copy of 64 KB or less from pageable memory is still on its way, ordered on the
+    /// default stream only, and this engine's kernels run on a stream that does not wait for that
+    /// one (`CU_STREAM_NON_BLOCKING`): launched at once, a kernel could read the old contents,
+    /// or have its output overwritten when the copy lands.
+    ///
+    /// # Safety
+    /// `src` must be readable for `bytes` bytes and `dst` a device allocation of at least as many.
+    unsafe fn htod(&self, dst: u64, src: *const c_void, bytes: usize) -> c_int {
+        // SAFETY: the caller's contract; synchronizing the default stream has no precondition.
+        unsafe {
+            match self.cu.cuMemcpyHtoD_v2(dst, src, bytes) {
+                0 => self.x.cuStreamSynchronize(std::ptr::null_mut()),
+                rc => rc,
+            }
+        }
+    }
+
     fn up_bytes(&self, b: &[u8]) -> Result<u64> {
         let d = self.alloc(b.len())?;
-        if !b.is_empty() && unsafe { self.cu.cuMemcpyHtoD_v2(d, b.as_ptr() as *const c_void, b.len()) } != 0 {
+        if !b.is_empty() && unsafe { self.htod(d, b.as_ptr() as *const c_void, b.len()) } != 0 {
             bail!("copy to the device failed");
         }
         Ok(d)
@@ -1104,11 +1122,7 @@ impl Engine {
         let es = (rb * n_out).next_multiple_of(256);
         let q = self.alloc(es * hs.len())?;
         for (i, hw) in hs.iter().enumerate() {
-            if unsafe {
-                self.cu
-                    .cuMemcpyHtoD_v2(q + (i * es) as u64, hw.data.as_ptr() as *const c_void, hw.data.len())
-            } != 0
-            {
+            if unsafe { self.htod(q + (i * es) as u64, hw.data.as_ptr() as *const c_void, hw.data.len()) } != 0 {
                 bail!("copy to the device failed");
             }
         }
@@ -1130,7 +1144,7 @@ impl Engine {
                 if sv.len() != n {
                     bail!("experts with different scale tables");
                 }
-                if unsafe { self.cu.cuMemcpyHtoD_v2(s + (i * n * 4) as u64, sv.as_ptr() as *const c_void, n * 4) } != 0 {
+                if unsafe { self.htod(s + (i * n * 4) as u64, sv.as_ptr() as *const c_void, n * 4) } != 0 {
                     bail!("copy to the device failed");
                 }
             }
@@ -2256,7 +2270,7 @@ impl Engine {
                 }
                 let v = &hs.hist[i].rows;
                 debug_assert_eq!(v.len(), d.hist_len[i]);
-                unsafe { self.cu.cuMemcpyHtoD_v2(*hp, v.as_ptr() as *const c_void, v.len() * 4) };
+                unsafe { self.htod(*hp, v.as_ptr() as *const c_void, v.len() * 4) };
             }
             // Rows first..pos to rows p % cap: at most two runs (the ring wraps once).
             for (rows, dev, devs) in [(&hs.k, d.k, d.ks), (&hs.v, d.v, d.vs)] {
@@ -2269,13 +2283,10 @@ impl Engine {
                         KvCache::F16 => (rows.h[r * kw..].as_ptr() as *const c_void, n * kw * 2),
                         KvCache::Q8 => (rows.q[r * kw..].as_ptr() as *const c_void, n * kw),
                     };
-                    unsafe { self.cu.cuMemcpyHtoD_v2(dev + (at * kw * el) as u64, src, bytes) };
+                    unsafe { self.htod(dev + (at * kw * el) as u64, src, bytes) };
                     if rows.mode == KvCache::Q8 {
                         let g = kw / 32;
-                        unsafe {
-                            self.cu
-                                .cuMemcpyHtoD_v2(devs + (at * g * 4) as u64, rows.s[r * g..].as_ptr() as *const c_void, n * g * 4)
-                        };
+                        unsafe { self.htod(devs + (at * g * 4) as u64, rows.s[r * g..].as_ptr() as *const c_void, n * g * 4) };
                     }
                 }
             }
@@ -2603,7 +2614,7 @@ mod tests {
         let info = [pos as i32, 0, 0, 0];
         unsafe {
             e.x.cuStreamSynchronize(e.stream);
-            e.cu.cuMemcpyHtoD_v2(p, info.as_ptr() as *const c_void, 16);
+            e.htod(p, info.as_ptr() as *const c_void, 16);
         }
     }
 
