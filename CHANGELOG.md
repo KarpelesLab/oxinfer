@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.16](https://github.com/KarpelesLab/oxinfer/compare/v0.0.15...v0.0.16) - 2026-11-22
+
+### Other
+
+- Inkling-2 Mini on iOS / iPadOS (device fit, options, entitlements, Simulator results); ios/README: steps for a real device
+- Inkling-2 on iOS: decide streaming on the app's memory budget, keep the GPU engine within it, memory_limit_gb
+- Inkling-2 Metal: expert lanes in row groups, NVFP4 file bytes given back after repacking, LoRA A x in the matvec's stage
+- MiniMax-H3 on CUDA as measured: the stage split of a forward on both devices, memory, agreement with the CPU path and torch, and one 1344x768 forward in 302.5 s
+- MiniMax-H3 on CUDA: the video VAE's 36 decoder blocks run on the GPU too, 124 frames of 448x256 in 6.4 to 8.1 s against 160 to 187 s on the CPU with frames within 3.8e-5, and the 4-step clip takes 54 s end to end against 943 s
+- MiniMax-H3 on CUDA: the FP8 transformer's 50 blocks run on the GPU with the blocks that do not fit streamed through two slots, one forward of a 448x256 124-frame clip (4682 rows) in 8.6 s against 194 to 457 s on the CPU, within 4.1e-5 to 1.3e-4 of torch per forward
+- Metal prefill round 3 (Q6_K / Q5_K word reads, device MoE routing, device first-logits head; what was measured and dropped)
+- the prompt's last-row LM head on the GPU's matvec kernels
+- Metal prefill: Q6_K / Q5_K blocks read as words; MoE layers routed on the device
+- oxinfer serve and oxinfer web are one server (GUI, management API, /v1, /v1/messages; web opens the browser), default port 8080; GUI: downloaded models above the catalog, a Downloaded filter; catalog: OpenUncensored/Inkling-2-Mini-Uncensored
+- Inkling-2 CUDA: prefill GEMMs on the weights' exact values (pp512 2900 -> 3560 tok/s), no ring upload for fresh sessions; docs: the CUDA engine, verification, speed against llama.cpp
+- default-run = oxinfer, so `cargo run -- web` works beside the membench binary
+- Inkling-2 drafter: checked against llama.cpp, the head product off the decode path, cost-aware draft length
+- README, docs/cli.md: the install commands without trailing comments (they scrolled out of view)
+
 ## [0.0.15](https://github.com/KarpelesLab/oxinfer/compare/v0.0.14...v0.0.15) - 2026-11-22
 
 ### Other
