@@ -78,6 +78,8 @@ fn main() -> anyhow::Result<()> {
         run(&mut e, &p, 1)?;
         let mut v = Vec::new();
         let mut toks = 0;
+        // (A profile covers the measured passes only.)
+        oxinfer::gpu::pf_reset();
         for _ in 0..reps {
             let (t, r, _, _) = run(&mut e, &p, 1)?;
             toks = t;

@@ -692,6 +692,10 @@ fn pf_note(kind: String, g: f64) {
         None => v.push((kind, g, 1)),
     }
 }
+/// Clears the times of [`pf_report`].
+pub(crate) fn pf_reset() {
+    PF_TIMES.lock().unwrap().clear();
+}
 /// Prints the GPU time per kind of op of the prefill plan steps so far (`OXINFER_PF_PROFILE`).
 pub(crate) fn pf_report() {
     let v = PF_TIMES.lock().unwrap();
@@ -721,6 +725,23 @@ const QSA_SCORE_BYTES: usize = 32 << 20;
 fn trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("OXINFER_METAL_TRACE").is_some())
+}
+
+static HOST_TICK: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+/// Nanoseconds per `mach_absolute_time` tick.
+fn host_tick_ns() -> f64 {
+    #[repr(C)]
+    struct Tb {
+        numer: u32,
+        denom: u32,
+    }
+    unsafe extern "C" {
+        fn mach_timebase_info(tb: *mut Tb) -> i32;
+    }
+    let mut tb = Tb { numer: 1, denom: 1 };
+    // SAFETY: writes the two fields.
+    unsafe { mach_timebase_info(&mut tb) };
+    tb.numer as f64 / tb.denom.max(1) as f64
 }
 
 /// Runs `encode` over the ranges of `parts`, one command buffer each with a concurrent compute
@@ -757,13 +778,17 @@ pub(crate) fn run_concurrent_then(
             cbs.push(cb);
         }
         let t1 = Instant::now();
+        let ta = Instant::now();
         after(None);
+        let mut t_after = ta.elapsed();
         let mut ok = true;
         for (j, &cb) in cbs.iter().enumerate() {
             (f.void)(cb, f.s_wait);
             let st = (f.status)(cb, f.s_status);
             if st == 4 {
+                let ta = Instant::now();
                 after(Some(j));
+                t_after += ta.elapsed();
             }
             if st != 4 && std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
                 let msg0: unsafe extern "C" fn(Id, Sel) -> Id = b.o.msg_send();
@@ -785,11 +810,38 @@ pub(crate) fn run_concurrent_then(
         if trace() && !cbs.is_empty() {
             let time: unsafe extern "C" fn(Id, Sel) -> f64 = b.o.msg_send();
             g = time(*cbs.last().unwrap(), b.o.sel(c"GPUEndTime")) - time(cbs[0], b.o.sel(c"GPUStartTime"));
+            if std::env::var_os("OXINFER_METAL_TRACE_CBS").is_some() {
+                let each: Vec<String> = cbs
+                    .iter()
+                    .map(|&cb| {
+                        format!(
+                            "{:.0}",
+                            (time(cb, b.o.sel(c"GPUEndTime")) - time(cb, b.o.sel(c"GPUStartTime"))) * 1e6
+                        )
+                    })
+                    .collect();
+                eprintln!("[metal decode: command buffers' gpu us: {}]", each.join(" "));
+            }
+            let busy: f64 = cbs
+                .iter()
+                .map(|&cb| time(cb, b.o.sel(c"GPUEndTime")) - time(cb, b.o.sel(c"GPUStartTime")))
+                .sum();
+            // The host clock in the GPU timestamps' time base (mach_absolute_time, seconds).
+            unsafe extern "C" {
+                fn mach_absolute_time() -> u64;
+            }
+            let now = mach_absolute_time() as f64 * 1e-9 * HOST_TICK.get_or_init(host_tick_ns);
             eprintln!(
-                "[metal decode: encode {:.0} us, wait {:.0} us, gpu {:.0} us]",
+                "[metal decode: {} command buffers, encode {:.0} us, wait {:.0} us, gpu {:.0} us, busy {:.0} us, \
+                 host work {:.0} us, first start {:.0} us after the first commit, done {:.0} us after the gpu]",
+                cbs.len(),
                 (t1 - t0).as_secs_f64() * 1e6,
                 t1.elapsed().as_secs_f64() * 1e6,
-                g * 1e6
+                g * 1e6,
+                busy * 1e6,
+                t_after.as_secs_f64() * 1e6,
+                (time(cbs[0], b.o.sel(c"GPUStartTime")) - (now - t0.elapsed().as_secs_f64())) * 1e6,
+                (now - time(*cbs.last().unwrap(), b.o.sel(c"GPUEndTime"))) * 1e6,
             );
         }
         (b.sels.pool_pop)(pool);
@@ -1597,17 +1649,53 @@ struct KvMirror {
     /// Positions the buffers hold, and how many match the host cache.
     cap: usize,
     synced: usize,
+    /// Bytes of each buffer.
+    bytes: usize,
     release: (MsgVoid, Sel),
 }
 
 impl Drop for KvMirror {
     fn drop(&mut self) {
+        if !self.k.is_null() && !self.v.is_null() {
+            kv_pool_put(self.bytes, self.k, self.v, self.release);
+            return;
+        }
         for b in [self.k, self.v] {
             if !b.is_null() {
                 unsafe { (self.release.0)(b, self.release.1) };
             }
         }
     }
+}
+
+/// Device KV copies of dropped sessions kept for the next ones (a new session would otherwise
+/// allocate fresh buffers, which the GPU then faults in on first write): (bytes, key buffer,
+/// value buffer), at most [`KV_POOL_BYTES`] in all, the oldest released first.
+struct KvPool(Vec<(usize, usize, usize)>);
+static KV_POOL: std::sync::Mutex<KvPool> = std::sync::Mutex::new(KvPool(Vec::new()));
+/// Bytes of device KV buffers [`KV_POOL`] keeps at most (less on phones).
+const KV_POOL_BYTES: usize = if cfg!(target_os = "ios") { 1 << 28 } else { 1 << 30 };
+
+fn kv_pool_put(cap_bytes: usize, k: Id, v: Id, release: (MsgVoid, Sel)) {
+    let mut p = KV_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    p.0.push((cap_bytes, k as usize, v as usize));
+    let mut total: usize = p.0.iter().map(|e| 2 * e.0).sum();
+    while total > KV_POOL_BYTES && !p.0.is_empty() {
+        let (b, k, v) = p.0.remove(0);
+        total -= 2 * b;
+        unsafe {
+            (release.0)(k as Id, release.1);
+            (release.0)(v as Id, release.1);
+        }
+    }
+}
+
+/// A pair of pooled KV buffers of exactly `bytes` each.
+fn kv_pool_take(bytes: usize) -> Option<(Id, Id)> {
+    let mut p = KV_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let i = p.0.iter().rposition(|e| e.0 == bytes)?;
+    let (_, k, v) = p.0.remove(i);
+    Some((k as Id, v as Id))
 }
 
 struct MetalSlot {
@@ -3299,6 +3387,21 @@ impl MetalBackend {
                 total as f64 / 1e9,
                 pf_state.as_ref().map_or(0, |p| p.st[8] + p.max_rows * 4 * 2560) as f64 / 1e9
             );
+            let line: Vec<String> = ops
+                .iter()
+                .take(48)
+                .map(|o| match o {
+                    MOp::Barrier => "|".into(),
+                    MOp::Norm { x, out, .. } => format!("norm({x}->{out})"),
+                    MOp::XHalf { x, .. } => format!("xh({x})"),
+                    MOp::Gemm { n_out, y, add, .. } => format!("gemm{n_out}(->{y}{})", if *add { "+" } else { "" }),
+                    MOp::Glu { out, .. } => format!("glu(->{out})"),
+                    MOp::QkRope { .. } => "qkrope".into(),
+                    MOp::PfFlash { .. } => "flash".into(),
+                    _ => "?".into(),
+                })
+                .collect();
+            eprintln!("[prefill plan ops: {}]", line.join(" "));
         }
         let arena = unsafe { new_len(self.device, self.sels.new_buffer_len, total.max(256), 0) };
         if arena.is_null() {
@@ -3559,12 +3662,12 @@ impl MetalPlan<'_> {
                 // followed by decoding: no reallocation and copy on its first step).
                 let cap = (pos + t + 1).next_power_of_two().max(256);
                 let bytes = cap * row * 4;
-                let (k, v) = unsafe {
+                let (k, v) = kv_pool_take(bytes).unwrap_or_else(|| unsafe {
                     (
                         new_len(be.device, be.sels.new_buffer_len, bytes, 0),
                         new_len(be.device, be.sels.new_buffer_len, bytes, 0),
                     )
-                };
+                });
                 if k.is_null() || v.is_null() {
                     for b in [k, v] {
                         if !b.is_null() {
@@ -3585,7 +3688,7 @@ impl MetalPlan<'_> {
                         unsafe { (self.f.void)(b, self.f.s_release) };
                     }
                 }
-                (m.k, m.v, m.cap) = (k, v, cap);
+                (m.k, m.v, m.cap, m.bytes) = (k, v, cap, bytes);
             }
             if m.synced < c.len {
                 let (hk, hv) = c.data();
@@ -5378,6 +5481,7 @@ impl DecodePlan for MetalPlan<'_> {
                         v: std::ptr::null_mut(),
                         cap: 0,
                         synced: 0,
+                        bytes: 0,
                         release,
                     })
                     .collect(),
@@ -5488,6 +5592,24 @@ impl DecodePlan for MetalPlan<'_> {
                     }
                 }
                 if self.pf.is_some() {
+                    // OXINFER_PF_SKIP=xhalf,norm,... (timing experiments only: wrong results):
+                    // leaves these kinds of prefill ops out.
+                    static SKIP: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+                    if let Some(sk) = SKIP.get_or_init(|| std::env::var("OXINFER_PF_SKIP").ok()) {
+                        let k = match op {
+                            MOp::Barrier => "barrier",
+                            MOp::Norm { .. } => "norm",
+                            MOp::XHalf { .. } => "xhalf",
+                            MOp::Gemm { .. } | MOp::GemmF32 { .. } => "gemm",
+                            MOp::Glu { .. } | MOp::Ew { .. } => "glu",
+                            MOp::QkRope { .. } => "qkrope",
+                            MOp::PfFlash { .. } | MOp::PfAttn { .. } => "attn",
+                            _ => "other",
+                        };
+                        if sk.split(',').any(|x| x == k) {
+                            continue;
+                        }
+                    }
                     self.encode_pf(e, op, arena, consts, &kvb, &stb, pos, t, &pf_run);
                     continue;
                 }
@@ -5982,10 +6104,19 @@ impl DecodePlan for MetalPlan<'_> {
             }
             if ok && from < end {
                 // In PF_PARTS command buffers (cut at barriers), for the caches' copies.
-                let mut parts: Vec<std::ops::Range<usize>> = Vec::with_capacity(PF_PARTS);
-                for d in 1..PF_PARTS {
+                let np = std::env::var("OXINFER_PF_PARTS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(PF_PARTS);
+                // Plus a cut after the last op using a KV cache, so that every cache is copied
+                // while the GPU runs the rest (the last layer's feed-forward, the head).
+                let mut cuts: Vec<usize> = (1..np).map(|d| from + (end - from) * d / np).collect();
+                cuts.push(kv_last.iter().copied().max().unwrap_or(0));
+                cuts.sort_unstable();
+                let mut parts: Vec<std::ops::Range<usize>> = Vec::with_capacity(np + 1);
+                for c in cuts {
                     let start = parts.last().map_or(from, |r| r.end);
-                    let cut = at((from + (end - from) * d / PF_PARTS).max(start));
+                    let cut = at(c.max(start));
                     if cut > start && cut < end {
                         parts.push(start..cut);
                     }
@@ -6014,12 +6145,17 @@ impl DecodePlan for MetalPlan<'_> {
         let t_ran = Instant::now();
         let _ = gpu;
         unsafe {
-            for j in 0..t {
-                std::ptr::copy_nonoverlapping(
-                    base.add(self.hidden.0 + j * self.strides[1]) as *const f32,
-                    s.hidden[j * h..].as_mut_ptr(),
-                    h,
-                );
+            if self.strides[1] == h * 4 && t * h >= 1 << 18 {
+                // Contiguous rows of a prefill chunk (MBs): in parallel.
+                super::par_copy(s.hidden.as_mut_ptr(), base.add(self.hidden.0) as *const f32, t * h);
+            } else {
+                for j in 0..t {
+                    std::ptr::copy_nonoverlapping(
+                        base.add(self.hidden.0 + j * self.strides[1]) as *const f32,
+                        s.hidden[j * h..].as_mut_ptr(),
+                        h,
+                    );
+                }
             }
             if let (Some(l), Some((off, n))) = (s.logits, self.logits)
                 && want_logits

@@ -532,6 +532,12 @@ pub fn pf_report() {
     crate::metal::decode::pf_report();
 }
 
+/// Clears the times [`pf_report`] adds up (to profile one pass after warm-up ones).
+pub fn pf_reset() {
+    #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+    crate::metal::decode::pf_reset();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
