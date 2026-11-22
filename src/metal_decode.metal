@@ -1322,6 +1322,72 @@ kernel void dec_add_norm_t(device const float* y [[buffer(0)]], device float* x 
     add_norm_body(y + t * ts.x, x + t * ts.y, out + t * ts.z, wy, wn, p, tid, nt2.x, sg, lane, red);
 }
 
+// AddNorm with a next norm, of token rows (add_norm_body's, summed in another order), one
+// threadgroup of 256 per token, n % 4 == 0 and n <= 256 * 4 * PF_NORM_V: x = (x + norm(y) wy)
+// scale, out = norm(x) wn (unless ts.w: nothing reads it) and out's scaled half rows for the next
+// GEMM (x_half's).
+kernel void pf_add_norm_half(device const float* y [[buffer(0)]], device float* x [[buffer(1)]], device float* out [[buffer(2)]],
+                             device const float* wy [[buffer(3)]], device const float* wn [[buffer(4)]], constant AN& p [[buffer(5)]],
+                             constant uint4& ts [[buffer(6)]], device half* xh [[buffer(7)]], device float* rs [[buffer(8)]],
+                             uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                             uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[8];
+    threadgroup float red2[8];
+    threadgroup float red3[8];
+    device const float4* yr = (device const float4*)(y + (ulong)r * ts.x);
+    device float4* xr = (device float4*)(x + (ulong)r * ts.y);
+    device float4* o = (device float4*)(out + (ulong)r * ts.z);
+    device const float4* wy4 = (device const float4*)wy;
+    device const float4* wn4 = (device const float4*)wn;
+    uint n4 = p.n / 4;
+    float4 yv[PF_NORM_V], xv[PF_NORM_V];
+    float s = 0.f;
+    for (uint j = 0; j < PF_NORM_V; j++) {
+        uint i = tid + j * 256;
+        yv[j] = i < n4 ? yr[i] : 0.f;
+        xv[j] = i < n4 ? xr[i] : 0.f;
+        s += dot(yv[j], yv[j]);
+    }
+    s = simd_sum(s);
+    if (lane == 0) red[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    s = ((red[0] + red[1]) + (red[2] + red[3])) + ((red[4] + red[5]) + (red[6] + red[7]));
+    float k = rsqrt(s / float(p.n) + p.eps);
+    float s2 = 0.f;
+    for (uint j = 0; j < PF_NORM_V; j++) {
+        uint i = tid + j * 256;
+        if (i < n4) {
+            xv[j] = (xv[j] + yv[j] * k * wy4[i]) * p.scale;
+            xr[i] = xv[j];
+            s2 += dot(xv[j], xv[j]);
+        }
+    }
+    s2 = simd_sum(s2);
+    if (lane == 0) red2[sg] = s2;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    s2 = ((red2[0] + red2[1]) + (red2[2] + red2[3])) + ((red2[4] + red2[5]) + (red2[6] + red2[7]));
+    float k2 = rsqrt(s2 / float(p.n) + p.eps);
+    float m = 0.f;
+    for (uint j = 0; j < PF_NORM_V; j++) {
+        uint i = tid + j * 256;
+        if (i < n4) {
+            float4 v = xv[j] * k2 * wn4[i];
+            if (ts.w == 0) o[i] = v;
+            yv[j] = v;
+            float4 a = abs(v);
+            m = max(m, max(max(a.x, a.y), max(a.z, a.w)));
+        }
+    }
+    m = pf_tg_max(m, sg, lane, red3);
+    float inv, sc = pf_row_scale(m, inv);
+    device half4* oh = (device half4*)(xh + (ulong)r * p.n);
+    for (uint j = 0; j < PF_NORM_V; j++) {
+        uint i = tid + j * 256;
+        if (i < n4) oh[i] = half4(yv[j] * sc);
+    }
+    if (tid == 0) rs[r] = inv;
+}
+
 // ---- Interventions (crate::intervene) -------------------------------------------------------
 // Residual hooks of one row x[n] (one threadgroup): `hot` holds the n_add add coefficients (padded
 // to 4) then 8 floats per item (bias, threshold, act: 0 linear / 1 relu / 2 jumprelu, op: 0 set /

@@ -1403,6 +1403,19 @@ enum MOp {
         w: Option<usize>,
         p: NormParams,
     },
+    /// Prefill plans: `AddNorm` with a next norm, of token rows (`pf_add_norm_half`; `p` as
+    /// `AddNorm`'s, `ts` the y, x, out strides then 1 when nothing reads the f32 out rows), that
+    /// also leaves the out rows' half rows in the GEMM scratch.
+    AddNormHalf {
+        pipe: Id,
+        y: usize,
+        x: usize,
+        out: usize,
+        wy: usize,
+        wn: usize,
+        p: [u32; 4],
+        ts: [u32; 4],
+    },
     /// Prefill plans: `Glu` of token rows (`pf_glu_half`; `ts` the g, u, out strides, then 1 when
     /// nothing reads the f32 rows, which are then not stored) that also leaves their half rows in
     /// the GEMM scratch.
@@ -2764,10 +2777,32 @@ impl MetalBackend {
                     next,
                     n,
                     eps,
-                } => {
+                } => 'an: {
                     let threads = n.next_multiple_of(32).min(1024);
                     if n > 8 * threads || wy.len() != n || next.is_some_and(|(_, w)| w.len() != n) {
                         return None;
+                    }
+                    // Prefill: a norm feeding the next op's GEMM makes its half rows too.
+                    if let Some((o, wn)) = next
+                        && pf
+                        && pf_norm_half()
+                        && n.is_multiple_of(4)
+                        && n <= PF_NORM_MAX
+                        && matches!(g.ops.get(i + 1), Some(Op::Linear { x: lx, n_in, .. }) if *lx == o && *n_in == n)
+                    {
+                        emit.push(MOp::AddNormHalf {
+                            pipe: self.named_pipeline("pf_add_norm_half")?,
+                            y: byte(y),
+                            x: byte(x),
+                            out: byte(o),
+                            wy: cst(wy),
+                            wn: cst(wn),
+                            p: [n as u32, eps.to_bits(), scale.to_bits(), 0],
+                            ts: [ts(y) as u32, ts(x) as u32, ts(o) as u32, 0],
+                        });
+                        xh_next = Some((o.buf, o.off, n));
+                        fused_out = Some(rng(o, n));
+                        break 'an (vec![rng(y, n), rng(x, n)], vec![rng(x, n), rng(o, n), (PF_RES, 0, usize::MAX)]);
                     }
                     emit.push(MOp::AddNorm {
                         pipe: self.named_pipeline("dec_add_norm")?,
@@ -3523,7 +3558,9 @@ impl MetalBackend {
             if pf {
                 group_reads.push((ops.len(), r.clone()));
                 if let Some(f) = fused_out {
-                    let at = emit.iter().position(|o| matches!(o, MOp::NormHalf { .. } | MOp::GluHalf { .. }));
+                    let at = emit
+                        .iter()
+                        .position(|o| matches!(o, MOp::NormHalf { .. } | MOp::GluHalf { .. } | MOp::AddNormHalf { .. }));
                     fused_rows.extend(at.map(|j| (ops.len() + j, f)));
                 }
             }
@@ -3554,7 +3591,7 @@ impl MetalBackend {
                 }
                 match &mut ops[j] {
                     MOp::NormHalf { p, .. } => p._p = 1,
-                    MOp::GluHalf { ts, .. } => ts[3] = 1,
+                    MOp::GluHalf { ts, .. } | MOp::AddNormHalf { ts, .. } => ts[3] = 1,
                     _ => {}
                 }
             }
@@ -3655,9 +3692,10 @@ impl MetalBackend {
                 total as f64 / 1e9,
                 pf_state.as_ref().map_or(0, |p| p.st[8] + p.max_rows * 4 * 2560) as f64 / 1e9
             );
+            let all = std::env::var("OXINFER_GPU_PLAN_DEBUG").is_ok_and(|v| v == "all");
             let line: Vec<String> = ops
                 .iter()
-                .take(48)
+                .take(if all { usize::MAX } else { 48 })
                 .map(|o| match o {
                     MOp::Barrier => "|".into(),
                     MOp::Norm { x, out, .. } => format!("norm({x}->{out})"),
@@ -3666,6 +3704,11 @@ impl MetalBackend {
                     MOp::Glu { out, .. } => format!("glu(->{out})"),
                     MOp::QkRope { .. } => "qkrope".into(),
                     MOp::PfFlash { .. } => "flash".into(),
+                    MOp::PfKvHalf { .. } => "kvh".into(),
+                    MOp::NormHalf { out, p, .. } => format!("normh(->{out}{})", if p._p != 0 { " half only" } else { "" }),
+                    MOp::GluHalf { out, ts, .. } => format!("gluh(->{out}{})", if ts[3] != 0 { " half only" } else { "" }),
+                    MOp::AddNormHalf { out, ts, .. } => format!("addnormh(->{out}{})", if ts[3] != 0 { " half only" } else { "" }),
+                    MOp::AddNorm { .. } => "addnorm".into(),
                     _ => "?".into(),
                 })
                 .collect();
@@ -4469,6 +4512,7 @@ impl MetalPlan<'_> {
             | MOp::PfFlash { .. }
             | MOp::PfKvHalf { .. }
             | MOp::NormHalf { .. }
+            | MOp::AddNormHalf { .. }
             | MOp::GluHalf { .. } => unreachable!("prefill op in a multi-token plan"),
         }
     }
@@ -4766,6 +4810,28 @@ impl MetalPlan<'_> {
             _p: u32,
         }
         match op {
+            MOp::AddNormHalf {
+                pipe,
+                y,
+                x,
+                out,
+                wy,
+                wn,
+                p,
+                ts,
+            } => {
+                e.pipe(*pipe);
+                e.buf(arena, *y, 0);
+                e.buf(arena, *x, 1);
+                e.buf(arena, *out, 2);
+                e.buf(consts, *wy, 3);
+                e.buf(consts, *wn, 4);
+                e.bytes(p, 5);
+                e.bytes(ts, 6);
+                e.buf(arena, pf.xh, 7);
+                e.buf(arena, pf.rs, 8);
+                e.dispatch((rows, 1), 256);
+            }
             MOp::NormHalf { pipe, x, out, w, p } => {
                 e.pipe(*pipe);
                 e.buf(arena, *x, 0);
@@ -5921,7 +5987,7 @@ impl DecodePlan for MetalPlan<'_> {
                         MOp::PfTopk { .. } | MOp::PfExperts(_) => "moe",
                         MOp::PfGdn { .. } => "gdn",
                         MOp::PfAttn { .. } | MOp::PfFlash { .. } | MOp::PfKvHalf { .. } => "attn",
-                        MOp::NormHalf { .. } => "norm",
+                        MOp::NormHalf { .. } | MOp::AddNormHalf { .. } => "norm",
                         MOp::GluHalf { .. } => "glu",
                     };
                     if !o.split(',').any(|x| x == k) {
@@ -5935,7 +6001,7 @@ impl DecodePlan for MetalPlan<'_> {
                     if let Some(sk) = SKIP.get_or_init(|| std::env::var("OXINFER_PF_SKIP").ok()) {
                         let k = match op {
                             MOp::Barrier => "barrier",
-                            MOp::Norm { .. } | MOp::NormHalf { .. } => "norm",
+                            MOp::Norm { .. } | MOp::NormHalf { .. } | MOp::AddNormHalf { .. } => "norm",
                             MOp::XHalf { .. } => "xhalf",
                             MOp::Gemm { .. } | MOp::GemmF32 { .. } => "gemm",
                             MOp::Glu { .. } | MOp::GluHalf { .. } | MOp::Ew { .. } => "glu",
@@ -5967,6 +6033,7 @@ impl DecodePlan for MetalPlan<'_> {
                     | MOp::PfFlash { .. }
                     | MOp::PfKvHalf { .. }
                     | MOp::NormHalf { .. }
+                    | MOp::AddNormHalf { .. }
                     | MOp::GluHalf { .. } => unreachable!("prefill op in a one-token plan"),
                     MOp::Norm {
                         pipe,
@@ -6395,6 +6462,7 @@ impl DecodePlan for MetalPlan<'_> {
                         MOp::PfFlash { .. } => "flash attn".into(),
                         MOp::PfKvHalf { .. } => "kv half".into(),
                         MOp::NormHalf { .. } => "norm+half".into(),
+                        MOp::AddNormHalf { .. } => "addnorm+half".into(),
                         MOp::GluHalf { .. } => "glu+half".into(),
                         MOp::QkRope { .. } => "qkrope".into(),
                         MOp::QsaKey { .. } => "qsa key".into(),
