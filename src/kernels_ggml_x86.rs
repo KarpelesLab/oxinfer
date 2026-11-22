@@ -11,7 +11,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use super::{Act, GgmlType, GgufMatrix, QK_K, decode_i8, e8m0_half, iq4xs_scale, q3k_scales, scale_min_k4, u32at};
-use crate::ggml::tables::{KVALUES_IQ4NL, KVALUES_MXFP4};
+use crate::ggml::tables::{IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, KVALUES_IQ4NL, KVALUES_MXFP4};
 use crate::kernels::simd::f16c_to_f32;
 use crate::quant::QBLOCK;
 use std::arch::x86_64::*;
@@ -34,17 +34,44 @@ unsafe fn nibbles(p: *const u8) -> __m256i {
     _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16::<4>(bytes), m), _mm_and_si128(bytes, m))
 }
 
-/// 16 where bit `i` of `bits` is set, for the 32 elements `i`.
+/// All ones where bit `i` of `bits` is set, for the 32 elements `i`.
 #[inline(always)]
-unsafe fn high_bits(bits: u32) -> __m256i {
+unsafe fn bit_mask(bits: u32) -> __m256i {
     let v = _mm256_set1_epi32(bits as i32);
     // Byte i / 8 of `bits` in element i (the shuffle is per 128-bit lane: bytes 0, 1 then 2, 3).
     let sh = _mm256_setr_epi8(
         0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
     );
     let bit = _mm256_set1_epi64x(0x8040_2010_0804_0201u64 as i64);
-    let m = _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(v, sh), bit), bit);
-    _mm256_and_si256(m, _mm256_set1_epi8(16))
+    _mm256_cmpeq_epi8(_mm256_and_si256(_mm256_shuffle_epi8(v, sh), bit), bit)
+}
+
+/// 16 where bit `i` of `bits` is set, for the 32 elements `i`.
+#[inline(always)]
+unsafe fn high_bits(bits: u32) -> __m256i {
+    _mm256_and_si256(bit_mask(bits), _mm256_set1_epi8(16))
+}
+
+/// The 32 grid magnitudes `mag` (bytes below 128) of an i-quant sub-block, element `i` negated
+/// where bit `i` of `signs` is set.
+#[inline(always)]
+unsafe fn signed(mag: __m256i, signs: u32) -> __m256i {
+    let m = bit_mask(signs);
+    _mm256_sub_epi8(_mm256_xor_si256(mag, m), m)
+}
+
+/// Four 8-value grid entries (the IQ2 grids: one byte per value, lowest first) in element order.
+#[inline(always)]
+unsafe fn grid4x8(g: [u64; 4]) -> __m256i {
+    _mm256_loadu_si256(g.as_ptr() as *const __m256i)
+}
+
+/// The four sign bytes of a sub-block of IQ2_XXS / IQ3_XXS: 7-bit indices `l` of `aux` into the
+/// even-parity sign table.
+#[inline(always)]
+fn ksigns4(aux: u32) -> u32 {
+    let k = |l: u32| KSIGNS_IQ2XS[((aux >> (7 * l)) & 127) as usize] as u32;
+    k(0) | (k(1) << 8) | (k(2) << 16) | (k(3) << 24)
 }
 
 /// 16 signed table entries looked up by 32 nibbles.
@@ -269,6 +296,77 @@ unsafe fn unpack(kind: GgmlType, b: &[u8], q: &mut [i8; QK_K], s: &mut [f32; 16]
             }
             false
         }
+        // The grid-table i-quants: a sub-block of 32 is four 8-value (IQ2) or eight 4-value
+        // (IQ3, gathered) grid entries, negated by 32 sign bits.
+        IQ2_XXS => {
+            debug_assert!(b.len() >= 66);
+            let d = f16at(b, 0);
+            for ib in 0..8 {
+                let (a0, a1) = (u32at(b, 2 + 8 * ib), u32at(b, 6 + 8 * ib));
+                s[2 * ib] = d * (0.5 + (a1 >> 28) as f32) * 0.25;
+                s[2 * ib + 1] = s[2 * ib];
+                let g = [0, 1, 2, 3].map(|l| IQ2XXS_GRID[((a0 >> (8 * l)) & 255) as usize]);
+                st(q, 32 * ib, signed(grid4x8(g), ksigns4(a1)));
+            }
+            false
+        }
+        IQ2_XS => {
+            debug_assert!(b.len() >= 74);
+            let d = f16at(b, 0);
+            for ib in 0..8 {
+                let sc = b[66 + ib];
+                s[2 * ib] = d * (0.5 + (sc & 0xF) as f32) * 0.25;
+                s[2 * ib + 1] = d * (0.5 + (sc >> 4) as f32) * 0.25;
+                let v = [0, 1, 2, 3].map(|l| super::u16at(b, 2 + 2 * (4 * ib + l)));
+                let g = v.map(|v| IQ2XS_GRID[(v & 511) as usize]);
+                let k = v.map(|v| KSIGNS_IQ2XS[(v >> 9) as usize]);
+                st(q, 32 * ib, signed(grid4x8(g), u32::from_le_bytes(k)));
+            }
+            false
+        }
+        IQ2_S => {
+            debug_assert!(b.len() >= 82);
+            let d = f16at(b, 0);
+            for ib in 0..8 {
+                let sc = b[74 + ib];
+                s[2 * ib] = d * (0.5 + (sc & 0xF) as f32) * 0.25;
+                s[2 * ib + 1] = d * (0.5 + (sc >> 4) as f32) * 0.25;
+                let h = b[66 + ib] as usize;
+                let g = [0, 1, 2, 3].map(|l| IQ2S_GRID[b[2 + 4 * ib + l] as usize | ((h << (8 - 2 * l)) & 0x300)]);
+                st(q, 32 * ib, signed(grid4x8(g), u32at(b, 34 + 4 * ib)));
+            }
+            false
+        }
+        IQ3_XXS => {
+            debug_assert!(b.len() >= 98);
+            let d = f16at(b, 0);
+            for ib in 0..8 {
+                let aux = u32at(b, 66 + 4 * ib);
+                s[2 * ib] = d * (0.5 + (aux >> 28) as f32) * 0.5;
+                s[2 * ib + 1] = s[2 * ib];
+                let idx = _mm256_cvtepu8_epi32(_mm_loadl_epi64(p.add(2 + 8 * ib) as *const __m128i));
+                let g = _mm256_i32gather_epi32::<4>(IQ3XXS_GRID.as_ptr() as *const i32, idx);
+                st(q, 32 * ib, signed(g, ksigns4(aux)));
+            }
+            false
+        }
+        IQ3_S => {
+            debug_assert!(b.len() >= 110);
+            let d = f16at(b, 0);
+            // Bit k of the sub-block's `qh` byte is bit 8 of its grid index k.
+            let hbit = _mm256_setr_epi32(1, 2, 4, 8, 16, 32, 64, 128);
+            for ib in 0..8 {
+                let sc = b[106 + ib / 2] >> (4 * (ib % 2));
+                s[2 * ib] = d * (1 + 2 * (sc & 0xF) as i32) as f32;
+                s[2 * ib + 1] = s[2 * ib];
+                let lo = _mm256_cvtepu8_epi32(_mm_loadl_epi64(p.add(2 + 8 * ib) as *const __m128i));
+                let h = _mm256_and_si256(_mm256_set1_epi32(b[66 + ib] as i32), hbit);
+                let hi = _mm256_and_si256(_mm256_cmpeq_epi32(h, hbit), _mm256_set1_epi32(256));
+                let g = _mm256_i32gather_epi32::<4>(IQ3S_GRID.as_ptr() as *const i32, _mm256_or_si256(lo, hi));
+                st(q, 32 * ib, signed(g, u32at(b, 74 + 4 * ib)));
+            }
+            false
+        }
         Q1_0 => {
             debug_assert!(b.len() >= 18);
             for i in 0..4 {
@@ -444,7 +542,26 @@ fn dequant_kind(kind: GgmlType) -> bool {
     use GgmlType::*;
     matches!(
         kind,
-        Q4_0 | Q5_0 | Q8_0 | IQ4_NL | MXFP4 | Q3_K | Q4_K | Q5_K | Q6_K | IQ4_XS | Q1_0 | Q2_0 | PQ2_0 | TQ1_0 | TQ2_0 | PTQ1_0
+        Q4_0 | Q5_0
+            | Q8_0
+            | IQ4_NL
+            | MXFP4
+            | Q3_K
+            | Q4_K
+            | Q5_K
+            | Q6_K
+            | IQ4_XS
+            | IQ2_XXS
+            | IQ2_XS
+            | IQ2_S
+            | IQ3_XXS
+            | IQ3_S
+            | Q1_0
+            | Q2_0
+            | PQ2_0
+            | TQ1_0
+            | TQ2_0
+            | PTQ1_0
     )
 }
 
