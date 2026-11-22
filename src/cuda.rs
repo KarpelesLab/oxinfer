@@ -3114,6 +3114,126 @@ mod tests {
         }
     }
 
+    /// A model's GGUF device weights, its decode and prefill plans and a session's device state
+    /// are freed with it: loading, running, dropping and loading again (the server's idle unload
+    /// and reload) leaves the device's free memory where it was, and the second load runs.
+    #[test]
+    fn ggml_weights_and_plans_are_freed_with_their_model() {
+        use crate::ggml::{GgmlType, GgufMatrix, random_blocks};
+        use crate::gpu::decode::{DecodePlan, Graph, LinMode, Op, Slot, Step};
+        let Some(be) = backend() else { return };
+        const MB: u64 = 1 << 20;
+        let (h, inter) = (4096usize, 16384usize);
+        let mut seed = 3u64;
+        // 164 MB of weights: gate (Q8_0), up (Q4_K), down (Q6_K).
+        let ms: Vec<GgufMatrix> = [(GgmlType::Q8_0, inter, h), (GgmlType::Q4_K, inter, h), (GgmlType::Q6_K, h, inter)]
+            .iter()
+            .map(|&(kind, n_out, n_in)| {
+                let bytes = random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed);
+                let mut m = GgufMatrix::from_bytes(kind, &bytes, n_out, n_in).unwrap();
+                m.set_factor(0.01).unwrap();
+                m
+            })
+            .collect();
+        let ones = vec![1f32; h];
+        let xin: Vec<f32> = (0..16 * h).map(|_| rnd(&mut seed)).collect();
+        // Compiles the formats' kernels (code, kept for the process) before measuring.
+        drop(
+            ms.iter()
+                .map(|m| be.upload(&WeightRef::Gguf(m), m.n_out, m.n_in))
+                .collect::<Vec<_>>(),
+        );
+        let free = || be.device_memory().expect("device memory").0;
+        let before = free();
+        let mut after = Vec::new();
+        let mut outs: Vec<Vec<f32>> = Vec::new();
+        for _load in 0..2 {
+            let devs: Vec<DeviceWeight> = ms
+                .iter()
+                .map(|m| be.upload(&WeightRef::Gguf(m), m.n_out, m.n_in).expect("device weight"))
+                .collect();
+            let mut g = Graph::new();
+            let (x, hn, act, hidden) = (g.buf(h), g.buf(h), g.buf(inter), g.buf(h));
+            (g.input, g.hidden, g.n_hidden) = (x, hidden, h);
+            g.ops.push(Op::norm(x, hn, &ones, h, 1e-6));
+            g.ops.push(Op::Linear {
+                w: WeightRef::Gguf(&ms[0]),
+                dev: &devs[0],
+                w2: Some((WeightRef::Gguf(&ms[1]), &devs[1])),
+                n_out: inter,
+                n_in: h,
+                x: hn,
+                y: act,
+                mode: LinMode::SiluPair,
+            });
+            g.ops.push(Op::Linear {
+                w: WeightRef::Gguf(&ms[2]),
+                dev: &devs[2],
+                w2: None,
+                n_out: h,
+                n_in: inter,
+                x: act,
+                y: x,
+                mode: LinMode::Add,
+            });
+            g.ops.push(Op::norm(x, hidden, &ones, h, 1e-6));
+            g.head_from = g.ops.len();
+            let one = be.build_plan(&g, 1).expect("single-token plan");
+            let pf = be.build_plan_pf(&g, 64).expect("prefill plan");
+            let mut slot = Slot(None);
+            let mut hs = vec![0f32; 16 * h];
+            let mut run = |plan: &dyn DecodePlan, t: usize| {
+                assert!(plan.step(
+                    &mut slot,
+                    Step {
+                        pos: 0,
+                        t,
+                        rope_cs: &[],
+                        x: &xin[..t * h],
+                        x2: &[],
+                        kv: &mut [],
+                        states: &mut [],
+                        hidden: &mut hs[..t * h],
+                        logits: None,
+                        params: None,
+                        capture: None,
+                        scratch: true,
+                        states_kept: false,
+                    },
+                ));
+                hs[..t * h].to_vec()
+            };
+            let a = run(&one, 1);
+            let b = run(&pf, 16);
+            assert!(a.iter().all(|v| v.is_finite()) && a.iter().any(|&v| v != 0.0));
+            let worst = a.iter().zip(&b).fold(0f32, |m, (p, q)| m.max((p - q).abs()));
+            assert!(worst < 1e-3, "prefill and single-token steps differ by {worst:.2e}");
+            let held = before.saturating_sub(free());
+            assert!(held > 150 * MB, "the loaded model holds only {} MB of device memory", held / MB);
+            outs.push(a);
+            drop(slot);
+            drop(pf);
+            drop(one);
+            drop(g);
+            drop(devs);
+            after.push(free());
+        }
+        // Other processes share the card: a margin well under the model's 164 MB.
+        for (i, &f) in after.iter().enumerate() {
+            assert!(
+                f + 48 * MB >= before,
+                "after unload {}: {} MB of device memory free, {} before the first load",
+                i + 1,
+                f / MB,
+                before / MB
+            );
+        }
+        assert!(
+            outs[0].iter().zip(&outs[1]).all(|(p, q)| p.to_bits() == q.to_bits()),
+            "the reloaded model's results differ"
+        );
+    }
+
     /// `cargo test --profile ci --lib ggml_bench -- --ignored --nocapture`: the ggml matvec (GB/s
     /// of weights read) and GEMM (TFLOP/s at 512 tokens) on matrices of Qwen3.8-27B's shapes.
     /// `OXINFER_GGML_CU=file` compiles the kernels from a file, `BENCH_KINDS=23,21` picks formats.
