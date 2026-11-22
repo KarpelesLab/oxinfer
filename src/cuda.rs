@@ -35,14 +35,13 @@ static INTEGRATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// The memory an allocation on the device can still take, from what `cuMemGetInfo` gave. On an
 /// integrated device the driver reports the system's free pages (`MemFree`, measured on a DGX
 /// Spark), which leaves out the page cache the kernel gives back on demand: the files a model was
-/// just read from would count against it. There the system's available memory is the figure,
-/// when it is larger.
+/// just read from would count against it. There the figure is what the system can give without
+/// swapping, less the reserve every load leaves it ([`crate::platform::memory_headroom`]).
 pub(crate) fn usable_free(free: usize, total: usize) -> usize {
     if !INTEGRATED.load(Ordering::Relaxed) {
         return free;
     }
-    let avail = crate::platform::available_memory().map_or(0, |a| a.min(total as u64) as usize);
-    free.max(avail)
+    crate::platform::memory_headroom().map_or(free, |h| h.min(total as u64) as usize)
 }
 
 dlsym::library! {
@@ -2133,6 +2132,51 @@ mod tests {
         }
     }
 
+    /// How many outputs of the prefill GEMM differ in bits from the CPU prefill GEMM and from the
+    /// product in its order (one f32 accumulator per output, one fused multiply-add per input in
+    /// order). Not asserted: the kernels are compiled with `--use_fast_math`, so the order of the
+    /// sums and their fusing are NVRTC's choice for the device.
+    /// `cargo test --lib cuda::tests::bit_identity -- --nocapture` prints what this one does.
+    #[test]
+    fn bit_identity_report() {
+        let Some(be) = backend() else { return };
+        let (n_out, n_in, t) = (128, 1024, 150);
+        let mut seed = 7;
+        let w = bf16(n_out * n_in, &mut seed);
+        let (q8, q4) = (quantize_bf16(&w, n_out, n_in), quantize_q4(&w, n_out, n_in));
+        let x = input(t, n_in, &mut seed);
+        let differ = |a: &[f32], b: &[f32]| a.iter().zip(b).filter(|(p, q)| p.to_bits() != q.to_bits()).count();
+        for (name, w, dense) in [
+            ("bf16", WeightRef::Bf16(&w), dense_bf(&w)),
+            ("q8", WeightRef::Q8(&q8), dense_q8(&q8)),
+            ("q4", WeightRef::Q4(&q4), dense_q4(&q4)),
+        ] {
+            let y = run_matmul(&be, &w, n_out, n_in, &x, t);
+            let mut fma = vec![0f32; t * n_out];
+            for i in 0..t {
+                for o in 0..n_out {
+                    fma[i * n_out + o] = (0..n_in).fold(0f32, |a, k| dense[o * n_in + k].mul_add(x[i * n_in + k], a));
+                }
+            }
+            let mut c = vec![0f32; t * n_out];
+            match &w {
+                WeightRef::Bf16(v) => kernels::matmul(v, n_out, n_in, &x, t, &mut c),
+                WeightRef::Q8(m) => kernels::matmul_quant_multi(&mut [(*m, &mut c[..])], &x, t),
+                WeightRef::Q4(m) => kernels::matmul_quant_multi(&mut [(*m, &mut c[..])], &x, t),
+                WeightRef::Gguf(_) => unreachable!(),
+            }
+            println!(
+                "{} {name}: {} of {} outputs differ from the CPU kernels (worst row error {:e}), {} from the fma-ordered product; the CPU kernels differ from it in {}",
+                be.name,
+                differ(&y, &c),
+                y.len(),
+                row_err(&y, &c, n_out),
+                differ(&y, &fma),
+                differ(&c, &fma)
+            );
+        }
+    }
+
     /// Several outputs per input in one submission, of different widths and formats, then a bigger
     /// batch (the staging buffers grow) and a smaller one again.
     #[test]
@@ -3138,7 +3182,10 @@ mod tests {
 
     /// A model's GGUF device weights, its decode and prefill plans and a session's device state
     /// are freed with it: loading, running, dropping and loading again (the server's idle unload
-    /// and reload) leaves the device's free memory where it was, and the second load runs.
+    /// and reload) leaves the device's free memory where it was, and the second load runs. Where
+    /// the device shares the system's memory (DGX Spark) its free memory is the system's, which
+    /// the other tests of this binary and every other process move by more than the model's 164
+    /// MB: the figures are printed there, not asserted.
     #[test]
     fn ggml_weights_and_plans_are_freed_with_their_model() {
         use crate::ggml::{GgmlType, GgufMatrix, random_blocks};
@@ -3166,6 +3213,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         let free = || be.device_memory().expect("device memory").0;
+        let shared = INTEGRATED.load(Ordering::Relaxed);
         let before = free();
         let mut after = Vec::new();
         let mut outs: Vec<Vec<f32>> = Vec::new();
@@ -3231,7 +3279,11 @@ mod tests {
             let worst = a.iter().zip(&b).fold(0f32, |m, (p, q)| m.max((p - q).abs()));
             assert!(worst < 1e-3, "prefill and single-token steps differ by {worst:.2e}");
             let held = before.saturating_sub(free());
-            assert!(held > 150 * MB, "the loaded model holds only {} MB of device memory", held / MB);
+            assert!(
+                shared || held > 150 * MB,
+                "the loaded model holds only {} MB of device memory",
+                held / MB
+            );
             outs.push(a);
             drop(slot);
             drop(pf);
@@ -3242,13 +3294,17 @@ mod tests {
         }
         // Other processes share the card: a margin well under the model's 164 MB.
         for (i, &f) in after.iter().enumerate() {
-            assert!(
-                f + 48 * MB >= before,
+            let what = format!(
                 "after unload {}: {} MB of device memory free, {} before the first load",
                 i + 1,
                 f / MB,
                 before / MB
             );
+            if shared {
+                println!("{what} (the system's memory)");
+            } else {
+                assert!(f + 48 * MB >= before, "{what}");
+            }
         }
         assert!(
             outs[0].iter().zip(&outs[1]).all(|(p, q)| p.to_bits() == q.to_bits()),

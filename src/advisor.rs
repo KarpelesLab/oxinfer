@@ -1024,6 +1024,21 @@ const RAM_FRACTION: f64 = 0.6;
 /// with [`GPU_HEADROOM_GB`] to spare (activations, the KV cache, the desktop).
 const GPU_FRACTION: f64 = 0.92;
 const GPU_HEADROOM_GB: f64 = 1.0;
+
+/// Whether the device keeps its own copy of the weights in the memory it shares with the CPU: a
+/// CUDA device with unified memory (DGX Spark, Jetson), where `cuMemAlloc` takes system memory
+/// beside the host's copy (Qwen3.5-0.8B bf16 on a Spark: 1.76 GB resident and 1.67 GB on the
+/// device). Metal wraps the host's pages.
+fn copies_in_shared_memory(kind: GpuKind, unified: bool) -> bool {
+    unified && kind == GpuKind::Cuda
+}
+
+/// Whether `memory_gb` of weights fit a device with `mem` GB for a decode plan: its own memory
+/// with the headroom, and twice the weights where the device's copy shares the host's memory.
+fn fits_device(kind: GpuKind, unified: bool, mem: f64, memory_gb: f64) -> bool {
+    let copies = if copies_in_shared_memory(kind, unified) { 2.0 } else { 1.0 };
+    copies * memory_gb + GPU_HEADROOM_GB <= GPU_FRACTION * mem
+}
 /// What an app keeps for itself where the OS limits apps ([`crate::stream::DeviceMemory::APP_RESERVE`]).
 const APP_RESERVE_GB: f64 = 1.073741824;
 
@@ -1334,8 +1349,8 @@ impl Row {
                     if m.moe { CPU_MOE_LAYER_MS } else { CPU_LAYER_MS },
                 );
                 let gpu = hw.gpu_ref().and_then(|(r, same)| {
-                    let mem = hw.gpu.as_ref()?.memory_gb?;
-                    let fits = memory_gb + GPU_HEADROOM_GB <= GPU_FRACTION * mem;
+                    let g = hw.gpu.as_ref()?;
+                    let fits = fits_device(g.kind, g.unified, g.memory_gb?, memory_gb);
                     let s = speed(token_gb, r.rates[format.index()], m.layers, r.layer_ms)?;
                     (fits && (r.moe || !m.moe)).then_some((s, if same { Basis::Reference } else { Basis::OtherDevice }))
                 });
@@ -1545,13 +1560,14 @@ fn accel_of(m: &Model, label: &str, format: Format, memory_gb: f64, streamed: bo
                 _ => false,
             };
             // A device decode plan keeps every weight on the device: on a discrete GPU they must
-            // fit its memory; unified memory wraps the host's (streamed layers per pass). FP8
-            // has Metal GEMMs but no decode matvec.
+            // fit its memory; Metal's unified memory wraps the host's (streamed layers per pass),
+            // CUDA's holds a second copy. FP8 has Metal GEMMs but no decode matvec.
             let on_gpu = gpu.filter(|g| {
                 graph
                     && g.kind != GpuKind::Vulkan
                     && !label.contains("FP8")
-                    && (g.unified || g.memory_gb.is_some_and(|mem| memory_gb + GPU_HEADROOM_GB <= GPU_FRACTION * mem))
+                    && ((g.unified && !copies_in_shared_memory(g.kind, g.unified))
+                        || g.memory_gb.is_some_and(|mem| fits_device(g.kind, g.unified, mem, memory_gb)))
             });
             let measured = streamed && m.moe && on_gpu.is_some_and(|g| g.unified);
             (prefill, on_gpu.map_or(Unit::Cpu, |g| Unit::Gpu(g.kind)), measured)
@@ -1679,7 +1695,10 @@ pub fn accelerators(plat: &Platform, device: DevicePref) -> Vec<Accelerator> {
         let is_used = used.is_some_and(|u| u.kind == g.kind && u.index == g.index);
         let mem = g.memory_bytes.map(|b| b as f64 / 1e9);
         let decode = g.kind != GpuKind::Vulkan;
-        let budget = if g.unified_memory {
+        let copies = copies_in_shared_memory(g.kind, g.unified_memory);
+        let budget = if copies {
+            mem.map(|m| ((GPU_FRACTION * m - GPU_HEADROOM_GB) / 2.0).max(0.0))
+        } else if g.unified_memory {
             mem.map(|m| ram.map_or(m, |r| m.min(r)))
         } else {
             mem.map(|m| (GPU_FRACTION * m - GPU_HEADROOM_GB).max(0.0))
@@ -1690,6 +1709,11 @@ pub fn accelerators(plat: &Platform, device: DevicePref) -> Vec<Accelerator> {
             "prompt matmuls only (bf16, Q8, Q4): decoding stays on the CPU"
         };
         let memory = match (g.unified_memory, budget, ram) {
+            (true, Some(b), _) if copies => format!(
+                "; shares the system's {} of RAM and keeps its own copy of the weights there: models up to {} decode on it",
+                gb(ram.or(mem).unwrap_or(0.0)),
+                gb(b)
+            ),
             (true, Some(b), Some(r)) => format!("; shares the system's {} of RAM, {} of it usable by the GPU", gb(r), gb(b)),
             (true, Some(b), None) => format!("; shares the system's RAM, {} usable by the GPU", gb(b)),
             (false, Some(b), _) => format!(
@@ -2331,6 +2355,26 @@ mod tests {
         let list = accelerators(&plat, DevicePref::Auto);
         assert!(list[1].used && list[1].decode && !list[1].unified);
         assert!((list[1].budget_gb.unwrap() - (0.92 * 16.6 - 1.0)).abs() < 1e-6);
+        // A CUDA device sharing the system's memory (DGX Spark): the device's copy of the
+        // weights is a second one in it.
+        let mut spark = card(GpuKind::Cuda, 130_660_000_000);
+        spark.unified_memory = true;
+        let spark = Platform {
+            cpu: cpu.clone(),
+            gpus: vec![spark],
+            notes: Vec::new(),
+        };
+        let s = &accelerators(&spark, DevicePref::Auto)[1];
+        assert!(s.used && s.decode && s.unified);
+        assert!((s.budget_gb.unwrap() - (0.92 * 130.66 - 1.0) / 2.0).abs() < 1e-6);
+        assert!(
+            s.status
+                .contains("keeps its own copy of the weights there: models up to 60 GB decode on it"),
+            "{}",
+            s.status
+        );
+        assert!(fits_device(GpuKind::Cuda, true, 130.66, 59.0) && !fits_device(GpuKind::Cuda, true, 130.66, 61.0));
+        assert!(fits_device(GpuKind::Cuda, false, 130.66, 61.0) && fits_device(GpuKind::Metal, true, 130.66, 61.0));
         assert!(
             !list[2].used && !list[2].decode && list[2].status.contains("cuda is picked first"),
             "{}",

@@ -1296,7 +1296,7 @@ impl CudaBackend {
                 "plan of {tokens} token(s){}: arena {} MB, {} of {} MB of VRAM free",
                 if pf { " (prefill)" } else { "" },
                 total >> 20,
-                free >> 20,
+                super::usable_free(free, all) >> 20,
                 all >> 20
             ));
         }
