@@ -207,7 +207,29 @@ pub fn resolve_gguf(repo: &str, quant: &str, cache_dir: Option<&Path>) -> Result
             .with_context(|| format!("{repo}: split GGUF part {p} is not in the listing"))?;
         fetch_file(repo, &dir, p, *size, src, i + 1, parts.len())?;
     }
+    // The shared part also under the name of the part it stands for, as llama.cpp opens the
+    // parts by name (oxinfer finds it by its header either way).
+    #[cfg(unix)]
+    for (link, target) in shared_part_links(&name, &parts) {
+        let at = dir.join(&link);
+        if !at.exists() && std::os::unix::fs::symlink(&target, &at).is_err() {
+            eprintln!("note: could not link {link} to {target}");
+        }
+    }
     Ok(dir.join(name))
+}
+
+/// The split parts of `name` that `parts` fetches under another name (see [`gguf_parts`]), as
+/// (part name, fetched name).
+fn shared_part_links(name: &str, parts: &[String]) -> Vec<(String, String)> {
+    let Some((pre, _, count, digits)) = crate::gguf::split_name(name) else {
+        return Vec::new();
+    };
+    (1..=count)
+        .zip(parts)
+        .map(|(i, p)| (format!("{pre}-{i:0digits$}-of-{count:0digits$}.gguf"), p.clone()))
+        .filter(|(want, p)| want != p && !p.contains('/'))
+        .collect()
 }
 
 /// The GGUF file of `repo` for `quant` and its parts (itself alone unless it is split).
@@ -250,12 +272,29 @@ fn gguf_parts(repo: &str, quant: &str, list: &Listing) -> Result<(String, Vec<St
             many.iter().map(|f| f.as_str()).collect::<Vec<_>>().join(", ")
         ),
     };
-    let parts: Vec<String> = match crate::gguf::split_name(&name) {
+    let mut parts: Vec<String> = match crate::gguf::split_name(&name) {
         Some((pre, _, count, digits)) => (1..=count)
             .map(|i| format!("{pre}-{i:0digits$}-of-{count:0digits$}.gguf"))
             .collect(),
         None => vec![name.clone()],
     };
+    // A part the listing does not have can be a file every quantization of the repository shares
+    // and that is named as none of them: ISTA-DASLab's DeepSeek V4.1 builds count
+    // `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` (the engram tables, at the repository's root) as
+    // their last part. One unsplit GGUF whose name says "engram", in the folder of the parts,
+    // stands for one missing part.
+    let folder = |f: &str| f.rsplit_once('/').map_or("", |(d, _)| d).to_string();
+    let missing: Vec<usize> = (0..parts.len()).filter(|&i| !list.contains_key(&parts[i])).collect();
+    let shared: Vec<&&String> = ggufs
+        .iter()
+        .filter(|f| {
+            let base = f.rsplit('/').next().unwrap_or(f);
+            crate::gguf::split_name(base).is_none() && base.to_ascii_lowercase().contains("engram") && folder(f) == folder(&name)
+        })
+        .collect();
+    if let ([i], [f]) = (missing.as_slice(), shared.as_slice()) {
+        parts[*i] = f.to_string();
+    }
     Ok((name, parts))
 }
 
@@ -972,4 +1011,43 @@ fn fetch_file(repo: &str, dir: &Path, name: &str, expected: Option<u64>, src: &S
         bail!("{}: size {} after download, expected {exp}", path.display(), md.len());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listing_of(names: &[&str]) -> Listing {
+        names
+            .iter()
+            .map(|n| (n.to_string(), (Some(1), Source::Inline(Vec::new()))))
+            .collect()
+    }
+
+    #[test]
+    fn shared_engram_part() {
+        // ISTA-DASLab's DeepSeek V4.1 builds: five named parts of six, the sixth shared.
+        let pre = "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M";
+        let mut names: Vec<String> = (1..=5).map(|i| format!("{pre}-0000{i}-of-00006.gguf")).collect();
+        names.push("DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00006.gguf".into());
+        names.push("DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf".into());
+        names.push("mmproj-DeepSeek-V4.1-Flash-1017-BF16.gguf".into());
+        let list = listing_of(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let (name, parts) = gguf_parts("r/x", "IQ1_M", &list).unwrap();
+        assert_eq!(name, format!("{pre}-00001-of-00006.gguf"));
+        assert_eq!(parts.len(), 6);
+        assert_eq!(parts[5], "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf");
+        assert_eq!(
+            shared_part_links(&name, &parts),
+            vec![(
+                format!("{pre}-00006-of-00006.gguf"),
+                "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf".to_string()
+            )]
+        );
+        // Every part listed: nothing replaced, nothing linked.
+        let list = listing_of(&["x-Q4-00001-of-00002.gguf", "x-Q4-00002-of-00002.gguf", "Engram.gguf"]);
+        let (name, parts) = gguf_parts("r/x", "Q4", &list).unwrap();
+        assert_eq!(parts, ["x-Q4-00001-of-00002.gguf", "x-Q4-00002-of-00002.gguf"]);
+        assert!(shared_part_links(&name, &parts).is_empty());
+    }
 }

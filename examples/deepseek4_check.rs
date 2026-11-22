@@ -10,7 +10,18 @@
 //! ```text
 //! deepseek4_check MODEL REF.safetensors [--chunk N] [--cpu] [--mmap]
 //! deepseek4_check MODEL --load [TEXT...]
+//! deepseek4_check MODEL --greedy TEXT|@IDS_FILE N_GEN OUT.bin [--cpu] [--no-stream] [--ids-out FILE]
 //! ```
+//!
+//! `--greedy` is the counterpart of `tools/llama_logits_dump.cpp` on a real checkpoint (same
+//! output, compared by `qwen_greedy_dump --compare`): the prompt (raw text, tokenized without a
+//! template, or `@file` of whitespace-separated ids) prefilled as the CLI does, then `N_GEN`
+//! greedy tokens one at a time, writing the f32 logits after the prompt and after each of them.
+//! A checkpoint larger than most of RAM is streamed as the CLI streams it.
+//!
+//! `--ppl TEXT_FILE N_CTX N_CHUNKS` (GGUF) is `llama-perplexity -c N_CTX --chunks N_CHUNKS` on the
+//! same text: the text tokenized after a BOS, cut into chunks of `N_CTX` tokens, each run from an
+//! empty context with its first token replaced by BOS, the second half of each chunk scored.
 //!
 //! Prints, for the prefill (in chunks of N tokens, default the whole prompt) and for the
 //! token-by-token decode, the largest logit difference, the mean KL divergence and the agreement
@@ -76,6 +87,96 @@ fn report(what: &str, ours: &[f32], refs: &[f32], vocab: usize) {
     );
 }
 
+/// `--ppl`: see the module documentation.
+fn perplexity(m: &DeepSeek4Model, dir: &Path, text: &str, n_ctx: usize, n_chunks: usize) -> Result<()> {
+    let hd = oxinfer::gguf::header(dir)?;
+    let bos = hd
+        .get("tokenizer.ggml.bos_token_id")
+        .and_then(oxinfer::gguf::Value::as_u64)
+        .context("no BOS token id in the GGUF header")? as u32;
+    let tok = hd.tokenizer()?;
+    let enc = tok
+        .encode(std::fs::read_to_string(text)?.as_str(), false)
+        .map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+    let mut ids = vec![bos];
+    ids.extend_from_slice(enc.get_ids());
+    let n_chunks = n_chunks.min(ids.len() / n_ctx);
+    let (h, vocab) = (m.cfg.hidden_size, m.cfg.vocab_size);
+    let first = n_ctx / 2;
+    let (mut nll, mut count) = (0f64, 0usize);
+    let t0 = std::time::Instant::now();
+    for ci in 0..n_chunks {
+        let mut chunk = ids[ci * n_ctx..(ci + 1) * n_ctx].to_vec();
+        chunk[0] = bos;
+        let mut sess = m.new_session();
+        let mut hs = Vec::with_capacity(n_ctx * h);
+        for piece in chunk.chunks(256) {
+            hs.extend(m.forward_hidden(&mut sess, piece));
+        }
+        let logits = m.logits(&hs[first * h..], n_ctx - first);
+        for j in first..n_ctx - 1 {
+            let row = &logits[(j - first) * vocab..(j - first + 1) * vocab];
+            let mx = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+            let lse = mx + row.iter().map(|&v| (v as f64 - mx).exp()).sum::<f64>().ln();
+            nll += lse - row[chunk[j + 1] as usize] as f64;
+            count += 1;
+        }
+        println!(
+            "[{}] {:.4}  ({:.1}s)",
+            ci + 1,
+            (nll / count as f64).exp(),
+            t0.elapsed().as_secs_f64()
+        );
+    }
+    println!(
+        "perplexity over {n_chunks} chunks of {n_ctx} ({} of {} tokens): {:.4} (mean NLL {:.4})",
+        n_chunks * n_ctx,
+        ids.len(),
+        (nll / count as f64).exp(),
+        nll / count as f64
+    );
+    Ok(())
+}
+
+/// `--greedy`: see the module documentation.
+fn greedy_dump(m: &DeepSeek4Model, dir: &Path, prompt: &str, n_gen: usize, out: &str, ids_out: Option<&str>) -> Result<()> {
+    let ids: Vec<u32> = match prompt.strip_prefix('@') {
+        Some(f) => std::fs::read_to_string(f)?
+            .split_whitespace()
+            .map(|v| v.parse::<u32>())
+            .collect::<Result<_, _>>()?,
+        None => {
+            let tok = oxinfer::gguf::header(dir)?.tokenizer()?;
+            let enc = tok.encode(prompt, false).map_err(|e| anyhow::anyhow!("encode: {e}"))?;
+            enc.get_ids().to_vec()
+        }
+    };
+    if let Some(f) = ids_out {
+        std::fs::write(f, ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(" "))?;
+    }
+    let h = m.cfg.hidden_size;
+    let mut sess = m.new_session();
+    let t0 = std::time::Instant::now();
+    let hs = oxinfer::generate::prefill(m, &mut sess, &ids, 256, &[]);
+    let mut logits = m.logits(&hs[hs.len() - h..], 1);
+    eprintln!("[prefill {} tokens: {:.2}s]", ids.len(), t0.elapsed().as_secs_f64());
+    let mut bytes = Vec::new();
+    let mut chosen = Vec::new();
+    let t1 = std::time::Instant::now();
+    for step in 0..=n_gen {
+        bytes.extend(logits.iter().flat_map(|v| v.to_le_bytes()));
+        let best = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32;
+        chosen.push(best);
+        if step < n_gen {
+            logits = m.forward(&mut sess, &[best]);
+        }
+    }
+    eprintln!("[decode {n_gen} tokens: {:.2}s]", t1.elapsed().as_secs_f64());
+    std::fs::write(out, bytes)?;
+    println!("{}", chosen.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(" "));
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let usage = "usage: deepseek4_check MODEL REF.safetensors [--chunk N] [--cpu] [--mmap]";
@@ -84,8 +185,31 @@ fn main() -> Result<()> {
     let (mut chunk, mut cpu, mut mmap) = (None, false, false);
     let (mut mtp_n, mut drafts) = (0usize, 3usize);
     let mut texts = Vec::new();
+    let ppl = if refp == "--ppl" {
+        let g = "--ppl TEXT_FILE N_CTX N_CHUNKS";
+        Some((
+            args.next().context(g)?,
+            args.next().context(g)?.parse::<usize>()?,
+            args.next().context(g)?.parse::<usize>()?,
+        ))
+    } else {
+        None
+    };
+    let greedy = if refp == "--greedy" {
+        let g = "--greedy TEXT|@IDS_FILE N_GEN OUT.bin";
+        Some((
+            args.next().context(g)?,
+            args.next().context(g)?.parse::<usize>()?,
+            args.next().context(g)?,
+        ))
+    } else {
+        None
+    };
+    let (mut no_stream, mut ids_out) = (false, None);
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--no-stream" => no_stream = true,
+            "--ids-out" => ids_out = Some(args.next().context("--ids-out FILE")?),
             "--chunk" => chunk = Some(args.next().context("--chunk N")?.parse::<usize>()?),
             "--cpu" => cpu = true,
             "--mtp" => mtp_n = args.next().context("--mtp N")?.parse()?,
@@ -95,7 +219,7 @@ fn main() -> Result<()> {
             other => anyhow::bail!("unknown argument {other}"),
         }
     }
-    mmap |= refp == "--load";
+    mmap |= refp == "--load" || greedy.is_some() || ppl.is_some();
     let dev = if cpu {
         oxinfer::platform::DevicePref::Cpu
     } else {
@@ -105,7 +229,30 @@ fn main() -> Result<()> {
     let dir = oxinfer::engine::resolve_model(&model, None)?;
     let cfg = oxinfer::config::DeepSeek4Config::load(&dir)?;
     let files = ModelFiles::open(&dir, !mmap)?;
-    let m = DeepSeek4Model::load(cfg, &files, oxinfer::model::Quant::Bf16)?;
+    let mut m = DeepSeek4Model::load(cfg, &files, oxinfer::model::Quant::Bf16)?;
+    if greedy.is_some() || ppl.is_some() {
+        let size = oxinfer::safetensors::checkpoint_bytes(&dir);
+        let streamer = if oxinfer::deepseek4::too_big(size) && !no_stream {
+            let s = oxinfer::stream::attach_deepseek4(&mut m, &files, oxinfer::deepseek4::default_stream().with_env())?;
+            let p = s.plan();
+            eprintln!(
+                "[stream: {:.2} GB resident, {:.2} GB streamed per pass]",
+                p.resident_bytes as f64 / 1e9,
+                p.streamed_bytes as f64 / 1e9
+            );
+            Some(s)
+        } else {
+            None
+        };
+        let r = match (greedy, ppl) {
+            (Some((prompt, n_gen, out)), _) => greedy_dump(&m, &dir, &prompt, n_gen, &out, ids_out.as_deref()),
+            (_, Some((text, n_ctx, n_chunks))) => perplexity(&m, &dir, &text, n_ctx, n_chunks),
+            _ => unreachable!(),
+        };
+        m.set_stream(None);
+        drop(streamer);
+        return r;
+    }
     // `--load` in place of the reference: only open the checkpoint (mapped), to try the loader
     // on the layout of a real file (even one whose tensor data was not downloaded), and print
     // the ids its tokenizer gives the texts that follow.
