@@ -279,11 +279,66 @@ fn quantize_block(blk: &[f32], q: &mut [i8]) -> (f32, i32) {
 
 /// Quantizes one row of `x` (`n_in = q.len()` values) into its slices of a `QAct`.
 fn quantize_row(row: &[f32], q: &mut [i8], scales: &mut [f32], sums: &mut [i32], fsums: &mut [f32], hsums: &mut [f32]) {
-    for b in 0..row.len() / QBLOCK {
-        let blk = &row[b * QBLOCK..(b + 1) * QBLOCK];
-        let (amax, s) = quantize_block(blk, &mut q[b * QBLOCK..(b + 1) * QBLOCK]);
+    let nb = row.len() / QBLOCK;
+    for b in 0..nb {
+        let (amax, s) = quantize_block(&row[b * QBLOCK..(b + 1) * QBLOCK], &mut q[b * QBLOCK..(b + 1) * QBLOCK]);
         scales[b] = amax / 127.0;
         sums[b] = s;
+    }
+    // The exact sums, each a sequential left-to-right sum (`Iterator::sum`'s order, from -0.0):
+    // on NEON four blocks at a time, one per lane (the sums of a block are serial chains, the
+    // blocks independent).
+    #[allow(unused_mut)]
+    let mut b0 = 0;
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        while b0 + 4 <= nb {
+            let p = row.as_ptr().add(b0 * QBLOCK);
+            let (mut h0, mut h1) = (vdupq_n_f32(-0.0), vdupq_n_f32(-0.0));
+            let mut second = [vdupq_n_f32(0.0); 16];
+            for i in (0..16).step_by(4) {
+                // Elements i..i+4 of the four blocks, transposed: lane k of `c[j]` is element
+                // i + j of block k (and `d` the same 16 further on).
+                let ld = |o: usize| -> [float32x4_t; 4] {
+                    let r: [float32x4_t; 4] = std::array::from_fn(|k| vld1q_f32(p.add(k * QBLOCK + o)));
+                    let (t0, t1) = (vtrn1q_f32(r[0], r[1]), vtrn2q_f32(r[0], r[1]));
+                    let (t2, t3) = (vtrn1q_f32(r[2], r[3]), vtrn2q_f32(r[2], r[3]));
+                    let (a0, a1) = (vreinterpretq_f64_f32(t0), vreinterpretq_f64_f32(t1));
+                    let (a2, a3) = (vreinterpretq_f64_f32(t2), vreinterpretq_f64_f32(t3));
+                    [
+                        vreinterpretq_f32_f64(vtrn1q_f64(a0, a2)),
+                        vreinterpretq_f32_f64(vtrn1q_f64(a1, a3)),
+                        vreinterpretq_f32_f64(vtrn2q_f64(a0, a2)),
+                        vreinterpretq_f32_f64(vtrn2q_f64(a1, a3)),
+                    ]
+                };
+                let (c, d) = (ld(i), ld(16 + i));
+                for j in 0..4 {
+                    h0 = vaddq_f32(h0, c[j]);
+                    h1 = vaddq_f32(h1, d[j]);
+                    second[i + j] = d[j];
+                }
+            }
+            // The whole block's sum continues the first half's chain.
+            let mut f = h0;
+            for v in second {
+                f = vaddq_f32(f, v);
+            }
+            let (mut a0, mut a1, mut af) = ([0f32; 4], [0f32; 4], [0f32; 4]);
+            vst1q_f32(a0.as_mut_ptr(), h0);
+            vst1q_f32(a1.as_mut_ptr(), h1);
+            vst1q_f32(af.as_mut_ptr(), f);
+            for k in 0..4 {
+                hsums[2 * (b0 + k)] = a0[k];
+                hsums[2 * (b0 + k) + 1] = a1[k];
+                fsums[b0 + k] = af[k];
+            }
+            b0 += 4;
+        }
+    }
+    for b in b0..nb {
+        let blk = &row[b * QBLOCK..(b + 1) * QBLOCK];
         let (h0, h1): (f32, f32) = (blk[..16].iter().sum(), blk[16..].iter().sum());
         hsums[2 * b] = h0;
         hsums[2 * b + 1] = h1;
@@ -671,5 +726,35 @@ mod tests {
                 assert_eq!(xa.hsums[2 * bi + 1].to_bits(), blk[16..].iter().sum::<f32>().to_bits());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod act_sum_tests {
+    /// The activation sums against `Iterator::sum` of each block and half block, bit for bit
+    /// (rows of several lengths: the four-block NEON path and the remainder; signed zeros).
+    #[test]
+    fn act_sums_match_sequential_sums() {
+        let mut seed = 3u64;
+        for n in [32usize, 96, 128, 2048, 8192 + 96] {
+            let x: Vec<f32> = (0..n)
+                .map(|i| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let v = ((seed >> 40) as f32 / (1u64 << 24) as f32 - 0.5) * [1e-3, 1.0, 300.0, 7e4][(i / 32) % 4];
+                    if i % 61 == 0 { -0.0 } else { v }
+                })
+                .collect();
+            let a = super::quantize_act(&x, 1, n);
+            for (b, blk) in x.chunks(32).enumerate() {
+                let f: f32 = blk.iter().sum();
+                let (h0, h1): (f32, f32) = (blk[..16].iter().sum(), blk[16..].iter().sum());
+                assert_eq!(a.fsums[b].to_bits(), f.to_bits(), "n {n} block {b}");
+                assert_eq!(a.hsums[2 * b].to_bits(), h0.to_bits(), "n {n} block {b}");
+                assert_eq!(a.hsums[2 * b + 1].to_bits(), h1.to_bits(), "n {n} block {b}");
+            }
+        }
+        // A block of negative zeros sums to -0.0 (as `Iterator::sum` does).
+        let a = super::quantize_act(&[-0.0f32; 128], 1, 128);
+        assert!(a.fsums.iter().chain(&a.hsums).all(|v| v.to_bits() == (-0.0f32).to_bits()));
     }
 }

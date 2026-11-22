@@ -1793,7 +1793,7 @@ impl<'a> Model<'a> {
     pub fn logits_raw(&self, hidden: &[f32], t: usize) -> Vec<f32> {
         let cfg = &self.cfg;
         let _timer = prof::start(Cat::Head);
-        let mut logits = vec![0f32; t * cfg.vocab_size];
+        let mut logits = crate::kernels::zeros_from(t * cfg.vocab_size, 1 << 16);
         let _unit = crate::stream::enter(&self.stream, self.layer_unit(self.layers.len()));
         linear(&self.head, cfg.vocab_size, cfg.hidden_size, hidden, t, &mut logits);
         logits
@@ -2383,10 +2383,11 @@ pub(crate) fn attention_ext(
             (false, None) => cache.len,
         }
     };
-    if par && rep > 1 && t * n_kv < threads {
-        // Too few (token, KV head) units to keep the threads busy with one task each: the
-        // shared-row kernel (same bits) parallelizes over keys and value columns instead of
-        // splitting the heads that share a KV row.
+    if par && rep > 1 && t * n_kv < threads && hi_of(t - 1) - lo_of(t - 1) > SHARED_MIN_KEYS {
+        // Too few (token, KV head) units to keep the threads busy with one task each, over
+        // enough keys: the shared-row kernel (same bits) parallelizes over keys and value
+        // columns instead of splitting the heads that share a KV row. Shorter ones take a task
+        // per head (one parallel region instead of three).
         crate::attn::attend_shared(
             t * n_kv,
             rep,
@@ -2458,6 +2459,13 @@ pub(crate) fn attention_ext(
         }
     }
 }
+
+/// Fewest keys (a query's last) for which few-token attention with grouped heads takes the
+/// shared-row kernel (`attn::attend_shared`, three parallel regions) rather than a task per
+/// head (one region, each KV row read by every head that shares it). M5 Max, 8 KV heads of 4
+/// query heads, one token: per head 1.4-1.8x faster at 64-1024 keys (6 against 11 us at 64,
+/// 22 against 30 at 512), the shared kernel ahead from about 4096.
+const SHARED_MIN_KEYS: usize = 1024;
 
 /// Chunks of at least this many tokens take [`attention_prefill`].
 pub(crate) const PREFILL_ATTN_MIN: usize = 32;

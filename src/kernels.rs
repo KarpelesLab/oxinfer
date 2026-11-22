@@ -60,13 +60,21 @@ const ZEROS_PAR_MIN: usize = 1 << 18;
 /// the calling thread alone (what `vec![0f32; n]` does once the allocator reuses freed blocks)
 /// was most of the prefill time outside the kernels.
 pub fn zeros(n: usize) -> Vec<f32> {
+    zeros_from(n, ZEROS_PAR_MIN)
+}
+
+/// [`zeros`] filled across the pool from `min` elements: for a buffer the caller writes right
+/// after on every thread anyway (a decode step's logits: 512 KB over a 128k vocabulary took
+/// 14 us on one thread, under 3 across the pool).
+pub fn zeros_from(n: usize, min: usize) -> Vec<f32> {
     const MIN: usize = ZEROS_PAR_MIN;
-    if n < MIN || pool::threads() == 1 {
+    let min = min.min(MIN);
+    if n < min || pool::threads() == 1 {
         return vec![0f32; n];
     }
     let mut v: Vec<f32> = Vec::with_capacity(n);
     let p = SendPtr(v.as_mut_ptr());
-    let chunk = (n / (pool::threads() * 2)).max(MIN / 4);
+    let chunk = (n / (pool::threads() * 2)).max(min / 4);
     pool::run(n.div_ceil(chunk), &|i| {
         let (a, b) = (i * chunk, ((i + 1) * chunk).min(n));
         // SAFETY: the chunks are disjoint and inside the allocation.

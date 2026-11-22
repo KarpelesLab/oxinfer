@@ -2155,7 +2155,7 @@ impl<'a> QwenModel<'a> {
     pub fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
         let _unit = crate::stream::enter(&self.stream, self.layers.len());
         let _timer = prof::start(Cat::Head);
-        let mut logits = crate::kernels::zeros(t * self.cfg.vocab_size);
+        let mut logits = crate::kernels::zeros_from(t * self.cfg.vocab_size, 1 << 16);
         linear(&self.lm_head, self.cfg.vocab_size, self.cfg.hidden_size, hidden, t, &mut logits);
         if let Some((_, _, inv)) = self.cfg.granite_scales() {
             logits.iter_mut().for_each(|v| *v *= inv);

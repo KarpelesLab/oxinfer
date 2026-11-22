@@ -400,7 +400,17 @@ pub fn apply_repetition_penalty(logits: &mut [f32], seen: &[u64], penalty: f32) 
     }
 }
 
+/// The index of the first largest value (NaNs never win; 0 when nothing beats -inf).
 pub fn argmax(x: &[f32]) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    if x.len() >= 64 {
+        // SAFETY: NEON is baseline on aarch64; every load is inside `x`.
+        return unsafe { argmax_neon(x) };
+    }
+    argmax_scalar(x)
+}
+
+fn argmax_scalar(x: &[f32]) -> u32 {
     let mut best = 0usize;
     let mut bv = f32::NEG_INFINITY;
     for (i, &v) in x.iter().enumerate() {
@@ -412,9 +422,78 @@ pub fn argmax(x: &[f32]) -> u32 {
     best as u32
 }
 
+/// [`argmax_scalar`] in two passes: the largest value (FMAXNM ignores NaNs as `>` does), then
+/// its first index. A vocabulary of logits per decoded token: the scalar loop's compare and
+/// branch per element took ~70 us over Llama 3's 128k.
+#[cfg(target_arch = "aarch64")]
+unsafe fn argmax_neon(x: &[f32]) -> u32 {
+    unsafe {
+        use std::arch::aarch64::*;
+        let (n, p) = (x.len(), x.as_ptr());
+        let mut m = [vdupq_n_f32(f32::NEG_INFINITY); 4];
+        let mut i = 0;
+        while i + 16 <= n {
+            for k in 0..4 {
+                m[k] = vmaxnmq_f32(m[k], vld1q_f32(p.add(i + 4 * k)));
+            }
+            i += 16;
+        }
+        let mut best = vmaxnmvq_f32(vmaxnmq_f32(vmaxnmq_f32(m[0], m[1]), vmaxnmq_f32(m[2], m[3])));
+        for &v in &x[i..] {
+            if v > best {
+                best = v;
+            }
+        }
+        // Nothing above -inf (all -inf or NaN): the scalar loop keeps index 0.
+        if best.is_nan() || best == f32::NEG_INFINITY {
+            return 0;
+        }
+        let b = vdupq_n_f32(best);
+        let mut i = 0;
+        while i + 16 <= n {
+            let e = [0, 1, 2, 3].map(|k| vceqq_f32(vld1q_f32(p.add(i + 4 * k)), b));
+            if vmaxvq_u32(vorrq_u32(vorrq_u32(e[0], e[1]), vorrq_u32(e[2], e[3]))) != 0 {
+                break;
+            }
+            i += 16;
+        }
+        (i + x[i..].iter().position(|&v| v == best).unwrap_or(0)) as u32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The NEON argmax against the scalar loop: ties (first index), NaNs, infinities.
+    #[test]
+    fn argmax_matches_scalar() {
+        let mut seed = 9u64;
+        let mut rnd = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 40) as u32
+        };
+        for n in [64usize, 65, 100, 1000, 128256] {
+            for case in 0..6 {
+                let mut x: Vec<f32> = (0..n).map(|_| (rnd() % 1000) as f32 / 7.0 - 50.0).collect();
+                match case {
+                    1 => x.iter_mut().step_by(3).for_each(|v| *v = f32::NAN),
+                    2 => x.fill(f32::NEG_INFINITY),
+                    3 => {
+                        x.fill(f32::NAN);
+                        x[n - 1] = f32::NEG_INFINITY;
+                    }
+                    4 => {
+                        x[n / 2] = f32::INFINITY;
+                        x[n - 1] = f32::INFINITY;
+                    }
+                    5 => x[0] = f32::NAN,
+                    _ => {}
+                }
+                assert_eq!(argmax(&x), argmax_scalar(&x), "n {n} case {case}");
+            }
+        }
+    }
 
     #[test]
     fn repetition_penalty() {
