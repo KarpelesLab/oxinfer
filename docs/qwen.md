@@ -31,6 +31,65 @@ otherwise the generation prompt closes the think block.
 
 Text, images, video and audio are supported (E2B/E4B have both towers).
 
+## Qwen3.8-27B-Heretic and its packagings
+
+`darrellbest/Qwen3.8-27B-Heretic` is Qwen3.8-27B with `attn.o_proj` and `mlp.down_proj` of layers
+11-63 rewritten in place (Heretic's arbitrary-rank ablation): the same 1,199 tensors, in 12 shards
+plus `model-auxiliary.safetensors` (the 15 MTP tensors), which the index names and the downloader
+therefore fetches. Checked in November 2026 on a shared 64-core x86 machine with an RTX 5080
+(16 GB), load 45-115 throughout, so the speeds are indicative only; three chat prompts (19, 20
+and 168 tokens, thinking off, no system prompt) and one 512x384 image (192 image tokens), greedy.
+
+Against transformers 5.24 in bf16 on the CPU, on the same files:
+
+| Prompt | Logits at the last position (max / mean difference, KL) | Greedy tokens |
+|---|---|---|
+| "What is the capital of France?" | 0.22 / 0.017, 4.6e-7; same top 10 (two near ties swapped) | 32/32 |
+| "Write a short poem about the sea." | 0.17 / 0.015, 3.6e-4; same top 10 in order | 32/32 |
+| a 168-token passage to summarize | 0.32 / 0.030, 2.7e-4; same top 9 | 32/32 |
+| image, "Describe this image." | 0.44 / 0.075, 3.2e-5; same top 10 in order | 10 of 32, then "and" for "," |
+
+The expanded image prompt and the pixel values are identical to the processor's; the image
+features differ from the reference tower run in bf16 by 2.5% in norm (one value by 10.7, mean
+difference 0.008 for features of mean magnitude 0.32), which was not looked into further. Video
+was not run on this checkpoint.
+
+What ran, each on the three text prompts unless noted (64 new tokens; CUDA takes the prefill
+matmuls, and the decode speeds with it are the CPU's on this 16 GB card):
+
+| Weights | Against bf16 on the CPU (last-position KL; greedy tokens kept) | Decode tok/s, CPU / CUDA | Prefill of 168 tokens, tok/s, CPU / CUDA |
+|---|---|---|---|
+| bf16 as stored (55.6 GB) | CUDA: the same 48 tokens | 1.1-1.4 / 1.2-1.4 | 28 / 31 |
+| `--quant q8` | 4e-8 to 2.3e-4; 43, 32 and 48 of 48 | 1.8-2.3 / 2.0-2.4 | 39 / 45 |
+| `--quant q4` | 8e-4 to 0.11; 30 of 31, 1 and 12 of 48 | 3.5-4.2 / 3.7-4.4 | 37 / 64 |
+| `-Heretic-GGUF:Q4_K_M` (16.8 GB) | 5e-6 to 2.7e-2; 30 of 31, 8 and 48 of 48 | 3.6-4.1 / 3.5-4.1 | 40 / 41 |
+| `-Heretic-NVFP4` (28.6 GB) | 2e-4 to 6e-2; 8 of 9, 9 and 48 of 48 | 1.8-2.1 / 2.1 (one prompt) | 35 / 37 |
+| `-Heretic-FP8` (36.8 GB) | 9e-7 to 1.7e-3; 8 of 9, 9 and 48 of 48 | 1.5-1.9 / 1.8 (one prompt) | 37 / 40 |
+
+Every quantized form answers the three prompts correctly and coherently (Paris; a rhymed poem;
+the summary with 476 and 1453), and describes the image (sky, sun, ground) with `--quant q4`,
+the GGUF and its `mmproj` file (`Qwen3.8-27B-Heretic-mmproj-F16.gguf`, which has to be saved or
+passed as `--mmproj`: the downloader fetches only the model file), NVFP4 and FP8. On each of
+them the CUDA run gives the CPU run's tokens.
+
+`--mtp` gives the plain greedy tokens in every case tried: bf16 on the CPU (one prompt, 3.15
+tokens per forward, 75% of drafts accepted, 2.8 tok/s against 1.2), `--quant q4` on the three
+prompts on the CPU, with CUDA and with `--exact-verify` (2.86 tokens per forward and 8.0 tok/s
+against 4.2 on the summary; 1.57 and 4.3-4.5 against 3.5 on the poem), and the GGUF (its
+embedded MTP layer; 3.32, 7.8 tok/s against 4.1), NVFP4 (3.15, 3.8 against 2.1) and FP8 (3.00,
+3.6 against 1.9) on the summary prompt.
+
+The NVFP4 repository is compressed-tensors' `nvfp4-pack-quantized` (the MLP and full-attention
+projections; Gated DeltaNet, embeddings, head, vision tower and MTP layer in bf16) and loaded as
+it was. The FP8 one is compressed-tensors' `float-quantized` (llm-compressor's `FP8_DYNAMIC`:
+E4M3 `.weight` with a bf16 `.weight_scale` of one factor per output row), which was refused for
+its missing `weight_scale_inv` block scales until this check and now loads as stored; the weights
+times their row scales are within 2.7% in norm of the bf16 checkpoint's on four matrices. Neither
+was compared with a reference running the same quantized files (vLLM, or transformers with
+compressed-tensors), their activations stay in float where the recipes quantize them (W8A8,
+NVFP4 inputs), and the GGUF was not compared with llama.cpp. The GGUF repository's `BF16` and
+`Q8_0` files were not downloaded.
+
 ## DSpark drafts for Qwen and Gemma 4
 
 `--draft` also takes a DSpark draft for Qwen3, Qwen3.5 / 3.8 and Gemma 4 targets: a Hugging Face

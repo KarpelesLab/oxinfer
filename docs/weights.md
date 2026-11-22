@@ -90,7 +90,11 @@ log-probability difference over the top 10 of those steps):
 `maritaca-ai/S5-nano` (`qwen3_5` safetensors of Qwen3.5-4B's shape, 9.3 GB) ran as stored and
 with `--quant q4`; `mradermacher/gemma-4-31B-it-ARA-heretic-GGUF:Q2_K` was only loaded from its
 header and tensor table (a file of the real size with zero weights: the 60 layers load and a
-forward pass runs).
+forward pass runs). `darrellbest/Qwen3.8-27B-Heretic-GGUF:Q4_K_M` (16.8 GB, with its embedded
+MTP layer and the repository's `mmproj` file) ran on text and an image, against oxinfer's bf16
+run of the safetensors release and not against llama.cpp; the release's compressed-tensors NVFP4
+and FP8 repositories load from their safetensors (see
+[Qwen3.8-27B-Heretic](qwen.md#qwen38-27b-heretic-and-its-packagings)).
 
 **Ternary-Bonsai 2** (PrismML) stores every matrix of the language model as ternary values with
 one f16 scale per group, in one of three packings: `Q2_0` (mainline llama.cpp's type 42: 2-bit
