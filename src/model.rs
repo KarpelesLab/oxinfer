@@ -2462,6 +2462,21 @@ pub(crate) fn attention_ext(
 /// Chunks of at least this many tokens take [`attention_prefill`].
 pub(crate) const PREFILL_ATTN_MIN: usize = 32;
 
+/// Whether the Qwen-family forward runs a prompt chunk of `t` tokens through
+/// [`attention_prefill`] (score and value GEMMs) rather than the per-(token, KV head) loop of
+/// [`attention`]. Not on x86-64 with the AVX2 kernels: there the loop scores eight keys at a
+/// time and keeps its output sums in registers (`kernels::dots`, `kernels::weighted_values`),
+/// and measured 1.1-2.6x faster for the whole prompt than the GEMMs on a 32-core AVX-512 CPU
+/// (see docs/performance.md, "x86-64 CPU prefill"). The loop gives a prompt chunk the bits of
+/// one-token attention; the GEMMs sum in another order.
+pub(crate) fn prefill_attention_gemm(t: usize) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if crate::kernels::simd::avx2() {
+        return false;
+    }
+    t >= PREFILL_ATTN_MIN
+}
+
 /// Causal (optionally sliding-window, `ext`-extended: see [`attention_ext`]) attention for a
 /// prefill chunk as GEMMs: per block of queries and KV head, the scores of the group's query
 /// heads against every key one of them sees, masked per row, soft-maxed, times V. A chunk that
