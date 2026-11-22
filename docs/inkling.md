@@ -541,25 +541,35 @@ placeholder rows; llama.cpp `-d 8192,32768 -n 32`), Q8_0:
 
 **Where a step's time goes.** A decoded token reads 5.1 GB of Q8_0 (48 layer applications, 8
 routed experts each, the LM head), 2.7-2.9 GB at 4 bits. Leaving kinds of ops out
-(`OXINFER_INKLING_SKIP`, the GPU time of a step, load 3) gives, in ms per token:
+(`OXINFER_INKLING_SKIP`; the best ms per token of 4 decode runs of 32 tokens, load 5-8) gives:
 
-| | step | routed experts | dense matmuls | LM head | attention | loop gates | mixes | convolutions, routing | dispatch / barrier floor |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Q8_0 | 17.1 | 6.7 | 2.7 | 0.9 | 1.9 | 1.4 | 1.1 | 0.8 | 1.8 |
-| mlx-community 4bit | 14.4 | 5.3 | 1.9 | 0.45 | 1.8 | 1.3 | 1.05 | 0.6 | 1.65 |
+| | step | routed experts | dense matmuls | attention | LM head | loop gates | mixes | convolutions | routing | barriers alone |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Q8_0 | 14.97 | 6.33 | 2.75 | 1.57 | 0.93 | 0.73 | 0.25 | 0.25 | 0.22 | 1.48 |
+| mlx-community 4bit | 12.10 | 4.73 | 2.12 | 1.58 | 0.68 | 0.91 | 0.53 | 0.41 | 0.39 | 1.58 |
 
-At Q8_0 the experts and the dense matmuls stream at about 480 GB/s and the head at 540 GB/s,
-near what this GPU reads, so a Q8_0 step cannot go much below 11 ms (about 90 tok/s). At 4 bits the
-experts reach only about 300 GB/s and a third of the step is the small kernels between the
-matmuls: a step has 941 dispatches in 805 dependent stages (`OXINFER_INKLING_PROFILE=N` counts
-them and times each kind of stage in a command buffer of its own; 12 stages per layer
-application, 21 with the loop's message gates), and with every kernel left out the barriers
-alone take 1.65-1.9 ms. Measured here: the expert kernels gain from more, smaller SIMD-groups (one
-output each: +3%; two to eight outputs per SIMD-group, or an output's inputs split over two to four
-SIMD-groups, were 1-10% slower; spreading a SIMD-group's (output, chunk) items evenly over its
-lanes was 15% slower), NVFP4 decoded with half-precision bit tricks rather than a table lookup
-(+3%); folding the routing into the first expert kernel (one stage less per layer) cost 7%, since
-each of its 1152 threadgroups then ranks the 128 scores again.
+At Q8_0 the experts and the dense matmuls stream at about 500 GB/s, near what this GPU reads,
+so a Q8_0 step cannot go much below 11 ms. The NVFP4 experts read at about 400 GB/s; with their
+arithmetic left out (the same loads) they save only 0.7 ms a token (460 GB/s). A step has 663
+dispatches in 751 dependent stages (`OXINFER_INKLING_PROFILE=N` counts them and times each kind
+of stage in a command buffer of its own; independent ops, such as a layer's six to eight
+projections, its mixes or the three attention gates, share a stage on the concurrent encoder),
+and with every kernel left out the barriers alone take 1.5-1.6 ms.
+
+What moved decoding (MLX 4-bit 70 -> 83 tok/s, Q8_0 59 -> 67): the kernels of one threadgroup
+per token (the attention residual's mixes, the norms) spread their dot products over all their
+threads instead of one SIMD-group per dot product walking the 2304 values (+11%); the message
+gates' norms written by the mixes that make their inputs, and their forget / gain matvecs (rows
+of the rank, 64) with the gate mix in one kernel of 4 lanes per row (+3%); the expert kernels at
+one output per SIMD-group and NVFP4 decoded with half-precision bit patterns (+3% each); the
+attention's key and value loads batched (+1-1.5% at 8k / 32k). What did not: a serial encoder
+without barriers (each dispatch after the last: 12% slower than the concurrent one with its 751
+barriers), the experts' input row staged in threadgroup memory (4% slower), two to eight
+outputs per SIMD-group or an output split over SIMD-groups (1-10% slower), NVFP4 dots in half
+precision (+0.8%), the routing folded into the experts' first kernel (7% slower: each of its
+1152 threadgroups ranks the 128 scores again) or done as one ranking pass (no change), and one
+stage less for the gates' norms by itself (no change: 805 -> 757 barriers). The cost is in the
+latency of kernels that run as one threadgroup per token, not in the number of barriers.
 
 **Verification passes** (speculative decoding) do not cost one step: a pass of n tokens reads the
 experts of every token, and n tokens choosing 8 of 128 experts each share few of them (4 tokens
@@ -570,7 +580,10 @@ read about 26-29 distinct experts). mlx-community 4bit, ms per pass:
 | pass | 14.0 | 18.9 | 23.1 | 27.3 | 37.2 | 46.0 | 65.3 | 85.4 |
 | without the routed experts | 9.4 | 11.2 | 12.4 | 13.7 | 17.5 | 20.4 | 27.2 | 34.6 |
 
-The experts add about 3.1 ms a token (4.6 ms for the first); the rest grows by 0.4-1.6 ms a token,
+(Measured before the changes above; now 11.9 ms for one token and 24.4 for four.) A pass of 4
+tokens adds 9.1 ms of experts to one of 1 token, 2.2 ms of dense matvecs, 0.6 of LM head, 0.3 of
+gates and nothing of attention. The experts add about 3.1 ms a token (4.6 ms for the first); the
+rest grows by 0.4-1.6 ms a token,
 mostly the multi-token matvecs (dense, head and gates: 2.1, 0.5 and 1.3 ms for one token, 14.6,
 5.4 and 7.6 for 16), which decode each weight chunk once for four tokens but load every token's
 input chunk once per output row pair (more rows per SIMD-group spill registers: twice slower).
@@ -675,18 +688,13 @@ oxinfer --model unsloth/Inkling-2-Mini-GGUF:UD-IQ3_XXS --draft auto --prompt "..
 
 ## Not done
 
-- 125 tok/s of decoding (the figure reported with EXO, see above): 59 at Q8_0, 70 at 4 bits
-  here. At 4 bits a step is a third small kernels between the matmuls (805 dependent stages) and
-  the experts read at 300 GB/s rather than the ~500 of Q8_0; fusions that add work to every
-  threadgroup of a stage lose (the routing folded into the experts' kernel: -7%), so what is left
-  is fewer stages with no more work each (the message gates' norms into their low-rank matmul,
-  the attention's merge when a token has one split) and expert kernels of more memory parallelism.
+- 125 tok/s of decoding (the figure reported with EXO, see above): 67 at Q8_0, 83 at 4 bits
+  here. What is left at 4 bits is the experts' bytes (4.7 ms), the dense matmuls (2.1 ms), and
+  attention, mixes, gates, convolutions and routing as kernels of one or a few threadgroups per
+  token whose latency adds up over 751 dependent stages; fusions that add work to every
+  threadgroup of a stage lose (above).
 - Speculative decoding is bounded by the experts a verification pass reads (3.1 ms a token at 4
   bits, above), whatever the drafter: no batching of the pass shares experts the tokens do not
-  share. The multi-token matvecs of the rest (0.4-1.6 ms a token) could still shrink.
-- CUDA sessions do not go back (no prompt lookup or drafts there): its sliding rings already keep
-  1024 positions more than the window and its full caches are by position, but its convolution
-  histories hold the last 3 inputs only. Keeping a pass's inputs per convolution (the history and
-  the pass's rows, `[3 + t][ch]`) beside them would let `truncate` copy the 3 rows before the new
-  position back; not done without a CUDA device to check it on.
+  share. The multi-token matvecs of the rest (2.2 ms more for 4 tokens than for 1) could shrink
+  with kernels of their own (the decode library's reload each token's input per row pair).
 - No GGUF of Small was tried (the same code reads its layout).
