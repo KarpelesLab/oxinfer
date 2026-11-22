@@ -725,47 +725,10 @@ pub(super) fn kernel_source(kinds: &[u32]) -> String {
     s
 }
 
-/// The module for `src`, compiled once per machine: kept in `$OXINFER_KERNEL_CACHE` (default
-/// `~/.cache/oxinfer/kernels`; `0` turns it off) as one file holding the source and the binary,
-/// used again only for exactly that source (NVRTC takes seconds for a dozen weight kinds).
+/// The module for `src` ([`CudaBackend::cached_module`]: compiled once per machine).
 fn cached_module(be: &CudaBackend, src: &str, kinds: &[u32]) -> Result<F> {
-    let dir = match std::env::var("OXINFER_KERNEL_CACHE") {
-        Ok(v) if v == "0" => None,
-        Ok(v) => Some(std::path::PathBuf::from(v)),
-        Err(_) => std::env::var("HOME")
-            .ok()
-            .map(|h| std::path::Path::new(&h).join(".cache").join("oxinfer").join("kernels")),
-    };
-    let (ma, mi) = be.sm();
     let ks: Vec<String> = kinds.iter().map(|k| k.to_string()).collect();
-    let name = format!("inkling-sm{ma}{mi}-{}.bin", ks.join("-"));
-    // [source length, u64][source][image]
-    if let Some(d) = &dir
-        && let Ok(f) = std::fs::read(d.join(&name))
-        && f.len() >= 8
-    {
-        let n = u64::from_le_bytes(f[..8].try_into().unwrap()) as usize;
-        if f.len() > 8 + n
-            && &f[8..8 + n] == src.as_bytes()
-            && let Ok(m) = be.load_image(&f[8 + n..])
-        {
-            return Ok(m);
-        }
-    }
-    let img = be.compile(src, "inkling.cu")?;
-    if let Some(d) = &dir
-        && std::fs::create_dir_all(d).is_ok()
-    {
-        // Written under a temporary name, then renamed: a reader sees a whole file.
-        let tmp = d.join(format!("{name}.{}", std::process::id()));
-        let mut f = (src.len() as u64).to_le_bytes().to_vec();
-        f.extend_from_slice(src.as_bytes());
-        f.extend_from_slice(&img);
-        if std::fs::write(&tmp, &f).is_ok() && std::fs::rename(&tmp, d.join(&name)).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-    }
-    be.load_image(&img)
+    be.cached_module(src, &format!("inkling-{{sm}}-{}", ks.join("-")), "inkling.cu")
 }
 
 const FIXED: [&str; 40] = [

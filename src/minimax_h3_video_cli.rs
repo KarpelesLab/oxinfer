@@ -331,6 +331,7 @@ pub fn run(args: &Args) -> Result<()> {
         if video.audio.is_some() { "" } else { "; no audio track" }
     );
     if args.profile {
+        eprint!("[transformer time by stage]\n{}", oxinfer::minimax_h3::dit::stage::report());
         eprint!("[time by operation]\n{}", oxinfer::sd::ops::timing::report());
     }
     Ok(())

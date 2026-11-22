@@ -1082,13 +1082,51 @@ impl CudaBackend {
     pub(crate) fn context(&self) -> Option<*mut c_void> {
         self.bind().then_some(self.ctx)
     }
-    /// The compute capability (major, minor).
-    pub(crate) fn sm(&self) -> (i32, i32) {
-        self.sm
-    }
     /// `src` compiled for this device (a native binary, or PTX), for [`Self::load_image`].
     pub(crate) fn compile(&self, src: &str, name: &str) -> Result<Vec<u8>> {
         nvrtc_image(src, name, self.sm)
+    }
+    /// The module for `src` (compiled as `unit`), compiled once per machine: kept in
+    /// `$OXINFER_KERNEL_CACHE` (default `~/.cache/oxinfer/kernels`; `0` turns it off) as one file
+    /// (`tag` with `{sm}` standing for the compute capability) holding the source and the binary,
+    /// used again only for exactly that source (NVRTC takes seconds for a large module).
+    pub(crate) fn cached_module(&self, src: &str, tag: &str, unit: &str) -> Result<*mut c_void> {
+        let dir = match std::env::var("OXINFER_KERNEL_CACHE") {
+            Ok(v) if v == "0" => None,
+            Ok(v) => Some(std::path::PathBuf::from(v)),
+            Err(_) => std::env::var("HOME")
+                .ok()
+                .map(|h| std::path::Path::new(&h).join(".cache").join("oxinfer").join("kernels")),
+        };
+        let (ma, mi) = self.sm;
+        let name = format!("{}.bin", tag.replace("{sm}", &format!("sm{ma}{mi}")));
+        // [source length, u64][source][image]
+        if let Some(d) = &dir
+            && let Ok(f) = std::fs::read(d.join(&name))
+            && f.len() >= 8
+        {
+            let n = u64::from_le_bytes(f[..8].try_into().unwrap()) as usize;
+            if f.len() > 8 + n
+                && &f[8..8 + n] == src.as_bytes()
+                && let Ok(m) = self.load_image(&f[8 + n..])
+            {
+                return Ok(m);
+            }
+        }
+        let img = self.compile(src, unit)?;
+        if let Some(d) = &dir
+            && std::fs::create_dir_all(d).is_ok()
+        {
+            // Written under a temporary name, then renamed: a reader sees a whole file.
+            let tmp = d.join(format!("{name}.{}", std::process::id()));
+            let mut f = (src.len() as u64).to_le_bytes().to_vec();
+            f.extend_from_slice(src.as_bytes());
+            f.extend_from_slice(&img);
+            if std::fs::write(&tmp, &f).is_ok() && std::fs::rename(&tmp, d.join(&name)).is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+        }
+        self.load_image(&img)
     }
     /// Loads a compiled module (from [`Self::compile`]).
     pub(crate) fn load_image(&self, image: &[u8]) -> Result<*mut c_void> {

@@ -14,11 +14,14 @@
 //! - the VAE (`vae`), ImageNet de-normalization, 8-bit rounding (truncation, as `to(uint8)`).
 
 pub mod audio_vae;
+#[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
+mod cuda;
 pub mod dit;
 #[cfg(feature = "media")]
 pub mod encode;
 pub mod lora;
 pub mod ref2va;
+mod stack_dev;
 #[doc(hidden)]
 pub mod tiny;
 pub mod vae;

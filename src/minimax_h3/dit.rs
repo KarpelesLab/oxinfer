@@ -48,6 +48,63 @@ use crate::safetensors::ModelFiles;
 use anyhow::{Context, Result, bail};
 use std::path::Path;
 
+/// Wall time of the stages of [`Dit::forward_av`] / [`Dit::forward`] since the process started
+/// (`--profile`).
+pub mod stage {
+    use crate::clock::Instant;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    const NAMES: [&str; 11] = [
+        "norms, AdaLN",
+        "qkv_proj",
+        "q/k norm, RoPE",
+        "attention",
+        "out_proj",
+        "fc1",
+        "SwiGLU",
+        "fc2",
+        "residuals",
+        "in / out layers",
+        "blocks on the device",
+    ];
+    pub(crate) const NORM: usize = 0;
+    pub(crate) const QKV: usize = 1;
+    pub(crate) const QK: usize = 2;
+    pub(crate) const ATTN: usize = 3;
+    pub(crate) const OUT: usize = 4;
+    pub(crate) const FC1: usize = 5;
+    pub(crate) const ACT: usize = 6;
+    pub(crate) const FC2: usize = 7;
+    pub(crate) const RES: usize = 8;
+    pub(crate) const IO: usize = 9;
+    #[allow(dead_code)] // only the device paths use it
+    pub(crate) const DEV: usize = 10;
+    static NS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
+    pub(super) struct T(usize, Instant);
+    pub(super) fn start(k: usize) -> T {
+        T(k, Instant::now())
+    }
+    impl Drop for T {
+        fn drop(&mut self) {
+            NS[self.0].fetch_add(self.1.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+    #[allow(dead_code)] // only the device paths use it
+    pub(crate) fn add(k: usize, d: std::time::Duration) {
+        NS[k].fetch_add(d.as_nanos() as u64, Ordering::Relaxed);
+    }
+    /// One line per stage that ran, in seconds.
+    pub fn report() -> String {
+        let mut s = String::new();
+        for (i, n) in NAMES.iter().enumerate() {
+            let t = NS[i].load(Ordering::Relaxed) as f64 / 1e9;
+            if t > 0.0005 {
+                s.push_str(&format!("  {n:16} {t:9.2} s\n"));
+            }
+        }
+        s
+    }
+}
+
 /// The modalities a row can carry (AdaLN sets per timestep).
 pub const MODALITIES: usize = 3;
 pub const TAG_IMAGE: u8 = 0;
@@ -226,6 +283,37 @@ impl<'a> DLin<'a> {
         };
         Ok(Self { w, b, n_out, n_in })
     }
+    /// This layer for an accelerator's block stack ([`super::stack_dev`]): None for weights it
+    /// has no kernel for (anything but FP8 with one scale and float16).
+    pub(crate) fn dev_spec(&self) -> Option<super::stack_dev::LinSpec<'_>> {
+        use super::stack_dev::{LinSpec, WSpec};
+        use crate::ggml::GgmlType;
+        if self.w.fold.is_some() {
+            return None;
+        }
+        let w = match &self.w.w {
+            crate::model::Weight::Gguf(m) if m.kind == GgmlType::F8E4M3 && m.data.len() == self.n_out * self.n_in => {
+                let s = m.block_scales.as_ref()?;
+                if s.s.len() != 1 {
+                    return None;
+                }
+                WSpec::F8(&m.data[..], s.s[0])
+            }
+            crate::model::Weight::Gguf(m)
+                if m.kind == GgmlType::F16 && m.block_scales.is_none() && m.data.len() == self.n_out * self.n_in * 2 =>
+            {
+                WSpec::F16(&m.data[..])
+            }
+            _ => return None,
+        };
+        Some(LinSpec {
+            w,
+            bias: self.b.as_deref(),
+            n_out: self.n_out,
+            n_in: self.n_in,
+            lora: self.w.lora_delta(),
+        })
+    }
     pub(crate) fn from_f32(w: &[f32], b: Option<Vec<f32>>, n_out: usize, n_in: usize) -> Result<Self> {
         Ok(Self {
             w: f32_lin(w, n_out, n_in)?,
@@ -312,6 +400,46 @@ pub struct Dit<'a> {
     /// MiniMax-H3's audio projections (in, out).
     audio: Option<(DLin<'a>, DLin<'a>)>,
     inv_freq: Vec<f32>,
+    /// The engine that runs the block stack on an accelerator, if any.
+    device: super::stack_dev::Device,
+}
+
+impl super::stack_dev::Source for Dit<'_> {
+    fn spec(&self) -> super::stack_dev::StackSpec {
+        let c = &self.cfg;
+        super::stack_dev::StackSpec {
+            hidden: c.hidden,
+            heads: c.heads,
+            head_dim: c.head_dim,
+            ffn: c.ffn,
+            half: 3 * self.inv_freq.len(),
+            norm_eps: c.norm_eps,
+            qk_eps: c.qk_eps,
+            stacked: self.blocks.first().is_some_and(|b| matches!(b.attn.qkv, Qkv::Stacked(_))),
+            gate_first: self.blocks.first().is_some_and(|b| b.ff.gate_first),
+        }
+    }
+    fn n_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+    fn block(&self, i: usize) -> Option<super::stack_dev::BlockSpec<'_>> {
+        let b = &self.blocks[i];
+        let first = &self.blocks[0];
+        let qkv = match (&b.attn.qkv, &first.attn.qkv) {
+            (Qkv::Stacked(w), Qkv::Stacked(_)) | (Qkv::Interleaved(w), Qkv::Interleaved(_)) => &**w,
+            _ => return None,
+        };
+        if b.ff.gate_first != first.ff.gate_first || b.adaln.is_none() {
+            return None;
+        }
+        Some(super::stack_dev::BlockSpec {
+            lins: [qkv.dev_spec()?, b.attn.out.dev_spec()?, b.ff.fc1.dev_spec()?, b.ff.fc2.dev_spec()?],
+            norm1: &b.norm1,
+            norm2: &b.norm2,
+            norm_qk: Some((&b.attn.norm_q, &b.attn.norm_k)),
+            scale: None,
+        })
+    }
 }
 
 /// One forward's inputs.
@@ -488,6 +616,7 @@ impl<'a> Dit<'a> {
             heads_out,
             audio,
             inv_freq,
+            device: Default::default(),
             cfg,
         })
     }
@@ -561,11 +690,14 @@ impl<'a> Dit<'a> {
         let cfg = &self.cfg;
         let (h, nh, hd) = (cfg.hidden, cfg.heads, cfg.head_dim);
         let inner = nh * hd;
+        let tm = stage::start(stage::NORM);
         let mut hn = x.to_vec();
         rmsnorm_f32w_rows_inplace(&mut hn, h, &b.norm1, cfg.norm_eps);
         if let Some(a) = ada {
             modulate(&mut hn, a, h, 0);
         }
+        drop(tm);
+        let tm = stage::start(stage::QKV);
         // q, k, v as [n, inner] each.
         let (mut q, mut k, v) = match &b.attn.qkv {
             Qkv::Split(w) => (w[0].forward(&hn, n), w[1].forward(&hn, n), w[2].forward(&hn, n)),
@@ -595,6 +727,8 @@ impl<'a> Dit<'a> {
                 (q, k, v)
             }
         };
+        drop(tm);
+        let tm = stage::start(stage::QK);
         let half = 3 * self.inv_freq.len();
         for (buf, w) in [(&mut q, &b.attn.norm_q), (&mut k, &b.attn.norm_k)] {
             for_chunks(buf, hd, true, |i, head| {
@@ -609,17 +743,29 @@ impl<'a> Dit<'a> {
                 }
             });
         }
+        drop(tm);
+        let tm = stage::start(stage::ATTN);
         let att = crate::qwen_vision::attention_chunked(&q, &k, &v, n, nh, hd);
+        drop(tm);
+        let tm = stage::start(stage::OUT);
         let y = b.attn.out.forward(&att, n);
+        drop(tm);
+        let tm = stage::start(stage::RES);
         residual(x, &y, ada, h, 2);
+        drop(tm);
 
+        let tm = stage::start(stage::NORM);
         let mut hn = x.to_vec();
         rmsnorm_f32w_rows_inplace(&mut hn, h, &b.norm2, cfg.norm_eps);
         if let Some(a) = ada {
             modulate(&mut hn, a, h, 3);
         }
+        drop(tm);
         let ffn = cfg.ffn;
+        let tm = stage::start(stage::FC1);
         let gu = b.ff.fc1.forward(&hn, n);
+        drop(tm);
+        let tm = stage::start(stage::ACT);
         let mut act = vec![0f32; n * ffn];
         for_chunks(&mut act, ffn, true, |r, row| {
             let src = &gu[r * 2 * ffn..(r + 1) * 2 * ffn];
@@ -632,7 +778,11 @@ impl<'a> Dit<'a> {
                 *o = uv * gv / (1.0 + (-gv).exp());
             }
         });
+        drop(tm);
+        let tm = stage::start(stage::FC2);
         let y = b.ff.fc2.forward(&act, n);
+        drop(tm);
+        let _tm = stage::start(stage::RES);
         residual(x, &y, ada, h, 5);
     }
 
@@ -649,6 +799,19 @@ impl<'a> Dit<'a> {
         let dump = dump.filter(|d| d.blocks);
         if let Some(d) = dump {
             d.write("x_in.bin", x);
+        }
+        // The whole stack on the accelerator when it takes it (not while every block is dumped).
+        if dump.is_none()
+            && let Some(dev) = self.device.get(self, "transformer")
+        {
+            let tables: Vec<Vec<f32>> = self.blocks.iter().map(|b| b.adaln.as_ref().unwrap().forward(st, nt)).collect();
+            let ada = super::stack_dev::AdaIn {
+                tables: &tables,
+                key: &key,
+            };
+            if dev.stack(self, x, Some(ada), &cos, &sin) {
+                return;
+            }
         }
         for (bi, b) in self.blocks.iter().enumerate() {
             // [nt * 3, 6H]: the six vectors of each (timestep, modality).
@@ -668,6 +831,12 @@ impl<'a> Dit<'a> {
                 d.write(&format!("blk_{bi}.bin"), x);
             }
         }
+    }
+
+    /// Frees the device memory the block stack holds on an accelerator (its weights go back
+    /// there at the next forward): what follows the sampling may need it.
+    pub fn release_device(&self) {
+        self.device.release();
     }
 
     /// The output norm of the rows `rows` of `x` (RMSNorm, then the shift / scale of each row's
@@ -732,6 +901,7 @@ impl<'a> Dit<'a> {
         {
             bail!("packed sequence: the rows, indices and positions do not agree");
         }
+        let tm = stage::start(stage::IO);
         let mut x = vec![0f32; n * h];
         for (src, index) in [
             (p.text_embedded, p.text_index),
@@ -743,8 +913,10 @@ impl<'a> Dit<'a> {
             }
         }
         let st = self.time_act(p.temb);
+        drop(tm);
         let dump = Dump::from_env();
         self.stack(&mut x, &st, p.timestep_index, p.tags, p.positions, dump.as_ref());
+        let _tm = stage::start(stage::IO);
         let v = self.heads_out[0].forward(&self.norm_out_rows(&x, p.video_index, &st, p.timestep_index), nv);
         let a = aout.forward(&self.norm_out_rows(&x, p.audio_index, &st, p.timestep_index), na);
         if let Some(d) = &dump {
@@ -920,6 +1092,8 @@ impl<'a> Dit<'a> {
 
     /// The layer of a [`LayerId`] from [`Dit::lora_parts`].
     pub(crate) fn layer_mut(&mut self, id: LayerId) -> &mut DLin<'a> {
+        // An engine built before this change holds the layer as it was.
+        self.device.reset();
         if id.block == usize::MAX {
             return &mut self.norm_out_ada;
         }
@@ -932,6 +1106,12 @@ impl<'a> Dit<'a> {
             (5, _) => &mut b.ff.fc2,
             _ => b.adaln.as_mut().expect("the AdaLN projection of a LayerId"),
         }
+    }
+
+    /// Keeps the first `n` blocks only (timing and comparing part of the stack).
+    pub fn truncate_blocks(&mut self, n: usize) {
+        self.device.reset();
+        self.blocks.truncate(n);
     }
 
     /// Whether the AdaLN projections are in the curve form of ComfyUI's "pruned" files.
