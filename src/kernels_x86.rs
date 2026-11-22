@@ -684,6 +684,38 @@ pub unsafe fn q4_rows_t1(m: &crate::quant::Q4Matrix, xq: *const i8, xs: *const f
     }
 }
 
+/// Q4: columns `k0..k1` of row `r` for the int8 prefill GEMM ([`crate::kernels::QMat::unpack_cols_i8`]):
+/// the nibbles minus 8 (low nibbles first in each block of 32), the f16 scales and the offsets.
+///
+/// # Safety
+/// The CPU has SSE2 and F16C (the int8 GEMM's callers checked more); the pointers have room.
+#[target_feature(enable = "avx2,f16c")]
+pub unsafe fn q4_unpack_cols(m: &crate::quant::Q4Matrix, r: usize, k0: usize, k1: usize, q: *mut i8, s: *mut f32, mn: *mut f32) {
+    let (n, bpr) = (m.n_in, m.n_in / 32);
+    let src = m.q.as_ptr().add(r * n / 2);
+    let (m4, eight) = (_mm_set1_epi8(0x0F), _mm_set1_epi8(8));
+    for b in k0 / 32..k1 / 32 {
+        let o = b - k0 / 32;
+        let v = _mm_loadu_si128(src.add(16 * b) as *const __m128i);
+        let lo = _mm_sub_epi8(_mm_and_si128(v, m4), eight);
+        let hi = _mm_sub_epi8(_mm_and_si128(_mm_srli_epi16::<4>(v), m4), eight);
+        _mm_storeu_si128(q.add(32 * o) as *mut __m128i, lo);
+        _mm_storeu_si128(q.add(32 * o + 16) as *mut __m128i, hi);
+        let d = f16c_to_f32(m.scales[r * bpr + b]);
+        *s.add(2 * o) = d;
+        *s.add(2 * o + 1) = d;
+    }
+    if let Some(of) = &m.offsets {
+        let gpr = n / of.group;
+        for b in k0 / 32..k1 / 32 {
+            let o = b - k0 / 32;
+            let v = crate::kernels::bf16_to_f32(of.v[r * gpr + b * 32 / of.group]);
+            *mn.add(2 * o) = v;
+            *mn.add(2 * o + 1) = v;
+        }
+    }
+}
+
 /// The AVX2 kernels against their scalar fallbacks, called directly (the dispatch picks one per
 /// process). They skip on CPUs without AVX2 + FMA.
 #[cfg(test)]

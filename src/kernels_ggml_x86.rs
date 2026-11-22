@@ -608,6 +608,43 @@ pub(super) unsafe fn dequant_row(kind: GgmlType, row: &[u8], n: usize, out: *mut
     true
 }
 
+/// `(sc16, min32)` of `kind`'s rows for the int8 prefill GEMM (`kernels::I8Layout` as x86-64
+/// reads it: whether the f32 scales differ within a block of 32, and whether the rows have
+/// offsets); None if `kind` has none there (Q2_K: its offsets are per 16 inputs).
+pub(super) fn i8_layout(kind: GgmlType) -> Option<(bool, bool)> {
+    use GgmlType::*;
+    Some(match kind {
+        Q8_0 | Q4_0 | IQ4_NL | MXFP4 | Q5_0 | IQ4_XS | IQ2_XXS | IQ3_XXS | IQ3_S | IQ1_S | Q1_0 | Q2_0 | PQ2_0 | TQ1_0 | TQ2_0 | PTQ1_0 => {
+            (false, false)
+        }
+        Q4_1 | Q5_1 | Q4_K | Q5_K => (false, true),
+        Q6_K | Q3_K | IQ2_XS | IQ2_S | IQ1_M | NVFP4 => (true, false),
+        _ => return None,
+    })
+}
+
+/// Whole blocks of one row of `kind` (`blocks`) for the int8 prefill GEMM: their int8 values at
+/// `q`, one scale per 16 inputs at `s` and, for the kinds with offsets, one offset per 16 at `m`
+/// (`decode_i8`'s values).
+///
+/// # Safety
+/// The CPU has AVX2, FMA and F16C; `kind` has an [`i8_layout`]; the pointers have room.
+#[target_feature(enable = "avx2,fma,f16c")]
+pub(super) unsafe fn unpack_cols_i8(kind: GgmlType, blocks: &[u8], q: *mut i8, s: *mut f32, m: *mut f32) {
+    let (bs, ts) = (kind.block_size(), kind.type_size());
+    let mut bq = Q([0i8; QK_K]);
+    let mut bsc = [0f32; 16];
+    let mut bm = [0f32; 16];
+    for (bi, blk) in blocks.chunks_exact(ts).enumerate() {
+        let has_min = unpack(kind, blk, &mut bq.0, &mut bsc, &mut bm);
+        std::ptr::copy_nonoverlapping(bq.0.as_ptr(), q.add(bi * bs), bs);
+        std::ptr::copy_nonoverlapping(bsc.as_ptr(), s.add(bi * bs / 16), bs / 16);
+        if has_min {
+            std::ptr::copy_nonoverlapping(bm.as_ptr(), m.add(bi * bs / 16), bs / 16);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{dequantize_row, dot_row_generic, random_blocks};

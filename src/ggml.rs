@@ -1539,6 +1539,19 @@ impl QMat for GgufMatrix {
     unsafe fn unpack_row_i8(&self, r: usize, q: *mut i8, ds: *mut f32, mn: *mut f32, sc: *mut i32) {
         unsafe { neon::unpack_row_i8(self.kind, self.data.as_ptr().add(r * self.row_bytes()), self.n_in, q, ds, mn, sc) }
     }
+    #[cfg(target_arch = "x86_64")]
+    fn i8_layout(&self) -> Option<crate::kernels::I8Layout> {
+        if self.block_scales.is_some() {
+            return None;
+        }
+        avx2::i8_layout(self.kind).map(|(sc16, min32)| crate::kernels::I8Layout { sc16, min32 })
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn unpack_cols_i8(&self, r: usize, k0: usize, k1: usize, q: *mut i8, s: *mut f32, m: *mut f32) {
+        let (bs, ts) = (self.kind.block_size(), self.kind.type_size());
+        debug_assert!(k0.is_multiple_of(bs) && k1.is_multiple_of(bs));
+        unsafe { avx2::unpack_cols_i8(self.kind, &self.row(r)[k0 / bs * ts..k1 / bs * ts], q, s, m) }
+    }
     unsafe fn rows_t1(&self, xa: &QAct, c: usize, y: *mut f32, r0: usize, r1: usize) {
         unsafe { self.rows_impl::<1>(xa, c, y, 0, r0, r1) }
     }

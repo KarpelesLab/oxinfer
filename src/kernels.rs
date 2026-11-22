@@ -1182,9 +1182,17 @@ pub trait QMat: Sync {
     unsafe fn rows_multi(&self, _xa: &QAct, _pairs: Option<&PairAct>, _t: usize, _y: *mut f32, _r0: usize, _r1: usize) -> bool {
         false
     }
-    /// How rows unpack for the int8 prefill GEMM, if they do (aarch64).
+    /// How rows unpack for the int8 prefill GEMM, if they do (aarch64, and x86-64 with AVX-512
+    /// VNNI).
     fn i8_layout(&self) -> Option<I8Layout> {
         None
+    }
+    /// x86-64: columns `k0..k1` (whole blocks of the format, multiples of 32) of row `r` for the
+    /// int8 prefill GEMM: `q` gets the `k1 - k0` int8 values, `s` one f32 scale per 16 inputs
+    /// (equal within a block of 32 unless `sc16`) and, with `min32`, `m` one offset per 16
+    /// inputs (equal within a block of 32): input `i` is `s[i / 16] * q[i] + m[i / 16]`.
+    unsafe fn unpack_cols_i8(&self, _r: usize, _k0: usize, _k1: usize, _q: *mut i8, _s: *mut f32, _m: *mut f32) {
+        unreachable!("no int8 GEMM layout")
     }
     /// Unpacks row `r` for the int8 prefill GEMM (see [`I8Layout`]): `q` gets `n_in` values,
     /// `ds` and (`min32`) `mn` `n_in / 32`, (`sc16`) `sc` `n_in / 16`.
@@ -1195,7 +1203,9 @@ pub trait QMat: Sync {
 
 /// How a matrix's rows unpack for the int8 prefill GEMM. Row element `i` (in block `b = i / 32`)
 /// is `ds[b] * sc[i / 16] * q[i]` (`sc = 1` unless `sc16`), and with `min32` the dot product
-/// also subtracts `mn[b]` times the exact f32 sum of the activations of block `b`.
+/// also subtracts `mn[b]` times the exact f32 sum of the activations of block `b`
+/// ([`QMat::unpack_row_i8`], aarch64). On x86-64 ([`QMat::unpack_cols_i8`]) `sc16` says that the
+/// f32 scales differ within a block of 32 and `min32` that the rows have offsets.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct I8Layout {
     pub sc16: bool,
@@ -1204,6 +1214,10 @@ pub struct I8Layout {
 
 #[cfg(target_arch = "aarch64")]
 #[path = "kernels_i8gemm.rs"]
+pub(crate) mod i8gemm;
+
+#[cfg(target_arch = "x86_64")]
+#[path = "kernels_i8gemm_x86.rs"]
 pub(crate) mod i8gemm;
 
 #[cfg(target_arch = "aarch64")]
@@ -1223,6 +1237,20 @@ impl QMat for QMatrix {
         let (n, bpr) = (self.n_in, self.n_in / QBLOCK);
         std::ptr::copy_nonoverlapping(self.q.as_ptr().add(r * n), q, n);
         std::ptr::copy_nonoverlapping(self.scales.as_ptr().add(r * bpr), ds, bpr);
+    }
+    #[cfg(target_arch = "x86_64")]
+    fn i8_layout(&self) -> Option<I8Layout> {
+        Some(I8Layout { sc16: false, min32: false })
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn unpack_cols_i8(&self, r: usize, k0: usize, k1: usize, q: *mut i8, s: *mut f32, _m: *mut f32) {
+        let (n, bpr) = (self.n_in, self.n_in / QBLOCK);
+        std::ptr::copy_nonoverlapping(self.q.as_ptr().add(r * n + k0), q, k1 - k0);
+        for b in k0 / QBLOCK..k1 / QBLOCK {
+            let d = self.scales[r * bpr + b];
+            *s.add(2 * (b - k0 / QBLOCK)) = d;
+            *s.add(2 * (b - k0 / QBLOCK) + 1) = d;
+        }
     }
     fn n_in(&self) -> usize {
         self.n_in
@@ -1424,6 +1452,21 @@ impl QMat for Q4Matrix {
             }
         }
     }
+    #[cfg(target_arch = "x86_64")]
+    fn i8_layout(&self) -> Option<I8Layout> {
+        // Offsets per group of whole blocks only.
+        if self.offsets.as_ref().is_some_and(|o| !o.group.is_multiple_of(QBLOCK)) {
+            return None;
+        }
+        Some(I8Layout {
+            sc16: false,
+            min32: self.offsets.is_some(),
+        })
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn unpack_cols_i8(&self, r: usize, k0: usize, k1: usize, q: *mut i8, s: *mut f32, m: *mut f32) {
+        simd::q4_unpack_cols(self, r, k0, k1, q, s, m)
+    }
     fn n_in(&self) -> usize {
         self.n_in
     }
@@ -1585,7 +1628,8 @@ pub fn multi_token_kernels() -> MultiTokenKernels {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefillGemm {
     /// The default: `Fast` (llama.cpp's int8 activation rounding on most rows, SME beside it
-    /// where present; `F32` off aarch64) in a language model's prompt processing (inside
+    /// where present; `F32` on x86-64 without AVX-512 VNNI and elsewhere) in a language model's
+    /// prompt processing (inside
     /// [`lm_prefill`]), `Exact` everywhere else (vision and audio towers, diffusion models,
     /// embeddings, text encoders). [`PrefillGemm::Exact`] opts out everywhere.
     Auto,
@@ -1602,13 +1646,14 @@ pub enum PrefillGemm {
     Hybrid,
     /// `Hybrid` with `Int8` on the NEON units (5/16 of the blocks on SME): the fastest, with
     /// llama.cpp's activation rounding on most rows (KL ~1e-4..1e-3 against `F32`). `Int8`
-    /// without SME.
+    /// without SME, also on x86-64 with AVX-512 VNNI.
     Fast,
     /// The int8 SDOT GEMM (aarch64) with the activations as two int8 planes per block of 32 (a
     /// value and its rounding residual: about 16-bit precision); `F32` elsewhere.
     Int8x2,
     /// The int8 GEMM with one int8 plane, the decode kernels' rounding: faster than `Int8x2`,
-    /// less precise (KL ~1e-3 against `F32` after a 2.5k-token prompt).
+    /// less precise (KL ~1e-3 against `F32` after a 2.5k-token prompt). aarch64 (`SDOT`) and
+    /// x86-64 with AVX-512 VNNI (`vpdpbusd`); `F32` elsewhere.
     Int8,
     /// Dequantized weights times f32 activations on the NEON / AVX2 FMA GEMM.
     F32,
@@ -1715,15 +1760,22 @@ fn prefill_effective() -> PrefillGemm {
 }
 
 /// The CPU prefill GEMM that runs on this machine for the selected [`prefill_gemm`]: `Sme`
-/// (also for `Hybrid` and `Fast` with SME), `Int8x2`, `Int8` or `F32`.
+/// (also for `Hybrid` and `Fast` with SME), `Int8x2` (aarch64), `Int8` (aarch64, x86-64 with
+/// AVX-512 VNNI) or `F32`.
 pub fn prefill_kernel() -> PrefillGemm {
     let sme = sme_available();
     let arm = cfg!(target_arch = "aarch64");
+    // One int8 plane: aarch64, and x86-64 with AVX-512 VNNI.
+    #[cfg(target_arch = "x86_64")]
+    let int8 = i8gemm::available();
+    #[cfg(not(target_arch = "x86_64"))]
+    let int8 = arm;
     match prefill_effective() {
         PrefillGemm::Sme | PrefillGemm::Hybrid | PrefillGemm::Fast if sme => PrefillGemm::Sme,
         PrefillGemm::Hybrid if arm => PrefillGemm::Int8x2,
-        PrefillGemm::Fast if arm => PrefillGemm::Int8,
-        g @ (PrefillGemm::Int8x2 | PrefillGemm::Int8) if arm => g,
+        PrefillGemm::Fast if int8 => PrefillGemm::Int8,
+        PrefillGemm::Int8x2 if arm => PrefillGemm::Int8x2,
+        PrefillGemm::Int8 if int8 => PrefillGemm::Int8,
         _ => PrefillGemm::F32,
     }
 }
@@ -1874,6 +1926,13 @@ pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &
     #[cfg(not(target_arch = "x86_64"))]
     let blocked: Option<(usize, usize, usize)> = None;
     let rows_per_block = blocked.map_or(rows_per_block, |(_, rows, _)| rows_per_block.clamp(rows, 2 * rows));
+    // The int8 GEMM of x86-64 (when any matrix takes it): its own rows and tokens per job (each
+    // row is unpacked once per job, so a job takes as many tokens as its cache blocks allow).
+    #[cfg(target_arch = "x86_64")]
+    let i8_job = (gemm && i8_planes() == Some(false) && refs.iter().any(|j| j.m.i8_layout().is_some())).then(i8gemm::tuning);
+    #[cfg(not(target_arch = "x86_64"))]
+    let i8_job: Option<(usize, usize, usize, usize)> = None;
+    let rows_per_block = i8_job.map_or(rows_per_block, |(rows, ..)| rows);
     let mut blocks: Vec<(u32, u32, u32)> = Vec::new();
     for (j, job) in refs.iter().enumerate() {
         let mut r = 0;
@@ -1902,6 +1961,10 @@ pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &
     let (tchunks, tc) = match blocked {
         Some((_, _, tokens)) if tc > tokens => (t.div_ceil(tokens), tokens),
         _ => (tchunks, tc),
+    };
+    let (tchunks, tc) = match i8_job {
+        Some((_, tokens, ..)) => (t.div_ceil(tokens), tokens),
+        None => (tchunks, tc),
     };
     // SME: whole 32-token tiles per chunk.
     let (tchunks, tc) = if sme_on {
@@ -1932,7 +1995,7 @@ pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &
     #[cfg(target_arch = "aarch64")]
     let xs32 = uses[Path::Sme as usize].then(|| sme::pack_x(x, t, n_in));
     let xa = uses[Path::Decode as usize].then(|| quantize_act(x, t, n_in));
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     let xg = uses[Path::I8 as usize].then(|| i8gemm::I8Act::new(x, t, n_in, planes.unwrap()));
     let mode = multi_token_kernels();
     // Two tokens: the pair kernels already unpack each block once, and keep both accumulators in
@@ -1953,7 +2016,7 @@ pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &
         match path(b) {
             #[cfg(target_arch = "aarch64")]
             Path::Sme => unsafe { sme::gemm_rows(job.m, xs32.as_ref().unwrap(), c0, c1, r0, r1, job.y.get()) },
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
             Path::I8 => unsafe { i8gemm::gemm_rows(job.m, xg.as_ref().unwrap(), c0, c1, r0, r1, job.y.get()) },
             Path::F32 => {
                 let xs = &x[c0 * n_in..c1 * n_in];
