@@ -5,13 +5,17 @@
 // earlier ones converted by `pf_kv_half`). A threadgroup of NSG SIMD-groups takes Q queries of one
 // head and walks the keys C at a time: S = Q K^T (f32 sums) goes to threadgroup memory for an
 // online softmax (Q / NSG rows per SIMD-group, C / 32 columns per lane), the probabilities come
-// back as half for O += P V, O held in a cooperative tensor. The queries are converted to half
+// back as half for O += P V, O held in a cooperative tensor. The queries are converted to QT
 // with the scale (times log2 e) folded in. The running maximum moves lazily, only when a row's
 // grows by more than 8 (2^8 fits half), as llama.cpp's.
-template <int HD, int Q, int C, int NSG>
-inline void pfm_body(device const float* q, device const half* kh, device const half* vh, device float* out,
+// QT = half: the keys from the half rows. QT = float (`pfmq_*`, for unscaled scores, as Gemma's,
+// whose rounding half Q and K would scale up): S = Q K^T in f32 from the f32 cache, only P V on
+// half operands.
+template <int HD, int Q, int C, int NSG, typename QT>
+inline void pfm_body(device const float* q, device const float* kc, device const half* kh, device const half* vh, device float* out,
                      device const float* gate, constant PFF& a, uint2 tg, ushort sg, ushort lane,
-                     threadgroup half* sq, threadgroup float* ss, threadgroup half* sp, threadgroup float* sr, threadgroup int* sf) {
+                     threadgroup QT* sq, threadgroup float* ss, threadgroup half* sp, threadgroup float* sr, threadgroup int* sf) {
+    typedef vec<QT, 4> QT4;
     constexpr int NT = NSG * 32;
     constexpr int NQ = Q / NSG;
     constexpr int NC = C / 32;
@@ -25,7 +29,7 @@ inline void pfm_body(device const float* q, device const half* kh, device const 
         uint j = i / H4;
         float4 v = 0.f;
         if (i0 + j < a.t) v = ((device const float4*)(q + (ulong)(i0 + j) * a.sq + (ulong)h * HD))[i % H4];
-        ((threadgroup half4*)sq)[i] = half4(v * sc);
+        ((threadgroup QT4*)sq)[i] = QT4(v * sc);
     }
     const uint pfirst = a.start + i0;
     const uint kend = a.start + min(i0 + Q, a.t);
@@ -39,13 +43,13 @@ inline void pfm_body(device const float* q, device const half* kh, device const 
         pi[jj] = pfirst + jj * NSG + sg;
         lo[jj] = a.window != 0 && pi[jj] + 1 > a.window ? pi[jj] + 1 - a.window : 0;
     }
-    auto tq = tensor<threadgroup half, extents<int32_t, HD, Q>, tensor_inline>(sq, extents<int32_t, HD, Q>());
+    auto tq = tensor<threadgroup QT, extents<int32_t, HD, Q>, tensor_inline>(sq, extents<int32_t, HD, Q>());
     auto ts = tensor<threadgroup float, extents<int32_t, C, Q>, tensor_inline>(ss, extents<int32_t, C, Q>());
     auto tp = tensor<threadgroup half, extents<int32_t, C, Q>, tensor_inline>(sp, extents<int32_t, C, Q>());
     matmul2d<matmul2d_descriptor(Q, C, HD, false, true, false, matmul2d_descriptor::mode::multiply), execution_simdgroups<NSG>> mm_qk;
     matmul2d<matmul2d_descriptor(Q, HD, C, false, false, false, matmul2d_descriptor::mode::multiply_accumulate),
              execution_simdgroups<NSG>> mm_pv;
-    device const half* kq = kh + kvh * HD;
+    device const QT* kq = (device const QT*)(is_same<QT, half>::value ? (device const void*)kh : (device const void*)kc) + kvh * HD;
     device const half* vq = vh + kvh * HD;
     auto tv0 = tensor((device half*)vq, dextents<int32_t, 2>(HD, C), array<int, 2>({1, rs}));
     auto co = mm_pv.template get_destination_cooperative_tensor<decltype(tp), decltype(tv0), float>();
@@ -59,7 +63,7 @@ inline void pfm_body(device const float* q, device const half* kh, device const 
         // A last partial block: rows past kend are clipped by the tensors' bounds (their scores
         // masked, their values zeros).
         int nk = min((int)C, (int)(kend - kb));
-        auto tk = tensor((device half*)(kq + (ulong)kb * rs), dextents<int32_t, 2>(HD, nk), array<int, 2>({1, rs}));
+        auto tk = tensor((device QT*)(kq + (ulong)kb * rs), dextents<int32_t, 2>(HD, nk), array<int, 2>({1, rs}));
         mm_qk.run(tq, tk, ts);
         threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
@@ -119,19 +123,22 @@ inline void pfm_body(device const float* q, device const half* kh, device const 
             }
         }
 }
-#define PFM_INST(NAME, HD, Q, C, NSG) \
+#define PFM_INST(NAME, HD, Q, C, NSG, QT) \
 kernel void NAME(device const float* q [[buffer(0)]], device const float* kc [[buffer(1)]], device const float* vc [[buffer(2)]], \
                  device float* out [[buffer(3)]], device const float* gate [[buffer(4)]], constant PFF& a [[buffer(5)]], \
                  device const half* kh [[buffer(6)]], device const half* vh [[buffer(7)]], \
                  uint2 tg [[threadgroup_position_in_grid]], ushort sg [[simdgroup_index_in_threadgroup]], \
                  ushort lane [[thread_index_in_simdgroup]]) { \
-    threadgroup half sq[Q * HD]; \
+    threadgroup QT sq[Q * HD]; \
     threadgroup float ss[Q * C]; \
     threadgroup half sp[Q * C]; \
     threadgroup float sr[Q]; \
     threadgroup int sf[1]; \
-    pfm_body<HD, Q, C, NSG>(q, kh, vh, out, gate, a, tg, sg, lane, sq, ss, sp, sr, sf); }
-PFM_INST(pfm_64, 64, 32, 64, 4)
-PFM_INST(pfm_128, 128, 16, 128, 4)
-PFM_INST(pfm_256, 256, 16, 64, 4)
-PFM_INST(pfm_512, 512, 16, 64, 8)
+    pfm_body<HD, Q, C, NSG, QT>(q, kc, kh, vh, out, gate, a, tg, sg, lane, sq, ss, sp, sr, sf); }
+PFM_INST(pfm_64, 64, 32, 64, 4, half)
+PFM_INST(pfm_128, 128, 16, 128, 4, half)
+PFM_INST(pfm_256, 256, 16, 64, 4, half)
+PFM_INST(pfm_512, 512, 16, 64, 8, half)
+PFM_INST(pfmq_64, 64, 32, 64, 4, float)
+PFM_INST(pfmq_128, 128, 16, 128, 4, float)
+PFM_INST(pfmq_256, 256, 16, 64, 4, float)

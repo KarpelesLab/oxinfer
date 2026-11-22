@@ -263,6 +263,13 @@ fn pf_mma_attn() -> bool {
     // (Read as each plan is built, so that `pf_ab` can compare.)
     std::env::var("OXINFER_PF_MMA_ATTN").map_or(true, |v| v != "0")
 }
+/// Whether an attention's scores take f32 queries and keys on the matrix units (`pfmq_*`, and
+/// heads of 512 the SIMD-group kernel): when they are not scaled down by about 1 / sqrt(hd) (Gemma
+/// 3 / 4 normalize q and k and use a scale of 1), half Q and K round them by up to ~1e-2
+/// (`OXINFER_PF_MMA_ATTN=2`: half for every model).
+fn pf_precise_scores(scale: f32, hd: usize) -> bool {
+    scale * scale * hd as f32 > 4.0 && std::env::var("OXINFER_PF_MMA_ATTN").map_or(true, |v| v != "2")
+}
 /// Whether prefill plans make the GEMMs' half rows in the SwiGLU / GeGLU before them
 /// (`pf_glu_half`, the same values; `OXINFER_PF_GLU_HALF=0`: a separate `x_half`).
 fn pf_glu_half() -> bool {
@@ -1960,8 +1967,11 @@ impl MetalBackend {
                         nh,
                         nkv,
                         window,
+                        scale,
                         ..
                     } => {
+                        // (Precise heads of 512 keep `pffs_512`: no f32 `pfmq_512` fits.)
+                        life[kv].3 &= !(hd == 512 && pf_precise_scores(scale, hd));
                         match window {
                             Some(w) => kvh_window[kv] = kvh_window[kv].max(w),
                             None => full[kv] = true,
@@ -3428,11 +3438,15 @@ impl MetalBackend {
                     };
                     let alt = (self.named_pipeline(&alt)?, aqt, athreads);
                     let mut half = kvh[kv];
-                    let mma = match hd {
-                        64 => Some(("pfm_64", 32, 128)),
-                        128 => Some(("pfm_128", 16, 128)),
-                        256 => Some(("pfm_256", 16, 128)),
-                        512 => Some(("pfm_512", 16, 256)),
+                    let precise = pf_precise_scores(scale, hd);
+                    let mma = match (hd, precise) {
+                        (64, false) => Some(("pfm_64", 32, 128)),
+                        (128, false) => Some(("pfm_128", 16, 128)),
+                        (256, false) => Some(("pfm_256", 16, 128)),
+                        (512, false) => Some(("pfm_512", 16, 256)),
+                        (64, true) => Some(("pfmq_64", 32, 128)),
+                        (128, true) => Some(("pfmq_128", 16, 128)),
+                        (256, true) => Some(("pfmq_256", 16, 128)),
                         _ => None,
                     }
                     .filter(|_| half.is_some())
@@ -7573,6 +7587,9 @@ mod tests {
         let be = MetalBackend::new().unwrap();
         let env = |k: &str, d: &str| std::env::var(k).unwrap_or(d.into());
         let start: usize = env("OXINFER_AB_START", "0").parse().unwrap();
+        // OXINFER_AB_SCALE: the attention scale (default 1 / sqrt(hd)); OXINFER_AB_AMP: the
+        // queries' and keys' amplitude (uniform in +-AMP / 2, default 6).
+        let amp: f32 = env("OXINFER_AB_AMP", "6").parse().unwrap();
         let window: usize = env("OXINFER_AB_WINDOW", "0").parse().unwrap();
         let mut seed = 11u64;
         for shape in env("OXINFER_AB_SHAPES", "32:8:128").split(',') {
@@ -7582,12 +7599,12 @@ mod tests {
                 let n = start + t;
                 let q: PageVec<f32> = {
                     let mut q = PageVec::<f32>::zeroed(t.next_multiple_of(128) * nh * hd);
-                    q.iter_mut().for_each(|x| *x = lcg(&mut seed) * 6.0);
+                    q.iter_mut().for_each(|x| *x = lcg(&mut seed) * amp);
                     q
                 };
                 let mut kc = PageVec::<f32>::zeroed(n.next_multiple_of(128) * nkv * hd);
                 let mut vc = PageVec::<f32>::zeroed(n.next_multiple_of(128) * nkv * hd);
-                kc.iter_mut().for_each(|x| *x = lcg(&mut seed) * 6.0);
+                kc.iter_mut().for_each(|x| *x = lcg(&mut seed) * amp);
                 vc.iter_mut().for_each(|x| *x = lcg(&mut seed) * 2.0);
                 // Half copies of the cache (`pfm_*` reads those).
                 let half_of = |c: &PageVec<f32>| {
@@ -7611,7 +7628,11 @@ mod tests {
                     t as u32,
                     nh as u32,
                     nkv as u32,
-                    (1.0f32 / (hd as f32).sqrt()).to_bits(),
+                    std::env::var("OXINFER_AB_SCALE")
+                        .ok()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .unwrap_or(1.0 / (hd as f32).sqrt())
+                        .to_bits(),
                     window as u32,
                     (nh * hd) as u32,
                     (nh * hd) as u32,
