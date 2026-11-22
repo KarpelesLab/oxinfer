@@ -52,9 +52,16 @@ faults on the first pass.
 
 The installers download the latest release's binary for this machine:
 
+On macOS and Linux:
+
 ```sh
-curl -fsSL https://karpeleslab.github.io/oxinfer/install.sh | sh      # macOS, Linux
-irm https://karpeleslab.github.io/oxinfer/install.ps1 | iex            # Windows (PowerShell)
+curl -fsSL https://karpeleslab.github.io/oxinfer/install.sh | sh
+```
+
+On Windows (PowerShell):
+
+```powershell
+irm https://karpeleslab.github.io/oxinfer/install.ps1 | iex
 ```
 
 - **`install.sh`** puts `oxinfer` in `~/.local/bin`, or `$OXINFER_INSTALL_DIR`, and says how to add that folder to `PATH` when it isn't there. It takes options after `sh -s --`:

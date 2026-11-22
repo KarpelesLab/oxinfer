@@ -12,16 +12,19 @@ may still change.
 
 ## Get started
 
-1. **Install it:**
+1. **Install it.** On macOS and Linux:
 
    ```sh
-   curl -fsSL https://karpeleslab.github.io/oxinfer/install.sh | sh                 # macOS, Linux
-   ```
-   ```powershell
-   irm https://karpeleslab.github.io/oxinfer/install.ps1 | iex                       # Windows
+   curl -fsSL https://karpeleslab.github.io/oxinfer/install.sh | sh
    ```
 
-   or take an archive from the [latest release](https://github.com/KarpelesLab/oxinfer/releases/latest),
+   On Windows (PowerShell):
+
+   ```powershell
+   irm https://karpeleslab.github.io/oxinfer/install.ps1 | iex
+   ```
+
+   Or take an archive from the [latest release](https://github.com/KarpelesLab/oxinfer/releases/latest),
    or build it: `cargo build --release`.
 2. **Run `oxinfer web`.** It opens `http://127.0.0.1:8090/` in your browser.
 3. **Pick a model** from the catalog. It shows each model's size and whether it fits this
