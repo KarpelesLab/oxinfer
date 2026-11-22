@@ -73,8 +73,9 @@ impl Mlp<'_> {
     }
     /// `down(act(gate(x)) * up(x))` for `t` rows of `x` (`hook`: neuron edits of `target`).
     fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32], hook: Option<(&NeuronHook, Target)>) {
-        let mut g = crate::kernels::zeros(t * self.inter);
-        let mut u = crate::kernels::zeros(t * self.inter);
+        // Both are fully written by the matmuls.
+        let mut g = crate::kernels::scratch(t * self.inter);
+        let mut u = crate::kernels::scratch(t * self.inter);
         linear_multi(
             &mut [(&self.gate, self.inter, &mut g[..]), (&self.up, self.inter, &mut u[..])],
             h,
@@ -86,6 +87,8 @@ impl Mlp<'_> {
             hk.apply(tg, &mut g, self.inter);
         }
         linear(&self.down, h, self.inter, &g, t, y);
+        crate::kernels::recycle(g);
+        crate::kernels::recycle(u);
     }
 }
 
@@ -2318,6 +2321,8 @@ impl<'a> QwenModel<'a> {
 
         let mut hn = crate::kernels::zeros(t * h);
         let mut y = crate::kernels::zeros(t * h);
+        // Each layer's large temporaries are handed to the next one.
+        let _scratch = crate::kernels::ScratchScope::open();
         for (l, layer) in self.layers.iter().enumerate() {
             let _unit = crate::stream::enter(&self.stream, l);
             rmsnorm_f32w_rows(&x, h, &layer.ln_in, eps, &mut hn);
@@ -2513,9 +2518,10 @@ impl<'a> QwenModel<'a> {
         let gated = cfg.attn_output_gate;
         let rope = if cfg.rope_interleaved { apply_rope_interleaved } else { apply_rope };
         let qw = if gated { 2 * nh * hd } else { nh * hd };
-        let mut qg = crate::kernels::zeros(t * qw);
-        let mut k = crate::kernels::zeros(t * nkv * hd);
-        let mut v = crate::kernels::zeros(t * nkv * hd);
+        // Fully written by the matmuls, as `q` and `kn` are by the loops below.
+        let mut qg = crate::kernels::scratch(t * qw);
+        let mut k = crate::kernels::scratch(t * nkv * hd);
+        let mut v = crate::kernels::scratch(t * nkv * hd);
         linear_multi(
             &mut [
                 (&at.q, qw, &mut qg[..]),
@@ -2534,7 +2540,7 @@ impl<'a> QwenModel<'a> {
 
         // Split query / gate, norm, partial RoPE, fold in the 1/sqrt(hd) scaling.
         let scale = cfg.attn_scale();
-        let mut q = crate::kernels::zeros(t * nh * hd);
+        let mut q = crate::kernels::scratch(t * nh * hd);
         let mut gate = crate::kernels::zeros(t * nh * hd);
         let par = t > 1;
         // MiniMax M2: one norm over all heads (ungated queries), here; none per head below.
@@ -2586,7 +2592,7 @@ impl<'a> QwenModel<'a> {
                 }
             }
         }
-        let mut kn = crate::kernels::zeros(t * nkv * hd);
+        let mut kn = crate::kernels::scratch(t * nkv * hd);
         for_chunks(&mut kn, hd, par, |i, ko| {
             let ti = i / nkv;
             match k_norm {
@@ -2677,6 +2683,9 @@ impl<'a> QwenModel<'a> {
             }
         }
         linear(&at.o, h, nh * hd, &att, t, y);
+        for b in [qg, k, v, q, kn] {
+            crate::kernels::recycle(b);
+        }
     }
 
     pub(crate) fn gdn_forward(&self, gd: &Gdn, st: &mut GdnState, mut rec: Option<&mut GdnRecord>, hn: &[f32], t: usize, y: &mut [f32]) {
@@ -2693,8 +2702,9 @@ impl<'a> QwenModel<'a> {
         let conv_dim = 2 * key_dim + value_dim;
         let kc = cfg.linear_conv_kernel_dim;
 
-        let mut qkv = crate::kernels::zeros(t * conv_dim);
-        let mut z = crate::kernels::zeros(t * value_dim);
+        // `qkv` and `z` are fully written by the matmuls, `c` by the convolution.
+        let mut qkv = crate::kernels::scratch(t * conv_dim);
+        let mut z = crate::kernels::scratch(t * value_dim);
         let mut b = crate::kernels::zeros(t * nv);
         let mut a = crate::kernels::zeros(t * nv);
         linear_multi(
@@ -2711,7 +2721,7 @@ impl<'a> QwenModel<'a> {
 
         // Causal depthwise conv over time (kernel kc, left context from the state), then SiLU.
         let _timer = prof::start(Cat::Attention);
-        let mut c = crate::kernels::zeros(t * conv_dim);
+        let mut c = crate::kernels::scratch(t * conv_dim);
         {
             let st_conv = &st.conv;
             // Input row `i` (negative: the rows kept from before the pass).
@@ -2789,10 +2799,16 @@ impl<'a> QwenModel<'a> {
         }
 
         // Gated delta rule, recurrent over time, parallel over value heads.
-        let mut out = crate::kernels::zeros(t * value_dim);
+        // The CPU rule writes every output (a device's pass gets zeros).
+        let want_gpu = prefill_gpu_exp(cfg, t, "gdn");
+        let mut out = if want_gpu {
+            crate::kernels::zeros(t * value_dim)
+        } else {
+            crate::kernels::scratch(t * value_dim)
+        };
         let sig = cfg.gdn_sigmoid_gate();
         // Qwen4-Exp prefill: the rule on the GPU (one pass over the chunk).
-        let on_gpu = prefill_gpu_exp(cfg, t, "gdn") && {
+        let on_gpu = want_gpu && {
             let mut ba = crate::kernels::zeros(t * 2 * nv);
             for (ti, row) in ba.chunks_mut(2 * nv).enumerate() {
                 row[..nv].copy_from_slice(&b[ti * nv..(ti + 1) * nv]);
@@ -2825,6 +2841,9 @@ impl<'a> QwenModel<'a> {
 
         gated_norm(&mut out, &z, &gd.norm_w, eps, sig, t * nv > 64);
         linear(&gd.out, h, value_dim, &out, t, y);
+        for b in [qkv, z, c, out] {
+            crate::kernels::recycle(b);
+        }
     }
 }
 

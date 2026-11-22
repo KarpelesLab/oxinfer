@@ -51,13 +51,16 @@ mod scratch {
 }
 use scratch::SCRATCH;
 
+/// Elements from which [`zeros`] fills across the pool (1 MiB: below it the parallel region costs
+/// more than it saves) and [`scratch`] reuses buffers.
+const ZEROS_PAR_MIN: usize = 1 << 18;
+
 /// A zeroed `Vec<f32>` of `n` elements, filled across the pool when large. A prompt's per-layer
 /// temporaries are megabytes each and fully written by the matmuls that follow: zeroing them on
 /// the calling thread alone (what `vec![0f32; n]` does once the allocator reuses freed blocks)
 /// was most of the prefill time outside the kernels.
 pub fn zeros(n: usize) -> Vec<f32> {
-    /// Below this (1 MiB), the parallel region costs more than it saves.
-    const MIN: usize = 1 << 18;
+    const MIN: usize = ZEROS_PAR_MIN;
     if n < MIN || pool::threads() == 1 {
         return vec![0f32; n];
     }
@@ -72,6 +75,57 @@ pub fn zeros(n: usize) -> Vec<f32> {
     // SAFETY: all `n` elements were written above (zero bytes are 0.0).
     unsafe { v.set_len(n) };
     v
+}
+
+/// Freed prompt temporaries kept for [`scratch`] while a [`ScratchScope`] is open.
+static SCRATCH_POOL: std::sync::Mutex<Vec<Vec<f32>>> = std::sync::Mutex::new(Vec::new());
+static SCRATCH_SCOPES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// While one is alive, [`recycle`] keeps large temporaries for [`scratch`] to hand out again; the
+/// last one to drop frees them. A forward pass over a prompt opens one, so that each layer
+/// reuses the megabytes of the previous one instead of taking (and zero-filling) new memory.
+pub struct ScratchScope(());
+
+impl ScratchScope {
+    pub fn open() -> Self {
+        SCRATCH_SCOPES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(())
+    }
+}
+
+impl Drop for ScratchScope {
+    fn drop(&mut self) {
+        if SCRATCH_SCOPES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            SCRATCH_POOL.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+    }
+}
+
+/// Buffers a [`ScratchScope`] keeps at most (a layer of the Qwen family frees about ten).
+const SCRATCH_KEEP: usize = 16;
+
+/// A `Vec<f32>` of `n` elements for a temporary that is fully written before it is read: its
+/// contents are unspecified (zeros, or what a buffer given to [`recycle`] held). Zero-filling a
+/// prompt's per-layer temporaries, megabytes each, cost as much as a tenth of the pass.
+pub fn scratch(n: usize) -> Vec<f32> {
+    if n >= ZEROS_PAR_MIN && SCRATCH_SCOPES.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        let mut pool = SCRATCH_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = pool.iter().position(|v| v.len() == n) {
+            return pool.swap_remove(i);
+        }
+    }
+    zeros(n)
+}
+
+/// Gives a temporary back for [`scratch`] (dropped when no [`ScratchScope`] is open, or small).
+pub fn recycle(v: Vec<f32>) {
+    if v.len() >= ZEROS_PAR_MIN && SCRATCH_SCOPES.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+        let mut pool = SCRATCH_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        if pool.len() >= SCRATCH_KEEP {
+            pool.remove(0);
+        }
+        pool.push(v);
+    }
 }
 
 /// Runs `f` compiled for AVX-512F or AVX2 where the CPU has them (x86-64; as is elsewhere). For
