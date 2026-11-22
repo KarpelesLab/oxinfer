@@ -201,8 +201,8 @@ Not checked or not done:
 - the soundtracks generated so far ([real runs](#real-runs)) were analysed and transcribed, not
   listened to; the one from the release's own bf16 transformer at 50 steps (below) was only
   measured; the audio VAE ran on the CPU only;
-- the character-swap LoRA; GPU execution (the 66 GB transformer runs on the CPU from mapped
-  weights).
+- the character-swap LoRA; GPU execution of the bf16 transformer (the 66 GB of it run on the CPU
+  from mapped weights; the FP8 file runs [on CUDA](#on-cuda)).
 
 The release's own bf16 weights from `FL2VA/` (192 cores, 251 GB RAM, CPU only): the fox prompt
 above in the `integrated_multimodal_description: [Shot 1] ...` form with an `Audio:` sentence,
@@ -766,6 +766,100 @@ another sample of the same scene with the same words (`Good morning.` now starts
 instead of 0 s, the second sentence at 2.0 s in both), 9 dB louder, and with the blobs noted
 above where the first clip had none: one seed each, so neither the level nor the blobs can be
 put down to the tokens.
+
+### On CUDA
+
+With `--device cuda` the transformer's 50 blocks and the video VAE decoder's 36 run on the GPU
+(`src/minimax_h3/cuda.rs`, kernels in `cuda.cu`): the sequence stays on the device from the
+first block to the last, the products run on the tensor cores, and the host keeps the text
+encoder, the layers before and after the blocks, the AdaLN tables and the schedule (the audio
+VAE runs as before). It takes the files of the runs above, FP8 "scaled" transformer weights with or without
+LoRA side paths and the float16 VAE; any other format (the bf16 and int8 ConvRot transformers,
+the release's diffusers folders, W6A8) still runs on the CPU, as do heads that are not a
+multiple of 64 wide. Measured on one RTX 5080 (16 GB, 1.5 GB of it in use by the desktop) beside a
+Threadripper 9970X shared with other jobs, a `--profile ci` build, the dog request of the table
+above (448x256, 124 frames, 4682 rows, the 4-step 768p LoRA, `--seed 1`, the kept Q8_0 prompt
+embedding):
+
+| | CPU | CUDA |
+|---|---|---|
+| one forward | 194 s (457 s in a run of one forward while the machine's other jobs were busier) | 8.6 s (12.8 to 13.4 s the first one: the LoRA factors as halves, 23 to 27 blocks copied to the device) |
+| the 4 forwards | 774.7 s | 38.6 s |
+| video VAE decode (124 frames) | 160 to 187 s | 6.4 to 8.1 s |
+| audio VAE decode | 1.2 s | 1.1 s |
+| load (transformer, VAEs, LoRA) | 5.6 s | 6.2 s |
+| the whole run, prompt embedding kept | 943 s (15.7 min) | 54 s |
+
+The text encoder is not in these totals (5.3 to 13.6 s on the CPU for the 124-token prompt with
+the Q8_0 GGUF, load included: GGUF weights have no device kernels). Peak resident memory of the
+CUDA run 30.4 GB, 6.2 GB of it allocated.
+
+Where one forward's time goes (`--profile`; on the device with `OXINFER_H3_GPU_PROF=1`, which
+waits for the GPU after every stage):
+
+| stage | CPU | CUDA |
+|---|---|---|
+| `qkv_proj` with its LoRA | 52.2 s | 1.90 s |
+| attention (56 heads over 4682 rows) | 16.0 s | 2.54 s |
+| `out_proj` with its LoRA | 17.8 s | 0.42 s |
+| `fc1` with its LoRA | 56.0 s | 2.44 s |
+| `fc2` with its LoRA | 41.0 s | 0.96 s |
+| norms and AdaLN, query / key norms and RoPE, SwiGLU, residuals | 6.0 s | 0.22 s |
+| copying the blocks that are not kept on the device | | 1.16 s (while the block before runs: not in the 8.6 s) |
+| the whole forward | 193.7 s | 8.6 s |
+
+The CPU column is a quarter of the four forwards of the run above. The CPU's time depends on
+what else the machine runs: the forward measured alone took 457.5 s with the same split (the
+four projections 426.8 s of it, attention 17.9 s), and the earlier runs above 322 to 543 s per
+forward. The four projections, float32 GEMMs over weights decoded eight rows at a time, are 86
+to 93% of a CPU forward.
+
+**1344x768.** One forward of the same prompt at 1344x768, 124 frames (37,834 rows; `--steps 2`,
+so the frames are noise and only the times mean something): 302.5 s, with 4 of the 50 blocks
+kept on the device beside the activations (15.2 of the 16 GB in use), then the VAE's 124 frames
+in 82.9 s and the audio in 1.2 s; 396 s in all, peak resident memory 33.0 GB (7.8 GB allocated).
+The four forwards of a clip were not run at that size, on either device.
+
+**Memory.** A block is about 0.45 GB on the device (0.385 GB of FP8 bytes as stored, the rest its
+LoRA factors), the transformer 22 GB: 23 to 27 blocks stay there and the others go through two
+slots, each copied while the block before it runs. The activations of 4682 rows take 1.2 GB
+(the feed-forward runs in row chunks and the attention in query chunks of at most 256 MB of
+scores, so neither grows with the square of the sequence). The transformer's blocks leave the
+device before the VAE decodes (its 36 float16 blocks are 4.8 GB and all fit), and the VAE's
+after.
+
+**Arithmetic.** The tensor cores multiply float16 operands and add in float32. FP8 and float16
+weights are exact in a half. Float32 operands (the activations, the attention's queries, keys,
+probabilities and values, LoRA factors that are not exact in a half) go in as two halves each,
+`hi + lo / 2048` after a power of two per row (per head for the values, per matrix for LoRA
+factors), and every product as two or three tensor-core products. Against the float32 CPU path
+and against torch (diffusers' transformer in float32 on the same inputs,
+`tools/minimax_h3_video_ref.py`), relative L2 error of the video / audio velocities of a forward:
+
+| forward | CUDA against the CPU path | CUDA against torch | the CPU path against torch |
+|---|---|---|---|
+| 1 (the same inputs for all three) | 9.5e-5 / 4.4e-6 (max abs 5.9e-3 / 3.5e-5, mean \|v\| 1.14 / 0.74) | 4.1e-5 / 2.4e-6 | 1.0e-4 / 4.8e-6 |
+| 2, 3, 4 (the inputs an earlier CPU run kept) | | 5.0e-5, 1.3e-4, 4.9e-5 / 3.9e-6, 5.1e-6, 3.1e-6 | 3.1e-4, 2.6e-4, 1.6e-4 / 2.1e-5, 3.2e-5, 2.6e-5 (that earlier run) |
+
+After the four steps the video rows are within 2.1% (relative L2) of torch's own four steps
+from the same noise and the audio rows within 0.24%; the CPU path's are within 2.6% and 0.29%
+of torch's and 2.3% and 0.17% of the CUDA run's (the 4-step schedule amplifies a forward's
+rounding, [above](#what-was-checked-1)). The
+VAE's decoded frames are within 3.8e-5 of the CPU's (mean 6.2e-7, mean magnitude 0.84). The
+engine's own tests compare both kinds of stack (FP8 with AdaLN, weighted query / key norms and
+LoRA side paths; float16 with biases and scaled residuals) with their definition in float64 on
+random weights: within 2e-5 of the largest value, whole and in chunks
+(`cargo test --lib minimax_h3::cuda`, on a machine with an NVIDIA GPU).
+
+Tried and not kept as the default: plain float16 operands (`OXINFER_H3_GPU_EXACT=0`, one
+tensor-core product instead of two or three) take 6.5 s of device time per forward instead of
+8.5 s, with velocities 9.5e-3 from the CPU's on average and 0.33 at most (against 7.8e-5 and
+5.9e-3). `OXINFER_H3_GPU=0` keeps the CPU path; `OXINFER_GPU_PLAN_DEBUG=1` says what the device
+took or why it declined.
+
+Not done: the text encoder on the GPU; the transformer's other weight formats there; requests
+whose activations do not fit beside two blocks (the CPU path then runs); a comparison of the
+decoded frames by eye.
 
 ### Still not supported
 
