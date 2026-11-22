@@ -125,6 +125,26 @@ struct Folds {
     claimed: Mutex<Vec<(String, bool)>>,
 }
 
+/// Lets the system take back the pages `[addr, addr + len)` (page-aligned) of a heap allocation that
+/// will not be read again (they stay allocated: the allocation is freed as a whole later).
+#[allow(unused_variables)]
+fn release_pages(addr: usize, len: usize) {
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "linux", target_os = "android"))]
+    {
+        unsafe extern "C" {
+            fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        // (Darwin: MADV_FREE_REUSABLE, which also takes the pages out of the footprint; Linux:
+        // MADV_DONTNEED.)
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        const ADVICE: i32 = 7;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const ADVICE: i32 = 4;
+        // SAFETY: the range is whole pages of a live allocation that nothing reads any more.
+        unsafe { madvise(addr as *mut std::ffi::c_void, len, ADVICE) };
+    }
+}
+
 /// Reads a whole file into memory using parallel positional reads (sequential where the
 /// platform has no positional read).
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -484,6 +504,8 @@ pub struct ModelFiles {
     dequantized: Mutex<HashMap<String, PageVec<u16>>>,
     /// Aligned copies of tensors from host-kept shards or unaligned mapped ones (never freed).
     copies: Mutex<HashMap<String, (PageVec<u64>, usize)>>,
+    /// Tensors whose memory [`ModelFiles::discard`] gave back (reading them again is an error).
+    discarded: Mutex<std::collections::HashSet<String>>,
 }
 
 /// Maximum shard size written by `write_quantized`.
@@ -574,6 +596,7 @@ impl ModelFiles {
             uses: Mutex::new(HashMap::new()),
             dequantized: Mutex::new(HashMap::new()),
             copies: Mutex::new(HashMap::new()),
+            discarded: Mutex::new(Default::default()),
         }
     }
 
@@ -638,6 +661,7 @@ impl ModelFiles {
                 uses: Mutex::new(HashMap::new()),
                 dequantized: Mutex::new(HashMap::new()),
                 copies: Mutex::new(HashMap::new()),
+                discarded: Mutex::new(Default::default()),
             });
         }
         // A `.safetensors` file given directly (a sidecar such as MiniMax-H3-Image's PDD heads).
@@ -718,6 +742,7 @@ impl ModelFiles {
             uses: Mutex::new(HashMap::new()),
             dequantized: Mutex::new(HashMap::new()),
             copies: Mutex::new(HashMap::new()),
+            discarded: Mutex::new(Default::default()),
         };
         if files.is_mlx() {
             let cfg = crate::fsx::read(&dir.join("config.json"))
@@ -1152,7 +1177,33 @@ impl ModelFiles {
 
     fn raw(&self, name: &str) -> Result<&[u8]> {
         let i = *self.index.get(name).with_context(|| format!("missing tensor {name}"))?;
+        if self.discarded.lock().unwrap().contains(name) {
+            bail!("tensor {name} was discarded after its conversion at load");
+        }
         self.shards[i].bytes(name)
+    }
+
+    /// Gives the memory of tensor `name` back to the system, when its shard was read into memory
+    /// and the loader made its own copy of it (a layout the kernels read, such as the NVFP4
+    /// experts repacked into ggml blocks): without this the file's bytes would stay beside the
+    /// copy for the model's life. Only whole pages inside the tensor are given back; memory-mapped
+    /// shards are left alone (their pages are clean and the system reclaims them). Reading the
+    /// tensor afterwards is an error.
+    pub fn discard(&self, name: &str) {
+        let Some(&i) = self.index.get(name) else { return };
+        let sh = &self.shards[i];
+        let (Storage::Heap(..), Some(t)) = (&sh.mmap, sh.tensors.get(name)) else {
+            return;
+        };
+        self.discarded.lock().unwrap().insert(name.to_string());
+        let base = sh.mmap.as_ptr() as usize;
+        let (lo, hi) = (
+            (base + t.start).next_multiple_of(crate::quant::PAGE),
+            (base + t.end) / crate::quant::PAGE * crate::quant::PAGE,
+        );
+        if hi > lo {
+            release_pages(lo, hi - lo);
+        }
     }
 
     fn touch(&self, name: &str) {

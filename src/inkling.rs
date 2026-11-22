@@ -1259,7 +1259,7 @@ impl<'a> Loader<'a, '_> {
                     f.note_use(n, true, false);
                 }
                 let (per, sper) = (n_out * n_in / 2, n_out * n_in / 16);
-                (0..ne)
+                let lins: Result<Vec<Lin>> = (0..ne)
                     .map(|e| {
                         let (d, s) = (&data[e * per..(e + 1) * per], &sc[e * sper..(e + 1) * sper]);
                         let factor = amax[e] / den;
@@ -1276,7 +1276,13 @@ impl<'a> Loader<'a, '_> {
                         }
                         Ok(Lin::gguf(GgufMatrix::new(GgmlType::F32, out.into(), n_out, n_in)?))
                     })
-                    .collect()
+                    .collect();
+                // (The repacked blocks are what runs: the file's codes and scales go.)
+                if lins.is_ok() {
+                    f.discard(full);
+                    f.discard(&sn);
+                }
+                lins
             }
             // MXFP8: E4M3 values, an E8M0 exponent per 32 along each row, used in place.
             "F8_E4M3" => {
@@ -1292,7 +1298,7 @@ impl<'a> Loader<'a, '_> {
                     f.note_use(n, true, false);
                 }
                 let (per, sper) = (n_out * n_in, n_out * n_in / 32);
-                (0..ne)
+                let lins: Result<Vec<Lin>> = (0..ne)
                     .map(|e| {
                         let mut s = PageVec::<f32>::zeroed(sper);
                         for (d, &b) in s.iter_mut().zip(&sc[e * sper..(e + 1) * sper]) {
@@ -1302,7 +1308,12 @@ impl<'a> Loader<'a, '_> {
                         let d = unsafe { QBuf::borrowed(&data[e * per..(e + 1) * per]) };
                         Ok(Lin::gguf(GgufMatrix::fp8(d, s.into(), n_out, n_in, (1, 32))?))
                     })
-                    .collect()
+                    .collect();
+                // (The values are read in place; the exponents were expanded.)
+                if lins.is_ok() {
+                    f.discard(&sn);
+                }
+                lins
             }
             _ => load_lin_experts(f, full, ne, n_out, n_in, self.quant),
         }

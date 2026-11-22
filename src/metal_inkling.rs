@@ -148,20 +148,17 @@ impl<'f> Pe<'f> {
     }
 }
 
-/// The grouped expert kernels' outputs per SIMD-group and SIMD-groups per output (`INK_XR`,
-/// `INK_XK`; `OXINFER_INKLING_XRK=R,K` for kernel work).
-fn xrk() -> (usize, usize) {
-    static V: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("OXINFER_INKLING_XRK")
-            .ok()
-            .and_then(|v| {
-                let (r, k) = v.split_once(',')?;
-                Some((r.parse().ok()?, k.parse().ok()?))
-            })
-            .filter(|&(r, k): &(usize, usize)| (1..=4).contains(&r) && matches!(k, 1 | 2 | 4))
-            .unwrap_or((1, 1))
-    })
+/// The lanes per row of the grouped expert kernels (`ink_*_gpair` / `_gsum`) for rows of `n_in`
+/// values in chunks of `ch`: the largest power of two dividing the chunk count, at most `max`
+/// (every lane then walks the same number of chunks).
+fn lanes_per_row(n_in: usize, ch: usize, max: usize) -> u32 {
+    let nch = (n_in / ch).max(1);
+    1u32 << nch.trailing_zeros().min(max.trailing_zeros())
+}
+
+/// The chunk of an expert format's kernels (values per `mdot`).
+fn ch_of(fmt: &str) -> usize {
+    expert_formats().iter().find(|f| f.0 == fmt).map_or(32, |f| f.3)
 }
 
 /// Tokens of a prefill pass at most (longer ones run in pieces), and their key splits.
@@ -273,9 +270,8 @@ fn expert_formats() -> Vec<(String, String, &'static str, usize, String)> {
 /// the prefill kernels too. `OXINFER_INKLING_METAL=FILE` takes the kernels from a file (kernel
 /// work).
 pub(crate) fn shader_src(mma: bool) -> String {
-    let (xr, xk) = xrk();
     let mut s = format!(
-        "#define INK_XR {xr}\n#define INK_XK {xk}\n{}{}{}#define MVK_GROUP 4\n{}",
+        "{}{}{}#define MVK_GROUP 4\n{}",
         super::SHADER_SRC,
         super::gguf_shader_tables(),
         super::GGUF_SHADER_SRC,
@@ -623,6 +619,8 @@ struct ExpDev {
     tab_d: Id,
     il: u32,
     off: u32,
+    /// Lanes per row of the grouped gate / up and down kernels.
+    lpr: (u32, u32),
     grouped: Option<Grouped>,
     xlora: Option<XLora>,
     /// The gate / up projections' updates: `A x` per slot first, the pair kernels add the rest
@@ -1599,6 +1597,7 @@ impl InkMetal {
                 tab_d: mk_tab(&tab_d, &mut owned)?,
                 il: if ex.interleaved { 2 } else { 1 },
                 off: if ex.interleaved { 1 } else { mi as u32 },
+                lpr: (lanes_per_row(h, ch_of(&gu_fmt), 16), lanes_per_row(mi, ch_of(&d_fmt), 32)),
                 grouped,
                 xlora,
                 xlora_gu,
@@ -1967,14 +1966,19 @@ impl InkMetal {
     /// in prefill passes the matrix-unit GEMM (or the multi-token matvecs 16 tokens at a time).
     #[allow(clippy::too_many_arguments)]
     fn mv(&self, e: &Pe, c: &Cx, d: &Dw, x: usize, y: usize, t: usize, mode: MvMode) {
-        self.mv_base(e, c, d, x, y, t, mode);
-        // The LoRA updates beside it: `u = A x`, then `y += s Bt u` once the matvec wrote y.
-        for l in &d.lora {
-            // SAFETY: the update lives with the model, which outlives its engine.
-            let s = unsafe { (*l.d).strength() };
-            if s == 0.0 || l.r == 0 {
-                continue;
-            }
+        // The LoRA updates beside it: `u = A x` in the matvec's own stage (both read x only), then
+        // `y += s Bt u` once the matvec wrote y. (Each update has its `u` rows in the scratch, so
+        // that the `A x` of all of them run with the matvec.)
+        // SAFETY: the updates live with the model, which outlives its engine.
+        let active: Vec<(&LoraDev, f32)> = d
+            .lora
+            .iter()
+            .map(|l| (l, unsafe { (*l.d).strength() }))
+            .filter(|(l, s)| *s != 0.0 && l.r != 0)
+            .collect();
+        let mut u = c.b.lu;
+        let mut us = Vec::with_capacity(active.len());
+        for (l, _) in &active {
             #[repr(C)]
             struct Pa {
                 n_in: u32,
@@ -1982,7 +1986,6 @@ impl InkMetal {
                 x: u32,
                 u: u32,
             }
-            e.barrier();
             e.pipe(self.p.lora_a);
             e.buf(c.a, 0, 0);
             e.buf(l.a, 0, 1);
@@ -1991,12 +1994,16 @@ impl InkMetal {
                     n_in: l.n_in as u32,
                     r: l.r as u32,
                     x: x as u32,
-                    u: c.b.lu as u32,
+                    u: u as u32,
                 },
                 2,
             );
             e.dispatch((l.r, t), 32);
-            e.barrier();
+            us.push(u);
+            u += t * l.r;
+        }
+        self.mv_base(e, c, d, x, y, t, mode);
+        for ((l, s), u) in active.iter().zip(us) {
             #[repr(C)]
             struct Pb {
                 n_out: u32,
@@ -2006,6 +2013,7 @@ impl InkMetal {
                 s: f32,
                 _p: [u32; 3],
             }
+            e.barrier();
             e.pipe(self.p.lora_b);
             e.buf(c.a, 0, 0);
             e.buf(l.bt, 0, 1);
@@ -2013,14 +2021,16 @@ impl InkMetal {
                 &Pb {
                     n_out: l.n_out as u32,
                     r: l.r as u32,
-                    u: c.b.lu as u32,
+                    u: u as u32,
                     y: y as u32,
-                    s,
+                    s: *s,
                     _p: [0; 3],
                 },
                 2,
             );
             e.dispatch((l.n_out.div_ceil(256), t), 256);
+        }
+        if !active.is_empty() {
             e.barrier();
         }
     }
@@ -3041,7 +3051,7 @@ impl InkMetal {
                 cap_u: self.caps.1,
                 add: 0,
             };
-            let gq = [b.grp as u32, b.asg as u32];
+            let gq = [b.grp as u32, b.asg as u32, ld.exp.lpr.0, ld.exp.lpr.1];
             let lq = self.gu_lora(e, c, ld, t);
             e.pipe(ld.exp.gpair);
             e.buf(c.a, 0, 0);
@@ -3051,7 +3061,7 @@ impl InkMetal {
             e.buf(lq.0, 0, 4);
             e.bytes(&lq.1, 5);
             if !self.skip(SK_EXP) {
-                e.dispatch((self.inter.div_ceil(4 * xrk().0 / xrk().1), n), 128);
+                e.dispatch((self.inter.div_ceil(4 * 16 / ld.exp.lpr.0 as usize), n), 128);
             }
             e.barrier();
             e.pipe(ld.exp.gsum);
@@ -3060,7 +3070,7 @@ impl InkMetal {
             e.bytes(&xp, 2);
             e.bytes(&gq, 3);
             if !self.skip(SK_EXP) {
-                e.dispatch((h.div_ceil(4 * xrk().0 / xrk().1), n), 128);
+                e.dispatch((h.div_ceil(4 * 32 / ld.exp.lpr.1 as usize), n), 128);
             }
             e.barrier();
             if ld.exp.xlora.is_none() {

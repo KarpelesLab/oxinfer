@@ -295,7 +295,8 @@ tables (`middle_cycle_cross_pass_queries`: the query and MLP queries of each loo
 ## Checkpoints
 
 - **The release**: the experts of layers 0-19 in NVFP4 (repacked at load into ggml's NVFP4
-  blocks, 4.5 bits a weight), of layers 20-23 in MXFP8 (read in place), the rest in bf16.
+  blocks, 4.5 bits a weight; the file's own bytes of them are then given back to the system), of
+  layers 20-23 in MXFP8 (read in place), the rest in bf16.
   `mtp.safetensors` (the MTP head) is the drafter of `--mtp`
   ([Speculative decoding](#speculative-decoding)).
 - **llama.cpp's `inkling2_loop`** (ggml-org's Q8_0, IQ4_NL, BF16): the tensors renamed back to
@@ -413,6 +414,22 @@ UD-IQ3_XXS) was answered right; prefill 84 tok/s, decode 13 tok/s, peak memory 1
 prefill chunks of 2048 (their activations are most of the difference: oxinfer uses chunks of 512
 below 32 GB of memory, `--prefill-chunk` / `prefill_chunk` sets them).
 
+**The quantized experts in memory.** The experts are never dequantized: NVFP4 runs from ggml's
+NVFP4 blocks (the same 4.5 bits a weight; the CPU's int8 kernels and the GPU's kernels read them),
+MXFP8 from the file's E4M3 bytes in place. The NVFP4 repacking held
+the file's own codes and scales beside the blocks for the model's life (the file is read into
+memory unless `--mmap`): the release on Metal had a footprint of 31 GB for an 18.6 GB file. The
+loader now gives those pages back once the blocks are made (`ModelFiles::discard`, reading them
+again is an error): 20 GB while decoding (`footprint`, 1.2 GB of it GPU memory: caches and
+activations); mlx-community 4bit (16 GB) 19 GB, its dense matrices being converted too. And
+MXFP8's E8M0 exponents are expanded to float32 for the kernels (one per 32 values, so an eighth
+of the values' size rather than a thirty-second): 0.5 GB instead of 0.13 for Mini's four MXFP8
+layers, 73 GB instead of 18 for `Inkling-2-Small-MXFP8`, whose values stream from storage
+either way. Small's NVFP4 release repacks its 40 NVFP4 layers as Mini's (290 GB; the file's
+bytes given back the same way when it is read into memory). transformers' quantized path (PR
+51062) holds one copy of each too (9.9 GiB allocated on MPS at load, 21 GiB in the driver, a peak
+footprint of 31 GB in the run of the speed table).
+
 What fits, from these sizes: weights + 1.3 GB (runtime and prefill chunks of 512, measured on
 the 9816-token prompt: 13.3 GB peak) + the windows + the context, in the memory a process can
 use, taken here as RAM - 4 GB (macOS and the rest). With `q8`:
@@ -468,7 +485,14 @@ resident on the device:
   tok/s on a 600-token Q8_0 prompt, decode unchanged). Checked with a synthetic PEFT adapter
   (rank 2, gate / up updates of all 128 experts on layers 3 and 10, down updates on layer 3,
   moving the logits by 1.0-1.3) on ggml-org Q8_0 and the release: prefill against the CPU with
-  the adapter KL 3.8e-10 / 6.6e-10, every decode step the CPU's top token.
+  the adapter KL 3.8e-10 / 6.6e-10, every decode step the CPU's top token. An update's `A x` runs
+  in its matvec's own stage (both read only x), so an adapter adds one stage per updated matrix
+  (before: three). OpenUncensored's PEFT adapter (rank 2, the 20 attention output projections of
+  layers 4-23, so 44 of the 48 applications) costs 1-2% of decoding (release, greedy, best of 3:
+  53.1 tok/s with it, 54.1 without, 54.7 merged into the release; load 12-61), AtomicChat's GGUF
+  adapter on AD-IQ2_M (3097 updates of rank 1, every projection and expert) 10% (62.7 against
+  69.6, its merged file 71.6), with the merged model's greedy text in both. (A report of half
+  speed with the PEFT adapter did not reproduce here: 51-57 tok/s before this change too.)
 
 The Metal engine and the CUDA one (`src/inkling_cuda.rs`) are two implementations of the same
 device interface in `src/inkling.rs` (`DevEngine` for the passes, `DevSession` for a session's
@@ -556,8 +580,7 @@ routing with ties and NaNs, the convolutions, mixes, clips and gates against the
 step on the CPU too and prints the difference; `OXINFER_INKLING_SKIP=dense,attn,exp,...` leaves
 kinds of ops out (measurements only); `OXINFER_INKLING_PROFILE=N` runs the passes of up to 16
 tokens stage by stage and prints the GPU time per kind of stage and the dispatch and barrier
-counts every N passes (slow: profiling only); `OXINFER_INKLING_XRK=R,K` sets the grouped expert
-kernels' outputs per SIMD-group and SIMD-groups per output (default 1,1; kernel work). The kernels compile on first use (about 1.5 s, cached by
+counts every N passes (slow: profiling only). The kernels compile on first use (about 1.5 s, cached by
 the system after).
 
 **Correctness.** Against transformers float32 on the release (the 24-token chat prompt and 16
@@ -566,7 +589,7 @@ greedy steps of [Verification](#verification-1)):
 | Pass | Max logit diff | Mean KL | Same top token | Greedy (16) |
 |---|---:|---:|---:|---:|
 | prompt in passes of 7 on the GPU (decode kernels) | 6.7e-4 | 2.2e-10 | 24/24 | |
-| 16 greedy steps on the GPU | 1.2e-4 | 3.8e-12 | 16/16 | 16/16 |
+| 16 greedy steps on the GPU | 1.1e-4 | 3.3e-12 | 16/16 | 16/16 |
 | the same after rolled-back junk passes | 1.2e-4 | 3.8e-12 | 16/16 | |
 | prompt as one prefill pass (matrix-unit GEMMs) | 0.69 | 1.0e-4 | 24/24 | 16/16 |
 
@@ -600,10 +623,30 @@ caches), interleaved model by model. tok/s:
 | mlx-community 4bit (17.3 GB) | **oxinfer, Metal** | **1808** | **1521** | **70.4** |
 | | mlx-lm (PR 2086), MLX 0.32.4 | 1387-1490 | 1056-1440 | 29-35 |
 | mlx-community oQ4e-mtp (16.9 GB) | oMLX 0.8.2, its MTP off / on | 1164-1452 | 912-1127 | 30-35 / 25-42 |
+| release | transformers (PR 51062, NVFP4 / MXFP8 experts kept quantized on MPS), bf16 | 165-248 | | 15.9 (13.4 with `generate`) |
 
 (llama.cpp's mainline reads unsloth's root files wrongly and has no NVFP4 GGUF path for the
 release; the MLX rows are mlx-lm's and oMLX's own measurements on this machine, load 9-31, see
-below.) Decode at a context of 8k / 32k (`examples/inkling2_ctx_bench`, the caches filled with
+below. The transformers row is huggingface/transformers PR 51062 (branch `inkling2-metal-fp4`,
+not merged at the time), whose `ArthurZ/metal-moe-decode` kernels run the experts from the
+checkpoint's banks; a 24-token prompt and 128 greedy tokens in a token loop, best of 3, idle GPU,
+load 7; oxinfer on the same release in the same conditions: pp512 1613, tg128 57-63.)
+
+**transformers' quantized experts against oxinfer's.** Their kernels read the release's layout in
+place: per row, the E2M1 codes (16 bytes per 32 values, one `uint4` per lane, so a SIMD-group reads
+512 contiguous bytes) and the E4M3 scales as `ushort` pairs; oxinfer repacks the NVFP4 experts into
+ggml's 36-byte blocks (which its CPU kernels read too) and gives the file's bytes back, so both
+hold one copy. The numerics are the same: E2M1 codes and E4M3 scales decoded by moving their bits
+into a half (the same trick, the same exact values), the scales applied to each 16-value partial
+dot product (oxinfer's grouped kernels now do this too), the per-expert factor
+`amax / outer_scale_denominator` in float32 from the file's float32 `amax` (their factors equal the
+file's to the bit: the bfloat16 `amax` of transformers' dequantizing loader, below, is not on this
+path), and MXFP8's E8M0 exponents as `2^(e - 127)` (theirs from the byte at run time, oxinfer's
+expanded to float32 at load, see [Long contexts and memory](#long-contexts-and-memory)). Their
+activations are bfloat16, so against the float32 reference: prefill KL 1.2e-2 (max logit diff 2.9),
+decode KL 8.2e-4 (3.4), greedy 16/16; oxinfer's 2.1e-10 and 3.3e-12. Their gate / up kernel flattens
+a pair's two rows over the lanes (4.5 chunks a lane) and runs each (token, route) pair on its own;
+oxinfer's group a pass's tokens by expert. Nothing in their dequantization is cheaper than ours. Decode at a context of 8k / 32k (`examples/inkling2_ctx_bench`, the caches filled with
 placeholder rows; llama.cpp `-d 8192,32768 -n 32`), Q8_0:
 
 | | 8k | 32k |
@@ -628,6 +671,51 @@ dispatches in 751 dependent stages (`OXINFER_INKLING_PROFILE=N` counts them and 
 of stage in a command buffer of its own; independent ops, such as a layer's six to eight
 projections, its mixes or the three attention gates, share a stage on the concurrent encoder),
 and with every kernel left out the barriers alone take 1.5-1.6 ms.
+
+**Lanes per row** (the grouped expert kernels): a row of 2304 values is 72 chunks of 32, and with
+one SIMD-group walking it chunk `lane + 32 i` the last round of every row had 8 of 32 lanes busy (75%
+of the lanes over the row; 36 chunks of a down row, 56%), and these kernels are bound by their
+arithmetic, not their loads (an NVFP4 gate / up pass of 8 experts in isolation: 62.5 us, the same
+loads without the arithmetic 44 us, a plain stream of the bytes 40 us). The lanes are now split
+into row groups of the largest power of two dividing the chunk count (8 lanes a gate / up row, 4 a
+down row), each group walking one row with every lane on the same number of chunks, the row's sum a
+reduction over its group; NVFP4 also applies its scales to each sub-block's dot product and loads a
+chunk's 16 code bytes together. The same pass: 47.5 us. Best of 4 alternated runs (`inkling2_bench
+-n 32 -v 1,4`, idle GPU, load 9-21), before -> after:
+
+| Checkpoint | tg32 tok/s | 1-token pass ms | 4-token pass ms |
+|---|---:|---:|---:|
+| mlx-community 4bit | 81.2 -> 82.5 | 12.15 -> 11.85 | 24.41 -> 21.71 |
+| unsloth UD-IQ3_XXS | 69.1 -> **80.2** | 13.11 -> 12.32 | 28.97 -> 23.97 |
+| release | 62.5 -> 62.8 | 15.94 -> 16.07 | 26.23 -> 25.52 |
+| ggml-org Q8_0 | 65.7 -> 65.7 | 15.05 -> 15.15 | 24.78 -> 25.07 |
+
+The 3-bit file (IQ3_XXS experts, whose grid decoding is the most arithmetic) gains most and now
+decodes about as fast as the 4-bit one (decode KL against the release's float32 reference, prompt
+in passes of 7: UD-IQ3_XXS 2.8e-3, mlx-community 4bit 2.4e-3). Verification passes gain more than
+one-token steps (a group's tokens reread the rows from the cache, which is arithmetic again).
+
+Measured and not kept: the same row groups for the dense matvecs (`ink_mvs`, every pass of 1 to 16
+tokens on one kernel family): 2-4% slower for one token (a SIMD-group then reads four rows' 128-byte
+pieces instead of one row's 512 contiguous bytes, and a 3072-row matrix has a quarter of the
+SIMD-groups), even for 16; three SIMD-groups splitting a row group's chunks, no better; a lane
+striping over four concatenated rows (all lanes busy, consecutive lanes on consecutive chunks), the
+same as the current kernel in isolation (an MLX 4-bit 3072 x 2304 matvec: 17.2 us, 18.8 striped;
+its loads alone 10.5 us: the dense matvecs are bound by the nibble decoding too). Reading the next
+projections' weights ahead into the system cache (32-48 MB, read back at 950 GB/s against 570 from
+memory) by a dispatch beside the latency-bound kernels of the stage before: 5% slower (the reads
+outlast those stages and they wait for them). Repacking the NVFP4 experts into tiles that a
+SIMD-group reads as 512-byte runs: the same loads cost (44 us either way), so no gain over the row
+groups on ggml's blocks.
+
+**Barriers.** A dispatch and barrier of an empty kernel costs 1.5 us (one threadgroup) to 2.5 us
+(1152), and a single-threadgroup kernel that reads and writes 9 KB 3.6 us; a grid-wide barrier
+inside a persistent kernel (an atomic counter in device memory, a spin with a timeout) 0.5 us with
+40 threadgroups of 256 or 1024 (one per core), 0.9 us with 160 (all co-resident here: no
+timeouts). The 751 stages of a step would then cost about 0.4 ms instead of 1.6: that is the most a
+persistent kernel could take off the barriers, against a kernel that would hold every op of a layer
+(at the register count of the largest) and fall back to the dispatched path whenever its threadgroups
+cannot all be resident.
 
 What moved decoding (MLX 4-bit 70 -> 83 tok/s, Q8_0 59 -> 67): the kernels of one threadgroup
 per token (the attention residual's mixes, the norms) spread their dot products over all their
@@ -828,8 +916,8 @@ oxinfer --model unsloth/Inkling-2-Mini-GGUF:UD-IQ3_XXS --draft auto --prompt "..
 
 ## Not done
 
-- 125 tok/s of decoding (the figure reported with EXO, see above): 67 at Q8_0, 83 at 4 bits
-  here. What is left at 4 bits is the experts' bytes (4.7 ms), the dense matmuls (2.1 ms), and
+- 125 tok/s of decoding (the figure reported with EXO, see above): 66 at Q8_0, 82 at 4 bits
+  (MLX) and 80 at 3 bits (UD-IQ3_XXS) here. What is left at 4 bits is the experts' bytes (4.7 ms), the dense matmuls (2.1 ms), and
   attention, mixes, gates, convolutions and routing as kernels of one or a few threadgroups per
   token whose latency adds up over 751 dependent stages; fusions that add work to every
   threadgroup of a stage lose (above).
