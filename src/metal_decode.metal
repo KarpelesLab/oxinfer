@@ -1057,6 +1057,103 @@ kernel void dec_glu_t(device const float* g [[buffer(0)]], device const float* u
     out[(ulong)t * ts.z + i] = act * u[(ulong)t * ts.y + i];
 }
 
+// ---- Prefill plans: a row's power-of-two scale for the matrix-unit GEMMs' half rows (the MMA
+// source's `row_scale`, for kernels of this one).
+inline float pf_row_scale(float m, thread float& inv) {
+    int e = 0;
+    if (m > 0.f && isfinite(m)) { frexp(m, e); e = clamp(14 - e, -100, 100); }
+    inv = ldexp(1.0f, -e);
+    return ldexp(1.0f, e);
+}
+inline float pf_tg_max(float m, uint sg, uint lane, threadgroup float* red) {
+    m = simd_max(m);
+    if (lane == 0) red[sg] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return max(max(max(red[0], red[1]), max(red[2], red[3])), max(max(red[4], red[5]), max(red[6], red[7])));
+}
+// dec_glu_t's rows (the same values), one threadgroup of 256 per token, also as the scaled half
+// rows `x_half` makes of them (`xh`, `rs`) for the next GEMM.
+#define PF_GLU_V 64
+kernel void pf_glu_half(device const float* g [[buffer(0)]], device const float* u [[buffer(1)]], device float* out [[buffer(2)]],
+                        constant uint2& p [[buffer(3)]], constant uint4& ts [[buffer(4)]], device half* xh [[buffer(5)]],
+                        device float* rs [[buffer(6)]], uint t [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[8];
+    float v[PF_GLU_V];
+    float m = 0.f;
+    for (uint j = 0; j < PF_GLU_V; j++) {
+        uint i = tid + j * 256;
+        if (i >= p.x) break;
+        float a = g[(ulong)t * ts.x + i];
+        float act;
+        if (p.y != 0) {
+            float tt = 0.7978845608f * (a + 0.044715f * a * a * a);
+            act = 0.5f * a * (1.0f + precise::tanh(tt));
+        } else {
+            act = a / (1.0f + exp(-a));
+        }
+        v[j] = act * u[(ulong)t * ts.y + i];
+        out[(ulong)t * ts.z + i] = v[j];
+        m = max(m, abs(v[j]));
+    }
+    m = pf_tg_max(m, sg, lane, red);
+    float inv, s = pf_row_scale(m, inv);
+    device half* o = xh + (ulong)t * p.x;
+    for (uint j = 0; j < PF_GLU_V; j++) {
+        uint i = tid + j * 256;
+        if (i >= p.x) break;
+        o[i] = half(v[j] * s);
+    }
+    if (tid == 0) rs[t] = inv;
+}
+// RMSNorm of token rows (dec_rms_norm's, summed in another order), one threadgroup of 256 per
+// token, n % 4 == 0 and n <= 256 * 4 * PF_NORM_V: the f32 rows and their scaled half rows for the
+// next GEMM (x_half's).
+#define PF_NORM_V 8
+kernel void pf_norm_half(device const float* x [[buffer(0)]], device float* out [[buffer(1)]], device const float* w [[buffer(2)]],
+                         constant NP& p [[buffer(3)]], device half* xh [[buffer(4)]], device float* rs [[buffer(5)]],
+                         uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[8];
+    threadgroup float red2[8];
+    device const float4* xr = (device const float4*)(x + (ulong)r * p.x_stride);
+    device float4* o = (device float4*)(out + (ulong)r * p.o_stride);
+    device const float4* w4 = (device const float4*)w;
+    uint n4 = p.n / 4;
+    float4 v[PF_NORM_V];
+    float s = 0.f;
+    for (uint j = 0; j < PF_NORM_V; j++) {
+        uint i = tid + j * 256;
+        v[j] = i < n4 ? xr[i] * p.pre : 0.f;
+        s += dot(v[j], v[j]);
+    }
+    s = simd_sum(s);
+    if (lane == 0) red[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    s = ((red[0] + red[1]) + (red[2] + red[3])) + ((red[4] + red[5]) + (red[6] + red[7]));
+    float k = rsqrt(s / float(p.n) + p.eps);
+    float m = 0.f;
+    for (uint j = 0; j < PF_NORM_V; j++) {
+        uint i = tid + j * 256;
+        if (i < n4) {
+            float4 y = v[j] * k;
+            if (p.has_w != 0) y *= w4[i];
+            o[i] = y;
+            v[j] = y;
+            float4 a = abs(y);
+            m = max(m, max(max(a.x, a.y), max(a.z, a.w)));
+        }
+    }
+    m = pf_tg_max(m, sg, lane, red2);
+    float inv, sc = pf_row_scale(m, inv);
+    device half4* oh = (device half4*)(xh + (ulong)r * p.n);
+    for (uint j = 0; j < PF_NORM_V; j++) {
+        uint i = tid + j * 256;
+        if (i < n4) oh[i] = half4(v[j] * sc);
+    }
+    if (tid == 0) rs[r] = inv;
+}
+
 #pragma clang fp reassociate(on)
 // ---- MoE experts of one token -------------------------------------------------------------------
 // Expert e's weights are at the addresses tab[e] (data, scales, affine offsets). `sel` holds the k

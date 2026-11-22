@@ -260,9 +260,25 @@ fn pf_flash() -> bool {
 /// Whether prefill plans attend on the matrix units (`pfm_*`, reading the chunk's keys and
 /// values as half rows; `OXINFER_PF_MMA_ATTN=0`: the f32 SIMD-group kernels `pff_*`).
 fn pf_mma_attn() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("OXINFER_PF_MMA_ATTN").map_or(true, |v| v != "0"))
+    // (Read as each plan is built, so that `pf_ab` can compare.)
+    std::env::var("OXINFER_PF_MMA_ATTN").map_or(true, |v| v != "0")
 }
+/// Whether prefill plans make the GEMMs' half rows in the SwiGLU / GeGLU before them
+/// (`pf_glu_half`, the same values; `OXINFER_PF_GLU_HALF=0`: a separate `x_half`).
+fn pf_glu_half() -> bool {
+    // (Read as each plan is built, so that `pf_ab` can compare.)
+    std::env::var("OXINFER_PF_GLU_HALF").map_or(true, |v| v != "0")
+}
+/// Whether prefill plans make the GEMMs' half rows in the RMSNorm before them (`pf_norm_half`,
+/// which sums in another order than `dec_rms_norm`; `OXINFER_PF_NORM_HALF=0`: `dec_rms_norm`
+/// and a separate `x_half`).
+fn pf_norm_half() -> bool {
+    // (Read as each plan is built, so that `pf_ab` can compare.)
+    std::env::var("OXINFER_PF_NORM_HALF").map_or(true, |v| v != "0")
+}
+/// Widest rows `pf_glu_half` and `pf_norm_half` take (`PF_GLU_V` and `PF_NORM_V` in the shader).
+const PF_GLU_MAX: usize = 256 * 64;
+const PF_NORM_MAX: usize = 256 * 4 * 8;
 /// Range ids of the half key / value slots of `pfm_*` (one per slot from here).
 const PF_KVH_RES: usize = PF_RES + 16;
 /// Positions before a chunk that `pfm_*`'s half rows hold beyond the chunk's own (a later chunk
@@ -1377,6 +1393,26 @@ enum MOp {
         stride: u32,
         n: u32,
     },
+    /// Prefill plans: `Norm` of token rows (`pf_norm_half`) that also leaves their half rows in
+    /// the GEMM scratch, as `XHalf` would.
+    NormHalf {
+        pipe: Id,
+        x: usize,
+        out: usize,
+        w: Option<usize>,
+        p: NormParams,
+    },
+    /// Prefill plans: `Glu` of token rows (`pf_glu_half`; `ts` the g, u, out strides) that also
+    /// leaves their half rows in the GEMM scratch.
+    GluHalf {
+        pipe: Id,
+        g: usize,
+        u: usize,
+        out: usize,
+        n: u32,
+        gelu: u32,
+        ts: [u32; 4],
+    },
     /// Prefill plans: `y = W x` (`y += W x` with `add`) on the matrix units from the scratch half
     /// rows, into rows `ldy` floats apart (0: `n_out`). Pipelines and outputs per threadgroup for
     /// 128-, 32- and 64-row tiles.
@@ -1994,6 +2030,8 @@ impl MetalBackend {
                 head_from = ops.len();
             }
             let mut emit: Vec<MOp> = Vec::new();
+            // The view whose half rows this op leaves in the GEMM scratch (fused conversions).
+            let mut xh_next: Option<(usize, usize, usize)> = None;
             let (r, w): (Vec<Range>, Vec<Range>) = match *op {
                 Op::Norm {
                     x,
@@ -2006,10 +2044,39 @@ impl MetalBackend {
                     out_stride,
                     eps,
                     add,
-                } => {
+                } => 'norm: {
                     let threads = n.next_multiple_of(32).min(1024);
                     // One row per token when the op has one row, else one dispatch per token.
                     let native = mt && rows == 1;
+                    // Prefill: a norm feeding the next op's GEMM makes its half rows too.
+                    let fuse = pf
+                        && native
+                        && !add
+                        && pf_norm_half()
+                        && n.is_multiple_of(4)
+                        && n <= PF_NORM_MAX
+                        && matches!(g.ops.get(i + 1), Some(Op::Linear { x: lx, n_in, .. }) if *lx == out && *n_in == n);
+                    if fuse {
+                        emit.push(MOp::NormHalf {
+                            pipe: self.named_pipeline("pf_norm_half")?,
+                            x: byte(x),
+                            out: byte(out),
+                            w: w.as_deref().map(&mut cst),
+                            p: NormParams {
+                                n: n as u32,
+                                eps,
+                                has_w: w.is_some() as u32,
+                                add: 0,
+                                x_stride: ts(x) as u32,
+                                o_stride: ts(out) as u32,
+                                pre,
+                                _p: 0,
+                            },
+                        });
+                        xh_next = Some((out.buf, out.off, n));
+                        let span = |v: View, s: usize| rng(v, (rows - 1) * s + n);
+                        break 'norm (vec![span(x, x_stride)], vec![span(out, out_stride), (PF_RES, 0, usize::MAX)]);
+                    }
                     emit.push(MOp::Norm {
                         pipe: self.named_pipeline("dec_rms_norm")?,
                         x: byte(x),
@@ -2147,15 +2214,31 @@ impl MetalBackend {
                                 emit.push(g1);
                                 emit.push(g2);
                                 emit.push(MOp::Barrier);
-                                emit.push(MOp::Glu {
-                                    pipe: self.named_pipeline("dec_glu")?,
-                                    g: pf_tmp,
-                                    u: pf_tmp + tokens * n_out * 4,
-                                    out: byte(y),
-                                    n: n_out as u32,
-                                    gelu: matches!(mode, LinMode::GeluPair) as u32,
-                                    t: Some((self.named_pipeline("dec_glu_t")?, [n_out as u32, n_out as u32, ts(y) as u32, 0])),
-                                });
+                                let ts_glu = [n_out as u32, n_out as u32, ts(y) as u32, 0];
+                                if pf_glu_half() && n_out <= PF_GLU_MAX {
+                                    // With the half rows of the down projection's input.
+                                    emit.push(MOp::GluHalf {
+                                        pipe: self.named_pipeline("pf_glu_half")?,
+                                        g: pf_tmp,
+                                        u: pf_tmp + tokens * n_out * 4,
+                                        out: byte(y),
+                                        n: n_out as u32,
+                                        gelu: matches!(mode, LinMode::GeluPair) as u32,
+                                        ts: ts_glu,
+                                    });
+                                    xh_next = Some((y.buf, y.off, n_out));
+                                    wv.push((PF_RES, 0, usize::MAX));
+                                } else {
+                                    emit.push(MOp::Glu {
+                                        pipe: self.named_pipeline("dec_glu")?,
+                                        g: pf_tmp,
+                                        u: pf_tmp + tokens * n_out * 4,
+                                        out: byte(y),
+                                        n: n_out as u32,
+                                        gelu: matches!(mode, LinMode::GeluPair) as u32,
+                                        t: Some((self.named_pipeline("dec_glu_t")?, ts_glu)),
+                                    });
+                                }
                                 r.push((PF_RES + 1, 0, usize::MAX));
                                 wv.push((PF_RES + 1, 0, usize::MAX));
                             }
@@ -3422,6 +3505,9 @@ impl MetalBackend {
             {
                 xh_of = None;
             }
+            if xh_next.is_some() {
+                xh_of = xh_next;
+            }
             ops.extend(emit);
             if let Some((w, w2)) = smv {
                 streamed.push(StreamedMv { mop: ops.len() - 1, w, w2 });
@@ -4344,7 +4430,9 @@ impl MetalPlan<'_> {
             | MOp::PfGdn { .. }
             | MOp::PfAttn { .. }
             | MOp::PfFlash { .. }
-            | MOp::PfKvHalf { .. } => unreachable!("prefill op in a multi-token plan"),
+            | MOp::PfKvHalf { .. }
+            | MOp::NormHalf { .. }
+            | MOp::GluHalf { .. } => unreachable!("prefill op in a multi-token plan"),
         }
     }
 }
@@ -4641,6 +4729,35 @@ impl MetalPlan<'_> {
             _p: u32,
         }
         match op {
+            MOp::NormHalf { pipe, x, out, w, p } => {
+                e.pipe(*pipe);
+                e.buf(arena, *x, 0);
+                e.buf(arena, *out, 1);
+                e.buf(consts, w.unwrap_or(0), 2);
+                e.bytes(p, 3);
+                e.buf(arena, pf.xh, 4);
+                e.buf(arena, pf.rs, 5);
+                e.dispatch((rows, 1), 256);
+            }
+            MOp::GluHalf {
+                pipe,
+                g,
+                u,
+                out,
+                n,
+                gelu,
+                ts,
+            } => {
+                e.pipe(*pipe);
+                e.buf(arena, *g, 0);
+                e.buf(arena, *u, 1);
+                e.buf(arena, *out, 2);
+                e.bytes(&[*n, *gelu], 3);
+                e.bytes(ts, 4);
+                e.buf(arena, pf.xh, 5);
+                e.buf(arena, pf.rs, 6);
+                e.dispatch((rows, 1), 256);
+            }
             MOp::XHalf { pipe, x, stride, n } => {
                 e.pipe(*pipe);
                 e.buf(arena, *x, 0);
@@ -5767,6 +5884,8 @@ impl DecodePlan for MetalPlan<'_> {
                         MOp::PfTopk { .. } | MOp::PfExperts(_) => "moe",
                         MOp::PfGdn { .. } => "gdn",
                         MOp::PfAttn { .. } | MOp::PfFlash { .. } | MOp::PfKvHalf { .. } => "attn",
+                        MOp::NormHalf { .. } => "norm",
+                        MOp::GluHalf { .. } => "glu",
                     };
                     if !o.split(',').any(|x| x == k) {
                         continue;
@@ -5779,10 +5898,10 @@ impl DecodePlan for MetalPlan<'_> {
                     if let Some(sk) = SKIP.get_or_init(|| std::env::var("OXINFER_PF_SKIP").ok()) {
                         let k = match op {
                             MOp::Barrier => "barrier",
-                            MOp::Norm { .. } => "norm",
+                            MOp::Norm { .. } | MOp::NormHalf { .. } => "norm",
                             MOp::XHalf { .. } => "xhalf",
                             MOp::Gemm { .. } | MOp::GemmF32 { .. } => "gemm",
-                            MOp::Glu { .. } | MOp::Ew { .. } => "glu",
+                            MOp::Glu { .. } | MOp::GluHalf { .. } | MOp::Ew { .. } => "glu",
                             MOp::QkRope { .. } => "qkrope",
                             MOp::PfFlash { .. } | MOp::PfAttn { .. } => "attn",
                             _ => "other",
@@ -5809,7 +5928,9 @@ impl DecodePlan for MetalPlan<'_> {
                     | MOp::PfGdn { .. }
                     | MOp::PfAttn { .. }
                     | MOp::PfFlash { .. }
-                    | MOp::PfKvHalf { .. } => unreachable!("prefill op in a one-token plan"),
+                    | MOp::PfKvHalf { .. }
+                    | MOp::NormHalf { .. }
+                    | MOp::GluHalf { .. } => unreachable!("prefill op in a one-token plan"),
                     MOp::Norm {
                         pipe,
                         x,
@@ -6236,6 +6357,8 @@ impl DecodePlan for MetalPlan<'_> {
                         MOp::PfAttn { .. } => "attn".into(),
                         MOp::PfFlash { .. } => "flash attn".into(),
                         MOp::PfKvHalf { .. } => "kv half".into(),
+                        MOp::NormHalf { .. } => "norm+half".into(),
+                        MOp::GluHalf { .. } => "glu+half".into(),
                         MOp::QkRope { .. } => "qkrope".into(),
                         MOp::QsaKey { .. } => "qsa key".into(),
                         MOp::QsaScore { .. } => "qsa score".into(),
