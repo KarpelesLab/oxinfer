@@ -1026,7 +1026,12 @@ impl VideoPipeline {
     pub fn decode(&self, rows: &[f32], g: Geometry) -> Result<Video> {
         let c = self.vae.cfg.latent_channels;
         let lat = unpatchify_video(rows, c, g.lt, g.lh, g.lw, self.dit.cfg.patch[1]);
-        let (px, nf) = self.vae.decode_video(&lat, g.lt, g.lh, g.lw)?;
+        // On an accelerator the transformer's blocks make room for the decoder's, and those for
+        // the next sampling's.
+        self.dit.release_device();
+        let decoded = self.vae.decode_video(&lat, g.lt, g.lh, g.lw);
+        self.vae.release_device();
+        let (px, nf) = decoded?;
         let (h, w) = (g.lh * self.vae.cfg.patch, g.lw * self.vae.cfg.patch);
         let plane = h * w;
         let frames = (0..nf)

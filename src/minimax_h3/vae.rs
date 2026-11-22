@@ -173,6 +173,42 @@ pub struct VaeDecoder<'a> {
     norm_out: (Vec<f32>, Vec<f32>),
     proj_out: DLin<'a>,
     inv_freq: Vec<f32>,
+    /// The engine that runs the block stack on an accelerator, if any.
+    device: super::stack_dev::Device,
+}
+
+impl super::stack_dev::Source for VaeDecoder<'_> {
+    fn spec(&self) -> super::stack_dev::StackSpec {
+        let c = &self.cfg;
+        super::stack_dev::StackSpec {
+            hidden: c.dim,
+            heads: c.heads,
+            head_dim: c.dim / c.heads,
+            ffn: 4 * c.dim,
+            half: c.axes * self.inv_freq.len(),
+            norm_eps: c.eps,
+            qk_eps: c.eps,
+            stacked: false,
+            gate_first: self.blocks.first().is_some_and(|b| b.gate_first),
+        }
+    }
+    fn n_blocks(&self) -> usize {
+        self.blocks.len()
+    }
+    fn block(&self, i: usize) -> Option<super::stack_dev::BlockSpec<'_>> {
+        let b = &self.blocks[i];
+        let Qkv::Interleaved(qkv) = &b.qkv else { return None };
+        if b.gate_first != self.blocks[0].gate_first {
+            return None;
+        }
+        Some(super::stack_dev::BlockSpec {
+            lins: [qkv.dev_spec()?, b.out.dev_spec()?, b.fc1.dev_spec()?, b.fc2.dev_spec()?],
+            norm1: &b.norm1,
+            norm2: &b.norm2,
+            norm_qk: None,
+            scale: Some((&b.scale1, &b.scale2)),
+        })
+    }
 }
 
 impl<'a> VaeDecoder<'a> {
@@ -250,6 +286,7 @@ impl<'a> VaeDecoder<'a> {
             norm_out: (v("decoder.norm_out.weight", d)?, v("decoder.norm_out.bias", d)?),
             proj_out: DLin::load(files, "decoder.proj_out", 3 * cfg.patch_t * cfg.patch * cfg.patch, d, true)?,
             inv_freq,
+            device: Default::default(),
             cfg,
         })
     }
@@ -296,7 +333,12 @@ impl<'a> VaeDecoder<'a> {
             }
         }
         let scale = (hd as f32).powf(-0.5);
-        for b in &self.blocks {
+        // The whole stack on the accelerator when it takes it.
+        let on_device = self
+            .device
+            .get(self, "video VAE")
+            .is_some_and(|dev| dev.stack(self, &mut x, None, &cos, &sin));
+        for b in self.blocks.iter().filter(|_| !on_device) {
             let mut hn = x.clone();
             rmsnorm_f32w_rows_inplace(&mut hn, d, &b.norm1, cfg.eps);
             let (mut q, mut k, v) = match &b.qkv {
@@ -387,6 +429,11 @@ impl<'a> VaeDecoder<'a> {
             }
         }
         img
+    }
+
+    /// Frees the device memory the block stack holds on an accelerator.
+    pub fn release_device(&self) {
+        self.device.release();
     }
 
     /// `_split_tiles`: tile starts and overlaps over `length` pixels.
