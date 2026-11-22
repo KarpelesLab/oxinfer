@@ -1697,4 +1697,48 @@ mod tests {
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// compressed-tensors `float-quantized` weights (llm-compressor's FP8 schemes: E4M3 `.weight`
+    /// beside a bf16 `.weight_scale` of one factor per output row) load as the scaled values.
+    #[test]
+    fn fp8_row_scales() {
+        let dir = std::env::temp_dir().join(format!("oxinfer-fp8row-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (r, c) = (6usize, 40usize);
+        let w: Vec<u8> = (0..r * c)
+            .map(|i| ((i * 37 + 11) % 127) as u8 | ((((i / 3) & 1) as u8) << 7))
+            .collect();
+        let scales: Vec<f32> = (0..r).map(|i| 0.0078125 * (i + 1) as f32).collect();
+        let sb: Vec<u8> = scales.iter().flat_map(|s| ((s.to_bits() >> 16) as u16).to_le_bytes()).collect();
+        let header = serde_json::json!({
+            "l.weight": {"dtype": "F8_E4M3", "shape": [r, c], "data_offsets": [0, r * c]},
+            "l.weight_scale": {"dtype": "BF16", "shape": [r, 1], "data_offsets": [r * c, r * c + r * 2]},
+        });
+        let mut h = serde_json::to_vec(&header).unwrap();
+        h.resize(h.len().next_multiple_of(8), b' ');
+        let mut out = (h.len() as u64).to_le_bytes().to_vec();
+        out.extend_from_slice(&h);
+        out.extend_from_slice(&w);
+        out.extend_from_slice(&sb);
+        std::fs::write(dir.join("model.safetensors"), out).unwrap();
+        {
+            let files = ModelFiles::open(&dir, true).unwrap();
+            let lin = crate::model::load_lin(&files, "l.weight", r, c, crate::model::Quant::Q4).unwrap();
+            // One-hot inputs read the matrix column by column.
+            let mut x = vec![0f32; c * c];
+            for i in 0..c {
+                x[i * c + i] = 1.0;
+            }
+            let mut y = vec![0f32; c * r];
+            crate::model::linear(&lin, r, c, &x, c, &mut y);
+            for i in 0..c {
+                for o in 0..r {
+                    let want = crate::ggml::e4m3_to_f32(w[o * c + i]) * scales[o];
+                    let got = y[i * r + o];
+                    assert!((want - got).abs() <= 1e-6 * (1.0 + want.abs()), "row {o} col {i}: {got} vs {want}");
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

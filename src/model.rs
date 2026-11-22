@@ -365,6 +365,14 @@ fn load_lin_stored<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: us
     }
     // FP8 block-quantized (DeepSeek / Mistral checkpoints): used as stored, zero-copy.
     if info.dtype == "F8_E4M3" {
+        // compressed-tensors `float-quantized` (llm-compressor's FP8 schemes): a factor per output
+        // row in `.weight_scale` instead of block divisors in `.weight_scale_inv`.
+        if let Some(base) = full.strip_suffix(".weight")
+            && !files.has(&format!("{base}.weight_scale_inv"))
+            && files.has(&format!("{base}.weight_scale"))
+        {
+            return fp8_scaled(files, full, n_out, n_in);
+        }
         return Ok(Lin::gguf(fp8_matrix(files, full, n_out, n_in)?));
     }
     let w = files.bf16(full)?;
