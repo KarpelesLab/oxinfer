@@ -3153,6 +3153,59 @@ mod tests {
         }
     }
 
+    /// The int8 prefill GEMM through the driver (x86-64 with AVX-512 VNNI): several pool jobs
+    /// and two token chunks, against the one-token decode kernels on the same int8 activations
+    /// (only the order of the f32 sums differs).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn int8_prefill_driver_matches_decode_kernels() {
+        if !i8gemm::available() {
+            eprintln!("skipped: no AVX-512 VNNI");
+            return;
+        }
+        use crate::ggml::{GgmlType, GgufMatrix, random_blocks};
+        crate::pool::init(4);
+        fn go<M: QMat>(name: &str, m: &M) {
+            let (n_out, n_in, t) = (m.n_out(), m.n_in(), 600usize);
+            let mut s = 5u64;
+            // Blocks of very different sizes, as activations have.
+            let x: Vec<f32> = (0..t * n_in)
+                .map(|i| lcg(&mut s) * if (i / 32) % 7 == 0 { 30.0 } else { 0.3 })
+                .collect();
+            let xa = quantize_act(&x, t, n_in);
+            let mut want = vec![0f32; t * n_out];
+            for c in 0..t {
+                unsafe { m.rows_t1(&xa, c, want.as_mut_ptr().add(c * n_out), 0, n_out) };
+            }
+            let mut got = vec![f32::NAN; t * n_out];
+            lm_prefill(|| matmul_quant_multi(&mut [(m, &mut got[..])], &x, t));
+            for c in 0..t {
+                let (g, w) = (&got[c * n_out..(c + 1) * n_out], &want[c * n_out..(c + 1) * n_out]);
+                let scale = w.iter().fold(0f32, |a, v| a.max(v.abs()));
+                for (r, (a, b)) in g.iter().zip(w).enumerate() {
+                    assert!((a - b).abs() <= 2e-5 * scale, "{name} [{c}, {r}]: {a} vs {b} (scale {scale})");
+                }
+            }
+        }
+        let (n_out, n_in) = (100usize, 4096usize);
+        let mut seed = 21u64;
+        let w: Vec<f32> = (0..n_out * n_in).map(|_| lcg(&mut seed)).collect();
+        go("Q8", &crate::quant::quantize_f32(&w, n_out, n_in));
+        go("Q4", &crate::quant::quantize_q4_f32(&w, n_out, n_in));
+        for kind in [
+            GgmlType::Q8_0,
+            GgmlType::Q4_K,
+            GgmlType::Q3_K,
+            GgmlType::Q6_K,
+            GgmlType::IQ3_XXS,
+            GgmlType::IQ4_XS,
+        ] {
+            let mut bs = 3u64;
+            let bytes = random_blocks(kind, n_out * n_in / kind.block_size(), &mut bs);
+            go(kind.name(), &GgufMatrix::from_bytes(kind, &bytes, n_out, n_in).unwrap());
+        }
+    }
+
     #[test]
     fn bf16_matmul_matches_reference() {
         crate::pool::init(2);

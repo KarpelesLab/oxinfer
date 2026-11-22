@@ -2,16 +2,17 @@
 //! `tools/llama_logits_dump.cpp` (same output format, so the two can be compared):
 //!
 //! ```text
-//! qwen_greedy_dump MODEL TEXT|@IDS_FILE N_GEN OUT.bin [--cpu] [--quant q8|q4] [--ids-out FILE]
+//! qwen_greedy_dump MODEL TEXT|@IDS_FILE N_GEN OUT.bin [--cpu] [--quant q8|q4] [--chunk N] [--ids-out FILE]
 //! qwen_greedy_dump --compare A.bin B.bin VOCAB
 //! ```
 //!
 //! Feeds the prompt (raw text, tokenized without a template, or `@file` of whitespace-separated
-//! token ids) as one batch, then generates `N_GEN` tokens greedily one at a time. Writes the f32
-//! logits row of the prompt's last position and of every generated token, and prints the chosen
-//! ids; `--ids-out` writes the prompt's token ids (the other tool's `IDS_FILE`). `--compare`
-//! reports, per step, both top tokens and the largest log-probability difference over the first
-//! file's top 10.
+//! token ids) as one batch (`--chunk N`: N tokens at a time; up to 7, quantized weights then take
+//! the decode kernels for the prompt too), then generates `N_GEN` tokens greedily one at a time.
+//! Writes the f32 logits row of the prompt's last position and of every generated token, and
+//! prints the chosen ids; `--ids-out` writes the prompt's token ids (the other tool's
+//! `IDS_FILE`). `--compare` reports, per step, both top tokens and the largest log-probability
+//! difference over the first file's top 10.
 
 use anyhow::{Context, Result};
 use oxinfer::qwen::QwenModel;
@@ -69,7 +70,7 @@ fn main() -> Result<()> {
     if a.first().map(String::as_str) == Some("--compare") {
         return compare(&a[1], &a[2], a[3].parse()?);
     }
-    let usage = "usage: qwen_greedy_dump MODEL TEXT|@IDS_FILE N_GEN OUT.bin [--cpu] [--quant q8|q4] [--ids-out FILE]";
+    let usage = "usage: qwen_greedy_dump MODEL TEXT|@IDS_FILE N_GEN OUT.bin [--cpu] [--quant q8|q4] [--chunk N] [--ids-out FILE]";
     let (model, text, n_gen, out) = (
         a.first().context(usage)?,
         a.get(1).context(usage)?,
@@ -112,8 +113,16 @@ fn main() -> Result<()> {
     let mut rows: Vec<u8> = Vec::new();
     let mut chosen = Vec::with_capacity(n_gen);
     let mut next = ids.clone();
+    let chunk: usize = a
+        .iter()
+        .position(|x| x == "--chunk")
+        .and_then(|i| a.get(i + 1))
+        .map_or(Ok(usize::MAX), |v| v.parse())?;
     for step in 0..=n_gen {
-        let hs = m.forward_hidden_mm(&mut sess, &next, &[]);
+        let mut hs = Vec::new();
+        for c in next.chunks(chunk.max(1)) {
+            hs = m.forward_hidden_mm(&mut sess, c, &[]);
+        }
         let l = m.logits(&hs[hs.len() - h..], 1);
         rows.extend(l.iter().flat_map(|v| v.to_le_bytes()));
         if step == n_gen {
