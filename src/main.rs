@@ -95,6 +95,8 @@ struct Args {
     no_stream: bool,
     mmproj: oxinfer::pixtral::Mmproj,
     cache_budget_gb: Option<f64>,
+    /// `--memory-limit-gb`: the app's memory limit (as iOS's; `EngineOptions::memory_limit`).
+    memory_limit_gb: Option<f64>,
     resident_mb: Option<u64>,
     prefetch_mb: Option<u64>,
     resident_mode: oxinfer::stream::ResidentMode,
@@ -318,6 +320,8 @@ fn usage() -> ! {
          \x20                      Gemma): a reader thread fetches the next layers while one computes\n\
          \x20 --cache-budget-gb F  with --stream, page cache the model may use: a resident set of\n\
          \x20                      F - prefetch stays cached, the other layers are dropped after use\n\
+         \x20 --memory-limit-gb F  the memory the model may use, as an iOS app's limit (to try a phone's\n\
+         \x20                      6-8 GB here): decides streaming, its budget and Inkling-2's GPU fit\n\
          \x20 --resident-mb N      with --stream, resident set size (instead of the budget's)\n\
          \x20 --prefetch-mb N      with --stream, read-ahead window (default 768)\n\
          \x20 --resident-mode M    cache (default) | lock (mlock) | copy (anonymous memory)\n\
@@ -657,6 +661,7 @@ fn parse_args() -> Result<Args> {
         no_stream: false,
         mmproj: Default::default(),
         cache_budget_gb: None,
+        memory_limit_gb: None,
         resident_mb: None,
         prefetch_mb: None,
         resident_mode: oxinfer::stream::ResidentMode::Cache,
@@ -864,6 +869,7 @@ fn parse_args() -> Result<Args> {
             }
             "--mmproj" => a.mmproj = oxinfer::pixtral::Mmproj::parse(&val()?),
             "--cache-budget-gb" => a.cache_budget_gb = Some(val()?.parse()?),
+            "--memory-limit-gb" => a.memory_limit_gb = Some(val()?.parse::<f64>()?).filter(|g| *g > 0.0),
             "--resident-mb" => a.resident_mb = Some(val()?.parse()?),
             "--prefetch-mb" => a.prefetch_mb = Some(val()?.parse()?),
             "--resident-mode" => {
@@ -3046,12 +3052,30 @@ fn run_inkling(mut args: Args) -> Result<()> {
     let eos = config::load_eos_ids(&args.model);
     // A checkpoint larger than most of RAM is streamed with a page-cache budget of 70% of RAM,
     // unless `--no-stream` (or `--mmap`) asks for plain demand paging.
+    // Where the app's memory is limited (iOS, `--memory-limit-gb`), the app's budget decides,
+    // with the caches and activations beside the weights (as the engine does).
     let size: u64 = oxinfer::safetensors::checkpoint_bytes(&args.model);
-    if oxinfer::inkling::too_big(size) && args.no_stream {
+    let dm = device_memory(&args);
+    let runtime = oxinfer::inkling::runtime_bytes(args.kv_cache, None).saturating_sub(oxinfer::stream::DeviceMemory::APP_RESERVE);
+    let app_stream = dm
+        .limits_app()
+        .then(|| oxinfer::stream::auto_stream_on(&dm, size, runtime))
+        .flatten();
+    let too_big = if dm.limits_app() {
+        app_stream.is_some()
+    } else {
+        oxinfer::inkling::too_big(size)
+    };
+    if too_big && args.no_stream {
         args.mmap = true;
     }
-    if oxinfer::inkling::too_big(size) && !args.stream && !args.mmap {
-        let budget = oxinfer::inkling::default_stream().cache_budget.unwrap_or(0) as f64 / 1e9;
+    if too_big && !args.stream && !args.mmap {
+        let budget = app_stream
+            .as_ref()
+            .map_or_else(oxinfer::inkling::default_stream, |o| o.clone())
+            .cache_budget
+            .unwrap_or(0) as f64
+            / 1e9;
         args.cache_budget_gb = Some(args.cache_budget_gb.unwrap_or(budget));
         eprintln!(
             "[the {:.0} GB checkpoint does not fit in memory: streaming it (--stream --cache-budget-gb {:.0})]",
@@ -3064,6 +3088,7 @@ fn run_inkling(mut args: Args) -> Result<()> {
     let files = safetensors::ModelFiles::open(&args.model, !args.mmap)?;
     let mut model = oxinfer::inkling::Inkling2Model::load(cfg, &files, args.quant)?;
     model.kv = args.kv_cache;
+    model.gpu_budget = dm.gpu_weight_budget().map(|b| b.saturating_sub(runtime));
     attach_loras(&args, &mut model)?;
     // (Prompt lookup rolls back what the model refutes: a session goes back up to
     // `inkling::ROLLBACK` positions.)
@@ -3768,6 +3793,11 @@ fn run_dspark<M: oxinfer::dspark::Target<Sess: Clone>>(
     Ok(())
 }
 
+/// This device's memory, the app's share capped by `--memory-limit-gb`.
+fn device_memory(args: &Args) -> oxinfer::stream::DeviceMemory {
+    oxinfer::stream::DeviceMemory::detect().limited(args.memory_limit_gb.map(|g| (g * 1e9) as u64))
+}
+
 /// Streams a checkpoint larger than this device holds (a 27B on a 12 GB phone) with the device's
 /// page-cache budget (see `stream::DeviceMemory`), unless told how to load it.
 fn auto_stream(args: &mut Args) {
@@ -3775,7 +3805,7 @@ fn auto_stream(args: &mut Args) {
         return;
     }
     let size = oxinfer::safetensors::checkpoint_bytes(&args.model);
-    if let Some(o) = oxinfer::stream::auto_stream(size) {
+    if let Some(o) = oxinfer::stream::auto_stream_on(&device_memory(args), size, 0) {
         let budget = o.cache_budget.unwrap_or(0) as f64 / 1e9;
         args.cache_budget_gb = Some(args.cache_budget_gb.unwrap_or(budget));
         eprintln!(

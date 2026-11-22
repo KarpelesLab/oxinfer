@@ -729,6 +729,16 @@ pub fn too_big(bytes: u64) -> bool {
     crate::mistral4::too_big(bytes)
 }
 
+/// Memory Inkling-2 Mini needs beside its weights, measured (see docs/inkling.md, "Long
+/// contexts and memory"): 1.3 GB of runtime (activations, prefill chunks of 512, the app), the
+/// sliding windows' caches (692 MB in f32) and `context` tokens of the full-attention caches
+/// (64 KB a token in f32), both scaled to the cache type. `context` None: 4096 tokens assumed.
+pub fn runtime_bytes(kv: KvCache, context: Option<usize>) -> u64 {
+    let r = kv.bytes_per_value() / 4.0;
+    let ctx = context.unwrap_or(4096) as f64;
+    (1.3e9 + 692e6 * r + ctx * 65536.0 * r) as u64
+}
+
 /// The convolution of keys or values.
 // Two per layer, built once.
 #[allow(clippy::large_enum_variant)]
@@ -1138,6 +1148,11 @@ pub struct Inkling2Model<'a> {
     device: std::sync::OnceLock<Option<Box<dyn DevEngine>>>,
     /// Engines replaced since (see `attach_lora`).
     retired: Vec<Box<dyn DevEngine>>,
+    /// Bytes of weights a GPU engine may keep mapped (None: no limit): above it the passes stay
+    /// on the CPU (a phone's GPU working set or app limit, `crate::stream::DeviceMemory`).
+    pub gpu_budget: Option<u64>,
+    /// The checkpoint's size (what a GPU engine maps).
+    weight_bytes: u64,
 }
 
 struct Loader<'a, 'c> {
@@ -1607,6 +1622,8 @@ impl<'a> Inkling2Model<'a> {
             stream: None,
             device: std::sync::OnceLock::new(),
             retired: Vec::new(),
+            gpu_budget: None,
+            weight_bytes: files.total_bytes(),
         };
         // Routed experts that cannot all stay in memory are read through the page cache as they
         // are routed: no accelerator mapping may pin them.
@@ -1775,6 +1792,14 @@ impl<'a> Inkling2Model<'a> {
         }
         self.device
             .get_or_init(|| {
+                if let Some(b) = self.gpu_budget.filter(|&b| self.weight_bytes > b) {
+                    eprintln!(
+                        "[inkling: the {:.1} GB of weights exceed the GPU budget ({:.1} GB): passes on the CPU]",
+                        self.weight_bytes as f64 / 1e9,
+                        b as f64 / 1e9
+                    );
+                    return None;
+                }
                 #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
                 if let Some(e) = cuda::Engine::new(self) {
                     return Some(Box::new(e) as Box<dyn DevEngine>);

@@ -377,7 +377,7 @@ pub unsafe extern "C" fn oxi_engine_info_json(e: *mut OxiEngine) -> *mut c_char 
     guard(std::ptr::null_mut(), || {
         let g = lock(unsafe { engine(e) }?);
         let i = g.info();
-        let dm = crate::stream::DeviceMemory::detect();
+        let dm = g.device_memory();
         let st = g.streamer().map(|s| {
             let (p, o) = (s.plan(), s.options());
             serde_json::json!({

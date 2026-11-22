@@ -527,6 +527,17 @@ pub const CATALOG: &[Model] = &[
     .moe()
     .note("unsloth's own layout (the root files); --kv-cache q8 for long contexts on 16-24 GB; Metal: ~66 tok/s decode"),
     Model::new(
+        "unsloth/Inkling-2-Mini-GGUF:UD-IQ2_XXS",
+        Kind::Chat,
+        26.4,
+        8.5,
+        &[Text, ImageInput, Thinking, Tools],
+    )
+    .fixed(Format::GgufLow, "GGUF UD-IQ2_XXS")
+    .speed(2.40, 48)
+    .moe()
+    .note("the phone file: in memory (GPU) on a 16 GB iPad, streamed from flash on 8-12 GB iPhones (docs/inkling.md, iOS); --kv-cache q8; Metal: ~73 tok/s decode (M5 Max); also :UD-IQ1_S (7.8 GB)"),
+    Model::new(
         "AtomicChat/Inkling-2-Mini-Uncensored-GGUF:AD-Q4_K",
         Kind::Chat,
         26.4,
@@ -1000,6 +1011,8 @@ const RAM_FRACTION: f64 = 0.6;
 /// with [`GPU_HEADROOM_GB`] to spare (activations, the KV cache, the desktop).
 const GPU_FRACTION: f64 = 0.92;
 const GPU_HEADROOM_GB: f64 = 1.0;
+/// What an app keeps for itself where the OS limits apps ([`crate::stream::DeviceMemory::APP_RESERVE`]).
+const APP_RESERVE_GB: f64 = 1.073741824;
 
 /// The GPU the estimates are for.
 #[derive(Clone, Debug)]
@@ -1017,6 +1030,10 @@ pub struct Hardware {
     pub cores: usize,
     pub ram_gb: Option<f64>,
     pub ram_available_gb: Option<f64>,
+    /// What an app may still allocate where the OS limits apps (iOS: `os_proc_available_memory`,
+    /// raised by the increased-memory-limit entitlement); None elsewhere. The weights must then
+    /// fit in it less 1 GB (the engine's rule, [`crate::stream::DeviceMemory::budget`]).
+    pub app_memory_gb: Option<f64>,
     pub gpu: Option<Gpu>,
     /// Where repo ids are downloaded, and the space left there.
     pub cache_dir: PathBuf,
@@ -1127,10 +1144,21 @@ impl Hardware {
             cores: plat.cpu.cores,
             ram_gb: plat.cpu.memory_bytes.map(|b| b as f64 / 1e9),
             ram_available_gb: crate::platform::available_memory().map(|b| b as f64 / 1e9),
+            app_memory_gb: crate::platform::process_available_memory().map(|b| b as f64 / 1e9),
             gpu,
             disk_free_gb: crate::platform::free_disk(&cache_dir).map(|b| b as f64 / 1e9),
             cache_dir,
             cpu_rates: [0.0; 7],
+        }
+    }
+
+    /// The weights that stay in memory, GB: 60% of the RAM, and where the OS limits apps, at most
+    /// what the app may use less 1 GB (as [`crate::stream::DeviceMemory::budget`]).
+    pub fn memory_budget_gb(&self) -> Option<f64> {
+        let ram = self.ram_gb.map(|r| RAM_FRACTION * r);
+        match self.app_memory_gb.map(|a| (a - APP_RESERVE_GB).max(1.0)) {
+            Some(a) => Some(ram.map_or(a, |r| r.min(a))),
+            None => ram,
         }
     }
 
@@ -1285,7 +1313,7 @@ impl Row {
         let mut variants: Vec<Variant> = variants_of(m)
             .into_iter()
             .map(|(label, format, args, memory_gb, token_gb)| {
-                let in_ram = hw.ram_gb.is_none_or(|r| memory_gb <= RAM_FRACTION * r);
+                let in_ram = hw.memory_budget_gb().is_none_or(|b| memory_gb <= b);
                 let cpu = speed(
                     token_gb,
                     hw.cpu_rates[format.index()] * CPU_FIT[format.index()],
@@ -1776,6 +1804,14 @@ pub fn render(hw: &Hardware, rows: &[Row], all: bool) -> String {
         opt(hw.disk_free_gb),
         hw.cache_dir.display()
     );
+    if let Some(a) = hw.app_memory_gb {
+        let _ = writeln!(
+            s,
+            "this app may use {} (weights kept in memory up to {})",
+            gb(a),
+            opt(hw.memory_budget_gb())
+        );
+    }
     for a in &hw.accelerators {
         let name = match a.backend {
             "cpu" => format!("CPU ({})", a.name),
@@ -1903,6 +1939,8 @@ pub fn to_json(hw: &Hardware, rows: &[Row]) -> serde_json::Value {
             "cores": hw.cores,
             "memory_gb": ro(hw.ram_gb),
             "memory_available_gb": ro(hw.ram_available_gb),
+            "app_memory_gb": ro(hw.app_memory_gb),
+            "memory_budget_gb": ro(hw.memory_budget_gb()),
             "disk_free_gb": ro(hw.disk_free_gb),
             "cache_dir": hw.cache_dir.display().to_string(),
             "gpu": hw.gpu.as_ref().map(|g| json!({
@@ -1954,6 +1992,7 @@ mod tests {
             cores: 8,
             ram_gb: Some(ram),
             ram_available_gb: Some(ram),
+            app_memory_gb: None,
             gpu: gpu.map(|(kind, name, mem)| Gpu {
                 kind,
                 name: name.into(),
@@ -2066,6 +2105,40 @@ mod tests {
         // Vulkan has no decode plans.
         let rows = survey(&hw(128.0, Some((GpuKind::Vulkan, "Some GPU", 24.0)), 500.0));
         assert!(rows.iter().all(|r| r.variants.iter().all(|v| v.runs != Runs::Gpu)));
+    }
+
+    #[test]
+    fn phone_app_limit() {
+        // An 8 GB iPhone whose app may use 6 GB: weights up to 4.8 GB stay in memory (60% of
+        // the RAM, under 6 - 1 GB); Inkling-2 Mini's 8.5 GB phone file streams from flash.
+        let mut h = unified(8.0, 5.7);
+        h.app_memory_gb = Some(6.0);
+        assert!((h.memory_budget_gb().unwrap() - 4.8).abs() < 1e-9);
+        let rows = survey(&h);
+        assert_eq!(
+            row(&rows, "unsloth/Inkling-2-Mini-GGUF:UD-IQ2_XXS").variants[0].runs,
+            Runs::Streamed
+        );
+        assert_ne!(row(&rows, "Qwen/Qwen3.5-0.8B").recommended().runs, Runs::Streamed);
+        // A low app limit binds before the RAM: 3 GB leaves 1.9 GB of weights.
+        h.app_memory_gb = Some(3.0);
+        assert!((h.memory_budget_gb().unwrap() - (3.0 - APP_RESERVE_GB)).abs() < 1e-9);
+        // A 16 GB iPad whose app may use 12 GB: 9.6 GB of weights, the phone file in memory,
+        // UD-IQ3_XXS (11.7 GB) streamed.
+        let mut h = unified(16.0, 12.0);
+        h.app_memory_gb = Some(12.0);
+        let rows = survey(&h);
+        assert_ne!(
+            row(&rows, "unsloth/Inkling-2-Mini-GGUF:UD-IQ2_XXS").variants[0].runs,
+            Runs::Streamed
+        );
+        assert_eq!(
+            row(&rows, "unsloth/Inkling-2-Mini-GGUF:UD-IQ3_XXS").variants[0].runs,
+            Runs::Streamed
+        );
+        let j = to_json(&h, &rows);
+        assert_eq!(j["hardware"]["app_memory_gb"], 12.0);
+        assert!(render(&h, &rows, false).contains("this app may use 12 GB"));
     }
 
     #[test]

@@ -130,7 +130,13 @@ int64_t oxi_cache_remove(const char *cache_dir, const char *name);
  *                        budget picked the same way, at most 85% of the GPU working set), or for
  *                        a Mistral Large 4 checkpoint over 60% of RAM; off: never (an oversized checkpoint
  *                        is then memory-mapped and demand-paged); cache_budget_gb=F, resident_mb,
- *                        prefetch_mb, expert_cache_mb, expert_predict=0|1 tune it
+ *                        prefetch_mb, expert_cache_mb, expert_predict=0|1 tune it. Inkling-2
+ *                        and the other MoE families decide on the app's budget too on iOS,
+ *                        counting their caches and activations beside the weights
+ *   memory_limit_gb=F    the memory the model may use, as an iOS app's limit (caps
+ *                        os_proc_available_memory; on a desktop, a phone's 6-8 GB): decides
+ *                        streaming, its budget, and whether Inkling-2's GPU engine maps the
+ *                        weights (above the budget its passes stay on the CPU)
  *   mmproj=auto|none|FILE  vision tower of Mistral Large 4 (pixtral) and Qwen3.5-family models
  *                        such as Qwen3.8-Flash-Next (qwen3vl_merger): a llama.cpp mmproj GGUF
  *                        (path or org/repo/file); auto (default): the checkpoint's tower, or the

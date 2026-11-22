@@ -167,6 +167,38 @@ impl DeviceMemory {
         }
     }
 
+    /// This device's memory with the app's share capped at `limit` (the engine's
+    /// `memory_limit_gb`: a phone's limit tried on a desktop, or a smaller share on purpose): the
+    /// limit then decides like iOS's `os_proc_available_memory` ([`Self::budget`],
+    /// [`Self::too_big`]). None leaves it as it is.
+    pub fn limited(mut self, limit: Option<u64>) -> Self {
+        if let Some(l) = limit {
+            self.app_available = Some(self.app_available.map_or(l, |a| a.min(l)));
+        }
+        self
+    }
+
+    /// Whether the app's memory is limited (iOS, or [`Self::limited`]).
+    pub fn limits_app(&self) -> bool {
+        self.app_available.is_some()
+    }
+
+    /// Bytes of weights an accelerator may keep mapped for a model that does not stream: 85% of
+    /// the GPU's working set (Metal's `recommendedMaxWorkingSetSize`, or
+    /// `OXINFER_GPU_WORKING_SET_GB`), and where the app's memory is limited, at most
+    /// [`Self::budget`]. None when nothing limits it.
+    pub fn gpu_weight_budget(&self) -> Option<u64> {
+        let ws = self
+            .gpu_working_set
+            .or_else(|| crate::gpu::active().and_then(|b| b.working_set()))
+            .map(|w| (w as f64 * 0.85) as u64);
+        let app = if self.limits_app() { self.budget() } else { None };
+        match (ws, app) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     /// The page-cache budget for a streamed model: on a device that limits apps (iOS), what the
     /// app may still use minus [`Self::APP_RESERVE`], at most 60% of the device's memory; elsewhere
     /// 70% of the memory. With GPU decoding, at most 85% of the GPU working set (the resident
@@ -208,12 +240,18 @@ impl DeviceMemory {
 /// options with the device's page-cache budget (and `OXINFER_FLASH_MBPS`), or None when the
 /// weights fit.
 pub fn auto_stream(bytes: u64) -> Option<StreamOptions> {
-    let d = DeviceMemory::detect();
-    if !d.too_big(bytes) {
+    auto_stream_on(&DeviceMemory::detect(), bytes, 0)
+}
+
+/// [`auto_stream`] on the device `d` for `bytes` of weights that need `runtime` bytes beside
+/// them beyond [`DeviceMemory::APP_RESERVE`] (KV caches, activations): None when both fit,
+/// else the options with the budget less `runtime`.
+pub fn auto_stream_on(d: &DeviceMemory, bytes: u64, runtime: u64) -> Option<StreamOptions> {
+    if !d.too_big(bytes.saturating_add(runtime)) {
         return None;
     }
     let mut o = StreamOptions::default().with_env();
-    o.cache_budget = d.budget();
+    o.cache_budget = d.budget().map(|b| b.saturating_sub(runtime).max(1 << 30));
     Some(o)
 }
 
@@ -1871,6 +1909,23 @@ mod tests {
         assert_eq!(busy.budget(), Some(4 * G));
         assert_eq!(DeviceMemory::default().budget(), None);
         assert!(!DeviceMemory::default().too_big(u64::MAX));
+        // A limit (`memory_limit_gb`) makes the desktop decide as a phone: 6 GB leaves 4.9 GB,
+        // so Inkling-2 Mini's 8.5 GB file streams, with its runtime taken off the budget; on the
+        // phone the smaller of the limit and the OS's wins.
+        let lim = mac.limited(Some(6 * G));
+        assert!(lim.limits_app() && !mac.limits_app());
+        assert_eq!(lim.budget(), Some(6 * G - DeviceMemory::APP_RESERVE));
+        assert!(auto_stream_on(&lim, 2 * G, 0).is_none());
+        let o = auto_stream_on(&lim, 8_500_000_000, G / 2).unwrap();
+        assert_eq!(o.cache_budget, Some(6 * G - DeviceMemory::APP_RESERVE - G / 2));
+        assert!(auto_stream_on(&lim, 4 * G, G).is_some(), "the runtime counts");
+        assert_eq!(phone.limited(Some(4 * G)).app_available, Some(4 * G));
+        assert_eq!(phone.limited(Some(9 * G)).app_available, Some(6 * G));
+        assert_eq!(phone.limited(None), phone);
+        // What an accelerator may map: 85% of its working set, and the budget where apps are
+        // limited.
+        assert_eq!(phone.gpu_weight_budget(), phone.budget());
+        assert!(near(gpu.limited(None).gpu_weight_budget(), (6 * G) * 85 / 100));
     }
 
     #[test]

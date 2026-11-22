@@ -179,6 +179,13 @@ pub struct EngineOptions {
     /// then plainly memory-mapped and demand-paged). Key `stream` (`auto`, `on` / `1`, `off` /
     /// `0`).
     pub stream_mode: StreamMode,
+    /// The memory this engine may use, as an iOS app's limit (`os_proc_available_memory`, which
+    /// it caps where there is one; [`crate::stream::DeviceMemory::limited`]): it decides whether
+    /// the weights stream and with what page-cache budget (Qwen, Gemma, Inkling-2 and the MoE
+    /// families that stream when too big), and whether Inkling-2's GPU engine maps them. To try a
+    /// phone's 6-8 GB on a desktop, or to keep a model to a share of the memory. Key
+    /// `memory_limit_gb` (empty or 0: none).
+    pub memory_limit: Option<u64>,
     /// Mistral Large 4 and Qwen3.5-family models (Qwen3.8-Flash-Next) from GGUF: where the
     /// vision tower (llama.cpp `mmproj` GGUF: `pixtral`, `qwen3vl_merger`, `inkling2v`) comes from. Default: an
     /// `mmproj*.gguf` beside the model (in its folder or the one above); a file (path or
@@ -434,6 +441,7 @@ impl Default for EngineOptions {
             cache_dir: None,
             stream: None,
             stream_mode: StreamMode::Auto,
+            memory_limit: None,
             mmproj: crate::pixtral::Mmproj::Auto,
             coreml_units: None,
             coreml_prefill: CoreMlPrefill::Auto,
@@ -512,6 +520,7 @@ impl EngineOptions {
         "stream",
         "mmproj",
         "cache_budget_gb",
+        "memory_limit_gb",
         "resident_mb",
         "prefetch_mb",
         "flash_mbps",
@@ -604,6 +613,16 @@ impl EngineOptions {
                 self.stream_mode = StreamMode::parse(value).with_context(|| format!("stream: expected auto, on or off, got {value:?}"))?
             }
             "mmproj" => self.mmproj = crate::pixtral::Mmproj::parse(value),
+            "memory_limit_gb" => {
+                let v: f64 = match value {
+                    "" => 0.0,
+                    v => v.parse().with_context(|| format!("{key}: not a number: {value:?}"))?,
+                };
+                if !(v >= 0.0 && v.is_finite()) {
+                    bail!("{key}: expected a size in GB, got {value:?}");
+                }
+                self.memory_limit = (v > 0.0).then_some((v * 1e9) as u64);
+            }
             "expert_predict" => self.stream.get_or_insert_with(Default::default).predict_experts = parse_bool(key, value)?,
             "cache_budget_gb" | "resident_mb" | "prefetch_mb" | "flash_mbps" | "expert_cache_mb" => {
                 let st = self.stream.get_or_insert_with(Default::default);
@@ -1402,6 +1421,8 @@ pub struct Engine {
     mmproj: crate::pixtral::Mmproj,
     prefill_chunk: usize,
     max_context: Option<usize>,
+    /// [`EngineOptions::memory_limit`].
+    memory_limit: Option<u64>,
     draft_tokens: usize,
     /// Turns fed in the current conversation.
     turns: usize,
@@ -1615,23 +1636,40 @@ impl Engine {
         // larger than most of RAM (its routed experts are read through the page cache).
         // Qwen4-Exp reads its n-gram table (tens of GB) a few rows per token: always mapped.
         let exp = model_type.starts_with("qwen4_exp");
+        // Where the app's memory is limited (iOS, or `memory_limit_gb`), the MoE families decide
+        // on the app's budget as Qwen and Gemma do, Inkling-2 counting its caches and activations
+        // (`inkling::runtime_bytes`) beside the weights.
+        let device_mem = crate::stream::DeviceMemory::detect().limited(opts.memory_limit);
+        let ckpt_bytes = crate::safetensors::checkpoint_bytes(&dir);
+        let runtime = match family {
+            Family::Inkling2 => {
+                crate::inkling::runtime_bytes(opts.kv_cache, opts.max_context).saturating_sub(crate::stream::DeviceMemory::APP_RESERVE)
+            }
+            _ => 0,
+        };
+        let moe_big = matches!(
+            family,
+            Family::Mistral4 | Family::DeepSeek4 | Family::Glm5 | Family::Kimi | Family::Inkling2 | Family::Ripple
+        );
+        let app_moe = !exp && moe_big && device_mem.limits_app();
         let too_big = if exp {
             crate::qwen4exp::too_big(&dir)
+        } else if app_moe {
+            device_mem.too_big(ckpt_bytes.saturating_add(runtime))
         } else {
-            matches!(
-                family,
-                Family::Mistral4 | Family::DeepSeek4 | Family::Glm5 | Family::Kimi | Family::Inkling2 | Family::Ripple
-            ) && crate::mistral4::too_big(crate::safetensors::checkpoint_bytes(&dir))
+            moe_big && crate::mistral4::too_big(ckpt_bytes)
         };
         let too_big = too_big || (family == Family::Longcat && crate::longcat::too_big(crate::safetensors::checkpoint_bytes(&dir)));
         // Too big for memory: streamed with a page-cache budget unless told otherwise
         // (2.5-3.5x faster than demand paging on the 378 GB UD-Q2_K_XL, see the README).
         // Qwen and Gemma checkpoints larger than this device holds (a 27B on a 12 GB phone)
         // stream with the device's page-cache budget (`stream::DeviceMemory`).
-        let auto = if too_big {
+        let auto = if too_big && app_moe {
+            Some(crate::stream::auto_stream_on(&device_mem, ckpt_bytes, runtime).unwrap_or_else(crate::mistral4::default_stream))
+        } else if too_big {
             Some(crate::mistral4::default_stream())
         } else if !exp && matches!(family, Family::Qwen | Family::Llama | Family::Gemma4 | Family::Gemma3) {
-            crate::stream::auto_stream(crate::safetensors::checkpoint_bytes(&dir))
+            crate::stream::auto_stream_on(&device_mem, ckpt_bytes, 0)
         } else {
             None
         };
@@ -2090,6 +2128,8 @@ impl Engine {
                 decision = None;
                 let mut model = Inkling2Model::load(crate::inkling::Inkling2Config::load(&dir)?, files, opts.quant)?;
                 model.kv = opts.kv_cache;
+                // (Weights that do not fit the GPU's share keep the passes on the CPU.)
+                model.gpu_budget = device_mem.gpu_weight_budget().map(|b| b.saturating_sub(runtime));
                 loras = crate::lora::attach_specs(&mut model, &lora_specs, &dir, opts.lora_merge)?;
                 if let Some(so) = stream.clone() {
                     streamer = Some(crate::stream::attach_inkling(&mut model, files, so)?);
@@ -2276,13 +2316,18 @@ impl Engine {
             // Bigger prefill chunks keep the GPU busier; on the CPU 256 keeps activations in cache.
             // (Inkling-2: big chunks for its 128 experts, see `inkling::default_prefill_chunk`.)
             prefill_chunk: opts.prefill_chunk.unwrap_or(if family == Family::Inkling2 {
-                crate::inkling::default_prefill_chunk()
+                // (512 where the app's memory is limited: a chunk of 2048 holds about 3 GB.)
+                match device_mem.limits_app() {
+                    true => crate::inkling::default_prefill_chunk().min(512),
+                    false => crate::inkling::default_prefill_chunk(),
+                }
             } else if gpu.is_some() {
                 1024
             } else {
                 256
             }),
             max_context: opts.max_context,
+            memory_limit: opts.memory_limit,
             draft_tokens: opts.draft_tokens.unwrap_or(6),
             turns: 0,
             unfed: None,
@@ -2360,6 +2405,7 @@ impl Engine {
             prefill_chunk: 0,
             // The conversion fixes the context.
             max_context: Some(opts.max_context.map_or(ctx, |m| m.min(ctx))),
+            memory_limit: opts.memory_limit,
             draft_tokens: 0,
             turns: 0,
             unfed: None,
@@ -2397,6 +2443,12 @@ impl Engine {
     /// footprint, and the emulated flash bandwidth.
     pub fn streamer(&self) -> Option<&Arc<crate::stream::Streamer>> {
         self.streamer.as_ref()
+    }
+
+    /// The memory this device offers the engine: [`crate::stream::DeviceMemory::detect`] with
+    /// [`EngineOptions::memory_limit`] applied (what streaming and the GPU fit were decided on).
+    pub fn device_memory(&self) -> crate::stream::DeviceMemory {
+        crate::stream::DeviceMemory::detect().limited(self.memory_limit)
     }
 
     pub fn info(&self) -> &ModelInfo {
@@ -4037,6 +4089,11 @@ mod tests {
         assert_eq!(o.stream_mode, StreamMode::Off);
         o.set("stream", "auto").unwrap();
         assert_eq!(o.effective_stream(None).and_then(|s| s.cache_budget), Some(10_000_000_000));
+        o.set("memory_limit_gb", "6.5").unwrap();
+        assert_eq!(o.memory_limit, Some(6_500_000_000));
+        o.set("memory_limit_gb", "0").unwrap();
+        assert_eq!(o.memory_limit, None);
+        assert!(o.set("memory_limit_gb", "-1").is_err() && o.set("memory_limit_gb", "lots").is_err());
         o.set("stream", "1").unwrap();
         assert_eq!(o.stream_mode, StreamMode::On);
         assert!(o.set("stream", "sometimes").is_err());
