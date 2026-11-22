@@ -1,24 +1,24 @@
 # The web GUI on this machine: `oxinfer web`
 
-`oxinfer web` serves the browser GUI of [the WebAssembly build](wasm.md) with this computer as
+`oxinfer web` (and `oxinfer serve`, the same server without opening the browser) serves the browser GUI of [the WebAssembly build](wasm.md) with this computer as
 its backend: the models run natively (every CPU core, Metal, CUDA), the page drives them over
 HTTP. The same port also serves the unchanged [OpenAI-compatible API](server.md) under `/v1`, so
 other programs (opencode, the `openai` clients, curl) can use the models the GUI loads while it
 is open.
 
 ```sh
-oxinfer web                          # http://127.0.0.1:8090/, opened in the browser
+oxinfer web                          # http://127.0.0.1:8080/, opened in the browser
 oxinfer web --port 9000 --no-open
 oxinfer web --host 0.0.0.0 --api-key "$(openssl rand -hex 16)"   # reachable from the network
 oxinfer web --model qwen=Qwen/Qwen3.5-0.8B,quant=q8 --memory-gb 24
-# [GUI: http://127.0.0.1:8090/]
-# [API: http://127.0.0.1:8090/v1 (OpenAI-compatible)]
+# [GUI: http://127.0.0.1:8080/]
+# [API: http://127.0.0.1:8080/v1 (OpenAI-compatible)]
 ```
 
 | Option | |
 |---|---|
 | `--host ADDR` | address to listen on (default `127.0.0.1`) |
-| `--port N` | port (default 8090, or the next free one up to 8109 when it is taken; a port given is used as given; 0 picks one) |
+| `--port N` | port (default 8080, or the next free one up to 8099 when it is taken; a port given is used as given; 0 picks one) |
 | `--listen ADDR:PORT` | both at once |
 | `--no-open` | do not open the GUI in the default browser |
 | `--api-key KEY` | requests need `Authorization: Bearer KEY`, the GUI's too (default `$OXINFER_API_KEY`); the browser opened at start gets the key in the address fragment, keeps it in its local storage and removes it from the address bar; another browser asks for it |
@@ -81,7 +81,7 @@ other clients can use, and the memory budget unloads the least recently used idl
 
 ### Connecting other programs
 
-The snippets use the address the page was opened at (`http://127.0.0.1:8090/v1` by default) and
+The snippets use the address the page was opened at (`http://127.0.0.1:8080/v1` by default) and
 the model ids of the server's list (Models in use): clients can only name those, and one that is
 not loaded loads on its first request, which waits for it (a downloaded model that is not in the
 list must be loaded once from the GUI, or given with `--model`).
@@ -96,7 +96,7 @@ list must be loaded once from the GUI, or given with `--model`).
       "oxinfer": {
         "npm": "@ai-sdk/openai-compatible",
         "name": "oxinfer (local)",
-        "options": { "baseURL": "http://127.0.0.1:8090/v1" },
+        "options": { "baseURL": "http://127.0.0.1:8080/v1" },
         "models": { "Qwen/Qwen3.5-0.8B": { "name": "Qwen/Qwen3.5-0.8B (oxinfer)" } }
       }
     },
@@ -108,7 +108,7 @@ list must be loaded once from the GUI, or given with `--model`).
   `opencode run -m oxinfer/Qwen/Qwen3.5-0.8B "Reply with just the word: pong"` answered `pong`.
   opencode's newer schema also has a `providers` key (with `package` and `settings`); `provider`
   is still read.
-- **Claude Code**: `ANTHROPIC_BASE_URL=http://127.0.0.1:8090` (no `/v1`),
+- **Claude Code**: `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` (no `/v1`),
   `ANTHROPIC_AUTH_TOKEN` (the key, or any value without one), `ANTHROPIC_MODEL` and
   `ANTHROPIC_SMALL_FAST_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL` set to a model id, then `claude`.
   Its system prompt and tool definitions are long, so the first request reads a long prompt, and

@@ -10,6 +10,7 @@ const emit = defineEmits(['use']);
 
 const GROUPS = [
   ['all', 'All'],
+  ['downloaded', 'Downloaded'],
   ['chat', 'Chat'],
   ['vision', 'Vision-language'],
   ['image', 'Images'],
@@ -26,6 +27,12 @@ const cache = ref(null);
 const cacheError = ref('');
 const group = ref('all');
 const query = ref('');
+// The downloaded models, most recently used (then largest) first; the first 8 unless expanded.
+const cacheAll = ref(false);
+const cacheShown = computed(() => {
+  const list = [...(cache.value?.entries || [])].sort((a, b) => (b.loaded - a.loaded) || ((b.last_used || 0) - (a.last_used || 0)) || (b.bytes - a.bytes));
+  return cacheAll.value ? list : list.slice(0, 8);
+});
 const showAll = ref(false);
 const manual = ref('');
 const setup = ref(null); // { spec, model (catalog entry) }
@@ -52,6 +59,7 @@ const counts = computed(() => {
   const c = { all: 0 };
   for (const m of catalog.value?.models || []) {
     c.all++;
+    if (m.cached) c.downloaded = (c.downloaded || 0) + 1;
     const g = groupOf(m);
     c[g] = (c[g] || 0) + 1;
   }
@@ -60,7 +68,7 @@ const counts = computed(() => {
 
 const shown = computed(() => {
   const q = query.value.trim().toLowerCase();
-  const list = (catalog.value?.models || []).filter((m) => (group.value === 'all' || groupOf(m) === group.value) && (!q || m.model.toLowerCase().includes(q) || m.note.toLowerCase().includes(q) || m.capabilities.some((c) => c.includes(q))));
+  const list = (catalog.value?.models || []).filter((m) => (group.value === 'all' || (group.value === 'downloaded' ? m.cached : groupOf(m) === group.value)) && (!q || m.model.toLowerCase().includes(q) || m.note.toLowerCase().includes(q) || m.capabilities.some((c) => c.includes(q))));
   return showAll.value || q || group.value !== 'all' ? list : list.slice(0, 24);
 });
 
@@ -303,6 +311,46 @@ onUnmounted(() => clearInterval(timer));
         </ul>
       </section>
 
+      <section class="block-section" aria-labelledby="cache-h">
+        <h2 id="cache-h">Downloaded models</h2>
+        <p v-if="cacheError" class="error" role="alert">{{ cacheError }}</p>
+        <p v-else-if="cache && !cache.entries.length" class="empty-note">No models downloaded yet — pick one from the catalog.</p>
+        <div v-else-if="cache" class="table-wrap">
+          <table class="cache">
+            <thead>
+              <tr>
+                <th scope="col">Model</th>
+                <th scope="col">Kind</th>
+                <th scope="col" class="num-col">Size</th>
+                <th scope="col">Last used</th>
+                <th scope="col"><span class="sr-only">Actions</span></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="e in cacheShown" :key="e.name">
+                <td>
+                  <span class="mono">{{ e.repo || e.name }}</span>
+                  <span v-if="e.catalog.length" class="badge">catalog</span>
+                  <span v-if="e.loaded" class="badge good">in use</span>
+                  <span v-if="e.downloading" class="badge warn">downloading</span>
+                  <span v-if="!e.usable" class="badge bad">incomplete</span>
+                </td>
+                <td>{{ e.kind || '—' }}</td>
+                <td class="num-col">{{ fmtBytes(e.bytes) }}</td>
+                <td>{{ fmtAgo(e.last_used) }}</td>
+                <td class="row-actions">
+                  <button v-if="e.usable && e.kind" type="button" class="link" @click="setupFromCache(e)">Load…</button>
+                  <button type="button" class="link danger" :disabled="e.loaded || e.downloading || readOnly" :title="e.loaded ? 'Unload it first' : e.downloading ? 'Cancel the download first' : ''" @click="askDelete(e)">Delete</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <button v-if="!cacheAll && cache.entries.length > cacheShown.length" type="button" class="link" @click="cacheAll = true">
+            Show all {{ cache.entries.length }} downloaded models
+          </button>
+        </div>
+      </section>
+
       <section class="block-section" aria-labelledby="cat-h">
         <h2 id="cat-h">Catalog</h2>
         <p class="hint">The models oxinfer was tested with, checked against this computer’s memory, GPU and free disk space.</p>
@@ -364,42 +412,6 @@ onUnmounted(() => clearInterval(timer));
         <p class="hint">A Hugging Face repo id (fetched from the ATOnline mirror when it has it, else Hugging Face), <code>org/name:QUANT</code> for one GGUF file of a repo, or a folder or file on this computer.</p>
       </section>
 
-      <section class="block-section" aria-labelledby="cache-h">
-        <h2 id="cache-h">Downloaded models</h2>
-        <p v-if="cacheError" class="error" role="alert">{{ cacheError }}</p>
-        <p v-else-if="cache && !cache.entries.length" class="empty-note">No models downloaded yet — pick one from the catalog.</p>
-        <div v-else-if="cache" class="table-wrap">
-          <table class="cache">
-            <thead>
-              <tr>
-                <th scope="col">Model</th>
-                <th scope="col">Kind</th>
-                <th scope="col" class="num-col">Size</th>
-                <th scope="col">Last used</th>
-                <th scope="col"><span class="sr-only">Actions</span></th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="e in cache.entries" :key="e.name">
-                <td>
-                  <span class="mono">{{ e.repo || e.name }}</span>
-                  <span v-if="e.catalog.length" class="badge">catalog</span>
-                  <span v-if="e.loaded" class="badge good">in use</span>
-                  <span v-if="e.downloading" class="badge warn">downloading</span>
-                  <span v-if="!e.usable" class="badge bad">incomplete</span>
-                </td>
-                <td>{{ e.kind || '—' }}</td>
-                <td class="num-col">{{ fmtBytes(e.bytes) }}</td>
-                <td>{{ fmtAgo(e.last_used) }}</td>
-                <td class="row-actions">
-                  <button v-if="e.usable && e.kind" type="button" class="link" @click="setupFromCache(e)">Load…</button>
-                  <button type="button" class="link danger" :disabled="e.loaded || e.downloading || readOnly" :title="e.loaded ? 'Unload it first' : e.downloading ? 'Cancel the download first' : ''" @click="askDelete(e)">Delete</button>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-      </section>
     </section>
 
     <SetupDialog v-if="setup" :spec="setup.spec" :model="setup.model" @close="closeSetup" @use="(k) => (closeSetup(), useKind(k))" />

@@ -1,9 +1,10 @@
 # OpenAI-compatible server
 
-`oxinfer serve` exposes the OpenAI API over a whitelist of models (`oxinfer web` serves the same
-API next to a browser GUI that sets models up and adds them to the list: see
-[The web GUI on this machine](web.md)): only the models given with
-`--model` can be requested, by their id. Each is `[ID=]SOURCE[,KEY=VALUE...]`: a local folder or
+`oxinfer serve` and `oxinfer web` are the same server: the OpenAI API under `/v1`, Anthropic's
+`/v1/messages`, and the [web GUI](web.md) with its management API, on one port (default
+`127.0.0.1:8080`, or the next free one when no port is given). `oxinfer web` also opens the GUI in
+the browser. The models clients can request are the ones given with `--model` and the ones set up
+in the GUI, by their id. Each `--model` is `[ID=]SOURCE[,KEY=VALUE...]`: a local folder or
 file, a repo id (fetched on first use, or at start with `--download`) or `org/name:QUANT` for a
 GGUF repo, an optional id (default: the source) and the model's options. HTTP and HTTPS are
 served by [httpsd](https://crates.io/crates/httpsd) (its thread-pool runtime, no async runtime).

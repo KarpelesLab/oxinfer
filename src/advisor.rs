@@ -494,6 +494,17 @@ pub const CATALOG: &[Model] = &[
     .moe()
     .note("matches transformers on the real weights; Metal: ~56 tok/s decode, ~1850 tok/s prefill (M5 Max); --mtp drafts with its MTP head"),
     Model::new(
+        "OpenUncensored/Inkling-2-Mini-Uncensored",
+        Kind::Chat,
+        26.4,
+        19.5,
+        &[Text, ImageInput, Thinking, Tools],
+    )
+    .fixed(Format::Q4, "NVFP4")
+    .speed(5.34, 48)
+    .moe()
+    .note("uncensored (abliterated: the 20 attention output projections edited, experts, vision tower and MTP head unchanged); same files as the release; the edit alone as a PEFT LoRA: --lora OpenUncensored/Inkling-2-Mini-Uncensored-LoRA"),
+    Model::new(
         "ggml-org/Inkling-2-Mini-GGUF:Q8_0",
         Kind::Chat,
         26.4,

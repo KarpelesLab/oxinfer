@@ -1,31 +1,60 @@
-//! `oxinfer web`: the browser GUI with this machine as its backend ([`oxinfer::server::web`]),
-//! next to the OpenAI-compatible API of `oxinfer serve` on the same port.
+//! `oxinfer serve` and `oxinfer web`: one server. The browser GUI with this machine as its
+//! backend ([`oxinfer::server::web`]), its management API, and the OpenAI- and
+//! Anthropic-compatible APIs on the same port. `web` also opens the GUI in the browser.
 
 use anyhow::{Result, bail};
 use oxinfer::server::{Api, ServerOptions, http};
 
-pub const USAGE: &str = "usage: oxinfer web [--host ADDR] [--port N] [--no-open] [--api-key KEY] [options]\n\
+pub const USAGE: &str = "usage: oxinfer serve|web [--host ADDR] [--port N] [--model [ID=]SOURCE[,KEY=VALUE...]]... [options]\n\
 \n\
-Serves the web GUI (chat, images, speech to text, text to speech, voice chat, video, embeddings;\n\
-the model catalog, downloads with progress, the model cache) at http://HOST:PORT/, and the\n\
-OpenAI-compatible API of `oxinfer serve` at http://HOST:PORT/v1 for other clients at the same\n\
-time. Models picked in the GUI join the API's model list.\n\
+One server for both: the web GUI (chat, images, speech to text, text to speech, voice chat,\n\
+video, embeddings; the model catalog, downloads with progress, the model cache) at\n\
+http://HOST:PORT/, the OpenAI-compatible API at /v1 (/v1/models, /v1/chat/completions,\n\
+/v1/completions, /v1/embeddings, /v1/images/*, /v1/audio/*, /v1/videos) and Anthropic's\n\
+/v1/messages. `oxinfer web` also opens the GUI in the browser; `oxinfer serve` does not\n\
+(--open / --no-open change that). Models picked in the GUI join the API's model list.\n\
+\n\
+--model SOURCE lists a model from the start: SOURCE is a local directory or file, a repo id\n\
+(org/name, fetched on first use) or org/name:QUANT (a GGUF file of the repo); ID is the name\n\
+clients use (default: SOURCE). Model options: the engine's (quant, device, mmap, stream,\n\
+mmproj, draft, mtp, lookup, lora, prompt_cache, max_context, ...) or the loader's for other\n\
+kinds, and kind=chat|embedding|image|transcription|speech, system=TEXT, think=1, max_tokens=N,\n\
+temperature=F, top_p=F, top_k=N, repetition_penalty=F, prompt_name=NAME, memory_gb=F.\n\
 \n\
 options:\n\
 \x20 --host ADDR           address to listen on (default 127.0.0.1)\n\
-\x20 --port N              port (default 8090, or the next free one; 0 picks one)\n\
+\x20 --port N              port (default 8080, or the next free one; 0 picks one)\n\
 \x20 --listen ADDR:PORT    both at once\n\
-\x20 --no-open             do not open the GUI in the browser\n\
-\x20 --api-key KEY         require Authorization: Bearer KEY for the API and the GUI (default:\n\
+\x20 --open, --no-open     open the GUI in the browser or not (default: web opens it, serve not)\n\
+\x20 --model [ID=]SOURCE   a model listed (and loadable) from the start; repeatable\n\
+\x20 --config FILE         JSON options: {\"listen\": ..., \"models\": [\"ID=SOURCE,...\" or\n\
+\x20                       {\"id\": ..., \"model\": ..., \"options\": {...}}], \"api_key\": ..., ...}\n\
+\x20 --api-key KEY         require Authorization: Bearer KEY for the APIs and the GUI (default:\n\
 \x20                       $OXINFER_API_KEY if set). Without one on a non-loopback address the\n\
 \x20                       GUI's management API is read-only (no downloads, deletions or loads)\n\
-\x20 --model [ID=]SOURCE   a model listed (and loadable) from the start; repeatable\n\
+\x20 --cors ORIGIN         send CORS headers allowing ORIGIN (* for any)\n\
+\x20 --max-body-mb N       largest request body (default 16, also the most the listener reads)\n\
+\x20 --preload             load every listed model at start (default: on first use)\n\
+\x20 --download            fetch every listed model at start\n\
+\x20 --memory-gb N         memory for loaded models together; least recently used ones are\n\
+\x20                       unloaded to make room (default 80% of RAM)\n\
+\x20 --cache-dir DIR       where repo ids are fetched to\n\
+\x20 --prompt-cache DIR    keep chat models' session snapshots in DIR (auto:\n\
+\x20                       ~/.cache/oxinfer/prompt-cache) across requests and restarts\n\
+\x20 --prompt-cache-gb F   size cap of the prompt cache (default 20; least recently used go)\n\
+\x20 --threads N           CPU threads (default: all cores)\n\
+\x20 --no-remote-media     do not fetch http(s) image / audio / video URLs (data: URLs only)\n\
+\x20 --local-media         also accept local paths and file:// URLs as media (trusted clients only)\n\
+\x20 --tls-cert FILE --tls-key FILE  HTTPS with this certificate chain and key (PEM)\n\
+\x20 --self-signed         HTTPS with a generated self-signed certificate\n\
+\x20 --workers N           connections served at once (default 32)\n\
+\x20 --thinking-key KEY    key of the signatures of /v1/messages thinking blocks (default: random\n\
+\x20                       per start; set it to keep them valid across restarts)\n\
 \x20 --no-update-check     do not ask GitHub for the latest release (the GUI tells when a newer\n\
 \x20                       oxinfer is out, checking at most every 6 hours, and can install it)\n\
-\x20 and the other options of `oxinfer serve` (--memory-gb, --cache-dir, --threads,\n\
-\x20 --prompt-cache, --cors, --tls-cert/--tls-key, --self-signed, --preload, --quiet, ...)";
+\x20 --quiet               no request log";
 
-const DEFAULT_PORT: u16 = 8090;
+const DEFAULT_PORT: u16 = 8080;
 
 /// Opens `url` in the default browser (best effort).
 fn open_browser(url: &str) {
@@ -40,11 +69,12 @@ fn open_browser(url: &str) {
     }
 }
 
-/// Runs the GUI's server with the arguments after `web`.
-pub fn run(args: &[String]) -> Result<()> {
+/// Runs the server with the arguments after `serve` or `web` (`command`); `open`: whether the
+/// GUI opens in the browser unless `--open` / `--no-open` says otherwise.
+pub fn run(args: &[String], command: &str, open: bool) -> Result<()> {
     let mut o = ServerOptions::default();
-    let (mut host, mut port, mut listen, mut open) = (None::<String>, None::<u16>, None::<String>, true);
-    super::server_cli::parse_options(&mut o, args, USAGE, "web", &mut |flag, val| {
+    let (mut host, mut port, mut listen, mut open) = (None::<String>, None::<u16>, None::<String>, open);
+    super::server_cli::parse_options(&mut o, args, USAGE, command, &mut |flag, val| {
         match flag {
             "host" => host = Some(val()?),
             "port" | "p" => port = Some(val()?.parse().map_err(|_| anyhow::anyhow!("--port: expected a port number"))?),

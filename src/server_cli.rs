@@ -1,45 +1,7 @@
-//! `oxinfer serve`: the OpenAI-compatible HTTP server ([`oxinfer::server`]).
+//! The option parsing of `oxinfer serve` / `oxinfer web` (one server, see `web_cli`).
 
 use anyhow::{Context, Result, bail};
-use oxinfer::server::{Api, ServerOptions, http};
-
-pub const USAGE: &str = "usage: oxinfer serve --model [ID=]SOURCE[,KEY=VALUE...] [--model ...] [options]\n\
-\n\
-OpenAI-compatible API (/v1/models, /v1/chat/completions, /v1/completions, /v1/embeddings,\n\
-/v1/images/generations, /v1/images/edits, /v1/audio/transcriptions, /v1/audio/translations,\n\
-/v1/audio/speech) over the listed models only. SOURCE is a local directory or file, a repo id\n\
-(org/name, fetched on first use) or org/name:QUANT (a GGUF file of the repo); ID is the name\n\
-clients use (default: SOURCE). Model options: the engine's (quant, device, mmap, stream, mmproj,\n\
-draft, mtp, lookup, prompt_cache, max_context, ...) or the loader's for other kinds, and\n\
-kind=chat|embedding|image|\n\
-transcription|speech, system=TEXT, think=1, max_tokens=N, temperature=F, top_p=F, top_k=N,\n\
-repetition_penalty=F, prompt_name=NAME, memory_gb=F.\n\
-\n\
-options:\n\
-\x20 --listen ADDR         address to listen on (default 127.0.0.1:8080; port 0 picks one)\n\
-\x20 --config FILE         JSON options: {\"listen\": ..., \"models\": [\"ID=SOURCE,...\" or\n\
-\x20                       {\"id\": ..., \"model\": ..., \"options\": {...}}], \"api_key\": ..., ...}\n\
-\x20 --api-key KEY         require Authorization: Bearer KEY (default: $OXINFER_API_KEY if set)\n\
-\x20 --cors ORIGIN         send CORS headers allowing ORIGIN (* for any)\n\
-\x20 --max-body-mb N       largest request body (default 16, also the most the listener reads)\n\
-\x20 --preload             load every model at start (default: on first use)\n\
-\x20 --download            fetch every model at start\n\
-\x20 --memory-gb N         memory for loaded models together; least recently used ones are\n\
-\x20                       unloaded to make room (default 80% of RAM)\n\
-\x20 --cache-dir DIR       where repo ids are fetched to\n\
-\x20 --prompt-cache DIR    keep chat models' session snapshots (KV caches, recurrent states) in\n\
-\x20                       DIR (auto: ~/.cache/oxinfer/prompt-cache; created private) across\n\
-\x20                       requests and restarts, restored when a prompt starts with a stored one\n\
-\x20 --prompt-cache-gb F   size cap of the prompt cache (default 20; least recently used go)\n\
-\x20 --threads N           CPU threads (default: all cores)\n\
-\x20 --no-remote-media     do not fetch http(s) image / audio / video URLs (data: URLs only)\n\
-\x20 --local-media         also accept local paths and file:// URLs as media (trusted clients only)\n\
-\x20 --tls-cert FILE --tls-key FILE  HTTPS with this certificate chain and key (PEM)\n\
-\x20 --self-signed         HTTPS with a generated self-signed certificate\n\
-\x20 --workers N           connections served at once (default 32)\n\
-\x20 --thinking-key KEY    key of the signatures of /v1/messages thinking blocks (default: random\n\
-\x20                       per start; set it to keep them valid across restarts)\n\
-\x20 --quiet               no request log";
+use oxinfer::server::ServerOptions;
 
 /// A caller's own flags: `(flag, value getter)`, true when it handled the flag.
 pub type ExtraFlags<'a> = dyn FnMut(&str, &mut dyn FnMut() -> Result<String>) -> Result<bool> + 'a;
@@ -90,29 +52,4 @@ pub fn parse_options(o: &mut ServerOptions, args: &[String], usage: &str, comman
         }
     }
     Ok(())
-}
-
-/// Runs the server with the arguments after `serve`.
-pub fn run(args: &[String]) -> Result<()> {
-    let mut o = ServerOptions::default();
-    parse_options(&mut o, args, USAGE, "serve", &mut |_, _| Ok(false))?;
-    if o.models.is_empty() {
-        eprintln!("{USAGE}");
-        bail!("no models: list them with --model (only the listed models can be requested)");
-    }
-    let plat = oxinfer::platform::detect();
-    eprintln!("[platform: {}]", plat.summary());
-    let api = Api::new(o)?;
-    let running = http::start(api.clone())?;
-    let models: Vec<String> = api
-        .models()
-        .into_iter()
-        .map(|(id, kind, loaded)| match (kind, loaded) {
-            (Some(k), true) => format!("{id} ({}, loaded)", k.as_str()),
-            (Some(k), false) => format!("{id} ({})", k.as_str()),
-            (None, _) => id,
-        })
-        .collect();
-    eprintln!("[serving {} on {}/v1]", models.join(", "), running.url());
-    running.wait()
 }

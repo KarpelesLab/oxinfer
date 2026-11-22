@@ -602,7 +602,7 @@ fn usage() -> ! {
     eprintln!("{}", sd3_cli::USAGE);
     eprintln!("{}", bagel_cli::USAGE);
     #[cfg(feature = "server")]
-    eprintln!("\n{}", server_cli::USAGE);
+    eprintln!("\n{}", web_cli::USAGE);
     std::process::exit(2)
 }
 
@@ -1335,12 +1335,12 @@ fn main() -> Result<()> {
     #[cfg(feature = "server")]
     if std::env::args().nth(1).as_deref() == Some("serve") {
         let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
-        return server_cli::run(&rest);
+        return web_cli::run(&rest, "serve", false);
     }
     #[cfg(feature = "server")]
     if std::env::args().nth(1).as_deref() == Some("web") {
         let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();
-        return web_cli::run(&rest);
+        return web_cli::run(&rest, "web", true);
     }
     if std::env::args().nth(1).as_deref() == Some("models") {
         let rest: Vec<String> = std::env::args().skip(2).filter(|a| a != "--auto-update").collect();

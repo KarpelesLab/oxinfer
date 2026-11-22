@@ -232,8 +232,8 @@ the same verdicts, and sets a model up from it: size and disk check, download wi
 
 | Command | |
 |---|---|
-| `oxinfer serve --model ...` | the [OpenAI-compatible server](server.md) over the listed models |
-| `oxinfer web [--host ADDR] [--port N] [--no-open] [--api-key KEY]` | the [browser GUI](web.md) with this machine as its backend (default `http://127.0.0.1:8090/`, opened in the browser), with the same `/v1` API on the same port; takes the options of `serve` too |
+| `oxinfer serve [--host ADDR] [--port N] [--model ...] [--api-key KEY]` | the server: the [browser GUI](web.md) with this machine as its backend, the [OpenAI-compatible API](server.md) under `/v1` and Anthropic's `/v1/messages`, all on one port (default `http://127.0.0.1:8080/`, or the next free port) |
+| `oxinfer web ...` | the same server, and it opens the GUI in the browser (`serve --open` does the same, `web --no-open` does not) |
 | `oxinfer models list [--json]` | the folders of the model cache (`$OXINFER_CACHE`, default `~/.cache/oxinfer/hub`) with their size, when oxinfer last loaded them and the specs that load them (`org/name`, `org/name:QUANT` for each GGUF file), and the free space of its disk |
 | `oxinfer models rm NAME... [--yes]` | deletes cache folders, named by folder (`org--name`) or repo id (`org/name`), after a confirmation (`--yes` to skip it; required when stdin is not a terminal); only folders directly inside the cache directory are removed, never a path outside it |
 
