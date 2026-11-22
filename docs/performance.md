@@ -80,9 +80,10 @@ Measured on an M5 Max, 256 greedy tokens after a short prompt, against the same 
 | Gemma 4 E2B-it | Q4 (`--save-quantized`) | 134 tok/s | 201 tok/s | |
 | Gemma 4 E4B-it | Q4 (`--save-quantized`) | 61 tok/s | 115 tok/s | |
 | Gemma 4 26B-A4B (MoE) | GGUF Q4_0 | 63 tok/s | 130 tok/s | 115-116 tok/s |
-| Inkling-2-Mini (MoE, looped; own engine, docs/inkling.md) | GGUF Q8_0 | 17 tok/s | 49 tok/s | 36.5 tok/s |
-| Inkling-2-Mini | GGUF AD-Q4_K | | 54 tok/s | 39.9 tok/s |
-| Inkling-2-Mini | release (NVFP4 experts) | | 47 tok/s | |
+| Inkling-2-Mini (MoE, looped; own engine, docs/inkling.md) | GGUF Q8_0 | 17 tok/s | 59 tok/s | 38 tok/s |
+| Inkling-2-Mini | GGUF AD-Q4_K | | 62 tok/s | 41 tok/s |
+| Inkling-2-Mini | release (NVFP4 experts) | | 56 tok/s | |
+| Inkling-2-Mini | mlx-community 4bit | | 70 tok/s | |
 
 Long contexts cost attention time (the KV cache stays f32): Llama-3.2-1B Q4_K_M decodes at 297
 tok/s after a 2.5k-token prompt (CPU decode 139). The first step of a model compiles its plan

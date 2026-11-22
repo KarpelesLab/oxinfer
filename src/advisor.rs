@@ -492,7 +492,7 @@ pub const CATALOG: &[Model] = &[
     .fixed(Format::Q4, "NVFP4")
     .speed(5.34, 48)
     .moe()
-    .note("matches transformers on the real weights; Metal: ~47 tok/s decode, ~1650 tok/s prefill (M5 Max); no MTP"),
+    .note("matches transformers on the real weights; Metal: ~56 tok/s decode, ~1850 tok/s prefill (M5 Max); --mtp drafts with its MTP head"),
     Model::new(
         "ggml-org/Inkling-2-Mini-GGUF:Q8_0",
         Kind::Chat,
@@ -503,7 +503,7 @@ pub const CATALOG: &[Model] = &[
     .fixed(Format::GgufQ8, "GGUF Q8_0")
     .speed(5.11, 48)
     .moe()
-    .note("images with the mmproj beside it; Metal: ~49 tok/s decode, ~1540 tok/s prefill (M5 Max; llama.cpp 36.5 / 996); no MTP"),
+    .note("images with the mmproj beside it; Metal: ~59 tok/s decode, ~1600 tok/s prefill (M5 Max; llama.cpp 38 / 1000); --draft auto with unsloth's drafter"),
     Model::new(
         "unsloth/Inkling-2-Mini-GGUF:UD-IQ3_XXS",
         Kind::Chat,
@@ -514,7 +514,7 @@ pub const CATALOG: &[Model] = &[
     .fixed(Format::GgufLow, "GGUF UD-IQ3_XXS")
     .speed(2.92, 48)
     .moe()
-    .note("unsloth's own layout (the root files); --kv-cache q8 for long contexts on 16-24 GB; Metal: ~55 tok/s decode"),
+    .note("unsloth's own layout (the root files); --kv-cache q8 for long contexts on 16-24 GB; Metal: ~66 tok/s decode"),
     Model::new(
         "AtomicChat/Inkling-2-Mini-Uncensored-GGUF:AD-Q4_K",
         Kind::Chat,
@@ -524,7 +524,7 @@ pub const CATALOG: &[Model] = &[
     )
     .fixed(Format::GgufQ4, "GGUF AD-Q4_K")
     .moe()
-    .note("uncensored (a rank-1 refusal-direction LoRA baked in); llama.cpp's layout; Metal: ~54 tok/s decode; also :AD-IQ3_S (13.3 GB), :AD-IQ2_M (8.7 GB, run); images with the mmproj beside it"),
+    .note("uncensored (a rank-1 refusal-direction LoRA baked in); llama.cpp's layout; Metal: ~62 tok/s decode (llama.cpp 41); also :AD-IQ3_S (13.3 GB), :AD-IQ2_M (8.7 GB, run); images with the mmproj beside it"),
     // The same quantizations without the LoRA, which AtomicChat ships separately: applied at
     // run time (`--lora`), switchable, closer to the baked files than the base (docs/lora.md).
     Model::new(

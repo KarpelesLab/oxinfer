@@ -645,6 +645,26 @@ impl FastEnc<'_> {
     }
 }
 
+/// A command buffer with a concurrent compute encoder on it, for a profile that times its parts
+/// one by one ([`end_timed`]).
+pub(crate) fn begin_enc(b: &MetalBackend, f: &Fns) -> (Id, Id) {
+    unsafe {
+        let cb = (f.msg0)(b.queue, f.s_cb);
+        (cb, (f.enc_type)(cb, f.s_enc_type, 1))
+    }
+}
+
+/// Ends the encoder `enc` of [`begin_enc`], commits `cb` and waits for it: its GPU seconds.
+pub(crate) fn end_timed(b: &MetalBackend, f: &Fns, cb: Id, enc: Id) -> f64 {
+    unsafe {
+        (f.void)(enc, f.s_end);
+        (f.void)(cb, f.s_commit);
+        (f.void)(cb, f.s_wait);
+        let time: unsafe extern "C" fn(Id, Sel) -> f64 = b.o.msg_send();
+        time(cb, b.o.sel(c"GPUEndTime")) - time(cb, b.o.sel(c"GPUStartTime"))
+    }
+}
+
 /// `OXINFER_PF_PROFILE` is set: prefill plans run each op in a command buffer of its own and
 /// add up the GPU time per kind of op ([`pf_report`]; slower, for profiling).
 fn pf_prof() -> bool {

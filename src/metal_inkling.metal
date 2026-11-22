@@ -612,16 +612,27 @@ kernel void ink_softcap(device float* a [[buffer(0)]], constant ICapP& p [[buffe
 // a sub-block of 16; the codes through MXFP4's doubled table): chunk b of 32 values is half of
 // block b / 2.
 struct NVFP4W { GgW g; };
+// Four E2M1 codes (the low nibbles of v's bytes) as floats over 2^-14: the code's exponent and mantissa
+// bits are a half's (subnormal for exponent 0), its sign the half's sign (no table lookups).
+inline float4 e2m1x4(uint v) {
+    uint lo = ((v & 0x00070007u) << 9) | ((v & 0x00080008u) << 12);
+    uint hi = (((v >> 8) & 0x00070007u) << 9) | (((v >> 8) & 0x00080008u) << 12);
+    half2 a = as_type<half2>(lo), b = as_type<half2>(hi);
+    return float4(float(a.x), float(b.x), float(a.y), float(b.y));
+}
 inline void load(NVFP4W w, uint row, uint b, thread float4* out) {
     device const uchar* B = w.g.q + (ulong)row * w.g.rb + (b / 2) * 36;
     for (uint s2 = 0; s2 < 2; s2++) {
         uint s = 2 * (b % 2) + s2;
-        float d = float(as_type<half>(ushort(ushort(B[s] & 0x7f) << 7))) * 128.f;
-        uchar4 v0 = ld4(B + 4 + 8 * s), v1 = ld4(B + 8 + 8 * s);
-        out[4 * s2 + 0] = kvm4(v0 & uchar(15)) * d;
-        out[4 * s2 + 1] = kvm4(v1 & uchar(15)) * d;
-        out[4 * s2 + 2] = kvm4(v0 >> uchar(4)) * d;
-        out[4 * s2 + 3] = kvm4(v1 >> uchar(4)) * d;
+        // (The scale, halved, times the codes' 2^14 and the table's doubling.)
+        float d = float(as_type<half>(ushort(ushort(B[s] & 0x7f) << 7))) * (128.f * 32768.f);
+        // (Blocks of 36 bytes in rows of whole blocks: the runs are 4-byte aligned.) Byte i's
+        // low nibble is element i, its high one element i + 8 of the sub-block.
+        uint v0 = *(device const uint*)(B + 4 + 8 * s), v1 = *(device const uint*)(B + 8 + 8 * s);
+        out[4 * s2 + 0] = e2m1x4(v0) * d;
+        out[4 * s2 + 1] = e2m1x4(v1) * d;
+        out[4 * s2 + 2] = e2m1x4(v0 >> 4) * d;
+        out[4 * s2 + 3] = e2m1x4(v1 >> 4) * d;
     }
 }
 // MXFP8: E4M3 bytes with a float scale per 32 values of a row (the E8M0 exponents expanded).
@@ -824,59 +835,93 @@ kernel void ink_xcombine(device float* a [[buffer(0)]], constant IXcP& p [[buffe
     device float* y = a + p.y + (ulong)ti * p.h + r;
     if (p.add != 0) *y += v; else *y = v;
 }
-// The pair and down kernels over the groups (grid: blocks of 8 outputs, group): as `_pair` for
+// The pair and down kernels over the groups (grid: blocks of 4 INK_XR outputs, group): as `_pair` for
 // every assignment of the group; the down rows of every assignment into `od`. (`p.y` is `od`.)
+// (INK_XR outputs per SIMD-group, each output's inputs split over INK_XK SIMD-groups of the
+// threadgroup's 4.)
+#ifndef INK_XR
+#define INK_XR 1
+#endif
+#ifndef INK_XK
+#define INK_XK 1
+#endif
+// Sums the lane sums `v` (n values) of the INK_XK SIMD-groups of an output block: the result in
+// the block's first SIMD-group (lanes of the others get garbage).
+inline void ink_ksum(thread float* v, uint n, uint sg, uint lane, threadgroup float* red) {
+    for (uint i = 0; i < n; i++) v[i] = simd_sum(v[i]);
+    if (INK_XK > 1) {
+        if (lane == 0)
+            for (uint i = 0; i < n; i++) red[sg * 4 * INK_XR + i] = v[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg % INK_XK == 0)
+            for (uint i = 0; i < n; i++) {
+                float t = 0.f;
+                for (uint q = 0; q < INK_XK; q++) t += red[(sg + q) * 4 * INK_XR + i];
+                v[i] = t;
+            }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
 #define INK_XG(NAME, T, X, CH, MAKE) \
+inline void NAME##_pair_one(device float* a, IXT e, constant IXP& p, uint j, uint kp, uint sg, uint lane, uint ti, uint s, \
+                            threadgroup float* red) { \
+    T f = MAKE(e, p.h); \
+    device const float* x = a + p.x + (ulong)ti * p.h; \
+    float v[4 * INK_XR]; \
+    if (p.il == 2) { \
+        float acc[2 * INK_XR], acc2[2 * INK_XR]; \
+        for (uint i = 0; i < 2 * INK_XR; i++) { acc[i] = 0.f; acc2[i] = 0.f; } \
+        mv_acc<T, X, CH, 2 * INK_XR, INK_XK>(f, f, false, 0, x, p.h, 2 * p.inter, 2 * j, kp, lane, acc, acc2, 1.f); \
+        for (uint i = 0; i < INK_XR; i++) { v[i] = acc[2 * i]; v[INK_XR + i] = acc[2 * i + 1]; } \
+    } else { \
+        float acc[INK_XR], acc2[INK_XR]; \
+        for (uint i = 0; i < INK_XR; i++) { acc[i] = 0.f; acc2[i] = 0.f; } \
+        mv_acc<T, X, CH, INK_XR, INK_XK>(f, f, true, p.off, x, p.h, 2 * p.inter, j, kp, lane, acc, acc2, 1.f); \
+        for (uint i = 0; i < INK_XR; i++) { v[i] = acc[i]; v[INK_XR + i] = acc2[i]; } \
+    } \
+    ink_ksum(v, 2 * INK_XR, sg, lane, red); \
+    if (lane == 0 && kp == 0) \
+        for (uint i = 0; i < INK_XR && j + i < p.inter; i++) { \
+            float gg = v[i] * e.factor, uu = v[INK_XR + i] * e.factor; \
+            float cu = p.cap_u > 0.f ? p.cap_u * precise::tanh(uu / p.cap_u) : uu; \
+            a[p.act + ((ulong)ti * p.k + s) * p.inter + j + i] = p.cap_g * precise::tanh(gg / p.cap_g) / (1.f + exp(-gg)) * cu; \
+        } \
+} \
 kernel void NAME##_gpair(device float* a [[buffer(0)]], device const IXT* tab [[buffer(1)]], constant IXP& p [[buffer(2)]], \
                          constant uint2& gq [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]], \
                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
-    uint j = (tg.x * 4 + sg) * 2; \
+    threadgroup float red[4 * 4 * INK_XR]; \
+    uint j = (tg.x * (4 / INK_XK) + sg / INK_XK) * INK_XR, kp = sg % INK_XK; \
     device const uint* g = (device const uint*)(a + gq.x); \
     device const uint* asg = (device const uint*)(a + gq.y); \
-    if (j >= p.inter || tg.y >= g[0]) return; \
+    if (tg.y >= g[0]) return; \
     uint ge = g[1 + 3 * tg.y], cnt = g[2 + 3 * tg.y], st = g[3 + 3 * tg.y]; \
     IXT e = tab[ge]; \
-    T f = MAKE(e, p.h); \
     for (uint q = 0; q < cnt; q++) { \
-        uint asn = asg[st + q], ti = asn / p.k, s = asn % p.k; \
-        device const float* x = a + p.x + (ulong)ti * p.h; \
-        float gv[2], uv[2]; \
-        if (p.il == 2) { \
-            float acc[4] = { 0.f, 0.f, 0.f, 0.f }, acc2[4] = { 0.f, 0.f, 0.f, 0.f }; \
-            mv_acc<T, X, CH, 4, 1>(f, f, false, 0, x, p.h, 2 * p.inter, 2 * j, 0, lane, acc, acc2, 1.f); \
-            gv[0] = simd_sum(acc[0]); uv[0] = simd_sum(acc[1]); gv[1] = simd_sum(acc[2]); uv[1] = simd_sum(acc[3]); \
-        } else { \
-            float acc[2] = { 0.f, 0.f }, acc2[2] = { 0.f, 0.f }; \
-            mv_acc<T, X, CH, 2, 1>(f, f, true, p.off, x, p.h, 2 * p.inter, j, 0, lane, acc, acc2, 1.f); \
-            gv[0] = simd_sum(acc[0]); gv[1] = simd_sum(acc[1]); uv[0] = simd_sum(acc2[0]); uv[1] = simd_sum(acc2[1]); \
-        } \
-        if (lane == 0) \
-            for (uint i = 0; i < 2 && j + i < p.inter; i++) { \
-                float gg = gv[i] * e.factor, uu = uv[i] * e.factor; \
-                float cu = p.cap_u > 0.f ? p.cap_u * precise::tanh(uu / p.cap_u) : uu; \
-                a[p.act + ((ulong)ti * p.k + s) * p.inter + j + i] = p.cap_g * precise::tanh(gg / p.cap_g) / (1.f + exp(-gg)) * cu; \
-            } \
+        uint asn = asg[st + q]; \
+        NAME##_pair_one(a, e, p, j, kp, sg, lane, asn / p.k, asn % p.k, red); \
     } } \
 kernel void NAME##_gsum(device float* a [[buffer(0)]], device const IXT* tab [[buffer(1)]], constant IXP& p [[buffer(2)]], \
                         constant uint2& gq [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]], \
                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
-    uint r = (tg.x * 4 + sg) * 2; \
+    threadgroup float red[4 * 4 * INK_XR]; \
+    uint r = (tg.x * (4 / INK_XK) + sg / INK_XK) * INK_XR, kp = sg % INK_XK; \
     device const uint* g = (device const uint*)(a + gq.x); \
     device const uint* asg = (device const uint*)(a + gq.y); \
-    if (r >= p.h || tg.y >= g[0]) return; \
+    if (tg.y >= g[0]) return; \
     uint ge = g[1 + 3 * tg.y], cnt = g[2 + 3 * tg.y], st = g[3 + 3 * tg.y]; \
     IXT e = tab[ge]; \
     T f = MAKE(e, p.inter); \
     for (uint q = 0; q < cnt; q++) { \
         uint asn = asg[st + q], ti = asn / p.k, s = asn % p.k; \
-        float acc[2] = { 0.f, 0.f }, acc2[2] = { 0.f, 0.f }; \
-        mv_acc<T, X, CH, 2, 1>(f, f, false, 0, a + p.act + (ulong)asn * p.inter, p.inter, p.h, r, 0, lane, acc, acc2, \
+        float acc[INK_XR], acc2[INK_XR]; \
+        for (uint i = 0; i < INK_XR; i++) { acc[i] = 0.f; acc2[i] = 0.f; } \
+        mv_acc<T, X, CH, INK_XR, INK_XK>(f, f, false, 0, a + p.act + (ulong)asn * p.inter, p.inter, p.h, r, kp, lane, acc, acc2, \
                                a[p.sel + (ulong)ti * 2 * p.k + p.k + s] * e.factor); \
-        float v0 = simd_sum(acc[0]), v1 = simd_sum(acc[1]); \
-        if (lane == 0) { \
+        ink_ksum(acc, INK_XR, sg, lane, red); \
+        if (lane == 0 && kp == 0) { \
             device float* y = a + p.y + (ulong)asn * p.h + r; \
-            y[0] = v0; \
-            if (r + 1 < p.h) y[1] = v1; \
+            for (uint i = 0; i < INK_XR && r + i < p.h; i++) y[i] = acc[i]; \
         } \
     } }
 

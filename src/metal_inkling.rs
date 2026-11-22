@@ -23,7 +23,7 @@
 //! rings of `window + ROLLBACK` rows by position, full-attention caches grow; the convolution
 //! rings have the host's layout.
 
-use super::decode::{FastEnc, Fns, MvFmt, MvMode, MvParams, MvWeight, encode_mv, mvk_rows, run_concurrent};
+use super::decode::{FastEnc, Fns, MvFmt, MvMode, MvParams, MvWeight, begin_enc, encode_mv, end_timed, mvk_rows, run_concurrent};
 use super::{GGUF_GPU_TYPES, Id, IntoInnerUnsafe, MetalBackend, MetalWeight, MsgNewBufLen, MsgVoid};
 use crate::ggml::GgmlType;
 use crate::gpu::WeightRef;
@@ -34,6 +34,124 @@ use crate::model::Lin;
 use std::fmt::Write as _;
 
 const SRC: &str = include_str!("metal_inkling.metal");
+
+/// Dispatches and barriers encoded so far (`OXINFER_INKLING_PROFILE` reports them per pass).
+static DISPATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static BARRIERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// `OXINFER_INKLING_PROFILE=N`: passes of up to [`MAX_T`] tokens run cut at every barrier, each
+/// stage in a command buffer of its own, and every N passes (default 16) the GPU time per kernel
+/// of a pass is printed with the dispatch and barrier counts (slow: for profiling).
+fn profile_every() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| match std::env::var("OXINFER_INKLING_PROFILE") {
+        Ok(v) => v.parse().unwrap_or(16).max(1),
+        Err(_) => 0,
+    })
+}
+
+/// A profile in progress: the command buffer being encoded, the pipelines of its stage, the
+/// GPU time per kind of stage (its sorted pipelines), the buffers each encoder makes resident.
+struct Prof<'f> {
+    be: &'static MetalBackend,
+    f: &'f Fns,
+    res: &'f [Id],
+    cb: std::cell::Cell<Id>,
+    stage: std::cell::RefCell<Vec<usize>>,
+    times: std::cell::RefCell<std::collections::HashMap<Vec<usize>, (f64, usize)>>,
+}
+
+/// The encoder of a pass: the decode library's, counting what it encodes; in a profile it is
+/// cut at every barrier ([`Prof`]).
+struct Pe<'f> {
+    enc: std::cell::Cell<Id>,
+    f: &'f Fns,
+    prof: Option<&'f Prof<'f>>,
+}
+
+impl<'f> Pe<'f> {
+    fn new(e: &FastEnc<'f>, prof: Option<&'f Prof<'f>>) -> Self {
+        Pe {
+            enc: std::cell::Cell::new(e.enc),
+            f: e.f,
+            prof,
+        }
+    }
+    fn fe(&self) -> FastEnc<'f> {
+        FastEnc {
+            enc: self.enc.get(),
+            f: self.f,
+        }
+    }
+    /// Notes a pipeline set by another encoding function (for the profile).
+    fn note(&self, p: Id) {
+        if let Some(pr) = self.prof {
+            pr.stage.borrow_mut().push(p as usize);
+        }
+    }
+    fn pipe(&self, p: Id) {
+        self.note(p);
+        self.fe().pipe(p);
+    }
+    fn buf(&self, b: Id, offset: usize, index: usize) {
+        self.fe().buf(b, offset, index);
+    }
+    fn bytes<T>(&self, v: &T, index: usize) {
+        self.fe().bytes(v, index);
+    }
+    fn dispatch(&self, groups: (usize, usize), threads: usize) {
+        DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.fe().dispatch(groups, threads);
+    }
+    fn dispatch3(&self, groups: (usize, usize, usize), threads: usize) {
+        DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.fe().dispatch3(groups, threads);
+    }
+    fn use_resources(&self, ids: &[Id]) {
+        self.fe().use_resources(ids);
+    }
+    fn barrier(&self) {
+        BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match self.prof {
+            None => self.fe().barrier(),
+            Some(pr) => self.cut(pr),
+        }
+    }
+    /// Profiles: ends the stage's command buffer, times it, and starts the next one.
+    fn cut(&self, pr: &Prof) {
+        let mut st = std::mem::take(&mut *pr.stage.borrow_mut());
+        if st.is_empty() {
+            return;
+        }
+        let g = end_timed(pr.be, pr.f, pr.cb.get(), self.enc.get());
+        st.sort_unstable();
+        st.dedup();
+        let mut t = pr.times.borrow_mut();
+        let v = t.entry(st).or_insert((0.0, 0));
+        v.0 += g;
+        v.1 += 1;
+        let (cb, enc) = begin_enc(pr.be, pr.f);
+        pr.cb.set(cb);
+        self.enc.set(enc);
+        self.use_resources(pr.res);
+    }
+}
+
+/// The grouped expert kernels' outputs per SIMD-group and SIMD-groups per output (`INK_XR`,
+/// `INK_XK`; `OXINFER_INKLING_XRK=R,K` for kernel work).
+fn xrk() -> (usize, usize) {
+    static V: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("OXINFER_INKLING_XRK")
+            .ok()
+            .and_then(|v| {
+                let (r, k) = v.split_once(',')?;
+                Some((r.parse().ok()?, k.parse().ok()?))
+            })
+            .filter(|&(r, k): &(usize, usize)| (1..=4).contains(&r) && matches!(k, 1 | 2 | 4))
+            .unwrap_or((1, 1))
+    })
+}
 
 /// Tokens of a prefill pass at most (longer ones run in pieces), and their key splits.
 const PF_T: usize = 512;
@@ -144,8 +262,9 @@ fn expert_formats() -> Vec<(String, String, &'static str, usize, String)> {
 /// the prefill kernels too. `OXINFER_INKLING_METAL=FILE` takes the kernels from a file (kernel
 /// work).
 pub(crate) fn shader_src(mma: bool) -> String {
+    let (xr, xk) = xrk();
     let mut s = format!(
-        "{}{}{}#define MVK_GROUP 4\n{}",
+        "#define INK_XR {xr}\n#define INK_XK {xk}\n{}{}{}#define MVK_GROUP 4\n{}",
         super::SHADER_SRC,
         super::gguf_shader_tables(),
         super::GGUF_SHADER_SRC,
@@ -1810,7 +1929,7 @@ impl InkMetal {
     /// `y = W x` for `t` tokens: the one-token matvec, the exact multi-token ones (up to 16), and
     /// in prefill passes the matrix-unit GEMM (or the multi-token matvecs 16 tokens at a time).
     #[allow(clippy::too_many_arguments)]
-    fn mv(&self, e: &FastEnc, c: &Cx, d: &Dw, x: usize, y: usize, t: usize, mode: MvMode) {
+    fn mv(&self, e: &Pe, c: &Cx, d: &Dw, x: usize, y: usize, t: usize, mode: MvMode) {
         self.mv_base(e, c, d, x, y, t, mode);
         // The LoRA updates beside it: `u = A x`, then `y += s Bt u` once the matvec wrote y.
         for l in &d.lora {
@@ -1871,11 +1990,12 @@ impl InkMetal {
 
     /// [`Self::mv`] without the LoRA updates.
     #[allow(clippy::too_many_arguments)]
-    fn mv_base(&self, e: &FastEnc, c: &Cx, d: &Dw, x: usize, y: usize, t: usize, mode: MvMode) {
+    fn mv_base(&self, e: &Pe, c: &Cx, d: &Dw, x: usize, y: usize, t: usize, mode: MvMode) {
         let a = c.a;
         if t == 1 {
             let (pipe, nr, ks) = d.one;
-            encode_mv(e, pipe, nr, ks, &d.w, None, (a, x * 4), (a, y * 4), mode, (a, 0));
+            e.note(pipe);
+            encode_mv(&e.fe(), pipe, nr, ks, &d.w, None, (a, x * 4), (a, y * 4), mode, (a, 0));
             return;
         }
         if t > MAX_T {
@@ -1941,7 +2061,7 @@ impl InkMetal {
     /// Rows of `x` (`n` floats each) to the GEMM scratch as scaled half rows (`rows` of them,
     /// the tile padding included).
     #[allow(clippy::too_many_arguments)]
-    fn x_half(&self, e: &FastEnc, c: &Cx, pf: &PfBufs, pp: &PfPipes, x: usize, n: usize, rows: usize) {
+    fn x_half(&self, e: &Pe, c: &Cx, pf: &PfBufs, pp: &PfPipes, x: usize, n: usize, rows: usize) {
         #[repr(C)]
         struct Xh {
             n: u32,
@@ -1970,7 +2090,7 @@ impl InkMetal {
     #[allow(clippy::too_many_arguments)]
     fn gemm(
         &self,
-        e: &FastEnc,
+        e: &Pe,
         c: &Cx,
         g: &Gemm,
         pf: &PfBufs,
@@ -2020,14 +2140,14 @@ impl InkMetal {
         e.dispatch((n_out / tn, rows / tm), 128);
     }
 
-    fn std(&self, e: &FastEnc, c: &Cx, pipe: Id) {
+    fn std(&self, e: &Pe, c: &Cx, pipe: Id) {
         e.pipe(pipe);
         e.buf(c.a, 0, 0);
         e.buf(self.consts, 0, 1);
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn mix(&self, e: &FastEnc, c: &Cx, states: &[usize], x: usize, q: usize, nq: usize, out: usize, norm: Option<usize>, t: usize) {
+    fn mix(&self, e: &Pe, c: &Cx, states: &[usize], x: usize, q: usize, nq: usize, out: usize, norm: Option<usize>, t: usize) {
         let mut p = MixP {
             h: self.h as u32,
             ns: states.len() as u32,
@@ -2051,7 +2171,7 @@ impl InkMetal {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn norm(&self, e: &FastEnc, c: &Cx, x: usize, out: usize, w: Option<usize>, eps: f32, xs: usize, os: usize, t: usize) {
+    fn norm(&self, e: &Pe, c: &Cx, x: usize, out: usize, w: Option<usize>, eps: f32, xs: usize, os: usize, t: usize) {
         let p = NormP {
             h: self.h as u32,
             eps,
@@ -2068,7 +2188,7 @@ impl InkMetal {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn copy(&self, e: &FastEnc, c: &Cx, src: usize, dst: usize, n: usize, ds: usize, t: usize) {
+    fn copy(&self, e: &Pe, c: &Cx, src: usize, dst: usize, n: usize, ds: usize, t: usize) {
         let p = CopyP {
             n: n as u32,
             src: src as u32,
@@ -2083,7 +2203,7 @@ impl InkMetal {
 
     /// Message gates `which` (gate index, input, norm weights, output) with messages `msgs + i`:
     /// the gated inputs RMS-normed into the outputs.
-    fn gates(&self, e: &FastEnc, c: &Cx, g: &[GateDev; 4], which: &[(usize, usize, usize, usize)], t: usize) {
+    fn gates(&self, e: &Pe, c: &Cx, g: &[GateDev; 4], which: &[(usize, usize, usize, usize)], t: usize) {
         let (h, th) = (self.h, c.b.tm * self.h);
         let b = c.b;
         for &(i, src, _, _) in which {
@@ -2218,7 +2338,7 @@ impl InkMetal {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn conv(&self, e: &FastEnc, c: &Cx, x: usize, out: usize, taps: usize, ring: Id, pos: usize, add: bool, t: usize) {
+    fn conv(&self, e: &Pe, c: &Cx, x: usize, out: usize, taps: usize, ring: Id, pos: usize, add: bool, t: usize) {
         let p = ConvP {
             h: self.h as u32,
             kn: self.kn as u32,
@@ -2241,7 +2361,7 @@ impl InkMetal {
 
     /// The raw inputs `x` (`ch` floats per token) of the last tokens into a ring (prefill).
     #[allow(clippy::too_many_arguments)]
-    fn ring_store(&self, e: &FastEnc, c: &Cx, x: usize, ch: usize, ring: Id, pos: usize, t: usize) {
+    fn ring_store(&self, e: &Pe, c: &Cx, x: usize, ch: usize, ring: Id, pos: usize, t: usize) {
         let pp = self.pfp.as_ref().expect("prefill kernels");
         #[repr(C)]
         struct P {
@@ -2272,7 +2392,7 @@ impl InkMetal {
     }
 
     /// The final mix, and the LM head with its cap over the last `head_rows` tokens.
-    fn enc_final(&self, e: &FastEnc, c: &Cx, t: usize, capture: &[usize], head_rows: usize) {
+    fn enc_final(&self, e: &Pe, c: &Cx, t: usize, capture: &[usize], head_rows: usize) {
         let (h, b) = (self.h, c.b);
         if self.capture(e, c, self.plan.len(), t, capture) {
             e.barrier();
@@ -2320,7 +2440,7 @@ impl InkMetal {
     }
 
     /// Copies the stream into the capture rows of the steps listed (true if any).
-    fn capture(&self, e: &FastEnc, c: &Cx, si: usize, t: usize, capture: &[usize]) -> bool {
+    fn capture(&self, e: &Pe, c: &Cx, si: usize, t: usize, capture: &[usize]) -> bool {
         let (h, nf) = (self.h, capture.len());
         let mut any = false;
         for (k, _) in capture.iter().enumerate().filter(|x| *x.1 == si) {
@@ -2332,7 +2452,7 @@ impl InkMetal {
 
     /// A step's attention half and its routing (everything before the experts).
     #[allow(clippy::too_many_arguments)]
-    fn enc_attn(&self, e: &FastEnc, c: &Cx, si: usize, t: usize, pos: usize, dev: &InkDev, capture: &[usize]) {
+    fn enc_attn(&self, e: &Pe, c: &Cx, si: usize, t: usize, pos: usize, dev: &InkDev, capture: &[usize]) {
         let (h, th) = (self.h, c.b.tm * self.h);
         let b = c.b;
         let sp = &self.plan[si];
@@ -2397,7 +2517,7 @@ impl InkMetal {
         e.barrier();
         let pf = c.b.pf.is_some() && t > MAX_T;
         // (Prefill GEMMs share one half-row scratch: one at a time.)
-        let sep = |e: &FastEnc| {
+        let sep = |e: &Pe| {
             if pf {
                 e.barrier();
             }
@@ -2680,7 +2800,7 @@ impl InkMetal {
 
     /// The router's logits of `hn` (the f32 GEMM in prefill passes, else a SIMD-group per
     /// expert) and the routing into `sel` (a pass of one token also gets its expert groups).
-    fn route(&self, e: &FastEnc, c: &Cx, ld: &LayerDev, t: usize) {
+    fn route(&self, e: &Pe, c: &Cx, ld: &LayerDev, t: usize) {
         let (h, b) = (self.h, c.b);
         match &self.pfp {
             Some(pp) if t > MAX_T => {
@@ -2712,7 +2832,15 @@ impl InkMetal {
             }
         }
         e.barrier();
-        let ro = RouteP {
+        self.std(e, c, self.p.route);
+        e.bytes(&self.route_params(c, ld, t), 2);
+        e.dispatch((t, 1), self.ne.next_multiple_of(32));
+        e.barrier();
+    }
+
+    fn route_params(&self, c: &Cx, ld: &LayerDev, t: usize) -> RouteP {
+        let b = c.b;
+        RouteP {
             n: self.ne as u32,
             k: self.topk as u32,
             logits: b.rlog as u32,
@@ -2723,16 +2851,12 @@ impl InkMetal {
             grp: b.grp as u32,
             asg: b.asg as u32,
             ..Default::default()
-        };
-        self.std(e, c, self.p.route);
-        e.bytes(&ro, 2);
-        e.dispatch((t, 1), self.ne.next_multiple_of(32));
-        e.barrier();
+        }
     }
 
     /// A step's experts (one token at a time) and the convolution after them.
     #[allow(clippy::too_many_arguments)]
-    fn enc_moe(&self, e: &FastEnc, c: &Cx, si: usize, t: usize, pos: usize, dev: &InkDev, grouped: bool) {
+    fn enc_moe(&self, e: &Pe, c: &Cx, si: usize, t: usize, pos: usize, dev: &InkDev, grouped: bool) {
         let (h, b) = (self.h, c.b);
         let sp = &self.plan[si];
         let ld = &self.layers[sp.layer];
@@ -2788,7 +2912,7 @@ impl InkMetal {
             e.bytes(&xp, 2);
             e.bytes(&gq, 3);
             if !self.skip(SK_EXP) {
-                e.dispatch((self.inter.div_ceil(8), n), 128);
+                e.dispatch((self.inter.div_ceil(4 * xrk().0 / xrk().1), n), 128);
             }
             e.barrier();
             e.pipe(ld.exp.gsum);
@@ -2797,7 +2921,7 @@ impl InkMetal {
             e.bytes(&xp, 2);
             e.bytes(&gq, 3);
             if !self.skip(SK_EXP) {
-                e.dispatch((h.div_ceil(8), n), 128);
+                e.dispatch((h.div_ceil(4 * xrk().0 / xrk().1), n), 128);
             }
             e.barrier();
             if ld.exp.xlora.is_none() {
@@ -2887,7 +3011,7 @@ impl InkMetal {
     /// The down projections' LoRA updates of the routed experts, added to `o`: per (token, slot)
     /// from `act`, or with `rows` (prefill: the grouped rows, their experts and half
     /// activations) from those.
-    fn xlora(&self, e: &FastEnc, c: &Cx, xl: &XLora, t: usize, rows: Option<(usize, &PfBufs)>) {
+    fn xlora(&self, e: &Pe, c: &Cx, xl: &XLora, t: usize, rows: Option<(usize, &PfBufs)>) {
         let (h, k, mi) = (self.h, self.topk, self.inter);
         #[repr(C)]
         struct Pa {
@@ -2984,7 +3108,7 @@ impl InkMetal {
     /// as in the arena): the tokens of each expert gathered into tiles, gate / up GEMMs, SiTU,
     /// down GEMMs, and the weighted sum into `o`.
     #[allow(clippy::too_many_arguments)]
-    fn enc_grouped(&self, e: &FastEnc, c: &Cx, si: usize, t: usize, gr: &Grouped, pb: &PfBufs, pp: &PfPipes, sel: &[f32]) {
+    fn enc_grouped(&self, e: &Pe, c: &Cx, si: usize, t: usize, gr: &Grouped, pb: &PfBufs, pp: &PfPipes, sel: &[f32]) {
         let (h, mi, k) = (self.h, self.inter, self.topk);
         let base = self.f.contents(c.a);
         let ld = &self.layers[self.plan[si].layer];
@@ -3149,6 +3273,7 @@ impl InkMetal {
                 _ => Vec::new(),
             };
             let (r, _) = run_concurrent(self.be, &self.f, std::slice::from_ref(&(0..1)), |e, _| {
+                let e = &Pe::new(e, None);
                 e.use_resources(indirect);
                 if let Some(p) = prev {
                     let gr = self.layers[self.plan[p].layer].exp.grouped.as_ref();
@@ -3169,6 +3294,101 @@ impl InkMetal {
             }
         }
         ok
+    }
+
+    /// A pass of up to [`MAX_T`] tokens as `run` encodes it, cut at every barrier and timed
+    /// stage by stage (`OXINFER_INKLING_PROFILE`); prints the time per kernel every few passes.
+    #[allow(clippy::too_many_arguments)]
+    fn run_profiled(&self, c: &Cx, t: usize, pos: usize, dev: &InkDev, capture: &[usize], head_rows: usize, res: &[Id]) -> bool {
+        type Acc = (usize, usize, usize, Vec<(Vec<usize>, f64, usize)>);
+        static ACC: std::sync::Mutex<Acc> = std::sync::Mutex::new((0, 0, 0, Vec::new()));
+        let pool = unsafe { (self.be.sels.pool_push)() };
+        let (cb, enc) = begin_enc(self.be, &self.f);
+        let pr = Prof {
+            be: self.be,
+            f: &self.f,
+            res,
+            cb: std::cell::Cell::new(cb),
+            stage: Default::default(),
+            times: Default::default(),
+        };
+        let fe = FastEnc { enc, f: &self.f };
+        let e = Pe::new(&fe, Some(&pr));
+        e.use_resources(res);
+        let (d0, b0) = (
+            DISPATCHES.load(std::sync::atomic::Ordering::Relaxed),
+            BARRIERS.load(std::sync::atomic::Ordering::Relaxed),
+        );
+        for si in 0..=self.plan.len() {
+            if si == self.plan.len() {
+                self.enc_final(&e, c, t, capture, head_rows);
+            } else {
+                self.enc_attn(&e, c, si, t, pos, dev, capture);
+                self.enc_moe(&e, c, si, t, pos, dev, false);
+            }
+        }
+        pr.stage.borrow_mut().push(0);
+        e.cut(&pr);
+        end_timed(self.be, &self.f, pr.cb.get(), e.enc.get());
+        unsafe { (self.be.sels.pool_pop)(pool) };
+        let mut acc = ACC.lock().unwrap_or_else(|p| p.into_inner());
+        acc.0 += 1;
+        acc.1 += DISPATCHES.load(std::sync::atomic::Ordering::Relaxed) - d0;
+        acc.2 += BARRIERS.load(std::sync::atomic::Ordering::Relaxed) - b0;
+        for (k, (g, n)) in pr.times.into_inner() {
+            match acc.3.iter_mut().find(|x| x.0 == k) {
+                Some(x) => (x.1, x.2) = (x.1 + g, x.2 + n),
+                None => acc.3.push((k, g, n)),
+            }
+        }
+        if acc.0 >= profile_every() {
+            let names: std::collections::HashMap<usize, String> = library(self.be)
+                .map(|l| {
+                    l.pipes
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .iter()
+                        .map(|(k, v)| (*v, k.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let passes = acc.0 as f64;
+            let mut rows: Vec<(String, f64, f64)> = acc
+                .3
+                .iter()
+                .map(|(k, g, n)| {
+                    let label: Vec<String> = k
+                        .iter()
+                        .filter(|&&p| p != 0)
+                        .map(|p| names.get(p).cloned().unwrap_or_else(|| format!("matvec@{:x}", p & 0xffff)))
+                        .collect();
+                    (label.join("+"), g / passes * 1e6, *n as f64 / passes)
+                })
+                .collect();
+            // (One kind of stage: the same kernels, whatever their pipelines' variants.)
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            rows.dedup_by(|a, b| {
+                a.0 == b.0 && {
+                    b.1 += a.1;
+                    b.2 += a.2;
+                    true
+                }
+            });
+            rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+            let total: f64 = rows.iter().map(|r| r.1).sum();
+            eprintln!(
+                "[inkling profile: {} passes of {t} token(s); per pass {:.0} dispatches, {:.0} barriers, {:.0} us of GPU time in its stages]",
+                acc.0,
+                acc.1 as f64 / passes,
+                acc.2 as f64 / passes,
+                total
+            );
+            for (l, us, n) in rows.iter().take(40) {
+                eprintln!("  {us:8.1} us {:5.1}%  {n:6.1} stages  {l}", us / total * 100.0);
+            }
+            *acc = (0, 0, 0, Vec::new());
+        }
+        true
     }
 }
 
@@ -3275,18 +3495,23 @@ impl DevEngine for InkMetal {
                 // encoded.
                 let parts: Vec<std::ops::Range<usize>> = (0..steps).step_by(8).map(|s| s..(s + 8).min(steps)).collect();
                 let indirect = if self.be.residency.is_some() { &[][..] } else { &self.indirect[..] };
-                run_concurrent(self.be, &self.f, &parts, |e, r| {
-                    e.use_resources(indirect);
-                    for si in r {
-                        if si == self.plan.len() {
-                            self.enc_final(e, &c, n, capture, head_rows);
-                        } else {
-                            self.enc_attn(e, &c, si, n, pos, dev, capture);
-                            self.enc_moe(e, &c, si, n, pos, dev, false);
+                if profile_every() > 0 {
+                    self.run_profiled(&c, n, pos, dev, capture, head_rows, indirect)
+                } else {
+                    run_concurrent(self.be, &self.f, &parts, |e, r| {
+                        let e = &Pe::new(e, None);
+                        e.use_resources(indirect);
+                        for si in r {
+                            if si == self.plan.len() {
+                                self.enc_final(e, &c, n, capture, head_rows);
+                            } else {
+                                self.enc_attn(e, &c, si, n, pos, dev, capture);
+                                self.enc_moe(e, &c, si, n, pos, dev, false);
+                            }
                         }
-                    }
-                })
-                .0
+                    })
+                    .0
+                }
             };
             if !ok {
                 panic!("Metal: an Inkling-2 pass failed (OXINFER_GPU_PLAN_DEBUG=1 says why)");

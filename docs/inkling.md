@@ -476,7 +476,10 @@ decoding is plain.
 `OXINFER_GPU_DECODE=0` (or `--gpu-decode off`) keeps the passes on the CPU,
 `OXINFER_INKLING_PREFILL=0` the prefill passes; `OXINFER_GPU_DECODE_CHECK=1` runs each decode
 step on the CPU too and prints the difference; `OXINFER_INKLING_SKIP=dense,attn,exp,...` leaves
-kinds of ops out (measurements only). The kernels compile on first use (about 1.5 s, cached by
+kinds of ops out (measurements only); `OXINFER_INKLING_PROFILE=N` runs the passes of up to 16
+tokens stage by stage and prints the GPU time per kind of stage and the dispatch and barrier
+counts every N passes (slow: profiling only); `OXINFER_INKLING_XRK=R,K` sets the grouped expert
+kernels' outputs per SIMD-group and SIMD-groups per output (default 1,1; kernel work). The kernels compile on first use (about 1.5 s, cached by
 the system after).
 
 **Correctness.** Against transformers float32 on the release (the 24-token chat prompt and 16
@@ -499,24 +502,24 @@ the logits by up to 4.2), and its decode steps the CPU's top token at every step
 
 ## Speed
 
-18-core M5 Max (128 GB, Apple10 GPU with matrix units), shared with other jobs (load averages 6-12
-for the table below; an image-generation job of another session used the GPU at times, so the
-same run moved by 10-20% between repeats). oxinfer: `examples/inkling2_bench` on the engine API
-(as `llama-bench`: a prompt of N random tokens into a fresh session, N tokens generated after a
+18-core M5 Max (128 GB, Apple10 GPU with matrix units), shared with other jobs (load averages
+2-4 for the table below, no other GPU job; at load 6-12 with another session's image jobs on the
+GPU the same runs were 10-25% slower). oxinfer: `examples/inkling2_bench` on the engine API (as
+`llama-bench`: a prompt of N random tokens into a fresh session, N tokens generated after a
 1-token prompt, after a warm-up pass of each, the median of 3 runs; f32 KV caches); llama.cpp:
 `llama-bench -p 512,2048 -n 128 -r 3 -fa 1` (master of 2026-11-21, Metal, its default f16
 caches), interleaved model by model. tok/s:
 
 | Checkpoint | engine | pp512 | pp2048 | tg128 |
 |---|---|---:|---:|---:|
-| ggml-org Q8_0 (27.8 GB) | llama.cpp, Metal | 996 | 822 | 36.5 |
-| | **oxinfer, Metal** | **1542** | **1346** | **49.1** |
+| ggml-org Q8_0 (27.8 GB) | llama.cpp, Metal | 1002 | 860 | 38.3 |
+| | **oxinfer, Metal** | **1603** | **1408** | **58.7** |
 | | oxinfer, CPU (a 2456-token prompt, measured before) | 116 | | 17.1 |
-| AtomicChat AD-Q4_K (16.5 GB) | llama.cpp, Metal | 1000 | 715 | 39.9 |
-| | **oxinfer, Metal** | **1701** | **1252** | **54.2** |
-| release (NVFP4 / MXFP8 experts, bf16 dense; 19.5 GB) | oxinfer, Metal | 1646 | 1243 | 46.8 |
-| unsloth UD-IQ3_XXS (11.7 GB) | oxinfer, Metal | 1692 | 1211 | 55.5 |
-| mlx-community 4bit (17.3 GB) | **oxinfer, Metal** | **1658** | **1349** | **54.4** |
+| AtomicChat AD-Q4_K (16.5 GB) | llama.cpp, Metal | 1010 | 793 | 40.6 |
+| | **oxinfer, Metal** | **1751** | **1418** | **62.4** |
+| release (NVFP4 / MXFP8 experts, bf16 dense; 19.5 GB) | oxinfer, Metal | 1856 | 1359 | 55.6 |
+| unsloth UD-IQ3_XXS (11.7 GB) | oxinfer, Metal | 1751 | 1333 | 65.6 |
+| mlx-community 4bit (17.3 GB) | **oxinfer, Metal** | **1808** | **1521** | **70.4** |
 | | mlx-lm (PR 2086), MLX 0.32.4 | 1387-1490 | 1056-1440 | 29-35 |
 | mlx-community oQ4e-mtp (16.9 GB) | oMLX 0.8.2, its MTP off / on | 1164-1452 | 912-1127 | 30-35 / 25-42 |
 
@@ -527,19 +530,48 @@ placeholder rows; llama.cpp `-d 8192,32768 -n 32`), Q8_0:
 
 | | 8k | 32k |
 |---|---:|---:|
-| llama.cpp (f16 caches) | 35.3 | 32.6 |
-| oxinfer, f32 caches | 46.4 | 40.1 |
-| oxinfer, f16 caches | 47.6 | 43.9 |
+| llama.cpp (f16 caches) | 34.9 | 34.2 |
+| oxinfer, f32 caches | 54.5 | 46.3 |
+| oxinfer, f16 caches | 56.1 | 51.0 |
 
-A decoded token reads 5.1 GB of Q8_0 (48 layer applications, 8 routed experts each, the LM
-head): 49 tok/s is ~250 GB/s. Skipping kinds of ops (`OXINFER_INKLING_SKIP`) shows the routed
-experts take a third of a step's GPU time at Q8_0, the dense matmuls an eighth, attention, the
-residual mixes and the loop's gates a few percent each; at 4 bits (2.7-2.9 GB a token) the
-small kernels between the matmuls (about 15 dependent stages per layer application, 24 per
-looped one) leave decoding at 54-59 tok/s rather than the 100+ of the bytes alone. Verification
-passes (speculative decoding) cost 1.6-1.9x a step at 4 tokens (Q8_0: 18-20 ms for 1 token,
-31-33 ms for 4; the experts of a pass are grouped so that a shared one is read once, but most of
-a pass's 32 choices differ).
+**Where a step's time goes.** A decoded token reads 5.1 GB of Q8_0 (48 layer applications, 8
+routed experts each, the LM head), 2.7-2.9 GB at 4 bits. Leaving kinds of ops out
+(`OXINFER_INKLING_SKIP`, the GPU time of a step, load 3) gives, in ms per token:
+
+| | step | routed experts | dense matmuls | LM head | attention | loop gates | mixes | convolutions, routing | dispatch / barrier floor |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Q8_0 | 17.1 | 6.7 | 2.7 | 0.9 | 1.9 | 1.4 | 1.1 | 0.8 | 1.8 |
+| mlx-community 4bit | 14.4 | 5.3 | 1.9 | 0.45 | 1.8 | 1.3 | 1.05 | 0.6 | 1.65 |
+
+At Q8_0 the experts and the dense matmuls stream at about 480 GB/s and the head at 540 GB/s,
+near what this GPU reads, so a Q8_0 step cannot go much below 11 ms (about 90 tok/s). At 4 bits the
+experts reach only about 300 GB/s and a third of the step is the small kernels between the
+matmuls: a step has 941 dispatches in 805 dependent stages (`OXINFER_INKLING_PROFILE=N` counts
+them and times each kind of stage in a command buffer of its own; 12 stages per layer
+application, 21 with the loop's message gates), and with every kernel left out the barriers
+alone take 1.65-1.9 ms. Measured here: the expert kernels gain from more, smaller SIMD-groups (one
+output each: +3%; two to eight outputs per SIMD-group, or an output's inputs split over two to four
+SIMD-groups, were 1-10% slower; spreading a SIMD-group's (output, chunk) items evenly over its
+lanes was 15% slower), NVFP4 decoded with half-precision bit tricks rather than a table lookup
+(+3%); folding the routing into the first expert kernel (one stage less per layer) cost 7%, since
+each of its 1152 threadgroups then ranks the 128 scores again.
+
+**Verification passes** (speculative decoding) do not cost one step: a pass of n tokens reads the
+experts of every token, and n tokens choosing 8 of 128 experts each share few of them (4 tokens
+read about 26-29 distinct experts). mlx-community 4bit, ms per pass:
+
+| tokens | 1 | 2 | 3 | 4 | 6 | 8 | 12 | 16 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| pass | 14.0 | 18.9 | 23.1 | 27.3 | 37.2 | 46.0 | 65.3 | 85.4 |
+| without the routed experts | 9.4 | 11.2 | 12.4 | 13.7 | 17.5 | 20.4 | 27.2 | 34.6 |
+
+The experts add about 3.1 ms a token (4.6 ms for the first); the rest grows by 0.4-1.6 ms a token,
+mostly the multi-token matvecs (dense, head and gates: 2.1, 0.5 and 1.3 ms for one token, 14.6,
+5.4 and 7.6 for 16), which decode each weight chunk once for four tokens but load every token's
+input chunk once per output row pair (more rows per SIMD-group spill registers: twice slower).
+A round of 3 drafts accepted at 50% (2.5 tokens) therefore costs about 32 ms (27 ms of verification,
+4-5 of drafting) against 35 ms of plain steps: drafting pays on code, about breaks even on prose
+and chat (see below).
 
 **The 125 tok/s and 1750 tok/s figures** reported for Inkling-2-Mini on a 48 GB M5 Max with EXO
 could not be traced or reproduced: EXO's model cards (`exo-explore/exo`, main of 2026-11-06)
@@ -552,7 +584,7 @@ oMLX (the only MLX engine with the release's drafter, on by default for `-mtp` c
 block 8, depth 7) reaches 37-42 tok/s on code (63-65% of drafts accepted) and 25-31 on prose
 (45-51%). 125 tok/s of plain decoding is not plausible on this chip (the best published
 single-token figures for the model are about 46 tok/s on an M5 Max); 1750 tok/s of prefill is
-(mlx-swift-lm reports 1834-1852 on an M5 Max; oxinfer: 1542-1701 at pp512).
+(mlx-swift-lm reports 1834-1852 on an M5 Max; oxinfer: 1603-1856 at pp512 at load 3, 1542-1701 at load 6-12).
 
 ## Speculative decoding
 
