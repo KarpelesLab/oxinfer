@@ -5,6 +5,7 @@ processor and model on the same inputs as oxinfer and compares with its dumps.
 usage: ref_vl.py MODEL_DIR [--image F]... [--video FRAMES_DIR]... [--frames-fps 24]
                  [--video-fps F] [--video-frames N] [--prompt TEXT] [--pil] [--dtype f32|bf16]
                  [--ours PREFIX] [--ours-logits FILE] [--ours-prompt FILE] [--generate N]
+                 [--tower [WEIGHTS.safetensors]]
 
 Videos are directories of frames (sorted image files, e.g. `ffmpeg -i clip.mp4 dir/%05d.png`),
 passed to the processor as an array with their frame rate, so it samples frames itself.
@@ -12,6 +13,10 @@ passed to the processor as an array with their frame rate, so it samples frames 
 --ours PREFIX compares oxinfer's --dump-mm files (PREFIX_pixels / _image / _vpixels / _video).
 --ours-logits compares the last-position logits (oxinfer --dump-logits, no system prompt).
 --ours-prompt compares the expanded prompt text (oxinfer --print-prompt --no-system).
+--tower runs the Qwen3.5-family vision tower alone (no language model is loaded; the tensors come
+from WEIGHTS, or from the folder's shards), in float32 and in bf16, and reports the image features
+of --ours (oxinfer --dump-mm, or examples/qwen_tower_dump.rs) against both, and bf16 against
+float32: what the reference's own bf16 arithmetic costs.
 """
 import argparse, os, sys, time
 import numpy as np
@@ -31,6 +36,7 @@ ap.add_argument("--ours")
 ap.add_argument("--ours-logits")
 ap.add_argument("--ours-prompt")
 ap.add_argument("--generate", type=int, default=0)
+ap.add_argument("--tower", nargs="?", const="", default=None)
 a = ap.parse_args()
 
 from PIL import Image
@@ -85,20 +91,6 @@ for k, v in inputs.items():
     if hasattr(v, "shape"):
         print(f"  {k}: {tuple(v.shape)} {v.dtype}" + (f" {v.tolist()}" if "grid" in k or "num_" in k else ""))
 
-dtype = torch.bfloat16 if a.dtype == "bf16" else torch.float32
-t0 = time.time()
-model = AutoModelForImageTextToText.from_pretrained(a.model, dtype=dtype).eval()
-print(f"loaded {type(model).__name__} in {time.time() - t0:.1f}s")
-if gemma and "num_frames_per_video" in inputs:
-    # transformers 5.20's Gemma4Model.forward does not pass num_frames_per_video on.
-    _gvf = model.model.get_video_features
-    _nf = inputs["num_frames_per_video"]
-
-    def _get_video_features(pixel_values_videos, video_position_ids=None, num_frames_per_video=None, **kwargs):
-        nf = _nf if num_frames_per_video is None else num_frames_per_video
-        return _gvf(pixel_values_videos, video_position_ids, nf, **kwargs)
-
-    model.model.get_video_features = _get_video_features
 
 
 def load(path, cols):
@@ -117,6 +109,62 @@ def report(name, ours, ref):
     d = np.abs(o - r)
     rel = np.linalg.norm(o - r) / max(np.linalg.norm(r), 1e-9)
     print(f"{name}: {n}x{r.shape[1]} max abs {d.max():.6f} mean abs {d.mean():.7f} rel {rel:.2e} (ref mean |x| {np.abs(r).mean():.4f})")
+
+
+if a.tower is not None:
+    import glob, json
+    from safetensors import safe_open
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
+
+    if a.tower:
+        shards = [a.tower]
+    else:
+        idx = os.path.join(a.model, "model.safetensors.index.json")
+        if os.path.exists(idx):
+            wm = json.load(open(idx))["weight_map"]
+            shards = sorted({os.path.join(a.model, f) for k, f in wm.items() if ".visual." in k or k.startswith("visual.")})
+        else:
+            shards = sorted(glob.glob(os.path.join(a.model, "*.safetensors")))
+    sd = {}
+    for f in shards:
+        with safe_open(f, "pt") as st:
+            for k in st.keys():
+                if "visual." in k:
+                    sd[k.split("visual.", 1)[1]] = st.get_tensor(k)
+    print("tower tensors:", len(sd), "stored as", {str(v.dtype) for v in sd.values()})
+    pv, grid = inputs["pixel_values"], inputs["image_grid_thw"]
+    print("grid_thw:", grid.tolist())
+    if a.ours:
+        report("pixels", load(a.ours + "_pixels.bin", pv.shape[-1]), pv.reshape(-1, pv.shape[-1]).float().numpy())
+    out = {}
+    for name, dt in (("float32", torch.float32), ("bf16", torch.bfloat16)):
+        vis = Qwen3_5VisionModel(cfg.vision_config)
+        missing, unexpected = vis.load_state_dict(sd, strict=False)
+        assert not missing and not unexpected, (missing, unexpected)
+        vis = vis.to(dt).eval()
+        t0 = time.time()
+        with torch.no_grad():
+            out[name] = vis(pv.to(dt), grid_thw=grid).pooler_output.float().numpy()
+        print(f"reference tower in {name}: {time.time() - t0:.1f}s")
+        if a.ours:
+            report(f"image features, oxinfer against {name}", load(a.ours + "_image.bin", out[name].shape[1]), out[name])
+    report("image features, bf16 against float32", out["bf16"], out["float32"])
+    sys.exit(0)
+
+dtype = torch.bfloat16 if a.dtype == "bf16" else torch.float32
+t0 = time.time()
+model = AutoModelForImageTextToText.from_pretrained(a.model, dtype=dtype).eval()
+print(f"loaded {type(model).__name__} in {time.time() - t0:.1f}s")
+if gemma and "num_frames_per_video" in inputs:
+    # transformers 5.20's Gemma4Model.forward does not pass num_frames_per_video on.
+    _gvf = model.model.get_video_features
+    _nf = inputs["num_frames_per_video"]
+
+    def _get_video_features(pixel_values_videos, video_position_ids=None, num_frames_per_video=None, **kwargs):
+        nf = _nf if num_frames_per_video is None else num_frames_per_video
+        return _gvf(pixel_values_videos, video_position_ids, nf, **kwargs)
+
+    model.model.get_video_features = _get_video_features
 
 
 with torch.no_grad():

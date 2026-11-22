@@ -51,7 +51,23 @@ Against transformers 5.24 in bf16 on the CPU, on the same files:
 
 The expanded image prompt and the pixel values are identical to the processor's; the image
 features differ from the reference tower run in bf16 by 2.5% in norm (one value by 10.7, mean
-difference 0.008 for features of mean magnitude 0.32), which was not looked into further. Video
+difference 0.008 for features of mean magnitude 0.32). That is the reference's bf16 arithmetic
+through 27 blocks, not oxinfer's tower, which computes in float32 on the bf16 weights: on
+Qwen3.8-27B's tower (the one this checkpoint carries; `tools/ref_vl.py --tower` on the shard that
+holds it, transformers 5.24 on the CPU, four other images) oxinfer is within 1.2e-5 of the tower
+run in float32, and the tower run in bf16 is 2.2-4.6% from the same tower in float32:
+
+| Image (tokens) | oxinfer against float32 (rel, max) | transformers bf16 against float32 (rel, max) |
+|---|---|---|
+| 512x384 (192) | 7.1e-6, 0.003 | 2.4e-2, 8.7 |
+| 500x333 (160) | 8.3e-6, 0.003 | 3.2e-2, 9.7 |
+| 224x320 (70) | 4.9e-6, 0.001 | 2.2e-2, 6.3 |
+| 1024x1024 (1024) | 1.2e-5, 0.010 | 4.6e-2, 23.2 |
+
+The image prompt was not rerun against a float32 reference of the whole 27B model. On Qwen3.5-9B
+(the same tower shape; 512x384 image, 210 prompt tokens) the float32 reference gives image
+features within 2.1e-5, logits within 1.7e-4 and the same 32 greedy tokens, and the bf16 one
+features 7.1% apart, logits within 0.33 (KL 2e-7) and, on that prompt, the same 32 tokens. Video
 was not run on this checkpoint.
 
 What ran, each on the three text prompts unless noted (64 new tokens; CUDA takes the prefill

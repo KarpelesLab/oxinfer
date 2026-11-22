@@ -73,6 +73,10 @@ name = "qwen_vl_hidden"
 required-features = ["hf", "media"]
 
 [[example]]
+name = "qwen_tower_dump"
+required-features = ["media"]
+
+[[example]]
 name = "transcribe"
 required-features = ["hf", "media"]
 

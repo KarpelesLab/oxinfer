@@ -68,12 +68,19 @@ and model on the same files and compares with oxinfer's `--dump-mm` / `--dump-lo
 | Qwen3.5-0.8B, 6-s 480x320 video (12 frames, 900 tokens) | max 8.9e-4, rel 2.3e-5 | max diff 2.8e-4 | identical |
 | Qwen3.5-0.8B, 500x332 video (8 frames resized to 512x320) | max 6.1e-4, rel 2.8e-5 | max diff 2.2e-4 | identical |
 | Qwen3.5-0.8B, 2 images + a video (1390 tokens, 9 M-RoPE spans) | | max diff 2.2e-4 | |
-| Qwen3.5-9B tower (the 27-layer tower of 3.8-27B), CPU | max 6.0e-4, rel 1.3e-5 | | |
+| Qwen3.5-9B tower (27 layers, as 3.8-27B's), CPU | max 6.0e-4, rel 1.3e-5 | | |
 | same, Metal with the matrix units (half-precision inputs) | max 0.17, rel 2.4e-3 | | |
+| Qwen3.5-9B, 512x384 image (192 tokens), transformers 5.24 | max 1.7e-3, rel 2.1e-5 | max diff 1.7e-4 | identical (32) |
+| Qwen3.8-27B tower alone, 224x320 to 1024x1024 (4 images), transformers 5.24 | max 0.010, rel 4.9e-6 to 1.2e-5 | | |
 | Gemma 4 E2B, 500x333 image (260 soft tokens) | max 4.2e-5, rel 3.6e-6 | max diff 1.4e-4 | |
 | Gemma 4 E2B, 6-s video (32 frames, 1920 soft tokens) | max 6.7e-5, rel 3.2e-6 | max diff 1.2e-4 | identical |
 
-The pixels match bit for bit in every case, and the expanded prompts are identical. On
+The pixels match bit for bit in every case, and the expanded prompts are identical. These are
+float32 references: the same towers run by transformers in bf16 (the dtype the checkpoints are
+stored in) are themselves 2.2-4.6% (Qwen3.8-27B), 5-10% (Qwen3.5-9B) and 6-11% (Qwen3.5-0.8B) in
+norm from their float32 runs on these images, single values by up to 23, so image features
+compared with a bf16 reference differ by that much (`tools/ref_vl.py --tower` prints both; see
+[Verifying against the reference](verification.md)). On
 Qwen3.8-27B (`--quant q8`), the same video gives: "The video begins with a serene winter scene
 featuring a red fox perched on a snow-covered tree branch. [...] As the video progresses, there is
 a sudden transition to a completely different scene. The new scene is a watercolor painting of a

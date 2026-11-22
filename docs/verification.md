@@ -18,6 +18,17 @@ M=~/.cache/oxinfer/hub/Qwen--Qwen3.5-0.8B
     --ours ours --ours-logits ours.bin --ours-prompt prompt.txt --generate 40
 ```
 
+Image features are compared with the reference in float32 (`--dtype f32`, the default): run in
+bf16, transformers' 27-layer Qwen tower is 2-10% in norm from its own float32 output on the
+images tried. The tower alone, without loading a language model (`--weights` / `--tower FILE`
+when only the shard holding `model.visual.*` is on disk, the first of Qwen3.8-27B's 18), against
+the reference in both dtypes:
+
+```sh
+cargo run --release --example qwen_tower_dump -- $M fox.png ours --cpu
+./venv/bin/python tools/ref_vl.py $M --image fox.png --tower --ours ours
+```
+
 Unlimited-OCR-2 is compared with the code in its checkpoint (`tools/ref_unlimited_ocr.py`: token
 ids, pixel values, encoder features, packed embeddings, logits and the greedy reply; see
 [Unlimited-OCR-2](ocr.md#agreement-with-the-reference)):
