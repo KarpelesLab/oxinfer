@@ -320,6 +320,18 @@ char *oxi_decide_info_json(OxiEngine *engine);
  * control vectors (`direction.N`, same meaning) or torch .pt. Returns 0 or -1. */
 int oxi_engine_set_interventions(OxiEngine *engine, const char *spec_json);
 
+/* Token hook: called with the reply's `n` tokens so far each time one is committed (the new one
+ * last; once with n = 0 when a reply starts). Write up to `cap` (4096) token ids into `out` for
+ * the model to read next and return their count (0: none); sampling resumes after them. Forced
+ * tokens go through the model like sampled ones (cache, conversation, streamed text, the
+ * reply), count in max_tokens and take precedence over response_format / forced tool calls; a
+ * forced stop token ends the reply. Drafts of speculative decoding never reach the hook. Runs
+ * on the generating thread. */
+typedef size_t (*oxi_token_hook_fn)(void *user, const uint32_t *reply, size_t n, uint32_t *out, size_t cap);
+
+/* Sets the token hook of the following replies (NULL removes it). Returns 0 or -1. */
+int oxi_engine_set_token_hook(OxiEngine *engine, oxi_token_hook_fn hook, void *user);
+
 /* The LoRA adapters attached at load (lora= options) as a JSON array of {"index", "path",
  * "format" ("peft" or "gguf"), "rank", "alpha", "strength", "modules", "merged", "bytes",
  * "skipped"}. Free with oxi_string_free. */

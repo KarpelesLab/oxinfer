@@ -1447,6 +1447,8 @@ pub struct Engine {
     history: Vec<u32>,
     /// The vocabulary and compiled grammars of constrained replies ([`ChatConfig::response_format`]).
     constrain: crate::constrain::Cache,
+    /// The per-reply token hook ([`Engine::set_token_hook`]).
+    token_hook: Option<crate::token_hook::SharedHook>,
     /// The prompt cache ([`EngineOptions::prompt_cache`]), its minimum, and whether the
     /// conversation waits to be stored.
     pcache: Option<crate::snapshot::PromptCache>,
@@ -2345,6 +2347,7 @@ impl Engine {
             lookup,
             history: Vec::new(),
             constrain: Default::default(),
+            token_hook: None,
             pcache,
             pcache_min: opts.prompt_cache_min_tokens.unwrap_or(64),
             pcache_pending: false,
@@ -2420,6 +2423,7 @@ impl Engine {
             lookup: None,
             history: Vec::new(),
             constrain: Default::default(),
+            token_hook: None,
             pcache: None,
             pcache_min: 0,
             pcache_pending: false,
@@ -2700,6 +2704,24 @@ impl Engine {
     }
 
     // ---- runtime interventions (crate::intervene) ----
+
+    /// Sets the token hook of the following replies, or removes it with None
+    /// ([`crate::token_hook`]): it sees every token of a reply as it is committed and may return
+    /// tokens the model reads next (forced tokens: run through the model, kept in the cache and
+    /// the conversation, streamed and returned like sampled ones, and counted in `max_tokens`),
+    /// after which sampling resumes. Forced tokens take precedence over a constraint
+    /// ([`ChatConfig::response_format`], forced tool calls), which does not see them. A forced
+    /// stop token ends the reply. Every decoding loop follows it (plain, prompt lookup, MTP,
+    /// DSpark); the Gemma 4 drafter, which does not sample, gives way to plain decoding while a
+    /// hook is set, as for constrained replies.
+    pub fn set_token_hook(&mut self, hook: Option<Box<dyn crate::token_hook::TokenHook>>) {
+        self.token_hook = hook.map(|h| std::sync::Arc::new(std::sync::Mutex::new(h)));
+    }
+
+    /// Whether a token hook is set ([`Engine::set_token_hook`]).
+    pub fn has_token_hook(&self) -> bool {
+        self.token_hook.is_some()
+    }
 
     /// Sets the runtime interventions (neuron edits, steering, ablation, SAE features; see
     /// [`crate::intervene::Spec`]) for the following requests, or removes them with None. The
@@ -3372,6 +3394,7 @@ impl PendingTurn {
             cancel,
             lookup,
             constrain,
+            token_hook,
             ..
         } = e;
         let tok: &Tokenizer = tok;
@@ -3381,12 +3404,17 @@ impl PendingTurn {
         // What the reply must be and the log probabilities to record ride on the sampler, so
         // every decoding loop that samples through it follows them.
         let constraint = constrain.constraint(tok, *fmt, &config.response_format, &config.tool_choice, &config.tools, think, stop)?;
-        let log = sampler.set_guide(
-            constraint
-                .map(|c| Box::new(c) as Box<dyn crate::sampler::TokenFilter>)
-                .or_else(|| lm.reply_guard(&ids)),
-            config.logprobs,
-        );
+        let filter = constraint
+            .map(|c| Box::new(c) as Box<dyn crate::sampler::TokenFilter>)
+            .or_else(|| lm.reply_guard(&ids));
+        // The token hook wraps the rest: its forced tokens first.
+        let filter = match token_hook {
+            Some(h) => {
+                Some(Box::new(crate::token_hook::HookFilter::new(h.clone(), filter, usize::MAX)) as Box<dyn crate::sampler::TokenFilter>)
+            }
+            None => filter,
+        };
+        let log = sampler.set_guide(filter, config.logprobs);
         let guided = sampler.guided();
         let call_id = Some(fmt.tool_call_marker())
             .filter(|m| !m.is_empty())

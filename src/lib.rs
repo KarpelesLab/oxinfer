@@ -114,6 +114,7 @@ pub mod snapshot;
 pub mod step1x;
 pub mod step_cache;
 pub mod stream;
+pub mod token_hook;
 pub mod tokenizer;
 pub mod tools;
 pub mod torch;

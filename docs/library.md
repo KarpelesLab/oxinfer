@@ -39,6 +39,51 @@ with `lora_merge`; `Engine::loras` lists them and `Engine::set_lora_strength` ch
 [Session snapshots and the prompt cache](sessions.md#session-snapshots-and-the-prompt-cache)); prompt-lookup
 drafting is the `lookup` options ([Prompt lookup](speculative-decoding.md#prompt-lookup)).
 
+### Token hook
+
+`Engine::set_token_hook` gives the following replies a hook (`oxinfer::token_hook::TokenHook`,
+or any `FnMut(&[u32]) -> Vec<u32> + Send`) that sees each token of a reply as it is committed,
+with the reply's tokens so far, and may return tokens for the model to read next. Sampling
+resumes after them. `TokenHook::on_start` may also give a reply's first tokens.
+
+```rust
+let tok = engine.tokenizer().clone();
+let note = tok.encode(" (receipt: 4471-KX)", false)?.get_ids().to_vec();
+let mut done = false;
+engine.set_token_hook(Some(Box::new(move |reply: &[u32]| {
+    if !done && tok.decode(reply, true).unwrap_or_default().ends_with('.') {
+        done = true;
+        return note.clone();
+    }
+    Vec::new()
+})));
+```
+
+- **Forced tokens behave like sampled ones.** They go through the model, so the cache and the
+  conversation hold them and the tokens after them are conditioned on them. They are streamed
+  as deltas, returned in `Reply::tokens` and `Reply::text` (or `thinking`), counted in
+  `max_tokens`, and have log probabilities when those are asked for. A forced stop token ends
+  the reply.
+- **Every decoding loop follows the hook:** plain decoding, prompt lookup, MTP and DSpark rounds,
+  on every device. It rides on the sampler's guide, which those loops all sample through.
+  Speculative rounds may draft the queued forced tokens, but the hook only ever sees committed
+  tokens, never drafts. The Gemma 4 drafter does not sample, so it gives way to plain decoding
+  while a hook is set, as it does for constrained replies.
+- **Forced tokens take precedence over a constraint** (`response_format`, forced tool calls),
+  which does not see them.
+- **Each forced token costs one forward pass.** Lookup drafts can cover several of them.
+- **The C API's equivalent** is `oxi_engine_set_token_hook` (a callback that writes up to 4096
+  token ids per call).
+- **The server has no hook:** a hook is code, not an option.
+
+`examples/token_hook.rs` forces a note after the reply's first sentence and checks it:
+- the note's tokens come right after the trigger;
+- sampling resumes after them;
+- the next turn can quote the note.
+
+On Inkling-2-Mini Q8_0 the replies are byte-identical on CPU and CUDA, with prompt lookup on.
+It also passes on Qwen3-0.6B (CPU, CUDA, CUDA with lookup).
+
 Tokenization is in the crate too: `oxinfer::tokenizer::Tokenizer` reads HuggingFace
 `tokenizer.json` files (BPE, Unigram, WordPiece and WordLevel models with every normalizer,
 pre-tokenizer, post-processor and decoder of the format, BPE dropout, script splitting,

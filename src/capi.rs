@@ -568,6 +568,50 @@ pub unsafe extern "C" fn oxi_engine_set_interventions(e: *mut OxiEngine, spec_js
     })
 }
 
+/// Token hook ([`crate::engine::Engine::set_token_hook`]): `reply` holds the reply's `n`
+/// tokens so far (the new one last; `n` is 0 once at the start of a reply); write up to `cap`
+/// tokens to force next into `out` and return how many (0: none).
+pub type OxiTokenHookFn = Option<unsafe extern "C" fn(user: *mut c_void, reply: *const u32, n: usize, out: *mut u32, cap: usize) -> usize>;
+
+/// The most tokens one hook call may force.
+const HOOK_CAP: usize = 4096;
+
+struct CHook {
+    cb: unsafe extern "C" fn(*mut c_void, *const u32, usize, *mut u32, usize) -> usize,
+    user: *mut c_void,
+}
+// SAFETY: the caller of `oxi_engine_set_token_hook` promises the callback may run on the
+// thread that generates (as for the other callbacks).
+unsafe impl Send for CHook {}
+
+impl CHook {
+    fn call(&self, reply: &[u32]) -> Vec<u32> {
+        let mut out = vec![0u32; HOOK_CAP];
+        let n = unsafe { (self.cb)(self.user, reply.as_ptr(), reply.len(), out.as_mut_ptr(), HOOK_CAP) };
+        out.truncate(n.min(HOOK_CAP));
+        out
+    }
+}
+
+impl crate::token_hook::TokenHook for CHook {
+    fn on_token(&mut self, reply: &[u32]) -> Vec<u32> {
+        self.call(reply)
+    }
+    fn on_start(&mut self) -> Vec<u32> {
+        self.call(&[])
+    }
+}
+
+/// Sets the token hook of the following replies (NULL removes it).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_engine_set_token_hook(e: *mut OxiEngine, hook: OxiTokenHookFn, user: *mut c_void) -> c_int {
+    guard(-1, || {
+        let e = unsafe { engine(e) }?;
+        lock(e).set_token_hook(hook.map(|cb| Box::new(CHook { cb, user }) as Box<dyn crate::token_hook::TokenHook>));
+        Ok(0)
+    })
+}
+
 /// The interventions in effect as JSON (`null` when none).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxi_engine_interventions_json(e: *mut OxiEngine) -> *mut c_char {
