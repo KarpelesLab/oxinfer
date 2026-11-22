@@ -18,7 +18,8 @@ pub enum WeightRef<'a> {
     Bf16(&'a [u16]),
     Q8(&'a QMatrix),
     Q4(&'a Q4Matrix),
-    /// llama.cpp block formats: no device kernels yet, every backend declines them (CPU path).
+    /// llama.cpp block formats, read as stored (Metal and CUDA have kernels for most; a backend
+    /// declines the ones it has none for, which stay on the CPU).
     Gguf(&'a GgufMatrix),
 }
 

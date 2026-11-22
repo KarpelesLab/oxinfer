@@ -1301,6 +1301,16 @@ __device__ __forceinline__ void gemmi_any(const W& w, const GemmP& p) {
         gemm_body<K, true>(w, p);
 }
 
+// `GGML_ONLY` (the language models' decode and prefill plans, `cuda_decode.rs`): only the matvec
+// and the GEMMs of the kinds asked for.
+#ifdef GGML_ONLY
+#define KERNELS(K)                                                                                                                         \
+    extern "C" __global__ void __launch_bounds__(256) mv_##K(W w, const float* x, float* y, u32 n_in, u32 n_out, u32 xs, u32 ys, u32 mode) { \
+        mv_body<K>(w, x, y, n_in, n_out, xs, ys, mode);                                                                                    \
+    }                                                                                                                                      \
+    extern "C" __global__ void __launch_bounds__(128) gemm_##K(W w, GemmP p) { gemm_body<K, false>(w, p); }                  \
+    extern "C" __global__ void __launch_bounds__(128) gemmi_##K(W w, GemmP p) { gemmi_any<K>(w, p); }
+#else
 #define KERNELS(K)                                                                                                                         \
     extern "C" __global__ void __launch_bounds__(128) mv_##K(W w, const float* x, float* y, u32 n_in, u32 n_out, u32 xs, u32 ys, u32 mode) { \
         mv_body<K>(w, x, y, n_in, n_out, xs, ys, mode);                                                                                    \
@@ -1328,6 +1338,8 @@ __device__ __forceinline__ void gemmi_any(const W& w, const GemmP& p) {
         gate_out_##K(W wf, W wg, const float* d, const float* x, const float* m, float* out, u32 h, u32 r) {                               \
         gate_out_body<K>(wf, wg, d, x, m, out, h, r);                                                                                      \
     }
+
+#endif
 
 #ifdef HAS_0
 KERNELS(0)
@@ -1410,6 +1422,8 @@ KERNELS(201)
 #ifdef HAS_202
 KERNELS(202)
 #endif
+
+#ifndef GGML_ONLY
 
 // ---- Small ops. `info[0]` is the position of the pass's first token (read on the device, so a
 // captured decode step replays at any position).
@@ -2186,3 +2200,4 @@ extern "C" __global__ void softcap_k(const float* l, float* out, u32 v, u32 u, u
     float x = l[tok * v + c];
     out[i] = cap > 0.f ? cap * tanh_acc(x / cap) : x;
 }
+#endif // GGML_ONLY

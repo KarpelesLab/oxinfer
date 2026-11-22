@@ -338,6 +338,136 @@ struct CudaWeight {
     offsets: u64,
     gpr: u32,
     gk: u32,
+    /// A ggml block format (`WeightRef::Gguf`): its kernels, the bytes per row and the factor on
+    /// every output; `data` holds the rows as stored.
+    gg: Option<(GgKernels, u64, f32)>,
+}
+
+/// The kernels over one ggml block format: `inkling_cuda.cu` compiled for that format alone
+/// (`GGML_ONLY`) the first time a weight of it is uploaded, and kept on disk
+/// ([`CudaBackend::cached_module`]).
+#[derive(Clone, Copy, PartialEq)]
+struct GgKernels {
+    /// `mv_K`: matrix-vector products, a warp per row, a grid row per token.
+    mv: *mut c_void,
+    /// `gemmi_K`: the tensor-core GEMM with the weights' exact values and split activations.
+    gemmi: *mut c_void,
+}
+
+/// A weight matrix as the ggml kernels take it (`W` in `inkling_cuda.cu`).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Wg {
+    q: u64,
+    s: u64,
+    ef: u64,
+    rb: u64,
+    es: u64,
+    ss: u64,
+    f: f32,
+    sr: u32,
+    sc: u32,
+    ncb: u32,
+}
+
+impl Wg {
+    fn of(cw: &CudaWeight) -> Option<(GgKernels, Wg)> {
+        let (k, rb, f) = cw.gg?;
+        Some((
+            k,
+            Wg {
+                q: cw.data,
+                rb,
+                f,
+                sr: 1,
+                sc: 1,
+                ncb: 1,
+                ..Wg::default()
+            },
+        ))
+    }
+}
+
+/// The GEMM kernels' parameters (`GemmP` in `inkling_cuda.cu`): `rows` rows of `x` (`xs` floats
+/// apart) into rows of `y` (`ys` apart); mode 0 stores, 1 adds.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GemmP {
+    x: u64,
+    y: u64,
+    gidx: u64,
+    tiles: u64,
+    ntiles: u64,
+    wrow: u64,
+    xh: u64,
+    xl: u64,
+    n_in: u32,
+    n_out: u32,
+    rows: u32,
+    xs: u32,
+    ys: u32,
+    mode: u32,
+    mi: u32,
+    inter: u32,
+    beta: f32,
+    lbeta: f32,
+}
+
+/// The ggml formats with device kernels (`dq<K>` in `inkling_cuda.cu`): every block format but
+/// the ternary and 1-bit ones, and the float ones.
+fn gg_supported(kind: crate::ggml::GgmlType) -> bool {
+    use crate::ggml::GgmlType::*;
+    matches!(
+        kind,
+        F32 | F16
+            | BF16
+            | Q4_0
+            | Q4_1
+            | Q5_0
+            | Q5_1
+            | Q8_0
+            | Q2_K
+            | Q3_K
+            | Q4_K
+            | Q5_K
+            | Q6_K
+            | IQ1_S
+            | IQ1_M
+            | IQ2_XXS
+            | IQ2_XS
+            | IQ2_S
+            | IQ3_XXS
+            | IQ3_S
+            | IQ4_NL
+            | IQ4_XS
+            | MXFP4
+    )
+}
+
+/// The i-quant grids and value tables, as device arrays.
+pub(crate) fn ggml_tables_src() -> String {
+    use crate::ggml::tables::*;
+    use std::fmt::Write;
+    let mut s = String::new();
+    let mut arr = |ty: &str, name: &str, vals: Vec<String>| {
+        let _ = write!(s, "__device__ const {ty} {name}[{}] = {{", vals.len());
+        s.push_str(&vals.join(","));
+        s.push_str("};\n");
+    };
+    arr("float", "kvalues_iq4nl", KVALUES_IQ4NL.iter().map(|v| format!("{v}.f")).collect());
+    arr("float", "kvalues_mxfp4", KVALUES_MXFP4.iter().map(|v| format!("{v}.f")).collect());
+    for (name, t) in [
+        ("iq2xxs_grid", &IQ2XXS_GRID[..]),
+        ("iq2xs_grid", &IQ2XS_GRID[..]),
+        ("iq2s_grid", &IQ2S_GRID[..]),
+        ("iq1s_grid", &IQ1S_GRID[..]),
+    ] {
+        arr("unsigned long long", name, t.iter().map(|v| format!("{v:#x}ull")).collect());
+    }
+    for (name, t) in [("iq3xxs_grid", &IQ3XXS_GRID[..]), ("iq3s_grid", &IQ3S_GRID[..])] {
+        arr("unsigned int", name, t.iter().map(|v| format!("{v:#x}u")).collect());
+    }
+    s
 }
 
 #[derive(Default)]
@@ -459,6 +589,9 @@ pub struct CudaBackend {
     /// Expert weights by host address and length: uploaded once, shared by the prefill MoE path
     /// and decode plans, freed with the last [`CacheRefs`] holding them (the model's unload).
     wcache: WCache,
+    /// The ggml kernels by format id (None: the module did not compile or load). Code, not
+    /// weights: the modules stay loaded for the process, like the main one.
+    gg: Mutex<std::collections::HashMap<u32, Option<GgKernels>>>,
     /// bf16, q8, q4
     funcs: [*mut c_void; 3],
     /// GEMM over affine Q4 weights.
@@ -566,6 +699,7 @@ impl CudaBackend {
             ctx,
             module,
             wcache: Default::default(),
+            gg: Mutex::new(std::collections::HashMap::new()),
             funcs,
             func_q4a,
             conv_funcs,
@@ -645,16 +779,72 @@ impl CudaBackend {
         }
     }
 
-    /// Device copy of one weight matrix (None for GGUF, or when VRAM is short).
+    /// The kernels for ggml format `kind`, compiled on first use.
+    fn gg_kernels(&self, kind: crate::ggml::GgmlType) -> Option<GgKernels> {
+        if !gg_supported(kind) {
+            return None;
+        }
+        let id = kind.id();
+        if let Some(k) = self.gg.lock().unwrap().get(&id) {
+            return *k;
+        }
+        let src = format!(
+            "#define GGML_ONLY 1\n#define HAS_{id} 1\n{}{}",
+            ggml_tables_src(),
+            include_str!("inkling_cuda.cu")
+        );
+        let k = match self.cached_module(&src, &format!("ggml-{{sm}}-{id}"), "ggml.cu") {
+            Ok(module) => {
+                let get = |name: String| -> Option<*mut c_void> {
+                    let c = CString::new(name).ok()?;
+                    let mut f = std::ptr::null_mut();
+                    (unsafe { self.cu.cuModuleGetFunction(&mut f, module, c.as_ptr()) } == 0).then_some(f)
+                };
+                get(format!("mv_{id}"))
+                    .zip(get(format!("gemmi_{id}")))
+                    .map(|(mv, gemmi)| GgKernels { mv, gemmi })
+            }
+            Err(e) => {
+                eprintln!("[cuda: no kernels for {kind} weights ({e}): they stay on the CPU]");
+                None
+            }
+        };
+        self.gg.lock().unwrap().insert(id, k);
+        k
+    }
+
+    /// Device copy of one weight matrix (None when VRAM is short, or for a GGUF format without
+    /// device kernels: the ternary and 1-bit ones, FP8 with block scales).
     fn upload_weight(&self, w: &WeightRef) -> Option<CudaWeight> {
         Some(match w {
-            WeightRef::Gguf(_) => return None,
+            WeightRef::Gguf(m) => {
+                // A tensor-wide scale is a factor on the outputs; block scales have no kernel here.
+                let f = match &m.block_scales {
+                    None => 1.0,
+                    Some(bs) if !m.kind.is_float() && bs.rows >= m.n_out && bs.cols >= m.n_in => bs.s[0],
+                    Some(_) => return None,
+                };
+                if !m.n_in.is_multiple_of(32) {
+                    return None;
+                }
+                let k = self.gg_kernels(m.kind)?;
+                let rb = m.row_bytes();
+                CudaWeight {
+                    data: self.upload_bytes(m.data.as_ptr(), m.n_out * rb)?,
+                    scales: 0,
+                    offsets: 0,
+                    gpr: 0,
+                    gk: 0,
+                    gg: Some((k, rb as u64, f)),
+                }
+            }
             WeightRef::Bf16(w) => CudaWeight {
                 data: self.upload_bytes(w.as_ptr() as *const u8, w.len() * 2)?,
                 scales: 0,
                 offsets: 0,
                 gpr: 0,
                 gk: 0,
+                gg: None,
             },
             WeightRef::Q8(m) => {
                 let data = self.upload_bytes(m.q.as_ptr() as *const u8, m.q.len())?;
@@ -671,6 +861,7 @@ impl CudaBackend {
                     offsets: 0,
                     gpr: 0,
                     gk: 0,
+                    gg: None,
                 }
             }
             WeightRef::Q4(m) => {
@@ -702,6 +893,7 @@ impl CudaBackend {
                     offsets,
                     gpr,
                     gk,
+                    gg: None,
                 }
             }
         })
@@ -1037,6 +1229,26 @@ impl CudaBackend {
             &mut gk as *mut u32 as *mut c_void,
         ];
         self.launch(func, ((n_out / TILE) as u32, (t_pad / TILE) as u32), 256, &mut params)
+    }
+
+    /// Queues `y[t][n_out] (+)= x[t][n_in] * W^T` over a ggml matrix (`gemmi_K`: the weights'
+    /// values as stored, the activations as pairs of halves, f32 sums per 16 columns); rows of
+    /// `x` are `n_in` floats apart and rows of `y` `n_out` (`mode` 1 adds).
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_gg(&self, k: GgKernels, w: Wg, x: u64, n_in: usize, y: u64, n_out: usize, t: usize, mode: u32) -> bool {
+        let p = GemmP {
+            x,
+            y,
+            n_in: n_in as u32,
+            n_out: n_out as u32,
+            rows: t as u32,
+            xs: n_in as u32,
+            ys: n_out as u32,
+            mode,
+            ..GemmP::default()
+        };
+        let mut params = [&w as *const Wg as *mut c_void, &p as *const GemmP as *mut c_void];
+        self.launch(k.gemmi, (n_out.div_ceil(64) as u32, t.div_ceil(64) as u32), 128, &mut params)
     }
 
     fn ensure_staging(&self, st: &mut Staging, x_bytes: usize, y_bytes: usize) -> bool {
@@ -1575,7 +1787,7 @@ impl Backend for CudaBackend {
         if !self.bind() {
             return false;
         }
-        if jobs.is_empty() || !n_in.is_multiple_of(32) || x.len() < t * n_in || jobs.iter().any(|j| matches!(j.w, WeightRef::Gguf(_))) {
+        if jobs.is_empty() || !n_in.is_multiple_of(32) || x.len() < t * n_in {
             return false;
         }
         let t_pad = t.div_ceil(TILE) * TILE;
@@ -1610,8 +1822,16 @@ impl Backend for CudaBackend {
         let mut y_off = 0usize;
         for j in jobs.iter() {
             let cw = &j.dev.downcast_ref::<CudaWeightBox>().unwrap().0;
-            let Some(func) = self.gemm_func(&j.w) else { return false };
-            if !self.gemm(func, cw, st.x, st.y + (y_off * 4) as u64, j.n_out, n_in, t_pad) {
+            let y = st.y + (y_off * 4) as u64;
+            let ok = match Wg::of(cw) {
+                // GGUF rows: the tensor-core GEMM over the stored blocks.
+                Some((k, w)) => self.gemm_gg(k, w, st.x, n_in, y, j.n_out, t, 0),
+                None => match self.gemm_func(&j.w) {
+                    Some(func) => self.gemm(func, cw, st.x, y, j.n_out, n_in, t_pad),
+                    None => false,
+                },
+            };
+            if !ok {
                 return false;
             }
             y_off += t_pad * j.n_out;
@@ -2453,6 +2673,99 @@ mod tests {
                 assert!(e < 1e-5, "{name} mode {mode}: error {e} against the definition");
             }
         }
+    }
+
+    /// The ggml kernels (`inkling_cuda.cu` compiled per format): the matvec and the GEMM of every
+    /// format with device kernels against the dequantized rows' products in f64.
+    #[test]
+    fn ggml_matvec_and_gemm_match_definition() {
+        use crate::ggml::{GgmlType, GgufMatrix, random_blocks};
+        use GgmlType::*;
+        let Some(be) = backend() else { return };
+        assert!(be.bind());
+        // 100 rows: a partial block of 8 warps and a partial 64-row tile; 70 tokens: a partial
+        // token tile.
+        let (n_out, n_in, t) = (100usize, 1024usize, 70usize);
+        let xs = 1088usize;
+        let mut seed = 77;
+        let x: Vec<f32> = (0..t * xs).map(|_| rnd(&mut seed) * 2.0).collect();
+        let y0: Vec<f32> = (0..t * n_out).map(|_| rnd(&mut seed)).collect();
+        let dx = be.upload_bytes(x.as_ptr() as *const u8, x.len() * 4).unwrap();
+        let mut dy = 0u64;
+        assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut dy, t * n_out * 4) }, 0);
+        for kind in [
+            F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+            IQ3_S, IQ4_NL, IQ4_XS, MXFP4,
+        ] {
+            let bytes = random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed);
+            let m = GgufMatrix::from_bytes(kind, &bytes, n_out, n_in).unwrap();
+            let mut dense = vec![0f32; n_out * n_in];
+            m.dequantize_rows(0, n_out, &mut dense);
+            let cw = be
+                .upload_weight(&WeightRef::Gguf(&m))
+                .unwrap_or_else(|| panic!("{kind}: no device weight"));
+            let (k, w) = Wg::of(&cw).unwrap();
+            for mode in 0u32..2 {
+                let mut r = vec![0f32; t * n_out];
+                let mut mag = vec![0f64; t * n_out];
+                for j in 0..t {
+                    let xr = &x[j * xs..j * xs + n_in];
+                    for o in 0..n_out {
+                        let row = &dense[o * n_in..(o + 1) * n_in];
+                        let dot: f64 = row.iter().zip(xr).map(|(&a, &b)| a as f64 * b as f64).sum();
+                        mag[j * n_out + o] = row.iter().zip(xr).map(|(&a, &b)| (a as f64 * b as f64).abs()).sum();
+                        r[j * n_out + o] = (dot + if mode == 1 { y0[j * n_out + o] as f64 } else { 0.0 }) as f32;
+                    }
+                }
+                let check = |what: &str, tol: f64| {
+                    let mut y = vec![0f32; t * n_out];
+                    assert_eq!(unsafe { be.cu.cuMemcpyDtoH_v2(y.as_mut_ptr() as *mut c_void, dy, y.len() * 4) }, 0);
+                    let worst = y
+                        .iter()
+                        .zip(&r)
+                        .zip(&mag)
+                        .map(|((&a, &b), &m)| (a as f64 - b as f64).abs() / (m + 1e-3))
+                        .fold(0f64, f64::max);
+                    assert!(worst < tol, "{kind} {what} mode {mode}: {worst:.2e} of the summed magnitudes");
+                };
+                // The matvec: a grid row per token.
+                assert!(be.htod(dy, &y0));
+                let (ni, no, xsu, ysu) = (n_in as u32, n_out as u32, xs as u32, n_out as u32);
+                let mut args = [
+                    &w as *const _ as *mut c_void,
+                    &dx as *const _ as *mut c_void,
+                    &dy as *const _ as *mut c_void,
+                    &ni as *const _ as *mut c_void,
+                    &no as *const _ as *mut c_void,
+                    &xsu as *const _ as *mut c_void,
+                    &ysu as *const _ as *mut c_void,
+                    &mode as *const _ as *mut c_void,
+                ];
+                assert!(be.launch(k.mv, (no.div_ceil(8), t as u32), 256, &mut args));
+                check("matvec", 2e-6);
+                // The GEMM (rows of x `xs` apart).
+                assert!(be.htod(dy, &y0));
+                let p = GemmP {
+                    x: dx,
+                    y: dy,
+                    n_in: ni,
+                    n_out: no,
+                    rows: t as u32,
+                    xs: xsu,
+                    ys: ysu,
+                    mode,
+                    ..GemmP::default()
+                };
+                let mut args = [&w as *const _ as *mut c_void, &p as *const _ as *mut c_void];
+                assert!(be.launch(k.gemmi, (no.div_ceil(64), (t as u32).div_ceil(64)), 128, &mut args));
+                check("gemm", 2e-6);
+            }
+            be.free_weight(&cw);
+        }
+        // Formats without kernels are declined (the CPU path keeps them).
+        let bytes = random_blocks(TQ2_0, n_out * n_in / TQ2_0.block_size(), &mut seed);
+        let m = GgufMatrix::from_bytes(TQ2_0, &bytes, n_out, n_in).unwrap();
+        assert!(be.upload_weight(&WeightRef::Gguf(&m)).is_none());
     }
 
     /// `cargo test --release --lib decode_matvec_bench -- --ignored --nocapture`: the decode

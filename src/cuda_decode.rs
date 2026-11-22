@@ -16,11 +16,14 @@
 //! place could not see. Multi-token plans keep the recurrent ops' inputs, so a rewind inside the
 //! step replays them ([`DecodePlan::replay_recurrent`]).
 //!
+//! GGUF weights are read as stored by kernels of their own (`inkling_cuda.cu`'s matvec, one module
+//! per ggml format: [`COp::Gmv`]); a gate / up pair of them is two matvecs and the activation.
+//!
 //! Declined (the model then decodes on the CPU): interventions, Qwen4-Exp's hyper-connection ops,
-//! GGUF weights, and graphs whose weights do not all fit in VRAM (`OXINFER_GPU_PLAN_DEBUG=1`
-//! says which op).
+//! GGUF weights in the ternary / 1-bit formats or in MoE experts, and graphs whose weights do not
+//! all fit in VRAM (`OXINFER_GPU_PLAN_DEBUG=1` says which op).
 
-use super::{Cu, CudaBackend, CudaWeight, CudaWeightBox};
+use super::{Cu, CudaBackend, CudaWeight, CudaWeightBox, Wg};
 use crate::gpu::WeightRef;
 use crate::gpu::decode::{DecodePlan, Ew, Graph, LinMode, Op, Slot, Step, View};
 use std::ffi::c_void;
@@ -83,6 +86,8 @@ impl P {
 const A: u64 = 1 << 62;
 const C: u64 = 1 << 61;
 const S: u64 = 1 << 60;
+/// The scratch of GGUF gate / up pairs (the gate's outputs).
+const G: u64 = 1 << 59;
 
 /// Kernel name suffix of a weight format.
 fn fmt(w: &WeightRef) -> Option<&'static str> {
@@ -168,6 +173,17 @@ enum COp {
         n_in: u32,
         mode: u32,
         gate: P,
+    },
+    /// A matvec over a ggml block format (`mv_K`): mode 0 stores, 1 adds; every token of the step
+    /// in one launch.
+    Gmv {
+        f: F,
+        w: Wg,
+        x: P,
+        y: P,
+        n_out: u32,
+        n_in: u32,
+        mode: u32,
     },
     Topk {
         f: F,
@@ -326,6 +342,7 @@ impl COp {
     fn ptrs(&mut self) -> Vec<&mut u64> {
         match self {
             COp::Mv { w, x, y, gate, .. } => vec![&mut w.q, &mut x.a, &mut y.a, &mut gate.a],
+            COp::Gmv { x, y, .. } => vec![&mut x.a, &mut y.a],
             COp::Topk { logits, sel, scale, .. } => vec![&mut logits.a, &mut sel.a, &mut scale.a],
             COp::Experts { x, act, y, sel, lora, .. } => {
                 let mut v = vec![&mut x.a, &mut act.a, &mut y.a, &mut sel.a];
@@ -628,6 +645,7 @@ impl CudaBackend {
             ts: 0,
         };
         let mut part_floats = 0usize;
+        let mut pair_floats = 0usize;
         let mut consts: Vec<f32> = Vec::new();
         let mut cst = |v: &[f32]| -> P {
             consts.resize(consts.len().next_multiple_of(16), 0.0);
@@ -725,11 +743,51 @@ impl CudaBackend {
                         y,
                         mode,
                     } => {
-                        let name = fmt(w)?;
                         if !n_in.is_multiple_of(32) {
                             return None;
                         }
                         let cw = &dev.downcast_ref::<CudaWeightBox>()?.0;
+                        if let WeightRef::Gguf(_) = w {
+                            // The kernel reads x four floats at a time.
+                            if !x.off.is_multiple_of(4) {
+                                return None;
+                            }
+                            let (k, wg) = Wg::of(cw)?;
+                            let mut mv = |f: F, w: Wg, y: P, mode: u32| {
+                                ops.push(COp::Gmv {
+                                    f,
+                                    w,
+                                    x: byte(x),
+                                    y,
+                                    n_out: n_out as u32,
+                                    n_in: n_in as u32,
+                                    mode,
+                                })
+                            };
+                            match (mode, w2) {
+                                (LinMode::Store, None) => mv(k.mv, wg, byte(y), 0),
+                                (LinMode::Add, None) => mv(k.mv, wg, byte(y), 1),
+                                (LinMode::SiluPair | LinMode::GeluPair, Some((WeightRef::Gguf(_), d2))) => {
+                                    let (k2, wg2) = Wg::of(&d2.downcast_ref::<CudaWeightBox>()?.0)?;
+                                    let ts = if mt { n_out.next_multiple_of(64) } else { n_out };
+                                    pair_floats = pair_floats.max(ts);
+                                    let gate = P { a: G, ts: (ts * 4) as u64 };
+                                    mv(k.mv, wg, gate, 0);
+                                    mv(k2.mv, wg2, byte(y), 0);
+                                    ops.push(COp::Glu {
+                                        f: self.func("dglu")?,
+                                        g: gate,
+                                        u: byte(y),
+                                        out: byte(y),
+                                        n: n_out as u32,
+                                        gelu: (mode == LinMode::GeluPair) as u32,
+                                    });
+                                }
+                                _ => return None,
+                            }
+                            continue;
+                        }
+                        let name = fmt(w)?;
                         let cw2 = match w2 {
                             Some((w2, d2)) => {
                                 if fmt(w2)? != name || !crate::gpu::decode::pairable(w, w2) {
@@ -1163,6 +1221,7 @@ impl CudaBackend {
             head_from = ops.len();
         }
         let part_off = region(part_floats.max(1) * 4);
+        let pair_off = region(pair_floats.max(1) * tokens * 4);
         let save_off: Vec<usize> = saves.iter().map(|&n| region(n * 4)).collect();
         let Some(arena) = self.alloc_zeroed(total) else {
             debug("no VRAM for the activation arena");
@@ -1184,6 +1243,8 @@ impl CudaBackend {
                     *p = cbuf + (*p & !C);
                 } else if *p & S != 0 {
                     *p = arena + save_off[(*p & !S) as usize] as u64;
+                } else if *p & G != 0 {
+                    *p = arena + pair_off as u64;
                 }
             }
         }
@@ -1378,6 +1439,18 @@ impl CudaPlan<'_> {
                     32 * MV_ROWS,
                     &mut args![w, w2, x, y, n_out, n_in, mode, gate],
                 )
+            }
+            COp::Gmv {
+                f,
+                w,
+                x,
+                y,
+                n_out,
+                n_in,
+                mode,
+            } => {
+                let (x, y, one) = (x.at(j), y.at(j), 0u32);
+                be.launch(f, (n_out.div_ceil(8), 1), 256, &mut args![w, x, y, n_in, n_out, one, one, mode])
             }
             COp::Topk {
                 f,
@@ -1626,6 +1699,24 @@ impl CudaPlan<'_> {
                     )
                 });
             }
+            COp::Gmv {
+                f,
+                w,
+                x,
+                y,
+                n_out,
+                n_in,
+                mode,
+            } if t > 1 => {
+                // A grid row per token: each token's sums are the single-token launch's.
+                let (xa, ya, xs, ys) = (x.a, y.a, (x.ts / 4) as u32, (y.ts / 4) as u32);
+                return be.launch(
+                    f,
+                    (n_out.div_ceil(8), t as u32),
+                    256,
+                    &mut args![w, xa, ya, n_in, n_out, xs, ys, mode],
+                );
+            }
             COp::GdnConv { x, save, dim, .. } if save.a != 0 => {
                 if !self.copy_rows(x, save, dim, t) {
                     return false;
@@ -1738,6 +1829,7 @@ impl DecodePlan for CudaPlan<'_> {
                 let k = match op {
                     COp::Mv { fk: Some(_), .. } => "matvec",
                     COp::Mv { .. } => "matvec-1",
+                    COp::Gmv { .. } => "matvec-ggml",
                     COp::Topk { .. } => "topk",
                     COp::Experts { .. } => "experts",
                     COp::Norm { .. } => "norm",

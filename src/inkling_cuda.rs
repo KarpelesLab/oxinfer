@@ -689,35 +689,9 @@ impl Drop for Engine {
     }
 }
 
-/// The i-quant grids and value tables, as device arrays.
-fn tables_src() -> String {
-    use crate::ggml::tables::*;
-    use std::fmt::Write;
-    let mut s = String::new();
-    let mut arr = |ty: &str, name: &str, vals: Vec<String>| {
-        let _ = write!(s, "__device__ const {ty} {name}[{}] = {{", vals.len());
-        s.push_str(&vals.join(","));
-        s.push_str("};\n");
-    };
-    arr("float", "kvalues_iq4nl", KVALUES_IQ4NL.iter().map(|v| format!("{v}.f")).collect());
-    arr("float", "kvalues_mxfp4", KVALUES_MXFP4.iter().map(|v| format!("{v}.f")).collect());
-    for (name, t) in [
-        ("iq2xxs_grid", &IQ2XXS_GRID[..]),
-        ("iq2xs_grid", &IQ2XS_GRID[..]),
-        ("iq2s_grid", &IQ2S_GRID[..]),
-        ("iq1s_grid", &IQ1S_GRID[..]),
-    ] {
-        arr("unsigned long long", name, t.iter().map(|v| format!("{v:#x}ull")).collect());
-    }
-    for (name, t) in [("iq3xxs_grid", &IQ3XXS_GRID[..]), ("iq3s_grid", &IQ3S_GRID[..])] {
-        arr("unsigned int", name, t.iter().map(|v| format!("{v:#x}u")).collect());
-    }
-    s
-}
-
 /// The module for the weight kinds `kinds`.
 pub(super) fn kernel_source(kinds: &[u32]) -> String {
-    let mut s = tables_src();
+    let mut s = crate::cuda::ggml_tables_src();
     for k in kinds {
         s.push_str(&format!("#define HAS_{k} 1\n"));
     }
