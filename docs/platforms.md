@@ -16,7 +16,7 @@ GPU (metal #0): Apple M5 Max, memory 115.4 GB (unified with CPU)
 | Apple Silicon (macOS, iOS) | NEON kernels (CPU prefill GEMMs on the SME tiles on M4 and later, `prefill_gemm`) + Metal GEMM for prefill; on M5 / A19 the GPU matrix units (prefill GEMMs and MoE experts); single-token decode entirely on the GPU (Llama 3, Qwen3 / 3.5 / 3.8 incl. MoE, Gemma 3 / 4 incl. 26B-A4B) | measured; the f32 GEMM gives bit-identical logits to the CPU path, the matrix units (default where present) ~3e-4 relative per product (`OXINFER_METAL_MMA=0` for bit-identical); iOS: runs in the Simulator (CPU and Metal; `ios/`) |
 | Apple Neural Engine (macOS 15 / iOS 18) | Core ML, for ANEMLL-converted models | measured on macOS; builds for iOS; see [Core ML](coreml.md#core-ml--apple-neural-engine) |
 | x86-64 (Linux, Windows, macOS) | AVX2 + FMA + F16C kernels chosen at run time: bf16 / f32 dot tiles and prefill GEMM, Q8 via `maddubs`, Q4, every GGUF format, decode attention; scalar fallback below AVX2 or with `OXINFER_SIMD=scalar` (`--devices` prints the set in use). No AVX-512 / VNNI kernels; Q4's multi-token column kernel and LoRA's dot products are NEON-only (x86 runs the token-pair and portable loops) | executed on Linux on one Zen 5 CPU (Threadripper 9970X); Windows and macOS compile only. Every AVX2 kernel is tested directly against its scalar fallback (bit for bit for the integer parts, GGUF rows and attention; 1e-6 of the summed magnitudes for the f32 sums). Qwen3.5-0.8B on 5 prompts, AVX2 against scalar: last-prompt-token logits within 4.8e-5 (bf16, Q8, Q4), same top 10; 64 greedy tokens identical in 14/15 runs, and bf16 within 5e-5 of transformers float32 with the same argmax (5/5). Q8 decode steps differ between the two by 0.4-0.6 in the largest logit (same top 1 on 317/320 teacher-forced steps), as far as either is from bf16: the integer block sums are identical (a build with the AVX2 integer path and the scalar order of f32 additions gives the scalar logits bit for bit over 169 steps), the f32 additions are ordered differently, and re-quantizing activations to int8 at every matmul amplifies that. Llama-3.2-1B GGUF (Q4_K_M, Q8_0): decode-kernel passes (`--prefill-chunk 1`) give bit-identical logits and greedy text to the portable path (10/10); with the f32 prefill GEMM the last hidden state differs by rounding (up to 1.8e-4 on values up to 17) and the logits by either ~2e-5 or 1.6e-3 to 5.7e-3: the LM head of the last token is a one-token pass on int8 activations, and the larger figure appears exactly when that rounding moves one to three of the 2048 int8 activations by one step (7/16 pseudo-random prompts on Q4_K_M, 5/16 on Q8_0; an f32 LM head pass on the same states stays within 1e-4 on all 32); on the 5 chat prompts 4.8e-3 / 3.5e-5 at most, 48 greedy tokens identical in 3/5 and 5/5 |
-| Linux / Windows + NVIDIA | CUDA driver API + NVRTC-compiled kernels (`cuda.rs`): prefill GEMMs (bf16, Q8, Q4, affine Q4), MoE experts (resident or streamed), convolutions, group / layer norms, attention; whole decode steps, single-token and multi-token (speculative verification); loaded as a native binary, so a toolkit newer than the driver works | measured on Linux on one RTX 5080 (NVRTC 13.4, driver CUDA 13.2), see [CUDA](#cuda); Windows and other GPUs not run |
+| Linux / Windows + NVIDIA | CUDA driver API + NVRTC-compiled kernels (`cuda.rs`): prefill GEMMs (bf16, Q8, Q4, affine Q4), MoE experts (resident or streamed), convolutions, group / layer norms, attention; whole decode steps, single-token and multi-token (speculative verification); Inkling-2 / Mini whole prefill and decode passes on kernels of its own (every GGUF format but the ternary / 1-bit ones, NVFP4, MXFP8); loaded as a native binary, so a toolkit newer than the driver works | measured on Linux on one RTX 5080 (NVRTC 13.4, driver CUDA 13.2) and one RTX PRO 6000 Blackwell (Inkling-2), see [CUDA](#cuda); Windows and other GPUs not run |
 | Android (aarch64) | NEON kernels | cross-compiles (`aarch64-linux-android`) |
 | Vulkan (any GPU with a Vulkan 1.0 driver) | compute shaders through the Vulkan loader (`vulkan.rs`, SPIR-V embedded in the binary): prefill GEMMs only (bf16, Q8, Q4, affine Q4); MoE experts, convolutions, norms, attention and decoding stay on the CPU | measured on Linux on one RTX 5080 (NVIDIA driver, Vulkan 1.4): logits bit-identical to the CPU path and the same greedy text for the four weight formats, see [Vulkan](#vulkan); integrated GPUs, other vendors, Windows, Android and MoltenVK not run |
 | wasm32 (WASI) | simd128 kernels (bf16, Q8, Q4), threads via wasi-threads | measured: Qwen3.5-0.8B Q8 at 123 tok/s decode with 16 threads under wasmtime 30, identical output to native; see below |
@@ -168,7 +168,7 @@ plain GPU decoding here (40 and 154 tok/s against 107 and 172): the drafts run o
 Q4 verification pass is compute-bound on the CUDA cores. So with CUDA decoding they are not the
 default (`Backend::prefers_plain_decode`); `--mtp` / `--draft` still use them.
 
-Declined (decoding stays on the CPU): interventions, Qwen4-Exp, GGUF weights, and models whose
+Declined (decoding stays on the CPU): interventions, Qwen4-Exp, GGUF weights (Inkling-2 aside, see below), and models whose
 weights do not all fit in VRAM: Gemma 4 26B-A4B's experts do not on 16 GB
 (`OXINFER_GPU_PLAN_DEBUG=1` names the op). Recurrent states go up and down every step (copied back
 on a second stream under the remaining layers; the upload is skipped when nothing on the host
@@ -177,6 +177,28 @@ The image-model timings include loading and quantizing the weights.
 
 `cargo test --lib cuda::` compares every kernel with a reference computed in f64 from its
 definition; it fails if a kernel does not compile or load, and skips without an NVIDIA GPU or NVRTC.
+
+**Inkling-2 / Inkling-2-Mini** run whole passes on the GPU with an engine of their own
+(`src/inkling_cuda.rs`, `inkling_cuda.cu`: the attention residual's mixes, the loop's message
+gates, the short convolutions with rings by position, relative-bias attention with sinks, L2 clips
+and output gate, the softcapped sigmoid routing and the SiTU experts in their stored formats,
+GGUF files included; see [Inkling-2 Mini](inkling.md#the-cuda-engine)). Prefill matches the CPU
+path to KL ~4e-11 at every position (a position where two experts tie within f32 rounding now and
+then aside), decode steps the CPU's f32 prefill to 1e-10 - 7e-9, greedy text identical; sessions go
+back up to 64 positions (prompt lookup, exact verification passes of up to 16 tokens). On an RTX
+PRO 6000 Blackwell against llama.cpp's CUDA backend (built from source, `llama-bench`), tok/s:
+
+| Mini checkpoint | engine | pp512 | pp2048 | tg128 | tg128 at 8k / 32k |
+|---|---|---:|---:|---:|---:|
+| ggml-org Q8_0 | llama.cpp | 3236 | 2747 | 87.8 | 85.7 / 79.7 |
+| | oxinfer | 3558 | 4261 | 120.3 | 110.2 / 98.0 |
+| unsloth UD-IQ3_XXS | llama.cpp | 3284 | 2784 | 98.2 | 96.0 / 88.3 |
+| | oxinfer | 3321 | 3817 | 131.5 | 120.9 / 106.8 |
+| AtomicChat AD-Q4_K | llama.cpp | 3243 | 2752 | 96.6 | 94.4 / 87.0 |
+| | oxinfer | 3503 | 4033 | 131.1 | 120.2 / 106.4 |
+| release (NVFP4) | oxinfer | 3481 | 4227 | 116.4 | 107.5 / 95.8 |
+
+Prefill of 2048 tokens after 32k of context: 2333 tok/s against llama.cpp's 1094 (Q8_0).
 
 ## Vulkan
 

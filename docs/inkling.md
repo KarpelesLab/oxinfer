@@ -498,6 +498,59 @@ prompt (Q8_0, 256 tokens), the same text each way: plain 120.7 tok/s, prompt loo
 (1.15 tokens per forward), unsloth's DSpark draft 103-105 (its CPU drafting costs about as much as
 the tokens it saves).
 
+### The CUDA engine
+
+With an NVIDIA GPU (`--device auto` or `cuda`), `src/inkling_cuda.rs` runs every pass on the
+GPU with its own kernels (`src/inkling_cuda.cu`, compiled by NVRTC at the first pass for the
+weight formats the model has, a few seconds; kept in `~/.cache/oxinfer/kernels`,
+`OXINFER_KERNEL_CACHE=DIR` or `0`). The host looks up the embeddings and samples.
+
+- **Passes of up to 16 tokens** (decoding, verification) on decode kernels: matvecs (the
+  projections of one input in one launch), the chosen experts' rows read in place, the mixes and
+  convolutions per token, attention split over the keys and merged with the sink; each such pass
+  is a CUDA graph (one per token count and captured steps), so a decoded token is one launch.
+- **Prefill** in chunks of up to 1024 tokens: tensor-core GEMMs, the routed experts as segments
+  per expert built on the device and grouped GEMMs (SiTU in the epilogue), attention in tiles of
+  8 queries sharing their keys and values in shared memory, convolutions a thread per (channel,
+  token), the message gates' low-rank projection a block per token.
+- **Weights as stored**: every GGUF block format but the ternary and 1-bit ones, the release's
+  NVFP4 (with its per-expert factors) and MXFP8 experts, unsloth's per-expert output factors,
+  oxinfer's Q8 / Q4, bf16, f16, f32. Caches in f32, f16 or q8 (`--kv-cache`); the full layers'
+  grow by a quarter, the sliding ones are rings of `window + 1024` rows.
+- **Precision**: activations in f32 throughout. The prefill GEMMs take the activations as pairs
+  of halves (the low half scaled by 2^11, out of f16's subnormals) and the weights as their exact
+  values (every format but f32 / bf16 stores small integers or grid values times a scale per 16
+  or 32), two tensor-core products per 16-wide step whose sums are scaled, minima added, with
+  f32 adds: 5e-8 of the summed magnitudes at worst, as an f32 GEMM (the matvecs: 2e-8). Plain
+  f16 operands (`gpu_exact=0`, ~10% faster prefill) move the logits by KL ~2e-3: drifts of even
+  3e-6 tip some of this model's near-tied expert choices.
+- A session the device cannot hold moves to the host and continues on the CPU; LoRA adapters,
+  Hadamard-folded or streamed weights, the ternary / 1-bit GGUF formats and MLX affine Q4 keep
+  the CPU path (`OXINFER_GPU_PLAN_DEBUG=1` says why); `OXINFER_INKLING_PROFILE=1` times each
+  kernel (CUDA events) and prints the table at exit.
+
+**Against the CPU path** (`examples/inkling2_cuda_check`: the same pseudo-random prompt on the
+CPU, saved, then on the GPU; `--all` every position, `--tail N` the last N prompt tokens as decode
+steps, compared with the CPU's f32 prefill since its decode kernels round activations to int8):
+
+| Checkpoint, prompt | Prefill (every position) | Decode steps (32) | Greedy (16) |
+|---|---|---|---|
+| release (NVFP4 / MXFP8 experts), 300 tokens | KL 2.5e-10, max diff 3e-4 | KL 9.6e-11 | 17/17 |
+| release, 8100 tokens (last 64 positions) | KL 7.6e-9 | KL 7.1e-9 | |
+| ggml-org Q8_0, 1400 tokens (GPU chunks of 512) | KL 4.3e-11 (per-query attention) | KL 7.3e-9 | 17/17 |
+| unsloth UD-IQ3_XXS, 300 tokens | KL 4.3e-11 | KL 4.2e-11 | 17/17 |
+| AtomicChat AD-Q4_K, 300 tokens | KL 4.3e-11 | KL 4.1e-11 | 17/17 |
+
+The GPU agrees with itself to KL 3e-12 (decode steps against its prefill) and its prefill is
+deterministic. Some prompts have a position where two experts tie to within f32 rounding:
+any two f32 implementations then choose differently there now and then. Of six 600-token Q8_0 prompts, three match at every position (KL
+4e-11), three have one such position (KL up to 1e-2 there, fading over the next tokens), with the
+tiled attention as with the per-query one (on different prompts); at 8400 tokens the release's
+last 64 positions are at 2e-8 with three such spikes. `cargo test --lib cuda::` checks every
+kernel against an f64 definition (every weight format through the matvec and both GEMMs, the
+experts on both paths, attention in the three cache formats with windows, rings and splits, the
+routing with ties and NaNs, the convolutions, mixes, clips and gates against the CPU's functions).
+
 `OXINFER_GPU_DECODE=0` (or `--gpu-decode off`) keeps the passes on the CPU,
 `OXINFER_INKLING_PREFILL=0` the prefill passes; `OXINFER_GPU_DECODE_CHECK=1` runs each decode
 step on the CPU too and prints the difference; `OXINFER_INKLING_SKIP=dense,attn,exp,...` leaves
@@ -623,6 +676,29 @@ block 8, depth 7) reaches 37-42 tok/s on code (63-65% of drafts accepted) and 25
 (45-51%). 125 tok/s of plain decoding is not plausible on this chip (the best published
 single-token figures for the model are about 46 tok/s on an M5 Max); 1750 tok/s of prefill is
 (mlx-swift-lm reports 1834-1852 on an M5 Max; oxinfer: 1603-1856 at pp512 at load 3, 1542-1701 at load 6-12).
+
+### CUDA
+
+RTX PRO 6000 Blackwell Workstation Edition (96 GB, sm_120), Threadripper PRO 9995WX, nothing else
+running. oxinfer: `examples/inkling2_cuda_check` (a prompt of N random tokens into a fresh session,
+128 tokens decoded after it; the second of two runs; `--depth D` runs D tokens first, untimed);
+llama.cpp: `llama-bench -p 512,2048 -n 128 -fa 1 -ngl 99` and `-p 2048 -n 128 -d 8192,32768` (master
+of 2026-11-22, built from source with CUDA 13.4, its default f16 caches; mainline reads unsloth's
+`Mainline_Support` copy of UD-IQ3_XXS, not the root file). tok/s:
+
+| Checkpoint | engine | pp512 | pp2048 | tg128 | pp2048 / tg128 at 8k | pp2048 / tg128 at 32k |
+|---|---|---:|---:|---:|---:|---:|
+| ggml-org Q8_0 | llama.cpp | 3236 | 2747 | 87.8 | 1943 / 85.7 | 1094 / 79.7 |
+| | **oxinfer** | **3558** | **4261** | **120.3** | **3504 / 110.2** | **2333 / 98.0** |
+| unsloth UD-IQ3_XXS | llama.cpp | 3284 | 2784 | 98.2 | 1963 / 96.0 | 1098 / 88.3 |
+| | **oxinfer** | **3321** | **3817** | **131.5** | **3202 / 120.9** | **2181 / 106.8** |
+| AtomicChat AD-Q4_K | llama.cpp | 3243 | 2752 | 96.6 | 1948 / 94.4 | 1093 / 87.0 |
+| | **oxinfer** | **3503** | **4033** | **131.1** | **3338 / 120.2** | **2239 / 106.4** |
+| release (NVFP4) | oxinfer | 3481 | 4227 | 116.4 | 3484 / 107.5 | 2317 / 95.8 |
+
+oxinfer's caches are f32 by default; with `--kv-cache f16` decoding at 32k is 102.1 (Q8_0), 110.8,
+110.3 and 99.5 tok/s. At 32k of context llama.cpp's prefill drops to 40% of its 2048-token rate,
+oxinfer's to 55%. llama.cpp has no reader for the release's NVFP4 safetensors.
 
 ## Speculative decoding
 

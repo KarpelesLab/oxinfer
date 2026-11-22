@@ -132,19 +132,25 @@ struct Dw {
     mvm: F,
     gdown: F,
     gout: F,
-    /// The GEMM in split halves (`gpu::exact`).
-    gemmx: F,
     /// A message gate's down projection for prefill (a block per token).
     gdown_t: F,
+    /// The split GEMM with the weights' exact values and per-16 scales (`gemmi_*`).
+    gemmi: F,
 }
 
 impl Dw {
-    /// The prefill GEMM: by default operands split into pairs of halves (products to ~1e-6, so
-    /// prefill matches the CPU's f32 GEMM: plain f16 operands moved this model's logits by KL
-    /// ~2e-3), or f16 operands, ~15% faster, with `gpu_exact=0` ([`crate::gpu::set_exact`]) or
-    /// `OXINFER_INKLING_EXACT=0` (which wins).
+    /// The prefill GEMM: by default the activations split into pairs of halves and the weights'
+    /// exact values with their scales applied per 16 in f32 (5e-8 of the summed magnitudes, as
+    /// f32: plain f16 operands moved this model's logits by KL ~2e-3), or f16 operands (~10%
+    /// faster) with `gpu_exact=0` ([`crate::gpu::set_exact`]) or `OXINFER_INKLING_EXACT=0`
+    /// (which wins).
     fn gemm_f(&self) -> F {
-        if split_gemm() { self.gemmx } else { self.gemm }
+        if !split_gemm() {
+            self.gemm
+        } else {
+            // f32 / bf16 weights take the split of both operands (`gemmi_*` falls back to it).
+            self.gemmi
+        }
     }
 }
 
@@ -986,7 +992,7 @@ impl Engine {
                     get(&format!("mvm_{k}"))?,
                     get(&format!("gate_down_{k}"))?,
                     get(&format!("gate_out_{k}"))?,
-                    get(&format!("gemmx_{k}"))?,
+                    get(&format!("gemmi_{k}"))?,
                     get(&format!("gate_down_t_{k}"))?,
                 ],
             );
@@ -1024,8 +1030,8 @@ impl Engine {
                 mvm: null,
                 gdown: null,
                 gout: null,
-                gemmx: null,
                 gdown_t: null,
+                gemmi: null,
             },
             final_norm: 0,
             final_query: 0,
@@ -1215,7 +1221,7 @@ impl Engine {
             mvm: f[4],
             gdown: f[5],
             gout: f[6],
-            gemmx: f[7],
+            gemmi: f[7],
             gdown_t: f[8],
         })
     }
@@ -1243,7 +1249,7 @@ impl Engine {
             mvm: f[4],
             gdown: f[5],
             gout: f[6],
-            gemmx: f[7],
+            gemmi: f[7],
             gdown_t: f[8],
         })
     }
@@ -1486,7 +1492,7 @@ impl Engine {
                             "mvm",
                             "gate_down",
                             "gate_out",
-                            "gemmx",
+                            "gemmi",
                             "gate_down_t"
                         ][i]
                     );
@@ -2304,7 +2310,11 @@ impl Engine {
         for (hs, d) in sess.layers.iter().zip(&ds.slots) {
             let kw = d.kw;
             for (i, hp) in d.hist.iter().enumerate() {
-                // The host's ring by position, in the device's layout.
+                // The host's ring by position, in the device's layout (a fresh session's is the
+                // device's zeros already).
+                if pos == 0 {
+                    break;
+                }
                 let v = &hs.hist[i].rows;
                 debug_assert_eq!(v.len(), d.hist_len[i]);
                 unsafe { self.cu.cuMemcpyHtoD_v2(*hp, v.as_ptr() as *const c_void, v.len() * 4) };

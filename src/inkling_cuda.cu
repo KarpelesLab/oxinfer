@@ -865,6 +865,442 @@ __device__ __forceinline__ void gemm_body(const W& w, const GemmP& p) {
             }
 }
 
+// ---- The split GEMM with exact weight values (`gemmi_*`): every format but f32 / bf16 stores
+// small integers or grid values (exact in f16) times a scale (and minus a minimum) per 16 or 32
+// values. The values go to the tensor cores as they are, the activations as split halves (two
+// products instead of three, no split of the weights), and each 16-wide step's sums are scaled
+// (plus minimum times the step's activation sum) with f32 arithmetic.
+template <int K>
+__device__ __forceinline__ constexpr bool int_ok() {
+    return K != K_F32 && K != K_BF16;
+}
+template <int K>
+__device__ __forceinline__ constexpr bool has_min() {
+    return K == K_Q4_1 || K == K_Q5_1 || K == K_Q4_K || K == K_Q5_K || K == K_Q2_K;
+}
+__device__ __forceinline__ float sgn(u32 signs, u32 bit) { return (signs >> bit) & 1 ? -1.f : 1.f; }
+
+// Elements 32 b + 4 j .. + 3 of a row as the values (dq = scale * value + min).
+template <int K>
+__device__ __forceinline__ float4 dqi(const u8* row, u32 b, u32 j) {
+    float4 o;
+    if constexpr (K == K_F16) {
+        uint2 u = ((const uint2*)row)[8 * b + j];
+        o = make_float4(h2f(u.x & 0xffff), h2f(u.x >> 16), h2f(u.y & 0xffff), h2f(u.y >> 16));
+    } else if constexpr (K == K_Q8_0) {
+        u32 u = rd32h(row + 34 * b + 2 + 4 * j);
+        o = make_float4(sbyte(u, 0), sbyte(u, 1), sbyte(u, 2), sbyte(u, 3));
+    } else if constexpr (K == K_OQ8 || K == K_F8) {
+        u32 u = rd32(row + 32 * b + 4 * j);
+        if constexpr (K == K_OQ8)
+            o = make_float4(sbyte(u, 0), sbyte(u, 1), sbyte(u, 2), sbyte(u, 3));
+        else
+            o = make_float4(e4m3(byte(u, 0)), e4m3(byte(u, 1)), e4m3(byte(u, 2)), e4m3(byte(u, 3)));
+    } else if constexpr (K == K_Q4_0 || K == K_IQ4_NL || K == K_OQ4) {
+        const u8* B = K == K_OQ4 ? row + 16 * b : row + 18 * b + 2;
+        u32 u = (K == K_OQ4 ? rd32(B + 4 * (j & 3)) : rd32h(B + 4 * (j & 3))) >> (4 * (j >> 2));
+        if constexpr (K == K_IQ4_NL)
+            o = make_float4(kvalues_iq4nl[u & 15], kvalues_iq4nl[(u >> 8) & 15], kvalues_iq4nl[(u >> 16) & 15], kvalues_iq4nl[(u >> 24) & 15]);
+        else
+            o = make_float4((float)(u & 15) - 8.f, (float)((u >> 8) & 15) - 8.f, (float)((u >> 16) & 15) - 8.f, (float)((u >> 24) & 15) - 8.f);
+    } else if constexpr (K == K_Q4_1) {
+        u32 u = rd32(row + 20 * b + 4 + 4 * (j & 3)) >> (4 * (j >> 2));
+        o = make_float4((float)(u & 15), (float)((u >> 8) & 15), (float)((u >> 16) & 15), (float)((u >> 24) & 15));
+    } else if constexpr (K == K_Q5_0 || K == K_Q5_1) {
+        const u8* B = row + (K == K_Q5_0 ? 22 : 24) * b;
+        u32 qh = K == K_Q5_0 ? rd32h(B + 2) : rd32(B + 4);
+        const u8* q = B + (K == K_Q5_0 ? 6 : 8);
+        u32 u = (K == K_Q5_0 ? rd32h(q + 4 * (j & 3)) : rd32(q + 4 * (j & 3))) >> (4 * (j >> 2));
+        u32 e = 4 * j;
+        float off = K == K_Q5_0 ? 16.f : 0.f;
+        o = make_float4((float)((u & 15) | (((qh >> e) & 1) << 4)) - off, (float)(((u >> 8) & 15) | (((qh >> (e + 1)) & 1) << 4)) - off,
+                        (float)(((u >> 16) & 15) | (((qh >> (e + 2)) & 1) << 4)) - off,
+                        (float)(((u >> 24) & 15) | (((qh >> (e + 3)) & 1) << 4)) - off);
+    } else if constexpr (K == K_MXFP4) {
+        const u8* q = row + 17 * b + 1 + 4 * (j & 3);
+        u32 sh = 4 * (j >> 2);
+        o = make_float4(kvalues_mxfp4[(q[0] >> sh) & 15], kvalues_mxfp4[(q[1] >> sh) & 15], kvalues_mxfp4[(q[2] >> sh) & 15], kvalues_mxfp4[(q[3] >> sh) & 15]);
+    } else if constexpr (K == K_NVFP4) {
+        const u8* B = row + 36 * (b >> 1);
+        u32 e0 = 32 * (b & 1) + 4 * j, sb = e0 >> 4, w = e0 & 15;
+        u32 u = rd32(B + 4 + 8 * sb + (w & 7)) >> (w >= 8 ? 4 : 0);
+        o = make_float4(kvalues_mxfp4[u & 15], kvalues_mxfp4[(u >> 8) & 15], kvalues_mxfp4[(u >> 16) & 15], kvalues_mxfp4[(u >> 24) & 15]);
+    } else if constexpr (K == K_Q4_K || K == K_Q5_K) {
+        const u8* B = row + (K == K_Q4_K ? 144 : 176) * (b >> 3);
+        u32 sub = b & 7;
+        u32 u = rd32(B + (K == K_Q4_K ? 16 : 48) + 32 * (sub >> 1) + 4 * j) >> (4 * (sub & 1));
+        u32 hb = 0;
+        if constexpr (K == K_Q5_K) hb = rd32(B + 16 + 4 * j) >> sub;
+        o = make_float4((float)((u & 15) | ((hb & 1) << 4)), (float)(((u >> 8) & 15) | (((hb >> 8) & 1) << 4)),
+                        (float)(((u >> 16) & 15) | (((hb >> 16) & 1) << 4)), (float)(((u >> 24) & 15) | (((hb >> 24) & 1) << 4)));
+    } else if constexpr (K == K_Q6_K) {
+        const u8* B = row + 210 * (b >> 3);
+        u32 sub = b & 7, n = sub >> 2, qq = sub & 3;
+        u32 ul = rd32h(B + 64 * n + 32 * (qq & 1) + 4 * j) >> (4 * (qq >> 1));
+        u32 uh = rd32h(B + 128 + 32 * n + 4 * j) >> (2 * qq);
+        o = make_float4((float)(int)((ul & 15) | ((uh & 3) << 4)) - 32.f, (float)(int)(((ul >> 8) & 15) | (((uh >> 8) & 3) << 4)) - 32.f,
+                        (float)(int)(((ul >> 16) & 15) | (((uh >> 16) & 3) << 4)) - 32.f,
+                        (float)(int)(((ul >> 24) & 15) | (((uh >> 24) & 3) << 4)) - 32.f);
+    } else if constexpr (K == K_Q3_K) {
+        const u8* B = row + 110 * (b >> 3);
+        u32 sub = b & 7, n = sub >> 2, jj = sub & 3;
+        u32 u = rd32h(B + 32 + 32 * n + 4 * j) >> (2 * jj);
+        u32 h = rd32h(B + 4 * j) >> (4 * n + jj);
+        o = make_float4((float)(u & 3) - ((h & 1) ? 0.f : 4.f), (float)((u >> 8) & 3) - (((h >> 8) & 1) ? 0.f : 4.f),
+                        (float)((u >> 16) & 3) - (((h >> 16) & 1) ? 0.f : 4.f), (float)((u >> 24) & 3) - (((h >> 24) & 1) ? 0.f : 4.f));
+    } else if constexpr (K == K_Q2_K) {
+        const u8* B = row + 84 * (b >> 3);
+        u32 sub = b & 7, n = sub >> 2, jj = sub & 3;
+        u32 u = rd32(B + 16 + 32 * n + 4 * j) >> (2 * jj);
+        o = make_float4((float)(u & 3), (float)((u >> 8) & 3), (float)((u >> 16) & 3), (float)((u >> 24) & 3));
+    } else if constexpr (K == K_IQ4_XS) {
+        const u8* B = row + 136 * (b >> 3);
+        u32 u = rd32(B + 8 + 16 * (b & 7) + 4 * (j & 3)) >> (4 * (j >> 2));
+        o = make_float4(kvalues_iq4nl[u & 15], kvalues_iq4nl[(u >> 8) & 15], kvalues_iq4nl[(u >> 16) & 15], kvalues_iq4nl[(u >> 24) & 15]);
+    } else if constexpr (K == K_IQ2_XXS || K == K_IQ2_XS || K == K_IQ2_S) {
+        u32 ib = b & 7, l = j >> 1, j0 = 4 * (j & 1);
+        u64 g;
+        u32 signs;
+        if constexpr (K == K_IQ2_XXS) {
+            const u8* B = row + 66 * (b >> 3);
+            u32 a0 = rd32h(B + 2 + 8 * ib), a1 = rd32h(B + 6 + 8 * ib);
+            g = iq2xxs_grid[(a0 >> (8 * l)) & 255];
+            signs = ksign((a1 >> (7 * l)) & 127);
+        } else if constexpr (K == K_IQ2_XS) {
+            const u8* B = row + 74 * (b >> 3);
+            u32 q = rd16(B + 2 + 2 * (4 * ib + l));
+            g = iq2xs_grid[q & 511];
+            signs = ksign(q >> 9);
+        } else {
+            const u8* B = row + 82 * (b >> 3);
+            u32 idx = (u32)B[2 + 4 * ib + l] | (((u32)B[66 + ib] << (8 - 2 * l)) & 0x300);
+            g = iq2s_grid[idx];
+            signs = B[34 + 4 * ib + l];
+        }
+        u32 gw = (u32)(g >> (8 * j0));
+        o = make_float4((float)byte(gw, 0) * sgn(signs, j0), (float)byte(gw, 1) * sgn(signs, j0 + 1), (float)byte(gw, 2) * sgn(signs, j0 + 2),
+                        (float)byte(gw, 3) * sgn(signs, j0 + 3));
+    } else if constexpr (K == K_IQ3_XXS || K == K_IQ3_S) {
+        u32 ib = b & 7, l = j >> 1, hf = j & 1;
+        u32 gw, signs;
+        if constexpr (K == K_IQ3_XXS) {
+            const u8* B = row + 98 * (b >> 3);
+            u32 aux = rd32h(B + 66 + 4 * ib);
+            signs = ksign((aux >> (7 * l)) & 127);
+            gw = iq3xxs_grid[B[2 + 8 * ib + 2 * l + hf]];
+        } else {
+            const u8* B = row + 110 * (b >> 3);
+            u32 h = B[66 + ib];
+            u32 idx = (u32)B[2 + 8 * ib + 2 * l + hf] | ((h << (8 - 2 * l - hf)) & 256);
+            gw = iq3s_grid[idx];
+            signs = B[74 + 4 * ib + l];
+        }
+        u32 s0 = 4 * hf;
+        o = make_float4((float)byte(gw, 0) * sgn(signs, s0), (float)byte(gw, 1) * sgn(signs, s0 + 1), (float)byte(gw, 2) * sgn(signs, s0 + 2),
+                        (float)byte(gw, 3) * sgn(signs, s0 + 3));
+    } else if constexpr (K == K_IQ1_S || K == K_IQ1_M) {
+        u32 ib = b & 7, l = j >> 1, j0 = 4 * (j & 1);
+        float delta;
+        u64 g;
+        if constexpr (K == K_IQ1_S) {
+            const u8* B = row + 50 * (b >> 3);
+            u32 qh = rd16(B + 34 + 2 * ib);
+            delta = (qh & 0x8000) ? -0.125f : 0.125f;
+            g = iq1s_grid[(u32)B[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8)];
+        } else {
+            const u8* B = row + 56 * (b >> 3);
+            u32 qh = B[32 + 2 * ib + l / 2];
+            u32 idx = (u32)B[4 * ib + l] | ((qh << (l % 2 ? 4 : 8)) & 0x700);
+            delta = (qh & (l % 2 ? 0x80 : 0x08)) ? -0.125f : 0.125f;
+            g = iq1s_grid[idx];
+        }
+        u32 gw = (u32)(g >> (8 * j0));
+        o = make_float4(sbyte(gw, 0) + delta, sbyte(gw, 1) + delta, sbyte(gw, 2) + delta, sbyte(gw, 3) + delta);
+    } else {
+        o = make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+    return o;
+}
+
+// The (scale, minimum) of elements 32 b + 16 half .. + 15 of a row (before a matrix's block
+// scales and factors).
+template <int K>
+__device__ __forceinline__ float2 dqs(const u8* row, u32 b, u32 half) {
+    if constexpr (K == K_Q8_0) return make_float2(h2f(rd16(row + 34 * b)), 0.f);
+    else if constexpr (K == K_Q4_0 || K == K_IQ4_NL) return make_float2(h2f(rd16(row + 18 * b)), 0.f);
+    else if constexpr (K == K_Q4_1) return make_float2(h2f(rd16(row + 20 * b)), h2f(rd16(row + 20 * b + 2)));
+    else if constexpr (K == K_Q5_0) return make_float2(h2f(rd16(row + 22 * b)), 0.f);
+    else if constexpr (K == K_Q5_1) return make_float2(h2f(rd16(row + 24 * b)), h2f(rd16(row + 24 * b + 2)));
+    else if constexpr (K == K_MXFP4) return make_float2(e8m0_half(row[17 * b]), 0.f);
+    else if constexpr (K == K_NVFP4) return make_float2(ue4m3_half(row[36 * (b >> 1) + 2 * (b & 1) + half]), 0.f);
+    else if constexpr (K == K_Q4_K || K == K_Q5_K) {
+        const u8* B = row + (K == K_Q4_K ? 144 : 176) * (b >> 3);
+        float sc, mn;
+        scale_min_k4(b & 7, B + 4, sc, mn);
+        return make_float2(h2f(rd16(B)) * sc, -h2f(rd16(B + 2)) * mn);
+    } else if constexpr (K == K_Q6_K) {
+        const u8* B = row + 210 * (b >> 3);
+        u32 sub = b & 7, n = sub >> 2, qq = sub & 3;
+        return make_float2(h2f(rd16(B + 208)) * (float)(signed char)B[192 + 8 * n + half + 2 * qq], 0.f);
+    } else if constexpr (K == K_Q3_K) {
+        const u8* B = row + 110 * (b >> 3);
+        u32 sub = b & 7, n = sub >> 2, jj = sub & 3;
+        u32 k = 8 * n + 2 * jj + half;
+        u32 a0 = rd32h(B + 96), a1 = rd32h(B + 100), tmp = rd32h(B + 104);
+        const u32 m1 = 0x03030303u, m2 = 0x0f0f0f0fu;
+        u32 aux;
+        switch (k >> 2) {
+            case 0: aux = (a0 & m2) | ((tmp & m1) << 4); break;
+            case 1: aux = (a1 & m2) | (((tmp >> 2) & m1) << 4); break;
+            case 2: aux = ((a0 >> 4) & m2) | (((tmp >> 4) & m1) << 4); break;
+            default: aux = ((a1 >> 4) & m2) | (((tmp >> 6) & m1) << 4); break;
+        }
+        return make_float2(h2f(rd16(B + 108)) * (float)((int)(signed char)(u8)(aux >> (8 * (k & 3))) - 32), 0.f);
+    } else if constexpr (K == K_Q2_K) {
+        const u8* B = row + 84 * (b >> 3);
+        u32 sub = b & 7, n = sub >> 2, jj = sub & 3;
+        u32 sv = B[8 * n + 2 * jj + half];
+        return make_float2(h2f(rd16(B + 80)) * (float)(sv & 15), -h2f(rd16(B + 82)) * (float)(sv >> 4));
+    } else if constexpr (K == K_IQ4_XS) {
+        const u8* B = row + 136 * (b >> 3);
+        u32 ib = b & 7;
+        int ls = (int)(((B[4 + ib / 2] >> (4 * (ib % 2))) & 15) | (((rd16(B + 2) >> (2 * ib)) & 3) << 4)) - 32;
+        return make_float2(h2f(rd16(B)) * (float)ls, 0.f);
+    } else if constexpr (K == K_IQ2_XXS) {
+        const u8* B = row + 66 * (b >> 3);
+        u32 a1 = rd32h(B + 6 + 8 * (b & 7));
+        return make_float2(h2f(rd16(B)) * (0.5f + (float)(a1 >> 28)) * 0.25f, 0.f);
+    } else if constexpr (K == K_IQ2_XS || K == K_IQ2_S) {
+        const u8* B = row + (K == K_IQ2_XS ? 74 : 82) * (b >> 3);
+        u32 sv = B[(K == K_IQ2_XS ? 66 : 74) + (b & 7)];
+        return make_float2(h2f(rd16(B)) * (0.5f + (float)(half ? (sv >> 4) : (sv & 15))) * 0.25f, 0.f);
+    } else if constexpr (K == K_IQ3_XXS) {
+        const u8* B = row + 98 * (b >> 3);
+        u32 aux = rd32h(B + 66 + 4 * (b & 7));
+        return make_float2(h2f(rd16(B)) * (0.5f + (float)(aux >> 28)) * 0.5f, 0.f);
+    } else if constexpr (K == K_IQ3_S) {
+        const u8* B = row + 110 * (b >> 3);
+        u32 ib = b & 7;
+        u32 sv = B[106 + ib / 2] >> (4 * (ib % 2));
+        return make_float2(h2f(rd16(B)) * (float)(1 + 2 * (sv & 15)), 0.f);
+    } else if constexpr (K == K_IQ1_S) {
+        const u8* B = row + 50 * (b >> 3);
+        u32 qh = rd16(B + 34 + 2 * (b & 7));
+        return make_float2(h2f(rd16(B)) * (float)(2 * ((qh >> 12) & 7) + 1), 0.f);
+    } else if constexpr (K == K_IQ1_M) {
+        const u8* B = row + 56 * (b >> 3);
+        u32 ib = b & 7;
+        u32 s0 = rd16(B + 48), s1 = rd16(B + 50), s2 = rd16(B + 52), s3 = rd16(B + 54);
+        float d = h2f((u16)((s0 >> 12) | ((s1 >> 8) & 0x00f0) | ((s2 >> 4) & 0x0f00) | (s3 & 0xf000)));
+        u32 sv = rd16(B + 48 + 2 * (ib / 2)) >> (6 * (ib % 2));
+        return make_float2(d * (float)(2 * ((sv >> (half ? 3 : 0)) & 7) + 1), 0.f);
+    } else {
+        return make_float2(1.f, 0.f);
+    }
+}
+
+template <int K>
+__device__ __forceinline__ void gemmi_body(const W& w, const GemmP& p) {
+    // The activations' halves, the weights' values, per 16-wide step the scales and minima of the
+    // weight rows and the activations' sums; the 64 x 65 outputs of the act epilogue after.
+    __shared__ u32 smem[GBM * 65 > 3 * GBM * GLD + 6 * 64 ? GBM * 65 : 3 * GBM * GLD + 6 * 64];
+    u32* As = smem;
+    u32* Al = smem + GBM * GLD;
+    u32* Bs = smem + 2 * GBM * GLD;
+    float* Ssc = (float*)(smem + 3 * GBM * GLD); // [2][64]
+    float* Smn = Ssc + 128;                      // [2][64]
+    float* Xsm = Smn + 128;                      // [2][64]
+    u32 tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    u32 e = 0, r0, nr;
+    if (p.tiles) {
+        if (blockIdx.y >= *p.ntiles) return;
+        Tile tl = p.tiles[blockIdx.y];
+        e = tl.e;
+        r0 = tl.r0;
+        nr = tl.n;
+    } else {
+        r0 = blockIdx.y * GBM;
+        if (r0 >= p.rows) return;
+        nr = min(GBM, p.rows - r0);
+    }
+    const u8* base = w.q + (u64)e * w.es;
+    const float* sbase = w.s ? w.s + (u64)e * w.ss : w.s;
+    float f = w.f * (w.ef ? w.ef[e] : 1.f);
+    u32 n0 = blockIdx.x * (p.mode == 2 ? 32 : GBN);
+    u32 lr = tid >> 1, lh = tid & 1;
+    const float* xrow = nullptr;
+    const u32 *xhr = nullptr, *xlr = nullptr;
+    if (lr < nr) {
+        u32 gr = r0 + lr;
+        u32 src = p.gidx ? (u32)p.gidx[gr] : gr;
+        xrow = p.x + (u64)src * p.xs;
+        if (p.xh) {
+            xhr = p.xh + (u64)src * (p.n_in / 2);
+            xlr = p.xl + (u64)src * (p.n_in / 2);
+        }
+    }
+    u32 wr;
+    bool wok;
+    if (p.mode == 2) {
+        u32 jj = n0 + (lr & 31);
+        wok = jj < p.mi;
+        wr = lr < 32 ? (p.inter ? 2 * jj : jj) : (p.inter ? 2 * jj + 1 : p.mi + jj);
+    } else {
+        wr = n0 + lr;
+        wok = wr < p.n_out;
+    }
+    const u8* wrow = base + (u64)wr * w.rb;
+    float acc[2][4][4];
+#pragma unroll
+    for (int a = 0; a < 2; a++)
+#pragma unroll
+        for (int b = 0; b < 4; b++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) acc[a][b][c] = 0.f;
+    u32 wm = (warp >> 1) * 32, wn = (warp & 1) * 32;
+    u32 g = lane >> 2, c4 = lane & 3;
+    u32 nb = p.n_in / 32;
+    for (u32 b = 0; b < nb; b++) {
+        // X: this thread's 16 values (half lh of the step) as split halves, and their sum.
+        float xs = 0.f;
+        if (xhr) {
+            const uint4* ph = (const uint4*)(xhr + 16 * b + 8 * lh);
+            const uint4* pl = (const uint4*)(xlr + 16 * b + 8 * lh);
+            uint4 h0 = ph[0], h1 = ph[1], l0 = pl[0], l1 = pl[1];
+            u32* ah = As + lr * GLD + 8 * lh;
+            u32* al2 = Al + lr * GLD + 8 * lh;
+            ah[0] = h0.x, ah[1] = h0.y, ah[2] = h0.z, ah[3] = h0.w, ah[4] = h1.x, ah[5] = h1.y, ah[6] = h1.z, ah[7] = h1.w;
+            al2[0] = l0.x, al2[1] = l0.y, al2[2] = l0.z, al2[3] = l0.w, al2[4] = l1.x, al2[5] = l1.y, al2[6] = l1.z, al2[7] = l1.w;
+            if constexpr (has_min<K>()) {
+                const float4* xp = (const float4*)(xrow + 32 * b + 16 * lh);
+#pragma unroll
+                for (int i = 0; i < 4; i++) {
+                    float4 v = xp[i];
+                    xs += (v.x + v.y) + (v.z + v.w);
+                }
+            }
+        } else if (xrow) {
+            const float4* xp = (const float4*)(xrow + 32 * b + 16 * lh);
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                float4 v = xp[i];
+                u32 at = lr * GLD + 8 * lh + 2 * i;
+                split_h2(v.x, v.y, As[at], Al[at]);
+                split_h2(v.z, v.w, As[at + 1], Al[at + 1]);
+                xs += (v.x + v.y) + (v.z + v.w);
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < 8; i++) As[lr * GLD + 8 * lh + i] = Al[lr * GLD + 8 * lh + i] = 0u;
+        }
+        Xsm[lh * 64 + lr] = xs;
+        // W: the 16 values of half lh (exact in f16), its scale and minimum.
+        if (wok) {
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                float4 v = dqi<K>(wrow, b, 4 * lh + i);
+                u32 at = lr * GLD + 8 * lh + 2 * i;
+                Bs[at] = pack_h2(v.x, v.y);
+                Bs[at + 1] = pack_h2(v.z, v.w);
+            }
+            float2 sm = dqs<K>(wrow, b, lh);
+            if constexpr (BLOCK_SCALED(K)) {
+                float bs = sbase[(wr / w.sr) * w.ncb + (32 * b) / w.sc];
+                sm.x *= bs;
+                sm.y *= bs;
+            }
+            Ssc[lh * 64 + lr] = sm.x;
+            Smn[lh * 64 + lr] = sm.y;
+        } else {
+#pragma unroll
+            for (int i = 0; i < 8; i++) Bs[lr * GLD + 8 * lh + i] = 0u;
+            Ssc[lh * 64 + lr] = 0.f;
+            Smn[lh * 64 + lr] = 0.f;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < 2; kk++) {
+            u32 kb = 8 * kk;
+            u32 af[2][4], al[2][4], bf[4][2];
+#pragma unroll
+            for (int mt = 0; mt < 2; mt++) {
+                u32 rb = (wm + 16 * mt + g) * GLD + kb + c4;
+                af[mt][0] = As[rb];
+                af[mt][1] = As[rb + 8 * GLD];
+                af[mt][2] = As[rb + 4];
+                af[mt][3] = As[rb + 8 * GLD + 4];
+                al[mt][0] = Al[rb];
+                al[mt][1] = Al[rb + 8 * GLD];
+                al[mt][2] = Al[rb + 4];
+                al[mt][3] = Al[rb + 8 * GLD + 4];
+            }
+#pragma unroll
+            for (int nt = 0; nt < 4; nt++) {
+                u32 cb = (wn + 8 * nt + g) * GLD + kb + c4;
+                bf[nt][0] = Bs[cb];
+                bf[nt][1] = Bs[cb + 4];
+            }
+#pragma unroll
+            for (int mt = 0; mt < 2; mt++)
+#pragma unroll
+                for (int nt = 0; nt < 4; nt++) {
+                    float st[4] = {0.f, 0.f, 0.f, 0.f}, stl[4] = {0.f, 0.f, 0.f, 0.f};
+                    mma16816(st, af[mt], bf[nt]);
+                    mma16816(stl, al[mt], bf[nt]);
+#pragma unroll
+                    for (int q = 0; q < 4; q++) {
+                        u32 rr = wm + 16 * mt + g + 8 * (q >> 1), cc = wn + 8 * nt + 2 * c4 + (q & 1);
+                        float v = st[q] + stl[q] * (1.f / 2048.f);
+                        acc[mt][nt][q] += Ssc[kk * 64 + cc] * v;
+                        if constexpr (has_min<K>()) acc[mt][nt][q] += Smn[kk * 64 + cc] * Xsm[kk * 64 + rr];
+                    }
+                }
+        }
+        __syncthreads();
+    }
+    if (p.mode == 2) {
+        float* Cs = (float*)smem;
+#pragma unroll
+        for (int mt = 0; mt < 2; mt++)
+#pragma unroll
+            for (int nt = 0; nt < 4; nt++)
+#pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    u32 rr = wm + 16 * mt + g + 8 * (q >> 1), cc = wn + 8 * nt + 2 * c4 + (q & 1);
+                    Cs[rr * 65 + cc] = acc[mt][nt][q] * f;
+                }
+        __syncthreads();
+        for (u32 i = tid; i < GBM * 32; i += 128) {
+            u32 rr = i >> 5, cc = i & 31;
+            if (rr < nr && n0 + cc < p.mi) p.y[(u64)(r0 + rr) * p.ys + n0 + cc] = situ(Cs[rr * 65 + cc], Cs[rr * 65 + 32 + cc], p.beta, p.lbeta);
+        }
+        return;
+    }
+#pragma unroll
+    for (int mt = 0; mt < 2; mt++)
+#pragma unroll
+        for (int nt = 0; nt < 4; nt++)
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                u32 rr = wm + 16 * mt + g + 8 * (q >> 1), cc = n0 + wn + 8 * nt + 2 * c4 + (q & 1);
+                if (rr < nr && cc < p.n_out) {
+                    float v = acc[mt][nt][q] * f;
+                    float* o = p.y + (u64)(r0 + rr) * p.ys + cc;
+                    if (p.mode == 1) v += *o;
+                    if (p.mode == 3) v *= p.wrow[r0 + rr];
+                    *o = v;
+                }
+            }
+}
+
+template <int K>
+__device__ __forceinline__ void gemmi_any(const W& w, const GemmP& p) {
+    if constexpr (int_ok<K>())
+        gemmi_body<K>(w, p);
+    else
+        gemm_body<K, true>(w, p);
+}
+
 #define KERNELS(K)                                                                                                                         \
     extern "C" __global__ void __launch_bounds__(128) mv_##K(W w, const float* x, float* y, u32 n_in, u32 n_out, u32 xs, u32 ys, u32 mode) { \
         mv_body<K>(w, x, y, n_in, n_out, xs, ys, mode);                                                                                    \
@@ -878,7 +1314,7 @@ __device__ __forceinline__ void gemm_body(const W& w, const GemmP& p) {
         moe_dn_body<K>(w, ids, wts, mid, y, h, mi, k, ys);                                                                                 \
     }                                                                                                                                      \
     extern "C" __global__ void __launch_bounds__(128) gemm_##K(W w, GemmP p) { gemm_body<K, false>(w, p); }                  \
-    extern "C" __global__ void __launch_bounds__(128) gemmx_##K(W w, GemmP p) { gemm_body<K, true>(w, p); }                         \
+    extern "C" __global__ void __launch_bounds__(128) gemmi_##K(W w, GemmP p) { gemmi_any<K>(w, p); }                         \
     extern "C" __global__ void __launch_bounds__(256) mvm_##K(MvJobs p) { mvm_body<K>(p); }                                  \
     extern "C" __global__ void __launch_bounds__(256)                                                                                      \
         gate_down_##K(W w, const float* x, const float* m, float* d, u32 h, u32 r, float eps) {                                            \
