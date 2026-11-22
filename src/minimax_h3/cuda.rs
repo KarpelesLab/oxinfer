@@ -51,6 +51,7 @@ dlsym::library! {
             pub fn cuEventDestroy_v2(event: *mut c_void) -> c_int;
             pub fn cuModuleGetFunction(f: *mut *mut c_void, module: *mut c_void, name: *const c_char) -> c_int;
             pub fn cuModuleUnload(module: *mut c_void) -> c_int;
+            pub fn cuFuncSetAttribute(f: *mut c_void, attrib: c_int, value: c_int) -> c_int;
             pub fn cuCtxSetCurrent(ctx: *mut c_void) -> c_int;
             pub fn cuLaunchKernel(
                 f: *mut c_void, gx: u32, gy: u32, gz: u32, bx: u32, by: u32, bz: u32,
@@ -108,6 +109,35 @@ struct GemmP {
     f: f32,
     pad: u32,
 }
+
+/// `AttP` of `cuda.cu`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AttP {
+    qh: u64,
+    ql: u64,
+    kh: u64,
+    kl: u64,
+    vh: u64,
+    vl: u64,
+    vs: u64,
+    out: u64,
+    os: u64,
+    n: u32,
+    nk: u32,
+    scale: f32,
+    pad: u32,
+}
+
+/// The shared memory of an `attn_flash` block for heads of `hd` (bytes): two planes each of 64
+/// queries, of 64 keys or `hd` value rows, and of 64 rows of probabilities, and eight floats per
+/// query.
+fn flash_smem(hd: usize) -> u32 {
+    let (q, p) = (64 * (hd / 2 + 4), 64 * 36);
+    ((2 * q + 2 * q.max(hd * 36) + 2 * p + 8 * 64) * 4) as u32
+}
+/// `CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES`.
+const MAX_DYNAMIC_SHARED: c_int = 8;
 
 /// A float matrix as half planes: `rows` of `cols / 2` words (two halves each; `cols` padded to a
 /// multiple of 32 with zeros), the values times a power of two that brings the largest into
@@ -424,6 +454,7 @@ struct Funcs {
     v_scale: F,
     v_planes: F,
     softmax_split: F,
+    attn_flash: F,
 }
 
 pub(super) struct Engine {
@@ -446,6 +477,9 @@ pub(super) struct Engine {
     /// The scores of one attention launch (bytes) and the rows of a feed-forward chunk, at most.
     score_bytes: usize,
     chunk_rows: usize,
+    /// The attention runs without a score matrix (`attn_flash`: heads 64 or 128 wide, and a device that
+    /// gives a block its shared memory; `OXINFER_H3_GPU_FLASH=0` keeps the three-launch form).
+    flash: bool,
 }
 
 // SAFETY: the raw pointers are driver handles; every use binds the context and goes through
@@ -567,7 +601,11 @@ impl Engine {
             v_scale: get("v_scale")?,
             v_planes: get("v_planes")?,
             softmax_split: get("softmax_split")?,
+            attn_flash: get(if hd == 128 { "attn_flash_128" } else { "attn_flash_64" })?,
         };
+        let flash = (hd == 64 || hd == 128)
+            && !std::env::var("OXINFER_H3_GPU_FLASH").is_ok_and(|v| v == "0")
+            && unsafe { x.cuFuncSetAttribute(f.attn_flash, MAX_DYNAMIC_SHARED, flash_smem(hd) as c_int) } == 0;
         let mut stream = std::ptr::null_mut();
         // Non-blocking: host copies do not wait for the kernels in flight.
         if unsafe { x.cuStreamCreate(&mut stream, 1) } != 0 {
@@ -600,10 +638,17 @@ impl Engine {
                 events,
             }),
             failed: AtomicBool::new(false),
-            prof: std::env::var("OXINFER_H3_GPU_PROF").is_ok_and(|v| v != "0"),
+            // The stages of one stack: the transformer's, or the VAE decoder's with `vae`.
+            prof: std::env::var("OXINFER_H3_GPU_PROF").is_ok_and(|v| v != "0" && (v == "vae") == (what != "transformer")),
             score_bytes: SCORE_BYTES,
             chunk_rows: usize::MAX,
+            flash,
         })
+    }
+
+    /// Whether the attention runs as `attn_flash` (split operands only).
+    fn flash_on(&self) -> bool {
+        self.flash && exact()
     }
 
     fn alloc(&self, bytes: usize) -> Option<u64> {
@@ -646,7 +691,7 @@ impl Engine {
         // The largest of: q, k, v of every row; the attention's output, one launch's scores and
         // their planes; a feed-forward chunk's gate / value rows and activations.
         let a = n * 3 * inner * 4;
-        let b = n * inner * 4 + 2 * qc * nk * 4;
+        let b = n * inner * 4 + if self.flash_on() { 0 } else { 2 * qc * nk * 4 };
         let rc = (a.max(b) / (3 * ffn * 4) / 64 * 64).clamp(64, n64).min(n).min(self.chunk_rows);
         let big = a.max(b).max(rc * 3 * ffn * 4);
         let plane = heads * nk * hd * 2;
@@ -728,6 +773,17 @@ impl Engine {
                 }
             }
         }
+        debug(
+            self.what,
+            &format!(
+                "{n} rows of {} ({} heads of {}, feed-forward {}): {:.2} GB of activations {caps:?}",
+                self.spec.hidden,
+                self.spec.heads,
+                self.spec.head_dim,
+                self.spec.ffn,
+                total as f64 / 1e9
+            ),
+        );
         st.arena = Arena { caps, all: ptrs };
         true
     }
@@ -784,6 +840,11 @@ impl Engine {
     }
 
     fn go(&self, f: F, grid: (u32, u32), block: u32, args: &mut [*mut c_void]) {
+        self.go_shared(f, grid, block, 0, args)
+    }
+
+    /// A launch with `shmem` bytes of dynamic shared memory per block.
+    fn go_shared(&self, f: F, grid: (u32, u32), block: u32, shmem: u32, args: &mut [*mut c_void]) {
         let rc = unsafe {
             self.x.cuLaunchKernel(
                 f,
@@ -793,7 +854,7 @@ impl Engine {
                 block,
                 1,
                 1,
-                0,
+                shmem,
                 self.stream,
                 args.as_mut_ptr(),
                 std::ptr::null_mut(),
@@ -804,7 +865,8 @@ impl Engine {
         }
     }
 
-    /// Ends a stage of the profile (`OXINFER_H3_GPU_PROF=1`: waits for the device).
+    /// Ends a stage of the profile (`OXINFER_H3_GPU_PROF=1`, or `vae` for the VAE decoder's
+    /// blocks: waits for the device).
     fn mark(&self, t: &mut crate::clock::Instant, k: usize) {
         if self.prof {
             unsafe { self.x.cuStreamSynchronize(self.stream) };
@@ -1056,7 +1118,26 @@ impl Engine {
             let scores = att + (n * inner * 4) as u64;
             let ps = [scores + (qc * nk * 4) as u64, scores + (qc * nk * 6) as u64];
             let words = |rows: usize| (rows * (hd / 2) * 4) as u64;
-            for q0 in (0..n).step_by(qc) {
+            let flash = self.flash_on();
+            if flash {
+                let p = AttP {
+                    qh: bf.qp[0],
+                    ql: bf.qp[1],
+                    kh: bf.kp[0],
+                    kl: bf.kp[1],
+                    vh: bf.vp[0],
+                    vl: bf.vp[1],
+                    vs: bf.vs,
+                    out: att,
+                    os: inner as u64,
+                    n: nu,
+                    nk: nk as u32,
+                    scale,
+                    pad: 0,
+                };
+                self.go_shared(self.f.attn_flash, (ceil(n, 64), heads as u32), 256, flash_smem(hd), &mut args![p]);
+            }
+            for q0 in (0..n).step_by(qc).filter(|_| !flash) {
                 let qn = qc.min(n - q0);
                 for hh in 0..heads {
                     let p = GemmP {
@@ -1431,10 +1512,11 @@ mod tests {
     fn stacks_match_definition() {
         use super::super::stack_dev::Engine as _;
         let Some(be) = backend() else { return };
-        let (h, heads, hd, ffn, half, n) = (64usize, 2usize, 64usize, 96usize, 24usize, 150usize);
-        let inner = heads * hd;
-        for dit in [true, false] {
-            let mut r = Rng(if dit { 7 } else { 11 });
+        let (h, heads, ffn, half, n) = (64usize, 2usize, 96usize, 24usize, 150usize);
+        // Heads of 128 as the transformer's, of 64 as the VAE's.
+        for (dit, hd) in [(true, 64usize), (false, 64), (true, 128)] {
+            let inner = heads * hd;
+            let mut r = Rng(if dit { 7 } else { 11 } + hd as u64);
             let blocks: Vec<TBlock> = (0..2)
                 .map(|bi| TBlock {
                     lins: [
@@ -1474,15 +1556,20 @@ mod tests {
             });
             let want = reference(&st, &x, ada, &cos, &sin);
             let peak = want.iter().fold(0f64, |m, v| m.max(v.abs()));
-            for chunked in [false, true] {
+            for (chunked, flash) in [(false, true), (true, true), (false, false), (true, false)] {
                 let mut e = Engine::build(be, &st, "test").unwrap();
                 if chunked {
                     (e.score_bytes, e.chunk_rows) = (1, 64);
                 }
+                assert!(e.flash, "no shared memory for the attention kernel");
+                e.flash = flash;
                 let mut got = x.clone();
                 assert!(e.run(&st, &mut got, ada, &cos, &sin), "the device declined");
                 let err = got.iter().zip(&want).map(|(a, b)| (*a as f64 - b).abs()).fold(0f64, f64::max);
-                assert!(err < 2e-5 * peak, "dit {dit}, chunked {chunked}: max error {err:e} of {peak:e}");
+                assert!(
+                    err < 2e-5 * peak,
+                    "dit {dit}, heads of {hd}, chunked {chunked}, flash {flash}: max error {err:e} of {peak:e}"
+                );
                 // The same again after a release.
                 e.release();
                 let mut again = x.clone();

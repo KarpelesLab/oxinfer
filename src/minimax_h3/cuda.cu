@@ -440,3 +440,255 @@ extern "C" __global__ void __launch_bounds__(256) softmax_split(float* s, u32 co
     }
     if (tid == 0) prs[r] = vs[0] * (1.f / 16384.f);
 }
+
+// ---- attention without the score matrix (heads of HD = 64 or 128): one 256-thread block per
+// (64 queries, head) walks the keys 64 at a time. Per step: the scores of 64 x 64 (three
+// tensor-core products of the query and key planes) stay in the accumulators; each row's running
+// maximum m and sum l are updated, the sums so far rescaled by exp(m_old - m_new); exp(s - m) 2^14
+// goes to shared memory as half planes and is multiplied with the 64 keys' value planes (three
+// products). out[q][c] = O / l vs[head] 2^-14. Shared memory: dynamic, see `flash_smem` in
+// cuda.rs. q, k: planes [head][n][HD / 2 words]; v: planes [head][HD][nk / 2 words].
+
+#define FQ 64
+#define FK 64
+#define PLD 36 // words per shared row of 64 halves
+
+struct AttP {
+    const u32* qh;
+    const u32* ql;
+    const u32* kh;
+    const u32* kl;
+    const u32* vh;
+    const u32* vl;
+    const float* vs;
+    float* out;
+    u64 os;
+    u32 n, nk;
+    float scale;
+    u32 pad;
+};
+
+__device__ __forceinline__ void put8(u32* d, const u32* s) {
+    uint4 a = ((const uint4*)s)[0], b = ((const uint4*)s)[1];
+    d[0] = a.x, d[1] = a.y, d[2] = a.z, d[3] = a.w, d[4] = b.x, d[5] = b.y, d[6] = b.z, d[7] = b.w;
+}
+__device__ __forceinline__ void zero8(u32* d) {
+#pragma unroll
+    for (int i = 0; i < 8; i++) d[i] = 0u;
+}
+
+// One 32-wide K step (from word k0) of a warp's 32 x 8 NT products: A rows from `a0` on in `ah` /
+// `al` (rows of `ald` words), B rows from `b0` on in `bh` / `bl`, three products; their sum
+// `hi + lo / 2048` is added to `acc`.
+template <int NT>
+__device__ __forceinline__ void flash_step(float acc[2][NT][4], const u32* ah, const u32* al, u32 ald, const u32* bh, const u32* bl, u32 bld, u32 a0, u32 b0, u32 g, u32 c4, u32 k0) {
+    float st[2][NT][4], stl[2][NT][4];
+#pragma unroll
+    for (int a = 0; a < 2; a++)
+#pragma unroll
+        for (int b = 0; b < NT; b++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) st[a][b][c] = stl[a][b][c] = 0.f;
+#pragma unroll
+    for (int kk = 0; kk < 2; kk++) {
+        u32 kb = k0 + 8 * kk;
+        u32 af[2][4], alo[2][4], bf[NT][2], blo[NT][2];
+#pragma unroll
+        for (int mt = 0; mt < 2; mt++) {
+            u32 rb = (a0 + 16 * mt + g) * ald + kb + c4;
+            af[mt][0] = ah[rb], af[mt][1] = ah[rb + 8 * ald], af[mt][2] = ah[rb + 4], af[mt][3] = ah[rb + 8 * ald + 4];
+            alo[mt][0] = al[rb], alo[mt][1] = al[rb + 8 * ald], alo[mt][2] = al[rb + 4], alo[mt][3] = al[rb + 8 * ald + 4];
+        }
+#pragma unroll
+        for (int nt = 0; nt < NT; nt++) {
+            u32 cb = (b0 + 8 * nt + g) * bld + kb + c4;
+            bf[nt][0] = bh[cb], bf[nt][1] = bh[cb + 4];
+            blo[nt][0] = bl[cb], blo[nt][1] = bl[cb + 4];
+        }
+#pragma unroll
+        for (int mt = 0; mt < 2; mt++)
+#pragma unroll
+            for (int nt = 0; nt < NT; nt++) {
+                mma16816(st[mt][nt], af[mt], bf[nt]);
+                mma16816(stl[mt][nt], alo[mt], bf[nt]);
+            }
+#pragma unroll
+        for (int mt = 0; mt < 2; mt++)
+#pragma unroll
+            for (int nt = 0; nt < NT; nt++) mma16816(stl[mt][nt], af[mt], blo[nt]);
+    }
+#pragma unroll
+    for (int a = 0; a < 2; a++)
+#pragma unroll
+        for (int b = 0; b < NT; b++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) acc[a][b][c] += st[a][b][c] + stl[a][b][c] * (1.f / 2048.f);
+}
+
+template <int HD>
+__device__ __forceinline__ void flash_body(const AttP& p) {
+    const u32 HW = HD / 2, QLD = HW + 4;
+    const u32 BW = FK * QLD > HD * PLD ? FK * QLD : HD * PLD;
+    const int NO = HD / 32; // 8-wide output tiles per warp (a quarter of the head's channels)
+    extern __shared__ u32 sm[];
+    u32* Qh = sm;
+    u32* Ql = Qh + FQ * QLD;
+    u32* Bh = Ql + FQ * QLD; // the step's keys (rows of QLD), then its values (HD rows of PLD)
+    u32* Bl = Bh + BW;
+    u32* Ph = Bl + BW;
+    u32* Pl = Ph + FQ * PLD;
+    float* rmax = (float*)(Pl + FQ * PLD); // [4][FQ]: per key quarter of the step
+    float* rsum = rmax + 4 * FQ;
+    u32 tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    u32 head = blockIdx.y, q0 = blockIdx.x * FQ;
+    if (q0 >= p.n) return;
+    u32 nq = min((u32)FQ, p.n - q0);
+    // A thread's part of a 64-row tile of HD halves: a quarter of a row.
+    u32 tr = tid >> 2, to = (HW / 4) * (tid & 3);
+#pragma unroll
+    for (u32 i = 0; i < HW / 4; i += 8) {
+        if (tr < nq) {
+            u64 at = ((u64)head * p.n + q0 + tr) * HW + to + i;
+            put8(Qh + tr * QLD + to + i, p.qh + at);
+            put8(Ql + tr * QLD + to + i, p.ql + at);
+        } else {
+            zero8(Qh + tr * QLD + to + i);
+            zero8(Ql + tr * QLD + to + i);
+        }
+    }
+    // Its part of the HD rows of 64 values: 256 / HD threads per row.
+    const u32 TPR = 256 / HD;
+    u32 vr = tid / TPR, vo = (32 / TPR) * (tid % TPR);
+    // This warp's 32 queries, its 16 keys of a step, its HD / 4 output channels.
+    u32 wm = (warp >> 2) * 32, kw = warp & 3, wn = kw * 16, cn = kw * (HD / 4);
+    u32 g = lane >> 2, c4 = lane & 3;
+    const float ninf = -__int_as_float(0x7f800000);
+    // Per thread: 4 rows (mt, q >> 1).
+    float o[2][NO][4], m[2][2], l[2][2];
+#pragma unroll
+    for (int a = 0; a < 2; a++) {
+#pragma unroll
+        for (int b = 0; b < NO; b++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) o[a][b][c] = 0.f;
+        m[a][0] = m[a][1] = ninf;
+        l[a][0] = l[a][1] = 0.f;
+    }
+    u32 half_nk = p.nk / 2;
+    for (u32 k0 = 0; k0 < p.n; k0 += FK) {
+#pragma unroll
+        for (u32 i = 0; i < HW / 4; i += 8) {
+            if (k0 + tr < p.n) {
+                u64 at = ((u64)head * p.n + k0 + tr) * HW + to + i;
+                put8(Bh + tr * QLD + to + i, p.kh + at);
+                put8(Bl + tr * QLD + to + i, p.kl + at);
+            } else {
+                zero8(Bh + tr * QLD + to + i);
+                zero8(Bl + tr * QLD + to + i);
+            }
+        }
+        __syncthreads();
+        float s[2][2][4];
+#pragma unroll
+        for (int a = 0; a < 2; a++)
+#pragma unroll
+            for (int b = 0; b < 2; b++)
+#pragma unroll
+                for (int c = 0; c < 4; c++) s[a][b][c] = 0.f;
+#pragma unroll
+        for (u32 k = 0; k < HW; k += 16) flash_step<2>(s, Qh, Ql, QLD, Bh, Bl, QLD, wm, wn, g, c4, k);
+        // The scaled scores (keys past n: -inf) and each row's maximum over this warp's keys.
+#pragma unroll
+        for (int mt = 0; mt < 2; mt++) {
+            float mx[2] = {ninf, ninf};
+#pragma unroll
+            for (int nt = 0; nt < 2; nt++)
+#pragma unroll
+                for (int q = 0; q < 4; q++) {
+                    u32 kc = k0 + wn + 8 * nt + 2 * c4 + (q & 1);
+                    float v = kc < p.n ? s[mt][nt][q] * p.scale : ninf;
+                    s[mt][nt][q] = v;
+                    mx[q >> 1] = fmaxf(mx[q >> 1], v);
+                }
+#pragma unroll
+            for (int hq = 0; hq < 2; hq++) {
+                float v = mx[hq];
+                v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 1));
+                v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, 2));
+                if (c4 == 0) rmax[kw * FQ + wm + 16 * mt + g + 8 * hq] = v;
+            }
+        }
+        __syncthreads();
+        // Every warp has its scores: the keys' place takes the values of the step's keys.
+#pragma unroll
+        for (u32 i = 0; i < 32 / TPR; i += 8) {
+            u32 w0 = k0 / 2 + vo + i;
+            if (w0 < half_nk) {
+                u64 at = ((u64)head * HD + vr) * half_nk + w0;
+                put8(Bh + vr * PLD + vo + i, p.vh + at);
+                put8(Bl + vr * PLD + vo + i, p.vl + at);
+            } else {
+                zero8(Bh + vr * PLD + vo + i);
+                zero8(Bl + vr * PLD + vo + i);
+            }
+        }
+        float alpha[2][2];
+#pragma unroll
+        for (int mt = 0; mt < 2; mt++) {
+#pragma unroll
+            for (int hq = 0; hq < 2; hq++) {
+                u32 rr = wm + 16 * mt + g + 8 * hq;
+                float mn = fmaxf(fmaxf(m[mt][hq], rmax[rr]), fmaxf(rmax[FQ + rr], fmaxf(rmax[2 * FQ + rr], rmax[3 * FQ + rr])));
+                alpha[mt][hq] = expf(m[mt][hq] - mn);
+                m[mt][hq] = mn;
+            }
+            float sum[2] = {0.f, 0.f};
+#pragma unroll
+            for (int nt = 0; nt < 2; nt++)
+#pragma unroll
+                for (int hq = 0; hq < 2; hq++) {
+                    float e0 = expf(s[mt][nt][2 * hq] - m[mt][hq]);
+                    float e1 = expf(s[mt][nt][2 * hq + 1] - m[mt][hq]);
+                    sum[hq] += e0 + e1;
+                    u32 at = (wm + 16 * mt + g + 8 * hq) * PLD + (wn >> 1) + 4 * nt + c4;
+                    split_h2(e0 * 16384.f, e1 * 16384.f, Ph[at], Pl[at]);
+                }
+#pragma unroll
+            for (int hq = 0; hq < 2; hq++) {
+                float v = sum[hq];
+                v += __shfl_xor_sync(0xffffffffu, v, 1);
+                v += __shfl_xor_sync(0xffffffffu, v, 2);
+                if (c4 == 0) rsum[kw * FQ + wm + 16 * mt + g + 8 * hq] = v;
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int mt = 0; mt < 2; mt++) {
+#pragma unroll
+            for (int hq = 0; hq < 2; hq++) {
+                u32 rr = wm + 16 * mt + g + 8 * hq;
+                l[mt][hq] = l[mt][hq] * alpha[mt][hq] + ((rsum[rr] + rsum[FQ + rr]) + (rsum[2 * FQ + rr] + rsum[3 * FQ + rr]));
+            }
+#pragma unroll
+            for (int nt = 0; nt < NO; nt++)
+#pragma unroll
+                for (int q = 0; q < 4; q++) o[mt][nt][q] *= alpha[mt][q >> 1];
+        }
+        flash_step<NO>(o, Ph, Pl, PLD, Bh, Bl, PLD, wm, cn, g, c4, 0);
+        flash_step<NO>(o, Ph, Pl, PLD, Bh, Bl, PLD, wm, cn, g, c4, 16);
+        __syncthreads();
+    }
+    float f = p.vs[head] * (1.f / 16384.f);
+#pragma unroll
+    for (int mt = 0; mt < 2; mt++)
+#pragma unroll
+        for (int nt = 0; nt < NO; nt++)
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                u32 rr = wm + 16 * mt + g + 8 * (q >> 1), cc = cn + 8 * nt + 2 * c4 + (q & 1);
+                if (rr < nq) p.out[(u64)(q0 + rr) * p.os + (u64)head * HD + cc] = o[mt][nt][q] * (f / l[mt][q >> 1]);
+            }
+}
+
+extern "C" __global__ void __launch_bounds__(256) attn_flash_64(AttP p) { flash_body<64>(p); }
+extern "C" __global__ void __launch_bounds__(256) attn_flash_128(AttP p) { flash_body<128>(p); }
