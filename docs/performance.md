@@ -1335,7 +1335,8 @@ grow as in a step (the passes in flight finish first, and the copy keeps the row
   Qwen4-Exp, `OXINFER_GPU_DECODE_CHECK`, or on CUDA (its plans have no chain yet).
 - Off switch: `--gpu-chain off`, engine / server / C API key `gpu_chain=0`,
   `oxinfer::gpu::set_decode_chain(Some(false))`, or `OXINFER_GPU_CHAIN=0` (it turns off
-  Inkling-2's chain as well). `parity_bench ... chain_ab=1` alternates the two run by run.
+  Inkling-2's and DeepSeek V4.1's chains as well). `parity_bench ... chain_ab=1` alternates the
+  two run by run.
 
 **Results** (M5 Max, `parity_bench MODEL pp= tg=128 reps=3 lookup=0 draft=none mtp=0`, best of
 3; master `f588d9f` ("before"), this build with the chain off and on alternated run by run

@@ -2125,7 +2125,7 @@ impl crate::generate::TextLm for DeepSeek4Model<'_> {
         on: &mut dyn FnMut(u32) -> crate::generate::Chain,
     ) -> Option<usize> {
         #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
-        if self.cfg.v41 && v41::gpu::wanted() {
+        if self.cfg.v41 && v41::gpu::wanted() && crate::gpu::decode_chain_enabled() {
             return v41::gpu::decode_greedy(self, sess, first, max, on);
         }
         let _ = (sess, first, max, on);
