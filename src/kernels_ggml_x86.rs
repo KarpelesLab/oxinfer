@@ -10,7 +10,7 @@
 //! `scale * q` (and Q4_K / Q5_K with their mins), bit-identical to `dequantize_row`.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use super::{Act, GgmlType, GgufMatrix, QK_K, decode_i8, e8m0_half, iq4xs_scale, q3k_scales, scale_min_k4, u32at};
+use super::{Act, GgmlType, GgufMatrix, QK_K, decode_i8, e8m0_half, iq4xs_scale, q3k_scales, scale_min_k4, u32at, ue4m3_half_table};
 use crate::ggml::tables::{IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS, KVALUES_IQ4NL, KVALUES_MXFP4};
 use crate::kernels::simd::f16c_to_f32;
 use crate::quant::QBLOCK;
@@ -170,6 +170,23 @@ unsafe fn unpack(kind: GgmlType, b: &[u8], q: &mut [i8; QK_K], s: &mut [f32; 16]
             debug_assert!(b.len() >= 17);
             st(q, 0, lookup(&KVALUES_MXFP4, nibbles(p.add(1))));
             s[..2].fill(e8m0_half(b[0]));
+            false
+        }
+        NVFP4 => {
+            // Four scale bytes, then per 16 values 8 bytes: their low nibbles are values 0..8,
+            // their high nibbles values 8..16.
+            debug_assert!(b.len() >= 36);
+            let lut = ue4m3_half_table();
+            let m4 = _mm_set1_epi8(0x0F);
+            for h in 0..2 {
+                let bytes = _mm_loadu_si128(p.add(4 + 16 * h) as *const __m128i);
+                let (lo, hi) = (_mm_and_si128(bytes, m4), _mm_and_si128(_mm_srli_epi16::<4>(bytes), m4));
+                let idx = _mm256_set_m128i(_mm_unpackhi_epi64(lo, hi), _mm_unpacklo_epi64(lo, hi));
+                st(q, 32 * h, lookup(&KVALUES_MXFP4, idx));
+            }
+            for (sb, o) in s[..4].iter_mut().enumerate() {
+                *o = lut[b[sb] as usize];
+            }
             false
         }
         Q4_1 => {
@@ -701,7 +718,7 @@ mod tests {
         if skip() {
             return;
         }
-        for kind in GgmlType::ALL.into_iter().filter(|k| !k.is_float()) {
+        for kind in GgmlType::ALL.into_iter().chain([GgmlType::NVFP4]).filter(|k| !k.is_float()) {
             let mut seed = 400 + kind.id() as u64;
             let bs = kind.block_size();
             for (bi, blk) in blocks(kind, &mut seed).chunks_exact(kind.type_size()).enumerate() {
@@ -733,7 +750,7 @@ mod tests {
             return;
         }
         let n_out = 9usize;
-        for kind in GgmlType::ALL.into_iter().filter(|k| !k.is_float()) {
+        for kind in GgmlType::ALL.into_iter().chain([GgmlType::NVFP4]).filter(|k| !k.is_float()) {
             // Block-of-32 formats get a block count that is not a multiple of 4 or 8.
             let n_in = if kind.block_size() != 32 { 3 * QK_K } else { 2 * QK_K + 96 };
             let mut seed = 500 + kind.id() as u64;
