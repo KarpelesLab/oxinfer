@@ -16,9 +16,10 @@ GPU (metal #0): Apple M5 Max, memory 115.4 GB (unified with CPU)
 | Apple Silicon (macOS, iOS) | NEON kernels (CPU prefill GEMMs on the SME tiles on M4 and later, `prefill_gemm`) + Metal GEMM for prefill; on M5 / A19 the GPU matrix units (prefill GEMMs and MoE experts); single-token decode entirely on the GPU (Llama 3, Qwen3 / 3.5 / 3.8 incl. MoE, Gemma 3 / 4 incl. 26B-A4B) | measured; the f32 GEMM gives bit-identical logits to the CPU path, the matrix units (default where present) ~3e-4 relative per product (`OXINFER_METAL_MMA=0` for bit-identical); iOS: runs in the Simulator (CPU and Metal; `ios/`), Inkling-2 Mini there greedy-identical to the Mac on CPU, Metal and streamed ([iOS / iPadOS](inkling.md#ios--ipados)) |
 | Apple Neural Engine (macOS 15 / iOS 18) | Core ML, for ANEMLL-converted models | measured on macOS; builds for iOS; see [Core ML](coreml.md#core-ml--apple-neural-engine) |
 | x86-64 (Linux, Windows, macOS) | AVX2 + FMA + F16C kernels chosen at run time: bf16 / f32 dot tiles and prefill GEMM, Q8 via `maddubs`, Q4, every GGUF format, decode attention; scalar fallback below AVX2 or with `OXINFER_SIMD=scalar` (`--devices` prints the set in use). With AVX-512F the prefill GEMM takes 16 rows x 16 tokens per step and is cache-blocked by columns, bit-identical to the AVX2 GEMM (`OXINFER_SIMD=avx2` keeps the latter; see [x86-64 CPU kernels](performance.md#x86-64-cpu-kernels-november-2026)); the grid-table i-quants unpack with AVX2. With AVX-512 VNNI a language model's prompt takes the int8 prefill GEMM (`vpdpbusd`; `prefill_gemm=fast`, the default there, with the decode kernels' activation rounding; `prefill_gemm=exact` keeps the f32 GEMM; see [x86-64 CPU prefill](performance.md#x86-64-cpu-prefill-november-2026)), and without it `fast` is the f32 GEMM; a Qwen-family prompt's attention is the per-head loop with AVX2 / AVX-512 kernels (the bits of one-token attention; faster here than the score and value GEMMs other architectures take), and the Gated DeltaNet rule and element-wise passes use AVX2 / AVX-512 with the scalar loops' bits; Q4's multi-token column kernel and LoRA's dot products are NEON-only (x86 runs the token-pair and portable loops) | executed on Linux on one Zen 5 CPU (Threadripper 9970X); Windows and macOS compile only. Every AVX2 kernel is tested directly against its scalar fallback (bit for bit for the integer parts, GGUF rows and attention; 1e-6 of the summed magnitudes for the f32 sums). Qwen3.5-0.8B on 5 prompts, AVX2 against scalar: last-prompt-token logits within 4.8e-5 (bf16, Q8, Q4), same top 10; 64 greedy tokens identical in 14/15 runs, and bf16 within 5e-5 of transformers float32 with the same argmax (5/5). Q8 decode steps differ between the two by 0.4-0.6 in the largest logit (same top 1 on 317/320 teacher-forced steps), as far as either is from bf16: the integer block sums are identical (a build with the AVX2 integer path and the scalar order of f32 additions gives the scalar logits bit for bit over 169 steps), the f32 additions are ordered differently, and re-quantizing activations to int8 at every matmul amplifies that. Llama-3.2-1B GGUF (Q4_K_M, Q8_0): decode-kernel passes (`--prefill-chunk 1`) give bit-identical logits and greedy text to the portable path (10/10); with the f32 prefill GEMM the last hidden state differs by rounding (up to 1.8e-4 on values up to 17) and the logits by either ~2e-5 or 1.6e-3 to 5.7e-3: the LM head of the last token is a one-token pass on int8 activations, and the larger figure appears exactly when that rounding moves one to three of the 2048 int8 activations by one step (7/16 pseudo-random prompts on Q4_K_M, 5/16 on Q8_0; an f32 LM head pass on the same states stays within 1e-4 on all 32); on the 5 chat prompts 4.8e-3 / 3.5e-5 at most, 48 greedy tokens identical in 3/5 and 5/5 |
-| Linux / Windows + NVIDIA | CUDA driver API + NVRTC-compiled kernels (`cuda.rs`): prefill GEMMs (bf16, Q8, Q4, affine Q4, the GGUF block formats), MoE experts (resident or streamed), convolutions, group / layer norms, attention; whole decode steps, single-token and multi-token (speculative verification), over the same formats; whole-pass prefill plans for GGUF weights ([below](#cuda)); Inkling-2 / Mini whole prefill and decode passes on kernels of its own (every GGUF format but the ternary / 1-bit ones, NVFP4, MXFP8); loaded as a native binary, so a toolkit newer than the driver works | measured on Linux on one RTX 5080 (NVRTC 13.4, driver CUDA 13.2) and one RTX PRO 6000 Blackwell (Inkling-2), see [CUDA](#cuda); Windows and other GPUs not run |
+| Linux / Windows + NVIDIA | CUDA driver API + NVRTC-compiled kernels (`cuda.rs`): prefill GEMMs (bf16, Q8, Q4, affine Q4, the GGUF block formats), MoE experts (resident or streamed), convolutions, group / layer norms, attention; whole decode steps, single-token and multi-token (speculative verification), over the same formats; whole-pass prefill plans for GGUF weights ([below](#cuda)); Inkling-2 / Mini whole prefill and decode passes on kernels of its own (every GGUF format but the ternary / 1-bit ones, NVFP4, MXFP8); loaded as a native binary, so a toolkit newer than the driver works | measured on Linux on one RTX 5080 (NVRTC 13.4, driver CUDA 13.2) and one RTX PRO 6000 Blackwell (Inkling-2), see [CUDA](#cuda), and on aarch64 on one DGX Spark (GB10, compute capability 12.1, NVRTC 13.0, unified memory), see [DGX Spark](#dgx-spark-aarch64-linux); Windows and other GPUs not run |
+| aarch64 Linux | NEON kernels (dotprod, i8mm); a language model's prompt on the int8 prefill GEMM (`prefill_gemm=fast`, the default), `exact` on the NEON f32 GEMM where the cores have no SME; with an NVIDIA GPU, CUDA and Vulkan as on x86-64 | measured on one DGX Spark (10 Cortex-X925 + 10 Cortex-A725, GB10): the test suite, Qwen3.5-0.8B against transformers float32 and the three devices against each other, see [DGX Spark](#dgx-spark-aarch64-linux); no other aarch64 Linux machine run |
 | Android (aarch64) | NEON kernels | cross-compiles (`aarch64-linux-android`) |
-| Vulkan (any GPU with a Vulkan 1.0 driver) | compute shaders through the Vulkan loader (`vulkan.rs`, SPIR-V embedded in the binary): prefill GEMMs only (bf16, Q8, Q4, affine Q4); MoE experts, convolutions, norms, attention and decoding stay on the CPU | measured on Linux on one RTX 5080 (NVIDIA driver, Vulkan 1.4): logits bit-identical to the CPU path and the same greedy text for the four weight formats, see [Vulkan](#vulkan); integrated GPUs, other vendors, Windows, Android and MoltenVK not run |
+| Vulkan (any GPU with a Vulkan 1.0 driver) | compute shaders through the Vulkan loader (`vulkan.rs`, SPIR-V embedded in the binary): prefill GEMMs only (bf16, Q8, Q4, affine Q4); MoE experts, convolutions, norms, attention and decoding stay on the CPU | measured on Linux on one RTX 5080 (NVIDIA driver, Vulkan 1.4): logits bit-identical to the CPU path and the same greedy text for the four weight formats, see [Vulkan](#vulkan); the same on one integrated device, a DGX Spark's GB10 ([DGX Spark](#dgx-spark-aarch64-linux)); other vendors, Windows, Android and MoltenVK not run |
 | wasm32 (WASI) | simd128 kernels (bf16, Q8, Q4), threads via wasi-threads | measured: Qwen3.5-0.8B Q8 at 123 tok/s decode with 16 threads under wasmtime 30, identical output to native; see below |
 | Browser (Chrome 137+) | simd128 kernels + WebGPU GEMM for prefill (WGSL, via JSPI) | measured in headless Chrome 155: Qwen3.5-0.8B Q8 prefill 34 -> 231 tok/s, identical output; Firefox/Safari run the CPU path (no JSPI) |
 
@@ -378,7 +379,9 @@ equal byte for byte) and greedy decoding (up to 64 tokens) gives the same text, 
 | Qwen3.5-0.8B `--quant q4` | Q4 (also with `OXINFER_VULKAN_STAGED=0`) |
 | mlx-community/Qwen3-4B-4bit | affine Q4 |
 
-No other device or driver was run, and no speed was measured.
+On a DGX Spark's GB10 (an integrated device) the same holds for the first three, the quantized
+ones against the CPU's f32 prompt GEMM: [DGX Spark](#dgx-spark-aarch64-linux). No other device
+or driver was run, and no speed was measured.
 
 `cargo test --lib vulkan::` runs the kernels in both memory modes against the exact (f64)
 product of the dequantized weights, the same product in the kernel's order of operations and the
@@ -387,3 +390,144 @@ outputs; weights split over several buffers and batches split over token ranges 
 lowered, results bit-identical to the unsplit path); declined shapes; freed memory; concurrent
 calls. `bit_identity_report` prints how many outputs differ from the fma-ordered reference on the
 machine at hand (none here). The tests skip without a Vulkan device.
+
+Instances and devices are created and destroyed one at a time in a process
+(`platform::gpu::vulkan::lifecycle`): with NVIDIA's 580.173 driver on a DGX Spark, threads doing
+so at once could leave a driver thread spinning in its exit handler, `vkDestroyDevice` waiting
+for it and every later call waiting for the loader.
+
+## DGX Spark (aarch64 Linux)
+
+One NVIDIA DGX Spark, November 2026: 10 Cortex-X925 and 10 Cortex-A725 cores (`neon dotprod i8mm
+bf16 fp16 sve sve2`, no SME), a GB10 GPU sharing the system's 131 GB, Ubuntu 24.04, kernel
+6.17, driver 580.173.02 (CUDA 13.0, compute capability 12.1), NVRTC 13.0.88 from the toolkit's
+`sbsa-linux` libraries, Vulkan 1.4.312, Rust 1.100. It is the first aarch64 Linux machine and
+the first CUDA device outside x86-64 that oxinfer ran on; the aarch64 kernels had run on Apple
+Silicon only. Two other jobs measured speed on the machine at the same time, so nothing here is
+a timing.
+
+```
+CPU: aarch64 on linux, 20 logical cores
+  features: neon dotprod i8mm bf16 fp16 sve sve2
+  memory: 130.7 GB
+GPU (cuda #0): NVIDIA GB10
+  memory: 130.7 GB (unified with CPU)
+  driver: CUDA driver 13.0, compute capability 12.1
+GPU (vulkan #0): NVIDIA GB10
+  memory: 98.0 GB (unified with CPU)
+  driver: Vulkan 1.4.312 (integrated)
+GPU (vulkan #1): llvmpipe (LLVM 20.1.2, 128 bits)
+  memory: 130.7 GB
+  driver: Vulkan 1.4.318 (cpu)
+```
+
+Before that listing the Vulkan loader prints `TU: error: ... failed to open device
+/dev/dri/renderD128 (VK_ERROR_INCOMPATIBLE_DRIVER)`: Mesa's Turnip driver (one of the eleven
+ICDs Ubuntu installs) trying NVIDIA's render node when the loader enumerates devices. It is not
+oxinfer's and changes nothing; `VK_LOADER_DRIVERS_DISABLE='*freedreno*'` removes the line.
+
+**What the platform changed.**
+
+- *Unified memory under CUDA.* The device reports `CU_DEVICE_ATTRIBUTE_INTEGRATED`, and is
+  listed as unified. Its `cuMemGetInfo` gives the system's `MemFree` (108.61 GB of 130.66 with
+  `MemAvailable` at 118.28): the page cache, which the kernel gives back on demand and which
+  holds the model files just read, counts as used. What a load may put on the device is
+  therefore taken from the system's available memory less the reserve every load leaves
+  (`cuda::usable_free`), for the GEMM weights, the Inkling-2 and MiniMax-H3 engines and the
+  server's eviction. The device's copy of the weights is a second one in the same memory:
+  Qwen3.5-0.8B bf16 holds 1.76 GB resident and 1.75 GB on the device (1.75 GB resident on the
+  CPU alone; with `--mmap` the host's copy is page cache). `--models` counts both, so models up
+  to 60 GB decode on the GPU here. The test that a dropped model returns its device memory
+  prints the figures on such a device instead of asserting them (every process moves them by
+  more than its 164 MB). Pinned memory (`cuMemAllocHost`) works as on a discrete card.
+- *Host-to-device copies.* `cuMemcpyHtoD` may return with a copy of 64 KB or less from pageable
+  memory still queued on the default stream. The Inkling-2 and MiniMax-H3 engines launch their
+  kernels on a stream that does not wait for that one, so they now wait for each copy. On the
+  Spark the race showed as `inkling::cuda::tests::matvecs_and_gemms_match_definition` failing
+  2 times in 14 runs beside the other CUDA tests (a matvec reading its input before it
+  arrived); none in 48 runs since. `inkling::cuda::tests::small_ops_match_cpu`, reported flaky
+  on x86-64 (about 1 run in 16), uploads its inputs the same way; it did not fail in any run
+  here, before or after.
+- *Vulkan devices one at a time*, see [Vulkan](#vulkan): the suite hung in 2 of 9 runs before,
+  in none of 22 since.
+- Nothing else needed a change: `libcuda.so.1` and `libnvrtc.so` are found by name through
+  `ld.so.conf`, NVRTC compiles every kernel for `sm_121` with the same options, feature
+  detection is the standard library's (SME from `AT_HWCAP2`: absent, so its tests return at
+  once), pages are 4 KB against Apple's 16 KB, and the thread pool takes all 20 cores.
+
+**Test suite.** `cargo fmt --check`, `cargo clippy --all-targets --all-features` and
+`--all-targets --no-default-features` (both with `-D warnings`) are clean. `cargo test --profile
+ci --all-features`: 463 unit tests pass and 11 are ignored (benchmarks and tests that need files
+not in the repository), the server's 10 offline tests pass and its 9 that fetch models are
+ignored, as are the 2 Inkling-2 rollback tests (weights) and the 4 media round trips; 9 doc
+tests pass (`tests/gemma_moe_gpu.rs` is for Apple Silicon and has no test here). The 23 CUDA tests (main backend, GGUF kernels and plans, Inkling-2 and MiniMax-H3
+engines) and the 9 Vulkan tests run on the GB10 in both memory modes, none skipped. Compiled
+out on this target: the x86-64 kernels' tests and the Metal and Core ML ones.
+`bit_identity_report` (CUDA and Vulkan): no output of the bf16, Q8 and Q4 prefill GEMMs differs
+from the CPU kernels.
+
+**Agreement.** Qwen3.5-0.8B on five chat prompts of 56 to 87 tokens and one of 2,064 (7,000
+characters of documentation and a question), `--dump-logits` for the last prompt token and 64
+greedy tokens without a system prompt. The reference is transformers 5.24 with PyTorch 2.15 in
+float32 on the CPU (`tools/ref_logits.py`'s comparison, the model loaded once). "exact" is
+`OXINFER_PREFILL_GEMM=exact`, the f32 prompt GEMM.
+
+| Qwen3.5-0.8B, CPU against transformers float32 | Largest logit difference | KL | Same top token | Same 64 tokens |
+|---|---|---|---|---|
+| bf16 | 4.2e-5 to 1.1e-4 | 2e-11 to 1.7e-10 | 6 of 6 (same top 10 in order) | 6 of 6 |
+| `--quant q8` | 0.34 to 0.65 | 4.3e-4 to 9.6e-3 | 6 of 6 | 1 of 6 |
+| `--quant q8`, exact | 0.24 to 0.40 | 2.4e-4 to 3.3e-3 | 6 of 6 | 2 of 6 |
+| `--quant q4` | 4.3 to 6.1 | 0.33 to 1.35 | 3 of 6 | 0 of 6 |
+| `--quant q4`, exact | 4.5 to 6.0 | 0.33 to 1.26 | 3 of 6 | 0 of 6 |
+
+The Q4 row is the quantization of a 0.8B model, not the kernels: the same weights give the same
+logits on the three devices below, and the kernels match their f64 definitions in the tests.
+
+| Against the CPU path | Device | Prompt logits | Same 64 tokens |
+|---|---|---|---|
+| Qwen3.5-0.8B bf16 | CUDA | bit-identical on the five short prompts (the two of 85 and 87 tokens have matmuls on the device, the others stay under its thresholds); 4.1e-5 at most on the long one (KL 1.2e-11), the same bits in three runs | 6 of 6 |
+| | Vulkan | bit-identical, 6 of 6 | 6 of 6 |
+| Qwen3.5-0.8B `--quant q8`, exact on both | CUDA | bit-identical on the five; 1.2e-5 on the long one | 3 of 6 |
+| | Vulkan | bit-identical, 6 of 6 | 6 of 6 |
+| Qwen3.5-0.8B `--quant q4`, exact on both | CUDA | bit-identical on the five; 1.0e-2 on the long one (KL 5.2e-7) | 3 of 6 |
+| | Vulkan | bit-identical, 6 of 6 | 6 of 6 |
+| Qwen3.5-0.8B `--quant q8` / `q4`, defaults | CUDA | bit-identical on the three shortest; on the others 0.34 to 0.58 / 0.53 to 0.58 (KL 3.4e-4 to 4.9e-3), same top token | 2 / 1 of 6 |
+| | Vulkan | 0.30 to 0.48 / 0.39 to 0.52 (KL 3e-4 to 6.8e-3), same top token 6 of 6 | 3 / 2 of 6 |
+| Qwen3.5-9B `--quant q4`, exact on both | CUDA | bit-identical on 3 of 6, 2.3e-5 to 3.8e-3 on the others (KL 3e-13 to 3e-9), same top 10 | 5 of 6 |
+| Qwen3.5-9B `--quant q4`, defaults | CUDA | 0.25 to 0.76 (KL 2.8e-5 to 1.5e-2), same top token 5 of 6 (the other prompt has two tokens 0.2 apart, and the exact CPU run picks CUDA's) | 3 of 6 |
+| Llama-3.2-1B Q4_K_M (GGUF), chat prompts | CUDA, prefill and decode plans | 0.25 to 0.45 (KL 3.8e-5 to 4.1e-3), same top token 6 of 6 | 4 of 6 |
+| Qwen3.5-0.8B bf16, one image (448 x 336, 140 image tokens) | CUDA / Vulkan | 6.4e-5 / 8.2e-5 (KL 2e-12) | yes / yes |
+| SD-Turbo, 512 x 512, one step | CUDA (convolutions, norms, attention) | image 79.8 dB against the CPU's (535 pixels differ, by 1); `OXINFER_GPU_CHECK=1` worst rel L2: attention 1.6e-6, conv+norm 1.4e-6, linear+norm 2.6e-7 | |
+
+How to read the rows that are not bit-identical:
+
+- *The long bf16 prompt on CUDA.* CUDA also takes the first chunk's attention, which sums in
+  another order than the CPU's. With the attention kept on the CPU (a build made for this
+  check) the logits of the 2,064-token prompt are the CPU's bit for bit, as Vulkan's are, which
+  takes the matmuls only. The 9B's three prompts that differ are those of 85 tokens and more,
+  where its 16 heads pass the device attention's threshold.
+- *Defaults on quantized weights.* On the CPU a language model's prompt takes the int8 GEMM
+  (activations rounded to int8, as in decoding) and the GPUs keep f32, so a default run compares
+  two roundings: the differences are those between `fast` and `exact` on the CPU alone (0.29 to
+  0.57 on these prompts). With `exact` on both sides the GEMMs agree to the bit.
+- *Greedy text on quantized weights under CUDA.* Decode steps run on the GPU with f32
+  activations and on the CPU with int8 ones. `OXINFER_GPU_DECODE_CHECK=1` over 64 tokens of the
+  five prompts (every GPU step also on the CPU): bf16 KL 1.6e-12 on average with the same token
+  on 271 of 271 steps; Q8 4.2e-4, 267 of 267; Q4 5.0e-4, 305 of 309; Llama-3.2-1B Q4_K_M
+  2.3e-4, 251 of 252. Vulkan does not decode, so its text follows from the prompt.
+
+Llama-3.2-1B Q4_K_M with `examples/qwen_greedy_dump.rs` as in [CUDA](#cuda) (five raw prompts of
+1,500 characters fed as one batch, 48 greedy tokens): against the CPU's f32 prompt GEMM the
+last-position distribution is within KL 1.3e-12 to 6.4e-7 (largest logit difference 1.8e-5 to
+5.1e-3) and the greedy tokens are identical on 3 of 5 (the others part at the second and third
+generated token, 0.109 against 0.108 and 0.058 against 0.056); against the CPU's default int8
+GEMM, KL 2.2e-4 to 2.9e-3 (0.16 to 0.48) and 2 of 5.
+
+The image prompt against transformers (`tools/ref_vl.py`, float32): pixel values identical,
+image features within 1.4e-4 (1.6e-5 relative), logits within 1.0e-4 (KL 1.0e-7) with the same
+top 10, and the same 64 greedy tokens.
+
+**Not run on this machine:** speed (measured separately), the affine-Q4 MLX checkpoints, MoE
+models, GGUF files other than Llama-3.2-1B Q4_K_M, Inkling-2 and MiniMax-H3 with real weights
+(their CUDA engines ran in the unit tests only), Whisper, the image and video pipelines other
+than SD-Turbo, speculative decoding, streamed weights and the server with a model.
