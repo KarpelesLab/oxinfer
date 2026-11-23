@@ -215,6 +215,7 @@ fn f32_lin(w: &[f32], n_out: usize, n_in: usize) -> Lin<'static> {
         n_out,
         n_in,
         block_scales: None,
+        x4: false,
     })
 }
 

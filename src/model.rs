@@ -121,6 +121,11 @@ impl<'a> Table<'a> {
                 span(&m.q[r * cols / 2..(r + 1) * cols / 2]),
                 span(&m.scales[r * bpr..(r + 1) * bpr]),
             ],
+            // (An interleaved table's row is spread over its group of four rows.)
+            Table::Gguf(m) if m.x4 => {
+                let gb = 4 * m.row_bytes();
+                vec![span(&m.data[r / 4 * gb..(r / 4 + 1) * gb])]
+            }
             Table::Gguf(m) => vec![span(m.row(r))],
             Table::Host { .. } | Table::Mlx { .. } => Vec::new(),
             Table::Folded(t, _) | Table::Adapted(t, _) => t.row_ranges(r, cols),
@@ -258,8 +263,13 @@ impl<'a> Table<'a> {
 
     fn load_stored(files: &'a ModelFiles, full: &str, rows: usize, cols: usize, store_as: Quant) -> Result<Self> {
         files.note_use(full, false, true);
-        if let Some(g) = files.ggml(full) {
-            let (kind, bytes) = g?;
+        if let Some(g) = files.ggml_cpu(full, rows, cols) {
+            let (kind, bytes, x4) = g?;
+            if x4 {
+                // The tensor is also a matmul weight (a tied LM head), interleaved for it.
+                // SAFETY: Table<'a> cannot outlive `bytes`.
+                return Ok(Table::Gguf(unsafe { GgufMatrix::borrowed_interleaved(kind, bytes, rows, cols)? }));
+            }
             return Table::from_gguf(kind, bytes, rows, cols).with_context(|| format!("tensor {full}"));
         }
         for kind in [QKind::Q8, QKind::Q4] {
@@ -332,8 +342,12 @@ pub fn load_lin<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usize
 fn load_lin_stored<'a>(files: &'a ModelFiles, full: &str, n_out: usize, n_in: usize, q: Quant) -> Result<Lin<'a>> {
     files.note_use(full, true, false);
     // GGUF: used in its own format whatever `q` asks for.
-    if let Some(g) = files.ggml(full) {
-        let (kind, bytes) = g?;
+    if let Some(g) = files.ggml_cpu(full, n_out, n_in) {
+        let (kind, bytes, x4) = g?;
+        if x4 {
+            // SAFETY: Lin<'a> cannot outlive `bytes`.
+            return Ok(Lin::gguf(unsafe { GgufMatrix::borrowed_interleaved(kind, bytes, n_out, n_in)? }));
+        }
         return Lin::from_gguf(kind, bytes, n_out, n_in).with_context(|| format!("tensor {full}"));
     }
     // SAFETY: the matrix borrows `files` for 'a, which outlives every model holding it.
@@ -605,14 +619,24 @@ pub(crate) fn nvfp4_blocks(packed: &[u8], sc: &[u8], factor: f32, n_out: usize, 
 /// shape `[n_exp, n_out * n_in]`); pre-quantized experts are borrowed views of the stored matrix.
 pub fn load_lin_experts<'a>(files: &'a ModelFiles, full: &str, n_exp: usize, n_out: usize, n_in: usize, q: Quant) -> Result<Vec<Lin<'a>>> {
     files.note_use(full, true, false);
-    if let Some(g) = files.ggml(full) {
-        let (kind, bytes) = g?;
+    // (Each expert's rows are whole groups of four when the tensor's are: `n_out` is a multiple
+    // of four, so the interleaved tensor is the experts' interleaved matrices one after another.)
+    let groups = n_out.is_multiple_of(4);
+    if let Some(g) = files.ggml_cpu(full, if groups { n_exp * n_out } else { 1 }, n_in) {
+        let (kind, bytes, x4) = g?;
         if !bytes.len().is_multiple_of(n_exp) {
             bail!("tensor {full}: {} bytes for {n_exp} experts", bytes.len());
         }
         return bytes
             .chunks(bytes.len() / n_exp)
-            .map(|b| Lin::from_gguf(kind, b, n_out, n_in).with_context(|| format!("tensor {full}")))
+            .map(|b| {
+                if x4 {
+                    // SAFETY: Lin<'a> cannot outlive `bytes`.
+                    Ok(Lin::gguf(unsafe { GgufMatrix::borrowed_interleaved(kind, b, n_out, n_in)? }))
+                } else {
+                    Lin::from_gguf(kind, b, n_out, n_in).with_context(|| format!("tensor {full}"))
+                }
+            })
             .collect();
     }
     let (rows, bpr) = (n_out, n_in / crate::quant::QBLOCK);

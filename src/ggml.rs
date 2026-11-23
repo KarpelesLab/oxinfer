@@ -32,6 +32,10 @@ mod neon;
 #[path = "kernels_ggml_x86.rs"]
 mod avx2;
 
+#[path = "ggml_repack.rs"]
+pub mod repack;
+pub use repack::{can_interleave, repack_setting, repack_wanted, set_repack};
+
 /// Elements per K-quant / i-quant super-block.
 pub const QK_K: usize = 256;
 
@@ -247,6 +251,9 @@ pub struct GgufMatrix {
     /// FP8 checkpoints: one scale per block of `rows` x `cols` weights (DeepSeek-style
     /// `weight_scale_inv`, multiplied in).
     pub block_scales: Option<BlockScales>,
+    /// Rows interleaved four at a time for the CPU decode kernels ([`repack`]; Q8_0). `row` is
+    /// not available then: the dequantizers and unpackers read the rows back.
+    pub x4: bool,
 }
 
 /// The block scales of an FP8 matrix: scale `(r / rows) * n_in.div_ceil(cols) + c / cols` (see
@@ -446,7 +453,50 @@ impl GgufMatrix {
             n_out,
             n_in,
             block_scales: None,
+            x4: false,
         })
+    }
+
+    /// Wraps `data`, a matrix already interleaved four rows at a time ([`repack`]).
+    pub fn interleaved(kind: GgmlType, data: QBuf<u8>, n_out: usize, n_in: usize) -> Result<Self> {
+        if !can_interleave(kind, n_out, n_in) {
+            bail!("a {kind} [{n_out}, {n_in}] matrix cannot be interleaved");
+        }
+        let mut m = Self::new(kind, data, n_out, n_in)?;
+        m.x4 = true;
+        Ok(m)
+    }
+
+    /// [`Self::interleaved`] over borrowed bytes.
+    ///
+    /// # Safety
+    /// As [`Self::borrowed`].
+    pub unsafe fn borrowed_interleaved(kind: GgmlType, bytes: &[u8], n_out: usize, n_in: usize) -> Result<Self> {
+        Self::interleaved(kind, unsafe { QBuf::borrowed(bytes) }, n_out, n_in)
+    }
+
+    /// An owned copy of `self` with its rows interleaved (when [`can_interleave`]; else plain).
+    pub fn to_interleaved(&self) -> Result<Self> {
+        let mut v = PageVec::<u8>::zeroed(self.data.len());
+        v.copy_from_slice(&self.data);
+        if self.x4 || !can_interleave(self.kind, self.n_out, self.n_in) || self.block_scales.is_some() {
+            let mut m = Self::new(self.kind, v.into(), self.n_out, self.n_in)?;
+            m.x4 = self.x4;
+            return Ok(m);
+        }
+        repack::interleave_in_place(self.kind, &mut v, self.n_in);
+        Self::interleaved(self.kind, v.into(), self.n_out, self.n_in)
+    }
+
+    /// Row `r` in the file's layout, also for an interleaved matrix (copied out then).
+    pub fn plain_row(&self, r: usize) -> std::borrow::Cow<'_, [u8]> {
+        if !self.x4 {
+            return std::borrow::Cow::Borrowed(self.row(r));
+        }
+        let rb = self.row_bytes();
+        let mut v = vec![0u8; rb];
+        repack::plain_blocks(self.kind, &self.data, rb, r, 0, self.n_in / self.kind.block_size(), &mut v);
+        std::borrow::Cow::Owned(v)
     }
 
     /// Borrows the raw tensor bytes without copying (e.g. from a mapped GGUF file).
@@ -467,7 +517,9 @@ impl GgufMatrix {
     pub fn row_bytes(&self) -> usize {
         self.kind.row_bytes(self.n_in)
     }
+    /// Row `r`'s bytes (not for an interleaved matrix: see [`Self::plain_row`]).
     pub fn row(&self, r: usize) -> &[u8] {
+        assert!(!self.x4, "row of an interleaved matrix");
         let rb = self.row_bytes();
         &self.data[r * rb..(r + 1) * rb]
     }
@@ -478,6 +530,12 @@ impl GgufMatrix {
     /// as `dequantize_row`, through NEON or AVX2 where available.
     pub fn dequantize_rows(&self, r0: usize, r1: usize, out: &mut [f32]) {
         let n = self.n_in;
+        if self.x4 {
+            for (i, r) in (r0..r1).enumerate() {
+                self.dequant_bytes(&self.plain_row(r), &mut out[i * n..(i + 1) * n]);
+            }
+            return;
+        }
         if self.kind == GgmlType::I8 {
             for (i, r) in (r0..r1).enumerate() {
                 let s = self.block_scales.as_ref().map_or(1.0, |bs| bs.get(r / bs.rows));
@@ -546,6 +604,14 @@ impl GgufMatrix {
             return false;
         }
         let n = k1 - k0;
+        if self.x4 {
+            let mut v = vec![0u8; (k1 - k0) / bs * ts];
+            for (i, r) in (r0..r1).enumerate() {
+                repack::plain_blocks(self.kind, &self.data, self.row_bytes(), r, k0 / bs, k1 / bs, &mut v);
+                self.dequant_bytes(&v, &mut out[i * n..(i + 1) * n]);
+            }
+            return true;
+        }
         for (i, r) in (r0..r1).enumerate() {
             self.dequant_bytes(&self.row(r)[k0 / bs * ts..k1 / bs * ts], &mut out[i * n..(i + 1) * n]);
         }
@@ -1499,14 +1565,14 @@ impl GgufMatrix {
             return;
         }
         #[cfg(target_arch = "x86_64")]
-        if crate::kernels::simd::avx2() {
+        if crate::kernels::simd::avx2() && !self.x4 {
             // SAFETY: AVX2 was detected; bounds per the caller's contract. Bit-identical to the
             // portable kernel below.
             unsafe { avx2::rows::<TC>(self, &x, y, ys, r0, r1) };
             return;
         }
         for r in r0..r1 {
-            let o = unsafe { dot_row_generic::<TC>(self.kind, self.row(r), &x) };
+            let o = unsafe { dot_row_generic::<TC>(self.kind, &self.plain_row(r), &x) };
             for c in 0..TC {
                 unsafe { *y.add(c * ys + r) = o[c] };
             }
@@ -1542,6 +1608,9 @@ impl QMat for GgufMatrix {
     }
     #[cfg(target_arch = "aarch64")]
     unsafe fn unpack_row_i8(&self, r: usize, q: *mut i8, ds: *mut f32, mn: *mut f32, sc: *mut i32) {
+        if self.x4 {
+            return unsafe { neon::unpack_row_i8_x4(self, r, q, ds, mn) };
+        }
         unsafe { neon::unpack_row_i8(self.kind, self.data.as_ptr().add(r * self.row_bytes()), self.n_in, q, ds, mn, sc) }
     }
     #[cfg(target_arch = "x86_64")]
@@ -1564,7 +1633,7 @@ impl QMat for GgufMatrix {
     unsafe fn unpack_cols_i8(&self, r: usize, k0: usize, k1: usize, q: *mut i8, s: *mut f32, m: *mut f32) {
         let (bs, ts) = (self.kind.block_size(), self.kind.type_size());
         debug_assert!(k0.is_multiple_of(bs) && k1.is_multiple_of(bs));
-        unsafe { avx2::unpack_cols_i8(self.kind, &self.row(r)[k0 / bs * ts..k1 / bs * ts], q, s, m) }
+        unsafe { avx2::unpack_cols_i8(self.kind, &self.plain_row(r)[k0 / bs * ts..k1 / bs * ts], q, s, m) }
     }
     unsafe fn rows_t1(&self, xa: &QAct, c: usize, y: *mut f32, r0: usize, r1: usize) {
         unsafe { self.rows_impl::<1>(xa, c, y, 0, r0, r1) }
@@ -2161,6 +2230,91 @@ mod tests {
             let mut yr = f32_reference(&wf, n_out, n_in, &x[..8 * n_in], 8);
             yr.extend(f32_reference(&wf2, n_out, n_in, &x[8 * n_in..], 16));
             check(&format!("{kind} grouped"), &y, &yr, 1e-4);
+        }
+    }
+
+    /// Interleaved matrices ([`repack`]) give every output bit-identical to the plain matrix's:
+    /// the one-token kernel (whole groups and row ranges that cut groups), 2-4 token tiles,
+    /// multi-token passes of every width, the matmul driver (decode and prefill GEMMs), and the
+    /// dequantizers and int8 unpackers the prefill GEMMs read.
+    #[test]
+    fn interleaved_rows_match_plain() {
+        crate::pool::init(3);
+        let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+        for kind in [GgmlType::Q8_0, GgmlType::Q4_0] {
+            // Block counts with and without a tail of the steps of four.
+            for (n_out, n_in) in [(24usize, 8 * 32), (40, 13 * 32), (8, 3 * 32)] {
+                let mut seed = 101 + n_in as u64;
+                let raw = random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed);
+                let m = GgufMatrix::from_bytes(kind, &raw, n_out, n_in).unwrap();
+                let x4 = m.to_interleaved().unwrap();
+                assert!(x4.x4);
+                for r in 0..n_out {
+                    assert_eq!(x4.plain_row(r), m.plain_row(r), "row {r}");
+                }
+                let (mut a, mut b) = (vec![0f32; n_out * n_in], vec![0f32; n_out * n_in]);
+                m.dequantize_rows(0, n_out, &mut a);
+                x4.dequantize_rows(0, n_out, &mut b);
+                assert_eq!(bits(&a), bits(&b), "{kind} dequantize_rows");
+                let k = (32, n_in);
+                let (mut a, mut b) = (vec![0f32; 5 * (k.1 - k.0)], vec![0f32; 5 * (k.1 - k.0)]);
+                assert!(m.dequantize_block(3, 8, k.0, k.1, &mut a));
+                assert!(x4.dequantize_block(3, 8, k.0, k.1, &mut b));
+                assert_eq!(bits(&a), bits(&b), "{kind} dequantize_block");
+                #[cfg(target_arch = "aarch64")]
+                if let Some(lay) = m.i8_layout() {
+                    assert_eq!(x4.i8_layout(), Some(lay));
+                    let bpr = n_in / 32;
+                    for r in 0..n_out {
+                        let (mut q0, mut q1) = (vec![0i8; n_in], vec![0i8; n_in]);
+                        let (mut d0, mut d1) = (vec![0f32; bpr], vec![0f32; bpr]);
+                        let (mut mn, mut sc) = (vec![0f32; bpr], vec![0i32; n_in / 16]);
+                        unsafe {
+                            m.unpack_row_i8(r, q0.as_mut_ptr(), d0.as_mut_ptr(), mn.as_mut_ptr(), sc.as_mut_ptr());
+                            x4.unpack_row_i8(r, q1.as_mut_ptr(), d1.as_mut_ptr(), mn.as_mut_ptr(), sc.as_mut_ptr());
+                        }
+                        assert_eq!((q0, bits(&d0)), (q1, bits(&d1)), "{kind} unpack_row_i8 row {r}");
+                    }
+                }
+                for t in 1..=16usize {
+                    let x: Vec<f32> = (0..t * n_in).map(|_| (lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0).collect();
+                    let xa = crate::quant::quantize_act(&x, t, n_in);
+                    let mut y0 = vec![0f32; t * n_out];
+                    for c in 0..t {
+                        unsafe { m.rows_t1(&xa, c, y0.as_mut_ptr().add(c * n_out), 0, n_out) };
+                    }
+                    // One token at a time, in ranges that cut groups of four.
+                    let mut y1 = vec![0f32; t * n_out];
+                    for c in 0..t {
+                        for (r0, r1) in [(0, 3), (3, 9.min(n_out)), (9.min(n_out), n_out)] {
+                            unsafe { x4.rows_t1(&xa, c, y1.as_mut_ptr().add(c * n_out), r0, r1) };
+                        }
+                    }
+                    assert_eq!(bits(&y1), bits(&y0), "{kind} [{n_out}, {n_in}] t={t} rows_t1");
+                    if (2..=4).contains(&t) {
+                        let mut y2 = vec![0f32; t * n_out];
+                        unsafe { x4.rows_tc(&xa, 0, t, y2.as_mut_ptr(), 1, n_out) };
+                        unsafe { x4.rows_tc(&xa, 0, t, y2.as_mut_ptr(), 0, 1) };
+                        assert_eq!(bits(&y2), bits(&y0), "{kind} t={t} rows_tc");
+                    }
+                    if t >= 2 {
+                        let pairs = crate::quant::PairAct::new(&xa);
+                        let mut y3 = vec![0f32; t * n_out];
+                        unsafe {
+                            assert!(x4.rows_multi(&xa, Some(&pairs), t, y3.as_mut_ptr(), 0, 7));
+                            assert!(x4.rows_multi(&xa, Some(&pairs), t, y3.as_mut_ptr(), 7, n_out));
+                        }
+                        assert_eq!(bits(&y3), bits(&y0), "{kind} t={t} rows_multi");
+                    }
+                    // The driver: decode kernels up to 16 tokens, prefill GEMMs past 4.
+                    for decode_max in [16usize, 4] {
+                        let (mut ya, mut yb) = (vec![0f32; t * n_out], vec![0f32; t * n_out]);
+                        crate::kernels::matmul_quant_multi_at(&mut [(&m, &mut ya[..])], &x, t, decode_max);
+                        crate::kernels::matmul_quant_multi_at(&mut [(&x4, &mut yb[..])], &x, t, decode_max);
+                        assert_eq!(bits(&yb), bits(&ya), "{kind} t={t} driver decode_max={decode_max}");
+                    }
+                }
+            }
         }
     }
 }

@@ -4,11 +4,14 @@
 //! best step and the parallel regions a step runs:
 //! `cargo run --release --example decode_ab -- MODEL [THREADS] [STEPS] [SETTINGS]`
 //! (a Qwen-family GGUF or checkpoint, e.g. Llama 3.2; THREADS: the pool's, default all; STEPS per
-//! setting; SETTINGS: comma-separated `gG` / `tN` / `gGtN`, the gated MLP fused (`g1`, the
-//! default) or not (`g0`) and the step's threads (`t0`: the default decode threads), default
-//! `g0,g1`). Settings switch every token, or every 64 tokens when their threads differ (so that
-//! the workers left out have parked). The settings are bit-identical: `AB_CHECK=1` first decodes
-//! with each one alone and asserts that the tokens are the same.
+//! setting; SETTINGS: comma-separated combinations of `gG`, `tN` and `rR` such as `g1t8r0`, the
+//! gated MLP fused (`g1`, the default) or not (`g0`), the step's threads (`t0`: the default
+//! decode threads), and the weights interleaved for the CPU kernels (`r1`, the default where
+//! the target has them) or in the file's layout (`r0`; both variants are loaded when the
+//! settings ask for both), default `g0,g1`). The checkpoint is read into memory, as the engine
+//! does by default. Settings switch every token, or every 64 tokens when their threads differ
+//! (so that the workers left out have parked). The settings are bit-identical: `AB_CHECK=1`
+//! first decodes with each one alone and asserts that the tokens are the same.
 
 use oxinfer::config::QwenConfig;
 use oxinfer::model::Quant;
@@ -21,6 +24,7 @@ use std::time::Instant;
 struct Setting {
     glu: bool,
     threads: usize,
+    repack: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -32,24 +36,50 @@ fn main() -> anyhow::Result<()> {
     let settings: Vec<Setting> = names
         .iter()
         .map(|s| {
-            let mut st = Setting { glu: true, threads: 0 };
-            let (g, t) = match s.split_once('t') {
-                Some((g, t)) => (g, Some(t)),
-                None => (s.as_str(), None),
+            let mut st = Setting {
+                glu: true,
+                threads: 0,
+                repack: true,
             };
-            if let Some(g) = g.strip_prefix('g') {
-                st.glu = g != "0";
-            }
-            if let Some(t) = t {
-                st.threads = t.parse().expect("tN: threads");
+            // Letters, each followed by its number.
+            let mut rest = s.as_str();
+            while let Some(c) = rest.chars().next() {
+                let n = rest[1..].find(|c: char| !c.is_ascii_digit()).map_or(rest.len(), |i| i + 1);
+                let v: usize = rest[1..n].parse().expect("a number after each letter");
+                match c {
+                    'g' => st.glu = v != 0,
+                    't' => st.threads = v,
+                    'r' => st.repack = v != 0,
+                    _ => panic!("unknown setting letter {c}"),
+                }
+                rest = &rest[n..];
             }
             st
         })
         .collect();
     oxinfer::pool::init(threads);
-    let files = ModelFiles::open(&path, false)?;
-    files.preload();
-    let model = QwenModel::load(QwenConfig::load(&path)?, &files, Quant::Q8)?;
+    // The models with the weights in the file's layout and interleaved (each loaded if a setting
+    // asks for it), each from its own copy of the checkpoint in memory.
+    let mut files = Vec::new();
+    for on in [false, true] {
+        files.push(
+            settings
+                .iter()
+                .any(|s| s.repack == on)
+                .then(|| ModelFiles::open(&path, true))
+                .transpose()?,
+        );
+    }
+    let mut models = Vec::new();
+    for (on, f) in [false, true].into_iter().zip(&files) {
+        // (The layout is chosen as the model loads.)
+        oxinfer::ggml::set_repack(Some(on));
+        models.push(match f {
+            Some(f) => Some(QwenModel::load(QwenConfig::load(&path)?, f, Quant::Q8)?),
+            None => None,
+        });
+    }
+    let model = models.iter().flatten().next().unwrap();
     let prompt: Vec<u32> = (0..32).map(|i| 1000 + i * 37).collect();
     let block = if settings.iter().any(|s| s.threads != settings[0].threads) {
         64
@@ -66,6 +96,7 @@ fn main() -> anyhow::Result<()> {
                 tok = oxinfer::sampler::argmax(&model.forward(&mut sess, &prompt));
             }
             let m = (i / block) % set.len();
+            let model = models[set[m].repack as usize].as_ref().unwrap();
             oxinfer::kernels::set_glu_fused(set[m].glu);
             oxinfer::pool::set_decode_threads(set[m].threads);
             let r0 = oxinfer::pool::regions();

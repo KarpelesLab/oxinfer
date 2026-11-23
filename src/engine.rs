@@ -222,6 +222,13 @@ pub struct EngineOptions {
     /// MoE experts on the GPU during prefill. Process-wide, applied on load; None leaves the
     /// current setting ([`crate::gpu::set_moe_offload`]). Key `gpu_moe`.
     pub gpu_moe: Option<bool>,
+    /// CPU decoding (aarch64, no GPU backend active): interleave the Q8_0 matrices of a GGUF
+    /// checkpoint read into memory four rows at a time, in place, for the decode kernels (llama.cpp's
+    /// repacked layout: the same memory, faster per core; see [`crate::ggml::repack`]). Mapped
+    /// checkpoints keep the file's layout. Process-wide, applied on load; None leaves the current
+    /// setting (default on, `OXINFER_REPACK=0` off; [`crate::ggml::set_repack`]). Key
+    /// `cpu_repack`.
+    pub cpu_repack: Option<bool>,
     /// Single-token decode steps entirely on the GPU (one submission per token) where the backend
     /// supports the model (Metal: dense Llama 3 / Qwen3 / Qwen3.5 / 3.8 layers; CUDA: those and
     /// Inkling-2, whose prompts then run whole on the GPU as well); everything else stays as it
@@ -451,6 +458,7 @@ impl Default for EngineOptions {
             gpu_exact: None,
             prefill_gemm: None,
             gpu_moe: None,
+            cpu_repack: None,
             gpu_decode: None,
             stream_gpu: None,
             decision_from: None,
@@ -534,6 +542,7 @@ impl EngineOptions {
         "gpu_exact",
         "prefill_gemm",
         "gpu_moe",
+        "cpu_repack",
         "gpu_decode",
         "stream_gpu",
         "decision_from",
@@ -659,6 +668,12 @@ impl EngineOptions {
                 }
             }
             "gpu_moe" => self.gpu_moe = Some(parse_bool(key, value)?),
+            "cpu_repack" => {
+                self.cpu_repack = match value.trim() {
+                    "" | "auto" => None,
+                    v => Some(parse_bool(key, v)?),
+                }
+            }
             "gpu_decode" => self.gpu_decode = Some(parse_bool(key, value)?),
             "stream_gpu" => {
                 self.stream_gpu = match value.trim() {
@@ -1520,6 +1535,9 @@ impl Engine {
         }
         if let Some(g) = opts.prefill_gemm {
             crate::kernels::set_prefill_gemm(g);
+        }
+        if let Some(on) = opts.cpu_repack {
+            crate::ggml::set_repack(Some(on));
         }
         if let Some(on) = opts.gpu_moe {
             crate::gpu::set_moe_offload(on);

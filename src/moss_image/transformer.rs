@@ -247,6 +247,7 @@ fn f16_dense(w: &[f32], n_out: usize, n_in: usize) -> Dense<'static> {
         n_out,
         n_in,
         block_scales: None,
+        x4: false,
     };
     Dense {
         w: Lin::gguf(m),

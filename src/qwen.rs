@@ -3144,6 +3144,7 @@ impl Moe<'_> {
                         n_out: ne,
                         n_in: h,
                         block_scales: None,
+                        x4: false,
                     })
                 });
                 linear(lin, ne, h, x, t, &mut logits);

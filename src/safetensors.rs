@@ -506,6 +506,9 @@ pub struct ModelFiles {
     copies: Mutex<HashMap<String, (PageVec<u64>, usize)>>,
     /// Tensors whose memory [`ModelFiles::discard`] gave back (reading them again is an error).
     discarded: Mutex<std::collections::HashSet<String>>,
+    /// GGUF tensors interleaved in place for the CPU decode kernels ([`ModelFiles::ggml_cpu`]);
+    /// reading their bytes otherwise is an error.
+    interleaved: Mutex<std::collections::HashSet<String>>,
 }
 
 /// Maximum shard size written by `write_quantized`.
@@ -597,6 +600,7 @@ impl ModelFiles {
             dequantized: Mutex::new(HashMap::new()),
             copies: Mutex::new(HashMap::new()),
             discarded: Mutex::new(Default::default()),
+            interleaved: Mutex::new(Default::default()),
         }
     }
 
@@ -665,6 +669,7 @@ impl ModelFiles {
                 dequantized: Mutex::new(HashMap::new()),
                 copies: Mutex::new(HashMap::new()),
                 discarded: Mutex::new(Default::default()),
+                interleaved: Mutex::new(Default::default()),
             });
         }
         // A `.safetensors` file given directly (a sidecar such as MiniMax-H3-Image's PDD heads).
@@ -746,6 +751,7 @@ impl ModelFiles {
             dequantized: Mutex::new(HashMap::new()),
             copies: Mutex::new(HashMap::new()),
             discarded: Mutex::new(Default::default()),
+            interleaved: Mutex::new(Default::default()),
         };
         if files.is_mlx() {
             let cfg = crate::fsx::read(&dir.join("config.json"))
@@ -1183,7 +1189,52 @@ impl ModelFiles {
         if self.discarded.lock().unwrap().contains(name) {
             bail!("tensor {name} was discarded after its conversion at load");
         }
+        if self.interleaved.lock().unwrap().contains(name) {
+            bail!("tensor {name} was interleaved for the CPU kernels at load (read it as a matrix)");
+        }
         self.shards[i].bytes(name)
+    }
+
+    /// GGUF tensor `name` as a `[n_out, n_in]` matrix for the CPU kernels: `(kind, bytes,
+    /// interleaved)`. When [`crate::ggml::repack_wanted`] and its shard was read into memory, a
+    /// matrix that [`crate::ggml::can_interleave`] is interleaved in place on its first request
+    /// (every later one gets the same bytes, interleaved): the same memory, laid out for the
+    /// decode kernels. Mapped shards (models too big for memory, streaming, `mmap`) keep the
+    /// file's layout. None if `name` is not a GGUF tensor.
+    pub fn ggml_cpu(&self, name: &str, n_out: usize, n_in: usize) -> Option<Result<(crate::ggml::GgmlType, &[u8], bool)>> {
+        let t = self.info(name)?.ggml?;
+        Some((|| {
+            let kind = crate::ggml::GgmlType::from_id(t).with_context(|| format!("tensor {name}: ggml type {t} is not supported"))?;
+            let i = *self.index.get(name).with_context(|| format!("missing tensor {name}"))?;
+            if self.interleaved.lock().unwrap().contains(name) {
+                self.touch(name);
+                return Ok((kind, self.shards[i].bytes(name)?, true));
+            }
+            // A tensor already read in the file's layout stays so (its readers keep that view).
+            let fresh = !self.touched.lock().unwrap().contains_key(name);
+            let bytes = self.bytes(name)?;
+            let heap = matches!(self.shards[i].mmap, Storage::Heap(..));
+            if !(heap
+                && fresh
+                && crate::ggml::can_interleave(kind, n_out, n_in)
+                && bytes.len() == n_out * kind.row_bytes(n_in)
+                && crate::ggml::repack_wanted())
+            {
+                return Ok((kind, bytes, false));
+            }
+            let mut done = self.interleaved.lock().unwrap();
+            if done.contains(name) {
+                // (Interleaved by another thread meanwhile.)
+                return Ok((kind, bytes, true));
+            }
+            // SAFETY: the shard's heap copy is owned by `self` and nothing has read this tensor's
+            // bytes before (`fresh`; every reader of an interleaved tensor comes through here,
+            // under the lock, and `raw` refuses the others), so no reference to them is live.
+            let m = unsafe { std::slice::from_raw_parts_mut(bytes.as_ptr() as *mut u8, bytes.len()) };
+            crate::ggml::repack::interleave_in_place(kind, m, n_in);
+            done.insert(name.to_string());
+            Ok((kind, &*m, true))
+        })())
     }
 
     /// Gives the memory of tensor `name` back to the system, when its shard was read into memory

@@ -4,7 +4,8 @@
 //! (defaults Q8_0, 8 threads, Llama 3.2 1B's shapes, a 1 GB ring). Prints us per call and GB/s,
 //! and the cost of an empty parallel region. `STREAM=1`: plain streaming reads of the ring
 //! instead, in parallel regions of `REGION_KB` split into blocks of `BLOCK_KB` (the machine's
-//! read bandwidth for a given split).
+//! read bandwidth for a given split). `X4=1`: the same ring interleaved four rows at a time
+//! (`oxinfer::ggml::repack`) too, timed alternately with the plain one.
 
 use oxinfer::ggml::{GgmlType, GgufMatrix, random_blocks};
 use oxinfer::kernels::matmul_quant_multi;
@@ -83,23 +84,40 @@ fn main() -> anyhow::Result<()> {
                 .collect();
             let x: Vec<f32> = (0..n_in).map(|i| ((i * 7919) % 2001) as f32 / 1000.0 - 1.0).collect();
             let mut y = vec![0f32; n_out];
-            for m in &ring {
-                matmul_quant_multi(&mut [(m, &mut y[..])], &x, 1);
-            }
-            let mut best = f64::MAX;
-            for _ in 0..5 {
-                let t0 = Instant::now();
-                for m in &ring {
+            let x4 = std::env::var("X4").is_ok_and(|v| v == "1") && oxinfer::ggml::can_interleave(kind, n_out, n_in);
+            let ring4: Vec<GgufMatrix> = if x4 {
+                ring.iter().map(|m| m.to_interleaved().unwrap()).collect()
+            } else {
+                Vec::new()
+            };
+            let rings: Vec<(&str, &[GgufMatrix])> = if x4 {
+                vec![("plain", &ring[..]), ("x4", &ring4[..])]
+            } else {
+                vec![("", &ring[..])]
+            };
+            for (_, r) in &rings {
+                for m in r.iter() {
                     matmul_quant_multi(&mut [(m, &mut y[..])], &x, 1);
                 }
-                best = best.min(t0.elapsed().as_secs_f64() / copies as f64);
             }
-            println!(
-                "  {kind_name} {n_out}x{n_in} ({:.1} MB): {:7.1} us  {:6.1} GB/s",
-                one.bytes() as f64 / 1e6,
-                best * 1e6,
-                one.bytes() as f64 / best / 1e9
-            );
+            let mut best = vec![f64::MAX; rings.len()];
+            for _ in 0..5 {
+                for (b, (_, r)) in best.iter_mut().zip(&rings) {
+                    let t0 = Instant::now();
+                    for m in r.iter() {
+                        matmul_quant_multi(&mut [(m, &mut y[..])], &x, 1);
+                    }
+                    *b = b.min(t0.elapsed().as_secs_f64() / copies as f64);
+                }
+            }
+            for (b, (name, _)) in best.iter().zip(&rings) {
+                println!(
+                    "  {kind_name} {name} {n_out}x{n_in} ({:.1} MB): {:7.1} us  {:6.1} GB/s",
+                    one.bytes() as f64 / 1e6,
+                    b * 1e6,
+                    one.bytes() as f64 / b / 1e9
+                );
+            }
         }
     }
     Ok(())

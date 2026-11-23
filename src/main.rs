@@ -293,6 +293,9 @@ fn usage() -> ! {
          \x20                      at once), fast (SME + int8 at once: fastest, least precise), int8x2\n\
          \x20                      (int8 GEMM with a residual activation plane, close to f32), int8\n\
          \x20                      or f32 (NEON / AVX2 FMA GEMM); env OXINFER_PREFILL_GEMM\n\
+         \x20 --cpu-repack M       on (default) | off: on aarch64 without a GPU backend, interleave a\n\
+         \x20                      GGUF model's Q8_0 matrices four rows at a time in place at load\n\
+         \x20                      (faster CPU decoding, same memory); env OXINFER_REPACK=0 for off\n\
          \x20 --lookup / --no-lookup  prompt-lookup drafting (default on): drafts copied from the\n\
          \x20                      conversation where its last tokens occurred before (quoting, editing,\n\
          \x20                      summarizing), verified like other drafts (exact); rounds without a\n\
@@ -832,6 +835,15 @@ fn parse_args() -> Result<Args> {
             "--fast-verify" => a.fast_verify = true,
             "--exact-verify" => a.fast_verify = false,
             "--prefill-gemm" => oxinfer::kernels::set_prefill_gemm(val()?.parse()?),
+            "--cpu-repack" => {
+                let v = val()?;
+                oxinfer::ggml::set_repack(match v.as_str() {
+                    "on" | "1" => Some(true),
+                    "off" | "0" => Some(false),
+                    "auto" => None,
+                    _ => bail!("--cpu-repack expects on|off|auto, got {v}"),
+                })
+            }
             "--lookup" => a.lookup = Some(true),
             "--no-lookup" => a.lookup = Some(false),
             "--lookup-tokens" => a.lookup_tokens = Some(val()?.parse()?),

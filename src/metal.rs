@@ -3988,6 +3988,7 @@ mod tests {
                     n_out,
                     n_in,
                     block_scales: None,
+                    x4: false,
                 })
                 .collect()
         };

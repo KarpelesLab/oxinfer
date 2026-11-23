@@ -54,6 +54,10 @@ type RowFn<const TC: usize> = unsafe fn(*const u8, usize, &Act) -> [f32; TC];
 /// Rows `r0..r1` of `m` against TC activation rows into `y[c * ys + r]`; false if `m.kind` has
 /// no NEON kernel (the caller then uses the portable path).
 pub(super) unsafe fn rows<const TC: usize>(m: &GgufMatrix, x: &Act, y: *mut f32, ys: usize, r0: usize, r1: usize) -> bool {
+    if m.x4 {
+        rows_x4::<TC>(m, x, y, ys, r0, r1);
+        return true;
+    }
     let f: RowFn<TC> = match m.kind {
         GgmlType::Q4_K => q4k::<TC, false>,
         GgmlType::Q5_K => q4k::<TC, true>,
@@ -886,6 +890,191 @@ unsafe fn q8_0<const TC: usize>(row: *const u8, n_in: usize, x: &Act) -> [f32; T
     out
 }
 
+/// SDOT by element: each lane of `acc` gains the dot product of its four int8 values of `w`
+/// with the four of `a` at 32-bit lane `L`.
+#[inline(always)]
+unsafe fn sdot_lane<const L: i32>(acc: int32x4_t, w: int8x16_t, a: int8x16_t) -> int32x4_t {
+    let mut r = acc;
+    std::arch::asm!(
+        ".arch_extension dotprod",
+        "sdot {r:v}.4s, {w:v}.16b, {a:v}.4b[{l}]",
+        r = inout(vreg) r,
+        w = in(vreg) w,
+        a = in(vreg) a,
+        l = const L,
+        options(pure, nomem, nostack)
+    );
+    r
+}
+
+/// Q8_0 or Q4_0 (`K`: `Q8` or `Q4_0`) interleaved four rows at a time ([`super::repack`]): the
+/// four rows of the group at `g` against TC activation rows, lane `i` of each result row `i`.
+/// Every row repeats the plain kernel's f32 operations (`q8_0`, `q32::<_, Q4_0>`) in its order
+/// (lane `k` of its accumulator there, the block `blk + k` of each step of four, is accumulator
+/// `k` here; `finish` adds them as `(0 + 1) + (2 + 3)`), so the results are bit-identical to the
+/// plain rows'.
+#[inline(always)]
+unsafe fn x4_kern<const TC: usize, const K: u8>(g: *const u8, n_in: usize, x: &Act) -> [float32x4_t; TC] {
+    let bpr = n_in / 32;
+    let zero = vdupq_n_s32(0);
+    let bsz = if K == Q8 { 136 } else { 72 };
+    let m4 = vdupq_n_u8(0x0F);
+    let mut acc = [[vdupq_n_f32(0.0); 4]; TC];
+    // The integer sums of block `b` for token `c`, one row per lane (Q4_0: less 8 times the sum
+    // of the activations, as `q32` takes it off).
+    let isum = |w: &[int8x16_t; 8], c: usize, b: usize| -> int32x4_t {
+        let xq = x.q.add(c * n_in + b * 32);
+        let (a0, a1) = (vld1q_s8(xq), vld1q_s8(xq.add(16)));
+        let s0 = sdot_lane::<3>(
+            sdot_lane::<2>(sdot_lane::<1>(sdot_lane::<0>(zero, w[0], a0), w[1], a0), w[2], a0),
+            w[3],
+            a0,
+        );
+        let s1 = sdot_lane::<3>(
+            sdot_lane::<2>(sdot_lane::<1>(sdot_lane::<0>(zero, w[4], a1), w[5], a1), w[6], a1),
+            w[7],
+            a1,
+        );
+        let s = vaddq_s32(s0, s1);
+        if K == Q8 {
+            s
+        } else {
+            vsubq_s32(s, vdupq_n_s32(*x.i.add(c * bpr + b) << 3))
+        }
+    };
+    // Pieces `w[j]`, j < 4: values `4j..4j + 4` of each row; `w[4 + j]`: values `16 + 4j..`.
+    let load = |b: usize| -> (float32x4_t, [int8x16_t; 8]) {
+        let p = g.add(b * bsz);
+        let mut w = [vdupq_n_s8(0); 8];
+        if K == Q8 {
+            for (j, v) in w.iter_mut().enumerate() {
+                *v = vld1q_s8(p.add(8 + 16 * j) as *const i8);
+            }
+        } else {
+            for j in 0..4 {
+                let v = vld1q_u8(p.add(8 + 16 * j));
+                w[j] = vreinterpretq_s8_u8(vandq_u8(v, m4));
+                w[4 + j] = vreinterpretq_s8_u8(vshrq_n_u8::<4>(v));
+            }
+        }
+        (f16x4_to_f32(p as *const u16), w)
+    };
+    let mut blk = 0;
+    while blk + 4 <= bpr {
+        for k in 0..4 {
+            let (dv, w) = load(blk + k);
+            for c in 0..TC {
+                let s = isum(&w, c, blk + k);
+                acc[c][k] = vfmaq_f32(acc[c][k], vcvtq_f32_s32(s), vmulq_n_f32(dv, *x.s.add(c * bpr + blk + k)));
+            }
+        }
+        blk += 4;
+    }
+    let mut out = [vdupq_n_f32(0.0); TC];
+    for c in 0..TC {
+        out[c] = vaddq_f32(vaddq_f32(acc[c][0], acc[c][1]), vaddq_f32(acc[c][2], acc[c][3]));
+    }
+    while blk < bpr {
+        let (dv, w) = load(blk);
+        for c in 0..TC {
+            let s = isum(&w, c, blk);
+            out[c] = vaddq_f32(out[c], vmulq_n_f32(vmulq_f32(vcvtq_f32_s32(s), dv), *x.s.add(c * bpr + blk)));
+        }
+        blk += 1;
+    }
+    out
+}
+
+/// The `x4_kern` tag of Q8_0.
+const Q8: u8 = 255;
+
+/// [`x4_kern`] for any TC (1..=8) in kernels of at most two tokens (more would keep too many
+/// accumulators for the registers; the group's weights stay in L1 between them).
+#[inline(always)]
+unsafe fn x4_group<const TC: usize, const K: u8>(g: *const u8, n_in: usize, x: &Act) -> [float32x4_t; TC] {
+    let mut out = [vdupq_n_f32(0.0); TC];
+    let mut c = 0;
+    while c < TC {
+        let xc = act_at(x, c);
+        if TC - c >= 2 {
+            let o = x4_kern::<2, K>(g, n_in, &xc);
+            out[c] = o[0];
+            out[c + 1] = o[1];
+            c += 2;
+        } else {
+            out[c] = x4_kern::<1, K>(g, n_in, &xc)[0];
+            c += 1;
+        }
+    }
+    out
+}
+
+/// Rows `r0..r1` of an interleaved matrix (`m.x4`) against TC activation rows into
+/// `y[c * ys + r]`: whole groups of four rows at a time (a group cut by `r0` or `r1` is computed
+/// whole and only its rows in range stored).
+unsafe fn rows_x4<const TC: usize>(m: &GgufMatrix, x: &Act, y: *mut f32, ys: usize, r0: usize, r1: usize) {
+    let gb = 4 * m.row_bytes();
+    let base = m.data.as_ptr();
+    let f = match m.kind {
+        GgmlType::Q8_0 => x4_group::<TC, Q8>,
+        GgmlType::Q4_0 => x4_group::<TC, Q4_0>,
+        k => unreachable!("no interleaved kernel for {k}"),
+    };
+    let mut g = r0 / 4;
+    while 4 * g < r1 {
+        let o = f(base.add(g * gb), m.n_in, x);
+        if 4 * g >= r0 && 4 * g + 4 <= r1 {
+            for c in 0..TC {
+                vst1q_f32(y.add(c * ys + 4 * g), o[c]);
+            }
+        } else {
+            for c in 0..TC {
+                let mut v = [0f32; 4];
+                vst1q_f32(v.as_mut_ptr(), o[c]);
+                for (i, &vi) in v.iter().enumerate() {
+                    let r = 4 * g + i;
+                    if (r0..r1).contains(&r) {
+                        *y.add(c * ys + r) = vi;
+                    }
+                }
+            }
+        }
+        g += 1;
+    }
+}
+
+/// Row `r` of an interleaved Q8_0 matrix unpacked for the int8 prefill GEMM (as
+/// [`unpack_row_i8`] unpacks a plain row).
+pub(super) unsafe fn unpack_row_i8_x4(m: &GgufMatrix, r: usize, q: *mut i8, ds: *mut f32, mn: *mut f32) {
+    if m.kind != GgmlType::Q8_0 {
+        // One block at a time back in the file's layout.
+        let (rb, ts) = (m.row_bytes(), m.kind.type_size());
+        let mut blk = [0u8; 34];
+        for b in 0..m.n_in / 32 {
+            super::repack::plain_block(m.kind, &m.data, rb, r, b, &mut blk[..ts]);
+            unpack_row_i8(m.kind, blk.as_ptr(), 32, q.add(32 * b), ds.add(b), mn.add(b), std::ptr::null_mut());
+        }
+        return;
+    }
+    let g = m.data.as_ptr().add(r / 4 * 4 * m.row_bytes());
+    let i = r % 4;
+    for b in 0..m.n_in / 32 {
+        let p = g.add(b * 136);
+        // The 32 four-byte pieces of the block: piece `4j + i` is values `4j..4j + 4` of row `i`.
+        let lo = vld4q_u32(p.add(8) as *const u32);
+        let hi = vld4q_u32(p.add(72) as *const u32);
+        let (vlo, vhi) = match i {
+            0 => (lo.0, hi.0),
+            1 => (lo.1, hi.1),
+            2 => (lo.2, hi.2),
+            _ => (lo.3, hi.3),
+        };
+        vst1q_s8(q.add(32 * b), vreinterpretq_s8_u32(vlo));
+        vst1q_s8(q.add(32 * b + 16), vreinterpretq_s8_u32(vhi));
+        *ds.add(b) = f16p(p.add(2 * i));
+    }
+}
+
 /// The blocks-of-32 nibble formats (`q32` kernel parameter).
 const Q4_0: u8 = 0;
 const IQ4_NL: u8 = 1;
@@ -1492,6 +1681,21 @@ unsafe fn act_at(x: &Act, c0: usize) -> Act {
 /// unpacked once per group). Every token's arithmetic is the one-token kernel's, so the rows are
 /// bit-identical to `rows::<1>`.
 unsafe fn cols_multi(m: &GgufMatrix, x: &Act, t: usize, y: *mut f32, ys: usize, r0: usize, r1: usize) {
+    if m.x4 {
+        // Tiles of whole groups of four rows (`col_tiles` over group indices).
+        crate::kernels::col_tiles(t, m.n_in, r0 / 4, r1.div_ceil(4), 4 * m.row_bytes(), |c0, c1, ga, gb| {
+            let (ta, tb) = ((4 * ga).max(r0), (4 * gb).min(r1));
+            let xg = act_at(x, c0);
+            let yg = y.add(c0 * ys);
+            macro_rules! go {
+                ($TC:literal) => {
+                    rows_x4::<$TC>(m, &xg, yg, ys, ta, tb)
+                };
+            }
+            crate::kernels::with_cols!(c1 - c0, go)
+        });
+        return;
+    }
     macro_rules! kern {
         ($TC:literal) => {
             match m.kind {
