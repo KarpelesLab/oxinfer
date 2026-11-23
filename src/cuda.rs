@@ -2813,6 +2813,115 @@ mod tests {
         }
     }
 
+    /// The prefill plans' tensor-core attention (`dfattn_D`): queries of a step after cached
+    /// positions, causal, with and without a window and an output gate, grouped heads, a partial
+    /// last tile of queries, against the f64 definition (to f16's rounding of the operands).
+    #[test]
+    fn prefill_flash_attention_matches_definition() {
+        let Some(be) = backend() else { return };
+        assert!(be.bind());
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct Dap {
+            nh: u32,
+            nkv: u32,
+            window: u32,
+            has_gate: u32,
+            g_stride: u32,
+            block: u32,
+            scale: f32,
+            _q: u32,
+        }
+        let mut seed = 5;
+        for d in [64usize, 128] {
+            let (nh, nkv, t, pos0) = (4usize, 2usize, 100usize, 37usize);
+            let len = pos0 + t;
+            let (qs, gs) = (nh * d + 16, nh * d);
+            let k: Vec<f32> = (0..len * nkv * d).map(|_| rnd(&mut seed) * 2.0).collect();
+            let v: Vec<f32> = (0..len * nkv * d).map(|_| rnd(&mut seed) * 2.0).collect();
+            let q: Vec<f32> = (0..t * qs).map(|_| rnd(&mut seed) * 2.0).collect();
+            let gate: Vec<f32> = (0..t * gs).map(|_| rnd(&mut seed) * 4.0).collect();
+            let sp: Vec<u32> = (0..t).flat_map(|j| [(pos0 + j) as u32, pos0 as u32, t as u32, j as u32]).collect();
+            let up = |v: &[f32]| be.upload_bytes(v.as_ptr() as *const u8, v.len() * 4).unwrap();
+            let (dk, dv, dq, dg) = (up(&k), up(&v), up(&q), up(&gate));
+            let dsp = be.upload_bytes(sp.as_ptr() as *const u8, sp.len() * 4).unwrap();
+            let mut dout = 0u64;
+            assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut dout, t * nh * d * 4) }, 0);
+            let f = be.func(&format!("dfattn_{d}")).unwrap();
+            let scale = 1.0 / (d as f32).sqrt();
+            for (window, has_gate) in [(0u32, 0u32), (50, 0), (0, 1), (130, 1)] {
+                let p = Dap {
+                    nh: nh as u32,
+                    nkv: nkv as u32,
+                    window,
+                    has_gate,
+                    g_stride: d as u32,
+                    block: 0,
+                    scale,
+                    _q: 0,
+                };
+                let (tt, qsu, os, gsu) = (t as u32, qs as u32, (nh * d) as u32, gs as u32);
+                let mut args = [
+                    &dq as *const _ as *mut c_void,
+                    &dk as *const _ as *mut c_void,
+                    &dv as *const _ as *mut c_void,
+                    &dout as *const _ as *mut c_void,
+                    &dg as *const _ as *mut c_void,
+                    &dsp as *const _ as *mut c_void,
+                    &p as *const _ as *mut c_void,
+                    &tt as *const _ as *mut c_void,
+                    &qsu as *const _ as *mut c_void,
+                    &os as *const _ as *mut c_void,
+                    &gsu as *const _ as *mut c_void,
+                ];
+                assert!(be.launch(f, ((t as u32).div_ceil(64), nh as u32), 128, &mut args));
+                let mut out = vec![0f32; t * nh * d];
+                assert_eq!(
+                    unsafe { be.cu.cuMemcpyDtoH_v2(out.as_mut_ptr() as *mut c_void, dout, out.len() * 4) },
+                    0
+                );
+                let mut worst = 0f64;
+                for j in 0..t {
+                    let pos = pos0 + j;
+                    let lo = if window != 0 && pos + 1 > window as usize {
+                        pos + 1 - window as usize
+                    } else {
+                        0
+                    };
+                    for h in 0..nh {
+                        let kvh = h / (nh / nkv);
+                        let qr = &q[j * qs + h * d..j * qs + (h + 1) * d];
+                        let sc: Vec<f64> = (lo..=pos)
+                            .map(|kp| {
+                                let kr = &k[(kp * nkv + kvh) * d..(kp * nkv + kvh + 1) * d];
+                                qr.iter().zip(kr).map(|(&a, &b)| a as f64 * b as f64).sum::<f64>() * scale as f64
+                            })
+                            .collect();
+                        let m = sc.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                        let e: Vec<f64> = sc.iter().map(|s| (s - m).exp()).collect();
+                        let l: f64 = e.iter().sum();
+                        for i in 0..d {
+                            let mut r: f64 = (lo..=pos)
+                                .zip(&e)
+                                .map(|(kp, w)| w * v[(kp * nkv + kvh) * d + i] as f64)
+                                .sum::<f64>()
+                                / l;
+                            if has_gate == 1 {
+                                r /= 1.0 + (-(gate[j * gs + h * d + i] as f64)).exp();
+                            }
+                            worst = worst.max((out[j * nh * d + h * d + i] as f64 - r).abs());
+                        }
+                    }
+                }
+                // f16 operands: ~1e-4 measured, values up to 1 in magnitude.
+                assert!(worst < 1e-3, "dfattn_{d} window {window} gate {has_gate}: error {worst:.2e}");
+            }
+            for ptr in [dk, dv, dq, dg, dsp, dout] {
+                unsafe { be.cu.cuMemFree_v2(ptr) };
+            }
+        }
+    }
+
     /// The decode matvecs (`cuda_decode.cu`): every format and output mode against the f64
     /// definition, and the multi-token kernel bit-identical to the single-token one per token
     /// (what makes a verification pass equal to one-token steps).

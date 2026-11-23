@@ -267,6 +267,9 @@ enum COp {
         f: F,
         /// The kernel over a batch of tokens (prefill plans; else null).
         ft: F,
+        /// The tensor-core kernel over the whole step (`dfattn_D`: fast prefill plans, head
+        /// dimensions 64 and 128; else null).
+        fa: F,
         combine: F,
         q: P,
         out: P,
@@ -703,6 +706,10 @@ impl CudaBackend {
             return None;
         }
         let mt = tokens > 1;
+        // Prefill plans: the fast GEMM (f16 operands) and attention on the tensor cores unless
+        // exact (`gpu::exact`; the attention also with `gpu::exact_attention`).
+        let fast_gemm = pf && !PF_EXACT.with(|c| c.get()).unwrap_or_else(crate::gpu::exact);
+        let fast_attn = fast_gemm && !crate::gpu::exact_attention();
         // The arena: every buffer 256-byte aligned; in a multi-token plan, `tokens` rows of `tsz`
         // floats (256-byte aligned too).
         let tsz: Vec<usize> = g.bufs.iter().map(|&n| if mt { n.next_multiple_of(64) } else { n }).collect();
@@ -1103,6 +1110,11 @@ impl CudaBackend {
                             } else {
                                 std::ptr::null_mut()
                             },
+                            fa: if fast_attn && matches!(hd, 64 | 128) {
+                                self.func(&format!("dfattn_{hd}"))?
+                            } else {
+                                std::ptr::null_mut()
+                            },
                             combine: self.func("dattn_combine")?,
                             q: byte(q),
                             out: byte(out),
@@ -1328,7 +1340,7 @@ impl CudaBackend {
         }
         let flag_off = region(4);
         // The fast prefill GEMM's f16 input rows.
-        let fast_gemm = pf && !PF_EXACT.with(|c| c.get()).unwrap_or_else(crate::gpu::exact);
+
         let xh_off = region(if fast_gemm { gemm_in_max * tokens * 2 } else { 4 });
         let part_off = region(part_floats.max(1) * 4);
         let pair_off = region(pair_floats.max(1) * tokens * 4);
@@ -1943,6 +1955,19 @@ impl CudaPlan<'_> {
                     (p.nh + 2 * p.nkv, tt),
                     p.hd,
                     &mut args![qa, oa, kc, vc, ko, vo, qn, kn, cs, sp, p, qs, os],
+                )
+            }
+            COp::Attn {
+                fa, q, out, kv, gate, p, ..
+            } if !fa.is_null() && p.block == 0 => {
+                // The whole step: 64 queries of a head per block.
+                let m = &slot.kv[kv];
+                let (qa, oa, ga, sp, qs, os, gs) = (q.a, out.a, gate.a, self.sp, st(q), st(out), st(gate));
+                be.launch(
+                    fa,
+                    (tt.div_ceil(64), p.nh),
+                    128,
+                    &mut args![qa, m.k, m.v, oa, ga, sp, p, tt, qs, os, gs],
                 )
             }
             COp::Attn {

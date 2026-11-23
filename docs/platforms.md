@@ -224,7 +224,14 @@ IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4. Three things run on the
   0.06-0.09) and its greedy tokens are the exact GEMM's in all four runs. The GEMM time of a
   512-token Qwen3-8B pass: 106 ms with the per-format dequantizer for every format, 98 with it
   reading cached bytes only (so its arithmetic, not memory, was the cost), 55 with the half
-  arithmetic unpacking; 64-row tiles 159; the split GEMM 114. RMSNorm, RoPE, the
+  arithmetic unpacking; 64-row tiles 159; the split GEMM 114. Attention in the default mode is
+  a tensor-core kernel over the whole step (`dfattn_*`, head dimensions 64 and 128: a block per
+  64 queries of a head, key tiles of 64 as f16 in shared memory, f16 products with f32 sums and
+  the softmax online in f32; within ~1e-4 of the f64 definition in `cuda::tests`): a 512-token
+  Qwen3-8B pass spends 1.5 ms there instead of 18.1 on the decode kernel in batches of 32
+  (`gpu_exact=1` keeps that), so its prompts run at 6165 tok/s at 512 tokens and 5432 at 2048,
+  Llama-3.2-1B's at 26871 and 21460, with the same greedy tokens as before on the four
+  `pf_check` runs. RMSNorm, RoPE, the
   activations, the Gated DeltaNet convolution and delta rule (the state in registers across the
   step's tokens) over all tokens in one launch; attention with the decode kernel, 32 tokens per
   launch; the hidden states, the new keys and values and the recurrent states come back to the
