@@ -882,6 +882,12 @@ impl Engine {
             return None;
         }
         let t0 = std::time::Instant::now();
+        // On a unified-memory device the checkpoint is mapped, and the driver copies pages that
+        // are not in the page table yet at 0.3 GB/s (`cuda::touch_before_upload`): every weight's
+        // pages are read first, in one pass of the thread pool.
+        let pages: Vec<&[u8]> = lins.iter().filter_map(|l| host_w(l, 1)).map(|hw| hw.data).collect();
+        crate::cuda::touch_all_before_upload(&pages);
+        let t_pages = t0.elapsed().as_secs_f64();
         e.h = h;
         e.vocab = c.vocab_size;
         e.unpadded = c.unpadded_vocab_size;
@@ -918,9 +924,10 @@ impl Engine {
         let pairs = (CHUNK * widest).max(CHUNK * e.k_top * mi) / 2;
         e.xsplit = (e.alloc(pairs * 4).ok()?, e.alloc(pairs * 4).ok()?, pairs);
         debug(&format!(
-            "{:.1} GB of weights on the device in {:.1} s (kinds {kinds:?})",
+            "{:.1} GB of weights on the device in {:.1} s ({t_pages:.1} s reading their pages; kinds {kinds:?}, lanes {})",
             total as f64 / 1e9,
-            t0.elapsed().as_secs_f64()
+            t0.elapsed().as_secs_f64(),
+            e.lanes
         ));
         Some(e)
     }

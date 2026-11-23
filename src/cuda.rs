@@ -674,6 +674,31 @@ pub(crate) fn touch_before_upload(src: &[u8]) {
     }
 }
 
+/// [`touch_before_upload`] for many buffers in one pass of the thread pool (every weight of the
+/// Inkling-2 engine, whose experts are a few megabytes each).
+pub(crate) fn touch_all_before_upload(srcs: &[&[u8]]) {
+    if !integrated() {
+        return;
+    }
+    const PIECE: usize = 4 << 20;
+    let pieces: Vec<(usize, usize)> = srcs
+        .iter()
+        .flat_map(|s| {
+            let (base, n) = (s.as_ptr() as usize, s.len());
+            (0..n.div_ceil(PIECE)).map(move |i| (base + i * PIECE, base + ((i + 1) * PIECE).min(n)))
+        })
+        .collect();
+    crate::pool::run(pieces.len(), &|i| {
+        let (a, b) = pieces[i];
+        let mut sum = 0u8;
+        for p in (a..b).step_by(4096) {
+            // SAFETY: inside one of the caller's buffers.
+            sum = sum.wrapping_add(unsafe { std::ptr::read_volatile(p as *const u8) });
+        }
+        std::hint::black_box(sum);
+    });
+}
+
 /// [`touch_pages`] for memory about to be written by the driver: a float of every page is
 /// written back, so the page is this process's own (not the shared zero page of a fresh
 /// allocation).
