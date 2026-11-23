@@ -134,7 +134,10 @@ second run instead of 10-11 (the experts of the previous run are hits).
 On-demand reads (routed experts, DeepSeek V4.1's engram rows) request every missing chunk first
 (asynchronous advisory reads on Darwin, `madvise(WILLNEED)` elsewhere) and touch the chunks after,
 instead of one read in flight per reader thread. The engram rows of a 2048-token prefill chunk are
-~50k scattered pages of a 110 GB table: 2.0 -> 0.85 s per engram layer.
+~50k scattered pages of a 110 GB table: 2.0 -> 0.85 s per engram layer. To find a request
+already cached, each chunk's middle page is probed (one `mincore`, ~1 us however small; three
+pages a chunk cost a warm V4.1 decode step 2.2 ms, one costs 1.0): a chunk the OS emptied is
+still found and read in bulk, one it thinned out faults its missing pages in where they are used.
 
 Measured on the M5 Max with the phone's limits emulated (`--cache-budget-gb`, `--flash-mbps`;
 greedy, a 40-token answer to a short prompt, CPU decoding; "3 threads" approximates the

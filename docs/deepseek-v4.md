@@ -432,6 +432,78 @@ third of its speed (1.0 ms of GPU time per layer instead of 0.3; see
 40 round trips costs ~0.2 ms besides. The dense matvecs alone on the GPU, one submission per
 matmul: 4.8 tok/s.
 
+#### Decode, round 2: the expert kernels
+
+Same setup and prompt as above (128 greedy tokens, no lookup drafting), the round above's binary
+(`6883fa0`) against this one, interleaved under the bench lock; other agents loaded the machine
+throughout (load average 2-16), so the figures are pairs taken minutes apart:
+
+| | round 1 (`6883fa0`) | now |
+|---|---|---|
+| decode warm, quiet pairs (load 2-4) | 15.3-15.8 tok/s | 16.3-16.8 tok/s |
+| decode warm, loaded pairs (load 10-13) | 13.3 / 13.5 / 14.6 / 14.7 | 14.1 / 14.7 / 15.2 / 16.9 |
+| decode cold (`--cold-start`, 23.8 GB read), two pairs in either order | 11.3 / 11.9 | 10.3 / 12.2 |
+
+(Cold, 10% of the experts come from the SSD and the step stalls on them ~30% of the time; the kernels change nothing there.)
+
+The same text in every run; the six greedy checks give dumps bit for bit those of the round above
+(llama.cpp's 33 tokens at every step, 198 of 198, mean KL 0.0004-0.0045), perplexity 2.9764 as
+before: every change below keeps the arithmetic.
+
+A warm step now (59.5 ms, `--profile`): routed + shared experts 31.1 ms (gate / up batch ~18,
+down batch ~10, activations ~1.5, expert reads 1.0), attention output projection 10.6, `wq_b`
+5.3, hyper-connection mixes 2.6, attention 2.5, input projections 2.2, LM head 2.0, router 1.2,
+engram 1.1.
+
+Kept:
+
+- One-token IQ1_S, IQ1_M and IQ2_XXS rows two at a time (`kernels_ggml.rs`, `*_rows::<2>`): the
+  activation vectors loaded once for both rows, a block's index bits read as whole words, the
+  scales and delta signs unpacked in vectors. IQ1_M puts the ternary grid entries straight into
+  the dot products and weighs its per-8 delta signs with the activations' sums of 8 (formed once
+  for both rows); IQ2_XXS takes one SDOT chain and one scale per 32 and multiplies the grid values
+  by +1 / -1 sign bytes. Bit for bit the one-row kernels (and so the multi-token ones). One core,
+  random 2304 x 5120 rows: IQ1_S 7.5 -> 8.4 GB/s, IQ1_M 4.9 -> 7.1, IQ2_XXS 8.1 -> 8.7; 18
+  threads, 27648 x 5120 from DRAM: IQ1_S 85 -> 83-95 (no clear gain), IQ1_M 52 -> 73-75, IQ2_XXS
+  83-87 -> 90-92.
+- The router reads its bf16 weights in place (`kernels::dot_bf16_exact`, the f32 `dot`'s lanes
+  and order over the widened values, so the same routes): 1.9 -> 1.2 ms.
+- The experts' activations of a short pass run in one parallel region (a task per expert).
+- An on-demand request probes one page of each chunk to find it cached instead of three (a
+  `mincore` costs ~1 us however small): expert reads 2.2 -> 1.0 ms when warm.
+
+What bounds the experts: the IQ kernels are bound by the instructions a grid entry costs, not by
+memory. Per 8 weights: the index from two bit fields (2-3 scalar operations), the table load, the
+insert into a vector, a share of the SDOT; about 190 instructions per 256-weight IQ1_S block,
+~8 a cycle. Measured by elimination on one core: constant table addresses (no index arithmetic)
+read IQ1_S at 25 GB/s, the real kernel at 8; a 2 KB table instead of 16 KB changes nothing (no
+cache effect); one more scalar operation per entry costs 20%. All 18 threads reach ~85-95 GB/s on
+IQ1_S (6 threads ~39: the slower 12 cores add ~4 GB/s each), against ~285 GB/s of plain streaming
+reads; the dense Q5_K matrices reach ~210 GB/s from 12 threads on (no gain from software
+prefetch at 0.5-4 KB ahead).
+
+Tried and not kept:
+
+- The grid indices formed in vectors (TBL, shifts and inserts: 4 operations for 8 entries) and
+  taken out per entry (`umov`), through the stack (vector stores, scalar loads), or as byte
+  offsets two at a time (64-bit lanes): 7.0, 6.6-6.9 and ~7.4 GB/s against 8.4. Getting them back
+  into general registers costs what the scalar arithmetic did.
+- Row pairs that keep both rows' 16 unpacked vectors live (spills): 6.1 GB/s.
+- Some routed experts on the GPU while the CPU runs the others and the shared expert (a Metal
+  plan for the last 1-3 of the 6, on a thread of its own, the sums added after): 15.0 / 14.2 /
+  13.1 tok/s for 1 / 2 / 3 experts against 16.4 with none. Two experts take 0.3 ms of GPU time
+  but 0.6-1.2 ms from submission to completion; the CPU's share takes 0.53 ms; with 15-17 CPU
+  threads the same.
+- The probes of an on-demand request on the pool's threads: 8.7 ms instead of 2.2 (the calls
+  serialize in the kernel).
+
+So the remaining decode time is the expert matmuls (~28 ms: the routed IQ kernels compute-bound,
+the shared Q5_K expert ~4 ms of it at memory speed) and the dense matmuls (~21 ms at ~210 GB/s). Beyond that, only a whole-token Metal decode graph
+(the GPU reads ~2x the CPU's bandwidth and does table lookups cheaply) would change the picture;
+it needs every V4.1 op on the device (hyper-connection mixes, the compressor and indexer
+attention with sinks, the grouped output projection, engram rows, routing with streamed experts
+wrapped from the page cache), and was not attempted.
+
 Not done for V4.1: image input (the ViT with 2D RoPE, the 3x3 aligner and the
 image processor; `mmproj` files are not read; the language model's side is in place and
 verified as above); DSpark (the `mtp.*` stages differ from V4's: 128 experts, a Markov head on the
