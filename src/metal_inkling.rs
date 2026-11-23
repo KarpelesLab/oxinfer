@@ -165,6 +165,14 @@ fn dconv_on() -> bool {
     *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_DCONV").is_ok_and(|v| v == "0"))
 }
 
+/// Most tokens of a pass whose attention kernel makes its queries, keys and values itself
+/// (`ink_attf`); `OXINFER_INKLING_ATTF=0`: none (`ink_q` and `ink_kv` before `ink_attv`).
+const ATTF_T: usize = 8;
+fn attf_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_ATTF").is_ok_and(|v| v == "0"))
+}
+
 /// The chunk of an expert format's kernels (values per `mdot`).
 fn ch_of(fmt: &str) -> usize {
     expert_formats().iter().find(|f| f.0 == fmt).map_or(32, |f| f.3)
@@ -817,6 +825,8 @@ struct Pipes {
     attn: [Id; 3],
     /// Passes of up to MAX_T tokens: lanes across the channels (`ink_attv`).
     attv: [Id; 3],
+    /// Passes of up to [`ATTF_T`] tokens: `ink_attv` with `ink_q` and `ink_kv` in it.
+    attf: [Id; 3],
     merge: Id,
     conv: Id,
     route: Id,
@@ -1946,6 +1956,14 @@ impl InkMetal {
                     pipe(&format!("ink_attv_4_{g}_2"))?,
                 ]
             },
+            attf: {
+                let g = m.layers[0].attn.hd.heads / m.layers[0].attn.hd.kv_heads;
+                [
+                    pipe(&format!("ink_attf_4_{g}_0"))?,
+                    pipe(&format!("ink_attf_4_{g}_1"))?,
+                    pipe(&format!("ink_attf_4_{g}_2"))?,
+                ]
+            },
             merge: pipe("ink_attn_merge")?,
             conv: pipe("ink_conv")?,
             route: pipe("ink_route")?,
@@ -2855,16 +2873,20 @@ impl InkMetal {
             clip_eps: CLIP_EPS,
             ..Default::default()
         };
-        self.std(e, c, self.p.q);
-        e.bytes(&qp, 2);
-        if !self.skip(SK_ATTN | SK_QKV) {
-            e.dispatch((nh, t), hd);
-        }
-        let dynamic = ld.kd.is_some();
-        let kn = self.kn;
         // A prefill pass longer than a sliding window's spare rows writes its keys and values
         // by position from `pos` into the arena's rows (copied to the ring after).
         let tmp = sd.ring != 0 && !self.inline_rings(t);
+        // (Short passes: the attention kernel makes its queries, keys and values.)
+        let fold = t <= ATTF_T && !tmp && attf_on() && !self.skip(SK_ATTN | SK_QKV | SK_ATTK);
+        if !fold {
+            self.std(e, c, self.p.q);
+            e.bytes(&qp, 2);
+            if !self.skip(SK_ATTN | SK_QKV) {
+                e.dispatch((nh, t), hd);
+            }
+        }
+        let dynamic = ld.kd.is_some();
+        let kn = self.kn;
         let pfb = c.b.pf.as_ref();
         let kp = KvP {
             kw: kw as u32,
@@ -2893,28 +2915,30 @@ impl InkMetal {
             KvCache::F16 => 1,
             KvCache::Q8 => 2,
         };
-        self.std(e, c, self.p.kv[fi]);
-        e.bytes(&kp, 2);
-        e.buf(sd.rings[0].0, 0, 3);
-        e.buf(sd.rings[1].0, 0, 4);
-        match (tmp, pfb) {
-            (true, Some(pb)) => {
-                e.buf(c.a, pb.kt * 4, 5);
-                e.buf(c.a, pb.vt * 4, 6);
-                e.buf(c.a, pb.kts * 4, 7);
-                e.buf(c.a, pb.vts * 4, 8);
+        if !fold {
+            self.std(e, c, self.p.kv[fi]);
+            e.bytes(&kp, 2);
+            e.buf(sd.rings[0].0, 0, 3);
+            e.buf(sd.rings[1].0, 0, 4);
+            match (tmp, pfb) {
+                (true, Some(pb)) => {
+                    e.buf(c.a, pb.kt * 4, 5);
+                    e.buf(c.a, pb.vt * 4, 6);
+                    e.buf(c.a, pb.kts * 4, 7);
+                    e.buf(c.a, pb.vts * 4, 8);
+                }
+                _ => {
+                    e.buf(sd.k.0, 0, 5);
+                    e.buf(sd.v.0, 0, 6);
+                    e.buf(sd.ks.0, 0, 7);
+                    e.buf(sd.vs.0, 0, 8);
+                }
             }
-            _ => {
-                e.buf(sd.k.0, 0, 5);
-                e.buf(sd.v.0, 0, 6);
-                e.buf(sd.ks.0, 0, 7);
-                e.buf(sd.vs.0, 0, 8);
+            if !self.skip(SK_ATTN | SK_QKV) {
+                e.dispatch((nkv, t), hd);
             }
+            e.barrier();
         }
-        if !self.skip(SK_ATTN | SK_QKV) {
-            e.dispatch((nkv, t), hd);
-        }
-        e.barrier();
         if !self.inline_rings(t) {
             self.ring_store(e, c, b.k, kw, sd.rings[0].0, pos, t);
             self.ring_store(e, c, b.v, kw, sd.rings[1].0, pos, t);
@@ -2964,8 +2988,24 @@ impl InkMetal {
             out: b.att as u32,
             ..ap
         };
-        self.std(e, c, if t <= MAX_T { self.p.attv[fi] } else { self.p.attn[fi] });
+        self.std(
+            e,
+            c,
+            if fold {
+                self.p.attf[fi]
+            } else if t <= MAX_T {
+                self.p.attv[fi]
+            } else {
+                self.p.attn[fi]
+            },
+        );
         e.bytes(&ap, 2);
+        if fold {
+            e.bytes(&kp, 11);
+            e.bytes(&qp, 12);
+            e.buf(sd.rings[0].0, 0, 13);
+            e.buf(sd.rings[1].0, 0, 14);
+        }
         e.buf(sd.k.0, 0, 3);
         e.buf(sd.v.0, 0, 4);
         e.buf(sd.ks.0, 0, 5);

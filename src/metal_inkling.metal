@@ -499,6 +499,46 @@ INK_ATTN(4, 4, 0) INK_ATTN(4, 4, 1) INK_ATTN(4, 4, 2)
 // together, each dot product a SIMD-group sum; at the short ranges of decoding each key is one
 // load per lane rather than a lane's walk over its row.
 #define INK_AKB 2
+// The SIMD-groups' partial results (maxima and sums in `sm`, accumulators in `so`) combined:
+// the merge's work for a token of one split, else the split's partial result.
+template <int D, int G>
+inline void ink_attv_fin(device float* a, constant IAP& p, uint ns, uint split, uint ti, uint h0, uint tid, threadgroup float* sm,
+                         threadgroup float* so) {
+    constexpr uint HD = D * 32;
+    for (uint i = tid; i < G * HD; i += 256) {
+        uint gg = i / HD, d = i % HD;
+        threadgroup const float* smg = sm + gg * 16;
+        float M = smg[0];
+        for (uint s2 = 1; s2 < 8; s2++) M = max(M, smg[s2]);
+        float L = 0.f, acc = 0.f;
+        for (uint s2 = 0; s2 < 8; s2++) {
+            if (smg[s2] == -INFINITY) continue;
+            float f = exp(smg[s2] - M);
+            L += smg[8 + s2] * f;
+            acc += so[(gg * 8 + s2) * HD + d] * f;
+        }
+        if (p.fin != 0 && ns == 1) {
+            // (A token of one split: the merge's work here, `ink_attn_merge` leaves it out. Per
+            // token, so that it is done the same way whatever the pass's other tokens.)
+            uint hh = h0 + gg;
+            float sink = a[p.sink + (ulong)ti * p.nh + hh];
+            float M2 = max(sink, M);
+            float L2 = exp(sink - M2);
+            float acc2 = 0.f;
+            if (M != -INFINITY) {
+                L2 += L * exp(M - M2);
+                acc2 += acc * exp(M - M2);
+            }
+            ulong o = (ulong)ti * p.nh * HD + hh * HD + d;
+            float gt = a[p.gate + o];
+            a[p.out + o] = acc2 / L2 * (1.0f / (1.0f + exp(-gt)));
+            continue;
+        }
+        device float* pr = a + p.part + (((ulong)ti * p.nh + h0 + gg) * p.maxsplit + split) * (HD + 2);
+        pr[d] = acc;
+        if (d == 0) { pr[HD] = M; pr[HD + 1] = L; }
+    }
+}
 template <int D, int G, int KFMT>
 inline void ink_attv_body(device float* a, device const float* c, constant IAP& p, device const uchar* kc, device const uchar* vc,
                           device const float* ksc, device const float* vsc, device const uchar* tk, device const uchar* tv,
@@ -575,39 +615,7 @@ inline void ink_attv_body(device float* a, device const float* c, constant IAP& 
         *(threadgroup float4*)(so + (gg * 8 + sg) * HD + lane * D) = o[gg];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint i = tid; i < G * HD; i += 256) {
-        uint gg = i / HD, d = i % HD;
-        threadgroup const float* smg = sm + gg * 16;
-        float M = smg[0];
-        for (uint s2 = 1; s2 < 8; s2++) M = max(M, smg[s2]);
-        float L = 0.f, acc = 0.f;
-        for (uint s2 = 0; s2 < 8; s2++) {
-            if (smg[s2] == -INFINITY) continue;
-            float f = exp(smg[s2] - M);
-            L += smg[8 + s2] * f;
-            acc += so[(gg * 8 + s2) * HD + d] * f;
-        }
-        if (p.fin != 0 && ns == 1) {
-            // (A token of one split: the merge's work here, `ink_attn_merge` leaves it out. Per
-            // token, so that it is done the same way whatever the pass's other tokens.)
-            uint hh = h0 + gg;
-            float sink = a[p.sink + (ulong)ti * p.nh + hh];
-            float M2 = max(sink, M);
-            float L2 = exp(sink - M2);
-            float acc2 = 0.f;
-            if (M != -INFINITY) {
-                L2 += L * exp(M - M2);
-                acc2 += acc * exp(M - M2);
-            }
-            ulong o = (ulong)ti * p.nh * HD + hh * HD + d;
-            float gt = a[p.gate + o];
-            a[p.out + o] = acc2 / L2 * (1.0f / (1.0f + exp(-gt)));
-            continue;
-        }
-        device float* pr = a + p.part + (((ulong)ti * p.nh + h0 + gg) * p.maxsplit + split) * (HD + 2);
-        pr[d] = acc;
-        if (d == 0) { pr[HD] = M; pr[HD + 1] = L; }
-    }
+    ink_attv_fin<D, G>(a, p, ns, split, ti, h0, tid, sm, so);
 }
 #define INK_ATTV(D, G, F) \
 kernel void ink_attv_##D##_##G##_##F(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IAP& p [[buffer(2)]], \
@@ -622,6 +630,214 @@ INK_ATTV(4, 3, 0) INK_ATTV(4, 3, 1) INK_ATTV(4, 3, 2)
 INK_ATTV(4, 1, 0) INK_ATTV(4, 1, 1) INK_ATTV(4, 1, 2)
 INK_ATTV(4, 2, 0) INK_ATTV(4, 2, 1) INK_ATTV(4, 2, 2)
 INK_ATTV(4, 4, 0) INK_ATTV(4, 4, 1) INK_ATTV(4, 4, 2)
+
+// ---- Passes of up to 8 tokens: `ink_q` and `ink_kv` in the attention kernel (`ink_attf`; no stage
+// between the projections and the attention). A threadgroup (kv head g, split, token ti) makes its
+// query heads' scaled and clipped queries and relative vectors as `ink_q` does, and the keys and
+// values of the pass's tokens in its split's range as `ink_kv` does (the same sums in the same
+// order: a channel a thread, SIMD-group sums then the head's 4 in order), rounded as the cache
+// stores them; the threadgroup whose split ends at its token's own position writes that token's
+// key and value to the cache and its inputs to the rings. (Keys of earlier positions come from the
+// cache, written by earlier passes.)
+template <int D, int G, int KFMT>
+inline void ink_attf_body(device float* a, device const float* c, constant IAP& p, constant IKvP& kp, constant IQP& qp,
+                          device uchar* kc, device uchar* vc, device float* ksc, device float* vsc, device float* rk, device float* rv,
+                          uint g, uint split, uint ti, uint tid, uint sg, uint lane, threadgroup float* sm, threadgroup float* so,
+                          threadgroup float* bias, threadgroup float* red, threadgroup float* rr) {
+    constexpr uint HD = D * 32;
+    uint lo, hi;
+    ink_range(p, ti, lo, hi);
+    uint ns = ink_nsplit(hi - lo, p.maxsplit, p.cmin), chunk = ink_chunk(hi - lo, p.maxsplit, p.cmin);
+    if (split >= ns) return;
+    uint j0 = lo + split * chunk, j1 = min(hi, j0 + chunk);
+    uint h0 = g * G, pp = p.pos + ti;
+    // The pass's tokens whose keys are in [j0, j1): kt0 .. kt0 + nloc - 1 (the last is ti at most).
+    uint kt0 = max(j0, p.pos) - p.pos;
+    uint nloc = j1 > p.pos ? j1 - max(j0, p.pos) : 0;
+    bool writer = split == ns - 1;
+    threadgroup float* qv = bias;
+    threadgroup float* kt = so;
+    threadgroup float* vt = so + 8 * HD;
+    uint kw = kp.kw, kn = kp.kn;
+    float tau = 1.f;
+    if (qp.alpha != 0.f) tau = 1.f + qp.alpha * log(max(1.f, float(qp.pos + ti + 1) / qp.floor_));
+    // Queries (`ink_q`): red[gg * 4 + s] the head's SIMD-group sums.
+    for (uint w = tid; w < G * HD; w += 256) {
+        uint gg = w / HD, ch = w % HD;
+        float v = a[qp.q + (ulong)ti * qp.w + (h0 + gg) * HD + ch] * c[qp.qs + (h0 + gg) * HD + ch];
+        qv[w] = v;
+        float s2 = simd_sum(v * v);
+        if (lane == 0) red[w / 32] = s2;
+    }
+    // Relative vectors (`ink_q`): SIMD-group gg, lane d.
+    if (sg < uint(G)) {
+        uint hh = h0 + sg;
+        float r = lane < qp.dr ? a[qp.r + ((ulong)ti * qp.nh + hh) * qp.dr + lane] * c[qp.rs + hh * qp.dr + lane] : 0.f;
+        float rn = simd_sum(r * r);
+        float rf = qp.rclip / (sqrt(rn) + qp.clip_eps);
+        if (rf < 1.f) r *= rf;
+        if (lane < 16) rr[sg * 16 + lane] = r * tau;
+    }
+    // Keys and values (`ink_kv`): red[16 + kk * 4 + s] and red[48 + kk * 4 + s].
+    for (uint w = tid; w < nloc * HD; w += 256) {
+        uint kk = w / HD, ch = w % HD, tj = kt0 + kk, chg = g * HD + ch;
+        uint pos = kp.pos + tj;
+        float sk = a[kp.k + (ulong)tj * kw + chg], sv = a[kp.v + (ulong)tj * kw + chg];
+        for (uint lag = 0; lag < kn; lag++) {
+            float xk, xv;
+            if (lag <= tj) {
+                xk = a[kp.k + (ulong)(tj - lag) * kw + chg];
+                xv = a[kp.v + (ulong)(tj - lag) * kw + chg];
+            } else {
+                int q = int(pos) - int(lag);
+                ulong r = (ulong)((q + int(kn) - 1 + int(kp.ring_cap)) % int(kp.ring_cap)) * kw + chg;
+                xk = rk[r];
+                xv = rv[r];
+            }
+            float wk = c[kp.tk + lag * kw + chg], wv = c[kp.tv + lag * kw + chg];
+            if (kp.dynamic != 0) {
+                wk += a[kp.kd + ((ulong)tj * kp.nkv + g) * kn + lag];
+                wv += a[kp.vd + ((ulong)tj * kp.nkv + g) * kn + lag];
+            }
+            sk += wk * xk;
+            sv += wv * xv;
+        }
+        sk *= kp.norm;
+        sv *= kp.norm;
+        kt[w] = sk;
+        vt[w] = sv;
+        float s2k = simd_sum(sk * sk), s2v = simd_sum(sv * sv);
+        if (lane == 0) {
+            red[16 + w / 32] = s2k;
+            red[48 + w / 32] = s2v;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float4 q4[G];
+    for (int gg = 0; gg < G; gg++) {
+        float n = 0.f;
+        for (uint s = 0; s < 4; s++) n += red[gg * 4 + s];
+        float f = qp.qclip / (sqrt(n) + qp.clip_eps);
+        float4 v = *(threadgroup float4*)(qv + gg * HD + lane * D);
+        if (f < 1.f) v *= f;
+        q4[gg] = (v * tau) * p.scale;
+    }
+    for (uint w = tid; w < nloc * HD; w += 256) {
+        uint kk = w / HD, ch = w % HD, tj = kt0 + kk, chg = g * HD + ch;
+        float nk = 0.f, nv = 0.f;
+        for (uint s = 0; s < 4; s++) nk += red[16 + kk * 4 + s];
+        for (uint s = 0; s < 4; s++) nv += red[48 + kk * 4 + s];
+        float sk = kt[w], sv = vt[w];
+        float f = kp.clip / (sqrt(nk) + kp.clip_eps);
+        if (f < 1.f) sk *= f;
+        sv *= rsqrt(nv / float(HD) + kp.eps);
+        // The values as the cache holds them.
+        float dk = sk, dv = sv;
+        if (KFMT == 1) {
+            dk = float(half(sk));
+            dv = float(half(sv));
+        } else if (KFMT == 2) {
+            float ak = simd_max(fabs(sk)) / 127.f, av = simd_max(fabs(sv)) / 127.f;
+            dk = float(char(clamp(round(sk * (ak > 0.f ? 1.f / ak : 0.f)), -128.f, 127.f))) * ak;
+            dv = float(char(clamp(round(sv * (av > 0.f ? 1.f / av : 0.f)), -128.f, 127.f))) * av;
+        }
+        kt[w] = dk;
+        vt[w] = dv;
+        if (writer && tj == ti) {
+            uint pos = kp.pos + tj;
+            ulong row = kp.cap != 0 ? pos % kp.cap : pos - kp.row_base;
+            kv_store<KFMT>(kc, ksc, row * kw + chg, sk, lane);
+            kv_store<KFMT>(vc, vsc, row * kw + chg, sv, lane);
+            if (kp.ring_write != 0) {
+                ulong wr = (ulong)((pos + kn - 1) % kp.ring_cap) * kw + chg;
+                rk[wr] = a[kp.k + (ulong)tj * kw + chg];
+                rv[wr] = a[kp.v + (ulong)tj * kw + chg];
+            }
+        }
+    }
+    uint dmin = pp + 1 - j1, dmax = pp - j0;
+    uint nb = dmin < p.extent ? min(dmax + 1, p.extent) - dmin : 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < G * nb; i += 256) {
+        uint gg = i / nb, k = i % nb;
+        float rv2[16], cv[16];
+        for (uint d = 0; d < 16; d++) {
+            rv2[d] = d < p.dr ? rr[gg * 16 + d] : 0.f;
+            cv[d] = d < p.dr ? c[p.rel + d * p.extent + dmin + k] : 0.f;
+        }
+        float b = 0.f;
+        for (uint d = 0; d < 16; d++) if (d < p.dr) b += rv2[d] * cv[d];
+        bias[gg * 1024 + k] = b;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float4 o[G];
+    float m[G], l[G];
+    for (int gg = 0; gg < G; gg++) {
+        m[gg] = -INFINITY;
+        l[gg] = 0.f;
+        o[gg] = 0.f;
+    }
+    ulong koff = (ulong)g * HD + lane * D;
+    for (uint base = j0 + sg; base < j1; base += 8 * INK_AKB) {
+        float4 k4[INK_AKB], v4[INK_AKB];
+        for (uint u = 0; u < INK_AKB; u++) {
+            uint j = min(base + 8 * u, j1 - 1);
+            if (j >= p.pos) {
+                k4[u] = *(threadgroup const float4*)(kt + (j - p.pos - kt0) * HD + lane * D);
+                v4[u] = *(threadgroup const float4*)(vt + (j - p.pos - kt0) * HD + lane * D);
+            } else {
+                ulong row = (p.cap != 0 ? (ulong)(j % p.cap) : (ulong)j) * p.kw + koff;
+                k4[u] = kv_get4<KFMT>(kc, ksc, row);
+                v4[u] = kv_get4<KFMT>(vc, vsc, row);
+            }
+        }
+        for (int gg = 0; gg < G; gg++) {
+            float s[INK_AKB];
+            float mx = m[gg];
+            for (uint u = 0; u < INK_AKB; u++) {
+                uint j = base + 8 * u;
+                float4 pr = k4[u] * q4[gg];
+                float dot = simd_sum((pr.x + pr.y) + (pr.z + pr.w));
+                uint dist = pp - j;
+                s[u] = j < j1 ? dot + (dist - dmin < nb ? bias[gg * 1024 + dist - dmin] : 0.f) : -INFINITY;
+                mx = max(mx, s[u]);
+            }
+            float al = mx == -INFINITY ? 1.f : exp(m[gg] - mx);
+            float4 acc = o[gg] * al;
+            float ls = l[gg] * al;
+            for (uint u = 0; u < INK_AKB; u++) {
+                float e = s[u] == -INFINITY ? 0.f : exp(s[u] - mx);
+                ls += e;
+                acc = fma(e, v4[u], acc);
+            }
+            o[gg] = acc;
+            l[gg] = ls;
+            m[gg] = mx;
+        }
+    }
+    // (`so` held the pass's keys: every SIMD-group is done with them first.)
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int gg = 0; gg < G; gg++) {
+        if (lane == 0) { sm[gg * 16 + sg] = m[gg]; sm[gg * 16 + 8 + sg] = l[gg]; }
+        *(threadgroup float4*)(so + (gg * 8 + sg) * HD + lane * D) = o[gg];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ink_attv_fin<D, G>(a, p, ns, split, ti, h0, tid, sm, so);
+}
+#define INK_ATTF(D, G, F) \
+kernel void ink_attf_##D##_##G##_##F(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IAP& p [[buffer(2)]], \
+                         device uchar* kc [[buffer(3)]], device uchar* vc [[buffer(4)]], device float* ksc [[buffer(5)]], \
+                         device float* vsc [[buffer(6)]], constant IKvP& kp [[buffer(11)]], constant IQP& qp [[buffer(12)]], \
+                         device float* rk [[buffer(13)]], device float* rv [[buffer(14)]], \
+                         uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
+    threadgroup float sm[G * 16]; threadgroup float so[G * 8 * D * 32]; threadgroup float bias[G * 1024]; \
+    threadgroup float red[128]; threadgroup float rr[G * 16]; \
+    ink_attf_body<D, G, F>(a, c, p, kp, qp, kc, vc, ksc, vsc, rk, rv, tg.x, tg.y, tg.z, tid, sg, lane, sm, so, bias, red, rr); }
+INK_ATTF(4, 3, 0) INK_ATTF(4, 3, 1) INK_ATTF(4, 3, 2)
+INK_ATTF(4, 1, 0) INK_ATTF(4, 1, 1) INK_ATTF(4, 1, 2)
+INK_ATTF(4, 2, 0) INK_ATTF(4, 2, 1) INK_ATTF(4, 2, 2)
+INK_ATTF(4, 4, 0) INK_ATTF(4, 4, 1) INK_ATTF(4, 4, 2)
 
 // ---- The splits of each (token, head) merged with the sink (one more logit, `sink`, of a zero
 // value), then gated: `out = softmax-weighted values * sigmoid(gate)` (grid: head, token).
