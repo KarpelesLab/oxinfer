@@ -664,6 +664,7 @@ impl<'a> Experts<'a> {
             let mut used: Vec<usize> = routes.iter().flatten().map(|r| r.0).collect();
             used.sort_unstable();
             used.dedup();
+            let _p = prof::phase(9, "expert reads");
             need(&used);
         }
         let mi = self.inter;

@@ -585,8 +585,10 @@ fn sigmoid(x: f32) -> f32 {
 }
 
 /// The mixing weights of one token's residual copies `x` (`[hc * H]`): `pre` `[hc]`, `post`
-/// `[hc]`, `comb` `[hc * hc]` (row `j` = source copy `j`) as `hc_split_sinkhorn`.
-pub(crate) fn hc_mix(c: &DeepSeek4Config, w: &Hc, x: &[f32], pre: &mut [f32], post: &mut [f32], comb: &mut [f32]) {
+/// `[hc]`, `comb` `[hc * hc]` (row `j` = source copy `j`) as `hc_split_sinkhorn`. With `par`, the
+/// `(2 + hc) hc` projections of the copies are spread over the threads (one token: 2 MB of weights
+/// per call; each dot product is the same either way, and so are the results).
+pub(crate) fn hc_mix_par(c: &DeepSeek4Config, w: &Hc, x: &[f32], pre: &mut [f32], post: &mut [f32], comb: &mut [f32], par: bool) {
     let n = c.hc_mult;
     let (eps, heps) = (c.rms_norm_eps as f32, c.hc_eps as f32);
     let ms = dot(x, x) / x.len() as f32;
@@ -596,7 +598,9 @@ pub(crate) fn hc_mix(c: &DeepSeek4Config, w: &Hc, x: &[f32], pre: &mut [f32], po
     } else {
         1.0 / (ms + eps).sqrt()
     };
-    let m = |i: usize| dot(&w.f[i * x.len()..(i + 1) * x.len()], x) * r;
+    let mut proj = vec![0f32; (2 + n) * n];
+    for_chunks(&mut proj, 1, par, |i, o| o[0] = dot(&w.f[i * x.len()..(i + 1) * x.len()], x));
+    let m = |i: usize| proj[i] * r;
     for i in 0..n {
         pre[i] = sigmoid(m(i) * w.scale[0] + w.base[i]) + heps;
         post[i] = 2.0 * sigmoid(m(n + i) * w.scale[1] + w.base[n + i]);
@@ -662,7 +666,7 @@ pub(crate) fn hc_pre(c: &DeepSeek4Config, w: &Hc, norm: &[f32], x: &[f32], t: us
         };
         let xr = &x[ti * n * h..(ti + 1) * n * h];
         let mut pre = vec![0f32; n];
-        hc_mix(c, w, xr, &mut pre, po, co);
+        hc_mix_par(c, w, xr, &mut pre, po, co, t == 1);
         hc_collapse(&pre, xr, yr);
         rmsnorm_f32w_inplace(yr, norm, c.rms_norm_eps as f32);
     });
@@ -1178,6 +1182,42 @@ fn grouped_out(c: &DeepSeek4Config, a: &Attn, att: &[f32], t: usize, gate: Optio
     };
     let (h, nh, hd, g, r) = (c.hidden_size, c.num_attention_heads, c.head_dim, c.o_groups, c.o_lora_rank);
     let gd = nh * hd / g;
+    let batched = t < GEMM_MIN
+        && a.wo_a
+            .iter()
+            .all(|w| w.active_lora().is_none() && crate::model::cpu_decode_kernels(w, r, gd, t));
+    if batched {
+        // Short passes on the CPU decode kernels: every group's matmul in one parallel region,
+        // each over its own quantized slice of the heads (the same rows `linear` would give).
+        let xs: Vec<crate::quant::QAct> = (0..g)
+            .map(|gi| {
+                let mut xi = vec![0f32; t * gd];
+                for ti in 0..t {
+                    xi[ti * gd..(ti + 1) * gd].copy_from_slice(&att[ti * nh * hd + gi * gd..ti * nh * hd + (gi + 1) * gd]);
+                }
+                crate::quant::quantize_act(&xi, t, gd)
+            })
+            .collect();
+        let mut ys = vec![vec![0f32; t * r]; g];
+        let mut jobs: Vec<(&Lin, usize, &mut [f32])> = a
+            .wo_a
+            .iter()
+            .zip(ys.iter_mut())
+            .enumerate()
+            .map(|(gi, (w, y))| (w, gi, &mut y[..]))
+            .collect();
+        crate::model::linear_batch_q(&xs, &mut jobs);
+        drop(jobs);
+        let mut y = vec![0f32; t * g * r];
+        for (gi, yi) in ys.iter().enumerate() {
+            for ti in 0..t {
+                y[(ti * g + gi) * r..(ti * g + gi + 1) * r].copy_from_slice(&yi[ti * r..(ti + 1) * r]);
+            }
+        }
+        gated(&mut y);
+        linear(&a.wo_b, h, g * r, &y, t, out);
+        return;
+    }
     if t < GEMM_MIN {
         // Short passes: each group on the decode kernels (the grouped GEMM pads to whole tiles).
         let mut y = vec![0f32; t * g * r];
@@ -1724,19 +1764,33 @@ pub(crate) fn moe_forward(
         hook: hook.filter(|k| k.edits(Target::Shared)),
         scale: None,
     };
+    let ph = prof::phase(8, "router");
     let ne = m.experts.n_experts();
     let mut logits = vec![0f32; t * ne];
-    for_chunks(&mut logits, ne, t > 1, |ti, lg| {
-        for (v, w) in lg.iter_mut().zip(m.router.chunks(h)) {
-            *v = dot(w, &x[ti * h..(ti + 1) * h]);
-        }
-    });
+    if t == 1 {
+        // One token: the experts' rows (7.9 MB of a V4.1 layer) over the threads.
+        const RB: usize = 16;
+        for_chunks(&mut logits, RB, true, |bi, lg| {
+            for (j, v) in lg.iter_mut().enumerate() {
+                let e = bi * RB + j;
+                *v = dot(&m.router[e * h..(e + 1) * h], x);
+            }
+        });
+    } else {
+        for_chunks(&mut logits, ne, true, |ti, lg| {
+            for (v, w) in lg.iter_mut().zip(m.router.chunks(h)) {
+                *v = dot(w, &x[ti * h..(ti + 1) * h]);
+            }
+        });
+    }
     let routes: Vec<_> = logits
         .chunks(ne)
         .zip(tokens)
         .enumerate()
         .map(|(i, (lg, &tk))| route(c, m, lg, tk, image.get(i).copied().unwrap_or(false)))
         .collect();
+    drop(ph);
+    let _p = prof::phase(10, "experts");
     m.experts.forward(x, t, h, &routes, y, need, hook, Some(&shared));
 }
 
@@ -2370,7 +2424,7 @@ mod tests {
         };
         let x: Vec<f32> = (0..n * 8).map(|i| (i as f32 * 0.7).cos()).collect();
         let (mut pre, mut post, mut comb) = (vec![0f32; n], vec![0f32; n], vec![0f32; n * n]);
-        hc_mix(&c, &w, &x, &mut pre, &mut post, &mut comb);
+        hc_mix_par(&c, &w, &x, &mut pre, &mut post, &mut comb, false);
         for j in 0..n {
             let row: f32 = comb[j * n..(j + 1) * n].iter().sum();
             let col: f32 = (0..n).map(|k| comb[k * n + j]).sum();

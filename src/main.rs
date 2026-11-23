@@ -106,6 +106,7 @@ struct Args {
     stream_threads: Option<usize>,
     expert_cache_mb: Option<u64>,
     expert_predict: bool,
+    cold_start: bool,
     images: Vec<PathBuf>,
     audios: Vec<PathBuf>,
     videos: Vec<PathBuf>,
@@ -339,6 +340,8 @@ fn usage() -> ! {
          \x20 --expert-cache-mb N  with --stream, page cache kept for recently used MoE experts (which\n\
          \x20                      are read on demand; default: what the budget leaves)\n\
          \x20 --expert-predict     with --stream, read the next MoE layer's guessed experts ahead (Qwen)\n\
+         \x20 --cold-start         with --stream, drop the model's pages from the page cache first (default:\n\
+         \x20                      use what an earlier run left cached, within the budget)\n\
          \x20 --no-stream          never stream, not even a Mistral Large 4 checkpoint larger than 60% of\n\
          \x20                      RAM (streamed by default): it is then memory-mapped and demand-paged\n\
          \x20 --image FILE         attach an image (repeatable; PNG/JPEG/WebP/GIF/BMP via oxideav)\n\
@@ -675,6 +678,7 @@ fn parse_args() -> Result<Args> {
         stream_threads: None,
         expert_cache_mb: None,
         expert_predict: false,
+        cold_start: false,
         images: Vec::new(),
         audios: Vec::new(),
         videos: Vec::new(),
@@ -908,6 +912,7 @@ fn parse_args() -> Result<Args> {
             "--stream-threads" => a.stream_threads = Some(val()?.parse()?),
             "--expert-cache-mb" => a.expert_cache_mb = Some(val()?.parse()?),
             "--expert-predict" => a.expert_predict = true,
+            "--cold-start" => a.cold_start = true,
             "--image" => a.images.push(PathBuf::from(val()?)),
             "--audio" => a.audios.push(PathBuf::from(val()?)),
             "--video" => a.videos.push(PathBuf::from(val()?)),
@@ -3342,6 +3347,7 @@ fn start_stream(
         opts.part_cache_bytes = Some(m << 20);
     }
     opts.predict_experts = args.expert_predict;
+    opts.cold_start = args.cold_start;
     if let Some(n) = args.stream_threads {
         opts.io_threads = n;
     }
@@ -3373,9 +3379,14 @@ fn start_stream(
     );
     if plan.part_bytes > 0 {
         eprintln!(
-            "[stream: {:.2} GB of routed experts read on demand, {:.2} GB of page cache keeps the recently used ones]",
+            "[stream: {:.2} GB of routed experts read on demand, {:.2} GB of page cache keeps the recently used ones{}]",
             plan.part_bytes as f64 / 1e9,
-            plan.part_cache_bytes as f64 / 1e9
+            plan.part_cache_bytes as f64 / 1e9,
+            if plan.warm_part_bytes > 0 {
+                format!(" ({:.2} GB of them already cached)", plan.warm_part_bytes as f64 / 1e9)
+            } else {
+                String::new()
+            }
         );
     }
     if plan.unmapped_bytes > 0 {

@@ -386,6 +386,8 @@ pub unsafe extern "C" fn oxi_engine_info_json(e: *mut OxiEngine) -> *mut c_char 
                 "streamed_bytes_per_pass": p.streamed_bytes,
                 "expert_bytes": p.part_bytes,
                 "expert_cache_bytes": p.part_cache_bytes,
+                "expert_cache_warm_bytes": p.warm_part_bytes,
+                "cold_start": o.cold_start,
                 "flash_bytes_per_sec": o.flash_bytes_per_sec,
                 "gpu_decode": crate::gpu::stream_decode_enabled(),
             })

@@ -136,7 +136,9 @@ int64_t oxi_cache_remove(const char *cache_dir, const char *name);
  *                        budget picked the same way, at most 85% of the GPU working set), or for
  *                        a Mistral Large 4 checkpoint over 60% of RAM; off: never (an oversized checkpoint
  *                        is then memory-mapped and demand-paged); cache_budget_gb=F, resident_mb,
- *                        prefetch_mb, expert_cache_mb, expert_predict=0|1 tune it. Inkling-2
+ *                        prefetch_mb, expert_cache_mb, expert_predict=0|1, cold_start=0|1 (drop
+ *                        the model's pages from the page cache first; default 0: use what an
+ *                        earlier run left cached, within the budget) tune it. Inkling-2
  *                        and the other MoE families decide on the app's budget too on iOS,
  *                        counting their caches and activations beside the weights
  *   memory_limit_gb=F    the memory the model may use, as an iOS app's limit (caps

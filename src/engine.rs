@@ -172,7 +172,8 @@ pub struct EngineOptions {
     /// page-cache budget. Whether to stream is [`EngineOptions::stream_mode`]; these are the
     /// settings (with [`StreamMode::Auto`], setting them turns streaming on). Keys
     /// `cache_budget_gb`, `resident_mb`, `prefetch_mb`, `flash_mbps`, `expert_cache_mb`,
-    /// `expert_predict` (Qwen MoE, Mistral Large 4).
+    /// `expert_predict` (Qwen MoE, Mistral Large 4), `cold_start` (drop the model's pages from the page
+    /// cache before the first pass; default: keep what an earlier run left, within the budget).
     pub stream: Option<crate::stream::StreamOptions>,
     /// Whether the weights stream (see [`EngineOptions::stream`]): `auto` (default) streams when
     /// streaming options are set, or a Mistral Large 4 / DeepSeek V4 checkpoint larger than 60% of RAM (with
@@ -537,6 +538,7 @@ impl EngineOptions {
         "flash_mbps",
         "expert_cache_mb",
         "expert_predict",
+        "cold_start",
         "coreml_units",
         "coreml_prefill",
         "gpu_exact",
@@ -636,6 +638,7 @@ impl EngineOptions {
                 self.memory_limit = (v > 0.0).then_some((v * 1e9) as u64);
             }
             "expert_predict" => self.stream.get_or_insert_with(Default::default).predict_experts = parse_bool(key, value)?,
+            "cold_start" => self.stream.get_or_insert_with(Default::default).cold_start = parse_bool(key, value)?,
             "cache_budget_gb" | "resident_mb" | "prefetch_mb" | "flash_mbps" | "expert_cache_mb" => {
                 let st = self.stream.get_or_insert_with(Default::default);
                 let v: f64 = value.parse().with_context(|| format!("{key}: not a number: {value:?}"))?;

@@ -71,7 +71,9 @@ pub struct StreamOptions {
     /// Drop streamed units from the page cache after use (only with a budget or resident size).
     pub evict: bool,
     /// Drop every cached page of the files when streaming starts (a cold cache, as after a
-    /// reboot); only with a budget or resident size.
+    /// reboot); only with a budget or resident size. Off (the default), what an earlier run left
+    /// in the page cache is used: the on-demand parts found cached fill the part cache (least
+    /// recently used first out like the others), and those it has no room for are dropped.
     pub cold_start: bool,
     /// Emulated storage bandwidth: the reader sleeps so that pages that were not cached arrive
     /// no faster than this. None: as fast as the device reads.
@@ -100,7 +102,7 @@ impl Default for StreamOptions {
             prefetch_bytes: 768 << 20,
             resident_mode: ResidentMode::Cache,
             evict: true,
-            cold_start: true,
+            cold_start: false,
             flash_bytes_per_sec: None,
             io: if cfg!(any(target_os = "macos", target_os = "ios")) {
                 IoMethod::Advise
@@ -337,6 +339,9 @@ pub struct StreamPlan {
     pub unmapped_bytes: u64,
     /// Time spent evicting the cache and loading the resident set.
     pub setup: Duration,
+    /// Bytes of on-demand parts found in the page cache at the start (without `cold_start`) and
+    /// kept in the part cache.
+    pub warm_part_bytes: u64,
 }
 
 /// A page-aligned piece of a unit: its address, length and place in a file.
@@ -780,6 +785,7 @@ impl Streamer {
         });
         if managed {
             plan.resident_failures = inner.setup();
+            plan.warm_part_bytes = inner.seed_parts();
         }
         // Start counting from here: the set-up reads are not part of any pass.
         inner.reset_counters();
@@ -1158,6 +1164,40 @@ impl Inner {
             }
         }
         failures
+    }
+
+    /// Without `cold_start`: the parts an earlier run left in the page cache (three pages of each
+    /// span resident) go to the part cache while it has room; the others found cached are
+    /// dropped, as the part cache would have. Returns the bytes kept.
+    fn seed_parts(&self) -> u64 {
+        if self.opts.cold_start || !self.opts.evict {
+            return 0;
+        }
+        let page = self.page;
+        let cached = |s: &Span| {
+            [s.addr, s.addr + ((s.len / 2) & !(page - 1)), s.addr + s.len - page]
+                .iter()
+                .all(|&a| sys::resident_bytes(a, page, page) == Some(page as u64))
+        };
+        let mut out = Vec::new();
+        let mut kept = 0;
+        {
+            let mut pc = self.parts.lock().unwrap();
+            for (u, unit) in self.units.iter().enumerate() {
+                for (p, part) in unit.parts.iter().enumerate() {
+                    if part.spans.is_empty() || !part.spans.iter().all(cached) {
+                        continue;
+                    }
+                    let ev = pc.admit((u, p), part.bytes, true);
+                    if ev.is_empty() {
+                        kept += part.bytes;
+                    }
+                    out.extend(ev);
+                }
+            }
+        }
+        self.queue_evictions(out.into_iter().map(|(u, p)| Evict::Part(u, p)));
+        kept
     }
 
     fn queue_evictions(&self, items: impl IntoIterator<Item = Evict>) {
@@ -1841,6 +1881,8 @@ mod tests {
                 resident_mode: mode,
                 flash_bytes_per_sec: Some(200e6),
                 chunk_bytes: 256 << 10,
+                // (The file was just written: from a cold cache, every read counts.)
+                cold_start: true,
                 ..Default::default()
             };
             let s = Streamer::new(&[&files], units, opts).unwrap();
@@ -2005,6 +2047,7 @@ mod tests {
             prefetch_bytes: SZ as u64,
             flash_bytes_per_sec: Some(500e6),
             chunk_bytes: 64 << 10,
+            cold_start: true,
             ..Default::default()
         };
         let s = Streamer::new(&[&files], units, opts).unwrap();
@@ -2040,6 +2083,80 @@ mod tests {
             assert!(st.bytes_evicted >= SZ as u64, "{st:?}");
         }
         drop(hook);
+        drop(s);
+        drop(files);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Without `cold_start`, the parts already in the page cache (the file was just written and
+    /// read) fill the part cache at the start, as far as it has room, and are hits then.
+    #[test]
+    fn warm_start_keeps_cached_parts() {
+        const N: usize = 4;
+        const SZ: usize = 256 << 10;
+        let dir = std::env::temp_dir().join(format!("oxinfer-stream-warm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut head = String::from("{");
+        for i in 0..N {
+            head += &format!(
+                "\"t{i}\":{{\"dtype\":\"U8\",\"shape\":[{SZ}],\"data_offsets\":[{},{}]}},",
+                i * SZ,
+                (i + 1) * SZ
+            );
+        }
+        head.pop();
+        head.push('}');
+        while !head.len().is_multiple_of(8) {
+            head.push(' ');
+        }
+        let mut bytes = (head.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(head.as_bytes());
+        bytes.extend((0..N * SZ).map(|i| (i * 11) as u8));
+        std::fs::write(dir.join("model.safetensors"), &bytes).unwrap();
+        let files = ModelFiles::open(&dir, false).unwrap();
+        let range = |i: usize| {
+            let b = files.bytes(&format!("t{i}")).unwrap();
+            (b.as_ptr() as usize, b.len())
+        };
+        // Every page in memory, as after an earlier run.
+        let mut sum = 0u64;
+        for i in 0..N {
+            sum += files.bytes(&format!("t{i}")).unwrap().iter().map(|&v| v as u64).sum::<u64>();
+        }
+        assert!(sum > 0);
+        let units = vec![UnitSpec {
+            name: "moe".into(),
+            ranges: vec![range(0)],
+            uses: 1.0,
+            parts: (1..N).map(|i| vec![range(i)]).collect(),
+        }];
+        // Room for two of the three parts.
+        let opts = StreamOptions {
+            resident_bytes: Some(SZ as u64 + (64 << 10)),
+            part_cache_bytes: Some(2 * SZ as u64 + (64 << 10)),
+            prefetch_bytes: SZ as u64,
+            chunk_bytes: 64 << 10,
+            ..Default::default()
+        };
+        let s = Streamer::new(&[&files], units, opts).unwrap();
+        if cfg!(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "linux",
+            target_os = "android"
+        )) {
+            let w = s.plan().warm_part_bytes;
+            assert!((2 * SZ as u64..=2 * SZ as u64 + (64 << 10)).contains(&w), "{:?}", s.plan());
+            let hook = StreamHook::new(s.clone(), 0);
+            {
+                let _g = hook.enter(0);
+                hook.need_parts(0, &[0, 1]);
+            }
+            let st = s.stats();
+            assert_eq!((st.parts, st.parts_cached), (2, 2), "{st:?}");
+            drop(hook);
+        }
+        s.shutdown();
         drop(s);
         drop(files);
         let _ = std::fs::remove_dir_all(&dir);

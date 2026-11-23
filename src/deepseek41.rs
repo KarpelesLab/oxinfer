@@ -369,7 +369,7 @@ fn mixes(c: &DeepSeek4Config, w: &Hc, x: &[f32], t: usize) -> (Vec<f32>, Vec<f32
                 std::slice::from_raw_parts_mut(cp.get().add(ti * n * n), n * n),
             )
         };
-        hc_mix(c, w, &x[ti * n * h..(ti + 1) * n * h], pr, po, co);
+        hc_mix_par(c, w, &x[ti * n * h..(ti + 1) * n * h], pr, po, co, t == 1);
     });
     (pre, post, comb)
 }
@@ -526,19 +526,24 @@ pub(super) fn forward(
         let lx = &m.x41[l];
         let _unit = crate::stream::enter(&m.stream, l);
         if let Some(e) = &lx.engram {
+            let _p = prof::phase(0, "engram");
             engram(m, e, &sess.eng, start, t, &mut x);
         }
         // (A DSpark draft reads the stream entering its target layers, after the engram.)
         capture(l, &x);
+        let ph = prof::phase(1, "hc mix");
         let (apre, post, comb) = mixes(c, &layer.hc_attn, &x, t);
         let xa = collapse(c, &pre, &x, &layer.attn_norm, t);
+        drop(ph);
         let rope = &ropes[usize::from(layer.ratio > 0)];
         let mut o = vec![0f32; t * h];
         attn(m, l, &xa, t, start, &mut sess.layers, (&rope.0, &rope.1), &mut shared, &mut o);
+        let ph = prof::phase(1, "hc mix");
         hc_post(c, &mut x, &o, &post, &comb, t);
         point(2 * l + 1, &mut x);
         let (fpre, post, comb) = mixes(c, &layer.hc_ffn, &x, t);
         let xf = collapse(c, &apre, &x, &layer.ffn_norm, t);
+        drop(ph);
         o.fill(0.0);
         let need = |ids: &[usize]| {
             if let Some(s) = &m.stream {
@@ -549,7 +554,9 @@ pub(super) fn forward(
         let hook = iv.as_ref().and_then(|s| s.hook(l, start));
         let im: &[bool] = if any_image { &image } else { &[] };
         moe_forward(c, &layer.moe, &xf, tokens, im, t, &mut o, need, hook.as_ref());
+        let ph = prof::phase(1, "hc mix");
         hc_post(c, &mut x, &o, &post, &comb, t);
+        drop(ph);
         point(2 * l + 2, &mut x);
         pre = fpre;
     }
@@ -601,11 +608,14 @@ fn attn(
         if let Some(ix) = &lx.idx {
             jobs.push((&ix.proj, ni, &mut iw[..]));
         }
+        let _p = prof::phase(2, "attn in-proj");
         linear_multi(&mut jobs, h, xa, t);
     }
     rmsnorm_f32w_rows_inplace(&mut qa, ql, &a.q_norm, eps);
     let mut q = vec![0f32; t * nh * hd];
+    let ph = prof::phase(3, "wq_b");
     linear(&a.wq_b, nh * hd, ql, &qa, t, &mut q);
+    drop(ph);
     let half = cos.len() / t;
     for_chunks(&mut q, hd, t * nh > 64, |i, qh| {
         let ti = i / nh;
@@ -616,6 +626,7 @@ fn attn(
     states[l].raw.extend_from_slice(&kv);
     // A key source: the latents of the groups this pass completes, then the indexers' keys made
     // from them (before the rotation) and the compressed keys (after it).
+    let ph = prof::phase(4, "key source");
     if let Some(cp) = &lx.comp {
         let st = &mut states[l];
         let mut lat: Vec<f32> = Vec::new();
@@ -675,6 +686,8 @@ fn attn(
     }
     // An index source chooses for the layers down to the next one. The indexer only matters for
     // a query that sees more than `index_topk` compressed keys (before that every key is taken).
+    drop(ph);
+    let ph = prof::phase(5, "indexer");
     if let Some(ix) = &lx.idx {
         let src = lx.kv_src.unwrap();
         let choose = (start + t) / r > topk;
@@ -726,12 +739,16 @@ fn attn(
             (None, &none)
         }
     };
+    drop(ph);
+    let ph = prof::phase(6, "attend");
     attend(c, &a.sink, &q, &states[l], comp, sel, r, t, start, &mut att);
+    drop(ph);
     // Undo the rotation of the values' tails at each query's position.
     for_chunks(&mut att, hd, t * nh > 64, |i, oh| {
         let ti = i / nh;
         rope_tail(oh, &cos[ti * half..(ti + 1) * half], &sin[ti * half..(ti + 1) * half], true);
     });
+    let _p = prof::phase(7, "attn out-proj");
     grouped_out(c, a, &att, t, None, out);
 }
 
