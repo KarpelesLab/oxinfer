@@ -1164,6 +1164,133 @@ The next levers: the DSpark plain rounds' 1-4% on prose (chaining them, which ne
 features of chained steps), and the Markov head of the GQA draft (one GPU submission and a
 152k-row readback per slot, half of a block pass: 3.8 of 7.6 ms on Qwen3-8B).
 
+#### Speculative decoding: the rounds the policies left behind (November 2026)
+
+The levers the round above named, on Metal (M5 Max) and the CPU:
+
+- **The GQA draft's Markov head in one submission** (`Backend::markov_greedy`, `mk_gather` /
+  `mk_argmax` in `metal_decode.metal`). The vanilla Markov head adds `markov_w2 * markov_w1[prev]`
+  to each slot's logits, `prev` the token drafted before it, so the slots ran one after the other:
+  per slot a matvec submission (the 152k x 256 `markov_w2`), its 152k-row readback, the add and a
+  scalar softmax on the host, 0.35 + 0.17 ms a slot on Qwen3-8B's draft. With greedy drafts
+  (`Sampler::plain_greedy`) and the block on the GPU plans, the whole chain now runs in one
+  command buffer after the block pass: per slot the bf16 row of `markov_w1` for the token the
+  device chose before it (a 78 MB bf16 copy of the table, made when the draft's plans are built),
+  the `w2` matvec adding into the slot's logits, and the argmax; the host gets the biased logits
+  and the tokens. Its drafts are the device's argmax ones; a slot where the host's choice differs
+  (a tie broken another way) ends the block after it, so a draft is never built on a token the
+  host did not choose. Sampled drafts, the rnn head and the code bridge keep the per-slot path.
+  `softmax_at` (each draft's probability) runs on eight lanes with `fast_exp` (0.2 -> 0.05 ms
+  per slot). A draft pass of Qwen3-8B's draft costs about the same for any length now: 5.8-7.6 ms
+  for 1 to 7 drafts (before: 6.3 for 1 draft to 9-10 for 5-6, the Markov head 3.8 ms of a
+  7-draft pass). `OXINFER_DSPARK_MARKOV_HOST=1` keeps the per-slot path.
+- **The first rounds.** A run's first draft round cost 25-34 ms of drafting and 42-53 ms of
+  verification (Qwen3-8B Q4_K_M, 7 drafts verified): the draft's GPU plans' first pass over its
+  weights costs about 20 ms more than the next ones (as the target's first decode step does, in
+  plain decoding too: 29 ms against 9.6), and with nothing measured yet the round verified the
+  whole block. The draft's plans now run once on a throwaway session when they are built (at
+  load: `Dspark::warm_gpu`), and the cost-aware policy starts with two plain rounds (which take
+  the target's first pass and measure a plain step) before its two measuring draft rounds, whose
+  verification lengths the plain step then prices through the prior. The first draft round now
+  costs 7.5 + 21 ms (3 drafts). On a 256-token prose reply this was most of what DSpark lost to
+  plain decoding (66 of 148 ms).
+- **The first draft rounds' average.** Whether to draft compares the recent tokens per second of
+  draft rounds with plain steps; the average now weighs the first 4 draft rounds evenly, then
+  moves (before: the second round replaced the first). One rejected block among the first two no
+  longer decides alone: on the CPU's code prompt a first 7-draft verification (64 ms for 4 tokens)
+  put the policy on plain steps for 8 rounds before its next probe.
+- **Chained plain rounds** (`DsparkDecoder::step_emit`, `Target::decode_greedy_feats`): where the
+  target chains greedy passes on the device (Inkling-2-Mini on Metal; plain decoding chains them,
+  the next pass queued while the host reads a token), DSpark's plain rounds now run the same
+  chain, each pass also copying the draft's features (the four streams the draft reads) into the
+  capture rows of its token slot (two slots: pass k + 1 writes the other while the host reads
+  pass k's), until the policy wants a draft round (the pass already queued still runs) or prompt
+  lookup has a long match; each token streams as it comes. Inkling's plain rounds cost 9.3-9.4 ms
+  before (one-token passes with features, 3% above plain decoding's 9.1), 9.07 chained.
+  `OXINFER_DSPARK_CHAIN=0` turns it off. Qwen3's plain decoding does not chain (one submission per
+  token, as DSpark's plain rounds: 9.6-9.7 ms both on Qwen3-8B Q4_K_M), so there DSpark's plain
+  rounds already cost a plain step; what it lost on prose was the first rounds (above) and probes.
+
+**Results** (M5 Max, the CLI, 256 tokens, greedy, `--no-system`, `d26a8ec` (before) and this
+build interleaved run by run under the bench lock; tok/s). Qwen3-8B with its DSpark draft
+(ankk98's Q4_K_M), `--no-lookup`, exact verification, and the CLI defaults (DSpark, prompt
+lookup, fast verification):
+
+| Target | prompt | plain | DSpark exact before -> after | defaults before -> after |
+|---|---|---:|---:|---:|
+| Q4_K_M | code | 102.2 | 121.3 -> **127.1** | 153.5 -> **162.1** |
+| | chat | 102.2 | 103.5 -> **110.6** | 116.7 -> 112.9 |
+| | prose | 101.5 | 96.5 -> **100.1** | 98.5 -> **101.4** |
+| Q8_0 | code | 65.8 | 121.1 -> **127.5** | 141.9 -> **149.6** |
+| | chat | 65.9 | 104.4 -> **110.7** | 115.3 -> **121.9** |
+| | prose | 65.7 | 78.4 -> **94.2** | 79.9 -> **98.8** |
+
+The defaults on the Q4_K_M chat prompt move with the policy's path through the reply: two more
+interleaved pairs gave 90.5 -> 103.4 and 96.8 -> 108.9 (under load). An earlier set (plain
+101.5-101.7): Q4_K_M exact code 120.4 -> 127.7, prose 97.0 -> 99.1; Q8_0 exact code 119.8 ->
+124.3, prose 78.3 -> 91.4. On Q4_K_M prose DSpark is now within 1.5% of plain decoding (before:
+5%): its remaining loss is the probes (2% budget) and the rounds whose drafts are rejected.
+
+Inkling-2-Mini with its DSpark draft (unsloth's Q8_0 by path, opt-in; DSpark `--no-lookup`) and
+prompt lookup (its default, `--no-draft`):
+
+| Checkpoint | prompt | plain | DSpark before -> after | lookup before -> after |
+|---|---|---:|---:|---:|
+| mlx-community 4bit | code | 110.2 | 107.3 -> 108.5 | 110.9 -> 111.1 |
+| | chat | 111.6 | 102.6 -> **105.8** | 122.0 -> 121.9 |
+| | prose | 111.3 | 104.4 -> **108.5** | 111.5 -> 111.0 |
+| unsloth UD-IQ3_XXS | code | 104.9 | 99.0 -> 99.8 | 105.7 -> 106.1 |
+| | chat | 105.3 | 98.9 -> 98.9 | 105.2 -> 104.9 |
+| | prose | 105.4 | 99.9 -> 99.6 | 105.7 -> 105.7 |
+
+(A second set on the 4-bit file: DSpark code 107.0 against plain 106.5.) The chained plain rounds
+bring the opt-in DSpark draft to 1-3% of plain decoding on the 4-bit file (before 3-8%), but no
+nearer: a verification of 2 to 8 tokens costs 33-34 ms, 3.6 plain steps (each token routes to its
+own experts), so a draft round pays only when about 3 of its drafts are accepted, and this draft's
+blocks are mostly rejected early (32-52% of the verified drafts accepted on these prompts). It
+stays opt-in. The IQ3_XXS rows move within noise (its plain rounds
+chain too; its drafts are accepted less).
+
+Gemma 4 E4B (`--quant q8`) with its assistant and Qwen3.5-9B (`--quant q8`, `--exact-verify`)
+with MTP, `--no-lookup`, are untouched by this round and measure the same (plain / before /
+after): Gemma code 87.1 / 186.4 / 186.9, chat 87.5 / 128.6 / 129.4, prose 87.3 / 116.7 / 116.8;
+Qwen3.5 code 59.9 / 93.2 / 91.9, chat 60.4 / 80.0 / 78.5, prose 60.2 / 74.4 / 74.7.
+
+**The CPU** (`--device cpu`, Qwen3-8B Q4_K_M with the DSpark draft on the CPU too, 128 tokens,
+exact, two interleaved sets, before -> after, plain in brackets): DSpark code 68.6 / 57.7 ->
+66.5 / 65.6 (54.2 / 51.5), chat 58.6 / 53.4 -> 55.0 / 54.2 (54.1 / 52.4), prose 50.1 / 44.7 ->
+51.7 / 51.6 (52.4 / 52.5); prompt lookup within noise (code 54.0 / 51.5 -> 53.3 / 50.4, prose
+52.1 / 51.7 -> 51.8 / 49.8). Prose loses 1-2% instead of 5-15% (before, rejected first blocks put
+the policy on plain steps and rare probes; now it drafts in about a quarter of the rounds, 61-63%
+of the drafts accepted), and code no longer drops when the first rounds are unlucky (57.7 above).
+
+The longer drafts the round above reported paying on the CPU code prompt do not today: fixed
+lengths (`--spec-draft-fixed --draft-tokens N`, two interleaved runs each) give N = 3 76.0 / 71.0,
+N = 4 67.3 / 62.8, N = 7 57.2 / 52.7 tok/s, the policy 69.7 / 65.3 and the previous one 67.5 /
+66.6 (both verifying at most 3 drafts in most rounds). Verifying 4 drafts (5 tokens) costs 41-44
+ms against 32-34 for 3 (the CPU's batch-invariant kernels take tokens in groups of 4), 8 tokens
+58-66 ms (2.8-3.1 plain steps, the prior says 2.57): with this draft's 75-80% acceptance the
+fourth draft does not pay for its row. The cost table is left as it is (it is the mean of Q4_K_M
+and Q8_0, whose 8-token passes cost 1.87 plain steps; the measured costs replace it after one
+round of each length). The policy's remaining gap to the fixed 3 drafts is its probing of longer
+lengths (one round in 8) and its plain rounds when a few blocks in a row are rejected.
+
+**Correctness.** Every greedy output above is the plain greedy output byte for byte
+(`--no-system`), with exact verification and with the defaults' fast verification, on every model
+and prompt, on Metal and on the CPU (the CPU's against the CPU's plain output).
+`decode_mvk_matches_single_token` passes; `markov_greedy_matches_host_chain` checks the device
+chain's biased logits against an f64 product and its tokens against the host's argmax of them.
+
+**Measured and dropped:**
+
+- Warming the target's verification plans while the prompt is prefilled: building a multi-token
+  plan takes 0.4-0.9 ms; the first pass's extra 20 ms is the GPU's, which plain decoding pays as
+  well on its first step, so there is nothing DSpark-specific to hide there.
+
+The next lever on Qwen3-8B: the draft's block pass itself (4 ms of GPU time for about 1 GB of
+weights, 250 GB/s, half of it the 152k x 4096 Q6_K LM head over 8 rows on the fast batched
+kernels; the target's one-token step reads 4.7 GB at 490 GB/s).
+
 #### M3 Ultra (November 2026)
 
 A Mac Studio with an M3 Ultra (24 performance and 8 efficiency cores, an 80-core GPU, 96 GB,
