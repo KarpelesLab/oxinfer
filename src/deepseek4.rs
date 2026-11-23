@@ -362,6 +362,14 @@ pub struct DeepSeek4Session {
     eng: Vec<i32>,
     /// Runtime interventions ([`crate::intervene`]).
     pub iv: crate::intervene::State,
+    /// V4.1 GPU decoding: the device copies of the caches, and the positions they may still
+    /// hold (a rollback lowers it).
+    #[cfg_attr(
+        not(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    gpu: crate::gpu::decode::Slot,
+    gpu_kept: usize,
 }
 
 impl DeepSeek4Session {
@@ -379,6 +387,7 @@ impl DeepSeek4Session {
         }
         self.eng.truncate(pos);
         self.pos = pos;
+        self.gpu_kept = self.gpu_kept.min(pos);
     }
 
     fn trim(&mut self) {
@@ -415,6 +424,12 @@ pub struct DeepSeek4Model<'a> {
     ern: Option<ernie::Ernie<'a>>,
     /// Weight streaming: unit `l` is layer `l`, unit `num_hidden_layers` the LM head.
     stream: Option<crate::stream::StreamHook>,
+    /// V4.1 decode on the GPU: the compiled plan (built on the first step that wants it).
+    #[cfg_attr(
+        not(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    gpu_plan: std::sync::OnceLock<Option<Box<dyn std::any::Any + Send + Sync>>>,
 }
 
 /// Loads tensors in DeepSeek's naming with shape checks.
@@ -841,6 +856,7 @@ impl<'a> DeepSeek4Model<'a> {
             hash,
             ern,
             stream: None,
+            gpu_plan: Default::default(),
         };
         // Routed experts that cannot all stay in memory are read through the page cache as they
         // are routed: no accelerator mapping may pin them.
@@ -888,6 +904,8 @@ impl<'a> DeepSeek4Model<'a> {
             pos: 0,
             eng: Vec::new(),
             iv: Default::default(),
+            gpu: Default::default(),
+            gpu_kept: 0,
         }
     }
 
@@ -994,6 +1012,14 @@ impl<'a> DeepSeek4Model<'a> {
 
     /// Runs `tokens` and returns the logits after the last one.
     pub fn forward(&self, sess: &mut DeepSeek4Session, tokens: &[u32]) -> Vec<f32> {
+        #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+        if tokens.len() == 1
+            && self.cfg.v41
+            && v41::gpu::wanted()
+            && let Some(l) = v41::gpu::step(self, sess, tokens[0], false)
+        {
+            return l;
+        }
         let h = self.cfg.hidden_size;
         let hs = self.forward_hidden(sess, tokens);
         self.logits(&hs[hs.len() - h..], 1)
@@ -1023,6 +1049,15 @@ impl<'a> DeepSeek4Model<'a> {
         feats: &mut Vec<f32>,
     ) -> Vec<f32> {
         if self.cfg.v41 {
+            #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+            if tokens.len() == 1
+                && mm.is_empty()
+                && layers.is_empty()
+                && v41::gpu::wanted()
+                && let Some(hs) = v41::gpu::step(self, sess, tokens[0], true)
+            {
+                return hs;
+            }
             return v41::forward(self, sess, tokens, mm, layers, feats);
         }
         assert!(mm.is_empty(), "DeepSeek V4 takes text only");

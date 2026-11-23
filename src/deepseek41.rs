@@ -36,6 +36,10 @@
 use super::*;
 use crate::gguf::Value;
 
+#[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+#[path = "deepseek41_gpu.rs"]
+pub(super) mod gpu;
+
 /// A key source's compressor.
 pub(super) struct Comp41<'a> {
     wkv: Lin<'a>,           // [hd, H]
@@ -888,7 +892,7 @@ pub(crate) fn gguf_config(hd: &crate::gguf::Header, mut base: serde_json::Value)
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
     #[test]
@@ -966,7 +970,7 @@ mod tests {
     /// The config of the tiny model: key sources at rates 2 and 1, an index layer on another
     /// layer's keys, candidate blocks from layer 3 used by layer 4, engram lookups before two
     /// layers. `over`: keys replaced.
-    fn tiny_config(over: serde_json::Value) -> DeepSeek4Config {
+    pub(super) fn tiny_config(over: serde_json::Value) -> DeepSeek4Config {
         let mut c = serde_json::json!({
             "model_type": "deepseek_v41",
             "text_config": {
@@ -991,7 +995,12 @@ mod tests {
 
     /// Writes a tiny random checkpoint of [`tiny_config`] in DeepSeek's naming (float32).
     fn tiny_checkpoint(dir: &std::path::Path) {
-        let c = tiny_config(serde_json::json!({}));
+        tiny_checkpoint_with(dir, serde_json::json!({}))
+    }
+
+    /// [`tiny_checkpoint`] of `tiny_config(over)`.
+    pub(super) fn tiny_checkpoint_with(dir: &std::path::Path, over: serde_json::Value) {
+        let c = tiny_config(over);
         let (h, nh, hd, ql) = (c.hidden_size, c.num_attention_heads, c.head_dim, c.q_lora_rank);
         let (g, r, hc) = (c.o_groups, c.o_lora_rank, c.hc_mult);
         let (ne, mi, v) = (c.n_routed_experts, c.moe_intermediate_size, c.vocab_size);

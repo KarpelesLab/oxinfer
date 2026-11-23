@@ -126,6 +126,73 @@ inline float mdot(MQ8_0 f, uint row, uint c, thread const X32& xr) {
     a = fma(c4(b[15], b[16]), xr.v[7], a);
     return d * hsum(a);
 }
+// ---- IQ1_S (50-byte blocks of 256, 2-byte aligned), chunk of 32 = one sub-block: four grid
+// entries of 8 ternary values (signed bytes) plus a shared delta, one scale. The delta is applied
+// to the sum of the x values rather than to each weight.
+struct MIQ1_S { device const uchar* w; ulong rb; };
+inline float mdot(MIQ1_S f, uint row, uint c, thread const X32& x) {
+    device const ushort* B = (device const ushort*)(f.w + (ulong)row * f.rb + (c / 8) * 50);
+    uint j = c % 8;
+    uint qh = B[17 + j], q01 = B[1 + 2 * j], q23 = B[2 + 2 * j];
+    float dl = float(as_type<half>(B[0])) * float(2 * ((qh >> 12) & 7) + 1);
+    float delta = (qh & 0x8000) ? -0.125f : 0.125f;
+    uint idx[4] = { (q01 & 255) | ((qh << 8) & 0x700), (q01 >> 8) | ((qh << 5) & 0x700),
+                    (q23 & 255) | ((qh << 2) & 0x700), (q23 >> 8) | ((qh >> 1) & 0x700) };
+    float4 s = 0.f, sx = 0.f;
+    for (uint l = 0; l < 4; l++) {
+        ulong g = iq1s_grid[idx[l]];
+        s = fma(float4(as_type<char4>(uint(g))), x.v[2 * l], s);
+        s = fma(float4(as_type<char4>(uint(g >> 32))), x.v[2 * l + 1], s);
+        sx += x.v[2 * l] + x.v[2 * l + 1];
+    }
+    return dl * (hsum(s) + delta * hsum(sx));
+}
+// ---- IQ1_M (56-byte blocks of 256): per group of 8 its own scale (3 bits a half sub-block) and
+// delta sign; the f16 scale in the top nibbles of the four scale words.
+struct MIQ1_M { device const uchar* w; ulong rb; };
+inline float mdot(MIQ1_M f, uint row, uint c, thread const X32& x) {
+    device const uchar* B = f.w + (ulong)row * f.rb + (c / 8) * 56;
+    uint j = c % 8;
+    device const ushort* S = (device const ushort*)(B + 48);
+    uint s0 = S[0], s1 = S[1], s2 = S[2], s3 = S[3];
+    float d = float(as_type<half>(ushort((s0 >> 12) | ((s1 >> 8) & 0x00f0) | ((s2 >> 4) & 0x0f00) | (s3 & 0xf000))));
+    uint sv = S[j / 2] >> (6 * (j % 2));
+    device const ushort* Q = (device const ushort*)B;
+    uint q01 = Q[2 * j], q23 = Q[2 * j + 1];
+    uint qh = Q[16 + j];
+    float r = 0.f;
+    for (uint l = 0; l < 4; l++) {
+        uint hb = (qh >> (8 * (l / 2))) & 255;
+        uint q = ((l < 2 ? q01 : q23) >> (8 * (l % 2))) & 255;
+        uint idx = q | ((hb << (l % 2 ? 4 : 8)) & 0x700);
+        float dl = d * float(2 * ((sv >> (l < 2 ? 0 : 3)) & 7) + 1);
+        float delta = (hb & (l % 2 ? 0x80u : 0x08u)) ? -0.125f : 0.125f;
+        ulong g = iq1s_grid[idx];
+        float4 a = float4(as_type<char4>(uint(g))) * x.v[2 * l];
+        a = fma(float4(as_type<char4>(uint(g >> 32))), x.v[2 * l + 1], a);
+        r += dl * (hsum(a) + delta * hsum(x.v[2 * l] + x.v[2 * l + 1]));
+    }
+    return r;
+}
+// ---- IQ2_XXS (66-byte blocks of 256, 2-byte aligned): per group of 8 a grid entry of unsigned
+// magnitudes and 7 sign bits (the eighth the parity), one scale per sub-block.
+struct MIQ2_XXS { device const uchar* w; ulong rb; };
+inline float4 sgn4(uint s) { return 1.f - 2.f * float4((uint4(s) >> uint4(0, 1, 2, 3)) & 1u); }
+inline float mdot(MIQ2_XXS f, uint row, uint c, thread const X32& x) {
+    device const ushort* B = (device const ushort*)(f.w + (ulong)row * f.rb + (c / 8) * 66);
+    uint j = c % 8;
+    uint a0 = B[1 + 4 * j] | (B[2 + 4 * j] << 16), a1 = B[3 + 4 * j] | (B[4 + 4 * j] << 16);
+    float db = float(as_type<half>(B[0])) * (0.5f + float(a1 >> 28)) * 0.25f;
+    float4 s = 0.f;
+    for (uint l = 0; l < 4; l++) {
+        ulong g = iq2xxs_grid[(a0 >> (8 * l)) & 255];
+        uint sg = (a1 >> (7 * l)) & 127;
+        sg |= (popcount(sg) & 1) << 7;
+        s = fma(float4(as_type<uchar4>(uint(g))) * sgn4(sg), x.v[2 * l], s);
+        s = fma(float4(as_type<uchar4>(uint(g >> 32))) * sgn4(sg >> 4), x.v[2 * l + 1], s);
+    }
+    return db * hsum(s);
+}
 // ---- K-quants: 256-value super-blocks, 8 chunks of 32 each. Chunk k of a super-block covers 16
 // bytes of quants: group g = k / 2 (64 values), half h = k % 2; its low nibbles are values
 // 64g + 16h + i (sub-block 2g), the high nibbles 64g + 32 + 16h + i (sub-block 2g + 1).
@@ -283,7 +350,8 @@ inline void mv_acc(F f, F f2, bool pair, uint r2off, device const float* x, uint
     for (int r = 0; r < NR; r++) { acc[r] += scale * a[r]; acc2[r] += scale * b[r]; }
 }
 // Reduces the lane sums over the threadgroup and writes rows r0 .. of y by `mode`: 0 store, 1 add,
-// 2 silu(acc) * acc2, 3 gelu(acc) * acc2, 4 add acc * sigmoid(*gate).
+// 2 silu(acc) * acc2, 3 gelu(acc) * acc2, 4 add acc * sigmoid(*gate), 5 raw pair, 6 clamped SwiGLU
+// pair (limit *gate; the expert pair kernels read it after the k ids and weights of `sel`).
 template <int NR, int KS>
 inline void mv_finish(thread float* acc, thread float* acc2, device float* y, uint mode, uint r0, uint n_out, uint sg, uint lane,
                       threadgroup float* red, device const float* gate) {
@@ -313,6 +381,11 @@ inline void mv_finish(thread float* acc, thread float* acc2, device float* y, ui
             // Raw pair (experts with LoRA updates): gate then up outputs, 2 n_out per slot.
             y[o] = a;
             y[n_out + o] = b;
+        } else if (mode == 6) {
+            // DeepSeek's clamped SwiGLU, the limit at *gate: silu(min(a, l)) * clamp(b, -l, l).
+            float l = gate[0];
+            float g = min(a, l);
+            y[o] = g / (1.0f + precise::exp(-g)) * clamp(b, -l, l);
         } else y[o] += a / (1.0f + exp(-gate[0]));
     }
 }
@@ -321,7 +394,7 @@ inline void mv_body(F f, F f2, device const float* x, device float* y, constant 
                     threadgroup float* red, device const float* gate) {
     float acc[NR], acc2[NR];
     for (int r = 0; r < NR; r++) { acc[r] = 0.f; acc2[r] = 0.f; }
-    mv_acc<F, X, CH, NR, KS>(f, f2, p.mode == 2 || p.mode == 3, 0, x, p.n_in, p.n_out, tg * NR, sg, lane, acc, acc2, 1.f);
+    mv_acc<F, X, CH, NR, KS>(f, f2, p.mode == 2 || p.mode == 3 || p.mode == 6, 0, x, p.n_in, p.n_out, tg * NR, sg, lane, acc, acc2, 1.f);
     mv_finish<NR, KS>(acc, acc2, y, p.mode, tg * NR, p.n_out, sg, lane, red, gate);
 }
 
@@ -1421,7 +1494,7 @@ MVX_SIG(NAME##_pair) { threadgroup float red[2]; \
     float acc[1] = { 0.f }, acc2[1] = { 0.f }; \
     T f = MAKE(e); T f2 = MAKE(e2); \
     mv_acc<T, X, CH, 1, 1>(f, f2, true, p._p, x, p.n_in, p.n_out, tg.x, sg, lane, acc, acc2, 1.f); \
-    mv_finish<1, 1>(acc, acc2, y + (ulong)s * p.n_out * (p.mode == 5u ? 2u : 1u), p.mode, tg.x, p.n_out, sg, lane, red, sel); } \
+    mv_finish<1, 1>(acc, acc2, y + (ulong)s * p.n_out * (p.mode == 5u ? 2u : 1u), p.mode, tg.x, p.n_out, sg, lane, red, sel + 2 * p.ldy); } \
 MVX_SIG(NAME##_sum) { threadgroup float red[2]; \
     float acc[1] = { 0.f }, acc2[1] = { 0.f }; \
     for (uint s = 0; s < p.ldy; s++) { \

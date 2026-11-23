@@ -166,6 +166,17 @@ impl MvFmt {
             },
         }
     }
+    /// The single-token instantiation: [`Self::instantiate`], with the 1-bit and 2-bit grid
+    /// formats of DeepSeek V4.1's experts on dot products of their own (`MIQ1_S`, `MIQ1_M`,
+    /// `MIQ2_XXS`) rather than the GEMM dequantizer.
+    fn instantiate_mv(self, nr: usize, ks: usize) -> String {
+        match self {
+            MvFmt::Gguf(k @ (GgmlType::IQ1_S | GgmlType::IQ1_M | GgmlType::IQ2_XXS)) => {
+                format!("MV_RAW(mv_{}_{nr}_{ks}, M{}, X32, 32, {nr}, {ks})", k.name(), k.name())
+            }
+            _ => self.instantiate(nr, ks),
+        }
+    }
     /// The multi-token instantiation (up to `tt` tokens; see `mvk_body` in the shader).
     fn instantiate_k(self, nr: usize, ks: usize, tt: usize, kind: MvkKind) -> String {
         let one = self.instantiate(nr, ks);
@@ -213,6 +224,9 @@ impl MvFmt {
                 GgmlType::Q5_K => raw("MQ5_K", "XKQ", 32),
                 GgmlType::Q6_K => raw("MQ6_K", "X6", 32),
                 GgmlType::F32 => gen_("F32W2".into()),
+                GgmlType::IQ1_S => raw("MIQ1_S", "X32", 32),
+                GgmlType::IQ1_M => raw("MIQ1_M", "X32", 32),
+                GgmlType::IQ2_XXS => raw("MIQ2_XXS", "X32", 32),
                 k => gen_(format!("{}W", k.name())),
             },
         }
@@ -256,7 +270,7 @@ pub(crate) fn shader_src() -> String {
         let _ = writeln!(s, "MVX(mvx_{n}, {t}, {x}, {ch}, MKX_{n})");
         for &(nr, ks) in &MV_VARIANTS {
             if f.specialized() || (nr, ks) == (2, 4) {
-                let _ = writeln!(s, "{}", f.instantiate(nr, ks));
+                let _ = writeln!(s, "{}", f.instantiate_mv(nr, ks));
             }
         }
         // A few rows at once (`mvt_<fmt>_1_<ks>`, see `MetalBackend::mvt_pipe`).
@@ -987,6 +1001,9 @@ pub(crate) enum MvMode {
     /// The experts' pair kernels with LoRA updates: the raw gate and up outputs (`2 n_out` per
     /// slot), the activation taken after the updates (`xlora_act`).
     RawPair = 5,
+    /// DeepSeek's clamped SwiGLU pair: `silu(min(a, l)) * clamp(b, -l, l)`, the limit `l` at
+    /// the gate buffer (the expert pair kernels: after the k ids and weights of the selection).
+    SiluClampPair = 6,
 }
 
 impl MetalBackend {
@@ -1077,10 +1094,10 @@ pub(crate) struct Fns {
     dispatch_ind: unsafe extern "C" fn(Id, Sel, Id, usize, *const MtlSize),
     barrier: unsafe extern "C" fn(Id, Sel, u64),
     use_res: unsafe extern "C" fn(Id, Sel, *const Id, usize, usize),
-    enc_type: unsafe extern "C" fn(Id, Sel, u64) -> Id,
-    msg0: Msg0,
-    void: MsgVoid,
-    status: MsgU,
+    pub(crate) enc_type: unsafe extern "C" fn(Id, Sel, u64) -> Id,
+    pub(crate) msg0: Msg0,
+    pub(crate) void: MsgVoid,
+    pub(crate) status: MsgU,
     contents: MsgPtr,
     s_pipe: Sel,
     s_buf: Sel,
@@ -1089,12 +1106,12 @@ pub(crate) struct Fns {
     s_dispatch_ind: Sel,
     s_barrier: Sel,
     s_use_res: Sel,
-    s_enc_type: Sel,
-    s_cb: Sel,
-    s_end: Sel,
-    s_commit: Sel,
-    s_wait: Sel,
-    s_status: Sel,
+    pub(crate) s_enc_type: Sel,
+    pub(crate) s_cb: Sel,
+    pub(crate) s_end: Sel,
+    pub(crate) s_commit: Sel,
+    pub(crate) s_wait: Sel,
+    pub(crate) s_status: Sel,
     s_contents: Sel,
     s_release: Sel,
 }
@@ -1598,7 +1615,7 @@ fn attn_narrow(pipe: Id, grp: usize, narrow: &[Option<Id>; 2], n: usize) -> (Id,
 /// of 2048-4096 on 1-2 SIMD-groups (each lane streaming 2-4 chunks) left the passes 1-4.5%
 /// slower (Orpheus 3B Q4_K_M 4.70 -> 4.49 ms, Llama 3.2 1B 1.94 -> 1.88 ms) while streaming
 /// matvecs without barriers ran as fast either way.
-fn mv_variant(fmt: MvFmt, n_in: usize) -> (usize, usize) {
+pub(crate) fn mv_variant(fmt: MvFmt, n_in: usize) -> (usize, usize) {
     if !fmt.specialized() {
         return (2, 4); // the only variant compiled for the generic kernel
     }
@@ -7534,6 +7551,9 @@ mod tests {
             MvFmt::Gguf(GgmlType::Q6_K),
             MvFmt::Gguf(GgmlType::Q3_K),
             MvFmt::Gguf(GgmlType::IQ4_XS),
+            MvFmt::Gguf(GgmlType::IQ1_S),
+            MvFmt::Gguf(GgmlType::IQ1_M),
+            MvFmt::Gguf(GgmlType::IQ2_XXS),
         ];
         for fmt in fmts {
             let (d1, s1, w1) = matrix(fmt, n_out, n_in, &mut seed);

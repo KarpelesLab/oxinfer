@@ -386,6 +386,9 @@ struct PartCache {
     pending: std::collections::VecDeque<(usize, usize)>,
     loading: Option<(usize, usize)>,
     ready: Vec<(usize, usize)>,
+    /// With an accelerator mapping the cached parts (`StreamHook::track_parts`): the parts let in
+    /// (true) and out (false) since it last looked.
+    log: Option<Vec<((usize, usize), bool)>>,
 }
 
 impl PartCache {
@@ -417,6 +420,9 @@ impl PartCache {
         self.entries.insert(k, (self.clock, bytes));
         self.by_use.insert(self.clock, k);
         self.used += bytes;
+        if let Some(l) = &mut self.log {
+            l.push((k, true));
+        }
         let mut out = Vec::new();
         let mut skipped = Vec::new();
         while self.used > self.cap {
@@ -427,6 +433,9 @@ impl PartCache {
             }
             let (_, b) = self.entries.remove(&v).unwrap();
             self.used -= b;
+            if let Some(l) = &mut self.log {
+                l.push((v, false));
+            }
             out.push(v);
         }
         for (stamp, v) in skipped {
@@ -605,6 +614,31 @@ impl StreamHook {
         let k = (self.base + i, p);
         let pc = self.s.inner.parts.lock().unwrap();
         pc.in_use.contains(&k) || pc.entries.contains_key(&k)
+    }
+    /// Starts recording which parts enter and leave the part cache (see [`Self::part_changes`])
+    /// and returns the parts of this model cached now (`(unit, part)`, the model's unit indices).
+    pub fn track_parts(&self) -> Vec<(usize, usize)> {
+        let mut pc = self.s.inner.parts.lock().unwrap();
+        if pc.log.is_none() {
+            pc.log = Some(Vec::new());
+        }
+        let n = self.s.inner.units.len();
+        pc.entries
+            .keys()
+            .filter(|k| k.0 >= self.base && k.0 < n)
+            .map(|k| (k.0 - self.base, k.1))
+            .collect()
+    }
+    /// The parts of this model that entered (true) or left (false) the part cache since the last
+    /// call, in order (after [`Self::track_parts`]).
+    pub fn part_changes(&self) -> Vec<(usize, usize, bool)> {
+        let mut pc = self.s.inner.parts.lock().unwrap();
+        let Some(l) = pc.log.as_mut() else { return Vec::new() };
+        let all = std::mem::take(l);
+        all.into_iter()
+            .filter(|(k, _)| k.0 >= self.base)
+            .map(|(k, on)| (k.0 - self.base, k.1, on))
+            .collect()
     }
     /// Accelerator state kept with the streamer (see `Streamer::device`).
     pub fn device_state(&self) -> &Mutex<Option<Box<dyn std::any::Any + Send + Sync>>> {

@@ -50,6 +50,8 @@ pub(crate) mod decode;
 mod dit;
 #[path = "metal_ds4.rs"]
 pub(crate) mod ds4;
+#[path = "metal_ds41.rs"]
+pub(crate) mod ds41;
 #[path = "metal_inkling.rs"]
 pub(crate) mod inkling;
 #[path = "metal_inkling_draft.rs"]
