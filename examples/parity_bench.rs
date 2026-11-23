@@ -100,6 +100,10 @@ fn main() -> anyhow::Result<()> {
     }
     if std::env::var_os("OXINFER_PF_PROFILE").is_some() {
         oxinfer::gpu::pf_report();
+        // The op-by-op path's launches (copies up, device time, copies down) over the whole run.
+        if let Some(s) = oxinfer::gpu::active().and_then(|b| b.stats()) {
+            eprintln!("[gpu: {s}]");
+        }
     }
     Ok(())
 }

@@ -523,6 +523,21 @@ fn touch_pages(ptr: *const u8, bytes: usize) {
     });
 }
 
+/// [`touch_pages`] for memory about to be written by the driver: a float of every page is
+/// written back, so the page is this process's own (not the shared zero page of a fresh
+/// allocation).
+fn touch_pages_mut(dst: &mut [f32]) {
+    const PIECE: usize = 1 << 20;
+    let (base, n) = (dst.as_mut_ptr() as usize, dst.len());
+    crate::pool::run(n.div_ceil(PIECE), &|i| {
+        for k in (i * PIECE..((i + 1) * PIECE).min(n)).step_by(1024) {
+            let p = (base + 4 * k) as *mut f32;
+            // SAFETY: inside `dst`, which this call holds exclusively; pieces are disjoint.
+            unsafe { std::ptr::write_volatile(p, std::ptr::read_volatile(p)) };
+        }
+    });
+}
+
 #[derive(Default)]
 struct Staging {
     x: u64,
@@ -835,6 +850,16 @@ impl CudaBackend {
             let _ = self.check(rc, "cuLaunchKernel").map_err(|e| eprintln!("[cuda: {e}]"));
         }
         rc == 0
+    }
+
+    /// Copies device memory into `dst`. On a unified-memory device the pages of `dst` are
+    /// written first: the driver fills pages that are not in the page table yet (a buffer just
+    /// allocated, as the callers' outputs are) many times slower ([`touch_pages`]).
+    fn dtoh(&self, dst: &mut [f32], src: u64) -> bool {
+        if integrated() && dst.len() >= (1 << 16) {
+            touch_pages_mut(dst);
+        }
+        unsafe { self.cu.cuMemcpyDtoH_v2(dst.as_mut_ptr() as *mut c_void, src, dst.len() * 4) == 0 }
     }
 
     fn htod<T>(&self, dst: u64, src: &[T]) -> bool {
@@ -1228,7 +1253,7 @@ impl CudaBackend {
             return false;
         }
         let t2 = Instant::now();
-        if unsafe { self.cu.cuMemcpyDtoH_v2(y.as_mut_ptr() as *mut c_void, st.mx.0, t * h * 4) } != 0 {
+        if !self.dtoh(&mut y[..t * h], st.mx.0) {
             return false;
         }
         self.stats.calls.fetch_add(1, Ordering::Relaxed);
@@ -1729,7 +1754,7 @@ impl Backend for CudaBackend {
             return false;
         }
         let t2 = Instant::now();
-        if unsafe { self.cu.cuMemcpyDtoH_v2(job.y.as_mut_ptr() as *mut c_void, st.y, t * job.n_out * 4) } != 0 {
+        if !self.dtoh(&mut job.y[..t * job.n_out], st.y) {
             return false;
         }
         self.stats.calls.fetch_add(1, Ordering::Relaxed);
@@ -1846,7 +1871,7 @@ impl Backend for CudaBackend {
         }
         let t2 = Instant::now();
         let mut o = vec![0f32; heads * tqp * dho];
-        if unsafe { self.cu.cuMemcpyDtoH_v2(o.as_mut_ptr() as *mut c_void, st.ao.0, o.len() * 4) } != 0 {
+        if !self.dtoh(&mut o, st.ao.0) {
             return false;
         }
         for h in 0..heads {
@@ -1924,11 +1949,7 @@ impl Backend for CudaBackend {
         let t2 = Instant::now();
         let mut y_off = 0usize;
         for j in jobs.iter_mut() {
-            if unsafe {
-                self.cu
-                    .cuMemcpyDtoH_v2(j.y.as_mut_ptr() as *mut c_void, st.y + (y_off * 4) as u64, t * j.n_out * 4)
-            } != 0
-            {
+            if !self.dtoh(&mut j.y[..t * j.n_out], st.y + (y_off * 4) as u64) {
                 return false;
             }
             y_off += t_pad * j.n_out;
