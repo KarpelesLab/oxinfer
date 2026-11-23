@@ -24,9 +24,13 @@ pub(crate) const MVK_CLASSES: [usize; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 16];
 /// chunk of every row and an accumulator per row and token, and loads each token's x chunk once
 /// for the rows) and the kernel's kind ([`MvkKind`]). See [`mvk_table`]; `OXINFER_MVK_ROWS=n` /
 /// `OXINFER_MVK_KIND=0|1|2` override it.
-pub(crate) fn mvk_variant(fmt: MvFmt, n_out: usize, n_in: usize, ks: usize, tt: usize) -> (usize, MvkKind) {
+pub(crate) fn mvk_variant(fmt: MvFmt, n_out: usize, n_in: usize, ks: usize, tt: usize, pair: bool) -> (usize, MvkKind) {
     let long = n_in / fmt.chunk() > 32 * ks;
-    let (nr, kind) = mvk_table(fmt, long, ks, tt);
+    let (nr, kind) = if pair {
+        mvk_pair_table(fmt, long, ks, tt)
+    } else {
+        mvk_table(fmt, long, ks, tt)
+    };
     // Few rows: a threadgroup each, to spread them over the GPU.
     let nr = if n_out < MVK_FEW_ROWS { 1 } else { nr };
     let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
@@ -39,6 +43,25 @@ pub(crate) fn mvk_variant(fmt: MvFmt, n_out: usize, n_in: usize, ks: usize, tt: 
         _ => kind,
     };
     (r.unwrap_or(nr), kind)
+}
+
+/// [`mvk_table`] for SiLU / GELU pairs, where each lane holds both matrices' decoded chunks: one
+/// row a threadgroup with half quants up to 8 tokens, sweeps of 4 for more (`decode_mvk_bench`
+/// with `OXINFER_MVK_PAIR=1`, 12288 x 4096 and 4096 x 4096 pairs: Q8_0 at 8 tokens 851 us with two
+/// float rows, 375 with one half; Q4_K 2183 / 540; at 16 tokens Q4_K 1379 in sweeps against
+/// 1463-5073).
+fn mvk_pair_table(fmt: MvFmt, _long: bool, _ks: usize, tt: usize) -> (usize, MvkKind) {
+    if tt > 8 {
+        return (2, MvkKind::Sweeps);
+    }
+    (
+        1,
+        if matches!(fmt, MvFmt::Bf16 | MvFmt::Gguf(GgmlType::F16)) {
+            MvkKind::Float
+        } else {
+            MvkKind::Half
+        },
+    )
 }
 
 /// Matrices of fewer rows take one row a threadgroup ([`mvk_variant`]).
@@ -263,7 +286,14 @@ pub(crate) fn shader_src() -> String {
                         let few = MVK_FEW_ROWS - 1;
                         [chunk, 2 * chunk]
                             .into_iter()
-                            .flat_map(|n_in| [mvk_variant(f, MVK_FEW_ROWS, n_in, ks, tt), mvk_variant(f, few, n_in, ks, tt)])
+                            .flat_map(|n_in| {
+                                [false, true].into_iter().flat_map(move |pair| {
+                                    [
+                                        mvk_variant(f, MVK_FEW_ROWS, n_in, ks, tt, pair),
+                                        mvk_variant(f, few, n_in, ks, tt, pair),
+                                    ]
+                                })
+                            })
                             .collect()
                     };
                     vs.sort_by_key(|&(nr, kind)| (nr, kind as u8));
@@ -985,12 +1015,12 @@ impl MetalBackend {
     }
     /// The multi-token matvec kernels of a format and SIMD-group split for steps of up to `tokens`
     /// tokens: the kernel of every token class that holds such a step.
-    pub(crate) fn mvk_pipes(&self, fmt: MvFmt, n_out: usize, n_in: usize, ks: usize, tokens: usize) -> Option<MvkPipe> {
+    pub(crate) fn mvk_pipes(&self, fmt: MvFmt, n_out: usize, n_in: usize, ks: usize, tokens: usize, pair: bool) -> Option<MvkPipe> {
         let mut pipes = [(std::ptr::null_mut(), 0); MVK_CLASSES.len()];
         let top = mvk_class(tokens);
         for (i, &tt) in MVK_CLASSES.iter().enumerate() {
             let tt = if i <= top { tt } else { MVK_CLASSES[top] };
-            let (nr, kind) = mvk_variant(fmt, n_out, n_in, ks, tt);
+            let (nr, kind) = mvk_variant(fmt, n_out, n_in, ks, tt, pair);
             pipes[i] = (self.mvk_pipe(fmt, nr, ks, tt, kind)?, nr);
         }
         Some(MvkPipe::Exact(pipes, 32 * ks))
@@ -2939,7 +2969,7 @@ impl MetalBackend {
                     let t = match fv {
                         Some((p, rows)) => Some((MvkPipe::Fast(p, rows, 128), ts(x) as u32, ts(y) as u32, gate.map_or(0, ts) as u32)),
                         None if mt => Some((
-                            self.mvk_pipes(mw.fmt, n_out, n_in, ks, tokens.min(tt))?,
+                            self.mvk_pipes(mw.fmt, n_out, n_in, ks, tokens.min(tt), mw2.is_some())?,
                             ts(x) as u32,
                             ts(y) as u32,
                             gate.map_or(0, ts) as u32,
@@ -3115,7 +3145,12 @@ impl MetalBackend {
                                 y: byte(logits) + n_exp * 4,
                                 mode: MvMode::Store,
                                 gate: 0,
-                                t: Some((self.mvk_pipes(fmt, 1, h, ks, tokens.min(tt))?, ts(x) as u32, ts(logits) as u32, 0)),
+                                t: Some((
+                                    self.mvk_pipes(fmt, 1, h, ks, tokens.min(tt), false)?,
+                                    ts(x) as u32,
+                                    ts(logits) as u32,
+                                    0,
+                                )),
                                 each: (0, 0),
                             });
                         }
@@ -3135,7 +3170,7 @@ impl MetalBackend {
                         );
                     }
                     let mvk = if pf {
-                        self.mvk_pipes(fmt, n_exp, h, ks, tokens.min(tt))
+                        self.mvk_pipes(fmt, n_exp, h, ks, tokens.min(tt), false)
                             .map(|p| (p, ts(x) as u32, ts(logits) as u32, 0))
                     } else {
                         None
@@ -7757,7 +7792,7 @@ mod tests {
                             reset();
                             // Up to 8 tokens through the 8-token kernels, more through the 16-token ones.
                             let tt = *MVK_TOKENS.iter().find(|&&t| t >= ntok).unwrap();
-                            let (tnr, kind) = mvk_variant(fmt, n_out, n_in, ks, tt);
+                            let (tnr, kind) = mvk_variant(fmt, n_out, n_in, ks, tt, pair.is_some());
                             let tpipe = be.mvk_pipe(fmt, tnr, ks, tt, kind).unwrap();
                             let (ok, _) = run_concurrent(&be, &f, &[std::ops::Range { start: 0, end: 1 }], |e, _| {
                                 encode_mvk(
@@ -8266,18 +8301,21 @@ mod tests {
                     let tt = *MVK_CLASSES.iter().find(|&&c| c >= t).unwrap();
                     for &(nr, kind) in &vars {
                         let (nr, kind) = if nr == 0 {
-                            mvk_variant(fmt, n_out, n_in, ks, tt)
+                            mvk_variant(fmt, n_out, n_in, ks, tt, std::env::var_os("OXINFER_MVK_PAIR").is_some())
                         } else {
                             (nr, kind)
                         };
                         let Some(pipe) = be.mvk_pipe(fmt, nr, ks, tt, kind) else { continue };
+                        // `OXINFER_MVK_PAIR=1`: SiLU pairs (the next copy as the second matrix).
+                        let pair = std::env::var_os("OXINFER_MVK_PAIR").is_some();
                         let us = best(&|e, c| {
+                            let w2 = wt((c + 1) % copies);
                             encode_mvk(
                                 e,
                                 (pipe, nr, ks),
                                 &wt(c),
-                                None,
-                                MvMode::Store,
+                                pair.then_some(&w2),
+                                if pair { MvMode::SiluPair } else { MvMode::Store },
                                 t,
                                 (st.x, 0),
                                 (st.y, 0),
