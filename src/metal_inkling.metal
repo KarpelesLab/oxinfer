@@ -668,12 +668,12 @@ inline float conv_in(device const float* a, constant ICrP& p, uint tj, uint i) {
     for (uint s = 0; s < p.ok; s++) v += a[p.od + ((ulong)tj * p.ok + s) * p.h + i];
     return v;
 }
-inline void ink_conv_one(device float* a, device const float* c, constant ICrP& p, device float* ring, uint i, uint ti) {
+// (`xin`: token ti's input, given.)
+inline void ink_conv_in(device float* a, device const float* c, constant ICrP& p, device float* ring, uint i, uint ti, float xin) {
     uint h = p.h, kn = p.kn;
     uint pos = p.pos + ti;
     device float* o = a + p.out + (ulong)ti * h + i;
     float old = p.mode != 0 ? *o : 0.f;
-    float xin = conv_in(a, p, ti, i);
     float s = xin;
     for (uint lag = 0; lag < kn; lag++) {
         float xv;
@@ -689,6 +689,9 @@ inline void ink_conv_one(device float* a, device const float* c, constant ICrP& 
     // from their rows, never from the ring, so the writes do not race with the reads).
     if (p.ring_write != 0) ring[(ulong)((pos + kn - 1) % p.ring_cap) * h + i] = xin;
     *o = p.mode == 0 ? s : old + s;
+}
+inline void ink_conv_one(device float* a, device const float* c, constant ICrP& p, device float* ring, uint i, uint ti) {
+    ink_conv_in(a, c, p, ring, i, ti, conv_in(a, p, ti, i));
 }
 kernel void ink_conv(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant ICrP& p [[buffer(2)]],
                      device float* ring [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
@@ -1195,6 +1198,9 @@ kernel void ink_xcombine(device float* a [[buffer(0)]], constant IXcP& p [[buffe
     device float* y = a + p.y + (ulong)ti * p.h + r;
     if (p.add != 0) *y += v; else *y = v;
 }
+// `_dconv` (passes of one token; grid: blocks of 32 / lpr rows, k SIMD-groups): SIMD-group s computes
+// slot s's down rows as `_gsum` does, then the convolution after the experts takes their sum in
+// slot order (`ink_conv`'s input) and writes the stream and the ring: no stage between them.
 // The pair and down kernels over the groups (grid: blocks of outputs, group): as `_pair` for every
 // assignment of the group; the down rows of every assignment into `od` (`p.y` is `od`). The lanes
 // of a SIMD-group are split into row groups of `lpr` lanes (`gq.z`, a power of two dividing the
@@ -1282,4 +1288,44 @@ kernel void NAME##_gsum(device float* a [[buffer(0)]], device const IXT* tab [[b
         float v = ink_lsum(ink_row_acc<T, X, CH>(f, rc, a + p.act + (ulong)asn * p.inter, p.inter / CH, jj, lpr), lpr); \
         if (jj == 0 && r < p.h) \
             a[p.y + (ulong)asn * p.h + r] = v * (a[p.sel + (ulong)ti * 2 * p.k + p.k + s] * e.factor); \
+    } } \
+kernel void NAME##_dconv(device float* a [[buffer(0)]], device const IXT* tab [[buffer(1)]], constant IXP& p [[buffer(2)]], \
+                         constant uint4& gq [[buffer(3)]], device const float* c [[buffer(4)]], constant ICrP& cp [[buffer(5)]], \
+                         device float* ring [[buffer(6)]], uint tg [[threadgroup_position_in_grid]], \
+                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
+    threadgroup float part[16 * 32]; \
+    uint lpr = gq.w, rg = lane / lpr, jj = lane % lpr, nr = 32 / lpr; \
+    uint r = tg * nr + rg; \
+    if (sg < p.k) { \
+        IXT e = tab[as_type<uint>(a[p.sel + sg])]; \
+        T f = MAKE(e, p.inter); \
+        float v = ink_lsum(ink_row_acc<T, X, CH>(f, min(r, p.h - 1), a + p.act + (ulong)sg * p.inter, p.inter / CH, jj, lpr), lpr); \
+        if (jj == 0) part[sg * nr + rg] = v * (a[p.sel + p.k + sg] * e.factor); \
+    } \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    uint i = tg * nr + lane; \
+    if (sg == 0 && lane < nr && i < p.h) { \
+        float xin = 0.f; \
+        for (uint s = 0; s < p.k; s++) xin += part[s * nr + lane]; \
+        ink_conv_in(a, c, cp, ring, i, 0, xin); \
     } }
+
+// ---- Passes of one token: the attention's output projection and the convolution after it in one
+// kernel (grid x: blocks of 4 rows; 4 SIMD-groups of 32 lanes, a row each, its chunks c = lane,
+// lane + 32, ... summed per lane then over the SIMD-group as the decode library's one-token matvec
+// does with one SIMD-group a row, so the same rows); the row is the convolution's input of that
+// channel (`ink_conv`'s, parameters `cp`), written to the ring and added to the stream.
+struct IMvE { device const uchar* q; device const uchar* s; device const uchar* o; };
+#define INK_MVC(NAME, T, X, CH, MAKE) \
+kernel void NAME(device const uchar* wb [[buffer(0)]], device const uchar* sb [[buffer(1)]], device float* a [[buffer(2)]], \
+                 constant MV& p [[buffer(4)]], device const uchar* ob [[buffer(7)]], device const float* c [[buffer(10)]], \
+                 constant ICrP& cp [[buffer(11)]], device float* ring [[buffer(12)]], \
+                 uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], \
+                 uint lane [[thread_index_in_simdgroup]]) { \
+    IMvE e = { wb + p.w_off, sb + p.s_off, ob + p.o_off }; \
+    T f = MAKE(e); \
+    uint r = tg * 4 + sg; \
+    float acc = 0.f; \
+    acc += ink_row_acc<T, X, CH>(f, min(r, p.n_out - 1), a + p.ldy, p.n_in / CH, lane, 32); \
+    float v = simd_sum(acc); \
+    if (lane == 0 && r < p.n_out) ink_conv_in(a, c, cp, ring, r, 0, v); }

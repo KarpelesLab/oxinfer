@@ -53,7 +53,7 @@ impl MvFmt {
             WeightRef::Gguf(_) => return None,
         })
     }
-    fn name(self) -> String {
+    pub(crate) fn name(self) -> String {
         match self {
             MvFmt::Bf16 => "bf".into(),
             MvFmt::Q8 => "q8".into(),
@@ -95,7 +95,7 @@ impl MvFmt {
     }
     /// The kernel's weight type, x chunk type and chunk size, and the `MKX_` constructor of the
     /// weight type from an expert table entry `e`.
-    fn kernel_types(self) -> (String, &'static str, usize, String) {
+    pub(crate) fn kernel_types(self) -> (String, &'static str, usize, String) {
         let raw = |t: &str, x: &'static str, ch: usize| (t.to_string(), x, ch, format!("{t}{{ (e).q, p.gpr }}"));
         let gen_ = |w: String| {
             (
@@ -143,7 +143,7 @@ impl MvFmt {
     }
 }
 
-fn all_formats() -> Vec<MvFmt> {
+pub(crate) fn all_formats() -> Vec<MvFmt> {
     let mut v = vec![MvFmt::Bf16, MvFmt::Q8, MvFmt::Q4];
     v.extend(GGUF_GPU_TYPES.iter().map(|&k| MvFmt::Gguf(k)));
     v

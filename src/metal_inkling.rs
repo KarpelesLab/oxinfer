@@ -158,6 +158,13 @@ fn lanes_per_row(n_in: usize, ch: usize, max: usize) -> u32 {
     1u32 << nch.trailing_zeros().min(max.trailing_zeros())
 }
 
+/// Whether passes of one token run the experts' down projections and the convolution after them
+/// in one kernel (`_dconv`; `OXINFER_INKLING_DCONV=0`: the grouped kernel and `ink_conv`).
+fn dconv_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_DCONV").is_ok_and(|v| v == "0"))
+}
+
 /// The chunk of an expert format's kernels (values per `mdot`).
 fn ch_of(fmt: &str) -> usize {
     expert_formats().iter().find(|f| f.0 == fmt).map_or(32, |f| f.3)
@@ -307,6 +314,12 @@ pub(crate) fn shader_src(mma: bool) -> String {
     }
     for k in GGUF_GPU_TYPES.iter().filter(|&&k| k != GgmlType::F32) {
         let _ = writeln!(s, "INK_EMB({})", k.name());
+    }
+    for f in super::decode::all_formats() {
+        let (t, x, ch, mk) = f.kernel_types();
+        let n = f.name();
+        let _ = writeln!(s, "#define IMVC_{n}(e) {mk}");
+        let _ = writeln!(s, "INK_MVC(ink_mvc_{n}, {t}, {x}, {ch}, IMVC_{n})");
     }
     if mma {
         s.push_str(PF_SRC);
@@ -554,6 +567,9 @@ struct Dw {
     /// Runtime LoRA updates of the matrix (`crate::lora`), applied beside it.
     lora: Vec<LoraDev>,
     one: (Id, usize, usize),
+    /// Passes of one token, where the one-token matvec runs a row per SIMD-group: the same
+    /// matvec followed by the convolution after the attention (`ink_mvc_*`).
+    mvc: Option<Id>,
     multi: [(Id, usize, usize); 2],
     /// Prefill: the matrix-unit GEMM, where the format has one; float32 weights (the loop's
     /// gates): their buffer and offset in floats, for the f32 GEMM.
@@ -621,6 +637,8 @@ struct ExpDev {
     /// The same over the pass's experts grouped by expert (passes of up to MAX_T tokens).
     gpair: Id,
     gsum: Id,
+    /// Passes of one token: the down rows and the convolution after them (`_dconv`).
+    dconv: Id,
     tab_gu: Id,
     tab_d: Id,
     il: u32,
@@ -1365,6 +1383,9 @@ impl InkMetal {
             };
             let (nr1, ks1) = if specialized(w.fmt) { (1, ks) } else { (2, 4) };
             let one = (be.mv_pipe(w.fmt, nr1, ks1).context("mv pipeline")?, nr1, ks1);
+            let mvc = (specialized(w.fmt) && (nr1, ks1) == (1, 1))
+                .then(|| lib.pipeline(be, &format!("ink_mvc_{}", w.fmt.name())))
+                .flatten();
             if profile_every() > 0 {
                 eprintln!(
                     "[inkling profile: matvec [{n_out}, {n_in}] {:?}: pipeline {:#x}]",
@@ -1435,6 +1456,7 @@ impl InkMetal {
             }
             Ok(Dw {
                 w,
+                mvc,
                 lora,
                 one,
                 multi: [mk(8)?, mk(16)?],
@@ -1648,6 +1670,7 @@ impl InkMetal {
                 sum: pipe(&format!("ink_x_{d_fmt}_sum"))?,
                 gpair: pipe(&format!("ink_x_{gu_fmt}_gpair"))?,
                 gsum: pipe(&format!("ink_x_{d_fmt}_gsum"))?,
+                dconv: pipe(&format!("ink_x_{d_fmt}_dconv"))?,
                 tab_gu: mk_tab(&tab_gu, &mut owned)?,
                 tab_d: mk_tab(&tab_d, &mut owned)?,
                 il: if ex.interleaved { 2 } else { 1 },
@@ -3023,14 +3046,51 @@ impl InkMetal {
             }
             e.barrier();
         }
-        if !self.skip(SK_DENSE) {
-            self.mv(e, c, &ld.o, b.att, b.ab, t, MvMode::Store);
+        let lora = ld.o.lora.iter().any(|l| l.r != 0 && unsafe { (*l.d).strength() } != 0.0);
+        match ld.o.mvc {
+            // The output projection and the convolution after it in one kernel.
+            Some(pipe) if t == 1 && !lora && !self.skip(SK_DENSE | SK_CONV) && dconv_on() => {
+                let w = &ld.o.w;
+                let cp = self.conv_p(b.ab, b.x, ld.attn_conv, pos, !ld.boundary, t, None);
+                let p = MvParams {
+                    n_out: w.n_out as u32,
+                    n_in: w.n_in as u32,
+                    mode: 0,
+                    rows_per_tg: 0,
+                    w_off: w.data_off,
+                    s_off: w.scales_off,
+                    w2_off: w.data_off,
+                    s2_off: w.scales_off,
+                    o_off: w.offs_off,
+                    o2_off: w.offs_off,
+                    gpr: w.gpr,
+                    gk: w.gk,
+                    ldy: b.att as u32,
+                    _p: 0,
+                };
+                e.pipe(pipe);
+                e.buf(w.data, 0, 0);
+                e.buf(w.scales, 0, 1);
+                e.buf(c.a, 0, 2);
+                e.bytes(&p, 4);
+                e.buf(w.offs, 0, 7);
+                e.buf(self.consts, 0, 10);
+                e.bytes(&cp, 11);
+                e.buf(sd.rings[2].0, 0, 12);
+                e.dispatch((w.n_out.div_ceil(4), 1), 128);
+                e.barrier();
+            }
+            _ => {
+                if !self.skip(SK_DENSE) {
+                    self.mv(e, c, &ld.o, b.att, b.ab, t, MvMode::Store);
+                }
+                e.barrier();
+                if !self.skip(SK_CONV) {
+                    self.conv(e, c, b.ab, b.x, ld.attn_conv, sd.rings[2].0, pos, !ld.boundary, t);
+                }
+                e.barrier();
+            }
         }
-        e.barrier();
-        if !self.skip(SK_CONV) {
-            self.conv(e, c, b.ab, b.x, ld.attn_conv, sd.rings[2].0, pos, !ld.boundary, t);
-        }
-        e.barrier();
         if !self.inline_rings(t) {
             self.ring_store(e, c, b.ab, h, sd.rings[2].0, pos, t);
         }
@@ -3188,6 +3248,21 @@ impl InkMetal {
                 e.dispatch((self.inter.div_ceil(4 * 16 / ld.exp.lpr.0 as usize), n), 128);
             }
             e.barrier();
+            if t == 1 && ld.exp.xlora.is_none() && self.topk <= 16 && !self.skip(SK_EXP | SK_CONV) && dconv_on() {
+                // The down rows and the convolution after them in one kernel.
+                let cp = self.conv_p(b.o, b.x, ld.mlp_conv, pos, true, t, Some(b.od));
+                e.pipe(ld.exp.dconv);
+                e.buf(c.a, 0, 0);
+                e.buf(ld.exp.tab_d, 0, 1);
+                e.bytes(&xp, 2);
+                e.bytes(&gq, 3);
+                e.buf(self.consts, 0, 4);
+                e.bytes(&cp, 5);
+                e.buf(sd.rings[3].0, 0, 6);
+                e.dispatch((h.div_ceil(32 / ld.exp.lpr.1 as usize), 1), 32 * self.topk);
+                e.barrier();
+                return;
+            }
             e.pipe(ld.exp.gsum);
             e.buf(c.a, 0, 0);
             e.buf(ld.exp.tab_d, 0, 1);
