@@ -538,7 +538,8 @@ weight formats the model has, a few seconds; kept in `~/.cache/oxinfer/kernels`,
   per expert built on the device and grouped GEMMs (SiTU in the epilogue), attention in tiles of
   8 queries sharing their keys and values in shared memory, convolutions a thread per (channel,
   token), the message gates' low-rank projection a block per token.
-- **Weights as stored**: every GGUF block format but the ternary and 1-bit ones, the release's
+- **Weights as stored**: every GGUF block format but the ternary and 1-bit ones (the 2-bit Q2_0
+  of AtomicChat's files included), the release's
   NVFP4 (with its per-expert factors) and MXFP8 experts, unsloth's per-expert output factors,
   oxinfer's Q8 / Q4, bf16, f16, f32. Caches in f32, f16 or q8 (`--kv-cache`); the full layers'
   grow by a quarter, the sliding ones are rings of `window + 1024` rows.
@@ -551,7 +552,9 @@ weight formats the model has, a few seconds; kept in `~/.cache/oxinfer/kernels`,
   3e-6 tip some of this model's near-tied expert choices.
 - A session the device cannot hold moves to the host and continues on the CPU; LoRA adapters,
   Hadamard-folded or streamed weights, the ternary / 1-bit GGUF formats and MLX affine Q4 keep
-  the CPU path (`OXINFER_GPU_PLAN_DEBUG=1` says why); `OXINFER_INKLING_PROFILE=1` times each
+  the CPU path (`OXINFER_GPU_PLAN_DEBUG=1` says why), and so does a model whose weights, 0.5 GB
+  of activations and 1 GB to spare do not fit the device's free memory (Q8_0 on a 16 GB card:
+  [below](#threadripper-9970x-and-rtx-5080-16-gb)); `OXINFER_INKLING_PROFILE=1` times each
   kernel (CUDA events) and prints the table at exit.
 
 **Against the CPU path** (`examples/inkling2_cuda_check`: the same pseudo-random prompt on the
@@ -794,6 +797,135 @@ oxinfer's caches are f32 by default; with `--kv-cache f16` decoding at 32k is 10
 110.3 and 99.5 tok/s. At 32k of context llama.cpp's prefill drops to 40% of its 2048-token rate,
 oxinfer's to 55%. llama.cpp has no reader for the release's NVFP4 safetensors.
 
+### Threadripper 9970X and RTX 5080 (16 GB)
+
+Threadripper 9970X (32 cores / 64 threads, AVX-512 with VNNI, 125 GB; 32 threads, the default)
+and an RTX 5080 (16 GB, 2.0 of them held by the desktop: 14.2 GB free), Linux, shared with other
+sessions' builds and model jobs (load averages 11-44 during these runs), so only rows of the same
+round compare. oxinfer: `examples/inkling2_bench` (a warm-up pass, then the median of 3; `--cpu`
+for the CPU rows), "before" master `422ea32`, "after" this work, both `--release`; "f32" is the
+bench's own prompt pass (the f32 GEMM, which is `prefill_gemm=exact`), "fast"
+`OXINFER_PREFILL_GEMM=fast`: the int8 activations a prompt gets by default from the command line
+and the engine. llama.cpp: master `f4f6f2e` (2026-11-23) built here, `llama-bench -p 512,2048 -n
+128 -r 3`, `-t 32` on a build without CUDA for the CPU rows, `-ngl 99 -fa 1` on a CUDA build
+(13.4) for the GPU rows. Two rounds, each engine and build in turn; tok/s, round 1 / round 2:
+
+| CPU, checkpoint | engine | pp512 | pp2048 | tg128 |
+|---|---|---:|---:|---:|
+| ggml-org Q8_0 (27.8 GB) | llama.cpp | 115 / 116 | 109 / 108 | 10.0 / 9.4 |
+| | oxinfer before, f32 | 107 / 115 | 118 / 126 | 8.6 / 9.7 |
+| | oxinfer before, fast | 124 / 123 | 144 / 137 | |
+| | oxinfer after, f32 | 179 / 183 | 195 / 195 | 9.5 / 10.2 |
+| | **oxinfer after, fast** | **221 / 216** | **259 / 239** | |
+| unsloth UD-IQ3_XXS (11.7 GB) | oxinfer before, f32 | 79 / 81 | 95 / 94 | 11.3 / 12.5 |
+| | oxinfer before, fast | 84 / 85 | 102 / 104 | |
+| | oxinfer after, f32 | 107 / 110 | 132 / 130 | 12.8 / 13.4 |
+| | **oxinfer after, fast** | **237 / 244** | **267 / 259** | |
+
+(Decoding has one path: the tg128 of a build is on its f32 row. Nothing changed in Q8_0's decode
+path: its tg128 rows differ by what two rounds of one build differ by. Mainline llama.cpp does
+not load unsloth's root files, `check_tensor_dims: tensor 'blk.24.attn_q.weight' not found`, and
+the repository no longer has the `Mainline_Support/` copies.)
+
+| RTX 5080, checkpoint | engine | pp512 | pp2048 | tg128 |
+|---|---|---:|---:|---:|
+| unsloth UD-IQ3_XXS (11.4 GB of weights on the device) | oxinfer | 1695 / 1702 | 1865 / 1895 | 97.9 / 99.6 |
+| AtomicChat AD-IQ2_M (8.7 GB; 8.4 GB on the device) | llama.cpp | 2049 / 2051 | 1760 / 1747 | 81.5 / 82.0 |
+| | oxinfer before (every pass on the CPU) | 128 | 137 | 13.4 |
+| | **oxinfer after** | **1824 / 1846** | **2092 / 2066** | **104.2 / 103.7** |
+| ggml-org Q8_0 (27.3 GB of weights: does not fit) | llama.cpp, `-ngl 0 -b 512` | 233 | | 7.7 (tg64) |
+| | oxinfer (every pass on the CPU, fast) | 217 | 250 | 9.5 |
+
+**What changed.**
+
+- **A prompt chunk's temporaries are kept for the pass** (CPU, every `prefill_gemm`). A layer
+  application took about forty temporaries of megabytes (a chunk of 2048 tokens: 19 MB each, the
+  experts' gathered rows and outputs 151 MB) from the allocator and gave them back, 48 times a
+  pass, and the process spent its time in the system mapping them again: a pp512 + pp2048 run of
+  the int8 expert GEMM took 13 minutes of user time and 45 of system time, and with the outputs
+  of one grouped GEMM written once on one thread beforehand (so that its 32 threads no longer
+  touched fresh pages) that GEMM went from 55 to 22 ms. The pass now takes them from and gives
+  them back to `kernels::Scratch` (the buffers the Qwen-family forward already kept; those that
+  are added to are zero-filled across the pool, the others written whole), the int8 activations
+  and the f32 GEMM's packed tiles included. Same bits: the logits of the last 64 of 600 prompt
+  positions and of 16 greedy steps are byte-identical to master's on Q8_0 and UD-IQ3_XXS
+  (`inkling2_cuda_check --cpu --save --all --keep 64`, `cmp`; the final build, with the changes
+  below). The prompt columns of the f32 rows above are this change alone (Q8_0 1.6x,
+  UD-IQ3_XXS 1.35x).
+- **The experts' grouped GEMMs on the int8 VNNI GEMM** (x86-64 with AVX-512 VNNI, under `fast`;
+  aarch64 already had its own). Each expert's tokens are rounded to int8 in groups of 16 of their
+  own, a pool job is 32 rows of one expert over up to 512 of its tokens, a segment's padding rows
+  are skipped. Matrices with a factor as wide as their rows (unsloth's per-expert scales, NVFP4's
+  tensor-wide one: 20 of UD-IQ3_XXS's 24 layers have them on both expert matrices) take the int8
+  GEMM too, the factor multiplied into each row's sums as the decode kernels do; before, one such
+  matrix kept a whole grouped matmul on the f32 GEMM. With the first change in both builds (the
+  `ci` profile, medians of 3): Q8_0 pp512 189 -> 212 and pp2048 214 -> 246, UD-IQ3_XXS 117 -> 222
+  and 137 -> 255. Against the f32 prefill (the last 64 of 600 prompt positions): mean KL 2.8e-3
+  (Q8_0) and 2.6e-3 (UD-IQ3_XXS), the same top token at 64 / 64 and the same 17 greedy tokens;
+  with f32 experts and int8 dense matmuls, as before, 2.4e-3 and 3.0e-3 (63 / 64 on UD-IQ3_XXS).
+  Without the first change this GEMM was slower than the f32 one (Q8_0 pp512 53-60 against
+  104-115): its 32-row jobs write 128 bytes per token each, so the 32 threads wrote the same
+  fresh pages at once.
+- **NVFP4 blocks unpacked with AVX2.** NVFP4 was the one format of the x86-64 decode kernels
+  still on the scalar unpacker. UD-IQ3_XXS (NVFP4 down experts on 20 layers), tg64, two
+  alternated rounds: 12.4 / 11.7 -> 13.6 / 12.8 tok/s, the matmuls 67.9 / 67.8 -> 57.8 / 59.8 ms
+  a token; the same logits digest and tokens (the unit tests compare the unpacked values and the
+  rows with the portable kernel's bit for bit).
+- **Q2_0 on the CUDA engine.** The engine had no kernel for ggml's 2-bit Q2_0 (type 42), so
+  AD-IQ2_M, whose down experts are Q2_0 on 16 of 24 layers, ran every pass on the CPU, on any
+  card. It is now a kind of the engine's kernels like the others. Against the CPU path on the
+  RTX 5080 (300 tokens): AD-IQ2_M prefill over every position mean KL 2.2e-6 (6.4e-4 at the
+  worst), the same top token at 300 / 300, 32 decode steps against the CPU's f32 prefill KL
+  6.2e-10, 17 / 17 greedy tokens; UD-IQ3_XXS prefill KL 4.3e-11 (300 / 300), decode steps
+  4.2e-11, 17 / 17, as on the RTX PRO 6000.
+
+**A checkpoint that does not fit the card** keeps every pass on the CPU: the engine wants the
+weights, 0.5 GB of activations and 1 GB to spare in the device's free memory and declines
+otherwise (`OXINFER_GPU_PLAN_DEBUG=1`: `27.3 GB of weights and 0.5 GB of activations do not fit
+in 14.2 GB of free device memory`); nothing is streamed to the device and there is no error.
+Q8_0 then runs at the CPU table's speed (the row above, measured with the device present).
+llama.cpp fails to load it with `-ngl 99` and fails to create its context with 4 to 11 layers
+on the device (13 GB of compute buffers, with `-b 512` too); with `-ngl 0` it runs the prompt's
+matmuls on the GPU from host weights (pp512 233-248) and aborts on a 2048-token batch (out of
+device memory).
+
+**Where the time goes on the CPU now** (`INKLING2_BENCH_PROF=1`, per parallel region, the `ci`
+profile). A prompt, pp2048, fast: UD-IQ3_XXS 3.9 ms a token, of which the matmuls 1.6 (the
+experts' grouped GEMMs 1.2, the dense projections 0.5), attention 1.0, the mixes, gates and norms
+0.6 and 0.75 outside the timers (convolutions, clips, the caches' rows, copies); Q8_0 4.1 ms
+with the same split. A decoded token reads 3.1 GB of UD-IQ3_XXS and 5.3 GB of Q8_0, and the large
+matmuls stream at what the machine gives (67-68 GB/s measured with `membench`, see
+[performance.md](performance.md#x86-64-cpu-kernels-november-2026)):
+
+| ms a token (GB read, GB/s) | experts | dense projections | LM head | gates' float matmuls | step |
+|---|---:|---:|---:|---:|---:|
+| UD-IQ3_XXS | 23.1 (1.30, 56) | 22.7 (1.29, 57) | 4.6 (0.32, 69) | 9.3 (0.23, 25) | 80 |
+| Q8_0 | 48.6 (3.25, 67) | 23.3 (1.37, 59) | 7.0 (0.49, 70) | 10.0 (0.23, 23) | 110 |
+
+So decoding is bound by memory bandwidth here (5.3 GB at 68 GB/s is 78 ms), and level with
+llama.cpp's on Q8_0 (9.5 / 10.2 against 10.0 / 9.4 tok/s). What is not: the 96 message gates of
+a token, whose float matmuls (64 x 4608, then two of 2304 x 64) are 194 parallel regions of
+1.2 MB at a third of the bandwidth, on the 16-token f32 GEMM tiles with one token in them.
+
+**Where the time goes on the RTX 5080** (`OXINFER_INKLING_PROFILE=1`, UD-IQ3_XXS, CUDA events
+around each launch: 12.9 ms a token that way, 10.0 without): a decoded token is about 1290 kernel
+launches in one graph, the routed experts 23% of the kernel time (22-40 us a launch), the dense
+matvecs and the router 25% (6-16 us), the LM head 3.5%, and the rest in kernels of 4-17 us each:
+the mixes 12%, the gates 10%, the convolutions 8%, the norms 5.5%, the residual adds, cache
+stores, routing, vector clips and attention 2-3% each. No kernel stands out: the step is a chain
+of many short ones, as on Metal.
+
+**Measured and not kept** (this machine): the gates' two tanh per value across the pool for a
+decode step (no change: 10.1 / 9.6 against 10.4 / 9.4 ms of mixes and gates a token); transparent
+huge pages for the heap (`glibc.malloc.hugetlb=1`: tg64 13.5 against 12.5-13.1 tok/s on the
+weights, and pp512 28 against 68, pp2048 87 against 65 tok/s on the temporaries before they were
+kept); whole rows instead of 1024-column blocks in the int8 GEMM for the experts' short segments
+(no change, measured before the temporaries were kept); the
+softmax exponentials of a prompt's attention through `fast_exp` under `fast` (attention 1.0-1.1
+against 1.0-1.2 ms a token: the exponentials are not what it costs). The grouped int8 jobs' row
+ranges start where every token's outputs cross a cache line (a large `Vec` starts 16 bytes into
+one): 3-4% of the grouped GEMM over two rounds, kept.
+
 ## Speculative decoding
 
 A session goes back up to 64 positions (`Inkling2Session::truncate`: the convolutions read
@@ -1017,4 +1149,17 @@ virtualization layer). [ios/README.md](../ios/README.md) has the steps to try it
   share. The multi-token matvecs of the rest (2.2 ms more for 4 tokens than for 1) could shrink
   with kernels of their own (the decode library's reload each token's input per row pair).
 - A CUDA drafter (the DSpark / MTP block runs on the CPU there: no gain over plain decoding).
+- A checkpoint larger than the card's free memory on the GPU: it runs on the CPU alone
+  ([above](#threadripper-9970x-and-rtx-5080-16-gb): Q8_0 on 16 GB). The looped layers 6-17 are 36
+  of a step's 48 applications and half of the experts, so an engine that kept those layers on the
+  device and ran the others on the host would have three quarters of a step there; it was not
+  built (the stream and the block states would cross between host and device at each boundary,
+  and a session's caches would live on both sides).
+- On the x86-64 CPU: the message gates' float matmuls of a decode step (9-10 ms of an 80-110 ms
+  token: 194 parallel regions of 1.2 MB each on GEMM tiles of 16 tokens holding one; a one-token
+  kernel with the same summation order would want those matrices by columns), and a prompt's
+  attention (1.0 ms of 3.9 a token at pp2048, next to 1.6 for all the matmuls).
+- On CUDA: the 1290 launches of a decoded token were not fused or run as parallel branches of the
+  graph (measured only, on the RTX 5080: the routed experts and the dense matvecs are half of
+  the kernel time, kernels of 4-11 us the other half).
 - No GGUF of Small was tried (the same code reads its layout).

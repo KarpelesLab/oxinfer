@@ -3,6 +3,10 @@
 //! after a 1-token prompt (greedy), each after a warm-up pass of the same size, the median of `-r`
 //! runs.
 //!
+//! The prompt passes run as the library runs them outside a generation: on the CPU with the f32
+//! GEMM. `OXINFER_PREFILL_GEMM=fast` gives the rounding a prompt has from the command line and
+//! the engine (`prefill_gemm`'s default there: int8 activations).
+//!
 //! ```text
 //! inkling2_bench MODEL [-p 512,2048] [-n 128] [-r 3] [--kv f32|f16|q8] [--cpu] [--threads N] [--chunk N] [-v 2,4,8]
 //! ```
