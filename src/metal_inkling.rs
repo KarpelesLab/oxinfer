@@ -423,8 +423,11 @@ struct AttnP {
     kw: u32,
     tbase: u32,
     tmp: u32,
-    _p0b: u32,
-    _p1b: u32,
+    /// `ink_attv` with one split for every token: the merge's outputs (gated, with the sinks).
+    fin: u32,
+    sink: u32,
+    gate: u32,
+    out: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -2807,6 +2810,14 @@ impl InkMetal {
             tmp: tmp as u32,
             ..Default::default()
         };
+        let fin = t <= MAX_T && maxsplit == 1;
+        let ap = AttnP {
+            fin: fin as u32,
+            sink: b.sink as u32,
+            gate: b.gate as u32,
+            out: b.att as u32,
+            ..ap
+        };
         self.std(e, c, if t <= MAX_T { self.p.attv[fi] } else { self.p.attn[fi] });
         e.bytes(&ap, 2);
         e.buf(sd.k.0, 0, 3);
@@ -2879,13 +2890,15 @@ impl InkMetal {
             cmin: cmin as u32,
             ..Default::default()
         };
-        e.pipe(self.p.merge);
-        e.buf(c.a, 0, 0);
-        e.bytes(&mp, 1);
-        if !self.skip(SK_ATTN | SK_MERGE) {
-            e.dispatch((nh, t), 128);
+        if !fin {
+            e.pipe(self.p.merge);
+            e.buf(c.a, 0, 0);
+            e.bytes(&mp, 1);
+            if !self.skip(SK_ATTN | SK_MERGE) {
+                e.dispatch((nh, t), 128);
+            }
+            e.barrier();
         }
-        e.barrier();
         if !self.skip(SK_DENSE) {
             self.mv(e, c, &ld.o, b.att, b.ab, t, MvMode::Store);
         }

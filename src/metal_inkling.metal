@@ -340,7 +340,7 @@ kernel void ink_q(device float* a [[buffer(0)]], device const float* c [[buffer(
 // positions `max(first, pos + t + 1 - window)..pos + t` (`window` 0: all); key q is cache row
 // `q % cap` (`cap` 0: q).
 struct IAP { uint nh; uint nkv; uint hd; uint dr; uint pos; uint window; uint cap; uint extent; uint cmin; uint maxsplit;
-             float scale; uint q; uint r; uint part; uint rel; uint kw; uint tbase; uint tmp; uint _p1; uint _p2; };
+             float scale; uint q; uint r; uint part; uint rel; uint kw; uint tbase; uint tmp; uint fin; uint sink; uint gate; uint out; };
 inline void ink_range(constant IAP& p, uint ti, thread uint& lo, thread uint& hi) {
     uint pp = p.pos + ti;
     hi = pp + 1;
@@ -586,6 +586,23 @@ inline void ink_attv_body(device float* a, device const float* c, constant IAP& 
             float f = exp(smg[s2] - M);
             L += smg[8 + s2] * f;
             acc += so[(gg * 8 + s2) * HD + d] * f;
+        }
+        if (p.fin != 0) {
+            // (One split for every token of the pass: the merge's work here, as `ink_attn_merge`
+            // does it.)
+            uint hh = h0 + gg;
+            float sink = a[p.sink + (ulong)ti * p.nh + hh];
+            float M2 = max(sink, M);
+            float L2 = exp(sink - M2);
+            float acc2 = 0.f;
+            if (M != -INFINITY) {
+                L2 += L * exp(M - M2);
+                acc2 += acc * exp(M - M2);
+            }
+            ulong o = (ulong)ti * p.nh * HD + hh * HD + d;
+            float gt = a[p.gate + o];
+            a[p.out + o] = acc2 / L2 * (1.0f / (1.0f + exp(-gt)));
+            continue;
         }
         device float* pr = a + p.part + (((ulong)ti * p.nh + h0 + gg) * p.maxsplit + split) * (HD + 2);
         pr[d] = acc;
