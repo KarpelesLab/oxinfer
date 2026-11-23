@@ -787,7 +787,11 @@ in [performance.md](performance.md#inkling-2-mini-decoding-on-metal-november-202
 passes went from 11.4-11.6 ms on the 4-bit files to 10.0-10.4 (tg64: mlx-community 4bit 85.5 ->
 98.5 tok/s, UD-IQ3_XXS 82.1 -> 94.3, Q8_0 66.7 -> 73.6), mostly by an attention kernel with its
 lanes across a head's channels and by keeping the small kernels' loads together and their
-registers few; about 7 ms of a pass is now the weights' streaming and 3.5 the chain.
+registers few; about 7 ms of a pass is now the weights' streaming and 3.5 the chain. A third round
+chained greedy passes on the device (the host no longer between tokens) and folded 4 of a layer's
+stages into the kernels beside them, the same logits bit for bit: greedy decoding at 110.5 tok/s
+(mlx-community 4bit, 9.05 ms a token), 103.2 (UD-IQ3_XXS), 80.8 (Q8_0); with prompt lookup up to
+124.8 on chat.
 
 ### CUDA
 

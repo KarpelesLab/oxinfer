@@ -1871,6 +1871,127 @@ experts into the next layer's mix (a stage a layer, but a verification pass's to
 sum each other's expert slots), and the output projection and routed experts' down projection,
 the two matvecs furthest from the GPU's bandwidth.
 
+**Round 3 (November 2026): the host gap, and the stages beside the bandwidth kernels.** The rule
+of round 2 (decode KL against the float32 references within the noise of the previous build,
+measured with `--chunk 16`; top-1 agreement on the three references; coherent greedy text with
+`--no-system`). Every GPU kernel change of this round computes the logits of the build before it
+bit for bit (the logits digest of `INKLING2_BENCH_SUM` unchanged after each, the tokens of a
+64-token greedy run the same): the release's decode KL is the previous round's to four digits,
+5.716e-12 / 2.272e-11 / 7.911e-13 (24 + 16, 620 + 96, 357 + 128), top-1 16/16, 96/96 and 128/128.
+The one thing that rounds differently is the embedding norm of the chained greedy decoding
+(below, a sum over the threadgroup rather than the host's sequential sum): the 9 greedy replies
+of 160 tokens (3 prompts on mlx-community 4bit, UD-IQ3_XXS and Q8_0) are those of the previous
+round's build, byte for byte.
+
+Before / after (best of 4 interleaved runs of `inkling2_bench -n 64 -r 2 -v 1,4`, load 1.9-4.5;
+"host loop" is `tg64` as measured before, a `forward` and the host's argmax per token, "chained"
+is `--chain`, greedy decoding as the CLI now runs it):
+
+| Checkpoint | tg64 ms / tok/s before | host loop after | chained after | one-token pass ms | 4-token pass ms |
+|---|---:|---:|---:|---:|---:|
+| mlx-community 4bit | 10.13 / 98.7 | 9.61 / 104.1 | **9.05 / 110.5** | 9.95 -> 9.32 | 20.03 -> 19.86 |
+| unsloth UD-IQ3_XXS | 10.68 / 93.6 | 10.24 / 97.7 | **9.69 / 103.2** | 10.45 -> 9.91 | 22.42 -> 22.25 |
+| ggml-org Q8_0 | 13.47 / 74.2 | 12.94 / 77.3 | **12.38 / 80.8** | 13.29 -> 12.65 | 23.31 -> 23.05 |
+
+**Kept** (mlx-community 4bit; profile times are `OXINFER_INKLING_PROFILE` stage times, us a stage):
+
+- **Greedy decoding chained on the device** (`Inkling2Model::decode_greedy`, see
+  [Inkling-2 Mini on the GPU](inkling.md#on-the-gpu)). With `OXINFER_METAL_TRACE` a one-token
+  pass kept the GPU busy 9.8 of the 10.18 ms between tokens: 135-200 us from the first commit to
+  the GPU starting (it had gone idle), 60-90 us from completion to the host waking, and the host's
+  copy of 0.8 MB of logits, its argmax and the next embedding. A pass now ends with the argmax of
+  its capped logits into a token slot (the softcap kernel's threadgroups reduce to partials, one
+  threadgroup to the token: the host's rule, the first index of the largest) and the next pass
+  starts from that token's embedding row, dequantized on the device (MLX affine rows, bf16, any
+  GGUF type of the decode kernels) and normed; the host encodes and queues pass k + 1 while pass k
+  runs and only reads a token after each. 10.15 -> 9.60 ms a token. `generate::decode` takes it
+  for plain greedy sampling; prompt lookup takes it for its rounds without a draft (below).
+- **The convolutions in the kernels before them** (passes of one token): the experts' down
+  projections and the convolution after them in one kernel (`_dconv`: a SIMD-group per slot
+  computes `_gsum`'s rows, the slots are summed in order in threadgroup memory, then the
+  convolution per channel), and the attention's output projection and its convolution in one
+  (`ink_mvc_*`: a row per SIMD-group with the decode library's one-token sums, the convolution
+  by lane 0): two stages fewer a layer. 33.8 + 6.6 -> 34.3 us and 12.9 + 6.6 -> 14.7 us; 9.66 ->
+  9.39 ms a token (chained).
+- **Queries, keys and values in the attention kernel** (`ink_attf`, passes of up to 8 tokens):
+  each threadgroup scales and clips its query heads' queries and relative vectors as `ink_q`
+  did, and computes the keys and values of the pass's tokens in its split's range as `ink_kv`
+  did, with the same sums in the same order (a channel a thread, SIMD-group sums, then the head's
+  four in order), rounded as the cache holds them; the threadgroup whose split ends at its token
+  writes that token's row and rings. 11.8 + 6.1 -> 16.2 us a layer; 9.29 -> 9.18 ms a token,
+  4-token passes 20.10 -> 19.85 ms.
+- **The routing in the gate / up kernel** (`_rpair`, passes of one token): every SIMD-group runs
+  `ink_route`'s single-SIMD-group routing and takes the expert of its group's pick; one
+  threadgroup writes the picks for `_dconv`. 52.8 + 4.5 -> 53.7 us; 9.30 -> 9.02 ms a token.
+- **Prompt lookup on the chain**: a lookup round without a draft worth verifying runs chained
+  passes, committing and streaming each token as it comes (`RoundDecoder::step_emit`), until the
+  lookup finds a draft worth verifying; the pass already queued then still runs, and its token
+  starts the verification round (`generate::Chain::Last`), so no queued pass is thrown away.
+
+**Measured and dropped:**
+
+- **The experts' kernels' memory access.** Rows of 2 or 4 outputs a row group, the x chunk loaded
+  once for them: down projection 31.8 -> 31.1 / 35.6 us. The weight loads of 3 or 9 chunks issued
+  before their dot products: 52.1 / 31.8 -> 54.2 / 32.2 and 66 / 39.7 us. What bounds them: with
+  only the weight loads (the dot products replaced by an xor of the bits) the down projection
+  takes 27.9 us of its 32 and the gate / up 48 of 52; the x loads alone 10.8 and 17.4 (they
+  overlap the weights'); a flat stream of the same 8 experts' 11.9 MB 25.4 us (500 GB/s with
+  the stage's start). The expert kernels are within 10% of what this GPU streams in a stage of
+  that size: about 3.7 us of a stage's time goes to its start, ramp and tail (the LM head's 260 MB
+  stream at 550 GB/s).
+- **Dense one-token matvecs with several lanes a row** (`ink_mv1_*`, as the expert kernels: 4 to
+  32 lanes a row, 4 SIMD-groups a threadgroup): the attention's projections 28.8 -> 29.7-29.9 us,
+  the output projection 12.8 -> 12.4 (16 or 32 lanes), the gates' down projections 5.9 -> 7.1-27.
+  And the attention's projections read twice in a row: 28.9 then 23.7 us, so the system cache
+  keeps little of 11.7 MB, and prefetching the next stage's weights during small kernels was not
+  tried.
+- **The convolutions in the next mix** (the mix's one threadgroup a token computing its stream
+  from the convolution, writing the stream and the ring, the block state pushed from the mix's own
+  norm of x): mix 8.75 + convolution 6.41 -> 18.55 us, and the mix alone got slower with the code
+  in it (7.54 -> 8.75 us: registers); 10.17 -> 10.59 ms a token. The convolution belongs with the
+  kernels spread over the GPU before it (`_dconv`, `ink_mvc_*` above).
+- **The convolution's loads issued first** in `_dconv` and `ink_mvc_*` (the ring, the taps and the
+  stream loaded before the dot products): 34.1 -> 35.0 and 14.7 -> 16.5 us (registers held over
+  the main loop); 9.04 -> 9.23 ms a token.
+
+**Speculative decoding** (the CLI, 256 tokens, greedy, `--no-system`, one run each, the two builds
+interleaved, load 1.8-3.5; DSpark with unsloth's Q8_0 draft by path; "same": the output is the
+same build's plain one):
+
+| Checkpoint | prompt | plain | prompt lookup (default) | DSpark draft |
+|---|---|---:|---:|---:|
+| mlx-community 4bit | code | 98.8 -> **108.9** | 99.1 -> 108.1 (1.02 tok/forward, 19% of drafts) | 99.4 -> 106.7 (1.17, 67%) |
+| | chat | 99.0 -> **109.6** | 113.4 -> **124.8** (1.30, 85%) | 96.2 -> 102.2 (1.02, 26%; parts from plain) |
+| unsloth UD-IQ3_XXS | code | 94.3 -> **102.2** | 95.8 -> 101.7 (1.02, 29%) | 93.2 -> 96.5 (1.12, 54%) |
+| | chat | 94.4 -> **102.0** | 93.1 -> 100.7 (1.00, 0%) | 90.6 -> 95.1 (1.04, 35%) |
+| ggml-org Q8_0 | code | 74.4 -> **80.1** | 76.5 -> 79.5 (1.01, 15%) | 78.9 -> **83.2** (1.42, 58%) |
+| | chat | 74.7 -> **80.0** | 74.4 -> **81.9** (1.04, 89%) | 73.3 -> 76.6 (1.06, 41%) |
+
+Plain decoding gained 7-11%, prompt lookup 4-10%. Prompt lookup now verifies fewer drafts (its
+cost-aware rounds compare a draft's expected tokens with the time of the chained passes, which
+got cheaper than a verification pass by more than the drafts' worth): within 1% of plain decoding
+where drafts rarely hold, +14% on the chat prompt with the 4-bit file (124.8 tok/s, 1.30 tokens
+a forward). A verification pass of 4 tokens still costs about twice a one-token pass (19.9
+against 9.3 ms): its tokens touch about 27 of the 128 experts, 3.4 times the bytes of one
+token's 8, and the kernels fused this round take passes of one token (the attention's up to 8).
+The DSpark draft pays only on Q8_0 code (+4% over plain, 1.42 tokens a forward). As in round 2,
+the 4-bit chat output with DSpark parts from the plain one (a near tie between a verification
+pass's logits and a one-token pass's); all the other outputs are the plain ones.
+
+**What is left to 125 tok/s** (8 ms a token). A chained one-token pass is 9.0 ms (mlx-community
+4bit), all of it GPU time: 9.7 ms of stage time in the profile, of which about 6.9 ms in the
+bandwidth kernels (gate / up with the routing 53.5 us x 44, down with the convolution 34.1 x 44,
+the attention's projections 28.9 x 40 and 30.0 x 8, the output projection with its convolution
+14.7 x 48, the LM head 0.47 ms, the MXFP8 layers' experts 0.55 ms, the router 4.8 x 48, the
+gates' down projections 5.8 x 48) and 2.8 ms in the others (the attention with its queries and
+keys 16.4 x 48, the mixes 7.8 x 89, the gates' forget / gain 7.6 x 48 and norms 5.9 x 49). The
+bandwidth kernels stream at 430-500 GB/s against about 550 for a long stream; the stage's start
+and ramp (about 3.7 us) is a quarter of the short ones' time. Reaching 8 ms needs about 1 ms
+more: the message gates (three stages, 19 us, on 24 of the 48 layer applications: their norm
+could go into the kernels that read their output, the router and the experts for the MLP's gate),
+the kernels fused this round for passes of several tokens (verification would gain the same 2-3
+stages a layer), and the dense projections' and experts' kernels at the stream's floor.
+
 #### DGX Spark, CUDA (November 2026)
 
 On a DGX Spark (GB10, 121 GB shared between the CPU and the GPU) against llama.cpp's CUDA backend
