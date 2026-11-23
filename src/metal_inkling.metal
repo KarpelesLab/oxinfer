@@ -587,9 +587,9 @@ inline void ink_attv_body(device float* a, device const float* c, constant IAP& 
             L += smg[8 + s2] * f;
             acc += so[(gg * 8 + s2) * HD + d] * f;
         }
-        if (p.fin != 0) {
-            // (One split for every token of the pass: the merge's work here, as `ink_attn_merge`
-            // does it.)
+        if (p.fin != 0 && ns == 1) {
+            // (A token of one split: the merge's work here, `ink_attn_merge` leaves it out. Per
+            // token, so that it is done the same way whatever the pass's other tokens.)
             uint hh = h0 + gg;
             float sink = a[p.sink + (ulong)ti * p.nh + hh];
             float M2 = max(sink, M);
@@ -625,13 +625,15 @@ INK_ATTV(4, 4, 0) INK_ATTV(4, 4, 1) INK_ATTV(4, 4, 2)
 
 // ---- The splits of each (token, head) merged with the sink (one more logit, `sink`, of a zero
 // value), then gated: `out = softmax-weighted values * sigmoid(gate)` (grid: head, token).
-struct IACP { uint nh; uint hd; uint maxsplit; uint part; uint sink; uint gate; uint out; uint pos; uint window; uint cmin; uint _p1; uint _p2; };
+struct IACP { uint nh; uint hd; uint maxsplit; uint part; uint sink; uint gate; uint out; uint pos; uint window; uint cmin; uint fin; uint _p2; };
 kernel void ink_attn_merge(device float* a [[buffer(0)]], constant IACP& p [[buffer(1)]],
                            uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
     uint hh = tg.x, ti = tg.y, hd = p.hd;
     uint hi = p.pos + ti + 1;
     uint lo = p.window != 0 && hi > p.window ? hi - p.window : 0;
     uint ns = ink_nsplit(hi - lo, p.maxsplit, p.cmin);
+    // (`fin`: tokens of one split were merged by `ink_attv`.)
+    if (p.fin != 0 && ns == 1) return;
     device const float* ph = a + p.part + ((ulong)ti * p.nh + hh) * p.maxsplit * (hd + 2);
     float sink = a[p.sink + (ulong)ti * p.nh + hh];
     float M = sink;

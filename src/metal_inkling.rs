@@ -423,7 +423,7 @@ struct AttnP {
     kw: u32,
     tbase: u32,
     tmp: u32,
-    /// `ink_attv` with one split for every token: the merge's outputs (gated, with the sinks).
+    /// `ink_attv`: the merge's outputs (gated, with the sinks) of the tokens of one split.
     fin: u32,
     sink: u32,
     gate: u32,
@@ -442,7 +442,7 @@ struct MergeP {
     pos: u32,
     window: u32,
     cmin: u32,
-    _p1: u32,
+    fin: u32,
     _p2: u32,
 }
 #[repr(C)]
@@ -2810,7 +2810,8 @@ impl InkMetal {
             tmp: tmp as u32,
             ..Default::default()
         };
-        let fin = t <= MAX_T && maxsplit == 1;
+        // (`ink_attv` merges the tokens of one split itself; the merge kernel the others.)
+        let fin = t <= MAX_T;
         let ap = AttnP {
             fin: fin as u32,
             sink: b.sink as u32,
@@ -2888,9 +2889,10 @@ impl InkMetal {
             pos: pos as u32,
             window: ld.window as u32,
             cmin: cmin as u32,
+            fin: fin as u32,
             ..Default::default()
         };
-        if !fin {
+        if !fin || maxsplit > 1 {
             e.pipe(self.p.merge);
             e.buf(c.a, 0, 0);
             e.bytes(&mp, 1);
