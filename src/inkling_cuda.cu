@@ -1553,9 +1553,18 @@ __device__ __forceinline__ void dq16h(const u8* row, u32 b, u32 h, u32* q) {
     if constexpr (K == K_Q4_K) {
         const u8* B = row + 144 * (b >> 3);
         u32 sub = b & 7;
-        float sc, mn;
-        scale_min_k4(sub, B + 4, sc, mn);
-        float d1 = h2f(rd16(B)) * sc, m1 = h2f(rd16(B + 2)) * mn;
+        // d, dmin and the 12 scale bytes in one 16-byte load (scale_min_k4's values).
+        uint4 hd = *(const uint4*)B;
+        u32 sh8 = 8 * (sub & 3), sc, mn;
+        if (sub < 4) {
+            sc = (hd.y >> sh8) & 63;
+            mn = (hd.z >> sh8) & 63;
+        } else {
+            u32 c = hd.w >> sh8;
+            sc = (c & 15) | (((hd.y >> sh8) >> 6 & 3) << 4);
+            mn = ((c >> 4) & 15) | (((hd.z >> sh8) >> 6 & 3) << 4);
+        }
+        float d1 = h2f(hd.x & 0xffff) * (float)sc, m1 = h2f(hd.x >> 16) * (float)mn;
         u32 dd = pack_h2(d1, d1), mm = pack_h2(-m1, -m1);
         uint4 u = *(const uint4*)(B + 16 + 32 * (sub >> 1) + 16 * h);
         u32 ws[4] = {u.x, u.y, u.z, u.w};
@@ -1573,10 +1582,22 @@ __device__ __forceinline__ void dq16h(const u8* row, u32 b, u32 h, u32* q) {
         // Elements 16 h .. of the block take scale byte 8 n + 2 qq + h (the per-16 scales).
         float d = h2f(rd16(B + 208)) * (float)(signed char)B[192 + 8 * n + 2 * qq + h];
         u32 dd = pack_h2(d, d);
+        // 2-byte aligned blocks: 5 aligned words around each 16 bytes, funnel-shifted.
+        const u8* pl = B + 64 * n + 32 * (qq & 1) + 16 * h;
+        const u8* ph = B + 128 + 32 * n + 16 * h;
+        u32 fs = 8 * ((u32)(u64)pl & 2);
+        const u32* la = (const u32*)((u64)pl & ~(u64)3);
+        const u32* ha = (const u32*)((u64)ph & ~(u64)3);
+        u32 lw[5], hw[5];
+#pragma unroll
+        for (int i = 0; i < 5; i++) {
+            lw[i] = la[i];
+            hw[i] = ha[i];
+        }
 #pragma unroll
         for (int i = 0; i < 4; i++) {
-            u32 ul = rd32h(B + 64 * n + 32 * (qq & 1) + 16 * h + 4 * i) >> (4 * (qq >> 1));
-            u32 uh = rd32h(B + 128 + 32 * n + 16 * h + 4 * i) >> (2 * qq);
+            u32 ul = __funnelshift_r(lw[i], lw[i + 1], fs) >> (4 * (qq >> 1));
+            u32 uh = __funnelshift_r(hw[i], hw[i + 1], fs) >> (2 * qq);
             u32 v = (ul & 0x0f0f0f0fu) | ((uh & 0x03030303u) << 4);
             u32 lo, hi;
             bytes_h2(v, 0x64206420u, lo, hi); // 1024 + 32: values - 32
@@ -1597,21 +1618,41 @@ __device__ __forceinline__ void dq16h(const u8* row, u32 b, u32 h, u32* q) {
 // that still fills the GPU, `gemmh_tile` in `cuda.rs`); 8 warps, 2 along the rows and 4 along the
 // outputs. Two 128 x 128 blocks per SM (`__launch_bounds__(256, 2)`: Qwen3-8B Q4_K_M prompts
 // 7526 -> 7860 tok/s at 512 tokens on an RTX PRO 6000; three spilled, 5842).
-template <int K, int BM, int BN>
+template <int BM, int BN>
+struct GhSmem {
+    u16 A[2][BM * HLD];
+    u16 B[2][BN * HLD];
+};
+// The tiles' shared memory: static up to 128 x 128, dynamic past (over the 48 KB of static
+// shared memory; the launch gives `sizeof(GhSmem)` and the kernel's attribute allows it).
+template <int BM, int BN>
+__device__ __forceinline__ GhSmem<BM, BN>& gh_smem() {
+    if constexpr (sizeof(GhSmem<BM, BN>) > 48 * 1024) {
+        extern __shared__ __align__(16) u8 gh_dyn[];
+        return *(GhSmem<BM, BN>*)gh_dyn;
+    } else {
+        __shared__ __align__(16) GhSmem<BM, BN> sm;
+        return sm;
+    }
+}
+template <int K, int BM, int BN, int NTH = 256>
 __device__ __forceinline__ void gemmh_seg(const W& w, const GemmH& p, u32 m0, u32 n0, u32 kb0, u32 kb1, float* fix) {
-    constexpr int MT = BM / 32, NT = BN / 32; // 16-row and 8-column MMA tiles per warp
-    __shared__ __align__(16) u16 As[2][BM * HLD];
-    __shared__ __align__(16) u16 Bs[2][BN * HLD];
+    // NTH / 32 warps, 4 along the outputs; each warp RPW rows x BN / 4 outputs.
+    constexpr int WMW = NTH / 128, RPW = BM / WMW, RP = NTH / 4;
+    constexpr int MT = RPW / 16, NT = BN / 32; // 16-row and 8-column MMA tiles per warp
+    auto& sm = gh_smem<BM, BN>();
+    auto& As = sm.A;
+    auto& Bs = sm.B;
     u32 tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     // Loads: A, BM rows x 64 bytes per step, 16 bytes per thread and pass of 64 rows; B, row
     // tid / 2 (the first 2 BN threads), parts (tid % 2) * 4 .. + 3 of the step's block of 32.
     u32 ar = tid >> 2, ac = (tid & 3) * 8;
-    const u16* xa[BM / 64];
-    bool aok[BM / 64];
+    const u16* xa[BM / RP];
+    bool aok[BM / RP];
 #pragma unroll
-    for (int i = 0; i < BM / 64; i++) {
-        xa[i] = p.xh + (u64)min(m0 + ar + 64 * i, p.rows - 1) * p.xs + ac;
-        aok[i] = m0 + ar + 64 * i < p.rows;
+    for (int i = 0; i < BM / RP; i++) {
+        xa[i] = p.xh + (u64)min(m0 + ar + RP * i, p.rows - 1) * p.xs + ac;
+        aok[i] = m0 + ar + RP * i < p.rows;
     }
     u32 br = tid >> 1, bh = tid & 1;
     bool bthr = br < BN;
@@ -1620,7 +1661,7 @@ __device__ __forceinline__ void gemmh_seg(const W& w, const GemmH& p, u32 m0, u3
     const u8* wrow = w.q + (u64)min(wr, p.n_out - 1) * w.rb;
     auto load_a = [&](u32 b, u32 st) {
 #pragma unroll
-        for (int i = 0; i < BM / 64; i++) cp16(&As[st][(ar + 64 * i) * HLD + ac], xa[i] + 32 * b, aok[i]);
+        for (int i = 0; i < BM / RP; i++) cp16(&As[st][(ar + RP * i) * HLD + ac], xa[i] + 32 * b, aok[i]);
         asm volatile("cp.async.commit_group;");
     };
     u32 bq[8];
@@ -1665,7 +1706,7 @@ __device__ __forceinline__ void gemmh_seg(const W& w, const GemmH& p, u32 m0, u3
         for (int b = 0; b < NT; b++)
 #pragma unroll
             for (int c = 0; c < 4; c++) acc[a][b][c] = 0.f;
-    u32 wm = (warp >> 2) * (BM / 2), wn = (warp & 3) * (BN / 4);
+    u32 wm = (warp >> 2) * RPW, wn = (warp & 3) * (BN / 4);
     load_a(kb0, kb0 & 1);
     load_b(kb0);
     store_b(kb0 & 1);
@@ -1738,21 +1779,21 @@ __device__ __forceinline__ void gemmh_body(const W& w, const GemmH& p) {
 // a part of a tile that a block took from a later step on (only its first: the others start at
 // step 0) goes to `fix` (BM x BN floats per block), which `gemmhk_fix` adds in after, in the
 // blocks' order: the results do not depend on timing.
-__device__ __forceinline__ void hk_range(const GemmH& p, u32 g, u32 G, u64& k0, u64& k1) {
-    u64 tiles = (u64)((p.n_out + 127) / 128) * ((p.rows + 127) / 128), W = tiles * (p.n_in / 32);
+__device__ __forceinline__ void hk_range(const GemmH& p, u32 g, u32 G, u32 bm, u64& k0, u64& k1) {
+    u64 tiles = (u64)((p.n_out + 127) / 128) * ((p.rows + bm - 1) / bm), W = tiles * (p.n_in / 32);
     k0 = W * g / G;
     k1 = W * (g + 1) / G;
 }
-template <int K>
+template <int K, int BM, int NTH>
 __device__ __forceinline__ void gemmhk_body(const W& w, const GemmH& p, float* fix) {
-    u32 nb = p.n_in / 32, ntm = (p.rows + 127) / 128;
+    u32 nb = p.n_in / 32, ntm = (p.rows + BM - 1) / BM;
     u64 k0, k1;
-    hk_range(p, blockIdx.x, gridDim.x, k0, k1);
+    hk_range(p, blockIdx.x, gridDim.x, BM, k0, k1);
     while (k0 < k1) {
         u32 tile = (u32)(k0 / nb), kb0 = (u32)(k0 % nb);
         u32 kb1 = (u32)min((u64)nb, kb0 + (k1 - k0));
-        u32 m0 = (tile % ntm) * 128, n0 = (tile / ntm) * 128;
-        gemmh_seg<K, 128, 128>(w, p, m0, n0, kb0, kb1, kb0 ? fix + (u64)blockIdx.x * 128 * 128 : nullptr);
+        u32 m0 = (tile % ntm) * BM, n0 = (tile / ntm) * 128;
+        gemmh_seg<K, BM, 128, NTH>(w, p, m0, n0, kb0, kb1, kb0 ? fix + (u64)blockIdx.x * BM * 128 : nullptr);
         k0 += kb1 - kb0;
     }
 }
@@ -1923,7 +1964,8 @@ __device__ __forceinline__ void gemmi_any(const W& w, const GemmP& p) {
     extern "C" __global__ void __launch_bounds__(256, 2) gemmh_##K(W w, GemmH p) { gemmh_body<K, 128, 128>(w, p); }                 \
     extern "C" __global__ void __launch_bounds__(256, 3) gemmhm_##K(W w, GemmH p) { gemmh_body<K, 64, 128>(w, p); }                 \
     extern "C" __global__ void __launch_bounds__(256, 3) gemmhs_##K(W w, GemmH p) { gemmh_body<K, 64, 64>(w, p); }                 \
-    extern "C" __global__ void __launch_bounds__(256, 2) gemmhk_##K(W w, GemmH p, float* fix) { gemmhk_body<K>(w, p, fix); }    \
+    extern "C" __global__ void __launch_bounds__(256, 2) gemmhk_##K(W w, GemmH p, float* fix) { gemmhk_body<K, 128, 256>(w, p, fix); } \
+    extern "C" __global__ void __launch_bounds__(512, 1) gemmhk2_##K(W w, GemmH p, float* fix) { gemmhk_body<K, 256, 512>(w, p, fix); } \
     extern "C" __global__ void __launch_bounds__(256)                                                                                      \
         mvq_##K(W w, const u8* xq, const float2* xd, float* y, u32 n_in, u32 n_out, u32 ys, u32 mode) {                                  \
         mvq_body<K, false>(w, w, xq, xd, y, n_in, n_out, ys, mode);                                                                        \
@@ -1932,25 +1974,25 @@ __device__ __forceinline__ void gemmi_any(const W& w, const GemmP& p) {
         mvqp_##K(W w, W w2, const u8* xq, const float2* xd, float* y, u32 n_in, u32 n_out, u32 ys, u32 gelu) {                           \
         mvq_body<K, true>(w, w2, xq, xd, y, n_in, n_out, ys, gelu);                                                                        \
     }
-// The stream-K GEMM's second pass (grid (blocks of `gemmhk`, 16), `fix` as its): a block whose
-// share ends inside a tile it began adds, to a sixteenth of the tile (blockIdx.y), the parts of
-// it that the next blocks took, summed in their order.
-extern "C" __global__ void __launch_bounds__(256) gemmhk_fix(GemmH p, const float* fix) {
-    u32 g = blockIdx.x, G = gridDim.x, nb = p.n_in / 32, ntm = (p.rows + 127) / 128;
+// The stream-K GEMM's second pass (grid (blocks of `gemmhk`, bm / 8), `fix` as its, bm its
+// tile's rows): a block whose share ends inside a tile it began adds, to 8 rows of the tile
+// (blockIdx.y), the parts of it that the next blocks took, summed in their order.
+extern "C" __global__ void __launch_bounds__(256) gemmhk_fix(GemmH p, const float* fix, u32 bm) {
+    u32 g = blockIdx.x, G = gridDim.x, nb = p.n_in / 32, ntm = (p.rows + bm - 1) / bm;
     u64 k0, k1;
-    hk_range(p, g, G, k0, k1);
+    hk_range(p, g, G, bm, k0, k1);
     if (k1 <= k0 || k1 % nb == 0) return;
     u64 tile = (k1 - 1) / nb, end = (tile + 1) * nb;
     if (tile * nb < k0) return; // the block took this tile from a later step: not its owner
-    u32 m0 = (u32)(tile % ntm) * 128, n0 = (u32)(tile / ntm) * 128;
+    u32 m0 = (u32)(tile % ntm) * bm, n0 = (u32)(tile / ntm) * 128;
     u32 i = blockIdx.y * 1024 + 4 * threadIdx.x; // 4 outputs of a row
     float4 sum = make_float4(0.f, 0.f, 0.f, 0.f);
     for (u32 h = g + 1; h < G; h++) {
         u64 h0, h1;
-        hk_range(p, h, G, h0, h1);
+        hk_range(p, h, G, bm, h0, h1);
         if (h0 >= end) break;
         if (h1 <= h0) continue;
-        float4 f = *(const float4*)(fix + (u64)h * 128 * 128 + i);
+        float4 f = *(const float4*)(fix + (u64)h * bm * 128 + i);
         sum.x += f.x;
         sum.y += f.y;
         sum.z += f.z;

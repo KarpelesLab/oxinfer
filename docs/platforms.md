@@ -312,7 +312,18 @@ IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4. Three things run on the
   10440 tok/s at 512 tokens and 9011 -> 10099 at 2048, Llama-3.2-1B Q4_K_M 42667 -> 49734 and
   43800 -> 49713. Then (`parity_bench` / llama-bench `e6d624b`, 5 runs each, idle GPU): Qwen3-8B
   pp512 10490 / 15887, pp2048 10099 / 15402, tg128 220 / 252; Llama-3.2-1B 48674 / 76353,
-  48751 / 82510, tg128 1300 / 1062. RMSNorm, RoPE, the
+  48751 / 82510, tg128 1300 / 1062. The weights' unpacking was then most of the GEMM's time
+  (a build that skips it, `ggml_bench`: Q4_K 12288 x 4096 261 -> 160 us, Q6_K 355 -> 160). Q6_K
+  reads its 2-byte aligned blocks as aligned words funnel-shifted and Q4_K its header in one
+  16-byte load there too (Q6_K 355 -> 329 us, Q4_K 261 -> 247); and from 256 rows on the
+  stream-K GEMM takes 256 x 128 tiles (`gemmhk2_*`: 16 warps of 64 x 32 outputs, one 512-thread
+  block per SM, 60 KB of dynamic shared memory), so each weight value unpacked serves twice the
+  rows: Q4_K 12288 x 4096 240 -> 207 us, 4096 x 12288 257 -> 231, 4096 x 4096 90 -> 79; Q6_K
+  329 -> 222, 311 -> 214, 120 -> 84 (`OXINFER_CUDA_GEMM_256=0` keeps the 128-row tiles).
+  Prompts on an idle GPU (median of 5), 128-row / 256-row tiles: Qwen3-8B Q4_K_M 11242 / 12315
+  tok/s at 512 tokens and 10777 / 12043 at 2048, Llama-3.2-1B Q4_K_M 50230 / 56789 and 50713 /
+  55369; the first step within 0.005-0.0075 of the exact GEMM's log-probabilities and the
+  greedy tokens the same (`pf_check`, 1500 tokens, 32 greedy). RMSNorm, RoPE, the
   activations, the Gated DeltaNet convolution and delta rule (the state in registers across the
   step's tokens) over all tokens in one launch; attention with the decode kernel, 32 tokens per
   launch; the hidden states, the new keys and values and the recurrent states come back to the

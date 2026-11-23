@@ -52,23 +52,35 @@ fn gemmh_tile(k: &GgKernels, n_out: u32, rows: u32) -> (*mut c_void, u32, u32) {
     }
 }
 
-/// The stream-K grid of the fast GEMM ([`GgKernels::gemmhk`]) for `n_out` outputs over `rows`
-/// rows of `n_in`, or None when the tiles of [`gemmh_tile`] fill the GPU's blocks evenly
-/// enough: two blocks per SM, each taking an equal share of the 128 x 128 tiles' 32-wide steps.
-/// `OXINFER_CUDA_STREAM_K=0` never takes it, `=1` always.
-fn gemmh_stream_k(n_out: u32, rows: u32, n_in: u32) -> Option<u32> {
+/// Dynamic shared memory of `gemmhk2_K`: two stages of 256 + 128 rows of 40 halves.
+pub(crate) const GEMMHK2_SHMEM: u32 = 2 * (256 + 128) * 40 * 2;
+
+/// The stream-K launch of the fast GEMM ([`GgKernels::gemmhk`]) for `n_out` outputs over `rows`
+/// rows of `n_in`: (kernel, blocks, threads, tile rows, dynamic shared memory), or None when the
+/// tiles of [`gemmh_tile`] fill the GPU's blocks evenly enough. From 256 rows on, 256 x 128
+/// tiles on one 512-thread block per SM ([`GgKernels::gemmhk2`]); else 128 x 128 on two
+/// 256-thread blocks per SM. `OXINFER_CUDA_STREAM_K=0` never takes it, `=1` always;
+/// `OXINFER_CUDA_GEMM_256=0` keeps the 128-row tiles.
+fn gemmh_stream_k(k: &GgKernels, n_out: u32, rows: u32, n_in: u32) -> Option<(*mut c_void, u32, u32, u32, u32)> {
     static MODE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    static BIG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let mode = *MODE.get_or_init(|| std::env::var("OXINFER_CUDA_STREAM_K").ok().map(|v| v != "0"));
-    let g = 2 * SMS.load(Ordering::Relaxed);
-    let tiles = n_out.div_ceil(128) * rows.div_ceil(128);
+    let big = *BIG.get_or_init(|| std::env::var("OXINFER_CUDA_GEMM_256").map_or(true, |v| v != "0")) && rows >= 256;
+    let sms = SMS.load(Ordering::Relaxed);
+    let (f, g, threads, bm, shm) = if big {
+        (k.gemmhk2, sms, 512, 256, GEMMHK2_SHMEM)
+    } else {
+        (k.gemmhk, 2 * sms, 256, 128, 0)
+    };
+    let tiles = n_out.div_ceil(128) * rows.div_ceil(bm);
     let steps = tiles as u64 * (n_in / 32) as u64;
     let g = (g as u64).min(steps / 8).max(1) as u32;
     let even = tiles.is_multiple_of(g) || tiles >= 8 * g;
-    match mode {
-        Some(false) => None,
-        Some(true) => Some(g),
-        None => (!even).then_some(g),
-    }
+    let on = match mode {
+        Some(m) => m,
+        None => big || !even,
+    };
+    on.then_some((f, g, threads, bm, shm))
 }
 
 /// Floats of the stream-K GEMM's scratch: a 128 x 128 tile per block of its largest grid.
@@ -117,6 +129,7 @@ dlsym::library! {
             pub fn cuEventCreate(event: *mut *mut c_void, flags: u32) -> c_int;
             pub fn cuEventRecord(event: *mut c_void, stream: *mut c_void) -> c_int;
             pub fn cuEventSynchronize(event: *mut c_void) -> c_int;
+            pub fn cuFuncSetAttribute(f: *mut c_void, attrib: c_int, value: c_int) -> c_int;
             pub fn cuMemcpyDtoHAsync_v2(dst: *mut c_void, src: u64, bytes: usize, stream: *mut c_void) -> c_int;
             pub fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> c_int;
             pub fn cuLaunchKernel(
@@ -436,6 +449,10 @@ struct GgKernels {
     /// ([`gemmh_stream_k`]).
     pub(crate) gemmhk: *mut c_void,
     pub(crate) gemmhk_fix: *mut c_void,
+    /// `gemmhk2_K`: stream-K over 256 x 128 tiles (512 threads, one block per SM, the tiles'
+    /// [`GEMMHK2_SHMEM`] bytes of dynamic shared memory): half the weights' unpacking per
+    /// product of the 128-row tiles.
+    pub(crate) gemmhk2: *mut c_void,
     /// `mvq_K` / `mvqp_K`: the int8 matvec and gate / up pair (Q4_K, Q6_K, Q8_0; null for the
     /// other formats) over x rounded by `dq8_x`.
     pub(crate) mvq: *mut c_void,
@@ -969,6 +986,11 @@ impl CudaBackend {
 
     /// [`Self::launch`] with a three-dimensional grid.
     fn launch3(&self, f: *mut c_void, grid: (u32, u32, u32), block: u32, params: &mut [*mut c_void]) -> bool {
+        self.launch_shm(f, (grid.0, grid.1, grid.2), block, 0, params)
+    }
+
+    /// [`Self::launch3`] with `shmem` bytes of dynamic shared memory.
+    fn launch_shm(&self, f: *mut c_void, grid: (u32, u32, u32), block: u32, shmem: u32, params: &mut [*mut c_void]) -> bool {
         let rc = unsafe {
             self.cu.cuLaunchKernel(
                 f,
@@ -978,7 +1000,7 @@ impl CudaBackend {
                 block,
                 1,
                 1,
-                0,
+                shmem,
                 std::ptr::null_mut(),
                 params.as_mut_ptr(),
                 std::ptr::null_mut(),
@@ -1062,6 +1084,10 @@ impl CudaBackend {
                     gemmhs: get(format!("gemmhs_{id}"))?,
                     gemmhk: get(format!("gemmhk_{id}"))?,
                     gemmhk_fix: get("gemmhk_fix".to_string())?,
+                    gemmhk2: get(format!("gemmhk2_{id}")).filter(|&f| {
+                        // CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
+                        unsafe { self.cu.cuFuncSetAttribute(f, 8, GEMMHK2_SHMEM as c_int) == 0 }
+                    })?,
                     mvq: q8.then(|| get(format!("mvq_{id}"))).flatten().unwrap_or(std::ptr::null_mut()),
                     mvqp: q8.then(|| get(format!("mvqp_{id}"))).flatten().unwrap_or(std::ptr::null_mut()),
                     dq8_x: get("dq8_x".to_string())?,
@@ -3534,16 +3560,18 @@ mod tests {
                     }
                     // Stream-K, the tile split over blocks at a few points (and blocks with no
                     // steps).
-                    for g in [1u32, 3, 7, 40] {
-                        let mut fix = 0u64;
-                        assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut fix, g as usize * 128 * 128 * 4) }, 0);
-                        assert!(be.htod(dy, &y0));
-                        let mut a2 = [args[0], args[1], &fix as *const _ as *mut c_void];
-                        assert!(be.launch(k.gemmhk, (g, 1), 256, &mut a2));
-                        let mut a3 = [args[1], &fix as *const _ as *mut c_void];
-                        assert!(be.launch(k.gemmhk_fix, (g, 16), 256, &mut a3));
-                        check(&format!("stream-k gemm over {g} blocks"), 2e-3);
-                        unsafe { be.cu.cuMemFree_v2(fix) };
+                    for (f, threads, bm, shm) in [(k.gemmhk, 256, 128u32, 0), (k.gemmhk2, 512, 256, GEMMHK2_SHMEM)] {
+                        for g in [1u32, 3, 7, 40] {
+                            let mut fix = 0u64;
+                            assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut fix, (g * bm) as usize * 128 * 4) }, 0);
+                            assert!(be.htod(dy, &y0));
+                            let mut a2 = [args[0], args[1], &fix as *const _ as *mut c_void];
+                            assert!(be.launch_shm(f, (g, 1, 1), threads, shm, &mut a2));
+                            let mut a3 = [args[1], &fix as *const _ as *mut c_void, &bm as *const _ as *mut c_void];
+                            assert!(be.launch(k.gemmhk_fix, (g, bm / 8), 256, &mut a3));
+                            check(&format!("stream-k gemm, {bm}-row tiles over {g} blocks"), 2e-3);
+                            unsafe { be.cu.cuMemFree_v2(fix) };
+                        }
                     }
                     unsafe { be.cu.cuMemFree_v2(dxh) };
                 }
@@ -4111,21 +4139,27 @@ mod tests {
                     let g = 2 * SMS.load(Ordering::Relaxed);
                     let mut fix = 0u64;
                     assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut fix, g as usize * 128 * 128 * 4) }, 0);
-                    let tiles = || {
-                        let (f, bm, bn) = gemmh_tile(&k, no, t as u32);
-                        let mut a = [&w as *const _ as *mut c_void, &ph as *const _ as *mut c_void];
-                        assert!(be.launch(f, (no.div_ceil(bn), (t as u32).div_ceil(bm)), 256, &mut a));
-                    };
-                    let sk = || {
+                    let sk_with = |f: *mut c_void, g: u32, threads: u32, bm: u32, shm: u32| {
                         let mut a = [
                             &w as *const _ as *mut c_void,
                             &ph as *const _ as *mut c_void,
                             &fix as *const _ as *mut c_void,
                         ];
-                        assert!(be.launch(k.gemmhk, (g, 1), 256, &mut a));
-                        let mut a = [&ph as *const _ as *mut c_void, &fix as *const _ as *mut c_void];
-                        assert!(be.launch(k.gemmhk_fix, (g, 16), 256, &mut a));
+                        assert!(be.launch_shm(f, (g, 1, 1), threads, shm, &mut a));
+                        let mut a = [
+                            &ph as *const _ as *mut c_void,
+                            &fix as *const _ as *mut c_void,
+                            &bm as *const _ as *mut c_void,
+                        ];
+                        assert!(be.launch(k.gemmhk_fix, (g, bm / 8), 256, &mut a));
                     };
+                    let sk2 = || sk_with(k.gemmhk2, g / 2, 512, 256, GEMMHK2_SHMEM);
+                    let tiles = || {
+                        let (f, bm, bn) = gemmh_tile(&k, no, t as u32);
+                        let mut a = [&w as *const _ as *mut c_void, &ph as *const _ as *mut c_void];
+                        assert!(be.launch(f, (no.div_ceil(bn), (t as u32).div_ceil(bm)), 256, &mut a));
+                    };
+                    let sk = || sk_with(k.gemmhk, g, 256, 128, 0);
                     let mut ya = vec![0f32; t * n_out];
                     let mut yb = vec![0f32; t * n_out];
                     tiles();
@@ -4136,6 +4170,10 @@ mod tests {
                     assert!(be.dtoh(&mut yb, dy));
                     let scale = ya.iter().fold(0f32, |m, v| m.max(v.abs()));
                     let worst = ya.iter().zip(&yb).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+                    sk2();
+                    sync();
+                    assert!(be.dtoh(&mut yb, dy));
+                    let worst2 = ya.iter().zip(&yb).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
                     let timed = |f: &dyn Fn()| {
                         let mut best = f64::MAX;
                         for _ in 0..7 {
@@ -4149,15 +4187,18 @@ mod tests {
                         }
                         best
                     };
-                    let (a, b) = (timed(&tiles), timed(&sk));
+                    let (a, b, c) = (timed(&tiles), timed(&sk), timed(&sk2));
                     let fl = 2.0 * (t * n_out * n_in) as f64;
                     eprintln!(
-                        "{kind} {n_out} x {n_in}: fast gemm by tiles {:.0} us ({:.1} TFLOP/s), stream-k {:.0} us ({:.1}); differ by {:.1e} of {scale:.1e}",
+                        "{kind} {n_out} x {n_in}: fast gemm by tiles {:.0} us ({:.1} TFLOP/s), stream-k {:.0} us ({:.1}), 256-row stream-k {:.0} us ({:.1}); differ by {:.1e} / {:.1e} of {scale:.1e}",
                         a * 1e6,
                         fl / a / 1e12,
                         b * 1e6,
                         fl / b / 1e12,
-                        worst
+                        c * 1e6,
+                        fl / c / 1e12,
+                        worst,
+                        worst2
                     );
                     unsafe {
                         be.cu.cuMemFree_v2(dxh);

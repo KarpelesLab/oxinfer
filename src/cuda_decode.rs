@@ -2028,10 +2028,10 @@ impl CudaPlan<'_> {
                             ((n_in / 2).div_ceil(256).min(8), tt),
                             256,
                             &mut args![xa, n_in, xs, xh, flag],
-                        ) && if let Some(g) = super::gemmh_stream_k(n_out, tt, n_in) {
+                        ) && if let Some((f, g, threads, bm, shm)) = super::gemmh_stream_k(&k, n_out, tt, n_in) {
                             let fix = pf.fix;
-                            be.launch(k.gemmhk, (g, 1), 256, &mut args![w, p, fix])
-                                && be.launch(k.gemmhk_fix, (g, 16), 256, &mut args![p, fix])
+                            be.launch_shm(f, (g, 1, 1), threads, shm, &mut args![w, p, fix])
+                                && be.launch(k.gemmhk_fix, (g, bm / 8), 256, &mut args![p, fix, bm])
                         } else {
                             let (f, bm, bn) = super::gemmh_tile(&k, n_out, tt);
                             be.launch(f, (n_out.div_ceil(bn), tt.div_ceil(bm)), 256, &mut args![w, p])
