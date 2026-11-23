@@ -554,6 +554,14 @@ fn touch_pages(ptr: *const u8, bytes: usize) {
     });
 }
 
+/// [`touch_pages`] before an upload by an engine with driver bindings of its own (MiniMax-H3's
+/// blocks, copied from the mapped checkpoint): on a unified-memory device only.
+pub(crate) fn touch_before_upload(src: &[u8]) {
+    if integrated() && src.len() >= (1 << 20) {
+        touch_pages(src.as_ptr(), src.len());
+    }
+}
+
 /// [`touch_pages`] for memory about to be written by the driver: a float of every page is
 /// written back, so the page is this process's own (not the shared zero page of a fresh
 /// allocation).
