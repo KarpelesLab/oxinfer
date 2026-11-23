@@ -89,7 +89,7 @@ pub(crate) fn gemmh_fix_floats() -> usize {
 }
 
 /// Whether the device in use shares the system's memory ([`INTEGRATED`]).
-fn integrated() -> bool {
+pub(crate) fn integrated() -> bool {
     INTEGRATED.load(Ordering::Relaxed)
 }
 

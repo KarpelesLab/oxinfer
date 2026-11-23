@@ -395,6 +395,100 @@ __device__ __forceinline__ float2 rowdot2(const W& w, const u8* ra, const u8* rb
     return make_float2(warp_sum(a1), warp_sum(a2));
 }
 
+#ifdef LANE_BLOCKS
+// ---- `LANE_BLOCKS` (N, the rows that share a block of the input): the matvecs and the routed
+// experts with a lane taking whole blocks of 32 values, for devices whose matvecs are bound by
+// their loads and their arithmetic and not by the memory (the GB10 of a DGX Spark, measured in
+// docs/inkling.md). What a block's values share (its scale, a superblock's header) is then decoded
+// once per block, its bytes are loaded as whole words, and a block of the input is loaded once for
+// N rows. Rows are rarely a multiple of 32 blocks (2304 values are 72, 1152 are 36), so a warp
+// takes several row groups, each group starting its lanes `nb mod 32` blocks further round: over
+// `lb_groups(nb)` groups every lane walks the same number of blocks. The sums are taken in
+// another order than with a lane per 4 values.
+__device__ __forceinline__ u32 lb_groups(u32 nb) {
+    u32 e = nb & 31u;
+    return e ? 32u / (e & (0u - e)) : 1u;
+}
+
+// The kinds these kernels take: those that store values times a scale (and a minimum) per 16 or
+// 32 values (`dqi`, `dqs` below). The float kinds keep a lane per 4 values (measured: bf16 reads
+// at 227 GB/s that way and 112 with a lane per block).
+template <int K>
+__device__ __forceinline__ float4 dqi(const u8* row, u32 b, u32 j);
+template <int K>
+__device__ __forceinline__ float2 dqs(const u8* row, u32 b, u32 half);
+template <int K>
+__device__ __forceinline__ constexpr bool has_min();
+template <int K>
+__device__ __forceinline__ constexpr bool lb_ok() {
+    return K != K_F32 && K != K_BF16 && K != K_F16;
+}
+
+// acc[i] += rows[i] . x over this lane's blocks (lane `rot` takes block 0), for N rows of one
+// matrix (or expert, `s` its block scales) of `nb` blocks; `ri`: the rows' indices. The values
+// are summed against x unscaled, and each 16's sum scaled (plus its minimum times the sum of x).
+template <int K, int N>
+__device__ __forceinline__ void blockdots(const W& w, const u8* const* rows, const float* s, const u32* ri, const float* x, u32 nb, u32 lane, u32 rot,
+                                          float* acc) {
+    for (u32 b = (lane + 32u - rot) & 31u; b < nb; b += 32) {
+        float4 xv[8];
+#pragma unroll
+        for (int j = 0; j < 8; j++) xv[j] = *(const float4*)(x + 32 * b + 4 * j);
+        float sx[2] = {0.f, 0.f};
+        if constexpr (has_min<K>()) {
+#pragma unroll
+            for (int j = 0; j < 8; j++) sx[j >> 2] += (xv[j].x + xv[j].y) + (xv[j].z + xv[j].w);
+        }
+#pragma unroll
+        for (int i = 0; i < N; i++) {
+            float p = 0.f;
+#pragma unroll
+            for (int hf = 0; hf < 2; hf++) {
+                float q = 0.f;
+#pragma unroll
+                for (int j = 4 * hf; j < 4 * hf + 4; j++) {
+                    float4 v = dqi<K>(rows[i], b, j);
+                    q += v.x * xv[j].x + v.y * xv[j].y + v.z * xv[j].z + v.w * xv[j].w;
+                }
+                float2 sm = dqs<K>(rows[i], b, hf);
+                p += sm.x * q;
+                if constexpr (has_min<K>()) p += sm.y * sx[hf];
+            }
+            if constexpr (BLOCK_SCALED(K)) p *= s[(ri[i] / w.sr) * w.ncb + (32 * b) / w.sc];
+            acc[i] += p;
+        }
+    }
+}
+
+// The matvec of rows r0.. of `w` over x into y for one warp: `lb_groups` groups of LANE_BLOCKS rows.
+template <int K>
+__device__ __forceinline__ void mv_lanes(const W& w, const float* x, float* y, u32 n_in, u32 n_out, u32 mode, u32 r0, u32 lane) {
+    u32 nb = n_in / 32, G = lb_groups(nb), extra = nb & 31u;
+    for (u32 g = 0; g < G; g++) {
+        u32 rg = r0 + g * LANE_BLOCKS;
+        if (rg >= n_out) return;
+        const u8* rows[LANE_BLOCKS];
+        u32 ri[LANE_BLOCKS];
+        float acc[LANE_BLOCKS];
+#pragma unroll
+        for (int i = 0; i < LANE_BLOCKS; i++) {
+            ri[i] = min(rg + i, n_out - 1);
+            rows[i] = w.q + (u64)ri[i] * w.rb;
+            acc[i] = 0.f;
+        }
+        blockdots<K, LANE_BLOCKS>(w, rows, w.s, ri, x, nb, lane, (g * extra) & 31u, acc);
+#pragma unroll
+        for (int i = 0; i < LANE_BLOCKS; i++) {
+            float v = warp_sum(acc[i]) * w.f;
+            if (lane == 0 && rg + i < n_out) {
+                float* o = y + rg + i;
+                *o = mode ? *o + v : v;
+            }
+        }
+    }
+}
+#endif
+
 // y[tok][r] (= or +=) W[r] . x[tok]: 8 rows per 256-thread block, grid.y tokens.
 // `MV_ROWS` (N; the launch then takes N rows per warp of its block): a warp takes N consecutive rows and a
 // lane whole blocks of 32 values, so each block of `x` is loaded once for the N rows and what a
@@ -517,6 +611,13 @@ __device__ __forceinline__ void mv_body(const W& w, const float* x, float* y, u3
         }
     }
     return;
+#endif
+#ifdef LANE_BLOCKS
+    if constexpr (lb_ok<K>()) {
+        mv_lanes<K>(w, x + (u64)blockIdx.y * xs, y + (u64)blockIdx.y * ys, n_in, n_out, mode,
+                    (blockIdx.x * (blockDim.x >> 5) + warp) * lb_groups(n_in / 32) * LANE_BLOCKS, lane);
+        return;
+    }
 #endif
     u32 r = blockIdx.x * (blockDim.x >> 5) + warp;
     if (r >= n_out) return;
@@ -686,6 +787,13 @@ __device__ __forceinline__ void mvm_body(const MvJobs& p) {
         if (blockIdx.x >= p.j[i].b0) jb = i;
     const MvJob& J = p.j[jb];
     u32 warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+#ifdef LANE_BLOCKS
+    if constexpr (lb_ok<K>()) {
+        mv_lanes<K>(J.w, p.x + (u64)blockIdx.y * p.xs, J.y + (u64)blockIdx.y * J.ys, p.n_in, J.n_out, 0,
+                    ((blockIdx.x - J.b0) * 8 + warp) * lb_groups(p.n_in / 32) * LANE_BLOCKS, lane);
+        return;
+    }
+#endif
     u32 r = (blockIdx.x - J.b0) * 8 + warp;
     if (r >= J.n_out) return;
     const float* xr = p.x + (u64)blockIdx.y * p.xs;
@@ -712,13 +820,45 @@ template <int K>
 __device__ __forceinline__ void moe_gu_body(const W& w, const int* ids, const float* x, float* mid, u32 n_in, u32 mi, u32 k, u32 xs,
                                             u32 inter, float beta, float lbeta) {
     u32 warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    u32 jr = blockIdx.x * 8 + warp;
-    if (jr >= mi) return;
     u32 slot = blockIdx.y, tok = slot / k;
     u32 e = ids[slot];
     const u8* base = w.q + (u64)e * w.es;
     const float* s = w.s ? w.s + (u64)e * w.ss : w.s;
     float f = w.f * (w.ef ? w.ef[e] : 1.f);
+#ifdef LANE_BLOCKS
+    if constexpr (lb_ok<K>()) {
+        // A warp: `lb_groups` groups of LANE_BLOCKS / 2 gate / up pairs.
+        const int P = LANE_BLOCKS / 2 > 0 ? LANE_BLOCKS / 2 : 1;
+        u32 nb = n_in / 32, G = lb_groups(nb), extra = nb & 31u;
+        u32 j0 = (blockIdx.x * 8 + warp) * G * P;
+        const float* xr = x + (u64)tok * xs;
+        for (u32 g = 0; g < G; g++) {
+            u32 jg = j0 + g * P;
+            if (jg >= mi) return;
+            const u8* rows[2 * P];
+            u32 ri[2 * P];
+            float acc[2 * P];
+#pragma unroll
+            for (int i = 0; i < P; i++) {
+                u32 jr = min(jg + i, mi - 1);
+                ri[2 * i] = inter ? 2 * jr : jr;
+                ri[2 * i + 1] = inter ? 2 * jr + 1 : mi + jr;
+                rows[2 * i] = base + (u64)ri[2 * i] * w.rb;
+                rows[2 * i + 1] = base + (u64)ri[2 * i + 1] * w.rb;
+                acc[2 * i] = acc[2 * i + 1] = 0.f;
+            }
+            blockdots<K, 2 * P>(w, rows, s, ri, xr, nb, lane, (g * extra) & 31u, acc);
+#pragma unroll
+            for (int i = 0; i < P; i++) {
+                float gs = warp_sum(acc[2 * i]) * f, us = warp_sum(acc[2 * i + 1]) * f;
+                if (lane == 0 && jg + i < mi) mid[(u64)slot * mi + jg + i] = situ(gs, us, beta, lbeta);
+            }
+        }
+        return;
+    }
+#endif
+    u32 jr = blockIdx.x * 8 + warp;
+    if (jr >= mi) return;
     u32 rg = inter ? 2 * jr : jr, ru = inter ? 2 * jr + 1 : mi + jr;
     const float* xr = x + (u64)tok * xs;
     float2 gu = rowdot2<K>(w, base + (u64)rg * w.rb, base + (u64)ru * w.rb, s, rg, ru, xr, n_in / 32, lane);
@@ -729,10 +869,47 @@ __device__ __forceinline__ void moe_gu_body(const W& w, const int* ids, const fl
 // 8 warps take 2 rows, 4 warps per row each with every 4th expert, summed in a fixed order.
 template <int K>
 __device__ __forceinline__ void moe_dn_body(const W& w, const int* ids, const float* wts, const float* mid, float* y, u32 h, u32 mi, u32 k, u32 ys) {
-    __shared__ float part[8];
     u32 warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    u32 r = blockIdx.x * 2 + (warp >> 2), q = warp & 3;
     u32 tok = blockIdx.y;
+#ifdef LANE_BLOCKS
+    if constexpr (lb_ok<K>()) {
+        // A warp: LANE_BLOCKS rows over the token's k experts, each expert's lanes starting
+        // `nb mod 32` blocks further round (36 blocks and 8 experts: 9 blocks a lane and row).
+        u32 nb = mi / 32, extra = nb & 31u;
+        u32 r0 = (blockIdx.x * 8 + warp) * LANE_BLOCKS;
+        if (r0 >= h) return;
+        const u8* rows[LANE_BLOCKS];
+        u32 ri[LANE_BLOCKS];
+        float tot[LANE_BLOCKS];
+#pragma unroll
+        for (int i = 0; i < LANE_BLOCKS; i++) {
+            ri[i] = min(r0 + i, h - 1);
+            tot[i] = 0.f;
+        }
+        for (u32 sl = 0; sl < k; sl++) {
+            u32 slot = tok * k + sl, e = ids[slot];
+            const float* s = w.s ? w.s + (u64)e * w.ss : w.s;
+            float f = wts[slot] * w.f * (w.ef ? w.ef[e] : 1.f);
+            float acc[LANE_BLOCKS];
+#pragma unroll
+            for (int i = 0; i < LANE_BLOCKS; i++) {
+                rows[i] = w.q + (u64)e * w.es + (u64)ri[i] * w.rb;
+                acc[i] = 0.f;
+            }
+            blockdots<K, LANE_BLOCKS>(w, rows, s, ri, mid + (u64)slot * mi, nb, lane, (sl * extra) & 31u, acc);
+#pragma unroll
+            for (int i = 0; i < LANE_BLOCKS; i++) tot[i] += f * acc[i];
+        }
+#pragma unroll
+        for (int i = 0; i < LANE_BLOCKS; i++) {
+            float v = warp_sum(tot[i]);
+            if (lane == 0 && r0 + i < h) y[(u64)tok * ys + r0 + i] = v;
+        }
+        return;
+    }
+#endif
+    __shared__ float part[8];
+    u32 r = blockIdx.x * 2 + (warp >> 2), q = warp & 3;
     float acc = 0.f;
     if (r < h) {
         for (u32 sl = q; sl < k; sl += 4) {

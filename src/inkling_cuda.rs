@@ -618,6 +618,8 @@ pub(super) struct Engine {
     stream: F,
     funcs: HashMap<&'static str, F>,
     kfuncs: HashMap<u32, [F; 9]>,
+    /// [`default_lanes`]: the kernels the module was built with.
+    lanes: usize,
     /// `OXINFER_INKLING_PROFILE=1`: time per kernel (calls, seconds), launches synchronized.
     prof: Option<Mutex<HashMap<usize, (u64, f64)>>>,
     /// Two buffers of a pass's `[tokens, hidden]` for the prefill convolutions (0: none yet).
@@ -690,8 +692,11 @@ impl Drop for Engine {
 }
 
 /// The module for the weight kinds `kinds`.
-pub(super) fn kernel_source(kinds: &[u32]) -> String {
+pub(super) fn kernel_source(kinds: &[u32], lanes: usize) -> String {
     let mut s = crate::cuda::ggml_tables_src();
+    if lanes > 0 {
+        s.push_str(&format!("#define LANE_BLOCKS {lanes}\n"));
+    }
     for k in kinds {
         s.push_str(&format!("#define HAS_{k} 1\n"));
     }
@@ -700,9 +705,34 @@ pub(super) fn kernel_source(kinds: &[u32]) -> String {
 }
 
 /// The module for `src` ([`CudaBackend::cached_module`]: compiled once per machine).
-fn cached_module(be: &CudaBackend, src: &str, kinds: &[u32]) -> Result<F> {
+fn cached_module(be: &CudaBackend, src: &str, kinds: &[u32], lanes: usize) -> Result<F> {
     let ks: Vec<String> = kinds.iter().map(|k| k.to_string()).collect();
-    be.cached_module(src, &format!("inkling-{{sm}}-{}", ks.join("-")), "inkling.cu")
+    let lb = if lanes > 0 { format!("-lb{lanes}") } else { String::new() };
+    be.cached_module(src, &format!("inkling-{{sm}}-{}{lb}", ks.join("-")), "inkling.cu")
+}
+
+/// The rows that share a block of the input in the matvec and expert kernels whose lanes take
+/// whole blocks of 32 values (`LANE_BLOCKS` in `inkling_cuda.cu`), or 0 for the kernels with a
+/// lane per 4 values. On by default on unified-memory devices (measured on a DGX Spark's GB10,
+/// where the matvecs are bound by their loads and arithmetic: docs/inkling.md);
+/// `OXINFER_INKLING_LANES=N` sets it (2 or 4; 0: off).
+fn default_lanes() -> usize {
+    static ENV: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| std::env::var("OXINFER_INKLING_LANES").ok().and_then(|v| v.parse().ok()));
+    match env {
+        Some(n) if n == 0 || n == 2 || n == 4 => n,
+        _ if crate::cuda::integrated() => 2,
+        _ => 0,
+    }
+}
+
+/// `lb_groups` of `inkling_cuda.cu`: the row groups a warp takes so that its lanes, each group
+/// starting `nb mod 32` blocks further round, walk the same number of blocks of rows of `nb`.
+fn lb_groups(nb: usize) -> usize {
+    match nb % 32 {
+        0 => 1,
+        e => 32 >> e.trailing_zeros(),
+    }
 }
 
 const FIXED: [&str; 40] = [
@@ -897,6 +927,11 @@ impl Engine {
 
     /// The kernels for weight kinds `kinds` (sorted) on `be`'s context, and nothing else.
     fn bare(be: &CudaBackend, kinds: &[u32]) -> Result<Engine> {
+        Self::bare_with(be, kinds, default_lanes())
+    }
+
+    /// [`Self::bare`] with the kernels of `lanes` ([`default_lanes`]).
+    fn bare_with(be: &CudaBackend, kinds: &[u32], lanes: usize) -> Result<Engine> {
         let x: Arc<Cux> = {
             use dlsym::Bindings;
             // SAFETY: libcuda is already initialised by the backend.
@@ -905,7 +940,7 @@ impl Engine {
             )
         };
         let ctx = be.context().ok_or_else(|| anyhow!("no context"))?;
-        let module = cached_module(be, &kernel_source(kinds), kinds)?;
+        let module = cached_module(be, &kernel_source(kinds, lanes), kinds, lanes)?;
         let get = |name: &str| -> Result<F> {
             let cn = CString::new(name)?;
             let mut f = std::ptr::null_mut();
@@ -948,6 +983,7 @@ impl Engine {
             stream,
             funcs,
             kfuncs,
+            lanes,
             prof: std::env::var("OXINFER_INKLING_PROFILE")
                 .is_ok_and(|v| v != "0")
                 .then(|| Mutex::new(HashMap::new())),
@@ -1454,6 +1490,20 @@ impl Engine {
         format!("{f:#x}")
     }
 
+    /// [`default_lanes`] for a weight kind: the float kinds keep the kernels with a lane per 4
+    /// values (`lb_ok` in `inkling_cuda.cu`).
+    fn lanes_of(&self, kind: u32) -> usize {
+        if matches!(kind, 0 | 1 | 30) { 0 } else { self.lanes }
+    }
+
+    /// The rows a warp of the matvec kernels takes of a matrix of `kind` over `n_in` values.
+    fn warp_rows(&self, kind: u32, n_in: usize) -> usize {
+        match self.lanes_of(kind) {
+            0 => 1,
+            n => lb_groups(n_in / 32) * n,
+        }
+    }
+
     fn copy(&self, dst: u64, src: u64, floats: usize) {
         unsafe { self.x.cuMemcpyDtoDAsync_v2(dst, src, floats * 4, self.stream) };
     }
@@ -1465,7 +1515,7 @@ impl Engine {
         if t <= MV_T {
             self.go(
                 w.mv,
-                (ceil(w.n_out, 4), t as u32, 1),
+                (ceil(w.n_out, 4 * self.warp_rows(w.kind, w.n_in)), t as u32, 1),
                 128,
                 &mut args![w.a, x, y, n_in, n_out, xs as u32, ys as u32, add as u32],
             );
@@ -1547,7 +1597,7 @@ impl Engine {
                     b0: blocks,
                     _p: 0,
                 };
-                blocks += ceil(w.n_out, 8);
+                blocks += ceil(w.n_out, 8 * self.warp_rows(w.kind, w.n_in));
                 p.n += 1;
                 i += 1;
             }
@@ -1860,7 +1910,7 @@ impl Engine {
         // The router in f32 on the matvec kernel whatever t (the choice of experts is sensitive).
         self.go(
             router.mv,
-            (ceil(ne, 4), t as u32, 1),
+            (ceil(ne, 4 * self.warp_rows(router.kind, h)), t as u32, 1),
             128,
             &mut args![router.a, x, ar.logits, h as u32, ne as u32, h as u32, ne as u32, 0u32],
         );
@@ -1871,9 +1921,19 @@ impl Engine {
             &mut args![ar.logits, bias, ar.ids, ar.wts, ne as u32, k as u32, self.route_scale, t as u32],
         );
         if t <= MV_T {
+            // (With `lanes`: a warp takes `lb_groups` groups of lanes / 2 gate / up pairs, and
+            // lanes rows of the down projection.)
+            let gu_rows = match self.lanes_of(gu.kind) {
+                0 => 8,
+                n => 8 * lb_groups(h / 32) * (n / 2),
+            };
+            let dn_rows = match self.lanes_of(dn.kind) {
+                0 => 2,
+                n => 8 * n,
+            };
             self.go(
                 gu.gu,
-                (ceil(mi, 8), (t * k) as u32, 1),
+                (ceil(mi, gu_rows), (t * k) as u32, 1),
                 256,
                 &mut args![
                     gu.a,
@@ -1891,7 +1951,7 @@ impl Engine {
             );
             self.go(
                 dn.dn,
-                (ceil(h, 2), t as u32, 1),
+                (ceil(h, dn_rows), t as u32, 1),
                 256,
                 &mut args![dn.a, ar.ids, ar.wts, ar.mid, y, h as u32, mi as u32, k as u32, h as u32],
             );
@@ -2642,44 +2702,40 @@ mod tests {
     }
 
     /// Every weight kind through the matvec (1 and 3 rows) and the GEMM (70 rows, partial tiles),
-    /// against the product of the CPU's dequantized rows in f64.
+    /// against the product of the CPU's dequantized rows in f64; the matvecs with a lane per 4
+    /// values and with a lane per block (`LANE_BLOCKS`: rows of 16, 72 and 36 or 40 blocks, so
+    /// one, four and eight or four row groups a warp).
     #[test]
     fn matvecs_and_gemms_match_definition() {
         let Some(be) = backend() else { return };
-        let e = Engine::bare(be, &KINDS).unwrap();
-        let (n_out, n_in) = (70usize, 512usize);
-        let mut seed = 7u64;
-        let mut mats: Vec<(String, Lin<'static>)> = Vec::new();
-        for &k in &KINDS {
-            let lin = match k {
-                K_OQ8 => Lin::q8(crate::quant::quantize_f32(&rnds(n_out * n_in, &mut seed, 0.5), n_out, n_in)),
-                K_OQ4 => Lin::q4(crate::quant::quantize_q4_f32(&rnds(n_out * n_in, &mut seed, 0.5), n_out, n_in)),
-                K_F8 => {
-                    let mut q = PageVec::<u8>::zeroed(n_out * n_in);
-                    for b in q.iter_mut() {
-                        let v = (rnd(&mut seed) * 128.0 + 128.0) as u8;
-                        *b = if v & 0x7f == 0x7f { 0 } else { v };
-                    }
-                    let mut s = PageVec::<f32>::zeroed(n_out * n_in / 32);
-                    for v in s.iter_mut() {
-                        *v = (2f32).powi(-((rnd(&mut seed).abs() * 8.0) as i32) - 4);
-                    }
-                    Lin::gguf(GgufMatrix::fp8(q.into(), s.into(), n_out, n_in, (1, 32)).unwrap())
-                }
-                k => gguf(GgmlType::from_id(k).unwrap(), n_out, n_in, &mut seed),
-            };
-            mats.push((format!("kind {k}"), lin));
+        for (lanes, n_in) in [(0usize, 512usize), (2, 512), (2, 2304), (4, 1152)] {
+            matvecs_and_gemms(be, lanes, n_in);
         }
-        let mut scaled = gguf(GgmlType::Q4_K, n_out, n_in, &mut seed);
+    }
+
+    fn matvecs_and_gemms(be: &CudaBackend, lanes: usize, n_in: usize) {
+        let e = Engine::bare_with(be, &KINDS, lanes).unwrap();
+        let n_out = 70usize;
+        let mut seed = 7u64;
+        let mut mats: Vec<(String, Lin<'static>, usize)> = Vec::new();
+        for &k in &KINDS {
+            // (Whole blocks: the formats with blocks of 256 take 1280 values for 1152.)
+            let n_in = GgmlType::from_id(k).map_or(n_in, |g| n_in.next_multiple_of(g.block_size()));
+            mats.push((format!("kind {k}, lanes {lanes}"), random_lin(k, n_out, n_in, &mut seed), n_in));
+        }
+        let n_k = n_in.next_multiple_of(256);
+        let mut scaled = gguf(GgmlType::Q4_K, n_out, n_k, &mut seed);
         if let Weight::Gguf(m) = &mut scaled.w {
             m.set_factor(0.37).unwrap();
         }
-        mats.push(("Q4_K with a factor".into(), scaled));
+        mats.push((format!("Q4_K with a factor, lanes {lanes}"), scaled, n_k));
         let kf = e.kfuncs.clone();
-        for (name, lin) in &mats {
+        for (name, lin, n_in) in &mats {
+            let n_in = *n_in;
             let dw = e.up_lins(&[lin], n_out, n_in, &kf).unwrap();
             let w = dense(lin, n_out, n_in);
-            for t in [1usize, 3, 70] {
+            // (The GEMMs do not depend on the lanes: once.)
+            for t in if lanes == 0 { vec![1usize, 3, 70] } else { vec![1, 3] } {
                 let x = rnds(t * n_in, &mut seed, 1.0);
                 let y0 = rnds(t * n_out, &mut seed, 1.0);
                 let (px, py) = (e.upf(&x).unwrap(), e.upf(&y0).unwrap());
@@ -2703,11 +2759,32 @@ mod tests {
                         let got = y[tok * n_out + r] as f64;
                         assert!(
                             (got - s).abs() <= tol * mag + 1e-9,
-                            "{name}, {t} rows, row {r} token {tok}: {got} against {s} (magnitude {mag})"
+                            "{name}, {n_in} values, {t} rows, row {r} token {tok}: {got} against {s} (magnitude {mag})"
                         );
                     }
                 }
             }
+        }
+    }
+
+    /// A random matrix of weight kind `k` (the kinds of [`KINDS`]).
+    fn random_lin(k: u32, n_out: usize, n_in: usize, seed: &mut u64) -> Lin<'static> {
+        match k {
+            K_OQ8 => Lin::q8(crate::quant::quantize_f32(&rnds(n_out * n_in, seed, 0.5), n_out, n_in)),
+            K_OQ4 => Lin::q4(crate::quant::quantize_q4_f32(&rnds(n_out * n_in, seed, 0.5), n_out, n_in)),
+            K_F8 => {
+                let mut q = PageVec::<u8>::zeroed(n_out * n_in);
+                for b in q.iter_mut() {
+                    let v = (rnd(seed) * 128.0 + 128.0) as u8;
+                    *b = if v & 0x7f == 0x7f { 0 } else { v };
+                }
+                let mut s = PageVec::<f32>::zeroed(n_out * n_in / 32);
+                for v in s.iter_mut() {
+                    *v = (2f32).powi(-((rnd(seed).abs() * 8.0) as i32) - 4);
+                }
+                Lin::gguf(GgufMatrix::fp8(q.into(), s.into(), n_out, n_in, (1, 32)).unwrap())
+            }
+            k => gguf(GgmlType::from_id(k).unwrap(), n_out, n_in, seed),
         }
     }
 
@@ -2720,8 +2797,16 @@ mod tests {
     #[test]
     fn moe_matches_definition() {
         let Some(be) = backend() else { return };
-        let mut e = Engine::bare(be, &[0, 8, 12]).unwrap();
-        let (h, mi, ne, k) = (256usize, 256usize, 16usize, 4usize);
+        // (A lane per block: rows of 8 and 40 blocks, so four row groups a warp of the gate / up
+        // kernel and four experts starting 8 blocks apart in the down kernel, and the reverse.)
+        for (lanes, h, mi) in [(0usize, 256usize, 256usize), (2, 256, 1280), (4, 1280, 256)] {
+            moe_matches(be, lanes, h, mi);
+        }
+    }
+
+    fn moe_matches(be: &CudaBackend, lanes: usize, h: usize, mi: usize) {
+        let mut e = Engine::bare_with(be, &[0, 8, 12], lanes).unwrap();
+        let (ne, k) = (16usize, 4usize);
         (e.h, e.mi, e.ne, e.k_top, e.route_scale, e.beta, e.lbeta) = (h, mi, ne, k, 2.5, 0.8, 1.5);
         let mut seed = 11u64;
         let tmax = 64;
@@ -2800,7 +2885,7 @@ mod tests {
                         let got = y[tok * h + r] as f64;
                         assert!(
                             (got - yr[r]).abs() <= tol * mag[r] + 1e-5,
-                            "interleaved {inter}, {t} tokens, token {tok} row {r}: {got} against {}",
+                            "lanes {lanes}, interleaved {inter}, {t} tokens, token {tok} row {r}: {got} against {}",
                             yr[r]
                         );
                     }
