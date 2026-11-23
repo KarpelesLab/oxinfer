@@ -490,6 +490,12 @@ pub struct Graph<'a> {
     /// The strengths of the LoRA updates ([`Op::LoraUp`], [`Experts::lora`]), read before every
     /// step.
     pub strengths: Vec<crate::lora::Strength>,
+    /// Greedy chains ([`DecodePlan::greedy`]): the token embedding table the input row is read
+    /// from (`n_input` columns) and the factor it is multiplied by, as the host computes the
+    /// input (`Table::row`, then `* scale`).
+    pub embed: Option<(&'a crate::model::Table<'a>, f32)>,
+    /// The table of the second input ([`Graph::input2`]), when it is a token's row.
+    pub embed2: Option<&'a crate::model::Table<'a>>,
 }
 
 /// The weight streamer as a decode plan sees it (see [`Graph::units`]).
@@ -592,6 +598,8 @@ impl<'a> Graph<'a> {
             units: Vec::new(),
             gate: None,
             strengths: Vec::new(),
+            embed: None,
+            embed2: None,
         }
     }
 
@@ -800,6 +808,26 @@ pub struct Step<'s, 'c> {
     pub states_kept: bool,
 }
 
+/// Greedy decoding chained on the device ([`DecodePlan::greedy`]).
+pub struct Greedy<'s, 'c> {
+    /// Tokens already in the caches (the position of the first pass).
+    pub pos: usize,
+    /// The token of the first pass.
+    pub first: u32,
+    /// Passes at most.
+    pub max: usize,
+    /// The RoPE rows of a position (as [`Step::rope_cs`] for one token).
+    pub rope_cs: &'s dyn Fn(usize) -> Vec<f32>,
+    /// The host KV caches (as [`Step::kv`]): the kept passes' keys and values are appended.
+    pub kv: &'s mut [&'c mut LayerCache],
+    /// The recurrent states (as [`Step::states`]): left as the kept passes leave them.
+    pub states: &'s mut [&'c mut [f32]],
+    /// As [`Step::states_kept`].
+    pub states_kept: bool,
+    /// Gets each kept pass's argmax in order and says what to do next.
+    pub on: &'s mut dyn FnMut(u32) -> crate::generate::Chain,
+}
+
 /// A compiled graph.
 pub trait DecodePlan: Send + Sync {
     /// Runs one step. Returns false (with the host caches unchanged) when the device failed.
@@ -815,6 +843,16 @@ pub trait DecodePlan: Send + Sync {
     /// cannot.
     fn replay_recurrent(&self, _slot: &mut Slot, _states: &mut [&mut [f32]], _keep: usize) -> bool {
         false
+    }
+    /// Greedy decoding with the passes chained on the device (one-token plans of graphs with
+    /// [`Graph::embed`]): pass k runs the token chosen by pass k - 1 (the first index of the
+    /// largest logit, as `crate::sampler::argmax`; `first` for pass 0), its input row looked up on
+    /// the device, so that pass k + 1 is queued before the host has read pass k's token. `on`
+    /// gets each kept pass's token ([`crate::generate::Chain`]); a pass queued past a stop is
+    /// undone (its keys and values are not appended, the recurrent states are those before it).
+    /// The passes kept, or None (nothing run, nothing changed) when the plan cannot.
+    fn greedy(&self, _slot: &mut Slot, _g: Greedy) -> Option<usize> {
+        None
     }
 }
 

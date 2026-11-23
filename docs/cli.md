@@ -39,6 +39,7 @@ Useful flags:
 | `--models` | list the tested models with what this machine can run and an estimated decoding speed (see [What runs on this machine](#what-runs-on-this-machine)) and exit |
 | `--device D` | `auto` (default: the first GPU backend that starts, Metal or CUDA before Vulkan, else the CPU), `cpu`, `metal`, `cuda`, `vulkan`; a device asked for by name that is missing or cannot start is an error, not a fallback |
 | `--gpu-decode on\|off` | generate a whole token per GPU submission (default `on` where supported; see [Decoding on the GPU](performance.md#decoding-on-the-gpu)); engine / speaker option `gpu_decode` |
+| `--gpu-chain on\|off` | greedy decoding chained on the device where tokens decode whole on the GPU: the argmax and the next token's embedding on the GPU, the next pass queued before the host reads a token (default `on`; the same tokens; see [Greedy decoding chained on the device](performance.md#greedy-decoding-chained-on-the-device-november-2026)); engine option `gpu_chain`, `OXINFER_GPU_CHAIN=0` |
 | `--prefill-chunk N` | tokens per prefill chunk (default 256 on the CPU, 1024 when a GPU backend is active) |
 | `--profile` | per-operation timing and bandwidth breakdown |
 | `--dump-logits FILE` | write the logits for the last prompt token (for reference checks) |

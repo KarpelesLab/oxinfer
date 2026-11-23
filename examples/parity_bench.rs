@@ -3,7 +3,8 @@
 //! counts it (raw text cut from `tools/bench/corpus.txt`), and plain decoding of G tokens after
 //! a short prompt, best and median of R repetitions:
 //! `cargo run --release --example parity_bench -- MODEL [pp=512,2048] [tg=128] [reps=3] [key=value ...]`
-//! (other options are `EngineOptions` keys, e.g. `device=cpu`, `lookup=0`, `draft=none`).
+//! (other options are `EngineOptions` keys, e.g. `device=cpu`, `lookup=0`, `draft=none`;
+//! `chain_ab=1` measures decoding with the greedy chain off and on, run by run alternated).
 
 use oxinfer::engine::{Engine, EngineOptions, Flow};
 
@@ -14,6 +15,7 @@ fn main() -> anyhow::Result<()> {
         .expect("usage: parity_bench MODEL [pp=..] [tg=N] [reps=N] [key=value ...]");
     let mut opts = EngineOptions::default();
     let (mut pps, mut tg, mut reps) = (vec![512usize, 2048], 128usize, 3usize);
+    let mut chain_ab = false;
     for kv in args {
         let (k, v) = kv.split_once('=').expect("options are key=value");
         match k {
@@ -26,6 +28,7 @@ fn main() -> anyhow::Result<()> {
             }
             "tg" => tg = v.parse()?,
             "reps" => reps = v.parse()?,
+            "chain_ab" => chain_ab = v == "1",
             _ => opts.set(k, v)?,
         }
     }
@@ -87,7 +90,22 @@ fn main() -> anyhow::Result<()> {
         }
         println!("pp{n} ({toks} tok): {}", stat(v));
     }
-    if tg > 0 {
+    if tg > 0 && chain_ab {
+        let p = text_of(&e, 16)?;
+        let (mut off, mut on) = (Vec::new(), Vec::new());
+        let mut g = 0;
+        for _ in 0..reps {
+            for chain in [false, true] {
+                oxinfer::gpu::set_decode_chain(Some(chain));
+                let (_, _, n, r) = run(&mut e, &p, tg)?;
+                g = n;
+                if chain { on.push(r) } else { off.push(r) }
+            }
+        }
+        oxinfer::gpu::set_decode_chain(None);
+        println!("tg{tg} ({g} tok) chain off: {}", stat(off));
+        println!("tg{tg} ({g} tok) chain on: {}", stat(on));
+    } else if tg > 0 {
         let p = text_of(&e, 16)?;
         let mut v = Vec::new();
         let mut g = 0;

@@ -1361,6 +1361,7 @@ impl<'a> QwenModel<'a> {
         g.input = x;
         g.hidden = hidden;
         g.n_hidden = h;
+        g.embed = Some((&self.embed, 1.0));
         g.rope_halves = vec![self.inv_freq.len()];
         // Interventions: parameter buffers, then a hook op per residual point that has one.
         let (hot, cold) = (
@@ -1720,6 +1721,68 @@ impl<'a> QwenModel<'a> {
             }
             p
         })
+    }
+
+    /// Greedy decoding chained on the device ([`crate::generate::TextLm::decode_greedy`]): the
+    /// GPU decode plan's passes, each starting from the argmax of the one before
+    /// ([`crate::gpu::decode::DecodePlan::greedy`]), exactly the tokens and caches of one-token
+    /// steps with the host's argmax. None (the session untouched) where plain steps would not
+    /// run on the plan's one-token path (interventions, captures, explicit positions, streamed
+    /// weights, Qwen4-Exp, `OXINFER_GPU_DECODE_CHECK`) or with the chain off
+    /// ([`crate::gpu::set_decode_chain`]).
+    pub fn decode_greedy(
+        &self,
+        sess: &mut QwenSession,
+        first: u32,
+        max: usize,
+        on: &mut dyn FnMut(u32) -> crate::generate::Chain,
+    ) -> Option<usize> {
+        if !crate::gpu::decode_chain_enabled()
+            || !self.gpu_decode_on()
+            || crate::gpu::decode::check()
+            || self.exp.is_some()
+            || self.stream.is_some()
+            || sess.iv.active()
+            || !sess.capture.is_empty()
+            || sess.positions.is_some()
+            || sess.deepstack.is_some()
+        {
+            return None;
+        }
+        let plan = self.gpu_plan()?;
+        let spans = sess.spans.clone();
+        let rope = |pos: usize| {
+            let (mut cs, sin) = self.rope_cs(&spans, pos, 1);
+            cs.extend_from_slice(&sin);
+            cs
+        };
+        let kept = sess.gpu_states_kept;
+        let mut kv: Vec<&mut LayerCache> = sess.kv.iter_mut().flatten().collect();
+        let mut states: Vec<&mut [f32]> = sess
+            .gdn
+            .iter_mut()
+            .flatten()
+            .flat_map(|g| [&mut g.s[..], &mut g.conv[..]])
+            .collect();
+        let _timer = prof::start(Cat::Matmul);
+        let n = plan.greedy(
+            &mut sess.gpu,
+            crate::gpu::decode::Greedy {
+                pos: sess.pos,
+                first,
+                max,
+                rope_cs: &rope,
+                kv: &mut kv,
+                states: &mut states,
+                states_kept: kept,
+                on,
+            },
+        )?;
+        sess.gpu_states_kept = true;
+        sess.gpu_rec = None;
+        sess.rec_span = None;
+        sess.pos += n;
+        Some(n)
     }
 
     /// Runs token `tok` through the GPU decode plan: the final-normed hidden state and, if

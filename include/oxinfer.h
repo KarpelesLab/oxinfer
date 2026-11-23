@@ -164,6 +164,10 @@ int64_t oxi_cache_remove(const char *cache_dir, const char *name);
  *                        mmproj*.gguf beside a GGUF model; none: no image input
  *   gpu_decode=0|1       generate a whole token per GPU submission where supported (Metal:
  *                        Llama 3, Qwen3, Qwen3.5/3.8 dense; default 1; process-wide)
+ *   gpu_chain=0|1        greedy decoding chained on the device where tokens decode whole on
+ *                        the GPU: the argmax and the next token's embedding computed there, the
+ *                        next pass queued before the host reads a token (the same tokens;
+ *                        default 1; process-wide)
  *   stream_gpu=0|1|auto  streamed models decode on the GPU too (process-wide; default: dense
  *                        models on the GPU, MoE models measure both on their first tokens and
  *                        keep the faster): resident layers stay wrapped, the others are wrapped

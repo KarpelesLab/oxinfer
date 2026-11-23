@@ -255,6 +255,12 @@ pub struct EngineOptions {
     /// was. Process-wide, applied on load; None leaves the current setting (default
     /// on; [`crate::gpu::set_decode`]). Key `gpu_decode`.
     pub gpu_decode: Option<bool>,
+    /// Greedy decoding chained on the device where a model decodes whole tokens on the GPU: the
+    /// argmax and the next token's embedding row computed there, so the next pass is queued
+    /// before the host reads a token (plain greedy replies, the plain rounds of prompt lookup and
+    /// DSpark; the same tokens as the host's argmax). Process-wide, applied on load; None leaves
+    /// the current setting (default on; [`crate::gpu::set_decode_chain`]). Key `gpu_chain`.
+    pub gpu_chain: Option<bool>,
     /// Streamed models (see [`EngineOptions::stream`]) decode on the GPU too: the resident layers
     /// stay wrapped, the others are wrapped per pass as they arrive and released after (Metal;
     /// Qwen3.5 / 3.8 dense and MoE, Gemma 4 / Gemma 3 dense and 26B-A4B; DeepSeek V4.1 as one
@@ -484,6 +490,7 @@ impl Default for EngineOptions {
             cpu_repack: None,
             cpu_q8k: None,
             gpu_decode: None,
+            gpu_chain: None,
             stream_gpu: None,
             decision_from: None,
             loras: Vec::new(),
@@ -572,6 +579,7 @@ impl EngineOptions {
         "cpu_repack",
         "cpu_q8k",
         "gpu_decode",
+        "gpu_chain",
         "stream_gpu",
         "decision_from",
         "lora",
@@ -712,6 +720,7 @@ impl EngineOptions {
                 }
             }
             "gpu_decode" => self.gpu_decode = Some(parse_bool(key, value)?),
+            "gpu_chain" => self.gpu_chain = Some(parse_bool(key, value)?),
             "stream_gpu" => {
                 self.stream_gpu = match value.trim() {
                     "" | "auto" => None,
@@ -1586,6 +1595,9 @@ impl Engine {
         }
         if let Some(on) = opts.gpu_decode {
             crate::gpu::set_decode(Some(on));
+        }
+        if let Some(on) = opts.gpu_chain {
+            crate::gpu::set_decode_chain(Some(on));
         }
         if let Some(on) = opts.stream_gpu {
             crate::gpu::set_stream_decode(Some(on));

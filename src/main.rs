@@ -512,6 +512,9 @@ fn usage() -> ! {
          \x20 --gpu-decode M       on (default) | off: generate a whole token per GPU submission\n\
          \x20                      (Metal; Llama 3, Orpheus, Qwen3, Qwen3.5 / 3.8 dense; CUDA: also\n\
          \x20                      Inkling-2, whose prefill then runs whole on the GPU too)\n\
+         \x20 --gpu-chain M        on (default) | off: greedy decoding chained on the device (the argmax and\n\
+         \x20                      the next token's embedding on the GPU, the next pass queued before the\n\
+         \x20                      host reads a token; the same tokens)\n\
          \x20 --dump-logits FILE   write last-prompt-token logits (f32 LE) and exit\n\
          \n\
          ANEMLL Core ML models (a meta.yaml folder; macOS 15 / iOS 18, Apple Neural Engine):\n\
@@ -1017,6 +1020,15 @@ fn parse_args() -> Result<Args> {
                     "off" | "0" | "false" => Some(false),
                     "auto" => None,
                     _ => bail!("--stream-gpu expects on|off|auto, got {v}"),
+                });
+            }
+            "--gpu-chain" => {
+                let v = val()?;
+                oxinfer::gpu::set_decode_chain(match v.as_str() {
+                    "on" | "1" | "true" => Some(true),
+                    "off" | "0" | "false" => Some(false),
+                    "auto" => None,
+                    _ => bail!("--gpu-chain expects on|off, got {v}"),
                 });
             }
             "--gpu-decode" => {

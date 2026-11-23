@@ -2076,7 +2076,7 @@ impl<'a> Inkling2Model<'a> {
         max: usize,
         on: &mut dyn FnMut(u32) -> crate::generate::Chain,
     ) -> Option<usize> {
-        if sess.iv.active() || sess.dev_off || crate::gpu::decode::check() {
+        if sess.iv.active() || sess.dev_off || crate::gpu::decode::check() || !crate::gpu::decode_chain_enabled() {
             return None;
         }
         let d = self.device()?;
@@ -2100,7 +2100,7 @@ impl<'a> Inkling2Model<'a> {
         feats: &mut Vec<f32>,
         on: &mut dyn FnMut(u32) -> crate::generate::Chain,
     ) -> Option<usize> {
-        if sess.iv.active() || sess.dev_off || crate::gpu::decode::check() {
+        if sess.iv.active() || sess.dev_off || crate::gpu::decode::check() || !crate::gpu::decode_chain_enabled() {
             return None;
         }
         let d = self.device()?;

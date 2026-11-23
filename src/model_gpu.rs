@@ -100,6 +100,8 @@ impl<'a> Model<'a> {
         g.input = x;
         g.hidden = hidden;
         g.n_hidden = h;
+        g.embed = Some((&self.embed, (h as f32).sqrt()));
+        g.embed2 = self.ple.as_ref().map(|p| &p.embed);
         g.rope_halves = vec![self.inv_freq_sliding.len(), self.inv_freq_full.len()];
         // Interventions (`crate::intervene`): parameter buffers and the hooked residual points.
         let (hot, cold) = (
@@ -742,6 +744,54 @@ impl<'a> Model<'a> {
             }
         }
         Some((hidden, logits))
+    }
+
+    /// Greedy decoding chained on the device ([`crate::generate::TextLm::decode_greedy`]; see
+    /// `QwenModel::decode_greedy`): exactly the tokens and caches of one-token GPU steps with the
+    /// host's argmax. None (the session untouched) where plain steps would not run on the plan's
+    /// one-token path, or with the chain off ([`crate::gpu::set_decode_chain`]).
+    pub fn decode_greedy(
+        &self,
+        sess: &mut Session,
+        first: u32,
+        max: usize,
+        on: &mut dyn FnMut(u32) -> crate::generate::Chain,
+    ) -> Option<usize> {
+        if !crate::gpu::decode_chain_enabled()
+            || !self.gpu_decode_on()
+            || crate::gpu::decode::check()
+            || self.stream.is_some()
+            || sess.iv.active()
+        {
+            return None;
+        }
+        let plan = self.gpu_plan()?;
+        let rope = |pos: usize| {
+            let mut cs = Vec::new();
+            for f in [&self.inv_freq_sliding, &self.inv_freq_full] {
+                let (c, s) = crate::kernels::rope_tables(&[pos], f);
+                cs.extend_from_slice(&c);
+                cs.extend_from_slice(&s);
+            }
+            cs
+        };
+        let mut kv: Vec<&mut LayerCache> = sess.caches.iter_mut().flatten().collect();
+        let _timer = crate::prof::start(crate::prof::Cat::Matmul);
+        let n = plan.greedy(
+            &mut sess.gpu,
+            crate::gpu::decode::Greedy {
+                pos: sess.pos,
+                first,
+                max,
+                rope_cs: &rope,
+                kv: &mut kv,
+                states: &mut [],
+                states_kept: false,
+                on,
+            },
+        )?;
+        sess.pos += n;
+        Some(n)
     }
 
     /// Runs token `tok` through the GPU decode plan: the final-normed hidden state and, if

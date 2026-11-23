@@ -1399,29 +1399,33 @@ kernel void dec_attn_combine(device const float* part [[buffer(0)]], device floa
 
 // ---- Gated DeltaNet ------------------------------------------------------------------------------
 // Causal depthwise conv (kernel kc) with SiLU, one thread per channel; the state [kc-1][dim] holds
-// the earlier inputs (oldest first) and shifts in this one.
+// the earlier inputs (oldest first) and shifts in this one. The state is read from `si` and
+// written to `st` (the same buffer but in a greedy chain's passes, which alternate between two
+// copies of the recurrent states, see `MetalPlan::greedy`).
 struct GC { uint dim; uint kc; };
-inline void gdn_conv_body(device const float* x, device float* out, device float* st, device const float* w, constant GC& p, uint ch) {
+inline void gdn_conv_body(device const float* x, device float* out, device const float* si, device float* st, device const float* w,
+                          constant GC& p, uint ch) {
     uint kc = p.kc;
     float xv = x[ch];
     float s = 0.f;
-    for (uint j = 0; j + 1 < kc; j++) s += w[ch * kc + j] * st[j * p.dim + ch];
+    for (uint j = 0; j + 1 < kc; j++) s += w[ch * kc + j] * si[j * p.dim + ch];
     s += w[ch * kc + kc - 1] * xv;
     out[ch] = s / (1.0f + exp(-s));
-    for (uint j = 0; j + 2 < kc; j++) st[j * p.dim + ch] = st[(j + 1) * p.dim + ch];
+    for (uint j = 0; j + 2 < kc; j++) st[j * p.dim + ch] = si[(j + 1) * p.dim + ch];
     st[(kc - 2) * p.dim + ch] = xv;
 }
 kernel void dec_gdn_conv(device const float* x [[buffer(0)]], device float* out [[buffer(1)]], device float* st [[buffer(2)]],
-                         device const float* w [[buffer(3)]], constant GC& p [[buffer(4)]], uint ch [[thread_position_in_grid]]) {
+                         device const float* w [[buffer(3)]], constant GC& p [[buffer(4)]], device const float* si [[buffer(5)]],
+                         uint ch [[thread_position_in_grid]]) {
     if (ch >= p.dim) return;
-    gdn_conv_body(x, out, st, w, p, ch);
+    gdn_conv_body(x, out, si, st, w, p, ch);
 }
 // ts: tokens, input and output strides.
 kernel void dec_gdn_conv_t(device const float* x [[buffer(0)]], device float* out [[buffer(1)]], device float* st [[buffer(2)]],
                            device const float* w [[buffer(3)]], constant GC& p [[buffer(4)]], constant uint4& ts [[buffer(5)]],
                            uint ch [[thread_position_in_grid]]) {
     if (ch >= p.dim) return;
-    for (uint t = 0; t < ts.x; t++) gdn_conv_body(x + (ulong)t * ts.y, out + (ulong)t * ts.z, st, w, p, ch);
+    for (uint t = 0; t < ts.x; t++) gdn_conv_body(x + (ulong)t * ts.y, out + (ulong)t * ts.z, st, st, w, p, ch);
 }
 
 // The gated delta rule for one token, one threadgroup per value head: thread (part, j) keeps rows
@@ -1439,7 +1443,7 @@ inline float tg_sum(float v, uint n, uint tid, uint sg, uint lane, threadgroup f
     return t;
 }
 inline void gdn_rule_body(device const float* c, device const float* z, device const float* b, device const float* a, device float* out,
-                          device float* state, device const float* cst, constant GR& p, uint hv, uint tid, uint sg, uint lane,
+                          device const float* si, device float* state, device const float* cst, constant GR& p, uint hv, uint tid, uint sg, uint lane,
                           threadgroup float* qs, threadgroup float* ks, threadgroup float* red, threadgroup float* red2) {
     // cst: decay_coef[nv], dt_bias[nv], norm_w[hdv]
     uint hdk = p.hdk, hdv = p.hdv, np = hdk / 32;
@@ -1458,11 +1462,13 @@ inline void gdn_rule_body(device const float* c, device const float* z, device c
     float ga = a[hv] + cst[p.nv + hv];
     float sp = ga > 20.f ? ga : log(1.0f + exp(ga));
     float decay = exp(cst[hv] * sp);
-    device float* S = state + (ulong)hv * hdk * hdv + part * 32 * hdv + j;
+    ulong so = (ulong)hv * hdk * hdv + part * 32 * hdv + j;
+    device const float* Si = si + so;
+    device float* S = state + so;
     float s[32];
     float kv = 0.f;
     for (uint d = 0; d < 32; d++) {
-        s[d] = S[d * hdv] * decay;
+        s[d] = Si[d * hdv] * decay;
         kv += s[d] * (ks[part * 32 + d] * kinv);
     }
     red[part * hdv + j] = kv;
@@ -1490,11 +1496,11 @@ inline void gdn_rule_body(device const float* c, device const float* z, device c
 }
 kernel void dec_gdn_rule(device const float* c [[buffer(0)]], device const float* z [[buffer(1)]], device const float* b [[buffer(2)]],
                          device const float* a [[buffer(3)]], device float* out [[buffer(4)]], device float* state [[buffer(5)]],
-                         device const float* cst [[buffer(6)]], constant GR& p [[buffer(7)]],
+                         device const float* cst [[buffer(6)]], constant GR& p [[buffer(7)]], device const float* si [[buffer(8)]],
                          uint hv [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float qs[256], ks[256], red[1024], red2[32];
-    gdn_rule_body(c, z, b, a, out, state, cst, p, hv, tid, sg, lane, qs, ks, red, red2);
+    gdn_rule_body(c, z, b, a, out, si, state, cst, p, hv, tid, sg, lane, qs, ks, red, red2);
 }
 // ts: tokens, strides of c, of z / b / a (one projection buffer) and of out; the tokens run in
 // order, each exactly as the single-token kernel.
@@ -1506,7 +1512,7 @@ kernel void dec_gdn_rule_t(device const float* c [[buffer(0)]], device const flo
     threadgroup float qs[256], ks[256], red[1024], red2[32];
     for (uint t = 0; t < ts.x; t++) {
         ulong pp = (ulong)t * ts.z;
-        gdn_rule_body(c + (ulong)t * ts.y, z + pp, b + pp, a + pp, out + (ulong)t * ts.w, state, cst, p, hv, tid, sg, lane, qs, ks, red, red2);
+        gdn_rule_body(c + (ulong)t * ts.y, z + pp, b + pp, a + pp, out + (ulong)t * ts.w, state, state, cst, p, hv, tid, sg, lane, qs, ks, red, red2);
         threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     }
 }
@@ -2337,4 +2343,243 @@ kernel void mk_argmax(device const float* y [[buffer(0)]], device uint* tok [[bu
         for (uint k = 1; k < 32; k++) mk_pick(bv, bi, tv[k], ti[k]);
         tok[p.slot + 1] = bi == 0xffffffffu ? 0u : bi;
     }
+}
+
+// ---- Greedy chains on the device (`MetalPlan::greedy`) ------------------------------------------
+// The argmax of a pass's logits (`n` floats at `x` of the arena): each threadgroup of 256 takes
+// 1024 values (4 consecutive a thread) and writes its (value, index bits) to `part + 2 tg`;
+// `dec_amax_fin` (one threadgroup of 1024) then writes the token (uint bits) to `tok`. The
+// host's rule (`crate::sampler::argmax`): the first index of the largest value above -inf, NaNs
+// never win, 0 when nothing does.
+struct AmP { uint n; uint x; uint part; uint tok; };
+inline void am_pick(thread float& bv, thread uint& bi, float v, uint i) {
+    if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+}
+inline void am_simd(thread float& bv, thread uint& bi) {
+    for (ushort m = 16; m > 0; m >>= 1) am_pick(bv, bi, simd_shuffle_xor(bv, m), simd_shuffle_xor(bi, m));
+}
+kernel void dec_amax_part(device float* a [[buffer(0)]], constant AmP& p [[buffer(1)]], uint tg [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float tv[8];
+    threadgroup uint ti[8];
+    float bv = -INFINITY;
+    uint bi = 0xffffffffu;
+    uint i0 = tg * 1024 + tid * 4;
+    for (uint j = 0; j < 4; j++) {
+        uint i = i0 + j;
+        if (i < p.n) {
+            float v = a[p.x + i];
+            if (v > bv) { bv = v; bi = i; }
+        }
+    }
+    am_simd(bv, bi);
+    if (lane == 0) { tv[sg] = bv; ti[sg] = bi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        for (uint k = 1; k < 8; k++) am_pick(bv, bi, tv[k], ti[k]);
+        a[p.part + 2 * tg] = bv;
+        a[p.part + 2 * tg + 1] = as_type<float>(bi);
+    }
+}
+kernel void dec_amax_fin(device float* a [[buffer(0)]], constant AmP& p [[buffer(1)]], uint tid [[thread_index_in_threadgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float tv[32];
+    threadgroup uint ti[32];
+    float bv = -INFINITY;
+    uint bi = 0xffffffffu;
+    uint np = (p.n + 1023) / 1024;
+    for (uint k = tid; k < np; k += 1024) am_pick(bv, bi, a[p.part + 2 * k], as_type<uint>(a[p.part + 2 * k + 1]));
+    am_simd(bv, bi);
+    if (lane == 0) { tv[sg] = bv; ti[sg] = bi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        for (uint k = 1; k < 32; k++) am_pick(bv, bi, tv[k], ti[k]);
+        ((device uint*)a)[p.tok] = bi == 0xffffffffu ? 0u : bi;
+    }
+}
+
+// The input row of a pass whose token the device chose: row `tok` (a uint of the arena) of a
+// token table, dequantized as the host's `Table::row` (the same operations in the same order, no
+// contraction), times `scale`, into `out` (`n` floats). A thread per 32 values (a block, or a
+// 32-value run of a 256-value K-quant super-block). Kinds (`EK_*` in metal_decode.rs): GGUF rows
+// of `rb` bytes at `q` (F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q4_K, Q5_K, Q6_K);
+// oxinfer's int8 rows (`q`, f32 scales per 32 at `s`); its Q4_0-layout rows (`q`, f16 scales at
+// `s`, bf16 affine offsets per `group` at `o`, or none when `o` is 0); MLX affine rows (`bits`,
+// bf16 scales and biases per `group` at `s` and `o`).
+struct EmP { ulong q; ulong s; ulong o; uint n; uint tok; uint out; uint rb; float scale; uint group; uint bits; uint kind; };
+inline float emb_h(device const uchar* b) { return float(as_type<half>(ushort(uint(b[0]) | (uint(b[1]) << 8)))); }
+inline float emb_bf(ushort v) { return as_type<float>(uint(v) << 16); }
+kernel void dec_embed(device float* a [[buffer(0)]], constant EmP& p [[buffer(1)]], uint c [[thread_position_in_grid]]) {
+#pragma clang fp contract(off)
+    if (c >= p.n / 32) return;
+    uint row = ((device const uint*)a)[p.tok];
+    device float* y = a + p.out + c * 32;
+    float v[32];
+    device const uchar* R = (device const uchar*)p.q + (ulong)row * p.rb;
+    switch (p.kind) {
+    case 0: { // F32
+        device const uchar* b = R + c * 128;
+        for (uint l = 0; l < 32; l++)
+            v[l] = as_type<float>(uint(b[4 * l]) | (uint(b[4 * l + 1]) << 8) | (uint(b[4 * l + 2]) << 16) | (uint(b[4 * l + 3]) << 24));
+        break;
+    }
+    case 1: { // F16
+        device const uchar* b = R + c * 64;
+        for (uint l = 0; l < 32; l++) v[l] = emb_h(b + 2 * l);
+        break;
+    }
+    case 2: { // BF16
+        device const uchar* b = R + c * 64;
+        for (uint l = 0; l < 32; l++) v[l] = emb_bf(ushort(uint(b[2 * l]) | (uint(b[2 * l + 1]) << 8)));
+        break;
+    }
+    case 3: { // Q8_0
+        device const uchar* b = R + c * 34;
+        float d = emb_h(b);
+        for (uint l = 0; l < 32; l++) v[l] = float(as_type<char>(b[2 + l])) * d;
+        break;
+    }
+    case 4: { // Q4_0
+        device const uchar* b = R + c * 18;
+        float d = emb_h(b);
+        for (uint j = 0; j < 16; j++) {
+            v[j] = float(int(b[2 + j] & 15) - 8) * d;
+            v[j + 16] = float(int(b[2 + j] >> 4) - 8) * d;
+        }
+        break;
+    }
+    case 5: { // Q4_1
+        device const uchar* b = R + c * 20;
+        float d = emb_h(b), m = emb_h(b + 2);
+        for (uint j = 0; j < 16; j++) {
+            float t0 = float(b[4 + j] & 15) * d;
+            float t1 = float(b[4 + j] >> 4) * d;
+            v[j] = t0 + m;
+            v[j + 16] = t1 + m;
+        }
+        break;
+    }
+    case 6: { // Q5_0
+        device const uchar* b = R + c * 22;
+        float d = emb_h(b);
+        uint qh = uint(b[2]) | (uint(b[3]) << 8) | (uint(b[4]) << 16) | (uint(b[5]) << 24);
+        for (uint j = 0; j < 16; j++) {
+            uint h0 = ((qh >> j) << 4) & 0x10, h1 = (qh >> (j + 12)) & 0x10;
+            v[j] = float(int((b[6 + j] & 15) | h0) - 16) * d;
+            v[j + 16] = float(int((b[6 + j] >> 4) | h1) - 16) * d;
+        }
+        break;
+    }
+    case 7: { // Q5_1
+        device const uchar* b = R + c * 24;
+        float d = emb_h(b), m = emb_h(b + 2);
+        uint qh = uint(b[4]) | (uint(b[5]) << 8) | (uint(b[6]) << 16) | (uint(b[7]) << 24);
+        for (uint j = 0; j < 16; j++) {
+            uint h0 = ((qh >> j) << 4) & 0x10, h1 = (qh >> (j + 12)) & 0x10;
+            float t0 = float((b[8 + j] & 15) | h0) * d;
+            float t1 = float((b[8 + j] >> 4) | h1) * d;
+            v[j] = t0 + m;
+            v[j + 16] = t1 + m;
+        }
+        break;
+    }
+    case 8: { // Q2_K: 32 values = the two 16-value sub-blocks (h = 0, 1) of (n, j)
+        device const uchar* b = R + (c / 8) * 84;
+        uint cc = c % 8, n = cc / 4, j = cc % 4;
+        float d = emb_h(b + 80), mn = emb_h(b + 82);
+        for (uint h = 0; h < 2; h++) {
+            uchar s = b[8 * n + 2 * j + h];
+            float dl = d * float(s & 15), ml = mn * float(s >> 4);
+            for (uint l = 0; l < 16; l++) {
+                float t = dl * float((b[16 + 32 * n + 16 * h + l] >> (2 * j)) & 3);
+                v[16 * h + l] = t - ml;
+            }
+        }
+        break;
+    }
+    case 9:    // Q4_K
+    case 10: { // Q5_K
+        bool five = p.kind == 10;
+        device const uchar* b = R + (c / 8) * (five ? 176 : 144);
+        uint cc = c % 8, j = cc / 2, h = cc % 2;
+        device const uchar* sc = b + 4;
+        float d = emb_h(b), mn = emb_h(b + 2);
+        uint s, m;
+        if (cc < 4) {
+            s = sc[cc] & 63;
+            m = sc[cc + 4] & 63;
+        } else {
+            s = (sc[cc + 4] & 15) | ((sc[cc - 4] >> 6) << 4);
+            m = (sc[cc + 4] >> 4) | ((sc[cc] >> 6) << 4);
+        }
+        float d1 = d * float(s), m1 = mn * float(m);
+        device const uchar* qs = b + (five ? 48 : 16) + 32 * j;
+        for (uint l = 0; l < 32; l++) {
+            uint q = (qs[l] >> (4 * h)) & 15;
+            if (five && (b[16 + l] & (1u << cc)) != 0) q += 16;
+            float t = d1 * float(q);
+            v[l] = t - m1;
+        }
+        break;
+    }
+    case 11: { // Q6_K: run `part` of the 128-value half `n`
+        device const uchar* b = R + (c / 8) * 210;
+        uint cc = c % 8, n = cc / 4, part = cc % 4;
+        device const uchar* ql = b + 64 * n;
+        device const uchar* qh = b + 128 + 32 * n;
+        device const uchar* sc = b + 192 + 8 * n;
+        float d = emb_h(b + 208);
+        for (uint l = 0; l < 32; l++) {
+            uint lo = (part & 1) != 0 ? ql[l + 32] : ql[l];
+            lo = (part & 2) != 0 ? lo >> 4 : lo & 15;
+            int q = int(lo | (((qh[l] >> (2 * part)) & 3) << 4)) - 32;
+            float ds = d * float(as_type<char>(sc[l / 16 + 2 * part]));
+            v[l] = ds * float(q);
+        }
+        break;
+    }
+    case 20: { // oxinfer int8
+        device const char* q = (device const char*)p.q + (ulong)row * p.n + c * 32;
+        float s = ((device const float*)p.s)[(ulong)row * (p.n / 32) + c];
+        for (uint l = 0; l < 32; l++) v[l] = float(q[l]) * s;
+        break;
+    }
+    case 21: { // oxinfer Q4 (Q4_0 layout, optional affine offsets)
+        device const uchar* q = (device const uchar*)p.q + (ulong)row * (p.n / 2) + c * 16;
+        float d = float(((device const half*)p.s)[(ulong)row * (p.n / 32) + c]);
+        float m = p.o != 0 ? emb_bf(((device const ushort*)p.o)[(ulong)row * (p.n / p.group) + c * 32 / p.group]) : 0.f;
+        for (uint j = 0; j < 16; j++) {
+            float t0 = float(int(q[j] & 15) - 8) * d;
+            float t1 = float(int(q[j] >> 4) - 8) * d;
+            v[j] = t0 + m;
+            v[j + 16] = t1 + m;
+        }
+        break;
+    }
+    case 22: { // MLX affine
+        uint per = 32 / p.bits, mask = (1u << p.bits) - 1, ng = p.n / p.group;
+        device const uint* w = (device const uint*)p.q + (ulong)row * (p.n / per);
+        uint g = c * 32 / p.group;
+        float s = emb_bf(((device const ushort*)p.s)[(ulong)row * ng + g]);
+        float bb = emb_bf(((device const ushort*)p.o)[(ulong)row * ng + g]);
+        for (uint l = 0; l < 32; l++) {
+            uint e = c * 32 + l;
+            uint q = (w[e / per] >> (p.bits * (e % per))) & mask;
+            float t = s * float(q);
+            v[l] = t + bb;
+        }
+        break;
+    }
+    default:
+        for (uint l = 0; l < 32; l++) v[l] = 0.f;
+    }
+    for (uint l = 0; l < 32; l++) y[l] = v[l] * p.scale;
+}
+
+// Copies `n` floats from `src` to `dst` (the recurrent states of a chain, see
+// `MetalPlan::greedy`).
+kernel void dec_copy(device const float* src [[buffer(0)]], device float* dst [[buffer(1)]], constant uint& n [[buffer(2)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i < n) dst[i] = src[i];
 }

@@ -2508,6 +2508,8 @@ pub(crate) struct MetalPlan<'b> {
     /// Most positions a step may reach (QSA scores: `Op::QsaSelect::cap` blocks).
     max_len: usize,
     pf: Option<PfState>,
+    /// Greedy chains (one-token plans of graphs with a device-readable token table).
+    chain: Option<ChainDev>,
 }
 unsafe impl Send for MetalPlan<'_> {}
 unsafe impl Sync for MetalPlan<'_> {}
@@ -2602,6 +2604,53 @@ fn kv_pool_take(bytes: usize) -> Option<(Id, Id)> {
     let (_, k, v) = p.0.remove(i);
     Some((k as Id, v as Id))
 }
+
+/// `EmP` of the shader (`dec_embed`): a token table the device reads.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct EmbP {
+    q: u64,
+    s: u64,
+    o: u64,
+    n: u32,
+    tok: u32,
+    out: u32,
+    rb: u32,
+    scale: f32,
+    group: u32,
+    bits: u32,
+    kind: u32,
+}
+
+/// `AmP` of the shader (`dec_amax_part`, `dec_amax_fin`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct AmP {
+    n: u32,
+    x: u32,
+    part: u32,
+    tok: u32,
+}
+
+/// What a one-token plan needs for greedy chains ([`MetalPlan::greedy`]).
+struct ChainDev {
+    embed: Id,
+    amax_part: Id,
+    amax_fin: Id,
+    copy: Id,
+    /// The input rows' tables (the input, then the second input if any; `tok` set per pass).
+    emb: Vec<EmbP>,
+    /// Arena float offsets of the two token slots and of the argmax's partials.
+    tok: usize,
+    part: usize,
+    /// The logits: arena float offset, count.
+    logits: (usize, usize),
+    /// Second copies of the recurrent states (a chain's passes alternate between the two).
+    alt: Vec<Id>,
+}
+
+/// Positions of KV room a chain makes ahead of its passes (more as it grows).
+const CHAIN_ROOM: usize = 256;
 
 struct MetalSlot {
     plan: u64,
@@ -4702,6 +4751,52 @@ impl MetalBackend {
                 .collect();
             eprintln!("[prefill plan ops: {}]", line.join(" "));
         }
+        // Greedy chains (`MetalPlan::greedy`): the token tables where the device reads them, the
+        // token slots and the argmax's partials (one-token plans without streamed weights or
+        // interventions).
+        let chain = match (g.embed, g.logits) {
+            (Some((table, scale)), Some((lv, vocab))) if !mt && g.gate.is_none() && g.params.is_none() => (|| -> Option<ChainDev> {
+                let ni = if g.n_input > 0 { g.n_input } else { g.n_hidden };
+                let mut emb = vec![self.embed_params(table, ni, scale, byte(g.input) / 4, &mut shared, &mut indirect)?];
+                match (g.input2, g.embed2) {
+                    (Some((v, n)), Some(t2)) => emb.push(self.embed_params(t2, n, 1.0, byte(v) / 4, &mut shared, &mut indirect)?),
+                    (None, None) => {}
+                    _ => return None,
+                }
+                let (embed, amax_part, amax_fin, copy) = (
+                    self.named_pipeline("dec_embed")?,
+                    self.named_pipeline("dec_amax_part")?,
+                    self.named_pipeline("dec_amax_fin")?,
+                    self.named_pipeline("dec_copy")?,
+                );
+                let tok = total / 4;
+                total += 256;
+                let part = total / 4;
+                total += (2 * vocab.div_ceil(1024) * 4).next_multiple_of(256);
+                let new_len: MsgNewBufLen = self.o.msg_send();
+                let mut alt = Vec::with_capacity(g.states.len());
+                for &n in &g.states {
+                    let b = unsafe { new_len(self.device, self.sels.new_buffer_len, (n * 4).max(16), 0) };
+                    if b.is_null() {
+                        return None;
+                    }
+                    owned.push(b);
+                    alt.push(b);
+                }
+                Some(ChainDev {
+                    embed,
+                    amax_part,
+                    amax_fin,
+                    copy,
+                    emb,
+                    tok,
+                    part,
+                    logits: (byte(lv) / 4, vocab),
+                    alt,
+                })
+            })(),
+            _ => None,
+        };
         let arena = unsafe { new_len(self.device, self.sels.new_buffer_len, total.max(256), 0) };
         if arena.is_null() {
             return None;
@@ -4783,12 +4878,125 @@ impl MetalBackend {
             units,
             max_len,
             pf: pf_state,
+            chain,
             f,
         })
     }
 }
 
 impl MetalBackend {
+    /// [`EmbP`] of a token table of `n` columns (its memory wrapped into `shared` / `indirect`),
+    /// writing rows times `scale` to arena float offset `out`; None for the tables the device
+    /// does not read (`dec_embed`'s kinds).
+    fn embed_params(
+        &self,
+        t: &crate::model::Table,
+        n: usize,
+        scale: f32,
+        out: usize,
+        shared: &mut Vec<Id>,
+        indirect: &mut Vec<Id>,
+    ) -> Option<EmbP> {
+        use crate::model::Table;
+        use crate::safetensors::TablePart;
+        if n == 0 || !n.is_multiple_of(32) || n > u32::MAX as usize {
+            return None;
+        }
+        let mut wrap = |p: *const u8, len: usize| -> Option<u64> {
+            if len == 0 {
+                return None;
+            }
+            let (id, a) = self.wrap_shared(p, len)?;
+            shared.push(id);
+            indirect.push(id);
+            Some(a)
+        };
+        let mut e = EmbP {
+            n: n as u32,
+            out: out as u32,
+            scale,
+            ..Default::default()
+        };
+        match t {
+            Table::Bf16(w) => {
+                if !w.len().is_multiple_of(n) {
+                    return None;
+                }
+                e.kind = 2;
+                e.rb = (2 * n) as u32;
+                e.q = wrap(w.as_ptr() as *const u8, w.len() * 2)?;
+            }
+            Table::Gguf(m) => {
+                if m.x4 || m.block_scales.is_some() || m.n_in != n {
+                    return None;
+                }
+                e.kind = match m.kind {
+                    GgmlType::F32 => 0,
+                    GgmlType::F16 => 1,
+                    GgmlType::BF16 => 2,
+                    GgmlType::Q8_0 => 3,
+                    GgmlType::Q4_0 => 4,
+                    GgmlType::Q4_1 => 5,
+                    GgmlType::Q5_0 => 6,
+                    GgmlType::Q5_1 => 7,
+                    GgmlType::Q2_K => 8,
+                    GgmlType::Q4_K => 9,
+                    GgmlType::Q5_K => 10,
+                    GgmlType::Q6_K => 11,
+                    _ => return None,
+                };
+                e.rb = m.row_bytes() as u32;
+                e.q = wrap(m.data.as_ptr(), m.data.len())?;
+            }
+            Table::Q8(m) => {
+                if m.n_in != n || !(m.scales.as_ptr() as usize).is_multiple_of(4) {
+                    return None;
+                }
+                e.kind = 20;
+                e.q = wrap(m.q.as_ptr() as *const u8, m.q.len())?;
+                e.s = wrap(m.scales.as_ptr() as *const u8, m.scales.len() * 4)?;
+            }
+            Table::Q4(m) => {
+                if m.n_in != n || !(m.scales.as_ptr() as usize).is_multiple_of(2) {
+                    return None;
+                }
+                e.kind = 21;
+                e.q = wrap(m.q.as_ptr(), m.q.len())?;
+                e.s = wrap(m.scales.as_ptr() as *const u8, m.scales.len() * 2)?;
+                if let Some(o) = &m.offsets {
+                    if o.group == 0
+                        || !o.group.is_multiple_of(32)
+                        || !n.is_multiple_of(o.group)
+                        || !(o.v.as_ptr() as usize).is_multiple_of(2)
+                    {
+                        return None;
+                    }
+                    e.o = wrap(o.v.as_ptr() as *const u8, o.v.len() * 2)?;
+                    e.group = o.group as u32;
+                }
+            }
+            Table::Mlx {
+                parts: [TablePart::Mem(d), TablePart::Mem(sc), TablePart::Mem(bi)],
+                q,
+            } => {
+                let aligned = (d.as_ptr() as usize).is_multiple_of(4)
+                    && (sc.as_ptr() as usize).is_multiple_of(2)
+                    && (bi.as_ptr() as usize).is_multiple_of(2);
+                if !matches!(q.bits, 2 | 4 | 8) || q.group == 0 || !q.group.is_multiple_of(32) || !n.is_multiple_of(q.group) || !aligned {
+                    return None;
+                }
+                e.kind = 22;
+                e.bits = q.bits as u32;
+                e.group = q.group as u32;
+                e.q = wrap(d.as_ptr(), d.len())?;
+                e.s = wrap(sc.as_ptr(), sc.len())?;
+                e.o = wrap(bi.as_ptr(), bi.len())?;
+            }
+            _ => return None,
+        }
+        Some(e)
+    }
+
     /// Address tables of the experts of an MoE layer: entry e = (data, scales, affine offsets,
     /// unused) GPU addresses of expert e. The experts' memory is wrapped in a few buffers (adjacent
     /// regions merged: experts are usually slices of one tensor), added to `owned` and `indirect`.
@@ -4946,8 +5154,6 @@ impl MetalPlan<'_> {
     /// Brings the device KV copies in line with the host caches (`pos` positions each) and makes
     /// room for `t` more positions.
     fn sync_kv(&self, slot: &mut MetalSlot, kv: &mut [&mut crate::model::LayerCache], pos: usize, t: usize) -> bool {
-        let be = self.be;
-        let new_len: MsgNewBufLen = be.o.msg_send();
         for (i, (m, c)) in slot.kv.iter_mut().zip(kv.iter_mut()).enumerate() {
             let row = self.kv[i].0 * self.kv[i].1;
             if c.len != pos || c.n_kv * c.hd != row {
@@ -4956,38 +5162,8 @@ impl MetalPlan<'_> {
             // A truncation (rewind) since the last step invalidates the copy from there on, even
             // if the host cache has grown back past it.
             m.synced = m.synced.min(c.len).min(c.kept);
-            if m.cap < pos + t {
-                // Room for at least one more token (a prompt of a power-of-two length is
-                // followed by decoding: no reallocation and copy on its first step).
-                let cap = (pos + t + 1).next_power_of_two().max(256);
-                let bytes = cap * row * 4;
-                let (k, v) = kv_pool_take(bytes).unwrap_or_else(|| unsafe {
-                    (
-                        new_len(be.device, be.sels.new_buffer_len, bytes, 0),
-                        new_len(be.device, be.sels.new_buffer_len, bytes, 0),
-                    )
-                });
-                if k.is_null() || v.is_null() {
-                    for b in [k, v] {
-                        if !b.is_null() {
-                            unsafe { (self.f.void)(b, self.f.s_release) };
-                        }
-                    }
-                    return false;
-                }
-                if m.synced > 0 {
-                    unsafe {
-                        let n = m.synced * row;
-                        super::par_copy(self.f.contents(k) as *mut f32, self.f.contents(m.k) as *const f32, n);
-                        super::par_copy(self.f.contents(v) as *mut f32, self.f.contents(m.v) as *const f32, n);
-                    }
-                }
-                for b in [m.k, m.v] {
-                    if !b.is_null() {
-                        unsafe { (self.f.void)(b, self.f.s_release) };
-                    }
-                }
-                (m.k, m.v, m.cap, m.bytes) = (k, v, cap, bytes);
+            if m.cap < pos + t && !self.grow_mirror(m, row, m.synced, pos + t) {
+                return false;
             }
             if m.synced < c.len {
                 let (hk, hv) = c.data();
@@ -5007,6 +5183,69 @@ impl MetalPlan<'_> {
 }
 
 impl MetalPlan<'_> {
+    /// Makes room for `need` positions in a device KV copy (rows of `row` floats), keeping its
+    /// first `valid` rows.
+    fn grow_mirror(&self, m: &mut KvMirror, row: usize, valid: usize, need: usize) -> bool {
+        let be = self.be;
+        let new_len: MsgNewBufLen = be.o.msg_send();
+        // Room for at least one more token (a prompt of a power-of-two length is followed by
+        // decoding: no reallocation and copy on its first step).
+        let cap = (need + 1).next_power_of_two().max(256);
+        let bytes = cap * row * 4;
+        let (k, v) = kv_pool_take(bytes).unwrap_or_else(|| unsafe {
+            (
+                new_len(be.device, be.sels.new_buffer_len, bytes, 0),
+                new_len(be.device, be.sels.new_buffer_len, bytes, 0),
+            )
+        });
+        if k.is_null() || v.is_null() {
+            for b in [k, v] {
+                if !b.is_null() {
+                    unsafe { (self.f.void)(b, self.f.s_release) };
+                }
+            }
+            return false;
+        }
+        if valid > 0 {
+            unsafe {
+                let n = valid * row;
+                super::par_copy(self.f.contents(k) as *mut f32, self.f.contents(m.k) as *const f32, n);
+                super::par_copy(self.f.contents(v) as *mut f32, self.f.contents(m.v) as *const f32, n);
+            }
+        }
+        for b in [m.k, m.v] {
+            if !b.is_null() {
+                unsafe { (self.f.void)(b, self.f.s_release) };
+            }
+        }
+        (m.k, m.v, m.cap, m.bytes) = (k, v, cap, bytes);
+        true
+    }
+
+    /// The plan's state in `slot` (made empty when the slot held another plan's).
+    fn slot_of<'s>(&self, slot: &'s mut Slot) -> &'s mut MetalSlot {
+        let fresh = !matches!(slot.0.as_ref().and_then(|b| b.downcast_ref::<MetalSlot>()), Some(m) if m.plan == self.id);
+        if fresh {
+            let release = (self.f.void, self.f.s_release);
+            slot.0 = Some(Box::new(MetalSlot {
+                plan: self.id,
+                kv: (0..self.kv.len())
+                    .map(|_| KvMirror {
+                        k: std::ptr::null_mut(),
+                        v: std::ptr::null_mut(),
+                        cap: 0,
+                        synced: 0,
+                        bytes: 0,
+                        release,
+                    })
+                    .collect(),
+                states: Vec::new(),
+                release,
+            }));
+        }
+        slot.0.as_mut().unwrap().downcast_mut::<MetalSlot>().unwrap()
+    }
+
     /// Wraps the host recurrent states as device buffers (in place; re-wrapped only when one
     /// moved). False if one cannot be wrapped without a copy.
     fn wrap_states(&self, slot: &mut MetalSlot, states: &[&mut [f32]]) -> bool {
@@ -6864,7 +7103,396 @@ impl MetalPlan<'_> {
     }
 }
 
+impl MetalPlan<'_> {
+    /// Encodes op `op` of a one-token plan at position `pos` (`cs`: the step's RoPE rows).
+    /// The recurrent states are read from `sti` and written to `stb` (the same but in greedy
+    /// chains).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_one(&self, e: &FastEnc, op: &MOp, kvb: &[(Id, Id)], stb: &[(Id, usize)], sti: &[(Id, usize)], pos: usize, cs: &[f32]) {
+        let (arena, consts) = (self.arena, self.consts);
+        match op {
+            MOp::Barrier => e.barrier(),
+            MOp::XHalf { .. }
+            | MOp::Gemm { .. }
+            | MOp::GemmF32 { .. }
+            | MOp::AddRows { .. }
+            | MOp::PfTopk { .. }
+            | MOp::PfExperts(..)
+            | MOp::PfGdn { .. }
+            | MOp::PfAttn { .. }
+            | MOp::PfFlash { .. }
+            | MOp::PfKvHalf { .. }
+            | MOp::NormHalf { .. }
+            | MOp::AddNormHalf { .. }
+            | MOp::PfMoeTail { .. }
+            | MOp::GluHalf { .. } => unreachable!("prefill op in a one-token plan"),
+            MOp::Norm {
+                pipe,
+                x,
+                out,
+                w,
+                p,
+                rows,
+                threads,
+                ..
+            } => {
+                e.pipe(*pipe);
+                e.buf(arena, *x, 0);
+                e.buf(arena, *out, 1);
+                e.buf(consts, w.unwrap_or(0), 2);
+                e.bytes(p, 3);
+                e.dispatch((*rows, 1), *threads);
+            }
+            MOp::Mv {
+                pipe,
+                nr,
+                ks,
+                w,
+                w2,
+                x,
+                y,
+                mode,
+                gate,
+                ..
+            } => encode_mv(e, *pipe, *nr, *ks, w, w2.as_ref(), (arena, *x), (arena, *y), *mode, (arena, *gate)),
+            MOp::Topk {
+                pipe,
+                logits,
+                sel,
+                n,
+                k,
+                scale,
+                ..
+            } => {
+                e.pipe(*pipe);
+                e.buf(arena, *logits, 0);
+                e.buf(arena, *sel, 1);
+                e.bytes(&[*n, *k, scale.is_some() as u32, 0], 2);
+                e.buf(consts, scale.unwrap_or(0), 3);
+                e.dispatch((1, 1), (*n as usize).next_multiple_of(32));
+            }
+            MOp::Experts {
+                pair,
+                sum,
+                tabs,
+                fused,
+                gelu,
+                add,
+                g,
+                d,
+                x,
+                sel,
+                act,
+                y,
+                h,
+                inter,
+                k,
+                edit,
+                lora,
+                ..
+            } => {
+                if lora.is_some() {
+                    self.encode_xlora(e, op, arena, consts, 1, [0; 4]);
+                    return;
+                }
+                let p = |n_out: usize, n_in: usize, mode: MvMode, q: (u32, u32), r2: usize| MvParams {
+                    n_out: n_out as u32,
+                    n_in: n_in as u32,
+                    mode: mode as u32,
+                    rows_per_tg: 1,
+                    gpr: q.0,
+                    gk: q.1,
+                    ldy: *k as u32,
+                    _p: r2 as u32,
+                    ..Default::default()
+                };
+                e.pipe(*pair);
+                e.buf(tabs[0], 0, 0);
+                e.buf(if *fused { tabs[0] } else { tabs[1] }, 0, 1);
+                e.buf(arena, *x, 2);
+                e.buf(arena, *act, 3);
+                let am = if *gelu { MvMode::GeluPair } else { MvMode::SiluPair };
+                e.bytes(&p(*inter, *h, am, *g, if *fused { *inter } else { 0 }), 4);
+                e.buf(arena, *sel, 5);
+                e.dispatch((*inter, *k), 32);
+                e.barrier();
+                if let Some((pipe, hot, n)) = edit {
+                    e.pipe(*pipe);
+                    e.buf(arena, *act, 0);
+                    e.buf(arena, *hot, 1);
+                    e.buf(arena, *sel, 2);
+                    e.bytes(&[*n, *inter as u32, *k as u32, 1u32], 3);
+                    e.dispatch(((*n as usize).div_ceil(64), 1), 64);
+                    e.barrier();
+                }
+                e.pipe(*sum);
+                e.buf(tabs[2], 0, 0);
+                e.buf(tabs[2], 0, 1);
+                e.buf(arena, *act, 2);
+                e.buf(arena, *y, 3);
+                e.bytes(&p(*h, *inter, if *add { MvMode::Add } else { MvMode::Store }, *d, 0), 4);
+                e.buf(arena, *sel, 5);
+                e.dispatch((*h, 1), 32);
+            }
+            MOp::QkRope {
+                pipe,
+                qkv,
+                qo,
+                kv,
+                qn,
+                kn,
+                p,
+                cs: c0,
+                ..
+            } => {
+                let mut p = *p;
+                p.pos = pos as u32;
+                e.pipe(*pipe);
+                e.buf(arena, *qkv, 0);
+                e.buf(arena, *qo, 1);
+                e.buf(kvb[*kv].0, 0, 2);
+                e.buf(kvb[*kv].1, 0, 3);
+                e.buf(consts, qn.unwrap_or(0), 4);
+                e.buf(consts, kn.unwrap_or(0), 5);
+                e.bytes(&p, 6);
+                e.bytes_slice(&cs[*c0..*c0 + 2 * p.half_rot as usize], 7);
+                e.dispatch(((p.nh + 2 * p.nkv) as usize, 1), p.hd as usize);
+            }
+            MOp::AddNorm {
+                pipe,
+                y,
+                x,
+                out,
+                wy,
+                wn,
+                p,
+                threads,
+                pre,
+                ..
+            } => {
+                e.pipe(*pipe);
+                e.buf(arena, *y, 0);
+                e.buf(arena, *x, 1);
+                e.buf(arena, *out, 2);
+                e.buf(consts, *wy, 3);
+                e.buf(consts, *wn, 4);
+                e.bytes(p, 5);
+                if let Some((ev, w0, np)) = pre {
+                    e.buf(arena, *ev, 6);
+                    e.buf(consts, *w0, 7);
+                    e.bytes(np, 8);
+                }
+                e.dispatch((1, 1), *threads);
+            }
+            MOp::Ew { pipe, a, b, out, n, p, .. } => {
+                e.pipe(*pipe);
+                e.buf(arena, *a, 0);
+                e.buf(arena, *b, 1);
+                e.buf(arena, *out, 2);
+                e.bytes(p, 3);
+                e.bytes(n, 4);
+                e.dispatch(((*n as usize).div_ceil(256), 1), 256);
+            }
+            MOp::PleGate {
+                pipe, k, q, v, out, n, hc, ..
+            } => {
+                e.pipe(*pipe);
+                e.buf(arena, *k, 0);
+                e.buf(arena, *q, 1);
+                e.buf(arena, *v, 2);
+                e.buf(arena, *out, 3);
+                e.bytes(&[*n, *hc], 4);
+                e.dispatch((*hc as usize, 1), 1024);
+            }
+            MOp::Steer { pipe, x, hot, cold, p } => {
+                e.pipe(*pipe);
+                e.buf(arena, *x, 0);
+                e.buf(arena, *hot, 1);
+                e.buf(arena, *cold, 2);
+                e.bytes(p, 3);
+                e.dispatch((1, 1), 1024);
+            }
+            MOp::NeuronEdit { pipe, act, hot, n } => {
+                e.pipe(*pipe);
+                e.buf(arena, *act, 0);
+                e.buf(arena, *hot, 1);
+                e.buf(arena, *hot, 2);
+                e.bytes(&[*n, 0u32, 0, 0], 3);
+                e.dispatch(((*n as usize).div_ceil(64), 1), 64);
+            }
+            MOp::LoraDown { .. } | MOp::LoraUp { .. } => self.encode_lora(e, op, arena, consts, 1),
+            MOp::Glu {
+                pipe, g, u, out, n, gelu, ..
+            } => {
+                e.pipe(*pipe);
+                e.buf(arena, *g, 0);
+                e.buf(arena, *u, 1);
+                e.buf(arena, *out, 2);
+                e.bytes(&[*n, *gelu], 3);
+                e.dispatch(((*n as usize).div_ceil(256), 1), 256);
+            }
+            MOp::GdnConv {
+                pipe,
+                x,
+                out,
+                state,
+                w,
+                dim,
+                kc,
+                ..
+            } => {
+                #[repr(C)]
+                struct Gc {
+                    dim: u32,
+                    kc: u32,
+                }
+                e.pipe(*pipe);
+                e.buf(arena, *x, 0);
+                e.buf(arena, *out, 1);
+                e.buf(stb[*state].0, stb[*state].1, 2);
+                e.buf(consts, *w, 3);
+                e.bytes(&Gc { dim: *dim, kc: *kc }, 4);
+                e.buf(sti[*state].0, sti[*state].1, 5);
+                e.dispatch(((*dim as usize).div_ceil(256), 1), 256);
+            }
+            MOp::GdnRule {
+                pipe,
+                c,
+                z,
+                b,
+                a,
+                out,
+                state,
+                cst,
+                p,
+                ..
+            } => {
+                e.pipe(*pipe);
+                e.buf(arena, *c, 0);
+                e.buf(arena, *z, 1);
+                e.buf(arena, *b, 2);
+                e.buf(arena, *a, 3);
+                e.buf(arena, *out, 4);
+                e.buf(stb[*state].0, stb[*state].1, 5);
+                e.buf(consts, *cst, 6);
+                e.bytes(p, 7);
+                e.buf(sti[*state].0, sti[*state].1, 8);
+                e.dispatch((p.nv as usize, 1), (p.hdk / 32 * p.hdv) as usize);
+            }
+            MOp::QsaKey {
+                pipe, k, kv, w, p, cs: c0, ..
+            } => {
+                let mut p = *p;
+                p.pos = pos as u32;
+                e.pipe(*pipe);
+                e.buf(arena, *k, 0);
+                e.buf(kvb[*kv].0, 0, 1);
+                e.buf(kvb[*kv].1, 0, 2);
+                e.buf(consts, *w, 3);
+                e.bytes(&p, 4);
+                e.bytes_slice(&cs[*c0..*c0 + 2 * p.half_rot as usize], 5);
+                e.dispatch((1, 1), p.d as usize);
+            }
+            MOp::QsaScore {
+                pipe,
+                q,
+                kv,
+                w,
+                p,
+                top,
+                cs: c0,
+                scores,
+                ..
+            } => {
+                let nb = (pos + 1) / p.r as usize;
+                if nb > *top {
+                    let mut p = *p;
+                    p.nb = nb as u32;
+                    e.pipe(*pipe);
+                    e.buf(arena, *q, 0);
+                    e.buf(kvb[*kv].1, 0, 1);
+                    e.buf(consts, *w, 2);
+                    e.buf(arena, *scores, 3);
+                    e.bytes(&p, 4);
+                    e.bytes_slice(&cs[*c0..*c0 + 2 * p.half_rot as usize], 5);
+                    e.dispatch((nb.div_ceil(256), 1), 256);
+                }
+            }
+            MOp::QsaTopk {
+                pipe, scores, sel, top, r, ..
+            } => {
+                let nb = (pos + 1) / r;
+                if nb > *top {
+                    e.pipe(*pipe);
+                    e.buf(arena, *scores, 0);
+                    e.buf(arena, *sel, 1);
+                    e.bytes(&[nb as u32, *top as u32, *r as u32, pos as u32], 2);
+                    e.dispatch((1, 1), 1024);
+                }
+            }
+            MOp::Attn {
+                grp,
+                pipe,
+                narrow,
+                combine,
+                q,
+                out,
+                kv,
+                gate,
+                window,
+                p,
+                threads,
+                hd,
+                sel,
+                ..
+            } => {
+                let mut p = *p;
+                p.len = (pos + 1) as u32;
+                p.lo = window.map_or(0, |w| (pos + 1).saturating_sub(w)) as u32;
+                let mut pipe = *pipe;
+                if let Some(sl) = qsa_list(sel, pos) {
+                    (pipe, p.len, p.lo) = (sl.0, sl.2 as u32, 0);
+                    e.buf(arena, sl.1, 7);
+                }
+                // Keys per threadgroup: one pass of its 8 SIMD-groups (256 keys) at least, so
+                // long contexts spread over up to ATTN_MAX_SPLIT threadgroups per head.
+                let n = (p.len - p.lo) as usize;
+                let chunk = n.div_ceil(ATTN_MAX_SPLIT).next_multiple_of(256).max(256);
+                p.nsplit = n.div_ceil(chunk) as u32;
+                p.chunk = chunk as u32;
+                let mut grp = *grp;
+                if sel.is_none() {
+                    (pipe, grp) = attn_narrow(pipe, grp, narrow, n);
+                }
+                e.pipe(pipe);
+                e.buf(arena, *q, 0);
+                e.buf(kvb[*kv].0, 0, 1);
+                e.buf(kvb[*kv].1, 0, 2);
+                e.buf(arena, *out, 3);
+                e.buf(arena, gate.unwrap_or(0), 4);
+                e.bytes(&p, 5);
+                e.buf(arena, self.part, 6);
+                e.dispatch((p.nh as usize / grp, p.nsplit as usize), *threads);
+                if p.nsplit > 1 {
+                    e.barrier();
+                    e.pipe(*combine);
+                    e.buf(arena, self.part, 0);
+                    e.buf(arena, *out, 1);
+                    e.buf(arena, gate.unwrap_or(0), 2);
+                    e.bytes(&p, 3);
+                    e.bytes(hd, 4);
+                    e.dispatch((p.nh as usize, 1), 256);
+                }
+            }
+        }
+    }
+}
+
 impl DecodePlan for MetalPlan<'_> {
+    fn greedy(&self, slot: &mut Slot, g: crate::gpu::decode::Greedy) -> Option<usize> {
+        self.greedy_impl(slot, g)
+    }
+
     fn tokens(&self) -> usize {
         self.tokens
     }
@@ -6926,26 +7554,7 @@ impl DecodePlan for MetalPlan<'_> {
         {
             return false;
         }
-        let fresh = !matches!(slot.0.as_ref().and_then(|b| b.downcast_ref::<MetalSlot>()), Some(m) if m.plan == self.id);
-        if fresh {
-            let release = (self.f.void, self.f.s_release);
-            slot.0 = Some(Box::new(MetalSlot {
-                plan: self.id,
-                kv: (0..self.kv.len())
-                    .map(|_| KvMirror {
-                        k: std::ptr::null_mut(),
-                        v: std::ptr::null_mut(),
-                        cap: 0,
-                        synced: 0,
-                        bytes: 0,
-                        release,
-                    })
-                    .collect(),
-                states: Vec::new(),
-                release,
-            }));
-        }
-        let ms = slot.0.as_mut().unwrap().downcast_mut::<MetalSlot>().unwrap();
+        let ms = self.slot_of(slot);
         let pos = s.pos;
         if !self.sync_kv(ms, s.kv, pos, t) || !self.wrap_states(ms, s.states) {
             return false;
@@ -7075,379 +7684,7 @@ impl DecodePlan for MetalPlan<'_> {
                     self.encode_multi(e, op, arena, consts, &kvb, &stb, pos, t);
                     continue;
                 }
-                match op {
-                    MOp::Barrier => e.barrier(),
-                    MOp::XHalf { .. }
-                    | MOp::Gemm { .. }
-                    | MOp::GemmF32 { .. }
-                    | MOp::AddRows { .. }
-                    | MOp::PfTopk { .. }
-                    | MOp::PfExperts(..)
-                    | MOp::PfGdn { .. }
-                    | MOp::PfAttn { .. }
-                    | MOp::PfFlash { .. }
-                    | MOp::PfKvHalf { .. }
-                    | MOp::NormHalf { .. }
-                    | MOp::AddNormHalf { .. }
-                    | MOp::PfMoeTail { .. }
-                    | MOp::GluHalf { .. } => unreachable!("prefill op in a one-token plan"),
-                    MOp::Norm {
-                        pipe,
-                        x,
-                        out,
-                        w,
-                        p,
-                        rows,
-                        threads,
-                        ..
-                    } => {
-                        e.pipe(*pipe);
-                        e.buf(arena, *x, 0);
-                        e.buf(arena, *out, 1);
-                        e.buf(consts, w.unwrap_or(0), 2);
-                        e.bytes(p, 3);
-                        e.dispatch((*rows, 1), *threads);
-                    }
-                    MOp::Mv {
-                        pipe,
-                        nr,
-                        ks,
-                        w,
-                        w2,
-                        x,
-                        y,
-                        mode,
-                        gate,
-                        ..
-                    } => encode_mv(e, *pipe, *nr, *ks, w, w2.as_ref(), (arena, *x), (arena, *y), *mode, (arena, *gate)),
-                    MOp::Topk {
-                        pipe,
-                        logits,
-                        sel,
-                        n,
-                        k,
-                        scale,
-                        ..
-                    } => {
-                        e.pipe(*pipe);
-                        e.buf(arena, *logits, 0);
-                        e.buf(arena, *sel, 1);
-                        e.bytes(&[*n, *k, scale.is_some() as u32, 0], 2);
-                        e.buf(consts, scale.unwrap_or(0), 3);
-                        e.dispatch((1, 1), (*n as usize).next_multiple_of(32));
-                    }
-                    MOp::Experts {
-                        pair,
-                        sum,
-                        tabs,
-                        fused,
-                        gelu,
-                        add,
-                        g,
-                        d,
-                        x,
-                        sel,
-                        act,
-                        y,
-                        h,
-                        inter,
-                        k,
-                        edit,
-                        lora,
-                        ..
-                    } => {
-                        if lora.is_some() {
-                            self.encode_xlora(e, op, arena, consts, 1, [0; 4]);
-                            continue;
-                        }
-                        let p = |n_out: usize, n_in: usize, mode: MvMode, q: (u32, u32), r2: usize| MvParams {
-                            n_out: n_out as u32,
-                            n_in: n_in as u32,
-                            mode: mode as u32,
-                            rows_per_tg: 1,
-                            gpr: q.0,
-                            gk: q.1,
-                            ldy: *k as u32,
-                            _p: r2 as u32,
-                            ..Default::default()
-                        };
-                        e.pipe(*pair);
-                        e.buf(tabs[0], 0, 0);
-                        e.buf(if *fused { tabs[0] } else { tabs[1] }, 0, 1);
-                        e.buf(arena, *x, 2);
-                        e.buf(arena, *act, 3);
-                        let am = if *gelu { MvMode::GeluPair } else { MvMode::SiluPair };
-                        e.bytes(&p(*inter, *h, am, *g, if *fused { *inter } else { 0 }), 4);
-                        e.buf(arena, *sel, 5);
-                        e.dispatch((*inter, *k), 32);
-                        e.barrier();
-                        if let Some((pipe, hot, n)) = edit {
-                            e.pipe(*pipe);
-                            e.buf(arena, *act, 0);
-                            e.buf(arena, *hot, 1);
-                            e.buf(arena, *sel, 2);
-                            e.bytes(&[*n, *inter as u32, *k as u32, 1u32], 3);
-                            e.dispatch(((*n as usize).div_ceil(64), 1), 64);
-                            e.barrier();
-                        }
-                        e.pipe(*sum);
-                        e.buf(tabs[2], 0, 0);
-                        e.buf(tabs[2], 0, 1);
-                        e.buf(arena, *act, 2);
-                        e.buf(arena, *y, 3);
-                        e.bytes(&p(*h, *inter, if *add { MvMode::Add } else { MvMode::Store }, *d, 0), 4);
-                        e.buf(arena, *sel, 5);
-                        e.dispatch((*h, 1), 32);
-                    }
-                    MOp::QkRope {
-                        pipe,
-                        qkv,
-                        qo,
-                        kv,
-                        qn,
-                        kn,
-                        p,
-                        cs: c0,
-                        ..
-                    } => {
-                        let mut p = *p;
-                        p.pos = pos as u32;
-                        e.pipe(*pipe);
-                        e.buf(arena, *qkv, 0);
-                        e.buf(arena, *qo, 1);
-                        e.buf(kvb[*kv].0, 0, 2);
-                        e.buf(kvb[*kv].1, 0, 3);
-                        e.buf(consts, qn.unwrap_or(0), 4);
-                        e.buf(consts, kn.unwrap_or(0), 5);
-                        e.bytes(&p, 6);
-                        e.bytes_slice(&cs[*c0..*c0 + 2 * p.half_rot as usize], 7);
-                        e.dispatch(((p.nh + 2 * p.nkv) as usize, 1), p.hd as usize);
-                    }
-                    MOp::AddNorm {
-                        pipe,
-                        y,
-                        x,
-                        out,
-                        wy,
-                        wn,
-                        p,
-                        threads,
-                        pre,
-                        ..
-                    } => {
-                        e.pipe(*pipe);
-                        e.buf(arena, *y, 0);
-                        e.buf(arena, *x, 1);
-                        e.buf(arena, *out, 2);
-                        e.buf(consts, *wy, 3);
-                        e.buf(consts, *wn, 4);
-                        e.bytes(p, 5);
-                        if let Some((ev, w0, np)) = pre {
-                            e.buf(arena, *ev, 6);
-                            e.buf(consts, *w0, 7);
-                            e.bytes(np, 8);
-                        }
-                        e.dispatch((1, 1), *threads);
-                    }
-                    MOp::Ew { pipe, a, b, out, n, p, .. } => {
-                        e.pipe(*pipe);
-                        e.buf(arena, *a, 0);
-                        e.buf(arena, *b, 1);
-                        e.buf(arena, *out, 2);
-                        e.bytes(p, 3);
-                        e.bytes(n, 4);
-                        e.dispatch(((*n as usize).div_ceil(256), 1), 256);
-                    }
-                    MOp::PleGate {
-                        pipe, k, q, v, out, n, hc, ..
-                    } => {
-                        e.pipe(*pipe);
-                        e.buf(arena, *k, 0);
-                        e.buf(arena, *q, 1);
-                        e.buf(arena, *v, 2);
-                        e.buf(arena, *out, 3);
-                        e.bytes(&[*n, *hc], 4);
-                        e.dispatch((*hc as usize, 1), 1024);
-                    }
-                    MOp::Steer { pipe, x, hot, cold, p } => {
-                        e.pipe(*pipe);
-                        e.buf(arena, *x, 0);
-                        e.buf(arena, *hot, 1);
-                        e.buf(arena, *cold, 2);
-                        e.bytes(p, 3);
-                        e.dispatch((1, 1), 1024);
-                    }
-                    MOp::NeuronEdit { pipe, act, hot, n } => {
-                        e.pipe(*pipe);
-                        e.buf(arena, *act, 0);
-                        e.buf(arena, *hot, 1);
-                        e.buf(arena, *hot, 2);
-                        e.bytes(&[*n, 0u32, 0, 0], 3);
-                        e.dispatch(((*n as usize).div_ceil(64), 1), 64);
-                    }
-                    MOp::LoraDown { .. } | MOp::LoraUp { .. } => self.encode_lora(e, op, arena, consts, 1),
-                    MOp::Glu {
-                        pipe, g, u, out, n, gelu, ..
-                    } => {
-                        e.pipe(*pipe);
-                        e.buf(arena, *g, 0);
-                        e.buf(arena, *u, 1);
-                        e.buf(arena, *out, 2);
-                        e.bytes(&[*n, *gelu], 3);
-                        e.dispatch(((*n as usize).div_ceil(256), 1), 256);
-                    }
-                    MOp::GdnConv {
-                        pipe,
-                        x,
-                        out,
-                        state,
-                        w,
-                        dim,
-                        kc,
-                        ..
-                    } => {
-                        #[repr(C)]
-                        struct Gc {
-                            dim: u32,
-                            kc: u32,
-                        }
-                        e.pipe(*pipe);
-                        e.buf(arena, *x, 0);
-                        e.buf(arena, *out, 1);
-                        e.buf(stb[*state].0, stb[*state].1, 2);
-                        e.buf(consts, *w, 3);
-                        e.bytes(&Gc { dim: *dim, kc: *kc }, 4);
-                        e.dispatch(((*dim as usize).div_ceil(256), 1), 256);
-                    }
-                    MOp::GdnRule {
-                        pipe,
-                        c,
-                        z,
-                        b,
-                        a,
-                        out,
-                        state,
-                        cst,
-                        p,
-                        ..
-                    } => {
-                        e.pipe(*pipe);
-                        e.buf(arena, *c, 0);
-                        e.buf(arena, *z, 1);
-                        e.buf(arena, *b, 2);
-                        e.buf(arena, *a, 3);
-                        e.buf(arena, *out, 4);
-                        e.buf(stb[*state].0, stb[*state].1, 5);
-                        e.buf(consts, *cst, 6);
-                        e.bytes(p, 7);
-                        e.dispatch((p.nv as usize, 1), (p.hdk / 32 * p.hdv) as usize);
-                    }
-                    MOp::QsaKey {
-                        pipe, k, kv, w, p, cs: c0, ..
-                    } => {
-                        let mut p = *p;
-                        p.pos = pos as u32;
-                        e.pipe(*pipe);
-                        e.buf(arena, *k, 0);
-                        e.buf(kvb[*kv].0, 0, 1);
-                        e.buf(kvb[*kv].1, 0, 2);
-                        e.buf(consts, *w, 3);
-                        e.bytes(&p, 4);
-                        e.bytes_slice(&cs[*c0..*c0 + 2 * p.half_rot as usize], 5);
-                        e.dispatch((1, 1), p.d as usize);
-                    }
-                    MOp::QsaScore {
-                        pipe,
-                        q,
-                        kv,
-                        w,
-                        p,
-                        top,
-                        cs: c0,
-                        scores,
-                        ..
-                    } => {
-                        let nb = (pos + 1) / p.r as usize;
-                        if nb > *top {
-                            let mut p = *p;
-                            p.nb = nb as u32;
-                            e.pipe(*pipe);
-                            e.buf(arena, *q, 0);
-                            e.buf(kvb[*kv].1, 0, 1);
-                            e.buf(consts, *w, 2);
-                            e.buf(arena, *scores, 3);
-                            e.bytes(&p, 4);
-                            e.bytes_slice(&cs[*c0..*c0 + 2 * p.half_rot as usize], 5);
-                            e.dispatch((nb.div_ceil(256), 1), 256);
-                        }
-                    }
-                    MOp::QsaTopk {
-                        pipe, scores, sel, top, r, ..
-                    } => {
-                        let nb = (pos + 1) / r;
-                        if nb > *top {
-                            e.pipe(*pipe);
-                            e.buf(arena, *scores, 0);
-                            e.buf(arena, *sel, 1);
-                            e.bytes(&[nb as u32, *top as u32, *r as u32, pos as u32], 2);
-                            e.dispatch((1, 1), 1024);
-                        }
-                    }
-                    MOp::Attn {
-                        grp,
-                        pipe,
-                        narrow,
-                        combine,
-                        q,
-                        out,
-                        kv,
-                        gate,
-                        window,
-                        p,
-                        threads,
-                        hd,
-                        sel,
-                        ..
-                    } => {
-                        let mut p = *p;
-                        p.len = (pos + 1) as u32;
-                        p.lo = window.map_or(0, |w| (pos + 1).saturating_sub(w)) as u32;
-                        let mut pipe = *pipe;
-                        if let Some(sl) = qsa_list(sel, pos) {
-                            (pipe, p.len, p.lo) = (sl.0, sl.2 as u32, 0);
-                            e.buf(arena, sl.1, 7);
-                        }
-                        // Keys per threadgroup: one pass of its 8 SIMD-groups (256 keys) at least, so
-                        // long contexts spread over up to ATTN_MAX_SPLIT threadgroups per head.
-                        let n = (p.len - p.lo) as usize;
-                        let chunk = n.div_ceil(ATTN_MAX_SPLIT).next_multiple_of(256).max(256);
-                        p.nsplit = n.div_ceil(chunk) as u32;
-                        p.chunk = chunk as u32;
-                        let mut grp = *grp;
-                        if sel.is_none() {
-                            (pipe, grp) = attn_narrow(pipe, grp, narrow, n);
-                        }
-                        e.pipe(pipe);
-                        e.buf(arena, *q, 0);
-                        e.buf(kvb[*kv].0, 0, 1);
-                        e.buf(kvb[*kv].1, 0, 2);
-                        e.buf(arena, *out, 3);
-                        e.buf(arena, gate.unwrap_or(0), 4);
-                        e.bytes(&p, 5);
-                        e.buf(arena, self.part, 6);
-                        e.dispatch((p.nh as usize / grp, p.nsplit as usize), *threads);
-                        if p.nsplit > 1 {
-                            e.barrier();
-                            e.pipe(*combine);
-                            e.buf(arena, self.part, 0);
-                            e.buf(arena, *out, 1);
-                            e.buf(arena, gate.unwrap_or(0), 2);
-                            e.bytes(&p, 3);
-                            e.bytes(hd, 4);
-                            e.dispatch((p.nh as usize, 1), 256);
-                        }
-                    }
-                }
+                self.encode_one(e, op, &kvb, &stb, &stb, pos, cs);
             }
         };
         // The new keys and values go back to the host caches (scratch ones stay on the device,
@@ -7673,6 +7910,218 @@ impl DecodePlan for MetalPlan<'_> {
             );
         }
         true
+    }
+}
+
+impl MetalPlan<'_> {
+    /// [`DecodePlan::greedy`]. Pass k (at position `pos + k`) starts with the input rows of the
+    /// token in slot (k + 1) % 2 (`dec_embed`; `first` for pass 0) and ends with the argmax of
+    /// its logits into slot k % 2 (`dec_amax_part` / `dec_amax_fin`), in two command buffers as a
+    /// step (the first small, so the GPU starts while the rest is encoded). Pass k + 1 is queued
+    /// before the host reads pass k's token, after which it appends pass k's keys and values to
+    /// the host caches (the device copies hold them already) and asks `on`. The recurrent states
+    /// alternate between the host's copy (read by even passes) and the plan's second one (read by
+    /// odd passes), so that a pass queued past a stop leaves the kept passes' states untouched;
+    /// they end in the host's copy.
+    fn greedy_impl(&self, slot: &mut Slot, g: crate::gpu::decode::Greedy) -> Option<usize> {
+        use crate::generate::Chain;
+        let ch = self.chain.as_ref()?;
+        let crate::gpu::decode::Greedy {
+            pos: pos0,
+            first,
+            max,
+            rope_cs,
+            kv,
+            states,
+            states_kept: _,
+            on,
+        } = g;
+        let max = max.min(self.max_len.saturating_sub(pos0));
+        if max == 0
+            || self.tokens != 1
+            || self.gate.is_some()
+            || self.pf.is_some()
+            || kv.len() != self.kv.len()
+            || states.len() != self.states.len()
+            || states.iter().zip(&self.states).any(|(a, &n)| a.len() != n)
+            || ch.alt.len() != states.len()
+        {
+            return None;
+        }
+        let _g = self.lock.lock().unwrap();
+        let ms = self.slot_of(slot);
+        if !self.sync_kv(ms, kv, pos0, max.min(CHAIN_ROOM)) || !self.wrap_states(ms, states) {
+            return None;
+        }
+        let (be, f, arena) = (self.be, &self.f, self.arena);
+        let base = f.contents(arena);
+        for (i, st) in self.strengths.1.iter().enumerate() {
+            // SAFETY: the plan reserved one float per strength at this offset of the arena.
+            unsafe { *(base.add(self.strengths.0) as *mut f32).add(i) = st.get() };
+        }
+        let slot_ptr = |k: usize| unsafe { (base as *mut u32).add(ch.tok + k % 2) };
+        // SAFETY: the token slots are the plan's, no pass of it runs.
+        unsafe { *slot_ptr(1) = first };
+        let host_st: Vec<(Id, usize)> = ms
+            .states
+            .iter()
+            .map(|(_, _, b)| b.as_ref().map_or((std::ptr::null_mut(), 0), |b| (b.id, b.offset_bytes)))
+            .collect();
+        let alt_st: Vec<(Id, usize)> = ch.alt.iter().map(|&b| (b, 0)).collect();
+        let end = self.ops.len();
+        // As a step's: a small first command buffer.
+        let at = |from: usize| (from..end).find(|&i| matches!(self.ops[i], MOp::Barrier)).unwrap_or(end);
+        let cut = at(end / 16);
+        let parts = [0..cut, cut..end];
+        let indirect = if be.residency.is_some() { &[][..] } else { &self.indirect[..] };
+        let retain: Msg0 = be.o.msg_send();
+        let s_retain = be.o.sel(c"retain");
+        let (vocab, lx) = (ch.logits.1, ch.logits.0);
+        let submit = |k: usize, kvb: &[(Id, Id)]| -> Vec<Id> {
+            let pos = pos0 + k;
+            let cs = rope_cs(pos);
+            // Pass k reads copy k % 2 of the recurrent states and writes the other.
+            let (si, so) = if k.is_multiple_of(2) {
+                (&host_st, &alt_st)
+            } else {
+                (&alt_st, &host_st)
+            };
+            unsafe {
+                let pool = (be.sels.pool_push)();
+                let mut cbs = Vec::with_capacity(parts.len());
+                for (pi, r) in parts.iter().enumerate() {
+                    let cb = (f.msg0)(be.queue, f.s_cb);
+                    let enc = (f.enc_type)(cb, f.s_enc_type, 1); // MTLDispatchTypeConcurrent
+                    let e = FastEnc { enc, f };
+                    e.use_resources(indirect);
+                    if pi == 0 {
+                        for p in &ch.emb {
+                            let mut p = *p;
+                            p.tok = (ch.tok + (k + 1) % 2) as u32;
+                            e.pipe(ch.embed);
+                            e.buf(arena, 0, 0);
+                            e.bytes(&p, 1);
+                            e.dispatch(((p.n as usize / 32).div_ceil(64), 1), 64);
+                        }
+                        e.barrier();
+                    }
+                    for i in r.clone() {
+                        self.encode_one(&e, &self.ops[i], kvb, so, si, pos, &cs);
+                    }
+                    if pi + 1 == parts.len() {
+                        let ap = AmP {
+                            n: vocab as u32,
+                            x: lx as u32,
+                            part: ch.part as u32,
+                            tok: (ch.tok + k % 2) as u32,
+                        };
+                        e.barrier();
+                        e.pipe(ch.amax_part);
+                        e.buf(arena, 0, 0);
+                        e.bytes(&ap, 1);
+                        e.dispatch((vocab.div_ceil(1024), 1), 256);
+                        e.barrier();
+                        e.pipe(ch.amax_fin);
+                        e.buf(arena, 0, 0);
+                        e.bytes(&ap, 1);
+                        e.dispatch((1, 1), 1024);
+                    }
+                    (f.void)(enc, f.s_end);
+                    (f.void)(cb, f.s_commit);
+                    retain(cb, s_retain);
+                    cbs.push(cb);
+                }
+                (be.sels.pool_pop)(pool);
+                cbs
+            }
+        };
+        let wait = |cbs: &[Id]| -> bool {
+            let mut ok = true;
+            for &cb in cbs {
+                unsafe {
+                    (f.void)(cb, f.s_wait);
+                    ok &= (f.status)(cb, f.s_status) == 4;
+                }
+            }
+            ok
+        };
+        let release = |cbs: Vec<Id>| {
+            for cb in cbs {
+                unsafe { (f.void)(cb, f.s_release) };
+            }
+        };
+        let mut kvb: Vec<(Id, Id)> = ms.kv.iter().map(|m| (m.k, m.v)).collect();
+        type Queue = std::collections::VecDeque<(usize, Vec<Id>)>;
+        // Queues pass k, growing the device KV copies first if they are full (the passes in
+        // flight finish first: the copy takes the rows they wrote).
+        let push = |q: &mut Queue, k: usize, ms: &mut MetalSlot, kvb: &mut Vec<(Id, Id)>, ok: &mut bool| {
+            let need = pos0 + k + 1;
+            if ms.kv.iter().any(|m| m.cap < need) {
+                for (_, cbs) in q.iter() {
+                    *ok &= wait(cbs);
+                }
+                for (i, m) in ms.kv.iter_mut().enumerate() {
+                    if m.cap < need {
+                        *ok &= self.grow_mirror(m, self.kv[i].0 * self.kv[i].1, pos0 + k, need + CHAIN_ROOM);
+                    }
+                }
+                *kvb = ms.kv.iter().map(|m| (m.k, m.v)).collect();
+            }
+            q.push_back((k, submit(k, kvb)));
+        };
+        let mut q: Queue = Queue::new();
+        let (mut sub, mut kept, mut stopped, mut last, mut ok) = (0usize, 0usize, false, false, true);
+        while sub < max.min(2) {
+            push(&mut q, sub, ms, &mut kvb, &mut ok);
+            sub += 1;
+        }
+        while let Some((k, cbs)) = q.pop_front() {
+            ok &= wait(&cbs);
+            release(cbs);
+            if !ok || stopped {
+                continue;
+            }
+            kept = k + 1;
+            let pos = pos0 + k;
+            for (i, (m, c)) in ms.kv.iter_mut().zip(kv.iter_mut()).enumerate() {
+                let row = self.kv[i].0 * self.kv[i].1;
+                // SAFETY: pass k has completed; its keys and values are in row `pos` of the copies.
+                unsafe {
+                    let kr = std::slice::from_raw_parts((f.contents(m.k) as *const f32).add(pos * row), row);
+                    let vr = std::slice::from_raw_parts((f.contents(m.v) as *const f32).add(pos * row), row);
+                    c.push(kr, vr, 1);
+                }
+                m.synced = pos + 1;
+                c.kept = c.len;
+            }
+            // SAFETY: pass k has completed; pass k + 1 writes the other slot.
+            match on(unsafe { *slot_ptr(k) }) {
+                Chain::Go if !last && sub < max => {
+                    push(&mut q, sub, ms, &mut kvb, &mut ok);
+                    sub += 1;
+                }
+                Chain::Go => {}
+                Chain::Last => last = true,
+                Chain::Stop => stopped = true,
+            }
+        }
+        if ok && kept % 2 == 1 && !alt_st.is_empty() {
+            // The kept passes' states are in the second copy: back to the host's.
+            ok &= run_concurrent(be, f, std::slice::from_ref(&(0..1)), |e, _| {
+                for ((a, h), &n) in alt_st.iter().zip(&host_st).zip(&self.states) {
+                    e.pipe(ch.copy);
+                    e.buf(a.0, a.1, 0);
+                    e.buf(h.0, h.1, 1);
+                    e.bytes(&(n as u32), 2);
+                    e.dispatch((n.div_ceil(256), 1), 256);
+                }
+            })
+            .0;
+        }
+        if !ok {
+            panic!("Metal: a chained decode pass failed (OXINFER_GPU_PLAN_DEBUG=1 says why)");
+        }
+        Some(kept)
     }
 }
 
@@ -8118,6 +8567,171 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The greedy chain's kernels against the host: `dec_embed` against `Table::row` (times a
+    /// scale) for every table kind it reads, and `dec_amax_part` / `dec_amax_fin` against
+    /// `crate::sampler::argmax` (ties, NaNs, infinities, partial blocks).
+    #[test]
+    fn chain_embed_and_argmax_match_host() {
+        use crate::model::Table;
+        let Ok(be) = MetalBackend::new() else { return };
+        let f = Fns::new(&be);
+        let (embed, apart, afin) = (
+            be.named_pipeline("dec_embed").unwrap(),
+            be.named_pipeline("dec_amax_part").unwrap(),
+            be.named_pipeline("dec_amax_fin").unwrap(),
+        );
+        let mut seed = 11u64;
+        let (rows, n) = (9usize, 1024usize);
+        // Arena: the token slot at float 0, the row at float 64; the logits after.
+        let new_len: MsgNewBufLen = be.o.msg_send();
+        let arena = unsafe { new_len(be.device, be.sels.new_buffer_len, (64 + n + 300_000 + 1024) * 4, 0) };
+        assert!(!arena.is_null());
+        let ap = f.contents(arena);
+        let a = |i: usize| unsafe { (ap as *mut f32).add(i) };
+        let w16: Vec<u16> = (0..rows * n).map(|_| (lcg(&mut seed).to_bits() >> 16) as u16).collect();
+        let mut tables: Vec<(String, Table)> = Vec::new();
+        for k in [
+            GgmlType::F32,
+            GgmlType::F16,
+            GgmlType::BF16,
+            GgmlType::Q8_0,
+            GgmlType::Q4_0,
+            GgmlType::Q4_1,
+            GgmlType::Q5_0,
+            GgmlType::Q5_1,
+            GgmlType::Q2_K,
+            GgmlType::Q4_K,
+            GgmlType::Q5_K,
+            GgmlType::Q6_K,
+        ] {
+            let raw = crate::ggml::random_blocks(k, rows * n / k.block_size(), &mut seed);
+            tables.push((format!("{k:?}"), Table::Gguf(GgufMatrix::from_bytes(k, &raw, rows, n).unwrap())));
+        }
+        let mut w16p = PageVec::<u16>::zeroed(w16.len());
+        w16p.copy_from_slice(&w16);
+        let w16s: &'static [u16] = &Box::leak(Box::new(w16p))[..];
+        tables.push(("bf16".into(), Table::Bf16(w16s)));
+        tables.push(("q8".into(), Table::Q8(crate::quant::quantize_bf16(&w16, rows, n))));
+        tables.push(("q4".into(), Table::Q4(crate::quant::quantize_q4(&w16, rows, n))));
+        let mut q4a = crate::quant::quantize_q4(&w16, rows, n);
+        let ov: Vec<u16> = (0..rows * n / 64).map(|_| (lcg(&mut seed).to_bits() >> 16) as u16).collect();
+        let mut ovp = PageVec::<u16>::zeroed(ov.len());
+        ovp.copy_from_slice(&ov);
+        q4a.offsets = Some(crate::quant::Offsets {
+            v: QBuf::from(ovp),
+            group: 64,
+        });
+        tables.push(("q4 affine".into(), Table::Q4(q4a)));
+        for (bits, group) in [(2usize, 64usize), (4, 64), (8, 32)] {
+            let per = 32 / bits;
+            let wb: Vec<u8> = (0..rows * n / per * 4)
+                .map(|i| (lcg(&mut seed).to_bits() >> (i % 13)) as u8)
+                .collect();
+            let sb: Vec<u8> = (0..rows * n / group)
+                .flat_map(|_| ((lcg(&mut seed).to_bits() >> 16) as u16).to_le_bytes())
+                .collect();
+            let bb: Vec<u8> = (0..rows * n / group)
+                .flat_map(|_| ((lcg(&mut seed).to_bits() >> 16) as u16).to_le_bytes())
+                .collect();
+            let leak = |v: Vec<u8>| -> &'static [u8] {
+                let mut p = PageVec::<u8>::zeroed(v.len());
+                p.copy_from_slice(&v);
+                &Box::leak(Box::new(p))[..]
+            };
+            let (wb, sb, bb) = (leak(wb), leak(sb), leak(bb));
+            use crate::safetensors::TablePart::Mem;
+            tables.push((
+                format!("mlx {bits}-bit"),
+                Table::Mlx {
+                    parts: [Mem(wb), Mem(sb), Mem(bb)],
+                    q: crate::safetensors::MlxQuant { bits, group },
+                },
+            ));
+        }
+        for (name, t) in &tables {
+            let (mut shared, mut indirect) = (Vec::new(), Vec::new());
+            let scale = if name.starts_with('Q') { 1.0 } else { 39.191835 };
+            let p = be
+                .embed_params(t, n, scale, 64, &mut shared, &mut indirect)
+                .unwrap_or_else(|| panic!("{name}: no device table"));
+            for row in [0usize, 4, rows - 1] {
+                unsafe { *(ap as *mut u32) = row as u32 };
+                let (ok, _) = run_concurrent(&be, &f, std::slice::from_ref(&(0..1)), |e, _| {
+                    e.use_resources(&indirect);
+                    e.pipe(embed);
+                    e.buf(arena, 0, 0);
+                    e.bytes(&p, 1);
+                    e.dispatch(((n / 32).div_ceil(64), 1), 64);
+                });
+                assert!(ok);
+                let mut want = vec![0f32; n];
+                t.row(row, &mut want);
+                want.iter_mut().for_each(|v| *v *= scale);
+                for (i, &w) in want.iter().enumerate() {
+                    let g = unsafe { *a(64 + i) };
+                    assert!(g == w || (g.is_nan() && w.is_nan()), "{name} row {row} [{i}]: {g} vs {w}");
+                }
+            }
+            for b in shared {
+                if be.unwrap_shared(b) {
+                    unsafe { (f.void)(b, f.s_release) };
+                }
+            }
+        }
+        // The argmax.
+        let x0 = 64 + n;
+        let part = x0 + 300_000;
+        let mut cases: Vec<Vec<f32>> = Vec::new();
+        for len in [1usize, 1000, 1024, 1025, 151_936, 262_144] {
+            let v: Vec<f32> = (0..len).map(|_| lcg(&mut seed)).collect();
+            cases.push(v.clone());
+            // Ties: the same maximum at several indices, the first must win.
+            let mut t = v.clone();
+            for &i in &[len / 2, len / 3, len - 1, 7.min(len - 1)] {
+                t[i] = 9.0;
+            }
+            cases.push(t);
+            // NaNs never win; -inf everywhere gives 0.
+            let mut nn = v.clone();
+            for i in (0..len).step_by(3) {
+                nn[i] = f32::NAN;
+            }
+            cases.push(nn);
+            cases.push(vec![f32::NEG_INFINITY; len]);
+            let mut inf = vec![f32::NEG_INFINITY; len];
+            inf[len - 1] = -1e30;
+            cases.push(inf);
+            let mut pinf = v.clone();
+            pinf[len / 4] = f32::INFINITY;
+            pinf[len - 1] = f32::INFINITY;
+            cases.push(pinf);
+        }
+        for (ci, v) in cases.iter().enumerate() {
+            unsafe { std::ptr::copy_nonoverlapping(v.as_ptr(), a(x0), v.len()) };
+            let p = AmP {
+                n: v.len() as u32,
+                x: x0 as u32,
+                part: part as u32,
+                tok: 1,
+            };
+            let (ok, _) = run_concurrent(&be, &f, std::slice::from_ref(&(0..1)), |e, _| {
+                e.pipe(apart);
+                e.buf(arena, 0, 0);
+                e.bytes(&p, 1);
+                e.dispatch((v.len().div_ceil(1024), 1), 256);
+                e.barrier();
+                e.pipe(afin);
+                e.buf(arena, 0, 0);
+                e.bytes(&p, 1);
+                e.dispatch((1, 1), 1024);
+            });
+            assert!(ok);
+            let got = unsafe { *(ap as *const u32).add(1) };
+            assert_eq!(got, crate::sampler::argmax(v), "case {ci} ({} values)", v.len());
+        }
+        unsafe { (f.void)(arena, f.s_release) };
     }
 
     /// Encodes a multi-token matvec (`mvk_*`, pipeline, rows per threadgroup, SIMD-groups per row)

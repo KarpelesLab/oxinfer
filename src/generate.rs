@@ -102,6 +102,9 @@ impl TextLm for Model<'_> {
     fn forward(&self, sess: &mut Session, tokens: &[u32]) -> Vec<f32> {
         Model::forward(self, sess, tokens)
     }
+    fn decode_greedy(&self, sess: &mut Session, first: u32, max: usize, on: &mut dyn FnMut(u32) -> Chain) -> Option<usize> {
+        Model::decode_greedy(self, sess, first, max, on)
+    }
     fn prefill_chunk(&self, chunk: usize) -> usize {
         Model::prefill_chunk(self, chunk)
     }
@@ -138,6 +141,9 @@ impl TextLm for QwenModel<'_> {
     }
     fn forward(&self, sess: &mut QwenSession, tokens: &[u32]) -> Vec<f32> {
         QwenModel::forward(self, sess, tokens)
+    }
+    fn decode_greedy(&self, sess: &mut QwenSession, first: u32, max: usize, on: &mut dyn FnMut(u32) -> Chain) -> Option<usize> {
+        QwenModel::decode_greedy(self, sess, first, max, on)
     }
 }
 

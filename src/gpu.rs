@@ -353,6 +353,7 @@ static ACTIVE: OnceLock<Option<Box<dyn Backend>>> = OnceLock::new();
 static EXACT: AtomicU8 = AtomicU8::new(0);
 static MOE: AtomicU8 = AtomicU8::new(0);
 static DECODE: AtomicU8 = AtomicU8::new(0);
+static CHAIN: AtomicU8 = AtomicU8::new(0);
 
 fn switch(a: &AtomicU8, env: &'static OnceLock<Option<String>>, var: &str, on_env: fn(&str) -> bool, default: bool) -> bool {
     match a.load(Ordering::Relaxed) {
@@ -433,6 +434,29 @@ pub fn set_decode(on: Option<bool>) {
 pub fn decode_enabled() -> bool {
     static ENV: OnceLock<Option<String>> = OnceLock::new();
     switch(&DECODE, &ENV, "OXINFER_GPU_DECODE", |v| v != "0", true)
+}
+
+/// Chains greedy decoding on the device: where a model decodes whole tokens on the GPU, each
+/// pass ends with the argmax of its logits and the next pass starts from that token's embedding
+/// row, both computed on the device, so the next pass is queued while the host reads a token
+/// (plain greedy decoding, the plain rounds of prompt lookup and DSpark). The tokens are those of
+/// the host's argmax, bit for bit. Process-wide, read when a reply starts. None restores the
+/// default (on, or `OXINFER_GPU_CHAIN=0|1`).
+pub fn set_decode_chain(on: Option<bool>) {
+    CHAIN.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// See [`set_decode_chain`].
+pub fn decode_chain_enabled() -> bool {
+    static ENV: OnceLock<Option<String>> = OnceLock::new();
+    switch(&CHAIN, &ENV, "OXINFER_GPU_CHAIN", |v| v != "0", true)
 }
 
 /// Decodes on the device also when the weights stream from storage (`crate::stream`): the

@@ -102,6 +102,10 @@ Orpheus and 26B-A4B GPU rows are tg128 from the
 | Inkling-2-Mini | release (NVFP4 experts) | | 56 tok/s | |
 | Inkling-2-Mini | mlx-community 4bit | | 70 tok/s | |
 
+Greedy decoding now chains the passes on the device (the argmax and the next input row on the
+GPU, the next pass queued before the host reads a token): +2-10% over these figures, see
+[Greedy decoding chained on the device](#greedy-decoding-chained-on-the-device-november-2026).
+
 Long contexts cost attention time (the KV cache stays f32): Llama-3.2-1B Q4_K_M decodes at 297
 tok/s after a 2.5k-token prompt (CPU decode 139). The first step of a model compiles its plan
 (~0.1-0.2 s); a multi-token pass (the prompt) builds it ahead.
@@ -1290,6 +1294,102 @@ chain's biased logits against an f64 product and its tokens against the host's a
 The next lever on Qwen3-8B: the draft's block pass itself (4 ms of GPU time for about 1 GB of
 weights, 250 GB/s, half of it the 152k x 4096 Q6_K LM head over 8 rows on the fast batched
 kernels; the target's one-token step reads 4.7 GB at 490 GB/s).
+
+#### Greedy decoding chained on the device (November 2026)
+
+Until now only Inkling-2 (its own engine) chained greedy passes on the GPU; every model on the
+general decode plan (Llama, Qwen3, Qwen3.5 / 3.8, Qwen MoE, Gemma 3, Gemma 4 dense and MoE)
+went back to the host after each token: wait for the command buffers, copy the logits out, take
+the argmax, look up the next token's embedding row (and Gemma's per-layer row), encode and commit
+the next pass. The GPU sat idle for that round trip (~0.2 ms with the host's wake-up and the
+GPU's restart), and an idle GPU starts the next burst slower.
+
+**What runs now** (`DecodePlan::greedy`, `MetalPlan::greedy_impl`; `TextLm::decode_greedy` for
+`QwenModel` and `Model`). A one-token plan whose graph names its token table (`Graph::embed`,
+and `Graph::embed2` for Gemma's per-layer embeddings) can run a chain of passes: pass k starts
+with `dec_embed`, which reads the token in slot (k + 1) % 2 of the arena and writes its
+dequantized row (times Gemma's `sqrt(hidden)`) into the input, and ends with `dec_amax_part` /
+`dec_amax_fin`, the argmax of the pass's logits into slot k % 2. Pass k + 1 is encoded and
+committed while pass k runs, so the GPU always has the next pass queued; the host waits for pass
+k, appends its keys and values to the host caches (the device copies have them already) and hands
+the token to the caller (`generate::Chain`: go on, stop, or queue nothing more). A pass queued
+past a stop is undone: its keys and values are never appended, and the recurrent states (Gated
+DeltaNet's conv and delta-rule states) alternate between the host's copy and a second device
+copy (even passes read the host's, odd passes the other; `dec_gdn_conv` / `dec_gdn_rule` read
+`si` and write `st`, the same buffer outside chains), so the kept passes' states are intact; an
+odd number of kept passes ends with one copy back to the host's buffer. The device KV copies
+grow as in a step (the passes in flight finish first, and the copy keeps the rows they wrote).
+
+- `dec_embed` dequantizes as the host's `Table::row` does, operation for operation without
+  contraction: GGUF F32, F16, BF16, Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, Q2_K, Q4_K, Q5_K, Q6_K, bf16
+  tables, oxinfer's int8 and Q4 tables (affine offsets included) and MLX affine tables. Other
+  tables (Q3_K, i-quants, repacked rows, tables with LoRA row updates or Hadamard folds) keep the
+  host loop.
+- The argmax is the host's rule (`sampler::argmax`): the first index of the largest value above
+  -inf, NaNs never win, 0 when nothing does.
+- Where it runs: plain greedy replies (`generate::decode`) and the rounds of prompt lookup without
+  a draft worth verifying (`lookup.rs` already took `decode_greedy`: when a draft appears, the
+  queued pass still runs and its token starts the verification round). Not with sampling, a
+  repetition penalty, a grammar or log probabilities (the sampler is not `plain_greedy`), with
+  interventions, captures, explicit M-RoPE positions or deepstack inputs, streamed weights,
+  Qwen4-Exp, `OXINFER_GPU_DECODE_CHECK`, or on CUDA (its plans have no chain yet).
+- Off switch: `--gpu-chain off`, engine / server / C API key `gpu_chain=0`,
+  `oxinfer::gpu::set_decode_chain(Some(false))`, or `OXINFER_GPU_CHAIN=0` (it turns off
+  Inkling-2's chain as well). `parity_bench ... chain_ab=1` alternates the two run by run.
+
+**Results** (M5 Max, `parity_bench MODEL pp= tg=128 reps=3 lookup=0 draft=none mtp=0`, best of
+3; master `f588d9f` ("before"), this build with the chain off and on alternated run by run
+(`chain_ab=1`), two sets each under the bench lock; llama.cpp `llama-bench -n 128 -p 0 -r 3` on
+Metal, the build of the prefill rounds. Another session's GPU jobs ran now and then: the
+26B-A4B, E4B and Qwen3-8B Q8_0 sets had disturbed runs, the clean ones are quoted). tok/s:
+
+| model | llama.cpp | before | chain off | chain on | on / before | on / llama.cpp |
+|---|---:|---:|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | 440 | 472-474 | 474-475 | **522-523** | 1.10 | 1.19 |
+| Llama-3.2-1B Q8_0 | 317 | 344-346 | 335-339 | **363-366** | 1.06 | 1.15 |
+| Gemma 4 E2B Q8_0 | 139 | 164.7-164.8 | 164.9-165.0 | **172.6-172.7** | 1.05 | 1.24 |
+| Gemma 4 E4B Q8_0 | 81 | 92.7 | 93.2 | **95.8** | 1.03 | 1.18 |
+| Gemma 4 26B-A4B Q4_0 | 121-126 | 148.3 | 147-148 | **154.5-154.9** | 1.04 | 1.23 |
+| Qwen3-8B Q4_K_M | 98.8 | 103.8-104.3 | 104.0 | **107.3-107.4** | 1.03 | 1.09 |
+| Qwen3-8B Q8_0 | 61.2 | 66.5-66.6 | 66.6 | **67.9** | 1.02 | 1.11 |
+
+The CLI (200 greedy tokens, `--no-system`, two prompts, chain off -> on): Llama 1B Q4_K_M
+466 -> 519 tok/s (`--no-lookup`), Q8_0 339-350 -> 367-371 (prompt lookup on: its plain rounds
+chain), Gemma 4 E2B 162 -> 170, E4B 92-95 -> 95-96, 26B-A4B 141-143 -> 151-152, Qwen3-8B Q4_K_M
+102 -> 105-106, Qwen3.5-0.8B (bf16, Gated DeltaNet) 274-276 -> 292-293 (`--no-lookup`) and
+253-274 -> 291-292 (prompt lookup on).
+
+The gain is the round trip per token, so it is largest where a pass is shortest: 0.20 ms of a
+2.1 ms pass on Llama 1B Q4_K_M (+10%), 0.3 ms of 9.6 ms on Qwen3-8B Q4_K_M (+3%). The "chain
+off" column is the step path of this build (the single-token op encoding moved into
+`MetalPlan::encode_one`, shared by steps and chains); it measures as master within noise (the
+Llama Q8_0 sets 1-3% below master moved by run).
+
+**Correctness.** Each chained pass runs the same kernels on the same inputs as a step: the
+input rows are bit for bit the host's (`chain_embed_and_argmax_match_host` checks every table
+kind against `Table::row`, and the argmax against `sampler::argmax` with ties, NaNs, infinities
+and partial blocks), so the logits are unchanged. `tests/gpu_chain.rs` runs tiny Llama (bf16,
+int8, Q4 tables), Gemma 4 (per-layer embeddings) and Qwen3.5 (Gated DeltaNet) checkpoints and
+checks the chain's tokens against host steps and the next host step's logits bit for bit after a
+whole chain (300 passes, past the device KV copies' growth), stops at the 1st, 7th and 8th token
+(odd and even kept passes), `Chain::Last`, and limited passes. With `--no-system`, 200 greedy
+tokens on two prompts were byte for byte the unchained output on Llama 1B Q4_K_M and Q8_0, Gemma
+4 E2B, E4B and 26B-A4B, Qwen3-8B Q4_K_M, Qwen3-8B Q8_0 with its defaults (DSpark, prompt lookup)
+and Qwen3.5-0.8B (with and without prompt lookup).
+
+**Kept as it was / not done:**
+
+- **Sampling stays on the host.** The host's sampler sorts the top-k candidates with an unstable
+  sort (the order of equal logits is the sort's), takes `exp` from the platform's libm and sums
+  in its own order; a GPU sampler drawing from the same xorshift stream would part from it on
+  ties and in the last bits of the probabilities, so a sampled reply would differ from the
+  host's. Only greedy decoding chains.
+- **DSpark's plain rounds** on Qwen3 / Gemma do not chain: they need the draft's features of
+  every pass, which the one-token plan does not capture (Inkling's passes copy them into the
+  token slot's capture rows). They cost a plain step as before.
+- **CUDA** plans have no chain yet (`DecodePlan::greedy` returns None there).
+- Three passes in flight: not tried; with one pass queued the GPU never waits on the host (the
+  host's work per token, the KV rows and the callback, is far below a pass).
 
 #### M3 Ultra (November 2026)
 
