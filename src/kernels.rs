@@ -101,10 +101,18 @@ impl ScratchScope {
     }
 }
 
+/// Whether a [`ScratchScope`] is open.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn scratch_open() -> bool {
+    SCRATCH_SCOPES.load(std::sync::atomic::Ordering::Relaxed) > 0
+}
+
 impl Drop for ScratchScope {
     fn drop(&mut self) {
         if SCRATCH_SCOPES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
             SCRATCH_POOL.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            #[cfg(target_arch = "x86_64")]
+            i8gemm::drop_kept();
         }
     }
 }
@@ -346,6 +354,32 @@ fn grouped_blocks(segs: &[(usize, usize)], n_out: usize, row_bytes: usize, rq: u
     blocks
 }
 
+/// Row ranges of about `rows` rows for the pool jobs of a matmul into `y` (`[_, n_out]`), as
+/// their boundaries (`0 ..= n_out`), placed where every token's outputs cross a cache line: two
+/// jobs then never write the same line. With boundaries at multiples of `rows` from 0, a buffer
+/// that does not start on a line (a large `Vec` starts 16 bytes into one) has every job share a
+/// line per token with each neighbour, and the jobs of a matmul store their outputs at the same
+/// time: on 32 cores those stores took most of a grouped matmul of 32 tokens per expert.
+#[cfg(target_arch = "x86_64")]
+fn line_aligned_rows(y: *const f32, n_out: usize, rows: usize) -> Vec<usize> {
+    let a = y as usize;
+    // Rows from the start of a token's outputs to its first line boundary (the same for every
+    // token when a token's outputs are whole lines).
+    let off = if n_out.is_multiple_of(16) && a.is_multiple_of(4) {
+        (64 - a % 64) % 64 / 4
+    } else {
+        0
+    };
+    let mut v = vec![0];
+    let mut r = if off == 0 { rows } else { off };
+    while r < n_out {
+        v.push(r);
+        r += rows;
+    }
+    v.push(n_out);
+    v
+}
+
 /// Grouped matmuls over row segments of one input (MoE experts, each with the tokens routed to
 /// it): job `j` multiplies rows `segs[j].0 .. + segs[j].1` of `x` (`[_, n_in]`) by `ws[j]`
 /// (`[n_out, n_in]`) into the same rows of `y` (`[_, n_out]`), all in one parallel region.
@@ -466,6 +500,46 @@ pub fn matmul_quant_grouped<M: QMat>(ms: &[&M], segs: &[(usize, usize)], x: &[f3
         } else {
             let (sq, nq): (Vec<usize>, Vec<usize>) = (0..blocks.len()).partition(|&b| on_sme(b));
             two_queues(&sq, &nq, &run);
+        }
+        return;
+    }
+    // x86-64 with AVX-512 VNNI, `fast`: each segment's tokens in int8 groups of 16 of their own
+    // (segments start on any multiple of TN), jobs of the int8 GEMM's rows and tokens within a
+    // segment; a segment's trailing zero rows (its padding) are skipped and get zeros.
+    #[cfg(target_arch = "x86_64")]
+    if i8_planes() == Some(false) && n_in.is_multiple_of(crate::quant::QBLOCK) && ms.iter().all(|m| m.i8_layout().is_some()) {
+        let live: Vec<(usize, usize)> = segs
+            .iter()
+            .map(|&(s, len)| {
+                let mut e = s + len;
+                while e > s && x[(e - 1) * n_in..e * n_in].iter().all(|&v| v == 0.0) {
+                    e -= 1;
+                }
+                (s, e - s)
+            })
+            .collect();
+        let (xa, base) = i8gemm::I8Act::segments(x, n_in, &live);
+        let (jr, jt, _, _) = i8gemm::tuning();
+        let starts = line_aligned_rows(y.as_ptr(), n_out, jr);
+        let mut jobs: Vec<(u32, u32, u32, u32)> = Vec::new();
+        for (j, &(_, len)) in live.iter().enumerate() {
+            for c in (0..len).step_by(jt) {
+                for r in starts.windows(2) {
+                    jobs.push((j as u32, r[0] as u32, r[1] as u32, c as u32));
+                }
+            }
+        }
+        let yp = SendPtr(y.as_mut_ptr());
+        pool::run(jobs.len(), &|b| {
+            let (j, r0, r1, c) = jobs[b];
+            let (j, r0, r1, c) = (j as usize, r0 as usize, r1 as usize, c as usize);
+            let (s, len) = live[j];
+            let c1 = (c + jt).min(len);
+            // SAFETY: `i8_planes` checked the CPU; each job owns rows r0..r1 of its tokens.
+            unsafe { i8gemm::gemm_rows_at(ms[j], &xa, base[j] + c, base[j] + c1, r0, r1, yp.get(), s + c) }
+        });
+        for (&(s, len), &(_, n)) in segs.iter().zip(&live) {
+            y[(s + n) * n_out..(s + len) * n_out].fill(0.0);
         }
         return;
     }
@@ -1592,6 +1666,14 @@ pub trait QMat: Sync {
     /// inputs (equal within a block of 32): input `i` is `s[i / 16] * q[i] + m[i / 16]`.
     unsafe fn unpack_cols_i8(&self, _r: usize, _k0: usize, _k1: usize, _q: *mut i8, _s: *mut f32, _m: *mut f32) {
         unreachable!("no int8 GEMM layout")
+    }
+    /// x86-64: a factor of row `r` that [`QMat::unpack_cols_i8`] leaves out (a scale as wide as
+    /// the row beside the format's own: NVFP4's tensor-wide scale, the per-expert scales of
+    /// unsloth's Inkling-2 files), which the int8 GEMM multiplies into the row's sums as the
+    /// decode kernels do. None when no row has one.
+    #[cfg(target_arch = "x86_64")]
+    fn i8_row_factor(&self, _r: usize) -> Option<f32> {
+        None
     }
     /// Unpacks row `r` for the int8 prefill GEMM (see [`I8Layout`]): `q` gets `n_in` values,
     /// `ds` and (`min32`) `mn` `n_in / 32`, (`sc16`) `sc` `n_in / 16`.
@@ -3638,6 +3720,53 @@ mod tests {
                     y[(s + r) * n_out..(s + len) * n_out].iter().all(|&v| v == 0.0),
                     "{kind}: padding rows"
                 );
+            }
+        }
+    }
+
+    /// x86-64: matrices with a factor as wide as their rows (unsloth's per-expert scales, NVFP4's
+    /// tensor-wide one) take the int8 grouped GEMM, the factor multiplied into each row's sums,
+    /// whatever buffer the outputs go to (the jobs' row ranges follow its cache lines).
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn grouped_fast_applies_row_factors() {
+        use crate::ggml::{GgmlType, GgufMatrix, random_blocks};
+        if !i8gemm::available() {
+            return;
+        }
+        crate::pool::init(4);
+        let (n_out, n_in) = (80usize, 256usize);
+        let mut seed = 21u64;
+        let segs = [(0usize, 24usize), (24, 8), (32, 40)];
+        let rows = 72;
+        let x: Vec<f32> = (0..rows * n_in).map(|_| lcg(&mut seed)).collect();
+        for kind in [GgmlType::Q8_0, GgmlType::IQ3_XXS, GgmlType::NVFP4] {
+            let ms: Vec<GgufMatrix> = (0..segs.len())
+                .map(|j| {
+                    let mut m =
+                        GgufMatrix::from_bytes(kind, &random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed), n_out, n_in)
+                            .unwrap();
+                    m.set_factor(0.25 + j as f32).unwrap();
+                    assert!(m.i8_layout().is_some(), "{kind}");
+                    m
+                })
+                .collect();
+            let mut want = vec![0f32; rows * n_out];
+            for (j, &(s, len)) in segs.iter().enumerate() {
+                let mut f = vec![0f32; n_out * n_in];
+                ms[j].dequantize_rows(0, n_out, &mut f);
+                let r = reference(&f, n_out, n_in, &x[s * n_in..(s + len) * n_in], len);
+                want[s * n_out..(s + len) * n_out].copy_from_slice(&r);
+            }
+            let scale = want.iter().fold(0f32, |a, v| a.max(v.abs()));
+            // Outputs at every offset from a cache line.
+            for shift in 0..16 {
+                let mut buf = vec![f32::NAN; rows * n_out + 16];
+                let y = &mut buf[shift..shift + rows * n_out];
+                lm_prefill(|| matmul_quant_grouped(&ms.iter().collect::<Vec<_>>(), &segs, &x, y));
+                for (i, (a, b)) in y.iter().zip(&want).enumerate() {
+                    assert!((a - b).abs() <= 2e-2 * scale, "{kind} shift {shift} [{i}]: {a} vs {b}");
+                }
             }
         }
     }

@@ -1546,10 +1546,19 @@ impl QMat for GgufMatrix {
     }
     #[cfg(target_arch = "x86_64")]
     fn i8_layout(&self) -> Option<crate::kernels::I8Layout> {
-        if self.block_scales.is_some() {
+        // Block scales as wide as the rows are a factor of each row's sums (`i8_row_factor`).
+        if self
+            .block_scales
+            .as_ref()
+            .is_some_and(|bs| self.kind.is_float() || bs.cols < self.n_in)
+        {
             return None;
         }
         avx2::i8_layout(self.kind).map(|(sc16, min32)| crate::kernels::I8Layout { sc16, min32 })
+    }
+    #[cfg(target_arch = "x86_64")]
+    fn i8_row_factor(&self, r: usize) -> Option<f32> {
+        self.sum_factor(r)
     }
     #[cfg(target_arch = "x86_64")]
     unsafe fn unpack_cols_i8(&self, r: usize, k0: usize, k1: usize, q: *mut i8, s: *mut f32, m: *mut f32) {

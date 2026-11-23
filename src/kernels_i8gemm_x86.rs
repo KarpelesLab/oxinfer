@@ -54,33 +54,92 @@ pub(crate) struct I8Act {
 struct P<X>(*mut X);
 unsafe impl<X> Sync for P<X> {}
 
+/// The buffers of dropped activations, kept while a `kernels::ScratchScope` is open.
+type Bufs = (Vec<u8>, Vec<f32>, Vec<f32>);
+static KEPT: std::sync::Mutex<Vec<Bufs>> = std::sync::Mutex::new(Vec::new());
+
+/// Frees the kept buffers (the last `kernels::ScratchScope` closed).
+pub(crate) fn drop_kept() {
+    KEPT.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+impl Drop for I8Act {
+    fn drop(&mut self) {
+        if self.q.capacity() >= 1 << 20 && crate::kernels::scratch_open() {
+            let mut kept = KEPT.lock().unwrap_or_else(|e| e.into_inner());
+            if kept.len() < 4 {
+                kept.push((
+                    std::mem::take(&mut self.q),
+                    std::mem::take(&mut self.s),
+                    std::mem::take(&mut self.f),
+                ));
+            }
+        }
+    }
+}
+
 impl I8Act {
     /// `two` (a second, residual plane) is the aarch64 GEMM's; there is one plane here.
     pub(crate) fn new(x: &[f32], t: usize, n_in: usize, two: bool) -> Self {
         assert_eq!(x.len(), t * n_in);
-        assert!(n_in.is_multiple_of(QBLOCK) && !two);
+        assert!(!two);
+        let groups: Vec<(usize, usize)> = (0..t.div_ceil(T)).map(|g| (T * g, (t - T * g).min(T))).collect();
+        Self::groups(x, n_in, &groups)
+    }
+
+    /// The row segments `(first row, rows)` of `x` (`[_, n_in]`), each in groups of 16 of its
+    /// own (a grouped matmul's segments start anywhere): the activations, and the token index
+    /// in them of each segment's first row (a multiple of 16).
+    pub(crate) fn segments(x: &[f32], n_in: usize, segs: &[(usize, usize)]) -> (Self, Vec<usize>) {
+        let mut groups = Vec::new();
+        let mut base = Vec::with_capacity(segs.len());
+        for &(s, len) in segs {
+            assert!((s + len) * n_in <= x.len());
+            base.push(groups.len() * T);
+            groups.extend((0..len.div_ceil(T)).map(|g| (s + T * g, (len - T * g).min(T))));
+        }
+        (Self::groups(x, n_in, &groups), base)
+    }
+
+    /// Groups of up to 16 consecutive rows of `x`, each `(first row, rows)`.
+    fn groups(x: &[f32], n_in: usize, rows: &[(usize, usize)]) -> Self {
+        assert!(n_in.is_multiple_of(QBLOCK));
         let nb = n_in / QBLOCK;
-        let groups = t.div_ceil(T);
+        let groups = rows.len();
         // Every byte and scale is written below (padding tokens as zeros), so the megabytes are
         // not zero-filled first (that fill, on the calling thread, cost as much as the rounding
         // on all of them).
+        // While a pass keeps its temporaries (`kernels::ScratchScope`), so are these: a prompt
+        // chunk's are megabytes per matmul, and fresh ones are mapped a page at a time by the
+        // threads that write them.
+        let (mut q, mut s, mut f) = match crate::kernels::scratch_open().then(|| KEPT.lock().unwrap_or_else(|e| e.into_inner()).pop()) {
+            Some(Some(b)) => b,
+            _ => Default::default(),
+        };
+        q.clear();
+        s.clear();
+        f.clear();
+        q.reserve(groups * n_in * T);
+        s.reserve(groups * nb * T);
+        f.reserve(groups * nb * T);
         let mut a = Self {
-            q: Vec::with_capacity(groups * n_in * T),
-            s: Vec::with_capacity(groups * nb * T),
-            f: Vec::with_capacity(groups * nb * T),
-            t,
+            q,
+            s,
+            f,
+            t: groups * T,
             n_in,
         };
         let p = (P(a.q.as_mut_ptr()), P(a.s.as_mut_ptr()), P(a.f.as_mut_ptr()));
         let run = |g: usize| {
             let p = &p;
+            let (r, n) = rows[g];
             // SAFETY: the caller of the GEMM checked the CPU features; each group is written by
-            // one task.
+            // one task and reads rows inside `x`.
             unsafe {
                 quantize_group(
-                    x.as_ptr().add(T * g * n_in),
+                    x.as_ptr().add(r * n_in),
                     n_in,
-                    (t - T * g).min(T),
+                    n,
                     p.0.0.add(g * n_in * T),
                     p.1.0.add(g * nb * T),
                     p.2.0.add(g * nb * T),
@@ -321,6 +380,26 @@ pub(crate) fn tuning() -> (usize, usize, usize, usize) {
 /// [`cpu_has_vnni512`] is true; `y` covers the outputs named.
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni,avx2,fma")]
 pub(crate) unsafe fn gemm_rows<M: QMat + ?Sized>(m: &M, xa: &I8Act, c0: usize, c1: usize, r0: usize, r1: usize, y: *mut f32) {
+    gemm_rows_at(m, xa, c0, c1, r0, r1, y, c0)
+}
+
+/// [`gemm_rows`] with the outputs of token `c0 + i` at row `yc0 + i` of `y` (a grouped matmul:
+/// the tokens of [`I8Act::segments`] against the rows of its input).
+///
+/// # Safety
+/// As [`gemm_rows`].
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni,avx2,fma")]
+pub(crate) unsafe fn gemm_rows_at<M: QMat + ?Sized>(
+    m: &M,
+    xa: &I8Act,
+    c0: usize,
+    c1: usize,
+    r0: usize,
+    r1: usize,
+    y: *mut f32,
+    yc0: usize,
+) {
     let lay = m.i8_layout().expect("no int8 GEMM layout");
     let (n_in, n_out) = (m.n_in(), m.n_out());
     debug_assert!(xa.n_in == n_in && c1 <= xa.t && c0.is_multiple_of(T));
@@ -358,9 +437,19 @@ pub(crate) unsafe fn gemm_rows<M: QMat + ?Sized>(m: &M, xa: &I8Act, c0: usize, c
             }
             k0 += kn;
         }
+        if m.i8_row_factor(r0).is_some() {
+            for r in r0..r1 {
+                let fr = _mm512_set1_ps(m.i8_row_factor(r).unwrap_or(1.0));
+                let (rg, i) = ((r - r0) / R, (r - r0) % R);
+                for g in 0..ng {
+                    let a = acc.as_mut_ptr().add((rg * ng + g) * R * T + T * i);
+                    _mm512_storeu_ps(a, _mm512_mul_ps(_mm512_loadu_ps(a), fr));
+                }
+            }
+        }
         for g in 0..ng {
             for ci in 0..(c1 - c0 - T * g).min(T) {
-                let yc = y.add((c0 + T * g + ci) * n_out + r0);
+                let yc = y.add((yc0 + T * g + ci) * n_out + r0);
                 for rg in 0..nrg {
                     let a = acc.as_ptr().add((rg * ng + g) * R * T + ci);
                     for i in 0..(r1 - r0 - R * rg).min(R) {
