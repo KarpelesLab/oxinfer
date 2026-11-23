@@ -250,7 +250,11 @@ IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4. Three things run on the
   buffers per layer: ~6 ms per later chunk of a long prompt, now 0.5-1.2); the prompt's LM head
   runs on the GPU (`matvec_rows`, f32 activations; the CPU's head rounds them to int8, which moves
   Qwen3-8B's first-step log-probabilities by up to 0.08). Qwen3-8B Q4_K_M prompts then run at
-  7588 tok/s at 512 tokens and 7119 at 2048, Llama-3.2-1B Q4_K_M at 32718 and 33050. RMSNorm, RoPE, the
+  7588 tok/s at 512 tokens and 7119 at 2048, Llama-3.2-1B Q4_K_M at 32718 and 33050. The fast
+  GEMM's tile follows the launch (128 x 128, 64 x 128 or 64 x 64 rows x outputs, the largest
+  giving half the SMs a block: the 1024-wide key and value projections take 64 x 64) and two
+  128 x 128 blocks share an SM; the logits do not change (every output sums its steps in the
+  same order): Qwen3-8B 7800 / 7608 tok/s, Llama-3.2-1B 36839 / 36425. RMSNorm, RoPE, the
   activations, the Gated DeltaNet convolution and delta rule (the state in registers across the
   step's tokens) over all tokens in one launch; attention with the decode kernel, 32 tokens per
   launch; the hidden states, the new keys and values and the recurrent states come back to the

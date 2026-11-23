@@ -32,6 +32,26 @@ const VRAM_RESERVE: usize = 512 << 20;
 /// DGX Spark). Set when a backend opens its device.
 static INTEGRATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Streaming multiprocessors of the device in use (set when a backend opens it).
+static SMS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// The fast prefill GEMM's kernel and its tile (rows, outputs) for `n_out` outputs over `rows`
+/// rows: the largest of 128 x 128, 64 x 128 and 64 x 64 that gives at least half the SMs a
+/// block. On an RTX PRO 6000 (188 SMs), 512 tokens: the 1024-wide key / value projections of
+/// Qwen3-8B take 64 x 64 tiles (128 blocks; 9.2 -> 5.4 ms over a pass); the 4096-wide ones keep
+/// 128 x 128 (128 blocks), which 64 x 128 tiles made slower (8.9 -> 10.5 ms).
+fn gemmh_tile(k: &GgKernels, n_out: u32, rows: u32) -> (*mut c_void, u32, u32) {
+    let half = SMS.load(Ordering::Relaxed).div_ceil(2);
+    let blocks = |bm: u32, bn: u32| n_out.div_ceil(bn) * rows.div_ceil(bm);
+    if blocks(128, 128) >= half {
+        (k.gemmh, 128, 128)
+    } else if blocks(64, 128) >= half {
+        (k.gemmhm, 64, 128)
+    } else {
+        (k.gemmhs, 64, 64)
+    }
+}
+
 /// Whether the device in use shares the system's memory ([`INTEGRATED`]).
 fn integrated() -> bool {
     INTEGRATED.load(Ordering::Relaxed)
@@ -382,8 +402,11 @@ struct GgKernels {
     /// rows a block of it takes (`MVP_ROWS` per warp).
     mvp: *mut c_void,
     mvp_block: u32,
-    /// `gemmh_K`: the fast prefill GEMM (f16 activations and weight values, f32 accumulation).
+    /// `gemmh_K`: the fast prefill GEMM (f16 activations and weight values, f32 accumulation),
+    /// 128 x 128 tiles; `gemmhm_K` 64 x 128, `gemmhs_K` 64 x 64 ([`gemmh_tile`]).
     pub(crate) gemmh: *mut c_void,
+    pub(crate) gemmhm: *mut c_void,
+    pub(crate) gemmhs: *mut c_void,
 }
 
 /// Rows per warp of the ggml matvec kernel of `kind` (`MV_ROWS` in `inkling_cuda.cu`), 0 for the
@@ -487,9 +510,6 @@ struct GemmP {
     beta: f32,
     lbeta: f32,
 }
-
-/// Rows (tokens) per block of the fast prefill GEMM (`HBM` in `inkling_cuda.cu`).
-pub(crate) const GEMMH_ROWS: u32 = 128;
 
 /// The fast prefill GEMM's parameters (`GemmH` in `inkling_cuda.cu`): `rows` f16 rows of `xh`
 /// (`xs` halves apart) into rows of `y` (`ys` floats apart); mode 0 stores, 1 adds.
@@ -784,6 +804,10 @@ impl CudaBackend {
             cu.cuDeviceGetAttribute(&mut major, 75, dev); // COMPUTE_CAPABILITY_MAJOR
             cu.cuDeviceGetAttribute(&mut minor, 76, dev);
         }
+        let mut sms = 0;
+        // CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT
+        unsafe { cu.cuDeviceGetAttribute(&mut sms, 16, dev) };
+        SMS.store(sms.max(1) as u32, Ordering::Relaxed);
         let mut integrated = 0;
         // CU_DEVICE_ATTRIBUTE_INTEGRATED
         if unsafe { cu.cuDeviceGetAttribute(&mut integrated, 18, dev) } == 0 {
@@ -996,6 +1020,8 @@ impl CudaBackend {
                     mvp: get(format!("mvp_{id}"))?,
                     mvp_block: threads / 32 * rows.max(1),
                     gemmh: get(format!("gemmh_{id}"))?,
+                    gemmhm: get(format!("gemmhm_{id}"))?,
+                    gemmhs: get(format!("gemmhs_{id}"))?,
                 })
             }
             Err(e) => {
@@ -3353,9 +3379,13 @@ mod tests {
                         mode,
                     };
                     let mut args = [&w as *const _ as *mut c_void, &p as *const _ as *mut c_void];
-                    assert!(be.launch(k.gemmh, (no.div_ceil(128), (t as u32).div_ceil(GEMMH_ROWS)), 256, &mut args));
-                    // Both operands rounded to f16: ~2^-11 of each product.
-                    check("fast gemm", 2e-3);
+                    // Every tile shape.
+                    for (f, bm, bn) in [(k.gemmh, 128, 128), (k.gemmhm, 64, 128), (k.gemmhs, 64, 64)] {
+                        assert!(be.htod(dy, &y0));
+                        assert!(be.launch(f, (no.div_ceil(bn), (t as u32).div_ceil(bm)), 256, &mut args));
+                        // Both operands rounded to f16: ~2^-11 of each product.
+                        check(&format!("fast gemm {bm} x {bn}"), 2e-3);
+                    }
                     unsafe { be.cu.cuMemFree_v2(dxh) };
                 }
             }

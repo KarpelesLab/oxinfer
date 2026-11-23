@@ -1407,14 +1407,9 @@ __device__ __forceinline__ void gemmi_body(const W& w, const GemmP& p) {
 // sum_k X[m][k] W[n][k] with X as f16 rows (`dhalf_t` converts them once per GEMM, rows `xs`
 // halves apart) and the weights dequantized to f16 values (block scales applied) per 32-wide K
 // step; f16 products with f32 accumulation in the tensor cores over the whole K, no per-step
-// scaling. A 256-thread block takes 128 rows x 128 outputs, 8 warps of 64 x 32; the next K
+// scaling. A 256-thread block takes up to 128 rows x 128 outputs; the next K
 // step's activations come in by cp.async and its weight bytes are prefetched into L1 while the
 // current step's MMAs run, then dequantized into the other of two shared-memory stages.
-#ifndef HBM
-#define HBM 128
-#endif
-#define HMT (HBM / 32) // 16-row MMA tiles per warp (warps 2 x 4)
-#define HBN 128
 #define HLD 40 // halves per shared row: 32 + 8 padding (ldmatrix rows on distinct banks)
 struct GemmH {
     const u16* xh;
@@ -1523,27 +1518,37 @@ __device__ __forceinline__ void dq16h(const u8* row, u32 b, u32 h, u32* q) {
     }
 }
 
-template <int K>
+// BM rows x BN outputs per block (128 x 128, 64 x 128 or 64 x 64: the launch picks the largest
+// that still fills the GPU, `gemmh_tile` in `cuda.rs`); 8 warps, 2 along the rows and 4 along the
+// outputs. Two 128 x 128 blocks per SM (`__launch_bounds__(256, 2)`: Qwen3-8B Q4_K_M prompts
+// 7526 -> 7860 tok/s at 512 tokens on an RTX PRO 6000; three spilled, 5842).
+template <int K, int BM, int BN>
 __device__ __forceinline__ void gemmh_body(const W& w, const GemmH& p) {
-    __shared__ __align__(16) u16 As[2][HBM * HLD];
-    __shared__ __align__(16) u16 Bs[2][HBN * HLD];
+    constexpr int MT = BM / 32, NT = BN / 32; // 16-row and 8-column MMA tiles per warp
+    __shared__ __align__(16) u16 As[2][BM * HLD];
+    __shared__ __align__(16) u16 Bs[2][BN * HLD];
     u32 tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    u32 m0 = blockIdx.y * HBM, n0 = blockIdx.x * HBN;
+    u32 m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
     if (m0 >= p.rows) return;
-    // Loads: A, 128 rows x 64 bytes per step, two 16-byte chunks per thread; B, row tid / 2,
-    // parts (tid % 2) * 4 .. + 3 of the step's block of 32.
-    u32 ar = tid >> 2, ac = (tid & 3) * 8; // rows ar and ar + 64, halves ac .. + 7
-    const u16* xa0 = p.xh + (u64)min(m0 + ar, p.rows - 1) * p.xs + ac;
-    const u16* xa1 = p.xh + (u64)min(m0 + ar + 64, p.rows - 1) * p.xs + ac;
-    bool aok0 = ar < HBM && m0 + ar < p.rows, aok1 = HBM > 64 && m0 + ar + 64 < p.rows;
+    // Loads: A, BM rows x 64 bytes per step, 16 bytes per thread and pass of 64 rows; B, row
+    // tid / 2 (the first 2 BN threads), parts (tid % 2) * 4 .. + 3 of the step's block of 32.
+    u32 ar = tid >> 2, ac = (tid & 3) * 8;
+    const u16* xa[BM / 64];
+    bool aok[BM / 64];
+#pragma unroll
+    for (int i = 0; i < BM / 64; i++) {
+        xa[i] = p.xh + (u64)min(m0 + ar + 64 * i, p.rows - 1) * p.xs + ac;
+        aok[i] = m0 + ar + 64 * i < p.rows;
+    }
     u32 br = tid >> 1, bh = tid & 1;
+    bool bthr = br < BN;
     u32 wr = n0 + br;
-    bool bok = wr < p.n_out;
+    bool bok = bthr && wr < p.n_out;
     const u8* wrow = w.q + (u64)min(wr, p.n_out - 1) * w.rb;
     u32 nb = p.n_in / 32;
     auto load_a = [&](u32 b, u32 st) {
-        if (ar < HBM) cp16(&As[st][ar * HLD + ac], xa0 + 32 * b, aok0);
-        if (HBM > 64) cp16(&As[st][(ar + 64) * HLD + ac], xa1 + 32 * b, aok1);
+#pragma unroll
+        for (int i = 0; i < BM / 64; i++) cp16(&As[st][(ar + 64 * i) * HLD + ac], xa[i] + 32 * b, aok[i]);
         asm volatile("cp.async.commit_group;");
     };
     u32 bq[8];
@@ -1576,18 +1581,19 @@ __device__ __forceinline__ void gemmh_body(const W& w, const GemmH& p) {
         if (bh) prefetch_l1(g0 + GB - 1);
     };
     auto store_b = [&](u32 st) {
+        if (!bthr) return;
         uint4* d = (uint4*)&Bs[st][br * HLD + 16 * bh];
         d[0] = make_uint4(bq[0], bq[1], bq[2], bq[3]);
         d[1] = make_uint4(bq[4], bq[5], bq[6], bq[7]);
     };
-    float acc[HMT][4][4];
+    float acc[MT][NT][4];
 #pragma unroll
-    for (int a = 0; a < HMT; a++)
+    for (int a = 0; a < MT; a++)
 #pragma unroll
-        for (int b = 0; b < 4; b++)
+        for (int b = 0; b < NT; b++)
 #pragma unroll
             for (int c = 0; c < 4; c++) acc[a][b][c] = 0.f;
-    u32 wm = (warp >> 2) * (HBM / 2), wn = (warp & 3) * 32;
+    u32 wm = (warp >> 2) * (BM / 2), wn = (warp & 3) * (BN / 4);
     load_a(0, 0);
     load_b(0);
     store_b(0);
@@ -1602,14 +1608,14 @@ __device__ __forceinline__ void gemmh_body(const W& w, const GemmH& p) {
         }
 #pragma unroll
         for (int kk = 0; kk < 2; kk++) {
-            u32 af[HMT][4], bf[4][2];
+            u32 af[MT][4], bf[NT][2];
 #pragma unroll
-            for (int mt = 0; mt < HMT; mt++) {
+            for (int mt = 0; mt < MT; mt++) {
                 u32 r = wm + 16 * mt + (lane & 15), c = 16 * kk + 8 * (lane >> 4);
                 ldsm_x4(af[mt], &As[st][r * HLD + c]);
             }
 #pragma unroll
-            for (int np = 0; np < 2; np++) {
+            for (int np = 0; np < NT / 2; np++) {
                 u32 r = wn + 16 * np + (lane & 7) + 8 * (lane >> 4), c = 16 * kk + 8 * ((lane >> 3) & 1);
                 u32 t4[4];
                 ldsm_x4(t4, &Bs[st][r * HLD + c]);
@@ -1619,9 +1625,9 @@ __device__ __forceinline__ void gemmh_body(const W& w, const GemmH& p) {
                 bf[2 * np + 1][1] = t4[3];
             }
 #pragma unroll
-            for (int mt = 0; mt < HMT; mt++)
+            for (int mt = 0; mt < MT; mt++)
 #pragma unroll
-                for (int nt = 0; nt < 4; nt++) mma16816(acc[mt][nt], af[mt], bf[nt]);
+                for (int nt = 0; nt < NT; nt++) mma16816(acc[mt][nt], af[mt], bf[nt]);
         }
         if (more) {
             load_b(b + 1);
@@ -1632,9 +1638,9 @@ __device__ __forceinline__ void gemmh_body(const W& w, const GemmH& p) {
     }
     u32 g = lane >> 2, c4 = lane & 3;
 #pragma unroll
-    for (int mt = 0; mt < HMT; mt++)
+    for (int mt = 0; mt < MT; mt++)
 #pragma unroll
-        for (int nt = 0; nt < 4; nt++)
+        for (int nt = 0; nt < NT; nt++)
 #pragma unroll
             for (int q = 0; q < 4; q++) {
                 u32 rr = m0 + wm + 16 * mt + g + 8 * (q >> 1), cc = n0 + wn + 8 * nt + 2 * c4 + (q & 1);
@@ -1666,7 +1672,9 @@ __device__ __forceinline__ void gemmi_any(const W& w, const GemmP& p) {
     }                                                                                                                                      \
     extern "C" __global__ void __launch_bounds__(128) gemm_##K(W w, GemmP p) { gemm_body<K, false>(w, p); }                  \
     extern "C" __global__ void __launch_bounds__(128) gemmi_##K(W w, GemmP p) { gemmi_any<K>(w, p); }                         \
-    extern "C" __global__ void __launch_bounds__(256) gemmh_##K(W w, GemmH p) { gemmh_body<K>(w, p); }
+    extern "C" __global__ void __launch_bounds__(256, 2) gemmh_##K(W w, GemmH p) { gemmh_body<K, 128, 128>(w, p); }                 \
+    extern "C" __global__ void __launch_bounds__(256, 3) gemmhm_##K(W w, GemmH p) { gemmh_body<K, 64, 128>(w, p); }                 \
+    extern "C" __global__ void __launch_bounds__(256, 3) gemmhs_##K(W w, GemmH p) { gemmh_body<K, 64, 64>(w, p); }
 #else
 #define KERNELS(K)                                                                                                                         \
     extern "C" __global__ void __launch_bounds__(128) mv_##K(W w, const float* x, float* y, u32 n_in, u32 n_out, u32 xs, u32 ys, u32 mode) { \

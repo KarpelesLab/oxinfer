@@ -1893,12 +1893,10 @@ impl CudaPlan<'_> {
                             ((n_in / 2).div_ceil(256).min(8), tt),
                             256,
                             &mut args![xa, n_in, xs, xh, flag],
-                        ) && be.launch(
-                            k.gemmh,
-                            (n_out.div_ceil(128), tt.div_ceil(super::GEMMH_ROWS)),
-                            256,
-                            &mut args![w, p],
-                        ),
+                        ) && {
+                            let (f, bm, bn) = super::gemmh_tile(&k, n_out, tt);
+                            be.launch(f, (n_out.div_ceil(bn), tt.div_ceil(bm)), 256, &mut args![w, p])
+                        },
                     );
                 }
                 if !be.launch(pf.guard, (n_in.div_ceil(256).min(8), tt), 256, &mut args![xa, n_in, xs, flag]) {
