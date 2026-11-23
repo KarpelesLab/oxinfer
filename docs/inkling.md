@@ -453,19 +453,24 @@ submission per pass, with the activations, the attention caches and the convolut
 resident on the device:
 
 - **Passes of up to 16 tokens** (decoding, speculative verification): the attention residual's
-  mixes (one threadgroup per query and token), the message gates of the loop's later passes,
-  the projections on the decode library's matvec kernels (its exact multi-token kernels for
-  several tokens), the key / value convolutions with their L2 clip and norm written straight to
-  the caches, the scaled and clipped queries and relative vectors (with the log scaling of the
-  full layers), attention in splits of keys with the relative bias of each distance, the sliding
-  window, the sink and the output gate, the post-attention convolution fused with the MLP's mix
-  and the sigmoid routing, the routed experts grouped by expert (tokens of a pass that choose the
-  same expert read it once) in their stored format (NVFP4, MXFP8, Q2_0, every GGUF type of the
-  decode kernels, the per-expert factors of unsloth's files), the post-MLP convolution summing the
-  experts' slots, the final mix, the LM head and the logit cap. Every token of a pass is computed
-  as it would be alone (the token is a grid dimension of every kernel; the splits of a token's
-  keys depend on its own range), so a verification pass gives exactly the logits of one-token
-  steps and speculative decoding stays exact.
+  mixes (one threadgroup per query and token), the message gates of the loop's later passes
+  (their norms left to the kernels that read them: the attention's projections, the router and
+  the experts' gate / up rows scale their sums by the norm), the projections on the decode
+  library's matvec kernels (its exact multi-token kernels for several tokens), the key / value
+  convolutions with their L2 clip and norm written straight to the caches, the scaled and clipped
+  queries and relative vectors (with the log scaling of the full layers), attention in splits of
+  keys with the relative bias of each distance (the last split of a token to finish merges them),
+  the sliding window, the sink and the output gate, the post-attention convolution fused with the
+  MLP's mix and the sigmoid routing, the routed experts grouped by expert (tokens of a pass that
+  choose the same expert read it once) in their stored format (NVFP4, MXFP8, Q2_0, every GGUF type
+  of the decode kernels, the per-expert factors of unsloth's files), the post-MLP convolution
+  summing the experts' slots, the final mix, the LM head and the logit cap. Every token of a pass
+  is computed as it would be alone (the token is a grid dimension of every kernel; the splits of a
+  token's keys depend on its own range), so a verification pass gives exactly the logits of
+  one-token steps and speculative decoding stays exact (`inkling2_bench --exact N` compares them:
+  0 logits of 600174 differ on ggml-org Q8_0, unsloth UD-IQ3_XXS and the release; on
+  mlx-community 4bit up to 1.4e-5 in the last bits, the decode library's multi-token and one-token
+  matvecs of MLX's affine 4-bit rows rounding differently).
 - **Prefill passes** of up to 512 tokens (longer prompts in pieces): the same, with the dense
   projections on the matrix-unit GEMMs (half operands, f32 accumulation; float32 loop gates on
   the f32 GEMM) and the routed experts as grouped matrix-unit GEMMs over each expert's tokens
