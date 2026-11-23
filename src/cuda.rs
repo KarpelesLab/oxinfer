@@ -435,6 +435,11 @@ struct GgKernels {
     /// ([`gemmh_stream_k`]).
     pub(crate) gemmhk: *mut c_void,
     pub(crate) gemmhk_fix: *mut c_void,
+    /// `mvq_K` / `mvqp_K`: the int8 matvec and gate / up pair (Q4_K, Q6_K, Q8_0; null for the
+    /// other formats) over x rounded by `dq8_x`.
+    pub(crate) mvq: *mut c_void,
+    pub(crate) mvqp: *mut c_void,
+    pub(crate) dq8_x: *mut c_void,
 }
 
 /// Rows per warp of the ggml matvec kernel of `kind` (`MV_ROWS` in `inkling_cuda.cu`), 0 for the
@@ -1021,6 +1026,10 @@ impl CudaBackend {
     fn gg_compile(&self, kind: crate::ggml::GgmlType, rows: u32) -> Option<GgKernels> {
         let id = kind.id();
         let threads = mv_threads(integrated());
+        let q8 = {
+            use crate::ggml::GgmlType::*;
+            matches!(kind, Q4_K | Q6_K | Q8_0)
+        };
         let body = include_str!("inkling_cuda.cu");
         // Tests may take the kernels from a file (`ggml_bench`: no rebuild per kernel edit).
         #[cfg(test)]
@@ -1052,6 +1061,9 @@ impl CudaBackend {
                     gemmhs: get(format!("gemmhs_{id}"))?,
                     gemmhk: get(format!("gemmhk_{id}"))?,
                     gemmhk_fix: get("gemmhk_fix".to_string())?,
+                    mvq: q8.then(|| get(format!("mvq_{id}"))).flatten().unwrap_or(std::ptr::null_mut()),
+                    mvqp: q8.then(|| get(format!("mvqp_{id}"))).flatten().unwrap_or(std::ptr::null_mut()),
+                    dq8_x: get("dq8_x".to_string())?,
                 })
             }
             Err(e) => {
@@ -3319,6 +3331,109 @@ mod tests {
                 ];
                 assert!(be.launch(k.mv, (no.div_ceil(k.mv_block), t as u32), k.mv_threads, &mut args));
                 check("matvec", 2e-6);
+                // The int8 matvec (`mvq`): x rounded by `dq8_x` (the CPU's `quantize_act` bytes and
+                // scales), then against the definition over those values; and its gate / up pair.
+                if !k.mvq.is_null() {
+                    let nb = n_in / 32;
+                    let (mut xq, mut xd) = (0u64, 0u64);
+                    assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut xq, t * n_in) }, 0);
+                    assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut xd, t * nb * 8) }, 0);
+                    let mut a = [
+                        &dx as *const _ as *mut c_void,
+                        &ni as *const _ as *mut c_void,
+                        &xsu as *const _ as *mut c_void,
+                        &xq as *const _ as *mut c_void,
+                        &xd as *const _ as *mut c_void,
+                    ];
+                    assert!(be.launch(k.dq8_x, (ni / 32, t as u32), 256, &mut a));
+                    let rows: Vec<f32> = (0..t).flat_map(|j| x[j * xs..j * xs + n_in].iter().copied()).collect();
+                    let qa = crate::quant::quantize_act(&rows, t, n_in);
+                    let mut gq = vec![0i8; t * n_in];
+                    let mut gd = vec![0f32; 2 * t * nb];
+                    assert_eq!(unsafe { be.cu.cuMemcpyDtoH_v2(gq.as_mut_ptr() as *mut c_void, xq, gq.len()) }, 0);
+                    assert!(be.dtoh(&mut gd, xd));
+                    assert_eq!(gq, qa.q, "{kind}: dq8_x's bytes");
+                    for i in 0..t * nb {
+                        assert_eq!(gd[2 * i].to_bits(), qa.scales[i].to_bits(), "{kind}: dq8_x's scale {i}");
+                        assert_eq!(gd[2 * i + 1], qa.scales[i] * qa.sums[i] as f32, "{kind}: dq8_x's sum {i}");
+                    }
+                    let xr: Vec<f64> = (0..t * n_in).map(|i| qa.q[i] as f64 * qa.scales[i / 32] as f64).collect();
+                    let dot = |d: &[f32], j: usize, o: usize| -> f64 {
+                        d[o * n_in..(o + 1) * n_in]
+                            .iter()
+                            .zip(&xr[j * n_in..(j + 1) * n_in])
+                            .map(|(&a, &b)| a as f64 * b)
+                            .sum()
+                    };
+                    let rws = k.mv_threads / 32;
+                    assert!(be.htod(dy, &y0));
+                    let mut a = [
+                        &w as *const _ as *mut c_void,
+                        &xq as *const _ as *mut c_void,
+                        &xd as *const _ as *mut c_void,
+                        &dy as *const _ as *mut c_void,
+                        &ni as *const _ as *mut c_void,
+                        &no as *const _ as *mut c_void,
+                        &ysu as *const _ as *mut c_void,
+                        &mode as *const _ as *mut c_void,
+                    ];
+                    assert!(be.launch(k.mvq, (no.div_ceil(rws), t as u32), k.mv_threads, &mut a));
+                    let mut y = vec![0f32; t * n_out];
+                    assert!(be.dtoh(&mut y, dy));
+                    let worst = (0..t * n_out)
+                        .map(|i| {
+                            let (j, o) = (i / n_out, i % n_out);
+                            let r = dot(&dense, j, o) + if mode == 1 { y0[i] as f64 } else { 0.0 };
+                            (y[i] as f64 - r).abs() / (mag[i] + 1e-3)
+                        })
+                        .fold(0f64, f64::max);
+                    assert!(worst < 2e-6, "{kind} int8 matvec mode {mode}: {worst:.2e}");
+                    // The pair: act(W x) (W2 x), mode 0 SiLU, 1 GELU.
+                    let (_, wg2) = Wg::of(&cw2).unwrap();
+                    let mut a = [
+                        &w as *const _ as *mut c_void,
+                        &wg2 as *const _ as *mut c_void,
+                        &xq as *const _ as *mut c_void,
+                        &xd as *const _ as *mut c_void,
+                        &dy as *const _ as *mut c_void,
+                        &ni as *const _ as *mut c_void,
+                        &no as *const _ as *mut c_void,
+                        &ysu as *const _ as *mut c_void,
+                        &mode as *const _ as *mut c_void,
+                    ];
+                    assert!(be.launch(k.mvqp, (no.div_ceil(rws), t as u32), k.mv_threads, &mut a));
+                    assert!(be.dtoh(&mut y, dy));
+                    let mut worst = 0f64;
+                    for j in 0..t {
+                        for o in 0..n_out {
+                            let (g, u) = (dot(&dense, j, o), dot(&dense2, j, o));
+                            let act = if mode == 1 {
+                                0.5 * g * (1.0 + (0.7978845608 * (g + 0.044715 * g * g * g)).tanh())
+                            } else {
+                                g / (1.0 + (-g).exp())
+                            };
+                            let (mg, mu): (f64, f64) = (
+                                dense[o * n_in..(o + 1) * n_in]
+                                    .iter()
+                                    .zip(&xr[j * n_in..])
+                                    .map(|(&a, &b)| (a as f64 * b).abs())
+                                    .sum(),
+                                dense2[o * n_in..(o + 1) * n_in]
+                                    .iter()
+                                    .zip(&xr[j * n_in..])
+                                    .map(|(&a, &b)| (a as f64 * b).abs())
+                                    .sum(),
+                            );
+                            let e = (y[j * n_out + o] as f64 - act * u).abs() / (mg * mu + 1e-3);
+                            worst = worst.max(e);
+                        }
+                    }
+                    assert!(worst < 2e-6, "{kind} int8 gate / up pair (mode {mode}): {worst:.2e}");
+                    unsafe {
+                        be.cu.cuMemFree_v2(xq);
+                        be.cu.cuMemFree_v2(xd);
+                    }
+                }
                 // The matvec with a lane per block of 32 (`MV_ROWS`: 1, and 3 rows per warp, a
                 // partial last warp), and the one with a warp per row, whatever this device takes.
                 for rows in [0u32, 1, 3] {
@@ -3675,8 +3790,11 @@ mod tests {
             s0.extend_from_slice(&s1);
             (hs, k.to_vec(), v.to_vec(), s0)
         };
-        let one = be.build_plan(&g, 1).expect("single-token plan");
-        let multi = be.build_plan(&g, 8).expect("multi-token plan");
+        let one = decode::with_pf_exact(true, || be.build_plan(&g, 1)).expect("single-token plan");
+        let multi = decode::with_pf_exact(true, || be.build_plan(&g, 8)).expect("multi-token plan");
+        // The int8 matvecs (Q4_K, Q6_K, Q8_0 matrices; the default unless `gpu_exact`).
+        let one_q = decode::with_pf_exact(false, || be.build_plan(&g, 1)).expect("int8 single-token plan");
+        let multi_q = decode::with_pf_exact(false, || be.build_plan(&g, 8)).expect("int8 multi-token plan");
         let pf = decode::with_pf_exact(true, || be.build_plan_pf(&g, 2048)).expect("prefill plan");
         let pf_fast = decode::with_pf_exact(false, || be.build_plan_pf(&g, 2048)).expect("fast prefill plan");
         let r1 = run(&one, &vec![1; n]);
@@ -3692,6 +3810,27 @@ mod tests {
             assert!(
                 a.iter().zip(b).all(|(p, q)| p.to_bits() == q.to_bits()),
                 "multi-token plan: {what} differ from single-token steps"
+            );
+        }
+        // The int8 matvecs: multi-token steps the single-token ones' bits, and to x's rounding to
+        // int8 of the f32 ones.
+        let q1 = run(&one_q, &vec![1; n]);
+        let qm = run(&multi_q, &[8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 3]);
+        for (what, a, b, c) in [
+            ("hidden", &r1.0, &q1.0, &qm.0),
+            ("keys", &r1.1, &q1.1, &qm.1),
+            ("values", &r1.2, &q1.2, &qm.2),
+            ("states", &r1.3, &q1.3, &qm.3),
+        ] {
+            assert!(
+                b.iter().zip(c).all(|(p, q)| p.to_bits() == q.to_bits()),
+                "int8 multi-token plan: {what} differ from its single-token steps"
+            );
+            let scale = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let worst = a.iter().zip(b).fold(0f32, |m, (p, q)| m.max((p - q).abs()));
+            assert!(
+                worst <= 3e-2 * scale,
+                "int8 plan: {what} differ by {worst:.2e} (largest value {scale:.2e})"
             );
         }
         // Prefill steps: 40 tokens, then 67 on top of them (GEMMs from 8 tokens on).
@@ -3827,7 +3966,7 @@ mod tests {
             });
             g.ops.push(Op::norm(x, hidden, &ones, h, 1e-6));
             g.head_from = g.ops.len();
-            let one = be.build_plan(&g, 1).expect("single-token plan");
+            let one = decode::with_pf_exact(true, || be.build_plan(&g, 1)).expect("single-token plan");
             let pf = decode::with_pf_exact(true, || be.build_plan_pf(&g, 64)).expect("prefill plan");
             let mut slot = Slot(None);
             let mut hs = vec![0f32; 16 * h];
@@ -4041,6 +4180,68 @@ mod tests {
                 }
                 sync();
                 let mv_s = t0.elapsed().as_secs_f64() / 50.0;
+                if !k.mvq.is_null() {
+                    let (mut xq, mut xd) = (0u64, 0u64);
+                    assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut xq, n_in) }, 0);
+                    assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut xd, n_in / 32 * 8) }, 0);
+                    let quant = || {
+                        let mut a = [
+                            &dx as *const _ as *mut c_void,
+                            &ni as *const _ as *mut c_void,
+                            &ni as *const _ as *mut c_void,
+                            &xq as *const _ as *mut c_void,
+                            &xd as *const _ as *mut c_void,
+                        ];
+                        assert!(be.launch(k.dq8_x, ((ni / 32).div_ceil(8), 1), 256, &mut a));
+                    };
+                    let mvq = || {
+                        let mut a = [
+                            &w as *const _ as *mut c_void,
+                            &xq as *const _ as *mut c_void,
+                            &xd as *const _ as *mut c_void,
+                            &dy as *const _ as *mut c_void,
+                            &ni as *const _ as *mut c_void,
+                            &no as *const _ as *mut c_void,
+                            &zero as *const _ as *mut c_void,
+                            &zero as *const _ as *mut c_void,
+                        ];
+                        assert!(be.launch(k.mvq, (no.div_ceil(k.mv_threads / 32), 1), k.mv_threads, &mut a));
+                    };
+                    let best = |f: &dyn Fn()| {
+                        let mut b = f64::MAX;
+                        for _ in 0..7 {
+                            sync();
+                            let t0 = Instant::now();
+                            for _ in 0..20 {
+                                f();
+                            }
+                            sync();
+                            b = b.min(t0.elapsed().as_secs_f64() / 20.0);
+                        }
+                        b
+                    };
+                    let (a, b, c) = (
+                        best(&mv),
+                        best(&mvq),
+                        best(&|| {
+                            quant();
+                            mvq()
+                        }),
+                    );
+                    let gb = |s: f64| (n_out * m.row_bytes()) as f64 / s / 1e9;
+                    eprintln!(
+                        "{kind} {n_out} x {n_in}: matvec {:.1} us ({:.0} GB/s), int8 {:.1} us ({:.0}), with its rounding of x {:.1} us",
+                        a * 1e6,
+                        gb(a),
+                        b * 1e6,
+                        gb(b),
+                        c * 1e6
+                    );
+                    unsafe {
+                        be.cu.cuMemFree_v2(xq);
+                        be.cu.cuMemFree_v2(xd);
+                    }
+                }
                 let t0 = Instant::now();
                 for _ in 0..5 {
                     gemm();

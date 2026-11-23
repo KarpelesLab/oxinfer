@@ -1758,6 +1758,148 @@ __device__ __forceinline__ void gemmhk_body(const W& w, const GemmH& p, float* f
 }
 
 
+// ---- The int8 matvecs of the decode plans (`mvq_K`, `mvqp_K`: Q4_K, Q6_K, Q8_0): x rounded to
+// int8 per block of 32 as the CPU's decode kernels round it (`dq8_x`: q = round(x 127 / amax),
+// rows of n_in bytes, and per block d = amax / 127 and d sum q), then as `mv_body` with
+// `MV_ROWS`: a warp per MV_ROWS rows, a lane per block of 32, the weights' stored integers
+// against x's with dp4a and each block's sums scaled in f32. PAIR: a gate / up pair, y = act(W
+// x) (W2 x) (mode 0 SiLU, 1 tanh GELU); else mode 1 adds to y.
+template <int K>
+__device__ __forceinline__ constexpr bool has_mvq() {
+    return K == K_Q4_K || K == K_Q6_K || K == K_Q8_0;
+}
+// 9 aligned words around 32 bytes at a 2-byte aligned p, funnel-shifted into w[0..7].
+__device__ __forceinline__ void ld32x8_h(const u8* p, u32* w) {
+    u32 fs = 8 * ((u32)(u64)p & 2);
+    const u32* a = (const u32*)((u64)p & ~(u64)3);
+    u32 r[9];
+#pragma unroll
+    for (int j = 0; j < 9; j++) r[j] = a[j];
+#pragma unroll
+    for (int j = 0; j < 8; j++) w[j] = __funnelshift_r(r[j], r[j + 1], fs);
+}
+template <int K>
+__device__ __forceinline__ float mvq_dot(const u8* rp, u32 b, const int* xq, float2 xd) {
+    if constexpr (K == K_Q4_K) {
+        const u8* B = rp + 144 * (b >> 3);
+        u32 sub = b & 7;
+        uint4 hd = *(const uint4*)B;
+        u32 sh8 = 8 * (sub & 3), sc, mn;
+        if (sub < 4) {
+            sc = (hd.y >> sh8) & 63;
+            mn = (hd.z >> sh8) & 63;
+        } else {
+            u32 c = hd.w >> sh8;
+            sc = (c & 15) | (((hd.y >> sh8) >> 6 & 3) << 4);
+            mn = ((c >> 4) & 15) | (((hd.z >> sh8) >> 6 & 3) << 4);
+        }
+        const uint4* qp = (const uint4*)(B + 16 + 32 * (sub >> 1));
+        uint4 u0 = qp[0], u1 = qp[1];
+        const u32 ws[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+        u32 sh = 4 * (sub & 1);
+        int acc = 0;
+#pragma unroll
+        for (int j = 0; j < 8; j++) acc = __dp4a((int)((ws[j] >> sh) & 0x0f0f0f0fu), xq[j], acc);
+        return xd.x * h2f(hd.x & 0xffff) * (float)sc * (float)acc - h2f(hd.x >> 16) * (float)mn * xd.y;
+    } else if constexpr (K == K_Q6_K) {
+        const u8* B = rp + 210 * (b >> 3);
+        u32 sub = b & 7, n = sub >> 2, qq = sub & 3;
+        u32 lw[8], hw[8];
+        ld32x8_h(B + 64 * n + 32 * (qq & 1), lw);
+        ld32x8_h(B + 128 + 32 * n, hw);
+        u32 s1 = 4 * (qq >> 1), s2 = 2 * qq;
+        int a0 = 0, a1 = 0;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            int v = (int)__vsub4(((lw[j] >> s1) & 0x0f0f0f0fu) | (((hw[j] >> s2) & 0x03030303u) << 4), 0x20202020u);
+            if (j < 4)
+                a0 = __dp4a(v, xq[j], a0);
+            else
+                a1 = __dp4a(v, xq[j], a1);
+        }
+        const signed char* scs = (const signed char*)(B + 192 + 8 * n + 2 * qq);
+        return xd.x * h2f(rd16(B + 208)) * (float)(scs[0] * a0 + scs[1] * a1);
+    } else {
+        const u8* B = rp + 34 * b;
+        u32 w[8];
+        ld32x8_h(B + 2, w);
+        int acc = 0;
+#pragma unroll
+        for (int j = 0; j < 8; j++) acc = __dp4a((int)w[j], xq[j], acc);
+        return xd.x * h2f(rd16(B)) * (float)acc;
+    }
+}
+#ifndef MVQ_ROWS
+#define MVQ_ROWS 1
+#endif
+template <int K, bool PAIR>
+__device__ __forceinline__ void mvq_body(const W& w, const W& w2, const u8* xq, const float2* xd, float* y, u32 n_in, u32 n_out, u32 ys, u32 mode) {
+    if constexpr (has_mvq<K>()) {
+        u32 warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+        u32 r0 = (blockIdx.x * (blockDim.x >> 5) + warp) * MVQ_ROWS;
+        if (r0 >= n_out) return;
+        u32 nb = n_in / 32;
+        const int4* xr = (const int4*)(xq + (u64)blockIdx.y * n_in);
+        const float2* dr = xd + (u64)blockIdx.y * nb;
+        float a[2][MVQ_ROWS];
+#pragma unroll
+        for (int i = 0; i < MVQ_ROWS; i++) a[0][i] = a[1][i] = 0.f;
+        for (u32 b = lane; b < nb; b += 32) {
+            int4 x0 = xr[2 * b], x1 = xr[2 * b + 1];
+            const int xv[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
+            float2 d = dr[b];
+#pragma unroll
+            for (int i = 0; i < MVQ_ROWS; i++) {
+                u32 row = min(r0 + i, n_out - 1);
+                a[0][i] += mvq_dot<K>(w.q + (u64)row * w.rb, b, xv, d);
+                if constexpr (PAIR) a[1][i] += mvq_dot<K>(w2.q + (u64)row * w2.rb, b, xv, d);
+            }
+        }
+#pragma unroll
+        for (int i = 0; i < MVQ_ROWS; i++) {
+            float g = warp_sum(a[0][i]) * w.f;
+            float u = PAIR ? warp_sum(a[1][i]) * w2.f : 0.f;
+            if (lane == 0 && r0 + i < n_out) {
+                float* o = y + (u64)blockIdx.y * ys + r0 + i;
+                if constexpr (PAIR) {
+                    float act;
+                    if (mode) {
+                        float t = 0.7978845608f * (g + 0.044715f * g * g * g);
+                        act = 0.5f * g * (1.0f + tanhf(t));
+                    } else {
+                        act = g / (1.0f + expf(-g));
+                    }
+                    *o = act * u;
+                } else {
+                    *o = mode ? *o + g : g;
+                }
+            }
+        }
+    }
+}
+// x's rows (n floats, xs apart; grid (blocks, rows), a warp per block of 32) rounded to int8 for
+// `mvq_K`: rows of n bytes at xq, per block (d, d sum q) at xd (rows of n / 32).
+extern "C" __global__ void __launch_bounds__(256) dq8_x(const float* x, u32 n, u32 xs, u8* xq, float2* xd) {
+    const float* r = x + (u64)blockIdx.y * xs;
+    u32 lane = threadIdx.x & 31, nb = n / 32;
+    u32 b = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (b >= nb) return;
+    float v = r[32 * b + lane];
+    float amax = warp_max(fabsf(v));
+    // Divisions rounded as the CPU's (the module is compiled with fast math).
+    float inv = amax > 0.f ? __fdiv_rn(127.f, amax) : 0.f;
+    int q = (int)roundf(__fmul_rn(v, inv));
+    int s = __reduce_add_sync(0xffffffffu, q);
+    u32 by = (u32)(q & 255) << (8 * (lane & 3));
+    by |= __shfl_xor_sync(0xffffffffu, by, 1);
+    by |= __shfl_xor_sync(0xffffffffu, by, 2);
+    if ((lane & 3) == 0) ((u32*)(xq + (u64)blockIdx.y * n + 32 * b))[lane >> 2] = by;
+    if (lane == 0) {
+        float d = __fdiv_rn(amax, 127.f);
+        xd[(u64)blockIdx.y * nb + b] = make_float2(d, __fmul_rn(d, (float)s));
+    }
+}
+
 template <int K>
 __device__ __forceinline__ void gemmi_any(const W& w, const GemmP& p) {
     if constexpr (int_ok<K>())
@@ -1781,7 +1923,15 @@ __device__ __forceinline__ void gemmi_any(const W& w, const GemmP& p) {
     extern "C" __global__ void __launch_bounds__(256, 2) gemmh_##K(W w, GemmH p) { gemmh_body<K, 128, 128>(w, p); }                 \
     extern "C" __global__ void __launch_bounds__(256, 3) gemmhm_##K(W w, GemmH p) { gemmh_body<K, 64, 128>(w, p); }                 \
     extern "C" __global__ void __launch_bounds__(256, 3) gemmhs_##K(W w, GemmH p) { gemmh_body<K, 64, 64>(w, p); }                 \
-    extern "C" __global__ void __launch_bounds__(256, 2) gemmhk_##K(W w, GemmH p, float* fix) { gemmhk_body<K>(w, p, fix); }
+    extern "C" __global__ void __launch_bounds__(256, 2) gemmhk_##K(W w, GemmH p, float* fix) { gemmhk_body<K>(w, p, fix); }    \
+    extern "C" __global__ void __launch_bounds__(256)                                                                                      \
+        mvq_##K(W w, const u8* xq, const float2* xd, float* y, u32 n_in, u32 n_out, u32 ys, u32 mode) {                                  \
+        mvq_body<K, false>(w, w, xq, xd, y, n_in, n_out, ys, mode);                                                                        \
+    }                                                                                                                                      \
+    extern "C" __global__ void __launch_bounds__(256)                                                                                      \
+        mvqp_##K(W w, W w2, const u8* xq, const float2* xd, float* y, u32 n_in, u32 n_out, u32 ys, u32 gelu) {                           \
+        mvq_body<K, true>(w, w2, xq, xd, y, n_in, n_out, ys, gelu);                                                                        \
+    }
 // The stream-K GEMM's second pass (grid (blocks of `gemmhk`, 16), `fix` as its): a block whose
 // share ends inside a tile it began adds, to a sixteenth of the tile (blockIdx.y), the parts of
 // it that the next blocks took, summed in their order.

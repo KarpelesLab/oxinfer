@@ -229,10 +229,22 @@ IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4. Three things run on the
   GB/s, 4096 x 12288 809 -> 970, the 151936-row LM head 895 -> 1128; Q6_K 1158 -> 1369, 1063 ->
   1244, 1154 -> 1318. Decode (tg128 median of 3, a GPU another process was using): Qwen3-8B
   Q4_K_M 161 -> 169 tok/s, Llama-3.2-1B Q4_K_M 866 -> 917.
-  Measured and dropped: an int8 matvec for Q4_K, Q6_K and Q8_0 (x rounded per block of 32 as
-  the CPU's decode kernels round it, once per block of rows into shared memory, then `dp4a`
-  against the stored integers and each block's sums scaled in f32, as llama.cpp's `mmvq`):
-  662 / 142 tok/s with a row per warp, 638 / 154 with two, 618 / 152 with four.
+  An int8 matvec for Q4_K, Q6_K and Q8_0 (x rounded per block of 32 as the CPU's decode kernels
+  round it, `dp4a` against the stored integers and each block's sums scaled in f32, as
+  llama.cpp's `mmvq`) first measured slower, 662 / 142 tok/s with a row per warp, 638 / 154
+  with two, 618 / 152 with four: every block of rows rounded the whole of x into 40 KB of shared
+  memory, so two blocks fitted an SM. Rounded once per matvec instead (`dq8_x`, into the plan's
+  arena; the bytes and scales of the CPU's `quantize_act`, divisions rounded as its; the q / k /
+  v matvecs of a layer round their input once), `mvq_K` / `mvqp_K` run a warp per row and a lane
+  per block of 32 as the f32 matvec: from L2 (`ggml_bench`, a matrix that fits it) 12288 x 4096
+  Q4_K in 6.9 us against 27.5 (7.8 with the rounding), Q6_K 9.8 against 30.3, so the f32
+  matvec was bound by its arithmetic and the int8 one reads at what memory gives. Decode (tg128
+  median of 3, the GPU 60-70% busy with another process, so against the f32 matvec in the same
+  minutes): Qwen3-8B Q4_K_M 113 -> 133 tok/s, Llama-3.2-1B Q4_K_M 492-544 -> 702-704. It is the
+  default; `gpu_exact=1` (or `OXINFER_CUDA_MVQ=0`) keeps f32 activations. Greedy decoding (64
+  tokens of four `pf_check` prompts) agrees with the CPU's at least as far as the f32 matvec's:
+  all four the same with both on three, and on the fourth (Qwen3-8B, 40 tokens) the int8 one
+  agrees with the CPU for all 64 tokens where the f32 one parts at the 43rd.
 - **Prompts, whole pass** (`decode_plan_prefill`, steps of up to 512 tokens,
   `OXINFER_CUDA_PREFILL_TOKENS`; `OXINFER_PREFILL_GPU=0` keeps the op-by-op path): the matmuls as
   tensor-core GEMMs. By default (`gemmh_*`) the activations go in as f16 rows (converted once per

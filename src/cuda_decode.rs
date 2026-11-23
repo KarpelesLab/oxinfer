@@ -467,6 +467,13 @@ pub(super) struct CudaPlan<'b> {
     /// Prefill plans: pinned host memory the step's new keys and values come down through (tens
     /// of megabytes per step, several times slower into pageable memory), or null.
     kv_pinned: *mut f32,
+    /// The int8 matvecs (`mvq_K`, unless `gpu::exact` or `OXINFER_CUDA_MVQ=0`): in the arena,
+    /// `tokens` rows of x rounded to int8 (as wide as the widest matvec input) and their blocks'
+    /// scales; 0 when off.
+    q8x: (u64, u64),
+    /// The x those rows hold (address, floats apart, width, tokens), while no op since has
+    /// written it: the q / k / v matvecs of a layer round their input once.
+    q8_last: std::cell::Cell<(u64, u32, u32, u32)>,
 }
 
 /// `dglu_t`, `dew_t`, `dqk_rope_t`, `dattn_combine_t`, `dgdn_conv_t`, `dgdn_rule_t` and
@@ -651,12 +658,14 @@ fn trace() -> bool {
 static PLAN_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
-    /// Prefill plans built on this thread take the split-half GEMM (true) or the fast one
-    /// (false) whatever `gpu::exact` says ([`with_pf_exact`]; tests).
+    /// Plans built on this thread are exact (true: prefill plans take the split-half GEMM,
+    /// decode plans f32 activations in their matvecs) or fast (false: the f16 GEMM, int8
+    /// matvecs) whatever `gpu::exact` says ([`with_pf_exact`]; tests).
     static PF_EXACT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
-/// Runs `f` with the prefill plans it builds on this thread exact (`gemmi`) or fast (`gemmh`).
+/// Runs `f` with the plans it builds on this thread exact (`gemmi`, f32 matvecs) or fast
+/// (`gemmh`, int8 matvecs).
 #[cfg(test)]
 pub(super) fn with_pf_exact<R>(exact: bool, f: impl FnOnce() -> R) -> R {
     let prev = PF_EXACT.with(|c| c.replace(Some(exact)));
@@ -1344,6 +1353,10 @@ impl CudaBackend {
 
         let xh_off = region(if fast_gemm { gemm_in_max * tokens * 2 } else { 4 });
         let fix_off = region(if fast_gemm { super::gemmh_fix_floats() * 4 } else { 4 });
+        let q8 =
+            !PF_EXACT.with(|c| c.get()).unwrap_or_else(crate::gpu::exact) && std::env::var("OXINFER_CUDA_MVQ").map_or(true, |v| v != "0");
+        let q8x_off = region(if q8 { gemm_in_max * tokens } else { 4 });
+        let q8d_off = region(if q8 { gemm_in_max / 32 * 8 * tokens } else { 4 });
         let part_off = region(part_floats.max(1) * 4);
         let pair_off = region(pair_floats.max(1) * tokens * 4);
         let save_off: Vec<usize> = saves.iter().map(|&n| region(n * 4)).collect();
@@ -1447,6 +1460,12 @@ impl CudaBackend {
             last_writer,
             strengths: (arena + str_off as u64, g.strengths.clone()),
             _cached: cached,
+            q8x: if q8 {
+                (arena + q8x_off as u64, arena + q8d_off as u64)
+            } else {
+                (0, 0)
+            },
+            q8_last: Default::default(),
             kv_pinned: {
                 let mut p: *mut c_void = std::ptr::null_mut();
                 if !pf || kvout_len == 0 || unsafe { self.cu.cuMemAllocHost_v2(&mut p, kvout_len * 4) } != 0 {
@@ -1626,6 +1645,9 @@ impl CudaPlan<'_> {
                 w2,
             } => {
                 let (x, y, one) = (x.at(j), y.at(j), 0u32);
+                if self.q8x.0 != 0 && !k.mvq.is_null() {
+                    return self.launch_mvq(&k, w, w2, x, 1, y, 0, n_in, n_out, mode, 1);
+                }
                 match w2 {
                     Some(w2) => be.launch(
                         k.mvp,
@@ -2039,6 +2061,46 @@ impl CudaPlan<'_> {
         })
     }
 
+    /// The int8 matvec (or gate / up pair) over `t` rows of x (`xs` floats apart): x rounded to
+    /// int8 into the plan's rows (`dq8_x`), then `mvq_K` / `mvqp_K` with a grid row per token.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_mvq(
+        &self,
+        k: &super::GgKernels,
+        w: Wg,
+        w2: Option<Wg>,
+        x: u64,
+        xs: u32,
+        y: u64,
+        ys: u32,
+        n_in: u32,
+        n_out: u32,
+        mode: u32,
+        t: u32,
+    ) -> bool {
+        let be = self.be;
+        let (xq, xd) = self.q8x;
+        let rows = k.mv_threads / 32;
+        let key = (x, xs, n_in, t);
+        let fresh = self.q8_last.get() == key;
+        self.q8_last.set(key);
+        (fresh || be.launch(k.dq8_x, ((n_in / 32).div_ceil(8), t), 256, &mut args![x, n_in, xs, xq, xd]))
+            && match w2 {
+                Some(w2) => be.launch(
+                    k.mvqp,
+                    (n_out.div_ceil(rows), t),
+                    k.mv_threads,
+                    &mut args![w, w2, xq, xd, y, n_in, n_out, ys, mode],
+                ),
+                None => be.launch(
+                    k.mvq,
+                    (n_out.div_ceil(rows), t),
+                    k.mv_threads,
+                    &mut args![w, xq, xd, y, n_in, n_out, ys, mode],
+                ),
+            }
+    }
+
     /// Launches `op` over the step's `t` tokens: matvecs at once, the rest token by token; the
     /// recurrent ops keep their inputs first (multi-token plans).
     fn launch_tokens(&self, op: &COp, slot: &CudaSlot, t: usize) -> bool {
@@ -2086,6 +2148,9 @@ impl CudaPlan<'_> {
             } if t > 1 => {
                 // A grid row per token: each token's sums are the single-token launch's.
                 let (xa, ya, xs, ys) = (x.a, y.a, (x.ts / 4) as u32, (y.ts / 4) as u32);
+                if self.q8x.0 != 0 && !k.mvq.is_null() {
+                    return self.launch_mvq(&k, w, w2, xa, xs, ya, ys, n_in, n_out, mode, t as u32);
+                }
                 return match w2 {
                     Some(w2) => be.launch(
                         k.mvp,
@@ -2208,11 +2273,24 @@ impl DecodePlan for CudaPlan<'_> {
         let mut queued = 0;
         let per_op = tr && std::env::var("OXINFER_CUDA_DECODE_TRACE").is_ok_and(|v| v == "2");
         let mut kinds: std::collections::BTreeMap<&str, (usize, f64)> = Default::default();
+        self.q8_last.set(Default::default());
         for (i, op) in self.ops[..end].iter().enumerate() {
             let ts = std::time::Instant::now();
+            if !matches!(op, COp::Gmv { .. }) {
+                self.q8_last.set(Default::default());
+            }
             if !self.launch_tokens(op, ms, t) {
                 debug(&format!("step of {t} token(s): op {i} of {} did not launch", self.ops.len()));
                 return false;
+            }
+            // A matvec writing into the rounded x's rows makes them stale.
+            if let COp::Gmv { y, n_out, .. } = *op {
+                let (x0, xs, n, tt) = self.q8_last.get();
+                let x1 = x0 + 4 * ((tt.max(1) as u64 - 1) * xs as u64 + n as u64);
+                let y1 = y.a + (t as u64 - 1) * y.ts + 4 * n_out as u64;
+                if y.a < x1 && x0 < y1 {
+                    self.q8_last.set(Default::default());
+                }
             }
             if per_op {
                 unsafe { be.cu.cuCtxSynchronize() };

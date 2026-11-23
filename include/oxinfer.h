@@ -122,7 +122,9 @@ int64_t oxi_cache_remove(const char *cache_dir, const char *name);
  *   cache_dir=PATH       where repo ids are downloaded
  *   gpu_exact=0|1        GPU matmuls bit-identical to the CPU (default 0: M5/A19 matrix
  *                        units, half-precision inputs; CUDA prompts of GGUF models in f16
- *                        operands, 1: split halves within ~1e-6 of f32; process-wide)
+ *                        operands and their decode matvecs over int8 activations as the
+ *                        CPU's, 1: split halves within ~1e-6 of f32 and f32 activations;
+ *                        process-wide)
  *   gpu_moe=0|1          MoE experts on the GPU in prefill (default 1; process-wide)
  *   cpu_repack=0|1       CPU decoding on aarch64: interleave a GGUF model's Q8_0, Q4_0, Q4_K and
  *                        Q6_K matrices four rows at a time in place at load, for faster decode

@@ -207,7 +207,9 @@ pub struct EngineOptions {
     /// (within ~1e-6 of f32) unless this is `false`, which gives plain f16 operands (~15% faster
     /// prefill). The CUDA prefill plans of GGUF language models take f16 activations and weight
     /// values (f32 sums) unless this is `true`, which gives the split-half GEMM (within ~1e-6 of
-    /// f32; 1.3-1.6x slower prompts). Key `gpu_exact`.
+    /// f32; 1.3-1.6x slower prompts); their decode plans round the activations of Q4_K, Q6_K and
+    /// Q8_0 matvecs to int8 per block of 32 as the CPU's decode kernels do unless this is `true`
+    /// (f32 activations). Key `gpu_exact`.
     pub gpu_exact: Option<bool>,
     /// CPU prefill matmuls ([`crate::kernels::PrefillGemm`]): `auto` (default: `fast`, with
     /// llama.cpp's int8 activation rounding), `exact` (the opt-out: `sme` where the CPU has SME,
