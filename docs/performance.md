@@ -859,6 +859,128 @@ of the [list above](#x86-64-cpu-kernels-november-2026). The int8 GEMM reaches 11
 32 threads of this shared machine, against 32 x 0.70-0.83 for its kernel alone on one core
 with the data in L1.
 
+#### Inkling-2-Mini decoding on Metal (November 2026)
+
+The goal of this round was the 125 tok/s of decoding (and 1750 of prefill) reported for
+Inkling-2-Mini on a 48 GB M5 Max with EXO (see [Inkling-2 Mini](inkling.md#speed), where that figure
+could not be traced). The starting point, best of interleaved runs of `inkling2_bench -n 64 -v 1,4`:
+mlx-community 4bit 82.5 tok/s (11.85 ms per one-token pass), unsloth UD-IQ3_XXS 80.2, ggml-org
+Q8_0 65.7; prefill was already at about 1750 tok/s. The rule for keeping a change: the f32
+reference agreement unchanged and, with `--no-system`, greedy text identical to the previous build
+(9 replies of 160 tokens: 3 prompts on mlx-community 4bit, UD-IQ3_XXS and Q8_0; the previous build
+gives the same text run after run).
+
+**Before / after** (best of 4-5 interleaved runs of each build, load 7-16; dispatches and barriers per
+one-token pass from `OXINFER_INKLING_PROFILE`):
+
+| Checkpoint | tg64 ms / tok/s | one-token pass ms | 4-token pass ms | dispatches / barriers |
+|---|---:|---:|---:|---:|
+| mlx-community 4bit | 11.88 / 84.1 -> 11.80 / 84.7 | 11.59 -> 11.41 | 21.60 -> 21.34 | 759 / 751 -> 759 / 751 |
+| unsloth UD-IQ3_XXS | 12.30 / 81.3 -> 12.30 / 81.3 | 12.02 -> 11.96 | 23.82 -> 23.76 | 759 / 751 -> 759 / 751 |
+| ggml-org Q8_0 | 15.08 / 66.3 -> 15.04 / 66.4 | 14.82 -> 14.68 | 24.57 -> 24.55 | 759 / 751 -> 759 / 751 |
+
+The kept changes are worth 0.5-1% (within the noise of this shared machine, whose other jobs made
+single runs 10-100% slower); the fusions below, which cut 240 dispatches and 192 barriers, did
+not change the time.
+
+**Kept:**
+
+- A decoding pass's first command buffer holds 2 of its 49 steps instead of 8: the GPU starts
+  after about 20 us of encoding instead of 90 (the other command buffers are encoded while it runs).
+  0.07 ms a token (11.93 -> 11.87 ms, best of 4 interleaved, load 5-12). The same logits.
+- The attention's relative bias puts its threads on the distances the key range has
+  (`G x nb` items) instead of on `G x 1024` slots of which a short range uses a few: the 33
+  threads that had the 3 heads one after the other now take one each. The attention kernel at
+  33 keys: 8.5 -> 7.9 us in isolation. The same logits.
+
+**Measured and dropped** (each against the build before it; "mb" is a Swift harness that runs
+one kernel 48-200 times in a command buffer with a barrier after each, weights rotated over 48
+copies so they come from memory, best of 5):
+
+- **Overlapping the host with the GPU.** With `OXINFER_METAL_TRACE` a one-token pass keeps the GPU
+  busy 11.30 ms of the 11.97 between tokens: the rest is encoding the first command buffer (90
+  us), commit to GPU start (190 us), completion to the host waking (70-85 us) and host work
+  between passes (300 us: the 0.8 MB logits copy, the argmax, the embedding row). A prelaunch was
+  built: the next one-token pass (position + 1, same session) encoded and committed while the
+  current one runs, its first command buffer waiting on an `MTLSharedEvent` that the next call
+  signals once it has written the embedding. 11.80-12.20 -> 11.73-11.83 ms (best of 3, 0.1 ms):
+  a CPU-signalled event takes 330-440 us to start the GPU (mb), no less than a commit (40-190
+  us after a gap of 150-300 us, 0.4-2 ms after the GPU went idle). A kernel spinning on a word
+  the host writes never saw the write (it ran to its cap of 200M polls), and a keep-alive kernel
+  queued after a pass only delays the next one (it waits for the spin; start 70-180 us either
+  way). Dropped: 1% against a pass that runs whenever the next call is not the predicted one
+  (garbage writes at position + 1, the rollback margin one row shorter, sessions that must flush it
+  before they are copied, read or dropped).
+- **Fusing the small kernels into their neighbours** (all of it bit for bit: the same logits
+  digest with each fusion on or off): the attention's merge in its kernel, the routing in the
+  router's matvec, the convolution after the experts in the down projections' kernel, the
+  message gates' norms in their mix kernel, each by the last threadgroup to finish (a counter per
+  token / head / row block in device memory, fences around the atomic, reset by the last). 759 ->
+  519 dispatches and 751 -> 559 barriers per token; 12.10 -> 12.15 ms (best of 4, noise 0.1 ms).
+  The stages that went were never the cost: an empty dispatch and barrier take 0.7 us on an idle
+  GPU (mb), and leaving a kind of stage out altogether (`OXINFER_INKLING_SKIP`, busy machine)
+  takes off its kernel's latency, not a barrier's: the merge 0-0.25 ms a token, the convolution
+  after the experts 0.18-0.35, the q / kv stage 0.3-0.4, the attention kernel 0.85-1.5, the MLP's
+  conv / mix kernel 0.7-0.9, the routed experts 4.3-4.9, the dense projections 1.9-2.5.
+- **A faster attention for short ranges** (keys interleaved over the 8 SIMD-groups, so that 33
+  keys keep all of them busy instead of one; splits of a fifth of the range, 64 to 256 keys, in
+  passes of up to 16 tokens): 33 keys 8.5 -> 6.9 us, 200 keys 10.7 -> 7.2, 500 keys 16.0 -> 11.2
+  (mb). Splits of 64 keys whatever the range are slower past 1000 keys (1000: 12.2 -> 15.1 us,
+  2000: 22.8 -> 34.8: those read 8-16 MB of f32 cache and are bound by it), hence the fifth. The keys are summed in another order, and the
+  greedy text then parted from the previous build's on 3 of the 9 replies (mlx-community 4bit at
+  token 25, "accurate" against "careful"; UD-IQ3_XXS twice). Dropped by the equality rule; it is
+  the change to make if that rule is relaxed (a few percent at contexts of a few hundred tokens).
+- **Cheaper nibble decoding in the dense matvecs.** The MLX 4-bit 3072 x 2304 matvec takes 16.2 us
+  on an idle GPU where a stream of its bytes takes 9.4 (mb; 412 GB/s for those 4 MB, 520 GB/s for
+  64 MB). Its loads alone with its access pattern (weights, f16 scales, bf16 offsets and 128 B of
+  x per lane and chunk) took as long as the whole kernel (32 against 32 us on a busy GPU): the
+  decode is not where the time goes. Decoding with half bit patterns (`0x6400 | nibble`, minus
+  1024) 35 against 32 us, x staged in threadgroup memory 43, 2 to 8 rows per SIMD-group with every
+  row's loads issued first 16.9-30 us against 16.2, 1 to 8 SIMD-groups per threadgroup no change.
+  MLX's `qmv_fast` decodes a value with a mask, a conversion and an FMA, as these kernels do, and
+  its `fp_quantized` E2M1 decoding is the same bit trick as `e2m1x4`: nothing to take from it.
+  (mlx-lm itself decodes this checkpoint at 29-35 tok/s here.)
+- **A mixed 3/4-bit layout**: UD-IQ3_XXS already is one (IQ3_XXS experts, 4-6 bit dense) and decodes
+  at the 4-bit file's speed (81 against 85 tok/s): at 3 bits the expert kernels are bound by the
+  IQ3 grid decoding, so fewer bytes do not turn into speed. Not pursued.
+- **The LM head** (0.2-0.7 ms a token): a shortlist cannot promise the full head's argmax without
+  a bound on the other rows, and the only cheap one (|w . h| <= |w| |h|) is far too loose for
+  logits within 0.1 of each other. Not built.
+
+**Speculative decoding** (the CLI, 256 tokens, greedy, `--no-system`; every output identical to
+the plain one; one run each, load 5-9):
+
+| Checkpoint | prompt | plain | prompt lookup (default) | DSpark draft (`--draft`) |
+|---|---|---:|---:|---:|
+| mlx-community 4bit | code | 81.6 | 86.1 (1.09 tok/forward, 39% of drafts) | 79.2 (1.20, 61%; unsloth's Q8_0 draft by path) |
+| | chat | 82.6 | 93.7 (1.18, 78%) | 82.7 (1.03, 28%) |
+| unsloth UD-IQ3_XXS | code | 81.5 | 85.0 (1.08, 71%) | 81.5 (1.50, 65%) |
+| | chat | 81.8 | 80.4 (1.00, 0%) | 79.4 (1.05, 38%) |
+| ggml-org Q8_0 | code | 66.1 | 68.6 (1.08, 42%) | 75.1 (1.62, 57%) |
+| | chat | 64.9 | 65.1 (1.05, 35%) | 63.3 (1.05, 35%) |
+
+A verification pass of 4 tokens costs 21.3-24.6 ms against 11.4-14.7 for one (the tokens read
+their own experts: 4 tokens touch 26-29 of the 128), so a round of 3 drafts accepted at a rate a
+gives `1 + a + a^2 + a^3` tokens for about 25 ms: 125 tok/s needs 3.2 tokens a round, an
+acceptance of about 87% at every slot. Prompt lookup gets 1.00-1.18 tokens per forward on these
+prompts, the DSpark draft 1.20-1.62 on code (57-65% of drafts) and 1.03-1.05 on chat; where
+drafting does not pay the cost-aware rounds stay within 3% of plain speed, and the best gain is
++13% (Q8_0 code with DSpark, chat with lookup on the 4-bit file).
+Neither better acceptance nor cheaper verification is in reach on these prompts: the experts of
+the drafted tokens are the floor of a verification pass.
+
+**What is left to 125 tok/s.** A one-token pass is 11.3 ms of GPU time for 2.7-2.9 GB of
+weights (mlx-community 4bit), which streams in 5.2-5.6 ms at the 520 GB/s this GPU reads; the
+other 6 ms are the latency of a chain of about 15 dependent kernels per layer application, 48
+times. 125 tok/s is 8 ms a token including 0.5-0.7 ms of host and launch gaps, so the chain would
+have to lose about 4 ms; this round found that its stages cost little each (0.7 us of dispatch
+and barrier) and that the kernels that run as one threadgroup per token (the mixes, the norms,
+the routing) or as a few threadgroups (the attention at short ranges: 8 of 40 cores) are where
+the time is. Making those spread over the GPU changes their sums' order, which the equality rule
+excludes; even all of it (the attention change above, the mixes at 512 threads instead of 1024:
+25% faster in mb on a busy GPU) is worth perhaps 0.5-1 ms. A realistic ceiling for plain decoding on this design is 90-95 tok/s
+for the 4-bit files, and the published 125 is not reproducible here.
+
 #### Earlier comparisons (llama-server, op-by-op Metal prefill)
 
 Same GGUF file in both engines, same prompt tokens (llama.cpp gets the text oxinfer's chat

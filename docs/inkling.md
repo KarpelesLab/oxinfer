@@ -764,6 +764,11 @@ block 8, depth 7) reaches 37-42 tok/s on code (63-65% of drafts accepted) and 25
 (45-51%). 125 tok/s of plain decoding is not plausible on this chip (the best published
 single-token figures for the model are about 46 tok/s on an M5 Max); 1750 tok/s of prefill is
 (mlx-swift-lm reports 1834-1852 on an M5 Max; oxinfer: 1603-1856 at pp512 at load 3, 1542-1701 at load 6-12).
+A round aimed at that figure (host and GPU overlap, kernel fusion, the attention at short ranges,
+the dense matvecs' decoding, speculative decoding) is in
+[performance.md](performance.md#inkling-2-mini-decoding-on-metal-november-2026): one-token
+passes are 11.4-11.6 ms on the 4-bit files, about 6 ms of them the latency of the chain of small
+kernels, and fusing 240 of the 759 dispatches away did not change the time.
 
 ### CUDA
 
