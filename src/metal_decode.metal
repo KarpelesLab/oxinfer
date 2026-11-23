@@ -1388,6 +1388,91 @@ kernel void pf_add_norm_half(device const float* y [[buffer(0)]], device float* 
     if (tid == 0) rs[r] = inv;
 }
 
+// Gemma 4's MoE layer tail of token rows, one threadgroup of 256 per token, n % 4 == 0 and
+// n <= 256 * 4 * PF_TAIL_V: the routed experts' rows combined as moe_combine does (e = the sum
+// over the token's k slots of weight * eo[row]), y = norm(d) wd + norm(e) we for the dense output
+// d (y's rows; norms as dec_rms_norm's, summed in another order), then pf_add_norm_half's step on
+// y: x = (x + norm(y) wy) scale, out = norm(x) wn (unless ts.w) and its scaled half rows.
+#define PF_TAIL_V 4
+inline float pf_tg_sum(float s, uint sg, uint lane, threadgroup float* red) {
+    s = simd_sum(s);
+    if (lane == 0) red[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return ((red[0] + red[1]) + (red[2] + red[3])) + ((red[4] + red[5]) + (red[6] + red[7]));
+}
+kernel void pf_moe_tail(device const float* y [[buffer(0)]], device float* x [[buffer(1)]], device float* out [[buffer(2)]],
+                        device const float* wy [[buffer(3)]], device const float* wn [[buffer(4)]], constant AN& p [[buffer(5)]],
+                        constant uint4& ts [[buffer(6)]], device half* xh [[buffer(7)]], device float* rs [[buffer(8)]],
+                        device const float* eo [[buffer(9)]], device const float2* slots [[buffer(10)]],
+                        device const float* wd [[buffer(11)]], device const float* we [[buffer(12)]], constant uint& k [[buffer(13)]],
+                        uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[5][8];
+    device const float4* yr = (device const float4*)(y + (ulong)r * ts.x);
+    device float4* xr = (device float4*)(x + (ulong)r * ts.y);
+    device float4* o = (device float4*)(out + (ulong)r * ts.z);
+    device const float4* wd4 = (device const float4*)wd;
+    device const float4* we4 = (device const float4*)we;
+    device const float4* wy4 = (device const float4*)wy;
+    device const float4* wn4 = (device const float4*)wn;
+    uint n4 = p.n / 4;
+    float4 dv[PF_TAIL_V], ev[PF_TAIL_V];
+    for (uint j = 0; j < PF_TAIL_V; j++) { dv[j] = 0.f; ev[j] = 0.f; }
+    for (uint s = 0; s < k; s++) {
+        float2 sl = slots[(ulong)r * k + s];
+        device const float4* er = (device const float4*)(eo + (ulong)as_type<uint>(sl.x) * p.n);
+        for (uint j = 0; j < PF_TAIL_V; j++) {
+            uint i = tid + j * 256;
+            if (i < n4) ev[j] += sl.y * er[i];
+        }
+    }
+    float sd = 0.f, se = 0.f;
+    for (uint j = 0; j < PF_TAIL_V; j++) {
+        uint i = tid + j * 256;
+        if (i < n4) dv[j] = yr[i];
+        sd += dot(dv[j], dv[j]);
+        se += dot(ev[j], ev[j]);
+    }
+    float kd = rsqrt(pf_tg_sum(sd, sg, lane, red[0]) / float(p.n) + p.eps);
+    float ke = rsqrt(pf_tg_sum(se, sg, lane, red[1]) / float(p.n) + p.eps);
+    float s = 0.f;
+    for (uint j = 0; j < PF_TAIL_V; j++) {
+        uint i = tid + j * 256;
+        if (i < n4) dv[j] = dv[j] * kd * wd4[i] + ev[j] * ke * we4[i];
+        s += dot(dv[j], dv[j]);
+    }
+    float k1 = rsqrt(pf_tg_sum(s, sg, lane, red[2]) / float(p.n) + p.eps);
+    float s2 = 0.f;
+    for (uint j = 0; j < PF_TAIL_V; j++) {
+        uint i = tid + j * 256;
+        if (i < n4) {
+            ev[j] = (xr[i] + dv[j] * k1 * wy4[i]) * p.scale;
+            xr[i] = ev[j];
+            s2 += dot(ev[j], ev[j]);
+        }
+    }
+    float k2 = rsqrt(pf_tg_sum(s2, sg, lane, red[3]) / float(p.n) + p.eps);
+    float m = 0.f;
+    for (uint j = 0; j < PF_TAIL_V; j++) {
+        uint i = tid + j * 256;
+        if (i < n4) {
+            float4 v = ev[j] * k2 * wn4[i];
+            if (ts.w == 0) o[i] = v;
+            dv[j] = v;
+            float4 a = abs(v);
+            m = max(m, max(max(a.x, a.y), max(a.z, a.w)));
+        }
+    }
+    m = pf_tg_max(m, sg, lane, red[4]);
+    float inv, sc = pf_row_scale(m, inv);
+    device half4* oh = (device half4*)(xh + (ulong)r * p.n);
+    for (uint j = 0; j < PF_TAIL_V; j++) {
+        uint i = tid + j * 256;
+        if (i < n4) oh[i] = half4(dv[j] * sc);
+    }
+    if (tid == 0) rs[r] = inv;
+}
+
 // ---- Interventions (crate::intervene) -------------------------------------------------------
 // Residual hooks of one row x[n] (one threadgroup): `hot` holds the n_add add coefficients (padded
 // to 4) then 8 floats per item (bias, threshold, act: 0 linear / 1 relu / 2 jumprelu, op: 0 set /

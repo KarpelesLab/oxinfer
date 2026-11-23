@@ -290,10 +290,10 @@ type PfItem<'a> = (Vec<Vec<MOp>>, &'a [Range], &'a [Range]);
 /// writes, writes what it reads or writes), then, with [`pf_late`], as late as the groups that
 /// depend on it allow. The stages are encoded in order with a barrier between them, so
 /// independent chains (a MoE layer's routing and experts, and its dense feed-forward) share
-/// stages rather than each step waiting for the other chain's. `split(x)`: whether the routed
-/// experts `x` (`MOp::PfExperts`) may run as separate phases. Ops from `cut` on (the head) keep
+/// stages rather than each step waiting for the other chain's. `split(x)`: how many separate
+/// phases the routed experts `x` (`MOp::PfExperts`) run as (0: one op). Ops from `cut` on (the head) keep
 /// their place after the rest. Returns the ops and where the head starts.
-fn pf_schedule(ops: Vec<MOp>, groups: &[PfGroup], cut: usize, head_from: usize, split: impl Fn(usize) -> bool) -> (Vec<MOp>, usize) {
+fn pf_schedule(ops: Vec<MOp>, groups: &[PfGroup], cut: usize, head_from: usize, split: impl Fn(usize) -> u8) -> (Vec<MOp>, usize) {
     let mut slots: Vec<Option<MOp>> = ops.into_iter().map(Some).collect();
     // (segments, reads, writes) of the groups with ops.
     let mut items: Vec<PfItem> = Vec::new();
@@ -302,8 +302,8 @@ fn pf_schedule(ops: Vec<MOp>, groups: &[PfGroup], cut: usize, head_from: usize, 
         for op in slots[*a..*b].iter_mut().map(|o| o.take().expect("an op in two groups")) {
             match op {
                 MOp::Barrier => segs.push(Vec::new()),
-                MOp::PfExperts(x, PF_X_ALL) if split(x) => {
-                    segs.extend((0..6).map(|k| vec![MOp::PfExperts(x, k)]));
+                MOp::PfExperts(x, PF_X_ALL) if split(x) > 0 => {
+                    segs.extend((0..split(x)).map(|k| vec![MOp::PfExperts(x, k)]));
                     segs.push(Vec::new());
                 }
                 op => segs.last_mut().unwrap().push(op),
@@ -371,6 +371,170 @@ fn pf_router_r() -> bool {
 /// spans of the buffers).
 fn pf_cols() -> bool {
     std::env::var("OXINFER_PF_COLS").map_or(true, |v| v != "0")
+}
+
+/// Whether prefill plans fuse Gemma 4's MoE layer tails (`MOp::PfMoeTail`; `OXINFER_PF_MOE_TAIL=0`:
+/// the combine, the two post norms and the residual step apart).
+fn pf_moe_tail() -> bool {
+    // (Read as each plan is built, so that `pf_ab` can compare.)
+    std::env::var("OXINFER_PF_MOE_TAIL").map_or(true, |v| v != "0")
+}
+
+/// A Gemma 4 MoE layer's tail fused into one `MOp::PfMoeTail`: the graph ops of the routed
+/// experts (`experts`), of the dense output's and the experts' post norms (`norms`, weights `wd`
+/// and `we`, compiled to nothing) and the residual step with the next norm (`add_norm`); `eo` is
+/// the experts' output view.
+struct PfTail {
+    experts: usize,
+    norms: [usize; 2],
+    add_norm: usize,
+    eo: View,
+    wd: Vec<f32>,
+    we: Vec<f32>,
+}
+
+/// How a graph op touches buffer `b`: None not at all, Some(true) reading it (or unknown),
+/// Some(false) writing it without reading.
+fn pf_touch(op: &Op, b: usize) -> Option<bool> {
+    let hit = |v: View| v.buf == b;
+    match *op {
+        Op::Linear { x, y, mode, .. } => {
+            if hit(x) || hit(y) && !matches!(mode, LinMode::Store | LinMode::SiluPair | LinMode::GeluPair) {
+                Some(true)
+            } else {
+                hit(y).then_some(false)
+            }
+        }
+        Op::Norm { x, out, add, .. } => {
+            if hit(x) || hit(out) && add {
+                Some(true)
+            } else {
+                hit(out).then_some(false)
+            }
+        }
+        Op::AddNorm { y, x, next, .. } => {
+            if hit(y) || hit(x) {
+                Some(true)
+            } else {
+                next.and_then(|(o, _)| hit(o).then_some(false))
+            }
+        }
+        Op::QkRope { qkv, q_out, .. } => {
+            if hit(qkv) {
+                Some(true)
+            } else {
+                hit(q_out).then_some(false)
+            }
+        }
+        Op::Attend { q, out, gate, .. } => {
+            if hit(q) || gate.is_some_and(|(v, _)| hit(v)) {
+                Some(true)
+            } else {
+                hit(out).then_some(false)
+            }
+        }
+        Op::Route { x, logits, sel, .. } => {
+            if hit(x) {
+                Some(true)
+            } else {
+                (hit(logits) || hit(sel)).then_some(false)
+            }
+        }
+        Op::Experts(ref ex) => {
+            if hit(ex.x) || hit(ex.sel) || hit(ex.y) && ex.add {
+                Some(true)
+            } else {
+                (hit(ex.y) || hit(ex.act)).then_some(false)
+            }
+        }
+        Op::Glu { g, u, out, .. } => {
+            if hit(g) || hit(u) {
+                Some(true)
+            } else {
+                hit(out).then_some(false)
+            }
+        }
+        _ => Some(true),
+    }
+}
+
+/// Gemma 4's MoE layer tails in a prefill graph: routed experts writing `eo`, then `ob +=
+/// norm(eo) we` and the residual step `AddNorm { y: ob, next }` whose next norm feeds a GEMM, with
+/// `ob = norm(ob) wd` among the few routing ops before the experts, the same `eps` everywhere,
+/// and neither `ob` nor `eo` read again before something overwrites them (so the tail stores
+/// neither).
+fn pf_moe_tails(g: &Graph) -> Vec<PfTail> {
+    let mut v = Vec::new();
+    let ops = &g.ops;
+    let host: Vec<usize> = std::iter::once(g.hidden.buf)
+        .chain(g.logits.map(|l| l.0.buf))
+        .chain(g.capture.map(|c| c.0.buf))
+        .chain(g.input2.map(|c| c.0.buf))
+        .collect();
+    // Not read before being overwritten (and not by the host).
+    let dead = |from: usize, b: usize| !host.contains(&b) && ops[from..].iter().find_map(|op| pf_touch(op, b)).is_none_or(|r| !r);
+    for (i, op) in ops.iter().enumerate() {
+        let Op::Experts(ex) = op else { continue };
+        if ex.add || ex.edits.is_some() || ex.lora.is_some() {
+            continue;
+        }
+        let h = ex.h;
+        let norm = |j: usize, x: View, out: View, add: bool| match ops.get(j) {
+            Some(Op::Norm {
+                x: nx,
+                out: no,
+                w: Some(w),
+                pre,
+                n,
+                rows: 1,
+                add: na,
+                eps,
+                ..
+            }) if *nx == x && *no == out && *pre == 1.0 && *n == h && *na == add => Some((w.to_vec(), *eps)),
+            _ => None,
+        };
+        let Some(Op::Norm { out: ob, .. }) = ops.get(i + 1) else { continue };
+        let ob = *ob;
+        let Some((we, e1)) = norm(i + 1, ex.y, ob, true) else { continue };
+        let Some(Op::AddNorm {
+            y,
+            next: Some((hn, _)),
+            n,
+            eps: e2,
+            ..
+        }) = ops.get(i + 2)
+        else {
+            continue;
+        };
+        if *y != ob || *n != h || *e2 != e1 || !h.is_multiple_of(4) || h > PF_TAIL_MAX || ob.buf == ex.y.buf {
+            continue;
+        }
+        if !matches!(ops.get(i + 3), Some(Op::Linear { x: lx, n_in, .. }) if lx == hn && *n_in == h) {
+            continue;
+        }
+        // The dense output's norm, with only norms of other rows and the routing in between.
+        let Some(j) = (i.saturating_sub(6)..i).rev().find(|&j| norm(j, ob, ob, false).is_some()) else {
+            continue;
+        };
+        let (wd, e0) = norm(j, ob, ob, false).unwrap();
+        let between_ok = ops[j + 1..i].iter().all(|op| match *op {
+            Op::Norm { x, out, .. } => x.buf != ob.buf && out.buf != ob.buf && out.buf != ex.y.buf,
+            Op::Route { x, .. } => x.buf != ob.buf,
+            _ => false,
+        });
+        if e0 != e1 || !between_ok || !dead(i + 3, ob.buf) || !dead(i + 3, ex.y.buf) {
+            continue;
+        }
+        v.push(PfTail {
+            experts: i,
+            norms: [j, i + 1],
+            add_norm: i + 2,
+            eo: ex.y,
+            wd,
+            we,
+        });
+    }
+    v
 }
 
 /// [`pf_schedule`] places the ops with slack as late as their dependents allow (default), or as
@@ -851,6 +1015,8 @@ pub(crate) fn pf_report() {
     eprintln!("  total {:.1} ms", tot * 1e3);
 }
 
+/// Widest rows of `pf_moe_tail` (256 threads x PF_TAIL_V float4s).
+const PF_TAIL_MAX: usize = 256 * 4 * 4;
 /// Prefill GEMMs with fewer 128-row tiles than this take 32-row ones (measured on an M5 Max).
 const PF_SMALL_TILES: usize = 160;
 /// Command buffers of a prefill pass (without MoE layers): each layer's new keys and values are
@@ -1534,6 +1700,23 @@ enum MOp {
         p: [u32; 4],
         ts: [u32; 4],
     },
+    /// Prefill plans: a Gemma 4 MoE layer's tail (`pf_moe_tail`, see `pf_moe_tails`): the routed
+    /// experts `ex`'s outputs combined from the staging, the post norms (weights `wd`, `we`) of
+    /// the dense output `y` and of the experts' added, then `AddNormHalf`'s step on that sum
+    /// (`y`, `x`, `out`, `wy`, `wn`, `p`, `ts` as there).
+    PfMoeTail {
+        pipe: Id,
+        ex: usize,
+        wd: usize,
+        we: usize,
+        y: usize,
+        x: usize,
+        out: usize,
+        wy: usize,
+        wn: usize,
+        p: [u32; 4],
+        ts: [u32; 4],
+    },
     /// Prefill plans: `Glu` of token rows (`pf_glu_half`; `ts` the g, u, out strides, then 1 when
     /// nothing reads the f32 rows, which are then not stored) that also leaves their half rows in
     /// the GEMM scratch.
@@ -1718,6 +1901,9 @@ struct PfExperts {
     gelu: bool,
     /// Runtime LoRA updates of the experts (`Experts::lora`).
     lora: Option<PfXLora>,
+    /// Whether the experts' outputs are combined into `y` here (else by the layer's
+    /// `MOp::PfMoeTail`, from the staging).
+    combine: bool,
 }
 
 /// The LoRA updates of a prefill plan's routed experts: `pfx_lora_down` / `pfx_lora_add`, the
@@ -2187,8 +2373,19 @@ impl MetalBackend {
         let mut streamed: Vec<StreamedMv> = Vec::new();
         let mut experts: Vec<StreamedExperts> = Vec::new();
         let mut max_len = usize::MAX;
+        // Prefill plans: Gemma 4's MoE layer tails (see `pf_moe_tails`).
+        let tails = if pf && pf_norm_half() && pf_moe_tail() {
+            pf_moe_tails(g)
+        } else {
+            Vec::new()
+        };
+        let tail_skip = |i: usize| tails.iter().any(|t| t.norms.contains(&i));
         for (i, op) in g.ops.iter().enumerate() {
             op_mop.push(ops.len());
+            if tail_skip(i) {
+                // (Computed by the layer's `MOp::PfMoeTail`.)
+                continue;
+            }
             let mut smv: Option<([usize; 3], Option<[usize; 3]>)> = None;
             let mut sxp: Option<StreamedExperts> = None;
             if i == g.head_from {
@@ -2795,7 +2992,9 @@ impl MetalBackend {
                         return None;
                     }
                     emit.push(MOp::PfExperts(pf_experts.len(), PF_X_ALL));
+                    let combine = !tails.iter().any(|t| t.experts == i);
                     pf_experts.push(PfExperts {
+                        combine,
                         pipes: (pg3, pd3),
                         up,
                         tabs: t16,
@@ -2931,6 +3130,37 @@ impl MetalBackend {
                     let threads = n.next_multiple_of(32).min(1024);
                     if n > 8 * threads || wy.len() != n || next.is_some_and(|(_, w)| w.len() != n) {
                         return None;
+                    }
+                    // Gemma 4's MoE layer tail, with the layer's experts' combine and post norms.
+                    if let Some(tl) = tails.iter().find(|tl| tl.add_norm == i)
+                        && let Some((o, wn)) = next
+                    {
+                        // (The layer's experts, the last compiled.)
+                        let xi = pf_experts.len().checked_sub(1)?;
+                        if pf_experts[xi].y != byte(tl.eo) || pf_experts[xi].combine {
+                            return None;
+                        }
+                        emit.push(MOp::PfMoeTail {
+                            pipe: self.named_pipeline("pf_moe_tail")?,
+                            ex: xi,
+                            wd: cst(&tl.wd),
+                            we: cst(&tl.we),
+                            y: byte(y),
+                            x: byte(x),
+                            out: byte(o),
+                            wy: cst(wy),
+                            wn: cst(wn),
+                            p: [n as u32, eps.to_bits(), scale.to_bits(), 0],
+                            ts: [ts(y) as u32, ts(x) as u32, ts(o) as u32, 0],
+                        });
+                        xh_next = Some((o.buf, o.off, n));
+                        fused_out = Some(rng(o, n));
+                        // (y and the experts' outputs are not stored: nothing reads them, see
+                        // `pf_moe_tails`.)
+                        break 'an (
+                            vec![rng(y, n), rng(x, n), (PF_RES + 2, 0, usize::MAX)],
+                            vec![rng(x, n), rng(o, n), rng(y, n), rng(tl.eo, n), (PF_RES, 0, usize::MAX)],
+                        );
                     }
                     // Prefill: a norm feeding the next op's GEMM makes its half rows too.
                     if let Some((o, wn)) = next
@@ -3712,9 +3942,12 @@ impl MetalBackend {
             if pf {
                 group_reads.push((ops.len(), r.clone()));
                 if let Some(f) = fused_out {
-                    let at = emit
-                        .iter()
-                        .position(|o| matches!(o, MOp::NormHalf { .. } | MOp::GluHalf { .. } | MOp::AddNormHalf { .. }));
+                    let at = emit.iter().position(|o| {
+                        matches!(
+                            o,
+                            MOp::NormHalf { .. } | MOp::GluHalf { .. } | MOp::AddNormHalf { .. } | MOp::PfMoeTail { .. }
+                        )
+                    });
                     fused_rows.extend(at.map(|j| (ops.len() + j, f)));
                 }
             }
@@ -3754,7 +3987,7 @@ impl MetalBackend {
                 }
                 match &mut ops[j] {
                     MOp::NormHalf { p, .. } => p._p = 1,
-                    MOp::GluHalf { ts, .. } | MOp::AddNormHalf { ts, .. } => ts[3] = 1,
+                    MOp::GluHalf { ts, .. } | MOp::AddNormHalf { ts, .. } | MOp::PfMoeTail { ts, .. } => ts[3] = 1,
                     _ => {}
                 }
             }
@@ -3847,7 +4080,11 @@ impl MetalBackend {
         if let Some(pfs) = pf_state.as_ref().filter(|_| pf_reorder()) {
             // (The head, if any, follows its barrier.)
             let cut = if head_from < ops.len() { head_from - 1 } else { ops.len() };
-            let split = |x: usize| pfs.route.is_some() && pfs.experts[x].lora.is_none();
+            let split = |x: usize| match &pfs.experts[x] {
+                e if pfs.route.is_none() || e.lora.is_some() => 0,
+                e if e.combine => 6,
+                _ => 5,
+            };
             (ops, head_from) = pf_schedule(std::mem::take(&mut ops), &pf_groups, cut, head_from, split);
         }
         // Split-attention partials after the activations (a region per token).
@@ -4682,6 +4919,7 @@ impl MetalPlan<'_> {
             | MOp::PfKvHalf { .. }
             | MOp::NormHalf { .. }
             | MOp::AddNormHalf { .. }
+            | MOp::PfMoeTail { .. }
             | MOp::GluHalf { .. } => unreachable!("prefill op in a multi-token plan"),
         }
     }
@@ -4999,6 +5237,36 @@ impl MetalPlan<'_> {
                 e.bytes(ts, 6);
                 e.buf(arena, pf.xh, 7);
                 e.buf(arena, pf.rs, 8);
+                e.dispatch((rows, 1), 256);
+            }
+            MOp::PfMoeTail {
+                pipe,
+                ex,
+                wd,
+                we,
+                y,
+                x,
+                out,
+                wy,
+                wn,
+                p,
+                ts,
+            } => {
+                e.pipe(*pipe);
+                e.buf(arena, *y, 0);
+                e.buf(arena, *x, 1);
+                e.buf(arena, *out, 2);
+                e.buf(consts, *wy, 3);
+                e.buf(consts, *wn, 4);
+                e.bytes(p, 5);
+                e.bytes(ts, 6);
+                e.buf(arena, pf.xh, 7);
+                e.buf(arena, pf.rs, 8);
+                e.buf(pf.stage, pf.st[8], 9);
+                e.buf(pf.stage, pf.st[2], 10);
+                e.buf(consts, *wd, 11);
+                e.buf(consts, *we, 12);
+                e.bytes(&(pf.experts[*ex].k as u32), 13);
                 e.dispatch((rows, 1), 256);
             }
             MOp::NormHalf { pipe, x, out, w, p } => {
@@ -5353,7 +5621,7 @@ impl MetalPlan<'_> {
                     ldo: u32,
                     _p: u32,
                 }
-                if on(5) {
+                if on(5) && x.combine {
                     e.pipe(m.combine);
                     e.buf(sb, st(8), 0);
                     e.buf(sb, st(2), 1);
@@ -6176,7 +6444,7 @@ impl DecodePlan for MetalPlan<'_> {
                         MOp::PfTopk { .. } | MOp::PfExperts(..) => "moe",
                         MOp::PfGdn { .. } => "gdn",
                         MOp::PfAttn { .. } | MOp::PfFlash { .. } | MOp::PfKvHalf { .. } => "attn",
-                        MOp::NormHalf { .. } | MOp::AddNormHalf { .. } => "norm",
+                        MOp::NormHalf { .. } | MOp::AddNormHalf { .. } | MOp::PfMoeTail { .. } => "norm",
                         MOp::GluHalf { .. } => "glu",
                     };
                     if !o.split(',').any(|x| x == k) {
@@ -6190,7 +6458,7 @@ impl DecodePlan for MetalPlan<'_> {
                     if let Some(sk) = SKIP.get_or_init(|| std::env::var("OXINFER_PF_SKIP").ok()) {
                         let k = match op {
                             MOp::Barrier => "barrier",
-                            MOp::Norm { .. } | MOp::NormHalf { .. } | MOp::AddNormHalf { .. } => "norm",
+                            MOp::Norm { .. } | MOp::NormHalf { .. } | MOp::AddNormHalf { .. } | MOp::PfMoeTail { .. } => "norm",
                             MOp::XHalf { .. } => "xhalf",
                             MOp::Gemm { .. } | MOp::GemmF32 { .. } => "gemm",
                             MOp::Glu { .. } | MOp::GluHalf { .. } | MOp::Ew { .. } => "glu",
@@ -6223,6 +6491,7 @@ impl DecodePlan for MetalPlan<'_> {
                     | MOp::PfKvHalf { .. }
                     | MOp::NormHalf { .. }
                     | MOp::AddNormHalf { .. }
+                    | MOp::PfMoeTail { .. }
                     | MOp::GluHalf { .. } => unreachable!("prefill op in a one-token plan"),
                     MOp::Norm {
                         pipe,
@@ -6660,6 +6929,7 @@ impl DecodePlan for MetalPlan<'_> {
                         MOp::PfKvHalf { .. } => "kv half".into(),
                         MOp::NormHalf { .. } => "norm+half".into(),
                         MOp::AddNormHalf { .. } => "addnorm+half".into(),
+                        MOp::PfMoeTail { .. } => "moe tail".into(),
                         MOp::GluHalf { .. } => "glu+half".into(),
                         MOp::QkRope { .. } => "qkrope".into(),
                         MOp::QsaKey { .. } => "qsa key".into(),
