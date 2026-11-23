@@ -671,9 +671,13 @@ Where oxinfer is still behind:
 - **CPU decode per core** (round 6: Q8_0, Q4_0, Q4_K and Q6_K matrices interleaved four rows at
   a time in place, llama.cpp's repacked layout, bit-identical): level with llama.cpp on 1 and 4
   threads for Q8_0, ahead for Q4_0, 5-10% behind for Q4_K_M; on all threads level or ahead, and
-  under load far ahead (llama.cpp's spinning threads collapse at 12 threads). Left: 8 threads on
-  the dense Q8_0 models, 10-15% behind llama.cpp's 8 threads in quiet windows. See
-  [CPU decode round 6](#cpu-decode-round-6-november-2026), and rounds 5, 4 and 3 before it.
+  under load far ahead (llama.cpp's spinning threads collapse at 12 threads). The 8-thread gap
+  of round 6 turned out to be core placement: macOS packs 8 threads into two of the three
+  clusters in some minutes (each cluster has its own bandwidth ceiling), and llama.cpp's
+  threads are packed as often as oxinfer's. On 8 threads oxinfer is now level or ahead
+  (round 7, which also vectorized the RMSNorms' sums of squares: +1-4% a step). See
+  [CPU decode round 7](#cpu-decode-round-7-8-threads-november-2026), and rounds 6, 5, 4 and 3
+  before it.
   Qwen3-8B (Q8_0, Q4_K_M), Gemma 4 12B, 26B-A4B, Orpheus and Llama 1B Q4_K_M decode level with
   or ahead of llama.cpp's best thread count.
 
@@ -1568,6 +1572,177 @@ Dropped or not done:
   blocks' size;
 - interleaving on x86-64: the AVX2 / AVX-512 kernels keep the file's layout (the layout is only
   enabled on aarch64; their portable fallbacks read interleaved rows back if one is ever given).
+
+#### CPU decode round 7: 8 threads (November 2026)
+
+Round 6 left one gap: on 8 threads, dense Q8_0 decoding was 10-15% behind llama.cpp's 8 threads
+in quiet windows (Llama 3.2 1B 161-167 against 192-194 tok/s, Gemma 4 12B 18 against 20.6). This
+round traced it to which cores the threads land on, and found that both engines are subject to it
+alike.
+
+**How it was measured.** Two temporary probes, not kept in the tree:
+
+- A trace of every pool region: when it was published, and for each thread its join and leave
+  times, the tasks it ran and its CPU number (`pthread_cpu_number_np`). The trace also marked
+  each decode step and timed the serial segments of a Gemma layer.
+- A placement sampler for any process, oxinfer or `llama-bench`. It is a dylib loaded with
+  `DYLD_INSERT_LIBRARIES`. Every 2 ms it signals each running thread of the process, and the
+  handler records the thread's CPU. From that it reports, per 50 ms window, how many of the busy
+  threads were on each cluster.
+
+**The machine.** This M5 Max has three 6-core clusters:
+
+- CPUs 12-17 are the "Super" cores (`hw.perflevel0`, 16 MB L2).
+- CPUs 0-5 and 6-11 are two clusters of "Performance" cores (`hw.perflevel1`, 8 MB L2 each).
+
+Each cluster has a bandwidth ceiling of its own. From the trace (Gemma 4 12B gate / up regions,
+GB/s that a cluster's threads streamed together):
+
+| threads in the cluster | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---|---|---|---|---|---|
+| Super cluster | 66 | 110 | 117 | 141 | 146 | 150 |
+| a Performance cluster | 63 | 88 | 97 | 114 | 115 | 115 |
+
+So 8 threads reach the memory's ~285 GB/s only when they are spread over all three clusters
+(3 + 3 + 2: 276-288 GB/s for the region). Packed into two clusters (Super 4-6 + one Performance
+cluster 2-4) they get 239-247 GB/s, whatever the work split. 16 and 18 threads cover every
+cluster and are not affected.
+
+**Placement.** macOS gives no affinity on Apple silicon: `thread_policy_set(THREAD_AFFINITY_POLICY)`
+returns `KERN_NOT_SUPPORTED`. The scheduler decides, and its choice follows the rest of the
+machine's load:
+
+- In quiet windows it spreads 8 busy threads 3 + 3 + 2. The same 8-thread Llama 1B Q8_0 step took
+  4.98-5.06 ms there, against 6.18 ms in a minute when the threads sat on two clusters.
+- In that packed minute, the gate / up region took 155 us when its threads were on two clusters
+  and 133-142 us when they were on three. The same region took 130 us on 16 threads.
+- In the packed phases threads migrated 400-750 times per 500 ms, and the Performance cluster in
+  use switched every ~2 s. In the spread phases there were ~80 migrations per 500 ms, and 16% more
+  regions ran per second.
+
+With the sampler on both engines, interleaved:
+
+- Quiet window: llama.cpp's 8 threads were on three clusters in 98-100% of the windows, oxinfer's
+  in 87-93%. Gemma 4 12B: 20.1-20.3 against 21.1-21.2 tok/s. Llama 1B: 186.5-186.7 against
+  194.3-194.8.
+- With 3 busy loops added: 57-76% against 55-64%, and 16.6-16.7 against 17.4-17.5 tok/s.
+- With 7 busy loops: 90% against 89-90%, and 14.6-16.0 against 17.2-17.4 tok/s.
+
+So llama.cpp's threads are packed as often as oxinfer's, and on the same placement oxinfer is
+faster. Two other suspects were tested and ruled out:
+
+- **The QoS class.** oxinfer runs at user-interactive and llama.cpp at none. Running oxinfer
+  unspecified, default, user-initiated or user-interactive gave the same placement and the same
+  step time (197.6-201.2 tok/s, in eight alternated runs).
+- **The spin budget before a worker yields.** It is 4096 spins (32.5 us), shorter than the 42 us
+  between Gemma steps. 65536 spins changed nothing (21.0-21.4 against 21.3-21.4 tok/s).
+
+The 10-15% "gap" of round 6 came from 8-thread runs that caught a packed minute: the separate
+processes of `parity_bench` and `llama-bench` alternated with the machine's state. In this
+round's runs, oxinfer's 8 threads were level with llama.cpp's or ahead in every pass (the table
+below).
+
+**Kept: the RMSNorm's sum of squares in 16 running sums** (`kernels::sum_squares`). The trace
+put Gemma 4 12B's serial work between regions at ~2 ms of a 46-55 ms step: 43 us a layer, of
+which the norms took ~19 us:
+
+- 2.7 us for the input norm;
+- 3.8 us for the query heads' norms and RoPE, 4.2 us for the keys and values;
+- 3.1, 2.3 and 3.0 us for the post-attention, pre-FFN and post-FFN norms with their residual
+  adds.
+
+Every norm's sum of squares was one chain of dependent adds in element order (kept until now for
+the bits). It is now 16 running sums, lane `i` taking the elements `i mod 16`, added in lane order,
+then the tail of fewer than 16 elements. Rust does not contract the multiplies and adds into FMAs,
+so the bits are the same on every target (`kernels::tests::sum_squares_is_sixteen_lanes_then_the_tail`).
+It serves all four `kernels::rmsnorm*` variants, so prefill, decode and verification passes still
+agree with one another bit for bit, and `cargo test --release --lib` passes unchanged.
+
+Timed in one process, with the old and new sums alternated step by step (a temporary switch):
+
+| model | threads | old sum (median step) | new sum | gain |
+|---|---|---|---|---|
+| Llama 3.2 1B Q8_0 (`decode_ab`, 1500 steps each) | 8 | 5.227 ms | 5.185 ms | +0.8% |
+| | 18 | 5.331 ms | 5.281 ms | +0.9% |
+| Gemma 4 12B Q8_0 (`parity_bench`, 194 steps each) | 8 | 47.10 ms | 46.28 ms | +1.8% |
+| | 18 | 47.93 ms | 47.13 ms | +1.7% |
+| Gemma 4 26B-A4B Q4_0 | 8 | 14.49 ms | 13.96 ms | +3.8% |
+
+The MoE model gains the most: each layer adds the dense MLP's, the router's and the experts' norms.
+
+Correctness: the logits change by the rounding of the sum, so they are no longer bit-identical to
+round 6's. `pf_check` (200-token raw-text prompt, 64 greedy tokens, top-20 log-probabilities each
+step, CPU), comparing old and new:
+
+| model | greedy tokens agreeing | mean / max KL over the top 20 (restricted, so it can dip below 0) | max \|Δ logprob\| |
+|---|---|---|---|
+| Llama 3.2 1B Q8_0 | 64/64 | -3.4e-4 / 1.0e-2 | 0.29 |
+| Llama 3.2 1B Q4_K_M | 64/64 | 4.6e-4 / 1.4e-2 | 0.26 |
+| Qwen3-8B Q8_0 | 64/64 | 5.9e-4 / 1.1e-2 | 0.46 |
+
+This is the noise the int8 activations already give: a one-ulp change in a normed row moves some
+roundings to int8. For comparison, the old build against itself with `prefill_gemm=exact`
+instead of `fast`: Llama 1B 4.6e-4 / 9.6e-3 (max Δ 0.27); Qwen3-8B 4.8e-4 / 9.6e-3 (0.70). CPU
+against Metal: 5.4e-5 / 8.4e-3 (0.19) and 7.2e-4 / 1.2e-2 (0.42). Repeated runs of either build
+are bit-identical. On Gemma 4 12B and 26B-A4B, raw-text continuations are near-uniform (round 3
+of Metal prefill saw the same between `fast` and `exact`), so the greedy tokens part after 6 and
+4 steps.
+
+**Decode tg against llama.cpp** (`parity_bench` reps=3 best, "before" = master `f6ebf5f`, "after"
+= this round, run ABBA as before / after / after / before; `llama-bench -ngl 0 -dev none -r 3` at
+the same thread count; oxinfer's 16 and 18 threads decode on 14 and 16 (`OXINFER_DECODE_THREADS`
+default); load averages 5-48, the machine shared). tok/s:
+
+| model | threads | llama.cpp | before | after |
+|---|---|---|---|---|
+| Llama 3.2 1B Q8_0 (tg128) | 1 | 57.2 | 59.0 / 58.1 | 58.8 / 58.7 |
+| | 4 | 156.2 | 157.6 / 155.7 | 157.9 / 156.8 |
+| | 8 | 178.8 ± 5.3 | 169.3 / 166.8 | 169.6 / 190.7 |
+| | 16 | 5.4 | 184.6 / 185.7 | 185.0 / 183.2 |
+| | 18 | 7.0 | 187.4 / 190.5 | 187.0 / 189.4 |
+| Llama 3.2 1B Q4_K_M (tg128) | 1 | 45.6 | 41.3 / 41.7 | 40.3 / 41.8 |
+| | 4 | 151.3 | 139.2 / 137.2 | 139.1 / 138.3 |
+| | 8 | 206.4 | 213.1 / 216.0 | 212.6 / 217.4 |
+| | 16 | 202.9 ± 23 | 251.6 / 249.4 | 252.5 / 263.5 |
+| | 18 | 12.4 | 249.6 / 252.5 | 250.2 / 257.9 |
+| Gemma 4 26B-A4B Q4_0 (tg64) | 1 | 16.8 | 21.0 / 21.8 | 20.7 / 21.7 |
+| | 4 | 47.6 | 58.2 / 57.2 | 59.2 / 58.8 |
+| | 8 | 65.6 | 69.9 / 69.5 | 71.7 / 71.2 |
+| | 16 | 59.9 | 71.3 / 71.4 | 73.9 / 73.7 |
+| | 18 | 15.9 ± 14 | 74.7 / 74.2 | 77.8 / 79.4 |
+| Gemma 4 12B Q8_0 (tg64) | 1 | 6.24 | 6.4 / 6.4 | 6.4 / 6.4 |
+| | 4 | 17.5 | 17.7 / 17.6 | 17.6 / 17.6 |
+| | 8 | 20.5 | 21.6 / 21.2 | 21.7 / 21.2 |
+| | 16 | 18.1 | 20.1 / 20.4 | 20.1 / 20.6 |
+| | 18 | 13.3 | 20.7 / 20.6 | 21.0 / 21.1 |
+
+(llama.cpp's 16 and 18 threads collapse whenever another job takes a core: its threads spin at
+every op's barrier. The Llama 1B Q8_0 runs at 8 threads moved between 167 and 191 tok/s from one
+process to the next, the packed and spread placements above.)
+
+Where things stand:
+
+- On 8 threads oxinfer is level with llama.cpp or ahead on every model measured. Under the same
+  placement it is 4-6% ahead.
+- Per core, Q4_K_M is still 5-10% behind (the nibble unpacking of round 6).
+- Gemma 4 26B-A4B gains 2.5-5% from the norms on 4-18 threads. The dense models' 1-2% is within
+  the run-to-run spread of separate processes and shows only in the alternated timing above.
+
+Measured and dropped:
+
+- **QoS classes for the compute threads** (unspecified, default, user-initiated, utility against
+  user-interactive): the same placement and speed.
+- **Affinity tags** (`THREAD_AFFINITY_POLICY`): not supported on Apple silicon.
+- **A longer spin before yielding** (65536 spins, ~0.5 ms, against 4096): no change on 8 threads.
+  Round 4 found it slower at 18 threads under load.
+
+Not done:
+
+- The serial work left between regions: 0.27 ms of a Llama 1B step, ~1.2 ms of a Gemma 4 12B
+  step. That is the activations' quantization, the per-head RoPE, the cache appends, and the
+  `vec!` allocations of every layer's temporaries.
+- The calling thread's wait for the last tasks: 0.24 ms of a Llama 1B step on 8 threads, 10 us
+  per Gemma gate / up region.
 
 #### x86-64 CPU prefill (November 2026)
 

@@ -3175,10 +3175,35 @@ pub fn axpy(y: &mut [f32], alpha: f32, x: &[f32]) {
     }
 }
 
+/// The sum of squares of an RMSNorm: 16 running sums, lane `i` taking the elements `i mod 16`,
+/// added in lane order at the end, then the tail of fewer than 16 elements in order. Separate
+/// multiplies and adds (Rust does not contract them), so every target gets the same bits. The
+/// running sums vectorize (4 NEON / 2 AVX registers) where one sum in element order was a
+/// serial chain of adds: ~2.7 us for a row of 3840 on the calling thread between parallel
+/// regions, 4-7 of them per layer (Gemma 4 12B: 0.8 ms of a 46 ms CPU decode step).
+#[inline]
+pub fn sum_squares(x: &[f32]) -> f32 {
+    let mut acc = [0f32; 16];
+    let (chunks, tail) = x.as_chunks::<16>();
+    for c in chunks {
+        for (a, &v) in acc.iter_mut().zip(c) {
+            *a += v * v;
+        }
+    }
+    let mut s = 0f32;
+    for a in acc {
+        s += a;
+    }
+    for &v in tail {
+        s += v * v;
+    }
+    s
+}
+
 /// RMSNorm: out = x * rsqrt(mean(x^2) + eps) * w   (w optional, bf16).
 pub fn rmsnorm(x: &[f32], w: Option<&[u16]>, eps: f32, out: &mut [f32]) {
     let n = x.len();
-    let ss: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32 + eps;
+    let ss: f32 = sum_squares(x) / n as f32 + eps;
     let r = ss.powf(-0.5);
     match w {
         Some(w) => {
@@ -3196,7 +3221,7 @@ pub fn rmsnorm(x: &[f32], w: Option<&[u16]>, eps: f32, out: &mut [f32]) {
 
 pub fn rmsnorm_inplace(x: &mut [f32], w: Option<&[u16]>, eps: f32) {
     let n = x.len();
-    let ss: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32 + eps;
+    let ss: f32 = sum_squares(x) / n as f32 + eps;
     let r = ss.powf(-0.5);
     match w {
         Some(w) => {
@@ -3228,7 +3253,7 @@ pub fn rmsnorm_rows_inplace(x: &mut [f32], n: usize, w: Option<&[u16]>, eps: f32
 /// RMSNorm with precomputed f32 weights (e.g. zero-centered `1 + w`): out = x * rsqrt(mean(x^2)+eps) * w.
 pub fn rmsnorm_f32w(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
     let n = x.len();
-    let ss: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32 + eps;
+    let ss: f32 = sum_squares(x) / n as f32 + eps;
     let r = ss.powf(-0.5);
     for i in 0..n {
         out[i] = x[i] * r * w[i];
@@ -3243,7 +3268,7 @@ pub fn rmsnorm_f32w_rows(x: &[f32], n: usize, w: &[f32], eps: f32, out: &mut [f3
 
 pub fn rmsnorm_f32w_inplace(x: &mut [f32], w: &[f32], eps: f32) {
     let n = x.len();
-    let ss: f32 = x.iter().map(|v| v * v).sum::<f32>() / n as f32 + eps;
+    let ss: f32 = sum_squares(x) / n as f32 + eps;
     let r = ss.powf(-0.5);
     for i in 0..n {
         x[i] *= r * w[i];
@@ -3451,6 +3476,34 @@ pub fn softmax_inplace(x: &mut [f32]) {
 mod tests {
     use super::*;
     use crate::quant::{dequantize_rows, dequantize_rows_q4, quantize_act, quantize_bf16, quantize_q4};
+
+    /// `sum_squares` is the 16-lane sum it documents (lanes in order, then the tail), and close
+    /// to the exact sum, at lengths with and without a tail.
+    #[test]
+    fn sum_squares_is_sixteen_lanes_then_the_tail() {
+        for n in [0usize, 1, 5, 16, 37, 256, 2048, 3840, 8191] {
+            let x: Vec<f32> = (0..n).map(|i| ((i * 7919 % 1013) as f32 - 506.0) * 1e-3).collect();
+            let mut lanes = [0f32; 16];
+            let whole = n / 16 * 16;
+            for (i, &v) in x[..whole].iter().enumerate() {
+                lanes[i % 16] += v * v;
+            }
+            let mut want = 0f32;
+            for l in lanes {
+                want += l;
+            }
+            for &v in &x[whole..] {
+                want += v * v;
+            }
+            let got = sum_squares(&x);
+            assert_eq!(got.to_bits(), want.to_bits(), "n = {n}");
+            let exact: f64 = x.iter().map(|&v| v as f64 * v as f64).sum();
+            assert!(
+                (got as f64 - exact).abs() <= 1e-5 * exact.max(1e-30),
+                "n = {n}: {got} against {exact}"
+            );
+        }
+    }
 
     /// The SME GEMM gives the NEON f32 GEMM's bits on whole 8-row groups (each output is the
     /// same fused-multiply-add chain over the inputs in order).
