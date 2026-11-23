@@ -2023,6 +2023,12 @@ pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &
     #[cfg(not(target_arch = "x86_64"))]
     let i8_job: Option<(usize, usize, usize, usize)> = None;
     let rows_per_block = i8_job.map_or(rows_per_block, |(rows, ..)| rows);
+    // The int8 GEMM of aarch64 Linux: jobs of its own size (see `i8gemm::job_rows`).
+    #[cfg(target_arch = "aarch64")]
+    let rows_per_block = match i8gemm::job_rows() {
+        Some(rows) if gemm && i8_planes().is_some() && refs.iter().any(|j| j.m.i8_layout().is_some()) => rows,
+        _ => rows_per_block,
+    };
     let mut blocks: Vec<(u32, u32, u32)> = Vec::new();
     for (j, job) in refs.iter().enumerate() {
         let mut r = 0;
