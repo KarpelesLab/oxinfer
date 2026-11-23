@@ -665,6 +665,141 @@ Where oxinfer is still behind:
   Qwen3-8B (Q8_0, Q4_K_M), Gemma 4 12B, 26B-A4B, Orpheus and Llama 1B Q4_K_M decode level with
   or ahead of llama.cpp's best thread count.
 
+#### M3 Ultra (November 2026)
+
+A Mac Studio with an M3 Ultra (24 performance and 8 efficiency cores, an 80-core GPU, 96 GB,
+macOS 15, Darwin 24.6), shared with about ten long-running CPU jobs at nice 5 (load averages 12-25 from them
+and from the builds of this round, more in the CPU runs noted below). Unlike the M5 Max of the
+sections above it has neither GPU matrix units (Apple9 family: no Metal 4 `matmul2d`) nor SME,
+so before this round every prompt on Metal took the op-by-op path (matmuls on the f32
+SIMD-group GEMM, attention and norms on the CPU, a host round trip per layer): the prefill plans
+need the half-row GEMMs, which existed only for the matrix units.
+
+Methodology. llama.cpp is the Homebrew build 5780 (`caf5681f`, July 2025), which loads neither
+Qwen3.5 (`qwen35`) nor Gemma 4 GGUFs, so those rows have no llama.cpp column; oxinfer does not
+load `qwen3moe` GGUFs (Qwen3-30B-A3B), so there is no MoE row with both. `llama-bench -p 512,2048
+-n 128 -r 3` and `parity_bench` (`draft=none lookup=0 mtp=0`, best of 3 after a warm-up pass of
+each size) on the same files, the engines alternated run by run, both under `nice -n 19` and
+**both under `caffeinate -d -i -u`**: with the display asleep (this machine runs headless) macOS
+holds the GPU at its lowest clock (338 MHz, `powermetrics --samplers gpu_power`) after a second
+or two of work, whatever the process's priority (`taskpolicy -t 0 -l 0` changed nothing), and
+both engines then ran 2-5x slower and drifted within a run (llama.cpp Llama 1B pp512 7339 then
+pp2048 1493, `± 430`); keeping the display awake lets the GPU clock up (pp512 ~8000 steady, both
+engines). CPU rows: `llama-bench -ngl 0 -nopo 1 -t 8 / 16` (the CPU backend; `-nopo 1` keeps its
+large matmuls off Metal), oxinfer `device=cpu threads=16 / 24`, the best of each.
+
+tok/s, llama.cpp / oxinfer before this round (master `422ea32`) / after (master with `8ca1574`
+and `c828f9a`, which also has the other sessions' work since `422ea32`, Metal
+prefill round 6 among it: the per-change figures below are the alternated ones); Metal pp512 /
+pp2048 / tg128:
+
+| model (Metal) | llama.cpp | before | after |
+|---|---|---|---|
+| Llama-3.2-1B Q4_K_M (bartowski) | 8402-8419 / 7778-7781 / 288 | 1543 / 1858 / 359 | 8524 / 9769 / 359 |
+| Llama-3.2-1B Q8_0 | 8833-8844 / 8141-8151 / 239-242 | 1560 / 1857 / 301 | 8749 / 9973 / 301 |
+| Qwen3-8B Q4_K_M (Qwen) | 1354-1360 / 1291-1296 / 81-82 | 327 / 385 / 94 | 1381 / 1440 / 94 |
+| Qwen3.5-9B Q4_K_M (unsloth) | (not loaded) | 490 / 619 / 92 | 1342 / 1436 / 93 |
+| Gemma 4 26B-A4B Q4_0 (ggml-org) | (not loaded) | 229 / 274 / 113 | 2425 / 2695 / 113 |
+
+CPU (oxinfer master `422ea32`: this round changed no CPU code), pp512 / tg64, load averages
+14-23:
+
+| model (CPU) | llama.cpp 8 threads | 16 threads | oxinfer 16 threads | 24 threads |
+|---|---|---|---|---|
+| Llama-3.2-1B Q4_K_M | 746-756 / 125-144 | 565-577 / 119-131 | 924 / 197 | 945 / 199 |
+| Llama-3.2-1B Q8_0 | 789-817 / 113 | 582-595 / 81 | 943 / 132 | 1011 / 135 |
+| Qwen3-8B Q4_K_M | 141-142 / 30 | 129 / 22 | 155 / 37 | 108 / 17 |
+
+(An earlier pass at load averages 20-45, during builds: Llama 1B Q4_K_M llama.cpp 301 / 54 on 8
+threads, oxinfer 420 / 127 on 24, and Qwen3-8B Q4_K_M oxinfer 80 at pp512; every figure here
+moves with the other jobs.)
+
+What changed:
+
+- **The half-row GEMMs on SIMD-group matrices** (`8ca1574`). `MMA_SHADER_SRC` compiles with
+  `MMA_UNITS 0` on GPUs without matrix units: every `mma_*` / `mmag_*` kernel keeps its name,
+  buffers, tiles and rounding (half input rows with a power-of-two scale, weights dequantized to
+  half per 64-wide K step, f32 sums), with the products on `simdgroup_half8x8` operands and
+  `simdgroup_float8x8` accumulators, so the prefill plans, the grouped expert GEMMs and the
+  op-by-op half-row GEMMs all run there (the matrix-unit attention, diffusion sessions and
+  Inkling-2's engine stay M5 / A19 only; attention takes the f32 SIMD-group `pff_*`). A
+  threadgroup's 4 SIMD-groups take 64 outputs: 2 x 2 of 32 x 32 for 64-token tiles, 128-token
+  tiles as two of 64 (32 accumulators a SIMD-group spill: the first build ran gate / up at 0.4
+  TFLOP/s), and the plans pick 64-token tiles where the matrix units take 128 (Llama 1B pp2048
+  9196 -> 9666). The token rows come straight from device memory (transposed 8x8 loads), the
+  weights through threadgroup memory. Against the f32 GEMMs (`OXINFER_METAL_MMA=0`, the op-by-op
+  path): the first step's top-20 log-probabilities within 3e-3 (Llama 1B, Qwen3-8B) to 1e-2
+  (Qwen3.5-9B) and the same 64 greedy tokens at 512 and 1500 corpus tokens (Qwen3-8B and
+  Qwen3.5-9B at 1500); Gemma 4 26B-A4B
+  within KL 4.5e-3 of them, as the CPU is (3.2e-3; the raw corpus's near-uniform continuations
+  part after a few tokens in every pair).
+- **SIMD-group layout for 32- and 16-token tiles** (`c828f9a`). `mma_gemm_bench` (isolated kernels, Q4_0 /
+  Q4_K / Q6_K, TFLOP/s) showed the 32-token tiles (short prompts, narrow outputs, the remainder
+  of a chunk and the routed experts' 32-row tiles) bound by the weight operands' loads from
+  threadgroup memory: 2 x 2 SIMD-groups load 4 weight and 2 token fragments for 8 products, 4
+  SIMD-groups along the outputs (16 outputs x 32 tokens each) 2 and 4:
+
+  | layout (outputs x tokens per SIMD-group) | 1408x2816 Q4_0 | 2816x704 Q4_0 | 8192x2048 Q4_K | 2048x2048 Q6_K |
+  |---|---|---|---|---|
+  | 64-token tile, 32 x 32 (kept) | 14.0 | 16.9 | 20.9 / 22.3 (t=2048) | 14.7 / 20.1 |
+  | 64-token tile, 16 x 64 | 12.9 | | 18.6 / 19.6 | 13.4 / 18.1 |
+  | 32-token tile, 32 x 16 (before) | 11.6 | 11.3 | 14.0 / 15.1 | 11.3 / 13.0 |
+  | 32-token tile, 16 x 32 (now) | 14.9 | 16.2 | 17.8 / 18.6 | 13.9 / 16.4 |
+  | 16-token tile, 16 x 16 (now) | 13.8 | | 15.8 / 16.4 | 12.5 / 13.4 |
+
+  Each lane now also scales the two elements of a result it holds by their tokens' inverse
+  scales (the lane layout of `metal_pfflash.metal`) instead of a product with a diagonal matrix
+  of them. The same products in the same order: the first-step log-probabilities and 32 greedy
+  tokens are bit for bit the previous build's on Llama 1B Q4_K_M and Qwen3-8B Q4_K_M at 64 and
+  1500 tokens; Gemma 4 26B-A4B within KL 4.5e-6. Alternated with the previous build twice (tok/s,
+  pp64 / pp512 / pp2048): Llama 1B Q4_K_M 2905-2915 / 8476-8505 / 9742-9779 -> 4017-4048 /
+  8505-8524 / 9741-9769, Qwen3-8B Q4_K_M 670-671 / 1364 / 1441 -> 851 / 1378-1381 / 1439-1440,
+  Gemma 4 26B-A4B 1016-1018 / 2306 / 2620-2628 -> 1077-1087 / 2421-2425 / 2692-2695, Llama 1B
+  Q8_0 8652 / 9911 -> 8749 / 9973, Qwen3.5-9B 1337 / 1438 -> 1342 / 1436.
+
+Measured and dropped (`mma_gemm_bench` with the kernels in `OXINFER_MMA_EXTRA`, which the
+SIMD-group library now takes too, unless noted):
+
+- the token rows staged in threadgroup memory beside the weights (as llama.cpp's `mul_mm`):
+  0.2-1.5 TFLOP/s slower at 64-token tiles, 0.3-0.5 faster at 32 (before the layout above);
+- 8 SIMD-groups (256 threads) on 64 x 128 tiles, half of them dequantizing: 19.6 / 22.3 against
+  21.0 / 22.3 at 512 / 2048 tokens; 128-token tiles in 4 SIMD-groups along the tokens: same;
+- the next K step's weights loaded into registers before this step's products, double-buffered
+  weight tiles, and threadgroup row strides of 64 / 68 / 80 halves instead of 72: all within
+  0.3 TFLOP/s;
+- 128 outputs x 32 tokens per threadgroup (4 SIMD-groups of 32 x 32): 13.1 / 15.5, below the
+  16 x 32 layout's 14.9 / 16.2;
+- decode matvecs with 2 or 4 rows per SIMD-group and 1 / 2 / 4 SIMD-groups per row for Q4_K
+  (Qwen3-8B Q4_K_M tg64 93.7 -> 90.4-94.4), and timing probes without the K-quant activation
+  sums or without the nibble conversions (wrong results; tg unchanged at 95.5-95.9): the Q4_K
+  matvec (390-590 GB/s in `decode_mv_bench`, against 700-760 for bf16) is not bound by its ALU
+  work. Gemma 4 26B-A4B's 8.4 ms decode step, timed by kind with `OXINFER_DEC_ONLY`: dense
+  matvecs and the head 3.7 ms, the routed experts 2.5, attention 1.1, norms / GLUs / RoPE 1.6,
+  barriers alone ~0.7: the small ops cost more here than on the M5 Max;
+- **CPU prefill through Accelerate** (`cblas_sgemm` opened with dlsym, which runs on the AMX
+  units): 2.4-3.2 TFLOP/s in f32 alone (512-2048 x 4096 x 4096-12288), but the weights must be
+  dequantized to f32 first, and a GEMM of dequantized blocks (8 MB at a time, dequantized on
+  the pool, with or without the next block's dequantization overlapping the multiply) reached
+  1.0-1.24 TOP/s on 4096 x 4096 Q4_K at 512 tokens against the int8 GEMM's 0.97-1.62 (8-24
+  threads, loaded machine), and 44.5 against 79.6 tok/s on Qwen3-8B Q4_K_M pp512.
+
+Where oxinfer is still behind on this machine:
+
+- **Prefill at 512 tokens** is level with llama.cpp b5780 (1.01-1.02x on Llama 1B Q4_K_M and
+  Qwen3-8B, 0.99x on Llama 1B Q8_0), ahead at 2048 (1.11-1.26x); the
+  SIMD-group GEMMs run at 19-22 TFLOP/s, about 75% of the GPU's f32 rate, and llama.cpp's
+  `mul_mm` is no faster. A newer llama.cpp (its own non-tensor kernels, flash attention on by
+  default) was not available on the machine.
+- **Decoding small and MoE models**: ahead of llama.cpp b5780 (Llama 1B 1.25x, Qwen3-8B 1.15x),
+  but a decode step pays ~3-5 µs per dispatch and barrier, which is most of a small model's
+  token (Llama 1B: 2.8 ms for 0.8 GB of weights) and of Gemma 4 26B-A4B's (113 tok/s, ~280 GB/s
+  of weights); the Q4_K matvec reads 390-590 GB/s where bf16 reads 700-760.
+- **CPU**: ahead of llama.cpp b5780's CPU backend at its best thread count here (prefill
+  1.1-1.25x, decoding 1.2-1.4x), at about the int8 SDOT rate per core in both. With ~10 cores
+  held by other jobs, more threads than free cores lose (Qwen3-8B pp512 108 on 24 threads
+  against 155 on 16, tg64 17 against 37; the default is 32, a thread per core, efficiency cores
+  included); no fixed count suits every load, so the default was left alone.
+
 #### CPU prefill GEMMs (November 2026)
 
 CPU prefill matmuls (more than `decode_max_tokens` tokens; decoding is unchanged) pick their
