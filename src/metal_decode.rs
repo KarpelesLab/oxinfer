@@ -266,6 +266,7 @@ pub(crate) fn shader_src() -> String {
                             .flat_map(|n_in| [mvk_variant(f, MVK_FEW_ROWS, n_in, ks, tt), mvk_variant(f, few, n_in, ks, tt)])
                             .collect()
                     };
+                    vs.sort_by_key(|&(nr, kind)| (nr, kind as u8));
                     vs.dedup();
                     for (nr, kind) in vs {
                         let _ = writeln!(s, "{}", f.instantiate_k(nr, ks, tt, kind));
