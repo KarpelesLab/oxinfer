@@ -104,6 +104,10 @@ f32, see [Metal prefill round 5](performance.md#metal-prefill-round-5-november-2
 8x8 SIMD-group matrices (`metal_pfflash.metal`: 32 queries per threadgroup sharing the key reads;
 heads of 256 and 512 split their dimensions over SIMD-groups; `OXINFER_PF_MMA_ATTN=0`). RMSNorms,
 Gemma's add-norms and the SwiGLU / GeGLU before a GEMM write its half input rows themselves.
+The compiled ops run in stages by dependence rather than in graph order (`pf_schedule`, see
+[Metal prefill round 6](performance.md#metal-prefill-round-6-november-2026)): a MoE layer's dense
+feed-forward runs beside its routed experts' GEMMs, and Gemma 4's MoE layer tail (the experts'
+combine, the post norms and the residual step) is one kernel.
 Token tiles are 128 rows, 64 for narrow outputs (fewer than 160 threadgroups of 128 rows: e.g.
 Llama-3.2-1B's 2048-wide projections at 512 tokens), 32 below that, and a last partial tile of
 up to 64 rows runs as 32-row tiles rather than one padded tile (513 tokens: 544 rows instead of
