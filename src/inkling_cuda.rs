@@ -305,8 +305,8 @@ struct HostW<'m> {
 }
 
 /// Kernel kinds: the GGUF ids, plus oxinfer's Q8 (200), Q4 (201) and FP8 E4M3 (202).
-const KINDS: [u32; 27] = [
-    0, 1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 30, 39, 40, 200, 201, 202,
+const KINDS: [u32; 28] = [
+    0, 1, 2, 3, 6, 7, 8, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29, 30, 39, 40, 42, 200, 201, 202,
 ];
 const K_OQ8: u32 = 200;
 const K_OQ4: u32 = 201;
@@ -1116,7 +1116,7 @@ impl Engine {
         {
             bail!("experts of different kinds or shapes");
         }
-        if !n_in.is_multiple_of(32) || (k0 == 40 && !n_in.is_multiple_of(64)) {
+        if !n_in.is_multiple_of(32) || ((k0 == 40 || k0 == 42) && !n_in.is_multiple_of(64)) {
             bail!("rows of {n_in} values");
         }
         let es = (rb * n_out).next_multiple_of(256);

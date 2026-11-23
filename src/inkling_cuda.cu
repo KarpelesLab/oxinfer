@@ -3,8 +3,8 @@
 // weight kind the model uses (`HAS_<id>`), so only those kinds' kernels are built.
 //
 // Weights are read as stored: every GGUF block format with a CPU dequantizer (except the ternary
-// and 1-bit ones), NVFP4 in ggml's layout, FP8 E4M3 with block scales (the release's MXFP8
-// experts), oxinfer's own Q8 / Q4, bf16, f16 and f32. `dq<K>(row, b, j)` gives elements
+// and 1-bit ones; the 2-bit Q2_0 is read), NVFP4 in ggml's layout, FP8 E4M3 with block scales
+// (the release's MXFP8 experts), oxinfer's own Q8 / Q4, bf16, f16 and f32. `dq<K>(row, b, j)` gives elements
 // `32 b + 4 j .. + 3` of a row (block `b`, part `j` of 8), unscaled by the matrix's block scales.
 // Activations are f32 everywhere except in the GEMMs (f16 operands, f32 accumulation).
 
@@ -54,6 +54,7 @@ struct W {
 #define K_BF16 30
 #define K_MXFP4 39
 #define K_NVFP4 40
+#define K_Q2_0 42
 #define K_OQ8 200
 #define K_OQ4 201
 #define K_F8 202
@@ -164,6 +165,13 @@ __device__ __forceinline__ float4 dq(const u8* row, u32 b, u32 j) {
         u32 u = rd32(B + 4 + 8 * s + (w & 7)) >> (w >= 8 ? 4 : 0);
         o = make_float4(kvalues_mxfp4[u & 15] * d, kvalues_mxfp4[(u >> 8) & 15] * d, kvalues_mxfp4[(u >> 16) & 15] * d,
                         kvalues_mxfp4[(u >> 24) & 15] * d);
+    } else if constexpr (K == K_Q2_0) {
+        // Blocks of 64: an f16 scale, then 16 bytes of 2-bit codes `c - 1` (four values a byte).
+        const u8* B = row + 18 * (b >> 1);
+        float d = h2f(rd16(B));
+        u32 u = B[2 + 8 * (b & 1) + j];
+        o = make_float4(((float)(u & 3) - 1.f) * d, ((float)((u >> 2) & 3) - 1.f) * d, ((float)((u >> 4) & 3) - 1.f) * d,
+                        ((float)((u >> 6) & 3) - 1.f) * d);
     } else if constexpr (K == K_Q4_K || K == K_Q5_K) {
         const u8* B = row + (K == K_Q4_K ? 144 : 176) * (b >> 3);
         u32 sub = b & 7;
@@ -1023,6 +1031,9 @@ __device__ __forceinline__ float4 dqi(const u8* row, u32 b, u32 j) {
         u32 e0 = 32 * (b & 1) + 4 * j, sb = e0 >> 4, w = e0 & 15;
         u32 u = rd32(B + 4 + 8 * sb + (w & 7)) >> (w >= 8 ? 4 : 0);
         o = make_float4(kvalues_mxfp4[u & 15], kvalues_mxfp4[(u >> 8) & 15], kvalues_mxfp4[(u >> 16) & 15], kvalues_mxfp4[(u >> 24) & 15]);
+    } else if constexpr (K == K_Q2_0) {
+        u32 u = row[18 * (b >> 1) + 2 + 8 * (b & 1) + j];
+        o = make_float4((float)(u & 3) - 1.f, (float)((u >> 2) & 3) - 1.f, (float)((u >> 4) & 3) - 1.f, (float)((u >> 6) & 3) - 1.f);
     } else if constexpr (K == K_Q4_K || K == K_Q5_K) {
         const u8* B = row + (K == K_Q4_K ? 144 : 176) * (b >> 3);
         u32 sub = b & 7;
@@ -1131,6 +1142,7 @@ __device__ __forceinline__ float2 dqs(const u8* row, u32 b, u32 half) {
     else if constexpr (K == K_Q5_1) return make_float2(h2f(rd16(row + 24 * b)), h2f(rd16(row + 24 * b + 2)));
     else if constexpr (K == K_MXFP4) return make_float2(e8m0_half(row[17 * b]), 0.f);
     else if constexpr (K == K_NVFP4) return make_float2(ue4m3_half(row[36 * (b >> 1) + 2 * (b & 1) + half]), 0.f);
+    else if constexpr (K == K_Q2_0) return make_float2(h2f(rd16(row + 18 * (b >> 1))), 0.f);
     else if constexpr (K == K_Q4_K || K == K_Q5_K) {
         const u8* B = row + (K == K_Q4_K ? 144 : 176) * (b >> 3);
         float sc, mn;
@@ -1513,6 +1525,9 @@ KERNELS(39)
 #endif
 #ifdef HAS_40
 KERNELS(40)
+#endif
+#ifdef HAS_42
+KERNELS(42)
 #endif
 #ifdef HAS_200
 KERNELS(200)
