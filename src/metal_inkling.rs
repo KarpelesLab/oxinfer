@@ -645,8 +645,10 @@ struct ExpDev {
     /// The same over the pass's experts grouped by expert (passes of up to MAX_T tokens).
     gpair: Id,
     gsum: Id,
-    /// Passes of one token: the down rows and the convolution after them (`_dconv`).
+    /// Passes of one token: the down rows and the convolution after them (`_dconv`), the routing
+    /// and the gate / up rows (`_rpair`).
     dconv: Id,
+    rpair: Id,
     tab_gu: Id,
     tab_d: Id,
     il: u32,
@@ -1681,6 +1683,7 @@ impl InkMetal {
                 gpair: pipe(&format!("ink_x_{gu_fmt}_gpair"))?,
                 gsum: pipe(&format!("ink_x_{d_fmt}_gsum"))?,
                 dconv: pipe(&format!("ink_x_{d_fmt}_dconv"))?,
+                rpair: pipe(&format!("ink_x_{gu_fmt}_rpair"))?,
                 tab_gu: mk_tab(&tab_gu, &mut owned)?,
                 tab_d: mk_tab(&tab_d, &mut owned)?,
                 il: if ex.interleaved { 2 } else { 1 },
@@ -3200,12 +3203,30 @@ impl InkMetal {
             }
         }
         e.barrier();
+        if self.route_in_pair(ld, t) {
+            return;
+        }
         self.std(e, c, self.p.route);
         e.bytes(&self.route_params(c, ld, t), 2);
         if !self.skip(SK_RT) {
             e.dispatch((t, 1), self.ne.next_multiple_of(32));
         }
         e.barrier();
+    }
+
+    /// Whether a pass of `t` tokens routes in the experts' gate / up kernel (`_rpair`, which then
+    /// leads to `_dconv`): one token, at most 128 experts, no LoRA updates of the experts.
+    fn dconv(&self, ld: &LayerDev, t: usize) -> bool {
+        t == 1 && ld.exp.xlora.is_none() && self.topk <= 16 && !self.skip(SK_EXP | SK_CONV) && dconv_on()
+    }
+    /// (`OXINFER_INKLING_RPAIR=0`: the routing in its own kernel.)
+    fn route_in_pair(&self, ld: &LayerDev, t: usize) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        self.dconv(ld, t)
+            && self.ne <= 128
+            && ld.exp.xlora_gu.is_none()
+            && !self.skip(SK_ROUTE | SK_RT)
+            && *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_RPAIR").is_ok_and(|v| v == "0"))
     }
 
     fn route_params(&self, c: &Cx, ld: &LayerDev, t: usize) -> RouteP {
@@ -3277,7 +3298,12 @@ impl InkMetal {
             };
             let gq = [b.grp as u32, b.asg as u32, ld.exp.lpr.0, ld.exp.lpr.1];
             let lq = self.gu_lora(e, c, ld, t);
-            e.pipe(ld.exp.gpair);
+            let rp = self.route_in_pair(ld, t);
+            e.pipe(if rp { ld.exp.rpair } else { ld.exp.gpair });
+            if rp {
+                e.buf(self.consts, 0, 6);
+                e.bytes(&self.route_params(c, ld, t), 7);
+            }
             e.buf(c.a, 0, 0);
             e.buf(ld.exp.tab_gu, 0, 1);
             e.bytes(&xp, 2);
@@ -3288,7 +3314,7 @@ impl InkMetal {
                 e.dispatch((self.inter.div_ceil(4 * 16 / ld.exp.lpr.0 as usize), n), 128);
             }
             e.barrier();
-            if t == 1 && ld.exp.xlora.is_none() && self.topk <= 16 && !self.skip(SK_EXP | SK_CONV) && dconv_on() {
+            if self.dconv(ld, t) {
                 // The down rows and the convolution after them in one kernel.
                 let cp = self.conv_p(b.o, b.x, ld.mlp_conv, pos, true, t, Some(b.od));
                 e.pipe(ld.exp.dconv);

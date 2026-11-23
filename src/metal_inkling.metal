@@ -935,6 +935,35 @@ kernel void ink_mvf(device float* a [[buffer(0)]], device const float* c [[buffe
 // largest `sigmoid(logit) + bias` (ties to the lower index), weighted by their sigmoid scores
 // renormalized over the k, times `scale`: ids (uint bits) then weights into `sel` (2 k per token).
 struct IRouteP { uint n; uint k; uint logits; uint sel; uint bias; float scale; uint single; uint grp; uint asg; uint _p0; uint _p1; uint _p2; };
+// The routing of token ti in one SIMD-group (n <= 128, k <= 32; 4 experts a lane, expert u * 32 +
+// lane in slot u, no threadgroup barriers): lane j < k gets the j-th pick and its sigmoid score; all
+// lanes the sum of the k scores.
+inline void ink_route_sg(device const float* a, device const float* c, constant IRouteP& p, uint ti, uint lane, thread uint& myid,
+                         thread float& mych, thread float& sum) {
+    uint n = p.n, k = p.k;
+    float scv[4], v[4];
+    for (uint u = 0; u < 4; u++) {
+        uint e = u * 32 + lane;
+        float lg = e < n ? a[p.logits + (ulong)ti * n + e] : 0.f;
+        float bs = e < n ? c[p.bias + e] : 0.f;
+        scv[u] = e < n ? 1.f / (1.f + exp(-lg)) : 0.f;
+        v[u] = e < n ? scv[u] + bs : -INFINITY;
+    }
+    myid = 0;
+    mych = 0.f;
+    sum = 0.f;
+    for (uint j = 0; j < k; j++) {
+        float bm = v[0], bsc = scv[0];
+        uint bu = 0;
+        for (uint u = 1; u < 4; u++) if (v[u] > bm) { bm = v[u]; bu = u; bsc = scv[u]; }
+        float m = simd_max(bm);
+        uint idx = simd_min(bm == m ? bu * 32 + lane : 0xffffffffu);
+        float cs = simd_shuffle(bsc, idx % 32);
+        if (lane == idx % 32) for (uint u = 0; u < 4; u++) if (u == idx / 32) v[u] = -INFINITY;
+        if (lane == j) { myid = idx; mych = cs; }
+        sum += cs;
+    }
+}
 kernel void ink_route(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IRouteP& p [[buffer(2)]],
                       uint ti [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                       uint nt [[threads_per_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
@@ -948,27 +977,9 @@ kernel void ink_route(device float* a [[buffer(0)]], device const float* c [[buf
         // (One SIMD-group, 4 experts a lane, expert u * 32 + lane in slot u: no threadgroup
         // barriers. Lane j keeps the j-th pick.)
         if (sg != 0) return;
-        float scv[4], v[4];
-        for (uint u = 0; u < 4; u++) {
-            uint e = u * 32 + lane;
-            float lg = e < n ? a[p.logits + (ulong)ti * n + e] : 0.f;
-            float bs = e < n ? c[p.bias + e] : 0.f;
-            scv[u] = e < n ? 1.f / (1.f + exp(-lg)) : 0.f;
-            v[u] = e < n ? scv[u] + bs : -INFINITY;
-        }
-        uint myid = 0;
-        float mych = 0.f, sum = 0.f;
-        for (uint j = 0; j < k; j++) {
-            float bm = v[0], bsc = scv[0];
-            uint bu = 0;
-            for (uint u = 1; u < 4; u++) if (v[u] > bm) { bm = v[u]; bu = u; bsc = scv[u]; }
-            float m = simd_max(bm);
-            uint idx = simd_min(bm == m ? bu * 32 + lane : 0xffffffffu);
-            float cs = simd_shuffle(bsc, idx % 32);
-            if (lane == idx % 32) for (uint u = 0; u < 4; u++) if (u == idx / 32) v[u] = -INFINITY;
-            if (lane == j) { myid = idx; mych = cs; }
-            sum += cs;
-        }
+        uint myid;
+        float mych, sum;
+        ink_route_sg(a, c, p, ti, lane, myid, mych, sum);
         if (lane < k) {
             sel[lane] = as_type<float>(myid);
             sel[k + lane] = mych / sum * p.scale;
@@ -1414,6 +1425,8 @@ kernel void ink_xcombine(device float* a [[buffer(0)]], constant IXcP& p [[buffe
     device float* y = a + p.y + (ulong)ti * p.h + r;
     if (p.add != 0) *y += v; else *y = v;
 }
+// `_rpair` (passes of one token): `_gpair` with the routing (`ink_route`'s) in every SIMD-group first,
+// group y being the y-th pick; one threadgroup writes the picks and their weights to `sel`.
 // `_dconv` (passes of one token; grid: blocks of 32 / lpr rows, k SIMD-groups): SIMD-group s computes
 // slot s's down rows as `_gsum` does, then the convolution after the experts takes their sum in
 // slot order (`ink_conv`'s input) and writes the stream and the ring: no stage between them.
@@ -1486,6 +1499,30 @@ kernel void NAME##_gpair(device float* a [[buffer(0)]], device const IXT* tab [[
             float cu = p.cap_u > 0.f ? p.cap_u * precise::tanh(uu / p.cap_u) : uu; \
             a[p.act + (ulong)asn * p.inter + j] = p.cap_g * precise::tanh(gg / p.cap_g) / (1.f + exp(-gg)) * cu; \
         } \
+    } } \
+kernel void NAME##_rpair(device float* a [[buffer(0)]], device const IXT* tab [[buffer(1)]], constant IXP& p [[buffer(2)]], \
+                         constant uint4& gq [[buffer(3)]], device const float* c [[buffer(6)]], constant IRouteP& rp [[buffer(7)]], \
+                         uint2 tg [[threadgroup_position_in_grid]], \
+                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
+    uint myid; float mych, sum; \
+    ink_route_sg(a, c, rp, 0, lane, myid, mych, sum); \
+    if (tg.x == 0 && tg.y == 0 && sg == 0 && lane < p.k) { \
+        a[p.sel + lane] = as_type<float>(myid); \
+        a[p.sel + p.k + lane] = mych / sum * rp.scale; \
+    } \
+    uint lpr = gq.z, rg = lane / lpr, jj = lane % lpr; \
+    uint j = (tg.x * 4 + sg) * (16 / lpr) + rg / 2, up = rg % 2; \
+    uint ge = simd_shuffle(myid, tg.y); \
+    IXT e = tab[ge]; \
+    T f = MAKE(e, p.h); \
+    uint jc = min(j, p.inter - 1); \
+    uint row = p.il == 2 ? 2 * jc + up : jc + up * p.off; \
+    float v = ink_lsum(ink_row_acc<T, X, CH>(f, row, a + p.x, p.h / CH, jj, lpr), lpr); \
+    float uv = simd_shuffle_down(v, lpr); \
+    if (jj == 0 && up == 0 && j < p.inter) { \
+        float gg = v * e.factor, uu = uv * e.factor; \
+        float cu = p.cap_u > 0.f ? p.cap_u * precise::tanh(uu / p.cap_u) : uu; \
+        a[p.act + (ulong)tg.y * p.inter + j] = p.cap_g * precise::tanh(gg / p.cap_g) / (1.f + exp(-gg)) * cu; \
     } } \
 kernel void NAME##_gsum(device float* a [[buffer(0)]], device const IXT* tab [[buffer(1)]], constant IXP& p [[buffer(2)]], \
                         constant uint4& gq [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]], \
