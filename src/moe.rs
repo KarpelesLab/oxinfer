@@ -544,39 +544,68 @@ impl<'a> Experts<'a> {
         for ((&e, tk), o) in used.iter().zip(&toks).zip(gu.iter_mut()) {
             self.gate_up[e].apply_lora(x, h, tk, t, o);
         }
-        // Activations of all experts, one after another ([sum n, mi]).
+        // Activations of all experts, one after another ([sum n, mi]), and the shared expert's,
+        // in one parallel region (a task per expert, each the elementwise steps of `Act::apply`).
         let total: usize = toks.iter().map(|tk| tk.len()).sum();
         let mut a = vec![0f32; total * mi];
-        let mut row = 0;
-        for ((&e, tk), gu) in used.iter().zip(&toks).zip(gu.iter_mut()) {
-            let n = tk.len();
-            let ae = &mut a[row * mi..(row + n) * mi];
-            match &self.gate_up[e] {
-                GateUp::Fused(_) => {
-                    for (ar, r) in ae.chunks_mut(mi).zip(gu.chunks_mut(2 * mi)) {
-                        self.gate_then_up(r);
-                        let (g, u) = r.split_at_mut(mi);
-                        self.act.apply(g, u);
-                        ar.copy_from_slice(g);
+        let offs: Vec<usize> = toks
+            .iter()
+            .scan(0, |r, tk| {
+                let o = *r;
+                *r += tk.len();
+                Some(o)
+            })
+            .collect();
+        {
+            /// Disjoint rows of the buffers below, one task each.
+            #[derive(Clone, Copy)]
+            struct Rows(*mut f32);
+            unsafe impl Send for Rows {}
+            unsafe impl Sync for Rows {}
+            let ap = Rows(a.as_mut_ptr());
+            let gp: Vec<Rows> = gu.iter_mut().map(|v| Rows(v.as_mut_ptr())).collect();
+            let sp = Rows(sgu.as_mut_ptr());
+            let ne = used.len();
+            crate::pool::run(ne + usize::from(shared.is_some()), &|j| {
+                // SAFETY: task `j` alone touches expert `j`'s rows of `gu` and `a` (or the shared
+                // expert's of `sgu`), which outlive the region.
+                let rows = |p: Rows, off: usize, len: usize| unsafe { std::slice::from_raw_parts_mut(p.0.add(off), len) };
+                if j == ne {
+                    let s = shared.expect("shared expert task");
+                    let n = t * s.inter;
+                    let (g, u) = rows(sp, 0, 2 * n).split_at_mut(n);
+                    s.act.apply_serial(g, u);
+                    return;
+                }
+                let n = toks[j].len();
+                let ae = rows(ap, offs[j] * mi, n * mi);
+                let gu = rows(gp[j], 0, n * 2 * mi);
+                match &self.gate_up[used[j]] {
+                    GateUp::Fused(_) => {
+                        for (ar, r) in ae.chunks_mut(mi).zip(gu.chunks_mut(2 * mi)) {
+                            self.gate_then_up(r);
+                            let (g, u) = r.split_at_mut(mi);
+                            self.act.apply_serial(g, u);
+                            ar.copy_from_slice(g);
+                        }
+                    }
+                    GateUp::Split(..) => {
+                        let (g, u) = gu.split_at_mut(n * mi);
+                        self.act.apply_serial(g, u);
+                        ae.copy_from_slice(g);
                     }
                 }
-                GateUp::Split(..) => {
-                    let (g, u) = gu.split_at_mut(n * mi);
-                    self.act.apply(g, u);
-                    ae.copy_from_slice(g);
-                }
+            });
+        }
+        if let Some(k) = hook {
+            for ((&e, tk), &o) in used.iter().zip(&toks).zip(&offs) {
+                k.apply_rows(Target::Expert(e), &mut a[o * mi..(o + tk.len()) * mi], mi, tk);
             }
-            if let Some(k) = hook {
-                k.apply_rows(Target::Expert(e), ae, mi, tk);
-            }
-            row += n;
         }
         drop(gu);
         if let Some(s) = shared {
-            let (g, u) = sgu.split_at_mut(t * s.inter);
-            s.act.apply(g, u);
             if let Some(k) = s.hook {
-                k.apply(Target::Shared, g, s.inter);
+                k.apply(Target::Shared, &mut sgu[..t * s.inter], s.inter);
             }
             sgu.truncate(t * s.inter);
         }
