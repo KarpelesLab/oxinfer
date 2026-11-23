@@ -192,6 +192,13 @@ C API key `stream_gpu`, `gpu::set_stream_decode`):
 - On the CPU: the MTP drafts (the MTP layer is resident), the embedding lookup, sampling; reading
   is the reader thread's.
 
+DeepSeek V4.1 goes further: a whole token is one stream of command buffers with no routing read
+back. Every expert the part cache holds stays wrapped, its GPU addresses in per-layer tables the
+expert kernels index with the GPU router's choice; the wrapped (wired) memory is the part cache,
+90 GB on the 128 GB Mac. A chosen expert the cache does not hold is a miss, read after the pass,
+and the token runs again from the first layer that missed (see
+[DeepSeek V4.1 decode on the GPU](deepseek-v4.md#decode-on-the-gpu-a-whole-token-per-command-stream)).
+
 Darwin / Metal facts this rests on (M5 Max, measured with small Swift programs): creating a no-copy
 buffer touches nothing; the first command buffer that uses it wires the whole buffer (about 20 ms
 per GB when the pages are cached; uncached pages are read in at 4-6 GB/s on the way), so units are

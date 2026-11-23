@@ -544,7 +544,8 @@ addresses are written to a per-layer table of 384 + 1 entries that the expert ke
 the router's choice. The streamer logs what enters and leaves the part cache
 (`StreamHook::track_parts` / `part_changes`), and the wraps follow before each step (~75 us an
 expert, in parallel; a first fill of 8k experts takes ~0.6 s, done on a thread of its own while
-the prompt is prefilled). The least-recently-used bookkeeping of a step's experts runs while the
+the prompt is prefilled). The memory so wired is the part cache's (90 GB here, beside 5.4 GB of
+wrapped dense weights). The least-recently-used bookkeeping of a step's experts runs while the
 next step is on the GPU.
 
 Routing without a round trip, and misses: the router kernel checks the chosen experts' table
