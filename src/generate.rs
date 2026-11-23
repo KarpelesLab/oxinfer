@@ -279,6 +279,8 @@ pub fn decode<M: TextLm + ?Sized>(
             unfed = Some(id);
             break;
         }
+        // A one-token step: on fewer threads where that leaves cores to the rest of the system.
+        let _decode = crate::pool::decode_scope();
         logits = model.forward(sess, &[id]);
         forwards += 1;
     }

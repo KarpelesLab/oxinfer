@@ -4,6 +4,8 @@
 //! costs about a microsecond. After a quiet period they back off to parking.
 //! A region ends as soon as every *claimed* block is done; a worker that never
 //! joined the region (e.g. because it was preempted) does not hold up the barrier.
+//! Inside a [`decode_scope`] regions may use fewer workers (see [`decode_threads`]); the others
+//! back off to parking as if no work came.
 
 use crate::clock::Instant;
 use std::sync::Arc;
@@ -13,19 +15,39 @@ use std::time::Duration;
 
 type JobFn<'a> = &'a (dyn Fn(usize) + Sync);
 
-/// One parallel-for, living on the caller's stack for the duration of `run`.
+/// One parallel-for, living on the caller's stack for the duration of `run`. The claim counter
+/// has a cache line of its own (128 bytes: Apple's lines), so that the claims do not take the
+/// job's line away from the threads about to read it.
+#[repr(C, align(128))]
 struct Region {
     f: JobFn<'static>,
     n: usize,
-    next: AtomicUsize,
+    next: Padded<AtomicUsize>,
+}
+
+/// A value alone on its cache line.
+#[repr(align(128))]
+struct Padded<T>(T);
+
+impl<T> std::ops::Deref for Padded<T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
 }
 
 struct Shared {
-    generation: AtomicU64,
+    /// What the waiting workers read, on a line of its own: the generation, the region and how
+    /// many workers it takes.
+    generation: Padded<AtomicU64>,
     region: AtomicPtr<Region>,
-    active: AtomicUsize,
-    sleepers: AtomicUsize,
+    workers: AtomicUsize,
     exit: AtomicBool,
+    sleepers: Padded<AtomicUsize>,
+    /// Per worker, on its own line: set while it may be inside a region. (One shared counter
+    /// that every worker incremented on joining and decremented on leaving queued 17
+    /// read-modify-writes on one line per region.)
+    busy: Box<[Padded<AtomicBool>]>,
 }
 
 pub struct Pool {
@@ -183,15 +205,17 @@ fn in_job(f: impl FnOnce()) {
 
 /// Claims and runs blocks of the current region, if any. Returns false if no region was published.
 #[inline]
-fn participate(shared: &Shared) -> bool {
-    shared.active.fetch_add(1, SeqCst);
+fn participate(shared: &Shared, id: usize) -> bool {
+    let busy = &shared.busy[id];
+    busy.store(true, SeqCst);
     let rp = shared.region.load(SeqCst);
     if rp.is_null() {
-        shared.active.fetch_sub(1, SeqCst);
+        busy.store(false, Release);
         return false;
     }
-    // SAFETY: the publisher keeps the region alive until `active` drops to zero after
-    // it has cleared the pointer, and we incremented `active` before loading it.
+    // SAFETY: the publisher keeps the region alive until it has cleared the pointer and then
+    // seen every `busy` flag clear, and this one was set before the pointer was loaded (both
+    // sequentially consistent: either the publisher sees the flag or we see the null).
     let region = unsafe { &*rp };
     in_job(|| {
         loop {
@@ -202,11 +226,11 @@ fn participate(shared: &Shared) -> bool {
             (region.f)(i);
         }
     });
-    shared.active.fetch_sub(1, SeqCst);
+    busy.store(false, Release);
     true
 }
 
-fn worker(shared: Arc<Shared>, qos: Qos) {
+fn worker(shared: Arc<Shared>, qos: Qos, id: usize) {
     set_qos(qos);
     let mut seen = 0u64;
     loop {
@@ -221,7 +245,10 @@ fn worker(shared: Arc<Shared>, qos: Qos) {
             let g = shared.generation.load(Acquire);
             if g != seen {
                 seen = g;
-                break;
+                // A region for fewer workers is not for this one, which goes on backing off.
+                if id < shared.workers.load(Relaxed) {
+                    break;
+                }
             }
             spins += 1;
             if spins < 4096 {
@@ -241,7 +268,7 @@ fn worker(shared: Arc<Shared>, qos: Qos) {
             }
             shared.sleepers.fetch_sub(1, SeqCst);
         }
-        participate(&shared);
+        participate(&shared, id);
     }
 }
 
@@ -257,11 +284,12 @@ impl Pool {
         POOL_QOS.store(o.qos as usize, Relaxed);
         set_qos(o.qos);
         let shared = Arc::new(Shared {
-            generation: AtomicU64::new(0),
+            generation: Padded(AtomicU64::new(0)),
             region: AtomicPtr::new(std::ptr::null_mut()),
-            active: AtomicUsize::new(0),
-            sleepers: AtomicUsize::new(0),
+            workers: AtomicUsize::new(usize::MAX),
             exit: AtomicBool::new(false),
+            sleepers: Padded(AtomicUsize::new(0)),
+            busy: (0..threads.max(1)).map(|_| Padded(AtomicBool::new(false))).collect(),
         });
         // Spawning can fail where the platform has no threads (wasm32 outside wasi-threads, where
         // `spawn` returns Unsupported); whatever was spawned is the pool, the rest runs inline.
@@ -275,7 +303,7 @@ impl Pool {
             } else {
                 o.qos
             };
-            match thread::Builder::new().name(format!("oxinfer-{i}")).spawn(move || worker(s, q)) {
+            match thread::Builder::new().name(format!("oxinfer-{i}")).spawn(move || worker(s, q, i)) {
                 Ok(h) => handles.push(h.thread().clone()),
                 Err(_) => break,
             }
@@ -303,28 +331,36 @@ impl Pool {
         if nested && std::env::var_os("OXINFER_POOL_DEBUG").is_some() {
             eprintln!("[pool: nested run]\n{}", std::backtrace::Backtrace::force_capture());
         }
-        if n == 1 || self.workers == 0 || nested {
+        // Inside a decode scope: that many threads, the caller included.
+        let workers = match DECODE.with(|d| d.get()) {
+            0 => self.workers,
+            t => t.min(self.workers + 1) - 1,
+        };
+        if n == 1 || workers == 0 || nested {
             for i in 0..n {
                 f(i);
             }
             return;
         }
+        REGIONS.fetch_add(1, Relaxed);
         // The caller's prompt-processing flag (`kernels::lm_prefill`) holds in the workers too.
         let lm = crate::kernels::in_lm_prefill();
         let scoped = move |i: usize| crate::kernels::with_lm_prefill(lm, || f(i));
         let f: &(dyn Fn(usize) + Sync) = &scoped;
         let s = &self.shared;
-        // SAFETY: the region outlives every access: the pointer is cleared and `active`
-        // observed zero before this function returns.
+        // SAFETY: the region outlives every access: the pointer is cleared and every `busy`
+        // flag observed clear before this function returns.
         let region = Region {
             f: unsafe { std::mem::transmute::<JobFn<'_>, JobFn<'static>>(f) },
             n,
-            next: AtomicUsize::new(0),
+            next: Padded(AtomicUsize::new(0)),
         };
+        // (Any value of `workers` a worker reads is safe: whoever joins is waited for below.)
+        s.workers.store(workers, Relaxed);
         s.region.store(&region as *const Region as *mut Region, SeqCst);
         s.generation.fetch_add(1, SeqCst);
         if s.sleepers.load(SeqCst) > 0 {
-            for h in &self.handles {
+            for h in &self.handles[..workers] {
                 h.unpark();
             }
         }
@@ -338,8 +374,11 @@ impl Pool {
             }
         });
         s.region.store(std::ptr::null_mut(), SeqCst);
-        while s.active.load(SeqCst) != 0 {
-            std::hint::spin_loop();
+        // Every worker, of this region's or not, that may have loaded the pointer has left.
+        for b in &s.busy[..self.workers] {
+            while b.load(SeqCst) {
+                std::hint::spin_loop();
+            }
         }
     }
 
@@ -348,6 +387,71 @@ impl Pool {
         for h in &self.handles {
             h.unpark();
         }
+    }
+}
+
+/// Parallel regions run so far (by any pool; runs inline on the caller are not counted).
+static REGIONS: AtomicU64 = AtomicU64::new(0);
+
+/// The number of parallel regions run so far (see [`Pool::run`]), for profiling.
+pub fn regions() -> u64 {
+    REGIONS.load(Relaxed)
+}
+
+thread_local! {
+    /// Inside a [`decode_scope`] on this (the calling) thread: the threads its regions use.
+    // Already const; clippy (1.100) still flags it on Android's thread-local implementation.
+    #[allow(clippy::missing_const_for_thread_local)]
+    static DECODE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Threads of a decode step (0: automatic; `usize::MAX`: not read from the environment yet).
+static DECODE_THREADS: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Sets the threads the regions of a [`decode_scope`] use, the caller included (at most the
+/// pool's), or 0 (the default; also `OXINFER_DECODE_THREADS`) for [`decode_threads`]'s choice.
+pub fn set_decode_threads(n: usize) {
+    DECODE_THREADS.store(n, Relaxed);
+}
+
+/// The threads the regions of a [`decode_scope`] use with a pool of `threads`: those set by
+/// [`set_decode_threads`] or `OXINFER_DECODE_THREADS`, else all but two from 12 threads on.
+///
+/// A one-token step is about a hundred short regions bound by memory bandwidth, and on a machine
+/// that also runs other work, one of all-the-cores' threads losing its core in the middle of a
+/// region holds the region up. On an 18-core M5 Max shared with other jobs (Llama 3.2 1B Q8_0),
+/// 16 threads decoded 2% faster than 18 on average over six interleaved comparisons (from 1.6%
+/// slower to 5% faster); the fastest count moved between 12 and 18 with the load, and a tuner
+/// choosing among 12-18 by measured step times was too noisy to beat the fixed choice.
+pub fn decode_threads(threads: usize) -> usize {
+    let mut n = DECODE_THREADS.load(Relaxed);
+    if n == usize::MAX {
+        n = std::env::var("OXINFER_DECODE_THREADS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        DECODE_THREADS.store(n, Relaxed);
+    }
+    match n {
+        0 if threads >= 12 => threads - 2,
+        0 => threads,
+        n => n.min(threads),
+    }
+}
+
+/// While the guard lives, the parallel regions this thread starts use [`decode_threads`]
+/// threads: for the steps of decoding loops (prompts keep every thread).
+pub fn decode_scope() -> DecodeScope {
+    let n = decode_threads(threads());
+    DecodeScope(DECODE.with(|d| d.replace(n)))
+}
+
+/// See [`decode_scope`].
+pub struct DecodeScope(usize);
+
+impl Drop for DecodeScope {
+    fn drop(&mut self) {
+        DECODE.with(|d| d.set(self.0));
     }
 }
 
