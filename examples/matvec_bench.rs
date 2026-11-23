@@ -5,7 +5,8 @@
 //! and the cost of an empty parallel region. `STREAM=1`: plain streaming reads of the ring
 //! instead, in parallel regions of `REGION_KB` split into blocks of `BLOCK_KB` (the machine's
 //! read bandwidth for a given split). `X4=1`: the same ring interleaved four rows at a time
-//! (`oxinfer::ggml::repack`) too, timed alternately with the plain one.
+//! (`oxinfer::ggml::repack`) too, timed alternately with the plain one. `Q8K=ab`: each with the
+//! K-quants' activations per 32 and per 256 (`oxinfer::quant::set_act_q8k`), alternated.
 
 use oxinfer::ggml::{GgmlType, GgufMatrix, random_blocks};
 use oxinfer::kernels::matmul_quant_multi;
@@ -95,14 +96,27 @@ fn main() -> anyhow::Result<()> {
             } else {
                 vec![("", &ring[..])]
             };
-            for (_, r) in &rings {
+            // `Q8K=ab`: each ring with the K-quants' activations per 32 and per 256, alternated.
+            let ab = std::env::var("Q8K").is_ok_and(|v| v == "ab");
+            let modes: &[(Option<bool>, &str)] = if ab {
+                &[(Some(false), "/q32"), (Some(true), "/q8k")]
+            } else {
+                &[(None, "")]
+            };
+            let rings: Vec<(String, &[GgufMatrix], Option<bool>)> = rings
+                .iter()
+                .flat_map(|(name, r)| modes.iter().map(move |(q, s)| (format!("{name}{s}"), *r, *q)))
+                .collect();
+            for (_, r, q) in &rings {
+                oxinfer::quant::set_act_q8k(*q);
                 for m in r.iter() {
                     matmul_quant_multi(&mut [(m, &mut y[..])], &x, 1);
                 }
             }
             let mut best = vec![f64::MAX; rings.len()];
             for _ in 0..5 {
-                for (b, (_, r)) in best.iter_mut().zip(&rings) {
+                for (b, (_, r, q)) in best.iter_mut().zip(&rings) {
+                    oxinfer::quant::set_act_q8k(*q);
                     let t0 = Instant::now();
                     for m in r.iter() {
                         matmul_quant_multi(&mut [(m, &mut y[..])], &x, 1);
@@ -110,7 +124,7 @@ fn main() -> anyhow::Result<()> {
                     *b = b.min(t0.elapsed().as_secs_f64() / copies as f64);
                 }
             }
-            for (b, (name, _)) in best.iter().zip(&rings) {
+            for (b, (name, _, _)) in best.iter().zip(&rings) {
                 println!(
                     "  {kind_name} {name} {n_out}x{n_in} ({:.1} MB): {:7.1} us  {:6.1} GB/s",
                     one.bytes() as f64 / 1e6,

@@ -10,7 +10,7 @@
 
 use crate::pool;
 use crate::prof::{self, Cat};
-use crate::quant::{PairAct, Q4Matrix, QAct, QBLOCK, QMatrix, dequantize_rows, dequantize_rows_q4, quantize_act};
+use crate::quant::{PairAct, Q4Matrix, QAct, QBLOCK, QMatrix, dequantize_rows, dequantize_rows_q4};
 
 #[inline(always)]
 pub fn bf16_to_f32(x: u16) -> f32 {
@@ -1644,6 +1644,11 @@ pub trait QMat: Sync {
     unsafe fn rows_t1(&self, xa: &QAct, c: usize, y: *mut f32, r0: usize, r1: usize);
     /// Decode: rows `r0..r1` against activation rows `c0..c0+tc` (tc in 2..=4), into `y[(c0+c)*n_out + r]`.
     unsafe fn rows_tc(&self, xa: &QAct, c0: usize, tc: usize, y: *mut f32, r0: usize, r1: usize);
+    /// Whether the decode kernels read the activations' per-256 form ([`crate::quant::Q8K`])
+    /// when they have it (and so need no per-32 form).
+    fn q8k(&self) -> bool {
+        false
+    }
     /// Whether `rows_multi` handles this matrix for `t` tokens (`Some`), and if so whether it
     /// wants the pair-interleaved activations for SMMLA (`Some(true)`).
     fn multi(&self, _t: usize) -> Option<bool> {
@@ -2530,7 +2535,7 @@ pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &
     let xt = uses[Path::F32 as usize].then(|| pack_xt(x, t, n_in));
     #[cfg(target_arch = "aarch64")]
     let xs32 = uses[Path::Sme as usize].then(|| sme::pack_x(x, t, n_in));
-    let xa = uses[Path::Decode as usize].then(|| quantize_act(x, t, n_in));
+    let xa = uses[Path::Decode as usize].then(|| decode_act(refs.iter().map(|j| j.m), x, t, n_in));
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     let xg = uses[Path::I8 as usize].then(|| i8gemm::I8Act::new(x, t, n_in, planes.unwrap()));
     let mode = multi_token_kernels();
@@ -2634,6 +2639,16 @@ fn grouped_sme_share(fast: bool) -> usize {
             .map(|s: usize| s.min(16))
     });
     s.unwrap_or(if fast { 0 } else { 7 })
+}
+
+/// The decode kernels' activations of `x` (`t` rows of `n_in`) for the matrices `ms`: the
+/// per-256 form ([`crate::quant::Q8K`]) when it is on and a matrix reads it, the per-32 form
+/// unless every quantized matrix reads the per-256 one.
+fn decode_act<'a, M: QMat + 'a>(ms: impl Iterator<Item = &'a M> + Clone, x: &[f32], t: usize, n_in: usize) -> QAct {
+    let mut q = ms.filter(|m| !m.dense());
+    let k = crate::quant::want_q8k(n_in) && q.clone().any(|m| m.q8k());
+    let per32 = !k || q.any(|m| !m.q8k());
+    crate::quant::quantize_act_with(x, t, n_in, per32, k)
 }
 
 /// Decode kernels: rows `r0..r1` of `m` against all `xa.t` activation rows into `y[c*n_out + r]`,
@@ -2743,7 +2758,7 @@ pub(crate) fn matmul_quant_glu<M: QMat>(gate: &M, up: &M, x: &[f32], t: usize, a
     let _timer = prof::start(Cat::Matmul);
     let total = gate.bytes() + up.bytes();
     prof::add_bytes(total);
-    let xa = quantize_act(x, t, n_in);
+    let xa = decode_act([gate, up].into_iter(), x, t, n_in);
     let mode = multi_token_kernels();
     let multi = (3..=MULTI_MAX).contains(&t) && mode != MultiTokenKernels::Pairs;
     let pairs = (multi && mode == MultiTokenKernels::Auto && cpu_has_i8mm() && (gate.multi(t) == Some(true) || up.multi(t) == Some(true)))
@@ -2756,10 +2771,19 @@ pub(crate) fn matmul_quant_glu<M: QMat>(gate: &M, up: &M, x: &[f32], t: usize, a
     let mut u = scratch(t * inter);
     let (gp, up_) = (SendPtr(g.as_mut_ptr()), SendPtr(u.as_mut_ptr()));
     let fill = crate::quant::QActFill::new(t, inter);
+    // The per-256 form: the task that completes a block of 256 activations (counted in rows done)
+    // quantizes it.
+    use crate::quant::QK8K;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let done: Vec<AtomicUsize> = (0..if fill.has_k() { t * inter / QK8K } else { 0 })
+        .map(|_| AtomicUsize::new(0))
+        .collect();
     pool::run(inter.div_ceil(rows), &|b| {
         let (r0, r1) = (b * rows, ((b + 1) * rows).min(inter));
         // SAFETY: tasks write disjoint rows `r0..r1` of every token's `g` and `u` (and the
-        // matching blocks of `fill`), which outlive the region.
+        // matching blocks of `fill`), which outlive the region. A block of 256 is read whole by
+        // the one task that counts its last rows, after every other task's writes to it (their
+        // release, its acquire).
         unsafe {
             decode_rows(gate, &xa, pairs.as_ref(), multi, gp.get(), r0, r1);
             decode_rows(up, &xa, pairs.as_ref(), multi, up_.get(), r0, r1);
@@ -2768,6 +2792,15 @@ pub(crate) fn matmul_quant_glu<M: QMat>(gate: &M, up: &M, x: &[f32], t: usize, a
                 let us = std::slice::from_raw_parts_mut(up_.get().add(c * inter + r0), r1 - r0);
                 act(gs, us);
                 fill.fill(c, r0, gs);
+                if fill.has_k() {
+                    for kb in r0 / QK8K..r1.div_ceil(QK8K) {
+                        let n = r1.min((kb + 1) * QK8K) - r0.max(kb * QK8K);
+                        if done[c * inter / QK8K + kb].fetch_add(n, Ordering::AcqRel) + n == QK8K {
+                            let blk = std::slice::from_raw_parts(gp.get().add(c * inter + kb * QK8K), QK8K);
+                            fill.fill_k(c, kb * QK8K, blk);
+                        }
+                    }
+                }
             }
         }
     });
@@ -3704,6 +3737,15 @@ mod tests {
                 assert_eq!(got.sums, want.sums);
                 assert_eq!(bits(&got.fsums), bits(&want.fsums));
                 assert_eq!(bits(&got.hsums), bits(&want.hsums));
+                // The per-256 form (when it is on and `inter` has whole blocks of 256).
+                assert_eq!(got.k.is_some(), want.k.is_some());
+                if let (Some(a), Some(b)) = (&got.k, &want.k) {
+                    assert_eq!(
+                        (&a.q, bits(&a.d), (&a.s, &a.bs)),
+                        (&b.q, bits(&b.d), (&b.s, &b.bs)),
+                        "{kind:?} {t} tokens, per 256"
+                    );
+                }
             }
         }
     }

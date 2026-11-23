@@ -240,6 +240,191 @@ pub struct QAct {
     pub neg32h: Vec<i32>,
     pub t: usize,
     pub n_in: usize,
+    /// Whether the per-32 fields above hold these activations (else their contents are stale,
+    /// and every consumer of these activations reads [`QAct::k`] instead).
+    pub per32: bool,
+    /// The same activations quantized per 256 for the K-quant decode kernels (see [`Q8K`]),
+    /// when [`act_q8k`] is on and `n_in` is a multiple of 256.
+    pub k: Option<Q8K>,
+}
+
+/// Values per block of [`Q8K`] activations (a K-quant super-block).
+pub const QK8K: usize = 256;
+
+/// Activations quantized per 256 values for the Q2_K, Q4_K and Q5_K decode kernels: llama.cpp's
+/// Q8_K with integer scales per 32. One f32 scale `d = amax / (127 * 31)` per block of 256 and,
+/// per 32 values, an integer `s` in 1..=31, `ceil(31 * amax32 / amax)`; the values are int8,
+/// `v / (d * s)` rounded half away from zero. So a block of 32 has nearly the step its own scale
+/// would give it (at most twice as coarse where `amax32` is near `amax / 31`), where llama.cpp's
+/// one scale per 256 gives small values next to a large one coarse steps (in decoding, 4x the
+/// KL divergence from float activations of scales per 32, against the same here); and the kernels
+/// still add a whole super-block's products, scales, sub-scales and mins in integers (bounded:
+/// Q5_K's worst case is 1.97e9) and convert to f32 once per super-block and row, where scales
+/// per 32 in f32 take float work per 32 values.
+pub struct Q8K {
+    pub q: Vec<i8>,
+    /// One scale per block of 256.
+    pub d: Vec<f32>,
+    /// The integer scale of each 32 values (1..=31).
+    pub s: Vec<i32>,
+    /// The sum of each 16 int8 values times their integer scale (the mins' term).
+    pub bs: Vec<i32>,
+}
+
+/// The integer scales' largest value: 31 keeps a super-block's integer sum in i32 for every
+/// format (see [`Q8K`]).
+const Q8K_SUB: f32 = 31.0;
+
+/// Rows of [`Q8K`] arrays to fill (whole blocks of 256).
+pub(crate) struct KOut<'a> {
+    pub q: &'a mut [i8],
+    pub d: &'a mut [f32],
+    pub s: &'a mut [i32],
+    pub bs: &'a mut [i32],
+}
+
+impl Q8K {
+    /// Empty arrays.
+    fn new() -> Self {
+        Self {
+            q: Vec::new(),
+            d: Vec::new(),
+            s: Vec::new(),
+            bs: Vec::new(),
+        }
+    }
+
+    /// Sized for `n` values (their contents unspecified).
+    fn resize(&mut self, n: usize) {
+        self.q.resize(n, 0);
+        self.d.resize(n / QK8K, 0.0);
+        self.s.resize(n / 32, 0);
+        self.bs.resize(n / 16, 0);
+    }
+
+    /// Values `e0..e0 + n` (whole blocks of 256) of the arrays at `p` (as `QActPtrs` keeps them).
+    ///
+    /// # Safety
+    /// In bounds, and no other live `KOut` covers these blocks.
+    unsafe fn out<'a>(p: (*mut i8, *mut f32, *mut i32, *mut i32), e0: usize, n: usize) -> KOut<'a> {
+        use std::slice::from_raw_parts_mut as sl;
+        unsafe {
+            KOut {
+                q: sl(p.0.add(e0), n),
+                d: sl(p.1.add(e0 / QK8K), n / QK8K),
+                s: sl(p.2.add(e0 / 32), n / 32),
+                bs: sl(p.3.add(e0 / 16), n / 16),
+            }
+        }
+    }
+}
+
+/// The explicit [`act_q8k`] setting: 0 none, 1 off, 2 on.
+static Q8K_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Sets whether the CPU decode kernels (aarch64) of Q2_K, Q4_K and Q5_K GGUF matrices take their
+/// activations in super-blocks of 256 ([`Q8K`]: integer sums over a super-block, faster) or with
+/// an f32 scale per 32 (the earlier kernels). The results differ by the activations' rounding.
+/// Process-wide, read as each matmul quantizes its input; None: the default (per 256, or per 32
+/// with `OXINFER_Q8K=0`).
+pub fn set_act_q8k(on: Option<bool>) {
+    Q8K_MODE.store(
+        match on {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// The setting in effect (see [`set_act_q8k`]).
+pub fn act_q8k() -> bool {
+    match Q8K_MODE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            *ENV.get_or_init(|| !std::env::var("OXINFER_Q8K").is_ok_and(|v| matches!(v.trim(), "0" | "off" | "false" | "no")))
+        }
+    }
+}
+
+/// Whether activations of `n_in` values get their [`Q8K`] form now.
+pub(crate) fn want_q8k(n_in: usize) -> bool {
+    n_in.is_multiple_of(QK8K) && act_q8k()
+}
+
+/// The integer scale of a block of 32 with largest magnitude `a32` in a block of 256 with `amax`.
+#[inline(always)]
+fn q8k_sub(a32: f32, amax: f32) -> i32 {
+    if amax > 0.0 {
+        ((Q8K_SUB * a32 / amax).ceil() as i32).clamp(1, Q8K_SUB as i32)
+    } else {
+        1
+    }
+}
+
+/// Quantizes one row (whole blocks of 256) to its [`Q8K`] form.
+fn quantize_row_k(row: &[f32], o: KOut) {
+    for (b, blk) in row.as_chunks::<QK8K>().0.iter().enumerate() {
+        let qb = &mut o.q[b * QK8K..(b + 1) * QK8K];
+        #[cfg(target_arch = "aarch64")]
+        let amax = unsafe {
+            use std::arch::aarch64::*;
+            let p = blk.as_ptr();
+            let mut a32 = [0f32; 8];
+            for (j, a) in a32.iter_mut().enumerate() {
+                let v: [float32x4_t; 8] = std::array::from_fn(|i| vabsq_f32(vld1q_f32(p.add(32 * j + 4 * i))));
+                let m = vmaxnmq_f32(
+                    vmaxnmq_f32(vmaxnmq_f32(v[0], v[1]), vmaxnmq_f32(v[2], v[3])),
+                    vmaxnmq_f32(vmaxnmq_f32(v[4], v[5]), vmaxnmq_f32(v[6], v[7])),
+                );
+                *a = vmaxnmvq_f32(m);
+            }
+            let amax = a32.iter().fold(0f32, |m, &v| m.max(v));
+            let base = if amax > 0.0 { 127.0 * Q8K_SUB / amax } else { 0.0 };
+            for (j, &a) in a32.iter().enumerate() {
+                let s = q8k_sub(a, amax);
+                let inv = base / s as f32;
+                o.s[8 * b + j] = s;
+                for h in 0..2 {
+                    let i = 2 * j + h;
+                    let v: [int32x4_t; 4] = std::array::from_fn(|k| vcvtaq_s32_f32(vmulq_n_f32(vld1q_f32(p.add(16 * i + 4 * k)), inv)));
+                    let sum = vaddvq_s32(vaddq_s32(vaddq_s32(v[0], v[1]), vaddq_s32(v[2], v[3])));
+                    o.bs[16 * b + i] = sum * s;
+                    let lo = vcombine_s16(vqmovn_s32(v[0]), vqmovn_s32(v[1]));
+                    let hi = vcombine_s16(vqmovn_s32(v[2]), vqmovn_s32(v[3]));
+                    vst1q_s8(qb.as_mut_ptr().add(16 * i), vcombine_s8(vqmovn_s16(lo), vqmovn_s16(hi)));
+                }
+            }
+            amax
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let amax = {
+            let a32: Vec<f32> = blk
+                .as_chunks::<32>()
+                .0
+                .iter()
+                .map(|c| c.iter().fold(0f32, |m, v| m.max(v.abs())))
+                .collect();
+            let amax = a32.iter().fold(0f32, |m, &v| m.max(v));
+            let base = if amax > 0.0 { 127.0 * Q8K_SUB / amax } else { 0.0 };
+            for (i, (o16, v16)) in qb.as_chunks_mut::<16>().0.iter_mut().zip(blk.as_chunks::<16>().0).enumerate() {
+                let s = q8k_sub(a32[i / 2], amax);
+                let inv = base / s as f32;
+                o.s[8 * b + i / 2] = s;
+                let mut sum = 0i32;
+                for (q, &v) in o16.iter_mut().zip(v16) {
+                    *q = (v * inv).round() as i8;
+                    sum += *q as i32;
+                }
+                o.bs[16 * b + i] = sum * s;
+            }
+            amax
+        };
+        o.d[b] = amax / (127.0 * Q8K_SUB);
+    }
 }
 
 /// One block of 32: int8 values (`v * 127 / amax`, rounded half away from zero), returning
@@ -383,10 +568,20 @@ struct QActPtrs {
     hsums: SendPtr<f32>,
     neg8: SendPtr<i32>,
     neg32h: SendPtr<i32>,
+    /// The [`Q8K`] arrays (null without them).
+    k: SendPtr<i8>,
+    kd: SendPtr<f32>,
+    ks: SendPtr<i32>,
+    kbs: SendPtr<i32>,
 }
 
 impl QActPtrs {
     fn new(xa: &mut QAct) -> Self {
+        let null = std::ptr::null_mut();
+        let (k, kd, ks, kbs) = match xa.k.as_mut() {
+            Some(k) => (k.q.as_mut_ptr(), k.d.as_mut_ptr(), k.s.as_mut_ptr(), k.bs.as_mut_ptr()),
+            None => (std::ptr::null_mut(), std::ptr::null_mut(), null, null),
+        };
         Self {
             q: SendPtr(xa.q.as_mut_ptr()),
             scales: SendPtr(xa.scales.as_mut_ptr()),
@@ -395,6 +590,10 @@ impl QActPtrs {
             hsums: SendPtr(xa.hsums.as_mut_ptr()),
             neg8: SendPtr(xa.neg8.as_mut_ptr()),
             neg32h: SendPtr(xa.neg32h.as_mut_ptr()),
+            k: SendPtr(k),
+            kd: SendPtr(kd),
+            ks: SendPtr(ks),
+            kbs: SendPtr(kbs),
         }
     }
 
@@ -417,22 +616,35 @@ impl QActPtrs {
             }
         }
     }
+
+    /// The [`Q8K`] form of `src`, values `e0..e0 + src.len()` counted over all rows (whole blocks
+    /// of 256).
+    ///
+    /// # Safety
+    /// The activations have that form, in bounds, and no other call at the same time covers
+    /// these blocks.
+    unsafe fn fill_k(&self, e0: usize, src: &[f32]) {
+        debug_assert!(!self.k.get().is_null() && e0.is_multiple_of(QK8K) && src.len().is_multiple_of(QK8K));
+        let p = (self.k.get(), self.kd.get(), self.ks.get(), self.kbs.get());
+        unsafe { quantize_row_k(src, Q8K::out(p, e0, src.len())) }
+    }
 }
 
 impl QAct {
     /// `t` rows of `n_in` (a multiple of [`QBLOCK`]) for a caller that writes every block: a
     /// buffer set recycled on this thread (its earlier contents) when one is large enough, else
     /// zeros. Decoding quantizes several inputs a layer; recycling them saves the allocations
-    /// and zero fills of each.
-    pub(crate) fn zeroed(t: usize, n_in: usize) -> Self {
+    /// and zero fills of each. With the [`Q8K`] form if `k` (`n_in` a multiple of 256).
+    pub(crate) fn zeroed(t: usize, n_in: usize, k: bool) -> Self {
         assert!(n_in.is_multiple_of(QBLOCK));
+        assert!(!k || n_in.is_multiple_of(QK8K));
         let nb = t * n_in / QBLOCK;
         let reused = QACT_FREE.with(|f| {
             let mut f = f.borrow_mut();
             let i = f.iter().position(|v| v.q.len() >= t * n_in)?;
             Some(f.swap_remove(i))
         });
-        if let Some(mut v) = reused {
+        let mut v = if let Some(mut v) = reused {
             // (Every array's length is proportional to its `q`'s.)
             v.q.truncate(t * n_in);
             v.scales.truncate(nb);
@@ -443,19 +655,30 @@ impl QAct {
             v.neg32h.truncate(2 * nb);
             v.t = t;
             v.n_in = n_in;
-            return v;
+            v.per32 = true;
+            v
+        } else {
+            QAct {
+                q: vec![0i8; t * n_in],
+                scales: vec![0f32; nb],
+                sums: vec![0i32; nb],
+                fsums: vec![0f32; nb],
+                hsums: vec![0f32; 2 * nb],
+                neg8: vec![0i32; nb],
+                neg32h: vec![0i32; 2 * nb],
+                t,
+                n_in,
+                per32: true,
+                k: None,
+            }
+        };
+        if !k {
+            v.k = None;
+        } else {
+            // A recycled set's form, resized (its values are all written).
+            v.k.get_or_insert_with(Q8K::new).resize(t * n_in);
         }
-        QAct {
-            q: vec![0i8; t * n_in],
-            scales: vec![0f32; nb],
-            sums: vec![0i32; nb],
-            fsums: vec![0f32; nb],
-            hsums: vec![0f32; 2 * nb],
-            neg8: vec![0i32; nb],
-            neg32h: vec![0i32; 2 * nb],
-            t,
-            n_in,
-        }
+        v
     }
 }
 
@@ -498,6 +721,8 @@ impl Drop for QAct {
                 neg32h: std::mem::take(&mut self.neg32h),
                 t: 0,
                 n_in: 0,
+                per32: true,
+                k: self.k.take(),
             };
             // (The set replaced is dropped while `f` is borrowed, so it is not kept again.)
             match slot {
@@ -509,8 +734,9 @@ impl Drop for QAct {
 }
 
 /// A [`QAct`] of `t` rows of `n_in` filled block by block from several threads at once
-/// ([`QActFill::fill`]): each block gets exactly what [`quantize_act`] gives it, so filling every
-/// block of every row makes the same activations.
+/// ([`QActFill::fill`], and [`QActFill::fill_k`] for the [`Q8K`] form when it is on): each block
+/// gets exactly what [`quantize_act`] gives it, so filling every block of every row makes the
+/// same activations.
 pub(crate) struct QActFill {
     xa: QAct,
     p: QActPtrs,
@@ -518,14 +744,33 @@ pub(crate) struct QActFill {
 
 impl QActFill {
     pub(crate) fn new(t: usize, n_in: usize) -> Self {
-        let mut xa = QAct::zeroed(t, n_in);
+        let mut xa = QAct::zeroed(t, n_in, want_q8k(n_in));
         Self {
             p: QActPtrs::new(&mut xa),
             xa,
         }
     }
 
-    /// Quantizes `src`, elements `e0..e0 + src.len()` of row `ti` (whole blocks).
+    /// Whether the activations get their [`Q8K`] form too ([`QActFill::fill_k`]).
+    pub(crate) fn has_k(&self) -> bool {
+        self.xa.k.is_some()
+    }
+
+    /// The [`Q8K`] form of `src`, elements `e0..e0 + src.len()` of row `ti` (whole blocks of 256;
+    /// see [`QActFill::has_k`]).
+    ///
+    /// # Safety
+    /// Calls running at the same time cover disjoint blocks.
+    pub(crate) unsafe fn fill_k(&self, ti: usize, e0: usize, src: &[f32]) {
+        let n_in = self.xa.n_in;
+        assert!(self.has_k() && ti < self.xa.t && e0.is_multiple_of(QK8K) && src.len().is_multiple_of(QK8K) && e0 + src.len() <= n_in);
+        // SAFETY: in bounds (checked above); disjoint from other calls' blocks (the caller's
+        // contract).
+        unsafe { self.p.fill_k(ti * n_in + e0, src) }
+    }
+
+    /// Quantizes `src`, elements `e0..e0 + src.len()` of row `ti` (whole blocks of 32), in the
+    /// per-32 form ([`QActFill::fill_k`] makes the other).
     ///
     /// # Safety
     /// Calls running at the same time cover disjoint blocks.
@@ -544,20 +789,37 @@ impl QActFill {
     }
 }
 
+/// Quantizes `t` rows of `n_in` activations for the decode kernels: per 32, and per 256 as well
+/// ([`QAct::k`]) when [`act_q8k`] is on and `n_in` is a multiple of 256.
 pub fn quantize_act(x: &[f32], t: usize, n_in: usize) -> QAct {
+    quantize_act_with(x, t, n_in, true, want_q8k(n_in))
+}
+
+/// [`quantize_act`] with the per-32 form only if `per32` (else its arrays are left as they were:
+/// [`QAct::per32`] off) and the [`Q8K`] form only if `k` (`n_in` a multiple of 256). Each row's
+/// values in a form are the same whichever forms are made.
+pub(crate) fn quantize_act_with(x: &[f32], t: usize, n_in: usize, per32: bool, k: bool) -> QAct {
     assert_eq!(x.len(), t * n_in);
-    let mut xa = QAct::zeroed(t, n_in);
+    assert!(per32 || k, "activations quantized in no form");
+    let mut xa = QAct::zeroed(t, n_in, k);
+    xa.per32 = per32;
     let bpr = n_in / QBLOCK;
     let p = QActPtrs::new(&mut xa);
+    // SAFETY: each call takes its own row.
+    let row = |ti: usize| unsafe {
+        let xr = &x[ti * n_in..(ti + 1) * n_in];
+        if per32 {
+            quantize_row(xr, p.out(ti * bpr, bpr));
+        }
+        if k {
+            p.fill_k(ti * n_in, xr);
+        }
+    };
     if t == 1 {
-        // SAFETY: the whole of the one row.
-        unsafe { quantize_row(x, p.out(0, bpr)) };
+        row(0);
     } else {
         // Rows in parallel (several tokens: speculative verification, prefill).
-        // SAFETY: each job takes its own row.
-        crate::pool::run(t, &|ti| unsafe {
-            quantize_row(&x[ti * n_in..(ti + 1) * n_in], p.out(ti * bpr, bpr))
-        });
+        crate::pool::run(t, &row);
     }
     xa
 }
@@ -568,7 +830,11 @@ impl QAct {
     pub fn gather(&self, rows: &[usize]) -> QAct {
         let n = self.n_in;
         let bpr = n / QBLOCK;
+        // (A form these activations do not have stays empty.)
         fn pick<T: Copy>(v: &[T], per: usize, rows: &[usize]) -> Vec<T> {
+            if v.is_empty() {
+                return Vec::new();
+            }
             rows.iter().flat_map(|&r| v[r * per..(r + 1) * per].iter().copied()).collect()
         }
         QAct {
@@ -581,6 +847,13 @@ impl QAct {
             neg32h: pick(&self.neg32h, 2 * bpr, rows),
             t: rows.len(),
             n_in: n,
+            per32: self.per32,
+            k: self.k.as_ref().map(|k| Q8K {
+                q: pick(&k.q, n, rows),
+                d: pick(&k.d, n / QK8K, rows),
+                s: pick(&k.s, n / 32, rows),
+                bs: pick(&k.bs, n / 16, rows),
+            }),
         }
     }
 }
@@ -597,6 +870,7 @@ pub struct PairAct {
 
 impl PairAct {
     pub fn new(xa: &QAct) -> Self {
+        assert!(xa.per32, "pair-interleaved activations of activations without the per-32 form");
         let (t, n) = (xa.t, xa.n_in);
         let bpr = n / QBLOCK;
         let np = t.div_ceil(2);
@@ -899,6 +1173,81 @@ mod tests {
                     assert_eq!(xa.neg32h[2 * bi + h], -32 * s16);
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod q8k_tests {
+    use super::*;
+
+    /// The per-256 form ([`Q8K`]) against the scalar definition, made alone or beside the per-32
+    /// form, by rows in parallel or block by block ([`QActFill`]), and kept through `gather`.
+    #[test]
+    fn q8k_activations_match_scalar() {
+        let (t, n) = (3usize, 3 * QK8K);
+        let mut seed = 5u64;
+        let mut x: Vec<f32> = (0..t * n)
+            .map(|i| {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (((seed >> 33) % 20001) as f32 / 1000.0 - 10.0) * [1e-3, 1.0, 50.0][(i / 48) % 3]
+            })
+            .collect();
+        x[QK8K..2 * QK8K].fill(0.0);
+        x[2 * QK8K + 5] = -1e-30;
+        let check = |xa: &QAct| {
+            let k = xa.k.as_ref().unwrap();
+            for (bi, blk) in x.chunks(QK8K).enumerate() {
+                let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let d = amax / (127.0 * 31.0);
+                assert_eq!(k.d[bi].to_bits(), d.to_bits());
+                for (j, b32) in blk.chunks(32).enumerate() {
+                    let a32 = b32.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let s = if amax > 0.0 {
+                        ((31.0 * a32 / amax).ceil() as i32).clamp(1, 31)
+                    } else {
+                        1
+                    };
+                    assert_eq!(k.s[bi * 8 + j], s, "block {bi} sub-block {j}");
+                    let inv = if amax > 0.0 { 127.0 * 31.0 / amax / s as f32 } else { 0.0 };
+                    let q: Vec<i8> = b32.iter().map(|&v| (v * inv).round() as i8).collect();
+                    let e = bi * QK8K + 32 * j;
+                    assert_eq!(&k.q[e..e + 32], &q[..], "block {bi} sub-block {j}");
+                    for h in 0..2 {
+                        let sum: i32 = q[16 * h..16 * h + 16].iter().map(|&v| v as i32).sum();
+                        assert_eq!(k.bs[e / 16 + h], s * sum);
+                    }
+                    // Each value within half a step of its own (the step at most twice what a
+                    // scale per 32 would give, beyond a 31st of the block's largest).
+                    let step = d * s as f32;
+                    for (&v, &qv) in b32.iter().zip(&q) {
+                        assert!((v - step * qv as f32).abs() <= 0.5001 * step + 1e-30);
+                    }
+                    if a32 >= amax / 31.0 && amax > 0.0 {
+                        assert!(step <= 2.0001 * a32 / 127.0, "block {bi} sub-block {j}: step {step}, amax32 {a32}");
+                    }
+                }
+            }
+        };
+        for per32 in [false, true] {
+            let xa = quantize_act_with(&x, t, n, per32, true);
+            assert_eq!(xa.per32, per32);
+            check(&xa);
+            // The values of each row alone.
+            check(&xa.gather(&[0, 1, 2]));
+        }
+        if want_q8k(n) {
+            let fill = QActFill::new(t, n);
+            assert!(fill.has_k());
+            for ti in 0..t {
+                for e in (0..n).step_by(QK8K) {
+                    unsafe {
+                        fill.fill(ti, e, &x[ti * n + e..ti * n + e + QK8K]);
+                        fill.fill_k(ti, e, &x[ti * n + e..ti * n + e + QK8K]);
+                    }
+                }
+            }
+            check(&fill.finish());
         }
     }
 }

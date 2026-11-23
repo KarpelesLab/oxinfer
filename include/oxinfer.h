@@ -131,6 +131,11 @@ int64_t oxi_cache_remove(const char *cache_dir, const char *name);
  *                        kernels with the same results (default 1
  *                        when no GPU backend is active and the weights are read into memory;
  *                        process-wide)
+ *   cpu_q8k=0|1          CPU decoding on aarch64 of Q2_K, Q4_K and Q5_K matrices: activations
+ *                        in super-blocks of 256 as llama.cpp's Q8_K, with integer scales per 32
+ *                        (default 1: faster) or with f32 scales per 32 (0: the earlier kernels;
+ *                        results differ by the activations' rounding; env OXINFER_Q8K=0;
+ *                        process-wide)
  *   stream=auto|on|off   stream weights from storage for models larger than RAM (1 / 0 work
  *                        too). auto (default): when a tuning key below is set, for a Qwen /
  *                        Gemma checkpoint larger than the device holds (on iOS: what

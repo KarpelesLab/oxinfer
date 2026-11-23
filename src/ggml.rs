@@ -1451,20 +1451,65 @@ pub(crate) struct Act {
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub n32h: *const i32,
     pub n_in: usize,
+    /// Whether the activations have their [`crate::quant::Q8K`] form: token `c` at `c * n_in`
+    /// values `kq`, `c * n_in / 256` scales `kd`, `c * n_in / 32` integer scales `ks` and
+    /// `c * n_in / 16` scaled sums `kbs`. (Pointers into a form the activations do not have
+    /// dangle: the per-32 ones when `QAct::per32` is off, these when `k` is false.)
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub k: bool,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub kq: *const i8,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub kd: *const f32,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub ks: *const i32,
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub kbs: *const i32,
 }
 
 impl Act {
     fn new(xa: &QAct, c0: usize) -> Self {
         let n = xa.n_in;
+        let null = std::ptr::null();
+        let (kq, kd, ks, kbs) = match &xa.k {
+            Some(k) => (k.q.as_ptr(), k.d.as_ptr(), k.s.as_ptr(), k.bs.as_ptr()),
+            None => (std::ptr::null(), std::ptr::null(), null, null),
+        };
         Self {
-            q: unsafe { xa.q.as_ptr().add(c0 * n) },
-            s: unsafe { xa.scales.as_ptr().add(c0 * n / QBLOCK) },
-            f: unsafe { xa.fsums.as_ptr().add(c0 * n / QBLOCK) },
-            h: unsafe { xa.hsums.as_ptr().add(c0 * n / 16) },
-            i: unsafe { xa.sums.as_ptr().add(c0 * n / QBLOCK) },
-            n8: unsafe { xa.neg8.as_ptr().add(c0 * n / QBLOCK) },
-            n32h: unsafe { xa.neg32h.as_ptr().add(c0 * n / 16) },
+            q: xa.q.as_ptr(),
+            s: xa.scales.as_ptr(),
+            f: xa.fsums.as_ptr(),
+            h: xa.hsums.as_ptr(),
+            i: xa.sums.as_ptr(),
+            n8: xa.neg8.as_ptr(),
+            n32h: xa.neg32h.as_ptr(),
             n_in: n,
+            k: xa.k.is_some(),
+            kq,
+            kd,
+            ks,
+            kbs,
+        }
+        .at(c0)
+    }
+
+    /// The activations from token `c0` on.
+    pub(crate) fn at(&self, c0: usize) -> Act {
+        let n = self.n_in;
+        Act {
+            q: self.q.wrapping_add(c0 * n),
+            s: self.s.wrapping_add(c0 * n / QBLOCK),
+            f: self.f.wrapping_add(c0 * n / QBLOCK),
+            h: self.h.wrapping_add(c0 * n / 16),
+            i: self.i.wrapping_add(c0 * n / QBLOCK),
+            n8: self.n8.wrapping_add(c0 * n / QBLOCK),
+            n32h: self.n32h.wrapping_add(c0 * n / 16),
+            n_in: n,
+            k: self.k,
+            kq: self.kq.wrapping_add(c0 * n),
+            kd: self.kd.wrapping_add(c0 * n / crate::quant::QK8K),
+            ks: self.ks.wrapping_add(c0 * n / 32),
+            kbs: self.kbs.wrapping_add(c0 * n / 16),
         }
     }
 }
@@ -1670,9 +1715,23 @@ impl QMat for GgufMatrix {
     unsafe fn rows_t1(&self, xa: &QAct, c: usize, y: *mut f32, r0: usize, r1: usize) {
         unsafe { self.rows_impl::<1>(xa, c, y, 0, r0, r1) }
     }
+    fn q8k(&self) -> bool {
+        #[cfg(target_arch = "aarch64")]
+        {
+            neon::q8k_kind(self.kind)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            false
+        }
+    }
     fn multi(&self, t: usize) -> Option<bool> {
         #[cfg(target_arch = "aarch64")]
         {
+            // On per-256 activations the K-quants run their one-token kernels on column groups.
+            if neon::q8k_kind(self.kind) && crate::quant::act_q8k() {
+                return Some(false);
+            }
             neon::multi_kind(self.kind, t)
         }
         #[cfg(not(target_arch = "aarch64"))]
@@ -2002,8 +2061,39 @@ mod tests {
     /// What the int8 decode path computes, in f64: per 16 elements `s * sum(q * xq) * xs`, plus
     /// `m * sum(x)` over the exact activations for formats with offsets.
     fn int8_reference(m: &GgufMatrix, x: &[f32], t: usize) -> Vec<f32> {
+        int8_reference_as(m, x, t, m.q8k())
+    }
+
+    /// [`int8_reference`] on the per-256 activations if `k8` (as the K-quants' kernels take them
+    /// when they have that form), else per 32 (as the portable kernel does).
+    fn int8_reference_as(m: &GgufMatrix, x: &[f32], t: usize, k8: bool) -> Vec<f32> {
         let (n_out, n_in, kind) = (m.n_out, m.n_in, m.kind);
         let xa = crate::quant::quantize_act(x, t, n_in);
+        // On the per-256 form: products `s * sum(q * xq) * d * xs` and mins
+        // `m * sum(xq) * d * xs`, `xs` the integer scale of the activations' 32 (see `quant::Q8K`).
+        if let Some(k) = xa.k.as_ref().filter(|_| k8) {
+            let mut y = vec![0f32; t * n_out];
+            let (mut q, mut s, mut mn) = ([0i8; QK_K], [0f32; 16], [0f32; 16]);
+            for r in 0..n_out {
+                for c in 0..t {
+                    let mut acc = 0f64;
+                    for (bi, blk) in m.row(r).chunks_exact(kind.type_size()).enumerate() {
+                        let has_min = decode_i8(kind, blk, &mut q, &mut s, &mut mn);
+                        let d = k.d[(c * n_in) / QK_K + bi] as f64;
+                        for g in 0..16 {
+                            let e = c * n_in + bi * QK_K + 16 * g;
+                            let isum: i32 = (0..16).map(|i| q[16 * g + i] as i32 * k.q[e + i] as i32).sum();
+                            acc += s[g] as f64 * isum as f64 * d * k.s[e / 32] as f64;
+                            if has_min {
+                                acc += mn[g] as f64 * k.bs[e / 16] as f64 * d;
+                            }
+                        }
+                    }
+                    y[c * n_out + r] = acc as f32;
+                }
+            }
+            return y;
+        }
         let bs = kind.block_size();
         let mut y = vec![0f32; t * n_out];
         let (mut q, mut s, mut mn) = ([0i8; QK_K], [0f32; 16], [0f32; 16]);
@@ -2092,24 +2182,27 @@ mod tests {
             let m = GgufMatrix::from_bytes(kind, &random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed), n_out, n_in).unwrap();
             for t in 2..=crate::ggml::neon::MULTI_MAX {
                 let x: Vec<f32> = (0..t * n_in).map(|_| (lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0).collect();
-                let xa = crate::quant::quantize_act(&x, t, n_in);
-                let pairs = crate::quant::PairAct::new(&xa);
-                let mut y1 = vec![0f32; t * n_out];
-                for c in 0..t {
-                    unsafe { m.rows_t1(&xa, c, y1.as_mut_ptr().add(c * n_out), 0, n_out) };
-                }
-                let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
-                for p in [None, Some(&pairs)] {
-                    if p.is_some() && !(mm && neon::multi_kind(kind, t) == Some(true)) {
-                        continue;
+                // Per-32 activations, and per 256 as well (the K-quants' kernels on those).
+                for k in [false, n_in.is_multiple_of(QK_K)] {
+                    let xa = crate::quant::quantize_act_with(&x, t, n_in, true, k);
+                    let pairs = crate::quant::PairAct::new(&xa);
+                    let mut y1 = vec![0f32; t * n_out];
+                    for c in 0..t {
+                        unsafe { m.rows_t1(&xa, c, y1.as_mut_ptr().add(c * n_out), 0, n_out) };
                     }
-                    let mut y = vec![0f32; t * n_out];
-                    // Two row ranges, the first odd-sized (a row-pair tail inside the matrix).
-                    unsafe {
-                        assert!(neon::rows_multi(&m, &Act::new(&xa, 0), p, t, y.as_mut_ptr(), n_out, 0, 7));
-                        assert!(neon::rows_multi(&m, &Act::new(&xa, 0), p, t, y.as_mut_ptr(), n_out, 7, n_out));
+                    let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+                    for p in [None, Some(&pairs)] {
+                        if p.is_some() && !(mm && neon::multi_kind(kind, t) == Some(true)) {
+                            continue;
+                        }
+                        let mut y = vec![0f32; t * n_out];
+                        // Two row ranges, the first odd-sized (a row-pair tail inside the matrix).
+                        unsafe {
+                            assert!(neon::rows_multi(&m, &Act::new(&xa, 0), p, t, y.as_mut_ptr(), n_out, 0, 7));
+                            assert!(neon::rows_multi(&m, &Act::new(&xa, 0), p, t, y.as_mut_ptr(), n_out, 7, n_out));
+                        }
+                        assert_eq!(bits(&y), bits(&y1), "{kind} t={t} k={k} smmla={}", p.is_some());
                     }
-                    assert_eq!(bits(&y), bits(&y1), "{kind} t={t} smmla={}", p.is_some());
                 }
             }
         }
@@ -2214,7 +2307,7 @@ mod tests {
                     y[c * n_out + r] = o[c];
                 }
             }
-            check(&format!("{kind} portable"), &y, &int8_reference(&m, &x, t), 1e-4);
+            check(&format!("{kind} portable"), &y, &int8_reference_as(&m, &x, t, false), 1e-4);
         }
     }
 
@@ -2342,33 +2435,36 @@ mod tests {
                 }
                 for t in 1..=16usize {
                     let x: Vec<f32> = (0..t * n_in).map(|_| (lcg(&mut seed) % 2001) as f32 / 1000.0 - 1.0).collect();
-                    let xa = crate::quant::quantize_act(&x, t, n_in);
-                    let mut y0 = vec![0f32; t * n_out];
-                    for c in 0..t {
-                        unsafe { m.rows_t1(&xa, c, y0.as_mut_ptr().add(c * n_out), 0, n_out) };
-                    }
-                    // One token at a time, in ranges that cut groups of four.
-                    let mut y1 = vec![0f32; t * n_out];
-                    for c in 0..t {
-                        for (r0, r1) in [(0, 3), (3, 9.min(n_out)), (9.min(n_out), n_out)] {
-                            unsafe { x4.rows_t1(&xa, c, y1.as_mut_ptr().add(c * n_out), r0, r1) };
+                    // Activations per 32, and per 256 too (the K-quants' kernels on those).
+                    for k in [false, n_in.is_multiple_of(QK_K)] {
+                        let xa = crate::quant::quantize_act_with(&x, t, n_in, true, k);
+                        let mut y0 = vec![0f32; t * n_out];
+                        for c in 0..t {
+                            unsafe { m.rows_t1(&xa, c, y0.as_mut_ptr().add(c * n_out), 0, n_out) };
                         }
-                    }
-                    assert_eq!(bits(&y1), bits(&y0), "{kind} [{n_out}, {n_in}] t={t} rows_t1");
-                    if (2..=4).contains(&t) {
-                        let mut y2 = vec![0f32; t * n_out];
-                        unsafe { x4.rows_tc(&xa, 0, t, y2.as_mut_ptr(), 1, n_out) };
-                        unsafe { x4.rows_tc(&xa, 0, t, y2.as_mut_ptr(), 0, 1) };
-                        assert_eq!(bits(&y2), bits(&y0), "{kind} t={t} rows_tc");
-                    }
-                    if t >= 2 {
-                        let pairs = crate::quant::PairAct::new(&xa);
-                        let mut y3 = vec![0f32; t * n_out];
-                        unsafe {
-                            assert!(x4.rows_multi(&xa, Some(&pairs), t, y3.as_mut_ptr(), 0, 7));
-                            assert!(x4.rows_multi(&xa, Some(&pairs), t, y3.as_mut_ptr(), 7, n_out));
+                        // One token at a time, in ranges that cut groups of four.
+                        let mut y1 = vec![0f32; t * n_out];
+                        for c in 0..t {
+                            for (r0, r1) in [(0, 3), (3, 9.min(n_out)), (9.min(n_out), n_out)] {
+                                unsafe { x4.rows_t1(&xa, c, y1.as_mut_ptr().add(c * n_out), r0, r1) };
+                            }
                         }
-                        assert_eq!(bits(&y3), bits(&y0), "{kind} t={t} rows_multi");
+                        assert_eq!(bits(&y1), bits(&y0), "{kind} [{n_out}, {n_in}] t={t} k={k} rows_t1");
+                        if (2..=4).contains(&t) {
+                            let mut y2 = vec![0f32; t * n_out];
+                            unsafe { x4.rows_tc(&xa, 0, t, y2.as_mut_ptr(), 1, n_out) };
+                            unsafe { x4.rows_tc(&xa, 0, t, y2.as_mut_ptr(), 0, 1) };
+                            assert_eq!(bits(&y2), bits(&y0), "{kind} t={t} k={k} rows_tc");
+                        }
+                        if t >= 2 {
+                            let pairs = crate::quant::PairAct::new(&xa);
+                            let mut y3 = vec![0f32; t * n_out];
+                            unsafe {
+                                assert!(x4.rows_multi(&xa, Some(&pairs), t, y3.as_mut_ptr(), 0, 7));
+                                assert!(x4.rows_multi(&xa, Some(&pairs), t, y3.as_mut_ptr(), 7, n_out));
+                            }
+                            assert_eq!(bits(&y3), bits(&y0), "{kind} t={t} k={k} rows_multi");
+                        }
                     }
                     // The driver: decode kernels up to 16 tokens, prefill GEMMs past 4.
                     for decode_max in [16usize, 4] {

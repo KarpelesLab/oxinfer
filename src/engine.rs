@@ -232,6 +232,12 @@ pub struct EngineOptions {
     /// setting (default on, `OXINFER_REPACK=0` off; [`crate::ggml::set_repack`]). Key
     /// `cpu_repack`.
     pub cpu_repack: Option<bool>,
+    /// CPU decoding (aarch64) of Q2_K, Q4_K and Q5_K GGUF matrices: activations in super-blocks
+    /// of 256 (llama.cpp's Q8_K with integer scales per 32, the default: faster) or, off, with
+    /// f32 scales per 32 (the earlier kernels); the results differ by the activations' rounding.
+    /// Process-wide; None leaves the current setting (`OXINFER_Q8K=0` for off;
+    /// [`crate::quant::set_act_q8k`]). Key `cpu_q8k`.
+    pub cpu_q8k: Option<bool>,
     /// Single-token decode steps entirely on the GPU (one submission per token) where the backend
     /// supports the model (Metal: dense Llama 3 / Qwen3 / Qwen3.5 / 3.8 layers; CUDA: those and
     /// Inkling-2, whose prompts then run whole on the GPU as well); everything else stays as it
@@ -463,6 +469,7 @@ impl Default for EngineOptions {
             prefill_gemm: None,
             gpu_moe: None,
             cpu_repack: None,
+            cpu_q8k: None,
             gpu_decode: None,
             stream_gpu: None,
             decision_from: None,
@@ -548,6 +555,7 @@ impl EngineOptions {
         "prefill_gemm",
         "gpu_moe",
         "cpu_repack",
+        "cpu_q8k",
         "gpu_decode",
         "stream_gpu",
         "decision_from",
@@ -676,6 +684,12 @@ impl EngineOptions {
             "gpu_moe" => self.gpu_moe = Some(parse_bool(key, value)?),
             "cpu_repack" => {
                 self.cpu_repack = match value.trim() {
+                    "" | "auto" => None,
+                    v => Some(parse_bool(key, v)?),
+                }
+            }
+            "cpu_q8k" => {
+                self.cpu_q8k = match value.trim() {
                     "" | "auto" => None,
                     v => Some(parse_bool(key, v)?),
                 }
@@ -1544,6 +1558,9 @@ impl Engine {
         }
         if let Some(on) = opts.cpu_repack {
             crate::ggml::set_repack(Some(on));
+        }
+        if let Some(on) = opts.cpu_q8k {
+            crate::quant::set_act_q8k(Some(on));
         }
         if let Some(on) = opts.gpu_moe {
             crate::gpu::set_moe_offload(on);

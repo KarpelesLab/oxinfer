@@ -985,7 +985,6 @@ unsafe fn gemm_rows_whole<M: QMat + ?Sized>(m: &M, xa: &I8Act, c0: usize, c1: us
 mod tests {
     use super::*;
     use crate::ggml::{GgmlType, GgufMatrix, random_blocks};
-    use crate::quant::quantize_act;
 
     /// The GEMM over row and token counts that leave partial tiles: with one plane against the
     /// one-token decode kernels (same int8 activations; only the f32 summation order differs),
@@ -996,7 +995,8 @@ mod tests {
         let x: Vec<f32> = (0..t * n_in)
             .map(|i| (((i * 7919) % 2001) as f32 / 1000.0 - 1.0) * if i % 61 == 0 { 9.0 } else { 1.0 })
             .collect();
-        let xa = quantize_act(&x, t, n_in);
+        // (The per-32 form only: the decode kernels then round the activations as the GEMM does.)
+        let xa = crate::quant::quantize_act_with(&x, t, n_in, true, false);
         let mut dec = vec![0f32; t * n_out];
         for c in 0..t {
             unsafe { m.rows_t1(&xa, c, dec.as_mut_ptr().add(c * n_out), 0, n_out) };

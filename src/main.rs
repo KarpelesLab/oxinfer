@@ -298,6 +298,10 @@ fn usage() -> ! {
          \x20                      GGUF model's Q8_0 / Q4_0 / Q4_K / Q6_K matrices four rows at a time\n\
          \x20                      in place at load (faster CPU decoding, same memory and results);\n\
          \x20                      env OXINFER_REPACK=0 for off\n\
+         \x20 --cpu-q8k M          on (default) | off: CPU decoding of Q2_K / Q4_K / Q5_K matrices\n\
+         \x20                      (aarch64) with activations in super-blocks of 256 (llama.cpp's\n\
+         \x20                      Q8_K, integer scales per 32) or f32 scales per 32 (slower; results\n\
+         \x20                      differ by rounding); env OXINFER_Q8K=0 for off\n\
          \x20 --lookup / --no-lookup  prompt-lookup drafting (default on): drafts copied from the\n\
          \x20                      conversation where its last tokens occurred before (quoting, editing,\n\
          \x20                      summarizing), verified like other drafts (exact); rounds without a\n\
@@ -848,6 +852,15 @@ fn parse_args() -> Result<Args> {
                     "off" | "0" => Some(false),
                     "auto" => None,
                     _ => bail!("--cpu-repack expects on|off|auto, got {v}"),
+                })
+            }
+            "--cpu-q8k" => {
+                let v = val()?;
+                oxinfer::quant::set_act_q8k(match v.as_str() {
+                    "on" | "1" => Some(true),
+                    "off" | "0" => Some(false),
+                    "auto" => None,
+                    _ => bail!("--cpu-q8k expects on|off|auto, got {v}"),
                 })
             }
             "--lookup" => a.lookup = Some(true),

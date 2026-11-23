@@ -8,10 +8,11 @@
 //! gated MLP fused (`g1`, the default) or not (`g0`), the step's threads (`t0`: the default
 //! decode threads), and the weights interleaved for the CPU kernels (`r1`, the default where
 //! the target has them) or in the file's layout (`r0`; both variants are loaded when the
-//! settings ask for both), default `g0,g1`). The checkpoint is read into memory, as the engine
+//! settings ask for both), and the K-quants' activations per 256 (`k1`, the default) or per 32
+//! (`k0`), default `g0,g1`). The checkpoint is read into memory, as the engine
 //! does by default. Settings switch every token, or every 64 tokens when their threads differ
-//! (so that the workers left out have parked). The settings are bit-identical: `AB_CHECK=1`
-//! first decodes with each one alone and asserts that the tokens are the same.
+//! (so that the workers left out have parked). The settings other than `k` are bit-identical:
+//! `AB_CHECK=1` first decodes with each one alone and asserts that the tokens are the same.
 
 use oxinfer::config::QwenConfig;
 use oxinfer::model::Quant;
@@ -25,6 +26,7 @@ struct Setting {
     glu: bool,
     threads: usize,
     repack: bool,
+    q8k: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -40,6 +42,7 @@ fn main() -> anyhow::Result<()> {
                 glu: true,
                 threads: 0,
                 repack: true,
+                q8k: true,
             };
             // Letters, each followed by its number.
             let mut rest = s.as_str();
@@ -50,6 +53,7 @@ fn main() -> anyhow::Result<()> {
                     'g' => st.glu = v != 0,
                     't' => st.threads = v,
                     'r' => st.repack = v != 0,
+                    'k' => st.q8k = v != 0,
                     _ => panic!("unknown setting letter {c}"),
                 }
                 rest = &rest[n..];
@@ -98,6 +102,7 @@ fn main() -> anyhow::Result<()> {
             let m = (i / block) % set.len();
             let model = models[set[m].repack as usize].as_ref().unwrap();
             oxinfer::kernels::set_glu_fused(set[m].glu);
+            oxinfer::quant::set_act_q8k(Some(set[m].q8k));
             oxinfer::pool::set_decode_threads(set[m].threads);
             let r0 = oxinfer::pool::regions();
             let t0 = Instant::now();
