@@ -85,11 +85,43 @@ pub(super) unsafe fn rows<const TC: usize>(m: &GgufMatrix, x: &Act, y: *mut f32,
     };
     let rb = m.row_bytes();
     let base = m.data.as_ptr();
+    if TC == 1 && rows_t1(m, x, y, r0, r1) {
+        return true;
+    }
     for r in r0..r1 {
         let o = f(base.add(r * rb), m.n_in, x);
         for c in 0..TC {
             *y.add(c * ys + r) = o[c];
         }
+    }
+    true
+}
+
+/// One-token rows of the formats with kernels that take several rows at a time (bit for bit the
+/// one-row kernels'); false for the others.
+unsafe fn rows_t1(m: &GgufMatrix, x: &Act, y: *mut f32, r0: usize, r1: usize) -> bool {
+    let rb = m.row_bytes();
+    let base = m.data.as_ptr();
+    let (n, p) = (m.n_in, |r: usize| base.add(r * rb));
+    macro_rules! go {
+        ($f:ident) => {{
+            let mut r = r0;
+            while r + 2 <= r1 {
+                let o = $f::<2>([p(r), p(r + 1)], n, x);
+                *y.add(r) = o[0];
+                *y.add(r + 1) = o[1];
+                r += 2;
+            }
+            if r < r1 {
+                *y.add(r) = $f::<1>([p(r)], n, x)[0];
+            }
+        }};
+    }
+    match m.kind {
+        GgmlType::IQ1_S => go!(iq1s_rows),
+        GgmlType::IQ1_M => go!(iq1m_rows),
+        GgmlType::IQ2_XXS => go!(iq2xxs_rows),
+        _ => return false,
     }
     true
 }
@@ -687,6 +719,244 @@ unsafe fn iq1s<const TC: usize>(row: *const u8, n_in: usize, x: &Act) -> [f32; T
         }
     }
     finish(acc)
+}
+
+/// One-token IQ1_S rows, `R` at a time: `iq1s::<1>` of each row, bit for bit (the same integer
+/// sums per 32 and the same float steps), with the activation vectors loaded once for the `R`
+/// rows, a block's index bits read as whole words and its scales and delta signs unpacked as
+/// vectors. These kernels are bound by the instructions a grid entry costs (its index from two
+/// bit fields, the load, the insert into a vector: about four for 8 weights), not by memory.
+#[inline(always)]
+unsafe fn iq1s_rows<const R: usize>(rows: [*const u8; R], n_in: usize, x: &Act) -> [f32; R] {
+    use super::tables::IQ1S_GRID as G;
+    let gp = G.as_ptr();
+    let mut acc = [vdupq_n_f32(0.0); R];
+    let (m7, one) = (vdupq_n_u16(7), vdupq_n_u16(1));
+    for sb in 0..n_in / QK_K {
+        let xq = x.q.add(sb * QK_K);
+        let mut b = [std::ptr::null::<u8>(); R];
+        let mut qw = [[0u64; 4]; R];
+        let mut hw = [[0u64; 2]; R];
+        for r in 0..R {
+            b[r] = rows[r].add(sb * 50);
+            for i in 0..4 {
+                qw[r][i] = rd64(b[r].add(2 + 8 * i));
+            }
+            hw[r] = [rd64(b[r].add(34)), rd64(b[r].add(42))];
+        }
+        // Per-32 SDOT sums of the ternary grid values, pairwise-added as `sums32` does.
+        let mut s = [[vdupq_n_s32(0); 8]; R];
+        unroll8!(ib, {
+            let (x0, x1) = (vld1q_s8(xq.add(32 * ib)), vld1q_s8(xq.add(32 * ib + 16)));
+            for r in 0..R {
+                let q4 = (qw[r][ib / 2] >> (32 * (ib % 2))) as usize;
+                let qh = (hw[r][ib / 4] >> (16 * (ib % 4))) as usize;
+                let g = |l: usize| gp.add(((q4 >> (8 * l)) & 255) | (((qh >> (3 * l)) & 7) << 8));
+                let w0 = vreinterpretq_s8_u64(vcombine_u64(vld1_u64(g(0)), vld1_u64(g(1))));
+                let w1 = vreinterpretq_s8_u64(vcombine_u64(vld1_u64(g(2)), vld1_u64(g(3))));
+                s[r][ib] = sdot(sdot(vdupq_n_s32(0), w0, x0), w1, x1);
+            }
+        });
+        let xi = x.i.add(sb * 8);
+        let (xi0, xi1) = (vld1q_s32(xi), vld1q_s32(xi.add(4)));
+        let xs = x.s.add(sb * 8);
+        let (xs0, xs1) = (vld1q_f32(xs), vld1q_f32(xs.add(4)));
+        for r in 0..R {
+            let a = &s[r];
+            let g0 = vpaddq_s32(vpaddq_s32(a[0], a[1]), vpaddq_s32(a[2], a[3]));
+            let g1 = vpaddq_s32(vpaddq_s32(a[4], a[5]), vpaddq_s32(a[6], a[7]));
+            // Scales 2 ((qh >> 12) & 7) + 1 and deltas -1 / +1 (bit 15) of the eight blocks.
+            let qh = vld1q_u16(b[r].add(34) as *const u16);
+            let sc = vorrq_u16(vshlq_n_u16::<1>(vandq_u16(vshrq_n_u16::<12>(qh), m7)), one);
+            let dl = vorrq_s16(vshrq_n_s16::<15>(vreinterpretq_s16_u16(qh)), vdupq_n_s16(1));
+            let sc = vreinterpretq_s16_u16(sc);
+            let (sc0, sc1) = (vmovl_s16(vget_low_s16(sc)), vmovl_high_s16(sc));
+            let (dl0, dl1) = (vmovl_s16(vget_low_s16(dl)), vmovl_high_s16(dl));
+            let a0 = vmulq_s32(vmlaq_n_s32(vmulq_s32(dl0, xi0), g0, 8), sc0);
+            let a1 = vmulq_s32(vmlaq_n_s32(vmulq_s32(dl1, xi1), g1, 8), sc1);
+            let d = vdupq_n_f32(f16p(b[r]) * 0.125);
+            let v = vfmaq_f32(acc[r], vcvtq_f32_s32(a0), vmulq_f32(d, xs0));
+            acc[r] = vfmaq_f32(v, vcvtq_f32_s32(a1), vmulq_f32(d, xs1));
+        }
+    }
+    finish(acc)
+}
+
+/// The 16 IQ1_M sub-block scales `2 s + 1` of a block (3 bits each, four per u16 word at bits 0,
+/// 3, 6 and 9 of the words at `b + 48`).
+#[inline(always)]
+unsafe fn iq1m_scales(b: *const u8) -> int8x16_t {
+    const IDX: [u8; 32] = [
+        0, 1, 0, 1, 0, 1, 0, 1, 2, 3, 2, 3, 2, 3, 2, 3, 4, 5, 4, 5, 4, 5, 4, 5, 6, 7, 6, 7, 6, 7, 6, 7,
+    ];
+    const SH: [i16; 8] = [0, -3, -6, -9, 0, -3, -6, -9];
+    let v = vcombine_u8(vld1_u8(b.add(48)), vdup_n_u8(0));
+    let sh = vld1q_s16(SH.as_ptr());
+    let m7 = vdupq_n_u16(7);
+    let lo = vandq_u16(vshlq_u16(vreinterpretq_u16_u8(vqtbl1q_u8(v, vld1q_u8(IDX.as_ptr()))), sh), m7);
+    let hi = vandq_u16(
+        vshlq_u16(vreinterpretq_u16_u8(vqtbl1q_u8(v, vld1q_u8(IDX.as_ptr().add(16)))), sh),
+        m7,
+    );
+    let s = vuzp1q_u8(vreinterpretq_u8_u16(lo), vreinterpretq_u8_u16(hi));
+    vreinterpretq_s8_u8(vorrq_u8(vshlq_n_u8::<1>(s), vdupq_n_u8(1)))
+}
+
+/// One-token IQ1_M rows, `R` at a time: `sb16::<1, Iq1M>` of each row, bit for bit. Per 16 values
+/// `sum((8 g + delta) x)` is `8 sum(g x) + delta_lo sum8_lo(x) + delta_hi sum8_hi(x)`: the ternary
+/// grid entries go straight into the dot products and the deltas weigh the activations' sums of 8
+/// (formed once for the `R` rows), so the integer sums per 32 equal `sums16`'s; the float steps
+/// are `sb16`'s.
+#[inline(always)]
+unsafe fn iq1m_rows<const R: usize>(rows: [*const u8; R], n_in: usize, x: &Act) -> [f32; R] {
+    use super::tables::IQ1S_GRID as G;
+    let gp = G.as_ptr();
+    let mut acc = [vdupq_n_f32(0.0); R];
+    let zero = vdupq_n_s32(0);
+    for sb in 0..n_in / QK_K {
+        let xq = x.q.add(sb * QK_K);
+        let mut b = [std::ptr::null::<u8>(); R];
+        let mut qw = [[0u64; 4]; R];
+        let mut hw = [[0u64; 2]; R];
+        let mut scd = [[vdupq_n_s16(0); 4]; R];
+        let mut sc32 = [[zero; 4]; R];
+        let mut d = [vdupq_n_f32(0.0); R];
+        for r in 0..R {
+            let br = rows[r].add(sb * 56);
+            b[r] = br;
+            for i in 0..4 {
+                qw[r][i] = rd64(br.add(8 * i));
+            }
+            hw[r] = [rd64(br.add(32)), rd64(br.add(40))];
+            let s = [rd16(br.add(48)), rd16(br.add(50)), rd16(br.add(52)), rd16(br.add(54))];
+            let dh = f16_to_f32((s[0] >> 12) | ((s[1] >> 8) & 0x00f0) | ((s[2] >> 4) & 0x0f00) | (s[3] & 0xf000));
+            d[r] = vdupq_n_f32(dh * 0.125);
+            let sc = iq1m_scales(br);
+            sc32[r] = s8x16_to_s32(sc);
+            // Scale times delta sign per 8 values (sub-block k's halves at 2k, 2k + 1).
+            let qh = vld1q_u8(br.add(32));
+            let (mlo, mhi) = (vtstq_u8(qh, vdupq_n_u8(0x08)), vtstq_u8(qh, vdupq_n_u8(0x80)));
+            let (m0, m1) = (vzip1q_u8(mlo, mhi), vzip2q_u8(mlo, mhi));
+            let scu = vreinterpretq_u8_s8(sc);
+            let (s0, s1) = (vzip1q_u8(scu, scu), vzip2q_u8(scu, scu));
+            let v0 = vreinterpretq_s8_u8(vsubq_u8(veorq_u8(s0, m0), m0));
+            let v1 = vreinterpretq_s8_u8(vsubq_u8(veorq_u8(s1, m1), m1));
+            scd[r] = [
+                vmovl_s8(vget_low_s8(v0)),
+                vmovl_high_s8(v0),
+                vmovl_s8(vget_low_s8(v1)),
+                vmovl_high_s8(v1),
+            ];
+        }
+        let mut gs = [[zero; 4]; R];
+        let mut ds = [[zero; 4]; R];
+        unroll4!(g, 0, {
+            let xv = [
+                vld1q_s8(xq.add(64 * g)),
+                vld1q_s8(xq.add(64 * g + 16)),
+                vld1q_s8(xq.add(64 * g + 32)),
+                vld1q_s8(xq.add(64 * g + 48)),
+            ];
+            // Sums of 8 of these 64 activations, in order.
+            let p = [vpaddlq_s8(xv[0]), vpaddlq_s8(xv[1]), vpaddlq_s8(xv[2]), vpaddlq_s8(xv[3])];
+            let s8 = vpaddq_s16(vpaddq_s16(p[0], p[1]), vpaddq_s16(p[2], p[3]));
+            for r in 0..R {
+                let mut pr = [zero; 4];
+                for j in 0..4 {
+                    let k = 4 * g + j;
+                    let q2 = (qw[r][k / 4] >> (16 * (k % 4))) as usize;
+                    let qh = (hw[r][k / 8] >> (8 * (k % 8))) as usize;
+                    let e0 = gp.add((q2 & 255) | ((qh << 8) & 0x700));
+                    let e1 = gp.add(((q2 >> 8) & 255) | ((qh << 4) & 0x700));
+                    let w = vreinterpretq_s8_u64(vcombine_u64(vld1_u64(e0), vld1_u64(e1)));
+                    pr[j] = sdot(zero, w, xv[j]);
+                }
+                gs[r][g] = vmulq_s32(vpaddq_s32(vpaddq_s32(pr[0], pr[1]), vpaddq_s32(pr[2], pr[3])), sc32[r][g]);
+                ds[r][g] = vpaddlq_s16(vmulq_s16(scd[r][g], s8));
+            }
+        });
+        let xs = x.s.add(sb * 8);
+        let (xs0, xs1) = (vld1q_f32(xs), vld1q_f32(xs.add(4)));
+        for r in 0..R {
+            let (g, e) = (&gs[r], &ds[r]);
+            let a0 = vaddq_s32(vshlq_n_s32::<3>(vpaddq_s32(g[0], g[1])), vpaddq_s32(e[0], e[1]));
+            let a1 = vaddq_s32(vshlq_n_s32::<3>(vpaddq_s32(g[2], g[3])), vpaddq_s32(e[2], e[3]));
+            let v = vfmaq_f32(acc[r], vcvtq_f32_s32(a0), vmulq_f32(d[r], xs0));
+            acc[r] = vfmaq_f32(v, vcvtq_f32_s32(a1), vmulq_f32(d[r], xs1));
+        }
+    }
+    finish(acc)
+}
+
+/// `KSIGNS64` as bytes of +1 / -1 (a sign pattern multiplies the grid values).
+static KSIGNS_PM: [u64; 128] = {
+    let mut t = [0u64; 128];
+    let mut i = 0usize;
+    while i < 128 {
+        t[i] = KSIGNS64[i] | 0x0101_0101_0101_0101;
+        i += 1;
+    }
+    t
+};
+
+/// One-token IQ2_XXS rows, `R` at a time: `sb16::<1, Iq2Xxs>` of each row, bit for bit. The scale
+/// is per 32, so each 32 takes one SDOT chain and its scale once (the integer sums equal
+/// `sums16`'s with equal scales on both halves); the signs multiply the grid values (+1 / -1
+/// bytes); the activation vectors are loaded once for the `R` rows.
+#[inline(always)]
+unsafe fn iq2xxs_rows<const R: usize>(rows: [*const u8; R], n_in: usize, x: &Act) -> [f32; R] {
+    use super::tables::IQ2XXS_GRID as G;
+    let gp = G.as_ptr();
+    let kp = KSIGNS_PM.as_ptr();
+    let mut acc = [vdupq_n_f32(0.0); R];
+    let zero = vdupq_n_s32(0);
+    for sb in 0..n_in / QK_K {
+        let xq = x.q.add(sb * QK_K);
+        let mut b = [std::ptr::null::<u8>(); R];
+        for r in 0..R {
+            b[r] = rows[r].add(sb * 66);
+        }
+        let mut s = [[zero; 8]; R];
+        unroll8!(ib, {
+            let (x0, x1) = (vld1q_s8(xq.add(32 * ib)), vld1q_s8(xq.add(32 * ib + 16)));
+            for r in 0..R {
+                let q = rd64(b[r].add(2 + 8 * ib));
+                let (a0, a1) = (q as usize, (q >> 32) as usize);
+                let g = |l: usize| gp.add((a0 >> (8 * l)) & 255);
+                let k = |l: usize| kp.add((a1 >> (7 * l)) & 127);
+                let ld = |p: *const u64, p2: *const u64| vreinterpretq_s8_u64(vcombine_u64(vld1_u64(p), vld1_u64(p2)));
+                let (g0, g1) = (ld(g(0), g(1)), ld(g(2), g(3)));
+                let (k0, k1) = (ld(k(0), k(1)), ld(k(2), k(3)));
+                let (w0, w1) = (vmulq_s8(g0, k0), vmulq_s8(g1, k1));
+                s[r][ib] = sdot(sdot(zero, w0, x0), w1, x1);
+            }
+        });
+        let xs = x.s.add(sb * 8);
+        let (xs0, xs1) = (vld1q_f32(xs), vld1q_f32(xs.add(4)));
+        for r in 0..R {
+            let a = &s[r];
+            let g0 = vpaddq_s32(vpaddq_s32(a[0], a[1]), vpaddq_s32(a[2], a[3]));
+            let g1 = vpaddq_s32(vpaddq_s32(a[4], a[5]), vpaddq_s32(a[6], a[7]));
+            // Scales 2 (aux >> 28) + 1 of the eight blocks (the second word of each).
+            let w = vld2q_u32_x2(b[r].add(2) as *const u32);
+            let one = vdupq_n_u32(1);
+            let sc0 = vreinterpretq_s32_u32(vorrq_u32(vshlq_n_u32::<1>(vshrq_n_u32::<28>(w.0.1)), one));
+            let sc1 = vreinterpretq_s32_u32(vorrq_u32(vshlq_n_u32::<1>(vshrq_n_u32::<28>(w.1.1)), one));
+            let (a0, a1) = (vmulq_s32(g0, sc0), vmulq_s32(g1, sc1));
+            let d = vdupq_n_f32(f16p(b[r]) * 0.125);
+            let v = vfmaq_f32(acc[r], vcvtq_f32_s32(a0), vmulq_f32(d, xs0));
+            acc[r] = vfmaq_f32(v, vcvtq_f32_s32(a1), vmulq_f32(d, xs1));
+        }
+    }
+    finish(acc)
+}
+
+/// Two `vld2q_u32` of 32 bytes each from `p` (the words of 8 blocks of 8 bytes, deinterleaved).
+#[inline(always)]
+unsafe fn vld2q_u32_x2(p: *const u32) -> ((uint32x4_t, uint32x4_t), (uint32x4_t, uint32x4_t)) {
+    let a = vld2q_u32(p);
+    let b = vld2q_u32(p.add(8));
+    ((a.0, a.1), (b.0, b.1))
 }
 
 /// IQ1_M: like IQ1_S with the delta sign per 8 values, 3-bit scales per 16 and the f16 super-block
@@ -2474,6 +2744,48 @@ unsafe fn deq_iq4xs(row: *const u8, n: usize, out: *mut f32) {
             let o = out.add(sb * QK_K + 32 * ib);
             st16(o, vqtbl1q_s8(kv, vandq_u8(v, m4)), dl);
             st16(o.add(16), vqtbl1q_s8(kv, vshrq_n_u8::<4>(v)), dl);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ggml::random_blocks;
+
+    /// The one-token kernels that take several rows at a time give each row bit for bit the
+    /// one-row kernel's result (which the multi-token kernels also reproduce), on row ranges of
+    /// every parity, and agree with the portable scalar dot product.
+    #[test]
+    fn row_group_kernels_match_one_row_kernels() {
+        for kind in [GgmlType::IQ1_S, GgmlType::IQ1_M, GgmlType::IQ2_XXS] {
+            let (n_out, n_in) = (11usize, 3 * QK_K);
+            let mut seed = 101 + kind.id() as u64;
+            let m = GgufMatrix::from_bytes(kind, &random_blocks(kind, n_out * n_in / QK_K, &mut seed), n_out, n_in).unwrap();
+            let x: Vec<f32> = (0..n_in).map(|i| ((i * 7919 + 13) % 2001) as f32 / 1000.0 - 1.0).collect();
+            let xa = crate::quant::quantize_act(&x, 1, n_in);
+            let act = Act::new(&xa, 0);
+            let one: RowFn<1> = match kind {
+                GgmlType::IQ1_S => iq1s::<1>,
+                GgmlType::IQ1_M => sb16::<1, Iq1M>,
+                _ => sb16::<1, Iq2Xxs>,
+            };
+            let want: Vec<u32> = (0..n_out)
+                .map(|r| unsafe { one(m.row(r).as_ptr(), n_in, &act)[0].to_bits() })
+                .collect();
+            for split in [0, 1, 4, 7, n_out] {
+                let mut y = vec![f32::NAN; n_out];
+                unsafe {
+                    assert!(rows_t1(&m, &act, y.as_mut_ptr(), 0, split));
+                    assert!(rows_t1(&m, &act, y.as_mut_ptr(), split, n_out));
+                }
+                let got: Vec<u32> = y.iter().map(|v| v.to_bits()).collect();
+                assert_eq!(got, want, "{kind} split {split}");
+                for (r, &v) in y.iter().enumerate() {
+                    let p = unsafe { super::super::dot_row_generic::<1>(kind, m.row(r), &act)[0] };
+                    assert!((v - p).abs() <= 1e-4 * (1.0 + p.abs()), "{kind} row {r}: {v} vs portable {p}");
+                }
+            }
         }
     }
 }
