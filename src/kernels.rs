@@ -1315,6 +1315,26 @@ pub mod simd {
     }
 }
 
+/// The kernels a language model's prompt takes on this CPU, for `--devices` (aarch64 Linux,
+/// where the choice follows the CPU's features).
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+pub fn kernels_summary() -> String {
+    let int8 = if i8gemm::mmla() {
+        "int8 GEMM on SMMLA (i8mm), column-blocked"
+    } else if i8gemm::tuning().0 > 0 {
+        "int8 GEMM on SDOT, column-blocked"
+    } else {
+        "int8 GEMM on SDOT"
+    };
+    let sme = if sme_available() { "SME f32 GEMM beside the " } else { "" };
+    let attn = if attn_neon() {
+        "per-head NEON loop"
+    } else {
+        "score and value GEMMs"
+    };
+    format!("prompt matmuls: {sme}{int8}; prompt attention: {attn}")
+}
+
 /// For measurements: `OXINFER_ATTN_UNBLOCKED=1` runs a prompt chunk's attention loop one
 /// (token, KV head) at a time instead of `model::attention_blocked` (the same bits).
 #[cfg(target_arch = "aarch64")]

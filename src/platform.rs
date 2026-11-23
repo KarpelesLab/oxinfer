@@ -334,6 +334,8 @@ impl Platform {
             "  kernels: {} (OXINFER_SIMD=scalar selects the fallbacks)",
             crate::kernels::simd::level_name()
         );
+        #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+        let _ = writeln!(s, "  kernels: {}", crate::kernels::kernels_summary());
         if let Some(m) = self.cpu.memory_bytes {
             let _ = writeln!(s, "  memory: {:.1} GB", m as f64 / 1e9);
         }
