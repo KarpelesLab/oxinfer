@@ -2371,6 +2371,8 @@ impl Engine {
         }
         let el = [4usize, 2, 1][ds.fmt as usize];
         let mode = [KvCache::F32, KvCache::F16, KvCache::Q8][ds.fmt as usize];
+        let t0 = std::time::Instant::now();
+        let mut moved = 0usize;
         for ((hs, d), &li) in sess.layers.iter_mut().zip(&ds.slots).zip(&slot_layer) {
             let kw = d.kw;
             for (i, hp) in d.hist.iter().enumerate() {
@@ -2386,6 +2388,9 @@ impl Engine {
                 let mut kr = KvRows::new(mode);
                 let mut raw = vec![0u8; n * kw * el];
                 let mut sc = vec![0f32; if mode == KvCache::Q8 { n * kw / 32 } else { 0 }];
+                // (Fresh buffers: `cuda::touch_before_download`.)
+                crate::cuda::touch_before_download(&mut raw);
+                crate::cuda::touch_before_download(&mut sc);
                 for (p0, p1) in runs(first, pos, d.cap) {
                     let (r, at, c) = (p0 - first, p0 % d.cap, p1 - p0);
                     unsafe {
@@ -2415,6 +2420,7 @@ impl Engine {
             };
             let k = rows_of(d.k, d.ks);
             let v = rows_of(d.v, d.vs);
+            moved += 2 * n * kw * el;
             *hs = LayerState {
                 k,
                 v,
@@ -2422,6 +2428,11 @@ impl Engine {
                 hist: std::mem::take(&mut hs.hist),
             };
         }
+        debug(&format!(
+            "a session of {pos} positions back on the host: {:.0} MB of caches in {:.2} s",
+            moved as f64 / 1e6,
+            t0.elapsed().as_secs_f64()
+        ));
     }
 
     /// Runs `x` (`[t, hidden]`) through the device session of `sess`.
@@ -2456,7 +2467,10 @@ impl Engine {
             }
         }
         let ar = self.arena.lock().unwrap();
+        // (A fresh buffer: on a unified-memory device the driver fills pages that are not in the
+        // page table yet many times slower, `cuda::touch_before_download`.)
         let mut out = vec![0f32; t * h];
+        crate::cuda::touch_before_download(&mut out);
         let mut done = 0;
         while done < t {
             let n = (t - done).min(CHUNK);
@@ -2492,6 +2506,7 @@ impl Engine {
                 self.pass(m, &ar, ds, n, capture);
             }
             let mut cap = vec![0f32; if feats.is_some() { nf * n * h } else { 0 }];
+            crate::cuda::touch_before_download(&mut cap);
             unsafe {
                 self.x
                     .cuMemcpyDtoHAsync_v2(out[done * h..].as_mut_ptr() as *mut c_void, ar.out, n * h * 4, self.stream);
@@ -2545,6 +2560,7 @@ impl Engine {
         assert!(unsafe { self.x.cuCtxSetCurrent(self.ctx) } == 0, "inkling cuda: context");
         let ar = self.arena.lock().unwrap();
         let mut out = vec![0f32; t * u];
+        crate::cuda::touch_before_download(&mut out);
         let mut done = 0;
         while done < t {
             let n = (t - done).min(16);

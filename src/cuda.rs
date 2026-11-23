@@ -714,6 +714,27 @@ fn touch_pages_mut(dst: &mut [f32]) {
     });
 }
 
+/// The same as [`touch_pages_mut`] before a download by an engine with driver bindings of its own
+/// (the Inkling-2 engine's hidden states and logits of a prompt, a session's caches going back to
+/// the host), on a unified-memory device and for buffers of 1 MB and more: smaller ones are a
+/// decode step's, whose memory the allocator hands back with its pages in place.
+pub(crate) fn touch_before_download<T: Copy>(dst: &mut [T]) {
+    let bytes = std::mem::size_of_val(dst);
+    if !integrated() || bytes < (1 << 20) {
+        return;
+    }
+    const PIECE: usize = 4 << 20;
+    let base = dst.as_mut_ptr() as usize;
+    crate::pool::run(bytes.div_ceil(PIECE), &|i| {
+        for at in (i * PIECE..((i + 1) * PIECE).min(bytes)).step_by(4096) {
+            let p = (base + at) as *mut u8;
+            // SAFETY: inside `dst`, which this call holds exclusively; pieces are disjoint, and
+            // a byte of a `Copy` value is written back as it was read.
+            unsafe { std::ptr::write_volatile(p, std::ptr::read_volatile(p)) };
+        }
+    });
+}
+
 #[derive(Default)]
 struct Staging {
     x: u64,
