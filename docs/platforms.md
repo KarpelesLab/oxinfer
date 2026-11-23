@@ -323,7 +323,11 @@ IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4. Three things run on the
   Prompts on an idle GPU (median of 5), 128-row / 256-row tiles: Qwen3-8B Q4_K_M 11242 / 12315
   tok/s at 512 tokens and 10777 / 12043 at 2048, Llama-3.2-1B Q4_K_M 50230 / 56789 and 50713 /
   55369; the first step within 0.005-0.0075 of the exact GEMM's log-probabilities and the
-  greedy tokens the same (`pf_check`, 1500 tokens, 32 greedy). RMSNorm, RoPE, the
+  greedy tokens the same (`pf_check`, 1500 tokens, 32 greedy). Every thread of a block unpacks
+  weights (four a row in the 512-thread 256-row kernel and the 64 x 64 one, eight values each:
+  half the threads did before; Q4_K 4096 x 12288 231 -> 197 us, Q6_K 222 -> 215 and 214 -> 206),
+  and GEMMs of one input (q / k / v, gate / up) convert it to f16 once (the logits do not
+  change). RMSNorm, RoPE, the
   activations, the Gated DeltaNet convolution and delta rule (the state in registers across the
   step's tokens) over all tokens in one launch; attention with the decode kernel, 32 tokens per
   launch; the hidden states, the new keys and values and the recurrent states come back to the

@@ -1614,6 +1614,65 @@ __device__ __forceinline__ void dq16h(const u8* row, u32 b, u32 h, u32* q) {
     }
 }
 
+// `dq16h` for a quarter of the block: elements 8 qd .. 8 qd + 7 as 4 half2.
+template <int K>
+__device__ __forceinline__ void dq8h(const u8* row, u32 b, u32 qd, u32* q) {
+    if constexpr (K == K_Q4_K) {
+        const u8* B = row + 144 * (b >> 3);
+        u32 sub = b & 7;
+        uint4 hd = *(const uint4*)B;
+        u32 sh8 = 8 * (sub & 3), sc, mn;
+        if (sub < 4) {
+            sc = (hd.y >> sh8) & 63;
+            mn = (hd.z >> sh8) & 63;
+        } else {
+            u32 c = hd.w >> sh8;
+            sc = (c & 15) | (((hd.y >> sh8) >> 6 & 3) << 4);
+            mn = ((c >> 4) & 15) | (((hd.z >> sh8) >> 6 & 3) << 4);
+        }
+        float d1 = h2f(hd.x & 0xffff) * (float)sc, m1 = h2f(hd.x >> 16) * (float)mn;
+        u32 dd = pack_h2(d1, d1), mm = pack_h2(-m1, -m1);
+        uint2 u = *(const uint2*)(B + 16 + 32 * (sub >> 1) + 8 * qd);
+        u32 ws[2] = {u.x, u.y};
+        u32 sh = 4 * (sub & 1);
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            u32 lo, hi;
+            bytes_h2((ws[i] >> sh) & 0x0f0f0f0fu, 0x64006400u, lo, hi);
+            q[2 * i] = h2fma(lo, dd, mm);
+            q[2 * i + 1] = h2fma(hi, dd, mm);
+        }
+    } else if constexpr (K == K_Q6_K) {
+        const u8* B = row + 210 * (b >> 3);
+        u32 sub = b & 7, n = sub >> 2, qq = sub & 3;
+        float d = h2f(rd16(B + 208)) * (float)(signed char)B[192 + 8 * n + 2 * qq + (qd >> 1)];
+        u32 dd = pack_h2(d, d);
+        const u8* pl = B + 64 * n + 32 * (qq & 1) + 8 * qd;
+        const u8* ph = B + 128 + 32 * n + 8 * qd;
+        u32 fs = 8 * ((u32)(u64)pl & 2);
+        const u32* la = (const u32*)((u64)pl & ~(u64)3);
+        const u32* ha = (const u32*)((u64)ph & ~(u64)3);
+        u32 lw[3] = {la[0], la[1], la[2]}, hw[3] = {ha[0], ha[1], ha[2]};
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            u32 ul = __funnelshift_r(lw[i], lw[i + 1], fs) >> (4 * (qq >> 1));
+            u32 uh = __funnelshift_r(hw[i], hw[i + 1], fs) >> (2 * qq);
+            u32 v = (ul & 0x0f0f0f0fu) | ((uh & 0x03030303u) << 4);
+            u32 lo, hi;
+            bytes_h2(v, 0x64206420u, lo, hi);
+            q[2 * i] = h2mul(lo, dd);
+            q[2 * i + 1] = h2mul(hi, dd);
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            float4 v = dq<K>(row, b, 2 * qd + i);
+            q[2 * i] = pack_h2(v.x, v.y);
+            q[2 * i + 1] = pack_h2(v.z, v.w);
+        }
+    }
+}
+
 // BM rows x BN outputs per block (128 x 128, 64 x 128 or 64 x 64: the launch picks the largest
 // that still fills the GPU, `gemmh_tile` in `cuda.rs`); 8 warps, 2 along the rows and 4 along the
 // outputs. Two 128 x 128 blocks per SM (`__launch_bounds__(256, 2)`: Qwen3-8B Q4_K_M prompts
@@ -1654,7 +1713,9 @@ __device__ __forceinline__ void gemmh_seg(const W& w, const GemmH& p, u32 m0, u3
         xa[i] = p.xh + (u64)min(m0 + ar + RP * i, p.rows - 1) * p.xs + ac;
         aok[i] = m0 + ar + RP * i < p.rows;
     }
-    u32 br = tid >> 1, bh = tid & 1;
+    // Weights: TPR threads per row, VPT values of the step's block of 32 each.
+    constexpr u32 TPR = NTH / BN >= 4 ? 4 : 2, VPT = 32 / TPR;
+    u32 br = tid / TPR, bh = tid % TPR;
     bool bthr = br < BN;
     u32 wr = n0 + br;
     bool bok = bthr && wr < p.n_out;
@@ -1664,23 +1725,25 @@ __device__ __forceinline__ void gemmh_seg(const W& w, const GemmH& p, u32 m0, u3
         for (int i = 0; i < BM / RP; i++) cp16(&As[st][(ar + RP * i) * HLD + ac], xa[i] + 32 * b, aok[i]);
         asm volatile("cp.async.commit_group;");
     };
-    u32 bq[8];
+    u32 bq[VPT / 2];
     auto load_b = [&](u32 b) {
         if (!bok) {
 #pragma unroll
-            for (int i = 0; i < 8; i++) bq[i] = 0u;
+            for (int i = 0; i < VPT / 2; i++) bq[i] = 0u;
             return;
         }
         if constexpr (BLOCK_SCALED(K)) {
             float sc = w.s[(wr / w.sr) * w.ncb + (32 * b) / w.sc];
 #pragma unroll
-            for (int i = 0; i < 4; i++) {
-                float4 v = dq<K>(wrow, b, 4 * bh + i);
+            for (int i = 0; i < VPT / 4; i++) {
+                float4 v = dq<K>(wrow, b, (VPT / 4) * bh + i);
                 bq[2 * i] = pack_h2(v.x * sc, v.y * sc);
                 bq[2 * i + 1] = pack_h2(v.z * sc, v.w * sc);
             }
-        } else {
+        } else if constexpr (TPR == 2) {
             dq16h<K>(wrow, b, bh, bq);
+        } else {
+            dq8h<K>(wrow, b, bh, bq);
         }
     };
     // The next step's weight bytes into L1 before the current step's MMAs, so that its
@@ -1690,14 +1753,14 @@ __device__ __forceinline__ void gemmh_seg(const W& w, const GemmH& p, u32 m0, u3
         constexpr u32 G = qgroup<K>(), GB = qgbytes<K>();
         if (b % G != 0 && b != 0) return;
         const u8* g0 = wrow + (u64)(b / G) * GB;
-        for (u32 o = 64 * bh; o < GB; o += 128) prefetch_l1(g0 + o);
-        if (bh) prefetch_l1(g0 + GB - 1);
+        for (u32 o = 128 * bh; o < GB; o += 128 * TPR) prefetch_l1(g0 + o);
+        if (bh == TPR - 1) prefetch_l1(g0 + GB - 1);
     };
     auto store_b = [&](u32 st) {
         if (!bthr) return;
-        uint4* d = (uint4*)&Bs[st][br * HLD + 16 * bh];
-        d[0] = make_uint4(bq[0], bq[1], bq[2], bq[3]);
-        d[1] = make_uint4(bq[4], bq[5], bq[6], bq[7]);
+        uint4* d = (uint4*)&Bs[st][br * HLD + VPT * bh];
+#pragma unroll
+        for (int i = 0; i < VPT / 8; i++) d[i] = make_uint4(bq[4 * i], bq[4 * i + 1], bq[4 * i + 2], bq[4 * i + 3]);
     };
     float acc[MT][NT][4];
 #pragma unroll

@@ -474,6 +474,9 @@ pub(super) struct CudaPlan<'b> {
     /// The x those rows hold (address, floats apart, width, tokens), while no op since has
     /// written it: the q / k / v matvecs of a layer round their input once.
     q8_last: std::cell::Cell<(u64, u32, u32, u32)>,
+    /// The same for the fast GEMM's f16 rows (`PfFuncs::xh`): q / k / v and gate / up convert
+    /// their input once.
+    xh_last: std::cell::Cell<(u64, u32, u32, u32)>,
     /// Prefill plans: each cache's new keys and values go down on a stream of their own as soon
     /// as the op writing them last has run (per cache, an event when written and one when
     /// landed in `kv_pinned`), and a host thread stages them into the host caches under the
@@ -1557,6 +1560,7 @@ impl CudaBackend {
                 (0, 0)
             },
             q8_last: Default::default(),
+            xh_last: Default::default(),
             kv_stream: {
                 let mut st: *mut c_void = std::ptr::null_mut();
                 if !kv_async || unsafe { self.cu.cuStreamCreate(&mut st, 1) } != 0 {
@@ -2022,20 +2026,25 @@ impl CudaPlan<'_> {
                         ys: st(y),
                         mode,
                     };
+                    let key = (xa, xs, n_in, tt);
+                    let fresh = self.xh_last.get() == key;
+                    self.xh_last.set(key);
                     return Some(
-                        be.launch(
-                            pf.half,
-                            ((n_in / 2).div_ceil(256).min(8), tt),
-                            256,
-                            &mut args![xa, n_in, xs, xh, flag],
-                        ) && if let Some((f, g, threads, bm, shm)) = super::gemmh_stream_k(&k, n_out, tt, n_in) {
-                            let fix = pf.fix;
-                            be.launch_shm(f, (g, 1, 1), threads, shm, &mut args![w, p, fix])
-                                && be.launch(k.gemmhk_fix, (g, bm / 8), 256, &mut args![p, fix, bm])
-                        } else {
-                            let (f, bm, bn) = super::gemmh_tile(&k, n_out, tt);
-                            be.launch(f, (n_out.div_ceil(bn), tt.div_ceil(bm)), 256, &mut args![w, p])
-                        },
+                        (fresh
+                            || be.launch(
+                                pf.half,
+                                ((n_in / 2).div_ceil(256).min(8), tt),
+                                256,
+                                &mut args![xa, n_in, xs, xh, flag],
+                            ))
+                            && if let Some((f, g, threads, bm, shm)) = super::gemmh_stream_k(&k, n_out, tt, n_in) {
+                                let fix = pf.fix;
+                                be.launch_shm(f, (g, 1, 1), threads, shm, &mut args![w, p, fix])
+                                    && be.launch(k.gemmhk_fix, (g, bm / 8), 256, &mut args![p, fix, bm])
+                            } else {
+                                let (f, bm, bn) = super::gemmh_tile(&k, n_out, tt);
+                                be.launch(f, (n_out.div_ceil(bn), tt.div_ceil(bm)), 256, &mut args![w, p])
+                            },
                     );
                 }
                 if !be.launch(pf.guard, (n_in.div_ceil(256).min(8), tt), 256, &mut args![xa, n_in, xs, flag]) {
@@ -2383,6 +2392,7 @@ impl DecodePlan for CudaPlan<'_> {
         let per_op = tr && std::env::var("OXINFER_CUDA_DECODE_TRACE").is_ok_and(|v| v == "2");
         let mut kinds: std::collections::BTreeMap<&str, (usize, f64)> = Default::default();
         self.q8_last.set(Default::default());
+        self.xh_last.set(Default::default());
         // The new keys and values down under the later layers' kernels (prefill plans).
         let row_floats: usize = self.kv.iter().map(|&(n, hd)| n * hd).sum();
         let mut stager = (!self.kv_stream.is_null()
@@ -2425,18 +2435,21 @@ impl DecodePlan for CudaPlan<'_> {
             let ts = std::time::Instant::now();
             if !matches!(op, COp::Gmv { .. }) {
                 self.q8_last.set(Default::default());
+                self.xh_last.set(Default::default());
             }
             if !self.launch_tokens(op, ms, t) {
                 debug(&format!("step of {t} token(s): op {i} of {} did not launch", self.ops.len()));
                 return false;
             }
-            // A matvec writing into the rounded x's rows makes them stale.
+            // A matvec writing into the rounded / converted x's rows makes them stale.
             if let COp::Gmv { y, n_out, .. } = *op {
-                let (x0, xs, n, tt) = self.q8_last.get();
-                let x1 = x0 + 4 * ((tt.max(1) as u64 - 1) * xs as u64 + n as u64);
                 let y1 = y.a + (t as u64 - 1) * y.ts + 4 * n_out as u64;
-                if y.a < x1 && x0 < y1 {
-                    self.q8_last.set(Default::default());
+                for c in [&self.q8_last, &self.xh_last] {
+                    let (x0, xs, n, tt) = c.get();
+                    let x1 = x0 + 4 * ((tt.max(1) as u64 - 1) * xs as u64 + n as u64);
+                    if y.a < x1 && x0 < y1 {
+                        c.set(Default::default());
+                    }
                 }
             }
             if per_op {
