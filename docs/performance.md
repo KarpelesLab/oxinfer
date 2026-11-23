@@ -1839,8 +1839,9 @@ Llama 3.2 1B Q4_K_M and Q8_0, Qwen3-8B Q4_K_M and Gemma 4 26B-A4B Q4_0.
 Measured and dropped:
 
 - Q4_K's eight sub-block sums first and its scales after (fewer live vectors, the loop over the
-  four chunks unrolled so the sums stay in registers): no faster (39.4-39.9 against 39.7-40.3
-  GB/s); the spills it removed were loads and stores, which are not the limit.
+  four chunks unrolled so the sums stay in registers; the form kept, as it reads more simply):
+  no faster (39.4-39.9 against 39.7-40.3 GB/s); the spills it removed were loads and stores,
+  which are not the limit.
 - The Q4_0 chains starting from `-8` times the block sum as well: 1-3% slower (51.5-52.7
   against 52.6-54.6 GB/s); its subtraction was one instruction per block of four rows.
 - What Q4_K's scales cost: without them (wrong results, timing only) the kernel reads 64-66 GB/s
