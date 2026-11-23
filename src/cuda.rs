@@ -116,6 +116,7 @@ dlsym::library! {
             pub fn cuStreamWaitEvent(stream: *mut c_void, event: *mut c_void, flags: u32) -> c_int;
             pub fn cuEventCreate(event: *mut *mut c_void, flags: u32) -> c_int;
             pub fn cuEventRecord(event: *mut c_void, stream: *mut c_void) -> c_int;
+            pub fn cuEventSynchronize(event: *mut c_void) -> c_int;
             pub fn cuMemcpyDtoHAsync_v2(dst: *mut c_void, src: u64, bytes: usize, stream: *mut c_void) -> c_int;
             pub fn cuMemGetInfo_v2(free: *mut usize, total: *mut usize) -> c_int;
             pub fn cuLaunchKernel(

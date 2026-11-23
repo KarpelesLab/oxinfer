@@ -474,6 +474,75 @@ pub(super) struct CudaPlan<'b> {
     /// The x those rows hold (address, floats apart, width, tokens), while no op since has
     /// written it: the q / k / v matvecs of a layer round their input once.
     q8_last: std::cell::Cell<(u64, u32, u32, u32)>,
+    /// Prefill plans: each cache's new keys and values go down on a stream of their own as soon
+    /// as the op writing them last has run (per cache, an event when written and one when
+    /// landed in `kv_pinned`), and a host thread stages them into the host caches under the
+    /// later layers' kernels ([`KvStager`]); null when off.
+    kv_stream: *mut c_void,
+    kv_events: Vec<(*mut c_void, *mut c_void)>,
+    /// Per op: the caches it writes last.
+    kv_writer: Vec<Vec<usize>>,
+}
+
+/// Floats of new keys and values from which a step stages them under its kernels (tests: the
+/// small models of `cuda::tests` too).
+const KV_ASYNC_MIN: usize = if cfg!(test) { 1 << 11 } else { 1 << 17 };
+
+/// The host thread of a prefill step that copies each cache's new rows from the pinned buffer
+/// into the host cache's staged room once its transfer has landed (caches sent in order by the
+/// step); dropping it waits for every copy.
+struct KvStager {
+    tx: Option<std::sync::mpsc::Sender<usize>>,
+    handle: Option<std::thread::JoinHandle<bool>>,
+}
+
+impl KvStager {
+    /// `jobs[c]`: (landed event, source keys, source values, destination keys, destination
+    /// values, floats each), addresses as integers (the buffers outlive the stager: the step
+    /// joins it before returning).
+    fn new(be: &CudaBackend, jobs: Vec<(usize, usize, usize, usize, usize, usize)>) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<usize>();
+        let cu = be.cu.clone();
+        let ctx = be.ctx as usize;
+        let handle = std::thread::spawn(move || {
+            if unsafe { cu.cuCtxSetCurrent(ctx as *mut c_void) } != 0 {
+                return false;
+            }
+            let mut ok = true;
+            for c in rx {
+                let (ev, sk, sv, dk, dv, n) = jobs[c];
+                ok &= unsafe { cu.cuEventSynchronize(ev as *mut c_void) } == 0;
+                if ok {
+                    // SAFETY: pinned rows landed (the event), staged room of n floats each.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(sk as *const f32, dk as *mut f32, n);
+                        std::ptr::copy_nonoverlapping(sv as *const f32, dv as *mut f32, n);
+                    }
+                }
+            }
+            ok
+        });
+        Self {
+            tx: Some(tx),
+            handle: Some(handle),
+        }
+    }
+    fn send(&self, c: usize) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(c);
+        }
+    }
+    /// Waits for every copy: whether all landed and were made.
+    fn finish(&mut self) -> bool {
+        self.tx = None;
+        self.handle.take().is_some_and(|h| h.join().unwrap_or(false))
+    }
+}
+
+impl Drop for KvStager {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 /// `dglu_t`, `dew_t`, `dqk_rope_t`, `dattn_combine_t`, `dgdn_conv_t`, `dgdn_rule_t` and
@@ -1411,6 +1480,28 @@ impl CudaBackend {
             }
             v
         };
+        let kv_writer: Vec<Vec<usize>> = {
+            let mut last = vec![usize::MAX; g.kv.len()];
+            for (i, op) in ops.iter().enumerate() {
+                if let COp::QkRope { kv, kout, .. } = op
+                    && kout.a != 0
+                    && *kv < last.len()
+                {
+                    last[*kv] = i;
+                }
+            }
+            let mut v = vec![Vec::new(); ops.len()];
+            if last.iter().all(|&i| i != usize::MAX) {
+                for (c, &i) in last.iter().enumerate() {
+                    v[i].push(c);
+                }
+            }
+            v
+        };
+        let kv_async = pf
+            && kvout_len > 0
+            && kv_writer.iter().map(|w| w.len()).sum::<usize>() == g.kv.len()
+            && std::env::var("OXINFER_CUDA_KV_ASYNC").map_or(true, |v| v != "0");
         let at = |v: View| arena + (boff[v.buf] + v.off * 4) as u64;
         let layout =
             g.kv.iter()
@@ -1466,6 +1557,24 @@ impl CudaBackend {
                 (0, 0)
             },
             q8_last: Default::default(),
+            kv_stream: {
+                let mut st: *mut c_void = std::ptr::null_mut();
+                if !kv_async || unsafe { self.cu.cuStreamCreate(&mut st, 1) } != 0 {
+                    st = std::ptr::null_mut();
+                }
+                st
+            },
+            kv_events: if kv_async {
+                g.kv.iter()
+                    .map_while(|_| {
+                        let (mut a, mut b): (*mut c_void, *mut c_void) = (std::ptr::null_mut(), std::ptr::null_mut());
+                        (unsafe { self.cu.cuEventCreate(&mut a, 2) == 0 && self.cu.cuEventCreate(&mut b, 2) == 0 }).then_some((a, b))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            kv_writer,
             kv_pinned: {
                 let mut p: *mut c_void = std::ptr::null_mut();
                 if !pf || kvout_len == 0 || unsafe { self.cu.cuMemAllocHost_v2(&mut p, kvout_len * 4) } != 0 {
@@ -2274,6 +2383,44 @@ impl DecodePlan for CudaPlan<'_> {
         let per_op = tr && std::env::var("OXINFER_CUDA_DECODE_TRACE").is_ok_and(|v| v == "2");
         let mut kinds: std::collections::BTreeMap<&str, (usize, f64)> = Default::default();
         self.q8_last.set(Default::default());
+        // The new keys and values down under the later layers' kernels (prefill plans).
+        let row_floats: usize = self.kv.iter().map(|&(n, hd)| n * hd).sum();
+        let mut stager = (!self.kv_stream.is_null()
+            && !self.kv_pinned.is_null()
+            && !s.scratch
+            && self.kv_events.len() == self.kv.len()
+            && s.kv.len() == self.kv.len()
+            && t * row_floats >= KV_ASYNC_MIN)
+            .then(|| {
+                let mut o = 0;
+                let mut jobs = Vec::with_capacity(self.kv.len());
+                for (i, c) in s.kv.iter_mut().enumerate() {
+                    let row = self.kv[i].0 * self.kv[i].1;
+                    let tr = self.tokens * row;
+                    let (dk, dv) = c.stage(t);
+                    // SAFETY: offsets within the `kvout.1` floats of the pinned buffer.
+                    let (sk, sv) = unsafe { (self.kv_pinned.add(o), self.kv_pinned.add(o + tr)) };
+                    jobs.push((
+                        self.kv_events[i].1 as usize,
+                        sk as usize,
+                        sv as usize,
+                        dk as usize,
+                        dv as usize,
+                        t * row,
+                    ));
+                    o += 2 * tr;
+                }
+                KvStager::new(be, jobs)
+            });
+        let kv_offsets: Vec<usize> = self
+            .kv
+            .iter()
+            .scan(0usize, |o, &(n, hd)| {
+                let at = *o;
+                *o += 2 * self.tokens * n * hd;
+                Some(at)
+            })
+            .collect();
         for (i, op) in self.ops[..end].iter().enumerate() {
             let ts = std::time::Instant::now();
             if !matches!(op, COp::Gmv { .. }) {
@@ -2313,6 +2460,31 @@ impl DecodePlan for CudaPlan<'_> {
                 let e = kinds.entry(k).or_default();
                 e.0 += 1;
                 e.1 += ts.elapsed().as_secs_f64() * 1e6;
+            }
+            if let Some(sg) = &stager {
+                for &c in &self.kv_writer[i] {
+                    let cu = &be.cu;
+                    let row = self.kv[c].0 * self.kv[c].1;
+                    let (o, tr, (ev, done)) = (kv_offsets[c], self.tokens * row, self.kv_events[c]);
+                    let src = self.kvout.0 + 4 * o as u64;
+                    // SAFETY: the pinned buffer holds `kvout.1` floats; the stager waits for `done`.
+                    let ok = unsafe {
+                        cu.cuEventRecord(ev, std::ptr::null_mut()) == 0
+                            && cu.cuStreamWaitEvent(self.kv_stream, ev, 0) == 0
+                            && cu.cuMemcpyDtoHAsync_v2(self.kv_pinned.add(o) as *mut c_void, src, t * row * 4, self.kv_stream) == 0
+                            && cu.cuMemcpyDtoHAsync_v2(
+                                self.kv_pinned.add(o + tr) as *mut c_void,
+                                src + 4 * tr as u64,
+                                t * row * 4,
+                                self.kv_stream,
+                            ) == 0
+                            && cu.cuEventRecord(done, self.kv_stream) == 0
+                    };
+                    if !ok {
+                        return false;
+                    }
+                    sg.send(c);
+                }
             }
             if queue {
                 for &st in &self.last_writer[i] {
@@ -2393,19 +2565,36 @@ impl DecodePlan for CudaPlan<'_> {
             return false;
         }
         if tr {
+            // The host's time between the last step's end and this one's start.
+            static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+            let mut last = LAST.lock().unwrap();
+            let gap = last.map_or(0.0, |l| t0.saturating_duration_since(l).as_secs_f64() * 1e6);
             eprintln!(
-                "[cuda decode step t={t}: states up {:.0} us, ops {:.0} us, results {:.0} us, states down {:.0} us]",
+                "[cuda decode step t={t}: states up {:.0} us, ops {:.0} us, results {:.0} us, states down {:.0} us; {gap:.0} us since the last step]",
                 (t1 - t0).as_secs_f64() * 1e6,
                 (t2 - t1).as_secs_f64() * 1e6,
                 (t3 - t2).as_secs_f64() * 1e6,
                 t3.elapsed().as_secs_f64() * 1e6
             );
+            *last = Some(std::time::Instant::now());
         }
         ms.states_valid = true;
         ms.last = (self.id, t);
         if s.scratch {
             for m in ms.kv.iter_mut() {
                 m.synced = m.synced.min(pos);
+            }
+            return true;
+        }
+        if let Some(mut sg) = stager.take() {
+            if !sg.finish() {
+                return false;
+            }
+            for (m, c) in ms.kv.iter_mut().zip(s.kv.iter_mut()) {
+                // SAFETY: the stager wrote every staged key and value.
+                unsafe { c.commit(t) };
+                c.kept = c.len;
+                m.synced = pos + t;
             }
             return true;
         }

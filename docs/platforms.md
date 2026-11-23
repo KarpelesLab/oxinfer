@@ -301,7 +301,18 @@ IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4. Three things run on the
   the exact GEMM's log-probabilities). An int8 GEMM in the tensor cores (x rounded to int8 per
   block of 32, `mma.m16n8k32.s8`, each block's sums scaled in f32 as llama.cpp's `mmq`) measured
   even with these tiles on Q4_K and up to 8% faster on Q6_K: the scaling after every 32-wide step
-  took ~45% of its time (225 against 401 us without it), so it is not kept. RMSNorm, RoPE, the
+  took ~45% of its time (225 against 401 us without it), so it is not kept. The new keys and
+  values (151 MB for a 512-token Qwen3-8B step) came down after the step's kernels and into the
+  host caches after that, ~7 ms outside them; they now go down per layer as soon as the op
+  writing them has run, on a stream of their own into the pinned buffer, and a host thread
+  copies each layer's into the room `LayerCache::stage` gave it while the later layers run,
+  taken into the caches (`commit`) only once the step has succeeded (a declined step leaves them
+  as they were). `OXINFER_CUDA_KV_ASYNC=0` gives the copy after the kernels back; the logits are
+  byte for byte the same (`pf_check`, 1500 tokens). On an idle GPU: Qwen3-8B Q4_K_M 8885 ->
+  10440 tok/s at 512 tokens and 9011 -> 10099 at 2048, Llama-3.2-1B Q4_K_M 42667 -> 49734 and
+  43800 -> 49713. Then (`parity_bench` / llama-bench `e6d624b`, 5 runs each, idle GPU): Qwen3-8B
+  pp512 10490 / 15887, pp2048 10099 / 15402, tg128 220 / 252; Llama-3.2-1B 48674 / 76353,
+  48751 / 82510, tg128 1300 / 1062. RMSNorm, RoPE, the
   activations, the Gated DeltaNet convolution and delta rule (the state in registers across the
   step's tokens) over all tokens in one launch; attention with the decode kernel, 32 tokens per
   launch; the hidden states, the new keys and values and the recurrent states come back to the

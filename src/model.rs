@@ -1496,6 +1496,31 @@ impl LayerCache {
             c.len += t;
         }
     }
+    /// Room for `t` more positions, and where their keys and values go (the vectors' spare
+    /// capacity): written by [`Self::commit`]'s caller before it is called, invisible until.
+    pub(crate) fn stage(&mut self, t: usize) -> (*mut f32, *mut f32) {
+        let n = t * self.n_kv * self.hd;
+        self.k.reserve(n);
+        self.v.reserve(n);
+        (
+            self.k.spare_capacity_mut().as_mut_ptr() as *mut f32,
+            self.v.spare_capacity_mut().as_mut_ptr() as *mut f32,
+        )
+    }
+    /// Takes the `t` positions [`Self::stage`] gave room for into the cache.
+    ///
+    /// # Safety
+    /// Every key and value of them must have been written.
+    pub(crate) unsafe fn commit(&mut self, t: usize) {
+        let n = t * self.n_kv * self.hd;
+        debug_assert!(self.k.capacity() - self.k.len() >= n && self.v.capacity() - self.v.len() >= n);
+        // SAFETY: the caller wrote them (staged room of at least n).
+        unsafe {
+            self.k.set_len(self.k.len() + n);
+            self.v.set_len(self.v.len() + n);
+        }
+        self.len += t;
+    }
     pub(crate) fn push(&mut self, k: &[f32], v: &[f32], t: usize) {
         debug_assert_eq!(k.len(), t * self.n_kv * self.hd);
         if k.len() >= 1 << 17 {
