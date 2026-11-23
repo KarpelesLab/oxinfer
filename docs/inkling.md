@@ -473,6 +473,15 @@ resident on the device:
   on the device. A pass longer than a sliding window's spare rows keeps its keys and values in the
   arena and moves its last rows to the window's ring after; the convolution rings are written
   once the convolutions have read them.
+- **Greedy decoding chained on the device** (plain greedy decoding: `--temp 0`, no repetition
+  penalty, no grammar, no lookup or draft): a pass ends with the argmax of its soft-capped logits
+  (the host's rule: the first index of the largest) written to a token slot of the arena, and the
+  next pass starts by dequantizing that token's embedding row (MLX affine, bf16 or any GGUF type
+  of the decode kernels) and its norm; so the next pass is encoded and queued while the current
+  one runs, and the host only reads a token after each (`Inkling2Model::decode_greedy`). No
+  logits are copied back. A pass queued past a stop token is rolled back. The embedding's norm
+  sums its squares in another order than the host's: the same greedy text on the 9 replies of
+  the speed checks (`inkling2_bench --chain` measures this path).
 - **KV caches** in f32, f16 or q8 rows (`--kv-cache`), the sliding windows as rings of
   `window + 64` rows by position, the full-attention caches growing; a session's state moves to
   the device on its first GPU pass and back to the host when a pass runs on the CPU (cloning a

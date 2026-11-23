@@ -257,6 +257,12 @@ impl Sampler {
         self.temperature <= 0.0
     }
 
+    /// Whether `sample` is the argmax of the logits as given (greedy, without a repetition
+    /// penalty or a guide).
+    pub fn plain_greedy(&self) -> bool {
+        self.greedy() && self.repetition_penalty == 1.0 && self.guide.is_none()
+    }
+
     /// The candidates `sample` draws from: token ids by decreasing probability, the
     /// (unnormalized over the cut) probabilities, how many survive top-p, and their total.
     /// With `masked`, tokens of probability zero (masked out) are never candidates.

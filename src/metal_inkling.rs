@@ -305,6 +305,9 @@ pub(crate) fn shader_src(mma: bool) -> String {
         let _ = writeln!(s, "INK_XP(ink_x_{n}, {t}, {x}, {ch}, IMK_{n})");
         let _ = writeln!(s, "INK_XG(ink_x_{n}, {t}, {x}, {ch}, IMK_{n})");
     }
+    for k in GGUF_GPU_TYPES.iter().filter(|&&k| k != GgmlType::F32) {
+        let _ = writeln!(s, "INK_EMB({})", k.name());
+    }
     if mma {
         s.push_str(PF_SRC);
     }
@@ -501,7 +504,7 @@ struct CapP {
     x: u32,
     out: u32,
     cap: f32,
-    _p0: u32,
+    am: u32,
     _p1: u32,
     _p2: u32,
 }
@@ -732,6 +735,9 @@ struct Bufs {
     logits: usize,
     capped: usize,
     cap: usize,
+    /// Greedy decoding on the device: the argmax's partials, two token slots.
+    amp: usize,
+    tok: usize,
     /// LoRA scratch (the down halves' outputs) and the largest rank.
     lu: usize,
     lora_r: usize,
@@ -798,6 +804,7 @@ struct Pipes {
     route: Id,
     mvf: Id,
     softcap: Id,
+    amax: Id,
     xgroup: Id,
     xcombine: Id,
     gmix_norm: Id,
@@ -819,6 +826,34 @@ struct PfPipes {
     combine: Id,
 }
 
+/// The embedding table on the device: the kernel, the table's addresses (MLX: values, scales,
+/// offsets), GGUF row bytes, MLX bits and group, the norm's weights in the constants.
+struct EmbDev {
+    pipe: Id,
+    q: u64,
+    s: u64,
+    b: u64,
+    rb: u32,
+    bits: u32,
+    group: u32,
+    nw: usize,
+}
+
+#[repr(C)]
+struct EmbP {
+    q: u64,
+    s: u64,
+    b: u64,
+    h: u32,
+    tok: u32,
+    x: u32,
+    nw: u32,
+    eps: f32,
+    rb: u32,
+    bits: u32,
+    group: u32,
+}
+
 pub(crate) struct InkMetal {
     be: &'static MetalBackend,
     f: Fns,
@@ -834,6 +869,8 @@ pub(crate) struct InkMetal {
     final_query: usize,
     final_norm: usize,
     lm_head: Dw,
+    /// The embedding table, where the device reads it ([`InkMetal::greedy`]).
+    emb: Option<EmbDev>,
     /// Buffers reached through the experts' address tables (made resident).
     indirect: Vec<Id>,
     /// Buffers made here (released on drop) and shared wraps (given back on drop).
@@ -1774,6 +1811,8 @@ impl InkMetal {
                 logits: take(t.min(MAX_T) * c.vocab_size),
                 capped: take(t.min(MAX_T) * c.unpadded_vocab_size),
                 cap: take(t * nf * h),
+                amp: take(2 * c.unpadded_vocab_size.div_ceil(256)),
+                tok: take(2),
                 lu: take((t * topk + 15 * ne + 128) * lora_r),
                 grp: take(1 + 3 * MAX_T * topk),
                 asg: take(MAX_T * topk),
@@ -1789,6 +1828,54 @@ impl InkMetal {
             let (id, _) = be.ink_buffer(total * 4).context("arena")?;
             Ok(Arena { id, b })
         };
+        // The embedding table where the device can read it (else greedy decoding stays on the host).
+        let emb = (|| -> Option<EmbDev> {
+            use crate::model::Table;
+            if h > 4096 || !h.is_multiple_of(32) {
+                return None;
+            }
+            let mut wr = |p: *const u8, n: usize| wrap(p, n, &mut shared, &mut indirect).ok();
+            let (name, q, sc, bi, rb, bits, group) = match &m.embed {
+                Table::Bf16(w) => ("ink_embed_bf".to_string(), wr(w.as_ptr() as *const u8, w.len() * 2)?, 0, 0, 0, 0, 0),
+                Table::Gguf(g) if GGUF_GPU_TYPES.contains(&g.kind) && g.kind != GgmlType::F32 && g.n_in == h => (
+                    format!("ink_embed_{}", g.kind.name()),
+                    wr(g.data.as_ptr(), g.data.len())?,
+                    0,
+                    0,
+                    g.row_bytes() as u32,
+                    0,
+                    0,
+                ),
+                Table::Mlx {
+                    parts:
+                        [
+                            crate::safetensors::TablePart::Mem(d),
+                            crate::safetensors::TablePart::Mem(sc),
+                            crate::safetensors::TablePart::Mem(bi),
+                        ],
+                    q,
+                } if matches!(q.bits, 2 | 4 | 8) && q.group > 0 && h.is_multiple_of(q.group) => (
+                    "ink_embed_mlx".to_string(),
+                    wr(d.as_ptr(), d.len())?,
+                    wr(sc.as_ptr(), sc.len())?,
+                    wr(bi.as_ptr(), bi.len())?,
+                    0,
+                    q.bits as u32,
+                    q.group as u32,
+                ),
+                _ => return None,
+            };
+            Some(EmbDev {
+                pipe: lib.pipeline(be, &name)?,
+                q,
+                s: sc,
+                b: bi,
+                rb,
+                bits,
+                group,
+                nw: consts.add(&m.embed_norm),
+            })
+        })();
         if consts.0.len() >= u32::MAX as usize {
             bail!("{} floats of constants", consts.0.len());
         }
@@ -1841,6 +1928,7 @@ impl InkMetal {
             route: pipe("ink_route")?,
             mvf: pipe("ink_mvf")?,
             softcap: pipe("ink_softcap")?,
+            amax: pipe("ink_amax")?,
             xgroup: pipe("ink_xgroup")?,
             mix8: pipe("ink_mix8")?,
             gmix_norm: pipe("ink_gmix_norm")?,
@@ -1877,6 +1965,7 @@ impl InkMetal {
             final_query,
             final_norm,
             lm_head,
+            emb,
             indirect,
             owned,
             shared,
@@ -2538,8 +2627,9 @@ impl InkMetal {
         e.dispatch((ch.div_ceil(256), t), 256);
     }
 
-    /// The final mix, and the LM head with its cap over the last `head_rows` tokens.
-    fn enc_final(&self, e: &Pe, c: &Cx, t: usize, capture: &[usize], head_rows: usize) {
+    /// The final mix, and the LM head with its cap over the last `head_rows` tokens; with `amax`
+    /// (one row), the argmax of the capped logits into the token slot there.
+    fn enc_final(&self, e: &Pe, c: &Cx, t: usize, capture: &[usize], head_rows: usize, amax: Option<usize>) {
         let (h, b) = (self.h, c.b);
         if self.capture(e, c, self.plan.len(), t, capture) {
             e.barrier();
@@ -2577,13 +2667,45 @@ impl InkMetal {
                 x: b.logits as u32,
                 out: b.capped as u32,
                 cap: self.caps.2,
+                am: amax.map_or(0, |_| b.amp as u32),
                 ..Default::default()
             };
             e.pipe(self.p.softcap);
             e.buf(c.a, 0, 0);
             e.bytes(&p, 1);
             e.dispatch((self.unpadded.div_ceil(256), head_rows), 256);
+            if let Some(tok) = amax {
+                e.barrier();
+                e.pipe(self.p.amax);
+                e.buf(c.a, 0, 0);
+                e.bytes(&[self.unpadded.div_ceil(256) as u32, b.amp as u32, tok as u32, 0], 1);
+                e.dispatch((1, 1), 1024);
+            }
         }
+    }
+
+    /// The input row of a one-token pass from the token id in arena slot `tok`.
+    fn enc_embed(&self, e: &Pe, c: &Cx, em: &EmbDev, tok: usize) {
+        e.pipe(em.pipe);
+        e.buf(c.a, 0, 0);
+        e.buf(self.consts, 0, 1);
+        e.bytes(
+            &EmbP {
+                q: em.q,
+                s: em.s,
+                b: em.b,
+                h: self.h as u32,
+                tok: tok as u32,
+                x: c.b.x as u32,
+                nw: em.nw as u32,
+                eps: self.eps,
+                rb: em.rb,
+                bits: em.bits,
+                group: em.group,
+            },
+            2,
+        );
+        e.dispatch((1, 1), 1024);
     }
 
     /// Copies the stream into the capture rows of the steps listed (true if any).
@@ -3460,7 +3582,7 @@ impl InkMetal {
                 if si < n {
                     self.enc_attn(e, c, si, t, pos, dev, capture);
                 } else {
-                    self.enc_final(e, c, t, capture, head_rows);
+                    self.enc_final(e, c, t, capture, head_rows, None);
                 }
             });
             ok &= r;
@@ -3498,7 +3620,7 @@ impl InkMetal {
         );
         for si in 0..=self.plan.len() {
             if si == self.plan.len() {
-                self.enc_final(&e, c, t, capture, head_rows);
+                self.enc_final(&e, c, t, capture, head_rows, None);
             } else {
                 self.enc_attn(&e, c, si, t, pos, dev, capture);
                 self.enc_moe(&e, c, si, t, pos, dev, false);
@@ -3637,6 +3759,133 @@ impl DevEngine for InkMetal {
         }
     }
 
+    fn greedy(
+        &self,
+        m: &Inkling2Model,
+        sess: &mut Inkling2Session,
+        first: u32,
+        max: usize,
+        on: &mut dyn FnMut(u32) -> bool,
+    ) -> Option<(usize, usize)> {
+        let em = self.emb.as_ref()?;
+        if max == 0 || profile_every() > 0 {
+            return None;
+        }
+        let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        if sess.dev.is_none() && !self.upload(m, sess) {
+            sess.dev = None;
+            return None;
+        }
+        let pos0 = sess.pos;
+        let dev = sess.dev.as_mut().and_then(|d| d.0.as_any().downcast_mut::<InkDev>())?;
+        dev.pos = pos0;
+        self.lora_strengths();
+        let c = Cx {
+            a: self.dec.id,
+            b: &self.dec.b,
+        };
+        let slot = |k: usize| unsafe { (self.f.contents(c.a) as *mut u32).add(c.b.tok + k) };
+        // Pass k reads its token from slot (k + 1) % 2 and writes its argmax to slot k % 2.
+        unsafe { *slot(1) = first };
+        let steps = self.plan.len() + 1;
+        let parts: Vec<std::ops::Range<usize>> = std::iter::once(0..2.min(steps))
+            .chain((2..steps).step_by(8).map(|s| s..(s + 8).min(steps)))
+            .collect();
+        let indirect = if self.be.residency.is_some() { &[][..] } else { &self.indirect[..] };
+        let be = self.be;
+        let wait: MsgVoid = be.o.msg_send();
+        let status: super::MsgU = be.o.msg_send();
+        let retain: super::Msg0 = be.o.msg_send();
+        let s_retain = be.o.sel(c"retain");
+        let drain = |cbs: &[Id]| -> bool {
+            let mut ok = true;
+            for &cb in cbs {
+                unsafe {
+                    wait(cb, be.sels.wait);
+                    ok &= status(cb, be.sels.status) == 4;
+                }
+            }
+            ok
+        };
+        let release = |cbs: Vec<Id>| {
+            for cb in cbs {
+                unsafe { wait(cb, be.sels.release) };
+            }
+        };
+        let submit = |k: usize, dev: &InkDev| -> Vec<Id> {
+            let pos = pos0 + k;
+            unsafe {
+                let pool = (be.sels.pool_push)();
+                let mut cbs = Vec::with_capacity(parts.len());
+                for r in &parts {
+                    let (cb, enc) = begin_enc(be, &self.f);
+                    let fe = FastEnc { enc, f: &self.f };
+                    let e = &Pe::new(&fe, None);
+                    e.use_resources(indirect);
+                    for si in r.clone() {
+                        if si == 0 {
+                            self.enc_embed(e, &c, em, c.b.tok + (k + 1) % 2);
+                            e.barrier();
+                        }
+                        if si == self.plan.len() {
+                            self.enc_final(e, &c, 1, &[], 1, Some(c.b.tok + k % 2));
+                        } else {
+                            self.enc_attn(e, &c, si, 1, pos, dev, &[]);
+                            self.enc_moe(e, &c, si, 1, pos, dev, false);
+                        }
+                    }
+                    end_commit(&self.f, cb, enc);
+                    retain(cb, s_retain);
+                    cbs.push(cb);
+                }
+                (be.sels.pool_pop)(pool);
+                cbs
+            }
+        };
+        // One pass ahead: pass k + 1 runs while the host takes pass k's token.
+        let mut q: std::collections::VecDeque<(usize, Vec<Id>)> = std::collections::VecDeque::new();
+        let (mut sub, mut kept, mut stopped, mut ok) = (0usize, 0usize, false, true);
+        let push = |q: &mut std::collections::VecDeque<(usize, Vec<Id>)>, k: usize, dev: &mut InkDev, ok: &mut bool| {
+            if dev.slots.iter().any(|s| s.ring == 0 && s.rows < pos0 + k + 1) {
+                // (Growing a cache copies it: the passes in flight finish first.)
+                for (_, cbs) in q.iter() {
+                    *ok &= drain(cbs);
+                }
+                *ok &= dev.reserve(pos0 + k + 1);
+            }
+            q.push_back((k, submit(k, dev)));
+        };
+        while sub < max.min(2) {
+            push(&mut q, sub, dev, &mut ok);
+            sub += 1;
+        }
+        while let Some((k, cbs)) = q.pop_front() {
+            ok &= drain(&cbs);
+            release(cbs);
+            if !ok || stopped {
+                continue;
+            }
+            kept = k + 1;
+            if kept == max {
+                continue;
+            }
+            if !on(unsafe { *slot(k % 2) }) {
+                stopped = true;
+                continue;
+            }
+            if sub < max {
+                push(&mut q, sub, dev, &mut ok);
+                sub += 1;
+            }
+        }
+        if !ok {
+            panic!("Metal: an Inkling-2 pass failed (OXINFER_GPU_PLAN_DEBUG=1 says why)");
+        }
+        dev.pos = pos0 + sub;
+        sess.pos = pos0 + sub;
+        Some((sub, kept))
+    }
+
     fn run(&self, m: &Inkling2Model, sess: &mut Inkling2Session, x: &[f32], t: usize, mut want: DevWant) -> bool {
         let h = self.h;
         if t == 0 || x.len() != t * h || (t > MAX_T && self.pfa.is_none()) {
@@ -3701,7 +3950,7 @@ impl DevEngine for InkMetal {
                         e.use_resources(indirect);
                         for si in r {
                             if si == self.plan.len() {
-                                self.enc_final(e, &c, n, capture, head_rows);
+                                self.enc_final(e, &c, n, capture, head_rows, None);
                             } else {
                                 self.enc_attn(e, &c, si, n, pos, dev, capture);
                                 self.enc_moe(e, &c, si, n, pos, dev, false);

@@ -8,8 +8,12 @@
 //! the engine (`prefill_gemm`'s default there: int8 activations).
 //!
 //! ```text
-//! inkling2_bench MODEL [-p 512,2048] [-n 128] [-r 3] [--kv f32|f16|q8] [--cpu] [--threads N] [--chunk N] [-v 2,4,8]
+//! inkling2_bench MODEL [-p 512,2048] [-n 128] [-r 3] [--kv f32|f16|q8] [--cpu] [--threads N] [--chunk N] [-v 2,4,8] [--chain]
 //! ```
+//!
+//! `--chain`: `tg N` as greedy decoding with the passes chained on the device
+//! (`Inkling2Model::decode_greedy`, as the CLI decodes greedily) rather than a host loop of
+//! `forward` and argmax.
 
 use anyhow::{Context, Result};
 use oxinfer::inkling::{Inkling2Config, Inkling2Model, KvCache};
@@ -22,9 +26,10 @@ fn median(mut v: Vec<f64>) -> f64 {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: inkling2_bench MODEL [-p 512,2048] [-n 128] [-r 3] [--kv f32|f16|q8] [--cpu] [--threads N] [--chunk N] [-v 2,4,8]";
+    let usage = "usage: inkling2_bench MODEL [-p 512,2048] [-n 128] [-r 3] [--kv f32|f16|q8] [--cpu] [--threads N] [--chunk N] [-v 2,4,8] [--chain]";
     let model = args.next().context(usage)?;
     let mut verify: Vec<usize> = Vec::new();
+    let mut chain = false;
     let (mut pp, mut tg, mut reps, mut kv, mut cpu, mut chunk) = (vec![512usize], 128usize, 3usize, KvCache::F32, false, 2048usize);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -42,6 +47,7 @@ fn main() -> Result<()> {
             "--kv" => kv = KvCache::parse(&args.next().context("--kv MODE")?)?,
             "--chunk" => chunk = args.next().context("--chunk N")?.parse::<usize>()?.max(1),
             "--cpu" => cpu = true,
+            "--chain" => chain = true,
             "--threads" => oxinfer::pool::configure(args.next().context("--threads N")?.parse::<usize>()?.max(1)),
             "-v" => {
                 verify = args
@@ -111,11 +117,20 @@ fn main() -> Result<()> {
                 oxinfer::prof::reset();
             }
             let t0 = std::time::Instant::now();
-            for _ in 0..if rep == 0 { 8 } else { tg } {
-                let l = m.forward(&mut sess, &[tok]);
-                tok = am(&l);
-                toks.push(tok);
-                digest = l.iter().fold(digest, |d, v| d.rotate_left(7) ^ u64::from(v.to_bits()));
+            let n = if rep == 0 { 8 } else { tg };
+            if chain {
+                m.decode_greedy(&mut sess, tok, n, &mut |t| {
+                    toks.push(t);
+                    true
+                })
+                .context("--chain: the device does not chain greedy passes")?;
+            } else {
+                for _ in 0..n {
+                    let l = m.forward(&mut sess, &[tok]);
+                    tok = am(&l);
+                    toks.push(tok);
+                    digest = l.iter().fold(digest, |d, v| d.rotate_left(7) ^ u64::from(v.to_bits()));
+                }
             }
             if rep > 0 {
                 times.push(t0.elapsed().as_secs_f64());

@@ -824,12 +824,117 @@ kernel void ink_mvr(device float* a [[buffer(0)]], device const float* c [[buffe
 
 // ---- The soft-capped logits of the tokens (`cap tanh(x / cap)`), cut to the first `u` of each
 // row of `v` (grid: blocks, token).
-struct ICapP { uint v; uint u; uint x; uint out; float cap; uint _p0; uint _p1; uint _p2; };
-kernel void ink_softcap(device float* a [[buffer(0)]], constant ICapP& p [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p.u) return;
-    float x = a[p.x + (ulong)gid.y * p.v + gid.x];
-    a[p.out + (ulong)gid.y * p.u + gid.x] = precise::tanh(x / p.cap) * p.cap;
+// With `am` (greedy decoding on the device, one row), each threadgroup's argmax as (value, index
+// bits) into `am + 2 tg` (`ink_amax` then takes the first index of the largest).
+struct ICapP { uint v; uint u; uint x; uint out; float cap; uint am; uint _p1; uint _p2; };
+// (v, i) for (bv, bi): the larger value, the lower index on a tie (indices of no candidate:
+// 0xffffffff, value -inf).
+inline void amax_pick(thread float& bv, thread uint& bi, float v, uint i) {
+    if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
 }
+inline void amax_simd(thread float& bv, thread uint& bi) {
+    for (ushort m = 16; m > 0; m >>= 1) amax_pick(bv, bi, simd_shuffle_xor(bv, m), simd_shuffle_xor(bi, m));
+}
+kernel void ink_softcap(device float* a [[buffer(0)]], constant ICapP& p [[buffer(1)]], uint2 gid [[thread_position_in_grid]],
+                        uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float tv[8];
+    threadgroup uint ti[8];
+    bool in = gid.x < p.u;
+    float y = -INFINITY;
+    if (in) {
+        float x = a[p.x + (ulong)gid.y * p.v + gid.x];
+        y = precise::tanh(x / p.cap) * p.cap;
+        a[p.out + (ulong)gid.y * p.u + gid.x] = y;
+    }
+    if (p.am == 0) return;
+    // (The host's argmax: the first index of the largest value above -inf; NaNs never win.)
+    bool c = in && y > -INFINITY;
+    float bv = c ? y : -INFINITY;
+    uint bi = c ? gid.x : 0xffffffffu;
+    amax_simd(bv, bi);
+    if (lane == 0) { tv[sg] = bv; ti[sg] = bi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        for (uint k = 1; k < 8; k++) amax_pick(bv, bi, tv[k], ti[k]);
+        a[p.am + 2 * tg.x] = bv;
+        a[p.am + 2 * tg.x + 1] = as_type<float>(bi);
+    }
+}
+// The argmax over `n` partials (one threadgroup of 1024): the token id (uint bits) into `tok`.
+struct IAmP { uint n; uint am; uint tok; uint _p; };
+kernel void ink_amax(device float* a [[buffer(0)]], constant IAmP& p [[buffer(1)]], uint tid [[thread_index_in_threadgroup]],
+                     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float tv[32];
+    threadgroup uint ti[32];
+    float bv = -INFINITY;
+    uint bi = 0xffffffffu;
+    for (uint k = tid; k < p.n; k += 1024) amax_pick(bv, bi, a[p.am + 2 * k], as_type<uint>(a[p.am + 2 * k + 1]));
+    amax_simd(bv, bi);
+    if (lane == 0) { tv[sg] = bv; ti[sg] = bi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        for (uint k = 1; k < 32; k++) amax_pick(bv, bi, tv[k], ti[k]);
+        ((device uint*)a)[p.tok] = bi == 0xffffffffu ? 0u : bi;
+    }
+}
+
+// ---- The input row of a pass whose token the device chose (`ink_amax` of the pass before): the
+// embedding table's row of the token (uint at `tok`) dequantized as the host does, then the
+// embedding norm (weights at `nw`) into `x` (one threadgroup of 1024; h <= 4096). Tables: MLX
+// affine rows (`bits` 2, 4 or 8, a bf16 scale and offset per `group`; `q`, `s`, `b` addresses),
+// GGUF rows of `rb` bytes (`ink_embed_<type>`), bf16 rows.
+struct IEmbP { ulong q; ulong s; ulong b; uint h; uint tok; uint x; uint nw; float eps; uint rb; uint bits; uint group; };
+inline void ink_embed_norm(device float* a, device const float* c, constant IEmbP& p, threadgroup float* xs, threadgroup float* red,
+                           uint tid) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float ss = 0.f;
+    for (uint i = tid; i < p.h; i += 1024) ss += xs[i] * xs[i];
+    ss = ink_sum(ss, red, tid, 1024);
+    float r = 1.f / sqrt(ss / float(p.h) + p.eps);
+    for (uint i = tid; i < p.h; i += 1024) a[p.x + i] = xs[i] * (r * c[p.nw + i]);
+}
+inline float bf16f(ushort v) { return as_type<float>(uint(v) << 16); }
+kernel void ink_embed_mlx(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IEmbP& p [[buffer(2)]],
+                          uint tid [[thread_index_in_threadgroup]]) {
+#pragma clang fp contract(off)
+    threadgroup float xs[4096];
+    threadgroup float red[32];
+    uint row = ((device const uint*)a)[p.tok];
+    uint per = 32 / p.bits, mask = (1u << p.bits) - 1, ng = p.h / p.group;
+    device const uint* w = (device const uint*)p.q + (ulong)row * (p.h / per);
+    device const ushort* sc = (device const ushort*)p.s + (ulong)row * ng;
+    device const ushort* bs = (device const ushort*)p.b + (ulong)row * ng;
+    for (uint i = tid; i < p.h; i += 1024) {
+        uint q = (w[i / per] >> (p.bits * (i % per))) & mask;
+        uint g = i / p.group;
+        float t = bf16f(sc[g]) * float(q);
+        xs[i] = t + bf16f(bs[g]);
+    }
+    ink_embed_norm(a, c, p, xs, red, tid);
+}
+kernel void ink_embed_bf(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IEmbP& p [[buffer(2)]],
+                         uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float xs[4096];
+    threadgroup float red[32];
+    uint row = ((device const uint*)a)[p.tok];
+    device const ushort* w = (device const ushort*)p.q + (ulong)row * p.h;
+    for (uint i = tid; i < p.h; i += 1024) xs[i] = bf16f(w[i]);
+    ink_embed_norm(a, c, p, xs, red, tid);
+}
+#define INK_EMB(T) \
+kernel void ink_embed_##T(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IEmbP& p [[buffer(2)]], \
+                          uint tid [[thread_index_in_threadgroup]]) { \
+    threadgroup float xs[4096]; \
+    threadgroup float red[32]; \
+    uint row = ((device const uint*)a)[p.tok]; \
+    T##W w = { { (device const uchar*)p.q, p.rb } }; \
+    for (uint b = tid; b < p.h / 32; b += 1024) { \
+        float4 v[8]; \
+        load(w, row, b, v); \
+        for (uint i = 0; i < 8; i++) *(threadgroup float4*)(xs + b * 32 + 4 * i) = v[i]; \
+    } \
+    ink_embed_norm(a, c, p, xs, red, tid); }
 
 // ---- Weight formats of the experts beyond the decode library's. NVFP4 (ggml's blocks of 64:
 // four unsigned E4M3 scales, halved, then four runs of 8 bytes holding elements j and j + 8 of

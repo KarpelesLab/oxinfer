@@ -997,6 +997,22 @@ pub(crate) trait DevEngine: Send + Sync {
     fn head(&self, m: &Inkling2Model, hidden: &[f32], t: usize, cap: bool) -> Option<Vec<f32>>;
     /// Moves the device state of `sess`, if any, back into its host caches.
     fn to_host(&self, m: &Inkling2Model, sess: &mut Inkling2Session);
+    /// Greedy decoding on the device ([`Inkling2Model::decode_greedy`]): one-token passes from
+    /// `first`, each pass's input the argmax of the one before, at most `max` of them; `on` gets
+    /// each pass's argmax but the last pass's, and stops the passes when it returns false (the
+    /// token it was given is not run). The passes run (the session advanced by them, a pass that
+    /// ran past a stop included) and the passes kept; None when the device does not do it (the
+    /// session is then untouched).
+    fn greedy(
+        &self,
+        _m: &Inkling2Model,
+        _sess: &mut Inkling2Session,
+        _first: u32,
+        _max: usize,
+        _on: &mut dyn FnMut(u32) -> bool,
+    ) -> Option<(usize, usize)> {
+        None
+    }
 }
 
 /// A session's state on a device ([`DevEngine`]).
@@ -2031,6 +2047,26 @@ impl<'a> Inkling2Model<'a> {
         self.embed.row(token as usize, out);
     }
 
+    /// Greedy decoding with the passes chained on the device: runs `first` and the tokens it leads
+    /// to, each the argmax of the logits after the one before (the first index of the largest
+    /// soft-capped logit, as [`crate::sampler::argmax`]), at most `max` passes, the device
+    /// computing each pass's input row from the pass before so that the next pass is queued
+    /// while the host takes a token. `on` gets every token but the last pass's argmax; returning
+    /// false stops, that token not run (as [`crate::generate::decode`] leaves a stop token
+    /// unfed). The passes kept, or None (the session untouched) when the device does not do it.
+    pub fn decode_greedy(&self, sess: &mut Inkling2Session, first: u32, max: usize, on: &mut dyn FnMut(u32) -> bool) -> Option<usize> {
+        if sess.iv.active() || sess.dev_off || crate::gpu::decode::check() {
+            return None;
+        }
+        let d = self.device()?;
+        let pos0 = sess.pos;
+        let (ran, kept) = d.greedy(self, sess, first, max, on)?;
+        if kept < ran {
+            sess.truncate(pos0 + kept).expect("a pass past the stop goes back");
+        }
+        Some(kept)
+    }
+
     /// Runs `tokens` and returns the logits after the last one.
     pub fn forward(&self, sess: &mut Inkling2Session, tokens: &[u32]) -> Vec<f32> {
         let mut logits = Vec::new();
@@ -2822,6 +2858,9 @@ impl crate::generate::TextLm for Inkling2Model<'_> {
     }
     fn forward(&self, sess: &mut Inkling2Session, tokens: &[u32]) -> Vec<f32> {
         Inkling2Model::forward(self, sess, tokens)
+    }
+    fn decode_greedy(&self, sess: &mut Inkling2Session, first: u32, max: usize, on: &mut dyn FnMut(u32) -> bool) -> Option<usize> {
+        Inkling2Model::decode_greedy(self, sess, first, max, on)
     }
 }
 

@@ -53,6 +53,13 @@ pub trait TextLm {
         let hs = self.forward_hidden_mm(sess, tokens, &[]);
         self.logits(&hs[hs.len() - h..], 1)
     }
+    /// Greedy decoding with the passes chained on the device (see
+    /// `Inkling2Model::decode_greedy`): runs `first` and the argmax tokens after it, at most
+    /// `max` passes, `on` getting every token but the last pass's and stopping on false. The
+    /// passes kept, or None (nothing run) when the model does not do it.
+    fn decode_greedy(&self, _sess: &mut Self::Sess, _first: u32, _max: usize, _on: &mut dyn FnMut(u32) -> bool) -> Option<usize> {
+        None
+    }
 }
 
 impl TextLm for Model<'_> {
@@ -267,7 +274,7 @@ pub fn decode<M: TextLm + ?Sized>(
     let mut forwards = 0usize;
     let mut reason = StopReason::Length;
     let mut unfed = None;
-    for _ in 0..max_tokens {
+    for i in 0..max_tokens {
         let id = sampler.sample(&logits);
         out.push(id);
         if stop.contains(&id) {
@@ -278,6 +285,26 @@ pub fn decode<M: TextLm + ?Sized>(
             reason = StopReason::Cancelled;
             unfed = Some(id);
             break;
+        }
+        // Greedy decoding the device chains (the rest of the reply in one call).
+        if sampler.plain_greedy() {
+            let mut stopped = None;
+            let mut on = |t: u32| -> bool {
+                out.push(t);
+                if stop.contains(&t) {
+                    stopped = Some((StopReason::Stop, None));
+                } else if on_token(&out) == Flow::Stop {
+                    stopped = Some((StopReason::Cancelled, Some(t)));
+                }
+                stopped.is_none()
+            };
+            if let Some(n) = model.decode_greedy(sess, id, max_tokens - i, &mut on) {
+                forwards += n;
+                if let Some((r, u)) = stopped {
+                    (reason, unfed) = (r, u);
+                }
+                break;
+            }
         }
         // A one-token step: on fewer threads where that leaves cores to the rest of the system.
         let _decode = crate::pool::decode_scope();
