@@ -253,8 +253,33 @@ pub(crate) enum Pick {
     Score(Option<Vec<f32>>),
 }
 
+/// A router's weights (`[n_exp, H]`): f32, or a checkpoint's bf16 values read in place (half the
+/// bytes a decode step reads; the dot products are bit for bit those of the f32 copy).
+pub(crate) enum RouterW<'a> {
+    F32(Vec<f32>),
+    Bf16(&'a [u16]),
+}
+
+impl RouterW<'_> {
+    /// `dot(row e, x)` (`h` values a row).
+    #[inline]
+    pub(crate) fn dot_row(&self, e: usize, h: usize, x: &[f32]) -> f32 {
+        match self {
+            RouterW::F32(w) => dot(&w[e * h..(e + 1) * h], x),
+            RouterW::Bf16(w) => crate::kernels::dot_bf16_exact(&w[e * h..(e + 1) * h], x),
+        }
+    }
+    /// The weights as f32 (a copy of bf16 ones).
+    pub(crate) fn f32(&self) -> std::borrow::Cow<'_, [f32]> {
+        match self {
+            RouterW::F32(w) => std::borrow::Cow::Borrowed(&w[..]),
+            RouterW::Bf16(w) => std::borrow::Cow::Owned(w.iter().map(|&v| crate::kernels::bf16_to_f32(v)).collect()),
+        }
+    }
+}
+
 pub(crate) struct Moe<'a> {
-    router: Vec<f32>, // [n_exp, H]
+    pub(crate) router: RouterW<'a>,
     pick: Pick,
     /// V4.1: the selection bias of the tokens of an image span (`gate.bias_vl`).
     bias_vl: Option<Vec<f32>>,
@@ -400,6 +425,17 @@ pub(crate) struct Loader<'a, 'c> {
 }
 
 impl<'a> Loader<'a, '_> {
+    /// A router: bf16 tensors in place, others as f32.
+    fn router(&self, full: &str, shape: &[usize]) -> Result<RouterW<'a>> {
+        if let Some(info) = self.files.info(full)
+            && info.dtype == "BF16"
+            && info.shape.iter().product::<usize>() == shape.iter().product::<usize>()
+            && let Ok(w) = self.files.bf16(full)
+        {
+            return Ok(RouterW::Bf16(w));
+        }
+        Ok(RouterW::F32(self.getf(full, shape)?))
+    }
     fn getf(&self, full: &str, shape: &[usize]) -> Result<Vec<f32>> {
         let info = self.files.info(full).with_context(|| format!("missing tensor {full}"))?;
         if info.shape.iter().product::<usize>() != shape.iter().product::<usize>() {
@@ -543,7 +579,7 @@ impl<'a> Loader<'a, '_> {
         };
         let vn = format!("{fp}gate.bias_vl");
         let moe = Moe {
-            router: self.getf(&format!("{fp}gate.weight"), &[ne, h])?,
+            router: self.router(&format!("{fp}gate.weight"), &[ne, h])?,
             pick,
             bias_vl: if c.v41 && self.files.has(&vn) {
                 Some(self.getf(&vn, &[ne])?)
@@ -1773,18 +1809,18 @@ pub(crate) fn moe_forward(
         for_chunks(&mut logits, RB, true, |bi, lg| {
             for (j, v) in lg.iter_mut().enumerate() {
                 let e = bi * RB + j;
-                *v = dot(&m.router[e * h..(e + 1) * h], x);
+                *v = m.router.dot_row(e, h, x);
             }
         });
     } else if t >= 64 {
         // Prefill chunks: one f32 GEMM (a 2048-token chunk spent 37 ms per layer in dot products).
-        logits = crate::sd::ops::matmul_f32(&m.router, ne, h, x, t);
+        logits = crate::sd::ops::matmul_f32(&m.router.f32(), ne, h, x, t);
     } else {
         // (Short passes keep the one-token arithmetic: speculative verification reproduces
         // plain decoding.)
         for_chunks(&mut logits, ne, true, |ti, lg| {
-            for (v, w) in lg.iter_mut().zip(m.router.chunks(h)) {
-                *v = dot(w, &x[ti * h..(ti + 1) * h]);
+            for (e, v) in lg.iter_mut().enumerate() {
+                *v = m.router.dot_row(e, h, &x[ti * h..(ti + 1) * h]);
             }
         });
     }

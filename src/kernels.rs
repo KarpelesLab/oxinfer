@@ -3065,6 +3065,28 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     s
 }
 
+/// [`dot`] of a bf16 row (widened exactly to f32) with `b`: the same eight lanes and the same
+/// order of operations, so the result is bit for bit `dot` of the row's f32 copy, from half the
+/// bytes.
+#[inline]
+pub fn dot_bf16_exact(a: &[u16], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len();
+    let mut acc = [0f32; 8];
+    let (ac, ar) = a.as_chunks::<8>();
+    let (bc, _) = b.as_chunks::<8>();
+    for (a8, b8) in ac.iter().zip(bc) {
+        for j in 0..8 {
+            acc[j] += bf16_to_f32(a8[j]) * b8[j];
+        }
+    }
+    let mut s = acc.iter().sum::<f32>();
+    for (i, &w) in ar.iter().enumerate() {
+        s += bf16_to_f32(w) * b[n - ar.len() + i];
+    }
+    s
+}
+
 /// `out[j] = dot(q, &keys[j * stride..][..q.len()])` for every `j`: the bits of [`dot`], with
 /// several keys in flight at a time on x86-64 (each sum keeps its own order).
 pub fn dots(q: &[f32], keys: &[f32], stride: usize, out: &mut [f32]) {
@@ -3502,6 +3524,19 @@ mod tests {
                 (got as f64 - exact).abs() <= 1e-5 * exact.max(1e-30),
                 "n = {n}: {got} against {exact}"
             );
+        }
+    }
+
+    /// `dot_bf16_exact` gives `dot`'s bits over the bf16 values widened to f32 (whole groups of
+    /// eight and tails).
+    #[test]
+    fn bf16_dot_matches_f32_dot_bitwise() {
+        let mut s = 11u64;
+        for n in [0usize, 5, 8, 64, 5120, 5123] {
+            let w: Vec<u16> = (0..n).map(|_| (lcg(&mut s).to_bits() >> 16) as u16).collect();
+            let x: Vec<f32> = (0..n).map(|_| lcg(&mut s)).collect();
+            let wf: Vec<f32> = w.iter().map(|&v| bf16_to_f32(v)).collect();
+            assert_eq!(dot_bf16_exact(&w, &x).to_bits(), dot(&wf, &x).to_bits(), "n={n}");
         }
     }
 

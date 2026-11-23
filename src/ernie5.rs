@@ -329,7 +329,7 @@ fn load_layer<'a>(ld: &Loader<'a, '_>, l: usize) -> Result<(Layer<'a>, LayerE<'a
     let act = act(c);
     let (moe, latent) = if l < e.first_k_dense_replace {
         let moe = Moe {
-            router: Vec::new(),
+            router: RouterW::F32(Vec::new()),
             pick: Pick::Score(None),
             bias_vl: None,
             experts: Experts::load(ld.files, &format!("{fp}experts."), 0, 0, 0, h, ld.quant, act)?,
@@ -346,7 +346,7 @@ fn load_layer<'a>(ld: &Loader<'a, '_>, l: usize) -> Result<(Layer<'a>, LayerE<'a
         let mut router = ld.getf(&format!("{fp}gate.weight"), &[ne, h])?;
         router.extend(ld.getf(&format!("{fp}gate.weight_1"), &[ne, h])?);
         let moe = Moe {
-            router,
+            router: RouterW::F32(router),
             pick: Pick::Score(Some(ld.getf(&format!("{fp}gate.bias"), &[ne])?)),
             bias_vl: None,
             experts: Experts::load(ld.files, &format!("{fp}experts."), ne, k, mi, ls, ld.quant, act)?,
@@ -676,9 +676,10 @@ fn ffn(m: &DeepSeek4Model, layer: &Layer, lx: &LayerE, x: &[f32], t: usize, y: &
     };
     // Scores: the two routers' sigmoids summed.
     let mut scores = vec![0f32; t * ne];
+    let rw = mo.router.f32();
     for_chunks(&mut scores, ne, t > 1, |ti, sc| {
         let xr = &x[ti * h..(ti + 1) * h];
-        let (r0, r1) = mo.router.split_at(ne * h);
+        let (r0, r1) = rw.split_at(ne * h);
         for (i, v) in sc.iter_mut().enumerate() {
             *v = sigmoid(dot(&r0[i * h..(i + 1) * h], xr)) + sigmoid(dot(&r1[i * h..(i + 1) * h], xr));
         }
