@@ -401,6 +401,89 @@ __device__ __forceinline__ float2 rowdot2(const W& w, const u8* ra, const u8* rb
 // block's values share (its scale, the superblock's header) is decoded once per 32 values, not
 // once per 4. For devices whose matvecs are bound by the loads and the arithmetic and not by the
 // memory (the GB10 of a DGX Spark, `cuda.rs`); the sums are taken in another order.
+// A block of 32 of a row against x's 32 values (`xv`, sum `sx`) for the matvecs: Q4_K and Q6_K
+// take the stored integers into floats by a byte permute into 2^23's mantissa and a subtraction
+// (no conversion instructions), and Q4_K its scale and min once per block (d sc sum q x - m sum
+// x); the other formats through `dq`.
+__device__ __forceinline__ float mag23(u32 v, u32 sel) { return __int_as_float(__byte_perm(v, 0x4B000000u, sel)); }
+template <int K>
+__device__ __forceinline__ float blockdot(const u8* rp, u32 b, const float4* xv, float sx) {
+    if constexpr (K == K_Q4_K) {
+        const u8* B = rp + 144 * (b >> 3);
+        u32 sub = b & 7;
+        // d, dmin and the 12 scale bytes in one 16-byte load (scale_min_k4's values).
+        uint4 hd = *(const uint4*)B;
+        u32 sh8 = 8 * (sub & 3), sc, mn;
+        if (sub < 4) {
+            sc = (hd.y >> sh8) & 63;
+            mn = (hd.z >> sh8) & 63;
+        } else {
+            u32 c = hd.w >> sh8;
+            sc = (c & 15) | (((hd.y >> sh8) >> 6 & 3) << 4);
+            mn = ((c >> 4) & 15) | (((hd.z >> sh8) >> 6 & 3) << 4);
+        }
+        const uint4* qp = (const uint4*)(B + 16 + 32 * (sub >> 1));
+        uint4 u0 = qp[0], u1 = qp[1];
+        const u32 ws[8] = {u0.x, u0.y, u0.z, u0.w, u1.x, u1.y, u1.z, u1.w};
+        u32 sh = 4 * (sub & 1);
+        float s0 = 0.f, s1 = 0.f;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            u32 v = (ws[j] >> sh) & 0x0f0f0f0fu;
+            s0 = fmaf(mag23(v, 0x7540) - 8388608.f, xv[j].x, s0);
+            s1 = fmaf(mag23(v, 0x7541) - 8388608.f, xv[j].y, s1);
+            s0 = fmaf(mag23(v, 0x7542) - 8388608.f, xv[j].z, s0);
+            s1 = fmaf(mag23(v, 0x7543) - 8388608.f, xv[j].w, s1);
+        }
+        return h2f(hd.x & 0xffff) * (float)sc * (s0 + s1) - h2f(hd.x >> 16) * (float)mn * sx;
+    } else if constexpr (K == K_Q6_K) {
+        const u8* B = rp + 210 * (b >> 3);
+        u32 sub = b & 7, n = sub >> 2, qq = sub & 3;
+        const u8* ql = B + 64 * n + 32 * (qq & 1);
+        const u8* qh = B + 128 + 32 * n;
+        u32 s1 = 4 * (qq >> 1), s2 = 2 * qq;
+        // The blocks are 2-byte aligned: 9 aligned words around each 32 bytes, funnel-shifted.
+        u32 fs = 8 * ((u32)(u64)ql & 2);
+        const u32* la = (const u32*)((u64)ql & ~(u64)3);
+        const u32* ha = (const u32*)((u64)qh & ~(u64)3);
+        u32 lw[9], hw[9];
+#pragma unroll
+        for (int j = 0; j < 9; j++) {
+            lw[j] = la[j];
+            hw[j] = ha[j];
+        }
+        float h[2] = {0.f, 0.f};
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            u32 l = __funnelshift_r(lw[j], lw[j + 1], fs), hb = __funnelshift_r(hw[j], hw[j + 1], fs);
+            u32 v = ((l >> s1) & 0x0f0f0f0fu) | (((hb >> s2) & 0x03030303u) << 4);
+            float a = h[j >> 2];
+            a = fmaf(mag23(v, 0x7540) - 8388640.f, xv[j].x, a); // 2^23 + 32: the values less 32
+            a = fmaf(mag23(v, 0x7541) - 8388640.f, xv[j].y, a);
+            a = fmaf(mag23(v, 0x7542) - 8388640.f, xv[j].z, a);
+            a = fmaf(mag23(v, 0x7543) - 8388640.f, xv[j].w, a);
+            h[j >> 2] = a;
+        }
+        const signed char* sc = (const signed char*)(B + 192 + 8 * n + 2 * qq);
+        return h2f(rd16(B + 208)) * ((float)sc[0] * h[0] + (float)sc[1] * h[1]);
+    } else {
+        float p = 0.f;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            float4 v = dq<K>(rp, b, j);
+            p += v.x * xv[j].x + v.y * xv[j].y + v.z * xv[j].z + v.w * xv[j].w;
+        }
+        return p;
+    }
+}
+template <int K>
+__device__ __forceinline__ float blocksum(const float4* xv) {
+    if constexpr (K != K_Q4_K) return 0.f;
+    float4 t = xv[0];
+#pragma unroll
+    for (int j = 1; j < 8; j++) t = make_float4(t.x + xv[j].x, t.y + xv[j].y, t.z + xv[j].z, t.w + xv[j].w);
+    return (t.x + t.y) + (t.z + t.w);
+}
 template <int K>
 __device__ __forceinline__ void mv_body(const W& w, const float* x, float* y, u32 n_in, u32 n_out, u32 xs, u32 ys, u32 mode) {
     u32 warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -415,16 +498,12 @@ __device__ __forceinline__ void mv_body(const W& w, const float* x, float* y, u3
         float4 xv[8];
 #pragma unroll
         for (int j = 0; j < 8; j++) xv[j] = *(const float4*)(xt + 32 * b + 4 * j);
+        float sx = blocksum<K>(xv);
 #pragma unroll
         for (int i = 0; i < MV_ROWS; i++) {
             u32 row = min(r0 + i, n_out - 1);
             const u8* rp = w.q + (u64)row * w.rb;
-            float p = 0.f;
-#pragma unroll
-            for (int j = 0; j < 8; j++) {
-                float4 v = dq<K>(rp, b, j);
-                p += v.x * xv[j].x + v.y * xv[j].y + v.z * xv[j].z + v.w * xv[j].w;
-            }
+            float p = blockdot<K>(rp, b, xv, sx);
             if constexpr (BLOCK_SCALED(K)) p *= w.s[(row / w.sr) * w.ncb + (32 * b) / w.sc];
             a[i] += p;
         }
@@ -473,6 +552,7 @@ __device__ __forceinline__ void mvp_body(const W& w, const W& w2, const float* x
         float4 xv[8];
 #pragma unroll
         for (int j = 0; j < 8; j++) xv[j] = *(const float4*)(xt + 32 * b + 4 * j);
+        float sx = blocksum<K>(xv);
 #pragma unroll
         for (int m = 0; m < 2; m++) {
             const W& ww = m ? w2 : w;
@@ -480,12 +560,7 @@ __device__ __forceinline__ void mvp_body(const W& w, const W& w2, const float* x
             for (int i = 0; i < MVP_ROWS; i++) {
                 u32 row = min(r0 + i, n_out - 1);
                 const u8* rp = ww.q + (u64)row * ww.rb;
-                float p = 0.f;
-#pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    float4 v = dq<K>(rp, b, j);
-                    p += v.x * xv[j].x + v.y * xv[j].y + v.z * xv[j].z + v.w * xv[j].w;
-                }
+                float p = blockdot<K>(rp, b, xv, sx);
                 if constexpr (BLOCK_SCALED(K)) p *= ww.s[(row / ww.sr) * ww.ncb + (32 * b) / ww.sc];
                 a[m][i] += p;
             }

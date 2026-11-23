@@ -219,6 +219,16 @@ IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4. Three things run on the
   a grid row per token, so their results are the single-token steps' bit for bit. On an RTX PRO
   6000 Blackwell (`parity_bench`, tg128): Llama-3.2-1B Q4_K_M 768 tok/s and Qwen3-8B Q4_K_M 169
   (666 / 161 with 4 values per lane and the pairs unfused; llama.cpp `e6d624b` 1067 / 254).
+  Q4_K and Q6_K blocks then go through a dot of their own (`blockdot`): the stored integers
+  become floats by a byte permute into 2^23's mantissa and one subtraction (no conversion
+  instructions), Q4_K applies its scale and min once per block (d sc sum q x - m sum x, sum x
+  once per lane and block for every row), Q6_K reads its 2-byte aligned blocks as aligned words
+  funnel-shifted (two 16-bit loads per word before) and Q4_K its header in one 16-byte load. The
+  matvecs were bound by their arithmetic per value (Q4_K, 1.46 times Q6_K's values per byte, ran
+  at 0.7 times its bandwidth); on the shapes alone (`ggml_bench`) Q4_K 12288 x 4096 875 -> 1036
+  GB/s, 4096 x 12288 809 -> 970, the 151936-row LM head 895 -> 1128; Q6_K 1158 -> 1369, 1063 ->
+  1244, 1154 -> 1318. Decode (tg128 median of 3, a GPU another process was using): Qwen3-8B
+  Q4_K_M 161 -> 169 tok/s, Llama-3.2-1B Q4_K_M 866 -> 917.
   Measured and dropped: an int8 matvec for Q4_K, Q6_K and Q8_0 (x rounded per block of 32 as
   the CPU's decode kernels round it, once per block of rows into shared memory, then `dp4a`
   against the stored integers and each block's sums scaled in f32, as llama.cpp's `mmvq`):
