@@ -544,6 +544,36 @@ fn pf_absorb() -> bool {
     std::env::var("OXINFER_PF_ABSORB").map_or(true, |v| v != "0")
 }
 
+/// One-token plans: for each AddNorm, the one-row RMSNorm right before it that adds into its y
+/// (Gemma 4 26B-A4B: the routed experts' post norm, `ob += norm(eo) w`), which the AddNorm's
+/// kernel then computes first (`dec_norm_add_norm`, the same arithmetic on the same threads): a
+/// dispatch and a barrier fewer per MoE layer (`OXINFER_DEC_NORM_PRE=0`: the separate norm).
+fn dec_norm_pre(g: &Graph) -> Vec<Option<usize>> {
+    let mut pre = vec![None; g.ops.len()];
+    for (i, w) in g.ops.windows(2).enumerate() {
+        if let [
+            Op::Norm {
+                out,
+                w: Some(_),
+                pre: p,
+                n,
+                rows: 1,
+                add: true,
+                ..
+            },
+            Op::AddNorm { y, n: n2, .. },
+        ] = w
+            && *p == 1.0
+            && y == out
+            && n == n2
+            && i + 1 < g.head_from
+        {
+            pre[i + 1] = Some(i);
+        }
+    }
+    pre
+}
+
 /// Norms a prefill plan's fused AddNorms make too (`MOp::AddNormHalf::ex`): for each AddNorm that
 /// takes `pf_add_norm_half` (its next norm feeding the next op's GEMM), up to two later RMSNorms of
 /// its new residual `x` (one row, no add, no pre-scale, the same `n` and `eps`) with only GEMMs,
@@ -1621,6 +1651,9 @@ enum MOp {
         threads: usize,
         /// Multi-token plans: the pipeline and the y, x, out strides.
         t: Option<(Id, [u32; 4])>,
+        /// One-token plans: a norm added into y first (`dec_norm_add_norm`): its input's arena
+        /// offset, its weight's constants offset and its parameters.
+        pre: Option<(usize, usize, NormParams)>,
     },
     Ew {
         pipe: Id,
@@ -2495,10 +2528,20 @@ impl MetalBackend {
             Vec::new()
         };
         let tail_skip = |i: usize| tails.iter().any(|t| t.norms.contains(&i)) || absorb.iter().any(|a| a.1.contains(&i));
+        // One-token plans: norms added into the next AddNorm's y, computed by it.
+        let pre_norm = if mt || std::env::var("OXINFER_DEC_NORM_PRE").is_ok_and(|v| v == "0") {
+            vec![None; g.ops.len()]
+        } else {
+            dec_norm_pre(g)
+        };
         for (i, op) in g.ops.iter().enumerate() {
             op_mop.push(ops.len());
             if tail_skip(i) {
                 // (Computed by the layer's `MOp::PfMoeTail`.)
+                continue;
+            }
+            if pre_norm.contains(&Some(i)) {
+                // (Computed by the next op, `dec_norm_add_norm`.)
                 continue;
             }
             let mut smv: Option<([usize; 3], Option<[usize; 3]>)> = None;
@@ -3318,8 +3361,33 @@ impl MetalBackend {
                         fused_out = Some(rng(o, n));
                         break 'an (vec![rng(y, n), rng(x, n)], wr);
                     }
+                    // A norm added into y right before (see `dec_norm_pre`).
+                    let pre = match pre_norm[i].map(|j| &g.ops[j]) {
+                        Some(Op::Norm {
+                            x: e,
+                            w: Some(w),
+                            eps,
+                            x_stride,
+                            out_stride,
+                            ..
+                        }) => Some((
+                            *e,
+                            cst(w),
+                            NormParams {
+                                n: n as u32,
+                                eps: *eps,
+                                has_w: 1,
+                                add: 1,
+                                x_stride: *x_stride as u32,
+                                o_stride: *out_stride as u32,
+                                pre: 1.0,
+                                _p: 0,
+                            },
+                        )),
+                        _ => None,
+                    };
                     emit.push(MOp::AddNorm {
-                        pipe: self.named_pipeline("dec_add_norm")?,
+                        pipe: self.named_pipeline(if pre.is_some() { "dec_norm_add_norm" } else { "dec_add_norm" })?,
                         y: byte(y),
                         x: byte(x),
                         out: next.map_or(byte(x), |(o, _)| byte(o)),
@@ -3336,10 +3404,16 @@ impl MetalBackend {
                         } else {
                             None
                         },
+                        pre: pre.map(|(e, w, np)| (byte(e), w, np)),
                     });
                     let mut w = vec![rng(x, n)];
                     w.extend(next.map(|(o, _)| rng(o, n)));
-                    (vec![rng(y, n), rng(x, n)], w)
+                    let mut r = vec![rng(y, n), rng(x, n)];
+                    if let Some((e, ..)) = pre {
+                        r.push(rng(e, n));
+                        w.push(rng(y, n));
+                    }
+                    (r, w)
                 }
                 Op::Ew { kind, a, b, out, n } => {
                     use crate::gpu::decode::Ew;
@@ -6785,6 +6859,7 @@ impl DecodePlan for MetalPlan<'_> {
                         wn,
                         p,
                         threads,
+                        pre,
                         ..
                     } => {
                         e.pipe(*pipe);
@@ -6794,6 +6869,11 @@ impl DecodePlan for MetalPlan<'_> {
                         e.buf(consts, *wy, 3);
                         e.buf(consts, *wn, 4);
                         e.bytes(p, 5);
+                        if let Some((ev, w0, np)) = pre {
+                            e.buf(arena, *ev, 6);
+                            e.buf(consts, *w0, 7);
+                            e.bytes(np, 8);
+                        }
                         e.dispatch((1, 1), *threads);
                     }
                     MOp::Ew { pipe, a, b, out, n, p, .. } => {

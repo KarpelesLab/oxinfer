@@ -649,10 +649,8 @@ MVK_SIG(NAME) { threadgroup float red[2 * NR * KS]; constant MV& p = q.m; \
 // ---- RMSNorm over rows of n: out = x * rsqrt(mean(x^2) + eps) * w (w optional; `add`: out += ...).
 // One threadgroup per row.
 struct NP { uint n; float eps; uint has_w; uint add; uint x_stride; uint o_stride; float pre; uint _p; };
-kernel void dec_rms_norm(device const float* x [[buffer(0)]], device float* out [[buffer(1)]], device const float* w [[buffer(2)]],
-                         constant NP& p [[buffer(3)]], uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
-                         uint nt [[threads_per_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float red[32];
+inline void rms_norm_body(device const float* x, device float* out, device const float* w, constant NP& p, uint r, uint tid, uint nt,
+                          uint sg, uint lane, threadgroup float* red) {
     device const float* xr = x + (ulong)r * p.x_stride;
     device float* o = out + (ulong)r * p.o_stride;
     // Up to 8 values per thread (and their weights) are loaded at once and kept in registers (one
@@ -692,6 +690,13 @@ kernel void dec_rms_norm(device const float* x [[buffer(0)]], device float* out 
             if (p.add != 0) o[i] += v; else o[i] = v;
         }
     }
+}
+
+kernel void dec_rms_norm(device const float* x [[buffer(0)]], device float* out [[buffer(1)]], device const float* w [[buffer(2)]],
+                         constant NP& p [[buffer(3)]], uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                         uint nt [[threads_per_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[32];
+    rms_norm_body(x, out, w, p, r, tid, nt, sg, lane, red);
 }
 
 // ---- Attention inputs for one token: per-head RMSNorm (optional) and RoPE of the queries (into
@@ -1333,6 +1338,19 @@ kernel void dec_add_norm(device const float* y [[buffer(0)]], device float* x [[
                          uint tid [[thread_index_in_threadgroup]], uint nt [[threads_per_threadgroup]],
                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float red[32];
+    add_norm_body(y, x, out, wy, wn, p, tid, nt, sg, lane, red);
+}
+// A one-row RMSNorm added into y first (y += rmsnorm(e) * w0: `dec_rms_norm`'s body and
+// parameters `np`, on the same threads), then the AddNorm: Gemma 4 26B-A4B's routed experts' post norm and its
+// residual step in one dispatch. Each thread reads back the y values it wrote itself.
+kernel void dec_norm_add_norm(device float* y [[buffer(0)]], device float* x [[buffer(1)]], device float* out [[buffer(2)]],
+                              device const float* wy [[buffer(3)]], device const float* wn [[buffer(4)]], constant AN& p [[buffer(5)]],
+                              device const float* e [[buffer(6)]], device const float* w0 [[buffer(7)]], constant NP& np [[buffer(8)]],
+                              uint tid [[thread_index_in_threadgroup]], uint nt [[threads_per_threadgroup]],
+                              uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[32];
+    rms_norm_body(e, y, w0, np, 0, tid, nt, sg, lane, red);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     add_norm_body(y, x, out, wy, wn, p, tid, nt, sg, lane, red);
 }
 // Several tokens (threadgroup y): ts = strides of y, x, out.
