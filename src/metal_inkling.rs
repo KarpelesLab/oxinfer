@@ -174,6 +174,13 @@ fn attf_on() -> bool {
     *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_ATTF").is_ok_and(|v| v == "0"))
 }
 
+/// Whether passes of up to [`MAX_T`] tokens merge a token's key splits in the attention kernel (the
+/// last split to finish) rather than in `ink_attn_merge` (`OXINFER_INKLING_MFOLD=0`).
+fn mfold_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_MFOLD").is_ok_and(|v| v == "0"))
+}
+
 /// The chunk of an expert format's kernels (values per `mdot`).
 fn ch_of(fmt: &str) -> usize {
     expert_formats().iter().find(|f| f.0 == fmt).map_or(32, |f| f.3)
@@ -453,6 +460,9 @@ struct AttnP {
     sink: u32,
     gate: u32,
     out: u32,
+    /// With `fin`: the splits' counters (the last split merges).
+    mcnt: u32,
+    _m1: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -514,9 +524,9 @@ struct MvfP {
     w: u32,
     x: u32,
     y: u32,
-    _p0: u32,
-    _p1: u32,
-    _p2: u32,
+    ss: u32,
+    np: u32,
+    eps: f32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -555,6 +565,10 @@ struct XP {
     cap_g: f32,
     cap_u: f32,
     add: u32,
+    ss: u32,
+    np: u32,
+    eps: f32,
+    _p: u32,
 }
 /// The decode library's multi-token matvec parameters (`MVK`).
 #[repr(C)]
@@ -743,6 +757,8 @@ struct Bufs {
     gd: usize,
     gf: usize,
     gg: usize,
+    /// The message gates' sums of squares per block of 64 channels (`ink_gfg`, [`InkMetal::mlp_fold`]).
+    gss: usize,
     q: usize,
     r: usize,
     gate: usize,
@@ -760,6 +776,9 @@ struct Bufs {
     act: usize,
     o: usize,
     part: usize,
+    /// A counter per (token, key head) of passes of up to MAX_T tokens: the last of a token's
+    /// splits to finish merges them (zero between passes).
+    mcnt: usize,
     hidden: usize,
     logits: usize,
     capped: usize,
@@ -1826,6 +1845,7 @@ impl InkMetal {
                 gd: take(4 * t * rank),
                 gf: take(4 * th),
                 gg: take(4 * th),
+                gss: take(4 * t * 64),
                 q: take(t * max_w),
                 r: take(t * max_nh * dr),
                 gate: take(t * max_w),
@@ -1843,6 +1863,7 @@ impl InkMetal {
                 act: take(t * topk * mi),
                 o: take(th),
                 part: take(t * max_nh * maxsplit * (128 + 2)),
+                mcnt: take(MAX_T * max_nkv),
                 hidden: take(th),
                 // (Prefill: the logits of the last tokens only.)
                 logits: take(t.min(MAX_T) * c.vocab_size),
@@ -2238,6 +2259,7 @@ impl InkMetal {
         }
         let (pipe, nr, threads) = d.multi[usize::from(t > 8)];
         let w = &d.w;
+        e.note(((w.n_out << 44) | (w.n_in << 24) | (pipe as usize & 0xff_ffff)) as Id);
         let p = MvkP {
             m: MvParams {
                 n_out: w.n_out as u32,
@@ -2260,7 +2282,7 @@ impl InkMetal {
             sy: w.n_out as u32,
             sgate: 0,
         };
-        e.pipe(pipe);
+        e.fe().pipe(pipe);
         e.buf(w.data, 0, 0);
         e.buf(w.scales, 0, 1);
         e.buf(a, x * 4, 2);
@@ -2452,7 +2474,8 @@ impl InkMetal {
 
     /// Message gates `which` (gate index, input, norm weights, output) with messages `msgs + i`:
     /// the gated inputs RMS-normed into the outputs.
-    fn gates(&self, e: &Pe, c: &Cx, g: &[GateDev; 4], which: &[(usize, usize, usize, usize)], t: usize, normed: bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn gates(&self, e: &Pe, c: &Cx, g: &[GateDev; 4], which: &[(usize, usize, usize, usize)], t: usize, normed: bool, fold: bool) {
         let (h, th) = (self.h, c.b.tm * self.h);
         let b = c.b;
         // (`normed`: the mixes that made the inputs wrote them normed, `mix_cat`.)
@@ -2480,25 +2503,18 @@ impl InkMetal {
         }
         e.barrier();
         // Float32 or bf16 forget / gain rows of the rank: both matvecs and the mix per channel in
-        // one kernel (`ink_gfg`), then the norm.
-        let fast = |d: &Dw| -> Option<u32> {
-            let el = match d.w.fmt {
-                MvFmt::Gguf(GgmlType::F32) => 4,
-                MvFmt::Bf16 => 2,
-                _ => return None,
-            };
-            (d.lora.is_empty() && self.rank.is_multiple_of(16) && d.w.gpr as usize == self.rank * el).then_some((el == 2) as u32)
-        };
+        // one kernel (`ink_gfg`), then the norm (with `fold`, in the kernels after: one gate).
         if let Some(bf) = which
             .iter()
-            .map(|&(i, ..)| fast(&g[i].forget).zip(fast(&g[i].gain)))
+            .map(|&(i, ..)| self.gate_fast(&g[i]))
             .try_fold(None, |acc: Option<u32>, f| {
-                let (a1, a2) = f?;
-                (a1 == a2 && acc.is_none_or(|x| x == a1)).then_some(Some(a1))
+                let a1 = f?;
+                acc.is_none_or(|x| x == a1).then_some(Some(a1))
             })
             .flatten()
         {
-            for &(i, src, _, _) in which {
+            let fold = fold && which.len() == 1;
+            for &(i, src, w, out) in which {
                 #[repr(C)]
                 struct P {
                     h: u32,
@@ -2509,6 +2525,9 @@ impl InkMetal {
                     out: u32,
                     bf: u32,
                     _p: u32,
+                    w: u32,
+                    ss: u32,
+                    _q: [u32; 2],
                 }
                 e.pipe(self.p.gfg);
                 e.buf(c.a, 0, 0);
@@ -2521,15 +2540,22 @@ impl InkMetal {
                         d: (b.gd + i * c.b.tm * self.rank) as u32,
                         x: src as u32,
                         m: (b.msgs + i * th) as u32,
-                        out: (b.gf + i * th) as u32,
+                        out: if fold { out } else { b.gf + i * th } as u32,
                         bf,
                         _p: 0,
+                        w: w as u32,
+                        ss: if fold { b.gss } else { 0 } as u32,
+                        _q: [0; 2],
                     },
                     3,
                 );
+                e.buf(self.consts, 0, 4);
                 e.dispatch((h.div_ceil(64), t), 256);
             }
             e.barrier();
+            if fold {
+                return;
+            }
             for &(i, _, w, out) in which {
                 self.norm(e, c, b.gf + i * th, out, Some(w), self.eps, h, h, t);
             }
@@ -2822,7 +2848,7 @@ impl InkMetal {
                     })
                     .collect();
                 if !self.skip(SK_GATES) {
-                    self.gates(e, c, g, &which, t, !self.skip(SK_MIX));
+                    self.gates(e, c, g, &which, t, !self.skip(SK_MIX), false);
                 }
                 3
             }
@@ -2983,13 +3009,16 @@ impl InkMetal {
             tmp: tmp as u32,
             ..Default::default()
         };
-        // (`ink_attv` merges the tokens of one split itself; the merge kernel the others.)
+        // (`ink_attv` merges the tokens of one split itself, and those of several splits in the
+        // last split to finish; the merge kernel the others.)
         let fin = t <= MAX_T;
+        let mfold = fin && mfold_on();
         let ap = AttnP {
             fin: fin as u32,
             sink: b.sink as u32,
             gate: b.gate as u32,
             out: b.att as u32,
+            mcnt: if mfold { b.mcnt as u32 } else { 0 },
             ..ap
         };
         self.std(
@@ -3081,7 +3110,7 @@ impl InkMetal {
             fin: fin as u32,
             ..Default::default()
         };
-        if !fin || maxsplit > 1 {
+        if !fin || (maxsplit > 1 && !mfold) {
             e.pipe(self.p.merge);
             e.buf(c.a, 0, 0);
             e.bytes(&mp, 1);
@@ -3146,19 +3175,67 @@ impl InkMetal {
             e.barrier();
             let (g, _) = ld.gates.as_ref().unwrap();
             if !self.skip(SK_GATES) {
-                self.gates(e, c, g, &[(3, b.hm, ld.ln_post, b.hn)], t, !self.skip(SK_MIX));
+                self.gates(e, c, g, &[(3, b.hm, ld.ln_post, b.hn)], t, !self.skip(SK_MIX), self.mlp_fold(si, t));
             }
         } else if !self.skip(SK_MIX) {
             self.mix(e, c, &sp.mlp_states, b.x, ld.mlp_query, 1, b.hn, Some(ld.ln_post), t);
         }
         e.barrier();
-        self.route(e, c, ld, t);
+        self.route(e, c, si, t);
+    }
+
+    /// Whether a message gate's forget / gain rows run in `ink_gfg` (float32 or bf16 rows of the
+    /// rank, no LoRA updates): whether they are bf16.
+    fn gate_fast(&self, g: &GateDev) -> Option<u32> {
+        let fast = |d: &Dw| -> Option<u32> {
+            let el = match d.w.fmt {
+                MvFmt::Gguf(GgmlType::F32) => 4,
+                MvFmt::Bf16 => 2,
+                _ => return None,
+            };
+            (d.lora.is_empty() && self.rank.is_multiple_of(16) && d.w.gpr as usize == self.rank * el).then_some((el == 2) as u32)
+        };
+        let (f, g) = (fast(&g.forget)?, fast(&g.gain)?);
+        (f == g).then_some(f)
+    }
+
+    /// Whether step `si`'s MLP message gate leaves its norm to the router and the experts' gate /
+    /// up kernels (`ink_gfg` writes the weighted output and its sums of squares, `ink_mvr` and
+    /// `_rpair` / `_gpair` scale their sums by the norm): passes of up to [`MAX_T`] tokens, no
+    /// LoRA updates of the experts' gate / up rows. `OXINFER_INKLING_GFOLD=0`: the norm kernel.
+    fn mlp_fold(&self, si: usize, t: usize) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sp = &self.plan[si];
+        let ld = &self.layers[sp.layer];
+        let Some((g, _)) = ld.gates.as_ref() else {
+            return false;
+        };
+        sp.bank.is_some()
+            && t <= MAX_T
+            && self.wide(t)
+            && self.h.is_multiple_of(4)
+            && self.h <= 4096
+            && ld.exp.xlora_gu.is_none()
+            && self.gate_fast(&g[3]).is_some()
+            && !self.skip(SK_GATES | SK_MIX | SK_ROUTE | SK_MVF)
+            && *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_GFOLD").is_ok_and(|v| v == "0"))
+    }
+
+    /// The parameters that point a kernel reading `hn` at its norm's partial sums (`ink_gscale`)
+    /// when step `si`'s MLP gate leaves the norm to it: (ss, np, eps).
+    fn fold_p(&self, c: &Cx, si: usize, t: usize) -> (u32, u32, f32) {
+        if self.mlp_fold(si, t) {
+            (c.b.gss as u32, self.h.div_ceil(64) as u32, self.eps)
+        } else {
+            (0, 0, 0.0)
+        }
     }
 
     /// The router's logits of `hn` (the f32 GEMM in prefill passes, else a SIMD-group per
     /// expert) and the routing into `sel` (a pass of one token also gets its expert groups).
-    fn route(&self, e: &Pe, c: &Cx, ld: &LayerDev, t: usize) {
+    fn route(&self, e: &Pe, c: &Cx, si: usize, t: usize) {
         let (h, b) = (self.h, c.b);
+        let ld = &self.layers[self.plan[si].layer];
         match &self.pfp {
             Some(pp) if t > MAX_T => {
                 // (32 x 32 tiles; the rows are padded to 32.)
@@ -3173,13 +3250,16 @@ impl InkMetal {
                 }
             }
             _ if self.wide(t) && h % 4 == 0 && h <= 4096 => {
+                let (ss, np, eps) = self.fold_p(c, si, t);
                 let rp = MvfP {
                     n_out: self.ne as u32,
                     n_in: h as u32,
                     w: ld.router as u32,
                     x: b.hn as u32,
                     y: b.rlog as u32,
-                    ..Default::default()
+                    ss,
+                    np,
+                    eps,
                 };
                 self.std(e, c, self.p.mvr);
                 e.bytes(&rp, 2);
@@ -3283,6 +3363,7 @@ impl InkMetal {
                 e.dispatch((1, 1), n.next_multiple_of(32));
                 e.barrier();
             }
+            let (ss, np, eps) = self.fold_p(c, si, t);
             let xp = XP {
                 inter: self.inter as u32,
                 h: h as u32,
@@ -3296,6 +3377,10 @@ impl InkMetal {
                 cap_g: self.caps.0,
                 cap_u: self.caps.1,
                 add: 0,
+                ss,
+                np,
+                eps,
+                _p: 0,
             };
             let gq = [b.grp as u32, b.asg as u32, ld.exp.lpr.0, ld.exp.lpr.1];
             let lq = self.gu_lora(e, c, ld, t);
@@ -3392,6 +3477,7 @@ impl InkMetal {
                 cap_g: self.caps.0,
                 cap_u: self.caps.1,
                 add: 0,
+                ..Default::default()
             };
             let lq = self.gu_lora(e, c, ld, t);
             e.pipe(ld.exp.pair);
