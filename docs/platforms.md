@@ -208,8 +208,23 @@ IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4. Three things run on the
   (666 / 161 with 4 values per lane and the pairs unfused; llama.cpp `e6d624b` 1067 / 254).
 - **Prompts, whole pass** (`decode_plan_prefill`, steps of up to 512 tokens,
   `OXINFER_CUDA_PREFILL_TOKENS`; `OXINFER_PREFILL_GPU=0` keeps the op-by-op path): the matmuls as
-  tensor-core GEMMs with the weights' integer values as stored (exact in f16), the activations as
-  pairs of halves and each 16-column step's sums scaled in f32 (`gemmi_*`); RMSNorm, RoPE, the
+  tensor-core GEMMs. By default (`gemmh_*`) the activations go in as f16 rows (converted once per
+  GEMM) and the weights as f16 values (Q4_K and Q6_K unpacked in half arithmetic, the other
+  formats through the per-format dequantizer), with f32 sums over the whole input in the tensor
+  cores, 128 x 128 tiles, the next step's activations by `cp.async` and its weight bytes
+  prefetched into L1 during the current step's products. With `gpu_exact=1` (or
+  `OXINFER_METAL_MMA=0`) the weights' integer values go in as stored (exact in f16), the
+  activations as pairs of halves and each 16-column step's sums are scaled in f32 (`gemmi_*`,
+  within ~1e-6 of f32). On an RTX PRO 6000 Blackwell (`parity_bench`, median of 3), exact /
+  default: Qwen3-8B Q4_K_M pp512 3301 / 5249 tok/s, pp2048 2776 / 4122; Llama-3.2-1B Q4_K_M
+  16027 / 21645 and 13109 / 16829 (llama.cpp `e6d624b`: 15602 / 15529 and 74052 / 82355). Against
+  the CPU's f32 prefill (`prefill_gemm=exact`; `examples/pf_check.rs`, raw corpus text, 512 and
+  1500 tokens, 32 greedy tokens), the default's first step is within 0.006-0.02 in
+  log-probability over the top 20 (the exact GEMM's 1e-5-2e-3; the CPU's own default int8 GEMM's
+  0.06-0.09) and its greedy tokens are the exact GEMM's in all four runs. The GEMM time of a
+  512-token Qwen3-8B pass: 106 ms with the per-format dequantizer for every format, 98 with it
+  reading cached bytes only (so its arithmetic, not memory, was the cost), 55 with the half
+  arithmetic unpacking; 64-row tiles 159; the split GEMM 114. RMSNorm, RoPE, the
   activations, the Gated DeltaNet convolution and delta rule (the state in registers across the
   step's tokens) over all tokens in one launch; attention with the decode kernel, 32 tokens per
   launch; the hidden states, the new keys and values and the recurrent states come back to the

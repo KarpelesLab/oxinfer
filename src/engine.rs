@@ -204,7 +204,9 @@ pub struct EngineOptions {
     /// prefill). Process-wide, applied on load; None leaves the current setting
     /// ([`crate::gpu::set_exact`]). Inkling-2 on CUDA takes its prefill GEMMs in split halves
     /// (within ~1e-6 of f32) unless this is `false`, which gives plain f16 operands (~15% faster
-    /// prefill). Key `gpu_exact`.
+    /// prefill). The CUDA prefill plans of GGUF language models take f16 activations and weight
+    /// values (f32 sums) unless this is `true`, which gives the split-half GEMM (within ~1e-6 of
+    /// f32; 1.3-1.6x slower prompts). Key `gpu_exact`.
     pub gpu_exact: Option<bool>,
     /// CPU prefill matmuls ([`crate::kernels::PrefillGemm`]): `auto` (default: `fast`, with
     /// llama.cpp's int8 activation rounding), `exact` (the opt-out: `sme` where the CPU has SME,

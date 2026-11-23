@@ -473,6 +473,10 @@ pub(super) struct CudaPlan<'b> {
 struct PfFuncs {
     guard: F,
     flag: u64,
+    /// The fast GEMM (`gemmh_K`, unless `gpu::exact`): `dhalf_t` and its f16 rows (`tokens` rows
+    /// of the widest GEMM input), else null.
+    half: F,
+    xh: u64,
     glu: F,
     ew: F,
     qk: F,
@@ -642,6 +646,21 @@ fn trace() -> bool {
 
 static PLAN_ID: AtomicU64 = AtomicU64::new(1);
 
+thread_local! {
+    /// Prefill plans built on this thread take the split-half GEMM (true) or the fast one
+    /// (false) whatever `gpu::exact` says ([`with_pf_exact`]; tests).
+    static PF_EXACT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with the prefill plans it builds on this thread exact (`gemmi`) or fast (`gemmh`).
+#[cfg(test)]
+pub(super) fn with_pf_exact<R>(exact: bool, f: impl FnOnce() -> R) -> R {
+    let prev = PF_EXACT.with(|c| c.replace(Some(exact)));
+    let r = f();
+    PF_EXACT.with(|c| c.set(prev));
+    r
+}
+
 /// `OXINFER_GPU_PLAN_DEBUG`: says why a plan or a step was declined.
 fn debug(why: &str) {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -706,6 +725,8 @@ impl CudaBackend {
         };
         let mut part_floats = 0usize;
         let mut pair_floats = 0usize;
+        // The widest input of a GGUF matmul (the fast prefill GEMM's f16 rows).
+        let mut gemm_in_max = 0usize;
         let mut consts: Vec<f32> = Vec::new();
         let mut cst = |v: &[f32]| -> P {
             consts.resize(consts.len().next_multiple_of(16), 0.0);
@@ -808,6 +829,7 @@ impl CudaBackend {
                         }
                         let cw = &dev.downcast_ref::<CudaWeightBox>()?.0;
                         if let WeightRef::Gguf(_) = w {
+                            gemm_in_max = gemm_in_max.max(n_in);
                             // The kernel reads x four floats at a time.
                             if !x.off.is_multiple_of(4) {
                                 return None;
@@ -1305,6 +1327,9 @@ impl CudaBackend {
             head_from = ops.len();
         }
         let flag_off = region(4);
+        // The fast prefill GEMM's f16 input rows.
+        let fast_gemm = pf && !PF_EXACT.with(|c| c.get()).unwrap_or_else(crate::gpu::exact);
+        let xh_off = region(if fast_gemm { gemm_in_max * tokens * 2 } else { 4 });
         let part_off = region(part_floats.max(1) * 4);
         let pair_off = region(pair_floats.max(1) * tokens * 4);
         let save_off: Vec<usize> = saves.iter().map(|&n| region(n * 4)).collect();
@@ -1419,6 +1444,8 @@ impl CudaBackend {
                 Some(PfFuncs {
                     guard: self.func("dguard_t")?,
                     flag: arena + flag_off as u64,
+                    half: if fast_gemm { self.func("dhalf_t")? } else { std::ptr::null_mut() },
+                    xh: arena + xh_off as u64,
                     glu: self.func("dglu_t")?,
                     ew: self.func("dew_t")?,
                     qk: self.func("dqk_rope_t")?,
@@ -1827,6 +1854,33 @@ impl CudaPlan<'_> {
                 mode,
             } if t >= PF_GEMM_MIN => {
                 let (xa, xs, flag) = (x.a, st(x), pf.flag);
+                if !pf.half.is_null() {
+                    // The fast GEMM: the rows as f16 once, then 128 x 128 tiles.
+                    let xh = pf.xh;
+                    let p = super::GemmH {
+                        xh,
+                        y: y.a,
+                        n_in,
+                        n_out,
+                        rows: tt,
+                        xs: n_in,
+                        ys: st(y),
+                        mode,
+                    };
+                    return Some(
+                        be.launch(
+                            pf.half,
+                            ((n_in / 2).div_ceil(256).min(8), tt),
+                            256,
+                            &mut args![xa, n_in, xs, xh, flag],
+                        ) && be.launch(
+                            k.gemmh,
+                            (n_out.div_ceil(128), tt.div_ceil(super::GEMMH_ROWS)),
+                            256,
+                            &mut args![w, p],
+                        ),
+                    );
+                }
                 if !be.launch(pf.guard, (n_in.div_ceil(256).min(8), tt), 256, &mut args![xa, n_in, xs, flag]) {
                     return Some(false);
                 }

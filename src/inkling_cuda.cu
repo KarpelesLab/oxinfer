@@ -1403,6 +1403,249 @@ __device__ __forceinline__ void gemmi_body(const W& w, const GemmP& p) {
             }
 }
 
+// ---- The fast prefill GEMM of the language models' plans (`gemmh_K`, `GGML_ONLY`): Y[m][n] (+)=
+// sum_k X[m][k] W[n][k] with X as f16 rows (`dhalf_t` converts them once per GEMM, rows `xs`
+// halves apart) and the weights dequantized to f16 values (block scales applied) per 32-wide K
+// step; f16 products with f32 accumulation in the tensor cores over the whole K, no per-step
+// scaling. A 256-thread block takes 128 rows x 128 outputs, 8 warps of 64 x 32; the next K
+// step's activations come in by cp.async and its weight bytes are prefetched into L1 while the
+// current step's MMAs run, then dequantized into the other of two shared-memory stages.
+#ifndef HBM
+#define HBM 128
+#endif
+#define HMT (HBM / 32) // 16-row MMA tiles per warp (warps 2 x 4)
+#define HBN 128
+#define HLD 40 // halves per shared row: 32 + 8 padding (ldmatrix rows on distinct banks)
+struct GemmH {
+    const u16* xh;
+    float* y;
+    u32 n_in, n_out, rows, xs, ys, mode;
+};
+__device__ __forceinline__ void ldsm_x4(u32* r, const void* p) {
+    u32 a = (u32)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+__device__ __forceinline__ void cp16(void* dst, const void* src, bool ok) {
+    u32 a = (u32)__cvta_generic_to_shared(dst);
+    int n = ok ? 16 : 0;
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(a), "l"(src), "r"(n));
+}
+// The bytes a format stores per group of blocks of 32 (`qgroup` blocks: 8 for the 256-value
+// superblocks), so that a block's bytes are within `[(b / qgroup) * qgbytes, + qgbytes)`.
+template <int K>
+__device__ __forceinline__ constexpr u32 qgroup() {
+    return K == K_Q4_0 || K == K_Q4_1 || K == K_Q5_0 || K == K_Q5_1 || K == K_Q8_0 || K == K_IQ4_NL || K == K_MXFP4 || K == K_F32 ||
+                   K == K_F16 || K == K_BF16 || K == K_OQ8 || K == K_OQ4 || K == K_F8
+               ? 1
+               : (K == K_NVFP4 ? 2 : 8);
+}
+template <int K>
+__device__ __forceinline__ constexpr u32 qgbytes() {
+    return K == K_F32 ? 128 : K == K_F16 || K == K_BF16 ? 64 : K == K_OQ8 || K == K_F8 ? 32 : K == K_OQ4 ? 16 : K == K_Q4_0 ? 18
+         : K == K_Q4_1 ? 20 : K == K_Q5_0 ? 22 : K == K_Q5_1 ? 24 : K == K_Q8_0 ? 34 : K == K_IQ4_NL ? 18 : K == K_MXFP4 ? 17
+         : K == K_NVFP4 ? 36 : K == K_Q2_K ? 84 : K == K_Q3_K ? 110 : K == K_Q4_K ? 144 : K == K_Q5_K ? 176 : K == K_Q6_K ? 210
+         : K == K_IQ2_XXS ? 66 : K == K_IQ2_XS ? 74 : K == K_IQ3_XXS ? 98 : K == K_IQ1_S ? 50 : K == K_IQ3_S ? 110 : K == K_IQ2_S ? 82
+         : K == K_IQ4_XS ? 136 : K == K_IQ1_M ? 56 : 256;
+}
+__device__ __forceinline__ void prefetch_l1(const void* p) { asm volatile("prefetch.global.L1 [%0];" ::"l"(p)); }
+
+// Half2 arithmetic on packed u32s.
+__device__ __forceinline__ u32 h2sub(u32 a, u32 b) {
+    u32 r;
+    asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+}
+__device__ __forceinline__ u32 h2fma(u32 a, u32 b, u32 c) {
+    u32 r;
+    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(b), "r"(c));
+    return r;
+}
+__device__ __forceinline__ u32 h2mul(u32 a, u32 b) {
+    u32 r;
+    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(r) : "r"(a), "r"(b));
+    return r;
+}
+// Four bytes of small unsigned values (below 1024) as two half2 (bytes 0, 1 and 2, 3), each value
+// v + bias exactly: the bytes go into the mantissa of 1024 (0x6400), and `off` (half2 of
+// 1024 - bias) is taken away.
+__device__ __forceinline__ void bytes_h2(u32 w, u32 off, u32& lo, u32& hi) {
+    u32 p = __byte_perm(w, 0, 0x3120); // bytes 0, 2, 1, 3
+    lo = h2sub((p & 0x00ff00ffu) | 0x64006400u, off);
+    hi = h2sub(((p >> 8) & 0x00ff00ffu) | 0x64006400u, off);
+}
+
+// The fast GEMM's weight values: elements 16 h .. 16 h + 15 of block b of a row as 8 half2 (`q`,
+// in order), the value as stored times its scales (and minus the minimum), rounded to f16. Q4_K
+// and Q6_K unpack in half arithmetic (a few operations per pair of values); the other formats
+// through `dq`.
+template <int K>
+__device__ __forceinline__ void dq16h(const u8* row, u32 b, u32 h, u32* q) {
+    if constexpr (K == K_Q4_K) {
+        const u8* B = row + 144 * (b >> 3);
+        u32 sub = b & 7;
+        float sc, mn;
+        scale_min_k4(sub, B + 4, sc, mn);
+        float d1 = h2f(rd16(B)) * sc, m1 = h2f(rd16(B + 2)) * mn;
+        u32 dd = pack_h2(d1, d1), mm = pack_h2(-m1, -m1);
+        uint4 u = *(const uint4*)(B + 16 + 32 * (sub >> 1) + 16 * h);
+        u32 ws[4] = {u.x, u.y, u.z, u.w};
+        u32 sh = 4 * (sub & 1);
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            u32 lo, hi;
+            bytes_h2((ws[i] >> sh) & 0x0f0f0f0fu, 0x64006400u, lo, hi);
+            q[2 * i] = h2fma(lo, dd, mm);
+            q[2 * i + 1] = h2fma(hi, dd, mm);
+        }
+    } else if constexpr (K == K_Q6_K) {
+        const u8* B = row + 210 * (b >> 3);
+        u32 sub = b & 7, n = sub >> 2, qq = sub & 3;
+        // Elements 16 h .. of the block take scale byte 8 n + 2 qq + h (the per-16 scales).
+        float d = h2f(rd16(B + 208)) * (float)(signed char)B[192 + 8 * n + 2 * qq + h];
+        u32 dd = pack_h2(d, d);
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            u32 ul = rd32h(B + 64 * n + 32 * (qq & 1) + 16 * h + 4 * i) >> (4 * (qq >> 1));
+            u32 uh = rd32h(B + 128 + 32 * n + 16 * h + 4 * i) >> (2 * qq);
+            u32 v = (ul & 0x0f0f0f0fu) | ((uh & 0x03030303u) << 4);
+            u32 lo, hi;
+            bytes_h2(v, 0x64206420u, lo, hi); // 1024 + 32: values - 32
+            q[2 * i] = h2mul(lo, dd);
+            q[2 * i + 1] = h2mul(hi, dd);
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            float4 v = dq<K>(row, b, 4 * h + i);
+            q[2 * i] = pack_h2(v.x, v.y);
+            q[2 * i + 1] = pack_h2(v.z, v.w);
+        }
+    }
+}
+
+template <int K>
+__device__ __forceinline__ void gemmh_body(const W& w, const GemmH& p) {
+    __shared__ __align__(16) u16 As[2][HBM * HLD];
+    __shared__ __align__(16) u16 Bs[2][HBN * HLD];
+    u32 tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    u32 m0 = blockIdx.y * HBM, n0 = blockIdx.x * HBN;
+    if (m0 >= p.rows) return;
+    // Loads: A, 128 rows x 64 bytes per step, two 16-byte chunks per thread; B, row tid / 2,
+    // parts (tid % 2) * 4 .. + 3 of the step's block of 32.
+    u32 ar = tid >> 2, ac = (tid & 3) * 8; // rows ar and ar + 64, halves ac .. + 7
+    const u16* xa0 = p.xh + (u64)min(m0 + ar, p.rows - 1) * p.xs + ac;
+    const u16* xa1 = p.xh + (u64)min(m0 + ar + 64, p.rows - 1) * p.xs + ac;
+    bool aok0 = ar < HBM && m0 + ar < p.rows, aok1 = HBM > 64 && m0 + ar + 64 < p.rows;
+    u32 br = tid >> 1, bh = tid & 1;
+    u32 wr = n0 + br;
+    bool bok = wr < p.n_out;
+    const u8* wrow = w.q + (u64)min(wr, p.n_out - 1) * w.rb;
+    u32 nb = p.n_in / 32;
+    auto load_a = [&](u32 b, u32 st) {
+        if (ar < HBM) cp16(&As[st][ar * HLD + ac], xa0 + 32 * b, aok0);
+        if (HBM > 64) cp16(&As[st][(ar + 64) * HLD + ac], xa1 + 32 * b, aok1);
+        asm volatile("cp.async.commit_group;");
+    };
+    u32 bq[8];
+    auto load_b = [&](u32 b) {
+        if (!bok) {
+#pragma unroll
+            for (int i = 0; i < 8; i++) bq[i] = 0u;
+            return;
+        }
+        if constexpr (BLOCK_SCALED(K)) {
+            float sc = w.s[(wr / w.sr) * w.ncb + (32 * b) / w.sc];
+#pragma unroll
+            for (int i = 0; i < 4; i++) {
+                float4 v = dq<K>(wrow, b, 4 * bh + i);
+                bq[2 * i] = pack_h2(v.x * sc, v.y * sc);
+                bq[2 * i + 1] = pack_h2(v.z * sc, v.w * sc);
+            }
+        } else {
+            dq16h<K>(wrow, b, bh, bq);
+        }
+    };
+    // The next step's weight bytes into L1 before the current step's MMAs, so that its
+    // dequantization (after them) does not wait for memory.
+    auto prefetch_b = [&](u32 b) {
+        if (!bok) return;
+        constexpr u32 G = qgroup<K>(), GB = qgbytes<K>();
+        if (b % G != 0 && b != 0) return;
+        const u8* g0 = wrow + (u64)(b / G) * GB;
+        for (u32 o = 64 * bh; o < GB; o += 128) prefetch_l1(g0 + o);
+        if (bh) prefetch_l1(g0 + GB - 1);
+    };
+    auto store_b = [&](u32 st) {
+        uint4* d = (uint4*)&Bs[st][br * HLD + 16 * bh];
+        d[0] = make_uint4(bq[0], bq[1], bq[2], bq[3]);
+        d[1] = make_uint4(bq[4], bq[5], bq[6], bq[7]);
+    };
+    float acc[HMT][4][4];
+#pragma unroll
+    for (int a = 0; a < HMT; a++)
+#pragma unroll
+        for (int b = 0; b < 4; b++)
+#pragma unroll
+            for (int c = 0; c < 4; c++) acc[a][b][c] = 0.f;
+    u32 wm = (warp >> 2) * (HBM / 2), wn = (warp & 3) * 32;
+    load_a(0, 0);
+    load_b(0);
+    store_b(0);
+    asm volatile("cp.async.wait_group 0;");
+    __syncthreads();
+    for (u32 b = 0; b < nb; b++) {
+        u32 st = b & 1;
+        bool more = b + 1 < nb;
+        if (more) {
+            prefetch_b(b + 1);
+            load_a(b + 1, st ^ 1);
+        }
+#pragma unroll
+        for (int kk = 0; kk < 2; kk++) {
+            u32 af[HMT][4], bf[4][2];
+#pragma unroll
+            for (int mt = 0; mt < HMT; mt++) {
+                u32 r = wm + 16 * mt + (lane & 15), c = 16 * kk + 8 * (lane >> 4);
+                ldsm_x4(af[mt], &As[st][r * HLD + c]);
+            }
+#pragma unroll
+            for (int np = 0; np < 2; np++) {
+                u32 r = wn + 16 * np + (lane & 7) + 8 * (lane >> 4), c = 16 * kk + 8 * ((lane >> 3) & 1);
+                u32 t4[4];
+                ldsm_x4(t4, &Bs[st][r * HLD + c]);
+                bf[2 * np][0] = t4[0];
+                bf[2 * np][1] = t4[1];
+                bf[2 * np + 1][0] = t4[2];
+                bf[2 * np + 1][1] = t4[3];
+            }
+#pragma unroll
+            for (int mt = 0; mt < HMT; mt++)
+#pragma unroll
+                for (int nt = 0; nt < 4; nt++) mma16816(acc[mt][nt], af[mt], bf[nt]);
+        }
+        if (more) {
+            load_b(b + 1);
+            store_b(st ^ 1);
+        }
+        asm volatile("cp.async.wait_group 0;");
+        __syncthreads();
+    }
+    u32 g = lane >> 2, c4 = lane & 3;
+#pragma unroll
+    for (int mt = 0; mt < HMT; mt++)
+#pragma unroll
+        for (int nt = 0; nt < 4; nt++)
+#pragma unroll
+            for (int q = 0; q < 4; q++) {
+                u32 rr = m0 + wm + 16 * mt + g + 8 * (q >> 1), cc = n0 + wn + 8 * nt + 2 * c4 + (q & 1);
+                if (rr < p.rows && cc < p.n_out) {
+                    float v = acc[mt][nt][q] * w.f;
+                    float* o = p.y + (u64)rr * p.ys + cc;
+                    *o = p.mode ? *o + v : v;
+                }
+            }
+}
+
 template <int K>
 __device__ __forceinline__ void gemmi_any(const W& w, const GemmP& p) {
     if constexpr (int_ok<K>())
@@ -1422,7 +1665,8 @@ __device__ __forceinline__ void gemmi_any(const W& w, const GemmP& p) {
         mvp_body<K>(w, w2, x, y, n_in, n_out, xs, ys, gelu);                                                                               \
     }                                                                                                                                      \
     extern "C" __global__ void __launch_bounds__(128) gemm_##K(W w, GemmP p) { gemm_body<K, false>(w, p); }                  \
-    extern "C" __global__ void __launch_bounds__(128) gemmi_##K(W w, GemmP p) { gemmi_any<K>(w, p); }
+    extern "C" __global__ void __launch_bounds__(128) gemmi_##K(W w, GemmP p) { gemmi_any<K>(w, p); }                         \
+    extern "C" __global__ void __launch_bounds__(256) gemmh_##K(W w, GemmH p) { gemmh_body<K>(w, p); }
 #else
 #define KERNELS(K)                                                                                                                         \
     extern "C" __global__ void __launch_bounds__(128) mv_##K(W w, const float* x, float* y, u32 n_in, u32 n_out, u32 xs, u32 ys, u32 mode) { \

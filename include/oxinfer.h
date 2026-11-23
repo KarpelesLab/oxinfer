@@ -121,7 +121,8 @@ int64_t oxi_cache_remove(const char *cache_dir, const char *name);
  *   prompt_cache_min_tokens=N  shortest conversation stored (default 64)
  *   cache_dir=PATH       where repo ids are downloaded
  *   gpu_exact=0|1        GPU matmuls bit-identical to the CPU (default 0: M5/A19 matrix
- *                        units, half-precision inputs; process-wide)
+ *                        units, half-precision inputs; CUDA prompts of GGUF models in f16
+ *                        operands, 1: split halves within ~1e-6 of f32; process-wide)
  *   gpu_moe=0|1          MoE experts on the GPU in prefill (default 1; process-wide)
  *   stream=auto|on|off   stream weights from storage for models larger than RAM (1 / 0 work
  *                        too). auto (default): when a tuning key below is set, for a Qwen /

@@ -382,6 +382,8 @@ struct GgKernels {
     /// rows a block of it takes (`MVP_ROWS` per warp).
     mvp: *mut c_void,
     mvp_block: u32,
+    /// `gemmh_K`: the fast prefill GEMM (f16 activations and weight values, f32 accumulation).
+    pub(crate) gemmh: *mut c_void,
 }
 
 /// Rows per warp of the ggml matvec kernel of `kind` (`MV_ROWS` in `inkling_cuda.cu`), 0 for the
@@ -484,6 +486,24 @@ struct GemmP {
     inter: u32,
     beta: f32,
     lbeta: f32,
+}
+
+/// Rows (tokens) per block of the fast prefill GEMM (`HBM` in `inkling_cuda.cu`).
+pub(crate) const GEMMH_ROWS: u32 = 128;
+
+/// The fast prefill GEMM's parameters (`GemmH` in `inkling_cuda.cu`): `rows` f16 rows of `xh`
+/// (`xs` halves apart) into rows of `y` (`ys` floats apart); mode 0 stores, 1 adds.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct GemmH {
+    pub xh: u64,
+    pub y: u64,
+    pub n_in: u32,
+    pub n_out: u32,
+    pub rows: u32,
+    pub xs: u32,
+    pub ys: u32,
+    pub mode: u32,
 }
 
 /// Whether every value is finite and below 32768 in magnitude: what the ggml GEMMs' split into
@@ -975,6 +995,7 @@ impl CudaBackend {
                     mv_threads: threads,
                     mvp: get(format!("mvp_{id}"))?,
                     mvp_block: threads / 32 * rows.max(1),
+                    gemmh: get(format!("gemmh_{id}"))?,
                 })
             }
             Err(e) => {
@@ -3059,6 +3080,29 @@ mod tests {
                 let mut args = [&w as *const _ as *mut c_void, &p as *const _ as *mut c_void];
                 assert!(be.launch(k.gemmi, (no.div_ceil(64), (t as u32).div_ceil(64)), 128, &mut args));
                 check("gemm", 2e-6);
+                // The fast GEMM (`gemmh`): f16 rows of x (`dhalf_t`'s), f16 weight values.
+                {
+                    let xh: Vec<u16> = (0..t)
+                        .flat_map(|j| x[j * xs..j * xs + n_in].iter().map(|&v| half::f16::from_f32(v).to_bits()))
+                        .collect();
+                    let dxh = be.upload_bytes(xh.as_ptr() as *const u8, xh.len() * 2).unwrap();
+                    assert!(be.htod(dy, &y0));
+                    let p = GemmH {
+                        xh: dxh,
+                        y: dy,
+                        n_in: ni,
+                        n_out: no,
+                        rows: t as u32,
+                        xs: ni,
+                        ys: ysu,
+                        mode,
+                    };
+                    let mut args = [&w as *const _ as *mut c_void, &p as *const _ as *mut c_void];
+                    assert!(be.launch(k.gemmh, (no.div_ceil(128), (t as u32).div_ceil(GEMMH_ROWS)), 256, &mut args));
+                    // Both operands rounded to f16: ~2^-11 of each product.
+                    check("fast gemm", 2e-3);
+                    unsafe { be.cu.cuMemFree_v2(dxh) };
+                }
             }
             be.free_weight(&cw);
             be.free_weight(&cw2);
@@ -3305,7 +3349,8 @@ mod tests {
         };
         let one = be.build_plan(&g, 1).expect("single-token plan");
         let multi = be.build_plan(&g, 8).expect("multi-token plan");
-        let pf = be.build_plan_pf(&g, 2048).expect("prefill plan");
+        let pf = decode::with_pf_exact(true, || be.build_plan_pf(&g, 2048)).expect("prefill plan");
+        let pf_fast = decode::with_pf_exact(false, || be.build_plan_pf(&g, 2048)).expect("fast prefill plan");
         let r1 = run(&one, &vec![1; n]);
         assert!(r1.0.iter().all(|v| v.is_finite()) && r1.0.iter().any(|&v| v.abs() > 0.1));
         // Multi-token steps: a grid row per token of the same kernels.
@@ -3334,6 +3379,21 @@ mod tests {
             assert!(
                 worst <= 2e-4 * scale,
                 "prefill plan: {what} differ by {worst:.2e} (largest value {scale:.2e})"
+            );
+        }
+        // The fast GEMM (f16 operands): to f16's rounding.
+        let rf = run(&pf_fast, &[40, 67]);
+        for (what, a, b) in [
+            ("hidden", &r1.0, &rf.0),
+            ("keys", &r1.1, &rf.1),
+            ("values", &r1.2, &rf.2),
+            ("states", &r1.3, &rf.3),
+        ] {
+            let scale = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let worst = a.iter().zip(b).fold(0f32, |m, (p, q)| m.max((p - q).abs()));
+            assert!(
+                worst <= 1e-2 * scale,
+                "fast prefill plan: {what} differ by {worst:.2e} (largest value {scale:.2e})"
             );
         }
         // An input the GEMMs cannot take (here not a number) declines the step and leaves the
@@ -3440,7 +3500,7 @@ mod tests {
             g.ops.push(Op::norm(x, hidden, &ones, h, 1e-6));
             g.head_from = g.ops.len();
             let one = be.build_plan(&g, 1).expect("single-token plan");
-            let pf = be.build_plan_pf(&g, 64).expect("prefill plan");
+            let pf = decode::with_pf_exact(true, || be.build_plan_pf(&g, 64)).expect("prefill plan");
             let mut slot = Slot(None);
             let mut hs = vec![0f32; 16 * h];
             let mut run = |plan: &dyn DecodePlan, t: usize| {

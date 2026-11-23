@@ -928,6 +928,23 @@ extern "C" __global__ void __launch_bounds__(1024) dgdn_rule_t1k(const float* c,
     dgdn_rule_t_body(c, z, b, a, out, state, cst, p, nt, cs, zs, bs, as, os);
 }
 
+// The fast prefill GEMM's input (`gemmh_K`): the step's rows (n floats each, xs apart; grid
+// (blocks, tokens)) as f16 rows of n, with dguard_t's check (f16 holds up to 65504; the same
+// bound as the split GEMM keeps the declined steps alike).
+extern "C" __global__ void dhalf_t(const float* x, unsigned int n, unsigned int xs, unsigned short* xh, unsigned int* flag) {
+    const float* r = x + (size_t)blockIdx.y * xs;
+    unsigned int* o = (unsigned int*)(xh + (size_t)blockIdx.y * n);
+    unsigned int top = 0u;
+    for (unsigned int i = blockIdx.x * blockDim.x + threadIdx.x; 2 * i < n; i += gridDim.x * blockDim.x) {
+        float a = r[2 * i], b = r[2 * i + 1];
+        top = max(top, max(__float_as_uint(a) & 0x7fffffffu, __float_as_uint(b) & 0x7fffffffu));
+        unsigned int h;
+        asm("cvt.rn.f16x2.f32 %0, %2, %1;" : "=r"(h) : "f"(a), "f"(b));
+        o[i] = h;
+    }
+    if (top >= 0x47000000u) *flag = 1u;
+}
+
 // ---- The GEMMs of a prefill plan take their inputs as pairs of f16 halves: sets *flag when a
 // value of the step's rows (n floats each, xs apart; grid (blocks, tokens)) is 32768 or more in
 // magnitude or not finite, and the host then declines the step (the CPU path runs it).
