@@ -2788,6 +2788,123 @@ mod tests {
         }
     }
 
+    /// The decode kernels on Inkling-2 Mini's shapes with random weights, timed with CUDA events
+    /// and printed (no assertion): `INK_BENCH_KINDS=8,12,40` picks the weight kinds,
+    /// `INK_BENCH_T=1,4` the tokens per pass.
+    /// `cargo test --release --lib inkling::cuda::tests::bench_decode_kernels -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_decode_kernels() {
+        let Some(be) = backend() else { return };
+        let list = |name: &str, default: &str| -> Vec<u32> {
+            std::env::var(name)
+                .unwrap_or_else(|_| default.to_string())
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect()
+        };
+        let (h, mi, ne, k, vocab) = (2304usize, 1152usize, 32usize, 8usize, 201_024usize);
+        let tmax = 16usize;
+        let reps = 24usize;
+        for kind in list("INK_BENCH_KINDS", "8,12,6,18,40,202,30") {
+            // (Down rows of 1152 values: the formats with blocks of 256 keep Q5_0 there, as
+            // AtomicChat's files do.)
+            let dn_kind = if GgmlType::from_id(kind).is_some_and(|g| !mi.is_multiple_of(g.block_size())) {
+                6
+            } else {
+                kind
+            };
+            let mut ks = vec![0, kind, dn_kind];
+            ks.sort_unstable();
+            ks.dedup();
+            let mut e = Engine::bare(be, &ks).unwrap();
+            (e.h, e.mi, e.ne, e.k_top, e.route_scale, e.beta, e.lbeta) = (h, mi, ne, k, 8.0, 4.0, 25.0);
+            let mut seed = 21u64;
+            let tk = tmax * k;
+            let mut ar = Engine::empty_arena();
+            ar.logits = zeros(&e, tmax * ne);
+            ar.ids = zeros(&e, tk);
+            ar.wts = zeros(&e, tk);
+            ar.mid = zeros(&e, tk * mi);
+            let kf = e.kfuncs.clone();
+            let r_dw = e.up_f32(&rnds(ne * h, &mut seed, 0.2), ne, h, &kf).unwrap();
+            let b_dev = e.upf(&rnds(ne, &mut seed, 0.05)).unwrap();
+            // One expert's bytes for all of them (each its own device memory).
+            let gu = random_lin(kind, 2 * mi, h, &mut seed);
+            let dn = random_lin(dn_kind, h, mi, &mut seed);
+            let gu_dw = e.up_lins(&vec![&gu; ne], 2 * mi, h, &kf).unwrap();
+            let dn_dw = e.up_lins(&vec![&dn; ne], h, mi, &kf).unwrap();
+            let bytes = |l: &Lin, n_in: usize| -> f64 {
+                let hw = host_w(l, n_in).unwrap();
+                (hw.data.len() + hw.scales.as_ref().map_or(0, |s| s.0.len() * 4)) as f64
+            };
+            let (gu_b, dn_b) = (bytes(&gu, h), bytes(&dn, mi));
+            // A layer's projections (q, gate: 3072; k, v: 1024; r: 384; sink: 24) and o, 16 copies
+            // of each on the device (a pass reads every layer's once), and the head.
+            let shapes = [3072usize, 384, 3072, 24, 1024, 1024];
+            let lins: Vec<Lin> = shapes.iter().map(|&n| random_lin(kind, n, h, &mut seed)).collect();
+            let dws: Vec<Vec<Dw>> = (0..16)
+                .map(|_| {
+                    lins.iter()
+                        .zip(&shapes)
+                        .map(|(l, &n)| e.up_lins(&[l], n, h, &kf).unwrap())
+                        .collect()
+                })
+                .collect();
+            let outs: Vec<u64> = shapes.iter().map(|&n| zeros(&e, tmax * n)).collect();
+            let proj_b: f64 = lins.iter().map(|l| bytes(l, h)).sum();
+            let o = random_lin(kind, h, 3072, &mut seed);
+            let o_dws: Vec<Dw> = (0..16).map(|_| e.up_lins(&[&o], h, 3072, &kf).unwrap()).collect();
+            let o_b = bytes(&o, 3072);
+            let head = random_lin(kind, vocab, h, &mut seed);
+            let head_dw = e.up_lins(&[&head], vocab, h, &kf).unwrap();
+            let head_b = bytes(&head, h);
+            let (py, pw, plog) = (zeros(&e, tmax * h), zeros(&e, tmax * 3072), zeros(&e, tmax * vocab));
+            let xs: Vec<u64> = (0..8).map(|_| e.upf(&rnds(tmax * h, &mut seed, 1.0)).unwrap()).collect();
+            unsafe { e.x.cuMemcpyDtoDAsync_v2(pw, xs[0], tmax * h * 4, e.stream) };
+            e.prof = Some(Mutex::new(HashMap::new()));
+            println!("kind {kind}: {:.2} bits a weight (experts)", gu_b * 8.0 / (2 * mi * h) as f64);
+            for t in list("INK_BENCH_T", "1,4") {
+                let t = (t as usize).clamp(1, tmax);
+                let phase = |name: &str, bytes: f64, run: &dyn Fn(usize)| {
+                    for i in 0..reps + 2 {
+                        if i == 2 {
+                            unsafe { e.x.cuStreamSynchronize(e.stream) };
+                            e.prof_collect();
+                            e.prof.as_ref().unwrap().lock().unwrap().clear();
+                        }
+                        run(i);
+                    }
+                    unsafe { e.x.cuStreamSynchronize(e.stream) };
+                    e.prof_collect();
+                    let mut p = e.prof.as_ref().unwrap().lock().unwrap();
+                    let mut rows: Vec<(String, f64)> = p.iter().map(|(f, v)| (e.name_of(*f), v.1 / reps as f64)).collect();
+                    rows.sort_by(|a, b| a.0.cmp(&b.0));
+                    let tot: f64 = rows.iter().map(|r| r.1).sum();
+                    let parts: Vec<String> = rows.iter().map(|r| format!("{} {:.0}", r.0, r.1 * 1e6)).collect();
+                    println!(
+                        "  t={t} {name}: {:.0} us ({:.0} GB/s over {:.1} MB) [{}]",
+                        tot * 1e6,
+                        bytes / tot / 1e9,
+                        bytes / 1e6,
+                        parts.join(", ")
+                    );
+                    p.clear();
+                };
+                // (Up to t * k distinct experts: an upper bound of the bytes read for t > 1.)
+                phase("experts", (t * k) as f64 * (gu_b + dn_b), &|i| {
+                    e.experts(&ar, &r_dw, b_dev, &gu_dw, &dn_dw, false, xs[i % 8], py, t)
+                });
+                phase("projections", proj_b, &|i| {
+                    let jobs: Vec<(&Dw, u64, usize)> = dws[i % 16].iter().zip(&outs).zip(&shapes).map(|((d, &o), &n)| (d, o, n)).collect();
+                    e.lin_many(&jobs, xs[i % 8], h, t)
+                });
+                phase("o", o_b, &|i| e.lin(&o_dws[i % 16], pw, py, t, 3072, h, false));
+                phase("head", head_b, &|i| e.lin(&head_dw, xs[i % 8], plog, t, h, vocab, false));
+            }
+        }
+    }
+
     fn situ(g: f64, u: f64, beta: f64, lbeta: f64) -> f64 {
         beta * (g / beta).tanh() / (1.0 + (-g).exp()) * lbeta * (u / lbeta).tanh()
     }
