@@ -1555,7 +1555,12 @@ impl CudaPlan<'_> {
                 mode,
             } => {
                 let (x, y, one) = (x.at(j), y.at(j), 0u32);
-                be.launch(k.mv, (n_out.div_ceil(8), 1), 256, &mut args![w, x, y, n_in, n_out, one, one, mode])
+                be.launch(
+                    k.mv,
+                    (n_out.div_ceil(k.mv_block), 1),
+                    256,
+                    &mut args![w, x, y, n_in, n_out, one, one, mode],
+                )
             }
             COp::Topk {
                 f,
@@ -1960,7 +1965,7 @@ impl CudaPlan<'_> {
                 let (xa, ya, xs, ys) = (x.a, y.a, (x.ts / 4) as u32, (y.ts / 4) as u32);
                 return be.launch(
                     k.mv,
-                    (n_out.div_ceil(8), t as u32),
+                    (n_out.div_ceil(k.mv_block), t as u32),
                     256,
                     &mut args![w, xa, ya, n_in, n_out, xs, ys, mode],
                 );

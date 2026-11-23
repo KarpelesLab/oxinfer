@@ -373,6 +373,37 @@ struct GgKernels {
     mv: *mut c_void,
     /// `gemmi_K`: the tensor-core GEMM with the weights' exact values and split activations.
     gemmi: *mut c_void,
+    /// Rows a block of `mv` takes: 8, a row per warp, or `8 N` when the kernel was compiled with
+    /// `MV_ROWS` N ([`mv_rows`]).
+    mv_block: u32,
+}
+
+/// Rows per warp of the ggml matvec kernel of `kind` (`MV_ROWS` in `inkling_cuda.cu`), 0 for the
+/// kernel with a warp per row and four values per lane. On a discrete card that kernel runs at
+/// what the card's memory gives (docs/platforms.md) and is kept; on a unified-memory device (the
+/// GB10 of a DGX Spark) it is bound by its loads and arithmetic, and a lane takes whole blocks of
+/// 32 values, for the number of rows that measured fastest per format there
+/// (`cargo test --profile ci --lib ggml_bench -- --ignored --nocapture` with
+/// `OXINFER_CUDA_MV_ROWS=N`, which sets it for every format).
+fn mv_rows(kind: crate::ggml::GgmlType, unified: bool) -> u32 {
+    use crate::ggml::GgmlType::*;
+    static ROWS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    if let Some(n) = *ROWS.get_or_init(|| std::env::var("OXINFER_CUDA_MV_ROWS").ok().and_then(|v| v.parse().ok())) {
+        return n.min(8);
+    }
+    if !unified {
+        return 0;
+    }
+    // GB/s of weights over 17408 x 5120 and 5120 x 17408, two passes each, against the warp
+    // per row: IQ4_XS 201 against 156, IQ3_XXS 167 / 148, Q5_K 180 / 154, Q6_K 172 / 153, Q4_K
+    // 161 / 146, IQ4_NL 204 / 154, Q8_0 207 / 184, Q4_0 222 / 180, Q2_K 221 / 208, Q3_K 136 /
+    // 129, IQ3_S 154 / 148; the IQ2 formats level at two rows and ahead at eight (IQ2_XXS 222 /
+    // 155, IQ2_XS 226 / 187, IQ2_S 197 / 186). The other formats were not measured.
+    match kind {
+        IQ2_XXS | IQ2_XS | IQ2_S => 8,
+        IQ4_XS | IQ4_NL | IQ3_S | IQ3_XXS | Q2_K | Q3_K | Q4_K | Q5_K | Q6_K | Q8_0 | Q4_0 => 2,
+        _ => 0,
+    }
 }
 
 /// A weight matrix as the ggml kernels take it (`W` in `inkling_cuda.cu`).
@@ -879,6 +910,15 @@ impl CudaBackend {
         if let Some(k) = self.gg.lock().unwrap().get(&id) {
             return *k;
         }
+        let k = self.gg_compile(kind, mv_rows(kind, integrated()));
+        self.gg.lock().unwrap().insert(id, k);
+        k
+    }
+
+    /// [`Self::gg_kernels`] with the matvec compiled for `rows` rows per warp (`MV_ROWS`; 0: the
+    /// kernel with a warp per row and four values per lane).
+    fn gg_compile(&self, kind: crate::ggml::GgmlType, rows: u32) -> Option<GgKernels> {
+        let id = kind.id();
         let body = include_str!("inkling_cuda.cu");
         // Tests may take the kernels from a file (`ggml_bench`: no rebuild per kernel edit).
         #[cfg(test)]
@@ -886,8 +926,12 @@ impl CudaBackend {
             .ok()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .unwrap_or_else(|| body.to_string());
-        let src = format!("#define GGML_ONLY 1\n#define HAS_{id} 1\n{}{body}", ggml_tables_src());
-        let k = match self.cached_module(&src, &format!("ggml-{{sm}}-{id}"), "ggml.cu") {
+        let (def, tag) = match rows {
+            0 => (String::new(), String::new()),
+            n => (format!("#define MV_ROWS {n}\n"), format!("-r{n}")),
+        };
+        let src = format!("#define GGML_ONLY 1\n#define HAS_{id} 1\n{def}{}{body}", ggml_tables_src());
+        match self.cached_module(&src, &format!("ggml-{{sm}}-{id}{tag}"), "ggml.cu") {
             Ok(module) => {
                 let get = |name: String| -> Option<*mut c_void> {
                     let c = CString::new(name).ok()?;
@@ -896,15 +940,17 @@ impl CudaBackend {
                 };
                 get(format!("mv_{id}"))
                     .zip(get(format!("gemmi_{id}")))
-                    .map(|(mv, gemmi)| GgKernels { mv, gemmi })
+                    .map(|(mv, gemmi)| GgKernels {
+                        mv,
+                        gemmi,
+                        mv_block: 8 * rows.max(1),
+                    })
             }
             Err(e) => {
                 eprintln!("[cuda: no kernels for {kind} weights ({e}): they stay on the CPU]");
                 None
             }
-        };
-        self.gg.lock().unwrap().insert(id, k);
-        k
+        }
     }
 
     /// Device copy of one weight matrix (None when VRAM is short, or for a GGUF format without
@@ -2902,8 +2948,21 @@ mod tests {
                     &ysu as *const _ as *mut c_void,
                     &mode as *const _ as *mut c_void,
                 ];
-                assert!(be.launch(k.mv, (no.div_ceil(8), t as u32), 256, &mut args));
+                assert!(be.launch(k.mv, (no.div_ceil(k.mv_block), t as u32), 256, &mut args));
                 check("matvec", 2e-6);
+                // The matvec with a lane per block of 32 (`MV_ROWS`: 1, and 3 rows per warp, a
+                // partial last warp), and the one with a warp per row, whatever this device takes.
+                for rows in [0u32, 1, 3] {
+                    if mode == 1 && rows == 3 {
+                        continue;
+                    }
+                    let kr = be
+                        .gg_compile(kind, rows)
+                        .unwrap_or_else(|| panic!("{kind}: no kernels with {rows} rows per warp"));
+                    assert!(be.htod(dy, &y0));
+                    assert!(be.launch(kr.mv, (no.div_ceil(kr.mv_block), t as u32), 256, &mut args));
+                    check(&format!("matvec, {rows} rows per warp"), 2e-6);
+                }
                 // The GEMM (rows of x `xs` apart).
                 assert!(be.htod(dy, &y0));
                 let p = GemmP {
@@ -3401,7 +3460,7 @@ mod tests {
                         &zero as *const _ as *mut c_void,
                         &zero as *const _ as *mut c_void,
                     ];
-                    assert!(be.launch(k.mv, (no.div_ceil(8), 1), 256, &mut args));
+                    assert!(be.launch(k.mv, (no.div_ceil(k.mv_block), 1), 256, &mut args));
                 };
                 let p = GemmP {
                     x: dx,

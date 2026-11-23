@@ -388,9 +388,49 @@ __device__ __forceinline__ float2 rowdot2(const W& w, const u8* ra, const u8* rb
 }
 
 // y[tok][r] (= or +=) W[r] . x[tok]: 8 rows per 256-thread block, grid.y tokens.
+// `MV_ROWS` (N; the launch then takes `8 N` rows per block): a warp takes N consecutive rows and a
+// lane whole blocks of 32 values, so each block of `x` is loaded once for the N rows and what a
+// block's values share (its scale, the superblock's header) is decoded once per 32 values, not
+// once per 4. For devices whose matvecs are bound by the loads and the arithmetic and not by the
+// memory (the GB10 of a DGX Spark, `cuda.rs`); the sums are taken in another order.
 template <int K>
 __device__ __forceinline__ void mv_body(const W& w, const float* x, float* y, u32 n_in, u32 n_out, u32 xs, u32 ys, u32 mode) {
     u32 warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+#ifdef MV_ROWS
+    u32 r0 = (blockIdx.x * (blockDim.x >> 5) + warp) * MV_ROWS;
+    if (r0 >= n_out) return;
+    const float* xt = x + (u64)blockIdx.y * xs;
+    float a[MV_ROWS];
+#pragma unroll
+    for (int i = 0; i < MV_ROWS; i++) a[i] = 0.f;
+    for (u32 b = lane; b < n_in / 32; b += 32) {
+        float4 xv[8];
+#pragma unroll
+        for (int j = 0; j < 8; j++) xv[j] = *(const float4*)(xt + 32 * b + 4 * j);
+#pragma unroll
+        for (int i = 0; i < MV_ROWS; i++) {
+            u32 row = min(r0 + i, n_out - 1);
+            const u8* rp = w.q + (u64)row * w.rb;
+            float p = 0.f;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                float4 v = dq<K>(rp, b, j);
+                p += v.x * xv[j].x + v.y * xv[j].y + v.z * xv[j].z + v.w * xv[j].w;
+            }
+            if constexpr (BLOCK_SCALED(K)) p *= w.s[(row / w.sr) * w.ncb + (32 * b) / w.sc];
+            a[i] += p;
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < MV_ROWS; i++) {
+        float v = warp_sum(a[i]) * w.f;
+        if (lane == 0 && r0 + i < n_out) {
+            float* o = y + (u64)blockIdx.y * ys + r0 + i;
+            *o = mode ? *o + v : v;
+        }
+    }
+    return;
+#endif
     u32 r = blockIdx.x * (blockDim.x >> 5) + warp;
     if (r >= n_out) return;
     const float* xr = x + (u64)blockIdx.y * xs;
