@@ -155,16 +155,16 @@ jobs:
           fi
 
       # A static x86_64-unknown-linux-fullrust executable: no libc, no interpreter, nothing to
-      # install. That target is not in the `unix` family and cannot load shared libraries, so
-      # the `gpu` feature (CUDA / Vulkan through dlopen) is left out: this binary runs on the
-      # CPU.
+      # install. The `gpu` feature is in: dlsym boots the system's own ld.so through dldota on
+      # first use and loads libcuda / libvulkan from there, so the GPU is used where a driver is
+      # installed, and the binary runs on the CPU where none is.
       # The image tracks the stable toolchain the other jobs use.
       - name: Build static libc-free binary (fullrust)
         uses: KarpelesLab/fullrust@master
         with:
           image: ghcr.io/karpeleslab/fullrust:1.100
           args: >-
-            --release --bin oxinfer --no-default-features --features media,hf,server,update
+            --release --bin oxinfer --no-default-features --features media,hf,gpu,server,update
             --config profile.release.debug=false --config profile.release.strip=true
 
       - name: Stage archive contents

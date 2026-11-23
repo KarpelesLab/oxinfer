@@ -1762,7 +1762,12 @@ pub fn accelerators(plat: &Platform, device: DevicePref) -> Vec<Accelerator> {
             unified: false,
             prefill: false,
             decode: false,
-            status: "No GPU detected: models run on the CPU".to_string(),
+            status: if cfg!(feature = "gpu") {
+                "No GPU detected: models run on the CPU"
+            } else {
+                "This build has no GPU support (built without the `gpu` feature): models run on the CPU"
+            }
+            .to_string(),
         });
     }
     if cfg!(target_vendor = "apple") {
@@ -2387,7 +2392,7 @@ mod tests {
             notes: Vec::new(),
         };
         let list = accelerators(&plat, DevicePref::Auto);
-        assert_eq!(list[1].status, "No GPU detected: models run on the CPU");
+        assert!(list[1].status.ends_with("models run on the CPU"), "{}", list[1].status);
         assert_eq!(list[1].to_json()["available"], false);
     }
 }

@@ -2848,7 +2848,15 @@ fn gemm_tuning() -> Option<(usize, usize, usize)> {
             let v: usize = std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
             v / q * q
         };
-        let kb = e("OXINFER_GEMM_KB", if cfg!(target_os = "linux") { 256 } else { 0 }, 256);
+        let kb = e(
+            "OXINFER_GEMM_KB",
+            if cfg!(any(target_os = "linux", target_os = "fullrust")) {
+                256
+            } else {
+                0
+            },
+            256,
+        );
         (kb > 0).then(|| (kb, e("OXINFER_GEMM_ROWS", 32, 16).max(16), e("OXINFER_GEMM_TOKENS", 256, 8).max(8)))
     })
 }

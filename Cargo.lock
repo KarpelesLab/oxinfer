@@ -139,11 +139,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "dlsym"
-version = "0.0.2"
+name = "dldota"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "652359da831bdf58d1e2ef75ffe39e59f96f6f8fc8243550317b58519f0481af"
+checksum = "3fc88509c45716a01a4f144c54598f4de4747445a2fbbff95d14adbba2979d8f"
+
+[[package]]
+name = "dlsym"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ecc11d8bfb15b7cdc0842cc0454e632a63bf2ecbc05cbe5f4d2b441404928bc"
 dependencies = [
+ "dldota",
  "libc",
  "windows-sys",
 ]

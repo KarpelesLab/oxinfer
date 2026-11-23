@@ -11,6 +11,31 @@
 pub use oxideav_core;
 
 pub mod advisor;
+/// `sincos` / `sincosf` for the fullrust target (the static release binary), whose
+/// compiler-builtins has `sin` and `cos` but not these: LLVM merges a `sin` and a `cos` of one
+/// value into them. `black_box` keeps the two calls here from being merged back into themselves.
+#[cfg(target_os = "fullrust")]
+mod fullrust_libm {
+    use std::hint::black_box;
+    /// # Safety
+    /// `s` and `c` are valid for writes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn sincos(x: f64, s: *mut f64, c: *mut f64) {
+        unsafe {
+            *s = black_box(x).sin();
+            *c = black_box(x).cos();
+        }
+    }
+    /// # Safety
+    /// `s` and `c` are valid for writes.
+    #[unsafe(no_mangle)]
+    pub unsafe extern "C" fn sincosf(x: f32, s: *mut f32, c: *mut f32) {
+        unsafe {
+            *s = black_box(x).sin();
+            *c = black_box(x).cos();
+        }
+    }
+}
 #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
 pub mod anemll;
 pub mod arktts;

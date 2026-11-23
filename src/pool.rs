@@ -128,7 +128,7 @@ pub fn cpu_cores() -> (usize, usize) {
 /// kernels bound by memory bandwidth or by the FMA units, and halves the cache each one has.
 pub fn default_threads() -> usize {
     let all = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "fullrust"))]
     if let Some(cores) = linux_physical_cores(all) {
         return cores;
     }
@@ -138,7 +138,7 @@ pub fn default_threads() -> usize {
 /// The number of physical cores among the CPUs this process may run on, when it differs from
 /// `all` (the logical CPUs available): the distinct `thread_siblings_list` of the allowed CPUs.
 /// None when anything is unreadable or a quota (not the affinity mask) limits the process.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "fullrust"))]
 fn linux_physical_cores(all: usize) -> Option<usize> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     let list = status.lines().find_map(|l| l.strip_prefix("Cpus_allowed_list:"))?.trim();

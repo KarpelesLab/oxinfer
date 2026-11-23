@@ -160,7 +160,7 @@ pub fn memory_reserve() -> u64 {
 /// memory plus reclaimable page cache); elsewhere what the OS lets this app still use (iOS), else
 /// the physical memory.
 pub fn available_memory() -> Option<u64> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "fullrust"))]
     {
         let s = std::fs::read_to_string("/proc/meminfo").ok()?;
         let line = s.lines().find(|l| l.starts_with("MemAvailable:"))?;
@@ -184,7 +184,7 @@ pub fn fits_in_memory(bytes: u64) -> bool {
 
 /// Physical memory in bytes, when the platform reports it.
 pub fn total_memory() -> Option<u64> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "fullrust"))]
     {
         let s = std::fs::read_to_string("/proc/meminfo").ok()?;
         let line = s.lines().find(|l| l.starts_with("MemTotal:"))?;
@@ -280,7 +280,12 @@ pub fn process_available_memory() -> Option<u64> {
 pub fn detect() -> Platform {
     let cpu = CpuInfo {
         arch: std::env::consts::ARCH,
-        os: std::env::consts::OS,
+        // fullrust (the static release binary) is Linux underneath.
+        os: if cfg!(target_os = "fullrust") {
+            "linux"
+        } else {
+            std::env::consts::OS
+        },
         features: cpu_features(),
         cores: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
         memory_bytes: total_memory(),

@@ -629,7 +629,11 @@ pub(crate) fn tuning() -> (usize, usize, usize, bool, bool, usize, usize) {
         // Measured on a DGX Spark (20 threads, 256 tokens, Q4_K, TOP/s): 5120 x 17408 at 3.9 with
         // 512 columns and 32-row jobs, 3.6 with 1024 columns, 2.6 with 16-row jobs (a group's
         // activations pass once per group); the 2048-wide shapes within the noise of each other.
-        let (kb, job, pair) = if cfg!(target_os = "linux") { (512, 32, 1) } else { (0, 0, 0) };
+        let (kb, job, pair) = if cfg!(any(target_os = "linux", target_os = "fullrust")) {
+            (512, 32, 1)
+        } else {
+            (0, 0, 0)
+        };
         (
             e("OXINFER_I8_KB", kb, QBLOCK),
             e("OXINFER_I8_ROWS", 32, 4).max(4),
