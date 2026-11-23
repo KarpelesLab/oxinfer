@@ -174,25 +174,6 @@ inline float mdot(MIQ1_M f, uint row, uint c, thread const X32& x) {
     }
     return r;
 }
-// ---- IQ2_XXS (66-byte blocks of 256, 2-byte aligned): per group of 8 a grid entry of unsigned
-// magnitudes and 7 sign bits (the eighth the parity), one scale per sub-block.
-struct MIQ2_XXS { device const uchar* w; ulong rb; };
-inline float4 sgn4(uint s) { return 1.f - 2.f * float4((uint4(s) >> uint4(0, 1, 2, 3)) & 1u); }
-inline float mdot(MIQ2_XXS f, uint row, uint c, thread const X32& x) {
-    device const ushort* B = (device const ushort*)(f.w + (ulong)row * f.rb + (c / 8) * 66);
-    uint j = c % 8;
-    uint a0 = B[1 + 4 * j] | (B[2 + 4 * j] << 16), a1 = B[3 + 4 * j] | (B[4 + 4 * j] << 16);
-    float db = float(as_type<half>(B[0])) * (0.5f + float(a1 >> 28)) * 0.25f;
-    float4 s = 0.f;
-    for (uint l = 0; l < 4; l++) {
-        ulong g = iq2xxs_grid[(a0 >> (8 * l)) & 255];
-        uint sg = (a1 >> (7 * l)) & 127;
-        sg |= (popcount(sg) & 1) << 7;
-        s = fma(float4(as_type<uchar4>(uint(g))) * sgn4(sg), x.v[2 * l], s);
-        s = fma(float4(as_type<uchar4>(uint(g >> 32))) * sgn4(sg >> 4), x.v[2 * l + 1], s);
-    }
-    return db * hsum(s);
-}
 // ---- K-quants: 256-value super-blocks, 8 chunks of 32 each. Chunk k of a super-block covers 16
 // bytes of quants: group g = k / 2 (64 values), half h = k % 2; its low nibbles are values
 // 64g + 16h + i (sub-block 2g), the high nibbles 64g + 32 + 16h + i (sub-block 2g + 1).

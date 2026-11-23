@@ -166,12 +166,12 @@ impl MvFmt {
             },
         }
     }
-    /// The single-token instantiation: [`Self::instantiate`], with the 1-bit and 2-bit grid
-    /// formats of DeepSeek V4.1's experts on dot products of their own (`MIQ1_S`, `MIQ1_M`,
-    /// `MIQ2_XXS`) rather than the GEMM dequantizer.
+    /// The single-token instantiation: [`Self::instantiate`], with the 1-bit grid formats of
+    /// DeepSeek V4.1's experts on dot products of their own (`MIQ1_S`, `MIQ1_M`) rather than the
+    /// GEMM dequantizer.
     fn instantiate_mv(self, nr: usize, ks: usize) -> String {
         match self {
-            MvFmt::Gguf(k @ (GgmlType::IQ1_S | GgmlType::IQ1_M | GgmlType::IQ2_XXS)) => {
+            MvFmt::Gguf(k @ (GgmlType::IQ1_S | GgmlType::IQ1_M)) => {
                 format!("MV_RAW(mv_{}_{nr}_{ks}, M{}, X32, 32, {nr}, {ks})", k.name(), k.name())
             }
             _ => self.instantiate(nr, ks),
@@ -226,7 +226,6 @@ impl MvFmt {
                 GgmlType::F32 => gen_("F32W2".into()),
                 GgmlType::IQ1_S => raw("MIQ1_S", "X32", 32),
                 GgmlType::IQ1_M => raw("MIQ1_M", "X32", 32),
-                GgmlType::IQ2_XXS => raw("MIQ2_XXS", "X32", 32),
                 k => gen_(format!("{}W", k.name())),
             },
         }

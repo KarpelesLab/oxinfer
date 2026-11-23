@@ -504,10 +504,130 @@ it needs every V4.1 op on the device (hyper-connection mixes, the compressor and
 attention with sinks, the grouped output projection, engram rows, routing with streamed experts
 wrapped from the page cache), and was not attempted.
 
+#### Decode on the GPU: a whole token per command stream
+
+The round after that built it: a decode step of V4.1 runs on Metal as one stream of command
+buffers, with no CPU round trip inside the token (`src/metal_ds41.rs` / `.metal`, the model side
+in `src/deepseek41_gpu.rs`). It is on by default with Metal; `--stream-gpu off` (engine / C API /
+server key `stream_gpu=0`, `gpu::set_stream_decode(Some(false))`, `OXINFER_STREAM_GPU=0`) keeps
+decoding on the CPU, which also stays the fallback for whatever the plan cannot take
+(interventions, image positions, multi-token passes, a model the kernels do not fit).
+
+What runs where:
+
+- The host computes what only it has or what costs nothing: the input embedding row, the 48 engram
+  rows (a 110 GB mapped table: looked up and dequantized before the step, 2 x 24 x 256 floats),
+  the rotary angles of the position. Prefill, speculative verification and fallback steps stay on
+  the CPU path.
+- Everything else is on the GPU: the hyper-connection mixes (24 dot products of 20480 split over
+  200 threadgroups, then the Sinkhorn iterations on one SIMD-group, the sums over a row and a
+  column of the 4 x 4 matrix by shuffles), collapse + RMS norm, the projections (the decode matvec
+  kernels of `metal_decode.metal`: Q8_0, Q5_K, bf16 at 450-560 GB/s), the key sources'
+  compressors (rate-2 pooling, rate-1 latents) and index keys, the lightning indexers (32 heads,
+  one per lane) with a radix-select top-512 that keeps the CPU's tie rule (lower position first),
+  the candidate blocks of layer 20, the window + compressed attention with sinks (split over
+  chunks of 32 keys, 8 heads a threadgroup sharing the key loads, then a combine that undoes the
+  rotation), the grouped output projection (8 matvecs), the engram gates, routing (sqrt-softplus,
+  bias, top-6, renormalized, on one SIMD-group), the shared expert (clamped SwiGLU pair) and the
+  routed experts, the LM head.
+- The host session stays authoritative. Each GPU step appends its keys (window key, the
+  compressors' pending rows, compressed and index keys) to the session; the device copies (a
+  128-row window ring per layer, the compressed and index keys of the four key sources) catch up
+  from it after a prefill, a CPU step or a rollback (a rollback re-uploads the whole window: the
+  device wrote ring rows of positions still in it).
+
+How the GPU reaches the routed experts. Wrapping the expert tensors whole is not an option: a
+no-copy buffer wires its pages when it becomes resident, and 115 GB of experts neither fit nor
+are in memory. So the streamer's part cache is the GPU's expert cache: every expert it holds is
+wrapped (three no-copy buffers over its page-cache pages, in the queue's residency set) and its
+addresses are written to a per-layer table of 384 + 1 entries that the expert kernels index with
+the router's choice. The streamer logs what enters and leaves the part cache
+(`StreamHook::track_parts` / `part_changes`), and the wraps follow before each step (~75 us an
+expert, in parallel; a first fill of 8k experts takes ~0.6 s, done on a thread of its own while
+the prompt is prefilled). The least-recently-used bookkeeping of a step's experts runs while the
+next step is on the GPU.
+
+Routing without a round trip, and misses: the router kernel checks the chosen experts' table
+entries. An expert without an address is recorded (layer, expert) and replaced by a zero expert
+with weight 0. After the pass the host reads the missed experts (all of them requested at once),
+wraps them and runs the token again from the first layer that missed: every cache write of a step
+goes to a fixed place, so a rerun is exact. Warm, a step misses nothing. While a step missed
+experts, the next ones run in chunks of 4 layers, each waited for (`OXINFER_DS41_CHUNK`): a miss is
+read before the layers after it run on a wrong guess and miss experts of their own, at ~0.3 ms
+per chunk of round trip; a step that misses nothing goes back to one stream.
+
+Measured (same setup as above: 128 greedy tokens after the lighthouse prompt, no lookup drafting,
+interleaved under the bench lock, load 4-10 from other jobs; "warm" after a 1,933-token prefill
+filled the part cache, "cold" with `--cold-start`):
+
+| | CPU decode (this round's binary, `--stream-gpu off`) | GPU decode | llama.cpp Metal + CPU experts (round above) |
+|---|---|---|---|
+| decode warm, tok/s | 17.1 / 17.0 / 15.1 / 13.9 | 47.4 / 44.8 / 42.5 / 37.9 | 6.0 |
+| decode warm, default prompt-lookup drafting on, tok/s | 16.3 | 47.1 | |
+| decode cold, tok/s | 12.1 / 12.1 | 14.3 / 13.5 | 5.7 |
+
+(The spread of the warm runs is other jobs' load on the GPU and CPU; the same text in every run.
+The lighthouse prompt gives prompt lookup nothing to draft, on either path.)
+
+Warm, a step takes 21 ms (47 tok/s once the run is going; the 128-token figure includes the
+first step and the prefill's tail). Cold, a step reads the same ~24 GB from the SSD over the 128
+tokens as the CPU does and runs ~17 partial passes of the layers instead of one.
+
+Where a warm step's GPU time goes (`OXINFER_DS41_PROFILE=1`: each stage in a command buffer of
+its own, summed per kind; 18.8 ms of the 21):
+
+| stage | ms / token | |
+|---|---|---|
+| routed experts (gate / up pair, down sum) | 6.0 | ~1.8 GB of IQ1_S / IQ1_M / IQ2_XXS / IQ2_S at ~300 GB/s |
+| attention output projection (8 groups + `wo_b`) | 3.7 | 2.1 GB of Q5_K at ~560 GB/s |
+| router, shared expert, mixing weights | 2.7 | |
+| `wq_b` | 2.3 | 1.15 GB of Q5_K at ~500 GB/s |
+| attention (window + 512 keys, combine) | 0.95 | |
+| hyper-connection dot products + collapse | 0.9 | |
+| attention input projections | 0.8 | |
+| LM head | 0.7 | 455 MB of Q5_K |
+| engram projections and gates | 0.35 | |
+| hyper-connection post | 0.3 | |
+| norms, compressors, indexers | 0.2 | |
+
+The remaining ~2 ms are the dependency barriers (~14 a layer) and the command buffer boundaries.
+
+Correctness: the six greedy checks against llama.cpp give its tokens at every step for five
+prompts (165 of 165; mean KL 0.0004-0.0033); the thinking prompt departs at step 13 of 33, at a
+near tie (top-2 log-probability gap 0.016 here, 0.064 in llama.cpp; the CPU path keeps llama.cpp's
+token there). Against the CPU path, mean KL 0.0002-0.0040 per prompt (the same size as the CPU
+path's own distance to llama.cpp: the CPU quantizes activations to int8, the GPU keeps them in
+f32). Perplexity (prefill, unchanged) 2.9766. Each kernel has a unit test against a CPU
+reference (`metal::ds41::tests`), and a small random V4.1 model at the kernels' sizes decodes 24
+steps on the GPU within 1e-3 of the CPU path's logits, through the indexer's choice, the
+candidate blocks, rate-2 pooling, engram rows, CPU steps in between and a rollback
+(`deepseek4::v41::gpu::tests`).
+
+Kept:
+
+- The IQ1_S and IQ1_M decode matvecs as dot products of their own (the grid entries' signed
+  bytes against x, the delta applied to the sums of x): 2304 x 5120 IQ1_S 142 -> 224 GB/s, IQ1_M
+  160 -> 229 GB/s, a 129280-row matrix 239 -> 338.
+- Sinkhorn on one SIMD-group instead of one thread (in-projection stage 2.8 -> 0.8 ms a token),
+  routing on one SIMD-group instead of 1024 threads with barriers (3.8 -> 2.7 ms with the
+  above).
+- Layers in chunks while experts miss: cold 10.7 -> 13.5 tok/s (one stream with whole-token reruns:
+  2-5 passes a step).
+
+Tried and not kept:
+
+- The same for IQ2_XXS (signs applied as +-1 vectors): slower than the GEMM dequantizer's loader
+  (2304 x 5120: 14.9 -> 15.9 us).
+- Four expert rows a threadgroup (each chunk of x loaded once for four rows): 6.2 ms against 6.0.
+
+Not done: a multi-token GPU pass (prompt-lookup verification runs on the CPU path, whose
+measured cost the cost-aware lookup policy weighs against the GPU's 21 ms step), chaining greedy
+steps on the device (`TextLm::decode_greedy`), faster IQ2_XXS / IQ2_S expert kernels.
+
 Not done for V4.1: image input (the ViT with 2D RoPE, the 3x3 aligner and the
 image processor; `mmproj` files are not read; the language model's side is in place and
 verified as above); DSpark (the `mtp.*` stages differ from V4's: 128 experts, a Markov head on the
 target's embedding and head, a confidence head; a `dspark*.gguf` beside the model is ignored and
 `--draft` refused); the other GGUF builds on their real weights (unsloth's, the Coder and
-AtomicChat builds: headers only); the FP8 / FP4 release; GPU decoding (a decode graph of the whole layer; the feed-forward block alone was tried, above). Runtime interventions use V4's hook points and were not measured on this
+AtomicChat builds: headers only); the FP8 / FP4 release. Runtime interventions use V4's hook points and were not measured on this
 architecture.
