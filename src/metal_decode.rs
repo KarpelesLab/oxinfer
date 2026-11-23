@@ -1170,7 +1170,7 @@ pub(crate) struct Fns {
     pub(crate) s_wait: Sel,
     pub(crate) s_status: Sel,
     s_contents: Sel,
-    s_release: Sel,
+    pub(crate) s_release: Sel,
 }
 
 impl Fns {
@@ -1536,6 +1536,61 @@ pub(crate) fn encode_mv(
     e.buf(w2.offs, 0, 8);
     e.buf(gate.0, gate.1, 9);
     e.dispatch((w.n_out.div_ceil(nr), 1), 32 * ks);
+}
+
+/// Encodes an exact multi-token matvec (`mvk_*`: a token's outputs are the one-token kernel's
+/// bits, see `decode_mvk_matches_single_token`) of `ntok` tokens with the kernel `pick` (pipeline,
+/// rows per threadgroup, threads per threadgroup: [`MvkPipe::pick`]): x / y rows `sx` / `sy`
+/// floats apart, token t's gate at `gate + t * sgate` floats (0: one gate for all, e.g. the
+/// limit of [`MvMode::SiluClampPair`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn encode_mvk_t(
+    e: &FastEnc,
+    (pipe, nr, threads): (Id, usize, usize),
+    w: &MvWeight,
+    w2: Option<&MvWeight>,
+    mode: MvMode,
+    ntok: usize,
+    x: (Id, usize),
+    y: (Id, usize),
+    gate: (Id, usize),
+    (sx, sy, sgate): (usize, usize, usize),
+) {
+    let w2 = w2.unwrap_or(w);
+    let p = MvkParams {
+        m: MvParams {
+            n_out: w.n_out as u32,
+            n_in: w.n_in as u32,
+            mode: mode as u32,
+            rows_per_tg: nr as u32,
+            w_off: w.data_off,
+            s_off: w.scales_off,
+            w2_off: w2.data_off,
+            s2_off: w2.scales_off,
+            o_off: w.offs_off,
+            o2_off: w2.offs_off,
+            gpr: w.gpr,
+            gk: w.gk,
+            ldy: 0,
+            _p: 0,
+        },
+        ntok: ntok as u32,
+        sx: sx as u32,
+        sy: sy as u32,
+        sgate: sgate as u32,
+    };
+    e.pipe(pipe);
+    e.buf(w.data, 0, 0);
+    e.buf(w.scales, 0, 1);
+    e.buf(x.0, x.1, 2);
+    e.buf(y.0, y.1, 3);
+    e.bytes(&p, 4);
+    e.buf(w2.data, 0, 5);
+    e.buf(w2.scales, 0, 6);
+    e.buf(w.offs, 0, 7);
+    e.buf(w2.offs, 0, 8);
+    e.buf(gate.0, gate.1, 9);
+    e.dispatch((w.n_out.div_ceil(nr), 1), threads);
 }
 
 impl MetalBackend {
@@ -7980,9 +8035,16 @@ mod tests {
                 for &ntok in toks {
                     for &ks in &ks_list {
                         let nr = if fmt.specialized() { 1 } else { 2 };
-                        for mode in [MvMode::Store, MvMode::Add, MvMode::SiluPair, MvMode::GeluPair, MvMode::AddGated] {
+                        for mode in [
+                            MvMode::Store,
+                            MvMode::Add,
+                            MvMode::SiluPair,
+                            MvMode::GeluPair,
+                            MvMode::AddGated,
+                            MvMode::SiluClampPair,
+                        ] {
                             let up = wt(1);
-                            let pair = matches!(mode, MvMode::SiluPair | MvMode::GeluPair).then_some(&up);
+                            let pair = matches!(mode, MvMode::SiluPair | MvMode::GeluPair | MvMode::SiluClampPair).then_some(&up);
                             let reset = || unsafe {
                                 std::ptr::copy_nonoverlapping(x.as_ptr(), f.contents(st.x) as *mut f32, x.len());
                                 std::ptr::copy_nonoverlapping(y0.as_ptr(), f.contents(st.y) as *mut f32, y0.len());

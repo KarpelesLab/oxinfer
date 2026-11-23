@@ -44,7 +44,6 @@ kernel void d41_dots(device const float* w [[buffer(0)]], device const float* x 
     float t = d41_tg_sum((a.x + a.y) + (a.z + a.w), red, tid, 256, sg, lane);
     if (tid == 0) part[r * p.split + s] = t;
 }
-
 // The mixing weights from the dot products (DeepSeek's hc_split_sinkhorn): out = pre [n], post
 // [n], comb [n * n] (row j = source copy j). One thread.
 struct MixP { uint n; uint split; uint len; uint iters; float eps; float heps; uint _p0; uint _p1; };
@@ -146,7 +145,6 @@ kernel void d41_collapse(device const float* x [[buffer(0)]], device const float
         if (i < p.h) out[i] = y[j] * sc * w[i];
     }
 }
-
 // Rows of d (grid = rows, 256 threads, d <= 4096): optionally RMS-normed (flags bit 0; weighted
 // with bit 1), then the last 2 half dimensions rotated as interleaved pairs by cs (cos [half]
 // then sin [half]; backwards with bit 2); src row r at r * ss, dst row at r * ds.
@@ -549,4 +547,73 @@ kernel void d41_topk(device const float* s [[buffer(0)]], device uint* out [[buf
         eq_seen += tot_eq;
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+}
+
+// ---- The input rows of a pass from token ids on the device: each token's (uint at tok + t ts)
+// row of the embedding table into the n residual copies of its x row (xs floats apart). Grid T,
+// 1024 threads. GGUF tables through the GEMM dequantizers (`d41_embed_<type>`, rows of rb bytes),
+// bf16 tables widened.
+struct EmbP { uint h; uint n; uint rb; uint ts; uint xs; uint _p0; uint _p1; uint _p2; };
+kernel void d41_embed_bf(device const ushort* w [[buffer(0)]], device const uint* tok [[buffer(1)]], device float* x [[buffer(2)]],
+                         constant EmbP& p [[buffer(3)]], uint t [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]]) {
+    uint row = tok[t * p.ts];
+    device float* xr = x + (ulong)t * p.xs;
+    for (uint i = tid; i < p.h; i += 1024) {
+        float v = as_type<float>(uint(w[(ulong)row * p.h + i]) << 16);
+        for (uint k = 0; k < p.n; k++) xr[k * p.h + i] = v;
+    }
+}
+#define D41_EMB(T) \
+kernel void d41_embed_##T(device const uchar* w [[buffer(0)]], device const uint* tok [[buffer(1)]], device float* x [[buffer(2)]], \
+                          constant EmbP& p [[buffer(3)]], uint t [[threadgroup_position_in_grid]], \
+                          uint tid [[thread_index_in_threadgroup]]) { \
+    uint row = tok[t * p.ts]; \
+    T##W wt = { { w, p.rb } }; \
+    device float* xr = x + (ulong)t * p.xs; \
+    for (uint b = tid; b < p.h / 32; b += 1024) { \
+        float4 v[8]; \
+        load(wt, row, b, v); \
+        for (uint k = 0; k < p.n; k++) \
+            for (uint i = 0; i < 8; i++) *(device float4*)(xr + k * p.h + b * 32 + 4 * i) = v[i]; \
+    } }
+
+// ---- Greedy decoding on the device: the token of the logits, sampler::argmax's (the first index
+// of the largest value above -inf; NaNs never win; 0 when there is none). d41_amax: grid
+// ceil(n / 1024) threadgroups of 1024, each its (value, index bits) into part; d41_amax_fin (one
+// threadgroup of 1024): the token over `parts` partials into tok[0].
+struct AmP { uint n; uint parts; uint _p0; uint _p1; };
+inline void d41_pick(thread float& bv, thread uint& bi, float v, uint i) {
+    if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+}
+inline void d41_pick_tg(thread float& bv, thread uint& bi, threadgroup float* tv, threadgroup uint* ti, uint tid, uint sg, uint lane) {
+    for (ushort m = 16; m > 0; m >>= 1) d41_pick(bv, bi, simd_shuffle_xor(bv, m), simd_shuffle_xor(bi, m));
+    if (lane == 0) { tv[sg] = bv; ti[sg] = bi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0)
+        for (uint k = 1; k < 32; k++) d41_pick(bv, bi, tv[k], ti[k]);
+}
+kernel void d41_amax(device const float* x [[buffer(0)]], device float* part [[buffer(1)]], constant AmP& p [[buffer(2)]],
+                     uint g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float tv[32];
+    threadgroup uint ti[32];
+    uint i = g * 1024 + tid;
+    float v = i < p.n ? x[i] : -INFINITY;
+    bool c = i < p.n && v > -INFINITY;
+    float bv = c ? v : -INFINITY;
+    uint bi = c ? i : 0xffffffffu;
+    d41_pick_tg(bv, bi, tv, ti, tid, sg, lane);
+    if (tid == 0) { part[2 * g] = bv; part[2 * g + 1] = as_type<float>(bi); }
+}
+kernel void d41_amax_fin(device const float* part [[buffer(0)]], device uint* tok [[buffer(1)]], constant AmP& p [[buffer(2)]],
+                         uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float tv[32];
+    threadgroup uint ti[32];
+    float bv = -INFINITY;
+    uint bi = 0xffffffffu;
+    for (uint k = tid; k < p.parts; k += 1024) d41_pick(bv, bi, part[2 * k], as_type<uint>(part[2 * k + 1]));
+    d41_pick_tg(bv, bi, tv, ti, tid, sg, lane);
+    if (tid == 0) tok[0] = bi == 0xffffffffu ? 0u : bi;
 }

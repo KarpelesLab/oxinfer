@@ -834,6 +834,10 @@ inline void mvk_out(device float* y, uint o, uint mode, float a, float b, device
     else if (mode == 3) {
         float t = 0.7978845608f * (a + 0.044715f * a * a * a);
         y[o] = 0.5f * a * (1.0f + precise::tanh(t)) * b;
+    } else if (mode == 6) {
+        float l = gate[0];
+        float g = min(a, l);
+        y[o] = g / (1.0f + precise::exp(-g)) * clamp(b, -l, l);
     } else y[o] += a / (1.0f + exp(-gate[0]));
 }
 // K-quants (Q4_K, Q5_K): the chunk's 32 quants as half (exact) and its super-block scale, min and the
@@ -958,7 +962,7 @@ template <typename F, typename X, uint CH, int NR, int KS, int T, int H>
 inline void mvk_part(F f, F f2, device const float* x, device float* y, device const float* gate, uint nt, constant MVK& q, uint tg,
                      uint sg, uint lane, threadgroup float* red) {
     constant MV& p = q.m;
-    const bool pair = p.mode == 2 || p.mode == 3;
+    const bool pair = p.mode == 2 || p.mode == 3 || p.mode == 6;
     const uint r0 = tg * NR, nch = p.n_in / CH;
     uint rows[NR];
     for (int r = 0; r < NR; r++) rows[r] = min(r0 + r, p.n_out - 1);
@@ -1022,7 +1026,7 @@ template <typename F, typename X, uint CH, int NR, int KS>
 inline void mvk_sweeps(F f, F f2, device const float* x, device float* y, constant MVK& q, uint tg, uint sg, uint lane,
                        threadgroup float* red, device const float* gate) {
     constant MV& p = q.m;
-    const bool pair = p.mode == 2 || p.mode == 3;
+    const bool pair = p.mode == 2 || p.mode == 3 || p.mode == 6;
     const uint r0 = tg * NR, nch = p.n_in / CH;
     uint rows[NR];
     for (int r = 0; r < NR; r++) rows[r] = min(r0 + r, p.n_out - 1);

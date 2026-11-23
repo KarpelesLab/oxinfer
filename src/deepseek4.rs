@@ -2116,6 +2116,21 @@ impl crate::generate::TextLm for DeepSeek4Model<'_> {
     fn forward(&self, sess: &mut DeepSeek4Session, tokens: &[u32]) -> Vec<f32> {
         DeepSeek4Model::forward(self, sess, tokens)
     }
+    /// V4.1 decoding on Metal chains greedy passes on the device (`v41::gpu::decode_greedy`).
+    fn decode_greedy(
+        &self,
+        sess: &mut DeepSeek4Session,
+        first: u32,
+        max: usize,
+        on: &mut dyn FnMut(u32) -> crate::generate::Chain,
+    ) -> Option<usize> {
+        #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+        if self.cfg.v41 && v41::gpu::wanted() {
+            return v41::gpu::decode_greedy(self, sess, first, max, on);
+        }
+        let _ = (sess, first, max, on);
+        None
+    }
 }
 
 /// Runtime interventions (`crate::intervene`): the residual points around every layer on the
@@ -2180,6 +2195,23 @@ impl crate::dspark::Target for DeepSeek4Model<'_> {
     }
     fn truncate(&self, sess: &mut DeepSeek4Session, len: usize) {
         sess.truncate(len);
+    }
+    /// V4.1 decoding on Metal verifies a few tokens in one GPU pass whose logits are those of
+    /// one-token steps, bit for bit (`v41::gpu::pass`).
+    fn forward_verify(&self, sess: &mut DeepSeek4Session, tokens: &[u32], layers: &[usize], feats: &mut Vec<f32>, fast: bool) -> Vec<f32> {
+        #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+        if self.cfg.v41
+            && layers.is_empty()
+            && tokens.len() > 1
+            && v41::gpu::wanted()
+            && let Some(l) = v41::gpu::pass(self, sess, tokens, false)
+        {
+            feats.clear();
+            return l;
+        }
+        let _ = fast;
+        let hs = self.forward_capture(sess, tokens, layers, feats);
+        self.logits(&hs, tokens.len())
     }
 }
 
