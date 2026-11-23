@@ -1019,7 +1019,8 @@ kernel void ink_mvf(device float* a [[buffer(0)]], device const float* c [[buffe
 // ---- Sigmoid routing (grid: token; one thread per expert, n <= 1024): the k experts of the
 // largest `sigmoid(logit) + bias` (ties to the lower index), weighted by their sigmoid scores
 // renormalized over the k, times `scale`: ids (uint bits) then weights into `sel` (2 k per token).
-struct IRouteP { uint n; uint k; uint logits; uint sel; uint bias; float scale; uint single; uint grp; uint asg; uint _p0; uint _p1; uint _p2; };
+// (`ntok`: the tokens of `ink_route_group`.)
+struct IRouteP { uint n; uint k; uint logits; uint sel; uint bias; float scale; uint single; uint grp; uint asg; uint ntok; uint _p1; uint _p2; };
 // The routing of token ti in one SIMD-group (n <= 128, k <= 32; 4 experts a lane, expert u * 32 +
 // lane in slot u, no threadgroup barriers): lane j < k gets the j-th pick and its sigmoid score; all
 // lanes the sum of the k scores.
@@ -1494,6 +1495,49 @@ kernel void ink_xgroup(device float* a [[buffer(0)]], constant IXgP& p [[buffer(
     }
     device uint* g = (device uint*)(a + p.grp);
     device uint* asg = (device uint*)(a + p.asg);
+    asg[before + rank] = i;
+    if (i == first) {
+        g[1 + 3 * gid] = e;
+        g[2 + 3 * gid] = cnt;
+        g[3 + 3 * gid] = before;
+    }
+    if (i == 0) g[0] = ng;
+}
+// The routing of a pass's tokens (`ink_route`'s single SIMD-group routing, SIMD-group s taking
+// tokens s, s + groups, ...) and `ink_xgroup` in one threadgroup of at least t k threads (n <= 128
+// experts, k <= 32): the same `sel`, `grp` and `asg`.
+kernel void ink_route_group(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IRouteP& rp [[buffer(2)]],
+                            uint i [[thread_index_in_threadgroup]], uint nth [[threads_per_threadgroup]],
+                            uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup uint ex[1024];
+    threadgroup uint fs[1024];
+    uint k = rp.k, nt = rp.ntok, n = nt * k;
+    for (uint ti = sg; ti < nt; ti += nth / 32) {
+        uint myid;
+        float mych, sum;
+        ink_route_sg(a, c, rp, ti, lane, myid, mych, sum);
+        if (lane < k) {
+            a[rp.sel + (ulong)ti * 2 * k + lane] = as_type<float>(myid);
+            a[rp.sel + (ulong)ti * 2 * k + k + lane] = mych / sum * rp.scale;
+            ex[ti * k + lane] = myid;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint e = i < n ? ex[i] : 0, first = i;
+    if (i < n)
+        for (uint j = 0; j < i; j++) if (ex[j] == e) { first = j; break; }
+    fs[i] = first;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (i >= n) return;
+    uint gid = 0, before = 0, rank = 0, cnt = 0, ng = 0;
+    for (uint j = 0; j < n; j++) {
+        uint fj = fs[j];
+        if (fj == j) { ng++; if (j < first) gid++; }
+        if (fj < first) before++;
+        if (fj == first) { cnt++; if (j < i) rank++; }
+    }
+    device uint* g = (device uint*)(a + rp.grp);
+    device uint* asg = (device uint*)(a + rp.asg);
     asg[before + rank] = i;
     if (i == first) {
         g[1 + 3 * gid] = e;

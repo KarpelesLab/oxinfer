@@ -520,7 +520,7 @@ struct RouteP {
     single: u32,
     grp: u32,
     asg: u32,
-    _p0: u32,
+    ntok: u32,
     _p1: u32,
     _p2: u32,
 }
@@ -871,6 +871,7 @@ struct Pipes {
     gmix_norm: Id,
     gfg: Id,
     gsc: Id,
+    route_group: Id,
     mvr: Id,
     lora_a: Id,
     lora_b: Id,
@@ -2014,6 +2015,7 @@ impl InkMetal {
             gmix_norm: pipe("ink_gmix_norm")?,
             gfg: pipe("ink_gfg")?,
             gsc: pipe("ink_gsc")?,
+            route_group: pipe("ink_route_group")?,
             mvr: pipe("ink_mvr")?,
             xcombine: pipe("ink_xcombine")?,
             lora_a: pipe("ink_lora_a")?,
@@ -3419,6 +3421,13 @@ impl InkMetal {
         if self.route_in_pair(ld, t) {
             return;
         }
+        if self.route_group(t) {
+            self.std(e, c, self.p.route_group);
+            e.bytes(&self.route_params(c, ld, t), 2);
+            e.dispatch((1, 1), (t * self.topk).next_multiple_of(32).max(128));
+            e.barrier();
+            return;
+        }
         self.std(e, c, self.p.route);
         e.bytes(&self.route_params(c, ld, t), 2);
         if !self.skip(SK_RT) {
@@ -3442,6 +3451,18 @@ impl InkMetal {
             && *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_RPAIR").is_ok_and(|v| v == "0"))
     }
 
+    /// Whether a pass of 2 to [`MAX_T`] tokens routes and groups its experts in one kernel
+    /// (`ink_route_group`: at most 128 experts, 32 a token; `OXINFER_INKLING_RGROUP=0`: `ink_route`,
+    /// then `ink_xgroup`).
+    fn route_group(&self, t: usize) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        (2..=MAX_T).contains(&t)
+            && self.ne <= 128
+            && self.topk <= 32
+            && !self.skip(SK_ROUTE | SK_RT)
+            && *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_RGROUP").is_ok_and(|v| v == "0"))
+    }
+
     fn route_params(&self, c: &Cx, ld: &LayerDev, t: usize) -> RouteP {
         let b = c.b;
         RouteP {
@@ -3454,6 +3475,7 @@ impl InkMetal {
             single: (t == 1) as u32,
             grp: b.grp as u32,
             asg: b.asg as u32,
+            ntok: t as u32,
             ..Default::default()
         }
     }
@@ -3477,8 +3499,8 @@ impl InkMetal {
                 asg: u32,
                 _p: [u32; 3],
             }
-            // (A pass of one token has its groups from the routing.)
-            if t > 1 {
+            // (A pass of one token has its groups from the routing, as `ink_route_group`'s passes.)
+            if t > 1 && !self.route_group(t) {
                 e.pipe(self.p.xgroup);
                 e.buf(c.a, 0, 0);
                 e.bytes(
