@@ -197,6 +197,15 @@ pub fn matmul_multi(jobs: &mut [(&[u16], usize, &mut [f32])], n_in: usize, x: &[
         matmul_quant_multi_at(&mut qj, x, t, TN - 1);
         return;
     }
+    #[cfg(target_arch = "aarch64")]
+    if t >= TN && n_in.is_multiple_of(32) && gemm_tuning().is_some() {
+        // Prefill on the cache-blocked NEON GEMM, through the quantized driver, as on x86-64
+        // (the same bits).
+        let mats: Vec<Bf16Mat> = jobs.iter().map(|(w, n_out, _)| Bf16Mat { w, n_out: *n_out, n_in }).collect();
+        let mut qj: Vec<(&Bf16Mat, &mut [f32])> = mats.iter().zip(jobs.iter_mut()).map(|(m, (_, _, y))| (m, &mut **y)).collect();
+        matmul_quant_multi_at(&mut qj, x, t, TN - 1);
+        return;
+    }
     let mut total_bytes = 0usize;
     let refs: Vec<JobRef> = jobs
         .iter_mut()
@@ -1105,6 +1114,54 @@ pub mod simd {
                 pair(c0 + 2)
             }
             _ => unreachable!("bad tc {tc}"),
+        }
+    }
+
+    /// [`gemm_8x8`] over `kn` columns only, added to the partial sums `acc[r * 8 + c]` (8 rows x
+    /// 8 tokens): the rows of `w` are `kn` values each, `xt` is the token panel from the first
+    /// of these columns on. The same fused multiply-adds in column order, so sums carried from
+    /// zero through consecutive column blocks are `gemm_8x8`'s bit for bit.
+    #[inline(always)]
+    pub unsafe fn gemm_8x8_acc(w: *const f32, kn: usize, xt: *const f32, acc: *mut f32) {
+        let mut a: [[float32x4_t; 2]; 8] = std::array::from_fn(|r| [vld1q_f32(acc.add(8 * r)), vld1q_f32(acc.add(8 * r + 4))]);
+        let mut k = 0;
+        let n4 = kn / 4 * 4;
+        while k < n4 {
+            let xp = xt.add(k * 8);
+            let x0a = vld1q_f32(xp);
+            let x0b = vld1q_f32(xp.add(4));
+            let x1a = vld1q_f32(xp.add(8));
+            let x1b = vld1q_f32(xp.add(12));
+            let x2a = vld1q_f32(xp.add(16));
+            let x2b = vld1q_f32(xp.add(20));
+            let x3a = vld1q_f32(xp.add(24));
+            let x3b = vld1q_f32(xp.add(28));
+            for (r, ar) in a.iter_mut().enumerate() {
+                let wq = vld1q_f32(w.add(r * kn + k));
+                ar[0] = vfmaq_laneq_f32::<0>(ar[0], x0a, wq);
+                ar[1] = vfmaq_laneq_f32::<0>(ar[1], x0b, wq);
+                ar[0] = vfmaq_laneq_f32::<1>(ar[0], x1a, wq);
+                ar[1] = vfmaq_laneq_f32::<1>(ar[1], x1b, wq);
+                ar[0] = vfmaq_laneq_f32::<2>(ar[0], x2a, wq);
+                ar[1] = vfmaq_laneq_f32::<2>(ar[1], x2b, wq);
+                ar[0] = vfmaq_laneq_f32::<3>(ar[0], x3a, wq);
+                ar[1] = vfmaq_laneq_f32::<3>(ar[1], x3b, wq);
+            }
+            k += 4;
+        }
+        while k < kn {
+            let xa = vld1q_f32(xt.add(k * 8));
+            let xb = vld1q_f32(xt.add(k * 8 + 4));
+            for (r, ar) in a.iter_mut().enumerate() {
+                let wv = *w.add(r * kn + k);
+                ar[0] = vfmaq_n_f32(ar[0], xa, wv);
+                ar[1] = vfmaq_n_f32(ar[1], xb, wv);
+            }
+            k += 1;
+        }
+        for (r, ar) in a.iter().enumerate() {
+            vst1q_f32(acc.add(8 * r), ar[0]);
+            vst1q_f32(acc.add(8 * r + 4), ar[1]);
         }
     }
 
@@ -2185,7 +2242,14 @@ pub(crate) fn matmul_quant_multi_at<M: QMat>(jobs: &mut [(&M, &mut [f32])], x: &
     // few enough tokens for a block to stay in L2 (see `gemm_tuning`).
     #[cfg(target_arch = "x86_64")]
     let blocked = (gemm && simd::avx512()).then(gemm_tuning);
-    #[cfg(not(target_arch = "x86_64"))]
+    // The cache-blocked NEON GEMM of aarch64 Linux: the same.
+    #[cfg(target_arch = "aarch64")]
+    let blocked = if gemm && prefill_kernel() != PrefillGemm::Sme {
+        gemm_tuning()
+    } else {
+        None
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let blocked: Option<(usize, usize, usize)> = None;
     let rows_per_block = blocked.map_or(rows_per_block, |(_, rows, _)| rows_per_block.clamp(rows, 2 * rows));
     // The int8 GEMM of x86-64 (when any matrix takes it): its own rows and tokens per job (each
@@ -2480,6 +2544,91 @@ fn gemm_tuning() -> (usize, usize, usize) {
     })
 }
 
+/// Tuning of the cache-blocked NEON prefill GEMM (aarch64 [`gemm_blocked`]): columns per block
+/// (`OXINFER_GEMM_KB`, a multiple of 256; 0: whole rows, no blocking), rows per pool job
+/// (`OXINFER_GEMM_ROWS`, a multiple of 16) and tokens per pool job (`OXINFER_GEMM_TOKENS`, a
+/// multiple of 8). None of them changes a result. None (whole rows) is the default outside
+/// Linux: the blocking was measured on a DGX Spark only (Cortex-X925 / A725, 2 MiB / 512 KiB of
+/// L2 per core), where every 8 rows otherwise stream the whole packed prompt from memory (18 MB
+/// at 256 tokens x 17408 inputs). Defaults for 512 KiB of L2: a job's activations of one column
+/// block (256 tokens x 256 columns of f32: 256 KiB) and its partial sums (32 rows x 256 tokens:
+/// 32 KiB) stay in L2 while its rows pass, 8 dequantized rows of the block (8 KiB) in L1.
+#[cfg(target_arch = "aarch64")]
+fn gemm_tuning() -> Option<(usize, usize, usize)> {
+    static T: std::sync::OnceLock<Option<(usize, usize, usize)>> = std::sync::OnceLock::new();
+    *T.get_or_init(|| {
+        let e = |k: &str, d: usize, q: usize| {
+            let v: usize = std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+            v / q * q
+        };
+        let kb = e("OXINFER_GEMM_KB", if cfg!(target_os = "linux") { 256 } else { 0 }, 256);
+        (kb > 0).then(|| (kb, e("OXINFER_GEMM_ROWS", 32, 16).max(16), e("OXINFER_GEMM_TOKENS", 256, 8).max(8)))
+    })
+}
+
+/// The prefill GEMM on NEON, cache-blocked (see [`gemm_tuning`]): rows `r0..` of `m` (whole
+/// groups of 8) times the `t` tokens of `xt` (8-token panels from the first token on), into
+/// `y[c * n_out + r]`. The columns go in blocks of `kb`: each group of 8 rows is dequantized
+/// for those columns only and multiplied with every token panel before the next block, the
+/// partial sums kept between blocks. Every output is still one fused multiply-add chain over
+/// the columns in order from zero, so the results are bit-identical to the 8x8 GEMM over whole
+/// rows.
+///
+/// Returns the first row it did not compute: `r0` when the format cannot be dequantized by
+/// column blocks ([`QMat::dequantize_block`]), else the end of the last whole group of 8 rows.
+#[cfg(target_arch = "aarch64")]
+unsafe fn gemm_blocked<M: QMat>(m: &M, xt: &[f32], t: usize, kb: usize, r0: usize, r1: usize, y: *mut f32) -> usize {
+    let (n_in, n_out) = (m.n_in(), m.n_out());
+    let full = r0 + (r1 - r0) / 8 * 8;
+    if full == r0 || t == 0 || n_in == 0 {
+        return r0;
+    }
+    let (np, ng) = (t.div_ceil(TN), (full - r0) / 8);
+    SCRATCH.with(|s| {
+        let mut s = s.borrow_mut();
+        let need = 8 * kb + ng * np * 64;
+        if s.len() < need {
+            s.resize(need, 0.0);
+        }
+        let (w, acc) = s.split_at_mut(8 * kb);
+        let acc = &mut acc[..ng * np * 64];
+        acc.fill(0.0);
+        let mut k0 = 0;
+        while k0 < n_in {
+            let kn = (n_in - k0).min(kb);
+            for g in 0..ng {
+                let rg = r0 + 8 * g;
+                if !m.dequantize_block(rg, rg + 8, k0, k0 + kn, &mut w[..8 * kn]) {
+                    // The columns are the same for every row: only the first call can decline.
+                    assert!(k0 == 0 && g == 0, "column blocks declined after the first");
+                    return r0;
+                }
+                for p in 0..np {
+                    simd::gemm_8x8_acc(
+                        w.as_ptr(),
+                        kn,
+                        xt.as_ptr().add((p * n_in + k0) * TN),
+                        acc.as_mut_ptr().add((g * np + p) * 64),
+                    );
+                }
+            }
+            k0 += kn;
+        }
+        for p in 0..np {
+            for c in 0..(t - TN * p).min(TN) {
+                let yc = y.add((TN * p + c) * n_out + r0);
+                for g in 0..ng {
+                    let a = &acc[(g * np + p) * 64..(g * np + p + 1) * 64];
+                    for r in 0..8 {
+                        *yc.add(8 * g + r) = a[8 * r + c];
+                    }
+                }
+            }
+        }
+        full
+    })
+}
+
 /// The prefill GEMM on AVX-512, cache-blocked: rows `r0..` of `m` (whole groups of 8) times the
 /// `t` tokens of `xt` (8-token panels from the first token on), into `y[c * n_out + r]`. The
 /// columns go in blocks of `kb`: each block of 16 rows is dequantized for those columns only and
@@ -2543,7 +2692,8 @@ unsafe fn gemm_blocked<M: QMat>(m: &M, xt: &[f32], t: usize, kb: usize, r0: usiz
 }
 
 /// Prefill with quantized weights: dequantize 8 rows at a time into a thread-local f32 scratch
-/// and run the f32 GEMM tiles over all tokens (x86-64 with AVX-512: [`gemm_blocked`]).
+/// and run the f32 GEMM tiles over all tokens (x86-64 with AVX-512 and aarch64 Linux:
+/// [`gemm_blocked`]).
 unsafe fn matmul_quant_block_prefill<M: QMat>(m: &M, x: &[f32], xt: &[f32], t: usize, r0: usize, r1: usize, y: *mut f32) {
     let n_in = m.n_in();
     let n_out = m.n_out();
@@ -2552,6 +2702,11 @@ unsafe fn matmul_quant_block_prefill<M: QMat>(m: &M, x: &[f32], xt: &[f32], t: u
         (true, gemm_blocked(m, xt, t, gemm_tuning().0, r0, r1, y))
     } else {
         (false, r0)
+    };
+    #[cfg(target_arch = "aarch64")]
+    let r0 = match gemm_tuning() {
+        Some((kb, ..)) => gemm_blocked(m, xt, t, kb, r0, r1, y),
+        None => r0,
     };
     SCRATCH.with(|s| {
         let mut s = s.borrow_mut();
@@ -3073,10 +3228,12 @@ mod tests {
     /// The cache-blocked AVX-512 GEMM gives the bits of the 8x8 AVX2 GEMM over whole rows:
     /// several column blocks with a short last one, 16-row groups with an 8-row group and
     /// leftover rows, token counts around the 8- and 16-token panels, and the column slices of
-    /// every kind of dequantizer. Rows it does not compute stay untouched.
-    #[cfg(target_arch = "x86_64")]
+    /// every kind of dequantizer. Rows it does not compute stay untouched. The same for the
+    /// cache-blocked NEON GEMM (groups of 8 rows, 8-token panels).
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     #[test]
     fn blocked_gemm_matches_8x8_bitwise() {
+        #[cfg(target_arch = "x86_64")]
         if !simd::cpu_has_avx512() || !simd::avx2() {
             eprintln!("skipped: no AVX-512");
             return;
