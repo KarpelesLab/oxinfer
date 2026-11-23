@@ -711,9 +711,9 @@ inline void mvk_finish(thread float (&a)[T][NR], thread float (&b)[T][NR], bool 
         mvk_out(y + (ulong)t * q.sy, r0 + r, p.mode, va, vb, gate + (ulong)t * q.sgate);
     }
 }
-// nt <= T tokens: per chunk, the NR rows' quants are decoded once (`wdec`; with a pair, the
-// second matrix's too), then each token's x chunk is loaded once and dotted with every row
-// (`wdot`, the single-token kernel's arithmetic): the weights are read once for all the tokens.
+// nt <= T tokens: per chunk, the NR rows' quants are decoded once (`wdec`; with a pair, then the
+// second matrix's), and each token's x chunk is loaded and dotted with every row (`wdot`, the
+// single-token kernel's arithmetic): the weights are read once for all the tokens.
 template <typename F, typename X, uint CH, int NR, int KS, int T, int H>
 inline void mvk_part(F f, F f2, device const float* x, device float* y, device const float* gate, uint nt, constant MVK& q, uint tg,
                      uint sg, uint lane, threadgroup float* red) {
@@ -728,28 +728,91 @@ inline void mvk_part(F f, F f2, device const float* x, device float* y, device c
     for (uint c = sg * 32 + lane; c < nch; c += KS * 32) {
         typename WDec<F, H>::T w[NR];
         for (int r = 0; r < NR; r++) wdec(f, rows[r], c, w[r]);
+        for (int t = 0; t < T; t++) {
+            if (uint(t) >= nt) break;
+            X xr;
+            xload(x + (ulong)t * q.sx, c, xr);
+            for (int r = 0; r < NR; r++) a[t][r] += wdot(f, w[r], c, xr);
+        }
         if (pair) {
-            typename WDec<F, H>::T w2[NR];
-            for (int r = 0; r < NR; r++) wdec(f2, rows[r], c, w2[r]);
+            // The second matrix in the same registers (each token's x chunk loaded again).
+            for (int r = 0; r < NR; r++) wdec(f2, rows[r], c, w[r]);
             for (int t = 0; t < T; t++) {
                 if (uint(t) >= nt) break;
                 X xr;
                 xload(x + (ulong)t * q.sx, c, xr);
-                for (int r = 0; r < NR; r++) {
-                    a[t][r] += wdot(f, w[r], c, xr);
-                    b[t][r] += wdot(f2, w2[r], c, xr);
-                }
-            }
-        } else {
-            for (int t = 0; t < T; t++) {
-                if (uint(t) >= nt) break;
-                X xr;
-                xload(x + (ulong)t * q.sx, c, xr);
-                for (int r = 0; r < NR; r++) a[t][r] += wdot(f, w[r], c, xr);
+                for (int r = 0; r < NR; r++) b[t][r] += wdot(f2, w[r], c, xr);
             }
         }
     }
     mvk_finish<NR, KS, T>(a, b, pair, nt, y, q, r0, sg, lane, red, gate);
+}
+// Sweeps of 4 tokens, each bounded by the step's count and finished token by token (the
+// previous kernels' structure, float rows): measured faster for 9-16 tokens of the oxinfer Q4 /
+// Q4_0 rows and of Q8_0 rows on one SIMD-group.
+template <int NR, int KS>
+inline void mvk_tfinish(thread float* acc, thread float* acc2, device float* y, uint mode, uint r0, uint n_out, uint sg, uint lane,
+                        threadgroup float* red, device const float* gate) {
+    for (int r = 0; r < NR; r++) { acc[r] = simd_sum(acc[r]); acc2[r] = simd_sum(acc2[r]); }
+    bool write = true;
+    if (KS > 1) {
+        if (lane == 0)
+            for (int r = 0; r < NR; r++) { red[sg * 2 * NR + r] = acc[r]; red[sg * 2 * NR + NR + r] = acc2[r]; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        write = sg == 0;
+        if (write)
+            for (int r = 0; r < NR; r++) {
+                float a = 0.f, b = 0.f;
+                for (int s = 0; s < KS; s++) { a += red[s * 2 * NR + r]; b += red[s * 2 * NR + NR + r]; }
+                acc[r] = a; acc2[r] = b;
+            }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (write && lane < NR && r0 + lane < n_out) {
+        float a = acc[0], b = acc2[0];
+        for (int r = 1; r < NR; r++) if (lane == uint(r)) { a = acc[r]; b = acc2[r]; }
+        mvk_out(y, r0 + lane, mode, a, b, gate);
+    }
+}
+template <typename F, typename X, uint CH, int NR, int KS>
+inline void mvk_sweeps(F f, F f2, device const float* x, device float* y, constant MVK& q, uint tg, uint sg, uint lane,
+                       threadgroup float* red, device const float* gate) {
+    constant MV& p = q.m;
+    const bool pair = p.mode == 2 || p.mode == 3;
+    const uint r0 = tg * NR, nch = p.n_in / CH;
+    uint rows[NR];
+    for (int r = 0; r < NR; r++) rows[r] = min(r0 + r, p.n_out - 1);
+    for (uint t0 = 0; t0 < q.ntok; t0 += 4) {
+        const uint nt = min(q.ntok - t0, 4u);
+        device const float* xg = x + (ulong)t0 * q.sx;
+        float a[4][NR], b[4][NR];
+        for (int t = 0; t < 4; t++)
+            for (int r = 0; r < NR; r++) { a[t][r] = 0.f; b[t][r] = 0.f; }
+        for (uint c = sg * 32 + lane; c < nch; c += KS * 32) {
+            typename WDec<F, 0>::T w[NR];
+            for (int r = 0; r < NR; r++) wdec(f, rows[r], c, w[r]);
+            for (int t = 0; t < 4; t++) {
+                if (uint(t) >= nt) continue;
+                X xr;
+                xload(xg + (ulong)t * q.sx, c, xr);
+                for (int r = 0; r < NR; r++) a[t][r] += wdot(f, w[r], c, xr);
+            }
+            if (pair) {
+                for (int r = 0; r < NR; r++) wdec(f2, rows[r], c, w[r]);
+                for (int t = 0; t < 4; t++) {
+                    if (uint(t) >= nt) continue;
+                    X xr;
+                    xload(xg + (ulong)t * q.sx, c, xr);
+                    for (int r = 0; r < NR; r++) b[t][r] += wdot(f2, w[r], c, xr);
+                }
+            }
+        }
+        for (int t = 0; t < 4; t++) {
+            if (uint(t) >= nt) break;
+            uint tt = t0 + t;
+            mvk_tfinish<NR, KS>(a[t], b[t], y + (ulong)tt * q.sy, p.mode, r0, p.n_out, sg, lane, red, gate + (ulong)tt * q.sgate);
+        }
+    }
 }
 // Kernels of up to 8 tokens run exactly T (no bounds on the token loops); of up to 16, as many
 // as the step has in groups of 8, a sweep over the rows each (the rows' weights from the cache
@@ -757,6 +820,10 @@ inline void mvk_part(F f, F f2, device const float* x, device float* y, device c
 template <typename F, typename X, uint CH, int NR, int KS, int T, int H>
 inline void mvk_body(F f, F f2, device const float* x, device float* y, constant MVK& q, uint tg, uint sg, uint lane,
                      threadgroup float* red, device const float* gate) {
+    if (H == 2) {
+        mvk_sweeps<F, X, CH, NR, KS>(f, f2, x, y, q, tg, sg, lane, red, gate);
+        return;
+    }
     if (T <= 8) {
         mvk_part<F, X, CH, NR, KS, T, H>(f, f2, x, y, gate, T, q, tg, sg, lane, red);
         return;
@@ -775,21 +842,21 @@ kernel void NAME(device const uchar* wb [[buffer(0)]], device const uchar* sb [[
                  uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], \
                  uint lane [[thread_index_in_simdgroup]])
 #define MVK_RAW(NAME, T, X, CH, NR, KS, TT, H) \
-MVK_SIG(NAME) { threadgroup float red[2 * NR * KS * TT]; constant MV& p = q.m; \
+MVK_SIG(NAME) { threadgroup float red[2 * NR * KS * (H == 2 ? 1 : (TT > 8 ? 8 : TT))]; constant MV& p = q.m; \
     T f = { wb + p.w_off, p.gpr }; T f2 = { wb2 + p.w2_off, p.gpr }; \
     mvk_body<T, X, CH, NR, KS, TT, H>(f, f2, x, y, q, tg, sg, lane, red, gate); }
 #define MVK_Q8(NAME, NR, KS, TT, H) \
-MVK_SIG(NAME) { threadgroup float red[2 * NR * KS * TT]; constant MV& p = q.m; \
+MVK_SIG(NAME) { threadgroup float red[2 * NR * KS * (H == 2 ? 1 : (TT > 8 ? 8 : TT))]; constant MV& p = q.m; \
     MQ8 f = { (device const char*)(wb + p.w_off), (device const float*)(sb + p.s_off), p.n_in }; \
     MQ8 f2 = { (device const char*)(wb2 + p.w2_off), (device const float*)(sb2 + p.s2_off), p.n_in }; \
     mvk_body<MQ8, X16, 16, NR, KS, TT, H>(f, f2, x, y, q, tg, sg, lane, red, gate); }
 #define MVK_Q4(NAME, NR, KS, TT, H) \
-MVK_SIG(NAME) { threadgroup float red[2 * NR * KS * TT]; constant MV& p = q.m; \
+MVK_SIG(NAME) { threadgroup float red[2 * NR * KS * (H == 2 ? 1 : (TT > 8 ? 8 : TT))]; constant MV& p = q.m; \
     MQ4 f = { wb + p.w_off, (device const half*)(sb + p.s_off), p.n_in, (device const ushort*)(ob + p.o_off), p.gpr, p.gk }; \
     MQ4 f2 = { wb2 + p.w2_off, (device const half*)(sb2 + p.s2_off), p.n_in, (device const ushort*)(ob2 + p.o2_off), p.gpr, p.gk }; \
     mvk_body<MQ4, X32, 32, NR, KS, TT, H>(f, f2, x, y, q, tg, sg, lane, red, gate); }
 #define MVK_GEN(NAME, W, NR, KS, TT, H) \
-MVK_SIG(NAME) { threadgroup float red[2 * NR * KS * TT]; constant MV& p = q.m; \
+MVK_SIG(NAME) { threadgroup float red[2 * NR * KS * (H == 2 ? 1 : (TT > 8 ? 8 : TT))]; constant MV& p = q.m; \
     MGen<W> f = { W{ { wb + p.w_off, p.gpr } } }; MGen<W> f2 = { W{ { wb2 + p.w2_off, p.gpr } } }; \
     mvk_body<MGen<W>, X32, 32, NR, KS, TT, H>(f, f2, x, y, q, tg, sg, lane, red, gate); }
 
