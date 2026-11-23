@@ -384,6 +384,116 @@ Whole-pass A/B runs across processes moved by ±5-15% with other jobs' GPU work,
 of alternated runs (load averages were 40-65 for most of the round). The per-op table, the host
 timings and `pf_ab` are the firmer measures.
 
+#### Metal prefill round 5 (November 2026)
+
+Measured first: per-op GPU times (`OXINFER_PF_PROFILE`, isolated dispatches) at 512 and 2048
+tokens on master `a3284a2`. At 2048 tokens attention was the largest item after the GEMMs: 17.5%
+of the summed op time on Llama-3.2-1B Q4_K_M (22 of 127 ms per pass), 14% on Qwen3-8B Q4_K_M (106
+of 759), 15% on Gemma 4 12B Q8_0 (197 of 1332) and 21% on 26B-A4B Q4_0 (112 of 534), with
+`pff_*` / `pffs_*` at 8.5-12.5 TFLOP/s. The GEMMs were not behind: the same 512-token passes
+profiled op by op in both engines (llama.cpp patched as in round 4; ms per pass, oxinfer /
+llama.cpp, the first numbers at load ~15, llama.cpp's at load 10-39) give Qwen3-8B Q8_0
+12288x4096 78.8 / 76.3, 4096x12288 41.8 / 43.5, 4096x4096 29.5 / 29.8, 1024x4096 9.6 / 12.7;
+Gemma 4 12B Q8_0 15360x3840 115.7 / 141.9 (50 / 41 TFLOP/s), 3840x15360 68.5 / 86.7, the
+attention projections 46 / 57; 26B-A4B Q4_0 dense projections 47 / 66 and the routed experts
+70.9 (with the routing, gathers and activation) / 66.3 (`MUL_MAT_ID`) plus ~5 of routing ops. So
+the Q8_0 / Q4_0 GEMMs were left as they are.
+
+What changed:
+
+- **Attention on the matrix units** (`metal_pfmma.metal`, `pfm_<hd>`), as llama.cpp's
+  `kernel_flash_attn_ext_tensor`: a threadgroup of 4 SIMD-groups takes 16 or 32 queries of a
+  head; per block of 64 or 128 keys `matmul2d` computes S = Q K^T into threadgroup memory, an
+  online softmax (lazy rescaling, as llama.cpp's) writes half probabilities, and `matmul2d`
+  accumulates O += P V in a cooperative tensor. The keys and values come from half copies of
+  the cache rows in the plan's arena: the RoPE kernel (`dec_qk_rope_t`) writes the chunk's next to
+  the f32 cache, `pf_kv_half` converts up to 6144 earlier positions (a later chunk keeps
+  `pff_*`), and caches whose lives do not overlap share a slot (one for Llama / Qwen). Kernel
+  alone (`pf_attn_bench`, 2048 queries over 8 KV heads, quiet GPU): 32 heads of 128 2.90 ->
+  0.99-1.05 ms (11.8 -> 33-35 TFLOP/s), 32 x 64 1.37 -> 0.70, 16 x 256 4.02 -> 1.14, 16 x 512
+  (2 KV heads) 7.2 -> 2.7. Per 512-token pass: Llama 1B 1.75 -> 1.2 ms, Qwen3-8B 8.5 -> 3.5,
+  Gemma 4 12B 16.9 -> 6.5, 26B-A4B 11.1 -> 4.3 (llama.cpp's FA: 1.6, 5.7, 10.5, 8.2).
+- **Gemma's scores in f32.** Gemma 3 / 4 normalize q and k and attend with a scale of 1, so the
+  scores are ~sqrt(hd) larger than with 1 / sqrt(hd), and half Q and K round them by up to 1e-2
+  (`pf_attn_bench` at scale 1: outputs 1.3e-2 off). Attentions whose scale exceeds
+  2 / sqrt(hd) take `pfmq_*` (f32 queries and the f32 cache's keys for S, half only for P V;
+  18-20 TFLOP/s, 5e-4 off) and heads of 512 keep `pffs_512`. On Gemma 4 12B this took the last
+  position's KL against the previous build from 1.5e-3 to 5.5e-6 (the CPU against the previous
+  build: 1.3e-3); `OXINFER_PF_MMA_ATTN=2` keeps half scores everywhere (llama.cpp's rounding, its
+  cache being f16), `=0` the old kernels.
+- **Norms and GLUs write the GEMMs' half rows.** `pf_glu_half` computes the SwiGLU / GeGLU
+  (`dec_glu_t`'s values, bit for bit) and the scaled half rows of the down projection's input in
+  the same pass; `pf_norm_half` (RMSNorm) and `pf_add_norm_half` (Gemma's residual add and next
+  norm) do the same for a norm whose next op's GEMM reads it, with 256 threads per token and
+  float4 loads (another summation order than `dec_rms_norm`, so not bit-identical). Their f32
+  rows are not stored when no later op and not the host reads them (every GLU output and the
+  norms before the projections), and a GEMM fed by cached half rows no longer counts its f32
+  input as read. Isolated per 512-token pass, norms, GLUs and half conversions: Llama 1B
+  3.85 -> 2.35 ms, Qwen3-8B 12.4 -> 8.5; one x_half pass and barrier fewer per norm and GLU (3 to
+  5 per layer). `OXINFER_PF_GLU_HALF=0` / `OXINFER_PF_NORM_HALF=0` turn these off; the switches are read
+  as each plan is built, so `pf_ab` compares them in one process.
+
+Measured and dropped:
+
+- The cache's f32 keys and values straight into `matmul2d` (half Q and P): 12 TFLOP/s at 2048
+  tokens, as `pff_*`; converting them to half in threadgroup memory per block (32 keys): 9.6
+  TFLOP/s. Only half rows in device memory let the matrix units run at speed. 8 SIMD-groups per
+  threadgroup (llama.cpp's choice) were slower than 4 here (1.82 against 1.25 ms).
+- For Gemma's scores: splitting Q into half high and low parts halves the error only (7e-3, 20
+  TFLOP/s); an f32 `pfmq_512` fits only 8 queries per threadgroup, no faster than `pffs_512`.
+- Swizzling the dense GEMMs' threadgroups so that groups of 8 or 32 output tiles run for every
+  token tile in turn (weights read from memory once): Qwen3-8B Q8_0 pp512 best of 5, three
+  alternations, 2964 / 2953 / 2810 tok/s unswizzled against 2941 / 2913 / 2807 (8) and 2898 /
+  2774 / 2281 (32).
+- What barriers still cost: removing all of them from a Llama 1B pass (wrong results,
+  `OXINFER_PF_SKIP=barrier`) takes 29.0 ms to 26.5; the remaining ones separate dependent ops
+  (the query, key and value GEMMs run concurrently with no gain, round 4).
+
+Measured on 2026-11-23, one lock window per model (load averages 15 falling to 2.5),
+`llama-bench -p 512,2048 -n 0 -r 4` (llama.cpp master of 2026-11-21) and `parity_bench` of the
+previous build (`a3284a2`) and this one, alternated three times; best of each, tok/s pp512 /
+pp2048:
+
+| model | llama.cpp | before | after | after / llama.cpp |
+|---|---|---|---|---|
+| Llama-3.2-1B Q4_K_M | 17820 / 16475 | 16370 / 15840 | 17751 / 18039 | 1.00 / 1.09 |
+| Llama-3.2-1B Q8_0 | 18282 / 16899 | 16643 / 16028 | 18047 / 18924 | 0.99 / 1.12 |
+| Orpheus 3B Q4_K_M | 6477 / 5643 | 6034 / 5618 | 6519 / 6746 | 1.01 / 1.20 |
+| Qwen3-8B Q4_K_M | 2825 / 2321 | 2729 / 2319 | 2890 / 2643 | 1.02 / 1.14 |
+| Qwen3-8B Q8_0 | 2939 / 2554 | 2794 / 2474 | 2969 / 2845 | 1.01 / 1.11 |
+| Gemma 4 12B Q8_0 | 1800 / 1520 | 1756 / 1371 | 1857 / 1487 | 1.03 / 0.98 |
+| Gemma 4 26B-A4B Q4_0 | 4165 / 3815 | 3624 / 3740 | 3840 / 4169 | 0.92 / 1.09 |
+
+The four closest, measured again an hour later the same way (load averages 5-11; Gemma 4 12B
+also with `OXINFER_PF_MMA_ATTN=2`, half scores: 1897 / 1730):
+
+| model | llama.cpp | before | after | after / llama.cpp |
+|---|---|---|---|---|
+| Llama-3.2-1B Q4_K_M | 17827 / 16525 | 16398 / 15912 | 17832 / 18794 | 1.00 / 1.14 |
+| Llama-3.2-1B Q8_0 | 18296 / 17002 | 16667 / 16041 | 18100 / 19094 | 0.99 / 1.12 |
+| Gemma 4 12B Q8_0 | 1795 / 1585 | 1764 / 1709 | 1870 / 1856 | 1.04 / 1.17 |
+| Gemma 4 26B-A4B Q4_0 | 4158 / 3718 | 3619 / 3690 | 3840 / 4067 | 0.92 / 1.09 |
+
+So Gemma 4 12B's 0.98 at 2048 tokens above was the GPU's load (its own previous build moved
+from 1371 to 1709 between the runs), and f32 scores cost it nothing measurable.
+
+Correctness (`pf_check`, `draft=none lookup=0 mtp=0`, raw text through the engine, so no system
+prompt):
+- Against the previous build, the greedy tokens (64, or until the model stops) of a
+  chat-formatted request to copy 5000 characters (the model's own template, 1100-1300 tokens):
+  identical on all seven models, and on the CPU's 24 too; of the corpus cut to 512 / 1500 / 4000
+  tokens (4000: a second chunk, through `pf_kv_half`): identical on the Llama, Orpheus and Qwen
+  models.
+- KL of the last position over the whole vocabulary, against the previous build / the CPU
+  (`device=cpu`, its default `fast` GEMMs) against the previous build / the CPU against this one,
+  chat prompt: Llama 1B Q4_K_M 2.1e-5 / 1.24e-2 / 1.19e-2, Q8_0 7.2e-5 / 4.4e-3 / 4.1e-3, Orpheus
+  6.1e-7 / 9.0e-4 / 9.0e-4, Qwen3-8B Q4_K_M 1.2e-8 / 1.7e-5 / 1.7e-5, Q8_0 2.3e-7 / 5.4e-4 /
+  5.5e-4, Gemma 4 12B 5.5e-6 / 1.3e-3 / 1.4e-3, 26B-A4B 4.3e-4 / 1.8e-3 / 3.0e-3 (its expert
+  routing has near ties, see [Gemma 4 26B-A4B](gemma-4-26b.md)); the corpus at 2000 tokens:
+  Llama 1B 1.6e-6, Qwen3-8B 1.6e-6 against the previous build.
+- On raw corpus text Gemma's continuations are near-uniform and the greedy tokens part at near
+  ties within a few steps, between the previous build and the CPU as much as with this one.
+
 Speculative decoding with a DSpark draft llama.cpp master loads (Anbeeld's Qwen3-14B-DSpark
 Q8_0 beside Qwen3-14B Q8_0; `--spec-type draft-dspark --spec-draft-n-max 7`, all layers on the
 GPU; oxinfer `--draft` with its default policy and fast verification; 200 tokens, greedy, one
@@ -401,27 +511,26 @@ GPU, so prefill with a default draft is within 0-25% of `--no-draft` (per-model 
 
 Where oxinfer is still behind:
 
-- **Metal prefill** (0.92 / 0.96x on Llama 1B Q4_K_M at 512 / 2048 tokens, 0.98x on Qwen3-8B at
-  512 and 1.14x at 2048 in the fourth round's quiet run; 0.8-0.95x on Orpheus and Gemma 4 12B in
-  the earlier ones): not the GEMMs, which sum 5% under llama.cpp's on the same shapes (see the
-  fourth round's per-op table), but what surrounds them: llama.cpp's dispatches overlap enough
-  that its pass runs 10% under the sum of its ops, while oxinfer's runs at its sum (each of its
-  ~190 barriers per Llama 1B pass costs ~12 µs); the norms and the half conversion for the GEMMs
-  (2.1 ms of a 30 ms Llama pass, llama.cpp's norms 0.4 with f32 GEMM inputs); attention with
-  128-wide heads (1.5x llama.cpp's at 512 tokens; the f32 and half SIMD-group kernels run alike,
-  so the next step is the matrix units); and 1-2 ms of host time per prompt. In the kernels alone
-  (`mma_gemm_bench`, 512 tokens) the dense GEMMs reach 40-50 TFLOP/s on Q8_0 / Q4_0 / Q4_K / Q5_K
-  / Q6_K and wide outputs, less on 2048-wide outputs (35-40) and the 512-wide key / value
-  projections; with this tiling the matrix units reach ~51-56 TFLOP/s with the weights'
-  dequantization taken out. Half-precision K-quant dequantization, 128x128 tiles, 8 SIMD-groups,
-  32-wide K steps, a token-major grid, software pipelining of the next block's loads,
-  double-buffered weight tiles, split K, fusing the half conversion into the norms or GLUs and
+- **Metal prefill** (after [round 5](#metal-prefill-round-5-november-2026): 0.99-1.04x
+  llama.cpp at 512 tokens and 1.09-1.20x at 2048 on Llama 1B, Orpheus, Qwen3-8B and Gemma 4 12B;
+  Llama 1B Q8_0 at 512 tokens 0.99): the GEMMs are level with or faster than llama.cpp's on the same
+  shapes in isolation (Q8_0 / Q4_0 included), attention runs on the matrix units at 25-35
+  TFLOP/s, and the norms and GLUs write the GEMMs' half inputs. What is left is the pass's
+  structure: barriers cost ~2.5 ms of a 29 ms Llama 1B pass, mostly where a GEMM's last wave
+  drains before the next dependent op. In the kernels alone (`mma_gemm_bench`, 512 tokens) the
+  dense GEMMs reach 40-50 TFLOP/s on Q8_0 / Q4_0 / Q4_K / Q5_K / Q6_K and wide outputs, less on
+  2048-wide outputs (35-40) and the 512-wide key / value projections; with this tiling the matrix
+  units reach ~51-56 TFLOP/s with the weights' dequantization taken out. Half-precision K-quant
+  dequantization, 128x128 tiles, 8 SIMD-groups, 32-wide K steps, a token-major grid or a swizzled
+  one, software pipelining of the next block's loads, double-buffered weight tiles, split K and
   running the query / key / value GEMMs concurrently were measured slower or no better.
-- **Gemma 4 26B-A4B prefill** (~0.85x at 512 tokens, level at 2048): the routed experts' grouped
-  GEMMs are ~45% of the pass at ~17 TFLOP/s (about 32 rows per expert at 512 tokens); covering
-  each expert with fewer, fuller tiles (64- and 128-row) was slower than the 128 / 32 / 16-row
-  tiling. The dense parts have narrow outputs (2816). Routing now stays on the GPU (no host
-  round trip per MoE layer); fusing gate and up is moot for this checkpoint (one fused tensor).
+- **Gemma 4 26B-A4B prefill** (0.92x at 512 tokens, 1.09x at 2048 after round 5): the routed
+  experts' grouped GEMMs are ~half of the pass at ~20 TFLOP/s (about 32 rows per expert at 512
+  tokens), as long as llama.cpp's `MUL_MAT_ID` plus its routing; the gap is the MoE layer's
+  chain of dependent steps (routing, gather and conversion, gate / up, activation, down,
+  combine, each behind a barrier). Covering each expert with fewer, fuller tiles (64- and
+  128-row) was slower than the 128 / 32 / 16-row tiling. Routing stays on the GPU (no host round
+  trip per MoE layer); fusing gate and up is moot for this checkpoint (one fused tensor).
 - **CPU prefill against llama.cpp on 12-16 threads**: level or ahead on the models measured in
   [CPU round 3](#cpu-round-3-november-2026) (the 26B-A4B's routed experts now take the int8
   GEMM too, and Qwen / Llama prompts no longer attend with a per-head loop), on a machine too

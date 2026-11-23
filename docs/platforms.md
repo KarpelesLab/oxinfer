@@ -95,9 +95,14 @@ graph (Llama 3, Qwen3, Qwen3.5 / 3.6 / 3.8 dense and MoE, Gemma 3 / 4 incl. 26B-
 Qwen3.8-Flash-Next): the graph without its LM head compiled as a prefill plan
 (`MetalBackend::build_plan_pf`, chunks of up to 2048 tokens), the activations on the device for
 the whole chunk, the matmuls as matrix-unit GEMMs, the routed experts as grouped GEMMs, and plain
-causal or sliding-window attention as flash attention on 8x8 SIMD-group matrices
-(`metal_pfflash.metal`: S = Q K^T and O += P V with an online softmax per row, 32 queries per
-threadgroup sharing the key reads; heads of 256 and 512 split their dimensions over SIMD-groups).
+causal or sliding-window attention as flash attention on the matrix units (`metal_pfmma.metal`,
+as llama.cpp's `kernel_flash_attn_ext_tensor`: S = Q K^T and O += P V with `matmul2d`, an online
+softmax in threadgroup memory, over half copies of the cache rows that the RoPE kernel writes for
+the chunk and `pf_kv_half` converts for up to 6144 earlier positions; Gemma's unscaled scores in
+f32, see [Metal prefill round 5](performance.md#metal-prefill-round-5-november-2026)), or else on
+8x8 SIMD-group matrices (`metal_pfflash.metal`: 32 queries per threadgroup sharing the key reads;
+heads of 256 and 512 split their dimensions over SIMD-groups; `OXINFER_PF_MMA_ATTN=0`). RMSNorms,
+Gemma's add-norms and the SwiGLU / GeGLU before a GEMM write its half input rows themselves.
 Token tiles are 128 rows, 64 for narrow outputs (fewer than 160 threadgroups of 128 rows: e.g.
 Llama-3.2-1B's 2048-wide projections at 512 tokens), 32 below that, and a last partial tile of
 up to 64 rows runs as 32-row tiles rather than one padded tile (513 tokens: 544 rows instead of
