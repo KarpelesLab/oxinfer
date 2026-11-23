@@ -711,9 +711,12 @@ inline void mvk_finish(thread float (&a)[T][NR], thread float (&b)[T][NR], bool 
         mvk_out(y + (ulong)t * q.sy, r0 + r, p.mode, va, vb, gate + (ulong)t * q.sgate);
     }
 }
-// nt <= T tokens: per chunk, the NR rows' quants are decoded once (`wdec`; with a pair, then the
-// second matrix's), and each token's x chunk is loaded and dotted with every row (`wdot`, the
-// single-token kernel's arithmetic): the weights are read once for all the tokens.
+// nt <= T tokens: per chunk, the NR rows' quants are decoded once (`wdec`; with a pair, the
+// second matrix's too), then each token's x chunk is loaded once and dotted with every row
+// (`wdot`, the single-token kernel's arithmetic): the weights are read once for all the tokens.
+// (Decoding a pair's second matrix into the first's registers after the first's tokens, x loaded
+// again, measured 1.5x slower in passes, for the other modes too: Inkling-2-Mini Q8_0 4-token
+// pass, its 2304 x 3072 matvecs 26.4 -> 41.9 us a stage.)
 template <typename F, typename X, uint CH, int NR, int KS, int T, int H>
 inline void mvk_part(F f, F f2, device const float* x, device float* y, device const float* gate, uint nt, constant MVK& q, uint tg,
                      uint sg, uint lane, threadgroup float* red) {
@@ -728,20 +731,24 @@ inline void mvk_part(F f, F f2, device const float* x, device float* y, device c
     for (uint c = sg * 32 + lane; c < nch; c += KS * 32) {
         typename WDec<F, H>::T w[NR];
         for (int r = 0; r < NR; r++) wdec(f, rows[r], c, w[r]);
-        for (int t = 0; t < T; t++) {
-            if (uint(t) >= nt) break;
-            X xr;
-            xload(x + (ulong)t * q.sx, c, xr);
-            for (int r = 0; r < NR; r++) a[t][r] += wdot(f, w[r], c, xr);
-        }
         if (pair) {
-            // The second matrix in the same registers (each token's x chunk loaded again).
-            for (int r = 0; r < NR; r++) wdec(f2, rows[r], c, w[r]);
+            typename WDec<F, H>::T w2[NR];
+            for (int r = 0; r < NR; r++) wdec(f2, rows[r], c, w2[r]);
             for (int t = 0; t < T; t++) {
                 if (uint(t) >= nt) break;
                 X xr;
                 xload(x + (ulong)t * q.sx, c, xr);
-                for (int r = 0; r < NR; r++) b[t][r] += wdot(f2, w[r], c, xr);
+                for (int r = 0; r < NR; r++) {
+                    a[t][r] += wdot(f, w[r], c, xr);
+                    b[t][r] += wdot(f2, w2[r], c, xr);
+                }
+            }
+        } else {
+            for (int t = 0; t < T; t++) {
+                if (uint(t) >= nt) break;
+                X xr;
+                xload(x + (ulong)t * q.sx, c, xr);
+                for (int r = 0; r < NR; r++) a[t][r] += wdot(f, w[r], c, xr);
             }
         }
     }
