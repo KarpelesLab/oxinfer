@@ -94,8 +94,9 @@ The releases' tensor names (`model.llm.*`, `model.visual.*`), which is also what
 (`[384, 4608, 2304]`), in one of three forms:
 
 - **MXFP8** (all 48 layers of the `-MXFP8` release, layers 40-47 of the other): E4M3 bytes with
-  an E8M0 exponent byte per 32 values along a row (`*_scale`). Read in place; the exponents are
-  expanded to float32 at load, 73 GB of memory for the whole model.
+  an E8M0 exponent byte per 32 values along a row (`*_scale`). Read in place, exponents
+  included: the CPU and Metal kernels decode `2^(e - 127)` from the bytes (18 GB for the whole
+  model). Under CUDA they are expanded to float32 at load (73 GB), which its kernels read.
 - **NVFP4** (layers 0-39 of `Inkling-2-Small`): two E2M1 codes per byte (low nibble first), an
   E4M3 scale per 16 values, and per expert `amax / outer_scale_denominator` (the denominator is
   2688 = 6 x 448). They are repacked at load into ggml's NVFP4 blocks, which takes the experts'

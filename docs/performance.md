@@ -537,9 +537,11 @@ Where oxinfer is still behind:
   loaded for clean ratios; llama.cpp's 16-thread runs collapsed under the load while
   oxinfer's work-claiming pool held up. Per-core throughput is not ahead: both engines' int8
   kernels issue at the SDOT rate (~340 GOP/s on one core).
-- **CPU decode of small Q8_0 models** (Llama 3.2 1B Q8_0: 160-175 tok/s against llama.cpp's
-  186-192 at 8 threads): the one-row Q8_0 kernel reads 67 GB/s on one core where plain streaming
-  does 91 and llama.cpp's repacked `Q8_0_4x8` kernel ~80; see round 3 for what was tried.
+- **CPU decode of small Q8_0 models** (Llama 3.2 1B Q8_0: 159-170 tok/s against llama.cpp's
+  168-183 at 12 threads, ~7% behind from 12%): the kernels match a replay of the step's matmuls
+  alone; what is left is the serial work between parallel regions and a memory system that
+  streams slower in place than in back-to-back replays. See
+  [CPU decode round 4](#cpu-decode-round-4-november-2026) and round 3 for what was tried.
   Qwen3-8B (Q8_0, Q4_K_M), Gemma 4 12B, 26B-A4B, Orpheus and Llama 1B Q4_K_M decode level with
   or ahead of llama.cpp's best thread count.
 
@@ -740,8 +742,9 @@ language models' prompts) except the attention, which applies in every mode:
   Inkling-2 MXFP8 experts, `fp8_matrix` checkpoints) borrow the exponent bytes from the mapped
   file and decode `2^(e - 127)` from the bits as they dequantize, instead of an f32 copy made at
   load: a quarter of the memory (Inkling-2-Small-MXFP8: ~18 GB of mapped bytes instead of ~73 GB
-  of f32 copies). Bit-identical to the expansion (`ggml::e8m0_tests`). With a GPU backend active
-  the expansion stays, because the Metal and CUDA MXFP8 kernels read f32 scales.
+  of f32 copies). Bit-identical to the expansion (`ggml::e8m0_tests`). The Metal expert kernels
+  now read the bytes too ([CPU decode round 4](#cpu-decode-round-4-november-2026)); under CUDA
+  and Vulkan the expansion stays, because their MXFP8 kernels read f32 scales.
 
 Correctness: Qwen3-8B Q8_0, last-token KL after a 2.8k-token raw prompt: `exact` before / after
 9.1e-8 (the attention's summation order), `fast` before / after 8.8e-4 (fast against exact:
@@ -793,6 +796,102 @@ The int8 prefill kernel already issues at the SDOT rate (~340 GOP/s on one core)
 (i8mm) issues at half that rate for twice the multiply-adds, so llama.cpp's SMMLA kernels are no
 faster per core. SME's int8 outer products (SMOPA) would be ~2x the SME f32 rate, but applying a
 per-block scale needs the int32 tiles read out every 32 values, which costs more than it gains.
+
+#### CPU decode round 4 (November 2026)
+
+The last CPU decode gap, Llama 3.2 1B Q8_0, profiled per parallel region (a timestamped trace of
+every `pool::run` and of marks between them, one token at 18 threads, medians over 60 tokens; not
+kept in the tree). Of ~6.4 ms a token, 5.8 ms were in parallel regions: per layer gate + up 154
+us, down 78, query / key / value 31, output 21, attention 15-24; the LM head 1.19 ms. The rest
+was serial work on the calling thread between regions, ~450 us a token:
+
+- 77 us between tokens, almost all of it `sampler::argmax`, a compare and branch per logit over
+  the 128k vocabulary, and 14 us zero-filling the logits on one thread;
+- 3-7 us before each matmul: the residual add and RMSNorm (its sum of squares is one serial
+  chain, kept for the bits), and the activations' quantization, whose exact block sums
+  (`fsums` / `hsums`, for the formats with mins) were three scalar left-to-right sums per block
+  (4.7 us for the 8192-wide down projection's input);
+- 3.4 us of query / key preparation before the attention, whose shared-row kernel ran three
+  parallel regions for a few hundred keys.
+
+Kept (all bit-identical; greedy outputs of Llama 3.2 1B Q8_0 and Q4_K_M, Qwen3-8B Q8_0 and
+Gemma 4 12B Q8_0 unchanged against the previous build):
+
+- **Few-token attention per head up to 1024 keys** (`model::SHARED_MIN_KEYS`): one region of one
+  task per query head instead of `attn::attend_shared`'s three (1.4-1.8x faster at 64-1024
+  keys: 64 keys 6 against 11 us, 512 keys 22 against 30, the shared kernel ahead from about
+  4096 keys); in decode 15 us against 24 a call.
+- **Activation sums on NEON**: four blocks a vector, one per lane, each still a left-to-right sum
+  from -0.0 (`quant::act_sum_tests`).
+- **NEON argmax** (`sampler::argmax_matches_scalar`: first index on ties, NaNs never chosen) and
+  the logits zeroed across the pool (`kernels::zeros_from`): 77 us between tokens down to 34.
+
+Measured and dropped, with the same trace or interleaved runs:
+
+- software prefetch in the Q8_0 kernel (0.5-16 KB ahead, L1 / L2 / streaming hints): within the
+  noise; a leaner Q8_0 loop (multi-register loads, scales gathered by lane: ~25% fewer
+  instructions, same bits): no faster at 12-18 threads; a timing probe of llama.cpp's 4-row
+  interleaved layout: 21% faster on one core (55 against 67 us for 2048 x 2048), level at 18
+  threads, as round 3 found;
+- decreasing ("guided") block sizes toward the end of each region: 3.5-4% slower a token (tokens
+  alternating between the two schedules in one process, so drift cancels: 1% between two
+  identical schedules); 1, 2, 4 or 16 blocks per thread instead of 8: within 1%, 16 3% slower;
+- idle workers prefetching the first 256 KB-4 MB of the matmul that followed last time while the
+  calling thread runs the serial work in between: 2-3% slower;
+- longer spinning before a worker yields (65536 or 10^6 spins instead of 4096, ~32 us): 15-70%
+  slower on the shared machine (the spinning threads take the cores the calling thread needs);
+- quantizing a one-token matmul's activations in the region's first tasks (the matmul tasks
+  waiting on them) instead of on the calling thread: within the noise.
+
+The kernels are not the limit: a replay of one decode step's matmuls alone (a `matvec_bench`
+variant, not kept: same shapes, same order, 18 threads) takes 4.7-5.3 ms at its best and the same per-region medians as
+in the model (gate + up 157-163 us, down 79-83), and plain streaming of the same sizes in the
+same blocks reads 250-280 GB/s against the kernel's ~225 in place. In some windows the replay's
+best tenth of passes ran ~15% faster (gate + up 127 against 149 us) when each matmul followed
+the last within 2 us, and never when a 5-20 us pause separated them; the effect came and went
+with the other jobs on the machine and was not reproduced on demand.
+
+Decode tg128 (`parity_bench`, best of each run's 3; interleaved rounds of llama.cpp, the
+previous build `a3284a2` and this one; llama.cpp's mean ± deviation of 3 at its best thread
+count; load averages in brackets), tok/s:
+
+| model | llama.cpp | before | after (18 threads) | after, 12 threads |
+|---|---|---|---|---|
+| Llama 3.2 1B Q8_0, 5 rounds [4-14] | 168-183 (12 thr) | 156.0-161.5 | 158.9-170.3 | 157.0-168.4 |
+| Llama 3.2 1B Q4_K_M, 5 rounds [4-14] | 205-218 (12) | 210.2-224.5 | 223.5-231.2 | |
+| Qwen3-8B Q8_0, 3 rounds [12-18] | 29.3-33.4 (10) | 30.4-30.9 | 30.9-31.3 | |
+| Gemma 4 12B Q8_0, 3 rounds [8-19] | 18.0-18.2 (10) | 18.8-19.8 | 18.7-19.0 | |
+
+Llama 3.2 1B Q8_0 stays the one gap, now ~7% (best against best 170.3 against 183.1; it was
+12%). In one quiet window (load 2.6-9) a no-LTO build of this tree, with the read-ahead above
+switched off, ran 176-188 tok/s; llama.cpp measured 174-183 a few minutes later and the release
+build 157-165, so on this shared machine (other agents' builds and GPU jobs, which also take
+memory bandwidth) a run's speed moved by 10% between minutes, more than the changes measured.
+The other models are level or ahead, as before.
+
+**MXFP8 byte scales on Metal.** The Metal expert kernels of Inkling-2 (`src/metal_inkling.metal`,
+the decode path's `ink_x_*`; `src/metal_inkling_pf.metal`, the prefill's grouped matrix-unit
+GEMMs `mmag_*`) have a byte-scale MXFP8 format, `mxf8b`, beside the f32-scale `mxf8`: its loader
+decodes `2^(e - 127)` from the E8M0 bits as the CPU does (0: 2^-127, 255: NaN) and multiplies as
+the f32 one does, so both give the same floats. With Metal active MXFP8 matrices now keep their
+exponent bytes mapped from the file (`ggml::e8m0_in_place`); CUDA and Vulkan keep the f32
+expansion, as does `OXINFER_MXFP8_SCALES=f32` (comparisons). The Metal backend's other paths
+take no MXFP8 matrix with runs of 32 (the dense FP8 kernels want 128 x 128 blocks), so those fall
+back to the CPU as before. `metal::inkling::mxf8_tests` runs the decode kernel (`_gsum`, 5
+tokens) and the prefill GEMMs (150 and 37 rows of two experts: every tile size) both ways on
+random E4M3 values and exponents (zero included) and finds the outputs bit-identical.
+
+On `thinkingmachines/Inkling-2-Mini`, whose layers 20-23 have MXFP8 experts (4.1 GB of E4M3
+values, 127 MB of exponent bytes, 510 MB as f32), on Metal (CLI, 672-token prompt, 128 tokens):
+
+| scales, 3 interleaved rounds [5-7] | prefill tok/s | decode tok/s | peak footprint | max RSS |
+|---|---|---|---|---|
+| E8M0 bytes, mapped (now) | 1430-1436 | 63.0-64.3 | 21.32 GB | 32.68 GB |
+| f32 expansion (`OXINFER_MXFP8_SCALES=f32`, before) | 1418-1427 | 63.6-64.2 | 21.70 GB | 33.18 GB |
+
+The same speed, 375 MB less memory of the process's own (the f32 copies), and the same greedy
+output in all six runs. On Inkling-2-Small-MXFP8 (48 MXFP8 layers) the same change keeps ~18 GB
+of exponent bytes mapped instead of ~73 GB of f32 copies, with Metal active as on the CPU.
 
 #### x86-64 CPU prefill (November 2026)
 
