@@ -3785,7 +3785,7 @@ where
         let mut on = |t: u32| -> crate::generate::Chain {
             use crate::generate::Chain;
             let now = crate::clock::Instant::now();
-            let dt = (now - last).as_secs_f64();
+            let dt = now.duration_since(last).as_secs_f64();
             last = now;
             adapt.record_plain(dt);
             out.push(t);
