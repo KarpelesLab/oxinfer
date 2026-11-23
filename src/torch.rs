@@ -409,7 +409,7 @@ fn read_impl(bytes: &[u8], permuted: bool) -> Result<Vec<(String, TorchTensor)>>
                         ok
                     })
                 };
-                if !row_major && !(permuted && dense()) {
+                if !(row_major || (permuted && dense())) {
                     bail!("tensor {name} is not contiguous (stride {stride:?} for shape {shape:?})");
                 }
                 let (start, len) = *entries

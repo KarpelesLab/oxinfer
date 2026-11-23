@@ -271,7 +271,7 @@ mod decode {
                 break;
             }
         }
-        if !kept.last().is_some_and(|k| k.0 == last) {
+        if kept.last().is_none_or(|k| k.0 != last) {
             let _ = decoder.flush();
             while let Ok(f) = decoder.receive_frame() {
                 take(f, &mut kept)?;

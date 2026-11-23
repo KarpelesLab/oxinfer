@@ -97,7 +97,7 @@ struct U4([u32; 4]);
 impl MetalBackend {
     /// [`crate::gpu::Backend::dit_session`].
     pub(crate) fn dit_session_impl(&'static self) -> Option<Box<dyn Session>> {
-        self.mma()?;
+        self.mma().filter(|m| m.units)?;
         let pipe = |n: &str| self.named_pipeline(n);
         let p = Pipes {
             rms: pipe("dit_rms_mod")?,

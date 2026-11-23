@@ -285,7 +285,7 @@ pub(crate) fn shader_src(mma: bool) -> String {
         super::decode::SRC
     );
     if mma {
-        s = format!("#define GTM {}\n{s}{}", super::MMA_GTM, super::MMA_SHADER_SRC);
+        s = format!("#define GTM {}\n#define MMA_UNITS 1\n{s}{}", super::MMA_GTM, super::MMA_SHADER_SRC);
     }
     match std::env::var_os("OXINFER_INKLING_METAL").and_then(|f| std::fs::read_to_string(f).ok()) {
         Some(src) => s.push_str(&src),
@@ -1189,7 +1189,7 @@ fn library(be: &MetalBackend) -> anyhow::Result<&'static Lib> {
             .into_inner_unsafe();
         let msg_str: unsafe extern "C" fn(Id, super::Sel, *const std::ffi::c_char) -> Id = o.msg_send();
         let msg0: Msg0 = o.msg_send();
-        let mma = be.mma().is_some();
+        let mma = be.mma().is_some_and(|m| m.units);
         let src = std::ffi::CString::new(shader_src(mma)).map_err(|e| e.to_string())?;
         let t0 = std::time::Instant::now();
         let ns = unsafe { msg_str(get_class(c"NSString".as_ptr()), o.sel(c"stringWithUTF8String:"), src.as_ptr()) };

@@ -26,7 +26,9 @@
 //! operands and f32 accumulation: ~3-5x faster, at a relative error of ~3e-4 per product. So does
 //! attention with 128-wide heads (`flash_attn128_mma`, ~2x faster than `flash_attn128`), or with
 //! f32 operands under [`crate::gpu::set_exact_attention`] (`flash_attn128_mma_f32`, as accurate as
-//! `flash_attn128` and ~10% faster).
+//! `flash_attn128` and ~10% faster). GPUs without matrix units (M1-M4) get the same GEMM kernels
+//! (names, operands and rounding contract: half inputs, f32 sums) on 8x8 SIMD-group matrices, so
+//! the prefill plans and the MoE expert GEMMs run there too.
 //! Environment: `OXINFER_METAL_MMA=0` keeps the f32 kernels (bit-identical to the CPU), `=1` tries
 //! the matrix-unit kernels on any GPU; `OXINFER_METAL_MOE=0` keeps MoE experts on the CPU;
 //! `OXINFER_METAL_TRACE=1` prints the copy and GPU time of every submission;
@@ -879,14 +881,17 @@ GG(IQ2_XXS) GG(IQ2_XS) GG(IQ2_S) GG(IQ3_XXS) GG(IQ3_S) GG(IQ1_S) GG(IQ1_M) GG(MX
 /// `mmag_*` run many weight matrices in one dispatch (MoE experts): each threadgroup row looks up
 /// its tile (expert, segment start and length, offset) and the expert's weight addresses.
 const MMA_SHADER_SRC: &str = r#"
+#if MMA_UNITS
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace mpp::tensor_ops;
+#endif
 // The first four fields as in P (the MK_* macros read them), then the row count; dense
 // kernels: _p0 the output row stride (0: n_out), _p1 the first token row of the grid, _p2 nonzero
 // to add the products to the outputs.
 struct MP { uint n_out; uint n_in; uint w_off; uint s_off; uint rows; uint _p0; uint _p1; uint _p2; };
 #define MKB 64
+#if MMA_UNITS
 typedef tensor<device half, dextents<int32_t, 2>, tensor_inline> XT;
 typedef tensor<device float, dextents<int32_t, 2>, tensor_inline> YT;
 
@@ -916,6 +921,7 @@ inline void zero(thread CT& c) {
 #pragma unroll
     for (uint16_t i = 0; i < c.get_capacity(); ++i) if (c.is_valid_element(i)) c[i] = 0;
 }
+#endif
 // A 32-block of weights as half: dequantized in f32, then converted; Q8_0 and Q4_0 in half
 // arithmetic from 16-bit loads instead (the same values: q d is exact in f32 and rounded once
 // either way), which cuts the dequantization's share of the GEMMs.
@@ -939,6 +945,8 @@ inline void loadh(Q4_0W w, uint row, uint b, thread half4* out) {
         out[i + 4] = (half4(v >> uchar(4)) - 8.h) * d;
     }
 }
+#if MMA_UNITS
+#define MMA_WS threadgroup half Ws[64 * MKB];
 template <typename W, int TM>
 inline void mma_tile(W w, device const half* xh, device const float* rs, device float* y, uint n_out, uint n_in, uint rows,
                      uint o0, uint t0, uint tid, threadgroup half* Ws, uint ldy = 0, uint add = 0) {
@@ -981,6 +989,81 @@ inline void mma_bf_tile(device const bfloat* w, device const half* xh, device co
     if (ldy != 0 || add != 0) scale_store_ld(c, rs, t0, y, ldy != 0 ? ldy : n_out, o0, add != 0);
     else scale_store(c, rs, t0, Y.slice(o0, t0));
 }
+#else
+// GPUs without matrix units (M1-M4): the same kernels on 8x8 SIMD-group matrices, half operands
+// and f32 accumulators, as on the matrix units. 4 SIMD-groups (2 x 2) per threadgroup; per 64-wide
+// K step the 64 weight rows are dequantized to half in threadgroup memory and the token rows read
+// straight from device memory with transposed 8x8 loads. The outputs are scaled per token row by
+// a product with a diagonal matrix of the rows' inverse scales (powers of two: exact) and stored
+// transposed; adds load the outputs first and take them as the product's accumulator.
+#define SG_LDW 72
+#define MMA_WS threadgroup half Ws[64 * SG_LDW + 128 * 8 * 2];
+template <typename W, int TM>
+inline void sg_tile(W w, device const half* xh, device const float* rs, device float* y, uint n_out, uint n_in, uint rows,
+                    uint o0, uint t0, uint tid, threadgroup half* Ws, uint ldy, uint add) {
+    constexpr int NB = TM / 16;
+    uint sg = tid / 32;
+    uint so = (sg / 2) * 32, st = (sg % 2) * (TM / 2);
+    threadgroup float* Ds = (threadgroup float*)(Ws + 64 * SG_LDW);
+    simdgroup_float8x8 c[4 * NB];
+#pragma unroll
+    for (int i = 0; i < 4 * NB; i++) c[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.f);
+    uint row = tid / 2, blk = tid % 2;   // each thread dequantizes one 32-block of one row
+    threadgroup half4* wd = (threadgroup half4*)(Ws + row * SG_LDW + blk * 32);
+    device const half* xs = xh + (ulong)(t0 + st) * n_in;
+    for (uint k0 = 0; k0 < n_in; k0 += MKB) {
+        half4 wv[8];
+        loadh(w, o0 + row, k0 / 32 + blk, wv);
+        for (uint i = 0; i < 8; i++) wd[i] = wv[i];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+        for (uint k = 0; k < MKB; k += 8) {
+            simdgroup_half8x8 a[4], b[NB];
+#pragma unroll
+            for (int i = 0; i < 4; i++) simdgroup_load(a[i], Ws + (so + 8 * i) * SG_LDW + k, SG_LDW);
+#pragma unroll
+            for (int j = 0; j < NB; j++) simdgroup_load(b[j], xs + (ulong)(8 * j) * n_in + k0 + k, n_in, ulong2(0, 0), true);
+#pragma unroll
+            for (int i = 0; i < 4; i++)
+#pragma unroll
+                for (int j = 0; j < NB; j++) simdgroup_multiply_accumulate(c[i * NB + j], a[i], b[j], c[i * NB + j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = tid; i < TM * 8; i += 128) {
+        uint r = t0 + (i / 64) * 8 + (i % 64) / 8;
+        Ds[i] = (i % 64) / 8 == i % 8 && r < rows ? rs[r] : 0.f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint ld = ldy != 0 ? ldy : n_out;
+#pragma unroll
+    for (int j = 0; j < NB; j++) {
+        uint tt = t0 + st + 8 * j;
+        if (tt >= rows) break;   // rows are whole 8-row blocks
+        simdgroup_float8x8 d;
+        simdgroup_load(d, Ds + (st / 8 + j) * 64, 8);
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+            device float* o = y + (ulong)tt * ld + o0 + so + 8 * i;
+            if (add != 0) {
+                simdgroup_float8x8 r0;
+                simdgroup_load(r0, o, ld, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(c[i * NB + j], c[i * NB + j], d, r0);
+            } else {
+                simdgroup_multiply(c[i * NB + j], c[i * NB + j], d);
+            }
+            simdgroup_store(c[i * NB + j], o, ld, ulong2(0, 0), true);
+        }
+    }
+}
+// 128-token tiles as two of 64 (32 accumulators per SIMD-group would spill).
+template <typename W, int TM>
+inline void mma_tile(W w, device const half* xh, device const float* rs, device float* y, uint n_out, uint n_in, uint rows,
+                     uint o0, uint t0, uint tid, threadgroup half* Ws, uint ldy = 0, uint add = 0) {
+    constexpr int T = TM > 64 ? 64 : TM;
+    for (uint h = 0; h < TM / T; h++) sg_tile<W, T>(w, xh, rs, y, n_out, n_in, rows, o0, t0 + h * T, tid, Ws, ldy, add);
+}
+#endif
 // Dense: 128-token tiles, 32-token tiles (`_s`) for short inputs and 64-token ones (`_m`) for
 // narrow outputs (prefill plans). (MAKE expands to text with commas, so it is only ever used
 // directly in a body, never forwarded to another macro.)
@@ -989,11 +1072,11 @@ kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[bu
                  device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], \
                  uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
 #define MMAD(NAME, WT, MAKE) \
-MMA_SIG(NAME) { threadgroup half Ws[64 * MKB]; \
+MMA_SIG(NAME) { MMA_WS \
     WT w = MAKE; mma_tile<WT, 128>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * 128, tid, Ws, p._p0, p._p2); } \
-MMA_SIG(NAME##_s) { threadgroup half Ws[64 * MKB]; \
+MMA_SIG(NAME##_s) { MMA_WS \
     WT w = MAKE; mma_tile<WT, 32>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * 32, tid, Ws, p._p0, p._p2); } \
-MMA_SIG(NAME##_m) { threadgroup half Ws[64 * MKB]; \
+MMA_SIG(NAME##_m) { MMA_WS \
     WT w = MAKE; mma_tile<WT, 64>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * 64, tid, Ws, p._p0, p._p2); }
 // Grouped: per-expert weight addresses, and one tile per threadgroup row. Each format comes with
 // tiles of GTM rows (NAME), 128 rows (NAME_l: the bulk of an expert's rows when it has many, the
@@ -1005,7 +1088,7 @@ struct GT { uint e; uint r0; uint rows; uint t0; };
 kernel void NAME(device const EP* ep [[buffer(0)]], device const GT* tiles [[buffer(1)]], device const half* xh [[buffer(2)]], \
                  device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], \
                  uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]])
-#define MMAG_PRE threadgroup half Ws[64 * MKB]; \
+#define MMAG_PRE MMA_WS \
     GT g = tiles[tg.y]; device const void* qb = ep[g.e].q; device const void* sb = ep[g.e].s;
 #define MMAG_ARGS w, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out, p.n_out, p.n_in, g.rows, tg.x * 64, g.t0, tid, Ws
 #define MMAG(NAME, WT, MAKE) \
@@ -1020,10 +1103,11 @@ kernel void NAME(device const void* qb [[buffer(0)]], device const void* sb [[bu
                  device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], \
                  device const ushort* ob [[buffer(6)]], constant OP& op [[buffer(7)]], \
                  uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { \
-    threadgroup half Ws[64 * MKB]; \
+    MMA_WS \
     Q4A w = { MK_Q4, ob + op.o_off, op.gpr, op.gk }; \
     mma_tile<Q4A, TM>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * 64, p._p1 + tg.y * TM, tid, Ws, p._p0, p._p2); }
 MMA_Q4A(mma_q4a, 128) MMA_Q4A(mma_q4a_s, 32) MMA_Q4A(mma_q4a_m, 64)
+#if MMA_UNITS
 #define MMA_BF(NAME, TN, TM) \
 kernel void NAME(device const ushort* qb [[buffer(0)]], device const half* xh [[buffer(2)]], device float* y [[buffer(3)]], \
                  constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]]) { \
@@ -1038,6 +1122,26 @@ kernel void NAME(device const EP* ep [[buffer(0)]], device const GT* tiles [[buf
     mma_bf_tile<TM, 64>((device const bfloat*)ep[g.e].q, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out, \
                         p.n_out, p.n_in, g.rows, tg.x * 64, g.t0); }
 MMAG_BF(mmag_bf, GTM) MMAG_BF(mmag_bf_l, 128) MMAG_BF(mmag_bf_s, 16)
+#else
+// bf16 weights through threadgroup memory as the quantized formats (converted to half), 64
+// outputs at a time.
+#define MMA_BF(NAME, TN, TM) \
+kernel void NAME(device const ushort* qb [[buffer(0)]], device const half* xh [[buffer(2)]], device float* y [[buffer(3)]], \
+                 constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], uint2 tg [[threadgroup_position_in_grid]], \
+                 uint tid [[thread_index_in_threadgroup]]) { \
+    MMA_WS BfW w = { qb + p.w_off, p.n_in }; \
+    for (uint h = 0; h < TN / 64; h++) \
+        mma_tile<BfW, TM>(w, xh, rs, y, p.n_out, p.n_in, p.rows, tg.x * TN + h * 64, p._p1 + tg.y * TM, tid, Ws, p._p0, p._p2); }
+MMA_BF(mma_bf64, 64, 128) MMA_BF(mma_bf128, 128, 128) MMA_BF(mma_bf64_s, 64, 32) MMA_BF(mma_bf128_s, 128, 32)
+MMA_BF(mma_bf64_m, 64, 64) MMA_BF(mma_bf128_m, 128, 64)
+#define MMAG_BF(NAME, TM) \
+kernel void NAME(device const EP* ep [[buffer(0)]], device const GT* tiles [[buffer(1)]], device const half* xh [[buffer(2)]], \
+                 device float* y [[buffer(3)]], constant MP& p [[buffer(4)]], device const float* rs [[buffer(5)]], \
+                 uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) { \
+    MMA_WS GT g = tiles[tg.y]; BfW w = { (device const ushort*)ep[g.e].q, p.n_in }; \
+    mma_tile<BfW, TM>(w, xh + (ulong)g.r0 * p.n_in, rs + g.r0, y + (ulong)g.r0 * p.n_out, p.n_out, p.n_in, g.rows, tg.x * 64, g.t0, tid, Ws); }
+MMAG_BF(mmag_bf, GTM) MMAG_BF(mmag_bf_l, 128) MMAG_BF(mmag_bf_s, 16)
+#endif
 #define GGM(T) MMAD(mma_##T, T##W, MK_GG(T##W)) MMAG(mmag_##T, T##W, MK_GG(T##W))
 GGM(F16) GGM(Q4_1) GGM(Q5_0) GGM(Q5_1)
 GGM(Q4_0) GGM(IQ4_NL) GGM(Q8_0) GGM(Q4_K) GGM(Q5_K) GGM(Q6_K) GGM(Q3_K) GGM(Q2_K) GGM(IQ4_XS)
@@ -1111,6 +1215,7 @@ kernel void silu_half(device const float* gu [[buffer(0)]], device half* ah [[bu
 // back as T in P for O += P V; O stays in a cooperative tensor, rescaled per query row as the max
 // moves. T = half is the fast kernel; T = float runs at f32 precision (P then reuses S: each thread
 // overwrites only the scores it has read).
+#if MMA_UNITS
 struct FAM { uint tq; uint tk; uint d; float scale; };
 template <typename T>
 inline void flash_attn128_body(device const T* q, device const T* k, device const T* v, device float* o, constant FAM& p,
@@ -1191,6 +1296,7 @@ kernel void flash_attn128_mma_f32(device const float* q [[buffer(0)]], device co
     threadgroup float L[64];
     flash_attn128_body<float>(q, k, v, o, p, S, S, A, L, tg, tid);
 }
+#endif
 // out[t] = sum over the token's k slots of weight * o[row].
 struct CB { uint n; uint k; uint ldo; uint _p; };
 kernel void moe_combine(device const float* o [[buffer(0)]], device const float2* slots [[buffer(1)]], device float* out [[buffer(2)]],
@@ -1512,8 +1618,11 @@ enum Tile {
     Grouped,
 }
 
-/// Matrix-unit pipelines (GPU cores with neural accelerators: M5, A19).
+/// Matrix-unit pipelines (GPU cores with neural accelerators: M5, A19), or the same kernels on
+/// SIMD-group matrices (`units` false: earlier GPUs, which then have no `flash128*`).
 struct Mma {
+    /// Whether these are the matrix-unit (Metal 4 `matmul2d`) kernels.
+    units: bool,
     x_half: Id,
     silu_half: Id,
     combine: Id,
@@ -1538,6 +1647,13 @@ struct Mma {
     /// (as accurate as `flash_attn128`, ~15% faster).
     flash128: Id,
     flash128_f32: Id,
+}
+
+impl Mma {
+    /// The fused 128-wide attention kernels (matrix units only).
+    fn flash128(&self) -> Option<(Id, Id)> {
+        self.units.then_some((self.flash128, self.flash128_f32))
+    }
 }
 
 #[repr(C)]
@@ -1926,28 +2042,44 @@ impl MetalBackend {
             Ok(lib)
         };
         let t_compile = Instant::now();
-        let (lib, has_mma, mma_error) = match want_mma {
+        // Without matrix units the same GEMMs (half operands, f32 accumulation) on SIMD-group
+        // matrices; OXINFER_METAL_MMA=0 keeps neither.
+        let extra = || {
+            // Kernel experiments (`mma_gemm_bench`): more source for the library.
+            std::env::var("OXINFER_MMA_EXTRA")
+                .ok()
+                .and_then(|f| std::fs::read_to_string(f).ok())
+                .unwrap_or_default()
+        };
+        let sg_src = || format!("#define GTM {MMA_GTM}\n#define MMA_UNITS 0\n{base_src}{MMA_SHADER_SRC}{}", extra());
+        let sg_lib = |e: Option<String>| -> Result<(Id, bool, bool, Option<String>)> {
+            match compile(&sg_src(), false) {
+                Ok(l) => Ok((l, true, false, e)),
+                Err(e2) => {
+                    eprintln!("[metal: SIMD-group half GEMMs unavailable: {e2}]");
+                    Ok((compile(&base_src, false)?, false, false, Some(e.unwrap_or_else(|| e2.to_string()))))
+                }
+            }
+        };
+        let (lib, has_mma, units, mma_error) = match want_mma {
             true => match compile(
                 &format!(
-                    "#define GTM {MMA_GTM}\n{base_src}{MMA_SHADER_SRC}{}{}",
+                    "#define GTM {MMA_GTM}\n#define MMA_UNITS 1\n{base_src}{MMA_SHADER_SRC}{}{}",
                     decode::PFM_SRC,
-                    // Kernel experiments (`mma_gemm_bench`): more source for the library.
-                    std::env::var("OXINFER_MMA_EXTRA")
-                        .ok()
-                        .and_then(|f| std::fs::read_to_string(f).ok())
-                        .unwrap_or_default()
+                    extra()
                 ),
                 true,
             ) {
-                Ok(l) => (l, true, None),
+                Ok(l) => (l, true, true, None),
                 Err(e) => {
                     if apple10 || mma_env.is_some() || std::env::var_os("OXINFER_DEBUG").is_some() {
                         eprintln!("[metal: matrix-unit kernels unavailable: {e}]");
                     }
-                    (compile(&base_src, false)?, false, Some(e.to_string()))
+                    sg_lib(Some(e.to_string()))?
                 }
             },
-            false => (compile(&base_src, false)?, false, None),
+            false if mma_env.as_deref() == Some("0") => (compile(&base_src, false)?, false, false, None),
+            false => sg_lib(None)?,
         };
         let pipeline = |name: &CStr| -> Result<Id> {
             let ns_name = unsafe { msg_str(nsstring_cls, o.sel(c"stringWithUTF8String:"), name.as_ptr()) };
@@ -1985,10 +2117,15 @@ impl MetalBackend {
                     .map(|&k| Ok((k, pipeline(&CString::new(format!("{prefix}_{}", k.name()))?)?)))
                     .collect::<Result<Vec<_>>>()
             };
+            let (flash128, flash128_f32) = match units {
+                true => (pipeline(c"flash_attn128_mma")?, pipeline(c"flash_attn128_mma_f32")?),
+                false => (flash128, flash128),
+            };
             Some(Mma {
+                units,
                 x_half: pipeline(c"x_half")?,
-                flash128: pipeline(c"flash_attn128_mma")?,
-                flash128_f32: pipeline(c"flash_attn128_mma_f32")?,
+                flash128,
+                flash128_f32,
                 silu_half: pipeline(c"silu_half")?,
                 combine: pipeline(c"moe_combine")?,
                 bf: [pipeline(c"mma_bf64")?, pipeline(c"mma_bf128")?],
@@ -2084,7 +2221,7 @@ impl MetalBackend {
         })();
         if std::env::var_os("OXINFER_METAL_TRACE").is_some() {
             eprintln!(
-                "[metal: library and pipelines ready in {:.0} ms (matrix units: {has_mma})]",
+                "[metal: library and pipelines ready in {:.0} ms (matrix units: {units}, half GEMMs: {has_mma})]",
                 t_compile.elapsed().as_secs_f64() * 1e3
             );
         }
@@ -2441,7 +2578,9 @@ impl MetalBackend {
         half: bool,
         out: &mut [f32],
     ) -> bool {
-        let Some(mma) = self.mma() else { return false };
+        let Some((f_half, f_f32)) = self.mma().and_then(|m| m.flash128()) else {
+            return false;
+        };
         let d = heads * 128;
         let (tqp, tkp) = (tq.next_multiple_of(64), tk.next_multiple_of(64));
         let w = if half { 2 } else { 4 };
@@ -2481,7 +2620,7 @@ impl MetalBackend {
             d: d as u32,
             scale: 1.0 / (128f32).sqrt(),
         };
-        let pipe = if half { mma.flash128 } else { mma.flash128_f32 };
+        let pipe = if half { f_half } else { f_f32 };
         let mut out = out;
         self.submit(
             t0,
@@ -2651,8 +2790,11 @@ impl MetalBackend {
     /// `Backend::matmul` on the matrix units; None when some job has no such kernel.
     fn matmul_mma(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [Job]) -> Option<bool> {
         // Rows padded to whole token tiles (zero rows; partial tiles take a slower path).
+        // Without matrix units 64-row tiles (see `sg_tile`).
         let (tile, tm) = if t <= MMA_SMALL {
             (Tile::Small, MMA_TM_S)
+        } else if self.mma.as_ref().is_some_and(|m| !m.units) {
+            (Tile::Mid, MMA_TM_S * 2)
         } else {
             (Tile::Dense, MMA_TM)
         };
@@ -3193,7 +3335,7 @@ impl Backend for MetalBackend {
         if q.len() < tq * d || k.len() < tk * d || v.len() < tk * d || out.len() < tq * d || tq == 0 || tk == 0 {
             return false;
         }
-        if dh == 128 && !causal && self.mma().is_some() {
+        if dh == 128 && !causal && self.mma().is_some_and(|m| m.units) {
             return self.flash_attention_mma(q, k, v, tq, tk, heads, !crate::gpu::exact_attention(), out);
         }
         if (dh == 64 || dh == 128) && !causal {

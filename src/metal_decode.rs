@@ -2330,7 +2330,7 @@ impl MetalBackend {
         let mut kvh: Vec<Option<(usize, usize, usize)>> = vec![None; g.kv.len()];
         let mut kvh_window: Vec<usize> = vec![0; g.kv.len()];
         let mut kvh_slot: Vec<usize> = vec![0; g.kv.len()];
-        if pf && pf_flash() && pf_mma_attn() {
+        if pf && pf_flash() && pf_mma_attn() && self.mma().is_some_and(|m| m.units) {
             // (first writer, writers, last reader, ok) per cache, and the widest window (0: none).
             let mut life: Vec<(usize, usize, usize, bool)> = vec![(usize::MAX, 0, 0, true); g.kv.len()];
             let mut full = vec![false; g.kv.len()];
@@ -5434,10 +5434,11 @@ impl MetalPlan<'_> {
                 add,
             } => {
                 // Few 128-row tiles (narrow outputs): 64-row ones, or 32-row ones if those are
-                // still few, keep more of the GPU busy.
+                // still few, keep more of the GPU busy. Without matrix units always 64-row ones
+                // (the SIMD-group kernels run 128-row tiles as two of 64, ~10% slower).
                 let few = |tm: usize| (n_out / pipes[0].1) * t.next_multiple_of(tm) / tm < PF_SMALL_TILES;
                 let (tile, tm) = match tile {
-                    0 if !few(tm) => (0, tm),
+                    0 if !few(tm) && m.units => (0, tm),
                     0 if !few(PF_TM_M) => (2, PF_TM_M),
                     _ => (1, super::MMA_TM_S),
                 };
