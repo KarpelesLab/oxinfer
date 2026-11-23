@@ -1399,7 +1399,11 @@ impl Inner {
                 .iter()
                 .all(|&a| sys::resident_bytes(a, page, page) == Some(page as u64))
         };
-        if demand && chunks.iter().all(cached) {
+        // On demand (a decode step's experts, ~20 chunks), one page of each chunk: a `mincore`
+        // costs ~1 us however small, and three a chunk were 2.2 ms of a 64 ms V4.1 step. A chunk
+        // the OS emptied since is still found; one it thinned out faults its missing pages in.
+        let probe = |c: &Span| sys::resident_bytes(c.addr + ((c.len / 2) & !(page - 1)), page, page) == Some(page as u64);
+        if demand && chunks.iter().all(probe) {
             let n: u64 = chunks.iter().map(|c| c.len as u64).sum();
             self.c.bytes_cached.fetch_add(n, Relaxed);
             return 0;
