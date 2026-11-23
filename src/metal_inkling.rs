@@ -24,7 +24,7 @@
 //! rings have the host's layout.
 
 use super::decode::{
-    FastEnc, Fns, MvFmt, MvMode, MvParams, MvWeight, begin_enc, encode_mv, end_commit, end_timed, mvk_rows, run_concurrent, wait_timed,
+    FastEnc, Fns, MvFmt, MvMode, MvParams, MvWeight, MvkPipe, begin_enc, encode_mv, end_commit, end_timed, run_concurrent, wait_timed,
 };
 use super::{GGUF_GPU_TYPES, Id, IntoInnerUnsafe, MetalBackend, MetalWeight, MsgNewBufLen, MsgVoid};
 use crate::generate::Chain;
@@ -317,7 +317,7 @@ fn expert_formats() -> Vec<(String, String, &'static str, usize, String)> {
 /// work).
 pub(crate) fn shader_src(mma: bool) -> String {
     let mut s = format!(
-        "{}{}{}#define MVK_GROUP 4\n{}",
+        "{}{}{}{}",
         super::SHADER_SRC,
         super::gguf_shader_tables(),
         super::GGUF_SHADER_SRC,
@@ -594,7 +594,7 @@ struct MvkP {
 // ---- The model on the device ------------------------------------------------------------------
 
 /// A dense matrix and its matvec pipelines: one token (pipeline, rows and SIMD-groups per
-/// threadgroup) and multi-token (8 and 16 tokens: pipeline, rows per threadgroup, threads).
+/// threadgroup) and multi-token (the decode library's kernels of every token class up to 16).
 struct Dw {
     w: MvWeight,
     /// Runtime LoRA updates of the matrix (`crate::lora`), applied beside it.
@@ -606,7 +606,7 @@ struct Dw {
     /// `one`'s matvec of a message gate's weighted output, scaled by the gate's norm (`ink_mvs_*`,
     /// [`InkMetal::attn_fold`]).
     mvs: Option<Id>,
-    multi: [(Id, usize, usize); 2],
+    multi: MvkPipe,
     /// Prefill: the matrix-unit GEMM, where the format has one; float32 weights (the loop's
     /// gates): their buffer and offset in floats, for the f32 GEMM.
     g: Option<Gemm>,
@@ -1440,13 +1440,6 @@ impl InkMetal {
                     w.fmt, one.0 as usize
                 );
             }
-            let mk = |tt: usize| -> anyhow::Result<(Id, usize, usize)> {
-                Ok((
-                    be.mvk_pipe(w.fmt, mvk_rows(tt), ks, tt).context("mvk pipeline")?,
-                    mvk_rows(tt),
-                    32 * ks,
-                ))
-            };
             // Prefill: the matrix-unit GEMM.
             let g = (|| -> Option<Gemm> {
                 let wr = l.as_ref();
@@ -1508,7 +1501,7 @@ impl InkMetal {
                 mvs,
                 lora,
                 one,
-                multi: [mk(8)?, mk(16)?],
+                multi: be.mvk_pipes(w.fmt, ks, MAX_T).context("mvk pipeline")?,
                 g,
                 f32g,
             })
@@ -2276,7 +2269,7 @@ impl InkMetal {
             }
             return;
         }
-        let (pipe, nr, threads) = d.multi[usize::from(t > 8)];
+        let (pipe, nr, threads) = d.multi.pick(t);
         let w = &d.w;
         e.note(((w.n_out << 44) | (w.n_in << 24) | (pipe as usize & 0xff_ffff)) as Id);
         let p = MvkP {

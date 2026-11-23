@@ -8,7 +8,7 @@
 //! The host's cache (`DsparkSession`) stays authoritative: every injection writes the device
 //! cache and copies the new rows back; rows the host gained otherwise are uploaded before use.
 
-use super::decode::{FastEnc, Fns, MvFmt, MvMode, MvParams, MvWeight, encode_mv, mvk_rows, run_concurrent};
+use super::decode::{FastEnc, Fns, MvFmt, MvMode, MvParams, MvWeight, MvkPipe, encode_mv, run_concurrent};
 use super::{Id, IntoInnerUnsafe, MetalBackend, MetalWeight, MsgNewBufLen, MsgVoid};
 use crate::ggml::GgmlType;
 use crate::gpu::decode::Slot;
@@ -29,11 +29,12 @@ struct MvkP {
     sgate: u32,
 }
 
-/// A matrix and its pipelines: one token, and 8 / 16 tokens.
+/// A matrix and its pipelines: one token, and the multi-token kernels of every token class up to
+/// 16.
 struct Mw {
     w: MvWeight,
     one: (Id, usize, usize),
-    multi: [(Id, usize, usize); 2],
+    multi: MvkPipe,
 }
 
 struct LayerW {
@@ -313,10 +314,9 @@ impl InkDraftMetal {
                 4
             };
             let (nr1, ks1) = if specialized(w.fmt) { (1, ks) } else { (2, 4) };
-            let mk = |tt: usize| Some((be.mvk_pipe(w.fmt, mvk_rows(tt), ks, tt)?, mvk_rows(tt), 32 * ks));
             Some(Mw {
                 one: (be.mv_pipe(w.fmt, nr1, ks1)?, nr1, ks1),
-                multi: [mk(8)?, mk(16)?],
+                multi: be.mvk_pipes(w.fmt, ks, 16)?,
                 w,
             })
         };
@@ -451,7 +451,7 @@ impl InkDraftMetal {
             encode_mv(e, pipe, nr, ks, &m.w, None, (a, x * 4), (a, y * 4), mode, (a, 0));
             return;
         }
-        let (pipe, nr, threads) = m.multi[usize::from(t > 8)];
+        let (pipe, nr, threads) = m.multi.pick(t);
         let (w, w2) = (&m.w, w2.map_or(&m.w, |u| &u.w));
         let p = MvkP {
             m: MvParams {
