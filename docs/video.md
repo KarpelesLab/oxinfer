@@ -795,6 +795,16 @@ The text encoder is not in these totals (5.3 to 13.6 s on the CPU for the 124-to
 the Q8_0 GGUF, load included: GGUF weights have no device kernels). Peak resident memory of the
 CUDA run 30.4 GB, 6.2 GB of it allocated.
 
+On a DGX Spark (GB10, 121 GB shared with the CPU; a release build, the same request, files and
+kept embedding) all 50 blocks stay on the device (20 GB of them, 92.5 GB then free) and the 36 of
+the VAE: the 4 forwards take 51.1 to 51.2 s in two runs (14.4 s the first with the blocks' copy,
+12.2 s each after, against 5.9 to 6.1 s on the RTX 5080), the video VAE decode 10.5 s, the audio
+VAE 2.2 s, the load 3.4 to 4.6 s and the clip 67.5 to 68.7 s, with 30.1 to 30.5 GB of the
+machine's memory taken (the frames were not compared with the RTX 5080's). Before the blocks' pages
+were read ahead of their copy (see [DGX Spark](platforms.md#cuda-speed-and-memory-on-the-gb10)) the
+first forward took 54.3 and 83.9 s in two runs, the VAE decode 25.3 and 33.3 s and the clip up
+to 160.7 s.
+
 Where one forward's time goes (`--profile`; on the device with `OXINFER_H3_GPU_PROF=1`, which
 waits for the GPU after every stage; `OXINFER_H3_GPU_PROF=vae` times the VAE decoder's blocks
 instead):

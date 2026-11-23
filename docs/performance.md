@@ -1308,6 +1308,18 @@ excludes; even all of it (the attention change above, the mixes at 512 threads i
 25% faster in mb on a busy GPU) is worth perhaps 0.5-1 ms. A realistic ceiling for plain decoding on this design is 90-95 tok/s
 for the 4-bit files, and the published 125 is not reproducible here.
 
+#### DGX Spark, CUDA (November 2026)
+
+On a DGX Spark (GB10, 121 GB shared between the CPU and the GPU) against llama.cpp's CUDA backend
+built there (master `94f3af3`, `llama-bench -ngl 99 -p 512,2048 -n 128 -r 3`), `parity_bench`
+with `device=cuda lookup=0 draft=none mtp=0`, tok/s over two to five interleaved runs:
+Llama-3.2-1B Q4_K_M 5173-5243 / 4137-4188 / 177-179 (pp512 / pp2048 / decode) against
+20368-21213 / 21107-22577 / 224-249, Qwen3.8-27B UD-Q3_K_XL 258 / 231-239 / 12.4 against
+994-1001 / 995 / 15.3-15.9. What the device's shared memory changes (the driver's free-memory
+figure, weights held twice, copies of pages not yet mapped, memory the GPU reads in place), what
+was measured and kept or not, and where the remaining time goes:
+[DGX Spark](platforms.md#cuda-speed-and-memory-on-the-gb10).
+
 #### Earlier comparisons (llama-server, op-by-op Metal prefill)
 
 Same GGUF file in both engines, same prompt tokens (llama.cpp gets the text oxinfer's chat

@@ -407,8 +407,9 @@ bf16 fp16 sve sve2`, no SME), a GB10 GPU sharing the system's 131 GB, Ubuntu 24.
 6.17, driver 580.173.02 (CUDA 13.0, compute capability 12.1), NVRTC 13.0.88 from the toolkit's
 `sbsa-linux` libraries, Vulkan 1.4.312, Rust 1.100. It is the first aarch64 Linux machine and
 the first CUDA device outside x86-64 that oxinfer ran on; the aarch64 kernels had run on Apple
-Silicon only. Two other jobs measured speed on the machine at the same time, so nothing here is
-a timing.
+Silicon only. Two other jobs measured speed on the machine at the same time, so nothing in the
+first part is a timing; the CUDA backend's speed and memory are
+[below](#cuda-speed-and-memory-on-the-gb10).
 
 ```
 CPU: aarch64 on linux, 20 logical cores
@@ -439,9 +440,11 @@ oxinfer's and changes nothing; `VK_LOADER_DRIVERS_DISABLE='*freedreno*'` removes
   therefore taken from the system's available memory less the reserve every load leaves
   (`cuda::usable_free`), for the GEMM weights, the Inkling-2 and MiniMax-H3 engines and the
   server's eviction. The device's copy of the weights is a second one in the same memory:
-  Qwen3.5-0.8B bf16 holds 1.76 GB resident and 1.75 GB on the device (1.75 GB resident on the
-  CPU alone; with `--mmap` the host's copy is page cache). `--models` counts both, so models up
-  to 60 GB decode on the GPU here. The test that a dropped model returns its device memory
+  Qwen3.5-0.8B bf16 read into memory holds 1.76 GB resident and 1.75 GB on the device (1.75 GB
+  resident on the CPU alone). A checkpoint is therefore mapped on such a device, so that the
+  host's copy is page cache the system takes back ([below](#cuda-speed-and-memory-on-the-gb10), with the
+  figures for larger models); weights that `--quant` makes at load are still held twice.
+  `--models` counts two copies, so models up to 60 GB are listed as decoding on the GPU here. The test that a dropped model returns its device memory
   prints the figures on such a device instead of asserting them (every process moves them by
   more than its 164 MB). Pinned memory (`cuMemAllocHost`) works as on a discrete card.
 - *Host-to-device copies.* `cuMemcpyHtoD` may return with a copy of 64 KB or less from pageable
@@ -531,7 +534,160 @@ The image prompt against transformers (`tools/ref_vl.py`, float32): pixel values
 image features within 1.4e-4 (1.6e-5 relative), logits within 1.0e-4 (KL 1.0e-7) with the same
 top 10, and the same 64 greedy tokens.
 
-**Not run on this machine:** speed (measured separately), the affine-Q4 MLX checkpoints, MoE
-models, GGUF files other than Llama-3.2-1B Q4_K_M, Inkling-2 and MiniMax-H3 with real weights
-(their CUDA engines ran in the unit tests only), Whisper, the image and video pipelines other
-than SD-Turbo, speculative decoding, streamed weights and the server with a model.
+### CUDA speed and memory on the GB10
+
+Measured on the same machine while two other jobs took turns on it (load averages 3 to 18): each
+number is the median of the three passes of one `examples/parity_bench.rs` run, and the runs of
+the builds compared alternate. "Before" is the tree at v0.0.17, without the free-memory figure
+above and without what follows. The discrete cards of [CUDA](#cuda) were not measured again:
+each change applies only to a device that reports `CU_DEVICE_ATTRIBUTE_INTEGRATED`, and a
+discrete card runs the code it ran before. Memory here is in units of 2^30 bytes, as
+`/proc/meminfo` counts it: the machine's 131 GB are 121 of them.
+
+**What the driver calls free memory.** `cuMemGetInfo` reports the system's free pages
+(`MemFree`), without the page cache: with 87 GB of files cached it reported 37 GB free, and
+fourteen 4 GB allocations still succeeded, the cache shrinking to 53 GB as the last ones came
+(the driver's figure was 1.4 to 3.6 GB while 73 to 90 GB were available). The backend refused
+every weight that did not fit in that figure, so a machine that had read its model files decoded
+on the CPU without saying so. With `MemFree` at 13.4 to 21.4 GB of 121 (97 to 99 GB cached),
+before / after taking what the system counts as available less its reserve (`cuda::usable_free`,
+above):
+
+| | decode tok/s | memory taken | whole run |
+|---|---|---|---|
+| Qwen3.5-9B `--quant q8` | 13.0 (no decode plan: CPU) / 22.5 | 38.5 / 22.4 GB | 40.3 / 27.6 s |
+| Qwen3.8-27B UD-Q3_K_XL | 6.4 / 11.5 | 26.9 / 14.7 GB | 53.0 / 34.6 s |
+
+(the memory and the time include the next change).
+
+**Every weight was held twice.** A checkpoint read into memory and then copied to the device
+occupies the same physical memory twice here: the 13.1 GB Qwen3.8-27B GGUF took 25.1 to 26.8 GB
+(`MemAvailable` before the run less its minimum during it; 14.5 GB of it the process's own
+pages), Qwen3.5-9B `--quant q8` 34.6 to 38.5 GB. On a unified-memory device the checkpoint is
+now mapped instead (`Backend::prefers_mapped_weights`; `OXINFER_CUDA_MAP=0` reads it as
+before): the file's pages are page cache the system takes back, and the device's copy is the
+one that counts. The same runs then take 13.3 to 14.7 GB and 19.1 to 22.4 GB. What `--quant`
+makes at load is still held twice, once for the CPU's kernels and once on the device, and
+`--models` still counts two copies of every weight on such a device, which is now the upper
+bound and not the rule for GGUF and bf16 files.
+
+Copying from a mapping needed one more thing: the driver copies host memory that is not in the
+process's page table yet, in pieces that do not start on a page boundary (a tensor of a GGUF
+file, a buffer just allocated), at 0.32 GB/s (1 GB of a mapped file in 32 MB pieces: 3.4 s, all
+of it user time in the driver; 5.3 GB/s for pieces that start on one), and at 17 GB/s once the
+pages are there. A mapped 27B took 28.1 s to build its decode plan that way. Uploads on such a
+device now read a byte of every page first, on the thread pool, and results coming down have
+their pages written first (the callers' output buffers are fresh allocations). Loading the 27B
+GGUF and answering a 568-token prompt with 32 tokens, whole run: 12.4 to 13.8 s read into
+memory, 35.4 to 36.1 s mapped without the page pass, 9.1 to 9.9 s mapped with it. The prompts of weights without a prefill plan (bf16, Q8, Q4:
+the op-by-op GEMMs, whose outputs come down after every launch) spent 10.7 to 11.8 s of a
+benchmark run's 31 to 33 s of device calls in those copies, 2.9 s now:
+
+| Qwen3.5-9B, tok/s | pp512 | pp2048 | decode | memory taken |
+|---|---:|---:|---:|---:|
+| `--quant q4`, before | 246-274 | 256-300 | 40.2-41.5 | 26.9-34.7 GB |
+| `--quant q4` | 353-355 | 345-349 | 42.3 | 8.8-13.7 GB |
+| `--quant q8`, before | 277 | 322-347 | 13.1 (CPU) or 22.9 | 34.6-37.5 GB |
+| `--quant q8` | 359 | 351 | 23.1 | 19.1-22.0 GB |
+| bf16, before | 277 | 357 | 13.5 | 36.0 GB |
+| bf16 | 363 | 347 | 13.7 | 17.5-18.2 GB |
+
+(two or three runs each where a range is given.) Qwen/Qwen3.8-27B in bf16 (56 GB of
+safetensors, which no 16 GB card holds) with `--quant q4`, before / now (one run / two): 84.6 /
+108.5-108.7 tok/s at 512 prompt tokens, 101.7 / 101.1-104.7 at 2048, 13.2 / 13.0-13.4 decoding;
+84.0 / 31.4-31.6 GB taken; the benchmark with its load and quantization 241 / 173-186 s.
+
+**Reading the host's memory in place** was measured and not kept. The driver registers host
+memory (anonymous or a mapped file, `cuMemHostRegister` with a device mapping) at the host's
+own address, so a kernel can read a checkpoint where it is. A kernel reading 2 GB once, a
+64 KB window 32 times over, and 256 scattered words per thread:
+
+| memory | read | written | 64 KB window, again and again | scattered reads |
+|---|---:|---:|---:|---:|
+| `cuMemAlloc` | 220 GB/s | 185 GB/s | 1333 GB/s | 3499 M/s |
+| `cuMemAllocHost` (page-locked) | 201-214 | 167-169 | 228 | 16 |
+| `cuMemHostAlloc`, write-combined | 219-226 | 184-191 | 230 | 3173 |
+| registered, 4 KiB pages | 168-172 | 113 | 329 | 24 |
+| registered, transparent huge pages | 154-166 | 110-115 | 374 | 2596 |
+| registered mapping of a file | 168 | | | |
+
+Only a device allocation is read again from the GPU's cache, and a GEMM reads each weight tile
+once per tile of tokens. Llama-3.2-1B Q4_K_M with its weights registered in place: 1111 tok/s at
+512 prompt tokens and 117 decoding, against 5295 and 169 from device allocations; copied into
+page-locked host allocations 2309 and 130, write-combined ones 2484 and 148. The Gated DeltaNet
+states (149 MB on the 27B, down to the host after every token) in page-locked memory that the
+kernels write directly: 2.3 ms a token for the host's copy, against 2.1 ms through the device
+copy and its pinned buffer; not kept either.
+
+**GGUF matvecs.** Unlike the formats above, decoding GGUF weights was bound by the kernel: the
+27B's 12.2 GB at 11.4 tokens a second are 139 GB/s. On a unified-memory device a lane of the
+matvec now takes whole blocks of 32 values and a warp two rows (eight for the IQ2 formats), so
+that what a block's values share is decoded once per block and each block of the input is
+loaded once for the rows (`MV_ROWS` in `inkling_cuda.cu`; `OXINFER_CUDA_MV_ROWS=N` for every
+format, 0 the discrete cards' kernel). GB/s of weights by format, 17408 x 5120 and 5120 x 17408,
+two passes each, before / after: IQ4_XS 156 / 201, IQ4_NL 154 / 204, Q4_0 180 / 222, Q8_0 184 /
+207, Q5_K 154 / 180, Q6_K 153 / 172, IQ3_XXS 148 / 167, Q4_K 146 / 161, Q2_K 208 / 221, Q3_K
+129 / 136, IQ3_S 148 / 154, IQ2_XXS 155 / 222, IQ2_XS 187 / 226, IQ2_S 186 / 197 (formats not
+in the list keep the other kernel: not measured). The sums are taken in another order; the test
+`ggml_matvec_and_gemm_match_definition` holds every variant to the same 2e-6 of the summed
+magnitudes.
+
+Against llama.cpp's CUDA backend built on the machine (master `94f3af3`,
+`llama-bench -ngl 99 -p 512,2048 -n 128 -r 3`) on the same files, `examples/parity_bench.rs`
+with `device=cuda lookup=0 draft=none mtp=0`; "before" is the tree these changes started from,
+with memory free (it decodes the 27B at 6.4 tok/s with the page cache full, above); tok/s, two
+to five runs each:
+
+| | | pp512 | pp2048 | decode | memory taken |
+|---|---|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_K_M | before | 5029-5484 | 3993-4214 | 153-171 | 1.6-3.6 GB |
+| | now | 5173-5243 | 4137-4188 | 177-179 | 1.5-2.5 GB |
+| | llama.cpp | 20368-21213 | 21107-22577 | 224-249 | 1.7-2.0 GB |
+| Qwen3.8-27B UD-Q3_K_XL | before | 251-260 | 238-241 | 11.0-11.4 | 25.4-26.2 GB |
+| | now | 258 | 231-239 | 12.4 | 14.0-17.8 GB |
+| | llama.cpp | 994-1001 | 995 | 15.3-15.9 | 13.9-14.2 GB |
+| Qwen3.8-27B UD-Q4_K_M (16.6 GB: IQ4_XS, Q5_K, Q4_K, Q6_K; one run, two of now) | before | 279 | 257 | 9.1 | 34.0 GB |
+| | now | 278 | 256-257 | 11.1-11.2 | 17.9 GB |
+| | llama.cpp | 1012 | 1026 | 13.0 | 17.2 GB |
+
+What is left against llama.cpp is in the kernels, 0.25x on prompts and 0.75 to 0.86x decoding.
+A 512-token step of the 27B is 1.92 s, 1.73 s of it the GEMMs (attention 53 ms, the delta rule
+79, the activations 27); on Llama 1B 68 of 91 ms (attention 17). `gemmi_*` reaches 12 to 18
+TFLOP/s on the 27B's shapes here (IQ4_XS 17-18, Q4_K 16-17, IQ3_XXS 18, Q5_K, Q6_K and Q3_K
+12.6 to 14.6, IQ3_S 12), about half of what it does on the RTX 5080. A token of the 27B is 80
+ms, 76 of them the matvecs (160 GB/s over the file's mix of formats, IQ3_S and Q3_K the
+slowest) and 2.2 the recurrent states' copy.
+
+MiniMax-H3's engine copies its blocks with bindings of its own and reads their pages first in
+the same way: one 448x256 clip of 124 frames in 67.5 to 68.7 s with every block on the device,
+against up to 160.7 s before ([On CUDA](video.md#on-cuda)).
+
+Agreement with the CPU path, measured here (`examples/qwen_greedy_dump.rs`: three raw prompts
+of 1,500 characters fed as one batch, then greedy tokens one at a time, every step's logits
+compared; the CPU on its f32 prompt GEMM):
+
+| | last prompt token, KL (largest logit difference) | decode steps, mean KL | greedy tokens identical |
+|---|---|---|---|
+| Llama-3.2-1B Q4_K_M, 48 tokens | 5.0e-12 to 3.0e-7 (0.005) | 3.1e-4 to 5.2e-4 | 3 of 3 |
+| Qwen3.8-27B UD-Q3_K_XL, 32 tokens | 1.4e-12 to 4.2e-7 (0.0045) | 2.3e-4 to 4.3e-4 | 2 of 3 (the third parts at token 10, 0.196 against 0.195) |
+| Qwen3.5-9B `--quant q4`, 32 tokens | 3.1e-12 to 2.4e-7 (0.0032) | 5.1e-4 to 2.5e-3 | 3 of 3 |
+| Qwen3.5-9B bf16, 32 tokens | 7.4e-12 to 1.7e-11 | 2.8e-12 to 7.9e-12 | 3 of 3 |
+
+`OXINFER_GPU_DECODE_CHECK=1` (every GPU step on the CPU too) over 42 to 48 tokens: mean KL
+1.0e-12 on Qwen3.5-9B bf16, 2.0e-4 with `--quant q4` and 2.5e-4 with `--quant q8` (the same top
+token at every step of the three), 3.2e-4 on Llama 1B Q4_K_M (42 of 42), 1.0e-4 on the 27B
+GGUF (47 of 48) and 1.0e-4 on the bf16 27B with `--quant q4` (48 of 48). The prompts of bf16
+and `--quant` weights are not bit-identical to the CPU's here because these are long enough for
+the device's attention, which sums in another order (see the rows above).
+
+Against the tree these changes started from, both on CUDA: every logit of the prompt and of 32
+greedy steps is bit-identical on Qwen3.5-9B bf16 and `--quant q4` (one prompt each); on the
+GGUF files (three prompts of Llama 1B, one of the 27B) the prompt's last-token logits show no
+difference (KL 0) and the decode steps differ by the matvec's order of sums, mean KL 1.7e-10 to
+1.1e-8, with the same 48 and 32 tokens.
+
+**Not run on this machine:** the affine-Q4 MLX checkpoints, MoE models, GGUF files other than
+Llama-3.2-1B Q4_K_M and Qwen3.8-27B UD-Q3_K_XL / UD-Q4_K_M, Inkling-2 with real weights (its
+CUDA engine ran in the unit tests only; MiniMax-H3 ran one clip, above), Whisper, the image and
+video pipelines other than SD-Turbo and that clip, speculative decoding, streamed weights and
+the server with a model.
