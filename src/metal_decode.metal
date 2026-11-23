@@ -595,10 +595,7 @@ inline void mvk_out(device float* y, uint o, uint mode, float a, float b, device
         y[o] = 0.5f * a * (1.0f + precise::tanh(t)) * b;
     } else y[o] += a / (1.0f + exp(-gate[0]));
 }
-// Every token's lane sums reduced as mv_finish reduces one token's: the SIMD-group sum, then the
-// KS SIMD-groups' sums in order (through threadgroup memory, `red`: 2 T NR KS floats), then the
-// mode's output, one (token, row) a lane of the first SIMD-group.
-// K-quants (Q4_K, Q5_K): the chunk's 32 quants as floats and its super-block scale, min and the
+// K-quants (Q4_K, Q5_K): the chunk's 32 quants as half (exact) and its super-block scale, min and the
 // two sub-blocks' scales and mins.
 struct WQK { half4 nl[4]; half4 nh[4]; float2 dm; float4 sc; };
 template <int KS> struct WDec<MQ4_K, KS> { typedef WQK T; };
@@ -634,7 +631,7 @@ inline float wdot(F f, thread const WQK& w, uint c, thread const XKQ& x) {
     for (int i = 0; i < 4; i++) { lo += x.k.l[i] * float4(w.nl[i]); hi += x.k.h[i] * float4(w.nh[i]); }
     return kq_fin(w.dm, w.sc.xy, w.sc.zw, dot(lo, NIB_LO), dot(hi, NIB_HI), x.k.sl, x.k.sh);
 }
-// Q6_K: the chunk's 32 values (minus 32) as floats, its scale and the four sub-blocks' scales.
+// Q6_K: the chunk's 32 values (minus 32) as half (exact), its scale and the four sub-blocks' scales.
 struct WQ6 { half4 v[8]; float d; float4 c; };
 template <int KS> struct WDec<MQ6_K, KS> { typedef WQ6 T; };
 inline void wdec(MQ6_K f, uint row, uint c, thread WQ6& w) {
@@ -659,6 +656,10 @@ inline float wdot(MQ6_K f, thread const WQ6& w, uint c, thread const X6& x) {
     float s3 = q6_pair(float4(w.v[6]), x.v[6], float4(w.v[7]), x.v[7]);
     return w.d * q6_sum(s0, s1, s2, s3, w.c.x, w.c.y, w.c.z, w.c.w);
 }
+// Every token's lane sums reduced as mv_finish reduces one token's: the SIMD-group sum, then the
+// KS SIMD-groups' sums in order (through threadgroup memory, `red`: 2 T NR KS floats), then the
+// mode's output, one (token, row) a lane of the first SIMD-group. With one SIMD-group a row,
+// every lane holds every sum after the SIMD-group sums and lane t NR + r writes row r of token t.
 template <int NR, int KS, int T>
 inline void mvk_finish(thread float (&a)[T][NR], thread float (&b)[T][NR], bool pair, device float* y, constant MVK& q, uint r0,
                        uint sg, uint lane, threadgroup float* red, device const float* gate) {
@@ -672,7 +673,6 @@ inline void mvk_finish(thread float (&a)[T][NR], thread float (&b)[T][NR], bool 
         }
     }
     if (KS == 1) {
-        // Every lane holds every sum: lane t NR + r writes row r of token t.
         for (uint i0 = 0; i0 < nt * NR; i0 += 32) {
             uint i = i0 + lane, tl = i / NR, rl = i % NR;
             float va = 0.f, vb = 0.f;
@@ -696,17 +696,10 @@ inline void mvk_finish(thread float (&a)[T][NR], thread float (&b)[T][NR], bool 
     for (uint i = lane; i < nt * NR; i += 32) {
         uint t = i / NR, r = i % NR;
         if (r0 + r >= p.n_out) continue;
-        float va, vb;
-        if (KS == 1) {
-            va = red[(t * NR + r) * 2];
-            vb = red[(t * NR + r) * 2 + 1];
-        } else {
-            va = 0.f;
-            vb = 0.f;
-            for (int s = 0; s < KS; s++) {
-                va += red[((s * T + t) * NR + r) * 2];
-                vb += red[((s * T + t) * NR + r) * 2 + 1];
-            }
+        float va = 0.f, vb = 0.f;
+        for (int s = 0; s < KS; s++) {
+            va += red[((s * T + t) * NR + r) * 2];
+            vb += red[((s * T + t) * NR + r) * 2 + 1];
         }
         mvk_out(y + (ulong)t * q.sy, r0 + r, p.mode, va, vb, gate + (ulong)t * q.sgate);
     }
