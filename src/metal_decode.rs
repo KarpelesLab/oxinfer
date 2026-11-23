@@ -1414,14 +1414,18 @@ fn attn_narrow(pipe: Id, grp: usize, narrow: &[Option<Id>; 2], n: usize) -> (Id,
     }
 }
 
-/// The matvec variant (rows per threadgroup, SIMD-groups per row) for a shape: enough lanes per
-/// row to cover it in one or two passes (measured: short rows want 1 SIMD-group, 8192 4).
+/// The matvec variant (rows per threadgroup, SIMD-groups per row) for a shape: a SIMD-group per
+/// 16 chunks of the row, rounded up to a power of two, at most 4 (rows of 2048 values or more
+/// in the 32-value formats take 4, each lane then streaming 1-4 chunks). Measured in whole decode passes, where each matvec waits for the previous op: rows
+/// of 2048-4096 on 1-2 SIMD-groups (each lane streaming 2-4 chunks) left the passes 1-4.5%
+/// slower (Orpheus 3B Q4_K_M 4.70 -> 4.49 ms, Llama 3.2 1B 1.94 -> 1.88 ms) while streaming
+/// matvecs without barriers ran as fast either way.
 fn mv_variant(fmt: MvFmt, n_in: usize) -> (usize, usize) {
     if !fmt.specialized() {
         return (2, 4); // the only variant compiled for the generic kernel
     }
     let nch = n_in / fmt.chunk();
-    (1, (nch / 64).clamp(1, 4).next_power_of_two().min(4))
+    (1, (nch / 16).clamp(1, 4).next_power_of_two().min(4))
 }
 
 #[repr(C)]
