@@ -5,8 +5,11 @@
 `--draft models/gemma-4-E4B-it-assistant` enables Google's multi-token-prediction drafter: a
 4-layer, 256-wide decoder that cross-attends to the main model's shared KV caches and predicts
 from the concatenation of the last token's embedding and the previous hidden state. Each round
-drafts 2–6 tokens (adaptive) and verifies them in one multi-token forward pass; greedy
-verification makes the output identical to plain greedy decoding. Acceptance is about 40% on prose
+drafts the number of tokens, 0 (a plain step) to 6, with the most expected tokens per second
+(`spec_cost::ChainPolicy`: the measured cost of a draft step and of verifying each length, the
+running acceptance of each draft position; `--spec-draft-fixed` always drafts `--draft-tokens`)
+and verifies them in one multi-token pass of the GPU decode plan (each token's arithmetic the
+one-token step's); greedy verification makes the output identical to plain greedy decoding. Acceptance is about 40% on prose
 and 55–65% on code, giving 2–4 tokens per forward. The drafter's own drafts were checked against
 the transformers implementation token for token. It pays off most where the verification pass
 is bandwidth-bound (bf16, Q8); at Q4 the multi-token int8 kernels are instruction-bound, so it
@@ -17,7 +20,10 @@ layer (`mtp.*`, `qwen_mtp.rs`): one gated-attention decoder layer that takes the
 final-normed hidden state at position i and the embedding of token i+1 (each RMS-normed,
 concatenated embedding first, projected by `mtp.fc`), runs at position i with its own KV cache,
 and predicts token i+2 through the shared LM head; further drafts feed it its own output (the
-vLLM `qwen3_5_mtp` scheme). The default is 3 drafts per round, adapting between 1 and 3. With GPU
+vLLM `qwen3_5_mtp` scheme). The default is up to 3 drafts per round, each round the length (0 to
+3) with the most expected tokens per second from the measured round times and the acceptance by
+draft position (`--no-mtp-cost` / `mtp_cost=0`: grow after a fully accepted round, shrink after a
+fully rejected one, between 1 and 3). With GPU
 decoding the verification is one GPU pass (the same multi-token kernels as DSpark's, so greedy output
 is plain GPU decoding's) and the draft head runs on the GPU; MTP is on by default for Qwen3.5-4B and
 Qwen3.5-9B, where it measured faster on every kind of prompt (numbers and the comparison with DSpark
@@ -183,11 +189,12 @@ on free prose there is rarely a match and the round is a plain one-token step.
   estimated per match class (match length, consensus, depth), calibrated online from the
   verification outcomes; with the measured time of verifying each number of drafts (a plain step
   for none), the round verifies the length with the most expected tokens per second, which is 0
-  (a plain step) when nothing is worth it. Until a verification has been measured it counts as
-  two plain steps (the first multi-token pass also prepares its GPU plan), so only a good match
-  starts one; a match that is not worth it is still tried now and then (after 8 rounds, doubling
-  to 128) so that a poor early estimate does not stick. In DSpark and MTP decoding every
-  round's verification time feeds the same measurements.
+  (a plain step) when nothing is worth it. A length not yet measured is estimated from the
+  measured ones through the backend's table of verification costs by token count
+  (`spec_cost::CostPrior`); a match that is not worth it is still tried now and then (as rarely
+  as keeps the expected loss of such probes within 2% of the plain steps' time) so that a poor
+  early estimate does not stick. In DSpark and MTP decoding every round's verification time
+  feeds the same measurements.
 - Exact like the other drafts: greedy output is the plain greedy output (bit for bit with
   `--exact-verify`; with fast verification the logits may differ in rounding, as for DSpark and
   MTP), and sampling uses speculative sampling with a one-token draft distribution (accept with

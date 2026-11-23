@@ -241,9 +241,10 @@ pub struct Policy {
     pub verify: Vec<(f64, usize)>,
     /// Decayed (accepted, verified) counts per class.
     pub classes: Vec<(f64, f64)>,
-    /// Rounds in a row with a match but no draft verified, and the current number before a probe.
+    /// Rounds in a row with a match but no draft verified.
     pub idle: usize,
-    pub probe: usize,
+    /// The shape of verification costs by length where they are not measured.
+    pub prior: crate::spec_cost::CostPrior,
 }
 
 impl Default for Policy {
@@ -252,7 +253,7 @@ impl Default for Policy {
             verify: Vec::new(),
             classes: vec![(0.0, 0.0); CLASSES],
             idle: 0,
-            probe: Self::PROBE,
+            prior: crate::spec_cost::CostPrior::default(),
         }
     }
 }
@@ -261,8 +262,6 @@ impl Policy {
     const DECAY: f64 = 0.8;
     const PRIOR: f64 = 2.0;
     const CLASS_DECAY: f64 = 0.995;
-    const PROBE: usize = 8;
-    const PROBE_MAX: usize = 128;
 
     fn chance(&self, class: usize) -> f64 {
         let (a, n) = self.classes[class];
@@ -297,32 +296,12 @@ impl Policy {
         }
     }
 
-    /// Verification time of `k` drafts: measured, else interpolated between the nearest measured
-    /// lengths; beyond the longest one measured, its time grown by 5% per draft (an optimistic
-    /// guess, so that longer lengths get tried). Before any verification of drafts was measured,
-    /// twice a plain step (the first multi-token pass may also prepare its GPU plan, so it is only
-    /// worth it for a good match); before a plain step was measured, unknown.
+    /// Verification time of `k` drafts: measured, else estimated from the measured lengths
+    /// through the backend's prior ([`crate::spec_cost::CostPrior::verify_time`]); unknown
+    /// before a plain step was measured.
     fn verify_time(&self, k: usize) -> Option<f64> {
-        if k > 0 && self.verify.iter().skip(1).all(|e| e.1 == 0) {
-            let plain = self.verify.first().filter(|e| e.1 > 0)?;
-            return Some(plain.0 * (2.0 + 0.05 * k as f64));
-        }
-        let m: Vec<(usize, f64)> = self
-            .verify
-            .iter()
-            .enumerate()
-            .filter(|e| e.1.1 > 0)
-            .map(|(j, e)| (j, e.0))
-            .collect();
-        let lo = m.iter().rev().find(|e| e.0 <= k);
-        let hi = m.iter().find(|e| e.0 >= k);
-        match (lo, hi) {
-            (Some(a), Some(b)) if a.0 == b.0 => Some(a.1),
-            (Some(a), Some(b)) => Some(a.1 + (b.1 - a.1) * (k - a.0) as f64 / (b.0 - a.0) as f64),
-            (Some(a), None) => Some(a.1 * (1.0 + 0.05 * (k - a.0) as f64)),
-            (None, Some(a)) => Some(a.1),
-            (None, None) => None,
-        }
+        self.verify.first().filter(|e| e.1 > 0)?;
+        self.prior.verify_time(&self.verify, k)
     }
 
     /// How many of the draft's tokens to verify: the length with the most expected tokens per
@@ -367,7 +346,10 @@ impl Lookup {
             toks: Vec::new(),
             index: HashMap::new(),
             memory: Memory::default(),
-            policy: Policy::default(),
+            policy: Policy {
+                prior: crate::spec_cost::CostPrior::detect(opts.fast_verify),
+                ..Policy::default()
+            },
             opts,
             stats: LookupStats::default(),
         }
@@ -533,12 +515,22 @@ impl Lookup {
             self.policy.idle = 0;
             return k;
         }
-        // Probe now and then so that a poor early estimate does not stick.
+        // Probe now and then so that a poor early estimate does not stick: up to 2 drafts, once
+        // the plain steps since the last probe have earned its expected loss (after 8 while
+        // plain steps are not measured: chained greedy steps record theirs when the chain ends).
         self.policy.idle += 1;
-        if self.policy.idle >= self.policy.probe {
+        let k = d.tokens.len().min(2);
+        let p = &self.policy;
+        let due = match (p.verify_time(0), p.verify_time(k)) {
+            (Some(plain), Some(v)) => {
+                let samples = p.verify.iter().skip(1).map(|e| e.1).sum();
+                crate::spec_cost::probe_due(p.idle, v - expected(&d.chances, k) * plain, plain, samples)
+            }
+            _ => p.idle >= 8,
+        };
+        if due {
             self.policy.idle = 0;
-            self.policy.probe = (self.policy.probe * 2).min(Policy::PROBE_MAX);
-            return d.tokens.len().min(2);
+            return k;
         }
         0
     }
@@ -553,9 +545,6 @@ impl Lookup {
             self.stats.rounds += 1;
             self.stats.drafted += drafts.len();
             self.stats.accepted += accepted;
-            if accepted == drafts.len() {
-                self.policy.probe = Policy::PROBE;
-            }
         }
         if !self.opts.memory || drafts.is_empty() {
             return;
@@ -1060,17 +1049,26 @@ mod tests {
 
     #[test]
     fn cost_aware_cut() {
-        let mut p = Policy::default();
+        let mut p = Policy {
+            prior: crate::spec_cost::CostPrior::new(crate::spec_cost::VerifyBackend::MetalExact),
+            ..Policy::default()
+        };
         assert_eq!(p.cut(&[0.9, 0.9]), 0, "unmeasured: a plain step first");
         p.record_time(0, 0.010);
         p.record_time(0, 0.010);
-        // No verification measured yet: twice a plain step, so only good matches.
-        assert_eq!(p.cut(&[0.5, 0.5]), 0);
-        assert_eq!(p.cut(&[0.95, 0.95, 0.95, 0.95]), 4);
+        // No verification measured yet: the backend's prior (Metal, exact kernels: 2 tokens cost
+        // 1.15 plain steps, 5 tokens 2).
+        assert_eq!(p.cut(&[0.1, 0.1]), 0);
+        assert_eq!(p.cut(&[0.5, 0.5]), 1);
+        assert_eq!(p.cut(&[0.99, 0.99, 0.99, 0.99]), 4);
         p.record_time(4, 0.030);
         p.record_time(4, 0.030);
-        // Verifying 4 costs 3 plain steps: only worth it with high chances.
+        // Verifying 4 costs 3 plain steps: only worth it with high chances, and 3 drafts (22.6 ms
+        // between the measured lengths in the prior's shape) are worth more.
         assert_eq!(p.cut(&[0.2, 0.2, 0.2, 0.2]), 0);
-        assert_eq!(p.cut(&[0.95, 0.95, 0.95, 0.95]), 4);
+        assert_eq!(p.cut(&[0.99, 0.99, 0.99, 0.99]), 3);
+        p.record_time(3, 0.026);
+        p.record_time(3, 0.026);
+        assert_eq!(p.cut(&[0.99, 0.99, 0.99, 0.99]), 4);
     }
 }

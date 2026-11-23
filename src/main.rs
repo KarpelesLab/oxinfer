@@ -75,6 +75,7 @@ struct Args {
     draft_device: Option<bool>,
     draft_conf_min: Option<f32>,
     fast_verify: bool,
+    fast_draft: bool,
     /// Prompt lookup: on/off (None: the default, `oxinfer::lookup::BY_DEFAULT`).
     lookup: Option<bool>,
     lookup_tokens: Option<usize>,
@@ -271,24 +272,30 @@ fn usage() -> ! {
          \x20                      README) or a Gemma 4 assistant (drafter) model (greedy only)\n\
          \x20 --no-draft           plain decoding: no DSpark draft (one beside the model or in the download\n\
          \x20                      cache is used by default where it measured faster) nor default MTP\n\
-         \x20 --draft-tokens N     max draft tokens per round (default 6 with a drafter, adaptive from 3;\n\
-         \x20                      3 with --mtp, 8 with --mtp --stream; DSpark: Mistral Large 4 / DeepSeek V4\n\
-         \x20                      3, Qwen / Gemma 4 the whole block)\n\
+         \x20 --draft-tokens N     max draft tokens per round (default 6 with a drafter, each round the\n\
+         \x20                      length, 0 to N, with the most expected tokens per second; 3 with --mtp,\n\
+         \x20                      8 with --mtp --stream; DSpark: Mistral Large 4 / DeepSeek V4 3, Qwen /\n\
+         \x20                      Gemma 4 the whole block)\n\
          \x20 --spec-draft-n-max N  the same as --draft-tokens\n\
          \x20 --spec-draft-p-min P  DSpark: cut a block before the first draft the draft model gives\n\
          \x20                      less than probability P (default 0.85 when the model streams, else 0)\n\
          \x20 --draft-device D     DSpark: auto (default: the GPU when there is one) | gpu | cpu, where the\n\
          \x20                      draft's matmuls run\n\
-         \x20 --spec-draft-fixed   DSpark (Qwen, Gemma 4): always draft and verify --draft-tokens (default:\n\
-         \x20                      a draft or a plain step, whichever measures faster, and the most\n\
-         \x20                      profitable part of each block verified; fixed when streaming)\n\
+         \x20 --spec-draft-fixed   DSpark (Qwen, Gemma 4) and the Gemma 4 assistant: always draft and\n\
+         \x20                      verify --draft-tokens (default: DSpark a draft or a plain step,\n\
+         \x20                      whichever measures faster, and the most profitable part of each\n\
+         \x20                      block verified, fixed when streaming; the assistant the length, 0\n\
+         \x20                      included, with the most expected tokens per second)\n\
          \x20 --spec-draft-conf-min C  DSpark: cut a block before the first draft whose confidence-head\n\
          \x20                      estimate of being accepted is below C (default 0: off)\n\
          \x20 --exact-verify       DSpark / MTP: verify drafts with the one-token kernels, so greedy\n\
          \x20                      output is the plain greedy output token for token (default: fast\n\
          \x20                      batched matrix kernels on the GPU, whose logits differ from plain\n\
          \x20                      decoding in rounding; --fast-verify asks for them explicitly)\n\
-         \x20 --prefill-gemm G     CPU prefill matmuls: auto (default: fast), exact (the same\n\
+         \x20 --exact-draft        DSpark: run the draft on the exact kernels too (default: its GPU\n\
+         \x20                      passes on the fast batched kernels, also with --exact-verify; the\n\
+         \x20                      output is the same, the drafts differ in rounding only)\n\
+         \x20 --prefill-gemm G    CPU prefill matmuls: auto (default: fast), exact (the same\n\
          \x20                      results as f32: sme with SME, else f32), sme (f32 on the SME\n\
          \x20                      tiles), hybrid (SME + int8x2\n\
          \x20                      at once), fast (SME + int8 at once: fastest, least precise), int8x2\n\
@@ -320,11 +327,12 @@ fn usage() -> ! {
          \x20 --mtp                Qwen3.5/3.8: speculative decoding with the checkpoint's multi-token\n\
          \x20                      prediction layer (greedy and sampled; same output distribution); the\n\
          \x20                      default for Qwen3.5-4B / 9B (--no-draft: plain decoding)\n\
-         \x20 --mtp-fixed         with --mtp, always draft --draft-tokens (default: adaptive 1..N)\n\
+         \x20 --mtp-fixed         with --mtp, always draft --draft-tokens (default: see --mtp-cost)\n\
          \x20 --mtp-from DIR       implies --mtp, with the MTP weights from another checkpoint (e.g. the\n\
          \x20                      original one when the model is a converted copy without them)\n\
-         \x20 --mtp-cost           with --mtp, pick each round's draft length from measured round times and\n\
-         \x20                      acceptance (default with --stream; --no-mtp-cost turns it off)\n\
+         \x20 --mtp-cost           with --mtp, pick each round's draft length (0 to --draft-tokens) from\n\
+         \x20                      measured round times and acceptance (default; --no-mtp-cost: grow\n\
+         \x20                      after a fully accepted round, shrink after a fully rejected one)\n\
          \x20 --stream             stream weights from the mapped file (models larger than RAM; Qwen and\n\
          \x20                      Gemma): a reader thread fetches the next layers while one computes\n\
          \x20 --cache-budget-gb F  with --stream, page cache the model may use: a resident set of\n\
@@ -656,6 +664,7 @@ fn parse_args() -> Result<Args> {
         draft_device: None,
         draft_conf_min: None,
         fast_verify: true,
+        fast_draft: true,
         lookup: None,
         lookup_tokens: None,
         lookup_min_match: None,
@@ -844,6 +853,8 @@ fn parse_args() -> Result<Args> {
             "--spec-draft-fixed" => a.mtp_fixed = true,
             "--fast-verify" => a.fast_verify = true,
             "--exact-verify" => a.fast_verify = false,
+            "--exact-draft" => a.fast_draft = false,
+            "--fast-draft" => a.fast_draft = true,
             "--prefill-gemm" => oxinfer::kernels::set_prefill_gemm(val()?.parse()?),
             "--cpu-repack" => {
                 let v = val()?;
@@ -1188,11 +1199,12 @@ fn generate_speculative(
     tok: &Tokenizer,
     hidden_last: Vec<f32>,
     k: usize,
+    fixed: bool,
     eos: &[u32],
     max_tokens: usize,
 ) -> (Vec<u32>, SpecStats, f64) {
     let mut printer = Printer::new(&chat::GemmaChat, false, tok);
-    let (d, stats) = generate::decode_speculative(model, drafter, sess, hidden_last, k, eos, max_tokens, &mut |out| {
+    let (d, stats) = generate::decode_speculative(model, drafter, sess, hidden_last, k, fixed, eos, max_tokens, &mut |out| {
         printer.print(tok, out)
     });
     printer.finish(tok, &d.tokens, eos);
@@ -1497,6 +1509,7 @@ fn run_session(args: &Args) -> Result<()> {
     opts.draft_device = args.draft_device;
     opts.draft_conf_min = args.draft_conf_min;
     opts.fast_verify = args.fast_verify;
+    opts.fast_draft = args.fast_draft;
     opts.mtp = args.mtp;
     opts.mtp_fixed = args.mtp_fixed;
     opts.mtp_from = args.mtp_from.as_ref().map(|d| d.to_string_lossy().into_owned());
@@ -3512,7 +3525,7 @@ fn run_qwen_mtp(
         draft_tokens: default_draft_tokens(args),
         adaptive: !args.mtp_fixed,
         stop: eos.to_vec(),
-        cost_aware: !args.mtp_fixed && args.mtp_cost.unwrap_or(args.stream),
+        cost_aware: !args.mtp_fixed && args.mtp_cost.unwrap_or(true),
         // Long drafts stay exact (the decode kernels are also faster than the GEMM at 8-15 tokens).
         exact: true,
         fast_verify: args.fast_verify,
@@ -3727,6 +3740,7 @@ fn run_dspark<M: oxinfer::dspark::Target<Sess: Clone>>(
         device: args.draft_device,
         conf_min: args.draft_conf_min.unwrap_or(0.0),
         fast_verify: args.fast_verify,
+        fast_draft: args.fast_draft,
     };
     let mut sampler =
         Sampler::new(args.temperature, args.top_k, args.top_p, args.seed).with_repetition_penalty(args.repetition_penalty.unwrap_or(1.0));
@@ -4081,6 +4095,7 @@ fn run_gemma_loaded(args: &Args, model: &Model, files: &safetensors::ModelFiles,
                     &tok,
                     hidden_last,
                     args.draft_tokens.unwrap_or(6),
+                    args.mtp_fixed,
                     &eos,
                     args.max_tokens,
                 );
@@ -4172,6 +4187,7 @@ fn run_gemma_loaded(args: &Args, model: &Model, files: &safetensors::ModelFiles,
             &tok,
             hidden_last,
             args.draft_tokens.unwrap_or(6),
+            args.mtp_fixed,
             &eos,
             args.max_tokens,
         );

@@ -83,7 +83,10 @@ int64_t oxi_cache_remove(const char *cache_dir, const char *name);
  *   max_context=N        conversation token limit (default: none)
  *   mtp=0|1              Qwen3.5/3.8 multi-token prediction speculative decoding
  *   mtp_from=PATH|REPO   MTP weights from another checkpoint (implies mtp=1)
- *   mtp_fixed=0|1        always draft draft_tokens (default adaptive)
+ *   mtp_fixed=0|1        always draft draft_tokens (MTP, DSpark, Gemma 4 assistant; default 0:
+ *                        each round's length from measured costs and acceptance)
+ *   mtp_cost=0|1         MTP: each round's draft length (0 to draft_tokens) with the most
+ *                        expected tokens per second (default 1; 0: grow / shrink by one)
  *   draft=PATH|REPO      a DSpark draft (Qwen, Gemma 4, Mistral Large 4: Hugging Face folder /
  *                        repo id or dflash GGUF; greedy and sampled, same output distribution)
  *                        or a Gemma 4 assistant (drafter) model (greedy); draft=auto: the
@@ -103,6 +106,9 @@ int64_t oxi_cache_remove(const char *cache_dir, const char *name);
  *                        (default 1: faster; logits then differ from plain decoding in rounding,
  *                        so greedy output can drift from plain greedy at near-ties; 0: exact,
  *                        the plain greedy output token for token)
+ *   fast_draft=0|1       DSpark on the GPU: run the draft's passes on the fast batched kernels
+ *                        also with fast_verify=0 (default 1: drafts change in rounding only,
+ *                        the output not at all; 0: the draft on the exact kernels too)
  *   lookup=auto|0|1      prompt-lookup drafting (default auto = on): drafts copied from the
  *                        conversation where its last tokens occurred before, verified in one
  *                        pass (exact like other drafts; rounds without a match are plain steps);

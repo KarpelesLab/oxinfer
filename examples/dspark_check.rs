@@ -81,6 +81,7 @@ fn check<M: Target<Sess: Clone>>(m: &M, d: &Dspark, tok: &Tokenizer, ids: &[u32]
             device: o.device,
             // The check compares against one-token forwards bit for bit.
             fast_verify: false,
+            fast_draft: false,
             ..Default::default()
         },
     );
@@ -184,6 +185,7 @@ fn check<M: Target<Sess: Clone>>(m: &M, d: &Dspark, tok: &Tokenizer, ids: &[u32]
                 conf_min: env_f32("DSPARK_CONF_MIN"),
                 cost_aware: gqa && std::env::var_os("DSPARK_FIXED").is_none(),
                 fast_verify: o.fast,
+                fast_draft: true,
             },
         );
         let lg = dec.prefill(ids, 256);

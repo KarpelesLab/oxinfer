@@ -436,7 +436,9 @@ pub struct SpecStats {
 
 /// Greedy speculative decoding with the Gemma 4 drafter. Produces exactly the plain greedy
 /// sequence. `hidden_last` is the final-normed hidden state of the last prompt token, whose
-/// forward the caller already ran. `k` is the maximum draft length (adaptive from 3). The cache
+/// forward the caller already ran. `k` is the maximum draft length: with `fixed` every round
+/// drafts it, else each round drafts the length (0 = a plain step) with the most expected tokens
+/// per second, starting from 3 ([`crate::spec_cost::ChainPolicy`]). The cache
 /// may hold accepted drafts past the last returned token when the limit or the callback ended the
 /// loop inside a round: truncate it to the conversation if it continues.
 #[allow(clippy::too_many_arguments)]
@@ -446,6 +448,7 @@ pub fn decode_speculative(
     sess: &mut Session,
     hidden_last: Vec<f32>,
     k: usize,
+    fixed: bool,
     eos: &[u32],
     max_tokens: usize,
     on_token: &mut dyn FnMut(&[u32]) -> Flow,
@@ -466,17 +469,19 @@ pub fn decode_speculative(
         cancelled = true;
     }
 
-    // Adaptive draft length: grow after a fully accepted round, shrink after a fully rejected one.
-    let (k_min, k_max) = (2usize.min(k.max(1)), k.max(1));
-    let mut k_cur = k_min.max(3).min(k_max);
+    // The draft length policy: the verification passes run the exact kernels.
+    let k_max = k.max(1);
+    let mut policy = crate::spec_cost::ChainPolicy::new(crate::spec_cost::CostPrior::detect(false));
     'outer: while !cancelled && !eos.contains(&last) && out.len() < max_tokens {
         // Draft k tokens from the drafter, chaining its projected hidden state.
         let pos = sess.pos; // index of `last` (not yet in the cache)
-        let k = k_cur.min(max_tokens - out.len());
+        let k_cur = if fixed { k_max } else { policy.choose(k_max, 3) };
+        let k = k_cur.min(max_tokens - out.len() - 1);
+        let t_round = Instant::now();
         let mut drafts = Vec::with_capacity(k);
         let mut hid = h_prev.clone();
         let mut cur = last;
-        for _ in 0..k.max(1) {
+        for _ in 0..k {
             let _t = prof::start(prof::Cat::Other);
             let emb = model.embed_scaled(cur);
             let (d, nh) = drafter.step(&emb, &hid, pos, sess.cache(ls), sess.cache(lg));
@@ -485,6 +490,7 @@ pub fn decode_speculative(
             cur = d;
         }
         stats.drafted += drafts.len();
+        let draft_secs = t_round.elapsed().as_secs_f64();
         if stats.forwards == 0 && std::env::var("OXINFER_DEBUG_DRAFT").is_ok() {
             eprintln!("[debug: pos {pos} last {last} drafts {drafts:?}]");
         }
@@ -495,8 +501,7 @@ pub fn decode_speculative(
         seq.extend_from_slice(&drafts);
         let check = std::env::var("OXINFER_CHECK_SPEC").is_ok();
         let sess_before = if check { Some(sess.clone()) } else { None };
-        let hs = model.forward_hidden(sess, &seq);
-        let logits = model.logits(&hs, seq.len());
+        let (hs, logits) = model.verify_hidden(sess, &seq);
         stats.forwards += 1;
         let v = model.cfg.vocab_size;
         if let Some(mut s2) = sess_before {
@@ -531,10 +536,15 @@ pub fn decode_speculative(
         if n < stats.per_pos.len() {
             stats.per_pos[n] += 1;
         }
-        if n == drafts.len() {
-            k_cur = (k_cur + 1).min(k_max);
-        } else if n == 0 {
-            k_cur = (k_cur - 1).max(k_min);
+        if k == k_cur {
+            policy.record(k, n, draft_secs, t_round.elapsed().as_secs_f64() - draft_secs);
+        }
+        if std::env::var_os("OXINFER_DEBUG_DRAFT").is_some() {
+            eprintln!(
+                "[drafter: k {k} accepted {n}; ms: draft {:.1} verify {:.1}]",
+                draft_secs * 1e3,
+                (t_round.elapsed().as_secs_f64() - draft_secs) * 1e3
+            );
         }
         if stats.forwards == 1 && std::env::var("OXINFER_DEBUG_DRAFT").is_ok() {
             let truth: Vec<u32> = (0..seq.len()).map(|i| argmax(&logits[i * v..(i + 1) * v])).collect();

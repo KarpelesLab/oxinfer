@@ -170,16 +170,22 @@ and `engine::resolve_auto_draft` do the search.
 
 **Each round** (unless `--spec-draft-fixed`, or when the model streams) is a draft pass or a plain
 step, whichever has given more tokens per second lately (measured, the first two samples of each
-kind discarded as warm-up). While plain steps win, a draft round is still tried after 6 plain
-rounds, then twice as long apart after each such probe that loses (up to 96). A draft pass costs
-the same for any number of drafts used, so it always drafts the whole block; then it verifies the
-part of the block with the most expected tokens per second: the cost of verifying each length is
-measured (interpolated where not yet measured), and the chance that each draft is accepted (when
+kind discarded as warm-up). While plain steps win, a draft round is still tried now and then, as
+rarely as keeps the probes' expected loss (a draft round's recent time beyond the plain time of the
+tokens it gave) within 2% of the plain steps' time (every 4 to 256 rounds). A draft pass costs
+about the same for any number of drafts used, so it drafts the whole block (or the most
+profitable length where each draft costs more); then it verifies the part of the block with the
+most expected tokens per second: the cost of verifying each length is measured, and estimated
+where not yet measured from the measured lengths through a small table of verification costs by
+token count for the backend (`spec_cost::CostPrior`: Metal's exact and fast kernels, the CPU's),
+and the chance that each draft is accepted (when
 the ones before it were) is estimated from its probability under the draft model, calibrated
 online by tenths (decayed counts of verified drafts and accepted ones, with the draft's own
 probability as a prior). The cut depends on the drafts only, so sampling keeps the target's
 distribution. The draft's context (keys and values of the committed positions) is computed
-lazily, in one pass before the next draft: rounds without a draft add no draft work.
+lazily, in one pass before the next draft: rounds without a draft add no draft work. The draft's
+GPU passes run on the fast batched kernels also with `--exact-verify` (`--exact-draft` /
+`fast_draft=0` to keep them exact): the drafts differ in rounding only, and the output not at all.
 
 **On the GPU** (Metal, GPU decoding on), the verification is one decode pass for all its tokens,
 each token's arithmetic exactly the single-token kernels' (the output is the plain GPU greedy

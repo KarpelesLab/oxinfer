@@ -124,12 +124,19 @@ pub struct EngineOptions {
     /// Implies `mtp`: take the MTP weights (and a draft head, if any) from this checkpoint
     /// (path or repo id), e.g. the original one for a converted copy. Key `mtp_from`.
     pub mtp_from: Option<String>,
-    /// With `mtp`, always draft `draft_tokens` (default: adaptive between 1 and that); with a
-    /// Qwen or Gemma 4 DSpark draft, likewise (default: a draft pass or a plain step, whichever
-    /// has measured faster lately, and the most profitable part of the block verified, see
-    /// [`crate::dspark::Adaptive`]; fixed when the model streams). Key `mtp_fixed` (or
-    /// `draft_fixed`).
+    /// With `mtp`, always draft `draft_tokens` (default: the length, 0 to that, with the most
+    /// expected tokens per second, see `mtp_cost`); with a Qwen or Gemma 4 DSpark draft,
+    /// likewise (default: a draft pass or a plain step, whichever has measured faster lately,
+    /// and the most profitable part of the block verified, see [`crate::dspark::Adaptive`]; fixed
+    /// when the model streams); with a Gemma 4 assistant, likewise (default: the length, 0 to
+    /// that, with the most expected tokens per second, [`crate::spec_cost::ChainPolicy`]). Key
+    /// `mtp_fixed` (or `draft_fixed`).
     pub mtp_fixed: bool,
+    /// With `mtp` and not `mtp_fixed`: each round's draft length (0 to `draft_tokens`) from the
+    /// measured round times and acceptance by position ([`crate::qwen_mtp::MtpOptions::cost_aware`];
+    /// default true); false: grow the length after a fully accepted round and shrink it after a
+    /// fully rejected one, between 1 and `draft_tokens`. Key `mtp_cost`.
+    pub mtp_cost: bool,
     /// Gemma 4: speculative decoding (greedy) with this assistant model (path or repo id).
     /// Mistral Large 4, DeepSeek V4, Qwen3, Qwen3.5 / 3.8, Gemma 4: speculative decoding (greedy
     /// and sampled; same output distribution) with this DSpark draft ([`crate::dspark`]: a
@@ -163,6 +170,10 @@ pub struct EngineOptions {
     /// ([`crate::dspark::DsparkOptions::fast_verify`], [`crate::qwen_mtp::MtpOptions::fast_verify`]).
     /// Default true; false: verification reproduces plain decoding bit for bit. Key `fast_verify`.
     pub fast_verify: bool,
+    /// DSpark: run the draft's GPU passes on the fast batched kernels also when verification
+    /// is exact ([`crate::dspark::DsparkOptions::fast_draft`]; the output is the same either
+    /// way). Default true. Key `fast_draft`.
+    pub fast_draft: bool,
     /// Where repo ids are downloaded (default [`crate::hf::cache_root`]). Key `cache_dir`.
     pub cache_dir: Option<PathBuf>,
     /// Qwen3.5/3.8, Gemma 4 / 3, Mistral Large 4: stream the weights from the (mapped) file for models larger than
@@ -452,12 +463,14 @@ impl Default for EngineOptions {
             mtp: false,
             mtp_from: None,
             mtp_fixed: false,
+            mtp_cost: true,
             draft: None,
             draft_tokens: None,
             draft_p_min: None,
             draft_device: None,
             draft_conf_min: None,
             fast_verify: true,
+            fast_draft: true,
             cache_dir: None,
             stream: None,
             stream_mode: StreamMode::Auto,
@@ -531,6 +544,7 @@ impl EngineOptions {
         "mtp",
         "mtp_from",
         "mtp_fixed",
+        "mtp_cost",
         "draft",
         "draft_tokens",
         "draft_p_min",
@@ -538,6 +552,7 @@ impl EngineOptions {
         "draft_conf_min",
         "draft_fixed",
         "fast_verify",
+        "fast_draft",
         "cache_dir",
         "stream",
         "mmproj",
@@ -610,7 +625,9 @@ impl EngineOptions {
                 self.mtp |= self.mtp_from.is_some();
             }
             "mtp_fixed" | "draft_fixed" => self.mtp_fixed = parse_bool(key, value)?,
+            "mtp_cost" => self.mtp_cost = parse_bool(key, value)?,
             "fast_verify" => self.fast_verify = parse_bool(key, value)?,
+            "fast_draft" => self.fast_draft = parse_bool(key, value)?,
             "draft" => self.draft = opt_str(value),
             "draft_tokens" => self.draft_tokens = parse_opt_usize(key, value)?,
             "draft_p_min" => {
@@ -1462,6 +1479,8 @@ pub struct Engine {
     /// [`EngineOptions::memory_limit`].
     memory_limit: Option<u64>,
     draft_tokens: usize,
+    /// The Gemma 4 assistant drafts `draft_tokens` every round ([`EngineOptions::mtp_fixed`]).
+    draft_fixed: bool,
     /// Turns fed in the current conversation.
     turns: usize,
     /// The last reply's final token when the model has not run it (see [`Decoded::unfed`]).
@@ -1673,6 +1692,7 @@ impl Engine {
             device: opts.draft_device,
             conf_min: opts.draft_conf_min.unwrap_or(0.0),
             fast_verify: opts.fast_verify,
+            fast_draft: opts.fast_draft,
         };
 
         let mut arena = Arena(Vec::new());
@@ -1858,9 +1878,9 @@ impl Engine {
                             draft_tokens,
                             adaptive: !opts.mtp_fixed,
                             stop,
-                            // Streaming passes are IO-bound: long drafts pay off, so pick their
-                            // length by cost and keep them exact.
-                            cost_aware: !opts.mtp_fixed && stream.is_some(),
+                            // The length with the most expected tokens per second (streaming
+                            // passes are IO-bound: long drafts pay off there; keep them exact).
+                            cost_aware: !opts.mtp_fixed && (opts.mtp_cost || stream.is_some()),
                             exact: stream.is_some(),
                             fast_verify: opts.fast_verify,
                         };
@@ -1926,6 +1946,7 @@ impl Engine {
                             device: opts.draft_device,
                             conf_min: opts.draft_conf_min.unwrap_or(0.0),
                             fast_verify: opts.fast_verify,
+                            fast_draft: opts.fast_draft,
                         };
                         Lm::Mistral4Dspark {
                             dec: Box::new(DsparkDecoder::new(model, dr, dopts)),
@@ -2005,6 +2026,7 @@ impl Engine {
                             device: opts.draft_device,
                             conf_min: opts.draft_conf_min.unwrap_or(0.0),
                             fast_verify: opts.fast_verify,
+                            fast_draft: opts.fast_draft,
                         };
                         Lm::DeepSeek4Dspark {
                             dec: Box::new(DsparkDecoder::new(model, dr, dopts)),
@@ -2375,6 +2397,7 @@ impl Engine {
             max_context: opts.max_context,
             memory_limit: opts.memory_limit,
             draft_tokens: opts.draft_tokens.unwrap_or(6),
+            draft_fixed: opts.mtp_fixed,
             turns: 0,
             unfed: None,
             chat_ids: None,
@@ -2454,6 +2477,7 @@ impl Engine {
             max_context: Some(opts.max_context.map_or(ctx, |m| m.min(ctx))),
             memory_limit: opts.memory_limit,
             draft_tokens: 0,
+            draft_fixed: false,
             turns: 0,
             unfed: None,
             chat_ids: None,
@@ -3434,6 +3458,7 @@ impl PendingTurn {
             prefill_chunk,
             max_context,
             draft_tokens,
+            draft_fixed,
             cancel,
             lookup,
             constrain,
@@ -3541,7 +3566,7 @@ impl PendingTurn {
                     // The drafter's loop is greedy and does not sample: guided replies decode plainly.
                     Some(dr) if !guided => {
                         let base = sess.pos;
-                        let (d, ss) = generate::decode_speculative(model, dr, sess, last, *draft_tokens, stop, max, &mut cb);
+                        let (d, ss) = generate::decode_speculative(model, dr, sess, last, *draft_tokens, *draft_fixed, stop, max, &mut cb);
                         // Keep the reply in the cache up to (not including) its last token.
                         sess.truncate(base + d.tokens.len() - 1);
                         st.drafted = ss.drafted;

@@ -560,6 +560,10 @@ impl Default for MtpOptions {
 /// Measurements behind the cost-aware draft length.
 #[derive(Clone, Debug, Default)]
 pub struct DraftCosts {
+    /// The shape of verification costs by length where they are not measured.
+    pub prior: crate::spec_cost::CostPrior,
+    /// Plain rounds (no draft) in a row.
+    pub plain_run: usize,
     /// `round_secs[k]`: moving average of a round's wall time (drafting + verification) with `k`
     /// drafts, and how many rounds it saw.
     pub round_secs: Vec<(f64, usize)>,
@@ -578,6 +582,11 @@ impl DraftCosts {
         }
         let (t, n) = self.round_secs[k];
         self.round_secs[k] = (ema(t, n, secs), n + 1);
+        if k == 0 {
+            self.plain_run += 1;
+            return;
+        }
+        self.plain_run = 0;
         if let Some(s) = step_secs {
             self.step_secs = ema(self.step_secs, (self.step_secs > 0.0) as usize, s);
         }
@@ -591,22 +600,23 @@ impl DraftCosts {
         }
     }
 
-    /// Estimated round time with `k` drafts: measured, else the nearest measured length plus
-    /// (or minus) the draft steps in between. Unmeasured lengths get no verification cost
-    /// growth, which makes the policy try them.
+    /// Estimated round time with `k` drafts: measured, else `k` draft steps plus the
+    /// verification of `k` drafts, estimated from the measured rounds' (their time less their
+    /// draft steps) through the prior's shape ([`crate::spec_cost::CostPrior::verify_time`]).
     pub(crate) fn round_time(&self, k: usize) -> Option<f64> {
         if let Some(&(t, n)) = self.round_secs.get(k)
             && n > 0
         {
             return Some(t);
         }
-        let (k0, &(t0, _)) = self
+        let verify: Vec<(f64, usize)> = self
             .round_secs
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.1 > 0)
-            .min_by_key(|(j, _)| j.abs_diff(k))?;
-        Some((t0 + (k as f64 - k0 as f64) * self.step_secs).max(1e-6))
+            .map(|(j, &(t, n))| ((t - j as f64 * self.step_secs).max(1e-6), n))
+            .collect();
+        let v = self.prior.verify_time(&verify, k)?;
+        Some((v + k as f64 * self.step_secs).max(1e-6))
     }
 
     /// Expected committed tokens per round with `k` drafts: 1 + sum over i of the probability
@@ -620,6 +630,41 @@ impl DraftCosts {
             e += p;
         }
         e
+    }
+
+    /// The next round's draft length, 0 (a plain step) to `k_max`: the one with the most expected
+    /// tokens per second; while plain steps win, the length that loses least now and then
+    /// ([`crate::spec_cost::probe_due`]), to follow the text. None until a round with drafts was
+    /// measured.
+    pub fn choose(&self, k_max: usize) -> Option<usize> {
+        let best = self.best(k_max)?;
+        let Some(plain) = self.round_secs.first().filter(|e| e.1 >= 2).map(|e| e.0) else {
+            // Measure a plain step once drafting is measured (twice: the first may compile).
+            return Some(if self.round_secs.iter().skip(1).map(|e| e.1).sum::<usize>() >= 2 {
+                0
+            } else {
+                best
+            });
+        };
+        let rate = |k: usize| self.round_time(k).map_or(0.0, |t| self.expected_tokens(k) / t);
+        if rate(best) * plain >= 1.0 {
+            // One round in 8 drafts one more, so that the next length stays measured.
+            let rounds: usize = self.round_secs.iter().skip(1).map(|e| e.1).sum();
+            return Some(if rounds % 8 == 7 { (best + 1).min(k_max.max(1)) } else { best });
+        }
+        let (mut k_probe, mut loss) = (best, f64::INFINITY);
+        for k in 1..=k_max.max(1) {
+            let l = self.round_time(k).unwrap_or(f64::INFINITY) - self.expected_tokens(k) * plain;
+            if l < loss {
+                (k_probe, loss) = (k, l);
+            }
+        }
+        let samples = self.round_secs.iter().skip(1).map(|e| e.1).sum();
+        Some(if crate::spec_cost::probe_due(self.plain_run, loss, plain, samples) {
+            k_probe
+        } else {
+            0
+        })
     }
 
     /// The draft length in `1..=k_max` with the most expected tokens per second.
@@ -710,6 +755,7 @@ impl<'m> MtpDecoder<'m> {
         } else {
             opts.draft_tokens
         };
+        let prior = crate::spec_cost::CostPrior::detect(opts.fast_verify);
         Self {
             model,
             mtp,
@@ -720,7 +766,13 @@ impl<'m> MtpDecoder<'m> {
             pend_t: Vec::new(),
             next: None,
             k_cur,
-            stats: MtpStats::default(),
+            stats: MtpStats {
+                costs: DraftCosts {
+                    prior,
+                    ..DraftCosts::default()
+                },
+                ..MtpStats::default()
+            },
             lookup: None,
         }
     }
@@ -960,9 +1012,11 @@ impl<'m> MtpDecoder<'m> {
             // not timed: the drafting time spread over the steps.
             let step = step_secs.or(Some(draft_secs / k as f64));
             self.stats.costs.record(k, draft_secs + verify_secs, accepted, step);
+        } else if self.k_cur == 0 && k == 0 {
+            self.stats.costs.record(0, draft_secs + verify_secs, 0, None);
         }
         if self.opts.cost_aware {
-            if let Some(b) = self.stats.costs.best(self.opts.draft_tokens.max(1)) {
+            if let Some(b) = self.stats.costs.choose(self.opts.draft_tokens.max(1)) {
                 self.k_cur = b;
             }
         } else if self.opts.adaptive && mtp_k == self.k_cur && mtp_k > 0 {

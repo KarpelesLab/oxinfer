@@ -2868,6 +2868,12 @@ pub struct DsparkOptions {
     /// that rounding). On by default; off, verification reproduces one-token decoding bit for
     /// bit. Only GPU decode plans have fast kernels (Metal); elsewhere this changes nothing.
     pub fast_verify: bool,
+    /// Run the draft's GPU passes on the fast batched kernels also when verification is exact
+    /// (`fast_verify` off): the drafts change in rounding only and the output not at all, since
+    /// the target verifies them, and a draft pass of a whole block costs much less (Qwen3-8B's
+    /// Q4_K_M draft: 9.6 -> 6.8 ms on an M5 Max). Default true; false drafts on the exact
+    /// kernels too (draft checks against a reference).
+    pub fast_draft: bool,
 }
 
 impl Default for DsparkOptions {
@@ -2880,6 +2886,7 @@ impl Default for DsparkOptions {
             device: None,
             conf_min: 0.0,
             fast_verify: true,
+            fast_draft: true,
         }
     }
 }
@@ -2915,20 +2922,23 @@ pub struct DsparkDecoder<'m, M: Target> {
 
 /// The cost-aware draft length policy ([`DsparkOptions::cost_aware`]), in two steps per round:
 ///
-/// - Whether to draft: a draft pass costs the same whatever the number of drafts used, so a round
-///   either drafts the whole block or none. It drafts when draft rounds have recently given more
-///   tokens per second than plain steps; otherwise it decodes plainly and drafts again now and then
-///   (after 6 plain rounds, twice as many after each probe that lost, up to 96) to follow the
-///   text.
+/// - Whether to draft: a draft pass costs about the same whatever the number of drafts used, so a
+///   round either drafts or not. It drafts when draft rounds have recently given more tokens per
+///   second than plain steps; otherwise it decodes plainly and drafts again now and then to
+///   follow the text, as rarely as keeps the probes' expected loss (a draft round's recent time
+///   beyond the plain time of the tokens it gave) within 2% of the plain steps' time
+///   ([`crate::spec_cost::probe_due`]).
 /// - How many drafts to verify ([`Adaptive::cut`]): with the drafts in hand, the length that
-///   gives the most expected tokens per second of the round, from the measured cost of verifying
-///   each length and each draft's chance of being accepted, estimated from its probability under
-///   the draft model (calibrated online: drafts by probability bin, accepted or not).
+///   gives the most expected tokens per second of the round, from the cost of verifying each
+///   length (measured, else estimated from the measured ones through the backend's prior,
+///   [`crate::spec_cost::CostPrior`]) and each draft's chance of being accepted, estimated from
+///   its probability under the draft model (calibrated online: drafts by probability bin,
+///   accepted or not).
 /// - How many to draft ([`Adaptive::best_k`]), where a draft pass costs more for more drafts (an
-///   Inkling-2 pass runs its head once per draft): the length with the most expected tokens per
-///   second from each slot's recent acceptance rate (given the slots before it were accepted) and
-///   the measured cost of drafting and verifying each length; one round in 8 drafts one more, so
-///   the next slot's rate stays measured.
+///   Inkling-2 pass runs its head once per draft, the Markov head of a GQA draft once per slot):
+///   the length with the most expected tokens per second from each slot's recent acceptance rate
+///   (given the slots before it were accepted) and the measured cost of drafting and verifying
+///   each length; one round in 8 drafts one more, so the next slot's rate stays measured.
 #[derive(Clone, Debug)]
 pub struct Adaptive {
     /// Recent cost of a draft pass, and of verifying (and committing) `t` drafts, with the number
@@ -2940,11 +2950,8 @@ pub struct Adaptive {
     pub bins: [(f64, f64); 10],
     /// Recent tokens and seconds per round with a draft pass.
     pub gain: (f64, f64, usize),
-    /// Rounds in a row without a draft, and the current number of them before a probe.
+    /// Rounds in a row without a draft.
     pub plain_run: usize,
-    pub probe: usize,
-    /// This round was a probe (drafted against the measured rates).
-    probing: bool,
     /// Recent cost of a draft pass by its number of drafts.
     pub draft_k: Vec<(f64, usize)>,
     /// Decayed counts per slot of drafts verified after an accepted one (or first), and of
@@ -2952,6 +2959,8 @@ pub struct Adaptive {
     pub slots: Vec<(f64, f64)>,
     /// Draft rounds so far (one in 8 explores a longer draft).
     rounds: usize,
+    /// The shape of verification costs by length where they are not measured.
+    pub prior: crate::spec_cost::CostPrior,
 }
 
 impl Default for Adaptive {
@@ -2962,20 +2971,16 @@ impl Default for Adaptive {
             bins: [(0.0, 0.0); 10],
             gain: (0.0, 0.0, 0),
             plain_run: 0,
-            probe: Self::PROBE,
-            probing: false,
             draft_k: Vec::new(),
             slots: Vec::new(),
             rounds: 0,
+            prior: crate::spec_cost::CostPrior::default(),
         }
     }
 }
 
 impl Adaptive {
     const DECAY: f64 = 0.8;
-    /// Plain rounds before the first probe (doubling up to `PROBE_MAX` while probes lose).
-    const PROBE: usize = 6;
-    const PROBE_MAX: usize = 96;
     /// Weight of the draft model's own probability against the calibration counts of its bin.
     const PRIOR: f64 = 2.0;
     /// Decay of the calibration counts per verified draft (a window of about 500 drafts).
@@ -3035,15 +3040,6 @@ impl Adaptive {
                 n + 1,
             ),
         };
-        if self.probing {
-            // A probe that lost: probe half as often.
-            let plain = self.verify.first().map_or(0.0, |v| v.0);
-            if t * plain < s {
-                self.probe = (self.probe * 2).min(Self::PROBE_MAX);
-            } else {
-                self.probe = Self::PROBE;
-            }
-        }
         self.plain_run = 0;
     }
 
@@ -3058,29 +3054,14 @@ impl Adaptive {
         (a + Self::PRIOR * f64::from(p)) / (n + Self::PRIOR)
     }
 
-    /// Verifying `k` drafts: measured, else interpolated (or extrapolated flat) between the
-    /// nearest measured lengths.
+    /// Verifying `k` drafts: measured, else estimated from the measured lengths through the
+    /// prior's shape ([`crate::spec_cost::CostPrior::verify_time`]).
     fn verify_time(&self, k: usize) -> Option<f64> {
-        let m: Vec<(usize, f64)> = self
-            .verify
-            .iter()
-            .enumerate()
-            .filter(|e| e.1.1 > 0)
-            .map(|(j, e)| (j, e.0))
-            .collect();
-        let lo = m.iter().rev().find(|e| e.0 <= k);
-        let hi = m.iter().find(|e| e.0 >= k);
-        match (lo, hi) {
-            (Some(a), Some(b)) if a.0 == b.0 => Some(a.1),
-            (Some(a), Some(b)) => Some(a.1 + (b.1 - a.1) * (k - a.0) as f64 / (b.0 - a.0) as f64),
-            (Some(a), None) | (None, Some(a)) => Some(a.1),
-            (None, None) => None,
-        }
+        self.prior.verify_time(&self.verify, k)
     }
 
     /// The next round's draft length: `k_max` (a draft pass) or 0 (a plain step).
     pub fn choose(&mut self, k_max: usize) -> usize {
-        self.probing = false;
         // First two draft rounds, then two plain ones, to measure both (the first of each may
         // compile a plan).
         if self.draft.1 < 2 {
@@ -3089,11 +3070,14 @@ impl Adaptive {
         let Some(plain) = self.verify.first().filter(|e| e.1 >= 2).map(|e| e.0) else {
             return 0;
         };
-        if self.gain.0 * plain >= self.gain.1 {
+        // The time a draft round takes beyond the plain time of the tokens it gives.
+        let loss = self.gain.1 - self.gain.0 * plain;
+        if loss <= 0.0 {
             return self.best_k(k_max);
         }
-        if self.plain_run >= self.probe {
-            self.probing = true;
+        // Draft rounds lose: a probe once the plain steps since the last one have earned its
+        // expected loss.
+        if crate::spec_cost::probe_due(self.plain_run, loss, plain, self.gain.2) {
             return self.best_k(k_max);
         }
         0
@@ -3183,10 +3167,11 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         }
         draft.set_device(opts.device.unwrap_or(DEVICE_BY_DEFAULT && crate::gpu::active().is_some()));
         if opts.device != Some(false) {
-            draft.init_gpu(model.lm_head(), model.vocab_size(), opts.fast_verify);
+            draft.init_gpu(model.lm_head(), model.vocab_size(), opts.fast_verify || opts.fast_draft);
         }
         let mut dsess = draft.new_session();
-        dsess.fast = opts.fast_verify;
+        dsess.fast = opts.fast_verify || opts.fast_draft;
+        let prior = crate::spec_cost::CostPrior::detect(opts.fast_verify);
         Self {
             model,
             draft,
@@ -3196,7 +3181,10 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
             opts,
             next: None,
             stats: MtpStats::default(),
-            adapt: Adaptive::default(),
+            adapt: Adaptive {
+                prior,
+                ..Adaptive::default()
+            },
             pending: (Vec::new(), 0),
             lookup: None,
         }
@@ -3337,6 +3325,9 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
             lk.draft_over(max_new.max(1) - 1, other.0, other.1)
         });
         let lookup_class = looked.as_ref().map(|l| l.1.clone()).unwrap_or_default();
+        // The committed positions the draft pass first added to the draft's context, and the time
+        // that took.
+        let mut catch_up = (0usize, 0.0f64);
         let mut prop = if let Some((tokens, _)) = looked {
             Proposal {
                 dists: tokens.iter().map(|&t| vec![(t, 1.0)]).collect(),
@@ -3344,7 +3335,10 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
                 ..Proposal::default()
             }
         } else if k > 0 {
+            let t = crate::clock::Instant::now();
+            catch_up = (self.pending.1, 0.0);
             self.flush();
+            catch_up.1 = t.elapsed().as_secs_f64();
             draft.propose(model, &mut self.dsess, next, k, self.opts.p_min, self.opts.conf_min, sampler)
         } else {
             Proposal::default()
@@ -3352,7 +3346,7 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         let draft_secs = t_round.elapsed().as_secs_f64();
         // `p_min` may have cut the block; the cost-aware policy verifies the most profitable part.
         let probs = prop.probs.clone();
-        if self.opts.cost_aware && !prop.tokens.is_empty() && lookup_class.is_empty() {
+        if self.opts.cost_aware && !prop.tokens.is_empty() && lookup_class.is_empty() && !sweep() {
             let m = self.adapt.cut(&prop.probs, draft_secs);
             prop.tokens.truncate(m);
             prop.dists.truncate(m);
@@ -3419,7 +3413,7 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         let tail_secs = t_round.elapsed().as_secs_f64() - draft_secs;
         if std::env::var_os("OXINFER_DEBUG_DRAFT").is_some() {
             eprintln!(
-                "[draft: p {:?} conf {:?} accepted {accepted}; ms: draft {:.1} verify {:.1} accept {:.1} rewind {:.1} inject {:.1}]",
+                "[draft: p {:?} conf {:?} verified {kd} accepted {accepted}; ms: draft {:.1} verify {:.1} accept {:.1} rewind {:.1} inject {:.1}]",
                 prop.probs,
                 prop.conf,
                 draft_secs * 1e3,
@@ -3447,13 +3441,33 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
         st.draft_secs += draft_secs;
         st.verify_secs += verify_secs;
         if k == self.k_cur && lookup_class.is_empty() {
-            self.adapt.record(&probs, kd, accepted, c, draft_secs, tail_secs);
+            // After plain rounds the draft pass first adds their positions to the draft's
+            // context; drafting every round would add a round's tokens each time, so the policy
+            // counts that share of the catch-up only (else a probe after a long plain stretch
+            // looks dear, and the stretch grows).
+            let (n, secs) = catch_up;
+            let share = if n > 0 {
+                secs * (self.adapt.gain.0.max(1.0) / n as f64).min(1.0)
+            } else {
+                secs
+            };
+            self.adapt.record(&probs, kd, accepted, c, draft_secs - secs + share, tail_secs);
         }
-        if self.opts.cost_aware {
+        if sweep() {
+            self.k_cur = st.rounds % (self.opts.draft_tokens + 1);
+        } else if self.opts.cost_aware {
             self.k_cur = self.adapt.choose(self.opts.draft_tokens);
         }
         out
     }
+}
+
+/// Debug (`OXINFER_SPEC_SWEEP`): rounds verify 0, 1, ... up to the most drafts in turn, every
+/// draft of a round verified, to measure verification costs by length (with
+/// `OXINFER_DEBUG_DRAFT`, which prints each round's).
+fn sweep() -> bool {
+    static S: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *S.get_or_init(|| std::env::var_os("OXINFER_SPEC_SWEEP").is_some())
 }
 
 /// Snapshots ([`crate::snapshot`]): the target's session, the draft's context cache and the
@@ -4424,7 +4438,10 @@ mod tests {
         assert_eq!(a.cut(&[0.999; 7], 0.010), 7);
         assert_eq!(a.cut(&[0.05; 7], 0.010), 0);
         assert_eq!(a.cut(&[0.999, 0.999, 0.05, 0.999, 0.999, 0.999, 0.999], 0.010), 2);
-        // Draft rounds that lose: plain steps, with a probe after 6, then after 12.
+        // Draft rounds that lose: plain steps, with probes as rare as keeps their expected loss
+        // (a draft round's time beyond the plain time of its token: 80 ms, then 67) within 2%
+        // of the plain steps' time, at most every 256 steps, and at most every 4 per draft round
+        // measured (a loss measured on two rounds is no reason to stop looking).
         let mut a = Adaptive::default();
         for _ in 0..2 {
             a.choose(7);
@@ -4435,7 +4452,7 @@ mod tests {
             a.record(&[], 0, 0, 1, 0.0, 0.010);
         }
         let mut drafts = Vec::new();
-        for r in 0..30 {
+        for r in 0..600 {
             let k = a.choose(7);
             if k > 0 {
                 drafts.push(r);
@@ -4444,7 +4461,27 @@ mod tests {
                 a.record(&[], 0, 0, 1, 0.0, 0.010);
             }
         }
-        assert_eq!(drafts, [4, 17], "probes at {drafts:?}");
+        assert_eq!(drafts[0], 6, "probes at {drafts:?}");
+        let gaps: Vec<usize> = drafts.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps.windows(2).all(|g| g[1] > g[0]) && drafts.len() < 20, "probes at {drafts:?}");
+        // Draft rounds that lose little are probed often.
+        let mut a = Adaptive::default();
+        for _ in 0..2 {
+            a.choose(7);
+            a.record(&[0.5; 7], 7, 0, 2, 0.002, 0.019);
+        }
+        for _ in 0..2 {
+            a.choose(7);
+            a.record(&[], 0, 0, 1, 0.0, 0.010);
+        }
+        let probes = (0..100)
+            .filter(|_| {
+                let k = a.choose(7);
+                a.record(&[], 0, 0, 1, 0.0, 0.010);
+                k > 0
+            })
+            .count();
+        assert!(probes >= 8, "{probes} probes");
     }
 
     /// Greedy DSpark decoding with the cost-aware policy (rounds with and without drafts, blocks

@@ -651,6 +651,18 @@ impl<'a> Model<'a> {
         feats: &mut Vec<f32>,
         fast: bool,
     ) -> Option<Vec<f32>> {
+        self.gpu_verify_hidden(sess, tokens, layers, feats, fast).map(|r| r.1)
+    }
+
+    /// [`Model::gpu_verify`] that also returns the final-normed hidden states `[t, hidden]`.
+    pub(super) fn gpu_verify_hidden(
+        &self,
+        sess: &mut Session,
+        tokens: &[u32],
+        layers: &[usize],
+        feats: &mut Vec<f32>,
+        fast: bool,
+    ) -> Option<(Vec<f32>, Vec<f32>)> {
         let t = tokens.len();
         if t == 0 || t > 16 || sess.iv.active() || layers.contains(&0) || self.cfg.bidirectional() {
             return None;
@@ -729,7 +741,7 @@ impl<'a> Model<'a> {
                 feats[(j * nf + fi) * h..(j * nf + fi + 1) * h].copy_from_slice(&captured[(j * nc + ci) * h..(j * nc + ci + 1) * h]);
             }
         }
-        Some(logits)
+        Some((hidden, logits))
     }
 
     /// Runs token `tok` through the GPU decode plan: the final-normed hidden state and, if

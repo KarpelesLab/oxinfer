@@ -2018,6 +2018,20 @@ impl<'a> Model<'a> {
         l
     }
 
+    /// A speculative verification pass (at most 16 tokens): the final-normed hidden states `[t,
+    /// hidden]` and the logits `[t, vocab]` of every token, each as a one-token step would give
+    /// them (on the GPU, the multi-token decode plan, whose one-token class is plain decoding's
+    /// kernels; on the CPU, the batch-invariant decode kernels up to
+    /// [`crate::kernels::decode_max_tokens`] tokens).
+    pub fn verify_hidden(&self, sess: &mut Session, tokens: &[u32]) -> (Vec<f32>, Vec<f32>) {
+        if let Some(r) = self.gpu_verify_hidden(sess, tokens, &[], &mut Vec::new(), false) {
+            return r;
+        }
+        let hs = self.forward_hidden_cpu(sess, tokens, &[]);
+        let logits = self.logits(&hs, tokens.len());
+        (hs, logits)
+    }
+
     /// Runs `tokens` through the decoder and returns the final-normed hidden states `[t, hidden]`.
     pub fn forward_hidden(&self, sess: &mut Session, tokens: &[u32]) -> Vec<f32> {
         self.forward_hidden_mm(sess, tokens, &[])

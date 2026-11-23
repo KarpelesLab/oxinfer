@@ -111,6 +111,7 @@ pub mod sd3;
 pub mod server;
 pub mod snac;
 pub mod snapshot;
+pub mod spec_cost;
 pub mod step1x;
 pub mod step_cache;
 pub mod stream;
