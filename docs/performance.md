@@ -691,7 +691,9 @@ kernel with the engine option `prefill_gemm` (`--prefill-gemm`, `OXINFER_PREFILL
   `SDOT` by element multiplies four activation bytes of one token against four rows. The
   activations are an int8 value plus an int8 rounding residual per block of 32 (about 16-bit).
 - `int8`: the same with the value plane only (the decode kernels' rounding, and llama.cpp's for
-  its repacked formats). Also on x86-64 with AVX-512 VNNI (`vpdpbusd`; see
+  its repacked formats). On aarch64 Linux it is cache-blocked by columns and runs on `SMMLA`
+  where the CPU has i8mm, with the same bits (see
+  [DGX Spark CPU](#dgx-spark-cpu-november-2026)). Also on x86-64 with AVX-512 VNNI (`vpdpbusd`; see
   [x86-64 CPU prefill](#x86-64-cpu-prefill-november-2026)); `hybrid` and `int8x2` are the f32
   GEMM there.
 - `f32`: dequantized weights times f32 activations on the NEON / AVX2 FMA GEMM (the previous
@@ -1319,6 +1321,264 @@ Llama-3.2-1B Q4_K_M 5173-5243 / 4137-4188 / 177-179 (pp512 / pp2048 / decode) ag
 figure, weights held twice, copies of pages not yet mapped, memory the GPU reads in place), what
 was measured and kept or not, and where the remaining time goes:
 [DGX Spark](platforms.md#cuda-speed-and-memory-on-the-gb10).
+
+#### DGX Spark CPU (November 2026)
+
+An NVIDIA DGX Spark: 10 Cortex-X925 (3.9 GHz, 2 MiB of L2 each) and 10 Cortex-A725 (2.8 GHz,
+512 KiB of L2 each), aarch64 Linux (Ubuntu 24.04, kernel 6.17), 121 GiB of unified LPDDR5x.
+`--devices` reports `neon dotprod i8mm bf16 fp16 sve sve2`; there is no SME, and the SVE vectors
+are 128 bits on both kinds of core. CPU only (`device=cpu`, 20 threads by default; the machine's
+GPU is under [CUDA](platforms.md#cuda)). Two other sessions built and ran models on the same
+machine throughout (load averages 8-21 from them; a lock kept the timed runs themselves apart),
+so the figures are low for this CPU and only interleaved runs compare.
+`examples/parity_bench.rs` as in the matrix (`lookup=0 draft=none mtp=0`, a warm-up pass per
+size, then one run), the configurations alternated over three rounds: the median, with the
+lowest and highest of the three in brackets. "Before" is master `a3284a2`; llama.cpp is master
+`94f3af3` (2026-11-22) built on the machine without CUDA, `llama-bench -r 1` on 10 and on 20
+threads in the same rounds. Prompt processing, tok/s:
+
+| model | pp512 before | after | llama.cpp 10 thr | 20 thr |
+|---|---|---|---|---|
+| Llama-3.2-1B Q4_K_M (bartowski) | 857 [821-859] | 1370 [1356-1377] | 270 [221-277] | 342 [317-355] |
+| Llama-3.2-1B Q8_0 | 866 [849-879] | 1546 [1522-1578] | 283 [278-288] | 352 [348-358] |
+| Qwen3.5-9B `--quant q4` | 184 [182-184] | 302 [299-304] | | |
+| Qwen3.5-9B `--quant q8` | 182 [179-185] | 289 [288-292] | | |
+| Qwen3.8-27B UD-Q3_K_XL (unsloth GGUF) | 48.3 [43.9-48.3] | 76.2 [71.5-76.5] | 6.2, 6.3 | 8.4 [8.4-8.4] |
+| Qwen3.8-27B UD-Q4_K_M (one round) | 47.8 | 82.8 | | 12.9 |
+
+| model | pp2048 before | after | llama.cpp 10 thr | 20 thr |
+|---|---|---|---|---|
+| Llama-3.2-1B Q4_K_M | 630 [589-643] | 1029 [1027-1063] | 253 [208-259] | 323 [300-330] |
+| Llama-3.2-1B Q8_0 | 646 [627-648] | 1158 [1147-1180] | 269 [265-269] | 335 [332-336] |
+| Qwen3.5-9B `--quant q4` | 176 [176-177] | 279 [278-282] | | |
+| Qwen3.5-9B `--quant q8` | 173 [172-175] | 274 [270-274] | | |
+| Qwen3.8-27B UD-Q3_K_XL | 47.1 [46.1-47.4] | 73.0 [69.3-73.4] | 6.2 (one round) | |
+| Qwen3.8-27B UD-Q4_K_M (one round) | 47.1 | 79.5 | | |
+
+Decoding (64 tokens after a 16-token prompt for Llama 1B, 32 for the 9B, 24 for the 27B), tok/s:
+
+| model | before | after | llama.cpp 10 thr | 20 thr |
+|---|---|---|---|---|
+| Llama-3.2-1B Q4_K_M | 118 [112-119] | 120 [118-122] | 103 [69-111] | 40.9 [13.0-41.9] |
+| Llama-3.2-1B Q8_0 | 81.9 [79.2-82.0] | 81.0 [79.7-81.5] | 71.6 [71.3-72.8] | 32.7 [31.7-36.3] |
+| Qwen3.5-9B `--quant q4` | 25.0 [24.9-25.4] | 25.2 [25.1-25.2] | | |
+| Qwen3.5-9B `--quant q8` | 13.4 [13.0-13.6] | 13.4 [13.4-13.5] | | |
+| Qwen3.8-27B UD-Q3_K_XL | 7.1 [6.9-7.2] | 7.2 [7.0-7.2] | 4.7, 4.5 | 4.9 [4.8-4.9] |
+| Qwen3.8-27B UD-Q4_K_M (one round) | 7.3 | 7.3 | | 5.6 |
+
+(The 27B's llama.cpp runs take minutes each at these speeds, so its 10-thread column has two
+rounds at 512 tokens and one at 2048. The "after" column of Llama-3.2-1B Q4_K_M is the same
+binary as the others; its three rounds ran in the group of the per-change runs below. The
+"after" columns were measured before the f32 GEMM change below, which leaves this path alone:
+the two builds alternated three more rounds at 1411 / 1082 against 1389 / 1073 on Llama 1B
+Q4_K_M, pp512 78.0 against 76.5 on the 27B and 305 against 302 on the 9B q4.) So a prompt
+runs 1.55-1.8x faster than before on every model, and decoding is unchanged, as it should be:
+nothing in it was touched, and it is bound by memory (below). Against llama.cpp at its better
+thread count the prompt is 3.2-4.4x faster on Llama 1B and 6.4-9.1x on the 27B files, and
+decoding 1.1-1.5x faster. llama.cpp's prompt processing gains 24-35% from the second ten
+threads and its decoding falls to 0.4-0.5x with them on Llama 1B (level on the 27B).
+
+What changed. All of it applies on aarch64 Linux only: Apple's cores, Android and Windows keep
+the kernels and defaults they had, since none of this could be measured on them, and x86-64 has
+its own kernels.
+
+- **Int8 prefill GEMM** (`src/kernels_i8gemm.rs`; `fast`, the default of a language model's
+  prompt, and `int8`): two changes, neither of which moves a bit of the result.
+  *Column blocks.* Each tile of 4 rows used to pass over every token of its pool job, so every
+  4 rows read the job's int8 activations again: 4.5 MB for 256 tokens of the 27B's 17408-wide
+  matrices, more than a core's L2 here. A job is now a group of 32 rows, unpacked once, and the
+  columns go in blocks of 512: the group's weights of one block (16 KiB) stay in L1 while the
+  job's activations of that block (128 KiB) pass once from L2, the partial f32 sums kept
+  between blocks. *SMMLA.* Where the CPU has i8mm the kernel is `SMMLA` in place of `SDOT` by
+  element: weight rows and tokens go two by two, 8 bytes of each per register, and one
+  instruction adds 32 products into a 2 x 2 tile of int32 sums (8 rows x 4 tokens per kernel
+  call: 8 instructions per 8 inputs, from 4 weight and 2 activation loads). The integer sums
+  per block of 32 (per 16 for the formats with a scale per 16) and the f32 operations after
+  them are the SDOT kernel's, in the same order. `examples/gemm_bench.rs`, one core, 512 x
+  2048, 256 tokens, SDOT with column blocks against SMMLA: Q4_K 310 -> 394, Q6_K 272 -> 370,
+  Q8_0 334 -> 458 GFLOP/s on a Cortex-X925 and 99 -> 129, 91 -> 112, 109 -> 149 on a
+  Cortex-A725. On 20 threads at 256 tokens (Q4_K, two passes at load averages 17-18, both
+  given), master against this: 5120 x 17408 1.50 / 1.59 -> 3.91 / 3.89 TFLOP/s, 17408 x 5120
+  3.15 / 2.98 -> 4.63 / 4.62, 4096 x 4096 2.68 / 2.68 -> 3.96 / 3.96, 2048 x 8192 1.71 / 1.74
+  -> 3.29 / 3.26, 2048 x 2048 2.92 / 3.01 -> 3.10 / 3.29.
+- **Prompt attention as the per-head loop.** [CPU round 3](#cpu-round-3-november-2026) moved
+  the Qwen-family prompt attention (which GGUF Llama files also take) to score and value GEMMs.
+  As on x86-64, the loop it replaced is faster here once it has kernels: `kernels::dots` scores
+  eight keys at a time per head and `kernels::weighted_values` keeps the output sums of up to
+  four heads that share a value row in registers over 16 columns while the keys pass (NEON,
+  the scalar loops' bits), and a prompt chunk goes through `model::attention_blocked`: the
+  query heads of one KV head for 8 tokens take the keys, then the values, in chunks of about
+  32 KiB, instead of every token streaming all the keys and values it sees. The loop gives a
+  prompt chunk the bits of one-token attention; the GEMMs summed in another order. One round
+  on Llama-3.2-1B Q4_K_M with an earlier build of the int8 GEMM, pp512 / pp2048: the GEMMs
+  971 / 600, the loop with its kernels one token at a time 966 / 659, in blocks 1345 / 1048.
+- **f32 prefill GEMM** (`prefill_gemm=exact`, and float-stored weights in any mode). The same
+  fault: every 8 rows streamed the whole packed prompt (18 MB at 256 tokens x 17408 inputs)
+  from memory, so 20 threads ran at what the memory delivers. It is cache-blocked by columns
+  now as the AVX-512 one is (`gemm_blocked` in `kernels.rs`, 8 rows x 8 tokens per step): a
+  pool job of 32 rows x 256 tokens dequantizes 8 rows of a 256-column block (8 KiB), multiplies
+  them with the job's token panels of that block (256 KiB, in L2) and keeps its partial sums
+  between blocks; bf16 weights take the same path. Each output is still one fused multiply-add
+  chain over the columns in order, so the results are bit-identical (unit test against the 8x8
+  GEMM over whole rows, and the logits below). `gemm_bench`, 20 threads, 256 tokens, two
+  passes at load averages 17-18, master against this: Q4_K 5120 x 17408 0.67 / 0.68 -> 1.54 /
+  1.54 TFLOP/s, 17408 x 5120 0.93 / 0.94 -> 1.62 / 1.64, 4096 x 4096 0.92 / 0.91 -> 1.62 /
+  1.62, 2048 x 8192 0.85 / 0.85 -> 1.15 / 1.15, 2048 x 2048 1.26 / 1.28 -> 1.21 / 1.21 (the
+  one shape whose activations already fit a Cortex-X925's L2); BF16 0.65 / 0.65 -> 1.56 /
+  1.55, 0.91 / 0.99 -> 1.63 / 1.62, 0.96 / 0.98 -> 1.27 / 1.28, 0.78 / 0.77 -> 1.16 / 1.16,
+  1.10 / 1.14 -> 1.17 / 1.18.
+- **`--devices`** prints the kernels a prompt takes here (`kernels: prompt matmuls: int8 GEMM on
+  SMMLA (i8mm), column-blocked; prompt attention: per-head NEON loop`).
+
+Each change of the default path alone, in the same binary with one switch
+(`OXINFER_I8_MMLA=0 OXINFER_I8_KB=0 OXINFER_I8_JOB_ROWS=0`: the previous int8 GEMM;
+`OXINFER_I8_MMLA=0`: the blocked SDOT GEMM; `OXINFER_ATTN_NEON=0`: the GEMM attention;
+`threads=10`), in the rounds of the tables above, tok/s (medians of three, the 27B's of two):
+
+| model | all on | previous int8 GEMM | blocked SDOT GEMM | GEMM attention | 10 threads |
+|---|---|---|---|---|---|
+| Llama-3.2-1B Q4_K_M pp512 / pp2048 | 1378 / 1068 | 1068 / 863 | 1200 / 973 | 1110 / 785 | 1270 / 946 |
+| Llama-3.2-1B Q8_0 pp512 / pp2048 | 1546 / 1158 | 1068 / 871 | 1332 / 1038 | 1178 / 804 | 1202 / 1026 |
+| Qwen3.5-9B `--quant q4` pp512 | 302 | 186 | | 298 | 253 |
+| Qwen3.5-9B `--quant q8` pp512 | 289 | 185 | | 289 | 231 |
+| Qwen3.8-27B UD-Q3_K_XL pp512 | 76.2 | 49.2 | | 76.0 | 65.0 |
+
+(The Q4_K_M row was measured with the pool variant of "not kept" below switched on, in all its
+columns.) The 9B has attention in a quarter of its layers and the 27B's prompt is nearly all
+matmuls, so the attention change is Llama's. Decoding on 10 threads against 20: 117 / 120
+(Llama 1B Q4_K_M), 80.7 / 81.0 (Q8_0), 23.3 / 25.2 and 12.9 / 13.4 (the 9B), 6.0 / 7.2 (the
+27B): every core is worth having, and 20 stays the default.
+
+`prefill_gemm=exact`, which the f32 GEMM serves, tok/s (three rounds; master, then this):
+
+| model | pp512 before | after | pp2048 before | after |
+|---|---|---|---|---|
+| Llama-3.2-1B Q4_K_M | 488 [484-490] | 661 [659-665] | 405 [403-409] | 579 [579-583] |
+| Qwen3.5-9B `--quant q4` | 66.5 [66.3-68.3] | 106 [105-106] | | |
+| Qwen3.8-27B UD-Q3_K_XL | 17.3 [16.3-17.6] | 30.8 [28.2-31.1] | | |
+
+(Llama 1B with the per-head attention and the whole-row GEMM, `OXINFER_GEMM_KB=0`: 536 / 483,
+so the blocks are 1.2x there and the attention 1.1-1.2x.) Float-stored weights take the f32
+GEMM in every mode, so their default prompt gains the same: Qwen3.5-9B without `--quant`
+(bf16), two rounds, pp512 67.8 / 67.3 -> 98.2 / 97.0 tok/s, decoding 8.1 either way.
+
+Results. `examples/qwen_greedy_dump.rs`, a 2,600-character prompt (709 tokens for Llama, 736
+for the Qwen models) fed as one batch and 16 greedy tokens, the 17 logits rows compared byte
+for byte against master:
+
+- `prefill_gemm=exact` with the GEMM attention (`OXINFER_ATTN_NEON=0`): identical on
+  Llama-3.2-1B Q4_K_M, Qwen3.5-9B q4 and bf16 and the 27B UD-Q3_K_XL (and Llama-3.2-1B Q8_0 on
+  the build before the f32 GEMM change), and with `OXINFER_GEMM_KB=0` beside the blocks. So
+  the blocked f32 GEMM changes nothing, and neither does the thread count or the affinity
+  (the same bytes from 10 threads pinned to the Cortex-X925s).
+- `prefill_gemm=int8` with the GEMM attention: identical on the same models, with the SMMLA GEMM
+  and with the blocked SDOT one.
+- The per-head loop in blocks against the same loop one token at a time: identical.
+- The per-head loop against the GEMM attention (what a default run changes), exact GEMMs: the
+  last prompt position's distribution differs by a KL of 4.6e-12 (Llama 1B Q4_K_M), 1.1e-12
+  (Q8_0), 4.3e-8 (the 9B q4) and 1.6e-11 (the 27B), the same figures as on x86-64; the 16 greedy
+  tokens are the same on Llama 1B Q4_K_M and the 9B, and part at a near tie on Q8_0 (the
+  sixth token, 0.138 against 0.136) and on the 27B (the fifth, 0.128 against 0.127).
+- With the int8 GEMM the same change of summation order is amplified by the rounding of the
+  activations at every matmul, as [x86-64 CPU prefill](#x86-64-cpu-prefill-november-2026)
+  describes: KL 4.6e-3, 1.1e-3, 3.5e-3 and 9.5e-4 against master's int8 prefill, where the
+  int8 prefill is 3.7e-3, 1.5e-4, 3.1e-3 and 2.4e-3 from the exact one of the same build; the
+  top token of the last prompt position is the same in all of them.
+
+Where the time goes (`--profile`, one run of master and one of this under the lock, 20
+threads, load averages 8-16):
+
+- Llama-3.2-1B Q4_K_M, 2503-token prompt: 1.8 -> 1.1 ms per token (542 -> 928 tok/s), the
+  matmuls 1.5 -> 0.6 and attention 0.9 -> 0.4 (the two timers overlap in master's GEMM
+  attention). Then 24 tokens at that context: 13.4 -> 12.2 ms each, the matmuls 8.7 -> 8.2
+  (0.80 GB per token at 92-97 GB/s), attention 4.1 -> 3.5, the LM head 1.9.
+- Qwen3.5-9B q4, 736 tokens: 5.5 -> 3.4 ms per token, the matmuls 4.9 -> 2.7, attention and
+  the Gated DeltaNet 0.5. Decoding 40-42 ms per token, the matmuls 36-37 of it: 4.46 GB per
+  token at 120-123 GB/s.
+- The 27B UD-Q3_K_XL, 736 tokens: 21.1 -> 14.7 ms per token, the matmuls 19.4 -> 12.8,
+  attention and the Gated DeltaNet 1.5 -> 1.3. Decoding 143-150 ms per token, the matmuls
+  133-140 of it (12.2 GB per token at 87-92 GB/s), the LM head 7, attention and the states 7.
+
+So a prompt is the int8 GEMM (87% of the 27B's time, 79% of the 9B's, about half of Llama
+1B's), which now runs at 3.3-4.6 TFLOP/s on 20 threads against 10 x 0.39-0.46 + 10 x 0.13-0.15
+for its kernel on one core of each kind; and decoding is the reading of the weights.
+
+What the machine gives:
+
+- `membench`: 33.5 GB/s of plain reads on one thread, 63 on 2, 99-107 on 4, 128 on 8 and
+  126-131 on 12 to 18; the bf16 matvec 127-134 GB/s on 12 to 18 threads. `matvec_bench` (a 2 GB
+  ring of Q4_K matrices, so every call reads from memory): 5120 x 17408 at 65 / 107 / 102 /
+  108 / 116 / 113 GB/s on 4 / 8 / 10 / 12 / 16 / 20 threads against 123-131 of plain
+  streaming. The 9B q4 decodes at that wall (4.46 GB per token at 120-123 GB/s in the
+  matmuls); the 27B UD-Q3_K_XL at 87-92 GB/s is short of it because its formats (Q3_K and the
+  i-quants) cost more per byte: `kernel_bench`, 5120 x 17408, one token, ns per 256 weights on 20 threads / one
+  Cortex-X925 / one Cortex-A725: Q4_K 1.01 / 5.1 / 13.4, IQ4_XS 1.01 / 4.8 / 13.8, Q3_K 1.02 /
+  8.2 / 26.6, IQ3_XXS 1.04 / 12.6 / 31.4 (Q3_K's 110 bytes in 1.02 ns are 108 GB/s, IQ3_XXS's
+  98 bytes 94 GB/s).
+- The multiply-add instructions alone, operands in L1, one core (a C probe, GCC 13 `-O3`,
+  eight accumulators), instructions per ns and products per ns on a Cortex-X925 / a
+  Cortex-A725: `SDOT` with both operands loaded 7.3 and 116 / 3.4 and 55; `SDOT` by element,
+  one load per four 14.6 and 233 / 5.5 and 88; `SMMLA` with both operands loaded 7.5 and 240 /
+  2.9 and 94; SVE `SDOT` 7.0 and 112 / 2.9 and 46; `FMLA` 7.3 and 29 / 2.8 and 11; `BFDOT` 7.3
+  and 58 / 3.3 and 27; `BFMMLA` 7.3 and 116 / 2.8 and 45. So `SMMLA` issues at `SDOT`'s rate
+  here for twice the products (on Apple's cores at half the rate,
+  [CPU round 3](#cpu-round-3-november-2026)), SVE at 128 bits gives what NEON gives, and the
+  SMMLA GEMM's 458 GFLOP/s on Q8_0 is 229 G products/s, at the instruction's rate.
+- Cores: a Cortex-A725 runs the int8 GEMM at a third of a Cortex-X925's speed (129 against
+  394 GFLOP/s on Q4_K) and the f32 GEMM at 0.28x (41 against 146), where the kernel's
+  `cpu_capacity` says 0.70.
+
+Measured and not kept:
+
+- **Keeping the slow cores off the end of a parallel region.** The pool hands out blocks one
+  at a time, so a slower core takes fewer; what remains is a block taken by a slow core near
+  the end, which the others wait for. A variant in which workers that find themselves on a
+  Cortex-A725 (`sched_getcpu` against `cpu_capacity`) leave the last 30 blocks of a region to
+  the others: pp512 / pp2048 1378 / 1068 against 1370 / 1029 (Llama 1B Q4_K_M), 1581 / 1202
+  against 1546 / 1158 (Q8_0), pp512 299 against 302 and 296 against 289 (the 9B), 78.8 against
+  76.2 (the 27B); decoding 119 / 120, 80.1 / 81.0, 23.9 / 25.2, 13.3 / 13.4, 7.2 / 7.2. From
+  -1% to +4% on prompts and 0 to -5% on decoding, inside the spread of a shared machine: the
+  pool is as it was.
+- **10 threads**, one per Cortex-X925: the table above (0.78-0.92x on prompts, 0.83-1.0x
+  decoding); pinned to those cores (`taskset`) master ran Llama 1B Q4_K_M at 612 / 542 tok/s
+  and 108 decoding against 735 / 593 and 114 on 20 threads.
+- **Transparent huge pages** for the weights (the system has them on `madvise`):
+  `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`, which makes malloc ask for them, changed neither
+  the plain reads (128-131 GB/s on 12 threads and 34 on one, either way) nor the bf16 matvec
+  (127 -> 134 on 12 threads, 133 -> 132 on 18): decoding is at the memory's rate, not the
+  TLB's. Nothing was added to the loader.
+- **SVE / SVE2 kernels**: 128-bit vectors that issue no faster than NEON's (the probe above).
+- **bf16 instructions**: `BFMMLA` multiplies four times `FMLA`'s products per instruction at
+  the same rate, but on operands rounded to bf16 (8 bits of mantissa), which is neither the
+  exact GEMM nor the documented int8 rounding; no kernel was built on it.
+- **Two tiles per call in the SDOT kernel** (8 chains instead of 4): +10% on a Cortex-X925 and
+  +4% on a Cortex-A725 for Q4_K and Q8_0, 0.66x / 0.76x for Q6_K, whose sums per 16 inputs no
+  longer fit the registers. Kept for the formats without them, where the CPU has no i8mm.
+- **Other SMMLA tiles** (row pairs x token pairs per call, one Cortex-X925, Q4_K / Q6_K /
+  Q8_0 GFLOP/s): 4 x 2, the one kept, 394 / 370 / 458; 4 x 3 399 / 328 / 433; 4 x 4 398 / 195
+  / 428; 2 x 2 342 / 322 / 402; 2 x 3 366 / 360 / 434; 2 x 4 369 / 338 / 440.
+- **Other blocks for the int8 GEMM** (20 threads, 256 tokens, Q4_K, 5120 x 17408, second of
+  two passes): 32-row jobs with 512 columns 3.95 TFLOP/s, with 1024 columns 3.57, with 2048
+  3.46; 16-row jobs 2.60; 64-row jobs 3.57-3.73. The 2048-wide shapes were within the noise
+  of each other.
+
+Where oxinfer is still behind or bound on this machine:
+
+- **Decoding** is where a model's weights leave memory at 113-130 GB/s, and the low-bit
+  formats do not reach that: the 27B UD-Q3_K_XL streams 87-92 GB/s, where the Q3_K and
+  IQ3_XXS decode kernels take 1.6x and 2.5x Q4_K's time per weight on a Cortex-X925. Their
+  unpackers are the place to look for that file; the Q4 and Q8 models are at the memory's
+  rate.
+- **The exact GEMM** stays 2.1-2.9x slower than the int8 one (pp512 661 against 1370 on Llama
+  1B, 106 against 302 on the 9B, 30.8 against 76.2 on the 27B): an `FMLA` multiplies 4
+  products where an `SMMLA` multiplies 32, and there is no SME here to make up for it.
+- **Prompts** are at the SMMLA instruction's rate on the Cortex-X925s, so what is left is
+  outside the GEMM: on Llama 1B the attention (0.4 of 1.1 ms per token at 2.5k tokens) and
+  the dequantization of activations and rows around the kernel; and a Cortex-A725 adds a
+  third of a big core where its two vector pipelines allow no more.
+- Not measured here: mixture-of-experts files (their grouped GEMM takes the same int8 kernel),
+  Gemma (whose prompt attention was `attention_prefill` already and still is), and anything
+  with the machine to itself.
 
 #### Earlier comparisons (llama-server, op-by-op Metal prefill)
 
