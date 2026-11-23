@@ -1329,6 +1329,8 @@ kernel void dec_add_norm_t(device const float* y [[buffer(0)]], device float* x 
 kernel void pf_add_norm_half(device const float* y [[buffer(0)]], device float* x [[buffer(1)]], device float* out [[buffer(2)]],
                              device const float* wy [[buffer(3)]], device const float* wn [[buffer(4)]], constant AN& p [[buffer(5)]],
                              constant uint4& ts [[buffer(6)]], device half* xh [[buffer(7)]], device float* rs [[buffer(8)]],
+                             constant uint4& ex [[buffer(9)]], device float* o2 [[buffer(10)]], device const float* w2 [[buffer(11)]],
+                             device float* o3 [[buffer(12)]], device const float* w3 [[buffer(13)]],
                              uint r [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                              uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float red[8];
@@ -1368,6 +1370,10 @@ kernel void pf_add_norm_half(device const float* y [[buffer(0)]], device float* 
     s2 = ((red2[0] + red2[1]) + (red2[2] + red2[3])) + ((red2[4] + red2[5]) + (red2[6] + red2[7]));
     float k2 = rsqrt(s2 / float(p.n) + p.eps);
     float m = 0.f;
+    // ex.x more norms of x (the new residual): rows ex.y / ex.z floats apart, with weights where
+    // bit j of ex.w is set.
+    device float4* e2 = (device float4*)(o2 + (ulong)r * ex.y);
+    device float4* e3 = (device float4*)(o3 + (ulong)r * ex.z);
     for (uint j = 0; j < PF_NORM_V; j++) {
         uint i = tid + j * 256;
         if (i < n4) {
@@ -1376,6 +1382,8 @@ kernel void pf_add_norm_half(device const float* y [[buffer(0)]], device float* 
             yv[j] = v;
             float4 a = abs(v);
             m = max(m, max(max(a.x, a.y), max(a.z, a.w)));
+            if (ex.x > 0) e2[i] = (ex.w & 1) != 0 ? xv[j] * k2 * ((device const float4*)w2)[i] : xv[j] * k2;
+            if (ex.x > 1) e3[i] = (ex.w & 2) != 0 ? xv[j] * k2 * ((device const float4*)w3)[i] : xv[j] * k2;
         }
     }
     m = pf_tg_max(m, sg, lane, red3);

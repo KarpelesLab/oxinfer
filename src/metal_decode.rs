@@ -537,6 +537,73 @@ fn pf_moe_tails(g: &Graph) -> Vec<PfTail> {
     v
 }
 
+/// Whether prefill plans' fused AddNorms also make the plain norms of the new residual that
+/// follow (`pf_norm_absorb`; `OXINFER_PF_ABSORB=0`: separate norms).
+fn pf_absorb() -> bool {
+    // (Read as each plan is built, so that `pf_ab` can compare.)
+    std::env::var("OXINFER_PF_ABSORB").map_or(true, |v| v != "0")
+}
+
+/// Norms a prefill plan's fused AddNorms make too (`MOp::AddNormHalf::ex`): for each AddNorm that
+/// takes `pf_add_norm_half` (its next norm feeding the next op's GEMM), up to two later RMSNorms of
+/// its new residual `x` (one row, no add, no pre-scale, the same `n` and `eps`) with only GEMMs,
+/// GLUs and norms of other rows in between, none of which writes `x` or touches the norm's output
+/// (Gemma 4 26B-A4B: the router's input and the experts'). Their sums run in the AddNorm's order,
+/// not `dec_rms_norm`'s.
+fn pf_norm_absorb(g: &Graph) -> Vec<(usize, Vec<usize>)> {
+    let ops = &g.ops;
+    let mut v = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        let Op::AddNorm {
+            x,
+            next: Some((o, _)),
+            n,
+            eps,
+            ..
+        } = *op
+        else {
+            continue;
+        };
+        if !n.is_multiple_of(4)
+            || n > PF_NORM_MAX
+            || !matches!(ops.get(i + 1), Some(Op::Linear { x: lx, n_in, .. }) if *lx == o && *n_in == n)
+        {
+            continue;
+        }
+        let mut found = Vec::new();
+        // Buffers the ops in between must leave alone (the residual and the norms' outputs).
+        let mut keep = vec![x.buf];
+        for (j, op) in ops.iter().enumerate().skip(i + 1) {
+            if found.len() == 2 {
+                break;
+            }
+            match *op {
+                Op::Norm {
+                    x: nx,
+                    out,
+                    pre,
+                    n: nn,
+                    rows: 1,
+                    add: false,
+                    eps: ne,
+                    ..
+                } if nx == x && pre == 1.0 && nn == n && ne == eps && out.buf != x.buf && !keep.contains(&out.buf) => {
+                    found.push(j);
+                    keep.push(out.buf);
+                }
+                Op::Linear { x: lx, y, .. } if !keep.contains(&lx.buf) && !keep.contains(&y.buf) => {}
+                Op::Glu { g: gg, u, out, .. } if !keep.contains(&gg.buf) && !keep.contains(&u.buf) && !keep.contains(&out.buf) => {}
+                Op::Norm { x: nx, out, .. } if !keep.contains(&nx.buf) && !keep.contains(&out.buf) => {}
+                _ => break,
+            }
+        }
+        if !found.is_empty() {
+            v.push((i, found));
+        }
+    }
+    v
+}
+
 /// [`pf_schedule`] places the ops with slack as late as their dependents allow (default), or as
 /// early as their dependences allow (`OXINFER_PF_REORDER=early`).
 fn pf_late() -> bool {
@@ -1699,6 +1766,11 @@ enum MOp {
         wn: usize,
         p: [u32; 4],
         ts: [u32; 4],
+        /// More norms of the new x (see `pf_norm_absorb`): how many, their outputs' strides, and
+        /// bit j set when norm j has weights; their outputs and weights.
+        ex: [u32; 4],
+        ex_out: [usize; 2],
+        ex_w: [usize; 2],
     },
     /// Prefill plans: a Gemma 4 MoE layer's tail (`pf_moe_tail`, see `pf_moe_tails`): the routed
     /// experts `ex`'s outputs combined from the staging, the post norms (weights `wd`, `we`) of
@@ -2379,7 +2451,13 @@ impl MetalBackend {
         } else {
             Vec::new()
         };
-        let tail_skip = |i: usize| tails.iter().any(|t| t.norms.contains(&i));
+        // Prefill plans: norms of a residual absorbed by the AddNorm that makes it.
+        let absorb = if pf && pf_norm_half() && pf_absorb() {
+            pf_norm_absorb(g)
+        } else {
+            Vec::new()
+        };
+        let tail_skip = |i: usize| tails.iter().any(|t| t.norms.contains(&i)) || absorb.iter().any(|a| a.1.contains(&i));
         for (i, op) in g.ops.iter().enumerate() {
             op_mop.push(ops.len());
             if tail_skip(i) {
@@ -3170,6 +3248,22 @@ impl MetalBackend {
                         && n <= PF_NORM_MAX
                         && matches!(g.ops.get(i + 1), Some(Op::Linear { x: lx, n_in, .. }) if *lx == o && *n_in == n)
                     {
+                        // The norms of the new x it absorbs.
+                        let mut ex = [0u32; 4];
+                        let (mut ex_out, mut ex_w) = ([0usize; 2], [0usize; 2]);
+                        let mut wr = vec![rng(x, n), rng(o, n), (PF_RES, 0, usize::MAX)];
+                        for &j in absorb.iter().find(|a| a.0 == i).map_or(&[][..], |a| &a.1[..]) {
+                            let Op::Norm { out: no, ref w, .. } = g.ops[j] else { return None };
+                            let k = ex[0] as usize;
+                            ex[1 + k] = ts(no) as u32;
+                            ex_out[k] = byte(no);
+                            if let Some(w) = w {
+                                ex_w[k] = cst(w);
+                                ex[3] |= 1 << k;
+                            }
+                            ex[0] += 1;
+                            wr.push(rng(no, n));
+                        }
                         emit.push(MOp::AddNormHalf {
                             pipe: self.named_pipeline("pf_add_norm_half")?,
                             y: byte(y),
@@ -3179,10 +3273,13 @@ impl MetalBackend {
                             wn: cst(wn),
                             p: [n as u32, eps.to_bits(), scale.to_bits(), 0],
                             ts: [ts(y) as u32, ts(x) as u32, ts(o) as u32, 0],
+                            ex,
+                            ex_out,
+                            ex_w,
                         });
                         xh_next = Some((o.buf, o.off, n));
                         fused_out = Some(rng(o, n));
-                        break 'an (vec![rng(y, n), rng(x, n)], vec![rng(x, n), rng(o, n), (PF_RES, 0, usize::MAX)]);
+                        break 'an (vec![rng(y, n), rng(x, n)], wr);
                     }
                     emit.push(MOp::AddNorm {
                         pipe: self.named_pipeline("dec_add_norm")?,
@@ -5226,6 +5323,9 @@ impl MetalPlan<'_> {
                 wn,
                 p,
                 ts,
+                ex,
+                ex_out,
+                ex_w,
             } => {
                 e.pipe(*pipe);
                 e.buf(arena, *y, 0);
@@ -5237,6 +5337,11 @@ impl MetalPlan<'_> {
                 e.bytes(ts, 6);
                 e.buf(arena, pf.xh, 7);
                 e.buf(arena, pf.rs, 8);
+                e.bytes(ex, 9);
+                e.buf(arena, ex_out[0], 10);
+                e.buf(consts, ex_w[0], 11);
+                e.buf(arena, ex_out[1], 12);
+                e.buf(consts, ex_w[1], 13);
                 e.dispatch((rows, 1), 256);
             }
             MOp::PfMoeTail {
