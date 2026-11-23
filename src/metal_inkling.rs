@@ -343,7 +343,9 @@ pub(crate) fn shader_src(mma: bool) -> String {
         let n = f.name();
         let _ = writeln!(s, "#define IMVC_{n}(e) {mk}");
         let _ = writeln!(s, "INK_MVC(ink_mvc_{n}, {t}, {x}, {ch}, IMVC_{n})");
-        let _ = writeln!(s, "INK_MVS(ink_mvs_{n}, {t}, {x}, {ch}, IMVC_{n})");
+        for (nr, ks) in super::decode::MV_VARIANTS {
+            let _ = writeln!(s, "INK_MVS(ink_mvs_{n}_{nr}_{ks}, {t}, {x}, {ch}, IMVC_{n}, {nr}, {ks})");
+        }
     }
     if mma {
         s.push_str(PF_SRC);
@@ -601,8 +603,8 @@ struct Dw {
     /// Passes of one token, where the one-token matvec runs a row per SIMD-group: the same
     /// matvec followed by the convolution after the attention (`ink_mvc_*`).
     mvc: Option<Id>,
-    /// Where `mvc` is: the same matvec of a message gate's weighted output, scaled by the gate's
-    /// norm (`ink_mvs_*`, [`InkMetal::attn_fold`]).
+    /// `one`'s matvec of a message gate's weighted output, scaled by the gate's norm (`ink_mvs_*`,
+    /// [`InkMetal::attn_fold`]).
     mvs: Option<Id>,
     multi: [(Id, usize, usize); 2],
     /// Prefill: the matrix-unit GEMM, where the format has one; float32 weights (the loop's
@@ -1431,7 +1433,7 @@ impl InkMetal {
             let mvc = (specialized(w.fmt) && (nr1, ks1) == (1, 1))
                 .then(|| lib.pipeline(be, &format!("ink_mvc_{}", w.fmt.name())))
                 .flatten();
-            let mvs = mvc.and_then(|_| lib.pipeline(be, &format!("ink_mvs_{}", w.fmt.name())));
+            let mvs = lib.pipeline(be, &format!("ink_mvs_{}_{nr1}_{ks1}", w.fmt.name()));
             if profile_every() > 0 {
                 eprintln!(
                     "[inkling profile: matvec [{n_out}, {n_in}] {:?}: pipeline {:#x}]",
@@ -2909,6 +2911,7 @@ impl InkMetal {
                         y as u32,
                         self.eps.to_bits(),
                     ];
+                    let (_, nr, ks) = d.one;
                     e.note(((w.n_out << 44) | (w.n_in << 24) | (d.mvs.unwrap() as usize & 0xff_ffff)) as Id);
                     e.fe().pipe(d.mvs.unwrap());
                     e.buf(w.data, 0, 0);
@@ -2917,7 +2920,7 @@ impl InkMetal {
                     e.bytes(&p, 4);
                     e.buf(w.offs, 0, 7);
                     e.bytes(&sp, 11);
-                    e.dispatch((w.n_out.div_ceil(4), 1), 128);
+                    e.dispatch((w.n_out.div_ceil(nr), 1), 32 * ks);
                 } else {
                     self.mv(e, c, d, xi(gi), y, t, MvMode::Store);
                 }

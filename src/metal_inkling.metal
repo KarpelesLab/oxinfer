@@ -1717,22 +1717,40 @@ kernel void NAME(device const uchar* wb [[buffer(0)]], device const uchar* sb [[
     float v = simd_sum(acc); \
     if (lane == 0 && r < p.n_out) ink_conv_in(a, c, cp, ring, r, 0, v); }
 
-// ---- Passes of one token: the one-token matvec (`ink_mvc_*`'s sums) of a message gate's weighted
-// output (`ink_gfg` with `ss`), scaled by the gate's norm (`sp`: its partial sums, their count, the
-// output's arena offset, eps bits; x at `p.ldy`).
-#define INK_MVS(NAME, T, X, CH, MAKE) \
+// ---- Passes of one token: the decode library's one-token matvec (`mv_body` with NR rows and KS
+// SIMD-groups a threadgroup: the same sums) of a message gate's weighted output (`ink_gfg` with
+// `ss`), scaled by the gate's norm (`sp`: its partial sums, their count, the output's arena offset,
+// eps bits; x at `p.ldy`).
+#define INK_MVS(NAME, T, X, CH, MAKE, NR, KS) \
 kernel void NAME(device const uchar* wb [[buffer(0)]], device const uchar* sb [[buffer(1)]], device float* a [[buffer(2)]], \
                  constant MV& p [[buffer(4)]], device const uchar* ob [[buffer(7)]], constant uint4& sp [[buffer(11)]], \
                  uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], \
                  uint lane [[thread_index_in_simdgroup]]) { \
+    threadgroup float red[2 * NR * KS]; \
     IMvE e = { wb + p.w_off, sb + p.s_off, ob + p.o_off }; \
     T f = MAKE(e); \
-    uint r = tg * 4 + sg; \
+    float acc[NR], acc2[NR]; \
+    for (int r = 0; r < NR; r++) { acc[r] = 0.f; acc2[r] = 0.f; } \
+    mv_acc<T, X, CH, NR, KS>(f, f, false, 0, a + p.ldy, p.n_in, p.n_out, tg * NR, sg, lane, acc, acc2, 1.f); \
+    for (int r = 0; r < NR; r++) acc[r] = simd_sum(acc[r]); \
+    if (KS > 1) { \
+        if (lane == 0) \
+            for (int r = 0; r < NR; r++) red[sg * 2 * NR + r] = acc[r]; \
+        threadgroup_barrier(mem_flags::mem_threadgroup); \
+        if (sg != 0) return; \
+        for (int r = 0; r < NR; r++) { \
+            float v = 0.f; \
+            for (int s2 = 0; s2 < KS; s2++) v += red[s2 * 2 * NR + r]; \
+            acc[r] = v; \
+        } \
+    } \
     float sc = ink_gscale(a, sp.x, sp.y, p.n_in, as_type<float>(sp.w), lane); \
-    float acc = 0.f; \
-    acc += ink_row_acc<T, X, CH>(f, min(r, p.n_out - 1), a + p.ldy, p.n_in / CH, lane, 32); \
-    float v = simd_sum(acc); \
-    if (lane == 0 && r < p.n_out) a[sp.z + r] = v * sc; }
+    uint r0 = tg * NR; \
+    if (lane < uint(NR) && r0 + lane < p.n_out) { \
+        float v = acc[0]; \
+        for (int r = 1; r < NR; r++) if (lane == uint(r)) v = acc[r]; \
+        a[sp.z + r0 + lane] = v * sc; \
+    } }
 
 // ---- Passes of several tokens: rows of `n` floats at `y` (one a token) scaled by their message
 // gate's norm (partials `ss + token * 64`, `np` of them; `ink_mvs_*`'s product). Grid: blocks of 256,
