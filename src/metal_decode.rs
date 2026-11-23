@@ -102,6 +102,10 @@ fn mvk_table(fmt: MvFmt, long: bool, ks: usize, tt: usize) -> (usize, MvkKind) {
             MvFmt::Q4 | MvFmt::Gguf(Q4_0) => (2, Sweeps),
             MvFmt::Gguf(Q8_0) if ks == 1 => (2, Sweeps),
             MvFmt::Gguf(Q8_0) => (2, Float),
+            // Q5_K (DeepSeek V4.1's dense matrices: 32768 x 1280, 1024 x 4096, 5120 x 8192; and
+            // 4096 / 12288 square and wide, 3072 x 2304): sweeps of 4 on two rows, 10-20% faster
+            // than sweeps of 8 at 11 and 16 tokens (`decode_mvk_bench`).
+            MvFmt::Gguf(Q5_K) => (2, Sweeps),
             // Sweeps of 8 tokens (see `mvk_body`).
             _ => (if ks == 1 { 1 } else { 2 }, Half),
         };
@@ -110,6 +114,9 @@ fn mvk_table(fmt: MvFmt, long: bool, ks: usize, tt: usize) -> (usize, MvkKind) {
         MvFmt::Q4 | MvFmt::Gguf(Q4_0) if ks == 1 => (1, Float),
         MvFmt::Q4 | MvFmt::Gguf(Q4_0) => (if long && many { 2 } else { 1 }, Half),
         MvFmt::Gguf(Q4_K) if ks == 1 => (1, Float),
+        // Long Q5_K rows at 6-8 tokens: sweeps of 4 on two rows (5120 x 8192: 8 tokens 306 ->
+        // 277 us, 6 tokens 233 -> 215; 4096 x 12288: 357 -> 334, 278 -> 261).
+        MvFmt::Gguf(Q5_K) if long && many => (2, Sweeps),
         MvFmt::Gguf(Q4_K | Q5_K) => (if long && many { 2 } else { 1 }, h(long)),
         MvFmt::Gguf(Q6_K) => (if ks == 1 { 1 } else { 2 }, Half),
         MvFmt::Gguf(Q8_0) if ks == 1 || tt <= 2 => (1, Half),

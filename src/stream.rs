@@ -571,6 +571,14 @@ impl StreamHook {
     pub fn prefetch_parts(&self, i: usize, ids: &[usize]) {
         self.s.prefetch_parts(self.base + i, ids);
     }
+    /// Starts reading parts `ids` of the model's unit `i` from storage without waiting (advisory
+    /// reads of their pages not in memory, all in flight at once), for experts a pass is likely
+    /// to route to soon: a later [`Self::need_parts`] then waits for reads under way instead of
+    /// starting them. Parts in use or cached are skipped; nothing is accounted to the part
+    /// cache. Returns the bytes requested.
+    pub fn advise_parts(&self, i: usize, ids: &[usize]) -> u64 {
+        self.s.advise_parts(self.base + i, ids)
+    }
     /// The streamer's settings.
     pub fn options(&self) -> &StreamOptions {
         self.s.options()
@@ -997,6 +1005,33 @@ impl Streamer {
             inner.c.stalls.fetch_add(1, Relaxed);
             inner.c.stall_ns.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
         }
+    }
+
+    fn advise_parts(&self, u: usize, ids: &[usize]) -> u64 {
+        let inner = &self.inner;
+        let Some(unit) = inner.units.get(u) else { return 0 };
+        let mut spans = Vec::new();
+        {
+            let pc = inner.parts.lock().unwrap();
+            for &p in ids {
+                let k = (u, p);
+                if p >= unit.parts.len() || pc.in_use.contains(&k) || pc.entries.contains_key(&k) || pc.loading == Some(k) {
+                    continue;
+                }
+                spans.extend_from_slice(&unit.parts[p].spans);
+            }
+        }
+        let page = inner.page;
+        let mut total = 0;
+        for s in spans {
+            // One page of the middle as the probe (as an on-demand request's).
+            if sys::resident_bytes(s.addr + ((s.len / 2) & !(page - 1)), page, page) == Some(page as u64) {
+                continue;
+            }
+            sys::advise(&inner.files[s.file], s);
+            total += s.len as u64;
+        }
+        total
     }
 
     fn prefetch_parts(&self, u: usize, ids: &[usize]) {

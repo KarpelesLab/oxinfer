@@ -102,6 +102,31 @@ fn cold_chunk() -> usize {
     })
 }
 
+/// Most layers ahead whose experts a cold pass predicts ([`Plan::predict`]).
+const PRED_MAX: usize = 4;
+
+/// `OXINFER_DS41_PREDICT=n` (0 to [`PRED_MAX`]): while experts miss, each layer runs the routers
+/// of the next n layers on its own input and the experts they choose that are not in memory are
+/// read ahead (advisory reads, not waited for).
+fn predict_layers() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("OXINFER_DS41_PREDICT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2)
+            .min(PRED_MAX)
+    })
+}
+
+/// `OXINFER_DS41_PREDICT_WAIT=0`: predicted experts are only read ahead, never waited for (by
+/// default those of the layers the next run of a cold pass takes are read and wrapped with its
+/// misses, so that it does not miss them).
+fn pred_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("OXINFER_DS41_PREDICT_WAIT").is_none_or(|v| v != "0"))
+}
+
 /// `OXINFER_DS41_TRACE=1`: one line per step (host and GPU time, misses).
 fn trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -589,6 +614,11 @@ struct Offs {
     cand: Tb,
     /// A pass's expert misses (in the row of its first slot): a count, then layer << 16 | expert.
     miss: Tb,
+    /// Cold passes: the next layers' router logits per token ([`PRED_MAX`] rows of experts), their
+    /// choice, and the predicted experts not in memory (as `miss`).
+    plog: Tb,
+    psel: Tb,
+    pred: Tb,
     hid: Tb,
     logits: Tb,
     /// Token ids (u32): a pass's inputs, or a greedy pass's argmax.
@@ -638,6 +668,9 @@ pub(crate) struct Plan {
     pending: Mutex<Vec<(usize, Vec<usize>)>>,
     /// The last step missed experts: the next runs in chunks of layers.
     cold: std::sync::atomic::AtomicBool,
+    /// Layers ahead whose experts a cold pass predicts, and whether the pass being encoded does.
+    predict: usize,
+    pred_on: std::sync::atomic::AtomicBool,
     lock: Mutex<()>,
     id: u64,
     /// Selectors: `retain`, `GPUStartTime`, `GPUEndTime`.
@@ -1189,6 +1222,9 @@ impl Plan {
             isel: a.tb(n_isrc.max(1) * d.topk),
             cand: a.tb(d.cand.map_or(1, |c| c.1)),
             miss: a.tb(1 + nl * d.k * TMAX),
+            plog: a.tb(PRED_MAX * n_exp),
+            psel: a.tb(2 * d.k + 1),
+            pred: a.tb(1 + nl * PRED_MAX * d.k * TMAX),
             hid: a.tb(h),
             logits: a.tb(d.vocab),
             tok: a.tb(1),
@@ -1253,6 +1289,8 @@ impl Plan {
             wraps: Mutex::new(Wraps::default()),
             pending: Mutex::new(Vec::new()),
             cold: std::sync::atomic::AtomicBool::new(true),
+            predict: predict_layers(),
+            pred_on: std::sync::atomic::AtomicBool::new(false),
             lock: Mutex::new(()),
             id: PLAN_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             s_retain: be.o.sel(c"retain"),
@@ -1507,10 +1545,19 @@ impl Plan {
 
     /// The miss list of the pass whose first slot is `j` (and clears it with `clear`).
     fn misses(&self, j: usize, clear: bool) -> Vec<u32> {
-        let cap = self.layers.len() * self.k * TMAX;
-        // SAFETY: the miss list: a count, then layer << 16 | expert.
+        self.list(self.off.miss.t(j), self.layers.len() * self.k * TMAX, clear)
+    }
+
+    /// A list of (layer, expert) the route kernel appended to at arena byte `at` (of at most
+    /// `cap`), emptied.
+    fn take_list(&self, at: usize, cap: usize) -> Vec<u32> {
+        self.list(at, cap, true)
+    }
+
+    fn list(&self, at: usize, cap: usize, clear: bool) -> Vec<u32> {
+        // SAFETY: the list: a count, then layer << 16 | expert.
         unsafe {
-            let p = contents(self.be, self.arena).add(self.off.miss.t(j)) as *mut u32;
+            let p = contents(self.be, self.arena).add(at) as *mut u32;
             let cnt = (*p as usize).min(cap);
             let v = (0..cnt).map(|i| *p.add(1 + i)).collect();
             if clear {
@@ -1607,13 +1654,16 @@ impl Plan {
         }
         if trace() {
             eprintln!(
-                "[ds41 gpu step {}{}: {:.2} ms, gpu {:.2} ms, {} pass(es), {} misses, wraps {:.2} ms, expert io {:.2} ms, cache bookkeeping {:.2} ms]",
+                "[ds41 gpu step {}{}: {} distinct experts, {:.2} ms, gpu {:.2} ms, {} pass(es), {} misses, {} predicted ({:.0} MB read ahead), wraps {:.2} ms, expert io {:.2} ms, cache bookkeeping {:.2} ms]",
                 inp.pos,
                 if nt > 1 { format!(" (+{} tokens)", nt - 1) } else { String::new() },
+                self.used(s0, nt).iter().map(|(_, v)| v.len()).sum::<usize>(),
                 t0.elapsed().as_secs_f64() * 1e3,
                 sx.gpu * 1e3,
                 sx.passes,
                 sx.missed,
+                sx.pred,
+                sx.pred_bytes as f64 / 1e6,
                 tw * 1e3,
                 sx.tio * 1e3,
                 sx.tbk * 1e3
@@ -1648,31 +1698,73 @@ impl Plan {
             nl
         };
         let mut upto = upto.unwrap_or(chunk.min(nl));
+        self.pred_on.store(
+            chunk < nl && hook.is_some() && self.predict > 0,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.take_list(self.off.pred.t(g.s0), nl * PRED_MAX * self.k * TMAX);
+        let split = |list: &[u32], keep: &dyn Fn(usize, usize) -> bool| {
+            let mut by_layer: Vec<Vec<usize>> = vec![Vec::new(); nl];
+            for &m in list {
+                let (l, e) = ((m >> 16) as usize, (m & 0xffff) as usize);
+                if l < nl && e < self.n_exp && !by_layer[l].contains(&e) && keep(l, e) {
+                    by_layer[l].push(e);
+                }
+            }
+            by_layer
+        };
+        // Predicted experts of the layers after the next run's: read while it runs.
+        let mut ahead: Vec<Vec<usize>> = vec![Vec::new(); nl];
+        let mut read_ahead = false;
         loop {
+            if std::mem::take(&mut read_ahead)
+                && let Some(hk) = hook
+                && !self.sync_wraps(wraps, Some(hk), &[])
+            {
+                return false;
+            }
+            let pred = self.take_list(self.off.pred.t(g.s0), nl * PRED_MAX * self.k * TMAX);
+            let mut need = split(&miss, &|_, _| true);
             if !miss.is_empty() {
                 sx.missed += miss.len();
-                let Some(hk) = hook else {
-                    // Every expert is wrapped without a streamer: a miss is a failed wrap.
-                    return false;
-                };
-                if sx.passes > 4 * nl {
+                if hook.is_none() || sx.passes > 4 * nl {
+                    // (Every expert is wrapped without a streamer: a miss is a failed wrap.)
                     return false;
                 }
+                from = need.iter().position(|v| !v.is_empty()).unwrap_or(0).min(from);
+            }
+            if let Some(hk) = hook
+                && (!miss.is_empty() || !pred.is_empty())
+            {
                 let ti = Instant::now();
-                let mut by_layer: Vec<Vec<usize>> = vec![Vec::new(); nl];
-                for &m in &miss {
-                    let (l, e) = ((m >> 16) as usize, (m & 0xffff) as usize);
-                    if l < nl && e < self.n_exp && !by_layer[l].contains(&e) {
-                        by_layer[l].push(e);
+                // Experts the layers run predicted for the layers after them: read with the
+                // misses (and waited for) for the layers the next run takes, so that they do not
+                // miss; read ahead (not waited for) for the layers after.
+                let pred = split(&pred, &|l, e| l >= from && !wraps.map.contains_key(&(l, e)));
+                for (l, ids) in pred.into_iter().enumerate() {
+                    for e in ids {
+                        if need[l].contains(&e) {
+                            continue;
+                        }
+                        sx.pred += 1;
+                        if l < upto && pred_wait() {
+                            need[l].push(e);
+                        } else {
+                            sx.pred_bytes += hk.advise_parts(l, &[e]);
+                            if !ahead[l].contains(&e) {
+                                ahead[l].push(e);
+                            }
+                        }
                     }
                 }
-                for (l, ids) in by_layer.iter().enumerate() {
+                // Every read requested before any is waited for.
+                for (l, ids) in need.iter().enumerate() {
                     if !ids.is_empty() {
-                        hk.prefetch_parts(l, ids);
+                        hk.advise_parts(l, ids);
                     }
                 }
                 let mut extra = Vec::new();
-                for (l, ids) in by_layer.iter().enumerate() {
+                for (l, ids) in need.iter().enumerate() {
                     if ids.is_empty() {
                         continue;
                     }
@@ -1689,9 +1781,10 @@ impl Plan {
                 // (Parts the cache would not keep, being full of parts in use, are dropped by the
                 // next sync, after this pass.)
                 sx.tio += ti.elapsed().as_secs_f64();
-                from = by_layer.iter().position(|v| !v.is_empty()).unwrap_or(0).min(from);
             }
-            // The part cache's bookkeeping of the last step's experts, while the GPU runs.
+            // While the GPU runs: the part cache's bookkeeping of the last step's experts, and the
+            // reads of the experts predicted for the layers after this run (into the part cache:
+            // the next sync wraps them, before the run that uses them).
             let (ok, gpu) = self.run(st, g, from, upto, want, &mut || {
                 if let Some(hk) = hook {
                     let ti = Instant::now();
@@ -1701,6 +1794,17 @@ impl Plan {
                         hk.leave(l);
                     }
                     sx.tbk += ti.elapsed().as_secs_f64();
+                    let ti = Instant::now();
+                    for (l, ids) in ahead.iter_mut().enumerate() {
+                        if l >= upto && !ids.is_empty() {
+                            hk.begin(l);
+                            hk.need_parts(l, ids);
+                            hk.leave(l);
+                            read_ahead = true;
+                        }
+                        ids.clear();
+                    }
+                    sx.tahead += ti.elapsed().as_secs_f64();
                 }
             });
             sx.gpu += gpu;
@@ -1721,6 +1825,7 @@ impl Plan {
             }
         }
         self.cold.store(sx.missed > 0, std::sync::atomic::Ordering::Relaxed);
+        self.pred_on.store(false, std::sync::atomic::Ordering::Relaxed);
         true
     }
 
@@ -2369,9 +2474,46 @@ impl Plan {
                 (c, lp.c_shared_limit),
             );
         }
+        // Cold: the next layers' routers on this layer's input, for the experts to read ahead.
+        let ahead: Vec<usize> = if self.pred_on.load(std::sync::atomic::Ordering::Relaxed) {
+            (l + 1..(l + 1 + self.predict).min(self.layers.len())).collect()
+        } else {
+            Vec::new()
+        };
+        if !ahead.is_empty() {
+            let e = r.e();
+            for (i, &la) in ahead.iter().enumerate() {
+                let y = (a, o.plog.t(g.s0) + i * self.n_exp * 4, o.plog.n);
+                self.mvn(&e, &self.layers[la].router, None, None, nt, xf, y, MvMode::Store, (a, 0));
+            }
+        }
         r.barrier("router");
         {
             let e = r.e();
+            for (i, &la) in ahead.iter().enumerate() {
+                let lq = &self.layers[la];
+                for j in toks.clone() {
+                    e.buf(a, o.plog.t(j) + i * self.n_exp * 4, 0);
+                    e.buf(c, lq.c_bias.unwrap_or(0), 1);
+                    e.buf(lq.tabs[0], 0, 2);
+                    e.buf(a, o.psel.t(j), 3);
+                    e.buf(a, o.pred.t(g.s0), 4);
+                    e.bytes(
+                        &RouteP {
+                            n: self.n_exp as u32,
+                            k: k as u32,
+                            rsf: self.rsf,
+                            limit: self.limit,
+                            scoring: self.scoring,
+                            norm: self.norm_topk as u32,
+                            layer: la as u32,
+                            has_bias: lq.c_bias.is_some() as u32,
+                        },
+                        5,
+                    );
+                    self.d(&e, P_ROUTE, (1, 1), 32);
+                }
+            }
             for j in toks.clone() {
                 e.buf(a, o.rlog.t(j), 0);
                 e.buf(c, lp.c_bias.unwrap_or(0), 1);
@@ -2405,6 +2547,21 @@ impl Plan {
                 (a, 0),
             );
         }
+        self.encode_experts(r, l, g);
+        r.barrier("hc post");
+        {
+            let e = r.e();
+            for j in toks {
+                self.hc_post(&e, o.xa_res.t(j), o.y1.t(j), Some(o.y2.t(j)), o.mix[l][1].t(j), o.x[l + 1].t(j));
+            }
+        }
+    }
+
+    /// The routed experts of layer `l`, token by token on the one-token kernels.
+    fn encode_experts(&self, r: &mut Rec, l: usize, g: Geo) {
+        let lp = &self.layers[l];
+        let (a, o, h, k) = (self.arena, &self.off, self.h, self.k);
+        let toks = g.s0..g.s0 + g.nt;
         r.barrier("experts");
         {
             let e = r.e();
@@ -2442,7 +2599,7 @@ impl Plan {
                 ..Default::default()
             };
             e.pipe(lp.sum.0);
-            for j in toks.clone() {
+            for j in toks {
                 e.buf(lp.tabs[2], 0, 0);
                 e.buf(lp.tabs[2], 0, 1);
                 e.buf(a, o.act.t(j), 2);
@@ -2450,13 +2607,6 @@ impl Plan {
                 e.bytes(&p, 4);
                 e.buf(a, o.sel[l].t(j), 5);
                 e.dispatch((h.div_ceil(lp.sum.1), 1), 32);
-            }
-        }
-        r.barrier("hc post");
-        {
-            let e = r.e();
-            for j in toks {
-                self.hc_post(&e, o.xa_res.t(j), o.y1.t(j), Some(o.y2.t(j)), o.mix[l][1].t(j), o.x[l + 1].t(j));
             }
         }
     }
@@ -2628,6 +2778,11 @@ enum Want {
 struct Stats {
     passes: usize,
     missed: usize,
+    /// Experts predicted and read ahead, and their bytes requested from storage.
+    pred: usize,
+    pred_bytes: u64,
+    /// Seconds reading predicted experts while the GPU ran.
+    tahead: f64,
     gpu: f64,
     tio: f64,
     tbk: f64,
@@ -2785,13 +2940,16 @@ impl Chain<'_> {
         let ok = p.drive(st, g, from, upto, missed, Want::Token, hook, &mut self.wraps, &mut sx);
         if trace() {
             eprintln!(
-                "[ds41 gpu chain step {pos}{}: {:.2} ms, gpu {:.2} ms, {} pass(es), {} misses, expert io {:.2} ms]",
+                "[ds41 gpu chain step {pos}{}: {:.2} ms, gpu {:.2} ms, {} pass(es), {} misses, {} predicted ({:.0} MB read ahead), expert io {:.2} ms, reads {:.2} ms while the GPU ran]",
                 if rerun { " (again)" } else { "" },
                 t0.elapsed().as_secs_f64() * 1e3,
                 sx.gpu * 1e3,
                 sx.passes,
                 sx.missed,
-                sx.tio * 1e3
+                sx.pred,
+                sx.pred_bytes as f64 / 1e6,
+                sx.tio * 1e3,
+                sx.tahead * 1e3
             );
         }
         ok
