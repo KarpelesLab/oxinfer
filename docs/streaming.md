@@ -38,6 +38,7 @@ before the lookup (with priority over the read-ahead) rather than faulting in pa
 | `--stream-gpu M` | `auto` (default: dense models decode on the GPU, MoE models measure both on their first tokens and keep the faster), `on`, `off` (Qwen3.5 / 3.8, Gemma 4 / 3; engine / C API / server key `stream_gpu`) |
 | `--expert-cache-mb N` | MoE: page cache kept for recently used routed experts (default: what the budget leaves after the resident set) |
 | `--expert-predict` | MoE: guess the next layer's experts and read them ahead (off by default, see below) |
+| `--cold-start` (`cold_start`) | drop the model's pages from the page cache before the first pass, as after a reboot (default: use what an earlier run left cached, see below) |
 | `--threads N`, `--qos C`, `--efficiency-threads N` | compute threads; their QoS class on Apple platforms (`interactive` default, `initiated`, `utility`, `background` = efficiency cores only); how many of them run at background QoS |
 
 With `--mtp`, streaming defaults to up to 8 drafts with a cost-aware draft length
@@ -121,6 +122,20 @@ same tokens as without streaming. Guessing the next layer's experts from the res
 (`--expert-predict`) hides part of the remaining stall (77% -> 44% of the time) but the wrong
 guesses read 27% more bytes, which the flash cannot afford: 6.9 tok/s, so it is off by default.
 
+Starting state. Streaming used to drop every page of the model from the page cache when it
+started (`StreamOptions::cold_start`, then on by default), so that each run started as after a
+reboot: a second run of the same model read everything again. It now keeps what an earlier run
+left (`cold_start` off by default; `--cold-start`, engine / C API / server key `cold_start=1`, for
+the old start): the on-demand parts found cached (three pages of each span resident) fill the part
+cache, oldest first out like the others, within its budget, and the cached parts it has no room
+for are dropped. DeepSeek V4.1 IQ1_M, 128 greedy tokens after a short prompt: 15-16 tok/s on the
+second run instead of 10-11 (the experts of the previous run are hits).
+
+On-demand reads (routed experts, DeepSeek V4.1's engram rows) request every missing chunk first
+(asynchronous advisory reads on Darwin, `madvise(WILLNEED)` elsewhere) and touch the chunks after,
+instead of one read in flight per reader thread. The engram rows of a 2048-token prefill chunk are
+~50k scattered pages of a 110 GB table: 2.0 -> 0.85 s per engram layer.
+
 Measured on the M5 Max with the phone's limits emulated (`--cache-budget-gb`, `--flash-mbps`;
 greedy, a 40-token answer to a short prompt, CPU decoding; "3 threads" approximates the
 iPhone's 2 performance + 4 efficiency cores), before the multi-token kernels. Pass times were
@@ -189,7 +204,14 @@ Which device runs a step: dense models decode on the GPU. A MoE step waits for i
 layer (40 round trips per token on Qwen3.5-35B-A3B, ~1 ms each with the GPU work they wait for),
 which on the M5 Max costs about what decoding on the CPU does, so with `stream_gpu` unset these
 models time their first steps on both (after two warm-up steps each, four measured) and keep the
-faster (`gpu::decode::DeviceChoice`; it prints its decision). Starting a layer that is still being
+faster (`gpu::decode::DeviceChoice`; it prints its decision). Short bursts of GPU work between
+CPU work also run slower than the same work back to back: on the M5 Max a one-token expert step
+(six IQ1_S experts of 2304 x 5120, resident random weights) takes 0.30 ms of GPU time when steps
+follow each other, 0.87 ms as soon as the GPU idles 0.1 ms or more between them (the clock drops;
+a thread keeping tiny command buffers going does not hold it up). DeepSeek V4.1's feed-forward
+block on the GPU (shared and routed experts in one plan per layer, the rest of the layer on the
+CPU) therefore took 1.0 ms of GPU time per layer and decoded at 7.9 tok/s against 11.0 on the CPU
+(same text); it was not kept. Starting a layer that is still being
 read on the CPU was not done: a 9-token verification pass spends ~0.1 s computing on the GPU against
 ~1 s of reading at 3 GB/s, so there is nothing for the CPU to hide.
 

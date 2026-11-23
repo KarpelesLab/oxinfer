@@ -297,7 +297,8 @@ average at start and end (other jobs shared the machine).
 the code before the GPU attention and the indexer changes: 37.9 tok/s, 55 min.)
 
 (Decode is that of the 9 tokens of the answer, with prompt-lookup drafting; a short prompt on a
-cold page cache decodes at 2.4-5 tok/s, the experts coming from storage.)
+cold page cache decodes at 2.4-5 tok/s, the experts coming from storage. Those figures predate the
+round [below](#decode-and-prefill-against-llamacpp).)
 
 Context memory: per position, the window keys of the last 128 positions (a constant), the
 compressed keys of the four key-source layers (512 floats; layers 2, 8 and 14 at rate 2, layer
@@ -364,10 +365,77 @@ SSD instead of 717: the read-ahead defeats the page cache); 8192-token chunks (7
 73.4, 441 GB read instead of 717, but 21.6 GB of peak memory instead of 8.2 and a colder cache
 after the prefill).
 
+#### Decode and prefill against llama.cpp
+
+The same file, 18 threads both, greedy, `--no-system`, interleaved runs under one lock (load
+average 2-12 from other jobs). Decode: 128 tokens after a 20-token prompt ("Write a short story
+about a lighthouse keeper..."), without prompt-lookup drafting; prefill: the 7,666-token
+passphrase prompt above and a 1,933-token wikitext prompt. "Cold" is a start after the model's
+pages were dropped from the page cache (oxinfer's `--cold-start`, which every streamed run used
+to do); "warm" a second run. llama.cpp (b11870+, master `225a534`) runs on the CPU (`-ngl 0`) or
+with the dense weights on Metal and the experts on the CPU (`-ngl 99 -ot exps=CPU`, its best
+setting here: the 231 GB do not fit in its Metal buffers).
+
+| | oxinfer before (master `19e037a`) | oxinfer now, cold | oxinfer now, warm | llama.cpp CPU | llama.cpp Metal + CPU experts |
+|---|---|---|---|---|---|
+| decode, tok/s | 8.9 (cold: every run was) | 12.2 | 15.5 | 0.32 cold, 0.38 warm | 5.7 cold, 6.0 warm |
+| prefill 7,666 tokens, tok/s | 85.3 | 108.0 | 134.0 | | |
+| prefill 1,933 tokens, tok/s | | | 125.4 | | 22.5 |
+
+Greedy tokens: the six prompts above give llama.cpp's 33 tokens at every step (198 of 198; mean
+KL 0.0004-0.0045, as before); perplexity (16 chunks of 512) 2.9764 against llama.cpp's 2.9774
+(2.9751 before: the prefill router's sums are a GEMM's now).
+
+Where a warm decode step goes (64 ms; `--profile` phases, which nest in its categories):
+
+| phase | ms / token | |
+|---|---|---|
+| routed + shared experts | 33 | CPU decode kernels; the IQ1_S / IQ1_M / IQ2_XXS experts are compute-bound (one core: IQ1_S 7.5 GB/s, IQ1_M 4.9, IQ2_XXS 8.1; all threads ~60-80 GB/s), the Q5_K shared expert reads at ~200 GB/s |
+| attention output projection | 10.2 | 52 MB of Q5_K per layer, ~205 GB/s |
+| `wq_b` | 5.2 | 29 MB of Q5_K per layer |
+| hyper-connection mixes | 2.6 | |
+| attention (window + 512 chosen keys) | 2.5 | |
+| expert reads (stalls) | 2.2 | 20-30 ms on a cold cache |
+| attention input projections | 2.1 | |
+| LM head | 1.9 | |
+| router | 1.8 | |
+| engram (48 rows of the 110 GB table, projection) | 1.2 | 3.8 cold |
+
+Of the 7.09 GB a token reads, 5.4 GB are the resident dense weights (Q5_K, Q8_0, BF16) and ~1.7
+GB routed experts. Decode runs on the CPU: the Metal backend has no decode graph for this family,
+and a hybrid did not pay (below).
+
+What changed:
+
+- Streaming kept nothing of an earlier run (it dropped the whole model from the page cache at
+  start): the experts found cached now fill the part cache (see [streaming](streaming.md)). The
+  part cache treats decode and prefill differently already: a decode step's few experts are
+  least-recently-used, a prefill chunk (half of a layer's experts or more) only fills free room.
+  On a warm start 100% of a decode step's experts are hits; from cold, 90% over the first 128
+  tokens.
+- The one-token router (384 x 5120 dot products per layer) and the 24 hyper-connection
+  projections ran on one thread: 7.1 -> 1.7 ms and 4.9 -> 2.5 ms per token. The output
+  projection's 8 groups run as one batch: 11.2 -> 10.1 ms.
+- IQ1_S rows (64% of the expert bytes) take the `+-1/8` delta out of the weights (`8 sum(g x) +
+  delta sum(x)`, bit for bit the old sums): 6.0 -> 7.5 GB/s per core.
+- Prefill: the engram rows of a chunk (~50k scattered pages) are requested all at once (2.1 ->
+  0.9 ms per token at 8k), the router is one f32 GEMM per chunk (0.8 -> 0.4 ms per token). The
+  expert GEMMs of a 2048-token chunk do run on the GPU (the routed experts wrapped per pass): 2.8
+  ms per token at 8k with the reads they wait for (1.0 ms of it stalls when warm), the GPU busy
+  16 s of the 66 s.
+
+Tried and not kept: the feed-forward block on the GPU during decode (the shared expert and the
+routed experts of a layer in one Metal plan, the rest of the layer on the CPU): same tokens, but
+7.9 tok/s against 11.0 on the CPU, because a GPU that idles between short bursts runs them at a
+third of its speed (1.0 ms of GPU time per layer instead of 0.3; see
+[streaming](streaming.md#gpu-decoding-with-streamed-weights-mixed-gpu--cpu)), and each of the
+40 round trips costs ~0.2 ms besides. The dense matvecs alone on the GPU, one submission per
+matmul: 4.8 tok/s.
+
 Not done for V4.1: image input (the ViT with 2D RoPE, the 3x3 aligner and the
 image processor; `mmproj` files are not read; the language model's side is in place and
 verified as above); DSpark (the `mtp.*` stages differ from V4's: 128 experts, a Markov head on the
 target's embedding and head, a confidence head; a `dspark*.gguf` beside the model is ignored and
 `--draft` refused); the other GGUF builds on their real weights (unsloth's, the Coder and
-AtomicChat builds: headers only); the FP8 / FP4 release; GPU decoding. Runtime interventions use V4's hook points and were not measured on this
+AtomicChat builds: headers only); the FP8 / FP4 release; GPU decoding (a decode graph of the whole layer; the feed-forward block alone was tried, above). Runtime interventions use V4's hook points and were not measured on this
 architecture.

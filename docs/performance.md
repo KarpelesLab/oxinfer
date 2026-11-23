@@ -39,7 +39,13 @@ in chunks of at least 2048 tokens, and a pass that uses most of a layer's expert
 evicts the cache's oldest ones (a cycle over more experts than the cache holds is the worst case
 of least-recently-used). A 32k-token prompt: 41.6 tok/s before the sparse attention moved to
 Metal, 73-75 after, 79.4 with the cache change (300 GB read instead of 717); 126k tokens at 65.6
-tok/s. See [DeepSeek V4.1](deepseek-v4.md#on-the-real-weights).
+tok/s. See [DeepSeek V4.1](deepseek-v4.md#on-the-real-weights). A later round (engram rows
+requested all at once, the router as one GEMM, and streaming keeping what an earlier run left in
+the page cache): 7,666 tokens at 108 tok/s from a cold cache (85 before), 134 on a second run;
+decode 8.9 -> 12.2 tok/s cold, 15.5 warm, on the CPU (a GPU that idles between short bursts runs
+them at a third of its speed, so the hybrid tried lost); llama.cpp on the same file: 6.0 tok/s
+decode and 22.5 tok/s prefill with its dense weights on Metal, 0.4 tok/s on the CPU alone. See
+[the round](deepseek-v4.md#decode-and-prefill-against-llamacpp).
 
 CPU decode attention (`attn.rs`). When a decode step has fewer (token, KV head) pairs than threads
 (single-token steps of GQA models, one shared key-value head as in DeepSeek V4, Mistral Large 4's
