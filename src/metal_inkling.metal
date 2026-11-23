@@ -498,7 +498,7 @@ INK_ATTN(4, 4, 0) INK_ATTN(4, 4, 1) INK_ATTN(4, 4, 2)
 // (SIMD-group sg: keys j0 + sg + 8 m), KB keys at a time with their key and value loads issued
 // together, each dot product a SIMD-group sum; at the short ranges of decoding each key is one
 // load per lane rather than a lane's walk over its row.
-#define INK_AKB 4
+#define INK_AKB 2
 template <int D, int G, int KFMT>
 inline void ink_attv_body(device float* a, device const float* c, constant IAP& p, device const uchar* kc, device const uchar* vc,
                           device const float* ksc, device const float* vsc, device const uchar* tk, device const uchar* tv,
