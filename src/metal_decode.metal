@@ -93,7 +93,7 @@ inline float xsum32(thread const X32& xr) {
 // from one-token passes in the last bits on MLX 4-bit weights).
 inline float q4_affine(float d, float qd, float xs, float o) {
 #pragma clang fp contract(off)
-    return fma(o, xs, d * (qd - 8.f * xs));
+    return fma(o, xs, d * fma(-8.f, xs, qd));
 }
 inline float mdot(MQ4 f, uint row, uint c, thread const X32& xr) {
     uint4 u = *(device const uint4*)(f.q + (ulong)row * (f.n_in / 2) + c * 16);
@@ -477,12 +477,12 @@ struct MVK { MV m; uint ntok; uint sx; uint sy; uint sgate; };
 // not depend on x), `wdot` is then `mdot`'s arithmetic on them, product for product. Formats
 // without a decoded form keep the row and call `mdot`.
 struct WRow { uint row; };
-template <typename F> struct WDec { typedef WRow T; };
+template <typename F, int KS> struct WDec { typedef WRow T; };
 template <typename F> inline void wdec(F f, uint row, uint c, thread WRow& w) { w.row = row; }
 template <typename F, typename X> inline float wdot(F f, thread const WRow& w, uint c, thread const X& xr) { return mdot(f, w.row, c, xr); }
 // Any other GGUF format: the chunk dequantized once (its GEMM loader), then mdot's dot product.
 struct WGen { float4 v[8]; };
-template <typename W> struct WDec<MGen<W>> { typedef WGen T; };
+template <typename W, int KS> struct WDec<MGen<W>, KS> { typedef WGen T; };
 template <typename W>
 inline void wdec(MGen<W> f, uint row, uint c, thread WGen& w) { load(f.w, row, c, w.v); }
 template <typename W>
@@ -492,18 +492,25 @@ inline float wdot(MGen<W> f, thread const WGen& w, uint c, thread const X32& xr)
     return hsum(a);
 }
 // The masked nibbles of a word as floats (see nib_acc): low nibbles in `l`, high in `h`.
-inline void nib_dec(uint w, thread half4& l, thread half4& h) {
-    l = half4(as_type<uchar4>(w & 0x0F0F0F0Fu));
-    h = half4(as_type<uchar4>((w >> 4) & 0x0F0F0F0Fu));
+template <typename V>
+inline void nib_dec(uint w, thread V& l, thread V& h) {
+    l = V(as_type<uchar4>(w & 0x0F0F0F0Fu));
+    h = V(as_type<uchar4>((w >> 4) & 0x0F0F0F0Fu));
 }
-inline float q4_dot(thread const half4* nl, thread const half4* nh, thread const X32& xr) {
+template <typename V>
+inline float q4_dot(thread const V* nl, thread const V* nh, thread const X32& xr) {
     float4 lo = 0.f, hi = 0.f;
     for (int i = 0; i < 4; i++) { lo += xr.v[i] * float4(nl[i]); hi += xr.v[4 + i] * float4(nh[i]); }
     return dot(lo, NIB_LO) + dot(hi, NIB_HI);
 }
-struct WQ4 { half4 nl[4]; half4 nh[4]; float d; float o; };
-template <> struct WDec<MQ4> { typedef WQ4 T; };
-inline void wdec(MQ4 f, uint row, uint c, thread WQ4& w) {
+// The quants as float4 or half4 (exact either way): with one SIMD-group a row (lanes taking two
+// chunks or more) float rows measured faster, with more half (4-bit Inkling-2-Mini's 201024 x 2304
+// head at 4 tokens 1.34 -> 1.28 ms; 4096 x 12288 at 4 tokens 202 -> 138 us).
+template <typename V> struct WQ4 { V nl[4]; V nh[4]; float d; float o; };
+template <int KS> struct WDec<MQ4, KS> { typedef WQ4<half4> T; };
+template <> struct WDec<MQ4, 1> { typedef WQ4<float4> T; };
+template <typename V>
+inline void wdec(MQ4 f, uint row, uint c, thread WQ4<V>& w) {
     uint4 u = *(device const uint4*)(f.q + (ulong)row * (f.n_in / 2) + c * 16);
     w.d = float(f.s[(ulong)row * (f.n_in / 32) + c]);
     w.o = f.gk != 0 ? as_type<float>(uint(f.o[(ulong)row * f.gpr + c / f.gk]) << 16) : 0.f;
@@ -512,12 +519,15 @@ inline void wdec(MQ4 f, uint row, uint c, thread WQ4& w) {
     nib_dec(u.z, w.nl[2], w.nh[2]);
     nib_dec(u.w, w.nl[3], w.nh[3]);
 }
-inline float wdot(MQ4 f, thread const WQ4& w, uint c, thread const X32& xr) {
+template <typename V>
+inline float wdot(MQ4 f, thread const WQ4<V>& w, uint c, thread const X32& xr) {
     if (f.gk == 0) return w.d * (q4_dot(w.nl, w.nh, xr) - 8.f * xsum32(xr));
     return q4_affine(w.d, q4_dot(w.nl, w.nh, xr), xsum32(xr), w.o);
 }
-template <> struct WDec<MQ4_0> { typedef WQ4 T; };
-inline void wdec(MQ4_0 f, uint row, uint c, thread WQ4& w) {
+template <int KS> struct WDec<MQ4_0, KS> { typedef WQ4<half4> T; };
+template <> struct WDec<MQ4_0, 1> { typedef WQ4<float4> T; };
+template <typename V>
+inline void wdec(MQ4_0 f, uint row, uint c, thread WQ4<V>& w) {
     device const ushort* b = (device const ushort*)(f.w + (ulong)row * f.rb + c * 18);
     w.d = float(as_type<half>(b[0]));
     w.o = 0.f;
@@ -526,14 +536,15 @@ inline void wdec(MQ4_0 f, uint row, uint c, thread WQ4& w) {
     nib_dec(ld32u(b + 5), w.nl[2], w.nh[2]);
     nib_dec(ld32u(b + 7), w.nl[3], w.nh[3]);
 }
-inline float wdot(MQ4_0 f, thread const WQ4& w, uint c, thread const X32& xr) { return w.d * (q4_dot(w.nl, w.nh, xr) - 8.f * xsum32(xr)); }
+template <typename V>
+inline float wdot(MQ4_0 f, thread const WQ4<V>& w, uint c, thread const X32& xr) { return w.d * (q4_dot(w.nl, w.nh, xr) - 8.f * xsum32(xr)); }
 struct WF16 { float4 w[4]; };
-template <> struct WDec<MBf> { typedef WF16 T; };
+template <int KS> struct WDec<MBf, KS> { typedef WF16 T; };
 inline void wdec(MBf f, uint row, uint c, thread WF16& w) {
     device const packed_ushort4* p = (device const packed_ushort4*)(f.w + (ulong)row * f.rb + c * 32);
     for (int i = 0; i < 4; i++) w.w[i] = bf4(p[i]);
 }
-template <> struct WDec<MF16> { typedef WF16 T; };
+template <int KS> struct WDec<MF16, KS> { typedef WF16 T; };
 inline void wdec(MF16 f, uint row, uint c, thread WF16& w) {
     device const packed_half4* p = (device const packed_half4*)(f.w + (ulong)row * f.rb + c * 32);
     for (int i = 0; i < 4; i++) w.w[i] = float4(half4(p[i]));
@@ -547,7 +558,7 @@ inline float wdot(F f, thread const WF16& w, uint c, thread const X16& xr) {
     return hsum(a);
 }
 struct WQ8 { half4 w[4]; float d; };
-template <> struct WDec<MQ8> { typedef WQ8 T; };
+template <int KS> struct WDec<MQ8, KS> { typedef WQ8 T; };
 inline void wdec(MQ8 f, uint row, uint c, thread WQ8& w) {
     uint4 u = *(device const uint4*)(f.q + (ulong)row * f.n_in + c * 16);
     w.d = f.s[(ulong)row * (f.n_in / 32) + c / 2];
@@ -562,7 +573,7 @@ inline float wdot(MQ8 f, thread const WQ8& w, uint c, thread const X16& xr) {
     return w.d * hsum(a);
 }
 struct WQ80 { half4 w[8]; float d; };
-template <> struct WDec<MQ8_0> { typedef WQ80 T; };
+template <int KS> struct WDec<MQ8_0, KS> { typedef WQ80 T; };
 inline void wdec(MQ8_0 f, uint row, uint c, thread WQ80& w) {
     device const ushort* b = (device const ushort*)(f.w + (ulong)row * f.rb + c * 34);
     w.d = float(as_type<half>(b[0]));
@@ -590,7 +601,7 @@ inline void mvk_out(device float* y, uint o, uint mode, float a, float b, device
 // K-quants (Q4_K, Q5_K): the chunk's 32 quants as floats and its super-block scale, min and the
 // two sub-blocks' scales and mins.
 struct WQK { half4 nl[4]; half4 nh[4]; float2 dm; float4 sc; };
-template <> struct WDec<MQ4_K> { typedef WQK T; };
+template <int KS> struct WDec<MQ4_K, KS> { typedef WQK T; };
 inline void wdec(MQ4_K f, uint row, uint c, thread WQK& w) {
     uint k = c % 8, g = k / 2, h = k % 2;
     device const uchar* B = f.w + (ulong)row * f.rb + (c / 8) * 144;
@@ -602,7 +613,7 @@ inline void wdec(MQ4_K f, uint row, uint c, thread WQK& w) {
     nib_dec(u.z, w.nl[2], w.nh[2]);
     nib_dec(u.w, w.nl[3], w.nh[3]);
 }
-template <> struct WDec<MQ5_K> { typedef WQK T; };
+template <int KS> struct WDec<MQ5_K, KS> { typedef WQK T; };
 inline void wdec(MQ5_K f, uint row, uint c, thread WQK& w) {
     uint k = c % 8, g = k / 2, h = k % 2;
     device const uchar* B = f.w + (ulong)row * f.rb + (c / 8) * 176;
@@ -625,7 +636,7 @@ inline float wdot(F f, thread const WQK& w, uint c, thread const XKQ& x) {
 }
 // Q6_K: the chunk's 32 values (minus 32) as floats, its scale and the four sub-blocks' scales.
 struct WQ6 { half4 v[8]; float d; float4 c; };
-template <> struct WDec<MQ6_K> { typedef WQ6 T; };
+template <int KS> struct WDec<MQ6_K, KS> { typedef WQ6 T; };
 inline void wdec(MQ6_K f, uint row, uint c, thread WQ6& w) {
     uint n = (c % 8) / 4, l0 = 8 * (c % 4);
     device const uchar* B = f.w + (ulong)row * f.rb + (c / 8) * 210;
@@ -659,6 +670,18 @@ inline void mvk_finish(thread float (&a)[T][NR], thread float (&b)[T][NR], bool 
             a[t][r] = simd_sum(a[t][r]);
             if (pair) b[t][r] = simd_sum(b[t][r]);
         }
+    }
+    if (KS == 1) {
+        // Every lane holds every sum: lane t NR + r writes row r of token t.
+        for (uint i0 = 0; i0 < nt * NR; i0 += 32) {
+            uint i = i0 + lane, tl = i / NR, rl = i % NR;
+            float va = 0.f, vb = 0.f;
+            for (int t = 0; t < T; t++)
+                for (int r = 0; r < NR; r++)
+                    if (tl == uint(t) && rl == uint(r)) { va = a[t][r]; vb = b[t][r]; }
+            if (i < nt * NR && r0 + rl < p.n_out) mvk_out(y + (ulong)tl * q.sy, r0 + rl, p.mode, va, vb, gate + (ulong)tl * q.sgate);
+        }
+        return;
     }
     if (lane == 0)
         for (int t = 0; t < T; t++) {
@@ -703,10 +726,10 @@ inline void mvk_body(F f, F f2, device const float* x, device float* y, constant
     for (int t = 0; t < T; t++)
         for (int r = 0; r < NR; r++) { a[t][r] = 0.f; b[t][r] = 0.f; }
     for (uint c = sg * 32 + lane; c < nch; c += KS * 32) {
-        typename WDec<F>::T w[NR];
+        typename WDec<F, KS>::T w[NR];
         for (int r = 0; r < NR; r++) wdec(f, rows[r], c, w[r]);
         if (pair) {
-            typename WDec<F>::T w2[NR];
+            typename WDec<F, KS>::T w2[NR];
             for (int r = 0; r < NR; r++) wdec(f2, rows[r], c, w2[r]);
             for (int t = 0; t < T; t++) {
                 if (uint(t) >= nt) break;

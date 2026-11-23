@@ -321,7 +321,7 @@ pub(crate) fn shader_src(mma: bool) -> String {
         super::SHADER_SRC,
         super::gguf_shader_tables(),
         super::GGUF_SHADER_SRC,
-        super::decode::SRC
+        super::decode::decode_src()
     );
     if mma {
         s = format!("#define GTM {}\n#define MMA_UNITS 1\n{s}{}", super::MMA_GTM, super::MMA_SHADER_SRC);

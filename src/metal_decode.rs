@@ -155,18 +155,18 @@ pub(crate) fn all_formats() -> Vec<MvFmt> {
     v
 }
 
+/// The decode kernels (`metal_decode.metal`); `OXINFER_DECODE_SRC=FILE` takes them from a file
+/// instead (kernel work without a rebuild, as `OXINFER_INKLING_METAL`).
+pub(crate) fn decode_src() -> String {
+    std::env::var("OXINFER_DECODE_SRC")
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_else(|| SRC.to_string())
+}
+
 /// The decode kernels' source with the matvec instantiations.
 pub(crate) fn shader_src() -> String {
-    let mut s = String::new();
-    // Tests: `OXINFER_DECODE_SRC=path` compiles that file instead of the built-in kernels
-    // (kernel experiments without a rebuild).
-    #[cfg(test)]
-    let src_file = std::env::var("OXINFER_DECODE_SRC")
-        .ok()
-        .and_then(|p| std::fs::read_to_string(p).ok());
-    #[cfg(not(test))]
-    let src_file: Option<String> = None;
-    s.push_str(src_file.as_deref().unwrap_or(SRC));
+    let mut s = decode_src();
     s.push_str(QSA_SRC);
     for f in all_formats() {
         // MoE experts: `mvx_<fmt>_pair` / `_sum`.
@@ -8173,6 +8173,13 @@ mod tests {
                     b / reps as f64 * 1e6
                 };
                 let (nr1, ks) = mv_variant(fmt, n_in);
+                // `OXINFER_MVK_KS=n`: that many SIMD-groups a row (Inkling's matvecs take 1 below
+                // 4096 values a row).
+                let ks = std::env::var("OXINFER_MVK_KS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|_| fmt.specialized())
+                    .unwrap_or(ks);
                 let pipe1 = be.mv_pipe(fmt, nr1, ks).unwrap();
                 let one = best(&|e, c| encode_mv(e, pipe1, nr1, ks, &wt(c), None, (st.x, 0), (st.y, 0), MvMode::Store, (st.y, 0)));
                 let gbs = (d.len() + sc.len().min(d.len())) as f64 / one / 1e3;
