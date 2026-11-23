@@ -233,14 +233,19 @@ pub struct QAct {
     pub fsums: Vec<f32>,
     /// Exact f32 sum of each half block of 16 (for the per-16 mins of GGUF Q2_K weights).
     pub hsums: Vec<f32>,
+    /// `-8` times each block's integer sum (the offset of centered nibbles, ready to start an
+    /// integer dot product from: the interleaved Q4_0 and Q4_K kernels).
+    pub neg8: Vec<i32>,
+    /// `-32` times the integer sum of each half block of 16 (Q6_K's offset, likewise).
+    pub neg32h: Vec<i32>,
     pub t: usize,
     pub n_in: usize,
 }
 
 /// One block of 32: int8 values (`v * 127 / amax`, rounded half away from zero), returning
-/// `amax` and the integer sum.
+/// `amax` and the integer sums of the two halves of 16.
 #[inline(always)]
-fn quantize_block(blk: &[f32], q: &mut [i8]) -> (f32, i32) {
+fn quantize_block(blk: &[f32], q: &mut [i8]) -> (f32, [i32; 2]) {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         use std::arch::aarch64::*;
@@ -252,38 +257,61 @@ fn quantize_block(blk: &[f32], q: &mut [i8]) -> (f32, i32) {
         }
         let amax = vmaxnmvq_f32(m);
         let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
-        let mut s = vdupq_n_s32(0);
+        let mut s = [vdupq_n_s32(0); 2];
         for h in 0..4 {
             let (a, b) = (
                 vcvtaq_s32_f32(vmulq_n_f32(v[2 * h], inv)),
                 vcvtaq_s32_f32(vmulq_n_f32(v[2 * h + 1], inv)),
             );
-            s = vaddq_s32(s, vaddq_s32(a, b));
+            s[h / 2] = vaddq_s32(s[h / 2], vaddq_s32(a, b));
             let n = vqmovn_s16(vcombine_s16(vqmovn_s32(a), vqmovn_s32(b)));
             vst1_s8(q.as_mut_ptr().add(8 * h), n);
         }
-        (amax, vaddvq_s32(s))
+        (amax, [vaddvq_s32(s[0]), vaddvq_s32(s[1])])
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
         let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
         let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
-        let mut s = 0i32;
-        for (o, &v) in q.iter_mut().zip(blk) {
+        let mut s = [0i32; 2];
+        for (i, (o, &v)) in q.iter_mut().zip(blk).enumerate() {
             *o = (v * inv).round() as i8;
-            s += *o as i32;
+            s[i / 16] += *o as i32;
         }
         (amax, s)
     }
 }
 
+/// A row's slices of a `QAct`.
+struct RowOut<'a> {
+    q: &'a mut [i8],
+    scales: &'a mut [f32],
+    sums: &'a mut [i32],
+    fsums: &'a mut [f32],
+    hsums: &'a mut [f32],
+    neg8: &'a mut [i32],
+    neg32h: &'a mut [i32],
+}
+
 /// Quantizes one row of `x` (`n_in = q.len()` values) into its slices of a `QAct`.
-fn quantize_row(row: &[f32], q: &mut [i8], scales: &mut [f32], sums: &mut [i32], fsums: &mut [f32], hsums: &mut [f32]) {
+fn quantize_row(row: &[f32], o: RowOut) {
+    let RowOut {
+        q,
+        scales,
+        sums,
+        fsums,
+        hsums,
+        neg8,
+        neg32h,
+    } = o;
     let nb = row.len() / QBLOCK;
     for b in 0..nb {
-        let (amax, s) = quantize_block(&row[b * QBLOCK..(b + 1) * QBLOCK], &mut q[b * QBLOCK..(b + 1) * QBLOCK]);
+        let (amax, [s0, s1]) = quantize_block(&row[b * QBLOCK..(b + 1) * QBLOCK], &mut q[b * QBLOCK..(b + 1) * QBLOCK]);
         scales[b] = amax / 127.0;
-        sums[b] = s;
+        sums[b] = s0 + s1;
+        neg8[b] = -8 * (s0 + s1);
+        neg32h[2 * b] = -32 * s0;
+        neg32h[2 * b + 1] = -32 * s1;
     }
     // The exact sums, each a sequential left-to-right sum (`Iterator::sum`'s order, from -0.0):
     // on NEON four blocks at a time, one per lane (the sums of a block are serial chains, the
@@ -346,37 +374,153 @@ fn quantize_row(row: &[f32], q: &mut [i8], scales: &mut [f32], sums: &mut [i32],
     }
 }
 
-/// A [`QAct`] of `t` rows of `n_in` filled block by block from several threads at once
-/// ([`QActFill::fill`]): each block gets exactly what [`quantize_act`] gives it, so filling every
-/// block of every row makes the same activations.
-pub(crate) struct QActFill {
-    xa: QAct,
+/// Raw pointers to every array of a [`QAct`], for filling disjoint blocks from several threads.
+struct QActPtrs {
     q: SendPtr<i8>,
     scales: SendPtr<f32>,
     sums: SendPtr<i32>,
     fsums: SendPtr<f32>,
     hsums: SendPtr<f32>,
+    neg8: SendPtr<i32>,
+    neg32h: SendPtr<i32>,
 }
 
-impl QActFill {
-    pub(crate) fn new(t: usize, n_in: usize) -> Self {
-        assert!(n_in.is_multiple_of(QBLOCK));
-        let bpr = n_in / QBLOCK;
-        let mut xa = QAct {
-            q: vec![0i8; t * n_in],
-            scales: vec![0f32; t * bpr],
-            sums: vec![0i32; t * bpr],
-            fsums: vec![0f32; t * bpr],
-            hsums: vec![0f32; t * bpr * 2],
-            t,
-            n_in,
-        };
+impl QActPtrs {
+    fn new(xa: &mut QAct) -> Self {
         Self {
             q: SendPtr(xa.q.as_mut_ptr()),
             scales: SendPtr(xa.scales.as_mut_ptr()),
             sums: SendPtr(xa.sums.as_mut_ptr()),
             fsums: SendPtr(xa.fsums.as_mut_ptr()),
             hsums: SendPtr(xa.hsums.as_mut_ptr()),
+            neg8: SendPtr(xa.neg8.as_mut_ptr()),
+            neg32h: SendPtr(xa.neg32h.as_mut_ptr()),
+        }
+    }
+
+    /// The slices of blocks `b0..b0 + nb` (counted over all rows).
+    ///
+    /// # Safety
+    /// In bounds, and no other live `RowOut` covers these blocks.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn out(&self, b0: usize, nb: usize) -> RowOut<'_> {
+        use std::slice::from_raw_parts_mut as sl;
+        unsafe {
+            RowOut {
+                q: sl(self.q.get().add(b0 * QBLOCK), nb * QBLOCK),
+                scales: sl(self.scales.get().add(b0), nb),
+                sums: sl(self.sums.get().add(b0), nb),
+                fsums: sl(self.fsums.get().add(b0), nb),
+                hsums: sl(self.hsums.get().add(2 * b0), 2 * nb),
+                neg8: sl(self.neg8.get().add(b0), nb),
+                neg32h: sl(self.neg32h.get().add(2 * b0), 2 * nb),
+            }
+        }
+    }
+}
+
+impl QAct {
+    /// `t` rows of `n_in` (a multiple of [`QBLOCK`]) for a caller that writes every block: a
+    /// buffer set recycled on this thread (its earlier contents) when one is large enough, else
+    /// zeros. Decoding quantizes several inputs a layer; recycling them saves the allocations
+    /// and zero fills of each.
+    pub(crate) fn zeroed(t: usize, n_in: usize) -> Self {
+        assert!(n_in.is_multiple_of(QBLOCK));
+        let nb = t * n_in / QBLOCK;
+        let reused = QACT_FREE.with(|f| {
+            let mut f = f.borrow_mut();
+            let i = f.iter().position(|v| v.q.len() >= t * n_in)?;
+            Some(f.swap_remove(i))
+        });
+        if let Some(mut v) = reused {
+            // (Every array's length is proportional to its `q`'s.)
+            v.q.truncate(t * n_in);
+            v.scales.truncate(nb);
+            v.sums.truncate(nb);
+            v.fsums.truncate(nb);
+            v.hsums.truncate(2 * nb);
+            v.neg8.truncate(nb);
+            v.neg32h.truncate(2 * nb);
+            v.t = t;
+            v.n_in = n_in;
+            return v;
+        }
+        QAct {
+            q: vec![0i8; t * n_in],
+            scales: vec![0f32; nb],
+            sums: vec![0i32; nb],
+            fsums: vec![0f32; nb],
+            hsums: vec![0f32; 2 * nb],
+            neg8: vec![0i32; nb],
+            neg32h: vec![0i32; 2 * nb],
+            t,
+            n_in,
+        }
+    }
+}
+
+/// Activation buffers given back on this thread ([`QAct`]'s drop), at most [`QACT_KEEP`] of up
+/// to [`QACT_MAX`] values each (decode-sized: prompts' are not kept).
+const QACT_KEEP: usize = 8;
+const QACT_MAX: usize = 1 << 16;
+
+thread_local! {
+    // Already const; clippy (1.100) still flags it on Android's thread-local implementation.
+    #[allow(clippy::missing_const_for_thread_local)]
+    static QACT_FREE: std::cell::RefCell<Vec<QAct>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl Drop for QAct {
+    fn drop(&mut self) {
+        let n = self.q.len();
+        if n == 0 || n > QACT_MAX || self.scales.len() * QBLOCK != n || self.neg32h.len() * 16 != n {
+            return;
+        }
+        // (`try_with`: nothing is kept while the thread's storage is being torn down.)
+        let _ = QACT_FREE.try_with(|f| {
+            let Ok(mut f) = f.try_borrow_mut() else { return };
+            // The slot to fill: a free one, else the smallest set if this one is larger.
+            let slot = if f.len() < QACT_KEEP {
+                None
+            } else {
+                match (0..f.len()).min_by_key(|&i| f[i].q.len()) {
+                    Some(i) if f[i].q.len() < n => Some(i),
+                    _ => return,
+                }
+            };
+            let v = QAct {
+                q: std::mem::take(&mut self.q),
+                scales: std::mem::take(&mut self.scales),
+                sums: std::mem::take(&mut self.sums),
+                fsums: std::mem::take(&mut self.fsums),
+                hsums: std::mem::take(&mut self.hsums),
+                neg8: std::mem::take(&mut self.neg8),
+                neg32h: std::mem::take(&mut self.neg32h),
+                t: 0,
+                n_in: 0,
+            };
+            // (The set replaced is dropped while `f` is borrowed, so it is not kept again.)
+            match slot {
+                None => f.push(v),
+                Some(i) => f[i] = v,
+            }
+        });
+    }
+}
+
+/// A [`QAct`] of `t` rows of `n_in` filled block by block from several threads at once
+/// ([`QActFill::fill`]): each block gets exactly what [`quantize_act`] gives it, so filling every
+/// block of every row makes the same activations.
+pub(crate) struct QActFill {
+    xa: QAct,
+    p: QActPtrs,
+}
+
+impl QActFill {
+    pub(crate) fn new(t: usize, n_in: usize) -> Self {
+        let mut xa = QAct::zeroed(t, n_in);
+        Self {
+            p: QActPtrs::new(&mut xa),
             xa,
         }
     }
@@ -391,16 +535,7 @@ impl QActFill {
         let (b0, nb) = ((ti * n_in + e0) / QBLOCK, src.len() / QBLOCK);
         // SAFETY: in bounds (checked above); disjoint from other calls' blocks (the caller's
         // contract).
-        unsafe {
-            quantize_row(
-                src,
-                std::slice::from_raw_parts_mut(self.q.get().add(b0 * QBLOCK), src.len()),
-                std::slice::from_raw_parts_mut(self.scales.get().add(b0), nb),
-                std::slice::from_raw_parts_mut(self.sums.get().add(b0), nb),
-                std::slice::from_raw_parts_mut(self.fsums.get().add(b0), nb),
-                std::slice::from_raw_parts_mut(self.hsums.get().add(2 * b0), 2 * nb),
-            )
-        }
+        unsafe { quantize_row(src, self.p.out(b0, nb)) }
     }
 
     /// The activations (every block filled).
@@ -411,53 +546,20 @@ impl QActFill {
 
 pub fn quantize_act(x: &[f32], t: usize, n_in: usize) -> QAct {
     assert_eq!(x.len(), t * n_in);
-    assert!(n_in.is_multiple_of(QBLOCK));
+    let mut xa = QAct::zeroed(t, n_in);
     let bpr = n_in / QBLOCK;
-    let mut q = vec![0i8; t * n_in];
-    let mut scales = vec![0f32; t * bpr];
-    let mut sums = vec![0i32; t * bpr];
-    let mut fsums = vec![0f32; t * bpr];
-    let mut hsums = vec![0f32; t * bpr * 2];
+    let p = QActPtrs::new(&mut xa);
     if t == 1 {
-        quantize_row(x, &mut q, &mut scales, &mut sums, &mut fsums, &mut hsums);
+        // SAFETY: the whole of the one row.
+        unsafe { quantize_row(x, p.out(0, bpr)) };
     } else {
         // Rows in parallel (several tokens: speculative verification, prefill).
-        struct P<T>(*mut T);
-        unsafe impl<T> Sync for P<T> {}
-        impl<T> P<T> {
-            /// Row `i` of `n` elements. SAFETY: different jobs take different rows.
-            #[allow(clippy::mut_from_ref)]
-            unsafe fn row(&self, i: usize, n: usize) -> &mut [T] {
-                unsafe { std::slice::from_raw_parts_mut(self.0.add(i * n), n) }
-            }
-        }
-        let (pq, ps, pi, pf, ph) = (
-            P(q.as_mut_ptr()),
-            P(scales.as_mut_ptr()),
-            P(sums.as_mut_ptr()),
-            P(fsums.as_mut_ptr()),
-            P(hsums.as_mut_ptr()),
-        );
+        // SAFETY: each job takes its own row.
         crate::pool::run(t, &|ti| unsafe {
-            quantize_row(
-                &x[ti * n_in..(ti + 1) * n_in],
-                pq.row(ti, n_in),
-                ps.row(ti, bpr),
-                pi.row(ti, bpr),
-                pf.row(ti, bpr),
-                ph.row(ti, 2 * bpr),
-            )
+            quantize_row(&x[ti * n_in..(ti + 1) * n_in], p.out(ti * bpr, bpr))
         });
     }
-    QAct {
-        q,
-        scales,
-        sums,
-        fsums,
-        hsums,
-        t,
-        n_in,
-    }
+    xa
 }
 
 impl QAct {
@@ -475,6 +577,8 @@ impl QAct {
             sums: pick(&self.sums, bpr, rows),
             fsums: pick(&self.fsums, bpr, rows),
             hsums: pick(&self.hsums, 2 * bpr, rows),
+            neg8: pick(&self.neg8, bpr, rows),
+            neg32h: pick(&self.neg32h, 2 * bpr, rows),
             t: rows.len(),
             n_in: n,
         }
@@ -776,8 +880,10 @@ mod tests {
             .collect();
         x[QBLOCK..2 * QBLOCK].fill(0.0); // an all-zero block
         x[2 * QBLOCK + 3] = 1e-30;
-        for tt in [1, t] {
+        // (The later passes take the earlier ones' recycled buffers, stale contents included.)
+        for tt in [1, t, 1, 2, t] {
             let xa = quantize_act(&x[..tt * n], tt, n);
+            assert_eq!((xa.q.len(), xa.neg32h.len(), xa.t), (tt * n, tt * n / 16, tt));
             for (bi, blk) in x[..tt * n].chunks(QBLOCK).enumerate() {
                 let amax = blk.iter().fold(0f32, |m, v| m.max(v.abs()));
                 let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
@@ -787,6 +893,11 @@ mod tests {
                 assert_eq!(xa.sums[bi], q.iter().map(|&v| v as i32).sum::<i32>());
                 assert_eq!(xa.fsums[bi].to_bits(), blk.iter().sum::<f32>().to_bits());
                 assert_eq!(xa.hsums[2 * bi + 1].to_bits(), blk[16..].iter().sum::<f32>().to_bits());
+                assert_eq!(xa.neg8[bi], -8 * xa.sums[bi]);
+                for h in 0..2 {
+                    let s16: i32 = q[16 * h..16 * h + 16].iter().map(|&v| v as i32).sum();
+                    assert_eq!(xa.neg32h[2 * bi + h], -32 * s16);
+                }
             }
         }
     }

@@ -1444,6 +1444,12 @@ pub(crate) struct Act {
     /// Integer block sums of the int8 values (folds the offset of centered nibble formats).
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub i: *const i32,
+    /// `-8` times the integer block sums ([`QAct::neg8`]).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub n8: *const i32,
+    /// `-32` times the integer sums of each half block ([`QAct::neg32h`]).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub n32h: *const i32,
     pub n_in: usize,
 }
 
@@ -1456,6 +1462,8 @@ impl Act {
             f: unsafe { xa.fsums.as_ptr().add(c0 * n / QBLOCK) },
             h: unsafe { xa.hsums.as_ptr().add(c0 * n / 16) },
             i: unsafe { xa.sums.as_ptr().add(c0 * n / QBLOCK) },
+            n8: unsafe { xa.neg8.as_ptr().add(c0 * n / QBLOCK) },
+            n32h: unsafe { xa.neg32h.as_ptr().add(c0 * n / 16) },
             n_in: n,
         }
     }

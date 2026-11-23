@@ -669,15 +669,17 @@ Where oxinfer is still behind:
   oxinfer's work-claiming pool held up. Per-core throughput is not ahead: both engines' int8
   kernels issue at the SDOT rate (~340 GOP/s on one core).
 - **CPU decode per core** (round 6: Q8_0, Q4_0, Q4_K and Q6_K matrices interleaved four rows at
-  a time in place, llama.cpp's repacked layout, bit-identical): level with llama.cpp on 1 and 4
-  threads for Q8_0, ahead for Q4_0, 5-10% behind for Q4_K_M; on all threads level or ahead, and
+  a time in place, llama.cpp's repacked layout, bit-identical; round 8: Q6_K and Q4_K kernels
+  with fewer instructions, still bit-identical, Q6_K +49% and Q4_K +9% on one core): level with
+  llama.cpp on 1 and 4 threads for Q8_0, ahead for Q4_0 and now for Q4_K_M (Llama 1B 47.8
+  against 44.6 tok/s on one thread, 151 against 135 on four); on all threads level or ahead, and
   under load far ahead (llama.cpp's spinning threads collapse at 12 threads). The 8-thread gap
   of round 6 turned out to be core placement: macOS packs 8 threads into two of the three
   clusters in some minutes (each cluster has its own bandwidth ceiling), and llama.cpp's
-  threads are packed as often as oxinfer's. On 8 threads oxinfer is now level or ahead
-  (round 7, which also vectorized the RMSNorms' sums of squares: +1-4% a step). See
-  [CPU decode round 7](#cpu-decode-round-7-8-threads-november-2026), and rounds 6, 5, 4 and 3
-  before it.
+  threads are packed as often as oxinfer's; on 8 threads oxinfer is level or ahead (round 7,
+  which also vectorized the RMSNorms' sums of squares: +1-4% a step). Left: an all-Q4_K model
+  ~6% behind on one core. See [CPU decode round 8](#cpu-decode-round-8-q4_k-and-q6_k-november-2026),
+  [round 7](#cpu-decode-round-7-8-threads-november-2026), and rounds 6, 5, 4 and 3 before it.
   Qwen3-8B (Q8_0, Q4_K_M), Gemma 4 12B, 26B-A4B, Orpheus and Llama 1B Q4_K_M decode level with
   or ahead of llama.cpp's best thread count.
 
@@ -1743,6 +1745,114 @@ Not done:
   `vec!` allocations of every layer's temporaries.
 - The calling thread's wait for the last tasks: 0.24 ms of a Llama 1B step on 8 threads, 10 us
   per Gemma gate / up region.
+
+#### CPU decode round 8: Q4_K and Q6_K (November 2026)
+
+Rounds 6 and 7 left Q4_K_M per core 5-10% behind llama.cpp. Taken apart by tensor type (a Llama 3.2 1B
+Q4_K_M token reads 467 MB of Q4_K and 332 MB of Q6_K, the 215 MB tied LM head among it) with
+`llama-quantize --pure` copies of the f16 checkpoint, one core (tg64, load 5): all-Q4_K
+llama.cpp 55.5 tok/s against 47.3, all-Q6_K 32.3 against 29.4. In `matvec_bench` the
+interleaved kernels read 33-36 GB/s (Q4_K) and 30-33 (Q6_K) on one core.
+
+Both kernels were bound by vector instructions, not by memory (one core streams Q8_0 at 86
+GB/s). The Q6_K kernel took ~450 vector instructions a four-row super-block: four to six to
+rebuild each 6-bit value vector, a subtraction of 32 per vector, and the `qh` pieces loaded
+twice. llama.cpp's kernels (`ggml_gemv_q4_K_8x8_q8_K`, the one picked on the M5 since it has
+i8mm, and `ggml_gemv_q6_K_8x8_q8_K`; both are SDOT GEMVs, SMMLA is only in their GEMMs) apply
+the scales in integers per 256 values against Q8_K activations (one f32 scale per 256), and
+decode the 6-bit scales with scalar code. oxinfer's activations keep one scale per 32 (more
+accurate, and the reason the float work is per 32), so the per-32 float steps stay; what changed
+is how the integers get there.
+
+Kept (bit-identical: the same integers, then the same f32 operations in the same order):
+
+- **Q6_K** (`q6k_x4`): the values stay unsigned (0..64), and each sub-block of 16's SDOT chain
+  starts from `-32` times the activations' integer sum over those 16 values, loaded to every
+  lane (`ld1r`), the same integer as the sum of the centred values. Each `qh` piece is read once
+  for the two `ql` segments it completes, and every value vector is two instructions (`and` +
+  `sli` for the low nibbles, `and` + `usra` for the high ones). One core 32.7 -> 48.7 GB/s
+  (+49%), four threads 112-124 -> 142-164.
+- **Q4_K** (`q4k_x4`): each sub-block's chain starts from `-8` times the activations' block sum
+  instead of having it subtracted; a scale byte becomes an f32 lane in one table lookup and one
+  conversion (`tbl` straight into 32-bit lanes; it was a lookup and five widenings per four);
+  `n * dmin - 8 * ds` is one fused multiply-subtract (`ds * 8` is exact, so it rounds once
+  either way); the activation scales and sums are read as vectors and used by lane. One core
+  36.6 -> 39.9 GB/s (+9%), four threads 114-134 -> 123-145.
+- The activations (`QAct`) carry the two new sums (`neg8`: `-8` times each block's integer sum;
+  `neg32h`: `-32` times each half block's), computed while quantizing.
+- **No allocations for decode activations**: a quantized input's arrays (`QAct`, seven of them)
+  go back to a small per-thread free list when dropped, and the next quantization of a
+  decode-sized input (up to 64k values) takes them instead of allocating and zero-filling (every
+  block is written before it is read; `quant::tests::activation_quantization_matches_scalar`
+  now quantizes into recycled buffers too).
+
+Per-core GB/s of weights read (`matvec_bench X4=1`, 2048 x 2048 / 8192 x 2048 / 2048 x 8192,
+best of 3 alternated runs, load 17-26 at the start, 5 at the end):
+
+| kernel | 1 thread before | after | 4 threads before | after |
+|---|---|---|---|---|
+| Q8_0 | 85.8-86.1 | 85.9-86.6 | | |
+| Q4_0 | 54.4-55.2 | 54.6-55.3 | | |
+| Q4_K | 36.4-36.9 | 39.6-39.9 | 114-134 | 123-145 |
+| Q6_K | 32.6-32.8 | 48.4-48.9 | 112-124 | 142-164 |
+
+Decode tg64 (`parity_bench`, median of 3, `device=cpu threads=N lookup=0 draft=none mtp=0`;
+llama.cpp `llama-bench -ngl 0 -dev none -t N -n 64 -p 0 -r 3`, its mean; the three alternated at
+each thread count, load averages in brackets; "18" is oxinfer's default, decode steps on 16),
+tok/s:
+
+| model | threads | llama.cpp | before | after |
+|---|---|---|---|---|
+| Llama 3.2 1B Q4_K_M [7-8] | 1 | 44.6 | 39.8 | 47.8 |
+| | 4 | 135.1 | 129.1 | 151.2 |
+| | 8 | 202.8 | 213.0 | 229.5 |
+| | 18 | 0.7 | 240.6 | 247.3 |
+| Llama 3.2 1B Q8_0 [17-25] | 1 | 56.7 | 58.9 | 59.1 |
+| | 4 | 151.9 | 155.2 | 159.2 |
+| | 8 | 161.6 | 158.6 | 160.8 |
+| | 18 | 1.5 | 180.0 | 177.0 |
+| Qwen3-8B Q4_K_M, tg32 [3-4] | 1 | 8.41 | 7.5 | 8.8 |
+| | 4 | 29.1 | 25.6 | 28.2 |
+| Gemma 4 26B-A4B Q4_0 [11-30] | 1 | 16.8 | 20.8 | 21.5 |
+| | 4 | 47.0 | 58.2 | 56.7 |
+| | 8 | 63.9 | 68.6 | 68.4 |
+| | 18 | 3.4 | 70.3 | 71.4 |
+
+Earlier the same evening (load 5), alternated the same way: Q4_K_M one thread 43.3-44.5 /
+38.3-39.6 / 47.6-48.2, four threads 140.3 / 128.4 / 149.2; all-Q4_K one thread 55.0 / 46.7 /
+51.8; all-Q6_K one thread 32.3 / 29.4 / 37.8 (a later run, load 4: 32.2 / 28.9 / 37.8). So Q4_K_M is now ahead
+of llama.cpp per core on Llama 1B (+7-12% on 1 and 4 threads, +13% on 8) where it was 5-10%
+behind, and on Qwen3-8B ahead on one thread and within 3% on four (it was 11% behind); the
+Q8_0 and Q4_0 rows are unchanged kernels (within the run-to-run noise of a loaded machine) and
+level with or ahead of llama.cpp at 1-8 threads. At 18 threads llama.cpp's spinning threads
+collapse with other jobs on the machine (0.7-3.4 tok/s), as in round 6. An all-Q4_K model is
+still ~6% behind on one core (51.8 against 55.0): the Q4_K kernel's float steps per 32 values
+are what its activation scales per 32 cost (see below).
+
+Correctness: the kernels are bit-identical to the plain ones (and so to the previous build):
+`ggml::tests::interleaved_rows_match_plain` (one token, 2-16 token tiles, row ranges cutting
+groups) and the multi-token batch-invariance tests pass unchanged, and `pf_check` (200-token
+prompt, 64 greedy tokens with the top-20 log-probabilities of every step, `device=cpu`) writes
+byte-identical files for the previous build, this one, and this one with `cpu_repack=0`, on
+Llama 3.2 1B Q4_K_M and Q8_0, Qwen3-8B Q4_K_M and Gemma 4 26B-A4B Q4_0.
+
+Measured and dropped:
+
+- Q4_K's eight sub-block sums first and its scales after (fewer live vectors, the loop over the
+  four chunks unrolled so the sums stay in registers): no faster (39.4-39.9 against 39.7-40.3
+  GB/s); the spills it removed were loads and stores, which are not the limit.
+- The Q4_0 chains starting from `-8` times the block sum as well: 1-3% slower (51.5-52.7
+  against 52.6-54.6 GB/s); its subtraction was one instruction per block of four rows.
+- What Q4_K's scales cost: without them (wrong results, timing only) the kernel reads 64-66 GB/s
+  on one core against 40.7, so a third of its instructions are the per-32 float steps: the
+  conversion and products of the 6-bit scales (~70 instructions a group, independent of the
+  token) and four per sub-block and token. llama.cpp's Q8_K activations (one scale per 256)
+  make those integer, but change every Q4_K / Q6_K result; per-32 scales are kept.
+
+Serial work per step: the activations' allocations are gone (above); the RMSNorms' sums of
+squares were vectorized in [round 7](#cpu-decode-round-7-8-threads-november-2026). The calling
+thread's wait for the last tasks of a region shrank with the kernels (the same blocks, run
+faster); splitting the last blocks finer was measured slower in round 5.
 
 #### x86-64 CPU prefill (November 2026)
 
