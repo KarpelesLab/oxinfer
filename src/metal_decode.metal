@@ -655,13 +655,14 @@ kernel void dec_rms_norm(device const float* x [[buffer(0)]], device float* out 
     threadgroup float red[32];
     device const float* xr = x + (ulong)r * p.x_stride;
     device float* o = out + (ulong)r * p.o_stride;
-    // Up to 8 values per thread are loaded at once and kept in registers (one memory latency
-    // instead of a chain); longer rows loop.
-    float xv[8];
+    // Up to 8 values per thread (and their weights) are loaded at once and kept in registers (one
+    // memory latency instead of a chain); longer rows loop.
+    float xv[8], wv[8];
     bool fits = p.n <= 8 * nt;
     float s = 0.f;
     if (fits) {
         for (uint j = 0; j < 8; j++) { uint i = tid + j * nt; xv[j] = i < p.n ? xr[i] * p.pre : 0.f; }
+        for (uint j = 0; j < 8; j++) { uint i = tid + j * nt; wv[j] = p.has_w != 0 && i < p.n ? w[i] : 1.f; }
         for (uint j = 0; j < 8; j++) s += xv[j] * xv[j];
     } else {
         for (uint i = tid; i < p.n; i += nt) { float v = xr[i] * p.pre; s += v * v; }
@@ -680,7 +681,7 @@ kernel void dec_rms_norm(device const float* x [[buffer(0)]], device float* out 
             uint i = tid + j * nt;
             if (i < p.n) {
                 float v = xv[j] * k;
-                if (p.has_w != 0) v *= w[i];
+                if (p.has_w != 0) v *= wv[j];
                 if (p.add != 0) o[i] += v; else o[i] = v;
             }
         }
@@ -844,7 +845,24 @@ inline void attn_body(device const float* q, device const float* kc, device cons
         }
         uint nb = min(32u, j1 - base);
         device const float* vb = vc + (ulong)base * rs + (ulong)kvh * HD + lane * D;
-        for (uint t = 0; t < nb; t++) {
+        uint t0 = 0;
+        if (!SEL) {
+            // Whole groups of VB keys: their value rows are loaded together (one memory latency
+            // instead of a chain), then accumulated in the same order as below (VB x D floats of
+            // registers: fewer keys for wider heads, which would spill).
+            constexpr int VB = D <= 4 ? 8 : D == 8 ? 4 : 2;
+            for (; t0 + VB <= nb; t0 += VB) {
+                float v8[VB][D];
+                for (int u = 0; u < VB; u++)
+                    for (int d = 0; d < D; d++) v8[u][d] = vb[(t0 + u) * rs + d];
+                for (int u = 0; u < VB; u++)
+                    for (int g = 0; g < G; g++) {
+                        float et = simd_shuffle(e[g], t0 + u);
+                        for (int d = 0; d < D; d++) o[g][d] = fma(et, v8[u][d], o[g][d]);
+                    }
+            }
+        }
+        for (uint t = t0; t < nb; t++) {
             device const float* vr = SEL ? vc + (ulong)idx[base + t] * rs + (ulong)kvh * HD + lane * D : vb + t * rs;
             float v[D];
             for (int d = 0; d < D; d++) v[d] = vr[d];
@@ -1279,7 +1297,7 @@ inline float tg_total(float s, uint nt, uint sg, uint lane, threadgroup float* r
 }
 inline void add_norm_body(device const float* y, device float* x, device float* out, device const float* wy, device const float* wn,
                           constant AN& p, uint tid, uint nt, uint sg, uint lane, threadgroup float* red) {
-    float yv[8], xv[8];
+    float yv[8], xv[8], wyv[8], wnv[8];
     float s = 0.f;
     for (uint j = 0; j < 8; j++) {
         uint i = tid + j * nt;
@@ -1287,12 +1305,18 @@ inline void add_norm_body(device const float* y, device float* x, device float* 
         xv[j] = i < p.n ? x[i] : 0.f;
         s += yv[j] * yv[j];
     }
+    // The weights loaded while the sums are taken.
+    for (uint j = 0; j < 8; j++) {
+        uint i = tid + j * nt;
+        wyv[j] = i < p.n ? wy[i] : 0.f;
+        wnv[j] = i < p.n && p.has_next != 0 ? wn[i] : 0.f;
+    }
     float k = rsqrt(tg_total(s, nt, sg, lane, red) / float(p.n) + p.eps);
     float s2 = 0.f;
     for (uint j = 0; j < 8; j++) {
         uint i = tid + j * nt;
         if (i < p.n) {
-            xv[j] = (xv[j] + yv[j] * k * wy[i]) * p.scale;
+            xv[j] = (xv[j] + yv[j] * k * wyv[j]) * p.scale;
             x[i] = xv[j];
             s2 += xv[j] * xv[j];
         }
@@ -1301,7 +1325,7 @@ inline void add_norm_body(device const float* y, device float* x, device float* 
     float k2 = rsqrt(tg_total(s2, nt, sg, lane, red) / float(p.n) + p.eps);
     for (uint j = 0; j < 8; j++) {
         uint i = tid + j * nt;
-        if (i < p.n) out[i] = xv[j] * k2 * wn[i];
+        if (i < p.n) out[i] = xv[j] * k2 * wnv[j];
     }
 }
 kernel void dec_add_norm(device const float* y [[buffer(0)]], device float* x [[buffer(1)]], device float* out [[buffer(2)]],

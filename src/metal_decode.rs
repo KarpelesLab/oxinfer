@@ -1396,6 +1396,24 @@ struct GdnRuleParams {
     hdv: u32,
 }
 
+/// Threads of the one-row norm kernels (`dec_rms_norm`, `dec_add_norm`) for rows of `n`: 8
+/// values each, which the kernels load at once with their weights (fewer threads finish sooner
+/// than 1024 with fewer values: an RMSNorm of 4096 took 3.6 us instead of 5.1 in a pass).
+fn norm_threads(n: usize) -> usize {
+    n.div_ceil(8).next_multiple_of(32).clamp(32, 1024)
+}
+
+/// The attention kernel for `n` keys: fewer query heads per threadgroup than the plan's `grp`
+/// (more threadgroups, shorter chains) up to 1024 keys, where the shared key and value rows
+/// cost little. Each head's arithmetic is the same whatever the grouping, so the results are too.
+fn attn_narrow(pipe: Id, grp: usize, narrow: &[Option<Id>; 2], n: usize) -> (Id, usize) {
+    match (n, narrow) {
+        (..=512, [Some(p), _]) => (*p, 1),
+        (..=1024, [_, Some(p)]) => (*p, 2),
+        _ => (pipe, grp),
+    }
+}
+
 /// The matvec variant (rows per threadgroup, SIMD-groups per row) for a shape: enough lanes per
 /// row to cover it in one or two passes (measured: short rows want 1 SIMD-group, 8192 4).
 fn mv_variant(fmt: MvFmt, n_in: usize) -> (usize, usize) {
@@ -1693,6 +1711,9 @@ enum MOp {
         /// Query heads per threadgroup.
         grp: usize,
         pipe: Id,
+        /// The kernels with 1 and 2 query heads per threadgroup (when `grp` is larger), for
+        /// shorter contexts (see [`attn_narrow`]).
+        narrow: [Option<Id>; 2],
         combine: Id,
         q: usize,
         out: usize,
@@ -2503,7 +2524,7 @@ impl MetalBackend {
                     eps,
                     add,
                 } => 'norm: {
-                    let threads = n.next_multiple_of(32).min(1024);
+                    let threads = norm_threads(n);
                     // One row per token when the op has one row, else one dispatch per token.
                     let native = mt && rows == 1;
                     // Prefill: a norm feeding the next op's GEMM makes its half rows too.
@@ -3217,7 +3238,7 @@ impl MetalBackend {
                     n,
                     eps,
                 } => 'an: {
-                    let threads = n.next_multiple_of(32).min(1024);
+                    let threads = norm_threads(n);
                     if n > 8 * threads || wy.len() != n || next.is_some_and(|(_, w)| w.len() != n) {
                         return None;
                     }
@@ -3855,6 +3876,7 @@ impl MetalBackend {
                     emit.push(MOp::Attn {
                         grp,
                         pipe: self.named_pipeline(&format!("dec_attn_{d}_{grp}"))?,
+                        narrow: [None; 2],
                         combine: self.named_pipeline("dec_attn_combine")?,
                         hd: hd as u32,
                         q: byte(q),
@@ -3998,9 +4020,11 @@ impl MetalBackend {
                         .into_iter()
                         .find(|&g| rep.is_multiple_of(g) && g * d <= 16)
                         .unwrap_or(1);
+                    let narrow = [1, 2].map(|n| (n < grp).then(|| self.named_pipeline(&format!("dec_attn_{d}_{n}"))).flatten());
                     emit.push(MOp::Attn {
                         grp,
                         pipe: self.named_pipeline(&format!("dec_attn_{d}_{grp}"))?,
+                        narrow,
                         combine: self.named_pipeline("dec_attn_combine")?,
                         hd: hd as u32,
                         q: byte(q),
@@ -4863,6 +4887,7 @@ impl MetalPlan<'_> {
             MOp::Attn {
                 grp,
                 pipe,
+                narrow,
                 combine,
                 q,
                 out,
@@ -4906,6 +4931,10 @@ impl MetalPlan<'_> {
                     p.chunk = chunk as u32;
                     let part = self.part + j * self.part_stride;
                     let gt = gate.map_or(0, |g| g + j * sg);
+                    let mut grp = *grp;
+                    if sel.is_none() {
+                        (pipe, grp) = attn_narrow(pipe, grp, narrow, n);
+                    }
                     e.pipe(pipe);
                     e.buf(arena, *q + j * sq, 0);
                     e.buf(kvb[*kv].0, 0, 1);
@@ -6910,6 +6939,7 @@ impl DecodePlan for MetalPlan<'_> {
                     MOp::Attn {
                         grp,
                         pipe,
+                        narrow,
                         combine,
                         q,
                         out,
@@ -6936,6 +6966,10 @@ impl DecodePlan for MetalPlan<'_> {
                         let chunk = n.div_ceil(ATTN_MAX_SPLIT).next_multiple_of(256).max(256);
                         p.nsplit = n.div_ceil(chunk) as u32;
                         p.chunk = chunk as u32;
+                        let mut grp = *grp;
+                        if sel.is_none() {
+                            (pipe, grp) = attn_narrow(pipe, grp, narrow, n);
+                        }
                         e.pipe(pipe);
                         e.buf(arena, *q, 0);
                         e.buf(kvb[*kv].0, 0, 1);
