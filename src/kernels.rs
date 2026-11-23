@@ -1107,6 +1107,178 @@ pub mod simd {
             _ => unreachable!("bad tc {tc}"),
         }
     }
+
+    /// `out[j] = dot(q, keys[j * stride..])` for `n` keys of `hd` values, with the bits of
+    /// [`super::dot`]: 8 partial sums per product (a multiply then an add, no FMA) added up in
+    /// order, then the leftover elements. Eight keys go at a time, so eight independent sums
+    /// are in flight instead of one that waits for each of its additions.
+    ///
+    /// # Safety
+    /// `q` covers `hd` values, `keys` `(n - 1) * stride + hd`, `out` `n`.
+    pub unsafe fn dots_neon(q: *const f32, hd: usize, keys: *const f32, stride: usize, n: usize, out: *mut f32) {
+        #[inline(always)]
+        unsafe fn pass<const K: usize>(q: *const f32, hd: usize, keys: *const f32, stride: usize, out: *mut f32) {
+            unsafe {
+                let chunks = hd / 8;
+                let z = vdupq_n_f32(0.0);
+                let mut acc = [[z; 2]; K];
+                for i in 0..chunks {
+                    let (q0, q1) = (vld1q_f32(q.add(8 * i)), vld1q_f32(q.add(8 * i + 4)));
+                    for (k, a) in acc.iter_mut().enumerate() {
+                        let p = keys.add(k * stride + 8 * i);
+                        a[0] = vaddq_f32(a[0], vmulq_f32(q0, vld1q_f32(p)));
+                        a[1] = vaddq_f32(a[1], vmulq_f32(q1, vld1q_f32(p.add(4))));
+                    }
+                }
+                for (k, acc) in acc.iter().enumerate() {
+                    let mut a = [0f32; 8];
+                    vst1q_f32(a.as_mut_ptr(), acc[0]);
+                    vst1q_f32(a.as_mut_ptr().add(4), acc[1]);
+                    let mut s = a.iter().sum::<f32>();
+                    for i in chunks * 8..hd {
+                        s += *q.add(i) * *keys.add(k * stride + i);
+                    }
+                    *out.add(k) = s;
+                }
+            }
+        }
+        unsafe {
+            let mut j = 0;
+            while j + 8 <= n {
+                pass::<8>(q, hd, keys.add(j * stride), stride, out.add(j));
+                j += 8;
+            }
+            if j + 4 <= n {
+                pass::<4>(q, hd, keys.add(j * stride), stride, out.add(j));
+                j += 4;
+            }
+            while j < n {
+                pass::<1>(q, hd, keys.add(j * stride), stride, out.add(j));
+                j += 1;
+            }
+        }
+    }
+
+    /// `out[r][c] (+)= sum_j w[r * ws + j] * values[j * stride + c]` for the first columns `c` of
+    /// `hd` (whole groups of 4), in order of `j`, a multiply then an add (the bits of an `axpy`
+    /// per key); from zero, or with `add` from what `out` holds (so that the keys can go in
+    /// chunks: the chain of each sum is the same). Returns the number of columns done (the rest
+    /// is the caller's). The sums of up to four rows over 16 columns stay in registers while
+    /// the keys pass, so each value is loaded once for the rows that share it and nothing is
+    /// stored per key.
+    ///
+    /// # Safety
+    /// `w` holds `rows` rows of `n` weights `ws` apart, `values` covers `(n - 1) * stride + hd`,
+    /// `out` is `rows * hd`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn weighted_values_neon(
+        w: *const f32,
+        ws: usize,
+        rows: usize,
+        n: usize,
+        values: *const f32,
+        stride: usize,
+        hd: usize,
+        out: *mut f32,
+        add: bool,
+    ) -> usize {
+        #[inline(always)]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn pass<const R: usize, const Q: usize>(
+            w: *const f32,
+            ws: usize,
+            n: usize,
+            values: *const f32,
+            stride: usize,
+            hd: usize,
+            out: *mut f32,
+            add: bool,
+        ) {
+            unsafe {
+                let z = vdupq_n_f32(0.0);
+                let mut acc = [[z; Q]; R];
+                if add {
+                    for (r, a) in acc.iter_mut().enumerate() {
+                        for (q, s) in a.iter_mut().enumerate() {
+                            *s = vld1q_f32(out.add(r * hd + 4 * q));
+                        }
+                    }
+                }
+                for j in 0..n {
+                    let p = values.add(j * stride);
+                    let v: [float32x4_t; Q] = std::array::from_fn(|q| vld1q_f32(p.add(4 * q)));
+                    for (r, a) in acc.iter_mut().enumerate() {
+                        let x = vld1q_dup_f32(w.add(r * ws + j));
+                        for q in 0..Q {
+                            a[q] = vaddq_f32(a[q], vmulq_f32(x, v[q]));
+                        }
+                    }
+                }
+                for (r, a) in acc.iter().enumerate() {
+                    for (q, s) in a.iter().enumerate() {
+                        vst1q_f32(out.add(r * hd + 4 * q), *s);
+                    }
+                }
+            }
+        }
+        unsafe {
+            let mut r = 0;
+            let mut done = 0;
+            while r < rows {
+                let g = if rows - r >= 4 {
+                    4
+                } else if rows - r >= 2 {
+                    2
+                } else {
+                    1
+                };
+                let (wr, or) = (w.add(r * ws), out.add(r * hd));
+                let mut c = 0;
+                while c + 16 <= hd {
+                    match g {
+                        4 => pass::<4, 4>(wr, ws, n, values.add(c), stride, hd, or.add(c), add),
+                        2 => pass::<2, 4>(wr, ws, n, values.add(c), stride, hd, or.add(c), add),
+                        _ => pass::<1, 4>(wr, ws, n, values.add(c), stride, hd, or.add(c), add),
+                    }
+                    c += 16;
+                }
+                while c + 4 <= hd {
+                    match g {
+                        4 => pass::<4, 1>(wr, ws, n, values.add(c), stride, hd, or.add(c), add),
+                        2 => pass::<2, 1>(wr, ws, n, values.add(c), stride, hd, or.add(c), add),
+                        _ => pass::<1, 1>(wr, ws, n, values.add(c), stride, hd, or.add(c), add),
+                    }
+                    c += 4;
+                }
+                done = c;
+                r += g;
+            }
+            done
+        }
+    }
+}
+
+/// For measurements: `OXINFER_ATTN_UNBLOCKED=1` runs a prompt chunk's attention loop one
+/// (token, KV head) at a time instead of `model::attention_blocked` (the same bits).
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn attn_unblocked() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var_os("OXINFER_ATTN_UNBLOCKED").is_some())
+}
+
+/// Whether attention takes the NEON kernels of [`dots`] and [`weighted_values`] (the same bits
+/// as the scalar loops) and, for a prompt chunk, the blocked per-head loop built on them in
+/// place of the score and value GEMMs (`model::prefill_attention_gemm`): aarch64 Linux,
+/// where this was measured (Cortex-X925 / A725). `OXINFER_ATTN_NEON=0` keeps the
+/// scalar loops and the GEMMs, `1` selects the kernels anywhere on aarch64.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn attn_neon() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("OXINFER_ATTN_NEON").as_deref() {
+        Ok("0") => false,
+        Ok("1") => true,
+        _ => cfg!(target_os = "linux"),
+    })
 }
 
 /// Computes rows r0..r1 of the output for all t tokens.
@@ -2498,6 +2670,12 @@ pub fn dots(q: &[f32], keys: &[f32], stride: usize, out: &mut [f32]) {
         unsafe { simd::dots_avx2(q.as_ptr(), hd, keys.as_ptr(), stride, n, out.as_mut_ptr()) };
         return;
     }
+    #[cfg(target_arch = "aarch64")]
+    if attn_neon() {
+        // SAFETY: the lengths were checked above.
+        unsafe { simd::dots_neon(q.as_ptr(), hd, keys.as_ptr(), stride, n, out.as_mut_ptr()) };
+        return;
+    }
     for (j, o) in out.iter_mut().enumerate() {
         *o = dot(q, &keys[j * stride..j * stride + hd]);
     }
@@ -2526,6 +2704,11 @@ pub fn weighted_values(w: &[f32], values: &[f32], stride: usize, hd: usize, out:
         // SAFETY: AVX2 was detected; the lengths were checked above.
         done = unsafe { simd::weighted_values(w.as_ptr(), rows, n, values.as_ptr(), stride, hd, out.as_mut_ptr()) };
     }
+    #[cfg(target_arch = "aarch64")]
+    if attn_neon() {
+        // SAFETY: the lengths were checked above.
+        done = unsafe { simd::weighted_values_neon(w.as_ptr(), n, rows, n, values.as_ptr(), stride, hd, out.as_mut_ptr(), false) };
+    }
     if done == hd {
         return;
     }
@@ -2534,6 +2717,33 @@ pub fn weighted_values(w: &[f32], values: &[f32], stride: usize, hd: usize, out:
         let o = &mut out[r * hd + done..(r + 1) * hd];
         o.fill(0.0);
         for (j, &x) in w[r * n..(r + 1) * n].iter().enumerate() {
+            for (c, a) in o.iter_mut().enumerate() {
+                *a += x * values[j * stride + done + c];
+            }
+        }
+    }
+}
+
+/// `out[r * hd + c] += sum_j w[r * ws + j] * values[j * stride + c]` for `j` in `0..n`, in order:
+/// [`weighted_values`] continued from what `out` holds, with the rows of `w` `ws` apart. Keys
+/// taken in consecutive chunks into rows that start at zero give [`weighted_values`]'s bits.
+pub fn weighted_values_add(w: &[f32], ws: usize, n: usize, values: &[f32], stride: usize, hd: usize, out: &mut [f32]) {
+    let rows = out.len() / hd.max(1);
+    if rows == 0 || hd == 0 || n == 0 {
+        return;
+    }
+    assert!(out.len() == rows * hd && ws >= n && w.len() >= (rows - 1) * ws + n);
+    assert!(values.len() >= (n - 1) * stride + hd, "values too short");
+    #[allow(unused_mut)]
+    let mut done = 0;
+    #[cfg(target_arch = "aarch64")]
+    if attn_neon() {
+        // SAFETY: the lengths were checked above.
+        done = unsafe { simd::weighted_values_neon(w.as_ptr(), ws, rows, n, values.as_ptr(), stride, hd, out.as_mut_ptr(), true) };
+    }
+    for r in 0..rows {
+        let o = &mut out[r * hd + done..(r + 1) * hd];
+        for (j, &x) in w[r * ws..r * ws + n].iter().enumerate() {
             for (c, a) in o.iter_mut().enumerate() {
                 *a += x * values[j * stride + done + c];
             }
@@ -3297,6 +3507,20 @@ mod tests {
                     weighted_values(&w, &keys, stride, hd, &mut got);
                     for (i, (a, b)) in got.iter().zip(&want).enumerate() {
                         assert_eq!(a.to_bits(), b.to_bits(), "values hd {hd} n {n} rows {rows} at {i}");
+                    }
+                    // The keys in chunks of 3 into zeroed rows, the weights' rows spaced apart.
+                    let ws = n + 2;
+                    let mut wide = vec![f32::NAN; rows * ws];
+                    for r in 0..rows {
+                        wide[r * ws..r * ws + n].copy_from_slice(&w[r * n..(r + 1) * n]);
+                    }
+                    let mut got = vec![0f32; rows * hd];
+                    for j0 in (0..n).step_by(3) {
+                        let m = (n - j0).min(3);
+                        weighted_values_add(&wide[j0..], ws, m, &keys[j0 * stride..], stride, hd, &mut got);
+                    }
+                    for (i, (a, b)) in got.iter().zip(&want).enumerate() {
+                        assert_eq!(a.to_bits(), b.to_bits(), "chunked values hd {hd} n {n} rows {rows} at {i}");
                     }
                 }
             }

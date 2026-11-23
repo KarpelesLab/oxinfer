@@ -2408,6 +2408,11 @@ pub(crate) fn attention_ext(
         return;
     }
     let group = if t * n_kv >= threads { rep } else { 1 };
+    #[cfg(target_arch = "aarch64")]
+    if par && group == rep && t >= PREFILL_ATTN_MIN && crate::kernels::attn_neon() && !crate::kernels::attn_unblocked() {
+        debug_assert!((0..t).all(|ti| hi_of(ti) <= cache.len));
+        return attention_blocked(q, cache, nh, t, &lo_of, &hi_of, out);
+    }
     let groups_per_kv = rep / group;
     let ntasks = t * n_kv * groups_per_kv;
     let op = SendPtr(out.as_mut_ptr());
@@ -2482,7 +2487,109 @@ pub(crate) fn prefill_attention_gemm(t: usize) -> bool {
     if crate::kernels::simd::avx2() {
         return false;
     }
+    // Nor on aarch64 Linux, where the loop has NEON kernels and takes a
+    // prompt's queries in blocks over chunks of keys (`attention_blocked`): on a DGX Spark
+    // (Cortex-X925 / A725) the GEMMs measured 0.8x of it at 512 tokens (docs/performance.md,
+    // "DGX Spark CPU").
+    #[cfg(target_arch = "aarch64")]
+    if crate::kernels::attn_neon() {
+        return false;
+    }
     t >= PREFILL_ATTN_MIN
+}
+
+/// Queries per task of [`attention_blocked`] (tokens of one KV head's group).
+#[cfg(target_arch = "aarch64")]
+const ATTN_BLOCK_TOKENS: usize = 8;
+
+/// The per-(token, KV head) loop of [`attention_ext`] for a prompt chunk, with the same bits:
+/// a task takes the query heads of one KV head for [`ATTN_BLOCK_TOKENS`] tokens and passes the
+/// keys, then the values, in chunks that stay in L1 / L2 for all of them, instead of every
+/// token streaming all the keys and values it sees from memory (megabytes per layer at a few
+/// thousand tokens of context). Each score is the same dot product and each output the same
+/// sum in key order.
+#[cfg(target_arch = "aarch64")]
+fn attention_blocked(
+    q: &[f32],
+    cache: &LayerCache,
+    nh: usize,
+    t: usize,
+    lo_of: &(dyn Fn(usize) -> usize + Sync),
+    hi_of: &(dyn Fn(usize) -> usize + Sync),
+    out: &mut [f32],
+) {
+    thread_local! {
+        // Already const; clippy (1.100) still flags it on Android's thread-local implementation.
+        #[allow(clippy::missing_const_for_thread_local)]
+        static SCORES: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let (hd, n_kv) = (cache.hd, cache.n_kv);
+    let rep = nh / n_kv;
+    let stride = n_kv * hd;
+    let tb = ATTN_BLOCK_TOKENS;
+    // Keys per chunk: about 32 KiB of key (or value) rows.
+    let kc = (8192 / hd.max(1)).max(16);
+    let nblocks = t.div_ceil(tb);
+    let op = SendPtr(out.as_mut_ptr());
+    crate::pool::run(nblocks * n_kv, &|task| {
+        let (blk, kvh) = (task / n_kv, task % n_kv);
+        let (t0, t1) = (blk * tb, ((blk + 1) * tb).min(t));
+        let blo = (t0..t1).map(lo_of).min().unwrap();
+        let bhi = (t0..t1).map(hi_of).max().unwrap();
+        let width = bhi.saturating_sub(blo);
+        SCORES.with(|sc| {
+            let mut sc = sc.borrow_mut();
+            let need = (t1 - t0) * rep * width;
+            if sc.len() < need {
+                sc.resize(need, 0.0);
+            }
+            // Scores: every query of the block against one chunk of keys at a time.
+            let mut c0 = blo;
+            while c0 < bhi {
+                let c1 = (c0 + kc).min(bhi);
+                for ti in t0..t1 {
+                    let (j0, j1) = (lo_of(ti).max(c0), hi_of(ti).min(c1));
+                    if j0 >= j1 {
+                        continue;
+                    }
+                    let keys = cache.k_from(j0, kvh);
+                    for h in 0..rep {
+                        let qb = (ti * nh + kvh * rep + h) * hd;
+                        let row = ((ti - t0) * rep + h) * width;
+                        crate::kernels::dots(&q[qb..qb + hd], keys, stride, &mut sc[row + j0 - blo..row + j1 - blo]);
+                    }
+                }
+                c0 = c1;
+            }
+            for ti in t0..t1 {
+                let (lo, hi) = (lo_of(ti), hi_of(ti));
+                for h in 0..rep {
+                    let row = ((ti - t0) * rep + h) * width;
+                    softmax_inplace(&mut sc[row + lo - blo..row + hi.max(lo) - blo]);
+                }
+            }
+            // SAFETY: tasks write disjoint ranges of `out` (the block's tokens, this KV head's
+            // query heads).
+            let o_of = |ti: usize| unsafe { std::slice::from_raw_parts_mut(op.get().add((ti * nh + kvh * rep) * hd), rep * hd) };
+            for ti in t0..t1 {
+                o_of(ti).fill(0.0);
+            }
+            // Values: each chunk of value rows added into every query that sees it, in key order.
+            let mut c0 = blo;
+            while c0 < bhi {
+                let c1 = (c0 + kc).min(bhi);
+                for ti in t0..t1 {
+                    let (j0, j1) = (lo_of(ti).max(c0), hi_of(ti).min(c1));
+                    if j0 >= j1 {
+                        continue;
+                    }
+                    let row = (ti - t0) * rep * width;
+                    crate::kernels::weighted_values_add(&sc[row + j0 - blo..], width, j1 - j0, cache.v_from(j0, kvh), stride, hd, o_of(ti));
+                }
+                c0 = c1;
+            }
+        });
+    });
 }
 
 /// Causal (optionally sliding-window, `ext`-extended: see [`attention_ext`]) attention for a
