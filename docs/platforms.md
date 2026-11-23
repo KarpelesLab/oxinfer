@@ -216,6 +216,10 @@ IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4. Three things run on the
   a grid row per token, so their results are the single-token steps' bit for bit. On an RTX PRO
   6000 Blackwell (`parity_bench`, tg128): Llama-3.2-1B Q4_K_M 768 tok/s and Qwen3-8B Q4_K_M 169
   (666 / 161 with 4 values per lane and the pairs unfused; llama.cpp `e6d624b` 1067 / 254).
+  Measured and dropped: an int8 matvec for Q4_K, Q6_K and Q8_0 (x rounded per block of 32 as
+  the CPU's decode kernels round it, once per block of rows into shared memory, then `dp4a`
+  against the stored integers and each block's sums scaled in f32, as llama.cpp's `mmvq`):
+  662 / 142 tok/s with a row per warp, 638 / 154 with two, 618 / 152 with four.
 - **Prompts, whole pass** (`decode_plan_prefill`, steps of up to 512 tokens,
   `OXINFER_CUDA_PREFILL_TOKENS`; `OXINFER_PREFILL_GPU=0` keeps the op-by-op path): the matmuls as
   tensor-core GEMMs. By default (`gemmh_*`) the activations go in as f16 rows (converted once per
