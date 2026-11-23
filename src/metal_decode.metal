@@ -2164,3 +2164,37 @@ kernel void pfx_lora_add(device const float* u [[buffer(0)]], device const float
     else at = (ulong)j * 2 * p.n + o;
     out[at] += acc;
 }
+
+// ---- A DSpark draft's Markov chain on the device (greedy, `Backend::markov_greedy`): slot i
+// takes the bf16 row of `markov_w1` for the token at tok[i] (`mk_gather`), adds `markov_w2`
+// times it to its logits (a few-rows matvec in add mode), and writes its argmax to tok[i + 1]
+// (`mk_argmax`: the first index of the largest value; NaNs never win, 0 when nothing does).
+struct MkP { uint rank; uint vocab; uint slot; uint _p; };
+kernel void mk_gather(device const ushort* w1 [[buffer(0)]], device const uint* tok [[buffer(1)]], device float* x [[buffer(2)]],
+                      constant MkP& p [[buffer(3)]], uint tid [[thread_position_in_grid]]) {
+    if (tid >= p.rank) return;
+    x[tid] = as_type<float>(uint(w1[(ulong)tok[p.slot] * p.rank + tid]) << 16);
+}
+inline void mk_pick(thread float& bv, thread uint& bi, float v, uint i) {
+    if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+}
+kernel void mk_argmax(device const float* y [[buffer(0)]], device uint* tok [[buffer(1)]], constant MkP& p [[buffer(2)]],
+                      uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float tv[32];
+    threadgroup uint ti[32];
+    device const float* row = y + (ulong)p.slot * p.vocab;
+    float bv = -INFINITY;
+    uint bi = 0xffffffffu;
+    for (uint k = tid; k < p.vocab; k += 1024) {
+        float v = row[k];
+        if (v > bv) { bv = v; bi = k; }
+    }
+    for (ushort m = 16; m > 0; m >>= 1) mk_pick(bv, bi, simd_shuffle_xor(bv, m), simd_shuffle_xor(bi, m));
+    if (lane == 0) { tv[sg] = bv; ti[sg] = bi; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        for (uint k = 1; k < 32; k++) mk_pick(bv, bi, tv[k], ti[k]);
+        tok[p.slot + 1] = bi == 0xffffffffu ? 0u : bi;
+    }
+}

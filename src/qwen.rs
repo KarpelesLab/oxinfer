@@ -1964,6 +1964,7 @@ impl<'a> QwenModel<'a> {
         });
         self.gpu_plans.get(key, || {
             let be = crate::gpu::active()?;
+            let t0 = crate::clock::Instant::now();
             let plan = self.gpu_graph_with(None, Some(layers)).and_then(|g| {
                 if fast {
                     be.decode_plan_multi_fast(&g, tokens)
@@ -1971,6 +1972,14 @@ impl<'a> QwenModel<'a> {
                     be.decode_plan_multi(&g, tokens)
                 }
             });
+            if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
+                eprintln!(
+                    "[gpu multi-token plan ({tokens} tokens{}, {} captures): {:.1} ms]",
+                    if fast { ", fast" } else { "" },
+                    layers.len(),
+                    t0.elapsed().as_secs_f64() * 1e3
+                );
+            }
             if plan.is_none() {
                 eprintln!("[no multi-token GPU plan for this model: speculative verification runs on the CPU]");
             }

@@ -1012,6 +1012,21 @@ pub(crate) trait DevEngine: Send + Sync {
     ) -> Option<(usize, usize)> {
         None
     }
+    /// [`DevEngine::greedy`] that also appends to `feats` the streams `capture` lists (as
+    /// [`DevWant::capture`]: `[t, capture.len(), hidden]`) of each kept pass.
+    #[allow(clippy::too_many_arguments)]
+    fn greedy_capture(
+        &self,
+        _m: &Inkling2Model,
+        _sess: &mut Inkling2Session,
+        _first: u32,
+        _max: usize,
+        _capture: &[usize],
+        _feats: &mut Vec<f32>,
+        _on: &mut dyn FnMut(u32) -> crate::generate::Chain,
+    ) -> Option<(usize, usize)> {
+        None
+    }
 }
 
 /// A session's state on a device ([`DevEngine`]).
@@ -2073,6 +2088,32 @@ impl<'a> Inkling2Model<'a> {
         Some(kept)
     }
 
+    /// [`Self::decode_greedy`] that also appends to `feats` the residual streams entering
+    /// `layers` of each kept pass (as [`crate::dspark::Target::forward_feats`]), for a DSpark
+    /// draft's context. None (the session and `feats` untouched) when the device does not do it.
+    pub fn decode_greedy_feats(
+        &self,
+        sess: &mut Inkling2Session,
+        first: u32,
+        max: usize,
+        layers: &[usize],
+        feats: &mut Vec<f32>,
+        on: &mut dyn FnMut(u32) -> crate::generate::Chain,
+    ) -> Option<usize> {
+        if sess.iv.active() || sess.dev_off || crate::gpu::decode::check() {
+            return None;
+        }
+        let d = self.device()?;
+        let pos0 = sess.pos;
+        let n0 = feats.len();
+        let (ran, kept) = d.greedy_capture(self, sess, first, max, layers, feats, on)?;
+        if kept < ran {
+            sess.truncate(pos0 + kept).expect("a pass past the stop goes back");
+        }
+        feats.truncate(n0 + kept * layers.len() * self.cfg.hidden_size);
+        Some(kept)
+    }
+
     /// Runs `tokens` and returns the logits after the last one.
     pub fn forward(&self, sess: &mut Inkling2Session, tokens: &[u32]) -> Vec<f32> {
         let mut logits = Vec::new();
@@ -2923,6 +2964,17 @@ impl crate::dspark::Target for Inkling2Model<'_> {
         feats: &mut Vec<f32>,
     ) -> Vec<f32> {
         self.forward_capture(sess, tokens, mm, layers, feats)
+    }
+    fn decode_greedy_feats(
+        &self,
+        sess: &mut Inkling2Session,
+        first: u32,
+        max: usize,
+        layers: &[usize],
+        feats: &mut Vec<f32>,
+        on: &mut dyn FnMut(u32) -> crate::generate::Chain,
+    ) -> Option<usize> {
+        Inkling2Model::decode_greedy_feats(self, sess, first, max, layers, feats, on)
     }
     fn forward_verify(&self, sess: &mut Inkling2Session, tokens: &[u32], layers: &[usize], feats: &mut Vec<f32>, _fast: bool) -> Vec<f32> {
         let t = tokens.len();

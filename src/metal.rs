@@ -3535,6 +3535,14 @@ impl Backend for MetalBackend {
         self.matvec_rows_impl(x, t, n_in, jobs)
     }
 
+    fn markov_greedy(&self, j: &mut crate::gpu::MarkovJob) -> bool {
+        self.markov_greedy_impl(j)
+    }
+
+    fn has_markov_greedy(&self) -> bool {
+        true
+    }
+
     fn decode_plan_multi<'s>(
         &'s self,
         g: &crate::gpu::decode::Graph,

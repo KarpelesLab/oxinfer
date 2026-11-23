@@ -77,6 +77,26 @@ pub struct RowsJob<'a> {
     pub y: &'a mut [f32],
 }
 
+/// A DSpark draft's vanilla Markov head, greedy, in one submission ([`Backend::markov_greedy`]):
+/// slot `i`'s logits (`logits` row `i`) get the bias `w2 * w1[prev]`, where `prev` is `first`
+/// for slot 0 and slot `i - 1`'s argmax after its bias otherwise.
+pub struct MarkovJob<'a> {
+    /// `[vocab, rank]` bf16 rows: the previous token's embedding.
+    pub w1: &'a [u16],
+    pub w1_dev: &'a DeviceWeight,
+    /// `[vocab, rank]`: the bias.
+    pub w2: WeightRef<'a>,
+    pub w2_dev: &'a DeviceWeight,
+    pub rank: usize,
+    pub vocab: usize,
+    pub first: u32,
+    /// `[k, vocab]`: the slots' logits before the bias, replaced by the logits after it.
+    pub logits: &'a mut [f32],
+    /// `[k]`: each slot's argmax (the first index of the largest logit, as
+    /// [`crate::sampler::argmax`]).
+    pub tokens: &'a mut [u32],
+}
+
 /// Attention of a prefill chunk over a host KV cache ([`Backend::attention_cached`]): query
 /// `i` (position `start + i`, `[nh, hd]`, already scaled) attends to the cached positions
 /// `sel[i]` when set (QSA, Qwen4-Exp), else to positions `0..=start + i`; heads share key / value
@@ -166,6 +186,15 @@ pub trait Backend: Send + Sync {
     /// pass, where the device reads the weights faster than the CPU. Returns false if nothing was
     /// computed (the caller then runs the batch on the CPU).
     fn matvec_rows(&self, _x: &[f32], _t: usize, _n_in: usize, _jobs: &mut [RowsJob]) -> bool {
+        false
+    }
+    /// See [`MarkovJob`]: the whole chain in one submission. Returns false if nothing was
+    /// computed (the caller then runs the chain itself).
+    fn markov_greedy(&self, _j: &mut MarkovJob) -> bool {
+        false
+    }
+    /// Whether [`Backend::markov_greedy`] runs at all (the caller then prepares its table).
+    fn has_markov_greedy(&self) -> bool {
         false
     }
     /// Runs a convolution directly on the device (gathering the k x k neighbourhoods itself, so

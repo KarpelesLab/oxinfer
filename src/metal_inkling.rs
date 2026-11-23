@@ -755,7 +755,7 @@ struct StepPlan {
 }
 
 /// Arena offsets (floats), each sized for `tm` tokens.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Bufs {
     tm: usize,
     /// The block states (`tm * hidden` floats each).
@@ -817,7 +817,7 @@ struct Bufs {
     pf: Option<PfBufs>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PfBufs {
     xh: usize,
     rs: usize,
@@ -4145,121 +4145,20 @@ impl DevEngine for InkMetal {
         max: usize,
         on: &mut dyn FnMut(u32) -> Chain,
     ) -> Option<(usize, usize)> {
-        let em = self.emb.as_ref()?;
-        if max == 0 || profile_every() > 0 {
-            return None;
-        }
-        let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
-        if sess.dev.is_none() && !self.upload(m, sess) {
-            sess.dev = None;
-            return None;
-        }
-        let pos0 = sess.pos;
-        let dev = sess.dev.as_mut().and_then(|d| d.0.as_any().downcast_mut::<InkDev>())?;
-        dev.pos = pos0;
-        self.lora_strengths();
-        let c = Cx {
-            a: self.dec.id,
-            b: &self.dec.b,
-        };
-        let slot = |k: usize| unsafe { (self.f.contents(c.a) as *mut u32).add(c.b.tok + k) };
-        // Pass k reads its token from slot (k + 1) % 2 and writes its argmax to slot k % 2.
-        unsafe { *slot(1) = first };
-        let steps = self.plan.len() + 1;
-        let parts: Vec<std::ops::Range<usize>> = std::iter::once(0..2.min(steps))
-            .chain((2..steps).step_by(8).map(|s| s..(s + 8).min(steps)))
-            .collect();
-        let indirect = if self.be.residency.is_some() { &[][..] } else { &self.indirect[..] };
-        let be = self.be;
-        let wait: MsgVoid = be.o.msg_send();
-        let status: super::MsgU = be.o.msg_send();
-        let retain: super::Msg0 = be.o.msg_send();
-        let s_retain = be.o.sel(c"retain");
-        let drain = |cbs: &[Id]| -> bool {
-            let mut ok = true;
-            for &cb in cbs {
-                unsafe {
-                    wait(cb, be.sels.wait);
-                    ok &= status(cb, be.sels.status) == 4;
-                }
-            }
-            ok
-        };
-        let release = |cbs: Vec<Id>| {
-            for cb in cbs {
-                unsafe { wait(cb, be.sels.release) };
-            }
-        };
-        let submit = |k: usize, dev: &InkDev| -> Vec<Id> {
-            let pos = pos0 + k;
-            unsafe {
-                let pool = (be.sels.pool_push)();
-                let mut cbs = Vec::with_capacity(parts.len());
-                for r in &parts {
-                    let (cb, enc) = begin_enc(be, &self.f);
-                    let fe = FastEnc { enc, f: &self.f };
-                    let e = &Pe::new(&fe, None);
-                    e.use_resources(indirect);
-                    for si in r.clone() {
-                        if si == 0 {
-                            self.enc_embed(e, &c, em, c.b.tok + (k + 1) % 2);
-                            e.barrier();
-                        }
-                        if si == self.plan.len() {
-                            self.enc_final(e, &c, 1, &[], 1, Some(c.b.tok + k % 2));
-                        } else {
-                            self.enc_attn(e, &c, si, 1, pos, dev, &[]);
-                            self.enc_moe(e, &c, si, 1, pos, dev, false);
-                        }
-                    }
-                    end_commit(&self.f, cb, enc);
-                    retain(cb, s_retain);
-                    cbs.push(cb);
-                }
-                (be.sels.pool_pop)(pool);
-                cbs
-            }
-        };
-        // One pass ahead: pass k + 1 runs while the host takes pass k's token.
-        let mut q: std::collections::VecDeque<(usize, Vec<Id>)> = std::collections::VecDeque::new();
-        let (mut sub, mut kept, mut stopped, mut last, mut ok) = (0usize, 0usize, false, false, true);
-        let push = |q: &mut std::collections::VecDeque<(usize, Vec<Id>)>, k: usize, dev: &mut InkDev, ok: &mut bool| {
-            if dev.slots.iter().any(|s| s.ring == 0 && s.rows < pos0 + k + 1) {
-                // (Growing a cache copies it: the passes in flight finish first.)
-                for (_, cbs) in q.iter() {
-                    *ok &= drain(cbs);
-                }
-                *ok &= dev.reserve(pos0 + k + 1);
-            }
-            q.push_back((k, submit(k, dev)));
-        };
-        while sub < max.min(2) {
-            push(&mut q, sub, dev, &mut ok);
-            sub += 1;
-        }
-        while let Some((k, cbs)) = q.pop_front() {
-            ok &= drain(&cbs);
-            release(cbs);
-            if !ok || stopped {
-                continue;
-            }
-            kept = k + 1;
-            match on(unsafe { *slot(k % 2) }) {
-                Chain::Go if !last && sub < max => {
-                    push(&mut q, sub, dev, &mut ok);
-                    sub += 1;
-                }
-                Chain::Go => {}
-                Chain::Last => last = true,
-                Chain::Stop => stopped = true,
-            }
-        }
-        if !ok {
-            panic!("Metal: an Inkling-2 pass failed (OXINFER_GPU_PLAN_DEBUG=1 says why)");
-        }
-        dev.pos = pos0 + sub;
-        sess.pos = pos0 + sub;
-        Some((sub, kept))
+        self.greedy_impl(m, sess, first, max, &[], None, on)
+    }
+
+    fn greedy_capture(
+        &self,
+        m: &Inkling2Model,
+        sess: &mut Inkling2Session,
+        first: u32,
+        max: usize,
+        capture: &[usize],
+        feats: &mut Vec<f32>,
+        on: &mut dyn FnMut(u32) -> Chain,
+    ) -> Option<(usize, usize)> {
+        self.greedy_impl(m, sess, first, max, capture, Some(feats), on)
     }
 
     fn run(&self, m: &Inkling2Model, sess: &mut Inkling2Session, x: &[f32], t: usize, mut want: DevWant) -> bool {
@@ -4359,6 +4258,158 @@ impl DevEngine for InkMetal {
             d.pos = sess.pos;
         }
         true
+    }
+}
+
+impl InkMetal {
+    /// [`DevEngine::greedy`], with `feats` (when set) receiving the streams `capture` lists
+    /// (as [`DevWant::capture`]; the step count plus one is the final-normed output) of each
+    /// kept pass, `[kept, capture.len(), hidden]`: pass k writes them to the capture rows of
+    /// token slot k % 2, read once it has completed (pass k + 1 writes the other slot).
+    #[allow(clippy::too_many_arguments)]
+    fn greedy_impl(
+        &self,
+        m: &Inkling2Model,
+        sess: &mut Inkling2Session,
+        first: u32,
+        max: usize,
+        capture: &[usize],
+        mut feats: Option<&mut Vec<f32>>,
+        on: &mut dyn FnMut(u32) -> Chain,
+    ) -> Option<(usize, usize)> {
+        let em = self.emb.as_ref()?;
+        if max == 0 || profile_every() > 0 || capture.len() > self.dec.b.nf {
+            return None;
+        }
+        let _g = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        if sess.dev.is_none() && !self.upload(m, sess) {
+            sess.dev = None;
+            return None;
+        }
+        let pos0 = sess.pos;
+        let dev = sess.dev.as_mut().and_then(|d| d.0.as_any().downcast_mut::<InkDev>())?;
+        dev.pos = pos0;
+        self.lora_strengths();
+        let c = Cx {
+            a: self.dec.id,
+            b: &self.dec.b,
+        };
+        let slot = |k: usize| unsafe { (self.f.contents(c.a) as *mut u32).add(c.b.tok + k) };
+        // Pass k reads its token from slot (k + 1) % 2 and writes its argmax to slot k % 2.
+        unsafe { *slot(1) = first };
+        let steps = self.plan.len() + 1;
+        let parts: Vec<std::ops::Range<usize>> = std::iter::once(0..2.min(steps))
+            .chain((2..steps).step_by(8).map(|s| s..(s + 8).min(steps)))
+            .collect();
+        let indirect = if self.be.residency.is_some() { &[][..] } else { &self.indirect[..] };
+        let be = self.be;
+        let wait: MsgVoid = be.o.msg_send();
+        let status: super::MsgU = be.o.msg_send();
+        let retain: super::Msg0 = be.o.msg_send();
+        let s_retain = be.o.sel(c"retain");
+        let drain = |cbs: &[Id]| -> bool {
+            let mut ok = true;
+            for &cb in cbs {
+                unsafe {
+                    wait(cb, be.sels.wait);
+                    ok &= status(cb, be.sels.status) == 4;
+                }
+            }
+            ok
+        };
+        let release = |cbs: Vec<Id>| {
+            for cb in cbs {
+                unsafe { wait(cb, be.sels.release) };
+            }
+        };
+        let (h, nf) = (self.h, capture.len());
+        let fin = self.plan.len() + 1;
+        // Pass k's capture rows: token slot k % 2.
+        let slot_bufs = |k: usize| Bufs {
+            cap: self.dec.b.cap + (k % 2) * nf * h,
+            ..self.dec.b.clone()
+        };
+        let submit = |k: usize, dev: &InkDev| -> Vec<Id> {
+            let pos = pos0 + k;
+            let bk = slot_bufs(k);
+            let c = Cx { a: c.a, b: &bk };
+            unsafe {
+                let pool = (be.sels.pool_push)();
+                let mut cbs = Vec::with_capacity(parts.len());
+                for r in &parts {
+                    let (cb, enc) = begin_enc(be, &self.f);
+                    let fe = FastEnc { enc, f: &self.f };
+                    let e = &Pe::new(&fe, None);
+                    e.use_resources(indirect);
+                    for si in r.clone() {
+                        if si == 0 {
+                            self.enc_embed(e, &c, em, c.b.tok + (k + 1) % 2);
+                            e.barrier();
+                        }
+                        if si == self.plan.len() {
+                            self.enc_final(e, &c, 1, capture, 1, Some(c.b.tok + k % 2));
+                            for (j, _) in capture.iter().enumerate().filter(|x| *x.1 == fin) {
+                                e.barrier();
+                                self.copy(e, &c, c.b.hidden, c.b.cap + j * h, h, nf * h, 1);
+                            }
+                        } else {
+                            self.enc_attn(e, &c, si, 1, pos, dev, capture);
+                            self.enc_moe(e, &c, si, 1, pos, dev, false);
+                        }
+                    }
+                    end_commit(&self.f, cb, enc);
+                    retain(cb, s_retain);
+                    cbs.push(cb);
+                }
+                (be.sels.pool_pop)(pool);
+                cbs
+            }
+        };
+        // One pass ahead: pass k + 1 runs while the host takes pass k's token.
+        let mut q: std::collections::VecDeque<(usize, Vec<Id>)> = std::collections::VecDeque::new();
+        let (mut sub, mut kept, mut stopped, mut last, mut ok) = (0usize, 0usize, false, false, true);
+        let push = |q: &mut std::collections::VecDeque<(usize, Vec<Id>)>, k: usize, dev: &mut InkDev, ok: &mut bool| {
+            if dev.slots.iter().any(|s| s.ring == 0 && s.rows < pos0 + k + 1) {
+                // (Growing a cache copies it: the passes in flight finish first.)
+                for (_, cbs) in q.iter() {
+                    *ok &= drain(cbs);
+                }
+                *ok &= dev.reserve(pos0 + k + 1);
+            }
+            q.push_back((k, submit(k, dev)));
+        };
+        while sub < max.min(2) {
+            push(&mut q, sub, dev, &mut ok);
+            sub += 1;
+        }
+        while let Some((k, cbs)) = q.pop_front() {
+            ok &= drain(&cbs);
+            release(cbs);
+            if !ok || stopped {
+                continue;
+            }
+            kept = k + 1;
+            if let Some(f) = feats.as_deref_mut() {
+                // SAFETY: pass k has completed; its capture rows are in the arena.
+                let src = unsafe { std::slice::from_raw_parts((self.f.contents(c.a) as *const f32).add(slot_bufs(k).cap), nf * h) };
+                f.extend_from_slice(src);
+            }
+            match on(unsafe { *slot(k % 2) }) {
+                Chain::Go if !last && sub < max => {
+                    push(&mut q, sub, dev, &mut ok);
+                    sub += 1;
+                }
+                Chain::Go => {}
+                Chain::Last => last = true,
+                Chain::Stop => stopped = true,
+            }
+        }
+        if !ok {
+            panic!("Metal: an Inkling-2 pass failed (OXINFER_GPU_PLAN_DEBUG=1 says why)");
+        }
+        dev.pos = pos0 + sub;
+        sess.pos = pos0 + sub;
+        Some((sub, kept))
     }
 }
 

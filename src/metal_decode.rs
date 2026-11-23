@@ -1574,6 +1574,105 @@ impl MetalBackend {
     }
 }
 
+impl MetalBackend {
+    /// [`crate::gpu::Backend::markov_greedy`]: per slot, the gather of the previous token's
+    /// `w1` row, the `w2` matvec adding the bias to the slot's logits, and the argmax, one after
+    /// the other in one command buffer.
+    pub(crate) fn markov_greedy_impl(&self, j: &mut crate::gpu::MarkovJob) -> bool {
+        let (r, v) = (j.rank, j.vocab);
+        let k = j.tokens.len();
+        if k == 0 || j.logits.len() < k * v || j.w1.len() < v * r || r > 1024 {
+            return false;
+        }
+        let Some(w2) = MvWeight::new(&j.w2, j.w2_dev, v, r) else {
+            return false;
+        };
+        let Some(w1) = j.w1_dev.downcast_ref::<MetalWeight>() else {
+            return false;
+        };
+        let Some((mv, nr, ks)) = self.mvt_pipe(w2.fmt, r) else {
+            return false;
+        };
+        let (Some(gather), Some(amax)) = (self.named_pipeline("mk_gather"), self.named_pipeline("mk_argmax")) else {
+            return false;
+        };
+        for d in [j.w1_dev, j.w2_dev] {
+            if let Some(mw) = d.downcast_ref::<MetalWeight>() {
+                mw.keep_resident(&self.residency);
+            }
+        }
+        let f = Fns::new(self);
+        let mut st = self.staging.lock().unwrap();
+        let st = &mut *st;
+        // x: the slot's w1 row, then the tokens.
+        let tok_off = r.next_multiple_of(4) * 4;
+        if !self.ensure_staging(st, tok_off + (k + 1) * 4, k * v * 4) {
+            return false;
+        }
+        // SAFETY: the staging buffers were just sized for these copies.
+        unsafe {
+            std::ptr::copy_nonoverlapping(j.logits.as_ptr(), f.contents(st.y) as *mut f32, k * v);
+            *(f.contents(st.x).add(tok_off) as *mut u32) = j.first;
+        }
+        let (ok, _) = run_concurrent(self, &f, &[std::ops::Range { start: 0, end: 1 }], |e, _| {
+            for i in 0..k {
+                let mp = [r as u32, v as u32, i as u32, 0];
+                e.pipe(gather);
+                e.buf(w1.data.id, w1.data.offset_bytes, 0);
+                e.buf(st.x, tok_off, 1);
+                e.buf(st.x, 0, 2);
+                e.bytes(&mp, 3);
+                e.dispatch((1, 1), r.next_multiple_of(32));
+                e.barrier();
+                let p = MvParams {
+                    n_out: v as u32,
+                    n_in: r as u32,
+                    mode: MvMode::Add as u32,
+                    rows_per_tg: nr as u32,
+                    w_off: w2.data_off,
+                    s_off: w2.scales_off,
+                    w2_off: w2.data_off,
+                    s2_off: w2.scales_off,
+                    o_off: w2.offs_off,
+                    o2_off: w2.offs_off,
+                    gpr: w2.gpr,
+                    gk: w2.gk,
+                    ldy: 1,
+                    _p: 0,
+                };
+                e.pipe(mv);
+                e.buf(w2.data, 0, 0);
+                e.buf(w2.scales, 0, 1);
+                e.buf(st.x, 0, 2);
+                e.buf(st.y, i * v * 4, 3);
+                e.bytes(&p, 4);
+                e.buf(w2.data, 0, 5);
+                e.buf(w2.scales, 0, 6);
+                e.buf(w2.offs, 0, 7);
+                e.buf(w2.offs, 0, 8);
+                e.buf(st.x, 0, 9);
+                e.dispatch((v.div_ceil(nr), 1), 32 * ks);
+                e.barrier();
+                e.pipe(amax);
+                e.buf(st.y, 0, 0);
+                e.buf(st.x, tok_off, 1);
+                e.bytes(&mp, 2);
+                e.dispatch((1, 1), 1024);
+                e.barrier();
+            }
+        });
+        if ok {
+            // SAFETY: as above.
+            unsafe {
+                std::ptr::copy_nonoverlapping(f.contents(st.y) as *const f32, j.logits.as_mut_ptr(), k * v);
+                std::ptr::copy_nonoverlapping((f.contents(st.x).add(tok_off) as *const u32).add(1), j.tokens.as_mut_ptr(), k);
+            }
+        }
+        self.stats.calls.fetch_add(1, Ordering::Relaxed);
+        ok
+    }
+}
+
 // ---- Decode plans -------------------------------------------------------------------------------
 
 use crate::gpu::decode::{DecodePlan, Graph, LinMode, Op, Slot, Step, View};
@@ -7628,6 +7727,57 @@ mod tests {
             for b in [db.id, sb.id] {
                 unsafe { (f.void)(b, f.s_release) };
             }
+        }
+    }
+
+    /// A DSpark Markov head's chain on the device (`Backend::markov_greedy`): each slot's
+    /// logits plus `w2 * w1[prev]` against an f64 product, `prev` the device's argmax of the slot
+    /// before (the host's argmax of the logits it returns).
+    #[test]
+    fn markov_greedy_matches_host_chain() {
+        use crate::gpu::{Backend, MarkovJob};
+        let Ok(be) = MetalBackend::new() else { return };
+        let mut seed = 11u64;
+        let (vocab, rank, k) = (1000usize, 256usize, 5usize);
+        let raw = crate::ggml::random_blocks(GgmlType::Q4_K, vocab * rank / GgmlType::Q4_K.block_size(), &mut seed);
+        let w2 = GgufMatrix::from_bytes(GgmlType::Q4_K, &raw, vocab, rank).unwrap();
+        let mut w2f = vec![0f32; vocab * rank];
+        w2.dequantize_rows(0, vocab, &mut w2f);
+        let w1: Vec<u16> = (0..vocab * rank).map(|_| (lcg(&mut seed).to_bits() >> 16) as u16).collect();
+        let w1_dev = be.upload(&WeightRef::Bf16(&w1), vocab, rank).unwrap();
+        let w2_dev = be.upload(&WeightRef::Gguf(&w2), vocab, rank).unwrap();
+        let base: Vec<f32> = (0..k * vocab).map(|_| 4.0 * lcg(&mut seed)).collect();
+        let (mut logits, mut tokens) = (base.clone(), vec![0u32; k]);
+        let first = 17u32;
+        assert!(be.markov_greedy(&mut MarkovJob {
+            w1: &w1,
+            w1_dev: &w1_dev,
+            w2: WeightRef::Gguf(&w2),
+            w2_dev: &w2_dev,
+            rank,
+            vocab,
+            first,
+            logits: &mut logits,
+            tokens: &mut tokens,
+        }));
+        let mut prev = first;
+        for i in 0..k {
+            let x: Vec<f64> = w1[prev as usize * rank..(prev as usize + 1) * rank]
+                .iter()
+                .map(|&b| f32::from_bits(u32::from(b) << 16) as f64)
+                .collect();
+            for j in 0..vocab {
+                let (bias, mag) = w2f[j * rank..(j + 1) * rank]
+                    .iter()
+                    .zip(&x)
+                    .fold((0.0, 0.0), |s, (&w, &xv)| (s.0 + w as f64 * xv, s.1 + (w as f64 * xv).abs()));
+                let want = base[i * vocab + j] as f64 + bias;
+                let got = logits[i * vocab + j] as f64;
+                assert!((got - want).abs() <= 1e-5 * (mag + 1.0), "slot {i} row {j}: {got} vs {want}");
+            }
+            let row = &logits[i * vocab..(i + 1) * vocab];
+            assert_eq!(tokens[i], crate::sampler::argmax(row), "slot {i}");
+            prev = tokens[i];
         }
     }
 

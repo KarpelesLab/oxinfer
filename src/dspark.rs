@@ -102,6 +102,20 @@ pub trait Target: TextLm {
     fn vocab_size(&self) -> usize;
     /// Drops cached positions at or beyond `len`.
     fn truncate(&self, sess: &mut Self::Sess, len: usize);
+    /// Greedy decoding with the passes chained on the device ([`TextLm::decode_greedy`]) that
+    /// also appends to `feats` the features of each kept pass (as [`Target::forward_feats`]):
+    /// a DSpark decoder's plain rounds back to back. None (nothing run) when the model does not.
+    fn decode_greedy_feats(
+        &self,
+        _sess: &mut Self::Sess,
+        _first: u32,
+        _max: usize,
+        _layers: &[usize],
+        _feats: &mut Vec<f32>,
+        _on: &mut dyn FnMut(u32) -> crate::generate::Chain,
+    ) -> Option<usize> {
+        None
+    }
 }
 
 /// The draft's decoder layers.
@@ -691,6 +705,18 @@ struct Markov<'a> {
     w2: Lin<'a>,
     joint: Option<(Lin<'a>, Vec<f32>)>,
     rank: usize,
+    /// The vanilla head's greedy chain on the device ([`Dspark::markov_device`]).
+    dev: std::sync::Mutex<MarkovDev>,
+}
+
+/// The device form of a Markov head's chain: not tried yet, `markov_w1` as bf16 rows with its
+/// device state, or unavailable (the backend has no such chain).
+#[derive(Default)]
+enum MarkovDev {
+    #[default]
+    Untried,
+    Ready(Vec<u16>, crate::gpu::DeviceWeight),
+    Off,
 }
 
 /// DSpine's code bridge (Tencent, "Draft in Parallel, Condition Through Depth", arXiv
@@ -1374,6 +1400,7 @@ impl<'a> Dspark<'a> {
                 w2: lin(&w2n, vocab, rank)?,
                 joint,
                 rank,
+                dev: Default::default(),
             })
         } else {
             None
@@ -2215,7 +2242,8 @@ impl<'a> Dspark<'a> {
         sampler: &mut Sampler,
     ) -> Proposal {
         let mut p = Proposal::default();
-        p.tokens = self.slots(target, sess, anchor, k, &mut |_, logits, conf| {
+        let greedy = sampler.plain_greedy();
+        p.tokens = self.slots(target, sess, anchor, k, greedy, &mut |_, logits, conf| {
             if conf.is_some_and(|c| c < conf_min) {
                 return None;
             }
@@ -2238,7 +2266,7 @@ impl<'a> Dspark<'a> {
     /// argmax, and those greedy drafts (for checks against a reference).
     pub fn draft_logits<M: Target + ?Sized>(&self, target: &M, sess: &mut DsparkSession, anchor: u32, k: usize) -> (Vec<f32>, Vec<u32>) {
         let mut out = Vec::new();
-        let drafts = self.slots(target, sess, anchor, k, &mut |_, logits, _| {
+        let drafts = self.slots(target, sess, anchor, k, false, &mut |_, logits, _| {
             out.extend_from_slice(logits);
             Some(crate::sampler::argmax(logits))
         });
@@ -2248,7 +2276,21 @@ impl<'a> Dspark<'a> {
     /// One draft pass: the whole block, the (soft-capped) logits of the first `k` draft slots,
     /// and the Markov chain, `choose(slot, logits, confidence)` picking each slot's token (the
     /// next slot's "previous token"; None ends the block). Returns the chosen tokens.
-    fn slots<M: Target + ?Sized>(&self, target: &M, sess: &mut DsparkSession, anchor: u32, k: usize, choose: &mut ChooseSlot) -> Vec<u32> {
+    ///
+    /// With `greedy` (`choose` takes the argmax) and the block on the GPU plans, a vanilla
+    /// Markov head runs its whole chain in one submission ([`Dspark::markov_device`]): its
+    /// drafts are the device's argmax ones, and a slot where `choose` picks another token ends
+    /// the block after it.
+    #[allow(clippy::too_many_arguments)]
+    fn slots<M: Target + ?Sized>(
+        &self,
+        target: &M,
+        sess: &mut DsparkSession,
+        anchor: u32,
+        k: usize,
+        greedy: bool,
+        choose: &mut ChooseSlot,
+    ) -> Vec<u32> {
         let _timer = crate::prof::start(crate::prof::Cat::Other);
         let c = &self.cfg;
         let k = k.clamp(1, c.max_draft());
@@ -2265,11 +2307,15 @@ impl<'a> Dspark<'a> {
             c.block_rows()
         };
         let mut stash = BridgeState::default();
+        let mut chained = None;
         let (hid, mut logits) = match self.gpu_block(target, sess, anchor) {
             Some((hid, mut l)) => {
                 let v = l.len() / c.block_rows();
                 l.drain(..first * v);
                 l.truncate(k * v);
+                if greedy {
+                    chained = self.markov_device(v, anchor, &mut l, k);
+                }
                 (hid, l)
             }
             None => {
@@ -2314,6 +2360,9 @@ impl<'a> Dspark<'a> {
                 let r = m.rank;
                 w1 = vec![0f32; r];
                 m.w1.row(prev as usize, &mut w1);
+            }
+            if let Some(m) = self.markov.as_ref().filter(|_| chained.is_none()) {
+                let r = m.rank;
                 // Vanilla head: the previous token's embedding; rnn head: gated state update,
                 // `state = gate * state + (1 - gate) * cand`, output tanh(third chunk).
                 let feat = match (&m.joint, state.as_mut()) {
@@ -2350,8 +2399,76 @@ impl<'a> Dspark<'a> {
             let Some(t) = choose(i, li, conf) else { break };
             prev = t;
             out.push(t);
+            // The next slot's bias came from the device's choice.
+            if chained.as_ref().is_some_and(|d: &Vec<u32>| d[i] != t) {
+                break;
+            }
         }
         out
+    }
+
+    /// The greedy chain of a vanilla Markov head on the device ([`crate::gpu::MarkovJob`]):
+    /// `logits` (`[k, vocab]`, the block's) get each slot's bias, and the slots' argmax tokens
+    /// come back; None (nothing changed) when the device does not run it. The first call makes a
+    /// bf16 copy of `markov_w1` for the device (Qwen3-8B's draft: 78 MB).
+    fn markov_device(&self, vocab: usize, first: u32, logits: &mut [f32], k: usize) -> Option<Vec<u32>> {
+        let m = self.markov.as_ref()?;
+        let be = crate::gpu::active()?;
+        let w2_dev = Self::dev(&m.w2, vocab, m.rank)?;
+        let mut st = self.markov_table(vocab)?;
+        let MarkovDev::Ready(w1, w1_dev) = &*st else { return None };
+        let mut tokens = vec![0u32; k];
+        let ok = be.markov_greedy(&mut crate::gpu::MarkovJob {
+            w1,
+            w1_dev,
+            w2: m.w2.as_ref(),
+            w2_dev,
+            rank: m.rank,
+            vocab,
+            first,
+            logits,
+            tokens: &mut tokens,
+        });
+        if !ok {
+            *st = MarkovDev::Off;
+            return None;
+        }
+        Some(tokens)
+    }
+
+    /// The device copy of a vanilla Markov head's `markov_w1` ([`Dspark::markov_device`]), made
+    /// on the first call (in parallel: 152k rows of 256 in about 20 ms); None without a head or
+    /// an accelerator.
+    fn markov_table(&self, vocab: usize) -> Option<std::sync::MutexGuard<'_, MarkovDev>> {
+        // `OXINFER_DSPARK_MARKOV_HOST`: the chain on the host, one submission per slot.
+        static HOST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *HOST.get_or_init(|| std::env::var_os("OXINFER_DSPARK_MARKOV_HOST").is_some()) {
+            return None;
+        }
+        let m = self.markov.as_ref().filter(|m| m.joint.is_none() && self.bridge.is_none())?;
+        let be = crate::gpu::active().filter(|b| b.has_markov_greedy())?;
+        let mut st = m.dev.lock().unwrap_or_else(|p| p.into_inner());
+        if matches!(*st, MarkovDev::Untried) {
+            let r = m.rank;
+            let mut w1 = vec![0u16; vocab * r];
+            let p = SendPtr16(w1.as_mut_ptr());
+            crate::pool::run(vocab.div_ceil(1024), &|c| {
+                let mut row = vec![0f32; r];
+                for i in c * 1024..((c + 1) * 1024).min(vocab) {
+                    m.w1.row(i, &mut row);
+                    for (j, &x) in row.iter().enumerate() {
+                        let b = x.to_bits();
+                        // SAFETY: each job writes its own rows.
+                        unsafe { *p.get().add(i * r + j) = ((b + 0x7fff + ((b >> 16) & 1)) >> 16) as u16 };
+                    }
+                }
+            });
+            *st = match be.upload(&crate::gpu::WeightRef::Bf16(&w1), vocab, r) {
+                Some(d) => MarkovDev::Ready(w1, d),
+                None => MarkovDev::Off,
+            };
+        }
+        Some(st)
     }
 }
 
@@ -2472,6 +2589,54 @@ impl Dspark<'_> {
         self.gpu.get_or_init(|| build(false));
         if fast && matches!(self.gpu.get(), Some(Some(_))) {
             self.gpu_fast.get_or_init(|| build(true));
+        }
+        // The Markov chain's device table, and a first pass of the plans the sessions use, now
+        // rather than in the first round.
+        if matches!(self.gpu.get(), Some(Some(_))) {
+            drop(self.markov_table(vocab));
+            self.warm_gpu(vocab, fast);
+        }
+    }
+
+    /// Runs the GPU plans of sessions with [`DsparkSession::fast`] = `fast` once, on a throwaway
+    /// session and zeros: a plan's first pass over the draft's weights costs about 20 ms more
+    /// than the next ones on an M5 Max (as the target's first decode step does), which the first
+    /// draft round would pay otherwise.
+    fn warm_gpu(&self, vocab: usize, fast: bool) {
+        let Some(gp) = self.gpu_plans(fast) else { return };
+        let mut s = self.new_session();
+        s.fast = fast;
+        let nf = self.cfg.target_layers.len() * self.target_hidden;
+        if self.gpu_inject(&mut s, &vec![0f32; nf], 1) != 1 || self.bridge.is_some() {
+            return;
+        }
+        let (nb, h) = (self.cfg.block_rows(), self.cfg.hidden);
+        let x = vec![0f32; nb * h];
+        let cs = self.rope_rows(s.len, nb);
+        let mut hidden = vec![0f32; nb * h];
+        let mut logits = vec![0f32; nb * vocab];
+        let mut kv: Vec<&mut LayerCache> = s.kv.iter_mut().collect();
+        let ok = gp.block.step(
+            &mut s.gpu_block,
+            crate::gpu::decode::Step {
+                pos: s.len,
+                t: nb,
+                rope_cs: &cs,
+                x: &x,
+                x2: &[],
+                kv: &mut kv,
+                states: &mut [],
+                hidden: &mut hidden,
+                logits: Some(&mut logits),
+                params: None,
+                capture: None,
+                scratch: true,
+                states_kept: false,
+            },
+        );
+        if ok {
+            let k = self.cfg.max_draft();
+            self.markov_device(vocab, 0, &mut logits[..k * vocab], k);
         }
     }
 
@@ -2987,6 +3152,8 @@ impl Adaptive {
     const BIN_DECAY: f64 = 0.998;
     /// Decay of the per-slot acceptance counts per draft round (a window of about 30 rounds).
     const SLOT_DECAY: f64 = 0.97;
+    /// Draft rounds averaged evenly before [`Adaptive::gain`] becomes a moving average.
+    const GAIN_MEAN: usize = 4;
 
     /// A moving average whose second sample replaces the first (which may include compiling a
     /// GPU plan or warming caches).
@@ -3032,8 +3199,15 @@ impl Adaptive {
             b.1 += 1.0;
         }
         let (t, s) = (emitted as f64, draft + verify);
+        // The mean of the first few draft rounds, then a moving average: one unlucky round among
+        // the first two (a block rejected early, or the first pass of a length) would otherwise
+        // decide alone, and stop drafting where drafts win (the CPU's code: 8 plain rounds before
+        // the next probe).
         self.gain = match self.gain.2 {
-            0 | 1 => (t, s, self.gain.2 + 1),
+            n if n < Self::GAIN_MEAN => {
+                let w = n as f64;
+                ((self.gain.0 * w + t) / (w + 1.0), (self.gain.1 * w + s) / (w + 1.0), n + 1)
+            }
             n => (
                 Self::DECAY * self.gain.0 + (1.0 - Self::DECAY) * t,
                 Self::DECAY * self.gain.1 + (1.0 - Self::DECAY) * s,
@@ -3045,6 +3219,15 @@ impl Adaptive {
 
     fn bin(p: f32) -> usize {
         ((p.max(0.0) * 10.0) as usize).min(9)
+    }
+
+    /// Records a plain step of `secs` taken in a chain of them ([`DsparkDecoder::step_emit`]).
+    fn record_plain(&mut self, secs: f64) {
+        if self.verify.is_empty() {
+            self.verify.push((0.0, 0));
+        }
+        Self::ema(&mut self.verify[0], secs);
+        self.plain_run += 1;
     }
 
     /// The chance that a draft of probability `p` (under the draft model) is accepted when the
@@ -3062,14 +3245,15 @@ impl Adaptive {
 
     /// The next round's draft length: `k_max` (a draft pass) or 0 (a plain step).
     pub fn choose(&mut self, k_max: usize) -> usize {
-        // First two draft rounds, then two plain ones, to measure both (the first of each may
-        // compile a plan).
-        if self.draft.1 < 2 {
-            return k_max;
-        }
+        // First two plain rounds, then two draft rounds, to measure both (the first of each may
+        // pay a plan's first pass); the plain step's cost prices the first draft rounds'
+        // verification lengths through the prior.
         let Some(plain) = self.verify.first().filter(|e| e.1 >= 2).map(|e| e.0) else {
             return 0;
         };
+        if self.draft.1 < 2 {
+            return k_max;
+        }
         // The time a draft round takes beyond the plain time of the tokens it gives.
         let loss = self.gain.1 - self.gain.0 * plain;
         if loss <= 0.0 {
@@ -3177,7 +3361,8 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
             draft,
             sess: model.new_session(),
             dsess,
-            k_cur: opts.draft_tokens,
+            // The cost-aware policy starts with plain rounds ([`Adaptive::choose`]).
+            k_cur: if opts.cost_aware && !sweep() { 0 } else { opts.draft_tokens },
             opts,
             next: None,
             stats: MtpStats::default(),
@@ -3549,6 +3734,103 @@ where
     }
 }
 
+impl<M: Target> DsparkDecoder<'_, M>
+where
+    M::Sess: Clone,
+{
+    /// [`Self::step`] handing each committed token to `emit` as it comes (false: stop there).
+    /// A plain round of greedy decoding on a target that chains its passes on the device
+    /// ([`Target::decode_greedy_feats`]) runs plain steps back to back, as plain decoding does,
+    /// each pass capturing the draft's features (read back once it completed) and each token
+    /// streamed, until the policy wants a draft round (or prompt lookup has a long match).
+    pub fn step_emit(&mut self, sampler: &mut Sampler, max_new: usize, emit: &mut dyn FnMut(u32) -> bool) -> Vec<u32> {
+        if let Some(out) = self.chain_plain(sampler, max_new, emit) {
+            return out;
+        }
+        let out = self.step(sampler, max_new);
+        for &t in &out {
+            emit(t);
+        }
+        out
+    }
+
+    /// The chained plain rounds of [`Self::step_emit`]; None (nothing done) when this round is
+    /// not a plain greedy one or the target does not chain.
+    fn chain_plain(&mut self, sampler: &mut Sampler, max_new: usize, emit: &mut dyn FnMut(u32) -> bool) -> Option<Vec<u32>> {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let next = self.next?;
+        if self.k_cur != 0
+            || !self.opts.cost_aware
+            || !sampler.plain_greedy()
+            || max_new < 2
+            || sweep()
+            || *OFF.get_or_init(|| std::env::var_os("OXINFER_DSPARK_CHAIN").is_some_and(|v| v == "0"))
+        {
+            return None;
+        }
+        // A long prompt-lookup match: `step` verifies it.
+        let plain = self.adapt.verify.first().map_or(0.0, |v| v.0);
+        if let Some(lk) = &mut self.lookup
+            && lk.draft_over(max_new - 1, 1.0, plain).is_some()
+        {
+            return None;
+        }
+        let t0 = crate::clock::Instant::now();
+        let model = self.model;
+        let k_max = self.opts.draft_tokens;
+        let (sess, adapt, lookup, stop) = (&mut self.sess, &mut self.adapt, &mut self.lookup, &self.opts.stop);
+        let mut out: Vec<u32> = Vec::new();
+        let mut feats = Vec::new();
+        let mut last = t0;
+        let mut on = |t: u32| -> crate::generate::Chain {
+            use crate::generate::Chain;
+            let now = crate::clock::Instant::now();
+            let dt = (now - last).as_secs_f64();
+            last = now;
+            adapt.record_plain(dt);
+            out.push(t);
+            if let Some(lk) = lookup.as_mut() {
+                lk.policy.record_time(0, dt);
+                lk.extend(&[t]);
+            }
+            if !emit(t) || stop.contains(&t) || out.len() >= max_new {
+                return Chain::Stop;
+            }
+            // A draft round next (the pass already queued still runs: its token comes too).
+            let plain = adapt.verify[0].0;
+            let rest = max_new - out.len();
+            if adapt.choose(k_max) > 0
+                || lookup
+                    .as_mut()
+                    .is_some_and(|lk| rest > 1 && lk.draft_over(rest - 1, 1.0, plain).is_some())
+            {
+                return Chain::Last;
+            }
+            Chain::Go
+        };
+        let kept = model.decode_greedy_feats(sess, next, max_new, &self.draft.cfg.target_layers, &mut feats, &mut on)?;
+        let secs = t0.elapsed().as_secs_f64();
+        self.pending.0.extend_from_slice(&feats);
+        self.pending.1 += kept;
+        if let Some(&t) = out.last() {
+            self.next = Some(t);
+        }
+        let st = &mut self.stats;
+        st.rounds += kept;
+        st.emitted += out.len();
+        if st.per_round.is_empty() {
+            st.per_round.push(0);
+        }
+        st.per_round[0] += kept;
+        st.verify_secs += secs;
+        if std::env::var_os("OXINFER_DEBUG_DRAFT").is_some() {
+            eprintln!("[draft: chained {kept} plain steps; ms: {:.1}]", secs * 1e3);
+        }
+        self.k_cur = self.adapt.choose(k_max);
+        Some(out)
+    }
+}
+
 impl<M: Target> crate::generate::RoundDecoder for DsparkDecoder<'_, M>
 where
     M::Sess: Clone,
@@ -3559,16 +3841,46 @@ where
     fn step(&mut self, sampler: &mut Sampler, max_new: usize) -> Vec<u32> {
         DsparkDecoder::step(self, sampler, max_new)
     }
+    fn step_emit(&mut self, sampler: &mut Sampler, max_new: usize, emit: &mut dyn FnMut(u32) -> bool) -> Vec<u32> {
+        DsparkDecoder::step_emit(self, sampler, max_new, emit)
+    }
     fn rounds(&self) -> usize {
         self.stats.rounds
     }
 }
 
 /// `softmax(logits)[t]`.
+/// (Eight lanes, so the passes vectorize: a draft's vocabulary takes 0.05 ms instead of 0.2.)
 fn softmax_at(logits: &[f32], t: u32) -> f32 {
-    let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let s: f32 = logits.iter().map(|&v| (v - m).exp()).sum();
-    (logits[t as usize] - m).exp() / s
+    let (ch, rest) = logits.as_chunks::<8>();
+    let mut mx = [f32::NEG_INFINITY; 8];
+    for c in ch {
+        for (m, &v) in mx.iter_mut().zip(c) {
+            *m = m.max(v);
+        }
+    }
+    let m = mx.iter().chain(rest).copied().fold(f32::NEG_INFINITY, f32::max);
+    if m == f32::NEG_INFINITY {
+        return 0.0;
+    }
+    let mut acc = [0f32; 8];
+    for c in ch {
+        for (a, &v) in acc.iter_mut().zip(c) {
+            *a += fast_exp(v - m);
+        }
+    }
+    let s = acc.iter().sum::<f32>() + rest.iter().map(|&v| fast_exp(v - m)).sum::<f32>();
+    fast_exp(logits[t as usize] - m) / s
+}
+
+#[derive(Clone, Copy)]
+struct SendPtr16(*mut u16);
+unsafe impl Send for SendPtr16 {}
+unsafe impl Sync for SendPtr16 {}
+impl SendPtr16 {
+    fn get(self) -> *mut u16 {
+        self.0
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4398,7 +4710,12 @@ mod tests {
                 *hist_plain.entry((i, t)).or_default() += 1;
             }
             let mut s = Sampler::new(1.0, 0, 1.0, (seed + n) as u64 + 1);
-            let mut dec = DsparkDecoder::new(&toy, &d, DsparkOptions::default());
+            // (Every round drafts: the cost-aware policy starts with plain rounds.)
+            let opts = DsparkOptions {
+                cost_aware: false,
+                ..DsparkOptions::default()
+            };
+            let mut dec = DsparkDecoder::new(&toy, &d, opts);
             let lg = dec.prefill(&prompt, 4);
             let spec = crate::generate::decode_rounds(&mut dec, &lg, &mut s, &[], 3, &mut |_| Flow::Continue);
             assert_eq!(spec.tokens.len(), 3);
@@ -4421,15 +4738,15 @@ mod tests {
     #[test]
     fn adaptive_policy() {
         let mut a = Adaptive::default();
-        // Two draft rounds, two plain ones to measure, then the rates decide.
-        assert_eq!(a.choose(7), 7);
-        a.record(&[0.99; 7], 7, 7, 8, 0.010, 0.020);
-        assert_eq!(a.choose(7), 7);
-        a.record(&[0.99; 7], 7, 7, 8, 0.010, 0.020);
+        // Two plain rounds, two draft rounds to measure, then the rates decide.
         assert_eq!(a.choose(7), 0);
         a.record(&[], 0, 0, 1, 0.0, 0.010);
         assert_eq!(a.choose(7), 0);
         a.record(&[], 0, 0, 1, 0.0, 0.010);
+        assert_eq!(a.choose(7), 7);
+        a.record(&[0.99; 7], 7, 7, 8, 0.010, 0.020);
+        assert_eq!(a.choose(7), 7);
+        a.record(&[0.99; 7], 7, 7, 8, 0.010, 0.020);
         // 8 tokens in 30 ms beats 1 in 10 ms.
         assert_eq!(a.choose(7), 7);
         // Verification costs 10 ms plus 10 ms per draft: confident drafts are all verified, a
@@ -4439,7 +4756,7 @@ mod tests {
         assert_eq!(a.cut(&[0.05; 7], 0.010), 0);
         assert_eq!(a.cut(&[0.999, 0.999, 0.05, 0.999, 0.999, 0.999, 0.999], 0.010), 2);
         // Draft rounds that lose: plain steps, with probes as rare as keeps their expected loss
-        // (a draft round's time beyond the plain time of its token: 80 ms, then 67) within 2%
+        // (a draft round's time beyond the plain time of its token: 80 ms, then 58) within 2%
         // of the plain steps' time, at most every 256 steps, and at most every 4 per draft round
         // measured (a loss measured on two rounds is no reason to stop looking).
         let mut a = Adaptive::default();
