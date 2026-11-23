@@ -656,11 +656,12 @@ Where oxinfer is still behind:
   loaded for clean ratios; llama.cpp's 16-thread runs collapsed under the load while
   oxinfer's work-claiming pool held up. Per-core throughput is not ahead: both engines' int8
   kernels issue at the SDOT rate (~340 GOP/s on one core).
-- **CPU decode of small Q8_0 models** (Llama 3.2 1B Q8_0: 159-170 tok/s against llama.cpp's
-  168-183 at 12 threads, ~7% behind from 12%): the kernels match a replay of the step's matmuls
-  alone; what is left is the serial work between parallel regions and a memory system that
-  streams slower in place than in back-to-back replays. See
-  [CPU decode round 4](#cpu-decode-round-4-november-2026) and round 3 for what was tried.
+- **CPU decode of small Q8_0 models under load** (Llama 3.2 1B Q8_0: level with llama.cpp's best
+  in quiet windows, 186-196 tok/s against 175-196; 161-175 against 168-185 at load averages of
+  5-11, where llama.cpp's 8 threads hold up best): a token streams its 1.31 GB at 240-257 GB/s,
+  what llama.cpp's speed amounts to too; the gap left under load is per-core speed (llama.cpp's
+  repacked kernel needs fewer threads). See
+  [CPU decode round 5](#cpu-decode-round-5-november-2026), round 4 and round 3 for what was tried.
   Qwen3-8B (Q8_0, Q4_K_M), Gemma 4 12B, 26B-A4B, Orpheus and Llama 1B Q4_K_M decode level with
   or ahead of llama.cpp's best thread count.
 
@@ -1013,6 +1014,109 @@ values, 127 MB of exponent bytes, 510 MB as f32), on Metal (CLI, 672-token promp
 The same speed, 375 MB less memory of the process's own (the f32 copies), and the same greedy
 output in all six runs. On Inkling-2-Small-MXFP8 (48 MXFP8 layers) the same change keeps ~18 GB
 of exponent bytes mapped instead of ~73 GB of f32 copies, with Metal active as on the CPU.
+
+#### CPU decode round 5 (November 2026)
+
+Llama 3.2 1B Q8_0 again, with a trace of every region's tasks (which thread ran which task,
+when; not kept) and `examples/decode_ab.rs`, which times decode steps under several settings in
+one process, switching settings every token (every 64 when they change the thread count, so
+that the threads left out have parked) and restarting from the prompt every 128 tokens, as
+tg128 does. Same-process alternation was the only way to see effects of a few percent: the
+machine's speed moved by 10-20% between minutes (per-step medians of 5.3 to 6.7 ms for the same
+build), and llama.cpp's own runs by as much.
+
+Where a token goes, 18 threads, in a quiet window (load 2-3): the 1.31 GB of weights a token
+(64.6 MB a layer, 279 MB of LM head) in 4.7-5.4 ms inside regions and ~0.3 ms between them.
+Inside the regions the threads were busy 85-92% of the time: the workers start a region 0.8-1.2
+us after it is published, the calling thread then waits 3-9 us at its end for the last tasks
+(half a task of 8-17 us, more for the LM head's ~2 MB, 130 us tasks), and about one worker in
+six regions does not take part at all (its core is busy elsewhere). Every thread ran its tasks
+at about the same speed (0.92-1.00x the median task): this M5 Max has 6 "super" and 12
+"performance" cores and no efficiency cores, and the work-claiming pool spreads the tasks
+evenly; the `Background` QoS, the only way to place threads, halves a thread's kernel speed
+(36 against 68 GB/s). Bandwidth (`matvec_bench`): plain reads stream 262-287 GB/s at 10-18
+threads (238 at 6), the Q8_0 kernel alone 220-231 GB/s at 6-18 threads in most windows and
+260-280 in quiet ones, the regions of a decode step 243-279 GB/s, the whole step 240-257 GB/s,
+which is what llama.cpp's 183-196 tok/s amounts to as well.
+
+Regions per token, Llama 3.2 1B (`pool::regions()`): 98 before (per layer the query / key /
+value matmuls, the attention, the output projection, gate and up, the SiLU, the down
+projection; then the logits' zero-fill and the LM head), 82 after (the SiLU's region gone into
+gate and up's). The query, key and value projections were already one region (`linear_multi`);
+the RMSNorms stay on the calling thread, their sum of squares a 2048-long serial chain (~1.4 us,
+33 a token) kept for the bits.
+
+Kept:
+
+- **Gated MLP in one region** (`kernels::matmul_quant_glu`): each task takes the same rows of
+  gate and up (whole blocks of 32), applies SiLU or GELU to them and quantizes them into the
+  down projection's int8 input, instead of a region for gate and up, a region for the
+  activation and the down projection's 8192-wide quantization on the calling thread.
+  Bit-identical (`kernels::tests::glu_matches_separate_steps_bitwise`; `OXINFER_DECODE_GLU=0`
+  for the old steps), for Llama / Qwen / Orpheus and Gemma's dense MLP. Gaps between regions
+  389 to 311 us a token; in one process, alternating, the median step 0.7% faster (5.848 to
+  5.806 ms over 1500 steps each) in a quiet window, 2.4% in a loaded one.
+- **Pool synchronization**: each worker announces itself in a region on a flag on its own cache
+  line, instead of incrementing and decrementing one shared counter (17 read-modify-writes
+  queued on one line a region), and the claim counter and the waiting workers' generation have
+  lines of their own: workers start 0.73-0.94 us after a region is published instead of
+  0.83-1.0; 0.5-0.9% a step (three alternating runs, one at -0.1%).
+- **Decode steps on all but two threads** from 12 threads on (`pool::decode_scope` around the
+  steps of `generate::decode`; `OXINFER_DECODE_THREADS=N` sets the count, prompts keep every
+  thread): the two workers left out park, leaving cores to the rest of the system instead of
+  one of 18 threads losing its core in the middle of a region. 16 against 18 threads: in five
+  one-process runs -1.4%, +0.2%, +0.9%, +2.4% and +4.9% a step; in two sets of four interleaved
+  tg128 rounds +4.1% and +0.3% on average (single rounds from -2.6% to +6.7%). Which count is
+  fastest moves with the load: 16 in quiet windows, 12-14 in the busiest (where 18 lost 7%), 8
+  always slower (147 against 159 tok/s).
+
+Measured and dropped:
+
+- splitting a region's last blocks in four, so that the last tasks claimed are short: the
+  calling thread's wait at the end of the gated MLP's region fell from 9.3 to 6.4 us, but steps
+  were 1.0-1.4% slower;
+- blocks of at most 512 KB in decode regions (the LM head's are ~2 MB): from -0.5% to +0.6%
+  in four comparisons (+4-5% in one, not reproduced);
+- choosing the decode thread count among 12-18 by measured step times (a few steps on each in
+  turn, then the fastest for 500 steps): the choice followed the noise (16, 18, 18, 12 in four
+  explorations of one run) and tg128 was no faster than the fixed 16 (157-169 against 162-173
+  tok/s);
+- the argmax fused into the LM head: after round 4's NEON argmax a token's argmax and the
+  logits' zero-fill take a few microseconds, under 0.2% of a step, not worth carrying the
+  greedy case through the model interface.
+
+Not tried: llama.cpp's 4-row interleaved layout again. Its 21% faster single-core kernel did not
+help at 18 threads (rounds 3 and 4), where the step streams as fast as plain reads in quiet
+windows, but it is what lets llama.cpp run 8 threads: on 8 threads oxinfer decodes 147 tok/s
+against 159 on 12-14, while llama.cpp's 8 threads held 186-189 tok/s through load averages of
+12-16 that cost oxinfer's 18 threads 10%. It would take either a second copy of the weights or
+every kernel (prompt GEMMs included) taught the interleaved layout.
+
+Decode tg128 (`parity_bench`, best of 3 of each run; rounds interleave llama.cpp, master
+`422ea32` and this branch; llama.cpp's mean of 3 at 8 and 12 threads, or 10 for the larger
+models; load averages in brackets), tok/s:
+
+| model | llama.cpp 8 thr | 12 thr | before | after |
+|---|---|---|---|---|
+| Llama 3.2 1B Q8_0, round 1 [5] | 185.2 | 177.6 | 161.3 | 167.8 |
+| round 2 [8] | 158.6 | 168.2 | 158.7 | 161.0 |
+| round 3 [10] | 156.6 | 182.9 | 158.4 | 166.9 |
+| round 4 [11] | 156.1 | 179.9 | 159.7 | 175.4 |
+| Llama 3.2 1B Q4_K_M, 2 rounds [12] | 190.1 / 196.9 | 220.1 / 216.8 | 231.8 / 230.0 | 251.3 / 245.9 |
+| Qwen3-8B Q8_0, 2 rounds [10-15] | | 30.6 / 32.8 (10 thr) | 27.7 / 27.8 | 29.2 / 28.9 |
+| Gemma 4 12B Q8_0, 2 rounds [17-19] | | 12.9 / 20.4 (10 thr) | 18.5 / 18.7 | 19.7 / 20.2 |
+| Gemma 4 26B-A4B Q4_0, 2 rounds [17] | | 63.7 / 66.2 (10 thr) | 67.2 / 66.7 | 68.2 / 68.2 |
+
+In two quieter windows earlier the same day (load 3-10) an intermediate build of this branch
+(the gated MLP and the pool flags, with the tail split above) ran Llama 3.2 1B Q8_0 at 179-194
+tok/s on 18 threads and 191-196 on 16, against llama.cpp's 185-196 at 8 threads and 174-189 at
+12 and the previous master's 183-192: level with llama.cpp's best when the machine is quiet,
+3-10% behind it under load (where llama.cpp's 8 threads hold up best), and 2-10% ahead of the
+previous build.
+The other models gained 1.5-7%; Qwen3-8B stays behind llama.cpp under this load (it was level in
+round 3's quieter runs). Greedy 128-token outputs (`--device cpu --no-system`, two prompts) are
+identical to the previous build's on Llama 3.2 1B Q8_0 and Q4_K_M, Qwen3-8B Q8_0, Gemma 4 12B
+Q8_0 and Gemma 4 26B-A4B Q4_0.
 
 #### x86-64 CPU prefill (November 2026)
 

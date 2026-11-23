@@ -420,8 +420,8 @@ pub fn set_decode_threads(n: usize) {
 /// A one-token step is about a hundred short regions bound by memory bandwidth, and on a machine
 /// that also runs other work, one of all-the-cores' threads losing its core in the middle of a
 /// region holds the region up. On an 18-core M5 Max shared with other jobs (Llama 3.2 1B Q8_0),
-/// 16 threads decoded 2% faster than 18 on average over six interleaved comparisons (from 1.6%
-/// slower to 5% faster); the fastest count moved between 12 and 18 with the load, and a tuner
+/// 16 threads decoded about 2% faster than 18 on average over seven comparisons (from 1.4% slower
+/// to 4.9% faster); the fastest count moved between 12 and 18 with the load, and a tuner
 /// choosing among 12-18 by measured step times was too noisy to beat the fixed choice.
 pub fn decode_threads(threads: usize) -> usize {
     let mut n = DECODE_THREADS.load(Relaxed);
