@@ -231,7 +231,16 @@ IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4. Three things run on the
   Qwen3-8B pass spends 1.5 ms there instead of 18.1 on the decode kernel in batches of 32
   (`gpu_exact=1` keeps that), so its prompts run at 6165 tok/s at 512 tokens and 5432 at 2048,
   Llama-3.2-1B's at 26871 and 21460, with the same greedy tokens as before on the four
-  `pf_check` runs. RMSNorm, RoPE, the
+  `pf_check` runs. Host time of a step: the new keys and values go into the host caches in one
+  parallel copy for every layer (a parallel region per layer and cache took 11-19 ms of a
+  512-token Qwen3-8B step, now 3.4), reserved for the whole prompt and the decode steps after it
+  (a power of two of positions, on transparent huge pages where Linux gives them on request; the
+  first decode step after a 512-token prompt took 25 ms moving 144 MB, now 6.6) and the device
+  copies of every layer's cache are one allocation (a growth allocated, zeroed and freed two
+  buffers per layer: ~6 ms per later chunk of a long prompt, now 0.5-1.2); the prompt's LM head
+  runs on the GPU (`matvec_rows`, f32 activations; the CPU's head rounds them to int8, which moves
+  Qwen3-8B's first-step log-probabilities by up to 0.08). Qwen3-8B Q4_K_M prompts then run at
+  7588 tok/s at 512 tokens and 7119 at 2048, Llama-3.2-1B Q4_K_M at 32718 and 33050. RMSNorm, RoPE, the
   activations, the Gated DeltaNet convolution and delta rule (the state in registers across the
   step's tokens) over all tokens in one launch; attention with the decode kernel, 32 tokens per
   launch; the hidden states, the new keys and values and the recurrent states come back to the

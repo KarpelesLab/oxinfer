@@ -1865,6 +1865,10 @@ impl<'a> QwenModel<'a> {
         }
         let half = self.inv_freq.len();
         let mut hidden = crate::kernels::zeros(t * h);
+        // The prompt's keys and values come down chunk by chunk: room for all of them at once.
+        for c in sess.kv.iter_mut().flatten() {
+            c.reserve(t);
+        }
         captured.clear();
         captured.resize(t * nc * h, 0.0);
         let mut c = 0;

@@ -1345,6 +1345,28 @@ pub struct Model<'a> {
 }
 
 /// `dst.extend_from_slice(src)` with the copy spread over the thread pool.
+/// Asks for the spare capacity of `b` on transparent huge pages (Linux; a hint, ignored where
+/// the system has none or for small buffers).
+fn advise_huge(b: &mut Vec<f32>) {
+    #[cfg(target_os = "linux")]
+    {
+        const HUGE: usize = 2 << 20;
+        unsafe extern "C" {
+            fn madvise(addr: *mut std::ffi::c_void, len: usize, advice: i32) -> i32;
+        }
+        const MADV_HUGEPAGE: i32 = 14;
+        let start = b.as_mut_ptr() as usize + b.len() * 4;
+        let end = b.as_mut_ptr() as usize + b.capacity() * 4;
+        let (a, z) = (start.next_multiple_of(HUGE), end / HUGE * HUGE);
+        if z > a {
+            // SAFETY: advice on whole pages of memory this Vec owns; it does not change contents.
+            unsafe { madvise(a as *mut std::ffi::c_void, z - a, MADV_HUGEPAGE) };
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = b;
+}
+
 fn par_extend(dst: &mut Vec<f32>, src: &[f32]) {
     const CHUNK: usize = 1 << 16;
     dst.reserve(src.len());
@@ -1400,6 +1422,54 @@ impl LayerCache {
     /// The auxiliary rows of every cached position (`[len, aux_dim]`).
     pub(crate) fn aux(&self) -> &[f32] {
         &self.aux
+    }
+    /// Room for `rows` more positions, taken at once (a prompt's rows from a device come in
+    /// chunks: one allocation instead of a reallocation per chunk), on huge pages where the
+    /// system gives them on request (Linux with transparent huge pages in `madvise` mode: the
+    /// first writes then fault a page per 2 MB, not per 4 KB, which took ~10 ms of a 512-token
+    /// Qwen3-8B prompt on CUDA).
+    pub(crate) fn reserve(&mut self, rows: usize) {
+        let row = self.n_kv * self.hd;
+        // Up to a power of two of positions: the decode steps after the prompt append to it
+        // without moving it (a move of a 512-token prompt's 144 MB took ~20 ms of a step).
+        let want = (self.len + rows + 1).next_power_of_two() * row;
+        for b in [&mut self.k, &mut self.v] {
+            if b.capacity() >= want {
+                continue;
+            }
+            b.reserve_exact(want - b.len());
+            advise_huge(b);
+        }
+    }
+    /// [`Self::push`] of `t` rows into each of several caches (a device step's keys and values of
+    /// every layer), copied in one parallel region over all of them.
+    pub(crate) fn push_all(items: &mut [(&mut LayerCache, &[f32], &[f32])], t: usize) {
+        const CHUNK: usize = 1 << 16;
+        // (destination, source, length) of every chunk of every copy.
+        let mut jobs: Vec<(usize, usize, usize)> = Vec::new();
+        for (c, k, v) in items.iter_mut() {
+            debug_assert_eq!(k.len(), t * c.n_kv * c.hd);
+            for (dst, src) in [(&mut c.k, *k), (&mut c.v, *v)] {
+                dst.reserve(src.len());
+                let d = dst.spare_capacity_mut().as_mut_ptr() as usize;
+                for a in (0..src.len()).step_by(CHUNK) {
+                    jobs.push((d + a * 4, src.as_ptr() as usize + a * 4, CHUNK.min(src.len() - a)));
+                }
+            }
+        }
+        crate::pool::run(jobs.len(), &|i| {
+            let (d, s, n) = jobs[i];
+            // SAFETY: each job writes its own chunk of a reserved spare capacity.
+            unsafe { std::ptr::copy_nonoverlapping(s as *const f32, d as *mut f32, n) };
+        });
+        for (c, k, v) in items.iter_mut() {
+            // SAFETY: every element of the extensions was written above.
+            unsafe {
+                c.k.set_len(c.k.len() + k.len());
+                c.v.set_len(c.v.len() + v.len());
+            }
+            c.len += t;
+        }
     }
     pub(crate) fn push(&mut self, k: &[f32], v: &[f32], t: usize) {
         debug_assert_eq!(k.len(), t * self.n_kv * self.hd);

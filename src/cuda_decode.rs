@@ -584,6 +584,9 @@ struct Mirror {
 struct CudaSlot {
     layout: u64,
     kv: Vec<Mirror>,
+    /// The one device buffer every mirror's keys and values live in (all layers grow together:
+    /// one allocation and one free per growth, not two per layer).
+    kv_arena: u64,
     states: Vec<(u64, usize)>,
     states_valid: bool,
     last: (u64, usize),
@@ -599,12 +602,8 @@ impl Drop for CudaSlot {
             if self.cu.cuCtxSetCurrent(self.ctx) != 0 {
                 return;
             }
-            for m in &self.kv {
-                for p in [m.k, m.v] {
-                    if p != 0 {
-                        self.cu.cuMemFree_v2(p);
-                    }
-                }
+            if self.kv_arena != 0 {
+                self.cu.cuMemFree_v2(self.kv_arena);
             }
             for &(p, _) in &self.states {
                 if p != 0 {
@@ -1486,6 +1485,34 @@ impl CudaPlan<'_> {
     /// for `t` more.
     fn sync_kv(&self, slot: &mut CudaSlot, kv: &mut [&mut crate::model::LayerCache], pos: usize, t: usize) -> bool {
         let cu = &self.be.cu;
+        // Room for pos + t positions in every mirror: one new arena for all of them.
+        if slot.kv.iter().any(|m| m.cap < pos + t) {
+            let cap = (pos + t).next_power_of_two().max(256);
+            let sizes: Vec<usize> = self.kv.iter().map(|&(n, hd)| (cap * n * hd * 4).next_multiple_of(256)).collect();
+            let bytes: usize = 2 * sizes.iter().sum::<usize>();
+            let Some(arena) = self.be.alloc_zeroed(bytes) else {
+                debug(&format!("no VRAM for the KV caches ({} MB)", bytes >> 20));
+                return false;
+            };
+            let mut at = arena;
+            for (i, (m, c)) in slot.kv.iter_mut().zip(kv.iter()).enumerate() {
+                let row = self.kv[i].0 * self.kv[i].1;
+                let (k, v) = (at, at + sizes[i] as u64);
+                at += 2 * sizes[i] as u64;
+                let keep = m.synced.min(c.len).min(c.kept);
+                if keep > 0 {
+                    unsafe {
+                        cu.cuMemcpyDtoD_v2(k, m.k, keep * row * 4);
+                        cu.cuMemcpyDtoD_v2(v, m.v, keep * row * 4);
+                    }
+                }
+                (m.k, m.v, m.cap, m.synced) = (k, v, cap, keep);
+            }
+            if slot.kv_arena != 0 {
+                unsafe { cu.cuMemFree_v2(slot.kv_arena) };
+            }
+            slot.kv_arena = arena;
+        }
         for (i, (m, c)) in slot.kv.iter_mut().zip(kv.iter_mut()).enumerate() {
             let row = self.kv[i].0 * self.kv[i].1;
             if c.len != pos || c.n_kv * c.hd != row {
@@ -1498,26 +1525,6 @@ impl CudaPlan<'_> {
             }
             // A truncation (rewind) since the last step invalidates the copy from there on.
             m.synced = m.synced.min(c.len).min(c.kept);
-            if m.cap < pos + t {
-                let cap = (pos + t).next_power_of_two().max(256);
-                let bytes = cap * row * 4;
-                let (Some(k), Some(v)) = (self.be.alloc_zeroed(bytes), self.be.alloc_zeroed(bytes)) else {
-                    debug(&format!("no VRAM for KV cache {i} ({} MB)", (2 * bytes) >> 20));
-                    return false;
-                };
-                unsafe {
-                    if m.synced > 0 {
-                        cu.cuMemcpyDtoD_v2(k, m.k, m.synced * row * 4);
-                        cu.cuMemcpyDtoD_v2(v, m.v, m.synced * row * 4);
-                    }
-                    for p in [m.k, m.v] {
-                        if p != 0 {
-                            cu.cuMemFree_v2(p);
-                        }
-                    }
-                }
-                (m.k, m.v, m.cap) = (k, v, cap);
-            }
             if m.synced < c.len {
                 let (hk, hv) = c.data();
                 let r = m.synced * row..c.len * row;
@@ -1547,6 +1554,7 @@ impl CudaPlan<'_> {
                         synced: 0,
                     })
                     .collect(),
+                kv_arena: 0,
                 states: Vec::new(),
                 states_valid: false,
                 last: (0, 0),
@@ -2329,12 +2337,23 @@ impl DecodePlan for CudaPlan<'_> {
             return false;
         }
         let mut o = 0;
+        let mut items = Vec::with_capacity(ms.kv.len());
         for (i, (m, c)) in ms.kv.iter_mut().zip(s.kv.iter_mut()).enumerate() {
             let row = self.kv[i].0 * self.kv[i].1;
             let tr = self.tokens * row;
-            c.push(&kvo[o..o + t * row], &kvo[o + tr..o + tr + t * row], t);
+            items.push((&mut **c, &kvo[o..o + t * row], &kvo[o + tr..o + tr + t * row]));
             o += 2 * tr;
             m.synced = pos + t;
+        }
+        // One parallel copy for every layer (a region per layer was ~10 ms of a 512-token step).
+        if items.iter().map(|(_, k, v)| k.len() + v.len()).sum::<usize>() >= 1 << 17 {
+            crate::model::LayerCache::push_all(&mut items, t);
+        } else {
+            for (c, k, v) in items.iter_mut() {
+                c.push(k, v, t);
+            }
+        }
+        for (c, ..) in items {
             c.kept = c.len;
         }
         true

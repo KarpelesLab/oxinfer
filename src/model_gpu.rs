@@ -560,6 +560,10 @@ impl<'a> Model<'a> {
         let pw = cfg.num_hidden_layers * cfg.hidden_size_per_layer_input;
         let nc = cap.len();
         let mut hidden = vec![0f32; t * h];
+        // The prompt's keys and values come down chunk by chunk: room for all of them at once.
+        for c in sess.caches.iter_mut().flatten() {
+            c.reserve(t);
+        }
         captured.clear();
         captured.resize(t * nc * h, 0.0);
         let mut c = 0;

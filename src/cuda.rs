@@ -2059,6 +2059,91 @@ impl Backend for CudaBackend {
         true
     }
 
+    /// GGUF weights only (the LM head of a prompt's last token, a draft's few rows): the decode
+    /// plans' matvec (`mv_K`, a grid row per input row; `mvp_K` for a gate / up pair, SiLU).
+    fn matvec_rows(&self, x: &[f32], t: usize, n_in: usize, jobs: &mut [crate::gpu::RowsJob]) -> bool {
+        if jobs.is_empty() || !(1..=4).contains(&t) || !n_in.is_multiple_of(32) || x.len() < t * n_in || !self.bind() {
+            return false;
+        }
+        let mut ws = Vec::with_capacity(jobs.len());
+        let mut y_total = 0usize;
+        for j in jobs.iter() {
+            let gg = |w: &WeightRef, d: &DeviceWeight| match w {
+                WeightRef::Gguf(_) => d.downcast_ref::<CudaWeightBox>().and_then(|b| Wg::of(&b.0)),
+                _ => None,
+            };
+            let Some((k, w)) = gg(&j.w, j.dev) else { return false };
+            let up = match &j.up {
+                Some((u, d)) => match gg(u, d) {
+                    Some((k2, w2)) if k2.mvp == k.mvp => Some(w2),
+                    _ => return false,
+                },
+                None => None,
+            };
+            if j.y.len() < t * j.n_out {
+                return false;
+            }
+            ws.push((k, w, up, y_total));
+            y_total += t * j.n_out;
+        }
+        let mut st = self.staging.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.ensure_staging(&mut st, t * n_in * 4, y_total * 4) || !self.htod(st.x, &x[..t * n_in]) {
+            return false;
+        }
+        let (tt, ni, xs) = (t as u32, n_in as u32, n_in as u32);
+        for (j, &(k, w, up, off)) in jobs.iter().zip(&ws) {
+            let (no, y, zero) = (j.n_out as u32, st.y + (off * 4) as u64, 0u32);
+            let x = st.x;
+            let ok = match up {
+                Some(w2) => self.launch(
+                    k.mvp,
+                    (no.div_ceil(k.mvp_block), tt),
+                    k.mv_threads,
+                    &mut [
+                        &w as *const _ as *mut c_void,
+                        &w2 as *const _ as *mut c_void,
+                        &x as *const _ as *mut c_void,
+                        &y as *const _ as *mut c_void,
+                        &ni as *const _ as *mut c_void,
+                        &no as *const _ as *mut c_void,
+                        &xs as *const _ as *mut c_void,
+                        &no as *const _ as *mut c_void,
+                        &zero as *const _ as *mut c_void,
+                    ],
+                ),
+                None => self.launch(
+                    k.mv,
+                    (no.div_ceil(k.mv_block), tt),
+                    k.mv_threads,
+                    &mut [
+                        &w as *const _ as *mut c_void,
+                        &x as *const _ as *mut c_void,
+                        &y as *const _ as *mut c_void,
+                        &ni as *const _ as *mut c_void,
+                        &no as *const _ as *mut c_void,
+                        &xs as *const _ as *mut c_void,
+                        &no as *const _ as *mut c_void,
+                        &zero as *const _ as *mut c_void,
+                    ],
+                ),
+            };
+            if !ok {
+                return false;
+            }
+        }
+        for (j, &(_, _, _, off)) in jobs.iter_mut().zip(&ws) {
+            let n = t * j.n_out;
+            if unsafe {
+                self.cu
+                    .cuMemcpyDtoH_v2(j.y.as_mut_ptr() as *mut c_void, st.y + (off * 4) as u64, n * 4)
+            } != 0
+            {
+                return false;
+            }
+        }
+        true
+    }
+
     fn decodes(&self) -> bool {
         true
     }
@@ -2810,6 +2895,67 @@ mod tests {
             assert!(be.moe(&x, t, h, mi, &routes, &tdev, &mut y2), "moe declined (transient)");
             assert!(y2 == y, "{act:?}: transient experts differ");
             drop(tdev);
+        }
+    }
+
+    /// `matvec_rows` over GGUF weights (the prompt's LM head, a draft's rows): 1 to 4 rows, a
+    /// plain matrix and a gate / up pair, against the CPU's dequantized rows in f64.
+    #[test]
+    fn ggml_matvec_rows_match_definition() {
+        use crate::ggml::{GgmlType, GgufMatrix, random_blocks};
+        let Some(be) = backend() else { return };
+        let (n_out, n_in) = (300usize, 512usize);
+        let mut seed = 9;
+        let mats: Vec<(GgufMatrix, Vec<f32>)> = [GgmlType::Q4_K, GgmlType::Q4_K, GgmlType::Q6_K]
+            .into_iter()
+            .map(|kind| {
+                let bytes = random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed);
+                let m = GgufMatrix::from_bytes(kind, &bytes, n_out, n_in).unwrap();
+                let mut d = vec![0f32; n_out * n_in];
+                m.dequantize_rows(0, n_out, &mut d);
+                (m, d)
+            })
+            .collect();
+        let devs: Vec<DeviceWeight> = mats
+            .iter()
+            .map(|(m, _)| be.upload(&WeightRef::Gguf(m), n_out, n_in).unwrap())
+            .collect();
+        for t in 1..=4usize {
+            let x: Vec<f32> = (0..t * n_in).map(|_| rnd(&mut seed) * 2.0).collect();
+            let (mut y0, mut y1) = (vec![0f32; t * n_out], vec![0f32; t * n_out]);
+            let mut jobs = [
+                crate::gpu::RowsJob {
+                    w: WeightRef::Gguf(&mats[2].0),
+                    dev: &devs[2],
+                    up: None,
+                    n_out,
+                    y: &mut y0,
+                },
+                crate::gpu::RowsJob {
+                    w: WeightRef::Gguf(&mats[0].0),
+                    dev: &devs[0],
+                    up: Some((WeightRef::Gguf(&mats[1].0), &devs[1])),
+                    n_out,
+                    y: &mut y1,
+                },
+            ];
+            assert!(be.matvec_rows(&x, t, n_in, &mut jobs), "matvec_rows declined {t} rows");
+            let dot = |d: &[f32], j: usize, o: usize| -> (f64, f64) {
+                let (row, xr) = (&d[o * n_in..(o + 1) * n_in], &x[j * n_in..(j + 1) * n_in]);
+                let v = row.iter().zip(xr).map(|(&a, &b)| a as f64 * b as f64).sum();
+                let m = row.iter().zip(xr).map(|(&a, &b)| (a as f64 * b as f64).abs()).sum();
+                (v, m)
+            };
+            for j in 0..t {
+                for o in 0..n_out {
+                    let (v, m) = dot(&mats[2].1, j, o);
+                    assert!((y0[j * n_out + o] as f64 - v).abs() < 2e-6 * (m + 1e-3), "plain row {j} {o}");
+                    let ((g, mg), (u, mu)) = (dot(&mats[0].1, j, o), dot(&mats[1].1, j, o));
+                    let want = g / (1.0 + (-g).exp()) * u;
+                    let e = (y1[j * n_out + o] as f64 - want).abs() / ((mg + 1e-3) * (mu + 1e-3));
+                    assert!(e < 2e-6, "pair row {j} {o}: {e:.2e}");
+                }
+            }
         }
     }
 
