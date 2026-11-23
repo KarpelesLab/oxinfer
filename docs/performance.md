@@ -72,13 +72,15 @@ jobs, so +-15%):
 With the Metal backend, single-token decode steps also run on the GPU, the whole forward pass in
 one command buffer per token (see [Platforms](platforms.md#platforms-and-accelerators) for what runs where).
 Measured on an M5 Max, 256 greedy tokens after a short prompt, against the same build with
-`--gpu-decode off` (GPU prefill, CPU decode; interleaved runs, load average ~5-11):
+`--gpu-decode off` (GPU prefill, CPU decode; interleaved runs, load average ~5-11); the Llama,
+Orpheus and 26B-A4B GPU rows are tg128 from the
+[Metal decode round](#metal-decode-round-november-2026), the others from earlier builds:
 
 | Model | Weights | CPU decode | GPU decode | llama.cpp Metal |
 |---|---|---|---|---|
-| Llama-3.2-1B-Instruct | GGUF Q4_K_M | 194-205 tok/s | 391 tok/s | 390-407 tok/s |
-| Llama-3.2-1B-Instruct | GGUF Q8_0 | 148-156 tok/s | 284 tok/s | 269-285 tok/s |
-| Orpheus 3B (text) | GGUF Q4_K_M | 87-94 tok/s | 161-168 tok/s | 176-189 tok/s |
+| Llama-3.2-1B-Instruct | GGUF Q4_K_M | 194-205 tok/s | 478 tok/s | 438 tok/s |
+| Llama-3.2-1B-Instruct | GGUF Q8_0 | 148-156 tok/s | 347 tok/s | 320 tok/s |
+| Orpheus 3B (text) | GGUF Q4_K_M | 87-94 tok/s | 211 tok/s | 198 tok/s |
 | Orpheus 3B (`--speak`) | GGUF Q4_K_M | 99 tok/s | 191 tok/s (RTF 0.46) | |
 | Qwen3.5-0.8B | GGUF Q8_0 | 179-182 tok/s | 356-361 tok/s | 282-284 tok/s |
 | Qwen3.5-0.8B | `--quant q8` | 196 tok/s | 351 tok/s | |
@@ -88,7 +90,7 @@ Measured on an M5 Max, 256 greedy tokens after a short prompt, against the same 
 | Zawen-v0.1-35B-A3B (MoE) | Q4 (`--save-quantized`) | 70 tok/s | 152 tok/s | |
 | Gemma 4 E2B-it | Q4 (`--save-quantized`) | 134 tok/s | 201 tok/s | |
 | Gemma 4 E4B-it | Q4 (`--save-quantized`) | 61 tok/s | 115 tok/s | |
-| Gemma 4 26B-A4B (MoE) | GGUF Q4_0 | 63 tok/s | 130 tok/s | 115-116 tok/s |
+| Gemma 4 26B-A4B (MoE) | GGUF Q4_0 | 63 tok/s | 149 tok/s | 123 tok/s |
 | Inkling-2-Mini (MoE, looped; own engine, docs/inkling.md) | GGUF Q8_0 | 17 tok/s | 59 tok/s | 38 tok/s |
 | Inkling-2-Mini | GGUF AD-Q4_K | | 62 tok/s | 41 tok/s |
 | Inkling-2-Mini | release (NVFP4 experts) | | 56 tok/s | |
@@ -642,6 +644,10 @@ Where oxinfer is still behind:
   dequantization, 128x128 tiles, 8 SIMD-groups, 32-wide K steps, a token-major grid or a swizzled
   one, software pipelining of the next block's loads, double-buffered weight tiles, split K and
   running the query / key / value GEMMs concurrently were measured slower or no better.
+- **Metal decode** is no longer behind (1.04-1.21x llama.cpp at tg128 after the
+  [Metal decode round](#metal-decode-round-november-2026), 5-7% less GPU time per token); what
+  is left over the weights' streaming time (1.07-1.48x of it) is the drain and ramp of each
+  dependent step, ~8 per layer: fusing the RoPE into the attention kernel would remove one.
 - **Gemma 4 26B-A4B prefill** (1.03x at 512 tokens, 1.16x at 2048 after round 6, from 0.92 /
   1.09): the routed experts' grouped GEMMs are still about half of the pass at ~12 TFLOP/s
   (14-18 rows per expert at 512 tokens, median), as slow as llama.cpp's `MUL_MAT_ID`; the dense
@@ -664,6 +670,138 @@ Where oxinfer is still behind:
   [CPU decode round 6](#cpu-decode-round-6-november-2026), and rounds 5, 4 and 3 before it.
   Qwen3-8B (Q8_0, Q4_K_M), Gemma 4 12B, 26B-A4B, Orpheus and Llama 1B Q4_K_M decode level with
   or ahead of llama.cpp's best thread count.
+
+#### Metal decode round (November 2026)
+
+One-token decode steps on Metal (the whole pass in one plan, see
+[Decoding on the GPU](#decoding-on-the-gpu)), against llama.cpp's Metal decode. M5 Max shared with
+other jobs (load averages 3-5 in the runs below; another session's GPU checks ran now and then,
+so every comparison is alternated). llama.cpp is the master of 2026-11-21 built in the prefill
+rounds (`llama-bench -n 128 -p 0 -r 3`, its average); oxinfer `parity_bench MODEL pp= tg=128
+reps=3 lookup=0 draft=none mtp=0` (the best of 3; medians within 1% except where noted), the
+engines run model by model back to back. "Before" is master `a1c3bbc`. tok/s:
+
+| model | llama.cpp | before | after | after / llama.cpp |
+|---|---|---|---|---|
+| Llama-3.2-1B Q4_K_M | 438 | 422 | 478 | 1.09 |
+| Llama-3.2-1B Q8_0 | 320 | 318 | 347 | 1.08 |
+| Llama-3.2-1B Q5_K_M (`llama-quantize` from the f16 GGUF) | 327-394 | 360 | 435 | 1.10-1.33 |
+| Orpheus 3B Q4_K_M | 198 | 192 | 211 | 1.06 |
+| Qwen3-8B Q4_K_M | 98.9 | 97.0 | 104.0 | 1.05 |
+| Qwen3-8B Q8_0 | 63.6 | 62.8 | 66.4 | 1.04 |
+| Qwen3-14B Q8_0 | 32.4-34.2 | 36.5-36.8 | 37.2-37.4 | 1.09-1.15 |
+| Qwen3.5-9B BF16 | 31.6 | 35.5 | 35.7 | 1.13 |
+| Gemma 4 12B Q8_0 | 36.7-39.7 | 39.6-40.6 | 40.1-42.2 | 1.06-1.09 |
+| Gemma 4 26B-A4B Q4_0 | 123 | 135 | 149 | 1.21 |
+
+(The 12-15 GB Q8_0 models' runs varied by 5-10% with the page cache, other jobs holding large
+models: two windows each. The 27B GGUF and Zawen were not in the cache.) Before this round
+oxinfer was 0.96-0.99x llama.cpp on the Llama 1B Q4_K_M, Orpheus and Qwen3-8B rows and level on
+the Q8_0 ones; it is now ahead on every model measured. Greedy text (`--no-system`, 200 tokens) is
+the previous build's on Llama 1B Q4_K_M, Qwen3-8B Q4_K_M, Gemma 4 12B and 26B-A4B, and `pf_check`
+(128 greedy tokens after two raw-text prompts) agreed on nine of them (all but Qwen3-14B, not run);
+Qwen3-8B with its DSpark draft and `--exact-verify` still gives the plain greedy text token for
+token.
+
+**Matvec bandwidth.** The note that Q4_K / Q5_K matvecs read 450-530 GB/s against 550-590 for
+Q6_K / Q8_0 was stale for Q4_K: streaming large matrices (no barrier between them, a ring of
+weight copies larger than the caches), every format but Q5_K was already at 555-595 GB/s
+(Q4_K 556-591, Q6_K 558-594, Q8_0 564-587, Q4_0 571-595). Q5_K was at 425-440, its fifth bits
+converted and multiplied apart from the nibbles (llama.cpp's kernel sums them apart too); they
+are now merged into each value's byte first (one conversion and product per value): 541-561 GB/s
+(2048x2048 534 -> 584, 4096x4096 439 -> 559, 12288x4096 432 -> 551, 4096x12288 425 -> 561,
+alternated in one process). The multi-token kernels call the same function, so speculative
+verification stays exact.
+
+**Where the time goes.** A decode pass is a chain of dependent ops, and with the matvecs at the
+memory's rate the rest is the fixed cost of each step of the chain. Taking kinds of ops out of
+the pass (`OXINFER_DEC_ONLY`, wrong results, timing only), GPU ms per token, before -> after:
+
+| | Llama-3.2-1B Q4_K_M | Qwen3-8B Q4_K_M | Orpheus 3B Q4_K_M |
+|---|---|---|---|
+| matvecs alone (no barriers) | 1.42 -> 1.40 | 7.97 -> 7.89 | 3.59 -> 3.54 |
+| + the barriers between them | +0.24 -> +0.26 | +0.69 -> +0.71 | +0.61 -> +0.63 |
+| + norms | +0.16 -> +0.12 | +0.47 -> +0.31 | +0.32 -> +0.21 |
+| + RoPE / KV append | +0.05 -> +0.04 | +0.08 -> +0.12 | +0.04 -> +0.08 |
+| + attention (16-150 keys) | +0.31 -> +0.11 | +0.80 -> +0.32 | +0.39 -> +0.22 |
+| whole pass | 2.17 -> 1.88 | 10.0 -> 9.25 | 4.94 -> 4.49 |
+
+(After: the `+` rows from the build before the SIMD-group change below, which shortened the
+barrier and norm stages again; the whole-pass rows are the final build.) llama.cpp's passes take
+2.01 / 9.79 / 4.78 ms of GPU time (its command buffers' spans), so oxinfer's GPU time per token is
+now 5-7% below llama.cpp's.
+
+Against the time to stream each model's weights once (every tensor but the token embedding,
+the head included, routed experts at k / n; 590 GB/s, the matvecs' rate), GPU ms per token
+(`OXINFER_METAL_TRACE`, medians of 64-token runs, the two builds alternated twice):
+
+| model | GB per token | streaming | before | after | after / streaming | step (host included) |
+|---|---|---|---|---|---|---|
+| Llama-3.2-1B Q4_K_M | 0.80 | 1.36 | 2.16-2.17 | 1.88 | 1.38 | 2.05-2.06 |
+| Llama-3.2-1B Q8_0 | 1.31 | 2.23 | 2.93-2.97 | 2.66-2.70 | 1.21 | 2.84-2.90 |
+| Orpheus 3B Q4_K_M | 2.08 | 3.53 | 4.89-4.94 | 4.47-4.48 | 1.27 | 4.66 |
+| Qwen3-8B Q4_K_M | 4.67 | 7.92 | 9.96-9.97 | 9.26-9.28 | 1.17 | 9.47-9.49 |
+| Qwen3-8B Q8_0 | 8.04 | 13.63 | 15.34 | 14.63 | 1.07 | 14.86-14.87 |
+| Gemma 4 12B Q8_0 | 12.65 | 21.45 | 24.36-24.41 | 23.28-23.32 | 1.09 | 23.54-23.60 |
+| Gemma 4 26B-A4B Q4_0 | 2.56 | 4.34 | 7.12-7.16 | 6.40-6.49 | 1.48 | 6.60-6.73 |
+
+What separates a pass from its weights' streaming time is the ~8 dependent steps per layer
+(more in Gemma's MoE layers), each paying the GPU's drain and ramp, 2.5-3 us per barrier stage:
+the small models, with the least work per stage, lose the most.
+
+Host time per token: the GPU starts a command buffer ~95 us after its commit and the host wakes
+~55-70 us after it ends, plus 15-45 us to copy the logits out: ~180-200 us of a step besides its
+GPU time (llama.cpp ~290 us on Llama 1B: 2.30 ms per token for 2.01 ms of GPU time).
+
+What changed (logits bit-identical unless noted):
+
+- Attention: up to 512 keys one query head per threadgroup, up to 1024 two (each head's
+  arithmetic is the same whatever the grouping), so short contexts spread over 32 threadgroups
+  instead of 8; the value rows of 8 keys (4 for heads of 256, 2 for 512, to stay in registers)
+  are loaded together instead of as a chain. In isolation, 36 layers with barriers, 32 heads of
+  128 over 80 keys: 15.3 -> 6.1 us per layer; heads of 256 at 150 keys 19.8 -> 13.3; 2048 keys
+  54.5 -> 45.4.
+- RMSNorm / AddNorm kernels on n/8 threads with their weights loaded up front: 4.6-5.3 ->
+  3.2-4.0 us per norm (sums in another order: greedy unchanged, first-token logits within 4e-6).
+- Matvecs: 4 SIMD-groups per row from rows of 2048 values (a SIMD-group per 16 chunks, at most
+  4; it was per 64). Streaming, a SIMD-group per row is as fast or faster, but in a pass, where
+  each matvec waits for the op before it, the wider split finishes sooner: Orpheus 4.70 -> 4.49
+  ms, Llama 1B Q4_K_M 1.94 -> 1.88, Gemma 4 26B-A4B 6.62 -> 6.44, Qwen3-8B Q8_0 14.84 -> 14.73
+  (the multi-token kernels take the same split, so verification stays exact).
+- Q5_K matvecs as above.
+- Gemma 4 26B-A4B: the routed experts' post norm (`ob += norm(eo) w`) runs in the residual
+  step's AddNorm kernel (`dec_norm_add_norm`, `dec_rms_norm`'s body on the same threads, so the
+  same bits; `OXINFER_DEC_NORM_PRE=0` keeps the separate norm): a dispatch and a barrier fewer
+  per layer, 6.41 -> 6.31-6.38 ms.
+
+Measured and dropped:
+
+- Folding each RMSNorm into the matvecs that read it (the kernel takes x and the norm weight,
+  dots x * w and scales by rsqrt of the sum of squares its lanes take of x, so the norm's
+  dispatch and barrier go): slower everywhere, as the L1 traffic of x and w per chunk (256 bytes
+  per 16 of Q4_K) became the limit. Qwen3-8B Q4_K_M 9.68 -> 10.2-10.4 ms with 1-8 rows per
+  threadgroup, Llama 1B 2.03 -> 2.06-2.13, Orpheus 4.78 -> 5.04-5.12.
+- The norm taken by the producing matvec's last threadgroup (an atomic count, device-scope
+  fences, `dec_rms_norm`'s sums replayed exactly): bit-identical, but the fences in every
+  threadgroup cost more than the dispatch they save (36 x a 4096 x 4096 Q4_K matvec and norm:
+  43 -> 105 us per layer; 2048 x 2048: 11.5 -> 36.8).
+- Prefetching the next matvec's weights into the caches during the light stages (norm, RoPE):
+  no gain (a 4096 x 4096 Q4_K matvec after a norm 25.4 us, 24.5-31.4 with 10-50% prefetched).
+- Matvec splits by matrix size (the old 1-2 SIMD-groups for matrices of over 1M chunk-rows) and
+  2-16 rows per threadgroup: no better in passes (Qwen3-8B 9.25 vs 9.27-9.34 ms) though some
+  stream faster alone.
+- Attention with 64-key splits at short contexts (more threadgroups, a combine pass): slower
+  (80 keys 15.3 -> 18.1 us); fewer SIMD-groups per threadgroup: no change.
+- Host latency: a command buffer committed ahead and released by a shared event starts ~80 us
+  after the signal instead of ~105 after a commit (not worth restructuring the step for); a
+  GPU-side spinner holding the queue never sees the host's flag; a flag the last kernel writes is
+  seen ~20 us after the GPU ends instead of ~60, but nothing guarantees the logits written
+  before it are visible to the CPU then, so the step still waits for completion.
+
+Tools: `examples/parity_bench` with `pp=` for decode only; `OXINFER_METAL_TRACE=1` per-step
+GPU / host timing; `OXINFER_DEC_ONLY=barrier,mv,norm,qk,attn,...` (timing only);
+`cargo test --release --lib decode_mv_bench -- --ignored` (matvecs; `OXINFER_MV_BARRIER=1` for
+a barrier after each).
 
 #### M3 Ultra (November 2026)
 
@@ -2360,10 +2498,11 @@ Where the differences come from:
 - **Decode with a GPU**: llama.cpp runs the whole forward pass on the GPU; the rows above have
   oxinfer decode on the CPU (`--profile` on the 27B: matmuls stream 16.9 GB/token at ~200 GB/s, 85
   of 95 ms per token), hence the 2.2x on the 27B and 2x on the MoE. oxinfer now runs the whole
-  decode pass on the GPU too ([Decoding on the GPU](#decoding-on-the-gpu)): on par with llama.cpp on
-  the 1B models, ahead on Qwen3.5-0.8B (1.27x), Zawen (1.2-1.3x) and Gemma 4 26B-A4B (1.13x),
-  behind on Orpheus 3B and the 27B (~0.9x; its Q4_K / Q5_K matvecs read 450-530 GB/s against
-  550-590 for Q6_K / Q8_0, the main remaining kernel gap).
+  decode pass on the GPU too ([Decoding on the GPU](#decoding-on-the-gpu)): at the time on par
+  with llama.cpp on the 1B models, ahead on Qwen3.5-0.8B (1.27x), Zawen (1.2-1.3x) and Gemma 4
+  26B-A4B (1.13x), behind on Orpheus 3B and the 27B (~0.9x). Since the
+  [Metal decode round](#metal-decode-round-november-2026) it is ahead on every model measured
+  there (1.04-1.21x; Q5_K matvecs at the other formats' 550-590 GB/s; the 27B not re-measured).
 - **Prefill with a GPU** (2.8x on the 27B, 10x on the MoE, 8x on 0.8B): only the dense GEMMs
   run on the GPU. They now use the M5 matrix units (half inputs, f32 accumulation; 144 -> 234
   tok/s at pp512 on the 27B, before that f32 simdgroup tiles at ~8.4 TFLOP/s against llama.cpp's

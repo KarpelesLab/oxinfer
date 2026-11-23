@@ -84,15 +84,18 @@ embedding (and Gemma's per-layer-embedding row) and samples from the logits. Wha
 
 Matvec kernels exist for bf16, oxinfer's Q8 and Q4 (also MLX affine Q4) and every GGUF format
 with a GEMM (specialized kernels for F16, Q4_0, Q8_0, Q4_K, Q5_K and Q6_K; the others through
-their GEMM dequantizers): one SIMD-group or more per row, lanes taking consecutive chunks of a
-row so a SIMD-group reads contiguous memory, the nibbles (and Q5_K's high bits) of a word
-unpacked four at a time as bytes, K-quant scales decoded without branches; 450-590 GB/s on
-large matrices of an M5 Max (Q5_K ~360-390: twice the float work per value of Q4_K, as the high
-bits are summed apart to keep single- and multi-token results identical; `cargo test --release
---lib decode_mv_bench -- --ignored`).
+their GEMM dequantizers): one SIMD-group or more per row (4 from rows of 2048 values), lanes
+taking consecutive chunks of a row so a SIMD-group reads contiguous memory, the nibbles (Q5_K's
+fifth bits merged in) of a word unpacked four at a time as bytes, K-quant scales decoded without
+branches; 540-595 GB/s streaming large matrices of an M5 Max in each of these formats (Q4_K,
+Q5_K, Q6_K, Q8_0, Q4_0 alike; `cargo test --release --lib decode_mv_bench -- --ignored`), less in
+a decode pass, where each matvec waits for the op before it (see
+[Metal decode round](performance.md#metal-decode-round-november-2026)).
 Attention scores 32 keys per SIMD-group step (one lane per key), reads each key and value row
-once for the query heads sharing it, and splits long contexts over up to 64 threadgroups per head
-group. Activations stay f32 end to end (the CPU kernels quantize them to int8 for the quantized
+once for the query heads sharing it (up to 512 keys one query head per threadgroup, so short
+contexts spread over more of the GPU; each head's arithmetic is the same either way), loads
+value rows a few at a time, and splits long contexts over up to 64 threadgroups per head group.
+Activations stay f32 end to end (the CPU kernels quantize them to int8 for the quantized
 formats), and so do the KV caches: the host caches stay authoritative and the device keeps a
 copy per session, appending what CPU passes added (prefill chunks, speculative verification) and
 forgetting what a rewind dropped. Not on the GPU: models with LoRA adapters attached, streamed
