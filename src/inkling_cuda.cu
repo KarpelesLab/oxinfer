@@ -1523,13 +1523,11 @@ __device__ __forceinline__ void dq16h(const u8* row, u32 b, u32 h, u32* q) {
 // outputs. Two 128 x 128 blocks per SM (`__launch_bounds__(256, 2)`: Qwen3-8B Q4_K_M prompts
 // 7526 -> 7860 tok/s at 512 tokens on an RTX PRO 6000; three spilled, 5842).
 template <int K, int BM, int BN>
-__device__ __forceinline__ void gemmh_body(const W& w, const GemmH& p) {
+__device__ __forceinline__ void gemmh_seg(const W& w, const GemmH& p, u32 m0, u32 n0, u32 kb0, u32 kb1, float* fix) {
     constexpr int MT = BM / 32, NT = BN / 32; // 16-row and 8-column MMA tiles per warp
     __shared__ __align__(16) u16 As[2][BM * HLD];
     __shared__ __align__(16) u16 Bs[2][BN * HLD];
     u32 tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    u32 m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
-    if (m0 >= p.rows) return;
     // Loads: A, BM rows x 64 bytes per step, 16 bytes per thread and pass of 64 rows; B, row
     // tid / 2 (the first 2 BN threads), parts (tid % 2) * 4 .. + 3 of the step's block of 32.
     u32 ar = tid >> 2, ac = (tid & 3) * 8;
@@ -1545,7 +1543,6 @@ __device__ __forceinline__ void gemmh_body(const W& w, const GemmH& p) {
     u32 wr = n0 + br;
     bool bok = bthr && wr < p.n_out;
     const u8* wrow = w.q + (u64)min(wr, p.n_out - 1) * w.rb;
-    u32 nb = p.n_in / 32;
     auto load_a = [&](u32 b, u32 st) {
 #pragma unroll
         for (int i = 0; i < BM / 64; i++) cp16(&As[st][(ar + 64 * i) * HLD + ac], xa[i] + 32 * b, aok[i]);
@@ -1594,14 +1591,14 @@ __device__ __forceinline__ void gemmh_body(const W& w, const GemmH& p) {
 #pragma unroll
             for (int c = 0; c < 4; c++) acc[a][b][c] = 0.f;
     u32 wm = (warp >> 2) * (BM / 2), wn = (warp & 3) * (BN / 4);
-    load_a(0, 0);
-    load_b(0);
-    store_b(0);
+    load_a(kb0, kb0 & 1);
+    load_b(kb0);
+    store_b(kb0 & 1);
     asm volatile("cp.async.wait_group 0;");
     __syncthreads();
-    for (u32 b = 0; b < nb; b++) {
+    for (u32 b = kb0; b < kb1; b++) {
         u32 st = b & 1;
-        bool more = b + 1 < nb;
+        bool more = b + 1 < kb1;
         if (more) {
             prefetch_b(b + 1);
             load_a(b + 1, st ^ 1);
@@ -1643,14 +1640,48 @@ __device__ __forceinline__ void gemmh_body(const W& w, const GemmH& p) {
         for (int nt = 0; nt < NT; nt++)
 #pragma unroll
             for (int q = 0; q < 4; q++) {
-                u32 rr = m0 + wm + 16 * mt + g + 8 * (q >> 1), cc = n0 + wn + 8 * nt + 2 * c4 + (q & 1);
-                if (rr < p.rows && cc < p.n_out) {
-                    float v = acc[mt][nt][q] * w.f;
+                u32 lr = wm + 16 * mt + g + 8 * (q >> 1), lc = wn + 8 * nt + 2 * c4 + (q & 1);
+                u32 rr = m0 + lr, cc = n0 + lc;
+                float v = acc[mt][nt][q] * w.f;
+                if (fix)
+                    fix[lr * BN + lc] = v;
+                else if (rr < p.rows && cc < p.n_out) {
                     float* o = p.y + (u64)rr * p.ys + cc;
                     *o = p.mode ? *o + v : v;
                 }
             }
 }
+template <int K, int BM, int BN>
+__device__ __forceinline__ void gemmh_body(const W& w, const GemmH& p) {
+    u32 m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
+    if (m0 >= p.rows) return;
+    gemmh_seg<K, BM, BN>(w, p, m0, n0, 0, p.n_in / 32, nullptr);
+}
+// Stream-K (`gemmhk_K`): the grid's blocks (a persistent grid of what the GPU holds at once)
+// take equal shares of all 128 x 128 tiles' 32-wide steps, tiles in order (rows fastest). A
+// block writes the outputs of a tile whose first step it took (with the steps it took of it);
+// a part of a tile that a block took from a later step on (only its first: the others start at
+// step 0) goes to `fix` (BM x BN floats per block), which `gemmhk_fix` adds in after, in the
+// blocks' order: the results do not depend on timing.
+__device__ __forceinline__ void hk_range(const GemmH& p, u32 g, u32 G, u64& k0, u64& k1) {
+    u64 tiles = (u64)((p.n_out + 127) / 128) * ((p.rows + 127) / 128), W = tiles * (p.n_in / 32);
+    k0 = W * g / G;
+    k1 = W * (g + 1) / G;
+}
+template <int K>
+__device__ __forceinline__ void gemmhk_body(const W& w, const GemmH& p, float* fix) {
+    u32 nb = p.n_in / 32, ntm = (p.rows + 127) / 128;
+    u64 k0, k1;
+    hk_range(p, blockIdx.x, gridDim.x, k0, k1);
+    while (k0 < k1) {
+        u32 tile = (u32)(k0 / nb), kb0 = (u32)(k0 % nb);
+        u32 kb1 = (u32)min((u64)nb, kb0 + (k1 - k0));
+        u32 m0 = (tile % ntm) * 128, n0 = (tile / ntm) * 128;
+        gemmh_seg<K, 128, 128>(w, p, m0, n0, kb0, kb1, kb0 ? fix + (u64)blockIdx.x * 128 * 128 : nullptr);
+        k0 += kb1 - kb0;
+    }
+}
+
 
 template <int K>
 __device__ __forceinline__ void gemmi_any(const W& w, const GemmP& p) {
@@ -1674,7 +1705,41 @@ __device__ __forceinline__ void gemmi_any(const W& w, const GemmP& p) {
     extern "C" __global__ void __launch_bounds__(128) gemmi_##K(W w, GemmP p) { gemmi_any<K>(w, p); }                         \
     extern "C" __global__ void __launch_bounds__(256, 2) gemmh_##K(W w, GemmH p) { gemmh_body<K, 128, 128>(w, p); }                 \
     extern "C" __global__ void __launch_bounds__(256, 3) gemmhm_##K(W w, GemmH p) { gemmh_body<K, 64, 128>(w, p); }                 \
-    extern "C" __global__ void __launch_bounds__(256, 3) gemmhs_##K(W w, GemmH p) { gemmh_body<K, 64, 64>(w, p); }
+    extern "C" __global__ void __launch_bounds__(256, 3) gemmhs_##K(W w, GemmH p) { gemmh_body<K, 64, 64>(w, p); }                 \
+    extern "C" __global__ void __launch_bounds__(256, 2) gemmhk_##K(W w, GemmH p, float* fix) { gemmhk_body<K>(w, p, fix); }
+// The stream-K GEMM's second pass (grid (blocks of `gemmhk`, 16), `fix` as its): a block whose
+// share ends inside a tile it began adds, to a sixteenth of the tile (blockIdx.y), the parts of
+// it that the next blocks took, summed in their order.
+extern "C" __global__ void __launch_bounds__(256) gemmhk_fix(GemmH p, const float* fix) {
+    u32 g = blockIdx.x, G = gridDim.x, nb = p.n_in / 32, ntm = (p.rows + 127) / 128;
+    u64 k0, k1;
+    hk_range(p, g, G, k0, k1);
+    if (k1 <= k0 || k1 % nb == 0) return;
+    u64 tile = (k1 - 1) / nb, end = (tile + 1) * nb;
+    if (tile * nb < k0) return; // the block took this tile from a later step: not its owner
+    u32 m0 = (u32)(tile % ntm) * 128, n0 = (u32)(tile / ntm) * 128;
+    u32 i = blockIdx.y * 1024 + 4 * threadIdx.x; // 4 outputs of a row
+    float4 sum = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (u32 h = g + 1; h < G; h++) {
+        u64 h0, h1;
+        hk_range(p, h, G, h0, h1);
+        if (h0 >= end) break;
+        if (h1 <= h0) continue;
+        float4 f = *(const float4*)(fix + (u64)h * 128 * 128 + i);
+        sum.x += f.x;
+        sum.y += f.y;
+        sum.z += f.z;
+        sum.w += f.w;
+        if (h1 >= end) break;
+    }
+    u32 rr = m0 + i / 128, cc = n0 + i % 128;
+    if (rr >= p.rows) return;
+    float* o = p.y + (u64)rr * p.ys + cc;
+    const float v[4] = {sum.x, sum.y, sum.z, sum.w};
+#pragma unroll
+    for (int e = 0; e < 4; e++)
+        if (cc + e < p.n_out) o[e] += v[e];
+}
 #else
 #define KERNELS(K)                                                                                                                         \
     extern "C" __global__ void __launch_bounds__(128) mv_##K(W w, const float* x, float* y, u32 n_in, u32 n_out, u32 xs, u32 ys, u32 mode) { \

@@ -480,6 +480,8 @@ struct PfFuncs {
     /// of the widest GEMM input), else null.
     half: F,
     xh: u64,
+    /// The stream-K GEMM's scratch ([`super::gemmh_fix_floats`]).
+    fix: u64,
     glu: F,
     ew: F,
     qk: F,
@@ -1341,6 +1343,7 @@ impl CudaBackend {
         // The fast prefill GEMM's f16 input rows.
 
         let xh_off = region(if fast_gemm { gemm_in_max * tokens * 2 } else { 4 });
+        let fix_off = region(if fast_gemm { super::gemmh_fix_floats() * 4 } else { 4 });
         let part_off = region(part_floats.max(1) * 4);
         let pair_off = region(pair_floats.max(1) * tokens * 4);
         let save_off: Vec<usize> = saves.iter().map(|&n| region(n * 4)).collect();
@@ -1457,6 +1460,7 @@ impl CudaBackend {
                     flag: arena + flag_off as u64,
                     half: if fast_gemm { self.func("dhalf_t")? } else { std::ptr::null_mut() },
                     xh: arena + xh_off as u64,
+                    fix: arena + fix_off as u64,
                     glu: self.func("dglu_t")?,
                     ew: self.func("dew_t")?,
                     qk: self.func("dqk_rope_t")?,
@@ -1893,7 +1897,11 @@ impl CudaPlan<'_> {
                             ((n_in / 2).div_ceil(256).min(8), tt),
                             256,
                             &mut args![xa, n_in, xs, xh, flag],
-                        ) && {
+                        ) && if let Some(g) = super::gemmh_stream_k(n_out, tt, n_in) {
+                            let fix = pf.fix;
+                            be.launch(k.gemmhk, (g, 1), 256, &mut args![w, p, fix])
+                                && be.launch(k.gemmhk_fix, (g, 16), 256, &mut args![p, fix])
+                        } else {
                             let (f, bm, bn) = super::gemmh_tile(&k, n_out, tt);
                             be.launch(f, (n_out.div_ceil(bn), tt.div_ceil(bm)), 256, &mut args![w, p])
                         },

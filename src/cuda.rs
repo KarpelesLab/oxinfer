@@ -52,6 +52,30 @@ fn gemmh_tile(k: &GgKernels, n_out: u32, rows: u32) -> (*mut c_void, u32, u32) {
     }
 }
 
+/// The stream-K grid of the fast GEMM ([`GgKernels::gemmhk`]) for `n_out` outputs over `rows`
+/// rows of `n_in`, or None when the tiles of [`gemmh_tile`] fill the GPU's blocks evenly
+/// enough: two blocks per SM, each taking an equal share of the 128 x 128 tiles' 32-wide steps.
+/// `OXINFER_CUDA_STREAM_K=0` never takes it, `=1` always.
+fn gemmh_stream_k(n_out: u32, rows: u32, n_in: u32) -> Option<u32> {
+    static MODE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| std::env::var("OXINFER_CUDA_STREAM_K").ok().map(|v| v != "0"));
+    let g = 2 * SMS.load(Ordering::Relaxed);
+    let tiles = n_out.div_ceil(128) * rows.div_ceil(128);
+    let steps = tiles as u64 * (n_in / 32) as u64;
+    let g = (g as u64).min(steps / 8).max(1) as u32;
+    let even = tiles.is_multiple_of(g) || tiles >= 8 * g;
+    match mode {
+        Some(false) => None,
+        Some(true) => Some(g),
+        None => (!even).then_some(g),
+    }
+}
+
+/// Floats of the stream-K GEMM's scratch: a 128 x 128 tile per block of its largest grid.
+pub(crate) fn gemmh_fix_floats() -> usize {
+    2 * SMS.load(Ordering::Relaxed) as usize * 128 * 128
+}
+
 /// Whether the device in use shares the system's memory ([`INTEGRATED`]).
 fn integrated() -> bool {
     INTEGRATED.load(Ordering::Relaxed)
@@ -407,6 +431,10 @@ struct GgKernels {
     pub(crate) gemmh: *mut c_void,
     pub(crate) gemmhm: *mut c_void,
     pub(crate) gemmhs: *mut c_void,
+    /// `gemmhk_K` and `gemmhk_fix`: the fast GEMM by stream-K over 128 x 128 tiles
+    /// ([`gemmh_stream_k`]).
+    pub(crate) gemmhk: *mut c_void,
+    pub(crate) gemmhk_fix: *mut c_void,
 }
 
 /// Rows per warp of the ggml matvec kernel of `kind` (`MV_ROWS` in `inkling_cuda.cu`), 0 for the
@@ -1022,6 +1050,8 @@ impl CudaBackend {
                     gemmh: get(format!("gemmh_{id}"))?,
                     gemmhm: get(format!("gemmhm_{id}"))?,
                     gemmhs: get(format!("gemmhs_{id}"))?,
+                    gemmhk: get(format!("gemmhk_{id}"))?,
+                    gemmhk_fix: get("gemmhk_fix".to_string())?,
                 })
             }
             Err(e) => {
@@ -3386,6 +3416,19 @@ mod tests {
                         // Both operands rounded to f16: ~2^-11 of each product.
                         check(&format!("fast gemm {bm} x {bn}"), 2e-3);
                     }
+                    // Stream-K, the tile split over blocks at a few points (and blocks with no
+                    // steps).
+                    for g in [1u32, 3, 7, 40] {
+                        let mut fix = 0u64;
+                        assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut fix, g as usize * 128 * 128 * 4) }, 0);
+                        assert!(be.htod(dy, &y0));
+                        let mut a2 = [args[0], args[1], &fix as *const _ as *mut c_void];
+                        assert!(be.launch(k.gemmhk, (g, 1), 256, &mut a2));
+                        let mut a3 = [args[1], &fix as *const _ as *mut c_void];
+                        assert!(be.launch(k.gemmhk_fix, (g, 16), 256, &mut a3));
+                        check(&format!("stream-k gemm over {g} blocks"), 2e-3);
+                        unsafe { be.cu.cuMemFree_v2(fix) };
+                    }
                     unsafe { be.cu.cuMemFree_v2(dxh) };
                 }
             }
@@ -3864,7 +3907,17 @@ mod tests {
         let mut seed = 5;
         for id in kinds {
             let kind = GgmlType::from_id(id).unwrap();
-            for (n_out, n_in) in [(17408usize, 5120usize), (5120, 17408)] {
+            let shapes: Vec<(usize, usize)> = std::env::var("BENCH_SHAPES")
+                .map(|v| {
+                    v.split(',')
+                        .map(|s| {
+                            let (a, b) = s.split_once('x').unwrap();
+                            (a.parse().unwrap(), b.parse().unwrap())
+                        })
+                        .collect()
+                })
+                .unwrap_or_else(|_| vec![(17408, 5120), (5120, 17408)]);
+            for (n_out, n_in) in shapes {
                 let bytes = random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed);
                 let m = GgufMatrix::from_bytes(kind, &bytes, n_out, n_in).unwrap();
                 let cw = be.upload_weight(&WeightRef::Gguf(&m)).unwrap();
@@ -3899,6 +3952,86 @@ mod tests {
                     ..GemmP::default()
                 };
                 let gemm = || assert!(be.gemm_gg_p(k, w, p));
+                // The fast GEMM of the prefill plans, by tiles and by stream-K (x's bytes as
+                // f16: only the time and the two's agreement count), best of rounds (the device
+                // may be shared).
+                {
+                    let xh: Vec<u16> = x.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
+                    let dxh = be.upload_bytes(xh.as_ptr() as *const u8, xh.len() * 2).unwrap();
+                    let ph = GemmH {
+                        xh: dxh,
+                        y: dy,
+                        n_in: ni,
+                        n_out: no,
+                        rows: t as u32,
+                        xs: ni,
+                        ys: no,
+                        mode: 0,
+                    };
+                    let g = 2 * SMS.load(Ordering::Relaxed);
+                    let mut fix = 0u64;
+                    assert_eq!(unsafe { be.cu.cuMemAlloc_v2(&mut fix, g as usize * 128 * 128 * 4) }, 0);
+                    let tiles = || {
+                        let (f, bm, bn) = gemmh_tile(&k, no, t as u32);
+                        let mut a = [&w as *const _ as *mut c_void, &ph as *const _ as *mut c_void];
+                        assert!(be.launch(f, (no.div_ceil(bn), (t as u32).div_ceil(bm)), 256, &mut a));
+                    };
+                    let sk = || {
+                        let mut a = [
+                            &w as *const _ as *mut c_void,
+                            &ph as *const _ as *mut c_void,
+                            &fix as *const _ as *mut c_void,
+                        ];
+                        assert!(be.launch(k.gemmhk, (g, 1), 256, &mut a));
+                        let mut a = [&ph as *const _ as *mut c_void, &fix as *const _ as *mut c_void];
+                        assert!(be.launch(k.gemmhk_fix, (g, 16), 256, &mut a));
+                    };
+                    let mut ya = vec![0f32; t * n_out];
+                    let mut yb = vec![0f32; t * n_out];
+                    tiles();
+                    sync();
+                    assert!(be.dtoh(&mut ya, dy));
+                    sk();
+                    sync();
+                    assert!(be.dtoh(&mut yb, dy));
+                    let scale = ya.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let worst = ya.iter().zip(&yb).fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+                    let timed = |f: &dyn Fn()| {
+                        let mut best = f64::MAX;
+                        for _ in 0..7 {
+                            sync();
+                            let t0 = Instant::now();
+                            for _ in 0..5 {
+                                f();
+                            }
+                            sync();
+                            best = best.min(t0.elapsed().as_secs_f64() / 5.0);
+                        }
+                        best
+                    };
+                    let (a, b) = (timed(&tiles), timed(&sk));
+                    let fl = 2.0 * (t * n_out * n_in) as f64;
+                    eprintln!(
+                        "{kind} {n_out} x {n_in}: fast gemm by tiles {:.0} us ({:.1} TFLOP/s), stream-k {:.0} us ({:.1}); differ by {:.1e} of {scale:.1e}",
+                        a * 1e6,
+                        fl / a / 1e12,
+                        b * 1e6,
+                        fl / b / 1e12,
+                        worst
+                    );
+                    unsafe {
+                        be.cu.cuMemFree_v2(dxh);
+                        be.cu.cuMemFree_v2(fix);
+                    }
+                }
+                if std::env::var_os("BENCH_FAST_ONLY").is_some() {
+                    be.free_weight(&cw);
+                    unsafe {
+                        be.cu.cuMemFree_v2(dx);
+                        be.cu.cuMemFree_v2(dy);
+                    }
+                    continue;
+                }
                 mv();
                 gemm();
                 sync();

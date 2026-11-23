@@ -261,7 +261,25 @@ IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4. Three things run on the
   GEMM's tile follows the launch (128 x 128, 64 x 128 or 64 x 64 rows x outputs, the largest
   giving half the SMs a block: the 1024-wide key and value projections take 64 x 64) and two
   128 x 128 blocks share an SM; the logits do not change (every output sums its steps in the
-  same order): Qwen3-8B 7800 / 7608 tok/s, Llama-3.2-1B 36839 / 36425. RMSNorm, RoPE, the
+  same order): Qwen3-8B 7800 / 7608 tok/s, Llama-3.2-1B 36839 / 36425. Where those tiles do not
+  fill the GPU's blocks evenly (fewer than eight waves and not whole ones: every GEMM of these two
+  models at 512 tokens, e.g. Qwen3-8B's 4096-wide projections give 128 tiles to 188 SMs and its
+  gate / up 384 to 376 block slots), the GEMM goes by stream-K (`gemmhk_*`; `OXINFER_CUDA_STREAM_K=0`
+  / `1` never / always): two blocks per SM, each taking an equal share of all 128 x 128 tiles'
+  32-wide steps; a block writes the tiles it began, and the parts of tiles it took from a later
+  step go to a scratch tile per block that a second pass (`gemmhk_fix`, sixteen blocks per tile)
+  adds in the blocks' order, so the results are the same from run to run. On the shapes alone
+  (`ggml_bench`, `BENCH_SHAPES`, best of 7 on a GPU another process was using): Q4_K 12288 x 4096
+  329 -> 266 us, 4096 x 12288 352 -> 271, 1024 x 4096 62 -> 41, 4096 x 4096 137 -> 123; the
+  second pass, one block per tile summing up to a dozen parts in turn, had cost 117 us of the
+  1024 x 4096 GEMM. The GEMM time of a 512-token Qwen3-8B pass falls from 67-79 to 49-69 ms
+  (per-op trace), and prompts (best of 5, a shared GPU): Qwen3-8B 7278 -> 8182 tok/s at 512
+  tokens and 6590 -> 7151 at 2048, Llama-3.2-1B 35960 -> 43064 and 34802 -> 40273; greedy
+  tokens unchanged on both (`pf_check`, 1500 tokens, 32 greedy: the first step within 0.006 of
+  the exact GEMM's log-probabilities). An int8 GEMM in the tensor cores (x rounded to int8 per
+  block of 32, `mma.m16n8k32.s8`, each block's sums scaled in f32 as llama.cpp's `mmq`) measured
+  even with these tiles on Q4_K and up to 8% faster on Q6_K: the scaling after every 32-wide step
+  took ~45% of its time (225 against 401 us without it), so it is not kept. RMSNorm, RoPE, the
   activations, the Gated DeltaNet convolution and delta rule (the state in registers across the
   step's tokens) over all tokens in one launch; attention with the decode kernel, 32 tokens per
   launch; the hidden states, the new keys and values and the recurrent states come back to the
