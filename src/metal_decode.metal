@@ -242,6 +242,111 @@ inline float mdot(MIQ1_M f, uint row, uint c, thread const X32& x) {
     }
     return r;
 }
+// ---- The routed experts' IQ1_S / IQ1_M dots (`mvxd_*`; one-token only, so free of the sharing
+// above): the grid entries from `iq1s_grid_h`, the same ternary values as halves (+-1 = 0x3c00 /
+// 0xbc00, a 16-byte row per entry, prepended by `decode_src`), which the multiply-adds take
+// without a conversion instruction (the kernels are bound by instructions, not memory: 2304 x
+// 5120 gate / up pairs 344 -> ~470 GB/s); x's sums over each group of 8 (for the deltas) formed
+// when x is loaded (`X32S`), once for the rows that share the load.
+struct X32S { float4 v[8]; float4 s; float t; };
+inline void xload(device const float* x, uint c, thread X32S& xr) {
+    device const float4* p = (device const float4*)(x + c * 32);
+    for (uint i = 0; i < 8; i++) xr.v[i] = p[i];
+    for (uint l = 0; l < 4; l++) xr.s[l] = hsum(xr.v[2 * l] + xr.v[2 * l + 1]);
+    xr.t = (xr.s.x + xr.s.y) + (xr.s.z + xr.s.w);
+}
+inline float4 gh_lo(uint4 g) { return float4(as_type<half4>(g.xy)); }
+inline float4 gh_hi(uint4 g) { return float4(as_type<half4>(g.zw)); }
+struct MXIQ1_S { device const uchar* w; ulong rb; };
+inline float mdot(MXIQ1_S f, uint row, uint c, thread const X32S& x) {
+    device const ushort* B = (device const ushort*)(f.w + (ulong)row * f.rb + (c / 8) * 50);
+    uint j = c % 8;
+    uint qh = B[17 + j], q01 = B[1 + 2 * j], q23 = B[2 + 2 * j];
+    float dl = float(as_type<half>(B[0])) * float(2 * ((qh >> 12) & 7) + 1);
+    float delta = (qh & 0x8000) ? -0.125f : 0.125f;
+    uint idx[4] = { (q01 & 255) | ((qh << 8) & 0x700), (q01 >> 8) | ((qh << 5) & 0x700),
+                    (q23 & 255) | ((qh << 2) & 0x700), (q23 >> 8) | ((qh >> 1) & 0x700) };
+    float4 s = 0.f;
+    for (uint l = 0; l < 4; l++) {
+        uint4 g = iq1s_grid_h[idx[l]];
+        s = fma(gh_lo(g), x.v[2 * l], s);
+        s = fma(gh_hi(g), x.v[2 * l + 1], s);
+    }
+    return dl * fma(delta, x.t, hsum(s));
+}
+// IQ1_M: groups 0-1 and 2-3 of the chunk share a scale; group l's delta sign is bit 4l + 3 of qh.
+struct MXIQ1_M { device const uchar* w; ulong rb; };
+inline float mdot(MXIQ1_M f, uint row, uint c, thread const X32S& x) {
+    device const uchar* B = f.w + (ulong)row * f.rb + (c / 8) * 56;
+    uint j = c % 8;
+    device const ushort* S = (device const ushort*)(B + 48);
+    uint s0 = S[0], s1 = S[1], s2 = S[2], s3 = S[3];
+    float d = float(as_type<half>(ushort((s0 >> 12) | ((s1 >> 8) & 0x00f0) | ((s2 >> 4) & 0x0f00) | (s3 & 0xf000))));
+    uint sv = S[j / 2] >> (6 * (j % 2));
+    device const ushort* Q = (device const ushort*)B;
+    uint q01 = Q[2 * j], q23 = Q[2 * j + 1];
+    uint qh = Q[16 + j];
+    uint4 g0 = iq1s_grid_h[(q01 & 255) | ((qh << 8) & 0x700)];
+    uint4 g1 = iq1s_grid_h[(q01 >> 8) | ((qh << 4) & 0x700)];
+    uint4 g2 = iq1s_grid_h[(q23 & 255) | (qh & 0x700)];
+    uint4 g3 = iq1s_grid_h[(q23 >> 8) | ((qh >> 4) & 0x700)];
+    float4 a = gh_lo(g0) * x.v[0];
+    a = fma(gh_hi(g0), x.v[1], a);
+    a = fma(gh_lo(g1), x.v[2], a);
+    a = fma(gh_hi(g1), x.v[3], a);
+    float4 b = gh_lo(g2) * x.v[4];
+    b = fma(gh_hi(g2), x.v[5], b);
+    b = fma(gh_lo(g3), x.v[6], b);
+    b = fma(gh_hi(g3), x.v[7], b);
+    float4 ds = select(float4(0.125f), float4(-0.125f), (uint4(qh) & uint4(0x8, 0x80, 0x800, 0x8000)) != 0u) * x.s;
+    float r0 = hsum(a) + (ds.x + ds.y), r1 = hsum(b) + (ds.z + ds.w);
+    return d * fma(float(2 * (sv & 7) + 1), r0, float(2 * ((sv >> 3) & 7) + 1) * r1);
+}
+// ---- The routed experts' IQ2_XXS (66-byte blocks of 256, 2-byte aligned) and IQ2_S (82 bytes)
+// dots, chunk of 32 = one sub-block: four grid entries of 8 magnitudes (8, 25 or 43) with a sign
+// bit each, one scale (two for IQ2_S). The block read as 16-bit words (the GEMM loader reads
+// bytes), the signs applied to the magnitude bytes (`sgn4`), the scale to the chunk's sum. (Grids
+// of halves as for IQ1, with the signs as half sign masks from a table: no faster.)
+// Four magnitude bytes b, negated where bits 0-3 of s are set, as floats: m = 0xff in the bytes
+// to negate, (b ^ m) + 1 = 256 - b there (b > 0: no carry into the next byte).
+inline float4 sgn4(uint b, uint s) {
+    uint m = ((s & 15u) * 0x00204081u) & 0x01010101u;
+    return float4(as_type<char4>((b ^ (m * 255u)) + m));
+}
+struct MXIQ2_XXS { device const uchar* w; ulong rb; };
+inline float mdot(MXIQ2_XXS f, uint row, uint c, thread const X32& x) {
+    device const ushort* B = (device const ushort*)(f.w + (ulong)row * f.rb + (c / 8) * 66);
+    uint j = c % 8;
+    uint a0 = uint(B[1 + 4 * j]) | (uint(B[2 + 4 * j]) << 16), a1 = uint(B[3 + 4 * j]) | (uint(B[4 + 4 * j]) << 16);
+    float db = float(as_type<half>(B[0])) * (0.5f + float(a1 >> 28)) * 0.25f;
+    float4 s = 0.f;
+    for (uint l = 0; l < 4; l++) {
+        ulong g = iq2xxs_grid[(a0 >> (8 * l)) & 255];
+        uint sg = (a1 >> (7 * l)) & 127;
+        sg |= (popcount(sg) & 1) << 7;
+        s = fma(sgn4(uint(g), sg), x.v[2 * l], s);
+        s = fma(sgn4(uint(g >> 32), sg >> 4), x.v[2 * l + 1], s);
+    }
+    return db * hsum(s);
+}
+struct MXIQ2_S { device const uchar* w; ulong rb; };
+inline float mdot(MXIQ2_S f, uint row, uint c, thread const X32& x) {
+    device const uchar* B = f.w + (ulong)row * f.rb + (c / 8) * 82;
+    device const ushort* H = (device const ushort*)B;
+    uint j = c % 8;
+    uint qs = uint(H[1 + 2 * j]) | (uint(H[2 + 2 * j]) << 16);
+    uint sn = uint(H[17 + 2 * j]) | (uint(H[18 + 2 * j]) << 16);
+    uint qh = B[66 + j], sc = B[74 + j];
+    float4 a = 0.f, b = 0.f;
+    for (uint l = 0; l < 4; l++) {
+        ulong g = iq2s_grid[((qs >> (8 * l)) & 255) | ((qh << (8 - 2 * l)) & 0x300)];
+        uint sg = sn >> (8 * l);
+        float4 v = fma(sgn4(uint(g), sg), x.v[2 * l], sgn4(uint(g >> 32), sg >> 4) * x.v[2 * l + 1]);
+        if (l < 2) a += v; else b += v;
+    }
+    float d = float(as_type<half>(H[0])) * 0.25f;
+    return d * fma(0.5f + float(sc & 15), hsum(a), (0.5f + float(sc >> 4)) * hsum(b));
+}
 // ---- K-quants: 256-value super-blocks, 8 chunks of 32 each. Chunk k of a super-block covers 16
 // bytes of quants: group g = k / 2 (64 values), half h = k % 2; its low nibbles are values
 // 64g + 16h + i (sub-block 2g), the high nibbles 64g + 32 + 16h + i (sub-block 2g + 1).
@@ -1557,6 +1662,37 @@ MVX_SIG(NAME##_sum) { threadgroup float red[2]; \
         mv_acc<T, X, CH, 1, 1>(f, f, false, 0, x + (ulong)s * p.n_in, p.n_in, p.n_out, tg.x, sg, lane, acc, acc2, sel[p.ldy + s]); \
     } \
     mv_finish<1, 1>(acc, acc2, y, p.mode, tg.x, p.n_out, sg, lane, red, sel); }
+// DeepSeek V4.1's routed experts on their own dots (`mvxd_<fmt>`, see `MetalBackend::expert_pipe`),
+// one SIMD-group a threadgroup. The pair kernel takes NRP rows of gate and up a SIMD-group (each x
+// chunk loaded once for them). The sum kernel takes NRS rows; its lanes go over the (slot, chunk)
+// tasks of all slots in turn instead of each slot's chunks (2304 values are 72 chunks of 32: a
+// slot at a time left 8 lanes with 3 chunks and 24 with 2), so every lane has 13 or 14 tasks.
+#define MVXD(NAME, T, X, CH, MAKE, NRP, NRS) \
+MVX_SIG(NAME##_pair) { threadgroup float red[2]; \
+    uint s = tg.y, row = tg.x * NRP; \
+    EPX e = tab[as_type<uint>(sel[s])], e2 = tab2[as_type<uint>(sel[s])]; \
+    float acc[NRP], acc2[NRP]; \
+    for (int r = 0; r < NRP; r++) { acc[r] = 0.f; acc2[r] = 0.f; } \
+    T f = MAKE(e); T f2 = MAKE(e2); \
+    mv_acc<T, X, CH, NRP, 1>(f, f2, true, p._p, x, p.n_in, p.n_out, row, 0, lane, acc, acc2, 1.f); \
+    mv_finish<NRP, 1>(acc, acc2, y + (ulong)s * p.n_out * (p.mode == 5u ? 2u : 1u), p.mode, row, p.n_out, 0, lane, red, sel + 2 * p.ldy); } \
+MVX_SIG(NAME##_sum) { threadgroup float red[2]; \
+    uint row = tg.x * NRS, rows[NRS]; \
+    for (int r = 0; r < NRS; r++) rows[r] = min(row + r, p.n_out - 1); \
+    uint nch = p.n_in / CH, s = 0, c = lane; \
+    while (c >= nch) { c -= nch; s++; } \
+    float a[NRS], b[NRS]; \
+    for (int r = 0; r < NRS; r++) { a[r] = 0.f; b[r] = 0.f; } \
+    while (s < p.ldy) { \
+        EPX e = tab[as_type<uint>(sel[s])]; T f = MAKE(e); \
+        X xr; \
+        xload(x + (ulong)s * p.n_in, c, xr); \
+        float w = sel[p.ldy + s]; \
+        for (int r = 0; r < NRS; r++) a[r] += w * mdot(f, rows[r], c, xr); \
+        c += 32; \
+        while (c >= nch) { c -= nch; s++; } \
+    } \
+    mv_finish<NRS, 1>(a, b, y, p.mode, row, p.n_out, 0, lane, red, sel); }
 #define MK_RAWX(T) T{ e.q, p.gpr }
 #define MKX_Q8(e) MQ8{ (device const char*)(e).q, (device const float*)(e).s, p.n_in }
 #define MKX_Q4(e) MQ4{ (e).q, (device const half*)(e).s, p.n_in, (device const ushort*)(e).o, p.gpr, p.gk }

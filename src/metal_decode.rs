@@ -252,10 +252,11 @@ pub(crate) fn all_formats() -> Vec<MvFmt> {
 /// The decode kernels (`metal_decode.metal`); `OXINFER_DECODE_SRC=FILE` takes them from a file
 /// instead (kernel work without a rebuild, as `OXINFER_INKLING_METAL`).
 pub(crate) fn decode_src() -> String {
-    std::env::var("OXINFER_DECODE_SRC")
+    let src = std::env::var("OXINFER_DECODE_SRC")
         .ok()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .unwrap_or_else(|| SRC.to_string())
+        .unwrap_or_else(|| SRC.to_string());
+    iq1s_half_grid() + &src
 }
 
 /// The decode kernels' source with the matvec instantiations.
@@ -268,6 +269,16 @@ pub(crate) fn shader_src() -> String {
         let n = f.name();
         let _ = writeln!(s, "#define MKX_{n}(e) {mk}");
         let _ = writeln!(s, "MVX(mvx_{n}, {t}, {x}, {ch}, MKX_{n})");
+        // DeepSeek V4.1's routed experts on dots of their own: `mvxd_<fmt>_pair` / `_sum`.
+        if let Some((nrp, nrs)) = mvxd_rows(f) {
+            let _ = writeln!(s, "#define MKD_{n}(e) MX{n}{{ (e).q, p.gpr }}");
+            let x = if matches!(f, MvFmt::Gguf(GgmlType::IQ1_S | GgmlType::IQ1_M)) {
+                "X32S"
+            } else {
+                "X32"
+            };
+            let _ = writeln!(s, "MVXD(mvxd_{n}, MX{n}, {x}, 32, MKD_{n}, {nrp}, {nrs})");
+        }
         for &(nr, ks) in &MV_VARIANTS {
             if f.specialized() || (nr, ks) == (2, 4) {
                 let _ = writeln!(s, "{}", f.instantiate_mv(nr, ks));
@@ -830,6 +841,52 @@ pub(crate) struct MvParams {
     pub gk: u32,
     pub ldy: u32,
     pub _p: u32,
+}
+
+/// The formats with routed-expert kernels of their own (`mvxd_<fmt>_pair` / `_sum`, DeepSeek
+/// V4.1's experts) and their rows a threadgroup: (pair, sum).
+fn mvxd_rows(f: MvFmt) -> Option<(usize, usize)> {
+    match f {
+        MvFmt::Gguf(GgmlType::IQ1_S | GgmlType::IQ1_M) => Some((2, 2)),
+        MvFmt::Gguf(GgmlType::IQ2_XXS | GgmlType::IQ2_S) => Some((1, 2)),
+        _ => None,
+    }
+}
+
+/// `iq1s_grid_h`: the IQ1_S / IQ1_M grid (`IQ1S_GRID`, ternary signed bytes) as halves, 8 to a
+/// 16-byte row (the `mvxd_` kernels' IQ1 dots).
+fn iq1s_half_grid() -> String {
+    let mut s = String::from("constant uint4 iq1s_grid_h[2048] = {");
+    for (i, &g) in crate::ggml::tables::IQ1S_GRID.iter().enumerate() {
+        let h = |b: usize| -> u32 {
+            match (g >> (8 * b)) as u8 {
+                0 => 0,
+                1 => 0x3c00,
+                _ => 0xbc00,
+            }
+        };
+        let w: Vec<String> = (0..4).map(|k| format!("{:#x}", h(2 * k) | (h(2 * k + 1) << 16))).collect();
+        let _ = write!(s, "{}uint4({})", if i > 0 { "," } else { "" }, w.join(","));
+    }
+    s.push_str("};\n");
+    s
+}
+
+impl MetalBackend {
+    /// An expert kernel for one token (`sum`: the down projection's, else the gate / up pair's)
+    /// and its rows a threadgroup of 32 threads: `mvxd_<fmt>` where the format has one, else
+    /// `mvx_<fmt>` (one row). The pair runs over (n_out / rows, k) threadgroups, the sum over
+    /// (n_out / rows, 1).
+    pub(crate) fn expert_pipe(&self, fmt: MvFmt, sum: bool) -> Option<(Id, usize)> {
+        let part = if sum { "sum" } else { "pair" };
+        match mvxd_rows(fmt) {
+            Some((nrp, nrs)) => Some((
+                self.named_pipeline(&format!("mvxd_{}_{part}", fmt.name()))?,
+                if sum { nrs } else { nrp },
+            )),
+            None => Some((self.named_pipeline(&format!("mvx_{}_{part}", fmt.name()))?, 1)),
+        }
+    }
 }
 
 /// A weight matrix as the matvec kernels address it.
@@ -8700,6 +8757,215 @@ mod tests {
                 }
                 println!("{line}");
             }
+        }
+    }
+
+    /// The MoE expert kernels of one token (`mvx_<fmt>_pair` / `_sum`, and DeepSeek V4.1's
+    /// [`MetalBackend::expert_pipe`]) at DeepSeek V4.1 Flash's shapes: 6 of `OXINFER_XB_NE` (default 48) experts a "layer", 43 layers a command buffer
+    /// (each its own experts, so the weights come from memory), gate / up `[2304, 5120]` and down
+    /// `[5120, 2304]` of each format of `OXINFER_XB_FMTS`. GPU time of the pair dispatches, the
+    /// sum dispatches, and both (a barrier between), and the outputs' largest difference from the
+    /// CPU reference (one layer).
+    #[test]
+    #[ignore]
+    fn decode_experts_bench() {
+        use crate::ggml::random_blocks;
+        let be = MetalBackend::new().unwrap();
+        let env = |k: &str, d: &str| std::env::var(k).unwrap_or(d.into());
+        let (h, inter, k, layers) = (5120usize, 2304usize, 6usize, 43usize);
+        let ne: usize = env("OXINFER_XB_NE", "48").parse().unwrap();
+        let mut seed = 5u64;
+        for fname in env("OXINFER_XB_FMTS", "IQ1_S,IQ1_M,IQ2_XXS,IQ2_S").split(',') {
+            let kind = GGUF_GPU_TYPES.iter().copied().find(|t| t.name() == fname).unwrap();
+            let fmt = MvFmt::Gguf(kind);
+            let (gb, db) = (kind.row_bytes(h) * inter, kind.row_bytes(inter) * h);
+            let sizes = [gb, gb, db];
+            let stride = |j: usize| sizes[j].next_multiple_of(4096);
+            let per = stride(0) + stride(1) + stride(2);
+            let mut mem = PageVec::<u8>::zeroed(ne * per);
+            let at = |e: usize, j: usize| e * per + (0..j).map(stride).sum::<usize>();
+            for e in 0..ne {
+                for (j, &sz) in sizes.iter().enumerate() {
+                    let v = random_blocks(kind, sz / kind.type_size(), &mut seed);
+                    mem[at(e, j)..at(e, j) + sz].copy_from_slice(&v);
+                }
+            }
+            let wb = be.wrap(mem.as_ptr(), mem.len()).unwrap();
+            let base = be.buffer_gpu_address(wb.id) + wb.offset_bytes as u64;
+            // The three tables (gate, up, down) of EPX entries.
+            let mut tabs = PageVec::<u64>::zeroed(3 * 512);
+            for j in 0..3 {
+                for e in 0..ne {
+                    for q in 0..4 {
+                        tabs[j * 512 + e * 4 + q] = base + at(e, j) as u64;
+                    }
+                }
+            }
+            let tb = be.wrap(tabs.as_ptr() as *const u8, tabs.len() * 8).unwrap();
+            // Per layer: k ids, k weights, the clamp limit (16 floats).
+            let mut sel = PageVec::<f32>::zeroed(layers * 16);
+            for l in 0..layers {
+                for s in 0..k {
+                    sel[l * 16 + s] = f32::from_bits(((l * k + s) % ne) as u32);
+                    sel[l * 16 + k + s] = 0.3 + 0.1 * s as f32;
+                }
+                sel[l * 16 + 2 * k] = 7.0;
+            }
+            let sb = be.wrap(sel.as_ptr() as *const u8, sel.len() * 4).unwrap();
+            let mut x = PageVec::<f32>::zeroed(h);
+            x.iter_mut().for_each(|v| *v = lcg(&mut seed) * 2.0);
+            let xb = be.wrap(x.as_ptr() as *const u8, h * 4).unwrap();
+            let act = PageVec::<f32>::zeroed(layers * k * inter);
+            let ab = be.wrap(act.as_ptr() as *const u8, act.len() * 4).unwrap();
+            let y = PageVec::<f32>::zeroed(layers * h);
+            let yb = be.wrap(y.as_ptr() as *const u8, y.len() * 4).unwrap();
+            // CPU reference of layer 0.
+            let deq = |e: usize, j: usize, n_out: usize, n_in: usize| {
+                let mut o = vec![0f32; n_out * n_in];
+                GgufMatrix::from_bytes(kind, &mem[at(e, j)..at(e, j) + sizes[j]], n_out, n_in)
+                    .unwrap()
+                    .dequantize_rows(0, n_out, &mut o);
+                o
+            };
+            let mut want_act = vec![0f64; k * inter];
+            let mut want_y = vec![0f64; h];
+            for s in 0..k {
+                let (gm, um, dm) = (deq(s, 0, inter, h), deq(s, 1, inter, h), deq(s, 2, h, inter));
+                let l = sel[2 * k] as f64;
+                for i in 0..inter {
+                    let a: f64 = (0..h).map(|j| gm[i * h + j] as f64 * x[j] as f64).sum();
+                    let b: f64 = (0..h).map(|j| um[i * h + j] as f64 * x[j] as f64).sum();
+                    let a = a.min(l);
+                    want_act[s * inter + i] = a / (1.0 + (-a).exp()) * b.clamp(-l, l);
+                }
+                for (o, wy) in want_y.iter_mut().enumerate() {
+                    *wy += sel[k + s] as f64 * (0..inter).map(|i| dm[o * inter + i] as f64 * want_act[s * inter + i]).sum::<f64>();
+                }
+            }
+            let rel = |got: &[f32], want: &[f64]| {
+                let m = want.iter().fold(0f64, |m, v| m.max(v.abs()));
+                got.iter().zip(want).fold(0f64, |e, (&g, &w)| e.max((g as f64 - w).abs())) / m
+            };
+            // Rounds over the variants (the GPU's clock varies with load and heat): the best time
+            // of each.
+            // `OXINFER_XB_KERNELS`: "mvx" (the generic expert kernels, one row a threadgroup),
+            // "new" ([`MetalBackend::expert_pipe`]'s), or NAME/ROWS (kernels `NAME_<fmt>_pair` /
+            // `_sum` at that many rows a threadgroup of 32 threads).
+            let specs: Vec<String> = env("OXINFER_XB_KERNELS", "mvx,new").split(',').map(String::from).collect();
+            let rounds: usize = env("OXINFER_XB_ROUNDS", "3").parse().unwrap();
+            let mut res = vec![[f64::MAX; 5]; specs.len()];
+            for (i, spec) in (0..rounds).flat_map(|_| specs.iter().enumerate()) {
+                let mut it = spec.split('/');
+                let v = it.next().unwrap();
+                let geo: Vec<usize> = it.map(|a| a.parse().unwrap()).collect();
+                let pipes = match (v, &geo[..]) {
+                    ("new", _) => be.expert_pipe(fmt, false).zip(be.expert_pipe(fmt, true)),
+                    (_, &[r]) => be
+                        .named_pipeline(&format!("{v}_{fname}_pair"))
+                        .zip(be.named_pipeline(&format!("{v}_{fname}_sum")))
+                        .map(|(p, s)| ((p, r), (s, r))),
+                    _ => be
+                        .named_pipeline(&format!("{v}_{fname}_pair"))
+                        .zip(be.named_pipeline(&format!("{v}_{fname}_sum")))
+                        .map(|(p, s)| ((p, 1), (s, 1))),
+                };
+                let Some(((pair, rp), (sum, rs))) = pipes else {
+                    println!("{v}: no kernels for {fname}");
+                    continue;
+                };
+                let (gp, gs) = (((inter.div_ceil(rp), k), 32), ((h.div_ceil(rs), 1), 32));
+                let enc = |e: &FastEnc, do_pair: bool, do_sum: bool| {
+                    e.use_resources(&[wb.id]);
+                    for l in 0..layers {
+                        let so = sb.offset_bytes + l * 64;
+                        if do_pair {
+                            let p = MvParams {
+                                n_out: inter as u32,
+                                n_in: h as u32,
+                                mode: MvMode::SiluClampPair as u32,
+                                rows_per_tg: 1,
+                                gpr: kind.row_bytes(h) as u32,
+                                ldy: k as u32,
+                                ..Default::default()
+                            };
+                            e.pipe(pair);
+                            e.buf(tb.id, tb.offset_bytes, 0);
+                            e.buf(tb.id, tb.offset_bytes + 512 * 8, 1);
+                            e.buf(xb.id, xb.offset_bytes, 2);
+                            e.buf(ab.id, ab.offset_bytes + l * k * inter * 4, 3);
+                            e.bytes(&p, 4);
+                            e.buf(sb.id, so, 5);
+                            e.dispatch(gp.0, gp.1);
+                            e.barrier();
+                        }
+                        if do_sum {
+                            let p = MvParams {
+                                n_out: h as u32,
+                                n_in: inter as u32,
+                                mode: MvMode::Store as u32,
+                                rows_per_tg: 1,
+                                gpr: kind.row_bytes(inter) as u32,
+                                ldy: k as u32,
+                                ..Default::default()
+                            };
+                            e.pipe(sum);
+                            e.buf(tb.id, tb.offset_bytes + 2 * 512 * 8, 0);
+                            e.buf(tb.id, tb.offset_bytes + 2 * 512 * 8, 1);
+                            e.buf(ab.id, ab.offset_bytes + l * k * inter * 4, 2);
+                            e.buf(yb.id, yb.offset_bytes + l * h * 4, 3);
+                            e.bytes(&p, 4);
+                            e.buf(sb.id, so, 5);
+                            e.dispatch(gs.0, gs.1);
+                            e.barrier();
+                        }
+                    }
+                };
+                let best = |do_pair: bool, do_sum: bool| {
+                    let t0 = std::time::Instant::now();
+                    while t0.elapsed().as_millis() < 50 {
+                        timed_conc(&be, |e| enc(e, do_pair, do_sum));
+                    }
+                    (0..5)
+                        .map(|_| timed_conc(&be, |e| enc(e, do_pair, do_sum)))
+                        .fold(f64::MAX, f64::min)
+                };
+                let r = &mut res[i];
+                r[0] = r[0].min(best(true, false));
+                r[1] = r[1].min(best(false, true));
+                r[2] = r[2].min(best(true, true));
+                (r[3], r[4]) = (rel(&act[..k * inter], &want_act), rel(&y[..h], &want_y));
+            }
+            for (spec, &[tp, ts, tb2, ep, es]) in specs.iter().zip(&res) {
+                let v = spec.split('/').next().unwrap();
+                let gbs = |bytes: usize, t: f64| (layers * bytes) as f64 / t / 1e9;
+                println!(
+                    "{fname:>8} {v:>8}: pair {:6.1} us {:4.0} GB/s (err {ep:.1e}) | sum {:6.1} us {:4.0} GB/s (err {es:.1e}) | both {:6.1} us {:4.0} GB/s",
+                    tp / layers as f64 * 1e6,
+                    gbs(2 * gb * k, tp),
+                    ts / layers as f64 * 1e6,
+                    gbs(db * k, ts),
+                    tb2 / layers as f64 * 1e6,
+                    gbs((2 * gb + db) * k, tb2),
+                );
+            }
+        }
+    }
+
+    /// [`timed`] on a concurrent encoder (dispatches ordered by explicit barriers).
+    fn timed_conc(be: &MetalBackend, encode: impl Fn(&FastEnc)) -> f64 {
+        let f = Fns::new(be);
+        let time: unsafe extern "C" fn(Id, Sel) -> f64 = be.o.msg_send();
+        unsafe {
+            let pool = (be.sels.pool_push)();
+            let cb = (f.msg0)(be.queue, f.s_cb);
+            let enc = (f.enc_type)(cb, f.s_enc_type, 1);
+            encode(&FastEnc { enc, f: &f });
+            (f.void)(enc, f.s_end);
+            (f.void)(cb, f.s_commit);
+            (f.void)(cb, f.s_wait);
+            let g = time(cb, be.o.sel(c"GPUEndTime")) - time(cb, be.o.sel(c"GPUStartTime"));
+            (be.sels.pool_pop)(pool);
+            g
         }
     }
 

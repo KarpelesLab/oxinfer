@@ -453,10 +453,11 @@ struct LayerPlan {
     sh: [Mv; 3],
     shared_clamp: bool,
     /// Expert address tables (gate, up, down; `n_exp + 1` EPX entries, the last the zero expert),
-    /// the pair and sum pipelines, and the gate / up and down row bytes.
+    /// the pair and sum pipelines with their rows a threadgroup (`MetalBackend::expert_pipe`),
+    /// and the gate / up and down row bytes.
     tabs: [Id; 3],
-    pair: Id,
-    sum: Id,
+    pair: (Id, usize),
+    sum: (Id, usize),
     gpr: [u32; 2],
     /// Per expert: (address, length) of the gate, up and down data.
     exp_mem: Vec<[(usize, usize); 3]>,
@@ -951,8 +952,8 @@ impl Plan {
                 sh: [mv(&ld.shared[0])?, mv(&ld.shared[1])?, mv(&ld.shared[2])?],
                 shared_clamp: ld.shared_limit > 0.0,
                 tabs,
-                pair: be.named_pipeline(&format!("mvx_{}_pair", fg.name()))?,
-                sum: be.named_pipeline(&format!("mvx_{}_sum", fd.name()))?,
+                pair: be.expert_pipe(fg, false)?,
+                sum: be.expert_pipe(fd, true)?,
                 gpr,
                 exp_mem,
             };
@@ -1970,14 +1971,14 @@ impl Plan {
                 ldy: k as u32,
                 ..Default::default()
             };
-            e.pipe(lp.pair);
+            e.pipe(lp.pair.0);
             e.buf(lp.tabs[0], 0, 0);
             e.buf(lp.tabs[1], 0, 1);
             e.buf(a, o.xf, 2);
             e.buf(a, o.act, 3);
             e.bytes(&p, 4);
             e.buf(a, o.sel[l], 5);
-            e.dispatch((self.inter, k), 32);
+            e.dispatch((self.inter.div_ceil(lp.pair.1), k), 32);
         }
         r.barrier("experts");
         {
@@ -1991,14 +1992,14 @@ impl Plan {
                 ldy: k as u32,
                 ..Default::default()
             };
-            e.pipe(lp.sum);
+            e.pipe(lp.sum.0);
             e.buf(lp.tabs[2], 0, 0);
             e.buf(lp.tabs[2], 0, 1);
             e.buf(a, o.act, 2);
             e.buf(a, o.y1, 3);
             e.bytes(&p, 4);
             e.buf(a, o.sel[l], 5);
-            e.dispatch((h, 1), 32);
+            e.dispatch((h.div_ceil(lp.sum.1), 1), 32);
         }
         r.barrier("hc post");
         {
@@ -2461,6 +2462,8 @@ mod tests {
             (GgmlType::IQ1_S, GgmlType::IQ1_M),
             (GgmlType::IQ2_XXS, GgmlType::IQ1_S),
             (GgmlType::IQ1_M, GgmlType::IQ2_XXS),
+            (GgmlType::IQ2_S, GgmlType::IQ2_S),
+            (GgmlType::Q4_K, GgmlType::Q4_K),
         ] {
             let mut seed = 17u64;
             let mats = |kind: GgmlType, n_out: usize, n_in: usize, seed: &mut u64| -> Vec<Vec<u8>> {
@@ -2507,8 +2510,10 @@ mod tests {
             let limit = 0.9f32;
             let sel: Vec<f32> = ids.iter().map(|&i| f32::from_bits(i)).chain(w).chain([limit]).collect();
             let (xb, sb, ab, yb) = (k.buf(&x), k.buf(&sel), k.buf(&vec![0f32; kk * inter]), k.buf(&vec![0f32; h]));
-            let pipe = |n: String| k.be.named_pipeline(&n).unwrap();
-            let (pair, sum) = (pipe(format!("mvx_{}_pair", fg.name())), pipe(format!("mvx_{}_sum", fd.name())));
+            let (pair, sum) = (
+                k.be.expert_pipe(MvFmt::Gguf(fg), false).unwrap(),
+                k.be.expert_pipe(MvFmt::Gguf(fd), true).unwrap(),
+            );
             let p1 = super::super::decode::MvParams {
                 n_out: inter as u32,
                 n_in: h as u32,
@@ -2529,21 +2534,21 @@ mod tests {
             };
             k.run(|e| {
                 e.use_resources(&[id]);
-                e.pipe(pair);
+                e.pipe(pair.0);
                 for (i, b) in [tg, tu, xb, ab].into_iter().enumerate() {
                     e.buf(b, 0, i);
                 }
                 e.bytes(&p1, 4);
                 e.buf(sb, 0, 5);
-                e.dispatch((inter, kk), 32);
+                e.dispatch((inter.div_ceil(pair.1), kk), 32);
                 e.barrier();
-                e.pipe(sum);
+                e.pipe(sum.0);
                 for (i, b) in [td, td, ab, yb].into_iter().enumerate() {
                     e.buf(b, 0, i);
                 }
                 e.bytes(&p2, 4);
                 e.buf(sb, 0, 5);
-                e.dispatch((h, 1), 32);
+                e.dispatch((h.div_ceil(sum.1), 1), 32);
             });
             let deq = |kind: GgmlType, b: &[u8], n_out: usize, n_in: usize| {
                 let mut o = vec![0f32; n_out * n_in];
