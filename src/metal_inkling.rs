@@ -186,7 +186,6 @@ const SK_HEAD: u32 = 128;
 const SK_QKV: u32 = 256;
 const SK_ATTK: u32 = 512;
 const SK_MERGE: u32 = 1024;
-const SK_CMIX: u32 = 2048;
 const SK_MVF: u32 = 4096;
 const SK_RT: u32 = 8192;
 const SK_NORM: u32 = 16384;
@@ -462,22 +461,6 @@ struct ConvP {
     ok: u32,
     _q0: u32,
     _q1: u32,
-}
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct RrP {
-    n: u32,
-    k: u32,
-    x: u32,
-    sel: u32,
-    bias: u32,
-    scale: f32,
-    w: u32,
-    n_in: u32,
-    single: u32,
-    grp: u32,
-    asg: u32,
-    _p: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -798,6 +781,8 @@ struct Arena {
 
 struct Pipes {
     mix: Id,
+    /// `ink_mix` for at most 8 block states (fewer registers).
+    mix8: Id,
     norm: Id,
     copy: Id,
     kv: [Id; 3],
@@ -812,7 +797,6 @@ struct Pipes {
     softcap: Id,
     xgroup: Id,
     xcombine: Id,
-    conv_mix: Id,
     gmix_norm: Id,
     gfg: Id,
     mvr: Id,
@@ -1855,7 +1839,7 @@ impl InkMetal {
             mvf: pipe("ink_mvf")?,
             softcap: pipe("ink_softcap")?,
             xgroup: pipe("ink_xgroup")?,
-            conv_mix: pipe("ink_conv_mix")?,
+            mix8: pipe("ink_mix8")?,
             gmix_norm: pipe("ink_gmix_norm")?,
             gfg: pipe("ink_gfg")?,
             mvr: pipe("ink_mvr")?,
@@ -1989,16 +1973,15 @@ impl InkMetal {
     // ---- Encoding --------------------------------------------------------------------------
 
     /// Measurements only (`OXINFER_INKLING_SKIP=dense,attn,exp,mix,gates,conv,route,head`, and
-    /// within those `qkv,attk,merge,cmix,mvf,rt,norm`: the query / key stage, the attention kernel,
-    /// its merge, the decoding passes' convolution-and-mix kernel, the router's matvec, the routing,
-    /// the plain norms): the kinds of ops left out of the passes (whose results are then
+    /// within those `qkv,attk,merge,mvf,rt,norm`: the query / key stage, the attention kernel, its
+    /// merge, the router's matvec, the routing, the plain norms): the kinds of ops left out of the passes (whose results are then
     /// meaningless).
     fn skip(&self, what: u32) -> bool {
         static SKIP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         let m = *SKIP.get_or_init(|| {
             let v = std::env::var("OXINFER_INKLING_SKIP").unwrap_or_default();
             let names = [
-                "dense", "attn", "exp", "mix", "gates", "conv", "route", "head", "qkv", "attk", "merge", "cmix", "mvf", "rt", "norm",
+                "dense", "attn", "exp", "mix", "gates", "conv", "route", "head", "qkv", "attk", "merge", "", "mvf", "rt", "norm",
             ];
             names
                 .iter()
@@ -2283,7 +2266,8 @@ impl InkMetal {
         if let Some(cat) = cat {
             self.gate_cat(c, &mut p, cat);
         }
-        self.std(e, c, self.p.mix);
+        // (At most 8 block states: fewer registers.)
+        self.std(e, c, if states.len() <= 8 { self.p.mix8 } else { self.p.mix });
         e.bytes(&p, 2);
         e.dispatch((nq, t), 1024);
     }
@@ -2479,7 +2463,6 @@ impl InkMetal {
         }
     }
 
-    /// The parameters of one query's mix (`ink_mix`).
     /// Points the mix `p` at the message gates' normed inputs: gate `i0` on (`msgs`: the second half
     /// of each gate's row, the messages' norm), its last query into gates up to 2 (the attention's
     /// three gates read the last of fewer queries).
@@ -2490,45 +2473,6 @@ impl InkMetal {
         p.cat_ts = (2 * h) as u32;
         p.cat_last = last as u32;
         p.cat_n = if msgs { 1 } else { (3 - i0).saturating_sub(last).max(1) as u32 };
-    }
-
-    fn mix_p(&self, c: &Cx, states: &[usize], x: usize, q: usize, out: usize, norm: Option<usize>) -> MixP {
-        let mut p = MixP {
-            h: self.h as u32,
-            ns: states.len() as u32,
-            norm: norm.is_some() as u32,
-            x: x as u32,
-            q: q as u32,
-            out: out as u32,
-            out_qs: (c.b.tm * self.h) as u32,
-            nw: norm.unwrap_or(0) as u32,
-            scale: (self.h as f32).powf(-0.5),
-            eps: self.eps,
-            mix_eps: MIX_EPS,
-            ..Default::default()
-        };
-        for (d, &s) in p.s.iter_mut().zip(states) {
-            *d = c.state(s) as u32;
-        }
-        p
-    }
-
-    /// The parameters of `ink_router_route` (a pass of one token also gets its experts' groups).
-    fn route_p(&self, b: &Bufs, ld: &LayerDev, t: usize) -> RrP {
-        RrP {
-            n: self.ne as u32,
-            k: self.topk as u32,
-            x: b.hn as u32,
-            sel: b.sel as u32,
-            bias: ld.bias as u32,
-            scale: self.route_scale,
-            w: ld.router as u32,
-            n_in: self.h as u32,
-            single: (t == 1) as u32,
-            grp: b.grp as u32,
-            asg: b.asg as u32,
-            _p: 0,
-        }
     }
 
     /// Whether a pass of `t` tokens writes its convolution inputs to the rings in the
@@ -2946,46 +2890,6 @@ impl InkMetal {
             self.mv(e, c, &ld.o, b.att, b.ab, t, MvMode::Store);
         }
         e.barrier();
-        if t <= MAX_T {
-            // The convolution, the MLP's input mix and (without message gates) the routing in one
-            // kernel per token.
-            let cp = self.conv_p(b.ab, b.x, ld.attn_conv, pos, !ld.boundary, t, None);
-            let mp = self.mix_p(
-                c,
-                &sp.mlp_states,
-                b.x,
-                ld.mlp_query,
-                if msgs { b.hm } else { b.hn },
-                (!msgs).then_some(ld.ln_post),
-            );
-            let mut mp = mp;
-            if msgs {
-                self.gate_cat(c, &mut mp, (3, false, 0));
-            }
-            let rp = self.route_p(b, ld, t);
-            e.pipe(self.p.conv_mix);
-            e.buf(c.a, 0, 0);
-            e.buf(self.consts, 0, 1);
-            e.bytes(&cp, 2);
-            e.buf(sd.rings[2].0, 0, 3);
-            e.bytes(&mp, 4);
-            e.bytes(&rp, 5);
-            // (The router's weights are read by many threadgroups, below, not by this one.)
-            e.bytes(&0u32, 6);
-            if !self.skip(SK_CMIX) {
-                e.dispatch((t, 1), 1024);
-            }
-            e.barrier();
-            if msgs {
-                let (g, _) = ld.gates.as_ref().unwrap();
-                if !self.skip(SK_GATES) {
-                    self.gates(e, c, g, &[(3, b.hm, ld.ln_post, b.hn)], t, true);
-                }
-            }
-            let _ = rp;
-            self.route(e, c, ld, t);
-            return;
-        }
         if !self.skip(SK_CONV) {
             self.conv(e, c, b.ab, b.x, ld.attn_conv, sd.rings[2].0, pos, !ld.boundary, t);
         }
