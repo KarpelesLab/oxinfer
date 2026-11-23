@@ -496,6 +496,34 @@ pub fn stream_decode_forced() -> Option<bool> {
 
 static STREAM_DECODE: AtomicU8 = AtomicU8::new(0);
 
+/// Layers ahead whose experts a streamed GPU decode predicts while experts miss (DeepSeek V4.1 on
+/// Metal: each layer also runs the routers of the next `n` layers on its own input, and the
+/// experts they choose that are not in memory are read with the misses, so the next layers do not
+/// miss them). 0 turns it off; None restores the default (2, or `OXINFER_DS41_PREDICT`, which
+/// overrides any setting). Process-wide, read when a model builds its decode plan; at most 4.
+pub fn set_stream_predict(layers: Option<usize>) {
+    STREAM_PREDICT.store(layers.map_or(usize::MAX, |n| n.min(STREAM_PREDICT_MAX)), Ordering::Relaxed);
+}
+
+/// See [`set_stream_predict`].
+pub fn stream_predict() -> usize {
+    if let Some(n) = std::env::var("OXINFER_DS41_PREDICT")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        return n.min(STREAM_PREDICT_MAX);
+    }
+    match STREAM_PREDICT.load(Ordering::Relaxed) {
+        usize::MAX => 2,
+        n => n,
+    }
+}
+
+/// The most layers [`set_stream_predict`] takes.
+pub const STREAM_PREDICT_MAX: usize = 4;
+
+static STREAM_PREDICT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
 /// True when the active backend decodes on the device and prefers plain decoding there (see
 /// [`Backend::prefers_plain_decode`]).
 pub fn plain_decode_preferred() -> bool {

@@ -350,6 +350,8 @@ fn usage() -> ! {
          \x20                      the others are wrapped per pass as they arrive (auto, the default: dense\n\
          \x20                      models on the GPU, MoE models measure both and keep the faster;\n\
          \x20                      DeepSeek V4.1: a whole token per GPU stream unless off)\n\
+         \x20 --stream-predict N   with --stream-gpu (DeepSeek V4.1): while experts miss, read the experts the\n\
+         \x20                      next N layers' routers predict with the misses (0 off, at most 4; default 2)\n\
          \x20 --expert-cache-mb N  with --stream, page cache kept for recently used MoE experts (which\n\
          \x20                      are read on demand; default: what the budget leaves)\n\
          \x20 --expert-predict     with --stream, read the next MoE layer's guessed experts ahead (Qwen)\n\
@@ -1012,6 +1014,14 @@ fn parse_args() -> Result<Args> {
                     .split_once(['x', 'X'])
                     .with_context(|| format!("--size expects WIDTHxHEIGHT, got {v}"))?;
                 a.size = Some((w.parse()?, h.parse()?));
+            }
+            "--stream-predict" => {
+                let v = val()?;
+                let n: usize = v.parse().map_err(|_| anyhow::anyhow!("--stream-predict expects 0-4, got {v}"))?;
+                if n > oxinfer::gpu::STREAM_PREDICT_MAX {
+                    bail!("--stream-predict expects 0-4, got {v}");
+                }
+                oxinfer::gpu::set_stream_predict(Some(n));
             }
             "--stream-gpu" => {
                 let v = val()?;

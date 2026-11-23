@@ -268,6 +268,13 @@ pub struct EngineOptions {
     /// leaves the current setting (default: dense models on the GPU, MoE models measure both and
     /// keep the faster; [`crate::gpu::set_stream_decode`]). Key `stream_gpu`.
     pub stream_gpu: Option<bool>,
+    /// Streamed GPU decoding (DeepSeek V4.1, Metal): while experts miss, each layer predicts the
+    /// experts of the next this many layers (their routers on its input) and they are read with
+    /// the misses, so those layers do not miss them; 0 turns it off, at most 4. Process-wide,
+    /// applied on load; None leaves the current setting (default 2;
+    /// [`crate::gpu::set_stream_predict`]; `OXINFER_DS41_PREDICT` overrides). Key
+    /// `stream_predict`.
+    pub stream_predict: Option<usize>,
     /// Typed decisions ([`Engine::decide`]) with the decision assets of this Jev bundle (path or
     /// repo id) on top of the loaded base model: only the small files are fetched (adapter, head,
     /// configs; see [`crate::decide::ASSET_FILES`]), not the backbone, and the base must match
@@ -492,6 +499,7 @@ impl Default for EngineOptions {
             gpu_decode: None,
             gpu_chain: None,
             stream_gpu: None,
+            stream_predict: None,
             decision_from: None,
             loras: Vec::new(),
             lora_merge: false,
@@ -581,6 +589,7 @@ impl EngineOptions {
         "gpu_decode",
         "gpu_chain",
         "stream_gpu",
+        "stream_predict",
         "decision_from",
         "lora",
         "lora_merge",
@@ -721,6 +730,21 @@ impl EngineOptions {
             }
             "gpu_decode" => self.gpu_decode = Some(parse_bool(key, value)?),
             "gpu_chain" => self.gpu_chain = Some(parse_bool(key, value)?),
+            "stream_predict" => {
+                self.stream_predict = match value.trim() {
+                    "" | "auto" => None,
+                    "off" => Some(0),
+                    v => {
+                        let n: usize = v
+                            .parse()
+                            .with_context(|| format!("{key}: expected a number of layers (0-4), got {v:?}"))?;
+                        if n > crate::gpu::STREAM_PREDICT_MAX {
+                            bail!("{key}: at most {} layers, got {n}", crate::gpu::STREAM_PREDICT_MAX);
+                        }
+                        Some(n)
+                    }
+                }
+            }
             "stream_gpu" => {
                 self.stream_gpu = match value.trim() {
                     "" | "auto" => None,
@@ -1601,6 +1625,9 @@ impl Engine {
         }
         if let Some(on) = opts.stream_gpu {
             crate::gpu::set_stream_decode(Some(on));
+        }
+        if let Some(n) = opts.stream_predict {
+            crate::gpu::set_stream_predict(Some(n));
         }
         let gpu = crate::gpu::ensure(opts.device)?;
         if crate::sd::is_diffusers(&dir) {
@@ -4157,6 +4184,13 @@ mod tests {
         o.set("draft_device", "auto").unwrap();
         assert_eq!(o.draft_device, None);
         assert!(o.set("draft_device", "npu").is_err());
+        o.set("stream_predict", "0").unwrap();
+        assert_eq!(o.stream_predict, Some(0));
+        o.set("stream_predict", "3").unwrap();
+        assert_eq!(o.stream_predict, Some(3));
+        o.set("stream_predict", "auto").unwrap();
+        assert_eq!(o.stream_predict, None);
+        assert!(o.set("stream_predict", "5").is_err());
         for u in [CoreMlUnits::Ane, CoreMlUnits::All, CoreMlUnits::Gpu, CoreMlUnits::Cpu] {
             assert_eq!(CoreMlUnits::parse(u.as_str()), Some(u));
         }

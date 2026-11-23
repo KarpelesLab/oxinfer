@@ -817,8 +817,10 @@ Kept:
   reason was found for the round above's 8-token pass (85 ms) costing more than its 11-token
   one (77): in isolation 8 tokens cost 3-5x a one-token matvec at these shapes and 11 tokens
   6-9x; that figure came from one profiled run on a loaded GPU and was not reproduced.
-- Cold passes predict experts (`OXINFER_DS41_PREDICT=n`, default 2, 0 off; only while experts
-  miss, so a warm step encodes nothing more): each layer also runs the routers of the next n
+- Cold passes predict experts (`--stream-predict N`, engine / C API / server key
+  `stream_predict`, `gpu::set_stream_predict`, `OXINFER_DS41_PREDICT` overriding them; default
+  2, 0 off; only while experts miss, so a warm step encodes nothing more): each layer also runs
+  the routers of the next n
   layers on its own input (a 384 x 5120 bf16 matvec and the routing kernel each), and the
   chosen experts not in memory are listed like misses. The host reads those of the layers the
   next run of layers takes together with the misses (every read requested before any is waited

@@ -103,21 +103,7 @@ fn cold_chunk() -> usize {
 }
 
 /// Most layers ahead whose experts a cold pass predicts ([`Plan::predict`]).
-const PRED_MAX: usize = 4;
-
-/// `OXINFER_DS41_PREDICT=n` (0 to [`PRED_MAX`]): while experts miss, each layer runs the routers
-/// of the next n layers on its own input and the experts they choose that are not in memory are
-/// read ahead (advisory reads, not waited for).
-fn predict_layers() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("OXINFER_DS41_PREDICT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(2)
-            .min(PRED_MAX)
-    })
-}
+const PRED_MAX: usize = crate::gpu::STREAM_PREDICT_MAX;
 
 /// `OXINFER_DS41_PREDICT_WAIT=0`: predicted experts are only read ahead, never waited for (by
 /// default those of the layers the next run of a cold pass takes are read and wrapped with its
@@ -1289,7 +1275,7 @@ impl Plan {
             wraps: Mutex::new(Wraps::default()),
             pending: Mutex::new(Vec::new()),
             cold: std::sync::atomic::AtomicBool::new(true),
-            predict: predict_layers(),
+            predict: crate::gpu::stream_predict(),
             pred_on: std::sync::atomic::AtomicBool::new(false),
             lock: Mutex::new(()),
             id: PLAN_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),

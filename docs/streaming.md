@@ -36,6 +36,7 @@ before the lookup (with priority over the read-ahead) rather than faulting in pa
 | `--stream-io M`, `--stream-threads N` | `advise` (default on Apple), `pread` or `touch`; reader threads (default 2) |
 | `--stream-trace` | one line per token / speculative round, and one per prefill: bytes read vs cache hits, stall time |
 | `--stream-gpu M` | `auto` (default: dense models decode on the GPU, MoE models measure both on their first tokens and keep the faster), `on`, `off` (Qwen3.5 / 3.8, Gemma 4 / 3; engine / C API / server key `stream_gpu`) |
+| `--stream-predict N` | DeepSeek V4.1 GPU decoding: while experts miss, the experts the next N layers' routers predict are read with the misses (0 off, at most 4, default 2; engine / C API / server key `stream_predict`, `gpu::set_stream_predict`; `OXINFER_DS41_PREDICT` overrides) |
 | `--expert-cache-mb N` | MoE: page cache kept for recently used routed experts (default: what the budget leaves after the resident set) |
 | `--expert-predict` | MoE: guess the next layer's experts and read them ahead (off by default, see below) |
 | `--cold-start` (`cold_start`) | drop the model's pages from the page cache before the first pass, as after a reboot (default: use what an earlier run left cached, see below) |
