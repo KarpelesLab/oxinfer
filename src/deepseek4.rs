@@ -1058,6 +1058,14 @@ impl<'a> DeepSeek4Model<'a> {
             {
                 return hs;
             }
+            // A prefill before GPU decoding: the plan and the expert wraps are made meanwhile.
+            #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+            if tokens.len() > 1 && v41::gpu::wanted() && self.gpu_plan.get().is_none() {
+                return std::thread::scope(|sc| {
+                    sc.spawn(|| v41::gpu::prepare(self));
+                    v41::forward(self, sess, tokens, mm, layers, feats)
+                });
+            }
             return v41::forward(self, sess, tokens, mm, layers, feats);
         }
         assert!(mm.is_empty(), "DeepSeek V4 takes text only");

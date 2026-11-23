@@ -19,6 +19,12 @@ inline float d41_tg_sum(float v, threadgroup float* red, uint tid, uint nt, uint
     return t;
 }
 
+// Sum over the lanes that differ from this one in the bits from `lo` up to (excluding) `hi`.
+inline float d41_xsum(float x, uint lo, uint hi) {
+    for (uint o = lo; o < hi; o <<= 1) x += simd_shuffle_xor(x, o);
+    return x;
+}
+
 // ---- Hyper-connection mixing weights --------------------------------------------------------
 // Dot products of `rows` rows of w (each `len` floats) with x, plus x . x as row `rows`, in
 // `split` parts: grid (rows + 1, split), 256 threads; part[r * split + s].
@@ -45,8 +51,36 @@ struct MixP { uint n; uint split; uint len; uint iters; float eps; float heps; u
 kernel void d41_mix_fin(device const float* part [[buffer(0)]], device const float* base [[buffer(1)]],
                         device const float* scale [[buffer(2)]], device float* out [[buffer(3)]], constant MixP& p [[buffer(4)]],
                         uint tid [[thread_index_in_threadgroup]]) {
-    if (tid != 0) return;
     uint n = p.n, m = (2 + n) * n;
+    if (m <= 32 && n * n <= 32 && (n & (n - 1)) == 0) {
+        // One SIMD-group: lane i holds mixing value i; the Sinkhorn sums over a row (lanes
+        // j n .. j n + n - 1) and over a column (lanes k, k + n, ...) by shuffles.
+        uint lane = tid;
+        float ss = 0.f;
+        for (uint s = 0; s < p.split; s++) ss += part[m * p.split + s];
+        float r = 1.0f / precise::sqrt(ss / float(p.len) + p.eps);
+        float v = 0.f;
+        if (lane < m)
+            for (uint s = 0; s < p.split; s++) v += part[lane * p.split + s];
+        float mm = v * r;
+        if (lane < n) out[lane] = d41_sigmoid(mm * scale[0] + base[lane]) + p.heps;
+        else if (lane < 2 * n) out[lane] = 2.0f * d41_sigmoid(mm * scale[1] + base[lane]);
+        // Lane l of the comb takes mixing value 2 n + l.
+        float c = simd_shuffle_down(mm, 2 * n);
+        bool in = lane < n * n;
+        c = in ? c * scale[2] + base[min(2 * n + lane, m - 1)] : 0.f;
+        float mx = in ? c : -INFINITY;
+        for (uint o = 1; o < n; o <<= 1) mx = max(mx, simd_shuffle_xor(mx, o));
+        float e = in ? precise::exp(c - mx) : 0.f;
+        c = in ? e / d41_xsum(e, 1, n) + p.heps : 0.f;
+        for (uint it = 0; it < p.iters; it++) {
+            if (it > 0) c = in ? c / (d41_xsum(c, 1, n) + p.heps) : 0.f;
+            c = in ? c / (d41_xsum(c, n, n * n) + p.heps) : 0.f;
+        }
+        if (in) out[2 * n + lane] = c;
+        return;
+    }
+    if (tid != 0) return;
     float ss = 0.f;
     for (uint s = 0; s < p.split; s++) ss += part[m * p.split + s];
     float r = 1.0f / precise::sqrt(ss / float(p.len) + p.eps);
@@ -310,61 +344,68 @@ kernel void d41_engram(device const float* xin [[buffer(0)]], device const float
 // (ties to the lower index), weights renormalized (norm != 0) times rsf. A chosen expert whose
 // gate address in `tab` (32-byte entries) is null is a miss: it is recorded in `miss` (count,
 // then layer << 16 | expert) and replaced by expert n_exp (zeros) with weight 0. sel: k ids (uint
-// bits), k weights, the SwiGLU limit. One threadgroup of 1024 (n_exp <= 1024).
+// bits), k weights, the SwiGLU limit. One SIMD-group (n_exp <= 1024): lane l holds experts
+// l + 32 i.
 struct RouteP { uint n; uint k; float rsf; float limit; uint scoring; uint norm; uint layer; uint has_bias; };
+inline float d41_score(float lg, uint scoring) {
+    if (scoring == 1) return d41_sigmoid(lg);
+    float u = precise::exp(lg);
+    float y = 1.0f + u;
+    float l1 = y == 1.0f ? u : precise::log(y) - ((y - 1.0f) - u) / y;
+    return precise::sqrt(lg > 20.f ? lg : l1);
+}
 kernel void d41_route(device const float* logits [[buffer(0)]], device const float* bias [[buffer(1)]], device const ulong* tab [[buffer(2)]],
                       device float* sel [[buffer(3)]], device atomic_uint* miss [[buffer(4)]], constant RouteP& p [[buffer(5)]],
-                      uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
                       uint lane [[thread_index_in_simdgroup]]) {
-    threadgroup float bv[32], red[32];
-    threadgroup uint bi[32];
-    threadgroup uint chosen[64];
-    float lg = tid < p.n ? logits[tid] : -INFINITY;
-    float sc;
-    if (p.scoring == 1) sc = d41_sigmoid(lg);
-    else if (p.scoring == 2) {
-        float u = precise::exp(lg);
-        float y = 1.0f + u;
-        float l1 = y == 1.0f ? u : precise::log(y) - ((y - 1.0f) - u) / y;
-        sc = precise::sqrt(lg > 20.f ? lg : l1);
-    } else {
-        float mx = simd_max(lg);
-        if (lane == 0) bv[sg] = mx;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        mx = bv[0];
-        for (uint i = 1; i < 32; i++) mx = max(mx, bv[i]);
-        float e = tid < p.n ? precise::exp(lg - mx) : 0.f;
-        float s = d41_tg_sum(e, red, tid, 1024, sg, lane);
-        sc = e / s;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint PER = 32;
+    float sc[PER], v[PER];
+    uint cnt = (p.n + 31) / 32;
+    float mx = -INFINITY, tot = 0.f;
+    for (uint i = 0; i < PER; i++) {
+        uint e = lane + 32 * i;
+        float lg = (i < cnt && e < p.n) ? logits[e] : -INFINITY;
+        sc[i] = lg;
+        mx = max(mx, lg);
     }
-    float v = tid < p.n ? sc + (p.has_bias != 0 ? bias[tid] : 0.f) : -INFINITY;
+    if (p.scoring == 0) {
+        mx = simd_max(mx);
+        for (uint i = 0; i < PER; i++) {
+            sc[i] = sc[i] == -INFINITY ? 0.f : precise::exp(sc[i] - mx);
+            tot += sc[i];
+        }
+        tot = simd_sum(tot);
+    }
+    for (uint i = 0; i < PER; i++) {
+        uint e = lane + 32 * i;
+        bool ok = i < cnt && e < p.n;
+        if (p.scoring == 0) sc[i] = sc[i] / tot;
+        else if (ok) sc[i] = d41_score(sc[i], p.scoring);
+        v[i] = ok ? sc[i] + (p.has_bias != 0 ? bias[e] : 0.f) : -INFINITY;
+    }
+    uint chosen[16];
+    float cs[16];
     for (uint j = 0; j < p.k; j++) {
-        float m = simd_max(v);
-        uint idx = v == m ? tid : 0xffffffffu;
-        idx = simd_min(idx);
-        if (lane == 0) { bv[sg] = m; bi[sg] = idx; }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        float best = bv[0];
-        uint bidx = bi[0];
-        for (uint i = 1; i < 32; i++)
-            if (bv[i] > best || (bv[i] == best && bi[i] < bidx)) { best = bv[i]; bidx = bi[i]; }
-        if (tid == bidx) v = -INFINITY;
-        if (tid == 0) chosen[j] = bidx;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        // This lane's best (the lowest index among equals), then the SIMD-group's.
+        float b = -INFINITY;
+        uint bi = 0xffffffffu, bs = 0;
+        for (uint i = 0; i < PER; i++)
+            if (v[i] > b) { b = v[i]; bi = lane + 32 * i; bs = i; }
+        float m = simd_max(b);
+        uint idx = simd_min(b == m ? bi : 0xffffffffu);
+        if (bi == idx) v[bs] = -INFINITY;
+        chosen[j] = idx;
+        // The winner's score.
+        float s = 0.f;
+        for (uint i = 0; i < PER; i++) s = (lane + 32 * i == idx) ? sc[i] : s;
+        cs[j] = simd_sum(s);
     }
-    // Every thread kept its own score: the chosen ones' scores through threadgroup memory.
-    threadgroup float scores[64];
-    for (uint j = 0; j < p.k; j++)
-        if (tid == chosen[j]) scores[j] = sc;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid != 0) return;
-    float tot = 0.f;
-    for (uint j = 0; j < p.k; j++) tot += scores[j];
-    tot += 1e-20f;
+    if (lane != 0) return;
+    float t = 0.f;
+    for (uint j = 0; j < p.k; j++) t += cs[j];
+    t += 1e-20f;
     for (uint j = 0; j < p.k; j++) {
         uint e = chosen[j];
-        float w = (p.norm != 0 && p.k > 1 ? scores[j] / tot : scores[j]) * p.rsf;
+        float w = (p.norm != 0 && p.k > 1 ? cs[j] / t : cs[j]) * p.rsf;
         if (tab[4 * e] == 0) {
             uint at = atomic_fetch_add_explicit(&miss[0], 1u, memory_order_relaxed);
             atomic_store_explicit(&miss[1 + at], (p.layer << 16) | e, memory_order_relaxed);

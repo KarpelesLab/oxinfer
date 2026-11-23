@@ -73,6 +73,18 @@ fn profile() -> bool {
     *ON.get_or_init(|| std::env::var_os("OXINFER_DS41_PROFILE").is_some_and(|v| v != "0"))
 }
 
+/// Layers per command stream of a step while experts miss (`OXINFER_DS41_CHUNK`, default 4).
+fn cold_chunk() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("OXINFER_DS41_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(4)
+    })
+}
+
 /// `OXINFER_DS41_TRACE=1`: one line per step (host and GPU time, misses).
 fn trace() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -512,6 +524,8 @@ pub(crate) struct Plan {
     wraps: Mutex<Wraps>,
     /// The last step's experts per layer, for the part cache (see [`Self::step`]).
     pending: Mutex<Vec<(usize, Vec<usize>)>>,
+    /// The last step missed experts: the next runs in chunks of layers.
+    cold: std::sync::atomic::AtomicBool,
     lock: Mutex<()>,
     id: u64,
     // Sizes.
@@ -1038,6 +1052,7 @@ impl Plan {
             own,
             wraps: Mutex::new(Wraps::default()),
             pending: Mutex::new(Vec::new()),
+            cold: std::sync::atomic::AtomicBool::new(true),
             lock: Mutex::new(()),
             id: PLAN_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             h,
@@ -1066,6 +1081,12 @@ impl Plan {
             src_rates,
             prof: Mutex::new((Vec::new(), 0)),
         })
+    }
+
+    /// Wraps the experts in memory now (a first step would), e.g. while a prefill runs.
+    pub(crate) fn prewrap(&self, hook: Option<&crate::stream::StreamHook>) {
+        let mut w = self.wraps.lock().unwrap();
+        self.sync_wraps(&mut w, hook, &[]);
     }
 
     /// A fresh device state for a session.
@@ -1287,7 +1308,17 @@ impl Plan {
         if self.n_eng > 0 {
             self.arena_f32(self.off.eng_in, inp.eng.len()).copy_from_slice(inp.eng);
         }
+        let nl = self.layers.len();
+        // While experts miss (a cold cache), a step runs in chunks of layers, each waited for:
+        // a chunk's misses are read before the layers after it run on a wrong guess (which
+        // would miss experts of their own). Warm, the whole token is one stream.
+        let chunk = if self.cold.load(std::sync::atomic::Ordering::Relaxed) {
+            cold_chunk()
+        } else {
+            nl
+        };
         let mut from = 0;
+        let mut upto = chunk.min(nl);
         let mut passes = 0;
         let mut missed_total = 0;
         let mut gpu = 0f64;
@@ -1296,7 +1327,7 @@ impl Plan {
         loop {
             self.arena_f32(self.off.miss, 1)[0] = 0.0;
             // The part cache's bookkeeping of the last step's experts, while the GPU runs.
-            let (ok, g) = self.run(st, pos, from, hidden_only, &mut || {
+            let (ok, g) = self.run(st, pos, from, upto, hidden_only, &mut || {
                 if let Some(hk) = hook {
                     let ti = Instant::now();
                     for (l, ids) in std::mem::take(&mut *self.pending.lock().unwrap()) {
@@ -1319,14 +1350,19 @@ impl Plan {
                 (0..cnt).map(|i| *p.add(1 + i)).collect()
             };
             if miss.is_empty() {
-                break;
+                if upto == nl {
+                    break;
+                }
+                from = upto;
+                upto = (upto + chunk).min(nl);
+                continue;
             }
             missed_total += miss.len();
             let Some(hk) = hook else {
                 // Every expert is wrapped without a streamer: a miss is a failed wrap.
                 return false;
             };
-            if passes > 4 {
+            if passes > 4 * nl {
                 return false;
             }
             let ti = Instant::now();
@@ -1361,9 +1397,8 @@ impl Plan {
             // sync, after this step.
             tio += ti.elapsed().as_secs_f64();
             from = by_layer.iter().position(|v| !v.is_empty()).unwrap_or(0);
-            // The rerun reads the selection again: restore the miss-free tables.
-            let _ = from;
         }
+        self.cold.store(missed_total > 0, std::sync::atomic::Ordering::Relaxed);
         // The experts used, for the part cache's least-recently-used order (taken while the next
         // step runs on the GPU).
         if hook.is_some() {
@@ -1396,7 +1431,10 @@ impl Plan {
     }
 
     /// Encodes and runs layers `from..` and the head. Returns (ok, GPU seconds).
-    fn run(&self, st: &State, pos: usize, from: usize, hidden_only: bool, while_busy: &mut dyn FnMut()) -> (bool, f64) {
+    /// Encodes and runs layers `from..upto` (and the head when `upto` is the last layer).
+    /// Returns (ok, GPU seconds).
+    #[allow(clippy::too_many_arguments)]
+    fn run(&self, st: &State, pos: usize, from: usize, upto: usize, hidden_only: bool, while_busy: &mut dyn FnMut()) -> (bool, f64) {
         let be = self.be;
         let f = &self.f;
         let prof = profile();
@@ -1416,7 +1454,7 @@ impl Plan {
             new_enc: &new_enc,
         };
         let nl = self.layers.len();
-        for l in from..nl {
+        for l in from..upto {
             self.encode_layer(&mut rec, st, l, pos);
             // A few command buffers per token: the GPU starts on the first ones while the rest
             // is encoded.
@@ -1424,7 +1462,9 @@ impl Plan {
                 rec.cut();
             }
         }
-        self.encode_head(&mut rec, hidden_only);
+        if upto == nl {
+            self.encode_head(&mut rec, hidden_only);
+        }
         rec.cut();
         drop(rec);
         while_busy();
@@ -1913,7 +1953,7 @@ impl Plan {
                 },
                 5,
             );
-            self.d(&e, P_ROUTE, (1, 1), 1024);
+            self.d(&e, P_ROUTE, (1, 1), 32);
             self.mv(&e, &lp.sh[2], None, (a, o.act_s), (a, o.y2), MvMode::Store, (a, 0));
         }
         r.barrier("experts");
@@ -2623,7 +2663,7 @@ mod tests {
                 e.buf(b, 0, i);
             }
             e.bytes(&rp, 5);
-            e.dispatch((1, 1), 1024);
+            e.dispatch((1, 1), 32);
             e.pipe(k.pipes[P_ENG]);
             for (i, b) in [xb, kvb, gwb, xo].into_iter().enumerate() {
                 e.buf(b, 0, i);

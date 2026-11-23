@@ -11,11 +11,12 @@ use super::*;
 use crate::metal::ds41 as md;
 use crate::metal::{MetalBackend, ds41::Plan};
 
-/// Whether this process decodes DeepSeek V4.1 on the GPU: `stream_gpu` on
-/// (`gpu::set_stream_decode(Some(true))`, `OXINFER_STREAM_GPU=1`, `--stream-gpu on`), with
-/// device decoding allowed ([`crate::gpu::decode_enabled`]). Off by default.
+/// Whether this process decodes DeepSeek V4.1 on the GPU: yes unless `stream_gpu` is off
+/// (`gpu::set_stream_decode(Some(false))`, `OXINFER_STREAM_GPU=0`, `--stream-gpu off`) or device
+/// decoding is ([`crate::gpu::decode_enabled`]). On an M5 Max it is about twice the CPU's speed
+/// with the experts cached and ahead of it from a cold cache (docs/deepseek-v4.md).
 pub(crate) fn wanted() -> bool {
-    crate::gpu::decode_enabled() && crate::gpu::stream_decode_forced() == Some(true)
+    crate::gpu::decode_enabled() && crate::gpu::stream_decode_forced() != Some(false)
 }
 
 fn backend() -> Option<&'static MetalBackend> {
@@ -151,6 +152,16 @@ fn plan<'p>(m: &'p DeepSeek4Model<'_>, be: &'static MetalBackend) -> Option<&'p 
         })
         .as_ref()
         .and_then(|b| b.downcast_ref::<Plan>())
+}
+
+/// Builds the plan and wraps the experts in memory (on a thread of its own while a prefill runs,
+/// so that the first decode step does not wait for them).
+pub(crate) fn prepare(m: &DeepSeek4Model) {
+    if let Some(be) = backend()
+        && let Some(p) = plan(m, be)
+    {
+        p.prewrap(m.stream.as_ref());
+    }
 }
 
 /// Brings the device copies of `sess`'s caches up to its position.

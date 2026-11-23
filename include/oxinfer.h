@@ -157,7 +157,9 @@ int64_t oxi_cache_remove(const char *cache_dir, const char *name);
  *                        models on the GPU, MoE models measure both on their first tokens and
  *                        keep the faster): resident layers stay wrapped, the others are wrapped
  *                        per pass as they arrive; Qwen3.5/3.8 dense and MoE, Gemma 4 / 3
- *                        dense and 26B-A4B (Metal). A streamed dense Qwen with an MTP layer decodes with it by default (draft=none for plain decoding)
+ *                        dense and 26B-A4B (Metal). A streamed dense Qwen with an MTP layer decodes with it by default (draft=none for plain decoding).
+ *                        DeepSeek V4.1 decodes a whole token on the GPU unless stream_gpu=0
+ *                        (its routed experts addressed from the page cache, Metal)
  *   coreml_units=auto|ane|all|gpu|cpu   Core ML models (ANEMLL format, Apple only): compute
  *                        units (default auto: the Neural Engine, or cpu/gpu following device)
  *   coreml_prefill=auto|batch|pad|single  Core ML models: how prompts are fed (default auto)

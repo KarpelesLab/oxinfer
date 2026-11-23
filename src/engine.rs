@@ -240,9 +240,10 @@ pub struct EngineOptions {
     pub gpu_decode: Option<bool>,
     /// Streamed models (see [`EngineOptions::stream`]) decode on the GPU too: the resident layers
     /// stay wrapped, the others are wrapped per pass as they arrive and released after (Metal;
-    /// Qwen3.5 / 3.8 dense and MoE, Gemma 4 / Gemma 3 dense and 26B-A4B). Process-wide, applied on load; None leaves the current
-    /// setting (default: dense models on the GPU, MoE models measure both and keep the faster;
-    /// [`crate::gpu::set_stream_decode`]). Key `stream_gpu`.
+    /// Qwen3.5 / 3.8 dense and MoE, Gemma 4 / Gemma 3 dense and 26B-A4B; DeepSeek V4.1 as one
+    /// command stream per token, on unless this is off). Process-wide, applied on load; None
+    /// leaves the current setting (default: dense models on the GPU, MoE models measure both and
+    /// keep the faster; [`crate::gpu::set_stream_decode`]). Key `stream_gpu`.
     pub stream_gpu: Option<bool>,
     /// Typed decisions ([`Engine::decide`]) with the decision assets of this Jev bundle (path or
     /// repo id) on top of the loaded base model: only the small files are fetched (adapter, head,
