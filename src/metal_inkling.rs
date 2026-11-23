@@ -23,7 +23,9 @@
 //! rings of `window + ROLLBACK` rows by position, full-attention caches grow; the convolution
 //! rings have the host's layout.
 
-use super::decode::{FastEnc, Fns, MvFmt, MvMode, MvParams, MvWeight, begin_enc, encode_mv, end_timed, mvk_rows, run_concurrent};
+use super::decode::{
+    FastEnc, Fns, MvFmt, MvMode, MvParams, MvWeight, begin_enc, encode_mv, end_commit, end_timed, mvk_rows, run_concurrent, wait_timed,
+};
 use super::{GGUF_GPU_TYPES, Id, IntoInnerUnsafe, MetalBackend, MetalWeight, MsgNewBufLen, MsgVoid};
 use crate::ggml::GgmlType;
 use crate::gpu::WeightRef;
@@ -61,6 +63,9 @@ struct Prof<'f> {
     cb: std::cell::Cell<Id>,
     stage: std::cell::RefCell<Vec<usize>>,
     times: std::cell::RefCell<std::collections::HashMap<Vec<usize>, (f64, usize)>>,
+    /// The stages' command buffers, committed back to back (the GPU stays busy and at speed) and
+    /// timed once the pass is done.
+    pending: std::cell::RefCell<Vec<(Id, Vec<usize>)>>,
 }
 
 /// The encoder of a pass: the decode library's, counting what it encodes; in a profile it is
@@ -134,13 +139,10 @@ impl<'f> Pe<'f> {
         if st.is_empty() {
             return;
         }
-        let g = end_timed(pr.be, pr.f, pr.cb.get(), self.enc.get());
         st.sort_unstable();
         st.dedup();
-        let mut t = pr.times.borrow_mut();
-        let v = t.entry(st).or_insert((0.0, 0));
-        v.0 += g;
-        v.1 += 1;
+        end_commit(pr.f, pr.cb.get(), self.enc.get());
+        pr.pending.borrow_mut().push((pr.cb.get(), st));
         let (cb, enc) = begin_enc(pr.be, pr.f);
         pr.cb.set(cb);
         self.enc.set(enc);
@@ -181,9 +183,17 @@ const SK_GATES: u32 = 16;
 const SK_CONV: u32 = 32;
 const SK_ROUTE: u32 = 64;
 const SK_HEAD: u32 = 128;
+const SK_QKV: u32 = 256;
+const SK_ATTK: u32 = 512;
+const SK_MERGE: u32 = 1024;
+const SK_CMIX: u32 = 2048;
+const SK_MVF: u32 = 4096;
+const SK_RT: u32 = 8192;
+const SK_NORM: u32 = 16384;
 
 /// Tokens of a pass at most (the decode library's multi-token matvecs take 16).
 pub(crate) const MAX_T: usize = 16;
+
 /// Splits of a token's keys at most (`ink_chunk` in the shader).
 const MAX_SPLIT: usize = 64;
 /// The epsilon of the attention residual's norms (`inkling::MIX_EPS`).
@@ -404,7 +414,7 @@ struct AttnP {
     window: u32,
     cap: u32,
     extent: u32,
-    _p0: u32,
+    cmin: u32,
     maxsplit: u32,
     scale: f32,
     q: u32,
@@ -429,7 +439,7 @@ struct MergeP {
     out: u32,
     pos: u32,
     window: u32,
-    _p0: u32,
+    cmin: u32,
     _p1: u32,
     _p2: u32,
 }
@@ -793,6 +803,8 @@ struct Pipes {
     kv: [Id; 3],
     q: Id,
     attn: [Id; 3],
+    /// Passes of up to MAX_T tokens: lanes across the channels (`ink_attv`).
+    attv: [Id; 3],
     merge: Id,
     conv: Id,
     route: Id,
@@ -803,6 +815,7 @@ struct Pipes {
     conv_mix: Id,
     gmix_norm: Id,
     gfg: Id,
+    mvr: Id,
     lora_a: Id,
     lora_b: Id,
     xlora_a: Id,
@@ -1406,6 +1419,10 @@ impl InkMetal {
             })
         };
         let (kn, dr) = (c.conv_kernel_size, c.d_rel);
+        // (`ink_attv` loads the relative vectors' up to 16 values at once.)
+        if dr > 16 {
+            bail!("relative vectors of {dr} values");
+        }
         let rank = c.loop_cfg.map_or(1, |l| l.gate_rank);
         let ne = c.n_routed_experts;
         let (topk, mi) = (c.num_experts_per_tok, c.moe_intermediate_size);
@@ -1821,6 +1838,17 @@ impl InkMetal {
                     pipe(&format!("ink_attn_4_{g}_2"))?,
                 ]
             },
+            attv: {
+                let g = m.layers[0].attn.hd.heads / m.layers[0].attn.hd.kv_heads;
+                if m.layers.iter().any(|l| l.attn.hd.heads / l.attn.hd.kv_heads != g) {
+                    bail!("layers with different groups of query heads");
+                }
+                [
+                    pipe(&format!("ink_attv_4_{g}_0"))?,
+                    pipe(&format!("ink_attv_4_{g}_1"))?,
+                    pipe(&format!("ink_attv_4_{g}_2"))?,
+                ]
+            },
             merge: pipe("ink_attn_merge")?,
             conv: pipe("ink_conv")?,
             route: pipe("ink_route")?,
@@ -1830,6 +1858,7 @@ impl InkMetal {
             conv_mix: pipe("ink_conv_mix")?,
             gmix_norm: pipe("ink_gmix_norm")?,
             gfg: pipe("ink_gfg")?,
+            mvr: pipe("ink_mvr")?,
             xcombine: pipe("ink_xcombine")?,
             lora_a: pipe("ink_lora_a")?,
             lora_b: pipe("ink_lora_b")?,
@@ -1959,13 +1988,18 @@ impl InkMetal {
 
     // ---- Encoding --------------------------------------------------------------------------
 
-    /// Measurements only (`OXINFER_INKLING_SKIP=dense,attn,exp,mix,gates,conv,route,head`): the
-    /// kinds of ops left out of the passes (whose results are then meaningless).
+    /// Measurements only (`OXINFER_INKLING_SKIP=dense,attn,exp,mix,gates,conv,route,head`, and
+    /// within those `qkv,attk,merge,cmix,mvf,rt,norm`: the query / key stage, the attention kernel,
+    /// its merge, the decoding passes' convolution-and-mix kernel, the router's matvec, the routing,
+    /// the plain norms): the kinds of ops left out of the passes (whose results are then
+    /// meaningless).
     fn skip(&self, what: u32) -> bool {
         static SKIP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         let m = *SKIP.get_or_init(|| {
             let v = std::env::var("OXINFER_INKLING_SKIP").unwrap_or_default();
-            let names = ["dense", "attn", "exp", "mix", "gates", "conv", "route", "head"];
+            let names = [
+                "dense", "attn", "exp", "mix", "gates", "conv", "route", "head", "qkv", "attk", "merge", "cmix", "mvf", "rt", "norm",
+            ];
             names
                 .iter()
                 .enumerate()
@@ -2254,6 +2288,14 @@ impl InkMetal {
         e.dispatch((nq, t), 1024);
     }
 
+    /// Passes of up to [`MAX_T`] tokens: the router's logits spread over the GPU (`ink_mvr`, a
+    /// threadgroup per expert) rather than a SIMD-group per expert. `OXINFER_INKLING_NARROW=1`
+    /// (measurements): `ink_mvf`.
+    fn wide(&self, t: usize) -> bool {
+        static NARROW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        t <= MAX_T && !*NARROW.get_or_init(|| std::env::var("OXINFER_INKLING_NARROW").is_ok_and(|v| v == "1"))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn norm(&self, e: &Pe, c: &Cx, x: usize, out: usize, w: Option<usize>, eps: f32, xs: usize, os: usize, t: usize) {
         let p = NormP {
@@ -2268,7 +2310,9 @@ impl InkMetal {
         };
         self.std(e, c, self.p.norm);
         e.bytes(&p, 2);
-        e.dispatch((t, 1), 256);
+        if !self.skip(SK_NORM) {
+            e.dispatch((t, 1), 256);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2721,7 +2765,7 @@ impl InkMetal {
         };
         self.std(e, c, self.p.q);
         e.bytes(&qp, 2);
-        if !self.skip(SK_ATTN) {
+        if !self.skip(SK_ATTN | SK_QKV) {
             e.dispatch((nh, t), hd);
         }
         let dynamic = ld.kd.is_some();
@@ -2775,7 +2819,7 @@ impl InkMetal {
                 e.buf(sd.vs.0, 0, 8);
             }
         }
-        if !self.skip(SK_ATTN) {
+        if !self.skip(SK_ATTN | SK_QKV) {
             e.dispatch((nkv, t), hd);
         }
         e.barrier();
@@ -2783,9 +2827,13 @@ impl InkMetal {
             self.ring_store(e, c, b.k, kw, sd.rings[0].0, pos, t);
             self.ring_store(e, c, b.v, kw, sd.rings[1].0, pos, t);
         }
-        // Splits: the most any token of the step has.
+        // Splits: the most any token of the step has (`ink_chunk`).
         let ms = c.b.maxsplit;
-        let chunk = |len: usize| 256usize.max(len.div_ceil(ms).div_ceil(32) * 32);
+        let cmin = if t > MAX_T { 256 } else { 64 };
+        let chunk = |len: usize| {
+            cmin.max(256.min(len.div_ceil(5).div_ceil(32) * 32))
+                .max(len.div_ceil(ms).div_ceil(32) * 32)
+        };
         let maxsplit = (0..t)
             .map(|ti| {
                 let hi = pos + ti + 1;
@@ -2803,6 +2851,7 @@ impl InkMetal {
             window: ld.window as u32,
             cap: sd.ring as u32,
             extent: ld.extent as u32,
+            cmin: cmin as u32,
             maxsplit: c.b.maxsplit as u32,
             scale: (hd as f32).powf(-0.5),
             q: b.q as u32,
@@ -2814,7 +2863,7 @@ impl InkMetal {
             tmp: tmp as u32,
             ..Default::default()
         };
-        self.std(e, c, self.p.attn[fi]);
+        self.std(e, c, if t <= MAX_T { self.p.attv[fi] } else { self.p.attn[fi] });
         e.bytes(&ap, 2);
         e.buf(sd.k.0, 0, 3);
         e.buf(sd.v.0, 0, 4);
@@ -2834,7 +2883,7 @@ impl InkMetal {
                 e.buf(sd.vs.0, 0, 10);
             }
         }
-        if !self.skip(SK_ATTN) {
+        if !self.skip(SK_ATTN | SK_ATTK) {
             e.dispatch3((nkv, maxsplit, t), 256);
         }
         e.barrier();
@@ -2883,12 +2932,13 @@ impl InkMetal {
             out: b.att as u32,
             pos: pos as u32,
             window: ld.window as u32,
+            cmin: cmin as u32,
             ..Default::default()
         };
         e.pipe(self.p.merge);
         e.buf(c.a, 0, 0);
         e.bytes(&mp, 1);
-        if !self.skip(SK_ATTN) {
+        if !self.skip(SK_ATTN | SK_MERGE) {
             e.dispatch((nh, t), 128);
         }
         e.barrier();
@@ -2922,7 +2972,9 @@ impl InkMetal {
             e.bytes(&rp, 5);
             // (The router's weights are read by many threadgroups, below, not by this one.)
             e.bytes(&0u32, 6);
-            e.dispatch((t, 1), 1024);
+            if !self.skip(SK_CMIX) {
+                e.dispatch((t, 1), 1024);
+            }
             e.barrier();
             if msgs {
                 let (g, _) = ld.gates.as_ref().unwrap();
@@ -2975,6 +3027,21 @@ impl InkMetal {
                     e.dispatch((self.ne / 32, t.div_ceil(32)), 128);
                 }
             }
+            _ if self.wide(t) && h % 4 == 0 && h <= 4096 => {
+                let rp = MvfP {
+                    n_out: self.ne as u32,
+                    n_in: h as u32,
+                    w: ld.router as u32,
+                    x: b.hn as u32,
+                    y: b.rlog as u32,
+                    ..Default::default()
+                };
+                self.std(e, c, self.p.mvr);
+                e.bytes(&rp, 2);
+                if !self.skip(SK_ROUTE | SK_MVF) {
+                    e.dispatch((self.ne, t), 128);
+                }
+            }
             _ => {
                 let rp = MvfP {
                     n_out: self.ne as u32,
@@ -2986,7 +3053,7 @@ impl InkMetal {
                 };
                 self.std(e, c, self.p.mvf);
                 e.bytes(&rp, 2);
-                if !self.skip(SK_ROUTE) {
+                if !self.skip(SK_ROUTE | SK_MVF) {
                     e.dispatch((self.ne.div_ceil(8), t), 256);
                 }
             }
@@ -2994,7 +3061,9 @@ impl InkMetal {
         e.barrier();
         self.std(e, c, self.p.route);
         e.bytes(&self.route_params(c, ld, t), 2);
-        e.dispatch((t, 1), self.ne.next_multiple_of(32));
+        if !self.skip(SK_RT) {
+            e.dispatch((t, 1), self.ne.next_multiple_of(32));
+        }
         e.barrier();
     }
 
@@ -3499,6 +3568,7 @@ impl InkMetal {
             cb: std::cell::Cell::new(cb),
             stage: Default::default(),
             times: Default::default(),
+            pending: Default::default(),
         };
         let fe = FastEnc { enc, f: &self.f };
         let e = Pe::new(&fe, Some(&pr));
@@ -3518,6 +3588,13 @@ impl InkMetal {
         pr.stage.borrow_mut().push(0);
         e.cut(&pr);
         end_timed(self.be, &self.f, pr.cb.get(), e.enc.get());
+        for (cb, st) in pr.pending.take() {
+            let g = wait_timed(self.be, &self.f, cb);
+            let mut t = pr.times.borrow_mut();
+            let v = t.entry(st).or_insert((0.0, 0));
+            v.0 += g;
+            v.1 += 1;
+        }
         unsafe { (self.be.sels.pool_pop)(pool) };
         let mut acc = ACC.lock().unwrap_or_else(|p| p.into_inner());
         if acc.4 != t {

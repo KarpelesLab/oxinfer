@@ -1042,9 +1042,21 @@ pub(crate) fn begin_enc(b: &MetalBackend, f: &Fns) -> (Id, Id) {
 
 /// Ends the encoder `enc` of [`begin_enc`], commits `cb` and waits for it: its GPU seconds.
 pub(crate) fn end_timed(b: &MetalBackend, f: &Fns, cb: Id, enc: Id) -> f64 {
+    end_commit(f, cb, enc);
+    wait_timed(b, f, cb)
+}
+
+/// Ends the encoder `enc` of [`begin_enc`] and commits `cb`.
+pub(crate) fn end_commit(f: &Fns, cb: Id, enc: Id) {
     unsafe {
         (f.void)(enc, f.s_end);
         (f.void)(cb, f.s_commit);
+    }
+}
+
+/// Waits for a committed command buffer: its GPU seconds.
+pub(crate) fn wait_timed(b: &MetalBackend, f: &Fns, cb: Id) -> f64 {
+    unsafe {
         (f.void)(cb, f.s_wait);
         let time: unsafe extern "C" fn(Id, Sel) -> f64 = b.o.msg_send();
         time(cb, b.o.sel(c"GPUEndTime")) - time(cb, b.o.sel(c"GPUStartTime"))

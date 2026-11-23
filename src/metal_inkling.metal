@@ -316,7 +316,7 @@ kernel void ink_q(device float* a [[buffer(0)]], device const float* c [[buffer(
 // split: D * 32 accumulators, then the max and the sum). The token at position `pos + t` sees
 // positions `max(first, pos + t + 1 - window)..pos + t` (`window` 0: all); key q is cache row
 // `q % cap` (`cap` 0: q).
-struct IAP { uint nh; uint nkv; uint hd; uint dr; uint pos; uint window; uint cap; uint extent; uint _p0; uint maxsplit;
+struct IAP { uint nh; uint nkv; uint hd; uint dr; uint pos; uint window; uint cap; uint extent; uint cmin; uint maxsplit;
              float scale; uint q; uint r; uint part; uint rel; uint kw; uint tbase; uint tmp; uint _p1; uint _p2; };
 inline void ink_range(constant IAP& p, uint ti, thread uint& lo, thread uint& hi) {
     uint pp = p.pos + ti;
@@ -324,9 +324,17 @@ inline void ink_range(constant IAP& p, uint ti, thread uint& lo, thread uint& hi
     lo = p.window != 0 && hi > p.window ? hi - p.window : 0;
 }
 // Keys per split of a token's range of `len` keys, and the splits (at most `ms`): the same rule for
-// every token, its own length.
-inline uint ink_chunk(uint len, uint ms) { return max(256u, ((len + ms - 1) / ms + 31) / 32 * 32); }
-inline uint ink_nsplit(uint len, uint ms) { return max(1u, (len + ink_chunk(len, ms) - 1) / ink_chunk(len, ms)); }
+// every token, its own length. Splits of about a fifth of the range, of 32 to 256 keys and at least
+// `cmin` (64 in passes of up to 16 tokens, whose few threadgroups would otherwise leave most cores
+// idle on ranges of a few hundred keys; 256 in prefill passes).
+inline uint ink_chunk(uint len, uint ms, uint cmin) {
+    uint fifth = min(256u, ((len + 4) / 5 + 31) / 32 * 32);
+    return max(max(cmin, fifth), ((len + ms - 1) / ms + 31) / 32 * 32);
+}
+inline uint ink_nsplit(uint len, uint ms, uint cmin) {
+    uint ch = ink_chunk(len, ms, cmin);
+    return max(1u, (len + ch - 1) / ch);
+}
 // Where key j is: the rows of the pass's own tokens (`tmp`: positions from `tbase`, a prefill pass
 // longer than a window's ring keeps them apart), else the cache (ring row `j % cap`).
 #define INK_ROW(j) ((p.tmp != 0 && (j) >= p.tbase) ? (ulong)((j) - p.tbase) : (p.cap != 0 ? (ulong)((j) % p.cap) : (ulong)(j)))
@@ -342,7 +350,7 @@ inline void ink_attn_body(device float* a, device const float* c, constant IAP& 
     constexpr uint HD = D * 32;
     uint lo, hi;
     ink_range(p, ti, lo, hi);
-    uint ns = ink_nsplit(hi - lo, p.maxsplit), chunk = ink_chunk(hi - lo, p.maxsplit);
+    uint ns = ink_nsplit(hi - lo, p.maxsplit, p.cmin), chunk = ink_chunk(hi - lo, p.maxsplit, p.cmin);
     if (split >= ns) return;
     uint j0 = lo + split * chunk, j1 = min(hi, j0 + chunk);
     uint h0 = g * G, pp = p.pos + ti;
@@ -367,8 +375,10 @@ inline void ink_attn_body(device float* a, device const float* c, constant IAP& 
         for (int d = 0; d < D; d++) o[gg][d] = 0.f;
     }
     ulong koff = (ulong)g * HD;
-    for (uint base = j0 + sg * 32; base < j1; base += 8 * 32) {
-        uint j = base + lane;
+    // (Keys interleaved over the SIMD-groups, SIMD-group sg taking keys j0 + sg + 8 k, so that a
+    // short range keeps all of them busy.)
+    for (uint base = j0 + sg; base < j1; base += 8 * 32) {
+        uint j = base + 8 * lane;
         float s[G];
         for (int gg = 0; gg < G; gg++) s[gg] = -INFINITY;
         if (j < j1) {
@@ -405,12 +415,12 @@ inline void ink_attn_body(device float* a, device const float* c, constant IAP& 
             for (int d = 0; d < D; d++) o[gg][d] *= al;
             m[gg] = mn;
         }
-        uint nbk = min(32u, j1 - base);
+        uint nbk = min(32u, (j1 - base + 7) / 8);
         // (The values of 8 keys loaded together, then accumulated in key order.)
         for (uint t0 = 0; t0 < nbk; t0 += 8) {
             float v8[8][D];
             for (uint u = 0; u < 8; u++) {
-                uint jj = min(base + t0 + u, j1 - 1);
+                uint jj = min(base + 8 * (t0 + u), j1 - 1);
                 ulong row = INK_ROW(jj) * p.kw + koff + lane * D;
                 device const uchar* vcb = INK_VB(jj);
                 device const float* vsb = INK_VS(jj);
@@ -460,15 +470,128 @@ INK_ATTN(4, 1, 0) INK_ATTN(4, 1, 1) INK_ATTN(4, 1, 2)
 INK_ATTN(4, 2, 0) INK_ATTN(4, 2, 1) INK_ATTN(4, 2, 2)
 INK_ATTN(4, 4, 0) INK_ATTN(4, 4, 1) INK_ATTN(4, 4, 2)
 
+// ---- The same for passes of up to 16 tokens (same grid, parameters and partial results): the
+// lanes of a SIMD-group across a head's channels (D each) and the SIMD-groups across the keys
+// (SIMD-group sg: keys j0 + sg + 8 m), KB keys at a time with their key and value loads issued
+// together, each dot product a SIMD-group sum; at the short ranges of decoding each key is one
+// load per lane rather than a lane's walk over its row.
+#define INK_AKB 4
+template <int D, int G, int KFMT>
+inline void ink_attv_body(device float* a, device const float* c, constant IAP& p, device const uchar* kc, device const uchar* vc,
+                          device const float* ksc, device const float* vsc, device const uchar* tk, device const uchar* tv,
+                          device const float* tks, device const float* tvs, uint g, uint split, uint ti, uint tid, uint sg, uint lane,
+                          threadgroup float* sm, threadgroup float* so, threadgroup float* bias) {
+    constexpr uint HD = D * 32;
+    uint lo, hi;
+    ink_range(p, ti, lo, hi);
+    uint ns = ink_nsplit(hi - lo, p.maxsplit, p.cmin), chunk = ink_chunk(hi - lo, p.maxsplit, p.cmin);
+    if (split >= ns) return;
+    uint j0 = lo + split * chunk, j1 = min(hi, j0 + chunk);
+    uint h0 = g * G, pp = p.pos + ti;
+    float4 q4[G];
+    for (int gg = 0; gg < G; gg++)
+        q4[gg] = *(device const float4*)(a + p.q + (ulong)ti * p.nh * HD + (h0 + gg) * HD + lane * D) * p.scale;
+    uint dmin = pp + 1 - j1, dmax = pp - j0;
+    uint nb = dmin < p.extent ? min(dmax + 1, p.extent) - dmin : 0;
+    for (uint i = tid; i < G * nb; i += 256) {
+        uint gg = i / nb, k = i % nb;
+        device const float* rq = a + p.r + ((ulong)ti * p.nh + h0 + gg) * p.dr;
+        float rv[16], cv[16];
+        for (uint d = 0; d < 16; d++) {
+            rv[d] = d < p.dr ? rq[d] : 0.f;
+            cv[d] = d < p.dr ? c[p.rel + d * p.extent + dmin + k] : 0.f;
+        }
+        float b = 0.f;
+        for (uint d = 0; d < 16; d++) if (d < p.dr) b += rv[d] * cv[d];
+        bias[gg * 1024 + k] = b;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float4 o[G];
+    float m[G], l[G];
+    for (int gg = 0; gg < G; gg++) {
+        m[gg] = -INFINITY;
+        l[gg] = 0.f;
+        o[gg] = 0.f;
+    }
+    ulong koff = (ulong)g * HD + lane * D;
+    for (uint base = j0 + sg; base < j1; base += 8 * INK_AKB) {
+        float4 k4[INK_AKB], v4[INK_AKB];
+        for (uint u = 0; u < INK_AKB; u++) {
+            uint j = min(base + 8 * u, j1 - 1);
+            ulong row = INK_ROW(j) * p.kw + koff;
+            k4[u] = kv_get4<KFMT>(INK_KB(j), INK_KS(j), row);
+            v4[u] = kv_get4<KFMT>(INK_VB(j), INK_VS(j), row);
+        }
+        for (int gg = 0; gg < G; gg++) {
+            float s[INK_AKB];
+            float mx = m[gg];
+            for (uint u = 0; u < INK_AKB; u++) {
+                uint j = base + 8 * u;
+                float4 pr = k4[u] * q4[gg];
+                float dot = simd_sum((pr.x + pr.y) + (pr.z + pr.w));
+                uint dist = pp - j;
+                s[u] = j < j1 ? dot + (dist - dmin < nb ? bias[gg * 1024 + dist - dmin] : 0.f) : -INFINITY;
+                mx = max(mx, s[u]);
+            }
+            float al = mx == -INFINITY ? 1.f : exp(m[gg] - mx);
+            float4 acc = o[gg] * al;
+            float ls = l[gg] * al;
+            for (uint u = 0; u < INK_AKB; u++) {
+                float e = s[u] == -INFINITY ? 0.f : exp(s[u] - mx);
+                ls += e;
+                acc = fma(e, v4[u], acc);
+            }
+            o[gg] = acc;
+            l[gg] = ls;
+            m[gg] = mx;
+        }
+    }
+    // The SIMD-groups' results combined: sm[gg * 16 + sg] the maxima, + 8 the sums.
+    for (int gg = 0; gg < G; gg++) {
+        if (lane == 0) { sm[gg * 16 + sg] = m[gg]; sm[gg * 16 + 8 + sg] = l[gg]; }
+        *(threadgroup float4*)(so + (gg * 8 + sg) * HD + lane * D) = o[gg];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < G * HD; i += 256) {
+        uint gg = i / HD, d = i % HD;
+        threadgroup const float* smg = sm + gg * 16;
+        float M = smg[0];
+        for (uint s2 = 1; s2 < 8; s2++) M = max(M, smg[s2]);
+        float L = 0.f, acc = 0.f;
+        for (uint s2 = 0; s2 < 8; s2++) {
+            if (smg[s2] == -INFINITY) continue;
+            float f = exp(smg[s2] - M);
+            L += smg[8 + s2] * f;
+            acc += so[(gg * 8 + s2) * HD + d] * f;
+        }
+        device float* pr = a + p.part + (((ulong)ti * p.nh + h0 + gg) * p.maxsplit + split) * (HD + 2);
+        pr[d] = acc;
+        if (d == 0) { pr[HD] = M; pr[HD + 1] = L; }
+    }
+}
+#define INK_ATTV(D, G, F) \
+kernel void ink_attv_##D##_##G##_##F(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IAP& p [[buffer(2)]], \
+                         device const uchar* kc [[buffer(3)]], device const uchar* vc [[buffer(4)]], device const float* ksc [[buffer(5)]], \
+                         device const float* vsc [[buffer(6)]], device const uchar* tk [[buffer(7)]], device const uchar* tv [[buffer(8)]], \
+                         device const float* tks [[buffer(9)]], device const float* tvs [[buffer(10)]], \
+                         uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
+    threadgroup float sm[G * 16]; threadgroup float so[G * 8 * D * 32]; threadgroup float bias[G * 1024]; \
+    ink_attv_body<D, G, F>(a, c, p, kc, vc, ksc, vsc, tk, tv, tks, tvs, tg.x, tg.y, tg.z, tid, sg, lane, sm, so, bias); }
+INK_ATTV(4, 3, 0) INK_ATTV(4, 3, 1) INK_ATTV(4, 3, 2)
+INK_ATTV(4, 1, 0) INK_ATTV(4, 1, 1) INK_ATTV(4, 1, 2)
+INK_ATTV(4, 2, 0) INK_ATTV(4, 2, 1) INK_ATTV(4, 2, 2)
+INK_ATTV(4, 4, 0) INK_ATTV(4, 4, 1) INK_ATTV(4, 4, 2)
+
 // ---- The splits of each (token, head) merged with the sink (one more logit, `sink`, of a zero
 // value), then gated: `out = softmax-weighted values * sigmoid(gate)` (grid: head, token).
-struct IACP { uint nh; uint hd; uint maxsplit; uint part; uint sink; uint gate; uint out; uint pos; uint window; uint _p0; uint _p1; uint _p2; };
+struct IACP { uint nh; uint hd; uint maxsplit; uint part; uint sink; uint gate; uint out; uint pos; uint window; uint cmin; uint _p1; uint _p2; };
 kernel void ink_attn_merge(device float* a [[buffer(0)]], constant IACP& p [[buffer(1)]],
                            uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
     uint hh = tg.x, ti = tg.y, hd = p.hd;
     uint hi = p.pos + ti + 1;
     uint lo = p.window != 0 && hi > p.window ? hi - p.window : 0;
-    uint ns = ink_nsplit(hi - lo, p.maxsplit);
+    uint ns = ink_nsplit(hi - lo, p.maxsplit, p.cmin);
     device const float* ph = a + p.part + ((ulong)ti * p.nh + hh) * p.maxsplit * (hd + 2);
     float sink = a[p.sink + (ulong)ti * p.nh + hh];
     float M = sink;
@@ -668,6 +791,30 @@ kernel void ink_conv_mix(device float* a [[buffer(0)]], device const float* c [[
     if (route == 0) return;
     threadgroup_barrier(mem_flags::mem_device);
     ink_route_body(a, c, rp, ti, tid, sg, lane, lg, bv, bi, chosen);
+}
+
+// ---- The router's logits of passes of up to 16 tokens (grid: expert, token; a threadgroup of 128
+// per row, float rows of `n_in`, a multiple of 4, in the constants), as `ink_mvf`.
+kernel void ink_mvr(device float* a [[buffer(0)]], device const float* c [[buffer(1)]], constant IMvfP& p [[buffer(2)]],
+                    uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float red[4];
+    uint r = tg.x, ti = tg.y, n4 = p.n_in / 4;
+    device const float4* w = (device const float4*)(c + p.w + (ulong)r * p.n_in);
+    device const float4* x = (device const float4*)(a + p.x + (ulong)ti * p.n_in);
+    // (Up to 8 float4 per thread, loaded together: n_in <= 4096.)
+    float4 wv[8], xv[8];
+    for (uint u = 0; u < 8; u++) {
+        uint k = tid + 128 * u;
+        wv[u] = k < n4 ? w[k] : 0.f;
+        xv[u] = k < n4 ? x[k] : 0.f;
+    }
+    float4 acc = 0.f;
+    for (uint u = 0; u < 8; u++) acc = fma(wv[u], xv[u], acc);
+    float s = simd_sum((acc.x + acc.y) + (acc.z + acc.w));
+    if (lane == 0) red[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) a[p.y + (ulong)ti * p.n_out + r] = (red[0] + red[1]) + (red[2] + red[3]);
 }
 
 // ---- The soft-capped logits of the tokens (`cap tanh(x / cap)`), cut to the first `u` of each
