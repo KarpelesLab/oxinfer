@@ -179,7 +179,8 @@ impl MvFmt {
     }
     /// The multi-token instantiation (up to `tt` tokens; see `mvk_body` in the shader).
     fn instantiate_k(self, nr: usize, ks: usize, tt: usize, kind: MvkKind) -> String {
-        let one = self.instantiate(nr, ks);
+        // (The one-token kernel's weight type: the same chunk arithmetic, see `wdot`.)
+        let one = self.instantiate_mv(nr, ks);
         let (mac, rest) = one.split_once('(').unwrap();
         let rest = rest
             .strip_suffix(')')

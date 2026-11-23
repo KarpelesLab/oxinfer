@@ -128,8 +128,44 @@ inline float mdot(MQ8_0 f, uint row, uint c, thread const X32& xr) {
 }
 // ---- IQ1_S (50-byte blocks of 256, 2-byte aligned), chunk of 32 = one sub-block: four grid
 // entries of 8 ternary values (signed bytes) plus a shared delta, one scale. The delta is applied
-// to the sum of the x values rather than to each weight.
+// to the sum of the x values rather than to each weight. The chunk is decoded (`iq1s_dec`) and its
+// sums taken (`iq1s_fin`, contraction off) by the same functions in the one-token and the
+// multi-token kernels, so that a verification pass gives the one-token bits.
 struct MIQ1_S { device const uchar* w; ulong rb; };
+struct WIQ1S { float4 g[8]; float dl; float delta; };
+inline void iq1s_dec(MIQ1_S f, uint row, uint c, thread WIQ1S& w) {
+    device const ushort* B = (device const ushort*)(f.w + (ulong)row * f.rb + (c / 8) * 50);
+    uint j = c % 8;
+    uint qh = B[17 + j], q01 = B[1 + 2 * j], q23 = B[2 + 2 * j];
+    w.dl = float(as_type<half>(B[0])) * float(2 * ((qh >> 12) & 7) + 1);
+    w.delta = (qh & 0x8000) ? -0.125f : 0.125f;
+    uint idx[4] = { (q01 & 255) | ((qh << 8) & 0x700), (q01 >> 8) | ((qh << 5) & 0x700),
+                    (q23 & 255) | ((qh << 2) & 0x700), (q23 >> 8) | ((qh >> 1) & 0x700) };
+    for (uint l = 0; l < 4; l++) {
+        ulong g = iq1s_grid[idx[l]];
+        w.g[2 * l] = float4(as_type<char4>(uint(g)));
+        w.g[2 * l + 1] = float4(as_type<char4>(uint(g >> 32)));
+    }
+}
+// The sums of one group of 8 (two float4 of grid values), then of the chunk; every product and
+// sum explicit (contraction off), so any kernel shape computes the same bits.
+inline void iq1s_acc(float4 g0, float4 g1, float4 x0, float4 x1, thread float4& s, thread float4& sx) {
+#pragma clang fp contract(off)
+    s = fma(g0, x0, s);
+    s = fma(g1, x1, s);
+    sx = sx + (x0 + x1);
+}
+inline float iq1s_end(float dl, float delta, float4 s, float4 sx) {
+#pragma clang fp contract(off)
+    return dl * fma(delta, hsum(sx), hsum(s));
+}
+inline float iq1s_fin(thread const WIQ1S& w, thread const X32& x) {
+    float4 s = 0.f, sx = 0.f;
+    for (uint l = 0; l < 4; l++) iq1s_acc(w.g[2 * l], w.g[2 * l + 1], x.v[2 * l], x.v[2 * l + 1], s, sx);
+    return iq1s_end(w.dl, w.delta, s, sx);
+}
+// (The one-token dot decodes each grid entry as it goes: the same operations as `iq1s_fin` on
+// `iq1s_dec`'s values, with fewer registers live.)
 inline float mdot(MIQ1_S f, uint row, uint c, thread const X32& x) {
     device const ushort* B = (device const ushort*)(f.w + (ulong)row * f.rb + (c / 8) * 50);
     uint j = c % 8;
@@ -141,15 +177,49 @@ inline float mdot(MIQ1_S f, uint row, uint c, thread const X32& x) {
     float4 s = 0.f, sx = 0.f;
     for (uint l = 0; l < 4; l++) {
         ulong g = iq1s_grid[idx[l]];
-        s = fma(float4(as_type<char4>(uint(g))), x.v[2 * l], s);
-        s = fma(float4(as_type<char4>(uint(g >> 32))), x.v[2 * l + 1], s);
-        sx += x.v[2 * l] + x.v[2 * l + 1];
+        iq1s_acc(float4(as_type<char4>(uint(g))), float4(as_type<char4>(uint(g >> 32))), x.v[2 * l], x.v[2 * l + 1], s, sx);
     }
-    return dl * (hsum(s) + delta * hsum(sx));
+    return iq1s_end(dl, delta, s, sx);
 }
 // ---- IQ1_M (56-byte blocks of 256): per group of 8 its own scale (3 bits a half sub-block) and
-// delta sign; the f16 scale in the top nibbles of the four scale words.
+// delta sign; the f16 scale in the top nibbles of the four scale words. Decoded and summed as
+// IQ1_S (`iq1m_dec`, `iq1m_fin`).
 struct MIQ1_M { device const uchar* w; ulong rb; };
+struct WIQ1M { float4 g[8]; float4 dl; float4 delta; };
+inline void iq1m_dec(MIQ1_M f, uint row, uint c, thread WIQ1M& w) {
+    device const uchar* B = f.w + (ulong)row * f.rb + (c / 8) * 56;
+    uint j = c % 8;
+    device const ushort* S = (device const ushort*)(B + 48);
+    uint s0 = S[0], s1 = S[1], s2 = S[2], s3 = S[3];
+    float d = float(as_type<half>(ushort((s0 >> 12) | ((s1 >> 8) & 0x00f0) | ((s2 >> 4) & 0x0f00) | (s3 & 0xf000))));
+    uint sv = S[j / 2] >> (6 * (j % 2));
+    device const ushort* Q = (device const ushort*)B;
+    uint q01 = Q[2 * j], q23 = Q[2 * j + 1];
+    uint qh = Q[16 + j];
+    for (uint l = 0; l < 4; l++) {
+        uint hb = (qh >> (8 * (l / 2))) & 255;
+        uint q = ((l < 2 ? q01 : q23) >> (8 * (l % 2))) & 255;
+        uint idx = q | ((hb << (l % 2 ? 4 : 8)) & 0x700);
+        w.dl[l] = d * float(2 * ((sv >> (l < 2 ? 0 : 3)) & 7) + 1);
+        w.delta[l] = (hb & (l % 2 ? 0x80u : 0x08u)) ? -0.125f : 0.125f;
+        ulong g = iq1s_grid[idx];
+        w.g[2 * l] = float4(as_type<char4>(uint(g)));
+        w.g[2 * l + 1] = float4(as_type<char4>(uint(g >> 32)));
+    }
+}
+// One group of 8 added to the chunk's sum `r`, every operation explicit (contraction off).
+inline float iq1m_grp(float r, float4 g0, float4 g1, float4 x0, float4 x1, float dl, float delta) {
+#pragma clang fp contract(off)
+    float4 a = g0 * x0;
+    a = fma(g1, x1, a);
+    return fma(dl, fma(delta, hsum(x0 + x1), hsum(a)), r);
+}
+inline float iq1m_fin(thread const WIQ1M& w, thread const X32& x) {
+    float r = 0.f;
+    for (uint l = 0; l < 4; l++) r = iq1m_grp(r, w.g[2 * l], w.g[2 * l + 1], x.v[2 * l], x.v[2 * l + 1], w.dl[l], w.delta[l]);
+    return r;
+}
+// (As for IQ1_S: `iq1m_fin`'s operations on `iq1m_dec`'s values, decoded as they are used.)
 inline float mdot(MIQ1_M f, uint row, uint c, thread const X32& x) {
     device const uchar* B = f.w + (ulong)row * f.rb + (c / 8) * 56;
     uint j = c % 8;
@@ -168,9 +238,7 @@ inline float mdot(MIQ1_M f, uint row, uint c, thread const X32& x) {
         float dl = d * float(2 * ((sv >> (l < 2 ? 0 : 3)) & 7) + 1);
         float delta = (hb & (l % 2 ? 0x80u : 0x08u)) ? -0.125f : 0.125f;
         ulong g = iq1s_grid[idx];
-        float4 a = float4(as_type<char4>(uint(g))) * x.v[2 * l];
-        a = fma(float4(as_type<char4>(uint(g >> 32))), x.v[2 * l + 1], a);
-        r += dl * (hsum(a) + delta * hsum(x.v[2 * l] + x.v[2 * l + 1]));
+        r = iq1m_grp(r, float4(as_type<char4>(uint(g))), float4(as_type<char4>(uint(g >> 32))), x.v[2 * l], x.v[2 * l + 1], dl, delta);
     }
     return r;
 }
@@ -535,6 +603,12 @@ template <typename F, int H> struct WDec { typedef WRow T; };
 template <typename F> inline void wdec(F f, uint row, uint c, thread WRow& w) { w.row = row; }
 template <typename F, typename X> inline float wdot(F f, thread const WRow& w, uint c, thread const X& xr) { return mdot(f, w.row, c, xr); }
 // Any other GGUF format: the chunk dequantized once (its GEMM loader), then mdot's dot product.
+template <int H> struct WDec<MIQ1_S, H> { typedef WIQ1S T; };
+inline void wdec(MIQ1_S f, uint row, uint c, thread WIQ1S& w) { iq1s_dec(f, row, c, w); }
+inline float wdot(MIQ1_S f, thread const WIQ1S& w, uint c, thread const X32& xr) { return iq1s_fin(w, xr); }
+template <int H> struct WDec<MIQ1_M, H> { typedef WIQ1M T; };
+inline void wdec(MIQ1_M f, uint row, uint c, thread WIQ1M& w) { iq1m_dec(f, row, c, w); }
+inline float wdot(MIQ1_M f, thread const WIQ1M& w, uint c, thread const X32& xr) { return iq1m_fin(w, xr); }
 struct WGen { float4 v[8]; };
 template <typename W, int H> struct WDec<MGen<W>, H> { typedef WGen T; };
 template <typename W>

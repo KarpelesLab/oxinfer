@@ -608,7 +608,12 @@ Kept:
 
 - The IQ1_S and IQ1_M decode matvecs as dot products of their own (the grid entries' signed
   bytes against x, the delta applied to the sums of x): 2304 x 5120 IQ1_S 142 -> 224 GB/s, IQ1_M
-  160 -> 229 GB/s, a 129280-row matrix 239 -> 338.
+  160 -> 229 GB/s, a 129280-row matrix 239 -> 338. The multi-token matvecs (verification) use
+  the same chunk arithmetic, written out with contraction off and shared by both kernels
+  (`iq1s_acc` / `iq1s_end`, `iq1m_grp`), so a verification pass gives the one-token bits
+  (`decode_mvk_matches_single_token`); the one-token kernel keeps decoding each grid entry as it
+  uses it (a version that decoded the whole chunk first, as the multi-token kernels do, read IQ1_S
+  at 183 GB/s instead of 219).
 - Sinkhorn on one SIMD-group instead of one thread (in-projection stage 2.8 -> 0.8 ms a token),
   routing on one SIMD-group instead of 1024 threads with barriers (3.8 -> 2.7 ms with the
   above).
