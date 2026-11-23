@@ -729,12 +729,11 @@ What changed:
   9196 -> 9666). The token rows come straight from device memory (transposed 8x8 loads), the
   weights through threadgroup memory. Against the f32 GEMMs (`OXINFER_METAL_MMA=0`, the op-by-op
   path): the first step's top-20 log-probabilities within 3e-3 (Llama 1B, Qwen3-8B) to 1e-2
-  (Qwen3.5-9B) and the same 64 greedy tokens at 512 and 1500 corpus tokens (Qwen3-8B and
-  Qwen3.5-9B at 1500); Gemma 4 26B-A4B
-  within KL 4.5e-3 of them, as the CPU is (3.2e-3; the raw corpus's near-uniform continuations
-  part after a few tokens in every pair).
-- **SIMD-group layout for 32- and 16-token tiles** (`c828f9a`). `mma_gemm_bench` (isolated kernels, Q4_0 /
-  Q4_K / Q6_K, TFLOP/s) showed the 32-token tiles (short prompts, narrow outputs, the remainder
+  (Qwen3.5-9B) of theirs and the same 64 greedy tokens at 512 and 1500 corpus tokens (Qwen3-8B
+  and Qwen3.5-9B at 1500); Gemma 4 26B-A4B within KL 4.5e-3 of them, as the CPU is (3.2e-3; the
+  raw corpus's near-uniform continuations part after a few tokens in every pair).
+- **SIMD-group layout for 32- and 16-token tiles** (`c828f9a`). `mma_gemm_bench` (isolated
+  kernels, Q4_0 / Q4_K / Q6_K, TFLOP/s) showed the 32-token tiles (short prompts, narrow outputs, the remainder
   of a chunk and the routed experts' 32-row tiles) bound by the weight operands' loads from
   threadgroup memory: 2 x 2 SIMD-groups load 4 weight and 2 token fragments for 8 products, 4
   SIMD-groups along the outputs (16 outputs x 32 tokens each) 2 and 4:
@@ -769,6 +768,11 @@ SIMD-group library now takes too, unless noted):
   0.3 TFLOP/s;
 - 128 outputs x 32 tokens per threadgroup (4 SIMD-groups of 32 x 32): 13.1 / 15.5, below the
   16 x 32 layout's 14.9 / 16.2;
+- prefill attention (`pff_*`, f32 SIMD-group matrices) taking 16 or 32 keys per online-softmax
+  step instead of 8 (one row maximum, rescale and sum per step; `pf_attn_bench`, 32 heads over 8
+  KV heads): heads of 128 at 512 tokens 0.488 -> 0.395 ms, but at 2048 2.68 -> 2.64 (16 keys) and
+  2.82 (32), heads of 64 0.97 -> 1.00 / 1.15 ms at 2048; attention is ~7% of a 2048-token
+  Qwen3-8B pass (97 of 1420 ms);
 - decode matvecs with 2 or 4 rows per SIMD-group and 1 / 2 / 4 SIMD-groups per row for Q4_K
   (Qwen3-8B Q4_K_M tg64 93.7 -> 90.4-94.4), and timing probes without the K-quant activation
   sums or without the nibble conversions (wrong results; tg unchanged at 95.5-95.9): the Q4_K
