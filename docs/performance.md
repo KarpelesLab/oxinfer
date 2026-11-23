@@ -815,6 +815,194 @@ GPU / host timing; `OXINFER_DEC_ONLY=barrier,mv,norm,qk,attn,...` (timing only);
 `cargo test --release --lib decode_mv_bench -- --ignored` (matvecs; `OXINFER_MV_BARRIER=1` for
 a barrier after each).
 
+#### Exact multi-token matvecs (November 2026)
+
+The decode library's multi-token matvecs (`mvk_*`, the exact kernels of speculative and lookup
+verification passes, `--exact-verify`, Inkling-2's passes of 2 to 16 tokens, and the odd-shaped
+matrices of prefill plans) must give every token's rows bit for bit as the one-token kernels do,
+so that a verification pass reproduces plain greedy decoding. This round made them exact on
+every format and cheaper per token. One-token decoding is unchanged bit for bit (the one-token
+kernels' outputs over every format, shape, split and mode against the previous build's, and the
+logits digest of 32 greedy tokens on the four Inkling-2-Mini checkpoints).
+
+**Exactness.** The library is compiled with fast math, and `#pragma clang fp reassociate(off)` only
+stops reassociation: the compiler still fuses any product into a following sum, and it chose
+differently in the two kernels. On MLX's affine 4-bit rows the one-token kernel computes the
+block as `fma(o, sum(x), d * (q - 8) . x)` (of six candidate orders, the one that matches it);
+the multi-token kernel, the same source in another loop, was compiled to another order, so
+`inkling2_bench --exact` found up to 1.4e-5 between a
+verification pass and one-token passes on mlx-community 4bit (a third to most of the logits;
+before: 241061 of 400116 logits of 2 tokens, 632761 of 800232 of 4, up to 1.38e-5). The sums the
+compiler had fused are now written out with contraction off and shared by both kernels
+(`q4_affine`; `kq_fin` for Q4_K / Q5_K; `q6_pair` and `q6_sum` for Q6_K, whose float4 dot
+products were lowered as two multiply-add chains each and whose final product by `d` the compiler
+fuses with the lane's running sum), each found by compiling the candidate orders and keeping the
+one whose one-token outputs equal the previous build's (`OXINFER_MV_DUMP`). With it,
+`inkling2_bench --exact 2,3,4,5,8,12,16` gives 0 differing logits on all four checkpoints (MLX
+4-bit, UD-IQ3_XXS, Q8_0 and the bf16 release), after prompts of 64 and 200 tokens.
+`decode_mvk_matches_single_token` now covers every format of the decode library (the 21 GGUF
+types, bf16, oxinfer Q8 and Q4, Q4 with MLX offsets per 64 and per 32 values), every mode (store,
+add, SiLU and GELU pairs, gated add), rows of 512, 1536 and 4096 values (one or several chunks a
+lane) and 2 to 16 tokens.
+
+**The kernels.** A lane must sum the same chunks in the same order as in the one-token kernel
+(lane l of SIMD-group s takes chunks 32 s + l, then every 32 KS), and the SIMD-group and
+threadgroup sums must run in the same order, so the multi-token kernels keep the one-token split
+and change what each lane holds:
+
+- Kernels for exactly 1 to 8 tokens and for 16 (`MVK_CLASSES`; a step runs the smallest class
+  that holds it, `MvkPipe::pick`), the token loops without bounds below 16; the 16-token class
+  runs as many tokens as the step has, in sweeps of 8 (accumulators for 16 at once measured 1.5-2
+  times slower). The previous kernels ran every step of up to 8 tokens through one 8-token kernel
+  in sweeps of 4.
+- Every format decodes a chunk once for all the tokens: Q4_K, Q5_K, Q6_K and the GGUF formats of
+  the generic kernel (IQ, Q2_K, Q3_K, ...) used to rerun the one-token dot product per token,
+  reloading and re-decoding the quants.
+- The decoded quants as half (exact for 4-bit, 5-bit, 6-bit and 8-bit values: half the registers)
+  or float (no conversion at each use), and one or two rows a threadgroup, chosen per format, row
+  length, SIMD-group split, token class and mode (`mvk_variant`, from `decode_mvk_bench` over
+  every variant), plus a third kind, sweeps of 4 tokens bounded by the step's count and finished
+  token by token with float quants (the previous kernels' structure), which stays faster for 9-16
+  tokens of 4-bit rows and for SiLU / GELU pairs of more than 8 tokens. Pairs (each lane holding
+  both matrices' chunks) take one row with half quants up to 8 tokens: Qwen3-8B's 12288 x 4096
+  gate / up pair at 8 tokens of Q8_0 375 us against 851 with two float rows.
+- Kernels of one SIMD-group a row reduce without threadgroup memory (every lane holds every sum
+  after the SIMD-group sums).
+- Matrices of fewer than 1024 rows take one row a threadgroup, to spread their rows over the
+  GPU (a rule, not measured on its own).
+
+**Kernel times** (`decode_mvk_bench`: a ring of copies of the matrix larger than the caches, one
+dispatch after the other, best of 4 x 32; the previous kernels with their 2 rows a threadgroup
+against this build's, in one window under the bench lock; us, and the one-token kernel's time on
+the same matrix). 12288 x 4096 on 4 SIMD-groups a row (a Qwen3-8B gate or up projection):
+
+| Format | one token | 2 tokens | 4 tokens | 8 tokens | 16 tokens |
+|---|---:|---:|---:|---:|---:|
+| Q4_K | 59 | 87.4 -> **68.7** | 176 -> **116** | 360 -> **279** | 868 -> 800 |
+| Q5_K | 66 | 104 -> **73.5** | 210 -> **119** | 441 -> **286** | 1139 -> **810** |
+| Q6_K | 76 | 99.8 -> **73.7** | 212 -> **91.5** | 428 -> **184** | 1033 -> **592** |
+| Q8_0 | 94 | 105 -> 94.4 | 155 -> **105** | 331 -> **258** | 858 -> **646** |
+| Q4_0 | 58 | 68.9 -> 67.9 | 134 -> 116 | 304 -> 269 | 770 -> 678 |
+| MLX 4-bit (affine) | 62 | 97.9 -> 79.8 | 132 -> 125 | 305 -> 287 | 681 -> 773 |
+| oxinfer Q4 | 59 | 75.6 -> 71.8 | 126 -> 125 | 292 -> 283 | 659 -> 752 |
+| oxinfer Q8 | 100 | 101 -> 100 | 128 -> 108 | 246 -> 232 | 598 -> 678 |
+| bf16 | 173 | 173 -> 173 | 179 -> 178 | 292 -> 250 | 700 -> 744 |
+| IQ3_XXS | 59 | 93.0 -> **63.5** | 179 -> **101** | 402 -> **253** | 917 -> **729** |
+
+Inkling-2-Mini's shapes on one SIMD-group a row (its matvecs' split), the 4-token column; the
+head is the 201024 x 2304 LM head:
+
+| Format | 2304 x 3072, one token | 4 tokens | head, one token | head, 4 tokens |
+|---|---:|---:|---:|---:|
+| MLX 4-bit | 11.0 | 21.9 -> 21.2 | 469 | 1128 -> 1268 |
+| Q8_0 | 15.2 | 21.8 -> 21.0 | 841 | 1044 -> 1153 |
+| Q4_K | 10.3 | 29.3 -> **19.8** | 472 | 1825 -> **1238** |
+| Q6_K | 12.4 | 27.6 -> **18.0** | 666 | 1642 -> **1024** |
+
+The times of separate windows moved by up to 10-25% for the 16-token runs of the previous
+kernels (Q8_0 659 to 858 us), so read that column's small differences as noise. What did not
+improve: the MLX 4-bit rows, whose previous kernels were faster because they rounded differently
+(the exact sum costs 2-12%), and 9-16 tokens of the oxinfer Q4 rows. (These tables and the
+end-to-end runs below predate the last change, the oxinfer Q4 dot in the previous kernels' shape:
+4096 x 12288 at 8 tokens 362 -> 335 us, at 16 715 -> 672.) NVFP4 has no decode-library
+kernel (Inkling's NVFP4 experts run its own kernels).
+
+**Verification passes.** Inkling-2-Mini, `inkling2_bench -n 64 -r 2 -v 1,2,4,8 --chain`, best of 3
+interleaved runs of the previous build (`f6ebf5f`) and this one, under the bench lock (load
+2-4); ms per pass, and in brackets the pass as a multiple of a one-token pass (`verify1`):
+
+| Checkpoint | 1 token | 2 tokens | 4 tokens | 8 tokens |
+|---|---:|---:|---:|---:|
+| mlx-community 4bit | 9.08 -> 9.13 | 13.72 (1.51) -> 13.73 (1.50) | 19.73 (2.17) -> 20.06 (2.20) | 33.45 (3.68) -> 34.14 (3.74) |
+| unsloth UD-IQ3_XXS | 9.53 -> 9.56 | 14.05 (1.47) -> **13.36 (1.40)** | 21.29 (2.23) -> **20.32 (2.13)** | 37.51 (3.94) -> **35.58 (3.72)** |
+| ggml-org Q8_0 | 12.45 -> 12.45 | 16.87 (1.36) -> 16.51 (1.33) | 22.56 (1.81) -> 22.65 (1.82) | 37.89 (3.04) -> 37.77 (3.03) |
+
+Chained greedy decoding (`tg64`) is unchanged (8.84-8.87 ms a token before, 8.86-8.91 after on
+the 4-bit file). Inkling's passes spend most of their time in its own expert kernels; of the decode
+library's matvecs, the UD-IQ3_XXS file's K-quant and IQ rows gain the most. The MLX 4-bit
+verification passes cost 2% more than before: the previous kernels were faster on those rows
+because they summed them differently from the one-token kernels (the rounding fixed above).
+
+Qwen3-8B with its DSpark draft (ankk98's block-7 Q4_K_M) and `--exact-verify`, the code prompt,
+128 tokens, `--spec-draft-fixed --draft-tokens N` so that every round verifies N + 1 tokens; the
+verification ms per round as the CLI reports it, and decode tok/s (best of 2 interleaved runs):
+
+| Target | N | verification ms | decode tok/s |
+|---|---:|---:|---:|
+| Q4_K_M | 1 (2 tokens) | 16 -> **13** | 67.4 -> **90.0** |
+| | 3 (4 tokens) | 30 -> **21** | 74.0 -> **106.0** |
+| | 7 (8 tokens) | 58 -> **41** | 57.3 -> **79.1** |
+| Q8_0 | 1 | 17 -> 16 | 68.4 -> 78.2 |
+| | 3 | 21 -> 19 | 99.1 -> 113.6 |
+| | 7 | 46 -> 42 | 64.7 -> 72.7 |
+
+A one-token step is 14.1 ms with the CLI on the Q4_K_M file at the time (plain decoding 70.7-71.0
+tok/s): a 4-token verification went from 2.1 to 1.5 one-token steps, an 8-token one from 4.1 to
+2.9. (The draft's own passes run the same kernels: drafting 0.54 -> 0.39 s for 39 rounds.)
+
+**Speculative decoding** (the CLI, 256 tokens, greedy, `--no-system`, one run each, the builds
+interleaved under the bench lock, load 2-4; Inkling's DSpark draft is unsloth's Q8_0 by path,
+Qwen3-8B's with `--exact-verify`), tok/s:
+
+| Model | prompt | plain | prompt lookup | DSpark |
+|---|---|---:|---:|---:|
+| Inkling-2-Mini mlx-community 4bit | code | 111.7 -> 111.9 | 110.2 -> 110.9 | 108.4 -> 107.8 |
+| | chat | 111.8 -> 111.5 | 127.1 -> 126.7 | 104.6 -> 103.6 |
+| Inkling-2-Mini UD-IQ3_XXS | code | 105.2 -> 106.2 | 106.2 -> 105.8 | 100.0 -> 100.7 |
+| | chat | 106.3 -> 105.9 | 105.3 -> 105.5 | 99.1 -> 98.6 |
+| Inkling-2-Mini Q8_0 | code | 80.4 -> 79.9 | 78.7 -> 80.0 | 83.5 -> 83.6 |
+| | chat | 79.7 -> 79.3 | 76.1 -> 81.4 | 73.5 -> 73.0 |
+| Qwen3-8B Q4_K_M | code | 70.7 -> 71.0 | 72.6 -> 76.0 | 73.0 -> 76.4 |
+| | chat | 76.4 -> 76.0 | 77.5 -> 78.5 | 74.3 -> 77.4 |
+
+Every speculative output is the same build's plain output, and every output is the previous
+build's except on the 4-bit Inkling file's chat prompt: there the prompt's prefill pass runs some
+matrices through the multi-token matvecs, which now round as one-token passes do; with the
+prefill on the CPU (`OXINFER_INKLING_PREFILL=0`) both builds give the same text. Inkling's
+speculative runs move within the runs' noise: its verification passes gained little (above), and
+its policies verify rarely on these prompts. Qwen3-8B gains 3-5% with the default cost-aware
+DSpark policy, but drafting every round is now much faster than plain decoding on this prompt
+(106 tok/s with 3 drafts a round, 71 plain) while the policy still decodes plainly most rounds
+(1.16 tokens a forward): its probes and their back-off were tuned when exact verification lost,
+and are the next lever for `--exact-verify`.
+
+**Measured and dropped** (`decode_mvk_bench`, 12288 x 4096 and 4096 x 12288 unless noted):
+
+- Two or four rows a threadgroup everywhere (x loaded once for the rows): slower wherever the
+  decoded rows' registers grow (Q4_K 12288 x 4096 at 4 tokens: 121 us with one row, 163-216 with
+  two, 289 with four); kept only where measured faster (above).
+- Accumulators in threadgroup memory, so that the token loop needs no registers per token: no
+  change (Q4_K at 8 tokens 304 -> 295 us, at 4 124 -> 125).
+- A SIMD-group set per token in a threadgroup (the one-token kernel run for each token, the rows'
+  weights read once from memory and then from the cache, as MLX's `qmv` runs a batch): slower than
+  the token loop (Q4_K 4 tokens 129 -> 176 us, 8 299 -> 424).
+- x chunks of every token held in registers and the rows streamed past them: spilled from 4
+  tokens on (4 tokens of 12288 x 4096 and 4096 x 12288: 550-800 us).
+- Each chunk's x sums (MLX offsets, Q4_0, K-quant minimums) computed once per threadgroup and
+  shared through threadgroup memory by 4 rows: no gain (Inkling-2-Mini's 201024 x 2304 head at 4
+  tokens 1277 -> 1296 us); with the sums removed altogether (wrong results) only 14% (1350 ->
+  1160), half the products removed 16%: no single part of the loop bounds it.
+- Decoding a pair's second matrix into the first's registers after the first's tokens (x loaded
+  again): 1.5 times slower in passes, for the other modes too (Inkling-2-Mini Q8_0, 2304 x 3072
+  at 4 tokens 26.4 -> 41.9 us a stage; Qwen3-8B Q4_K_M 4-token verification 19 -> 28 ms).
+- Accumulators for all 16 tokens of the 16-token class: 1.5-2 times slower than sweeps of 8
+  (Q8_0 12288 x 4096 955 -> 646 us).
+
+What is left grows with the tokens while the weights stream once: a lane's work per token is the
+one-token kernel's (a multiply-add per weight, the x sums, the chunk's reduction, the x loads), and
+none of it dominates alone (above). At 2 tokens the weights' stream hides most of it (Q6_K, Q8_0
+and bf16 12288 x 4096 at 1.0 times a one-token pass), at 8 tokens it is 1.4 (bf16) to 4.7 (Q4_K)
+times a one-token pass. The fast verification kernels (`metal_fastv.metal`,
+the default without `--exact-verify`) use the matrix units and are not bound by it, at the cost of
+exactness.
+
+Tools: `cargo test --release --lib decode_mvk_bench -- --ignored --nocapture` (`OXINFER_MVK_FMTS`,
+`_SHAPES`, `_T`, `_KS`, `_PAIR=1`, and with `OXINFER_MVK_ALL=1` every variant: `_NR`, `_H`);
+`OXINFER_MVK_ROWS` / `OXINFER_MVK_KIND` override the variant; `OXINFER_DECODE_SRC=FILE` takes the
+decode kernels from a file (decode plans and Inkling-2's, no rebuild); `OXINFER_MV_DUMP=FILE` in
+`decode_mvk_matches_single_token` writes the one-token outputs, to compare builds;
+`inkling2_bench --exact N,..`.
+
 #### M3 Ultra (November 2026)
 
 A Mac Studio with an M3 Ultra (24 performance and 8 efficiency cores, an 80-core GPU, 96 GB,
