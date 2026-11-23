@@ -27,6 +27,7 @@ use super::decode::{
     FastEnc, Fns, MvFmt, MvMode, MvParams, MvWeight, begin_enc, encode_mv, end_commit, end_timed, mvk_rows, run_concurrent, wait_timed,
 };
 use super::{GGUF_GPU_TYPES, Id, IntoInnerUnsafe, MetalBackend, MetalWeight, MsgNewBufLen, MsgVoid};
+use crate::generate::Chain;
 use crate::ggml::GgmlType;
 use crate::gpu::WeightRef;
 use crate::inkling::{
@@ -3906,7 +3907,7 @@ impl DevEngine for InkMetal {
         sess: &mut Inkling2Session,
         first: u32,
         max: usize,
-        on: &mut dyn FnMut(u32) -> bool,
+        on: &mut dyn FnMut(u32) -> Chain,
     ) -> Option<(usize, usize)> {
         let em = self.emb.as_ref()?;
         if max == 0 || profile_every() > 0 {
@@ -3985,7 +3986,7 @@ impl DevEngine for InkMetal {
         };
         // One pass ahead: pass k + 1 runs while the host takes pass k's token.
         let mut q: std::collections::VecDeque<(usize, Vec<Id>)> = std::collections::VecDeque::new();
-        let (mut sub, mut kept, mut stopped, mut ok) = (0usize, 0usize, false, true);
+        let (mut sub, mut kept, mut stopped, mut last, mut ok) = (0usize, 0usize, false, false, true);
         let push = |q: &mut std::collections::VecDeque<(usize, Vec<Id>)>, k: usize, dev: &mut InkDev, ok: &mut bool| {
             if dev.slots.iter().any(|s| s.ring == 0 && s.rows < pos0 + k + 1) {
                 // (Growing a cache copies it: the passes in flight finish first.)
@@ -4007,16 +4008,14 @@ impl DevEngine for InkMetal {
                 continue;
             }
             kept = k + 1;
-            if kept == max {
-                continue;
-            }
-            if !on(unsafe { *slot(k % 2) }) {
-                stopped = true;
-                continue;
-            }
-            if sub < max {
-                push(&mut q, sub, dev, &mut ok);
-                sub += 1;
+            match on(unsafe { *slot(k % 2) }) {
+                Chain::Go if !last && sub < max => {
+                    push(&mut q, sub, dev, &mut ok);
+                    sub += 1;
+                }
+                Chain::Go => {}
+                Chain::Last => last = true,
+                Chain::Stop => stopped = true,
             }
         }
         if !ok {

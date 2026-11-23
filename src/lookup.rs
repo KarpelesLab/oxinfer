@@ -693,6 +693,10 @@ impl<M: Target> crate::generate::RoundDecoder for LookupRounds<'_, M> {
     }
 
     fn step(&mut self, sampler: &mut Sampler, max_new: usize) -> Vec<u32> {
+        self.step_emit(sampler, max_new, &mut |_| true)
+    }
+
+    fn step_emit(&mut self, sampler: &mut Sampler, max_new: usize, emit: &mut dyn FnMut(u32) -> bool) -> Vec<u32> {
         let next = self.next.expect("push a first token before step");
         let model = self.model;
         let n = model.session_len(self.sess);
@@ -702,6 +706,41 @@ impl<M: Target> crate::generate::RoundDecoder for LookupRounds<'_, M> {
         d.tokens.truncate(k);
         d.class.truncate(k);
         let draft_secs = t0.elapsed().as_secs_f64();
+        // No draft worth verifying: greedy passes chained on the device (where the model has them),
+        // each token committed and streamed as it comes, until a draft is worth verifying (the
+        // pass already queued then still runs: its token is the next round's first).
+        if k == 0 && sampler.plain_greedy() && max_new > 0 {
+            let (sess, lookup) = (&mut *self.sess, &mut *self.lookup);
+            let stop = lookup.opts.stop.clone();
+            let mut out: Vec<u32> = Vec::new();
+            let mut on = |t: u32| -> crate::generate::Chain {
+                use crate::generate::Chain;
+                out.push(t);
+                lookup.extend(&[t]);
+                if !emit(t) || stop.contains(&t) {
+                    return Chain::Stop;
+                }
+                let d = lookup.draft((max_new - out.len()).saturating_sub(1));
+                if lookup.cut(&d) > 0 { Chain::Last } else { Chain::Go }
+            };
+            if let Some(kept) = model.decode_greedy(sess, next, max_new, &mut on) {
+                let secs = t0.elapsed().as_secs_f64();
+                if kept > 0 {
+                    self.lookup.policy.record_time(0, (secs - draft_secs) / kept as f64);
+                }
+                self.next = out.last().copied();
+                let st = &mut self.stats;
+                st.rounds += kept;
+                st.emitted += out.len();
+                if st.per_round.is_empty() {
+                    st.per_round.resize(1, 0);
+                }
+                st.per_round[0] += kept;
+                st.draft_secs += draft_secs;
+                st.verify_secs += secs - draft_secs;
+                return out;
+            }
+        }
         let v = model.vocab_size();
         let stop = std::mem::take(&mut self.lookup.opts.stop);
         let (out, accepted) = if k == 0 {
@@ -740,6 +779,9 @@ impl<M: Target> crate::generate::RoundDecoder for LookupRounds<'_, M> {
                 if d.vetoed { " (vetoed)" } else { "" },
                 (secs - draft_secs) * 1e3
             );
+        }
+        for &t in &out {
+            emit(t);
         }
         out
     }

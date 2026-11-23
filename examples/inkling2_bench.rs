@@ -121,7 +121,7 @@ fn main() -> Result<()> {
             if chain {
                 m.decode_greedy(&mut sess, tok, n, &mut |t| {
                     toks.push(t);
-                    true
+                    oxinfer::generate::Chain::Go
                 })
                 .context("--chain: the device does not chain greedy passes")?;
             } else {

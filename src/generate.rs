@@ -55,11 +55,22 @@ pub trait TextLm {
     }
     /// Greedy decoding with the passes chained on the device (see
     /// `Inkling2Model::decode_greedy`): runs `first` and the argmax tokens after it, at most
-    /// `max` passes, `on` getting every token but the last pass's and stopping on false. The
-    /// passes kept, or None (nothing run) when the model does not do it.
-    fn decode_greedy(&self, _sess: &mut Self::Sess, _first: u32, _max: usize, _on: &mut dyn FnMut(u32) -> bool) -> Option<usize> {
+    /// `max` passes, `on` getting each kept pass's token in order ([`Chain`]). The passes kept
+    /// (the session advanced by them), or None (nothing run) when the model does not do it.
+    fn decode_greedy(&self, _sess: &mut Self::Sess, _first: u32, _max: usize, _on: &mut dyn FnMut(u32) -> Chain) -> Option<usize> {
         None
     }
+}
+
+/// What a chain of greedy passes on the device does after a pass's token ([`TextLm::decode_greedy`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Chain {
+    /// Run the token, and go on.
+    Go,
+    /// Do not run the token (a pass already queued for it is undone).
+    Stop,
+    /// Queue no more passes: the passes already queued run (their tokens still come).
+    Last,
 }
 
 impl TextLm for Model<'_> {
@@ -289,14 +300,18 @@ pub fn decode<M: TextLm + ?Sized>(
         // Greedy decoding the device chains (the rest of the reply in one call).
         if sampler.plain_greedy() {
             let mut stopped = None;
-            let mut on = |t: u32| -> bool {
+            let mut on = |t: u32| -> Chain {
+                if out.len() >= max_tokens {
+                    // (The last pass: its token is not one of the reply's.)
+                    return Chain::Stop;
+                }
                 out.push(t);
                 if stop.contains(&t) {
                     stopped = Some((StopReason::Stop, None));
                 } else if on_token(&out) == Flow::Stop {
                     stopped = Some((StopReason::Cancelled, Some(t)));
                 }
-                stopped.is_none()
+                if stopped.is_none() { Chain::Go } else { Chain::Stop }
             };
             if let Some(n) = model.decode_greedy(sess, id, max_tokens - i, &mut on) {
                 forwards += n;
@@ -325,6 +340,16 @@ pub fn decode<M: TextLm + ?Sized>(
 pub trait RoundDecoder {
     fn push(&mut self, token: u32);
     fn step(&mut self, sampler: &mut Sampler, max_new: usize) -> Vec<u32>;
+    /// [`RoundDecoder::step`] that hands each committed token to `emit` as soon as it has it
+    /// (a decoder that commits many tokens in one step streams them); `emit` returns false to
+    /// stop there (a stop token, or the caller's cancel). By default after the step.
+    fn step_emit(&mut self, sampler: &mut Sampler, max_new: usize, emit: &mut dyn FnMut(u32) -> bool) -> Vec<u32> {
+        let out = self.step(sampler, max_new);
+        for &id in &out {
+            emit(id);
+        }
+        out
+    }
     /// Verification rounds run so far.
     fn rounds(&self) -> usize;
 }
@@ -373,12 +398,13 @@ pub fn decode_rounds<D: RoundDecoder + ?Sized>(
     dec.push(first);
     let mut cancelled = !stop.contains(&first) && on_token(&out) == Flow::Stop;
     while !cancelled && !stop.contains(out.last().unwrap()) && out.len() < max_tokens {
-        for id in dec.step(sampler, max_tokens - out.len()) {
+        dec.step_emit(sampler, max_tokens - out.len(), &mut |id| {
             out.push(id);
             if !cancelled && !stop.contains(&id) && on_token(&out) == Flow::Stop {
                 cancelled = true;
             }
-        }
+            !cancelled && !stop.contains(&id)
+        });
     }
     let last = *out.last().unwrap();
     let reason = if stop.contains(&last) {
