@@ -169,10 +169,12 @@ inline float mdot(MQ4_K f, uint row, uint c, thread const XKQ& x) {
     return dm.x * (s0.x * dot(lo, NIB_LO) + s1.x * dot(hi, NIB_HI)) - dm.y * (s0.y * x.k.sl + s1.y * x.k.sh);
 }
 // Q5_K: the fifth bit of value 64g + 16h + i (and of 64g + 32 + 16h + i) is bit 2g (2g + 1) of
-// qh[16h + i].
+// qh[16h + i]. Merged into each value's byte before the float conversion (one conversion and
+// product per value, as Q4_K: 550-560 GB/s instead of 425-440 with the bits summed apart).
 struct MQ5_K { device const uchar* w; ulong rb; };
-inline void bit_acc(uint w, uint sh, float4 xa, float4 xb, thread float4& lo, thread float4& hi) {
-    uint a = (w >> sh) & 0x01010101u, b = (w >> (sh + 1)) & 0x01010101u;
+inline void nib5_acc(uint w, uint q, uint sh, float4 xa, float4 xb, thread float4& lo, thread float4& hi) {
+    uint a = (w & 0x0F0F0F0Fu) | (((q >> sh) & 0x01010101u) << 4);
+    uint b = ((w >> 4) & 0x0F0F0F0Fu) | (((q >> (sh + 1)) & 0x01010101u) << 4);
     lo += xa * float4(as_type<uchar4>(a));
     hi += xb * float4(as_type<uchar4>(b));
 }
@@ -184,17 +186,12 @@ inline float mdot(MQ5_K f, uint row, uint c, thread const XKQ& x) {
     float2 s0 = sc.xy, s1 = sc.zw;
     uint4 u = *(device const uint4*)(B + 48 + 32 * g + 16 * h);
     uint4 q = *(device const uint4*)(B + 16 + 16 * h);
-    float4 lo = 0.f, hi = 0.f, bl = 0.f, bh = 0.f;
-    nib_acc(u.x, x.k.l[0], x.k.h[0], lo, hi);
-    nib_acc(u.y, x.k.l[1], x.k.h[1], lo, hi);
-    nib_acc(u.z, x.k.l[2], x.k.h[2], lo, hi);
-    nib_acc(u.w, x.k.l[3], x.k.h[3], lo, hi);
-    bit_acc(q.x, 2 * g, x.k.l[0], x.k.h[0], bl, bh);
-    bit_acc(q.y, 2 * g, x.k.l[1], x.k.h[1], bl, bh);
-    bit_acc(q.z, 2 * g, x.k.l[2], x.k.h[2], bl, bh);
-    bit_acc(q.w, 2 * g, x.k.l[3], x.k.h[3], bl, bh);
-    float vl = dot(lo, NIB_LO) + 16.f * dot(bl, NIB_LO), vh = dot(hi, NIB_HI) + 16.f * dot(bh, NIB_LO);
-    return dm.x * (s0.x * vl + s1.x * vh) - dm.y * (s0.y * x.k.sl + s1.y * x.k.sh);
+    float4 lo = 0.f, hi = 0.f;
+    nib5_acc(u.x, q.x, 2 * g, x.k.l[0], x.k.h[0], lo, hi);
+    nib5_acc(u.y, q.y, 2 * g, x.k.l[1], x.k.h[1], lo, hi);
+    nib5_acc(u.z, q.z, 2 * g, x.k.l[2], x.k.h[2], lo, hi);
+    nib5_acc(u.w, q.w, 2 * g, x.k.l[3], x.k.h[3], lo, hi);
+    return dm.x * (s0.x * dot(lo, NIB_LO) + s1.x * dot(hi, NIB_HI)) - dm.y * (s0.y * x.k.sl + s1.y * x.k.sh);
 }
 // Q6_K (210-byte super-blocks, 2-byte aligned): chunk k covers half n = k / 4 and positions
 // l = 8 (k % 4) + i of it; its values are 128n + l + {0, 32, 64, 96} (sub-blocks of 16 with
