@@ -778,11 +778,88 @@ Tried and not kept:
   us); 3 or 4 rows a SIMD-group (worse); half grids and sign masks for IQ2 (slower); two pair
   rows a SIMD-group for IQ2 (108 against 91 us).
 
-Not done: tokens of a verification pass sharing an expert's reads (each token reads its six
-experts, the largest share of a verification pass); a faster 8-token class of the multi-token
-Q5_K matvecs at these shapes; the cold path (14.4 tok/s, as before: prefetching the router's
-likely experts a layer ahead was not attempted); fewer barriers (the only fusion tried lost, see
-above).
+Not done here (the round below tried them): tokens of a verification pass sharing an expert's
+reads; a faster 8-token class of the multi-token Q5_K matvecs; the cold path; fewer barriers
+(the only fusion tried lost, see above).
+
+#### Decode on the GPU, round 3: verification passes, the cold path
+
+Same setup (master before this round, `008a377`, against this round's binary, interleaved under
+the bench lock, load 3-7 from other jobs throughout: the warm figures move 30% from run to run
+with it, so pairs taken minutes apart are what compare).
+
+| | before (`008a377`) | now |
+|---|---|---|
+| decode warm, lighthouse, no lookup, tok/s (second runs, 3 pairs) | 42.8 / 36.4 / 47.9 | 44.9 / 40.0 / 43.6 (the one-token step is unchanged) |
+| decode warm, code prompt, lookup on, tok/s (4 pairs, each after a warm-up run) | 37.8 / 66.9 / 66.8 / 49.4 | 67.0 / 67.0 / 67.2 / 45.5 |
+| GPU time of an 11-token verification pass, warm, ms (`--lookup-fixed`, profiled) | 148.4 | 139.3 |
+| decode cold (`--cold-start`), tok/s, interleaved pairs | 14.7 / 15.0 / 14.3 | 15.1 / 15.5 / 15.6 |
+
+The same text in every run, lookup on, off and `--lookup-fixed`. The code prompt with lookup
+reaches 67 tok/s on quiet stretches with both binaries: its verification passes are of 1.8
+tokens on average (2-4 tokens, where nothing changed); the 11-token figure is what this round's
+Q5_K change buys (attention output projection 34.9 -> 30.4 ms a pass, `wq_b` 23.2 -> 20.3, LM
+head 8.4 -> 6.8).
+
+Correctness: the six greedy checks give the round above's dumps exactly (every step's top-5 log
+probabilities identical; llama.cpp's tokens at every step for five prompts, 165 of 165, mean KL
+0.0004-0.0033; the thinking prompt departs at step 13 as before; against the CPU path mean KL
+0.0002-0.0040). Perplexity 2.9766. `decode_mvk_matches_single_token` passes with the new
+variants.
+
+Kept:
+
+- Q5_K multi-token matvecs (`mvk_table`): 9-16 tokens in sweeps of 4 on two rows instead of
+  sweeps of 8 (`decode_mvk_bench`, us at 11 / 16 tokens: 32768 x 1280 573 / 786 -> 480 / 711,
+  1024 x 4096 63 / 83 -> 53 / 73, 5120 x 8192 465 / 643 -> 395 / 581; also faster on 4096 x
+  4096, 12288 x 4096, 4096 x 12288 and 3072 x 2304), and long rows at 6-8 tokens the same
+  (5120 x 8192: 8 tokens 306 -> 277, 6 tokens 233 -> 215; 4096 x 12288 357 -> 334). No Q5_K
+  reason was found for the round above's 8-token pass (85 ms) costing more than its 11-token
+  one (77): in isolation 8 tokens cost 3-5x a one-token matvec at these shapes and 11 tokens
+  6-9x; that figure came from one profiled run on a loaded GPU and was not reproduced.
+- Cold passes predict experts (`OXINFER_DS41_PREDICT=n`, default 2, 0 off; only while experts
+  miss, so a warm step encodes nothing more): each layer also runs the routers of the next n
+  layers on its own input (a 384 x 5120 bf16 matvec and the routing kernel each), and the
+  chosen experts not in memory are listed like misses. The host reads those of the layers the
+  next run of layers takes together with the misses (every read requested before any is waited
+  for), so that run does not miss them, and reads those of later layers while the GPU runs
+  (`OXINFER_DS41_PREDICT_WAIT=0`: predictions only read ahead). 128 cold tokens: 3260 -> 1991
+  misses, 2405 -> 2082 partial passes, 15.0 -> 15.5 tok/s.
+
+Measured on the way, the SSD: a cold run reads 24.3 GB of experts for 128 tokens (0.19 GB a
+token, ~10% of the experts a step uses), during 2.8-2.9 s of expert reads, ~8.5 GB/s while
+reading; 8 parallel 8 MB-block reads of the uncached engram file reach 12.3 GB/s. So the reads
+are not far from the drive; what is lost is that they do not overlap the GPU: a cold step takes
+~67 ms, 35-40 ms of it GPU time (twice a warm step's: 16-19 partial passes of 4 layers, and a
+GPU idle between them runs slower) and 22-30 ms of reads the next layers wait for. Predicting
+removes misses, but the experts a run needs are known only once the run before it has routed,
+so their reads still sit between the two.
+
+Tried and not kept:
+
+- Verification passes grouped by expert (each chosen expert read once for all the tokens that
+  chose it, as Inkling-2's experts; `mvxg_*`: a kernel listing a pass's groups, pair and sum
+  kernels over (rows, group), groups of 2-4 tokens decoding each chunk once (the dots split into
+  a decode and a product part) and groups of one on the one-token arithmetic, the down sums
+  written per (token, slot) and summed by a small kernel; the one-token sum kernel reduced per
+  slot so that both give the same bits, which a unit test held for the four expert formats).
+  Slower in every case: these kernels are bound by instructions, not memory, so a shared read
+  saves nothing, and a group's accumulators cost occupancy. `decode_experts_group_bench`, IQ1_S,
+  experts of a pass against token by token: 11 tokens over 384 experts (54 distinct of 66) 1055
+  -> 1577 us; even 16 tokens over 48 (25 distinct of 96) 1516 -> 3164 us; IQ2_XXS 1561 ->
+  1703 / 1805. The per-slot reduction alone made the one-token sum kernel 13-21% slower (IQ1_S
+  42.8 -> 48.4 us). Dropped whole.
+- Predictions read ahead only, not waited for: misses unchanged (the reads had not finished when
+  needed), 15.0 -> 14.8 tok/s; 4 layers ahead (more bytes read for fewer misses: 1220 misses,
+  14.0 tok/s), chunks of 3, 6 or 8 layers (15.0-15.5): no better than the default.
+
+The dense stages: on a quiet GPU `wq_b` (32768 x 1280 Q5_K) runs at 461 GB/s, `wo_b` (5120 x
+8192) at 490, a `wo_a` group (1024 x 4096) at ~350 alone (eight run side by side); other
+SIMD-group splits of the one-token kernel (1, 2, 4 a row) are within 5% or slower (`wq_b` 448 /
+463 / 417 GB/s). Near the memory's speed already, so not tuned further.
+
+Not done: a cold step whose reads overlap its GPU work (it would need the experts of a run known
+a run ahead; predictions two chunks ahead were too inaccurate to try in time); fewer barriers.
 
 Not done for V4.1: image input (the ViT with 2D RoPE, the 3x3 aligner and the
 image processor; `mmproj` files are not read; the language model's side is in place and
