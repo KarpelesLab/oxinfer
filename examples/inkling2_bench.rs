@@ -8,12 +8,14 @@
 //! the engine (`prefill_gemm`'s default there: int8 activations).
 //!
 //! ```text
-//! inkling2_bench MODEL [-p 512,2048] [-n 128] [-r 3] [--kv f32|f16|q8] [--cpu] [--threads N] [--chunk N] [-v 2,4,8] [--chain]
+//! inkling2_bench MODEL [-p 512,2048] [-n 128] [-r 3] [--kv f32|f16|q8] [--cpu] [--threads N] [--chunk N] [-v 2,4,8] [--chain] [--exact 2,4,8]
 //! ```
 //!
 //! `--chain`: `tg N` as greedy decoding with the passes chained on the device
 //! (`Inkling2Model::decode_greedy`, as the CLI decodes greedily) rather than a host loop of
-//! `forward` and argmax.
+//! `forward` and argmax. `--exact N,..`: after prompts of 64 and of 200 random tokens, N tokens as
+//! one verification pass against the same N one at a time: the largest logit difference and how
+//! many logits differ (speculative decoding gives the plain greedy text when there are none).
 
 use anyhow::{Context, Result};
 use oxinfer::inkling::{Inkling2Config, Inkling2Model, KvCache};
@@ -26,9 +28,10 @@ fn median(mut v: Vec<f64>) -> f64 {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: inkling2_bench MODEL [-p 512,2048] [-n 128] [-r 3] [--kv f32|f16|q8] [--cpu] [--threads N] [--chunk N] [-v 2,4,8] [--chain]";
+    let usage = "usage: inkling2_bench MODEL [-p 512,2048] [-n 128] [-r 3] [--kv f32|f16|q8] [--cpu] [--threads N] [--chunk N] [-v 2,4,8] [--chain] [--exact 2,4,8]";
     let model = args.next().context(usage)?;
     let mut verify: Vec<usize> = Vec::new();
+    let mut exact: Vec<usize> = Vec::new();
     let mut chain = false;
     let (mut pp, mut tg, mut reps, mut kv, mut cpu, mut chunk) = (vec![512usize], 128usize, 3usize, KvCache::F32, false, 2048usize);
     while let Some(a) = args.next() {
@@ -49,6 +52,15 @@ fn main() -> Result<()> {
             "--cpu" => cpu = true,
             "--chain" => chain = true,
             "--threads" => oxinfer::pool::configure(args.next().context("--threads N")?.parse::<usize>()?.max(1)),
+            "--exact" => {
+                exact = args
+                    .next()
+                    .context("--exact N,..")?
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse())
+                    .collect::<Result<_, _>>()?
+            }
             "-v" => {
                 verify = args
                     .next()
@@ -164,6 +176,29 @@ fn main() -> Result<()> {
         }
         let t = median(times);
         println!("verify{n}: {:.2} ms per pass", t * 1e3);
+    }
+    // A verification pass against one-token passes.
+    for &n in &exact {
+        for plen in [64, 200] {
+            let mut sess = m.new_session();
+            let ids: Vec<u32> = (0..plen).map(|_| rnd()).collect();
+            m.forward(&mut sess, &ids);
+            let base = sess.pos;
+            let toks: Vec<u32> = (0..n).map(|_| rnd()).collect();
+            let mut one = Vec::new();
+            for &t in &toks {
+                one.extend(m.forward(&mut sess, &[t]));
+            }
+            sess.truncate(base)?;
+            let all = oxinfer::dspark::Target::forward_verify(&m, &mut sess, &toks, &[], &mut Vec::new(), false);
+            anyhow::ensure!(all.len() == one.len(), "verification logits: {} against {}", all.len(), one.len());
+            let diff = all.iter().zip(&one).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let nd = all.iter().zip(&one).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            println!(
+                "exact{n} after {plen}: max logit diff {diff:.3e}, {nd} of {} logits differ",
+                all.len()
+            );
+        }
     }
     Ok(())
 }

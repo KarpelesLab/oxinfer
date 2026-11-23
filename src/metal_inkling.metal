@@ -1672,3 +1672,31 @@ kernel void NAME(device const uchar* wb [[buffer(0)]], device const uchar* sb [[
     acc += ink_row_acc<T, X, CH>(f, min(r, p.n_out - 1), a + p.ldy, p.n_in / CH, lane, 32); \
     float v = simd_sum(acc); \
     if (lane == 0 && r < p.n_out) ink_conv_in(a, c, cp, ring, r, 0, v); }
+
+// ---- Passes of one token: the one-token matvec (`ink_mvc_*`'s sums) of a message gate's weighted
+// output (`ink_gfg` with `ss`), scaled by the gate's norm (`sp`: its partial sums, their count, the
+// output's arena offset, eps bits; x at `p.ldy`).
+#define INK_MVS(NAME, T, X, CH, MAKE) \
+kernel void NAME(device const uchar* wb [[buffer(0)]], device const uchar* sb [[buffer(1)]], device float* a [[buffer(2)]], \
+                 constant MV& p [[buffer(4)]], device const uchar* ob [[buffer(7)]], constant uint4& sp [[buffer(11)]], \
+                 uint tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]], \
+                 uint lane [[thread_index_in_simdgroup]]) { \
+    IMvE e = { wb + p.w_off, sb + p.s_off, ob + p.o_off }; \
+    T f = MAKE(e); \
+    uint r = tg * 4 + sg; \
+    float sc = ink_gscale(a, sp.x, sp.y, p.n_in, as_type<float>(sp.w), lane); \
+    float acc = 0.f; \
+    acc += ink_row_acc<T, X, CH>(f, min(r, p.n_out - 1), a + p.ldy, p.n_in / CH, lane, 32); \
+    float v = simd_sum(acc); \
+    if (lane == 0 && r < p.n_out) a[sp.z + r] = v * sc; }
+
+// ---- Passes of several tokens: rows of `n` floats at `y` (one a token) scaled by their message
+// gate's norm (partials `ss + token * 64`, `np` of them; `ink_mvs_*`'s product). Grid: blocks of 256,
+// token.
+struct IGsP { uint y; uint n; uint ss; uint np; uint h; float eps; uint _p0; uint _p1; };
+kernel void ink_gsc(device float* a [[buffer(0)]], constant IGsP& p [[buffer(1)]], uint2 tg [[threadgroup_position_in_grid]],
+                    uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    uint ti = tg.y, i = tg.x * 256 + tid;
+    float sc = ink_gscale(a, p.ss + ti * 64, p.np, p.h, p.eps, lane);
+    if (i < p.n) a[p.y + (ulong)ti * p.n + i] *= sc;
+}

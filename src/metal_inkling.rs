@@ -174,6 +174,13 @@ fn attf_on() -> bool {
     *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_ATTF").is_ok_and(|v| v == "0"))
 }
 
+/// Whether the message gates leave their norms to the kernels after them
+/// (`OXINFER_INKLING_GFOLD=0`: the norm kernel).
+fn gfold_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_GFOLD").is_ok_and(|v| v == "0"))
+}
+
 /// Whether passes of up to [`MAX_T`] tokens merge a token's key splits in the attention kernel (the
 /// last split to finish) rather than in `ink_attn_merge` (`OXINFER_INKLING_MFOLD=0`).
 fn mfold_on() -> bool {
@@ -336,6 +343,7 @@ pub(crate) fn shader_src(mma: bool) -> String {
         let n = f.name();
         let _ = writeln!(s, "#define IMVC_{n}(e) {mk}");
         let _ = writeln!(s, "INK_MVC(ink_mvc_{n}, {t}, {x}, {ch}, IMVC_{n})");
+        let _ = writeln!(s, "INK_MVS(ink_mvs_{n}, {t}, {x}, {ch}, IMVC_{n})");
     }
     if mma {
         s.push_str(PF_SRC);
@@ -593,6 +601,9 @@ struct Dw {
     /// Passes of one token, where the one-token matvec runs a row per SIMD-group: the same
     /// matvec followed by the convolution after the attention (`ink_mvc_*`).
     mvc: Option<Id>,
+    /// Where `mvc` is: the same matvec of a message gate's weighted output, scaled by the gate's
+    /// norm (`ink_mvs_*`, [`InkMetal::attn_fold`]).
+    mvs: Option<Id>,
     multi: [(Id, usize, usize); 2],
     /// Prefill: the matrix-unit GEMM, where the format has one; float32 weights (the loop's
     /// gates): their buffer and offset in floats, for the f32 GEMM.
@@ -859,6 +870,7 @@ struct Pipes {
     xcombine: Id,
     gmix_norm: Id,
     gfg: Id,
+    gsc: Id,
     mvr: Id,
     lora_a: Id,
     lora_b: Id,
@@ -1418,6 +1430,7 @@ impl InkMetal {
             let mvc = (specialized(w.fmt) && (nr1, ks1) == (1, 1))
                 .then(|| lib.pipeline(be, &format!("ink_mvc_{}", w.fmt.name())))
                 .flatten();
+            let mvs = mvc.and_then(|_| lib.pipeline(be, &format!("ink_mvs_{}", w.fmt.name())));
             if profile_every() > 0 {
                 eprintln!(
                     "[inkling profile: matvec [{n_out}, {n_in}] {:?}: pipeline {:#x}]",
@@ -1489,6 +1502,7 @@ impl InkMetal {
             Ok(Dw {
                 w,
                 mvc,
+                mvs,
                 lora,
                 one,
                 multi: [mk(8)?, mk(16)?],
@@ -1999,6 +2013,7 @@ impl InkMetal {
             mix8: pipe("ink_mix8")?,
             gmix_norm: pipe("ink_gmix_norm")?,
             gfg: pipe("ink_gfg")?,
+            gsc: pipe("ink_gsc")?,
             mvr: pipe("ink_mvr")?,
             xcombine: pipe("ink_xcombine")?,
             lora_a: pipe("ink_lora_a")?,
@@ -2513,7 +2528,6 @@ impl InkMetal {
             })
             .flatten()
         {
-            let fold = fold && which.len() == 1;
             for &(i, src, w, out) in which {
                 #[repr(C)]
                 struct P {
@@ -2544,7 +2558,7 @@ impl InkMetal {
                         bf,
                         _p: 0,
                         w: w as u32,
-                        ss: if fold { b.gss } else { 0 } as u32,
+                        ss: if fold { b.gss + i * c.b.tm * 64 } else { 0 } as u32,
                         _q: [0; 2],
                     },
                     3,
@@ -2848,7 +2862,7 @@ impl InkMetal {
                     })
                     .collect();
                 if !self.skip(SK_GATES) {
-                    self.gates(e, c, g, &which, t, !self.skip(SK_MIX), false);
+                    self.gates(e, c, g, &which, t, !self.skip(SK_MIX), self.attn_fold(si, t));
                 }
                 3
             }
@@ -2863,7 +2877,80 @@ impl InkMetal {
             }
         };
         let xi = |i: usize| b.xn + if n_in == 3 { i * th } else { 0 };
-        if !self.skip(SK_DENSE) {
+        let afold = self.attn_fold(si, t);
+        if afold {
+            // The gates' weighted outputs: the projections scaled by their gate's norm, in the
+            // matvec (one token) or after it (several, the same product).
+            let jobs = self.dense_jobs(ld, b);
+            for &(d, gi, y) in &jobs {
+                if t == 1 {
+                    let w = &d.w;
+                    let p = MvParams {
+                        n_out: w.n_out as u32,
+                        n_in: w.n_in as u32,
+                        mode: 0,
+                        rows_per_tg: 0,
+                        w_off: w.data_off,
+                        s_off: w.scales_off,
+                        w2_off: w.data_off,
+                        s2_off: w.scales_off,
+                        o_off: w.offs_off,
+                        o2_off: w.offs_off,
+                        gpr: w.gpr,
+                        gk: w.gk,
+                        ldy: xi(gi) as u32,
+                        _p: 0,
+                    };
+                    let sp = [
+                        (b.gss + gi * c.b.tm * 64) as u32,
+                        h.div_ceil(64) as u32,
+                        y as u32,
+                        self.eps.to_bits(),
+                    ];
+                    e.note(((w.n_out << 44) | (w.n_in << 24) | (d.mvs.unwrap() as usize & 0xff_ffff)) as Id);
+                    e.fe().pipe(d.mvs.unwrap());
+                    e.buf(w.data, 0, 0);
+                    e.buf(w.scales, 0, 1);
+                    e.buf(c.a, 0, 2);
+                    e.bytes(&p, 4);
+                    e.buf(w.offs, 0, 7);
+                    e.bytes(&sp, 11);
+                    e.dispatch((w.n_out.div_ceil(4), 1), 128);
+                } else {
+                    self.mv(e, c, d, xi(gi), y, t, MvMode::Store);
+                }
+            }
+            if t > 1 {
+                e.barrier();
+                for &(d, gi, y) in &jobs {
+                    #[repr(C)]
+                    struct P {
+                        y: u32,
+                        n: u32,
+                        ss: u32,
+                        np: u32,
+                        h: u32,
+                        eps: f32,
+                        _p: [u32; 2],
+                    }
+                    e.pipe(self.p.gsc);
+                    e.buf(c.a, 0, 0);
+                    e.bytes(
+                        &P {
+                            y: y as u32,
+                            n: d.w.n_out as u32,
+                            ss: (b.gss + gi * c.b.tm * 64) as u32,
+                            np: h.div_ceil(64) as u32,
+                            h: h as u32,
+                            eps: self.eps,
+                            _p: [0; 2],
+                        },
+                        1,
+                    );
+                    e.dispatch((d.w.n_out.div_ceil(256), t), 256);
+                }
+            }
+        } else if !self.skip(SK_DENSE) {
             for (d, x, y) in [
                 (&ld.q, xi(0), b.q),
                 (&ld.r, xi(0), b.r),
@@ -3199,12 +3286,57 @@ impl InkMetal {
         (f == g).then_some(f)
     }
 
+    /// A layer's attention projections: the matrix, the input (message gate) it reads, its output.
+    fn dense_jobs<'l>(&self, ld: &'l LayerDev, b: &Bufs) -> Vec<(&'l Dw, usize, usize)> {
+        let mut v = vec![
+            (&ld.q, 0, b.q),
+            (&ld.r, 0, b.r),
+            (&ld.gate, 0, b.gate),
+            (&ld.sink, 0, b.sink),
+            (&ld.k, 1, b.k),
+            (&ld.v, 2, b.v),
+        ];
+        if let Some(kd) = &ld.kd {
+            v.push((kd, 1, b.kd));
+        }
+        if let Some(vd) = &ld.vd {
+            v.push((vd, 2, b.vd));
+        }
+        v
+    }
+
+    /// Whether step `si`'s three attention message gates leave their norms to the projections
+    /// after them (`ink_gfg` writes the weighted outputs and their sums of squares; one token:
+    /// `ink_mvs_*` scale the matvecs by the norms, several: `ink_gsc` scales the projections):
+    /// passes of up to [`MAX_T`] tokens, every projection with `ink_mvs_*` and without LoRA updates.
+    /// `OXINFER_INKLING_GFOLD=0`: the norm kernel.
+    fn attn_fold(&self, si: usize, t: usize) -> bool {
+        let sp = &self.plan[si];
+        let ld = &self.layers[sp.layer];
+        let Some((g, _)) = ld.gates.as_ref() else {
+            return false;
+        };
+        let bf = self.gate_fast(&g[0]);
+        sp.bank.is_some()
+            && ld.attn_query.is_some()
+            && t <= MAX_T
+            && self.h <= 4096
+            && bf.is_some()
+            && (1..3).all(|i| self.gate_fast(&g[i]) == bf)
+            && [&ld.q, &ld.r, &ld.gate, &ld.sink, &ld.k, &ld.v]
+                .into_iter()
+                .chain(ld.kd.as_ref())
+                .chain(ld.vd.as_ref())
+                .all(|d| d.mvs.is_some() && d.lora.is_empty())
+            && !self.skip(SK_GATES | SK_MIX | SK_DENSE)
+            && gfold_on()
+    }
+
     /// Whether step `si`'s MLP message gate leaves its norm to the router and the experts' gate /
     /// up kernels (`ink_gfg` writes the weighted output and its sums of squares, `ink_mvr` and
     /// `_rpair` / `_gpair` scale their sums by the norm): passes of up to [`MAX_T`] tokens, no
     /// LoRA updates of the experts' gate / up rows. `OXINFER_INKLING_GFOLD=0`: the norm kernel.
     fn mlp_fold(&self, si: usize, t: usize) -> bool {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let sp = &self.plan[si];
         let ld = &self.layers[sp.layer];
         let Some((g, _)) = ld.gates.as_ref() else {
@@ -3218,14 +3350,14 @@ impl InkMetal {
             && ld.exp.xlora_gu.is_none()
             && self.gate_fast(&g[3]).is_some()
             && !self.skip(SK_GATES | SK_MIX | SK_ROUTE | SK_MVF)
-            && *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_GFOLD").is_ok_and(|v| v == "0"))
+            && gfold_on()
     }
 
     /// The parameters that point a kernel reading `hn` at its norm's partial sums (`ink_gscale`)
     /// when step `si`'s MLP gate leaves the norm to it: (ss, np, eps).
     fn fold_p(&self, c: &Cx, si: usize, t: usize) -> (u32, u32, f32) {
         if self.mlp_fold(si, t) {
-            (c.b.gss as u32, self.h.div_ceil(64) as u32, self.eps)
+            ((c.b.gss + 3 * c.b.tm * 64) as u32, self.h.div_ceil(64) as u32, self.eps)
         } else {
             (0, 0, 0.0)
         }
