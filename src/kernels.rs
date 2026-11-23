@@ -109,8 +109,23 @@ impl Drop for ScratchScope {
     }
 }
 
-/// Buffers a [`ScratchScope`] keeps at most (a layer of the Qwen family frees about ten).
-const SCRATCH_KEEP: usize = 16;
+/// Buffers a [`ScratchScope`] keeps at most (a layer of the Qwen family frees about ten, a layer
+/// application of Inkling-2 about forty, of six sizes).
+const SCRATCH_KEEP: usize = 64;
+
+/// [`scratch`] zero-filled, across the pool when large: for a temporary that is added to. A
+/// reused buffer is already mapped, which a fresh `vec![0f32; n]` of megabytes is not: every
+/// page of it is then faulted in by whichever threads write it first.
+pub fn scratch_zeroed(n: usize) -> Vec<f32> {
+    let mut v = scratch(n);
+    if n >= ZEROS_PAR_MIN {
+        let chunk = (n / (pool::threads() * 2)).max(ZEROS_PAR_MIN / 4);
+        for_chunks(&mut v, chunk, true, |_, c| c.fill(0.0));
+    } else {
+        v.fill(0.0);
+    }
+    v
+}
 
 /// A `Vec<f32>` of `n` elements for a temporary that is fully written before it is read: its
 /// contents are unspecified (zeros, or what a buffer given to [`recycle`] held). Zero-filling a
@@ -123,6 +138,47 @@ pub fn scratch(n: usize) -> Vec<f32> {
         }
     }
     zeros(n)
+}
+
+/// A [`scratch`] buffer that goes back through [`recycle`] when dropped.
+pub struct Scratch(Vec<f32>);
+
+impl Scratch {
+    /// `n` elements of unspecified contents: for a temporary written whole before it is read.
+    pub fn new(n: usize) -> Self {
+        Self(scratch(n))
+    }
+    /// `n` zeros ([`scratch_zeroed`]).
+    pub fn zeroed(n: usize) -> Self {
+        Self(scratch_zeroed(n))
+    }
+    /// A buffer made elsewhere, to be recycled when dropped.
+    pub fn from_vec(v: Vec<f32>) -> Self {
+        Self(v)
+    }
+    /// The buffer, kept by the caller.
+    pub fn into_vec(mut self) -> Vec<f32> {
+        std::mem::take(&mut self.0)
+    }
+}
+
+impl std::ops::Deref for Scratch {
+    type Target = Vec<f32>;
+    fn deref(&self) -> &Vec<f32> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Scratch {
+    fn deref_mut(&mut self) -> &mut Vec<f32> {
+        &mut self.0
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        recycle(std::mem::take(&mut self.0));
+    }
 }
 
 /// Gives a temporary back for [`scratch`] (dropped when no [`ScratchScope`] is open, or small).
@@ -460,13 +516,17 @@ fn token_split(row_blocks: usize, t: usize, nthreads: usize) -> (usize, usize) {
 pub const TN: usize = 8;
 
 /// Packs `x` ([t, n_in]) into token tiles of TN: `xt[tile][k][c] = x[tile*TN + c][k]`, zero padded.
-fn pack_xt(x: &[f32], t: usize, n_in: usize) -> Vec<f32> {
+fn pack_xt(x: &[f32], t: usize, n_in: usize) -> Scratch {
     let tiles = t.div_ceil(TN);
-    let mut xt = vec![0f32; tiles * n_in * TN];
+    // (A reused buffer: every tile is written whole, the last one's padding as zeros.)
+    let mut xt = Scratch::new(tiles * n_in * TN);
     let p = SendPtr(xt.as_mut_ptr());
     pool::run(tiles, &|tile| {
         // SAFETY: each tile writes a disjoint range of `xt`.
         let dst = unsafe { std::slice::from_raw_parts_mut(p.get().add(tile * n_in * TN), n_in * TN) };
+        if (tile + 1) * TN > t {
+            dst.fill(0.0);
+        }
         for c in 0..TN {
             let tok = tile * TN + c;
             if tok >= t {
@@ -3864,7 +3924,7 @@ mod tests {
             if !(t > decode_max_tokens() && sme_available()) {
                 let xt = (t >= TN).then(|| pack_xt(&x, t, n_in));
                 let mut yb = vec![0f32; t * n_out];
-                unsafe { matmul_block(&w, n_out, n_in, &x, xt.as_deref(), t, 0, n_out, yb.as_mut_ptr()) };
+                unsafe { matmul_block(&w, n_out, n_in, &x, xt.as_ref().map(|v| &v[..]), t, 0, n_out, yb.as_mut_ptr()) };
                 for (i, (a, b)) in y.iter().zip(&yb).enumerate() {
                     assert_eq!(a.to_bits(), b.to_bits(), "bf16 t={t} [{}, {}]: {a} vs {b}", i / n_out, i % n_out);
                 }

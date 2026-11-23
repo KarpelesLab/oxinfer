@@ -790,13 +790,18 @@ impl<'a> Experts<'a> {
                     .collect()
             })
             .collect();
-        let mut xs = vec![0f32; rows * h];
+        // The megabytes of a chunk's gathered rows and outputs are buffers of the pass, reused
+        // from one layer to the next (`kernels::Scratch`: each is written whole below).
+        use crate::kernels::Scratch;
+        let mut xs = Scratch::new(rows * h);
         for_chunks(&mut xs, h, true, |i, row| {
             if src[i] != usize::MAX {
                 row.copy_from_slice(&x[src[i] * h..(src[i] + 1) * h]);
+            } else {
+                row.fill(0.0);
             }
         });
-        let mut a = vec![0f32; rows * mi];
+        let mut a = Scratch::new(rows * mi);
         match &self.gate_up[0] {
             GateUp::Fused(_) => {
                 let ls: Vec<&Lin> = self
@@ -804,7 +809,7 @@ impl<'a> Experts<'a> {
                     .iter()
                     .map(|g| if let GateUp::Fused(l) = g { l } else { unreachable!() })
                     .collect();
-                let mut gu = vec![0f32; rows * 2 * mi];
+                let mut gu = Scratch::new(rows * 2 * mi);
                 linear_grouped(&ls, &segs, 2 * mi, h, &xs, &mut gu);
                 grouped_lora(&ls, &segs, &count, 2 * mi, h, &xs, &mut gu);
                 for_chunks(&mut a, mi, true, |i, ar| {
@@ -826,7 +831,7 @@ impl<'a> Experts<'a> {
                     .iter()
                     .map(|g| if let GateUp::Split(g, u) = g { (g, u) } else { unreachable!() })
                     .unzip();
-                let mut u = vec![0f32; rows * mi];
+                let mut u = Scratch::new(rows * mi);
                 linear_grouped(&gs, &segs, mi, h, &xs, &mut a);
                 linear_grouped(&us, &segs, mi, h, &xs, &mut u);
                 grouped_lora(&gs, &segs, &count, mi, h, &xs, &mut a);
@@ -842,7 +847,8 @@ impl<'a> Experts<'a> {
             }
         }
         let ds: Vec<&Lin> = self.down.iter().collect();
-        let mut o = vec![0f32; rows * h];
+        drop(xs);
+        let mut o = Scratch::new(rows * h);
         linear_grouped(&ds, &segs, h, mi, &a, &mut o);
         grouped_lora(&ds, &segs, &count, h, mi, &a, &mut o);
         for_chunks(y, h, true, |ti, yr| {

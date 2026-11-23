@@ -1529,12 +1529,18 @@ fn short_conv(taps: &[f32], dynamic: Option<(&[f32], usize)>, hist: &mut ConvRin
     let t = x.len() / ch;
     debug_assert_eq!((hist.ch, hist.back), (ch, k - 1));
     // The `k - 1` inputs before `x`, then `x`.
-    let mut seq = Vec::with_capacity((k - 1 + t) * ch);
-    for p in start as isize - (k - 1) as isize..start as isize {
-        seq.extend_from_slice(hist.row(p));
-    }
-    seq.extend_from_slice(x);
     let back = (k - 1) * ch;
+    let mut seq = Scratch::new(back + t * ch);
+    for (i, p) in (start as isize - (k - 1) as isize..start as isize).enumerate() {
+        seq[i * ch..(i + 1) * ch].copy_from_slice(hist.row(p));
+    }
+    {
+        let x = &*x;
+        for_chunks(&mut seq[back..], ch, t > 4, |ti, row| {
+            row.copy_from_slice(&x[ti * ch..(ti + 1) * ch])
+        });
+    }
+    let seq = &seq[..];
     for_chunks(x, ch, t > 1, |ti, row| {
         // Row `ti` of `x` is row `ti + k - 1` of `seq`.
         for (c, o) in row.iter_mut().enumerate() {
@@ -1576,8 +1582,9 @@ fn mix(states: &[Vec<f32>], x: &[f32], queries: &[f32], h: usize) -> Vec<Vec<f32
     let nq = queries.len() / h;
     let t = x.len() / h;
     let scale = (h as f32).powf(-0.5);
-    let mut out = vec![0f32; t * nq * h];
+    let mut out = scratch(t * nq * h);
     for_chunks(&mut out, nq * h, t > 4, |ti, o| {
+        o.fill(0.0);
         let mut xn = x[ti * h..(ti + 1) * h].to_vec();
         rms_unit(&mut xn, MIX_EPS);
         let mut s = vec![0f32; states.len() + 1];
@@ -1596,13 +1603,17 @@ fn mix(states: &[Vec<f32>], x: &[f32], queries: &[f32], h: usize) -> Vec<Vec<f32
     if nq == 1 {
         return vec![out];
     }
-    (0..nq)
+    let per = (0..nq)
         .map(|q| {
-            (0..t)
-                .flat_map(|ti| out[(ti * nq + q) * h..(ti * nq + q + 1) * h].iter().copied())
-                .collect()
+            let mut v = scratch(t * h);
+            for_chunks(&mut v, h, t > 4, |ti, r| {
+                r.copy_from_slice(&out[(ti * nq + q) * h..(ti * nq + q + 1) * h])
+            });
+            v
         })
-        .collect()
+        .collect();
+    recycle(out);
+    per
 }
 
 impl<'a> Inkling2Model<'a> {
@@ -2108,6 +2119,11 @@ impl<'a> Inkling2Model<'a> {
         let h = c.hidden_size;
         let eps = c.rms_norm_eps as f32;
         let start = sess.pos;
+        // A prompt chunk's temporaries (megabytes each, about forty per layer application) are
+        // taken from and given back to the buffers of the pass: fresh ones are mapped page by
+        // page by the threads that write them first, which on 32 cores cost more than the
+        // kernels (a decode step's are too small to be kept).
+        let _scratch = crate::kernels::ScratchScope::open();
         let mut x = self.embed_rows(tokens, mm);
         let iv = sess.iv.active().then(|| sess.iv.clone());
         let point = |p: usize, x: &mut [f32]| {
@@ -2146,8 +2162,11 @@ impl<'a> Inkling2Model<'a> {
                 } else {
                     // Every pass starts again from the loop's input.
                     let prev = states.split_off(pre.1 + 1);
-                    states.truncate(pre.1);
-                    bank = Some((prev, std::mem::replace(&mut x, pre.0.clone())));
+                    states.drain(pre.1..).for_each(recycle);
+                    if let Some((bs, bx)) = bank.replace((prev, std::mem::replace(&mut x, pre.0.clone()))) {
+                        bs.into_iter().for_each(recycle);
+                        recycle(bx);
+                    }
                 }
             }
             capture(si, &x);
@@ -2158,7 +2177,10 @@ impl<'a> Inkling2Model<'a> {
                 (Some((bs, bx)), Some(li)) if step.pass > 0 => Some((li, mix(bs, bx, &li.query, h))),
                 _ => None,
             };
-            let gated = |i: usize, src: &[f32]| -> Option<Vec<f32>> { msgs.as_ref().map(|(li, m)| self.gate(&li.gates[i], src, &m[i], t)) };
+            let gated = |i: usize, src: &[f32]| -> Option<Scratch> {
+                msgs.as_ref()
+                    .map(|(li, m)| Scratch::from_vec(self.gate(&li.gates[i], src, &m[i], t)))
+            };
             // What the attention reads: the layer's input, or mixes of it with the block states.
             let mixed = layer.attn_query.as_ref().map(|q| mix(&states, &x, q, h));
             let input = |i: usize| -> &[f32] {
@@ -2168,11 +2190,11 @@ impl<'a> Inkling2Model<'a> {
                 }
             };
             let normed = |w: &[f32], src: &[f32]| {
-                let mut y = vec![0f32; t * h];
+                let mut y = Scratch::new(t * h);
                 rmsnorm_f32w_rows(src, h, w, eps, &mut y);
                 y
             };
-            let mut a = vec![0f32; t * h];
+            let mut a = scratch(t * h);
             match (&layer.ln_in, msgs.is_some()) {
                 (InNorm::One(w), false) => {
                     let xn = normed(w, input(0));
@@ -2184,15 +2206,15 @@ impl<'a> Inkling2Model<'a> {
                     self.attention(&layer.attn, [&xq, &xk, &xv], t, start, st, &mut a);
                 }
                 (InNorm::Qkv(wq, wk, wv), m) => {
-                    let src = |i: usize| match m {
-                        true => std::borrow::Cow::Owned(gated(i, input(i)).unwrap()),
-                        false => std::borrow::Cow::Borrowed(input(i)),
+                    let src = |i: usize, w: &[f32]| match m {
+                        true => normed(w, &gated(i, input(i)).unwrap()),
+                        false => normed(w, input(i)),
                     };
-                    let (xq, xk, xv) = (normed(wq, &src(0)), normed(wk, &src(1)), normed(wv, &src(2)));
+                    let (xq, xk, xv) = (src(0, wq), src(1, wk), src(2, wv));
                     self.attention(&layer.attn, [&xq, &xk, &xv], t, start, st, &mut a);
                 }
             }
-            drop(mixed);
+            mixed.into_iter().flatten().for_each(recycle);
             short_conv(&layer.attn_conv, None, &mut st.hist[2], &mut a, h, conv_norm, start);
             // The stream inside the block: a block's first layer starts it from its attention.
             if layer.boundary {
@@ -2200,14 +2222,16 @@ impl<'a> Inkling2Model<'a> {
                 states.push(std::mem::replace(&mut x, a));
             } else {
                 add_inplace(&mut x, &a);
+                recycle(a);
             }
             point(2 * si + 1, &mut x);
-            let mut hn = mix(&states, &x, &layer.mlp_query, h).pop().unwrap();
+            let mut hn = Scratch::from_vec(mix(&states, &x, &layer.mlp_query, h).pop().unwrap());
             if let Some(g) = gated(3, &hn) {
                 hn = g;
             }
             rmsnorm_f32w_rows_inplace(&mut hn, h, &layer.ln_post, eps);
-            let mut o = vec![0f32; t * h];
+            // (The experts add to it.)
+            let mut o = Scratch::zeroed(t * h);
             let hook = iv.as_ref().and_then(|s| s.hook(si, start));
             {
                 let need = |ids: &[usize]| {
@@ -2221,6 +2245,10 @@ impl<'a> Inkling2Model<'a> {
             short_conv(&layer.mlp_conv, None, &mut st.hist[3], &mut o, h, conv_norm, start);
             add_inplace(&mut x, &o);
             point(2 * si + 2, &mut x);
+            drop((hn, o));
+            if let Some((_, m)) = msgs {
+                m.into_iter().for_each(recycle);
+            }
         }
         capture(steps.len(), &x);
         let mut out = mix(&states, &x, &self.final_query, h).pop().unwrap();
@@ -2228,6 +2256,12 @@ impl<'a> Inkling2Model<'a> {
         // (One more index: the final-normed output, what Inkling-2's drafter reads last.)
         capture(steps.len() + 1, &out);
         sess.pos += t;
+        states.into_iter().for_each(recycle);
+        if let Some((bs, bx)) = bank {
+            bs.into_iter().for_each(recycle);
+            recycle(bx);
+        }
+        recycle(x);
         out
     }
 
@@ -2237,7 +2271,7 @@ impl<'a> Inkling2Model<'a> {
         let h = self.cfg.hidden_size;
         let r = self.cfg.loop_cfg.map_or(0, |c| c.gate_rank);
         let eps = self.cfg.rms_norm_eps as f32;
-        let mut cat = vec![0f32; t * 2 * h];
+        let mut cat = Scratch::new(t * 2 * h);
         for_chunks(&mut cat, 2 * h, t > 4, |ti, row| {
             row[..h].copy_from_slice(&x[ti * h..(ti + 1) * h]);
             row[h..].copy_from_slice(&m[ti * h..(ti + 1) * h]);
@@ -2246,9 +2280,9 @@ impl<'a> Inkling2Model<'a> {
         });
         let mut d = vec![0f32; t * r];
         linear(&g.down, r, 2 * h, &cat, t, &mut d);
-        let (mut f, mut gn) = (vec![0f32; t * h], vec![0f32; t * h]);
+        let (mut f, mut gn) = (Scratch::new(t * h), Scratch::new(t * h));
         linear_multi(&mut [(&g.forget, h, &mut f[..]), (&g.gain, h, &mut gn[..])], r, &d, t);
-        let mut out = vec![0f32; t * h];
+        let mut out = scratch(t * h);
         for_chunks(&mut out, h, t > 4, |ti, o| {
             let at = ti * h;
             for (j, o) in o.iter_mut().enumerate() {
@@ -2289,12 +2323,13 @@ impl<'a> Inkling2Model<'a> {
         } = a.hd;
         let (w, kw) = (nh * d, nkv * d);
         let [xq, xk, xv] = xs;
-        let mut q = vec![0f32; t * w];
-        let mut r = vec![0f32; t * nh * dr];
-        let mut gate = vec![0f32; t * w];
-        let mut sink = vec![0f32; t * nh];
-        let mut k = vec![0f32; t * kw];
-        let mut v = vec![0f32; t * kw];
+        // (Each written whole by its projection.)
+        let mut q = Scratch::new(t * w);
+        let mut r = Scratch::new(t * nh * dr);
+        let mut gate = Scratch::new(t * w);
+        let mut sink = Scratch::new(t * nh);
+        let mut k = Scratch::new(t * kw);
+        let mut v = Scratch::new(t * kw);
         let dynamic = matches!(a.k_conv, KvConv::Dynamic { .. });
         let mut kd = vec![0f32; if dynamic { t * nkv * kn } else { 0 }];
         let mut vd = vec![0f32; if dynamic { t * nkv * kn } else { 0 }];
@@ -2378,7 +2413,7 @@ impl<'a> Inkling2Model<'a> {
 
         let first = st.first;
         let (ck, cv) = (&st.k, &st.v);
-        let mut att = vec![0f32; t * w];
+        let mut att = Scratch::zeroed(t * w);
         // Prefill chunks: key blocks through the GEMM micro-kernel (`OXINFER_INKLING_ATTN=loop`
         // keeps the per-query loop below).
         #[cfg(has_simd)]
@@ -2403,7 +2438,7 @@ impl<'a> Inkling2Model<'a> {
                 st.first = keep;
             }
         }
-        for (x, &g) in att.iter_mut().zip(&gate) {
+        for (x, &g) in att.iter_mut().zip(gate.iter()) {
             *x *= sigmoid(g);
         }
         drop(_timer);

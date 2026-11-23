@@ -4,7 +4,7 @@
 //! runs.
 //!
 //! ```text
-//! inkling2_bench MODEL [-p 512,2048] [-n 128] [-r 3] [--kv f32|f16|q8] [--cpu] [--chunk N] [-v 2,4,8]
+//! inkling2_bench MODEL [-p 512,2048] [-n 128] [-r 3] [--kv f32|f16|q8] [--cpu] [--threads N] [--chunk N] [-v 2,4,8]
 //! ```
 
 use anyhow::{Context, Result};
@@ -18,7 +18,7 @@ fn median(mut v: Vec<f64>) -> f64 {
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: inkling2_bench MODEL [-p 512,2048] [-n 128] [-r 3] [--kv f32|f16|q8] [--cpu] [--chunk N] [-v 2,4,8]";
+    let usage = "usage: inkling2_bench MODEL [-p 512,2048] [-n 128] [-r 3] [--kv f32|f16|q8] [--cpu] [--threads N] [--chunk N] [-v 2,4,8]";
     let model = args.next().context(usage)?;
     let mut verify: Vec<usize> = Vec::new();
     let (mut pp, mut tg, mut reps, mut kv, mut cpu, mut chunk) = (vec![512usize], 128usize, 3usize, KvCache::F32, false, 2048usize);
@@ -38,6 +38,7 @@ fn main() -> Result<()> {
             "--kv" => kv = KvCache::parse(&args.next().context("--kv MODE")?)?,
             "--chunk" => chunk = args.next().context("--chunk N")?.parse::<usize>()?.max(1),
             "--cpu" => cpu = true,
+            "--threads" => oxinfer::pool::configure(args.next().context("--threads N")?.parse::<usize>()?.max(1)),
             "-v" => {
                 verify = args
                     .next()
@@ -67,11 +68,16 @@ fn main() -> Result<()> {
         seed ^= seed << 17;
         (seed % 199_000) as u32 + 100
     };
+    // (`INKLING2_BENCH_PROF`: the per-category time of the timed runs, as `--profile` prints it.)
+    let prof = std::env::var_os("INKLING2_BENCH_PROF").is_some();
     for &n in &pp {
         let mut times = Vec::new();
         for rep in 0..=reps {
             let ids: Vec<u32> = (0..n).map(|_| rnd()).collect();
             let mut sess = m.new_session();
+            if rep == 1 {
+                oxinfer::prof::reset();
+            }
             let t0 = std::time::Instant::now();
             for c in ids.chunks(chunk) {
                 m.forward_hidden(&mut sess, c);
@@ -79,6 +85,9 @@ fn main() -> Result<()> {
             if rep > 0 {
                 times.push(t0.elapsed().as_secs_f64());
             }
+        }
+        if prof {
+            oxinfer::prof::report(times.iter().sum(), n * reps);
         }
         let t = median(times);
         println!("pp{n}: {:.1} tok/s ({:.3} s)", n as f64 / t, t);
@@ -94,6 +103,9 @@ fn main() -> Result<()> {
             let mut sess = m.new_session();
             let mut tok = am(&m.forward(&mut sess, &[rnd()]));
             (digest, toks) = (0, Vec::new());
+            if rep == 1 {
+                oxinfer::prof::reset();
+            }
             let t0 = std::time::Instant::now();
             for _ in 0..if rep == 0 { 8 } else { tg } {
                 let l = m.forward(&mut sess, &[tok]);
@@ -104,6 +116,9 @@ fn main() -> Result<()> {
             if rep > 0 {
                 times.push(t0.elapsed().as_secs_f64());
             }
+        }
+        if prof {
+            oxinfer::prof::report(times.iter().sum(), tg * reps);
         }
         let t = median(times);
         println!("tg{tg}: {:.1} tok/s ({:.2} ms/token)", tg as f64 / t, t * 1e3 / tg as f64);
