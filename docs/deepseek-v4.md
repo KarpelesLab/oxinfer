@@ -626,9 +626,163 @@ Tried and not kept:
   (2304 x 5120: 14.9 -> 15.9 us).
 - Four expert rows a threadgroup (each chunk of x loaded once for four rows): 6.2 ms against 6.0.
 
-Not done: a multi-token GPU pass (prompt-lookup verification runs on the CPU path, whose
-measured cost the cost-aware lookup policy weighs against the GPU's 21 ms step), chaining greedy
-steps on the device (`TextLm::decode_greedy`), faster IQ2_XXS / IQ2_S expert kernels.
+Not done here (the round below did it): a multi-token GPU pass (prompt-lookup verification ran on
+the CPU path), chaining greedy steps on the device (`TextLm::decode_greedy`), faster IQ2_XXS /
+IQ2_S expert kernels.
+
+#### Decode on the GPU, round 2: chained greedy passes, verification passes, expert kernels
+
+Same setup: master before this round (`4bb69f8`) against this round's binary, interleaved under
+the bench lock, each binary run twice in a row so that the second run starts warm for it (each
+process's part cache leaves the page cache a little colder for the other binary), load 4-10
+from other jobs; the lighthouse prompt (128 greedy tokens, no lookup) and a code prompt (add a
+docstring to each function of a 40-line Python module and reply with the whole module: 256
+tokens, mostly copied, so prompt lookup drafts most of it).
+
+| | before (`4bb69f8`) | now |
+|---|---|---|
+| decode warm, lighthouse, no lookup, tok/s (second runs) | 40.8 / 42.2 / 42.6 | 46.0 / 47.0 / 47.5 |
+| the same, earlier runs at load 4-5 | 41.7 / 43.3 | 49.7-50.2 (4 runs of this code, the dropped fusion below switched off) |
+| decode warm, code prompt, prompt lookup on (the default), tok/s | 36.0 / 30.9 (CPU verification, 1.18 tokens a pass) | 47.2 / 53.5 (GPU verification, 1.7-1.9 tokens a pass) |
+| decode warm, code prompt, `--no-lookup`, tok/s | | 43.3 / 42.3 |
+| decode cold (`--cold-start`, 24.3 GB read), tok/s | 14.5 | 14.4 |
+| GPU time of a warm step (`OXINFER_DS41_PROFILE=1`, same run conditions) | 20.9 ms | 19.6 ms |
+
+The same text in every run, with and without lookup and chaining (the verification passes give
+the one-token logits bit for bit, see below).
+
+Where a warm one-token step's GPU time goes now (ms; the profiled pair above, a loaded GPU: the
+round above measured 18.8 ms for the same stages on a quieter one):
+
+| stage | before | now |
+|---|---|---|
+| routed experts | 6.65 | 5.01 |
+| attention output projection | 3.98 | 4.11 |
+| router, shared expert, mixing weights | 2.93 | 2.98 |
+| `wq_b` | 2.72 | 2.84 |
+| attention | 1.16 | 1.19 |
+| hyper-connection dot products + collapse | 0.98 | 0.90 |
+| attention input projections | 0.84 | 0.86 |
+| LM head (+ the greedy argmax now) | 0.74 | 0.75 |
+| engram | 0.38 | 0.38 |
+| hyper-connection post | 0.36 | 0.37 |
+| norms, compressors, indexers, embedding | 0.19 | 0.21 |
+
+On a quiet GPU the experts stage went 6.0 -> 3.7-3.9 ms (profiles of the same binaries at load
+4-5: before 17.1 ms a step, now 15.4-16.1).
+
+Correctness: the six greedy checks (`deepseek4_check --greedy`, the GPU one-token step path) give
+llama.cpp's tokens at every step for five prompts (165 of 165; mean KL 0.0004-0.0033); the
+thinking prompt departs at step 13, at the same near tie as before. Against the CPU path, mean
+KL 0.0002-0.0040 per prompt; against the round above's GPU dumps, every step's top token the
+same, mean KL 0.0000 (largest top-5 log-probability change 0.048: the new expert kernels sum in
+another order). Perplexity (prefill, unchanged) 2.9766. `decode_mvk_matches_single_token`
+passes (it now covers the clamped SwiGLU pair).
+
+##### Greedy passes chained on the device
+
+Greedy decoding (the CLI's default, and the passes between prompt-lookup drafts) no longer goes
+through the host between tokens (`TextLm::decode_greedy`, as Inkling-2 does): a pass ends with
+the argmax of its logits on the device (two kernels, `sampler::argmax`'s rule: the first index
+of the largest value, NaN never), and the next pass's first kernel reads its input row from
+the embedding table at that token. The table (Q5_K, 455 MB) is wrapped for the device; every
+GPU step now embeds on the device (the host writes the token id), so a chained pass and a plain
+step compute the same bits.
+
+The host still has two things to do between tokens: the engram rows (48 rows of the 110 GB
+table, which only the host can read) and its copy of the caches. So each pass is queued in two
+parts: its layers before the first engram layer (layer 0 here) are committed while the pass
+before runs; the rest is encoded too, but committed only once the host has the token (read from
+shared memory when the pass before completes) and has written the engram rows. The host then
+updates its session and calls the caller's callback while the GPU works. Measured from the
+token read to the release of the next pass: 0.15-0.18 ms (median over a run), less than layer
+0's GPU time, so the GPU does not wait. Activation buffers have a row per pass slot (two slots
+alternate), so a pass's first layers never overwrite the pass before.
+
+Expert misses are handled as a step handles them: the queued first layers of the next pass ran
+on the token of a pass that missed experts, so they are dropped; the pass runs again from the
+first layer that missed, and while experts keep missing, passes run one at a time (in chunks of
+layers, as before). A stop (end of the reply, the caller cancels) drops the next pass's queued
+layers: they wrote rows of a position past the session's (`State::dev_pos` counts them; the next
+sync puts back what they overwrote, which is nothing for the window keys: see the ring below).
+
+Measured (same binary, `OXINFER_DS41_CHAIN=0` for the plain loop, 4 interleaved pairs at load
+7-9): 44.3-45.6 tok/s chained against 41.1-43.2 one step at a time. Before, a step took 0.3 ms
+of host time between GPU passes (step wall time minus GPU time) and the GPU idled meanwhile.
+
+##### Verification passes on the GPU
+
+Prompt lookup's verification (`dspark::Target::forward_verify`) runs on the GPU for passes of up
+to 16 tokens (the drafts plus one), and gives each token the logits of a one-token step bit for
+bit:
+
+- Matvecs run on the decode library's exact multi-token kernels (`mvk_*`: the weights decoded
+  once, each token's dot product the one-token kernel's arithmetic), of the one-token kernel's
+  split. The shared expert's clamped SwiGLU pair was not among their modes: added
+  (`MvMode::SiluClampPair` in `mvk_out`, and in `decode_mvk_matches_single_token`).
+- Everything else runs token by token on the one-token kernels (mixing weights, norms, the
+  compressors, the indexer's scores and top-512 per token, candidate blocks and masks per token,
+  attention, routing, the routed experts), dispatched together between the same barriers.
+- A token's key must not overwrite a window row that an earlier token of the pass still reads:
+  the device's window ring has 128 + 16 rows, and the pooling rows of a rate-2 key source 32
+  slots (a group's rows never overwritten by the later tokens of a pass). A rollback of up to 16
+  positions leaves every window row the next step reads in place, so lookup's truncation after a
+  verification costs nothing on the device.
+- Unit tests: a pass of 2, 5, 11 and 16 tokens (from positions where groups pool across the pass
+  and the indexer chooses) gives the logits of one-token steps bit for bit, and so do steps
+  after a rollback into the pass (`gpu_pass_matches_steps`); a pass run again from any layer and
+  a pass in chunks of layers give the bits of a whole pass (`gpu_rerun_and_chunks_are_exact`).
+  On the real model, lookup on and off give the same text.
+
+GPU time of a warm pass (code prompt, profiled): 1 token 16.2 ms, 2 tokens 25.3, 4 tokens 36.8,
+8 tokens 85.2, 11 tokens 76.6 (`--lookup-fixed`). The routed experts cost each token its own
+(3.4-3.8 ms a token: tokens do not share expert reads), and the multi-token matvecs read the
+weights once but cost compute per token (`decode_mvk_bench` at these shapes, against one
+one-token matvec: Q5_K 2 tokens 1.05-1.5x, 4 tokens 1.8-2.4x, 8 tokens 4.1-6x; the 8-token
+class's two-row kernel is the slow one for Q5_K here, slower than the 16-token kernels'
+sweeps). With the cost-aware lookup policy measuring these costs, the code prompt decodes at
+47-54 tok/s with lookup against 42-43 without (1.7-1.9 tokens a pass, 85-95% of the drafts
+accepted); text that gives lookup nothing to draft is not affected.
+
+##### Expert kernels
+
+The routed experts of V4.1 run on kernels of their own (`mvxd_<fmt>_pair` / `_sum`,
+`MetalBackend::expert_pipe`; the generic MoE kernels are unchanged):
+
+- IQ1_S / IQ1_M: the ternary grid as halves (a 2048-entry table, 16 bytes an entry), which the
+  multiply-adds take without a conversion instruction (the kernels were bound by instructions,
+  not memory); x's sums of 8 for the deltas formed at the x load, once for the rows sharing it;
+  two rows of gate and up a SIMD-group.
+- IQ2_XXS / IQ2_S: blocks read as 16-bit words, the signs applied to the magnitude bytes, instead
+  of the GEMM dequantizer's loader.
+- Sums: two rows a SIMD-group, the lanes over the (slot, chunk) tasks of all six slots (2304
+  values are 72 chunks: a slot at a time left 24 of 32 lanes idle a third of the time).
+
+`decode_experts_bench` (43 layers of 6 experts from memory, 2304 x 5120 pairs / 5120 x 2304
+sums), GB/s before -> after: IQ1_S 344 -> 473 / 204 -> 324, IQ1_M 354 -> 435 / 219 -> 347,
+IQ2_XXS 368 -> 401 / 239 -> 335, IQ2_S 469 -> 483 / 295 -> 401; weighted by the model's formats,
+6.2 -> 4.5 ms of experts a token. The one-token IQ1_S / IQ1_M dots of the dense matvecs and
+their sums shared with the multi-token kernels are unchanged.
+
+Tried and not kept:
+
+- A block's hyper-connection post computed by the mixing kernels after it (the dot products and
+  the collapse forming the residual copies as they read them, the post stage and its barrier
+  gone: 80 stages fewer a token): 48.2-48.7 tok/s against 49.7-50.2 without (4 pairs, same
+  binary). The mixing stage went 0.73 + 0.28 ms (mixing + post) to 1.45 ms: each of the 25
+  threadgroups of a split forms the same copies again.
+- Expert kernels: several SIMD-groups a threadgroup, one row each (no gain); two rows sharing x
+  without the half grids (noise); the sum split across SIMD-groups with a threadgroup reduction
+  (40.6-41 against 42.8 us); x's sums precomputed with the grid kept as signed bytes (no gain:
+  the conversion was the cost); IQ1_S's delta folded into a doubled 64 KB table (63 against 58
+  us); 3 or 4 rows a SIMD-group (worse); half grids and sign masks for IQ2 (slower); two pair
+  rows a SIMD-group for IQ2 (108 against 91 us).
+
+Not done: tokens of a verification pass sharing an expert's reads (each token reads its six
+experts, the largest share of a verification pass); a faster 8-token class of the multi-token
+Q5_K matvecs at these shapes; the cold path (14.4 tok/s, as before: prefetching the router's
+likely experts a layer ahead was not attempted); fewer barriers (the only fusion tried lost, see
+above).
 
 Not done for V4.1: image input (the ViT with 2D RoPE, the 3x3 aligner and the
 image processor; `mmproj` files are not read; the language model's side is in place and
