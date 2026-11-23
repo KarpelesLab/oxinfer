@@ -1237,6 +1237,13 @@ impl ModelFiles {
         })())
     }
 
+    /// How many tensors [`ModelFiles::ggml_cpu`] interleaved, and their bytes.
+    pub fn interleaved(&self) -> (usize, u64) {
+        let done = self.interleaved.lock().unwrap();
+        let bytes = done.iter().filter_map(|n| self.info(n)).map(|t| (t.end - t.start) as u64).sum();
+        (done.len(), bytes)
+    }
+
     /// Gives the memory of tensor `name` back to the system, when its shard was read into memory
     /// and the loader made its own copy of it (a layout the kernels read, such as the NVFP4
     /// experts repacked into ggml blocks): without this the file's bytes would stay beside the

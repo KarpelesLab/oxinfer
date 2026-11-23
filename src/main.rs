@@ -2444,6 +2444,7 @@ fn run_qwen(mut args: Args) -> Result<()> {
         pool::threads(),
         t0.elapsed().as_secs_f64()
     );
+    note_interleaved(&files);
     // The MTP layer where it is the default (`qwen_mtp::BY_DEFAULT`), unless --no-draft, a draft,
     // or a mode plain decoding serves.
     if !args.mtp
@@ -3846,6 +3847,17 @@ fn device_memory(args: &Args) -> oxinfer::stream::DeviceMemory {
 /// page-cache budget (see `stream::DeviceMemory`), unless told how to load it.
 /// Whether the active GPU backend has checkpoints mapped instead of read into memory
 /// (`Backend::prefers_mapped_weights`: a CUDA device that shares the system's memory).
+/// Notes the matrices the loader interleaved for the CPU decode kernels (`--cpu-repack`).
+fn note_interleaved(files: &safetensors::ModelFiles) {
+    let (n, bytes) = files.interleaved();
+    if n > 0 {
+        eprintln!(
+            "[{n} matrices ({:.2} GB) interleaved for the CPU decode kernels]",
+            bytes as f64 / 1e9
+        );
+    }
+}
+
 fn gpu_maps_weights() -> bool {
     oxinfer::gpu::active().is_some_and(|b| b.prefers_mapped_weights())
 }
@@ -3916,6 +3928,7 @@ fn run_gemma_loaded(args: &Args, model: &Model, files: &safetensors::ModelFiles,
         pool::threads(),
         t0.elapsed().as_secs_f64()
     );
+    note_interleaved(files);
     if let Some(out) = &args.save_quantized {
         return save_quantized(&args.model, out, files, model.quant);
     }

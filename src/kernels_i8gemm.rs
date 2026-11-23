@@ -84,6 +84,10 @@ impl Tile {
         let n_in = m.n_in();
         let nb = n_in / QBLOCK;
         self.fit(n_in);
+        // A matrix stored four rows at a time fills it directly (the same values).
+        if m.fill_tile4(r, self.q.as_mut_ptr(), self.ds.as_mut_ptr()) {
+            return;
+        }
         for (i, u) in rows.iter_mut().enumerate() {
             u.fit(n_in);
             if r + i < m.n_out() {

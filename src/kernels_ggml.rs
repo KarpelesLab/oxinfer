@@ -988,8 +988,185 @@ unsafe fn x4_kern<const TC: usize, const K: u8>(g: *const u8, n_in: usize, x: &A
 /// The `x4_kern` tag of Q8_0.
 const Q8: u8 = 255;
 
-/// [`x4_kern`] for any TC (1..=8) in kernels of at most two tokens (more would keep too many
-/// accumulators for the registers; the group's weights stay in L1 between them).
+/// The `x4_group` tag of Q4_K.
+const Q4K: u8 = 254;
+
+/// Q4_K interleaved four rows at a time ([`super::repack`]: per super-block the four `d`, the
+/// four `dmin`, then the 12 scale bytes and the 128 value bytes of each row in 4-byte pieces):
+/// `q4k`'s operations for each row in its order, lane `i` of each result row `i`. `q4k`'s lane
+/// `l` (sub-blocks `l` and `l + 4` of every super-block) is accumulator `l` here; the scales of
+/// the four rows are unpacked together, to the same values (small integers, then the same f32
+/// products), one vector per sub-block.
+#[inline(always)]
+unsafe fn q4k_x4<const TC: usize>(g: *const u8, n_in: usize, x: &Act) -> [float32x4_t; TC] {
+    let bpr = n_in / 32;
+    let zero = vdupq_n_s32(0);
+    let m4 = vdupq_n_u8(0x0F);
+    let mut acc = [[vdupq_n_f32(0.0); 4]; TC];
+    for sb in 0..n_in / QK_K {
+        let b = g.add(sb * 576);
+        let (d, dmin) = (f16x4_to_f32(b as *const u16), f16x4_to_f32(b.add(8) as *const u16));
+        // The scales and mins (`get_scale_min_k4`, as `q4k` unpacks them) of the four rows at
+        // once: word `w` of the twelve bytes of row `i` is lane `i` of `u[w]`.
+        let km1 = vdupq_n_u32(0x3f3f_3f3f);
+        let (km2, km3) = (vdupq_n_u32(0x0f0f_0f0f), vdupq_n_u32(0x0303_0303));
+        let u = [
+            vld1q_u32(b.add(16) as *const u32),
+            vld1q_u32(b.add(32) as *const u32),
+            vld1q_u32(b.add(48) as *const u32),
+        ];
+        let hi6 = |a: uint32x4_t, c: uint32x4_t| vorrq_u32(a, vshlq_n_u32::<4>(vandq_u32(vshrq_n_u32::<6>(c), km3)));
+        // Each: lane `i` holds row `i`'s four bytes (sub-blocks 0..4, or 4..8).
+        let raw = [
+            vandq_u32(u[0], km1),
+            hi6(vandq_u32(u[2], km2), u[0]),
+            vandq_u32(u[1], km1),
+            hi6(vandq_u32(vshrq_n_u32::<4>(u[2]), km2), u[1]),
+        ];
+        // Sub-block `k` of the four rows: bytes `k`, `4 + k`, `8 + k`, `12 + k` as f32 lanes.
+        const BY_K: [u8; 16] = [0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
+        let idx = vld1q_u8(BY_K.as_ptr());
+        let by_k = |v: uint32x4_t| -> [float32x4_t; 4] {
+            let t = vqtbl1q_u8(vreinterpretq_u8_u32(v), idx);
+            let (a, c) = u8x8_to_f32(vget_low_u8(t));
+            let (e, f) = u8x8_to_f32(vget_high_u8(t));
+            [a, c, e, f]
+        };
+        let (s_lo, s_hi, n_lo, n_hi) = (by_k(raw[0]), by_k(raw[1]), by_k(raw[2]), by_k(raw[3]));
+        let ds_lo = s_lo.map(|s| vmulq_f32(s, d));
+        let ds_hi = s_hi.map(|s| vmulq_f32(s, d));
+        let dm = |n: float32x4_t, ds: float32x4_t| vsubq_f32(vmulq_f32(n, dmin), vmulq_n_f32(ds, 8.0));
+        let dm_lo: [float32x4_t; 4] = std::array::from_fn(|k| dm(n_lo[k], ds_lo[k]));
+        let dm_hi: [float32x4_t; 4] = std::array::from_fn(|k| dm(n_hi[k], ds_hi[k]));
+        let mut isum = [[zero; 8]; TC];
+        let qs = b.add(64);
+        for j in 0..4 {
+            // Chunk `j`'s pieces: low nibbles are sub-block `2j`, high ones `2j + 1`.
+            let mut lo = [vdupq_n_s8(0); 8];
+            let mut hi = [vdupq_n_s8(0); 8];
+            for p in 0..8 {
+                let v = vld1q_u8(qs.add(16 * (8 * j + p)));
+                lo[p] = vreinterpretq_s8_u8(vandq_u8(v, m4));
+                hi[p] = vreinterpretq_s8_u8(vshrq_n_u8::<4>(v));
+            }
+            for c in 0..TC {
+                let xq = x.q.add(c * n_in + sb * QK_K + 64 * j);
+                let dot = |w: &[int8x16_t; 8], xq: *const i8| -> int32x4_t {
+                    let (a0, a1) = (vld1q_s8(xq), vld1q_s8(xq.add(16)));
+                    let s0 = sdot_lane::<3>(
+                        sdot_lane::<2>(sdot_lane::<1>(sdot_lane::<0>(zero, w[0], a0), w[1], a0), w[2], a0),
+                        w[3],
+                        a0,
+                    );
+                    let s1 = sdot_lane::<3>(
+                        sdot_lane::<2>(sdot_lane::<1>(sdot_lane::<0>(zero, w[4], a1), w[5], a1), w[6], a1),
+                        w[7],
+                        a1,
+                    );
+                    vaddq_s32(s0, s1)
+                };
+                isum[c][2 * j] = dot(&lo, xq);
+                isum[c][2 * j + 1] = dot(&hi, xq.add(32));
+            }
+        }
+        for c in 0..TC {
+            let xs = x.s.add(c * bpr + sb * 8);
+            let xf = x.f.add(c * bpr + sb * 8);
+            let xi = x.i.add(c * bpr + sb * 8);
+            let s = |k: usize| vcvtq_f32_s32(vsubq_s32(isum[c][k], vdupq_n_s32(*xi.add(k) << 3)));
+            for l in 0..4 {
+                let mut v = vfmaq_f32(acc[c][l], s(l), vmulq_n_f32(ds_lo[l], *xs.add(l)));
+                v = vfmaq_f32(v, s(l + 4), vmulq_n_f32(ds_hi[l], *xs.add(l + 4)));
+                v = vfmsq_f32(v, dm_lo[l], vdupq_n_f32(*xf.add(l)));
+                acc[c][l] = vfmsq_f32(v, dm_hi[l], vdupq_n_f32(*xf.add(l + 4)));
+            }
+        }
+    }
+    let mut out = [vdupq_n_f32(0.0); TC];
+    for c in 0..TC {
+        out[c] = vaddq_f32(vaddq_f32(acc[c][0], acc[c][1]), vaddq_f32(acc[c][2], acc[c][3]));
+    }
+    out
+}
+
+/// The `x4_group` tag of Q6_K.
+const Q6KX: u8 = 253;
+
+/// Q6_K interleaved four rows at a time ([`super::repack`]: per super-block the four `d`, the
+/// int8 scales by sub-block (the four rows' scale of sub-block `k` at `4k`), then `ql` and `qh`
+/// in 4-byte pieces): `sb16::<_, Q6K>`'s operations for each row in its order, lane `i` of each
+/// result row `i` (its lane `l`, blocks of 32 `l` and `l + 4`, is accumulator `l` here). Each
+/// sub-block of 16's integer sum times its scale, added in pairs, is the same integer as there.
+#[inline(always)]
+unsafe fn q6k_x4<const TC: usize>(g: *const u8, n_in: usize, x: &Act) -> [float32x4_t; TC] {
+    let bpr = n_in / 32;
+    let zero = vdupq_n_s32(0);
+    let (m4, m30, b32) = (vdupq_n_u8(0x0F), vdupq_n_u8(0x30), vdupq_n_s8(32));
+    let mut acc = [[vdupq_n_f32(0.0); 4]; TC];
+    for sb in 0..n_in / QK_K {
+        let b = g.add(sb * 840);
+        let dv = f16x4_to_f32(b as *const u16);
+        let (ql, qh) = (b.add(72), b.add(584));
+        // Sums of the sub-blocks of 16, one lane per row.
+        let mut s16 = [[zero; 16]; TC];
+        for n in 0..2 {
+            for s in 0..4 {
+                // Segment `s` of half `n`: `ql` bytes `64n + 16s..`, with `qh` bytes
+                // `32n + 16 (s % 2)..`; its low nibbles are sub-block `8n + s`, its high ones
+                // `8n + s + 4` (`Q6K::unpack`'s `q[s]` and `q[s + 4]`).
+                let mut lo = [vdupq_n_s8(0); 4];
+                let mut hi = [vdupq_n_s8(0); 4];
+                for t in 0..4 {
+                    let l = vld1q_u8(ql.add(16 * (16 * n + 4 * s + t)));
+                    let h = vld1q_u8(qh.add(16 * (8 * n + 4 * (s % 2) + t)));
+                    let (hl, hh) = if s < 2 {
+                        (vandq_u8(vshlq_n_u8::<4>(h), m30), vandq_u8(h, m30))
+                    } else {
+                        (vandq_u8(vshlq_n_u8::<2>(h), m30), vandq_u8(vshrq_n_u8::<2>(h), m30))
+                    };
+                    lo[t] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(l, m4), hl)), b32);
+                    hi[t] = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(l), hh)), b32);
+                }
+                let (k0, k1) = (8 * n + s, 8 * n + s + 4);
+                for c in 0..TC {
+                    let xq = x.q.add(c * n_in + sb * QK_K);
+                    let dot = |w: &[int8x16_t; 4], a: int8x16_t| {
+                        sdot_lane::<3>(
+                            sdot_lane::<2>(sdot_lane::<1>(sdot_lane::<0>(zero, w[0], a), w[1], a), w[2], a),
+                            w[3],
+                            a,
+                        )
+                    };
+                    s16[c][k0] = dot(&lo, vld1q_s8(xq.add(16 * k0)));
+                    s16[c][k1] = dot(&hi, vld1q_s8(xq.add(16 * k1)));
+                }
+            }
+        }
+        // The scales, sub-block `k`'s four rows as int32 lanes.
+        let mut sc = [zero; 16];
+        for q in 0..4 {
+            let v = s8x16_to_s32(vld1q_s8(b.add(8 + 16 * q) as *const i8));
+            sc[4 * q..4 * q + 4].copy_from_slice(&v);
+        }
+        for c in 0..TC {
+            let xs = x.s.add(c * bpr + sb * 8);
+            let blk = |j: usize| vcvtq_f32_s32(vmlaq_s32(vmulq_s32(s16[c][2 * j], sc[2 * j]), s16[c][2 * j + 1], sc[2 * j + 1]));
+            for l in 0..4 {
+                let v = vfmaq_f32(acc[c][l], blk(l), vmulq_n_f32(dv, *xs.add(l)));
+                acc[c][l] = vfmaq_f32(v, blk(l + 4), vmulq_n_f32(dv, *xs.add(l + 4)));
+            }
+        }
+    }
+    let mut out = [vdupq_n_f32(0.0); TC];
+    for c in 0..TC {
+        out[c] = vaddq_f32(vaddq_f32(acc[c][0], acc[c][1]), vaddq_f32(acc[c][2], acc[c][3]));
+    }
+    out
+}
+
+/// [`x4_kern`] or [`q4k_x4`] (`K == Q4K`) for any TC (1..=8) in kernels of at most two tokens
+/// (more would keep too many accumulators for the registers; the group's weights stay in L1
+/// between them).
 #[inline(always)]
 unsafe fn x4_group<const TC: usize, const K: u8>(g: *const u8, n_in: usize, x: &Act) -> [float32x4_t; TC] {
     let mut out = [vdupq_n_f32(0.0); TC];
@@ -997,12 +1174,24 @@ unsafe fn x4_group<const TC: usize, const K: u8>(g: *const u8, n_in: usize, x: &
     while c < TC {
         let xc = act_at(x, c);
         if TC - c >= 2 {
-            let o = x4_kern::<2, K>(g, n_in, &xc);
+            let o = if K == Q4K {
+                q4k_x4::<2>(g, n_in, &xc)
+            } else if K == Q6KX {
+                q6k_x4::<2>(g, n_in, &xc)
+            } else {
+                x4_kern::<2, K>(g, n_in, &xc)
+            };
             out[c] = o[0];
             out[c + 1] = o[1];
             c += 2;
         } else {
-            out[c] = x4_kern::<1, K>(g, n_in, &xc)[0];
+            out[c] = if K == Q4K {
+                q4k_x4::<1>(g, n_in, &xc)[0]
+            } else if K == Q6KX {
+                q6k_x4::<1>(g, n_in, &xc)[0]
+            } else {
+                x4_kern::<1, K>(g, n_in, &xc)[0]
+            };
             c += 1;
         }
     }
@@ -1018,6 +1207,8 @@ unsafe fn rows_x4<const TC: usize>(m: &GgufMatrix, x: &Act, y: *mut f32, ys: usi
     let f = match m.kind {
         GgmlType::Q8_0 => x4_group::<TC, Q8>,
         GgmlType::Q4_0 => x4_group::<TC, Q4_0>,
+        GgmlType::Q4_K => x4_group::<TC, Q4K>,
+        GgmlType::Q6_K => x4_group::<TC, Q6KX>,
         k => unreachable!("no interleaved kernel for {k}"),
     };
     let mut g = r0 / 4;
@@ -1043,16 +1234,52 @@ unsafe fn rows_x4<const TC: usize>(m: &GgufMatrix, x: &Act, y: *mut f32, ys: usi
     }
 }
 
+/// Rows `r..r + 4` (one group) of an interleaved Q8_0 or Q4_0 matrix straight into the int8
+/// GEMM's four-row tile (`QMat::fill_tile4`): the tile's layout is the Q8_0 groups' values, so
+/// Q8_0 copies them and Q4_0 splits each piece's nibbles (less 8, as `b32_i8` centers them).
+pub(super) unsafe fn fill_tile4_x4(m: &GgufMatrix, r: usize, q: *mut i8, ds: *mut f32) -> bool {
+    let g = m.data.as_ptr().add(r / 4 * 4 * m.row_bytes());
+    let nb = m.n_in / 32;
+    match m.kind {
+        GgmlType::Q8_0 => {
+            for b in 0..nb {
+                let p = g.add(b * 136);
+                for j in 0..8 {
+                    vst1q_s8(q.add(b * 128 + 16 * j), vld1q_s8(p.add(8 + 16 * j) as *const i8));
+                }
+                vst1q_f32(ds.add(4 * b), f16x4_to_f32(p as *const u16));
+            }
+        }
+        GgmlType::Q4_0 => {
+            let (m4, eight) = (vdupq_n_u8(0x0F), vdupq_n_s8(8));
+            for b in 0..nb {
+                let p = g.add(b * 72);
+                for j in 0..4 {
+                    let v = vld1q_u8(p.add(8 + 16 * j));
+                    let lo = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, m4)), eight);
+                    let hi = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v)), eight);
+                    vst1q_s8(q.add(b * 128 + 16 * j), lo);
+                    vst1q_s8(q.add(b * 128 + 64 + 16 * j), hi);
+                }
+                vst1q_f32(ds.add(4 * b), f16x4_to_f32(p as *const u16));
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
 /// Row `r` of an interleaved Q8_0 matrix unpacked for the int8 prefill GEMM (as
 /// [`unpack_row_i8`] unpacks a plain row).
-pub(super) unsafe fn unpack_row_i8_x4(m: &GgufMatrix, r: usize, q: *mut i8, ds: *mut f32, mn: *mut f32) {
+pub(super) unsafe fn unpack_row_i8_x4(m: &GgufMatrix, r: usize, q: *mut i8, ds: *mut f32, mn: *mut f32, sc: *mut i32) {
     if m.kind != GgmlType::Q8_0 {
         // One block at a time back in the file's layout.
-        let (rb, ts) = (m.row_bytes(), m.kind.type_size());
-        let mut blk = [0u8; 34];
-        for b in 0..m.n_in / 32 {
+        let (rb, ts, bs) = (m.row_bytes(), m.kind.type_size(), m.kind.block_size());
+        let mut blk = [0u8; 256];
+        for b in 0..m.n_in / bs {
             super::repack::plain_block(m.kind, &m.data, rb, r, b, &mut blk[..ts]);
-            unpack_row_i8(m.kind, blk.as_ptr(), 32, q.add(32 * b), ds.add(b), mn.add(b), std::ptr::null_mut());
+            let (q, ds, mn, sc) = (q.add(bs * b), ds.add(bs / 32 * b), mn.add(bs / 32 * b), sc.add(bs / 16 * b));
+            unpack_row_i8(m.kind, blk.as_ptr(), bs, q, ds, mn, sc);
         }
         return;
     }
@@ -1766,7 +1993,7 @@ pub(super) unsafe fn rows_multi(
     r1: usize,
 ) -> bool {
     debug_assert!((2..=MULTI_MAX).contains(&t));
-    if cols_kind(m.kind) {
+    if cols_kind(m.kind) || m.x4 {
         cols_multi(m, x, t, y, ys, r0, r1);
         return true;
     }
@@ -1946,6 +2173,46 @@ pub(super) unsafe fn dequant_row(kind: GgmlType, row: *const u8, n: usize, out: 
         GgmlType::IQ4_XS => deq_iq4xs(row, n, out),
         GgmlType::Q8_0 | GgmlType::Q4_0 | GgmlType::Q5_0 | GgmlType::IQ4_NL => deq_b32(kind, row, n, out),
         _ => return false,
+    }
+    true
+}
+
+/// The four rows of the group at `g` of an interleaved Q8_0 or Q4_0 matrix ([`super::repack`])
+/// dequantized into `out` (`[4][n]`, rows `n` apart): `deq_b32`'s values (each row's pieces
+/// gathered by a de-interleaving load, then the same products).
+pub(super) unsafe fn dequant_group_x4(kind: GgmlType, g: *const u8, n: usize, out: *mut f32) -> bool {
+    let (bsz, eight) = match kind {
+        GgmlType::Q8_0 => (136, None),
+        GgmlType::Q4_0 => (72, Some((vdupq_n_u8(0x0F), vdupq_n_s8(8)))),
+        _ => return false,
+    };
+    for b in 0..n / 32 {
+        let p = g.add(b * bsz);
+        let mut d = [0f32; 4];
+        vst1q_f32(d.as_mut_ptr(), f16x4_to_f32(p as *const u16));
+        // Row `i`'s values 0..16 and 16..32.
+        let mut v = [[vdupq_n_s8(0); 2]; 4];
+        match eight {
+            None => {
+                let (lo, hi) = (vld4q_u32(p.add(8) as *const u32), vld4q_u32(p.add(72) as *const u32));
+                v = [[lo.0, hi.0], [lo.1, hi.1], [lo.2, hi.2], [lo.3, hi.3]].map(|r| r.map(|x| vreinterpretq_s8_u32(x)));
+            }
+            Some((m4, e)) => {
+                let a = vld4q_u32(p.add(8) as *const u32);
+                for (i, r) in [a.0, a.1, a.2, a.3].into_iter().enumerate() {
+                    let u = vreinterpretq_u8_u32(r);
+                    v[i] = [
+                        vsubq_s8(vreinterpretq_s8_u8(vandq_u8(u, m4)), e),
+                        vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(u)), e),
+                    ];
+                }
+            }
+        }
+        for i in 0..4 {
+            let o = out.add(i * n + 32 * b);
+            st16(o, v[i][0], d[i]);
+            st16(o.add(16), v[i][1], d[i]);
+        }
     }
     true
 }

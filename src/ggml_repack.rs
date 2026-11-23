@@ -6,7 +6,9 @@
 //! row 0 bytes 4..8, ...]` (Q8_0: 136 bytes, Q4_0: 72, whose byte `j` holds values `j` and
 //! `j + 16`). One SDOT by element multiplies a 16-byte piece with four activations and leaves
 //! each row's sum in its own lane, so the kernel computes four rows with the instructions plain
-//! rows take for one or two (`kernels_ggml.rs`, `x4_kern`).
+//! rows take for one or two (`kernels_ggml.rs`, `x4_kern`). Q4_K and Q6_K super-blocks are
+//! laid out the same way (see [`layout`]: scales first, then the values in pieces), as
+//! llama.cpp's `block_q4_Kx8` / `block_q6_Kx8` interleave eight rows.
 //!
 //! The same bytes are moved, so an interleaved matrix takes no more memory than the plain one;
 //! the loader interleaves a tensor in place in a checkpoint read into memory
@@ -51,19 +53,76 @@ pub fn repack_wanted() -> bool {
 
 /// Whether a `[n_out, n_in]` matrix of `kind` can be interleaved.
 pub fn can_interleave(kind: GgmlType, n_out: usize, n_in: usize) -> bool {
-    matches!(kind, GgmlType::Q8_0 | GgmlType::Q4_0) && n_out > 0 && n_out.is_multiple_of(4) && n_in.is_multiple_of(32)
+    layout(kind).is_some() && n_out > 0 && n_out.is_multiple_of(4) && n_in.is_multiple_of(kind.block_size())
+}
+
+/// How a block of four rows is laid out, in order: the `fields` (offset in the plain block,
+/// bytes), each stored for the four rows together, `[row 0 .. row 3]`, or for a `true` field
+/// byte by byte, `[row 0 byte 0, row 1 byte 0, .., row 3 byte 0, row 0 byte 1, ..]`; then the
+/// `pieces` regions (offset, bytes) in 4-byte pieces, `[row 0 bytes 0..4, row 1 bytes 0..4,
+/// row 2, row 3, row 0 bytes 4..8, ..]`. None for the kinds that are not interleaved.
+struct Layout {
+    fields: &'static [(usize, usize, bool)],
+    pieces: &'static [(usize, usize)],
+}
+
+fn layout(kind: GgmlType) -> Option<Layout> {
+    Some(match kind {
+        GgmlType::Q8_0 => Layout {
+            fields: &[(0, 2, false)],
+            pieces: &[(2, 32)],
+        },
+        GgmlType::Q4_0 => Layout {
+            fields: &[(0, 2, false)],
+            pieces: &[(2, 16)],
+        },
+        // d, dmin; the twelve bytes of 6-bit scales and mins, the nibbles.
+        GgmlType::Q4_K => Layout {
+            fields: &[(0, 2, false), (2, 2, false)],
+            pieces: &[(4, 12), (16, 128)],
+        },
+        // d, the sixteen int8 scales by sub-block (each sub-block's four together); `ql`, `qh`.
+        GgmlType::Q6_K => Layout {
+            fields: &[(208, 2, false), (192, 16, true)],
+            pieces: &[(0, 128), (128, 64)],
+        },
+        _ => return None,
+    })
+}
+
+/// Every byte of a plain block of row `i` and its offset in the interleaved block of four:
+/// `f(plain offset, interleaved offset)`.
+fn each_byte(kind: GgmlType, i: usize, mut f: impl FnMut(usize, usize)) {
+    let l = layout(kind).expect("an interleaved kind");
+    let mut o = 0;
+    for &(src, len, by_byte) in l.fields {
+        for j in 0..len {
+            f(src + j, o + if by_byte { 4 * j + i } else { len * i + j });
+        }
+        o += 4 * len;
+    }
+    for &(src, len) in l.pieces {
+        for j in 0..len {
+            f(src + j, o + 16 * (j / 4) + 4 * i + j % 4);
+        }
+        o += 4 * len;
+    }
 }
 
 /// One group of four plain rows (`src`, `4 * row_bytes`) interleaved into `dst` (as long).
 fn interleave_group(kind: GgmlType, src: &[u8], dst: &mut [u8]) {
     let (rb, ts) = (src.len() / 4, kind.type_size());
+    // The block's byte map, once.
+    let mut map = [[0u16; 256]; 4];
+    for (i, m) in map.iter_mut().enumerate() {
+        each_byte(kind, i, |p, o| m[p] = o as u16);
+    }
     for b in 0..rb / ts {
         let o = &mut dst[4 * b * ts..4 * (b + 1) * ts];
-        for i in 0..4 {
+        for (i, m) in map.iter().enumerate() {
             let s = &src[i * rb + b * ts..i * rb + (b + 1) * ts];
-            o[2 * i..2 * i + 2].copy_from_slice(&s[..2]);
-            for j in 0..(ts - 2) / 4 {
-                o[8 + 16 * j + 4 * i..12 + 16 * j + 4 * i].copy_from_slice(&s[2 + 4 * j..6 + 4 * j]);
+            for (p, &v) in s.iter().enumerate() {
+                o[m[p] as usize] = v;
             }
         }
     }
@@ -106,9 +165,20 @@ pub fn interleave_in_place(kind: GgmlType, bytes: &mut [u8], n_in: usize) {
 pub(super) fn plain_block(kind: GgmlType, data: &[u8], rb: usize, r: usize, b: usize, out: &mut [u8]) {
     let (g, i, ts) = (r / 4, r % 4, kind.type_size());
     let s = &data[g * 4 * rb + 4 * b * ts..g * 4 * rb + 4 * (b + 1) * ts];
-    out[..2].copy_from_slice(&s[2 * i..2 * i + 2]);
-    for j in 0..(ts - 2) / 4 {
-        out[2 + 4 * j..6 + 4 * j].copy_from_slice(&s[8 + 16 * j + 4 * i..12 + 16 * j + 4 * i]);
+    let l = layout(kind).expect("an interleaved kind");
+    let mut o = 0;
+    for &(src, len, by_byte) in l.fields {
+        for j in 0..len {
+            out[src + j] = s[o + if by_byte { 4 * j + i } else { len * i + j }];
+        }
+        o += 4 * len;
+    }
+    for &(src, len) in l.pieces {
+        for j in (0..len).step_by(4) {
+            let p = o + 4 * j + 4 * i;
+            out[src + j..src + j + 4].copy_from_slice(&s[p..p + 4]);
+        }
+        o += 4 * len;
     }
 }
 
@@ -128,11 +198,11 @@ mod tests {
     #[test]
     fn interleave_round_trip() {
         crate::pool::init(3);
-        let (n_out, n_in) = (12usize, 5 * 32);
-        for kind in [GgmlType::Q8_0, GgmlType::Q4_0] {
+        let (n_out, n_in) = (12usize, 5 * 256);
+        for kind in [GgmlType::Q8_0, GgmlType::Q4_0, GgmlType::Q4_K, GgmlType::Q6_K] {
             let rb = kind.row_bytes(n_in);
             let mut seed = 5u64;
-            let plain = crate::ggml::random_blocks(kind, n_out * n_in / 32, &mut seed);
+            let plain = crate::ggml::random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed);
             let mut x = plain.clone();
             interleave_in_place(kind, &mut x, n_in);
             assert_ne!(x, plain);
@@ -143,7 +213,7 @@ mod tests {
             assert_eq!(a, b);
             let mut row = vec![0u8; rb];
             for r in 0..n_out {
-                plain_blocks(kind, &x, rb, r, 0, n_in / 32, &mut row);
+                plain_blocks(kind, &x, rb, r, 0, n_in / kind.block_size(), &mut row);
                 assert_eq!(row, plain[r * rb..(r + 1) * rb], "{kind} row {r}");
             }
         }

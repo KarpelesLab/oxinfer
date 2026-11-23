@@ -1680,6 +1680,14 @@ pub trait QMat: Sync {
     unsafe fn unpack_row_i8(&self, _r: usize, _q: *mut i8, _ds: *mut f32, _mn: *mut f32, _sc: *mut i32) {
         unreachable!("no int8 GEMM layout")
     }
+    /// aarch64: rows `r..r + 4` unpacked as [`QMat::unpack_row_i8`] unpacks them, straight into
+    /// the int8 GEMM's four-row tile (`q[b * 128 + 16 * g + 4 * i + e]` is value `32 b + 4 g + e`
+    /// of row `r + i`, `ds[4 b + i]` its block scale), for a format without `min32` or `sc16`;
+    /// false (nothing written) unless the matrix stores its rows that way already (interleaved,
+    /// see [`crate::ggml::repack`]).
+    unsafe fn fill_tile4(&self, _r: usize, _q: *mut i8, _ds: *mut f32) -> bool {
+        false
+    }
 }
 
 /// How a matrix's rows unpack for the int8 prefill GEMM. Row element `i` (in block `b = i / 32`)

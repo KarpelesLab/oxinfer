@@ -531,8 +531,24 @@ impl GgufMatrix {
     pub fn dequantize_rows(&self, r0: usize, r1: usize, out: &mut [f32]) {
         let n = self.n_in;
         if self.x4 {
-            for (i, r) in (r0..r1).enumerate() {
-                self.dequant_bytes(&self.plain_row(r), &mut out[i * n..(i + 1) * n]);
+            let rb = self.row_bytes();
+            let mut v = Vec::new();
+            let mut r = r0;
+            while r < r1 {
+                let o = &mut out[(r - r0) * n..];
+                #[cfg(target_arch = "aarch64")]
+                // SAFETY: rows `r..r + 4` are a whole group of the matrix and `o` has room for them.
+                if r.is_multiple_of(4)
+                    && r + 4 <= r1
+                    && unsafe { neon::dequant_group_x4(self.kind, self.data.as_ptr().add(r * rb), n, o.as_mut_ptr()) }
+                {
+                    r += 4;
+                    continue;
+                }
+                v.resize(rb, 0);
+                repack::plain_blocks(self.kind, &self.data, rb, r, 0, n / self.kind.block_size(), &mut v);
+                self.dequant_bytes(&v, &mut o[..n]);
+                r += 1;
             }
             return;
         }
@@ -1607,9 +1623,13 @@ impl QMat for GgufMatrix {
         neon::i8_layout(self.kind).map(|(sc16, min32)| crate::kernels::I8Layout { sc16, min32 })
     }
     #[cfg(target_arch = "aarch64")]
+    unsafe fn fill_tile4(&self, r: usize, q: *mut i8, ds: *mut f32) -> bool {
+        self.x4 && r.is_multiple_of(4) && r + 4 <= self.n_out && unsafe { neon::fill_tile4_x4(self, r, q, ds) }
+    }
+    #[cfg(target_arch = "aarch64")]
     unsafe fn unpack_row_i8(&self, r: usize, q: *mut i8, ds: *mut f32, mn: *mut f32, sc: *mut i32) {
         if self.x4 {
-            return unsafe { neon::unpack_row_i8_x4(self, r, q, ds, mn) };
+            return unsafe { neon::unpack_row_i8_x4(self, r, q, ds, mn, sc) };
         }
         unsafe { neon::unpack_row_i8(self.kind, self.data.as_ptr().add(r * self.row_bytes()), self.n_in, q, ds, mn, sc) }
     }
@@ -2241,9 +2261,14 @@ mod tests {
     fn interleaved_rows_match_plain() {
         crate::pool::init(3);
         let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
-        for kind in [GgmlType::Q8_0, GgmlType::Q4_0] {
+        for kind in [GgmlType::Q8_0, GgmlType::Q4_0, GgmlType::Q4_K, GgmlType::Q6_K] {
             // Block counts with and without a tail of the steps of four.
             for (n_out, n_in) in [(24usize, 8 * 32), (40, 13 * 32), (8, 3 * 32)] {
+                let n_in = if kind.block_size() == QK_K {
+                    (n_in / 32usize).div_ceil(4) * QK_K
+                } else {
+                    n_in
+                };
                 let mut seed = 101 + n_in as u64;
                 let raw = random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed);
                 let m = GgufMatrix::from_bytes(kind, &raw, n_out, n_in).unwrap();
@@ -2256,7 +2281,11 @@ mod tests {
                 m.dequantize_rows(0, n_out, &mut a);
                 x4.dequantize_rows(0, n_out, &mut b);
                 assert_eq!(bits(&a), bits(&b), "{kind} dequantize_rows");
-                let k = (32, n_in);
+                // Rows that cut the groups of four (whole groups and single rows).
+                let mut c = vec![0f32; (n_out - 4) * n_in];
+                x4.dequantize_rows(3, n_out - 1, &mut c);
+                assert_eq!(bits(&c), bits(&a[3 * n_in..(n_out - 1) * n_in]), "{kind} dequantize_rows 3..");
+                let k = (if n_in > kind.block_size() { kind.block_size() } else { 0 }, n_in);
                 let (mut a, mut b) = (vec![0f32; 5 * (k.1 - k.0)], vec![0f32; 5 * (k.1 - k.0)]);
                 assert!(m.dequantize_block(3, 8, k.0, k.1, &mut a));
                 assert!(x4.dequantize_block(3, 8, k.0, k.1, &mut b));
@@ -2268,12 +2297,35 @@ mod tests {
                     for r in 0..n_out {
                         let (mut q0, mut q1) = (vec![0i8; n_in], vec![0i8; n_in]);
                         let (mut d0, mut d1) = (vec![0f32; bpr], vec![0f32; bpr]);
-                        let (mut mn, mut sc) = (vec![0f32; bpr], vec![0i32; n_in / 16]);
+                        let (mut m0, mut m1) = (vec![0f32; bpr], vec![0f32; bpr]);
+                        let (mut s0, mut s1) = (vec![0i32; n_in / 16], vec![0i32; n_in / 16]);
                         unsafe {
-                            m.unpack_row_i8(r, q0.as_mut_ptr(), d0.as_mut_ptr(), mn.as_mut_ptr(), sc.as_mut_ptr());
-                            x4.unpack_row_i8(r, q1.as_mut_ptr(), d1.as_mut_ptr(), mn.as_mut_ptr(), sc.as_mut_ptr());
+                            m.unpack_row_i8(r, q0.as_mut_ptr(), d0.as_mut_ptr(), m0.as_mut_ptr(), s0.as_mut_ptr());
+                            x4.unpack_row_i8(r, q1.as_mut_ptr(), d1.as_mut_ptr(), m1.as_mut_ptr(), s1.as_mut_ptr());
                         }
-                        assert_eq!((q0, bits(&d0)), (q1, bits(&d1)), "{kind} unpack_row_i8 row {r}");
+                        assert_eq!(
+                            (q0, bits(&d0), bits(&m0), s0),
+                            (q1, bits(&d1), bits(&m1), s1),
+                            "{kind} unpack_row_i8 row {r}"
+                        );
+                    }
+                    // The int8 GEMM's four-row tiles, straight from the groups (the formats
+                    // without offsets or scales per 16).
+                    assert!(!unsafe { m.fill_tile4(0, std::ptr::null_mut(), std::ptr::null_mut()) });
+                    for r in (0..n_out).step_by(4).filter(|_| !lay.min32 && !lay.sc16) {
+                        let (mut tq, mut td) = (vec![0i8; bpr * 128], vec![0f32; bpr * 4]);
+                        assert!(unsafe { x4.fill_tile4(r, tq.as_mut_ptr(), td.as_mut_ptr()) });
+                        for i in 0..4 {
+                            let (mut q, mut d) = (vec![0i8; n_in], vec![0f32; bpr]);
+                            let (mut mn, mut sc) = (vec![0f32; bpr], vec![0i32; n_in / 16]);
+                            unsafe { m.unpack_row_i8(r + i, q.as_mut_ptr(), d.as_mut_ptr(), mn.as_mut_ptr(), sc.as_mut_ptr()) };
+                            for b in 0..bpr {
+                                assert_eq!(td[4 * b + i].to_bits(), d[b].to_bits(), "{kind} tile scale");
+                                for e in 0..32 {
+                                    assert_eq!(tq[b * 128 + 16 * (e / 4) + 4 * i + e % 4], q[32 * b + e], "{kind} tile value");
+                                }
+                            }
+                        }
                     }
                 }
                 for t in 1..=16usize {
