@@ -1442,7 +1442,8 @@ impl LayerCache {
         }
     }
     /// [`Self::push`] of `t` rows into each of several caches (a device step's keys and values of
-    /// every layer), copied in one parallel region over all of them.
+    /// every layer), copied in one parallel region over all of them. (CUDA only.)
+    #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
     pub(crate) fn push_all(items: &mut [(&mut LayerCache, &[f32], &[f32])], t: usize) {
         const CHUNK: usize = 1 << 16;
         // (destination, source, length) of every chunk of every copy.
