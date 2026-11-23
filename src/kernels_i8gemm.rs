@@ -358,7 +358,15 @@ impl MTile {
             self.sc.resize(nb * 8 * MRP, 0);
         }
         let q = self.q.as_mut_ptr();
-        for p in 0..MRP {
+        // Pairs filled straight from a matrix stored four rows at a time (two pairs a group).
+        let mut direct = [false; MRP];
+        for p in (0..MRP).step_by(2) {
+            if r + 2 * p + 4 <= r1 && m.fill_pairs4(r + 2 * p, q, self.ds.as_mut_ptr(), p, MRP) {
+                direct[p] = true;
+                direct[p + 1] = true;
+            }
+        }
+        for p in (0..MRP).filter(|&p| !direct[p]) {
             for (k, u) in rows.iter_mut().enumerate().take(2) {
                 u.fit(n_in);
                 if r + 2 * p + k < r1 {
@@ -1066,6 +1074,21 @@ mod tests {
             }
         }
         assert_eq!(n, 20, "formats");
+    }
+
+    /// Interleaved matrices (`ggml::repack`) through every GEMM path, tiles filled from the
+    /// groups included.
+    #[test]
+    fn interleaved_gguf_matches_decode_kernels() {
+        crate::pool::init(2);
+        let (n_out, n_in) = (16, 512);
+        for kind in [GgmlType::Q8_0, GgmlType::Q4_0, GgmlType::Q4_K, GgmlType::Q6_K] {
+            let mut seed = 5u64;
+            let bytes = random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed);
+            let m = GgufMatrix::from_bytes(kind, &bytes, n_out, n_in).unwrap().to_interleaved().unwrap();
+            assert!(m.x4);
+            check(&m, kind.name());
+        }
     }
 
     #[test]

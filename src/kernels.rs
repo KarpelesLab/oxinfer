@@ -1688,6 +1688,14 @@ pub trait QMat: Sync {
     unsafe fn fill_tile4(&self, _r: usize, _q: *mut i8, _ds: *mut f32) -> bool {
         false
     }
+    /// aarch64: rows `r..r + 4` as pairs `p0`, `p0 + 1` of the SMMLA GEMM's tile of `mrp`
+    /// pairs (`q[(i * mrp + p) * 16 + 8 k + e]` is value `8 i + e` of row `2 p + k`,
+    /// `ds[(b * mrp + p) * 4..]` the pair's block scales `[s0, s0, s1, s1]`), the values
+    /// [`QMat::unpack_row_i8`] gives, for a format without `min32` or `sc16`; false (nothing
+    /// written) unless the matrix is interleaved (see [`QMat::fill_tile4`]).
+    unsafe fn fill_pairs4(&self, _r: usize, _q: *mut i8, _ds: *mut f32, _p0: usize, _mrp: usize) -> bool {
+        false
+    }
 }
 
 /// How a matrix's rows unpack for the int8 prefill GEMM. Row element `i` (in block `b = i / 32`)

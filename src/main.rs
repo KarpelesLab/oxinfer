@@ -294,8 +294,9 @@ fn usage() -> ! {
          \x20                      (int8 GEMM with a residual activation plane, close to f32), int8\n\
          \x20                      or f32 (NEON / AVX2 FMA GEMM); env OXINFER_PREFILL_GEMM\n\
          \x20 --cpu-repack M       on (default) | off: on aarch64 without a GPU backend, interleave a\n\
-         \x20                      GGUF model's Q8_0 matrices four rows at a time in place at load\n\
-         \x20                      (faster CPU decoding, same memory); env OXINFER_REPACK=0 for off\n\
+         \x20                      GGUF model's Q8_0 / Q4_0 / Q4_K / Q6_K matrices four rows at a time\n\
+         \x20                      in place at load (faster CPU decoding, same memory and results);\n\
+         \x20                      env OXINFER_REPACK=0 for off\n\
          \x20 --lookup / --no-lookup  prompt-lookup drafting (default on): drafts copied from the\n\
          \x20                      conversation where its last tokens occurred before (quoting, editing,\n\
          \x20                      summarizing), verified like other drafts (exact); rounds without a\n\

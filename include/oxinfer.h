@@ -124,8 +124,9 @@ int64_t oxi_cache_remove(const char *cache_dir, const char *name);
  *                        units, half-precision inputs; CUDA prompts of GGUF models in f16
  *                        operands, 1: split halves within ~1e-6 of f32; process-wide)
  *   gpu_moe=0|1          MoE experts on the GPU in prefill (default 1; process-wide)
- *   cpu_repack=0|1       CPU decoding on aarch64: interleave a GGUF model's Q8_0 matrices four
- *                        rows at a time in place at load, for faster decode kernels (default 1
+ *   cpu_repack=0|1       CPU decoding on aarch64: interleave a GGUF model's Q8_0, Q4_0, Q4_K and
+ *                        Q6_K matrices four rows at a time in place at load, for faster decode
+ *                        kernels with the same results (default 1
  *                        when no GPU backend is active and the weights are read into memory;
  *                        process-wide)
  *   stream=auto|on|off   stream weights from storage for models larger than RAM (1 / 0 work

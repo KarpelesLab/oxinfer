@@ -656,12 +656,12 @@ Where oxinfer is still behind:
   loaded for clean ratios; llama.cpp's 16-thread runs collapsed under the load while
   oxinfer's work-claiming pool held up. Per-core throughput is not ahead: both engines' int8
   kernels issue at the SDOT rate (~340 GOP/s on one core).
-- **CPU decode of small Q8_0 models under load** (Llama 3.2 1B Q8_0: level with llama.cpp's best
-  in quiet windows, 186-196 tok/s against 175-196; 161-175 against 168-185 at load averages of
-  5-11, where llama.cpp's 8 threads hold up best): a token streams its 1.31 GB at 240-257 GB/s,
-  what llama.cpp's speed amounts to too; the gap left under load is per-core speed (llama.cpp's
-  repacked kernel needs fewer threads). See
-  [CPU decode round 5](#cpu-decode-round-5-november-2026), round 4 and round 3 for what was tried.
+- **CPU decode per core** (round 6: Q8_0, Q4_0, Q4_K and Q6_K matrices interleaved four rows at
+  a time in place, llama.cpp's repacked layout, bit-identical): level with llama.cpp on 1 and 4
+  threads for Q8_0, ahead for Q4_0, 5-10% behind for Q4_K_M; on all threads level or ahead, and
+  under load far ahead (llama.cpp's spinning threads collapse at 12 threads). Left: 8 threads on
+  the dense Q8_0 models, 10-15% behind llama.cpp's 8 threads in quiet windows. See
+  [CPU decode round 6](#cpu-decode-round-6-november-2026), and rounds 5, 4 and 3 before it.
   Qwen3-8B (Q8_0, Q4_K_M), Gemma 4 12B, 26B-A4B, Orpheus and Llama 1B Q4_K_M decode level with
   or ahead of llama.cpp's best thread count.
 
@@ -1256,6 +1256,174 @@ The other models gained 1.5-7%; Qwen3-8B stays behind llama.cpp under this load 
 round 3's quieter runs). Greedy 128-token outputs (`--device cpu --no-system`, two prompts) are
 identical to the previous build's on Llama 3.2 1B Q8_0 and Q4_K_M, Qwen3-8B Q8_0, Gemma 4 12B
 Q8_0 and Gemma 4 26B-A4B Q4_0.
+
+#### CPU decode round 6 (November 2026)
+
+Round 5 left llama.cpp ahead on loaded machines, and the cause was per-core speed: its
+repacked kernels need fewer threads for the same bandwidth. This round interleaves the weights
+the way llama.cpp's ggml-cpu "repack" buffers do (`block_q8_0x4` and its kin with 4-byte
+pieces), in place at load, so that one SDOT by element computes four rows.
+
+**The layout** (`src/ggml_repack.rs`). A Q8_0, Q4_0, Q4_K or Q6_K matrix whose row count is a
+multiple of four is stored as groups of four rows, each group as its blocks in order with the
+four rows' block `b` together: the scale fields first (the four `d`; Q4_K's four `dmin` too;
+Q6_K's int8 scales by sub-block), then the values' bytes in 4-byte pieces, `[row 0 bytes 0..4,
+row 1 bytes 0..4, row 2, row 3, row 0 bytes 4..8, ...]` (Q4_K's twelve bytes of 6-bit scales as
+pieces as well, so the four rows' scales unpack in three vector words). A piece times four
+activations (`sdot v.4s, w.16b, x.4b[lane]`) leaves each row's sum in its own lane, and a block
+of 32 needs 8 SDOTs and two activation loads for four rows, where the plain kernel needs 2 SDOTs,
+2 loads and a pairwise-add tree per row; the scales come as one vector per block. The same bytes
+move, so the layout takes no memory of its own: the loader interleaves a tensor in place
+(`ModelFiles::ggml_cpu`) in the copy of the checkpoint it read into memory, which is the default
+outside iOS. Mapped checkpoints (`mmap=1`, too big for memory, streamed) keep the file's layout,
+and so does every model while a GPU backend is active (its kernels read the file's layout).
+Reading an interleaved tensor's bytes other than as a matrix is an error rather than garbage.
+
+**Bit-identical.** The decode kernels (`kernels_ggml.rs`: `x4_kern` for Q8_0 / Q4_0, `q4k_x4`,
+`q6k_x4`) repeat the plain kernels' f32 operations row by row in their order: the plain kernels
+keep, per row, one accumulator lane per block of a step of four (Q8_0, Q4_0) or per sub-block
+pair (Q4_K, Q6_K) and add the lanes as `(0 + 1) + (2 + 3)` at the end; the interleaved ones keep
+one accumulator per such lane, with the four rows in its lanes, and add them in the same order.
+The integer sums are exact either way. So every output is bit-identical to the plain matrix's
+(`ggml::tests::interleaved_rows_match_plain`: one token, 2-4 token tiles, multi-token passes of
+2-16 tokens, the driver's decode and prefill paths, row ranges that cut groups, dequantization;
+`kernels::i8gemm::tests::interleaved_gguf_matches_decode_kernels`: the SDOT, SMMLA and
+column-blocked prompt GEMMs), multi-token verification still equals plain decoding, and greedy
+128-token outputs (`--device cpu --no-system`, two prompts) are identical to the previous
+build's on Llama 3.2 1B Q8_0 and Q4_K_M, Qwen3-8B Q8_0, Gemma 4 12B Q8_0 and Gemma 4 26B-A4B
+Q4_0.
+
+**Prompts.** The prompt GEMMs read the interleaved groups: the int8 GEMM's four-row tile is the
+Q8_0 group's layout, so a Q8_0 group is copied into it and a Q4_0 group's nibbles split
+(`QMat::fill_tile4`), the SMMLA GEMM's row pairs are zipped from two pieces
+(`QMat::fill_pairs4`), whole groups dequantize with de-interleaving loads for the SME and f32
+GEMMs, and Q4_K / Q6_K rows are unpacked one super-block at a time back in the file's layout. A
+first version that unpacked every row through that last path left Gemma 4 26B-A4B Q4_0 prompts
+28% slower (pp512 289-334 against 208-244 tok/s); with the tiles filled from the groups, pp512,
+`cpu_repack=0` against `=1`, alternated: 26B-A4B 354 / 334 against 355 / 357, Qwen3-8B Q8_0
+223 / 205 against 213 / 201, Llama 3.2 1B Q8_0 1235 / 1288 against 1298 / 1189 (load 3-16).
+
+**Opt-out**: `cpu_repack=0` (`EngineOptions::cpu_repack`, the C API's and the server's option
+key), `--cpu-repack off`, or `OXINFER_REPACK=0`; process-wide, applied on load. The CLI notes
+what it interleaved (`[113 matrices (1.31 GB) interleaved for the CPU decode kernels]`).
+
+**One core.** `matvec_bench X4=1` (a 512 MB ring of random matrices, both layouts timed in
+turn), 2048 x 2048 / 8192 x 2048 / 2048 x 8192, GB/s of weights read:
+
+| format | 1 thread plain / interleaved | 4 threads | 8 threads | 16 threads |
+|---|---|---|---|---|
+| Q8_0 [3] | 69.9-71.0 / 84.8-85.7 (+21%) | 174-207 / 194-236 (+11-14%) | 210-242 / 215-244 (+1-3%) | 239-283 / 251-283 (level) |
+| Q4_0, Gemma 26B-A4B's expert shapes [4] | 36.3-38.7 / 49.1-51.9 (+34-42%) | 92-116 / 107-125 | 112-152 / 118-170 | |
+| Q4_K [5] | 32.5-33.3 / 34.5-35.9 (+4-10%) | 99-110 / 103-120 | 145-185 / 155-186 | |
+| Q6_K, incl. the 128256 x 2048 LM head [3] | 30.5-30.7 / 32.3-32.5 (+6%) | 101-112 / 106-118 | 153-193 / 159-204 | |
+
+The Q8_0 and Q4_0 kernels gain what the shared activation loads, scale conversions and add
+trees saved; Q4_K and Q6_K are bound by unpacking the nibbles and 6-bit values, which
+interleaving does not change (Q4_K gained 0-5% until its scales were unpacked four rows at a
+time). For comparison, llama.cpp's own repack (`llama-bench --repack 0` / `1`, Llama 3.2 1B,
+tg64, load 4) is worth +30% on one core for Q8_0 (43.4 to 56.5 tok/s) and +12% for Q4_K_M
+(40.6 to 45.5), +8% and +2% on 8 threads.
+
+**Decode against llama.cpp.** `parity_bench` (tg64, tg32 for the 8B and larger; median of 3)
+with `cpu_repack=0` ("before": the previous build's kernels, bit for bit) and `=1` ("after"),
+separate processes, alternated with `llama-bench -ngl 0 -dev none` (mean of 3) at the same
+thread count, two rounds each (`/`); "all": oxinfer's default (18 threads, decode steps on 16),
+llama.cpp on 12. tok/s.
+
+A quieter window (load averages 6-12; the machine is shared):
+
+| model | threads | llama.cpp | before | after |
+|---|---|---|---|---|
+| Llama 3.2 1B Q8_0 | 1 | 56.0 / 54.9 | 47.0 / 46.7 | 56.8 / 56.0 |
+| | 4 | 154.7 / 156.9 | 123.2 / 118.0 | 156.5 / 157.1 |
+| | 8 | 191.5 / 156.3 | 160.6 / 161.0 | 164.3 / 161.5 |
+| | all | 169.2 / 188.7 | 162.7 / 163.9 | 183.7 / 183.9 |
+| Llama 3.2 1B Q4_K_M | 1 | 41.7 / 44.1 | 35.0 / 37.1 | 38.7 / 39.5 |
+| | 4 | 139.0 / 142.4 | 124.2 / 123.7 | 129.7 / 128.0 |
+| | 8 | 206.3 / 201.4 | 207.1 / 205.8 | 216.1 / 213.1 |
+| | all | 226.2 / 222.4 | 241.0 / 240.3 | 250.6 / 246.0 |
+| Qwen3-8B Q8_0 | 1 | 9.14 / 9.48 | 8.0 / 8.1 | 9.8 / 9.8 |
+| | 4 | 28.0 / 27.9 | 22.8 / 22.5 | 27.7 / 28.1 |
+| | 8 | 28.6 / 33.2 | 28.6 / 28.9 | 29.0 / 28.8 |
+| | all | 33.0 / 32.1 | 30.0 / 29.8 | 32.1 / 31.9 |
+| Gemma 4 12B Q8_0 | 1 | 5.83 / 6.09 | 5.1 / 5.1 | 6.3 / 6.3 |
+| | 4 | 17.5 / 17.2 | 14.0 / 14.1 | 17.4 / 17.3 |
+| | 8 | 20.7 / 20.5 | 18.2 / 18.2 | 18.0 / 17.7 |
+| | all | 20.2 / 20.3 | 19.4 / 19.6 | 20.9 / 20.8 |
+| Gemma 4 26B-A4B Q4_0 | 1 | 16.8 / 17.9 | 16.2 / 16.7 | 21.0 / 21.2 |
+| | 4 | 48.1 / 47.6 | 44.5 / 45.2 | 55.9 / 55.9 |
+| | 8 | 64.9 / 64.5 | 64.8 / 66.8 | 67.8 / 66.3 |
+| | all | 61.0 / 62.0 | 68.6 / 68.9 | 69.8 / 68.4 |
+
+Under load: the same with nine busy loops (`perl -e 'while(1){}'`) on the 18 cores while
+measuring, on top of other sessions' jobs (load averages 3-37):
+
+| model | threads | llama.cpp | before | after |
+|---|---|---|---|---|
+| Llama 3.2 1B Q8_0 | 4 | 141.5 / 138.8 | 128.1 / 125.4 | 141.1 / 141.2 |
+| | 8 | 130.7 / 106.8 (± 23-28) | 148.3 / 151.6 | 132.3 / 120.3 |
+| | all | 7.0 / 4.7 | 132.7 / 149.1 | 153.9 / 156.0 |
+| Llama 3.2 1B Q4_K_M | 4 | 115.0 / 113.4 | 106.0 / 106.6 | 112.2 / 108.7 |
+| | 8 | 147.4 / 173.4 | 173.0 / 142.9 | 179.5 / 180.3 |
+| | all | 6.4 / 6.2 | 172.4 / 173.5 | 174.4 / 162.8 |
+| Qwen3-8B Q8_0 | 4 | 22.9 / 22.3 | 19.3 / 19.5 | 22.8 / 23.0 |
+| | 8 | 14.3 / 15.2 | 23.8 / 25.9 | 24.1 / 27.0 |
+| | all | 0.97 / 1.78 | 23.8 / 25.0 | 26.2 / 27.4 |
+| Gemma 4 12B Q8_0 | 4 | 14.3 / 14.1 | 12.5 / 12.4 | 14.5 / 14.6 |
+| | 8 | 16.5 / 16.7 | 16.7 / 16.5 | 17.4 / 17.3 |
+| | all | 1.23 / 1.17 | 16.4 / 15.8 | 17.4 / 17.3 |
+| Gemma 4 26B-A4B Q4_0 | 4 | 43.7 / 44.1 | 41.8 / 41.3 | 49.5 / 48.0 |
+| | 8 | 58.3 / 60.7 | 56.5 / 57.7 | 60.0 / 61.6 |
+| | all | 3.81 / 1.99 | 51.4 / 51.2 | 56.6 / 54.9 |
+
+So per core oxinfer now matches llama.cpp on Q8_0 (1 and 4 threads: Llama 1B level, Qwen3-8B
+and Gemma 4 12B level to 8% ahead; 15-33% faster than before) and is ahead on Q4_0 (26B-A4B
+16-25% ahead of llama.cpp on 1-4 threads, 24-30% ahead of before); Q4_K_M per core stays 5-10%
+behind llama.cpp (+4-11% over before) and ahead from 8 threads on. On every thread it is given
+oxinfer is now level with or ahead of llama.cpp's best count in quiet windows (Llama 1B Q8_0
+184 against llama.cpp's 156-192 at 8 and 169-189 at 12), and under load it holds where llama.cpp
+does not: llama.cpp's spinning threads collapse to 1-7 tok/s at 12 threads and lose 20-55% at 8
+(Llama 1B Q8_0 107-131, Qwen3-8B 14-15), while oxinfer's work-claiming pool on all threads
+keeps 70-85% of its quiet speed, and the interleaved kernels add 4-16% there on the Q8_0 and
+Q4_0 models (Qwen3-8B 26-27 against 24-25 before; Q4_K_M within the noise). One gap is left: 8 threads on the dense Q8_0 models, where llama.cpp
+reaches 192-194 tok/s on Llama 1B and 20.6 on Gemma 4 12B in quiet windows against oxinfer's
+161-167 and 18; the interleaved kernels do not change it (the kernels stream at 236-285 GB/s
+on 8 threads in `matvec_bench`, so the time goes elsewhere in the step), and in one quiet
+minute the same 8-thread setting ran 196-200 tok/s in `decode_ab`, so it is at least partly the
+machine's minute-to-minute swings.
+
+**Prompts, after.** pp512 with `cpu_repack=0` against `=1`, two alternations each (median of 3,
+load 15-25): Gemma 4 26B-A4B Q4_0 358 / 358 against 382 / 394 (the expert tiles now come
+straight from the groups), Llama 3.2 1B Q4_K_M 1322 / 1313 against 1250 / 1301, Qwen3-8B Q8_0
+252 / 238 against 238 / 231; with the SMMLA GEMM forced (`OXINFER_I8_MMLA=1`, the aarch64 Linux
+default, so that path is exercised here) Qwen3-8B 246 / 235 against 233 / 228 and the 26B-A4B
+329 / 337 against 352 / 346. Taking the f32 (SME) and int8 GEMMs apart on Qwen3-8B gave 129 /
+136 against 136 / 136 and 236 / 233 against 233 / 214: the Q8_0 prompts are level to a few
+percent slower, within this machine's swings, which could not be narrowed further today; the
+Q4_K and Q6_K rows are still unpacked one super-block at a time from the groups (a tile fill
+like Q8_0's would remove that).
+
+**Memory and load time** (`/usr/bin/time -l`, CLI, `--device cpu`, three alternations):
+the peak footprint is the same within 10 MB (Gemma 4 12B Q8_0 13.137-13.145 GB without,
+13.140-13.149 GB with; Qwen3-8B 13.77 both; 26B-A4B 15.13-15.14 both), since the tensors are
+interleaved in the memory they were read into. Loading takes 0.2-0.35 s longer for the pass
+over the weights on the thread pool (12B: 0.95-0.97 s to 1.29-1.31; Qwen3-8B 0.52-0.54 to
+0.73-0.76; 26B-A4B 1.01-1.02 to 1.34; Llama 1B Q4_K_M 0.16 to 0.19), with the file in the page
+cache. With `--mmap`, a checkpoint too big for memory or a streamed one, nothing is interleaved:
+a copy would double the memory for the time of the load and turn clean, reclaimable file pages
+into the process's own (as on iOS, where mapping is the default for that reason).
+
+Dropped or not done:
+
+- 8-row interleaving (llama.cpp's `q4_K_8x8`, `q6_K_8x8` with SMMLA): SMMLA issues at half
+  SDOT's rate on these cores (round 3), and the four-row SDOT kernels were bound by unpacking,
+  not by the dot products;
+- other decode block sizes on 8 threads (1, 2, 4 or 16 blocks a thread, 32 KB minimum, in one
+  `decode_ab` process, Llama 1B Q8_0, load 3): the default 8 a thread 200 tok/s, 4 198, 16
+  198, a 32 KB minimum 199, 2 183, 1 with 32 KB 183, so the 8-thread gap above is not the
+  blocks' size;
+- interleaving on x86-64: the AVX2 / AVX-512 kernels keep the file's layout (the layout is only
+  enabled on aarch64; their portable fallbacks read interleaved rows back if one is ever given).
 
 #### x86-64 CPU prefill (November 2026)
 

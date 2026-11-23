@@ -222,10 +222,10 @@ pub struct EngineOptions {
     /// MoE experts on the GPU during prefill. Process-wide, applied on load; None leaves the
     /// current setting ([`crate::gpu::set_moe_offload`]). Key `gpu_moe`.
     pub gpu_moe: Option<bool>,
-    /// CPU decoding (aarch64, no GPU backend active): interleave the Q8_0 matrices of a GGUF
-    /// checkpoint read into memory four rows at a time, in place, for the decode kernels (llama.cpp's
-    /// repacked layout: the same memory, faster per core; see [`crate::ggml::repack`]). Mapped
-    /// checkpoints keep the file's layout. Process-wide, applied on load; None leaves the current
+    /// CPU decoding (aarch64, no GPU backend active): interleave the Q8_0, Q4_0, Q4_K and Q6_K
+    /// matrices of a GGUF checkpoint read into memory four rows at a time, in place, for the decode
+    /// kernels (llama.cpp's repacked layouts: the same memory and the same results, faster per
+    /// core; see [`crate::ggml::repack`]). Mapped checkpoints keep the file's layout. Process-wide, applied on load; None leaves the current
     /// setting (default on, `OXINFER_REPACK=0` off; [`crate::ggml::set_repack`]). Key
     /// `cpu_repack`.
     pub cpu_repack: Option<bool>,

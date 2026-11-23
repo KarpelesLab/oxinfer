@@ -1623,6 +1623,10 @@ impl QMat for GgufMatrix {
         neon::i8_layout(self.kind).map(|(sc16, min32)| crate::kernels::I8Layout { sc16, min32 })
     }
     #[cfg(target_arch = "aarch64")]
+    unsafe fn fill_pairs4(&self, r: usize, q: *mut i8, ds: *mut f32, p0: usize, mrp: usize) -> bool {
+        self.x4 && r.is_multiple_of(4) && r + 4 <= self.n_out && unsafe { neon::fill_pairs4_x4(self, r, q, ds, p0, mrp) }
+    }
+    #[cfg(target_arch = "aarch64")]
     unsafe fn fill_tile4(&self, r: usize, q: *mut i8, ds: *mut f32) -> bool {
         self.x4 && r.is_multiple_of(4) && r + 4 <= self.n_out && unsafe { neon::fill_tile4_x4(self, r, q, ds) }
     }

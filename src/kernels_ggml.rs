@@ -1269,6 +1269,44 @@ pub(super) unsafe fn fill_tile4_x4(m: &GgufMatrix, r: usize, q: *mut i8, ds: *mu
     true
 }
 
+/// Rows `r..r + 4` (one group) of an interleaved Q8_0 or Q4_0 matrix as pairs `p0`, `p0 + 1` of
+/// the SMMLA GEMM's tile (`QMat::fill_pairs4`): two 4-byte pieces of a row are its 8 values of
+/// an SMMLA operand, so zipping consecutive pieces gives rows 0 and 1, then 2 and 3.
+pub(super) unsafe fn fill_pairs4_x4(m: &GgufMatrix, r: usize, q: *mut i8, ds: *mut f32, p0: usize, mrp: usize) -> bool {
+    let g = m.data.as_ptr().add(r / 4 * 4 * m.row_bytes());
+    let (bsz, nib) = match m.kind {
+        GgmlType::Q8_0 => (136, false),
+        GgmlType::Q4_0 => (72, true),
+        _ => return false,
+    };
+    let (m4, eight) = (vdupq_n_u8(0x0F), vdupq_n_s8(8));
+    for b in 0..m.n_in / 32 {
+        let p = g.add(b * bsz);
+        // Values `4j..4j + 4` of the four rows.
+        let mut e = [vdupq_n_u32(0); 8];
+        if nib {
+            for j in 0..4 {
+                let v = vld1q_u8(p.add(8 + 16 * j));
+                e[j] = vreinterpretq_u32_s8(vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v, m4)), eight));
+                e[4 + j] = vreinterpretq_u32_s8(vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8::<4>(v)), eight));
+            }
+        } else {
+            for (j, v) in e.iter_mut().enumerate() {
+                *v = vld1q_u32(p.add(8 + 16 * j) as *const u32);
+            }
+        }
+        for c in 0..4 {
+            let i = 4 * b + c;
+            vst1q_u32(q.add((i * mrp + p0) * 16) as *mut u32, vzip1q_u32(e[2 * c], e[2 * c + 1]));
+            vst1q_u32(q.add((i * mrp + p0 + 1) * 16) as *mut u32, vzip2q_u32(e[2 * c], e[2 * c + 1]));
+        }
+        let d = f16x4_to_f32(p as *const u16);
+        vst1q_f32(ds.add((b * mrp + p0) * 4), vzip1q_f32(d, d));
+        vst1q_f32(ds.add((b * mrp + p0 + 1) * 4), vzip2q_f32(d, d));
+    }
+    true
+}
+
 /// Row `r` of an interleaved Q8_0 matrix unpacked for the int8 prefill GEMM (as
 /// [`unpack_row_i8`] unpacks a plain row).
 pub(super) unsafe fn unpack_row_i8_x4(m: &GgufMatrix, r: usize, q: *mut i8, ds: *mut f32, mn: *mut f32, sc: *mut i32) {
