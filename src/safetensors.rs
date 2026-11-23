@@ -617,6 +617,9 @@ impl ModelFiles {
     pub fn open(dir: &Path, in_memory: bool) -> Result<Self> {
         // Copied into memory only if that leaves the system its reserve (20% of RAM, at most
         // 2 GB): otherwise mapped, its pages then reclaimable page cache.
+        // Mapped as well when the active GPU backend asks for it (it keeps its own copy of the
+        // weights in the system's memory: `Backend::prefers_mapped_weights`).
+        let in_memory = in_memory && !crate::gpu::active().is_some_and(|b| b.prefers_mapped_weights());
         let in_memory = in_memory && {
             let bytes = checkpoint_bytes(dir);
             let fits = crate::platform::fits_in_memory(bytes);

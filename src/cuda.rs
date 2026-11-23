@@ -32,6 +32,11 @@ const VRAM_RESERVE: usize = 512 << 20;
 /// DGX Spark). Set when a backend opens its device.
 static INTEGRATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether the device in use shares the system's memory ([`INTEGRATED`]).
+fn integrated() -> bool {
+    INTEGRATED.load(Ordering::Relaxed)
+}
+
 /// The memory an allocation on the device can still take, from what `cuMemGetInfo` gave. On an
 /// integrated device the driver reports the system's free pages (`MemFree`, measured on a DGX
 /// Spark), which leaves out the page cache the kernel gives back on demand: the files a model was
@@ -500,6 +505,24 @@ pub(crate) fn ggml_tables_src() -> String {
     s
 }
 
+/// Reads a byte of every page of `[ptr, ptr + bytes)` on the thread pool, so that each is in
+/// this process's page table. On a unified-memory device the driver copies host memory that is
+/// not (the pages of a mapped file nothing has read yet) at 0.3 GB/s, and at 17 GB/s once it is
+/// (measured on a DGX Spark, driver 580.173: docs/platforms.md).
+fn touch_pages(ptr: *const u8, bytes: usize) {
+    const PIECE: usize = 8 << 20;
+    let base = ptr as usize;
+    crate::pool::run(bytes.div_ceil(PIECE), &|i| {
+        let (a, b) = (base + i * PIECE, base + ((i + 1) * PIECE).min(bytes));
+        let mut sum = 0u8;
+        for p in (a..b).step_by(4096) {
+            // SAFETY: inside the caller's buffer.
+            sum = sum.wrapping_add(unsafe { std::ptr::read_volatile(p as *const u8) });
+        }
+        std::hint::black_box(sum);
+    });
+}
+
 #[derive(Default)]
 struct Staging {
     x: u64,
@@ -757,6 +780,9 @@ impl CudaBackend {
         let mut d = 0u64;
         if unsafe { self.cu.cuMemAlloc_v2(&mut d, bytes) } != 0 {
             return None;
+        }
+        if integrated() && bytes >= (1 << 20) {
+            touch_pages(ptr, bytes);
         }
         if unsafe { self.cu.cuMemcpyHtoD_v2(d, ptr as *const c_void, bytes) } != 0 {
             unsafe { self.cu.cuMemFree_v2(d) };
@@ -1922,6 +1948,10 @@ impl Backend for CudaBackend {
     /// layer drafts on the CPU); Qwen3-4B 4-bit at 173 plainly, 140 with its DSpark draft.
     fn prefers_plain_decode(&self) -> bool {
         true
+    }
+
+    fn prefers_mapped_weights(&self) -> bool {
+        integrated() && std::env::var("OXINFER_CUDA_MAP").map_or(true, |v| v != "0")
     }
 
     fn decode_plan<'s>(&'s self, g: &crate::gpu::decode::Graph) -> Option<Box<dyn crate::gpu::decode::DecodePlan + 's>> {

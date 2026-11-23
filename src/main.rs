@@ -2422,7 +2422,7 @@ fn run_qwen(mut args: Args) -> Result<()> {
         model.cfg.num_hidden_layers,
         model.cfg.hidden_size,
         files.total_bytes() as f64 / 1e9,
-        if args.mmap { "mmap" } else { "in RAM" },
+        if args.mmap || gpu_maps_weights() { "mmap" } else { "in RAM" },
         if files.metadata("format") == Some("gguf") {
             "GGUF".to_string()
         } else {
@@ -2587,7 +2587,7 @@ fn run_mistral4(mut args: Args) -> Result<()> {
         model.cfg.num_hidden_layers,
         model.cfg.hidden_size,
         files.total_bytes() as f64 / 1e9,
-        if args.mmap { "mmap" } else { "in RAM" },
+        if args.mmap || gpu_maps_weights() { "mmap" } else { "in RAM" },
         if files.metadata("format") == Some("gguf") {
             "GGUF".to_string()
         } else {
@@ -2713,7 +2713,7 @@ fn run_deepseek4(mut args: Args) -> Result<()> {
         model.cfg.num_hidden_layers,
         model.cfg.hidden_size,
         files.total_bytes() as f64 / 1e9,
-        if args.mmap { "mmap" } else { "in RAM" },
+        if args.mmap || gpu_maps_weights() { "mmap" } else { "in RAM" },
         if files.metadata("format") == Some("gguf") {
             "GGUF".to_string()
         } else {
@@ -2810,7 +2810,7 @@ fn run_kimi(mut args: Args) -> Result<()> {
         model.cfg.num_hidden_layers,
         model.cfg.hidden_size,
         files.total_bytes() as f64 / 1e9,
-        if args.mmap { "mmap" } else { "in RAM" },
+        if args.mmap || gpu_maps_weights() { "mmap" } else { "in RAM" },
         if files.metadata("format") == Some("gguf") {
             "GGUF".to_string()
         } else {
@@ -2883,7 +2883,7 @@ fn run_ripple(mut args: Args) -> Result<()> {
         model.cfg.num_hidden_layers,
         model.cfg.hidden_size,
         files.total_bytes() as f64 / 1e9,
-        if args.mmap { "mmap" } else { "in RAM" },
+        if args.mmap || gpu_maps_weights() { "mmap" } else { "in RAM" },
         model.quant,
         model.streamed_bytes() as f64 / 1e9,
         pool::threads(),
@@ -2934,7 +2934,7 @@ fn run_raon(mut args: Args) -> Result<()> {
         model.cfg.hidden_size,
         model.cfg.streams(),
         files.total_bytes() as f64 / 1e9,
-        if args.mmap { "mmap" } else { "in RAM" },
+        if args.mmap || gpu_maps_weights() { "mmap" } else { "in RAM" },
         model.quant,
         pool::threads(),
         t0.elapsed().as_secs_f64()
@@ -3002,7 +3002,7 @@ fn run_glm5(mut args: Args) -> Result<()> {
         c.kda.iter().filter(|k| **k).count(),
         c.hidden_size,
         files.total_bytes() as f64 / 1e9,
-        if args.mmap { "mmap" } else { "in RAM" },
+        if args.mmap || gpu_maps_weights() { "mmap" } else { "in RAM" },
         if files.metadata("format") == Some("gguf") {
             "GGUF".to_string()
         } else {
@@ -3117,7 +3117,7 @@ fn run_inkling(mut args: Args) -> Result<()> {
         c.sliding.iter().filter(|s| **s).count(),
         c.hidden_size,
         files.total_bytes() as f64 / 1e9,
-        if args.mmap { "mmap" } else { "in RAM" },
+        if args.mmap || gpu_maps_weights() { "mmap" } else { "in RAM" },
         model.quant,
         model.streamed_bytes() as f64 / 1e9,
         pool::threads(),
@@ -3202,7 +3202,7 @@ fn run_nemotron(args: Args) -> Result<()> {
         c.describe(),
         c.hidden_size,
         files.total_bytes() as f64 / 1e9,
-        if args.mmap { "mmap" } else { "in RAM" },
+        if args.mmap || gpu_maps_weights() { "mmap" } else { "in RAM" },
         if files.metadata("format") == Some("gguf") {
             "GGUF".to_string()
         } else {
@@ -3832,6 +3832,12 @@ fn device_memory(args: &Args) -> oxinfer::stream::DeviceMemory {
 
 /// Streams a checkpoint larger than this device holds (a 27B on a 12 GB phone) with the device's
 /// page-cache budget (see `stream::DeviceMemory`), unless told how to load it.
+/// Whether the active GPU backend has checkpoints mapped instead of read into memory
+/// (`Backend::prefers_mapped_weights`: a CUDA device that shares the system's memory).
+fn gpu_maps_weights() -> bool {
+    oxinfer::gpu::active().is_some_and(|b| b.prefers_mapped_weights())
+}
+
 fn auto_stream(args: &mut Args) {
     if args.stream || args.mmap || args.no_stream {
         return;
@@ -3892,7 +3898,7 @@ fn run_gemma_loaded(args: &Args, model: &Model, files: &safetensors::ModelFiles,
         model.cfg.num_hidden_layers,
         model.cfg.hidden_size,
         files.total_bytes() as f64 / 1e9,
-        if args.mmap { "mmap" } else { "in RAM" },
+        if args.mmap || gpu_maps_weights() { "mmap" } else { "in RAM" },
         model.quant,
         model.streamed_bytes() as f64 / 1e9,
         pool::threads(),
@@ -4237,7 +4243,7 @@ fn run_longcat(mut args: Args) -> Result<()> {
         c.n_routed_experts,
         c.oe.as_ref().map_or(String::new(), |oe| format!(", {} n-gram tables", oe.tables())),
         files.total_bytes() as f64 / 1e9,
-        if args.mmap { "mmap" } else { "in RAM" },
+        if args.mmap || gpu_maps_weights() { "mmap" } else { "in RAM" },
         model.quant,
         model.streamed_bytes() as f64 / 1e9,
         pool::threads(),
