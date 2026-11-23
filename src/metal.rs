@@ -991,23 +991,26 @@ inline void mma_bf_tile(device const bfloat* w, device const half* xh, device co
 }
 #else
 // GPUs without matrix units (M1-M4): the same kernels on 8x8 SIMD-group matrices, half operands
-// and f32 accumulators, as on the matrix units. 4 SIMD-groups (2 x 2) per threadgroup; per 64-wide
-// K step the 64 weight rows are dequantized to half in threadgroup memory and the token rows read
-// straight from device memory with transposed 8x8 loads. The outputs are scaled per token row by
-// a product with a diagonal matrix of the rows' inverse scales (powers of two: exact) and stored
-// transposed; adds load the outputs first and take them as the product's accumulator.
+// and f32 accumulators, as on the matrix units. 4 SIMD-groups per threadgroup: 2 x 2 (32 outputs
+// x 32 tokens each) for 64-token tiles, 4 along the outputs (16 outputs each) for 32- and 16-token
+// ones, whose products are then bound by the weights' loads from threadgroup memory rather than
+// by the tokens' (M3 Ultra: 25-40% faster than 2 x 2 there). Per 64-wide K step the 64 weight rows
+// are dequantized to half in threadgroup memory and the token rows read straight from device
+// memory with transposed 8x8 loads. Each lane scales the two elements of an 8x8 result it holds
+// (one output row, two tokens: the lane layout of `metal_pfflash.metal`) by their token rows'
+// inverse scales, adds the outputs to them for an add, and the results are stored transposed.
 #define SG_LDW 72
-#define MMA_WS threadgroup half Ws[64 * SG_LDW + 128 * 8 * 2];
+#define MMA_WS threadgroup half Ws[64 * SG_LDW];
 template <typename W, int TM>
 inline void sg_tile(W w, device const half* xh, device const float* rs, device float* y, uint n_out, uint n_in, uint rows,
                     uint o0, uint t0, uint tid, threadgroup half* Ws, uint ldy, uint add) {
-    constexpr int NB = TM / 16;
+    // SGO SIMD-groups along the outputs (NA 8-row blocks each), 4 / SGO along the tokens (NB).
+    constexpr int SGO = TM >= 64 ? 2 : 4, NA = 8 / SGO, NB = TM / (32 / SGO);
     uint sg = tid / 32;
-    uint so = (sg / 2) * 32, st = (sg % 2) * (TM / 2);
-    threadgroup float* Ds = (threadgroup float*)(Ws + 64 * SG_LDW);
-    simdgroup_float8x8 c[4 * NB];
+    uint so = (sg % SGO) * (8 * NA), st = (sg / SGO) * (8 * NB);
+    simdgroup_float8x8 c[NA * NB];
 #pragma unroll
-    for (int i = 0; i < 4 * NB; i++) c[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.f);
+    for (int i = 0; i < NA * NB; i++) c[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.f);
     uint row = tid / 2, blk = tid % 2;   // each thread dequantizes one 32-block of one row
     threadgroup half4* wd = (threadgroup half4*)(Ws + row * SG_LDW + blk * 32);
     device const half* xs = xh + (ulong)(t0 + st) * n_in;
@@ -1018,39 +1021,36 @@ inline void sg_tile(W w, device const half* xh, device const float* rs, device f
         threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
         for (uint k = 0; k < MKB; k += 8) {
-            simdgroup_half8x8 a[4], b[NB];
+            simdgroup_half8x8 a[NA], b[NB];
 #pragma unroll
-            for (int i = 0; i < 4; i++) simdgroup_load(a[i], Ws + (so + 8 * i) * SG_LDW + k, SG_LDW);
+            for (int i = 0; i < NA; i++) simdgroup_load(a[i], Ws + (so + 8 * i) * SG_LDW + k, SG_LDW);
 #pragma unroll
             for (int j = 0; j < NB; j++) simdgroup_load(b[j], xs + (ulong)(8 * j) * n_in + k0 + k, n_in, ulong2(0, 0), true);
 #pragma unroll
-            for (int i = 0; i < 4; i++)
+            for (int i = 0; i < NA; i++)
 #pragma unroll
                 for (int j = 0; j < NB; j++) simdgroup_multiply_accumulate(c[i * NB + j], a[i], b[j], c[i * NB + j]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    for (uint i = tid; i < TM * 8; i += 128) {
-        uint r = t0 + (i / 64) * 8 + (i % 64) / 8;
-        Ds[i] = (i % 64) / 8 == i % 8 && r < rows ? rs[r] : 0.f;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // This lane's elements of an 8x8 result: column (token) fc and fc + 1 of one row.
+    uint lane = tid % 32;
+    uint fc = ((lane / 4) & 2) * 2 + (lane % 2) * 2;
     uint ld = ldy != 0 ? ldy : n_out;
 #pragma unroll
     for (int j = 0; j < NB; j++) {
         uint tt = t0 + st + 8 * j;
         if (tt >= rows) break;   // rows are whole 8-row blocks
-        simdgroup_float8x8 d;
-        simdgroup_load(d, Ds + (st / 8 + j) * 64, 8);
+        float2 sc = float2(rs[tt + fc], rs[tt + fc + 1]);
 #pragma unroll
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < NA; i++) {
             device float* o = y + (ulong)tt * ld + o0 + so + 8 * i;
+            thread float2& e = reinterpret_cast<thread float2&>(c[i * NB + j].thread_elements());
+            e *= sc;
             if (add != 0) {
                 simdgroup_float8x8 r0;
                 simdgroup_load(r0, o, ld, ulong2(0, 0), true);
-                simdgroup_multiply_accumulate(c[i * NB + j], c[i * NB + j], d, r0);
-            } else {
-                simdgroup_multiply(c[i * NB + j], c[i * NB + j], d);
+                e += reinterpret_cast<thread float2&>(r0.thread_elements());
             }
             simdgroup_store(c[i * NB + j], o, ld, ulong2(0, 0), true);
         }
