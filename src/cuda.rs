@@ -376,6 +376,12 @@ struct GgKernels {
     /// Rows a block of `mv` takes: 8, a row per warp, or `8 N` when the kernel was compiled with
     /// `MV_ROWS` N ([`mv_rows`]).
     mv_block: u32,
+    /// Threads per block of `mv` and `mvp` (`mv_block / rows` warps).
+    mv_threads: u32,
+    /// `mvp_K`: a gate / up pair of this format with the activation (decode plans), and the
+    /// rows a block of it takes (`MVP_ROWS` per warp).
+    mvp: *mut c_void,
+    mvp_block: u32,
 }
 
 /// Rows per warp of the ggml matvec kernel of `kind` (`MV_ROWS` in `inkling_cuda.cu`), 0 for the
@@ -391,8 +397,13 @@ fn mv_rows(kind: crate::ggml::GgmlType, unified: bool) -> u32 {
     if let Some(n) = *ROWS.get_or_init(|| std::env::var("OXINFER_CUDA_MV_ROWS").ok().and_then(|v| v.parse().ok())) {
         return n.min(8);
     }
+    // On a discrete card (an RTX PRO 6000 Blackwell), with the gate / up pairs fused (`mvp`): a
+    // row per warp with blocks of 32 per lane in 128-thread blocks ([`mv_threads`]) decodes
+    // Llama-3.2-1B Q4_K_M at 768 tok/s and Qwen3-8B Q4_K_M at 169, against 666 / 161 for the
+    // warp per row with four values per lane and the pairs unfused; two rows per warp 671 / 172,
+    // 256-thread blocks 713 / 170, 64-thread blocks 750 / 171.
     if !unified {
-        return 0;
+        return 1;
     }
     // GB/s of weights over 17408 x 5120 and 5120 x 17408, two passes each, against the warp
     // per row: IQ4_XS 201 against 156, IQ3_XXS 167 / 148, Q5_K 180 / 154, Q6_K 172 / 153, Q4_K
@@ -404,6 +415,16 @@ fn mv_rows(kind: crate::ggml::GgmlType, unified: bool) -> u32 {
         IQ4_XS | IQ4_NL | IQ3_S | IQ3_XXS | Q2_K | Q3_K | Q4_K | Q5_K | Q6_K | Q8_0 | Q4_0 => 2,
         _ => 0,
     }
+}
+
+/// Threads per block of the ggml matvec: 128 on discrete cards (faster than 256 there, see
+/// [`mv_rows`]), 256 on unified-memory devices (as measured there).
+fn mv_threads(unified: bool) -> u32 {
+    static T: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+    if let Some(n) = *T.get_or_init(|| std::env::var("OXINFER_CUDA_MV_THREADS").ok().and_then(|v| v.parse().ok())) {
+        return n.clamp(32, 1024) / 32 * 32;
+    }
+    if unified { 256 } else { 128 }
 }
 
 /// A weight matrix as the ggml kernels take it (`W` in `inkling_cuda.cu`).
@@ -927,6 +948,7 @@ impl CudaBackend {
     /// kernel with a warp per row and four values per lane).
     fn gg_compile(&self, kind: crate::ggml::GgmlType, rows: u32) -> Option<GgKernels> {
         let id = kind.id();
+        let threads = mv_threads(integrated());
         let body = include_str!("inkling_cuda.cu");
         // Tests may take the kernels from a file (`ggml_bench`: no rebuild per kernel edit).
         #[cfg(test)]
@@ -946,13 +968,14 @@ impl CudaBackend {
                     let mut f = std::ptr::null_mut();
                     (unsafe { self.cu.cuModuleGetFunction(&mut f, module, c.as_ptr()) } == 0).then_some(f)
                 };
-                get(format!("mv_{id}"))
-                    .zip(get(format!("gemmi_{id}")))
-                    .map(|(mv, gemmi)| GgKernels {
-                        mv,
-                        gemmi,
-                        mv_block: 8 * rows.max(1),
-                    })
+                Some(GgKernels {
+                    mv: get(format!("mv_{id}"))?,
+                    gemmi: get(format!("gemmi_{id}"))?,
+                    mv_block: threads / 32 * rows.max(1),
+                    mv_threads: threads,
+                    mvp: get(format!("mvp_{id}"))?,
+                    mvp_block: threads / 32 * rows.max(1),
+                })
             }
             Err(e) => {
                 eprintln!("[cuda: no kernels for {kind} weights ({e}): they stay on the CPU]");
@@ -2920,6 +2943,12 @@ mod tests {
                 .upload_weight(&WeightRef::Gguf(&m))
                 .unwrap_or_else(|| panic!("{kind}: no device weight"));
             let (k, w) = Wg::of(&cw).unwrap();
+            // A second matrix of the format: the up half of a gate / up pair.
+            let bytes2 = random_blocks(kind, n_out * n_in / kind.block_size(), &mut seed);
+            let m2 = GgufMatrix::from_bytes(kind, &bytes2, n_out, n_in).unwrap();
+            let mut dense2 = vec![0f32; n_out * n_in];
+            m2.dequantize_rows(0, n_out, &mut dense2);
+            let cw2 = be.upload_weight(&WeightRef::Gguf(&m2)).unwrap();
             for mode in 0u32..2 {
                 let mut r = vec![0f32; t * n_out];
                 let mut mag = vec![0f64; t * n_out];
@@ -2956,7 +2985,7 @@ mod tests {
                     &ysu as *const _ as *mut c_void,
                     &mode as *const _ as *mut c_void,
                 ];
-                assert!(be.launch(k.mv, (no.div_ceil(k.mv_block), t as u32), 256, &mut args));
+                assert!(be.launch(k.mv, (no.div_ceil(k.mv_block), t as u32), k.mv_threads, &mut args));
                 check("matvec", 2e-6);
                 // The matvec with a lane per block of 32 (`MV_ROWS`: 1, and 3 rows per warp, a
                 // partial last warp), and the one with a warp per row, whatever this device takes.
@@ -2968,8 +2997,51 @@ mod tests {
                         .gg_compile(kind, rows)
                         .unwrap_or_else(|| panic!("{kind}: no kernels with {rows} rows per warp"));
                     assert!(be.htod(dy, &y0));
-                    assert!(be.launch(kr.mv, (no.div_ceil(kr.mv_block), t as u32), 256, &mut args));
+                    assert!(be.launch(kr.mv, (no.div_ceil(kr.mv_block), t as u32), kr.mv_threads, &mut args));
                     check(&format!("matvec, {rows} rows per warp"), 2e-6);
+                }
+                // The gate / up pair (`mvp`) with this matrix as the gate and `m2` as the up:
+                // act(g) * u, SiLU (mode 0) or GELU (mode 1), against the f64 definition, to
+                // 2e-6 of the product of the two dots' summed magnitudes.
+                {
+                    let gelu = mode;
+                    let (w2, d2) = (&cw2, &dense2);
+                    let (_, wg2) = Wg::of(w2).unwrap();
+                    let mut args = [
+                        &w as *const _ as *mut c_void,
+                        &wg2 as *const _ as *mut c_void,
+                        &dx as *const _ as *mut c_void,
+                        &dy as *const _ as *mut c_void,
+                        &ni as *const _ as *mut c_void,
+                        &no as *const _ as *mut c_void,
+                        &xsu as *const _ as *mut c_void,
+                        &ysu as *const _ as *mut c_void,
+                        &gelu as *const _ as *mut c_void,
+                    ];
+                    assert!(be.launch(k.mvp, (no.div_ceil(k.mvp_block), t as u32), k.mv_threads, &mut args));
+                    let mut y = vec![0f32; t * n_out];
+                    assert_eq!(unsafe { be.cu.cuMemcpyDtoH_v2(y.as_mut_ptr() as *mut c_void, dy, y.len() * 4) }, 0);
+                    let mut worst = 0f64;
+                    for j in 0..t {
+                        let xr = &x[j * xs..j * xs + n_in];
+                        for o in 0..n_out {
+                            let dots = |d: &[f32]| {
+                                let row = &d[o * n_in..(o + 1) * n_in];
+                                let v: f64 = row.iter().zip(xr).map(|(&a, &b)| a as f64 * b as f64).sum();
+                                let m: f64 = row.iter().zip(xr).map(|(&a, &b)| (a as f64 * b as f64).abs()).sum();
+                                (v, m)
+                            };
+                            let ((g, mg), (u, mu)) = (dots(&dense), dots(d2));
+                            let act = if gelu == 1 {
+                                0.5 * g * (1.0 + (0.7978845608 * (g + 0.044715 * g * g * g)).tanh())
+                            } else {
+                                g / (1.0 + (-g).exp())
+                            };
+                            let e = (y[j * n_out + o] as f64 - act * u).abs() / ((mg + 1e-3) * (mu + 1e-3));
+                            worst = worst.max(e);
+                        }
+                    }
+                    assert!(worst < 2e-6, "{kind} gate / up pair (gelu {gelu}): {worst:.2e}");
                 }
                 // The GEMM (rows of x `xs` apart).
                 assert!(be.htod(dy, &y0));
@@ -2989,6 +3061,7 @@ mod tests {
                 check("gemm", 2e-6);
             }
             be.free_weight(&cw);
+            be.free_weight(&cw2);
         }
         // Activations the GEMM's f16 halves cannot hold are declined too.
         {
@@ -3468,7 +3541,7 @@ mod tests {
                         &zero as *const _ as *mut c_void,
                         &zero as *const _ as *mut c_void,
                     ];
-                    assert!(be.launch(k.mv, (no.div_ceil(k.mv_block), 1), 256, &mut args));
+                    assert!(be.launch(k.mv, (no.div_ceil(k.mv_block), 1), k.mv_threads, &mut args));
                 };
                 let p = GemmP {
                     x: dx,

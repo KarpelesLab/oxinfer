@@ -200,9 +200,12 @@ format the first time a weight of it is uploaded and kept in `~/.cache/oxinfer/k
 F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ1_S, IQ1_M, IQ2_XXS,
 IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and MXFP4. Three things run on them:
 
-- **Decode steps**: a matvec per format, a warp per row, activations f32 (a gate / up pair is
-  two matvecs and the activation). Multi-token plans (speculative verification) launch the same
-  kernel with a grid row per token, so their results are the single-token steps' bit for bit.
+- **Decode steps**: a matvec per format, activations f32; on discrete cards a warp per row and a
+  lane per block of 32 in 128-thread blocks, and a gate / up pair of one format in one launch
+  with the activation. Multi-token plans (speculative verification) launch the same kernel with
+  a grid row per token, so their results are the single-token steps' bit for bit. On an RTX PRO
+  6000 Blackwell (`parity_bench`, tg128): Llama-3.2-1B Q4_K_M 768 tok/s and Qwen3-8B Q4_K_M 169
+  (666 / 161 with 4 values per lane and the pairs unfused; llama.cpp `e6d624b` 1067 / 254).
 - **Prompts, whole pass** (`decode_plan_prefill`, steps of up to 512 tokens,
   `OXINFER_CUDA_PREFILL_TOKENS`; `OXINFER_PREFILL_GPU=0` keeps the op-by-op path): the matmuls as
   tensor-core GEMMs with the weights' integer values as stored (exact in f16), the activations as
@@ -625,7 +628,8 @@ copy and its pinned buffer; not kept either.
 matvec now takes whole blocks of 32 values and a warp two rows (eight for the IQ2 formats), so
 that what a block's values share is decoded once per block and each block of the input is
 loaded once for the rows (`MV_ROWS` in `inkling_cuda.cu`; `OXINFER_CUDA_MV_ROWS=N` for every
-format, 0 the discrete cards' kernel). GB/s of weights by format, 17408 x 5120 and 5120 x 17408,
+format, 0 the warp-per-row kernel; discrete cards take one row per warp in 128-thread blocks,
+`OXINFER_CUDA_MV_THREADS`, and fuse a gate / up pair: see [GGUF weights](#cuda)). GB/s of weights by format, 17408 x 5120 and 5120 x 17408,
 two passes each, before / after: IQ4_XS 156 / 201, IQ4_NL 154 / 204, Q4_0 180 / 222, Q8_0 184 /
 207, Q5_K 154 / 180, Q6_K 153 / 172, IQ3_XXS 148 / 167, Q4_K 146 / 161, Q2_K 208 / 221, Q3_K
 129 / 136, IQ3_S 148 / 154, IQ2_XXS 155 / 222, IQ2_XS 187 / 226, IQ2_S 186 / 197 (formats not

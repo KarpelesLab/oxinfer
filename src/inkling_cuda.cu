@@ -388,7 +388,7 @@ __device__ __forceinline__ float2 rowdot2(const W& w, const u8* ra, const u8* rb
 }
 
 // y[tok][r] (= or +=) W[r] . x[tok]: 8 rows per 256-thread block, grid.y tokens.
-// `MV_ROWS` (N; the launch then takes `8 N` rows per block): a warp takes N consecutive rows and a
+// `MV_ROWS` (N; the launch then takes N rows per warp of its block): a warp takes N consecutive rows and a
 // lane whole blocks of 32 values, so each block of `x` is loaded once for the N rows and what a
 // block's values share (its scale, the superblock's header) is decoded once per 32 values, not
 // once per 4. For devices whose matvecs are bound by the loads and the arithmetic and not by the
@@ -438,6 +438,64 @@ __device__ __forceinline__ void mv_body(const W& w, const float* x, float* y, u3
     if (lane == 0) {
         float* o = y + (u64)blockIdx.y * ys + r;
         *o = mode ? *o + acc : acc;
+    }
+}
+
+// A gate / up pair (the language models' plans): y[tok][r] = act(W[r] . x) * (W2[r] . x), act SiLU
+// (gelu 0) or tanh GELU (1), the two matrices in the same format. As `mv_body` with `MV_ROWS`
+// (a lane per block of 32), the warp taking MVP_ROWS rows of both: each block of x is loaded once
+// for the 2 MVP_ROWS rows.
+#ifndef MVP_ROWS
+#ifdef MV_ROWS
+#define MVP_ROWS MV_ROWS
+#else
+#define MVP_ROWS 1
+#endif
+#endif
+template <int K>
+__device__ __forceinline__ void mvp_body(const W& w, const W& w2, const float* x, float* y, u32 n_in, u32 n_out, u32 xs, u32 ys, u32 gelu) {
+    u32 warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    u32 r0 = (blockIdx.x * (blockDim.x >> 5) + warp) * MVP_ROWS;
+    if (r0 >= n_out) return;
+    const float* xt = x + (u64)blockIdx.y * xs;
+    float a[2][MVP_ROWS];
+#pragma unroll
+    for (int i = 0; i < MVP_ROWS; i++) a[0][i] = a[1][i] = 0.f;
+    for (u32 b = lane; b < n_in / 32; b += 32) {
+        float4 xv[8];
+#pragma unroll
+        for (int j = 0; j < 8; j++) xv[j] = *(const float4*)(xt + 32 * b + 4 * j);
+#pragma unroll
+        for (int m = 0; m < 2; m++) {
+            const W& ww = m ? w2 : w;
+#pragma unroll
+            for (int i = 0; i < MVP_ROWS; i++) {
+                u32 row = min(r0 + i, n_out - 1);
+                const u8* rp = ww.q + (u64)row * ww.rb;
+                float p = 0.f;
+#pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    float4 v = dq<K>(rp, b, j);
+                    p += v.x * xv[j].x + v.y * xv[j].y + v.z * xv[j].z + v.w * xv[j].w;
+                }
+                if constexpr (BLOCK_SCALED(K)) p *= ww.s[(row / ww.sr) * ww.ncb + (32 * b) / ww.sc];
+                a[m][i] += p;
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < MVP_ROWS; i++) {
+        float g = warp_sum(a[0][i]) * w.f, u = warp_sum(a[1][i]) * w2.f;
+        if (lane == 0 && r0 + i < n_out) {
+            float act;
+            if (gelu) {
+                float t = 0.7978845608f * (g + 0.044715f * g * g * g);
+                act = 0.5f * g * (1.0f + tanhf(t));
+            } else {
+                act = g / (1.0f + expf(-g));
+            }
+            y[(u64)blockIdx.y * ys + r0 + i] = act * u;
+        }
     }
 }
 
@@ -1347,6 +1405,9 @@ __device__ __forceinline__ void gemmi_any(const W& w, const GemmP& p) {
 #define KERNELS(K)                                                                                                                         \
     extern "C" __global__ void __launch_bounds__(256) mv_##K(W w, const float* x, float* y, u32 n_in, u32 n_out, u32 xs, u32 ys, u32 mode) { \
         mv_body<K>(w, x, y, n_in, n_out, xs, ys, mode);                                                                                    \
+    }                                                                                                                                      \
+    extern "C" __global__ void __launch_bounds__(256) mvp_##K(W w, W w2, const float* x, float* y, u32 n_in, u32 n_out, u32 xs, u32 ys, u32 gelu) { \
+        mvp_body<K>(w, w2, x, y, n_in, n_out, xs, ys, gelu);                                                                               \
     }                                                                                                                                      \
     extern "C" __global__ void __launch_bounds__(128) gemm_##K(W w, GemmP p) { gemm_body<K, false>(w, p); }                  \
     extern "C" __global__ void __launch_bounds__(128) gemmi_##K(W w, GemmP p) { gemmi_any<K>(w, p); }

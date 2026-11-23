@@ -17,7 +17,8 @@
 //! step replays them ([`DecodePlan::replay_recurrent`]).
 //!
 //! GGUF weights are read as stored by kernels of their own (`inkling_cuda.cu`'s matvec, one module
-//! per ggml format: [`COp::Gmv`]); a gate / up pair of them is two matvecs and the activation.
+//! per ggml format: [`COp::Gmv`]); a gate / up pair of one format is one matvec with the activation
+//! (`mvp_K`; two matvecs and the activation otherwise, and in prefill plans).
 //!
 //! Prefill plans (`Backend::decode_plan_prefill`, GGUF weights only) are multi-token plans of up
 //! to 512 tokens whose matvecs run as tensor-core GEMMs over the stored blocks (`gemmi_K`) and
@@ -193,6 +194,9 @@ enum COp {
     Gmv {
         k: super::GgKernels,
         w: Wg,
+        /// A gate / up pair of one format (`mvp_K`, decode plans only): the up matrix; `mode`
+        /// 0 SiLU, 1 GELU.
+        w2: Option<Wg>,
         x: P,
         y: P,
         n_out: u32,
@@ -813,6 +817,7 @@ impl CudaBackend {
                                 ops.push(COp::Gmv {
                                     k,
                                     w,
+                                    w2: None,
                                     x: byte(x),
                                     y,
                                     n_out: n_out as u32,
@@ -825,6 +830,20 @@ impl CudaBackend {
                                 (LinMode::Add, None) => mv(k, wg, byte(y), 1),
                                 (LinMode::SiluPair | LinMode::GeluPair, Some((WeightRef::Gguf(_), d2))) => {
                                     let (k2, wg2) = Wg::of(&d2.downcast_ref::<CudaWeightBox>()?.0)?;
+                                    // One format: one launch for both and the activation.
+                                    if !pf && k.mvp == k2.mvp {
+                                        ops.push(COp::Gmv {
+                                            k,
+                                            w: wg,
+                                            w2: Some(wg2),
+                                            x: byte(x),
+                                            y: byte(y),
+                                            n_out: n_out as u32,
+                                            n_in: n_in as u32,
+                                            mode: (mode == LinMode::GeluPair) as u32,
+                                        });
+                                        continue;
+                                    }
                                     let ts = if mt { n_out.next_multiple_of(64) } else { n_out };
                                     pair_floats = pair_floats.max(ts);
                                     let gate = P { a: G, ts: (ts * 4) as u64 };
@@ -1553,14 +1572,23 @@ impl CudaPlan<'_> {
                 n_out,
                 n_in,
                 mode,
+                w2,
             } => {
                 let (x, y, one) = (x.at(j), y.at(j), 0u32);
-                be.launch(
-                    k.mv,
-                    (n_out.div_ceil(k.mv_block), 1),
-                    256,
-                    &mut args![w, x, y, n_in, n_out, one, one, mode],
-                )
+                match w2 {
+                    Some(w2) => be.launch(
+                        k.mvp,
+                        (n_out.div_ceil(k.mvp_block), 1),
+                        k.mv_threads,
+                        &mut args![w, w2, x, y, n_in, n_out, one, one, mode],
+                    ),
+                    None => be.launch(
+                        k.mv,
+                        (n_out.div_ceil(k.mv_block), 1),
+                        k.mv_threads,
+                        &mut args![w, x, y, n_in, n_out, one, one, mode],
+                    ),
+                }
             }
             COp::Topk {
                 f,
@@ -1791,6 +1819,7 @@ impl CudaPlan<'_> {
             COp::Gmv {
                 k,
                 w,
+                w2: None,
                 x,
                 y,
                 n_out,
@@ -1960,15 +1989,24 @@ impl CudaPlan<'_> {
                 n_out,
                 n_in,
                 mode,
+                w2,
             } if t > 1 => {
                 // A grid row per token: each token's sums are the single-token launch's.
                 let (xa, ya, xs, ys) = (x.a, y.a, (x.ts / 4) as u32, (y.ts / 4) as u32);
-                return be.launch(
-                    k.mv,
-                    (n_out.div_ceil(k.mv_block), t as u32),
-                    256,
-                    &mut args![w, xa, ya, n_in, n_out, xs, ys, mode],
-                );
+                return match w2 {
+                    Some(w2) => be.launch(
+                        k.mvp,
+                        (n_out.div_ceil(k.mvp_block), t as u32),
+                        k.mv_threads,
+                        &mut args![w, w2, xa, ya, n_in, n_out, xs, ys, mode],
+                    ),
+                    None => be.launch(
+                        k.mv,
+                        (n_out.div_ceil(k.mv_block), t as u32),
+                        k.mv_threads,
+                        &mut args![w, xa, ya, n_in, n_out, xs, ys, mode],
+                    ),
+                };
             }
             COp::GdnConv { x, save, dim, .. } if save.a != 0 => {
                 if !self.copy_rows(x, save, dim, t) {
