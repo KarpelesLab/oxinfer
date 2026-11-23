@@ -1776,7 +1776,12 @@ pub(crate) fn moe_forward(
                 *v = dot(&m.router[e * h..(e + 1) * h], x);
             }
         });
+    } else if t >= 64 {
+        // Prefill chunks: one f32 GEMM (a 2048-token chunk spent 37 ms per layer in dot products).
+        logits = crate::sd::ops::matmul_f32(&m.router, ne, h, x, t);
     } else {
+        // (Short passes keep the one-token arithmetic: speculative verification reproduces
+        // plain decoding.)
         for_chunks(&mut logits, ne, true, |ti, lg| {
             for (v, w) in lg.iter_mut().zip(m.router.chunks(h)) {
                 *v = dot(w, &x[ti * h..(ti + 1) * h]);

@@ -68,7 +68,7 @@ pub(super) unsafe fn rows<const TC: usize>(m: &GgufMatrix, x: &Act, y: *mut f32,
         GgmlType::IQ2_S => sb16::<TC, Iq2S>,
         GgmlType::IQ3_XXS => sb16::<TC, Iq3Xxs>,
         GgmlType::IQ3_S => sb16::<TC, Iq3S>,
-        GgmlType::IQ1_S => sb16::<TC, Iq1S>,
+        GgmlType::IQ1_S => iq1s::<TC>,
         GgmlType::IQ1_M => sb16::<TC, Iq1M>,
         GgmlType::Q2_K => q2k::<TC>,
         GgmlType::IQ4_XS => iq4xs::<TC>,
@@ -647,6 +647,46 @@ impl Sb16 for Iq1S {
         });
         f16p(b) * 0.125
     }
+}
+
+/// IQ1_S rows for the one-token kernels: `sb16::<TC, Iq1S>` with the `+-1` delta out of the
+/// weights. Per 32 values `sum((8 g + delta) x) = 8 sum(g x) + delta sum(x)`, the sum of `x` being
+/// the activations' integer block sum, so the ternary grid entries go straight into the dot
+/// products (no shift and add per vector) and each 32 takes its scale once. The integer sums
+/// equal `sb16`'s, and the float steps are the same: the results are bit for bit `sb16`'s.
+unsafe fn iq1s<const TC: usize>(row: *const u8, n_in: usize, x: &Act) -> [f32; TC] {
+    use super::tables::IQ1S_GRID as G;
+    let bpr = n_in / 32;
+    let mut acc = [vdupq_n_f32(0.0); TC];
+    let gp = G.as_ptr();
+    for sb in 0..n_in / QK_K {
+        let b = row.add(sb * 50);
+        let mut w = [vdupq_n_s8(0); 16];
+        let (mut sc, mut dl) = ([0i32; 8], [0i32; 8]);
+        unroll8!(ib, {
+            let qh = rd16(b.add(34 + 2 * ib)) as usize;
+            sc[ib] = (2 * ((qh >> 12) & 7) + 1) as i32;
+            dl[ib] = if qh & 0x8000 != 0 { -1 } else { 1 };
+            let q4 = rd32(b.add(2 + 4 * ib)) as usize;
+            let g = |l: usize| gp.add(((q4 >> (8 * l)) & 255) | (((qh >> (3 * l)) & 7) << 8));
+            for h in 0..2 {
+                w[2 * ib + h] = vreinterpretq_s8_u64(vcombine_u64(vld1_u64(g(2 * h)), vld1_u64(g(2 * h + 1))));
+            }
+        });
+        let d = vdupq_n_f32(f16p(b) * 0.125);
+        let (sc0, sc1) = (vld1q_s32(sc.as_ptr()), vld1q_s32(sc.as_ptr().add(4)));
+        let (dl0, dl1) = (vld1q_s32(dl.as_ptr()), vld1q_s32(dl.as_ptr().add(4)));
+        for c in 0..TC {
+            let (g0, g1) = sums32(&w, x.q.add(c * n_in + sb * QK_K));
+            let xi = x.i.add(c * bpr + sb * 8);
+            let a0 = vmulq_s32(vmlaq_n_s32(vmulq_s32(dl0, vld1q_s32(xi)), g0, 8), sc0);
+            let a1 = vmulq_s32(vmlaq_n_s32(vmulq_s32(dl1, vld1q_s32(xi.add(4))), g1, 8), sc1);
+            let xs = x.s.add(c * bpr + sb * 8);
+            let v = vfmaq_f32(acc[c], vcvtq_f32_s32(a0), vmulq_f32(d, vld1q_f32(xs)));
+            acc[c] = vfmaq_f32(v, vcvtq_f32_s32(a1), vmulq_f32(d, vld1q_f32(xs.add(4))));
+        }
+    }
+    finish(acc)
 }
 
 /// IQ1_M: like IQ1_S with the delta sign per 8 values, 3-bit scales per 16 and the f16 super-block

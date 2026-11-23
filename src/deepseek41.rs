@@ -417,14 +417,18 @@ fn engram(m: &DeepSeek4Model, e: &Engram, hist: &[i32], start: usize, t: usize, 
         hash.ids(e.li, hist, start + ti, row);
         row.iter_mut().for_each(|r| *r += e.base);
     }
+    let ph = prof::phase(12, "engram rows");
     if let Some(s) = &m.stream {
         let rows: Vec<(usize, usize)> = ids.iter().flat_map(|&r| e.table.row_ranges(r, ed)).collect();
         s.need_ranges(&rows);
     }
     let mut emb = vec![0f32; t * cols * ed];
     for_chunks(&mut emb, ed, t > 1, |i, row| e.table.row(ids[i], row));
+    drop(ph);
     let mut kv = vec![0f32; t * (n + 1) * h];
+    let ph = prof::phase(11, "engram proj");
     linear(&e.wkv, (n + 1) * h, cols * ed, &emb, t, &mut kv);
+    drop(ph);
     let eps = c.rms_norm_eps as f32;
     for_chunks(x, n * h, t > 1, |ti, xr| {
         // An image position takes no lookup.

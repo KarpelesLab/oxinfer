@@ -1404,6 +1404,47 @@ impl Inner {
             self.c.bytes_cached.fetch_add(n, Relaxed);
             return 0;
         }
+        let rate = f64::from_bits(self.rate.load(Relaxed));
+        if demand && matches!(self.opts.io, IoMethod::Advise) && !(throttle && rate > 0.0) {
+            // On demand, without emulated storage: every missing chunk's read is requested first
+            // (asynchronous advisory reads), then the chunks are touched, so that many small
+            // spans (the engram rows of a prefill chunk: ~50k pages spread over 110 GB) are read
+            // with that many requests in flight instead of one per reader thread.
+            let mut missing = Vec::new();
+            let mut total = 0u64;
+            for c in &chunks {
+                let have = if cached(c) {
+                    c.len as u64
+                } else {
+                    sys::resident_bytes(c.addr, c.len, page).unwrap_or(0).min(c.len as u64)
+                };
+                self.c.bytes_cached.fetch_add(have, Relaxed);
+                let miss = c.len as u64 - have;
+                if miss > 0 {
+                    total += miss;
+                    sys::advise(&self.files[c.file], *c);
+                    missing.push(*c);
+                }
+            }
+            self.c.bytes_read.fetch_add(total, Relaxed);
+            if !notouch {
+                let next = std::sync::atomic::AtomicUsize::new(0);
+                let touch_all = || {
+                    crate::pool::raise_qos();
+                    while let Some(c) = missing.get(next.fetch_add(1, Relaxed)) {
+                        touch(c.addr, c.len, page);
+                    }
+                };
+                let n = self.opts.io_threads.max(missing.len() / 256).clamp(1, 8).min(missing.len().max(1));
+                std::thread::scope(|sc| {
+                    for _ in 1..n {
+                        sc.spawn(touch_all);
+                    }
+                    touch_all();
+                });
+            }
+            return total;
+        }
         let n = self.opts.io_threads.clamp(1, chunks.len().max(1));
         if n == 1 {
             work();
