@@ -1920,6 +1920,32 @@ pub fn set_decode_max_tokens(n: usize) {
     DECODE_MAX_TOKENS.store(n.clamp(7, 15), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether decode passes run a gated MLP's projections, activation and quantization in one
+/// region ([`matmul_quant_glu`]): 0 off, 1 on, 2 not read yet (`OXINFER_DECODE_GLU=0` turns it
+/// off).
+static GLU_FUSED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
+/// See [`set_glu_fused`].
+pub(crate) fn glu_fused() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match GLU_FUSED.load(Relaxed) {
+        2 => {
+            let on = std::env::var("OXINFER_DECODE_GLU").map_or(true, |v| v != "0");
+            GLU_FUSED.store(on as u8, Relaxed);
+            on
+        }
+        v => v == 1,
+    }
+}
+
+/// For benchmarks: `false` runs a decode pass's gated MLP as separate steps (a region for the
+/// gate and up projections, one for the activation, the down projection's quantization on the
+/// calling thread), as before [`matmul_quant_glu`]. Results are identical.
+#[doc(hidden)]
+pub fn set_glu_fused(on: bool) {
+    GLU_FUSED.store(on as u8, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Kernels for quantized decode passes of 2 or more tokens (speculative verification). All three
 /// give bit-identical rows whatever the token count; they differ in speed only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2542,6 +2568,56 @@ pub fn matmul_quant_batch<M: QMat>(xs: &[QAct], jobs: &mut [(&M, usize, &mut [f3
     });
 }
 
+/// The gated projection of an MLP on the decode kernels, `t` tokens (at most
+/// [`decode_max_tokens`]) of `x` ([t, n_in]): `act(gate x, up x)` (`act(g, u)` writes into `g`,
+/// elementwise), returned quantized as the input of the down projection, in one parallel region.
+/// Each task takes the same rows of `gate` and `up` (whole blocks of 32), applies the activation
+/// to them and quantizes them, instead of a region for both matmuls, one for the activation and
+/// the quantization of the whole row on the calling thread. Bit-identical to those steps: the
+/// rows are the same kernels' and the activation and quantization work element by element and
+/// block by block. Neither matrix may be float-stored, both have the same shape, and `n_out` is a
+/// multiple of 32.
+pub(crate) fn matmul_quant_glu<M: QMat>(gate: &M, up: &M, x: &[f32], t: usize, act: &(dyn Fn(&mut [f32], &mut [f32]) + Sync)) -> QAct {
+    let (n_in, inter) = (gate.n_in(), gate.n_out());
+    assert!(up.n_in() == n_in && up.n_out() == inter && inter.is_multiple_of(QBLOCK));
+    assert!(!gate.dense() && !up.dense() && t <= decode_max_tokens());
+    assert_eq!(x.len(), t * n_in, "input shape mismatch");
+    let _timer = prof::start(Cat::Matmul);
+    let total = gate.bytes() + up.bytes();
+    prof::add_bytes(total);
+    let xa = quantize_act(x, t, n_in);
+    let mode = multi_token_kernels();
+    let multi = (3..=MULTI_MAX).contains(&t) && mode != MultiTokenKernels::Pairs;
+    let pairs = (multi && mode == MultiTokenKernels::Auto && cpu_has_i8mm() && (gate.multi(t) == Some(true) || up.multi(t) == Some(true)))
+        .then(|| PairAct::new(&xa));
+    // Blocks as `matmul_quant_multi` sizes them for the two matrices together, in whole blocks
+    // of 32 rows of each.
+    let target = (total / (pool::threads() * 8)).max(128 * 1024);
+    let rows = ((target * inter / total.max(1) + QBLOCK / 2) / QBLOCK * QBLOCK).max(QBLOCK);
+    let mut g = scratch(t * inter);
+    let mut u = scratch(t * inter);
+    let (gp, up_) = (SendPtr(g.as_mut_ptr()), SendPtr(u.as_mut_ptr()));
+    let fill = crate::quant::QActFill::new(t, inter);
+    pool::run(inter.div_ceil(rows), &|b| {
+        let (r0, r1) = (b * rows, ((b + 1) * rows).min(inter));
+        // SAFETY: tasks write disjoint rows `r0..r1` of every token's `g` and `u` (and the
+        // matching blocks of `fill`), which outlive the region.
+        unsafe {
+            decode_rows(gate, &xa, pairs.as_ref(), multi, gp.get(), r0, r1);
+            decode_rows(up, &xa, pairs.as_ref(), multi, up_.get(), r0, r1);
+            for c in 0..t {
+                let gs = std::slice::from_raw_parts_mut(gp.get().add(c * inter + r0), r1 - r0);
+                let us = std::slice::from_raw_parts_mut(up_.get().add(c * inter + r0), r1 - r0);
+                act(gs, us);
+                fill.fill(c, r0, gs);
+            }
+        }
+    });
+    recycle(g);
+    recycle(u);
+    fill.finish()
+}
+
 /// Tuning of the cache-blocked AVX-512 prefill GEMM ([`gemm_blocked`]): columns per block
 /// (`OXINFER_GEMM_KB`, a multiple of 256), rows per pool job (`OXINFER_GEMM_ROWS`, a multiple of
 /// 16) and tokens per pool job (`OXINFER_GEMM_TOKENS`, a multiple of 16). None of them changes a
@@ -3027,18 +3103,20 @@ pub fn silu_mul(a: &mut [f32], b: &[f32]) {
     let _timer = prof::start(Cat::Elementwise);
     let par = a.len() >= PAR_MIN;
     let chunk = if par { par_chunk(a.len()) } else { a.len() };
-    for_chunks(a, chunk, par, |i, c| {
-        let b = &b[i * chunk..];
-        wide(
-            #[inline(always)]
-            || {
-                for (ai, &bi) in c.iter_mut().zip(b) {
-                    let x = *ai;
-                    *ai = x / (1.0 + fast_exp(-x)) * bi;
-                }
-            },
-        )
-    });
+    for_chunks(a, chunk, par, |i, c| silu_mul_serial(c, &b[i * chunk..]));
+}
+
+/// [`silu_mul`] on the calling thread, untimed (inside parallel regions).
+pub(crate) fn silu_mul_serial(a: &mut [f32], b: &[f32]) {
+    wide(
+        #[inline(always)]
+        || {
+            for (ai, &bi) in a.iter_mut().zip(b) {
+                let x = *ai;
+                *ai = x / (1.0 + fast_exp(-x)) * bi;
+            }
+        },
+    )
 }
 
 /// Runs `f(index, chunk)` over fixed-size chunks, in parallel only when asked.
@@ -3093,11 +3171,14 @@ pub fn gelu_mul(a: &mut [f32], b: &[f32]) {
     let _timer = prof::start(Cat::Elementwise);
     let par = a.len() >= PAR_MIN;
     let chunk = if par { par_chunk(a.len()) } else { a.len() };
-    for_chunks(a, chunk, par, |i, c| {
-        for (ai, &bi) in c.iter_mut().zip(&b[i * chunk..]) {
-            *ai = gelu_tanh(*ai) * bi;
-        }
-    });
+    for_chunks(a, chunk, par, |i, c| gelu_mul_serial(c, &b[i * chunk..]));
+}
+
+/// [`gelu_mul`] on the calling thread, untimed (inside parallel regions).
+pub(crate) fn gelu_mul_serial(a: &mut [f32], b: &[f32]) {
+    for (ai, &bi) in a.iter_mut().zip(b) {
+        *ai = gelu_tanh(*ai) * bi;
+    }
 }
 
 pub fn add_inplace(a: &mut [f32], b: &[f32]) {
@@ -3343,6 +3424,42 @@ mod tests {
     fn lcg(seed: &mut u64) -> f32 {
         *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
         ((*seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+    }
+
+    /// The fused gated projection ([`matmul_quant_glu`]) gives the separate steps' activations
+    /// bit for bit: the two matmuls, the activation over the whole rows, then their quantization.
+    #[test]
+    fn glu_matches_separate_steps_bitwise() {
+        use crate::ggml::{GgmlType, GgufMatrix, random_blocks};
+        for (kind, inter, n_in, t) in [
+            (GgmlType::Q8_0, 352, 256, 1),
+            (GgmlType::Q8_0, 4096, 256, 3),
+            (GgmlType::Q4_K, 1056, 512, 1),
+            (GgmlType::Q4_K, 512, 512, 5),
+        ] {
+            let mut seed = 5u64;
+            let mut mat = || {
+                let bytes = random_blocks(kind, inter * n_in / kind.block_size(), &mut seed);
+                GgufMatrix::from_bytes(kind, &bytes, inter, n_in).unwrap()
+            };
+            let (gate, up) = (mat(), mat());
+            let mut s = 7u64;
+            let x: Vec<f32> = (0..t * n_in).map(|_| lcg(&mut s)).collect();
+            for act in [crate::moe::Act::Silu, crate::moe::Act::GeluTanh] {
+                let (mut g, mut u) = (vec![0f32; t * inter], vec![0f32; t * inter]);
+                matmul_quant_multi(&mut [(&gate, &mut g[..]), (&up, &mut u[..])], &x, t);
+                act.apply(&mut g, &mut u);
+                let want = quantize_act(&g, t, inter);
+                let got = matmul_quant_glu(&gate, &up, &x, t, &|g: &mut [f32], u: &mut [f32]| act.apply_serial(g, u));
+                assert_eq!((got.t, got.n_in), (t, inter));
+                assert_eq!(got.q, want.q, "{kind:?} {t} tokens");
+                let bits = |v: &[f32]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+                assert_eq!(bits(&got.scales), bits(&want.scales));
+                assert_eq!(got.sums, want.sums);
+                assert_eq!(bits(&got.fsums), bits(&want.fsums));
+                assert_eq!(bits(&got.hsums), bits(&want.hsums));
+            }
+        }
     }
 
     fn reference(wf: &[f32], n_out: usize, n_in: usize, xa_f: &[f32], t: usize) -> Vec<f32> {

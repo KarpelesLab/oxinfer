@@ -35,6 +35,23 @@ impl Act {
             }
         }
     }
+    /// [`Act::apply`] on the calling thread, untimed (the rows of one task of a parallel region).
+    pub(crate) fn apply_serial(self, g: &mut [f32], u: &mut [f32]) {
+        match self {
+            Act::Silu => silu_mul_serial(g, u),
+            Act::GeluTanh => gelu_mul_serial(g, u),
+            Act::SiluClamp(l) => {
+                for v in g.iter_mut() {
+                    *v = v.min(l);
+                }
+                for v in u.iter_mut() {
+                    *v = v.clamp(-l, l);
+                }
+                silu_mul_serial(g, u)
+            }
+            Act::SwigluOai { .. } | Act::Situ { .. } => self.apply(g, u),
+        }
+    }
     #[inline]
     fn scalar(self, g: f32, u: f32) -> f32 {
         match self {

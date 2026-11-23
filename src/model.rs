@@ -1211,6 +1211,37 @@ pub(crate) fn linear_batch_q(xs: &[crate::quant::QAct], jobs: &mut [(&Lin, usize
     matmul_quant_batch(xs, &mut gg);
 }
 
+/// `act(gate x, up x)` for `t` rows of `x` quantized as the next matmul's input, in one parallel
+/// region ([`crate::kernels::matmul_quant_glu`]), when both run on the CPU decode kernels
+/// ([`cpu_decode_kernels`]) in the same storage without a LoRA update (None otherwise: the
+/// caller runs the steps one by one). With the result, [`linear_batch_q`] gives the down
+/// projection bit-identical to `linear` of the activations.
+pub(crate) fn linear_glu_q(
+    gate: &Lin,
+    up: &Lin,
+    inter: usize,
+    n_in: usize,
+    x: &[f32],
+    t: usize,
+    act: crate::moe::Act,
+) -> Option<crate::quant::QAct> {
+    if !crate::kernels::glu_fused()
+        || !inter.is_multiple_of(crate::quant::QBLOCK)
+        || [gate, up]
+            .iter()
+            .any(|l| l.active_lora().is_some() || !cpu_decode_kernels(l, inter, n_in, t))
+    {
+        return None;
+    }
+    let f = |g: &mut [f32], u: &mut [f32]| act.apply_serial(g, u);
+    match (&gate.w, &up.w) {
+        (Weight::Q8(g), Weight::Q8(u)) => Some(crate::kernels::matmul_quant_glu(g, u, x, t, &f)),
+        (Weight::Q4(g), Weight::Q4(u)) => Some(crate::kernels::matmul_quant_glu(g, u, x, t, &f)),
+        (Weight::Gguf(g), Weight::Gguf(u)) => Some(crate::kernels::matmul_quant_glu(g, u, x, t, &f)),
+        _ => None,
+    }
+}
+
 pub(crate) fn linear(l: &Lin, n_out: usize, n_in: usize, x: &[f32], t: usize, y: &mut [f32]) {
     linear_multi(&mut [(l, n_out, y)], n_in, x, t);
 }
@@ -2095,15 +2126,28 @@ impl<'a> Model<'a> {
         // ---- MLP ----
         rmsnorm_f32w_rows(x, h, &layer.ln_pre_ffn, eps, &mut hn);
         let inter = layer.inter;
-        let mut g = vec![0f32; t * inter];
-        let mut u = vec![0f32; t * inter];
-        linear_multi(&mut [(&layer.gate, inter, &mut g[..]), (&layer.up, inter, &mut u[..])], h, &hn, t);
-        gelu_mul(&mut g, &u);
-        if let Some(k) = &hook {
-            k.apply(Target::Mlp, &mut g, inter);
-        }
         let mut d = o; // reuse buffer [t, h]
-        linear(&layer.down, h, inter, &g, t, &mut d);
+        // Decoding on the CPU: projections, activation and quantization in one region.
+        let fused = hook.is_none()
+            && layer.down.active_lora().is_none()
+            && cpu_decode_kernels(&layer.down, h, inter, t)
+            && match linear_glu_q(&layer.gate, &layer.up, inter, h, &hn, t, crate::moe::Act::GeluTanh) {
+                Some(xa) => {
+                    linear_batch_q(std::slice::from_ref(&xa), &mut [(&layer.down, 0, &mut d)]);
+                    true
+                }
+                None => false,
+            };
+        if !fused {
+            let mut g = vec![0f32; t * inter];
+            let mut u = vec![0f32; t * inter];
+            linear_multi(&mut [(&layer.gate, inter, &mut g[..]), (&layer.up, inter, &mut u[..])], h, &hn, t);
+            gelu_mul(&mut g, &u);
+            if let Some(k) = &hook {
+                k.apply(Target::Mlp, &mut g, inter);
+            }
+            linear(&layer.down, h, inter, &g, t, &mut d);
+        }
         if let Some(m) = &layer.moe {
             // The routed experts, beside the dense MLP, on the same residual.
             rmsnorm_f32w_rows_inplace(&mut d, h, &m.ln_post_dense, eps);

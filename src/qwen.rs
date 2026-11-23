@@ -73,6 +73,15 @@ impl Mlp<'_> {
     }
     /// `down(act(gate(x)) * up(x))` for `t` rows of `x` (`hook`: neuron edits of `target`).
     fn forward(&self, x: &[f32], t: usize, h: usize, y: &mut [f32], hook: Option<(&NeuronHook, Target)>) {
+        // Decoding on the CPU: projections, activation and quantization in one region.
+        if hook.is_none()
+            && self.down.active_lora().is_none()
+            && crate::model::cpu_decode_kernels(&self.down, h, self.inter, t)
+            && let Some(xa) = crate::model::linear_glu_q(&self.gate, &self.up, self.inter, h, x, t, self.act)
+        {
+            crate::model::linear_batch_q(std::slice::from_ref(&xa), &mut [(&self.down, 0, y)]);
+            return;
+        }
         // Both are fully written by the matmuls.
         let mut g = crate::kernels::scratch(t * self.inter);
         let mut u = crate::kernels::scratch(t * self.inter);
@@ -2541,7 +2550,8 @@ impl<'a> QwenModel<'a> {
         // Split query / gate, norm, partial RoPE, fold in the 1/sqrt(hd) scaling.
         let scale = cfg.attn_scale();
         let mut q = crate::kernels::scratch(t * nh * hd);
-        let mut gate = crate::kernels::zeros(t * nh * hd);
+        // The output gate's values (Qwen3.5 / 3.6), when the model has one.
+        let mut gate = if gated { crate::kernels::zeros(t * nh * hd) } else { Vec::new() };
         let par = t > 1;
         // MiniMax M2: one norm over all heads (ungated queries), here; none per head below.
         let (q_norm, k_norm) = if cfg.qk_norm_full() {

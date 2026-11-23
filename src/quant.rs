@@ -346,6 +346,69 @@ fn quantize_row(row: &[f32], q: &mut [i8], scales: &mut [f32], sums: &mut [i32],
     }
 }
 
+/// A [`QAct`] of `t` rows of `n_in` filled block by block from several threads at once
+/// ([`QActFill::fill`]): each block gets exactly what [`quantize_act`] gives it, so filling every
+/// block of every row makes the same activations.
+pub(crate) struct QActFill {
+    xa: QAct,
+    q: SendPtr<i8>,
+    scales: SendPtr<f32>,
+    sums: SendPtr<i32>,
+    fsums: SendPtr<f32>,
+    hsums: SendPtr<f32>,
+}
+
+impl QActFill {
+    pub(crate) fn new(t: usize, n_in: usize) -> Self {
+        assert!(n_in.is_multiple_of(QBLOCK));
+        let bpr = n_in / QBLOCK;
+        let mut xa = QAct {
+            q: vec![0i8; t * n_in],
+            scales: vec![0f32; t * bpr],
+            sums: vec![0i32; t * bpr],
+            fsums: vec![0f32; t * bpr],
+            hsums: vec![0f32; t * bpr * 2],
+            t,
+            n_in,
+        };
+        Self {
+            q: SendPtr(xa.q.as_mut_ptr()),
+            scales: SendPtr(xa.scales.as_mut_ptr()),
+            sums: SendPtr(xa.sums.as_mut_ptr()),
+            fsums: SendPtr(xa.fsums.as_mut_ptr()),
+            hsums: SendPtr(xa.hsums.as_mut_ptr()),
+            xa,
+        }
+    }
+
+    /// Quantizes `src`, elements `e0..e0 + src.len()` of row `ti` (whole blocks).
+    ///
+    /// # Safety
+    /// Calls running at the same time cover disjoint blocks.
+    pub(crate) unsafe fn fill(&self, ti: usize, e0: usize, src: &[f32]) {
+        let n_in = self.xa.n_in;
+        assert!(ti < self.xa.t && e0.is_multiple_of(QBLOCK) && src.len().is_multiple_of(QBLOCK) && e0 + src.len() <= n_in);
+        let (b0, nb) = ((ti * n_in + e0) / QBLOCK, src.len() / QBLOCK);
+        // SAFETY: in bounds (checked above); disjoint from other calls' blocks (the caller's
+        // contract).
+        unsafe {
+            quantize_row(
+                src,
+                std::slice::from_raw_parts_mut(self.q.get().add(b0 * QBLOCK), src.len()),
+                std::slice::from_raw_parts_mut(self.scales.get().add(b0), nb),
+                std::slice::from_raw_parts_mut(self.sums.get().add(b0), nb),
+                std::slice::from_raw_parts_mut(self.fsums.get().add(b0), nb),
+                std::slice::from_raw_parts_mut(self.hsums.get().add(2 * b0), 2 * nb),
+            )
+        }
+    }
+
+    /// The activations (every block filled).
+    pub(crate) fn finish(self) -> QAct {
+        self.xa
+    }
+}
+
 pub fn quantize_act(x: &[f32], t: usize, n_in: usize) -> QAct {
     assert_eq!(x.len(), t * n_in);
     assert!(n_in.is_multiple_of(QBLOCK));
