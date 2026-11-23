@@ -258,6 +258,33 @@ kernel void gemm_f32_s(device const void* qb [[buffer(0)]], device const float* 
     simdgroup_store(c10, y + (ulong)t0 * p.n_out + o0 + 8, p.n_out, ulong2(0, 0), true);
     simdgroup_store(c11, y + (ulong)(t0 + 8) * p.n_out + o0 + 8, p.n_out, ulong2(0, 0), true);
 }
+// gemm_f32_s for n_in % 32 == 0 (prefill plans' MoE routers), each step's loads issued for 32
+// columns of K before its products, which run in gemm_f32_s's order (the same results): the
+// router's chain of dependent steps waits on memory 4x less often.
+#define GFR_LD(A0, A1, B0, B1, K) \
+    simdgroup_float8x8 A0, A1, B0, B1; \
+    simdgroup_load(A0, ws + (K), p.n_in); simdgroup_load(A1, ws + (ulong)8 * p.n_in + (K), p.n_in); \
+    simdgroup_load(B0, xs + (K), p.n_in, ulong2(0, 0), true); simdgroup_load(B1, xs + (ulong)8 * p.n_in + (K), p.n_in, ulong2(0, 0), true);
+#define GFR_MMA(A0, A1, B0, B1) \
+    simdgroup_multiply_accumulate(c00, A0, B0, c00); simdgroup_multiply_accumulate(c01, A0, B1, c01); \
+    simdgroup_multiply_accumulate(c10, A1, B0, c10); simdgroup_multiply_accumulate(c11, A1, B1, c11);
+kernel void gemm_f32_r(device const void* qb [[buffer(0)]], device const float* x [[buffer(2)]], device float* y [[buffer(3)]],
+                       constant P& p [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                       uint sg [[simdgroup_index_in_threadgroup]]) {
+    uint o0 = tg.x * 32 + (sg / 2) * 16, t0 = tg.y * 32 + (sg % 2) * 16;
+    device const float* ws = (device const float*)qb + p.w_off + (ulong)o0 * p.n_in;
+    device const float* xs = x + (ulong)t0 * p.n_in;
+    simdgroup_float8x8 c00(0.f), c01(0.f), c10(0.f), c11(0.f);
+    for (uint k = 0; k < p.n_in; k += 32) {
+        GFR_LD(a0, a1, b0, b1, k) GFR_LD(d0, d1, e0, e1, k + 8)
+        GFR_LD(f0, f1, g0, g1, k + 16) GFR_LD(h0, h1, i0, i1, k + 24)
+        GFR_MMA(a0, a1, b0, b1) GFR_MMA(d0, d1, e0, e1) GFR_MMA(f0, f1, g0, g1) GFR_MMA(h0, h1, i0, i1)
+    }
+    simdgroup_store(c00, y + (ulong)t0 * p.n_out + o0, p.n_out, ulong2(0, 0), true);
+    simdgroup_store(c01, y + (ulong)(t0 + 8) * p.n_out + o0, p.n_out, ulong2(0, 0), true);
+    simdgroup_store(c10, y + (ulong)t0 * p.n_out + o0 + 8, p.n_out, ulong2(0, 0), true);
+    simdgroup_store(c11, y + (ulong)(t0 + 8) * p.n_out + o0 + 8, p.n_out, ulong2(0, 0), true);
+}
 struct OP { uint o_off; uint gpr; uint gk; uint _p; };
 kernel void gemm_q4a(device const void* qb [[buffer(0)]], device const void* sb [[buffer(1)]],
                      device const float* x [[buffer(2)]], device float* y [[buffer(3)]], constant P& p [[buffer(4)]],
@@ -1179,25 +1206,42 @@ kernel void moe_combine(device const float* o [[buffer(0)]], device const float2
 }
 // The routing of a prefill chunk's MoE layer on the device, as the host's `pf_route` lays it
 // out (so the GPU need not stop for the host at each MoE layer): per token, `k` expert ids (as
-// bits) then `k` weights in `sel`. One threadgroup of 256: the experts' entries are counted,
-// thread 0 cuts the experts' segments (16-row multiples) into tiles as `group_tiles` (class c
-// from tile c * max_tiles), then the entries are placed in token order, 256 at a time (each
-// entry's rank among the chunk's entries of its expert by a scan of the chunk): the gathered
-// row's source token (`src`, ~0 for padding), its expert (`rexp`) and each slot's [row, weight].
-// `args`: indirect dispatch sizes, (rows, 1, 1), then (gu_x, tiles of class c, 1) for c = 0..2,
-// then (dn_x, tiles of class c, 1).
+// bits) then `k` weights in `sel`. One threadgroup of 256 per expert: each counts every expert's
+// entries and scans the counts (the experts' segments, 16-row multiples, cut into tiles as
+// `group_tiles`: class c from tile c * max_tiles), then writes its own tiles and places its own
+// entries in token order, 256 at a time (each entry's rank among its expert's by a prefix sum):
+// the gathered row's source token (`src`, ~0 for padding), its expert (`rexp`) and each slot's
+// [row, weight]. Threadgroup 0 writes `args`: indirect dispatch sizes, (rows, 1, 1), then (gu_x,
+// tiles of class c, 1) for c = 0..2, then (dn_x, tiles of class c, 1).
 struct RT { uint t; uint k; uint n_exp; uint sel_stride; uint max_tiles; uint gu_x; uint dn_x; uint _p; };
 #define RT_THREADS 256
+#define RT_PER 4
 inline uint rt_id(device const float* sel, constant RT& p, uint i) {
     return as_type<uint>(sel[(ulong)(i / p.k) * p.sel_stride + i % p.k]);
 }
+// Exclusive prefix sum of v over the threadgroup (RT_THREADS threads); `total` gets the sum.
+inline uint rt_scan(uint v, uint tid, threadgroup uint* part, thread uint& total) {
+    uint lane = tid % 32, sg = tid / 32;
+    uint ex = simd_prefix_exclusive_sum(v);
+    if (lane == 31) part[sg] = ex + v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint before = 0, all = 0;
+    for (uint q = 0; q < RT_THREADS / 32; q++) {
+        uint x = part[q];
+        before += q < sg ? x : 0;
+        all += x;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    total = all;
+    return before + ex;
+}
 kernel void pf_route(device const float* sel [[buffer(0)]], device uint* src [[buffer(1)]], device uint* rexp [[buffer(2)]],
                      device uint2* slots [[buffer(3)]], device uint4* tiles [[buffer(4)]], device uint* args [[buffer(5)]],
-                     constant RT& p [[buffer(6)]], uint tid [[thread_position_in_threadgroup]]) {
-    threadgroup atomic_uint cnt[1024];
-    threadgroup uint start[1024];
-    threadgroup uint ce[RT_THREADS];
-    threadgroup uint total;
+                     constant RT& p [[buffer(6)]], uint me [[threadgroup_position_in_grid]],
+                     uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup atomic_uint cnt[RT_THREADS * RT_PER];
+    threadgroup uint part[RT_THREADS / 32];
+    threadgroup uint mine[5];
     uint n = p.t * p.k;
     for (uint x = tid; x < p.n_exp; x += RT_THREADS) atomic_store_explicit(&cnt[x], 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1206,48 +1250,57 @@ kernel void pf_route(device const float* sel [[buffer(0)]], device uint* src [[b
         if (e < p.n_exp) atomic_fetch_add_explicit(&cnt[e], 1u, memory_order_relaxed);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        uint rows = 0, nc0 = 0, nc1 = 0, nc2 = 0;
-        for (uint x = 0; x < p.n_exp; x++) {
-            uint len = (atomic_load_explicit(&cnt[x], memory_order_relaxed) + 15) / 16 * 16, t0 = 0;
-            for (; t0 + 128 <= len; t0 += 128) tiles[nc0++] = uint4(x, rows, len, t0);
-            for (; t0 + GTM <= len; t0 += GTM) tiles[p.max_tiles + nc1++] = uint4(x, rows, len, t0);
-            if (t0 < len) tiles[2 * p.max_tiles + nc2++] = uint4(x, rows, len, t0);
-            start[x] = rows;
-            rows += len;
+    // Experts RT_PER * tid ..: their padded lengths and tiles of each class, then the prefix sums.
+    uint len[RT_PER], c0[RT_PER], c1[RT_PER], c2[RT_PER];
+    uint sl = 0, s0 = 0, s1 = 0, s2 = 0;
+    for (uint j = 0; j < RT_PER; j++) {
+        uint x = tid * RT_PER + j;
+        uint c = x < p.n_exp ? atomic_load_explicit(&cnt[x], memory_order_relaxed) : 0;
+        uint l = (c + 15) / 16 * 16;
+        uint a = l / 128, r = l - a * 128, b = r / GTM;
+        len[j] = l; c0[j] = a; c1[j] = b; c2[j] = r - b * GTM > 0 ? 1 : 0;
+        sl += l; s0 += a; s1 += b; s2 += c2[j];
+    }
+    uint rows, n0, n1, n2;
+    uint bl = rt_scan(sl, tid, part, rows), b0 = rt_scan(s0, tid, part, n0);
+    uint b1 = rt_scan(s1, tid, part, n1), b2 = rt_scan(s2, tid, part, n2);
+    for (uint j = 0; j < RT_PER; j++) {
+        if (tid * RT_PER + j == me) {
+            mine[0] = bl; mine[1] = len[j]; mine[2] = b0; mine[3] = b1; mine[4] = b2;
         }
-        uint nc[3] = { nc0, nc1, nc2 };
+        bl += len[j]; b0 += c0[j]; b1 += c1[j]; b2 += c2[j];
+    }
+    if (me == 0 && tid == 0) {
         args[0] = rows; args[1] = 1; args[2] = 1;
+        uint nc[3] = { n0, n1, n2 };
         for (uint c = 0; c < 3; c++) {
             args[3 + 3 * c] = p.gu_x; args[4 + 3 * c] = nc[c]; args[5 + 3 * c] = 1;
             args[12 + 3 * c] = p.dn_x; args[13 + 3 * c] = nc[c]; args[14 + 3 * c] = 1;
         }
-        total = rows;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint rows = total;
-    for (uint r = tid; r < rows; r += RT_THREADS) { src[r] = 0xffffffffu; rexp[r] = 0xffffffffu; }
-    threadgroup_barrier(mem_flags::mem_device);
-    for (uint c0 = 0; c0 < n; c0 += RT_THREADS) {
-        uint i = c0 + tid, m = min(uint(RT_THREADS), n - c0);
-        uint e = i < n ? rt_id(sel, p, i) : 0xffffffffu;
-        ce[tid] = e;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        uint before = 0, same = 0;
-        if (e < p.n_exp) {
-            for (uint q = 0; q < m; q++) {
-                bool hit = ce[q] == e;
-                before += hit && q < tid;
-                same += hit;
-            }
-            uint r = start[e] + before, j = i / p.k, s = i % p.k;
+    uint start = mine[0], l = mine[1];
+    if (tid == 0) {
+        uint t0 = 0, i0 = mine[2], i1 = mine[3];
+        for (; t0 + 128 <= l; t0 += 128) tiles[i0++] = uint4(me, start, l, t0);
+        for (; t0 + GTM <= l; t0 += GTM) tiles[p.max_tiles + i1++] = uint4(me, start, l, t0);
+        if (t0 < l) tiles[2 * p.max_tiles + mine[4]] = uint4(me, start, l, t0);
+    }
+    uint c = atomic_load_explicit(&cnt[me], memory_order_relaxed);
+    for (uint r = c + tid; r < l; r += RT_THREADS) { src[start + r] = 0xffffffffu; rexp[start + r] = 0xffffffffu; }
+    uint base = 0;
+    for (uint c0i = 0; c0i < n && base < c; c0i += RT_THREADS) {
+        uint i = c0i + tid;
+        bool hit = i < n && rt_id(sel, p, i) == me;
+        uint tot;
+        uint rank = rt_scan(hit ? 1u : 0u, tid, part, tot);
+        if (hit) {
+            uint r = start + base + rank, j = i / p.k, s = i % p.k;
             src[r] = j;
-            rexp[r] = e;
+            rexp[r] = me;
             slots[i] = uint2(r, as_type<uint>(sel[(ulong)j * p.sel_stride + p.k + s]));
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (e < p.n_exp && before + 1 == same) start[e] += same;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        base += tot;
     }
 }
 "#;

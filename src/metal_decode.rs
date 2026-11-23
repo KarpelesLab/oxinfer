@@ -270,6 +270,115 @@ fn pf_mma_attn() -> bool {
 fn pf_precise_scores(scale: f32, hd: usize) -> bool {
     scale * scale * hd as f32 > 4.0 && std::env::var("OXINFER_PF_MMA_ATTN").map_or(true, |v| v != "2")
 }
+/// Whether prefill plans schedule their ops by dependence ([`pf_schedule`]; `OXINFER_PF_REORDER=0`:
+/// in graph order, a barrier wherever an op depends on one since the last).
+fn pf_reorder() -> bool {
+    // (Read as each plan is built, so that `pf_ab` can compare.)
+    std::env::var("OXINFER_PF_REORDER").map_or(true, |v| v != "0")
+}
+
+/// A graph op's compiled ops for [`pf_schedule`]: (start, end) in the plan's ops, the ranges they
+/// read, the ranges they write.
+type PfGroup = (usize, usize, Vec<Range>, Vec<Range>);
+/// [`pf_schedule`]: a group's segments (its ops between its own barriers), reads and writes.
+type PfItem<'a> = (Vec<Vec<MOp>>, &'a [Range], &'a [Range]);
+
+/// Schedules the compiled ops of a prefill plan's graph ops (`groups`: each one's ops as
+/// `ops[start..end]`, with the ranges it reads and writes) by their dependences. Each group's
+/// ops, cut at their own barriers into segments, go to consecutive stages: first as early as
+/// possible (after the last stage of every earlier group it conflicts with: reads what it
+/// writes, writes what it reads or writes), then, with [`pf_late`], as late as the groups that
+/// depend on it allow. The stages are encoded in order with a barrier between them, so
+/// independent chains (a MoE layer's routing and experts, and its dense feed-forward) share
+/// stages rather than each step waiting for the other chain's. `split(x)`: whether the routed
+/// experts `x` (`MOp::PfExperts`) may run as separate phases. Ops from `cut` on (the head) keep
+/// their place after the rest. Returns the ops and where the head starts.
+fn pf_schedule(ops: Vec<MOp>, groups: &[PfGroup], cut: usize, head_from: usize, split: impl Fn(usize) -> bool) -> (Vec<MOp>, usize) {
+    let mut slots: Vec<Option<MOp>> = ops.into_iter().map(Some).collect();
+    // (segments, reads, writes) of the groups with ops.
+    let mut items: Vec<PfItem> = Vec::new();
+    for (a, b, r, w) in groups.iter().filter(|g| g.1 <= cut) {
+        let mut segs: Vec<Vec<MOp>> = vec![Vec::new()];
+        for op in slots[*a..*b].iter_mut().map(|o| o.take().expect("an op in two groups")) {
+            match op {
+                MOp::Barrier => segs.push(Vec::new()),
+                MOp::PfExperts(x, PF_X_ALL) if split(x) => {
+                    segs.extend((0..6).map(|k| vec![MOp::PfExperts(x, k)]));
+                    segs.push(Vec::new());
+                }
+                op => segs.last_mut().unwrap().push(op),
+            }
+        }
+        segs.retain(|s| !s.is_empty());
+        if !segs.is_empty() {
+            items.push((segs, r, w));
+        }
+    }
+    let conflict = |i: usize, j: usize| {
+        let (x, y) = (&items[i], &items[j]);
+        overlaps(x.1, y.2) || overlaps(x.2, y.2) || overlaps(x.2, y.1)
+    };
+    // As soon as possible: after the last stage of every earlier group it depends on.
+    let mut first = vec![0usize; items.len()];
+    for i in 0..items.len() {
+        first[i] = (0..i)
+            .filter(|&j| conflict(i, j))
+            .map(|j| first[j] + items[j].0.len())
+            .max()
+            .unwrap_or(0);
+    }
+    let len = (0..items.len()).map(|i| first[i] + items[i].0.len()).max().unwrap_or(0);
+    // Then as late as possible (`pf_late`): right before the first later group that depends on
+    // it, so that a chain with slack (the dense feed-forward of a MoE layer) runs beside the
+    // longer one's matching steps (the experts' GEMMs) rather than beside its first, small ones.
+    if pf_late() {
+        for i in (0..items.len()).rev() {
+            let end = (i + 1..items.len())
+                .filter(|&j| conflict(i, j))
+                .map(|j| first[j])
+                .min()
+                .unwrap_or(len);
+            first[i] = end - items[i].0.len();
+        }
+    }
+    let mut stages: Vec<Vec<MOp>> = Vec::new();
+    stages.resize_with(len, Vec::new);
+    for (i, (segs, _, _)) in items.into_iter().enumerate() {
+        for (k, sg) in segs.into_iter().enumerate() {
+            stages[first[i] + k].extend(sg);
+        }
+    }
+    let mut out: Vec<MOp> = Vec::with_capacity(slots.len());
+    for (k, st) in stages.into_iter().enumerate() {
+        if k > 0 {
+            out.push(MOp::Barrier);
+        }
+        out.extend(st);
+    }
+    let head = out.len() + (head_from - cut);
+    out.extend(slots.drain(cut..).map(|o| o.expect("a head op")));
+    debug_assert!(slots.iter().all(|o| o.is_none() || matches!(o, Some(MOp::Barrier))));
+    (out, head)
+}
+
+/// Whether prefill plans' MoE routers take `gemm_f32_r` (`OXINFER_PF_ROUTER=s`: `gemm_f32_s`; the
+/// same results).
+fn pf_router_r() -> bool {
+    std::env::var("OXINFER_PF_ROUTER").map_or(true, |v| v != "s")
+}
+
+/// Whether prefill plans' dependences compare the columns of token rows (`OXINFER_PF_COLS=0`:
+/// spans of the buffers).
+fn pf_cols() -> bool {
+    std::env::var("OXINFER_PF_COLS").map_or(true, |v| v != "0")
+}
+
+/// [`pf_schedule`] places the ops with slack as late as their dependents allow (default), or as
+/// early as their dependences allow (`OXINFER_PF_REORDER=early`).
+fn pf_late() -> bool {
+    std::env::var("OXINFER_PF_REORDER").map_or(true, |v| v != "early")
+}
+
 /// Whether prefill plans make the GEMMs' half rows in the SwiGLU / GeGLU before them
 /// (`pf_glu_half`, the same values; `OXINFER_PF_GLU_HALF=0`: a separate `x_half`).
 fn pf_glu_half() -> bool {
@@ -752,6 +861,8 @@ const PF_PARTS: usize = 8;
 const PF_REM_ROWS: usize = 64;
 /// u32s of the device MoE routing's indirect dispatch sizes (`pf_route`'s `args`).
 const PF_ROUTE_ARGS: usize = 21;
+/// `MOp::PfExperts`: every phase in one op.
+const PF_X_ALL: u8 = u8::MAX;
 /// Rows of the prefill GEMMs' middle tiles (`MOp::Gemm::pipes[2]`).
 const PF_TM_M: usize = 64;
 /// Multi-token plans: bytes of QSA block score rows (see `MOp::QsaScore`).
@@ -1481,8 +1592,10 @@ enum MOp {
         ts: [u32; 4],
     },
     /// Prefill plans: routed experts as grouped matrix-unit GEMMs over the tokens of each expert;
-    /// the step reads the routing back first (index into `MetalPlan::pf`'s experts).
-    PfExperts(usize),
+    /// the step reads the routing back first (index into `MetalPlan::pf`'s experts). The second
+    /// field is the phase encoded ([`PF_X_ALL`]: all of them, with barriers between; else one of
+    /// the device-routed phases 0-5: routing, gather, gate / up, activation, down, combine).
+    PfExperts(usize, u8),
     /// Prefill plans: the Gated DeltaNet rule over the chunk (`pf_gdn_rule`), then its gated norm.
     PfGdn {
         rule: Id,
@@ -1923,7 +2036,7 @@ impl MetalBackend {
         total += (g.strengths.len().max(1) * 4).next_multiple_of(256);
         // Prefill plans: the GEMM scratch (half rows, their scales, outputs before an add or a
         // pair's activation).
-        let (mut pf_xh, mut pf_rs, mut pf_tmp, mut pf_tmp_n) = (0, 0, 0, 0);
+        let (mut pf_xh, mut pf_rs, mut pf_tmp, mut pf_tmp_n, mut pf_rt) = (0, 0, 0, 0, 0);
         if pf {
             let (mut ni, mut no) = (0, 0);
             for op in &g.ops {
@@ -1939,6 +2052,16 @@ impl MetalBackend {
             pf_tmp = total;
             pf_tmp_n = no;
             total += (2 * tokens * no * 4).next_multiple_of(256);
+            // The routers' logits: a region of their own (`PF_RES + 3`), so that routing runs
+            // beside the GEMMs that use `pf_tmp`.
+            let ne = g
+                .ops
+                .iter()
+                .map(|op| if let Op::Route { n_exp, .. } = *op { n_exp } else { 0 })
+                .max()
+                .unwrap_or(0);
+            pf_rt = total;
+            total += (tokens * ne * 4).next_multiple_of(256);
         }
         // The view whose half rows the scratch holds, and the routed experts.
         // Matrix-unit attention (`pfm_*`): a cache written by one QkRope of the plan and read by
@@ -2025,6 +2148,9 @@ impl MetalBackend {
         // the fused half conversions write (their op).
         let mut group_reads: Vec<(usize, Vec<Range>)> = Vec::new();
         let mut fused_rows: Vec<(usize, Range)> = Vec::new();
+        // Prefill plans: each graph op's compiled ops (start, end) with what they read and write,
+        // for the schedule below.
+        let mut pf_groups: Vec<PfGroup> = Vec::new();
         let mut pf_experts: Vec<PfExperts> = Vec::new();
         // Constants: every vector 64-byte aligned.
         let mut consts: Vec<f32> = Vec::new();
@@ -2041,7 +2167,21 @@ impl MetalBackend {
         let mut indirect: Vec<Id> = Vec::new();
         let mut head_from = usize::MAX;
         let (mut rd, mut wr): (Vec<Range>, Vec<Range>) = (Vec::new(), Vec::new());
-        let rng = |v: View, n: usize| (v.buf, v.off, v.off + n + (tokens - 1) * tsz[v.buf]);
+        // Prefill plans: every op covers all the token rows of the views it touches, so a view
+        // within one row stands for its columns (views on disjoint columns of the same rows do
+        // not overlap, e.g. the query, key and value GEMMs' outputs); a wider one for the buffer.
+        let cols = pf && pf_cols();
+        let rng = |v: View, n: usize| {
+            if cols {
+                if v.off + n <= tsz[v.buf] {
+                    (v.buf, v.off, v.off + n)
+                } else {
+                    (v.buf, 0, usize::MAX)
+                }
+            } else {
+                (v.buf, v.off, v.off + n + (tokens - 1) * tsz[v.buf])
+            }
+        };
         // Streaming: the first compiled op of each graph op, and the matvecs of streamed weights.
         let mut op_mop: Vec<usize> = Vec::with_capacity(g.ops.len());
         let mut streamed: Vec<StreamedMv> = Vec::new();
@@ -2484,10 +2624,10 @@ impl MetalBackend {
                     if pf && n_exp.is_multiple_of(64) && h.is_multiple_of(32) && ts(x) == h {
                         let woff = mw.data_off as usize;
                         emit.push(MOp::GemmF32 {
-                            pipe: self.named_pipeline("gemm_f32_s")?,
+                            pipe: self.named_pipeline(if pf_router_r() { "gemm_f32_r" } else { "gemm_f32_s" })?,
                             w: woff,
                             x: byte(x),
-                            y: pf_tmp,
+                            y: pf_rt,
                             n_out: n_exp,
                             n_in: h,
                         });
@@ -2519,7 +2659,7 @@ impl MetalBackend {
                         emit.push(MOp::Barrier);
                         emit.push(MOp::PfTopk {
                             pipe: self.named_pipeline("pf_topk")?,
-                            logits: pf_tmp,
+                            logits: pf_rt,
                             sel: byte(sel),
                             n: n_exp as u32,
                             k: k as u32,
@@ -2527,8 +2667,8 @@ impl MetalBackend {
                             ts: [n_exp as u32, ts(sel) as u32, 0, 0],
                         });
                         break 'route (
-                            vec![rng(x, h), rng(logits, rows), (PF_RES + 1, 0, usize::MAX)],
-                            vec![rng(logits, rows), rng(sel, 2 * k), (PF_RES + 1, 0, usize::MAX)],
+                            vec![rng(x, h), rng(logits, rows), (PF_RES + 3, 0, usize::MAX)],
+                            vec![rng(logits, rows), rng(sel, 2 * k), (PF_RES + 3, 0, usize::MAX)],
                         );
                     }
                     let mvk = if pf {
@@ -2654,7 +2794,7 @@ impl MetalBackend {
                     if !ex.h.is_multiple_of(64) || !ex.inter.is_multiple_of(64) {
                         return None;
                     }
-                    emit.push(MOp::PfExperts(pf_experts.len()));
+                    emit.push(MOp::PfExperts(pf_experts.len(), PF_X_ALL));
                     pf_experts.push(PfExperts {
                         pipes: (pg3, pd3),
                         up,
@@ -3562,7 +3702,7 @@ impl MetalBackend {
                 wr.clear();
             }
             if let Some((b, o, n)) = xh_of
-                && overlaps(&w, &[(b, o, o + n + (tokens - 1) * tsz[b])])
+                && overlaps(&w, &[rng(View { buf: b, off: o }, n)])
             {
                 xh_of = None;
             }
@@ -3577,6 +3717,15 @@ impl MetalBackend {
                         .position(|o| matches!(o, MOp::NormHalf { .. } | MOp::GluHalf { .. } | MOp::AddNormHalf { .. }));
                     fused_rows.extend(at.map(|j| (ops.len() + j, f)));
                 }
+            }
+            if pf {
+                // (The routed experts' staging is one more resource.)
+                let mut gr = (r.clone(), w.clone());
+                if emit.iter().any(|o| matches!(o, MOp::PfExperts(..))) {
+                    gr.0.push((PF_RES + 2, 0, usize::MAX));
+                    gr.1.push((PF_RES + 2, 0, usize::MAX));
+                }
+                pf_groups.push((ops.len(), ops.len() + emit.len(), gr.0, gr.1));
             }
             ops.extend(emit);
             if let Some((w, w2)) = smv {
@@ -3695,6 +3844,12 @@ impl MetalBackend {
             None
         };
         let _ = pf_tmp_n;
+        if let Some(pfs) = pf_state.as_ref().filter(|_| pf_reorder()) {
+            // (The head, if any, follows its barrier.)
+            let cut = if head_from < ops.len() { head_from - 1 } else { ops.len() };
+            let split = |x: usize| pfs.route.is_some() && pfs.experts[x].lora.is_none();
+            (ops, head_from) = pf_schedule(std::mem::take(&mut ops), &pf_groups, cut, head_from, split);
+        }
         // Split-attention partials after the activations (a region per token).
         let part = total;
         let part_stride = (part_floats * 4).next_multiple_of(256);
@@ -4520,7 +4675,7 @@ impl MetalPlan<'_> {
             | MOp::GemmF32 { .. }
             | MOp::AddRows { .. }
             | MOp::PfTopk { .. }
-            | MOp::PfExperts(_)
+            | MOp::PfExperts(..)
             | MOp::PfGdn { .. }
             | MOp::PfAttn { .. }
             | MOp::PfFlash { .. }
@@ -4992,15 +5147,23 @@ impl MetalPlan<'_> {
                 e.bytes(ts, 4);
                 e.dispatch((t, 1), (*n as usize).next_multiple_of(32));
             }
-            MOp::PfExperts(i) => {
+            MOp::PfExperts(i, phase) => {
                 let x = &pf.experts[*i];
+                // One phase, or all of them with barriers between.
+                let all = *phase == PF_X_ALL;
+                let on = |k: u8| all || *phase == k;
+                let bar = || {
+                    if all {
+                        e.barrier();
+                    }
+                };
                 let (er, nt) = run.get();
                 let (h, mi) = (x.h, x.inter);
                 let st = |j: usize| pf.st[j];
                 let sb = pf.stage;
                 // Routed on the device: the grids' sizes come from `pf_route`'s output.
                 let dev = pf.route.is_some();
-                if let Some(route) = pf.route {
+                if let Some(route) = pf.route.filter(|_| on(0)) {
                     #[repr(C)]
                     struct Rt {
                         t: u32,
@@ -5032,8 +5195,8 @@ impl MetalPlan<'_> {
                         },
                         6,
                     );
-                    e.dispatch((1, 1), 256);
-                    e.barrier();
+                    e.dispatch((x.n_exp, 1), 256);
+                    bar();
                 }
                 let per_row = |threads: usize| {
                     if dev {
@@ -5042,22 +5205,24 @@ impl MetalPlan<'_> {
                         e.dispatch((er, 1), threads);
                     }
                 };
-                e.pipe(m.x_half);
-                e.buf(arena, x.x, 0);
-                e.buf(sb, st(3), 1);
-                e.buf(sb, st(4), 2);
-                e.bytes(
-                    &Xh {
-                        n: h as u32,
-                        gather: 1,
-                        stride: x.x_stride,
-                        _p: 0,
-                    },
-                    3,
-                );
-                e.buf(sb, st(0), 4);
-                per_row(256);
-                e.barrier();
+                if on(1) {
+                    e.pipe(m.x_half);
+                    e.buf(arena, x.x, 0);
+                    e.buf(sb, st(3), 1);
+                    e.buf(sb, st(4), 2);
+                    e.bytes(
+                        &Xh {
+                            n: h as u32,
+                            gather: 1,
+                            stride: x.x_stride,
+                            _p: 0,
+                        },
+                        3,
+                    );
+                    e.buf(sb, st(0), 4);
+                    per_row(256);
+                    bar();
+                }
                 // (The grouped kernels take each tile's rows from the tile.)
                 let params = |n_out: usize, n_in: usize, s_off: u32| super::MmaParams {
                     n_out: n_out as u32,
@@ -5097,14 +5262,16 @@ impl MetalPlan<'_> {
                 } else {
                     0
                 };
-                match x.up {
-                    Some((pu, rb)) => {
-                        grouped(x.pipes.0, x.tabs[0], st(3), st(5), st(4), &params(mi, h, x.row_bytes.0), 3);
-                        grouped(pu, x.tabs[1], st(3), up_at, st(4), &params(mi, h, rb), 3);
+                if on(2) {
+                    match x.up {
+                        Some((pu, rb)) => {
+                            grouped(x.pipes.0, x.tabs[0], st(3), st(5), st(4), &params(mi, h, x.row_bytes.0), 3);
+                            grouped(pu, x.tabs[1], st(3), up_at, st(4), &params(mi, h, rb), 3);
+                        }
+                        None => grouped(x.pipes.0, x.tabs[0], st(3), st(5), st(4), &params(2 * mi, h, x.row_bytes.0), 3),
                     }
-                    None => grouped(x.pipes.0, x.tabs[0], st(3), st(5), st(4), &params(2 * mi, h, x.row_bytes.0), 3),
+                    bar();
                 }
-                e.barrier();
                 let lp = |n_in: usize, r: u32, n: usize, xs: u32| PxLoraParams {
                     n_in: n_in as u32,
                     r,
@@ -5139,7 +5306,8 @@ impl MetalPlan<'_> {
                     e.dispatch((w.div_ceil(256), er), 256);
                     e.barrier();
                 };
-                if let Some(l) = &x.lora
+                if all
+                    && let Some(l) = &x.lora
                     && let Some(gu) = &l.gate_up
                 {
                     lora_pass(gu, l, (arena, x.x), &lp(h, gu.r, mi, x.x_stride), st(5), 1);
@@ -5151,24 +5319,29 @@ impl MetalPlan<'_> {
                     split: u32,
                     limit: f32,
                 }
-                e.pipe(m.silu_half);
-                e.buf(sb, st(5), 0);
-                e.buf(sb, st(6), 1);
-                e.buf(sb, st(7), 2);
-                e.bytes(
-                    &Sh {
-                        n: mi as u32,
-                        gelu: x.gelu as u32,
-                        split,
-                        limit: 0.0,
-                    },
-                    3,
-                );
-                per_row(256);
-                e.barrier();
-                grouped(x.pipes.1, x.tabs[2], st(6), st(8), st(7), &params(h, mi, x.row_bytes.1), 12);
-                e.barrier();
-                if let Some(l) = &x.lora
+                if on(3) {
+                    e.pipe(m.silu_half);
+                    e.buf(sb, st(5), 0);
+                    e.buf(sb, st(6), 1);
+                    e.buf(sb, st(7), 2);
+                    e.bytes(
+                        &Sh {
+                            n: mi as u32,
+                            gelu: x.gelu as u32,
+                            split,
+                            limit: 0.0,
+                        },
+                        3,
+                    );
+                    per_row(256);
+                    bar();
+                }
+                if on(4) {
+                    grouped(x.pipes.1, x.tabs[2], st(6), st(8), st(7), &params(h, mi, x.row_bytes.1), 12);
+                    bar();
+                }
+                if all
+                    && let Some(l) = &x.lora
                     && let Some(dn) = &l.dn
                 {
                     lora_pass(dn, l, (sb, st(5)), &lp(mi, dn.r, h, 0), st(8), 0);
@@ -5180,20 +5353,22 @@ impl MetalPlan<'_> {
                     ldo: u32,
                     _p: u32,
                 }
-                e.pipe(m.combine);
-                e.buf(sb, st(8), 0);
-                e.buf(sb, st(2), 1);
-                e.buf(arena, x.y, 2);
-                e.bytes(
-                    &Cb {
-                        n: h as u32,
-                        k: x.k as u32,
-                        ldo: x.y_stride,
-                        _p: 0,
-                    },
-                    3,
-                );
-                e.dispatch(((h / 4).div_ceil(64), t), 64);
+                if on(5) {
+                    e.pipe(m.combine);
+                    e.buf(sb, st(8), 0);
+                    e.buf(sb, st(2), 1);
+                    e.buf(arena, x.y, 2);
+                    e.bytes(
+                        &Cb {
+                            n: h as u32,
+                            k: x.k as u32,
+                            ldo: x.y_stride,
+                            _p: 0,
+                        },
+                        3,
+                    );
+                    e.dispatch(((h / 4).div_ceil(64), t), 64);
+                }
             }
             MOp::PfGdn {
                 rule,
@@ -5998,7 +6173,7 @@ impl DecodePlan for MetalPlan<'_> {
                         MOp::Attn { .. } => "attn",
                         MOp::QsaKey { .. } | MOp::QsaScore { .. } | MOp::QsaTopk { .. } => "qsa",
                         MOp::XHalf { .. } | MOp::Gemm { .. } | MOp::GemmF32 { .. } | MOp::AddRows { .. } => "mv",
-                        MOp::PfTopk { .. } | MOp::PfExperts(_) => "moe",
+                        MOp::PfTopk { .. } | MOp::PfExperts(..) => "moe",
                         MOp::PfGdn { .. } => "gdn",
                         MOp::PfAttn { .. } | MOp::PfFlash { .. } | MOp::PfKvHalf { .. } => "attn",
                         MOp::NormHalf { .. } | MOp::AddNormHalf { .. } => "norm",
@@ -6041,7 +6216,7 @@ impl DecodePlan for MetalPlan<'_> {
                     | MOp::GemmF32 { .. }
                     | MOp::AddRows { .. }
                     | MOp::PfTopk { .. }
-                    | MOp::PfExperts(_)
+                    | MOp::PfExperts(..)
                     | MOp::PfGdn { .. }
                     | MOp::PfAttn { .. }
                     | MOp::PfFlash { .. }
@@ -6451,7 +6626,7 @@ impl DecodePlan for MetalPlan<'_> {
                     if matches!(op, MOp::Barrier) {
                         continue;
                     }
-                    if let MOp::PfExperts(x) = op
+                    if let MOp::PfExperts(x, _) = op
                         && pf.route.is_none()
                     {
                         match self.pf_route(pf, &pf.experts[*x], t) {
@@ -6469,7 +6644,15 @@ impl DecodePlan for MetalPlan<'_> {
                         MOp::Glu { .. } => "glu".into(),
                         MOp::AddRows { .. } => "addrows".into(),
                         MOp::PfTopk { .. } => "topk".into(),
-                        MOp::PfExperts(_) => "experts".into(),
+                        MOp::PfExperts(_, ph) => match *ph {
+                            0 => "experts route".into(),
+                            1 => "experts gather".into(),
+                            2 => "experts gate/up".into(),
+                            3 => "experts act".into(),
+                            4 => "experts down".into(),
+                            5 => "experts combine".into(),
+                            _ => "experts".into(),
+                        },
                         MOp::PfGdn { .. } => "gdn rule".into(),
                         MOp::GdnConv { .. } => "conv".into(),
                         MOp::PfAttn { .. } => "attn".into(),
@@ -6496,7 +6679,7 @@ impl DecodePlan for MetalPlan<'_> {
             // (Routed on the device: no stops.)
             let stops: Vec<(usize, usize)> = (from..end)
                 .filter_map(|i| match self.ops[i] {
-                    MOp::PfExperts(x) if pf.route.is_none() => Some((i, x)),
+                    MOp::PfExperts(x, _) if pf.route.is_none() => Some((i, x)),
                     _ => None,
                 })
                 .collect();
