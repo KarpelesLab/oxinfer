@@ -19,25 +19,49 @@ pub(crate) const MVK_TOKENS: [usize; 2] = [8, 16];
 /// needs.
 pub(crate) const MVK_CLASSES: [usize; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 16];
 
-/// Rows per threadgroup of a format's multi-token matvecs for up to `tt` tokens (each lane holds
-/// a decoded chunk of every row and an accumulator per row and token; each token's x chunk is
-/// loaded once for the rows). Measured on an M5 Max (`decode_mvk_bench`, 4096 x 4096 to 12288 x
-/// 4096 and 4096 x 12288, 2 to 8 tokens): one row for the 4-bit and 5-bit formats and Q8_0, where
-/// the registers of a second decoded row cost more than the x loads it saves; two for Q6_K, oxinfer
-/// Q8 and the formats of the generic kernel. `OXINFER_MVK_ROWS` overrides it.
-pub(crate) fn mvk_rows(fmt: MvFmt, _tt: usize) -> usize {
-    static ROWS: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    let over = *ROWS.get_or_init(|| {
-        std::env::var("OXINFER_MVK_ROWS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|r| [1, 2, 4].contains(r))
-    });
-    over.unwrap_or(match fmt {
-        MvFmt::Q8 | MvFmt::Gguf(GgmlType::Q6_K) => 2,
-        f if !f.specialized() => 2,
-        _ => 1,
-    })
+/// The multi-token matvec variant for a format, a row of `n_in` values split over `ks`
+/// SIMD-groups and steps of up to `tt` tokens: rows per threadgroup (each lane holds a decoded
+/// chunk of every row and an accumulator per row and token, and loads each token's x chunk once
+/// for the rows) and whether the decoded quants are half (else float; exact either way: half
+/// takes half the registers, float needs no conversion at each use). See [`mvk_table`];
+/// `OXINFER_MVK_ROWS=n` / `OXINFER_MVK_HALF=0|1` override it.
+pub(crate) fn mvk_variant(fmt: MvFmt, n_in: usize, ks: usize, tt: usize) -> (usize, bool) {
+    let long = n_in / fmt.chunk() > 32 * ks;
+    let (nr, half) = mvk_table(fmt, long, ks, tt);
+    let env = |k: &str| std::env::var(k).ok().and_then(|v| v.parse::<usize>().ok());
+    static OVER: std::sync::OnceLock<(Option<usize>, Option<usize>)> = std::sync::OnceLock::new();
+    let (r, h) = *OVER.get_or_init(|| (env("OXINFER_MVK_ROWS").filter(|r| [1, 2, 4].contains(r)), env("OXINFER_MVK_HALF")));
+    (r.unwrap_or(nr), h.map_or(half, |h| h != 0))
+}
+
+/// [`mvk_variant`] by format, row length (`long`: lanes take two chunks or more), SIMD-groups per
+/// row and token class, as measured on an M5 Max (`decode_mvk_bench` over every variant, 2 to
+/// 16 tokens, 4096 x 4096, 12288 x 4096 and 4096 x 12288 on 4 SIMD-groups, Inkling-2-Mini's
+/// 3072 x 2304 and 2304 x 3072 on one). Two rows a threadgroup pay where each lane streams
+/// several chunks for many tokens (the x loads they share) and for the 8-bit and wider formats;
+/// one row where its registers would cost more. Half rows pay for Q4_0 / oxinfer Q4 on 4
+/// SIMD-groups and the K-quants of long rows; float rows for Q5_K (its merged fifth bit) and
+/// Q8_0 at 4 tokens or more.
+fn mvk_table(fmt: MvFmt, long: bool, ks: usize, tt: usize) -> (usize, bool) {
+    use GgmlType::*;
+    let many = tt >= 6;
+    if tt > 8 {
+        // Sweeps of 8 tokens (see `mvk_body`).
+        let half = !matches!(fmt, MvFmt::Gguf(Q8_0));
+        return (if ks == 1 { 1 } else { 2 }, half);
+    }
+    match fmt {
+        MvFmt::Q4 | MvFmt::Gguf(Q4_0) if ks == 1 => (1, false),
+        MvFmt::Q4 | MvFmt::Gguf(Q4_0) => (if long && many { 2 } else { 1 }, true),
+        MvFmt::Gguf(Q4_K) if ks == 1 => (1, false),
+        MvFmt::Gguf(Q4_K | Q5_K) => (if long && many { 2 } else { 1 }, long),
+        MvFmt::Gguf(Q6_K) => (if ks == 1 { 1 } else { 2 }, true),
+        MvFmt::Gguf(Q8_0) if ks == 1 || tt <= 2 => (1, true),
+        MvFmt::Gguf(Q8_0) => (2, false),
+        MvFmt::Q8 => (2, true),
+        MvFmt::Bf16 | MvFmt::Gguf(F16) => (if !long && tt <= 6 { 1 } else { 2 }, false),
+        _ => (2, false),
+    }
 }
 
 /// A weight format with a decode matvec kernel.
@@ -87,17 +111,17 @@ impl MvFmt {
         }
     }
     /// The multi-token instantiation (up to `tt` tokens; see `mvk_body` in the shader).
-    fn instantiate_k(self, nr: usize, ks: usize, tt: usize) -> String {
+    fn instantiate_k(self, nr: usize, ks: usize, tt: usize, half: bool) -> String {
         let one = self.instantiate(nr, ks);
         let (mac, rest) = one.split_once('(').unwrap();
         let rest = rest
             .strip_suffix(')')
             .unwrap()
-            .replacen(&format!("mv_{}_{nr}_{ks}", self.name()), &self.mvk_name(nr, ks, tt), 1);
-        format!("{}({rest}, {tt})", mac.replacen("MV_", "MVK_", 1))
+            .replacen(&format!("mv_{}_{nr}_{ks}", self.name()), &self.mvk_name(nr, ks, tt, half), 1);
+        format!("{}({rest}, {tt}, {})", mac.replacen("MV_", "MVK_", 1), u8::from(half))
     }
-    fn mvk_name(self, nr: usize, ks: usize, tt: usize) -> String {
-        format!("mvk_{}_{nr}_{ks}_{tt}", self.name())
+    fn mvk_name(self, nr: usize, ks: usize, tt: usize, half: bool) -> String {
+        format!("mvk_{}_{nr}_{ks}_{tt}{}", self.name(), if half { "h" } else { "" })
     }
     /// The kernel's weight type, x chunk type and chunk size, and the `MKX_` constructor of the
     /// weight type from an expert table entry `e`.
@@ -195,12 +219,16 @@ pub(crate) fn shader_src() -> String {
         for ks in [1, 2, 4] {
             if f.specialized() || ks == 4 {
                 for tt in MVK_CLASSES {
-                    let _ = writeln!(s, "{}", f.instantiate_k(mvk_rows(f, tt), ks, tt));
-                    // decode_mvk_bench: the other row counts too.
-                    if std::env::var_os("OXINFER_MVK_ALL").is_some() {
-                        for nr in [1, 2, 4].into_iter().filter(|&n| n != mvk_rows(f, tt)) {
-                            let _ = writeln!(s, "{}", f.instantiate_k(nr, ks, tt));
-                        }
+                    // The variants of short and long rows (decode_mvk_bench: all of them).
+                    let mut vs: Vec<(usize, bool)> = if std::env::var_os("OXINFER_MVK_ALL").is_some() {
+                        [1, 2, 4].into_iter().flat_map(|nr| [(nr, false), (nr, true)]).collect()
+                    } else {
+                        let chunk = f.chunk() * 32 * ks;
+                        vec![mvk_variant(f, chunk, ks, tt), mvk_variant(f, 2 * chunk, ks, tt)]
+                    };
+                    vs.dedup();
+                    for (nr, half) in vs {
+                        let _ = writeln!(s, "{}", f.instantiate_k(nr, ks, tt, half));
                     }
                 }
             }
@@ -908,21 +936,21 @@ impl MetalBackend {
         Some((self.named_pipeline(&format!("mvt_{}_1_{ks}", fmt.name()))?, 1, ks))
     }
     /// The multi-token matvec pipeline for up to `tt` tokens (one of [`MVK_CLASSES`]).
-    pub(crate) fn mvk_pipe(&self, fmt: MvFmt, nr: usize, ks: usize, tt: usize) -> Option<Id> {
+    pub(crate) fn mvk_pipe(&self, fmt: MvFmt, nr: usize, ks: usize, tt: usize, half: bool) -> Option<Id> {
         if !fmt.specialized() && ks != 4 {
             return None;
         }
-        self.named_pipeline(&fmt.mvk_name(nr, ks, tt))
+        self.named_pipeline(&fmt.mvk_name(nr, ks, tt, half))
     }
     /// The multi-token matvec kernels of a format and SIMD-group split for steps of up to `tokens`
     /// tokens: the kernel of every token class that holds such a step.
-    pub(crate) fn mvk_pipes(&self, fmt: MvFmt, ks: usize, tokens: usize) -> Option<MvkPipe> {
+    pub(crate) fn mvk_pipes(&self, fmt: MvFmt, n_in: usize, ks: usize, tokens: usize) -> Option<MvkPipe> {
         let mut pipes = [(std::ptr::null_mut(), 0); MVK_CLASSES.len()];
         let top = mvk_class(tokens);
         for (i, &tt) in MVK_CLASSES.iter().enumerate() {
             let tt = if i <= top { tt } else { MVK_CLASSES[top] };
-            let nr = mvk_rows(fmt, tt);
-            pipes[i] = (self.mvk_pipe(fmt, nr, ks, tt)?, nr);
+            let (nr, half) = mvk_variant(fmt, n_in, ks, tt);
+            pipes[i] = (self.mvk_pipe(fmt, nr, ks, tt, half)?, nr);
         }
         Some(MvkPipe::Exact(pipes, 32 * ks))
     }
@@ -2870,7 +2898,7 @@ impl MetalBackend {
                     let t = match fv {
                         Some((p, rows)) => Some((MvkPipe::Fast(p, rows, 128), ts(x) as u32, ts(y) as u32, gate.map_or(0, ts) as u32)),
                         None if mt => Some((
-                            self.mvk_pipes(mw.fmt, ks, tokens.min(tt))?,
+                            self.mvk_pipes(mw.fmt, n_in, ks, tokens.min(tt))?,
                             ts(x) as u32,
                             ts(y) as u32,
                             gate.map_or(0, ts) as u32,
@@ -3046,7 +3074,7 @@ impl MetalBackend {
                                 y: byte(logits) + n_exp * 4,
                                 mode: MvMode::Store,
                                 gate: 0,
-                                t: Some((self.mvk_pipes(fmt, ks, tokens.min(tt))?, ts(x) as u32, ts(logits) as u32, 0)),
+                                t: Some((self.mvk_pipes(fmt, h, ks, tokens.min(tt))?, ts(x) as u32, ts(logits) as u32, 0)),
                                 each: (0, 0),
                             });
                         }
@@ -3066,7 +3094,7 @@ impl MetalBackend {
                         );
                     }
                     let mvk = if pf {
-                        self.mvk_pipes(fmt, ks, tokens.min(tt))
+                        self.mvk_pipes(fmt, h, ks, tokens.min(tt))
                             .map(|p| (p, ts(x) as u32, ts(logits) as u32, 0))
                     } else {
                         None
@@ -7688,8 +7716,8 @@ mod tests {
                             reset();
                             // Up to 8 tokens through the 8-token kernels, more through the 16-token ones.
                             let tt = *MVK_TOKENS.iter().find(|&&t| t >= ntok).unwrap();
-                            let tnr = mvk_rows(fmt, tt);
-                            let tpipe = be.mvk_pipe(fmt, tnr, ks, tt).unwrap();
+                            let (tnr, half) = mvk_variant(fmt, n_in, ks, tt);
+                            let tpipe = be.mvk_pipe(fmt, tnr, ks, tt, half).unwrap();
                             let (ok, _) = run_concurrent(&be, &f, &[std::ops::Range { start: 0, end: 1 }], |e, _| {
                                 encode_mvk(
                                     e,
@@ -8086,8 +8114,8 @@ mod tests {
     /// over a ring of copies of the matrix larger than the caches, one dispatch after the other
     /// (`cargo test --release --lib decode_mvk_bench -- --ignored --nocapture`;
     /// `OXINFER_MVK_FMTS=Q4_K,q4a,..` (`q4a`: oxinfer Q4 with MLX affine offsets),
-    /// `OXINFER_MVK_SHAPES=4096x4096,..`, `OXINFER_MVK_T=1,2,4,8`; with `OXINFER_MVK_ALL=1` every
-    /// row count of `OXINFER_MVK_NR=1,2,4`).
+    /// `OXINFER_MVK_SHAPES=4096x4096,..`, `OXINFER_MVK_T=1,2,4,8`, `OXINFER_MVK_KS=n`; with
+    /// `OXINFER_MVK_ALL=1` every variant, see `vars`).
     #[test]
     #[ignore]
     fn decode_mvk_bench() {
@@ -8103,10 +8131,16 @@ mod tests {
             })
             .collect();
         let toks: Vec<usize> = env("OXINFER_MVK_T", "1,2,4,8").split(',').map(|v| v.parse().unwrap()).collect();
-        let nrs: Vec<usize> = if std::env::var_os("OXINFER_MVK_ALL").is_some() {
-            env("OXINFER_MVK_NR", "1,2,4").split(',').map(|v| v.parse().unwrap()).collect()
+        // (rows, half): every variant with OXINFER_MVK_ALL (`OXINFER_MVK_NR=1,2,4`,
+        // `OXINFER_MVK_H=0,1`), else the plans' (0).
+        let vars: Vec<(usize, bool)> = if std::env::var_os("OXINFER_MVK_ALL").is_some() {
+            let hs: Vec<bool> = env("OXINFER_MVK_H", "0,1").split(',').map(|v| v == "1").collect();
+            env("OXINFER_MVK_NR", "1,2,4")
+                .split(',')
+                .flat_map(|v| hs.iter().map(move |&h| (v.parse().unwrap(), h)))
+                .collect()
         } else {
-            vec![0]
+            vec![(0, false)]
         };
         let mut seed = 9u64;
         for name in fmts.split(',') {
@@ -8186,15 +8220,13 @@ mod tests {
                 let mut line = format!("{name:>7} {n_out}x{n_in} ks {ks}: one {one:.1}us ({gbs:.0} GB/s)");
                 for &t in &toks {
                     let tt = *MVK_CLASSES.iter().find(|&&c| c >= t).unwrap();
-                    for &nr in &nrs {
-                        let nr = if nr == 0 { mvk_rows(fmt, tt) } else { nr };
-                        let Some(pipe) = be.mvk_pipe(fmt, nr, ks, tt) else { continue };
-                        // `OXINFER_MVK_TPG=1`: threadgroups of a SIMD-group set per token (kernel experiments).
-                        let sets = if std::env::var_os("OXINFER_MVK_TPG").is_some() { tt } else { 1 };
+                    for &(nr, half) in &vars {
+                        let (nr, half) = if nr == 0 { mvk_variant(fmt, n_in, ks, tt) } else { (nr, half) };
+                        let Some(pipe) = be.mvk_pipe(fmt, nr, ks, tt, half) else { continue };
                         let us = best(&|e, c| {
                             encode_mvk(
                                 e,
-                                (pipe, nr, ks * sets),
+                                (pipe, nr, ks),
                                 &wt(c),
                                 None,
                                 MvMode::Store,
@@ -8206,10 +8238,7 @@ mod tests {
                                 n_out,
                             )
                         });
-                        // The pipeline's thread limit: below 1024 when its registers limit occupancy.
-                        let max_threads: unsafe extern "C" fn(Id, Sel) -> usize = be.o.msg_send();
-                        let mt = unsafe { max_threads(pipe, be.o.sel(c"maxTotalThreadsPerThreadgroup")) };
-                        let _ = write!(line, " | t{t} nr{nr} {us:.1} ({:.2}x) m{mt}", us / one);
+                        let _ = write!(line, " | t{t} nr{nr}{} {us:.1} ({:.2}x)", if half { "h" } else { "f" }, us / one);
                     }
                 }
                 println!("{line}");

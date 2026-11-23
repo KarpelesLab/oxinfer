@@ -316,7 +316,7 @@ impl InkDraftMetal {
             let (nr1, ks1) = if specialized(w.fmt) { (1, ks) } else { (2, 4) };
             Some(Mw {
                 one: (be.mv_pipe(w.fmt, nr1, ks1)?, nr1, ks1),
-                multi: be.mvk_pipes(w.fmt, ks, 16)?,
+                multi: be.mvk_pipes(w.fmt, w.n_in, ks, 16)?,
                 w,
             })
         };

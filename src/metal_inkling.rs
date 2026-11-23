@@ -1501,7 +1501,7 @@ impl InkMetal {
                 mvs,
                 lora,
                 one,
-                multi: be.mvk_pipes(w.fmt, ks, MAX_T).context("mvk pipeline")?,
+                multi: be.mvk_pipes(w.fmt, w.n_in, ks, MAX_T).context("mvk pipeline")?,
                 g,
                 f32g,
             })
