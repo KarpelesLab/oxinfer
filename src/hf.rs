@@ -221,6 +221,7 @@ pub fn resolve_gguf(repo: &str, quant: &str, cache_dir: Option<&Path>) -> Result
 
 /// The split parts of `name` that `parts` fetches under another name (see [`gguf_parts`]), as
 /// (part name, fetched name).
+#[cfg_attr(not(unix), allow(dead_code))]
 fn shared_part_links(name: &str, parts: &[String]) -> Vec<(String, String)> {
     let Some((pre, _, count, digits)) = crate::gguf::split_name(name) else {
         return Vec::new();
