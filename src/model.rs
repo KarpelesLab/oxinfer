@@ -1498,6 +1498,11 @@ impl LayerCache {
     }
     /// Room for `t` more positions, and where their keys and values go (the vectors' spare
     /// capacity): written by [`Self::commit`]'s caller before it is called, invisible until.
+    // Used by the CUDA decode plans only.
+    #[cfg_attr(
+        not(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))),
+        allow(dead_code)
+    )]
     pub(crate) fn stage(&mut self, t: usize) -> (*mut f32, *mut f32) {
         let n = t * self.n_kv * self.hd;
         self.k.reserve(n);
@@ -1511,6 +1516,11 @@ impl LayerCache {
     ///
     /// # Safety
     /// Every key and value of them must have been written.
+    // Used by the CUDA decode plans only.
+    #[cfg_attr(
+        not(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32")))),
+        allow(dead_code)
+    )]
     pub(crate) unsafe fn commit(&mut self, t: usize) {
         let n = t * self.n_kv * self.hd;
         debug_assert!(self.k.capacity() - self.k.len() >= n && self.v.capacity() - self.v.len() >= n);
