@@ -582,9 +582,11 @@ routing with ties and NaNs, the convolutions, mixes, clips and gates against the
 `OXINFER_GPU_DECODE=0` (or `--gpu-decode off`) keeps the passes on the CPU,
 `OXINFER_INKLING_PREFILL=0` the prefill passes; `OXINFER_GPU_DECODE_CHECK=1` runs each decode
 step on the CPU too and prints the difference; `OXINFER_INKLING_SKIP=dense,attn,exp,...` leaves
-kinds of ops out (measurements only); `OXINFER_INKLING_PROFILE=N` runs the passes of up to 16
-tokens stage by stage and prints the GPU time per kind of stage and the dispatch and barrier
-counts every N passes (slow: profiling only). The kernels compile on first use (about 1.5 s, cached by
+kinds of ops out (measurements only: the routing then sees stale inputs, so its experts' reads
+are not those of a real pass); `OXINFER_INKLING_PROFILE=N` runs the passes of up to 16 tokens
+stage by stage, a command buffer each committed back to back, and prints the GPU time per kind
+of stage and the dispatch and barrier counts every N passes (profiling only);
+`OXINFER_INKLING_NARROW=1` puts the router's logits back on `ink_mvf` (measurements). The kernels compile on first use (about 1.5 s, cached by
 the system after).
 
 **Correctness.** Against transformers float32 on the release (the 24-token chat prompt and 16
@@ -745,7 +747,7 @@ read about 26-29 distinct experts). mlx-community 4bit, ms per pass:
 | pass | 14.0 | 18.9 | 23.1 | 27.3 | 37.2 | 46.0 | 65.3 | 85.4 |
 | without the routed experts | 9.4 | 11.2 | 12.4 | 13.7 | 17.5 | 20.4 | 27.2 | 34.6 |
 
-(Measured before the changes above; now 11.9 ms for one token and 24.4 for four.) A pass of 4
+(Measured before the changes above; now 10.0 ms for one token and 20.1 for four.) A pass of 4
 tokens adds 9.1 ms of experts to one of 1 token, 2.2 ms of dense matvecs, 0.6 of LM head, 0.3 of
 gates and nothing of attention. The experts add about 3.1 ms a token (4.6 ms for the first); the
 rest grows by 0.4-1.6 ms a token,
@@ -768,11 +770,13 @@ block 8, depth 7) reaches 37-42 tok/s on code (63-65% of drafts accepted) and 25
 (45-51%). 125 tok/s of plain decoding is not plausible on this chip (the best published
 single-token figures for the model are about 46 tok/s on an M5 Max); 1750 tok/s of prefill is
 (mlx-swift-lm reports 1834-1852 on an M5 Max; oxinfer: 1603-1856 at pp512 at load 3, 1542-1701 at load 6-12).
-A round aimed at that figure (host and GPU overlap, kernel fusion, the attention at short ranges,
-the dense matvecs' decoding, speculative decoding) is in
-[performance.md](performance.md#inkling-2-mini-decoding-on-metal-november-2026): one-token
-passes are 11.4-11.6 ms on the 4-bit files, about 6 ms of them the latency of the chain of small
-kernels, and fusing 240 of the 759 dispatches away did not change the time.
+Two rounds aimed at that figure (host and GPU overlap, kernel fusion, the attention at short ranges,
+the dense matvecs' decoding, speculative decoding; then the small kernels of the latency chain) are
+in [performance.md](performance.md#inkling-2-mini-decoding-on-metal-november-2026): one-token
+passes went from 11.4-11.6 ms on the 4-bit files to 10.0-10.4 (tg64: mlx-community 4bit 85.5 ->
+98.5 tok/s, UD-IQ3_XXS 82.1 -> 94.3, Q8_0 66.7 -> 73.6), mostly by an attention kernel with its
+lanes across a head's channels and by keeping the small kernels' loads together and their
+registers few; about 7 ms of a pass is now the weights' streaming and 3.5 the chain.
 
 ### CUDA
 

@@ -1412,7 +1412,157 @@ the routing) or as a few threadgroups (the attention at short ranges: 8 of 40 co
 the time is. Making those spread over the GPU changes their sums' order, which the equality rule
 excludes; even all of it (the attention change above, the mixes at 512 threads instead of 1024:
 25% faster in mb on a busy GPU) is worth perhaps 0.5-1 ms. A realistic ceiling for plain decoding on this design is 90-95 tok/s
-for the 4-bit files, and the published 125 is not reproducible here.
+for the 4-bit files, and the published 125 is not reproducible here (but see round 2 below:
+98.5 tok/s on the 4-bit file once the order of the sums was allowed to change).
+
+**Round 2 (November 2026): the latency chain.** The rule changed for this round: a change is kept
+when its agreement with the float32 reference (`inkling2_check`: decode KL, top-1 agreement) is no
+worse than the previous build's within the noise, and greedy text stays coherent; summation
+order may change. The previous build gives the same text run after run, this one parts from it
+on 3 of the 9 replies of 160 tokens (at bytes 155, 240 and 431 of 504-653: "Need be careful" for
+"Need be accurate", "simple decorations" for "simple jewelry"), all coherent.
+
+Before / after (best of 4 interleaved runs of `inkling2_bench -n 64 -r 2 -v 1,4`, load 2.4-4.6):
+
+| Checkpoint | tg64 ms / tok/s | one-token pass ms | 4-token pass ms |
+|---|---:|---:|---:|
+| mlx-community 4bit | 11.69 / 85.5 -> **10.15 / 98.5** | 11.28 -> 9.97 | 21.23 -> 20.11 |
+| unsloth UD-IQ3_XXS | 12.18 / 82.1 -> **10.61 / 94.3** | 11.77 -> 10.42 | 23.57 -> 22.26 |
+| ggml-org Q8_0 | 15.00 / 66.7 -> **13.58 / 73.6** | 14.63 -> 13.36 | 24.31 -> 23.22 |
+
+The master this round is rebased onto (8ca1574) decodes at the previous round's speed (mlx-community
+4bit: 11.68 ms, the previous round 11.68, this round 10.12; best of 3 interleaved, load 2.5-4.3).
+At longer contexts (`inkling2_ctx_bench`, mlx-community 4bit, 48 tokens): 10.4 ms a token at 300
+tokens, 11.3 at 2000, 11.9 at 8000.
+
+**Accuracy.** The reference agreement is measured with the prompt fed in passes of 16 tokens
+(`inkling2_check --chunk 16`), which run the decoding kernels in float32 throughout: fed as one
+prefill pass, the prompt's activations are rounded to half precision for the GEMMs, and a change
+of the last bit anywhere moves the following decode KL by one to two orders of magnitude
+(the attention change below took the release's 16-step KL from 2.6e-6 to 3.0e-4 that way, with
+the prefill KL going from 1.8e-4 to 6.3e-7). Mean decode KL of the release against its float32
+reference on three prompts (24 tokens + 16 decoded, 620 + 96 (code), 357 + 128 (prose)); the
+top-1 agreement is 16/16, 96/96 and 128/128 for every build:
+
+| Build | 24 + 16 | 620 + 96 | 357 + 128 | tg64 ms (mlx-community 4bit) |
+|---|---:|---:|---:|---:|
+| previous round (644f76c) | 3.3e-12 | 2.1e-11 | 9.1e-13 | 11.71 |
+| attention across the channels, splits of a fifth, router per threadgroup (691be1d) | 4.4e-12 | 2.1e-11 | 8.3e-13 | 11.05 |
+| convolution apart from the mix, mix8, routing in a SIMD-group, norm loads (62adac6) | 4.3e-12 | 2.7e-11 | 9.1e-13 | 10.55 (11.19 before, same batch) |
+| merge in the attention kernel (62832aa, bb4c533) | 3.3e-12 | 2.4e-11 | 8.2e-13 | 10.40 (10.47) |
+| 2 keys a SIMD-group at a time (feee754) | 5.7e-12 | 2.3e-11 | 7.9e-13 | 10.24 (10.30) |
+
+The builds measured on the way (variants not kept included) span 1.8e-11 to 2.8e-11 on the
+620-token prompt: that is the noise. On the quantized checkpoints the decode KL is the
+quantization's and the same to four digits before and after (mlx-community 4bit 2.352e-3 /
+5.530e-2 / 1.509e-2, UD-IQ3_XXS 2.843e-3 / 3.623e-2 / 1.050e-2, Q8_0 7.137e-4 / 1.155e-2 /
+8.766e-4; top-1 16/16, 83/96, 126/128; 16/16, 87/96, 124/128; 16/16, 94/96, 128/128).
+
+**How it was measured.** `OXINFER_INKLING_PROFILE` ran each stage in a command buffer of its own
+and waited for it, so the GPU idled between stages and ran them at a lower clock: its per-kernel
+times summed to 39.6 ms for an 11.4 ms pass. It now commits the stages back to back and reads
+their times at the end (10.4-11.7 ms of stage time for passes of 10.2-11.5): a stage's time there
+includes about 2 us of command buffer start, but kernels can be compared in place, and a
+variant of the Metal source (`OXINFER_INKLING_METAL`) needs no rebuild. Two other methods misled:
+leaving a kind of stage out (`OXINFER_INKLING_SKIP`) leaves stale or garbage inputs to the routing,
+whose experts then come from the cache (leaving the routing out took 5.2 ms off a 12.5 ms pass), and
+a kernel timed alone in a harness runs on a GPU whose clock follows the load (an 8 x 64-FMA kernel
+with a barrier: 1.35 to 3.6 us depending on what else ran). In a pass, an extra stage of an empty
+kernel costs 1.1-1.4 us (passes padded with 192 or 384 of them).
+
+What the stages cost (profile, mlx-community 4bit, us a stage, 48 layer applications):
+
+| Kernel | before | after |
+|---|---:|---:|
+| attention (`ink_attn` -> `ink_attv`) | 21.3 | 11.7 |
+| convolution + MLP mix (`ink_conv_mix`, one threadgroup) | 17.5-20.9 | -> `ink_conv` 6.5 + `ink_mix8` 7.9 |
+| attention input mix (`ink_mix` -> `ink_mix8`) | 11.5 | 7.9 |
+| router logits (`ink_mvf` -> `ink_mvr`) | 7.9 | 4.9 |
+| routing (`ink_route`) | 6.8 | 4.5 |
+| norms (`ink_norm`) | 7.4 | 6.3 |
+| attention merge (`ink_attn_merge`) | 3.9 | 0 at fewer than 64 keys |
+
+**Kept:**
+
+- **Attention with the lanes across a head's channels** (`ink_attv`, passes of up to 16 tokens):
+  a SIMD-group takes a key at a time with its 32 lanes on the head's 128 channels, so that a key
+  is one 16-byte load per lane and a SIMD-group sum per query head, the keys interleaved over the
+  8 SIMD-groups; the key and value loads of 2 keys are issued together. The previous kernel had a
+  lane per key walk its 128 channels in 4 rounds of 8 loads, then the values in rounds of 8 keys.
+  Splits of a fifth of the range, 64 to 256 keys (the change of the previous round dropped for the
+  equality rule). 21.3 -> 11.7 us a layer at the ranges of tg64; 33 -> 28 us at 2000 tokens of
+  context, 49 -> 44 at 8000 (the earlier kernel with the same splits). 1, 4 and 8 keys at a time:
+  10.7, 13.0 and 16.9 us at tg64, 32, 30 and - at 2000 (more registers: fewer SIMD-groups in
+  flight); splits of at most 128 or 64 keys: slower at 8000 (11.9 -> 12.1 / 12.3 ms a token).
+- **The tokens of one split merge in the attention kernel** (the sink and the gate), the merge
+  kernel leaving them out: one stage fewer a layer below 64 keys of range. 10.47 -> 10.40 ms.
+- **The router's logits a threadgroup per expert** (`ink_mvr`: 128 threadgroups of 128 threads,
+  every thread's 4-5 float4 loads issued together) instead of a SIMD-group per expert walking
+  2304 values: 7.9 -> 4.9 us; 11.19 -> 11.05 ms a token.
+- **The convolution after the attention apart from the MLP's mix.** `ink_conv_mix` (the
+  convolution, then the mix, in one threadgroup of 1024 per token) walked each thread's 2-3
+  channels three times, every walk a round trip to memory; the convolution as `ink_conv` (9
+  threadgroups, a channel a thread) and then the mix is one stage more and 3-5 us less.
+- **`ink_mix8`**: the mix of at most 8 block states (Inkling-2-Mini has at most 5), whose thread
+  keeps its 3 channels' x and states in registers from the first walk to the output (8 + 2
+  accumulators instead of 16 + 2): 11.5 -> 8.8 us. The same with 16 states: 15.8 us (spills).
+- **The routing in one SIMD-group** (`ink_route`, at most 128 experts: 4 a lane, no threadgroup
+  barriers; the k picks kept by lanes 0..k): 6.8 -> 4.5 us. **The norms' loads** (12 a thread)
+  issued together: 7.4 -> 6.3 us. Together with the two above: 11.19 -> 10.55 ms a token.
+
+**Measured and dropped:**
+
+- **Mixes over the whole GPU in two stages** (`ink_mixp`: per block of 128 or 256 channels, the dot
+  products of the queries with the states and of every pair of states, from which the output's
+  norm follows without a pass over it; `ink_mixo`: the weights and the block's outputs): 9.7 + 8.4
+  us against 11.5 for the one-threadgroup mix, 11.46-11.53 ms a token against 11.61-11.87.
+- **One threadgroup of 768 threads with all of a thread's loads issued first** (`ink_mix3`, the
+  convolution in it): 16.1 us against 11.4 / 18.0; the routing with 8 experts a lane and its picks
+  in 16-entry arrays: 10.9 us against 6.8; the keys' and values' convolution with every lag's loads
+  first: 6.2 -> 9.4 us; the convolution with its 16 expert slots and 8 lags in arrays: 8.4 -> 9.1-9.4
+  us. In
+  each the arrays took the registers that let more SIMD-groups hide their loads' latency; the kept
+  versions issue their loads together with arrays of at most 4-12 values.
+- **The relative bias's 16 loads issued together** in the earlier attention kernel: no change
+  alone (kept in `ink_attv`).
+- **The one-token matvecs in other shapes** (2 or 4 SIMD-groups a row, 2 rows a threadgroup): the
+  attention's projections 29.3 -> 32-33 us, the LM head 485 -> 498-564 us; the output projection
+  13.0 -> 11.8 with 4 SIMD-groups a row, not enough to pay for the rest.
+
+**Speculative decoding** (the CLI, 256 tokens, greedy, `--no-system`, one run each, load 2.4-3.3;
+DSpark on the 4-bit file with unsloth's Q8_0 draft by path):
+
+| Checkpoint | prompt | plain | prompt lookup (default) | DSpark draft |
+|---|---|---:|---:|---:|
+| mlx-community 4bit | code | 98.5 | 97.9 (1.08 tok/forward, 33% of drafts) | 97.2 (1.17, 59%) |
+| | chat | 98.5 | 111.9 (1.27, 79%) | 94.9 (1.03, 32%) |
+| unsloth UD-IQ3_XXS | code | 94.1 | 95.5 (1.05, 55%) | 91.5 (1.16, 55%) |
+| | chat | 93.9 | 92.3 (1.01, 7%) | 89.8 (1.04, 35%) |
+| ggml-org Q8_0 | code | 73.5 | 75.9 (1.08, 43%) | 78.5 (1.38, 55%) |
+| | chat | 73.9 | 74.1 (1.03, 27%) | 72.7 (1.05, 35%) |
+
+Plain decoding gained more than verification passes (one-token passes 12% faster, 4-token passes
+5%: the experts of 4 tokens, about 27 of the 128, are most of a verification pass), so drafting
+pays less than before: +14% at best (chat with lookup on the 4-bit file, 1.27 tokens a forward),
+-4% to +7% elsewhere. Eleven of the twelve speculative outputs are the plain ones; the 4-bit chat
+with DSpark parts from it at byte 364 of 753. That is not new: a verification pass and one-token
+passes give logits that differ by up to 1.3e-5 (8 tokens after 56 or 200, a third to all of the
+logits differing in the last bits) on the previous round's build as on this one, so a near tie can go either way;
+the previous build happens to give the same text on that prompt.
+
+**What is left to 125 tok/s** (8 ms a token). A one-token pass is now 10.4-10.8 ms of stage time:
+about 7.0 ms of the bandwidth kernels (routed experts 54.6 + 32.6 us a layer, 440 and 370 GB/s;
+the attention's projections 29.7 us, 380 GB/s; the output projection 13.2 us, 300 GB/s; the LM
+head 0.5 ms, 500 GB/s; the 4 MXFP8 layers' experts 0.6 ms) and 3.5 ms of the others (the mixes
+7.9 us x 89, the attention 11.7 x 48, the convolutions 6.5 x 96, the message gates 7.8 + 6.3 + 6.0 x
+48, the keys and queries 6.3, the router 4.9 and routing 4.5 x 48), plus 0.3-0.5 ms of host and
+launch. Even every small kernel at a stage's floor (about 2 us: 1.1-1.4 of stage and one round
+trip) would leave about 9 ms, and the matvecs at 480 GB/s another 0.8 ms less: 125 tok/s needs
+both and more. The next steps in reach: the attention's key / query stage folded into the
+attention kernel (the queries' clipping is a SIMD-group sum there), the convolution after the
+experts into the next layer's mix (a stage a layer, but a verification pass's tokens would then
+sum each other's expert slots), and the output projection and routed experts' down projection,
+the two matvecs furthest from the GPU's bandwidth.
 
 #### DGX Spark, CUDA (November 2026)
 
