@@ -607,9 +607,17 @@ mod tests {
         })
     }
 
-    /// A backend of its own: the process-wide one would put the other tests on the GPU.
+    /// A backend of its own: the process-wide one would put the other tests on the GPU. None
+    /// (the test skips) without a device, or on a device without residency sets (such as the
+    /// paravirtual GPU of CI's macOS virtual machines), where `Plan::build` declines and the
+    /// model decodes on the CPU.
     fn own_backend() -> Option<&'static MetalBackend> {
-        Some(Box::leak(Box::new(MetalBackend::new().ok()?)))
+        let be = MetalBackend::new().ok()?;
+        if !md::supported(&be) {
+            eprintln!("no Metal residency set on this device: the DeepSeek V4.1 GPU decode test skips");
+            return None;
+        }
+        Some(Box::leak(Box::new(be)))
     }
 
     /// The model's session after a CPU prefill of 9 tokens.

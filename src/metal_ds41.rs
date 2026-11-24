@@ -887,6 +887,14 @@ fn expert_parts(w: &WeightRef) -> Option<ExpertMem> {
     })
 }
 
+/// Whether `be` can run this decode at all: it reaches the experts through their addresses, so
+/// it needs the queue's residency set (macOS 15, a device with matrix kernels; the paravirtual
+/// GPU of macOS virtual machines has none). Without, [`Plan::build`] declines and the model
+/// decodes on the CPU.
+pub(crate) fn supported(be: &MetalBackend) -> bool {
+    be.residency.is_some()
+}
+
 impl Plan {
     /// Compiles the decode of `d` on `be` (None when some part cannot run there; the model then
     /// decodes on the CPU). Experts are wrapped by [`Self::step`] (`stream`: from the part cache;
@@ -903,10 +911,10 @@ impl Plan {
             dbg("unsupported sizes");
             return None;
         }
-        be.residency.as_ref().or_else(|| {
+        if !supported(be) {
             dbg("no residency set");
-            None
-        })?;
+            return None;
+        }
         // The input embedding on the device (a GGUF type of the dequantizers, or bf16).
         let emb_kind = match &d.embed {
             Some(EmbDesc::Gguf { kind, .. }) if super::GGUF_GPU_TYPES.contains(kind) && *kind != crate::ggml::GgmlType::F32 => Some(*kind),
