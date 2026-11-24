@@ -4689,10 +4689,13 @@ mod tests {
         }
     }
 
+    /// A model folder with the engine options that attach its draft.
+    type DraftCase = (&'static str, PathBuf, Vec<(&'static str, String)>);
+
     /// Speculative decoding's models with checkpoints: the tiny Inkling-2 with its MTP drafter
     /// and the tiny DeepSeek V4 with a DSpark draft (each case: the folder, the options with the
     /// draft).
-    fn draft_cases(tag: &str) -> Vec<(&'static str, PathBuf, Vec<(&'static str, String)>)> {
+    fn draft_cases(tag: &str) -> Vec<DraftCase> {
         let ink = tiny_inkling(&format!("d{tag}"));
         crate::inkling::tiny::write_tiny_mtp(&ink, 9, &[0, 2]).unwrap();
         let ds = std::env::temp_dir().join(format!("oxinfer-ds4-engine-d{tag}-{}", std::process::id()));

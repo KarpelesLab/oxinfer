@@ -78,6 +78,26 @@ rows beside the target's session; the drafter's device copy of its cache (Inklin
 uploaded again from the host's at its next pass. Re-running the draft from the tokens is not an
 option (its context comes from the target's features at every position: a whole prefill).
 
+Measured on Inkling-2-Mini (`thinkingmachines/Inkling-2-Mini` with its MTP head, `mtp=on`, M5 Max,
+Metal decode with the drafter on the GPU, other jobs on the machine at load 3) with
+`examples/chat_turns.rs`: a 2936-token first turn in thinking mode (160 reply tokens), then a
+2956-token second turn whose past reply is sent back as text. "Before" is `prompt_checkpoints=0`,
+what a draft got until now (it refused checkpoints and snapshots):
+
+| turn 2 | cached | prefill | wall (160 tokens) | drafts accepted (fixed lengths) |
+|---|---|---|---|---|
+| before (the conversation starts over) | 0 | 5.2-5.8 s | 9.9 s | 98 of 422 |
+| after (in memory, back to the previous prompt but its last token) | 2935 | 0.18-0.23 s | 4.1 s | 98 of 422 |
+| a new process, `--prompt-cache` (read in 0.09 s) | 2955 | 0.14 s | 4.7 s | |
+
+The replies are the same tokens in all three (and those of plain decoding without the head); with
+fixed draft lengths (`draft_fixed=on`) the second turn drafts and accepts exactly as many tokens
+as before (with the cost-aware policy the counts follow its timings: 9 of 39 before, 9 of 13
+after). The prompt cache held 2.7 GB (f32 caches: four snapshots of 0.71-0.73 GB). The
+first turn takes its checkpoints as without a draft (its prompt fed in three parts: 4.7-5.7 s
+against 3.5-5.4 s in one, within the machine's noise). No DeepSeek V4 DSpark draft was at hand
+(V4.1's is not supported yet); V4's is covered by the tiny models' tests.
+
 Measured on DeepSeek-V4.1-Flash-1017 (ISTA-DASLab GSQ-RCO IQ1_M, M5 Max, Metal decode, warm page
 cache, other jobs on the machine at load 4-10) with `examples/chat_turns.rs`: a 2131-token
 first turn in thinking mode (160 reply tokens, all thinking, so the reply sent back is empty and
