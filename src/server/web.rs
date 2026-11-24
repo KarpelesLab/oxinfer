@@ -26,14 +26,19 @@
 //! | `POST /api/web/caches/free` | `{"model"}` or `{}`: lets go of the streamed models' cached experts |
 //! | `GET /api/web/update` | this version, the latest release, whether it is newer and can be installed from here |
 //! | `POST /api/web/update` | installs the latest release over this executable and restarts into it ([`allow_self_update`]) |
+//! | `GET /api/web/opencode` | opencode's configuration ([`crate::opencode`]): detected, its file, and per chat model whether it has an entry and whether that is up to date |
+//! | `POST /api/web/opencode/add` | `{"model"}`: writes the model's entry (and the `oxinfer` provider) to opencode's configuration |
+//! | `POST /api/web/opencode/remove` | `{"model"}`: removes its entry (and the provider when it has no model left) |
 //!
 //! Every endpoint but `info` needs the API key when one is set. Requests that change anything
 //! (POST, DELETE) must be JSON and, when the browser sends an `Origin`, come from the page's own
 //! origin; on a loopback listener the `Host` must be a loopback name (against DNS rebinding).
 //! Bound to a non-loopback address without an API key, the management API is read-only:
 //! downloads, deletions, loads, unloads, cancels, cache clearing and updates are refused with 403
-//! (`oxinfer web` warns at start).
+//! (`oxinfer web` warns at start). The opencode endpoints also need the request to come from this
+//! machine (a loopback listener or a loopback client): they write to the server user's home.
 
+mod opencode;
 mod update;
 
 pub use update::{RESTART_ENV, Restart, allow_self_update};
@@ -482,6 +487,9 @@ fn management(api: &Arc<Api>, w: &WebState, req: &ApiRequest, rest: &str) -> Api
         }
         (["update"], true, _, _) => json_ok(update_status(api, w)),
         (["update"], _, true, _) => start_update(api, w),
+        (["opencode"], true, _, _) => json_ok(opencode::status(api, w, req)),
+        (["opencode", "add"], _, true, _) => opencode::change(api, w, req, &body(req)?, true),
+        (["opencode", "remove"], _, true, _) => opencode::change(api, w, req, &body(req)?, false),
         (["models"], true, _, _) => json_ok(models(api, w)),
         (["activity"], true, _, _) => json_ok(api.status()),
         (["requests"], true, _, _) => {

@@ -205,6 +205,8 @@ pub(crate) struct Entry {
     fingerprint: Mutex<Option<String>>,
     /// Whether the chat model takes images, once it has been loaded (kept after an unload).
     vision: Mutex<Option<bool>>,
+    /// What the chat model can do, from its last load (kept after an unload).
+    caps: Mutex<Option<crate::engine::Capabilities>>,
 }
 
 impl Entry {
@@ -234,6 +236,7 @@ impl Entry {
             details: Mutex::new(None),
             fingerprint: Mutex::new(None),
             vision: Mutex::new(None),
+            caps: Mutex::new(None),
         }
     }
 
@@ -271,6 +274,8 @@ pub(crate) struct EntryStatus {
     /// Seconds since its last use.
     pub idle_secs: f64,
     pub fingerprint: Option<String>,
+    /// What the chat model could do when it was last loaded.
+    pub caps: Option<crate::engine::Capabilities>,
 }
 
 pub(crate) struct Registry {
@@ -522,6 +527,7 @@ impl Registry {
                 details: lock(&e.details).clone(),
                 idle_secs: now_ms().saturating_sub(e.used_at.load(Ordering::Relaxed)) as f64 / 1e3,
                 fingerprint: lock(&e.fingerprint).clone(),
+                caps: *lock(&e.caps),
             })
             .collect()
     }
@@ -1058,6 +1064,7 @@ impl Registry {
         if let Loaded::Chat(engine) = &loaded {
             *lock(&e.fingerprint) = Some(engine.prompt_cache_fingerprint().to_string());
             *lock(&e.vision) = Some(engine.accepts_images());
+            *lock(&e.caps) = Some(engine.capabilities());
         }
         crate::model_cache::touch(src, self.cache_dir.as_deref());
         if self.log {

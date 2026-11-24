@@ -371,6 +371,57 @@ pub unsafe extern "C" fn oxi_engine_cancel(e: *const OxiEngine) {
     }
 }
 
+/// opencode's configuration at `dir` (NULL: the detected one).
+fn opencode_config(dir: Option<&str>) -> Result<crate::opencode::Config> {
+    match dir {
+        Some(d) => Ok(crate::opencode::Config::at(d)),
+        None => crate::opencode::detect().context("opencode is not set up for this user (no ~/.config/opencode)"),
+    }
+}
+
+/// opencode's configuration as JSON: `{"dir", "path", "models"}` (the ids of the `oxinfer`
+/// provider), or NULL when opencode is not set up for this user.
+#[unsafe(no_mangle)]
+pub extern "C" fn oxi_opencode_detect() -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let c = opencode_config(None)?;
+        let v = serde_json::json!({"dir": c.dir(), "path": c.path(), "models": c.models()?});
+        Ok(out_string(v.to_string()))
+    })
+}
+
+/// Adds the loaded model to opencode's configuration as model `id` of the `oxinfer` provider.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_opencode_add(
+    e: *mut OxiEngine,
+    id: *const c_char,
+    base_url: *const c_char,
+    api_key: *const c_char,
+    dir: *const c_char,
+) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let caps = lock(unsafe { engine(e) }?).capabilities();
+        let id = unsafe { str_arg(id, "id") }?;
+        let provider = crate::opencode::Provider {
+            base_url: unsafe { str_arg(base_url, "base_url") }?.to_string(),
+            api_key: unsafe { opt_str_arg(api_key, "api_key") }?.map(str::to_string),
+        };
+        let cfg = opencode_config(unsafe { opt_str_arg(dir, "dir") }?)?;
+        let c = cfg.add(&provider, &crate::opencode::Model::new(id, &caps))?;
+        Ok(out_string(serde_json::to_string(&c)?))
+    })
+}
+
+/// Removes model `id` from opencode's configuration (and the provider when it has none left).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_opencode_remove(id: *const c_char, dir: *const c_char) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        let id = unsafe { str_arg(id, "id") }?;
+        let cfg = opencode_config(unsafe { opt_str_arg(dir, "dir") }?)?;
+        Ok(out_string(serde_json::to_string(&cfg.remove(id)?)?))
+    })
+}
+
 /// Model information as JSON.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn oxi_engine_info_json(e: *mut OxiEngine) -> *mut c_char {
@@ -418,6 +469,7 @@ pub unsafe extern "C" fn oxi_engine_info_json(e: *mut OxiEngine) -> *mut c_char 
                 "recurrent": c.recurrent,
             })),
             "decision": g.decision_assets().map(|d| d.info_json()),
+            "capabilities": g.capabilities(),
             "stream": st,
             "device_memory": serde_json::json!({
                 "total": dm.total,

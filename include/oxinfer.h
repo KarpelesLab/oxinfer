@@ -278,11 +278,35 @@ void oxi_engine_cancel(const OxiEngine *engine);
 
 /* Model information as a JSON object (path, model_type, family, layers, quant, format, device,
  * threads, speculative, load_secs, coreml (null, or units, prefill, context_length, ...),
- * decision (null, or as oxi_decide_info_json), stream (null, or cache_budget, resident_bytes,
+ * decision (null, or as oxi_decide_info_json), capabilities ({vision, thinking, tools, context}),
+ * stream (null, or cache_budget, resident_bytes,
  * streamed_bytes_per_pass, expert_bytes, expert_cache_bytes, flash_bytes_per_sec, gpu_decode),
  * device_memory (total, app_available, gpu_working_set, stream_budget: what the streaming
  * defaults were picked from), ...). */
 char *oxi_engine_info_json(OxiEngine *engine);
+
+/* opencode integration (over oxinfer::opencode): the model's entry under the "oxinfer" provider
+ * (@ai-sdk/openai-compatible) of opencode's global configuration ($XDG_CONFIG_HOME/opencode, else
+ * ~/.config/opencode; opencode.jsonc, else opencode.json). Edits keep the rest of the file (other
+ * keys and providers, comments, indentation); each write backs the file up first
+ * (opencode.json.oxinfer-<unix time>.bak, the last five kept) and replaces it atomically. `dir`
+ * NULL: the detected directory. The results are JSON, freed with oxi_string_free(), or NULL on
+ * error. */
+
+/* {"dir", "path", "models": [ids of the oxinfer provider]}; NULL when opencode is not set up. */
+char *oxi_opencode_detect(void);
+
+/* Adds (or brings up to date) the loaded model as model `id`: reasoning, tool_call, attachment,
+ * modalities and limit from what the engine can do ("capabilities" of oxi_engine_info_json); the
+ * provider's baseURL is `base_url` ("http://127.0.0.1:8080/v1") and its apiKey `api_key` (may be
+ * NULL). Returns {"path", "changed", "created", "backup", ...}. */
+char *oxi_opencode_add(OxiEngine *engine, const char *id, const char *base_url, const char *api_key,
+                       const char *dir);
+
+/* Removes model `id` (and the provider when it has no model left). Returns {"path", "changed",
+ * "provider_removed", "default_model": ["model", ...] when opencode's default named it (left as it
+ * is), ...}. */
+char *oxi_opencode_remove(const char *id, const char *dir);
 
 /* Statistics of the last turn as a JSON object: prompt_tokens, prefill_secs, prefill_tok_s,
  * generated_tokens, decode_secs, decode_tok_s, forwards, drafted, accepted, acceptance,

@@ -1160,6 +1160,20 @@ pub struct ModelInfo {
     pub coreml: Option<CoreMlInfo>,
 }
 
+/// What a chat model can do ([`Engine::capabilities`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Capabilities {
+    /// It takes images ([`Engine::accepts_images`]): its vision tower (or mmproj file) is there.
+    pub vision: bool,
+    /// It writes a thinking block (its chat format has one).
+    pub thinking: bool,
+    /// Its chat format has tool calls.
+    pub tools: bool,
+    /// The most tokens a conversation can hold: the `max_context` option, else the trained
+    /// context (None when neither is known).
+    pub context: Option<usize>,
+}
+
 /// Stops the running (or next) generation of an engine from any thread.
 #[derive(Clone, Debug)]
 pub struct CancelHandle(Arc<AtomicBool>);
@@ -3259,6 +3273,37 @@ impl Engine {
         voice.reply(model, &self.tok, user, &mm_text, &feats, o, chunk, on_text)
     }
 
+    /// What the model can do, for clients that configure it ([`crate::opencode`]): images in
+    /// ([`Engine::accepts_images`]), a thinking block, tool calls (its chat format has them),
+    /// and its context (the `max_context` option, else its trained context).
+    pub fn capabilities(&self) -> Capabilities {
+        let f = self.fmt;
+        let tags = f.tag_tokens();
+        let marks = f.text_marks();
+        let thinking = !f.think_tokens().0.is_empty()
+            || tags.as_ref().is_some_and(|t| !t.think.is_empty())
+            || marks.as_ref().is_some_and(|m| !m.think_open.is_empty());
+        let tools = !f.tool_call_marker().is_empty()
+            || tags.as_ref().is_some_and(|t| !t.calls.is_empty())
+            || marks.as_ref().is_some_and(|m| !m.call.is_empty());
+        let trained = self
+            .info
+            .coreml
+            .as_ref()
+            .map(|c| c.context_length)
+            .or_else(|| trained_context(&self.info.path));
+        let context = match (self.max_context, trained) {
+            (Some(m), Some(t)) => Some(m.min(t)),
+            (m, t) => m.or(t),
+        };
+        Capabilities {
+            vision: self.accepts_images(),
+            thinking,
+            tools,
+            context,
+        }
+    }
+
     /// Whether the model takes images (its vision tower is there: for a GGUF model, an mmproj
     /// file it can use beside it or given), as `/v1/models` advertises it.
     pub fn accepts_images(&self) -> bool {
@@ -4077,6 +4122,32 @@ pub fn resolve_auto_draft(model: &Path, cache_dir: Option<&Path>) -> Result<Path
     let repo = crate::dspark::auto_repo(model).context("draft=auto: no DSpark draft beside the model, and none known for it")?;
     let dir = resolve_model_with(repo, cache_dir, &crate::pixtral::Mmproj::None)?;
     crate::dspark::draft_in(&dir).with_context(|| format!("{repo}: no DSpark draft in {}", dir.display()))
+}
+
+/// The context a model was trained for: a GGUF file's `<arch>.context_length`, else the
+/// `max_position_embeddings` of its `config.json` (or of its `text_config`). None when neither says.
+pub fn trained_context(model: &Path) -> Option<usize> {
+    let gguf = if model.is_dir() {
+        crate::gguf::model_in_dir(model)
+    } else {
+        Some(model.to_path_buf())
+    };
+    if let Some(g) = gguf.filter(|g| crate::gguf::is_gguf(g)) {
+        let h = crate::gguf::header(&g).ok()?;
+        let n = h.get(&format!("{}.context_length", h.arch()))?.as_u64()?;
+        return usize::try_from(n).ok().filter(|&n| n > 0);
+    }
+    let dir = if model.is_dir() { model } else { model.parent()? };
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("config.json")).ok()?).ok()?;
+    ["max_position_embeddings", "max_sequence_length", "seq_length"]
+        .iter()
+        .find_map(|k| {
+            [&v, &v["text_config"], &v["llm_config"]]
+                .iter()
+                .find_map(|c| c.get(*k).and_then(serde_json::Value::as_u64))
+        })
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|&n| n > 0)
 }
 
 pub fn resolve_model(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {

@@ -111,6 +111,7 @@ pub mod nemotron;
 pub mod nemotron_asr;
 pub mod nomic_bert;
 pub mod omnigen2;
+pub mod opencode;
 pub mod pixtral;
 pub mod platform;
 pub mod png;
