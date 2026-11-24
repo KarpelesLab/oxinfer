@@ -159,6 +159,13 @@ fn lanes_per_row(n_in: usize, ch: usize, max: usize) -> u32 {
     1u32 << nch.trailing_zeros().min(max.trailing_zeros())
 }
 
+/// The lanes per row of the experts' down rows (`_gsum`, `_dconv`): about 3 chunks a lane, at most
+/// 16 lanes (the 36 chunks of Inkling-2-Mini's 1152 values: 16 lanes, 2-3 chunks each; 4 lanes of 9
+/// chunks each took 35.3 us a layer, 8 lanes 31.9, 16 30.6, 32 35.4).
+fn down_lanes(n_in: usize, ch: usize) -> u32 {
+    ((n_in / ch).div_ceil(3).next_power_of_two().clamp(1, 16)) as u32
+}
+
 /// Whether passes of one token run the experts' down projections and the convolution after them
 /// in one kernel (`_dconv`; `OXINFER_INKLING_DCONV=0`: the grouped kernel and `ink_conv`).
 fn dconv_on() -> bool {
@@ -169,6 +176,13 @@ fn dconv_on() -> bool {
 /// Most tokens of a pass whose attention kernel makes its queries, keys and values itself
 /// (`ink_attf`); `OXINFER_INKLING_ATTF=0`: none (`ink_q` and `ink_kv` before `ink_attv`).
 const ATTF_T: usize = 8;
+/// The query heads of an `ink_attf` threadgroup for groups of `g` query heads a key head: one
+/// (`OXINFER_INKLING_ATTQ=0`: the group).
+fn attf_g(g: usize) -> usize {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let one = *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_ATTQ").is_ok_and(|v| v == "0"));
+    if one { 1 } else { g }
+}
 fn attf_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_ATTF").is_ok_and(|v| v == "0"))
@@ -230,6 +244,13 @@ const MIX_EPS: f32 = 1e-6;
 /// Added to a norm before an L2 clip divides by it (`inkling::CLIP_EPS`).
 const CLIP_EPS: f32 = 1e-6;
 
+/// Whether the IQ2_XXS / IQ2_S / IQ3_XXS experts run on the dots of their own
+/// (`OXINFER_INKLING_XDOTS=0`: the generic loader's).
+fn xdots() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_XDOTS").is_ok_and(|v| v == "0"))
+}
+
 /// The formats of routed experts: kernel suffix, weight type, x chunk type and size, and the
 /// constructor of the weight type from a table entry `e` (rows of `n` values).
 fn expert_formats() -> Vec<(String, String, &'static str, usize, String)> {
@@ -289,7 +310,20 @@ fn expert_formats() -> Vec<(String, String, &'static str, usize, String)> {
     ];
     for &k in GGUF_GPU_TYPES.iter() {
         let n = k.name();
+        // (The IQ2 / IQ3 dots that apply the signs to the magnitudes and the scale to the sum.)
+        let dot = |t: &str| {
+            (
+                n.to_string(),
+                t.to_string(),
+                "X32",
+                32,
+                format!("{t}{{ (device const uchar*)(e).q, (e).rb }}"),
+            )
+        };
         v.push(match k {
+            GgmlType::IQ3_XXS if xdots() => dot("MXIQ3_XXS"),
+            GgmlType::IQ2_S if xdots() => dot("MXIQ2_S"),
+            GgmlType::IQ2_XXS if xdots() => dot("MXIQ2_XXS"),
             GgmlType::F16 => raw(n, "MF16", "X16", 16),
             GgmlType::Q4_0 => raw(n, "MQ4_0", "X32", 32),
             GgmlType::Q8_0 => raw(n, "MQ8_0", "X32", 32),
@@ -853,6 +887,7 @@ struct Pipes {
     mix: Id,
     /// `ink_mix` for at most 8 block states (fewer registers).
     mix8: Id,
+    mix5: Id,
     norm: Id,
     copy: Id,
     kv: [Id; 3],
@@ -1718,7 +1753,7 @@ impl InkMetal {
                 tab_d: mk_tab(&tab_d, &mut owned)?,
                 il: if ex.interleaved { 2 } else { 1 },
                 off: if ex.interleaved { 1 } else { mi as u32 },
-                lpr: (lanes_per_row(h, ch_of(&gu_fmt), 16), lanes_per_row(mi, ch_of(&d_fmt), 32)),
+                lpr: (lanes_per_row(h, ch_of(&gu_fmt), 16), down_lanes(mi, ch_of(&d_fmt))),
                 grouped,
                 xlora,
                 xlora_gu,
@@ -1873,7 +1908,7 @@ impl InkMetal {
                 act: take(t * topk * mi),
                 o: take(th),
                 part: take(t * max_nh * maxsplit * (128 + 2)),
-                mcnt: take(MAX_T * max_nkv),
+                mcnt: take(MAX_T * max_nh),
                 hidden: take(th),
                 // (Prefill: the logits of the last tokens only.)
                 logits: take(t.min(MAX_T) * c.vocab_size),
@@ -1994,9 +2029,9 @@ impl InkMetal {
             attf: {
                 let g = m.layers[0].attn.hd.heads / m.layers[0].attn.hd.kv_heads;
                 [
-                    pipe(&format!("ink_attf_4_{g}_0"))?,
-                    pipe(&format!("ink_attf_4_{g}_1"))?,
-                    pipe(&format!("ink_attf_4_{g}_2"))?,
+                    pipe(&format!("ink_attf_4_{}_0", attf_g(g)))?,
+                    pipe(&format!("ink_attf_4_{}_1", attf_g(g)))?,
+                    pipe(&format!("ink_attf_4_{}_2", attf_g(g)))?,
                 ]
             },
             merge: pipe("ink_attn_merge")?,
@@ -2007,6 +2042,7 @@ impl InkMetal {
             amax: pipe("ink_amax")?,
             xgroup: pipe("ink_xgroup")?,
             mix8: pipe("ink_mix8")?,
+            mix5: pipe("ink_mix5")?,
             gmix_norm: pipe("ink_gmix_norm")?,
             gfg: pipe("ink_gfg")?,
             gsc: pipe("ink_gsc")?,
@@ -2437,8 +2473,14 @@ impl InkMetal {
         if let Some(cat) = cat {
             self.gate_cat(c, &mut p, cat);
         }
-        // (At most 8 block states: fewer registers.)
-        self.std(e, c, if states.len() <= 8 { self.p.mix8 } else { self.p.mix });
+        // (At most 5 or 8 block states: fewer registers. Inkling-2-Mini has at most 5: 7.0 -> 5.8 us
+        // a mix with 5.)
+        let pipe = match states.len() {
+            0..=5 => self.p.mix5,
+            6..=8 => self.p.mix8,
+            _ => self.p.mix,
+        };
+        self.std(e, c, pipe);
         e.bytes(&p, 2);
         e.dispatch((nq, t), 1024);
     }
@@ -3143,7 +3185,8 @@ impl InkMetal {
             }
         }
         if !self.skip(SK_ATTN | SK_ATTK) {
-            e.dispatch3((nkv, maxsplit, t), 256);
+            let tgs = if fold { nh / attf_g(nh / nkv) } else { nkv };
+            e.dispatch3((tgs, maxsplit, t), 256);
         }
         e.barrier();
         if let (true, Some(pb), Some(pp)) = (tmp, pfb, &self.pfp) {
