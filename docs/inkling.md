@@ -602,7 +602,10 @@ kinds of ops out (measurements only: the routing then sees stale inputs, so its 
 are not those of a real pass); `OXINFER_INKLING_PROFILE=N` runs the passes of up to 16 tokens
 stage by stage, a command buffer each committed back to back, and prints the GPU time per kind
 of stage and the dispatch and barrier counts every N passes (profiling only);
-`OXINFER_INKLING_NARROW=1` puts the router's logits back on `ink_mvf` (measurements). The kernels compile on first use (about 1.5 s, cached by
+`OXINFER_INKLING_NARROW=1` puts the router's logits back on `ink_mvf` (measurements);
+`OXINFER_INKLING_ATTQ=0` runs the attention of passes of up to 8 tokens a key head (three query
+heads) a threadgroup rather than a query head, `OXINFER_INKLING_XDOTS=0` the IQ2 / IQ3 experts on the generic
+loader (both the same speed or slower, for comparisons). The kernels compile on first use (about 1.5 s, cached by
 the system after).
 
 **Correctness.** Against transformers float32 on the release (the 24-token chat prompt and 16
@@ -796,7 +799,10 @@ registers few; about 7 ms of a pass is now the weights' streaming and 3.5 the ch
 chained greedy passes on the device (the host no longer between tokens) and folded 4 of a layer's
 stages into the kernels beside them, the same logits bit for bit: greedy decoding at 110.5 tok/s
 (mlx-community 4bit, 9.05 ms a token), 103.2 (UD-IQ3_XXS), 80.8 (Q8_0); with prompt lookup up to
-124.8 on chat.
+124.8 on chat. After a fourth round (112.9 tok/s) a fifth gave the attention a threadgroup a query
+head with the relative bias in the keys' dot products, lighter mixes and the experts' down rows on
+16 lanes: 121.2 tok/s (8.25 ms; mlx-community 4bit), 116.7 (UD-IQ3_XXS), 87.0 (Q8_0), prompt lookup
+129.3 on chat; the 125 of plain decoding is still 0.2-0.25 ms a token away.
 
 ### CUDA
 

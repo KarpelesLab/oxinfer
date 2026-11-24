@@ -3277,6 +3277,150 @@ one-token pass (19.7 against 9.1 ms), so drafts pay only above about 2.2 tokens 
 floor is the decode library's multi-token dense matvec (2.3 times the one-token time at 4 tokens,
 about 9 us a stage a token) and the experts of the drafted tokens (2.2-2.4 times).
 
+**Round 5 (November 2026): the attention a head a threadgroup, the mixes, the experts' down rows.**
+The rule of rounds 2-4 (decode KL against the float32 references within the noise of the previous
+build, measured with `--chunk 16`; top-1 agreement on the three references; coherent greedy text
+with `--no-system`; verification passes still giving the one-token logits bit for bit). The goal
+was plain greedy decoding at 125 tok/s (8.0 ms a token) on the 4-bit file; this round reached
+8.25 ms (121.2 tok/s; 8.17 in a quieter batch), and prompt lookup on chat 129.3.
+
+Before / after (best of 4 interleaved runs of `inkling2_bench -n 64 -r 2 -v 1,4 --chain`, load
+3.6-5.4; "one-token pass" and "4-token pass" are `verify1` / `verify4`):
+
+| Checkpoint | tg64 chained ms / tok/s before | after | one-token pass ms | 4-token pass ms |
+|---|---:|---:|---:|---:|
+| mlx-community 4bit | 8.86 / 112.9 | **8.25 / 121.2** | 9.14 -> 8.64 | 19.87 -> 19.60 |
+| unsloth UD-IQ3_XXS | 9.28 / 107.8 | **8.57 / 116.7** | 9.57 -> 8.83 | 20.35 -> 19.61 |
+| ggml-org Q8_0 | 12.18 / 82.1 | **11.50 / 87.0** | 12.41 -> 11.75 | 22.84 -> 22.06 |
+
+**Where a one-token pass goes against the bytes it reads** (`OXINFER_INKLING_PROFILE=32`,
+mlx-community 4bit, us a stage, 9343 -> 8796 us of stage time; "floor": the stage's bytes at the
+550 GB/s a long stream reaches). The token reads about 2.88 GB, 5.24 ms at 550 GB/s:
+
+| Stage (count) | bytes | floor | before | after |
+|---|---:|---:|---:|---:|
+| routed gate / up with the routing (44) | 23.9 MB | 43.5 | 53.3 | 53.8 |
+| routed down with the convolution (44) | 11.9 MB | 21.7 | 33.8 | **30.7** |
+| attention projections (40 + 8) | 11.1 MB | 20.3 | 28.5 / 29.0 | 28.8 / 29.2 |
+| output projection with the convolution (48) | 4.0 MB | 7.2 | 14.3 | 14.5 |
+| attention with its queries, keys and values (48) | < 0.1 MB | | 15.9 | **10.9** |
+| mixes (89 + 7) | 0.06 MB | | 7.8 | **5.7** |
+| LM head (1) | 260.5 MB | 474 | 475 | 474 |
+| message gates' forget / gain (48) | 1.2 MB a gate | 2.1 | 8.0 | 7.9 |
+| MXFP8 layers' gate / up, down (4) | 43.8, 21.9 MB | 79.6, 39.8 | 85.9, 51.4 | 86.2, 47.6 |
+| message gates' down projections (48) | 0.6 MB a gate | 1.1 | 5.7 | 5.8 |
+| router (48) | 1.2 MB | 2.1 | 4.9 | 5.1 |
+
+The bandwidth kernels (the first four rows, the head and the MXFP8 experts) take 6.8 ms of the 8.8
+for 2.82 GB, 415 GB/s; the routed gate / up stage streams at 445 GB/s, its down stage at 390, the
+attention's projections at 385, the output projection at 275. The latency kernels (attention,
+mixes, gates, router) take 2.0 ms. Every stage carries about 1.2 us of dispatch and barrier and the
+bandwidth stages 3-4 us of ramp and tail (rounds 2-4), 535 barriers a token.
+
+**Accuracy** (mean decode KL against the float32 references, `inkling2_check --chunk 16`; top-1
+16/16, 96/96 and 128/128 for both):
+
+| Build | 24 + 16 | 620 + 96 | 357 + 128 |
+|---|---:|---:|---:|
+| previous round (round 4's last build) | 5.845e-12 | 2.373e-11 | 7.588e-13 |
+| this round | 3.817e-12 | 2.092e-11 | 6.649e-13 |
+
+Within the 1.8e-11 to 2.8e-11 that round 2's builds spanned on the 620-token prompt. The quantized
+checkpoints' decode KL is the previous round's to four digits (mlx-community 4bit 2.352e-3 /
+5.530e-2 / 1.509e-2, top-1 16/16, 83/96, 126/128; UD-IQ3_XXS 2.843e-3 / 3.623e-2 / 1.050e-2, 16/16,
+87/96, 124/128; Q8_0 7.137e-4 / 1.155e-2 / 8.766e-4, 16/16, 94/96, 128/128). `inkling2_bench
+--exact 2,4,8,12` after 64 and 200 tokens: 0 logits differ on Q8_0, UD-IQ3_XXS, the release and
+mlx-community 4bit (the 4-bit file's affine rows now round alike in both matvecs on master). Of the
+9 greedy replies of 160 tokens (`--no-system`), 4 are the previous build's and 5 part from it at
+bytes 154-484 of 491-664, all coherent ("Need be accurate" for "Need be careful", "crafting/jewelry"
+for "crafting/art", the same plan of a function reworded).
+
+**Kept** (the arithmetic of one-token passes and verification passes changed together):
+
+- **The attention a query head a threadgroup** (`ink_attf`, passes of up to 8 tokens): 24
+  threadgroups instead of 8 of 3 heads each, each making its head's query, relative vector, and its
+  key head's key and value (the first of the three writes them to the cache), with the same sums in
+  the same order, so the same logits bit for bit. 15.9 -> 12.9 us a layer
+  (`OXINFER_INKLING_ATTQ=0`: the heads of a group together).
+- **The relative bias in the key's dot product** (`ink_attf`, `ink_attv`): lane d < 16 adds
+  `r_d bank[d][dist]` to its part of the SIMD-group sum, the bank's column loaded with the key,
+  instead of a pass over the range into threadgroup memory and a barrier before the keys; the
+  heads' output gates and sinks are loaded at the kernel's start. 12.9 -> 10.9 us.
+- **The mixes' threadgroup sums as SIMD-group sums** (SIMD-group j sums value j over the 32
+  SIMD-groups, the output's sum of squares by every SIMD-group) instead of a loop of 32 loads in
+  one thread: 7.8 -> 7.0 us; **`ink_mix5`** for at most 5 block states (Inkling-2-Mini's most: the
+  others' registers freed; the same logits): 7.0 -> 5.7 us. Together 0.2 ms a token.
+- **The experts' down rows on 16 lanes** (`_dconv`, `_gsum`: about 3 chunks a lane rather than the
+  largest power of two dividing the chunk count, 4 lanes of 9 chunks for 1152 values): 35.3 ->
+  30.6 us a layer (8 lanes 31.9, 32 lanes 35.4); 0.15-0.2 ms a token. The gate / up kernels stay at
+  8 lanes (4: 58.2 us, 16: 56.4, against 53.9).
+- **IQ3_XXS, IQ2_S and IQ2_XXS experts on dots of their own** (`MXIQ3_XXS`, the decode library's
+  `MXIQ2_S` / `MXIQ2_XXS`: the signs applied to the magnitude bytes, the scale to the chunk's sum,
+  the block read as 16-bit words; `OXINFER_INKLING_XDOTS=0`: the generic loader's): UD-IQ3_XXS gate /
+  up 48.9 -> 46.5 us (IQ3_XXS) and 49.0 -> 47.3 (IQ2_S). Those kernels stay bound by their decoding:
+  16.3 MB in 46.5 us, 350 GB/s.
+
+**Measured and dropped:**
+
+- **Kernels that wait for the one before instead of a barrier.** Upper bounds first (wrong results,
+  timing only): without the barrier between the experts' gate / up and down kernels, 8.91 -> 8.17 ms
+  a token; without any barrier, 5.81 ms. Then the real thing, every waiting kernel dispatched after
+  the one it waits for in the same stage and spinning (one thread a threadgroup) on a count its
+  threadgroups make (fences around the atomics, as the attention's merge): the down kernel's
+  SIMD-group per slot waiting for its slot's gate / up threadgroups, 9.07 -> 10.01 ms (host loop);
+  a down kernel a slot a threadgroup (`_dslot`: the slot's rows into the arena, the last slot of a
+  row block summing them in order and running the convolution, bit for bit) waiting the same way,
+  8.31 -> 8.99 ms, and 8.94 with a barrier instead (the kernel itself is 0.6 ms slower); the slots in
+  2, 4 or 8 groups, group i's gate / up rows beside group i - 1's down rows, barriers between: 9.35,
+  10.15, 11.09 ms; the mixes waiting for the output projection's and the down kernel's threadgroups
+  (their loads of the block states first): 8.38 -> 8.62 ms; the output projection waiting for the
+  attention's threadgroups with its rows' first chunks loaded meanwhile: 9.15 ms; the router waiting
+  for the mix or the gate with its weights loaded: 9.12. Every variant gave the same logits bit for
+  bit and no wait gave up (each ended after 4M polls at most, flagging it); the waiting
+  threadgroups cost more than the barriers they replace.
+- **The router in the MLP gate's kernel** (`ink_gfg` with the router's columns of its 64 channels,
+  the last threadgroup summing the 36 partials): 8.0 + 5.0 -> 12.4 us; no gain over the two stages.
+  **The routing in the router's last threadgroup** rather than in every SIMD-group of the gate / up
+  kernel (the routing is 3 us of that kernel's 53): 8.17 ms either way.
+- **The mix's output norm from the sums of its first pass** (the states' and x's dot products, so
+  one threadgroup reduction instead of two): 7.8 -> 24.5 us (27 sums a thread spill).
+- **Other shapes**: 4 keys at a time in the attention (11.4 against 10.6 us); 2 or 8 SIMD-groups a
+  threadgroup in the gate / up and output projection kernels; NVFP4's 16 code bytes as one load and
+  its two scales as one word; the message gate's inputs loaded first; one or two command buffers a
+  chained pass instead of seven (8.85-8.87 against 8.88 ms): all within the noise.
+
+**Short-range attention.** The faster attention for short ranges that round 1 dropped for the
+greedy-equality rule is the one round 2 brought back (`ink_attv`, keys interleaved over the 8
+SIMD-groups, splits of a fifth of the range); this round's kernel is that one with a head a
+threadgroup and the bias folded in.
+
+**Speculative decoding** (the CLI, 256 tokens, greedy, `--no-system`, one run each, the two builds
+interleaved, load 2-4; "same": the output is the same build's plain one):
+
+| Checkpoint | prompt | plain | prompt lookup (default) |
+|---|---|---:|---:|
+| mlx-community 4bit | code | 104.2 -> **111.5** | 105.0 -> 113.1 (1.02 tok/forward, 36% of drafts; same) |
+| | chat | 109.4 -> **115.9** | 121.5 -> **129.3** (1.19, 87%; same) |
+| unsloth UD-IQ3_XXS | code | 106.5 -> **114.8** | 106.6 -> 115.4 (1.02, 56%; same) |
+| | chat | 106.4 -> **114.9** | 106.7 -> 115.1 (1.01, 33%; same) |
+| ggml-org Q8_0 | code | 81.6 -> **86.0** | 81.5 -> 85.9 (1.02, 33%; same) |
+| | chat | 81.3 -> **85.8** | 83.0 -> **87.4** (1.03, 88%; same) |
+
+The plain outputs of this build are the previous build's on the code prompts and on the 4-bit
+file's chat; the Q8_0 and UD-IQ3_XXS chat replies part from them at bytes 605 and 556 ("taiyaki,
+yatsuhashi, mochi" for "taiyaki, yatsuhashi"; "Historic center and temples" for "Classic temples
+and old Kyoto").
+
+**What is left to 125 tok/s plain** (8.0 ms; this round's 8.17-8.25 on the 4-bit file). The pass
+is 8.8 ms of stage time: 6.8 ms in bandwidth kernels that move 2.82 GB at 415 GB/s, and 2.0 ms
+in the latency chain. The stream's floor is 5.2 ms; the gap is the 3-4 us of start, ramp and tail
+of about 190 bandwidth stages (0.7 ms) and their kernels' own 10-30% below a flat stream (the down
+and output projection the furthest). The measurements above say the barriers are worth up to 0.7
+ms at the experts alone and 3 ms in all, but only as concurrency the dependencies forbid: the
+waits that keep the dependencies cost more than the barriers. What remains in reach is per-kernel:
+the output projection at 275 GB/s and the gate / up kernel's in-kernel routing (3 us a layer, which
+moved elsewhere costs the same).
+
 #### DGX Spark, CUDA (November 2026)
 
 On a DGX Spark (GB10, 121 GB shared between the CPU and the GPU) against llama.cpp's CUDA backend
