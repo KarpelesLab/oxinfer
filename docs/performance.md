@@ -1392,6 +1392,38 @@ and Qwen3.5-0.8B (with and without prompt lookup).
 - Three passes in flight: not tried; with one pass queued the GPU never waits on the host (the
   host's work per token, the KV rows and the callback, is far below a pass).
 
+#### Long contexts (November 2026)
+
+The device's copies of the attention caches (the decode, verification and prefill plans on Metal
+with matrix units) now hold half-precision rows by default (`gpu_kv=f16`; `gpu_kv=f32`,
+`--gpu-kv f32` or `OXINFER_GPU_KV=f32` for the f32 rows of before), as llama.cpp's default f16
+cache: decode attention reads half the bytes, and the prefill's SIMD-group-matrix attention reads
+the cache directly at any length (it fell back to the f32 kernel past 6144 + chunk positions and
+converted every earlier row to half on each chunk). The host's caches stay f32, filled from the
+device's rows. QSA caches (Qwen3.8-Flash-Next past 2051 positions) stay f32; DeepSeek V4.1's and
+Inkling-2's own Metal engines keep their own caches, unchanged. Also: the KV copies sit in the
+queue's residency set (bound per command buffer, they were made resident again on every pass, at
+a cost growing with their size: Qwen3-8B 32k steps without attention 59.9 -> 89.8 tok/s), they
+grow to need + 1/8 rather than the next power of two, and Gemma 4 E2B / E4B prompts run the
+KV-sharing layers on each chunk's last token only (llama.cpp's pruning; `OXINFER_PF_PRUNE=0`).
+
+Greedy output on short prompts: Qwen3-8B Q8_0 and Gemma 4 E4B Q8_0, 200 tokens of a 30-token chat
+prompt, identical with f16 and f32 caches, with the device chain on and off.
+
+`llama-bench` (llama.cpp master `253671d`, Metal, `-fa 1 -r 2`: `-p 8192,32768 -n 0` and
+`-p 0 -n 64 -d 8192,32768`) against `examples/parity_bench.rs` (`pp=8192,32768` and
+`depth=8192,32768 tg=64`, `reps=2 lookup=0 draft=none mtp=0`), interleaved model by model, M5 Max
+at load averages 2.5-7. tok/s, llama.cpp / oxinfer (best of 2; oxinfer f32 caches in brackets):
+
+| model | pp8192 | pp32768 | tg64 @ 8192 | tg64 @ 32768 |
+|---|---|---|---|---|
+| Qwen3-8B Q8_0 | 2121 / 2053 | 1066 / 1215 | 53.4 / 54.2 | 36.4 / 37.1 (f32 28.0) |
+| Gemma 4 E4B Q8_0 | 6300 / 5969 | 4429 / 4845 | 75.4 / 83.0 | 66.9 / 71.0 (f32 49.5) |
+| Gemma 4 12B Q8_0 | 1194 / 1269 | 1050 / 1008 | 34.6 / 39.1 | 31.0 / 33.7 (f32 20.2) |
+
+Decoding at 32k positions is 1.3-1.7x the f32 caches' and level with or ahead of llama.cpp;
+prefill is within 0.95-1.14x of it at 8k and 32k.
+
 #### M3 Ultra (November 2026)
 
 A Mac Studio with an M3 Ultra (24 performance and 8 efficiency cores, an 80-core GPU, 96 GB,
