@@ -22,7 +22,12 @@ println!("\n{:.1} tok/s, {:.0}% drafts accepted", reply.stats.decode_tok_s(), 10
 ```
 
 `examples/chat.rs` is a complete chat. Wrap `Engine::load` in `oxinfer::hf::with_progress` for
-download progress and cancellation. [Core ML](coreml.md) packages load through the same
+download progress and cancellation. Loading `org/repo:QUANT` fetches the GGUF repository's
+top-level `mmproj*.gguf` vision projector beside the model when it has one (BF16, else F16, else
+F32), unless the `mmproj` option (`EngineOptions::mmproj`) is `none` or a file;
+`oxinfer::engine::resolve_model_with` and `oxinfer::hf::resolve_with` fetch with that choice
+without loading, `resolve_model` / `hf::resolve` as `auto`. `Engine::accepts_images` tells
+whether a loaded model takes images. [Core ML](coreml.md) packages load through the same
 `Engine::load` on macOS / iOS, with the options `coreml_units` (`ane`, `all`, `gpu`, `cpu`) and
 `coreml_prefill` (`auto`, `batch`, `pad`, `single`); `engine.info().coreml` describes them. The lower-level pieces the CLI is built from are public too:
 `oxinfer::generate` (decoding loops with per-token callbacks, MTP and drafter speculative

@@ -28,10 +28,11 @@ scales; prefill GEMMs and the grouped MoE experts run on the GPU, see
 [FP8 on the GPU](#fp8-on-the-gpu)), transformers-saved copies, and llama.cpp GGUF files (`mistral-large4`, split into parts
 or not; unsloth's are tested). The Pixtral vision tower (30 layers of 2048, 2D RoPE, 2x2 patch
 merger and GELU projector) comes from the checkpoint, or for a GGUF model from the `mmproj` file
-beside it (in its folder or the one above). `--mmproj FILE` (engine / C option `mmproj=FILE`, a
+beside it (in its folder or the one above; `org/repo:QUANT` fetches the repository's top-level
+`mmproj*.gguf` with the model, BF16 first). `--mmproj FILE` (engine / C option `mmproj=FILE`, a
 path or `org/repo/file`; `EngineOptions::mmproj`) names the projector instead, for a GGUF model
 kept elsewhere or to replace a checkpoint's own tower, and `--mmproj none` (`mmproj=none`)
-turns image input off. The chat format is the model's template:
+turns image input off; either way no projector is fetched. The chat format is the model's template:
 `[SYSTEM_PROMPT]`, `[MODEL_SETTINGS]{"reasoning_effort": ...}` (`high` with `--think`, `low`
 otherwise; the model thinks in `[THINK]...[/THINK]` either way, shown dimmed), `[INST]` turns,
 `[AVAILABLE_TOOLS]` / `[TOOL_CALLS]` tool calling, images as rows of `[IMG]` closed by

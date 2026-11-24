@@ -85,7 +85,7 @@ matmuls, and the decode speeds with it are the CPU's on this 16 GB card):
 Every quantized form answers the three prompts correctly and coherently (Paris; a rhymed poem;
 the summary with 476 and 1453), and describes the image (sky, sun, ground) with `--quant q4`,
 the GGUF and its `mmproj` file (`Qwen3.8-27B-Heretic-mmproj-F16.gguf`, which has to be saved or
-passed as `--mmproj`: the downloader fetches only the model file), NVFP4 and FP8. On each of
+fetched with the model when it is at the repository's top level, or passed as `--mmproj`), NVFP4 and FP8. On each of
 them the CUDA run gives the CPU run's tokens.
 
 `--mtp` gives the plain greedy tokens in every case tried: bf16 on the CPU (one prompt, 3.15

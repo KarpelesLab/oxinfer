@@ -108,16 +108,15 @@ RoPE, 2x2 merger into 2560-wide tokens placed with interleaved M-RoPE; image pos
 `<|image_pad|>` in the n-gram embedding, as transformers does). From safetensors it is the
 checkpoint's `model.visual.*`; for a GGUF model it comes from llama.cpp's `mmproj` file
 (`clip.projector_type` `qwen3vl_merger`; unsloth publishes `mmproj-F16.gguf` / `-BF16` in the
-repo root), found beside the model (its folder or the one above) or named with `--mmproj FILE`
-(engine / C / server option `mmproj=FILE`; `mmproj=none` turns images off). The conv kernel
+repo root, and `org/repo:QUANT` fetches it with the model: BF16, else F16, else F32), found
+beside the model (its folder or the one above) or named with `--mmproj FILE` (engine / C /
+server option `mmproj=FILE`; `mmproj=none` turns images off and fetches no projector). The conv kernel
 llama.cpp splits per frame (`v.patch_embd.weight`, `.weight.1`) is joined back; F16 weights load
 as bf16, which restores the released bf16 values exactly. Images go through `--image`, the
 engine's attachments, the C API and the server's `image_url` content parts.
 
 ```sh
-# the mmproj file in the repo root is picked up automatically
-curl -L -o ~/.cache/oxinfer/hub/unsloth--Qwen3.8-Flash-Next-GGUF/mmproj-F16.gguf \
-    https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/main/mmproj-F16.gguf
+# the mmproj file in the repo root is fetched beside the model and picked up automatically
 ./target/release/oxinfer --model unsloth/Qwen3.8-Flash-Next-GGUF:UD-Q4_K_XL --image painting.png -p "Describe this image."
 ```
 

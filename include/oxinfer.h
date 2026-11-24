@@ -51,7 +51,10 @@ void oxi_string_free(char *s);
 char *oxi_devices(void);
 
 /* Downloads a model into the cache (or finds it there) and returns its local path:
- * "org/name" (safetensors repo) or "org/name:QUANT" (one GGUF file of a repo, e.g. Q4_K_M).
+ * "org/name" (safetensors repo) or "org/name:QUANT" (one GGUF file of a repo, e.g. Q4_K_M, with
+ * its split parts, and the repo's top-level mmproj*.gguf vision projector beside it when it has
+ * one and none is there yet: BF16, else F16, else F32; oxi_load with mmproj=none or mmproj=FILE
+ * fetches the model alone).
  * `cache_dir` NULL: $OXINFER_CACHE, else ~/.cache/oxinfer/hub (iOS: Library/Application
  * Support/oxinfer/hub in the app container). `progress` may be NULL. */
 char *oxi_download(const char *spec, const char *cache_dir, oxi_progress_fn progress, void *user);
@@ -167,7 +170,8 @@ int64_t oxi_cache_remove(const char *cache_dir, const char *name);
  *   mmproj=auto|none|FILE  vision tower of Mistral Large 4 (pixtral) and Qwen3.5-family models
  *                        such as Qwen3.8-Flash-Next (qwen3vl_merger): a llama.cpp mmproj GGUF
  *                        (path or org/repo/file); auto (default): the checkpoint's tower, or the
- *                        mmproj*.gguf beside a GGUF model; none: no image input
+ *                        mmproj*.gguf beside a GGUF model (org/name:QUANT fetches the repo's
+ *                        top-level one with the model); none: no image input, nothing fetched
  *   gpu_decode=0|1       generate a whole token per GPU submission where supported (Metal:
  *                        Llama 3, Qwen3, Qwen3.5/3.8 dense; default 1; process-wide)
  *   gpu_chain=0|1        greedy decoding chained on the device where tokens decode whole on

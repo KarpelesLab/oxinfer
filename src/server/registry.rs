@@ -203,6 +203,8 @@ pub(crate) struct Entry {
     /// The prompt-cache fingerprint of the chat model, once loaded (kept after an unload, so
     /// that its snapshots can still be told apart).
     fingerprint: Mutex<Option<String>>,
+    /// Whether the chat model takes images, once it has been loaded (kept after an unload).
+    vision: Mutex<Option<bool>>,
 }
 
 impl Entry {
@@ -231,6 +233,7 @@ impl Entry {
             vram: AtomicU64::new(0),
             details: Mutex::new(None),
             fingerprint: Mutex::new(None),
+            vision: Mutex::new(None),
         }
     }
 
@@ -737,12 +740,21 @@ impl Registry {
             .collect()
     }
 
+    /// [`Self::list`] with whether each chat model takes images (None until it has been loaded).
+    pub fn list_vision(&self) -> Vec<(String, Option<Kind>, bool, Option<bool>)> {
+        self.active()
+            .into_iter()
+            .map(|e| (e.spec.id.clone(), e.kind(), e.bytes.load(Ordering::Relaxed) > 0, *lock(&e.vision)))
+            .collect()
+    }
+
     /// Fetches every model (and detects its kind).
     pub fn download(&self) -> Result<()> {
         for e in self.active() {
             self.detect(e)?;
             if e.spec.source.contains('/') && !Path::new(&e.spec.source).exists() {
-                crate::engine::resolve_model(&e.spec.source, self.cache_dir.as_deref()).with_context(|| e.spec.id.clone())?;
+                crate::engine::resolve_model_with(&e.spec.source, self.cache_dir.as_deref(), &spec_mmproj(&e.spec))
+                    .with_context(|| e.spec.id.clone())?;
             }
         }
         Ok(())
@@ -862,7 +874,7 @@ impl Registry {
             _ if crate::zonos::is_zonos(Path::new(&e.spec.source)) => (Kind::Speech, None),
             _ if !Path::new(&e.spec.source).exists() && crate::fish::is_drama(Path::new(&e.spec.source)) => (Kind::Speech, None),
             _ => {
-                let path = self.probe_path(&e.spec.source)?;
+                let path = self.probe_path(&e.spec)?;
                 let (k, img) = detect_path(&path, &e.spec.source);
                 match given {
                     Some(Kind::Image) if img.is_none() => bail!("{}: not an image pipeline oxinfer knows", e.spec.source),
@@ -875,13 +887,15 @@ impl Registry {
     }
 
     /// A local path holding enough of the model to tell its kind.
-    fn probe_path(&self, source: &str) -> Result<PathBuf> {
+    fn probe_path(&self, spec: &ModelSpec) -> Result<PathBuf> {
+        let source = spec.source.as_str();
         if let Some(p) = local_path(source, self.cache_dir.as_deref()) {
             return Ok(p);
         }
         if source.contains(':') {
-            // org/name:QUANT, a GGUF file: the model itself.
-            return crate::engine::resolve_model(source, self.cache_dir.as_deref());
+            // org/name:QUANT, a GGUF file: the model itself (with its vision projector, as the
+            // load fetches it).
+            return crate::engine::resolve_model_with(source, self.cache_dir.as_deref(), &spec_mmproj(spec));
         }
         #[cfg(feature = "hf")]
         {
@@ -1043,6 +1057,7 @@ impl Registry {
         *lock(&e.details) = Some(loaded.details(t0.elapsed().as_secs_f64()));
         if let Loaded::Chat(engine) = &loaded {
             *lock(&e.fingerprint) = Some(engine.prompt_cache_fingerprint().to_string());
+            *lock(&e.vision) = Some(engine.accepts_images());
         }
         crate::model_cache::touch(src, self.cache_dir.as_deref());
         if self.log {
@@ -1050,6 +1065,11 @@ impl Registry {
         }
         Ok(loaded)
     }
+}
+
+/// The `mmproj` option of a model (what fetching a GGUF repository brings beside the model).
+fn spec_mmproj(spec: &ModelSpec) -> crate::pixtral::Mmproj {
+    spec.option("mmproj").map(crate::pixtral::Mmproj::parse).unwrap_or_default()
 }
 
 fn load_image(ik: ImageKind, src: &str, opts: &[(&str, &str)], cache_dir: Option<&Path>, cache: Option<&str>) -> Result<ImageModel> {

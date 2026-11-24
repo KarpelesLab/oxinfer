@@ -33,6 +33,7 @@ Useful flags:
 | `--mtp-from DIR` | `--mtp` with the MTP weights taken from another checkpoint (e.g. the original of a converted copy) |
 | `--lora FILE[:SCALE]` | Qwen, Llama, Gemma, Inkling-2: a LoRA adapter applied at run time (repeatable; scale 1, as llama.cpp's `--lora-scaled`): a PEFT folder or a llama.cpp GGUF adapter; image models: a LoRA merged into the pipeline, as before (see [LoRA adapters](lora.md)) |
 | `--lora-merge` | merge the language-model LoRAs into the weights at load (float weights exact, quantized ones re-quantized) |
+| `--mmproj FILE\|none` | the vision projector of a GGUF model (Qwen3.5-family, Mistral Large 4, MiniMax M3, Inkling-2): a llama.cpp `mmproj` GGUF, a path or `org/repo/file`; default: the `mmproj*.gguf` beside the model. `--model org/repo:QUANT` fetches the repository's top-level `mmproj*.gguf` with the model, with a note (BF16, else F16, else F32, else another; never files in subfolders such as `Old_Support/`), unless one is beside the model already; `none` turns images off and fetches none, and a given file is used instead (see [Getting weights](weights.md)) |
 | `--mmap` | map weights from disk instead of copying them into RAM |
 | `--save-quantized DIR` | write a pre-quantized, text-only checkpoint at `--quant` precision (see [Pre-quantized checkpoints](performance.md#pre-quantized-checkpoints)) and exit |
 | `--devices` | list detected CPU features and GPUs (Metal, CUDA, Vulkan) and exit |

@@ -6,7 +6,8 @@
 the browser. The models clients can request are the ones given with `--model`, the ones set up
 in the GUI, by their id, and any other repo id a request names ([Models on request](#models-on-request)). Each `--model` is `[ID=]SOURCE[,KEY=VALUE...]`: a local folder or
 file, a repo id (fetched on first use, or at start with `--download`) or `org/name:QUANT` for a
-GGUF repo, an optional id (default: the source) and the model's options. HTTP and HTTPS are
+GGUF repo (with the repository's top-level `mmproj*.gguf` vision projector beside the model,
+unless the `mmproj` option is `none` or a file), an optional id (default: the source) and the model's options. HTTP and HTTPS are
 served by [httpsd](https://crates.io/crates/httpsd) (its thread-pool runtime, no async runtime).
 
 ```sh
@@ -40,7 +41,7 @@ img = client.images.generate(model="sd", prompt="a lighthouse at dusk", size="51
 
 | Endpoint | Models | Notes |
 |---|---|---|
-| `GET /v1/models`, `/v1/models/{id}` | all | the whitelist, with `kind` and `loaded` |
+| `GET /v1/models`, `/v1/models/{id}` | all | the whitelist, with `kind` and `loaded`; a chat model, once loaded, also has `capabilities` (`["completion", "vision"]` when it takes images, else `["completion"]`) and `modalities` (`{"input": ["text", "image"], "output": ["text"]}`) |
 | `POST /v1/chat/completions` | chat (Gemma 4 / 3, Qwen 3.5 / 3.8 / 3, Llama 3, Mistral Large 4, DeepSeek V4, Core ML) | system / developer, multi-turn, `image_url` (data: or http(s) URLs) and `video_url` parts (vision checkpoints), `input_audio` (Gemma 4), `tools` / `tool_choice` (`auto`, `none`, `required` or a function: forced calls) with `tool_calls` out, `response_format` (`json_object`, `json_schema`: constrained decoding), `logprobs` / `top_logprobs`, `temperature`, `top_p`, `top_k`, `max_tokens` / `max_completion_tokens`, `stop`, `seed`, `n`, `stream` (SSE, `stream_options.include_usage`), thinking with `reasoning_effort` (`none` off, anything else on), `enable_thinking` or `chat_template_kwargs.enable_thinking`, returned as `reasoning_content`; `modalities: ["text", "audio"]` with `audio` (LFM3-Omni, Haru: a spoken reply, [below](#spoken-replies-lfm3-omni-haru)) |
 | `POST /v1/messages`, `/v1/messages/count_tokens` | chat | Anthropic's Messages API (Claude Code, the `anthropic` SDKs): see [below](#anthropic-messages-api) |
 | `POST /v1/completions` | chat | raw continuations (no template): `prompt` as text, texts or token ids, `echo`, `stop`, `stream` |

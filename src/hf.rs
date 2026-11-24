@@ -84,8 +84,17 @@ fn report(p: &Progress) {
 }
 
 /// A local directory is used as is; otherwise `spec` must be a repo id (`org/name`), which is
-/// fetched into the cache (if needed) and its directory returned.
+/// fetched into the cache (if needed) and its directory returned. For `org/name:QUANT` the
+/// repository's vision projector comes along when it has one ([`resolve_with`] with
+/// [`Mmproj::Auto`](crate::pixtral::Mmproj::Auto)).
 pub fn resolve(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
+    resolve_with(spec, cache_dir, &crate::pixtral::Mmproj::Auto)
+}
+
+/// [`resolve`] with the model's `mmproj` choice: for a GGUF repository (`org/name:QUANT`),
+/// `auto` also fetches one of its top-level `mmproj*.gguf` vision files beside the model
+/// ([`resolve_gguf_with`]); `none` or a given file fetch none.
+pub fn resolve_with(spec: &str, cache_dir: Option<&Path>, mmproj: &crate::pixtral::Mmproj) -> Result<PathBuf> {
     let p = Path::new(spec);
     if p.is_dir() || crate::gguf::is_gguf(p) {
         return Ok(p.to_path_buf());
@@ -94,7 +103,7 @@ pub fn resolve(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
     if let Some((repo, quant)) = spec.split_once(':')
         && repo.split('/').count() == 2
     {
-        return resolve_gguf(repo, quant, cache_dir);
+        return resolve_gguf_with(repo, quant, cache_dir, mmproj);
     }
     let parts: Vec<&str> = spec.split('/').collect();
     if parts.len() != 2 || parts.iter().any(|s| s.is_empty() || s.starts_with('.')) || spec.starts_with('/') {
@@ -154,7 +163,7 @@ pub fn resolve_file(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
     if let Some((repo, quant)) = spec.split_once(':')
         && repo.split('/').count() == 2
     {
-        return resolve_gguf(repo, quant, cache_dir);
+        return resolve_gguf_with(repo, quant, cache_dir, &crate::pixtral::Mmproj::None);
     }
     let parts: Vec<&str> = spec.split('/').collect();
     if parts.len() < 2 || parts.iter().any(|s| s.is_empty() || s.starts_with('.')) || spec.starts_with('/') {
@@ -194,18 +203,41 @@ fn gguf_models(list: &Listing) -> Vec<&String> {
 }
 
 /// `org/name:QUANT` for a repository of GGUF files (as llama.cpp's `-hf`): the file whose name
-/// ends in `QUANT.gguf` (case-insensitive, e.g. `Q4_K_M` or `FastMTP-32K`), fetched alone.
+/// ends in `QUANT.gguf` (case-insensitive, e.g. `Q4_K_M` or `FastMTP-32K`) and its split parts,
+/// with the repository's vision projector when it has one ([`resolve_gguf_with`] with
+/// [`Mmproj::Auto`](crate::pixtral::Mmproj::Auto)).
 pub fn resolve_gguf(repo: &str, quant: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
+    resolve_gguf_with(repo, quant, cache_dir, &crate::pixtral::Mmproj::Auto)
+}
+
+/// [`resolve_gguf`] with the model's `mmproj` choice: `auto` also fetches the repository's
+/// top-level `mmproj*.gguf` (BF16, else F16, else F32, else another) beside the model, where
+/// [`crate::pixtral::mmproj_for`] finds it, unless one is there already; `none` or a given file
+/// fetch the model alone.
+pub fn resolve_gguf_with(repo: &str, quant: &str, cache_dir: Option<&Path>, mmproj: &crate::pixtral::Mmproj) -> Result<PathBuf> {
     let list = listing(repo)?;
     let (name, parts) = gguf_parts(repo, quant, &list)?;
     let root = cache_dir.map(Path::to_path_buf).unwrap_or_else(cache_root);
     let dir = root.join(repo.replace('/', "--"));
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
+    let proj = gguf_mmproj(&list, &name, &mmprojs_present(&dir, &name), mmproj);
+    let count = parts.len() + usize::from(proj.is_some());
     for (i, p) in parts.iter().enumerate() {
         let (size, src) = list
             .get(p)
             .with_context(|| format!("{repo}: split GGUF part {p} is not in the listing"))?;
-        fetch_file(repo, &dir, p, *size, src, i + 1, parts.len())?;
+        fetch_file(repo, &dir, p, *size, src, i + 1, count)?;
+    }
+    if let Some(p) = &proj {
+        let (size, src) = &list[p];
+        let have = std::fs::metadata(dir.join(p)).map_or(0, |m| m.len());
+        if have == 0 || size.is_some_and(|s| s != have) {
+            eprintln!(
+                "note: also fetching {p}{}, the repository's vision projector for image input (mmproj none skips it)",
+                size.map_or(String::new(), |s| format!(" ({})", human_gb(s)))
+            );
+        }
+        fetch_file(repo, &dir, p, *size, src, count, count)?;
     }
     // The shared part also under the name of the part it stands for, as llama.cpp opens the
     // parts by name (oxinfer finds it by its header either way).
@@ -217,6 +249,63 @@ pub fn resolve_gguf(repo: &str, quant: &str, cache_dir: Option<&Path>) -> Result
         }
     }
     Ok(dir.join(name))
+}
+
+/// The `mmproj*.gguf` files already in the cache beside GGUF model `name` of the repository cached
+/// in `dir`, as repository paths: in the model's folder and, for a model in a subfolder, the
+/// repository's top level (the folders [`crate::pixtral::mmproj_for`] looks in).
+fn mmprojs_present(dir: &Path, name: &str) -> Vec<String> {
+    let mut folders = vec![String::new()];
+    if let Some((sub, _)) = name.rsplit_once('/') {
+        folders.push(format!("{sub}/"));
+    }
+    let mut out = Vec::new();
+    for f in folders {
+        let Ok(rd) = std::fs::read_dir(dir.join(&f)) else { continue };
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.starts_with("mmproj") && n.ends_with(".gguf") {
+                out.push(format!("{f}{n}"));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The vision projector of a GGUF repository to fetch beside its model `name`, given the
+/// `mmproj*.gguf` files the cache has beside it already (`present`, as repository paths) and the
+/// model's `mmproj` choice. With `auto`, one of the listing's top-level `mmproj*.gguf` files:
+/// BF16, else F16, else F32, else the first other one; never one in a subfolder (unsloth's
+/// `Old_Support/`) or one not named `.gguf`. None with `none` or a given file, when the
+/// repository has none, when the model is more than one folder down (where
+/// [`crate::pixtral::mmproj_for`] would not find it), or when another projector is present
+/// already; a listed one that is present (perhaps partly) is returned, so that it completes.
+fn gguf_mmproj(list: &Listing, name: &str, present: &[String], mmproj: &crate::pixtral::Mmproj) -> Option<String> {
+    if *mmproj != crate::pixtral::Mmproj::Auto || name.matches('/').count() > 1 {
+        return None;
+    }
+    let mut cands: Vec<&String> = list
+        .keys()
+        .filter(|k| !k.contains('/') && k.starts_with("mmproj") && k.ends_with(".gguf"))
+        .collect();
+    if !present.is_empty() {
+        return present.iter().find(|p| cands.contains(p)).cloned();
+    }
+    let rank = |n: &str| {
+        let n = n.to_ascii_lowercase();
+        if n.contains("bf16") {
+            0
+        } else if n.contains("f16") {
+            1
+        } else if n.contains("f32") {
+            2
+        } else {
+            3
+        }
+    };
+    cands.sort_by(|a, b| rank(a).cmp(&rank(b)).then_with(|| a.cmp(b)));
+    cands.first().map(|s| s.to_string())
 }
 
 /// The split parts of `name` that `parts` fetches under another name (see [`gguf_parts`]), as
@@ -364,7 +453,16 @@ pub fn plan(spec: &str, cache_dir: Option<&Path>) -> Result<Plan> {
     let dir = root.join(repo.replace('/', "--"));
     let list = listing(repo)?;
     let names = match quant {
-        Some(q) => gguf_parts(repo, q, &list)?.1,
+        Some(q) => {
+            let (name, mut parts) = gguf_parts(repo, q, &list)?;
+            parts.extend(gguf_mmproj(
+                &list,
+                &name,
+                &mmprojs_present(&dir, &name),
+                &crate::pixtral::Mmproj::Auto,
+            ));
+            parts
+        }
         None => repo_files(repo, &list, &mut |name| peek_meta(repo, &dir, &list, name), Some(&dir))?,
     };
     let files = names
@@ -1023,6 +1121,97 @@ mod tests {
             .iter()
             .map(|n| (n.to_string(), (Some(1), Source::Inline(Vec::new()))))
             .collect()
+    }
+
+    #[test]
+    fn gguf_mmproj_choice() {
+        use crate::pixtral::Mmproj;
+        let auto = Mmproj::Auto;
+        // unsloth/Inkling-2-Mini-GGUF's layout.
+        let mut names = vec![
+            "Inkling-2-Mini-IQ3_XXS.gguf",
+            "Inkling-2-Mini-Q4_K_M.gguf",
+            "mmproj-F32.gguf",
+            "mmproj-F16.gguf",
+            "mmproj-BF16.gguf",
+            "Old_Support/mmproj-BF16.gguf_file",
+            "Old_Support/mmproj-F16.gguf_file",
+            "README.md",
+        ];
+        let list = listing_of(&names);
+        let m = "Inkling-2-Mini-IQ3_XXS.gguf";
+        assert_eq!(gguf_mmproj(&list, m, &[], &auto).as_deref(), Some("mmproj-BF16.gguf"));
+        // The model choice is unchanged by the projectors.
+        assert_eq!(gguf_parts("r/x", "IQ3_XXS", &list).unwrap().1, [m]);
+        // BF16, then F16, then F32, then any other.
+        names.retain(|n| *n != "mmproj-BF16.gguf");
+        assert_eq!(gguf_mmproj(&listing_of(&names), m, &[], &auto).as_deref(), Some("mmproj-F16.gguf"));
+        names.retain(|n| *n != "mmproj-F16.gguf");
+        assert_eq!(gguf_mmproj(&listing_of(&names), m, &[], &auto).as_deref(), Some("mmproj-F32.gguf"));
+        names.retain(|n| *n != "mmproj-F32.gguf");
+        names.push("mmproj-model-Q8_0.gguf");
+        assert_eq!(
+            gguf_mmproj(&listing_of(&names), m, &[], &auto).as_deref(),
+            Some("mmproj-model-Q8_0.gguf")
+        );
+        // Only files in subfolders, or not named .gguf: none.
+        let only_old = listing_of(&[
+            m,
+            "Old_Support/mmproj-BF16.gguf_file",
+            "Old_Support/mmproj-F16.gguf",
+            "mmproj-F16.gguf_file",
+        ]);
+        assert_eq!(gguf_mmproj(&only_old, m, &[], &auto), None);
+        // A text-only repository: none.
+        assert_eq!(gguf_mmproj(&listing_of(&[m]), m, &[], &auto), None);
+        // The mmproj option: none, or a file of the user's, fetch nothing.
+        assert_eq!(gguf_mmproj(&list, m, &[], &Mmproj::None), None);
+        assert_eq!(gguf_mmproj(&list, m, &[], &Mmproj::File("/x/mmproj-F16.gguf".into())), None);
+        // A projector already beside the model: none fetched, whatever its name; a listed one
+        // that is present (perhaps an interrupted download) is completed instead.
+        assert_eq!(gguf_mmproj(&list, m, &["mmproj-mine.gguf".into()], &auto), None);
+        assert_eq!(
+            gguf_mmproj(&list, m, &["mmproj-F16.gguf".into()], &auto).as_deref(),
+            Some("mmproj-F16.gguf")
+        );
+        // A split model one folder down (unsloth's large models): the top-level projector, which
+        // mmproj_for finds in the folder above; deeper, none.
+        let split = listing_of(&[
+            "Q4_K_M/x-Q4_K_M-00001-of-00002.gguf",
+            "Q4_K_M/x-Q4_K_M-00002-of-00002.gguf",
+            "mmproj-F16.gguf",
+        ]);
+        assert_eq!(
+            gguf_mmproj(&split, "Q4_K_M/x-Q4_K_M-00001-of-00002.gguf", &[], &auto).as_deref(),
+            Some("mmproj-F16.gguf")
+        );
+        assert_eq!(gguf_mmproj(&split, "a/b/x-Q4_K_M.gguf", &[], &auto), None);
+        assert_eq!(
+            gguf_mmproj(
+                &split,
+                "Q4_K_M/x-Q4_K_M-00001-of-00002.gguf",
+                &["Q4_K_M/mmproj-x.gguf".into()],
+                &auto
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn mmprojs_on_disk() {
+        let dir = std::env::temp_dir().join(format!("oxinfer-mmproj-present-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Q4")).unwrap();
+        let m = "Q4/x-Q4-00001-of-00002.gguf";
+        assert!(mmprojs_present(&dir, m).is_empty());
+        for f in ["mmproj-F16.gguf", "mmproj-F16.gguf_file", "x.gguf", "Q4/mmproj-own.gguf"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        assert_eq!(mmprojs_present(&dir, m), ["Q4/mmproj-own.gguf", "mmproj-F16.gguf"]);
+        assert_eq!(mmprojs_present(&dir, "x.gguf"), ["mmproj-F16.gguf"]);
+        // What resolve_gguf_with fetches is what mmproj_for then finds.
+        assert_eq!(crate::pixtral::mmproj_for(&dir.join("x.gguf")), Some(dir.join("mmproj-F16.gguf")));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

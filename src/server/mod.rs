@@ -1022,17 +1022,27 @@ impl Api {
     fn models_json(&self) -> Value {
         let data: Vec<Value> = self
             .models
-            .list()
+            .list_vision()
             .into_iter()
-            .map(|(id, kind, loaded)| {
-                json!({
+            .map(|(id, kind, loaded, vision)| {
+                let mut m = json!({
                     "id": id,
                     "object": "model",
                     "created": 0,
                     "owned_by": "oxinfer",
                     "kind": kind.map(Kind::as_str),
                     "loaded": loaded,
-                })
+                });
+                // Chat models once loaded: what they take besides text (extra fields, which
+                // OpenAI clients ignore; vision-aware ones read `capabilities` / `modalities`).
+                if let Some(v) = vision {
+                    m["capabilities"] = json!(if v { vec!["completion", "vision"] } else { vec!["completion"] });
+                    m["modalities"] = json!({
+                        "input": if v { vec!["text", "image"] } else { vec!["text"] },
+                        "output": ["text"],
+                    });
+                }
+                m
             })
             .collect();
         json!({ "object": "list", "data": data })

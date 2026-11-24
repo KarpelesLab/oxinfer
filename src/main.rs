@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use oxinfer::chat::{self, ChatFormat};
-use oxinfer::engine::{load_tokenizer, resolve_auto_draft, resolve_file, resolve_model, save_quantized};
+use oxinfer::engine::{load_tokenizer, resolve_auto_draft, resolve_file, resolve_model_with, save_quantized};
 use oxinfer::generate::{self, Flow, SpecStats, TextStream};
 use oxinfer::model::{Model, Quant, Session};
 use oxinfer::sampler::Sampler;
@@ -371,7 +371,8 @@ fn usage() -> ! {
          \x20 --dump-mm PREFIX     write multimodal soft tokens / patches as f32 files (for reference checks)\n\
          \x20 --mmproj FILE|none   Mistral Large 4, Qwen3.5-family (Qwen3.8-Flash-Next): the vision tower\n\
          \x20                      (llama.cpp mmproj GGUF, path or org/repo/file; default: the checkpoint's,\n\
-         \x20                      or the mmproj*.gguf beside a GGUF model), or none\n\
+         \x20                      or the mmproj*.gguf beside a GGUF model, which org/repo:QUANT\n\
+         \x20                      fetches with it), or none (nothing fetched)\n\
          \x20 --lora FILE[:SCALE]  Qwen, Llama, Gemma, Inkling-2: a LoRA adapter applied at run time\n\
          \x20                      (repeatable; scale 1): a PEFT folder (adapter_config.json +\n\
          \x20                      adapter_model.safetensors, or org/repo holding one) or a llama.cpp\n\
@@ -1468,19 +1469,23 @@ fn main() -> Result<()> {
         // Drama 3's repository: its loader also fetches the codec.
         args.model.clone()
     } else {
-        resolve_model(&spec, args.cache_dir.as_deref())?
+        resolve_model_with(&spec, args.cache_dir.as_deref(), &args.mmproj)?
     };
     if let Some(d) = &args.draft
         && d.as_os_str() != "auto"
     {
         let spec = d.to_string_lossy().to_string();
-        let d = resolve_model(&spec, args.cache_dir.as_deref())?;
+        let d = resolve_model_with(&spec, args.cache_dir.as_deref(), &oxinfer::pixtral::Mmproj::None)?;
         // A draft repository holding several GGUF quantizations: its Q8_0 draft.
         args.draft = Some(oxinfer::dspark::draft_in(&d).unwrap_or(d));
     }
     if let Some(d) = &args.mtp_from {
         let spec = d.to_string_lossy().to_string();
-        args.mtp_from = Some(resolve_model(&spec, args.cache_dir.as_deref())?);
+        args.mtp_from = Some(resolve_model_with(
+            &spec,
+            args.cache_dir.as_deref(),
+            &oxinfer::pixtral::Mmproj::None,
+        )?);
     }
     // A file, or a PEFT adapter folder (language models) fetched as one.
     for l in &mut args.loras {

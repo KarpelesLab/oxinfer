@@ -295,7 +295,10 @@ oxinfer --model ggml-org/Inkling-2-Mini-GGUF:Q8_0 --image photo.png --prompt "De
 oxinfer --model unsloth/Inkling-2-Mini-GGUF:UD-IQ3_XXS --kv-cache q8 --prompt "..."
 ```
 
-A GGUF model takes its images from the `mmproj*.gguf` beside it (`mmproj` option). The model
+A GGUF model takes its images from the `mmproj*.gguf` beside it (`mmproj` option). Fetching
+`org/repo:QUANT` brings the repository's top-level projector along (`mmproj-BF16.gguf`, else F16,
+else F32; about 0.6-1 GB, never the `Old_Support/` copies), unless one is beside the model
+already or `mmproj` is `none` or a file. The model
 always thinks a little, even at the lowest effort (its card says so); `--think` asks for the
 template's default effort (0.9).
 

@@ -38,7 +38,13 @@ cross-origin requests).
 GGUF repository whose name ends in `QUANT.gguf`, e.g.
 `HauhauCS/Qwen3.8-27B-Uncensored-HauhauCS-Aggressive-MTP-GGUF:Q4_K_P`). Models split into parts
 (`name-00001-of-00009.gguf`, ...) load from any part or from their folder, and `org/repo:QUANT`
-fetches every part. Architectures: `qwen35`
+fetches every part. When the repository has a vision projector at its top level
+(`mmproj*.gguf`, as unsloth's and ggml-org's repositories of vision models do), `org/repo:QUANT`
+fetches one beside the model too, with a note (BF16, else F16, else F32, else another; files in
+subfolders such as `Old_Support/` are left alone), so that images work without naming it.
+Nothing more is fetched when an `mmproj*.gguf` is beside the model already (whatever its name),
+or when the `mmproj` option (`--mmproj`, engine / C / server `mmproj=`) is `none` or names a
+file. Architectures: `qwen35`
 (Qwen3.5 / 3.6 / 3.8), `qwen35moe`, `qwen3`, `llama` (Llama 3.x, and Orpheus TTS, see
 [below](#llama-3-gguf)), `gemma4` (Gemma 4 text models, dense and 26B-A4B; see
 [Gemma 4 26B-A4B](gemma-4-26b.md#gemma-4-26b-a4b-moe)), `mistral-large4` (see

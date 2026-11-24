@@ -1648,18 +1648,19 @@ impl Engine {
     /// (`org/name`, or `org/name:QUANT` for a GGUF repo) fetched into the cache.
     pub fn load(model: &str, opts: &EngineOptions) -> Result<Engine> {
         let t0 = Instant::now();
-        let dir = resolve_model(model, opts.cache_dir.as_deref())?;
+        let dir = resolve_model_with(model, opts.cache_dir.as_deref(), &opts.mmproj)?;
+        let no_mmproj = crate::pixtral::Mmproj::None;
         let side_dir = opts
             .mtp_from
             .as_deref()
-            .map(|s| resolve_model(s, opts.cache_dir.as_deref()))
+            .map(|s| resolve_model_with(s, opts.cache_dir.as_deref(), &no_mmproj))
             .transpose()?;
         // A draft repository holding several GGUF quantizations: its Q8_0 draft.
         let draft_dir = opts
             .draft
             .as_deref()
             .filter(|s| *s != "none" && *s != "auto")
-            .map(|s| resolve_model(s, opts.cache_dir.as_deref()).map(|d| crate::dspark::draft_in(&d).unwrap_or(d)))
+            .map(|s| resolve_model_with(s, opts.cache_dir.as_deref(), &no_mmproj).map(|d| crate::dspark::draft_in(&d).unwrap_or(d)))
             .transpose()?;
         if is_coreml_dir(&dir) {
             if opts.decision_from.is_some() {
@@ -3258,39 +3259,53 @@ impl Engine {
         voice.reply(model, &self.tok, user, &mm_text, &feats, o, chunk, on_text)
     }
 
+    /// Whether the model takes images (its vision tower is there: for a GGUF model, an mmproj
+    /// file it can use beside it or given), as `/v1/models` advertises it.
+    pub fn accepts_images(&self) -> bool {
+        match self.info.family {
+            // (Gemma 4's tower comes from its safetensors checkpoint only.)
+            Family::Gemma4 => self.info.coreml.is_none() && !crate::gguf::is_gguf(&self.info.path),
+            _ => self.check_media().is_ok(),
+        }
+    }
+
+    /// Errors when the model cannot take attachments.
+    fn check_media(&self) -> Result<()> {
+        if self.info.coreml.is_some() {
+            bail!("attachments are not supported for Core ML models");
+        }
+        match self.info.family {
+            Family::Gemma4 => {}
+            Family::Qwen if self.mmproj == crate::pixtral::Mmproj::None => bail!("image input is disabled (mmproj none)"),
+            Family::Qwen if crate::lfm3_omni::is_omni(&self.info.path) => {}
+            Family::Qwen if crate::qwen_vision::QwenMmConfig::load_with(&self.info.path, &self.mmproj)?.is_some() => {}
+            Family::Qwen if crate::minimax_vl01::Vl01Config::load(&self.info.path)?.is_some() => {}
+            Family::Qwen if crate::gguf::is_gguf(&self.info.path) => {
+                bail!("this checkpoint has no vision tower (for a GGUF model: no Qwen mmproj file beside it; set the mmproj option)")
+            }
+            Family::Qwen => bail!("this checkpoint has no vision tower (text only)"),
+            Family::UnlimitedOcr => {}
+            Family::Mistral4 if self.mmproj == crate::pixtral::Mmproj::None => bail!("image input is disabled (mmproj none)"),
+            Family::Mistral4 if crate::pixtral::PixtralConfig::load_with(&self.info.path, &self.mmproj)?.is_some() => {}
+            Family::Mistral4 => {
+                bail!("this checkpoint has no vision tower (for a GGUF model: no mmproj file beside it; set the mmproj option)")
+            }
+            Family::Inkling2 if self.mmproj == crate::pixtral::Mmproj::None => bail!("image input is disabled (mmproj none)"),
+            Family::Inkling2 if crate::inkling_vision::Inkling2VisionConfig::load_with(&self.info.path, &self.mmproj)?.is_some() => {}
+            Family::Inkling2 if crate::gguf::is_gguf(&self.info.path) => {
+                bail!("this checkpoint has no vision tower (for a GGUF model: no inkling2v mmproj file beside it; set the mmproj option)")
+            }
+            _ => bail!("attachments are supported for Gemma 4 and Qwen3.5-family vision models only"),
+        }
+        Ok(())
+    }
+
     /// The placeholder text and soft tokens of a message's attachments (nothing when empty).
     fn prepare_media(&self, media: &Attachments) -> Result<(String, Vec<mm::MmFeature>)> {
         Ok(if media.is_empty() {
             (String::new(), Vec::new())
         } else {
-            if self.info.coreml.is_some() {
-                bail!("attachments are not supported for Core ML models");
-            }
-            match self.info.family {
-                Family::Gemma4 => {}
-                Family::Qwen if self.mmproj == crate::pixtral::Mmproj::None => bail!("image input is disabled (mmproj none)"),
-                Family::Qwen if crate::lfm3_omni::is_omni(&self.info.path) => {}
-                Family::Qwen if crate::qwen_vision::QwenMmConfig::load_with(&self.info.path, &self.mmproj)?.is_some() => {}
-                Family::Qwen if crate::minimax_vl01::Vl01Config::load(&self.info.path)?.is_some() => {}
-                Family::Qwen if crate::gguf::is_gguf(&self.info.path) => {
-                    bail!("this checkpoint has no vision tower (for a GGUF model: no Qwen mmproj file beside it; set the mmproj option)")
-                }
-                Family::Qwen => bail!("this checkpoint has no vision tower (text only)"),
-                Family::UnlimitedOcr => {}
-                Family::Mistral4 if self.mmproj == crate::pixtral::Mmproj::None => bail!("image input is disabled (mmproj none)"),
-                Family::Mistral4 if crate::pixtral::PixtralConfig::load_with(&self.info.path, &self.mmproj)?.is_some() => {}
-                Family::Mistral4 => {
-                    bail!("this checkpoint has no vision tower (for a GGUF model: no mmproj file beside it; set the mmproj option)")
-                }
-                Family::Inkling2 if self.mmproj == crate::pixtral::Mmproj::None => bail!("image input is disabled (mmproj none)"),
-                Family::Inkling2 if crate::inkling_vision::Inkling2VisionConfig::load_with(&self.info.path, &self.mmproj)?.is_some() => {}
-                Family::Inkling2 if crate::gguf::is_gguf(&self.info.path) => {
-                    bail!(
-                        "this checkpoint has no vision tower (for a GGUF model: no inkling2v mmproj file beside it; set the mmproj option)"
-                    )
-                }
-                _ => bail!("attachments are supported for Gemma 4 and Qwen3.5-family vision models only"),
-            }
+            self.check_media()?;
             let req = mm::MmRequest {
                 model: &self.info.path,
                 images: &media.images,
@@ -4060,22 +4075,30 @@ pub fn resolve_auto_draft(model: &Path, cache_dir: Option<&Path>) -> Result<Path
         return Ok(p);
     }
     let repo = crate::dspark::auto_repo(model).context("draft=auto: no DSpark draft beside the model, and none known for it")?;
-    let dir = resolve_model(repo, cache_dir)?;
+    let dir = resolve_model_with(repo, cache_dir, &crate::pixtral::Mmproj::None)?;
     crate::dspark::draft_in(&dir).with_context(|| format!("{repo}: no DSpark draft in {}", dir.display()))
 }
 
 pub fn resolve_model(spec: &str, cache_dir: Option<&Path>) -> Result<PathBuf> {
+    resolve_model_with(spec, cache_dir, &crate::pixtral::Mmproj::Auto)
+}
+
+/// [`resolve_model`] with the model's `mmproj` choice ([`EngineOptions::mmproj`]): fetching a
+/// GGUF repository (`org/name:QUANT`) with `auto` also fetches its top-level `mmproj*.gguf`
+/// vision projector beside the model, unless one is there already ([`crate::hf::resolve_with`]);
+/// `none` or a given file fetch the model alone.
+pub fn resolve_model_with(spec: &str, cache_dir: Option<&Path>, mmproj: &crate::pixtral::Mmproj) -> Result<PathBuf> {
     // A folder holding one GGUF model (a single file or the parts of a split one): its first file.
     if let Some(f) = crate::gguf::model_in_dir(Path::new(spec)) {
         return Ok(f);
     }
     #[cfg(feature = "hf")]
     {
-        crate::hf::resolve(spec, cache_dir)
+        crate::hf::resolve_with(spec, cache_dir, mmproj)
     }
     #[cfg(not(feature = "hf"))]
     {
-        let _ = cache_dir;
+        let _ = (cache_dir, mmproj);
         let p = PathBuf::from(spec);
         if p.is_dir() || crate::gguf::is_gguf(&p) {
             Ok(p)
