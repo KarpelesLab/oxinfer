@@ -1,6 +1,19 @@
 use anyhow::{Context, Result, bail};
 use oxinfer::chat::{self, ChatFormat};
-use oxinfer::engine::{load_tokenizer, resolve_auto_draft, resolve_file, resolve_model_with, save_quantized};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use oxinfer::engine::save_quantized;
+use oxinfer::engine::{load_tokenizer, resolve_auto_draft, resolve_file, resolve_model_with};
+
+/// The browser build has no file system to write a checkpoint to.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn save_quantized(
+    _src: &std::path::Path,
+    _out: &std::path::Path,
+    _files: &oxinfer::safetensors::ModelFiles,
+    _quant: oxinfer::model::Quant,
+) -> anyhow::Result<()> {
+    anyhow::bail!("--save-quantized is not available on wasm32-unknown-unknown")
+}
 use oxinfer::generate::{self, Flow, SpecStats, TextStream};
 use oxinfer::model::{Model, Quant, Session};
 use oxinfer::sampler::Sampler;
