@@ -152,6 +152,55 @@ impl<'f> Pe<'f> {
     }
 }
 
+/// The `ink_pf` read-ahead lists of a layer ([`LayerDev::pf`]): the attention's projections,
+/// its output projection, the message gates' down rows and forget / gain rows before the
+/// attention, the same of the gate before the MLP, the router.
+const PF_ATTN: usize = 0;
+const PF_O: usize = 1;
+const PF_AGATE_DOWN: usize = 2;
+const PF_AGATE_FG: usize = 3;
+const PF_MGATE_DOWN: usize = 4;
+const PF_MGATE_FG: usize = 5;
+const PF_ROUTER: usize = 6;
+/// Threadgroups of 256 an `ink_pf` dispatch.
+const PF_TGS: usize = 32;
+
+/// The 128-byte lines of `n` bytes at `a`: (first line, lines).
+fn line_range(a: u64, n: u64) -> Option<[u64; 2]> {
+    let (lo, hi) = (a & !127, (a + n).next_multiple_of(128));
+    (hi > lo).then(|| [lo, (hi - lo) / 128])
+}
+
+/// The 128-byte lines a matvec reads of its weights (data, scales, affine offsets): (address,
+/// lines) per range, for `ink_pf` (at most 16 ranges: the first).
+fn pf_lines(be: &MetalBackend, ws: &[&Dw]) -> Vec<[u64; 2]> {
+    let mut v = Vec::new();
+    for d in ws {
+        let w = &d.w;
+        let (n_out, n_in) = (w.n_out as u64, w.n_in as u64);
+        let at = |id: Id, off: u64| be.buffer_gpu_address(id) + off;
+        let mut r = vec![(at(w.data, w.data_off), n_out * w.gpr as u64)];
+        match w.fmt {
+            MvFmt::Gguf(_) => {}
+            MvFmt::Bf16 => r[0].1 = n_out * n_in * 2,
+            MvFmt::Q8 => {
+                r[0].1 = n_out * n_in;
+                r.push((at(w.scales, w.scales_off), n_out * n_in / 32 * 4));
+            }
+            MvFmt::Q4 => {
+                r[0].1 = n_out * n_in / 2;
+                r.push((at(w.scales, w.scales_off), n_out * n_in / 32 * 2));
+                if w.gk != 0 {
+                    r.push((at(w.offs, w.offs_off), n_out * w.gpr as u64 * 2));
+                }
+            }
+        }
+        v.extend(r.into_iter().filter_map(|(a, n)| line_range(a, n)));
+    }
+    v.truncate(16);
+    v
+}
+
 /// The lanes per row of the grouped expert kernels (`ink_*_gpair` / `_gsum`) for rows of `n_in`
 /// values in chunks of `ch`: the largest power of two dividing the chunk count, at most `max`
 /// (every lane then walks the same number of chunks).
@@ -184,6 +233,19 @@ fn attf_g(g: usize) -> usize {
     let one = *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_ATTQ").is_ok_and(|v| v == "0"));
     if one { 1 } else { g }
 }
+/// `OXINFER_INKLING_PF`: which of a layer's `PF_*` lists are read ahead (`InkMetal::prefetch`),
+/// a mask of bits `1 << PF_*`: by default the output projection, the message gates' down rows,
+/// the forget / gain rows of the gate before the MLP and the router (0x76; 0: none).
+fn pf_mask() -> u32 {
+    static M: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *M.get_or_init(|| {
+        std::env::var("OXINFER_INKLING_PF")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0x76)
+    })
+}
+
 fn attf_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| !std::env::var("OXINFER_INKLING_ATTF").is_ok_and(|v| v == "0"))
@@ -770,6 +832,8 @@ struct LayerDev {
     vd: Option<Dw>,
     gates: Option<([GateDev; 4], usize)>,
     exp: ExpDev,
+    /// The 128-byte lines `ink_pf` reads ahead (address, lines), by `PF_*`.
+    pf: Vec<Vec<[u64; 2]>>,
 }
 
 /// What a step of the pass does with the loop and the block states (fixed by the config).
@@ -915,6 +979,7 @@ struct Pipes {
     lora_b: Id,
     xlora_a: Id,
     xlora_b: Id,
+    pf: Id,
 }
 
 /// The prefill kernels.
@@ -995,6 +1060,9 @@ pub(crate) struct InkMetal {
     ring_rows: usize,
     window: usize,
     lock: std::sync::Mutex<()>,
+    /// `ink_pf`'s sink (never written in practice), where the weights are resident by a
+    /// residency set (the only way `ink_pf` reaches them).
+    pf_sink: Option<Id>,
 }
 unsafe impl Send for InkMetal {}
 unsafe impl Sync for InkMetal {}
@@ -1922,6 +1990,7 @@ impl InkMetal {
                 vd,
                 gates,
                 exp,
+                pf: Default::default(),
             });
         }
         let lm_head = dense(&m.lm_head, c.vocab_size, h, &mut shared)?;
@@ -2127,6 +2196,32 @@ impl InkMetal {
         let (cbuf, cp) = be.ink_buffer(consts.0.len() * 4).context("constants")?;
         unsafe { std::ptr::copy_nonoverlapping(consts.0.as_ptr() as *const u8, cp, consts.0.len() * 4) };
         owned.push(cbuf);
+        let cbase = be.buffer_gpu_address(cbuf);
+        for ld in &mut layers {
+            let mut attn: Vec<&Dw> = vec![&ld.q, &ld.r, &ld.gate, &ld.sink, &ld.k, &ld.v];
+            attn.extend(ld.kd.iter().chain(ld.vd.iter()));
+            let mut pf = vec![pf_lines(be, &attn), pf_lines(be, &[&ld.o])];
+            match &ld.gates {
+                Some((g, _)) => {
+                    pf.push(pf_lines(be, &[&g[0].down, &g[1].down, &g[2].down]));
+                    let fg: Vec<&Dw> = g[..3].iter().flat_map(|g| [&g.forget, &g.gain]).collect();
+                    pf.push(pf_lines(be, &fg));
+                    pf.push(pf_lines(be, &[&g[3].down]));
+                    pf.push(pf_lines(be, &[&g[3].forget, &g[3].gain]));
+                }
+                None => pf.extend([vec![], vec![], vec![], vec![]]),
+            }
+            pf.push(line_range(cbase + ld.router as u64 * 4, (ne * h * 4) as u64).into_iter().collect());
+            ld.pf = pf;
+        }
+        let pf_sink = match &be.residency {
+            Some(_) => {
+                let (id, _) = be.ink_buffer(256).context("read-ahead sink")?;
+                owned.push(id);
+                Some(id)
+            }
+            None => None,
+        };
         if let Some(r) = &be.residency {
             r.update(&indirect, true);
         }
@@ -2185,6 +2280,7 @@ impl InkMetal {
             lora_b: pipe("ink_lora_b")?,
             xlora_a: pipe("ink_xlora_a")?,
             xlora_b: pipe("ink_xlora_b")?,
+            pf: pipe("ink_pf")?,
         };
         let pfp = match pfa {
             Some(_) => Some(PfPipes {
@@ -2232,6 +2328,7 @@ impl InkMetal {
             ring_rows: kn - 1 + ROLLBACK,
             window: c.sliding_window_size,
             lock: std::sync::Mutex::new(()),
+            pf_sink,
         })
     }
 
@@ -2659,9 +2756,20 @@ impl InkMetal {
     }
 
     /// Message gates `which` (gate index, input, norm weights, output) with messages `msgs + i`:
-    /// the gated inputs RMS-normed into the outputs.
+    /// the gated inputs RMS-normed into the outputs. `pf`: a layer and the `PF_*` lists its
+    /// down-projection stage and its forget / gain stage read ahead ([`Self::prefetch`]).
     #[allow(clippy::too_many_arguments)]
-    fn gates(&self, e: &Pe, c: &Cx, g: &[GateDev; 4], which: &[(usize, usize, usize, usize)], t: usize, normed: bool, fold: bool) {
+    fn gates(
+        &self,
+        e: &Pe,
+        c: &Cx,
+        g: &[GateDev; 4],
+        which: &[(usize, usize, usize, usize)],
+        t: usize,
+        normed: bool,
+        fold: bool,
+        pf: Option<(&LayerDev, usize, usize)>,
+    ) {
         let (h, th) = (self.h, c.b.tm * self.h);
         let b = c.b;
         // (`normed`: the mixes that made the inputs wrote them normed, `mix_cat`.)
@@ -2686,6 +2794,9 @@ impl InkMetal {
             if c.b.pf.is_some() {
                 e.barrier();
             }
+        }
+        if let Some(pf) = pf {
+            self.prefetch(e, pf.0, pf.1, t);
         }
         e.barrier();
         // Float32 or bf16 forget / gain rows of the rank: both matvecs and the mix per channel in
@@ -2736,6 +2847,9 @@ impl InkMetal {
                 );
                 e.buf(self.consts, 0, 4);
                 e.dispatch((h.div_ceil(64), t), 256);
+            }
+            if let Some(pf) = pf {
+                self.prefetch(e, pf.0, pf.2, t);
             }
             e.barrier();
             if fold {
@@ -3024,6 +3138,7 @@ impl InkMetal {
                 if !self.skip(SK_MIX) {
                     self.mix_cat(e, c, &sp.attn_states, b.x, q, nq, b.mixed, None, t, Some((0, false, nq - 1)));
                 }
+                self.prefetch(e, ld, PF_AGATE_DOWN, t);
                 e.barrier();
                 let (g, _) = ld.gates.as_ref().unwrap();
                 let which: Vec<(usize, usize, usize, usize)> = (0..3)
@@ -3033,12 +3148,24 @@ impl InkMetal {
                     })
                     .collect();
                 if !self.skip(SK_GATES) {
-                    self.gates(e, c, g, &which, t, !self.skip(SK_MIX), self.attn_fold(si, t));
+                    self.gates(
+                        e,
+                        c,
+                        g,
+                        &which,
+                        t,
+                        !self.skip(SK_MIX),
+                        self.attn_fold(si, t),
+                        Some((ld, PF_AGATE_FG, PF_ATTN)),
+                    );
                 }
                 3
             }
             (None, true) => unreachable!("a looped layer reads the block states"),
         };
+        if !msgs {
+            self.prefetch(e, ld, PF_ATTN, t);
+        }
         e.barrier();
         let pf = c.b.pf.is_some() && t > MAX_T;
         // (Prefill GEMMs share one half-row scratch: one at a time.)
@@ -3320,6 +3447,7 @@ impl InkMetal {
             let tgs = if fold { nh / attf_g(nh / nkv) } else { nkv };
             e.dispatch3((tgs, maxsplit, t), 256);
         }
+        self.prefetch(e, ld, PF_O, t);
         e.barrier();
         if let (true, Some(pb), Some(pp)) = (tmp, pfb, &self.pfp) {
             // The pass's last rows to the window's ring.
@@ -3432,16 +3560,67 @@ impl InkMetal {
             if !self.skip(SK_MIX) {
                 self.mix_cat(e, c, &sp.mlp_states, b.x, ld.mlp_query, 1, b.hm, None, t, Some((3, false, 0)));
             }
+            self.prefetch(e, ld, PF_MGATE_DOWN, t);
+            self.prefetch(e, ld, PF_MGATE_FG, t);
             e.barrier();
             let (g, _) = ld.gates.as_ref().unwrap();
             if !self.skip(SK_GATES) {
-                self.gates(e, c, g, &[(3, b.hm, ld.ln_post, b.hn)], t, !self.skip(SK_MIX), self.mlp_fold(si, t));
+                let pf = Some((ld, PF_ROUTER, usize::MAX));
+                self.gates(
+                    e,
+                    c,
+                    g,
+                    &[(3, b.hm, ld.ln_post, b.hn)],
+                    t,
+                    !self.skip(SK_MIX),
+                    self.mlp_fold(si, t),
+                    pf,
+                );
             }
-        } else if !self.skip(SK_MIX) {
-            self.mix(e, c, &sp.mlp_states, b.x, ld.mlp_query, 1, b.hn, Some(ld.ln_post), t);
+        } else {
+            if !self.skip(SK_MIX) {
+                self.mix(e, c, &sp.mlp_states, b.x, ld.mlp_query, 1, b.hn, Some(ld.ln_post), t);
+            }
+            self.prefetch(e, ld, PF_ROUTER, t);
         }
         e.barrier();
         self.route(e, c, si, t);
+    }
+
+    /// Reads `ld`'s read-ahead list `which` (`PF_*`) into the system cache beside the latency
+    /// kernels of the stage being encoded, so that the stage after it, which reads those weights,
+    /// finds them there (passes of up to [`MAX_T`] tokens; [`pf_mask`]). The stage waits for the
+    /// reads: a list is worth it where it takes less time than the kernels beside it.
+    fn prefetch(&self, e: &Pe, ld: &LayerDev, which: usize, t: usize) {
+        let Some(sink) = self.pf_sink else { return };
+        if t > MAX_T || which >= ld.pf.len() || pf_mask() & (1 << which) == 0 {
+            return;
+        }
+        let r = &ld.pf[which];
+        let total: u64 = r.iter().map(|x| x[1]).sum();
+        if total == 0 {
+            return;
+        }
+        #[repr(C)]
+        struct P {
+            n: u32,
+            lo: u32,
+            hi: u32,
+            _p: u32,
+            r: [[u64; 2]; 16],
+        }
+        let mut p = P {
+            n: r.len() as u32,
+            lo: 0,
+            hi: total as u32,
+            _p: 0,
+            r: [[0; 2]; 16],
+        };
+        p.r[..r.len()].copy_from_slice(r);
+        e.pipe(self.p.pf);
+        e.buf(sink, 0, 0);
+        e.bytes(&p, 1);
+        e.dispatch((PF_TGS, 1), 256);
     }
 
     /// Whether a message gate's forget / gain rows run in `ink_gfg` (float32 or bf16 rows of the
