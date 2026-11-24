@@ -110,6 +110,13 @@ fn sliding(l: usize) -> bool {
 /// A byte-level BPE `tokenizer.json`: every byte one token (GPT-2's byte-to-character map, ids
 /// 0 to 255), no merges, and [`SPECIAL`] from [`SPECIAL_BASE`].
 fn tokenizer_json() -> Value {
+    byte_tokenizer(&SPECIAL, SPECIAL_BASE)
+}
+
+/// A byte-level BPE `tokenizer.json`: every byte one token (GPT-2's byte-to-character map, ids
+/// 0 to 255), no merges, and the special tokens `special` from id `base` (also for the other
+/// tiny test models).
+pub(crate) fn byte_tokenizer(special: &[&str], base: u32) -> Value {
     let printable = |b: u32| (0x21..=0x7e).contains(&b) || (0xa1..=0xac).contains(&b) || (0xae..=0xff).contains(&b);
     let mut vocab = serde_json::Map::new();
     let mut extra = 0;
@@ -123,8 +130,8 @@ fn tokenizer_json() -> Value {
         vocab.insert(c.to_string(), json!(b));
     }
     let mut added = Vec::new();
-    for (i, s) in SPECIAL.iter().enumerate() {
-        let id = SPECIAL_BASE + i as u32;
+    for (i, s) in special.iter().enumerate() {
+        let id = base + i as u32;
         vocab.insert(s.to_string(), json!(id));
         added.push(
             json!({"id": id, "content": s, "single_word": false, "lstrip": false, "rstrip": false,

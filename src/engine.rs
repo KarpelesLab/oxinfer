@@ -336,8 +336,9 @@ pub struct EngineOptions {
     /// `/tmp` is refused. Key `prompt_cache` (a directory, `auto` for
     /// [`crate::snapshot::default_dir`], empty or `none` for none). Families: Gemma 4 / 3, Qwen
     /// (Qwen3, Qwen3.5 / 3.6 / 3.8 dense and MoE, Qwen2.5-VL), Llama 3, with or without their
-    /// DSpark / MTP drafts, Inkling-2 without a draft (CPU and Metal); not Mistral Large 4, DeepSeek V4, Qwen4-Exp, Core ML, nor the Gemma 4
-    /// assistant drafter's state (none: it keeps no cache).
+    /// DSpark / MTP drafts, Inkling-2 and DeepSeek V4 / V4.1 without a draft (CPU and Metal);
+    /// not Mistral Large 4, Qwen4-Exp, Core ML, nor the Gemma 4 assistant drafter's state (none:
+    /// it keeps no cache).
     pub prompt_cache: Option<PathBuf>,
     /// Size cap of the prompt cache in GB (default [`crate::snapshot::DEFAULT_CAP_GB`]). Key
     /// `prompt_cache_gb`.
@@ -345,13 +346,15 @@ pub struct EngineOptions {
     /// Shortest conversation (in tokens) the prompt cache stores (default 64). Key
     /// `prompt_cache_min_tokens`.
     pub prompt_cache_min_tokens: Option<usize>,
-    /// Inkling-2: in-memory checkpoints [`Engine::chat`] keeps of a conversation's prompt (the
-    /// prefix shared by every conversation with the same system prompt and tools, and each
-    /// prompt but its last token), so that the next conversation can reuse the cache up to
-    /// one of them after a mismatch (a past reply rendered without its thinking, an edited
-    /// message) instead of starting over: the model's convolutions and sliding windows cannot be
-    /// cut back further than 64 positions otherwise. Each holds the sliding layers' last window
-    /// of keys and values (Inkling-2-Mini: about 650 MB with f32 caches, 180 MB with q8). Past
+    /// Inkling-2 and DeepSeek V4 / V4.1: in-memory checkpoints [`Engine::chat`] keeps of a
+    /// conversation's prompt (the prefix shared by every conversation with the same system
+    /// prompt and tools, and each prompt but its last token), so that the next conversation can
+    /// reuse the cache up to one of them after a mismatch (a past reply rendered without its
+    /// thinking, an edited message) instead of starting over: the models' convolutions, sliding
+    /// windows and compressors' rows cannot be cut back further than 64 positions otherwise.
+    /// Each holds the sliding layers' last window of keys and values (Inkling-2-Mini: about 650
+    /// MB with f32 caches, 180 MB with q8; DeepSeek-V4-Flash: about 30 MB, the window's raw keys
+    /// and the compressors' pending rows, the compressed keys being shared). Past
     /// the cap the lowest one and the newest stay. Default [`DEFAULT_PROMPT_CHECKPOINTS`], 0
     /// turns them off. Key `prompt_checkpoints`.
     pub prompt_checkpoints: Option<usize>,
@@ -1332,6 +1335,7 @@ impl Lm {
             Lm::QwenDspark { dec } => dec.write_state(w),
             Lm::GemmaDspark { dec } => dec.write_state(w),
             Lm::Inkling2 { sess, .. } => sess.write_state(w),
+            Lm::DeepSeek4 { sess, .. } => sess.write_state(w),
             _ => bail!("session snapshots are not supported for this model family"),
         }
     }
@@ -1345,6 +1349,7 @@ impl Lm {
             Lm::QwenDspark { dec } => dec.read_state(r),
             Lm::GemmaDspark { dec } => dec.read_state(r),
             Lm::Inkling2 { sess, .. } => sess.read_state(r),
+            Lm::DeepSeek4 { sess, .. } => sess.read_state(r),
             _ => bail!("session snapshots are not supported for this model family"),
         }
     }
@@ -1356,24 +1361,29 @@ impl Lm {
             Lm::QwenMtp { dec } => dec.sess.exp.is_none(),
             Lm::QwenDspark { dec } => dec.sess.exp.is_none(),
             Lm::Inkling2 { model, .. } => model.snapshots(),
+            Lm::DeepSeek4 { .. } => true,
             _ => false,
         }
     }
     /// Whether the cache can go back to positions it took a checkpoint of (Inkling-2, whose
-    /// convolutions and sliding windows cannot be cut back further than a few positions).
+    /// convolutions and sliding windows cannot be cut back further than a few positions;
+    /// DeepSeek V4 / V4.1, whose sliding windows and compressors' rows cannot either).
     fn checkpoints(&self) -> bool {
-        matches!(self, Lm::Inkling2 { .. })
+        matches!(self, Lm::Inkling2 { .. } | Lm::DeepSeek4 { .. })
     }
     /// Takes a checkpoint of the current position, keeping at most `max` ([`Lm::checkpoints`]).
     fn checkpoint(&mut self, max: usize) {
-        if let Lm::Inkling2 { model, sess } = self {
-            model.checkpoint(sess, max);
+        match self {
+            Lm::Inkling2 { model, sess } => model.checkpoint(sess, max),
+            Lm::DeepSeek4 { sess, .. } => sess.checkpoint(max),
+            _ => {}
         }
     }
     /// Whether there is a checkpoint of position `pos`.
     fn has_checkpoint(&self, pos: usize) -> bool {
         match self {
             Lm::Inkling2 { model, sess } => model.has_checkpoint(sess, pos),
+            Lm::DeepSeek4 { sess, .. } => sess.has_checkpoint(pos),
             _ => false,
         }
     }
@@ -1382,6 +1392,7 @@ impl Lm {
     fn reachable(&self, len: usize) -> usize {
         match self {
             Lm::Inkling2 { model, sess } => model.reachable(sess, len),
+            Lm::DeepSeek4 { sess, .. } => sess.reachable(len),
             _ if self.truncatable() => len,
             _ => 0,
         }
@@ -1389,8 +1400,13 @@ impl Lm {
     /// Cuts the cache back to `len`, a position [`Lm::reachable`] gave; false when it could not
     /// (the cache must then start over).
     fn cut_to(&mut self, len: usize) -> bool {
-        if let Lm::Inkling2 { model, sess } = self {
-            return match model.cut_to(sess, len) {
+        let r = match self {
+            Lm::Inkling2 { model, sess } => Some(model.cut_to(sess, len)),
+            Lm::DeepSeek4 { sess, .. } => Some(sess.cut_to(len)),
+            _ => None,
+        };
+        if let Some(r) = r {
+            return match r {
                 Ok(()) => true,
                 Err(e) => {
                     eprintln!("[{e:#}]");
@@ -1433,6 +1449,7 @@ impl Lm {
             Lm::QwenDspark { dec } => drop(dec.prefill(ids, chunk)),
             Lm::GemmaDspark { dec } => drop(dec.prefill(ids, chunk)),
             Lm::Inkling2 { model, sess } => drop(generate::prefill(*model, sess, ids, chunk, &[])),
+            Lm::DeepSeek4 { model, sess } => drop(generate::prefill(*model, sess, ids, chunk, &[])),
             _ => bail!("not supported for this model family"),
         }
         Ok(())
@@ -4557,5 +4574,97 @@ mod tests {
         assert_eq!(again.tokens, first.tokens);
         std::fs::remove_dir_all(&cache).ok();
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn tiny_deepseek(tag: &str, v41: bool) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("oxinfer-ds4-engine-{tag}-{v41}-{}", std::process::id()));
+        crate::deepseek4::tiny::write_chat(&dir, v41, serde_json::json!({})).unwrap();
+        dir
+    }
+
+    /// DeepSeek V4 / V4.1: a next turn whose past reply is rendered otherwise than the model
+    /// wrote it (its thinking goes; here the tiny model's reply is just other tokens) reuses the
+    /// cache up to the previous prompt's checkpoint, also when the reply ran further than the
+    /// session goes back otherwise; a regenerated reply all of its prompt but the last token.
+    #[test]
+    fn deepseek_chat_reuses_the_previous_prompt() {
+        for v41 in [false, true] {
+            let dir = tiny_deepseek("chat", v41);
+            let mut e = Engine::load(dir.to_str().unwrap(), &cpu_options()).unwrap();
+            e.config_mut().max_tokens = 90;
+            e.config_mut().think = true;
+            let mut convo = vec![
+                Message::system("You answer briefly. ".repeat(6)),
+                Message::user("Hello there, what is the weather like today?"),
+            ];
+            let r1 = e.chat(&convo, &mut quiet).unwrap();
+            assert_eq!(r1.stats.cached_tokens, 0);
+            let len1 = r1.stats.prompt_tokens;
+            convo.push(Message::assistant(format!("{}!", r1.text)));
+            convo.push(Message::user("And tomorrow?"));
+            let r2 = e.chat(&convo, &mut quiet).unwrap();
+            assert!(
+                r2.stats.cached_tokens + 1 >= len1,
+                "v41 {v41}: {} cached of {len1}",
+                r2.stats.cached_tokens
+            );
+            let len2 = r2.stats.cached_tokens + r2.stats.prompt_tokens;
+            let r3 = e.chat(&convo, &mut quiet).unwrap();
+            assert_eq!(r3.stats.cached_tokens, len2 - 1, "v41 {v41}");
+            // With checkpoints off, the conversation starts over after a long reply.
+            let mut o = cpu_options();
+            o.set("prompt_checkpoints", "0").unwrap();
+            let mut e = Engine::load(dir.to_str().unwrap(), &o).unwrap();
+            e.config_mut().max_tokens = 90;
+            e.config_mut().think = true;
+            let r1 = e.chat(&convo[..2], &mut quiet).unwrap();
+            let r2 = e.chat(&convo, &mut quiet).unwrap();
+            if r1.tokens.len() > crate::deepseek4::ROLLBACK + 1 {
+                assert_eq!(r2.stats.cached_tokens, 0, "v41 {v41}");
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// DeepSeek V4 / V4.1 conversations go to the prompt cache and come back from it in another
+    /// engine, whose greedy reply is the first engine's and that of an engine that computes the
+    /// whole prompt.
+    #[test]
+    fn deepseek_prompt_cache_restores() {
+        for v41 in [false, true] {
+            let dir = tiny_deepseek("pcache", v41);
+            let cache = std::env::temp_dir().join(format!("oxinfer-ds4-pc-{v41}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&cache);
+            let mut o = cpu_options();
+            o.set("prompt_cache", cache.to_str().unwrap()).unwrap();
+            o.set("prompt_cache_min_tokens", "8").unwrap();
+            let convo = vec![
+                Message::system("You answer briefly. ".repeat(6)),
+                Message::user("Name a famous library."),
+            ];
+            let first = {
+                let mut e = Engine::load(dir.to_str().unwrap(), &o).unwrap();
+                e.config_mut().max_tokens = 12;
+                let r = e.chat(&convo, &mut quiet).unwrap();
+                e.flush_prompt_cache().unwrap();
+                assert!(e.prompt_cache_info().unwrap().1 > 0, "nothing stored");
+                r
+            };
+            let mut e = Engine::load(dir.to_str().unwrap(), &o).unwrap();
+            e.config_mut().max_tokens = 12;
+            let again = e.chat(&convo, &mut quiet).unwrap();
+            assert_eq!(again.stats.restored_tokens, first.stats.prompt_tokens - 1, "v41 {v41}");
+            assert_eq!(again.tokens, first.tokens, "v41 {v41}");
+            // The whole prompt computed in one pass.
+            let mut o = cpu_options();
+            o.set("prompt_checkpoints", "0").unwrap();
+            let mut e = Engine::load(dir.to_str().unwrap(), &o).unwrap();
+            e.config_mut().max_tokens = 12;
+            let fresh = e.chat(&convo, &mut quiet).unwrap();
+            assert_eq!(fresh.stats.cached_tokens + fresh.stats.restored_tokens, 0);
+            assert_eq!(fresh.tokens, first.tokens, "v41 {v41}: against a fresh prefill");
+            std::fs::remove_dir_all(&cache).ok();
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 }

@@ -1,7 +1,8 @@
 # Session snapshots and the prompt cache
 
 A session (the KV caches, the Gated DeltaNet recurrent and convolution states, Inkling-2's
-convolution rings and sliding-window caches, positions and vision spans, the DSpark draft's
+convolution rings and sliding-window caches, DeepSeek V4's windows, compressed keys and
+compressors' rows, positions and vision spans, the DSpark draft's
 context cache and pending features, the MTP layer's cache and pending rows, and the tokens) can
 be written to a file and read back bit for bit (`snapshot.rs`):
 
@@ -17,8 +18,8 @@ fingerprint (checkpoint, precision, format, device, speculative decoding and its
 token prefix, with a size cap (`prompt_cache_gb`, default 20; least recently used first).
 `Engine::chat` restores the snapshot that saves the most of the prompt: for models without
 recurrent state (Gemma, Qwen3, Llama, with their drafts) any common prefix (the restored caches
-are cut back), for Qwen3.5 / 3.6 / 3.8 and Inkling-2 (recurrent or convolution state cannot be
-cut back) a whole snapshot the prompt starts with. It stores each conversation after its reply (left pending so the reply is not
+are cut back), for Qwen3.5 / 3.6 / 3.8, Inkling-2 and DeepSeek V4 / V4.1 (recurrent, convolution or
+compressor state cannot be cut back) a whole snapshot the prompt starts with. It stores each conversation after its reply (left pending so the reply is not
 delayed: the server writes it on another thread once the response is sent; the next request, an
 explicit `Engine::flush_prompt_cache` or the engine's drop also write it) and, for the recurrent
 models, the prefix every conversation with the same system prompt and tools shares (the first
@@ -46,6 +47,20 @@ caps them (each about 650 MB for Inkling-2-Mini with f32 caches, 180 MB with q8;
 live on the GPU between passes); with `--prompt-cache` they restore the stored prompt but its
 last token from disk.
 
+**DeepSeek V4 / V4.1: the same checkpoints.** Every layer keeps a sliding window of raw keys and
+the compressors keep the rows of the windows still pooling, both trimmed as the session goes on
+(64 positions of slack, so speculative rounds can roll back); the compressed keys and the engram
+ids only grow. A checkpoint (`DeepSeek4Session::checkpoint`, `reachable`, `cut_to`) holds, per
+layer, the window's raw keys and the compressors' pending rows as they were at its position (the
+compressed keys are cut back to their count then): about 30 MB for V4.1-Flash, so the default
+two cost little. `Engine::chat` takes them as for Inkling-2 (`prompt_checkpoints`, default 2, 0
+off), and a next turn whose past reply lost its thinking goes back to the previous prompt but its
+last token. Snapshots (`--save-session`, `--prompt-cache`) hold the host's session, which stays
+authoritative on Metal too (V4.1's GPU decode appends each pass's keys to it); the device's
+copies of the caches are rebuilt from it at the first pass after a restore or a cut back
+(`deepseek41_gpu.rs`). Not with a DSpark draft (V4's draft keeps its own state; snapshots and
+checkpoints are refused there).
+
 The directory is created private (0700; an existing one is set to 0700, which fails unless it is
 yours, so `/tmp` or `/dev/shm` themselves are refused; a directory of your own on a tmpfs gives
 memory-speed restores on Linux), files are written 0600 under a temporary name and renamed into
@@ -63,8 +78,12 @@ stored. The server's status page lists the snapshots per directory and model and
 Families: Gemma 4 / 3, Qwen3, Qwen3.5 / 3.6 / 3.8 (dense, MoE, Qwen2.5-VL), Llama 3, with DSpark
 or MTP drafts and the Gemma 4 assistant drafter, Inkling-2 (Small and Mini, without a draft; on
 the CPU and on Metal, whose session buffers are read in place, the KV caches in their own f32 /
-f16 / q8 format: `src/inkling.rs`, `tests` `snapshot_round_trip_*`; not on CUDA yet). Not (yet): Mistral Large 4, DeepSeek V4
-(compressed-attention state), Qwen3.8-Flash-Next (Qwen4-Exp: n-gram and indexer state), Core ML
+f16 / q8 format: `src/inkling.rs`, `tests` `snapshot_round_trip_*`; not on CUDA yet), DeepSeek
+V4 / V4.1 and ERNIE 5.5 (without a draft; CPU and Metal decode: `src/deepseek4.rs` tests
+`checkpoint_cut_back_matches_fresh`, `snapshot_round_trip`, `deepseek41_gpu.rs`
+`gpu_checkpoint_cut_back_matches_fresh`, `gpu_snapshot_round_trip`, `tests/server.rs`
+`deepseek_chat_reuses_the_cache_after_thinking`, on tiny random models from
+`src/deepseek4_tiny.rs`). Not (yet): Mistral Large 4, Qwen3.8-Flash-Next (Qwen4-Exp: n-gram and indexer state), Core ML
 models.
 
 Checks (M5 Max, Metal; the machine was shared with other jobs at load 30-95, which slowed the

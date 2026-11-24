@@ -105,7 +105,8 @@ impl Engine {
     /// (the same conversation with the reply and new messages appended, the reply rendered as the
     /// model wrote it), only the new tokens are fed ([`Stats::cached_tokens`]); models without
     /// recurrent state (Gemma, Qwen3, Llama) also keep the part the conversations share when
-    /// they differ later, and Inkling-2 the part up to its latest checkpoint within it
+    /// they differ later, and Inkling-2 and DeepSeek V4 / V4.1 the part up to their latest
+    /// checkpoint within it
     /// ([`EngineOptions::prompt_checkpoints`]: the shared system prefix and each prompt but its
     /// last token, so a next turn whose past reply lost its thinking reuses the whole previous
     /// prompt). Otherwise the conversation starts over, or, with a prompt cache
@@ -123,7 +124,7 @@ impl Engine {
         let common = |c: &[u32]| c.iter().zip(&ids).take_while(|(a, b)| a == b).count();
         // What the cache in memory saves: all of it when the conversation extends it, else the
         // common prefix as far as the cache can be cut back (models without recurrent state: all
-        // of it; Inkling-2: to a checkpoint, see `prompt_checkpoints`).
+        // of it; Inkling-2, DeepSeek V4: to a checkpoint, see `prompt_checkpoints`).
         let mut skip = match self.chat_ids.take() {
             Some(c) if self.context_len() == c.len() => {
                 let n = common(&c);
@@ -187,7 +188,8 @@ impl Engine {
         // conversation with this system prompt and tools shares, and the whole prompt but its
         // last token (a request sent again, a reply regenerated, or the next turn, whose
         // rendering of this reply differs from the tokens the model wrote: its thinking goes),
-        // the first time each is computed. Inkling-2 also keeps checkpoints of them in memory,
+        // the first time each is computed. Inkling-2 and DeepSeek V4 also keep checkpoints of
+        // them in memory,
         // to go back to the next time.
         let (cached, mut pre_secs) = (skip, 0.0);
         let checkpoints = self.checkpoints > 0 && self.lm.checkpoints();

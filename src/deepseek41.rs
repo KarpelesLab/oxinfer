@@ -967,30 +967,9 @@ pub(super) mod tests {
         assert_eq!(candidate_blocks(&[9.0, 0.0, 1.0, 5.0, 0.5, 0.2], 2, 2), Some(vec![0, 2]));
     }
 
-    /// The config of the tiny model: key sources at rates 2 and 1, an index layer on another
-    /// layer's keys, candidate blocks from layer 3 used by layer 4, engram lookups before two
-    /// layers. `over`: keys replaced.
+    /// The config of the tiny model ([`super::tiny::v41_json`]); `over`: keys replaced.
     pub(super) fn tiny_config(over: serde_json::Value) -> DeepSeek4Config {
-        let mut c = serde_json::json!({
-            "model_type": "deepseek_v41",
-            "text_config": {
-                "hidden_size": 16, "num_hidden_layers": 6, "num_attention_heads": 2, "head_dim": 8,
-                "qk_rope_head_dim": 4, "q_lora_rank": 8, "o_groups": 2, "o_lora_rank": 4, "vocab_size": 32,
-                "n_routed_experts": 4, "n_shared_experts": 1, "num_experts_per_tok": 2, "moe_intermediate_size": 8,
-                "routed_scaling_factor": 1.5, "swiglu_limit": 1.5, "sliding_window": 4, "rms_norm_eps": 1e-20,
-                "compress_ratios": [0, 2, 2, 1, 1, 0], "kv_source_layer_ids": [1, 3],
-                "index_source_layer_ids": [1, 2, 3, 4], "index_n_heads": 8, "index_head_dim": 8, "index_topk": 2,
-                "candidate_source_layer_id": 3, "candidate_topk_blocks": 2, "candidate_block_size": 2,
-                "engram_layer_ids": [1, 3], "engram_max_ngram_size": 3, "engram_vocab_size": 20,
-                "engram_n_heads": 2, "engram_head_dim": 4, "engram_pad_token_id": 2,
-                "engram_multipliers": [[7, 11, 13], [17, 19, 23]],
-                "engram_token_map": (0..32).map(|i| i % 20).collect::<Vec<i32>>(),
-            }
-        });
-        for (k, v) in over.as_object().unwrap() {
-            c["text_config"][k] = v.clone();
-        }
-        DeepSeek4Config::from_json(c).unwrap()
+        DeepSeek4Config::from_json(super::tiny::v41_json(over)).unwrap()
     }
 
     /// Writes a tiny random checkpoint of [`tiny_config`] in DeepSeek's naming (float32).
@@ -1000,99 +979,7 @@ pub(super) mod tests {
 
     /// [`tiny_checkpoint`] of `tiny_config(over)`.
     pub(super) fn tiny_checkpoint_with(dir: &std::path::Path, over: serde_json::Value) {
-        let c = tiny_config(over);
-        let (h, nh, hd, ql) = (c.hidden_size, c.num_attention_heads, c.head_dim, c.q_lora_rank);
-        let (g, r, hc) = (c.o_groups, c.o_lora_rank, c.hc_mult);
-        let (ne, mi, v) = (c.n_routed_experts, c.moe_intermediate_size, c.vocab_size);
-        let (ni, di, ed) = (c.index_n_heads, c.index_head_dim, c.engram_head_dim);
-        let cols = (c.engram_max_ngram_size - 1) * c.engram_n_heads;
-        let mut seed = 0x5eed41u64;
-        let mut rng = move || {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (seed >> 40) as f32 / (1u64 << 23) as f32 - 1.0
-        };
-        let mut tensors: Vec<(String, Vec<usize>, Vec<u8>)> = Vec::new();
-        // `scale` times uniform noise, plus `bias`.
-        let mut add = |name: String, shape: &[usize], scale: f32, bias: f32| {
-            let n: usize = shape.iter().product();
-            let bytes = (0..n).flat_map(|_| (bias + scale * rng()).to_le_bytes()).collect();
-            tensors.push((name, shape.to_vec(), bytes));
-        };
-        let mat = |fan_in: usize, gain: f32| gain * (3.0 / fan_in as f32).sqrt();
-        add("embed.weight".into(), &[v, h], 1.7, 0.0);
-        add("head.weight".into(), &[v, h], mat(h, 4.0), 0.0);
-        add("norm.weight".into(), &[h], 0.2, 1.0);
-        // The primes above 19, two heads per n-gram size and layer: 23 + 29 + 31 + 37, then
-        // 41 + 43 + 47 + 53.
-        let rows = [120usize, 184];
-        for l in 0..c.num_hidden_layers {
-            let p = format!("layers.{l}.");
-            let ratio = c.ratio(l);
-            let mix = (2 + hc) * hc;
-            for part in ["attn", "ffn"] {
-                add(format!("{p}{part}_norm.weight"), &[h], 0.2, 1.0);
-                add(format!("{p}hc_{part}_fn"), &[mix, hc * h], mat(hc * h, 4.0), 0.0);
-                add(format!("{p}hc_{part}_base"), &[mix], 0.5, 0.0);
-                add(format!("{p}hc_{part}_scale"), &[3], 0.25, 0.75);
-            }
-            add(format!("{p}attn.wq_a.weight"), &[ql, h], mat(h, 2.0), 0.0);
-            add(format!("{p}attn.q_norm.weight"), &[ql], 0.2, 1.0);
-            add(format!("{p}attn.wq_b.weight"), &[nh * hd, ql], mat(ql, 2.0), 0.0);
-            add(format!("{p}attn.wkv.weight"), &[hd, h], mat(h, 2.0), 0.0);
-            add(format!("{p}attn.kv_norm.weight"), &[hd], 0.2, 1.0);
-            add(format!("{p}attn.wo_a.weight"), &[g * r, nh * hd / g], mat(nh * hd / g, 1.0), 0.0);
-            add(format!("{p}attn.wo_b.weight"), &[h, g * r], mat(g * r, 1.0), 0.0);
-            add(format!("{p}attn.attn_sink"), &[nh], 1.0, 0.0);
-            let is_kv = c.kv_source_layer_ids.contains(&l);
-            if is_kv {
-                add(format!("{p}attn.compressor.wkv.weight"), &[hd, h], mat(h, 2.0), 0.0);
-                if ratio > 1 {
-                    add(format!("{p}attn.compressor.wgate.weight"), &[hd, h], mat(h, 3.0), 0.0);
-                }
-                add(format!("{p}attn.compressor.norm.weight"), &[hd], 0.2, 1.0);
-                add(format!("{p}attn.indexer.wk.weight"), &[di, hd], mat(hd, 2.0), 0.0);
-                add(format!("{p}attn.indexer.k_norm.weight"), &[di], 0.2, 1.0);
-            }
-            if c.index_source_layer_ids.contains(&l) {
-                add(format!("{p}attn.indexer.wq_b.weight"), &[ni * di, ql], mat(ql, 2.0), 0.0);
-                add(format!("{p}attn.indexer.weights_proj.weight"), &[ni, h], mat(h, 1.0), 0.0);
-            }
-            if let Some(li) = c.engram_layer_ids.iter().position(|&e| e == l) {
-                add(format!("{p}engram.embed.weight"), &[rows[li], ed], 1.0, 0.0);
-                add(
-                    format!("{p}engram.wkv.weight"),
-                    &[(hc + 1) * h, cols * ed],
-                    mat(cols * ed, 3.0),
-                    0.0,
-                );
-                add(format!("{p}engram.q_weight"), &[hc, h], 0.3, 1.0);
-                add(format!("{p}engram.k_weight"), &[hc, h], 0.3, 1.0);
-            }
-            add(format!("{p}ffn.gate.weight"), &[ne, h], mat(h, 3.0), 0.0);
-            add(format!("{p}ffn.gate.bias"), &[ne], 0.3, 0.0);
-            add(format!("{p}ffn.gate.bias_vl"), &[ne], 2.0, 0.0);
-            for e in (0..ne).map(|e| format!("experts.{e}")).chain(["shared_experts".to_string()]) {
-                add(format!("{p}ffn.{e}.w1.weight"), &[mi, h], mat(h, 2.0), 0.0);
-                add(format!("{p}ffn.{e}.w3.weight"), &[mi, h], mat(h, 2.0), 0.0);
-                add(format!("{p}ffn.{e}.w2.weight"), &[h, mi], mat(mi, 1.0), 0.0);
-            }
-        }
-        let mut head = serde_json::Map::new();
-        let mut data = Vec::new();
-        for (name, shape, bytes) in tensors {
-            let entry = serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [data.len(), data.len() + bytes.len()]});
-            head.insert(name, entry);
-            data.extend(bytes);
-        }
-        let mut head = serde_json::Value::Object(head).to_string();
-        while !head.len().is_multiple_of(8) {
-            head.push(' ');
-        }
-        let mut file = (head.len() as u64).to_le_bytes().to_vec();
-        file.extend_from_slice(head.as_bytes());
-        file.extend(data);
-        std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join("model.safetensors"), file).unwrap();
+        super::tiny::write_v41(dir, over).unwrap();
     }
 
     /// A tiny random V4.1 model, without a reference (tools/ref_deepseek41.py measures the

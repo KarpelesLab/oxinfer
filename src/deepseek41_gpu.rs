@@ -833,4 +833,91 @@ mod tests {
         assert_eq!(seen, want[..3]);
         assert_eq!(e.pos, base.pos + 3);
     }
+
+    /// Greedy one-token GPU steps from `t`: the logits of each.
+    fn gpu_steps(m: &DeepSeek4Model, s: &mut DeepSeek4Session, mut t: u32, n: usize, be: &'static MetalBackend) -> Vec<f32> {
+        let mut out = Vec::new();
+        for _ in 0..n {
+            let l = pass_on(m, s, &[t], false, be).expect("the GPU step did not run");
+            t = crate::sampler::argmax(&l);
+            out.extend(l);
+        }
+        out
+    }
+
+    /// A session decoded on the GPU far past a checkpoint (the device's window ring and the
+    /// host's windows overwritten and trimmed), cut back to it, decodes as a fresh session from
+    /// the same prefill, bit for bit (the device copies brought back from the host's); chained
+    /// greedy decoding too.
+    #[test]
+    fn gpu_checkpoint_cut_back_matches_fresh() {
+        let Some(be) = own_backend() else { return };
+        let files = tiny();
+        let m = DeepSeek4Model::load(super::super::tests::tiny_config(over()), &files, Quant::Bf16).unwrap();
+        let base = prefilled(&m);
+        let c = base.pos;
+        let mut a = base.clone();
+        a.checkpoint(2);
+        gpu_steps(&m, &mut a, 5, 3 * crate::deepseek4::ROLLBACK + 20, be);
+        assert!(a.layers.iter().any(|l| l.raw_start > c), "the window was not trimmed");
+        assert_eq!(a.reachable(c + 3), c);
+        a.cut_to(c).unwrap();
+        let got = gpu_steps(&m, &mut a, 9, 30, be);
+        let mut b = base.clone();
+        let want = gpu_steps(&m, &mut b, 9, 30, be);
+        assert_eq!(bits(&got), bits(&want), "one-token steps after the checkpoint");
+        // Chained, after another cut back.
+        a.cut_to(c).unwrap();
+        let mut b = base.clone();
+        let (mut ga, mut gb) = (Vec::new(), Vec::new());
+        let ka = decode_greedy_on(
+            &m,
+            &mut a,
+            11,
+            20,
+            &mut |t| {
+                ga.push(t);
+                Ch::Go
+            },
+            be,
+        );
+        let kb = decode_greedy_on(
+            &m,
+            &mut b,
+            11,
+            20,
+            &mut |t| {
+                gb.push(t);
+                Ch::Go
+            },
+            be,
+        );
+        assert_eq!((ka, &ga), (kb, &gb), "chained after the checkpoint");
+    }
+
+    /// A session decoded on the GPU, written to a snapshot and read into a fresh session (no
+    /// device state: its copies are made from the host's at its first pass), decodes on the GPU
+    /// as the original does, bit for bit.
+    #[test]
+    fn gpu_snapshot_round_trip() {
+        use crate::snapshot::{SessionState, SnapReader, SnapWriter};
+        let Some(be) = own_backend() else { return };
+        let files = tiny();
+        let m = DeepSeek4Model::load(super::super::tests::tiny_config(over()), &files, Quant::Bf16).unwrap();
+        let mut a = prefilled(&m);
+        gpu_steps(&m, &mut a, 5, 90, be);
+        let path = std::env::temp_dir().join(format!("oxinfer-ds41-gpu-snap-{}.oxsnap", std::process::id()));
+        let mut w = SnapWriter::new(std::fs::File::create(&path).unwrap()).unwrap();
+        a.write_state(&mut w).unwrap();
+        w.finish(serde_json::json!({})).unwrap();
+        let mut b = m.new_session();
+        let mut r = SnapReader::open(&path).unwrap();
+        b.read_state(&mut r).unwrap();
+        r.finish().unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(b.pos, a.pos);
+        let got = gpu_steps(&m, &mut b, 7, 20, be);
+        let want = gpu_steps(&m, &mut a, 7, 20, be);
+        assert_eq!(bits(&got), bits(&want));
+    }
 }

@@ -50,6 +50,8 @@
 
 #[path = "ernie5.rs"]
 mod ernie;
+#[path = "deepseek4_tiny.rs"]
+pub mod tiny;
 #[path = "deepseek41.rs"]
 mod v41;
 pub use ernie::{ErnieMtpDecoder, ErnieMtpSession};
@@ -370,14 +372,63 @@ pub struct DeepSeek4Session {
     )]
     gpu: crate::gpu::decode::Slot,
     gpu_kept: usize,
+    /// Checkpoints of earlier positions, lowest first ([`DeepSeek4Session::checkpoint`]; shared
+    /// by the session's copies).
+    checkpoints: Vec<std::sync::Arc<Checkpoint>>,
+}
+
+/// Most positions a session goes back without a checkpoint ([`DeepSeek4Session::truncate`]): the
+/// raw keys and the compressors' rows are kept that far beyond what attention needs.
+pub const ROLLBACK: usize = SLACK;
+
+/// What a session cannot rebuild of an earlier position once it has gone further: per layer the
+/// window's raw keys and the compressors' pending rows as they were there (the compressed keys
+/// only grow, so their count is enough). See [`DeepSeek4Session::checkpoint`].
+pub(crate) struct Checkpoint {
+    pos: usize,
+    layers: Vec<LayerMark>,
+}
+
+struct LayerMark {
+    raw: Vec<f32>,
+    raw_start: usize,
+    comp: Option<CompMark>,
+    idx: Option<CompMark>,
+}
+
+struct CompMark {
+    n: usize,
+    kv: Vec<f32>,
+    sc: Vec<f32>,
+    rows_start: usize,
+}
+
+impl CompMark {
+    fn of(c: &CompState) -> Self {
+        Self {
+            n: c.n,
+            kv: c.kv.clone(),
+            sc: c.sc.clone(),
+            rows_start: c.rows_start,
+        }
+    }
+    fn restore(&self, c: &mut CompState) {
+        c.keys.truncate(self.n * c.d);
+        c.n = self.n;
+        c.kv.clone_from(&self.kv);
+        c.sc.clone_from(&self.sc);
+        c.rows_start = self.rows_start;
+    }
 }
 
 impl DeepSeek4Session {
-    /// Drops cached positions at or beyond `pos`.
+    /// Drops cached positions at or beyond `pos` (at most [`ROLLBACK`] back, else to a
+    /// checkpoint with [`DeepSeek4Session::cut_to`]).
     pub fn truncate(&mut self, pos: usize) {
         if pos >= self.pos {
             return;
         }
+        self.checkpoints.retain(|c| c.pos <= pos);
         for st in &mut self.layers {
             assert!(pos >= st.raw_start, "rollback beyond the kept raw keys");
             st.raw.truncate((pos - st.raw_start) * self.hd);
@@ -388,6 +439,101 @@ impl DeepSeek4Session {
         self.eng.truncate(pos);
         self.pos = pos;
         self.gpu_kept = self.gpu_kept.min(pos);
+    }
+
+    /// Takes a [`Checkpoint`] of the current position (none when there is one already or `max`
+    /// is 0), keeping at most `max`: past that the lowest one (a shared prefix, say) and the
+    /// newest stay, the second lowest goes. Each holds the window's raw keys and the
+    /// compressors' pending rows of every layer (DeepSeek-V4-Flash: about 30 MB).
+    pub fn checkpoint(&mut self, max: usize) {
+        let pos = self.pos;
+        if max == 0 || pos == 0 || self.has_checkpoint(pos) {
+            return;
+        }
+        let layers = self
+            .layers
+            .iter()
+            .map(|st| LayerMark {
+                raw: st.raw.clone(),
+                raw_start: st.raw_start,
+                comp: st.comp.as_ref().map(CompMark::of),
+                idx: st.idx.as_ref().map(CompMark::of),
+            })
+            .collect();
+        let cp = std::sync::Arc::new(Checkpoint { pos, layers });
+        if std::env::var_os("OXINFER_DEBUG").is_some() {
+            let floats: usize = cp
+                .layers
+                .iter()
+                .map(|l| {
+                    l.raw.len()
+                        + [&l.comp, &l.idx]
+                            .into_iter()
+                            .flatten()
+                            .map(|c| c.kv.len() + c.sc.len())
+                            .sum::<usize>()
+                })
+                .sum();
+            eprintln!("[DeepSeek V4: checkpoint of position {pos}, {:.1} MB]", floats as f64 * 4e-6);
+        }
+        let at = self.checkpoints.partition_point(|c| c.pos < pos);
+        self.checkpoints.insert(at, cp);
+        while self.checkpoints.len() > max {
+            self.checkpoints.remove(if max > 1 { 1 } else { 0 });
+        }
+    }
+
+    /// Whether there is a checkpoint of position `pos`.
+    pub fn has_checkpoint(&self, pos: usize) -> bool {
+        self.checkpoints.iter().any(|c| c.pos == pos)
+    }
+
+    /// The positions of the checkpoints, lowest first.
+    pub fn checkpoint_positions(&self) -> Vec<usize> {
+        self.checkpoints.iter().map(|c| c.pos).collect()
+    }
+
+    /// The latest position up to `len` that the session can go back to ([`Self::cut_to`]):
+    /// `len` itself when within [`ROLLBACK`], else its latest checkpoint up to `len`, else 0.
+    pub fn reachable(&self, len: usize) -> usize {
+        if len >= self.pos {
+            return self.pos;
+        }
+        if self.pos - len <= ROLLBACK {
+            return len;
+        }
+        self.checkpoints.iter().map(|c| c.pos).filter(|&p| p <= len).max().unwrap_or(0)
+    }
+
+    /// Goes back to position `len`: within [`ROLLBACK`], or to a checkpoint of that position.
+    /// The logits from there are those of a session that ran the same tokens up to `len` (in
+    /// the same passes) and nothing after; the device's copies of the caches (V4.1 on Metal)
+    /// are brought back from the host's at the next pass.
+    pub fn cut_to(&mut self, len: usize) -> Result<()> {
+        if len >= self.pos {
+            return Ok(());
+        }
+        if self.pos - len <= ROLLBACK {
+            self.truncate(len);
+            return Ok(());
+        }
+        let Some(cp) = self.checkpoints.iter().find(|c| c.pos == len).cloned() else {
+            bail!("DeepSeek V4: no checkpoint of position {len} to go back to (at {})", self.pos);
+        };
+        for (st, m) in self.layers.iter_mut().zip(&cp.layers) {
+            st.raw.clone_from(&m.raw);
+            st.raw_start = m.raw_start;
+            for (c, mk) in [(&mut st.comp, &m.comp), (&mut st.idx, &m.idx)] {
+                if let (Some(c), Some(mk)) = (c.as_mut(), mk) {
+                    mk.restore(c);
+                }
+            }
+        }
+        self.eng.truncate(len);
+        self.pos = len;
+        self.gpu_kept = self.gpu_kept.min(len);
+        self.checkpoints.retain(|c| c.pos <= len);
+        Ok(())
     }
 
     fn trim(&mut self) {
@@ -402,6 +548,80 @@ impl DeepSeek4Session {
                 c.trim(self.pos);
             }
         }
+    }
+}
+
+/// Snapshots ([`crate::snapshot`]): the position and the engram ids, then per layer its raw keys
+/// (and the position of the first), and for its compressor and indexer the compressed keys and
+/// the rows of the windows still pooling. The host's state is the whole state (V4.1 on Metal:
+/// the device's copies are rebuilt from it at the next pass). Checkpoints are not part of it.
+impl crate::snapshot::SessionState for DeepSeek4Session {
+    fn write_state<W: std::io::Write>(&self, w: &mut crate::snapshot::SnapWriter<W>) -> Result<()> {
+        w.u64s("ds4.pos", &[self.pos as u64, self.layers.len() as u64, self.eng.len() as u64])?;
+        let eng: Vec<u32> = self.eng.iter().map(|&e| e as u32).collect();
+        w.u32s("ds4.eng", &eng)?;
+        for (l, st) in self.layers.iter().enumerate() {
+            w.u64s(&format!("ds4.{l}.raw_start"), &[st.raw_start as u64, st.raw.len() as u64])?;
+            w.f32s(&format!("ds4.{l}.raw"), &st.raw)?;
+            for (name, c) in [("comp", &st.comp), ("idx", &st.idx)] {
+                let Some(c) = c else { continue };
+                let p = format!("ds4.{l}.{name}");
+                w.u64s(&format!("{p}.n"), &[c.n as u64, c.rows_start as u64, c.kv.len() as u64])?;
+                w.f32s(&format!("{p}.keys"), &c.keys)?;
+                w.f32s(&format!("{p}.kv"), &c.kv)?;
+                w.f32s(&format!("{p}.sc"), &c.sc)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_state(&mut self, r: &mut crate::snapshot::SnapReader) -> Result<()> {
+        let h = r.u64s_exact("ds4.pos", 3)?;
+        let (pos, nl, ne) = (h[0] as usize, h[1] as usize, h[2] as usize);
+        if nl != self.layers.len() || (ne != pos && ne != 0) {
+            bail!("snapshot: the DeepSeek V4 state does not match the model");
+        }
+        let eng = r.u32s("ds4.eng", ne)?;
+        if eng.len() != ne {
+            bail!("snapshot: bad engram ids");
+        }
+        let hd = self.hd;
+        for (l, st) in self.layers.iter_mut().enumerate() {
+            let rs = r.u64s_exact(&format!("ds4.{l}.raw_start"), 2)?;
+            let (raw_start, raw_len) = (rs[0] as usize, rs[1] as usize);
+            if raw_start > pos || (raw_len != 0 && Some(raw_len) != (pos - raw_start).checked_mul(hd)) {
+                bail!("snapshot: layer {l}'s window does not match the model");
+            }
+            st.raw = r.f32s(&format!("ds4.{l}.raw"), raw_len)?;
+            st.raw_start = raw_start;
+            for (name, c) in [("comp", &mut st.comp), ("idx", &mut st.idx)] {
+                let Some(c) = c else { continue };
+                let p = format!("ds4.{l}.{name}");
+                let m = r.u64s_exact(&format!("{p}.n"), 3)?;
+                let (n, rows_start, kv_len) = (m[0] as usize, m[1] as usize, m[2] as usize);
+                let width = c.width.max(1);
+                let rows = kv_len / width;
+                if n > pos / c.ratio.max(1) || rows_start > pos || kv_len % width != 0 || rows > pos - rows_start {
+                    bail!("snapshot: layer {l}'s {name} state does not match the model");
+                }
+                let keys = n.checked_mul(c.d).context("snapshot: compressed keys")?;
+                c.keys = r.f32s(&format!("{p}.keys"), keys)?;
+                c.n = n;
+                c.kv = r.f32s(&format!("{p}.kv"), kv_len)?;
+                c.sc = r.f32s(&format!("{p}.sc"), kv_len)?;
+                c.rows_start = rows_start;
+            }
+        }
+        self.eng = eng.into_iter().map(|e| e as i32).collect();
+        self.pos = pos;
+        self.gpu = Default::default();
+        self.gpu_kept = 0;
+        self.checkpoints.clear();
+        Ok(())
+    }
+
+    fn truncatable(&self) -> bool {
+        false
     }
 }
 
@@ -906,6 +1126,7 @@ impl<'a> DeepSeek4Model<'a> {
             iv: Default::default(),
             gpu: Default::default(),
             gpu_kept: 0,
+            checkpoints: Vec::new(),
         }
     }
 
@@ -2241,112 +2462,9 @@ mod tests {
         assert_eq!(gguf_name("output_hc_fn.weight", &[16384, 4]).map(|x| x.1), Some(vec![4, 16384]));
     }
 
-    /// A deterministic uniform generator in [-1, 1).
-    struct Rng(u64);
-    impl Rng {
-        fn next(&mut self) -> f32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 40) as f32 / (1u64 << 23) as f32 - 1.0
-        }
-    }
-
-    /// Writes a tiny random checkpoint in DeepSeek's naming (float32) with a hash layer, a CSA
-    /// layer whose indexer chooses, a heavily compressed layer and a window-only one; returns its
-    /// config.
+    /// Writes the tiny random V4 checkpoint ([`tiny::write_v4`]) and returns its config.
     fn tiny_checkpoint(dir: &std::path::Path) -> DeepSeek4Config {
-        let ratios = [0usize, 4, 8, 0];
-        let c = DeepSeek4Config::from_json(serde_json::json!({
-            "hidden_size": 16, "num_hidden_layers": ratios.len(), "num_attention_heads": 2, "head_dim": 8,
-            "qk_rope_head_dim": 4, "q_lora_rank": 8, "o_groups": 2, "o_lora_rank": 4, "vocab_size": 32,
-            "n_routed_experts": 4, "n_shared_experts": 1, "num_experts_per_tok": 2, "moe_intermediate_size": 8,
-            "routed_scaling_factor": 1.5, "swiglu_limit": 1.5, "num_hash_layers": 1, "sliding_window": 4,
-            "compress_ratios": ratios, "index_n_heads": 2, "index_head_dim": 8, "index_topk": 2
-        }))
-        .unwrap();
-        let (h, nh, hd, ql) = (c.hidden_size, c.num_attention_heads, c.head_dim, c.q_lora_rank);
-        let (g, r, hc) = (c.o_groups, c.o_lora_rank, c.hc_mult);
-        let (ne, k, mi, v) = (c.n_routed_experts, c.num_experts_per_tok, c.moe_intermediate_size, c.vocab_size);
-        let (ni, di) = (c.index_n_heads, c.index_head_dim);
-        let mut rng = Rng(0x5eed);
-        let mut tensors: Vec<(String, &'static str, Vec<usize>, Vec<u8>)> = Vec::new();
-        // `scale` times uniform noise, plus `bias`.
-        let mut add = |name: String, shape: &[usize], scale: f32, bias: f32| {
-            let n: usize = shape.iter().product();
-            let bytes = (0..n).flat_map(|_| (bias + scale * rng.next()).to_le_bytes()).collect();
-            tensors.push((name, "F32", shape.to_vec(), bytes));
-        };
-        let mat = |fan_in: usize, gain: f32| gain * (3.0 / fan_in as f32).sqrt();
-        add("embed.weight".into(), &[v, h], 1.7, 0.0);
-        add("head.weight".into(), &[v, h], mat(h, 4.0), 0.0);
-        add("norm.weight".into(), &[h], 0.2, 1.0);
-        add("hc_head_fn".into(), &[hc, hc * h], mat(hc * h, 4.0), 0.0);
-        add("hc_head_base".into(), &[hc], 0.5, 0.0);
-        add("hc_head_scale".into(), &[1], 0.25, 0.75);
-        for (l, &ratio) in ratios.iter().enumerate() {
-            let p = format!("layers.{l}.");
-            let mix = (2 + hc) * hc;
-            for part in ["attn", "ffn"] {
-                add(format!("{p}{part}_norm.weight"), &[h], 0.2, 1.0);
-                add(format!("{p}hc_{part}_fn"), &[mix, hc * h], mat(hc * h, 4.0), 0.0);
-                add(format!("{p}hc_{part}_base"), &[mix], 0.5, 0.0);
-                add(format!("{p}hc_{part}_scale"), &[3], 0.25, 0.75);
-            }
-            add(format!("{p}attn.wq_a.weight"), &[ql, h], mat(h, 2.0), 0.0);
-            add(format!("{p}attn.q_norm.weight"), &[ql], 0.2, 1.0);
-            add(format!("{p}attn.wq_b.weight"), &[nh * hd, ql], mat(ql, 2.0), 0.0);
-            add(format!("{p}attn.wkv.weight"), &[hd, h], mat(h, 2.0), 0.0);
-            add(format!("{p}attn.kv_norm.weight"), &[hd], 0.2, 1.0);
-            add(format!("{p}attn.wo_a.weight"), &[g * r, nh * hd / g], mat(nh * hd / g, 1.0), 0.0);
-            add(format!("{p}attn.wo_b.weight"), &[h, g * r], mat(g * r, 1.0), 0.0);
-            add(format!("{p}attn.attn_sink"), &[nh], 1.0, 0.0);
-            let mut compressor = |p: String, d: usize| {
-                let w = if ratio == 4 { 2 * d } else { d };
-                add(format!("{p}wkv.weight"), &[w, h], mat(h, 1.0), 0.0);
-                add(format!("{p}wgate.weight"), &[w, h], mat(h, 3.0), 0.0);
-                add(format!("{p}ape"), &[ratio, w], 0.5, 0.0);
-                add(format!("{p}norm.weight"), &[d], 0.2, 1.0);
-            };
-            if ratio > 0 {
-                compressor(format!("{p}attn.compressor."), hd);
-            }
-            if ratio == 4 {
-                compressor(format!("{p}attn.indexer.compressor."), di);
-                add(format!("{p}attn.indexer.wq_b.weight"), &[ni * di, ql], mat(ql, 2.0), 0.0);
-                add(format!("{p}attn.indexer.weights_proj.weight"), &[ni, h], mat(h, 1.0), 0.0);
-            }
-            add(format!("{p}ffn.gate.weight"), &[ne, h], mat(h, 3.0), 0.0);
-            if l >= c.num_hash_layers {
-                add(format!("{p}ffn.gate.bias"), &[ne], 0.3, 0.0);
-            }
-            for e in (0..ne).map(|e| format!("experts.{e}")).chain(["shared_experts".to_string()]) {
-                add(format!("{p}ffn.{e}.w1.weight"), &[mi, h], mat(h, 2.0), 0.0);
-                add(format!("{p}ffn.{e}.w3.weight"), &[mi, h], mat(h, 2.0), 0.0);
-                add(format!("{p}ffn.{e}.w2.weight"), &[h, mi], mat(mi, 1.0), 0.0);
-            }
-        }
-        // The hash layer's experts of each token id (distinct).
-        let tab: Vec<u8> = (0..v)
-            .flat_map(|t| (0..k).map(move |j| ((t * 3 + j * (1 + t % (ne - 1))) % ne) as i32))
-            .flat_map(|e| e.to_le_bytes())
-            .collect();
-        tensors.push(("layers.0.ffn.gate.tid2eid".into(), "I32", vec![v, k], tab));
-        let mut head = serde_json::Map::new();
-        let mut data = Vec::new();
-        for (name, dtype, shape, bytes) in tensors {
-            let entry = serde_json::json!({"dtype": dtype, "shape": shape, "data_offsets": [data.len(), data.len() + bytes.len()]});
-            head.insert(name, entry);
-            data.extend(bytes);
-        }
-        let mut head = serde_json::Value::Object(head).to_string();
-        while !head.len().is_multiple_of(8) {
-            head.push(' ');
-        }
-        let mut file = (head.len() as u64).to_le_bytes().to_vec();
-        file.extend_from_slice(head.as_bytes());
-        file.extend(data);
-        std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join("model.safetensors"), file).unwrap();
-        c
+        tiny::write_v4(dir, serde_json::json!({})).unwrap()
     }
 
     /// Runtime interventions on a tiny random model, without a reference: every kind of hook
@@ -2547,5 +2665,130 @@ mod tests {
             assert!((row - 1.0).abs() < 1e-3 && (col - 1.0).abs() < 1e-5, "{row} {col}");
         }
         assert!(pre.iter().all(|&p| p > 0.0 && p < 1.01) && post.iter().all(|&p| p > 0.0 && p < 2.0));
+    }
+
+    /// The tiny V4 and V4.1 models (`tag` names the checkpoint folder).
+    fn tiny_models(tag: &str) -> Vec<(&'static str, &'static DeepSeek4Model<'static>)> {
+        let mut out = Vec::new();
+        for v41 in [false, true] {
+            let dir = std::env::temp_dir().join(format!("oxinfer-ds4-{tag}-{v41}-{}", std::process::id()));
+            let cfg = if v41 {
+                tiny::write_v41(&dir, serde_json::json!({})).unwrap()
+            } else {
+                tiny::write_v4(&dir, serde_json::json!({})).unwrap()
+            };
+            let files: &'static ModelFiles = Box::leak(Box::new(ModelFiles::open(&dir, true).unwrap()));
+            std::fs::remove_dir_all(&dir).ok();
+            let m = Box::leak(Box::new(DeepSeek4Model::load(cfg, files, Quant::Bf16).unwrap()));
+            out.push((if v41 { "V4.1" } else { "V4" }, &*m));
+        }
+        out
+    }
+
+    fn tokens(n: usize, salt: usize, v: usize) -> Vec<u32> {
+        (0..n).map(|i| ((i * 7 + salt * 11 + i / 5) % v) as u32).collect()
+    }
+
+    /// Runs `ids` in passes of `pass` tokens; the logits after each pass.
+    fn run(m: &DeepSeek4Model, sess: &mut DeepSeek4Session, ids: &[u32], pass: usize) -> Vec<f32> {
+        ids.chunks(pass).flat_map(|c| m.forward(sess, c)).collect()
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// A session that ran far past a checkpoint (its windows and compressors' rows trimmed),
+    /// cut back to it and fed other tokens gives the logits of a fresh session that ran the same
+    /// passes up to it, bit for bit; going back a few positions from there works as before.
+    #[test]
+    fn checkpoint_cut_back_matches_fresh() {
+        for (name, m) in tiny_models("cp") {
+            let v = m.cfg.vocab_size;
+            for pass in [1, 9, 64] {
+                let (c, past) = (100, 300);
+                let first = tokens(c + past, 0, v);
+                let next = tokens(60, 3, v);
+                let mut a = m.new_session();
+                run(m, &mut a, &first[..c], pass);
+                a.checkpoint(2);
+                run(m, &mut a, &first[c..], pass);
+                assert!(a.layers.iter().any(|l| l.raw_start > c), "{name}: the window was not trimmed");
+                assert_eq!(a.reachable(c + 5), c);
+                assert_eq!(a.reachable(a.pos - 10), a.pos - 10);
+                assert_eq!(a.reachable(c - 1), 0);
+                assert!(a.cut_to(c + 5).is_err());
+                a.cut_to(c).unwrap();
+                assert_eq!(a.pos, c);
+                let got = run(m, &mut a, &next[..40], pass);
+                let mut b = m.new_session();
+                run(m, &mut b, &first[..c], pass);
+                let want = run(m, &mut b, &next[..40], pass);
+                assert_eq!(bits(&got), bits(&want), "{name}: after the checkpoint (passes of {pass})");
+                // A few back from the end, as before.
+                a.truncate(c + 20);
+                b.truncate(c + 20);
+                let got = run(m, &mut a, &next[40..], pass);
+                let want = run(m, &mut b, &next[40..], pass);
+                assert_eq!(bits(&got), bits(&want), "{name}: going back after a restore (passes of {pass})");
+            }
+        }
+    }
+
+    /// Checkpoints past the cap: the lowest and the newest stay; a rollback before one drops it.
+    #[test]
+    fn checkpoint_cap_keeps_lowest_and_newest() {
+        let (_, m) = tiny_models("cap")[0];
+        let t = tokens(120, 1, m.cfg.vocab_size);
+        let mut s = m.new_session();
+        for end in [10, 30, 50, 80, 120] {
+            let from = s.pos;
+            run(m, &mut s, &t[from..end], 64);
+            s.checkpoint(2);
+        }
+        assert_eq!(s.checkpoint_positions(), vec![10, 120]);
+        assert!(s.has_checkpoint(10) && !s.has_checkpoint(30));
+        s.truncate(100);
+        assert_eq!(s.checkpoint_positions(), vec![10]);
+        s.cut_to(10).unwrap();
+        assert_eq!(s.checkpoint_positions(), vec![10]);
+        let mut off = m.new_session();
+        run(m, &mut off, &t[..20], 64);
+        off.checkpoint(0);
+        assert!(off.checkpoint_positions().is_empty());
+    }
+
+    /// A session written to a snapshot and read into a fresh one continues as the original does,
+    /// bit for bit; a snapshot of the other version is refused.
+    #[test]
+    fn snapshot_round_trip() {
+        use crate::snapshot::{SessionState, SnapReader, SnapWriter};
+        let models = tiny_models("snap");
+        for (i, &(name, m)) in models.iter().enumerate() {
+            let t = tokens(330, 2, m.cfg.vocab_size);
+            let mut a = m.new_session();
+            run(m, &mut a, &t[..300], 32);
+            a.checkpoint(2);
+            let path = std::env::temp_dir().join(format!("oxinfer-ds4-snap-{i}-{}.oxsnap", std::process::id()));
+            let mut w = SnapWriter::new(std::fs::File::create(&path).unwrap()).unwrap();
+            a.write_state(&mut w).unwrap();
+            w.finish(serde_json::json!({})).unwrap();
+            let mut b = m.new_session();
+            let mut r = SnapReader::open(&path).unwrap();
+            b.read_state(&mut r).unwrap();
+            r.finish().unwrap();
+            assert_eq!(b.pos, 300);
+            assert!(b.checkpoint_positions().is_empty());
+            assert!(!b.truncatable());
+            let got = run(m, &mut b, &t[300..], 1);
+            let want = run(m, &mut a, &t[300..], 1);
+            assert_eq!(bits(&got), bits(&want), "{name}");
+            // The other version's session does not take it.
+            let (_, other) = models[1 - i];
+            let mut c = other.new_session();
+            let mut r = SnapReader::open(&path).unwrap();
+            assert!(c.read_state(&mut r).is_err(), "{name}: read by the other version");
+            std::fs::remove_file(&path).ok();
+        }
     }
 }
