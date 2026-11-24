@@ -1169,6 +1169,52 @@ fn prompt_cache_across_restarts() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A thinking conversation on a tiny random Inkling-2-Mini: each request extends the previous
+/// one with the reply as returned (its `reasoning_content` too, which the re-rendered
+/// conversation leaves out, so the reply's tokens differ from those in the cache). The second
+/// and third turns still reuse the cache up to the previous prompt.
+#[test]
+fn inkling_chat_reuses_the_cache_after_thinking() {
+    let dir = std::env::temp_dir().join(format!("oxinfer-ink-server-{}", std::process::id()));
+    oxinfer::inkling::tiny::write_tiny(&dir, 5).unwrap();
+    let s = serve(&format!("model=ink={},device=cpu", dir.display()));
+    let ask = |messages: &[Value]| {
+        let req = json!({"model": "ink", "messages": messages, "temperature": 0, "max_tokens": 80});
+        let (st, body) = request(s.addr(), "POST", "/v1/chat/completions", &req.to_string());
+        assert_eq!(st, 200, "{body}");
+        serde_json::from_str::<Value>(&body).unwrap()
+    };
+    let mut convo = vec![
+        json!({"role": "system", "content": "You are a careful assistant. ".repeat(8)}),
+        json!({"role": "user", "content": "What is the tallest mountain?"}),
+    ];
+    let mut prompt = 0;
+    for (turn, next) in ["And the second tallest?", "Thanks. Which one is harder to climb?", ""]
+        .into_iter()
+        .enumerate()
+    {
+        let v = ask(&convo);
+        let usage = &v["usage"];
+        let cached = usage["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0) as usize;
+        if turn > 0 {
+            assert!(
+                cached + 1 >= prompt,
+                "turn {turn}: {cached} cached tokens of the previous prompt's {prompt}: {v}"
+            );
+        }
+        prompt = usage["prompt_tokens"].as_u64().unwrap() as usize;
+        let m = &v["choices"][0]["message"];
+        convo.push(json!({
+            "role": "assistant",
+            "content": m["content"].as_str().unwrap_or_default(),
+            "reasoning_content": m["reasoning_content"].as_str().unwrap_or("Let me think about mountains."),
+        }));
+        convo.push(json!({"role": "user", "content": next}));
+    }
+    s.stop().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 fn b64_decode(s: &str) -> Option<Vec<u8>> {

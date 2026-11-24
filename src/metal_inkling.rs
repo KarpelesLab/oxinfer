@@ -31,7 +31,8 @@ use crate::generate::Chain;
 use crate::ggml::GgmlType;
 use crate::gpu::WeightRef;
 use crate::inkling::{
-    DevBox, DevEngine, DevSession, DevWant, InNorm, Inkling2Model, Inkling2Session, KvCache, KvConv, LayerState, ROLLBACK,
+    Checkpoint, DevBox, DevEngine, DevSession, DevWant, InNorm, Inkling2Model, Inkling2Session, KvCache, KvConv, KvRows, LayerState,
+    ROLLBACK, SlotCheckpoint,
 };
 use crate::model::Lin;
 use std::fmt::Write as _;
@@ -1248,6 +1249,147 @@ impl DevSession for InkDev {
         self.pos = len;
         true
     }
+    /// (Between passes nothing runs on the device: the buffers are read and written in place.)
+    fn checkpoint(&self, pos: usize, shape: &[LayerState], keep: &[usize]) -> Option<Vec<SlotCheckpoint>> {
+        if pos != self.pos || shape.len() != self.slots.len() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(self.slots.len());
+        for ((s, st), &k) in self.slots.iter().zip(shape).zip(keep) {
+            let (first, kr, vr) = if k > 0 && s.ring != 0 {
+                let lo = pos.saturating_sub(k);
+                if pos - lo > s.ring {
+                    return None;
+                }
+                let (kr, vr) = s.read_rows(lo, pos);
+                (lo, kr, vr)
+            } else if k == 0 && s.ring == 0 {
+                (pos, KvRows::new(s.fmt), KvRows::new(s.fmt))
+            } else {
+                return None;
+            };
+            let mut conv: [Vec<f32>; 4] = Default::default();
+            for ((c, hr), &(_, p, n)) in conv.iter_mut().zip(&st.hist).zip(&s.rings) {
+                let (back, ch) = (hr.back, hr.ch);
+                if hr.rows.len() != n {
+                    return None;
+                }
+                let cap = n / ch;
+                for j in 0..back {
+                    let slot = (pos + j) % cap;
+                    let row = unsafe { std::slice::from_raw_parts((p as *const f32).add(slot * ch), ch) };
+                    c.extend_from_slice(row);
+                }
+            }
+            out.push(SlotCheckpoint { first, k: kr, v: vr, conv });
+        }
+        Some(out)
+    }
+    fn restore(&mut self, cp: &Checkpoint, shape: &[LayerState]) -> bool {
+        let pos = cp.pos;
+        if pos > self.pos || cp.slots.len() != self.slots.len() || shape.len() != self.slots.len() {
+            return false;
+        }
+        // Everything is checked before anything is written.
+        for ((s, c), st) in self.slots.iter().zip(&cp.slots).zip(shape) {
+            let sliding_ok = if s.ring != 0 {
+                let n = pos.saturating_sub(c.first) * s.kw;
+                let held = |r: &KvRows| match r.mode {
+                    KvCache::F32 => r.f.len() == n,
+                    KvCache::F16 => r.h.len() == n,
+                    KvCache::Q8 => r.q.len() == n && r.s.len() == n / 32,
+                };
+                c.k.mode == s.fmt && c.v.mode == s.fmt && pos >= c.first && pos - c.first <= s.ring && held(&c.k) && held(&c.v)
+            } else {
+                c.first == pos
+            };
+            let conv_ok = c
+                .conv
+                .iter()
+                .zip(&st.hist)
+                .zip(&s.rings)
+                .all(|((v, hr), r)| hr.rows.len() == r.2 && v.len() == hr.back * hr.ch);
+            if !sliding_ok || !conv_ok {
+                return false;
+            }
+        }
+        for ((s, c), st) in self.slots.iter().zip(&cp.slots).zip(shape) {
+            if s.ring != 0 {
+                s.write_rows(c.first, pos, &c.k, &c.v);
+            }
+            for ((v, hr), &(_, p, n)) in c.conv.iter().zip(&st.hist).zip(&s.rings) {
+                let (back, ch) = (hr.back, hr.ch);
+                let cap = n / ch;
+                for j in 0..back {
+                    // (Position `pos - back + j` is in slot `pos + j` modulo the capacity.)
+                    let slot = (pos + j) % cap;
+                    unsafe { std::ptr::copy_nonoverlapping(v[j * ch..].as_ptr(), (p as *mut f32).add(slot * ch), ch) };
+                }
+            }
+        }
+        self.pos = pos;
+        true
+    }
+    fn download_into(&self, layers: &mut [LayerState], pos: usize) -> bool {
+        if pos != self.pos || layers.len() != self.slots.len() {
+            return false;
+        }
+        self.download(layers, pos);
+        true
+    }
+}
+
+impl SlotDev {
+    /// The keys and values of positions `first..pos` (rows the slot holds).
+    fn read_rows(&self, first: usize, pos: usize) -> (KvRows, KvRows) {
+        let rb = row_bytes(self.fmt, self.kw);
+        let (mut kr, mut vr) = (KvRows::new(self.fmt), KvRows::new(self.fmt));
+        for (rows, src, sc) in [(&mut kr, self.k.1, self.ks.1), (&mut vr, self.v.1, self.vs.1)] {
+            for p in first..pos {
+                let r = if self.ring != 0 { p % self.ring } else { p };
+                unsafe {
+                    let at = src.add(r * rb);
+                    match self.fmt {
+                        KvCache::F32 => rows.f.extend_from_slice(std::slice::from_raw_parts(at as *const f32, self.kw)),
+                        KvCache::F16 => rows.h.extend_from_slice(std::slice::from_raw_parts(at as *const u16, self.kw)),
+                        KvCache::Q8 => {
+                            rows.q.extend_from_slice(std::slice::from_raw_parts(at as *const i8, self.kw));
+                            rows.s
+                                .extend_from_slice(std::slice::from_raw_parts((sc as *const f32).add(r * self.kw / 32), self.kw / 32));
+                        }
+                    }
+                }
+            }
+        }
+        (kr, vr)
+    }
+
+    /// Writes the keys and values of positions `first..pos` (as [`SlotDev::read_rows`] gives
+    /// them) into the slot's rows of those positions.
+    fn write_rows(&self, first: usize, pos: usize, kr: &KvRows, vr: &KvRows) {
+        let rb = row_bytes(self.fmt, self.kw);
+        let kw = self.kw;
+        for (rows, dst, dsc) in [(kr, self.k.1, self.ks.1), (vr, self.v.1, self.vs.1)] {
+            for (i, p) in (first..pos).enumerate() {
+                let r = if self.ring != 0 { p % self.ring } else { p };
+                unsafe {
+                    let at = dst.add(r * rb);
+                    match self.fmt {
+                        KvCache::F32 => std::ptr::copy_nonoverlapping(rows.f[i * kw..].as_ptr() as *const u8, at, rb),
+                        KvCache::F16 => std::ptr::copy_nonoverlapping(rows.h[i * kw..].as_ptr() as *const u8, at, rb),
+                        KvCache::Q8 => {
+                            std::ptr::copy_nonoverlapping(rows.q[i * kw..].as_ptr() as *const u8, at, rb);
+                            std::ptr::copy_nonoverlapping(
+                                rows.s[i * kw / 32..].as_ptr() as *const u8,
+                                dsc.add(r * kw / 32 * 4),
+                                kw / 32 * 4,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl InkDev {
@@ -1255,25 +1397,7 @@ impl InkDev {
     fn download(&self, layers: &mut [LayerState], pos: usize) {
         for (s, st) in self.slots.iter().zip(layers.iter_mut()) {
             let first = if s.ring != 0 { pos.saturating_sub(s.ring) } else { 0 };
-            let rb = row_bytes(s.fmt, s.kw);
-            for (rows, src, sc) in [(&mut st.k, s.k.1, s.ks.1), (&mut st.v, s.v.1, s.vs.1)] {
-                *rows = crate::inkling::KvRows::new(s.fmt);
-                for p in first..pos {
-                    let r = if s.ring != 0 { p % s.ring } else { p };
-                    unsafe {
-                        let at = src.add(r * rb);
-                        match s.fmt {
-                            KvCache::F32 => rows.f.extend_from_slice(std::slice::from_raw_parts(at as *const f32, s.kw)),
-                            KvCache::F16 => rows.h.extend_from_slice(std::slice::from_raw_parts(at as *const u16, s.kw)),
-                            KvCache::Q8 => {
-                                rows.q.extend_from_slice(std::slice::from_raw_parts(at as *const i8, s.kw));
-                                rows.s
-                                    .extend_from_slice(std::slice::from_raw_parts((sc as *const f32).add(r * s.kw / 32), s.kw / 32));
-                            }
-                        }
-                    }
-                }
-            }
+            (st.k, st.v) = s.read_rows(first, pos);
             st.first = first;
             for (ring, (_, p, n)) in st.hist.iter_mut().zip(&s.rings) {
                 debug_assert_eq!(ring.rows.len(), *n);
@@ -1399,6 +1523,14 @@ impl Lib {
 
 /// Builds the engine of `m` on the active Metal backend; None when the model or its weights are
 /// not for these kernels (it then runs on the CPU).
+/// Tests: the engine on a Metal backend of its own (the process's active backend may be the CPU,
+/// which other tests ask for).
+#[cfg(test)]
+pub(crate) fn build_own(m: &Inkling2Model) -> Option<Box<dyn DevEngine>> {
+    let be: &'static MetalBackend = Box::leak(Box::new(MetalBackend::new().ok()?));
+    InkMetal::new(be, m).ok().map(|e| Box::new(e) as Box<dyn DevEngine>)
+}
+
 pub(crate) fn build(m: &Inkling2Model) -> Option<Box<dyn DevEngine>> {
     let be: &'static MetalBackend = crate::gpu::active()?.as_any()?.downcast_ref::<MetalBackend>()?;
     match InkMetal::new(be, m) {
@@ -4154,6 +4286,10 @@ impl DevEngine for InkMetal {
 
     fn rollback(&self) -> usize {
         ROLLBACK
+    }
+
+    fn snapshots(&self) -> bool {
+        true
     }
 
     fn forward(&self, m: &Inkling2Model, sess: &mut Inkling2Session, x: &[f32], t: usize) -> Vec<f32> {

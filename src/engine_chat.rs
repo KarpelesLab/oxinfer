@@ -105,7 +105,10 @@ impl Engine {
     /// (the same conversation with the reply and new messages appended, the reply rendered as the
     /// model wrote it), only the new tokens are fed ([`Stats::cached_tokens`]); models without
     /// recurrent state (Gemma, Qwen3, Llama) also keep the part the conversations share when
-    /// they differ later. Otherwise the conversation starts over, or, with a prompt cache
+    /// they differ later, and Inkling-2 the part up to its latest checkpoint within it
+    /// ([`EngineOptions::prompt_checkpoints`]: the shared system prefix and each prompt but its
+    /// last token, so a next turn whose past reply lost its thinking reuses the whole previous
+    /// prompt). Otherwise the conversation starts over, or, with a prompt cache
     /// ([`EngineOptions::prompt_cache`]), from the stored snapshot that saves the most. Prompts
     /// with attachments in the reused part always start over (the cached soft tokens might be of
     /// other media).
@@ -118,16 +121,16 @@ impl Engine {
         let placeholder = |t: &u32| feats.iter().any(|f| f.token_id == *t);
         let truncatable = self.lm.truncatable();
         let common = |c: &[u32]| c.iter().zip(&ids).take_while(|(a, b)| a == b).count();
-        // What the cache in memory saves.
+        // What the cache in memory saves: all of it when the conversation extends it, else the
+        // common prefix as far as the cache can be cut back (models without recurrent state: all
+        // of it; Inkling-2: to a checkpoint, see `prompt_checkpoints`).
         let mut skip = match self.chat_ids.take() {
             Some(c) if self.context_len() == c.len() => {
                 let n = common(&c);
                 if n == c.len() && n < ids.len() {
                     n
-                } else if truncatable {
-                    n.min(ids.len() - 1)
                 } else {
-                    0
+                    self.lm.reachable(n.min(ids.len() - 1))
                 }
             }
             _ => 0,
@@ -169,8 +172,11 @@ impl Engine {
             }
         } else if skip > 0 && skip < self.context_len() {
             self.flush_prompt_cache_logged();
-            self.lm.truncate_to(skip);
-            self.history.truncate(skip);
+            if self.lm.cut_to(skip) {
+                self.history.truncate(skip);
+            } else {
+                skip = 0;
+            }
         }
         if skip == 0 {
             self.flush_prompt_cache_logged();
@@ -179,27 +185,44 @@ impl Engine {
         let restore_secs = if restored > 0 { self.stats.restore_secs } else { 0.0 };
         // Models with recurrent state cannot cut a snapshot back: store the prefix that every
         // conversation with this system prompt and tools shares, and the whole prompt but its
-        // last token (a request sent again, a reply regenerated), the first time each is
-        // computed.
+        // last token (a request sent again, a reply regenerated, or the next turn, whose
+        // rendering of this reply differs from the tokens the model wrote: its thinking goes),
+        // the first time each is computed. Inkling-2 also keeps checkpoints of them in memory,
+        // to go back to the next time.
         let (cached, mut pre_secs) = (skip, 0.0);
-        if self.pcache.is_some() && !truncatable {
+        let checkpoints = self.checkpoints > 0 && self.lm.checkpoints();
+        if (self.pcache.is_some() && !truncatable) || checkpoints {
             let shared = self.shared_prefix_len(messages, &ids);
             for b in [shared, ids.len() - 1] {
-                let covered = self
-                    .pcache
-                    .as_ref()
-                    .is_some_and(|pc| pc.covers(&self.fingerprint, &ids[..b], false));
-                if b >= self.pcache_min && b > skip && b < ids.len() && !covered && !ids[..b].iter().any(placeholder) {
-                    let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+                if b == 0 || b < skip || b >= ids.len() || ids[..b].iter().any(placeholder) {
+                    continue;
+                }
+                let store = self.pcache.is_some()
+                    && !truncatable
+                    && b > skip
+                    && b >= self.pcache_min
+                    && !self
+                        .pcache
+                        .as_ref()
+                        .is_some_and(|pc| pc.covers(&self.fingerprint, &ids[..b], false));
+                let checkpoint = checkpoints && !self.lm.has_checkpoint(b);
+                if !store && !checkpoint {
+                    continue;
+                }
+                let _run = RUN.lock().unwrap_or_else(|p| p.into_inner());
+                if b > skip {
                     let t = Instant::now();
                     self.lm.prefill_only(&ids[skip..b], self.prefill_chunk)?;
                     pre_secs += t.elapsed().as_secs_f64();
                     self.history.extend_from_slice(&ids[skip..b]);
-                    if let Err(e) = self.store_snapshot() {
-                        eprintln!("[prompt cache: {e:#}]");
-                    }
                     skip = b;
                     self.chat_ids = None;
+                }
+                if checkpoint {
+                    self.lm.checkpoint(self.checkpoints);
+                }
+                if store && let Err(e) = self.store_snapshot() {
+                    eprintln!("[prompt cache: {e:#}]");
                 }
             }
         }

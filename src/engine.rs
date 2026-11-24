@@ -330,7 +330,7 @@ pub struct EngineOptions {
     /// `/tmp` is refused. Key `prompt_cache` (a directory, `auto` for
     /// [`crate::snapshot::default_dir`], empty or `none` for none). Families: Gemma 4 / 3, Qwen
     /// (Qwen3, Qwen3.5 / 3.6 / 3.8 dense and MoE, Qwen2.5-VL), Llama 3, with or without their
-    /// DSpark / MTP drafts; not Mistral Large 4, DeepSeek V4, Qwen4-Exp, Core ML, nor the Gemma 4
+    /// DSpark / MTP drafts, Inkling-2 without a draft (CPU and Metal); not Mistral Large 4, DeepSeek V4, Qwen4-Exp, Core ML, nor the Gemma 4
     /// assistant drafter's state (none: it keeps no cache).
     pub prompt_cache: Option<PathBuf>,
     /// Size cap of the prompt cache in GB (default [`crate::snapshot::DEFAULT_CAP_GB`]). Key
@@ -339,7 +339,20 @@ pub struct EngineOptions {
     /// Shortest conversation (in tokens) the prompt cache stores (default 64). Key
     /// `prompt_cache_min_tokens`.
     pub prompt_cache_min_tokens: Option<usize>,
+    /// Inkling-2: in-memory checkpoints [`Engine::chat`] keeps of a conversation's prompt (the
+    /// prefix shared by every conversation with the same system prompt and tools, and each
+    /// prompt but its last token), so that the next conversation can reuse the cache up to
+    /// one of them after a mismatch (a past reply rendered without its thinking, an edited
+    /// message) instead of starting over: the model's convolutions and sliding windows cannot be
+    /// cut back further than 64 positions otherwise. Each holds the sliding layers' last window
+    /// of keys and values (Inkling-2-Mini: about 650 MB with f32 caches, 180 MB with q8). Past
+    /// the cap the lowest one and the newest stay. Default [`DEFAULT_PROMPT_CHECKPOINTS`], 0
+    /// turns them off. Key `prompt_checkpoints`.
+    pub prompt_checkpoints: Option<usize>,
 }
+
+/// Default of [`EngineOptions::prompt_checkpoints`].
+pub const DEFAULT_PROMPT_CHECKPOINTS: usize = 2;
 
 /// Whether a model's weights stream from storage ([`EngineOptions::stream_mode`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -512,6 +525,7 @@ impl Default for EngineOptions {
             prompt_cache: None,
             prompt_cache_gb: None,
             prompt_cache_min_tokens: None,
+            prompt_checkpoints: None,
         }
     }
 }
@@ -602,6 +616,7 @@ impl EngineOptions {
         "prompt_cache",
         "prompt_cache_gb",
         "prompt_cache_min_tokens",
+        "prompt_checkpoints",
     ];
 
     /// Sets an option by name (see the field docs for the keys). Unknown keys are errors.
@@ -788,6 +803,16 @@ impl EngineOptions {
                 }
             }
             "prompt_cache_min_tokens" => self.prompt_cache_min_tokens = parse_opt_usize(key, value)?,
+            "prompt_checkpoints" => {
+                self.prompt_checkpoints = match value.trim() {
+                    "" | "auto" => None,
+                    "off" | "none" => Some(0),
+                    v => Some(
+                        v.parse()
+                            .with_context(|| format!("{key}: expected a number of checkpoints, got {v:?}"))?,
+                    ),
+                }
+            }
             "interventions" => {
                 self.interventions = match value.trim() {
                     "" => None,
@@ -1276,6 +1301,7 @@ impl Lm {
             Lm::QwenMtp { dec } => dec.write_state(w),
             Lm::QwenDspark { dec } => dec.write_state(w),
             Lm::GemmaDspark { dec } => dec.write_state(w),
+            Lm::Inkling2 { sess, .. } => sess.write_state(w),
             _ => bail!("session snapshots are not supported for this model family"),
         }
     }
@@ -1288,6 +1314,7 @@ impl Lm {
             Lm::QwenMtp { dec } => dec.read_state(r),
             Lm::QwenDspark { dec } => dec.read_state(r),
             Lm::GemmaDspark { dec } => dec.read_state(r),
+            Lm::Inkling2 { sess, .. } => sess.read_state(r),
             _ => bail!("session snapshots are not supported for this model family"),
         }
     }
@@ -1298,8 +1325,54 @@ impl Lm {
             Lm::Qwen { sess, .. } => sess.exp.is_none(),
             Lm::QwenMtp { dec } => dec.sess.exp.is_none(),
             Lm::QwenDspark { dec } => dec.sess.exp.is_none(),
+            Lm::Inkling2 { model, .. } => model.snapshots(),
             _ => false,
         }
+    }
+    /// Whether the cache can go back to positions it took a checkpoint of (Inkling-2, whose
+    /// convolutions and sliding windows cannot be cut back further than a few positions).
+    fn checkpoints(&self) -> bool {
+        matches!(self, Lm::Inkling2 { .. })
+    }
+    /// Takes a checkpoint of the current position, keeping at most `max` ([`Lm::checkpoints`]).
+    fn checkpoint(&mut self, max: usize) {
+        if let Lm::Inkling2 { model, sess } = self {
+            model.checkpoint(sess, max);
+        }
+    }
+    /// Whether there is a checkpoint of position `pos`.
+    fn has_checkpoint(&self, pos: usize) -> bool {
+        match self {
+            Lm::Inkling2 { model, sess } => model.has_checkpoint(sess, pos),
+            _ => false,
+        }
+    }
+    /// The latest position up to `len` (below the current one) that the cache can be cut back
+    /// to ([`Lm::cut_to`]); 0 when none.
+    fn reachable(&self, len: usize) -> usize {
+        match self {
+            Lm::Inkling2 { model, sess } => model.reachable(sess, len),
+            _ if self.truncatable() => len,
+            _ => 0,
+        }
+    }
+    /// Cuts the cache back to `len`, a position [`Lm::reachable`] gave; false when it could not
+    /// (the cache must then start over).
+    fn cut_to(&mut self, len: usize) -> bool {
+        if let Lm::Inkling2 { model, sess } = self {
+            return match model.cut_to(sess, len) {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("[{e:#}]");
+                    false
+                }
+            };
+        }
+        if !self.truncatable() {
+            return false;
+        }
+        self.truncate_to(len);
+        true
     }
     /// Whether the cache can be cut back to any earlier position (no recurrent state).
     fn truncatable(&self) -> bool {
@@ -1329,6 +1402,7 @@ impl Lm {
             Lm::QwenMtp { dec } => drop(dec.prefill(ids, chunk)),
             Lm::QwenDspark { dec } => drop(dec.prefill(ids, chunk)),
             Lm::GemmaDspark { dec } => drop(dec.prefill(ids, chunk)),
+            Lm::Inkling2 { model, sess } => drop(generate::prefill(*model, sess, ids, chunk, &[])),
             _ => bail!("not supported for this model family"),
         }
         Ok(())
@@ -1543,6 +1617,8 @@ pub struct Engine {
     pcache: Option<crate::snapshot::PromptCache>,
     pcache_min: usize,
     pcache_pending: bool,
+    /// Prompt checkpoints kept ([`EngineOptions::prompt_checkpoints`]).
+    checkpoints: usize,
     /// Identifies the model and the settings its state depends on, for snapshots.
     fingerprint: String,
     /// What [`fingerprint`] hashes besides the LoRA adapters.
@@ -2456,6 +2532,7 @@ impl Engine {
             pcache,
             pcache_min: opts.prompt_cache_min_tokens.unwrap_or(64),
             pcache_pending: false,
+            checkpoints: opts.prompt_checkpoints.unwrap_or(DEFAULT_PROMPT_CHECKPOINTS),
             omni_voice: None,
             fingerprint: String::new(),
             fingerprint_source: String::new(),
@@ -2533,6 +2610,7 @@ impl Engine {
             pcache: None,
             pcache_min: 0,
             pcache_pending: false,
+            checkpoints: 0,
             omni_voice: None,
             fingerprint: String::new(),
             fingerprint_source: String::new(),
@@ -4191,6 +4269,13 @@ mod tests {
         o.set("stream_predict", "auto").unwrap();
         assert_eq!(o.stream_predict, None);
         assert!(o.set("stream_predict", "5").is_err());
+        o.set("prompt_checkpoints", "0").unwrap();
+        assert_eq!(o.prompt_checkpoints, Some(0));
+        o.set("prompt_checkpoints", "4").unwrap();
+        assert_eq!(o.prompt_checkpoints, Some(4));
+        o.set("prompt_checkpoints", "").unwrap();
+        assert_eq!(o.prompt_checkpoints, None);
+        assert!(o.set("prompt_checkpoints", "x").is_err());
         for u in [CoreMlUnits::Ane, CoreMlUnits::All, CoreMlUnits::Gpu, CoreMlUnits::Cpu] {
             assert_eq!(CoreMlUnits::parse(u.as_str()), Some(u));
         }
@@ -4250,5 +4335,91 @@ mod tests {
         assert_eq!(o.mmproj, Mmproj::File("/x/mmproj-F16.gguf".into()));
         o.set("mmproj", "auto").unwrap();
         assert_eq!(o.mmproj, Mmproj::Auto);
+    }
+
+    fn tiny_inkling(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("oxinfer-ink-engine-{tag}-{}", std::process::id()));
+        crate::inkling::tiny::write_tiny(&dir, 3).unwrap();
+        dir
+    }
+
+    fn quiet(_: &Delta) -> Flow {
+        Flow::Continue
+    }
+
+    /// On the CPU (other tests of this process ask for it; the device's checkpoints are
+    /// `inkling`'s tests).
+    fn cpu_options() -> EngineOptions {
+        let mut o = EngineOptions::default();
+        o.set("device", "cpu").unwrap();
+        o
+    }
+
+    /// A next turn whose past reply is rendered otherwise than the model wrote it (Inkling-2
+    /// drops the thinking; here the tiny model's reply is just other tokens) reuses the cache up
+    /// to the previous prompt's checkpoint, also when the reply ran further than the session goes
+    /// back otherwise (80 tokens).
+    #[test]
+    fn inkling_chat_reuses_the_previous_prompt() {
+        let dir = tiny_inkling("chat");
+        let mut e = Engine::load(dir.to_str().unwrap(), &cpu_options()).unwrap();
+        e.config_mut().max_tokens = 80;
+        let mut convo = vec![
+            Message::system("You answer briefly. ".repeat(6)),
+            Message::user("Hello there, what is the weather like today?"),
+        ];
+        let r1 = e.chat(&convo, &mut quiet).unwrap();
+        assert_eq!(r1.stats.cached_tokens, 0);
+        let len1 = r1.stats.prompt_tokens;
+        convo.push(Message::assistant(format!("{}!", r1.text)));
+        convo.push(Message::user("And tomorrow?"));
+        let r2 = e.chat(&convo, &mut quiet).unwrap();
+        assert!(r2.stats.cached_tokens + 1 >= len1, "{} cached of {len1}", r2.stats.cached_tokens);
+        // A regenerated reply (the same conversation again): from the checkpoint before the
+        // last prompt token.
+        let len2 = r2.stats.cached_tokens + r2.stats.prompt_tokens;
+        let r3 = e.chat(&convo, &mut quiet).unwrap();
+        assert_eq!(r3.stats.cached_tokens, len2 - 1);
+        // With checkpoints off, the conversation starts over after a long reply.
+        let mut o = cpu_options();
+        o.set("prompt_checkpoints", "0").unwrap();
+        let mut e = Engine::load(dir.to_str().unwrap(), &o).unwrap();
+        e.config_mut().max_tokens = 80;
+        let r1 = e.chat(&convo[..2], &mut quiet).unwrap();
+        let r2 = e.chat(&convo, &mut quiet).unwrap();
+        if r1.tokens.len() > crate::inkling::ROLLBACK + 1 {
+            assert_eq!(r2.stats.cached_tokens, 0);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Inkling-2 conversations go to the prompt cache and come back from it in another engine.
+    #[test]
+    fn inkling_prompt_cache_restores() {
+        let dir = tiny_inkling("pcache");
+        let cache = std::env::temp_dir().join(format!("oxinfer-ink-pc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache);
+        let mut o = cpu_options();
+        o.set("prompt_cache", cache.to_str().unwrap()).unwrap();
+        o.set("prompt_cache_min_tokens", "8").unwrap();
+        let convo = vec![
+            Message::system("You answer briefly. ".repeat(6)),
+            Message::user("Name a famous library."),
+        ];
+        let first = {
+            let mut e = Engine::load(dir.to_str().unwrap(), &o).unwrap();
+            e.config_mut().max_tokens = 8;
+            let r = e.chat(&convo, &mut quiet).unwrap();
+            e.flush_prompt_cache().unwrap();
+            assert!(e.prompt_cache_info().unwrap().1 > 0, "nothing stored");
+            r
+        };
+        let mut e = Engine::load(dir.to_str().unwrap(), &o).unwrap();
+        e.config_mut().max_tokens = 8;
+        let again = e.chat(&convo, &mut quiet).unwrap();
+        assert_eq!(again.stats.restored_tokens, first.stats.prompt_tokens - 1);
+        assert_eq!(again.tokens, first.tokens);
+        std::fs::remove_dir_all(&cache).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -47,11 +47,18 @@
 //! A session can go back up to [`ROLLBACK`] positions ([`Inkling2Session::truncate`], what
 //! speculative decoding needs): the convolutions keep their last inputs in rings of
 //! `kernel - 1 + ROLLBACK` rows indexed by position, and the sliding-window caches keep that many
-//! positions more than their window.
+//! positions more than their window. Further back, it goes to a [`Checkpoint`] taken at that
+//! position ([`Inkling2Model::checkpoint`], [`Inkling2Model::cut_to`]: the convolutions' last
+//! inputs and the sliding slots' last window, the full-attention caches being kept whole), which
+//! is how [`crate::engine::Engine::chat`] reuses a conversation's prompt after a mismatch.
 
 #[cfg(all(feature = "gpu", not(any(target_os = "macos", target_os = "ios", target_arch = "wasm32"))))]
 #[path = "inkling_cuda.rs"]
 mod cuda;
+
+#[doc(hidden)]
+#[path = "inkling_tiny.rs"]
+pub mod tiny;
 
 use crate::intervene::{NeuronHook, Target};
 use crate::kernels::*;
@@ -945,6 +952,19 @@ impl KvRows {
     fn bytes(&self) -> usize {
         self.f.len() * 4 + self.h.len() * 2 + self.q.len() + self.s.len() * 4
     }
+    /// A copy of values `from..to` (multiples of 32 for Q8).
+    fn range(&self, from: usize, to: usize) -> KvRows {
+        let mut r = KvRows::new(self.mode);
+        match self.mode {
+            KvCache::F32 => r.f = self.f[from..to].to_vec(),
+            KvCache::F16 => r.h = self.h[from..to].to_vec(),
+            KvCache::Q8 => {
+                r.q = self.q[from..to].to_vec();
+                r.s = self.s[from / 32..to / 32].to_vec();
+            }
+        }
+        r
+    }
 }
 
 /// Whole passes on an accelerator (CUDA: `inkling_cuda.rs`; Metal: `crate::metal::inkling`),
@@ -960,6 +980,11 @@ pub(crate) trait DevEngine: Send + Sync {
     /// cannot (prompt lookup and draft models then stay off).
     fn rollback(&self) -> usize {
         0
+    }
+    /// Whether a session on the device can be written to a snapshot where it is
+    /// ([`DevSession::download_into`]).
+    fn snapshots(&self) -> bool {
+        false
     }
     /// Most tokens of a pass whose rows are those of one-token passes (speculative verification
     /// stays within it: [`Inkling2Model::max_draft`]).
@@ -1046,6 +1071,58 @@ pub(crate) trait DevSession: Send + Sync {
     fn truncate(&mut self, _pos: usize, _len: usize) -> bool {
         false
     }
+    /// The slots' part of a [`Checkpoint`] of position `pos` (`shape`: the session's host
+    /// layers, for the convolution rings' layout; `keep[slot]`: the positions before `pos` a
+    /// sliding slot keeps, 0 for a full one); None when the device cannot (the session then
+    /// moves to the host for it).
+    fn checkpoint(&self, _pos: usize, _shape: &[LayerState], _keep: &[usize]) -> Option<Vec<SlotCheckpoint>> {
+        None
+    }
+    /// Goes back to the position of `cp`, taken from this session at an earlier position (its
+    /// full-attention rows before it unchanged since); false when the device cannot.
+    fn restore(&mut self, _cp: &Checkpoint, _shape: &[LayerState]) -> bool {
+        false
+    }
+    /// Writes the caches and rings at position `pos` into `layers` (fresh ones with the host's
+    /// ring shapes) without leaving the device; false when the device cannot.
+    fn download_into(&self, _layers: &mut [LayerState], _pos: usize) -> bool {
+        false
+    }
+}
+
+/// What a session needs to go back to an earlier position from any later one (further than
+/// [`ROLLBACK`]): the convolutions' inputs before it and the sliding-window slots' last window
+/// of keys and values (their rings and caches drop older positions); the full-attention slots
+/// keep every row by position. [`Inkling2Model::checkpoint`] takes one,
+/// [`Inkling2Model::cut_to`] goes back to it.
+pub struct Checkpoint {
+    pub(crate) pos: usize,
+    pub(crate) slots: Vec<SlotCheckpoint>,
+}
+
+/// One cache slot's part of a [`Checkpoint`].
+pub(crate) struct SlotCheckpoint {
+    /// A sliding slot: the keys and values of positions `first..pos` (empty for a full slot,
+    /// whose `first` is then `pos`).
+    pub(crate) first: usize,
+    pub(crate) k: KvRows,
+    pub(crate) v: KvRows,
+    /// The rows of positions `pos - (kernel - 1)..pos` of the four convolution rings, in order.
+    pub(crate) conv: [Vec<f32>; 4],
+}
+
+impl Checkpoint {
+    /// The position it goes back to.
+    pub fn pos(&self) -> usize {
+        self.pos
+    }
+    /// Bytes held.
+    pub fn bytes(&self) -> usize {
+        self.slots
+            .iter()
+            .map(|s| s.k.bytes() + s.v.bytes() + s.conv.iter().map(|c| c.len() * 4).sum::<usize>())
+            .sum()
+    }
 }
 
 /// See [`DevSession`]: authoritative while set (the host caches are then stale).
@@ -1115,6 +1192,12 @@ pub struct Inkling2Session {
     pub(crate) dev: Option<DevBox>,
     /// The device could not hold this session's caches: it runs on the host from then on.
     pub(crate) dev_off: bool,
+    /// Checkpoints of earlier positions, lowest first ([`Inkling2Model::checkpoint`]; shared by
+    /// the session's copies).
+    pub(crate) checkpoints: Vec<std::sync::Arc<Checkpoint>>,
+    /// The earliest position [`Inkling2Session::truncate`] may go back to: a restored
+    /// checkpoint's (the rings and windows hold nothing older).
+    pub(crate) floor: usize,
 }
 
 /// What a device pass returns ([`DevEngine::run`]).
@@ -1135,12 +1218,14 @@ impl Inkling2Session {
         if len >= self.pos {
             return Ok(());
         }
-        if self.pos - len > ROLLBACK {
+        if self.pos - len > ROLLBACK || len < self.floor {
             bail!(
-                "Inkling-2: a session goes back at most {ROLLBACK} positions ({} asked)",
-                self.pos - len
+                "Inkling-2: a session goes back at most {ROLLBACK} positions and not before position {} ({len} asked at {})",
+                self.floor,
+                self.pos
             );
         }
+        self.checkpoints.retain(|c| c.pos <= len);
         if let Some(d) = &mut self.dev {
             if !d.0.truncate(self.pos, len) {
                 bail!("Inkling-2: this device's sessions cannot go back to an earlier position");
@@ -1157,6 +1242,104 @@ impl Inkling2Session {
         }
         self.pos = len;
         Ok(())
+    }
+}
+
+/// The snapshot code of a cache format.
+fn kv_code(m: KvCache) -> u64 {
+    match m {
+        KvCache::F32 => 0,
+        KvCache::F16 => 1,
+        KvCache::Q8 => 2,
+    }
+}
+
+/// Snapshots ([`crate::snapshot`]): the position (and the earliest one the session goes back
+/// to), then per cache slot the position of its first cached row, its keys and values in the
+/// cache's format and its four convolution rings. A session on the device is read from there
+/// (Metal; it stays there); a restored session starts on the host and moves to the device at
+/// its next pass. Checkpoints are not part of it.
+impl crate::snapshot::SessionState for Inkling2Session {
+    fn write_state<W: std::io::Write>(&self, w: &mut crate::snapshot::SnapWriter<W>) -> Result<()> {
+        let fetched;
+        let layers: &[LayerState] = match &self.dev {
+            Some(d) => {
+                let mut l: Vec<LayerState> = self
+                    .layers
+                    .iter()
+                    .map(|st| LayerState {
+                        hist: st.hist.clone(),
+                        ..Default::default()
+                    })
+                    .collect();
+                if !d.0.download_into(&mut l, self.pos) {
+                    bail!("session snapshots are not supported for Inkling-2 on this device");
+                }
+                fetched = l;
+                &fetched
+            }
+            None => &self.layers,
+        };
+        w.u64s("ink.pos", &[self.pos as u64, self.floor as u64])?;
+        for (i, st) in layers.iter().enumerate() {
+            w.u64s(&format!("ink.{i}.first"), &[st.first as u64, kv_code(st.k.mode)])?;
+            for (n, r) in [("k", &st.k), ("v", &st.v)] {
+                let name = format!("ink.{i}.{n}");
+                match r.mode {
+                    KvCache::F32 => w.f32s(&name, &r.f)?,
+                    KvCache::F16 => w.u16s(&name, &r.h)?,
+                    KvCache::Q8 => {
+                        w.i8s(&name, &r.q)?;
+                        w.f32s(&format!("{name}.s"), &r.s)?;
+                    }
+                }
+            }
+            for (j, h) in st.hist.iter().enumerate() {
+                w.f32s(&format!("ink.{i}.conv{j}"), &h.rows)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn read_state(&mut self, r: &mut crate::snapshot::SnapReader) -> Result<()> {
+        let p = r.u64s_exact("ink.pos", 2)?;
+        let (pos, floor) = (p[0] as usize, p[1] as usize);
+        if floor > pos {
+            bail!("snapshot: bad positions");
+        }
+        for (i, st) in self.layers.iter_mut().enumerate() {
+            let f = r.u64s_exact(&format!("ink.{i}.first"), 2)?;
+            let first = f[0] as usize;
+            if first > pos || f[1] != kv_code(st.k.mode) {
+                bail!("snapshot: cache slot {i} does not match the model (another KV cache format?)");
+            }
+            let n = (pos - first).checked_mul(st.hist[0].ch).context("snapshot: cache size")?;
+            for (name, rows) in [("k", &mut st.k), ("v", &mut st.v)] {
+                let name = format!("ink.{i}.{name}");
+                *rows = KvRows::new(rows.mode);
+                match rows.mode {
+                    KvCache::F32 => rows.f = r.f32s(&name, n)?,
+                    KvCache::F16 => rows.h = r.u16s(&name, n)?,
+                    KvCache::Q8 => {
+                        rows.q = r.i8s(&name, n)?;
+                        rows.s = r.f32s(&format!("{name}.s"), n / 32)?;
+                    }
+                }
+            }
+            st.first = first;
+            for (j, h) in st.hist.iter_mut().enumerate() {
+                r.f32s_into(&format!("ink.{i}.conv{j}"), &mut h.rows)?;
+            }
+        }
+        self.pos = pos;
+        self.floor = floor;
+        self.dev = None;
+        self.checkpoints.clear();
+        Ok(())
+    }
+
+    fn truncatable(&self) -> bool {
+        false
     }
 }
 
@@ -1774,7 +1957,129 @@ impl<'a> Inkling2Model<'a> {
             iv: Default::default(),
             dev: None,
             dev_off: false,
+            checkpoints: Vec::new(),
+            floor: 0,
         }
+    }
+
+    /// Positions kept per cache slot by a [`Checkpoint`]: a sliding slot's window, 0 for a full
+    /// slot.
+    fn checkpoint_keep(&self) -> Vec<usize> {
+        let c = &self.cfg;
+        c.slot_layers()
+            .into_iter()
+            .map(|l| if c.sliding[l] { c.sliding_window_size } else { 0 })
+            .collect()
+    }
+
+    /// Takes a [`Checkpoint`] of the current position of `sess` (none when it has one there or
+    /// `max` is 0), keeping at most `max`: past that the lowest one (a shared prefix, say) and
+    /// the newest stay, the second lowest goes.
+    pub fn checkpoint(&self, sess: &mut Inkling2Session, max: usize) {
+        let pos = sess.pos;
+        if max == 0 || pos == 0 || sess.checkpoints.iter().any(|c| c.pos == pos) {
+            return;
+        }
+        let keep = self.checkpoint_keep();
+        let dev = sess.dev.as_ref().and_then(|d| d.0.checkpoint(pos, &sess.layers, &keep));
+        let slots = match dev {
+            Some(s) => s,
+            None => {
+                self.to_host(sess);
+                sess.layers
+                    .iter()
+                    .zip(&keep)
+                    .map(|(st, &k)| {
+                        let kw = st.hist[0].ch;
+                        let conv: [Vec<f32>; 4] = std::array::from_fn(|i| {
+                            let r = &st.hist[i];
+                            (0..r.back)
+                                .flat_map(|j| r.row(pos as isize - (r.back - j) as isize).iter().copied())
+                                .collect::<Vec<f32>>()
+                        });
+                        let (first, k, v) = if k > 0 {
+                            let lo = pos.saturating_sub(k).max(st.first);
+                            let (a, b) = ((lo - st.first) * kw, (pos - st.first) * kw);
+                            (lo, st.k.range(a, b), st.v.range(a, b))
+                        } else {
+                            (pos, KvRows::new(st.k.mode), KvRows::new(st.v.mode))
+                        };
+                        SlotCheckpoint { first, k, v, conv }
+                    })
+                    .collect()
+            }
+        };
+        let cp = std::sync::Arc::new(Checkpoint { pos, slots });
+        let at = sess.checkpoints.partition_point(|c| c.pos < pos);
+        sess.checkpoints.insert(at, cp);
+        while sess.checkpoints.len() > max {
+            let i = if max > 1 { 1 } else { 0 };
+            sess.checkpoints.remove(i);
+        }
+    }
+
+    /// Whether `sess` has a checkpoint of position `pos`.
+    pub fn has_checkpoint(&self, sess: &Inkling2Session, pos: usize) -> bool {
+        sess.checkpoints.iter().any(|c| c.pos == pos)
+    }
+
+    /// The latest position up to `len` that `sess` can go back to ([`Self::cut_to`]): `len`
+    /// itself when within what it goes back ([`Self::rollback_limit`]), else its latest
+    /// checkpoint up to `len`, else 0.
+    pub fn reachable(&self, sess: &Inkling2Session, len: usize) -> usize {
+        if len >= sess.pos {
+            return sess.pos;
+        }
+        if len >= sess.floor && sess.pos - len <= self.rollback_limit() {
+            return len;
+        }
+        sess.checkpoints.iter().map(|c| c.pos).filter(|&p| p <= len).max().unwrap_or(0)
+    }
+
+    /// Goes back to position `len`: within what the session goes back, or to a checkpoint of
+    /// that position. The logits from there are those of a session that ran the same tokens up
+    /// to `len` (in the same passes) and nothing after.
+    pub fn cut_to(&self, sess: &mut Inkling2Session, len: usize) -> Result<()> {
+        if len >= sess.pos {
+            return Ok(());
+        }
+        if len >= sess.floor && sess.pos - len <= self.rollback_limit() {
+            return sess.truncate(len);
+        }
+        let Some(cp) = sess.checkpoints.iter().find(|c| c.pos == len).cloned() else {
+            bail!("Inkling-2: no checkpoint of position {len} to go back to (at {})", sess.pos);
+        };
+        let restored = match &mut sess.dev {
+            Some(d) => d.0.restore(&cp, &sess.layers),
+            None => false,
+        };
+        if !restored {
+            self.to_host(sess);
+            let keep = self.checkpoint_keep();
+            for ((st, s), &k) in sess.layers.iter_mut().zip(&cp.slots).zip(&keep) {
+                let kw = st.hist[0].ch;
+                if k > 0 {
+                    st.k = s.k.clone();
+                    st.v = s.v.clone();
+                    st.first = s.first;
+                } else {
+                    let rows = len.saturating_sub(st.first);
+                    st.k.truncate(rows * kw);
+                    st.v.truncate(rows * kw);
+                }
+                for (r, rows) in st.hist.iter_mut().zip(&s.conv) {
+                    let (back, ch) = (r.back, r.ch);
+                    for j in 0..back {
+                        r.row_mut(len as isize - (back - j) as isize)
+                            .copy_from_slice(&rows[j * ch..(j + 1) * ch]);
+                    }
+                }
+            }
+        }
+        sess.pos = len;
+        sess.floor = len;
+        sess.checkpoints.retain(|c| c.pos <= len);
+        Ok(())
     }
 
     /// Most draft tokens a speculative round verifies: [`DEVICE_MAX_DRAFT`] when the passes run
@@ -1880,6 +2185,12 @@ impl<'a> Inkling2Model<'a> {
     /// device allows (0 on CUDA), [`ROLLBACK`] on the CPU. Speculative decoding needs one.
     pub fn rollback_limit(&self) -> usize {
         self.device().map_or(ROLLBACK, |d| d.rollback())
+    }
+
+    /// Whether sessions of this model can be written to snapshots: on the CPU, or on a device
+    /// that reads them where they are (Metal).
+    pub fn snapshots(&self) -> bool {
+        self.device().is_none_or(|d| d.snapshots())
     }
 
     /// Whether sessions of this model can go back at all (prompt lookup and drafts need it).
@@ -3214,5 +3525,158 @@ mod tests {
         let both = mix(&[state], &x, &[0.0; 8], h);
         assert_eq!(both.len(), 2);
         assert!((both[1][0] - 1.0).abs() < 1e-4 && (both[1][1] - 1.0).abs() < 1e-4);
+    }
+
+    /// The tiny random Inkling-2-Mini of [`tiny`], loaded with `kv` caches; on the CPU only
+    /// unless `device` (then on the accelerator when there is one).
+    fn tiny_model(tag: &str, kv: KvCache, device: bool) -> &'static Inkling2Model<'static> {
+        let dir = std::env::temp_dir().join(format!("oxinfer-ink-tiny-{tag}-{}", std::process::id()));
+        tiny::write_tiny(&dir, 7).unwrap();
+        let cfg = Inkling2Config::load(&dir).unwrap();
+        let files: &'static ModelFiles = Box::leak(Box::new(ModelFiles::open(&dir, true).unwrap()));
+        let mut m = Inkling2Model::load(cfg, files, Quant::Bf16).unwrap();
+        m.kv = kv;
+        // (The device engine on a backend of its own: the process's may be the CPU.)
+        #[cfg(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64"))]
+        let dev = if device { crate::metal::inkling::build_own(&m) } else { None };
+        #[cfg(not(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64")))]
+        let dev: Option<Box<dyn DevEngine>> = {
+            let _ = device;
+            None
+        };
+        let _ = m.device.set(dev);
+        Box::leak(Box::new(m))
+    }
+
+    /// Every position's logits of `toks` run from the session's position in passes of `pass`.
+    fn run(m: &Inkling2Model, sess: &mut Inkling2Session, toks: &[u32], pass: usize) -> Vec<f32> {
+        let mut out = Vec::new();
+        for c in toks.chunks(pass) {
+            let hs = m.forward_hidden(sess, c);
+            out.extend(m.logits(&hs, c.len()));
+        }
+        out
+    }
+
+    fn tokens(n: usize, salt: usize) -> Vec<u32> {
+        (0..n).map(|i| ((i * 37 + salt * 11) % 250) as u32).collect()
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// A session that ran past a checkpoint (further than it can go back otherwise), cut back to
+    /// it and fed other tokens gives the logits of a fresh session that ran the same passes up
+    /// to it, bit for bit; going back a few positions from there works as before.
+    fn checkpoint_matches_fresh(m: &Inkling2Model, pass: usize) {
+        let (c, past) = (100, 90);
+        let first = tokens(c + past, 0);
+        let next = tokens(40, 3);
+        let mut a = m.new_session();
+        run(m, &mut a, &first[..c], pass);
+        m.checkpoint(&mut a, 2);
+        run(m, &mut a, &first[c..], pass);
+        assert!(a.pos - c > m.rollback_limit());
+        assert_eq!(m.reachable(&a, c + 5), c);
+        assert_eq!(m.reachable(&a, a.pos - 10), a.pos - 10);
+        assert_eq!(m.reachable(&a, c - 1), 0);
+        assert!(m.cut_to(&mut a, c + 5).is_err());
+        m.cut_to(&mut a, c).unwrap();
+        let got = run(m, &mut a, &next[..30], pass);
+        let mut b = m.new_session();
+        run(m, &mut b, &first[..c], pass);
+        let want = run(m, &mut b, &next[..30], pass);
+        assert_eq!(bits(&got), bits(&want), "after the checkpoint (passes of {pass})");
+        // Not before the restored position; a few back from the end, as before.
+        assert!(a.truncate(c - 1).is_err());
+        a.truncate(c + 20).unwrap();
+        b.truncate(c + 20).unwrap();
+        let got = run(m, &mut a, &next[30..], pass);
+        let want = run(m, &mut b, &next[30..], pass);
+        assert_eq!(bits(&got), bits(&want), "going back after a restore (passes of {pass})");
+    }
+
+    #[test]
+    fn checkpoint_cut_back_matches_fresh_cpu() {
+        for kv in [KvCache::F32, KvCache::F16] {
+            let m = tiny_model(&format!("cp{kv:?}"), kv, false);
+            for pass in [1, 7, 64] {
+                checkpoint_matches_fresh(m, pass);
+            }
+        }
+    }
+
+    /// The same on the accelerator, when there is one (Metal; skipped otherwise).
+    #[test]
+    fn checkpoint_cut_back_matches_fresh_device() {
+        let m = tiny_model("cpdev", KvCache::F32, true);
+        let mut s = m.new_session();
+        run(m, &mut s, &tokens(8, 0), 8);
+        if s.dev.is_none() || m.device().is_none_or(|d| !d.snapshots()) {
+            eprintln!("[no Inkling-2 device engine here: skipped]");
+            return;
+        }
+        eprintln!("[Inkling-2 checkpoints on the device]");
+        for pass in [1, 16, 64] {
+            checkpoint_matches_fresh(m, pass);
+        }
+    }
+
+    /// Checkpoints past the cap: the lowest and the newest stay.
+    #[test]
+    fn checkpoint_cap_keeps_lowest_and_newest() {
+        let m = tiny_model("cap", KvCache::F32, false);
+        let mut s = m.new_session();
+        let t = tokens(80, 1);
+        for end in [10, 30, 50, 80] {
+            let from = s.pos;
+            run(m, &mut s, &t[from..end], 64);
+            m.checkpoint(&mut s, 2);
+        }
+        let at: Vec<usize> = s.checkpoints.iter().map(|c| c.pos()).collect();
+        assert_eq!(at, vec![10, 80]);
+        assert!(m.has_checkpoint(&s, 10) && !m.has_checkpoint(&s, 30));
+        m.cut_to(&mut s, 10).unwrap();
+        assert_eq!(s.checkpoints.len(), 1);
+    }
+
+    /// A session written to a snapshot and read into a fresh one continues as the original does,
+    /// bit for bit (host caches in each format; the device's read where they are).
+    fn snapshot_round_trip(m: &Inkling2Model, tag: &str) {
+        use crate::snapshot::{SessionState, SnapReader, SnapWriter};
+        let t = tokens(150, 2);
+        let mut a = m.new_session();
+        run(m, &mut a, &t[..120], 32);
+        let path = std::env::temp_dir().join(format!("oxinfer-ink-snap-{tag}-{}.oxsnap", std::process::id()));
+        let mut w = SnapWriter::new(std::fs::File::create(&path).unwrap()).unwrap();
+        a.write_state(&mut w).unwrap();
+        w.finish(json!({})).unwrap();
+        let mut b = m.new_session();
+        let mut r = SnapReader::open(&path).unwrap();
+        b.read_state(&mut r).unwrap();
+        r.finish().unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(b.pos, 120);
+        let got = run(m, &mut b, &t[120..], 1);
+        let want = run(m, &mut a, &t[120..], 1);
+        assert_eq!(bits(&got), bits(&want), "{tag}");
+    }
+
+    #[test]
+    fn snapshot_round_trip_cpu() {
+        for kv in [KvCache::F32, KvCache::F16] {
+            snapshot_round_trip(tiny_model(&format!("snap{kv:?}"), kv, false), &format!("{kv:?}"));
+        }
+    }
+
+    #[test]
+    fn snapshot_round_trip_device() {
+        let m = tiny_model("snapdev", KvCache::F32, true);
+        if !m.snapshots() || m.device().is_none() {
+            eprintln!("[no Inkling-2 device engine here: skipped]");
+            return;
+        }
+        snapshot_round_trip(m, "device");
     }
 }

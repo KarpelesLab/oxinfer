@@ -122,9 +122,15 @@ int64_t oxi_cache_remove(const char *cache_dir, const char *name);
  *                        DIR (auto: ~/.cache/oxinfer/prompt-cache), created private (0700);
  *                        oxi_engine_chat restores the one that saves the most of a prompt and
  *                        stores conversations (oxi_engine_flush_prompt_cache). Gemma 4 / 3,
- *                        Qwen, Llama 3 (and their DSpark / MTP drafts)
+ *                        Qwen, Llama 3 (and their DSpark / MTP drafts), Inkling-2 (no draft;
+ *                        CPU and Metal)
  *   prompt_cache_gb=F    prompt cache size cap (default 20; least recently used removed)
  *   prompt_cache_min_tokens=N  shortest conversation stored (default 64)
+ *   prompt_checkpoints=N Inkling-2: in-memory checkpoints oxi_engine_chat keeps of a prompt (the
+ *                        shared system prefix, the prompt but its last token) so that the next
+ *                        conversation reuses the cache up to one after a mismatch (a past reply
+ *                        without its thinking, an edited message); each holds the sliding layers'
+ *                        last window (Mini: ~650 MB with f32 caches, ~180 MB q8). Default 2, 0 off
  *   cache_dir=PATH       where repo ids are downloaded
  *   gpu_exact=0|1        GPU matmuls bit-identical to the CPU (default 0: M5/A19 matrix
  *                        units, half-precision inputs; CUDA prompts of GGUF models in f16

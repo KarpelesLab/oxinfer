@@ -126,6 +126,8 @@ enum Kind {
     F32,
     U32,
     U64,
+    U16,
+    I8,
 }
 
 impl Kind {
@@ -133,6 +135,8 @@ impl Kind {
         match self {
             Kind::F32 | Kind::U32 => 4,
             Kind::U64 => 8,
+            Kind::U16 => 2,
+            Kind::I8 => 1,
         }
     }
     fn name(self) -> &'static str {
@@ -140,6 +144,8 @@ impl Kind {
             Kind::F32 => "f32",
             Kind::U32 => "u32",
             Kind::U64 => "u64",
+            Kind::U16 => "u16",
+            Kind::I8 => "i8",
         }
     }
     fn parse(s: &str) -> Option<Self> {
@@ -147,6 +153,8 @@ impl Kind {
             "f32" => Kind::F32,
             "u32" => Kind::U32,
             "u64" => Kind::U64,
+            "u16" => Kind::U16,
+            "i8" => Kind::I8,
             _ => return None,
         })
     }
@@ -219,6 +227,12 @@ impl<W: Write> SnapWriter<W> {
     }
     pub fn u64s(&mut self, name: &str, v: &[u64]) -> Result<()> {
         self.put(name, Kind::U64, v)
+    }
+    pub fn u16s(&mut self, name: &str, v: &[u16]) -> Result<()> {
+        self.put(name, Kind::U16, v)
+    }
+    pub fn i8s(&mut self, name: &str, v: &[i8]) -> Result<()> {
+        self.put(name, Kind::I8, v)
     }
 
     /// Writes the footer with `meta` (an object; the section table is added) and returns the
@@ -396,6 +410,14 @@ impl SnapReader {
     /// The next section, `name`, of exactly `count` u64 values.
     pub fn u64s_exact(&mut self, name: &str, count: usize) -> Result<Vec<u64>> {
         self.take(name, Kind::U64, Some(count as u64), 0)
+    }
+    /// The next section, `name`, of exactly `count` u16 values.
+    pub fn u16s(&mut self, name: &str, count: usize) -> Result<Vec<u16>> {
+        self.take(name, Kind::U16, Some(count as u64), 0)
+    }
+    /// The next section, `name`, of exactly `count` i8 values.
+    pub fn i8s(&mut self, name: &str, count: usize) -> Result<Vec<i8>> {
+        self.take(name, Kind::I8, Some(count as u64), 0)
     }
 
     /// Checks that every section was read and that the checksum matches.
