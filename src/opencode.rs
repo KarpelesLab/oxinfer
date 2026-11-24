@@ -460,14 +460,16 @@ fn save(path: &Path, exists: bool, text: &str) -> Result<Option<PathBuf>> {
 /// file) and renames it over `target`.
 fn replace_with(tmp: &Path, target: &Path, exists: bool, text: &str) -> Result<()> {
     use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(tmp)
-        .with_context(|| format!("create {}", tmp.display()))?;
-    f.write_all(text.as_bytes())?;
-    f.sync_all()?;
-    drop(f);
+    {
+        // Closed at the end of the block, before the rename.
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+    }
     if exists {
         std::fs::set_permissions(tmp, std::fs::metadata(target)?.permissions())?;
     } else {
