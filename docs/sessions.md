@@ -54,6 +54,12 @@ anything is allocated, and a checksum is checked before the state is used. A sna
 model or other options is refused; a corrupted one is removed from the cache and the prompt is
 computed.
 
+`Engine::clear_prompt_cache` (C: `oxi_engine_clear_prompt_cache`) removes the engine's own
+snapshots (its fingerprint's; other models' stay) and drops the conversation waiting to be
+stored. The server's status page lists the snapshots per directory and model and clears them
+(`POST /api/web/prompt-cache/clear`, `Api::clear_prompt_cache`; see
+[the server](server.md#status-cancelling-and-the-caches)).
+
 Families: Gemma 4 / 3, Qwen3, Qwen3.5 / 3.6 / 3.8 (dense, MoE, Qwen2.5-VL), Llama 3, with DSpark
 or MTP drafts and the Gemma 4 assistant drafter, Inkling-2 (Small and Mini, without a draft; on
 the CPU and on Metal, whose session buffers are read in place, the KV caches in their own f32 /

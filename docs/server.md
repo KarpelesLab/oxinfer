@@ -270,6 +270,42 @@ previous one. With `--prompt-cache DIR` (or `auto`; per model `prompt_cache=`), 
 also kept on disk across requests, conversations and restarts and restored when a prompt starts
 with one (see [Session snapshots and the prompt cache](sessions.md#session-snapshots-and-the-prompt-cache)).
 
+### Status, cancelling and the caches
+
+With `web=1` (`oxinfer web`) the GUI's **Status** view shows what the server is doing and acts on
+it; its API is the management API's (see [docs/web.md](web.md#management-api) for the fields):
+
+```sh
+curl -s localhost:8080/api/web/activity | jq '.requests'      # running and queued requests
+curl -s -X POST -H 'Content-Type: application/json' localhost:8080/api/web/requests/req-12/cancel
+curl -s -X POST -H 'Content-Type: application/json' -d '{"id": "qwen", "cancel": true}' localhost:8080/api/web/models/unload
+curl -s -X POST -H 'Content-Type: application/json' -d '{"model": "qwen"}' localhost:8080/api/web/prompt-cache/clear
+curl -s -X POST -H 'Content-Type: application/json' -d '{}' localhost:8080/api/web/caches/free
+```
+
+| Endpoint | |
+|---|---|
+| `GET /api/web/activity` | uptime and version, the requests in flight and the last 20 finished, the models with their memory, GPU memory, device and streaming caches, the process (CPU use, memory), the machine (memory, pressure), the GPU, the prompt caches |
+| `GET /api/web/requests` | the requests in flight: `id`, `kind`, `model`, `stage` (`queued` while another request uses the model), `elapsed`, `tokens`, `tokens_per_sec`, `step`, `client` |
+| `POST /api/web/requests/{id}/cancel` | cancels one (also a `video_...` job) |
+| `POST /api/web/models/unload` | `{"id"}`; `"cancel": true` cancels its requests first |
+| `GET /api/web/prompt-cache`, `POST /api/web/prompt-cache/clear` | the snapshots per directory and model; `{"model"}`, `{"fingerprint"}` or `{}` removes them |
+| `POST /api/web/caches/free` | the streamed models let go of their cached experts |
+
+A cancelled request stops at its next stopping point and frees its model for the next one: a
+request waiting for its model gives up at once, a generation stops at its next token (or
+denoising step, or streamed write); the prompt pass itself is not interrupted. Its client gets
+status 499 with `"code": "cancelled"`, or, streamed, an error event (`data: {"error": ...}` and
+`data: [DONE]` for chat and completions, `event: error` for images and `/v1/messages`).
+
+These endpoints follow the management API's rules: the API key when one is set, JSON bodies and
+the page's own origin for changes, a loopback `Host` on a loopback listener, and read-only (403)
+on a non-loopback listener without a key. Without `web=1` they are not served; the library has
+them as `Api::status` (the same JSON), `Api::requests`, `Api::cancel`, `Api::unload`,
+`Api::clear_prompt_cache` and `Api::free_caches`, and `Engine::clear_prompt_cache` for one
+engine; the C API as `oxi_server_status`, `oxi_server_cancel`, `oxi_server_unload_model`,
+`oxi_server_clear_prompt_cache`, `oxi_server_free_caches` and `oxi_engine_clear_prompt_cache`.
+
 ### Models on request
 
 A request may name a model that is not listed: a repo id (`org/name`, or `org/name:QUANT` for a
