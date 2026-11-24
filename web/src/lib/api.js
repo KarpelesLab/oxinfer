@@ -187,8 +187,22 @@ export class HttpApi {
   load(model, { id, options } = {}) {
     return this.post('api/web/models/load', { model, id, options });
   }
-  unload(id) {
-    return this.post('api/web/models/unload', { id });
+  unload(id, { cancel } = {}) {
+    return this.post('api/web/models/unload', cancel ? { id, cancel: true } : { id });
+  }
+  /// The status page: requests in flight, models, resources, prompt caches.
+  activity() {
+    return this.get('api/web/activity');
+  }
+  cancelRequest(id) {
+    return this.post(`api/web/requests/${encodeURIComponent(id)}/cancel`, {});
+  }
+  /// `{}` (all), `{ model }`, or `{ fingerprint, dir }`.
+  clearPromptCache(what) {
+    return this.post('api/web/prompt-cache/clear', what);
+  }
+  freeCaches(model) {
+    return this.post('api/web/caches/free', model ? { model } : {});
   }
 
   /// Follows a download job until it ends: `onUpdate(job)` for each report.

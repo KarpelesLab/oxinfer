@@ -20,6 +20,7 @@ import VoiceView from './components/VoiceView.vue';
 import VideoView from './components/VideoView.vue';
 import EmbedView from './components/EmbedView.vue';
 import ConnectView from './components/ConnectView.vue';
+import StatusView from './components/StatusView.vue';
 import UpdateBanner from './components/UpdateBanner.vue';
 
 const WASM_URL = `${import.meta.env.BASE_URL}oxinfer.wasm`;
@@ -44,6 +45,7 @@ const NATIVE_MODES = [
   ['video', 'Video'],
   ['embed', 'Embed'],
   ['connect', 'Connect apps'],
+  ['status', 'Status'],
 ];
 const mode = ref(params.get('mode') || 'chat');
 // null while the backend is being detected.
@@ -319,6 +321,7 @@ onMounted(async () => {
       <VideoView v-else-if="mode === 'video'" @manage="setMode('models')" />
       <EmbedView v-else-if="mode === 'embed'" @manage="setMode('models')" />
       <ConnectView v-else-if="mode === 'connect'" @manage="setMode('models')" />
+      <StatusView v-else-if="mode === 'status'" />
     </template>
   </template>
 
