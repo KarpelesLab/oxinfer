@@ -42,16 +42,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod activity;
 pub mod http;
 mod media;
 mod openai;
 mod registry;
 mod sign;
 mod speech;
+mod status;
 mod video;
 pub mod web;
 
+pub use activity::{RequestInfo, Stage as RequestStage};
 pub use registry::Kind;
+pub use status::PromptCacheCleared;
 
 /// One model of the whitelist: `[ID=]SOURCE[,KEY=VALUE...]`, e.g. `qwen=Qwen/Qwen3-0.6B,quant=q8`.
 #[derive(Clone, Debug, PartialEq)]
@@ -473,6 +477,9 @@ pub struct ApiRequest {
     /// The `Origin` and `Host` headers, checked by the web GUI's management API.
     pub origin: Option<String>,
     pub host: Option<String>,
+    /// The client's address (`IP:PORT`) and `User-Agent`, when known: shown on the status page.
+    pub peer: Option<String>,
+    pub user_agent: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -488,6 +495,8 @@ impl ApiRequest {
             authorization: None,
             origin: None,
             host: None,
+            peer: None,
+            user_agent: None,
             body,
         }
     }
@@ -675,6 +684,10 @@ pub struct Api {
     videos: video::Videos,
     /// The listener is a loopback address.
     loopback: bool,
+    /// The requests in flight ([`Api::requests`]).
+    activity: Arc<activity::Activity>,
+    /// The prompt-cache snapshots' metadata, by file (the status page reads it often).
+    snap_index: std::sync::Mutex<status::SnapIndex>,
 }
 
 impl Api {
@@ -705,6 +718,8 @@ impl Api {
             opts,
             ids: AtomicU64::new(0),
             videos: video::Videos::default(),
+            activity: Arc::new(activity::Activity::new()),
+            snap_index: Default::default(),
             loopback: std::net::ToSocketAddrs::to_socket_addrs(&opts_listen)
                 .ok()
                 .and_then(|mut a| a.next())
@@ -772,6 +787,40 @@ impl Api {
         self.models.unload_idle(u64::MAX);
     }
 
+    /// The model requests in flight (running, or waiting for their model), oldest first.
+    pub fn requests(&self) -> Vec<RequestInfo> {
+        self.activity.requests()
+    }
+
+    /// Cancels a request in flight ([`RequestInfo::id`]) or a video job (`video_...`): one
+    /// waiting for its model gives up at once, a generation stops at its next token or step and
+    /// frees its model, and the client gets an error (status 499, code `cancelled`; a streamed
+    /// response ends with an error event). False when there is no such request.
+    pub fn cancel(&self, id: &str) -> bool {
+        self.activity.cancel(id) || self.videos.cancel(id)
+    }
+
+    /// Removes prompt-cache snapshots ([`ServerOptions::prompt_cache`] and the models' own
+    /// directories): of model `model` (an id; it must have been loaded since the start, which
+    /// tells its snapshots apart), or all of them. Loaded idle models forget them too.
+    pub fn clear_prompt_cache(&self, model: Option<&str>) -> Result<PromptCacheCleared> {
+        status::clear_prompt_cache(self, model, None, None).map_err(|e| anyhow::anyhow!(e.message))
+    }
+
+    /// Lets go of the cached experts of the models streamed from disk (model `id`, or all):
+    /// they are read from storage again when next needed. Returns the bytes let go.
+    pub fn free_caches(&self, id: Option<&str>) -> Result<u64> {
+        status::free_caches(self, id).map_err(|e| anyhow::anyhow!(e.message))
+    }
+
+    /// What the server is doing, as the web GUI's status page shows it (`GET
+    /// /api/web/activity`): uptime and version, the requests in flight and the last ones
+    /// finished, the models with their memory and device, the process's and the machine's
+    /// resources, the prompt caches and the streamed models' caches.
+    pub fn status(&self) -> Value {
+        status::status_json(self)
+    }
+
     /// A fresh id after a prefix (`chatcmpl-` gives `chatcmpl-...`).
     pub(crate) fn new_id(&self, prefix: &str) -> String {
         let n = self.ids.fetch_add(1, Ordering::Relaxed);
@@ -826,10 +875,61 @@ impl Api {
             return Err(ApiError::new(413, format!("request body over {} bytes", self.opts.max_body)));
         }
         self.admit(req)?;
+        let post = req.method.eq_ignore_ascii_case("POST");
+        let kind = activity::kind_of(&path).filter(|_| post);
+        let Some(kind) = kind else { return self.dispatch(req, &path) };
+        // A model request: listed (and cancellable) until its response is written.
+        let mut reg = self
+            .activity
+            .start(kind, &path, requested_model(req), req.peer.clone(), req.user_agent.clone());
+        let scope = activity::enter(&reg.task);
+        let out = self.dispatch(req, &path);
+        drop(scope);
+        match out {
+            Ok(Output::Stream { content_type, producer }) => {
+                activity::set_stream(&reg.task);
+                let anthropic = openai::is_anthropic_path(&path);
+                let events = content_type.starts_with("text/event-stream");
+                Ok(Output::Stream {
+                    content_type,
+                    producer: Box::new(move |sink| {
+                        let task = reg.task.clone();
+                        let _scope = activity::enter(&task);
+                        // A cancel ends the body at its next write, with an error event.
+                        let mut told = false;
+                        let mut write = |b: &[u8]| {
+                            if task.cancelled() {
+                                if !told && events {
+                                    told = true;
+                                    sink(cancel_event(kind, anthropic).as_bytes());
+                                }
+                                return false;
+                            }
+                            sink(b)
+                        };
+                        producer(&mut write);
+                        reg.finish("ok", Some(200));
+                    }),
+                })
+            }
+            _ if reg.task.cancelled() => Err(activity::cancelled_error()),
+            Ok(Output::Full(r)) => {
+                reg.finish(if r.status < 400 { "ok" } else { "error" }, Some(r.status));
+                Ok(Output::Full(r))
+            }
+            Err(e) => {
+                reg.finish("error", Some(e.status));
+                Err(e)
+            }
+        }
+    }
+
+    /// Runs a request on its endpoint.
+    fn dispatch(self: &Arc<Self>, req: &ApiRequest, path: &str) -> ApiResult<Output> {
         let get = req.method.eq_ignore_ascii_case("GET");
         let post = req.method.eq_ignore_ascii_case("POST");
         let wrong_method = || ApiError::new(405, format!("{} is not allowed on {path}", req.method));
-        match path.as_str() {
+        match path {
             "/v1/models" if get => Ok(Output::Full(ApiResponse::json(200, &self.models_json()))),
             p if p.starts_with("/v1/models/") && get => {
                 let id = &p["/v1/models/".len()..];
@@ -936,6 +1036,25 @@ impl Api {
             })
             .collect();
         json!({ "object": "list", "data": data })
+    }
+}
+
+/// The event that ends a streamed response cancelled from the status page, in the endpoint's
+/// format.
+fn cancel_event(kind: &str, anthropic: bool) -> String {
+    let e = activity::cancelled_error();
+    if anthropic {
+        format!(
+            "event: error\ndata: {}\n\n",
+            String::from_utf8_lossy(&openai::anthropic_error_response(&e).body)
+        )
+    } else if kind == "image" {
+        format!(
+            "event: error\ndata: {}\n\n",
+            json!({ "type": "error", "error": e.to_json()["error"] })
+        )
+    } else {
+        format!("data: {}\n\ndata: [DONE]\n\n", e.to_json())
     }
 }
 

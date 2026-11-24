@@ -299,6 +299,11 @@ pub trait Backend: Send + Sync {
     fn device_memory(&self) -> Option<(u64, u64)> {
         None
     }
+    /// Bytes of device memory this process has allocated through the backend (Metal's
+    /// `currentAllocatedSize`), when it says: the server's status page.
+    fn allocated_memory(&self) -> Option<u64> {
+        None
+    }
     /// Whether checkpoints are better mapped from their files than read into memory: the device
     /// keeps a copy of every weight it uses in memory it shares with the host (a unified-memory
     /// CUDA device), so the host's own copy would hold the same physical memory a second time,

@@ -548,6 +548,11 @@ fn generate_images(
     on_step: &mut dyn FnMut(usize, usize, usize) -> bool,
 ) -> anyhow::Result<Vec<(usize, usize, Vec<u8>)>> {
     use anyhow::bail;
+    // The status page sees the steps, and a cancel from it stops the pipelines between steps.
+    let on_step = &mut |i: usize, k: usize, n: usize| {
+        super::activity::step(k, n);
+        !super::activity::cancelled() && on_step(i, k, n)
+    };
     let (w, h) = (job.size.map(|s| s.0), job.size.map(|s| s.1));
     let first = job.images.first();
     if job.mask.is_some() && !matches!(m, ImageModel::Sd(_) | ImageModel::QwenImage(_)) {

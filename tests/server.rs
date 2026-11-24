@@ -1885,3 +1885,317 @@ fn auto_models_fetch_and_idle_unload() {
     assert_eq!(st, 200, "{body}");
     s.stop().unwrap();
 }
+
+// ---- the status page: requests in flight, cancel, unload, the caches ---------------------------
+
+/// A prompt-cache snapshot as an engine stores it (`model`: its fingerprint), without a model.
+fn fake_snapshot(dir: &std::path::Path, name: &str, model: &str, model_type: &str, tokens: &[u32]) {
+    std::fs::create_dir_all(dir).unwrap();
+    oxinfer::snapshot::write_atomic(&dir.join(format!("{name}.oxsnap")), |f| {
+        let mut w = oxinfer::snapshot::SnapWriter::new(f)?;
+        w.u32s("tokens", tokens)?;
+        w.finish(json!({"model": model, "model_type": model_type, "tokens": tokens.len()}))?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+fn json_of(body: &str) -> Value {
+    serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {body}"))
+}
+
+#[test]
+fn status_page_and_prompt_cache() {
+    let base = std::env::temp_dir().join(format!("oxinfer-status-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let pc = base.join("pc");
+    fake_snapshot(&pc, "a", "fp-one", "qwen3", &[1, 2, 3]);
+    fake_snapshot(&pc, "b", "fp-one", "qwen3", &[1, 2, 3, 4]);
+    fake_snapshot(&pc, "c", "fp-two", "gemma3", &[5]);
+    std::fs::write(pc.join("notes.txt"), "not a snapshot").unwrap();
+    let s = serve(&format!("web=1; model=m=/nonexistent/model; prompt_cache={}", pc.display()));
+    let a = s.addr();
+    let (st, body) = request(a, "GET", "/api/web/activity", "");
+    assert_eq!(st, 200, "{body}");
+    let v = json_of(&body);
+    assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+    assert!(v["uptime"].is_u64() && v["started"].is_u64());
+    assert_eq!(v["requests"], json!([]));
+    assert_eq!((&v["served"], &v["cancelled"]), (&json!(0), &json!(0)));
+    assert_eq!(v["process"]["pid"], std::process::id());
+    assert!(v["machine"].is_object());
+    assert_eq!((&v["models"][0]["id"], &v["models"][0]["state"]), (&json!("m"), &json!("unloaded")));
+    let cache = &v["prompt_cache"];
+    assert_eq!(cache["entries"], 3, "{cache}");
+    let d = &cache["dirs"][0];
+    assert_eq!(d["path"], pc.display().to_string());
+    let one = d["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["fingerprint"] == "fp-one")
+        .unwrap();
+    assert_eq!(
+        (&one["entries"], &one["model_type"], &one["tokens"]),
+        (&json!(2), &json!("qwen3"), &json!(7))
+    );
+    assert_eq!(one["ids"], json!([]), "no model loaded with this fingerprint");
+    let (st, body) = request(a, "GET", "/api/web/prompt-cache", "");
+    assert_eq!((st, json_of(&body)["entries"].as_u64()), (200, Some(3)));
+
+    // Nothing in flight.
+    let (st, body) = request(a, "GET", "/api/web/requests", "");
+    assert_eq!((st, &json_of(&body)["data"]), (200, &json!([])));
+    let (st, body) = request(a, "POST", "/api/web/requests/req-999/cancel", "{}");
+    assert_eq!((st, &json_of(&body)["error"]["code"]), (404, &json!("request_not_found")));
+
+    // Clearing: a model never loaded cannot be told apart; a directory must be the cache's.
+    let clear = |b: Value| request(a, "POST", "/api/web/prompt-cache/clear", &b.to_string());
+    let (st, body) = clear(json!({"model": "m"}));
+    assert_eq!(st, 409, "{body}");
+    let (st, _) = clear(json!({"model": "nope"}));
+    assert_eq!(st, 404);
+    let (st, body) = clear(json!({"dir": base.display().to_string()}));
+    assert_eq!(st, 400, "{body}");
+    assert_eq!(std::fs::read_dir(&pc).unwrap().count(), 4);
+    let (st, body) = clear(json!({"fingerprint": "fp-one", "dir": pc.display().to_string()}));
+    assert_eq!((st, &json_of(&body)["removed"]), (200, &json!(2)), "{body}");
+    assert!(!pc.join("a.oxsnap").exists() && !pc.join("b.oxsnap").exists() && pc.join("c.oxsnap").exists());
+    let (st, body) = clear(json!({}));
+    assert_eq!((st, &json_of(&body)["removed"]), (200, &json!(1)), "{body}");
+    assert!(!pc.join("c.oxsnap").exists());
+    assert!(pc.join("notes.txt").exists(), "only snapshots are removed");
+    let (_, body) = request(a, "GET", "/api/web/activity", "");
+    assert_eq!(json_of(&body)["prompt_cache"]["entries"], 0);
+
+    // No model streams from disk here: nothing to free.
+    let (st, body) = request(a, "POST", "/api/web/caches/free", "{}");
+    assert_eq!((st, &json_of(&body)["freed"]), (200, &json!(0)), "{body}");
+    let (st, _) = request(a, "POST", "/api/web/caches/free", r#"{"model": "nope"}"#);
+    assert_eq!(st, 404);
+
+    // Another site's page changes nothing.
+    let evil = ["Host: localhost", "Origin: http://evil.example", "Content-Type: application/json"];
+    fake_snapshot(&pc, "d", "fp-two", "gemma3", &[5]);
+    for p in [
+        "/api/web/prompt-cache/clear",
+        "/api/web/requests/req-1/cancel",
+        "/api/web/caches/free",
+    ] {
+        let (st, _) = request_with(a, "POST", p, &evil, "{}");
+        assert_eq!(st, 403, "{p}");
+    }
+    assert!(pc.join("d.oxsnap").exists());
+    s.stop().unwrap();
+
+    // With an API key: the key is needed for all of it.
+    let s = serve(&format!("web=1; api_key=k; prompt_cache={}", pc.display()));
+    for (m, p) in [
+        ("GET", "/api/web/activity"),
+        ("GET", "/api/web/requests"),
+        ("POST", "/api/web/prompt-cache/clear"),
+    ] {
+        let (st, _) = request(s.addr(), m, p, "{}");
+        assert_eq!(st, 401, "{p}");
+    }
+    let (st, _) = request_with(
+        s.addr(),
+        "GET",
+        "/api/web/activity",
+        &["Host: localhost", "Authorization: Bearer k"],
+        "",
+    );
+    assert_eq!(st, 200);
+    s.stop().unwrap();
+
+    // A non-loopback listener without a key: the status reads, the actions are refused.
+    let o = ServerOptions::from_pairs(&format!("web=1; log=0; listen=0.0.0.0:0; prompt_cache={}", pc.display())).unwrap();
+    let api = Api::new(o).unwrap();
+    let get = oxinfer::server::ApiRequest::new("GET", "/api/web/activity", None, vec![]);
+    assert_eq!(api.handle(&get).collect().status, 200);
+    for p in [
+        "/api/web/prompt-cache/clear",
+        "/api/web/requests/req-1/cancel",
+        "/api/web/caches/free",
+    ] {
+        let r = api.handle(&oxinfer::server::ApiRequest::post_json(p, "{}")).collect();
+        assert_eq!(r.status, 403, "{p}");
+        assert_eq!(serde_json::from_slice::<Value>(&r.body).unwrap()["error"]["code"], "read_only");
+    }
+    assert!(pc.join("d.oxsnap").exists());
+    // The library: the same report and actions.
+    assert_eq!(api.status()["prompt_cache"]["entries"], 1);
+    assert!(api.requests().is_empty() && !api.cancel("req-1"));
+    assert_eq!(api.clear_prompt_cache(None).unwrap().entries, 1);
+    assert_eq!(api.free_caches(None).unwrap(), 0);
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Polls `/api/web/requests` until a request matches `pred`; returns it.
+fn wait_request(a: SocketAddr, what: &str, pred: impl Fn(&Value) -> bool) -> Value {
+    let t0 = std::time::Instant::now();
+    loop {
+        let (_, body) = request(a, "GET", "/api/web/requests", "");
+        let v = json_of(&body);
+        if let Some(r) = v["data"].as_array().unwrap().iter().find(|r| pred(r)) {
+            return r.clone();
+        }
+        if t0.elapsed().as_secs() >= 120 {
+            let (_, act) = request(a, "GET", "/api/web/activity", "");
+            panic!("no request {what} after 120 s: {v}; recent: {}", json_of(&act)["recent"]);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Cancelling requests (running, queued, streamed) and unloading a model, with a tiny random
+/// SD 3.5 (denoising steps are its stopping points).
+#[test]
+fn cancel_requests_and_unload_models() {
+    let dir = std::env::temp_dir().join(format!("oxinfer-cancel-sd3-{}", std::process::id()));
+    oxinfer::sd3::tiny::write_tiny_release(&dir).unwrap();
+    let s = serve(&format!("web=1; model=sd3={}", dir.display()));
+    let a = s.addr();
+    // Far more steps than the test waits for.
+    let slow = json!({"model": "sd3", "prompt": "a fox", "size": "256x256", "steps": 100000, "seed": 1}).to_string();
+    let spawn = |body: String| std::thread::spawn(move || request(a, "POST", "/v1/images/generations", &body));
+    let cancel = |id: &str| request(a, "POST", &format!("/api/web/requests/{id}/cancel"), "{}");
+
+    let running = spawn(slow.clone());
+    let r = wait_request(a, "denoising", |r| r["step"]["done"].as_u64() > Some(0));
+    assert_eq!(
+        (&r["kind"], &r["model"], &r["stage"]),
+        (&json!("image"), &json!("sd3"), &json!("generating")),
+        "{r}"
+    );
+    assert_eq!((&r["endpoint"], &r["stream"]), (&json!("/v1/images/generations"), &json!(false)));
+    assert!(r["client"].as_str().unwrap().starts_with("127.0.0.1:"), "{r}");
+    let id = r["id"].as_str().unwrap().to_string();
+
+    // A second request waits for the model; cancelled, it gives up at once.
+    let queued = spawn(slow.clone());
+    let q = wait_request(a, "queued", |r| r["stage"] == "queued");
+    let (st, body) = cancel(q["id"].as_str().unwrap());
+    assert_eq!(st, 200, "{body}");
+    let (st, body) = queued.join().unwrap();
+    assert_eq!((st, &json_of(&body)["error"]["code"]), (499, &json!("cancelled")), "{body}");
+
+    // The running one stops at its next step.
+    let t0 = std::time::Instant::now();
+    let (st, body) = cancel(&id);
+    assert_eq!((st, &json_of(&body)["cancelled"]), (200, &json!(true)), "{body}");
+    let (st, body) = running.join().unwrap();
+    assert_eq!((st, &json_of(&body)["error"]["code"]), (499, &json!("cancelled")), "{body}");
+    assert!(t0.elapsed().as_secs() < 30, "stopped after {:?}", t0.elapsed());
+    let (_, body) = request(a, "GET", "/api/web/activity", "");
+    let v = json_of(&body);
+    assert_eq!(v["requests"], json!([]), "{v}");
+    assert_eq!((&v["served"], &v["cancelled"]), (&json!(2), &json!(2)));
+    assert_eq!(v["recent"][0]["outcome"], "cancelled");
+    assert_eq!(v["models"][0]["state"], "ready", "its slot is free again");
+
+    // Streamed: the stream ends with an error event.
+    let mut sreq = json_of(&slow);
+    sreq["stream"] = json!(true);
+    let streamed = spawn(sreq.to_string());
+    let r = wait_request(a, "streamed", |r| r["stream"] == true && r["step"]["done"].as_u64() > Some(0));
+    cancel(r["id"].as_str().unwrap());
+    let (st, body) = streamed.join().unwrap();
+    assert_eq!(st, 200);
+    let ev = events(&body);
+    let (name, err) = ev.last().unwrap();
+    assert_eq!((name.as_str(), &err["error"]["code"]), ("error", &json!("cancelled")), "{body}");
+
+    // The model serves the next request as usual.
+    let quick = json!({"model": "sd3", "prompt": "a fox", "size": "64x64", "steps": 2, "seed": 1}).to_string();
+    let (st, body) = request(a, "POST", "/v1/images/generations", &quick);
+    assert_eq!(st, 200, "{body}");
+
+    // Unloading: refused while a request uses the model, unless its requests are cancelled.
+    let busy = spawn(slow.clone());
+    wait_request(a, "busy", |r| r["step"]["done"].as_u64() > Some(0));
+    let (st, body) = request(a, "POST", "/api/web/models/unload", r#"{"id": "sd3"}"#);
+    assert_eq!(st, 409, "{body}");
+    let (st, body) = request(a, "POST", "/api/web/models/unload", r#"{"id": "sd3", "cancel": true}"#);
+    let v = json_of(&body);
+    assert_eq!((st, &v["unloaded"], &v["cancelled"]), (200, &json!(true), &json!(1)), "{body}");
+    assert_eq!(busy.join().unwrap().0, 499);
+    let (_, body) = request(a, "GET", "/api/web/activity", "");
+    let m = &json_of(&body)["models"][0];
+    assert_eq!(
+        (&m["loaded"], &m["state"], &m["memory"]),
+        (&json!(false), &json!("unloaded"), &json!(0)),
+        "{m}"
+    );
+    // Loaded again by a request, then unloaded while idle.
+    let (st, _) = request(a, "POST", "/v1/images/generations", &quick);
+    assert_eq!(st, 200);
+    let (_, body) = request(a, "GET", "/api/web/activity", "");
+    let m = &json_of(&body)["models"][0];
+    assert_eq!(m["loaded"], true, "{m}");
+    assert!(m["loaded_at"].is_u64() && m["load_secs"].is_number(), "{m}");
+    let (st, body) = request(a, "POST", "/api/web/models/unload", r#"{"id": "sd3"}"#);
+    assert_eq!((st, &json_of(&body)["unloaded"]), (200, &json!(true)), "{body}");
+    s.stop().unwrap();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Cancelling a chat completion mid-reply, and clearing a loaded model's prompt-cache snapshots.
+#[test]
+#[ignore = "fetches Qwen/Qwen3-0.6B"]
+fn cancel_chat_and_clear_prompt_cache_with_a_model() {
+    let chat = env("OXINFER_E2E_CHAT", "Qwen/Qwen3-0.6B");
+    let pc = std::env::temp_dir().join(format!("oxinfer-status-pc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&pc);
+    fake_snapshot(&pc, "other", "another-model", "gemma3", &[1, 2, 3]);
+    let s = serve(&format!("web=1; model=chat={chat}; prompt_cache={}", pc.display()));
+    let a = s.addr();
+    let system = "You are a careful assistant for a library. ".repeat(12);
+    let long = json!({"model": "chat", "max_tokens": 4000, "temperature": 0.7, "messages": [
+        {"role": "system", "content": system.clone()}, {"role": "user", "content": "Write a very long story about a lighthouse."}]})
+    .to_string();
+    let t = std::thread::spawn(move || request(a, "POST", "/v1/chat/completions", &long));
+    let r = wait_request(a, "generating", |r| r["tokens"].as_u64() > Some(5));
+    assert_eq!((&r["kind"], &r["model"]), (&json!("chat"), &json!("chat")), "{r}");
+    let t0 = std::time::Instant::now();
+    let (st, _) = request(a, "POST", &format!("/api/web/requests/{}/cancel", r["id"].as_str().unwrap()), "{}");
+    assert_eq!(st, 200);
+    let (st, body) = t.join().unwrap();
+    assert_eq!((st, &json_of(&body)["error"]["code"]), (499, &json!("cancelled")), "{body}");
+    assert!(t0.elapsed().as_secs() < 5, "stopped after {:?}", t0.elapsed());
+    let (_, body) = request(a, "GET", "/api/web/activity", "");
+    let v = json_of(&body);
+    let m = &v["models"][0];
+    assert_eq!((&m["loaded"], &m["state"]), (&json!(true), &json!("ready")), "{m}");
+    assert!(m["device"].is_string() && m["model_type"].is_string(), "{m}");
+    assert!(v["recent"][0]["tokens"].as_u64() > Some(5));
+    // A finished reply is stored; clearing the model's snapshots leaves the other model's.
+    let short = json!({"model": "chat", "max_tokens": 10, "temperature": 0, "messages": [
+        {"role": "system", "content": system}, {"role": "user", "content": "Name one famous library."}]})
+    .to_string();
+    let (st, body) = request(a, "POST", "/v1/chat/completions", &short);
+    assert_eq!(st, 200, "{body}");
+    let mine = || {
+        let (_, body) = request(a, "GET", "/api/web/prompt-cache", "");
+        let v = json_of(&body);
+        v["dirs"][0]["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["ids"] == json!(["chat"]))
+            .map(|g| g["entries"].as_u64().unwrap())
+            .unwrap_or(0)
+    };
+    let t0 = std::time::Instant::now();
+    while mine() == 0 {
+        assert!(t0.elapsed().as_secs() < 30, "no snapshot stored");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let (st, body) = request(a, "POST", "/api/web/prompt-cache/clear", r#"{"model": "chat"}"#);
+    assert_eq!(st, 200, "{body}");
+    assert!(json_of(&body)["removed"].as_u64() > Some(0), "{body}");
+    assert_eq!(mine(), 0);
+    assert!(pc.join("other.oxsnap").exists());
+    s.stop().unwrap();
+    std::fs::remove_dir_all(&pc).ok();
+}

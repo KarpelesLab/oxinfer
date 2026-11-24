@@ -122,6 +122,7 @@ fn status(code: u16) -> StatusCode {
         405 => "Method Not Allowed",
         413 => "Payload Too Large",
         415 => "Unsupported Media Type",
+        499 => "Client Closed Request",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "Error",
@@ -164,6 +165,8 @@ fn handle(api: &Arc<Api>, req: &Request) -> Response {
         .or_else(|| h.get("x-api-key").map(|k| format!("Bearer {k}")));
     r.origin = h.get("origin").map(str::to_string);
     r.host = h.get("host").map(str::to_string);
+    r.peer = req.peer_addr().map(|a| a.to_string());
+    r.user_agent = h.get("user-agent").map(str::to_string);
     let resp = match api.handle(&r) {
         Output::Full(full) => {
             let mut resp = Response::new(status(full.status)).header("Content-Type", full.content_type.clone());

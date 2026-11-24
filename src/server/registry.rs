@@ -1,6 +1,7 @@
 //! The whitelist's models: kind detection, lazy loading, one request at a time per model, and
 //! least-recently-used unloading under the memory budget.
 
+use super::activity;
 use super::{ApiError, ApiResult, ModelSpec};
 use crate::engine::{Engine, EngineOptions};
 use crate::model::Quant;
@@ -115,6 +116,42 @@ pub(crate) enum Loaded {
 }
 
 impl Loaded {
+    /// Stops what the model is running from another thread (the models with a stop flag).
+    fn cancel_hook(&self) -> Option<Box<dyn Fn() + Send + Sync>> {
+        let h = match self {
+            Loaded::Chat(e) => e.cancel_handle(),
+            Loaded::Speech(s) => s.cancel_handle(),
+            Loaded::Zonos(z) => z.cancel_handle(),
+            Loaded::Arktts(a) => a.cancel_handle(),
+            _ => return None,
+        };
+        Some(Box::new(move || h.cancel()))
+    }
+
+    /// What the status page shows of a loaded model.
+    fn details(&self, load_secs: f64) -> Details {
+        let mut d = Details {
+            device: None,
+            model_type: None,
+            quant: None,
+            format: None,
+            loaded_at: super::now(),
+            load_secs,
+            streamer: None,
+            prompt_cache: None,
+        };
+        if let Loaded::Chat(e) = self {
+            let i = e.info();
+            d.device = Some(i.device.clone());
+            d.model_type = Some(i.model_type.clone());
+            d.quant = Some(i.quant.as_str().to_string());
+            d.format = Some(i.format);
+            d.streamer = e.streamer().map(std::sync::Arc::downgrade);
+            d.prompt_cache = e.prompt_cache_info().map(|(dir, _, _)| dir);
+        }
+        d
+    }
+
     fn kind(&self) -> Kind {
         match self {
             Loaded::Chat(_) => Kind::Chat,
@@ -125,6 +162,23 @@ impl Loaded {
             Loaded::Video(_) => Kind::Video,
         }
     }
+}
+
+/// What is known of a loaded model beyond its spec (chat models: from the engine).
+#[derive(Clone, Debug)]
+pub(crate) struct Details {
+    /// `cpu` or the GPU backend's name (chat models).
+    pub device: Option<String>,
+    pub model_type: Option<String>,
+    pub quant: Option<String>,
+    pub format: Option<&'static str>,
+    /// When it was loaded (Unix time) and how long that took.
+    pub loaded_at: u64,
+    pub load_secs: f64,
+    /// The weight streamer of a model streamed from disk (not kept alive by this).
+    pub streamer: Option<std::sync::Weak<crate::stream::Streamer>>,
+    /// The prompt cache's directory.
+    pub prompt_cache: Option<PathBuf>,
 }
 
 /// One model of the whitelist.
@@ -144,6 +198,11 @@ pub(crate) struct Entry {
     used_at: AtomicU64,
     /// Device memory the model took when it was loaded (0: none, or no discrete GPU).
     vram: AtomicU64,
+    /// While loaded: what the status page shows of it.
+    details: Mutex<Option<Details>>,
+    /// The prompt-cache fingerprint of the chat model, once loaded (kept after an unload, so
+    /// that its snapshots can still be told apart).
+    fingerprint: Mutex<Option<String>>,
 }
 
 impl Entry {
@@ -170,7 +229,16 @@ impl Entry {
             retired: AtomicBool::new(false),
             used_at: AtomicU64::new(now_ms()),
             vram: AtomicU64::new(0),
+            details: Mutex::new(None),
+            fingerprint: Mutex::new(None),
         }
+    }
+
+    /// Forgets the loaded model's figures (it was just unloaded); returns the bytes it counted.
+    fn unloaded(&self) -> u64 {
+        self.vram.store(0, Ordering::Relaxed);
+        *lock(&self.details) = None;
+        self.bytes.swap(0, Ordering::Relaxed)
     }
 
     fn kind(&self) -> Option<Kind> {
@@ -194,6 +262,12 @@ pub(crate) struct EntryStatus {
     pub busy: bool,
     /// Memory counted for it while loaded.
     pub bytes: u64,
+    /// Device memory it took at its load (discrete GPUs).
+    pub vram: u64,
+    pub details: Option<Details>,
+    /// Seconds since its last use.
+    pub idle_secs: f64,
+    pub fingerprint: Option<String>,
 }
 
 pub(crate) struct Registry {
@@ -334,8 +408,7 @@ impl Registry {
                 .try_lock()
                 .map_err(|_| ApiError::new(409, format!("{} is in use; try again once its request is done", spec.id)))?;
             *g = None;
-            old.bytes.store(0, Ordering::Relaxed);
-            old.vram.store(0, Ordering::Relaxed);
+            old.unloaded();
             old.retired.store(true, Ordering::Relaxed);
         }
         entries.push(fresh);
@@ -413,8 +486,7 @@ impl Registry {
             .try_lock()
             .map_err(|_| ApiError::new(409, format!("{id} is in use; try again once its request is done")))?;
         let was = g.take().is_some();
-        e.bytes.store(0, Ordering::Relaxed);
-        e.vram.store(0, Ordering::Relaxed);
+        e.unloaded();
         if was && self.log {
             eprintln!("[unloaded {id}]");
         }
@@ -443,8 +515,37 @@ impl Registry {
                 loaded: e.bytes.load(Ordering::Relaxed) > 0,
                 busy: e.busy(),
                 bytes: e.bytes.load(Ordering::Relaxed),
+                vram: e.vram.load(Ordering::Relaxed),
+                details: lock(&e.details).clone(),
+                idle_secs: now_ms().saturating_sub(e.used_at.load(Ordering::Relaxed)) as f64 / 1e3,
+                fingerprint: lock(&e.fingerprint).clone(),
             })
             .collect()
+    }
+
+    /// Unloads model `id`, waiting up to `wait` for the request using it to end (after
+    /// cancelling it, say). False when it was not loaded; a 409 when it is still in use.
+    pub fn unload_waiting(&self, id: &str, wait: std::time::Duration) -> ApiResult<bool> {
+        let t0 = std::time::Instant::now();
+        loop {
+            match self.unload(id) {
+                Err(e) if e.status == 409 && t0.elapsed() < wait => std::thread::sleep(std::time::Duration::from_millis(25)),
+                r => return r,
+            }
+        }
+    }
+
+    /// `f` on every loaded chat engine that is idle (never waits): `(id, f's result)`.
+    pub fn each_idle_engine<R>(&self, mut f: impl FnMut(&mut Engine) -> R) -> Vec<(String, R)> {
+        let mut out = Vec::new();
+        for e in self.active() {
+            if let Ok(mut g) = e.slot.try_lock()
+                && let Some(Loaded::Chat(engine)) = g.as_mut()
+            {
+                out.push((e.spec.id.clone(), f(engine)));
+            }
+        }
+        out
     }
 
     /// Whether a model whose files are under `folder` is loaded or in use.
@@ -510,16 +611,26 @@ impl Registry {
     pub fn acquire_with(&self, id: &str, want: Kind, mut on: Option<OnStage<'_, '_>>) -> ApiResult<Lease<'_>> {
         let gone = || ApiError::new(499, "the client closed the request");
         let entry = self.find(id)?;
+        // The request this thread runs (the status page's), which may be cancelled while it
+        // waits.
+        let task = activity::current();
+        activity::set_model(id);
         let mut guard = match (&mut on, entry.slot.try_lock()) {
             (_, Ok(g)) => g,
             (_, Err(std::sync::TryLockError::Poisoned(p))) => p.into_inner(),
-            (None, Err(std::sync::TryLockError::WouldBlock)) => lock(&entry.slot),
+            (None, Err(std::sync::TryLockError::WouldBlock)) if task.is_none() => lock(&entry.slot),
             // In use: say so every two seconds until it is free.
-            (Some(on), Err(std::sync::TryLockError::WouldBlock)) => {
+            (on, Err(std::sync::TryLockError::WouldBlock)) => {
+                activity::set_stage(activity::Stage::Queued);
                 let mut next = std::time::Instant::now();
                 loop {
+                    if activity::cancelled() {
+                        return Err(activity::cancelled_error());
+                    }
                     if std::time::Instant::now() >= next {
-                        if !on(&Stage::Waiting) {
+                        if let Some(on) = on.as_mut()
+                            && !on(&Stage::Waiting)
+                        {
                             return Err(gone());
                         }
                         next = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -533,7 +644,11 @@ impl Registry {
                 }
             }
         };
+        if activity::cancelled() {
+            return Err(activity::cancelled_error());
+        }
         if guard.is_none() {
+            activity::set_stage(activity::Stage::Loading);
             let load = || -> ApiResult<Loaded> {
                 let (kind, image) = self.detect(entry).map_err(|e| ApiError::new(500, format!("model {id}: {e:#}")))?;
                 if kind != want {
@@ -543,9 +658,11 @@ impl Registry {
                     .map_err(|e| ApiError::new(500, format!("load {id}: {e:#}")))
             };
             *guard = Some(match &mut on {
-                None => load()?,
-                Some(on) => {
-                    if !on(&Stage::Loading) {
+                None if task.is_none() => load()?,
+                on => {
+                    if let Some(on) = on.as_mut()
+                        && !on(&Stage::Loading)
+                    {
                         return Err(gone());
                     }
                     // Downloads report through the hook; once the last file is whole the rest
@@ -554,15 +671,30 @@ impl Registry {
                     {
                         let mut hook = |p: &crate::hf::Progress| {
                             let last = p.count > 0 && p.index == p.count && p.total == Some(p.done);
-                            on(&Stage::Downloading {
-                                file: p.file,
-                                index: p.index,
-                                count: p.count,
-                                done: p.done,
-                                total: p.total,
-                            }) && (!last || on(&Stage::Loading))
+                            if p.index > 0 {
+                                activity::download(p.done, p.total);
+                                if last {
+                                    activity::set_stage(activity::Stage::Loading);
+                                }
+                            }
+                            let Some(on) = on.as_mut() else { return !activity::cancelled() };
+                            !activity::cancelled()
+                                && on(&Stage::Downloading {
+                                    file: p.file,
+                                    index: p.index,
+                                    count: p.count,
+                                    done: p.done,
+                                    total: p.total,
+                                })
+                                && (!last || on(&Stage::Loading))
                         };
-                        crate::hf::with_progress(&mut hook, || Ok(load())).map_err(|_| gone())??
+                        crate::hf::with_progress(&mut hook, || Ok(load())).map_err(|_| {
+                            if activity::cancelled() {
+                                activity::cancelled_error()
+                            } else {
+                                gone()
+                            }
+                        })??
                     }
                     // Without `hf` nothing is downloaded: the wait is the load alone.
                     #[cfg(not(feature = "hf"))]
@@ -573,6 +705,12 @@ impl Registry {
         let kind = guard.as_ref().unwrap().kind();
         if kind != want {
             return Err(wrong_kind(id, kind, want));
+        }
+        if let Some(t) = &task {
+            if let Some(h) = guard.as_ref().unwrap().cancel_hook() {
+                t.on_cancel(h);
+            }
+            activity::set_stage(activity::Stage::Generating);
         }
         entry.last_used.store(self.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
         entry.used_at.store(now_ms(), Ordering::Relaxed);
@@ -679,8 +817,7 @@ impl Registry {
         if g.take().is_none() {
             return false;
         }
-        let b = e.bytes.swap(0, Ordering::Relaxed);
-        e.vram.store(0, Ordering::Relaxed);
+        let b = e.unloaded();
         if self.log {
             eprintln!("[unloaded {} ({:.1} GB) {why}]", e.spec.id, b as f64 / 1e9);
         }
@@ -903,6 +1040,10 @@ impl Registry {
             _ => 0,
         };
         e.vram.store(vram, Ordering::Relaxed);
+        *lock(&e.details) = Some(loaded.details(t0.elapsed().as_secs_f64()));
+        if let Loaded::Chat(engine) = &loaded {
+            *lock(&e.fingerprint) = Some(engine.prompt_cache_fingerprint().to_string());
+        }
         crate::model_cache::touch(src, self.cache_dir.as_deref());
         if self.log {
             eprintln!("[loaded {} in {:.1}s]", spec.id, t0.elapsed().as_secs_f64());

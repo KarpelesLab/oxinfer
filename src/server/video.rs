@@ -144,6 +144,27 @@ impl Videos {
             .ok_or_else(|| ApiError::new(404, format!("no video {id:?}")).code("video_not_found"))
     }
 
+    /// Cancels job `id` if it is running (as `POST /v1/videos/{id}/cancel`): false when there
+    /// is no such running job.
+    pub fn cancel(&self, id: &str) -> bool {
+        let Ok(j) = self.find(id) else { return false };
+        if !j.running() {
+            return false;
+        }
+        j.cancel.store(true, Ordering::Relaxed);
+        j.set(|s| {
+            if s.status == "queued" || s.stage == "waiting" {
+                s.stage = "cancelling";
+            }
+        });
+        true
+    }
+
+    /// The running jobs (the status page).
+    pub fn running(&self) -> Vec<Value> {
+        lock(&self.jobs).iter().filter(|j| j.running()).map(|j| j.to_json()).collect()
+    }
+
     /// Drops expired files and the oldest finished jobs beyond [`KEEP_JOBS`].
     fn prune(&self) {
         let mut jobs = lock(&self.jobs);

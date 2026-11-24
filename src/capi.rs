@@ -484,6 +484,13 @@ pub unsafe extern "C" fn oxi_engine_flush_prompt_cache(e: *mut OxiEngine) -> c_i
     guard(-1, || Ok(c_int::from(lock(unsafe { engine(e) }?).flush_prompt_cache()?)))
 }
 
+/// Removes this model's snapshots from the prompt cache (option `prompt_cache`; other models'
+/// stay) and drops the conversation waiting to be stored. Returns the snapshots removed, or -1.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_engine_clear_prompt_cache(e: *mut OxiEngine) -> i64 {
+    guard(-1, || Ok(lock(unsafe { engine(e) }?).clear_prompt_cache().0 as i64))
+}
+
 /// Detected CPU features and GPUs (the CLI's `--devices` report).
 #[unsafe(no_mangle)]
 pub extern "C" fn oxi_devices() -> *mut c_char {
@@ -2953,6 +2960,62 @@ pub unsafe extern "C" fn oxi_server_unload(s: *mut OxiServer) -> c_int {
     guard(-1, || {
         unsafe { server(s) }?.api.unload_all();
         Ok(0)
+    })
+}
+
+/// Unloads model `id` now (it stays listed and loads again on its next request). Returns 1 if
+/// it was loaded, 0 if not, -1 on error (not listed, or a request is using it).
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_server_unload_model(s: *mut OxiServer, id: *const c_char) -> c_int {
+    guard(-1, || {
+        let id = unsafe { str_arg(id, "id") }?;
+        Ok(c_int::from(unsafe { server(s) }?.api.unload(id)?))
+    })
+}
+
+/// What the server is doing, as JSON (`Api::status`, the web GUI's status page): uptime, the
+/// requests in flight and recent ones, the models with their memory and device, the process's
+/// and the machine's resources, the prompt caches. Free with `oxi_string_free`; NULL on error.
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_server_status(s: *mut OxiServer) -> *mut c_char {
+    guard(std::ptr::null_mut(), || {
+        Ok(out_string(unsafe { server(s) }?.api.status().to_string()))
+    })
+}
+
+/// Cancels the request in flight `id` (`req-N`, from `oxi_server_status`) or video job
+/// (`video_...`): it stops at its next token or step and frees its model; its client gets an
+/// error (status 499). Returns 1, 0 when there is no such request, or -1.
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_server_cancel(s: *mut OxiServer, id: *const c_char) -> c_int {
+    guard(-1, || {
+        let id = unsafe { str_arg(id, "id") }?;
+        Ok(c_int::from(unsafe { server(s) }?.api.cancel(id)))
+    })
+}
+
+/// Removes prompt-cache snapshots: of model `model` (an id loaded since the server started), or
+/// all of them when `model` is NULL. Returns the snapshots removed, or -1.
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_server_clear_prompt_cache(s: *mut OxiServer, model: *const c_char) -> i64 {
+    guard(-1, || {
+        let model = unsafe { opt_str_arg(model, "model") }?;
+        Ok(unsafe { server(s) }?.api.clear_prompt_cache(model)?.entries as i64)
+    })
+}
+
+/// Lets go of the cached experts of the models streamed from disk (model `model`, or all when
+/// NULL); they are read from storage again when next needed. Returns the bytes, or -1.
+#[cfg(all(feature = "server", not(target_arch = "wasm32")))]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn oxi_server_free_caches(s: *mut OxiServer, model: *const c_char) -> i64 {
+    guard(-1, || {
+        let model = unsafe { opt_str_arg(model, "model") }?;
+        Ok(unsafe { server(s) }?.api.free_caches(model)? as i64)
     })
 }
 

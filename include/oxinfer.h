@@ -302,6 +302,11 @@ int64_t oxi_engine_load_session(OxiEngine *engine, const char *path);
  * to write) or -1. */
 int oxi_engine_flush_prompt_cache(OxiEngine *engine);
 
+/* With prompt_cache set: removes this model's snapshots from the prompt cache (those of other
+ * models and options stay) and drops the conversation waiting to be stored. Returns the
+ * snapshots removed, or -1. */
+int64_t oxi_engine_clear_prompt_cache(OxiEngine *engine);
+
 /* A typed decision ("System 1" of the Jev models): one prefill pass, a calibrated probability per
  * option, no generation. The conversation is not disturbed. `request_json` is a /v1/decide body:
  *   {"kind": "noul" | "score" | "choice",
@@ -1141,6 +1146,33 @@ int oxi_server_handle(OxiServer *s, const char *method, const char *path, const 
 
 /* Unloads every idle model (each loads again on its next request). Returns 0 or -1. */
 int oxi_server_unload(OxiServer *s);
+
+/* Unloads model `id` now (it stays listed and loads again on its next request). Returns 1 (it
+ * was loaded), 0 (it was not) or -1 (not listed, or a request is using it). */
+int oxi_server_unload_model(OxiServer *s, const char *id);
+
+/* What the server is doing, as JSON (what the web GUI's status page shows, GET
+ * /api/web/activity): "version", "uptime", "requests" (in flight: "id" req-N, "kind", "model",
+ * "stage" starting/queued/downloading/loading/prompt/generating, "elapsed", "tokens",
+ * "tokens_per_sec", "step", "client"), "videos", "recent", "models" ("memory", "vram", "device",
+ * "state", "stream"), "process" ("cpu_percent", "resident", "footprint"), "machine", "gpu",
+ * "prompt_cache" (per directory, snapshots by model). Free with oxi_string_free; NULL on error. */
+char *oxi_server_status(OxiServer *s);
+
+/* Cancels request `id` ("req-N" from oxi_server_status, or a "video_..." job): one waiting for
+ * its model gives up at once, a generation stops at its next token or denoising step and frees
+ * its model; its client gets status 499 with code "cancelled" (a stream ends with an error
+ * event). Returns 1, 0 (no such request in flight) or -1. */
+int oxi_server_cancel(OxiServer *s, const char *id);
+
+/* Removes prompt-cache snapshots (the prompt_cache directory and the models' own): of model
+ * `model` (an id loaded since the server started), or all of them when NULL. Loaded idle models
+ * forget them too. Returns the snapshots removed, or -1. */
+int64_t oxi_server_clear_prompt_cache(OxiServer *s, const char *model);
+
+/* Lets go of the experts the models streamed from disk keep cached (model `model`, or all when
+ * NULL); they are read from storage again when next needed. Returns the bytes, or -1. */
+int64_t oxi_server_free_caches(OxiServer *s, const char *model);
 
 /* Stops the listener if it runs and frees the server (NULL is ignored). */
 void oxi_server_free(OxiServer *s);

@@ -2752,6 +2752,23 @@ impl Engine {
         self.pcache.as_ref().map(|c| (c.dir().to_path_buf(), c.entries().len(), c.bytes()))
     }
 
+    /// Removes this model's snapshots from the prompt cache ([`EngineOptions::prompt_cache`];
+    /// those of other models and options stay) and drops the conversation waiting to be stored.
+    /// Returns the snapshots removed and their bytes ((0, 0) without a prompt cache).
+    pub fn clear_prompt_cache(&mut self) -> (usize, u64) {
+        self.pcache_pending = false;
+        let Some(pc) = &mut self.pcache else { return (0, 0) };
+        // Snapshots written or removed by other engines and processes since it was read.
+        pc.rescan();
+        pc.clear(Some(&self.fingerprint))
+    }
+
+    /// What this model's prompt-cache snapshots are stored under (their `model` metadata): the
+    /// model and the options its state depends on, hashed.
+    pub fn prompt_cache_fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
     /// Writes the current conversation to the prompt cache unless it is too short, unknown or
     /// already there.
     fn store_snapshot(&mut self) -> Result<bool> {

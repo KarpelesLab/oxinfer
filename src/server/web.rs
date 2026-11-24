@@ -17,7 +17,13 @@
 //! | `POST /api/web/downloads/{id}/cancel` | cancels it (the partial file stays, a later download resumes it) |
 //! | `GET /api/web/models` | the models clients can use (`/v1/models`), with their load state |
 //! | `POST /api/web/models/load` | `{"model", "id", "options"}`: adds the model and loads it in the background |
-//! | `POST /api/web/models/unload` | `{"id"}`: unloads it (it stays listed and loads again on use) |
+//! | `POST /api/web/models/unload` | `{"id"}`: unloads it (it stays listed and loads again on use); with `"cancel": true` its requests are cancelled first |
+//! | `GET /api/web/activity` | the status page: uptime, requests in flight and recent ones, models with memory and device, process, machine and GPU, prompt caches ([`Api::status`]) |
+//! | `GET /api/web/requests` | the requests in flight (running and queued) and the running video jobs |
+//! | `POST /api/web/requests/{id}/cancel` | cancels one (also `DELETE /api/web/requests/{id}`): it stops at its next token or step and frees its model |
+//! | `GET /api/web/prompt-cache` | the prompt caches: per directory the snapshots by model |
+//! | `POST /api/web/prompt-cache/clear` | `{"model"}`, `{"fingerprint"}` or `{}` (all), optionally `"dir"`: removes snapshots |
+//! | `POST /api/web/caches/free` | `{"model"}` or `{}`: lets go of the streamed models' cached experts |
 //! | `GET /api/web/update` | this version, the latest release, whether it is newer and can be installed from here |
 //! | `POST /api/web/update` | installs the latest release over this executable and restarts into it ([`allow_self_update`]) |
 //!
@@ -25,8 +31,8 @@
 //! (POST, DELETE) must be JSON and, when the browser sends an `Origin`, come from the page's own
 //! origin; on a loopback listener the `Host` must be a loopback name (against DNS rebinding).
 //! Bound to a non-loopback address without an API key, the management API is read-only:
-//! downloads, deletions, loads, unloads and updates are refused with 403 (`oxinfer web` warns at
-//! start).
+//! downloads, deletions, loads, unloads, cancels, cache clearing and updates are refused with 403
+//! (`oxinfer web` warns at start).
 
 mod update;
 
@@ -477,6 +483,36 @@ fn management(api: &Arc<Api>, w: &WebState, req: &ApiRequest, rest: &str) -> Api
         (["update"], true, _, _) => json_ok(update_status(api, w)),
         (["update"], _, true, _) => start_update(api, w),
         (["models"], true, _, _) => json_ok(models(api, w)),
+        (["activity"], true, _, _) => json_ok(api.status()),
+        (["requests"], true, _, _) => {
+            let data: Vec<Value> = api.requests().iter().map(super::RequestInfo::to_json).collect();
+            json_ok(json!({"data": data, "videos": api.videos.running()}))
+        }
+        (["requests", id, "cancel"], _, true, _) | (["requests", id], _, _, true) => {
+            if !api.cancel(id) {
+                return Err(ApiError::new(404, format!("no request {id:?} in flight")).code("request_not_found"));
+            }
+            if api.opts.log {
+                eprintln!("[cancelled {id}]");
+            }
+            json_ok(json!({"id": id, "cancelled": true}))
+        }
+        (["prompt-cache"], true, _, _) => json_ok(super::status::prompt_cache_json(api, &api.models.status())),
+        (["prompt-cache", "clear"], _, true, _) => {
+            let b = body(req)?;
+            let r = super::status::clear_prompt_cache(
+                api,
+                str_field(&b, &["model", "id"]),
+                str_field(&b, &["fingerprint"]),
+                str_field(&b, &["dir"]),
+            )?;
+            json_ok(json!({"removed": r.entries, "bytes": r.bytes}))
+        }
+        (["caches", "free"], _, true, _) => {
+            let b = body(req)?;
+            let freed = super::status::free_caches(api, str_field(&b, &["model", "id"]))?;
+            json_ok(json!({"freed": freed}))
+        }
         (["models", "load"], _, true, _) => load(api, w, &body(req)?),
         (["models", "unload"], _, true, _) => {
             let b = body(req)?;
@@ -492,6 +528,12 @@ fn management(api: &Arc<Api>, w: &WebState, req: &ApiRequest, rest: &str) -> Api
             if let Some(l) = loading {
                 l.cancel.store(true, Ordering::Relaxed);
                 return json_ok(json!({"id": id, "unloaded": false, "cancelling": true}));
+            }
+            // In use: its requests cancelled, unloaded once they have stopped.
+            if b.get("cancel").and_then(Value::as_bool) == Some(true) {
+                let n = api.activity.cancel_model(id);
+                let was = api.models.unload_waiting(id, Duration::from_secs(10))?;
+                return json_ok(json!({"id": id, "unloaded": was, "cancelled": n}));
             }
             let was = api.models.unload(id)?;
             json_ok(json!({"id": id, "unloaded": was}))

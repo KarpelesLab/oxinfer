@@ -3514,6 +3514,11 @@ impl Backend for MetalBackend {
         (v > 0).then_some(v)
     }
 
+    fn allocated_memory(&self) -> Option<u64> {
+        let f: MsgU = self.o.msg_send();
+        Some(unsafe { f(self.device, self.o.sel(c"currentAllocatedSize")) })
+    }
+
     fn dit_session(&'static self) -> Option<Box<dyn crate::gpu::dit::Session>> {
         self.dit_session_impl()
     }

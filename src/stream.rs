@@ -894,6 +894,50 @@ impl Streamer {
         Some(n)
     }
 
+    /// Bytes of on-demand parts (MoE experts) the part cache holds now, and its capacity.
+    pub fn part_cache_usage(&self) -> (u64, u64) {
+        let pc = self.inner.parts.lock().unwrap();
+        (pc.used, pc.cap)
+    }
+
+    /// Lets go of the on-demand parts the part cache keeps between uses (except those in use or
+    /// read ahead for the pass to come) and drops their pages from the page cache, in the
+    /// background. They are read from storage again when next needed. Returns the bytes let go.
+    pub fn release_part_cache(&self) -> u64 {
+        let inner = &self.inner;
+        let mut out = Vec::new();
+        let mut bytes = 0;
+        {
+            let mut pc = inner.parts.lock().unwrap();
+            let busy: Vec<(usize, usize)> = pc
+                .in_use
+                .iter()
+                .chain(pc.pending.iter())
+                .chain(pc.ready.iter())
+                .chain(pc.loading.iter())
+                .copied()
+                .collect();
+            let gone: Vec<((usize, usize), u64, u64)> = pc
+                .entries
+                .iter()
+                .filter(|(k, _)| !busy.contains(k))
+                .map(|(k, &(stamp, b))| (*k, stamp, b))
+                .collect();
+            for (k, stamp, b) in gone {
+                pc.entries.remove(&k);
+                pc.by_use.remove(&stamp);
+                pc.used -= b;
+                bytes += b;
+                if let Some(l) = &mut pc.log {
+                    l.push((k, false));
+                }
+                out.push(k);
+            }
+        }
+        inner.queue_evictions(out.into_iter().map(|(u, p)| Evict::Part(u, p)));
+        bytes
+    }
+
     /// Changes the emulated storage bandwidth while running.
     pub fn set_flash_bytes_per_sec(&self, rate: Option<f64>) {
         self.inner.rate.store(rate.map_or(0, f64::to_bits), Relaxed);

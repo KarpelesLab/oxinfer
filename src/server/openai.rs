@@ -700,6 +700,7 @@ fn run_chat(api: &Api, req: &ChatRequest, emit: Emit, on: Option<OnStage<'_, '_>
     let mut on = on;
     let mut lease = api.models.acquire_with(&req.model, Kind::Chat, on.as_deref_mut())?;
     let mut prompt = |done: usize, total: usize| {
+        super::activity::prompt(done, total);
         if let Some(on) = on.as_deref_mut() {
             on(&Stage::Prompt { done, total });
         }
@@ -722,6 +723,7 @@ fn run_chat(api: &Api, req: &ChatRequest, emit: Emit, on: Option<OnStage<'_, '_>
         let reply = crate::generate::with_prefill_progress(&mut prompt, || {
             engine.chat(&messages, &mut |d| {
                 logs.push(d.logprob);
+                super::activity::token();
                 let ok = if d.thinking {
                     thinking.push_str(d.text);
                     d.text.is_empty() || emit(i, d.text, true, &[])
@@ -730,7 +732,8 @@ fn run_chat(api: &Api, req: &ChatRequest, emit: Emit, on: Option<OnStage<'_, '_>
                     text.push_str(&t);
                     t.is_empty() || emit(i, &t, false, &logs.take())
                 };
-                gone |= !ok;
+                // A cancel from the status page stops it as a client gone away would.
+                gone |= !ok || super::activity::cancelled();
                 if gone || filter.hit { Flow::Stop } else { Flow::Continue }
             })
         })
@@ -1603,6 +1606,7 @@ impl Completion {
         let mut on = on;
         let mut lease = api.models.acquire_with(&self.model, Kind::Chat, on.as_deref_mut())?;
         let mut reading = |done: usize, total: usize| {
+            super::activity::prompt(done, total);
             if let Some(on) = on.as_deref_mut() {
                 on(&Stage::Prompt { done, total });
             }
@@ -1645,9 +1649,10 @@ impl Completion {
                 let reply = crate::generate::with_prefill_progress(&mut reading, || {
                     engine.complete(&prompt, &mut |d| {
                         logs.push(d.logprob);
+                        super::activity::token();
                         let t = filter.push(d.text);
                         text.push_str(&t);
-                        gone |= !t.is_empty() && !emit(k, &t, &logs.take());
+                        gone |= (!t.is_empty() && !emit(k, &t, &logs.take())) || super::activity::cancelled();
                         if gone || filter.hit { Flow::Stop } else { Flow::Continue }
                     })
                 })

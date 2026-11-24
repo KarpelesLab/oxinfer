@@ -739,6 +739,23 @@ impl PromptCache {
         self.entries.retain(|e| e.path != path);
         let _ = std::fs::remove_file(path);
     }
+
+    /// Removes the snapshots of `model` (a fingerprint; None: of every model) and their files.
+    /// Returns how many were removed and their bytes.
+    pub fn clear(&mut self, model: Option<&str>) -> (usize, u64) {
+        let (gone, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.entries)
+            .into_iter()
+            .partition(|e| model.is_none_or(|m| e.model == m));
+        self.entries = keep;
+        let mut out = (0, 0);
+        for e in gone {
+            if std::fs::remove_file(&e.path).is_ok() {
+                out.0 += 1;
+                out.1 += e.bytes;
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -832,6 +849,13 @@ mod tests {
         c.store("m", &[8, 8], false, write(&[8, 8], 50_000)).unwrap();
         assert!(c.entries().len() <= 2);
         assert!(c.entries().iter().any(|e| e.tokens == [8, 8]));
+        // Cleared by model, then all of it.
+        c.store("other", &[7, 7], false, write(&[7, 7], 10)).unwrap();
+        let n = c.entries().len();
+        assert_eq!(c.clear(Some("other")).0, 1);
+        assert_eq!(c.entries().len(), n - 1);
+        assert_eq!(c.clear(None).0, n - 1);
+        assert!(c.entries().is_empty() && PromptCache::open(&dir, 1 << 20).unwrap().entries().is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 }
