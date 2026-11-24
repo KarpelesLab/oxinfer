@@ -58,8 +58,25 @@ off), and a next turn whose past reply lost its thinking goes back to the previo
 last token. Snapshots (`--save-session`, `--prompt-cache`) hold the host's session, which stays
 authoritative on Metal too (V4.1's GPU decode appends each pass's keys to it); the device's
 copies of the caches are rebuilt from it at the first pass after a restore or a cut back
-(`deepseek41_gpu.rs`). Not with a DSpark draft (V4's draft keeps its own state; snapshots and
-checkpoints are refused there).
+(`deepseek41_gpu.rs`).
+
+**With a draft.** Inkling-2 with its MTP head or DSpark drafter and DeepSeek V4 with its DSpark
+draft keep checkpoints and snapshots too (they used to refuse them: the draft keeps its own
+state). The draft's state is its context cache (per position and draft layer, keys computed from
+that position's target features alone), the features of positions not yet in it, and for
+Inkling-2's drafter its head's context rows. A checkpoint (`DsparkDecoder::checkpoint`, beside the
+target's, dropped with it) holds what cutting the draft's session back cannot bring back: the
+waiting features, Inkling-2's head rows (it keeps the last 512 positions; the head reads the row
+before the anchor) and, for a draft whose every layer has a window, its cache's rows from the
+window and 256 positions before the checkpoint (Inkling-2-Mini's drafter has a full-attention
+layer and V4's draft keeps every position, so their caches are only cut back). That is a few MB
+(Inkling-2-Mini's head rows: 512 of 2304 floats, 4.7 MB). `DsparkDecoder::cut_to` goes back to the
+target's checkpoint and puts the draft's state back: the decoder then drafts exactly as one that
+ran the same tokens (the same draft logits bit for bit, so the same acceptance) and its greedy
+output is that of plain decoding. Snapshots hold the draft's cache, waiting features and head
+rows beside the target's session; the drafter's device copy of its cache (Inkling-2 on Metal) is
+uploaded again from the host's at its next pass. Re-running the draft from the tokens is not an
+option (its context comes from the target's features at every position: a whole prefill).
 
 Measured on DeepSeek-V4.1-Flash-1017 (ISTA-DASLab GSQ-RCO IQ1_M, M5 Max, Metal decode, warm page
 cache, other jobs on the machine at load 4-10) with `examples/chat_turns.rs`: a 2131-token
@@ -96,14 +113,19 @@ stored. The server's status page lists the snapshots per directory and model and
 [the server](server.md#status-cancelling-and-the-caches)).
 
 Families: Gemma 4 / 3, Qwen3, Qwen3.5 / 3.6 / 3.8 (dense, MoE, Qwen2.5-VL), Llama 3, with DSpark
-or MTP drafts and the Gemma 4 assistant drafter, Inkling-2 (Small and Mini, without a draft; on
+or MTP drafts and the Gemma 4 assistant drafter, Inkling-2 (Small and Mini, with or without the
+MTP / DSpark drafter; on
 the CPU and on Metal, whose session buffers are read in place, the KV caches in their own f32 /
 f16 / q8 format: `src/inkling.rs`, `tests` `snapshot_round_trip_*`; not on CUDA yet), DeepSeek
-V4 / V4.1 and ERNIE 5.5 (without a draft; CPU and Metal decode: `src/deepseek4.rs` tests
+V4 / V4.1 and ERNIE 5.5 (V4 with or without its DSpark draft; CPU and Metal decode:
+`src/deepseek4.rs` tests
 `checkpoint_cut_back_matches_fresh`, `snapshot_round_trip`, `deepseek41_gpu.rs`
 `gpu_checkpoint_cut_back_matches_fresh`, `gpu_snapshot_round_trip`, `tests/server.rs`
 `deepseek_chat_reuses_the_cache_after_thinking`, on tiny random models from
-`src/deepseek4_tiny.rs`). Not (yet): Mistral Large 4, Qwen3.8-Flash-Next (Qwen4-Exp: n-gram and indexer state), Core ML
+`src/deepseek4_tiny.rs`; with drafts: `inkling.rs` and `deepseek4.rs`
+`draft_checkpoint_cut_back_matches_fresh`, `engine.rs` `drafts_reuse_the_previous_prompt`,
+`drafts_prompt_cache_restores`, on the tiny drafts of `inkling_tiny.rs` `write_tiny_mtp` and
+`deepseek4_tiny.rs` `write_draft`). Not (yet): Mistral Large 4, Qwen3.8-Flash-Next (Qwen4-Exp: n-gram and indexer state), Core ML
 models.
 
 Checks (M5 Max, Metal; the machine was shared with other jobs at load 30-95, which slowed the

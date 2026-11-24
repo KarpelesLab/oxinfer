@@ -336,7 +336,8 @@ pub struct EngineOptions {
     /// `/tmp` is refused. Key `prompt_cache` (a directory, `auto` for
     /// [`crate::snapshot::default_dir`], empty or `none` for none). Families: Gemma 4 / 3, Qwen
     /// (Qwen3, Qwen3.5 / 3.6 / 3.8 dense and MoE, Qwen2.5-VL), Llama 3, with or without their
-    /// DSpark / MTP drafts, Inkling-2 and DeepSeek V4 / V4.1 without a draft (CPU and Metal);
+    /// DSpark / MTP drafts, Inkling-2 and DeepSeek V4 / V4.1, with or without their drafts (CPU
+    /// and Metal);
     /// not Mistral Large 4, Qwen4-Exp, Core ML, nor the Gemma 4 assistant drafter's state (none:
     /// it keeps no cache).
     pub prompt_cache: Option<PathBuf>,
@@ -354,7 +355,8 @@ pub struct EngineOptions {
     /// windows and compressors' rows cannot be cut back further than 64 positions otherwise.
     /// Each holds the sliding layers' last window of keys and values (Inkling-2-Mini: about 650
     /// MB with f32 caches, 180 MB with q8; DeepSeek-V4.1-Flash: about 22 MB, the window's raw keys
-    /// and the compressors' pending rows, the compressed keys being shared). Past
+    /// and the compressors' pending rows, the compressed keys being shared; a draft's state
+    /// beside it: a few MB, see [`crate::dspark::DsparkDecoder::checkpoint`]). Past
     /// the cap the lowest one and the newest stay. Default [`DEFAULT_PROMPT_CHECKPOINTS`], 0
     /// turns them off. Key `prompt_checkpoints`.
     pub prompt_checkpoints: Option<usize>,
@@ -1336,6 +1338,8 @@ impl Lm {
             Lm::GemmaDspark { dec } => dec.write_state(w),
             Lm::Inkling2 { sess, .. } => sess.write_state(w),
             Lm::DeepSeek4 { sess, .. } => sess.write_state(w),
+            Lm::Inkling2Dspark { dec } => dec.write_state(w),
+            Lm::DeepSeek4Dspark { dec } => dec.write_state(w),
             _ => bail!("session snapshots are not supported for this model family"),
         }
     }
@@ -1350,6 +1354,8 @@ impl Lm {
             Lm::GemmaDspark { dec } => dec.read_state(r),
             Lm::Inkling2 { sess, .. } => sess.read_state(r),
             Lm::DeepSeek4 { sess, .. } => sess.read_state(r),
+            Lm::Inkling2Dspark { dec } => dec.read_state(r),
+            Lm::DeepSeek4Dspark { dec } => dec.read_state(r),
             _ => bail!("session snapshots are not supported for this model family"),
         }
     }
@@ -1361,21 +1367,28 @@ impl Lm {
             Lm::QwenMtp { dec } => dec.sess.exp.is_none(),
             Lm::QwenDspark { dec } => dec.sess.exp.is_none(),
             Lm::Inkling2 { model, .. } => model.snapshots(),
-            Lm::DeepSeek4 { .. } => true,
+            Lm::Inkling2Dspark { dec } => dec.model().snapshots(),
+            Lm::DeepSeek4 { .. } | Lm::DeepSeek4Dspark { .. } => true,
             _ => false,
         }
     }
     /// Whether the cache can go back to positions it took a checkpoint of (Inkling-2, whose
     /// convolutions and sliding windows cannot be cut back further than a few positions;
-    /// DeepSeek V4 / V4.1, whose sliding windows and compressors' rows cannot either).
+    /// DeepSeek V4 / V4.1, whose sliding windows and compressors' rows cannot either; with their
+    /// drafts, whose state goes back with them).
     fn checkpoints(&self) -> bool {
-        matches!(self, Lm::Inkling2 { .. } | Lm::DeepSeek4 { .. })
+        matches!(
+            self,
+            Lm::Inkling2 { .. } | Lm::DeepSeek4 { .. } | Lm::Inkling2Dspark { .. } | Lm::DeepSeek4Dspark { .. }
+        )
     }
     /// Takes a checkpoint of the current position, keeping at most `max` ([`Lm::checkpoints`]).
     fn checkpoint(&mut self, max: usize) {
         match self {
             Lm::Inkling2 { model, sess } => model.checkpoint(sess, max),
             Lm::DeepSeek4 { sess, .. } => sess.checkpoint(max),
+            Lm::Inkling2Dspark { dec } => dec.checkpoint(max),
+            Lm::DeepSeek4Dspark { dec } => dec.checkpoint(max),
             _ => {}
         }
     }
@@ -1384,6 +1397,8 @@ impl Lm {
         match self {
             Lm::Inkling2 { model, sess } => model.has_checkpoint(sess, pos),
             Lm::DeepSeek4 { sess, .. } => sess.has_checkpoint(pos),
+            Lm::Inkling2Dspark { dec } => dec.has_checkpoint(pos),
+            Lm::DeepSeek4Dspark { dec } => dec.has_checkpoint(pos),
             _ => false,
         }
     }
@@ -1393,6 +1408,8 @@ impl Lm {
         match self {
             Lm::Inkling2 { model, sess } => model.reachable(sess, len),
             Lm::DeepSeek4 { sess, .. } => sess.reachable(len),
+            Lm::Inkling2Dspark { dec } => dec.reachable(len),
+            Lm::DeepSeek4Dspark { dec } => dec.reachable(len),
             _ if self.truncatable() => len,
             _ => 0,
         }
@@ -1403,6 +1420,8 @@ impl Lm {
         let r = match self {
             Lm::Inkling2 { model, sess } => Some(model.cut_to(sess, len)),
             Lm::DeepSeek4 { sess, .. } => Some(sess.cut_to(len)),
+            Lm::Inkling2Dspark { dec } => Some(dec.cut_to(len)),
+            Lm::DeepSeek4Dspark { dec } => Some(dec.cut_to(len)),
             _ => None,
         };
         if let Some(r) = r {
@@ -1450,6 +1469,8 @@ impl Lm {
             Lm::GemmaDspark { dec } => drop(dec.prefill(ids, chunk)),
             Lm::Inkling2 { model, sess } => drop(generate::prefill(*model, sess, ids, chunk, &[])),
             Lm::DeepSeek4 { model, sess } => drop(generate::prefill(*model, sess, ids, chunk, &[])),
+            Lm::Inkling2Dspark { dec } => drop(dec.prefill(ids, chunk)),
+            Lm::DeepSeek4Dspark { dec } => drop(dec.prefill(ids, chunk)),
             _ => bail!("not supported for this model family"),
         }
         Ok(())
@@ -4663,6 +4684,115 @@ mod tests {
             let fresh = e.chat(&convo, &mut quiet).unwrap();
             assert_eq!(fresh.stats.cached_tokens + fresh.stats.restored_tokens, 0);
             assert_eq!(fresh.tokens, first.tokens, "v41 {v41}: against a fresh prefill");
+            std::fs::remove_dir_all(&cache).ok();
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// Speculative decoding's models with checkpoints: the tiny Inkling-2 with its MTP drafter
+    /// and the tiny DeepSeek V4 with a DSpark draft (each case: the folder, the options with the
+    /// draft).
+    fn draft_cases(tag: &str) -> Vec<(&'static str, PathBuf, Vec<(&'static str, String)>)> {
+        let ink = tiny_inkling(&format!("d{tag}"));
+        crate::inkling::tiny::write_tiny_mtp(&ink, 9, &[0, 2]).unwrap();
+        let ds = std::env::temp_dir().join(format!("oxinfer-ds4-engine-d{tag}-{}", std::process::id()));
+        let cfg = crate::deepseek4::tiny::write_chat(&ds, false, serde_json::json!({})).unwrap();
+        let draft = ds.join("dspark-draft.gguf");
+        crate::deepseek4::tiny::write_draft(&draft, &cfg, 7, 5).unwrap();
+        vec![
+            ("Inkling-2 MTP", ink, vec![("mtp", "on".into())]),
+            ("DeepSeek V4 DSpark", ds, vec![("draft", draft.display().to_string())]),
+        ]
+    }
+
+    /// On the CPU, with `kv` set; without a draft unless `kv` gives one.
+    fn draft_engine(dir: &Path, kv: &[(&str, String)]) -> Engine {
+        let mut o = cpu_options();
+        o.set("draft", "none").unwrap();
+        o.set("draft_device", "cpu").unwrap();
+        for (k, v) in kv {
+            o.set(k, v).unwrap();
+        }
+        let mut e = Engine::load(dir.to_str().unwrap(), &o).unwrap();
+        e.config_mut().max_tokens = 90;
+        e.config_mut().think = true;
+        e
+    }
+
+    /// With a draft, a next turn whose past reply is rendered otherwise than the model wrote it
+    /// and a regenerated reply reuse the cache as without one (the draft's state goes back with
+    /// the target's), and the greedy replies are those of the engine without the draft.
+    #[test]
+    fn drafts_reuse_the_previous_prompt() {
+        for (name, dir, with) in draft_cases("chat") {
+            let turns = |e: &mut Engine| {
+                let mut convo = vec![Message::system("You answer briefly. ".repeat(6)), Message::user("Tell me a story.")];
+                let r1 = e.chat(&convo, &mut quiet).unwrap();
+                convo.push(Message::assistant(format!("{}!", r1.text)));
+                convo.push(Message::user("And tomorrow?"));
+                let r2 = e.chat(&convo, &mut quiet).unwrap();
+                let r3 = e.chat(&convo, &mut quiet).unwrap();
+                [r1, r2, r3]
+            };
+            let spec = turns(&mut draft_engine(&dir, &with));
+            let plain = turns(&mut draft_engine(&dir, &[]));
+            assert!(spec.iter().map(|r| r.stats.drafted).sum::<usize>() > 0, "{name}: no drafts");
+            let len1 = spec[0].stats.prompt_tokens;
+            assert!(spec[0].tokens.len() > 64, "{name}: a short first reply");
+            assert!(
+                spec[1].stats.cached_tokens + 1 >= len1,
+                "{name}: {} cached of {len1}",
+                spec[1].stats.cached_tokens
+            );
+            let len2 = spec[1].stats.cached_tokens + spec[1].stats.prompt_tokens;
+            assert_eq!(spec[2].stats.cached_tokens, len2 - 1, "{name}");
+            for (i, (s, p)) in spec.iter().zip(&plain).enumerate() {
+                assert_eq!(s.stats.cached_tokens, p.stats.cached_tokens, "{name}: turn {i}");
+                assert_eq!(s.tokens, p.tokens, "{name}: turn {i}");
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// With a draft, conversations go to the prompt cache and come back from it in another
+    /// engine, whose greedy reply is the first engine's.
+    #[test]
+    fn drafts_prompt_cache_restores() {
+        for (name, dir, mut with) in draft_cases("pcache") {
+            let cache = std::env::temp_dir().join(format!("oxinfer-draft-pc-{}-{}", name.len(), std::process::id()));
+            let _ = std::fs::remove_dir_all(&cache);
+            with.push(("prompt_cache", cache.display().to_string()));
+            with.push(("prompt_cache_min_tokens", "8".into()));
+            let convo = vec![
+                Message::system("You answer briefly. ".repeat(6)),
+                Message::user("Name a famous library."),
+            ];
+            let first = {
+                let mut e = draft_engine(&dir, &with);
+                e.config_mut().max_tokens = 24;
+                let r = e.chat(&convo, &mut quiet).unwrap();
+                e.flush_prompt_cache().unwrap();
+                assert!(e.prompt_cache_info().unwrap().1 > 0, "{name}: nothing stored");
+                r
+            };
+            let mut e = draft_engine(&dir, &with);
+            e.config_mut().max_tokens = 24;
+            let again = e.chat(&convo, &mut quiet).unwrap();
+            assert_eq!(again.stats.restored_tokens, first.stats.prompt_tokens - 1, "{name}");
+            assert_eq!(again.tokens, first.tokens, "{name}");
+            assert!(again.stats.drafted > 0, "{name}: no drafts");
+            // The next turn from the snapshot of the whole conversation, in a third engine.
+            let mut convo = convo;
+            convo.push(Message::assistant(first.text.clone()));
+            convo.push(Message::user("Another one?"));
+            let next = e.chat(&convo, &mut quiet).unwrap();
+            e.flush_prompt_cache().unwrap();
+            drop(e);
+            let mut e = draft_engine(&dir, &with);
+            e.config_mut().max_tokens = 24;
+            let other = e.chat(&convo, &mut quiet).unwrap();
+            assert!(other.stats.restored_tokens > 0, "{name}");
+            assert_eq!(other.tokens, next.tokens, "{name}: the next turn");
             std::fs::remove_dir_all(&cache).ok();
             std::fs::remove_dir_all(&dir).ok();
         }

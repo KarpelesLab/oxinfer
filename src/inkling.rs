@@ -3263,6 +3263,23 @@ impl crate::intervene::Host for Inkling2Model<'_> {
     }
 }
 
+/// A speculative decoder's checkpoints ([`crate::dspark::DsparkDecoder::checkpoint`]): the
+/// session's own.
+impl crate::dspark::CheckpointTarget for Inkling2Model<'_> {
+    fn checkpoint(&self, sess: &mut Inkling2Session, max: usize) {
+        Inkling2Model::checkpoint(self, sess, max)
+    }
+    fn has_checkpoint(&self, sess: &Inkling2Session, pos: usize) -> bool {
+        Inkling2Model::has_checkpoint(self, sess, pos)
+    }
+    fn reachable(&self, sess: &Inkling2Session, len: usize) -> usize {
+        Inkling2Model::reachable(self, sess, len)
+    }
+    fn cut_to(&self, sess: &mut Inkling2Session, len: usize) -> Result<()> {
+        Inkling2Model::cut_to(self, sess, len)
+    }
+}
+
 /// What a speculative decoder needs of its target (a session goes back up to [`ROLLBACK`]
 /// positions).
 impl crate::dspark::Target for Inkling2Model<'_> {
@@ -3564,6 +3581,29 @@ mod tests {
 
     fn bits(v: &[f32]) -> Vec<u32> {
         v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// With the drafter (the tiny one of [`tiny::write_tiny_mtp`], one layer attending to every
+    /// position as the release's, or all three to a window): a decoder that went back to a
+    /// checkpoint further than its draft's head rows (and windowed cache) reach drafts and
+    /// decodes as a fresh one, and its snapshot continues as it does
+    /// ([`crate::dspark::checks::checkpoint_matches_fresh`]).
+    #[test]
+    fn draft_checkpoint_cut_back_matches_fresh() {
+        for local in [&[0usize, 2][..], &[0, 1, 2]] {
+            let tag = format!("dcp{}", local.len());
+            let m = tiny_model(&tag, KvCache::F32, false);
+            let dir = std::env::temp_dir().join(format!("oxinfer-ink-tiny-{tag}-{}", std::process::id()));
+            tiny::write_tiny_mtp(&dir, 9, local).unwrap();
+            let path = dir.join("mtp.safetensors");
+            let df: &'static ModelFiles = Box::leak(Box::new(ModelFiles::open(&path, true).unwrap()));
+            let d = crate::dspark::Dspark::load(&path, df, m.cfg.hidden_size, m.cfg.vocab_size, Quant::Bf16).unwrap();
+            check_draft(m, &d).unwrap();
+            let first = tokens(100 + 560, 0);
+            let next = tokens(30, 3);
+            crate::dspark::checks::checkpoint_matches_fresh(m, &d, &first, 100, &next, 32, &format!("Inkling-2 MTP {local:?}"));
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     /// A session that ran past a checkpoint (further than it can go back otherwise), cut back to

@@ -57,13 +57,15 @@ fn main() -> Result<()> {
         let s = &r.stats;
         let h = oxinfer::snapshot::hash64(&[&r.tokens.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>()]);
         println!(
-            "turn {n}: {} prompt tokens ({} cached, {} restored in {:.2} s), prefill {:.2} s, {} reply tokens, wall {:.2} s, reply {h:016x}",
+            "turn {n}: {} prompt tokens ({} cached, {} restored in {:.2} s), prefill {:.2} s, {} reply tokens ({} of {} drafts accepted), wall {:.2} s, reply {h:016x}",
             s.prompt_tokens + s.cached_tokens,
             s.cached_tokens,
             s.restored_tokens,
             s.restore_secs,
             s.prefill_secs,
             r.tokens.len(),
+            s.accepted,
+            s.drafted,
             wall
         );
         if let Some(p) = &save_tokens {

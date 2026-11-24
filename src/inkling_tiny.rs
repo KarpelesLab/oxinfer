@@ -241,3 +241,68 @@ pub fn write_tiny(dir: &Path, seed: u64) -> Result<()> {
     }
     t.write(&dir.join("model.safetensors"))
 }
+
+/// Layer applications of a pass of the tiny model (the looped layers run three times).
+const STEPS: usize = LAYERS + (LOOP.1 - LOOP.0) * 2;
+
+/// Adds a tiny random block drafter to the checkpoint folder `dir` of [`write_tiny`], as the
+/// release's MTP head (`mtp.safetensors` and `config.json`'s `mtp_config`; a DSpark GGUF of it
+/// is the same drafter): 3 layers of 64 (4 heads of 16 on 2 key / value heads), the layers of
+/// `local` attending to the 8 positions before the anchor (the others to all), blocks of 4, a
+/// Markov head of rank 8, reading the streams entering layer applications 2, 10 and 18 and the
+/// final-normed output.
+pub fn write_tiny_mtp(dir: &Path, seed: u64, local: &[usize]) -> Result<()> {
+    const DL: usize = 3;
+    const NH: usize = 4;
+    const NKV: usize = 2;
+    const HD: usize = 16;
+    const DI: usize = 96;
+    const DR: usize = 8;
+    let cfg_path = dir.join("config.json");
+    let raw = std::fs::read(&cfg_path).with_context(|| cfg_path.display().to_string())?;
+    let mut config: Value = serde_json::from_slice(&raw)?;
+    let targets = [2, 10, 18, STEPS];
+    config["mtp_config"] = json!({
+        "hidden_size": H, "num_hidden_layers": DL, "num_attention_heads": NH, "num_key_value_heads": NKV,
+        "head_dim": HD, "intermediate_size": DI, "sliding_window_size": 8, "local_layer_ids": local,
+        "block_size": 4, "target_layer_ids": targets, "markov_head_type": "rnn_hidden", "rope_theta": 10000.0,
+        "rms_norm_eps": 1e-6,
+    });
+    std::fs::write(&cfg_path, serde_json::to_vec_pretty(&config)?)?;
+    let mut t = Tensors {
+        list: Vec::new(),
+        rng: Rng(seed ^ 0x0fed_cba9_8765_4321),
+    };
+    let (qw, kw) = (NH * HD, NKV * HD);
+    for l in 0..DL {
+        let p = format!("layers.{l}.");
+        for n in ["input_layernorm", "post_attention_layernorm", "dflare_norm"] {
+            t.ones(&format!("{p}{n}.weight"), H);
+        }
+        t.mat(&format!("{p}self_attn.q_proj.weight"), &[qw, H], 1.0);
+        for n in ["k_proj", "v_proj", "k_proj_ctx", "v_proj_ctx"] {
+            t.mat(&format!("{p}self_attn.{n}.weight"), &[kw, H], 1.0);
+        }
+        t.mat(&format!("{p}self_attn.o_proj.weight"), &[H, qw], 0.7);
+        for n in ["q_norm", "k_norm", "k_norm_ctx"] {
+            t.ones(&format!("{p}self_attn.{n}.weight"), HD);
+        }
+        t.mat(&format!("{p}mlp.gate_proj.weight"), &[DI, H], 1.0);
+        t.mat(&format!("{p}mlp.up_proj.weight"), &[DI, H], 1.0);
+        t.mat(&format!("{p}mlp.down_proj.weight"), &[H, DI], 0.7);
+    }
+    t.uni("fuse_weight", &[DL + 1, targets.len()], 1.0, 0.0);
+    t.ones("markov_head.dflare_norm.weight", H);
+    t.ones("norm.weight", H);
+    t.uni("mask_embed", &[H], 1.0, 0.0);
+    t.uni("markov_head.markov_w1.weight", &[VOCAB, DR], 1.0, 0.0);
+    t.mat("markov_head.hidden_out.weight", &[H, DR], 1.0);
+    t.uni("markov_head.hidden_out.bias", &[H], 0.1, 0.0);
+    t.mat("markov_head.rnn_proj.weight", &[3 * DR, 2 * DR + 2 * H], 1.0);
+    t.uni("markov_head.rnn_proj.bias", &[3 * DR], 0.1, 0.0);
+    // The drafter's tensors have no prefix.
+    for e in &mut t.list {
+        e.0 = e.0.trim_start_matches("model.llm.").to_string();
+    }
+    t.write(&dir.join("mtp.safetensors"))
+}

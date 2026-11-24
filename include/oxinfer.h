@@ -125,8 +125,9 @@ int64_t oxi_cache_remove(const char *cache_dir, const char *name);
  *                        DIR (auto: ~/.cache/oxinfer/prompt-cache), created private (0700);
  *                        oxi_engine_chat restores the one that saves the most of a prompt and
  *                        stores conversations (oxi_engine_flush_prompt_cache). Gemma 4 / 3,
- *                        Qwen, Llama 3 (and their DSpark / MTP drafts), Inkling-2 and
- *                        DeepSeek V4 / V4.1 (no draft; CPU and Metal)
+ *                        Qwen, Llama 3 (and their DSpark / MTP drafts), Inkling-2 (and its
+ *                        DSpark / MTP drafter) and DeepSeek V4 / V4.1 (and V4's DSpark draft;
+ *                        CPU and Metal)
  *   prompt_cache_gb=F    prompt cache size cap (default 20; least recently used removed)
  *   prompt_cache_min_tokens=N  shortest conversation stored (default 64)
  *   prompt_checkpoints=N Inkling-2, DeepSeek V4 / V4.1: in-memory checkpoints oxi_engine_chat

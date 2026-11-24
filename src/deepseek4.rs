@@ -2393,6 +2393,23 @@ impl crate::intervene::Host for DeepSeek4Model<'_> {
     }
 }
 
+/// A DSpark decoder's checkpoints ([`crate::dspark::DsparkDecoder::checkpoint`]): the
+/// session's own.
+impl crate::dspark::CheckpointTarget for DeepSeek4Model<'_> {
+    fn checkpoint(&self, sess: &mut DeepSeek4Session, max: usize) {
+        sess.checkpoint(max)
+    }
+    fn has_checkpoint(&self, sess: &DeepSeek4Session, pos: usize) -> bool {
+        sess.has_checkpoint(pos)
+    }
+    fn reachable(&self, sess: &DeepSeek4Session, len: usize) -> usize {
+        sess.reachable(len)
+    }
+    fn cut_to(&self, sess: &mut DeepSeek4Session, len: usize) -> Result<()> {
+        sess.cut_to(len)
+    }
+}
+
 /// The target of a DSpark draft ([`crate::dspark`]).
 impl crate::dspark::Target for DeepSeek4Model<'_> {
     fn forward_feats(
@@ -2696,6 +2713,29 @@ mod tests {
 
     fn bits(v: &[f32]) -> Vec<u32> {
         v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// With a DSpark draft (the tiny one of [`tiny::write_draft`]): a decoder that went back to
+    /// a checkpoint drafts and decodes as a fresh one, and its snapshot continues as it does
+    /// ([`crate::dspark::checks::checkpoint_matches_fresh`]).
+    #[test]
+    fn draft_checkpoint_cut_back_matches_fresh() {
+        let dir = std::env::temp_dir().join(format!("oxinfer-ds4-dcp-{}", std::process::id()));
+        let cfg = tiny::write_v4(&dir, serde_json::json!({})).unwrap();
+        let path = std::env::temp_dir().join(format!("oxinfer-ds4-dcp-draft-{}.gguf", std::process::id()));
+        tiny::write_draft(&path, &cfg, 3, 5).unwrap();
+        let files: &'static ModelFiles = Box::leak(Box::new(ModelFiles::open(&dir, true).unwrap()));
+        let df: &'static ModelFiles = Box::leak(Box::new(ModelFiles::open(&path, true).unwrap()));
+        let (h, v) = (cfg.hidden_size, cfg.vocab_size);
+        let m = DeepSeek4Model::load(cfg, files, Quant::Bf16).unwrap();
+        let d = crate::dspark::Dspark::load(&path, df, h, v, Quant::Bf16).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_file(&path).ok();
+        let first = tokens(300, 0, v);
+        let next = tokens(30, 3, v);
+        for chunk in [1, 16] {
+            crate::dspark::checks::checkpoint_matches_fresh(&m, &d, &first, 100, &next, chunk, &format!("V4 DSpark {chunk}"));
+        }
     }
 
     /// A session that ran far past a checkpoint (its windows and compressors' rows trimmed),

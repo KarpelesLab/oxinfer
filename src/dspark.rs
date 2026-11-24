@@ -118,6 +118,22 @@ pub trait Target: TextLm {
     }
 }
 
+/// A target whose sessions keep checkpoints of earlier positions to go back to beyond what
+/// [`Target::truncate`] reaches (Inkling-2's convolutions and sliding windows, DeepSeek V4's
+/// windows and compressors): what [`DsparkDecoder::checkpoint`] and [`DsparkDecoder::cut_to`]
+/// build on.
+pub trait CheckpointTarget: Target {
+    /// Takes a checkpoint of the session's current position, keeping at most `max`.
+    fn checkpoint(&self, sess: &mut Self::Sess, max: usize);
+    /// Whether the session has a checkpoint of position `pos`.
+    fn has_checkpoint(&self, sess: &Self::Sess, pos: usize) -> bool;
+    /// The latest position up to `len` (below the current one) the session can go back to; 0
+    /// when none.
+    fn reachable(&self, sess: &Self::Sess, len: usize) -> usize;
+    /// Goes back to `len`, a position [`CheckpointTarget::reachable`] gave.
+    fn cut_to(&self, sess: &mut Self::Sess, len: usize) -> Result<()>;
+}
+
 /// The draft's decoder layers.
 #[derive(Clone, Debug)]
 pub enum Backbone {
@@ -3083,6 +3099,30 @@ pub struct DsparkDecoder<'m, M: Target> {
     /// tokens per second. The caller keeps its context in step through `prefill` (it appends the
     /// tokens fed); rounds append what they commit.
     pub lookup: Option<crate::lookup::Lookup>,
+    /// The draft's side of the target's checkpoints ([`DsparkDecoder::checkpoint`]), lowest
+    /// first.
+    marks: Vec<DraftMark>,
+}
+
+/// The draft's state at a checkpoint of the target ([`DsparkDecoder::checkpoint`]): what a later
+/// [`DsparkDecoder::cut_to`] cannot get back by cutting the draft's session back. The context
+/// cache's entries depend on their own position's features only, so the cache cut back to `dlen`
+/// is the cache as it was, but for the rows it dropped since: the oldest of a cache bounded by
+/// its windows (kept here from `lo`, the window and [`SLACK`] before `dlen`) and Inkling-2's head
+/// rows (those it held, at most `2 * SLACK`). The features of positions not yet in the cache are
+/// kept too.
+#[derive(Clone)]
+struct DraftMark {
+    /// The target's position, and the draft cache's length then.
+    pos: usize,
+    dlen: usize,
+    /// Rows `lo..dlen` of each layer (none, `lo == dlen`, for a cache that drops nothing).
+    lo: usize,
+    a: Vec<Vec<f32>>,
+    b: Vec<Vec<f32>>,
+    rnn: Vec<f32>,
+    rnn_start: usize,
+    pending: (Vec<f32>, usize),
 }
 
 /// The cost-aware draft length policy ([`DsparkOptions::cost_aware`]), in two steps per round:
@@ -3372,6 +3412,7 @@ impl<'m, M: Target> DsparkDecoder<'m, M> {
             },
             pending: (Vec::new(), 0),
             lookup: None,
+            marks: Vec::new(),
         }
     }
 
@@ -3663,9 +3704,6 @@ where
 {
     pub fn write_state<W: std::io::Write>(&self, w: &mut crate::snapshot::SnapWriter<W>) -> Result<()> {
         use crate::snapshot::SessionState;
-        if self.draft.ds4.is_some() || self.draft.ink.is_some() {
-            bail!("session snapshots are not supported with a DeepSeek V4 or Inkling-2 draft");
-        }
         self.sess.write_state(w)?;
         let d = &self.dsess;
         w.u64s("dspark.pos", &[d.start as u64, d.len as u64, self.pending.1 as u64])?;
@@ -3679,7 +3717,13 @@ where
                 crate::snapshot::write_kv(w, &format!("dspark.kv.{l}"), c)?;
             }
         }
-        w.f32s("dspark.pending", &self.pending.0)
+        w.f32s("dspark.pending", &self.pending.0)?;
+        // Inkling-2's drafter: its head's context rows.
+        if self.draft.ink.is_some() {
+            w.u64s("dspark.rnn_pos", &[d.rnn_start as u64, d.rnn_w as u64])?;
+            w.f32s("dspark.rnn", &d.rnn)?;
+        }
+        Ok(())
     }
 
     /// Reads a state written by [`DsparkDecoder::write_state`] into a fresh decoder.
@@ -3710,7 +3754,19 @@ where
         d.len = len;
         let nf = self.draft.cfg.target_layers.len() * self.model.hidden_size();
         self.pending = (r.f32s("dspark.pending", pend * nf)?, pend);
+        if self.draft.ink.is_some() {
+            let p = r.u64s_exact("dspark.rnn_pos", 2)?;
+            let (rs, rw) = (p[0] as usize, p[1] as usize);
+            if rs > len || (rw != 0 && rw != self.draft.cfg.hidden) {
+                bail!("snapshot: bad draft head rows");
+            }
+            let d = &mut self.dsess;
+            d.rnn = r.f32s("dspark.rnn", (len - rs) * rw)?;
+            d.rnn_start = rs;
+            d.rnn_w = rw;
+        }
         self.next = None;
+        self.marks.clear();
         Ok(())
     }
 
@@ -3731,6 +3787,123 @@ where
             self.dsess.truncate(len);
         }
         self.next = None;
+    }
+}
+
+/// Checkpoints of a target that keeps them ([`CheckpointTarget`]): the target's and, beside it,
+/// the draft's state at the same position, so that the decoder goes back to it as a whole and
+/// drafts from there as a decoder that ran the same tokens would (the same drafts, so the same
+/// acceptance; the output is the target's anyway).
+impl<M: CheckpointTarget> DsparkDecoder<'_, M> {
+    /// Takes a checkpoint of the current position (target and draft), keeping at most `max`.
+    pub fn checkpoint(&mut self, max: usize) {
+        let pos = self.model.session_len(&self.sess);
+        self.model.checkpoint(&mut self.sess, max);
+        if self.model.has_checkpoint(&self.sess, pos) && !self.marks.iter().any(|m| m.pos == pos) {
+            let d = &self.dsess;
+            let dlen = d.len;
+            // Rows a cache bounded by its windows may drop later (all positions are kept
+            // otherwise, and come back by cutting the cache).
+            let lo = if d.keep == 0 {
+                dlen
+            } else {
+                d.start.max(dlen.saturating_sub(d.keep + d.slack))
+            };
+            let rows = |v: &[Vec<f32>], w: usize| -> Vec<Vec<f32>> {
+                v.iter().map(|c| c[(lo - d.start) * w..(dlen - d.start) * w].to_vec()).collect()
+            };
+            let mark = DraftMark {
+                pos,
+                dlen,
+                lo,
+                a: rows(&d.a, d.wa),
+                b: rows(&d.b, d.wb),
+                rnn: d.rnn.clone(),
+                rnn_start: d.rnn_start,
+                pending: self.pending.clone(),
+            };
+            let at = self.marks.partition_point(|m| m.pos < pos);
+            self.marks.insert(at, mark);
+        }
+        // The target's cap decides which go.
+        let (model, sess) = (self.model, &self.sess);
+        self.marks.retain(|m| model.has_checkpoint(sess, m.pos));
+    }
+
+    /// Whether there is a checkpoint of position `pos`.
+    pub fn has_checkpoint(&self, pos: usize) -> bool {
+        self.model.has_checkpoint(&self.sess, pos) && self.marks.iter().any(|m| m.pos == pos)
+    }
+
+    /// The latest position up to `len` the decoder can go back to ([`Self::cut_to`]); 0 when
+    /// none.
+    pub fn reachable(&self, len: usize) -> usize {
+        let n = self.model.session_len(&self.sess);
+        let r = self.model.reachable(&self.sess, len);
+        if r >= n || self.marks.iter().any(|m| m.pos == r) || self.draft_keeps(r) {
+            return r;
+        }
+        // A position the target reaches without a checkpoint that the draft does not: its
+        // latest checkpoint before.
+        self.marks.iter().map(|m| m.pos).filter(|&p| p <= len).max().unwrap_or(0)
+    }
+
+    /// Whether the draft's state at `len` comes back by cutting it back (the cache's rows and
+    /// Inkling-2's head row before `len` are still there).
+    fn draft_keeps(&self, len: usize) -> bool {
+        let d = &self.dsess;
+        let dl = len.min(d.len);
+        let rows = d.keep == 0 || d.start <= dl.saturating_sub(d.keep);
+        let rnn = d.rnn_w == 0 || dl == 0 || d.rnn_start < dl;
+        rows && rnn
+    }
+
+    /// Goes back to `len`, a position [`Self::reachable`] gave: the target to its checkpoint (or
+    /// within what it cuts back), the draft to its state there.
+    pub fn cut_to(&mut self, len: usize) -> Result<()> {
+        let n = self.model.session_len(&self.sess);
+        if len >= n {
+            return Ok(());
+        }
+        let mark = self.marks.iter().find(|m| m.pos == len).cloned();
+        if mark.is_none() && !self.draft_keeps(len) {
+            bail!("DSpark: the draft cannot go back to position {len} (at {n})");
+        }
+        if let Some(m) = &mark
+            && (self.dsess.len < m.dlen || (m.lo == m.dlen && self.dsess.start > m.lo))
+        {
+            bail!("DSpark: the draft's cache lost the checkpoint of position {len}");
+        }
+        self.model.cut_to(&mut self.sess, len)?;
+        self.next = None;
+        self.marks.retain(|m| m.pos <= len);
+        let Some(m) = mark else {
+            // Within what the draft's cache cuts back (as `truncate_to`).
+            let dl = self.dsess.len;
+            if len >= dl {
+                let nf = self.pending.0.len() / self.pending.1.max(1);
+                self.pending.1 = len - dl;
+                self.pending.0.truncate(self.pending.1 * nf);
+            } else {
+                self.pending = (Vec::new(), 0);
+                self.dsess.truncate(len);
+            }
+            return Ok(());
+        };
+        let d = &mut self.dsess;
+        d.truncate(m.dlen);
+        if m.lo < m.dlen && d.start > m.lo {
+            d.a = m.a;
+            d.b = m.b;
+            d.start = m.lo;
+            d.ink_sync = d.ink_sync.min(m.lo);
+        }
+        if d.rnn_w > 0 {
+            d.rnn = m.rnn;
+            d.rnn_start = m.rnn_start;
+        }
+        self.pending = m.pending;
+        Ok(())
     }
 }
 
@@ -3891,6 +4064,108 @@ impl SendPtr {
     #[inline(always)]
     fn get(self) -> *mut f32 {
         self.0
+    }
+}
+
+/// Checks of a decoder going back to a checkpoint, for the targets that keep them (their tests
+/// call [`checks::checkpoint_matches_fresh`] on tiny random models and drafts).
+#[cfg(test)]
+pub(crate) mod checks {
+    use super::*;
+    use crate::generate::Flow;
+    use crate::snapshot::{SessionState, SnapReader, SnapWriter};
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// Fixed draft lengths on the CPU.
+    fn opts() -> DsparkOptions {
+        DsparkOptions {
+            draft_tokens: 3,
+            cost_aware: false,
+            fast_verify: false,
+            device: Some(false),
+            ..Default::default()
+        }
+    }
+
+    /// A block's draft logits and tokens from the decoder's state, with `anchor`.
+    fn drafts<M: Target>(dec: &mut DsparkDecoder<M>, anchor: u32) -> (Vec<u32>, Vec<u32>) {
+        let (m, d) = (dec.model, dec.draft);
+        let (lg, toks) = d.draft_logits(m, dec.draft_session_mut(), anchor, 3);
+        (bits(&lg), toks)
+    }
+
+    /// Prefills `toks`, then decodes `n` tokens greedily: the tokens, drafts and accepted drafts.
+    fn decode<M: Target>(dec: &mut DsparkDecoder<M>, toks: &[u32], chunk: usize, n: usize) -> (Vec<u32>, usize, usize)
+    where
+        M::Sess: Clone,
+    {
+        let (d0, a0) = (dec.stats.drafted, dec.stats.accepted);
+        let lg = dec.prefill(toks, chunk);
+        let mut s = Sampler::new(0.0, 0, 1.0, 1);
+        let out = crate::generate::decode_rounds(dec, &lg, &mut s, &[], n, &mut |_| Flow::Continue);
+        (out.tokens, dec.stats.drafted - d0, dec.stats.accepted - a0)
+    }
+
+    /// A decoder that took a checkpoint after `first[..c]`, ran the rest of `first` and a reply
+    /// (further than it goes back otherwise), then went back to the checkpoint, drafts as a
+    /// fresh decoder that ran `first[..c]` (the same draft logits, bit for bit) and decodes
+    /// `next` as it does (the same tokens, drafts and accepted drafts). A snapshot of it, read
+    /// into a fresh decoder, then continues as it does.
+    pub(crate) fn checkpoint_matches_fresh<M: CheckpointTarget>(
+        model: &M,
+        draft: &Dspark,
+        first: &[u32],
+        c: usize,
+        next: &[u32],
+        chunk: usize,
+        tag: &str,
+    ) where
+        M::Sess: Clone + SessionState,
+    {
+        let mut a = DsparkDecoder::new(model, draft, opts());
+        drop(a.prefill(&first[..c], chunk));
+        a.checkpoint(2);
+        assert!(a.has_checkpoint(c), "{tag}");
+        decode(&mut a, &first[c..], chunk, 40);
+        let d = &a.dsess;
+        eprintln!(
+            "[{tag}: at {}, the draft's cache from {} (head rows from {}), checkpoint at {c}]",
+            model.session_len(&a.sess),
+            d.start,
+            d.rnn_start
+        );
+        assert_eq!(a.reachable(c), c, "{tag}");
+        a.cut_to(c).unwrap();
+        assert_eq!(model.session_len(&a.sess), c);
+        let mut b = DsparkDecoder::new(model, draft, opts());
+        drop(b.prefill(&first[..c], chunk));
+        assert!(
+            drafts(&mut a, next[0]) == drafts(&mut b, next[0]),
+            "{tag}: the drafts after the checkpoint"
+        );
+        let got = decode(&mut a, next, chunk, 48);
+        let want = decode(&mut b, next, chunk, 48);
+        assert_eq!(got, want, "{tag}: decoding after the checkpoint");
+        eprintln!("[{tag}: {} drafts, {} accepted]", got.1, got.2);
+        // A snapshot (with features waiting to join the draft's cache, if any).
+        let path = std::env::temp_dir().join(format!("oxinfer-dspark-cp-{tag}-{}.oxsnap", std::process::id()));
+        let mut w = SnapWriter::new(std::fs::File::create(&path).unwrap()).unwrap();
+        a.write_state(&mut w).unwrap();
+        w.finish(serde_json::json!({})).unwrap();
+        let mut r = SnapReader::open(&path).unwrap();
+        let mut s = DsparkDecoder::new(model, draft, opts());
+        s.read_state(&mut r).unwrap();
+        r.finish().unwrap();
+        std::fs::remove_file(&path).ok();
+        let more = &first[..24];
+        assert_eq!(
+            decode(&mut s, more, chunk, 32),
+            decode(&mut a, more, chunk, 32),
+            "{tag}: after a snapshot"
+        );
     }
 }
 
