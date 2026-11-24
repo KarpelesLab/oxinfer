@@ -1,8 +1,9 @@
 # Session snapshots and the prompt cache
 
-A session (the KV caches, the Gated DeltaNet recurrent and convolution states, positions and
-vision spans, the DSpark draft's context cache and pending features, the MTP layer's cache and
-pending rows, and the tokens) can be written to a file and read back bit for bit (`snapshot.rs`):
+A session (the KV caches, the Gated DeltaNet recurrent and convolution states, Inkling-2's
+convolution rings and sliding-window caches, positions and vision spans, the DSpark draft's
+context cache and pending features, the MTP layer's cache and pending rows, and the tokens) can
+be written to a file and read back bit for bit (`snapshot.rs`):
 
 ```sh
 oxinfer --model Qwen/Qwen3-8B-GGUF:Q8_0 -p "$(cat long_prompt.txt)" --save-session s.oxsnap
@@ -16,8 +17,8 @@ fingerprint (checkpoint, precision, format, device, speculative decoding and its
 token prefix, with a size cap (`prompt_cache_gb`, default 20; least recently used first).
 `Engine::chat` restores the snapshot that saves the most of the prompt: for models without
 recurrent state (Gemma, Qwen3, Llama, with their drafts) any common prefix (the restored caches
-are cut back), for Qwen3.5 / 3.6 / 3.8 (recurrent state cannot be cut back) a whole snapshot the
-prompt starts with. It stores each conversation after its reply (left pending so the reply is not
+are cut back), for Qwen3.5 / 3.6 / 3.8 and Inkling-2 (recurrent or convolution state cannot be
+cut back) a whole snapshot the prompt starts with. It stores each conversation after its reply (left pending so the reply is not
 delayed: the server writes it on another thread once the response is sent; the next request, an
 explicit `Engine::flush_prompt_cache` or the engine's drop also write it) and, for the recurrent
 models, the prefix every conversation with the same system prompt and tools shares (the first
@@ -28,6 +29,23 @@ conversation replaces the snapshots of its own prefixes. In memory, `Engine::cha
 conversation for these models (it used to start over unless the new conversation extended the
 old one).
 
+**Inkling-2 in memory: prompt checkpoints.** A chat client sends each turn the conversation with
+the last reply as returned; the template renders past replies without their thinking, so the
+tokens differ from the cache's right after the previous prompt. Models without recurrent state
+cut their caches back there; Qwen3.5's recurrent states and Inkling-2's convolutions and
+sliding windows cannot (Inkling-2 goes back 64 positions at most), and the whole conversation
+was prefilled again each turn (`cached_tokens` 0 on a 7222-token conversation, 10 s a turn).
+For Inkling-2, `Engine::chat` keeps checkpoints of the shared prefix (as above) and of each
+prompt but its last token (the convolutions' last inputs and the sliding windows' last 1024
+positions; the full-attention caches keep everything anyway), with or without a prompt cache,
+and the next conversation goes back to the latest one within its common prefix with the cache:
+a next turn reuses the whole previous prompt, a regenerated reply all of its prompt but the
+last token. `prompt_checkpoints` (engine / C API / per-model server key; default 2, 0 off)
+caps them (each about 650 MB for Inkling-2-Mini with f32 caches, 180 MB with q8; see
+[inkling.md](inkling.md)). Qwen3.5 / 3.6 / 3.8 do not have them yet (their recurrent states can
+live on the GPU between passes); with `--prompt-cache` they restore the stored prompt but its
+last token from disk.
+
 The directory is created private (0700; an existing one is set to 0700, which fails unless it is
 yours, so `/tmp` or `/dev/shm` themselves are refused; a directory of your own on a tmpfs gives
 memory-speed restores on Linux), files are written 0600 under a temporary name and renamed into
@@ -37,7 +55,9 @@ model or other options is refused; a corrupted one is removed from the cache and
 computed.
 
 Families: Gemma 4 / 3, Qwen3, Qwen3.5 / 3.6 / 3.8 (dense, MoE, Qwen2.5-VL), Llama 3, with DSpark
-or MTP drafts and the Gemma 4 assistant drafter. Not (yet): Mistral Large 4, DeepSeek V4
+or MTP drafts and the Gemma 4 assistant drafter, Inkling-2 (Small and Mini, without a draft; on
+the CPU and on Metal, whose session buffers are read in place, the KV caches in their own f32 /
+f16 / q8 format: `src/inkling.rs`, `tests` `snapshot_round_trip_*`; not on CUDA yet). Not (yet): Mistral Large 4, DeepSeek V4
 (compressed-attention state), Qwen3.8-Flash-Next (Qwen4-Exp: n-gram and indexer state), Core ML
 models.
 

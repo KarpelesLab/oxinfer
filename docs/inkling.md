@@ -86,6 +86,32 @@ keep 64 positions beyond their window, so a session can go back up to 64 positio
 (`inkling::ROLLBACK`, what speculative decoding needs). The cache of a local layer holds at most
 2112 positions whatever the context length.
 
+**Going further back: prompt checkpoints.** A chat client sends the whole conversation each
+turn, with the last reply as returned: without its thinking, which the chat template leaves out
+of past turns while the session's cache holds it (and, at the start of the reply, the tokens
+the model wrote to open its messages). The tokens then differ from the cache's right after the
+previous prompt, too far back for those 64 positions, and the whole conversation used to be
+prefilled again every turn (a 7222-token conversation on unsloth's IQ3_XXS: 0 cached tokens and
+10 s per turn on Metal). `Engine::chat` now keeps checkpoints of the prompt
+(`Inkling2Model::checkpoint`): of the prefix every conversation with the same system prompt and
+tools shares, and of each prompt but its last token, the prompt being fed in two or three
+parts for it. A checkpoint holds what a session cannot get back by cutting its caches: the
+convolutions' last 3 inputs (four rings per cache slot) and the sliding slots' last window of
+keys and values (their rings and caches drop older positions); the full-attention slots keep
+every position. The next turn goes back to the latest checkpoint within the common prefix
+(`Inkling2Model::cut_to`: the full slots cut, the windows and the convolution inputs written
+back) and feeds the conversation from there: the previous prompt is reused and only the
+reply's visible text and the new message are fed. A session cut back so gives the logits of a
+session that ran the same passes up to there, bit for bit (CPU and Metal; on a device that has
+no checkpoint support, CUDA for now, the session moves to the host for them). After a restore
+the session goes back up to 64 positions as before, but not before the restored position.
+
+Each checkpoint costs the sliding applications' window: about 650 MB for Mini with f32 caches,
+330 MB with f16, 180 MB with q8 (1024 of the 1088 rows of the windows' table below), a
+copy of that much memory when taken. `prompt_checkpoints` (engine / C API / per-model server
+key, default 2, 0 off) caps them; past the cap the lowest (the shared prefix) and the newest
+stay. Sessions with a DSpark or MTP draft (`Lm::Inkling2Dspark`) do not take them yet.
+
 ## Checkpoints
 
 The releases' tensor names (`model.llm.*`, `model.visual.*`), which is also what transformers'
@@ -492,7 +518,10 @@ resident on the device:
 - **KV caches** in f32, f16 or q8 rows (`--kv-cache`), the sliding windows as rings of
   `window + 64` rows by position, the full-attention caches growing; a session's state moves to
   the device on its first GPU pass and back to the host when a pass runs on the CPU (cloning a
-  session reads it back), and `truncate` works on either side.
+  session reads it back), and `truncate` works on either side. Prompt checkpoints are read from
+  and written to the device's buffers in place (the windows' rows at their ring positions, the
+  convolution rings' last rows), and so are snapshots (`--prompt-cache`, `--save-session`: the
+  session stays on the device; a restored one moves there at its next pass).
 - **LoRA adapters** (`--lora`) run on the device too: the dense updates as a down / up pair of
   kernels beside each matmul, the experts' down-projection updates per expert from an address
   table whose strengths are written at each pass (switching an adapter needs no rebuild); the
