@@ -637,7 +637,11 @@ of stage and the dispatch and barrier counts every N passes (profiling only);
 `OXINFER_INKLING_NARROW=1` puts the router's logits back on `ink_mvf` (measurements);
 `OXINFER_INKLING_ATTQ=0` runs the attention of passes of up to 8 tokens a key head (three query
 heads) a threadgroup rather than a query head, `OXINFER_INKLING_XDOTS=0` the IQ2 / IQ3 experts on the generic
-loader (both the same speed or slower, for comparisons). The kernels compile on first use (about 1.5 s, cached by
+loader (both the same speed or slower, for comparisons); `OXINFER_INKLING_PF=MASK` picks which of a
+layer's small weight lists a one-token pass reads ahead into the system cache beside the latency
+kernels before them (bits: 1 the attention's projections, 2 its output projection, 4 the attention
+gates' down rows, 8 their forget / gain rows, 16 the MLP gate's down rows, 32 its forget / gain rows,
+64 the router; default 118, 0 none). The kernels compile on first use (about 1.5 s, cached by
 the system after).
 
 **Correctness.** Against transformers float32 on the release (the 24-token chat prompt and 16
@@ -834,7 +838,11 @@ stages into the kernels beside them, the same logits bit for bit: greedy decodin
 124.8 on chat. After a fourth round (112.9 tok/s) a fifth gave the attention a threadgroup a query
 head with the relative bias in the keys' dot products, lighter mixes and the experts' down rows on
 16 lanes: 121.2 tok/s (8.25 ms; mlx-community 4bit), 116.7 (UD-IQ3_XXS), 87.0 (Q8_0), prompt lookup
-129.3 on chat; the 125 of plain decoding is still 0.2-0.25 ms a token away.
+129.3 on chat. A sixth read small weights (the output projection, the message gates' rows, the
+router) into the system cache beside the latency kernels before them and routed in one SIMD-group of
+the experts' gate / up threadgroups, the greedy text unchanged: 124.0 tok/s (8.07 ms; mlx-community
+4bit), 122.9 (UD-IQ3_XXS, from 116.5), 88.7 (Q8_0); llama.cpp's `inkling2_loop` gives 21.9 and 37.8
+on the UD-IQ3_XXS and Q8_0 files.
 
 ### CUDA
 

@@ -3453,6 +3453,55 @@ waits that keep the dependencies cost more than the barriers. What remains in re
 the output projection at 275 GB/s and the gate / up kernel's in-kernel routing (3 us a layer, which
 moved elsewhere costs the same).
 
+**Round 6 (November 2026): small weights read ahead beside the latency kernels, the routing in one
+SIMD-group of the gate / up kernel.** The rule of the earlier rounds, held more strictly: the 9
+greedy replies of 160 tokens (`--no-system`; 3 prompts on unsloth UD-IQ3_XXS, mlx-community 4bit and
+ggml-org Q8_0) are master's byte for byte, and neither change touches the arithmetic (the routing
+picks and weights are computed by the same code in the same order; the read-ahead only loads).
+
+Before / after (`inkling2_bench -p 0 -n 64 -r 2 --chain`, the builds alternated 4 times under the
+bench lock, load 4.4-8.2; best run of each):
+
+| Checkpoint | tg64 chained before | after |
+|---|---:|---:|
+| unsloth UD-IQ3_XXS | 8.58 ms / 116.5 tok/s | **8.14 ms / 122.9 tok/s** (+5.5%) |
+| mlx-community 4bit | 8.22 ms / 121.7 tok/s | **8.07 ms / 124.0 tok/s** (+1.9%) |
+| ggml-org Q8_0 | 11.45 ms / 87.3 tok/s | **11.28 ms / 88.7 tok/s** (+1.6%) |
+
+Every one of the 4 alternations had the new build ahead. llama.cpp (`llama-bench -p 0 -n 64`, its
+`inkling2_loop` architecture, build 253671d, the same lock): UD-IQ3_XXS 21.9 tok/s, Q8_0 37.8.
+
+**Kept:**
+
+- **The routing in one SIMD-group of each gate / up threadgroup** (`_rpair`). Every SIMD-group of
+  the kernel routed the token (the sigmoid scores of 128 experts and k rounds of a SIMD-group
+  maximum) before loading its rows, and took its threadgroup's expert by a shuffle. Now the first
+  SIMD-group routes, stopping at its threadgroup's pick (pick y needs y + 1 rounds, not k; the
+  threadgroup that writes the picks and weights to `sel` does all k), and hands the expert to the
+  others through threadgroup memory behind one barrier. The same picks and weights bit for bit.
+  UD-IQ3_XXS 116.5 -> about 118.5 tok/s on its own (`OXINFER_INKLING_PF=0` against master).
+- **Small weights read ahead into the system cache beside the latency kernels before them**
+  (`ink_pf`: 32 threadgroups of 256 threads loading a word of each 128-byte line of up to 16 address
+  ranges, dispatched in the same stage as the kernels beside them; the weights are reached by GPU
+  address, resident through the residency set). The lists, per layer: the output projection beside
+  the attention kernel, the attention gates' down rows beside the attention's input mix, the MLP
+  gate's down rows and forget / gain rows beside the MLP's input mix, and the router beside the MLP
+  gate's forget / gain stage (or the MLP's mix where it has no gate). About 118.5 -> 122.9 tok/s on
+  UD-IQ3_XXS. `OXINFER_INKLING_PF=MASK` picks the lists (a sum of the values in docs/inkling.md; default 118 = 2 + 4 + 16 + 32 + 64; 0 none).
+
+**Measured and dropped:**
+
+- **The attention's projections read ahead** (value 1, 11.1 MB a layer, beside the message gates'
+  forget / gain stage or the input mix): 121.7 -> 117-119 tok/s, as round 5 found for them: the
+  reads outlast the small stage they sit beside. Adding the attention gates' forget / gain rows
+  (value 8, mask 126) was within the noise of the default, so they stay out.
+- **More or fewer read-ahead threadgroups**: 8 slower (118.1 against 120-122), 16 and 64 within the
+  noise of 32.
+
+Round 5 read ahead whole projections, whose reads take longer than the mixes beside them; the lists
+kept here are each well under a megabyte, short enough to finish inside the latency kernel's own
+time, and the stage after them then starts from the system cache.
+
 #### DGX Spark, CUDA (November 2026)
 
 On a DGX Spark (GB10, 121 GB shared between the CPU and the GPU) against llama.cpp's CUDA backend
