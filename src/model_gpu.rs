@@ -6,6 +6,13 @@ use super::{Layer, LayerCache, Lin, Model, Session};
 use crate::gpu::decode::{Ew, Graph, LinMode, Op, Step, pairable};
 use std::borrow::Cow;
 
+/// Whether prompts skip the KV-sharing layers' rows nothing reads ([`Model::gpu_prefill_pruned`];
+/// `OXINFER_PF_PRUNE=0`: not).
+fn pf_prune() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("OXINFER_PF_PRUNE").map_or(true, |v| v != "0"))
+}
+
 impl<'a> Model<'a> {
     fn gpu_graph<'s>(&'s self, lay: Option<&crate::intervene::GpuLayout>) -> Option<Graph<'s>> {
         self.gpu_graph_with(lay, None)
@@ -14,19 +21,28 @@ impl<'a> Model<'a> {
     /// [`Self::gpu_graph`], plus for multi-token plans (`multi`: layers whose outputs to capture)
     /// the copies of those layers' outputs.
     fn gpu_graph_with<'s>(&'s self, lay: Option<&crate::intervene::GpuLayout>, multi: Option<&[usize]>) -> Option<Graph<'s>> {
-        self.gpu_graph_mode(lay, multi, false)
+        self.gpu_graph_mode(lay, multi, false, 0..self.cfg.num_hidden_layers)
     }
 
     /// [`Self::gpu_graph_with`]; `prefill`: for a prefill plan (`Backend::decode_plan_prefill`):
-    /// no LM head.
+    /// no LM head. `layers`: the layers the graph runs, all of them, or
+    /// - the first ones (a prefill plan): the hidden output is the residual after the last;
+    /// - the last ones: the input is that residual followed by the scaled token embedding (the
+    ///   per-layer embeddings' projection reads it), and the second input the token's PLE row.
     fn gpu_graph_mode<'s>(
         &'s self,
         lay: Option<&crate::intervene::GpuLayout>,
         multi: Option<&[usize]>,
         prefill: bool,
+        layers: std::ops::Range<usize>,
     ) -> Option<Graph<'s>> {
         let cfg = &self.cfg;
         if cfg.bidirectional() {
+            return None;
+        }
+        let (from, upto) = (layers.start, layers.end);
+        let part = from > 0 || upto < cfg.num_hidden_layers;
+        if part && (lay.is_some() || multi.is_some_and(|m| !m.is_empty()) || from >= upto || (from > 0) == (upto < cfg.num_hidden_layers)) {
             return None;
         }
         let h = cfg.hidden_size;
@@ -87,7 +103,14 @@ impl<'a> Model<'a> {
         if let Some(s) = &self.stream {
             g.gate = Some(std::sync::Arc::new(s.clone()));
         }
-        let x = g.buf(h);
+        // (The last layers: the residual, then the token embedding.)
+        let x = g.buf(if from > 0 { 2 * h } else { h });
+        let emb_in = if from > 0 { x.at(h) } else { x };
+        if from > 0 {
+            g.n_input = 2 * h;
+        }
+        // Plans of every part of the model share slots.
+        g.layout_key = Some(self.final_norm.as_ptr() as usize);
         let hn = g.buf(h);
         let qkv = g.buf(nh * max_hd + 2 * max_kv * max_hd);
         let qo = g.buf(nh * max_hd);
@@ -100,8 +123,10 @@ impl<'a> Model<'a> {
         g.input = x;
         g.hidden = hidden;
         g.n_hidden = h;
-        g.embed = Some((&self.embed, (h as f32).sqrt()));
-        g.embed2 = self.ple.as_ref().map(|p| &p.embed);
+        if from == 0 {
+            g.embed = Some((&self.embed, (h as f32).sqrt()));
+            g.embed2 = self.ple.as_ref().map(|p| &p.embed);
+        }
         g.rope_halves = vec![self.inv_freq_sliding.len(), self.inv_freq_full.len()];
         // Interventions (`crate::intervene`): parameter buffers and the hooked residual points.
         let (hot, cold) = (
@@ -133,7 +158,7 @@ impl<'a> Model<'a> {
                 let emb = g.buf(nl * p);
                 g.input2 = Some((emb, nl * p));
                 g.units.push((g.ops.len(), 0));
-                put(&mut g, &ple.proj, nl * p, h, x, pli, LinMode::Store)?;
+                put(&mut g, &ple.proj, nl * p, h, emb_in, pli, LinMode::Store)?;
                 g.ops.push(Op::Norm {
                     x: pli,
                     out: pli,
@@ -195,6 +220,9 @@ impl<'a> Model<'a> {
         // the input norm of a layer comes with the last step of the one before.
         let mut have_hn = false;
         for (l, layer) in self.layers.iter().enumerate() {
+            if l < from || l >= upto {
+                continue;
+            }
             let Layer { hd, n_kv, .. } = *layer;
             g.units.push((g.ops.len(), self.layer_unit(l)));
             let kv = *slot.get(layer.kv_src).filter(|&&s| s != usize::MAX)?;
@@ -423,6 +451,13 @@ impl<'a> Model<'a> {
             }
             have_hn = true;
         }
+        if upto < nl {
+            // The first layers: the residual out (the next layer's input norm is left unread).
+            g.hidden = x;
+            g.n_input = h;
+            g.head_from = g.ops.len();
+            return Some(g);
+        }
         g.head_from = g.ops.len();
         g.units.push((g.ops.len(), self.layer_unit(nl)));
         if prefill {
@@ -534,7 +569,7 @@ impl<'a> Model<'a> {
         self.gpu_plans.get(key, || {
             let be = crate::gpu::active()?;
             let plan = self
-                .gpu_graph_mode(None, Some(cap), true)
+                .gpu_graph_mode(None, Some(cap), true, 0..self.cfg.num_hidden_layers)
                 .and_then(|g| be.decode_plan_prefill(&g, tokens));
             if std::env::var_os("OXINFER_GPU_PLAN_DEBUG").is_some() {
                 eprintln!("[gpu prefill plan: {}]", if plan.is_some() { "built" } else { "none" });
@@ -639,6 +674,175 @@ impl<'a> Model<'a> {
             hidden.extend_from_slice(&hs);
         }
         Some(hidden)
+    }
+
+    /// The plans of a pruned prefill ([`Model::gpu_prefill_pruned`]): the prefill plan of the
+    /// layers before `split` and the one-token plan of the others.
+    #[allow(clippy::type_complexity)]
+    fn gpu_split_plans(
+        &self,
+        split: usize,
+    ) -> Option<(
+        std::sync::Arc<dyn crate::gpu::decode::DecodePlan>,
+        std::sync::Arc<dyn crate::gpu::decode::DecodePlan>,
+    )> {
+        if !self.gpu_decode_on() {
+            return None;
+        }
+        let tokens = crate::qwen::prefill_plan_tokens();
+        let nl = self.cfg.num_hidden_layers;
+        let first = self.gpu_plans.get((1u64 << 60) | ((split as u64) << 32) | tokens as u64, || {
+            let be = crate::gpu::active()?;
+            be.decode_plan_prefill(&self.gpu_graph_mode(None, Some(&[]), true, 0..split)?, tokens)
+        })?;
+        let rest = self.gpu_plans.get((1u64 << 59) | split as u64, || {
+            let be = crate::gpu::active()?;
+            be.decode_plan(&self.gpu_graph_mode(None, None, false, split..nl)?)
+        })?;
+        Some((first, rest))
+    }
+
+    /// [`Model::prefill_hidden`] on the GPU for models with KV-sharing layers: the layers before
+    /// the first of those (the ones that fill the caches) on every token of the prompt, on the
+    /// prefill plan, then the rest on its last token alone when `last` (that token's hidden
+    /// state), as a one-token step reading the caches the first part filled. None (nothing
+    /// changed) when unavailable.
+    pub(super) fn gpu_prefill_pruned(&self, sess: &mut Session, tokens: &[u32], last: bool) -> Option<Vec<f32>> {
+        let cfg = &self.cfg;
+        let (t, nl, h) = (tokens.len(), cfg.num_hidden_layers, cfg.hidden_size);
+        let split = cfg.first_kv_shared_layer();
+        if cfg.num_kv_shared_layers == 0
+            || split == 0
+            || split >= nl
+            || !pf_prune()
+            || sess.iv.active()
+            || !sess.capture.is_empty()
+            || self.stream.is_some()
+            || cfg.bidirectional()
+        {
+            return None;
+        }
+        let (first, rest) = self.gpu_split_plans(split)?;
+        let n = first.tokens();
+        let pw = nl * cfg.hidden_size_per_layer_input;
+        for c in sess.caches.iter_mut().flatten() {
+            c.reserve(t);
+        }
+        // The residual after the first part, of each chunk's tokens.
+        let mut res = vec![0f32; n.min(t) * h];
+        let mut c = 0;
+        while c < t {
+            let m = n.min(t - c);
+            let toks = &tokens[c..c + m];
+            let mut x = Vec::with_capacity(m * h);
+            let mut x2 = Vec::new();
+            for &tok in toks {
+                x.extend_from_slice(&self.embed_scaled(tok));
+                if let Some(ple) = &self.ple {
+                    let o = x2.len();
+                    x2.resize(o + pw, 0.0);
+                    ple.embed.row(tok as usize, &mut x2[o..]);
+                }
+            }
+            let cs = self.rope_rows(sess.pos, m);
+            let ok = {
+                let _timer = crate::prof::start(crate::prof::Cat::Matmul);
+                let mut kv: Vec<&mut LayerCache> = sess.caches.iter_mut().flatten().collect();
+                first.step(
+                    &mut sess.gpu,
+                    Step {
+                        pos: sess.pos,
+                        t: m,
+                        rope_cs: &cs,
+                        x: &x,
+                        x2: &x2,
+                        kv: &mut kv,
+                        states: &mut [],
+                        hidden: &mut res[..m * h],
+                        logits: None,
+                        params: None,
+                        capture: None,
+                        scratch: false,
+                        states_kept: false,
+                    },
+                )
+            };
+            if !ok {
+                break;
+            }
+            sess.pos += m;
+            c += m;
+        }
+        if c == 0 {
+            return None;
+        }
+        if c < t {
+            // The rest of the prompt on the host path, through every layer.
+            let hs = self.forward_hidden_cpu(sess, &tokens[c..], &[]);
+            return Some(if last { hs[hs.len() - h..].to_vec() } else { Vec::new() });
+        }
+        if !last {
+            return Some(Vec::new());
+        }
+        // The last token through the KV-sharing layers: a one-token step at its position, whose
+        // keys and values the first part wrote (the host caches give that row back to the
+        // step, which copies it down again).
+        let m = t - (t - 1) / n * n;
+        let tok = tokens[t - 1];
+        let p = sess.pos - 1;
+        let mut x = res[(m - 1) * h..m * h].to_vec();
+        x.extend_from_slice(&self.embed_scaled(tok));
+        let mut x2 = Vec::new();
+        if let Some(ple) = &self.ple {
+            x2.resize(pw, 0.0);
+            ple.embed.row(tok as usize, &mut x2);
+        }
+        let cs = self.rope_rows(p, 1);
+        let mut hidden = vec![0f32; h];
+        sess.truncate(p);
+        let ok = {
+            let _timer = crate::prof::start(crate::prof::Cat::Matmul);
+            let mut kv: Vec<&mut LayerCache> = sess.caches.iter_mut().flatten().collect();
+            rest.step(
+                &mut sess.gpu,
+                Step {
+                    pos: p,
+                    t: 1,
+                    rope_cs: &cs,
+                    x: &x,
+                    x2: &x2,
+                    kv: &mut kv,
+                    states: &mut [],
+                    hidden: &mut hidden,
+                    logits: None,
+                    params: None,
+                    capture: None,
+                    scratch: false,
+                    states_kept: false,
+                },
+            )
+        };
+        if !ok {
+            return Some(self.forward_hidden_cpu(sess, &[tok], &[]));
+        }
+        sess.pos = p + 1;
+        Some(hidden)
+    }
+
+    /// RoPE cos / sin rows of `m` positions from `pos`, per table (sliding, full), as the GPU
+    /// plans read them.
+    fn rope_rows(&self, pos: usize, m: usize) -> Vec<f32> {
+        let positions: Vec<usize> = (pos..pos + m).collect();
+        let mut cs = Vec::new();
+        for f in [&self.inv_freq_sliding, &self.inv_freq_full] {
+            let half = f.len();
+            let (co, si) = crate::kernels::rope_tables(&positions, f);
+            for j in 0..m {
+                cs.extend_from_slice(&co[j * half..(j + 1) * half]);
+                cs.extend_from_slice(&si[j * half..(j + 1) * half]);
+            }
+        }
+        cs
     }
 
     /// Runs `tokens` (at most 16) through a multi-token GPU plan, as one-token GPU steps would one

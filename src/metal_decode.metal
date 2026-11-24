@@ -1167,8 +1167,12 @@ kernel void dec_rms_norm(device const float* x [[buffer(0)]], device float* out 
 // dimension (hd threads). cos / sin of the position come from the host (`cs`: half cos, half sin).
 struct QP { uint nh; uint nkv; uint hd; uint half_rot; uint q_stride; uint k_off; uint v_off; uint pos;
             uint interleaved; uint has_qn; uint has_kn; float eps; uint v_norm; uint v_from_k; uint _p0; uint _p1; };
-template <typename CS>
-inline void qk_rope_body(device const float* qkv, device float* qo, device float* kc, device float* vc, device const float* qn,
+// A cache entry of type KT (the general plans' caches are f32, or half rows with `gpu_kv=f16`:
+// clamped to half's range).
+template <typename KT> inline KT kv_store(float v) { return KT(v); }
+template <> inline half kv_store<half>(float v) { return half(clamp(v, -65504.f, 65504.f)); }
+template <typename CS, typename KT = float>
+inline void qk_rope_body(device const float* qkv, device float* qo, device KT* kc, device KT* vc, device const float* qn,
                          device const float* kn, constant QP& p, uint pos, CS cs, uint h, uint i, uint sg, uint lane,
                          threadgroup float* buf, threadgroup float* red, device half* kh = nullptr, device half* vh = nullptr);
 kernel void dec_qk_rope(device const float* qkv [[buffer(0)]], device float* qo [[buffer(1)]], device float* kc [[buffer(2)]],
@@ -1195,8 +1199,28 @@ kernel void dec_qk_rope_t(device const float* qkv [[buffer(0)]], device float* q
     qk_rope_body(qkv + (ulong)t * ts.x, qo + (ulong)t * ts.y, kc, vc, qn, kn, p, p.pos + t, cs + (ulong)t * ts.z, tg.x, i, sg, lane, buf, red,
                  kh, vh);
 }
-template <typename CS>
-inline void qk_rope_body(device const float* qkv, device float* qo, device float* kc, device float* vc, device const float* qn,
+// The same over half caches (`gpu_kv=f16`).
+kernel void dec_qk_rope_h(device const float* qkv [[buffer(0)]], device float* qo [[buffer(1)]], device half* kc [[buffer(2)]],
+                          device half* vc [[buffer(3)]], device const float* qn [[buffer(4)]], device const float* kn [[buffer(5)]],
+                          constant QP& p [[buffer(6)]], constant float* cs [[buffer(7)]],
+                          uint h [[threadgroup_position_in_grid]], uint i [[thread_index_in_threadgroup]],
+                          uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float buf[512];
+    threadgroup float red[16];
+    qk_rope_body(qkv, qo, kc, vc, qn, kn, p, p.pos, cs, h, i, sg, lane, buf, red);
+}
+kernel void dec_qk_rope_t_h(device const float* qkv [[buffer(0)]], device float* qo [[buffer(1)]], device half* kc [[buffer(2)]],
+                            device half* vc [[buffer(3)]], device const float* qn [[buffer(4)]], device const float* kn [[buffer(5)]],
+                            constant QP& p [[buffer(6)]], device const float* cs [[buffer(7)]], constant uint4& ts [[buffer(8)]],
+                            uint2 tg [[threadgroup_position_in_grid]], uint i [[thread_index_in_threadgroup]],
+                            uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float buf[512];
+    threadgroup float red[16];
+    uint t = tg.y;
+    qk_rope_body(qkv + (ulong)t * ts.x, qo + (ulong)t * ts.y, kc, vc, qn, kn, p, p.pos + t, cs + (ulong)t * ts.z, tg.x, i, sg, lane, buf, red);
+}
+template <typename CS, typename KT>
+inline void qk_rope_body(device const float* qkv, device float* qo, device KT* kc, device KT* vc, device const float* qn,
                          device const float* kn, constant QP& p, uint pos, CS cs, uint h, uint i, uint sg, uint lane,
                          threadgroup float* buf, threadgroup float* red, device half* kh, device half* vh) {
     uint hd = p.hd;
@@ -1217,7 +1241,7 @@ inline void qk_rope_body(device const float* qkv, device float* qo, device float
         else if (kind == 1) v *= kn[i];
     }
     if (kind == 2) {
-        vc[((ulong)pos * p.nkv + hh) * hd + i] = v;
+        vc[((ulong)pos * p.nkv + hh) * hd + i] = kv_store<KT>(v);
         if (p._p0 != 0) vh[((ulong)pos * p.nkv + hh) * hd + i] = half(clamp(v, -65504.f, 65504.f));
         return;
     }
@@ -1239,7 +1263,7 @@ inline void qk_rope_body(device const float* qkv, device float* qo, device float
     }
     if (kind == 0) qo[hh * hd + i] = v;
     else {
-        kc[((ulong)pos * p.nkv + hh) * hd + i] = v;
+        kc[((ulong)pos * p.nkv + hh) * hd + i] = kv_store<KT>(v);
         if (p._p0 != 0) kh[((ulong)pos * p.nkv + hh) * hd + i] = half(clamp(v, -65504.f, 65504.f));
     }
 }
@@ -1266,8 +1290,8 @@ struct AP { uint nh; uint nkv; uint len; uint lo; float scale; uint has_gate; ui
 // value row is read once for the G heads.
 // SEL (QSA sparse attention, metal_qsa.metal): key j is cache position idx[j] rather than j. PT: how
 // the parameters arrive (per-token copies in the prefill kernels).
-template <int D, int G, bool SEL = false, typename PT = constant AP&>
-inline void attn_body(device const float* q, device const float* kc, device const float* vc, device float* out, device const float* gate,
+template <int D, int G, bool SEL = false, typename PT = constant AP&, typename KT = float>
+inline void attn_body(device const float* q, device const KT* kc, device const KT* vc, device float* out, device const float* gate,
                       device float* part, PT p, uint hg, uint split, uint tid, uint sg, uint lane, threadgroup float* sm,
                       threadgroup float* so, threadgroup float* qs, device const uint* idx = nullptr) {
     constexpr uint HD = D * 32;
@@ -1292,11 +1316,11 @@ inline void attn_body(device const float* q, device const float* kc, device cons
         float s[G];
         for (int g = 0; g < G; g++) s[g] = -INFINITY;
         if (j < j1) {
-            device const float4* kr = (device const float4*)(kc + (ulong)(SEL ? idx[j] : j) * rs + (ulong)kvh * HD);
+            device const vec<KT, 4>* kr = (device const vec<KT, 4>*)(kc + (ulong)(SEL ? idx[j] : j) * rs + (ulong)kvh * HD);
             float4 acc[G];
             for (int g = 0; g < G; g++) acc[g] = 0.f;
             for (uint d = 0; d < HD / 4; d++) {
-                float4 k4 = kr[d];
+                float4 k4 = float4(kr[d]);
                 for (int g = 0; g < G; g++) acc[g] = fma(k4, ((threadgroup const float4*)(qs + g * HD))[d], acc[g]);
             }
             for (int g = 0; g < G; g++) s[g] = (acc[g].x + acc[g].y) + (acc[g].z + acc[g].w);
@@ -1311,7 +1335,7 @@ inline void attn_body(device const float* q, device const float* kc, device cons
             m[g] = mn;
         }
         uint nb = min(32u, j1 - base);
-        device const float* vb = vc + (ulong)base * rs + (ulong)kvh * HD + lane * D;
+        device const KT* vb = vc + (ulong)base * rs + (ulong)kvh * HD + lane * D;
         uint t0 = 0;
         if (!SEL) {
             // Whole groups of VB keys: their value rows are loaded together (one memory latency
@@ -1321,7 +1345,7 @@ inline void attn_body(device const float* q, device const float* kc, device cons
             for (; t0 + VB <= nb; t0 += VB) {
                 float v8[VB][D];
                 for (int u = 0; u < VB; u++)
-                    for (int d = 0; d < D; d++) v8[u][d] = vb[(t0 + u) * rs + d];
+                    for (int d = 0; d < D; d++) v8[u][d] = float(vb[(t0 + u) * rs + d]);
                 for (int u = 0; u < VB; u++)
                     for (int g = 0; g < G; g++) {
                         float et = simd_shuffle(e[g], t0 + u);
@@ -1330,9 +1354,9 @@ inline void attn_body(device const float* q, device const float* kc, device cons
             }
         }
         for (uint t = t0; t < nb; t++) {
-            device const float* vr = SEL ? vc + (ulong)idx[base + t] * rs + (ulong)kvh * HD + lane * D : vb + t * rs;
+            device const KT* vr = SEL ? vc + (ulong)idx[base + t] * rs + (ulong)kvh * HD + lane * D : vb + t * rs;
             float v[D];
-            for (int d = 0; d < D; d++) v[d] = vr[d];
+            for (int d = 0; d < D; d++) v[d] = float(vr[d]);
             for (int g = 0; g < G; g++) {
                 float et = simd_shuffle(e[g], t);
                 for (int d = 0; d < D; d++) o[g][d] = fma(et, v[d], o[g][d]);
@@ -1374,6 +1398,19 @@ kernel void dec_attn_##D##_##G(device const float* q [[buffer(0)]], device const
     threadgroup float sm[16]; threadgroup float so[8 * D * 32]; threadgroup float qs[G * D * 32]; \
     attn_body<D, G>(q, kc, vc, out, gate, part, p, tg.x, tg.y, tid, sg, lane, sm, so, qs); }
 ATTN(2, 1) ATTN(2, 2) ATTN(2, 4) ATTN(2, 8) ATTN(4, 1) ATTN(4, 2) ATTN(4, 4) ATTN(8, 1) ATTN(8, 2) ATTN(16, 1)
+// Over half caches (`gpu_kv=f16`; more query heads per threadgroup for heads of 256 and 512).
+// (Lanes splitting each key's dimensions, a step's loads then whole rows, were no faster:
+// `dec_attn_bench` level for heads of 128 and 256, 13% slower for heads of 64 at 32k keys.)
+#define ATTN_H(D, G) \
+kernel void dec_attn_h_##D##_##G(device const float* q [[buffer(0)]], device const half* kc [[buffer(1)]], device const half* vc [[buffer(2)]], \
+                         device float* out [[buffer(3)]], device const float* gate [[buffer(4)]], constant AP& p [[buffer(5)]], \
+                         device float* part [[buffer(6)]], \
+                         uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
+                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) { \
+    threadgroup float sm[16]; threadgroup float so[8 * D * 32]; threadgroup float qs[G * D * 32]; \
+    attn_body<D, G, false, constant AP&, half>(q, kc, vc, out, gate, part, p, tg.x, tg.y, tid, sg, lane, sm, so, qs); }
+ATTN_H(2, 1) ATTN_H(2, 2) ATTN_H(2, 4) ATTN_H(2, 8) ATTN_H(4, 1) ATTN_H(4, 2) ATTN_H(4, 4) ATTN_H(8, 1) ATTN_H(8, 2) ATTN_H(8, 4)
+ATTN_H(16, 1) ATTN_H(16, 2) ATTN_H(16, 4)
 kernel void dec_attn_combine(device const float* part [[buffer(0)]], device float* out [[buffer(1)]], device const float* gate [[buffer(2)]],
                              constant AP& p [[buffer(3)]], constant uint& hd [[buffer(4)]],
                              uint h [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {

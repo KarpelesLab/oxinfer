@@ -1408,6 +1408,35 @@ fn par_extend(dst: &mut Vec<f32>, src: &[f32]) {
     unsafe { dst.set_len(old + n) };
 }
 
+/// [`par_extend`] from half values (a device's half cache rows).
+#[cfg_attr(
+    not(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64")),
+    allow(dead_code)
+)]
+fn par_extend_f16(dst: &mut Vec<f32>, src: &[half::f16]) {
+    const CHUNK: usize = 1 << 15;
+    dst.reserve(src.len());
+    let old = dst.len();
+    let d = dst.spare_capacity_mut().as_mut_ptr() as usize;
+    let n = src.len();
+    let job = |i: usize| {
+        let a = i * CHUNK;
+        let len = CHUNK.min(n - a);
+        // SAFETY: chunk `i` of the reserved spare capacity, written by this job only.
+        let out = unsafe { std::slice::from_raw_parts_mut((d as *mut f32).add(a), len) };
+        half::slice::HalfFloatSliceExt::convert_to_f32_slice(&src[a..a + len], out);
+    };
+    if n <= CHUNK {
+        if n > 0 {
+            job(0);
+        }
+    } else {
+        crate::pool::run(n.div_ceil(CHUNK), &job);
+    }
+    // SAFETY: every element of the extension was written above.
+    unsafe { dst.set_len(old + n) };
+}
+
 #[derive(Clone)]
 pub struct LayerCache {
     k: Vec<f32>,
@@ -1541,6 +1570,17 @@ impl LayerCache {
             self.k.extend_from_slice(k);
             self.v.extend_from_slice(v);
         }
+        self.len += t;
+    }
+    /// [`Self::push`] of half rows (a device's half cache), converted by all threads.
+    #[cfg_attr(
+        not(all(feature = "gpu", any(target_os = "macos", target_os = "ios"), target_arch = "aarch64")),
+        allow(dead_code)
+    )]
+    pub(crate) fn push_f16(&mut self, k: &[half::f16], v: &[half::f16], t: usize) {
+        debug_assert_eq!(k.len(), t * self.n_kv * self.hd);
+        par_extend_f16(&mut self.k, k);
+        par_extend_f16(&mut self.v, v);
         self.len += t;
     }
     #[inline(always)]
@@ -2064,6 +2104,22 @@ impl<'a> Model<'a> {
             return hs;
         }
         self.forward_hidden_cpu(sess, tokens, mm)
+    }
+
+    /// [`crate::generate::TextLm::prefill_hidden`]: a prompt chunk of which only the last
+    /// token's hidden state is read (`last`), or none. With KV-sharing layers (Gemma 4 E2B /
+    /// E4B), which add nothing to the caches, the GPU prefill runs the layers before them on the
+    /// whole chunk and those layers only on its last token (on none for earlier chunks), as
+    /// llama.cpp does; the result is then the last token's hidden state alone.
+    pub fn prefill_hidden(&self, sess: &mut Session, tokens: &[u32], mm: &[(usize, &[f32])], last: bool) -> Vec<f32> {
+        if tokens.len() > 1
+            && mm.is_empty()
+            && crate::qwen::prefill_gpu(tokens.len(), "plan")
+            && let Some(hs) = self.gpu_prefill_pruned(sess, tokens, last)
+        {
+            return hs;
+        }
+        self.forward_hidden_mm(sess, tokens, mm)
     }
 
     fn forward_hidden_cpu(&self, sess: &mut Session, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {

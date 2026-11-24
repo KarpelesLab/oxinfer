@@ -4,7 +4,9 @@
 //! a short prompt, best and median of R repetitions:
 //! `cargo run --release --example parity_bench -- MODEL [pp=512,2048] [tg=128] [reps=3] [key=value ...]`
 //! (other options are `EngineOptions` keys, e.g. `device=cpu`, `lookup=0`, `draft=none`;
-//! `chain_ab=1` measures decoding with the greedy chain off and on, run by run alternated).
+//! `chain_ab=1` measures decoding with the greedy chain off and on, run by run alternated;
+//! `depth=8192,32768` measures decoding of G tokens after a prompt of each length instead;
+//! `text=FILE` takes the prompts from FILE rather than the corpus).
 
 use oxinfer::engine::{Engine, EngineOptions, Flow};
 
@@ -15,7 +17,9 @@ fn main() -> anyhow::Result<()> {
         .expect("usage: parity_bench MODEL [pp=..] [tg=N] [reps=N] [key=value ...]");
     let mut opts = EngineOptions::default();
     let (mut pps, mut tg, mut reps) = (vec![512usize, 2048], 128usize, 3usize);
+    let mut depths: Vec<usize> = Vec::new();
     let mut chain_ab = false;
+    let mut text: Option<String> = None;
     for kv in args {
         let (k, v) = kv.split_once('=').expect("options are key=value");
         match k {
@@ -27,8 +31,16 @@ fn main() -> anyhow::Result<()> {
                     .collect::<Result<_, _>>()?
             }
             "tg" => tg = v.parse()?,
+            "depth" => {
+                depths = v
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.parse())
+                    .collect::<Result<_, _>>()?
+            }
             "reps" => reps = v.parse()?,
             "chain_ab" => chain_ab = v == "1",
+            "text" => text = Some(v.to_string()),
             _ => opts.set(k, v)?,
         }
     }
@@ -38,8 +50,19 @@ fn main() -> anyhow::Result<()> {
         "[{} ({:?}, {:?}) on {} with {} threads]",
         i.model_type, i.family, i.quant, i.device, i.threads
     );
-    let corpus = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tools/bench/corpus.txt"))?;
-    let ids = e.tokenizer().encode(corpus.as_str(), false)?.get_ids().to_vec();
+    let corpus = std::fs::read_to_string(
+        text.as_deref()
+            .unwrap_or(concat!(env!("CARGO_MANIFEST_DIR"), "/tools/bench/corpus.txt")),
+    )?;
+    // Long prompts repeat the corpus (llama-bench's prompts are random tokens; the dense models'
+    // speed depends only on the length).
+    let longest = pps.iter().chain(&depths).copied().max().unwrap_or(0);
+    let mut ids = e.tokenizer().encode(corpus.as_str(), false)?.get_ids().to_vec();
+    let copies = longest / ids.len().max(1) + 1;
+    if copies > 1 {
+        let text = vec![corpus.as_str(); copies].join("\n\n");
+        ids = e.tokenizer().encode(text.as_str(), false)?.get_ids().to_vec();
+    }
     // Text of exactly n tokens (re-encoded: trim until it is).
     let text_of = |e: &Engine, n: usize| -> anyhow::Result<String> {
         let mut k = n.min(ids.len());
@@ -90,7 +113,22 @@ fn main() -> anyhow::Result<()> {
         }
         println!("pp{n} ({toks} tok): {}", stat(v));
     }
-    if tg > 0 && chain_ab {
+    // Decoding at depth (llama-bench `-d D -n G`): G tokens after a prompt of D tokens.
+    for &d in &depths {
+        let p = text_of(&e, d)?;
+        run(&mut e, &p, 2)?;
+        let mut v = Vec::new();
+        let mut g = 0;
+        for _ in 0..reps {
+            let (_, _, n, r) = run(&mut e, &p, tg)?;
+            g = n;
+            v.push(r);
+        }
+        println!("tg{tg} @ d{d} ({g} tok): {}", stat(v));
+    }
+    if !depths.is_empty() {
+        // (depth runs replace the short-prompt decode)
+    } else if tg > 0 && chain_ab {
         let p = text_of(&e, 16)?;
         let (mut off, mut on) = (Vec::new(), Vec::new());
         let mut g = 0;

@@ -2,7 +2,8 @@
 // The causal (optionally windowed) attention of `pff_*` (same `PFF` arguments), as llama.cpp's
 // `kernel_flash_attn_ext_tensor`, over half copies of the cache's rows (`kh` / `vh`, rows of
 // nkv * HD halves by position: the chunk's written by `dec_qk_rope_t` next to the f32 cache, the
-// earlier ones converted by `pf_kv_half`). A threadgroup of NSG SIMD-groups takes Q queries of one
+// earlier ones converted by `pf_kv_half`; or, with `gpu_kv=f16`, the half caches themselves, at
+// any length). A threadgroup of NSG SIMD-groups takes Q queries of one
 // head and walks the keys C at a time: S = Q K^T (f32 sums) goes to threadgroup memory for an
 // online softmax (Q / NSG rows per SIMD-group, C / 32 columns per lane), the probabilities come
 // back as half for O += P V, O held in a cooperative tensor. The queries are converted to QT
@@ -137,8 +138,12 @@ kernel void NAME(device const float* q [[buffer(0)]], device const float* kc [[b
     pfm_body<HD, Q, C, NSG, QT>(q, kc, kh, vh, out, gate, a, tg, sg, lane, sq, ss, sp, sr, sf); }
 PFM_INST(pfm_64, 64, 32, 64, 4, half)
 PFM_INST(pfm_128, 128, 16, 128, 4, half)
-PFM_INST(pfm_256, 256, 16, 64, 4, half)
-PFM_INST(pfm_512, 512, 16, 64, 8, half)
+// Heads of 256 and 512 walk 128 keys at a time (`pf_attn_bench`, 2048 queries after 30000
+// positions: 8 x 256 heads 15.8 -> 13.7 ms, 8 x 512 48.1 -> 30.5 ms; 512 queries from 0: level or
+// faster). 64 keys at a time, 4 or 16 SIMD-groups for 512, 8 for 256, and for heads of 64 16
+// queries or 128 keys were slower at long contexts.
+PFM_INST(pfm_256, 256, 16, 128, 4, half)
+PFM_INST(pfm_512, 512, 16, 128, 8, half)
 PFM_INST(pfmq_64, 64, 32, 64, 4, float)
 PFM_INST(pfmq_128, 128, 16, 128, 4, float)
 PFM_INST(pfmq_256, 256, 16, 64, 4, float)

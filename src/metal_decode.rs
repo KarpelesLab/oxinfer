@@ -2325,6 +2325,8 @@ enum MOp {
     /// SIMD-group matrices (`pff_<hd>`); `a`: the shader's `PFF` without the start position and
     /// token count; `qt` queries and `threads` threads per threadgroup.
     PfFlash {
+        /// The cache holds half rows: `pipe` reads them (as `half`'s rows) at any length.
+        cache_half: bool,
         pipe: Id,
         qt: usize,
         threads: usize,
@@ -2491,6 +2493,9 @@ pub(crate) struct MetalPlan<'b> {
     /// Multi-token plans: the capture rows (offset, floats per token).
     capture: Option<(usize, usize)>,
     kv: Vec<(usize, usize)>,
+    /// Caches the device holds as half rows (`gpu_kv=f16`): those read only by attention the
+    /// half kernels cover (not QSA's), with matrix units for the prefill plans' attention.
+    kv_half: Vec<bool>,
     rope_halves: Vec<usize>,
     input2: Option<(usize, usize)>,
     states: Vec<usize>,
@@ -2565,11 +2570,82 @@ struct KvMirror {
     synced: usize,
     /// Bytes of each buffer.
     bytes: usize,
+    /// Half rows (`gpu_kv=f16`, [`MetalPlan::kv_half`]) rather than f32 ones.
+    half: bool,
+    /// The queue's residency set, which holds the buffers: bound per submission instead, a
+    /// buffer is made resident again by every command buffer, at a cost that grows with its
+    /// size (GBs at long contexts: ~7 ms a decode step of Qwen3-8B at 32k positions).
+    res: Option<std::sync::Arc<super::Residency>>,
     release: (MsgVoid, Sel),
+}
+
+impl KvMirror {
+    /// Appends rows `from .. from + n` (of `row` values) of the keys and values to the host
+    /// cache `c` (converted to f32 from half rows).
+    ///
+    /// # Safety
+    /// The rows are in the buffers and no pass in flight writes them.
+    unsafe fn push_to(&self, f: &Fns, c: &mut crate::model::LayerCache, from: usize, n: usize, row: usize) {
+        let r = from * row..(from + n) * row;
+        if self.half {
+            let (k, v) = unsafe {
+                (
+                    std::slice::from_raw_parts(f.contents(self.k) as *const half::f16, r.end),
+                    std::slice::from_raw_parts(f.contents(self.v) as *const half::f16, r.end),
+                )
+            };
+            c.push_f16(&k[r.clone()], &v[r], n);
+        } else {
+            let (k, v) = unsafe {
+                (
+                    std::slice::from_raw_parts(f.contents(self.k) as *const f32, r.end),
+                    std::slice::from_raw_parts(f.contents(self.v) as *const f32, r.end),
+                )
+            };
+            c.push(&k[r.clone()], &v[r], n);
+        }
+    }
+
+    /// Writes host rows from row `from` on (`row` values each) into the keys (`v` false) or
+    /// values.
+    ///
+    /// # Safety
+    /// The buffers hold the rows and no pass in flight uses them.
+    unsafe fn store(&self, f: &Fns, v: bool, from: usize, row: usize, src: &[f32]) {
+        let b = if v { self.v } else { self.k };
+        if self.half {
+            let d = unsafe { std::slice::from_raw_parts_mut((f.contents(b) as *mut half::f16).add(from * row), src.len()) };
+            // Clamped to half's range, as the kernels store them.
+            let conv = |o: &mut [half::f16], s: &[f32]| {
+                for (o, &x) in o.iter_mut().zip(s) {
+                    *o = half::f16::from_f32(x.clamp(-65504.0, 65504.0));
+                }
+            };
+            if src.len() <= 1 << 20 {
+                conv(d, src);
+            } else {
+                // (Eight threads: about as fast as the memory.)
+                let chunk = src.len().div_ceil(8);
+                std::thread::scope(|sc| {
+                    for (o, s) in d.chunks_mut(chunk).zip(src.chunks(chunk)) {
+                        sc.spawn(move || conv(o, s));
+                    }
+                });
+            }
+        } else {
+            unsafe { super::par_copy((f.contents(b) as *mut f32).add(from * row), src.as_ptr(), src.len()) };
+        }
+    }
 }
 
 impl Drop for KvMirror {
     fn drop(&mut self) {
+        if let Some(r) = &self.res
+            && !self.k.is_null()
+            && !self.v.is_null()
+        {
+            r.update(&[self.k, self.v], false);
+        }
         if !self.k.is_null() && !self.v.is_null() {
             kv_pool_put(self.bytes, self.k, self.v, self.release);
             return;
@@ -2687,6 +2763,10 @@ fn layout_id(g: &Graph) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     g.kv.hash(&mut h);
     g.states.hash(&mut h);
+    if let Some(k) = g.layout_key {
+        k.hash(&mut h);
+        return h.finish() | 1;
+    }
     g.ops
         .iter()
         .find_map(|op| match op {
@@ -2828,6 +2908,18 @@ impl MetalBackend {
         // PF_KVH_PAST before the chunk), which the QkRope fills for the chunk and `pf_kv_half` for
         // the positions before; caches whose lives (first write to last read) do not overlap
         // share a slot. (arena offset of the keys, of the values, positions) per cache.
+        // Caches held as half rows (`gpu_kv=f16`): every plan of the model decides alike (the
+        // graph's ops, the device), so they share the slot's copies.
+        let kv_half: Vec<bool> = {
+            let on = crate::gpu::kv_half_enabled() && pf_flash() && pf_mma_attn() && self.mma().is_some_and(|m| m.units);
+            let mut h = vec![on; g.kv.len()];
+            for op in &g.ops {
+                if let Op::QsaKey { kv, .. } | Op::QsaSelect { kv, .. } | Op::AttendSel { kv, .. } = *op {
+                    h[kv] = false;
+                }
+            }
+            h
+        };
         let mut kvh: Vec<Option<(usize, usize, usize)>> = vec![None; g.kv.len()];
         let mut kvh_window: Vec<usize> = vec![0; g.kv.len()];
         let mut kvh_slot: Vec<usize> = vec![0; g.kv.len()];
@@ -2869,7 +2961,7 @@ impl MetalBackend {
             // Slots: (last reader, bytes).
             let mut slots: Vec<(usize, usize)> = Vec::new();
             let mut order: Vec<usize> = (0..g.kv.len())
-                .filter(|&k| life[k].1 == 1 && life[k].3 && life[k].2 > life[k].0)
+                .filter(|&k| life[k].1 == 1 && life[k].3 && life[k].2 > life[k].0 && !kv_half[k])
                 .collect();
             order.sort_by_key(|&k| life[k].0);
             let mut assigned: Vec<Option<usize>> = vec![None; g.kv.len()];
@@ -3317,8 +3409,9 @@ impl MetalBackend {
                             cap,
                         });
                     }
+                    let kh = nkv > 0 && kv_half[kv];
                     emit.push(MOp::QkRope {
-                        pipe: self.named_pipeline("dec_qk_rope")?,
+                        pipe: self.named_pipeline(if kh { "dec_qk_rope_h" } else { "dec_qk_rope" })?,
                         qkv: byte(qkv),
                         qo: byte(q_out),
                         kv,
@@ -3345,7 +3438,7 @@ impl MetalBackend {
                         cs: g.rope_halves[..rope].iter().map(|h| 2 * h).sum(),
                         t: if mt {
                             Some((
-                                self.named_pipeline("dec_qk_rope_t")?,
+                                self.named_pipeline(if kh { "dec_qk_rope_t_h" } else { "dec_qk_rope_t" })?,
                                 ts(qkv) as u32,
                                 ts(q_out) as u32,
                                 rope_table(rope),
@@ -4444,7 +4537,14 @@ impl MetalBackend {
                     };
                     let alt = (self.named_pipeline(&alt)?, aqt, athreads);
                     let mut half = kvh[kv];
-                    let precise = pf_precise_scores(scale, hd);
+                    // Half caches are the kernels' half rows themselves. Their keys are rounded
+                    // already, and half queries for unscaled scores move the output no more than
+                    // f32 ones (Gemma 4 E4B at 7000 tokens, KL of 32 greedy steps against f32
+                    // caches 1.0e-6 with half queries, 4.3e-6 with f32 ones times the half keys,
+                    // CPU against GPU 1.2e-3) at up to twice the speed (`pf_attn_bench` 8 x 512
+                    // heads, 2048 queries after 30000 positions: 93.6 -> 48.0 ms).
+                    let cache_half = kv_half[kv];
+                    let precise = pf_precise_scores(scale, hd) && !cache_half;
                     let mma = match (hd, precise) {
                         (64, false) => Some(("pfm_64", 32, 128)),
                         (128, false) => Some(("pfm_128", 16, 128)),
@@ -4455,13 +4555,18 @@ impl MetalBackend {
                         (256, true) => Some(("pfmq_256", 16, 128)),
                         _ => None,
                     }
-                    .filter(|_| half.is_some())
+                    .filter(|_| half.is_some() || cache_half)
                     .and_then(|(n, q, th)| Some((self.named_pipeline(n)?, q, th)));
                     if mma.is_none() {
+                        if cache_half {
+                            // (No f32 kernel reads half caches.)
+                            return None;
+                        }
                         half = None;
                     }
                     let (pipe, qt, threads) = mma.unwrap_or(alt);
                     emit.push(MOp::PfFlash {
+                        cache_half,
                         half,
                         alt,
                         pipe,
@@ -4519,16 +4624,21 @@ impl MetalBackend {
                         return None;
                     }
                     part_floats = part_floats.max(nh * ATTN_MAX_SPLIT * (hd + 2));
-                    // Query heads per threadgroup: as many of a key head's as fit (G * D <= 16).
+                    // Query heads per threadgroup: as many of a key head's as fit (G * D <= 16; over
+                    // half caches G * D <= 64, at most 4 for heads of 256 and 512: fewer
+                    // threadgroups reading the same rows, `dec_attn_bench` 16 x 512 with 2 key
+                    // heads at 32k positions 1159 -> 620 us, 16 x 256 with 4 358 -> 308 us).
                     let rep = nh / nkv;
+                    let fit = if kv_half[kv] { 64 } else { 16 };
                     let grp = [8, 4, 2, 1]
                         .into_iter()
-                        .find(|&g| rep.is_multiple_of(g) && g * d <= 16)
+                        .find(|&g| rep.is_multiple_of(g) && g * d <= fit && (g < 8 || d <= 2))
                         .unwrap_or(1);
-                    let narrow = [1, 2].map(|n| (n < grp).then(|| self.named_pipeline(&format!("dec_attn_{d}_{n}"))).flatten());
+                    let kt = if kv_half[kv] { "h_" } else { "" };
+                    let narrow = [1, 2].map(|n| (n < grp).then(|| self.named_pipeline(&format!("dec_attn_{kt}{d}_{n}"))).flatten());
                     emit.push(MOp::Attn {
                         grp,
-                        pipe: self.named_pipeline(&format!("dec_attn_{d}_{grp}"))?,
+                        pipe: self.named_pipeline(&format!("dec_attn_{kt}{d}_{grp}"))?,
                         narrow,
                         combine: self.named_pipeline("dec_attn_combine")?,
                         hd: hd as u32,
@@ -4861,6 +4971,7 @@ impl MetalBackend {
             part_stride,
             capture: g.capture.map(|(v, n)| (byte(v), n)),
             kv: g.kv.clone(),
+            kv_half,
             rope_halves: g.rope_halves.clone(),
             input2: g.input2.map(|(v, n)| (byte(v), n)),
             states: g.states.clone(),
@@ -5169,6 +5280,15 @@ impl MetalPlan<'_> {
             // A truncation (rewind) since the last step invalidates the copy from there on, even
             // if the host cache has grown back past it.
             m.synced = m.synced.min(c.len).min(c.kept);
+            // A copy of the other precision (a plan of the same slot built with the other
+            // `gpu_kv`) starts over from the host cache.
+            if m.half != self.kv_half[i] {
+                m.synced = 0;
+                if m.cap > 0 && !self.grow_mirror_as(m, row, 0, m.cap, self.kv_half[i]) {
+                    return false;
+                }
+                m.half = self.kv_half[i];
+            }
             if m.cap < pos + t && !self.grow_mirror(m, row, m.synced, pos + t) {
                 return false;
             }
@@ -5176,10 +5296,8 @@ impl MetalPlan<'_> {
                 let (hk, hv) = c.data();
                 let r = m.synced * row..c.len * row;
                 unsafe {
-                    let dk = (self.f.contents(m.k) as *mut f32).add(r.start);
-                    let dv = (self.f.contents(m.v) as *mut f32).add(r.start);
-                    super::par_copy(dk, hk[r.clone()].as_ptr(), r.len());
-                    super::par_copy(dv, hv[r.clone()].as_ptr(), r.len());
+                    m.store(&self.f, false, m.synced, row, &hk[r.clone()]);
+                    m.store(&self.f, true, m.synced, row, &hv[r]);
                 }
                 m.synced = c.len;
             }
@@ -5193,12 +5311,21 @@ impl MetalPlan<'_> {
     /// Makes room for `need` positions in a device KV copy (rows of `row` floats), keeping its
     /// first `valid` rows.
     fn grow_mirror(&self, m: &mut KvMirror, row: usize, valid: usize, need: usize) -> bool {
+        let half = m.half;
+        self.grow_mirror_as(m, row, valid, need, half)
+    }
+
+    /// [`Self::grow_mirror`] into buffers of half rows or f32 ones (`valid` rows are kept only
+    /// when that does not change).
+    fn grow_mirror_as(&self, m: &mut KvMirror, row: usize, valid: usize, need: usize, half: bool) -> bool {
         let be = self.be;
         let new_len: MsgNewBufLen = be.o.msg_send();
+        let valid = if half == m.half { valid } else { 0 };
         // Room for at least one more token (a prompt of a power-of-two length is followed by
-        // decoding: no reallocation and copy on its first step).
-        let cap = (need + 1).next_power_of_two().max(256);
-        let bytes = cap * row * 4;
+        // decoding: no reallocation and copy on its first step), and an eighth more for the
+        // decoding after a prompt (not the next power of two: GBs unused at long contexts).
+        let cap = (need + 1 + need / 8).next_multiple_of(256);
+        let bytes = cap * row * if half { 2 } else { 4 };
         let (k, v) = kv_pool_take(bytes).unwrap_or_else(|| unsafe {
             (
                 new_len(be.device, be.sels.new_buffer_len, bytes, 0),
@@ -5215,9 +5342,16 @@ impl MetalPlan<'_> {
         }
         if valid > 0 {
             unsafe {
-                let n = valid * row;
+                // (Rows of half values: row is even, nkv * hd with hd a multiple of 32.)
+                let n = valid * row / if half { 2 } else { 1 };
                 super::par_copy(self.f.contents(k) as *mut f32, self.f.contents(m.k) as *const f32, n);
                 super::par_copy(self.f.contents(v) as *mut f32, self.f.contents(m.v) as *const f32, n);
+            }
+        }
+        if let Some(r) = &m.res {
+            r.update(&[k, v], true);
+            if !m.k.is_null() && !m.v.is_null() {
+                r.update(&[m.k, m.v], false);
             }
         }
         for b in [m.k, m.v] {
@@ -5225,7 +5359,7 @@ impl MetalPlan<'_> {
                 unsafe { (self.f.void)(b, self.f.s_release) };
             }
         }
-        (m.k, m.v, m.cap, m.bytes) = (k, v, cap, bytes);
+        (m.k, m.v, m.cap, m.bytes, m.half) = (k, v, cap, bytes, half);
         true
     }
 
@@ -5243,6 +5377,8 @@ impl MetalPlan<'_> {
                         cap: 0,
                         synced: 0,
                         bytes: 0,
+                        half: false,
+                        res: self.be.residency.clone(),
                         release,
                     })
                     .collect(),
@@ -6552,12 +6688,17 @@ impl MetalPlan<'_> {
                 a,
                 half,
                 alt,
+                cache_half,
             } => {
                 let mut a = *a;
                 a[0] = pos as u32;
                 a[1] = t as u32;
                 let mma = half.filter(|h| pos + t <= h.2);
-                let (pipe, qt, threads) = if mma.is_some() { (*pipe, *qt, *threads) } else { *alt };
+                let (pipe, qt, threads) = if mma.is_some() || *cache_half {
+                    (*pipe, *qt, *threads)
+                } else {
+                    *alt
+                };
                 e.pipe(pipe);
                 e.buf(arena, *q, 0);
                 e.buf(kvb[*kv].0, 0, 1);
@@ -6565,7 +6706,10 @@ impl MetalPlan<'_> {
                 e.buf(arena, *out, 3);
                 e.buf(arena, *gate, 4);
                 e.bytes(&a, 5);
-                if let Some((kh, vh, _)) = mma {
+                if *cache_half {
+                    e.buf(kvb[*kv].0, 0, 6);
+                    e.buf(kvb[*kv].1, 0, 7);
+                } else if let Some((kh, vh, _)) = mma {
                     e.buf(arena, kh, 6);
                     e.buf(arena, vh, 7);
                 }
@@ -7726,11 +7870,7 @@ impl DecodePlan for MetalPlan<'_> {
                 }
                 kv_done[i] = true;
                 let row = kv_shape[i].0 * kv_shape[i].1;
-                unsafe {
-                    let k = std::slice::from_raw_parts((f.contents(m.k) as *const f32).add(pos * row), t * row);
-                    let v = std::slice::from_raw_parts((f.contents(m.v) as *const f32).add(pos * row), t * row);
-                    c.push(k, v, t);
-                }
+                unsafe { m.push_to(f, c, pos, t, row) };
                 m.synced = pos + t;
                 c.kept = c.len;
             }
@@ -8093,11 +8233,7 @@ impl MetalPlan<'_> {
             for (i, (m, c)) in ms.kv.iter_mut().zip(kv.iter_mut()).enumerate() {
                 let row = self.kv[i].0 * self.kv[i].1;
                 // SAFETY: pass k has completed; its keys and values are in row `pos` of the copies.
-                unsafe {
-                    let kr = std::slice::from_raw_parts((f.contents(m.k) as *const f32).add(pos * row), row);
-                    let vr = std::slice::from_raw_parts((f.contents(m.v) as *const f32).add(pos * row), row);
-                    c.push(kr, vr, 1);
-                }
+                unsafe { m.push_to(f, c, pos, 1, row) };
                 m.synced = pos + 1;
                 c.kept = c.len;
             }
@@ -9649,6 +9785,128 @@ mod tests {
             let g = time(cb, be.o.sel(c"GPUEndTime")) - time(cb, be.o.sel(c"GPUStartTime"));
             (be.sels.pool_pop)(pool);
             g
+        }
+    }
+
+    /// Decode attention kernels (`MOp::Attn`'s, split over key chunks as a step splits them, and
+    /// the combine): GPU time of one token's attention over `n` cached positions and the cache
+    /// bytes read per second, outputs checked against the first kernel. `OXINFER_AB_SHAPES=nh:nkv:hd,..`,
+    /// `OXINFER_AB_N=8192,32768`, `OXINFER_AB_PIPES=dec_attn_%d_%g:4,dec_attn_h_%d_%g:2` (kernel and
+    /// bytes per cached value; `%d` / `%g` are the kernel's D and G).
+    #[test]
+    #[ignore]
+    fn dec_attn_bench() {
+        let be = MetalBackend::new().unwrap();
+        let env = |k: &str, d: &str| std::env::var(k).unwrap_or(d.into());
+        let mut seed = 5u64;
+        let combine = be.named_pipeline("dec_attn_combine").unwrap();
+        for shape in env("OXINFER_AB_SHAPES", "32:8:64,32:8:128,16:4:256,16:2:512").split(',') {
+            let v: Vec<usize> = shape.split(':').map(|x| x.parse().unwrap()).collect();
+            let (nh, nkv, hd) = (v[0], v[1], v[2]);
+            let d = hd / 32;
+            let grp = [8, 4, 2, 1]
+                .into_iter()
+                .find(|&g| (nh / nkv).is_multiple_of(g) && g * d <= 16)
+                .unwrap_or(1);
+            for n in env("OXINFER_AB_N", "8192,32768").split(',').map(|x| x.parse::<usize>().unwrap()) {
+                let rnd = |len: usize, amp: f32, seed: &mut u64| {
+                    let mut v = PageVec::<f32>::zeroed(len);
+                    v.iter_mut().for_each(|x| *x = lcg(seed) * amp);
+                    v
+                };
+                let q = rnd(nh * hd, 4.0, &mut seed);
+                let kc = rnd(n * nkv * hd, 4.0, &mut seed);
+                let vc = rnd(n * nkv * hd, 2.0, &mut seed);
+                let h16 = |c: &PageVec<f32>| {
+                    let mut h = PageVec::<u16>::zeroed(c.len());
+                    h.iter_mut().zip(c.iter()).for_each(|(h, &x)| *h = half::f16::from_f32(x).to_bits());
+                    h
+                };
+                // OXINFER_AB_LAYERS=L: half caches of L layers attended one after the other (as a
+                // pass does: none of them stays in the caches), timed per layer.
+                let layers: usize = env("OXINFER_AB_LAYERS", "1").parse().unwrap();
+                let half: Vec<(PageVec<u16>, PageVec<u16>)> = (0..layers).map(|_| (h16(&kc), h16(&vc))).collect();
+                let w32 = |v: &PageVec<f32>| be.wrap(v.as_ptr() as *const u8, v.len() * 4).unwrap();
+                let w16 = |v: &PageVec<u16>| be.wrap(v.as_ptr() as *const u8, v.len() * 2).unwrap();
+                let (wq, wk, wv) = (w32(&q), w32(&kc), w32(&vc));
+                let wh: Vec<_> = half.iter().map(|(k, v)| (w16(k), w16(v))).collect();
+                let max_split: usize = env("OXINFER_AB_SPLIT", &ATTN_MAX_SPLIT.to_string()).parse().unwrap();
+                let part = PageVec::<f32>::zeroed(nh * max_split * (hd + 2));
+                let wp = w32(&part);
+                let outs: Vec<PageVec<f32>> = (0..4).map(|_| PageVec::<f32>::zeroed(nh * hd)).collect();
+                let wo: Vec<_> = outs.iter().map(&w32).collect();
+                let chunk = n.div_ceil(max_split).next_multiple_of(256).max(256);
+                let p = AttnParams {
+                    nh: nh as u32,
+                    nkv: nkv as u32,
+                    len: n as u32,
+                    lo: 0,
+                    scale: 1.0 / (hd as f32).sqrt(),
+                    has_gate: 0,
+                    g_stride: 0,
+                    g_off: 0,
+                    nsplit: n.div_ceil(chunk) as u32,
+                    chunk: chunk as u32,
+                    _p: [0; 2],
+                };
+                let mut line = format!("{nh}x{hd} kv {nkv} n={n} grp {grp}");
+                for (pi, spec) in env("OXINFER_AB_PIPES", "dec_attn_%d_%g:4,dec_attn_h_%d_%g:2")
+                    .split(',')
+                    .enumerate()
+                    .take(4)
+                {
+                    let mut it = spec.split(':');
+                    let name = it.next().unwrap();
+                    let bpv: usize = it.next().unwrap().parse().unwrap();
+                    // (An optional third field: query heads per threadgroup other than the plan's.)
+                    let grp: usize = it.next().map_or(grp, |g| g.parse().unwrap());
+                    let name = name.replace("%d", &d.to_string()).replace("%g", &grp.to_string());
+                    let Some(pipe) = be.named_pipeline(&name) else {
+                        let _ = write!(line, " {name}: missing");
+                        continue;
+                    };
+                    let nl = if bpv == 2 { layers } else { 1 };
+                    let enc1 = |e: &FastEnc, li: usize| {
+                        let (k, v) = if bpv == 2 { (&wh[li].0, &wh[li].1) } else { (&wk, &wv) };
+                        e.pipe(pipe);
+                        e.buf(wq.id, wq.offset_bytes, 0);
+                        e.buf(k.id, k.offset_bytes, 1);
+                        e.buf(v.id, v.offset_bytes, 2);
+                        e.buf(wo[pi].id, wo[pi].offset_bytes, 3);
+                        e.buf(wq.id, wq.offset_bytes, 4);
+                        e.bytes(&p, 5);
+                        e.buf(wp.id, wp.offset_bytes, 6);
+                        e.dispatch((nh / grp, p.nsplit as usize), 256);
+                        e.barrier();
+                        e.pipe(combine);
+                        e.buf(wp.id, wp.offset_bytes, 0);
+                        e.buf(wo[pi].id, wo[pi].offset_bytes, 1);
+                        e.buf(wq.id, wq.offset_bytes, 2);
+                        e.bytes(&p, 3);
+                        e.bytes(&(hd as u32), 4);
+                        e.dispatch((nh, 1), 256);
+                        e.barrier();
+                    };
+                    let enc = |e: &FastEnc| (0..nl).for_each(|li| enc1(e, li));
+                    timed(&be, |e| enc(e));
+                    let mut best = f64::MAX;
+                    for _ in 0..8 {
+                        best = best.min(timed(&be, |e| (0..4).for_each(|_| enc(e))) / (4 * nl) as f64);
+                    }
+                    let mut err = String::new();
+                    if pi > 0 {
+                        let (mut dd, mut m) = (0f32, 0f32);
+                        for (x, y) in outs[0].iter().zip(outs[pi].iter()) {
+                            dd = dd.max((x - y).abs());
+                            m = m.max(x.abs());
+                        }
+                        err = format!(" (d {:.1e})", dd / m);
+                    }
+                    let bytes = (2 * n * nkv * hd * bpv) as f64;
+                    let _ = write!(line, " | {name}: {:.1} us {:.0} GB/s{err}", best * 1e6, bytes / best / 1e9);
+                }
+                println!("{line}");
+            }
         }
     }
 

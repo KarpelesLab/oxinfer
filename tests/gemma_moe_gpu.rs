@@ -56,7 +56,13 @@ const MI: usize = 128;
 const TOP_K: usize = 64;
 
 fn tiny_gemma_moe() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("oxinfer-tiny-gemma-moe-{}", std::process::id()));
+    tiny_gemma_moe_shared(0)
+}
+
+/// [`tiny_gemma_moe`] whose last `shared` layers read the caches of the last earlier layers of
+/// their kind (Gemma 4 E2B / E4B's KV sharing).
+fn tiny_gemma_moe_shared(shared: usize) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("oxinfer-tiny-gemma-moe-{}-{shared}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let (heads, kv, gkv, hd, ghd, inter) = (2usize, 1usize, 1usize, 256usize, 512usize, 256usize);
     let types = ["sliding_attention", "full_attention", "sliding_attention", "full_attention"];
@@ -66,7 +72,7 @@ fn tiny_gemma_moe() -> PathBuf {
         "head_dim": hd, "global_head_dim": ghd, "attention_k_eq_v": true, "vocab_size": VOCAB,
         "hidden_size_per_layer_input": 0, "sliding_window": 48, "final_logit_softcapping": 30.0,
         "rms_norm_eps": 1e-6, "layer_types": types, "enable_moe_block": true, "num_experts": N_EXP,
-        "top_k_experts": TOP_K, "moe_intermediate_size": MI,
+        "top_k_experts": TOP_K, "moe_intermediate_size": MI, "num_kv_shared_layers": shared,
     });
     std::fs::write(dir.join("config.json"), serde_json::to_vec(&cfg).unwrap()).unwrap();
     let mut s = 7u64;
@@ -250,6 +256,52 @@ fn gpu_prefill_plan_and_decode_match_cpu() {
             .map(|(a, b)| worst_row(a, b, VOCAB))
             .fold(0f32, f32::max);
         assert!(apart > 0.1, "{quant:?}: the adapter's strength barely matters ({apart})");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// KV-sharing layers: a prompt's last token alone runs through them (the layers before them on
+/// every token, across prefill plan steps), and the decode steps after it read the caches the
+/// first layers filled; both must give the CPU's results up to rounding.
+#[test]
+fn gpu_prefill_skips_kv_shared_rows() {
+    unsafe { std::env::set_var("OXINFER_PREFILL_TOKENS", "64") };
+    let plat = oxinfer::platform::detect();
+    let Ok(Some(_)) = oxinfer::gpu::init(&plat, oxinfer::platform::DevicePref::Auto) else {
+        eprintln!("no GPU: skipped");
+        return;
+    };
+    let dir = tiny_gemma_moe_shared(2);
+    let cfg = TextConfig::load(&dir).unwrap();
+    assert_eq!(cfg.first_kv_shared_layer(), 2);
+    let files = ModelFiles::open(&dir, true).unwrap();
+    let tokens: Vec<u32> = (0..300u32).map(|i| (i * 37 + 11) % VOCAB as u32).collect();
+    let next = [5u32, 77, 300, 411];
+    for quant in [Quant::Bf16, Quant::Q8] {
+        let model = Model::load(cfg.clone(), &files, quant).unwrap();
+        oxinfer::gpu::set_exact(true);
+        oxinfer::gpu::set_decode(Some(false));
+        let all: Vec<u32> = tokens.iter().chain(&next).copied().collect();
+        let h_all = model.forward_hidden(&mut model.new_session(), &all);
+        let last_ref = &h_all[(tokens.len() - 1) * H..tokens.len() * H];
+        let l_ref: Vec<Vec<f32>> = (tokens.len()..all.len())
+            .map(|i| model.logits(&h_all[i * H..(i + 1) * H], 1))
+            .collect();
+        oxinfer::gpu::set_exact(false);
+        oxinfer::gpu::set_decode(Some(true));
+        let mut s_gpu = model.new_session();
+        let last = model.prefill_hidden(&mut s_gpu, &tokens, &[], true);
+        if oxinfer::gpu::active().is_some() {
+            // (Only the last token's row: the shared layers ran on it alone.)
+            assert_eq!(last.len(), H, "{quant:?}: the prefill did not skip the shared layers' rows");
+        }
+        assert_eq!(s_gpu.pos, tokens.len());
+        let l_gpu: Vec<Vec<f32>> = next.iter().map(|&tk| model.forward(&mut s_gpu, &[tk])).collect();
+        let prefill = worst_row(&last[last.len() - H..], last_ref, H);
+        let decode = l_gpu.iter().zip(&l_ref).map(|(a, b)| worst_row(a, b, VOCAB)).fold(0f32, f32::max);
+        eprintln!("{quant:?} (2 shared layers): prefill last token {prefill:.2e}, decode worst step {decode:.2e}");
+        assert!(prefill < 1e-2, "{quant:?}: the last token's hidden state differs by {prefill}");
+        assert!(decode < 2e-2, "{quant:?}: decode logits differ by {decode}");
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

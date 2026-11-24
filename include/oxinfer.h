@@ -178,6 +178,9 @@ int64_t oxi_cache_remove(const char *cache_dir, const char *name);
  *                        the GPU: the argmax and the next token's embedding computed there, the
  *                        next pass queued before the host reads a token (the same tokens;
  *                        default 1; process-wide)
+ *   gpu_kv=f16|f32|auto  the device's copies of the attention caches where whole-pass GPU plans
+ *                        run (Metal with matrix units): half-precision rows (default: half the
+ *                        attention's memory traffic at long contexts) or f32; process-wide
  *   stream_gpu=0|1|auto  streamed models decode on the GPU too (process-wide; default: dense
  *                        models on the GPU, MoE models measure both on their first tokens and
  *                        keep the faster): resident layers stay wrapped, the others are wrapped

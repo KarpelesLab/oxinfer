@@ -518,6 +518,8 @@ fn usage() -> ! {
          \x20 --gpu-chain M        on (default) | off: greedy decoding chained on the device (the argmax and\n\
          \x20                      the next token's embedding on the GPU, the next pass queued before the\n\
          \x20                      host reads a token; the same tokens)\n\
+         \x20 --gpu-kv T           f16 (default) | f32: the device's copies of the attention caches\n\
+         \x20                      (Metal whole-pass plans; f16 halves their traffic at long contexts)\n\
          \x20 --dump-logits FILE   write last-prompt-token logits (f32 LE) and exit\n\
          \n\
          ANEMLL Core ML models (a meta.yaml folder; macOS 15 / iOS 18, Apple Neural Engine):\n\
@@ -1040,6 +1042,15 @@ fn parse_args() -> Result<Args> {
                     "off" | "0" | "false" => Some(false),
                     "auto" => None,
                     _ => bail!("--gpu-chain expects on|off, got {v}"),
+                });
+            }
+            "--gpu-kv" => {
+                let v = val()?;
+                oxinfer::gpu::set_kv_half(match v.as_str() {
+                    "f16" | "half" => Some(true),
+                    "f32" => Some(false),
+                    "auto" => None,
+                    _ => bail!("--gpu-kv expects f16|f32, got {v}"),
                 });
             }
             "--gpu-decode" => {

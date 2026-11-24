@@ -496,6 +496,10 @@ pub struct Graph<'a> {
     pub embed: Option<(&'a crate::model::Table<'a>, f32)>,
     /// The table of the second input ([`Graph::input2`]), when it is a token's row.
     pub embed2: Option<&'a crate::model::Table<'a>>,
+    /// Identifies the model whose plans share slots (device copies of the caches): plans of
+    /// graphs with the same caches, states and key share them. None: the graph's first weight
+    /// (graphs of part of a model's layers set the model's key).
+    pub layout_key: Option<usize>,
 }
 
 /// The weight streamer as a decode plan sees it (see [`Graph::units`]).
@@ -600,6 +604,7 @@ impl<'a> Graph<'a> {
             strengths: Vec::new(),
             embed: None,
             embed2: None,
+            layout_key: None,
         }
     }
 

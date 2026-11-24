@@ -33,6 +33,12 @@ pub trait TextLm {
     /// Runs `tokens` through the model, with the embeddings of some positions replaced by
     /// multimodal soft tokens; returns the final-normed hidden states `[tokens, hidden]`.
     fn forward_hidden_mm(&self, sess: &mut Self::Sess, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32>;
+    /// [`Self::forward_hidden_mm`] for a prompt chunk whose hidden states nothing reads but the
+    /// last token's (`last`), or none: a model may then skip work only those rows need (Gemma's
+    /// KV-sharing layers) and return the last token's alone (or, without `last`, anything).
+    fn prefill_hidden(&self, sess: &mut Self::Sess, tokens: &[u32], mm: &[(usize, &[f32])], _last: bool) -> Vec<f32> {
+        self.forward_hidden_mm(sess, tokens, mm)
+    }
     /// LM-head logits `[t, vocab]` for the last `t` hidden states given.
     fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32>;
     /// Declares `gh` x `gw` vision tokens at sequence position `start` before they are fed
@@ -92,6 +98,9 @@ impl TextLm for Model<'_> {
     }
     fn forward_hidden_mm(&self, sess: &mut Session, tokens: &[u32], mm: &[(usize, &[f32])]) -> Vec<f32> {
         Model::forward_hidden_mm(self, sess, tokens, mm)
+    }
+    fn prefill_hidden(&self, sess: &mut Session, tokens: &[u32], mm: &[(usize, &[f32])], last: bool) -> Vec<f32> {
+        Model::prefill_hidden(self, sess, tokens, mm, last)
     }
     fn logits(&self, hidden: &[f32], t: usize) -> Vec<f32> {
         Model::logits(self, hidden, t)
@@ -182,7 +191,8 @@ fn report_prefill(done: usize, total: usize) {
 }
 
 /// Prefills `ids` in chunks of `chunk` tokens with multimodal overrides (`(position in ids,
-/// embedding)`); returns the hidden states of the last chunk. A chunk ending inside a run of
+/// embedding)`); returns the hidden states of the last chunk (at least its last token's: models
+/// may skip work only the others' need, see [`TextLm::prefill_hidden`]). A chunk ending inside a run of
 /// consecutive overrides is stretched to the run's end when the model needs whole runs
 /// ([`TextLm::mm_runs_whole`]).
 pub fn prefill<M: TextLm + ?Sized>(model: &M, sess: &mut M::Sess, ids: &[u32], chunk: usize, overrides: &[(usize, Vec<f32>)]) -> Vec<f32> {
@@ -230,7 +240,7 @@ fn prefill_inner<M: TextLm + ?Sized>(
             .filter(|(p, _)| *p >= start && *p < end)
             .map(|(p, e)| (p - start, e.as_slice()))
             .collect();
-        hs = model.forward_hidden_mm(sess, c, &local);
+        hs = model.prefill_hidden(sess, c, &local, end == ids.len());
         start = end;
         if report {
             report_prefill(end, ids.len());

@@ -261,6 +261,12 @@ pub struct EngineOptions {
     /// DSpark; the same tokens as the host's argmax). Process-wide, applied on load; None leaves
     /// the current setting (default on; [`crate::gpu::set_decode_chain`]). Key `gpu_chain`.
     pub gpu_chain: Option<bool>,
+    /// How the device holds its copies of the attention caches where whole-pass GPU plans run
+    /// (Metal with matrix units): half-precision rows (`Some(true)`, the default: half the
+    /// attention's memory traffic at long contexts, as llama.cpp's f16 cache) or f32 ones.
+    /// Process-wide, applied on load (read as a model builds its plans); None leaves the current
+    /// setting ([`crate::gpu::set_kv_half`]). Key `gpu_kv` (`f16`, `f32` or `auto`).
+    pub gpu_kv: Option<bool>,
     /// Streamed models (see [`EngineOptions::stream`]) decode on the GPU too: the resident layers
     /// stay wrapped, the others are wrapped per pass as they arrive and released after (Metal;
     /// Qwen3.5 / 3.8 dense and MoE, Gemma 4 / Gemma 3 dense and 26B-A4B; DeepSeek V4.1 as one
@@ -511,6 +517,7 @@ impl Default for EngineOptions {
             cpu_q8k: None,
             gpu_decode: None,
             gpu_chain: None,
+            gpu_kv: None,
             stream_gpu: None,
             stream_predict: None,
             decision_from: None,
@@ -602,6 +609,7 @@ impl EngineOptions {
         "cpu_q8k",
         "gpu_decode",
         "gpu_chain",
+        "gpu_kv",
         "stream_gpu",
         "stream_predict",
         "decision_from",
@@ -745,6 +753,14 @@ impl EngineOptions {
             }
             "gpu_decode" => self.gpu_decode = Some(parse_bool(key, value)?),
             "gpu_chain" => self.gpu_chain = Some(parse_bool(key, value)?),
+            "gpu_kv" => {
+                self.gpu_kv = match value.trim() {
+                    "f16" | "half" => Some(true),
+                    "f32" => Some(false),
+                    "" | "auto" => None,
+                    v => bail!("gpu_kv: expected f16, f32 or auto, got {v:?}"),
+                }
+            }
             "stream_predict" => {
                 self.stream_predict = match value.trim() {
                     "" | "auto" => None,
@@ -1713,6 +1729,9 @@ impl Engine {
         }
         if let Some(on) = opts.gpu_chain {
             crate::gpu::set_decode_chain(Some(on));
+        }
+        if let Some(on) = opts.gpu_kv {
+            crate::gpu::set_kv_half(Some(on));
         }
         if let Some(on) = opts.stream_gpu {
             crate::gpu::set_stream_decode(Some(on));
@@ -4387,6 +4406,11 @@ mod tests {
         o.set("prompt_checkpoints", "").unwrap();
         assert_eq!(o.prompt_checkpoints, None);
         assert!(o.set("prompt_checkpoints", "x").is_err());
+        o.set("gpu_kv", "f32").unwrap();
+        assert_eq!(o.gpu_kv, Some(false));
+        o.set("gpu_kv", "auto").unwrap();
+        assert_eq!(o.gpu_kv, None);
+        assert!(o.set("gpu_kv", "q8").is_err());
         for u in [CoreMlUnits::Ane, CoreMlUnits::All, CoreMlUnits::Gpu, CoreMlUnits::Cpu] {
             assert_eq!(CoreMlUnits::parse(u.as_str()), Some(u));
         }
@@ -4404,6 +4428,7 @@ mod tests {
                 "draft_device" => "gpu",
                 "prefill_gemm" => "sme",
                 "kv_cache" => "q8",
+                "gpu_kv" => "f16",
                 "mtp_from" | "draft" | "cache_dir" | "decision_from" => "x",
                 "interventions" => r#"{"neurons":[{"layer":1,"neuron":2,"op":"zero"}]}"#,
                 _ => "1",

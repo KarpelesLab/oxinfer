@@ -359,6 +359,7 @@ static EXACT: AtomicU8 = AtomicU8::new(0);
 static MOE: AtomicU8 = AtomicU8::new(0);
 static DECODE: AtomicU8 = AtomicU8::new(0);
 static CHAIN: AtomicU8 = AtomicU8::new(0);
+static KV_HALF: AtomicU8 = AtomicU8::new(0);
 
 fn switch(a: &AtomicU8, env: &'static OnceLock<Option<String>>, var: &str, on_env: fn(&str) -> bool, default: bool) -> bool {
     match a.load(Ordering::Relaxed) {
@@ -462,6 +463,29 @@ pub fn set_decode_chain(on: Option<bool>) {
 pub fn decode_chain_enabled() -> bool {
     static ENV: OnceLock<Option<String>> = OnceLock::new();
     switch(&CHAIN, &ENV, "OXINFER_GPU_CHAIN", |v| v != "0", true)
+}
+
+/// Keeps the device's copies of the attention caches as half-precision rows (`true`, the default)
+/// or f32 ones (`false`), where whole-pass GPU plans run (Metal with matrix units: decoding,
+/// verification and prefill plans; QSA caches stay f32). Half rows halve the attention's memory
+/// traffic at long contexts, as llama.cpp's f16 cache; the host's caches stay f32 (filled from
+/// the device's rows). Process-wide, read when a model builds its plans. None restores the
+/// default (on, or `OXINFER_GPU_KV=f32|f16`).
+pub fn set_kv_half(on: Option<bool>) {
+    KV_HALF.store(
+        match on {
+            Some(true) => 1,
+            Some(false) => 2,
+            None => 0,
+        },
+        Ordering::Relaxed,
+    );
+}
+
+/// See [`set_kv_half`].
+pub fn kv_half_enabled() -> bool {
+    static ENV: OnceLock<Option<String>> = OnceLock::new();
+    switch(&KV_HALF, &ENV, "OXINFER_GPU_KV", |v| v != "f32", true)
 }
 
 /// Decodes on the device also when the weights stream from storage (`crate::stream`): the
