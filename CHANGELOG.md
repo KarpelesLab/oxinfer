@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.21](https://github.com/KarpelesLab/oxinfer/compare/v0.0.20...v0.0.21) - 2026-11-24
+
+### Added
+
+- DeepSeek V4 / V4.1 reuse a conversation's prompt across turns: in-memory prompt checkpoints (the windows' raw keys and the compressors' pending rows; Engine::chat goes back to the previous prompt when the past reply lost its thinking; prompt_checkpoints, default 2) and session snapshots / prompt cache (the host session, rebuilt on the Metal decode path's device copies at the next pass); tiny random V4 / V4.1 checkpoints with a tokenizer for engine and server tests; examples/chat_turns measures turn-to-turn reuse
+- *(web)* Add to opencode / Update / Remove from opencode on each chat model in the Models and Status views, shown when the server found opencode's configuration; docs for the endpoints and the entry written
+- *(opencode)* add and remove the server's chat models in opencode's global configuration
+
+### Fixed
+
+- *(cli)* the binary builds for wasm32-unknown-unknown again: save_quantized is compiled out there, so --save-quantized reports it is unavailable
+- *(opencode)* close the temporary file at the end of a block rather than with drop (clippy::drop_non_drop on wasm)
+- *(opencode)* the temporary file's write in a function of its own (clippy::redundant_closure_call)
+- *(hf)* fetching a GGUF repo (org/name:QUANT) brings its top-level mmproj*.gguf vision projector beside the model (BF16, else F16, else F32, else another; never Old_Support/ or .gguf_file), with a note, unless one is there already or mmproj is none or a file; /v1/models advertises capabilities and modalities of loaded chat models
+
+### Other
+
+- Inkling-2-Mini decoding on Metal, round 6 (read-ahead of small weights beside the latency kernels, routing in one SIMD-group; llama.cpp comparison; OXINFER_INKLING_PF)
+- *(metal)* Inkling-2 decode: small weights read ahead into the system cache beside the latency kernels before them (ink_pf: the output projection, the message gates' down and forget / gain rows, the router; OXINFER_INKLING_PF mask), the experts' routing in one SIMD-group of each gate / up threadgroup (_rpair); tg64 chained UD-IQ3_XXS 116.5 -> 122.9 tok/s, mlx-community 4bit 121.7 -> 124.0, Q8_0 87.3 -> 88.7, greedy text unchanged
+- DeepSeek V4 / V4.1 prompt checkpoints and snapshots, measured on V4.1-Flash (turn 2: 17.0 s prefill -> 0.70 s); chat_turns --save-tokens
+- long contexts on Metal: half-precision device KV caches, Qwen3-8B / Gemma 4 E4B / 12B prefill at 8k / 32k and decoding at those depths against llama.cpp (f32 caches for comparison)
+- *(metal)* long contexts: half-precision device KV caches (gpu_kv=f16 default; engine / server / C API key gpu_kv, --gpu-kv, OXINFER_GPU_KV, gpu::set_kv_half): decode, verification and prefill plans read and write half rows, prefill attention reads them at any length (it fell back to the f32 SIMD-group kernel past 6144 + chunk positions and converted every earlier row each chunk); KV copies in the queue's residency set (re-made resident by every command buffer at a cost growing with their size: Qwen3-8B 32k no-attention steps 59.9 -> 89.8 tok/s) and sized need + 1/8 instead of the next power of two; Gemma 4 E2B / E4B prompts run the KV-sharing layers on the last token only (TextLm::prefill_hidden, as llama.cpp's pruning; OXINFER_PF_PRUNE=0); half-cache decode attention takes up to 4 query heads of 256 / 512 per threadgroup; prefill attention on heads of 256 / 512 walks 128 keys at a time; dec_attn_bench; parity_bench depth= / text=
+
 ## [0.0.20](https://github.com/KarpelesLab/oxinfer/compare/v0.0.19...v0.0.20) - 2026-11-24
 
 ### Added
